@@ -1,0 +1,16 @@
+# python
+.venv/
+__pycache__/
+*.pyc
+
+# model artifacts / weights (too big to commit — keep export scripts + instructions instead)
+models/
+*.onnx
+*.xclbin
+*.bin
+*.safetensors
+*.nemo
+
+# scratch
+*.wav
+*.log
