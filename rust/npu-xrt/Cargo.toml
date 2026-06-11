@@ -1,0 +1,16 @@
+[package]
+name = "npu-xrt"
+version = "0.1.0"
+edition = "2021"
+description = "Safe Rust bindings to drive the AMD XDNA2 NPU via a thin C++ XRT shim"
+
+[lib]
+name = "npu_xrt"
+path = "src/lib.rs"
+
+[build-dependencies]
+cc = "1"
+
+[[bin]]
+name = "spike_matmul"
+path = "src/bin/spike_matmul.rs"

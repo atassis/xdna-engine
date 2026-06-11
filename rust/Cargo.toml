@@ -1,0 +1,7 @@
+[workspace]
+resolver = "2"
+members = ["npu-xrt", "npu-asr-host", "npu-asr"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"

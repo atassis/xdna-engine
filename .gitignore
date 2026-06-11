@@ -1,10 +1,16 @@
 # python
 .venv/
+.venv-iron/
 __pycache__/
 *.pyc
+# NOTE: mlir-aie/ is now a pinned git submodule (was gitignored clone). See
+# internal notes. Its dirty working tree (copy-forward kernels +
+# build artifacts + applied patch) is hidden from the parent via .gitmodules ignore=all.
 
 # model artifacts / weights (too big to commit — keep export scripts + instructions instead)
 models/
+# artifacts/ is regenerable: scripts/extract_block0.py + extract_blocks.py from the ONNX
+artifacts/
 *.onnx
 *.xclbin
 *.bin
@@ -14,3 +20,6 @@ models/
 # scratch
 *.wav
 *.log
+
+# rust build artifacts
+rust/target/

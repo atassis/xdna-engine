@@ -1,0 +1,4 @@
+[submodule "mlir-aie"]
+	path = mlir-aie
+	url = https://github.com/Xilinx/mlir-aie
+	ignore = all

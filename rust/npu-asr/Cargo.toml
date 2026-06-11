@@ -1,0 +1,20 @@
+[package]
+name = "npu-asr"
+version = "0.1.0"
+edition = "2021"
+description = "GigaAM-v3 encoder on the XDNA2 NPU, driven from Rust (Rung 6)"
+
+[lib]
+name = "npu_asr"
+path = "src/lib.rs"
+
+[dependencies]
+npu-xrt = { path = "../npu-xrt" }
+npu-asr-host = { path = "../npu-asr-host" }
+ndarray = "0.16"
+ndarray-npy = { version = "0.9", default-features = false }
+rayon = "1"
+
+[[bin]]
+name = "verify_encoder"
+path = "src/bin/verify_encoder.rs"

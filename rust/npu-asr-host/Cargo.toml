@@ -1,0 +1,13 @@
+[package]
+name = "npu-asr-host"
+version = "0.1.0"
+edition = "2021"
+description = "Pure host-side (CPU) tensor math for the GigaAM-v3 encoder — no NPU dependency"
+
+[lib]
+name = "npu_asr_host"
+path = "src/lib.rs"
+
+[dependencies]
+ndarray = "0.16"
+rayon = "1"

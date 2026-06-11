@@ -1,0 +1,44 @@
+diff --git a/programming_examples/basic/matrix_multiplication/common.h b/programming_examples/basic/matrix_multiplication/common.h
+index 275ff39..ff119f3 100644
+--- a/programming_examples/basic/matrix_multiplication/common.h
++++ b/programming_examples/basic/matrix_multiplication/common.h
+@@ -16,6 +16,7 @@
+ 
+ #include <algorithm>
+ #include <bits/stdc++.h>
++#include <cassert>  // local fix: gcc16 no longer pulls assert transitively
+ #include <cmath>
+ #include <fstream>
+ #include <iostream>
+diff --git a/programming_examples/common.cmake b/programming_examples/common.cmake
+index 3fd4fea..ae5868f 100644
+--- a/programming_examples/common.cmake
++++ b/programming_examples/common.cmake
+@@ -50,6 +50,14 @@ endif()
+ # -----------------------------------------------------------------------------
+ # XRT auto-detection (supports both Ubuntu packages and legacy /opt/xilinx/xrt)
+ # -----------------------------------------------------------------------------
++# LOCAL PATCH (CachyOS): Arch's xrt cmake export references missing static .a libs,
++# so find_package(XRT) hard-fails. Allow overriding via env to use the shared .so.
++if(NOT DEFINED XRT_INC_DIR AND DEFINED ENV{XRT_INC_DIR})
++    set(XRT_INC_DIR "$ENV{XRT_INC_DIR}" CACHE STRING "Path to XRT headers")
++endif()
++if(NOT DEFINED XRT_LIB_DIR AND DEFINED ENV{XRT_LIB_DIR})
++    set(XRT_LIB_DIR "$ENV{XRT_LIB_DIR}" CACHE STRING "Path to XRT libraries")
++endif()
+ if(NOT DEFINED XRT_INC_DIR OR NOT DEFINED XRT_LIB_DIR)
+     find_package(XRT QUIET)
+     if(XRT_FOUND)
+diff --git a/programming_examples/ml/layernorm/Makefile b/programming_examples/ml/layernorm/Makefile
+index f663aae..12220cd 100644
+--- a/programming_examples/ml/layernorm/Makefile
++++ b/programming_examples/ml/layernorm/Makefile
+@@ -37,7 +37,7 @@ endif
+ 
+ build/aie.mlir: ${srcdir}/${aie_py_src}
+ 	mkdir -p ${@D}
+-	python3 $< -d ${devicename} -r ${rows} -c ${cols} -t ${trace_size}>$@
++	python3 $< -d ${devicename} -r ${rows} -c ${cols} -t ${trace_size} >$@
+ 
+ build/aie_trace.mlir: ${srcdir}/${aie_py_src}
+ 	mkdir -p ${@D}

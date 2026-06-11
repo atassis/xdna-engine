@@ -1,0 +1,77 @@
+##===- Makefile.ffn — fused two-matmul (FFN) C=(A@W1)@W2, on-chip H ----===##
+# Usage:
+#   source scripts/iron_env.sh
+#   make -f Makefile.ffn NPU2=1            # default small shapes (single tile)
+#   make -f Makefile.ffn NPU2=1 M=512 K=768 P=3072 N=768 m=64 k=64 p=64 n=64
+#
+# Builds one xclbin that runs BOTH matmuls in a single dispatch.  The kernel
+# .o is compiled with NO *_ONLY define so it exports both matmul_bf16_bf16
+# (mm1, H kept bf16 on-chip) and matmul_bf16_f32 (mm2, f32 C out).
+##===---------------------------------------------------------------------===##
+
+srcdir := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
+
+# final FFN dims
+M?=64
+K?=128
+P?=128
+N?=128
+# per-core tile dims
+m?=64
+k?=64
+p?=64
+n?=64
+
+h_dtype?=bf16
+dtype_in?=bf16
+dtype_out?=f32
+
+devicename ?= $(if $(filter 1,$(NPU2)),npu2,npu)
+target_suffix=ffn_${M}x${K}x${P}x${N}_${m}x${k}x${p}x${n}
+mlir_target=build/aie_${target_suffix}.mlir
+xclbin_target=build/final_${target_suffix}.xclbin
+insts_target=build/insts_${target_suffix}.txt
+
+MLIR_AIE_DIR := $(shell python3 -c "from aie.utils.config import root_path; print(root_path())")
+WARNING_FLAGS = -Wno-parentheses -Wno-attributes -Wno-macro-redefined -Wno-empty-body -Wno-missing-template-arg-list-after-template-kw
+PEANOWRAP2P_FLAGS = -O2 -std=c++20 --target=aie2p-none-unknown-elf ${WARNING_FLAGS} -DNDEBUG -I ${MLIR_AIE_DIR}/include
+kernels_dir=${srcdir}/../../../../aie_kernels/aie2p
+
+# kernel objects: mm1 geometry (m x k x p) and mm2 geometry (m x p x n).
+# Compiled WITHOUT *_ONLY so both bf16_bf16 and bf16_f32 symbols are present.
+kobj1=build/mm_${m}x${k}x${p}.o
+kobj2=build/mm_${m}x${p}x${n}.o
+
+.PHONY: all
+all: ${xclbin_target}
+
+# FORCE: kernel .o is named by tile geometry only (not dtype), so a stale
+# single_core build (bf16_f32-ONLY) is silently reused and the link fails on
+# missing matmul_bf16_bf16/zero_bf16.  Always recompile the kernel objects.
+.PHONY: FORCE
+${kobj1} ${kobj2}: FORCE
+
+build/mm_%.o: ${kernels_dir}/mm.cc
+	@mkdir -p build
+	@set -e; dims=$*; \
+	  a=$${dims%%x*}; rest=$${dims#*x}; b=$${rest%%x*}; c=$${rest#*x}; \
+	  echo "[kernel] mm.cc DIM_M=$$a DIM_K=$$b DIM_N=$$c -> $@"; \
+	  ${PEANO_INSTALL_DIR}/bin/clang++ ${PEANOWRAP2P_FLAGS} \
+	    -DDIM_M=$$a -DDIM_K=$$b -DDIM_N=$$c -c $< -o $@
+
+${mlir_target}: ${srcdir}/ffn_gemm2_iron.py
+	@mkdir -p build
+	python3 $< --dev ${devicename} -M $M -K $K -P $P -N $N \
+	   -m $m -k $k -p $p -n $n --dtype_in ${dtype_in} --dtype_out ${dtype_out} \
+	   --h_dtype ${h_dtype} > $@
+
+${xclbin_target}: ${mlir_target} ${kobj1} ${kobj2}
+	cd build && aiecc --alloc-scheme=basic-sequential --aie-generate-xclbin \
+	   --no-compile-host --xclbin-name=$(notdir $@) \
+	   --no-xchesscc --no-xbridge --peano ${PEANO_INSTALL_DIR} \
+	   --aie-generate-npu-insts --npu-insts-name=$(notdir ${insts_target}) \
+	   ../$<
+
+.PHONY: clean
+clean:
+	rm -rf build
