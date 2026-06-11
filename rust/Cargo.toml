@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["npu-xrt", "npu-asr-host", "npu-asr"]
+members = ["npu-xrt", "npu-asr-host", "npu-asr", "npu-onnx", "npu-asr-serve"]
 
 [profile.release]
 opt-level = 3

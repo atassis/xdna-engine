@@ -40,12 +40,23 @@ impl Encoder {
         Encoder { blocks }
     }
 
-    /// Run the block stack from a [400,768] input, returning every block's output ([T,768]).
-    pub fn forward_blocks(&self, x0: &Array2<f32>) -> Vec<Array2<f32>> {
+    /// Run the block stack from a [T,768] input, returning every block's output ([T,768]).
+    /// `valid_len` is the number of non-padded time frames; padded frames are zeroed and masked
+    /// through the time-mixing ops (attention, dwconv). Pass valid_len >= T for no masking.
+    pub fn forward_blocks(&self, x0: &Array2<f32>, valid_len: usize) -> Vec<Array2<f32>> {
         let mut x = x0.mapv(bf16_round);
+        // zero padded frames at the block-stack input so block 0 starts clean
+        let (t, d) = x.dim();
+        if valid_len < t {
+            for ti in valid_len..t {
+                for c in 0..d {
+                    x[[ti, c]] = 0.0;
+                }
+            }
+        }
         let mut outs = Vec::with_capacity(self.blocks.len());
         for blk in &self.blocks {
-            x = blk.forward(&x);
+            x = blk.forward(&x, valid_len);
             outs.push(x.clone());
         }
         outs

@@ -176,8 +176,10 @@ impl FusedBlock {
         }
     }
 
-    /// x is [T, 768] (bf16-valued f32). Returns [T, 768] (bf16-valued).
-    pub fn forward(&self, x: &Array2<f32>) -> Array2<f32> {
+    /// x is [T, 768] (bf16-valued f32). `valid_len` is the number of non-padded time frames;
+    /// the two time-mixing ops (attention, depthwise conv) mask positions >= valid_len so padding
+    /// doesn't leak into valid frames (pass valid_len >= T for no masking). Returns [T, 768].
+    pub fn forward(&self, x: &Array2<f32>, valid_len: usize) -> Array2<f32> {
         let mut x = x.mapv(bf16_round);
 
         // --- FFN1 (macaron half), residual ×0.5 ---
@@ -190,7 +192,7 @@ impl FusedBlock {
         let qp = self.q.forward(&r);
         let kp = self.k.forward(&r);
         let vp = self.v.forward(&ln);
-        let ctx = mha(&qp, &kp, &vp, N_HEADS, HEAD_DIM, true);
+        let ctx = mha(&qp, &kp, &vp, N_HEADS, HEAD_DIM, true, valid_len);
         let op = self.o.forward(&ctx);
         x = (&x + &op).mapv(bf16_round);
 
@@ -198,7 +200,16 @@ impl FusedBlock {
         let ln = layer_norm(&x, &self.ln_conv_w, &self.ln_conv_b, LN_EPS);
         let pw1 = self.pw1.forward(&ln); // [T,1536]
         let pw1t = pw1.t().to_owned(); // [1536,T]
-        let g = glu(&pw1t); // [768,T]
+        let mut g = glu(&pw1t); // [768,T]
+        // zero padded time columns so the depthwise FIR (k=5) doesn't pull padding into valid frames
+        let tt_g = g.ncols();
+        if valid_len < tt_g {
+            for c in 0..g.nrows() {
+                for ti in valid_len..tt_g {
+                    g[[c, ti]] = 0.0;
+                }
+            }
+        }
         let mut dwout = dwconv_k5(&g, &self.dw_taps); // [768,T] on host (parallel 5-tap FIR)
         // + depthwise bias (broadcast over T)
         let (ch, tt) = dwout.dim();

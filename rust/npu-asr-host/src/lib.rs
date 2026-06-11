@@ -78,6 +78,8 @@ pub fn rope(
 }
 
 /// Multi-head scaled-dot-product attention. q,k,v are each [T, D], D = n_heads*head_dim.
+/// `valid_len` masks padded key positions (j >= valid_len) with -inf before softmax, so padded
+/// frames don't contaminate the valid frames' attention (pass valid_len >= T for no masking).
 pub fn mha(
     q: &Array2<f32>,
     k: &Array2<f32>,
@@ -85,9 +87,11 @@ pub fn mha(
     n_heads: usize,
     head_dim: usize,
     round_probs: bool,
+    valid_len: usize,
 ) -> Array2<f32> {
     use rayon::prelude::*;
     let (t, d) = q.dim();
+    let vl = valid_len.min(t);
     let scale = 1.0 / (head_dim as f32).sqrt();
     // Each head is independent — compute per-head context [T,HD] in parallel across cores.
     let ctxs: Vec<Array2<f32>> = (0..n_heads)
@@ -100,6 +104,14 @@ pub fn mha(
             // scores = (qh @ kh^T) * scale  -> [T, T]  (matrixmultiply, not scalar loops)
             let mut sc = qh.dot(&kh.t());
             sc.mapv_inplace(|x| x * scale);
+            // mask padded key columns (j >= vl) so they drop out of the softmax
+            if vl < t {
+                for mut row in sc.rows_mut() {
+                    for j in vl..t {
+                        row[j] = f32::NEG_INFINITY;
+                    }
+                }
+            }
             // row-wise softmax (max-stable), optionally bf16-rounding the probabilities
             for mut row in sc.rows_mut() {
                 let mut maxv = f32::NEG_INFINITY;
@@ -384,7 +396,7 @@ mod tests {
     #[test]
     fn test_mha_no_round() {
         let (q, k, v) = mha_inputs();
-        let out = mha(&q, &k, &v, 2, 4, false);
+        let out = mha(&q, &k, &v, 2, 4, false, 3);
         let exp = [
             -1.18690836e+00, -2.22432256e-01, -1.02206445e+00, 3.63069683e-01, -6.10106885e-01,
             -7.53903568e-01, -2.43777782e-01, -3.99768412e-01, -8.78197402e-02, -2.48804614e-01,
@@ -398,7 +410,7 @@ mod tests {
     #[test]
     fn test_mha_round() {
         let (q, k, v) = mha_inputs();
-        let out = mha(&q, &k, &v, 2, 4, true);
+        let out = mha(&q, &k, &v, 2, 4, true, 3);
         let exp = [
             -1.18585062e+00, -2.22294509e-01, -1.02140045e+00, 3.62818062e-01, -6.11286521e-01,
             -7.55464554e-01, -2.44101077e-01, -4.00213450e-01, -8.73454213e-02, -2.49094710e-01,

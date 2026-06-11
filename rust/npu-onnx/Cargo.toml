@@ -1,0 +1,17 @@
+[package]
+name = "npu-onnx"
+version = "0.1.0"
+edition = "2021"
+description = "Run ONNX graphs from Rust via a thin C-shim over the system onnxruntime"
+links = "onnxruntime"
+
+[lib]
+name = "npu_onnx"
+path = "src/lib.rs"
+
+[build-dependencies]
+cc = "1"
+
+[[bin]]
+name = "onnx_smoke"
+path = "src/bin/onnx_smoke.rs"

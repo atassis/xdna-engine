@@ -18,3 +18,7 @@ rayon = "1"
 [[bin]]
 name = "verify_encoder"
 path = "src/bin/verify_encoder.rs"
+
+[[bin]]
+name = "encode_server"
+path = "src/bin/encode_server.rs"

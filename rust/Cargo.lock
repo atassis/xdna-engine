@@ -184,6 +184,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "npu-asr-serve"
+version = "0.1.0"
+dependencies = [
+ "ndarray",
+ "npu-asr",
+ "npu-onnx",
+ "npu-xrt",
+]
+
+[[package]]
+name = "npu-onnx"
+version = "0.1.0"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "npu-xrt"
 version = "0.1.0"
 dependencies = [

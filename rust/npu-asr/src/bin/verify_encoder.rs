@@ -57,7 +57,7 @@ fn main() {
     let x0 = subsample(&ws, &audio);
 
     // correctness pass (also warms the device)
-    let outs = enc.forward_blocks(&x0);
+    let outs = enc.forward_blocks(&x0, 400);
     let mut worst = 0f32;
     for i in 0..nb {
         let refr = squeeze0(ws.ref_tensor(&format!("out_L{i}")));
@@ -78,12 +78,12 @@ fn main() {
     println!("  worst per-block rel = {worst:.2e}");
 
     // steady-state (warm) latency + NPU-vs-host split
-    let _ = enc.forward_blocks(&x0); // extra warmup
+    let _ = enc.forward_blocks(&x0, 400); // extra warmup
     reset_prof();
     let t0 = Instant::now();
     for _ in 0..iters {
         let xs = subsample(&ws, &audio);
-        let _ = enc.forward_blocks(&xs);
+        let _ = enc.forward_blocks(&xs, 400);
     }
     let warm_ms = t0.elapsed().as_secs_f64() * 1e3 / iters as f64;
     let (npu_s, ndisp) = prof();
