@@ -10,6 +10,7 @@ extern "C" {
 typedef struct ShimDevice ShimDevice;
 typedef struct ShimKernel ShimKernel;
 typedef struct ShimBo     ShimBo;
+typedef struct ShimRun    ShimRun;
 
 ShimDevice* shim_device_open(unsigned int index);
 void        shim_device_close(ShimDevice*);
@@ -36,6 +37,15 @@ int shim_run_matmul8(ShimKernel*, unsigned int opcode, ShimBo* instr, size_t ins
 /* depthwise-conv1d host ABI: kernel(opcode, instr, instr_count, X, W, Y) — no tmp/trace. */
 int shim_run_dwconv6(ShimKernel*, unsigned int opcode, ShimBo* instr, size_t instr_count,
                      ShimBo* x, ShimBo* w, ShimBo* y);
+
+/* ASYNC split of shim_run_matmul8: _start submits the run (xrt::kernel::operator() enqueues +
+ * starts execution) and returns a run handle WITHOUT waiting, so the host can do other work (prep
+ * the next dispatch, post-process the previous) while the NPU computes. _wait blocks for completion.
+ * Returns NULL/-1 on failure (message in shim_last_error). Free the handle with shim_run_free. */
+ShimRun* shim_run_matmul8_start(ShimKernel*, unsigned int opcode, ShimBo* instr, size_t instr_count,
+                                ShimBo* a, ShimBo* b, ShimBo* c, ShimBo* tmp, ShimBo* trace);
+int      shim_run_wait(ShimRun*); /* 0 = completed, -1 = error/not-completed */
+void     shim_run_free(ShimRun*);
 
 const char* shim_last_error(void);
 

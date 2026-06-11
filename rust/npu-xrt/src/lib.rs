@@ -22,6 +22,10 @@ struct CKernel {
 struct CBo {
     _private: [u8; 0],
 }
+#[repr(C)]
+struct CRun {
+    _private: [u8; 0],
+}
 
 extern "C" {
     fn shim_device_open(index: c_uint) -> *mut CDevice;
@@ -62,6 +66,20 @@ extern "C" {
         w: *mut CBo,
         y: *mut CBo,
     ) -> c_int;
+    #[allow(clippy::too_many_arguments)]
+    fn shim_run_matmul8_start(
+        k: *mut CKernel,
+        opcode: c_uint,
+        instr: *mut CBo,
+        count: usize,
+        a: *mut CBo,
+        b: *mut CBo,
+        c: *mut CBo,
+        tmp: *mut CBo,
+        trace: *mut CBo,
+    ) -> *mut CRun;
+    fn shim_run_wait(r: *mut CRun) -> c_int;
+    fn shim_run_free(r: *mut CRun);
     fn shim_last_error() -> *const c_char;
 }
 
@@ -95,6 +113,32 @@ pub struct Kernel {
 pub struct Bo {
     ptr: *mut CBo,
     nbytes: usize,
+}
+
+/// An in-flight (async) NPU dispatch. Created by [`Kernel::run_matmul8_start`], which submits the
+/// command and returns immediately (the NPU runs while the host does other work). Call [`Run::wait`]
+/// to block for completion. Dropping without waiting still frees the handle (XRT joins on destroy).
+pub struct Run {
+    ptr: *mut CRun,
+}
+
+impl Run {
+    /// Block until this dispatch completes. Consumes the handle (a run is waited at most once).
+    pub fn wait(self) -> Result<()> {
+        // SAFETY: ptr is a live handle from run_matmul8_start; Drop frees it after this.
+        let r = unsafe { shim_run_wait(self.ptr) };
+        if r != 0 {
+            Err(format!("run_wait: {}", last_error()))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Drop for Run {
+    fn drop(&mut self) {
+        unsafe { shim_run_free(self.ptr) }
+    }
 }
 
 impl Device {
@@ -182,6 +226,33 @@ impl Kernel {
             Err(format!("run_matmul8: {}", last_error()))
         } else {
             Ok(())
+        }
+    }
+
+    /// Async variant of [`run_matmul8`]: submit the dispatch and return immediately with a [`Run`]
+    /// handle (the NPU executes while the host continues). Call [`Run::wait`] before consuming `c`.
+    /// All BOs (and the kernel) must outlive the returned `Run`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_matmul8_start(
+        &self,
+        opcode: u32,
+        instr: &Bo,
+        count: usize,
+        a: &Bo,
+        b: &Bo,
+        c: &Bo,
+        tmp: &Bo,
+        trace: &Bo,
+    ) -> Result<Run> {
+        let ptr = unsafe {
+            shim_run_matmul8_start(
+                self.ptr, opcode, instr.ptr, count, a.ptr, b.ptr, c.ptr, tmp.ptr, trace.ptr,
+            )
+        };
+        if ptr.is_null() {
+            Err(format!("run_matmul8_start: {}", last_error()))
+        } else {
+            Ok(Run { ptr })
         }
     }
 

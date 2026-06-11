@@ -8,8 +8,8 @@ use std::rc::Rc;
 use ndarray::prelude::*;
 use npu_asr_host::prof;
 use npu_asr_host::{
-    bf16_round, dwconv_k5, glu, layer_norm, layer_norm_normalize, mha, residual_add_round, rope,
-    silu,
+    bf16_round, dwconv_k5, glu, glu_fused, layer_norm, layer_norm_normalize, mha,
+    residual_add_round, rope, silu,
 };
 use npu_xrt::Device;
 
@@ -146,6 +146,11 @@ pub struct FusedBlock {
     o: ProjOp,
     pw1: ProjOp,
     pw2: ProjOp,
+    /// pw1's bias [1536] (two_ctx: applied in `glu_fused`; non-two_ctx: unused, rides the WAEpilogue).
+    pw1_bias: Vec<f32>,
+    /// two_ctx Goal-2 toggle: fused bias+GLU+transpose (default) vs the original bias→transpose→glu.
+    /// Runtime-selected (`NPU_GLU_FUSED=0` disables) so the cut can be A/B'd cleanly in one binary.
+    glu_fused_on: bool,
     // host LayerNorm affines
     ln_satt_w: Vec<f32>,
     ln_satt_b: Vec<f32>,
@@ -212,7 +217,14 @@ impl FusedBlock {
         // pointwise convs: [out,in,1] -> [in,out] (squeeze k, transpose)
         let pw1w = w.m3("conv.pointwise_conv1.weight"); // [1536,768,1]
         let pw1_bt = squeeze_t(&pw1w); // [768,1536]
-        let pw1 = mk_bias(&pw1_bt, 1536, &w.v("conv.pointwise_conv1.bias"));
+        let pw1_bias = w.v("conv.pointwise_conv1.bias"); // [1536]
+        // two_ctx: pw1 emits the RAW matmul (Epi::None) and the bias folds into glu_fused (Goal-2
+        // host cut: one fused bias+GLU+transpose pass replaces the bias epilogue + the [T,1536]->
+        // [1536,T] transpose copy + the standalone glu). Fallback path keeps the biased pw1 + glu.
+        #[cfg(feature = "two_ctx")]
+        let pw1 = CtxAOp::new(ctx_a.clone(), &pw1_bt, 1536, Epi::None, &[]);
+        #[cfg(not(feature = "two_ctx"))]
+        let pw1 = mk_bias(&pw1_bt, 1536, &pw1_bias);
         let pw2w = w.m3("conv.pointwise_conv2.weight"); // [768,768,1]
         let pw2_bt = squeeze_t(&pw2w);
         let pw2 = mk_bias(&pw2_bt, 768, &w.v("conv.pointwise_conv2.bias"));
@@ -238,6 +250,8 @@ impl FusedBlock {
             o,
             pw1,
             pw2,
+            pw1_bias,
+            glu_fused_on: std::env::var("NPU_GLU_FUSED").as_deref() != Ok("0"),
             ln_satt_w: w.v("norm_self_att.weight"),
             ln_satt_b: w.v("norm_self_att.bias"),
             ln_conv_w: w.v("norm_conv.weight"),
@@ -284,7 +298,24 @@ impl FusedBlock {
         let ln = prof::time("layer_norm", || {
             layer_norm(&x, &self.ln_conv_w, &self.ln_conv_b, LN_EPS)
         });
-        let pw1 = self.pw1.forward(&ln); // [T,1536]
+        let pw1 = self.pw1.forward(&ln); // two_ctx: [T,1536] RAW; fallback: [T,1536] biased
+        #[cfg(feature = "two_ctx")]
+        let mut g = prof::time("glu", || {
+            if self.glu_fused_on {
+                glu_fused(&pw1, &self.pw1_bias) // [768,T] — bias+GLU+transpose in one pass
+            } else {
+                // original path (for A/B): apply bias, transpose, then glu — from the raw pw1.
+                let two_c = pw1.ncols();
+                let mut biased = pw1.clone();
+                biased.axis_iter_mut(Axis(0)).for_each(|mut row| {
+                    for j in 0..two_c {
+                        row[j] += self.pw1_bias[j];
+                    }
+                });
+                glu(&biased.t().to_owned()) // [768,T]
+            }
+        });
+        #[cfg(not(feature = "two_ctx"))]
         let mut g = prof::time("glu", || {
             let pw1t = pw1.t().to_owned(); // [1536,T]
             glu(&pw1t) // [768,T]

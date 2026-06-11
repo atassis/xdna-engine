@@ -14,6 +14,7 @@
 struct ShimDevice { xrt::device dev; };
 struct ShimKernel { xrt::hw_context ctx; xrt::kernel kern; };
 struct ShimBo     { xrt::bo bo; };
+struct ShimRun    { xrt::run run; };
 
 static thread_local std::string g_err;
 static void set_err(const char* s) { g_err = s ? s : "null"; }
@@ -100,3 +101,25 @@ int shim_run_dwconv6(ShimKernel* k, unsigned int opcode, ShimBo* instr, size_t i
     return 0;
   )
 }
+
+// xrt::kernel::operator() constructs a run AND starts it (enqueues the command); the wait is
+// separate. So building the run here = the async "start"; the host returns immediately while the
+// NPU executes. Same arg layout as shim_run_matmul8.
+ShimRun* shim_run_matmul8_start(ShimKernel* k, unsigned int opcode, ShimBo* instr, size_t instr_count,
+                                ShimBo* a, ShimBo* b, ShimBo* c, ShimBo* tmp, ShimBo* trace) {
+  GUARD_PTR(
+    auto run = k->kern(opcode, instr->bo, instr_count,
+                       a->bo, b->bo, c->bo, tmp->bo, trace->bo);
+    return new ShimRun{ std::move(run) };
+  )
+}
+
+int shim_run_wait(ShimRun* r) {
+  GUARD_INT(
+    ert_cmd_state st = r->run.wait();
+    if (st != ERT_CMD_STATE_COMPLETED) { set_err("kernel run did not complete"); return -1; }
+    return 0;
+  )
+}
+
+void shim_run_free(ShimRun* r) { delete r; }

@@ -300,6 +300,50 @@ pub fn glu(x: &Array2<f32>) -> Array2<f32> {
     out
 }
 
+/// Fused bias + GLU + transpose (Goal-2 host cut). `pw1` is the RAW pointwise-conv1 output `[T, 2C]`
+/// (row-major, NO bias epilogue applied on the NPU — the bias is folded in here) and `bias` is length
+/// `2C`. Returns `[C, T]` (channel-major, ready for the depthwise FIR) =
+/// `(pw1[:, :C] + bias[:C]) * sigmoid(pw1[:, C:] + bias[C:])`, transposed in the same pass.
+///
+/// Replaces THREE host passes — the pw1 bias-epilogue, the `pw1.t().to_owned()` full `[T,2C]->[2C,T]`
+/// transpose copy, and the standalone `glu()` — with ONE. Numerically exact (identical f32 math:
+/// add-bias then `a*sigmoid(g)`), so encoder rel/WER are unchanged. Coarse-band parallel over output
+/// channels (contiguous writes; the per-channel read strides by `2C`, traded against eliminating the
+/// transpose pass — A/B'd in verify_encoder's `glu` line).
+pub fn glu_fused(pw1: &Array2<f32>, bias: &[f32]) -> Array2<f32> {
+    use rayon::prelude::*;
+    let (t, two_c) = pw1.dim();
+    let c = two_c / 2;
+    debug_assert_eq!(bias.len(), two_c);
+    let xc = pw1.as_standard_layout();
+    let xs = xc.as_slice().unwrap(); // [T*2C] row-major
+    let mut out = Array2::<f32>::zeros((c, t));
+    let nthreads = rayon::current_num_threads().max(1);
+    let band = c.div_ceil(nthreads); // ~nthreads tasks
+    out.as_slice_mut()
+        .unwrap()
+        .par_chunks_mut(band * t)
+        .enumerate()
+        .for_each(|(bi, obuf)| {
+            let c0 = bi * band;
+            for (li, orow) in obuf.chunks_mut(t).enumerate() {
+                let ci = c0 + li;
+                if ci >= c {
+                    break;
+                }
+                let ba = bias[ci];
+                let bg = bias[ci + c];
+                for (ti, o) in orow.iter_mut().enumerate() {
+                    let base = ti * two_c;
+                    let a = xs[base + ci] + ba;
+                    let g = xs[base + ci + c] + bg;
+                    *o = a * sigmoid_scalar(g);
+                }
+            }
+        });
+    out
+}
+
 /// numerically-stable scalar sigmoid using `fast_exp_nonpos` on the non-positive branch.
 #[inline(always)]
 fn sigmoid_scalar(g: f32) -> f32 {

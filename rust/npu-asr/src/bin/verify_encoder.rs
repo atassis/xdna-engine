@@ -27,6 +27,21 @@ fn rel(got: &Array2<f32>, refr: &Array2<f32>) -> (f32, f32) {
     (maxd, maxd / (maxr + 1e-9))
 }
 
+/// Read a RAPL energy counter (µJ). None if the sysfs node is absent/unreadable.
+fn rapl_uj(path: &str) -> Option<u128> {
+    std::fs::read_to_string(path).ok()?.trim().parse::<u128>().ok()
+}
+const RAPL_PKG: &str = "/sys/class/powercap/intel-rapl:0/energy_uj"; // package-0 (includes the NPU, per tier0 F1)
+const RAPL_CORE: &str = "/sys/class/powercap/intel-rapl:0:0/energy_uj"; // CPU cores only
+/// µJ delta with single-wrap handling (counter wraps at max_energy_range_uj).
+fn uj_delta(before: u128, after: u128, max: u128) -> u128 {
+    if after >= before {
+        after - before
+    } else {
+        after + max - before
+    }
+}
+
 fn squeeze0(a: ArrayD<f32>) -> Array2<f32> {
     a.index_axis(Axis(0), 0)
         .to_owned()
@@ -82,12 +97,36 @@ fn main() {
     reset_prof();
     npu_asr::engines::marsh::reset();
     npu_asr_host::prof::reset();
+    let rapl_max = rapl_uj("/sys/class/powercap/intel-rapl:0/max_energy_range_uj");
+    let (e_pkg0, e_core0) = (rapl_uj(RAPL_PKG), rapl_uj(RAPL_CORE));
     let t0 = Instant::now();
     for _ in 0..iters {
         let xs = subsample(&ws, &audio);
         let _ = enc.forward_blocks(&xs, 400);
     }
-    let warm_ms = t0.elapsed().as_secs_f64() * 1e3 / iters as f64;
+    let elapsed = t0.elapsed();
+    let warm_ms = elapsed.as_secs_f64() * 1e3 / iters as f64;
+    // --- energy over the steady-state loop (RAPL package incl. NPU; core = CPU cores only) ---
+    if let (Some(p0), Some(p1), Some(max)) = (e_pkg0, rapl_uj(RAPL_PKG), rapl_max) {
+        let secs = elapsed.as_secs_f64();
+        let pkg_j = uj_delta(p0, p1, max) as f64 / 1e6;
+        let pkg_per = pkg_j / iters as f64 * 1e3; // mJ/inference
+        println!(
+            "  ENERGY: package {:.1} W avg | {:.1} mJ/inference  ({:.2} J over {iters} runs)",
+            pkg_j / secs,
+            pkg_per,
+            pkg_j
+        );
+        if let (Some(c0), Some(c1)) = (e_core0, rapl_uj(RAPL_CORE)) {
+            let core_j = uj_delta(c0, c1, max) as f64 / 1e6;
+            println!(
+                "          cores   {:.1} W avg | {:.1} mJ/inference   (non-core = NPU+uncore+mem: {:.1} mJ/inf)",
+                core_j / secs,
+                core_j / iters as f64 * 1e3,
+                (pkg_j - core_j) / iters as f64 * 1e3
+            );
+        }
+    }
     let (npu_s, ndisp) = prof();
     let npu_ms = npu_s * 1e3 / iters as f64;
     println!(

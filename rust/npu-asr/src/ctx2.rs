@@ -25,7 +25,7 @@ use std::rc::Rc;
 use std::time::Instant;
 
 use ndarray::prelude::*;
-use npu_xrt::{f32_to_bf16_bits, Bo, Device, Kernel, FLAG_CACHEABLE, FLAG_HOST_ONLY};
+use npu_xrt::{f32_to_bf16_bits, Bo, Device, Kernel, Run, FLAG_CACHEABLE, FLAG_HOST_ONLY};
 use rayon::prelude::*;
 
 use crate::engines::{marsh, prof_record, read_instr_words, u16_bytes, PAD_M, WA_SUBDIR};
@@ -114,6 +114,26 @@ pub struct SharedCtxA {
     // first dispatch writes the FULL activation BO (zeroing device padding rows mp..PAD_M); later
     // dispatches write only the mp prefix (the padding rows stay zero on device thereafter).
     a_inited: std::cell::Cell<bool>,
+    /// Goal-1 async overlap: double-buffer slots for pipelining the INDEPENDENT mm2 K-split partials
+    /// (each partial reads a different column-slice of H and a different weight → no data dep). Empty
+    /// unless `NPU_MM2_PIPELINE=1`. Two slots = a 2-deep pipeline (one dispatch in flight on the NPU
+    /// while the host preps the next / post-processes the previous). See [`FfnMm2::forward`].
+    pipeline: bool,
+    pipe: Vec<PipeSlot>,
+}
+
+/// One double-buffer slot for the async mm2 pipeline: its own activation/output BOs (so a dispatch
+/// in flight on the NPU isn't clobbered by the host prepping the next on the other slot) + own
+/// tmp/trace (avoid sharing kernel scratch across concurrent runs) + own host scratch.
+struct PipeSlot {
+    bo_a: Bo,
+    bo_c: Bo,
+    bo_tmp: Bo,
+    bo_tr: Bo,
+    cbuf: RefCell<Vec<f32>>,
+    a_buf: RefCell<Vec<u16>>,   // bf16 scratch (empty for int8)
+    a_buf_i8: RefCell<Vec<i8>>, // int8 scratch (empty for bf16)
+    a_inited: std::cell::Cell<bool>,
 }
 
 /// The per-shape output widths the resident 768x3072 kernel serves via instruction streams.
@@ -160,6 +180,27 @@ impl SharedCtxA {
         let bo_tmp = dev.alloc_bo(&kern, 1, FLAG_HOST_ONLY, g_tmp).unwrap();
         let bo_tr = dev.alloc_bo(&kern, 4, FLAG_HOST_ONLY, g_tr).unwrap();
 
+        // Goal-1 async overlap: 2-slot double-buffer for the mm2 pipeline. DEFAULT-ON (measured s10:
+        // ~29ms/8% off the bf16 default, ~15-17ms native/int8, numerically byte-identical — same
+        // kernel + same host f32 accumulation order). Opt out with `NPU_MM2_PIPELINE=0`.
+        let pipeline = std::env::var("NPU_MM2_PIPELINE").as_deref() != Ok("0");
+        let mut pipe = Vec::new();
+        if pipeline {
+            eprintln!("[ctx2] async mm2 pipeline ENABLED (default; set NPU_MM2_PIPELINE=0 to disable)");
+            for _ in 0..2 {
+                pipe.push(PipeSlot {
+                    bo_a: dev.alloc_bo(&kern, PAD_M * KA * prec.in_bytes(), FLAG_HOST_ONLY, g_a).unwrap(),
+                    bo_c: dev.alloc_bo(&kern, PAD_M * NA * 4, FLAG_HOST_ONLY, g_c).unwrap(),
+                    bo_tmp: dev.alloc_bo(&kern, 1, FLAG_HOST_ONLY, g_tmp).unwrap(),
+                    bo_tr: dev.alloc_bo(&kern, 4, FLAG_HOST_ONLY, g_tr).unwrap(),
+                    cbuf: RefCell::new(vec![0f32; PAD_M * NA]),
+                    a_buf: RefCell::new(if prec.is_int8() { Vec::new() } else { vec![0u16; PAD_M * KA] }),
+                    a_buf_i8: RefCell::new(if prec.is_int8() { vec![0i8; PAD_M * KA] } else { Vec::new() }),
+                    a_inited: std::cell::Cell::new(false),
+                });
+            }
+        }
+
         Rc::new(SharedCtxA {
             dev: dev.clone(),
             kern,
@@ -174,7 +215,93 @@ impl SharedCtxA {
             a_buf_i8: RefCell::new(if prec.is_int8() { vec![0i8; PAD_M * KA] } else { Vec::new() }),
             cbuf: RefCell::new(vec![0f32; PAD_M * NA]),
             a_inited: std::cell::Cell::new(false),
+            pipeline,
+            pipe,
         })
+    }
+
+    /// Async overlap, the prep half: convert+write+sync slot `s`'s activation from the strided view
+    /// `a_real` `[mp, KA]`, then SUBMIT the dispatch (N=`n`, weight `bo_b`) WITHOUT waiting — the NPU
+    /// runs while the caller does other host work. Returns the in-flight [`Run`] + (int8) the dynamic
+    /// activation scale to dequant with in [`pipe_read`]. bf16 and int8 both supported.
+    fn pipe_start(&self, s: usize, a_real: ArrayView2<f32>, bo_b: &Bo, n: usize) -> (Run, f32) {
+        let (mp, kk) = a_real.dim();
+        debug_assert_eq!(kk, KA);
+        let slot = &self.pipe[s];
+        let tc = Instant::now();
+        let scale_a = if self.prec.is_int8() {
+            let amax = a_real.iter().fold(0f32, |m, &v| m.max(v.abs()));
+            let scale_a = if amax > 0.0 { amax / 127.0 } else { 1.0 };
+            let mut a = slot.a_buf_i8.borrow_mut();
+            a.par_chunks_mut(KA).take(mp).enumerate().for_each(|(r, row)| {
+                for c in 0..KA {
+                    row[c] = quant_i8(a_real[[r, c]], scale_a);
+                }
+            });
+            if slot.a_inited.get() {
+                slot.bo_a.write_bytes(&i8_bytes(&a)[..mp * KA]).unwrap();
+            } else {
+                slot.bo_a.write_bytes(i8_bytes(&a)).unwrap();
+                slot.a_inited.set(true);
+            }
+            scale_a
+        } else {
+            let mut a = slot.a_buf.borrow_mut();
+            a.par_chunks_mut(KA).take(mp).enumerate().for_each(|(r, row)| {
+                for c in 0..KA {
+                    row[c] = f32_to_bf16_bits(a_real[[r, c]]);
+                }
+            });
+            if slot.a_inited.get() {
+                slot.bo_a.write_bytes(&u16_bytes(&a)[..mp * KA * 2]).unwrap();
+            } else {
+                slot.bo_a.write_bytes(u16_bytes(&a)).unwrap();
+                slot.a_inited.set(true);
+            }
+            1.0
+        };
+        marsh::add(marsh::CONV, tc.elapsed());
+        let ts = Instant::now();
+        slot.bo_a.sync_to_device().unwrap();
+        marsh::add(marsh::SYNC_TO, ts.elapsed());
+
+        let (instr, n_instr) = self.stream(n);
+        let run = self
+            .kern
+            .run_matmul8_start(3, instr, n_instr, &slot.bo_a, bo_b, &slot.bo_c, &slot.bo_tmp, &slot.bo_tr)
+            .unwrap();
+        (run, scale_a)
+    }
+
+    /// Async overlap, the post half: read slot `s`'s output `[mp, n]` (the dispatch must already be
+    /// waited) and apply the mm2 epilogue (Epi::None → raw, or int8 dequant by `scale_a * w_scale`).
+    /// Returns an owned `[mp, n]` f32 to be host-accumulated.
+    fn pipe_read(&self, s: usize, mp: usize, n: usize, scale_a: f32, w_scale: &[f32]) -> Array2<f32> {
+        let slot = &self.pipe[s];
+        let tf = Instant::now();
+        slot.bo_c.sync_from_device().unwrap();
+        marsh::add(marsh::SYNC_FROM, tf.elapsed());
+        let tr = Instant::now();
+        {
+            let mut cf = slot.cbuf.borrow_mut();
+            let dst = unsafe { std::slice::from_raw_parts_mut(cf.as_mut_ptr() as *mut u8, mp * n * 4) };
+            slot.bo_c.read_bytes(dst).unwrap();
+        }
+        marsh::add(marsh::READ, tr.elapsed());
+        let te = Instant::now();
+        let cf = slot.cbuf.borrow();
+        let data: Vec<f32> = if self.prec.is_int8() {
+            let acc: &[i32] = unsafe { std::slice::from_raw_parts(cf.as_ptr() as *const i32, mp * n) };
+            (0..mp * n)
+                .into_par_iter()
+                .map(|i| acc[i] as f32 * scale_a * w_scale[i % n])
+                .collect()
+        } else {
+            cf[..mp * n].to_vec()
+        };
+        let out = Array2::from_shape_vec((mp, n), data).unwrap();
+        marsh::add(marsh::EPI, te.elapsed());
+        out
     }
 
     /// (instr BO, n_instr) for the per-shape stream that produces N=`n` output on the resident kernel.
@@ -451,6 +578,9 @@ impl FfnMm2 {
     pub fn forward(&self, h: &Array2<f32>) -> Array2<f32> {
         let (mp, kk) = h.dim();
         assert_eq!(kk, NA);
+        if self.parts[0].shared.pipeline {
+            return self.forward_pipelined(h, mp);
+        }
         let mut acc = Array2::<f32>::zeros((mp, MM2_OUT));
         for (i, op) in self.parts.iter().enumerate() {
             // strided column-slice view of H -> converted directly into the kernel's bf16 buffer
@@ -458,13 +588,55 @@ impl FfnMm2 {
             let hk = h.slice(s![.., i * KA..(i + 1) * KA]); // [mp, KA] view
             acc += &op.forward_view(hk);
         }
+        self.add_bias2(&mut acc);
+        acc
+    }
+
+    /// Goal-1 async overlap: the 4 K-split partials are mutually INDEPENDENT (different H column-slice
+    /// + different weight), so run them as a 2-deep start/wait pipeline. At each step we SUBMIT the
+    /// next partial (its host prep — quant/convert + sync — overlaps the previous partial's NPU
+    /// compute) and then read+accumulate the previous partial (its host post — readback + dequant —
+    /// overlaps the just-submitted partial's NPU compute). Two double-buffer slots keep one dispatch
+    /// in flight without the host clobbering its activation/output BOs. Numerically identical to the
+    /// sequential path (same kernel, same host f32 accumulate); only the scheduling differs.
+    fn forward_pipelined(&self, h: &Array2<f32>, mp: usize) -> Array2<f32> {
+        let shared = &self.parts[0].shared;
+        let n = MM2_OUT;
+        let np = self.parts.len();
+        let mut acc = Array2::<f32>::zeros((mp, MM2_OUT));
+
+        let h0 = h.slice(s![.., 0..KA]);
+        let (mut prev_run, mut prev_scale) = shared.pipe_start(0, h0, &self.parts[0].bo_b, n);
+        let (mut prev_slot, mut prev_i) = (0usize, 0usize);
+
+        for i in 1..np {
+            let slot = i % 2;
+            let hi = h.slice(s![.., i * KA..(i + 1) * KA]);
+            let (cur_run, cur_scale) = shared.pipe_start(slot, hi, &self.parts[i].bo_b, n);
+            // P(i-1) is on a different slot than the just-submitted Pi → safe to finish it now; its
+            // host post-processing overlaps Pi's NPU compute.
+            prev_run.wait().unwrap();
+            acc += &shared.pipe_read(prev_slot, mp, n, prev_scale, &self.parts[prev_i].w_scale);
+            prev_run = cur_run;
+            prev_scale = cur_scale;
+            prev_slot = slot;
+            prev_i = i;
+        }
+        prev_run.wait().unwrap();
+        acc += &shared.pipe_read(prev_slot, mp, n, prev_scale, &self.parts[prev_i].w_scale);
+
+        self.add_bias2(&mut acc);
+        acc
+    }
+
+    #[inline]
+    fn add_bias2(&self, acc: &mut Array2<f32>) {
         let b2 = &self.bias2;
         acc.axis_iter_mut(Axis(0)).for_each(|mut row| {
             for c in 0..MM2_OUT {
                 row[c] += b2[c];
             }
         });
-        acc
     }
 }
 
