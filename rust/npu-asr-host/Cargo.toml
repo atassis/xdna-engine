@@ -8,6 +8,10 @@ description = "Pure host-side (CPU) tensor math for the GigaAM-v3 encoder — no
 name = "npu_asr_host"
 path = "src/lib.rs"
 
+[[bin]]
+name = "host_bench"
+path = "src/bin/host_bench.rs"
+
 [dependencies]
 ndarray = "0.16"
 rayon = "1"

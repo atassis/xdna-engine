@@ -1,0 +1,78 @@
+##===- Makefile.wa_gemm2 — whole_array GEMM->GEMM fusion SLICE -----------===##
+#
+# Builds the whole_array-idiom on-chip GEMM->GEMM:  C = (A @ W1) @ W2  with the
+# intermediate H = A@W1 kept ON-CHIP (mm1 -> col MemTile -> mm2, ONE dispatch).
+#
+#   n_cols=1 : the single-column chain. BUILDS to xclbin (DMA-channel-legal:
+#              mm2 reads 1 H + 1 W2 = 2 input channels).
+#   n_cols>=2: the multi-column ALL-TO-ALL H exchange a real FFN needs. FAILS at
+#              aiecc placement -- mm2 would need n_cols H-slab inputs + 1 W2 =
+#              n_cols+1 INPUT DMA channels, but an AIE2 compute tile has only 2:
+#                "tile (0,3) requires 3 input/1 output DMA channels,
+#                 but only 2 input/2 output available"
+#              This target is kept so the wall is reproducible, not hidden.
+#
+# Usage:
+#   source scripts/iron_env.sh
+#   make -f Makefile.wa_gemm2 onecol      # builds the n_cols=1 xclbin (PASS)
+#   make -f Makefile.wa_gemm2 twocol      # reproduces the channel-wall FAIL
+#   make -f Makefile.wa_gemm2 kernels     # just the .o objects
+##===---------------------------------------------------------------------===##
+
+REPO   := $(shell git -C $(dir $(realpath $(firstword $(MAKEFILE_LIST)))) rev-parse --show-toplevel)
+WA     := $(REPO)/mlir-aie/programming_examples/basic/matrix_multiplication/whole_array
+BUILD  := $(WA)/build_gemm2
+IRON   := $(WA)/wa_gemm2_iron.py
+KDIR   := $(REPO)/mlir-aie/aie_kernels/aie2p
+EPISRC := $(REPO)/route_b_kernels/aie_kernels/mm_silu_epilogue.cc
+INC    := $(shell python3 -c "from aie.utils.config import root_path; print(root_path())")/include
+
+# tile geometry (slice = 32x32x32)
+m ?= 32
+k ?= 32
+p ?= 32
+n ?= 32
+
+CXX     := $(PEANO_INSTALL_DIR)/bin/clang++
+CXXFLAGS := -O2 -std=c++20 --target=aie2p-none-unknown-elf \
+  -Wno-parentheses -Wno-attributes -Wno-macro-redefined -Wno-empty-body \
+  -Wno-missing-template-arg-list-after-template-kw -DNDEBUG -I $(INC)
+
+AIECC := aiecc --alloc-scheme=basic-sequential --aie-generate-xclbin \
+  --no-compile-host --no-xchesscc --no-xbridge --peano $(PEANO_INSTALL_DIR) \
+  --aie-generate-npu-insts
+
+.PHONY: all onecol twocol kernels clean
+all: onecol
+
+# --- kernel objects (mm.cc built WITHOUT *_ONLY => exports both bf16_bf16 and
+#     bf16_f32; the epilogue's "#include ../aie_kernel_utils.h" needs the mlir-aie
+#     kernels tree, so we compile it from a temp copy placed there). ---
+kernels: $(BUILD)/mm_$(m)x$(k)x$(n).o $(BUILD)/mm_silu_epilogue_$(m)x$(k)x$(n).o
+
+$(BUILD)/mm_$(m)x$(k)x$(n).o: $(KDIR)/mm.cc
+	@mkdir -p $(BUILD)
+	$(CXX) $(CXXFLAGS) -DDIM_M=$(m) -DDIM_K=$(k) -DDIM_N=$(n) -c $< -o $@
+
+$(BUILD)/mm_silu_epilogue_$(m)x$(k)x$(n).o: $(EPISRC)
+	@mkdir -p $(BUILD)
+	cp $(EPISRC) $(KDIR)/mm_silu_epilogue.cc
+	$(CXX) $(CXXFLAGS) -DEPI_M=$(m) -DEPI_N=$(n) -c $(KDIR)/mm_silu_epilogue.cc -o $@ ; \
+	  rc=$$? ; rm -f $(KDIR)/mm_silu_epilogue.cc ; exit $$rc
+
+onecol: kernels
+	cd $(BUILD) && python3 $(IRON) --n-cols 1 -M 32 -K 32 -P 32 -N 32 \
+	  -m $(m) -k $(k) -p $(p) -n $(n) > aie_wa_gemm2_1col.mlir
+	cd $(BUILD) && $(AIECC) --xclbin-name=final_wa_gemm2_1col.xclbin \
+	  --npu-insts-name=insts_wa_gemm2_1col.txt aie_wa_gemm2_1col.mlir
+	@echo "[onecol] -> $(BUILD)/final_wa_gemm2_1col.xclbin"
+
+twocol: kernels
+	cd $(BUILD) && python3 $(IRON) --n-cols 2 -M 32 -K 32 -P 64 -N 64 \
+	  -m $(m) -k $(k) -p $(p) -n $(n) > aie_wa_gemm2_2col.mlir
+	@echo "[twocol] expect aiecc to FAIL at the 2-input-DMA-channel limit:"
+	cd $(BUILD) && $(AIECC) --xclbin-name=final_wa_gemm2_2col.xclbin \
+	  --npu-insts-name=insts_wa_gemm2_2col.txt aie_wa_gemm2_2col.mlir
+
+clean:
+	rm -rf $(BUILD)

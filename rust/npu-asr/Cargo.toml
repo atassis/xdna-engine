@@ -8,6 +8,22 @@ description = "GigaAM-v3 encoder on the XDNA2 NPU, driven from Rust (Rung 6)"
 name = "npu_asr"
 path = "src/lib.rs"
 
+[features]
+# `two_ctx` (DEFAULT — the V2 switch-free encoder): run the WHOLE encoder on ONE resident
+# `512x768x3072` whole-array xclbin. All 7 K=768 ops dispatch via per-shape instruction streams
+# (N=768/1536/3072), swapping only the instruction BO (no hw-context switch); the FFN mm2 (K=3072) is
+# K-split into 4x N=768 partials on the SAME kernel, host-accumulated. ZERO context switches across the
+# encoder. Supersedes `chained_ffn` (mm1 lands on ctxA, SiLU on host, so device-BO H-chaining no longer
+# applies). Verified rel 1.8e-2 vs ONNX; warm ~558ms (beats CPU 563ms). Needs the resident xclbin +
+# the 3 N-streams (built by scripts/build_kernels.sh, whole_array 768x{768,1536,3072}).
+#   A/B fallbacks:  --no-default-features --features chained_ffn  (pre-V2 chained two-WAEpilogue path)
+#                   --no-default-features                         (bare two-WAEpilogue path)
+default = ["two_ctx"]
+two_ctx = []
+# `chained_ffn` (pre-V2 default): keep the FFN intermediate H in a device BO across mm1->mm2 (no host
+# round-trip). A no-op when `two_ctx` is on (which routes mm1/mm2 differently).
+chained_ffn = []
+
 [dependencies]
 npu-xrt = { path = "../npu-xrt" }
 npu-asr-host = { path = "../npu-asr-host" }

@@ -34,8 +34,24 @@ pub struct Encoder {
 
 impl Encoder {
     pub fn new(dev: Rc<Device>, root: &Path, ws: &WeightStore, n_blocks: usize) -> Self {
+        // With `two_ctx`, build the ONE shared hw-context (resident ctxA xclbin) ONCE for the whole
+        // encoder and hand every block a clone of the `Rc` -> ALL matmul ops (the 7 K=768 ops AND
+        // the FFN mm2, K-split into 4× N=768) dispatch on the same resident kernel: zero context
+        // switches across the whole encoder.
+        #[cfg(feature = "two_ctx")]
+        let ctx_a = crate::ctx2::SharedCtxA::new(&dev, root);
         let blocks = (0..n_blocks)
-            .map(|i| FusedBlock::new(dev.clone(), root, ws.block(i), &ws.cos, &ws.sin))
+            .map(|i| {
+                FusedBlock::new(
+                    dev.clone(),
+                    root,
+                    ws.block(i),
+                    &ws.cos,
+                    &ws.sin,
+                    #[cfg(feature = "two_ctx")]
+                    ctx_a.clone(),
+                )
+            })
             .collect();
         Encoder { blocks }
     }

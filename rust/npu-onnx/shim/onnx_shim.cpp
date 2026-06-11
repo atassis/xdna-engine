@@ -37,6 +37,8 @@ void sort_env_free(ShimOrtEnv* e) {
 ShimOrtSession* sort_session_create(ShimOrtEnv* env, const char* model_path) {
     OrtSessionOptions* opt = nullptr;
     if (!ok(ort()->CreateSessionOptions(&opt))) return nullptr;
+    // tiny models — a 1-thread intra-op pool avoids contending with the encoder's rayon glue
+    ort()->SetIntraOpNumThreads(opt, 1);
     OrtSession* s = nullptr;
     bool good = ok(ort()->CreateSession(env->env, model_path, opt, &s));
     ort()->ReleaseSessionOptions(opt);

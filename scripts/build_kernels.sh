@@ -32,8 +32,32 @@ rm -f $MM/build/mm_*.o $MMW/build/mm_*.o
 for KN in 768x768 3072x768 768x1536; do K=${KN%x*}; N=${KN#*x}
   make -C $MM NPU2=1 M=512 K=$K N=$N dtype_in=bf16 dtype_out=f32           # single_core (1 col)
 done
+# --- V2 encoder whole_array kernels (default = FAST BFP16_IREE, tile 64x32x96) ---
+# The shipped V2 encoder (two_ctx) runs the WHOLE encoder on ONE resident 768x3072 xclbin via per-N
+# instruction streams (768/1536/3072). The fast kernel/dataflow-2x BFP16_IREE microkernel gives ~2x
+# (n=96 chosen so the resident-stream reuse holds across all served widths). Needs the mlir-aie patch
+# applied (setup_route_b.sh does this: BFP16_IREE microkernel + bfp16_iree flag + WA_C_DEPTH).
+rm -f $MMW/build/mm_64x32x96.o
+for N in 3072 1536 768; do
+  rm -f $MMW/build/aie_512x768x${N}_64x32x96_8c.mlir
+  WA_C_DEPTH=1 make -C $MMW NPU2=1 M=512 K=768 N=$N m=64 k=32 n=96 \
+     dtype_in=bf16 dtype_out=f32 n_aie_cols=8 use_iron=1 \
+     emulate_bfloat16_mmul_with_bfp16=1 bfp16_iree=1 \
+     build/final_512x768x${N}_64x32x96_8c.xclbin
+done
+# native bf16 32x32x32 (precise, rel<0.08) — selectable via NPU_PRECISION=native.
+rm -f $MMW/build/mm_32x32x32.o
 for KN in 768x768 3072x768 768x1536 768x3072; do K=${KN%x*}; N=${KN#*x}
   make -C $MMW NPU2=1 M=512 K=$K N=$N dtype_in=bf16 dtype_out=f32 n_aie_cols=8 use_iron=1  # whole_array (8 col)
+done
+# int8 64x64x96 (integer-exact kernel, ~3.6x, half weight bytes) — selectable via NPU_PRECISION=int8
+# (RU GigaAM WER-validated: G4 = 9.2%, == precise). Native 8x8x8 path: NO bfp16 flags.
+rm -f $MMW/build/mm_64x64x96.o
+for N in 3072 1536 768; do
+  rm -f $MMW/build/aie_512x768x${N}_64x64x96_8c.mlir
+  WA_C_DEPTH=1 make -C $MMW NPU2=1 M=512 K=768 N=$N m=64 k=64 n=96 \
+     dtype_in=i8 dtype_out=i32 n_aie_cols=8 use_iron=1 \
+     build/final_512x768x${N}_64x64x96_8c.xclbin
 done
 
 echo "== FUSION xclbins (docs/10): whole_array matmul+epilogue + softmax-400 =="

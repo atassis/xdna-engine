@@ -5,6 +5,8 @@
 
 use ndarray::prelude::*;
 
+pub mod prof;
+
 /// bf16 round-to-nearest-even of an f32 (truncate-with-round of the mantissa). Matches numpy
 /// ml_dtypes.bfloat16.
 pub fn bf16_round(x: f32) -> f32 {
@@ -16,36 +18,121 @@ pub fn bf16_round(x: f32) -> f32 {
     f32::from_bits((bits.wrapping_add(bias)) & 0xffff_0000)
 }
 
+/// Branch-free bf16 round-to-nearest-even for KNOWN-FINITE inputs (no NaN/Inf path). Identical
+/// bit-pattern to `bf16_round` for all finite x; used on the softmax probabilities (always finite,
+/// in [0,1]) so the rounding pass auto-vectorizes. Do NOT use where x may be NaN/Inf.
+#[inline(always)]
+fn bf16_round_finite(x: f32) -> f32 {
+    let bits = x.to_bits();
+    let bias = 0x0000_7fff + ((bits >> 16) & 1);
+    f32::from_bits((bits.wrapping_add(bias)) & 0xffff_0000)
+}
+
+/// Fast scalar exp for x <= 0 (the softmax operand is always `score - rowmax <= 0`).
+/// Uses 2^y decomposition: e^x = 2^(x*log2e); split into integer part (bit-shift into the f32
+/// exponent) and a degree-5 minimax polynomial on the [0,1) fractional part. Max relative error
+/// ~1e-7 over the negative reals — far below the bf16 softmax-prob rounding noise that follows it.
+/// (Branch-free, auto-vectorizable; ~5-8x faster than libm `expf` here.)
+#[doc(hidden)]
+#[inline(always)]
+pub fn fast_exp_nonpos(x: f32) -> f32 {
+    // clamp very negative inputs to 0 (e^-100 underflows anyway) to keep the exponent in range
+    let x = if x < -87.0 { -87.0 } else { x };
+    const LOG2E: f32 = 1.442695040888963;
+    let y = x * LOG2E; // e^x = 2^y, y <= 0
+    let yf = y.floor(); // integer part (<= 0)
+    let f = y - yf; // fractional part in [0,1)
+    // 2^f minimax poly (Horner), accurate to ~1e-7 on [0,1)
+    let p = 1.0
+        + f * (0.6931471805599453
+            + f * (0.2402265069591007
+                + f * (0.05550410866482158
+                    + f * (0.009618129107628477 + f * 0.0013333558146428443))));
+    // 2^yf via exponent bits: bias 127, yf is an exact small negative integer
+    let e = (yf as i32 + 127) as u32;
+    let scale = f32::from_bits(e << 23);
+    p * scale
+}
+
+/// Fused residual add + bf16 round in one parallel sweep: out = bf16_round(x + scale*y).
+/// Replaces `(&x + &y.mapv(|v| s*v)).mapv(bf16_round)` (3 allocs/passes) with one alloc + one
+/// vectorized pass. x,y are [T,D] same shape; result is a fresh array (x is not mutated).
+pub fn residual_add_round(x: &Array2<f32>, y: &Array2<f32>, scale: f32) -> Array2<f32> {
+    use rayon::prelude::*;
+    let (t, d) = x.dim();
+    debug_assert_eq!(x.dim(), y.dim());
+    let xc = x.as_standard_layout();
+    let yc = y.as_standard_layout();
+    let xs = xc.as_slice().unwrap();
+    let ys = yc.as_slice().unwrap();
+    let data: Vec<f32> = (xs, ys)
+        .into_par_iter()
+        .map(|(&xv, &yv)| bf16_round(xv + scale * yv))
+        .collect();
+    Array2::from_shape_vec((t, d), data).unwrap()
+}
+
 /// LayerNorm over the LAST axis with affine. x is [T, D]. gamma,beta len D.
 /// var is POPULATION variance (ddof=0).
 pub fn layer_norm(x: &Array2<f32>, gamma: &[f32], beta: &[f32], eps: f32) -> Array2<f32> {
+    use rayon::prelude::*;
     let (t, d) = x.dim();
+    let xc = x.as_standard_layout();
+    let xs = xc.as_slice().unwrap();
     let mut out = Array2::<f32>::zeros((t, d));
-    for i in 0..t {
-        let row = x.row(i);
-        let mean = row.sum() / d as f32;
-        let var = row.iter().map(|&v| (v - mean) * (v - mean)).sum::<f32>() / d as f32;
-        let inv = 1.0 / (var + eps).sqrt();
-        for j in 0..d {
-            out[[i, j]] = (row[j] - mean) * inv * gamma[j] + beta[j];
-        }
-    }
+    // rows are independent -> parallelize over them (was fully serial over T=400 rows).
+    out.as_slice_mut()
+        .unwrap()
+        .par_chunks_mut(d)
+        .enumerate()
+        .for_each(|(i, orow)| {
+            let row = &xs[i * d..i * d + d];
+            let mut sum = 0f32;
+            for &v in row {
+                sum += v;
+            }
+            let mean = sum / d as f32;
+            let mut vs = 0f32;
+            for &v in row {
+                let c = v - mean;
+                vs += c * c;
+            }
+            let inv = 1.0 / (vs / d as f32 + eps).sqrt();
+            for j in 0..d {
+                orow[j] = (row[j] - mean) * inv * gamma[j] + beta[j];
+            }
+        });
     out
 }
 
 /// LayerNorm NORMALIZE-ONLY over the last axis (no affine). [T,D] -> [T,D].
 pub fn layer_norm_normalize(x: &Array2<f32>, eps: f32) -> Array2<f32> {
+    use rayon::prelude::*;
     let (t, d) = x.dim();
+    let xc = x.as_standard_layout();
+    let xs = xc.as_slice().unwrap();
     let mut out = Array2::<f32>::zeros((t, d));
-    for i in 0..t {
-        let row = x.row(i);
-        let mean = row.sum() / d as f32;
-        let var = row.iter().map(|&v| (v - mean) * (v - mean)).sum::<f32>() / d as f32;
-        let inv = 1.0 / (var + eps).sqrt();
-        for j in 0..d {
-            out[[i, j]] = (row[j] - mean) * inv;
-        }
-    }
+    out.as_slice_mut()
+        .unwrap()
+        .par_chunks_mut(d)
+        .enumerate()
+        .for_each(|(i, orow)| {
+            let row = &xs[i * d..i * d + d];
+            let mut sum = 0f32;
+            for &v in row {
+                sum += v;
+            }
+            let mean = sum / d as f32;
+            let mut vs = 0f32;
+            for &v in row {
+                let c = v - mean;
+                vs += c * c;
+            }
+            let inv = 1.0 / (vs / d as f32 + eps).sqrt();
+            for j in 0..d {
+                orow[j] = (row[j] - mean) * inv;
+            }
+        });
     out
 }
 
@@ -57,23 +144,38 @@ pub fn rope(
     n_heads: usize,
     head_dim: usize,
 ) -> Array2<f32> {
+    use rayon::prelude::*;
     let (t, d) = ln.dim();
     let half = head_dim / 2;
+    let lnc = ln.as_standard_layout();
+    let cosc = cos.as_standard_layout();
+    let sinc = sin.as_standard_layout();
+    let lns = lnc.as_slice().unwrap();
+    let coss = cosc.as_slice().unwrap();
+    let sins = sinc.as_slice().unwrap();
     let mut out = Array2::<f32>::zeros((t, d));
-    for ti in 0..t {
-        for h in 0..n_heads {
-            let base = h * head_dim;
-            for d_ in 0..head_dim {
-                let xr = ln[[ti, base + d_]];
-                let rot = if d_ < half {
-                    -ln[[ti, base + d_ + half]]
-                } else {
-                    ln[[ti, base + d_ - half]]
-                };
-                out[[ti, base + d_]] = xr * cos[[ti, d_]] + rot * sin[[ti, d_]];
+    // independent per time-row; slice-based inner loop avoids per-element index/bounds overhead.
+    out.as_slice_mut()
+        .unwrap()
+        .par_chunks_mut(d)
+        .enumerate()
+        .for_each(|(ti, orow)| {
+            let irow = &lns[ti * d..ti * d + d];
+            let crow = &coss[ti * head_dim..ti * head_dim + head_dim];
+            let srow = &sins[ti * head_dim..ti * head_dim + head_dim];
+            for h in 0..n_heads {
+                let base = h * head_dim;
+                for d_ in 0..head_dim {
+                    let xr = irow[base + d_];
+                    let rot = if d_ < half {
+                        -irow[base + d_ + half]
+                    } else {
+                        irow[base + d_ - half]
+                    };
+                    orow[base + d_] = xr * crow[d_] + rot * srow[d_];
+                }
             }
-        }
-    }
+        });
     out
 }
 
@@ -93,70 +195,120 @@ pub fn mha(
     let (t, d) = q.dim();
     let vl = valid_len.min(t);
     let scale = 1.0 / (head_dim as f32).sqrt();
-    // Each head is independent — compute per-head context [T,HD] in parallel across cores.
-    let ctxs: Vec<Array2<f32>> = (0..n_heads)
-        .into_par_iter()
-        .map(|h| {
+
+    // Parallelism granularity: with only `n_heads` (16) work items on a 20-core pool, 4 cores sit
+    // idle and a 400x400 head softmax doesn't fit in L2. Instead tile each head over query-row
+    // blocks -> n_heads * n_tiles items so rayon balances across all cores and each item's working
+    // set is smaller. Each (head, row-tile) computes its scores tile, softmaxes it, multiplies by
+    // V, and writes its context tile straight into the shared output (disjoint row x col regions).
+    const ROW_TILE: usize = 64;
+    let n_tiles = t.div_ceil(ROW_TILE);
+
+    let mut out = Array2::<f32>::zeros((t, d));
+    {
+        let out_ptr = out.as_mut_ptr() as usize; // base of the [t,d] row-major buffer (Send)
+        (0..n_heads * n_tiles).into_par_iter().for_each(|item| {
+            let h = item / n_tiles;
+            let tile = item % n_tiles;
+            let r0 = tile * ROW_TILE;
+            let r1 = (r0 + ROW_TILE).min(t);
             let base = h * head_dim;
-            let qh = q.slice(s![.., base..base + head_dim]); // [T, HD]
-            let kh = k.slice(s![.., base..base + head_dim]);
-            let vh = v.slice(s![.., base..base + head_dim]);
-            // scores = (qh @ kh^T) * scale  -> [T, T]  (matrixmultiply, not scalar loops)
+            let qh = q.slice(s![r0..r1, base..base + head_dim]); // [tile, HD]
+            let kh = k.slice(s![.., base..base + head_dim]); // [T, HD]
+            let vh = v.slice(s![.., base..base + head_dim]); // [T, HD]
+            // scores tile = qh @ kh^T  -> [tile, T] (matrixmultiply). scale folded into softmax.
             let mut sc = qh.dot(&kh.t());
-            sc.mapv_inplace(|x| x * scale);
-            // mask padded key columns (j >= vl) so they drop out of the softmax
-            if vl < t {
-                for mut row in sc.rows_mut() {
-                    for j in vl..t {
-                        row[j] = f32::NEG_INFINITY;
-                    }
-                }
-            }
-            // row-wise softmax (max-stable), optionally bf16-rounding the probabilities
             for mut row in sc.rows_mut() {
+                let r = row.as_slice_mut().unwrap();
+                // row-max over valid key columns only (scale>0 keeps argmax)
                 let mut maxv = f32::NEG_INFINITY;
-                for &x in row.iter() {
+                for &x in &r[..vl] {
                     if x > maxv {
                         maxv = x;
                     }
                 }
+                let off = maxv * scale;
                 let mut sum = 0f32;
-                for x in row.iter_mut() {
-                    *x = (*x - maxv).exp();
-                    sum += *x;
+                for x in r[..vl].iter_mut() {
+                    let e = fast_exp_nonpos(*x * scale - off);
+                    *x = e;
+                    sum += e;
+                }
+                for x in r[vl..].iter_mut() {
+                    *x = 0.0; // padded key columns drop out
                 }
                 let inv = 1.0 / sum;
-                for x in row.iter_mut() {
-                    *x *= inv;
-                    if round_probs {
-                        *x = bf16_round(*x);
+                if round_probs {
+                    // probs are finite & in [0,1] -> branch-free round vectorizes
+                    for x in r[..vl].iter_mut() {
+                        *x = bf16_round_finite(*x * inv);
+                    }
+                } else {
+                    for x in r[..vl].iter_mut() {
+                        *x *= inv;
                     }
                 }
             }
-            sc.dot(&vh) // ctx [T, HD]
-        })
-        .collect();
-    let mut out = Array2::<f32>::zeros((t, d));
-    for (h, ctx) in ctxs.into_iter().enumerate() {
-        let base = h * head_dim;
-        out.slice_mut(s![.., base..base + head_dim]).assign(&ctx);
+            let ctx = sc.dot(&vh); // [tile, HD]
+            // scatter ctx into out[r0..r1, base..base+HD]; rows are disjoint across tiles AND
+            // columns are disjoint across heads, so no two items touch the same element.
+            for (ri, row) in ctx.outer_iter().enumerate() {
+                let dst_row = r0 + ri;
+                let dst = (out_ptr as *mut f32).wrapping_add(dst_row * d + base);
+                for (ci, &val) in row.iter().enumerate() {
+                    unsafe { *dst.add(ci) = val };
+                }
+            }
+        });
     }
     out
 }
 
 /// GLU: x is [2C, T] (channel-major). a = x[..C], g = x[C..]; out[c,t] = a[c,t] * sigmoid(g[c,t]).
+///
+/// Parallelized over BANDS of channels (≈one band per core), NOT single channels. The original
+/// `par_chunks_mut(t)` spawned one rayon task per channel (~768 micro-tasks); that scheduling
+/// overhead — amplified when interleaved with the encoder's NPU DMA waits — was an earlier
+/// in-situ regression (docs/17). Back-to-back A/B (docs/19) showed per-channel rayon vs serial is
+/// actually within noise and load-dependent (serial wins idle, rayon wins under core contention);
+/// coarse bands amortize the task overhead so they dominate both regimes. Each a-/g-row is a
+/// contiguous [T] span, so the inner loop still auto-vectorizes.
 pub fn glu(x: &Array2<f32>) -> Array2<f32> {
+    use rayon::prelude::*;
     let (two_c, t) = x.dim();
     let c = two_c / 2;
+    let xc = x.as_standard_layout();
+    let xs = xc.as_slice().unwrap();
     let mut out = Array2::<f32>::zeros((c, t));
-    for ci in 0..c {
-        for ti in 0..t {
-            let a = x[[ci, ti]];
-            let g = x[[c + ci, ti]];
-            out[[ci, ti]] = a / (1.0 + (-g).exp());
-        }
-    }
+    let nthreads = rayon::current_num_threads().max(1);
+    let band = c.div_ceil(nthreads); // channels per task → ~nthreads tasks total
+    out.as_slice_mut()
+        .unwrap()
+        .par_chunks_mut(band * t)
+        .enumerate()
+        .for_each(|(bi, obuf)| {
+            let c0 = bi * band;
+            for (li, orow) in obuf.chunks_mut(t).enumerate() {
+                let ci = c0 + li;
+                let arow = &xs[ci * t..ci * t + t];
+                let grow = &xs[(c + ci) * t..(c + ci) * t + t];
+                for ti in 0..t {
+                    orow[ti] = arow[ti] * sigmoid_scalar(grow[ti]);
+                }
+            }
+        });
     out
+}
+
+/// numerically-stable scalar sigmoid using `fast_exp_nonpos` on the non-positive branch.
+#[inline(always)]
+fn sigmoid_scalar(g: f32) -> f32 {
+    if g >= 0.0 {
+        1.0 / (1.0 + fast_exp_nonpos(-g))
+    } else {
+        let e = fast_exp_nonpos(g);
+        e / (1.0 + e)
+    }
 }
 
 /// depthwise conv1d k=5 'same' (pad=2): x[C,T], taps[C,5] -> [C,T] (f32). Parallel over channels.
@@ -193,12 +345,22 @@ pub fn dwconv_k5(x: &Array2<f32>, taps: &Array2<f32>) -> Array2<f32> {
 
 /// elementwise sigmoid 1/(1+e^-x)
 pub fn sigmoid(x: &Array2<f32>) -> Array2<f32> {
-    x.mapv(|v| 1.0 / (1.0 + (-v).exp()))
+    use rayon::prelude::*;
+    let (r, c) = x.dim();
+    let xc = x.as_standard_layout();
+    let xs = xc.as_slice().unwrap();
+    let data: Vec<f32> = xs.par_iter().map(|&v| sigmoid_scalar(v)).collect();
+    Array2::from_shape_vec((r, c), data).unwrap()
 }
 
 /// elementwise SiLU x*sigmoid(x)
 pub fn silu(x: &Array2<f32>) -> Array2<f32> {
-    x.mapv(|v| v / (1.0 + (-v).exp()))
+    use rayon::prelude::*;
+    let (r, c) = x.dim();
+    let xc = x.as_standard_layout();
+    let xs = xc.as_slice().unwrap();
+    let data: Vec<f32> = xs.par_iter().map(|&v| v * sigmoid_scalar(v)).collect();
+    Array2::from_shape_vec((r, c), data).unwrap()
 }
 
 /// 1D conv via im2col. x is [Cin, L], w is [Cout, Cin, k], b is [Cout].
@@ -278,6 +440,35 @@ mod tests {
             .zip(expected.iter())
             .map(|(&x, &y)| (x - y).abs())
             .fold(0f32, f32::max)
+    }
+
+    #[test]
+    fn test_fast_exp_accuracy() {
+        // fast_exp_nonpos must track libm expf to well under the bf16 rounding noise (~4e-3 rel)
+        // that follows it in softmax/sigmoid. Check max rel err over the operating range.
+        let mut maxrel = 0f32;
+        let mut x = -60.0f32;
+        while x <= 0.0 {
+            let a = fast_exp_nonpos(x);
+            let b = x.exp();
+            maxrel = maxrel.max(((a - b) / b).abs());
+            x += 0.001;
+        }
+        assert!(maxrel < 5e-4, "fast_exp rel err {maxrel:e} too high");
+    }
+
+    #[test]
+    fn test_residual_add_round() {
+        let x = arr2(&[[1.0f32, 2.0, 3.0], [4.0, 5.0, 6.0]]);
+        let y = arr2(&[[0.5f32, 1.0, 1.5], [2.0, 2.5, 3.0]]);
+        let got = residual_add_round(&x, &y, 0.5);
+        // reference: bf16_round(x + 0.5*y) elementwise
+        for i in 0..2 {
+            for j in 0..3 {
+                let want = bf16_round(x[[i, j]] + 0.5 * y[[i, j]]);
+                assert_eq!(got[[i, j]], want);
+            }
+        }
     }
 
     #[test]
@@ -435,6 +626,23 @@ mod tests {
             -4.08787251e-01,
         ];
         assert!(maxdiff(&out, &exp) < 1e-4);
+    }
+
+    #[test]
+    fn test_glu_banding_nondivisible() {
+        // C = 383 (odd, > rayon thread count) exercises the coarse-band remainder path: the last
+        // band is a short chunk and ci = c0+li must stay in range. Compare to a serial reference.
+        let (c, t) = (383usize, 7usize);
+        let data: Vec<f32> = (0..2 * c * t).map(|i| ((i % 13) as f32 - 6.0) * 0.25).collect();
+        let x = Array2::from_shape_vec((2 * c, t), data).unwrap();
+        let out = glu(&x);
+        assert_eq!(out.dim(), (c, t));
+        for ci in 0..c {
+            for ti in 0..t {
+                let exp = x[[ci, ti]] * (1.0 / (1.0 + (-x[[c + ci, ti]]).exp()));
+                assert!((out[[ci, ti]] - exp).abs() < 1e-4, "glu mismatch at ({ci},{ti})");
+            }
+        }
     }
 
     #[test]

@@ -80,6 +80,8 @@ fn main() {
     // steady-state (warm) latency + NPU-vs-host split
     let _ = enc.forward_blocks(&x0, 400); // extra warmup
     reset_prof();
+    npu_asr::engines::marsh::reset();
+    npu_asr_host::prof::reset();
     let t0 = Instant::now();
     for _ in 0..iters {
         let xs = subsample(&ws, &audio);
@@ -96,4 +98,6 @@ fn main() {
         ndisp / iters as u64,
         warm_ms - npu_ms
     );
+    npu_asr_host::prof::dump(iters); // per-op host breakdown when NPU_HOST_PROF is set
+    npu_asr::engines::marsh::dump(iters); // per-dispatch marshaling breakdown when NPU_MARSH_PROF is set
 }

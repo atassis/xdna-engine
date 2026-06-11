@@ -1,0 +1,8 @@
+# Build the encoder host glue with the full native ISA (AVX2/FMA on this XDNA2 host).
+# The CPU "host glue" (LayerNorm / RoPE / MHA-softmax / GLU / SiLU / residual+bf16 marshalling in
+# npu-asr-host) is a wall of f32 element loops; -C target-cpu=native lets the autovectorizer emit
+# AVX2+FMA, ~30% off the host budget (measured via `cargo run -p npu-asr-host --bin host_bench`).
+# It also unlocks the vectorized `fast_exp_nonpos` softmax path. The encoder runs on the machine it
+# is built on (single XDNA2 dev host), so native codegen is safe here.
+[build]
+rustflags = ["-C", "target-cpu=native"]

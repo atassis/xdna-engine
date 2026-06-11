@@ -53,6 +53,11 @@ PORT=11434
 UNIT_DIR="$HOME/.config/systemd/user"
 UNIT_PATH="$UNIT_DIR/npu-asr.service"
 
+# Stable runtime dir for libonnxruntime, decoupled from the volatile cargo target/ build tree
+# (which `cargo clean` wipes). The unit puts this on LD_LIBRARY_PATH so the service resolves
+# its .so here regardless of build-tree churn. Override with STABLE_LIB_DIR=...
+STABLE_LIB_DIR="${STABLE_LIB_DIR:-$HOME/.local/lib/npu-asr}"
+
 # Pretty logging helpers.
 info() { printf '\033[1;34m[install]\033[0m %s\n' "$*"; }
 ok()   { printf '\033[1;32m[ ok ]\033[0m %s\n' "$*"; }
@@ -103,6 +108,26 @@ info "Building Rust workspace (cargo build --release)..."
 ASR_SERVE="$REPO/rust/target/release/asr_serve"
 [ -x "$ASR_SERVE" ] || die "Build finished but $ASR_SERVE is missing/not executable."
 ok "Built asr_serve: $ASR_SERVE"
+
+# ---------------------------------------------------------------------------
+# 3b. Stable onnxruntime .so (decouple the runtime from the cargo build tree)
+# ---------------------------------------------------------------------------
+# asr_serve links libonnxruntime via a RUNPATH into rust/target/.../build/npu-onnx-*/out,
+# whose symlinks point into the onnx-asr venv. `cargo clean` wipes that dir -> the service
+# can no longer find libonnxruntime.so.1. Copy the real versioned .so into a STABLE dir with
+# the SONAME symlink the loader needs, and put that dir on LD_LIBRARY_PATH in the unit. Because
+# the binary uses DT_RUNPATH (searched AFTER LD_LIBRARY_PATH), the stable dir wins -> the
+# service survives `cargo clean` and any build-tree churn.
+info "Hardening onnxruntime .so -> $STABLE_LIB_DIR"
+ORT_REAL_SO="$(find "$ONNX_ASR_VENV" -path '*/onnxruntime/capi/libonnxruntime.so.*' 2>/dev/null \
+                 | grep -E 'libonnxruntime\.so\.[0-9]' | head -n1 || true)"
+[ -n "$ORT_REAL_SO" ] || die "no libonnxruntime.so.* under $ONNX_ASR_VENV (onnx-asr venv layout changed?)."
+mkdir -p "$STABLE_LIB_DIR"
+cp -f "$ORT_REAL_SO" "$STABLE_LIB_DIR/"
+ORT_SO_BASE="$(basename "$ORT_REAL_SO")"                        # e.g. libonnxruntime.so.1.26.0
+ln -sf "$ORT_SO_BASE" "$STABLE_LIB_DIR/libonnxruntime.so.1"     # SONAME the loader needs at runtime
+ln -sf "$ORT_SO_BASE" "$STABLE_LIB_DIR/libonnxruntime.so"       # link-name (completeness)
+ok "Stable .so: $STABLE_LIB_DIR/$ORT_SO_BASE (+ SONAME symlink)"
 
 # ---------------------------------------------------------------------------
 # 4. Artifacts
@@ -173,8 +198,11 @@ After=graphical-session.target
 [Service]
 Type=simple
 WorkingDirectory=$REPO
-# Pure-Rust single binary: runs onnx preproc/decode (system onnxruntime, baked rpath) + the
-# NPU encoder in-process. No Python or env needed at runtime; cwd resolves artifacts/.
+# Resolve libonnxruntime.so.1 from the STABLE dir (not the volatile cargo build tree). The
+# binary's DT_RUNPATH is searched AFTER LD_LIBRARY_PATH, so this wins and survives cargo clean.
+Environment=LD_LIBRARY_PATH=$STABLE_LIB_DIR
+# Pure-Rust single binary: runs onnx preproc/decode (system onnxruntime) + the NPU encoder
+# in-process. No Python needed at runtime; cwd resolves artifacts/.
 ExecStart=$ASR_SERVE $PORT
 Restart=on-failure
 RestartSec=3

@@ -9,8 +9,17 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
 use std::rc::Rc;
+use std::time::Duration;
+
+/// Max accepted request body. A 16 kHz/16-bit mono WAV at the encoder's 1600-frame cap is well
+/// under 1 MB; 64 MB is a generous ceiling that still blocks a `Content-Length: huge` OOM attack.
+const MAX_BODY: usize = 64 * 1024 * 1024;
+/// Per-connection socket read/write timeout — the accept loop is single-threaded (serialized for
+/// the single-tenant NPU), so one slow/stalled client must not be able to wedge it forever.
+const SOCKET_TIMEOUT: Duration = Duration::from_secs(30);
 
 use ndarray::prelude::*;
 use npu_asr::encoder::{subsample, Encoder};
@@ -54,6 +63,8 @@ impl Pipeline {
     }
 
     fn transcribe(&self, samples: &[i16]) -> String {
+        use std::time::Instant;
+        let t_mel = Instant::now();
         let wav: Vec<f32> = samples.iter().map(|&s| s as f32 / 32768.0).collect();
         let n = wav.len() as i64;
         let lens = [n];
@@ -77,11 +88,20 @@ impl Pipeline {
             }
         }
         let valid = (teff.max(1) - 1) / 4 + 1;
+        let mel_ms = t_mel.elapsed().as_secs_f64() * 1e3;
+        let t_enc = Instant::now();
         let x0 = subsample(&self.ws, &audio);
         let outs = self.enc.forward_blocks(&x0, valid);
         let encoded = outs.last().unwrap(); // [400,768] frame-major
+        let enc_ms = t_enc.elapsed().as_secs_f64() * 1e3;
+        let t_dec = Instant::now();
         let ids = self.decode(encoded, valid);
-        self.detokenize(&ids)
+        let text = self.detokenize(&ids);
+        eprintln!(
+            "[timing] mel+preproc {mel_ms:.0} ms | encoder {enc_ms:.0} ms | decode {:.0} ms ({} frames, {} tokens)",
+            t_dec.elapsed().as_secs_f64() * 1e3, valid, ids.len()
+        );
+        text
     }
 
     // greedy RNNT decode (mirrors onnx-asr _AsrWithTransducerDecoding)
@@ -203,6 +223,9 @@ fn main() {
 }
 
 fn handle(mut stream: TcpStream, pipe: &Pipeline) -> std::io::Result<()> {
+    // A stalled client must not block the single-threaded accept loop indefinitely.
+    let _ = stream.set_read_timeout(Some(SOCKET_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(SOCKET_TIMEOUT));
     let peer = stream.peer_addr().map(|a| a.to_string()).unwrap_or_default();
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut line = String::new();
@@ -228,8 +251,15 @@ fn handle(mut stream: TcpStream, pipe: &Pipeline) -> std::io::Result<()> {
             }
         }
     }
+    if request_line.starts_with("GET ") && request_line.contains("/health") {
+        return respond(&mut stream, 200, "{\"status\":\"ok\"}");
+    }
     if !request_line.contains("/v1/audio/transcriptions") {
         return respond(&mut stream, 404, "{\"error\":\"not found\"}");
+    }
+    // Cap the body BEFORE allocating: a bogus Content-Length must not trigger a multi-GB alloc.
+    if content_len > MAX_BODY {
+        return respond(&mut stream, 413, "{\"error\":\"request too large\"}");
     }
     let mut body = vec![0u8; content_len];
     reader.read_exact(&mut body)?;
@@ -238,10 +268,18 @@ fn handle(mut stream: TcpStream, pipe: &Pipeline) -> std::io::Result<()> {
         None => return respond(&mut stream, 400, "{\"error\":\"no file part\"}"),
     };
     let samples = match parse_wav_i16(wav) {
-        Some(s) => s,
-        None => return respond(&mut stream, 400, "{\"error\":\"bad wav\"}"),
+        Some(s) if !s.is_empty() => s,
+        _ => return respond(&mut stream, 400, "{\"error\":\"bad or empty wav\"}"),
     };
-    let text = pipe.transcribe(&samples);
+    // The pipeline runs ONNX (.expect on session errors) + the NPU; a panic here would otherwise
+    // unwind through the single accept thread and kill the whole server. Contain it -> 500.
+    let text = match catch_unwind(AssertUnwindSafe(|| pipe.transcribe(&samples))) {
+        Ok(t) => t,
+        Err(_) => {
+            eprintln!("[asr_serve] {peer} -> transcription panicked ({} samples)", samples.len());
+            return respond(&mut stream, 500, "{\"error\":\"transcription failed\"}");
+        }
+    };
     eprintln!("[asr_serve] {peer} -> {} samples -> {:?}", samples.len(), text);
     let body = format!("{{\"text\": \"{}\"}}", json_escape(&text));
     respond(&mut stream, 200, &body)
@@ -319,15 +357,120 @@ fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
     (0..=hay.len() - needle.len()).find(|&i| &hay[i..i + needle.len()] == needle)
 }
 
-/// Parse a 16-bit PCM WAV: find the `data` chunk and read it as little-endian i16.
+/// Parse a 16 kHz / mono / 16-bit PCM WAV into little-endian i16 samples.
+///
+/// Walks the RIFF chunk list properly (id[4] + LE u32 size + word-aligned body) rather than
+/// scanning for the bytes `data` — a `LIST`/`INFO` chunk containing the substring "data" before
+/// the real `data` chunk would mis-parse the old way. Validates `fmt ` (PCM/extensible, 16-bit,
+/// mono, 16 kHz) so a stereo / 24-bit / wrong-rate file is a clean 400, not silent garbage; the
+/// mel front-end assumes exactly this format.
 fn parse_wav_i16(wav: &[u8]) -> Option<Vec<i16>> {
-    let pos = find(wav, b"data")?;
-    let size_off = pos + 4;
-    if size_off + 4 > wav.len() {
+    if wav.len() < 12 || &wav[0..4] != b"RIFF" || &wav[8..12] != b"WAVE" {
         return None;
     }
-    let size = u32::from_le_bytes([wav[size_off], wav[size_off + 1], wav[size_off + 2], wav[size_off + 3]]) as usize;
-    let data = &wav[size_off + 4..];
-    let n = size.min(data.len()) / 2;
+    let mut off = 12usize;
+    let mut fmt_ok = false;
+    let mut data: Option<&[u8]> = None;
+    while off + 8 <= wav.len() {
+        let id = &wav[off..off + 4];
+        let sz = u32::from_le_bytes([wav[off + 4], wav[off + 5], wav[off + 6], wav[off + 7]]) as usize;
+        let body_start = off + 8;
+        let body_end = body_start.saturating_add(sz).min(wav.len());
+        match id {
+            b"fmt " if body_end - body_start >= 16 => {
+                let b = &wav[body_start..body_end];
+                let audio_fmt = u16::from_le_bytes([b[0], b[1]]);
+                let channels = u16::from_le_bytes([b[2], b[3]]);
+                let rate = u32::from_le_bytes([b[4], b[5], b[6], b[7]]);
+                let bits = u16::from_le_bytes([b[14], b[15]]);
+                // 1 = PCM, 0xFFFE = WAVE_FORMAT_EXTENSIBLE (still LPCM here)
+                fmt_ok = (audio_fmt == 1 || audio_fmt == 0xFFFE)
+                    && bits == 16
+                    && channels == 1
+                    && rate == 16_000;
+            }
+            b"data" => data = Some(&wav[body_start..body_end]),
+            _ => {}
+        }
+        // chunk bodies are word-aligned: an odd size is padded with one byte.
+        off = body_start.saturating_add(sz).saturating_add(sz & 1);
+    }
+    if !fmt_ok {
+        return None;
+    }
+    let data = data?;
+    let n = data.len() / 2;
     Some((0..n).map(|i| i16::from_le_bytes([data[i * 2], data[i * 2 + 1]])).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a minimal RIFF/WAVE: optional pre-data chunks, then fmt + data.
+    fn wav(channels: u16, rate: u32, bits: u16, samples: &[i16], pre_chunks: &[(&[u8; 4], &[u8])]) -> Vec<u8> {
+        fn chunk(out: &mut Vec<u8>, id: &[u8; 4], body: &[u8]) {
+            out.extend_from_slice(id);
+            out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            out.extend_from_slice(body);
+            if body.len() % 2 == 1 {
+                out.push(0); // word-align padding
+            }
+        }
+        let mut fmt = Vec::new();
+        fmt.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        fmt.extend_from_slice(&channels.to_le_bytes());
+        fmt.extend_from_slice(&rate.to_le_bytes());
+        fmt.extend_from_slice(&(rate * channels as u32 * (bits / 8) as u32).to_le_bytes());
+        fmt.extend_from_slice(&(channels * bits / 8).to_le_bytes());
+        fmt.extend_from_slice(&bits.to_le_bytes());
+        let mut data = Vec::new();
+        for &s in samples {
+            data.extend_from_slice(&s.to_le_bytes());
+        }
+        let mut inner = Vec::new();
+        inner.extend_from_slice(b"WAVE");
+        for (id, body) in pre_chunks {
+            chunk(&mut inner, id, body);
+        }
+        chunk(&mut inner, b"fmt ", &fmt);
+        chunk(&mut inner, b"data", &data);
+        let mut out = Vec::new();
+        out.extend_from_slice(b"RIFF");
+        out.extend_from_slice(&(inner.len() as u32).to_le_bytes());
+        out.extend_from_slice(&inner);
+        out
+    }
+
+    #[test]
+    fn parses_valid_mono_16k() {
+        let s = [1i16, -2, 3, -4, 1000];
+        let got = parse_wav_i16(&wav(1, 16_000, 16, &s, &[])).expect("valid wav");
+        assert_eq!(got, s);
+    }
+
+    #[test]
+    fn skips_list_chunk_containing_data_bytes() {
+        // A LIST/INFO chunk whose body literally contains the bytes "data" before the real data
+        // chunk. The old substring scan matched here and read garbage; the chunk walker must not.
+        let s = [7i16, 8, 9];
+        let pre: &[(&[u8; 4], &[u8])] = &[(b"LIST", b"INFOdata\x10\x00\x00\x00junkjunkjunk")];
+        let got = parse_wav_i16(&wav(1, 16_000, 16, &s, pre)).expect("valid wav w/ LIST");
+        assert_eq!(got, s, "must read the real data chunk, not the bytes inside LIST");
+    }
+
+    #[test]
+    fn rejects_stereo_and_wrong_rate_and_24bit() {
+        let s = [1i16, 2, 3, 4];
+        assert!(parse_wav_i16(&wav(2, 16_000, 16, &s, &[])).is_none(), "stereo rejected");
+        assert!(parse_wav_i16(&wav(1, 44_100, 16, &s, &[])).is_none(), "wrong rate rejected");
+        assert!(parse_wav_i16(&wav(1, 16_000, 24, &s, &[])).is_none(), "24-bit rejected");
+    }
+
+    #[test]
+    fn rejects_garbage_and_non_riff() {
+        assert!(parse_wav_i16(b"").is_none());
+        assert!(parse_wav_i16(b"not a wav file at all").is_none());
+        assert!(parse_wav_i16(&[0u8; 8]).is_none());
+    }
 }
