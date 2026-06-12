@@ -1,0 +1,51 @@
+##===- Makefile.mstat -----------------------------------------------------===##
+#
+# M-STATIONARY (row/token-stationary) whole-array GEMM probe (internal notes CLUE 1).
+# Plain bf16->f32 matmul, 8 columns split M, B broadcast. No epilogue (de-risk placement first).
+#
+# Build (CPU-only, on open Peano):
+#   make -f Makefile.mstat NPU2=1 M=512 K=768 N=3072 m=16 k=32 n=32 n_aie_cols=8 \
+#        build/final_mstat_512x768x3072_16x32x32_8c.xclbin
+#
+# Drive from rust/npu-asr/src/bin/mstat_probe.rs. UNIQUE target_suffix (mstat_*) so artifacts never
+# collide with the shipped N-stationary kernels in the shared mlir-aie sandbox.
+#
+srcdir := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
+subdir=whole_array
+targetname=m_stationary
+
+M?=512
+K?=768
+N?=3072
+m?=16
+k?=32
+n?=32
+n_aie_cols?=8
+b_col_maj?=0
+
+dtype_in?=bf16
+dtype_out?=f32
+
+kernels=mm_${m}x${k}x${n}
+
+aieargs+=-m $m -k $k -n $n --n-aie-cols ${n_aie_cols} --b-col-maj ${b_col_maj}
+
+target_suffix=mstat_${M}x${K}x${N}_${m}x${k}x${n}_${n_aie_cols}c
+
+use_iron=1
+aie_py_src=m_stationary_iron.py
+
+buffer_aloc_flag=basic-sequential
+
+# matmul object: bf16 in, f32 acc, native (NO bfp16 flags). KERNEL_DEFINES carries any fast flags
+# from makefile-common (none here -> native 32x32-style kernel).
+MM_DEFINES=-Dbf16_f32_ONLY -DDIM_M=${m} -DDIM_K=${k} -DDIM_N=${n} -DVECTORIZED_ONLY
+ifeq (${b_col_maj}, 1)
+	MM_DEFINES+=-DB_COL_MAJ
+endif
+
+include ${srcdir}/../makefile-common
+
+build/mm_${m}x${k}x${n}.o: ${kernels_dir}/mm.cc
+	mkdir -p ${@D}
+	cd ${@D} && ${KERNEL_CC} ${KERNEL_CFLAGS} ${MM_DEFINES} ${KERNEL_DEFINES} -c $< -o ${@F}

@@ -15,7 +15,7 @@ MM=$PE/basic/matrix_multiplication
 K=mlir-aie/aie_kernels/aie2p
 
 [ -d mlir-aie ] || { echo "mlir-aie not present — run scripts/setup_route_b.sh first" >&2; exit 1; }
-mkdir -p "$PE/ml/dwconv1d" "$PE/ml/softmax400"
+mkdir -p "$PE/ml/dwconv1d" "$PE/ml/softmax400" "$PE/ml/layernorm"
 
 # dwconv1d k=5 (docs/08) — last missing Conformer primitive
 cp "$RB/dwconv1d/dwconv1d.cc" "$K/dwconv1d.cc"
@@ -34,5 +34,12 @@ cp "$RB/whole_array_fused/Makefile.modal"            "$MM/whole_array/Makefile.m
 # single_core fused GEMM->GEMM (on-chip intermediate) design
 cp "$RB/ffn_gemm2/ffn_gemm2_iron.py" "$MM/single_core/ffn_gemm2_iron.py"
 cp "$RB/ffn_gemm2/Makefile.ffn"      "$MM/single_core/Makefile.ffn"
+# M-stationary GEMM probe (internal notes; KILLED but kept reproducible) — bin/mstat_probe.rs
+cp "$RB/m_stationary/m_stationary_iron.py" "$MM/whole_array/m_stationary_iron.py"
+cp "$RB/m_stationary/Makefile.mstat"       "$MM/whole_array/Makefile.mstat"
+# ctxLN — encoder LayerNorm on the NPU (Step D, internal notes): f32 two-pass kernel + design
+cp "$RB/aie_kernels/ln_2pass.cc"     "$K/ln_2pass.cc"
+cp "$RB/ctx_ln/ctx_ln_iron.py"       "$PE/ml/layernorm/ctx_ln_iron.py"
+cp "$RB/ctx_ln/Makefile.ctxln"       "$PE/ml/layernorm/Makefile.ctxln"
 
 echo "synced route_b_kernels/ -> mlir-aie build sandbox (edit route_b_kernels/, never mlir-aie/)"

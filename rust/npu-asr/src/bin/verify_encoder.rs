@@ -9,7 +9,7 @@ use std::rc::Rc;
 use std::time::Instant;
 
 use ndarray::prelude::*;
-use npu_asr::encoder::{subsample, Encoder};
+use npu_asr::encoder::Encoder;
 use npu_asr::engines::{prof, reset_prof};
 use npu_asr::weights::WeightStore;
 use npu_xrt::Device;
@@ -69,7 +69,7 @@ fn main() {
     );
 
     let audio = squeeze0(ws.ref_tensor("audio_signal")); // [64,1600]
-    let x0 = subsample(&ws, &audio);
+    let x0 = enc.subsample(&ws, &audio);
 
     // correctness pass (also warms the device)
     let outs = enc.forward_blocks(&x0, 400);
@@ -101,7 +101,7 @@ fn main() {
     let (e_pkg0, e_core0) = (rapl_uj(RAPL_PKG), rapl_uj(RAPL_CORE));
     let t0 = Instant::now();
     for _ in 0..iters {
-        let xs = subsample(&ws, &audio);
+        let xs = enc.subsample(&ws, &audio);
         let _ = enc.forward_blocks(&xs, 400);
     }
     let elapsed = t0.elapsed();

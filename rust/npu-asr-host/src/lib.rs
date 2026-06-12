@@ -205,8 +205,16 @@ pub fn mha(
     let n_tiles = t.div_ceil(ROW_TILE);
 
     let mut out = Array2::<f32>::zeros((t, d));
+    // sub-step profiling (NPU_HOST_PROF): accumulate per-item ns into atomics in the parallel loop,
+    // emit once after the join (summed-thread-time, so the RATIO scores:softmax:ctxV:scatter is the
+    // meaningful read, not the absolute — parallel threads overlap). Zero cost when prof is off.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let prof_on = crate::prof::enabled();
+    let (sc_ns, sm_ns, cx_ns, st_ns) =
+        (AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0));
     {
         let out_ptr = out.as_mut_ptr() as usize; // base of the [t,d] row-major buffer (Send)
+        let (sc_a, sm_a, cx_a, st_a) = (&sc_ns, &sm_ns, &cx_ns, &st_ns);
         (0..n_heads * n_tiles).into_par_iter().for_each(|item| {
             let h = item / n_tiles;
             let tile = item % n_tiles;
@@ -217,23 +225,39 @@ pub fn mha(
             let kh = k.slice(s![.., base..base + head_dim]); // [T, HD]
             let vh = v.slice(s![.., base..base + head_dim]); // [T, HD]
             // scores tile = qh @ kh^T  -> [tile, T] (matrixmultiply). scale folded into softmax.
+            let _ts = prof_on.then(std::time::Instant::now);
             let mut sc = qh.dot(&kh.t());
+            if let Some(t) = _ts {
+                sc_a.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
+            let _ts = prof_on.then(std::time::Instant::now);
             for mut row in sc.rows_mut() {
                 let r = row.as_slice_mut().unwrap();
-                // row-max over valid key columns only (scale>0 keeps argmax)
+                // row-max over valid key columns only (scale>0 keeps argmax). fmax reduction → LLVM-vec.
                 let mut maxv = f32::NEG_INFINITY;
                 for &x in &r[..vl] {
-                    if x > maxv {
-                        maxv = x;
-                    }
+                    maxv = maxv.max(x);
                 }
                 let off = maxv * scale;
-                let mut sum = 0f32;
+                // pass 2a: exp IN PLACE — no reduction in this loop, so the branch-free inline
+                // `fast_exp_nonpos` auto-vectorizes. Splitting exp from the sum is the point: the old
+                // fused `sum += e` ordered float reduction serialized the (otherwise vectorizable) exp.
                 for x in r[..vl].iter_mut() {
-                    let e = fast_exp_nonpos(*x * scale - off);
-                    *x = e;
-                    sum += e;
+                    *x = fast_exp_nonpos(*x * scale - off);
                 }
+                // pass 2b: sum the exps with 8 independent accumulators so the reduction itself
+                // vectorizes (one vaddps/chunk instead of a serial fadd dependency chain).
+                let mut acc = [0f32; 8];
+                let mut chunks = r[..vl].chunks_exact(8);
+                for c in chunks.by_ref() {
+                    for i in 0..8 {
+                        acc[i] += c[i];
+                    }
+                }
+                for (i, &x) in chunks.remainder().iter().enumerate() {
+                    acc[i] += x;
+                }
+                let sum: f32 = acc.iter().sum();
                 for x in r[vl..].iter_mut() {
                     *x = 0.0; // padded key columns drop out
                 }
@@ -249,7 +273,15 @@ pub fn mha(
                     }
                 }
             }
+            if let Some(t) = _ts {
+                sm_a.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
+            let _ts = prof_on.then(std::time::Instant::now);
             let ctx = sc.dot(&vh); // [tile, HD]
+            if let Some(t) = _ts {
+                cx_a.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
+            let _ts = prof_on.then(std::time::Instant::now);
             // scatter ctx into out[r0..r1, base..base+HD]; rows are disjoint across tiles AND
             // columns are disjoint across heads, so no two items touch the same element.
             for (ri, row) in ctx.outer_iter().enumerate() {
@@ -259,7 +291,16 @@ pub fn mha(
                     unsafe { *dst.add(ci) = val };
                 }
             }
+            if let Some(t) = _ts {
+                st_a.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
         });
+    }
+    if prof_on {
+        crate::prof::add_ns("mha:1_scores", sc_ns.load(Ordering::Relaxed) as u128);
+        crate::prof::add_ns("mha:2_softmax", sm_ns.load(Ordering::Relaxed) as u128);
+        crate::prof::add_ns("mha:3_ctxV", cx_ns.load(Ordering::Relaxed) as u128);
+        crate::prof::add_ns("mha:4_scatter", st_ns.load(Ordering::Relaxed) as u128);
     }
     out
 }
@@ -409,6 +450,37 @@ pub fn silu(x: &Array2<f32>) -> Array2<f32> {
 
 /// 1D conv via im2col. x is [Cin, L], w is [Cout, Cin, k], b is [Cout].
 /// Lout = (L + 2*pad - k)/stride + 1. Output [Cout, Lout].
+/// `a @ b.T` for C-contiguous `a` [M, K] and `b` [N, K], returning [M, N]. The single-threaded
+/// ndarray `.dot()` leaves 19 of 20 cores idle on the subsample front-end (a ~1.4 GMAC conv = the
+/// fattest host op, ~32 ms). This row-blocks `a` across rayon threads and runs `matrixmultiply` on
+/// each block — each output row's K-reduction is computed by the SAME `.dot()` kernel on its block,
+/// so the result is byte-identical to the serial path; only the M dimension is split across cores.
+/// Toggle `NPU_PAR_SUBSAMPLE=0` reverts to the serial `.dot()` for A/B.
+fn par_dot_bt(a: &Array2<f32>, b: &Array2<f32>) -> Array2<f32> {
+    use rayon::prelude::*;
+    static PAR_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *PAR_ON.get_or_init(|| std::env::var("NPU_PAR_SUBSAMPLE").as_deref() != Ok("0"));
+    let (m, k) = a.dim();
+    let n = b.dim().0;
+    if !on || m < 32 {
+        return a.dot(&b.t());
+    }
+    let rows_per = m.div_ceil(rayon::current_num_threads()).max(1);
+    let mut prod = Array2::<f32>::zeros((m, n));
+    let a_s = a.as_slice().expect("a contiguous");
+    prod.as_slice_mut()
+        .expect("prod contiguous")
+        .par_chunks_mut(rows_per * n)
+        .zip(a_s.par_chunks(rows_per * k))
+        .for_each(|(pblk, ablk)| {
+            let r = ablk.len() / k;
+            let av = ArrayView2::from_shape((r, k), ablk).expect("a block view");
+            let pres = av.dot(&b.t()); // [r, n], matrixmultiply blocked over K (same order as serial)
+            pblk.copy_from_slice(pres.as_slice().expect("dot result contiguous"));
+        });
+    prod
+}
+
 pub fn im2col_conv1d(
     x: &Array2<f32>,
     w: &Array3<f32>,
@@ -416,35 +488,18 @@ pub fn im2col_conv1d(
     stride: usize,
     pad: usize,
 ) -> Array2<f32> {
-    let (cin, l) = x.dim();
+    let (cin, _l) = x.dim();
     let (cout, cin_w, k) = w.dim();
     debug_assert_eq!(cin, cin_w);
-    let lp = l + 2 * pad;
-    let lout = (lp - k) / stride + 1;
-    // padded input
-    let mut xp = Array2::<f32>::zeros((cin, lp));
-    for ci in 0..cin {
-        for li in 0..l {
-            xp[[ci, li + pad]] = x[[ci, li]];
-        }
-    }
-    // cols: [Lout, Cin*k] with (Cin,k) flattened Cin-major (row = ci*k + ki)
-    let mut cols = Array2::<f32>::zeros((lout, cin * k));
-    for t in 0..lout {
-        let start = t * stride;
-        for ci in 0..cin {
-            for ki in 0..k {
-                cols[[t, ci * k + ki]] = xp[[ci, start + ki]];
-            }
-        }
-    }
+    let cols = im2col(x, k, stride, pad); // [Lout, Cin*k]
+    let lout = cols.nrows();
     // W2: [Cout, Cin*k] (same flatten order)
     let w2 = w
         .to_shape((cout, cin * k))
         .expect("reshape w")
         .to_owned();
     // out = (cols @ W2.T + b).T  -> [Cout, Lout]
-    let prod = cols.dot(&w2.t()); // [Lout, Cout]
+    let prod = par_dot_bt(&cols, &w2); // [Lout, Cout]
     let mut out = Array2::<f32>::zeros((cout, lout));
     for t in 0..lout {
         for co in 0..cout {
@@ -454,8 +509,34 @@ pub fn im2col_conv1d(
     out
 }
 
+/// im2col for a 1D conv: zero-pad `x` [Cin, L] by `pad` each side and gather the sliding length-`k`
+/// stride-`stride` windows into `cols` [Lout, Cin*k] (Cin-major flatten: col = ci*k + ki — the same
+/// order `im2col_conv1d` reshapes the weight with). Factored out so the conv MATMUL can be routed
+/// elsewhere (e.g. the resident NPU kernel) while this host-side gather is reused unchanged.
+pub fn im2col(x: &Array2<f32>, k: usize, stride: usize, pad: usize) -> Array2<f32> {
+    let (cin, l) = x.dim();
+    let lp = l + 2 * pad;
+    let lout = (lp - k) / stride + 1;
+    let mut xp = Array2::<f32>::zeros((cin, lp));
+    for ci in 0..cin {
+        for li in 0..l {
+            xp[[ci, li + pad]] = x[[ci, li]];
+        }
+    }
+    let mut cols = Array2::<f32>::zeros((lout, cin * k));
+    for t in 0..lout {
+        let start = t * stride;
+        for ci in 0..cin {
+            for ki in 0..k {
+                cols[[t, ci * k + ki]] = xp[[ci, start + ki]];
+            }
+        }
+    }
+    cols
+}
+
 #[inline]
-fn relu_inplace(a: &mut Array2<f32>) {
+pub fn relu_inplace(a: &mut Array2<f32>) {
     a.mapv_inplace(|v| if v > 0.0 { v } else { 0.0 });
 }
 

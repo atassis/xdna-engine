@@ -29,6 +29,7 @@ use npu_xrt::{f32_to_bf16_bits, Bo, Device, Kernel, Run, FLAG_CACHEABLE, FLAG_HO
 use rayon::prelude::*;
 
 use crate::engines::{marsh, prof_record, read_instr_words, u16_bytes, PAD_M, WA_SUBDIR};
+use npu_asr_host::prof;
 
 /// Matmul precision for the V2 encoder — a SELECTABLE, first-class choice (the general-purpose
 /// multi-precision engine). Each precision = a kernel tile + device dtype + host pre/post, but ALL
@@ -132,6 +133,12 @@ pub struct SharedCtxA {
     modal: bool,
     ka_dev: usize,
     modal_streams: Vec<(usize, bool, Bo, usize)>,
+    /// int8 host fast-path (`NPU_INT8_FASTEPI`, default ON; `=0` reverts to the legacy path for A/B).
+    /// Two byte-identical cuts to the int8 marshaling pools: (1) parallel exact `amax` reduction
+    /// (replaces the serial `iter().fold` quant scan); (2) division-free row-chunked dequant epilogue
+    /// (replaces the per-element `i % n` hardware divide, keeping the exact `(acc·scale_a)·ws[c]`
+    /// multiply order). int8-only; no effect on the bf16 default.
+    fast_int8: bool,
 }
 
 /// One double-buffer slot for the async mm2 pipeline: its own activation/output BOs (so a dispatch
@@ -285,6 +292,16 @@ impl SharedCtxA {
             modal,
             ka_dev,
             modal_streams,
+            fast_int8: {
+                let on = prec.is_int8() && std::env::var("NPU_INT8_FASTEPI").as_deref() != Ok("0");
+                if prec.is_int8() {
+                    eprintln!(
+                        "[ctx2] int8 host fast-path {} (parallel amax + division-free dequant; NPU_INT8_FASTEPI=0 disables)",
+                        if on { "ENABLED" } else { "DISABLED" }
+                    );
+                }
+                on
+            },
         })
     }
 
@@ -307,8 +324,7 @@ impl SharedCtxA {
         let slot = &self.pipe[s];
         let tc = Instant::now();
         let scale_a = if self.prec.is_int8() {
-            let amax = a_real.iter().fold(0f32, |m, &v| m.max(v.abs()));
-            let scale_a = if amax > 0.0 { amax / 127.0 } else { 1.0 };
+            let scale_a = quant_scale(a_real, mp, self.fast_int8);
             let mut a = slot.a_buf_i8.borrow_mut();
             a.par_chunks_mut(KA).take(mp).enumerate().for_each(|(r, row)| {
                 for c in 0..KA {
@@ -375,10 +391,8 @@ impl SharedCtxA {
         let cf = slot.cbuf.borrow();
         let data: Vec<f32> = if self.prec.is_int8() {
             let acc: &[i32] = unsafe { std::slice::from_raw_parts(cf.as_ptr() as *const i32, mp * n) };
-            (0..mp * n)
-                .into_par_iter()
-                .map(|i| acc[i] as f32 * scale_a * w_scale[i % n])
-                .collect()
+            // raw dequant (Epi::None): the per-op bias/SiLU is applied later in `finish_slot`.
+            dequant_epi(acc, mp, n, scale_a, w_scale, Epi::None, &[], self.fast_int8)
         } else {
             cf[..mp * n].to_vec()
         };
@@ -585,8 +599,7 @@ impl CtxAOp {
 
         let tc = Instant::now();
         // dynamic per-tensor activation scale = max|A| / 127 over the real mp×KA elements
-        let amax = a_real.iter().fold(0f32, |m, &v| m.max(v.abs()));
-        let scale_a = if amax > 0.0 { amax / 127.0 } else { 1.0 };
+        let scale_a = quant_scale(a_real, mp, sh.fast_int8);
         {
             let mut a = sh.a_buf_i8.borrow_mut();
             a.par_chunks_mut(KA).take(mp).enumerate().for_each(|(r, row)| {
@@ -627,26 +640,65 @@ impl CtxAOp {
         let cf = sh.cbuf.borrow();
         // the device wrote i32; reinterpret the 4B/elem readback buffer as i32 (same layout, no copy).
         let acc: &[i32] = unsafe { std::slice::from_raw_parts(cf.as_ptr() as *const i32, mp * n) };
-        let epi = self.epi;
-        let bias = &self.bias;
-        let ws = &self.w_scale;
-        let data: Vec<f32> = (0..mp * n)
-            .into_par_iter()
-            .map(|i| {
-                let c = i % n;
-                let v = acc[i] as f32 * scale_a * ws[c]; // dequant
-                match epi {
-                    Epi::None => v,
-                    Epi::Bias => v + bias[c],
-                    Epi::SiluBias => {
-                        let z = v + bias[c];
-                        z * fast_sigmoid(z)
-                    }
-                }
-            })
-            .collect();
+        let data = dequant_epi(acc, mp, n, scale_a, &self.w_scale, self.epi, &self.bias, sh.fast_int8);
         let out = Array2::from_shape_vec((mp, n), data).unwrap();
         marsh::add(marsh::EPI, te.elapsed());
+        out
+    }
+
+    /// Goal-1 async overlap for an INDEPENDENT op pair (qk ∥ v): qk reads `rope(ln)`, v reads `ln`,
+    /// neither depends on the other, both feed `mha`. Submit both — each into its own double-buffer
+    /// slot — so `self`'s NPU compute overlaps `other`'s host prep (quant/convert+sync) and `self`'s
+    /// readback overlaps `other`'s NPU compute. Reuses the 2 `PipeSlot`s (free during attention: ffn1's
+    /// mm2 has finished and ffn2's hasn't started). Numerically IDENTICAL to two sequential `forward_view`
+    /// calls (same kernel, same per-op epilogue) — only the scheduling differs. Falls back to sequential
+    /// when the pipeline is off (`NPU_MM2_PIPELINE=0`).
+    pub fn forward2_overlapped(
+        &self,
+        a_self: ArrayView2<f32>,
+        other: &CtxAOp,
+        a_other: ArrayView2<f32>,
+    ) -> (Array2<f32>, Array2<f32>) {
+        let sh = &self.shared;
+        if !sh.pipeline {
+            return (self.forward_view(a_self), other.forward_view(a_other));
+        }
+        let mp0 = a_self.dim().0;
+        let mp1 = a_other.dim().0;
+        // submit both (slot 0 = self, slot 1 = other); the 2nd submit's host prep overlaps the 1st's run.
+        let (run0, sc0) = sh.pipe_start(0, a_self, &self.bo_b, self.n);
+        let (run1, sc1) = sh.pipe_start(1, a_other, &other.bo_b, other.n);
+        run0.wait().unwrap();
+        let o0 = self.finish_slot(0, mp0, sc0); // self's readback overlaps other's NPU compute
+        run1.wait().unwrap();
+        let o1 = other.finish_slot(1, mp1, sc1);
+        (o0, o1)
+    }
+
+    /// Read `[mp, n]` from the pipe slot this op was `pipe_start`ed into, applying this op's epilogue.
+    /// modal: bias is K-aug'd + applied on-chip (and these ops are never SiLU) → `pipe_read`'s output is
+    /// already complete. non-modal bf16 / int8: `pipe_read` returns the raw (int8: dequant'd) matmul, so
+    /// add this op's host bias here — matching `forward_view`'s epilogue exactly.
+    fn finish_slot(&self, slot: usize, mp: usize, scale_a: f32) -> Array2<f32> {
+        let sh = &self.shared;
+        let mut out = sh.pipe_read(slot, mp, self.n, scale_a, &self.w_scale);
+        if sh.modal {
+            return out;
+        }
+        let n = self.n;
+        let bias = &self.bias;
+        match self.epi {
+            Epi::None => {}
+            Epi::Bias => out.axis_iter_mut(Axis(0)).for_each(|mut row| {
+                for c in 0..n {
+                    row[c] += bias[c];
+                }
+            }),
+            Epi::SiluBias => out.iter_mut().enumerate().for_each(|(i, v)| {
+                let z = *v + bias[i % n];
+                *v = z * fast_sigmoid(z);
+            }),
+        }
         out
     }
 }
@@ -724,16 +776,18 @@ impl FfnMm2 {
             // P(i-1) is on a different slot than the just-submitted Pi → safe to finish it now; its
             // host post-processing overlaps Pi's NPU compute.
             prev_run.wait().unwrap();
-            acc += &shared.pipe_read(prev_slot, mp, n, prev_scale, &self.parts[prev_i].w_scale);
+            let part = shared.pipe_read(prev_slot, mp, n, prev_scale, &self.parts[prev_i].w_scale);
+            prof::time("mm2_accum", || acc += &part);
             prev_run = cur_run;
             prev_scale = cur_scale;
             prev_slot = slot;
             prev_i = i;
         }
         prev_run.wait().unwrap();
-        acc += &shared.pipe_read(prev_slot, mp, n, prev_scale, &self.parts[prev_i].w_scale);
+        let part = shared.pipe_read(prev_slot, mp, n, prev_scale, &self.parts[prev_i].w_scale);
+        prof::time("mm2_accum", || acc += &part);
 
-        self.add_bias2(&mut acc);
+        prof::time("mm2_accum", || self.add_bias2(&mut acc));
         acc
     }
 
@@ -745,6 +799,61 @@ impl FfnMm2 {
                 row[c] += b2[c];
             }
         });
+    }
+}
+
+/// The subsample front-end's conv2 matmul on the resident ctxA (DEFAULT-ON, `NPU_SS_NPU=0` reverts).
+/// conv2 is `cols[Lout, 3840] @ w2ᵀ -> [Lout, 768]` and K=3840 = 5×768, so it K-splits onto ctxA
+/// EXACTLY like [`FfnMm2`] (5 partials, Epi::None, host f32 accumulate, +b2 once; ReLU stays on the
+/// caller). Output is `[Lout, 768]` = the subsample result directly (no transpose). Runs at the
+/// resident kernel's precision. MEASURED net-positive (e2e −20ms bf16) + WER-safe at every precision
+/// (bf16 9.6→9.2%, int8 9.2→8.7%, native 9.2%). Offloads ~1.18 GMAC of host matmul.
+pub const CONV2_KSPLIT: usize = 5; // 3840 / 768
+
+pub struct Conv2Mm {
+    parts: Vec<CtxAOp>, // CONV2_KSPLIT ops on ctxA, each weight [KA, 768], Epi::None
+    bias: Vec<f32>,     // length 768 (cout), added on host once after the partial sum
+}
+
+impl Conv2Mm {
+    /// `w2` is the conv2 weight `[cout=768, cin=768, k=5]`, `b2` length 768. Reshaped to `[768, 3840]`
+    /// (Cin-major, j = ci*k + ki — matching the host `im2col` cols flatten) and split along K into 5×
+    /// `[768, 768]` ctxA weights.
+    pub fn new(shared: Rc<SharedCtxA>, w2: &Array3<f32>, b2: &[f32]) -> Self {
+        let (cout, cin, k) = w2.dim();
+        assert_eq!(cout, MM2_OUT, "conv2 cout must be {MM2_OUT}");
+        let kk = cin * k;
+        assert_eq!(kk, CONV2_KSPLIT * KA, "conv2 K={kk} must be {CONV2_KSPLIT}×{KA}");
+        assert_eq!(b2.len(), MM2_OUT);
+        // [cout, cin*k] in the same Cin-major flatten the host im2col uses for cols.
+        let w2r = w2.to_shape((cout, kk)).expect("reshape conv2 weight").to_owned();
+        let parts = (0..CONV2_KSPLIT)
+            .map(|p| {
+                // partial p: activation = cols[:, p*KA..(p+1)*KA] [Lout, KA]; weight W_p[j', co] =
+                // w2r[co, p*KA + j'] → CtxAOp wants [KA, n]=[K, cout], so W_p = w2r[:, p-block].T.
+                let wp = w2r.slice(s![.., p * KA..(p + 1) * KA]).t().to_owned(); // [KA, cout]
+                CtxAOp::new(shared.clone(), &wp, MM2_OUT, Epi::None, &[])
+            })
+            .collect();
+        Conv2Mm { parts, bias: b2.to_vec() }
+    }
+
+    /// `cols` is `[Lout, 3840]` (host im2col of the conv0 output). Returns `[Lout, 768]` = the conv2
+    /// pre-activation `cols @ w2ᵀ + b2` (the caller applies ReLU). Lout (=400) ≤ PAD_M.
+    pub fn forward(&self, cols: &Array2<f32>) -> Array2<f32> {
+        let (mp, kk) = cols.dim();
+        assert_eq!(kk, CONV2_KSPLIT * KA);
+        let mut acc = Array2::<f32>::zeros((mp, MM2_OUT));
+        for (p, op) in self.parts.iter().enumerate() {
+            let ck = cols.slice(s![.., p * KA..(p + 1) * KA]); // [Lout, KA] view
+            acc += &op.forward_view(ck);
+        }
+        acc.axis_iter_mut(Axis(0)).for_each(|mut row| {
+            for c in 0..MM2_OUT {
+                row[c] += self.bias[c];
+            }
+        });
+        acc
     }
 }
 
@@ -764,6 +873,85 @@ fn fast_sigmoid(x: f32) -> f32 {
 #[inline(always)]
 fn quant_i8(x: f32, scale: f32) -> i8 {
     (x / scale).round().clamp(-127.0, 127.0) as i8
+}
+
+/// Dynamic per-tensor activation scale = max|A|/127 over the real `[mp, KA]` view. `max` is exact and
+/// associative, so the parallel row-reduction (`fast`) yields the BYTE-IDENTICAL amax to the serial
+/// `iter().fold` — it just spreads the mp×KA scan across cores instead of one thread. Returns the
+/// quant scale (1.0 for an all-zero tensor, matching the legacy guard).
+#[inline]
+fn quant_scale(a_real: ArrayView2<f32>, mp: usize, fast: bool) -> f32 {
+    let amax = if fast {
+        (0..mp)
+            .into_par_iter()
+            .map(|r| {
+                let mut m = 0f32;
+                for c in 0..KA {
+                    m = m.max(a_real[[r, c]].abs());
+                }
+                m
+            })
+            .reduce(|| 0f32, f32::max)
+    } else {
+        a_real.iter().fold(0f32, |m, &v| m.max(v.abs()))
+    };
+    if amax > 0.0 { amax / 127.0 } else { 1.0 }
+}
+
+/// Dequant an i32 accumulator `[mp, n]` → f32 with the per-op epilogue. The `fast` path is row-chunked
+/// so the column index `c` is an inner loop counter — no per-element `i % n` hardware divide (n is a
+/// runtime non-power-of-2 divisor, so it can't be strength-reduced) — and `ws[c]`/`bias[c]` reads are
+/// sequential. The per-element float ops keep the EXACT legacy order `(acc as f32 * scale_a) * ws[c]
+/// [+ bias[c]]`, so the output is byte-identical to the `into_par_iter` path; only the loop shape and
+/// the dropped divide differ. The legacy branch is retained for clean A/B.
+#[inline]
+fn dequant_epi(
+    acc: &[i32],
+    mp: usize,
+    n: usize,
+    scale_a: f32,
+    ws: &[f32],
+    epi: Epi,
+    bias: &[f32],
+    fast: bool,
+) -> Vec<f32> {
+    if !fast {
+        return (0..mp * n)
+            .into_par_iter()
+            .map(|i| {
+                let c = i % n;
+                let v = acc[i] as f32 * scale_a * ws[c];
+                match epi {
+                    Epi::None => v,
+                    Epi::Bias => v + bias[c],
+                    Epi::SiluBias => {
+                        let z = v + bias[c];
+                        z * fast_sigmoid(z)
+                    }
+                }
+            })
+            .collect();
+    }
+    let mut data = vec![0f32; mp * n];
+    data.par_chunks_mut(n).zip(acc.par_chunks(n)).for_each(|(orow, arow)| match epi {
+        Epi::None => {
+            for c in 0..n {
+                orow[c] = arow[c] as f32 * scale_a * ws[c];
+            }
+        }
+        Epi::Bias => {
+            for c in 0..n {
+                orow[c] = arow[c] as f32 * scale_a * ws[c] + bias[c];
+            }
+        }
+        Epi::SiluBias => {
+            for c in 0..n {
+                let z = arow[c] as f32 * scale_a * ws[c] + bias[c];
+                orow[c] = z * fast_sigmoid(z);
+            }
+        }
+    });
+    data
 }
 
 /// Reinterpret an i8 slice as raw bytes for `Bo::write_bytes` (1 byte/elem).

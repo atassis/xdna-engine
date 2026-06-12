@@ -1,0 +1,55 @@
+##===- Makefile.phase ----------------------------------------------------===##
+#
+# STEP C O1/G2 GEMM+LN co-residency probe: ONE xclbin holding a GEMM core (mm.cc) AND an
+# LN core (layer_norm.cc), both active concurrently on disjoint regions of the f32 C buffer.
+# Build the co-resident artifact + the two single-core latency baselines:
+#   make -f Makefile.phase NPU2=1 mode=both build/final_32x32x64_both.xclbin
+#   make -f Makefile.phase NPU2=1 mode=gemm build/final_32x32x64_gemm.xclbin
+#   make -f Makefile.phase NPU2=1 mode=ln   build/final_32x32x64_ln.xclbin
+# Drive from bin/phase_probe.rs: one hwctx, dispatch x100, compare both vs gemm-only latency.
+#
+srcdir := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
+subdir=whole_array
+targetname=phase_probe
+
+# Single GEMM tile = one core. LN slab reuses the [m,n] f32 C buffer.
+# 32x32x64 is a UNIQUE tile (mm_32x32x64.o collides with no shipped kernel), so probe
+# artifacts never race with the parallel Step-B builds in the shared mlir-aie sandbox.
+m?=32
+k?=32
+n?=64
+
+# makefile-common bakes -M -K -N --dtype_in --dtype_out into aieargs; give them values.
+M?=32
+K?=32
+N?=64
+dtype_in?=bf16
+dtype_out?=f32
+
+mode?=both
+
+# the two distinct core programs baked into the xclbin
+kernels=mm_${m}x${k}x${n} layer_norm
+
+aieargs+=-m $m -k $k -n $n --mode ${mode}
+
+# distinct suffix so probe artifacts never collide with shipped kernels
+target_suffix=${m}x${k}x${n}_${mode}
+
+use_iron=1
+aie_py_src=phase_probe_iron.py
+
+buffer_aloc_flag=basic-sequential
+
+# mm.cc bf16->f32 single-tile matmul (same defines the Step-B halfprobe uses)
+MM_DEFINES=-Dbf16_f32_ONLY -DDIM_M=${m} -DDIM_K=${k} -DDIM_N=${n} -DVECTORIZED_ONLY
+
+include ${srcdir}/../makefile-common
+
+build/mm_${m}x${k}x${n}.o: ${kernels_dir}/mm.cc
+	mkdir -p ${@D}
+	cd ${@D} && ${KERNEL_CC} ${KERNEL_CFLAGS} ${MM_DEFINES} ${KERNEL_DEFINES} -c $< -o ${@F}
+
+build/layer_norm.o: ${kernels_dir}/layer_norm.cc
+	mkdir -p ${@D}
+	cd ${@D} && ${KERNEL_CC} ${KERNEL_CFLAGS} ${KERNEL_DEFINES} -c $< -o ${@F}

@@ -9,5 +9,7 @@ pub mod weights;
 pub mod engines;
 #[cfg(feature = "two_ctx")]
 pub mod ctx2;
+#[cfg(feature = "two_ctx")]
+pub mod ctx_ln;
 pub mod block;
 pub mod encoder;

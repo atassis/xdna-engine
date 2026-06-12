@@ -19,6 +19,8 @@ use crate::engines::ChainedFFN;
 use crate::engines::WAEpilogue;
 #[cfg(feature = "two_ctx")]
 use crate::ctx2::{CtxAOp, Epi, FfnMm2, SharedCtxA};
+#[cfg(feature = "two_ctx")]
+use crate::ctx_ln::CtxLn;
 use crate::weights::BlockWeights;
 
 const D_MODEL: usize = 768;
@@ -49,6 +51,14 @@ fn fold_ln_into_mm1(g: &[f32], beta: &[f32], w1: &Array2<f32>, b1: &[f32]) -> (A
     (w1p, b1p)
 }
 
+/// Apply the LN affine on the host: out[r,j] = x[r,j]*gamma[j] + beta[j]. Used after the on-NPU
+/// normalize-only ctxLN for the 4 affine LN sites (the normalize — mean/var/invsqrt, the numerically
+/// hard transcendental — is on the NPU; this cheap linear affine stays exact on the host).
+#[cfg(feature = "two_ctx")]
+fn apply_affine(x: &Array2<f32>, gamma: &[f32], beta: &[f32]) -> Array2<f32> {
+    Array2::from_shape_fn(x.dim(), |(r, j)| x[[r, j]] * gamma[j] + beta[j])
+}
+
 /// Macaron-half FFN. By default (`chained_ffn` feature) the 3072-wide intermediate H is kept in a
 /// device BO across the two dispatches (no host round-trip). Without the feature it falls back to
 /// the original two independent weight-bound dispatches with a host hop between them. Either way:
@@ -57,6 +67,8 @@ fn fold_ln_into_mm1(g: &[f32], beta: &[f32], w1: &Array2<f32>, b1: &[f32]) -> (A
 struct FusedFFN {
     mm1: CtxAOp, // ctxA plain matmul N=3072; host epilogue = SiLU(z + b1) (Epi::SiluBias)
     mm2: FfnMm2, // SAME ctxA, K=3072 split into 4× N=768 partials; host-accumulate + bias2
+    // ctxLN: the (folded, normalize-only) LN runs on the NPU when NPU_LN_NPU=1 (Step D). None = host.
+    ctx_ln: Option<Rc<CtxLn>>,
 }
 #[cfg(all(not(feature = "two_ctx"), feature = "chained_ffn"))]
 struct FusedFFN {
@@ -94,7 +106,7 @@ impl FusedFFN {
     /// two_ctx FFN: mm1 on shared ctxA (plain, N=3072), mm2 on shared ctxB (N=768). The LN affine is
     /// folded into W1 exactly as before; bias1 is added on host then SiLU; bias2 added on host.
     #[cfg(feature = "two_ctx")]
-    fn new(w: &BlockWeights, pfx: &str, norm: &str, ctx_a: Rc<SharedCtxA>) -> Self {
+    fn new(w: &BlockWeights, pfx: &str, norm: &str, ctx_a: Rc<SharedCtxA>, ctx_ln: Option<Rc<CtxLn>>) -> Self {
         let g = w.v(&format!("{norm}.weight"));
         let beta = w.v(&format!("{norm}.bias"));
         let w1 = w.m(&format!("{pfx}.linear1.weight")); // [768,3072]
@@ -107,7 +119,7 @@ impl FusedFFN {
         let mm1 = CtxAOp::new(ctx_a.clone(), &w1p, D_FF, Epi::SiluBias, &b1p);
         // mm2 on the SAME ctxA (K=3072 split into 4× N=768) -> one resident xclbin, zero switches.
         let mm2 = FfnMm2::new(ctx_a, &w2, &b2);
-        FusedFFN { mm1, mm2 }
+        FusedFFN { mm1, mm2, ctx_ln }
     }
 
     #[cfg(not(feature = "two_ctx"))]
@@ -125,7 +137,11 @@ impl FusedFFN {
 
     #[cfg(feature = "two_ctx")]
     fn forward(&self, x: &Array2<f32>) -> Array2<f32> {
-        let norm = prof::time("layer_norm", || layer_norm_normalize(x, LN_EPS)); // affine folded into mm1
+        // affine folded into mm1 -> normalize-only LN; on the NPU (ctxLN) when NPU_LN_NPU=1, else host.
+        let norm = prof::time("layer_norm", || match &self.ctx_ln {
+            Some(cl) => cl.normalize(x),
+            None => layer_norm_normalize(x, LN_EPS),
+        });
         let h = self.mm1.forward(&norm); // [Mp,3072] = SiLU(norm@W1' + b1) (host epilogue)
         self.mm2.forward(&h) // [Mp,768] = h@W2 + b2 (host bias2)
     }
@@ -151,6 +167,12 @@ pub struct FusedBlock {
     /// two_ctx Goal-2 toggle: fused bias+GLU+transpose (default) vs the original bias→transpose→glu.
     /// Runtime-selected (`NPU_GLU_FUSED=0` disables) so the cut can be A/B'd cleanly in one binary.
     glu_fused_on: bool,
+    /// two_ctx Goal-1 toggle: overlap qk ∥ v (independent attention projections) on the 2 pipe slots.
+    /// MEASURED opt-in (`NPU_QKV_OVERLAP=1`): byte-identical, but NEUTRAL on the fast-bf16 default
+    /// (per-dispatch NPU compute ~0.3ms — only 2 ops/block to hide), ~6ms on native. Default-OFF so the
+    /// shipped default is unchanged; kept as a lever for the native path. No-op if the mm2 pipeline is off.
+    #[cfg(feature = "two_ctx")]
+    qkv_overlap_on: bool,
     // host LayerNorm affines
     ln_satt_w: Vec<f32>,
     ln_satt_b: Vec<f32>,
@@ -160,6 +182,9 @@ pub struct FusedBlock {
     bn_b: Vec<f32>,
     ln_out_w: Vec<f32>,
     ln_out_b: Vec<f32>,
+    // ctxLN: the 4 affine LNs run normalize-on-NPU + host γ,β when NPU_LN_NPU=1 (Step D). None = host.
+    #[cfg(feature = "two_ctx")]
+    ctx_ln: Option<Rc<CtxLn>>,
     dw_taps: Array2<f32>, // [768,5]
     dw_bias: Vec<f32>,
     cos: Array2<f32>,
@@ -175,15 +200,16 @@ impl FusedBlock {
         cos: &Array2<f32>,
         sin: &Array2<f32>,
         #[cfg(feature = "two_ctx")] ctx_a: Rc<SharedCtxA>,
+        #[cfg(feature = "two_ctx")] ctx_ln: Option<Rc<CtxLn>>,
     ) -> Self {
         #[cfg(not(feature = "two_ctx"))]
         let ffn1 = FusedFFN::new(dev.clone(), root, w, "feed_forward1", "norm_feed_forward1");
         #[cfg(not(feature = "two_ctx"))]
         let ffn2 = FusedFFN::new(dev.clone(), root, w, "feed_forward2", "norm_feed_forward2");
         #[cfg(feature = "two_ctx")]
-        let ffn1 = FusedFFN::new(w, "feed_forward1", "norm_feed_forward1", ctx_a.clone());
+        let ffn1 = FusedFFN::new(w, "feed_forward1", "norm_feed_forward1", ctx_a.clone(), ctx_ln.clone());
         #[cfg(feature = "two_ctx")]
-        let ffn2 = FusedFFN::new(w, "feed_forward2", "norm_feed_forward2", ctx_a.clone());
+        let ffn2 = FusedFFN::new(w, "feed_forward2", "norm_feed_forward2", ctx_a.clone(), ctx_ln.clone());
 
         // Build a K=768 `_bias` projection op. Default -> its own `_bias` WAEpilogue (per-shape
         // xclbin). two_ctx -> a CtxAOp on the shared ctxA kernel (bias added on host).
@@ -252,6 +278,8 @@ impl FusedBlock {
             pw2,
             pw1_bias,
             glu_fused_on: std::env::var("NPU_GLU_FUSED").as_deref() != Ok("0"),
+            #[cfg(feature = "two_ctx")]
+            qkv_overlap_on: std::env::var("NPU_QKV_OVERLAP").as_deref() == Ok("1"),
             ln_satt_w: w.v("norm_self_att.weight"),
             ln_satt_b: w.v("norm_self_att.bias"),
             ln_conv_w: w.v("norm_conv.weight"),
@@ -260,6 +288,8 @@ impl FusedBlock {
             bn_b: w.v("conv.batch_norm.bias"),
             ln_out_w: w.v("norm_out.weight"),
             ln_out_b: w.v("norm_out.bias"),
+            #[cfg(feature = "two_ctx")]
+            ctx_ln,
             dw_taps,
             dw_bias: w.v("conv.depthwise_conv.bias"),
             cos: cos.clone(),
@@ -267,11 +297,33 @@ impl FusedBlock {
         }
     }
 
+    /// Affine LayerNorm dispatch: normalize on the NPU (ctxLN) then host γ,β when NPU_LN_NPU=1,
+    /// else the all-host `layer_norm`. Both match the host reference exactly.
+    #[cfg(feature = "two_ctx")]
+    fn ln_affine(&self, x: &Array2<f32>, gamma: &[f32], beta: &[f32]) -> Array2<f32> {
+        match &self.ctx_ln {
+            Some(cl) => apply_affine(&cl.normalize(x), gamma, beta),
+            None => layer_norm(x, gamma, beta, LN_EPS),
+        }
+    }
+    #[cfg(not(feature = "two_ctx"))]
+    fn ln_affine(&self, x: &Array2<f32>, gamma: &[f32], beta: &[f32]) -> Array2<f32> {
+        layer_norm(x, gamma, beta, LN_EPS)
+    }
+
     /// x is [T, 768] (bf16-valued f32). `valid_len` is the number of non-padded time frames;
     /// the two time-mixing ops (attention, depthwise conv) mask positions >= valid_len so padding
     /// doesn't leak into valid frames (pass valid_len >= T for no masking). Returns [T, 768].
-    pub fn forward(&self, x: &Array2<f32>, valid_len: usize) -> Array2<f32> {
-        let mut x = prof::time("bf16_round", || x.mapv(bf16_round));
+    pub fn forward(&self, x: &Array2<f32>, valid_len: usize, is_first: bool) -> Array2<f32> {
+        // R1: the block stack maintains a bf16-valued invariant — enc_prep rounds block 0's input, and
+        // every block returns a bf16-rounded output (final LN + residual_add_round). So this per-block entry
+        // round is IDEMPOTENT for blocks >=1; skip it (byte-identical). Keep block 0's as a defensive
+        // boundary even though enc_prep already rounds it.
+        let mut x = if is_first {
+            prof::time("bf16_round", || x.mapv(bf16_round))
+        } else {
+            x.to_owned()
+        };
 
         // --- FFN1 (macaron half), residual ×0.5 ---
         let f1 = self.ffn1.forward(&x);
@@ -279,15 +331,29 @@ impl FusedBlock {
 
         // --- MHSA ---
         let ln = prof::time("layer_norm", || {
-            layer_norm(&x, &self.ln_satt_w, &self.ln_satt_b, LN_EPS)
+            self.ln_affine(&x, &self.ln_satt_w, &self.ln_satt_b)
         });
         let r = prof::time("rope", || {
             rope(&ln, &self.cos, &self.sin, N_HEADS, HEAD_DIM)
         });
+        // qk (reads rope'd `r`) ∥ v (reads `ln`) are independent and both feed mha → overlap their
+        // NPU compute with each other's host marshaling on the 2 pipe slots (Goal-1, two_ctx default).
+        #[cfg(feature = "two_ctx")]
+        let (qk, vp) = if self.qkv_overlap_on {
+            self.qk.forward2_overlapped(r.view(), &self.v, ln.view())
+        } else {
+            (self.qk.forward(&r), self.v.forward(&ln))
+        };
+        #[cfg(not(feature = "two_ctx"))]
         let qk = self.qk.forward(&r); // [T,1536]
-        let qp = qk.slice(s![.., ..D_MODEL]).to_owned();
-        let kp = qk.slice(s![.., D_MODEL..]).to_owned();
+        #[cfg(not(feature = "two_ctx"))]
         let vp = self.v.forward(&ln);
+        let (qp, kp) = prof::time("qk_split", || {
+            (
+                qk.slice(s![.., ..D_MODEL]).to_owned(),
+                qk.slice(s![.., D_MODEL..]).to_owned(),
+            )
+        });
         let ctx = prof::time("mha", || {
             mha(&qp, &kp, &vp, N_HEADS, HEAD_DIM, true, valid_len)
         });
@@ -296,7 +362,7 @@ impl FusedBlock {
 
         // --- ConvModule ---
         let ln = prof::time("layer_norm", || {
-            layer_norm(&x, &self.ln_conv_w, &self.ln_conv_b, LN_EPS)
+            self.ln_affine(&x, &self.ln_conv_w, &self.ln_conv_b)
         });
         let pw1 = self.pw1.forward(&ln); // two_ctx: [T,1536] RAW; fallback: [T,1536] biased
         #[cfg(feature = "two_ctx")]
@@ -321,14 +387,16 @@ impl FusedBlock {
             glu(&pw1t) // [768,T]
         });
         // zero padded time columns so the depthwise FIR (k=5) doesn't pull padding into valid frames
-        let tt_g = g.ncols();
-        if valid_len < tt_g {
-            for c in 0..g.nrows() {
-                for ti in valid_len..tt_g {
-                    g[[c, ti]] = 0.0;
+        prof::time("pad_mask", || {
+            let tt_g = g.ncols();
+            if valid_len < tt_g {
+                for c in 0..g.nrows() {
+                    for ti in valid_len..tt_g {
+                        g[[c, ti]] = 0.0;
+                    }
                 }
             }
-        }
+        });
         let dwout = prof::time("dwconv", || {
             let mut dwout = dwconv_k5(&g, &self.dw_taps); // [768,T] on host (parallel 5-tap FIR)
             // + depthwise bias (broadcast over T)
@@ -342,10 +410,13 @@ impl FusedBlock {
             dwout
         });
         let bn = prof::time("layer_norm", || {
-            layer_norm(&dwout.t().to_owned(), &self.bn_w, &self.bn_b, LN_EPS) // [T,768]
+            self.ln_affine(&dwout.t().to_owned(), &self.bn_w, &self.bn_b) // [T,768]
         });
-        let sw = prof::time("silu", || silu(&bn.t().to_owned())); // [768,T]
-        let pw2 = self.pw2.forward(&sw.t().to_owned()); // [T,768]
+        // silu is elementwise, so silu(bn) == silu(bn.t()).t(), and pw2 wants [T,768] = silu(bn)
+        // directly — so apply silu in the [T,768] layout and skip the bn.t() and sw.t() copies (the
+        // conv tail had 3 transposes of [768,T]; this removes 2). Byte-identical (same f32 values).
+        let sw = prof::time("silu", || silu(&bn)); // [T,768]
+        let pw2 = self.pw2.forward(&sw); // [T,768]
         x = prof::time("residual+bf16", || residual_add_round(&x, &pw2, 1.0));
 
         // --- FFN2 (macaron half), residual ×0.5 ---
@@ -354,7 +425,7 @@ impl FusedBlock {
 
         // --- final LayerNorm ---
         prof::time("layer_norm", || {
-            layer_norm(&x, &self.ln_out_w, &self.ln_out_b, LN_EPS).mapv(bf16_round)
+            self.ln_affine(&x, &self.ln_out_w, &self.ln_out_b).mapv(bf16_round)
         })
     }
 }

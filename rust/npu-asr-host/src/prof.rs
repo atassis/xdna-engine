@@ -51,6 +51,16 @@ fn add(name: &'static str, ns: u128) {
     }
 }
 
+/// Add a pre-measured ns total into bucket `name` (for sub-step accumulators that can't wrap a
+/// closure — e.g. timing inside a rayon parallel loop via atomics, then emitting once after the join).
+/// No-op when disabled.
+pub fn add_ns(name: &'static str, ns: u128) {
+    if !enabled() {
+        return;
+    }
+    add(name, ns);
+}
+
 /// Time a closure into bucket `name` (no-op overhead when disabled apart from the call itself).
 #[inline]
 pub fn time<T>(name: &'static str, f: impl FnOnce() -> T) -> T {

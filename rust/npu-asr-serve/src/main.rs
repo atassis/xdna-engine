@@ -22,7 +22,7 @@ const MAX_BODY: usize = 64 * 1024 * 1024;
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(30);
 
 use ndarray::prelude::*;
-use npu_asr::encoder::{subsample, Encoder};
+use npu_asr::encoder::Encoder;
 use npu_asr::weights::WeightStore;
 use npu_onnx::{Env, Session, Tensor};
 use npu_xrt::Device;
@@ -90,9 +90,9 @@ impl Pipeline {
         let valid = (teff.max(1) - 1) / 4 + 1;
         let mel_ms = t_mel.elapsed().as_secs_f64() * 1e3;
         let t_enc = Instant::now();
-        let x0 = subsample(&self.ws, &audio);
-        let outs = self.enc.forward_blocks(&x0, valid);
-        let encoded = outs.last().unwrap(); // [400,768] frame-major
+        let x0 = self.enc.subsample(&self.ws, &audio);
+        let encoded = self.enc.forward_last(&x0, valid); // [400,768] frame-major (no per-block Vec)
+        let encoded = &encoded;
         let enc_ms = t_enc.elapsed().as_secs_f64() * 1e3;
         let t_dec = Instant::now();
         let ids = self.decode(encoded, valid);

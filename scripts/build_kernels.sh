@@ -18,6 +18,9 @@ make -C $PE/ml/dwconv1d NPU2=1
 echo "== layernorm [400x768] =="
 make -C $PE/ml/layernorm NPU2=1 rows=400 cols=768
 
+echo "== ctxLN [512x768] (encoder LayerNorm on NPU, Step D — f32 two-pass, NPU_LN_NPU=1) =="
+make -C $PE/ml/layernorm -f Makefile.ctxln NPU2=1 rows=512 cols=768 build/final_ctxln_512x768.xclbin
+
 echo "== silu (two sizes; length/cols/chans must be a multiple of 1024) =="
 rm -f $PE/ml/silu/build/*.o $PE/ml/silu/build/kernels.a
 make -C $PE/ml/silu NPU2=1 length=307200 cols=4 chans=1

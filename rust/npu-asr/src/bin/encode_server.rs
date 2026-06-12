@@ -61,8 +61,10 @@ fn main() {
         }
         let valid = (teff.max(1) - 1) / 4 + 1;
         let x0 = subsample(&ws, &audio);
-        let outs = enc.forward_blocks(&x0, valid); // mask padded frames past valid_len
-        let encoded = outs[outs.len() - 1].t().to_owned(); // [768,400]
+        // R5: the service uses only the final block output → forward_last avoids cloning + retaining all
+        // 16 intermediate [T,768] tensors (~20 MB/req of pure waste). Numerically identical to forward_blocks().pop().
+        let last = enc.forward_last(&x0, valid); // mask padded frames past valid_len
+        let encoded = last.t().to_owned(); // [768,400]
 
         out.write_all(&(valid as u32).to_le_bytes()).unwrap();
         let mut resp = Vec::with_capacity(D * T_OUT * 4);
