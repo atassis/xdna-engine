@@ -73,6 +73,10 @@ impl Precision {
 /// ctxA fixed contraction / padded output width.
 pub const KA: usize = 768;
 pub const NA: usize = 3072;
+/// K-augmented contraction for the Step-A modal on-chip epilogue (`NPU_MODAL_EPI=1`): bias rides an
+/// extra 32-wide k-block (`A_aug=[A|ones]`, `B_aug=[B;bias]` → `A@B+bias`), so the on-chip epilogue
+/// needs no host bias-add and no 3rd DMA channel. KAUG = KA + 32 = 800.
+pub const KAUG: usize = KA + 32;
 
 /// On-chip-epilogue replacement, applied on the HOST to ctxA's f32 output (first N columns only).
 #[derive(Clone, Copy, PartialEq)]
@@ -120,6 +124,14 @@ pub struct SharedCtxA {
     /// while the host preps the next / post-processes the previous). See [`FfnMm2::forward`].
     pipeline: bool,
     pipe: Vec<PipeSlot>,
+    /// Step-A modal on-chip epilogue (`NPU_MODAL_EPI=1`, bf16/native only). The resident xclbin is the
+    /// K-augmented (K=800) f32-out modal design; bias is folded via K-aug and SiLU runs on-chip,
+    /// selected per dispatch by the instruction-stream's baked RTP mode. Output stays f32 (no
+    /// re-expand), so the host epilogue becomes a no-op. `ka_dev` = device-side K (768 normal, 800
+    /// modal). `modal_streams` = (N, is_silu, instr BO, n_instr) — 6 streams (3 N × {silu,identity}).
+    modal: bool,
+    ka_dev: usize,
+    modal_streams: Vec<(usize, bool, Bo, usize)>,
 }
 
 /// One double-buffer slot for the async mm2 pipeline: its own activation/output BOs (so a dispatch
@@ -147,10 +159,25 @@ impl SharedCtxA {
     pub fn with_precision(dev: &Rc<Device>, root: &Path, prec: Precision) -> Rc<Self> {
         let wa = root.join(WA_SUBDIR);
         let (mt, kt, nt) = prec.tile();
-        eprintln!("[ctx2] V2 encoder precision = {prec:?} (tile {mt}x{kt}x{nt})");
-        // ONE resident kernel = the largest (N=3072) plain whole-array program; every K=768 op runs
-        // on it via its own per-N instruction stream.
-        let xclbin = wa.join(format!("final_{PAD_M}x{KA}x{NA}_{mt}x{kt}x{nt}_8c.xclbin"));
+        // Step-A modal on-chip epilogue: K-aug bias + on-chip SiLU, f32 out, one resident xclbin with
+        // RTP-selected mode per inst-stream. bf16/native only (the modal xclbin is the native 32³ tile).
+        // modal on-chip epilogue (K-aug bias + on-chip SiLU, f32 out) — built for both bf16 tiles
+        // (native 32³, fast 64×32×96). DEFAULT-ON for bf16 (measured: fast −40ms → sub-300ms idle,
+        // WER 9.6% unchanged). int8 would need an i32-dequant epilogue (not built). Opt out:
+        // `NPU_MODAL_EPI=0`.
+        let modal = !prec.is_int8() && std::env::var("NPU_MODAL_EPI").as_deref() != Ok("0");
+        let ka_dev = if modal { KAUG } else { KA };
+        eprintln!(
+            "[ctx2] V2 encoder precision = {prec:?} (tile {mt}x{kt}x{nt}){}",
+            if modal { "  [modal on-chip epilogue: K-aug bias + on-chip SiLU, f32 out]" } else { "" }
+        );
+        // ONE resident kernel = the largest (N=3072) whole-array program; every op runs on it via its
+        // per-N (and, modal, per-mode) instruction stream.
+        let xclbin = if modal {
+            wa.join(format!("final_{PAD_M}x{KAUG}x{NA}_{mt}x{kt}x{nt}_8c_modalsilu.xclbin"))
+        } else {
+            wa.join(format!("final_{PAD_M}x{KA}x{NA}_{mt}x{kt}x{nt}_8c.xclbin"))
+        };
         let kern = dev
             .load_kernel(xclbin.to_str().unwrap(), None)
             .unwrap_or_else(|e| panic!("load {}: {e}", xclbin.display()));
@@ -162,20 +189,36 @@ impl SharedCtxA {
         let g_tmp = kern.group_id(6).unwrap();
         let g_tr = kern.group_id(7).unwrap();
 
-        // load the per-shape streams (insts built for the 768x{n} xclbins; they run correctly on the
-        // resident 768x3072 kernel — N is stream-driven, K is fixed at 768 for all of them).
-        let mut streams = Vec::with_capacity(CTXA_STREAMS.len());
-        for &n in CTXA_STREAMS.iter() {
-            let insts = wa.join(format!("insts_{PAD_M}x{KA}x{n}_{mt}x{kt}x{nt}_8c.txt"));
-            let (instr_bytes, n_instr) = read_instr_words(&insts);
+        let load_stream = |insts: &Path| {
+            let (instr_bytes, n_instr) = read_instr_words(insts);
             let bo = dev.alloc_bo(&kern, instr_bytes.len(), FLAG_CACHEABLE, g_instr).unwrap();
             bo.write_bytes(&instr_bytes).unwrap();
             bo.sync_to_device().unwrap();
-            streams.push((n, bo, n_instr));
+            (bo, n_instr)
+        };
+
+        // plain (non-modal) per-N streams; modal loads its 6 (N × {silu,identity}) streams below.
+        let mut streams = Vec::with_capacity(CTXA_STREAMS.len());
+        let mut modal_streams: Vec<(usize, bool, Bo, usize)> = Vec::new();
+        if modal {
+            for &n in CTXA_STREAMS.iter() {
+                for (is_silu, tag) in [(true, "modalsilu"), (false, "modalid")] {
+                    let insts = wa.join(format!("insts_{PAD_M}x{KAUG}x{n}_{mt}x{kt}x{nt}_8c_{tag}.txt"));
+                    let (bo, n_instr) = load_stream(&insts);
+                    modal_streams.push((n, is_silu, bo, n_instr));
+                }
+            }
+        } else {
+            for &n in CTXA_STREAMS.iter() {
+                let insts = wa.join(format!("insts_{PAD_M}x{KA}x{n}_{mt}x{kt}x{nt}_8c.txt"));
+                let (bo, n_instr) = load_stream(&insts);
+                streams.push((n, bo, n_instr));
+            }
         }
 
-        // activation BO: in_bytes/elem (bf16=2, int8=1). Output BO is 4B/elem either way (f32 / i32).
-        let bo_a = dev.alloc_bo(&kern, PAD_M * KA * prec.in_bytes(), FLAG_HOST_ONLY, g_a).unwrap();
+        // activation BO: in_bytes/elem (bf16=2, int8=1), K = ka_dev (768 / 800 modal). Output BO is
+        // 4B/elem (f32 / i32).
+        let bo_a = dev.alloc_bo(&kern, PAD_M * ka_dev * prec.in_bytes(), FLAG_HOST_ONLY, g_a).unwrap();
         let bo_c = dev.alloc_bo(&kern, PAD_M * NA * 4, FLAG_HOST_ONLY, g_c).unwrap();
         let bo_tmp = dev.alloc_bo(&kern, 1, FLAG_HOST_ONLY, g_tmp).unwrap();
         let bo_tr = dev.alloc_bo(&kern, 4, FLAG_HOST_ONLY, g_tr).unwrap();
@@ -188,13 +231,22 @@ impl SharedCtxA {
         if pipeline {
             eprintln!("[ctx2] async mm2 pipeline ENABLED (default; set NPU_MM2_PIPELINE=0 to disable)");
             for _ in 0..2 {
+                // modal: K-aug pipe activation (ones-column at KA) so the mm2 partials' identity stream
+                // adds their (zero) bias correctly; sized ka_dev.
+                let mut a_buf = vec![0u16; PAD_M * ka_dev];
+                if modal {
+                    let one = f32_to_bf16_bits(1.0);
+                    for r in 0..PAD_M {
+                        a_buf[r * ka_dev + KA] = one;
+                    }
+                }
                 pipe.push(PipeSlot {
-                    bo_a: dev.alloc_bo(&kern, PAD_M * KA * prec.in_bytes(), FLAG_HOST_ONLY, g_a).unwrap(),
+                    bo_a: dev.alloc_bo(&kern, PAD_M * ka_dev * prec.in_bytes(), FLAG_HOST_ONLY, g_a).unwrap(),
                     bo_c: dev.alloc_bo(&kern, PAD_M * NA * 4, FLAG_HOST_ONLY, g_c).unwrap(),
                     bo_tmp: dev.alloc_bo(&kern, 1, FLAG_HOST_ONLY, g_tmp).unwrap(),
                     bo_tr: dev.alloc_bo(&kern, 4, FLAG_HOST_ONLY, g_tr).unwrap(),
                     cbuf: RefCell::new(vec![0f32; PAD_M * NA]),
-                    a_buf: RefCell::new(if prec.is_int8() { Vec::new() } else { vec![0u16; PAD_M * KA] }),
+                    a_buf: RefCell::new(if prec.is_int8() { Vec::new() } else { a_buf }),
                     a_buf_i8: RefCell::new(if prec.is_int8() { vec![0i8; PAD_M * KA] } else { Vec::new() }),
                     a_inited: std::cell::Cell::new(false),
                 });
@@ -211,13 +263,38 @@ impl SharedCtxA {
             bo_tr,
             g_b,
             prec,
-            a_buf: RefCell::new(if prec.is_int8() { Vec::new() } else { vec![0u16; PAD_M * KA] }),
+            a_buf: RefCell::new(if prec.is_int8() {
+                Vec::new()
+            } else {
+                // modal: K-aug activation [PAD_M, 800] with the ones-column at index KA (so the K-aug
+                // matmul adds bias); the conversion loop writes only cols 0..KA, leaving this intact.
+                let mut v = vec![0u16; PAD_M * ka_dev];
+                if modal {
+                    let one = f32_to_bf16_bits(1.0);
+                    for r in 0..PAD_M {
+                        v[r * ka_dev + KA] = one;
+                    }
+                }
+                v
+            }),
             a_buf_i8: RefCell::new(if prec.is_int8() { vec![0i8; PAD_M * KA] } else { Vec::new() }),
             cbuf: RefCell::new(vec![0f32; PAD_M * NA]),
             a_inited: std::cell::Cell::new(false),
             pipeline,
             pipe,
+            modal,
+            ka_dev,
+            modal_streams,
         })
+    }
+
+    /// (instr BO, n_instr) for the modal stream producing N=`n` in mode `is_silu` on the resident xclbin.
+    fn modal_stream(&self, n: usize, is_silu: bool) -> (&Bo, usize) {
+        self.modal_streams
+            .iter()
+            .find(|(sn, ss, _, _)| *sn == n && *ss == is_silu)
+            .map(|(_, _, bo, ni)| (bo, *ni))
+            .unwrap_or_else(|| panic!("ctxA modal: no stream N={n} silu={is_silu}"))
     }
 
     /// Async overlap, the prep half: convert+write+sync slot `s`'s activation from the strided view
@@ -246,14 +323,15 @@ impl SharedCtxA {
             }
             scale_a
         } else {
+            let kd = self.ka_dev;
             let mut a = slot.a_buf.borrow_mut();
-            a.par_chunks_mut(KA).take(mp).enumerate().for_each(|(r, row)| {
+            a.par_chunks_mut(kd).take(mp).enumerate().for_each(|(r, row)| {
                 for c in 0..KA {
                     row[c] = f32_to_bf16_bits(a_real[[r, c]]);
                 }
             });
             if slot.a_inited.get() {
-                slot.bo_a.write_bytes(&u16_bytes(&a)[..mp * KA * 2]).unwrap();
+                slot.bo_a.write_bytes(&u16_bytes(&a)[..mp * kd * 2]).unwrap();
             } else {
                 slot.bo_a.write_bytes(u16_bytes(&a)).unwrap();
                 slot.a_inited.set(true);
@@ -265,7 +343,12 @@ impl SharedCtxA {
         slot.bo_a.sync_to_device().unwrap();
         marsh::add(marsh::SYNC_TO, ts.elapsed());
 
-        let (instr, n_instr) = self.stream(n);
+        // mm2 partials use the identity epilogue (Epi::None -> zero K-aug bias); modal selects it.
+        let (instr, n_instr) = if self.modal {
+            self.modal_stream(n, false)
+        } else {
+            self.stream(n)
+        };
         let run = self
             .kern
             .run_matmul8_start(3, instr, n_instr, &slot.bo_a, bo_b, &slot.bo_c, &slot.bo_tmp, &slot.bo_tr)
@@ -321,8 +404,9 @@ pub struct CtxAOp {
     n: usize,       // real output width (one of CTXA_STREAMS)
     epi: Epi,
     bias: Vec<f32>, // length n
-    bo_b: Bo,       // weight [KA, n] row-major, synced once (bf16 bits, or int8 for the int8 path)
+    bo_b: Bo,       // weight [KA, n] row-major (modal: [KAUG, n] with bias K-aug'd into row KA)
     w_scale: Vec<f32>, // int8: per-output-channel symmetric scale (len n); empty for bf16
+    is_silu: bool,  // modal: dispatch the silu-mode stream (Epi::SiluBias) vs identity (else)
 }
 
 impl CtxAOp {
@@ -358,11 +442,22 @@ impl CtxAOp {
             bo_b.sync_to_device().unwrap();
             (bo_b, w_scale)
         } else {
-            let mut b_bits = vec![0u16; KA * n];
+            // modal: weight is [KAUG, n] with bias K-aug'd into row KA (rows KA+1..KAUG stay 0); the
+            // on-chip epilogue then adds nothing for bias (it's in the matmul) and applies SiLU for
+            // the silu-mode stream. Non-modal: plain [KA, n].
+            let kd = shared.ka_dev;
+            let mut b_bits = vec![0u16; kd * n];
             for kk in 0..KA {
                 let base = kk * n;
                 for nn in 0..n {
                     b_bits[base + nn] = f32_to_bf16_bits(w_real[[kk, nn]]);
+                }
+            }
+            if shared.modal {
+                let base = KA * n; // the K-aug bias row
+                for nn in 0..n {
+                    let bv = if epi == Epi::None { 0.0 } else { bias[nn] };
+                    b_bits[base + nn] = f32_to_bf16_bits(bv);
                 }
             }
             let bo_b = shared.dev_alloc_b(b_bits.len() * 2).expect("alloc ctxA weight BO");
@@ -372,6 +467,7 @@ impl CtxAOp {
         };
 
         CtxAOp {
+            is_silu: shared.modal && epi == Epi::SiluBias,
             shared,
             n,
             epi,
@@ -400,16 +496,19 @@ impl CtxAOp {
         let sh = &self.shared;
 
         // --- write/convert activation into the shared bf16 buffer (rows beyond mp stay zero) ---
+        // modal: buffer row width is ka_dev=800 with the ones-column at index KA preserved (set once
+        // at init); we only write the real KA cols here, so the K-aug bias term stays intact.
+        let kd = sh.ka_dev;
         let tc = Instant::now();
         {
             let mut a = sh.a_buf.borrow_mut();
-            a.par_chunks_mut(KA).take(mp).enumerate().for_each(|(r, row)| {
+            a.par_chunks_mut(kd).take(mp).enumerate().for_each(|(r, row)| {
                 for c in 0..KA {
                     row[c] = f32_to_bf16_bits(a_real[[r, c]]);
                 }
             });
             if sh.a_inited.get() {
-                sh.bo_a.write_bytes(&u16_bytes(&a)[..mp * KA * 2]).unwrap();
+                sh.bo_a.write_bytes(&u16_bytes(&a)[..mp * kd * 2]).unwrap();
             } else {
                 sh.bo_a.write_bytes(u16_bytes(&a)).unwrap();
                 sh.a_inited.set(true);
@@ -420,9 +519,13 @@ impl CtxAOp {
         sh.bo_a.sync_to_device().unwrap();
         marsh::add(marsh::SYNC_TO, ts.elapsed());
 
-        // --- dispatch on the resident kernel via this op's N=n stream (swap instr BO only) ---
+        // --- dispatch on the resident kernel via this op's stream (modal: N + epilogue-mode) ---
         let n = self.n;
-        let (instr, n_instr) = sh.stream(n);
+        let (instr, n_instr) = if sh.modal {
+            sh.modal_stream(n, self.is_silu)
+        } else {
+            sh.stream(n)
+        };
         let t0 = Instant::now();
         sh.kern
             .run_matmul8(3, instr, n_instr, &sh.bo_a, &self.bo_b, &sh.bo_c, &sh.bo_tmp, &sh.bo_tr)
@@ -446,17 +549,22 @@ impl CtxAOp {
         let vals: &[f32] = &cf[..mp * n];
         let epi = self.epi;
         let bias = &self.bias;
-        let data: Vec<f32> = match epi {
-            Epi::None => vals.to_vec(),
-            Epi::Bias => vals.par_iter().enumerate().map(|(i, &raw)| raw + bias[i % n]).collect(),
-            Epi::SiluBias => vals
-                .par_iter()
-                .enumerate()
-                .map(|(i, &raw)| {
-                    let v = raw + bias[i % n];
-                    v * fast_sigmoid(v)
-                })
-                .collect(),
+        // modal: bias + SiLU already applied on-chip (f32 out) -> host epilogue is a no-op copy.
+        let data: Vec<f32> = if sh.modal {
+            vals.to_vec()
+        } else {
+            match epi {
+                Epi::None => vals.to_vec(),
+                Epi::Bias => vals.par_iter().enumerate().map(|(i, &raw)| raw + bias[i % n]).collect(),
+                Epi::SiluBias => vals
+                    .par_iter()
+                    .enumerate()
+                    .map(|(i, &raw)| {
+                        let v = raw + bias[i % n];
+                        v * fast_sigmoid(v)
+                    })
+                    .collect(),
+            }
         };
         let out = Array2::from_shape_vec((mp, n), data).unwrap();
         marsh::add(marsh::EPI, te.elapsed());

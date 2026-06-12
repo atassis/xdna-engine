@@ -70,6 +70,18 @@ make -C $MMW -f Makefile.silu NPU2=1 M=512 K=800  N=3072 n_aie_cols=8          b
 make -C $MMW -f Makefile.silu NPU2=1 M=512 K=3104 N=768  n_aie_cols=8 no_silu=1 build/final_512x3104x768_32x32x32_8c_bias.xclbin
 make -C $MMW -f Makefile.silu NPU2=1 M=512 K=800  N=1536 n_aie_cols=8 no_silu=1 build/final_512x800x1536_32x32x32_8c_bias.xclbin
 make -C $MMW -f Makefile.silu NPU2=1 M=512 K=800  N=768  n_aie_cols=8 no_silu=1 build/final_512x800x768_32x32x32_8c_bias.xclbin
+# Step-A MODAL on-chip epilogue (NPU_MODAL_EPI=1, native): ONE resident K=800 f32-out xclbin with an
+# RTP-selected epilogue; 6 streams = 3 N x {silu(no_silu=0), identity(no_silu=1)}. The silu/identity
+# xclbins are identical modulo the per-build UUID, so the silu one is the resident; both insts are used.
+rm -f $MMW/build/mm_silu_epilogue_*.o
+for N in 3072 1536 768; do
+  # FAST (64x32x96 BFP16_IREE) modal -- the shipped default precision
+  WA_C_DEPTH=1 make -C $MMW -f Makefile.modal NPU2=1 M=512 K=800 N=$N m=64 k=32 n=96 n_aie_cols=8 emulate_bfloat16_mmul_with_bfp16=1 bfp16_iree=1           build/final_512x800x${N}_64x32x96_8c_modalsilu.xclbin
+  WA_C_DEPTH=1 make -C $MMW -f Makefile.modal NPU2=1 M=512 K=800 N=$N m=64 k=32 n=96 n_aie_cols=8 emulate_bfloat16_mmul_with_bfp16=1 bfp16_iree=1 no_silu=1 build/final_512x800x${N}_64x32x96_8c_modalid.xclbin
+  # NATIVE (32x32x32) modal -- for NPU_PRECISION=native
+  make -C $MMW -f Makefile.modal NPU2=1 M=512 K=800 N=$N m=32 k=32 n=32 n_aie_cols=8           build/final_512x800x${N}_32x32x32_8c_modalsilu.xclbin
+  make -C $MMW -f Makefile.modal NPU2=1 M=512 K=800 N=$N m=32 k=32 n=32 n_aie_cols=8 no_silu=1 build/final_512x800x${N}_32x32x32_8c_modalid.xclbin
+done
 make -C $PE/ml/softmax400 NPU2=1 build/final.xclbin   # softmax-400 (pad->416)
 
 echo "All encoder + fusion xclbins built."

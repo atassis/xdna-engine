@@ -29,6 +29,8 @@ cp "$RB/softmax400/Makefile"      "$PE/ml/softmax400/Makefile"
 # whole_array fused matmul+epilogue design
 cp "$RB/whole_array_fused/whole_array_silu_iron.py" "$MM/whole_array/whole_array_silu_iron.py"
 cp "$RB/whole_array_fused/Makefile.silu"            "$MM/whole_array/Makefile.silu"
+cp "$RB/whole_array_fused/whole_array_modal_iron.py" "$MM/whole_array/whole_array_modal_iron.py"
+cp "$RB/whole_array_fused/Makefile.modal"            "$MM/whole_array/Makefile.modal"
 # single_core fused GEMM->GEMM (on-chip intermediate) design
 cp "$RB/ffn_gemm2/ffn_gemm2_iron.py" "$MM/single_core/ffn_gemm2_iron.py"
 cp "$RB/ffn_gemm2/Makefile.ffn"      "$MM/single_core/Makefile.ffn"

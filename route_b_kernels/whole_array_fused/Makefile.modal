@@ -1,0 +1,78 @@
+##===- Makefile.silu ------------------------------------------------------===##
+#
+# This file licensed under the Apache License v2.0 with LLVM Exceptions.
+# See https://llvm.org/LICENSE.txt for license information.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+#
+# Copyright (C) 2025, Advanced Micro Devices, Inc.
+#
+##===----------------------------------------------------------------------===##
+#
+# WHOLE-ARRAY (8-column) fused matmul + bias (+ optional SiLU): ONE xclbin
+# computes silu(A@B+bias) [silu mode] or A@B+bias [bias mode], bf16 in/out,
+# f32 in-core accumulate, across all n_aie_cols columns. Reuses the
+# matrix_multiplication makefile-common build machinery.
+#
+# Invoke with:  make -f Makefile.silu NPU2=1 M=.. K=.. N=.. n_aie_cols=8 [no_silu=1]
+#
+srcdir := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
+subdir=whole_array
+targetname=whole_array_modal
+
+# Final GEMM dims (default = FFN linear1; K here is the AUGMENTED K = K_real + k)
+M?=512
+K?=800
+N?=3072
+
+# Single AIE-core tile dims
+m?=32
+k?=32
+n?=32
+
+n_aie_cols?=8
+b_col_maj?=0
+
+# bf16 in, f32 accumulate (matmul), bf16 out (after epilogue)
+dtype_in?=bf16
+dtype_out?=f32
+
+# silu mode (default) vs bias-only (no activation) mode
+no_silu?=0
+
+# Two kernel objects: the matmul (mm.cc) and the fused epilogue.
+kernels=mm_${m}x${k}x${n} mm_silu_epilogue_${m}x${k}x${n}
+
+aieargs+=-m $m -k $k -n $n --n-aie-cols ${n_aie_cols} --b-col-maj ${b_col_maj}
+ifeq (${no_silu}, 1)
+aieargs+=--no-silu
+endif
+
+# Distinct suffix so silu/bias artifacts never collide with the plain matmul's.
+mode_tag=$(if $(filter 1,${no_silu}),modalid,modalsilu)
+target_suffix=${M}x${K}x${N}_${m}x${k}x${n}_${n_aie_cols}c_${mode_tag}
+
+use_iron=1
+aie_py_src=whole_array_modal_iron.py
+
+# Linear buffer allocation (bank-aware tends to overflow with the extra acc bufs)
+buffer_aloc_flag=basic-sequential
+
+# matmul object needs the bf16_f32 combo defines (mm.cc names symbols by combo).
+MM_DEFINES=-Dbf16_f32_ONLY -DDIM_M=${m} -DDIM_K=${k} -DDIM_N=${n} -DVECTORIZED_ONLY
+EPI_DEFINES=-DEPI_M=${m} -DEPI_N=${n}
+ifeq (${b_col_maj}, 1)
+	MM_DEFINES+=-DB_COL_MAJ
+endif
+
+include ${srcdir}/../makefile-common
+
+# matmul object: bf16 in, f32 acc. KERNEL_DEFINES carries the BFP16_IREE / emulate flags from
+# makefile-common (fast tile) — without it a fast-flagged build silently compiles the native kernel.
+build/mm_${m}x${k}x${n}.o: ${kernels_dir}/mm.cc
+	mkdir -p ${@D}
+	cd ${@D} && ${KERNEL_CC} ${KERNEL_CFLAGS} ${MM_DEFINES} ${KERNEL_DEFINES} -c $< -o ${@F}
+
+# Epilogue object: f32 acc -> silu/narrow -> bf16 out.
+build/mm_silu_epilogue_${m}x${k}x${n}.o: ${kernels_dir}/mm_silu_epilogue.cc
+	mkdir -p ${@D}
+	cd ${@D} && ${KERNEL_CC} ${KERNEL_CFLAGS} ${EPI_DEFINES} -c $< -o ${@F}

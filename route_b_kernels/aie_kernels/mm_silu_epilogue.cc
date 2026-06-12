@@ -103,6 +103,64 @@ static inline void mm_narrow_epilogue(const float *__restrict pC_in,
   event1();
 }
 
+// --- f32-OUT variants (Step A resident modal epilogue) ------------------------
+// The bf16-out epilogue forces the host to re-expand bf16->f32 for its downstream
+// math (mha/glu/accumulate), which MEASURED as a net loss (s10 narrow backfire,
+// +100ms). Keeping the output f32 means the host consumer needs NOTHING back.
+// SiLU is still computed in bf16 (the proven, accurate-enough path; WER-gated),
+// then up-converted to f32 for the store. Bias is folded into the matmul via
+// K-augmentation (host), so these are pure elementwise.
+
+// silu(x) computed in bf16, stored f32.
+template <int size>
+static inline void mm_silu_epilogue_f32o(const float *__restrict pC_in,
+                                         float *__restrict pC_out) {
+  event0();
+  static_assert(size % 16 == 0, "tile size must be a multiple of 16");
+  const aie::vector<bfloat16, 16> half = aie::broadcast<bfloat16, 16>(0.5f);
+  const aie::vector<bfloat16, 16> one = aie::broadcast<bfloat16, 16>(1.0f);
+  const float *__restrict in_ptr = pC_in;
+  float *__restrict out_ptr = pC_out;
+  AIE_PREPARE_FOR_PIPELINING
+  AIE_LOOP_MIN_ITERATION_COUNT(2)
+  for (int off = 0; off < size; off += 16) {
+    aie::vector<float, 16> accf = aie::load_v<16>(in_ptr);
+    in_ptr += 16;
+    aie::accum<accfloat, 16> a;
+    a.from_vector(accf);
+    aie::vector<bfloat16, 16> xv = a.to_vector<bfloat16>();
+    auto half_x = aie::mul(xv, half);
+    auto tanh_half_x = aie::tanh<bfloat16>(half_x.to_vector<float>());
+    auto tanh_p1 = aie::add(tanh_half_x, one);
+    aie::vector<bfloat16, 16> sig = aie::mul(tanh_p1, half);
+    aie::vector<bfloat16, 16> outv = aie::mul(xv, sig);
+    // up-convert bf16 -> f32 via an accumulator (mirrors the f32->bf16 narrow path in reverse).
+    aie::accum<accfloat, 16> oacc;
+    oacc.from_vector(outv);
+    aie::store_v(out_ptr, oacc.to_vector<float>());
+    out_ptr += 16;
+  }
+  event1();
+}
+
+// identity: copy f32 acc -> f32 out (the matmul already folded bias via K-aug).
+template <int size>
+static inline void mm_identity_epilogue_f32o(const float *__restrict pC_in,
+                                            float *__restrict pC_out) {
+  event0();
+  static_assert(size % 16 == 0, "tile size must be a multiple of 16");
+  const float *__restrict in_ptr = pC_in;
+  float *__restrict out_ptr = pC_out;
+  AIE_PREPARE_FOR_PIPELINING
+  AIE_LOOP_MIN_ITERATION_COUNT(2)
+  for (int off = 0; off < size; off += 16) {
+    aie::store_v(out_ptr, aie::load_v<16>(in_ptr));
+    in_ptr += 16;
+    out_ptr += 16;
+  }
+  event1();
+}
+
 extern "C" {
 
 // Tile dims provided at compile time (same DIM_M/DIM_N as the matmul).
@@ -122,6 +180,21 @@ void mm_silu_epilogue_f32_bf16(const float *__restrict c_in,
 void mm_narrow_epilogue_f32_bf16(const float *__restrict c_in,
                                  bfloat16 *__restrict c_out) {
   mm_narrow_epilogue<EPI_M * EPI_N>(c_in, c_out);
+}
+
+// MODAL f32-out epilogue for the Step-A resident xclbin: rtp[0] selects the mode
+// per instruction-stream (1 = SiLU for the FFN mm1, 0 = identity for every other
+// op whose bias is K-augmented into the matmul). One xclbin, mode chosen by which
+// stream the host dispatches -> zero context switches (the V2 mechanism, extended
+// from N-selection to N+mode-selection).
+void mm_modal_epilogue_f32_f32(const float *__restrict c_in,
+                               float *__restrict c_out,
+                               const int32_t *__restrict rtp) {
+  if (rtp[0] != 0) {
+    mm_silu_epilogue_f32o<EPI_M * EPI_N>(c_in, c_out);
+  } else {
+    mm_identity_epilogue_f32o<EPI_M * EPI_N>(c_in, c_out);
+  }
 }
 
 } // extern "C"
