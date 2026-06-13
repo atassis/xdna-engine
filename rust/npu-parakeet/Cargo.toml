@@ -1,0 +1,34 @@
+[package]
+name = "npu-parakeet"
+version = "0.1.0"
+edition = "2021"
+description = "Parakeet-tdt-0.6b-v3 FastConformer encoder — Phase 2 host CPU reference (rel-pos, dwconv k=9, ÷8 conv2D subsample)"
+
+[lib]
+name = "npu_parakeet"
+path = "src/lib.rs"
+
+[features]
+# `npu`: route the encoder's matmuls through the XDNA2 NPU (native whole_array xclbins).
+# Off by default so the host f32 reference builds without XRT (CI / other branches).
+npu = ["dep:npu-xrt", "dep:npu-onnx"]
+
+[dependencies]
+ndarray = "0.16"
+ndarray-npy = { version = "0.9", default-features = false }
+npu-xrt = { path = "../npu-xrt", optional = true }
+npu-onnx = { path = "../npu-onnx", optional = true }
+rayon = "1"
+
+[[bin]]
+name = "verify_parakeet"
+path = "src/bin/verify_parakeet.rs"
+
+[[bin]]
+name = "parakeet_encode_npu"
+path = "src/bin/parakeet_encode_npu.rs"
+
+[[bin]]
+name = "parakeet_serve"
+path = "src/bin/parakeet_serve.rs"
+required-features = ["npu"]

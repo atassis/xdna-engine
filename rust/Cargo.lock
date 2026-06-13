@@ -201,6 +201,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "npu-parakeet"
+version = "0.1.0"
+dependencies = [
+ "ndarray",
+ "ndarray-npy",
+ "npu-onnx",
+ "npu-xrt",
+ "rayon",
+]
+
+[[package]]
 name = "npu-xrt"
 version = "0.1.0"
 dependencies = [

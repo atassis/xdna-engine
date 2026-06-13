@@ -61,10 +61,15 @@ ShimOrtRun* sort_run(ShimOrtSession* sess,
     for (int i = 0; i < n_in && good; i++) {
         size_t nel = 1;
         for (int d = 0; d < in_ndims[i]; d++) nel *= (size_t)in_dims[i][d];
-        bool i64 = in_dtypes[i] == 1;
-        ONNXTensorElementDataType dt = i64 ? ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64
-                                           : ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT;
-        size_t bytes = nel * (i64 ? 8 : 4);
+        // dtype: 0=f32, 1=i64, 2=i32
+        ONNXTensorElementDataType dt;
+        size_t esize;
+        switch (in_dtypes[i]) {
+            case 1: dt = ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64; esize = 8; break;
+            case 2: dt = ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32; esize = 4; break;
+            default: dt = ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT; esize = 4; break;
+        }
+        size_t bytes = nel * esize;
         good = ok(ort()->CreateTensorWithDataAsOrtValue(
             mem, const_cast<void*>(in_data[i]), bytes, in_dims[i], (size_t)in_ndims[i], dt, &ins[i]));
     }

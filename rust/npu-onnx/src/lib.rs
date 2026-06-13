@@ -78,23 +78,26 @@ pub struct Session {
 pub enum Tensor<'a> {
     F32(&'a [f32], Vec<i64>),
     I64(&'a [i64], Vec<i64>),
+    I32(&'a [i32], Vec<i64>),
 }
 impl Tensor<'_> {
     fn dtype(&self) -> c_int {
         match self {
             Tensor::F32(..) => 0,
             Tensor::I64(..) => 1,
+            Tensor::I32(..) => 2,
         }
     }
     fn dims(&self) -> &[i64] {
         match self {
-            Tensor::F32(_, d) | Tensor::I64(_, d) => d,
+            Tensor::F32(_, d) | Tensor::I64(_, d) | Tensor::I32(_, d) => d,
         }
     }
     fn data_ptr(&self) -> *const c_void {
         match self {
             Tensor::F32(d, _) => d.as_ptr() as *const c_void,
             Tensor::I64(d, _) => d.as_ptr() as *const c_void,
+            Tensor::I32(d, _) => d.as_ptr() as *const c_void,
         }
     }
 }
