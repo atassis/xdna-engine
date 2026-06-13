@@ -42,26 +42,65 @@ pub struct Encoder {
 }
 
 impl Encoder {
+    /// Construct with baked defaults + env overrides (the shipped behaviour).
+    /// For programmatic control over tuning knobs, use [`Self::new_with_tuning`] directly
+    /// (available under the `two_ctx` feature).
     pub fn new(dev: Rc<Device>, root: &Path, ws: &WeightStore, n_blocks: usize) -> Self {
-        // With `two_ctx`, build the ONE shared hw-context (resident ctxA xclbin) ONCE for the whole
-        // encoder and hand every block a clone of the `Rc` -> ALL matmul ops (the 7 K=768 ops AND
-        // the FFN mm2, K-split into 4× N=768) dispatch on the same resident kernel: zero context
-        // switches across the whole encoder.
         #[cfg(feature = "two_ctx")]
-        let ctx_a = crate::ctx2::SharedCtxA::new(&dev, root);
-        // Step D: on-NPU LayerNorm (ctxLN), opt-in via NPU_LN_NPU=1 (default OFF -> host LN). Built
-        // ONCE and shared across all blocks (the encoder runs sequentially, so one BO set suffices).
-        #[cfg(feature = "two_ctx")]
-        let ctx_ln = if std::env::var("NPU_LN_NPU").as_deref() == Ok("1") {
+        {
+            let cfg = crate::tuning::TuningConfig::baked_default(
+                crate::ctx2::Precision::from_env(),
+            )
+            .with_env_overrides();
+            return Self::new_with_tuning(dev, root, ws, n_blocks, &cfg);
+        }
+        // `not(two_ctx)` path: no shared contexts, no tuning config — build blocks directly.
+        #[cfg(not(feature = "two_ctx"))]
+        {
+            let blocks = (0..n_blocks)
+                .map(|i| {
+                    FusedBlock::new(
+                        dev.clone(),
+                        root,
+                        ws.block(i),
+                        &ws.cos,
+                        &ws.sin,
+                    )
+                })
+                .collect();
+            Encoder { blocks }
+        }
+    }
+
+    /// Construct with an explicit [`TuningConfig`] instead of reading env vars inside. Behaviour is
+    /// byte-identical to [`Self::new`] when `cfg == TuningConfig::baked_default(p).with_env_overrides()`.
+    ///
+    /// Only available under the `two_ctx` feature (all tuning knobs are `two_ctx`-only).
+    #[cfg(feature = "two_ctx")]
+    pub fn new_with_tuning(
+        dev: Rc<Device>,
+        root: &Path,
+        ws: &WeightStore,
+        n_blocks: usize,
+        cfg: &crate::tuning::TuningConfig,
+    ) -> Self {
+        // Build the ONE shared hw-context (resident ctxA xclbin) ONCE for the whole encoder and hand
+        // every block a clone of the `Rc` -> ALL matmul ops (the 7 K=768 ops AND the FFN mm2,
+        // K-split into 4× N=768) dispatch on the same resident kernel: zero context switches across
+        // the whole encoder.
+        let ctx_a = crate::ctx2::SharedCtxA::with_tuning(&dev, root, cfg);
+        // Step D: on-NPU LayerNorm (ctxLN), opt-in via cfg.layernorm_on_npu (default OFF -> host LN).
+        // Built ONCE and shared across all blocks (the encoder runs sequentially, so one BO set suffices).
+        let ctx_ln = if cfg.layernorm_on_npu {
             Some(crate::ctx_ln::CtxLn::new(&dev, root))
         } else {
             None
         };
-        // conv2 of the subsample on the resident ctxA (built once). DEFAULT-ON; NPU_SS_NPU=0 reverts to
-        // the all-host front-end. MEASURED net-positive (e2e −20ms bf16) + WER-safe at every precision
+        // conv2 of the subsample on the resident ctxA (built once). DEFAULT-ON via cfg.subsample_on_npu;
+        // NPU_SS_NPU=0 / cfg.subsample_on_npu=false reverts to the all-host front-end.
+        // MEASURED net-positive (e2e −20ms bf16) + WER-safe at every precision
         // (bf16 9.6→9.2%, int8 9.2→8.7%, native 9.2% unchanged).
-        #[cfg(feature = "two_ctx")]
-        let conv2mm = if std::env::var("NPU_SS_NPU").as_deref() != Ok("0") {
+        let conv2mm = if cfg.subsample_on_npu {
             let w2 = ws
                 .pre("pre_encode.conv.2.weight")
                 .clone()
@@ -75,24 +114,20 @@ impl Encoder {
         };
         let blocks = (0..n_blocks)
             .map(|i| {
-                FusedBlock::new(
+                FusedBlock::new_with_flags(
                     dev.clone(),
                     root,
                     ws.block(i),
                     &ws.cos,
                     &ws.sin,
-                    #[cfg(feature = "two_ctx")]
                     ctx_a.clone(),
-                    #[cfg(feature = "two_ctx")]
                     ctx_ln.clone(),
+                    cfg.glu_fused,
+                    cfg.qkv_overlap,
                 )
             })
             .collect();
-        Encoder {
-            blocks,
-            #[cfg(feature = "two_ctx")]
-            conv2mm,
-        }
+        Encoder { blocks, conv2mm }
     }
 
     /// Front-end subsampling, encoder-owned so the conv2 matmul can route to the NPU. Default: conv0

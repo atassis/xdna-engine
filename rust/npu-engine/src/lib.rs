@@ -7,3 +7,4 @@ pub mod pipeline;
 pub mod registry;
 pub mod bert;
 pub mod asr;
+pub mod tuning_profile;

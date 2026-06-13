@@ -182,10 +182,18 @@ const CTXA_STREAMS: [usize; 3] = [768, 1536, NA];
 
 impl SharedCtxA {
     pub fn new(dev: &Rc<Device>, root: &Path) -> Rc<Self> {
-        Self::with_precision(dev, root, Precision::from_env())
+        let cfg = crate::tuning::TuningConfig::baked_default(Precision::from_env()).with_env_overrides();
+        Self::with_tuning(dev, root, &cfg)
     }
 
+    /// Back-compat: precision only; all other knobs from baked defaults + env overrides.
     pub fn with_precision(dev: &Rc<Device>, root: &Path, prec: Precision) -> Rc<Self> {
+        let cfg = crate::tuning::TuningConfig::baked_default(prec).with_env_overrides();
+        Self::with_tuning(dev, root, &cfg)
+    }
+
+    pub fn with_tuning(dev: &Rc<Device>, root: &Path, cfg: &crate::tuning::TuningConfig) -> Rc<Self> {
+        let prec = cfg.precision;
         let wa = root.join(WA_SUBDIR);
         let (mt, kt, nt) = prec.tile();
         // Step-A modal on-chip epilogue: K-aug bias + on-chip SiLU, f32 out, one resident xclbin with
@@ -194,10 +202,10 @@ impl SharedCtxA {
         // (native 32³, fast 64×32×96). DEFAULT-ON for bf16 (measured: fast −40ms → sub-300ms idle,
         // WER 9.6% unchanged). int8 would need an i32-dequant epilogue (not built). Opt out:
         // `NPU_MODAL_EPI=0`.
-        let modal = !prec.is_int8() && std::env::var("NPU_MODAL_EPI").as_deref() != Ok("0");
+        let modal = !prec.is_int8() && cfg.modal_epilogue;
         // L3: on-chip int8 dequant (int8 only, opt-in). Loads the `modalint8dq` resident xclbin instead
         // of the plain int8 one; its epilogue dequants the i32 accumulator to f32 on-core (×S from rtp[0]).
-        let modal_int8 = prec.is_int8() && std::env::var("NPU_INT8_ONCHIP").as_deref() == Ok("1");
+        let modal_int8 = prec.is_int8() && cfg.int8_onchip_dequant;
         let ka_dev = if modal { KAUG } else { KA };
         eprintln!(
             "[ctx2] V2 encoder precision = {prec:?} (tile {mt}x{kt}x{nt}){}{}",
@@ -288,7 +296,7 @@ impl SharedCtxA {
         // FORCED OFF for modal_int8 (stage-1): the per-N dequant stream's rtp[0] is patched per dispatch,
         // so two concurrent dispatches sharing one instr BO would clobber each other's S. Per-slot instr
         // BOs (stage 2) re-enable it.
-        let pipeline = !modal_int8 && std::env::var("NPU_MM2_PIPELINE").as_deref() != Ok("0");
+        let pipeline = !modal_int8 && cfg.mm2_pipeline;
         let mut pipe = Vec::new();
         if pipeline {
             eprintln!("[ctx2] async mm2 pipeline ENABLED (default; set NPU_MM2_PIPELINE=0 to disable)");
@@ -348,7 +356,7 @@ impl SharedCtxA {
             ka_dev,
             modal_streams,
             fast_int8: {
-                let on = prec.is_int8() && std::env::var("NPU_INT8_FASTEPI").as_deref() != Ok("0");
+                let on = prec.is_int8() && cfg.int8_fast_epi;
                 if prec.is_int8() {
                     eprintln!(
                         "[ctx2] int8 host fast-path {} (parallel amax + division-free dequant; NPU_INT8_FASTEPI=0 disables)",

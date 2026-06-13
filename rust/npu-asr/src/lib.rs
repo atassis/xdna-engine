@@ -11,5 +11,7 @@ pub mod engines;
 pub mod ctx2;
 #[cfg(feature = "two_ctx")]
 pub mod ctx_ln;
+#[cfg(feature = "two_ctx")]
+pub mod tuning;
 pub mod block;
 pub mod encoder;

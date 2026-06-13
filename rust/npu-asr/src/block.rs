@@ -192,6 +192,33 @@ pub struct FusedBlock {
 }
 
 impl FusedBlock {
+    /// As `new`, but glu_fused / qkv_overlap come from resolved config instead of env. Behavior is
+    /// identical to `new` when the flags equal the env-derived defaults.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_flags(
+        dev: Rc<Device>,
+        root: &Path,
+        w: &BlockWeights,
+        cos: &Array2<f32>,
+        sin: &Array2<f32>,
+        #[cfg(feature = "two_ctx")] ctx_a: Rc<SharedCtxA>,
+        #[cfg(feature = "two_ctx")] ctx_ln: Option<Rc<CtxLn>>,
+        glu_fused: bool,
+        qkv_overlap: bool,
+    ) -> Self {
+        let mut blk = Self::new(
+            dev, root, w, cos, sin,
+            #[cfg(feature = "two_ctx")] ctx_a,
+            #[cfg(feature = "two_ctx")] ctx_ln,
+        );
+        blk.glu_fused_on = glu_fused;
+        #[cfg(feature = "two_ctx")]
+        { blk.qkv_overlap_on = qkv_overlap; }
+        #[cfg(not(feature = "two_ctx"))]
+        { let _ = qkv_overlap; }
+        blk
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         dev: Rc<Device>,

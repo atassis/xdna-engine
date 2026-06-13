@@ -28,7 +28,8 @@ impl ConformerEncoder {
     pub fn new(dev: Rc<Device>, root: &Path, weights_dir: &Path) -> Self {
         let ws = WeightStore::load(weights_dir).expect("encoder weights");
         let n = ws.nblocks();
-        let inner = GigaEncoder::new(dev, root, &ws, n);
+        let cfg = crate::tuning_profile::resolve(root, npu_asr::ctx2::Precision::from_env());
+        let inner = GigaEncoder::new_with_tuning(dev, root, &ws, n, &cfg);
         ConformerEncoder { inner, ws }
     }
     pub fn subsample(&self, audio: &Array2<f32>) -> Array2<f32> { self.inner.subsample(&self.ws, audio) }

@@ -28,3 +28,7 @@ path = "src/bin/verify_embeddings.rs"
 [[bin]]
 name = "engine_serve"
 path = "src/bin/engine_serve.rs"
+
+[[bin]]
+name = "probe_tuning"
+path = "src/bin/probe_tuning.rs"

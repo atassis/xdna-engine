@@ -69,7 +69,8 @@ pub struct BertEncoder {
 
 impl BertEncoder {
     pub fn new(dev: Rc<Device>, root: &Path, weights: &BertWeights, n_heads: usize, head_dim: usize) -> Self {
-        let shared = SharedCtxA::new(&dev, root);
+        let cfg = crate::tuning_profile::resolve(root, npu_asr::ctx2::Precision::from_env());
+        let shared = SharedCtxA::with_tuning(&dev, root, &cfg);
         let blocks = (0..weights.n_layers())
             .map(|i| BertBlock::new(shared.clone(), &weights.layers[i], n_heads, head_dim))
             .collect();
