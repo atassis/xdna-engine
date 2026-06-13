@@ -1,0 +1,21 @@
+[scenario]
+kind = "embeddings"
+name = "bge-base-en-v1.5"
+
+[model]
+hidden = 768
+ff = 3072
+n_heads = 12
+head_dim = 64
+n_layers = 12
+max_seq = 512
+precision = "bf16"
+
+[artifacts]
+weights = "artifacts/bge-base/encoder"
+tokenizer = "artifacts/bge-base/tokenizer.json"
+onnx_ref = "artifacts/bge-base/model.onnx"
+
+[embeddings]
+pooling = "mean"
+normalize = true

@@ -1,0 +1,30 @@
+[package]
+name = "npu-engine"
+version = "0.1.0"
+edition = "2021"
+description = "General multi-model engine over the XDNA2 NPU kernel kit (ASR + embeddings via a Frontend/Encoder/Head pipeline)"
+
+[lib]
+name = "npu_engine"
+path = "src/lib.rs"
+
+[dependencies]
+ndarray = "0.16"
+ndarray-npy = { version = "0.9", default-features = false }
+rayon = "1"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
+npu-xrt = { path = "../npu-xrt" }
+npu-asr = { path = "../npu-asr", features = ["two_ctx"] }
+npu-asr-host = { path = "../npu-asr-host" }
+npu-onnx = { path = "../npu-onnx" }
+npu-parakeet = { path = "../npu-parakeet", features = ["npu"] }
+
+[[bin]]
+name = "verify_embeddings"
+path = "src/bin/verify_embeddings.rs"
+
+[[bin]]
+name = "engine_serve"
+path = "src/bin/engine_serve.rs"

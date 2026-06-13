@@ -1,0 +1,13 @@
+[scenario]
+kind = "asr"
+name = "gigaam-v3-ru"
+[model]
+hidden = 768
+ff = 3072
+n_heads = 16
+head_dim = 48
+n_layers = 16
+max_seq = 400
+precision = "bf16"
+[artifacts]
+weights = "artifacts"

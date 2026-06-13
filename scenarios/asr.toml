@@ -1,0 +1,13 @@
+[scenario]
+kind = "asr"
+name = "parakeet-tdt-0.6b-v3"
+[model]
+hidden = 1024
+ff = 4096
+n_heads = 8
+head_dim = 128
+n_layers = 24
+max_seq = 2040
+precision = "bf16"
+[artifacts]
+weights = "artifacts/parakeet"

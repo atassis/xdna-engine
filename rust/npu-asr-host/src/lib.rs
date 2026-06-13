@@ -459,6 +459,34 @@ pub fn silu(x: &Array2<f32>) -> Array2<f32> {
     Array2::from_shape_vec((r, c), data).unwrap()
 }
 
+/// Abramowitz & Stegun 7.1.26 erf approximation (max abs error ~1.5e-7), enough for the 0.08
+/// engine tolerance.
+fn erf_scalar(x: f32) -> f32 {
+    let sign = if x < 0.0 { -1.0 } else { 1.0 };
+    let x = x.abs();
+    let t = 1.0 / (1.0 + 0.3275911 * x);
+    let y = 1.0
+        - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t
+            + 0.254829592)
+            * t
+            * (-x * x).exp();
+    sign * y
+}
+
+/// Exact GELU: 0.5*x*(1 + erf(x/sqrt(2))). Elementwise; parallel over the flattened tensor.
+pub fn gelu(x: &Array2<f32>) -> Array2<f32> {
+    use rayon::prelude::*;
+    const INV_SQRT2: f32 = std::f32::consts::FRAC_1_SQRT_2;
+    let (r, c) = x.dim();
+    let xc = x.as_standard_layout();
+    let xs = xc.as_slice().unwrap();
+    let data: Vec<f32> = xs
+        .par_iter()
+        .map(|&v| 0.5 * v * (1.0 + erf_scalar(v * INV_SQRT2)))
+        .collect();
+    Array2::from_shape_vec((r, c), data).unwrap()
+}
+
 /// 1D conv via im2col. x is [Cin, L], w is [Cout, Cin, k], b is [Cout].
 /// Lout = (L + 2*pad - k)/stride + 1. Output [Cout, Lout].
 /// `a @ b.T` for C-contiguous `a` [M, K] and `b` [N, K], returning [M, N]. The single-threaded
@@ -857,5 +885,17 @@ mod tests {
         // global checksum
         let sum: f32 = out.iter().sum();
         assert!((sum - 6.350164e+02).abs() / 6.350164e+02 < 1e-3);
+    }
+
+    #[test]
+    fn gelu_matches_reference_points() {
+        use ndarray::array;
+        let x = array![[0.0f32, 1.0, -1.0, 2.0]];
+        let y = gelu(&x);
+        // exact GELU: 0.5*x*(1+erf(x/sqrt(2)))
+        let expect = [0.0f32, 0.8413447, -0.15865526, 1.9544997];
+        for (g, e) in y.iter().zip(expect.iter()) {
+            assert!((g - e).abs() < 1e-4, "gelu got {g}, want {e}");
+        }
     }
 }
