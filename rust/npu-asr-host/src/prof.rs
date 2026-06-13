@@ -16,7 +16,8 @@ use std::time::Instant;
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static INIT: std::sync::Once = std::sync::Once::new();
 
-static BUCKETS: Mutex<Vec<(&'static str, u128, u64)>> = Mutex::new(Vec::new());
+// (name, ns, calls, bytes, flops). bytes/flops are 0 unless the op reports work via add_work().
+static BUCKETS: Mutex<Vec<(&'static str, u128, u64, u128, u128)>> = Mutex::new(Vec::new());
 
 fn ensure_init() {
     INIT.call_once(|| {
@@ -46,7 +47,23 @@ fn add(name: &'static str, ns: u128) {
             e.1 += ns;
             e.2 += 1;
         } else {
-            b.push((name, ns, 1));
+            b.push((name, ns, 1, 0, 0));
+        }
+    }
+}
+
+/// Accumulate bytes-moved + FLOPs for op `name` (companion to `time`; same bucket name). No-op when
+/// disabled. Lets the dump emit achieved GB/s and GFLOP/s per op -> compute- vs memory-bound + %peak.
+pub fn add_work(name: &'static str, bytes: u64, flops: u64) {
+    if !enabled() {
+        return;
+    }
+    if let Ok(mut b) = BUCKETS.lock() {
+        if let Some(e) = b.iter_mut().find(|e| e.0 == name) {
+            e.3 += bytes as u128;
+            e.4 += flops as u128;
+        } else {
+            b.push((name, 0, 0, bytes as u128, flops as u128));
         }
     }
 }
@@ -106,16 +123,28 @@ pub fn dump(iters: usize) {
     let total: u128 = rows.iter().map(|r| r.1).sum();
     let it = iters.max(1) as f64;
     eprintln!("\n=== HOST per-op profile (per run, {iters} iters) ===");
-    eprintln!("  {:<22} {:>10}  {:>8}  {:>6}", "op", "ms/run", "calls/run", "%");
-    for (name, ns, calls) in &rows {
+    eprintln!(
+        "  {:<22} {:>10}  {:>8}  {:>6}  {:>8}  {:>9}",
+        "op", "ms/run", "calls/run", "%", "GB/s", "GFLOP/s"
+    );
+    for (name, ns, calls, bytes, flops) in &rows {
         let ms = *ns as f64 / 1e6 / it;
         let pct = if total > 0 { *ns as f64 / total as f64 * 100.0 } else { 0.0 };
+        // achieved rates: total work / total time (iters cancel). For summed-thread-time ops (mha),
+        // these are per-thread-time-normalized; the RAYON_NUM_THREADS=1 run makes them wall-clean.
+        let secs = *ns as f64 / 1e9;
+        let gbps = if secs > 0.0 && *bytes > 0 { *bytes as f64 / 1e9 / secs } else { 0.0 };
+        let gflops = if secs > 0.0 && *flops > 0 { *flops as f64 / 1e9 / secs } else { 0.0 };
+        let gbs_s = if gbps > 0.0 { format!("{gbps:.1}") } else { "-".to_string() };
+        let gfl_s = if gflops > 0.0 { format!("{gflops:.1}") } else { "-".to_string() };
         eprintln!(
-            "  {:<22} {:>10.2}  {:>8}  {:>5.1}%",
+            "  {:<22} {:>10.2}  {:>8}  {:>5.1}%  {:>8}  {:>9}",
             name,
             ms,
             *calls as f64 / it,
-            pct
+            pct,
+            gbs_s,
+            gfl_s
         );
     }
     eprintln!(

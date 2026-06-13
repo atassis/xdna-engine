@@ -69,6 +69,8 @@ pub fn residual_add_round(x: &Array2<f32>, y: &Array2<f32>, scale: f32) -> Array
         .into_par_iter()
         .map(|(&xv, &yv)| bf16_round(xv + scale * yv))
         .collect();
+    // read x + read y + write out = 3 arrays; ~2 flop/elem (fma + round). memory-bound op.
+    crate::prof::add_work("residual+bf16", (t * d * 3 * 4) as u64, (t * d * 2) as u64);
     Array2::from_shape_vec((t, d), data).unwrap()
 }
 
@@ -102,6 +104,7 @@ pub fn layer_norm(x: &Array2<f32>, gamma: &[f32], beta: &[f32], eps: f32) -> Arr
                 orow[j] = (row[j] - mean) * inv * gamma[j] + beta[j];
             }
         });
+    crate::prof::add_work("layer_norm", (t * d * 2 * 4) as u64, (t * d * 6) as u64);
     out
 }
 
@@ -133,6 +136,7 @@ pub fn layer_norm_normalize(x: &Array2<f32>, eps: f32) -> Array2<f32> {
                 orow[j] = (row[j] - mean) * inv;
             }
         });
+    crate::prof::add_work("layer_norm", (t * d * 2 * 4) as u64, (t * d * 5) as u64);
     out
 }
 
@@ -301,6 +305,13 @@ pub fn mha(
         crate::prof::add_ns("mha:2_softmax", sm_ns.load(Ordering::Relaxed) as u128);
         crate::prof::add_ns("mha:3_ctxV", cx_ns.load(Ordering::Relaxed) as u128);
         crate::prof::add_ns("mha:4_scatter", st_ns.load(Ordering::Relaxed) as u128);
+        // matmul FLOPs (the BLAS-headroom number): scores = qh@kh^T, ctxV = p@vh, each
+        // t(queries) x vl(valid keys) x head_dim x 2 x n_heads. GFLOP/s vs AVX peak sizes the win.
+        let mm = (t as u64) * (vl as u64) * (head_dim as u64) * 2 * (n_heads as u64);
+        crate::prof::add_work("mha:1_scores", (2 * t * d * 4) as u64, mm); // ~q,k DRAM reads
+        crate::prof::add_work("mha:3_ctxV", (2 * t * d * 4) as u64, mm); // ~v read + out write
+        // softmax: ~exp(1)+a few flop over t*vl*n_heads probs; cache-resident (tiled) -> compute-bound.
+        crate::prof::add_work("mha:2_softmax", 0, (t as u64) * (vl as u64) * (n_heads as u64) * 10);
     }
     out
 }

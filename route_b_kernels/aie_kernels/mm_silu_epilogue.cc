@@ -161,6 +161,44 @@ static inline void mm_identity_epilogue_f32o(const float *__restrict pC_in,
   event1();
 }
 
+// --- int8 DEQUANT epilogue (L3: on-chip i32 -> f32 dequant) -------------------
+// The int8 matmul (matmul_i8_i32) reduces i8*i8 into an i32 accumulator tile,
+// IN-PLACE in the C tile (4 bytes/elem, exactly like the f32-out modal). This
+// epilogue reads that i32 tile, multiplies by a single per-dispatch scalar
+//   S = scale_a (dynamic per-tensor activation scale) * w_scale (per-tensor weight scale)
+// and writes f32 out — IN-PLACE (i32 and f32 are both 4B; we read each lane as
+// i32 before overwriting it as f32, so aliasing pC_in==pC_out is safe). This is
+// the whole L3 win: it moves the fat per-element dequant MULTIPLY off the host
+// (where it materialised a fresh f32 Vec, ~50ms, the reason int8 lost to bf16)
+// onto the array, so the host epilogue becomes the same near-no-op as the bf16
+// modal. Per-column weight scale + bias + SiLU stay on the host for this first
+// cut (bias/silu are cheap; per-column w_scale would need per-column on-chip
+// delivery — a later upgrade via an expanded RTP). Layout-independent: dequant
+// is per-element, so the mmul-blocked storage order is irrelevant, the C
+// ObjectFifo de-shuffles to row-major on the way out exactly as elsewhere.
+template <int size>
+static inline void mm_dequant_epilogue_i32_f32(const int32_t *__restrict pC_in,
+                                               float *__restrict pC_out,
+                                               float scale) {
+  event0();
+  static_assert(size % 16 == 0, "tile size must be a multiple of 16");
+  const int32_t *__restrict in_ptr = pC_in;
+  float *__restrict out_ptr = pC_out;
+  const aie::vector<float, 16> sv = aie::broadcast<float, 16>(scale);
+  AIE_PREPARE_FOR_PIPELINING
+  AIE_LOOP_MIN_ITERATION_COUNT(2)
+  for (int off = 0; off < size; off += 16) {
+    aie::vector<int32_t, 16> iv = aie::load_v<16>(in_ptr);
+    in_ptr += 16;
+    // i32 -> f32 (full-range, no shift), then scale by S.
+    aie::vector<float, 16> fv = aie::to_float(iv, 0);
+    aie::vector<float, 16> outv = aie::mul(fv, sv);
+    aie::store_v(out_ptr, outv);
+    out_ptr += 16;
+  }
+  event1();
+}
+
 extern "C" {
 
 // Tile dims provided at compile time (same DIM_M/DIM_N as the matmul).
@@ -195,6 +233,20 @@ void mm_modal_epilogue_f32_f32(const float *__restrict c_in,
   } else {
     mm_identity_epilogue_f32o<EPI_M * EPI_N>(c_in, c_out);
   }
+}
+
+// MODAL int8 DEQUANT epilogue (L3): i32 acc -> f32 out, scaled by the per-dispatch
+// scalar S delivered as the f32 bit-pattern in rtp[0] (the host bitcasts
+// scale_a*w_scale into an i32 RTP slot before each dispatch). One mode (dequant);
+// bias/SiLU run on the host (cheap). In-place: c_in and c_out alias the same 4B
+// C tile. Reads S from RTP (not a build constant) so the resident xclbin serves
+// every op — each dispatch patches its own S into the instruction stream's RTP.
+void mm_modal_dequant_i32_f32(const int32_t *__restrict c_in,
+                              float *__restrict c_out,
+                              const int32_t *__restrict rtp) {
+  union { int32_t i; float f; } s;
+  s.i = rtp[0];
+  mm_dequant_epilogue_i32_f32<EPI_M * EPI_N>(c_in, c_out, s.f);
 }
 
 } // extern "C"

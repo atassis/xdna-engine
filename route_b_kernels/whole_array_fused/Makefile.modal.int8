@@ -1,0 +1,78 @@
+##===- Makefile.modal.int8 ------------------------------------------------===##
+#
+# This file licensed under the Apache License v2.0 with LLVM Exceptions.
+# See https://llvm.org/LICENSE.txt for license information.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+#
+# Copyright (C) 2025, Advanced Micro Devices, Inc.
+#
+##===----------------------------------------------------------------------===##
+#
+# L3 — WHOLE-ARRAY (8-column) int8 matmul with an on-chip DEQUANT epilogue: ONE
+# xclbin computes  out = (i8 A @ i8 B) [i32 acc] * S  ->  f32 out, with the
+# per-dispatch dequant scalar S delivered via rtp[0] (f32 bits). Mirrors
+# Makefile.modal but: i8 in / i32 acc / i32 C tile (epilogue dequants i32->f32
+# IN-PLACE), single mode (no silu/identity split), NO K-augmentation (int8 bias
+# and SiLU stay on host), so K is the real K (768), not 800.
+#
+# Invoke (see scripts/build_kernels.sh):
+#   make -f Makefile.modal.int8 NPU2=1 M=512 K=768 N=$N m=64 k=64 n=96 n_aie_cols=8 \
+#        build/final_512x768x${N}_64x64x96_8c_modalint8dq.xclbin
+#
+srcdir := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
+subdir=whole_array
+targetname=whole_array_modal_int8
+
+# Final GEMM dims (int8: K = real K, no bias K-aug)
+M?=512
+K?=768
+N?=3072
+
+# Single AIE-core tile dims (int8 fast tile)
+m?=64
+k?=64
+n?=96
+
+n_aie_cols?=8
+b_col_maj?=0
+
+# i8 in, i32 accumulate, i32 C tile (epilogue dequants i32->f32 on chip)
+dtype_in?=i8
+dtype_out?=i32
+
+# Single dequant mode (no_silu is accepted for makefile-common compatibility but unused).
+no_silu?=1
+
+# Two kernel objects: the int8 matmul (mm.cc, matmul_i8_i32) and the dequant epilogue.
+kernels=mm_${m}x${k}x${n} mm_silu_epilogue_${m}x${k}x${n}
+
+aieargs+=-m $m -k $k -n $n --n-aie-cols ${n_aie_cols} --b-col-maj ${b_col_maj}
+
+# Distinct suffix so int8-dequant artifacts never collide with the bf16 modal's or the plain int8's.
+mode_tag=modalint8dq
+target_suffix=${M}x${K}x${N}_${m}x${k}x${n}_${n_aie_cols}c_${mode_tag}
+
+use_iron=1
+aie_py_src=whole_array_modal_int8_iron.py
+
+# Linear buffer allocation (bank-aware tends to overflow with the extra acc bufs)
+buffer_aloc_flag=basic-sequential
+
+# matmul object needs the i8_i32 combo defines (mm.cc names symbols by combo: matmul_i8_i32 / zero_i32).
+MM_DEFINES=-Di8_i32_ONLY -DDIM_M=${m} -DDIM_K=${k} -DDIM_N=${n} -DVECTORIZED_ONLY
+EPI_DEFINES=-DEPI_M=${m} -DEPI_N=${n}
+ifeq (${b_col_maj}, 1)
+	MM_DEFINES+=-DB_COL_MAJ
+endif
+
+include ${srcdir}/../makefile-common
+
+# matmul object: i8 in, i32 acc.
+build/mm_${m}x${k}x${n}.o: ${kernels_dir}/mm.cc
+	mkdir -p ${@D}
+	cd ${@D} && ${KERNEL_CC} ${KERNEL_CFLAGS} ${MM_DEFINES} ${KERNEL_DEFINES} -c $< -o ${@F}
+
+# Epilogue object: i32 acc -> f32 dequant (×S from rtp[0]).
+build/mm_silu_epilogue_${m}x${k}x${n}.o: ${kernels_dir}/mm_silu_epilogue.cc
+	mkdir -p ${@D}
+	cd ${@D} && ${KERNEL_CC} ${KERNEL_CFLAGS} ${EPI_DEFINES} -c $< -o ${@F}

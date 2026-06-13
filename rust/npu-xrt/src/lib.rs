@@ -348,3 +348,162 @@ pub fn f32_to_bf16_bits(x: f32) -> u16 {
 pub fn bf16_bits_to_f32(b: u16) -> f32 {
     f32::from_bits((b as u32) << 16)
 }
+
+/// Pack a contiguous `f32` slice into bf16 bits (`u16`), round-to-nearest-even.
+/// **Byte-identical** to applying [`f32_to_bf16_bits`] element-wise, for every input
+/// (finite, denormal, inf, NaN) — the SIMD path replicates the exact integer bias formula,
+/// so it does not depend on any hardware bf16-convert rounding. Uses AVX-512F (present on
+/// Zen5/Krackan, enabled by `target-cpu=native`) when detected at runtime; scalar otherwise.
+/// `dst` is filled for `min(src.len(), dst.len())` elements.
+#[inline]
+pub fn pack_f32_to_bf16(src: &[f32], dst: &mut [u16]) {
+    let n = src.len().min(dst.len());
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx512f") {
+            // SAFETY: gated on runtime AVX-512F detection; ptrs valid for `n` elems.
+            unsafe {
+                pack_f32_to_bf16_avx512(src.as_ptr(), dst.as_mut_ptr(), n);
+            }
+            return;
+        }
+    }
+    for i in 0..n {
+        dst[i] = f32_to_bf16_bits(src[i]);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn pack_f32_to_bf16_avx512(src: *const f32, dst: *mut u16, n: usize) {
+    use std::arch::x86_64::*;
+    let c_7fff = _mm512_set1_epi32(0x0000_7fff);
+    let c_one = _mm512_set1_epi32(1);
+    let c_absmask = _mm512_set1_epi32(0x7fff_ffff);
+    let c_inf = _mm512_set1_epi32(0x7f80_0000);
+    let c_qnan = _mm512_set1_epi32(0x0000_0040);
+    let mut i = 0usize;
+    while i + 16 <= n {
+        let bits = _mm512_loadu_si512(src.add(i) as *const __m512i);
+        // finite RNE: (bits + (0x7fff + ((bits>>16)&1))) >> 16
+        let lsb = _mm512_and_si512(_mm512_srli_epi32(bits, 16), c_one);
+        let bias = _mm512_add_epi32(c_7fff, lsb);
+        let rounded = _mm512_srli_epi32(_mm512_add_epi32(bits, bias), 16);
+        // NaN: (bits>>16) | 0x40   when (bits & 0x7fffffff) > 0x7f800000
+        let nan_res = _mm512_or_si512(_mm512_srli_epi32(bits, 16), c_qnan);
+        let absv = _mm512_and_si512(bits, c_absmask);
+        let nan_mask = _mm512_cmpgt_epi32_mask(absv, c_inf);
+        let res32 = _mm512_mask_blend_epi32(nan_mask, rounded, nan_res);
+        let res16 = _mm512_cvtepi32_epi16(res32); // 16x i32 low-16 -> 16x i16
+        _mm256_storeu_si256(dst.add(i) as *mut __m256i, res16);
+        i += 16;
+    }
+    while i < n {
+        *dst.add(i) = f32_to_bf16_bits(*src.add(i));
+        i += 1;
+    }
+}
+
+/// Expand a contiguous bf16-bits (`u16`) slice into `f32` (`<<16`), the inverse of the pack.
+/// Byte-identical to [`bf16_bits_to_f32`] element-wise. Uses AVX-512F when detected; scalar otherwise.
+#[inline]
+pub fn unpack_bf16_to_f32(src: &[u16], dst: &mut [f32]) {
+    let n = src.len().min(dst.len());
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx512f") {
+            // SAFETY: gated on runtime AVX-512F detection; ptrs valid for `n` elems.
+            unsafe {
+                unpack_bf16_to_f32_avx512(src.as_ptr(), dst.as_mut_ptr(), n);
+            }
+            return;
+        }
+    }
+    for i in 0..n {
+        dst[i] = bf16_bits_to_f32(src[i]);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn unpack_bf16_to_f32_avx512(src: *const u16, dst: *mut f32, n: usize) {
+    use std::arch::x86_64::*;
+    let mut i = 0usize;
+    while i + 16 <= n {
+        let u16x16 = _mm256_loadu_si256(src.add(i) as *const __m256i); // 16x u16
+        let u32x16 = _mm512_cvtepu16_epi32(u16x16); // zero-extend to 16x u32
+        let f = _mm512_slli_epi32(u32x16, 16); // bf16 bits << 16 = f32 bits
+        _mm512_storeu_ps(dst.add(i), _mm512_castsi512_ps(f));
+        i += 16;
+    }
+    while i < n {
+        *dst.add(i) = bf16_bits_to_f32(*src.add(i));
+        i += 1;
+    }
+}
+
+#[cfg(test)]
+mod bf16_pack_tests {
+    use super::*;
+
+    #[test]
+    fn unpack_bf16_to_f32_byte_identical_to_scalar() {
+        let src: Vec<u16> = (0u32..=0xffff).map(|b| b as u16).collect(); // every bf16 bit pattern
+        let mut got = vec![0f32; src.len()];
+        unpack_bf16_to_f32(&src, &mut got);
+        for (i, &b) in src.iter().enumerate() {
+            let want = bf16_bits_to_f32(b);
+            // bit-compare (covers NaN payloads too, since both are pure <<16)
+            assert_eq!(got[i].to_bits(), want.to_bits(), "mismatch at bf16 bits {b:#06x}");
+        }
+    }
+
+    #[test]
+    fn pack_unpack_roundtrip_idempotent_on_bf16_values() {
+        // bf16-valued f32 (low 16 bits zero) must survive f32->bf16->f32 unchanged.
+        let mut src = vec![0f32; 4096 + 3];
+        let mut s: u32 = 0xC0FFEE11;
+        for v in src.iter_mut() {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *v = f32::from_bits(s & 0xffff_0000); // bf16-valued: low 16 bits cleared
+        }
+        let mut bits = vec![0u16; src.len()];
+        pack_f32_to_bf16(&src, &mut bits);
+        let mut back = vec![0f32; src.len()];
+        unpack_bf16_to_f32(&bits, &mut back);
+        for i in 0..src.len() {
+            if src[i].is_nan() {
+                continue;
+            }
+            assert_eq!(src[i].to_bits(), back[i].to_bits(), "roundtrip drift at {i}");
+        }
+    }
+
+    #[test]
+    fn pack_f32_to_bf16_byte_identical_to_scalar() {
+        let mut src: Vec<f32> = vec![
+            0.0, -0.0, 1.0, -1.0, 0.5, -0.5, 1e-30, -1e-30, 1e30, -1e30,
+            f32::MIN_POSITIVE, f32::MAX, f32::MIN, f32::INFINITY, f32::NEG_INFINITY,
+            f32::NAN, -f32::NAN, 3.14159, 2.71828, 65504.0, 1.0 / 3.0,
+        ];
+        // deterministic pseudo-random sweep over the full bit range (incl. denormals/NaN/inf)
+        let mut s: u32 = 0x1234_5678;
+        for _ in 0..200_000 {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            src.push(f32::from_bits(s));
+        }
+        // non-multiple-of-16 length exercises the scalar tail
+        src.extend_from_slice(&[1.5, -2.5, 0.123]);
+
+        let mut got = vec![0u16; src.len()];
+        pack_f32_to_bf16(&src, &mut got);
+        for (i, &x) in src.iter().enumerate() {
+            assert_eq!(
+                got[i],
+                f32_to_bf16_bits(x),
+                "mismatch at {i} for {x:?} (bits {:#010x})",
+                x.to_bits()
+            );
+        }
+    }
+}

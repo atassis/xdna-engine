@@ -62,6 +62,16 @@ for N in 3072 1536 768; do
      dtype_in=i8 dtype_out=i32 n_aie_cols=8 use_iron=1 \
      build/final_512x768x${N}_64x64x96_8c.xclbin
 done
+# L3 — int8 MODAL DEQUANT (internal notes, NPU_INT8_ONCHIP=1): same i8 64x64x96 matmul + an on-chip
+# i32->f32 dequant epilogue (×S from rtp[0], host-patched per dispatch). Kills int8's ~50ms host dequant
+# so its host epilogue becomes a near-no-op like the bf16 modal. ONE resident xclbin, 3 N-streams; the
+# dequant epilogue object is its own tile (64x64x96) so it can't collide with the bf16 modal's.
+rm -f $MMW/build/mm_silu_epilogue_64x64x96.o
+for N in 3072 1536 768; do
+  rm -f $MMW/build/aie_512x768x${N}_64x64x96_8c_modalint8dq.mlir
+  WA_C_DEPTH=1 make -C $MMW -f Makefile.modal.int8 NPU2=1 M=512 K=768 N=$N m=64 k=64 n=96 n_aie_cols=8 \
+     build/final_512x768x${N}_64x64x96_8c_modalint8dq.xclbin
+done
 
 echo "== FUSION xclbins (docs/10): whole_array matmul+epilogue + softmax-400 =="
 WAF=$MMW   # whole_array build dir

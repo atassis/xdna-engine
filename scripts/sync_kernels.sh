@@ -31,6 +31,9 @@ cp "$RB/whole_array_fused/whole_array_silu_iron.py" "$MM/whole_array/whole_array
 cp "$RB/whole_array_fused/Makefile.silu"            "$MM/whole_array/Makefile.silu"
 cp "$RB/whole_array_fused/whole_array_modal_iron.py" "$MM/whole_array/whole_array_modal_iron.py"
 cp "$RB/whole_array_fused/Makefile.modal"            "$MM/whole_array/Makefile.modal"
+# L3 — int8 modal: on-chip i32->f32 dequant epilogue (internal notes)
+cp "$RB/whole_array_fused/whole_array_modal_int8_iron.py" "$MM/whole_array/whole_array_modal_int8_iron.py"
+cp "$RB/whole_array_fused/Makefile.modal.int8"           "$MM/whole_array/Makefile.modal.int8"
 # single_core fused GEMM->GEMM (on-chip intermediate) design
 cp "$RB/ffn_gemm2/ffn_gemm2_iron.py" "$MM/single_core/ffn_gemm2_iron.py"
 cp "$RB/ffn_gemm2/Makefile.ffn"      "$MM/single_core/Makefile.ffn"
