@@ -2,6 +2,7 @@
 
 pub mod parakeet;
 pub mod whisper;
+pub mod whisper_decoder;
 
 use std::collections::HashMap;
 use std::path::Path;

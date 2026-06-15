@@ -1,0 +1,59 @@
+##===- Makefile.mstatln ---------------------------------------------------===##
+#
+# M-STATIONARY GEMM with a FUSED LayerNorm epilogue (Phase 1.2 spike).
+# bf16 in, f32 accumulate (matmul) -> per-row two-pass LayerNorm -> bf16 out, ONE dispatch.
+# Single-block only (n == N); see m_stationary_ln_iron.py header.
+#
+# Build (CPU-only, on open Peano):
+#   make -f Makefile.mstatln NPU2=1 M=512 K=768 N=64 m=16 k=32 n=64 n_aie_cols=8 \
+#        build/final_mstatln_512x768x64_16x32x64_8c.xclbin
+#
+# Drive from rust/npu-asr/src/bin/mstat_ln_probe.rs. UNIQUE target_suffix (mstatln_*).
+#
+srcdir := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
+subdir=whole_array
+targetname=m_stationary_ln
+
+M?=512
+K?=768
+N?=64
+m?=16
+k?=32
+n?=64
+n_aie_cols?=8
+b_col_maj?=0
+
+dtype_in?=bf16
+dtype_out?=bf16
+
+# Two kernel objects: the matmul (mm.cc, bf16->f32 acc) and the fused LayerNorm epilogue.
+kernels=mm_${m}x${k}x${n} mm_ln_epilogue_${m}x${k}x${n}
+
+aieargs+=-m $m -k $k -n $n --n-aie-cols ${n_aie_cols} --b-col-maj ${b_col_maj}
+
+target_suffix=mstatln_${M}x${K}x${N}_${m}x${k}x${n}_${n_aie_cols}c
+
+use_iron=1
+aie_py_src=m_stationary_ln_iron.py
+
+buffer_aloc_flag=basic-sequential
+
+# matmul object: bf16 in, f32 acc, native (NO bfp16 flags).
+MM_DEFINES=-Dbf16_f32_ONLY -DDIM_M=${m} -DDIM_K=${k} -DDIM_N=${n} -DVECTORIZED_ONLY
+ifeq (${b_col_maj}, 1)
+	MM_DEFINES+=-DB_COL_MAJ
+endif
+
+# LN epilogue object: DIM_M rows x DIM_N full row width (== n single-block); DIM_R/DIM_T = mmul tile
+# dims for bf16->f32 non-emulate (r,s,t = 4,8,8) — the tiled-layout gather constants.
+EPI_DEFINES=-DDIM_M=${m} -DDIM_N=${n} -DDIM_R=4 -DDIM_T=8
+
+include ${srcdir}/../makefile-common
+
+build/mm_${m}x${k}x${n}.o: ${kernels_dir}/mm.cc
+	mkdir -p ${@D}
+	cd ${@D} && ${KERNEL_CC} ${KERNEL_CFLAGS} ${MM_DEFINES} ${KERNEL_DEFINES} -c $< -o ${@F}
+
+build/mm_ln_epilogue_${m}x${k}x${n}.o: ${kernels_dir}/mm_ln_epilogue.cc
+	mkdir -p ${@D}
+	cd ${@D} && ${KERNEL_CC} ${KERNEL_CFLAGS} ${EPI_DEFINES} ${KERNEL_DEFINES} -c $< -o ${@F}

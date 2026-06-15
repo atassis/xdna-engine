@@ -92,6 +92,13 @@ impl WhisperEncoder {
         &self.w
     }
 
+    /// The NPU device this encoder opened (when built via `new_npu`), so a co-resident decoder can
+    /// share the SAME single-tenant device instead of double-opening `/dev/accel/accel0`.
+    #[cfg(feature = "npu")]
+    pub fn device(&self) -> Option<std::rc::Rc<npu_xrt::Device>> {
+        self.npu.as_ref().map(|n| n.device())
+    }
+
     /// Linear with weights stored [K_in, N_out]: `x[M,K]·W[K,N] + b[N]` (bias broadcast over rows).
     fn linear(&self, x: &Array2<f32>, w: &Array2<f32>, b: &Array1<f32>, _id: &str) -> Array2<f32> {
         // host path: id unused (the NPU path in A9 will use it to key the weight-BO cache)

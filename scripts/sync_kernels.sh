@@ -40,6 +40,10 @@ cp "$RB/ffn_gemm2/Makefile.ffn"      "$MM/single_core/Makefile.ffn"
 # M-stationary GEMM probe (internal notes; KILLED but kept reproducible) — bin/mstat_probe.rs
 cp "$RB/m_stationary/m_stationary_iron.py" "$MM/whole_array/m_stationary_iron.py"
 cp "$RB/m_stationary/Makefile.mstat"       "$MM/whole_array/Makefile.mstat"
+# M-stationary GEMM + fused LayerNorm epilogue (Phase 1.2 spike) — bin/mstat_ln_probe.rs
+cp "$RB/aie_kernels/mm_ln_epilogue.cc"         "$K/mm_ln_epilogue.cc"
+cp "$RB/m_stationary/m_stationary_ln_iron.py"  "$MM/whole_array/m_stationary_ln_iron.py"
+cp "$RB/m_stationary/Makefile.mstatln"         "$MM/whole_array/Makefile.mstatln"
 # ctxLN — encoder LayerNorm on the NPU (Step D, internal notes): f32 two-pass kernel + design
 cp "$RB/aie_kernels/ln_2pass.cc"     "$K/ln_2pass.cc"
 cp "$RB/ctx_ln/ctx_ln_iron.py"       "$PE/ml/layernorm/ctx_ln_iron.py"

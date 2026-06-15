@@ -8,6 +8,7 @@
 pub mod weights;
 pub mod engines;
 pub mod conv_npu;
+pub mod ctx_decode;
 #[cfg(feature = "two_ctx")]
 pub mod ctx2;
 #[cfg(feature = "two_ctx")]

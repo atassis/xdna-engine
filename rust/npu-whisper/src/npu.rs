@@ -33,6 +33,12 @@ impl WhisperNpu {
         let shared = SharedCtxA::with_precision(&dev, root, precision);
         WhisperNpu { dev, shared, precision }
     }
+
+    /// Share the opened device (single-tenant) so a co-resident decoder can reuse it instead of
+    /// double-opening `/dev/accel/accel0`.
+    pub fn device(&self) -> Rc<Device> {
+        Rc::clone(&self.dev)
+    }
 }
 
 /// The NPU matmul ops for one pre-norm block: the four K=768 projections (q/k/v/out, n=768), the

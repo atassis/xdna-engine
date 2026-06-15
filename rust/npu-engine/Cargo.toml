@@ -47,3 +47,11 @@ path = "src/bin/engine_serve.rs"
 [[bin]]
 name = "probe_tuning"
 path = "src/bin/probe_tuning.rs"
+
+[[bin]]
+name = "verify_whisper_decode"
+path = "src/bin/verify_whisper_decode.rs"
+
+[[bin]]
+name = "whisper_e2e_timing"
+path = "src/bin/whisper_e2e_timing.rs"
