@@ -18,13 +18,30 @@ use npu_engine::registry;
 const SCENARIO: &str = "scenarios/asr-whisper-small.toml";
 const PASSES: usize = 3;
 
+// Intel/AMD RAPL package energy (µJ). Package domain includes the on-die NPU on this part; the
+// core subdomain (intel-rapl:0:0) is broken on this AMD chip — use package only. World-readable.
+const RAPL_PKG: &str = "/sys/class/powercap/intel-rapl:0/energy_uj";
+const RAPL_MAX: &str = "/sys/class/powercap/intel-rapl:0/max_energy_range_uj";
+fn rapl_uj(p: &str) -> Option<u128> {
+    std::fs::read_to_string(p).ok()?.trim().parse().ok()
+}
+fn uj_delta(b: u128, a: u128, max: u128) -> u128 {
+    if a >= b { a - b } else { a + max - b }
+}
+
 fn main() {
     let wav_path = std::env::args().nth(1).expect("usage: whisper_e2e_timing <clip.wav>");
 
     let bytes = std::fs::read(&wav_path).unwrap_or_else(|e| panic!("read {wav_path}: {e}"));
     let samples = parse_wav_i16(&bytes).expect("parse 16k/mono/16-bit WAV");
     let dur_s = samples.len() as f64 / 16_000.0;
-    let backend = if std::env::var("NPU_DECODE").is_ok() { "NPU" } else { "ONNX" };
+    let backend = if std::env::var("NPU_DECODE_FUSED").is_ok() {
+        "FUSED"
+    } else if std::env::var("NPU_DECODE").is_ok() {
+        "NPU"
+    } else {
+        "ONNX"
+    };
     eprintln!(
         "[bench] clip={wav_path} samples={} duration_s={dur_s:.3} backend={backend} passes={PASSES}",
         samples.len()
@@ -41,10 +58,27 @@ fn main() {
     let warm = pipe.transcribe(&samples);
     eprintln!("[bench] warmup text: {warm:?}");
 
-    eprintln!("[bench] --- {PASSES} timed passes ---");
+    eprintln!("[bench] --- {PASSES} timed passes (with RAPL package energy) ---");
+    let rmax = rapl_uj(RAPL_MAX).unwrap_or(u128::MAX);
+    let e0 = rapl_uj(RAPL_PKG);
+    let t0 = std::time::Instant::now();
     for p in 0..PASSES {
         eprintln!("[bench] timed pass {}/{PASSES}", p + 1);
         let _ = pipe.transcribe(&samples);
+    }
+    let wall_s = t0.elapsed().as_secs_f64();
+    if let (Some(b), Some(a)) = (e0, rapl_uj(RAPL_PKG)) {
+        let j = uj_delta(b, a, rmax) as f64 / 1e6;
+        let j_per = j / PASSES as f64;
+        let avg_w = j / wall_s;
+        // RTF on the timed window (audio seconds processed per wall second).
+        let rtf = (dur_s * PASSES as f64) / wall_s;
+        eprintln!(
+            "[WHISPER_ENERGY] backend={backend} pkg_J_total={j:.2} pkg_J_per_transcription={j_per:.2} \
+             avg_pkg_W={avg_w:.2} wall_s={wall_s:.2} rtf={rtf:.2}x"
+        );
+    } else {
+        eprintln!("[WHISPER_ENERGY] backend={backend} RAPL unreadable ({RAPL_PKG})");
     }
     eprintln!("[bench] done (duration_s={dur_s:.3})");
 }

@@ -7,10 +7,11 @@
 extern "C" {
 #endif
 
-typedef struct ShimDevice ShimDevice;
-typedef struct ShimKernel ShimKernel;
-typedef struct ShimBo     ShimBo;
-typedef struct ShimRun    ShimRun;
+typedef struct ShimDevice    ShimDevice;
+typedef struct ShimKernel    ShimKernel;
+typedef struct ShimBo        ShimBo;
+typedef struct ShimRun       ShimRun;
+typedef struct ShimElfKernel ShimElfKernel;
 
 ShimDevice* shim_device_open(unsigned int index);
 void        shim_device_close(ShimDevice*);
@@ -46,6 +47,20 @@ ShimRun* shim_run_matmul8_start(ShimKernel*, unsigned int opcode, ShimBo* instr,
                                 ShimBo* a, ShimBo* b, ShimBo* c, ShimBo* tmp, ShimBo* trace);
 int      shim_run_wait(ShimRun*); /* 0 = completed, -1 = error/not-completed */
 void     shim_run_free(ShimRun*);
+
+/* --- Fused full-ELF dispatch (the IRON FusedMLIROperator path) ----------------------------------
+ * A full ELF carries its own instructions+config (no xclbin, no insts BO). Mirrors IRON's
+ * fusion.py FullELFCallable: xrt::elf(bytes) -> hw_context(device, elf) -> ext::kernel(ctx, name).
+ * kernel_name NULL/empty defaults to "main:sequence" (IRON's device:sequence default). The ELF bytes
+ * are copied in, so the caller may patch+reload its own buffer freely. Returns NULL on failure. */
+ShimElfKernel* shim_elf_kernel_load(ShimDevice*, const void* elf_bytes, size_t nbytes,
+                                    const char* kernel_name);
+void           shim_elf_kernel_close(ShimElfKernel*);
+
+/* Dispatch a full-ELF kernel with N buffer-object args (run.set_arg(i, bo) for i in 0..n_bos),
+ * start + wait. The fused-arena ABI passes exactly 3 BOs (input, output, scratch), but this is
+ * generic-N to match IRON's variadic set_arg loop. 0 on success. */
+int shim_run_elf(ShimElfKernel*, ShimBo* const* bos, size_t n_bos);
 
 const char* shim_last_error(void);
 

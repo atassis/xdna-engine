@@ -26,13 +26,23 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use ndarray::prelude::*;
-use npu_xrt::{pack_f32_to_bf16, Bo, Device, Kernel, FLAG_CACHEABLE, FLAG_HOST_ONLY};
+use npu_xrt::{f32_to_bf16_bits, pack_f32_to_bf16, Bo, Device, Kernel, FLAG_CACHEABLE, FLAG_HOST_ONLY};
 
 /// Smallest legal M for the native-bf16 8-col whole_array design (see build_decode_kernels.sh).
 const M: usize = 64;
 const TILE: &str = "8x32x32"; // m x k x n
 const COLS: usize = 8;
 const WA: &str = "mlir-aie/programming_examples/basic/matrix_multiplication/whole_array/build";
+
+// --- on-chip single-query multi-head attention (mha_decode) ---
+const ATTN_D: usize = 768;
+const ATTN_NHEADS: usize = 12;
+const ATTN_HD: usize = 64; // D / NHEADS
+const ATTN_TKV: usize = 64; // keys per K/V tile; MUST match the kernel's MHA_TKV.
+const ATTN_S_MAX: usize = 448; // fixed max cache length -> fixed unrolled tile count.
+const ATTN_N_TILES: usize = (ATTN_S_MAX + ATTN_TKV - 1) / ATTN_TKV; // 7 (the ONE xclbin)
+const ATTN_KV_TILE: usize = 2 * ATTN_TKV * ATTN_HD + 2; // K | V | int32 header (2 bf16)
+const MHA_DIR: &str = "mlir-aie/programming_examples/ml/mha_decode/build";
 
 /// Round `n` up to the next multiple of 32 (the whole_array N-tiling constraint, N % (n*cols)..
 /// here N % 32 == 0 suffices for the GEMV shapes we register; cols=8,n=32 => N % 256 for full
@@ -50,6 +60,22 @@ fn u16_bytes(v: &[u16]) -> &[u8] {
 pub enum DecodeEpi {
     None,
     Bias,
+}
+
+/// Pre-norm applied to the decode activation `x[K]` before the projection. The norm is FOLDED into
+/// the resident weight (`W'' = diag(γ)·W`, LN also `bias' = β@W + bias`), making it SEPARABLE from
+/// the matmul (see `internal notes` §3):
+///   RMS: `out = inv_rms·(x @ W'') + bias`,  `inv_rms = 1/√(Σx²/K + eps)`
+///   LN : `out = inv_std·((x−mean) @ W'') + bias'`,  `mean=Σx/K`, `inv_std=1/√(Σ(x−mean)²/K + eps)`
+/// Because decode is M=1, the norm is a single K-vector reduction (free on host, not a dispatch);
+/// the heavy `x @ W''` stays the one resident GEMV dispatch. `register_fused` precomputes `W''`/`bias'`;
+/// `fused_norm_gemv` does the (trivial) input-scale on host, dispatches the GEMV, and host-adds `bias'`.
+#[derive(Clone, Debug)]
+pub enum Norm {
+    /// RMSNorm(γ, eps): `inv_rms = 1/√(mean(x²)+eps)`; `γ` folded into `W''`.
+    Rms { gamma: Vec<f32>, eps: f32 },
+    /// LayerNorm(γ, β, eps): `mean`/`inv_std` over x; `γ` folded into `W''`, `β` folded into `bias'`.
+    Ln { gamma: Vec<f32>, beta: Vec<f32>, eps: f32 },
 }
 
 /// A registered decoder weight: resident `[K, N_pad]` bf16 matrix, written to the device once.
@@ -94,11 +120,31 @@ struct ShapeKernel {
     c_buf: RefCell<Vec<f32>>,
 }
 
+/// Resident on-chip single-query MHA kernel (the ONE runtime-S mha_decode xclbin) plus its reusable
+/// q/kv/ctx BOs. Loaded lazily on first `attn` call. The kernel streams a FIXED `ATTN_N_TILES` K/V
+/// tiles per head and reads the real per-tile key count at runtime from each tile's int32 header, so
+/// one xclbin serves every cache length S<=ATTN_S_MAX.
+struct AttnKernel {
+    kern: Rc<Kernel>,
+    instr: Bo,
+    n_instr: usize,
+    bo_q: Bo,   // [NHEADS*HD] bf16 (head-major query)
+    bo_kv: Bo,  // [NHEADS*N_TILES*KV_TILE] bf16 (per head/tile: K | V | int32 hdr)
+    bo_ctx: Bo, // [NHEADS*HD] f32 (read back)
+    bo_tmp: Bo,
+    bo_tr: Bo,
+    q_bf: RefCell<Vec<u16>>,
+    kv_bf: RefCell<Vec<u16>>,
+    ctx_buf: RefCell<Vec<f32>>,
+}
+
 /// Resident on-NPU GEMV primitive for the decoder. Holds one [`ShapeKernel`] per (K, N_pad) shape.
 pub struct CtxDecode {
     dev: Rc<Device>,
     root: PathBuf,
     shapes: RefCell<HashMap<(usize, usize), Rc<ShapeKernel>>>,
+    /// The lazily-loaded on-chip attention kernel (single runtime-S mha_decode xclbin).
+    attn_kernel: RefCell<Option<Rc<AttnKernel>>>,
     /// Cheap dispatch counter: incremented once per `gemv` (== one NPU matmul dispatch). Used by the
     /// timing harness to report dispatches/token exactly. Free in the hot path (a single `Cell` add).
     dispatches: Cell<u64>,
@@ -110,6 +156,7 @@ impl CtxDecode {
             dev: Rc::clone(dev),
             root: root.to_path_buf(),
             shapes: RefCell::new(HashMap::new()),
+            attn_kernel: RefCell::new(None),
             dispatches: Cell::new(0),
         }
     }
@@ -317,6 +364,354 @@ impl CtxDecode {
         }
         Ok(out)
     }
+
+    /// Ensure the on-chip MHA kernel (single runtime-S mha_decode xclbin) is loaded; load it and
+    /// alloc its reusable BOs on first use. Returns a clear error naming the missing artifact if
+    /// the build step (scripts/build_mha_decode.sh) has not produced it.
+    fn ensure_attn(&self) -> Result<Rc<AttnKernel>, String> {
+        if let Some(ak) = self.attn_kernel.borrow().as_ref() {
+            return Ok(Rc::clone(ak));
+        }
+        let dir = self.root.join(MHA_DIR);
+        let xclbin = dir.join(format!("final_mha_decode_{ATTN_S_MAX}.xclbin"));
+        let insts = dir.join(format!("insts_mha_decode_{ATTN_S_MAX}.txt"));
+        if !xclbin.exists() {
+            return Err(format!(
+                "ctxDecode::attn: missing MHA xclbin {} — build it with: \
+                 source scripts/iron_env.sh && bash scripts/build_mha_decode.sh",
+                xclbin.display()
+            ));
+        }
+        if !insts.exists() {
+            return Err(format!(
+                "ctxDecode::attn: missing MHA insts {} — build it with: \
+                 source scripts/iron_env.sh && bash scripts/build_mha_decode.sh",
+                insts.display()
+            ));
+        }
+
+        let kern = self
+            .dev
+            .load_kernel(xclbin.to_str().unwrap(), None)
+            .map_err(|e| format!("ctxDecode::attn: load {}: {e}", xclbin.display()))?;
+        let ibytes = std::fs::read(&insts)
+            .map_err(|e| format!("ctxDecode::attn: read insts {}: {e}", insts.display()))?;
+        let n_instr = ibytes.len() / 4;
+        let g = |i| kern.group_id(i).unwrap();
+
+        let instr = self
+            .dev
+            .alloc_bo(&kern, ibytes.len(), FLAG_CACHEABLE, g(1))
+            .map_err(|e| format!("ctxDecode::attn: alloc instr BO: {e}"))?;
+        instr.write_bytes(&ibytes).map_err(|e| format!("ctxDecode::attn: write instr: {e}"))?;
+        instr.sync_to_device().map_err(|e| format!("ctxDecode::attn: sync instr: {e}"))?;
+
+        let q_elems = ATTN_NHEADS * ATTN_HD;
+        let kv_elems = ATTN_NHEADS * ATTN_N_TILES * ATTN_KV_TILE;
+        let ctx_elems = ATTN_NHEADS * ATTN_HD;
+        let bo_q = self
+            .dev
+            .alloc_bo(&kern, q_elems * 2, FLAG_HOST_ONLY, g(3))
+            .map_err(|e| format!("ctxDecode::attn: alloc q BO: {e}"))?;
+        let bo_kv = self
+            .dev
+            .alloc_bo(&kern, kv_elems * 2, FLAG_HOST_ONLY, g(4))
+            .map_err(|e| format!("ctxDecode::attn: alloc kv BO: {e}"))?;
+        let bo_ctx = self
+            .dev
+            .alloc_bo(&kern, ctx_elems * 4, FLAG_HOST_ONLY, g(5))
+            .map_err(|e| format!("ctxDecode::attn: alloc ctx BO: {e}"))?;
+        let bo_tmp = self
+            .dev
+            .alloc_bo(&kern, 8, FLAG_HOST_ONLY, g(6))
+            .map_err(|e| format!("ctxDecode::attn: alloc tmp BO: {e}"))?;
+        let bo_tr = self
+            .dev
+            .alloc_bo(&kern, 4, FLAG_HOST_ONLY, g(7))
+            .map_err(|e| format!("ctxDecode::attn: alloc trace BO: {e}"))?;
+        eprintln!(
+            "[ctxDecode] resident MHA xclbin loaded (single-query, {ATTN_NHEADS} heads x {ATTN_HD}, \
+             runtime-S streaming/flash, {ATTN_N_TILES} tiles, bf16 in / f32 ctx)"
+        );
+
+        let ak = Rc::new(AttnKernel {
+            kern,
+            instr,
+            n_instr,
+            bo_q,
+            bo_kv,
+            bo_ctx,
+            bo_tmp,
+            bo_tr,
+            q_bf: RefCell::new(vec![0u16; q_elems]),
+            kv_bf: RefCell::new(vec![0u16; kv_elems]),
+            ctx_buf: RefCell::new(vec![0f32; ctx_elems]),
+        });
+        *self.attn_kernel.borrow_mut() = Some(Rc::clone(&ak));
+        Ok(ak)
+    }
+
+    /// Eagerly load the on-chip MHA kernel + alloc its BOs (preload at decoder construction so a
+    /// missing xclbin fails loudly up front rather than mid-decode). Idempotent.
+    pub fn ensure_attn_loaded(&self) -> Result<(), String> {
+        self.ensure_attn().map(|_| ())
+    }
+
+    /// On-chip single-query multi-head attention for the decoder's self-attention sublayer.
+    /// `q` is the query row [768]; `k_flat`/`v_flat` are the self-KV cache `[s, 768]` row-major
+    /// (f32, as held by the decoder). `s` is the real cache length (1..=448). Converts K/V to bf16,
+    /// packs head-major into the FIXED `ATTN_N_TILES`-tile layout with per-tile runtime key counts
+    /// (zero-pad-free: empty/partial tiles carry their real count in the int32 header), dispatches
+    /// the resident MHA kernel (ONE dispatch, M=1), and returns the context row ctx[768] f32.
+    /// Mirrors the BO management in `gemv` (reused resident BOs; per-call write/sync/dispatch/read).
+    pub fn attn(
+        &self,
+        q: &[f32],
+        k_flat: &[f32],
+        v_flat: &[f32],
+        s: usize,
+    ) -> Result<Vec<f32>, String> {
+        assert_eq!(q.len(), ATTN_D, "ctxDecode::attn: q len {} != D {ATTN_D}", q.len());
+        assert!(s >= 1 && s <= ATTN_S_MAX, "ctxDecode::attn: s={s} out of 1..={ATTN_S_MAX}");
+        assert_eq!(k_flat.len(), s * ATTN_D, "ctxDecode::attn: k_flat len {} != s*D", k_flat.len());
+        assert_eq!(v_flat.len(), s * ATTN_D, "ctxDecode::attn: v_flat len {} != s*D", v_flat.len());
+        self.dispatches.set(self.dispatches.get() + 1);
+        let ak = self.ensure_attn()?;
+
+        let n_real_tiles = s.div_ceil(ATTN_TKV); // tiles holding >=1 real key (<= N_TILES)
+        let hdr_off = 2 * ATTN_TKV * ATTN_HD;
+
+        // ---- pack q [12,64] bf16 (head-major) ----
+        {
+            let mut qb = ak.q_bf.borrow_mut();
+            for h in 0..ATTN_NHEADS {
+                for d in 0..ATTN_HD {
+                    qb[h * ATTN_HD + d] = f32_to_bf16_bits(q[h * ATTN_HD + d]);
+                }
+            }
+            ak.bo_q.write_bytes(u16_bytes(&qb)).map_err(|e| format!("ctxDecode::attn: write q: {e}"))?;
+        }
+        ak.bo_q.sync_to_device().map_err(|e| format!("ctxDecode::attn: sync q: {e}"))?;
+
+        // ---- pack kv [12, N_TILES, KV_TILE] bf16 (K | V | int32 runtime count) ----
+        {
+            let mut kvb = ak.kv_bf.borrow_mut();
+            for v in kvb.iter_mut() {
+                *v = 0;
+            }
+            for h in 0..ATTN_NHEADS {
+                let base = h * ATTN_HD;
+                for t in 0..ATTN_N_TILES {
+                    let off = (h * ATTN_N_TILES + t) * ATTN_KV_TILE;
+                    let k_off = off;
+                    let v_off = off + ATTN_TKV * ATTN_HD;
+                    for r in 0..ATTN_TKV {
+                        let key = t * ATTN_TKV + r;
+                        if key >= s {
+                            break; // remaining rows in this tile are empty (stay 0)
+                        }
+                        for d in 0..ATTN_HD {
+                            kvb[k_off + r * ATTN_HD + d] = f32_to_bf16_bits(k_flat[key * ATTN_D + base + d]);
+                            kvb[v_off + r * ATTN_HD + d] = f32_to_bf16_bits(v_flat[key * ATTN_D + base + d]);
+                        }
+                    }
+                    // per-tile runtime count (int32, bit-exact into 2 bf16 lanes).
+                    let s_in_tile: i32 = if t >= n_real_tiles {
+                        0
+                    } else {
+                        let real = (s - t * ATTN_TKV).min(ATTN_TKV) as i32;
+                        if t == n_real_tiles - 1 {
+                            -real
+                        } else {
+                            real
+                        }
+                    };
+                    let bytes = s_in_tile.to_le_bytes();
+                    kvb[off + hdr_off] = u16::from_le_bytes([bytes[0], bytes[1]]);
+                    kvb[off + hdr_off + 1] = u16::from_le_bytes([bytes[2], bytes[3]]);
+                }
+            }
+            ak.bo_kv.write_bytes(u16_bytes(&kvb)).map_err(|e| format!("ctxDecode::attn: write kv: {e}"))?;
+        }
+        ak.bo_kv.sync_to_device().map_err(|e| format!("ctxDecode::attn: sync kv: {e}"))?;
+
+        // ---- dispatch (same ABI as gemv: opcode 3, A=q, B=kv, C=ctx) ----
+        ak.kern
+            .run_matmul8(3, &ak.instr, ak.n_instr, &ak.bo_q, &ak.bo_kv, &ak.bo_ctx, &ak.bo_tmp, &ak.bo_tr)
+            .map_err(|e| format!("ctxDecode::attn: dispatch: {e}"))?;
+
+        // ---- read back ctx [12,64] f32 -> [768] ----
+        ak.bo_ctx.sync_from_device().map_err(|e| format!("ctxDecode::attn: sync ctx: {e}"))?;
+        {
+            let mut cb = ak.ctx_buf.borrow_mut();
+            let dst = unsafe {
+                std::slice::from_raw_parts_mut(cb.as_mut_ptr() as *mut u8, ATTN_NHEADS * ATTN_HD * 4)
+            };
+            ak.bo_ctx.read_bytes(dst).map_err(|e| format!("ctxDecode::attn: read ctx: {e}"))?;
+        }
+        let ctx = ak.ctx_buf.borrow().clone();
+        Ok(ctx)
+    }
+
+    /// Register a FUSED pre-norm + projection weight: precompute the folded weight `W'' = diag(γ)·W`
+    /// (LN also `bias' = β@W + bias`), pack `W''` to a resident bf16 `[K, N_pad]` BO (same residency as
+    /// [`register_weight`]), and ensure the matching `{ln|rms}` xclbin is loaded. The returned
+    /// [`FusedWeight`] holds the folded `bias'` (LN) / `bias` (RMS) for the host post-add and the norm
+    /// params for the (trivial, M=1) per-call input reduction.
+    ///
+    /// `w` is `[K, N]` f32 row-major (the ORIGINAL weight, pre-fold). `bias` is length-N (or empty).
+    /// The fold reference is `rust/npu-asr/src/bin/norm_gemv_probe.rs`; correctness is the §3 separable
+    /// identity proven to machine-ε by `norm_gemv_probe selftest`.
+    pub fn register_fused(&mut self, w: &Array2<f32>, norm: Norm, bias: &[f32]) -> FusedWeight {
+        let k = w.nrows();
+        let n = w.ncols();
+        if !bias.is_empty() {
+            assert_eq!(bias.len(), n, "ctxDecode: bias len {} != N {n}", bias.len());
+        }
+
+        // --- fold: W''[k][n] = gamma[k] * W[k][n] ---
+        let gamma = match &norm {
+            Norm::Rms { gamma, .. } => gamma,
+            Norm::Ln { gamma, .. } => gamma,
+        };
+        assert_eq!(gamma.len(), k, "ctxDecode: gamma len {} != K {k}", gamma.len());
+        let mut wpp = Array2::<f32>::zeros((k, n));
+        for kk in 0..k {
+            let g = gamma[kk];
+            for nn in 0..n {
+                wpp[[kk, nn]] = g * w[[kk, nn]];
+            }
+        }
+
+        // --- folded bias: LN bias'[n] = sum_k beta[k]*W[k][n] + bias[n]; RMS bias' = bias ---
+        let bias_p: Vec<f32> = match &norm {
+            Norm::Ln { beta, .. } => {
+                assert_eq!(beta.len(), k, "ctxDecode: beta len {} != K {k}", beta.len());
+                (0..n)
+                    .map(|nn| {
+                        let s: f32 = (0..k).map(|kk| beta[kk] * w[[kk, nn]]).sum();
+                        s + bias.get(nn).copied().unwrap_or(0.0)
+                    })
+                    .collect()
+            }
+            Norm::Rms { .. } => {
+                if bias.is_empty() {
+                    vec![0.0; n]
+                } else {
+                    bias.to_vec()
+                }
+            }
+        };
+
+        // Reuse register_weight's residency for W'' (DecodeEpi::None — bias' is host-added in
+        // fused_norm_gemv, not in gemv, since the folded bias may differ from a plain weight bias).
+        let dw = self.register_weight(&wpp, DecodeEpi::None, &[]);
+
+        FusedWeight { dw, norm, bias_p }
+    }
+
+    /// Run the fused pre-norm + projection for a registered [`FusedWeight`]: normalize `x` (the M=1
+    /// reduction over K — `inv_rms·x` for RMS, `inv_std·(x−mean)` for LN), dispatch the resident GEMV
+    /// on `W''` (one dispatch), and host-add the folded `bias'`. Returns the length-N result.
+    pub fn fused_norm_gemv(&self, fw: &FusedWeight, x: &[f32]) -> Result<Vec<f32>, String> {
+        let k = fw.dw.k;
+        assert_eq!(x.len(), k, "ctxDecode: x len {} != weight K {k}", x.len());
+
+        // Input normalization (f32; the bf16-long-reduction lesson: reduce in f32).
+        let x_norm: Vec<f32> = match &fw.norm {
+            Norm::Rms { eps, .. } => {
+                let ms = x.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>() / k as f64;
+                let inv = 1.0 / (ms + *eps as f64).sqrt();
+                x.iter().map(|&v| (v as f64 * inv) as f32).collect()
+            }
+            Norm::Ln { eps, .. } => {
+                let mean = x.iter().map(|&v| v as f64).sum::<f64>() / k as f64;
+                let var = x.iter().map(|&v| (v as f64 - mean) * (v as f64 - mean)).sum::<f64>()
+                    / k as f64;
+                let inv = 1.0 / (var + *eps as f64).sqrt();
+                x.iter().map(|&v| ((v as f64 - mean) * inv) as f32).collect()
+            }
+        };
+
+        // x_norm @ W'' on device (the resident GEMV), then host-add the folded bias'.
+        let mut out = self.gemv(&fw.dw, &x_norm)?;
+        for (o, &b) in out.iter_mut().zip(fw.bias_p.iter()) {
+            *o += b;
+        }
+        Ok(out)
+    }
+
+    /// Collapsed decoder SELF-attention sublayer: fused LN+QKV → on-chip MHA → O projection, run as
+    /// ONE host call with the q/ctx intermediates threaded buffer-to-buffer (no standalone host
+    /// `Vec`s, no caller-visible round-trip between the three dispatches). Numerically BYTE-IDENTICAL
+    /// to the M1.a sequence `fused_norm_gemv(qkv) → attn → gemv(self_out)` — same dispatches, same
+    /// bf16 packing, same f32 epilogues; only the host marshaling between stages is removed.
+    ///
+    /// `qkv` is the fused LN+QKV weight `[768, 2304]` (q|k|v concat). `self_out` is the O projection
+    /// `[768, 768]` (`DecodeEpi::Bias`). `x` is the residual-stream row `[768]`. `self_k`/`self_v` are
+    /// the growing self-KV caches `[s, 768]` row-major; this method APPENDS the new step's k/v (so the
+    /// caller must NOT extend them itself) and then attends over the full `s = n_self_before + 1` rows.
+    /// Returns the self-attn output `[768]` to add to the residual.
+    ///
+    /// ## Why this is BO-chaining's limit on our stack (the collapse mechanism note)
+    /// The three dispatches use THREE distinct xclbins (QKV gemv / mha_decode / O gemv), each its own
+    /// hw-context with its own arg group-ids and — decisively — INCOMPATIBLE buffer LAYOUTS at every
+    /// seam: QKV emits f32 row-0-of-`[64,2304]`; attn wants q as bf16 head-major `[12,64]`; attn emits
+    /// f32 ctx`[768]`; O wants bf16 row-0-of-`[64,768]`. So the inter-stage transform (f32↔bf16 +
+    /// re-layout) is INTRINSIC host compute, not removable by keeping a BO device-resident. Unlike the
+    /// ctx2 FFN BO-chain (which keeps H resident across mm1→mm2 on the SAME resident kernel), there is
+    /// no same-kernel residency to exploit across these three kernels. This method therefore collapses
+    /// the *host marshaling* (intermediate allocations + the caller-visible Vec hops), which is the
+    /// available win; true device-resident chaining would require a single stitched multi-launch ELF
+    /// (M1.b, separate task) or an ERT_CMD_CHAIN/runlist shim (not present in npu-xrt).
+    #[allow(clippy::too_many_arguments)]
+    pub fn self_attn_chained(
+        &self,
+        qkv: &FusedWeight,
+        self_out: &DecodeWeight,
+        x: &[f32],
+        self_k: &mut Vec<f32>,
+        self_v: &mut Vec<f32>,
+        n_self_before: usize,
+    ) -> Result<Vec<f32>, String> {
+        debug_assert_eq!(qkv.dw.n, 3 * ATTN_D, "self_attn_chained: qkv N must be 3*768");
+        // Stage 1: fused LN+QKV (one dispatch). Identical to the M1.a `fused_norm_gemv` call.
+        let qkv_out = self.fused_norm_gemv(qkv, x)?; // [2304] = q|k|v
+        // Append this step's k/v to the caches IN PLACE (the caller no longer round-trips k/v through
+        // its own Vecs). Byte-identical to `extend_from_slice(&k); extend_from_slice(&v)` in M1.a.
+        self_k.extend_from_slice(&qkv_out[ATTN_D..2 * ATTN_D]);
+        self_v.extend_from_slice(&qkv_out[2 * ATTN_D..3 * ATTN_D]);
+        let s = n_self_before + 1;
+
+        // Stage 2: on-chip MHA (one dispatch). q is passed as a SLICE of qkv_out — no standalone Vec.
+        let ctx = self.attn(&qkv_out[0..ATTN_D], self_k, self_v, s)?; // [768] f32 ctx
+
+        // Stage 3: O projection (one dispatch). ctx flows straight in as the gemv activation — no
+        // caller-visible ctx_vec hop. `gemv` applies `self_out`'s bias epilogue (DecodeEpi::Bias).
+        self.gemv(self_out, &ctx)
+    }
+}
+
+/// A registered fused pre-norm + projection weight: the folded `W''` resident GEMV weight + the
+/// folded `bias'` (host post-add) + the norm params (the M=1 input reduction). Built by
+/// [`CtxDecode::register_fused`], consumed by [`CtxDecode::fused_norm_gemv`].
+pub struct FusedWeight {
+    dw: DecodeWeight,
+    norm: Norm,
+    /// Folded bias: LN `β@W + bias`; RMS `bias` (or zeros). Length N.
+    bias_p: Vec<f32>,
+}
+
+impl FusedWeight {
+    pub fn k(&self) -> usize {
+        self.dw.k
+    }
+    pub fn n(&self) -> usize {
+        self.dw.n
+    }
+    pub fn n_pad(&self) -> usize {
+        self.dw.n_pad
+    }
 }
 
 #[cfg(test)]
@@ -372,5 +767,65 @@ mod tests {
         let rel_l2 = (num / den).sqrt();
         eprintln!("[ctxDecode parity] rel-L2 = {rel_l2:.4e} (threshold 0.08), n={n}");
         assert!(rel_l2 <= 0.08, "rel-L2 {rel_l2:.4e} exceeds 0.08");
+    }
+
+    /// Device-gated parity for the FUSED LN path: `LayerNorm(x)@W + bias` (host golden) vs
+    /// `register_fused(W, Ln{γ,β,eps}, bias)` + `fused_norm_gemv`, [768,768], rel-L2 <= 0.08.
+    /// Requires the NPU (single-tenant) and the 768x768 xclbin.
+    /// Run with:  cargo test -p npu-asr fused_ln_parity -- --ignored --test-threads=1
+    #[test]
+    #[ignore]
+    fn fused_ln_parity_768x768() {
+        let (k, n) = (768usize, 768usize);
+        let eps = 1e-5f32;
+
+        let mut w_data = vec![0f32; k * n];
+        lcg_fill(&mut w_data, 0x1234_5678);
+        let w = Array2::from_shape_vec((k, n), w_data).unwrap();
+        let mut x = vec![0f32; k];
+        lcg_fill(&mut x, 0x9E37_79B9);
+        let mut gamma = vec![0f32; k];
+        lcg_fill(&mut gamma, 0xABCD_1234);
+        for g in gamma.iter_mut() {
+            *g += 1.0;
+        }
+        let mut beta = vec![0f32; k];
+        lcg_fill(&mut beta, 0x5555_AAAA);
+        let mut bias = vec![0f32; n];
+        lcg_fill(&mut bias, 0x0F0F_F0F0);
+
+        // host golden: y = (LayerNorm(x; gamma, beta, eps)) @ W + bias
+        let mean = x.iter().map(|&v| v as f64).sum::<f64>() / k as f64;
+        let var =
+            x.iter().map(|&v| (v as f64 - mean) * (v as f64 - mean)).sum::<f64>() / k as f64;
+        let inv = 1.0 / (var + eps as f64).sqrt();
+        let xn: Vec<f64> =
+            (0..k).map(|kk| (x[kk] as f64 - mean) * inv * gamma[kk] as f64 + beta[kk] as f64).collect();
+        let mut y_ref = vec![0f64; n];
+        for nn in 0..n {
+            let mut s = 0f64;
+            for kk in 0..k {
+                s += xn[kk] * w[[kk, nn]] as f64;
+            }
+            y_ref[nn] = s + bias[nn] as f64;
+        }
+
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let dev = Rc::new(Device::open(0).expect("open NPU (stop npu-asr/voxd first)"));
+        let mut dec = CtxDecode::new(&dev, root.as_path());
+        let fw = dec.register_fused(&w, Norm::Ln { gamma, beta, eps }, &bias);
+        let y_npu = dec.fused_norm_gemv(&fw, &x).expect("fused_norm_gemv");
+
+        assert_eq!(y_npu.len(), n);
+        let mut num = 0f64;
+        let mut den = 0f64;
+        for i in 0..n {
+            let d = y_npu[i] as f64 - y_ref[i];
+            num += d * d;
+            den += y_ref[i] * y_ref[i];
+        }
+        let rel_l2 = (num / den).sqrt();
+        eprintln!("[ctxDecode fused-LN parity] rel-L2 = {rel_l2:.4e} (threshold 0.08), n={n}");
+        assert!(rel_l2 <= 0.08, "fused-LN rel-L2 {rel_l2:.4e} exceeds 0.08");
     }
 }

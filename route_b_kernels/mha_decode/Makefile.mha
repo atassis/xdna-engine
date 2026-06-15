@@ -1,0 +1,38 @@
+##===- Makefile.mha ------------------------------------------------------===##
+#
+# mha_decode — on-chip single-query MHA xclbin (M1 Task 0). Modeled on Makefile.ctxln.
+# Build (run from the ml/mha_decode sandbox dir, CPU-only):
+#   make -f Makefile.mha NPU2=1 seq=64 build/final_mha_decode_64.xclbin
+# Produces final_mha_decode_${seq}.xclbin + insts_mha_decode_${seq}.txt (S-bucket
+# encoded in the name so the 3 buckets {1,64,448} never collide).
+#
+# The kernel is STREAMING/flash: the .o depends only on TKV (keys per K/V tile),
+# not on S. Built once; the per-S xclbin just unrolls a different tile count.
+#
+srcdir := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
+include ${srcdir}/../../makefile-common
+VPATH := ${srcdir}/../../../aie_kernels/aie2p
+
+devicename ?= $(if $(filter 1,$(NPU2)),npu2,npu)
+seq ?= 64
+tkv ?= 64
+tag = mha_decode_${seq}
+
+aie_py_src = mha_decode_iron.py
+
+all: build/final_${tag}.xclbin
+
+# IRON expects the kernel object named "mha_decode.o" (Kernel(... "mha_decode.o" ...)).
+build/mha_decode.o: mha_decode.cc
+	mkdir -p ${@D}
+	cd ${@D} && ${PEANO_INSTALL_DIR}/bin/clang++ ${PEANOWRAP2P_FLAGS} -DMHA_TKV=${tkv} -c $< -o ${@F}
+
+build/aie_${tag}.mlir: ${srcdir}/${aie_py_src}
+	mkdir -p ${@D}
+	python3 $< -d ${devicename} -s ${seq} -t 0 > $@
+
+build/final_${tag}.xclbin: build/aie_${tag}.mlir build/mha_decode.o
+	mkdir -p ${@D}
+	cd ${@D} && aiecc --aie-generate-xclbin --aie-generate-npu-insts --no-compile-host \
+		--no-xchesscc --no-xbridge --peano ${PEANO_INSTALL_DIR} \
+		--xclbin-name=${@F} --npu-insts-name=insts_${tag}.txt aie_${tag}.mlir

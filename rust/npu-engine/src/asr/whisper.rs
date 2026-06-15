@@ -23,7 +23,7 @@ use npu_whisper::config::WhisperCfg;
 use npu_whisper::encoder::WhisperEncoder;
 use tokenizers::Tokenizer;
 
-use crate::asr::whisper_decoder::{HostDecoder, WhisperDecoderWeights};
+use crate::asr::whisper_decoder::{FusedDecoder, HostDecoder, WhisperDecoderWeights};
 use crate::config::ScenarioConfig;
 use crate::pipeline::AsrModel;
 
@@ -205,6 +205,9 @@ pub struct WhisperAsr {
     /// registered up front, sharing the encoder's single-tenant device). `None` => ONNX decode path.
     /// `RefCell` because `transcribe(&self)` mutates the decoder's self-KV cache (`step`/`reset`).
     npu_decoder: Option<RefCell<HostDecoder>>,
+    /// Whole-decode fused-ELF backend (env `NPU_DECODE_FUSED`): the ENTIRE 12-layer decoder in one
+    /// fused-ELF dispatch/token (vs `npu_decoder`'s ~72). Takes precedence over `npu_decoder`.
+    npu_fused: Option<RefCell<FusedDecoder>>,
     _env: Rc<Env>,
 }
 
@@ -232,23 +235,34 @@ impl WhisperAsr {
         // of the ONNX decoder graphs. Built ONCE here (weights + resident CtxDecode kernels), sharing
         // the encoder's already-open single-tenant device. When unset, the decoder is None and the
         // transcribe path is byte-identical to the ONNX baseline.
-        let npu_decoder = if std::env::var("NPU_DECODE").is_ok() {
+        // Decode backend: NPU_DECODE_FUSED (whole 12-layer fused ELF, 1 dispatch/token) takes
+        // precedence over NPU_DECODE (per-op, ~72 dispatches/token); else ONNX. All share the
+        // encoder's single-tenant device + the same host weights.
+        let fused_on = std::env::var("NPU_DECODE_FUSED").is_ok();
+        let npu_on = std::env::var("NPU_DECODE").is_ok();
+        let (npu_decoder, npu_fused) = if fused_on || npu_on {
             let dev = enc
                 .device()
-                .expect("NPU_DECODE: encoder must hold an open NPU device (built via new_npu)");
+                .expect("NPU decode: encoder must hold an open NPU device (built via new_npu)");
             let weights = Rc::new(
                 WhisperDecoderWeights::load(&ws.join("whisper_decoder"))
-                    .expect("NPU_DECODE: load whisper_decoder host weights"),
+                    .expect("NPU decode: load whisper_decoder host weights"),
             );
-            // CtxDecode root = xroot (worktree root; holds the mlir-aie symlink + whole_array xclbins).
-            let dec = HostDecoder::new_npu(weights, &dev, &xroot);
-            eprintln!("[whisper] NPU_DECODE=1: per-token decoder matmuls on the NPU");
-            Some(RefCell::new(dec))
+            if fused_on {
+                let fdir = xroot.join("artifacts/fused_decode12");
+                let fd = FusedDecoder::new(weights, &dev, &fdir);
+                eprintln!("[whisper] NPU_DECODE_FUSED=1: whole 12-layer decode in ONE fused-ELF dispatch/token");
+                (None, Some(RefCell::new(fd)))
+            } else {
+                let dec = HostDecoder::new_npu(weights, &dev, &xroot);
+                eprintln!("[whisper] NPU_DECODE=1: per-token decoder matmuls on the NPU");
+                (Some(RefCell::new(dec)), None)
+            }
         } else {
-            None
+            (None, None)
         };
 
-        WhisperAsr { prep, decoder, decoder_past, enc, tok, npu_decoder, _env: env }
+        WhisperAsr { prep, decoder, decoder_past, enc, tok, npu_decoder, npu_fused, _env: env }
     }
 
     /// Step 0: run the no-past graph over the full prompt + encoder hidden states. Delegates to the
@@ -290,10 +304,47 @@ impl WhisperAsr {
     /// `[SOT, lang, TRANSCRIBE, NOTIMESTAMPS]`, full-vocab argmax, EOT stop, and `MAX_DECODE` cap.
     /// The ONLY difference is the source of per-step logits.
     fn greedy_decode(&self, encoder_hidden: &[f32]) -> Vec<i64> {
-        match &self.npu_decoder {
-            Some(dec) => self.greedy_decode_npu(&mut dec.borrow_mut(), encoder_hidden),
-            None => self.greedy_decode_onnx(encoder_hidden),
+        if let Some(fd) = &self.npu_fused {
+            self.greedy_decode_fused(&mut fd.borrow_mut(), encoder_hidden)
+        } else if let Some(dec) = &self.npu_decoder {
+            self.greedy_decode_npu(&mut dec.borrow_mut(), encoder_hidden)
+        } else {
+            self.greedy_decode_onnx(encoder_hidden)
         }
+    }
+
+    /// Whole-decode fused-ELF greedy decode. IDENTICAL control logic to `greedy_decode_npu` (lang
+    /// detect, prompt, argmax, EOT, MAX_DECODE) — only the backend is `FusedDecoder` (1 dispatch/token).
+    fn greedy_decode_fused(&self, dec: &mut FusedDecoder, encoder_hidden: &[f32]) -> Vec<i64> {
+        let enc2 = Array2::from_shape_vec((T_ENC, D), encoder_hidden.to_vec())
+            .expect("encoder_hidden is [T_ENC*D]");
+        dec.precompute_cross(&enc2);
+        let lang_logits = dec.step(SOT, 0);
+        let lang = Self::pick_lang(&lang_logits);
+        let prompt: Vec<i64> = vec![SOT, lang, TRANSCRIBE, NOTIMESTAMPS];
+        let mut ids = prompt.clone();
+        dec.reset();
+        let mut logits = Vec::new();
+        for (pos, &tok) in prompt.iter().enumerate() {
+            logits = dec.step(tok, pos);
+        }
+        let mut next = argmax(&logits);
+        if next != EOT {
+            ids.push(next);
+        }
+        for step in 0..(MAX_DECODE - 1) {
+            if next == EOT {
+                break;
+            }
+            let pos = prompt.len() + step;
+            let logits = dec.step(next, pos);
+            next = argmax(&logits);
+            if next == EOT {
+                break;
+            }
+            ids.push(next);
+        }
+        ids
     }
 
     /// ONNX KV-cached greedy decode (the baseline; unchanged behavior).
@@ -435,12 +486,12 @@ impl AsrModel for WhisperAsr {
             // #tokens = emitted ids minus the 4-token prompt [SOT, lang, TRANSCRIBE, NOTIMESTAMPS].
             let n_tok = ids.len().saturating_sub(4).max(1);
             let ms_per_tok = dec_ms / n_tok as f64;
-            let (backend, disp_per_tok) = match &self.npu_decoder {
-                Some(dec) => {
-                    let d = dec.borrow().npu_dispatches();
-                    ("NPU", d as f64 / n_tok as f64)
-                }
-                None => ("ONNX", 0.0),
+            let (backend, disp_per_tok) = if self.npu_fused.is_some() {
+                ("FUSED", 1.0) // whole 12-layer decode = ONE dispatch/token by construction
+            } else if let Some(dec) = &self.npu_decoder {
+                ("NPU", dec.borrow().npu_dispatches() as f64 / n_tok as f64)
+            } else {
+                ("ONNX", 0.0)
             };
             eprintln!(
                 "[WHISPER_TIMING] backend={backend} e2e_ms={e2e_ms:.2} preproc_ms={prep_ms:.2} \

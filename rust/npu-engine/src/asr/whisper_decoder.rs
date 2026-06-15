@@ -22,7 +22,7 @@ use std::rc::Rc;
 
 use ndarray::prelude::*;
 use ndarray_npy::read_npy;
-use npu_asr::ctx_decode::{CtxDecode, DecodeEpi, DecodeWeight};
+use npu_asr::ctx_decode::{CtxDecode, DecodeEpi, DecodeWeight, FusedWeight, Norm};
 use npu_asr_host::gelu;
 use npu_xrt::Device;
 
@@ -175,6 +175,9 @@ struct LayerState {
 /// sliced into q,k,v on the host). All bias adds / GELU stay on the host after readback.
 struct NpuLayer {
     qkv: DecodeWeight,       // fused self q|k|v: [768, 2304], DecodeEpi::Bias (concat q/k/v biases)
+    /// Fused LN_self + self-QKV: `W'' = diag(γ)·[q|k|v]`, `bias' = β@W + concat(q/k/v bias)` —
+    /// ONE dispatch does LN_self→QKV when `NPU_DECODE_ATTN` is set (replaces host-LN + qkv gemv).
+    qkv_fused: FusedWeight,  // [768, 2304], LN folded
     self_out: DecodeWeight,  // [768, 768], DecodeEpi::Bias
     cross_q: DecodeWeight,   // [768, 768], DecodeEpi::Bias
     cross_out: DecodeWeight, // [768, 768], DecodeEpi::Bias
@@ -200,6 +203,10 @@ pub struct HostDecoder {
     w: Rc<WhisperDecoderWeights>,
     state: Vec<LayerState>,
     npu: Option<NpuCtx>,
+    /// When true (env `NPU_DECODE_ATTN` set, NPU active), the SELF-attention sublayer runs on-NPU:
+    /// fused LN_self+QKV (`fused_norm_gemv`) and on-chip attention (`CtxDecode::attn`) replace the
+    /// step-1 host-LN + qkv gemv + host `attend_one`. Cross-attn + FFN stay exactly as step-1 (M3).
+    npu_attn: bool,
 }
 
 /// `x[1,K] @ W[K,N] + b[N]` for a single row vector. Returns a length-N row.
@@ -271,7 +278,7 @@ fn attend_one(q: &[f32], k_flat: &[f32], v_flat: &[f32], s: usize) -> Vec<f32> {
 impl HostDecoder {
     pub fn new(w: Rc<WhisperDecoderWeights>) -> Self {
         let state = (0..N_LAYERS).map(|_| LayerState::default()).collect();
-        HostDecoder { w, state, npu: None }
+        HostDecoder { w, state, npu: None, npu_attn: false }
     }
 
     /// Total NPU GEMV dispatches issued so far (0 on the host-only path). Used by the timing harness.
@@ -308,8 +315,20 @@ impl HostDecoder {
                 qkv_b.extend_from_slice(lw.k_b.as_slice().unwrap());
                 qkv_b.extend_from_slice(lw.v_b.as_slice().unwrap());
 
+                // Fused LN_self + QKV: fold ln_self (γ,β) into the concat [768,2304] weight + bias.
+                let qkv_fused = decode.register_fused(
+                    &qkv_w,
+                    Norm::Ln {
+                        gamma: lw.ln_self_w.as_slice().unwrap().to_vec(),
+                        beta: lw.ln_self_b.as_slice().unwrap().to_vec(),
+                        eps: LN_EPS,
+                    },
+                    &qkv_b,
+                );
+
                 NpuLayer {
                     qkv: decode.register_weight(&qkv_w, DecodeEpi::Bias, &qkv_b),
+                    qkv_fused,
                     self_out: decode.register_weight(
                         &lw.out_w,
                         DecodeEpi::Bias,
@@ -339,7 +358,16 @@ impl HostDecoder {
             })
             .collect();
         let state = (0..N_LAYERS).map(|_| LayerState::default()).collect();
-        HostDecoder { w, state, npu: Some(NpuCtx { decode, layers }) }
+        // On-NPU self-attention is opt-in via NPU_DECODE_ATTN (only meaningful with the NPU active).
+        let npu_attn = std::env::var("NPU_DECODE_ATTN").is_ok();
+        if npu_attn {
+            // Preload the MHA xclbin so a missing artifact fails loudly at construction, not mid-decode.
+            decode
+                .ensure_attn_loaded()
+                .unwrap_or_else(|e| panic!("NPU_DECODE_ATTN set but MHA kernel unavailable: {e}"));
+            eprintln!("[whisper_decoder] NPU_DECODE_ATTN: on-chip SELF-attention enabled (cross+FFN stay host/step-1)");
+        }
+        HostDecoder { w, state, npu: Some(NpuCtx { decode, layers }), npu_attn }
     }
 
     /// Clear the self-KV caches for a new utterance. (Cross-KV must be re-set via `precompute_cross`.)
@@ -392,31 +420,59 @@ impl HostDecoder {
             let npu_layer = npu.map(|n| &n.layers[li]);
 
             // --- 1. self-attention (pre-norm, causal) ---
-            let ln = ln_row(&x, &lw.ln_self_w, &lw.ln_self_b);
-            // Self q/k/v: NPU runs ONE fused [768,2304] gemv (bias-fused), host slices into q/k/v;
-            // the host fallback does three [768,768] matmuls.
-            let (q, k, v) = match (npu, npu_layer) {
-                (Some(ctx), Some(nl)) => {
+            // Self q/k/v projection. THREE paths:
+            //  * NPU + NPU_DECODE_ATTN: the COLLAPSED self-attn sublayer (`self_attn_chained`) runs
+            //    LN+QKV → on-chip MHA → O as one host call, threading q/ctx buffer-to-buffer (no
+            //    caller-visible intermediate Vec hops). Byte-identical to the M1.a 3-call sequence.
+            //  * NPU only (step-1): host LN_self, then ONE fused [768,2304] qkv gemv (bias-fused).
+            //  * host: LN_self, then three [768,768] matmuls.
+            let attn = if let (Some(ctx), Some(nl)) = (npu, npu_layer) {
+                if self.npu_attn {
+                    let st = &mut self.state[li];
+                    let n_before = st.n_self;
+                    let out = ctx
+                        .decode
+                        .self_attn_chained(
+                            &nl.qkv_fused,
+                            &nl.self_out,
+                            &x,
+                            &mut st.self_k,
+                            &mut st.self_v,
+                            n_before,
+                        )
+                        .expect("npu collapsed self-attn (QKV→MHA→O)");
+                    st.n_self += 1;
+                    out
+                } else {
+                    // NPU step-1: host LN_self + fused qkv gemv, host attend_one, npu self-out gemv.
+                    let ln = ln_row(&x, &lw.ln_self_w, &lw.ln_self_b);
                     let qkv = ctx.decode.gemv(&nl.qkv, &ln).expect("npu self-qkv gemv");
-                    (qkv[0..D].to_vec(), qkv[D..2 * D].to_vec(), qkv[2 * D..3 * D].to_vec())
+                    let (q, k, v) = (
+                        &qkv[0..D],
+                        &qkv[D..2 * D],
+                        &qkv[2 * D..3 * D],
+                    );
+                    let st = &mut self.state[li];
+                    st.self_k.extend_from_slice(k);
+                    st.self_v.extend_from_slice(v);
+                    st.n_self += 1;
+                    let st = &self.state[li];
+                    let ctx_vec = attend_one(q, &st.self_k, &st.self_v, st.n_self);
+                    ctx.decode.gemv(&nl.self_out, &ctx_vec).expect("npu self-out gemv")
                 }
-                _ => (
-                    linear_row(&ln, &lw.q_w, &lw.q_b),
-                    linear_row(&ln, &lw.k_w, &lw.k_b),
-                    linear_row(&ln, &lw.v_w, &lw.v_b),
-                ),
-            };
-            {
+            } else {
+                // Pure host path.
+                let ln = ln_row(&x, &lw.ln_self_w, &lw.ln_self_b);
+                let q = linear_row(&ln, &lw.q_w, &lw.q_b);
+                let k = linear_row(&ln, &lw.k_w, &lw.k_b);
+                let v = linear_row(&ln, &lw.v_w, &lw.v_b);
                 let st = &mut self.state[li];
                 st.self_k.extend_from_slice(&k);
                 st.self_v.extend_from_slice(&v);
                 st.n_self += 1;
-            }
-            let st = &self.state[li];
-            let ctx_vec = attend_one(&q, &st.self_k, &st.self_v, st.n_self);
-            let attn = match (npu, npu_layer) {
-                (Some(ctx), Some(nl)) => ctx.decode.gemv(&nl.self_out, &ctx_vec).expect("npu self-out gemv"),
-                _ => linear_row(&ctx_vec, &lw.out_w, &lw.out_b),
+                let st = &self.state[li];
+                let ctx_vec = attend_one(&q, &st.self_k, &st.self_v, st.n_self);
+                linear_row(&ctx_vec, &lw.out_w, &lw.out_b)
             };
             for d in 0..D {
                 x[d] += attn[d];
@@ -465,6 +521,208 @@ impl HostDecoder {
         let ln = ln_row(&x, &w.ln_post_w, &w.ln_post_b);
         let mut logits = vec![0f32; VOCAB];
         let ws = w.proj_out_w.as_standard_layout(); // [768, vocab]
+        let wslice = ws.as_slice().unwrap();
+        for i in 0..D {
+            let xi = ln[i];
+            let row = &wslice[i * VOCAB..i * VOCAB + VOCAB];
+            for j in 0..VOCAB {
+                logits[j] += xi * row[j];
+            }
+        }
+        logits
+    }
+}
+
+// =============================================================================================
+// Fused whole-decode backend (NPU_DECODE_FUSED): the ENTIRE 12-layer decoder runs as ONE fused-ELF
+// dispatch per token (vs the per-op `CtxDecode` path's ~72 dispatches). Loads the prebuilt fused ELF
+// + resident weight arena from `artifacts/fused_decode12/` (gen_decode.py). Per utterance: compute
+// encoder cross-K/V into the resident scratch arena. Per token: embed→write x→patch KV/mask→reload
+// ELF→dispatch→read x12→host ln_post+proj_out logits (the lm-head stays host, like every other path).
+// Numerically validated: verify_fused_decode.py = 21/21 argmax vs f32 reference on the real encoder.
+// =============================================================================================
+use npu_xrt::{
+    pack_f32_to_bf16, unpack_bf16_to_f32, Arena, ElfKernel, FusedArena, FusedElfPatcher,
+};
+
+const T_PAD: usize = 1536; // encoder positions padded to a %64,%16 multiple (matches gen_decode.py)
+
+/// (arena, byte-offset, byte-len) of a named buffer in the fused arenas (from meta.json layout).
+struct BufLoc {
+    arena: Arena,
+    off: usize,
+    len: usize,
+}
+
+/// Whole-decode fused-ELF backend. Mirrors `HostDecoder`'s decode contract (`precompute_cross`,
+/// per-token logits) but collapses all 12 layers into one dispatch.
+pub struct FusedDecoder {
+    dev: Rc<Device>,
+    w: Rc<WhisperDecoderWeights>,
+    arena: FusedArena,
+    base_elf: Vec<u8>,
+    patcher: FusedElfPatcher,
+    layout: HashMap<String, BufLoc>,
+    output: String, // e.g. "x12"
+    t_enc: usize,
+    n_self: usize, // self-KV positions already written this utterance (== KV write slot for next token)
+}
+
+fn pack_bf16_bytes(f: &[f32]) -> Vec<u8> {
+    let mut bits = vec![0u16; f.len()];
+    pack_f32_to_bf16(f, &mut bits);
+    let mut out = vec![0u8; bits.len() * 2];
+    for (i, &b) in bits.iter().enumerate() {
+        out[2 * i..2 * i + 2].copy_from_slice(&b.to_le_bytes());
+    }
+    out
+}
+
+fn unpack_bf16_bytes(bytes: &[u8]) -> Vec<f32> {
+    let u16s: Vec<u16> = bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+    let mut out = vec![0f32; u16s.len()];
+    unpack_bf16_to_f32(&u16s, &mut out);
+    out
+}
+
+impl FusedDecoder {
+    /// Load the prebuilt fused decode ELF + resident weight arena. `fused_dir` =
+    /// `artifacts/fused_decode12` (decode.elf, meta.json, buffers/<name>.bin). Static weights are
+    /// written into the scratch arena once here; encoder cross-K/V + self-KV caches are populated
+    /// per utterance in `precompute_cross`.
+    pub fn new(w: Rc<WhisperDecoderWeights>, dev: &Rc<Device>, fused_dir: &Path) -> Self {
+        let base_elf = std::fs::read(fused_dir.join("decode.elf"))
+            .unwrap_or_else(|e| panic!("read decode.elf: {e} (run gen_decode.py --layers 12)"));
+        let meta: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(fused_dir.join("meta.json")).expect("read meta.json"))
+                .expect("parse meta.json");
+        let usz = |k: &str| meta[k].as_u64().expect(k) as usize;
+        let (in_sz, out_sz, scr_sz) = (usz("input_size"), usz("output_size"), usz("scratch_size"));
+        let output = meta["output"].as_str().expect("output").to_string();
+
+        let mut layout = HashMap::new();
+        for (name, e) in meta["layout"].as_object().expect("layout") {
+            let arena = match e["type"].as_str().unwrap() {
+                "input" => Arena::Input,
+                "output" => Arena::Output,
+                "scratch" => Arena::Scratch,
+                o => panic!("bad arena type {o}"),
+            };
+            layout.insert(
+                name.clone(),
+                BufLoc { arena, off: e["offset"].as_u64().unwrap() as usize, len: e["len"].as_u64().unwrap() as usize },
+            );
+        }
+
+        let arena = FusedArena::new(dev, in_sz, out_sz, scr_sz).expect("alloc fused arenas");
+
+        // Write static weight buffers (everything except the per-utterance encoder-K/V and self-KV
+        // caches, which we populate in precompute_cross).
+        for name in meta["weights"].as_array().expect("weights") {
+            let name = name.as_str().unwrap();
+            if name.ends_with("Kenc") || name.ends_with("Venc") || name.ends_with("kcache") || name.ends_with("vcache") {
+                continue;
+            }
+            let bytes = std::fs::read(fused_dir.join("buffers").join(format!("{name}.bin")))
+                .unwrap_or_else(|e| panic!("read buffer {name}.bin: {e}"));
+            let loc = &layout[name];
+            assert_eq!(bytes.len(), loc.len, "{name}: blob {} != layout {}", bytes.len(), loc.len);
+            arena.write_at(loc.arena, loc.off, &bytes).unwrap();
+        }
+
+        // KV cache offsets (bytes) for the patcher: every per-layer kcache/vcache.
+        let mut kv_offsets: Vec<u32> = Vec::new();
+        for (name, loc) in &layout {
+            if name.ends_with("kcache") || name.ends_with("vcache") {
+                kv_offsets.push(loc.off as u32);
+            }
+        }
+        let head_dim = meta["patch"]["head_dim"].as_u64().unwrap_or(HEAD_DIM as u64) as u32;
+        let patcher = FusedElfPatcher::build(&base_elf, &kv_offsets, head_dim);
+        let t_enc = meta["dims"]["T_enc"].as_u64().expect("dims.T_enc") as usize;
+
+        FusedDecoder { dev: Rc::clone(dev), w, arena, base_elf, patcher, layout, output, t_enc, n_self: 0 }
+    }
+
+    fn write_buf(&self, name: &str, f: &[f32]) {
+        let loc = &self.layout[name];
+        let bytes = pack_bf16_bytes(f);
+        assert_eq!(bytes.len(), loc.len, "{name}: {} != {}", bytes.len(), loc.len);
+        self.arena.write_at(loc.arena, loc.off, &bytes).unwrap();
+    }
+
+    fn zero_buf(&self, name: &str) {
+        let loc = &self.layout[name];
+        self.arena.write_at(loc.arena, loc.off, &vec![0u8; loc.len]).unwrap();
+    }
+
+    /// Encoder cross-K/V → per-layer resident scratch (head-major, padded T_enc→T_PAD); also clears
+    /// the self-KV caches and the position counter. Mirrors gen_decode.py's heads_pad layout exactly.
+    pub fn precompute_cross(&mut self, enc_hidden: &Array2<f32>) {
+        let t = enc_hidden.nrows();
+        assert_eq!(t, self.t_enc, "encoder T_enc {} != ELF T_enc {}", t, self.t_enc);
+        let w = Rc::clone(&self.w);
+        for (li, lw) in w.layers.iter().enumerate() {
+            let kenc = enc_hidden.dot(&lw.cross_k_w); // [T,768], cross_k_b is zeros
+            let mut venc = enc_hidden.dot(&lw.cross_v_w);
+            venc += &lw.cross_v_b.view().insert_axis(Axis(0));
+            for (name, src) in [(format!("L{li}_Kenc"), &kenc), (format!("L{li}_Venc"), &venc)] {
+                // head-major padded: out[h, t, d] = src[t, h*HEAD_DIM + d]; rows t>=T_enc are zero.
+                let mut padded = vec![0f32; N_HEADS * T_PAD * HEAD_DIM];
+                for tt in 0..t {
+                    let row = src.row(tt);
+                    for h in 0..N_HEADS {
+                        let dst = (h * T_PAD + tt) * HEAD_DIM;
+                        for d in 0..HEAD_DIM {
+                            padded[dst + d] = row[h * HEAD_DIM + d];
+                        }
+                    }
+                }
+                self.write_buf(&name, &padded);
+            }
+            self.zero_buf(&format!("L{li}_kcache"));
+            self.zero_buf(&format!("L{li}_vcache"));
+        }
+        self.arena.sync_to_device().unwrap();
+        self.n_self = 0;
+    }
+
+    /// Fresh self-KV for a new prompt (cross-K/V unchanged for this utterance).
+    pub fn reset(&mut self) {
+        for li in 0..N_LAYERS {
+            self.zero_buf(&format!("L{li}_kcache"));
+            self.zero_buf(&format!("L{li}_vcache"));
+        }
+        self.arena.sync_to_device().unwrap();
+        self.n_self = 0;
+    }
+
+    /// One decode step → vocab logits `[51865]`. Embeds token+pos, dispatches the whole 12-layer ELF
+    /// (KV write slot + softmax mask patched for this position), then host ln_post + proj_out.
+    pub fn step(&mut self, token: i64, pos: usize) -> Vec<f32> {
+        let tok = token as usize;
+        let x: Vec<f32> = (0..D)
+            .map(|d| self.w.embed_tokens[[tok, d]] + self.w.embed_positions[[pos, d]])
+            .collect();
+        self.write_buf("x", &x);
+
+        // patch the KV-write offset (slot n_self) + softmax mask length (n_self+1), then re-register.
+        let patched = self.patcher.patch(&self.base_elf, self.n_self as u32);
+        let kern: ElfKernel = self.dev.load_elf_kernel(&patched, Some("main:sequence")).expect("load fused ELF");
+        self.arena.sync_input().unwrap();
+        self.arena.dispatch(&kern).expect("fused decode dispatch");
+        self.arena.sync_from_device().unwrap();
+        self.n_self += 1;
+
+        let oloc = &self.layout[&self.output];
+        let mut out_bytes = vec![0u8; oloc.len];
+        self.arena.read_at(oloc.arena, oloc.off, &mut out_bytes).unwrap();
+        let x12 = unpack_bf16_bytes(&out_bytes);
+
+        // final LN + proj_out → logits (host f32, like every other backend).
+        let ln = ln_row(&x12[0..D], &self.w.ln_post_w, &self.w.ln_post_b);
+        let mut logits = vec![0f32; VOCAB];
+        let ws = self.w.proj_out_w.as_standard_layout();
         let wslice = ws.as_slice().unwrap();
         for i in 0..D {
             let xi = ln[i];

@@ -48,5 +48,10 @@ cp "$RB/m_stationary/Makefile.mstatln"         "$MM/whole_array/Makefile.mstatln
 cp "$RB/aie_kernels/ln_2pass.cc"     "$K/ln_2pass.cc"
 cp "$RB/ctx_ln/ctx_ln_iron.py"       "$PE/ml/layernorm/ctx_ln_iron.py"
 cp "$RB/ctx_ln/Makefile.ctxln"       "$PE/ml/layernorm/Makefile.ctxln"
+# mha_decode — on-chip single-query MHA for the Whisper decoder (M1 Task 0): kernel + design
+mkdir -p "$PE/ml/mha_decode"
+cp "$RB/mha_decode/mha_decode.cc"      "$K/mha_decode.cc"
+cp "$RB/mha_decode/mha_decode_iron.py" "$PE/ml/mha_decode/mha_decode_iron.py"
+cp "$RB/mha_decode/Makefile.mha"       "$PE/ml/mha_decode/Makefile.mha"
 
 echo "synced route_b_kernels/ -> mlir-aie build sandbox (edit route_b_kernels/, never mlir-aie/)"

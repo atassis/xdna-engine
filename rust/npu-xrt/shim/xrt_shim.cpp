@@ -10,11 +10,15 @@
 #include "xrt/xrt_kernel.h"
 #include "xrt/xrt_hw_context.h"
 #include "xrt/experimental/xrt_xclbin.h"
+#include "xrt/experimental/xrt_elf.h"
+#include "xrt/experimental/xrt_ext.h"
 
 struct ShimDevice { xrt::device dev; };
 struct ShimKernel { xrt::hw_context ctx; xrt::kernel kern; };
 struct ShimBo     { xrt::bo bo; };
 struct ShimRun    { xrt::run run; };
+// Full-ELF kernel: own the elf + hw_context so they outlive the ext::kernel that references them.
+struct ShimElfKernel { xrt::elf elf; xrt::hw_context ctx; xrt::ext::kernel kern; };
 
 static thread_local std::string g_err;
 static void set_err(const char* s) { g_err = s ? s : "null"; }
@@ -123,3 +127,33 @@ int shim_run_wait(ShimRun* r) {
 }
 
 void shim_run_free(ShimRun* r) { delete r; }
+
+// --- Fused full-ELF dispatch (IRON FusedMLIROperator path) ---------------------------------------
+
+ShimElfKernel* shim_elf_kernel_load(ShimDevice* d, const void* elf_bytes, size_t nbytes,
+                                    const char* kernel_name) {
+  GUARD_PTR(
+    // xrt::elf copies the bytes (data,size ctor), so the caller's buffer can be reused/patched.
+    xrt::elf elf(elf_bytes, nbytes);
+    xrt::hw_context ctx(d->dev, elf);
+    std::string name = (kernel_name && kernel_name[0]) ? std::string(kernel_name)
+                                                       : std::string("main:sequence");
+    xrt::ext::kernel k(ctx, name);
+    return new ShimElfKernel{ std::move(elf), std::move(ctx), std::move(k) };
+  )
+}
+
+void shim_elf_kernel_close(ShimElfKernel* k) { delete k; }
+
+int shim_run_elf(ShimElfKernel* k, ShimBo* const* bos, size_t n_bos) {
+  GUARD_INT(
+    xrt::run run(k->kern);
+    for (size_t i = 0; i < n_bos; ++i) {
+      run.set_arg(static_cast<int>(i), bos[i]->bo);
+    }
+    run.start();
+    ert_cmd_state st = run.wait();
+    if (st != ERT_CMD_STATE_COMPLETED) { set_err("elf run did not complete"); return -1; }
+    return 0;
+  )
+}

@@ -70,10 +70,20 @@ fn rel_l2(a: &[f32], b: &[f32]) -> f32 {
 
 fn main() {
     let host = std::env::args().any(|a| a == "--host");
-    let npu = std::env::args().any(|a| a == "--npu");
+    // --npu-attn = the NPU path with on-chip SELF-attention (fused LN+QKV + mha kernel) enabled.
+    let npu_attn = std::env::args().any(|a| a == "--npu-attn");
+    let npu = npu_attn || std::env::args().any(|a| a == "--npu");
     if !host && !npu {
-        eprintln!("note: pass --host (host-vs-onnx) or --npu (npu-vs-onnx) to select the parity check.");
+        eprintln!(
+            "note: pass --host (host-vs-onnx), --npu (npu-vs-onnx), or --npu-attn (npu + on-chip \
+             self-attention) to select the parity check."
+        );
         return;
+    }
+    // --npu-attn turns on the on-chip self-attention path the decoder gates on NPU_DECODE_ATTN.
+    if npu_attn {
+        // SAFETY: single-threaded harness, set before any decoder construction reads it.
+        unsafe { std::env::set_var("NPU_DECODE_ATTN", "1") };
     }
 
     let root = PathBuf::from(std::env::var("WHISPER_ROOT").unwrap_or_else(|_| "..".into()));
@@ -114,7 +124,13 @@ fn main() {
     };
     hostdec.precompute_cross(&enc);
 
-    let label = if npu { "npu" } else { "host" };
+    let label = if npu_attn {
+        "npu-attn"
+    } else if npu {
+        "npu"
+    } else {
+        "host"
+    };
 
     // Greedy decode N_STEPS on BOTH, starting from SOT, comparing per-step logits + argmax.
     // ONNX step 0 runs the no-past graph over the single SOT prompt; candidate runs step(SOT, pos=0).
