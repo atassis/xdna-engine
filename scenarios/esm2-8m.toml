@@ -1,0 +1,21 @@
+[scenario]
+kind = "embeddings"
+name = "esm2_t6_8M"
+
+[model]
+hidden = 320
+ff = 1280
+n_heads = 20
+head_dim = 16
+n_layers = 6
+max_seq = 512
+precision = "bf16"
+
+[artifacts]
+weights = "artifacts/esm2-8m/encoder"
+tokenizer = "artifacts/esm2-8m/golden.json"
+onnx_ref = "artifacts/esm2-8m/model.onnx"
+
+[embeddings]
+pooling = "mean"
+normalize = true

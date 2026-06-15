@@ -574,6 +574,135 @@ pub fn im2col(x: &Array2<f32>, k: usize, stride: usize, pad: usize) -> Array2<f3
     cols
 }
 
+/// im2col for a NON-OVERLAPPING 2D patch stem (stride == kernel, pad 0): the ViT/DeiT/DINOv2 patch
+/// embedding. Input `x` is `[Cin, H, W]`, patch `(ph, pw)` with `H%ph==0`, `W%pw==0`. Returns cols
+/// `[num_patches, Cin*ph*pw]` with:
+///   - column flatten order `col = ci*(ph*pw) + ki*pw + kj`  (matches ONNX weight [Cout,Cin,ph,pw]
+///     row-major reshape to [Cout, Cin*ph*pw] — the 2D generalization of the 1D `im2col`),
+///   - patch-row order `gh*(W/pw) + gw`  (matches ViT `Conv2d -> flatten(2) -> transpose`).
+/// So `cols @ weight.reshape(Cout,K).T (+bias)` == the patch embedding, exactly (fp32).
+pub fn im2col2d_patch(x: &Array3<f32>, ph: usize, pw: usize) -> Array2<f32> {
+    let (cin, h, w) = x.dim();
+    assert!(h % ph == 0 && w % pw == 0, "patch stem requires H%ph==0 && W%pw==0");
+    let (gh, gw) = (h / ph, w / pw);
+    let k = cin * ph * pw;
+    let mut cols = Array2::<f32>::zeros((gh * gw, k));
+    for ih in 0..gh {
+        for iw in 0..gw {
+            let p = ih * gw + iw;
+            for ci in 0..cin {
+                for ki in 0..ph {
+                    for kj in 0..pw {
+                        cols[[p, ci * (ph * pw) + ki * pw + kj]] = x[[ci, ih * ph + ki, iw * pw + kj]];
+                    }
+                }
+            }
+        }
+    }
+    cols
+}
+
+/// The resident ctxA grid: contraction tile KA and the served output widths.
+pub const PATCH_KA: usize = 768;
+pub const PATCH_STREAMS: [usize; 3] = [768, 1536, 3072];
+
+/// Result of aligning a (K_real, N_real) GEMM onto the resident ctxA grid by zero-padding.
+#[derive(Debug, Clone, Copy)]
+pub struct Grid {
+    pub k_pad: usize,
+    pub n_pad: usize,
+    pub waste: f32, // k_pad*n_pad / (k_real*n_real) - 1
+}
+
+/// Pad (K_real, N_real) up to the resident grid: K to the next multiple of PATCH_KA, N to the
+/// smallest served stream width >= N_real. Panics if N_real exceeds the widest served stream.
+pub fn pad_to_grid(k_real: usize, n_real: usize) -> Grid {
+    let k_pad = k_real.div_ceil(PATCH_KA) * PATCH_KA;
+    let n_pad = *PATCH_STREAMS
+        .iter()
+        .find(|&&w| w >= n_real)
+        .unwrap_or_else(|| panic!("N={n_real} exceeds widest served stream {}", PATCH_STREAMS[2]));
+    let waste = (k_pad as f32 * n_pad as f32) / (k_real as f32 * n_real as f32) - 1.0;
+    Grid { k_pad, n_pad, waste }
+}
+
+/// im2col for a GENERAL 2D conv (overlapping windows, stride, zero-pad). Input `x` [Cin,H,W],
+/// kernel (kh,kw), stride (sh,sw), pad (ph,pw). Returns cols [out_h*out_w, Cin*kh*kw] with
+/// column flatten `col = ci*(kh*kw) + ki*kw + kj` and row order `oh*out_w + ow` (matches ONNX
+/// weight [Cout,Cin,kh,kw] reshape and the Conv->flatten output order). out_dim = (in+2p-k)/s + 1.
+pub fn im2col2d(
+    x: &Array3<f32>,
+    kh: usize,
+    kw: usize,
+    sh: usize,
+    sw: usize,
+    ph: usize,
+    pw: usize,
+) -> Array2<f32> {
+    let (cin, h, w) = x.dim();
+    let out_h = (h + 2 * ph - kh) / sh + 1;
+    let out_w = (w + 2 * pw - kw) / sw + 1;
+    let k = cin * kh * kw;
+    let mut cols = Array2::<f32>::zeros((out_h * out_w, k));
+    for oh in 0..out_h {
+        for ow in 0..out_w {
+            let p = oh * out_w + ow;
+            for ci in 0..cin {
+                for ki in 0..kh {
+                    for kj in 0..kw {
+                        let ih = oh * sh + ki; // padded coords
+                        let iw = ow * sw + kj;
+                        if ih >= ph && iw >= pw && ih < ph + h && iw < pw + w {
+                            cols[[p, ci * (kh * kw) + ki * kw + kj]] = x[[ci, ih - ph, iw - pw]];
+                        } // else stays 0 (the zero pad)
+                    }
+                }
+            }
+        }
+    }
+    cols
+}
+
+/// Direct fp32 conv2d reference (independent of im2col), returns [out_h*out_w, Cout], row order
+/// oh*out_w+ow. For the lowering-identity test only.
+pub fn conv2d_ref(
+    x: &Array3<f32>,
+    wt: &Array4<f32>,
+    kh: usize,
+    kw: usize,
+    sh: usize,
+    sw: usize,
+    ph: usize,
+    pw: usize,
+) -> Array2<f32> {
+    let (cin, h, w) = x.dim();
+    let cout = wt.dim().0;
+    let out_h = (h + 2 * ph - kh) / sh + 1;
+    let out_w = (w + 2 * pw - kw) / sw + 1;
+    let mut out = Array2::<f32>::zeros((out_h * out_w, cout));
+    for oh in 0..out_h {
+        for ow in 0..out_w {
+            let p = oh * out_w + ow;
+            for co in 0..cout {
+                let mut s = 0f32;
+                for ci in 0..cin {
+                    for ki in 0..kh {
+                        for kj in 0..kw {
+                            let ih = oh * sh + ki;
+                            let iw = ow * sw + kj;
+                            if ih >= ph && iw >= pw && ih < ph + h && iw < pw + w {
+                                s += x[[ci, ih - ph, iw - pw]] * wt[[co, ci, ki, kj]];
+                            }
+                        }
+                    }
+                }
+                out[[p, co]] = s;
+            }
+        }
+    }
+    out
+}
+
 #[inline]
 pub fn relu_inplace(a: &mut Array2<f32>) {
     a.mapv_inplace(|v| if v > 0.0 { v } else { 0.0 });
@@ -598,6 +727,114 @@ pub fn subsample(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_im2col2d_patch_equals_conv2d() {
+        // Non-overlapping patch stem == im2col2d + matmul, checked vs a naive direct conv2d in fp32.
+        // Cin=2, H=W=4, patch 2x2 -> 4 patches, K=Cin*ph*pw=8, Cout(embed)=3.
+        let (cin, h, w, ph, pw, cout) = (2usize, 4usize, 4usize, 2usize, 2usize, 3usize);
+        let mut x = Array3::<f32>::zeros((cin, h, w));
+        for (i, v) in x.iter_mut().enumerate() {
+            *v = (i as f32 * 0.1) - 1.0;
+        }
+        let mut wt = Array4::<f32>::zeros((cout, cin, ph, pw)); // ONNX weight [Cout,Cin,kh,kw]
+        for (i, v) in wt.iter_mut().enumerate() {
+            *v = (i as f32 * 0.05) - 0.3;
+        }
+
+        // ours: cols[P,K] @ W2[K,Cout], W2[k,co] = wt.reshape(cout,K)[co,k]
+        let cols = im2col2d_patch(&x, ph, pw); // [P=4, K=8]
+        let k = cin * ph * pw;
+        let w2 = wt.to_shape((cout, k)).unwrap().to_owned(); // [cout, K]
+        let mut ours = Array2::<f32>::zeros((cols.nrows(), cout));
+        for p in 0..cols.nrows() {
+            for co in 0..cout {
+                let mut s = 0f32;
+                for kk in 0..k {
+                    s += cols[[p, kk]] * w2[[co, kk]];
+                }
+                ours[[p, co]] = s;
+            }
+        }
+
+        // reference: direct non-overlapping conv2d, patch index = gh*(W/pw)+gw
+        let (gh, gw) = (h / ph, w / pw);
+        let mut refr = Array2::<f32>::zeros((gh * gw, cout));
+        for ih in 0..gh {
+            for iw in 0..gw {
+                let p = ih * gw + iw;
+                for co in 0..cout {
+                    let mut s = 0f32;
+                    for ci in 0..cin {
+                        for ki in 0..ph {
+                            for kj in 0..pw {
+                                s += x[[ci, ih * ph + ki, iw * pw + kj]] * wt[[co, ci, ki, kj]];
+                            }
+                        }
+                    }
+                    refr[[p, co]] = s;
+                }
+            }
+        }
+        let maxd = ours
+            .iter()
+            .zip(refr.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(maxd < 1e-5, "im2col2d_patch lowering mismatch: maxd={maxd}");
+    }
+
+    #[test]
+    fn test_pad_to_grid() {
+        // DINOv2: K_real=588 -> 768; N_real=768 served as-is.
+        let g = pad_to_grid(588, 768);
+        assert_eq!((g.k_pad, g.n_pad), (768, 768));
+        // ViT-L/16: K_real=768 as-is; N_real=1024 -> 1536.
+        let g = pad_to_grid(768, 1024);
+        assert_eq!((g.k_pad, g.n_pad), (768, 1536));
+        // waste = k_pad*n_pad/(k_real*n_real) - 1
+        let expect_waste = (768.0 * 1536.0) / (768.0 * 1024.0) - 1.0;
+        assert!((g.waste - expect_waste).abs() < 1e-6, "waste={}", g.waste);
+        // ViT-B/16: perfectly clean.
+        let g = pad_to_grid(768, 768);
+        assert_eq!((g.k_pad, g.n_pad), (768, 768));
+        assert!(g.waste.abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_im2col2d_equals_conv2d_strided() {
+        // overlapping 3x3 stride 2 pad 1, Cin=2 H=W=5 -> out 3x3, K=Cin*9=18, Cout=4
+        let (cin, h, w, kh, kw, sh, sw, ph, pw, cout) = (2, 5, 5, 3, 3, 2, 2, 1, 1, 4);
+        let mut x = Array3::<f32>::zeros((cin, h, w));
+        for (i, v) in x.iter_mut().enumerate() {
+            *v = (i as f32 * 0.07) - 1.0;
+        }
+        let mut wt = Array4::<f32>::zeros((cout, cin, kh, kw)); // [Cout,Cin,kh,kw]
+        for (i, v) in wt.iter_mut().enumerate() {
+            *v = (i as f32 * 0.03) - 0.4;
+        }
+
+        let cols = im2col2d(&x, kh, kw, sh, sw, ph, pw); // [out_h*out_w, Cin*kh*kw]
+        let k = cin * kh * kw;
+        let w2 = wt.to_shape((cout, k)).unwrap().to_owned();
+        let mut ours = Array2::<f32>::zeros((cols.nrows(), cout));
+        for p in 0..cols.nrows() {
+            for co in 0..cout {
+                let mut s = 0f32;
+                for kk in 0..k {
+                    s += cols[[p, kk]] * w2[[co, kk]];
+                }
+                ours[[p, co]] = s;
+            }
+        }
+        let refr = conv2d_ref(&x, &wt, kh, kw, sh, sw, ph, pw); // [out_h*out_w, Cout]
+        let maxd = ours
+            .iter()
+            .zip(refr.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(maxd < 1e-5, "im2col2d/conv2d mismatch maxd={maxd}");
+    }
 
     fn maxdiff(a: &Array2<f32>, expected: &[f32]) -> f32 {
         a.iter()

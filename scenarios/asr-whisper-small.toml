@@ -1,0 +1,16 @@
+[scenario]
+kind = "asr"
+name = "whisper-small"
+
+[model]
+hidden = 768
+ff = 3072
+n_heads = 12
+head_dim = 64
+n_layers = 12
+max_seq = 1500
+precision = "bf16"
+kernel = "zeropad"
+
+[artifacts]
+weights = "artifacts/whisper-small"

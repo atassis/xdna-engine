@@ -399,8 +399,11 @@ dependencies = [
  "ndarray",
  "ndarray-npy",
  "npu-asr-host",
+ "npu-onnx",
  "npu-xrt",
  "rayon",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -431,9 +434,11 @@ dependencies = [
  "npu-asr-host",
  "npu-onnx",
  "npu-parakeet",
+ "npu-whisper",
  "npu-xrt",
  "rayon",
  "serde",
+ "serde_json",
  "tokenizers",
  "toml",
 ]
@@ -454,6 +459,17 @@ dependencies = [
  "npu-onnx",
  "npu-xrt",
  "rayon",
+]
+
+[[package]]
+name = "npu-whisper"
+version = "0.1.0"
+dependencies = [
+ "ndarray",
+ "ndarray-npy",
+ "npu-asr",
+ "npu-asr-host",
+ "npu-xrt",
 ]
 
 [[package]]

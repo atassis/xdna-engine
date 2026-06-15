@@ -29,8 +29,16 @@ pub trait Head {
     fn run(&self, encoded: &Array2<f32>, valid_len: usize) -> Self::Output;
 }
 
+/// A text/sequence embedder: input string -> embedding vector. Implemented by both the BERT
+/// (`bert::EmbedPipeline`) and ESM-2 (`esm::EsmEmbedPipeline`) pipelines so the registry can host
+/// either behind one `Scenario::Embed` arm. Distinct method name (`embed_one`) delegates to each
+/// pipeline's inherent `embed` (no recursion, inherent methods preserved for the verify bins).
+pub trait Embedder {
+    fn embed_one(&self, text: String) -> Vec<f32>;
+}
+
 /// One assembled, ready-to-serve pipeline. The registry returns this; `engine_serve` matches on it.
 pub enum Scenario {
     Asr(Box<dyn AsrModel>),
-    Embed(crate::bert::EmbedPipeline),
+    Embed(Box<dyn Embedder>),
 }

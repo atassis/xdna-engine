@@ -16,11 +16,18 @@ pub fn build(cfg_path: &Path, root: &Path) -> Scenario {
     match cfg.scenario.kind.as_str() {
         "embeddings" => {
             let dev = Rc::new(Device::open(0).expect("open NPU (stop other ASR/embeddings service first)"));
-            Scenario::Embed(crate::bert::EmbedPipeline::build(&cfg, root, dev))
+            if cfg.scenario.name.to_lowercase().starts_with("esm") {
+                Scenario::Embed(Box::new(crate::esm::EsmEmbedPipeline::build(&cfg, root, dev)))
+            } else {
+                Scenario::Embed(Box::new(crate::bert::EmbedPipeline::build(&cfg, root, dev)))
+            }
         }
         "asr" => {
             if cfg.scenario.name.to_lowercase().contains("parakeet") {
                 Scenario::Asr(Box::new(crate::asr::parakeet::ParakeetAsr::build(&cfg, root)))
+            } else if cfg.scenario.name.to_lowercase().contains("whisper") {
+                // Whisper opens its own NPU device inside new_npu (like parakeet); don't open here.
+                Scenario::Asr(Box::new(crate::asr::whisper::WhisperAsr::build(&cfg, root)))
             } else {
                 let dev = Rc::new(Device::open(0).expect("open NPU (stop other ASR service first)"));
                 Scenario::Asr(Box::new(crate::asr::AsrPipeline::build(&cfg, root, dev)))

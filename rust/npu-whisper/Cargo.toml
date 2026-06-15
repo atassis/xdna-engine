@@ -1,0 +1,30 @@
+[package]
+name = "npu-whisper"
+version = "0.1.0"
+edition = "2021"
+description = "Whisper-small encoder — host CPU f32 reference (conv stem + 12 pre-norm transformer blocks + post-LN)"
+
+[lib]
+name = "npu_whisper"
+path = "src/lib.rs"
+
+[features]
+# `npu`: route the encoder's per-token linear projections through the XDNA2 NPU via the shared
+# ctx2 K=768 kernel (attention/LN/GELU stay on host). Off by default so the host f32 reference
+# builds without XRT (CI / other branches).
+npu = ["dep:npu-xrt", "dep:npu-asr"]
+
+[dependencies]
+ndarray = "0.16"
+ndarray-npy = { version = "0.9", default-features = false }
+npu-asr-host = { path = "../npu-asr-host" }
+npu-xrt = { path = "../npu-xrt", optional = true }
+npu-asr = { path = "../npu-asr", features = ["two_ctx"], optional = true }
+
+[[bin]]
+name = "verify_whisper"
+path = "src/bin/verify_whisper.rs"
+
+[[bin]]
+name = "whisper_encode_npu"
+path = "src/bin/whisper_encode_npu.rs"

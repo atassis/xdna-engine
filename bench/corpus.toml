@@ -1,0 +1,6 @@
+# Short WER/latency corpus: 17 FLEURS clips (4 EN + 13 RU) with ground-truth refs.
+# Ground truth lives in <dir>/refs.json (filename -> lowercased reference transcript).
+[corpus]
+name = "wer_clips"
+dir = "artifacts/wer_clips"
+refs = "artifacts/wer_clips/refs.json"

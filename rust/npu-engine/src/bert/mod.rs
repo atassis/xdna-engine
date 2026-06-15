@@ -41,3 +41,9 @@ impl EmbedPipeline {
         self.head.run(&enc, valid)
     }
 }
+
+impl crate::pipeline::Embedder for EmbedPipeline {
+    fn embed_one(&self, text: String) -> Vec<f32> {
+        self.embed(text)
+    }
+}

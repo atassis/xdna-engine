@@ -1,6 +1,7 @@
 //! ASR pipeline: GigaAM-v3 encoder (wrapped behind Encoder) + ONNX mel preproc/RNNT decode.
 
 pub mod parakeet;
+pub mod whisper;
 
 use std::collections::HashMap;
 use std::path::Path;

@@ -1,0 +1,22 @@
+[scenario]
+kind = "embeddings"
+name = "esm2_t12_35M"
+
+[model]
+hidden = 480
+ff = 1920
+n_heads = 20
+head_dim = 24
+n_layers = 12
+max_seq = 512
+precision = "bf16"
+kernel = "zeropad"
+
+[artifacts]
+weights = "artifacts/esm2-35m/encoder"
+tokenizer = "artifacts/esm2-35m/golden.json"
+onnx_ref = "artifacts/esm2-35m/model.onnx"
+
+[embeddings]
+pooling = "mean"
+normalize = true

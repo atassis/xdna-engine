@@ -27,8 +27,11 @@ pub struct ModelCfg {
     pub max_seq: usize,
     #[serde(default = "default_precision")]
     pub precision: String, // native | bf16 | int8
+    #[serde(default = "default_kernel")]
+    pub kernel: String, // zeropad | native (ESM matmul-shape strategy)
 }
 fn default_precision() -> String { "bf16".into() }
+fn default_kernel() -> String { "zeropad".into() }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct Artifacts {

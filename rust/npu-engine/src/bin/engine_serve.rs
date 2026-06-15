@@ -70,7 +70,7 @@ fn handle(mut stream: TcpStream, scen: &Scenario) -> std::io::Result<()> {
             let inputs = parse_inputs(&body);
             let mut data = String::new();
             for (i, text) in inputs.iter().enumerate() {
-                let v = pipe.embed(text.clone());
+                let v = pipe.embed_one(text.clone());
                 let arr = v.iter().map(|x| format!("{x}")).collect::<Vec<_>>().join(",");
                 if i > 0 { data.push(','); }
                 data.push_str(&format!("{{\"object\":\"embedding\",\"index\":{i},\"embedding\":[{arr}]}}"));
