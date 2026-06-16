@@ -250,7 +250,8 @@ impl WhisperAsr {
             );
             if fused_on {
                 let fdir = xroot.join("artifacts/fused_decode12");
-                let fd = FusedDecoder::new(weights, &dev, &fdir);
+                // Share the encoder's resident ctx2 kernel so the cross-K/V fold runs on the NPU.
+                let fd = FusedDecoder::new(weights, &dev, &fdir, enc.shared());
                 eprintln!("[whisper] NPU_DECODE_FUSED=1: whole 12-layer decode in ONE fused-ELF dispatch/token");
                 (None, Some(RefCell::new(fd)))
             } else {
@@ -344,6 +345,8 @@ impl WhisperAsr {
             }
             ids.push(next);
         }
+        // P0: per-phase breakdown for this utterance (no-op unless FUSED_PHASE_TIMING set).
+        dec.dump_phase_timing();
         ids
     }
 

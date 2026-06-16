@@ -62,6 +62,49 @@ void           shim_elf_kernel_close(ShimElfKernel*);
  * generic-N to match IRON's variadic set_arg loop. 0 on success. */
 int shim_run_elf(ShimElfKernel*, ShimBo* const* bos, size_t n_bos);
 
+/* ASYNC split of shim_run_elf (the PIPE lever): _start submits the ELF run (set_arg + run.start())
+ * and returns a run handle WITHOUT waiting, so the host can register the NEXT token's position-only
+ * patched ELF while this dispatch executes on the NPU. Wait via shim_run_wait, free via shim_run_free
+ * (the same ShimRun handle the matmul async path uses). The ShimElfKernel and all BOs must outlive the
+ * returned ShimRun. Returns NULL on failure (message in shim_last_error). */
+ShimRun* shim_run_elf_start(ShimElfKernel*, ShimBo* const* bos, size_t n_bos);
+
+/* --- Persistent-hw_context full-ELF path (kills per-token re-registration) -----------------------
+ * The standard shim_elf_kernel_load above rebuilds the WHOLE hw_context per patched ELF — on aie2p
+ * that re-runs the NPU partition config (~20 ms/token, measured). This split builds the hw_context
+ * ONCE from a base ELF (shim_elf_ctx_open), then per token rebuilds only a lightweight xrt::module
+ * (patched bytes) + xrt::ext::kernel bound to the SAME context (shim_elf_kernel_rebind). The ctrlcode
+ * rides the ERT run packet, so a same-shape patched module reuses the resident partition. If the
+ * 20 ms is partition config (not ctrlcode upload) this removes most of it. The context must outlive
+ * every kernel rebound onto it. ShimElfKernel2 borrows the ctx; close it before the ctx. */
+typedef struct ShimElfCtx     ShimElfCtx;
+typedef struct ShimElfKernel2 ShimElfKernel2;
+ShimElfCtx*     shim_elf_ctx_open(ShimDevice*, const void* base_elf, size_t nbytes);
+void            shim_elf_ctx_close(ShimElfCtx*);
+ShimElfKernel2* shim_elf_kernel_rebind(ShimElfCtx*, const void* elf_bytes, size_t nbytes,
+                                       const char* kernel_name);
+void            shim_elf_kernel2_close(ShimElfKernel2*);
+int             shim_run_elf2(ShimElfKernel2*, ShimBo* const* bos, size_t n_bos);
+
+/* --- Resident full-ELF runner with ctrl-scratchpad parameters (Option C: kills re-registration) ---
+ * Registers a CONSTANT full ELF ONCE (elf -> hw_context -> ext::kernel -> run), binds the arena BOs
+ * once, and fetches the ELF's ctrl scratchpad BO (xrt::run::get_ctrl_scratchpad_bo, valid only if the
+ * ELF was built with aiex.scratchpad_parameter). Per dispatch the host writes the per-token parameter
+ * word(s) (e.g. KV-write offset, softmax mask length) into the mapped scratchpad and dispatches — no
+ * ELF patch, no re-registration. `shim_elf_resident_open` returns NULL if the ELF has no scratchpad
+ * (so the caller can fall back). scratchpad_size()==0 likewise signals no scratchpad. */
+typedef struct ShimElfResident ShimElfResident;
+ShimElfResident* shim_elf_resident_open(ShimDevice*, const void* elf_bytes, size_t nbytes,
+                                        const char* kernel_name);
+void             shim_elf_resident_close(ShimElfResident*);
+size_t           shim_elf_resident_scratchpad_size(ShimElfResident*);
+/* Bind the N arena BOs to run args 0..N once (same handles reused every dispatch). 0 on success. */
+int              shim_elf_resident_bind(ShimElfResident*, ShimBo* const* bos, size_t n_bos);
+/* Write `len` bytes at byte `offset` into the host-mapped ctrl scratchpad (no device sync yet). */
+int              shim_elf_resident_write(ShimElfResident*, size_t offset, const void* data, size_t len);
+/* Sync the scratchpad to device, start the bound run, wait for completion. 0 on success. */
+int              shim_elf_resident_dispatch(ShimElfResident*);
+
 const char* shim_last_error(void);
 
 #ifdef __cplusplus

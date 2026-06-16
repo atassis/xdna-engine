@@ -99,6 +99,14 @@ impl WhisperEncoder {
         self.npu.as_ref().map(|n| n.device())
     }
 
+    /// The resident ctx2 shared kernel this encoder loaded (when built via `new_npu`), so a
+    /// co-resident decoder can register its OWN K=768 GEMM ops on it (e.g. the per-utterance
+    /// cross-K/V fold) and run them on the NPU instead of the host.
+    #[cfg(feature = "npu")]
+    pub fn shared(&self) -> Option<std::rc::Rc<npu_asr::ctx2::SharedCtxA>> {
+        self.npu.as_ref().map(|n| n.shared.clone())
+    }
+
     /// Linear with weights stored [K_in, N_out]: `x[M,K]·W[K,N] + b[N]` (bias broadcast over rows).
     fn linear(&self, x: &Array2<f32>, w: &Array2<f32>, b: &Array1<f32>, _id: &str) -> Array2<f32> {
         // host path: id unused (the NPU path in A9 will use it to key the weight-BO cache)

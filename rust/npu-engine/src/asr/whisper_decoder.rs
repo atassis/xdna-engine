@@ -22,7 +22,9 @@ use std::rc::Rc;
 
 use ndarray::prelude::*;
 use ndarray_npy::read_npy;
+use npu_asr::ctx2::{CtxAOp, Epi, SharedCtxA};
 use npu_asr::ctx_decode::{CtxDecode, DecodeEpi, DecodeWeight, FusedWeight, Norm};
+use npu_asr::engines::PAD_M;
 use npu_asr_host::gelu;
 use npu_xrt::Device;
 
@@ -542,8 +544,29 @@ impl HostDecoder {
 // Numerically validated: verify_fused_decode.py = 21/21 argmax vs f32 reference on the real encoder.
 // =============================================================================================
 use npu_xrt::{
-    pack_f32_to_bf16, unpack_bf16_to_f32, Arena, ElfKernel, FusedArena, FusedElfPatcher,
+    pack_f32_to_bf16, unpack_bf16_to_f32, Arena, ElfCtx, ElfKernel, ElfKernel2, ElfResident,
+    FusedArena, FusedElfPatcher, Run,
 };
+
+/// Deep-C resident-scratchpad state: the decode ELF is CONSTANT (registered ONCE via
+/// [`ElfResident`]); per token the host writes two scratchpad words — `kv_off` (addr-kind, raw,
+/// element-units = `n_self*head_dim`) and `sm_mask` (core-kind, written `<<2` per the firmware
+/// UPDATE_REG requirement, value = `n_self+1`) — then dispatches. Replaces the per-token
+/// `patch_elf` + `load_elf` re-registration entirely (energy + latency win).
+struct ResidentState {
+    res: ElfResident,
+    kv_off_byte: usize,
+    sm_off_byte: usize,
+    sm_core: bool,
+    head_dim: u32,
+}
+
+/// Per-token dispatch handle: either a freshly-registered ELF (own hw_context, the original
+/// ~20 ms/token path) or one rebound onto a persistent [`ElfCtx`] (partition config hoisted out).
+enum FusedKern {
+    Fresh(ElfKernel),
+    Reuse(ElfKernel2),
+}
 
 const T_PAD: usize = 1536; // encoder positions padded to a %64,%16 multiple (matches gen_decode.py)
 
@@ -552,6 +575,46 @@ struct BufLoc {
     arena: Arena,
     off: usize,
     len: usize,
+}
+
+/// P0 per-phase timing accumulator (env `FUSED_PHASE_TIMING`). All values are nanoseconds, summed
+/// across every `step` of one utterance (reset in `precompute_cross`). `cross_fold` is the single
+/// per-utterance encoder cross-K/V compute+write; the rest are per-token (one dispatch each).
+#[derive(Default)]
+struct PhaseAcc {
+    embed: u128,       // token+pos embedding lookup → host x[768]
+    write_x: u128,     // pack x to bf16 + write into the input arena
+    patch: u128,       // FusedElfPatcher::patch (27 MB to_vec + KV-offset/mask scan)
+    load_elf: u128,    // load_elf_kernel — per-token ELF re-registration with XRT
+    prefetch: u128,    // host patch+load_elf of the NEXT position, OVERLAPPED under `dispatch` (the
+                       //   default PIPE path; informational, NOT in step_sum — it hides under the run)
+    sync_in: u128,     // arena.sync_input (host→device DMA of the input arena)
+    dispatch: u128,    // arena.dispatch — the actual 12-layer NPU run (incl. the overlapped prefetch)
+    sync_out: u128,    // arena.sync_from_device (device→host DMA of the output arena)
+    read_unpack: u128, // read_at + unpack bf16 output → x12[768]
+    lm_head: u128,     // host ln_post + proj_out (768×51865 naive loop) → logits
+    steps: u64,        // number of dispatches (== tokens incl. lang-detect + prompt)
+    cross_fold: u128,  // per-utterance encoder cross-K/V fold (host matmuls + arena writes + sync)
+    utterances: u64,
+}
+
+/// A running lap timer: `lap(&mut acc)` adds the time since the previous lap (or `start`) to `acc`
+/// and re-marks. A no-op when constructed `off` (timing disabled) — zero Instant calls on the hot
+/// path, so the breakdown can ship in-tree without perturbing the un-instrumented latency.
+struct Lap {
+    mark: Option<std::time::Instant>,
+}
+impl Lap {
+    fn start(on: bool) -> Self {
+        Lap { mark: on.then(std::time::Instant::now) }
+    }
+    fn lap(&mut self, acc: &mut u128) {
+        if let Some(m) = self.mark {
+            let now = std::time::Instant::now();
+            *acc += now.duration_since(m).as_nanos();
+            self.mark = Some(now);
+        }
+    }
 }
 
 /// Whole-decode fused-ELF backend. Mirrors `HostDecoder`'s decode contract (`precompute_cross`,
@@ -566,6 +629,30 @@ pub struct FusedDecoder {
     output: String, // e.g. "x12"
     t_enc: usize,
     n_self: usize, // self-KV positions already written this utterance (== KV write slot for next token)
+    timing: bool,  // env FUSED_PHASE_TIMING: accumulate + dump the per-phase breakdown
+    ph: PhaseAcc,
+    /// env `NPU_DECODE_FUSED_REUSECTX`: P1.1 spike — persistent hw_context built once from the base
+    /// ELF, per-token patched ELFs rebound onto it. **BLOCKED on this XRT**: `ext::kernel(ctx, module,
+    /// name)` rejects an ELF-built hw_context ("not created using XCLBIN") — an ELF context binds only
+    /// its own module. The plumbing is kept (works for an xclbin-backed ctx); the flag panics if set.
+    /// See `log/2026-06/fused-decode-reusectx-wall.md`. The viable levers are runtime-offset kernel
+    /// regen or async-prefetch of the position-only registration.
+    reuse_ctx: Option<ElfCtx>,
+    /// Lever #2 (energy + latency): per-layer (cross_k, cross_v) GEMM ops on the NPU's resident ctx2
+    /// kernel. When present, `precompute_cross` computes the encoder cross-K/V fold (12×2 [1500,768]@
+    /// [768,768] GEMMs, ~370 ms host) on the NPU instead of the CPU. `None` = host f32 fold (fallback).
+    cross_ops: Option<Vec<(CtxAOp, CtxAOp)>>,
+    /// PIPE 1-deep lookahead slot (the DEFAULT fused decode path): `(n_self_it_was_built_for, kernel)`.
+    /// The patched ELF for the next token depends ONLY on `n_self` (KV-write offset + softmax mask), not
+    /// the argmax'd token, so it is registered on the host during the PREVIOUS token's dispatch (see
+    /// `dispatch_pipe`), hiding the ~14 ms `load_elf` off the critical path. Consumed by the next `step`
+    /// iff its `n_self` matches; invalidated (`None`) by `reset`/`precompute_cross` where `n_self`
+    /// rewinds and a stale prefetch would mispatch. Unused on the `reuse_ctx` (REUSECTX) diagnostic path.
+    next_kern: Option<(usize, ElfKernel)>,
+    /// Deep-C (DEFAULT when the decode ELF carries scratchpad params): register the constant ELF once
+    /// and drive per-token KV-offset + softmax-mask via the ctrl scratchpad. When `Some`, the
+    /// patch/PIPE/REUSECTX paths are bypassed. Force the legacy patch path with NPU_DECODE_FUSED_PATCH.
+    resident: Option<ResidentState>,
 }
 
 fn pack_bf16_bytes(f: &[f32]) -> Vec<u8> {
@@ -590,7 +677,12 @@ impl FusedDecoder {
     /// `artifacts/fused_decode12` (decode.elf, meta.json, buffers/<name>.bin). Static weights are
     /// written into the scratch arena once here; encoder cross-K/V + self-KV caches are populated
     /// per utterance in `precompute_cross`.
-    pub fn new(w: Rc<WhisperDecoderWeights>, dev: &Rc<Device>, fused_dir: &Path) -> Self {
+    pub fn new(
+        w: Rc<WhisperDecoderWeights>,
+        dev: &Rc<Device>,
+        fused_dir: &Path,
+        shared: Option<Rc<SharedCtxA>>,
+    ) -> Self {
         let base_elf = std::fs::read(fused_dir.join("decode.elf"))
             .unwrap_or_else(|e| panic!("read decode.elf: {e} (run gen_decode.py --layers 12)"));
         let meta: serde_json::Value =
@@ -641,7 +733,88 @@ impl FusedDecoder {
         let patcher = FusedElfPatcher::build(&base_elf, &kv_offsets, head_dim);
         let t_enc = meta["dims"]["T_enc"].as_u64().expect("dims.T_enc") as usize;
 
-        FusedDecoder { dev: Rc::clone(dev), w, arena, base_elf, patcher, layout, output, t_enc, n_self: 0 }
+        // Deep-C: if the ELF carries scratchpad params (gen_decode emits the `scratchpad` meta block),
+        // register it ONCE as a resident kernel and bind the arena BOs once. Per token we then only
+        // write 2 scratchpad words + dispatch — no per-token ELF patch/reload. Opt out (legacy patch
+        // path) with NPU_DECODE_FUSED_PATCH=1 for A/B comparison.
+        let resident = if meta.get("scratchpad").is_some()
+            && std::env::var("NPU_DECODE_FUSED_PATCH").is_err()
+        {
+            let sp = &meta["scratchpad"];
+            let kv_name = sp["kv_param"].as_str().expect("scratchpad.kv_param");
+            let sm_name = sp["mask_param"].as_str().expect("scratchpad.mask_param");
+            let pget = |n: &str, f: &str| sp["params"][n][f].clone();
+            let kv_off_byte = pget(kv_name, "byte_offset").as_u64().expect("kv byte_offset") as usize;
+            let sm_off_byte = pget(sm_name, "byte_offset").as_u64().expect("sm byte_offset") as usize;
+            let sm_core = pget(sm_name, "kind").as_str() == Some("core");
+            let sp_head_dim = sp["head_dim"].as_u64().unwrap_or(HEAD_DIM as u64) as u32;
+            let res = dev
+                .open_elf_resident(&base_elf, Some("main:sequence"))
+                .expect("open_elf_resident: decode ELF lacks a ctrl scratchpad (rebuild gen_decode.py)");
+            arena.bind_resident(&res).expect("bind resident arena BOs");
+            eprintln!(
+                "[whisper_decoder] DEEP-C resident scratchpad decode: register-once + per-token \
+                 kv_off(byte {kv_off_byte})/sm_mask(byte {sm_off_byte}, core={sm_core}) — no patch/reload"
+            );
+            Some(ResidentState { res, kv_off_byte, sm_off_byte, sm_core, head_dim: sp_head_dim })
+        } else {
+            None
+        };
+
+        let timing = std::env::var("FUSED_PHASE_TIMING").is_ok();
+        if timing {
+            eprintln!("[whisper_decoder] FUSED_PHASE_TIMING: per-phase decode breakdown enabled");
+        }
+        let reuse_ctx = if std::env::var("NPU_DECODE_FUSED_REUSECTX").is_ok() {
+            let c = dev.open_elf_ctx(&base_elf).expect("open persistent fused-ELF hw_context");
+            eprintln!("[whisper_decoder] NPU_DECODE_FUSED_REUSECTX: persistent hw_context — per-token rebind, no re-registration");
+            Some(c)
+        } else {
+            None
+        };
+        // Lever #2: register per-layer cross-K/V GEMM ops on the shared ctx2 kernel (NPU fold). Opt
+        // out with NPU_DECODE_FUSED_HOSTCROSS=1 (keeps the host f32 fold for A/B + WER comparison).
+        let host_cross = std::env::var("NPU_DECODE_FUSED_HOSTCROSS").is_ok();
+        let cross_ops = match (shared, host_cross) {
+            (Some(sh), false) => {
+                let ops: Vec<(CtxAOp, CtxAOp)> = w
+                    .layers
+                    .iter()
+                    .map(|lw| {
+                        // cross_k bias is zeros (Epi::None); cross_v has a bias (applied NPU-side).
+                        let ck = CtxAOp::new(sh.clone(), &lw.cross_k_w, D, Epi::None, &[]);
+                        let cv = CtxAOp::new(
+                            sh.clone(),
+                            &lw.cross_v_w,
+                            D,
+                            Epi::Bias,
+                            lw.cross_v_b.as_slice().unwrap(),
+                        );
+                        (ck, cv)
+                    })
+                    .collect();
+                eprintln!("[whisper_decoder] cross-K/V fold on NPU (ctx2 GEMM, lever #2)");
+                Some(ops)
+            }
+            _ => None,
+        };
+        FusedDecoder {
+            dev: Rc::clone(dev),
+            w,
+            arena,
+            base_elf,
+            patcher,
+            layout,
+            output,
+            t_enc,
+            n_self: 0,
+            timing,
+            ph: PhaseAcc::default(),
+            reuse_ctx,
+            cross_ops,
+            next_kern: None,
+            resident,
+        }
     }
 
     fn write_buf(&self, name: &str, f: &[f32]) {
@@ -659,13 +832,29 @@ impl FusedDecoder {
     /// Encoder cross-K/V → per-layer resident scratch (head-major, padded T_enc→T_PAD); also clears
     /// the self-KV caches and the position counter. Mirrors gen_decode.py's heads_pad layout exactly.
     pub fn precompute_cross(&mut self, enc_hidden: &Array2<f32>) {
+        // New utterance: start a fresh per-phase breakdown (so each dumped line is one utterance).
+        if self.timing {
+            self.ph = PhaseAcc::default();
+        }
+        let mut tmr = Lap::start(self.timing);
         let t = enc_hidden.nrows();
         assert_eq!(t, self.t_enc, "encoder T_enc {} != ELF T_enc {}", t, self.t_enc);
         let w = Rc::clone(&self.w);
         for (li, lw) in w.layers.iter().enumerate() {
-            let kenc = enc_hidden.dot(&lw.cross_k_w); // [T,768], cross_k_b is zeros
-            let mut venc = enc_hidden.dot(&lw.cross_v_w);
-            venc += &lw.cross_v_b.view().insert_axis(Axis(0));
+            // cross-K/V fold: NPU ctx2 GEMM when registered (lever #2), else host f32.
+            let (kenc, venc) = match &self.cross_ops {
+                Some(ops) => {
+                    let (ck, cv) = &ops[li];
+                    // cross_v bias applied NPU-side via Epi::Bias; cross_k has none.
+                    (apply_tiled_ctxa(ck, enc_hidden), apply_tiled_ctxa(cv, enc_hidden))
+                }
+                None => {
+                    let kenc = enc_hidden.dot(&lw.cross_k_w); // [T,768], cross_k_b is zeros
+                    let mut venc = enc_hidden.dot(&lw.cross_v_w);
+                    venc += &lw.cross_v_b.view().insert_axis(Axis(0));
+                    (kenc, venc)
+                }
+            };
             for (name, src) in [(format!("L{li}_Kenc"), &kenc), (format!("L{li}_Venc"), &venc)] {
                 // head-major padded: out[h, t, d] = src[t, h*HEAD_DIM + d]; rows t>=T_enc are zero.
                 let mut padded = vec![0f32; N_HEADS * T_PAD * HEAD_DIM];
@@ -685,6 +874,9 @@ impl FusedDecoder {
         }
         self.arena.sync_to_device().unwrap();
         self.n_self = 0;
+        self.next_kern = None; // PIPE: n_self rewound — any prefetched kernel is now mispatched.
+        tmr.lap(&mut self.ph.cross_fold);
+        self.ph.utterances += 1;
     }
 
     /// Fresh self-KV for a new prompt (cross-K/V unchanged for this utterance).
@@ -695,29 +887,37 @@ impl FusedDecoder {
         }
         self.arena.sync_to_device().unwrap();
         self.n_self = 0;
+        self.next_kern = None; // PIPE: n_self rewound — any prefetched kernel is now mispatched.
     }
 
     /// One decode step → vocab logits `[51865]`. Embeds token+pos, dispatches the whole 12-layer ELF
     /// (KV write slot + softmax mask patched for this position), then host ln_post + proj_out.
     pub fn step(&mut self, token: i64, pos: usize) -> Vec<f32> {
+        let mut tmr = Lap::start(self.timing);
         let tok = token as usize;
         let x: Vec<f32> = (0..D)
             .map(|d| self.w.embed_tokens[[tok, d]] + self.w.embed_positions[[pos, d]])
             .collect();
+        tmr.lap(&mut self.ph.embed);
         self.write_buf("x", &x);
+        tmr.lap(&mut self.ph.write_x);
 
-        // patch the KV-write offset (slot n_self) + softmax mask length (n_self+1), then re-register.
-        let patched = self.patcher.patch(&self.base_elf, self.n_self as u32);
-        let kern: ElfKernel = self.dev.load_elf_kernel(&patched, Some("main:sequence")).expect("load fused ELF");
-        self.arena.sync_input().unwrap();
-        self.arena.dispatch(&kern).expect("fused decode dispatch");
-        self.arena.sync_from_device().unwrap();
-        self.n_self += 1;
+        // Deep-C (default when the ELF carries scratchpad params): register-once + per-token scratchpad
+        // writes, no patch/reload. Else PIPE (async-prefetch the next position's ELF registration under
+        // this dispatch) is the default; the REUSECTX diagnostic opts out to the synchronous rebind path.
+        if self.resident.is_some() {
+            self.dispatch_resident(&mut tmr);
+        } else if self.reuse_ctx.is_some() {
+            self.dispatch_sync(&mut tmr);
+        } else {
+            self.dispatch_pipe(&mut tmr);
+        }
 
         let oloc = &self.layout[&self.output];
         let mut out_bytes = vec![0u8; oloc.len];
         self.arena.read_at(oloc.arena, oloc.off, &mut out_bytes).unwrap();
         let x12 = unpack_bf16_bytes(&out_bytes);
+        tmr.lap(&mut self.ph.read_unpack);
 
         // final LN + proj_out → logits (host f32, like every other backend).
         let ln = ln_row(&x12[0..D], &self.w.ln_post_w, &self.w.ln_post_b);
@@ -731,8 +931,200 @@ impl FusedDecoder {
                 logits[j] += xi * row[j];
             }
         }
+        tmr.lap(&mut self.ph.lm_head);
+        self.ph.steps += 1;
         logits
     }
+
+    /// Deep-C dispatch: the constant ELF is already registered (resident) and the arena BOs bound, so
+    /// one token = write the 2 scratchpad words for this position + dispatch. No patch, no reload, no
+    /// re-registration (removes the ~14 ms load_elf + ~1.2 ms patch the patch path pays per token).
+    ///   kv_off (addr-kind): raw element-units BD offset = n_self*head_dim
+    ///   sm_mask (core-kind): context length n_self+1, shifted <<2 (firmware UPDATE_REG; core >>2)
+    fn dispatch_resident(&mut self, tmr: &mut Lap) {
+        let n = self.n_self as u32;
+        {
+            let r = self.resident.as_ref().unwrap();
+            let kv_val = n.wrapping_mul(r.head_dim);
+            r.res
+                .write_scratchpad(r.kv_off_byte, &kv_val.to_le_bytes())
+                .expect("write kv_off scratchpad");
+            let sm_raw = n + 1;
+            let sm_val = if r.sm_core { sm_raw << 2 } else { sm_raw };
+            r.res
+                .write_scratchpad(r.sm_off_byte, &sm_val.to_le_bytes())
+                .expect("write sm_mask scratchpad");
+        }
+        tmr.lap(&mut self.ph.patch); // scratchpad writes (~µs) occupy the old per-token "patch" slot
+        self.arena.sync_input().unwrap();
+        tmr.lap(&mut self.ph.sync_in);
+        self.resident.as_ref().unwrap().res.dispatch().expect("resident decode dispatch");
+        tmr.lap(&mut self.ph.dispatch);
+        self.arena.sync_from_device().unwrap();
+        tmr.lap(&mut self.ph.sync_out);
+        self.n_self += 1;
+    }
+
+    /// Synchronous registration + dispatch for one token (the REUSECTX diagnostic path only — the
+    /// default decode path is `dispatch_pipe`): patch the position-only KV-write offset + softmax mask,
+    /// rebind onto the persistent ctx (or, defensively, freshly register), sync the input arena,
+    /// dispatch (start+wait), sync the output back, advance `n_self`. `x` is already in the input arena.
+    fn dispatch_sync(&mut self, tmr: &mut Lap) {
+        let patched = self.patcher.patch(&self.base_elf, self.n_self as u32);
+        tmr.lap(&mut self.ph.patch);
+        let kern = match &self.reuse_ctx {
+            Some(ctx) => FusedKern::Reuse(ctx.rebind(&patched, Some("main:sequence")).expect("rebind fused ELF")),
+            None => FusedKern::Fresh(self.dev.load_elf_kernel(&patched, Some("main:sequence")).expect("load fused ELF")),
+        };
+        tmr.lap(&mut self.ph.load_elf);
+        self.arena.sync_input().unwrap();
+        tmr.lap(&mut self.ph.sync_in);
+        match &kern {
+            FusedKern::Reuse(k) => self.arena.dispatch2(k),
+            FusedKern::Fresh(k) => self.arena.dispatch(k),
+        }
+        .expect("fused decode dispatch");
+        tmr.lap(&mut self.ph.dispatch);
+        self.arena.sync_from_device().unwrap();
+        tmr.lap(&mut self.ph.sync_out);
+        self.n_self += 1;
+    }
+
+    /// PIPE registration + dispatch for one token: the patched ELF for position `n_self` was already
+    /// registered during the PREVIOUS token's dispatch (the 1-deep `next_kern` slot) — so this token
+    /// skips straight to dispatch. We start the NPU run ASYNC, then register the NEXT position's ELF on
+    /// the host WHILE the 56.9 ms run is in flight (it depends only on position, so it is knowable
+    /// before this token's logits return), and finally wait. The first token of an utterance and the
+    /// first after a `reset` have no predecessor to hide under, so they register synchronously here
+    /// (counted into `load_elf`); every steady-state token registers under the dispatch (counted into
+    /// `prefetch`, which is OFF the critical path → `load_elf` leaves the per-token `step_sum`).
+    fn dispatch_pipe(&mut self, tmr: &mut Lap) {
+        // Current kernel: the prefetch from the previous step iff it was built for this exact n_self;
+        // otherwise (first token / post-reset) register it now, on the critical path.
+        let cur = match self.next_kern.take() {
+            Some((p, k)) if p == self.n_self => k,
+            _ => {
+                let patched = self.patcher.patch(&self.base_elf, self.n_self as u32);
+                tmr.lap(&mut self.ph.patch);
+                let k = self
+                    .dev
+                    .load_elf_kernel(&patched, Some("main:sequence"))
+                    .expect("load fused ELF");
+                tmr.lap(&mut self.ph.load_elf);
+                k
+            }
+        };
+        self.arena.sync_input().unwrap();
+        tmr.lap(&mut self.ph.sync_in);
+        // Start the NPU run; it returns immediately. `cur` + the arena must outlive `run` (held below).
+        let run: Run = self.arena.dispatch_start(&cur).expect("fused decode dispatch start");
+        // Overlap window: build + register the NEXT position's patched ELF while the NPU computes.
+        let pf_mark = self.timing.then(std::time::Instant::now);
+        let next_pos = self.n_self + 1;
+        let patched_next = self.patcher.patch(&self.base_elf, next_pos as u32);
+        let next_k = self
+            .dev
+            .load_elf_kernel(&patched_next, Some("main:sequence"))
+            .expect("load next fused ELF");
+        self.next_kern = Some((next_pos, next_k));
+        if let Some(m) = pf_mark {
+            self.ph.prefetch += std::time::Instant::now().duration_since(m).as_nanos();
+        }
+        // Block for the NPU run. `dispatch` thus times start + overlapped prefetch + wait = the true
+        // per-token critical path (if XRT serialized the host build behind the run, it shows up here).
+        run.wait().expect("fused decode dispatch wait");
+        tmr.lap(&mut self.ph.dispatch);
+        self.arena.sync_from_device().unwrap();
+        tmr.lap(&mut self.ph.sync_out);
+        self.n_self += 1;
+        // `cur` owns the in-flight run's hw_context; it MUST NOT drop before run.wait() above. Owned
+        // values drop at lexical scope end (not last-use), so this explicit drop only documents intent.
+        drop(cur);
+    }
+
+    /// Dump the per-phase breakdown accumulated since the last `precompute_cross` (one utterance).
+    /// Per-token phases are reported as mean ms/step (= ms/token) and as a share of the per-step sum;
+    /// `cross_fold` is the once-per-utterance encoder cross-K/V cost. The per-step sum reconciles to
+    /// the `WHISPER_TIMING` `ms_per_tok` (modulo the few extra lang-detect+prompt dispatches). No-op
+    /// unless `FUSED_PHASE_TIMING` is set.
+    pub fn dump_phase_timing(&self) {
+        if !self.timing || self.ph.steps == 0 {
+            return;
+        }
+        let p = &self.ph;
+        let n = p.steps as f64;
+        let ms = |x: u128| x as f64 / 1e6;
+        let per = |x: u128| ms(x) / n; // mean ms per dispatch (per token)
+        let step_sum =
+            p.embed + p.write_x + p.patch + p.load_elf + p.sync_in + p.dispatch + p.sync_out + p.read_unpack + p.lm_head;
+        let pct = |x: u128| if step_sum > 0 { 100.0 * x as f64 / step_sum as f64 } else { 0.0 };
+        // Single greppable line (means in ms/token) for the result note. `prefetch_ms` is the PIPE
+        // overlap (next-token registration hidden under the NPU dispatch); it is NOT in step_sum.
+        eprintln!(
+            "[FUSED_PHASE] steps={} cross_fold_ms={:.2} embed_ms={:.3} write_x_ms={:.3} \
+             patch_ms={:.3} load_elf_ms={:.3} prefetch_ms={:.3} sync_in_ms={:.3} dispatch_ms={:.3} \
+             sync_out_ms={:.3} read_unpack_ms={:.3} lm_head_ms={:.3} step_sum_ms={:.3}",
+            p.steps,
+            ms(p.cross_fold),
+            per(p.embed),
+            per(p.write_x),
+            per(p.patch),
+            per(p.load_elf),
+            per(p.prefetch),
+            per(p.sync_in),
+            per(p.dispatch),
+            per(p.sync_out),
+            per(p.read_unpack),
+            per(p.lm_head),
+            ms(step_sum) / n,
+        );
+        // Human-readable ranked table (descending share of the per-token sum).
+        let mut rows = [
+            ("embed", p.embed),
+            ("write_x", p.write_x),
+            ("patch", p.patch),
+            ("load_elf", p.load_elf),
+            ("sync_in", p.sync_in),
+            ("dispatch", p.dispatch),
+            ("sync_out", p.sync_out),
+            ("read_unpack", p.read_unpack),
+            ("lm_head", p.lm_head),
+        ];
+        rows.sort_by(|a, b| b.1.cmp(&a.1));
+        eprintln!("[FUSED_PHASE] per-token breakdown ({} dispatches, mean ms/token, ranked):", p.steps);
+        for (name, v) in rows {
+            eprintln!("  {name:<12} {:>8.3} ms  {:>5.1}%", per(v), pct(v));
+        }
+        eprintln!(
+            "  {:<12} {:>8.3} ms/token   (+ {:.2} ms/utterance cross_fold)",
+            "step_sum",
+            ms(step_sum) / n,
+            ms(p.cross_fold),
+        );
+        if p.prefetch > 0 {
+            eprintln!(
+                "  {:<12} {:>8.3} ms/token   (PIPE: next-token ELF registration, OVERLAPPED under dispatch — off critical path)",
+                "prefetch",
+                per(p.prefetch),
+            );
+        }
+    }
+}
+
+/// Apply a K=768→768 ctx2 GEMM op to `x` `[M, 768]` (M may exceed PAD_M), row-tiling into chunks of
+/// ≤PAD_M and stacking the `[M, 768]` result in row order. Mirrors `npu_whisper::npu::apply_tiled`
+/// (inlined here to avoid the cfg-gated dependency). Used for the on-NPU cross-K/V fold (lever #2).
+fn apply_tiled_ctxa(op: &CtxAOp, x: &Array2<f32>) -> Array2<f32> {
+    let m = x.nrows();
+    let mut out = Array2::<f32>::zeros((m, D));
+    let mut r = 0;
+    while r < m {
+        let end = (r + PAD_M).min(m);
+        let chunk = x.slice(s![r..end, ..]).to_owned();
+        out.slice_mut(s![r..end, ..]).assign(&op.forward(&chunk));
+        r = end;
+    }
+    out
 }
 
 /// LayerNorm of a single row (last-axis affine, population variance, eps 1e-5) — same math as

@@ -30,6 +30,18 @@ struct CRun {
 struct CElfKernel {
     _private: [u8; 0],
 }
+#[repr(C)]
+struct CElfCtx {
+    _private: [u8; 0],
+}
+#[repr(C)]
+struct CElfKernel2 {
+    _private: [u8; 0],
+}
+#[repr(C)]
+struct CElfResident {
+    _private: [u8; 0],
+}
 
 extern "C" {
     fn shim_device_open(index: c_uint) -> *mut CDevice;
@@ -92,6 +104,33 @@ extern "C" {
     ) -> *mut CElfKernel;
     fn shim_elf_kernel_close(k: *mut CElfKernel);
     fn shim_run_elf(k: *mut CElfKernel, bos: *const *mut CBo, n_bos: usize) -> c_int;
+    fn shim_run_elf_start(k: *mut CElfKernel, bos: *const *mut CBo, n_bos: usize) -> *mut CRun;
+    fn shim_elf_ctx_open(d: *mut CDevice, base_elf: *const c_void, nbytes: usize) -> *mut CElfCtx;
+    fn shim_elf_ctx_close(c: *mut CElfCtx);
+    fn shim_elf_kernel_rebind(
+        c: *mut CElfCtx,
+        elf_bytes: *const c_void,
+        nbytes: usize,
+        name: *const c_char,
+    ) -> *mut CElfKernel2;
+    fn shim_elf_kernel2_close(k: *mut CElfKernel2);
+    fn shim_run_elf2(k: *mut CElfKernel2, bos: *const *mut CBo, n_bos: usize) -> c_int;
+    fn shim_elf_resident_open(
+        d: *mut CDevice,
+        elf_bytes: *const c_void,
+        nbytes: usize,
+        name: *const c_char,
+    ) -> *mut CElfResident;
+    fn shim_elf_resident_close(r: *mut CElfResident);
+    fn shim_elf_resident_scratchpad_size(r: *mut CElfResident) -> usize;
+    fn shim_elf_resident_bind(r: *mut CElfResident, bos: *const *mut CBo, n_bos: usize) -> c_int;
+    fn shim_elf_resident_write(
+        r: *mut CElfResident,
+        offset: usize,
+        data: *const c_void,
+        len: usize,
+    ) -> c_int;
+    fn shim_elf_resident_dispatch(r: *mut CElfResident) -> c_int;
     fn shim_last_error() -> *const c_char;
 }
 
@@ -127,6 +166,28 @@ pub struct Kernel {
 /// 3 BOs: input/output/scratch). The ELF bytes are copied in, so the source buffer may be patched.
 pub struct ElfKernel {
     ptr: *mut CElfKernel,
+}
+
+/// A resident hw_context built ONCE from a base fused ELF. Per-token patched ELFs are bound onto it
+/// via [`ElfCtx::rebind`] (rebuilding only a lightweight `xrt::module` + `ext::kernel`), hoisting the
+/// ~20 ms/token NPU partition-config out of the per-token loop. The context must outlive every
+/// [`ElfKernel2`] rebound onto it. See `shim_elf_ctx_open`.
+pub struct ElfCtx {
+    ptr: *mut CElfCtx,
+}
+
+/// A per-token kernel bound onto a persistent [`ElfCtx`] (borrows its hw_context; owns its own
+/// patched ELF + module + kernel). Dispatched like [`ElfKernel`] but via `shim_run_elf2`.
+pub struct ElfKernel2 {
+    ptr: *mut CElfKernel2,
+}
+
+/// A resident runner for a CONSTANT full ELF built with `aiex.scratchpad_parameter` (Option C). The
+/// ELF + hw_context + kernel + run are created ONCE; the arena BOs are bound once; per dispatch the
+/// host writes the per-token parameter word(s) into the ctrl scratchpad and dispatches — no ELF
+/// re-registration. Construct via [`Device::open_elf_resident`].
+pub struct ElfResident {
+    ptr: *mut CElfResident,
 }
 
 /// A device buffer object.
@@ -240,6 +301,38 @@ impl Device {
             Ok(ElfKernel { ptr })
         }
     }
+
+    /// Build a persistent [`ElfCtx`] (hw_context) ONCE from a base fused ELF. Per-token patched ELFs
+    /// are then bound via [`ElfCtx::rebind`] without re-running the partition config. `base_elf` is
+    /// any same-shape ELF (e.g. the unpatched base); the bytes are copied into XRT.
+    pub fn open_elf_ctx(&self, base_elf: &[u8]) -> Result<ElfCtx> {
+        let ptr =
+            unsafe { shim_elf_ctx_open(self.ptr, base_elf.as_ptr() as *const c_void, base_elf.len()) };
+        if ptr.is_null() {
+            Err(format!("open_elf_ctx({} bytes): {}", base_elf.len(), last_error()))
+        } else {
+            Ok(ElfCtx { ptr })
+        }
+    }
+
+    /// Open a resident runner for a CONSTANT scratchpad-parameter ELF (Option C). Registers the ELF
+    /// ONCE. Returns `Err` if the ELF has no ctrl scratchpad (i.e. not a scratchpad-parameter build —
+    /// caller should fall back to the patch path). `name=None` uses `"main:sequence"`.
+    pub fn open_elf_resident(&self, elf_bytes: &[u8], name: Option<&str>) -> Result<ElfResident> {
+        let cname = match name {
+            Some(s) => Some(CString::new(s).map_err(|e| e.to_string())?),
+            None => None,
+        };
+        let name_ptr = cname.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
+        let ptr = unsafe {
+            shim_elf_resident_open(self.ptr, elf_bytes.as_ptr() as *const c_void, elf_bytes.len(), name_ptr)
+        };
+        if ptr.is_null() {
+            Err(format!("open_elf_resident({} bytes): {}", elf_bytes.len(), last_error()))
+        } else {
+            Ok(ElfResident { ptr })
+        }
+    }
 }
 
 impl Drop for Device {
@@ -350,11 +443,123 @@ impl ElfKernel {
             Ok(())
         }
     }
+
+    /// Async variant of [`run_elf`] (the PIPE lever): submit the dispatch over `bos` and return
+    /// immediately with a [`Run`] handle. The NPU executes while the host registers the next token's
+    /// position-only patched ELF; call [`Run::wait`] before reading the output arena. This `ElfKernel`
+    /// and all BOs must outlive the returned `Run`.
+    pub fn start_elf(&self, bos: &[&Bo]) -> Result<Run> {
+        let ptrs: Vec<*mut CBo> = bos.iter().map(|b| b.ptr).collect();
+        let ptr = unsafe { shim_run_elf_start(self.ptr, ptrs.as_ptr(), ptrs.len()) };
+        if ptr.is_null() {
+            Err(format!("start_elf({} bos): {}", ptrs.len(), last_error()))
+        } else {
+            Ok(Run { ptr })
+        }
+    }
 }
 
 impl Drop for ElfKernel {
     fn drop(&mut self) {
         unsafe { shim_elf_kernel_close(self.ptr) }
+    }
+}
+
+impl ElfCtx {
+    /// Bind a patched ELF onto this resident hw_context, rebuilding only the module + kernel (no
+    /// partition re-config). `name=None` uses `"main:sequence"`. The returned [`ElfKernel2`] borrows
+    /// this context — keep the `ElfCtx` alive at least as long as any kernel rebound from it.
+    pub fn rebind(&self, elf_bytes: &[u8], name: Option<&str>) -> Result<ElfKernel2> {
+        let cname = match name {
+            Some(s) => Some(CString::new(s).map_err(|e| e.to_string())?),
+            None => None,
+        };
+        let name_ptr = cname.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
+        let ptr = unsafe {
+            shim_elf_kernel_rebind(
+                self.ptr,
+                elf_bytes.as_ptr() as *const c_void,
+                elf_bytes.len(),
+                name_ptr,
+            )
+        };
+        if ptr.is_null() {
+            Err(format!("rebind({} bytes): {}", elf_bytes.len(), last_error()))
+        } else {
+            Ok(ElfKernel2 { ptr })
+        }
+    }
+}
+
+impl Drop for ElfCtx {
+    fn drop(&mut self) {
+        unsafe { shim_elf_ctx_close(self.ptr) }
+    }
+}
+
+impl ElfKernel2 {
+    /// Dispatch over `bos` mapped positionally to args 0..N, start + wait. Same ABI as
+    /// [`ElfKernel::run_elf`] but on a kernel bound to a persistent [`ElfCtx`].
+    pub fn run_elf(&self, bos: &[&Bo]) -> Result<()> {
+        let ptrs: Vec<*mut CBo> = bos.iter().map(|b| b.ptr).collect();
+        let r = unsafe { shim_run_elf2(self.ptr, ptrs.as_ptr(), ptrs.len()) };
+        if r != 0 {
+            Err(format!("run_elf2({} bos): {}", ptrs.len(), last_error()))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Drop for ElfKernel2 {
+    fn drop(&mut self) {
+        unsafe { shim_elf_kernel2_close(self.ptr) }
+    }
+}
+
+impl ElfResident {
+    /// Size of the ctrl scratchpad (bytes). >0 means the ELF carries scratchpad parameters.
+    pub fn scratchpad_size(&self) -> usize {
+        unsafe { shim_elf_resident_scratchpad_size(self.ptr) }
+    }
+
+    /// Bind the arena BOs to run args 0..N once (reused every dispatch).
+    pub fn bind(&self, bos: &[&Bo]) -> Result<()> {
+        let ptrs: Vec<*mut CBo> = bos.iter().map(|b| b.ptr).collect();
+        let r = unsafe { shim_elf_resident_bind(self.ptr, ptrs.as_ptr(), ptrs.len()) };
+        if r != 0 {
+            Err(format!("resident bind({} bos): {}", ptrs.len(), last_error()))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Write `bytes` at byte `offset` into the host-mapped ctrl scratchpad (no device sync yet).
+    pub fn write_scratchpad(&self, offset: usize, bytes: &[u8]) -> Result<()> {
+        let r = unsafe {
+            shim_elf_resident_write(self.ptr, offset, bytes.as_ptr() as *const c_void, bytes.len())
+        };
+        if r != 0 {
+            Err(format!("resident write_scratchpad@{offset}: {}", last_error()))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Sync the scratchpad to device, start the bound run, wait for completion.
+    pub fn dispatch(&self) -> Result<()> {
+        let r = unsafe { shim_elf_resident_dispatch(self.ptr) };
+        if r != 0 {
+            Err(format!("resident dispatch: {}", last_error()))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Drop for ElfResident {
+    fn drop(&mut self) {
+        unsafe { shim_elf_resident_close(self.ptr) }
     }
 }
 
@@ -445,6 +650,25 @@ impl FusedArena {
     /// Dispatch the fused ELF over `[input, output, scratch]`.
     pub fn dispatch(&self, kern: &ElfKernel) -> Result<()> {
         kern.run_elf(&[&self.input, &self.output, &self.scratch])
+    }
+
+    /// Async dispatch over `[input, output, scratch]` (the PIPE lever): returns a [`Run`] handle
+    /// immediately so the host can register the next token's ELF while the NPU runs. `kern` and this
+    /// arena must outlive the returned `Run`; call [`Run::wait`] before [`FusedArena::sync_from_device`].
+    pub fn dispatch_start(&self, kern: &ElfKernel) -> Result<Run> {
+        kern.start_elf(&[&self.input, &self.output, &self.scratch])
+    }
+
+    /// Dispatch over `[input, output, scratch]` with a persistent-context kernel ([`ElfKernel2`]).
+    pub fn dispatch2(&self, kern: &ElfKernel2) -> Result<()> {
+        kern.run_elf(&[&self.input, &self.output, &self.scratch])
+    }
+
+    /// Bind the three arenas to a resident runner once ([`ElfResident::bind`]). After this, a token
+    /// loop is: write x into input + [`FusedArena::sync_input`], write scratchpad param(s) via the
+    /// resident, then [`ElfResident::dispatch`] (it syncs the scratchpad + runs the bound args).
+    pub fn bind_resident(&self, r: &ElfResident) -> Result<()> {
+        r.bind(&[&self.input, &self.output, &self.scratch])
     }
 }
 

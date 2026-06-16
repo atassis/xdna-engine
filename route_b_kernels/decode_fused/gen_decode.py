@@ -20,6 +20,7 @@ import numpy as np
 import ml_dtypes
 import torch
 
+import newstack_compat  # noqa: F401 — MUST precede iron imports (new-mlir-aie port shim)
 from iron.common import AIEContext
 from iron.common.fusion import FusedMLIROperator, load_elf
 from iron.operators.gemv.op import GEMV
@@ -94,10 +95,15 @@ def main():
     sc = dict(input_sizes=(H, HD), input_strides=(HD, 1), input_offset=0, output_sizes=(1, H, HD),
               output_strides=(0, S * HD, 1), output_offset=0, input_buffer_size=H * HD,
               output_buffer_size=H * S * HD, num_aie_channels=1)
-    op_sck = StridedCopy(**sc, kwargs={"output_offset_patch_marker": KV_MAGIC}, context=ctx)
-    op_scv = StridedCopy(**sc, kwargs={"output_offset_patch_marker": KV_MAGIC}, context=ctx)
+    # Deep-C: the per-token KV-write position offset is now a runtime `addr`-kind scratchpad param
+    # (shared symbol "kv_off", element units = n_self*head_dim) instead of a per-token ELF patch →
+    # the decode ELF is CONSTANT across tokens (registered once; host writes the offset per dispatch).
+    op_sck = StridedCopy(**sc, kwargs={"output_offset_scratchpad": "kv_off"}, context=ctx)
+    op_scv = StridedCopy(**sc, kwargs={"output_offset_scratchpad": "kv_off"}, context=ctx)
     op_sc_s = GEMV(M=S, K=HD, num_aie_columns=8, tile_size_input=4, tile_size_output=S // 8, num_batches=H, context=ctx)
-    op_sm_s = Softmax(rows=16, cols=S, num_aie_columns=1, num_channels=1, rtp_vector_size=S, mask_patch_value=SM_MAGIC, context=ctx)
+    # Deep-C: the per-token self-softmax mask width is now a runtime `core`-kind scratchpad param
+    # (symbol "sm_mask", element units = context_len = n_self) read on-tile, instead of an ELF patch.
+    op_sm_s = Softmax(rows=16, cols=S, num_aie_columns=1, num_channels=1, rtp_vector_size=S, mask_scratchpad="sm_mask", context=ctx)
     op_tr_s = Transpose(M=S, N=HD, num_aie_columns=2, num_channels=1, m=tms, n=tns, s=tss, context=ctx)
     op_ct_s = GEMV(M=HD, K=S, num_aie_columns=8, tile_size_input=4, tile_size_output=HD // 8, num_batches=H, context=ctx)
     op_sc_c = GEMV(M=TP, K=HD, num_aie_columns=8, tile_size_input=4, tile_size_output=TP // 8, num_batches=H, context=ctx)
@@ -203,6 +209,20 @@ def main():
     wnames = list(weights_to_write.keys())
     lay = {n: fused.get_layout_for_buffer(n) for n in ["x", out_name] + wnames}
 
+    # Deep-C: aiecc emits the scratchpad StateTable layout (params.txt) next to the fused MLIR; parse
+    # it so the host (Rust) knows each param's byte offset (= state_table_idx*4) + kind. The ctrl
+    # scratchpad is a u32 array; addr-kind values are written raw, core-kind values are written <<2
+    # (firmware UPDATE_REG requirement — the core right-shifts by 2 after reading).
+    import glob, shutil
+    _pp = sorted(glob.glob("**/decode*.mlir.prj/params.txt", recursive=True), key=os.path.getmtime)
+    scratchpad_params = {}
+    if _pp:
+        shutil.copy(_pp[-1], os.path.join(a.out, "params.txt"))
+        for line in open(_pp[-1]).read().splitlines()[1:]:
+            if line.strip():
+                nm, idx, ty, kind = line.split()
+                scratchpad_params[nm] = {"byte_offset": int(idx) * 4, "kind": kind, "dtype": ty}
+
     # ---- device-faithful golden (N-layer forward) ----
     x = bf16(rng.standard_normal(D).astype(np.float32))
     cur_x = x
@@ -240,7 +260,10 @@ def main():
         "input_size": int(in_sz), "output_size": int(out_sz), "scratch_size": int(scr),
         "layout": {n: {"type": v[0], "offset": int(v[1]), "len": int(v[2])} for n, v in lay.items()},
         "inputs": ["x"], "weights": wnames, "output": out_name,
-        "patch": {"kv_cache_offsets": [int(lay[n][1]) for n in patch_offsets_names], "head_dim": HD, "num_preceding": P},
+        # Deep-C: ELF is CONSTANT (no per-token patch). Per token the host writes scratchpad params:
+        #   kv_off (addr) = n_self*head_dim  (element units, raw);  sm_mask (core) = n_self+1 (<<2 by host)
+        "scratchpad": {"params": scratchpad_params, "kv_param": "kv_off", "mask_param": "sm_mask",
+                       "head_dim": HD, "num_preceding": P},
         "dims": {"layers": NL, "S": S, "P": P, "T_enc": T, "T_pad": TP},
     }
     json.dump(meta, open(os.path.join(a.out, "meta.json"), "w"), indent=2)
