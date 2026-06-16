@@ -23,7 +23,7 @@ use npu_whisper::config::WhisperCfg;
 use npu_whisper::encoder::WhisperEncoder;
 use tokenizers::Tokenizer;
 
-use crate::asr::whisper_decoder::{FusedDecoder, HostDecoder, WhisperDecoderWeights};
+use crate::asr::whisper_decoder::{BatchedFusedDecoder, FusedDecoder, HostDecoder, WhisperDecoderWeights};
 use crate::config::ScenarioConfig;
 use crate::pipeline::AsrModel;
 
@@ -208,6 +208,9 @@ pub struct WhisperAsr {
     /// Whole-decode fused-ELF backend (env `NPU_DECODE_FUSED`): the ENTIRE 12-layer decoder in one
     /// fused-ELF dispatch/token (vs `npu_decoder`'s ~72). Takes precedence over `npu_decoder`.
     npu_fused: Option<RefCell<FusedDecoder>>,
+    /// Subsystem B (env `NPU_DECODE_FUSED_BATCH` + `NPU_DECODE_FUSED_BATCH_DIR`): batched decode over B
+    /// streams in one dispatch/step. Driven by `transcribe_batch` (offline bulk), not the serve path.
+    npu_fused_batch: Option<RefCell<BatchedFusedDecoder>>,
     _env: Rc<Env>,
 }
 
@@ -240,7 +243,8 @@ impl WhisperAsr {
         // encoder's single-tenant device + the same host weights.
         let fused_on = std::env::var("NPU_DECODE_FUSED").is_ok();
         let npu_on = std::env::var("NPU_DECODE").is_ok();
-        let (npu_decoder, npu_fused) = if fused_on || npu_on {
+        let batch_on = std::env::var("NPU_DECODE_FUSED_BATCH").is_ok();
+        let (npu_decoder, npu_fused, npu_fused_batch) = if fused_on || npu_on || batch_on {
             let dev = enc
                 .device()
                 .expect("NPU decode: encoder must hold an open NPU device (built via new_npu)");
@@ -248,22 +252,43 @@ impl WhisperAsr {
                 WhisperDecoderWeights::load(&ws.join("whisper_decoder"))
                     .expect("NPU decode: load whisper_decoder host weights"),
             );
-            if fused_on {
-                let fdir = xroot.join("artifacts/fused_decode12");
+            // Subsystem B: batched decoder (offline-bulk), independent of the single-stream backend.
+            let nfb = if batch_on {
+                let bdir = std::path::PathBuf::from(
+                    std::env::var("NPU_DECODE_FUSED_BATCH_DIR")
+                        .expect("NPU_DECODE_FUSED_BATCH requires NPU_DECODE_FUSED_BATCH_DIR"),
+                );
+                eprintln!("[whisper] batched fused decode dir: {}", bdir.display());
+                // O1: share the encoder's resident ctx2 kernel so the batched cross-K/V fold runs on
+                // the NPU (like M=1), not the naive host f32 loop.
+                Some(RefCell::new(BatchedFusedDecoder::new(Rc::clone(&weights), &dev, &bdir, enc.shared())))
+            } else {
+                None
+            };
+            if !fused_on && !npu_on {
+                (None, None, nfb)
+            } else if fused_on {
+                // NPU_DECODE_FUSED_DIR overrides the fused-ELF artifact dir (for A/B of alternate
+                // builds, e.g. the lever-3 coalesced ELF). Default: artifacts/fused_decode12.
+                let fdir = match std::env::var("NPU_DECODE_FUSED_DIR") {
+                    Ok(d) => std::path::PathBuf::from(d),
+                    Err(_) => xroot.join("artifacts/fused_decode12"),
+                };
+                eprintln!("[whisper] fused decode ELF dir: {}", fdir.display());
                 // Share the encoder's resident ctx2 kernel so the cross-K/V fold runs on the NPU.
                 let fd = FusedDecoder::new(weights, &dev, &fdir, enc.shared());
                 eprintln!("[whisper] NPU_DECODE_FUSED=1: whole 12-layer decode in ONE fused-ELF dispatch/token");
-                (None, Some(RefCell::new(fd)))
+                (None, Some(RefCell::new(fd)), nfb)
             } else {
                 let dec = HostDecoder::new_npu(weights, &dev, &xroot);
                 eprintln!("[whisper] NPU_DECODE=1: per-token decoder matmuls on the NPU");
-                (Some(RefCell::new(dec)), None)
+                (Some(RefCell::new(dec)), None, nfb)
             }
         } else {
-            (None, None)
+            (None, None, None)
         };
 
-        WhisperAsr { prep, decoder, decoder_past, enc, tok, npu_decoder, npu_fused, _env: env }
+        WhisperAsr { prep, decoder, decoder_past, enc, tok, npu_decoder, npu_fused, npu_fused_batch, _env: env }
     }
 
     /// Step 0: run the no-past graph over the full prompt + encoder hidden states. Delegates to the
@@ -425,6 +450,209 @@ impl WhisperAsr {
             }
             ids.push(next);
         }
+        ids
+    }
+
+    /// Preprocess + NPU-encode one clip → (flat encoder hidden `[T_ENC*D]`, preproc_ms, encoder_ms).
+    fn encode_clip_timed(&self, samples: &[i16]) -> (Vec<f32>, f64, f64) {
+        let mut wav = vec![0f32; N_SAMPLES];
+        let m = samples.len().min(N_SAMPLES);
+        for i in 0..m {
+            wav[i] = samples[i] as f32 / 32768.0;
+        }
+        let tp = std::time::Instant::now();
+        let feat = self
+            .prep
+            .run(&[("waveform", Tensor::F32(&wav, vec![1, N_SAMPLES as i64]))], &["input_features"])
+            .expect("preprocessor");
+        let feats = feat.f32(0);
+        let mut mel = Array2::<f32>::zeros((N_MELS, N_FRAMES));
+        for c in 0..N_MELS {
+            for t in 0..N_FRAMES {
+                mel[[c, t]] = feats[c * N_FRAMES + t];
+            }
+        }
+        let prep_ms = tp.elapsed().as_secs_f64() * 1e3;
+        let te = std::time::Instant::now();
+        let encoded = self.enc.forward_last(&mel);
+        let flat: Vec<f32> = encoded.as_standard_layout().iter().copied().collect();
+        let enc_ms = te.elapsed().as_secs_f64() * 1e3;
+        (flat, prep_ms, enc_ms)
+    }
+
+    fn encode_clip(&self, samples: &[i16]) -> Vec<f32> {
+        self.encode_clip_timed(samples).0
+    }
+
+    /// Encode B clips, returning the hiddens + total preproc_ms + total encoder_ms (the encoder stage
+    /// is per-clip sequential — NOT batched — so this is the shared front-end cost for the bench).
+    pub fn encode_clips_timed(&self, clips: &[&[i16]]) -> (Vec<Vec<f32>>, f64, f64) {
+        let (mut prep, mut enc) = (0.0, 0.0);
+        let mut out = Vec::with_capacity(clips.len());
+        for s in clips {
+            let (f, p, e) = self.encode_clip_timed(s);
+            prep += p;
+            enc += e;
+            out.push(f);
+        }
+        (out, prep, enc)
+    }
+
+    /// Subsystem B: transcribe exactly B clips at once (offline-bulk lockstep). Encodes each clip
+    /// (sequential, single-tenant NPU), then runs ONE batched greedy decode over all B streams.
+    pub fn transcribe_batch(&self, clips: &[&[i16]]) -> Vec<String> {
+        let cell = self.npu_fused_batch.as_ref().expect("NPU_DECODE_FUSED_BATCH not enabled");
+        let mut dec = cell.borrow_mut();
+        let b = dec.batch();
+        assert_eq!(clips.len(), b, "transcribe_batch needs exactly B={b} clips");
+        let encs: Vec<Array2<f32>> = clips
+            .iter()
+            .map(|s| Array2::from_shape_vec((T_ENC, D), self.encode_clip(s)).expect("enc shape"))
+            .collect();
+        let ids = self.greedy_decode_fused_batch(&mut dec, &encs);
+        ids.iter().map(|id| self.detokenize(id)).collect()
+    }
+
+    /// Subsystem B — O3: transcribe N clips (any N) via length-bucketed offline-bulk. Sorts clips by
+    /// sample-count (the decode-length proxy — the encoder pads all clips to T_ENC, so encoder length
+    /// is useless), chunks into ⌈N/B⌉ B-sized buckets (last padded by repeating its longest clip),
+    /// decodes each bucket lockstep, and reassembles transcripts in the ORIGINAL order. Similar-length
+    /// clips per bucket cut lockstep waste vs length-mixed batches (each bucket runs to ITS longest,
+    /// not the global longest).
+    pub fn transcribe_bulk(&self, clips: &[&[i16]]) -> Vec<String> {
+        let b = self.npu_fused_batch.as_ref().expect("NPU_DECODE_FUSED_BATCH not enabled").borrow().batch();
+        let n = clips.len();
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by_key(|&i| clips[i].len()); // ascending by samples; bucket = similar lengths
+        let mut out = vec![String::new(); n];
+        for chunk in order.chunks(b) {
+            let mut idxs: Vec<usize> = chunk.to_vec();
+            while idxs.len() < b {
+                idxs.push(*chunk.last().unwrap()); // pad short last bucket by repeating its longest
+            }
+            let bucket: Vec<&[i16]> = idxs.iter().map(|&i| clips[i]).collect();
+            let texts = self.transcribe_batch(&bucket);
+            for (k, &orig) in chunk.iter().enumerate() {
+                out[orig] = texts[k].clone();
+            }
+        }
+        out
+    }
+
+    // ---- decode-only bench hooks (subsystem-B perf): encode once (untimed), then time each decode
+    // backend over the SAME encoder outputs. Token ids include the 4-token prompt (caller subtracts).
+
+    /// Preprocess + NPU-encode each clip → flat encoder hiddens `[T_ENC*D]` (sequential; untimed by caller).
+    pub fn encode_clips(&self, clips: &[&[i16]]) -> Vec<Vec<f32>> {
+        clips.iter().map(|s| self.encode_clip(s)).collect()
+    }
+
+    /// Batched decoder width B, if the batched backend is enabled (for the O3 bulk scheduler/bench).
+    pub fn batch_width(&self) -> Option<usize> {
+        self.npu_fused_batch.as_ref().map(|c| c.borrow().batch())
+    }
+
+    /// Single-stream (M=1) fused greedy decode for one pre-encoded clip → token ids (incl. prompt).
+    pub fn decode_m1_ids(&self, enc_flat: &[f32]) -> Vec<i64> {
+        let cell = self.npu_fused.as_ref().expect("decode_m1_ids needs NPU_DECODE_FUSED");
+        self.greedy_decode_fused(&mut cell.borrow_mut(), enc_flat)
+    }
+
+    /// Batched (B-stream) fused greedy decode over B pre-encoded clips → per-stream token ids.
+    pub fn decode_batch_ids(&self, encs_flat: &[Vec<f32>]) -> Vec<Vec<i64>> {
+        let cell = self.npu_fused_batch.as_ref().expect("decode_batch_ids needs NPU_DECODE_FUSED_BATCH");
+        let mut dec = cell.borrow_mut();
+        let encs: Vec<Array2<f32>> = encs_flat
+            .iter()
+            .map(|f| Array2::from_shape_vec((T_ENC, D), f.clone()).expect("enc shape"))
+            .collect();
+        self.greedy_decode_fused_batch(&mut dec, &encs)
+    }
+
+    /// O3 bench hook: decode N pre-encoded clips bucketed by `sort_key` (sample-count). Returns
+    /// (ids in ORIGINAL order, total_computed_slots = Σ_bucket steps×B). `sort=true` length-sorts
+    /// before bucketing; `sort=false` keeps input order (length-mixed buckets) for the A/B. The pad
+    /// slots that fill a short last bucket are counted in `slots` (they are real dispatch work).
+    pub fn decode_bulk_ids(&self, encs_flat: &[Vec<f32>], sort_key: &[usize], sort: bool) -> (Vec<Vec<i64>>, usize) {
+        let cell = self.npu_fused_batch.as_ref().expect("decode_bulk_ids needs NPU_DECODE_FUSED_BATCH");
+        let mut dec = cell.borrow_mut();
+        let b = dec.batch();
+        let n = encs_flat.len();
+        let mut order: Vec<usize> = (0..n).collect();
+        if sort {
+            order.sort_by_key(|&i| sort_key[i]);
+        }
+        let mut out: Vec<Vec<i64>> = vec![Vec::new(); n];
+        let mut slots = 0usize;
+        for chunk in order.chunks(b) {
+            let mut idxs: Vec<usize> = chunk.to_vec();
+            while idxs.len() < b {
+                idxs.push(*chunk.last().unwrap());
+            }
+            let encs: Vec<Array2<f32>> = idxs
+                .iter()
+                .map(|&i| Array2::from_shape_vec((T_ENC, D), encs_flat[i].clone()).expect("enc shape"))
+                .collect();
+            let ids = self.greedy_decode_fused_batch(&mut dec, &encs);
+            slots += dec.last_steps() * b;
+            for (k, &orig) in chunk.iter().enumerate() {
+                out[orig] = ids[k].clone();
+            }
+        }
+        (out, slots)
+    }
+
+    /// Batched greedy decode (lockstep) → per-stream token ids. IDENTICAL control logic to
+    /// `greedy_decode_fused` (lang detect, prompt, argmax, EOT, MAX_DECODE), widened to B streams: all
+    /// advance one token/step; finished streams feed EOT (ignored) until every stream hits EOT.
+    fn greedy_decode_fused_batch(
+        &self,
+        dec: &mut BatchedFusedDecoder,
+        encs: &[Array2<f32>],
+    ) -> Vec<Vec<i64>> {
+        let b = encs.len();
+        dec.precompute_cross_batch(encs);
+        let lang_logits = dec.step_batch(&vec![SOT; b], 0);
+        let langs: Vec<i64> = lang_logits.iter().map(|l| Self::pick_lang(l)).collect();
+        dec.reset();
+        let prompts: Vec<[i64; 4]> =
+            langs.iter().map(|&l| [SOT, l, TRANSCRIBE, NOTIMESTAMPS]).collect();
+        let mut ids: Vec<Vec<i64>> = prompts.iter().map(|p| p.to_vec()).collect();
+        let plen = prompts[0].len();
+        let mut logits: Vec<Vec<f32>> = Vec::new();
+        for pos in 0..plen {
+            let toks: Vec<i64> = (0..b).map(|bi| prompts[bi][pos]).collect();
+            logits = dec.step_batch(&toks, pos);
+        }
+        let mut next: Vec<i64> = logits.iter().map(|l| argmax(l)).collect();
+        let mut active = vec![true; b];
+        for bi in 0..b {
+            if next[bi] == EOT {
+                active[bi] = false;
+            } else {
+                ids[bi].push(next[bi]);
+            }
+        }
+        for step in 0..(MAX_DECODE - 1) {
+            if active.iter().all(|&a| !a) {
+                break;
+            }
+            let pos = plen + step;
+            let toks: Vec<i64> = (0..b).map(|bi| if active[bi] { next[bi] } else { EOT }).collect();
+            let logits = dec.step_batch(&toks, pos);
+            for bi in 0..b {
+                if !active[bi] {
+                    continue;
+                }
+                next[bi] = argmax(&logits[bi]);
+                if next[bi] == EOT {
+                    active[bi] = false;
+                } else {
+                    ids[bi].push(next[bi]);
+                }
+            }
+        }
+        dec.dump_phase_timing(); // FUSED_PHASE_TIMING: per-dispatch batched breakdown
         ids
     }
 

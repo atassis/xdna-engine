@@ -11,7 +11,14 @@ Discovered port deltas (keep this list as the canonical record):
      `Program(dev, rt).resolve_program(SequentialPlacer())`; the new signature is
      `resolve_program(device_name="main")`. We provide a stand-in `SequentialPlacer` and make
      `resolve_program` drop a leading placer positional arg.
+  2. The explicit-placement kwarg was renamed `placement=` -> `tile=` across the dataflow/runtime
+     API (`ObjectFifoHandle.{split,join,forward}`, `Worker.__init__`, `Runtime.{fill,drain}`). The
+     GEMM operator's design.py still calls `placement=Tile(...)` (deep-C only exercised GEMV/LN/etc.,
+     whose design.py the deep-C patch already ported, so this delta surfaced only when GEMM was first
+     built on the new stack for the lever-3 batching probe). We rename the kwarg at call time so the
+     unported GEMM design.py runs unchanged. No-op on the old stack (this branch never runs there).
 """
+import functools
 import sys
 import types
 
@@ -38,3 +45,27 @@ except ImportError:
         return _orig_resolve(self, *args, **kwargs)
 
     _Program.resolve_program = _resolve_program
+
+    # Delta 2: rename `placement=` -> `tile=` at call time on the methods amd/IRON's (unported)
+    # GEMM design.py still calls with the old kwarg name.
+    def _rename_placement(fn):
+        @functools.wraps(fn)
+        def _wrapped(*args, **kwargs):
+            if "placement" in kwargs:
+                kwargs.setdefault("tile", kwargs.pop("placement"))
+            return fn(*args, **kwargs)
+        return _wrapped
+
+    from aie.iron.dataflow import ObjectFifoHandle
+    from aie.iron.worker import Worker
+    from aie.iron import Runtime
+
+    for _cls, _meth in (
+        (ObjectFifoHandle, "split"),
+        (ObjectFifoHandle, "join"),
+        (ObjectFifoHandle, "forward"),
+        (Worker, "__init__"),
+        (Runtime, "fill"),
+        (Runtime, "drain"),
+    ):
+        setattr(_cls, _meth, _rename_placement(getattr(_cls, _meth)))

@@ -1111,6 +1111,303 @@ impl FusedDecoder {
     }
 }
 
+// =============================================================================================
+// Subsystem-B: BatchedFusedDecoder — drive the batched decode ELF (gen_decode_batched.py
+// --scratchpad) for B streams at once, OFFLINE-BULK LOCKSTEP. All B streams advance one token per
+// step, so deep-C's scalar scratchpad params (kv_off = n_self*head_dim, sm_mask = (n_self+1)<<2) are
+// SHARED across the batch. Per step: write B embed rows into the B-wide `x` input -> write the 2
+// scalar params -> ONE dispatch -> read B output rows -> B host lm-heads. Resident-only.
+// =============================================================================================
+/// Batched whole-decode fused-ELF backend (subsystem B). See module banner.
+pub struct BatchedFusedDecoder {
+    w: Rc<WhisperDecoderWeights>,
+    arena: FusedArena,
+    layout: HashMap<String, BufLoc>,
+    output: String, // e.g. "x12"
+    b: usize,       // batch width (streams)
+    t_enc: usize,
+    t_pad: usize,
+    n_self: usize,
+    res: ElfResident,
+    kv_off_byte: usize,
+    sm_off_byte: usize,
+    sm_core: bool,
+    head_dim: u32,
+    timing: bool, // env FUSED_PHASE_TIMING: per-phase decode breakdown
+    ph: PhaseAcc,
+    /// O1 (lever #2 for the batch): per-layer (cross_k, cross_v) GEMM ops on the encoder's shared ctx2
+    /// kernel. When `Some`, `precompute_cross_batch` folds each stream's encoder cross-K/V on the NPU
+    /// (~0.078 s/utt, like M=1) instead of the naive host f32 `enc.dot()` (6.36 s/batch). `None` = host
+    /// fold (fallback / A-B). Opt out with NPU_DECODE_FUSED_HOSTCROSS=1.
+    cross_ops: Option<Vec<(CtxAOp, CtxAOp)>>,
+}
+
+impl BatchedFusedDecoder {
+    /// Load the prebuilt batched decode ELF + resident weight arena. `dir` holds decode_b.elf,
+    /// meta.json (with a `scratchpad` block + dims.B/T), buffers/<name>.bin. `shared` = the encoder's
+    /// resident ctx2 kernel (Some → O1 NPU cross-K/V fold; None → host f32 fold).
+    pub fn new(w: Rc<WhisperDecoderWeights>, dev: &Rc<Device>, dir: &Path, shared: Option<Rc<SharedCtxA>>) -> Self {
+        let base_elf = std::fs::read(dir.join("decode_b.elf"))
+            .unwrap_or_else(|e| panic!("read decode_b.elf: {e} (gen_decode_batched.py --scratchpad)"));
+        let meta: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("meta.json")).expect("read meta.json"))
+                .expect("parse meta.json");
+        let usz = |k: &str| meta[k].as_u64().expect(k) as usize;
+        let (in_sz, out_sz, scr_sz) = (usz("input_size"), usz("output_size"), usz("scratch_size"));
+        let output = meta["output"].as_str().expect("output").to_string();
+        let b = meta["dims"]["B"].as_u64().expect("dims.B") as usize;
+        let t_enc = meta["dims"]["T"].as_u64().expect("dims.T") as usize;
+        let t_pad = ((t_enc + 63) / 64) * 64;
+
+        let mut layout = HashMap::new();
+        for (name, e) in meta["layout"].as_object().expect("layout") {
+            let arena = match e["type"].as_str().unwrap() {
+                "input" => Arena::Input,
+                "output" => Arena::Output,
+                "scratch" => Arena::Scratch,
+                o => panic!("bad arena type {o}"),
+            };
+            layout.insert(
+                name.clone(),
+                BufLoc { arena, off: e["offset"].as_u64().unwrap() as usize, len: e["len"].as_u64().unwrap() as usize },
+            );
+        }
+        let arena = FusedArena::new(dev, in_sz, out_sz, scr_sz).expect("alloc batched fused arenas");
+        // static weights (skip per-utterance encoder-K/V + self-KV caches).
+        for name in meta["weights"].as_array().expect("weights") {
+            let name = name.as_str().unwrap();
+            if name.ends_with("Kenc") || name.ends_with("Venc") || name.ends_with("kcache") || name.ends_with("vcache") {
+                continue;
+            }
+            let bytes = std::fs::read(dir.join("buffers").join(format!("{name}.bin")))
+                .unwrap_or_else(|e| panic!("read buffer {name}.bin: {e}"));
+            let loc = &layout[name];
+            assert_eq!(bytes.len(), loc.len, "{name}: blob {} != layout {}", bytes.len(), loc.len);
+            arena.write_at(loc.arena, loc.off, &bytes).unwrap();
+        }
+        let sp = &meta["scratchpad"];
+        let kvn = sp["kv_param"].as_str().expect("scratchpad.kv_param");
+        let smn = sp["mask_param"].as_str().expect("scratchpad.mask_param");
+        let kv_off_byte = sp["params"][kvn]["byte_offset"].as_u64().expect("kv byte_offset") as usize;
+        let sm_off_byte = sp["params"][smn]["byte_offset"].as_u64().expect("sm byte_offset") as usize;
+        let sm_core = sp["params"][smn]["kind"].as_str() == Some("core");
+        let head_dim = sp["head_dim"].as_u64().unwrap_or(HEAD_DIM as u64) as u32;
+        let res = dev
+            .open_elf_resident(&base_elf, Some("main:sequence"))
+            .expect("open_elf_resident (batched decode ELF lacks scratchpad?)");
+        arena.bind_resident(&res).expect("bind resident arena BOs");
+        eprintln!("[batched] B={b} t_enc={t_enc} resident scratchpad decode (scratch {:.0} MB)", scr_sz as f64 / 1e6);
+        let timing = std::env::var("FUSED_PHASE_TIMING").is_ok();
+        // O1: register per-layer cross-K/V GEMM ops on the encoder's shared ctx2 kernel (NPU fold),
+        // mirroring FusedDecoder's lever #2. Opt out (host f32 fold) with NPU_DECODE_FUSED_HOSTCROSS=1.
+        let host_cross = std::env::var("NPU_DECODE_FUSED_HOSTCROSS").is_ok();
+        let cross_ops = match (shared, host_cross) {
+            (Some(sh), false) => {
+                let ops: Vec<(CtxAOp, CtxAOp)> = w
+                    .layers
+                    .iter()
+                    .map(|lw| {
+                        let ck = CtxAOp::new(sh.clone(), &lw.cross_k_w, D, Epi::None, &[]);
+                        let cv = CtxAOp::new(
+                            sh.clone(),
+                            &lw.cross_v_w,
+                            D,
+                            Epi::Bias,
+                            lw.cross_v_b.as_slice().unwrap(),
+                        );
+                        (ck, cv)
+                    })
+                    .collect();
+                eprintln!("[batched] cross-K/V fold on NPU (ctx2 GEMM, O1) for all B streams");
+                Some(ops)
+            }
+            _ => {
+                eprintln!("[batched] cross-K/V fold on HOST (naive f32) — no shared ctx2 / HOSTCROSS set");
+                None
+            }
+        };
+        BatchedFusedDecoder {
+            w, arena, layout, output, b, t_enc, t_pad, n_self: 0, res, kv_off_byte, sm_off_byte, sm_core, head_dim,
+            timing, ph: PhaseAcc::default(), cross_ops,
+        }
+    }
+
+    pub fn batch(&self) -> usize {
+        self.b
+    }
+
+    /// Dispatches accumulated since the last `precompute_cross_batch` (O3: per-bucket step count for
+    /// the utilisation metric real_tokens / (steps × B)).
+    pub fn last_steps(&self) -> usize {
+        self.ph.steps as usize
+    }
+
+    fn zero_buf(&self, name: &str) {
+        let loc = &self.layout[name];
+        self.arena.write_at(loc.arena, loc.off, &vec![0u8; loc.len]).unwrap();
+    }
+
+    /// Write one stream's row into a B-wide buffer (`x` input, [B, D] stream-major).
+    fn write_row(&self, name: &str, bi: usize, f: &[f32]) {
+        let loc = &self.layout[name];
+        let bytes = pack_bf16_bytes(f);
+        let row = bytes.len();
+        assert_eq!(loc.len, self.b * row, "{name} not B-wide ({} != {}*{})", loc.len, self.b, row);
+        self.arena.write_at(loc.arena, loc.off + bi * row, &bytes).unwrap();
+    }
+
+    /// Fold B encoders' cross-K/V into the B-wide per-layer resident scratch (head-major, padded
+    /// T_enc->T_PAD per stream); clear self-KV; reset position. Host f32 fold (per-stream, parallel).
+    pub fn precompute_cross_batch(&mut self, encs: &[Array2<f32>]) {
+        assert_eq!(encs.len(), self.b, "need exactly B={} encoder outputs", self.b);
+        // Fresh per-phase counters for this batch/bucket (so last_steps() == this bucket's dispatches,
+        // O3; and each FUSED_PHASE_TIMING dump is one batch).
+        self.ph = PhaseAcc::default();
+        let mut tmr = Lap::start(self.timing);
+        let stream_elems = N_HEADS * self.t_pad * HEAD_DIM;
+        let w = Rc::clone(&self.w);
+        for (li, lw) in w.layers.iter().enumerate() {
+            let mut kbuf = vec![0f32; self.b * stream_elems];
+            let mut vbuf = vec![0f32; self.b * stream_elems];
+            for (bi, enc) in encs.iter().enumerate() {
+                let t = enc.nrows();
+                assert_eq!(t, self.t_enc, "encoder T_enc {} != ELF {}", t, self.t_enc);
+                // O1: NPU ctx2 GEMM fold when registered (cross_v bias applied NPU-side via Epi::Bias),
+                // else naive host f32 (the 6.36 s/batch fallback).
+                let (kenc, venc) = match &self.cross_ops {
+                    Some(ops) => {
+                        let (ck, cv) = &ops[li];
+                        (apply_tiled_ctxa(ck, enc), apply_tiled_ctxa(cv, enc))
+                    }
+                    None => {
+                        let kenc = enc.dot(&lw.cross_k_w); // [T,768], cross_k bias is zeros
+                        let mut venc = enc.dot(&lw.cross_v_w);
+                        venc += &lw.cross_v_b.view().insert_axis(Axis(0));
+                        (kenc, venc)
+                    }
+                };
+                let base = bi * stream_elems;
+                for tt in 0..t {
+                    let kr = kenc.row(tt);
+                    let vr = venc.row(tt);
+                    for h in 0..N_HEADS {
+                        let dst = base + (h * self.t_pad + tt) * HEAD_DIM;
+                        for d in 0..HEAD_DIM {
+                            kbuf[dst + d] = kr[h * HEAD_DIM + d];
+                            vbuf[dst + d] = vr[h * HEAD_DIM + d];
+                        }
+                    }
+                }
+            }
+            for (name, src) in [(format!("L{li}_Kenc"), &kbuf), (format!("L{li}_Venc"), &vbuf)] {
+                let loc = &self.layout[&name];
+                let bytes = pack_bf16_bytes(src);
+                assert_eq!(bytes.len(), loc.len, "{name}: {} != {}", bytes.len(), loc.len);
+                self.arena.write_at(loc.arena, loc.off, &bytes).unwrap();
+            }
+            self.zero_buf(&format!("L{li}_kcache"));
+            self.zero_buf(&format!("L{li}_vcache"));
+        }
+        self.arena.sync_to_device().unwrap();
+        self.n_self = 0;
+        tmr.lap(&mut self.ph.cross_fold);
+        self.ph.utterances += 1;
+    }
+
+    /// Fresh self-KV for a new prompt (cross-K/V unchanged for this utterance batch).
+    pub fn reset(&mut self) {
+        for li in 0..N_LAYERS {
+            self.zero_buf(&format!("L{li}_kcache"));
+            self.zero_buf(&format!("L{li}_vcache"));
+        }
+        self.arena.sync_to_device().unwrap();
+        self.n_self = 0;
+    }
+
+    /// One lockstep decode step for all B streams. `tokens[bi]` is stream bi's current token; `pos` is
+    /// the shared position (lockstep). Returns B logit vectors [VOCAB].
+    pub fn step_batch(&mut self, tokens: &[i64], pos: usize) -> Vec<Vec<f32>> {
+        assert_eq!(tokens.len(), self.b, "need B={} tokens", self.b);
+        let mut tmr = Lap::start(self.timing);
+        for (bi, &tok) in tokens.iter().enumerate() {
+            let t = tok as usize;
+            let x: Vec<f32> = (0..D)
+                .map(|d| self.w.embed_tokens[[t, d]] + self.w.embed_positions[[pos, d]])
+                .collect();
+            self.write_row("x", bi, &x);
+        }
+        tmr.lap(&mut self.ph.write_x); // B embed lookups + pack + write
+        let n = self.n_self as u32;
+        let kv_val = n.wrapping_mul(self.head_dim);
+        self.res.write_scratchpad(self.kv_off_byte, &kv_val.to_le_bytes()).expect("kv_off");
+        let sm_raw = n + 1;
+        let sm_val = if self.sm_core { sm_raw << 2 } else { sm_raw };
+        self.res.write_scratchpad(self.sm_off_byte, &sm_val.to_le_bytes()).expect("sm_mask");
+        tmr.lap(&mut self.ph.patch); // scratchpad writes
+        self.arena.sync_input().unwrap();
+        tmr.lap(&mut self.ph.sync_in);
+        self.res.dispatch().expect("batched decode dispatch");
+        tmr.lap(&mut self.ph.dispatch);
+        self.arena.sync_from_device().unwrap();
+        tmr.lap(&mut self.ph.sync_out);
+        self.n_self += 1;
+
+        let oloc = &self.layout[&self.output];
+        let row = D * 2;
+        let mut out_bytes = vec![0u8; oloc.len];
+        self.arena.read_at(oloc.arena, oloc.off, &mut out_bytes).unwrap();
+        tmr.lap(&mut self.ph.read_unpack);
+        // O2: batched lm-head. Build LN_all [B,D] (per-stream ln_post), then ONE GEMM
+        // LN_all @ proj_out_w[D,VOCAB] -> logits [B,VOCAB] (ndarray .dot, cache-blocked/SIMD),
+        // replacing the B naive D×VOCAB triple loops. Same f32 math; argmax-identical.
+        let mut ln_all = Array2::<f32>::zeros((self.b, D));
+        for bi in 0..self.b {
+            let x12 = unpack_bf16_bytes(&out_bytes[bi * row..(bi + 1) * row]);
+            let ln = ln_row(&x12[0..D], &self.w.ln_post_w, &self.w.ln_post_b);
+            ln_all.row_mut(bi).assign(&Array1::from_vec(ln));
+        }
+        let logits_mat = ln_all.dot(&self.w.proj_out_w); // [B, VOCAB]
+        let all: Vec<Vec<f32>> = (0..self.b).map(|bi| logits_mat.row(bi).to_vec()).collect();
+        tmr.lap(&mut self.ph.lm_head); // batched ln_post + one proj_out GEMM
+        self.ph.steps += 1;
+        all
+    }
+
+    /// Per-phase batched-decode breakdown (env FUSED_PHASE_TIMING). `steps` = dispatches; each dispatch
+    /// produces B tokens, so per-token figures divide the per-step mean by B.
+    pub fn dump_phase_timing(&self) {
+        if !self.timing || self.ph.steps == 0 {
+            return;
+        }
+        let p = &self.ph;
+        let n = p.steps as f64;
+        let ms = |x: u128| x as f64 / 1e6;
+        let per = |x: u128| ms(x) / n; // mean ms per dispatch (per step = B tokens)
+        let step_sum = p.write_x + p.patch + p.sync_in + p.dispatch + p.sync_out + p.read_unpack + p.lm_head;
+        eprintln!(
+            "[BATCHED_PHASE] B={} steps={} cross_fold_ms={:.2} write_x_ms={:.3} patch_ms={:.3} \
+             sync_in_ms={:.3} dispatch_ms={:.3} sync_out_ms={:.3} read_unpack_ms={:.3} lm_head_ms={:.3} \
+             step_sum_ms_per_dispatch={:.3}  (per-token = /{}; cross_fold once/batch)",
+            self.b, p.steps, ms(p.cross_fold), per(p.write_x), per(p.patch), per(p.sync_in),
+            per(p.dispatch), per(p.sync_out), per(p.read_unpack), per(p.lm_head), ms(step_sum) / n, self.b,
+        );
+        let mut rows = [
+            ("write_x", p.write_x), ("patch", p.patch), ("sync_in", p.sync_in), ("dispatch", p.dispatch),
+            ("sync_out", p.sync_out), ("read_unpack", p.read_unpack), ("lm_head", p.lm_head),
+        ];
+        rows.sort_by(|a, b| b.1.cmp(&a.1));
+        let pct = |x: u128| if step_sum > 0 { 100.0 * x as f64 / step_sum as f64 } else { 0.0 };
+        eprintln!("[BATCHED_PHASE] per-dispatch breakdown (B={} streams/dispatch, mean ms, ranked):", self.b);
+        for (name, v) in rows {
+            eprintln!("  {name:<12} {:>8.3} ms/dispatch  {:>8.4} ms/token  {:>5.1}%", per(v), per(v) / self.b as f64, pct(v));
+        }
+        eprintln!(
+            "  {:<12} {:>8.3} ms/dispatch  {:>8.4} ms/token   (+ {:.1} ms cross_fold/batch over {} streams)",
+            "step_sum", ms(step_sum) / n, (ms(step_sum) / n) / self.b as f64, ms(p.cross_fold), self.b,
+        );
+    }
+}
+
 /// Apply a K=768→768 ctx2 GEMM op to `x` `[M, 768]` (M may exceed PAD_M), row-tiling into chunks of
 /// ≤PAD_M and stacking the `[M, 768]` result in row order. Mirrors `npu_whisper::npu::apply_tiled`
 /// (inlined here to avoid the cfg-gated dependency). Used for the on-NPU cross-K/V fold (lever #2).

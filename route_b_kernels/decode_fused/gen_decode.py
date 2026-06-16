@@ -77,7 +77,14 @@ def main():
     ap.add_argument("--t-enc", type=int, default=1500)
     ap.add_argument("--t-pad", type=int, default=1536)
     ap.add_argument("--seed", type=int, default=9)
+    # lever #3 coalescing toggles — DEFAULT OFF = deep-C baseline (correct). On-device numerics of the
+    # combined coalescing are NOT yet validated (lever3_ab WER 0.996 → broken); these flags isolate which.
+    #   --coalesce-cross : (i) store Venc pre-transposed [H,HD,TP], drop the 12 per-head op_tr_c launches.
+    #   --coalesce-self  : (1) head-batch op_tr_s (num_batches=H), one launch for all H heads.
+    ap.add_argument("--coalesce-cross", action="store_true", help="lever3 (i) cross-V pre-transpose")
+    ap.add_argument("--coalesce-self", action="store_true", help="lever3 (1) batched self-V transpose")
     a = ap.parse_args()
+    co_cross, co_self = a.coalesce_cross, a.coalesce_self
     os.makedirs(os.path.join(a.out, "buffers"), exist_ok=True)
     w, NL, S, P, T, TP = a.weights, a.layers, a.prompt_len, a.num_preceding, a.t_enc, a.t_pad
     scale = 1.0 / np.sqrt(HD)
@@ -104,11 +111,15 @@ def main():
     # Deep-C: the per-token self-softmax mask width is now a runtime `core`-kind scratchpad param
     # (symbol "sm_mask", element units = context_len = n_self) read on-tile, instead of an ELF patch.
     op_sm_s = Softmax(rows=16, cols=S, num_aie_columns=1, num_channels=1, rtp_vector_size=S, mask_scratchpad="sm_mask", context=ctx)
-    op_tr_s = Transpose(M=S, N=HD, num_aie_columns=2, num_channels=1, m=tms, n=tns, s=tss, context=ctx)
+    # lever #3 (1): head-batched self-attn V transpose (num_batches=H, ONE launch for all H heads) when
+    # --coalesce-self; else per-head (num_batches=1) = deep-C baseline. vcache [H,S,HD] contiguous.
+    op_tr_s = Transpose(M=S, N=HD, num_batches=(H if co_self else 1), num_aie_columns=2, num_channels=1, m=tms, n=tns, s=tss, context=ctx)
     op_ct_s = GEMV(M=HD, K=S, num_aie_columns=8, tile_size_input=4, tile_size_output=HD // 8, num_batches=H, context=ctx)
     op_sc_c = GEMV(M=TP, K=HD, num_aie_columns=8, tile_size_input=4, tile_size_output=TP // 8, num_batches=H, context=ctx)
     op_sm_c = Softmax(rows=16, cols=TP, num_aie_columns=1, num_channels=1, rtp_vector_size=T, mask_patch_value=0, context=ctx)
-    op_tr_c = Transpose(M=TP, N=HD, num_aie_columns=2, num_channels=1, m=tmc, n=tnc, s=tsc, context=ctx)
+    # lever #3 (i): when --coalesce-cross, Venc is stored pre-transposed [H,HD,TP] host-side and op_ct_c
+    # reads it directly (no per-token op_tr_c). Else the deep-C per-head transpose (op_tr_c) is used.
+    op_tr_c = None if co_cross else Transpose(M=TP, N=HD, num_aie_columns=2, num_channels=1, m=tmc, n=tnc, s=tsc, context=ctx)
     op_ct_c = GEMV(M=HD, K=TP, num_aie_columns=8, tile_size_input=4, tile_size_output=HD // 8, num_batches=H, context=ctx)
     op_f1 = GEMV(M=FF, K=D, num_aie_columns=8, tile_size_input=4, tile_size_output=FF // 8, context=ctx)
     op_add_ff = ElementwiseAdd(size=FF, tile_size=FF // 8, num_aie_columns=8, context=ctx)
@@ -161,7 +172,9 @@ def main():
                         ("Wco", bf16(Wco.T.copy()).reshape(-1)), ("bco", bf16(bco)),
                         ("Wf1", bf16(mat_f1).reshape(-1)), ("bias_f1", bf16(bias_f1)),
                         ("Wf2", bf16(Wf2.T.copy()).reshape(-1)), ("bf2", bf16(bf2)),
-                        ("Kenc", Kenc_b.reshape(-1)), ("Venc", Venc_b.reshape(-1)),
+                        ("Kenc", Kenc_b.reshape(-1)),
+                        # (i): pre-transpose Venc to [H,HD,TP] when coalescing cross; else [H,TP,HD] (deep-C).
+                        ("Venc", (Venc_b.transpose(0, 2, 1).copy() if co_cross else Venc_b).reshape(-1)),
                         ("kcache", kc.reshape(-1)), ("vcache", vc.reshape(-1))]:
             weights_to_write[pre + nm] = arr
         patch_offsets_names += [pre + "kcache", pre + "vcache"]
@@ -169,25 +182,33 @@ def main():
         bufsz.update({
             pre + "qkv": QKV * 2, pre + "kcache": H * S * HD * 2, pre + "vcache": H * S * HD * 2, pre + "vcT": H * S * HD * 2,
             pre + "scs": 16 * S * 2, pre + "sws": 16 * S * 2,
-            pre + "Kenc": H * TP * HD * 2, pre + "Venc": H * TP * HD * 2, pre + "vcTc": H * TP * HD * 2,
+            pre + "Kenc": H * TP * HD * 2, pre + "Venc": H * TP * HD * 2,
             pre + "scc": 16 * TP * 2, pre + "swc": 16 * TP * 2,
         })
+        if not co_cross:  # cross-V transpose output buffer only when NOT pre-transposing Venc
+            bufsz[pre + "vcTc"] = H * TP * HD * 2
 
         nxt = f"x{l+1}"  # layer output residual buffer
+        # (1) self-V transpose: one batched launch (--coalesce-self) or H per-head launches (deep-C).
+        self_tr = ([(op_tr_s, pre + "vcache", pre + "vcT")] if co_self else
+                   [(op_tr_s, f"{pre}vcache[{h*phs}:{(h+1)*phs}]", f"{pre}vcT[{h*phs}:{(h+1)*phs}]") for h in range(H)])
+        # (i) cross-V: op_ct_c reads pre-transposed Venc directly (--coalesce-cross), or H per-head op_tr_c.
+        cross_tr = ([(op_ct_c, pre + "Venc", f"{pre}swc[0:{HSc}]", pre + "ctc")] if co_cross else
+                    [(op_tr_c, f"{pre}Venc[{h*phc}:{(h+1)*phc}]", f"{pre}vcTc[{h*phc}:{(h+1)*phc}]") for h in range(H)]
+                    + [(op_ct_c, pre + "vcTc", f"{pre}swc[0:{HSc}]", pre + "ctc")])
         rl += [
             (op_ln, cur, pre + "xn_s"),
             (op_qkv, pre + "Wqkv", pre + "xn_s", pre + "qkv"), (op_add_qkv, pre + "qkv", pre + "bias_qkv", pre + "qkv"),
             (op_sck, pre + "qkv[1536:3072]", pre + "kcache"), (op_scv, pre + "qkv[3072:4608]", pre + "vcache"),
             (op_sc_s, pre + "kcache", pre + "qkv[0:1536]", f"{pre}scs[0:{HSs}]"), (op_sm_s, pre + "scs", pre + "sws"),
-        ] + [(op_tr_s, f"{pre}vcache[{h*phs}:{(h+1)*phs}]", f"{pre}vcT[{h*phs}:{(h+1)*phs}]") for h in range(H)] + [
+        ] + self_tr + [
             (op_ct_s, pre + "vcT", f"{pre}sws[0:{HSs}]", pre + "cts"),
             (op_proj, pre + "Wso", pre + "cts", pre + "asf"), (op_add768, pre + "asf", pre + "bso", pre + "asf"),
             (op_add768, cur, pre + "asf", pre + "x1"),
             (op_ln, pre + "x1", pre + "xn_c"),
             (op_proj, pre + "Wcq", pre + "xn_c", pre + "qc"), (op_add768, pre + "qc", pre + "bias_cq", pre + "qc"),
             (op_sc_c, pre + "Kenc", pre + "qc", f"{pre}scc[0:{HSc}]"), (op_sm_c, pre + "scc", pre + "swc"),
-        ] + [(op_tr_c, f"{pre}Venc[{h*phc}:{(h+1)*phc}]", f"{pre}vcTc[{h*phc}:{(h+1)*phc}]") for h in range(H)] + [
-            (op_ct_c, pre + "vcTc", f"{pre}swc[0:{HSc}]", pre + "ctc"),
+        ] + cross_tr + [
             (op_proj, pre + "Wco", pre + "ctc", pre + "acf"), (op_add768, pre + "acf", pre + "bco", pre + "acf"),
             (op_add768, pre + "x1", pre + "acf", pre + "x2"),
             (op_ln, pre + "x2", pre + "xn_f"),

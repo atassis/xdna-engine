@@ -40,6 +40,20 @@ struct BufEntry {
 }
 
 #[derive(Deserialize)]
+struct ParamSpec {
+    byte_offset: usize,
+    kind: String,
+}
+
+#[derive(Deserialize)]
+struct ScratchpadSpec {
+    params: HashMap<String, ParamSpec>,
+    kv_param: String,
+    mask_param: String,
+    head_dim: u32,
+}
+
+#[derive(Deserialize)]
 struct Meta {
     elf: String,
     input_size: usize,
@@ -51,6 +65,8 @@ struct Meta {
     output: String,
     #[serde(default)]
     patch: Option<PatchSpec>,
+    #[serde(default)]
+    scratchpad: Option<ScratchpadSpec>,
 }
 
 impl Meta {
@@ -114,13 +130,36 @@ fn main() {
     );
 
     let dev = Device::open(0).expect("open NPU (stop npu-asr.service/voxd.service first)");
-    let kern = dev
-        .load_elf_kernel(&elf, Some("main:sequence"))
-        .expect("load_elf_kernel — the make-or-break call");
-    println!("  load_elf_kernel OK");
+
+    // Resident-scratchpad mode (deep-C): set PROBE_POS=<pos> to drive a scratchpad ELF (kv_off/sm_mask)
+    // at decode position `pos` (current token at pos, context pos+1). Used to gate the batched decode ELF.
+    let resident_pos: Option<u32> = std::env::var("PROBE_POS").ok().and_then(|s| s.parse().ok());
+    let use_resident = resident_pos.is_some() && meta.scratchpad.is_some();
 
     let arena = FusedArena::new(&dev, meta.input_size, meta.output_size, meta.scratch_size)
         .expect("alloc arenas");
+
+    // open kernel / resident handle
+    let kern = if use_resident {
+        None
+    } else {
+        let k = dev
+            .load_elf_kernel(&elf, Some("main:sequence"))
+            .expect("load_elf_kernel — the make-or-break call");
+        println!("  load_elf_kernel OK");
+        Some(k)
+    };
+    let resident = if use_resident {
+        let res = dev
+            .open_elf_resident(&elf, Some("main:sequence"))
+            .expect("open_elf_resident (scratchpad ELF)");
+        arena.bind_resident(&res).expect("bind resident arena BOs");
+        println!("  open_elf_resident OK (PROBE_POS={})", resident_pos.unwrap());
+        Some(res)
+    } else {
+        None
+    };
+
     // Place every input + resident weight buffer by NAME from buffers/<name>.bin.
     for name in meta.inputs.iter().chain(meta.weights.iter()) {
         let (a, off, len) = meta.arena_of(name);
@@ -130,16 +169,31 @@ fn main() {
     }
     arena.sync_to_device().unwrap();
 
-    arena.dispatch(&kern).expect("fused ELF dispatch");
-    println!("  dispatch OK");
+    if let Some(res) = &resident {
+        let pos = resident_pos.unwrap();
+        let sp = meta.scratchpad.as_ref().unwrap();
+        let kv = &sp.params[&sp.kv_param];
+        let sm = &sp.params[&sp.mask_param];
+        let kv_val: u32 = pos * sp.head_dim; // addr-kind: raw element offset
+        let sm_raw: u32 = pos + 1; // context length
+        let sm_val: u32 = if sm.kind == "core" { sm_raw << 2 } else { sm_raw };
+        res.write_scratchpad(kv.byte_offset, &kv_val.to_le_bytes()).unwrap();
+        res.write_scratchpad(sm.byte_offset, &sm_val.to_le_bytes()).unwrap();
+        res.dispatch().expect("resident scratchpad dispatch");
+        println!("  resident dispatch OK (kv_off={kv_val} sm_mask={sm_val})");
+    } else {
+        arena.dispatch(kern.as_ref().unwrap()).expect("fused ELF dispatch");
+        println!("  dispatch OK");
+    }
     arena.sync_from_device().unwrap();
 
     // FUSED_TIME: measure the per-token NPU costs (vs per-dispatch-floor 0.35ms, M1 decode ~200ms/tok,
     // CPU ONNX ~50-82ms/tok). Times: (a) ELF re-registration (load_elf_kernel of the whole ELF), the
     // suspected dominant per-token host cost; (b) dispatch alone (reusing one kernel); (c) the full
     // per-token sequence patch→reload→sync_input→dispatch→sync_out.
-    if std::env::var("FUSED_TIME").is_ok() {
+    if std::env::var("FUSED_TIME").is_ok() && kern.is_some() {
         use std::time::Instant;
+        let kern = kern.as_ref().unwrap();
         let warmup = 3usize;
         let iters = 20usize;
         // (a) re-registration
@@ -148,9 +202,9 @@ fn main() {
         for _ in 0..iters { let _ = dev.load_elf_kernel(&elf, Some("main:sequence")).unwrap(); }
         let reg_ms = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
         // (b) dispatch alone
-        for _ in 0..warmup { arena.dispatch(&kern).unwrap(); }
+        for _ in 0..warmup { arena.dispatch(kern).unwrap(); }
         let t = Instant::now();
-        for _ in 0..iters { arena.dispatch(&kern).unwrap(); }
+        for _ in 0..iters { arena.dispatch(kern).unwrap(); }
         let disp_ms = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
         // (c) full per-token (patch host buffer + reload + sync_input + dispatch + sync_out)
         let base = read(&dir.join(&meta.elf));
