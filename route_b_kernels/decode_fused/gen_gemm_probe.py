@@ -64,6 +64,10 @@ def main():
     ap.add_argument("--tile-n", type=int, default=16)  # bf16 vectorized mm.cc needs tile_n % 16 == 0
     ap.add_argument("--num-cols", type=int, default=1)
     ap.add_argument("--seed", type=int, default=11)
+    ap.add_argument("--fuse-residual", action="store_true",
+                    help="O7 (KILLED — 2-input-DMA-channel wall): preload C with a residual input")
+    ap.add_argument("--m-stationary", action="store_true",
+                    help="O6: M-stationary dataflow (columns split M, B broadcast) -> all 32 cores at skinny N")
     args = ap.parse_args()
     M, K, N = args.M, args.K, args.N
     os.makedirs(os.path.join(args.out, "buffers"), exist_ok=True)
@@ -77,29 +81,43 @@ def main():
 
     rng = np.random.default_rng(args.seed)
     X = bf16(rng.standard_normal((K, N)).astype(np.float32))  # [K, N] activation (N token-columns)
+    R = bf16(rng.standard_normal((M, N)).astype(np.float32)) if args.fuse_residual else None  # [M,N] residual
 
     ctx = AIEContext()
-    gemm = GEMM(
+    gemm_kw = dict(
         M=M, K=K, N=N,
         tile_m=args.tile_m, tile_k=args.tile_k, tile_n=args.tile_n,
         num_aie_columns=args.num_cols,
         context=ctx,
     )
-    runlist = [(gemm, "W", "X", "out")]  # A=W[M,K], B=X[K,N], C=out[M,N]
-    fused = FusedMLIROperator("gemmprobe", runlist, input_args=["X"], output_args=["out"], context=ctx)
+    if args.m_stationary:
+        gemm_kw["m_stationary"] = True
+    if args.fuse_residual:
+        gemm_kw["fuse_residual"] = True
+    gemm = GEMM(**gemm_kw)
+    if args.fuse_residual:
+        runlist = [(gemm, "W", "X", "R", "out")]  # A=W, B=X, RESID=R, C=out
+        in_args = ["X", "R"]
+    else:
+        runlist = [(gemm, "W", "X", "out")]  # A=W[M,K], B=X[K,N], C=out[M,N]
+        in_args = ["X"]
+    fused = FusedMLIROperator("gemmprobe", runlist, input_args=in_args, output_args=["out"], context=ctx)
     fused.compile()
 
     elf_bytes = load_elf(fused).view(np.uint8).tobytes()
     in_sz, out_sz, scratch_sz = fused.buffer_sizes
-    names = ("X", "out", "W")
+    names = ("X", "out", "W") + (("R",) if args.fuse_residual else ())
     lay = {n: fused.get_layout_for_buffer(n) for n in names}
     print(f"GEMM M={M} K={K} N={N} (tile {args.tile_m}x{args.tile_k}x{args.tile_n}, cols={args.num_cols})")
     print("buffer_sizes (in,out,scratch) =", fused.buffer_sizes)
     for n, v in lay.items():
         print(f"  {n}: type={v[0]} off={int(v[1])} len={int(v[2])}")
 
-    # device-faithful golden: out = W @ X in bf16 (same dataflow precision the device runs)
-    out_g = bf16(W.astype(np.float32) @ X.astype(np.float32))  # [M, N]
+    # device-faithful golden: out = W @ X (+ residual) in bf16 (same dataflow precision the device runs)
+    out_g = W.astype(np.float32) @ X.astype(np.float32)  # [M, N]
+    if args.fuse_residual:
+        out_g = out_g + R.astype(np.float32)  # O7: C = residual + W@X
+    out_g = bf16(out_g)
 
     def wbuf(name, vals):
         with open(os.path.join(args.out, "buffers", f"{name}.bin"), "wb") as f:
@@ -107,6 +125,8 @@ def main():
 
     wbuf("W", W.reshape(-1))
     wbuf("X", X.reshape(-1))
+    if args.fuse_residual:
+        wbuf("R", R.reshape(-1))
     wbuf("out", out_g.reshape(-1))
     with open(os.path.join(args.out, "gemmprobe.elf"), "wb") as f:
         f.write(elf_bytes)
@@ -119,7 +139,7 @@ def main():
         "output_size": int(out_sz),
         "scratch_size": int(scratch_sz),
         "layout": {n: {"type": v[0], "offset": int(v[1]), "len": int(v[2])} for n, v in lay.items()},
-        "inputs": ["X"],
+        "inputs": in_args,
         "weights": ["W"],
         "output": "out",
         "dims": {"M": M, "K": K, "N": N, "layer": L, "weight_bytes": weight_bytes},

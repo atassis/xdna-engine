@@ -87,7 +87,7 @@ def main():
     ap.add_argument("--scratchpad", action="store_true", help="deep-C runtime kv_off/sm_mask params (engine mode)")
     ap.add_argument("--engine-only", action="store_true", help="skip golden + per-utterance buffers (engine fills Kenc/Venc/kcache); fast/lean build for the host driver")
     ap.add_argument("--P", type=int, default=-1, help="prefilled self positions (default S-1); current token at pos P")
-    ap.add_argument("--occ", action="store_true", help="O18: spread the 1-column softmaxes/transposes across more cores (sm 1->8, tr_c 1->8, tr_s 1->4) — fills the array residual that stays at 4/32 cores even at B>=128")
+    ap.add_argument("--occ", action="store_true", help="O18: spread the 1-column softmaxes/transposes across more cores (sm 1->8, tr_s 1->2, tr_c 1->2; transposes cap at 2 clean s=8 cols since N=HD=64) — fills the array residual that stays at 4/32 cores even at B>=128")
     ap.add_argument("--seed", type=int, default=9)
     a = ap.parse_args()
     B, NL, S, T = a.B, a.layers, a.S, a.T

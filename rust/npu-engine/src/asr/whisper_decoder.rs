@@ -1125,6 +1125,7 @@ pub struct BatchedFusedDecoder {
     layout: HashMap<String, BufLoc>,
     output: String, // e.g. "x12"
     b: usize,       // batch width (streams)
+    nl: usize,      // layer count from meta.dims.layers (12 for prod; <12 for build-cheap perf-probe ELFs)
     t_enc: usize,
     t_pad: usize,
     n_self: usize,
@@ -1156,6 +1157,7 @@ impl BatchedFusedDecoder {
         let (in_sz, out_sz, scr_sz) = (usz("input_size"), usz("output_size"), usz("scratch_size"));
         let output = meta["output"].as_str().expect("output").to_string();
         let b = meta["dims"]["B"].as_u64().expect("dims.B") as usize;
+        let nl = meta["dims"]["layers"].as_u64().unwrap_or(N_LAYERS as u64) as usize;
         let t_enc = meta["dims"]["T"].as_u64().expect("dims.T") as usize;
         let t_pad = ((t_enc + 63) / 64) * 64;
 
@@ -1206,6 +1208,7 @@ impl BatchedFusedDecoder {
                 let ops: Vec<(CtxAOp, CtxAOp)> = w
                     .layers
                     .iter()
+                    .take(nl) // only the nl layers this ELF uses (avoids wasted weight uploads on perf-probe ELFs)
                     .map(|lw| {
                         let ck = CtxAOp::new(sh.clone(), &lw.cross_k_w, D, Epi::None, &[]);
                         let cv = CtxAOp::new(
@@ -1227,7 +1230,7 @@ impl BatchedFusedDecoder {
             }
         };
         BatchedFusedDecoder {
-            w, arena, layout, output, b, t_enc, t_pad, n_self: 0, res, kv_off_byte, sm_off_byte, sm_core, head_dim,
+            w, arena, layout, output, b, nl, t_enc, t_pad, n_self: 0, res, kv_off_byte, sm_off_byte, sm_core, head_dim,
             timing, ph: PhaseAcc::default(), cross_ops,
         }
     }
@@ -1266,7 +1269,7 @@ impl BatchedFusedDecoder {
         let mut tmr = Lap::start(self.timing);
         let stream_elems = N_HEADS * self.t_pad * HEAD_DIM;
         let w = Rc::clone(&self.w);
-        for (li, lw) in w.layers.iter().enumerate() {
+        for (li, lw) in w.layers.iter().take(self.nl).enumerate() {
             let mut kbuf = vec![0f32; self.b * stream_elems];
             let mut vbuf = vec![0f32; self.b * stream_elems];
             for (bi, enc) in encs.iter().enumerate() {
@@ -1316,7 +1319,7 @@ impl BatchedFusedDecoder {
 
     /// Fresh self-KV for a new prompt (cross-K/V unchanged for this utterance batch).
     pub fn reset(&mut self) {
-        for li in 0..N_LAYERS {
+        for li in 0..self.nl {
             self.zero_buf(&format!("L{li}_kcache"));
             self.zero_buf(&format!("L{li}_vcache"));
         }

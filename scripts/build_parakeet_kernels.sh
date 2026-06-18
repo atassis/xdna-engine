@@ -22,7 +22,7 @@ rm -f $MMW/build/mm_64x32x128.o
 for N in 1024 2048 4096; do
   rm -f $MMW/build/aie_512x1024x${N}_64x32x128_8c.mlir
   echo "== FAST BFP16 512x1024x${N} 64x32x128 8c =="
-  WA_C_DEPTH=1 make -C $MMW NPU2=1 M=512 K=1024 N="$N" m=64 k=32 n=128 \
+  WA_C_DEPTH=1 make -C $MMW AIECC_JOBS="${AIECC_JOBS:-0}" NPU2=1 M=512 K=1024 N="$N" m=64 k=32 n=128 \
      dtype_in=bf16 dtype_out=f32 n_aie_cols=8 use_iron=1 \
      emulate_bfloat16_mmul_with_bfp16=1 bfp16_iree=1 \
      build/final_512x1024x${N}_64x32x128_8c.xclbin
@@ -32,7 +32,7 @@ done
 rm -f $MMW/build/mm_32x32x32.o
 for N in 1024 2048 4096; do
   echo "== NATIVE bf16 512x1024x${N} 32x32x32 8c =="
-  make -C $MMW NPU2=1 M=512 K=1024 N="$N" dtype_in=bf16 dtype_out=f32 n_aie_cols=8 use_iron=1 \
+  make -C $MMW AIECC_JOBS="${AIECC_JOBS:-0}" NPU2=1 M=512 K=1024 N="$N" dtype_in=bf16 dtype_out=f32 n_aie_cols=8 use_iron=1 \
        build/final_512x1024x${N}_32x32x32_8c.xclbin
 done
 echo "Built Parakeet resident xclbins + per-N instruction streams (fast + native tiles)."

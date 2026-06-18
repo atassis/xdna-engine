@@ -39,6 +39,18 @@ if [ -f "$GEMM_PATCH" ]; then
   fi
 fi
 
+# O6: M-stationary GEMM mode (backward-compat — default N-stationary unchanged). Needed for
+# --m-stationary builds; harmless otherwise. Applies after fusion-prefix (both touch gemm/design.py).
+MSTAT_PATCH="$REPO/route_b_kernels/patches/iron-gemm-mstationary.patch"
+if [ -f "$MSTAT_PATCH" ]; then
+  if git -C "$IRON" apply --reverse --check "$MSTAT_PATCH" >/dev/null 2>&1; then
+    echo "[build] iron-gemm-mstationary patch already applied"
+  else
+    echo "[build] applying iron-gemm-mstationary patch"
+    git -C "$IRON" apply "$MSTAT_PATCH"
+  fi
+fi
+
 export PATH="$VENV_IRON/bin:$VENV_IRON/cc-shim:$AIEBU_DIR:$PATH"
 export PEANO_INSTALL_DIR="$VENV_IRON/lib/python3.14/site-packages/llvm-aie"
 export PYTHONPATH="$IRON:$(dirname "$GEN")${PYTHONPATH:+:$PYTHONPATH}"
@@ -48,7 +60,7 @@ for N in $NS; do
   WORK="$(mktemp -d)"   # amd/IRON writes build/ intermediates under CWD
   mkdir -p "$OUT"
   echo "=== building GEMM probe N=$N cols=$NUM_COLS -> $OUT (work=$WORK) ==="
-  ( cd "$WORK" && "$VENV_IRON/bin/python" "$GEN" --weights "$WEIGHTS" --N "$N" --num-cols "$NUM_COLS" --tile-n "$TILE_N" --out "$OUT" )
+  ( cd "$WORK" && "$VENV_IRON/bin/python" "$GEN" --weights "$WEIGHTS" --N "$N" --num-cols "$NUM_COLS" --tile-n "$TILE_N" --out "$OUT" ${TILE_M:+--tile-m "$TILE_M"} ${FUSE_RESIDUAL:+--fuse-residual} ${M_STATIONARY:+--m-stationary} )
   rm -rf "$WORK"
   echo "    elf=$(du -h "$OUT/gemmprobe.elf" | cut -f1)"
 done

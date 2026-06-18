@@ -1,0 +1,1191 @@
+diff --git a/tools/aiecc/aiecc.cpp b/tools/aiecc/aiecc.cpp
+--- a/tools/aiecc/aiecc.cpp
++++ b/tools/aiecc/aiecc.cpp
+@@ -46,6 +46,7 @@
+ #include "llvm/Support/Path.h"
+ #include "llvm/Support/Process.h"
+ #include "llvm/Support/Program.h"
++#include "llvm/Support/SHA256.h"
+ #include "llvm/Support/SourceMgr.h"
+ #include "llvm/Support/ToolOutputFile.h"
+ #include "llvm/Support/raw_ostream.h"
+@@ -90,6 +91,8 @@
+ 
+ #include "aie/Target/LLVMIR/Dialect/XLLVM/XLLVMToLLVMIRTranslation.h"
+ 
++#include "llvm/ADT/StringExtras.h"
++#include "llvm/ADT/StringMap.h"
+ #include "llvm/IR/Module.h"
+ 
+ // Optional library integrations for direct calls instead of subprocess
+@@ -2056,6 +2059,509 @@
+   return success();
+ }
+ 
++// -------------------------------------------------------------------------
++// Kernel-cache dedup instrumentation + structural cache key
++// -------------------------------------------------------------------------
++// Phase-time accumulators (milliseconds, summed across all per-core threads).
++// Used by the -v phase-split report (Task 1 Step 2 of the kernel-cache plan).
++// Atomic doubles via compare-exchange (no std::atomic<double> fetch_add pre-C++20
++// in a portable way; this is fine for low-contention summation).
++static std::atomic<long long> g_phaseLowerNs{0};
++static std::atomic<long long> g_phaseTranslateNs{0};
++static std::atomic<long long> g_phaseOptNs{0};
++static std::atomic<long long> g_phaseLlcNs{0};
++static std::atomic<long long> g_phaseLinkNs{0};
++static std::atomic<long long> g_phaseRenameNs{0};
++static std::atomic<int> g_coresFull{0};
++static std::atomic<int> g_coresDerived{0};
++
++using Clock = std::chrono::steady_clock;
++static inline long long elapsedNs(Clock::time_point t0) {
++  return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - t0)
++      .count();
++}
++
++// Mask tile-specific symbol *indices* so structurally-identical cores hash to
++// the same key. Ports the EXACT masking the validated premise used
++// ([[aiecc-kernel-cache-dedup-validated]]): replace digit-runs ONLY inside
++// @-symbol tokens, preserving bare immediates/sizes outside symbols (so a
++// folded tile-address would still show as a bare-int diff -> different key ->
++// compiled separately = safe by construction). Also normalize the
++// `core_<col>_<row>` and `_anonymousN` / `in0_N` / `out0_N` suffix indices,
++// which are all part of @-symbol names and thus already covered by the
++// inside-@-symbol digit masking.
++static std::string maskTileSymbols(llvm::StringRef s) {
++  std::string out;
++  out.reserve(s.size());
++  size_t i = 0, n = s.size();
++  auto isSymChar = [](char c) {
++    return std::isalnum((unsigned char)c) || c == '_' || c == '.' || c == '$';
++  };
++  while (i < n) {
++    char c = s[i];
++    if (c == '@' || c == '%') {
++      // Start of an LLVM symbol/value name (global @ or local %). Emit the
++      // sigil, then copy the identifier with every maximal digit-run replaced
++      // by a single 'N' placeholder. Quoted names (@"...") are handled by
++      // copying through the quotes but still masking digits inside.
++      out.push_back(c);
++      i++;
++      bool quoted = (i < n && s[i] == '"');
++      if (quoted) {
++        out.push_back(s[i]);
++        i++;
++        while (i < n && s[i] != '"') {
++          if (std::isdigit((unsigned char)s[i])) {
++            out.push_back('N');
++            while (i < n && std::isdigit((unsigned char)s[i]))
++              i++;
++          } else {
++            out.push_back(s[i]);
++            i++;
++          }
++        }
++        if (i < n && s[i] == '"') {
++          out.push_back('"');
++          i++;
++        }
++      } else {
++        while (i < n && isSymChar(s[i])) {
++          if (std::isdigit((unsigned char)s[i])) {
++            out.push_back('N');
++            while (i < n && std::isdigit((unsigned char)s[i]))
++              i++;
++          } else {
++            out.push_back(s[i]);
++            i++;
++          }
++        }
++      }
++    } else {
++      out.push_back(c);
++      i++;
++    }
++  }
++  return out;
++}
++
++// Extract the single `aie.core(%tile_C_R) { ... }` block from a per-core slice
++// module string (brace-matched). The slice has exactly ONE core (others were
++// erased), so we key/rename on the CORE BODY ONLY — NOT the whole slice. The
++// device shell (tiles/buffers/locks/objectfifos/runtime-seq) is kept identically
++// in every slice of a device but the per-core lock/anon-buffer declarations are
++// emitted ADJACENT to each core, so erasing different other-cores shifts shell
++// line POSITIONS even though the content is identical. Keying on the full slice
++// would therefore hash position noise and defeat the dedup (observed: 32 GEMM
++// tiles -> 32 "unique" instead of 1). The core body alone is position-stable and
++// fully determines the compiled .opt.ll (the body references shell symbols by
++// name, which the masking normalizes). Returns the body substring, or the whole
++// input if no core block is found (defensive -> distinct key -> full compile).
++static llvm::StringRef extractCoreBody(llvm::StringRef moduleStr) {
++  size_t anchor = moduleStr.find("aie.core(");
++  if (anchor == llvm::StringRef::npos)
++    return moduleStr;
++  // Back up to the start of the line so the `%core_C_R = ` SSA result (the core
++  // function name, which becomes @core_C_R in the .opt.ll and MUST be renamed)
++  // is included in the body substring.
++  size_t p = moduleStr.rfind('\n', anchor);
++  p = (p == llvm::StringRef::npos) ? 0 : p + 1;
++  // Find the opening brace of the core body.
++  size_t brace = moduleStr.find('{', anchor);
++  if (brace == llvm::StringRef::npos)
++    return moduleStr;
++  int depth = 0;
++  size_t i = brace;
++  for (; i < moduleStr.size(); ++i) {
++    if (moduleStr[i] == '{')
++      depth++;
++    else if (moduleStr[i] == '}') {
++      depth--;
++      if (depth == 0) {
++        ++i; // include closing brace
++        break;
++      }
++    }
++  }
++  return moduleStr.substr(p, i - p);
++}
++
++// SHA256 hex of the masked CORE BODY = the structural cache key.
++static std::string coreStructuralKey(llvm::StringRef moduleStr) {
++  std::string masked = maskTileSymbols(extractCoreBody(moduleStr));
++  llvm::SHA256 hasher;
++  hasher.update(llvm::ArrayRef<uint8_t>(
++      reinterpret_cast<const uint8_t *>(masked.data()), masked.size()));
++  return llvm::toHex(hasher.final(), /*LowerCase=*/true);
++}
++
++// True if c can appear inside an LLVM @/% identifier (unquoted form).
++static inline bool isLLVMIdentChar(char c) {
++  return std::isalnum((unsigned char)c) || c == '_' || c == '.' || c == '$';
++}
++
++// Return the substring of `moduleStr` spanning the `aie.device(...) @<name> {
++// ... }` block (brace-matched). The per-core slice keeps the WHOLE module (all
++// devices share tile coords like (0,2)), so symbol/tile scans MUST be scoped to
++// the relevant device to avoid matching another device's identically-numbered
++// tile. Returns the whole module if the device is not found (defensive).
++static llvm::StringRef deviceBlock(llvm::StringRef moduleStr,
++                                   llvm::StringRef deviceName) {
++  // Anchor on `@<deviceName> {` (the device symbol). deviceName is the bare
++  // symbol (e.g. "op1_GEMM"); the printed form is `aie.device(npu2) @op1_GEMM {`.
++  std::string anchor = "@" + deviceName.str();
++  size_t a = moduleStr.find(anchor);
++  if (a == llvm::StringRef::npos)
++    return moduleStr;
++  size_t brace = moduleStr.find('{', a);
++  if (brace == llvm::StringRef::npos)
++    return moduleStr;
++  int depth = 0;
++  size_t i = brace;
++  for (; i < moduleStr.size(); ++i) {
++    if (moduleStr[i] == '{')
++      depth++;
++    else if (moduleStr[i] == '}') {
++      depth--;
++      if (depth == 0) {
++        ++i;
++        break;
++      }
++    }
++  }
++  return moduleStr.substr(a, i - a);
++}
++
++// Enumerate, in DECLARATION ORDER, the sym_names of every aie.buffer / aie.lock
++// bound to a given tile WITHIN the named device block. These are exactly the
++// tile-specific globals that survive into the per-core .opt.ll (after DCE keeps
++// only this core's). Declaration order is identical across tiles of the same
++// kernel (same objectfifo wiring), so positionally pairing rep-tile's list with
++// target-tile's list yields the rename map.
++static void collectTileSymbols(llvm::StringRef moduleStr,
++                               llvm::StringRef deviceName, int col, int row,
++                               llvm::SmallVectorImpl<std::string> &syms) {
++  llvm::StringRef scope = deviceBlock(moduleStr, deviceName);
++  std::string tileTok = "%tile_" + std::to_string(col) + "_" +
++                        std::to_string(row);
++  llvm::SmallVector<llvm::StringRef, 0> lines;
++  scope.split(lines, '\n');
++  for (llvm::StringRef line : lines) {
++    // Match: <ws> %NAME = aie.buffer(%tile_C_R ...   OR  %NAME = aie.lock(%tile_C_R ...
++    llvm::StringRef t = line.ltrim();
++    if (!t.starts_with("%"))
++      continue;
++    size_t eq = t.find(" = aie.");
++    if (eq == llvm::StringRef::npos)
++      continue;
++    llvm::StringRef rhs = t.substr(eq + 3); // skip " = " -> points at "aie...."
++    if (!(rhs.starts_with("aie.buffer(") || rhs.starts_with("aie.lock(")))
++      continue;
++    // The tile operand must be EXACTLY this tile (tileTok followed by ',' or ')').
++    size_t tp = rhs.find(tileTok);
++    if (tp == llvm::StringRef::npos)
++      continue;
++    char after = (tp + tileTok.size() < rhs.size()) ? rhs[tp + tileTok.size()]
++                                                    : '\0';
++    if (after != ',' && after != ')')
++      continue; // avoid %tile_1_2 matching %tile_1_20
++    // Extract the LHS bare name (between % and " =").
++    llvm::StringRef name = t.substr(1, eq - 1);
++    syms.push_back(name.str());
++  }
++}
++
++// Build a bare-identifier rename map (repIdent -> targetIdent) for deriving the
++// target core's .opt.ll from the representative's. Two symbol classes:
++//   1. The core/tile names: core_<C>_<R>, tile_<C>_<R> (direct from coords).
++//   2. The per-tile buffer/lock globals: enumerated per-tile from each slice's
++//      shell (collectTileSymbols) and paired positionally. We can NOT recover
++//      these from the pre-lowering CORE BODY alone, because the body references
++//      object FIFOs generically and the concrete buffer symbol is chosen during
++//      per-(col,row) lowering — so the body text differs only in core/tile names
++//      across same-kernel tiles. The shell, however, names every buffer with its
++//      tile, so the shell is the cheap source of the concrete rename.
++// Safety: positional pairing is validated by requiring the masked forms to match
++// (maskTileSymbols(rep[i]) == maskTileSymbols(tgt[i])) and the counts to be
++// equal; any mismatch -> failure -> caller falls back to a full compile.
++static LogicalResult buildRenameMap(llvm::StringRef repModule,
++                                    llvm::StringRef tgtModule,
++                                    llvm::StringRef deviceName, int repCol,
++                                    int repRow, int tgtCol, int tgtRow,
++                                    llvm::StringMap<std::string> &renameMap) {
++  // 1. core/tile direct renames.
++  auto add = [&](const std::string &from, const std::string &to) -> bool {
++    auto it = renameMap.find(from);
++    if (it != renameMap.end())
++      return it->second == to;
++    renameMap[from] = to;
++    return true;
++  };
++  std::string repCR = std::to_string(repCol) + "_" + std::to_string(repRow);
++  std::string tgtCR = std::to_string(tgtCol) + "_" + std::to_string(tgtRow);
++  if (!add("core_" + repCR, "core_" + tgtCR))
++    return failure();
++  if (!add("tile_" + repCR, "tile_" + tgtCR))
++    return failure();
++
++  // 2. per-tile buffer/lock globals, paired positionally with masked-form check.
++  llvm::SmallVector<std::string, 32> repSyms, tgtSyms;
++  collectTileSymbols(repModule, deviceName, repCol, repRow, repSyms);
++  collectTileSymbols(tgtModule, deviceName, tgtCol, tgtRow, tgtSyms);
++  if (repSyms.size() != tgtSyms.size())
++    return failure();
++  for (size_t i = 0; i < repSyms.size(); ++i) {
++    // Structural sanity: the i-th symbol of each tile must be the same KIND
++    // (same name modulo indices), else the lists are misaligned.
++    if (maskTileSymbols("%" + repSyms[i]) != maskTileSymbols("%" + tgtSyms[i]))
++      return failure();
++    if (!add(repSyms[i], tgtSyms[i]))
++      return failure();
++  }
++  return success();
++}
++
++// Apply a bare-identifier rename map to one line of LLVM IR, renaming whole
++// @<ident> / %<ident> identifier tokens only (never substrings, never literals).
++static std::string applyRenameToLine(llvm::StringRef line,
++                                     const llvm::StringMap<std::string> &m) {
++  std::string out;
++  out.reserve(line.size() + 16);
++  size_t i = 0, n = line.size();
++  while (i < n) {
++    char c = line[i];
++    if (c == '@' || c == '%') {
++      // Quoted identifiers: leave as-is (rare; our tile symbols are unquoted).
++      if (i + 1 < n && line[i + 1] == '"') {
++        out.push_back(c);
++        i++;
++        continue;
++      }
++      size_t start = i + 1;
++      size_t j = start;
++      while (j < n && isLLVMIdentChar(line[j]))
++        j++;
++      llvm::StringRef ident = line.substr(start, j - start);
++      auto it = m.find(ident);
++      out.push_back(c);
++      if (it != m.end())
++        out.append(it->second);
++      else
++        out.append(ident.str());
++      i = j;
++    } else {
++      out.push_back(c);
++      i++;
++    }
++  }
++  return out;
++}
++
++// Generate the per-core linker script from the PRE-LOWERING module (the slice).
++// Factored out of compileCore so the kernel-cache derive path (deriveCore) and
++// the full-compile path share ONE ld.script code path (byte-identical link).
++static LogicalResult genLdScriptForCore(ModuleOp moduleOp, StringRef deviceName,
++                                        const CoreInfo &core,
++                                        StringRef tmpDirName,
++                                        StringRef ldScriptPath) {
++  // Clone the pre-lowering module for ldscript generation. We cannot mutate the
++  // shared moduleOp (data race with parallel core threads), so this per-thread
++  // clone is the correct place to rewrite link_files to absolute paths.
++  OwningOpRef<ModuleOp> ldScriptModule = moduleOp.clone();
++  ldScriptModule->walk([&](xilinx::AIE::CoreOp coreOp) {
++    auto tileOp = dyn_cast<xilinx::AIE::TileOp>(coreOp.getTile().getDefiningOp());
++    if (!tileOp || tileOp.getCol() != core.col || tileOp.getRow() != core.row)
++      return;
++    if (auto filesAttr = coreOp.getLinkFiles()) {
++      SmallVector<mlir::Attribute> absFiles;
++      for (auto f : filesAttr->getAsRange<mlir::StringAttr>()) {
++        SmallString<256> absPath(tmpDirName);
++        sys::path::append(absPath, sys::path::filename(f.getValue()));
++        absFiles.push_back(
++            mlir::StringAttr::get(ldScriptModule->getContext(), absPath));
++      }
++      coreOp.setLinkFilesAttr(
++          mlir::ArrayAttr::get(ldScriptModule->getContext(), absFiles));
++    }
++  });
++
++  std::error_code ec;
++  raw_fd_ostream ldScriptFile(ldScriptPath, ec);
++  if (ec) {
++    std::lock_guard<std::mutex> lock(outputMutex);
++    llvm::errs() << "Error opening linker script file: " << ec.message() << "\n";
++    return failure();
++  }
++  if (failed(xilinx::AIE::AIETranslateToLdScript(
++          *ldScriptModule, ldScriptFile, core.col, core.row, deviceName))) {
++    std::lock_guard<std::mutex> lock(outputMutex);
++    llvm::errs() << "Error generating linker script\n";
++    return failure();
++  }
++  if (verbose) {
++    std::lock_guard<std::mutex> lock(outputMutex);
++    llvm::outs() << "Generated linker script: " << ldScriptPath << "\n";
++  }
++  return success();
++}
++
++// Peano back-end: llc (.opt.ll -> .o) then clang link (.o + ld.script -> .elf).
++// Extracted from compileCore so the full-compile and kernel-cache derive paths
++// share ONE byte-identical llc+link code path (the byte gate's correctness
++// fulcrum). Only the Peano / --no-xbridge path is supported here.
++static LogicalResult peanoLlcAndLink(StringRef optPath, StringRef objPath,
++                                     StringRef ldScriptPath, StringRef elfPath,
++                                     StringRef deviceName, const CoreInfo &core,
++                                     StringRef aieTarget, StringRef tmpDirName) {
++  std::string peanoLlc = findPeanoTool("llc");
++  if (peanoLlc.empty()) {
++    std::lock_guard<std::mutex> lock(outputMutex);
++    llvm::errs() << "Error: Could not find Peano llc\n";
++    return failure();
++  }
++  std::string optLevelStr = std::to_string(optLevel);
++
++  // Run llc
++  SmallVector<std::string, 10> llcCmd = {peanoLlc,
++                                         std::string(optPath),
++                                         "-O" + optLevelStr,
++                                         "--march=" + aieTarget.lower(),
++                                         "--function-sections",
++                                         "--filetype=obj",
++                                         "-o",
++                                         std::string(objPath)};
++  auto tLlc0 = Clock::now();
++  if (!executeCommand(llcCmd)) {
++    std::lock_guard<std::mutex> lock(outputMutex);
++    llvm::errs() << "Error running Peano llc\n";
++    return failure();
++  }
++  g_phaseLlcNs += elapsedNs(tLlc0);
++
++  // Link with Peano clang
++  std::string peanoClang = findPeanoTool("clang");
++  if (peanoClang.empty()) {
++    std::lock_guard<std::mutex> lock(outputMutex);
++    llvm::errs() << "Error: Could not find Peano clang\n";
++    return failure();
++  }
++
++  std::string peanoTarget = getPeanoTarget(aieTarget);
++
++  // Get Peano bin directory for the linker
++  StringRef peanoDir = getPeanoInstallDir();
++  SmallString<128> peanoBinDir;
++  if (!peanoDir.empty()) {
++    peanoBinDir = peanoDir;
++    sys::path::append(peanoBinDir, "bin");
++  } else {
++    peanoBinDir = sys::path::parent_path(peanoClang);
++  }
++
++  // Find Peano's lld linker explicitly
++  SmallString<256> peanoLld(peanoBinDir);
++  sys::path::append(peanoLld, "ld.lld");
++
++  SmallVector<std::string, 20> linkCmd = {peanoClang, "-O" + optLevelStr,
++                                          "--target=" + peanoTarget};
++
++  if (sys::fs::can_execute(peanoLld)) {
++    linkCmd.push_back("-fuse-ld=" + std::string(peanoLld));
++  } else {
++    linkCmd.push_back("-B" + std::string(peanoBinDir));
++    linkCmd.push_back("-fuse-ld=lld");
++  }
++
++  linkCmd.push_back(std::string(objPath));
++
++  // Handle external object files specified via link_files (or deprecated
++  // link_with). The linker script has INPUT() directives (relative paths); copy
++  // every file to the .prj directory so the linker can find them.
++  for (const auto &lf : core.linkFiles) {
++    SmallString<256> srcLinkWith;
++    if (sys::path::is_absolute(lf)) {
++      srcLinkWith = lf;
++    } else {
++      SmallString<256> cwdPath;
++      sys::fs::current_path(cwdPath);
++      sys::path::append(cwdPath, lf);
++      if (sys::fs::exists(cwdPath)) {
++        srcLinkWith = cwdPath;
++      } else {
++        SmallString<256> tmpPath(tmpDirName);
++        sys::path::append(tmpPath, lf);
++        if (sys::fs::exists(tmpPath)) {
++          srcLinkWith = tmpPath;
++        } else {
++          SmallString<256> inputDir =
++              sys::path::parent_path(getInputFilename());
++          if (inputDir.empty())
++            sys::fs::current_path(inputDir);
++          srcLinkWith = inputDir;
++          sys::path::append(srcLinkWith, lf);
++          sys::path::remove_dots(srcLinkWith, /*remove_dot_dot=*/true);
++        }
++      }
++    }
++
++    SmallString<256> destLinkWith(tmpDirName);
++    sys::path::append(destLinkWith, sys::path::filename(lf));
++    if (srcLinkWith != destLinkWith) {
++      if (failed(atomicCopyFile(srcLinkWith, tmpDirName,
++                                sys::path::filename(lf))))
++        return failure();
++      if (verbose) {
++        std::lock_guard<std::mutex> lock(outputMutex);
++        llvm::outs() << "Copied external object: " << srcLinkWith << " -> "
++                     << destLinkWith << "\n";
++      }
++    } else if (verbose) {
++      std::lock_guard<std::mutex> lock(outputMutex);
++      llvm::outs() << "External object already in place: " << srcLinkWith
++                   << "\n";
++    }
++    // The .o is not added to linkCmd — the linker script INPUT()s it.
++  }
++
++  // Make linker script path absolute
++  SmallString<128> absLdScriptPath;
++  if (sys::path::is_absolute(ldScriptPath)) {
++    absLdScriptPath = ldScriptPath;
++  } else {
++    std::error_code ec = sys::fs::real_path(ldScriptPath, absLdScriptPath);
++    if (ec) {
++      sys::fs::current_path(absLdScriptPath);
++      sys::path::append(absLdScriptPath, ldScriptPath);
++    }
++  }
++
++  linkCmd.push_back("-Wl,--gc-sections");
++  linkCmd.push_back("-Wl,--orphan-handling=error");
++  linkCmd.push_back("-Wl,-T," + std::string(absLdScriptPath));
++
++  if (linkAgainstHsa) {
++    if (!sysroot.empty()) {
++      SmallString<256> rocmLibPath(sysroot);
++      sys::path::append(rocmLibPath, "opt", "rocm", "lib");
++      linkCmd.push_back("-L" + std::string(rocmLibPath));
++    } else {
++      linkCmd.push_back("-L/opt/rocm/lib");
++    }
++    linkCmd.push_back("-lhsa-runtime64");
++  }
++
++  linkCmd.push_back("-o");
++  linkCmd.push_back(std::string(elfPath));
++
++  auto tLink0 = Clock::now();
++  if (!executeCommand(linkCmd)) {
++    std::lock_guard<std::mutex> lock(outputMutex);
++    llvm::errs() << "Error linking ELF file\n";
++    return failure();
++  }
++  g_phaseLinkNs += elapsedNs(tLink0);
++  return success();
++}
++
+ static LogicalResult compileCore(MLIRContext &context, ModuleOp moduleOp,
+                                  StringRef deviceName, const CoreInfo &core,
+                                  StringRef tmpDirName, StringRef aieTarget,
+@@ -2098,12 +2604,14 @@
+   mlir::registerLLVMDialectTranslation(context);
+   xilinx::xllvm::registerXLLVMDialectTranslation(context);
+ 
++  auto tLower0 = Clock::now();
+   if (failed(runLLVMLoweringPipeline(*coreModule, deviceName, core.col,
+                                      core.row, aieTarget, tmpDirName))) {
+     std::lock_guard<std::mutex> lock(outputMutex);
+     llvm::errs() << "Error lowering core to LLVM\n";
+     return failure();
+   }
++  g_phaseLowerNs += elapsedNs(tLower0);
+ 
+   // Step 2: Translate to LLVM IR in-memory using translateModuleToLLVMIR
+   SmallString<128> llvmIRPath(tmpDirName);
+@@ -2111,6 +2619,7 @@
+                                     std::to_string(core.col) + "_" +
+                                     std::to_string(core.row) + ".ll");
+ 
++  auto tTrans0 = Clock::now();
+   llvm::LLVMContext llvmCtx;
+   std::unique_ptr<llvm::Module> llvmModule =
+       translateModuleToLLVMIR(*coreModule, llvmCtx);
+@@ -2136,6 +2645,7 @@
+       llvm::outs() << "Generated LLVM IR: " << llvmIRPath << "\n";
+     }
+   }
++  g_phaseTranslateNs += elapsedNs(tTrans0);
+ 
+   // Step 3: Generate linker script (for non-xbridge linking)
+   // Note: BCF is generated later in the linking step when xbridge is enabled
+@@ -2145,52 +2655,9 @@
+                                       std::to_string(core.row) + ".ld.script");
+ 
+   if (!xbridge) {
+-    // Clone the pre-lowering module for ldscript generation.  We need a
+-    // separate clone here because coreModule will be destructively lowered to
+-    // LLVM IR by runLLVMLoweringPipeline below, making it unsuitable for
+-    // AIETranslateToLdScript.  We also cannot mutate the shared moduleOp
+-    // (data race with parallel core threads), so this per-thread clone is the
+-    // correct place to rewrite link_files to absolute paths.
+-    OwningOpRef<ModuleOp> ldScriptModule = moduleOp.clone();
+-    ldScriptModule->walk([&](xilinx::AIE::CoreOp coreOp) {
+-      auto tileOp =
+-          dyn_cast<xilinx::AIE::TileOp>(coreOp.getTile().getDefiningOp());
+-      if (!tileOp || tileOp.getCol() != core.col || tileOp.getRow() != core.row)
+-        return;
+-      if (auto filesAttr = coreOp.getLinkFiles()) {
+-        SmallVector<mlir::Attribute> absFiles;
+-        for (auto f : filesAttr->getAsRange<mlir::StringAttr>()) {
+-          SmallString<256> absPath(tmpDirName);
+-          sys::path::append(absPath, sys::path::filename(f.getValue()));
+-          absFiles.push_back(
+-              mlir::StringAttr::get(ldScriptModule->getContext(), absPath));
+-        }
+-        coreOp.setLinkFilesAttr(
+-            mlir::ArrayAttr::get(ldScriptModule->getContext(), absFiles));
+-      }
+-    });
+-
+-    // Generate linker script from the pre-lowering clone with absolute paths.
+-    std::error_code ec;
+-    raw_fd_ostream ldScriptFile(ldScriptPath, ec);
+-    if (ec) {
+-      std::lock_guard<std::mutex> lock(outputMutex);
+-      llvm::errs() << "Error opening linker script file: " << ec.message()
+-                   << "\n";
++    if (failed(genLdScriptForCore(moduleOp, deviceName, core, tmpDirName,
++                                  ldScriptPath)))
+       return failure();
+-    }
+-
+-    if (failed(xilinx::AIE::AIETranslateToLdScript(
+-            *ldScriptModule, ldScriptFile, core.col, core.row, deviceName))) {
+-      std::lock_guard<std::mutex> lock(outputMutex);
+-      llvm::errs() << "Error generating linker script\n";
+-      return failure();
+-    }
+-
+-    if (verbose) {
+-      std::lock_guard<std::mutex> lock(outputMutex);
+-      llvm::outs() << "Generated linker script: " << ldScriptPath << "\n";
+-    }
+   }
+ 
+   // Step 4: Compile LLVM IR to object file
+@@ -2199,6 +2666,14 @@
+                                  std::to_string(core.col) + "_" +
+                                  std::to_string(core.row) + ".o");
+ 
++  // Post-opt IR path (Peano path). Declared at function scope so the deferred
++  // llc step (in peanoLlcAndLink, Step 5) can find it, and so compileCores can
++  // cache it as the kernel-cache representative for derived cores.
++  SmallString<128> optPath(tmpDirName);
++  sys::path::append(optPath, deviceName.str() + "_core_" +
++                                 std::to_string(core.col) + "_" +
++                                 std::to_string(core.row) + ".opt.ll");
++
+   if (xchesscc) {
+     // xchesscc compilation: IR downgrade -> chess-llvm-link -> xchesscc_wrapper
+ 
+@@ -2314,13 +2789,7 @@
+     // Run opt on peanohacked IR.
+     // Cap opt level at O1 for Peano to match old Python aiecc behavior.
+     // Higher levels cause SLP vectorizer to create types that crash GlobalISel.
+-    SmallString<128> optPath(tmpDirName);
+-    sys::path::append(optPath, deviceName.str() + "_core_" +
+-                                   std::to_string(core.col) + "_" +
+-                                   std::to_string(core.row) + ".opt.ll");
+-
+     unsigned safeOptLevel = optLevel > 1 ? 1 : optLevel;
+-    std::string optLevelStr = std::to_string(optLevel);
+     SmallVector<std::string, 12> optCmd = {
+         peanoOpt,
+         "--passes=default<O" + std::to_string(safeOptLevel) + ">",
+@@ -2334,27 +2803,15 @@
+       optCmd.insert(optCmd.begin() + 1, "-disable-loop-idiom-memset");
+     }
+ 
++    auto tOpt0 = Clock::now();
+     if (!executeCommand(optCmd)) {
+       std::lock_guard<std::mutex> lock(outputMutex);
+       llvm::errs() << "Error running Peano opt\n";
+       return failure();
+     }
+-
+-    // Run llc
+-    SmallVector<std::string, 10> llcCmd = {peanoLlc,
+-                                           std::string(optPath),
+-                                           "-O" + optLevelStr,
+-                                           "--march=" + aieTarget.lower(),
+-                                           "--function-sections",
+-                                           "--filetype=obj",
+-                                           "-o",
+-                                           std::string(objPath)};
+-
+-    if (!executeCommand(llcCmd)) {
+-      std::lock_guard<std::mutex> lock(outputMutex);
+-      llvm::errs() << "Error running Peano llc\n";
+-      return failure();
+-    }
++    g_phaseOptNs += elapsedNs(tOpt0);
++    // llc is deferred to peanoLlcAndLink (shared with the kernel-cache derive
++    // path) and runs as part of Step 5 below.
+   }
+ 
+   // Step 5: Link to ELF
+@@ -2530,150 +2987,125 @@
+       llvm::outs() << "Linked with xbridge: " << elfPath << "\n";
+     }
+   } else {
+-    // Link with Peano clang
+-    std::string peanoClang = findPeanoTool("clang");
+-    if (peanoClang.empty()) {
+-      std::lock_guard<std::mutex> lock(outputMutex);
+-      llvm::errs() << "Error: Could not find Peano clang\n";
++    // Peano path: run llc (.opt.ll -> .o) then link (.o + ld.script -> .elf).
++    // Shared with the kernel-cache derive path (deriveCore) so both paths use
++    // ONE byte-identical llc+link code path.
++    if (failed(peanoLlcAndLink(optPath, objPath, ldScriptPath, elfPath,
++                               deviceName, core, aieTarget, tmpDirName)))
+       return failure();
+-    }
+-
+-    std::string peanoTarget = getPeanoTarget(aieTarget);
+-    std::string optLevelStr = std::to_string(optLevel);
+-
+-    // Get Peano bin directory for the linker
+-    StringRef peanoDir = getPeanoInstallDir();
+-    SmallString<128> peanoBinDir;
+-    if (!peanoDir.empty()) {
+-      peanoBinDir = peanoDir;
+-      sys::path::append(peanoBinDir, "bin");
+-    } else {
+-      // Infer from clang path
+-      peanoBinDir = sys::path::parent_path(peanoClang);
+-    }
+-
+-    // Find Peano's lld linker explicitly
+-    SmallString<256> peanoLld(peanoBinDir);
+-    sys::path::append(peanoLld, "ld.lld");
+-
+-    SmallVector<std::string, 20> linkCmd = {peanoClang, "-O" + optLevelStr,
+-                                            "--target=" + peanoTarget};
+-
+-    // Explicitly specify Peano's lld linker to avoid using system ld
+-    if (sys::fs::can_execute(peanoLld)) {
+-      linkCmd.push_back("-fuse-ld=" + std::string(peanoLld));
+-    } else {
+-      // Fallback: try to use lld from Peano bin via -B
+-      linkCmd.push_back("-B" + std::string(peanoBinDir));
+-      linkCmd.push_back("-fuse-ld=lld");
+-    }
+-
+-    linkCmd.push_back(std::string(objPath));
+-
+-    // Handle external object files specified via link_files (or deprecated
+-    // link_with).  The linker script generated by aie-translate will include an
+-    // INPUT() directive for each file, but uses a relative path.  We copy every
+-    // file to the .prj directory so the linker can find them.
+-    for (const auto &lf : core.linkFiles) {
+-      SmallString<256> srcLinkWith;
+-      if (sys::path::is_absolute(lf)) {
+-        srcLinkWith = lf;
+-      } else {
+-        // First try current working directory
+-        SmallString<256> cwdPath;
+-        sys::fs::current_path(cwdPath);
+-        sys::path::append(cwdPath, lf);
+-        if (sys::fs::exists(cwdPath)) {
+-          srcLinkWith = cwdPath;
+-        } else {
+-          // Try tmpDirName (used in JIT where .o is pre-compiled there)
+-          SmallString<256> tmpPath(tmpDirName);
+-          sys::path::append(tmpPath, lf);
+-          if (sys::fs::exists(tmpPath)) {
+-            srcLinkWith = tmpPath;
+-          } else {
+-            // Fall back to input file directory
+-            SmallString<256> inputDir =
+-                sys::path::parent_path(getInputFilename());
+-            if (inputDir.empty()) {
+-              sys::fs::current_path(inputDir);
+-            }
+-            srcLinkWith = inputDir;
+-            sys::path::append(srcLinkWith, lf);
+-            sys::path::remove_dots(srcLinkWith, /*remove_dot_dot=*/true);
+-          }
+-        }
+-      }
+-
+-      // Copy the object file to the .prj directory so the linker script's
+-      // INPUT() directive can find it. Copy atomically to avoid races between
+-      // parallel cores that share the same .o filename.
+-      SmallString<256> destLinkWith(tmpDirName);
+-      sys::path::append(destLinkWith, sys::path::filename(lf));
+-      if (srcLinkWith != destLinkWith) {
+-        if (failed(atomicCopyFile(srcLinkWith, tmpDirName,
+-                                  sys::path::filename(lf))))
+-          return failure();
++  }
+ 
+-        if (verbose) {
+-          std::lock_guard<std::mutex> lock(outputMutex);
+-          llvm::outs() << "Copied external object: " << srcLinkWith << " -> "
+-                       << destLinkWith << "\n";
+-        }
+-      } else if (verbose) {
+-        std::lock_guard<std::mutex> lock(outputMutex);
+-        llvm::outs() << "External object already in place: " << srcLinkWith
+-                     << "\n";
+-      }
++  g_coresFull++;
++  outElfPath = std::string(elfPath);
++  if (verbose) {
++    std::lock_guard<std::mutex> lock(outputMutex);
++    llvm::outs() << "Generated ELF: " << outElfPath << "\n";
++  }
+ 
+-      // Note: We don't add the object file to linkCmd because the linker
+-      // script already has INPUT() directives for each file
+-    }
++  return success();
++}
+ 
+-    // Make linker script path absolute
+-    SmallString<128> absLdScriptPath;
+-    if (sys::path::is_absolute(ldScriptPath)) {
+-      absLdScriptPath = ldScriptPath;
+-    } else {
+-      std::error_code ec = sys::fs::real_path(ldScriptPath, absLdScriptPath);
+-      if (ec) {
+-        sys::fs::current_path(absLdScriptPath);
+-        sys::path::append(absLdScriptPath, ldScriptPath);
+-      }
++// Kernel-cache derive path (Wave B): produce THIS core's ELF from a
++// representative core that hashed to the same structural key, WITHOUT re-running
++// the expensive lower+translate+opt pipeline. Mechanism:
++//   1. read the representative's cached .opt.ll,
++//   2. rename its tile-specific symbols to THIS core's (renameMap, built by
++//      lockstep alignment of the two sliced module strings),
++//   3. generate THIS core's ld.script from its pre-lowering slice module,
++//   4. run the SAME llc + link as a full compile (peanoLlcAndLink).
++// Result is byte-identical to a from-scratch compile by construction: the .opt.ll
++// is exactly what opt would have produced (modulo the correct symbol rename) and
++// the back-end is the identical code path with this tile's own ld.script.
++// Only the Peano / --no-xbridge path is supported; callers must fall back to
++// compileCore otherwise.
++static LogicalResult deriveCore(ModuleOp sliceModule, StringRef deviceName,
++                                const CoreInfo &core, StringRef tmpDirName,
++                                StringRef aieTarget, StringRef repOptLlPath,
++                                const llvm::StringMap<std::string> &renameMap,
++                                std::string &outElfPath) {
++  auto tRename0 = Clock::now();
++  // 1+2. Read rep .opt.ll, rename symbols line-by-line -> this core's .opt.ll.
++  auto repBufOrErr = MemoryBuffer::getFile(repOptLlPath);
++  if (!repBufOrErr) {
++    std::lock_guard<std::mutex> lock(outputMutex);
++    llvm::errs() << "Error reading representative .opt.ll: " << repOptLlPath
++                 << ": " << repBufOrErr.getError().message() << "\n";
++    return failure();
++  }
++  SmallString<128> optPath(tmpDirName);
++  sys::path::append(optPath, deviceName.str() + "_core_" +
++                                 std::to_string(core.col) + "_" +
++                                 std::to_string(core.row) + ".opt.ll");
++  {
++    std::error_code ec;
++    raw_fd_ostream optFile(optPath, ec);
++    if (ec) {
++      std::lock_guard<std::mutex> lock(outputMutex);
++      llvm::errs() << "Error opening derived .opt.ll: " << ec.message() << "\n";
++      return failure();
+     }
+-
+-    linkCmd.push_back("-Wl,--gc-sections");
+-    linkCmd.push_back("-Wl,--orphan-handling=error");
+-    linkCmd.push_back("-Wl,-T," + std::string(absLdScriptPath));
+-
+-    // Add HSA runtime linking if requested
+-    if (linkAgainstHsa) {
+-      if (!sysroot.empty()) {
+-        SmallString<256> rocmLibPath(sysroot);
+-        sys::path::append(rocmLibPath, "opt", "rocm", "lib");
+-        linkCmd.push_back("-L" + std::string(rocmLibPath));
+-      } else {
+-        linkCmd.push_back("-L/opt/rocm/lib");
+-      }
+-      linkCmd.push_back("-lhsa-runtime64");
++    llvm::StringRef content = (*repBufOrErr)->getBuffer();
++    llvm::SmallVector<llvm::StringRef, 0> lines;
++    content.split(lines, '\n');
++    for (size_t i = 0; i < lines.size(); ++i) {
++      // The first line is a `; ModuleID = '...rep...peanohack.ll'` comment whose
++      // path embeds the rep's col/row. Rewrite it to this core's for a
++      // byte-identical match to a from-scratch compile (the comment text is part
++      // of the .opt.ll but is NOT emitted into the .o by llc, so it does not
++      // affect ELF bytes; we rewrite it anyway for derived-.opt.ll fidelity).
++      optFile << applyRenameToLine(lines[i], renameMap);
++      if (i + 1 < lines.size())
++        optFile << '\n';
+     }
++  }
+ 
+-    linkCmd.push_back("-o");
+-    linkCmd.push_back(std::string(elfPath));
++  // 3. Generate this core's ld.script from its pre-lowering slice.
++  SmallString<128> ldScriptPath(tmpDirName);
++  sys::path::append(ldScriptPath, deviceName.str() + "_core_" +
++                                      std::to_string(core.col) + "_" +
++                                      std::to_string(core.row) + ".ld.script");
++  if (failed(genLdScriptForCore(sliceModule, deviceName, core, tmpDirName,
++                                ldScriptPath)))
++    return failure();
++  g_phaseRenameNs += elapsedNs(tRename0);
+ 
+-    if (!executeCommand(linkCmd)) {
+-      std::lock_guard<std::mutex> lock(outputMutex);
+-      llvm::errs() << "Error linking ELF file\n";
+-      return failure();
++  // 4. Compute the ELF path (mirrors compileCore Step 5) and run llc + link.
++  SmallString<128> objPath(tmpDirName);
++  sys::path::append(objPath, deviceName.str() + "_core_" +
++                                 std::to_string(core.col) + "_" +
++                                 std::to_string(core.row) + ".o");
++  SmallString<128> elfPath;
++  if (!core.elfFile.empty()) {
++    elfPath = core.elfFile;
++  } else {
++    elfPath = tmpDirName;
++    sys::path::append(elfPath, deviceName.str() + "_core_" +
++                                   std::to_string(core.col) + "_" +
++                                   std::to_string(core.row) + ".elf");
++  }
++  SmallString<256> absElfPath;
++  std::error_code ec = sys::fs::real_path(elfPath, absElfPath);
++  if (ec) {
++    if (sys::path::is_absolute(elfPath)) {
++      absElfPath = elfPath;
++    } else {
++      sys::fs::current_path(absElfPath);
++      sys::path::append(absElfPath, elfPath);
++      sys::path::remove_dots(absElfPath, /*remove_dot_dot=*/true);
+     }
+   }
++  elfPath = absElfPath;
++
++  if (failed(peanoLlcAndLink(optPath, objPath, ldScriptPath, elfPath, deviceName,
++                             core, aieTarget, tmpDirName)))
++    return failure();
+ 
++  g_coresDerived++;
+   outElfPath = std::string(elfPath);
+   if (verbose) {
+     std::lock_guard<std::mutex> lock(outputMutex);
+-    llvm::outs() << "Generated ELF: " << outElfPath << "\n";
++    llvm::outs() << "Derived ELF (kernel-cache): " << outElfPath << "\n";
+   }
+-
+   return success();
+ }
+ 
+@@ -2767,6 +3199,33 @@
+     coreModuleStrs[{core.col, core.row}] = std::move(s);
+   }
+ 
++  // --- Kernel-cache structural partition (Task 2) ---
++  // Key each core by a structural hash of its sliced module string with
++  // tile-specific symbol indices masked. Cores sharing a key are byte-identical
++  // modulo symbol rename ([[aiecc-kernel-cache-dedup-validated]]); only the
++  // first ("representative") of each key is fully compiled, the rest are derived
++  // (Wave B) by symbol-rename + cheap back-end.
++  std::map<std::pair<int, int>, std::string> coreKey;
++  std::map<std::string, std::pair<int, int>> keyToRep; // key -> representative
++  for (const auto &core : cores) {
++    std::string key = coreStructuralKey(coreModuleStrs[{core.col, core.row}]);
++    coreKey[{core.col, core.row}] = key;
++    keyToRep.emplace(key, std::make_pair(core.col, core.row)); // first wins
++  }
++  if (verbose) {
++    std::map<std::string, int> hist;
++    for (const auto &core : cores)
++      hist[coreKey[{core.col, core.row}]]++;
++    llvm::outs() << "[kernel-cache] " << cores.size() << " cores -> "
++                 << keyToRep.size() << " unique kernels\n";
++    int g = 0;
++    for (const auto &kv : keyToRep) {
++      llvm::outs() << "[kernel-cache]   group " << g++ << " rep=(" << kv.second.first
++                   << "," << kv.second.second << ") count=" << hist[kv.first]
++                   << " key=" << kv.first.substr(0, 12) << "\n";
++    }
++  }
++
+   // Get the dialect registry to use for parallel contexts
+   DialectRegistry registry;
+   mlir::registerAllDialects(registry);
+@@ -2776,82 +3235,156 @@
+   // Thread-safe results storage
+   std::mutex resultsMutex;
+   std::atomic<bool> hasFailure{false};
+-
+-  // Create futures for parallel tasks
+-  std::vector<std::future<void>> futures;
+-  futures.reserve(cores.size());
+-
+-  // Use a semaphore-like pattern with atomic counter for thread limiting
+   std::atomic<unsigned> activeThreads{0};
+ 
+-  for (const auto &core : cores) {
+-    // Wait if we've reached the thread limit
+-    while (activeThreads.load() >= nThreads) {
+-      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+-    }
+-
+-    // Check if any thread has failed
+-    if (hasFailure.load()) {
+-      break;
+-    }
+-
+-    activeThreads++;
+-
+-    // Create task for this core
+-    futures.push_back(std::async(
+-        std::launch::async,
+-        [&registry, &coreModuleStrs, deviceName = deviceName.str(),
+-         tmpDirName = tmpDirName.str(), aieTarget = aieTarget.str(), core,
+-         &resultsMutex, &elfPaths, &hasFailure, &activeThreads]() {
+-          // Each thread creates its own MLIRContext
+-          MLIRContext threadContext;
+-          threadContext.appendDialectRegistry(registry);
+-          threadContext.loadAllAvailableDialects();
+-
+-          // Register LLVM IR translation dialects
+-          mlir::registerBuiltinDialectTranslation(threadContext);
+-          mlir::registerLLVMDialectTranslation(threadContext);
+-          xilinx::xllvm::registerXLLVMDialectTranslation(threadContext);
+-
+-          // Parse the module in this thread's context
+-          ParserConfig parseConfig(&threadContext);
+-          OwningOpRef<ModuleOp> threadModule = parseSourceString<ModuleOp>(
+-              coreModuleStrs.at({core.col, core.row}), parseConfig);
+-
+-          if (!threadModule) {
+-            {
+-              std::lock_guard<std::mutex> lock(resultsMutex);
+-              llvm::errs() << "Error: Failed to parse module for core ("
+-                           << core.col << ", " << core.row << ")\n";
+-            }
+-            hasFailure.store(true);
+-            activeThreads--;
+-            return;
+-          }
++  // Worker that FULLY compiles one core (parse slice -> compileCore). Used for
++  // representatives (Wave A) and as the kernel-cache fallback.
++  auto fullCompileWorker = [&](const CoreInfo &core) {
++    MLIRContext threadContext;
++    threadContext.appendDialectRegistry(registry);
++    threadContext.loadAllAvailableDialects();
++    mlir::registerBuiltinDialectTranslation(threadContext);
++    mlir::registerLLVMDialectTranslation(threadContext);
++    xilinx::xllvm::registerXLLVMDialectTranslation(threadContext);
++
++    ParserConfig parseConfig(&threadContext);
++    OwningOpRef<ModuleOp> threadModule = parseSourceString<ModuleOp>(
++        coreModuleStrs.at({core.col, core.row}), parseConfig);
++    if (!threadModule) {
++      {
++        std::lock_guard<std::mutex> lock(resultsMutex);
++        llvm::errs() << "Error: Failed to parse module for core (" << core.col
++                     << ", " << core.row << ")\n";
++      }
++      hasFailure.store(true);
++      return;
++    }
++    std::string elfPath;
++    if (failed(compileCore(threadContext, *threadModule, deviceName, core,
++                           tmpDirName, aieTarget, elfPath))) {
++      hasFailure.store(true);
++      return;
++    }
++    if (!elfPath.empty()) {
++      std::lock_guard<std::mutex> lock(resultsMutex);
++      elfPaths[{core.col, core.row}] = elfPath;
++    }
++  };
+ 
+-          // Compile the core (note: compileCore may emit its own
+-          // diagnostics to stderr which can interleave with other threads)
+-          std::string elfPath;
+-          if (failed(compileCore(threadContext, *threadModule, deviceName, core,
+-                                 tmpDirName, aieTarget, elfPath))) {
+-            hasFailure.store(true);
+-            activeThreads--;
+-            return;
+-          }
++  // Kernel-cache eligibility: derivation only on the Peano / --no-xbridge /
++  // link+compile path (the only path peanoLlcAndLink + deriveCore support). On
++  // any other configuration we fall back to fully compiling every core (the
++  // original single-wave behavior), so correctness is never at risk.
++  bool kcEligible = compile && link && !xchesscc && !xbridge;
++
++  // The representative's cached .opt.ll path (deterministic from its col/row).
++  auto repOptLlPathFor = [&](std::pair<int, int> rep) {
++    SmallString<128> p(tmpDirName);
++    sys::path::append(p, deviceName.str() + "_core_" +
++                            std::to_string(rep.first) + "_" +
++                            std::to_string(rep.second) + ".opt.ll");
++    return std::string(p);
++  };
+ 
+-          // Store result
+-          if (!elfPath.empty()) {
++  // Helper to fan a set of cores out across nThreads with the active-thread cap.
++  auto fanOut = [&](const SmallVector<CoreInfo> &subset, auto &&workerForCore) {
++    std::vector<std::future<void>> futures;
++    futures.reserve(subset.size());
++    for (const auto &core : subset) {
++      while (activeThreads.load() >= nThreads)
++        std::this_thread::sleep_for(std::chrono::milliseconds(10));
++      if (hasFailure.load())
++        break;
++      activeThreads++;
++      futures.push_back(std::async(std::launch::async, [&, core]() {
++        workerForCore(core);
++        activeThreads--;
++      }));
++    }
++    for (auto &f : futures)
++      f.wait();
++  };
++
++  if (!kcEligible) {
++    // Single wave: fully compile every core (original behavior).
++    fanOut(cores, fullCompileWorker);
++  } else {
++    // Partition into representatives (Wave A) and derivable non-reps (Wave B).
++    SmallVector<CoreInfo> reps, nonReps;
++    for (const auto &core : cores) {
++      auto rep = keyToRep.at(coreKey[{core.col, core.row}]);
++      if (rep == std::make_pair((int)core.col, (int)core.row))
++        reps.push_back(core);
++      else
++        nonReps.push_back(core);
++    }
++
++    // Wave A: fully compile the ~14 representatives (produces their .opt.ll).
++    fanOut(reps, fullCompileWorker);
++
++    // Wave B: derive every non-rep from its representative's cached .opt.ll by
++    // symbol-rename + cheap back-end (llc + link). Falls back to a full compile
++    // if the rename map can't be built (defensive; never expected).
++    if (!hasFailure.load()) {
++      auto deriveWorker = [&](const CoreInfo &core) {
++        auto rep = keyToRep.at(coreKey[{core.col, core.row}]);
++        llvm::StringMap<std::string> renameMap;
++        if (failed(buildRenameMap(coreModuleStrs.at(rep),
++                                  coreModuleStrs.at({core.col, core.row}),
++                                  deviceName, rep.first, rep.second, core.col,
++                                  core.row, renameMap))) {
++          {
+             std::lock_guard<std::mutex> lock(resultsMutex);
+-            elfPaths[{core.col, core.row}] = elfPath;
++            llvm::errs() << "[kernel-cache] rename-map build failed for core ("
++                         << core.col << "," << core.row << ") rep=(" << rep.first
++                         << "," << rep.second
++                         << "); falling back to full compile\n";
+           }
+-
+-          activeThreads--;
+-        }));
++          fullCompileWorker(core);
++          return;
++        }
++        // Parse this core's slice for ld.script generation.
++        MLIRContext threadContext;
++        threadContext.appendDialectRegistry(registry);
++        threadContext.loadAllAvailableDialects();
++        mlir::registerBuiltinDialectTranslation(threadContext);
++        mlir::registerLLVMDialectTranslation(threadContext);
++        xilinx::xllvm::registerXLLVMDialectTranslation(threadContext);
++        ParserConfig parseConfig(&threadContext);
++        OwningOpRef<ModuleOp> sliceModule = parseSourceString<ModuleOp>(
++            coreModuleStrs.at({core.col, core.row}), parseConfig);
++        if (!sliceModule) {
++          hasFailure.store(true);
++          return;
++        }
++        std::string elfPath;
++        if (failed(deriveCore(*sliceModule, deviceName, core, tmpDirName,
++                              aieTarget, repOptLlPathFor(rep), renameMap,
++                              elfPath))) {
++          hasFailure.store(true);
++          return;
++        }
++        if (!elfPath.empty()) {
++          std::lock_guard<std::mutex> lock(resultsMutex);
++          elfPaths[{core.col, core.row}] = elfPath;
++        }
++      };
++      fanOut(nonReps, deriveWorker);
++    }
+   }
+ 
+-  // Wait for all tasks to complete
+-  for (auto &future : futures) {
+-    future.wait();
++  if (verbose) {
++    auto ms = [](std::atomic<long long> &ns) {
++      return (double)ns.load() / 1e6;
++    };
++    std::lock_guard<std::mutex> lock(outputMutex);
++    llvm::outs() << llvm::formatv(
++        "[kernel-cache] phase split (summed across threads, ms):  lower={0:F0}  "
++        "translate={1:F0}  opt={2:F0}  llc={3:F0}  link={4:F0}  rename={5:F0}  | "
++        "full={6} derived={7}\n",
++        ms(g_phaseLowerNs), ms(g_phaseTranslateNs), ms(g_phaseOptNs),
++        ms(g_phaseLlcNs), ms(g_phaseLinkNs), ms(g_phaseRenameNs),
++        g_coresFull.load(), g_coresDerived.load());
+   }
+ 
+   // hasFailure is atomic — multiple threads may set it concurrently without

@@ -1,0 +1,208 @@
+diff --git a/include/aie/Dialect/AIEX/AIEUtils.h b/include/aie/Dialect/AIEX/AIEUtils.h
+index 5f2ff9f..7ddba44 100644
+--- a/include/aie/Dialect/AIEX/AIEUtils.h
++++ b/include/aie/Dialect/AIEX/AIEUtils.h
+@@ -11,15 +11,30 @@
+ #include "aie/Dialect/AIE/IR/AIEDialect.h"
+ #include "mlir/Dialect/MemRef/IR/MemRef.h"
+ #include "mlir/IR/Value.h"
++#include "llvm/ADT/DenseMap.h"
+ 
+ using namespace mlir;
+ 
+ namespace xilinx {
+ namespace AIEX {
+ 
+-memref::GlobalOp getOrCreateDataMemref(OpBuilder &builder, AIE::DeviceOp dev,
+-                                       mlir::Location loc,
+-                                       ArrayRef<uint32_t> words);
++// Find (or create) a private constant `memref.global` in `dev` holding `words`.
++//
++// `dedupCache`/`nextId`, when provided, make repeated calls O(1) instead of the
++// O(n)-per-call (= O(n^2) over a whole runtime sequence) behavior of rescanning
++// every existing global for dedup and probing the symbol table to find a free
++// name on each call. Callers lowering many BDs (e.g. NPU DMA lowering of a large
++// multi-column program) MUST pass both, seeded once from the device's existing
++// globals: `dedupCache` maps initial-value -> global; `*nextId` is the next free
++// "blockwrite_data_<n>" index (one past the max already present), which the
++// helper post-increments per created global. Seeding past the max guarantees
++// unique names by construction (no symbol-table probe). Both are scoped to one
++// device's lowering and hold raw op handles — discard them afterward.
++memref::GlobalOp getOrCreateDataMemref(
++    OpBuilder &builder, AIE::DeviceOp dev, mlir::Location loc,
++    ArrayRef<uint32_t> words,
++    llvm::DenseMap<mlir::Attribute, memref::GlobalOp> *dedupCache = nullptr,
++    unsigned *nextId = nullptr);
+ 
+ // Result of tracing through subview/cast operations to a block argument for
+ // traceSubviewToBlockArgument function.
+diff --git a/lib/Dialect/AIEX/Transforms/AIEDmaToNpu.cpp b/lib/Dialect/AIEX/Transforms/AIEDmaToNpu.cpp
+index fa8ff04..1628508 100644
+--- a/lib/Dialect/AIEX/Transforms/AIEDmaToNpu.cpp
++++ b/lib/Dialect/AIEX/Transforms/AIEDmaToNpu.cpp
+@@ -526,8 +526,17 @@ struct WriteBdToBlockWritePattern : OpConversionPattern<NpuWriteBdOp> {
+   using OpConversionPattern::OpConversionPattern;
+ 
+ public:
+-  WriteBdToBlockWritePattern(MLIRContext *context, PatternBenefit benefit = 1)
+-      : OpConversionPattern(context, benefit) {}
++  WriteBdToBlockWritePattern(
++      MLIRContext *context,
++      llvm::DenseMap<Attribute, memref::GlobalOp> *dedupCache, unsigned *nextId,
++      PatternBenefit benefit = 1)
++      : OpConversionPattern(context, benefit), dedupCache(dedupCache),
++        nextId(nextId) {}
++
++  // Per-pass-run memo + next free name index for blockwrite data globals (see
++  // getOrCreateDataMemref). Owned by the pass; live only during the conversion.
++  llvm::DenseMap<Attribute, memref::GlobalOp> *dedupCache;
++  unsigned *nextId;
+ 
+   LogicalResult
+   matchAndRewrite(NpuWriteBdOp op, OpAdaptor adaptor,
+@@ -705,7 +714,8 @@ public:
+     {
+       OpBuilder::InsertionGuard guard(rewriter);
+       rewriter.setInsertionPoint(op->getParentOfType<AIE::RuntimeSequenceOp>());
+-      global = getOrCreateDataMemref(rewriter, dev, op.getLoc(), words);
++      global = getOrCreateDataMemref(rewriter, dev, op.getLoc(), words,
++                                     dedupCache, nextId);
+     }
+     auto memref = memref::GetGlobalOp::create(
+         rewriter, op.getLoc(), global.getType(), global.getName());
+@@ -746,6 +756,27 @@ struct AIEDmaToNpuPass : xilinx::AIEX::impl::AIEDmaToNpuBase<AIEDmaToNpuPass> {
+     target.addDynamicallyLegalOp<NpuMaskWrite32Op>(
+         [&](NpuMaskWrite32Op op) { return !op.getBuffer(); });
+ 
++    // Seed, from the device's existing globals, (a) a dedup cache (initial-value
++    // -> global) and (b) the next free "blockwrite_data_<n>" name index (one past
++    // the current max). WriteBdToBlockWritePattern then keeps both in sync as it
++    // creates globals. This turns the per-BD dedup AND name-uniquing from O(n)
++    // each (a full rescan / symbol-table probe per call) into O(1), i.e. O(n^2)
++    // -> O(n) over the whole runtime sequence. Seeding the index past the max
++    // keeps names unique by construction. Both are locals (raw op handles) and
++    // must not outlive this conversion.
++    llvm::DenseMap<Attribute, memref::GlobalOp> dataMemrefCache;
++    unsigned nextBlockwriteId = 0;
++    for (auto g : device.getOps<memref::GlobalOp>()) {
++      if (auto initVal = g.getInitialValue())
++        dataMemrefCache.try_emplace(*initVal, g);
++      StringRef suffix = g.getSymName();
++      if (suffix.consume_front("blockwrite_data_")) {
++        unsigned idx;
++        if (!suffix.getAsInteger(10, idx) && idx >= nextBlockwriteId)
++          nextBlockwriteId = idx + 1;
++      }
++    }
++
+     RewritePatternSet patterns(&getContext());
+     patterns.insert<BlockWriteSymToAddr>(&getContext());
+     patterns.insert<DmaToNpuPattern>(&getContext());
+@@ -754,7 +785,8 @@ struct AIEDmaToNpuPass : xilinx::AIEX::impl::AIEDmaToNpuBase<AIEDmaToNpuPass> {
+     patterns.insert<PushQueuetoWrite32Pattern>(&getContext());
+     patterns.insert<RtpToWrite32Pattern>(&getContext());
+     patterns.insert<Write32SymToAddr>(&getContext());
+-    patterns.insert<WriteBdToBlockWritePattern>(&getContext());
++    patterns.insert<WriteBdToBlockWritePattern>(&getContext(), &dataMemrefCache,
++                                                &nextBlockwriteId);
+ 
+     if (failed(applyPartialConversion(device, target, std::move(patterns))))
+       signalPassFailure();
+diff --git a/lib/Dialect/AIEX/Utils/AIEUtils.cpp b/lib/Dialect/AIEX/Utils/AIEUtils.cpp
+index b5a71a3..cf955b9 100644
+--- a/lib/Dialect/AIEX/Utils/AIEUtils.cpp
++++ b/lib/Dialect/AIEX/Utils/AIEUtils.cpp
+@@ -14,8 +14,9 @@
+ using namespace mlir;
+ using namespace xilinx;
+ 
+-// Counter shared across calls to getOrCreateDataMemref so that uniquing scans
+-// can skip past previously used indices efficiently.
++// Fallback counter for naming the private blockwrite data globals when no caller
++// `nextId` is supplied. Combined with the legacy symbol-table probe below this
++// stays correct; hot callers pass a seeded `nextId` to avoid the O(n) probe.
+ static unsigned blockwriteDataCounter = 0;
+ 
+ std::optional<AIEX::SubviewTraceResult>
+@@ -125,37 +126,59 @@ AIEX::traceSubviewToBlockArgument(Value value) {
+   return std::nullopt;
+ }
+ 
+-memref::GlobalOp AIEX::getOrCreateDataMemref(OpBuilder &builder,
+-                                             AIE::DeviceOp dev,
+-                                             mlir::Location loc,
+-                                             ArrayRef<uint32_t> words) {
++memref::GlobalOp AIEX::getOrCreateDataMemref(
++    OpBuilder &builder, AIE::DeviceOp dev, mlir::Location loc,
++    ArrayRef<uint32_t> words,
++    llvm::DenseMap<mlir::Attribute, memref::GlobalOp> *dedupCache,
++    unsigned *nextId) {
+   uint32_t num_words = words.size();
+   MemRefType memrefType = MemRefType::get({num_words}, builder.getI32Type());
+   TensorType tensorType =
+       RankedTensorType::get({num_words}, builder.getI32Type());
+-  memref::GlobalOp global = nullptr;
+   auto initVal = DenseElementsAttr::get<uint32_t>(tensorType, words);
+-  auto otherGlobals = dev.getOps<memref::GlobalOp>();
+-  for (auto g : otherGlobals) {
+-    if (g.getType() != memrefType)
+-      continue;
+-    auto otherValue = g.getInitialValue();
+-    if (!otherValue)
+-      continue;
+-    if (*otherValue != initVal)
+-      continue;
+-    global = g;
+-    break;
++
++  // Dedup. The initial-value attribute is uniqued and encodes both the element
++  // data and the (shaped) type, so it is a sufficient key on its own.
++  memref::GlobalOp global = nullptr;
++  if (dedupCache) {
++    // O(1): the cache is seeded by the caller from the device's existing globals
++    // and kept in sync below as we create new ones.
++    auto it = dedupCache->find(initVal);
++    if (it != dedupCache->end())
++      return it->second;
++  } else {
++    // No cache supplied: fall back to the original O(n) linear scan. Kept so the
++    // helper stays correct for any low-volume caller, but hot callers must pass a
++    // cache (see header) to avoid O(n^2) behavior.
++    for (auto g : dev.getOps<memref::GlobalOp>()) {
++      if (g.getType() != memrefType)
++        continue;
++      auto otherValue = g.getInitialValue();
++      if (!otherValue)
++        continue;
++      if (*otherValue != initVal)
++        continue;
++      return g;
++    }
+   }
+-  if (!global) {
+-    std::string name = "blockwrite_data_";
++
++  // Choose a name. With a caller-supplied `nextId` (seeded one past the largest
++  // existing blockwrite_data_<n>) the name is unique by construction, so no
++  // symbol-table probe is needed. Without it, fall back to the legacy probe.
++  std::string name;
++  if (nextId) {
++    name = "blockwrite_data_" + std::to_string((*nextId)++);
++  } else {
++    name = "blockwrite_data_";
+     while (dev.lookupSymbol(name + std::to_string(blockwriteDataCounter)))
+       blockwriteDataCounter++;
+-    name += std::to_string(blockwriteDataCounter);
+-    global = memref::GlobalOp::create(builder, loc, name,
+-                                      builder.getStringAttr("private"),
+-                                      memrefType, initVal, true, nullptr);
++    name += std::to_string(blockwriteDataCounter++);
+   }
++  global = memref::GlobalOp::create(builder, loc, name,
++                                    builder.getStringAttr("private"), memrefType,
++                                    initVal, true, nullptr);
++  if (dedupCache)
++    (*dedupCache)[initVal] = global;
+   return global;
+ }
+ 

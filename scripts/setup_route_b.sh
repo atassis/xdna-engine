@@ -61,6 +61,17 @@ else
   git -C mlir-aie apply "$PATCHFILE" && echo "  applied mlir-aie-cachyos.patch"
 fi
 
+# PATCH: parallelize aiecc per-core compilation on the make-based whole_array path (Parakeet
+# build-perf; AIECC_JOBS, default 1 = no behaviour change). Mirrors the IRON full-elf
+# AIECC_JOBS lever for the make path IRON's base.py patch can't reach. Applies AFTER cachyos
+# (shares makefile-common). Idempotent (reverse-check). See route_b_kernels/patches/.
+JOBSPATCH="$REPO/route_b_kernels/patches/mlir-aie-aiecc-jobs.patch"
+if git -C mlir-aie apply --reverse --check "$JOBSPATCH" 2>/dev/null; then
+  echo "  mlir-aie-aiecc-jobs.patch already applied"
+else
+  git -C mlir-aie apply "$JOBSPATCH" && echo "  applied mlir-aie-aiecc-jobs.patch"
+fi
+
 # INSTALL D: our custom kernels/designs. route_b_kernels/ (tracked) is the single source of
 # truth; copy them FORWARD into the gitignored mlir-aie build sandbox (one-directional => no
 # drift; real files so relative-path Makefiles/includes work). See docs/08-10 + sync_kernels.sh.

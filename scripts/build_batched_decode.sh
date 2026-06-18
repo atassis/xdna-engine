@@ -26,10 +26,16 @@ apply_patch(){ local p="$1"; [ -f "$p" ] || return 0
 apply_patch "$REPO/patches/amd-IRON-deepc.patch"
 apply_patch "$REPO/route_b_kernels/patches/iron-transpose-num-batches.patch"
 apply_patch "$REPO/route_b_kernels/patches/iron-gemm-fusion-prefix.patch"
+apply_patch "$REPO/route_b_kernels/patches/iron-aiecc-build-perf.patch"  # AIECC_JOBS (-j) + SKIP_EXPAND_PDIS env-gates
 
 export PATH="$VENV_IRON/bin:$VENV_IRON/cc-shim:$AIEBU_DIR:$PATH"
 export PEANO_INSTALL_DIR="$VENV_IRON/lib/python3.14/site-packages/llvm-aie"
 export PYTHONPATH="$IRON:$GENDIR${PYTHONPATH:+:$PYTHONPATH}"
+# aiecc per-core compile parallelism (the iron-aiecc-jobs patch reads this; default 1 keeps other
+# sessions unchanged). 16 cuts the per-core .o phase ~16x on this 20-core box; the final-ELF assembly
+# stays single-threaded. Override with AIECC_JOBS=N.
+export AIECC_JOBS="${AIECC_JOBS:-16}"
+echo "[build] AIECC_JOBS=$AIECC_JOBS (aiecc per-core parallelism)"
 
 case "$WHAT" in
   ffn)
@@ -42,7 +48,8 @@ case "$WHAT" in
     OUT="$REPO/artifacts/cross_attn_batched_B${B}"; GEN="$GENDIR/gen_cross_attn_batched.py"; ARGS="--B $B --T ${T:-128}" ;;
   decode)
     NL="${NL:-2}"; sp_tag=""; [ -n "${SP:-}" ] && sp_tag="_sp"; occ_tag=""; [ -n "${OCC:-}" ] && occ_tag="_occ"
-    OUT="$REPO/artifacts/decode_batched_B${B}_L${NL}${sp_tag}${occ_tag}"; GEN="$GENDIR/gen_decode_batched.py"
+    nopdi_tag=""; [ -n "${SKIP_EXPAND_PDIS:-}" ] && nopdi_tag="_nopdi"
+    OUT="$REPO/artifacts/decode_batched_B${B}_L${NL}${sp_tag}${occ_tag}${nopdi_tag}"; GEN="$GENDIR/gen_decode_batched.py"
     ARGS="--B $B --layers $NL --S ${S:-64} --T ${T:-128}"
     [ -n "${SP:-}" ] && ARGS="$ARGS --scratchpad"
     [ -n "${ENG:-}" ] && ARGS="$ARGS --engine-only"

@@ -1,0 +1,298 @@
+diff --git a/aie_kernels/aie2p/mm.cc b/aie_kernels/aie2p/mm.cc
+index 76d6cd0..159ae4c 100644
+--- a/aie_kernels/aie2p/mm.cc
++++ b/aie_kernels/aie2p/mm.cc
+@@ -409,6 +409,25 @@ matmul_vectorized_8x8x8_i8_i32(const int8 *__restrict pA, const int8 *__restrict
+         pA, pB, pC);
+ }
+ 
++// O7 epilogue fusion: preload the GEMM C accumulation buffer with the residual
++// tensor instead of zeroing it, so the subsequent matmul K-loop accumulates
++// W@x ONTO the residual (C = residual + W@x). Fuses the per-layer residual-add
++// into the projection at zero extra compute. `resid` has the same flat [M*N]
++// layout as C's accumulation buffer (col-maj [N,M] when c_col_maj), so the copy
++// is layout-agnostic. Mirrors zero_vectorized's linear store pattern.
++template <typename T, int M, int N>
++void preload_residual_vectorized(T *__restrict c, const T *__restrict resid)
++{
++    constexpr int r = 512 / (sizeof(T) * 8); // 512-bit units (AIE2P)
++    static_assert((M * N) % r == 0);
++    const T *__restrict c_end = c + M * N;
++    event0();
++    for (; c < c_end; c += r, resid += r) {
++        aie::store_v(c, aie::load_v<r>(resid));
++    }
++    event1();
++}
++
+ extern "C" {
+ 
+ // If you want to compile microkernels with different inner tile sizes,
+@@ -507,6 +526,14 @@ extern "C" {
+         zero_scalar<ctype_out, DIM_M, DIM_N>(c_out);                                                                   \
+     }
+ 
+-combos(matmul_vectorized_c_func) combos(matmul_scalar_c_func) combos(zero_vectorized_c_func) combos(zero_scalar_c_func)
++// O7: preload-C (residual fusion) — replaces zero_##type when a GEMM fuses its
++// following residual-add. Signature mirrors zero_ but takes the residual input.
++#define preload_residual_c_func(ctype_in, mlir_type_in, ctype_out, mlir_type_out, r, s, t)                             \
++    void preload_residual_##mlir_type_out(ctype_out *c_out, ctype_out *resid_in)                                       \
++    {                                                                                                                  \
++        preload_residual_vectorized<ctype_out, DIM_M, DIM_N>(c_out, resid_in);                                        \
++    }
++
++combos(matmul_vectorized_c_func) combos(matmul_scalar_c_func) combos(zero_vectorized_c_func) combos(zero_scalar_c_func) combos(preload_residual_c_func)
+ 
+ } // extern "C"
+\ No newline at end of file
+diff --git a/iron/operators/gemm/design.py b/iron/operators/gemm/design.py
+index a8ed8ad..37d968e 100644
+--- a/iron/operators/gemm/design.py
++++ b/iron/operators/gemm/design.py
+@@ -147,8 +147,16 @@ def my_matmul(
+     kernel_object=None,
+     func_prefix="",
+     generate_taps=False,
++    fuse_residual=0,
+ ):
+     n_aie_rows = 4
++    # O7 epilogue fusion is only implemented for the single-column (n_aie_cols==1)
++    # not-separate_c_tiles path used by the batched-decode projections at B=16.
++    if fuse_residual:
++        assert n_aie_cols == 1 and not separate_c_tiles, (
++            "fuse_residual is only implemented for n_aie_cols==1, separate_c_tiles==False "
++            f"(got n_aie_cols={n_aie_cols}, separate_c_tiles={separate_c_tiles})"
++        )
+ 
+     dev_name = dev if isinstance(dev, str) else dev.resolve().name
+ 
+@@ -280,7 +288,9 @@ def my_matmul(
+ 
+     # AIE Core Function declarations
+     scalar_suffix = "_scalar" if use_scalar else ""
+-    gemm_object = kernel_object or f"{func_prefix}gemm_{m}x{k}x{n}.o"
++    gemm_object = (
++        f"{func_prefix}{kernel_object}" if kernel_object else f"{func_prefix}gemm_{m}x{k}x{n}.o"
++    )
+     if use_larger_internal_buffer:
+         # Fix fifo depth for C objfifo to 1 since 1 buffer will be used for accumulation
+         # and another for transfer to L2
+@@ -289,17 +299,17 @@ def my_matmul(
+         C_l1_ty_internal = np.ndarray[(m, n), np.dtype[dtype_out_internal]]
+         # A kernel to convert from the internal f32 accumulation to bf16 for transfer to L2 is needed
+         convert_copy_kernel = Kernel(
+-            f"convert_copy_f32_to_bf16",
++            f"{func_prefix}convert_copy_f32_to_bf16",
+             "convert_copy.o",
+             [C_l1_ty_internal, C_l1_ty, np.int32],
+         )
+         # Fix the kernels to use f32 outputs
+         zero_kernel = Kernel(
+-            f"zero{scalar_suffix}_f32",
++            f"{func_prefix}zero{scalar_suffix}_f32",
+             gemm_object,
+             [C_l1_ty_internal],
+         )
+-        matmul_func_name = f"matmul{scalar_suffix}_{dtype_in_str}_f32"
++        matmul_func_name = f"{func_prefix}matmul{scalar_suffix}_{dtype_in_str}_f32"
+         matmul_kernel = Kernel(
+             matmul_func_name,
+             gemm_object,
+@@ -310,17 +320,29 @@ def my_matmul(
+         # we only need the zero and matmul kernels
+         fifo_depth_out = fifo_depth
+         zero_kernel = Kernel(
+-            f"zero{scalar_suffix}_{dtype_out_str}",
++            f"{func_prefix}zero{scalar_suffix}_{dtype_out_str}",
+             gemm_object,
+             [C_l1_ty],
+         )
+-        matmul_func_name = f"matmul{scalar_suffix}_{dtype_in_str}_{dtype_out_str}"
++        matmul_func_name = f"{func_prefix}matmul{scalar_suffix}_{dtype_in_str}_{dtype_out_str}"
+         matmul_kernel = Kernel(
+             matmul_func_name,
+             gemm_object,
+             [A_l1_ty, B_l1_ty, C_l1_ty],
+         )
+ 
++    # O7: preload-residual kernel — copies the residual tile into the C accumulation
++    # buffer (replacing the zero-init), so the matmul K-loop accumulates W@x onto it.
++    preload_kernel = (
++        Kernel(
++            f"{func_prefix}preload_residual_{dtype_out_str}",
++            gemm_object,
++            [C_l1_ty, C_l1_ty],  # (c_out, resid_in)
++        )
++        if fuse_residual
++        else None
++    )
++
+     # Tile declarations as tile[row][col]
+     tiles = [[(col, row) for col in range(0, n_aie_cols)] for row in range(0, 6)]
+     core_tiles = tiles[2:]
+@@ -335,6 +357,10 @@ def my_matmul(
+     C_l1l2_fifos = [[None] * n_aie_cols for _ in range(n_aie_rows)]
+     C_l2l3_fifos = [None] * n_aie_cols
+ 
++    # O7: residual input FIFOs — mirror of the C output FIFOs, as an INPUT path.
++    RESID_l2l1_fifos = [[None] * n_aie_cols for _ in range(n_aie_rows)]
++    RESID_l3l2_fifos = [None] * n_aie_cols
++
+     # Runtime parameters
+     rtps = [
+         [
+@@ -436,6 +462,32 @@ def my_matmul(
+         for j in range(n_aie_rows):
+             C_l1l2_fifos[j][col] = c_tmp_fifos[j]
+ 
++        # O7: residual INPUT — mirror of the C output collection above, reversed.
++        # L3 RESID -> RESID_L3L2 (same dims_to_stream as C, so the col-maj reorder
++        # round-trips to each core's internal [m,n] accumulation layout) -> split to
++        # per-row L1 -> core preload.
++        if fuse_residual:
++            # dims_to_stream goes on the consumer .split (not the shim-producer fifo,
++            # which doesn't support it) — mirrors how the A input is distributed.
++            RESID_l3l2_fifos[col] = ObjectFifo(
++                C_l2_ty,
++                name=f"RESID_L3L2_{col}",
++                depth=fifo_depth,
++            )
++            resid_tmp_fifos = (
++                RESID_l3l2_fifos[col]
++                .cons()
++                .split(
++                    of_offsets,
++                    obj_types=[C_l1_ty] * n_aie_rows,
++                    names=[f"RESID_L2L1_{col}_{row}" for row in range(n_aie_rows)],
++                    dims_to_stream=[dims_to_stream] * n_aie_rows,
++                    placement=Tile(col, 1),
++                )
++            )
++            for j in range(n_aie_rows):
++                RESID_l2l1_fifos[j][col] = resid_tmp_fifos[j]
++
+     # Tasks for each worker to perform
+     def core_fn(
+         in_a,
+@@ -447,6 +499,8 @@ def my_matmul(
+         my_rtp,
+         barrier,
+         elem_out_internal,
++        in_resid,
++        preload,
+     ):
+         barrier.wait_for_value(1)
+         rtp_K_div_k = my_rtp[0]
+@@ -457,7 +511,14 @@ def my_matmul(
+         for _ in loop:
+             if not use_larger_internal_buffer:
+                 elem_out_internal = out_c.acquire(1)
+-            zero(elem_out_internal)
++            if preload is not None:
++                # O7: preload the C accumulation buffer with the residual instead
++                # of zeroing → the matmul K-loop accumulates W@x onto the residual.
++                resid_tile = in_resid.acquire(1)
++                preload(elem_out_internal, resid_tile)
++                in_resid.release(1)
++            else:
++                zero(elem_out_internal)
+ 
+             for _ in range_(rtp_K_div_k):
+                 elem_in_a = in_a.acquire(1)
+@@ -497,6 +558,8 @@ def my_matmul(
+                         rtps[row][col],
+                         workerBarriers[row][col],
+                         acc_buffer,
++                        RESID_l2l1_fifos[row][col].cons() if fuse_residual else None,
++                        preload_kernel,
+                     ],
+                     placement=Tile(tile_col, tile_row),
+                     stack_size=0xD00,
+@@ -546,7 +609,14 @@ def my_matmul(
+ 
+     # Runtime operations to move data to/from the AIE-array
+     rt = Runtime()
+-    with rt.sequence(A_ty, B_ty, C_ty) as (A, B, C):
++    # O7: residual is an extra input (after A,B, before C) → matches GEMM.get_arg_spec.
++    seq_tys = (A_ty, B_ty, C_ty, C_ty) if fuse_residual else (A_ty, B_ty, C_ty)
++    with rt.sequence(*seq_tys) as seq_args:
++        if fuse_residual:
++            A, B, RESID, C = seq_args
++        else:
++            A, B, C = seq_args
++            RESID = None
+         rt.start(*workers)
+ 
+         # Set runtime parameters
+@@ -632,6 +702,18 @@ def my_matmul(
+                             placement=Tile(col, 0),
+                         )
+ 
++                        # O7: fill the residual input with the SAME tap as the C
++                        # output (residual and C share the col-maj [N,M] L3 layout),
++                        # so it round-trips into each core's accumulation buffer.
++                        if fuse_residual:
++                            rt.fill(
++                                RESID_l3l2_fifos[col].prod(),
++                                RESID,
++                                tap=C_tile,
++                                task_group=tg,
++                                placement=Tile(col, 0),
++                            )
++
+                     for tile_row in range(current_tb_n_rows):
+                         if separate_c_tiles:
+                             # C Output Transfer for larger N dimensions:
+diff --git a/iron/operators/gemm/op.py b/iron/operators/gemm/op.py
+index ac391cc..a72e83b 100644
+--- a/iron/operators/gemm/op.py
++++ b/iron/operators/gemm/op.py
+@@ -38,6 +38,11 @@ class GEMM(MLIROperator):
+     dtype_out: str = field(default="bf16", repr=False)
+     use_scalar: bool = field(default=False, repr=False)
+     separate_c_tiles: bool = field(default=False, repr=False)
++    # O7 epilogue fusion: when True, the GEMM takes an extra residual input (same
++    # shape as C) and preloads the C accumulation buffer with it instead of zeroing,
++    # so the matmul accumulates W@x ONTO the residual (C = residual + W@x). Fuses the
++    # per-layer residual-add at zero extra compute. Default False = byte-identical.
++    fuse_residual: bool = field(default=False, repr=False)
+     context: object = field(default=None, repr=False)
+ 
+     _name_aliases: ClassVar[Dict[str, str]] = {
+@@ -103,6 +108,7 @@ class GEMM(MLIROperator):
+                     "emulate_bf16_mmul_with_bfp16": self.emulate_bf16_mmul_with_bfp16,
+                     "prio_accuracy": self.prio_accuracy,
+                     "separate_c_tiles": int(self.separate_c_tiles),
++                    "fuse_residual": int(self.fuse_residual),
+                     "trace_size": 0,
+                     "generate_taps": False,
+                     "kernel_object": f"gemm_{self.tile_m}x{self.tile_k}x{self.tile_n}_{int(self.b_col_maj)}_{int(self.c_col_maj)}{self._kernel_flags_suffix}.o",
+@@ -150,15 +156,25 @@ class GEMM(MLIROperator):
+         ]
+ 
+     def get_arg_spec(self):
+-        return [
++        spec = [
+             AIERuntimeArgSpec("in", (self.M, self.K)),  # input A
+             AIERuntimeArgSpec(
+                 "in", (self.K, self.N) if not self.b_col_maj else (self.N, self.K)
+             ),  # input B (weights)
++        ]
++        if self.fuse_residual:
++            # O7: residual input, same shape/layout as C (preloaded into the C buffer)
++            spec.append(
++                AIERuntimeArgSpec(
++                    "in", (self.M, self.N) if not self.c_col_maj else (self.N, self.M)
++                )
++            )  # input RESID
++        spec.append(
+             AIERuntimeArgSpec(
+                 "out", (self.M, self.N) if not self.c_col_maj else (self.N, self.M)
+-            ),  # output C
+-        ]
++            )
++        )  # output C
++        return spec
+ 
+     def pad_A(self, A_np):
+         """Pad A matrix to match operator dimensions (M, K)"""

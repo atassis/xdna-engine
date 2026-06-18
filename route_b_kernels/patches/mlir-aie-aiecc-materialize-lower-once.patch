@@ -1,0 +1,154 @@
+diff --git a/tools/aiecc/aiecc.cpp b/tools/aiecc/aiecc.cpp
+--- a/tools/aiecc/aiecc.cpp
++++ b/tools/aiecc/aiecc.cpp
+@@ -4547,6 +4547,117 @@
+   return success();
+ }
+ 
++/// Generate NPU instructions for ALL devices from a SINGLE whole-module NPU
++/// lowering. This is the O(devices) replacement for calling
++/// generateNpuInstructions() once per device, which each clone the WHOLE module
++/// and re-run the (module-level, all-device) materialize + NPU lowering pipeline
++/// — O(devices^2). Since the runtime-sequence materialize pass is module-level
++/// and patchPdiIds assigns IDs over the whole module regardless of which device
++/// is extracted, lowering once and translating every device's runtime sequence
++/// from that single lowered module produces byte-identical instructions to the
++/// per-device path. Used on the full-ELF / no-expand-load-pdis path; see
++/// internal notes
++/// (aiecc-materialize-redundant-relowering).
++static LogicalResult generateAllNpuInstructionsOnce(ModuleOp moduleOp,
++                                                    StringRef tmpDirName) {
++  if (!generateNpuInsts && !generateFullElf) {
++    return success();
++  }
++  if (dryRun) {
++    return success();
++  }
++
++  // Clone the whole module ONCE; NPU lowering is destructive. (Clone is cheap
++  // ~0.1s; the cost in this function is the per-device translate loop below.)
++  OwningOpRef<ModuleOp> clonedModule = moduleOp.clone();
++
++  // Single whole-module NPU lowering (materialize + device passes + optional
++  // PDI-id patch). patchPdiIds matches the per-device path (generateFullElf).
++  if (failed(runNpuLoweringPipeline(*clonedModule, tmpDirName,
++                                    /*patchPdiIds=*/generateFullElf))) {
++    return failure();
++  }
++
++  // Dump intermediate once if requested.
++  SmallString<128> npuLoweredPath(tmpDirName);
++  sys::path::append(npuLoweredPath, "all_npu_lowered.mlir");
++  dumpModuleToFile(*clonedModule, npuLoweredPath, "NPU lowered module (once)");
++
++  // Translate every device's runtime sequence to its NPU binary (the only
++  // device-specific step). Mirrors generateNpuInstructions' inner loop. This
++  // loop is the dominant cost of the function (~120s at B=128 — emitting the
++  // unrolled npu instruction stream; instruction-volume bound, shrinks only with
++  // op-count reduction).
++  LogicalResult result = success();
++  for (auto devOp : clonedModule->getOps<xilinx::AIE::DeviceOp>()) {
++    StringRef devName = devOp.getSymName();
++    if (!deviceName.empty() && devName != deviceName) {
++      continue;
++    }
++    devOp.walk([&](xilinx::AIE::RuntimeSequenceOp seq) {
++      if (failed(result)) {
++        return;
++      }
++      if (!sequenceName.empty() && seq.getSymName() != sequenceName) {
++        return;
++      }
++      StringRef seqName = seq.getSymName();
++      std::string outputFileName =
++          formatString(instsName, devName.str(), seqName);
++      SmallString<128> outputPath;
++      if (generateNpuInsts) {
++        outputPath = outputFileName;
++      } else {
++        outputPath = tmpDirName;
++        sys::path::append(outputPath, outputFileName);
++      }
++      if (verbose) {
++        llvm::outs() << "Generating NPU instructions for sequence: " << seqName
++                     << " -> " << outputPath << "\n";
++      }
++      std::vector<uint32_t> instructions;
++      std::vector<xilinx::AIE::TxnLocEntry> locmap;
++      if (failed(xilinx::AIE::AIETranslateNpuToBinary(
++              *clonedModule, instructions, devName, seqName,
++              keepLoc ? &locmap : nullptr))) {
++        llvm::errs() << "Error generating NPU instructions for sequence: "
++                     << seqName << "\n";
++        result = failure();
++        return;
++      }
++      std::error_code ec;
++      raw_fd_ostream binFile(outputPath, ec, sys::fs::OpenFlags::OF_None);
++      if (ec) {
++        llvm::errs() << "Error opening NPU instructions file: " << ec.message()
++                     << "\n";
++        result = failure();
++        return;
++      }
++      binFile.write(reinterpret_cast<const char *>(instructions.data()),
++                    instructions.size() * sizeof(uint32_t));
++      if (verbose) {
++        llvm::outs() << "Wrote " << instructions.size()
++                     << " instructions to: " << outputPath << "\n";
++      }
++      if (keepLoc) {
++        SmallString<128> locmapPath(outputPath);
++        locmapPath.append(".locmap.json");
++        std::error_code locEc;
++        raw_fd_ostream locFile(locmapPath, locEc, sys::fs::OpenFlags::OF_Text);
++        if (locEc) {
++          llvm::errs() << "Error opening locmap sidecar: " << locEc.message()
++                       << "\n";
++          result = failure();
++          return;
++        }
++        StringRef binBaseName = sys::path::filename(outputPath);
++        xilinx::AIE::emitNpuLocmapJSON(locFile, devName, binBaseName, locmap);
++      }
++    });
++  }
++  return result;
++}
++
+ //===----------------------------------------------------------------------===//
+ // Transaction Generation
+ //===----------------------------------------------------------------------===//
+@@ -6094,7 +6205,14 @@
+ 
+     // Generate NPU instructions from in-memory module.
+     // (this runs runNpuLoweringPipeline = the runtime-sequence MATERIALIZE pass)
+-    {
++    //
++    // On the full-ELF / no-expand-load-pdis path this per-device call is O(N^2):
++    // it clones the WHOLE module and re-runs the module-level materialize for
++    // every device. We instead lower ONCE after the loop
++    // (generateAllNpuInstructionsOnce) — byte-identical, ~N x less materialize.
++    // See aiecc-materialize-redundant-relowering.
++    bool deferNpuInstsToOncePass = generateFullElf && !expandLoadPdis;
++    if (!deferNpuInstsToOncePass) {
+       ScopedPhaseTimer _t("npu-insts+materialize");
+       if (!generateCtrlPkt &&
+           failed(generateNpuInstructions(moduleOp, tmpDirName, devName))) {
+@@ -6318,6 +6436,16 @@
+     }
+   }
+ 
++  // Full-ELF / no-expand path: generate ALL devices' NPU instructions from a
++  // SINGLE whole-module lowering (replaces the per-device O(N^2) calls deferred
++  // in the loop above). Byte-identical; cuts the dominant materialize phase ~N x.
++  if (generateFullElf && !expandLoadPdis) {
++    ScopedPhaseTimer _t("npu-insts+materialize-once");
++    if (failed(generateAllNpuInstructionsOnce(moduleOp, tmpDirName))) {
++      return failure();
++    }
++  }
++
+   // Generate full ELF after all devices are processed
+   {
+     ScopedPhaseTimer _t("full-elf-assembly");

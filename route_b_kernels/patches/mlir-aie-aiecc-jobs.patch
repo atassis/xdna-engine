@@ -1,0 +1,34 @@
+diff --git a/programming_examples/basic/matrix_multiplication/makefile-common b/programming_examples/basic/matrix_multiplication/makefile-common
+index f62afc8..d88f9a0 100644
+--- a/programming_examples/basic/matrix_multiplication/makefile-common
++++ b/programming_examples/basic/matrix_multiplication/makefile-common
+@@ -102,6 +102,13 @@ else
+ aiecc_chess_flags=--unified
+ endif
+ 
++# Parakeet/whole_array build-perf: parallelize aiecc per-core compilation.
++# Correctness-neutral (parallelism does not change the produced xclbin bytes).
++# 0 = auto-detect CPU count; 1 = sequential (upstream default; no behaviour change).
++# Mirror of the IRON full-elf AIECC_JOBS lever (route_b_kernels/patches/iron-aiecc-build-perf.patch)
++# for the make-based whole_array path Parakeet uses.
++AIECC_JOBS?=1
++
+ ifeq ($(devicename),npu2)
+ kernels_dir=${srcdir}/../../../../aie_kernels/aie2p
+ else 
+@@ -171,13 +178,13 @@ ${trace_mlir_target}: ${srcdir}/${aie_py_src}
+ 
+ ${xclbin_target}: ${mlir_target} ${kernels:%=build/%.o}
+ 	mkdir -p ${@D}
+-	cd ${@D} && aiecc --alloc-scheme=${buffer_aloc_flag} --aie-generate-xclbin --no-compile-host --xclbin-name=${@F} \
++	cd ${@D} && aiecc -j${AIECC_JOBS} --alloc-scheme=${buffer_aloc_flag} --aie-generate-xclbin --no-compile-host --xclbin-name=${@F} \
+ 				${aiecc_peano_flags} ${aiecc_chess_flags} \
+ 				--aie-generate-npu-insts --npu-insts-name=${insts_target:build/%=%} $(<:%=../%)
+ 
+ ${trace_xclbin_target}: ${trace_mlir_target} ${kernels:%=build/%.o}
+ 	mkdir -p ${@D}
+-	cd ${@D} && aiecc --alloc-scheme=${buffer_aloc_flag} --aie-generate-xclbin --no-compile-host --xclbin-name=${@F} \
++	cd ${@D} && aiecc -j${AIECC_JOBS} --alloc-scheme=${buffer_aloc_flag} --aie-generate-xclbin --no-compile-host --xclbin-name=${@F} \
+ 				${aiecc_peano_flags} ${aiecc_chess_flags} \
+ 				--aie-generate-npu-insts --npu-insts-name=${insts_target:build/%=%} $(<:%=../%)
+ 
