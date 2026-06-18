@@ -19,6 +19,7 @@ ln_post + lm-head, as M=1). Run inside the IRON env. Validate --layers 2 first, 
 import argparse
 import json
 import os
+import sys
 
 import numpy as np
 import ml_dtypes
@@ -57,21 +58,34 @@ def gelu_t(h):
     return torch.nn.functional.gelu(torch.from_numpy(h.astype(np.float32)), approximate="tanh").numpy()
 
 
-def pick_tt(M, N, ncols=1, nch=1):
+def pick_tt(M, N, ncols=1, nch=1, prefer_n_full=False):
     # Largest valid (m,n,s) transpose tile. The IRON Transpose design splits N across COLUMNS and M
     # across CHANNELS (design.py taps_in_L3L2: sizes [M//nch//m, N//ncols//n, m, n]), so the tile must
     # satisfy n | (N//ncols), m | (M//nch), plus the s-floor and m*n<=8192. Prefer s=8 (efficient kernel).
+    #
+    # prefer_n_full: bias toward n == N//ncols (a SINGLE tile column in N -> the tile grid is only on M).
+    # This is required for the transpose BD-iteration coalesce (design.py needs n==N so each per-batch L3
+    # transfer's grid telescopes / the drain is the chunkable [grid_row, n, m] form). Without it the
+    # largest-m heuristic picks e.g. m=224,n=32 (2D grid -> 4D-saturated TAP, NOT coalesceable). Falls back
+    # to the general pick if no n==Nc tile fits.
     Nc, Mc = N // ncols, M // nch
-    for s in (8, 4):
-        for m in sorted((d for d in range(s, Mc + 1) if Mc % d == 0 and d % s == 0), reverse=True):
-            for n in sorted((d for d in range(s, Nc + 1) if Nc % d == 0 and d % s == 0), reverse=True):
-                if m * n > 8192:
-                    continue
-                if s == 8 and (m <= 16 or n <= 16):
-                    continue
-                if s == 4 and (m <= 4 or n <= 4):
-                    continue
+    def _candidates():
+        for s in (8, 4):
+            for m in sorted((d for d in range(s, Mc + 1) if Mc % d == 0 and d % s == 0), reverse=True):
+                for n in sorted((d for d in range(s, Nc + 1) if Nc % d == 0 and d % s == 0), reverse=True):
+                    if m * n > 8192:
+                        continue
+                    if s == 8 and (m <= 16 or n <= 16):
+                        continue
+                    if s == 4 and (m <= 4 or n <= 4):
+                        continue
+                    yield m, n, s
+    if prefer_n_full:
+        for m, n, s in _candidates():
+            if n == Nc:  # single column in N -> grid only on M (coalesceable)
                 return m, n, s
+    for m, n, s in _candidates():
+        return m, n, s
     raise ValueError(f"no transpose tiling {M}x{N} ncols={ncols} nch={nch}")
 
 
@@ -110,16 +124,46 @@ def main():
     sm_cols = 8 if a.occ else 1
     tr_s_cols = 2 if a.occ else 1
     tr_c_cols = 2 if a.occ else 1
-    tms, tns, tss = pick_tt(S, HD, tr_s_cols)
-    tmc, tnc, tsc = pick_tt(TP, HD, tr_c_cols)
+    _cbd = bool(os.environ.get("COALESCE_GEMV"))
+    _cbd_tr = bool(os.environ.get("COALESCE_TR"))  # transpose B-unroll->BD; biases tiling to n==N (coalesceable)
+    if _cbd_tr:
+        sys.stderr.write(
+            "\n*** WARNING: COALESCE_TR is ON-DEVICE FALSIFIED (WER 1.0 vs baseline 0.1245) ***\n"
+            "    The transpose coalesce produces a NUMERICALLY WRONG decode (the L2L1 stream-reshape\n"
+            "    breaks under the single coalesced fill). Build numbers are real but the ELF is garbage.\n"
+            "    See internal notes. Do NOT use for real output.\n\n")
+    tms, tns, tss = pick_tt(S, HD, tr_s_cols, prefer_n_full=_cbd_tr)
+    tmc, tnc, tsc = pick_tt(TP, HD, tr_c_cols, prefer_n_full=_cbd_tr)
 
     # ---- ops (created once, reused for all layers) ----
     ctx = AIEContext()
     op_ln = LayerNorm(size=CH * D, num_aie_columns=1, num_channels=CH, tile_size=D, context=ctx)
-    g_qkv = GEMM(M=QKV, K=D, N=B, tile_m=64, tile_k=64, tile_n=16, num_aie_columns=g_cols, b_col_maj=True, c_col_maj=True, context=ctx)
-    g_proj = GEMM(M=D, K=D, N=B, tile_m=64, tile_k=64, tile_n=16, num_aie_columns=g_cols, b_col_maj=True, c_col_maj=True, context=ctx)
-    g_f1 = GEMM(M=FF, K=D, N=B, tile_m=64, tile_k=64, tile_n=16, num_aie_columns=g_cols, b_col_maj=True, c_col_maj=True, context=ctx)
-    g_f2 = GEMM(M=D, K=FF, N=B, tile_m=64, tile_k=64, tile_n=16, num_aie_columns=g_cols, b_col_maj=True, c_col_maj=True, context=ctx)
+    # M_STATIONARY (opt-in env, default OFF -> unchanged N-stationary): re-test the banked O6
+    # M-stationary GEMM (GEMM(m_stationary=True)) at B=128, the condition o6-mstationary-arrayfill-moot-at-b16
+    # flagged as able to flip its B=16 moot verdict. Columns split M (tile_m=M/(4*g_cols)), B broadcast,
+    # all 32 cores; enables per-row LN/GELU epilogue fusion (the real prize). NOTE: m_stationary skips the
+    # c_col_maj layout path -> verify rel-L2 FIRST (the layout gate). Only valid at g_cols==8 (B>=128).
+    _mstat = bool(os.environ.get("M_STATIONARY")) and g_cols == 8
+    if _mstat:
+        sys.stderr.write("\n*** M_STATIONARY=1: projection GEMMs use m_stationary=True (B=128 re-test) ***\n\n")
+
+    def _gemm(Mg, Kg):
+        # m_stationary forces tile_m = M/(4*g_cols) and the bf16 mmul needs tile_m % 16 == 0
+        # -> M % (64*g_cols) == 0 (i.e. M%512 at g_cols=8). Only GEMMs that satisfy it go
+        # m_stationary; the rest fall back to N-stationary (so the decode still builds).
+        if _mstat and Mg % (64 * g_cols) == 0:
+            sys.stderr.write(f"    [m_stat] M={Mg} -> m_stationary (tile_m={Mg // (4 * g_cols)})\n")
+            return GEMM(M=Mg, K=Kg, N=B, tile_m=Mg // (4 * g_cols), tile_k=64, tile_n=16,
+                        num_aie_columns=g_cols, m_stationary=True, context=ctx)
+        if _mstat:
+            sys.stderr.write(f"    [m_stat] M={Mg} NOT %{64 * g_cols} -> stays N-stationary\n")
+        return GEMM(M=Mg, K=Kg, N=B, tile_m=64, tile_k=64, tile_n=16, num_aie_columns=g_cols,
+                    b_col_maj=True, c_col_maj=True, context=ctx)
+
+    g_qkv = _gemm(QKV, D)
+    g_proj = _gemm(D, D)
+    g_f1 = _gemm(FF, D)
+    g_f2 = _gemm(D, FF)
     add_qkv = ElementwiseAdd(size=B * QKV, tile_size=QKV // 8, num_aie_columns=8, context=ctx)
     add_d = ElementwiseAdd(size=B * D, tile_size=D // 8, num_aie_columns=8, context=ctx)
     add_ff = ElementwiseAdd(size=B * FF, tile_size=FF // 8, num_aie_columns=8, context=ctx)
@@ -136,16 +180,19 @@ def main():
     sc_v = StridedCopy(input_sizes=(B, H, HD), input_strides=(QKV, HD, 1), input_offset=2 * D,
                        output_sizes=(B, H, HD), output_strides=(H * S * HD, S * HD, 1), output_offset=sc_off,
                        input_buffer_size=B * QKV, output_buffer_size=B * H * S * HD, num_aie_channels=1, kwargs=sc_kw, context=ctx)
-    g_scs = GEMV(M=S, K=HD, num_aie_columns=8, tile_size_input=4, tile_size_output=S // 8, num_batches=BH, context=ctx)
+    # B-unroll->BD-iteration (op-count lever): opt the per-head/stream GEMV DMA into
+    # one batched 4D BD per column instead of BH per-batch transfers. Env-gated so the
+    # default build is byte-identical (370686d); on-device rel-L2+WER validated separately.
+    g_scs = GEMV(M=S, K=HD, num_aie_columns=8, tile_size_input=4, tile_size_output=S // 8, num_batches=BH, coalesce_batch_dma=_cbd, context=ctx)
     sm_s = (Softmax(rows=BH, cols=S, num_aie_columns=sm_cols, num_channels=1, rtp_vector_size=S, mask_scratchpad="sm_mask", context=ctx)
             if sp else
             Softmax(rows=BH, cols=S, num_aie_columns=sm_cols, num_channels=1, rtp_vector_size=S, mask_patch_value=0, context=ctx))
-    tr_s = Transpose(M=S, N=HD, num_batches=BH, num_aie_columns=tr_s_cols, num_channels=1, m=tms, n=tns, s=tss, context=ctx)
-    g_cts = GEMV(M=HD, K=S, num_aie_columns=8, tile_size_input=4, tile_size_output=HD // 8, num_batches=BH, context=ctx)
-    g_scc = GEMV(M=TP, K=HD, num_aie_columns=8, tile_size_input=4, tile_size_output=TP // 8, num_batches=BH, context=ctx)
+    tr_s = Transpose(M=S, N=HD, num_batches=BH, num_aie_columns=tr_s_cols, num_channels=1, m=tms, n=tns, s=tss, coalesce_batch_dma=_cbd_tr, context=ctx)
+    g_cts = GEMV(M=HD, K=S, num_aie_columns=8, tile_size_input=4, tile_size_output=HD // 8, num_batches=BH, coalesce_batch_dma=_cbd, context=ctx)
+    g_scc = GEMV(M=TP, K=HD, num_aie_columns=8, tile_size_input=4, tile_size_output=TP // 8, num_batches=BH, coalesce_batch_dma=_cbd, context=ctx)
     sm_c = Softmax(rows=BH, cols=TP, num_aie_columns=sm_cols, num_channels=1, rtp_vector_size=T, mask_patch_value=0, context=ctx)
-    tr_c = Transpose(M=TP, N=HD, num_batches=BH, num_aie_columns=tr_c_cols, num_channels=1, m=tmc, n=tnc, s=tsc, context=ctx)
-    g_ctc = GEMV(M=HD, K=TP, num_aie_columns=8, tile_size_input=4, tile_size_output=HD // 8, num_batches=BH, context=ctx)
+    tr_c = Transpose(M=TP, N=HD, num_batches=BH, num_aie_columns=tr_c_cols, num_channels=1, m=tmc, n=tnc, s=tsc, coalesce_batch_dma=_cbd_tr, context=ctx)
+    g_ctc = GEMV(M=HD, K=TP, num_aie_columns=8, tile_size_input=4, tile_size_output=HD // 8, num_batches=BH, coalesce_batch_dma=_cbd, context=ctx)
 
     chD = CH * D * 2
     HSs, HSc = BH * S * 2, BH * TP * 2

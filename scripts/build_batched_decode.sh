@@ -26,7 +26,9 @@ apply_patch(){ local p="$1"; [ -f "$p" ] || return 0
 apply_patch "$REPO/patches/amd-IRON-deepc.patch"
 apply_patch "$REPO/route_b_kernels/patches/iron-transpose-num-batches.patch"
 apply_patch "$REPO/route_b_kernels/patches/iron-gemm-fusion-prefix.patch"
-apply_patch "$REPO/route_b_kernels/patches/iron-aiecc-build-perf.patch"  # AIECC_JOBS (-j) + SKIP_EXPAND_PDIS env-gates
+apply_patch "$REPO/route_b_kernels/patches/iron-aiecc-build-perf.patch"
+apply_patch "$REPO/route_b_kernels/patches/iron-gemv-coalesce-batch-dma.patch"  # opt-in BD-iteration (default off; COALESCE_GEMV gates it)  # AIECC_JOBS (-j) + SKIP_EXPAND_PDIS env-gates
+apply_patch "$REPO/route_b_kernels/patches/iron-gemm-mstationary.patch"  # opt-in GEMM(m_stationary=True) (default off; M_STATIONARY gates it in gen_decode_batched)
 
 export PATH="$VENV_IRON/bin:$VENV_IRON/cc-shim:$AIEBU_DIR:$PATH"
 export PEANO_INSTALL_DIR="$VENV_IRON/lib/python3.14/site-packages/llvm-aie"
@@ -49,7 +51,8 @@ case "$WHAT" in
   decode)
     NL="${NL:-2}"; sp_tag=""; [ -n "${SP:-}" ] && sp_tag="_sp"; occ_tag=""; [ -n "${OCC:-}" ] && occ_tag="_occ"
     nopdi_tag=""; [ -n "${SKIP_EXPAND_PDIS:-}" ] && nopdi_tag="_nopdi"
-    OUT="$REPO/artifacts/decode_batched_B${B}_L${NL}${sp_tag}${occ_tag}${nopdi_tag}"; GEN="$GENDIR/gen_decode_batched.py"
+    mstat_tag=""; [ -n "${M_STATIONARY:-}" ] && mstat_tag="_mstat"
+    OUT="$REPO/artifacts/decode_batched_B${B}_L${NL}${sp_tag}${occ_tag}${nopdi_tag}${mstat_tag}"; GEN="$GENDIR/gen_decode_batched.py"
     ARGS="--B $B --layers $NL --S ${S:-64} --T ${T:-128}"
     [ -n "${SP:-}" ] && ARGS="$ARGS --scratchpad"
     [ -n "${ENG:-}" ] && ARGS="$ARGS --engine-only"
