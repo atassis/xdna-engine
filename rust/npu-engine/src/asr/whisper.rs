@@ -345,16 +345,29 @@ impl WhisperAsr {
         let enc2 = Array2::from_shape_vec((T_ENC, D), encoder_hidden.to_vec())
             .expect("encoder_hidden is [T_ENC*D]");
         dec.precompute_cross(&enc2);
+        // Step-0 language detection needs the FULL logits (restricted argmax over the language block) → it
+        // stays on host. The steady-state loop uses the on-NPU argmax (`step_token`) when the argmax-fused
+        // proj_out ELF is loaded: the ELF returns a token id and the 104 KB logits readback is dropped.
         let lang_logits = dec.step(SOT, 0);
         let lang = Self::pick_lang(&lang_logits);
         let prompt: Vec<i64> = vec![SOT, lang, TRANSCRIBE, NOTIMESTAMPS];
         let mut ids = prompt.clone();
         dec.reset();
-        let mut logits = Vec::new();
+        let npu_argmax = dec.has_npu_argmax();
+        // next token after feeding token `tok` at `pos`: on-NPU argmax (id) when available, else host argmax.
+        let next_tok = |dec: &mut FusedDecoder, tok: i64, pos: usize| -> i64 {
+            if npu_argmax {
+                dec.step_token(tok, pos)
+            } else {
+                argmax(&dec.step(tok, pos))
+            }
+        };
+        // Feed the prompt; the next token comes from the LAST prompt position. Earlier positions just
+        // advance the KV cache (dispatch); their result is discarded (use the cheap id path when available).
+        let mut next = 0i64;
         for (pos, &tok) in prompt.iter().enumerate() {
-            logits = dec.step(tok, pos);
+            next = next_tok(dec, tok, pos);
         }
-        let mut next = argmax(&logits);
         if next != EOT {
             ids.push(next);
         }
@@ -363,8 +376,7 @@ impl WhisperAsr {
                 break;
             }
             let pos = prompt.len() + step;
-            let logits = dec.step(next, pos);
-            next = argmax(&logits);
+            next = next_tok(dec, next, pos);
             if next == EOT {
                 break;
             }

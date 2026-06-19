@@ -574,10 +574,168 @@ enum FusedKern {
 const T_PAD: usize = 1536; // encoder positions padded to a %64,%16 multiple (matches gen_decode.py)
 
 /// (arena, byte-offset, byte-len) of a named buffer in the fused arenas (from meta.json layout).
+#[derive(Clone, Copy)]
 struct BufLoc {
     arena: Arena,
     off: usize,
     len: usize,
+}
+
+/// e2e/NPU wide-dispatch lm-head: a standalone `proj_out` GEMV ELF run as ONE dispatch/token, replacing
+/// both the host f32 ~40M-MAC matmul and the latency-negative 17-chunk ctx2 path. The ELF is CONSTANT (no
+/// per-token patch / scratchpad), so it registers once and dispatches with the bound arena each token.
+/// The GEMV computes `logits[VOCAB_PAD] = (γ⊙proj_out_w).Tᵀ · norm` (vocab-as-M → contiguous vector output,
+/// no whole_array DMA-stride wall); the LN affine-normalize and the `β·W` bias stay on host (cheap). Built
+/// by `route_b_kernels/decode_fused/gen_projout.py` / `scripts/build_projout_elf.sh`.
+struct ProjOutElf {
+    arena: FusedArena,
+    kern: ElfKernel,
+    x_loc: BufLoc,
+    logits_loc: BufLoc,
+    vocab: usize,
+    // step-2 (on-NPU argmax): when the ELF has the fused per-column partial argmax, `amax_loc` is the 64-B
+    // output (cols × [val:f32 | idx:i32]); the host does the trivial cols-way reduce → token id. While
+    // validating, we compute BOTH the NPU id and the host argmax(logits) and count mismatches.
+    amax_loc: Option<BufLoc>,
+    cols: usize,
+    vocab_pad: usize,
+    amax_mismatch: std::cell::Cell<usize>,
+    amax_checked: std::cell::Cell<usize>,
+}
+
+impl ProjOutElf {
+    fn load(dev: &Rc<Device>, dir: &Path, _w: &WhisperDecoderWeights) -> Self {
+        let elf = std::fs::read(dir.join("projout.elf"))
+            .unwrap_or_else(|e| panic!("read projout.elf: {e} (run scripts/build_projout_elf.sh)"));
+        let meta: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("meta.json")).expect("read projout meta.json"))
+                .expect("parse projout meta.json");
+        let usz = |k: &str| meta[k].as_u64().expect(k) as usize;
+        let (in_sz, out_sz, scr_sz) = (usz("input_size"), usz("output_size"), usz("scratch_size"));
+        let vocab = usz("vocab");
+        let mut layout = HashMap::new();
+        for (name, e) in meta["layout"].as_object().expect("projout layout") {
+            let arena = match e["type"].as_str().unwrap() {
+                "input" => Arena::Input,
+                "output" => Arena::Output,
+                "scratch" => Arena::Scratch,
+                o => panic!("bad arena type {o}"),
+            };
+            layout.insert(
+                name.clone(),
+                BufLoc { arena, off: e["offset"].as_u64().unwrap() as usize, len: e["len"].as_u64().unwrap() as usize },
+            );
+        }
+        let arena = FusedArena::new(dev, in_sz, out_sz, scr_sz).expect("alloc projout arena");
+        for name in meta["weights"].as_array().expect("projout weights") {
+            let name = name.as_str().unwrap();
+            let bytes = std::fs::read(dir.join("buffers").join(format!("{name}.bin")))
+                .unwrap_or_else(|e| panic!("read projout buffer {name}.bin: {e}"));
+            let loc = &layout[name];
+            assert_eq!(bytes.len(), loc.len, "{name}: blob {} != layout {}", bytes.len(), loc.len);
+            arena.write_at(loc.arena, loc.off, &bytes).unwrap();
+        }
+        // K-aug bias: write the input tail [1, 0…0] (vs elems) at element offset D ONCE. The β·W bias is
+        // folded into the GEMV weight's column D, so GEMV(mat, [nrm, 1, 0…]) = norm·(γ⊙W) + β·W = complete
+        // logits on-device. Per token we only overwrite [0:D], so this tail persists.
+        let vs = usz("vs");
+        let d = usz("D");
+        let x_loc = layout["x"];
+        let mut tail = vec![0f32; vs];
+        tail[0] = 1.0;
+        arena.write_at(x_loc.arena, x_loc.off + d * 2, &pack_bf16_bytes(&tail)).unwrap();
+        arena.sync_input().unwrap();
+        let kern = dev.load_elf_kernel(&elf, Some("main:sequence")).expect("register projout ELF");
+        let has_argmax = meta.get("argmax").and_then(|v| v.as_bool()).unwrap_or(false);
+        let cols = meta.get("cols").and_then(|v| v.as_u64()).unwrap_or(8) as usize;
+        let vocab_pad = usz("vocab_pad");
+        let amax_loc = if has_argmax { Some(layout["amax"]) } else { None };
+        eprintln!("[whisper_decoder] NPU_DECODE_PROJOUT_ELF: proj_out GEMV ELF, 1 dispatch/token (vocab_pad={}, K-aug bias{}, weight {:.0} MB)",
+            vocab_pad, if has_argmax { ", +on-NPU argmax (validating)" } else { "" }, scr_sz as f64 / 1e6);
+        ProjOutElf {
+            arena, kern, x_loc, logits_loc: layout["logits"], vocab, amax_loc, cols, vocab_pad,
+            amax_mismatch: std::cell::Cell::new(0), amax_checked: std::cell::Cell::new(0),
+        }
+    }
+
+    /// Host cols-way reduce of the NPU per-column partials: `amax` = cols × [val:f32 | idx:i32] (8 B each).
+    /// Column c covers logits[c·slice : (c+1)·slice]; global token = c·slice + local_idx; pick the column
+    /// with the largest value (strict `>`, first wins — matches host argmax). Returns the token id.
+    fn argmax_from_amax(&self, amax: &[u8]) -> i64 {
+        let slice = self.vocab_pad / self.cols;
+        let (mut best_val, mut best_tok) = (f32::NEG_INFINITY, 0usize);
+        for c in 0..self.cols {
+            let o = c * 8;
+            let val = f32::from_le_bytes([amax[o], amax[o + 1], amax[o + 2], amax[o + 3]]);
+            let idx = i32::from_le_bytes([amax[o + 4], amax[o + 5], amax[o + 6], amax[o + 7]]) as usize;
+            if val > best_val {
+                best_val = val;
+                best_tok = c * slice + idx;
+            }
+        }
+        best_tok as i64
+    }
+
+    /// `nrm` = affine-free normalized hidden [D]. One NPU dispatch → logits[0:vocab] (β·W bias is folded
+    /// into the GEMV via K-aug — the device emits complete logits, no host bias-add).
+    fn logits(&self, nrm: &[f32]) -> Vec<f32> {
+        let xb = pack_bf16_bytes(nrm);
+        self.arena.write_at(self.x_loc.arena, self.x_loc.off, &xb).unwrap();
+        self.arena.sync_input().unwrap();
+        self.arena.dispatch(&self.kern).expect("projout dispatch");
+        self.arena.sync_from_device().unwrap();
+        let mut ob = vec![0u8; self.logits_loc.len];
+        self.arena.read_at(self.logits_loc.arena, self.logits_loc.off, &mut ob).unwrap();
+        let mut logits = unpack_bf16_bytes(&ob); // [vocab_pad]
+        logits.truncate(self.vocab);
+        // step-2 validation: compare the on-NPU argmax (host cols-way reduce of `amax`) vs host argmax(logits).
+        if let Some(al) = self.amax_loc {
+            let mut ab = vec![0u8; al.len];
+            self.arena.read_at(al.arena, al.off, &mut ab).unwrap();
+            let id_npu = self.argmax_from_amax(&ab);
+            let mut id_host = 0usize;
+            for i in 1..self.vocab {
+                if logits[i] > logits[id_host] {
+                    id_host = i;
+                }
+            }
+            self.amax_checked.set(self.amax_checked.get() + 1);
+            if id_npu != id_host as i64 {
+                let n = self.amax_mismatch.get() + 1;
+                self.amax_mismatch.set(n);
+                if n <= 8 {
+                    eprintln!("[projout argmax] MISMATCH #{n}: npu={id_npu} host={id_host} (logit npu={:.4} host={:.4})",
+                        logits.get(id_npu as usize).copied().unwrap_or(f32::NAN), logits[id_host]);
+                }
+            }
+        }
+        logits
+    }
+
+    /// e2e/NPU steady-state: dispatch + read ONLY the 64-B `amax` partials → token id (host cols-way
+    /// reduce). Drops the 104 KB logits readback + host argmax. Requires the argmax-fused ELF.
+    fn token_id(&self, nrm: &[f32]) -> i64 {
+        let al = self.amax_loc.expect("token_id needs the argmax-fused proj_out ELF");
+        let xb = pack_bf16_bytes(nrm);
+        self.arena.write_at(self.x_loc.arena, self.x_loc.off, &xb).unwrap();
+        self.arena.sync_input().unwrap();
+        self.arena.dispatch(&self.kern).expect("projout dispatch");
+        self.arena.sync_from_device().unwrap();
+        let mut ab = vec![0u8; al.len];
+        self.arena.read_at(al.arena, al.off, &mut ab).unwrap();
+        self.argmax_from_amax(&ab)
+    }
+
+    fn has_argmax(&self) -> bool {
+        self.amax_loc.is_some()
+    }
+
+    fn dump_amax_stats(&self) {
+        if self.amax_loc.is_some() {
+            eprintln!("[projout argmax] validation: {} mismatches / {} tokens (host cols-way vs host argmax)",
+                self.amax_mismatch.get(), self.amax_checked.get());
+        }
+    }
 }
 
 /// P0 per-phase timing accumulator (env `FUSED_PHASE_TIMING`). All values are nanoseconds, summed
@@ -643,6 +801,9 @@ pub struct FusedDecoder {
     /// (pre-transposed [H,HD,TP]) to int8 with a per-(head,HD) scale `s_cv` the host computes from the real
     /// Venc + writes for op_mul_cv to apply to the context output. Halves the Venc LPDDR re-read. Default false.
     int8_cross_v: bool,
+    /// e2e/NPU: the ELF outputs logits[VOCAB_PAD] (ln_post+proj_out on-NPU) -> step() returns them
+    /// directly (drops the host proj_out matmul). Default false = ELF outputs the 768-hidden.
+    npu_logits: bool,
     n_self: usize, // self-KV positions already written this utterance (== KV write slot for next token)
     timing: bool,  // env FUSED_PHASE_TIMING: accumulate + dump the per-phase breakdown
     ph: PhaseAcc,
@@ -657,6 +818,18 @@ pub struct FusedDecoder {
     /// kernel. When present, `precompute_cross` computes the encoder cross-K/V fold (12×2 [1500,768]@
     /// [768,768] GEMMs, ~370 ms host) on the NPU instead of the CPU. `None` = host f32 fold (fallback).
     cross_ops: Option<Vec<(CtxAOp, CtxAOp)>>,
+    /// e2e/NPU step-1 (env `NPU_DECODE_PROJOUT_CTX2=1`): run the per-token `ln_post`+`proj_out` logits
+    /// projection on the NPU's resident ctx2 kernel instead of the host f32 ~40M-MAC matmul. The vocab
+    /// (51865) is computed in `ceil(VOCAB/NA)=17` chunks of N=`NA`=3072 (the resident kernel's max served
+    /// stream width — a single 52224-wide stream would need a new 17×-larger xclbin), each a `CtxAOp` whose
+    /// weight folds the LN affine: `W'_chunk = γ[:,None]·proj_out_w[:,chunk]`, `bias'_chunk = β·proj_out_w[:,chunk]`.
+    /// `step()` normalizes the hidden WITHOUT affine, runs the 17 chunk GEMVs, concatenates → logits[0:VOCAB].
+    /// Host argmax stays (step-2 moves it on-NPU). bf16 ctx2 (default precision) → gate WER. `None` = host f32.
+    proj_out_ops: Option<Vec<CtxAOp>>,
+    /// e2e/NPU wide-dispatch lm-head (env `NPU_DECODE_PROJOUT_ELF=1`): the standalone proj_out GEMV ELF —
+    /// ONE dispatch/token (vs the 17 ctx2 chunks), the latency-positive path. Takes precedence over
+    /// `proj_out_ops` when both are set. `None` = use `proj_out_ops` or the host f32 matmul.
+    proj_out_elf: Option<ProjOutElf>,
     /// PIPE 1-deep lookahead slot (the DEFAULT fused decode path): `(n_self_it_was_built_for, kernel)`.
     /// The patched ELF for the next token depends ONLY on `n_self` (KV-write offset + softmax mask), not
     /// the argmax'd token, so it is registered on the host during the PREVIOUS token's dispatch (see
@@ -741,6 +914,27 @@ impl FusedDecoder {
             arena.write_at(loc.arena, loc.off, &bytes).unwrap();
         }
 
+        // BIAS FUSION (K-aug): write the augmentation tail [1, 0..0] (VS elems) ONCE at element offset k of
+        // each L*_<suffix> GEMV-input buffer. The producing op writes only [0:k], so this constant persists
+        // for every token → GEMV(W_aug, [x,1,0..]) = W·x + bias, with the separate bias-add op eliminated.
+        if let Some(aug) = meta.get("fuse_bias_aug").and_then(|v| v.as_object()) {
+            let vs = meta.get("fuse_bias_vs").and_then(|v| v.as_u64()).unwrap_or(64) as usize;
+            let nl = meta["dims"]["layers"].as_u64().expect("dims.layers") as usize;
+            let mut tail = vec![0f32; vs];
+            tail[0] = 1.0;
+            let tail_bytes = pack_bf16_bytes(&tail);
+            for (suffix, kval) in aug {
+                let k = kval.as_u64().expect("fuse_bias_aug k") as usize;
+                for li in 0..nl {
+                    let loc = &layout[&format!("L{li}_{suffix}")];
+                    arena.write_at(loc.arena, loc.off + k * 2, &tail_bytes).unwrap();
+                }
+            }
+            if !aug.is_empty() {
+                eprintln!("[whisper_decoder] fuse_bias: K-aug tails written ({} input(s) × {} layers)", aug.len(), nl);
+            }
+        }
+
         // KV cache offsets (bytes) for the patcher: every per-layer kcache/vcache.
         let mut kv_offsets: Vec<u32> = Vec::new();
         for (name, loc) in &layout {
@@ -757,6 +951,10 @@ impl FusedDecoder {
             eprintln!("[whisper_decoder] int8_cross_k: per-utterance per-channel Kenc int8 (s_cq -> op_mul_cq on qc)");
         }
         let int8_cross_v = meta.get("int8_cross_v").and_then(|v| v.as_bool()).unwrap_or(false);
+        let npu_logits = meta.get("npu_logits").and_then(|v| v.as_bool()).unwrap_or(false);
+        if npu_logits {
+            eprintln!("[whisper_decoder] npu_logits: ln_post+proj_out on the NPU (ELF outputs logits)");
+        }
         if int8_cross_v {
             assert!(coalesce_cross, "int8_cross_v requires coalesce_cross (Venc must be resident pre-transposed)");
             eprintln!("[whisper_decoder] int8_cross_v: per-utterance per-channel Venc int8 (s_cv -> op_mul_cv on ctc)");
@@ -810,6 +1008,30 @@ impl FusedDecoder {
         // Lever #2: register per-layer cross-K/V GEMM ops on the shared ctx2 kernel (NPU fold). Opt
         // out with NPU_DECODE_FUSED_HOSTCROSS=1 (keeps the host f32 fold for A/B + WER comparison).
         let host_cross = std::env::var("NPU_DECODE_FUSED_HOSTCROSS").is_ok();
+        // e2e/NPU step-1: build the proj_out ctx2 ops (same shared kernel) when opted-in. Keep an Rc
+        // clone since the cross-ops match below consumes `shared`.
+        let proj_out_ops = match (shared.as_ref(), std::env::var("NPU_DECODE_PROJOUT_CTX2").is_ok()) {
+            (Some(sh), true) => {
+                let ops = build_proj_out_ctx2(sh, &w);
+                eprintln!(
+                    "[whisper_decoder] NPU_DECODE_PROJOUT_CTX2: ln_post+proj_out on NPU ctx2 ({} chunks of N={})",
+                    ops.len(),
+                    npu_asr::ctx2::NA
+                );
+                Some(ops)
+            }
+            _ => None,
+        };
+        // e2e/NPU wide-dispatch lm-head: load the standalone proj_out GEMV ELF (1 dispatch/token) when
+        // opted-in. Default dir artifacts/projout_elf; override with NPU_DECODE_PROJOUT_ELF_DIR.
+        let proj_out_elf = if std::env::var("NPU_DECODE_PROJOUT_ELF").is_ok() {
+            let dir = std::env::var("NPU_DECODE_PROJOUT_ELF_DIR")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| fused_dir.parent().unwrap_or(fused_dir).join("projout_elf"));
+            Some(ProjOutElf::load(dev, &dir, &w))
+        } else {
+            None
+        };
         let cross_ops = match (shared, host_cross) {
             (Some(sh), false) => {
                 let ops: Vec<(CtxAOp, CtxAOp)> = w
@@ -845,11 +1067,14 @@ impl FusedDecoder {
             coalesce_cross,
             int8_cross_k,
             int8_cross_v,
+            npu_logits,
             n_self: 0,
             timing,
             ph: PhaseAcc::default(),
             reuse_ctx,
             cross_ops,
+            proj_out_ops,
+            proj_out_elf,
             next_kern: None,
             resident,
         }
@@ -1003,8 +1228,8 @@ impl FusedDecoder {
 
     /// One decode step → vocab logits `[51865]`. Embeds token+pos, dispatches the whole 12-layer ELF
     /// (KV write slot + softmax mask patched for this position), then host ln_post + proj_out.
-    pub fn step(&mut self, token: i64, pos: usize) -> Vec<f32> {
-        let mut tmr = Lap::start(self.timing);
+    /// Shared decode preamble: embed the token, dispatch the fused decode ELF, return the 768-hidden `x12`.
+    fn run_hidden(&mut self, token: i64, pos: usize, tmr: &mut Lap) -> Vec<f32> {
         let tok = token as usize;
         let x: Vec<f32> = (0..D)
             .map(|d| self.w.embed_tokens[[tok, d]] + self.w.embed_positions[[pos, d]])
@@ -1017,11 +1242,11 @@ impl FusedDecoder {
         // writes, no patch/reload. Else PIPE (async-prefetch the next position's ELF registration under
         // this dispatch) is the default; the REUSECTX diagnostic opts out to the synchronous rebind path.
         if self.resident.is_some() {
-            self.dispatch_resident(&mut tmr);
+            self.dispatch_resident(tmr);
         } else if self.reuse_ctx.is_some() {
-            self.dispatch_sync(&mut tmr);
+            self.dispatch_sync(tmr);
         } else {
-            self.dispatch_pipe(&mut tmr);
+            self.dispatch_pipe(tmr);
         }
 
         let oloc = &self.layout[&self.output];
@@ -1029,6 +1254,66 @@ impl FusedDecoder {
         self.arena.read_at(oloc.arena, oloc.off, &mut out_bytes).unwrap();
         let x12 = unpack_bf16_bytes(&out_bytes);
         tmr.lap(&mut self.ph.read_unpack);
+        x12
+    }
+
+    /// e2e/NPU steady-state: hidden → proj_out + argmax ON THE NPU → token id (only the 64-B partials are
+    /// read back, not the 104 KB logits). Requires the argmax-fused proj_out ELF (`gen_projout --argmax`).
+    pub fn step_token(&mut self, token: i64, pos: usize) -> i64 {
+        let mut tmr = Lap::start(self.timing);
+        let x12 = self.run_hidden(token, pos, &mut tmr);
+        let nrm = ln_norm_only(&x12[0..D]);
+        let id = self.proj_out_elf.as_ref().expect("step_token needs proj_out_elf").token_id(&nrm);
+        tmr.lap(&mut self.ph.lm_head);
+        self.ph.steps += 1;
+        id
+    }
+
+    /// Whether the steady-state token-id path (`step_token`) is available (argmax-fused ELF loaded).
+    pub fn has_npu_argmax(&self) -> bool {
+        self.proj_out_elf.as_ref().is_some_and(|pe| pe.has_argmax())
+    }
+
+    pub fn step(&mut self, token: i64, pos: usize) -> Vec<f32> {
+        let mut tmr = Lap::start(self.timing);
+        let x12 = self.run_hidden(token, pos, &mut tmr);
+
+        // e2e/NPU: the ELF already computed ln_post + proj_out → logits[VOCAB_PAD]. Return logits[0:VOCAB]
+        // directly (host argmax over them); the ~40M-MAC host proj_out matmul is gone.
+        if self.npu_logits {
+            self.ph.steps += 1;
+            return x12[0..VOCAB].to_vec();
+        }
+
+        // e2e/NPU wide-dispatch lm-head: the standalone proj_out GEMV ELF — ONE dispatch/token (vs the 17
+        // ctx2 chunks). Highest precedence. The LN affine + β·W bias are handled inside `logits()`.
+        if let Some(ref pe) = self.proj_out_elf {
+            let nrm = ln_norm_only(&x12[0..D]);
+            let logits = pe.logits(&nrm);
+            tmr.lap(&mut self.ph.lm_head);
+            self.ph.steps += 1;
+            return logits;
+        }
+
+        // e2e/NPU step-1: ln_post + proj_out on the NPU ctx2 kernel (17 chunks of N=NA). The LN affine
+        // (γ,β) is folded into each chunk's weight/bias, so here we normalize the hidden WITHOUT affine,
+        // then run the chunk GEMVs and concatenate into logits[0:VOCAB]. Host argmax follows (step-2 moves it).
+        if let Some(ref pops) = self.proj_out_ops {
+            let nrm = ln_norm_only(&x12[0..D]);
+            let nrm2d = Array2::from_shape_vec((1, D), nrm).expect("nrm [1,D]");
+            let na = npu_asr::ctx2::NA;
+            let mut logits = vec![0f32; VOCAB];
+            for (c, op) in pops.iter().enumerate() {
+                let out = op.forward(&nrm2d); // [1, NA] f32
+                let row = out.row(0);
+                let j0 = c * na;
+                let width = (VOCAB - j0).min(na); // last chunk's pad cols (0-weight → 0) are dropped
+                logits[j0..j0 + width].copy_from_slice(&row.as_slice().unwrap()[0..width]);
+            }
+            tmr.lap(&mut self.ph.lm_head);
+            self.ph.steps += 1;
+            return logits;
+        }
 
         // final LN + proj_out → logits (host f32, like every other backend).
         let ln = ln_row(&x12[0..D], &self.w.ln_post_w, &self.w.ln_post_b);
@@ -1163,6 +1448,9 @@ impl FusedDecoder {
     /// the `WHISPER_TIMING` `ms_per_tok` (modulo the few extra lang-detect+prompt dispatches). No-op
     /// unless `FUSED_PHASE_TIMING` is set.
     pub fn dump_phase_timing(&self) {
+        if let Some(pe) = &self.proj_out_elf {
+            pe.dump_amax_stats();
+        }
         if !self.timing || self.ph.steps == 0 {
             return;
         }
@@ -1540,6 +1828,49 @@ fn apply_tiled_ctxa(op: &CtxAOp, x: &Array2<f32>) -> Array2<f32> {
         r = end;
     }
     out
+}
+
+/// e2e/NPU step-1: build the per-chunk `proj_out` ctx2 ops. The resident ctx2 kernel serves output
+/// widths ≤ `NA`=3072, so the 51865-wide vocab is computed in `ceil(VOCAB/NA)=17` chunks, each a
+/// `CtxAOp(N=NA, Epi::Bias)`. The LN affine folds into the weight/bias so the GEMV input is the
+/// affine-free normalized hidden: `logits = (norm·γ+β)·W = norm·(γ⊙W) + (β·W)`. Per chunk:
+///   `W'[i, jj] = γ[i] · proj_out_w[i, j0+jj]`,  `bias'[jj] = Σ_i β[i]·proj_out_w[i, j0+jj]`
+/// (the last chunk's `jj ≥ width` cols get 0 weight + 0 bias — harmless, dropped in `step()`).
+fn build_proj_out_ctx2(sh: &Rc<SharedCtxA>, w: &WhisperDecoderWeights) -> Vec<CtxAOp> {
+    let na = npu_asr::ctx2::NA;
+    let gamma = &w.ln_post_w; // [D]
+    let beta = &w.ln_post_b;  // [D]
+    let pw = &w.proj_out_w;   // [D, VOCAB]
+    assert_eq!(pw.dim(), (D, VOCAB), "proj_out_w shape");
+    let n_chunks = VOCAB.div_ceil(na);
+    let mut ops = Vec::with_capacity(n_chunks);
+    for c in 0..n_chunks {
+        let j0 = c * na;
+        let width = (VOCAB - j0).min(na);
+        let mut wp = Array2::<f32>::zeros((D, na));
+        let mut bias = vec![0f32; na];
+        for i in 0..D {
+            let (gi, bi) = (gamma[i], beta[i]);
+            for jj in 0..width {
+                let wv = pw[[i, j0 + jj]];
+                wp[[i, jj]] = gi * wv;
+                bias[jj] += bi * wv;
+            }
+        }
+        ops.push(CtxAOp::new(sh.clone(), &wp, na, Epi::Bias, &bias));
+    }
+    ops
+}
+
+/// Affine-free LayerNorm normalize of a single row: `(x - μ)/σ` (population variance, eps 1e-5), WITHOUT
+/// the γ/β affine — used by the e2e/NPU proj_out paths, where the ln_post affine is folded into the
+/// proj_out weight/bias instead (`logits = (norm·γ+β)·W = norm·(γ⊙W) + β·W`).
+fn ln_norm_only(x: &[f32]) -> Vec<f32> {
+    let d = x.len();
+    let mean: f32 = x.iter().sum::<f32>() / d as f32;
+    let var: f32 = x.iter().map(|&v| (v - mean) * (v - mean)).sum::<f32>() / d as f32;
+    let inv = 1.0 / (var + LN_EPS).sqrt();
+    x.iter().map(|&v| (v - mean) * inv).collect()
 }
 
 /// LayerNorm of a single row (last-axis affine, population variance, eps 1e-5) — same math as

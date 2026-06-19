@@ -110,6 +110,21 @@ def main():
     # Q/K/V) so each is WER-gated independently.
     ap.add_argument("--int8-ffn", action="store_true", help="int8 static FFN weights (Wf1, Wf2)")
     ap.add_argument("--int8-attn-w", action="store_true", help="int8 static attention weights (Wqkv, Wso, Wcq, Wco)")
+    # BIAS FUSION (inter-op overhead lever, the M=1 LATENCY attack — fewer ops, not fewer bytes): fold the
+    # post-GEMV bias-add INTO the GEMV via K-augmentation (append the bias as one extra weight column + a
+    # constant 1 to the input vector), eliminating the separate ElementwiseAdd op. EXACT (WER must == base).
+    # --fuse-bias-ffn = the 2 FFN GEMVs (Wf1, Wf2); attention GEMVs are a follow-on.
+    ap.add_argument("--fuse-bias-ffn", action="store_true", help="fold Wf1/Wf2 bias into the GEMV (K-aug), drop the 2 add ops")
+    # --fuse-bias-attn = the 4 attention GEMVs: op_qkv (Wqkv) + op_proj (Wso/Wcq/Wco, reused 3×). Drops 4
+    # bias-adds. Inputs augmented: xn_s (qkv), cts (Wso), xn_c (Wcq), ctc (Wco). Same K-aug mechanism as FFN.
+    ap.add_argument("--fuse-bias-attn", action="store_true", help="fold Wqkv/Wso/Wcq/Wco bias into the GEMV (K-aug), drop 4 add ops")
+    # --fuse-gelu: fold the FFN GELU into op_f1's epilogue (gelu over the m_output C-tile, in the GEMV
+    # core_body). REQUIRES --fuse-bias-ffn so op_f1 outputs W·x+bias and the epilogue gives gelu(W·x+bias).
+    ap.add_argument("--fuse-gelu", action="store_true", help="fold the FFN GELU into op_f1's epilogue (needs --fuse-bias-ffn)")
+    # --npu-logits (e2e/NPU migration step 1): run ln_post + proj_out ON THE NPU — the ELF outputs
+    # logits[VOCAB_PAD] instead of the 768-hidden, so the host drops the ~40M-MAC proj_out matmul (argmax
+    # stays host for now). ln_post affine folds into proj_out (the LN op is pure-normalize).
+    ap.add_argument("--npu-logits", action="store_true", help="run ln_post+proj_out on the NPU (ELF outputs logits)")
     a = ap.parse_args()
     co_cross, co_self = a.coalesce_cross, a.coalesce_self
     co_self_tr = a.coalesce_self_tr
@@ -117,6 +132,26 @@ def main():
     int8_cv = a.int8_cross_v
     int8_ffn = a.int8_ffn
     int8_attn_w = a.int8_attn_w
+    fuse_ffn = a.fuse_bias_ffn
+    fuse_attn = a.fuse_bias_attn
+    fuse_gelu = a.fuse_gelu
+    npu_logits = a.npu_logits
+    if fuse_gelu and not fuse_ffn:
+        ap.error("--fuse-gelu requires --fuse-bias-ffn (the epilogue needs op_f1 to output W·x+bias)")
+    VS = 64  # kernel_vector_size — K must stay a multiple of it; K-aug pads by exactly one VS block
+    if fuse_ffn and int8_ffn:
+        ap.error("--fuse-bias-ffn + --int8-ffn not supported together yet (int8 quant of the aug weight)")
+    if fuse_attn and (int8_attn_w or int8_ck or int8_cv):
+        ap.error("--fuse-bias-attn not supported with int8 attention/cross flags yet (aug-weight quant + qc/ctc scale interplay)")
+
+    def aug_bias(mat, bias):
+        """K-augment a weight [M,K] with its [M] bias -> [M, K+VS]: column K = bias, columns K+1..K+VS-1 = 0.
+        With input x_aug = [x, 1, 0..0], GEMV(W_aug, x_aug) = W·x + bias in ONE op (the bias-add is gone)."""
+        M, K = mat.shape
+        out = np.zeros((M, K + VS), np.float32)
+        out[:, 0:K] = mat
+        out[:, K] = bias
+        return out
     if int8_cv and not co_cross:
         ap.error("--int8-cross-v requires --coalesce-cross (op_ct_c must read the resident pre-transposed Venc)")
 
@@ -139,7 +174,7 @@ def main():
     # ---- ops (created once, reused for all layers) ----
     ctx = AIEContext()
     op_ln = LayerNorm(size=D, num_aie_columns=1, num_channels=1, tile_size=D, context=ctx)
-    op_proj = GEMV(M=D, K=D, num_aie_columns=8, tile_size_input=4, tile_size_output=D // 8,
+    op_proj = GEMV(M=D, K=D + (VS if fuse_attn else 0), num_aie_columns=8, tile_size_input=4, tile_size_output=D // 8,
                    dtype_a=("int8" if int8_attn_w else "bf16"), context=ctx)
     op_add768 = ElementwiseAdd(size=D, tile_size=D // 8, num_aie_columns=8, context=ctx)
     op_mul_cq = ElementwiseMul(size=D, tile_size=D // 8, num_aie_columns=8, context=ctx)  # int8 cross-K: qc *= s_cq
@@ -148,7 +183,7 @@ def main():
     op_mulw_d = ElementwiseMul(size=D, tile_size=D // 8, num_aie_columns=8, context=ctx)   # Wso/Wcq/Wco, Wf2 (M=D)
     op_mulw_qkv = ElementwiseMul(size=QKV, tile_size=QKV // 8, num_aie_columns=8, context=ctx)  # Wqkv (M=QKV)
     op_mulw_ff = ElementwiseMul(size=FF, tile_size=FF // 8, num_aie_columns=8, context=ctx)  # Wf1 (M=FF)
-    op_qkv = GEMV(M=QKV, K=D, num_aie_columns=8, tile_size_input=4, tile_size_output=QKV // 8,
+    op_qkv = GEMV(M=QKV, K=D + (VS if fuse_attn else 0), num_aie_columns=8, tile_size_input=4, tile_size_output=QKV // 8,
                   dtype_a=("int8" if int8_attn_w else "bf16"), context=ctx)
     op_add_qkv = ElementwiseAdd(size=QKV, tile_size=QKV // 8, num_aie_columns=8, context=ctx)
     sc = dict(input_sizes=(H, HD), input_strides=(HD, 1), input_offset=0, output_sizes=(1, H, HD),
@@ -183,11 +218,12 @@ def main():
     op_tr_c = None if co_cross else Transpose(M=TP, N=HD, num_aie_columns=2, num_channels=1, m=tmc, n=tnc, s=tsc, context=ctx)
     op_ct_c = GEMV(M=HD, K=TP, num_aie_columns=8, tile_size_input=4, tile_size_output=HD // 8, num_batches=H,
                    dtype_a=("int8" if int8_cv else "bf16"), context=ctx)
-    op_f1 = GEMV(M=FF, K=D, num_aie_columns=8, tile_size_input=4, tile_size_output=FF // 8,
-                 dtype_a=("int8" if int8_ffn else "bf16"), context=ctx)
+    # fuse_ffn: op_f1/op_f2 contract over the AUGMENTED K (real K + VS); the bias rides in the extra block.
+    op_f1 = GEMV(M=FF, K=D + (VS if fuse_ffn else 0), num_aie_columns=8, tile_size_input=4, tile_size_output=FF // 8,
+                 dtype_a=("int8" if int8_ffn else "bf16"), epilogue=("gelu" if fuse_gelu else "none"), context=ctx)
     op_add_ff = ElementwiseAdd(size=FF, tile_size=FF // 8, num_aie_columns=8, context=ctx)
     op_gelu = GELU(size=FF, num_aie_columns=8, num_channels=1, tile_size=FF // 8, context=ctx)
-    op_f2 = GEMV(M=D, K=FF, num_aie_columns=8, tile_size_input=4, tile_size_output=D // 8,
+    op_f2 = GEMV(M=D, K=FF + (VS if fuse_ffn else 0), num_aie_columns=8, tile_size_input=4, tile_size_output=D // 8,
                  dtype_a=("int8" if int8_ffn else "bf16"), context=ctx)
 
     HSs, HSc, phs, phc = H * S * 2, H * TP * 2, S * HD * 2, TP * HD * 2
@@ -260,12 +296,23 @@ def main():
                 # matches the GEMV's int8 A layout (a_k=K//2). wb writes the bytes through unchanged.
                 return np.ascontiguousarray(q).reshape(-1).view(BF16)
             return bf16(mat).reshape(-1)
-        for nm, arr in [("Wqkv", w_or_i8(mat_qkv, int8_attn_w, "sw_qkv")), ("bias_qkv", bf16(bias_qkv)),
-                        ("Wso", w_or_i8(Wso.T.copy(), int8_attn_w, "sw_so")), ("bso", bf16(bso)),
-                        ("Wcq", w_or_i8(mat_cq, int8_attn_w, "sw_cq")), ("bias_cq", bf16(bias_cq)),
-                        ("Wco", w_or_i8(Wco.T.copy(), int8_attn_w, "sw_co")), ("bco", bf16(bco)),
-                        ("Wf1", w_or_i8(mat_f1, int8_ffn, "sw_f1")), ("bias_f1", bf16(bias_f1)),
-                        ("Wf2", w_or_i8(Wf2.T.copy(), int8_ffn, "sw_f2")), ("bf2", bf16(bf2)),
+        for nm, arr in [
+                        # fuse_attn: Wqkv/Wso/Wcq/Wco K-augmented with their bias; the separate bias buffers
+                        # are dropped. Else unchanged (+ optional int8 attn-w).
+                        ("Wqkv", bf16(aug_bias(mat_qkv, bias_qkv)).reshape(-1) if fuse_attn else w_or_i8(mat_qkv, int8_attn_w, "sw_qkv")),
+                        *([] if fuse_attn else [("bias_qkv", bf16(bias_qkv))]),
+                        ("Wso", bf16(aug_bias(Wso.T.copy(), bso)).reshape(-1) if fuse_attn else w_or_i8(Wso.T.copy(), int8_attn_w, "sw_so")),
+                        *([] if fuse_attn else [("bso", bf16(bso))]),
+                        ("Wcq", bf16(aug_bias(mat_cq, bias_cq)).reshape(-1) if fuse_attn else w_or_i8(mat_cq, int8_attn_w, "sw_cq")),
+                        *([] if fuse_attn else [("bias_cq", bf16(bias_cq))]),
+                        ("Wco", bf16(aug_bias(Wco.T.copy(), bco)).reshape(-1) if fuse_attn else w_or_i8(Wco.T.copy(), int8_attn_w, "sw_co")),
+                        *([] if fuse_attn else [("bco", bf16(bco))]),
+                        # fuse_ffn: Wf1/Wf2 are K-augmented with their bias (one extra column); the separate
+                        # bias_f1/bf2 buffers are dropped (folded in). Else unchanged (+ optional int8).
+                        ("Wf1", bf16(aug_bias(mat_f1, bias_f1)).reshape(-1) if fuse_ffn else w_or_i8(mat_f1, int8_ffn, "sw_f1")),
+                        *([] if fuse_ffn else [("bias_f1", bf16(bias_f1))]),
+                        ("Wf2", bf16(aug_bias(Wf2.T.copy(), bf2)).reshape(-1) if fuse_ffn else w_or_i8(Wf2.T.copy(), int8_ffn, "sw_f2")),
+                        *([] if fuse_ffn else [("bf2", bf16(bf2))]),
                         ("Kenc", (Kenc_i8 if int8_ck else Kenc_b).reshape(-1)),
                         # (i): pre-transpose Venc to [H,HD,TP] when coalescing cross; else [H,TP,HD] (deep-C).
                         # int8_cv: Venc_i8 is already pre-transposed int8 [H,HD,TP] (co_cross enforced).
@@ -296,6 +343,15 @@ def main():
         if int8_attn_w:
             bufsz[pre + "Wqkv"] = QKV * D; bufsz[pre + "Wso"] = D * D
             bufsz[pre + "Wcq"] = D * D; bufsz[pre + "Wco"] = D * D
+        if fuse_ffn:
+            # augmented GEMV inputs: producing op writes [0:K_real], GEMV reads [0:K_real+VS]; tail [1,0..]
+            # is set ONCE by the engine. xn_f feeds op_f1 (K=D), h feeds op_f2 (K=FF).
+            bufsz[pre + "xn_f"] = (D + VS) * 2
+            bufsz[pre + "h"] = (FF + VS) * 2
+        if fuse_attn:
+            # xn_s->op_qkv, cts->op_proj/Wso, xn_c->op_proj/Wcq, ctc->op_proj/Wco (all K=D).
+            for b in ("xn_s", "cts", "xn_c", "ctc"):
+                bufsz[pre + b] = (D + VS) * 2
         if not co_cross:  # cross-V transpose output buffer only when NOT pre-transposing Venc
             bufsz[pre + "vcTc"] = H * TP * HD * 2
         if not co_self_tr:  # self-V transpose output buffer only when NOT storing vcache transposed (M0.5)
@@ -313,34 +369,53 @@ def main():
         else:
             self_tr = [(op_tr_s, f"{pre}vcache[{h*phs}:{(h+1)*phs}]", f"{pre}vcT[{h*phs}:{(h+1)*phs}]") for h in range(H)]
             v_ct = "vcT"
+        # fuse_attn: K-augmented attention inputs — the PRODUCING op writes [0:D] (byte-sliced), the GEMV
+        # reads the full [D+VS]; the engine sets the [1,0..] tail. (D2 = D in bytes.)
+        D2 = D * 2
+        a_xns = f"xn_s[0:{D2}]" if fuse_attn else "xn_s"
+        a_xnc = f"xn_c[0:{D2}]" if fuse_attn else "xn_c"
+        a_cts = f"cts[0:{D2}]" if fuse_attn else "cts"
+        a_ctc = f"ctc[0:{D2}]" if fuse_attn else "ctc"
         # (i) cross-V: op_ct_c reads pre-transposed Venc directly (--coalesce-cross), or H per-head op_tr_c.
         # int8_cv (co_cross enforced): op_ct_c reads int8 Venc, then op_mul_cv scales ctc by per-channel s_cv.
-        cross_tr = ([(op_ct_c, pre + "Venc", f"{pre}swc[0:{HSc}]", pre + "ctc")]
+        cross_tr = ([(op_ct_c, pre + "Venc", f"{pre}swc[0:{HSc}]", pre + a_ctc)]
                     + ([(op_mul_cv, pre + "ctc", pre + "s_cv", pre + "ctc")] if int8_cv else []) if co_cross else
                     [(op_tr_c, f"{pre}Venc[{h*phc}:{(h+1)*phc}]", f"{pre}vcTc[{h*phc}:{(h+1)*phc}]") for h in range(H)]
-                    + [(op_ct_c, pre + "vcTc", f"{pre}swc[0:{HSc}]", pre + "ctc")])
+                    + [(op_ct_c, pre + "vcTc", f"{pre}swc[0:{HSc}]", pre + a_ctc)])
         # int8-weights: a per-row scale mul on the GEMV output, inserted BEFORE the bias add (no-op if bf16).
         def wm(op, buf, sname, is_i8):
             return [(op, buf, pre + sname, buf)] if is_i8 else []
+        # fuse_attn: drop the bias-add (folded into the aug weight); else keep it (with optional int8 mulw).
+        def ba(addop, *args, mulw=None, sname=None, is_i8=False):
+            return [] if fuse_attn else ((wm(mulw, args[0], sname, is_i8) if mulw else []) + [(addop, *args)])
         rl += [
-            (op_ln, cur, pre + "xn_s"),
-            (op_qkv, pre + "Wqkv", pre + "xn_s", pre + "qkv"), *wm(op_mulw_qkv, pre + "qkv", "sw_qkv", int8_attn_w), (op_add_qkv, pre + "qkv", pre + "bias_qkv", pre + "qkv"),
+            (op_ln, cur, pre + a_xns),
+            (op_qkv, pre + "Wqkv", pre + "xn_s", pre + "qkv"), *ba(op_add_qkv, pre + "qkv", pre + "bias_qkv", pre + "qkv", mulw=op_mulw_qkv, sname="sw_qkv", is_i8=int8_attn_w),
             (op_sck, pre + "qkv[1536:3072]", pre + "kcache"), (op_scv, pre + "qkv[3072:4608]", pre + "vcache"),
             (op_sc_s, pre + "kcache", pre + "qkv[0:1536]", f"{pre}scs[0:{HSs}]"), (op_sm_s, pre + "scs", pre + "sws"),
         ] + self_tr + [
-            (op_ct_s, pre + v_ct, f"{pre}sws[0:{HSs}]", pre + "cts"),
-            (op_proj, pre + "Wso", pre + "cts", pre + "asf"), *wm(op_mulw_d, pre + "asf", "sw_so", int8_attn_w), (op_add768, pre + "asf", pre + "bso", pre + "asf"),
+            (op_ct_s, pre + v_ct, f"{pre}sws[0:{HSs}]", pre + a_cts),
+            (op_proj, pre + "Wso", pre + "cts", pre + "asf"), *ba(op_add768, pre + "asf", pre + "bso", pre + "asf", mulw=op_mulw_d, sname="sw_so", is_i8=int8_attn_w),
             (op_add768, cur, pre + "asf", pre + "x1"),
-            (op_ln, pre + "x1", pre + "xn_c"),
-            (op_proj, pre + "Wcq", pre + "xn_c", pre + "qc"), *wm(op_mulw_d, pre + "qc", "sw_cq", int8_attn_w), (op_add768, pre + "qc", pre + "bias_cq", pre + "qc"),
+            (op_ln, pre + "x1", pre + a_xnc),
+            (op_proj, pre + "Wcq", pre + "xn_c", pre + "qc"), *ba(op_add768, pre + "qc", pre + "bias_cq", pre + "qc", mulw=op_mulw_d, sname="sw_cq", is_i8=int8_attn_w),
         ] + ([(op_mul_cq, pre + "qc", pre + "s_cq", pre + "qc")] if int8_ck else []) + [
             (op_sc_c, pre + "Kenc", pre + "qc", f"{pre}scc[0:{HSc}]"), (op_sm_c, pre + "scc", pre + "swc"),
         ] + cross_tr + [
-            (op_proj, pre + "Wco", pre + "ctc", pre + "acf"), *wm(op_mulw_d, pre + "acf", "sw_co", int8_attn_w), (op_add768, pre + "acf", pre + "bco", pre + "acf"),
+            (op_proj, pre + "Wco", pre + "ctc", pre + "acf"), *ba(op_add768, pre + "acf", pre + "bco", pre + "acf", mulw=op_mulw_d, sname="sw_co", is_i8=int8_attn_w),
             (op_add768, pre + "x1", pre + "acf", pre + "x2"),
-            (op_ln, pre + "x2", pre + "xn_f"),
+            (op_ln, pre + "x2", pre + (f"xn_f[0:{D*2}]" if fuse_ffn else "xn_f")),
+        ] + ([
+            # fuse_ffn: bias folded into Wf1/Wf2 (K-aug). op_f1 reads aug xn_f (D+VS), writes h[0:FF];
+            # op_gelu on [0:FF] (DROPPED if fuse_gelu — folded into op_f1's C-tile epilogue); op_f2 reads aug
+            # h (FF+VS). The 2 bias-adds are GONE. (slices are in BYTES)
+            (op_f1, pre + "Wf1", pre + "xn_f", pre + f"h[0:{FF*2}]"),
+            *([] if fuse_gelu else [(op_gelu, pre + f"h[0:{FF*2}]", pre + f"h[0:{FF*2}]")]),
+            (op_f2, pre + "Wf2", pre + "h", pre + "ff"),
+        ] if fuse_ffn else [
             (op_f1, pre + "Wf1", pre + "xn_f", pre + "h"), *wm(op_mulw_ff, pre + "h", "sw_f1", int8_ffn), (op_add_ff, pre + "h", pre + "bias_f1", pre + "h"), (op_gelu, pre + "h", pre + "h"),
             (op_f2, pre + "Wf2", pre + "h", pre + "ff"), *wm(op_mulw_d, pre + "ff", "sw_f2", int8_ffn), (op_add768, pre + "ff", pre + "bf2", pre + "ff"),
+        ]) + [
             (op_add768, pre + "x2", pre + "ff", nxt),
         ]
         layer_data.append(dict(mat_qkv=mat_qkv, bias_qkv=bias_qkv, Wso=Wso, bso=bso, mat_cq=mat_cq,
@@ -349,13 +424,53 @@ def main():
         cur = nxt
 
     out_name = cur
+    if npu_logits:
+        # e2e/NPU step 1: ln_post + proj_out on the NPU -> ELF outputs logits[VOCAB_PAD]. VOCAB_PAD pads to a
+        # multiple of num_aie_columns=8 (GEMV M constraint). ln_post affine folds into proj_out (LN op is
+        # pure-normalize): logits = (norm·γ + β)·W -> A=(γ·W).T [VOCAB,D], bias = β·W [VOCAB].
+        VOCAB, VOCAB_PAD = 51865, 65536  # 65536 = 2*32768 (ElementwiseAdd tiling) and %8 (GEMV M)
+        g_post = np.load(os.path.join(w, "ln_post.weight.npy")).astype(np.float32)
+        b_post = np.load(os.path.join(w, "ln_post.bias.npy")).astype(np.float32)
+        Wproj = np.load(os.path.join(w, "proj_out.weight.npy")).astype(np.float32)  # [D, VOCAB]
+        mat_proj = (g_post[:, None] * Wproj).T.copy()            # [VOCAB, D]
+        bias_proj = (b_post @ Wproj).astype(np.float32)          # [VOCAB]
+        mat_pad = np.zeros((VOCAB_PAD, D), np.float32); mat_pad[0:VOCAB] = mat_proj
+        bias_pad = np.full(VOCAB_PAD, -1e30, np.float32); bias_pad[0:VOCAB] = bias_proj  # pad rows never win argmax
+        op_proj_out = GEMV(M=VOCAB_PAD, K=D, num_aie_columns=8, tile_size_input=4, tile_size_output=VOCAB_PAD // 8, context=ctx)
+        op_add_logits = ElementwiseAdd(size=VOCAB_PAD, tile_size=VOCAB_PAD // 8, num_aie_columns=8, context=ctx)
+        rl += [
+            (op_ln, cur, "hn"),                                  # reuse op_ln (pure normalize, size=D)
+            (op_proj_out, "Wproj", "hn", "logits"),
+            (op_add_logits, "logits", "bias_proj", "logits"),
+        ]
+        weights_to_write["Wproj"] = bf16(mat_pad).reshape(-1)
+        weights_to_write["bias_proj"] = bf16(bias_pad)
+        bufsz["hn"] = D * 2
+        bufsz["logits"] = VOCAB_PAD * 2
+        out_name = "logits"
+    if os.environ.get("DUMP_OPS"):
+        from collections import Counter
+        c = Counter(type(e[0]).__name__ for e in rl)
+        print(f"# runlist: {len(rl)} entries over NL={NL} ({len(rl)//NL}/layer)")
+        for nm, n in c.most_common():
+            print(f"  {nm:18} {n:4}  ({n//NL}/layer)")
+        print("# --- full per-layer op sequence (buffers: out <- ins) ---")
+        for e in rl:
+            op = e[0]; bufs = list(e[1:])
+            ins = ", ".join(str(b) for b in bufs[:-1]); out = str(bufs[-1]) if bufs else "?"
+            print(f"  {type(op).__name__:16} {out:14} <- {ins}")
+        import sys; sys.exit(0)
     fused = FusedMLIROperator("decode", rl, input_args=["x"], output_args=[out_name],
                               buffer_sizes=bufsz, context=ctx)
     fused.compile()
     elf = load_elf(fused).view(np.uint8).tobytes()
     in_sz, out_sz, scr = fused.buffer_sizes
     wnames = list(weights_to_write.keys())
-    lay = {n: fused.get_layout_for_buffer(n) for n in ["x", out_name] + wnames}
+    # fuse_bias: the K-augmented SCRATCH inputs (xn_f, h) must be in the layout so the engine can find their
+    # arena offset to write the augmentation tail. (Normal scratch buffers aren't exported.)
+    _aug_sufs = (["xn_f", "h"] if fuse_ffn else []) + (["xn_s", "cts", "xn_c", "ctc"] if fuse_attn else [])
+    aug_names = [f"L{li}_{suf}" for li in range(NL) for suf in _aug_sufs]
+    lay = {n: fused.get_layout_for_buffer(n) for n in ["x", out_name] + wnames + aug_names}
 
     # Deep-C: aiecc emits the scratchpad StateTable layout (params.txt) next to the fused MLIR; parse
     # it so the host (Rust) knows each param's byte offset (= state_table_idx*4) + kind. The ctrl
@@ -434,6 +549,14 @@ def main():
         # int8 STATIC weights: L*_W{f1,f2} (int8_ffn) / L*_W{qkv,so,cq,co} (int8_attn_w) are int8 [M,K//2];
         # the op_mulw applies the static L*_sw_* per-row scale to the GEMV output before its bias add.
         "int8_ffn": bool(int8_ffn), "int8_attn_w": bool(int8_attn_w),
+        # BIAS FUSION (K-aug): each listed per-layer input buffer L*_<suffix> is sized real_k+VS; the engine
+        # writes the augmentation tail [1, 0..0] (VS elems) at element offset real_k ONCE (the producing op
+        # only writes [0:real_k], so the tail persists). Lets GEMV(W_aug,x_aug)=W·x+bias with no add op.
+        # e2e/NPU: ELF outputs logits[VOCAB_PAD] (ln_post+proj_out on-NPU); the engine reads them directly +
+        # drops the host proj_out matmul (argmax stays host: logits[0:51865]).
+        "npu_logits": bool(npu_logits),
+        "fuse_bias_aug": ({**({"xn_f": D, "h": FF} if fuse_ffn else {}),
+                           **({"xn_s": D, "cts": D, "xn_c": D, "ctc": D} if fuse_attn else {})}), "fuse_bias_vs": VS,
     }
     json.dump(meta, open(os.path.join(a.out, "meta.json"), "w"), indent=2)
     print(f"\nwrote {NL}-layer decode ELF ({len(elf)}B, scratch {scr/1e6:.1f}MB) to {a.out}")
