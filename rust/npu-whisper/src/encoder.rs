@@ -18,6 +18,31 @@ use crate::weights::{TensorMap, WhisperWeights};
 
 const LN_EPS: f32 = 1e-5;
 
+// --- B3: env-gated per-op encoder timing (ENC_PEROP_TIMING=1). Off by default -> production untouched.
+// Accumulates host-visible wall ms per stage across all 12 layers; printed by forward_last.
+thread_local! {
+    static ENC_PEROP: std::cell::RefCell<Option<Vec<(&'static str, f64)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+#[inline]
+fn perop_add(stage: &'static str, dt_ms: f64) {
+    ENC_PEROP.with(|p| {
+        if let Some(v) = p.borrow_mut().as_mut() {
+            if let Some(e) = v.iter_mut().find(|(s, _)| *s == stage) { e.1 += dt_ms; }
+            else { v.push((stage, dt_ms)); }
+        }
+    });
+}
+/// Time an expression into `stage` (no-op unless ENC_PEROP is initialized).
+macro_rules! timed {
+    ($stage:expr, $e:expr) => {{
+        let __t = std::time::Instant::now();
+        let __r = $e;
+        perop_add($stage, __t.elapsed().as_secs_f64() * 1e3);
+        __r
+    }};
+}
+
 pub struct WhisperEncoder {
     pub cfg: WhisperCfg,
     w: WhisperWeights,
@@ -142,7 +167,7 @@ impl WhisperEncoder {
         let m = x.nrows();
 
         // --- self-attention sublayer ---
-        let ln1 = layer_norm(x, b.v("ln1.weight").as_slice().unwrap(), b.v("ln1.bias").as_slice().unwrap(), LN_EPS);
+        let ln1 = timed!("ln", layer_norm(x, b.v("ln1.weight").as_slice().unwrap(), b.v("ln1.bias").as_slice().unwrap(), LN_EPS));
 
         #[cfg(feature = "npu")]
         let use_npu = self.npu.is_some();
@@ -155,49 +180,49 @@ impl WhisperEncoder {
             {
                 use crate::npu::apply_tiled;
                 let ops = &self.block_ops[i];
-                q = apply_tiled(&ops.q, &ln1, 768);
-                k = apply_tiled(&ops.k, &ln1, 768); // k.bias is zeros (applied on NPU)
-                v = apply_tiled(&ops.v, &ln1, 768);
+                q = timed!("qkv_proj", apply_tiled(&ops.q, &ln1, 768));
+                k = timed!("qkv_proj", apply_tiled(&ops.k, &ln1, 768)); // k.bias is zeros (applied on NPU)
+                v = timed!("qkv_proj", apply_tiled(&ops.v, &ln1, 768));
             }
             #[cfg(not(feature = "npu"))]
             unreachable!();
         } else {
-            q = self.linear(&ln1, &b.m("q.weight"), &b.v("q.bias"), &format!("{i}.q"));
-            k = self.linear(&ln1, &b.m("k.weight"), &b.v("k.bias"), &format!("{i}.k"));
-            v = self.linear(&ln1, &b.m("v.weight"), &b.v("v.bias"), &format!("{i}.v"));
+            q = timed!("qkv_proj", self.linear(&ln1, &b.m("q.weight"), &b.v("q.bias"), &format!("{i}.q")));
+            k = timed!("qkv_proj", self.linear(&ln1, &b.m("k.weight"), &b.v("k.bias"), &format!("{i}.k")));
+            v = timed!("qkv_proj", self.linear(&ln1, &b.m("v.weight"), &b.v("v.bias"), &format!("{i}.v")));
         }
-        let ctx = mha(&q, &k, &v, self.cfg.n_heads, self.cfg.head_dim, false, m); // full attention
+        let ctx = timed!("mha", mha(&q, &k, &v, self.cfg.n_heads, self.cfg.head_dim, false, m)); // full attention
         let attn;
         if use_npu {
             #[cfg(feature = "npu")]
             {
-                attn = crate::npu::apply_tiled(&self.block_ops[i].out, &ctx, 768);
+                attn = timed!("out_proj", crate::npu::apply_tiled(&self.block_ops[i].out, &ctx, 768));
             }
             #[cfg(not(feature = "npu"))]
             unreachable!();
         } else {
-            attn = self.linear(&ctx, &b.m("out.weight"), &b.v("out.bias"), &format!("{i}.out"));
+            attn = timed!("out_proj", self.linear(&ctx, &b.m("out.weight"), &b.v("out.bias"), &format!("{i}.out")));
         }
-        let x = x + &attn; // residual
+        let x = timed!("residual", x + &attn); // residual
 
         // --- feed-forward sublayer ---
-        let ln2 = layer_norm(&x, b.v("ln2.weight").as_slice().unwrap(), b.v("ln2.bias").as_slice().unwrap(), LN_EPS);
+        let ln2 = timed!("ln", layer_norm(&x, b.v("ln2.weight").as_slice().unwrap(), b.v("ln2.bias").as_slice().unwrap(), LN_EPS));
         let f_out;
         if use_npu {
             #[cfg(feature = "npu")]
             {
                 use crate::npu::{apply_tiled, apply_tiled_mm2};
                 let ops = &self.block_ops[i];
-                let f = gelu(&apply_tiled(&ops.fc1, &ln2, 3072)); // bias on NPU, GELU on host
-                f_out = apply_tiled_mm2(&ops.fc2, &f);
+                let f = timed!("gelu", gelu(&timed!("fc1", apply_tiled(&ops.fc1, &ln2, 3072)))); // bias on NPU, GELU on host
+                f_out = timed!("fc2", apply_tiled_mm2(&ops.fc2, &f));
             }
             #[cfg(not(feature = "npu"))]
             unreachable!();
         } else {
-            let f = gelu(&self.linear(&ln2, &b.m("fc1.weight"), &b.v("fc1.bias"), &format!("{i}.fc1")));
-            f_out = self.linear(&f, &b.m("fc2.weight"), &b.v("fc2.bias"), &format!("{i}.fc2"));
+            let f = timed!("gelu", gelu(&timed!("fc1", self.linear(&ln2, &b.m("fc1.weight"), &b.v("fc1.bias"), &format!("{i}.fc1")))));
+            f_out = timed!("fc2", self.linear(&f, &b.m("fc2.weight"), &b.v("fc2.bias"), &format!("{i}.fc2")));
         }
-        x + &f_out // residual
+        timed!("residual", x + &f_out) // residual
     }
 
     /// Run all blocks from a conv-stem-output (with pos already added). Returns each block's output
@@ -215,13 +240,28 @@ impl WhisperEncoder {
     /// Full encoder from a mel [n_mels, 3000]: conv stem + pos + all blocks + final ln_post.
     /// Returns `encoded` == post-LN(block_{n-1}).
     pub fn forward_last(&self, mel: &Array2<f32>) -> Array2<f32> {
-        let mut x = self.conv_stem(mel);
-        self.add_pos(&mut x);
+        let perop = std::env::var("ENC_PEROP_TIMING").is_ok();
+        if perop { ENC_PEROP.with(|p| *p.borrow_mut() = Some(Vec::new())); }
+        let mut x = timed!("conv_stem", self.conv_stem(mel));
+        timed!("residual", self.add_pos(&mut x));
         for i in 0..self.cfg.n_layers {
             x = self.block(i, &x);
         }
         let g = self.w.ref_tensor("ln_post.weight").into_dimensionality::<Ix1>().unwrap();
         let be = self.w.ref_tensor("ln_post.bias").into_dimensionality::<Ix1>().unwrap();
-        layer_norm(&x, g.as_slice().unwrap(), be.as_slice().unwrap(), LN_EPS)
+        let out = timed!("ln", layer_norm(&x, g.as_slice().unwrap(), be.as_slice().unwrap(), LN_EPS));
+        if perop {
+            ENC_PEROP.with(|p| {
+                if let Some(v) = p.borrow_mut().take() {
+                    let total: f64 = v.iter().map(|(_, t)| t).sum();
+                    let mut sorted = v.clone();
+                    sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                    eprint!("[ENC_PEROP] sum_ms={total:.2}");
+                    for (s, t) in &sorted { eprint!(" {s}={t:.2}({:.0}%)", 100.0 * t / total); }
+                    eprintln!();
+                }
+            });
+        }
+        out
     }
 }

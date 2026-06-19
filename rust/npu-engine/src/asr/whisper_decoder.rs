@@ -559,6 +559,9 @@ struct ResidentState {
     sm_off_byte: usize,
     sm_core: bool,
     head_dim: u32,
+    /// M0.5 (--coalesce-self-tr): byte offset of the 2nd addr scratchpad `vcache_off` (= n_self, the
+    /// transposed-vcache write column). `None` = deep-C layout ([H,S,HD], no transposed write).
+    vcache_off_byte: Option<usize>,
 }
 
 /// Per-token dispatch handle: either a freshly-registered ELF (own hw_context, the original
@@ -628,6 +631,18 @@ pub struct FusedDecoder {
     layout: HashMap<String, BufLoc>,
     output: String, // e.g. "x12"
     t_enc: usize,
+    /// lever #3 (i): meta `coalesce_cross` — when true the ELF reads the encoder Venc PRE-TRANSPOSED
+    /// [H,HD,TP] (dropping the per-token op_tr_c cross-V transpose, the #1 inter-op round-trip), so
+    /// `precompute_cross` must write each L*_Venc in that layout. Default false = deep-C [H,TP,HD].
+    coalesce_cross: bool,
+    /// int8 cross-K (meta `int8_cross_k`): quantize each per-utterance Kenc to int8 with the fixed
+    /// per-layer `cross_k_scales` (s_k folded into mat_cq at build, so it cancels) + write int8 bytes into
+    /// the bf16-typed Kenc buffer (halves its LPDDR re-read). Default false.
+    int8_cross_k: bool,
+    /// int8 cross-V (meta `int8_cross_v`, implies `coalesce_cross`): quantize each per-utterance Venc
+    /// (pre-transposed [H,HD,TP]) to int8 with a per-(head,HD) scale `s_cv` the host computes from the real
+    /// Venc + writes for op_mul_cv to apply to the context output. Halves the Venc LPDDR re-read. Default false.
+    int8_cross_v: bool,
     n_self: usize, // self-KV positions already written this utterance (== KV write slot for next token)
     timing: bool,  // env FUSED_PHASE_TIMING: accumulate + dump the per-phase breakdown
     ph: PhaseAcc,
@@ -712,7 +727,11 @@ impl FusedDecoder {
         // caches, which we populate in precompute_cross).
         for name in meta["weights"].as_array().expect("weights") {
             let name = name.as_str().unwrap();
-            if name.ends_with("Kenc") || name.ends_with("Venc") || name.ends_with("kcache") || name.ends_with("vcache") {
+            // NOTE: `_s_cq` (leading underscore) is REQUIRED — the host-computed int8 scale buffers are
+            // named `L{li}_s_cq`. A bare `s_cq` suffix would also (wrongly) match the real `L{li}_bias_cq`
+            // cross-attention query-bias weights ("bias_cq" ends in "s_cq"), skipping them and breaking
+            // the deep-C baseline (1-token "You" garbage). Keep the underscore.
+            if name.ends_with("Kenc") || name.ends_with("Venc") || name.ends_with("kcache") || name.ends_with("vcache") || name.ends_with("_s_cq") || name.ends_with("_s_cv") {
                 continue;
             }
             let bytes = std::fs::read(fused_dir.join("buffers").join(format!("{name}.bin")))
@@ -732,6 +751,19 @@ impl FusedDecoder {
         let head_dim = meta["patch"]["head_dim"].as_u64().unwrap_or(HEAD_DIM as u64) as u32;
         let patcher = FusedElfPatcher::build(&base_elf, &kv_offsets, head_dim);
         let t_enc = meta["dims"]["T_enc"].as_u64().expect("dims.T_enc") as usize;
+        let coalesce_cross = meta.get("coalesce_cross").and_then(|v| v.as_bool()).unwrap_or(false);
+        let int8_cross_k = meta.get("int8_cross_k").and_then(|v| v.as_bool()).unwrap_or(false);
+        if int8_cross_k {
+            eprintln!("[whisper_decoder] int8_cross_k: per-utterance per-channel Kenc int8 (s_cq -> op_mul_cq on qc)");
+        }
+        let int8_cross_v = meta.get("int8_cross_v").and_then(|v| v.as_bool()).unwrap_or(false);
+        if int8_cross_v {
+            assert!(coalesce_cross, "int8_cross_v requires coalesce_cross (Venc must be resident pre-transposed)");
+            eprintln!("[whisper_decoder] int8_cross_v: per-utterance per-channel Venc int8 (s_cv -> op_mul_cv on ctc)");
+        }
+        if coalesce_cross {
+            eprintln!("[whisper_decoder] coalesce_cross: writing encoder Venc pre-transposed [H,HD,TP] (cross-V transpose eliminated)");
+        }
 
         // Deep-C: if the ELF carries scratchpad params (gen_decode emits the `scratchpad` meta block),
         // register it ONCE as a resident kernel and bind the arena BOs once. Per token we then only
@@ -747,6 +779,9 @@ impl FusedDecoder {
             let kv_off_byte = pget(kv_name, "byte_offset").as_u64().expect("kv byte_offset") as usize;
             let sm_off_byte = pget(sm_name, "byte_offset").as_u64().expect("sm byte_offset") as usize;
             let sm_core = pget(sm_name, "kind").as_str() == Some("core");
+            // M0.5: optional 2nd addr scratchpad for the transposed self-vcache write column (= n_self).
+            let vcache_off_byte = meta.get("vcache_param").and_then(|v| v.as_str())
+                .map(|name| pget(name, "byte_offset").as_u64().expect("vcache byte_offset") as usize);
             let sp_head_dim = sp["head_dim"].as_u64().unwrap_or(HEAD_DIM as u64) as u32;
             let res = dev
                 .open_elf_resident(&base_elf, Some("main:sequence"))
@@ -756,7 +791,7 @@ impl FusedDecoder {
                 "[whisper_decoder] DEEP-C resident scratchpad decode: register-once + per-token \
                  kv_off(byte {kv_off_byte})/sm_mask(byte {sm_off_byte}, core={sm_core}) — no patch/reload"
             );
-            Some(ResidentState { res, kv_off_byte, sm_off_byte, sm_core, head_dim: sp_head_dim })
+            Some(ResidentState { res, kv_off_byte, sm_off_byte, sm_core, head_dim: sp_head_dim, vcache_off_byte })
         } else {
             None
         };
@@ -807,6 +842,9 @@ impl FusedDecoder {
             layout,
             output,
             t_enc,
+            coalesce_cross,
+            int8_cross_k,
+            int8_cross_v,
             n_self: 0,
             timing,
             ph: PhaseAcc::default(),
@@ -821,6 +859,36 @@ impl FusedDecoder {
         let loc = &self.layout[name];
         let bytes = pack_bf16_bytes(f);
         assert_eq!(bytes.len(), loc.len, "{name}: {} != {}", bytes.len(), loc.len);
+        self.arena.write_at(loc.arena, loc.off, &bytes).unwrap();
+    }
+
+    /// int8 cross-K: quantize f32 -> int8 with PER-CHANNEL (h,d) scales and write the int8 BYTES into the
+    /// bf16-typed buffer (the GEMV kernel reinterprets them as int8). 1 byte/elem -> buffer is half-size.
+    /// `scales` is [H*HD] in (h,d) order; the padded `f` is [N_HEADS, T_PAD, HEAD_DIM] head-major, so
+    /// element idx -> channel (h = idx/(T_PAD*HEAD_DIM), d = idx%HEAD_DIM).
+    fn write_buf_i8(&self, name: &str, f: &[f32], scales: &[f32]) {
+        let loc = &self.layout[name];
+        let tphd = T_PAD * HEAD_DIM;
+        let bytes: Vec<u8> = f.iter().enumerate().map(|(idx, &v)| {
+            let s = scales[(idx / tphd) * HEAD_DIM + (idx % HEAD_DIM)];
+            let inv = if s != 0.0 { 1.0 / s } else { 0.0 };
+            ((v * inv).round().clamp(-127.0, 127.0) as i8) as u8
+        }).collect();
+        assert_eq!(bytes.len(), loc.len, "{name} (i8): {} != {}", bytes.len(), loc.len);
+        self.arena.write_at(loc.arena, loc.off, &bytes).unwrap();
+    }
+
+    /// int8 cross-V: like `write_buf_i8` but for the PRE-TRANSPOSED Venc layout [H,HD,TP]. The contiguous
+    /// inner dim is T_PAD, so element idx -> channel (h,d) = idx / T_PAD (and `scales` is [H*HD] in (h,d)
+    /// order, matching the L*_s_cv buffer op_mul_cv reads).
+    fn write_buf_i8_venc(&self, name: &str, f: &[f32], scales: &[f32]) {
+        let loc = &self.layout[name];
+        let bytes: Vec<u8> = f.iter().enumerate().map(|(idx, &v)| {
+            let s = scales[idx / T_PAD];
+            let inv = if s != 0.0 { 1.0 / s } else { 0.0 };
+            ((v * inv).round().clamp(-127.0, 127.0) as i8) as u8
+        }).collect();
+        assert_eq!(bytes.len(), loc.len, "{name} (i8v): {} != {}", bytes.len(), loc.len);
         self.arena.write_at(loc.arena, loc.off, &bytes).unwrap();
     }
 
@@ -857,17 +925,60 @@ impl FusedDecoder {
             };
             for (name, src) in [(format!("L{li}_Kenc"), &kenc), (format!("L{li}_Venc"), &venc)] {
                 // head-major padded: out[h, t, d] = src[t, h*HEAD_DIM + d]; rows t>=T_enc are zero.
+                // lever #3 (i): when coalesce_cross, write Venc PRE-TRANSPOSED [H,HD,TP] so the ELF's
+                // op_ct_c reads it directly (eliminates the per-token cross-V transpose, the #1 inter-op
+                // round-trip). Kenc always stays [H,TP,HD].
+                let venc_coalesced = self.coalesce_cross && name.ends_with("Venc");
                 let mut padded = vec![0f32; N_HEADS * T_PAD * HEAD_DIM];
                 for tt in 0..t {
                     let row = src.row(tt);
                     for h in 0..N_HEADS {
-                        let dst = (h * T_PAD + tt) * HEAD_DIM;
                         for d in 0..HEAD_DIM {
-                            padded[dst + d] = row[h * HEAD_DIM + d];
+                            let dst = if venc_coalesced {
+                                (h * HEAD_DIM + d) * T_PAD + tt // [H,HD,TP] pre-transposed
+                            } else {
+                                (h * T_PAD + tt) * HEAD_DIM + d // [H,TP,HD] deep-C
+                            };
+                            padded[dst] = row[h * HEAD_DIM + d];
                         }
                     }
                 }
-                self.write_buf(&name, &padded);
+                if self.int8_cross_k && name.ends_with("Kenc") {
+                    // PER-UTTERANCE per-channel: s[h,d] = headroom*max_t|Kenc[h,t,d]|/127 from THIS real
+                    // Kenc; quantize Kenc -> int8 + write the s_cq buffer that op_mul_cq applies to qc.
+                    // headroom (env INT8_CK_HEADROOM, default 1.0): >1 leaves int8 range above max (no
+                    // clipping but coarser); =1 maps max->127 (full range, finest). Per-utterance max has
+                    // no outliers beyond itself, so 1.0 is safe and uses the whole int8 range.
+                    let headroom: f32 = std::env::var("INT8_CK_HEADROOM").ok()
+                        .and_then(|v| v.parse().ok()).unwrap_or(1.0);
+                    let tphd = T_PAD * HEAD_DIM;
+                    let mut s_hd = vec![0f32; N_HEADS * HEAD_DIM];
+                    for (idx, &v) in padded.iter().enumerate() {
+                        let ch = (idx / tphd) * HEAD_DIM + (idx % HEAD_DIM);
+                        let a = v.abs();
+                        if a > s_hd[ch] { s_hd[ch] = a; }
+                    }
+                    for s in s_hd.iter_mut() { *s = if *s > 0.0 { *s * headroom / 127.0 } else { 1.0 }; }
+                    self.write_buf_i8(&name, &padded, &s_hd);
+                    self.write_buf(&format!("L{li}_s_cq"), &s_hd);
+                } else if self.int8_cross_v && name.ends_with("Venc") {
+                    // `padded` here is pre-transposed [H,HD,TP] (coalesce_cross is enforced for int8_cross_v),
+                    // so the contiguous inner dim is T_PAD and channel (h,d) = idx / T_PAD. Per-channel scale
+                    // s_cv[h,d] = headroom*max_t|Venc[h,d,t]|/127; op_mul_cv applies it to the ctc output.
+                    let headroom: f32 = std::env::var("INT8_CV_HEADROOM").ok()
+                        .and_then(|v| v.parse().ok()).unwrap_or(1.0);
+                    let mut s_cv = vec![0f32; N_HEADS * HEAD_DIM];
+                    for (idx, &v) in padded.iter().enumerate() {
+                        let ch = idx / T_PAD;
+                        let a = v.abs();
+                        if a > s_cv[ch] { s_cv[ch] = a; }
+                    }
+                    for s in s_cv.iter_mut() { *s = if *s > 0.0 { *s * headroom / 127.0 } else { 1.0 }; }
+                    self.write_buf_i8_venc(&name, &padded, &s_cv);
+                    self.write_buf(&format!("L{li}_s_cv"), &s_cv);
+                } else {
+                    self.write_buf(&name, &padded);
+                }
             }
             self.zero_buf(&format!("L{li}_kcache"));
             self.zero_buf(&format!("L{li}_vcache"));
@@ -954,6 +1065,10 @@ impl FusedDecoder {
             r.res
                 .write_scratchpad(r.sm_off_byte, &sm_val.to_le_bytes())
                 .expect("write sm_mask scratchpad");
+            // M0.5: transposed self-vcache write column = n_self (raw addr, no *head_dim).
+            if let Some(vb) = r.vcache_off_byte {
+                r.res.write_scratchpad(vb, &n.to_le_bytes()).expect("write vcache_off scratchpad");
+            }
         }
         tmr.lap(&mut self.ph.patch); // scratchpad writes (~µs) occupy the old per-token "patch" slot
         self.arena.sync_input().unwrap();

@@ -79,6 +79,18 @@ def main():
         total_words += w
         rows.append((name, e, w, wer))
 
+    # FAIL LOUD: no scored clips means the run produced nothing (empty/garbage TSV) — never report
+    # a spurious 0.0000 PASS. (Was a silent failure mode: B=128 produced clips=0 -> "PASS".)
+    if not rows or total_words == 0:
+        n_lines = sum(1 for _ in open(tsv, encoding="utf-8"))
+        print(
+            f"[WER-GATE] ERROR: 0 clips scored ({len(hyps)} hyp lines in TSV, {n_lines} raw lines, "
+            f"{len(refs)} refs). The decode produced no matching transcripts -> FAILURE, not a pass.",
+            file=sys.stderr,
+        )
+        print("[WER-GATE] aggregate per-stream WER N/A (0 clips) -> FAIL")
+        sys.exit(2)
+
     agg = total_edits / total_words if total_words else 0.0
     print(f"{'clip':<12} {'edits':>6} {'words':>6} {'WER':>8}")
     for name, e, w, wer in rows:

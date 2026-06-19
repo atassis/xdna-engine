@@ -23,3 +23,6 @@ artifacts/
 
 # rust build artifacts
 rust/target/
+build/
+route_b_kernels/decode_fused/build/
+**/build/

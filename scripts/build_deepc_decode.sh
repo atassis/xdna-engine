@@ -32,7 +32,9 @@ GEN="$REPO/route_b_kernels/decode_fused/gen_decode.py"
 command -v "$AIEBU_DIR/aiebu-asm" >/dev/null || [ -x "$AIEBU_DIR/aiebu-asm" ] || { echo "ERROR: aiebu-asm not at $AIEBU_DIR"; exit 1; }
 
 # Apply the deep-C amd/IRON patch (fuse_mlir hoist + StridedCopy/Softmax scratchpad) if not present.
-if git -C "$IRON" apply --reverse --check "$PATCH" >/dev/null 2>&1; then
+if [ -n "${SKIP_IRON_PATCH:-}" ]; then
+  echo "[build] SKIP_IRON_PATCH=1 — assuming deep-C already present in the shared IRON tree (do NOT re-apply over stacked patches)"
+elif git -C "$IRON" apply --reverse --check "$PATCH" >/dev/null 2>&1; then
   echo "[build] amd/IRON deep-C patch already applied"
 else
   echo "[build] applying amd/IRON deep-C patch"
@@ -45,7 +47,7 @@ export PYTHONPATH="$IRON${PYTHONPATH:+:$PYTHONPATH}"
 
 WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT   # amd/IRON writes build/ intermediates under CWD
 mkdir -p "$OUT"
-echo "[build] gen_decode --layers $LAYERS -> $OUT (work=$WORK)"
-( cd "$WORK" && "$VENV_IRON/bin/python" "$GEN" --weights "$WEIGHTS" --layers "$LAYERS" --out "$OUT" )
+echo "[build] gen_decode --layers $LAYERS -> $OUT (work=$WORK) ${GEN_EXTRA:+extra: $GEN_EXTRA}"
+( cd "$WORK" && "$VENV_IRON/bin/python" "$GEN" --weights "$WEIGHTS" --layers "$LAYERS" --out "$OUT" ${GEN_EXTRA:-} )
 echo "[build] done. decode.elf=$(du -h "$OUT/decode.elf" | cut -f1); params:"
 cat "$OUT/params.txt"

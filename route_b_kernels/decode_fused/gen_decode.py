@@ -26,6 +26,7 @@ from iron.common.fusion import FusedMLIROperator, load_elf
 from iron.operators.gemv.op import GEMV
 from iron.operators.layer_norm.op import LayerNorm
 from iron.operators.elementwise_add.op import ElementwiseAdd
+from iron.operators.elementwise_mul.op import ElementwiseMul
 from iron.operators.softmax.op import Softmax
 from iron.operators.strided_copy.op import StridedCopy
 from iron.operators.transpose.op import Transpose
@@ -83,8 +84,51 @@ def main():
     #   --coalesce-self  : (1) head-batch op_tr_s (num_batches=H), one launch for all H heads.
     ap.add_argument("--coalesce-cross", action="store_true", help="lever3 (i) cross-V pre-transpose")
     ap.add_argument("--coalesce-self", action="store_true", help="lever3 (1) batched self-V transpose")
+    # O18 occupancy: lift the softmax off 1 column to 8 (byte-neutral). DEFAULT OFF = deep-C baseline.
+    # (The transpose is already num_aie_columns=2 in this M=1 generator, so --occ = softmax 1->8 here.)
+    ap.add_argument("--occ", action="store_true", help="O18: lift softmax 1->8 columns (occupancy A/B)")
+    # M0.5: store the self vcache PRE-TRANSPOSED [H,HD,S] and write each new V row transposed (op_scv via a
+    # 2nd addr scratchpad `vcache_off`=n_self), so op_ct_s reads it directly and op_tr_s is ELIMINATED
+    # (kills the per-token self-V transpose round-trip, the #2 inter-op sink). Default OFF.
+    ap.add_argument("--coalesce-self-tr", action="store_true", help="M0.5: transposed self vcache, drop op_tr_s")
+    # int8 cross-K (#1 M=1 byte lever, step 1): store the resident cross-K (Kenc) int8 (halves its LPDDR
+    # re-read) + run op_sc_c as int8(matrix)xbf16(vector). A FIXED per-layer scale s_k is calibrated from
+    # Kenc and FOLDED into mat_cq/bias_cq so it cancels (scores = (s_k*qc).Kenc_int8 = qc.Kenc_real). The
+    # host quantizes per-utterance Kenc with the same meta-provided s_k. Venc/op_ct_c stay bf16 for now.
+    ap.add_argument("--int8-cross-k", action="store_true", help="int8 resident cross-K (Kenc) + int8 op_sc_c")
+    # int8 cross-V (#1 M=1 byte lever, step 2): store the resident cross-V (Venc) int8 (halves ITS LPDDR
+    # re-read; together with int8-cross-k the FULL cross K/V re-read is halved, -28.3 MB/token). op_ct_c
+    # runs int8(matrix=Venc)xbf16(vector=attn); the per-(head,HD) scale s_v multiplies the CONTEXT OUTPUT
+    # (post-GEMV, via op_mul_cv) -- can't fold into attn (that's per-t, the contracted axis). REQUIRES
+    # --coalesce-cross: op_ct_c must read the resident pre-transposed Venc [H,HD,TP] directly; without it
+    # op_ct_c reads the on-chip op_tr_c scratch (transposing int8 would need a separate kernel).
+    ap.add_argument("--int8-cross-v", action="store_true", help="int8 resident cross-V (Venc) + int8 op_ct_c (needs --coalesce-cross)")
+    # int8 WEIGHTS (the dominant LPDDR term: ~198 MB/token of bf16 GEMV matrices re-streamed each token).
+    # STATIC per-output-row quant (s[m]=max_k|W[m,k]|/127, baked at build — no host/engine work): the GEMV
+    # reads int8 A (halved buffer) and an op_mul applies s[m] to the output BEFORE the bias add. Split FFN
+    # (Wf1/Wf2 — biggest + no attention-score sensitivity) from attention (Wqkv/Wso/Wcq/Wco — perturb cached
+    # Q/K/V) so each is WER-gated independently.
+    ap.add_argument("--int8-ffn", action="store_true", help="int8 static FFN weights (Wf1, Wf2)")
+    ap.add_argument("--int8-attn-w", action="store_true", help="int8 static attention weights (Wqkv, Wso, Wcq, Wco)")
     a = ap.parse_args()
     co_cross, co_self = a.coalesce_cross, a.coalesce_self
+    co_self_tr = a.coalesce_self_tr
+    int8_ck = a.int8_cross_k
+    int8_cv = a.int8_cross_v
+    int8_ffn = a.int8_ffn
+    int8_attn_w = a.int8_attn_w
+    if int8_cv and not co_cross:
+        ap.error("--int8-cross-v requires --coalesce-cross (op_ct_c must read the resident pre-transposed Venc)")
+
+    def qrow(mat):
+        """Static per-output-row int8 quant of a weight matrix [M,K]. Returns (int8 array [M,K], scale [M]).
+        out=GEMV(int8 A)·x is then ×s[m] (op_mul) to recover W·x: s[m]·Σ_k round(W[m,k]/s[m])·x[k] ≈ W[m]·x."""
+        m = mat.astype(np.float32)
+        s = np.abs(m).max(axis=1) / 127.0
+        s = np.where(s > 0, s, 1.0)
+        q = np.clip(np.round(m / s[:, None]), -127, 127).astype(np.int8)
+        return q, s.astype(np.float32)
+    sm_cols = 8 if a.occ else 1
     os.makedirs(os.path.join(a.out, "buffers"), exist_ok=True)
     w, NL, S, P, T, TP = a.weights, a.layers, a.prompt_len, a.num_preceding, a.t_enc, a.t_pad
     scale = 1.0 / np.sqrt(HD)
@@ -95,9 +139,17 @@ def main():
     # ---- ops (created once, reused for all layers) ----
     ctx = AIEContext()
     op_ln = LayerNorm(size=D, num_aie_columns=1, num_channels=1, tile_size=D, context=ctx)
-    op_proj = GEMV(M=D, K=D, num_aie_columns=8, tile_size_input=4, tile_size_output=D // 8, context=ctx)
+    op_proj = GEMV(M=D, K=D, num_aie_columns=8, tile_size_input=4, tile_size_output=D // 8,
+                   dtype_a=("int8" if int8_attn_w else "bf16"), context=ctx)
     op_add768 = ElementwiseAdd(size=D, tile_size=D // 8, num_aie_columns=8, context=ctx)
-    op_qkv = GEMV(M=QKV, K=D, num_aie_columns=8, tile_size_input=4, tile_size_output=QKV // 8, context=ctx)
+    op_mul_cq = ElementwiseMul(size=D, tile_size=D // 8, num_aie_columns=8, context=ctx)  # int8 cross-K: qc *= s_cq
+    op_mul_cv = ElementwiseMul(size=D, tile_size=D // 8, num_aie_columns=8, context=ctx)  # int8 cross-V: ctc *= s_cv
+    # int8-weights: per-output-row scale muls applied to the GEMV output before its bias add (size = M).
+    op_mulw_d = ElementwiseMul(size=D, tile_size=D // 8, num_aie_columns=8, context=ctx)   # Wso/Wcq/Wco, Wf2 (M=D)
+    op_mulw_qkv = ElementwiseMul(size=QKV, tile_size=QKV // 8, num_aie_columns=8, context=ctx)  # Wqkv (M=QKV)
+    op_mulw_ff = ElementwiseMul(size=FF, tile_size=FF // 8, num_aie_columns=8, context=ctx)  # Wf1 (M=FF)
+    op_qkv = GEMV(M=QKV, K=D, num_aie_columns=8, tile_size_input=4, tile_size_output=QKV // 8,
+                  dtype_a=("int8" if int8_attn_w else "bf16"), context=ctx)
     op_add_qkv = ElementwiseAdd(size=QKV, tile_size=QKV // 8, num_aie_columns=8, context=ctx)
     sc = dict(input_sizes=(H, HD), input_strides=(HD, 1), input_offset=0, output_sizes=(1, H, HD),
               output_strides=(0, S * HD, 1), output_offset=0, input_buffer_size=H * HD,
@@ -106,25 +158,37 @@ def main():
     # (shared symbol "kv_off", element units = n_self*head_dim) instead of a per-token ELF patch →
     # the decode ELF is CONSTANT across tokens (registered once; host writes the offset per dispatch).
     op_sck = StridedCopy(**sc, kwargs={"output_offset_scratchpad": "kv_off"}, context=ctx)
-    op_scv = StridedCopy(**sc, kwargs={"output_offset_scratchpad": "kv_off"}, context=ctx)
+    if co_self_tr:
+        # transposed vcache [H,HD,S]: new V[h,d] -> vcache[h*HD*S + d*S + n_self]; head stride HD*S, dim
+        # stride S, runtime column offset = vcache_off (= n_self, NOT n_self*HD like the kcache kv_off).
+        sc_v = dict(input_sizes=(H, HD), input_strides=(HD, 1), input_offset=0, output_sizes=(1, H, HD),
+                    output_strides=(0, HD * S, S), output_offset=0, input_buffer_size=H * HD,
+                    output_buffer_size=H * S * HD, num_aie_channels=1)
+        op_scv = StridedCopy(**sc_v, kwargs={"output_offset_scratchpad": "vcache_off"}, context=ctx)
+    else:
+        op_scv = StridedCopy(**sc, kwargs={"output_offset_scratchpad": "kv_off"}, context=ctx)
     op_sc_s = GEMV(M=S, K=HD, num_aie_columns=8, tile_size_input=4, tile_size_output=S // 8, num_batches=H, context=ctx)
     # Deep-C: the per-token self-softmax mask width is now a runtime `core`-kind scratchpad param
     # (symbol "sm_mask", element units = context_len = n_self) read on-tile, instead of an ELF patch.
-    op_sm_s = Softmax(rows=16, cols=S, num_aie_columns=1, num_channels=1, rtp_vector_size=S, mask_scratchpad="sm_mask", context=ctx)
+    op_sm_s = Softmax(rows=16, cols=S, num_aie_columns=sm_cols, num_channels=1, rtp_vector_size=S, mask_scratchpad="sm_mask", context=ctx)
     # lever #3 (1): head-batched self-attn V transpose (num_batches=H, ONE launch for all H heads) when
     # --coalesce-self; else per-head (num_batches=1) = deep-C baseline. vcache [H,S,HD] contiguous.
     op_tr_s = Transpose(M=S, N=HD, num_batches=(H if co_self else 1), num_aie_columns=2, num_channels=1, m=tms, n=tns, s=tss, context=ctx)
     op_ct_s = GEMV(M=HD, K=S, num_aie_columns=8, tile_size_input=4, tile_size_output=HD // 8, num_batches=H, context=ctx)
-    op_sc_c = GEMV(M=TP, K=HD, num_aie_columns=8, tile_size_input=4, tile_size_output=TP // 8, num_batches=H, context=ctx)
-    op_sm_c = Softmax(rows=16, cols=TP, num_aie_columns=1, num_channels=1, rtp_vector_size=T, mask_patch_value=0, context=ctx)
+    op_sc_c = GEMV(M=TP, K=HD, num_aie_columns=8, tile_size_input=4, tile_size_output=TP // 8, num_batches=H,
+                   dtype_a=("int8" if int8_ck else "bf16"), context=ctx)
+    op_sm_c = Softmax(rows=16, cols=TP, num_aie_columns=sm_cols, num_channels=1, rtp_vector_size=T, mask_patch_value=0, context=ctx)
     # lever #3 (i): when --coalesce-cross, Venc is stored pre-transposed [H,HD,TP] host-side and op_ct_c
     # reads it directly (no per-token op_tr_c). Else the deep-C per-head transpose (op_tr_c) is used.
     op_tr_c = None if co_cross else Transpose(M=TP, N=HD, num_aie_columns=2, num_channels=1, m=tmc, n=tnc, s=tsc, context=ctx)
-    op_ct_c = GEMV(M=HD, K=TP, num_aie_columns=8, tile_size_input=4, tile_size_output=HD // 8, num_batches=H, context=ctx)
-    op_f1 = GEMV(M=FF, K=D, num_aie_columns=8, tile_size_input=4, tile_size_output=FF // 8, context=ctx)
+    op_ct_c = GEMV(M=HD, K=TP, num_aie_columns=8, tile_size_input=4, tile_size_output=HD // 8, num_batches=H,
+                   dtype_a=("int8" if int8_cv else "bf16"), context=ctx)
+    op_f1 = GEMV(M=FF, K=D, num_aie_columns=8, tile_size_input=4, tile_size_output=FF // 8,
+                 dtype_a=("int8" if int8_ffn else "bf16"), context=ctx)
     op_add_ff = ElementwiseAdd(size=FF, tile_size=FF // 8, num_aie_columns=8, context=ctx)
     op_gelu = GELU(size=FF, num_aie_columns=8, num_channels=1, tile_size=FF // 8, context=ctx)
-    op_f2 = GEMV(M=D, K=FF, num_aie_columns=8, tile_size_input=4, tile_size_output=D // 8, context=ctx)
+    op_f2 = GEMV(M=D, K=FF, num_aie_columns=8, tile_size_input=4, tile_size_output=D // 8,
+                 dtype_a=("int8" if int8_ffn else "bf16"), context=ctx)
 
     HSs, HSc, phs, phc = H * S * 2, H * TP * 2, S * HD * 2, TP * HD * 2
     rl = []
@@ -160,60 +224,123 @@ def main():
         def heads_pad(M):
             o = np.zeros((H, TP, HD), np.float32); o[:, 0:T, :] = M.reshape(T, H, HD).transpose(1, 0, 2); return bf16(o)
         Kenc_b, Venc_b = heads_pad(Kenc), heads_pad(Venc)
+        if int8_ck:
+            # PER-UTTERANCE PER-CHANNEL int8: the scale is NOT folded at build (golden Kenc != real Kenc).
+            # Instead op_mul_cq scales qc by a per-channel s_cq buffer the HOST writes from the REAL Kenc
+            # each utterance: scores = Σ_d (qc[h,d]*s[h,d])*Kenc_int8 = qc·Kenc_real. mat_cq stays UNFOLDED.
+            # gen_decode emits only golden placeholders (Kenc_i8, s_cq); the host overwrites both per utterance.
+            kf = Kenc_b.astype(np.float32)  # [H, TP, HD]
+            s_hd = np.abs(kf).max(axis=1) * 1.25 / 127.0  # [H, HD]
+            s_hd = np.where(s_hd > 0, s_hd, 1.0)
+            Kenc_i8 = np.clip(np.round(kf / s_hd[:, None, :]), -127, 127).astype(np.int8)
+            s_cq = s_hd.reshape(-1).astype(np.float32)  # [D] golden per-channel scale (o = h*HD + d)
+        if int8_cv:
+            # PER-UTTERANCE PER-CHANNEL int8 for Venc (pre-transposed [H,HD,TP]; int8_cv requires co_cross).
+            # op_ct_c computes ctc[h,d] = Σ_t attn[h,t]·Venc_int8[h,d,t]; op_mul_cv then scales ctc[h,d] by
+            # s_cv[h,d] (POST-GEMV — the scale is per output-channel d, can't fold into attn which is per-t).
+            # gen emits golden placeholders (Venc_i8, s_cv); the host overwrites both from the real Venc.
+            vt = Venc_b.transpose(0, 2, 1).astype(np.float32)  # [H, HD, TP]
+            s_vd = np.abs(vt).max(axis=2) / 127.0  # [H, HD] (headroom 1.0 = full int8 range)
+            s_vd = np.where(s_vd > 0, s_vd, 1.0)
+            Venc_i8 = np.clip(np.round(vt / s_vd[:, :, None]), -127, 127).astype(np.int8)  # [H, HD, TP]
+            s_cv = s_vd.reshape(-1).astype(np.float32)  # [D] golden per-channel scale (o = h*HD + d)
         k_past = bf16(rng.standard_normal((H, P, HD)).astype(np.float32) * 0.5)
         v_past = bf16(rng.standard_normal((H, P, HD)).astype(np.float32) * 0.5)
         kc = np.zeros((H, S, HD), BF16); vc = np.zeros((H, S, HD), BF16)
         if P: kc[:, 0:P], vc[:, 0:P] = k_past, v_past
 
         # --- register weight buffers ---
-        for nm, arr in [("Wqkv", bf16(mat_qkv).reshape(-1)), ("bias_qkv", bf16(bias_qkv)),
-                        ("Wso", bf16(Wso.T.copy()).reshape(-1)), ("bso", bf16(bso)),
-                        ("Wcq", bf16(mat_cq).reshape(-1)), ("bias_cq", bf16(bias_cq)),
-                        ("Wco", bf16(Wco.T.copy()).reshape(-1)), ("bco", bf16(bco)),
-                        ("Wf1", bf16(mat_f1).reshape(-1)), ("bias_f1", bf16(bias_f1)),
-                        ("Wf2", bf16(Wf2.T.copy()).reshape(-1)), ("bf2", bf16(bf2)),
-                        ("Kenc", Kenc_b.reshape(-1)),
+        # int8 weights: store the per-row int8 quant + register the static `sw_*` per-row scale buffer the
+        # op_mulw applies to the GEMV output. `mat` is the EXACT [M,K] matrix stored below (post-fold/T).
+        def w_or_i8(mat, is_i8, sname):
+            if is_i8:
+                q, s = qrow(mat)
+                weights_to_write[pre + sname] = bf16(s)  # static per-row [M] scale (loaded as a normal weight)
+                # bf16-buffer/int8-bytes: view the M*K int8 bytes as M*K/2 bf16 slots so the element count
+                # matches the GEMV's int8 A layout (a_k=K//2). wb writes the bytes through unchanged.
+                return np.ascontiguousarray(q).reshape(-1).view(BF16)
+            return bf16(mat).reshape(-1)
+        for nm, arr in [("Wqkv", w_or_i8(mat_qkv, int8_attn_w, "sw_qkv")), ("bias_qkv", bf16(bias_qkv)),
+                        ("Wso", w_or_i8(Wso.T.copy(), int8_attn_w, "sw_so")), ("bso", bf16(bso)),
+                        ("Wcq", w_or_i8(mat_cq, int8_attn_w, "sw_cq")), ("bias_cq", bf16(bias_cq)),
+                        ("Wco", w_or_i8(Wco.T.copy(), int8_attn_w, "sw_co")), ("bco", bf16(bco)),
+                        ("Wf1", w_or_i8(mat_f1, int8_ffn, "sw_f1")), ("bias_f1", bf16(bias_f1)),
+                        ("Wf2", w_or_i8(Wf2.T.copy(), int8_ffn, "sw_f2")), ("bf2", bf16(bf2)),
+                        ("Kenc", (Kenc_i8 if int8_ck else Kenc_b).reshape(-1)),
                         # (i): pre-transpose Venc to [H,HD,TP] when coalescing cross; else [H,TP,HD] (deep-C).
-                        ("Venc", (Venc_b.transpose(0, 2, 1).copy() if co_cross else Venc_b).reshape(-1)),
-                        ("kcache", kc.reshape(-1)), ("vcache", vc.reshape(-1))]:
+                        # int8_cv: Venc_i8 is already pre-transposed int8 [H,HD,TP] (co_cross enforced).
+                        ("Venc", (Venc_i8 if int8_cv else (Venc_b.transpose(0, 2, 1).copy() if co_cross else Venc_b)).reshape(-1)),
+                        ("kcache", kc.reshape(-1)),
+                        # M0.5: vcache stored transposed [H,HD,S] when --coalesce-self-tr (op_ct_s reads it).
+                        ("vcache", (vc.transpose(0, 2, 1).copy() if co_self_tr else vc).reshape(-1))]:
             weights_to_write[pre + nm] = arr
+        if int8_ck:
+            weights_to_write[pre + "s_cq"] = bf16(s_cq)  # per-channel qc scale; host overwrites per utterance
+        if int8_cv:
+            weights_to_write[pre + "s_cv"] = bf16(s_cv)  # per-channel ctc scale; host overwrites per utterance
         patch_offsets_names += [pre + "kcache", pre + "vcache"]
         # explicit sizes for sliced/cache/score buffers
         bufsz.update({
-            pre + "qkv": QKV * 2, pre + "kcache": H * S * HD * 2, pre + "vcache": H * S * HD * 2, pre + "vcT": H * S * HD * 2,
+            pre + "qkv": QKV * 2, pre + "kcache": H * S * HD * 2, pre + "vcache": H * S * HD * 2,
             pre + "scs": 16 * S * 2, pre + "sws": 16 * S * 2,
-            pre + "Kenc": H * TP * HD * 2, pre + "Venc": H * TP * HD * 2,
+            **({pre + "s_cq": D * 2} if int8_ck else {}),
+            **({pre + "s_cv": D * 2} if int8_cv else {}),
+            pre + "Kenc": H * TP * HD * (1 if int8_ck else 2),
+            pre + "Venc": H * TP * HD * (1 if int8_cv else 2),
             pre + "scc": 16 * TP * 2, pre + "swc": 16 * TP * 2,
         })
+        # int8 weights: explicit halved byte size (auto-inference defaults to bf16; cf. Kenc). bf16 weights
+        # stay auto-sized. Value = M*K int8 bytes (the GEMV reads it as M*(K//2) bf16 slots).
+        if int8_ffn:
+            bufsz[pre + "Wf1"] = FF * D; bufsz[pre + "Wf2"] = D * FF
+        if int8_attn_w:
+            bufsz[pre + "Wqkv"] = QKV * D; bufsz[pre + "Wso"] = D * D
+            bufsz[pre + "Wcq"] = D * D; bufsz[pre + "Wco"] = D * D
         if not co_cross:  # cross-V transpose output buffer only when NOT pre-transposing Venc
             bufsz[pre + "vcTc"] = H * TP * HD * 2
+        if not co_self_tr:  # self-V transpose output buffer only when NOT storing vcache transposed (M0.5)
+            bufsz[pre + "vcT"] = H * S * HD * 2
 
         nxt = f"x{l+1}"  # layer output residual buffer
-        # (1) self-V transpose: one batched launch (--coalesce-self) or H per-head launches (deep-C).
-        self_tr = ([(op_tr_s, pre + "vcache", pre + "vcT")] if co_self else
-                   [(op_tr_s, f"{pre}vcache[{h*phs}:{(h+1)*phs}]", f"{pre}vcT[{h*phs}:{(h+1)*phs}]") for h in range(H)])
+        # (1) self-V transpose: ELIMINATED (--coalesce-self-tr, vcache stored [H,HD,S], op_ct_s reads it
+        # directly) | one batched launch (--coalesce-self) | H per-head launches (deep-C).
+        if co_self_tr:
+            self_tr = []
+            v_ct = "vcache"  # already transposed [H,HD,S]
+        elif co_self:
+            self_tr = [(op_tr_s, pre + "vcache", pre + "vcT")]
+            v_ct = "vcT"
+        else:
+            self_tr = [(op_tr_s, f"{pre}vcache[{h*phs}:{(h+1)*phs}]", f"{pre}vcT[{h*phs}:{(h+1)*phs}]") for h in range(H)]
+            v_ct = "vcT"
         # (i) cross-V: op_ct_c reads pre-transposed Venc directly (--coalesce-cross), or H per-head op_tr_c.
-        cross_tr = ([(op_ct_c, pre + "Venc", f"{pre}swc[0:{HSc}]", pre + "ctc")] if co_cross else
+        # int8_cv (co_cross enforced): op_ct_c reads int8 Venc, then op_mul_cv scales ctc by per-channel s_cv.
+        cross_tr = ([(op_ct_c, pre + "Venc", f"{pre}swc[0:{HSc}]", pre + "ctc")]
+                    + ([(op_mul_cv, pre + "ctc", pre + "s_cv", pre + "ctc")] if int8_cv else []) if co_cross else
                     [(op_tr_c, f"{pre}Venc[{h*phc}:{(h+1)*phc}]", f"{pre}vcTc[{h*phc}:{(h+1)*phc}]") for h in range(H)]
                     + [(op_ct_c, pre + "vcTc", f"{pre}swc[0:{HSc}]", pre + "ctc")])
+        # int8-weights: a per-row scale mul on the GEMV output, inserted BEFORE the bias add (no-op if bf16).
+        def wm(op, buf, sname, is_i8):
+            return [(op, buf, pre + sname, buf)] if is_i8 else []
         rl += [
             (op_ln, cur, pre + "xn_s"),
-            (op_qkv, pre + "Wqkv", pre + "xn_s", pre + "qkv"), (op_add_qkv, pre + "qkv", pre + "bias_qkv", pre + "qkv"),
+            (op_qkv, pre + "Wqkv", pre + "xn_s", pre + "qkv"), *wm(op_mulw_qkv, pre + "qkv", "sw_qkv", int8_attn_w), (op_add_qkv, pre + "qkv", pre + "bias_qkv", pre + "qkv"),
             (op_sck, pre + "qkv[1536:3072]", pre + "kcache"), (op_scv, pre + "qkv[3072:4608]", pre + "vcache"),
             (op_sc_s, pre + "kcache", pre + "qkv[0:1536]", f"{pre}scs[0:{HSs}]"), (op_sm_s, pre + "scs", pre + "sws"),
         ] + self_tr + [
-            (op_ct_s, pre + "vcT", f"{pre}sws[0:{HSs}]", pre + "cts"),
-            (op_proj, pre + "Wso", pre + "cts", pre + "asf"), (op_add768, pre + "asf", pre + "bso", pre + "asf"),
+            (op_ct_s, pre + v_ct, f"{pre}sws[0:{HSs}]", pre + "cts"),
+            (op_proj, pre + "Wso", pre + "cts", pre + "asf"), *wm(op_mulw_d, pre + "asf", "sw_so", int8_attn_w), (op_add768, pre + "asf", pre + "bso", pre + "asf"),
             (op_add768, cur, pre + "asf", pre + "x1"),
             (op_ln, pre + "x1", pre + "xn_c"),
-            (op_proj, pre + "Wcq", pre + "xn_c", pre + "qc"), (op_add768, pre + "qc", pre + "bias_cq", pre + "qc"),
+            (op_proj, pre + "Wcq", pre + "xn_c", pre + "qc"), *wm(op_mulw_d, pre + "qc", "sw_cq", int8_attn_w), (op_add768, pre + "qc", pre + "bias_cq", pre + "qc"),
+        ] + ([(op_mul_cq, pre + "qc", pre + "s_cq", pre + "qc")] if int8_ck else []) + [
             (op_sc_c, pre + "Kenc", pre + "qc", f"{pre}scc[0:{HSc}]"), (op_sm_c, pre + "scc", pre + "swc"),
         ] + cross_tr + [
-            (op_proj, pre + "Wco", pre + "ctc", pre + "acf"), (op_add768, pre + "acf", pre + "bco", pre + "acf"),
+            (op_proj, pre + "Wco", pre + "ctc", pre + "acf"), *wm(op_mulw_d, pre + "acf", "sw_co", int8_attn_w), (op_add768, pre + "acf", pre + "bco", pre + "acf"),
             (op_add768, pre + "x1", pre + "acf", pre + "x2"),
             (op_ln, pre + "x2", pre + "xn_f"),
-            (op_f1, pre + "Wf1", pre + "xn_f", pre + "h"), (op_add_ff, pre + "h", pre + "bias_f1", pre + "h"), (op_gelu, pre + "h", pre + "h"),
-            (op_f2, pre + "Wf2", pre + "h", pre + "ff"), (op_add768, pre + "ff", pre + "bf2", pre + "ff"),
+            (op_f1, pre + "Wf1", pre + "xn_f", pre + "h"), *wm(op_mulw_ff, pre + "h", "sw_f1", int8_ffn), (op_add_ff, pre + "h", pre + "bias_f1", pre + "h"), (op_gelu, pre + "h", pre + "h"),
+            (op_f2, pre + "Wf2", pre + "h", pre + "ff"), *wm(op_mulw_d, pre + "ff", "sw_f2", int8_ffn), (op_add768, pre + "ff", pre + "bf2", pre + "ff"),
             (op_add768, pre + "x2", pre + "ff", nxt),
         ]
         layer_data.append(dict(mat_qkv=mat_qkv, bias_qkv=bias_qkv, Wso=Wso, bso=bso, mat_cq=mat_cq,
@@ -270,7 +397,11 @@ def main():
     x_out = cur_x
 
     bdir = os.path.join(a.out, "buffers")
-    def wb(n, v): open(os.path.join(bdir, f"{n}.bin"), "wb").write(np.asarray(v, BF16).tobytes())
+    def wb(n, v):
+        v = np.asarray(v)
+        # int8 buffers (quantized weights / golden K/V) write RAW bytes; everything else is bf16.
+        data = v.tobytes() if v.dtype == np.int8 else np.asarray(v, BF16).tobytes()
+        open(os.path.join(bdir, f"{n}.bin"), "wb").write(data)
     wb("x", x); wb(out_name, x_out)
     for nm, arr in weights_to_write.items():
         wb(nm, arr)
@@ -286,6 +417,23 @@ def main():
         "scratchpad": {"params": scratchpad_params, "kv_param": "kv_off", "mask_param": "sm_mask",
                        "head_dim": HD, "num_preceding": P},
         "dims": {"layers": NL, "S": S, "P": P, "T_enc": T, "T_pad": TP},
+        # lever #3 layout contract for the host: when coalesce_cross, the host must write each L*_Venc
+        # buffer pre-transposed [H,HD,TP] (op_ct_c reads it directly; no per-token op_tr_c). coalesce_self
+        # batches op_tr_s (host vcache layout unchanged). Default false = deep-C [H,TP,HD].
+        "coalesce_cross": bool(co_cross), "coalesce_self": bool(co_self),
+        # M0.5: when coalesce_self_tr, the host must (a) write each L*_vcache transposed [H,HD,S], and
+        # (b) drive a 2nd addr scratchpad `vcache_off` = n_self (column) per token (kv_off stays n_self*HD).
+        "coalesce_self_tr": bool(co_self_tr),
+        **({"vcache_param": "vcache_off"} if co_self_tr else {}),
+        # int8 cross-K (per-utterance per-channel): L*_Kenc are int8 [H,TP,HD]; the host quantizes Kenc per
+        # utterance + writes the L*_s_cq [D] per-channel scale buffer that op_mul_cq applies to qc.
+        "int8_cross_k": bool(int8_ck),
+        # int8 cross-V (per-utterance per-channel; implies coalesce_cross): L*_Venc are int8 [H,HD,TP]; the
+        # host quantizes Venc per utterance + writes L*_s_cv [D] that op_mul_cv applies to the ctc output.
+        "int8_cross_v": bool(int8_cv),
+        # int8 STATIC weights: L*_W{f1,f2} (int8_ffn) / L*_W{qkv,so,cq,co} (int8_attn_w) are int8 [M,K//2];
+        # the op_mulw applies the static L*_sw_* per-row scale to the GEMV output before its bias add.
+        "int8_ffn": bool(int8_ffn), "int8_attn_w": bool(int8_attn_w),
     }
     json.dump(meta, open(os.path.join(a.out, "meta.json"), "w"), indent=2)
     print(f"\nwrote {NL}-layer decode ELF ({len(elf)}B, scratch {scr/1e6:.1f}MB) to {a.out}")
