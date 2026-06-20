@@ -263,8 +263,15 @@ impl WhisperEncoder {
             v = timed!("qkv_proj", self.linear(&ln1, &b.m("v.weight"), &b.v("v.bias"), &format!("{i}.v")));
         }
         // full attention: NPU static-MHA op when gated (NPU_ENC_MHA_NPU), else host f32 mha.
+        // NPU_ENC_MHA_MAXLAYER=N: run NPU MHA only for the first N blocks (i<N). The bf16 attention
+        // error compounds over layers, so the first few may stay WER-acceptable — a PARTIAL offload.
         #[cfg(feature = "npu")]
-        let ctx = match &self.mha_npu {
+        let mha_npu_here = self.mha_npu.as_ref().filter(|_| {
+            let maxl = std::env::var("NPU_ENC_MHA_MAXLAYER").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(usize::MAX);
+            i < maxl
+        });
+        #[cfg(feature = "npu")]
+        let ctx = match mha_npu_here {
             Some(op) if m == 1500 => timed!("mha", op.forward(&q, &k, &v)),
             _ => timed!("mha", mha(&q, &k, &v, self.cfg.n_heads, self.cfg.head_dim, false, m)),
         };
