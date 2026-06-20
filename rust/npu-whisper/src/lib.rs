@@ -8,6 +8,8 @@
 pub mod config;
 pub mod encoder;
 #[cfg(feature = "npu")]
+pub mod mha_npu;
+#[cfg(feature = "npu")]
 pub mod npu;
 pub mod weights;
 

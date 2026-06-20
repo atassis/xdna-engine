@@ -143,6 +143,46 @@ static inline void mm_silu_epilogue_f32o(const float *__restrict pC_in,
   event1();
 }
 
+// GELU (tanh approx, matches torch gelu(approximate="tanh") + the decode gelu_tile_bf16):
+//   gelu(x) = 0.5*x*(1 + tanh( sqrt(2/pi) * (x + 0.044715*x^3) ))
+// f32 acc in -> bf16 gelu -> f32 out (mirrors the silu f32o path). Used by the modal GELU mode (rtp[0]==2)
+// to fold the Whisper encoder FFN activation into the fc1 GEMM epilogue (drops the ~260 ms/utt host GELU).
+template <int size>
+static inline void mm_gelu_epilogue_f32o(const float *__restrict pC_in,
+                                         float *__restrict pC_out) {
+  event0();
+  static_assert(size % 16 == 0, "tile size must be a multiple of 16");
+  const aie::vector<bfloat16, 16> half = aie::broadcast<bfloat16, 16>(0.5f);
+  const aie::vector<bfloat16, 16> one = aie::broadcast<bfloat16, 16>(1.0f);
+  const aie::vector<bfloat16, 16> c0 = aie::broadcast<bfloat16, 16>(0.7978845608f); // sqrt(2/pi)
+  const aie::vector<bfloat16, 16> c1 = aie::broadcast<bfloat16, 16>(0.044715f);
+  const float *__restrict in_ptr = pC_in;
+  float *__restrict out_ptr = pC_out;
+  AIE_PREPARE_FOR_PIPELINING
+  AIE_LOOP_MIN_ITERATION_COUNT(2)
+  for (int off = 0; off < size; off += 16) {
+    aie::vector<float, 16> accf = aie::load_v<16>(in_ptr);
+    in_ptr += 16;
+    aie::accum<accfloat, 16> a;
+    a.from_vector(accf);
+    aie::vector<bfloat16, 16> xv = a.to_vector<bfloat16>();
+    aie::vector<bfloat16, 16> x2 = aie::mul(xv, xv);                  // x^2  (mul -> accum -> vector)
+    aie::vector<bfloat16, 16> x3 = aie::mul(x2, xv);                  // x^3
+    aie::vector<bfloat16, 16> c1x3 = aie::mul(c1, x3);               // c1*x^3
+    aie::vector<bfloat16, 16> inner_b = aie::add(xv, c1x3);          // x + c1*x^3  (add -> vector)
+    auto inner = aie::mul(c0, inner_b);                             // c0*(x + c1*x^3)  (accum)
+    aie::vector<bfloat16, 16> t = aie::tanh<bfloat16>(inner.to_vector<float>()); // tanh(inner)
+    aie::vector<bfloat16, 16> t_p1 = aie::add(t, one);              // 1 + tanh
+    aie::vector<bfloat16, 16> xt = aie::mul(xv, t_p1);              // x*(1+tanh)
+    aie::vector<bfloat16, 16> gx = aie::mul(half, xt);             // 0.5*x*(1+tanh)
+    aie::accum<accfloat, 16> oacc;
+    oacc.from_vector(gx);
+    aie::store_v(out_ptr, oacc.to_vector<float>());
+    out_ptr += 16;
+  }
+  event1();
+}
+
 // identity: copy f32 acc -> f32 out (the matmul already folded bias via K-aug).
 template <int size>
 static inline void mm_identity_epilogue_f32o(const float *__restrict pC_in,
@@ -228,8 +268,11 @@ void mm_narrow_epilogue_f32_bf16(const float *__restrict c_in,
 void mm_modal_epilogue_f32_f32(const float *__restrict c_in,
                                float *__restrict c_out,
                                const int32_t *__restrict rtp) {
-  if (rtp[0] != 0) {
+  // rtp[0]: 0=identity, 1=silu, 2=gelu (modal modes; baked per instruction stream).
+  if (rtp[0] == 1) {
     mm_silu_epilogue_f32o<EPI_M * EPI_N>(c_in, c_out);
+  } else if (rtp[0] == 2) {
+    mm_gelu_epilogue_f32o<EPI_M * EPI_N>(c_in, c_out);
   } else {
     mm_identity_epilogue_f32o<EPI_M * EPI_N>(c_in, c_out);
   }

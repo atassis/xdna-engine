@@ -89,9 +89,8 @@ impl ConvNpu {
         Array2::from_shape_vec((MT, n), c).unwrap()
     }
 
-    /// Full conv layer on NPU. x[Cin,H,W], w[Cout,Cin,kh,kw], b[Cout]; (kh,kw,stride,pad). Cout must be
-    /// a built band (64/128/256/512). Returns y[Cout,Hout,Wout]. im2col2d -> M-tile(512) -> K-split(768)
-    /// -> accumulate -> +bias.
+    /// Full conv layer on NPU (symmetric stride/pad). x[Cin,H,W], w[Cout,Cin,kh,kw], b[Cout].
+    /// Returns y[Cout,Hout,Wout]. Thin wrapper over `conv_asym`.
     pub fn conv(
         &self,
         x: &Array3<f32>,
@@ -102,13 +101,32 @@ impl ConvNpu {
         stride: usize,
         pad: usize,
     ) -> Array3<f32> {
+        self.conv_asym(x, w, b, kh, kw, stride, stride, pad, pad)
+    }
+
+    /// Full conv layer on NPU with ASYMMETRIC stride/pad per dim (sh/sw, ph/pw) — needed for 1D convs
+    /// laid out as 2D (kh=1, ph=0). x[Cin,H,W], w[Cout,Cin,kh,kw], b[Cout]. Cout must be a built band.
+    /// im2col2d -> M-tile(512) -> K-split(768) -> accumulate -> +bias.
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv_asym(
+        &self,
+        x: &Array3<f32>,
+        w: &Array4<f32>,
+        b: &Array1<f32>,
+        kh: usize,
+        kw: usize,
+        sh: usize,
+        sw: usize,
+        ph: usize,
+        pw: usize,
+    ) -> Array3<f32> {
         let (cin, h, wd) = x.dim();
         let cout = w.dim().0;
-        let out_h = (h + 2 * pad - kh) / stride + 1;
-        let out_w = (wd + 2 * pad - kw) / stride + 1;
+        let out_h = (h + 2 * ph - kh) / sh + 1;
+        let out_w = (wd + 2 * pw - kw) / sw + 1;
         let m_real = out_h * out_w;
         let k_real = cin * kh * kw;
-        let cols = im2col2d(x, kh, kw, stride, stride, pad, pad); // [m_real, k_real]
+        let cols = im2col2d(x, kh, kw, sh, sw, ph, pw); // [m_real, k_real]
         let wmat = w.to_shape((cout, k_real)).unwrap().to_owned(); // [cout, k_real]
         let k_chunks = k_real.div_ceil(KT);
         let mut out = Array2::<f32>::zeros((m_real, cout));

@@ -83,6 +83,17 @@ extern "C" {
         y: *mut CBo,
     ) -> c_int;
     #[allow(clippy::too_many_arguments)]
+    fn shim_run_mha7(
+        k: *mut CKernel,
+        opcode: c_uint,
+        instr: *mut CBo,
+        count: usize,
+        q: *mut CBo,
+        kk: *mut CBo,
+        v: *mut CBo,
+        o: *mut CBo,
+    ) -> c_int;
+    #[allow(clippy::too_many_arguments)]
     fn shim_run_matmul8_start(
         k: *mut CKernel,
         opcode: c_uint,
@@ -419,6 +430,29 @@ impl Kernel {
         };
         if r != 0 {
             Err(format!("run_dwconv6: {}", last_error()))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Dispatch the MHA host ABI: (opcode, instr, count, Q, K, V, O). 4 data BOs, mirroring the IRON
+    /// MHA op's `rt.sequence(Q, K, V, O)`. Blocks until the run completes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_mha(
+        &self,
+        opcode: u32,
+        instr: &Bo,
+        count: usize,
+        q: &Bo,
+        k: &Bo,
+        v: &Bo,
+        o: &Bo,
+    ) -> Result<()> {
+        let r = unsafe {
+            shim_run_mha7(self.ptr, opcode, instr.ptr, count, q.ptr, k.ptr, v.ptr, o.ptr)
+        };
+        if r != 0 {
+            Err(format!("run_mha: {}", last_error()))
         } else {
             Ok(())
         }

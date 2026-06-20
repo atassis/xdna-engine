@@ -36,8 +36,9 @@ b_col_maj?=0
 dtype_in?=bf16
 dtype_out?=f32
 
-# silu mode (default) vs bias-only (no activation) mode
+# silu mode (default) vs bias-only (no activation) vs gelu mode
 no_silu?=0
+gelu?=0
 
 # Two kernel objects: the matmul (mm.cc) and the fused epilogue.
 kernels=mm_${m}x${k}x${n} mm_silu_epilogue_${m}x${k}x${n}
@@ -46,9 +47,12 @@ aieargs+=-m $m -k $k -n $n --n-aie-cols ${n_aie_cols} --b-col-maj ${b_col_maj}
 ifeq (${no_silu}, 1)
 aieargs+=--no-silu
 endif
+ifeq (${gelu}, 1)
+aieargs+=--gelu
+endif
 
-# Distinct suffix so silu/bias artifacts never collide with the plain matmul's.
-mode_tag=$(if $(filter 1,${no_silu}),modalid,modalsilu)
+# Distinct suffix so silu/bias/gelu artifacts never collide with the plain matmul's.
+mode_tag=$(if $(filter 1,${gelu}),modalgelu,$(if $(filter 1,${no_silu}),modalid,modalsilu))
 target_suffix=${M}x${K}x${N}_${m}x${k}x${n}_${n_aie_cols}c_${mode_tag}
 
 use_iron=1

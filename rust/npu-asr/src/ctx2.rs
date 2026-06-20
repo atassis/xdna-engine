@@ -85,6 +85,9 @@ pub enum Epi {
     /// SiLU(x + bias[col]) (replaces the `_silu` xclbin for the FFN mm1; bias rode the K-aug block
     /// there, applied BEFORE SiLU, so it's added here before the sigmoid). bias length = n.
     SiluBias,
+    /// GELU(x + bias[col]) (tanh approx) — modal-only, folds the Whisper encoder FFN fc1 activation into
+    /// the GEMM epilogue (rtp[0]=2 mode). bias rides the K-aug block (applied before gelu). bias length = n.
+    GeluBias,
     /// x + bias[col] (replaces the `_bias` xclbin for qk/v/o/pw1/pw2). bias length = n.
     Bias,
     /// raw matmul output, no bias (bias slice is empty). Used by the mm2 K-split partials, which
@@ -132,7 +135,7 @@ pub struct SharedCtxA {
     /// modal). `modal_streams` = (N, is_silu, instr BO, n_instr) — 6 streams (3 N × {silu,identity}).
     modal: bool,
     ka_dev: usize,
-    modal_streams: Vec<(usize, bool, Bo, usize)>,
+    modal_streams: Vec<(usize, u8, Bo, usize)>, // (N, mode 0=id/1=silu/2=gelu, instr, n_instr)
     /// int8 host fast-path (`NPU_INT8_FASTEPI`, default ON; `=0` reverts to the legacy path for A/B).
     /// Two byte-identical cuts to the int8 marshaling pools: (1) parallel exact `amax` reduction
     /// (replaces the serial `iter().fold` quant scan); (2) division-free row-chunked dequant epilogue
@@ -217,7 +220,11 @@ impl SharedCtxA {
         let xclbin = if modal_int8 {
             wa.join(format!("final_{PAD_M}x{KA}x{NA}_{mt}x{kt}x{nt}_8c_modalint8dq.xclbin"))
         } else if modal {
-            wa.join(format!("final_{PAD_M}x{KAUG}x{NA}_{mt}x{kt}x{nt}_8c_modalsilu.xclbin"))
+            // Default = the proven 2-branch modalsilu xclbin (rtp[0]: 0=identity, 1=silu). NPU_ENC_GELU_FUSED
+            // opts into the 3-branch modalgelu superset (adds rtp[0]=2 = on-chip GELU for the Whisper encoder
+            // fc1 fusion); silu/identity behavior is unchanged (validated baseline-identical without fusion).
+            let tag = if std::env::var("NPU_ENC_GELU_FUSED").is_ok() { "modalgelu" } else { "modalsilu" };
+            wa.join(format!("final_{PAD_M}x{KAUG}x{NA}_{mt}x{kt}x{nt}_8c_{tag}.xclbin"))
         } else {
             wa.join(format!("final_{PAD_M}x{KA}x{NA}_{mt}x{kt}x{nt}_8c.xclbin"))
         };
@@ -243,7 +250,7 @@ impl SharedCtxA {
         // plain (non-modal) per-N streams; modal loads its 6 (N × {silu,identity}) streams below;
         // modal_int8 loads its 3 dequant streams + scans each for the 32 rtp[0] patch slots.
         let mut streams = Vec::with_capacity(CTXA_STREAMS.len());
-        let mut modal_streams: Vec<(usize, bool, Bo, usize)> = Vec::new();
+        let mut modal_streams: Vec<(usize, u8, Bo, usize)> = Vec::new();
         let mut modal_int8_streams: Vec<ModalInt8Stream> = Vec::new();
         if modal_int8 {
             const N_AIE_CORES: usize = 32; // 4 rows × 8 cols — one rtp[0] write packet each
@@ -268,11 +275,17 @@ impl SharedCtxA {
                 });
             }
         } else if modal {
+            let gelu_enabled = std::env::var("NPU_ENC_GELU_FUSED").is_ok();
             for &n in CTXA_STREAMS.iter() {
-                for (is_silu, tag) in [(true, "modalsilu"), (false, "modalid")] {
+                // mode: 1=silu, 0=identity (every N); 2=gelu only when NPU_ENC_GELU_FUSED + a stream exists
+                // (built for N=NA, the FFN fc1 width — the only gelu user). All modes run on the loaded xclbin.
+                for (mode, tag) in [(1u8, "modalsilu"), (0u8, "modalid"), (2u8, "modalgelu")] {
                     let insts = wa.join(format!("insts_{PAD_M}x{KAUG}x{n}_{mt}x{kt}x{nt}_8c_{tag}.txt"));
+                    if mode == 2 && (!gelu_enabled || !insts.exists()) {
+                        continue; // gelu stream only loaded when opted-in + present (NA only)
+                    }
                     let (bo, n_instr) = load_stream(&insts);
-                    modal_streams.push((n, is_silu, bo, n_instr));
+                    modal_streams.push((n, mode, bo, n_instr));
                 }
             }
         } else {
@@ -395,13 +408,13 @@ impl SharedCtxA {
         prof_record(t0.elapsed());
     }
 
-    /// (instr BO, n_instr) for the modal stream producing N=`n` in mode `is_silu` on the resident xclbin.
-    fn modal_stream(&self, n: usize, is_silu: bool) -> (&Bo, usize) {
+    /// (instr BO, n_instr) for the modal stream producing N=`n` in `mode` (0=id,1=silu,2=gelu) on the xclbin.
+    fn modal_stream(&self, n: usize, mode: u8) -> (&Bo, usize) {
         self.modal_streams
             .iter()
-            .find(|(sn, ss, _, _)| *sn == n && *ss == is_silu)
+            .find(|(sn, ss, _, _)| *sn == n && *ss == mode)
             .map(|(_, _, bo, ni)| (bo, *ni))
-            .unwrap_or_else(|| panic!("ctxA modal: no stream N={n} silu={is_silu}"))
+            .unwrap_or_else(|| panic!("ctxA modal: no stream N={n} mode={mode}"))
     }
 
     /// Async overlap, the prep half: convert+write+sync slot `s`'s activation from the strided view
@@ -457,7 +470,7 @@ impl SharedCtxA {
 
         // mm2 partials use the identity epilogue (Epi::None -> zero K-aug bias); modal selects it.
         let (instr, n_instr) = if self.modal {
-            self.modal_stream(n, false)
+            self.modal_stream(n, 0)
         } else {
             self.stream(n)
         };
@@ -518,7 +531,7 @@ pub struct CtxAOp {
     w_scale: Vec<f32>, // int8: per-output-channel symmetric scale (len n); empty for bf16
     w_global: f32,  // modal_int8 (L3): per-TENSOR weight scale (one scalar) so dequant ×(scale_a·w_global)
                     // is a single on-core multiply via rtp[0]; 1.0 for the per-column host-dequant path.
-    is_silu: bool,  // modal: dispatch the silu-mode stream (Epi::SiluBias) vs identity (else)
+    mode: u8,  // modal epilogue mode: 0=identity, 1=silu (Epi::SiluBias), 2=gelu (Epi::GeluBias)
 }
 
 impl CtxAOp {
@@ -595,7 +608,7 @@ impl CtxAOp {
         };
 
         CtxAOp {
-            is_silu: shared.modal && epi == Epi::SiluBias,
+            mode: if shared.modal { match epi { Epi::SiluBias => 1, Epi::GeluBias => 2, _ => 0 } } else { 0 },
             shared,
             n,
             epi,
@@ -657,7 +670,7 @@ impl CtxAOp {
         // --- dispatch on the resident kernel via this op's stream (modal: N + epilogue-mode) ---
         let n = self.n;
         let (instr, n_instr) = if sh.modal {
-            sh.modal_stream(n, self.is_silu)
+            sh.modal_stream(n, self.mode)
         } else {
             sh.stream(n)
         };
@@ -691,6 +704,7 @@ impl CtxAOp {
             match epi {
                 Epi::None => vals.to_vec(),
                 Epi::Bias => vals.par_iter().enumerate().map(|(i, &raw)| raw + bias[i % n]).collect(),
+                Epi::GeluBias => unreachable!("GeluBias is modal-only (gelu runs on-chip)"),
                 Epi::SiluBias => vals
                     .par_iter()
                     .enumerate()
@@ -822,6 +836,7 @@ impl CtxAOp {
         let data: Vec<f32> = match epi {
             Epi::None => vals.to_vec(),
             Epi::Bias => vals.par_iter().enumerate().map(|(i, &v)| v + bias[i % n]).collect(),
+            Epi::GeluBias => unreachable!("GeluBias is modal-only (gelu runs on-chip)"),
             Epi::SiluBias => vals
                 .par_iter()
                 .enumerate()
@@ -884,6 +899,7 @@ impl CtxAOp {
                     row[c] += bias[c];
                 }
             }),
+            Epi::GeluBias => unreachable!("GeluBias is modal-only (gelu runs on-chip)"),
             Epi::SiluBias => out.iter_mut().enumerate().for_each(|(i, v)| {
                 let z = *v + bias[i % n];
                 *v = z * fast_sigmoid(z);
@@ -1117,6 +1133,7 @@ fn dequant_epi(
                 match epi {
                     Epi::None => v,
                     Epi::Bias => v + bias[c],
+                    Epi::GeluBias => unreachable!("GeluBias is modal-only (gelu runs on-chip)"),
                     Epi::SiluBias => {
                         let z = v + bias[c];
                         z * fast_sigmoid(z)
@@ -1137,6 +1154,7 @@ fn dequant_epi(
                 orow[c] = arow[c] as f32 * scale_a * ws[c] + bias[c];
             }
         }
+        Epi::GeluBias => unreachable!("GeluBias is modal-only (gelu runs on-chip)"),
         Epi::SiluBias => {
             for c in 0..n {
                 let z = arow[c] as f32 * scale_a * ws[c] + bias[c];

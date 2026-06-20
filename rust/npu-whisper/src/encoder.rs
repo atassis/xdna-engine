@@ -50,6 +50,14 @@ pub struct WhisperEncoder {
     npu: Option<crate::npu::WhisperNpu>,
     #[cfg(feature = "npu")]
     block_ops: Vec<crate::npu::BlockOps>,
+    // NPU_ENC_MHA_NPU=1: full attention on the NPU (static-shape MHA xclbin) instead of host `mha`.
+    // Default None -> host path (production untouched). Gated + WER-validated separately.
+    #[cfg(feature = "npu")]
+    mha_npu: Option<crate::mha_npu::MhaNpu>,
+    // NPU_ENC_CONV_NPU=1: conv stem (conv1/conv2) as M-stationary GEMM on the NPU (reuses the prebuilt
+    // 512x768x768 band) instead of host im2col_conv1d. GELU/transpose stay host. Gated; default None.
+    #[cfg(feature = "npu")]
+    conv_npu: Option<npu_asr::conv_npu::ConvNpu>,
 }
 
 impl WhisperEncoder {
@@ -63,6 +71,10 @@ impl WhisperEncoder {
             npu: None,
             #[cfg(feature = "npu")]
             block_ops: Vec::new(),
+            #[cfg(feature = "npu")]
+            mha_npu: None,
+            #[cfg(feature = "npu")]
+            conv_npu: None,
         }
     }
 
@@ -97,19 +109,46 @@ impl WhisperEncoder {
                     k: mk("k.weight", "k.bias", 768),
                     v: mk("v.weight", "v.bias", 768),
                     out: mk("out.weight", "out.bias", 768),
-                    // FFN mm1: K=768 -> 3072 + bias; GELU applied on host (NOT SiluBias).
-                    fc1: mk("fc1.weight", "fc1.bias", 3072),
+                    // FFN mm1: K=768 -> 3072 + bias. NPU_ENC_GELU_FUSED=1 folds GELU into the GEMM epilogue
+                    // (Epi::GeluBias, modal rtp[0]=2) — drops the ~260 ms/utt host GELU; else GELU on host.
+                    fc1: if std::env::var("NPU_ENC_GELU_FUSED").is_ok() {
+                        CtxAOp::new(shared.clone(), &bw.m("fc1.weight"), 3072, Epi::GeluBias,
+                                    bw.v("fc1.bias").as_slice().unwrap())
+                    } else {
+                        mk("fc1.weight", "fc1.bias", 3072)
+                    },
                     // FFN mm2: K=3072 -> 768 + bias2 (host-accumulated K-split, bias2 added once).
                     fc2: FfnMm2::new(shared.clone(), &bw.m("fc2.weight"), bw.v("fc2.bias").as_slice().unwrap()),
                 }
             })
             .collect();
 
+        // NPU_ENC_MHA_NPU=1: load the static-shape encoder-MHA xclbin onto the SAME device (single-tenant).
+        let mha_npu = if std::env::var("NPU_ENC_MHA_NPU").is_ok() {
+            let base = root.join("artifacts/encoder_mha");
+            let xclbin = base.join("StaticMHA_h12_s1500_d64_kv0_causal0_npu2.xclbin");
+            let insts = base.join("StaticMHA_h12_s1500_d64_kv0_causal0_npu2.bin");
+            Some(crate::mha_npu::MhaNpu::open(&npu.device(), &xclbin, &insts)
+                .expect("NPU_ENC_MHA_NPU: load encoder-MHA xclbin (build via gen_encoder_mha.py)"))
+        } else {
+            None
+        };
+
+        // NPU_ENC_CONV_NPU=1: route the conv stem through the M-stationary GEMM conv (prebuilt 768 band).
+        let conv_npu = if std::env::var("NPU_ENC_CONV_NPU").is_ok() {
+            let wa = root.join(npu_asr::engines::WA_SUBDIR);
+            Some(npu_asr::conv_npu::ConvNpu::new(npu.device(), wa))
+        } else {
+            None
+        };
+
         WhisperEncoder {
             cfg,
             w,
             npu: Some(npu),
             block_ops,
+            mha_npu,
+            conv_npu,
         }
     }
 
@@ -144,12 +183,44 @@ impl WhisperEncoder {
     pub fn conv_stem(&self, mel: &Array2<f32>) -> Array2<f32> {
         let c = self.w.conv();
         // conv1: k3 s1 p1, Cin=n_mels -> Cout=d_model ; [d_model, 3000]
+        // conv2: k3 s2 p1, Cin=d_model -> Cout=d_model ; [d_model, 1500]
+        #[cfg(feature = "npu")]
+        if let Some(cv) = &self.conv_npu {
+            let h = self.conv1d_npu(cv, mel, &c.m3("conv1.weight"), &c.v("conv1.bias"), 1, 1);
+            let h = gelu(&h);
+            let h = self.conv1d_npu(cv, &h, &c.m3("conv2.weight"), &c.v("conv2.bias"), 2, 1);
+            let h = gelu(&h);
+            return h.t().to_owned(); // [1500, d_model]
+        }
         let h = im2col_conv1d(mel, &c.m3("conv1.weight"), c.v("conv1.bias").as_slice().unwrap(), 1, 1);
         let h = gelu(&h);
-        // conv2: k3 s2 p1, Cin=d_model -> Cout=d_model ; [d_model, 1500]
         let h = im2col_conv1d(&h, &c.m3("conv2.weight"), c.v("conv2.bias").as_slice().unwrap(), 2, 1);
         let h = gelu(&h);
         h.t().to_owned() // [1500, d_model]
+    }
+
+    /// conv1d-as-GEMM on the NPU: `x[Cin,W]` * `w[Cout,Cin,k]` (+bias) -> `[Cout,Wout]`. Wraps the 2D
+    /// ConvNpu (treats the 1D conv as kh=1). bf16 on-chip — gated + WER-validated (NPU_ENC_CONV_NPU).
+    #[cfg(feature = "npu")]
+    fn conv1d_npu(
+        &self,
+        cv: &npu_asr::conv_npu::ConvNpu,
+        x: &Array2<f32>,
+        w3: &Array3<f32>,
+        b: &Array1<f32>,
+        stride: usize,
+        pad: usize,
+    ) -> Array2<f32> {
+        let (cin, wd) = x.dim();
+        let (cout, _cin, k) = w3.dim();
+        let x3 = x.view().insert_axis(Axis(1)).to_owned(); // [Cin, 1, W]
+        let w4 = w3.view().insert_axis(Axis(2)).to_owned(); // [Cout, Cin, 1, k]
+        // 1D conv: H=1 with kh=1, NO H-padding (ph=0, sh=1); W carries the sequence (kw=k, pad=pw).
+        let y3 = cv.conv_asym(&x3, &w4, b, 1, k, 1, stride, 0, pad); // [Cout, 1, Wout]
+        let wout = y3.dim().2;
+        debug_assert_eq!((y3.dim().0, y3.dim().1), (cout, 1));
+        let _ = (cin, wd);
+        y3.into_shape_with_order((cout, wout)).unwrap()
     }
 
     /// Add the learned positional embedding `embed_positions[:T]` in place.
@@ -191,6 +262,13 @@ impl WhisperEncoder {
             k = timed!("qkv_proj", self.linear(&ln1, &b.m("k.weight"), &b.v("k.bias"), &format!("{i}.k")));
             v = timed!("qkv_proj", self.linear(&ln1, &b.m("v.weight"), &b.v("v.bias"), &format!("{i}.v")));
         }
+        // full attention: NPU static-MHA op when gated (NPU_ENC_MHA_NPU), else host f32 mha.
+        #[cfg(feature = "npu")]
+        let ctx = match &self.mha_npu {
+            Some(op) if m == 1500 => timed!("mha", op.forward(&q, &k, &v)),
+            _ => timed!("mha", mha(&q, &k, &v, self.cfg.n_heads, self.cfg.head_dim, false, m)),
+        };
+        #[cfg(not(feature = "npu"))]
         let ctx = timed!("mha", mha(&q, &k, &v, self.cfg.n_heads, self.cfg.head_dim, false, m)); // full attention
         let attn;
         if use_npu {
@@ -213,7 +291,10 @@ impl WhisperEncoder {
             {
                 use crate::npu::{apply_tiled, apply_tiled_mm2};
                 let ops = &self.block_ops[i];
-                let f = timed!("gelu", gelu(&timed!("fc1", apply_tiled(&ops.fc1, &ln2, 3072)))); // bias on NPU, GELU on host
+                // NPU_ENC_GELU_FUSED: fc1 is built with Epi::GeluBias → its output is already gelu(W·x+b),
+                // so the host GELU is skipped. Else GELU on host (default).
+                let h1 = timed!("fc1", apply_tiled(&ops.fc1, &ln2, 3072));
+                let f = if std::env::var("NPU_ENC_GELU_FUSED").is_ok() { h1 } else { timed!("gelu", gelu(&h1)) };
                 f_out = timed!("fc2", apply_tiled_mm2(&ops.fc2, &f));
             }
             #[cfg(not(feature = "npu"))]

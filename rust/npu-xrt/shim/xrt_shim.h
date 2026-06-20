@@ -39,6 +39,10 @@ int shim_run_matmul8(ShimKernel*, unsigned int opcode, ShimBo* instr, size_t ins
 int shim_run_dwconv6(ShimKernel*, unsigned int opcode, ShimBo* instr, size_t instr_count,
                      ShimBo* x, ShimBo* w, ShimBo* y);
 
+/* MHA host ABI: kernel(opcode, instr, instr_count, Q, K, V, O) — 4 data BOs. */
+int shim_run_mha7(ShimKernel*, unsigned int opcode, ShimBo* instr, size_t instr_count,
+                  ShimBo* q, ShimBo* kk, ShimBo* v, ShimBo* o);
+
 /* ASYNC split of shim_run_matmul8: _start submits the run (xrt::kernel::operator() enqueues +
  * starts execution) and returns a run handle WITHOUT waiting, so the host can do other work (prep
  * the next dispatch, post-process the previous) while the NPU computes. _wait blocks for completion.

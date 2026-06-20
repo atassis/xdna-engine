@@ -86,7 +86,9 @@ make -C $MMW -f Makefile.silu NPU2=1 M=512 K=800  N=768  n_aie_cols=8 no_silu=1 
 # Step-A MODAL on-chip epilogue (NPU_MODAL_EPI=1, native): ONE resident K=800 f32-out xclbin with an
 # RTP-selected epilogue; 6 streams = 3 N x {silu(no_silu=0), identity(no_silu=1)}. The silu/identity
 # xclbins are identical modulo the per-build UUID, so the silu one is the resident; both insts are used.
-rm -f $MMW/build/mm_silu_epilogue_*.o
+# Clean BOTH the epilogue AND the matmul objects: `make` mtime-tracking can reuse a stale mm_*.o across
+# kernel-source changes, producing a silently-wrong xclbin (bit us 2026-06-20, [[encoder-gelu-fusion-attempt]]).
+rm -f $MMW/build/mm_silu_epilogue_*.o $MMW/build/mm_64x32x96.o $MMW/build/mm_32x32x32.o
 for N in 3072 1536 768; do
   # FAST (64x32x96 BFP16_IREE) modal -- the shipped default precision
   WA_C_DEPTH=1 make -C $MMW -f Makefile.modal NPU2=1 M=512 K=800 N=$N m=64 k=32 n=96 n_aie_cols=8 emulate_bfloat16_mmul_with_bfp16=1 bfp16_iree=1           build/final_512x800x${N}_64x32x96_8c_modalsilu.xclbin
@@ -95,6 +97,9 @@ for N in 3072 1536 768; do
   make -C $MMW -f Makefile.modal NPU2=1 M=512 K=800 N=$N m=32 k=32 n=32 n_aie_cols=8           build/final_512x800x${N}_32x32x32_8c_modalsilu.xclbin
   make -C $MMW -f Makefile.modal NPU2=1 M=512 K=800 N=$N m=32 k=32 n=32 n_aie_cols=8 no_silu=1 build/final_512x800x${N}_32x32x32_8c_modalid.xclbin
 done
+# GELU mode (3-branch superset: rtp[0]=2) — only the FFN fc1 width (N=3072). Opt-in via NPU_ENC_GELU_FUSED
+# (folds the Whisper encoder FFN GELU into the fc1 epilogue, ~5-12% encoder / -5% e2e; WER 0.1245 marginal).
+WA_C_DEPTH=1 make -C $MMW -f Makefile.modal NPU2=1 M=512 K=800 N=3072 m=64 k=32 n=96 n_aie_cols=8 emulate_bfloat16_mmul_with_bfp16=1 bfp16_iree=1 gelu=1 build/final_512x800x3072_64x32x96_8c_modalgelu.xclbin
 make -C $PE/ml/softmax400 NPU2=1 build/final.xclbin   # softmax-400 (pad->416)
 
 echo "All encoder + fusion xclbins built."

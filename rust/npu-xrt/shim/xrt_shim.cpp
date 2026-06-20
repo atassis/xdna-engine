@@ -125,6 +125,18 @@ int shim_run_dwconv6(ShimKernel* k, unsigned int opcode, ShimBo* instr, size_t i
   )
 }
 
+// MHA host ABI: kernel(opcode, instr, instr_count, Q, K, V, O) — 4 data BOs (the IRON MHA op's
+// rt.sequence(Q, K, V, O)). Same structure as shim_run_matmul8, one fewer data arg.
+int shim_run_mha7(ShimKernel* k, unsigned int opcode, ShimBo* instr, size_t instr_count,
+                  ShimBo* q, ShimBo* kk, ShimBo* v, ShimBo* o) {
+  GUARD_INT(
+    auto run = k->kern(opcode, instr->bo, instr_count, q->bo, kk->bo, v->bo, o->bo);
+    ert_cmd_state st = run.wait();
+    if (st != ERT_CMD_STATE_COMPLETED) { set_err("kernel run did not complete"); return -1; }
+    return 0;
+  )
+}
+
 // xrt::kernel::operator() constructs a run AND starts it (enqueues the command); the wait is
 // separate. So building the run here = the async "start"; the host returns immediately while the
 // NPU executes. Same arg layout as shim_run_matmul8.

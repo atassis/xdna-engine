@@ -89,6 +89,7 @@ def my_matmul(
     emulate_bf16_mmul_with_bfp16,
     trace_size,
     generate_taps=False,
+    do_gelu=False,
 ):
     n_aie_rows = 4
     n_aie_cores = n_aie_rows * n_aie_cols
@@ -365,7 +366,7 @@ def my_matmul(
         # bake the epilogue mode into this instruction stream's RTP (1=silu, 0=identity), then
         # release the barrier so the cores read it. A silu-built stream and an identity-built stream
         # are two .txt insts on the SAME xclbin -> the host picks mode by choosing the stream.
-        mode_val = 1 if do_silu else 0
+        mode_val = 2 if do_gelu else (1 if do_silu else 0)  # rtp[0]: 0=identity, 1=silu, 2=gelu
         flat_rtps = [rtp_bufs[r][c] for r in range(n_aie_rows) for c in range(n_aie_cols)]
 
         def set_modes(*ps):
@@ -459,6 +460,12 @@ def main():
         "Default is silu mode: out = silu(A@B+bias).",
     )
     argparser.add_argument(
+        "--gelu",
+        action="store_true",
+        help="gelu mode: out = gelu(A@B+bias) (tanh approx). Folds the Whisper encoder FFN activation "
+        "into the fc1 epilogue. Overrides --no-silu. rtp[0]=2.",
+    )
+    argparser.add_argument(
         "--emulate-bf16-mmul-with-bfp16", type=bool, default=False
     )
     # Accepted for makefile-common compatibility; this design is fixed to
@@ -482,6 +489,7 @@ def main():
         args.emulate_bf16_mmul_with_bfp16,
         args.trace_size,
         args.generate_taps,
+        args.gelu,
     )
     if args.generate_taps:
         return maybe_module
