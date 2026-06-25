@@ -1,0 +1,16 @@
+[package]
+name = "npu-cli"
+version = "0.1.0"
+edition = "2021"
+description = "npu - the engine multitool (serve, transcribe, embed, models, config, reload, bake)"
+
+[[bin]]
+name = "npu"
+path = "src/main.rs"
+
+[dependencies]
+npu-runtime = { path = "../npu-runtime" }
+npu-engine = { path = "../npu-engine" }
+npu-weights = { path = "../npu-weights" }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"

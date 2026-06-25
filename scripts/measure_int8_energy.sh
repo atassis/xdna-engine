@@ -28,13 +28,13 @@ if awk "BEGIN{exit !($LOAD > 3.0)}"; then
   echo "[measure] WARNING: load $LOAD > 3.0 — box is NOT quiesced. RAPL energy will be CONTAMINATED."
   echo "[measure] Quit the game/video and re-run, or pass through anyway (timing still indicative, energy NOT)."
 fi
-for p in parakeet_serve; do pgrep -af "$p" | grep -qv 'grep' && echo "[measure] NOTE: $p running — will be stopped below"; done
+for p in 'npu serve'; do pgrep -af "$p" | grep -qv 'grep' && echo "[measure] NOTE: $p running — will be stopped below"; done
 
-restart() { echo "[measure] restarting npu services"; systemctl --user start npu-asr voxd 2>/dev/null; }
+restart() { echo "[measure] restarting npu services"; systemctl --user start npu-serve voxd 2>/dev/null; }
 trap restart EXIT
 echo "[measure] stopping services + clearing device (single-tenant)"
-systemctl --user stop npu-asr voxd 2>/dev/null
-pkill -f 'parakeet[_]serve' 2>/dev/null   # bracket avoids self-match of this script's own cmdline
+systemctl --user stop npu-serve voxd 2>/dev/null
+pkill -f 'npu[ ]serve' 2>/dev/null   # bracket avoids self-match of this script's own cmdline
 sleep 3
 if fuser /dev/accel/accel0 2>/dev/null; then echo "[measure] ERROR: device still busy"; exit 1; fi
 echo "[measure] device clear; clip=$CLIP"

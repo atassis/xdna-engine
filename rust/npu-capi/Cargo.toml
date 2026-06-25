@@ -1,0 +1,19 @@
+[package]
+name = "npu-capi"
+version = "0.1.0"
+edition = "2021"
+description = "C ABI over the npu-engine library (in-process embedding from any language)"
+
+[lib]
+name = "npu_engine"
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+npu-engine = { path = "../npu-engine" }
+npu-runtime = { path = "../npu-runtime" }
+
+[build-dependencies]
+cbindgen = "0.27"
+
+[dev-dependencies]
+cc = "1"

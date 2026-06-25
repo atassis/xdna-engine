@@ -125,6 +125,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
 
 [[package]]
+name = "cbindgen"
+version = "0.27.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3fce8dd7fcfcbf3a0a87d8f515194b49d6135acab73e18bd380d1d93bb1a15eb"
+dependencies = [
+ "clap",
+ "heck 0.4.1",
+ "indexmap",
+ "log",
+ "proc-macro2",
+ "quote",
+ "serde",
+ "serde_json",
+ "syn",
+ "tempfile",
+ "toml",
+]
+
+[[package]]
 name = "cc"
 version = "1.2.63"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -168,7 +187,7 @@ version = "4.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2ce8604710f6733aa641a2b3731eaa1e8b3d9973d5e3565da11800813f997a9"
 dependencies = [
- "heck",
+ "heck 0.5.0",
  "proc-macro2",
  "quote",
  "syn",
@@ -540,6 +559,12 @@ name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+
+[[package]]
+name = "heck"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "95505c38b4572b2d910cecb0281560f54b440a19336cbbcb27bf6ce6adc6f5a8"
 
 [[package]]
 name = "heck"
@@ -932,13 +957,24 @@ dependencies = [
 ]
 
 [[package]]
-name = "npu-asr-serve"
+name = "npu-capi"
 version = "0.1.0"
 dependencies = [
- "ndarray",
- "npu-asr",
- "npu-onnx",
- "npu-xrt",
+ "cbindgen",
+ "cc",
+ "npu-engine",
+ "npu-runtime",
+]
+
+[[package]]
+name = "npu-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "npu-engine",
+ "npu-runtime",
+ "npu-weights",
 ]
 
 [[package]]
@@ -960,6 +996,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "thiserror",
  "tokenizers",
  "toml",
 ]
@@ -980,6 +1017,16 @@ dependencies = [
  "npu-onnx",
  "npu-xrt",
  "rayon",
+]
+
+[[package]]
+name = "npu-runtime"
+version = "0.1.0"
+dependencies = [
+ "npu-engine",
+ "serde",
+ "tempfile",
+ "toml",
 ]
 
 [[package]]

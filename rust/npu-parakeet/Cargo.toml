@@ -28,7 +28,3 @@ path = "src/bin/verify_parakeet.rs"
 name = "parakeet_encode_npu"
 path = "src/bin/parakeet_encode_npu.rs"
 
-[[bin]]
-name = "parakeet_serve"
-path = "src/bin/parakeet_serve.rs"
-required-features = ["npu"]

@@ -20,6 +20,7 @@ ndarray-npy = { version = "0.9", default-features = false }
 rayon = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+thiserror = "1"
 toml = "0.8"
 tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
 npu-xrt = { path = "../npu-xrt" }
@@ -45,10 +46,6 @@ path = "src/bin/verify_esm.rs"
 [[bin]]
 name = "verify_native_gemm"
 path = "src/bin/verify_native_gemm.rs"
-
-[[bin]]
-name = "engine_serve"
-path = "src/bin/engine_serve.rs"
 
 [[bin]]
 name = "probe_tuning"
