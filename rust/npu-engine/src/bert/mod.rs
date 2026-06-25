@@ -22,8 +22,11 @@ pub struct EmbedPipeline {
 
 impl EmbedPipeline {
     pub fn build(cfg: &ScenarioConfig, root: &Path, dev: Rc<Device>) -> Self {
-        let wpath = root.join(&cfg.artifacts.weights);
-        let weights = Rc::new(BertWeights::load(&wpath, cfg.model.n_layers).expect("bert weights"));
+        // Uniform declarative entry point: arena (bake-on-missing) when artifacts.source is set,
+        // else the legacy npy dir -- all behind one call.
+        let weights = Rc::new(
+            BertWeights::load_for(&cfg.artifacts, root, cfg.model.n_layers).expect("bert weights"),
+        );
         let frontend = EmbedFrontend::new(
             &root.join(&cfg.artifacts.tokenizer), weights.clone(), cfg.model.max_seq);
         let encoder = BertEncoder::new(dev, root, &weights, cfg.model.n_heads, cfg.model.head_dim);

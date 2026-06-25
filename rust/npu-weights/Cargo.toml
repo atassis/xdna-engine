@@ -1,0 +1,38 @@
+# rust/npu-weights/Cargo.toml
+[package]
+name = "npu-weights"
+version = "0.1.0"
+edition = "2021"
+description = "Rust-native weight loader: bake HF safetensors/ONNX into a mmap BF16 arena"
+
+[lib]
+name = "npu_weights"
+path = "src/lib.rs"
+
+[[bin]]
+name = "npu-weights"
+path = "src/bin/npu_weights.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+safetensors = "0.4"
+memmap2 = "0.9"
+# hf-hub 0.3 exposes only default/online/tokio; "online" provides the sync ureq
+# (+native-tls) API. No ureq/rustls-tls features exist in 0.3, so we use "online".
+hf-hub = { version = "0.3", default-features = false, features = ["online"] }
+sha2 = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+half = "2"
+# ONNX initializer decode (weights only, NOT inference): a minimal hand-written
+# prost message set (onnx.rs) decodes ModelProto/GraphProto/TensorProto; no protoc
+# build step (the proto schema is vendored as Rust structs, not codegen).
+prost = "0.14"
+# The `verify` subcommand reads the Python oracle .npy at runtime, so these are
+# normal deps (the plan listed them dev-only, but the installed binary needs them).
+ndarray = "0.16"
+ndarray-npy = { version = "0.9", default-features = false }
+
+[dev-dependencies]
+tempfile = "3"

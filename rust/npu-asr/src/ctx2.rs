@@ -619,6 +619,49 @@ impl CtxAOp {
         }
     }
 
+    /// Fast-restart constructor: build a [`CtxAOp`] from PRE-PACKED bf16 weight bits (the exact
+    /// `[KA, n]` row-major bf16 the device BO expects) instead of an f32 `[KA, n]` matrix, skipping
+    /// the per-startup f32->bf16 pack done in [`new`]. The bits come straight from a bf16-baked
+    /// `NPU_WEIGHTS_ARENA` (see `npu_weights::arena::Loaded::tensor_bf16`).
+    ///
+    /// Additive and conservative: this only handles the plain non-modal, non-int8 bf16 BO layout
+    /// (`[KA, n]` u16). If the shared context is modal (K-aug epilogue) or int8 -- where the BO
+    /// layout differs (KAUG rows / on-chip dequant scales / per-column int8) -- or if `w_bits` is
+    /// not exactly `KA * n` long, it returns `None` so the caller falls back to [`new`] with the
+    /// f32 weight. The `bias`/`epi` are applied host-side exactly as in [`new`] (non-modal path),
+    /// so behavior matches the f32 build bit-for-bit when the bf16 bits equal the f32->bf16 pack.
+    pub fn new_bf16(
+        shared: Rc<SharedCtxA>,
+        w_bits: &[u16],
+        n: usize,
+        epi: Epi,
+        bias: &[f32],
+    ) -> Option<Self> {
+        assert!(CTXA_STREAMS.contains(&n), "ctxA op N={n} not a served stream");
+        assert_eq!(bias.len(), if epi == Epi::None { 0 } else { n });
+        // Only the plain non-modal bf16 BO layout matches a straight [KA, n] bf16 handoff. Modal
+        // (KAUG rows + K-aug bias) and int8 need a different BO build -> let the caller use `new`.
+        if shared.modal || shared.prec.is_int8() {
+            return None;
+        }
+        if w_bits.len() != KA * n {
+            return None;
+        }
+        let bo_b = shared.dev_alloc_b(w_bits.len() * 2).expect("alloc ctxA bf16 weight BO");
+        bo_b.write_bytes(u16_bytes(w_bits)).unwrap();
+        bo_b.sync_to_device().unwrap();
+        Some(CtxAOp {
+            mode: 0, // non-modal only (guarded above)
+            shared,
+            n,
+            epi,
+            bias: bias.to_vec(),
+            bo_b,
+            w_scale: Vec::new(), // bf16 path: no int8 per-column scales
+            w_global: 1.0,
+        })
+    }
+
     /// `a_real` is `[Mp, KA]` (Mp <= PAD_M). Returns `[Mp, n]` f32 with the host epilogue applied.
     pub fn forward(&self, a_real: &Array2<f32>) -> Array2<f32> {
         self.forward_view(a_real.view())

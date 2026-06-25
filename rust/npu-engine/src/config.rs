@@ -35,11 +35,47 @@ fn default_kernel() -> String { "zeropad".into() }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct Artifacts {
+    /// Legacy npy/f32 weights directory. Still the default path when no declarative `source` is set,
+    /// so existing scenarios parse + load byte-identically.
+    #[serde(default)]
     pub weights: String,
     #[serde(default)]
     pub tokenizer: String,
     #[serde(default)]
     pub onnx_ref: String,
+    /// Declarative weight source: `"hf:<repo>[@rev]"` or `"path:/abs"`. When set, the engine
+    /// resolves + bakes (on missing) a `npu-weights` arena via this spec instead of reading the
+    /// legacy npy `weights` dir. Optional and additive: omit it and the npy path is unchanged.
+    #[serde(default)]
+    pub source: String,
+    /// `npu-weights` arch name driving the bake transform: `bert|esm|vit|opt|whisper|fastconformer|gigaam`.
+    /// Required when `source` is set; ignored otherwise.
+    #[serde(default)]
+    pub arch: String,
+    /// Optional explicit arena `.safetensors` path. When empty the arena path is derived
+    /// (`${XDNA_ARENA_DIR:-<root>/artifacts/arenas}/<arch>__<src>__<fp>.safetensors`).
+    #[serde(default)]
+    pub arena: String,
+}
+
+impl Artifacts {
+    /// Build a declarative `npu_weights::spec::ModelSpec` from the `source`/`arch`/`arena` fields,
+    /// or `None` when no `source` is configured (legacy npy path). Errors on a malformed source or
+    /// a `source` without an `arch`.
+    pub fn model_spec(&self) -> anyhow::Result<Option<npu_weights::spec::ModelSpec>> {
+        if self.source.is_empty() {
+            return Ok(None);
+        }
+        anyhow::ensure!(!self.arch.is_empty(),
+            "artifacts.source is set but artifacts.arch is empty (need bert|esm|vit|opt|whisper|fastconformer|gigaam)");
+        let source = npu_weights::spec::Source::parse(&self.source)?;
+        let arena = if self.arena.is_empty() {
+            None
+        } else {
+            Some(std::path::PathBuf::from(&self.arena))
+        };
+        Ok(Some(npu_weights::spec::ModelSpec { source, arch: self.arch.clone(), arena }))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]

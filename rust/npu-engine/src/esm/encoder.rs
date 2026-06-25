@@ -86,11 +86,24 @@ impl EsmBlock {
     fn new(shared: Rc<SharedCtxA>, l: &EsmLayer, hidden: usize, ff: usize, n_heads: usize, head_dim: usize) -> Self {
         let proj_n = round_stream(hidden); // 320/480 -> 768
         let ff_n = round_stream(ff); // 1280 -> 1536, 1920 -> 3072
-        // q/k/v/o: weight [hidden,hidden] -> pad to [KA, proj_n]; bias -> proj_n.
+        // Build a bf16 GEMV op, preferring the pre-packed arena bf16 bits (fast restart: no per-start
+        // f32->bf16 pack) when (a) this layer carries bf16 for `wk`, (b) the bits are already the exact
+        // [KA, n] device layout (i.e. NO host pad is needed -- hidden==KA and n matches), and (c) the
+        // shared context accepts the plain bf16 BO (non-modal, non-int8). Otherwise fall back to the
+        // f32 `new` (pad2 to [KA, n]) UNCHANGED. The fall-through covers padded ESM models, modal/int8
+        // contexts, and the npy path -- so default behavior is identical.
         let mk = |wk: &str, bk: &str, n: usize| {
-            CtxAOp::new(shared.clone(), &pad2(&l.m(wk), KA, n), n, Epi::Bias, &vpad(&l.v(bk), n))
+            let bias = vpad(&l.v(bk), n);
+            if let Some((sh, bits)) = l.bf16_bits(wk) {
+                if sh.as_slice() == [KA, n] {
+                    if let Some(op) = CtxAOp::new_bf16(shared.clone(), bits, n, Epi::Bias, &bias) {
+                        return op;
+                    }
+                }
+            }
+            CtxAOp::new(shared.clone(), &pad2(&l.m(wk), KA, n), n, Epi::Bias, &bias)
         };
-        let ffn1 = CtxAOp::new(shared.clone(), &pad2(&l.m("ffn1_w"), KA, ff_n), ff_n, Epi::Bias, &vpad(&l.v("ffn1_b"), ff_n));
+        let ffn1 = mk("ffn1_w", "ffn1_b", ff_n);
         // ffn2: weight [ff, hidden] -> pad to [NA=3072, MM2_OUT=768]; bias -> 768.
         let ffn2 = FfnMm2::new(shared.clone(), &pad2(&l.m("ffn2_w"), NA, MM2_OUT), &vpad(&l.v("ffn2_b"), MM2_OUT));
         EsmBlock {
@@ -134,8 +147,7 @@ impl EsmBlock {
 
 pub struct EsmEncoder {
     blocks: Vec<EsmBlock>,
-    final_ln_w: Vec<f32>,
-    final_ln_b: Vec<f32>,
+    final_ln: Option<(Vec<f32>, Vec<f32>)>,
 }
 impl EsmEncoder {
     pub fn new(dev: Rc<Device>, root: &Path, w: &EsmWeights, hidden: usize, ff: usize, n_heads: usize, head_dim: usize) -> Self {
@@ -144,7 +156,7 @@ impl EsmEncoder {
         let blocks = (0..w.n_layers())
             .map(|i| EsmBlock::new(shared.clone(), &w.layers[i], hidden, ff, n_heads, head_dim))
             .collect();
-        EsmEncoder { blocks, final_ln_w: w.final_ln_w.clone(), final_ln_b: w.final_ln_b.clone() }
+        EsmEncoder { blocks, final_ln: w.final_ln.clone() }
     }
 }
 impl Encoder for EsmEncoder {
@@ -153,7 +165,11 @@ impl Encoder for EsmEncoder {
         for b in &self.blocks {
             x = b.forward(&x, valid);
         }
-        layer_norm(&x, &self.final_ln_w, &self.final_ln_b, LN_EPS) // final LN after all layers
+        // final LN after all layers, only for models that have one (e.g. esm2); bge has none.
+        match &self.final_ln {
+            Some((w, b)) => layer_norm(&x, w, b, LN_EPS),
+            None => x,
+        }
     }
 }
 
@@ -181,7 +197,7 @@ pub struct EsmEncoderNative {
     kf1: Rc<NativeKernel>, // ffn1: K=hidden, N=round256(ff)
     kf2: Rc<NativeKernel>, // ffn2: K=ff,    N=round256(hidden)
     blocks: Vec<EsmBlockNative>,
-    final_ln_w: Vec<f32>, final_ln_b: Vec<f32>,
+    final_ln: Option<(Vec<f32>, Vec<f32>)>,
 }
 impl EsmEncoderNative {
     pub fn new(dev: Rc<Device>, root: &Path, w: &EsmWeights, hidden: usize, ff: usize, n_heads: usize, head_dim: usize) -> Self {
@@ -202,7 +218,7 @@ impl EsmEncoderNative {
                 hidden, ff, n_heads, head_dim,
             }
         }).collect();
-        EsmEncoderNative { kp, kf1, kf2, blocks, final_ln_w: w.final_ln_w.clone(), final_ln_b: w.final_ln_b.clone() }
+        EsmEncoderNative { kp, kf1, kf2, blocks, final_ln: w.final_ln.clone() }
     }
     fn block_forward(&self, b: &EsmBlockNative, x: &Array2<f32>, valid: usize) -> Array2<f32> {
         let h = b.hidden;
@@ -228,6 +244,9 @@ impl Encoder for EsmEncoderNative {
         for b in &self.blocks {
             x = self.block_forward(b, &x, valid);
         }
-        layer_norm(&x, &self.final_ln_w, &self.final_ln_b, LN_EPS)
+        match &self.final_ln {
+            Some((w, b)) => layer_norm(&x, w, b, LN_EPS),
+            None => x,
+        }
     }
 }

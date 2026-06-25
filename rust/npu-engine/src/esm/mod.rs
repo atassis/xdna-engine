@@ -25,8 +25,11 @@ pub struct EsmEmbedPipeline {
 }
 impl EsmEmbedPipeline {
     pub fn build(cfg: &ScenarioConfig, root: &Path, dev: Rc<Device>) -> Self {
-        let wpath = root.join(&cfg.artifacts.weights);
-        let w = Rc::new(EsmWeights::load(&wpath, cfg.model.n_layers).expect("esm weights"));
+        // Uniform declarative entry point: arena (bake-on-missing) when artifacts.source is set,
+        // else NPU_WEIGHTS_ARENA env, else the legacy npy dir -- all behind one call.
+        let w = Rc::new(
+            EsmWeights::load_for(&cfg.artifacts, root, cfg.model.n_layers).expect("esm weights"),
+        );
         let frontend = Frontend_::new(w.clone(), cfg.model.max_seq);
         let m = &cfg.model;
         let encoder: Box<dyn Encoder> = if m.kernel == "native" {
