@@ -26,3 +26,6 @@ rust/target/
 build/
 route_b_kernels/decode_fused/build/
 **/build/
+
+# local AMD-toolchain target paths (no absolute fork paths in git)
+scripts/amd_toolchains.env

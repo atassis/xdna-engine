@@ -100,9 +100,29 @@ fn bf16_to_f32(bytes: &[u8]) -> Vec<f32> {
 }
 
 fn main() {
-    let dir = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "artifacts/fused_spike".to_string());
+    // CLI: [artifacts_dir] [--warmup N] [--iters M]. The timing flags add a
+    // dispatch-only warm-loop (measurement only; the computation is unchanged).
+    let mut dir_arg: Option<String> = None;
+    let mut do_time = false;
+    let mut warmup = 20usize;
+    let mut iters = 200usize;
+    let mut it = std::env::args().skip(1);
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--warmup" => {
+                warmup = it.next().and_then(|s| s.parse().ok()).unwrap_or(warmup);
+                do_time = true;
+            }
+            "--iters" => {
+                iters = it.next().and_then(|s| s.parse().ok()).unwrap_or(iters);
+                do_time = true;
+            }
+            "--time" => do_time = true,
+            s if !s.starts_with("--") && dir_arg.is_none() => dir_arg = Some(s.to_string()),
+            _ => {}
+        }
+    }
+    let dir = dir_arg.unwrap_or_else(|| "artifacts/fused_spike".to_string());
     let dir = Path::new(&dir);
     println!("[fused_elf_probe] artifacts: {}", dir.display());
 
@@ -182,8 +202,37 @@ fn main() {
         res.dispatch().expect("resident scratchpad dispatch");
         println!("  resident dispatch OK (kv_off={kv_val} sm_mask={sm_val})");
     } else {
-        arena.dispatch(kern.as_ref().unwrap()).expect("fused ELF dispatch");
-        println!("  dispatch OK");
+        // Single-shot (cold first dispatch) is always timed; it is the fair
+        // A/B point against the non-re-entrant cascade (which can only do one).
+        let k = kern.as_ref().unwrap();
+        let t0 = std::time::Instant::now();
+        arena.dispatch(k).expect("fused ELF dispatch");
+        let single_us = t0.elapsed().as_secs_f64() * 1e6;
+        println!("  dispatch OK (single-shot/first-dispatch {single_us:.1} us)");
+
+        // Warm dispatch timing: --warmup N --iters M (default 20/200). Wraps
+        // ONLY the NPU dispatch (run/wait) -- NOT the one-time ELF load.
+        if do_time {
+            for _ in 0..warmup {
+                arena.dispatch(k).unwrap();
+            }
+            let (mut total, mut tmin, mut tmax) = (0f64, f64::MAX, 0f64);
+            for _ in 0..iters {
+                let t = std::time::Instant::now();
+                arena.dispatch(k).unwrap();
+                let us = t.elapsed().as_secs_f64() * 1e6;
+                total += us;
+                tmin = tmin.min(us);
+                tmax = tmax.max(us);
+            }
+            println!(
+                "  warm dispatch (warmup={warmup} iters={iters}): avg={:.1} min={:.1} max={:.1} us",
+                total / iters as f64,
+                tmin,
+                tmax
+            );
+            println!("  single-shot (first dispatch): {single_us:.1} us");
+        }
     }
     arena.sync_from_device().unwrap();
 
