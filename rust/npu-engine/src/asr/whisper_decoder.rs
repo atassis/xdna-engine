@@ -1022,15 +1022,31 @@ impl FusedDecoder {
             }
             _ => None,
         };
-        // e2e/NPU wide-dispatch lm-head: load the standalone proj_out GEMV ELF (1 dispatch/token) when
-        // opted-in. Default dir artifacts/projout_elf; override with NPU_DECODE_PROJOUT_ELF_DIR.
-        let proj_out_elf = if std::env::var("NPU_DECODE_PROJOUT_ELF").is_ok() {
+        // e2e/NPU wide-dispatch lm-head: the standalone proj_out GEMV ELF (1 dispatch/token) runs
+        // ln_post + proj_out + argmax on the NPU, so the host does zero lm-head math (WER-exact 0.1172,
+        // ~4.3% faster decode / lm_head -48%, CPU-offload). DEFAULT-ON. Opt out with
+        // NPU_DECODE_PROJOUT_ELF=0 (host lm-head). Auto-falls back to the host lm-head when the prebuilt
+        // ELF is absent (fresh checkout / CI without the ~84 MB artifact) or when the ctx2 A/B path is
+        // explicitly requested. Default dir artifacts/projout_elf; override with NPU_DECODE_PROJOUT_ELF_DIR.
+        let projout_optout = matches!(
+            std::env::var("NPU_DECODE_PROJOUT_ELF").as_deref(),
+            Ok("0") | Ok("false") | Ok("no")
+        ) || std::env::var("NPU_DECODE_PROJOUT_CTX2").is_ok();
+        let proj_out_elf = if projout_optout {
+            None
+        } else {
             let dir = std::env::var("NPU_DECODE_PROJOUT_ELF_DIR")
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|_| fused_dir.parent().unwrap_or(fused_dir).join("projout_elf"));
-            Some(ProjOutElf::load(dev, &dir, &w))
-        } else {
-            None
+            if dir.join("projout.elf").exists() {
+                Some(ProjOutElf::load(dev, &dir, &w))
+            } else {
+                eprintln!(
+                    "[whisper_decoder] proj_out ELF absent at {} -- host lm-head fallback (build scripts/build_projout_elf.sh to enable the on-NPU lm-head; set NPU_DECODE_PROJOUT_ELF=0 to silence)",
+                    dir.display()
+                );
+                None
+            }
         };
         let cross_ops = match (shared, host_cross) {
             (Some(sh), false) => {

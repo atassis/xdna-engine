@@ -1,10 +1,12 @@
 # dwconv1d/dwconv1d.py -*- Python -*-
 #
-# IRON design for depthwise conv1d (k=5, 'same' padding) over [C=768, T=400].
-# One ObjectFifo tile == one channel's time series; a second fifo streams that
-# channel's 5 taps (padded to 16). C channels are split across `columns`, each
-# column-core looping over its share. Mirrors the proven eltwise_mul 3-buffer
-# (in / weights / out) template.
+# IRON design for depthwise conv1d (k=9, 'same' padding) over [C=1024, T=400] --
+# the Parakeet-TDT FastConformer ConvModule depthwise conv. One ObjectFifo tile
+# == one channel's time series; a second fifo streams that channel's weight tile
+# (9 taps in slots [0..8] + BatchNorm-folded bias in slot [9], padded to 16). C
+# channels are split across `columns`, each column-core looping over its share.
+# Mirrors the proven eltwise_mul 3-buffer (in / weights / out) template; the core
+# kernel (dwconv1d.cc) computes the FIR with the aie::sliding_mul COMPUTE brick.
 #
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
@@ -15,12 +17,13 @@ import sys
 
 from aie.iron import Kernel, ObjectFifo, Program, Runtime, Worker
 from aie.iron.device import NPU1, NPU2
+from aie.iron.placers import SequentialPlacer
 from aie.helpers.taplib.tap import TensorAccessPattern
 from aie.iron.controlflow import range_
 
-C = 768  # channels
-T = 400  # time steps (after subsampling)
-KW = 16  # weight tile size (only first 5 taps used)
+C = 1024  # channels (Parakeet d_model)
+T = 400   # time steps (encoder frame count baked at build)
+KW = 16   # weight tile size (taps[0..8] + bias[9], rest unused)
 
 
 def my_dwconv(dev, num_columns):
@@ -42,7 +45,7 @@ def my_dwconv(dev, num_columns):
     of_outs = [ObjectFifo(out_tile_ty, name=f"out_{i}") for i in range(num_columns)]
 
     dwconv = Kernel(
-        "dwconv1d_k5_bf16", "kernels.a", [in_tile_ty, w_tile_ty, out_tile_ty]
+        "dwconv1d_k9_bf16", "kernels.a", [in_tile_ty, w_tile_ty, out_tile_ty]
     )
 
     def core_body(of_in, of_w, of_out, dwconv_fn):
@@ -84,7 +87,7 @@ def my_dwconv(dev, num_columns):
             rt.drain(of_outs[i].cons(), Y, out_taps[i], wait=True, task_group=tg)
         rt.finish_task_group(tg)
 
-    return Program(dev, rt).resolve_program()
+    return Program(dev, rt).resolve_program(SequentialPlacer())
 
 
 p = argparse.ArgumentParser()

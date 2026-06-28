@@ -1,0 +1,96 @@
+diff --git a/route_b_kernels/cascade_ffn/ffn_cascade.py b/route_b_kernels/cascade_ffn/ffn_cascade.py
+index 181e2d1..fea9bb4 100644
+--- a/route_b_kernels/cascade_ffn/ffn_cascade.py
++++ b/route_b_kernels/cascade_ffn/ffn_cascade.py
+@@ -162,6 +162,7 @@ def build_module(D, FF, NCORES, M_INPUT, EPS):
+     w1tile_l2 = MemRefType.get([M_INPUT, D], bf16_ty, memory_space=l2_ms)
+     w2tile_l2 = MemRefType.get([M_INPUT, M_SLAB], bf16_ty, memory_space=l2_ms)
+     bias_l2_ty = MemRefType.get([M_SLAB], bf16_ty, memory_space=l2_ms)
++    xb_l2_ty = MemRefType.get([D], bf16_ty, memory_space=l2_ms)  # x / b_fc2 relay temp
+     out_l2_ty = MemRefType.get([D], bf16_ty, memory_space=l2_ms)
+ 
+     # --- Channels ---
+@@ -176,8 +177,19 @@ def build_module(D, FF, NCORES, M_INPUT, EPS):
+     # they share ONE reused inL2L1[c] core DMA channel -- AIE2P cores have only ~2
+     # input DMA channels, so x + inL2L1 = the 2-channel budget (mixed shapes on one
+     # channel is fine; matvec_cascade_add reuses one channel for R + A).
+-    Channel("inX", size=[1, 1], broadcast_shape=[NCORES, 1])
++    # NO broadcast channel: broadcast_shape does not re-arm across host re-dispatch
++    # (the inX broadcast multicast lock hangs/aborts the 2nd dispatch). Both
++    # re-dispatchable refs avoid broadcast (matvec_cascade_add has none;
++    # attention_decode copies x from L3 per-col). So x AND b_fc2 ride each col's own
++    # shim stream colL3L2[c] (uniform [768] each, like the original FIFO), and the
++    # segment relay SPLITS them off the weights onto a separate memtile->core channel
++    # inXl2l1[c] -- keeping the weight channel inL2L1 pure/uniform. Per core:
++    # inXl2l1 + inL2L1 = 2 input DMA channels (wall #4 clear). CRUCIAL vs the reverted
++    # af05bb8 attempt: b_fc2 is sent to ALL cores (not just col0 via scf.if) so the
++    # herd ChannelGet is UNCONDITIONAL -- a conditional acquire mis-lowers (the
++    # StaticMHA conditional-acquire wall); only the HEAD core USES b_fc2.
+     channel_decl("colL3L2", size=[NCORES])
++    channel_decl("inXl2l1", size=[NCORES])
+     channel_decl("inL2L1", size=[NCORES])
+     channel_decl("chan_cascade", size=[N_CASCADE - 1], channel_type="npu_cascade")
+ 
+@@ -218,10 +230,13 @@ def build_module(D, FF, NCORES, M_INPUT, EPS):
+             # DMA channels, so this adds NO channel (wall #4 stays clear), and both
+             # transfers are uniform [768] (no odd-shape fragility). The weight stream
+             # is now uniform [w1x48, bias, w2x96] -- identical to the 7 clean cores.
+-            ChannelPut("inX", x_l3, offsets=[0], sizes=[D], strides=[1])
+-            ChannelPut("inX", biases_l3, offsets=[FF], sizes=[D], strides=[1])
+             for c in range(NCORES):
+                 ci = arith.ConstantOp.create_index(c)
++                # Each col's shim stream LEADS with x then b_fc2 (both [768], uniform
++                # across cols), then the weights. The relay splits x/b_fc2 -> inXl2l1,
++                # weights -> inL2L1. b_fc2 = biases[FF:FF+D] (the fc2 bias slab).
++                ChannelPut("colL3L2", x_l3, indices=[ci], offsets=[0], sizes=[D], strides=[1])
++                ChannelPut("colL3L2", biases_l3, indices=[ci], offsets=[FF], sizes=[D], strides=[1])
+                 # ONE multiplexed shim stream per col, in herd-consume order:
+                 # Wfc1 col slab rows [c*384:+384] of [FF,D] as 48 x [8,768] ...
+                 ChannelPut(
+@@ -247,14 +262,21 @@ def build_module(D, FF, NCORES, M_INPUT, EPS):
+             def segment_body(out_s):
+                 out_l2 = AllocOp(out_l2_ty, [], [])
+ 
+-                # L2 relay: drain the multiplexed colL3L2 stream in herd-consume
+-                # order (w1 tiles, bias, w2 tiles) and fan out to the memtile
+-                # L2->L1 channels. FIFO order on colL3L2 == consume order -> no
+-                # cross-channel deadlock.
++                # L2 relay: drain colL3L2[c] in launch-put order -- x, then b_fc2
++                # (both -> inXl2l1), then the weights w1/bias/w2 (-> inL2L1). Splitting
++                # x/b_fc2 off the weight channel keeps inL2L1 pure/uniform weights.
++                # FIFO order on colL3L2 == consume order -> no cross-channel deadlock.
+                 for c in range(NCORES):
+                     ci = arith.ConstantOp.create_index(c)
++                    xrelay = AllocOp(xb_l2_ty, [], [])
++                    ChannelGet("colL3L2", xrelay.result, indices=[ci])
++                    ChannelPut("inXl2l1", xrelay.result, indices=[ci])
++                    DeallocOp(xrelay)
++                    bfrelay = AllocOp(xb_l2_ty, [], [])
++                    ChannelGet("colL3L2", bfrelay.result, indices=[ci])
++                    ChannelPut("inXl2l1", bfrelay.result, indices=[ci])
++                    DeallocOp(bfrelay)
+                     # Uniform weight stream for every col: w1 tiles, bias, w2 tiles.
+-                    # (b_fc2 no longer rides this channel -- it is on inX broadcast.)
+                     for _ in for_(FC1_TILES):
+                         t2 = AllocOp(w1tile_l2, [], [])
+                         ChannelGet("colL3L2", t2.result, indices=[ci])
+@@ -302,12 +324,13 @@ def build_module(D, FF, NCORES, M_INPUT, EPS):
+                     bfc2_l1 = AllocOp(vecD_l1, [], [])
+                     out_l1 = AllocOp(vecD_l1, [], [])
+ 
+-                    # ---- 1. broadcast x + b_fc2 (two same-shape [768] gets on the
+-                    # inX broadcast; ALL cores consume both for broadcast FIFO
+-                    # consistency, but only the HEAD core uses bfc2_l1). x feeds LN;
+-                    # bfc2_l1 is held until the cascade HEAD injects it. ----
+-                    ChannelGet("inX", x_l1.result, indices=[tx, ty])
+-                    ChannelGet("inX", bfc2_l1.result, indices=[tx, ty])
++                    # ---- 1. per-col x + b_fc2 from inXl2l1 (no broadcast; re-armable).
++                    # Every core gets its OWN x (feeds LN) and its own b_fc2 copy --
++                    # both gets UNCONDITIONAL (uniform across cores, like the original
++                    # FIFO) so no conditional acquire. Only the HEAD core USES bfc2_l1
++                    # (held until the cascade HEAD injects it); the others ignore it. ----
++                    ChannelGet("inXl2l1", x_l1.result, indices=[tx])
++                    ChannelGet("inXl2l1", bfc2_l1.result, indices=[tx])
+ 
+                     acc_sum = AllocOp(acc_l1, [], [])
+                     acc_sq = AllocOp(acc_l1, [], [])

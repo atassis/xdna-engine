@@ -42,8 +42,11 @@ def npy(wdir, layer, name):
 
 
 def ln(x_f32):
-    t = torch.from_numpy(x_f32.astype(np.float32)).reshape(1, -1)
-    return torch.nn.functional.layer_norm(t, normalized_shape=(t.shape[-1],)).numpy().reshape(-1)
+    # Non-affine LayerNorm over the last dim, per row. Accepts [D] or [M_TILE,D].
+    t = torch.from_numpy(x_f32.astype(np.float32))
+    t2 = t.reshape(-1, t.shape[-1])
+    n = torch.nn.functional.layer_norm(t2, normalized_shape=(t2.shape[-1],)).numpy()
+    return n.reshape(x_f32.shape)
 
 
 def gelu_tanh(h_f32):
@@ -57,7 +60,10 @@ def main():
     ap.add_argument("--layer", type=int, default=0)
     ap.add_argument("--out", default="artifacts/cascade_ffn/iron_baseline")
     ap.add_argument("--seed", type=int, default=11)
+    ap.add_argument("--m-tile", type=int, default=1, dest="M_TILE",
+                    help="activation rows (M-tile). 1 reproduces the M=1 baseline exactly.")
     args = ap.parse_args()
+    MT = args.M_TILE
     os.makedirs(os.path.join(args.out, "buffers"), exist_ok=True)
     L = args.layer
 
@@ -75,22 +81,36 @@ def main():
     mat_fc2 = bf16(Wfc2.T.copy())                     # [D, FF]
     b_fc2_bf = bf16(b_fc2)                            # [D]
 
-    # --- device-faithful golden (bf16 at every stage) ---
+    # --- device-faithful golden (bf16 at every stage), batched over M_TILE rows.
+    # x/out are [M_TILE, D] row-major (M_TILE=1 -> [D], reproduces the baseline).
+    # Each row is an independent FFN; matmuls are [M_TILE,*] @ W.T so per-element
+    # results equal the per-row f32-dot-then-bf16 the device GEMM computes. ---
     rng = np.random.default_rng(args.seed)
-    x = bf16(rng.standard_normal(D).astype(np.float32))
-    n_hw = bf16(ln(x.astype(np.float32)))
-    h1 = bf16(mat_fc1.astype(np.float32) @ n_hw.astype(np.float32))
-    h2 = bf16(h1.astype(np.float32) + bias_fc1.astype(np.float32))
+    x = bf16(rng.standard_normal((MT, D)).astype(np.float32))
+    n_hw = bf16(ln(x.astype(np.float32)))                                  # [MT,D]
+    h1 = bf16(n_hw.astype(np.float32) @ mat_fc1.astype(np.float32).T)      # [MT,FF]
+    h2 = bf16(h1.astype(np.float32) + bias_fc1.astype(np.float32))         # + bias (bcast)
     h3 = bf16(gelu_tanh(h2.astype(np.float32)))
-    o1 = bf16(mat_fc2.astype(np.float32) @ h3.astype(np.float32))
-    o2 = bf16(o1.astype(np.float32) + b_fc2_bf.astype(np.float32))
+    o1 = bf16(h3.astype(np.float32) @ mat_fc2.astype(np.float32).T)        # [MT,D]
+    o2 = bf16(o1.astype(np.float32) + b_fc2_bf.astype(np.float32))         # + b_fc2 (bcast)
+    if MT == 1:
+        x = x.reshape(-1)   # keep the M=1 baseline byte-identical ([D], not [1,D])
+        o2 = o2.reshape(-1)
 
     def wbuf(name, vals):
         with open(os.path.join(args.out, "buffers", f"{name}.bin"), "wb") as f:
             f.write(np.asarray(vals, dtype=BF16).tobytes())
 
+    # K-AUGMENT Wfc1 to [FF, D+32]: cols 0:D = (gf*Wfc1).T, col D = bias_fc1, cols
+    # D+1:D+32 = 0. The device fc1 GEMM folds the bias in (vector mac over the bias
+    # block) so bias is NOT streamed separately -- matches mv_bf16_gelu.cc FC1_WROW
+    # and ffn_cascade.py FC1_WROW. (The golden o2 math above is unchanged.)
+    FC1_WROW = D + 32
+    mat_fc1_aug = np.zeros((FF, FC1_WROW), dtype=BF16)
+    mat_fc1_aug[:, :D] = mat_fc1
+    mat_fc1_aug[:, D] = bias_fc1
     wbuf("x", x)
-    wbuf("Wfc1", mat_fc1.reshape(-1))
+    wbuf("Wfc1", mat_fc1_aug.reshape(-1))
     wbuf("bfc1", bias_fc1)
     wbuf("Wfc2", mat_fc2.reshape(-1))
     wbuf("bfc2", b_fc2_bf)
@@ -100,15 +120,15 @@ def main():
     out_md5 = hashlib.md5(out_bytes).hexdigest()
     meta = {
         "seed": args.seed,
-        "dims": {"D": D, "FF": FF, "layer": L},
+        "dims": {"D": D, "FF": FF, "layer": L, "M_TILE": MT},
         "weights_dir": args.weights,
         "buffers": {
-            "x": {"elems": D, "bytes": D * 2},
-            "Wfc1": {"elems": FF * D, "bytes": FF * D * 2, "shape": [FF, D]},
+            "x": {"elems": MT * D, "bytes": MT * D * 2, "shape": [MT, D]},
+            "Wfc1": {"elems": FF * (D + 32), "bytes": FF * (D + 32) * 2, "shape": [FF, D + 32], "kaug": "col D = bias_fc1"},
             "bfc1": {"elems": FF, "bytes": FF * 2},
             "Wfc2": {"elems": D * FF, "bytes": D * FF * 2, "shape": [D, FF]},
             "bfc2": {"elems": D, "bytes": D * 2},
-            "out": {"elems": D, "bytes": D * 2},
+            "out": {"elems": MT * D, "bytes": MT * D * 2, "shape": [MT, D]},
         },
         "out_md5": out_md5,
         "gate": "rel-L2(device out, buffers/out.bin) <= 0.08",

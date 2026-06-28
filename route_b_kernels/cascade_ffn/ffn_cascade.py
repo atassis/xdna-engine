@@ -127,13 +127,36 @@ def _map_mul_plus(coeff, k):
 
 
 @module_builder
-def build_module(D, FF, NCORES, M_INPUT, EPS):
+def build_module(D, FF, NCORES, M_INPUT, EPS, M_TILE):
+    # M_TILE = activation rows (sequence positions) processed per dispatch. The
+    # FFN is GEMM now (weight tile reused across all M_TILE rows), not the M=1
+    # GEMV. The host re-dispatches this ELF ceil(T_enc/M_TILE) times per layer
+    # (re-entrant via the mlir-air load_pdi cascade reset, ELF path). M_TILE is
+    # L1-bound: the full-tile cascade payload partial+recv = 2*M_TILE*D*2 bytes
+    # must fit the 64KB L1 (M_TILE=16 -> 48KB peak). Larger M_TILE needs cascade
+    # row-sub-tiling (Phase 1 scaling). See internal notes fused-ffn-phase0-gate.
     M_SLAB = FF // NCORES            # 384: fc1 out rows/core == fc2 K-chunk/core
     assert FF % NCORES == 0 and M_SLAB % M_INPUT == 0 and D % M_INPUT == 0
     assert M_SLAB % 16 == 0 and D % 16 == 0 and D % 32 == 0  # bf16 legalize + cascade payload
+    assert M_TILE >= 1
     FC1_TILES = M_SLAB // M_INPUT   # 48
     FC2_TILES = D // M_INPUT        # 96
+    # fc1 weight tiles are K-AUGMENTED: D=768 reduction cols + a 32-wide bias block
+    # (col D = bias_fc1[oc], D+1..D+32 = 0). The fc1 GEMM kernel folds the bias in
+    # (vector mac) so bias is NOT a separate inL2L1 transfer -- that multiplexing
+    # inflated the w1 objectFIFO lock and overran the weight buffer at M_TILE>1
+    # (see internal notes mtile-ffn-phase1-ln-fix). FC1_WROW must match the kernel.
+    FC1_WROW = D + 32                # 800
     N_CASCADE = NCORES
+
+    # --- Per-stage latency-attribution stubs (measure-first; latency only, NOT
+    # correct). FFN_STUB_GEMM=1 keeps the inL2L1 weight stream (no relay deadlock)
+    # but skips the fc1/fc2/gelu compute -> slope_full - slope_stubgemm = GEMM+gelu
+    # per-row cost. FFN_STUB_CASCADE=1 drops the 8-hop W->E serial reduction (TAIL
+    # writes its own wbuf) -> slope_full - slope_stubcascade = cascade per-row cost.
+    # See internal notes (the 150 us/row attribution).
+    STUB_GEMM = os.environ.get("FFN_STUB_GEMM") == "1"
+    STUB_CASCADE = os.environ.get("FFN_STUB_CASCADE") == "1"
 
     bf16_ty = BF16Type.get()
     f32_ty = F32Type.get()
@@ -145,24 +168,26 @@ def build_module(D, FF, NCORES, M_INPUT, EPS):
     # static bias vectors are folded into ONE `biases` buffer of length FF+D:
     #   biases[0:FF]      = bias_fc1 = bf@Wfc1 + b_fc1   (per-core +bias before GELU)
     #   biases[FF:FF+D]   = b_fc2                         (cascade-HEAD residual)
-    x_l3_ty = MemRefType.get([D], bf16_ty)
-    Wfc1_l3_ty = MemRefType.get([FF, D], bf16_ty)        # (gf[:,None]*Wfc1).T
+    # x/out are now [M_TILE, D] (the M-tile activation/output batch); weights and
+    # biases are M-independent (reused across all rows).
+    x_l3_ty = MemRefType.get([M_TILE, D], bf16_ty)
+    Wfc1_l3_ty = MemRefType.get([FF, FC1_WROW], bf16_ty)  # K-aug: (gf*Wfc1).T ++ bias col
     biases_l3_ty = MemRefType.get([FF + D], bf16_ty)     # bias_fc1 ++ b_fc2  (3840)
     Wfc2_l3_ty = MemRefType.get([D, FF], bf16_ty)        # Wfc2.T (= mat_fc2)
-    out_l3_ty = MemRefType.get([D], bf16_ty)
+    out_l3_ty = MemRefType.get([M_TILE, D], bf16_ty)
 
     # L1 buffer types.
-    vecD_l1 = MemRefType.get([D], bf16_ty, memory_space=l1_ms)          # 768
-    vecSlab_l1 = MemRefType.get([M_SLAB], bf16_ty, memory_space=l1_ms)  # 384
-    w1tile_l1 = MemRefType.get([M_INPUT, D], bf16_ty, memory_space=l1_ms)       # [8,768]
+    actMT_l1 = MemRefType.get([M_TILE, D], bf16_ty, memory_space=l1_ms)      # x/xnorm/partial/recv
+    hMT_l1 = MemRefType.get([M_TILE, M_SLAB], bf16_ty, memory_space=l1_ms)   # fc1 out slab / fc2 in
+    vecD_l1 = MemRefType.get([D], bf16_ty, memory_space=l1_ms)               # b_fc2 broadcast vec
+    vecSlab_l1 = MemRefType.get([M_SLAB], bf16_ty, memory_space=l1_ms)       # bias_fc1 slab
+    w1tile_l1 = MemRefType.get([M_INPUT, FC1_WROW], bf16_ty, memory_space=l1_ms)  # [8,800] K-aug
     w2tile_l1 = MemRefType.get([M_INPUT, M_SLAB], bf16_ty, memory_space=l1_ms)  # [8,384]
-    tile_l1 = MemRefType.get([M_INPUT], bf16_ty, memory_space=l1_ms)    # [8]
-    acc_l1 = MemRefType.get([16], f32_ty, memory_space=l1_ms)
     # L2 staging buffers (one tile each, ping-ponged by the relay).
-    w1tile_l2 = MemRefType.get([M_INPUT, D], bf16_ty, memory_space=l2_ms)
+    w1tile_l2 = MemRefType.get([M_INPUT, FC1_WROW], bf16_ty, memory_space=l2_ms)
     w2tile_l2 = MemRefType.get([M_INPUT, M_SLAB], bf16_ty, memory_space=l2_ms)
     bias_l2_ty = MemRefType.get([M_SLAB], bf16_ty, memory_space=l2_ms)
-    out_l2_ty = MemRefType.get([D], bf16_ty, memory_space=l2_ms)
+    out_l2_ty = MemRefType.get([M_TILE, D], bf16_ty, memory_space=l2_ms)
 
     # --- Channels ---
     # Broadcast x to all cols. Each col's weights ride ONE multiplexed L3->L2 shim
@@ -188,18 +213,25 @@ def build_module(D, FF, NCORES, M_INPUT, EPS):
         f.attributes["llvm.emit_c_interface"] = UnitAttr.get()
         return f
 
-    fc1_func = _kdecl("matvec_fc1_tile_bf16_store", [w1tile_l1, vecD_l1, tile_l1])
-    fc2_func = _kdecl("matvec_fc2_tile_bf16_store", [w2tile_l1, vecSlab_l1, tile_l1])
-    gelu_func = _kdecl("gelu_tile_bf16", [T.i32(), vecSlab_l1])
-    # partial_plus_r_bf16(uint32 n, bf16* partial, bf16* r_full, int offset, bf16* d);
-    # used only at length D=768 (cascade) -> one static shape, no dynamic memref.
+    # LayerNorm over M_TILE rows: (i32 m_act, i32 n, f32 eps, x[M_TILE,D], xnorm[M_TILE,D])
+    ln_func = _kdecl("layernorm_rows_bf16", [T.i32(), T.i32(), f32_ty, actMT_l1, actMT_l1])
+    # GEMM tiles: (i32 m_act, i32 col_off, w_tile, act[M_TILE,*], out[M_TILE,*]).
+    # fc1: w[8,768] @ xnorm[M_TILE,768] -> h_slab[M_TILE,384] at col_off.
+    fc1_func = _kdecl("gemm_fc1_tile_bf16", [T.i32(), T.i32(), w1tile_l1, actMT_l1, hMT_l1])
+    # fc2: w[8,384] @ h_slab[M_TILE,384] -> partial[M_TILE,768] at col_off.
+    # fc2 reads the SHARED [M_INPUT,FC1_WROW] weight buffer (w2 lands in its first
+    # M_SLAB cols, row stride FC1_WROW) -> decl uses w1tile_l1, kernel uses WROW=FC1_WROW.
+    fc2_func = _kdecl("gemm_fc2_tile_bf16", [T.i32(), T.i32(), w1tile_l1, hMT_l1, actMT_l1])
+    # broadcast-bias adds (single memref type each): +bias_fc1 on h, +b_fc2 on partial.
+    bias_slab_func = _kdecl("add_bias_bcast_slab_bf16", [T.i32(), T.i32(), hMT_l1, vecSlab_l1])
+    bias_d_func = _kdecl("add_bias_bcast_d_bf16", [T.i32(), T.i32(), actMT_l1, vecD_l1])
+    # GELU once over the full [M_TILE,M_SLAB] flat slab (runtime n = M_TILE*M_SLAB).
+    gelu_func = _kdecl("gelu_tile_bf16", [T.i32(), hMT_l1])
+    # partial_plus_r_bf16(n, partial, r_full, offset, d): cascade middle/tail add,
+    # elementwise over the flat [M_TILE,D] payload (n = M_TILE*D, offset 0).
     ppr_func = _kdecl(
-        "partial_plus_r_bf16", [T.i32(), vecD_l1, vecD_l1, T.i32(), vecD_l1]
+        "partial_plus_r_bf16", [T.i32(), actMT_l1, actMT_l1, T.i32(), actMT_l1]
     )
-
-    slab_map = _map_mul(M_SLAB)         # i -> i*384
-    mtile_map = _map_mul(M_INPUT)       # t -> t*8
-    scatter_maps = [_map_mul_plus(M_INPUT, i) for i in range(M_INPUT)]  # t -> t*8 + i
 
     # Host BO order (group_id = arg index + 3): bo0/x=gid3, bo1/Wfc1=gid4,
     # bo2/biases=gid5, bo3/Wfc2=gid6, bo4/out=gid7. (5 BOs, fits the aiecc cap.)
@@ -210,30 +242,29 @@ def build_module(D, FF, NCORES, M_INPUT, EPS):
         @launch(sizes=[1, 1], operands=[x_a, w1_a, biases_a, w2_a, out_a])
         def launch_body(lx, ly, lsx, lsy, x_l3, w1_l3, biases_l3, w2_l3, out_l3):
             # L3-side reads (consolidated shim BDs). The inX broadcast carries TWO
-            # same-shape [768] transfers to every core: x (for LN) then b_fc2 (the
-            # cascade-HEAD residual). b_fc2 rides inX -- the proven-reliable channel
-            # core0 already reads -- NOT the weight stream: multiplexing the odd
-            # [768] b_fc2 onto core0's colL3L2/inL2L1 corrupted core0's weights
-            # (only core0's partial was wrong). inX is already one of core0's 2 input
-            # DMA channels, so this adds NO channel (wall #4 stays clear), and both
-            # transfers are uniform [768] (no odd-shape fragility). The weight stream
-            # is now uniform [w1x48, bias, w2x96] -- identical to the 7 clean cores.
-            ChannelPut("inX", x_l3, offsets=[0], sizes=[D], strides=[1])
-            ChannelPut("inX", biases_l3, offsets=[FF], sizes=[D], strides=[1])
+            # transfers to every core: x[M_TILE,D] (the activation batch, for LN +
+            # fc1) then b_fc2[D] (the cascade-HEAD residual). b_fc2 rides inX -- the
+            # proven-reliable channel every core already reads -- NOT the weight
+            # stream: multiplexing the odd b_fc2 onto core0's colL3L2/inL2L1
+            # corrupted core0's weights. inX is already one of each core's 2 input
+            # DMA channels, so this adds NO channel (wall #4 stays clear). The weight
+            # stream stays uniform [w1x48, bias, w2x96] across all 8 cores.
+            ChannelPut("inX", x_l3, offsets=[0, 0], sizes=[M_TILE, D], strides=[D, 1])
+            # b_fc2[D] read as [M_TILE,D] via stride-0 row replication, so this
+            # transfer matches x's [M_TILE,D] size on the shared inX broadcast
+            # (unequal transfers on one broadcast channel corrupt -- the M_TILE>1 bug).
+            ChannelPut("inX", biases_l3, offsets=[FF], sizes=[M_TILE, D], strides=[0, 1])
             for c in range(NCORES):
                 ci = arith.ConstantOp.create_index(c)
                 # ONE multiplexed shim stream per col, in herd-consume order:
-                # Wfc1 col slab rows [c*384:+384] of [FF,D] as 48 x [8,768] ...
+                # Wfc1 col slab rows [c*384:+384] of [FF,FC1_WROW] as 48 x [8,800].
+                # The bias is baked into col D of each weight row (K-aug), so there
+                # is NO separate bias transfer on this stream anymore.
                 ChannelPut(
                     "colL3L2", w1_l3, indices=[ci],
                     offsets=[c * FC1_TILES, 0, 0],
-                    sizes=[FC1_TILES, M_INPUT, D],
-                    strides=[M_INPUT * D, D, 1],
-                )
-                # ... then the bias_fc1 slot biases[c*384:+384] (biases[0:FF]) ...
-                ChannelPut(
-                    "colL3L2", biases_l3, indices=[ci],
-                    offsets=[c * M_SLAB], sizes=[M_SLAB], strides=[1],
+                    sizes=[FC1_TILES, M_INPUT, FC1_WROW],
+                    strides=[M_INPUT * FC1_WROW, FC1_WROW, 1],
                 )
                 # ... then Wfc2 col-block cols [c*384:+384] of [D,FF] as 96 x [8,384].
                 ChannelPut(
@@ -248,23 +279,17 @@ def build_module(D, FF, NCORES, M_INPUT, EPS):
                 out_l2 = AllocOp(out_l2_ty, [], [])
 
                 # L2 relay: drain the multiplexed colL3L2 stream in herd-consume
-                # order (w1 tiles, bias, w2 tiles) and fan out to the memtile
-                # L2->L1 channels. FIFO order on colL3L2 == consume order -> no
-                # cross-channel deadlock.
+                # order (w1 tiles, then w2 tiles) and fan out to the memtile L2->L1
+                # channels. bias is K-aug'd into the w1 tiles (no separate transfer).
+                # FIFO order on colL3L2 == consume order -> no cross-channel deadlock.
                 for c in range(NCORES):
                     ci = arith.ConstantOp.create_index(c)
-                    # Uniform weight stream for every col: w1 tiles, bias, w2 tiles.
-                    # (b_fc2 no longer rides this channel -- it is on inX broadcast.)
                     for _ in for_(FC1_TILES):
                         t2 = AllocOp(w1tile_l2, [], [])
                         ChannelGet("colL3L2", t2.result, indices=[ci])
                         ChannelPut("inL2L1", t2.result, indices=[ci])
                         DeallocOp(t2)
                         yield_([])
-                    b2 = AllocOp(bias_l2_ty, [], [])
-                    ChannelGet("colL3L2", b2.result, indices=[ci])
-                    ChannelPut("inL2L1", b2.result, indices=[ci])
-                    DeallocOp(b2)
                     for _ in for_(FC2_TILES):
                         t2 = AllocOp(w2tile_l2, [], [])
                         ChannelGet("colL3L2", t2.result, indices=[ci])
@@ -276,173 +301,146 @@ def build_module(D, FF, NCORES, M_INPUT, EPS):
                 def herd_body(tx, ty, sx, sy, _out_l2):
                     c0 = arith.ConstantOp.create_index(0)
                     c1 = arith.ConstantOp.create_index(1)
-                    cD_idx = arith.ConstantOp.create_index(D)
-                    cSlab_idx = arith.ConstantOp.create_index(M_SLAB)
-                    c16_idx = arith.ConstantOp.create_index(16)
+                    c8 = arith.ConstantOp.create_index(M_INPUT)
                     last_ty = arith.ConstantOp.create_index(N_CASCADE - 1)
 
-                    n_slab_i32 = arith.constant(T.i32(), M_SLAB)
+                    m_tile_i32 = arith.constant(T.i32(), M_TILE)
                     n_d_i32 = arith.constant(T.i32(), D)
+                    n_slab_i32 = arith.constant(T.i32(), M_SLAB)
+                    gelu_n_i32 = arith.constant(T.i32(), M_TILE * M_SLAB)   # GELU flat len
+                    ppr_n_i32 = arith.constant(T.i32(), M_TILE * D)         # cascade flat len
                     off0_i32 = arith.constant(T.i32(), 0)
+                    eps_f32 = arith.ConstantOp(f32_ty, float(EPS)).result
 
-                    vbf = VectorType.get([16], bf16_ty)
-                    vf32 = VectorType.get([16], f32_ty)
-                    idmap = AffineMapAttr.get(AffineMap.get_identity(1))
-                    cst0b = arith.ConstantOp(bf16_ty, 0.0)
-                    cst0f = arith.ConstantOp(f32_ty, 0.0)
+                    # L1-CAPACITY: the AIE static allocator does NOT reuse a
+                    # DeallocOp'd buffer for a later AllocOp -- it sums every live
+                    # AllocOp -- and weight tiles double-buffer (~36KB). So we ALIAS
+                    # one working buffer `wbuf` through the disjoint lifetimes
+                    # x -> xnorm (LN in-place) -> partial (fc2 out / cascade), and
+                    # keep one `rbuf` for cascade recv. Two [M_TILE,D] buffers, not
+                    # four -- the L1 fit that sets the all-L1 M_TILE ceiling.
+                    wbuf = AllocOp(actMT_l1, [], [])       # x -> xnorm -> partial
+                    wbuf.attributes["air.shrinkage"] = BoolAttr.get(False)
+                    rbuf = AllocOp(actMT_l1, [], [])       # cascade recv
+                    rbuf.attributes["air.shrinkage"] = BoolAttr.get(False)
+                    h_l1 = AllocOp(hMT_l1, [], [])
+                    bfc2_l1 = AllocOp(actMT_l1, [], [])  # b_fc2 replicated to [M_TILE,D]
+                    # ONE shared weight buffer for BOTH the fc1 and fc2 streams. Using a
+                    # single AllocOp (not a per-loop one) makes aircc give the inL2L1
+                    # weight objectFIFO exactly ONE buffer -> free-lock init=1 -> strict
+                    # producer/consumer alternation, so the L2->L1 producer can NEVER
+                    # overrun the in-flight tile (the M_TILE>1 bug was aircc merging the
+                    # per-loop w1+w2 buffers into one over-credited FIFO; see
+                    # mtile-ffn-phase1-ln-fix). [8,FC1_WROW] holds the fc1 [8,800] tile;
+                    # fc2 reuses its first [8,M_SLAB]. Trade-off: depth-1 = no DMA/compute
+                    # overlap (the M-tile LPDDR-reuse win is unaffected -- weights still
+                    # stream once per tile). Recovering overlap = a Phase-2 aircc lever.
+                    wtile = AllocOp(w1tile_l1, [], [])
+                    wtile.attributes["air.shrinkage"] = BoolAttr.get(False)
 
-                    x_l1 = AllocOp(vecD_l1, [], [])
-                    xnorm_l1 = AllocOp(vecD_l1, [], [])
-                    h_l1 = AllocOp(vecSlab_l1, [], [])
-                    bias_l1 = AllocOp(vecSlab_l1, [], [])
-                    partial_op = AllocOp(vecD_l1, [], [])
-                    partial_op.attributes["air.shrinkage"] = BoolAttr.get(False)
-                    recv_op = AllocOp(vecD_l1, [], [])
-                    recv_op.attributes["air.shrinkage"] = BoolAttr.get(False)
-                    bfc2_l1 = AllocOp(vecD_l1, [], [])
-                    out_l1 = AllocOp(vecD_l1, [], [])
-
-                    # ---- 1. broadcast x + b_fc2 (two same-shape [768] gets on the
-                    # inX broadcast; ALL cores consume both for broadcast FIFO
-                    # consistency, but only the HEAD core uses bfc2_l1). x feeds LN;
-                    # bfc2_l1 is held until the cascade HEAD injects it. ----
-                    ChannelGet("inX", x_l1.result, indices=[tx, ty])
+                    # ---- 1. broadcast x[M_TILE,D] -> wbuf + b_fc2(rep [M_TILE,D]) ->
+                    # bfc2_l1; ALL cores consume both (broadcast FIFO), only HEAD uses
+                    # bfc2_l1. Both transfers are [M_TILE,D] (equal size on inX). ----
+                    ChannelGet("inX", wbuf.result, indices=[tx, ty])
                     ChannelGet("inX", bfc2_l1.result, indices=[tx, ty])
 
-                    acc_sum = AllocOp(acc_l1, [], [])
-                    acc_sq = AllocOp(acc_l1, [], [])
-                    zf = BroadcastOp(vf32, cst0f)
-                    transfer_write(None, zf, acc_sum.result, [c0], idmap, [True])
-                    transfer_write(None, zf, acc_sq.result, [c0], idmap, [True])
-                    for j in for_(c0, cD_idx, c16_idx):
-                        sub_x = subview(x_l1.result, [j], [16], [1])
-                        vx = transfer_read(vbf, sub_x, [c0], idmap, cst0b, [True])
-                        vxf = arith.extf(vf32, vx)
-                        vs = transfer_read(vf32, acc_sum.result, [c0], idmap, cst0f, [True])
-                        transfer_write(None, arith.addf(vs, vxf), acc_sum.result, [c0], idmap, [True])
-                        # sum-of-squares: square in BF16 (f32 vector mul/fma are illegal
-                        # on AIE2P -- mul_elem unsupported), accumulate in f32. (int4 RMS.)
-                        vsq_b = arith.mulf(vx, vx)
-                        vq = transfer_read(vf32, acc_sq.result, [c0], idmap, cst0f, [True])
-                        transfer_write(None, arith.addf(vq, arith.extf(vf32, vsq_b)), acc_sq.result, [c0], idmap, [True])
-                        yield_([])
-                    v_sum_f = transfer_read(vf32, acc_sum.result, [c0], idmap, cst0f, [True])
-                    total_sum = vector_reduction(f32_ty, "add", v_sum_f)
-                    v_sq_f = transfer_read(vf32, acc_sq.result, [c0], idmap, cst0f, [True])
-                    total_sq = vector_reduction(f32_ty, "add", v_sq_f)
-                    cDf = arith.ConstantOp(f32_ty, float(D))
-                    epsf = arith.ConstantOp(f32_ty, float(EPS))
-                    mean = arith.divf(total_sum, cDf)
-                    mean_of_sq = arith.divf(total_sq, cDf)
-                    var = arith.subf(mean_of_sq, arith.mulf(mean, mean))
-                    rstd = math_dialect.rsqrt(arith.addf(var, epsf))
-                    # Normalize in BF16 (x-mean)*rstd: f32 vector mul is illegal on AIE2P,
-                    # and bf16 elementwise mul is the supported path (int4 RMS normalize).
-                    v_mean = BroadcastOp(vbf, arith.truncf(bf16_ty, mean))
-                    v_rstd = BroadcastOp(vbf, arith.truncf(bf16_ty, rstd))
-                    for j in for_(c0, cD_idx, c16_idx):
-                        sub_x = subview(x_l1.result, [j], [16], [1])
-                        vx = transfer_read(vbf, sub_x, [c0], idmap, cst0b, [True])
-                        v_cen = arith.subf(vx, v_mean.result)
-                        v_nrm = arith.mulf(v_cen, v_rstd.result)
-                        sub_o = subview(xnorm_l1.result, [j], [16], [1])
-                        transfer_write(None, v_nrm, sub_o, [c0], idmap, [True])
-                        yield_([])
-                    DeallocOp(acc_sum)
-                    DeallocOp(acc_sq)
-                    DeallocOp(x_l1)
+                    # ---- 2. LayerNorm per row, IN-PLACE in wbuf (reads a full row
+                    # before writing it, so in-place is safe). ----
+                    CallOp(ln_func, [m_tile_i32, n_d_i32, eps_f32, wbuf.result, wbuf.result])
 
-                    # ---- 2. fc1 tiling: get [8,768] tiles, scatter into h_ty[384] ----
+                    # ---- 3. fc1 GEMM (+ bias K-aug'd into the weight tile): each
+                    # [8,FC1_WROW] tile reused across all M_TILE rows -> kernel writes
+                    # [M_TILE,8] = dot(xnorm, w[:768]) + bias into h_l1[:,col_off].
+                    # Reads wbuf (now xnorm). ----
                     for t in for_(0, FC1_TILES):
-                        w1t = AllocOp(w1tile_l1, [], [])
-                        ChannelGet("inL2L1", w1t.result, indices=[tx])
-                        ht = AllocOp(tile_l1, [], [])
-                        CallOp(fc1_func, [w1t.result, xnorm_l1.result, ht.result])
-                        for i in range(M_INPUT):
-                            ci = arith.ConstantOp.create_index(i)
-                            v = memref_load(ht.result, [ci])
-                            dpos = affine_apply(scatter_maps[i], [t])
-                            memref_store(v, h_l1.result, [dpos])
-                        DeallocOp(w1t)
-                        DeallocOp(ht)
+                        ChannelGet("inL2L1", wtile.result, indices=[tx])
+                        if not STUB_GEMM:  # keep the get (drain inL2L1), skip compute
+                            col_off = arith.IndexCastOp(T.i32(), arith.MulIOp(t, c8)).result
+                            CallOp(fc1_func, [m_tile_i32, col_off, wtile.result, wbuf.result, h_l1.result])
                         yield_([])
-                    DeallocOp(xnorm_l1)
 
-                    # ---- 3. + bias_fc1 slab (inline, BEFORE GELU) ----
-                    ChannelGet("inL2L1", bias_l1.result, indices=[tx])
-                    for j in for_(c0, cSlab_idx, c16_idx):
-                        sub_h = subview(h_l1.result, [j], [16], [1])
-                        sub_b = subview(bias_l1.result, [j], [16], [1])
-                        vh = transfer_read(vbf, sub_h, [c0], idmap, cst0b, [True])
-                        vb = transfer_read(vbf, sub_b, [c0], idmap, cst0b, [True])
-                        vsum = arith.addf(arith.extf(vf32, vh), arith.extf(vf32, vb))
-                        transfer_write(None, arith.truncf(vbf, vsum), sub_h, [c0], idmap, [True])
-                        yield_([])
-                    DeallocOp(bias_l1)
+                    # ---- 4. GELU once over the full [M_TILE,M_SLAB] slab (bias already
+                    # folded into fc1). ----
+                    if not STUB_GEMM:
+                        CallOp(gelu_func, [gelu_n_i32, h_l1.result])
 
-                    # ---- 4. GELU(tanh) once over the full 384 slab ----
-                    CallOp(gelu_func, [n_slab_i32, h_l1.result])
-
-                    # ---- 5. fc2 tiling: get [8,384] tiles, scatter into partial[768] ----
+                    # ---- 5. fc2 GEMM: each [8,M_SLAB] weight tile reused across rows ->
+                    # kernel writes [M_TILE,8] into wbuf (now the partial) at col_off.
+                    # The w2 [8,M_SLAB] tile lands in the first M_SLAB cols of wtile
+                    # (row stride FC1_WROW); the fc2 kernel reads it at WROW=FC1_WROW.
+                    # wbuf's xnorm role is dead after fc1 -> safe reuse. ----
                     for t in for_(0, FC2_TILES):
-                        w2t = AllocOp(w2tile_l1, [], [])
-                        ChannelGet("inL2L1", w2t.result, indices=[tx])
-                        pt = AllocOp(tile_l1, [], [])
-                        CallOp(fc2_func, [w2t.result, h_l1.result, pt.result])
-                        for i in range(M_INPUT):
-                            ci = arith.ConstantOp.create_index(i)
-                            v = memref_load(pt.result, [ci])
-                            dpos = affine_apply(scatter_maps[i], [t])
-                            memref_store(v, partial_op.result, [dpos])
-                        DeallocOp(w2t)
-                        DeallocOp(pt)
+                        ChannelGet("inL2L1", wtile.result, offsets=[0, 0],
+                                   sizes=[M_INPUT, M_SLAB], strides=[FC1_WROW, 1], indices=[tx])
+                        if not STUB_GEMM:  # keep the get (drain inL2L1), skip compute
+                            col_off = arith.IndexCastOp(T.i32(), arith.MulIOp(t, c8)).result
+                            CallOp(fc2_func, [m_tile_i32, col_off, wtile.result, h_l1.result, wbuf.result])
                         yield_([])
                     DeallocOp(h_l1)
+                    DeallocOp(wtile)
 
-                    # ---- 6. cascade K-reduction (+ b_fc2 head-inject), W->E along tx ----
-                    # HEAD (tx==0): acc = partial + b_fc2 -> put slot[0]. MIDDLE
-                    # (tx 1..6): get slot[tx-1], add own partial, put slot[tx]. TAIL
-                    # (tx==7): get slot[tx-1], add -> out_l1 -> L2. (int4 W->E idiom.)
+                    # ---- 6. cascade K-reduction (+ b_fc2 head-inject), W->E along tx.
+                    # Payload is the full [M_TILE,D] partial in wbuf (multi-beat). HEAD
+                    # (tx==0): wbuf += b_fc2 (broadcast) -> put. MIDDLE (1..6): get prev
+                    # -> rbuf, wbuf += rbuf in-place, put. TAIL (tx==7): get -> rbuf,
+                    # wbuf += rbuf in-place, drain wbuf -> L2. ----
+                    if STUB_CASCADE:
+                        # latency-only: drop the 8-hop W->E serial reduce; TAIL writes
+                        # its own wbuf (no inter-core get/put/ppr). Cores run parallel.
+                        cmp_tail = arith.CmpIOp(arith.CmpIPredicate.eq, tx, last_ty)
+                        if_t = scf.IfOp(cmp_tail, has_else=True)
+                        with InsertionPoint(if_t.then_block):
+                            dma_memcpy_nd(
+                                _out_l2, wbuf.result,
+                                dst_offsets=[0, 0], dst_sizes=[M_TILE, D], dst_strides=[D, 1],
+                                src_offsets=[0, 0], src_sizes=[M_TILE, D], src_strides=[D, 1],
+                            )
+                            yield_([])
+                        with InsertionPoint(if_t.else_block):
+                            yield_([])
+                        DeallocOp(wbuf)
+                        DeallocOp(rbuf)
+                        DeallocOp(bfc2_l1)
+                        return
                     cmp_head = arith.CmpIOp(arith.CmpIPredicate.eq, tx, c0)
                     if_head = scf.IfOp(cmp_head, has_else=True)
                     with InsertionPoint(if_head.then_block):
-                        # b_fc2 already in bfc2_l1 (from the inX broadcast); inject it.
-                        CallOp(ppr_func, [n_d_i32, partial_op.result, bfc2_l1.result, off0_i32, partial_op.result])
-                        ChannelPut("chan_cascade", partial_op.result, indices=[tx])
+                        # wbuf += b_fc2 (bfc2_l1 is [M_TILE,D] replicated -> elementwise ppr).
+                        CallOp(ppr_func, [ppr_n_i32, wbuf.result, bfc2_l1.result, off0_i32, wbuf.result])
+                        ChannelPut("chan_cascade", wbuf.result, indices=[tx])
                         yield_([])
                     with InsertionPoint(if_head.else_block):
                         cmp_tail = arith.CmpIOp(arith.CmpIPredicate.eq, tx, last_ty)
                         if_tail = scf.IfOp(cmp_tail, has_else=True)
                         with InsertionPoint(if_tail.then_block):
                             prev_t = arith.SubIOp(tx, c1)
-                            ChannelGet("chan_cascade", recv_op.result, indices=[prev_t])
-                            CallOp(ppr_func, [n_d_i32, partial_op.result, recv_op.result, off0_i32, out_l1.result])
+                            ChannelGet("chan_cascade", rbuf.result, indices=[prev_t])
+                            CallOp(ppr_func, [ppr_n_i32, wbuf.result, rbuf.result, off0_i32, wbuf.result])
                             dma_memcpy_nd(
-                                _out_l2, out_l1.result,
-                                dst_offsets=[0], dst_sizes=[D], dst_strides=[1],
-                                src_offsets=[0], src_sizes=[D], src_strides=[1],
+                                _out_l2, wbuf.result,
+                                dst_offsets=[0, 0], dst_sizes=[M_TILE, D], dst_strides=[D, 1],
+                                src_offsets=[0, 0], src_sizes=[M_TILE, D], src_strides=[D, 1],
                             )
                             yield_([])
                         with InsertionPoint(if_tail.else_block):
                             prev_m = arith.SubIOp(tx, c1)
-                            ChannelGet("chan_cascade", recv_op.result, indices=[prev_m])
-                            CallOp(ppr_func, [n_d_i32, partial_op.result, recv_op.result, off0_i32, partial_op.result])
-                            ChannelPut("chan_cascade", partial_op.result, indices=[tx])
+                            ChannelGet("chan_cascade", rbuf.result, indices=[prev_m])
+                            CallOp(ppr_func, [ppr_n_i32, wbuf.result, rbuf.result, off0_i32, wbuf.result])
+                            ChannelPut("chan_cascade", wbuf.result, indices=[tx])
                             yield_([])
                         yield_([])
 
-                    DeallocOp(partial_op)
-                    DeallocOp(recv_op)
+                    DeallocOp(wbuf)
+                    DeallocOp(rbuf)
                     DeallocOp(bfc2_l1)
-                    DeallocOp(out_l1)
 
                 herd_body.attributes["link_with"] = StringAttr.get(KERNEL_OBJ)
 
-                # Drain the assembled out[768] L2 -> L3 (after the herd).
+                # Drain the assembled out[M_TILE,D] L2 -> L3 (after the herd).
                 dma_memcpy_nd(
                     out_s, out_l2.result,
-                    dst_offsets=[0], dst_sizes=[D], dst_strides=[1],
-                    src_offsets=[0], src_sizes=[D], src_strides=[1],
+                    dst_offsets=[0, 0], dst_sizes=[M_TILE, D], dst_strides=[D, 1],
+                    src_offsets=[0, 0], src_sizes=[M_TILE, D], src_strides=[D, 1],
                 )
                 DeallocOp(out_l2)
 
@@ -453,6 +451,11 @@ if __name__ == "__main__":
     ap.add_argument("--ff", type=int, default=3072, dest="FF")
     ap.add_argument("--cores", type=int, default=8, dest="NCORES")
     ap.add_argument("--m-input", type=int, default=8, dest="M_INPUT")
+    ap.add_argument("--m-tile", type=int, default=4, dest="M_TILE",
+                    help="activation rows per dispatch (M-tile). All-L1 ceiling is small "
+                         "(~4): two [M_TILE,D] act buffers + h + double-buffered weight "
+                         "tiles (~36KB) must fit 64KB L1. Large M_TILE needs the "
+                         "L2-resident intermediate (Phase 1).")
     ap.add_argument("--eps", type=float, default=1.0e-5)
     ap.add_argument("-p", "--print-module-only", action="store_true")
     ap.add_argument("--output-format", choices=["xclbin", "elf"], default="xclbin", dest="output_format")
@@ -466,7 +469,7 @@ if __name__ == "__main__":
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
 
-    module = build_module(args.D, args.FF, args.NCORES, args.M_INPUT, args.eps)
+    module = build_module(args.D, args.FF, args.NCORES, args.M_INPUT, args.eps, args.M_TILE)
 
     if args.print_module_only or args.compile_mode == "print":
         print(module)
@@ -479,12 +482,20 @@ if __name__ == "__main__":
 
     # XRTBackend writes air.xclbin / air.insts.bin + air_project/ to CWD; run in out_dir.
     os.chdir(out_dir)
+    # Backend recipe = the int4 SINGLE-TRIP cascade (o_gemv_ffn_int4_fused), NOT the
+    # matvec_cascade_add MULTI-TRIP recipe the original copied. matvec re-arms its
+    # cascade lock state via a 128-trip launch loop; our launch is sizes=[1,1] (one
+    # trip), so use_lock_race_condition_fix=True + runtime_loop_tiling_sizes=[2,2]
+    # (both tied to the shim-DMA-BD pass over the runtime loop) mis-configure a
+    # non-existent loop -> 2nd dispatch "qds_device::wait() unexpected command state".
+    # The only re-entrant SINGLE-TRIP npu_cascade reference uses the defaults +
+    # stack_size=4096. See internal notes.
     backend = XRTBackend(
         verbose=args.verbose,
         omit_while_true_loop=False,
-        runtime_loop_tiling_sizes=[2, 2],
         output_format=args.output_format,
-        use_lock_race_condition_fix=True,
+        use_lock_race_condition_fix=False,
+        stack_size=4096,
     )
     backend.compile(module)
     backend.unload()

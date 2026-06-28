@@ -124,6 +124,7 @@ impl Encoder {
                     ctx_ln.clone(),
                     cfg.glu_fused,
                     cfg.qkv_overlap,
+                    cfg.ffn_resident,
                 )
             })
             .collect();

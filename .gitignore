@@ -29,3 +29,7 @@ route_b_kernels/decode_fused/build/
 
 # local AMD-toolchain target paths (no absolute fork paths in git)
 scripts/amd_toolchains.env
+
+# stray aircc output if a build is ever run with CWD=repo-root (real output goes to artifacts/)
+/air.mlir
+/air_project/

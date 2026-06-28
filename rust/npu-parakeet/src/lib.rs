@@ -13,6 +13,7 @@
 //! Phase 3 swaps the host matmuls for `npu_asr::ctx2` NPU dispatches.
 
 pub mod config;
+pub mod decoder;
 pub mod encoder;
 #[cfg(feature = "npu")]
 pub mod npu;
@@ -22,5 +23,6 @@ pub mod prof;
 pub mod weights;
 
 pub use config::ModelCfg;
+pub use decoder::TdtDecoder;
 pub use encoder::FastConformerEncoder;
 pub use weights::ParakeetWeights;

@@ -69,6 +69,10 @@ struct FusedFFN {
     mm2: FfnMm2, // SAME ctxA, K=3072 split into 4× N=768 partials; host-accumulate + bias2
     // ctxLN: the (folded, normalize-only) LN runs on the NPU when NPU_LN_NPU=1 (Step D). None = host.
     ctx_ln: Option<Rc<CtxLn>>,
+    // NPU_ENC_FFN_RESIDENT (draft, default OFF): keep the [Mp,3072] mm1->mm2 intermediate in one bf16
+    // buffer across the seam (no host f32 materialize / per-partial re-conversion). Set from the
+    // resolved TuningConfig in `new_with_flags`; defaults from env in `new`.
+    resident_on: bool,
 }
 #[cfg(all(not(feature = "two_ctx"), feature = "chained_ffn"))]
 struct FusedFFN {
@@ -119,7 +123,12 @@ impl FusedFFN {
         let mm1 = CtxAOp::new(ctx_a.clone(), &w1p, D_FF, Epi::SiluBias, &b1p);
         // mm2 on the SAME ctxA (K=3072 split into 4× N=768) -> one resident xclbin, zero switches.
         let mm2 = FfnMm2::new(ctx_a, &w2, &b2);
-        FusedFFN { mm1, mm2, ctx_ln }
+        FusedFFN {
+            mm1,
+            mm2,
+            ctx_ln,
+            resident_on: std::env::var("NPU_ENC_FFN_RESIDENT").as_deref() == Ok("1"),
+        }
     }
 
     #[cfg(not(feature = "two_ctx"))]
@@ -142,6 +151,13 @@ impl FusedFFN {
             Some(cl) => cl.normalize(x),
             None => layer_norm_normalize(x, LN_EPS),
         });
+        // RESIDENT-INTERMEDIATE FFN (NPU_ENC_FFN_RESIDENT, draft): keep the [Mp,3072] mm1->mm2
+        // intermediate in one bf16 buffer (no host f32 materialize / per-partial re-conversion).
+        // forward_resident falls back internally for int8; for bf16 it is numerically identical to
+        // the non-resident path. Default OFF -> the shipped two-step path below.
+        if self.resident_on {
+            return self.mm2.forward_resident(&self.mm1, &norm);
+        }
         let h = self.mm1.forward(&norm); // [Mp,3072] = SiLU(norm@W1' + b1) (host epilogue)
         self.mm2.forward(&h) // [Mp,768] = h@W2 + b2 (host bias2)
     }
@@ -205,6 +221,7 @@ impl FusedBlock {
         #[cfg(feature = "two_ctx")] ctx_ln: Option<Rc<CtxLn>>,
         glu_fused: bool,
         qkv_overlap: bool,
+        ffn_resident: bool,
     ) -> Self {
         let mut blk = Self::new(
             dev, root, w, cos, sin,
@@ -213,9 +230,13 @@ impl FusedBlock {
         );
         blk.glu_fused_on = glu_fused;
         #[cfg(feature = "two_ctx")]
-        { blk.qkv_overlap_on = qkv_overlap; }
+        {
+            blk.qkv_overlap_on = qkv_overlap;
+            blk.ffn1.resident_on = ffn_resident;
+            blk.ffn2.resident_on = ffn_resident;
+        }
         #[cfg(not(feature = "two_ctx"))]
-        { let _ = qkv_overlap; }
+        { let _ = (qkv_overlap, ffn_resident); }
         blk
     }
 

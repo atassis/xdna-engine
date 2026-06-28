@@ -1,0 +1,69 @@
+diff --git a/python/air/dialects/_air_ops_ext.py b/python/air/dialects/_air_ops_ext.py
+index 50af15b..3d74fe7 100644
+--- a/python/air/dialects/_air_ops_ext.py
++++ b/python/air/dialects/_air_ops_ext.py
+@@ -172,6 +172,7 @@ class Channel(ChannelOp):
+             Union[Sequence[Union[int, IntegerAttr, Operation, Value]], ArrayAttr]
+         ] = None,
+         size=None,
++        buffer_resources: Optional[Union[int, IntegerAttr]] = None,
+         loc=None,
+         ip=None,
+     ):
+@@ -182,6 +183,20 @@ class Channel(ChannelOp):
+             ip=ip,
+         )
+ 
++        # Optional objectFIFO depth knob: the `buffer_resources` attribute is
++        # consumed by AIRToAIEPass (AIRToAIEPass.cpp, ChannelOp::getBufferResources)
++        # as the depth of the lowered aie.objectfifo (default 1). Exposing it on the
++        # placed Channel wrapper lets dataflow pin a deeper FIFO (e.g. depth-2 for
++        # producer/consumer overlap) without hand-editing the IR.
++        if buffer_resources is not None:
++            if isinstance(buffer_resources, IntegerAttr):
++                buffer_resources_attr = buffer_resources
++            else:
++                buffer_resources_attr = IntegerAttr.get(
++                    IntegerType.get_signless(64), buffer_resources
++                )
++            super().attributes["buffer_resources"] = buffer_resources_attr
++
+         if not (broadcast_shape is None):
+             static_sizes = []
+             if isinstance(broadcast_shape, ArrayAttr):
+diff --git a/python/test/dialect/channel_buffer_resources.py b/python/test/dialect/channel_buffer_resources.py
+new file mode 100644
+index 0000000..6be1383
+--- /dev/null
++++ b/python/test/dialect/channel_buffer_resources.py
+@@ -0,0 +1,30 @@
++# Copyright (C) 2026, Advanced Micro Devices, Inc.
++# SPDX-License-Identifier: MIT
++
++# RUN: %PYTHON %s | FileCheck %s
++
++# Exercises the `buffer_resources` knob on the placed Channel wrapper. The
++# attribute is consumed by AIRToAIEPass as the depth of the lowered
++# aie.objectfifo (default 1); see
++# test/Conversion/AIRToAIE/air_channel_to_objectfifo_buffer_resources.mlir.
++
++from air.ir import *
++from air.dialects.air import *
++
++
++@module_builder
++def build_module():
++    # Default: no buffer_resources attribute is emitted (depth stays 1).
++    # CHECK: air.channel @chan_default []
++    Channel("chan_default")
++
++    # Explicit depth-2 FIFO via the python knob.
++    # CHECK: air.channel @chan_depth2 [] {buffer_resources = 2 : i64}
++    Channel("chan_depth2", buffer_resources=2)
++
++    # Explicit depth-4 FIFO.
++    # CHECK: air.channel @chan_depth4 [] {buffer_resources = 4 : i64}
++    Channel("chan_depth4", buffer_resources=4)
++
++
++print(build_module())

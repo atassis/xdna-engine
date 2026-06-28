@@ -1,6 +1,6 @@
 ##===- Makefile -----------------------------------------------------------===##
 #
-# Depthwise conv1d (k=5) example. Build: `source scripts/iron_env.sh` then
+# Depthwise conv1d (k=9, Parakeet ConvModule) example. Build: `source scripts/iron_env.sh` then
 # `make NPU2=1` (xclbin + insts.bin). Driven on the NPU via pyxrt
 # (scripts/run_npu_dwconv1d.py); the C++ host harness is unbuildable on Arch.
 #

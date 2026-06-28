@@ -15,6 +15,7 @@ pub struct TuningConfig {
     pub mm2_pipeline: bool,        // NPU_MM2_PIPELINE
     pub int8_fast_epi: bool,       // NPU_INT8_FASTEPI
     pub int8_onchip_dequant: bool, // NPU_INT8_ONCHIP
+    pub ffn_resident: bool,        // NPU_ENC_FFN_RESIDENT (resident fc1->fc2 intermediate; draft, default OFF)
 }
 
 impl TuningConfig {
@@ -32,6 +33,7 @@ impl TuningConfig {
             mm2_pipeline: true,
             int8_fast_epi: true,
             int8_onchip_dequant: false,
+            ffn_resident: false,
         }
     }
 
@@ -58,6 +60,7 @@ impl TuningConfig {
         self.layernorm_on_npu = is_one("NPU_LN_NPU", self.layernorm_on_npu);
         self.qkv_overlap = is_one("NPU_QKV_OVERLAP", self.qkv_overlap);
         self.int8_onchip_dequant = is_one("NPU_INT8_ONCHIP", self.int8_onchip_dequant);
+        self.ffn_resident = is_one("NPU_ENC_FFN_RESIDENT", self.ffn_resident);
         self
     }
 }

@@ -250,9 +250,13 @@ impl WhisperEncoder {
             #[cfg(feature = "npu")]
             {
                 use crate::npu::apply_tiled;
+                use npu_asr::engines::marsh;
                 let ops = &self.block_ops[i];
+                marsh::set_op(marsh::Q);
                 q = timed!("qkv_proj", apply_tiled(&ops.q, &ln1, 768));
+                marsh::set_op(marsh::K);
                 k = timed!("qkv_proj", apply_tiled(&ops.k, &ln1, 768)); // k.bias is zeros (applied on NPU)
+                marsh::set_op(marsh::V);
                 v = timed!("qkv_proj", apply_tiled(&ops.v, &ln1, 768));
             }
             #[cfg(not(feature = "npu"))]
@@ -281,6 +285,7 @@ impl WhisperEncoder {
         if use_npu {
             #[cfg(feature = "npu")]
             {
+                npu_asr::engines::marsh::set_op(npu_asr::engines::marsh::OUT);
                 attn = timed!("out_proj", crate::npu::apply_tiled(&self.block_ops[i].out, &ctx, 768));
             }
             #[cfg(not(feature = "npu"))]
@@ -296,13 +301,28 @@ impl WhisperEncoder {
         if use_npu {
             #[cfg(feature = "npu")]
             {
-                use crate::npu::{apply_tiled, apply_tiled_mm2};
+                use crate::npu::{apply_tiled, apply_tiled_ffn_resident, apply_tiled_mm2};
+                use npu_asr::engines::marsh;
                 let ops = &self.block_ops[i];
-                // NPU_ENC_GELU_FUSED: fc1 is built with Epi::GeluBias → its output is already gelu(W·x+b),
-                // so the host GELU is skipped. Else GELU on host (default).
-                let h1 = timed!("fc1", apply_tiled(&ops.fc1, &ln2, 3072));
-                let f = if std::env::var("NPU_ENC_GELU_FUSED").is_ok() { h1 } else { timed!("gelu", gelu(&h1)) };
-                f_out = timed!("fc2", apply_tiled_mm2(&ops.fc2, &f));
+                // RESIDENT-INTERMEDIATE FFN (NPU_ENC_FFN_RESIDENT, requires NPU_ENC_GELU_FUSED so the
+                // GELU is fused into fc1's on-chip epilogue): keep the [mp,3072] fc1->fc2 intermediate
+                // in one bf16 buffer across the seam -> no host materialize / re-conversion of the
+                // largest data object. See internal notes (the FFN
+                // sub-block is ~67% of the encoder's host marshaling).
+                let resident = std::env::var("NPU_ENC_FFN_RESIDENT").is_ok()
+                    && std::env::var("NPU_ENC_GELU_FUSED").is_ok();
+                if resident {
+                    marsh::set_op(marsh::FC1);
+                    f_out = timed!("ffn_resident", apply_tiled_ffn_resident(&ops.fc1, &ops.fc2, &ln2));
+                } else {
+                    marsh::set_op(marsh::FC1);
+                    // NPU_ENC_GELU_FUSED: fc1 is built with Epi::GeluBias → its output is already
+                    // gelu(W·x+b), so the host GELU is skipped. Else GELU on host (default).
+                    let h1 = timed!("fc1", apply_tiled(&ops.fc1, &ln2, 3072));
+                    let f = if std::env::var("NPU_ENC_GELU_FUSED").is_ok() { h1 } else { timed!("gelu", gelu(&h1)) };
+                    marsh::set_op(marsh::FC2);
+                    f_out = timed!("fc2", apply_tiled_mm2(&ops.fc2, &f));
+                }
             }
             #[cfg(not(feature = "npu"))]
             unreachable!();

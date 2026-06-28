@@ -894,6 +894,167 @@ impl CtxAOp {
         out
     }
 
+    /// Resident-FFN helper (flag-gated): run this op's matmul and write the ACTIVATED result as bf16
+    /// bits into `out` (row-major `[mp, n]`) instead of returning an f32 `Array2`. This lets the FFN
+    /// keep the `[mp, NA]` fc1->fc2 intermediate (the biggest data object) in ONE reused bf16 buffer
+    /// across the seam: no f32 `Array2` materialize and no per-partial f32->bf16 re-conversion in fc2.
+    ///
+    /// bf16/native only (the resident draft does not cover int8 -> see [`FfnMm2::forward_resident`],
+    /// which falls back). modal: the bias+activation already ran on-chip (the f32 readback is the
+    /// final value), so packing is an identity pack. non-modal: the host epilogue (Bias/SiLU) is
+    /// applied here before packing -- byte-identical intermediate to [`forward_view`] either way
+    /// (the modal GELU-fused fc1 is the intended Whisper-encoder user: mode=2, on-chip GELU).
+    pub fn forward_activated_bf16(&self, a_real: ArrayView2<f32>, out: &mut Vec<u16>) -> usize {
+        assert!(!self.shared.prec.is_int8(), "forward_activated_bf16 is bf16-only");
+        let (mp, kk) = a_real.dim();
+        assert_eq!(kk, KA);
+        assert!(mp <= PAD_M);
+        let sh = &self.shared;
+        let kd = sh.ka_dev;
+        let n = self.n;
+
+        // --- convert+write activation (mirrors forward_view's bf16 branch) ---
+        let tc = Instant::now();
+        {
+            let mut a = sh.a_buf.borrow_mut();
+            a.par_chunks_mut(kd).take(mp).enumerate().for_each(|(r, row)| {
+                let arow = a_real.row(r);
+                if let Some(src) = arow.as_slice() {
+                    pack_f32_to_bf16(&src[..KA], &mut row[..KA]);
+                } else {
+                    for c in 0..KA {
+                        row[c] = f32_to_bf16_bits(a_real[[r, c]]);
+                    }
+                }
+            });
+            if sh.a_inited.get() {
+                sh.bo_a.write_bytes(&u16_bytes(&a)[..mp * kd * 2]).unwrap();
+            } else {
+                sh.bo_a.write_bytes(u16_bytes(&a)).unwrap();
+                sh.a_inited.set(true);
+            }
+        }
+        marsh::add(marsh::CONV, tc.elapsed());
+        let ts = Instant::now();
+        sh.bo_a.sync_to_device().unwrap();
+        marsh::add(marsh::SYNC_TO, ts.elapsed());
+
+        // --- dispatch on the resident kernel (modal: N + this op's epilogue-mode) ---
+        let (instr, n_instr) = if sh.modal { sh.modal_stream(n, self.mode) } else { sh.stream(n) };
+        let t0 = Instant::now();
+        sh.kern
+            .run_matmul8(3, instr, n_instr, &sh.bo_a, &self.bo_b, &sh.bo_c, &sh.bo_tmp, &sh.bo_tr)
+            .unwrap();
+        prof_record(t0.elapsed());
+        let tf = Instant::now();
+        sh.bo_c.sync_from_device().unwrap();
+        marsh::add(marsh::SYNC_FROM, tf.elapsed());
+        let tr = Instant::now();
+        {
+            let mut cf = sh.cbuf.borrow_mut();
+            let dst = unsafe { std::slice::from_raw_parts_mut(cf.as_mut_ptr() as *mut u8, mp * n * 4) };
+            sh.bo_c.read_bytes(dst).unwrap();
+        }
+        marsh::add(marsh::READ, tr.elapsed());
+
+        // --- activate (modal: on-chip already => identity) + pack to bf16 into the resident buffer ---
+        let te = Instant::now();
+        if out.len() < mp * n {
+            out.resize(mp * n, 0);
+        }
+        let cf = sh.cbuf.borrow();
+        let vals: &[f32] = &cf[..mp * n];
+        let epi = self.epi;
+        let bias = &self.bias;
+        let modal = sh.modal;
+        out[..mp * n]
+            .par_chunks_mut(n)
+            .zip(vals.par_chunks(n))
+            .for_each(|(orow, vrow)| {
+                for c in 0..n {
+                    let raw = vrow[c];
+                    let act = if modal {
+                        raw // bias + activation already applied on-chip
+                    } else {
+                        match epi {
+                            Epi::None => raw,
+                            Epi::Bias => raw + bias[c],
+                            Epi::SiluBias => {
+                                let z = raw + bias[c];
+                                z * fast_sigmoid(z)
+                            }
+                            Epi::GeluBias => unreachable!("GeluBias is modal-only (gelu runs on-chip)"),
+                        }
+                    };
+                    orow[c] = f32_to_bf16_bits(act);
+                }
+            });
+        marsh::add(marsh::EPI, te.elapsed());
+        mp
+    }
+
+    /// Resident-FFN helper (flag-gated): dispatch this op (an fc2 K-split partial, `Epi::None` weight)
+    /// on a bf16 column-slice of a device-resident `[mp, src_stride]` bf16 intermediate (columns
+    /// `[col_off, col_off+KA)` of each row), returning the RAW f32 matmul `[mp, n]`. The source is
+    /// ALREADY bf16 (packed once by [`forward_activated_bf16`]), so there is no per-partial f32->bf16
+    /// re-conversion -- fc2 reads the resident intermediate directly. Sequential (shares `bo_a`/`bo_c`);
+    /// bf16/native only.
+    pub fn forward_bf16_rows(
+        &self,
+        src_bf16: &[u16],
+        mp: usize,
+        src_stride: usize,
+        col_off: usize,
+    ) -> Array2<f32> {
+        assert!(!self.shared.prec.is_int8(), "forward_bf16_rows is bf16-only");
+        assert!(mp <= PAD_M);
+        let sh = &self.shared;
+        let kd = sh.ka_dev;
+        let n = self.n;
+
+        let tc = Instant::now();
+        {
+            let mut a = sh.a_buf.borrow_mut();
+            // copy the bf16 column-slice into the activation buffer (cols 0..KA); the modal ones-column
+            // at index KA is preserved (we only overwrite 0..KA).
+            a.par_chunks_mut(kd).take(mp).enumerate().for_each(|(r, row)| {
+                let base = r * src_stride + col_off;
+                row[..KA].copy_from_slice(&src_bf16[base..base + KA]);
+            });
+            if sh.a_inited.get() {
+                sh.bo_a.write_bytes(&u16_bytes(&a)[..mp * kd * 2]).unwrap();
+            } else {
+                sh.bo_a.write_bytes(u16_bytes(&a)).unwrap();
+                sh.a_inited.set(true);
+            }
+        }
+        marsh::add(marsh::CONV, tc.elapsed());
+        let ts = Instant::now();
+        sh.bo_a.sync_to_device().unwrap();
+        marsh::add(marsh::SYNC_TO, ts.elapsed());
+
+        // mm2 partials use the identity epilogue (Epi::None -> zero K-aug bias); modal selects mode 0.
+        let (instr, n_instr) = if sh.modal { sh.modal_stream(n, 0) } else { sh.stream(n) };
+        let t0 = Instant::now();
+        sh.kern
+            .run_matmul8(3, instr, n_instr, &sh.bo_a, &self.bo_b, &sh.bo_c, &sh.bo_tmp, &sh.bo_tr)
+            .unwrap();
+        prof_record(t0.elapsed());
+        let tf = Instant::now();
+        sh.bo_c.sync_from_device().unwrap();
+        marsh::add(marsh::SYNC_FROM, tf.elapsed());
+        let tr = Instant::now();
+        {
+            let mut cf = sh.cbuf.borrow_mut();
+            let dst = unsafe { std::slice::from_raw_parts_mut(cf.as_mut_ptr() as *mut u8, mp * n * 4) };
+            sh.bo_c.read_bytes(dst).unwrap();
+        }
+        marsh::add(marsh::READ, tr.elapsed());
+        let cf = sh.cbuf.borrow();
+        // Epi::None (raw): FfnMm2 accumulates the partials then adds bias2 once.
+        Array2::from_shape_vec((mp, n), cf[..mp * n].to_vec()).unwrap()
+    }
+
     /// Goal-1 async overlap for an INDEPENDENT op pair (qk ∥ v): qk reads `rope(ln)`, v reads `ln`,
     /// neither depends on the other, both feed `mha`. Submit both — each into its own double-buffer
     /// slot — so `self`'s NPU compute overlaps `other`'s host prep (quant/convert+sync) and `self`'s
@@ -964,6 +1125,10 @@ const MM2_KSPLIT: usize = NA / KA; // 3072 / 768 = 4
 pub struct FfnMm2 {
     parts: Vec<CtxAOp>, // MM2_KSPLIT ops on ctxA, each weight [KA, MM2_OUT], Epi::None
     bias2: Vec<f32>,    // length MM2_OUT, added on host once after the partial sum
+    /// Resident-FFN draft (`forward_resident`): the reused `[mp, NA]` bf16 buffer that holds the
+    /// fc1->fc2 intermediate across the seam (no f32 materialize, no per-partial re-conversion). Empty
+    /// until the resident path is first used; lazily grown to `PAD_M*NA`.
+    inter: RefCell<Vec<u16>>,
 }
 
 impl FfnMm2 {
@@ -980,7 +1145,50 @@ impl FfnMm2 {
         FfnMm2 {
             parts,
             bias2: b2.to_vec(),
+            inter: RefCell::new(Vec::new()),
         }
+    }
+
+    /// RESIDENT-INTERMEDIATE FFN (flag-gated draft; the Whisper-encoder fc1->fc2 seam, the biggest
+    /// host-marshaling sink -- see `internal notes`). Runs fc1 (`mm1`)
+    /// and this fc2, holding the activated `[mp, NA]` intermediate in ONE reused bf16 buffer across the
+    /// seam: fc1's device output is read back once and packed to bf16 in place; fc2's 4 K-split
+    /// partials consume bf16 COLUMN-SLICES of that buffer directly. This removes (a) the f32 `Array2`
+    /// materialize of the `[mp, NA]` intermediate and (b) fc2's per-partial f32->bf16 re-conversion --
+    /// the two host stages the seam attribution flagged as ~removable. The intermediate that fc2 sees
+    /// is byte-identical to the non-resident path (same activated-f32 -> bf16 truncation), so the
+    /// output matches `forward(&mm1.forward(x))` exactly.
+    ///
+    /// REQUIRES the on-chip activation (modal GELU-fused fc1 = `Epi::GeluBias`, mode 2): with the
+    /// activation fused into fc1's epilogue there is no host op between fc1 and fc2, which is what lets
+    /// the intermediate stay bf16-resident. The caller gates on `NPU_ENC_FFN_RESIDENT` +
+    /// `NPU_ENC_GELU_FUSED`. int8 is not covered by this draft -> it falls back to the host-mediated
+    /// `forward(&mm1.forward(x))`.
+    ///
+    /// NOTE (the remaining, kernel-gated step): the f32 device->host READBACK of fc1's output still
+    /// happens (the resident kernel outputs f32, and an fc2 K-split column-slice of a `[mp, NA]`
+    /// row-major buffer is strided, not a contiguous device sub-tensor). Eliminating that readback
+    /// entirely -- a TRUE on-device fc1->fc2 hand-off -- needs the fused fc1->GELU->fc2 kernel
+    /// (route_b `cascade_ffn`, an on-chip K=3072 reduction), which is NPU/kernel work, not host
+    /// plumbing. This draft is the maximal host-resident form on the current f32-out kernel ABI.
+    pub fn forward_resident(&self, mm1: &CtxAOp, x: &Array2<f32>) -> Array2<f32> {
+        // int8 (or any int8 ctx) is out of scope for the draft -> host-mediated fallback (exact).
+        if self.parts[0].shared.prec.is_int8() {
+            return self.forward(&mm1.forward(x));
+        }
+        // 1) fc1 -> activated [mp, NA] intermediate, packed once into the reused bf16 resident buffer.
+        let mp = {
+            let mut inter = self.inter.borrow_mut();
+            mm1.forward_activated_bf16(x.view(), &mut inter)
+        };
+        // 2) fc2: each K-split partial reads a bf16 column-slice of the resident intermediate directly.
+        let inter = self.inter.borrow();
+        let mut acc = Array2::<f32>::zeros((mp, MM2_OUT));
+        for (i, op) in self.parts.iter().enumerate() {
+            acc += &op.forward_bf16_rows(&inter, mp, NA, i * KA);
+        }
+        self.add_bias2(&mut acc);
+        acc
     }
 
     /// `h` is `[Mp, 3072]` (the SiLU'd FFN intermediate). Returns `[Mp, 768]` = h@W2 + b2.
@@ -1025,7 +1233,16 @@ impl FfnMm2 {
             // P(i-1) is on a different slot than the just-submitted Pi → safe to finish it now; its
             // host post-processing overlaps Pi's NPU compute. The wait() is the NPU-stall the pipeline
             // tries to hide — profile it separately (mm2_wait) to see the overlap slack.
-            prof::time("mm2_wait", || prev_run.wait().unwrap());
+            // record the dispatch into the shared NPU profiler (count + stall) so the mm2 K-split shows
+        // up in `dump_dispatch_prof` — the pipelined path bypasses `forward_view`, which would
+        // otherwise undercount the dispatch stream (fc2 is ~144 of the 324 encoder dispatches).
+        {
+            let tw = Instant::now();
+            prev_run.wait().unwrap();
+            let dt = tw.elapsed();
+            prof::add_ns("mm2_wait", dt.as_nanos());
+            prof_record(dt);
+        }
             let part = shared.pipe_read(prev_slot, mp, n, prev_scale, &self.parts[prev_i].w_scale);
             prof::time("mm2_accum", || acc += &part);
             prof::add_work("mm2_accum", (mp * n * 3 * 4) as u64, (mp * n) as u64); // read acc+part, write acc
@@ -1034,7 +1251,16 @@ impl FfnMm2 {
             prev_slot = slot;
             prev_i = i;
         }
-        prof::time("mm2_wait", || prev_run.wait().unwrap());
+        // record the dispatch into the shared NPU profiler (count + stall) so the mm2 K-split shows
+        // up in `dump_dispatch_prof` — the pipelined path bypasses `forward_view`, which would
+        // otherwise undercount the dispatch stream (fc2 is ~144 of the 324 encoder dispatches).
+        {
+            let tw = Instant::now();
+            prev_run.wait().unwrap();
+            let dt = tw.elapsed();
+            prof::add_ns("mm2_wait", dt.as_nanos());
+            prof_record(dt);
+        }
         let part = shared.pipe_read(prev_slot, mp, n, prev_scale, &self.parts[prev_i].w_scale);
         prof::time("mm2_accum", || acc += &part);
         prof::add_work("mm2_accum", (mp * n * 3 * 4) as u64, (mp * n) as u64);

@@ -70,8 +70,25 @@ impl NpuMatmul {
         let base = root.join(WA_SUBDIR);
         // resident kernel tile: fast BFP16 64x32x128 (default) or native bf16 32x32x32 (NPU_NATIVE=1)
         let tile = if std::env::var("NPU_NATIVE").is_ok() { "32x32x32" } else { "64x32x128" }.to_string();
-        // resident xclbin = the largest N (4096) K=1024 kernel for this tile
-        let xclbin = base.join(format!("final_512x1024x4096_{tile}_8c.xclbin"));
+        // resident xclbin = a K=1024 whole_array kernel for this tile. The array program is
+        // N-independent (per-N differs only in the runtime instruction stream, swapped per
+        // dispatch), so ANY surviving N works as the resident. Prefer the largest N present;
+        // fall back to a smaller surviving build (the N=4096/2048 twins were deleted by the
+        // an earlier occupancy run; N=1024 survives). Env NPU_RESIDENT_XCLBIN overrides.
+        let xclbin = if let Ok(p) = std::env::var("NPU_RESIDENT_XCLBIN") {
+            PathBuf::from(p)
+        } else {
+            let mut chosen = None;
+            for n in ["4096", "2048", "1024"] {
+                let cand = base.join(format!("final_512x1024x{n}_{tile}_8c.xclbin"));
+                if cand.exists() {
+                    chosen = Some(cand);
+                    break;
+                }
+            }
+            chosen.unwrap_or_else(|| base.join(format!("final_512x1024x4096_{tile}_8c.xclbin")))
+        };
+        eprintln!("[npu] resident xclbin = {}", xclbin.display());
         let kern = dev
             .load_kernel(xclbin.to_str().unwrap(), None)
             .unwrap_or_else(|e| panic!("load resident {}: {e:?}", xclbin.display()));

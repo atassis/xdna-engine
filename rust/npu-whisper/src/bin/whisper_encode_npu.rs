@@ -65,6 +65,15 @@ fn main() {
         .collect();
     names.sort();
 
+    // Step 0 (resident full-NPU spec): NPU_MARSH_PROF=1 splits the encoder's NPU dispatch stream into
+    // NPU-compute (stall) vs host marshaling (round-trip). Reset the cumulative profilers before the
+    // timed loop; dump the per-pass average after. No-op (cheap recording only) when the var is unset.
+    #[cfg(feature = "npu")]
+    if !cpu {
+        npu_asr::engines::reset_prof();
+        npu_asr::engines::marsh::reset();
+    }
+
     let mut total = 0f64;
     let mut n = 0;
     for p in &names {
@@ -79,4 +88,9 @@ fn main() {
         println!("[enc] {stem}  [{}, {}]  {:.3}s", enc_out.nrows(), enc_out.ncols(), dt);
     }
     println!("\nmean encode {:.3}s/clip over {n} clips", total / n.max(1) as f64);
+
+    #[cfg(feature = "npu")]
+    if !cpu {
+        npu_asr::engines::dump_dispatch_prof(n); // NPU_MARSH_PROF=1: round-trip vs stall split
+    }
 }
