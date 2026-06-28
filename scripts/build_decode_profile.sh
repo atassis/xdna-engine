@@ -17,7 +17,7 @@
 set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PROFILE="${1:-}"; shift || true
-export AIECC_PATH="${AIECC_PATH:-$REPO/mlir-aie/build-on2/bin/aiecc}"
+export AIECC_PATH="${AIECC_PATH:-$("$REPO/scripts/toolchain_up.sh")/bin/aiecc}"
 export AIECC_JOBS="${AIECC_JOBS:-16}"
 case "$PROFILE" in
   wer)

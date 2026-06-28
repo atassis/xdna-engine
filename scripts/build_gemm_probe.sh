@@ -27,29 +27,12 @@ GEN="$REPO/route_b_kernels/decode_fused/gen_gemm_probe.py"
 [ -x "$AIEBU_DIR/aiebu-asm" ] || { echo "ERROR: aiebu-asm not at $AIEBU_DIR"; exit 1; }
 [ -f "$WEIGHTS/L0/fc1.weight.npy" ] || { echo "ERROR: weights not at $WEIGHTS"; exit 1; }
 
-# Apply the GEMM fusion-prefix fix (func_prefix on kernel object + symbol names) idempotently.
-# Needed for ANY GEMM op under FusedMLIROperator on this stack; deep-C only exercised GEMV.
-GEMM_PATCH="$REPO/route_b_kernels/patches/iron-gemm-fusion-prefix.patch"
-if [ -f "$GEMM_PATCH" ]; then
-  if git -C "$IRON" apply --reverse --check "$GEMM_PATCH" >/dev/null 2>&1; then
-    echo "[build] iron-gemm-fusion-prefix patch already applied"
-  else
-    echo "[build] applying iron-gemm-fusion-prefix patch"
-    git -C "$IRON" apply "$GEMM_PATCH"
-  fi
-fi
-
-# O6: M-stationary GEMM mode (backward-compat — default N-stationary unchanged). Needed for
-# --m-stationary builds; harmless otherwise. Applies after fusion-prefix (both touch gemm/design.py).
-MSTAT_PATCH="$REPO/route_b_kernels/patches/iron-gemm-mstationary.patch"
-if [ -f "$MSTAT_PATCH" ]; then
-  if git -C "$IRON" apply --reverse --check "$MSTAT_PATCH" >/dev/null 2>&1; then
-    echo "[build] iron-gemm-mstationary patch already applied"
-  else
-    echo "[build] applying iron-gemm-mstationary patch"
-    git -C "$IRON" apply "$MSTAT_PATCH"
-  fi
-fi
+# GEMM fusion-prefix + M-stationary are now COMMITS on the atassis/IRON:xdna2-asr fork branch (not .patch).
+# Require the checkout to be on it (gemm-fusion-prefix needed for any GEMM under FusedMLIROperator;
+# m-stationary is the opt-in --m-stationary mode, default N-stationary unchanged).
+on="$(git -C "$IRON" rev-parse --abbrev-ref HEAD 2>/dev/null)"
+[ "$on" = xdna2-asr ] || { echo "ERROR: $IRON must be on xdna2-asr (got '$on'). Run: git -C \"$IRON\" checkout xdna2-asr"; exit 1; }
+echo "[build] IRON on xdna2-asr @ $(git -C "$IRON" rev-parse --short HEAD)"
 
 export PATH="$VENV_IRON/bin:$VENV_IRON/cc-shim:$AIEBU_DIR:$PATH"
 export PEANO_INSTALL_DIR="$VENV_IRON/lib/python3.14/site-packages/llvm-aie"

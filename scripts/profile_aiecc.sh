@@ -21,7 +21,7 @@ command -v gdb >/dev/null || { echo "FATAL: gdb not installed"; exit 1; }
 
 # pick the aiecc PID with the largest cumulative CPU time (= deepest in the serial phase).
 # Match the C++ aiecc binary by exact process name (covers both the wheel `mlir_aie/bin/aiecc`
-# and our isolated `mlir-aie/build-on2/bin/aiecc`); the Python wrapper is `aiecc.py`, not `aiecc`.
+# and our isolated the toolchain_up instance aiecc); the Python wrapper is `aiecc.py`, not `aiecc`.
 PID="$(for p in $(pgrep -x aiecc 2>/dev/null); do
          ct=$(ps -o cputimes= -p "$p" 2>/dev/null | tr -d ' '); [ -n "$ct" ] && echo "$ct $p"
        done | sort -rn | head -1 | awk '{print $2}')"

@@ -152,6 +152,12 @@ static inline void mm_gelu_epilogue_f32o(const float *__restrict pC_in,
                                          float *__restrict pC_out) {
   event0();
   static_assert(size % 16 == 0, "tile size must be a multiple of 16");
+  // NOTE (2026-06-28): a full-f32 polynomial GELU here recovers the RU precision in theory but HANGS
+  // on-device ("run_matmul8: kernel run did not complete") -- f32 elementwise/transcendental ops are NOT
+  // free on this bf16-native unit (the cube + tanh + finish in f32 blow the cycle budget; both the pure-f32
+  // and the f32-cube+bf16-tanh hybrid timed out). So this stays the bf16 tanh-approx (fast, ships). The
+  // bf16 GELU costs RU +0.4 (whisper-resident-ffn-wer-gate); recovering it needs a bf16-NATIVE precision
+  // trick (e.g. keep the cube in the f32 accumulator without full-f32 vectors), parked as kernel R&D.
   const aie::vector<bfloat16, 16> half = aie::broadcast<bfloat16, 16>(0.5f);
   const aie::vector<bfloat16, 16> one = aie::broadcast<bfloat16, 16>(1.0f);
   const aie::vector<bfloat16, 16> c0 = aie::broadcast<bfloat16, 16>(0.7978845608f); // sqrt(2/pi)

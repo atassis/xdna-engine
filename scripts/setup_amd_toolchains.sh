@@ -49,10 +49,12 @@ apply_one() {  # name  series-file  target-dir
   fi
 }
 
-apply_one mlir-aie "$P/mlir-aie.series" "$MLIR_AIE_DIR"
-apply_one iron     "$P/iron.series"     "$IRON_DIR"
+# mlir-aie + mlir-air + IRON are NO LONGER patched here -- their delta is carried as FORK BRANCHES (commits,
+# not .patch): mlir-aie = atassis/mlir-aie:xdna2-asr (setup_route_b.sh checks it out, toolchain_up.sh builds
+# it); IRON = atassis/IRON:xdna2-asr (the decode build scripts require amd/IRON checked out on it); mlir-air =
+# atassis/mlir-air per-PR branches (#1694, #1695). Only llvm-aie/Peano remains (consumed as a pinned wheel;
+# this .series apply is a no-op unless an llvm-aie.series is ever added).
 apply_one llvm-aie "$P/llvm-aie.series" "$LLVM_AIE_DIR"
-apply_one mlir-air "$P/mlir-air.series" "$MLIR_AIR_DIR"
 
 echo
 echo "===================== SUMMARY ====================="

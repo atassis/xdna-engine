@@ -19,16 +19,13 @@ GENDIR="$REPO/route_b_kernels/decode_fused"
 [ -d "$IRON/iron" ] || { echo "ERROR: amd/IRON not at $IRON"; exit 1; }
 [ -x "$AIEBU_DIR/aiebu-asm" ] || { echo "ERROR: aiebu-asm not at $AIEBU_DIR"; exit 1; }
 
-# apply IRON patches idempotently (deep-C scratchpad + transpose num_batches + GEMM fusion-prefix)
-apply_patch(){ local p="$1"; [ -f "$p" ] || return 0
-  if git -C "$IRON" apply --reverse --check "$p" >/dev/null 2>&1; then echo "[build] $(basename "$p") already applied"
-  else echo "[build] applying $(basename "$p")"; git -C "$IRON" apply "$p"; fi; }
-apply_patch "$REPO/patches/amd-IRON-deepc.patch"
-apply_patch "$REPO/route_b_kernels/patches/iron-transpose-num-batches.patch"
-apply_patch "$REPO/route_b_kernels/patches/iron-gemm-fusion-prefix.patch"
-apply_patch "$REPO/route_b_kernels/patches/iron-aiecc-build-perf.patch"
-apply_patch "$REPO/route_b_kernels/patches/iron-gemv-coalesce-batch-dma.patch"  # opt-in BD-iteration (default off; COALESCE_GEMV gates it)  # AIECC_JOBS (-j) + SKIP_EXPAND_PDIS env-gates
-apply_patch "$REPO/route_b_kernels/patches/iron-gemm-mstationary.patch"  # opt-in GEMM(m_stationary=True) (default off; M_STATIONARY gates it in gen_decode_batched)
+# IRON delta is the atassis/IRON:xdna2-asr fork branch (commits, not .patch). The deepc base + transpose +
+# fusion-prefix + build-perf + path-override + the consolidated gemv op (coalesce/int8/gelu, default-off) +
+# mstationary are all on it. Require the checkout to be on the branch; git-applying the old separate patches
+# would now CONFLICT with the consolidated gemv op. (gemv levers stay default-off => byte-identical baseline.)
+on="$(git -C "$IRON" rev-parse --abbrev-ref HEAD 2>/dev/null)"
+[ "$on" = xdna2-asr ] || { echo "ERROR: $IRON must be on the xdna2-asr fork branch (got '$on'). Run: git -C \"$IRON\" checkout xdna2-asr"; exit 1; }
+echo "[build] IRON on xdna2-asr @ $(git -C "$IRON" rev-parse --short HEAD)"
 
 export PATH="$VENV_IRON/bin:$VENV_IRON/cc-shim:$AIEBU_DIR:$PATH"
 export PEANO_INSTALL_DIR="$VENV_IRON/lib/python3.14/site-packages/llvm-aie"

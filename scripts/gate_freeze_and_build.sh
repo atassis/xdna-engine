@@ -22,7 +22,7 @@ AIEBU_DIR="~/repositories/ns/amd/XRT-src/src/runtime_src/core/common/aiebu/build
 WEIGHTS="$REPO/artifacts/whisper-small/whisper_decoder"
 GENDIR="$REPO/route_b_kernels/decode_fused"
 
-export AIECC_PATH="${AIECC_PATH:-$REPO/mlir-aie/build-on2/bin/aiecc}"
+export AIECC_PATH="${AIECC_PATH:-$("$REPO/scripts/toolchain_up.sh")/bin/aiecc}"
 export AIECC_PHASE_TIMERS="${AIECC_PHASE_TIMERS:-1}"
 export AIECC_PHASE_TIMERS_FILE="${AIECC_PHASE_TIMERS_FILE:-$FROZEN_DIR/phase_timers.log}"
 export AIECC_JOBS="${AIECC_JOBS:-16}"
@@ -30,15 +30,10 @@ export PATH="$VENV_IRON/bin:$VENV_IRON/cc-shim:$AIEBU_DIR:$PATH"
 export PEANO_INSTALL_DIR="$VENV_IRON/lib/python3.14/site-packages/llvm-aie"
 export PYTHONPATH="$IRON:$GENDIR${PYTHONPATH:+:$PYTHONPATH}"
 
-# apply IRON patches idempotently (same set as build_batched_decode.sh)
-apply_patch(){ local p="$1"; [ -f "$p" ] || return 0
-  if git -C "$IRON" apply --reverse --check "$p" >/dev/null 2>&1; then echo "[freeze] $(basename "$p") already applied"
-  else echo "[freeze] applying $(basename "$p")"; git -C "$IRON" apply "$p"; fi; }
-apply_patch "$REPO/patches/amd-IRON-deepc.patch"
-apply_patch "$REPO/route_b_kernels/patches/iron-transpose-num-batches.patch"
-apply_patch "$REPO/route_b_kernels/patches/iron-gemm-fusion-prefix.patch"
-apply_patch "$REPO/route_b_kernels/patches/iron-aiecc-build-perf.patch"
-apply_patch "$REPO/route_b_kernels/patches/iron-gemv-coalesce-batch-dma.patch"  # opt-in BD-iteration (default off; COALESCE_GEMV gates it)
+# IRON delta = the atassis/IRON:xdna2-asr fork branch (commits, not .patch). Require the checkout to be on it.
+on="$(git -C "$IRON" rev-parse --abbrev-ref HEAD 2>/dev/null)"
+[ "$on" = xdna2-asr ] || { echo "ERROR: $IRON must be on xdna2-asr (got '$on'). Run: git -C \"$IRON\" checkout xdna2-asr"; exit 1; }
+echo "[freeze] IRON on xdna2-asr @ $(git -C "$IRON" rev-parse --short HEAD)"
 
 rm -rf "$FROZEN_DIR"; mkdir -p "$FROZEN_DIR/work" "$FROZEN_DIR/out"
 : > "$AIECC_PHASE_TIMERS_FILE"

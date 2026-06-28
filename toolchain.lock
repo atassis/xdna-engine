@@ -1,0 +1,9 @@
+# toolchain.lock -- the single source of truth for ONE exact AIE toolchain.
+# Sourced by scripts/toolchain_up.sh. Change this file = change the toolchain (deliberately).
+# Phase 2: mlir-aie built from a CLEAN atassis/mlir-aie fork integration-branch commit (no dirty working tree),
+# with the route_b kernels overlaid by sync_kernels.sh (policy B). The base 8373e49 + our 14-patch stack are
+# the commits ON this branch; bump it by rebasing the branch onto upstream + re-pinning here.
+MLIR_AIE_FORK_COMMIT=d885525eaee4d92164a6fdea5811eb8ff924a975   # atassis/mlir-aie:xdna2-asr tip (base 8373e49 + 14 patches)
+MLIR_DISTRO_DIR=mlir-aie/my_install/mlir                       # prebuilt MLIR core we link against (do NOT rebuild)
+PEANO_DIST=llvm_aie-21.0.0.2026052701+9e603b76                 # pinned Peano (the .venv-iron llvm-aie wheel)
+NANOBIND=2.12.0                                                # the dep that silently broke us at 2.13.0

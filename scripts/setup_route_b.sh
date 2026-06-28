@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Reproduce the Route B (open mlir-aie/Peano) build environment on this CachyOS box.
-# Idempotent: safe to re-run. mlir-aie is a PINNED git submodule (see docs/11); .venv-iron is
-# .gitignored. This script is the durable record of the CachyOS fixes (3-file patch + gcc-13
-# shims + pinned toolchain) needed to build/run on Arch/CachyOS.
+# Idempotent: safe to re-run. mlir-aie is a PINNED git submodule (see docs/11) checked out on our fork
+# integration branch atassis/mlir-aie:xdna2-asr (the CachyOS fixes + toolchain patches are COMMITS on it,
+# no apply-patch step); .venv-iron is .gitignored. Durable record of the env (fork branch + gcc-13 shims +
+# pinned toolchain wheels) needed to build/run on Arch/CachyOS.
 set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO"
@@ -41,36 +42,19 @@ if [ ! -e mlir-aie/.git ]; then
   git submodule update --init --depth 1 mlir-aie 2>/dev/null \
     || git submodule update --init mlir-aie
 fi
-# Pin to the exact recorded commit (the submodule gitlink already points here; this is a
-# belt-and-suspenders checkout in case a shallow fetch landed on a branch tip).
-if [ "$(git -C mlir-aie rev-parse HEAD)" != "$MLIR_AIE_SHA" ]; then
-  git -C mlir-aie fetch --depth 1 origin "$MLIR_AIE_SHA"
-  git -C mlir-aie checkout -q "$MLIR_AIE_SHA"
-fi
-
-PE="$REPO/mlir-aie/programming_examples"
-
-# PATCH: the 3 CachyOS build fixes to upstream files (common.cmake env XRT dirs; common.h
-# <cassert> for gcc16; layernorm Makefile redirect space), as ONE patch tethered to
-# MLIR_AIE_SHA. Replaces the old inline seds/python. Idempotent: if it reverse-applies
-# cleanly the patch is already in place, so skip. See route_b_kernels/patches/.
-PATCHFILE="$REPO/route_b_kernels/patches/mlir-aie-cachyos.patch"
-if git -C mlir-aie apply --reverse --check "$PATCHFILE" 2>/dev/null; then
-  echo "  mlir-aie-cachyos.patch already applied"
-else
-  git -C mlir-aie apply "$PATCHFILE" && echo "  applied mlir-aie-cachyos.patch"
-fi
-
-# PATCH: parallelize aiecc per-core compilation on the make-based whole_array path (Parakeet
-# build-perf; AIECC_JOBS, default 1 = no behaviour change). Mirrors the IRON full-elf
-# AIECC_JOBS lever for the make path IRON's base.py patch can't reach. Applies AFTER cachyos
-# (shares makefile-common). Idempotent (reverse-check). See route_b_kernels/patches/.
-JOBSPATCH="$REPO/route_b_kernels/patches/mlir-aie-aiecc-jobs.patch"
-if git -C mlir-aie apply --reverse --check "$JOBSPATCH" 2>/dev/null; then
-  echo "  mlir-aie-aiecc-jobs.patch already applied"
-else
-  git -C mlir-aie apply "$JOBSPATCH" && echo "  applied mlir-aie-aiecc-jobs.patch"
-fi
+# Check out our FORK INTEGRATION BRANCH: atassis/mlir-aie:xdna2-asr = the upstream base (MLIR_AIE_SHA) +
+# our 14-patch toolchain stack carried as COMMITS (the CachyOS build fixes + the bf16 mm.cc microkernel +
+# aiecc-jobs are all on the branch). Replaces the old "checkout SHA + apply cachyos/jobs patches inline" --
+# there is no apply-patch step anymore. toolchain.lock pins the exact commit; scripts/toolchain_up.sh builds
+# the toolchain INSTANCE from a clean git-worktree of it; the route_b kernels are overlaid below by
+# sync_kernels. The engine's submodule gitlink stays at the upstream base (ignore=all hides this checkout).
+set -a; . "$REPO/toolchain.lock"; set +a   # -> MLIR_AIE_FORK_COMMIT
+git -C mlir-aie remote get-url fork >/dev/null 2>&1 \
+  || git -C mlir-aie remote add fork "${MLIR_AIE_FORK_URL:-https://github.com/atassis/mlir-aie}"
+git -C mlir-aie cat-file -e "${MLIR_AIE_FORK_COMMIT}^{commit}" 2>/dev/null \
+  || git -C mlir-aie fetch fork xdna2-asr
+git -C mlir-aie checkout -B xdna2-asr "$MLIR_AIE_FORK_COMMIT" \
+  && echo "  mlir-aie on xdna2-asr @ ${MLIR_AIE_FORK_COMMIT:0:12}"
 
 # INSTALL D: our custom kernels/designs. route_b_kernels/ (tracked) is the single source of
 # truth; copy them FORWARD into the gitignored mlir-aie build sandbox (one-directional => no

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# FAST, ISOLATED aiecc byte-gate: run build-on2 aiecc DIRECTLY on the frozen
+# FAST, ISOLATED aiecc byte-gate: run the toolchain_up instance aiecc DIRECTLY on the frozen
 # decode MLIR (scripts/gate_freeze_and_build.sh must have produced it). This
 # isolates COMPILER (aiecc) changes from generator variation — the proper gate
 # for Track A. Replicates IRON's AieccFullElfCompilationRule command for our
@@ -17,7 +17,7 @@ VENV_IRON="$REPO/.venv-iron"
 AIEBU_DIR="~/repositories/ns/amd/XRT-src/src/runtime_src/core/common/aiebu/build/Release/src/cpp/utils/asm"
 PEANO="$VENV_IRON/lib/python3.14/site-packages/llvm-aie"
 
-export AIECC_PATH="${AIECC_PATH:-$REPO/mlir-aie/build-on2/bin/aiecc}"
+export AIECC_PATH="${AIECC_PATH:-$("$REPO/scripts/toolchain_up.sh")/bin/aiecc}"
 export AIECC_JOBS="${AIECC_JOBS:-16}"
 WORK="${WORK:-$(mktemp -d)}"
 export AIECC_PHASE_TIMERS=1

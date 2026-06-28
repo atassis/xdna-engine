@@ -10,11 +10,14 @@
 set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"; cd "$REPO"
 RB=route_b_kernels
-PE=mlir-aie/programming_examples
+# Target mlir-aie root: default = the submodule (back-compat); pass an arg to overlay a clean fork-branch
+# checkout instead (Phase-2 policy B -- kernels stay route_b-authored, synced into the build source).
+AIEROOT="${1:-mlir-aie}"
+PE=$AIEROOT/programming_examples
 MM=$PE/basic/matrix_multiplication
-K=mlir-aie/aie_kernels/aie2p
+K=$AIEROOT/aie_kernels/aie2p
 
-[ -d mlir-aie ] || { echo "mlir-aie not present — run scripts/setup_route_b.sh first" >&2; exit 1; }
+[ -d "$AIEROOT" ] || { echo "$AIEROOT not present — run scripts/setup_route_b.sh first" >&2; exit 1; }
 mkdir -p "$PE/ml/dwconv1d" "$PE/ml/softmax400" "$PE/ml/layernorm"
 
 # dwconv1d k=5 (docs/08) — last missing Conformer primitive

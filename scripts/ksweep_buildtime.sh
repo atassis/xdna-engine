@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # K-sweep: build the fused decode at several layer counts with the fully-optimized
-# build-on2 aiecc, recording end-to-end (gen+aiecc) wall + per-phase + ELF sha.
+# the toolchain_up instance aiecc, recording end-to-end (gen+aiecc) wall + per-phase + ELF sha.
 # Build-only (engine-only), no NPU. K>1 has no canonical byte-gate (GATE INFO).
 #   bash scripts/ksweep_buildtime.sh "1 4 6 8 12"
 set -uo pipefail

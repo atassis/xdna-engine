@@ -24,26 +24,30 @@ VENV_IRON="${VENV_IRON:-$REPO/.venv-iron}"
 IRON="${IRON:-~/repositories/ns/amd/IRON}"
 AIEBU_DIR="${AIEBU_DIR:-~/repositories/ns/amd/XRT-src/src/runtime_src/core/common/aiebu/build/Release/src/cpp/utils/asm}"
 WEIGHTS="${WEIGHTS:-$REPO/artifacts/whisper-small/whisper_decoder}"
-PATCH="$REPO/patches/amd-IRON-deepc.patch"
 GEN="$REPO/route_b_kernels/decode_fused/gen_decode.py"
 
 [ -x "$VENV_IRON/bin/python" ] || { echo "ERROR: $VENV_IRON/bin/python missing (see prerequisites)"; exit 1; }
 [ -d "$IRON/iron" ] || { echo "ERROR: amd/IRON not at $IRON"; exit 1; }
 command -v "$AIEBU_DIR/aiebu-asm" >/dev/null || [ -x "$AIEBU_DIR/aiebu-asm" ] || { echo "ERROR: aiebu-asm not at $AIEBU_DIR"; exit 1; }
 
-# Apply the deep-C amd/IRON patch (fuse_mlir hoist + StridedCopy/Softmax scratchpad) if not present.
-if [ -n "${SKIP_IRON_PATCH:-}" ]; then
-  echo "[build] SKIP_IRON_PATCH=1 — assuming deep-C already present in the shared IRON tree (do NOT re-apply over stacked patches)"
-elif git -C "$IRON" apply --reverse --check "$PATCH" >/dev/null 2>&1; then
-  echo "[build] amd/IRON deep-C patch already applied"
-else
-  echo "[build] applying amd/IRON deep-C patch"
-  git -C "$IRON" apply "$PATCH"
-fi
+# IRON delta (deep-C scratchpad + the rest) = the atassis/IRON:xdna2-asr fork branch (commits, not .patch).
+# Require the checkout to be on it -- no more git-apply over a shared tree.
+on="$(git -C "$IRON" rev-parse --abbrev-ref HEAD 2>/dev/null)"
+[ "$on" = xdna2-asr ] || { echo "ERROR: $IRON must be on the xdna2-asr fork branch (got '$on'). Run: git -C \"$IRON\" checkout xdna2-asr"; exit 1; }
+echo "[build] IRON on xdna2-asr @ $(git -C "$IRON" rev-parse --short HEAD)"
 
 export PATH="$VENV_IRON/bin:$VENV_IRON/cc-shim:$AIEBU_DIR:$PATH"
 export PEANO_INSTALL_DIR="$VENV_IRON/lib/python3.14/site-packages/llvm-aie"
 export PYTHONPATH="$IRON${PYTHONPATH:+:$PYTHONPATH}"
+
+# Resolve aiecc from the local FORK build, never the pip wheel binary. A `pip install`/wheel reinstall
+# silently reverts the hand-swapped wheel aiecc and drops every compiler patch (the 2026-06-26 regression
+# class). The IRON AieccCompilationRule (iron-aiecc-path-override.patch) honors AIECC_PATH; without it this
+# script fell through to $VENV_IRON/bin/aiecc (the wheel slot). Matches the gate scripts.
+# NOTE: re-confirm the decode byte-gate on the first build after this switch (instance aiecc may differ
+# from the previously-swapped wheel binary).
+export AIECC_PATH="${AIECC_PATH:-$("$REPO/scripts/toolchain_up.sh")/bin/aiecc}"
+[ -x "$AIECC_PATH" ] || { echo "ERROR: instance aiecc not at $AIECC_PATH (run scripts/toolchain_up.sh)"; exit 1; }
 
 WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT   # amd/IRON writes build/ intermediates under CWD
 mkdir -p "$OUT"

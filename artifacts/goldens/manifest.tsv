@@ -1,0 +1,3 @@
+# xclbin	sha256	expected	note
+final_512x800x3072_64x32x96_8c_modalsilu.xclbin	e97887fa098522b1	en_wer=0.124;ru_wer=0.127	Jun-20 working modalsilu (host-GELU baseline path)
+final_512x800x3072_64x32x96_8c_modalgelu.xclbin	e4f7f8dc9d292f3b	en_wer=0.124;ru_wer=0.131	device-validated 2026-06-28 (gelu-fused+resident, no-hang); rebuilt from toolchain.lock instance

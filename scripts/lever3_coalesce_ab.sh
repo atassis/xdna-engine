@@ -82,15 +82,11 @@ log "\n################  STEP 0 — build coalesced ELF (new 1.3.2 stack)  #####
 if [ ! -f "$BASE_DIR/decode.elf" ]; then
   log "[ERR] baseline ELF missing: $BASE_DIR/decode.elf (deep-C resident baseline — build via scripts/build_deepc_decode.sh 12). Aborting."; exit 1
 fi
-# Ensure the lever-3 transpose num_batches change is in the shared IRON (orthogonal to amd-IRON-deepc.patch,
-# which build_deepc_decode.sh applies). Idempotent: skip if already present.
-if git -C "$IRON" apply --reverse --check "$TPATCH" >/dev/null 2>&1; then
-  log "[iron] lever-3 transpose num_batches already applied"
-elif git -C "$IRON" apply --check "$TPATCH" >/dev/null 2>&1; then
-  git -C "$IRON" apply "$TPATCH" && log "[iron] applied lever-3 transpose num_batches patch"
-else
-  log "[ERR] lever-3 transpose patch neither applies nor is already present in $IRON. Resolve manually."; exit 1
-fi
+# The lever-3 transpose num_batches change is now a COMMIT on the atassis/IRON:xdna2-asr fork branch
+# (with the deep-C base + the rest). Require the checkout to be on it -- no more .patch apply.
+on="$(git -C "$IRON" rev-parse --abbrev-ref HEAD 2>/dev/null)"
+[ "$on" = xdna2-asr ] || { log "[ERR] $IRON must be on xdna2-asr (got '$on'). Run: git -C \"$IRON\" checkout xdna2-asr"; exit 1; }
+log "[iron] IRON on xdna2-asr @ $(git -C "$IRON" rev-parse --short HEAD)"
 log "[build] building coalesced 12-layer ELF -> $COAL_DIR via build_deepc_decode.sh (compile-only) ..."
 if bash "$WT/scripts/build_deepc_decode.sh" 12 "$COAL_DIR" >>"$LOG" 2>&1; then
   log "[build] coalesced ELF OK: $(ls -la "$COAL_DIR/decode.elf" | awk '{print $5" bytes"}')"

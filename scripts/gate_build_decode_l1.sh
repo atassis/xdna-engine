@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Byte-gate harness for the build-chain attack (a batch run).
-# Builds the B=128 NL=1 fused-decode ELF via build-on2 aiecc (SP=1 ENG=1
+# Builds the B=128 NL=1 fused-decode ELF via the toolchain_up instance aiecc (SP=1 ENG=1
 # SKIP_EXPAND_PDIS=1 DISABLE_REPEATER=1) and prints the ELF sha256, comparing it
 # to the canonical FULL-GENERATOR-PATH reference 370686d.
 #
@@ -22,7 +22,7 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 NL="${1:-1}"
 REF_SHA="370686d71d65b9f181f5a51b16230e690ccaf1bdc39b6e0e8f96c8667f538a04"
 
-export AIECC_PATH="${AIECC_PATH:-$REPO/mlir-aie/build-on2/bin/aiecc}"
+export AIECC_PATH="${AIECC_PATH:-$("$REPO/scripts/toolchain_up.sh")/bin/aiecc}"
 export AIECC_PHASE_TIMERS="${AIECC_PHASE_TIMERS:-1}"
 export AIECC_JOBS="${AIECC_JOBS:-16}"
 
