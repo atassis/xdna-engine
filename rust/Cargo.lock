@@ -1002,6 +1002,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "npu-gemma"
+version = "0.1.0"
+dependencies = [
+ "ndarray",
+]
+
+[[package]]
 name = "npu-onnx"
 version = "0.1.0"
 dependencies = [

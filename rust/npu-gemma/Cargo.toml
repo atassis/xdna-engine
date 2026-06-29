@@ -1,0 +1,18 @@
+[package]
+name = "npu-gemma"
+version = "0.1.0"
+edition = "2021"
+description = "Gemma 3 small-LLM decoder on the XDNA2 NPU engine — Phase 0 scaffold (host-CPU reference + the NPU port map). The run-any-model proof: a real LLM decoder reusing our resident-FFN + fused-decode + KV primitives."
+
+[lib]
+name = "npu_gemma"
+path = "src/lib.rs"
+
+[features]
+# `npu`: route the decoder's matmuls/attention through the XDNA2 NPU (our fused-decode + resident-FFN
+# primitives). OFF by default so the host-CPU reference scaffold builds without XRT (CI / unattended).
+# Phase 0 is host-CPU reference + scaffold only; the on-NPU path is wired in a later phase.
+npu = []
+
+[dependencies]
+ndarray = "0.16"

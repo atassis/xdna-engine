@@ -63,6 +63,11 @@ def main():
     ap.add_argument("--steps", type=int, default=16)
     ap.add_argument("--prompt-len", type=int, default=448)
     ap.add_argument("--t-pad", type=int, default=1536)
+    ap.add_argument("--npu-logits", action="store_true",
+                    help="append ln_post+proj_out on-NPU so the ELF outputs logits[VOCAB_PAD]; argmax reads "
+                         "them directly (validates the e2e/NPU logits path on REAL data, T6(a) strong version)")
+    ap.add_argument("--compile-only", action="store_true",
+                    help="compile the fused op then exit (no device) -- validate the graph/build with services up")
     a = ap.parse_args()
     w, NL, S, TP = a.weights, a.layers, a.prompt_len, a.t_pad
     scale = 1.0 / np.sqrt(HD)
@@ -151,9 +156,26 @@ def main():
                (o_a8, p+"ff", p+"bf2", p+"ff"), (o_a8, p+"x2", p+"ff", nxt)]
         cur = nxt
     out_name = cur
+    weights_extra = {}
+    if a.npu_logits:
+        # e2e/NPU: run ln_post + proj_out on the NPU so the ELF outputs logits[VOCAB_PAD] (ln_post affine
+        # folds into proj_out; o_ln is pure-normalize). Mirrors gen_decode --npu-logits. argmax stays host.
+        VOCAB_PAD = 65536
+        mat_proj = (lnp_w[:, None] * proj).T.copy()             # [VOCAB, D]
+        bias_proj = (lnp_b @ proj).astype(np.float32)           # [VOCAB]
+        mat_pad = np.zeros((VOCAB_PAD, D), np.float32); mat_pad[0:VOCAB] = mat_proj
+        bias_pad = np.full(VOCAB_PAD, -1e30, np.float32); bias_pad[0:VOCAB] = bias_proj
+        o_proj_out = GEMV(M=VOCAB_PAD, K=D, num_aie_columns=8, tile_size_input=4, tile_size_output=VOCAB_PAD // 8, context=ctx)
+        o_add_logits = ElementwiseAdd(size=VOCAB_PAD, tile_size=VOCAB_PAD // 8, num_aie_columns=8, context=ctx)
+        rl += [(o_ln, out_name, "hn"), (o_proj_out, "Wproj", "hn", "logits"), (o_add_logits, "logits", "bias_proj", "logits")]
+        bufsz.update({"hn": D * 2, "logits": VOCAB_PAD * 2, "Wproj": VOCAB_PAD * D * 2, "bias_proj": VOCAB_PAD * 2})
+        weights_extra = {"Wproj": bf16(mat_pad).reshape(-1), "bias_proj": bf16(bias_pad)}
+        out_name = "logits"
     fused = FusedMLIROperator("decode", rl, input_args=["x"], output_args=[out_name], buffer_sizes=bufsz, context=ctx)
     print("compiling fused decode op...")
     fused.compile()
+    if a.compile_only:
+        import sys; print(f"compile-only: fused op compiled OK (out={out_name}, npu_logits={a.npu_logits})"); sys.exit(0)
     callable_ = fused.get_callable()  # FusedFullELFCallable
     elf_data = load_elf(fused)
 
@@ -174,6 +196,8 @@ def main():
                         ("Kenc", bf16(d["Kenc"]).reshape(-1)), ("Venc", bf16(d["Venc"]).reshape(-1)),
                         ("kcache", np.zeros(H*S*HD, BF16)), ("vcache", np.zeros(H*S*HD, BF16))]:
             put2(p + nm, arr)
+    for nm, arr in weights_extra.items():  # npu-logits: Wproj/bias_proj (non-per-layer)
+        put2(nm, arr)
     # __call__ syncs only input+output; scratch (weights/encoder-KV/caches) must be synced once now.
     callable_.scratch_buffer.to("npu")
 
@@ -246,8 +270,12 @@ def main():
         patches.update({int(i): (step + 1, 0xFFFFFFFF) for i in sm_locs})
         ed = elf_data.copy(); patch_elf(ed, patches); callable_.reload_elf(ed)
         callable_()
-        hidden = f32(xout.data[0:D])
-        nt = int(np.argmax(logits_of(hidden)))
+        if a.npu_logits:
+            # ELF already produced logits[VOCAB_PAD] on-NPU (ln_post+proj_out); argmax over the real vocab.
+            nt = int(np.argmax(f32(xout.data[0:VOCAB])))
+        else:
+            hidden = f32(xout.data[0:D])
+            nt = int(np.argmax(logits_of(hidden)))
         fus_toks.append(nt); tok = nt
         if nt == EOT: break
 

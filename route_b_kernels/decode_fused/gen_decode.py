@@ -510,6 +510,16 @@ def main():
         ff = bf16(bf16(bf16(d["Wf2"].T.copy()).astype(np.float32) @ h2.astype(np.float32)).astype(np.float32) + bf16(d["bf2"]).astype(np.float32))
         cur_x = bf16(x2.astype(np.float32) + ff.astype(np.float32))
     x_out = cur_x
+    if npu_logits:
+        # e2e/NPU: the ELF runs ln_post + proj_out on-NPU and outputs logits[VOCAB_PAD], so the golden
+        # output must be the logits too (not the 768-hidden). Match the on-NPU op: hn = pure-normalize LN
+        # (gamma folded into mat_proj), logits = hn @ mat_proj.T + bias_proj; pad rows = -1e30 (never win
+        # argmax). Without this the golden was the hidden state mislabeled "logits" -> the rel-L2 gate was
+        # meaningless and argmax-parity uncheckable.
+        hn = ln(x_out.astype(np.float32))
+        lg = (hn @ mat_proj.T).astype(np.float32) + bias_proj
+        gold = np.full(VOCAB_PAD, -1e30, np.float32); gold[0:VOCAB] = lg
+        x_out = bf16(gold)
 
     bdir = os.path.join(a.out, "buffers")
     def wb(n, v):

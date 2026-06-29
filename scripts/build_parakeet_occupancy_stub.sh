@@ -35,10 +35,21 @@ FINAL="$MMW/build/final_512x1024x4096_${TILE}_8c.xclbin"
 STUB_OUT="$MMW/build/final_512x1024x4096_${TILE}_8c_STUB.xclbin"
 MMO="$MMW/build/mm_${m}x${k}x${n}.o"
 
+PROD_BAK="$MMW/build/final_512x1024x4096_${TILE}_8c.prod.bak"
 restore_production() {
-  echo "[stub] restoring production resident kernel ($TILE) ..."
-  rm -f "$MMO"
-  # rebuild only the chosen tile's production xclbins (real mm.cc)
+  # Fast path: the production N=4096 xclbin was BACKED UP (never deleted), so just move it
+  # back -- instant, and it is the genuine real-mm.cc artifact (it was never rebuilt from the
+  # stub). This is the safe replacement for the old delete-then-rebuild dance that could lose
+  # the production twin if the relink/rebuild failed mid-flight.
+  rm -f "$MMO"  # drop the stub object so the next plain `make` recompiles the real mm.cc
+  if [[ -f "$PROD_BAK" ]]; then
+    echo "[stub] restoring production N=4096 xclbin from fast backup ..."
+    mv -f "$PROD_BAK" "$FINAL"
+    echo "[stub] production restored (fast)."
+    return
+  fi
+  # Fallback (backup missing -- should not happen): rebuild from the real mm.cc.
+  echo "[stub] WARN no backup found; rebuilding production resident kernels ($TILE) from mm.cc ..."
   for NN in 1024 2048 4096; do
     WA_C_DEPTH=1 make -C "$MMW" AIECC_JOBS="${AIECC_JOBS:-0}" NPU2=1 M=512 K=1024 N="$NN" \
       m=$m k=$k n=$n dtype_in=bf16 dtype_out=f32 n_aie_cols=8 use_iron=1 $FAST \
@@ -55,18 +66,28 @@ fi
 
 # 2. compile the movement-only stub OVER the production matmul object.
 echo "[stub] compiling mm_movement_stub.cc -> $MMO ($TILE) ..."
+# -I mlir-aie so the stub's `#include "aie_kernels/aie2p/zero.cc"` resolves (the real mm.cc includes
+# zero.cc as a sibling in kernels_dir; the stub lives elsewhere so it needs the source-tree root on the
+# include path). $MAD/include supplies aie_api; the repo's mlir-aie/ supplies aie_kernels.
 "$PEANO_INSTALL_DIR/bin/clang++" -O2 -std=c++20 --target=aie2p-none-unknown-elf -DNDEBUG \
-  -I "$MAD/include" -Dbf16_f32_ONLY -DDIM_M=$m -DDIM_K=$k -DDIM_N=$n -DVECTORIZED_ONLY $MMDEF \
+  -I "$MAD/include" -I "$REPO/mlir-aie" -Dbf16_f32_ONLY -DDIM_M=$m -DDIM_K=$k -DDIM_N=$n -DVECTORIZED_ONLY $MMDEF \
   -c route_b_kernels/occupancy/mm_movement_stub.cc -o "$MMO"
 touch "$MMO"  # newer than mm.cc so make won't rebuild from the real source
 
 # 3. relink the N=4096 resident xclbin with the stub object, save as _STUB.
+#    SAFETY: back up the production FINAL FIRST (never delete it). `make` overwrites FINAL with
+#    the stub build (MMO was touched newer than mm.cc above, so the relink fires); we copy that
+#    out to _STUB, then immediately restore production from the backup. If the relink dies, the
+#    EXIT trap restores production from the same backup -- the production twin can never be lost.
+echo "[stub] backing up production xclbin -> $PROD_BAK ..."
+cp -f "$FINAL" "$PROD_BAK"
 echo "[stub] relinking resident xclbin with the stub object ..."
-rm -f "$FINAL"
 WA_C_DEPTH=1 make -C "$MMW" AIECC_JOBS="${AIECC_JOBS:-0}" NPU2=1 M=512 K=1024 N=4096 \
   m=$m k=$k n=$n dtype_in=bf16 dtype_out=f32 n_aie_cols=8 use_iron=1 $FAST \
   "build/final_512x1024x4096_${TILE}_8c.xclbin"
 cp -f "$FINAL" "$STUB_OUT"
 echo "[stub] wrote $STUB_OUT"
-# trap restores the production FINAL on exit.
-echo "[stub] done (production restored on exit)."
+# Production is restored by the EXIT trap (single restore path) from $PROD_BAK -- fast, and it
+# also fires if anything above died. Do NOT restore here too, or the trap would find no backup
+# and fall back to the slow rebuild on a normal exit.
+echo "[stub] done (production restored from fast backup on exit)."
