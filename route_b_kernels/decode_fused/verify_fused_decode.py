@@ -18,6 +18,7 @@ import numpy as np
 import ml_dtypes
 import torch
 
+import newstack_compat  # noqa: F401 — MUST precede iron imports (new-mlir-aie port shim)
 from iron.common import AIEContext
 from iron.common.fusion import FusedMLIROperator, load_elf, patch_elf
 from iron.operators.gemv.op import GEMV

@@ -69,3 +69,18 @@ except ImportError:
         (Runtime, "drain"),
     ):
         setattr(_cls, _meth, _rename_placement(getattr(_cls, _meth)))
+
+    # Delta 3: the device method `get_num_connections(tile, output)` was removed from the aie.iron
+    # device object between the e4f35d6 wheel (Mar-2026, HAS it) and current upstream (Jun, removed it);
+    # `get_shim_tiles` survived. amd/IRON's `get_shim_dma_limit` (iron/common/utils.py, added by #114 in
+    # May) sums it across shim tiles to size the ShimDMA budget. Restore it with the AIE2P/NPU2 hardware
+    # constants -- verified against the wheel: shim/compute tiles expose 2 DMA channels per direction, mem
+    # tiles 6. No-op on the old stack (this whole branch only runs where aie.iron.placers is absent).
+    from aie.iron.device import NPU2 as _NPU2
+
+    def _get_num_connections(self, tile, output=True):
+        mem_rc = {(t.col, t.row) for t in self.get_mem_tiles()}
+        return 6 if (tile.col, tile.row) in mem_rc else 2
+
+    if not hasattr(_NPU2(), "get_num_connections"):
+        _NPU2.get_num_connections = _get_num_connections

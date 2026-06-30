@@ -38,7 +38,14 @@ echo "[build] IRON on xdna2-asr @ $(git -C "$IRON" rev-parse --short HEAD)"
 
 export PATH="$VENV_IRON/bin:$VENV_IRON/cc-shim:$AIEBU_DIR:$PATH"
 export PEANO_INSTALL_DIR="$VENV_IRON/lib/python3.14/site-packages/llvm-aie"
-export PYTHONPATH="$IRON${PYTHONPATH:+:$PYTHONPATH}"
+
+# Resolve `aie` (the mlir-aie framework: Program/Runtime/ScratchpadParameter/place-tiles) from the FORK
+# INSTANCE python, NOT the pip wheel. The wheel (e4f35d6) still has aie.iron.placers but LACKS our deep-C
+# ScratchpadParameter; the rebased instance has ScratchpadParameter and no placers (the C++ auto-placer +
+# newstack_compat shim cover the removed module). Mirrors toolchain_smoke.sh. `iron.operators.*` (amd/IRON,
+# ported off SequentialPlacer) come from $IRON; the two namespaces (aie.iron vs iron) do not shadow.
+INST="$("$REPO/scripts/toolchain_up.sh")"
+export PYTHONPATH="$INST/python:$IRON${PYTHONPATH:+:$PYTHONPATH}"
 
 # Resolve aiecc from the local FORK build, never the pip wheel binary. A `pip install`/wheel reinstall
 # silently reverts the hand-swapped wheel aiecc and drops every compiler patch (the 2026-06-26 regression
@@ -46,7 +53,7 @@ export PYTHONPATH="$IRON${PYTHONPATH:+:$PYTHONPATH}"
 # script fell through to $VENV_IRON/bin/aiecc (the wheel slot). Matches the gate scripts.
 # NOTE: re-confirm the decode byte-gate on the first build after this switch (instance aiecc may differ
 # from the previously-swapped wheel binary).
-export AIECC_PATH="${AIECC_PATH:-$("$REPO/scripts/toolchain_up.sh")/bin/aiecc}"
+export AIECC_PATH="${AIECC_PATH:-$INST/bin/aiecc}"
 [ -x "$AIECC_PATH" ] || { echo "ERROR: instance aiecc not at $AIECC_PATH (run scripts/toolchain_up.sh)"; exit 1; }
 
 WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT   # amd/IRON writes build/ intermediates under CWD

@@ -3,7 +3,7 @@
 # Phase 2: mlir-aie built from a CLEAN atassis/mlir-aie fork integration-branch commit (no dirty working tree),
 # with the route_b kernels overlaid by sync_kernels.sh (policy B). The base 8373e49 + our 14-patch stack are
 # the commits ON this branch; bump it by rebasing the branch onto upstream + re-pinning here.
-MLIR_AIE_FORK_COMMIT=d885525eaee4d92164a6fdea5811eb8ff924a975   # atassis/mlir-aie:xdna2-asr tip (base 8373e49 + 14 patches)
+MLIR_AIE_FORK_COMMIT=094a90536e4d0fcc057c8304c6829b23ac222c1e   # atassis/mlir-aie REBASED onto upstream/main afc887f (2026-06-30 +15h): 8 keepers, #3212/#3211/#3216/#3178 dropped; branch sync/mlir-aie-latest; PUSHED to fork. DEVICE GATE PASS: decode.elf byte-identical (sha 4e2164a3) to deployed baseline
 MLIR_DISTRO_DIR=mlir-aie/my_install/mlir                       # prebuilt MLIR core we link against (do NOT rebuild)
-PEANO_DIST=llvm_aie-21.0.0.2026052701+9e603b76                 # pinned Peano (the .venv-iron llvm-aie wheel)
+PEANO_DIST=llvm_aie-21.0.0.2026062301+cb664e8c                 # pinned Peano (.venv-iron wheel); bumped from 2026052701 to upstream afc887f blessed nightly; VALIDATED: decode WER 0.0842 == old-Peano baseline (prod-binary A/B, 17 clips, identical to 4 decimals)
 NANOBIND=2.12.0                                                # the dep that silently broke us at 2.13.0
