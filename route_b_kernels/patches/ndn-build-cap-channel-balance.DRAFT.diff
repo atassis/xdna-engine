@@ -1,0 +1,115 @@
+--- a/lib/Dialect/AIE/Transforms/AIEObjectFifoStatefulTransform.cpp
++++ b/lib/Dialect/AIE/Transforms/AIEObjectFifoStatefulTransform.cpp
+@@ -80,6 +80,23 @@
+ class DMAChannelAnalysis {
+   DenseMap<std::tuple<Value, DMAChannelDir, int>, int> channelsPerTile;
+   DenseMap<std::tuple<Value, DMAChannelDir, int>, int> aieStreamsPerTile;
++  // DRAFT (ndn-build-cap, internal notes): a MemTile's BD-ID
++  // namespace is split into two 24-wide halves by channel-number PARITY (see
++  // AIETargetModel::isBdChannelAccessible: even channel -> bd_id<24, odd channel -> bd_id
++  // >=24), shared across ALL channels of that parity -- NOT exclusive per channel index. A
++  // pure first-fit-by-index channel assignment can pack multiple relays onto the same
++  // parity and starve the BD allocator well below the combined 48-ID budget even though
++  // distinct channel *indices* look "free". Track cumulative depth charged per (tile,
++  // parity) so getDMAChannelIndex can prefer the less-loaded parity when a depth hint is
++  // available. UNVERIFIED -- needs an attended build-check (see the handoff for the repro).
++  DenseMap<std::pair<Value, int>, int> bdLoadPerParity;
++
++  int bdLoad(TileOp tileOp, int parity) {
++    return bdLoadPerParity.lookup({tileOp.getResult(), parity});
++  }
++  void chargeBdLoad(TileOp tileOp, int parity, int depth) {
++    bdLoadPerParity[{tileOp.getResult(), parity}] += depth;
++  }
+ 
+ public:
+   DMAChannelAnalysis(DeviceOp &device) {
+@@ -122,9 +139,15 @@
+   }
+ 
+   /// Given a tile and DMAChannelDir, returns next usable channel index for
+-  /// that tile.
++  /// that tile. `depthHint` (ndn-build-cap DRAFT), when >= 0, is the fifo depth this
++  /// channel will carry; for MemTiles this is used to prefer the less BD-loaded parity
++  /// class among the free channel indices, instead of pure first-fit-by-index, so a
++  /// large-depth relay does not get starved by unrelated small relays that happen to
++  /// share its parity. depthHint < 0 (the default) reproduces the original first-fit
++  /// behavior exactly (bit-identical channel assignment for all existing callers).
+   int getDMAChannelIndex(TileOp tileOp, DMAChannelDir dir,
+-                         bool requiresAdjacentTileAccessChannels) {
++                         bool requiresAdjacentTileAccessChannels,
++                         int depthHint = -1) {
+     int maxChannelNum = 0;
+     if (dir == DMAChannelDir::MM2S)
+       maxChannelNum = tileOp.getNumSourceConnections(WireBundle::DMA);
+@@ -142,14 +165,28 @@
+       maxChannelNum = std::min(maxChannelNum, maxChannelNumForAdjacentTile);
+     }
+ 
++    bool balanceParity =
++        depthHint >= 0 && targetModel.isMemTile(tileOp.getCol(), tileOp.getRow());
++    int bestChannel = -1;
+     for (int i = 0; i < maxChannelNum; i++) {
+       if (int usageCnt = channelsPerTile[{tileOp.getResult(), dir, i}];
+           usageCnt == 0) {
+-        channelsPerTile[{tileOp.getResult(), dir, i}] = 1;
+-        return i;
++        if (!balanceParity) {
++          bestChannel = i;
++          break;
++        }
++        if (bestChannel == -1 ||
++            bdLoad(tileOp, i & 1) < bdLoad(tileOp, bestChannel & 1)) {
++          bestChannel = i;
++        }
+       }
+     }
+-    return -1;
++    if (bestChannel == -1)
++      return -1;
++    channelsPerTile[{tileOp.getResult(), dir, bestChannel}] = 1;
++    if (balanceParity)
++      chargeBdLoad(tileOp, bestChannel & 1, depthHint);
++    return bestChannel;
+   }
+ 
+   /// Given a tile and DMAChannel, adds entry to aieStreamsPerTile or
+@@ -2294,9 +2331,19 @@
+ 
+       if (shouldProcessProducer) {
+         bool requiresAdjacentTileAccessChannels = crossTileInfos.at(producer);
++        // ndn-build-cap DRAFT: hint the producer-side depth (this fifo's own declared
++        // size) so a MemTile channel pick can balance BD-ID load across parities.
++        // NOTE (unverified): mirrors the depth lookup pattern at the createBuffers call
++        // site below (isa<ArrayAttr>(getElemNumber()) ? size(0) : findObjectFifoSize(...));
++        // re-check that exact signature/overload during the attended build-check.
++        int depthHint = isa<ArrayAttr>(producer.getElemNumber())
++                            ? producer.size(0)
++                            : findObjectFifoSize(getOperation(),
++                                                 producer.getProducerTileOp(),
++                                                 producer);
+         int channelIndex = dmaAnalysis.getDMAChannelIndex(
+             producer.getProducerTileOp(), DMAChannelDir::MM2S,
+-            requiresAdjacentTileAccessChannels);
++            requiresAdjacentTileAccessChannels, depthHint);
+         fifo_dma_channel_index[producer] = channelIndex;
+       }
+ 
+@@ -2309,9 +2356,16 @@
+ 
+         if (shouldProcessConsumer) {
+           bool requiresAdjacentTileAccessChannels = crossTileInfos.at(consumer);
++          // ndn-build-cap DRAFT: same depth hint, consumer side (unverified, see note
++          // above).
++          int depthHint = isa<ArrayAttr>(consumer.getElemNumber())
++                              ? consumer.size(0)
++                              : findObjectFifoSize(getOperation(),
++                                                   consumer.getProducerTileOp(),
++                                                   consumer);
+           int channelIndex = dmaAnalysis.getDMAChannelIndex(
+               consumer.getProducerTileOp(), DMAChannelDir::S2MM,
+-              requiresAdjacentTileAccessChannels);
++              requiresAdjacentTileAccessChannels, depthHint);
+           fifo_dma_channel_index[consumer] = channelIndex;
+         }
+       }
