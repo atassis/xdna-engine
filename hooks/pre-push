@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Guard: refuse to push private material to the public xdna-engine repo.
+# Activate with:  git config core.hooksPath hooks
+set -euo pipefail
+Z=0000000000000000000000000000000000000000
+forbidden_paths='^(journal/|strategy/|internal/|docs/(handoffs|tasks|log|kb|reference|superpowers|archive|research)/|\.claude/|STARTER_PROMPT)'
+forbidden_text='/home/[a-z]|autonomous session|two-Sonnet|atassis\.ru|100\.64\.|-----BEGIN [A-Z ]*PRIVATE KEY-----'
+fail=0
+while read -r local_ref local_sha remote_ref remote_sha; do
+  [ "$local_sha" = "$Z" ] && continue
+  if [ "$remote_sha" = "$Z" ]; then
+    revs=$(git rev-list "$local_sha" --not --remotes)
+  else
+    revs=$(git rev-list "$remote_sha..$local_sha")
+  fi
+  for c in $revs; do
+    if git diff-tree --no-commit-id --name-only -r "$c" | grep -Eq "$forbidden_paths"; then
+      echo "BLOCKED: $c touches a forbidden private path"; fail=1
+    fi
+    if git log -1 --format='%B' "$c" | grep -Eiq 'autonomous session|two-Sonnet'; then
+      echo "BLOCKED: $c message contains agent-signal text"; fail=1
+    fi
+    if git grep -EIiq "$forbidden_text" "$c" 2>/dev/null; then
+      echo "BLOCKED: $c content matches a forbidden pattern"; fail=1
+    fi
+  done
+done
+if [ "$fail" -ne 0 ]; then
+  echo "pre-push guard refused the push. Do NOT use --no-verify unless you are certain." >&2
+  exit 1
+fi
+exit 0

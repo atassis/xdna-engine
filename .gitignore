@@ -3,9 +3,9 @@
 .venv-iron/
 __pycache__/
 *.pyc
-# NOTE: mlir-aie/ is now a pinned git submodule (was gitignored clone). See
-# internal notes. Its dirty working tree (copy-forward kernels +
-# build artifacts + applied patch) is hidden from the parent via .gitmodules ignore=all.
+# NOTE: mlir-aie/ is a pinned git submodule. Its dirty working tree (copy-forward
+# kernels + build artifacts + applied patch) is hidden from the parent via
+# .gitmodules ignore=all.
 
 # model artifacts / weights (too big to commit — keep export scripts + instructions instead)
 models/
@@ -33,3 +33,9 @@ scripts/amd_toolchains.env
 # stray aircc output if a build is ever run with CWD=repo-root (real output goes to artifacts/)
 /air.mlir
 /air_project/
+
+# agent scaffolding and the private companion working copy must never be tracked here
+.claude/
+journal/
+strategy/
+STARTER_PROMPT*.md
