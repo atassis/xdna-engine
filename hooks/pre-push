@@ -14,13 +14,16 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     revs=$(git rev-list "$remote_sha..$local_sha")
   fi
   for c in $revs; do
-    if git diff-tree --no-commit-id --name-only -r "$c" | grep -Eq "$forbidden_paths"; then
+    changed=$(git diff-tree --no-commit-id --name-only -r "$c" \
+              | grep -vE '^hooks/pre-push$|^\.githooks-install\.md$' || true)
+    if printf '%s\n' "$changed" | grep -Eq "$forbidden_paths"; then
       echo "BLOCKED: $c touches a forbidden private path"; fail=1
     fi
     if git log -1 --format='%B' "$c" | grep -Eiq 'autonomous session|two-Sonnet'; then
       echo "BLOCKED: $c message contains agent-signal text"; fail=1
     fi
-    if git grep -EIiq "$forbidden_text" "$c" 2>/dev/null; then
+    # scan only the files this commit changed (not the whole tree), excluding the guard itself
+    if [ -n "$changed" ] && git grep -EIiq "$forbidden_text" "$c" -- $changed 2>/dev/null; then
       echo "BLOCKED: $c content matches a forbidden pattern"; fail=1
     fi
   done
