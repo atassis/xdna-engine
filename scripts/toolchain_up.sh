@@ -6,6 +6,21 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 set -a; . "$REPO/toolchain.lock"; set +a
 source "$REPO/scripts/fast_build_env.sh"   # ccache + lld (no-ops if absent)
+
+# Resolve the MLIR core distro (the LLVM/MLIR framework aiecc is built ON -- NOT Peano). It is a
+# prebuilt dependency provisioned SEPARATELY by scripts/fetch_mlir_distro.sh (network); this script
+# stays local-only and just resolves the path. Prefer the single-file pin MLIR_DISTRO_WHEEL (bumping
+# the MLIR core = one line in toolchain.lock); fall back to a repo-relative MLIR_DISTRO_DIR for old locks.
+if [ -n "${MLIR_DISTRO_WHEEL:-}" ]; then
+  MLIR_DISTRO_ABS="$HOME/.cache/xdna2-build/mlir-distro/${MLIR_DISTRO_WHEEL#mlir-}/mlir"
+  [ -e "$MLIR_DISTRO_ABS/bin/mlir-tblgen" ] || {
+    echo "[toolchain_up] MLIR distro $MLIR_DISTRO_WHEEL not provisioned. Run: scripts/fetch_mlir_distro.sh" >&2
+    exit 1
+  }
+else
+  MLIR_DISTRO_ABS="$REPO/$MLIR_DISTRO_DIR"
+fi
+
 LOCKHASH="$(sha256sum "$REPO/toolchain.lock" | cut -c1-12)"
 INST="${TOOLCHAIN_HOME:-$HOME/.cache/xdna2-build/instances}/$LOCKHASH"
 PYPKG="$INST/python/aie/iron/program.py"
@@ -48,8 +63,8 @@ fi
 cmake -G Ninja -B "$INST/build" -S "$SRC" \
   -DCMAKE_BUILD_TYPE=Release \
   -DPython3_EXECUTABLE="$REPO/.venv-iron/bin/python" \
-  -DCMAKE_PREFIX_PATH="$REPO/$MLIR_DISTRO_DIR" \
-  -DMLIR_DIR="$REPO/$MLIR_DISTRO_DIR/lib/cmake/mlir" \
+  -DCMAKE_PREFIX_PATH="$MLIR_DISTRO_ABS" \
+  -DMLIR_DIR="$MLIR_DISTRO_ABS/lib/cmake/mlir" \
   -DCMAKE_MODULE_PATH="$REPO/mlir-aie/cmake/modulesXilinx" \
   -DAIE_ENABLE_BINDINGS_PYTHON=ON -DLLVM_ENABLE_RTTI=ON \
   -DLLVM_INCLUDE_TESTS=OFF -DLLVM_USE_LINKER=lld \
