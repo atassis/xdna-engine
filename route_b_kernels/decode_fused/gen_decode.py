@@ -192,16 +192,16 @@ def main():
     # Deep-C: the per-token KV-write position offset is now a runtime `addr`-kind scratchpad param
     # (shared symbol "kv_off", element units = n_self*head_dim) instead of a per-token ELF patch →
     # the decode ELF is CONSTANT across tokens (registered once; host writes the offset per dispatch).
-    op_sck = StridedCopy(**sc, kwargs={"output_offset_scratchpad": "kv_off"}, context=ctx)
+    op_sck = StridedCopy(**sc, output_offset_parameter="kv_off", context=ctx)
     if co_self_tr:
         # transposed vcache [H,HD,S]: new V[h,d] -> vcache[h*HD*S + d*S + n_self]; head stride HD*S, dim
         # stride S, runtime column offset = vcache_off (= n_self, NOT n_self*HD like the kcache kv_off).
         sc_v = dict(input_sizes=(H, HD), input_strides=(HD, 1), input_offset=0, output_sizes=(1, H, HD),
                     output_strides=(0, HD * S, S), output_offset=0, input_buffer_size=H * HD,
                     output_buffer_size=H * S * HD, num_aie_channels=1)
-        op_scv = StridedCopy(**sc_v, kwargs={"output_offset_scratchpad": "vcache_off"}, context=ctx)
+        op_scv = StridedCopy(**sc_v, output_offset_parameter="vcache_off", context=ctx)
     else:
-        op_scv = StridedCopy(**sc, kwargs={"output_offset_scratchpad": "kv_off"}, context=ctx)
+        op_scv = StridedCopy(**sc, output_offset_parameter="kv_off", context=ctx)
     op_sc_s = GEMV(M=S, K=HD, num_aie_columns=8, tile_size_input=4, tile_size_output=S // 8, num_batches=H, context=ctx)
     # Deep-C: the per-token self-softmax mask width is now a runtime `core`-kind scratchpad param
     # (symbol "sm_mask", element units = context_len = n_self) read on-tile, instead of an ELF patch.

@@ -107,8 +107,8 @@ def main():
     scd = dict(input_sizes=(H, HD), input_strides=(HD, 1), input_offset=0, output_sizes=(1, H, HD),
                output_strides=(0, S * HD, 1), output_offset=0, input_buffer_size=H * HD,
                output_buffer_size=H * S * HD, num_aie_channels=1)
-    o_sk = StridedCopy(**scd, kwargs={"output_offset_scratchpad": "kv_off"}, context=ctx)
-    o_sv = StridedCopy(**scd, kwargs={"output_offset_scratchpad": "kv_off"}, context=ctx)
+    o_sk = StridedCopy(**scd, output_offset_parameter="kv_off", context=ctx)
+    o_sv = StridedCopy(**scd, output_offset_parameter="kv_off", context=ctx)
     o_ss = GEMV(M=S, K=HD, num_aie_columns=8, tile_size_input=4, tile_size_output=S // 8, num_batches=H, context=ctx)
     o_ms = Softmax(rows=16, cols=S, num_aie_columns=1, num_channels=1, rtp_vector_size=S, vector_size_parameter="sm_mask", context=ctx)
     o_ts = Transpose(M=S, N=HD, num_aie_columns=2, num_channels=1, m=tms, n=tns, s=tss, context=ctx)

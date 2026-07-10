@@ -172,14 +172,14 @@ def main():
                        output_sizes=(B, H, HD), output_strides=(H * HD, HD, 1), output_offset=0,
                        input_buffer_size=B * QKV, output_buffer_size=B * H * HD, num_aie_channels=1, context=ctx)
     # scratchpad mode (engine): kv write offset + self-softmax mask are RUNTIME params (deep-C); else baked.
-    sc_kw = {"output_offset_scratchpad": "kv_off"} if sp else {}
+    sc_kw = {"output_offset_parameter": "kv_off"} if sp else {}
     sc_off = 0 if sp else P * HD
     sc_k = StridedCopy(input_sizes=(B, H, HD), input_strides=(QKV, HD, 1), input_offset=D,
                        output_sizes=(B, H, HD), output_strides=(H * S * HD, S * HD, 1), output_offset=sc_off,
-                       input_buffer_size=B * QKV, output_buffer_size=B * H * S * HD, num_aie_channels=1, kwargs=sc_kw, context=ctx)
+                       input_buffer_size=B * QKV, output_buffer_size=B * H * S * HD, num_aie_channels=1, **sc_kw, context=ctx)
     sc_v = StridedCopy(input_sizes=(B, H, HD), input_strides=(QKV, HD, 1), input_offset=2 * D,
                        output_sizes=(B, H, HD), output_strides=(H * S * HD, S * HD, 1), output_offset=sc_off,
-                       input_buffer_size=B * QKV, output_buffer_size=B * H * S * HD, num_aie_channels=1, kwargs=sc_kw, context=ctx)
+                       input_buffer_size=B * QKV, output_buffer_size=B * H * S * HD, num_aie_channels=1, **sc_kw, context=ctx)
     # B-unroll->BD-iteration (op-count lever): opt the per-head/stream GEMV DMA into
     # one batched 4D BD per column instead of BH per-batch transfers. Env-gated so the
     # default build is byte-identical (370686d); on-device rel-L2+WER validated separately.
