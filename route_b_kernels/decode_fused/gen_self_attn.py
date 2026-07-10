@@ -117,8 +117,7 @@ def main():
     sc_v = StridedCopy(**sc, kwargs={"output_offset_patch_marker": KV_MAGIC}, context=ctx)
     g_scores = GEMV(M=S, K=HD, num_aie_columns=8, tile_size_input=4, tile_size_output=S // 8,
                     num_batches=H, context=ctx)
-    softmax = Softmax(rows=SM_ROWS, cols=S, num_aie_columns=1, num_channels=1, rtp_vector_size=S,
-                      mask_patch_value=SM_MAGIC, context=ctx)
+    softmax = Softmax(rows=SM_ROWS, cols=S, num_aie_columns=1, num_channels=1, rtp_vector_size=SM_MAGIC, context=ctx)
     transpose = Transpose(M=S, N=HD, num_aie_columns=2, num_channels=1, m=tm, n=tn, s=ts, context=ctx)
     g_ctx = GEMV(M=HD, K=S, num_aie_columns=8, tile_size_input=4, tile_size_output=HD // 8,
                  num_batches=H, context=ctx)

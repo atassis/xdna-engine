@@ -121,9 +121,8 @@ def main():
     add_q = ElementwiseAdd(size=D, tile_size=D // 8, num_aie_columns=8, context=ctx)
     g_scores = GEMV(M=TP, K=HD, num_aie_columns=8, tile_size_input=4, tile_size_output=TP // 8,
                     num_batches=H, context=ctx)
-    # STATIC mask: mask_patch_value=0 => active width fixed to rtp_vector_size (= real T_enc).
-    softmax = Softmax(rows=SM_ROWS, cols=TP, num_aie_columns=1, num_channels=1, rtp_vector_size=T,
-                      mask_patch_value=0, context=ctx)
+    # STATIC mask: no runtime mask patch => active width fixed to rtp_vector_size (= real T_enc).
+    softmax = Softmax(rows=SM_ROWS, cols=TP, num_aie_columns=1, num_channels=1, rtp_vector_size=T, context=ctx)
     transpose = Transpose(M=TP, N=HD, num_aie_columns=2, num_channels=1, m=tm, n=tn, s=ts, context=ctx)
     g_ctx = GEMV(M=HD, K=TP, num_aie_columns=8, tile_size_input=4, tile_size_output=HD // 8,
                  num_batches=H, context=ctx)

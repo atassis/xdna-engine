@@ -120,7 +120,7 @@ def main():
                b_col_maj=True, c_col_maj=True, context=ctx)
     add_q = ElementwiseAdd(size=B * D, tile_size=D // 8, num_aie_columns=8, context=ctx)
     g_scores = GEMV(M=TP, K=HD, num_aie_columns=8, tile_size_input=4, tile_size_output=TP // 8, num_batches=BH, context=ctx)
-    softmax = Softmax(rows=BH, cols=TP, num_aie_columns=1, num_channels=1, rtp_vector_size=TP, mask_patch_value=0, context=ctx)
+    softmax = Softmax(rows=BH, cols=TP, num_aie_columns=1, num_channels=1, rtp_vector_size=TP, context=ctx)
     transpose = Transpose(M=TP, N=HD, num_batches=BH, num_aie_columns=1, num_channels=1, m=tm, n=tn, s=ts, context=ctx)
     g_ctx = GEMV(M=HD, K=TP, num_aie_columns=8, tile_size_input=4, tile_size_output=HD // 8, num_batches=BH, context=ctx)
     g_o = GEMM(M=D, K=D, N=B, tile_m=64, tile_k=64, tile_n=16, num_aie_columns=g_cols,

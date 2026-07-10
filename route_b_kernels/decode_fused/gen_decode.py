@@ -205,14 +205,14 @@ def main():
     op_sc_s = GEMV(M=S, K=HD, num_aie_columns=8, tile_size_input=4, tile_size_output=S // 8, num_batches=H, context=ctx)
     # Deep-C: the per-token self-softmax mask width is now a runtime `core`-kind scratchpad param
     # (symbol "sm_mask", element units = context_len = n_self) read on-tile, instead of an ELF patch.
-    op_sm_s = Softmax(rows=16, cols=S, num_aie_columns=sm_cols, num_channels=1, rtp_vector_size=S, mask_scratchpad="sm_mask", context=ctx)
+    op_sm_s = Softmax(rows=16, cols=S, num_aie_columns=sm_cols, num_channels=1, rtp_vector_size=S, vector_size_parameter="sm_mask", context=ctx)
     # lever #3 (1): head-batched self-attn V transpose (num_batches=H, ONE launch for all H heads) when
     # --coalesce-self; else per-head (num_batches=1) = deep-C baseline. vcache [H,S,HD] contiguous.
     op_tr_s = Transpose(M=S, N=HD, num_batches=(H if co_self else 1), num_aie_columns=2, num_channels=1, m=tms, n=tns, s=tss, context=ctx)
     op_ct_s = GEMV(M=HD, K=S, num_aie_columns=8, tile_size_input=4, tile_size_output=HD // 8, num_batches=H, context=ctx)
     op_sc_c = GEMV(M=TP, K=HD, num_aie_columns=8, tile_size_input=4, tile_size_output=TP // 8, num_batches=H,
                    dtype_a=("int8" if int8_ck else "bf16"), context=ctx)
-    op_sm_c = Softmax(rows=16, cols=TP, num_aie_columns=sm_cols, num_channels=1, rtp_vector_size=T, mask_patch_value=0, context=ctx)
+    op_sm_c = Softmax(rows=16, cols=TP, num_aie_columns=sm_cols, num_channels=1, rtp_vector_size=T, context=ctx)
     # lever #3 (i): when --coalesce-cross, Venc is stored pre-transposed [H,HD,TP] host-side and op_ct_c
     # reads it directly (no per-token op_tr_c). Else the deep-C per-head transpose (op_tr_c) is used.
     op_tr_c = None if co_cross else Transpose(M=TP, N=HD, num_aie_columns=2, num_channels=1, m=tmc, n=tnc, s=tsc, context=ctx)

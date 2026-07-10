@@ -123,7 +123,7 @@ def main():
                        output_sizes=(B, H, HD), output_strides=(H * S * HD, S * HD, 1), output_offset=P * HD,
                        input_buffer_size=B * QKV, output_buffer_size=B * H * S * HD, num_aie_channels=1, context=ctx)
     g_scores = GEMV(M=S, K=HD, num_aie_columns=8, tile_size_input=4, tile_size_output=S // 8, num_batches=BH, context=ctx)
-    softmax = Softmax(rows=BH, cols=S, num_aie_columns=1, num_channels=1, rtp_vector_size=S, mask_patch_value=0, context=ctx)
+    softmax = Softmax(rows=BH, cols=S, num_aie_columns=1, num_channels=1, rtp_vector_size=S, context=ctx)
     transpose = Transpose(M=S, N=HD, num_batches=BH, num_aie_columns=1, num_channels=1, m=tm, n=tn, s=ts, context=ctx)
     g_ctx = GEMV(M=HD, K=S, num_aie_columns=8, tile_size_input=4, tile_size_output=HD // 8, num_batches=BH, context=ctx)
     g_o = GEMM(M=D, K=D, N=B, tile_m=64, tile_k=64, tile_n=16, num_aie_columns=g_cols,

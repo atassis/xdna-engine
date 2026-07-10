@@ -184,13 +184,13 @@ def main():
     # one batched 4D BD per column instead of BH per-batch transfers. Env-gated so the
     # default build is byte-identical (370686d); on-device rel-L2+WER validated separately.
     g_scs = GEMV(M=S, K=HD, num_aie_columns=8, tile_size_input=4, tile_size_output=S // 8, num_batches=BH, coalesce_batch_dma=_cbd, context=ctx)
-    sm_s = (Softmax(rows=BH, cols=S, num_aie_columns=sm_cols, num_channels=1, rtp_vector_size=S, mask_scratchpad="sm_mask", context=ctx)
+    sm_s = (Softmax(rows=BH, cols=S, num_aie_columns=sm_cols, num_channels=1, rtp_vector_size=S, vector_size_parameter="sm_mask", context=ctx)
             if sp else
-            Softmax(rows=BH, cols=S, num_aie_columns=sm_cols, num_channels=1, rtp_vector_size=S, mask_patch_value=0, context=ctx))
+            Softmax(rows=BH, cols=S, num_aie_columns=sm_cols, num_channels=1, rtp_vector_size=S, context=ctx))
     tr_s = Transpose(M=S, N=HD, num_batches=BH, num_aie_columns=tr_s_cols, num_channels=1, m=tms, n=tns, s=tss, coalesce_batch_dma=_cbd_tr, context=ctx)
     g_cts = GEMV(M=HD, K=S, num_aie_columns=8, tile_size_input=4, tile_size_output=HD // 8, num_batches=BH, coalesce_batch_dma=_cbd, context=ctx)
     g_scc = GEMV(M=TP, K=HD, num_aie_columns=8, tile_size_input=4, tile_size_output=TP // 8, num_batches=BH, coalesce_batch_dma=_cbd, context=ctx)
-    sm_c = Softmax(rows=BH, cols=TP, num_aie_columns=sm_cols, num_channels=1, rtp_vector_size=T, mask_patch_value=0, context=ctx)
+    sm_c = Softmax(rows=BH, cols=TP, num_aie_columns=sm_cols, num_channels=1, rtp_vector_size=T, context=ctx)
     tr_c = Transpose(M=TP, N=HD, num_batches=BH, num_aie_columns=tr_c_cols, num_channels=1, m=tmc, n=tnc, s=tsc, coalesce_batch_dma=_cbd_tr, context=ctx)
     g_ctc = GEMV(M=HD, K=TP, num_aie_columns=8, tile_size_input=4, tile_size_output=HD // 8, num_batches=BH, coalesce_batch_dma=_cbd, context=ctx)
 

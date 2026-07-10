@@ -92,10 +92,10 @@ def op_factory(ctx):
     f["gemv_ctx_cross"] = (lambda: gemv1(HD, TP, H), "cross ctx 64x1536 b12 per-col M=8")
     # Standalone softmax: compile-time (non-scratchpad) variant -> no kv/mask binding.
     f["softmax_self"] = (lambda: Softmax(rows=16, cols=S, num_aie_columns=1, num_channels=1,
-                                         rtp_vector_size=S, mask_patch_value=0, context=ctx),
+                                         rtp_vector_size=S, context=ctx),
                          "self softmax cols=448 real 1col")
     f["softmax_cross"] = (lambda: Softmax(rows=16, cols=TP, num_aie_columns=1, num_channels=1,
-                                          rtp_vector_size=TP, mask_patch_value=0, context=ctx),
+                                          rtp_vector_size=TP, context=ctx),
                           "cross softmax cols=1536 real 1col")
     # V-transpose (the #1 suspect). Real op is 2-col (splits N=64 into 2x32) -> trace-flow
     # routing conflict, same as GEMV. Per-col proxy: 1 col at N=HD//2=32 = one production
