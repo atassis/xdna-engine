@@ -67,8 +67,15 @@ Grounded in audit DMA constants (91us dispatch floor, 17.6us/MB ~57GB/s, bf16). 
 | parakeet-enc (ungated, genericity) | 1.71x | 2.08x | SAME primitive, different shape+gating |
 
 Dispatch-elimination is the constant primary lever; intermediate-byte saving grows with M; weights are the
-shared floor both arms pay. **Measure at realistic prefill M, not M=6.** E2B caveat: I=12288 forces multi-
-dispatch chunking (~4x), shrinking the dispatch saving -> validate the real ELF dispatch count vs generate_taps.
+shared floor both arms pay. **Measure at realistic prefill M, not M=6.**
+
+**Chunking caveat RESOLVED (2026-07-11, toolchain-validated non-mutating build):** the individual whole-array
+GEMM builds as a SINGLE dispatch at BOTH 270M (N=2048) and E2B (N=12288) FFN widths -- N=12288 at n=32/8-col =
+48 BD row-blocks, under the 64-BD limit, so NO N-splitting. Proof: both xclbins built (140K each, placement
+47 tiles/0 unplaced); NPU insts stream 43 (270M) vs 45 (E2B) lines = same single-dispatch shape, more loop
+iters. So base_dispatch~5 holds for E2B and the full ~364us dispatch saving is achievable for the baseline
+arm. STILL OPEN (the actual hard part): the FUSED resident block's dispatch count depends on the M*I
+intermediate fitting L1/L2 -- that residency (not the per-GEMM BD limit) is what may force fused-block tiling.
 
 ## Build plan (Task 3+, toolchain-gated)
 
