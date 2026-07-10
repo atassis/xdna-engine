@@ -39,3 +39,4 @@ scripts/amd_toolchains.env
 journal/
 strategy/
 STARTER_PROMPT*.md
+artifacts/gemma4-e2b/
