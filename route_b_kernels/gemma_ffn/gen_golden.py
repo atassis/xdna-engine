@@ -24,10 +24,12 @@ def gelu_tanh(x):
 
 
 def gemma_rmsnorm(x, gamma, eps):
+    """RMSNorm with EFFECTIVE gamma (the oracle already folds the family convention: Gemma3 1+w vs
+    Gemma4 w). Sum-of-squares in float32 (audit: bf16 ssq is a bug)."""
     x = x.astype(np.float32)
-    var = np.mean(x * x, axis=-1, keepdims=True)  # sum-of-squares in f32 (audit: bf16 ssq is a bug)
+    var = np.mean(x * x, axis=-1, keepdims=True)
     xn = x / np.sqrt(var + eps)
-    return xn * (1.0 + gamma.astype(np.float32))
+    return xn * gamma.astype(np.float32)
 
 
 def _maybe_bf16(x, compute_dtype):
@@ -40,22 +42,24 @@ def _maybe_bf16(x, compute_dtype):
 
 
 def ffn_forward(x_in, wdir, eps=1e-6, compute_dtype="float32"):
-    """Run the Gemma FFN sub-block. wdir holds gate_proj/up_proj/down_proj/pre_norm/post_norm .npy."""
+    """Gemma FFN resident sub-block: pre_norm -> gate/up -> GeGLU -> down (= the dense mlp output).
+
+    Boundary matches scripts/gemma_ffn_oracle.py: input = pre_feedforward_layernorm INPUT, output = mlp
+    module OUTPUT. Excludes post_norm / residual / MoE / PLE (layer-level plumbing). wdir holds
+    gate_proj/up_proj/down_proj/pre_norm .npy.
+    """
     g = np.load(os.path.join(wdir, "gate_proj.npy"))   # [I, D]
     u = np.load(os.path.join(wdir, "up_proj.npy"))     # [I, D]
     d = np.load(os.path.join(wdir, "down_proj.npy"))   # [D, I]
     pre = np.load(os.path.join(wdir, "pre_norm.npy"))  # [D]
-    post = np.load(os.path.join(wdir, "post_norm.npy"))  # [D]
     bf = lambda t: _maybe_bf16(t, compute_dtype)
 
-    x_in = x_in.astype(np.float32)
-    normed = bf(gemma_rmsnorm(x_in, pre, eps))
+    normed = bf(gemma_rmsnorm(x_in.astype(np.float32), pre, eps))  # RMSNorm always in f32
     gate = bf(normed @ bf(g).T)          # [.., I]
     up = bf(normed @ bf(u).T)            # [.., I]
     h = bf(gelu_tanh(gate) * up)         # [.., I]
-    down = bf(h @ bf(d).T)               # [.., D]
-    out = x_in + gemma_rmsnorm(down, post, eps)
-    return out.astype(np.float32)
+    down = bf(h @ bf(d).T)               # [.., D]  = dense mlp output (sub-block output)
+    return down.astype(np.float32)
 
 
 def rel_l2(a, b):

@@ -32,11 +32,13 @@ def _load():
 
 @pytest.mark.skipif(not (ORACLE / "meta.json").exists(), reason=f"no oracle at {ORACLE}")
 def test_fp32_golden_matches_oracle_formula():
-    """fp32 golden must reproduce the HF sub-block to ~float precision -> the formula is exact."""
+    """fp32 golden must reproduce the HF sub-block. Exactness is only checkable against an fp32 oracle;
+    a bf16 oracle (E2B, captured in bf16 for RAM) limits the floor to bf16 rounding (~few e-3)."""
     meta, x, ref = _load()
     got = ffn_forward(x, str(ORACLE / "weights"), meta["rms_norm_eps"], compute_dtype="float32")
     r = rel_l2(got, ref)
-    assert r <= 1e-4, f"fp32 formula diverges: rel_L2={r:.2e} (check RMSNorm (1+gamma)/f32-ssq or gelu_tanh)"
+    bar = 1e-4 if meta.get("dtype") == "float32" else 5e-3  # bf16 oracle -> bf16-rounding-limited
+    assert r <= bar, f"fp32 formula diverges: rel_L2={r:.2e} > {bar} (RMSNorm gamma/f32-ssq or gelu_tanh?)"
 
 
 @pytest.mark.skipif(not (ORACLE / "meta.json").exists(), reason=f"no oracle at {ORACLE}")
