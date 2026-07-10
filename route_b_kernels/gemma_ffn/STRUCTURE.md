@@ -91,3 +91,18 @@ normed/gate/up/h on-chip across gate->up->geglu->down; needs on-chip `gelu(gate)
 (f32 ssq; the m_stationary / decode_norm_gemv reduction primitives are the bridge), single-herd, multi-dispatch
 chunk over I for E2B. Build via FORK instance (`toolchain_up.sh`->aiecc, `toolchain_smoke.sh` first). Gate:
 rel_L2<=0.08 + corr>=0.99 vs the bf16 golden (native bf16 path; BFP16_IREE needs 0.65 bar + risks #847 -O1/-O2).
+
+## Device status (2026-07-11)
+
+- **Build**: whole-array GEMM builds to xclbin non-mutatingly at 270M (512x640x2048) AND E2B (512x1536x12288)
+  widths, single dispatch (48 BD < 64 limit), placement 47 tiles/0 unplaced. Recipe: frozen instance +
+  ironenv Peano, `rm -rf build/` after (see memory `gemma4-npu-target`).
+- **Execution**: xclbin dispatches + runs on the NPU (0.727 ms/iter, 1845 GFLOP/s). Kernel ABI confirmed from
+  test.cpp/common.h: 6 args = (opcode=3, bo_instr[gid1], instr_len, A[gid3], B[gid4], C[gid5]).
+- **Correctness: PARKED on harness/env (not toolchain).** Neither device harness validates numerics: the
+  python runner `run_npu_mm_silu_wa.py` is stale vs the current whole_array host layout (both B row/col-major
+  wrong -> C de-shuffle / A-tiling drift), and canonical `make run` (test.cpp) fails host cmake config
+  (`/usr/lib/libxilinxopencl.a` missing, XRT dev-package gap). Owner filing a harness-fix task (upstreamable
+  to AMD: XRT cmake gap + runner refresh). Resume device-correctness once a working matmul harness exists.
+- **Blocked on merge-#2**: rebuilding on the settled new instance `b78e43abb532` needs the route_b generators
+  ported to the new-aiecc CLI first (owned by the merge-#2 session).
