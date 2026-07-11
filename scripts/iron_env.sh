@@ -7,7 +7,8 @@
 # use BASH_SOURCE under bash and fall back to $0 under zsh (zsh sets $0 to the sourced path).
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)"
 export PATH="$REPO/.venv-iron/bin:$REPO/.venv-iron/cc-shim:$PATH"   # aiecc + gcc-13 shims
-INST="$("$REPO/scripts/toolchain_up.sh")"
+INST="$("$REPO/scripts/toolchain_up.sh")" || { echo "iron_env: toolchain_up.sh failed" >&2; return 1; }
+[ -n "$INST" ] || { echo "iron_env: empty instance dir from toolchain_up.sh" >&2; return 1; }
 export PYTHONPATH="$INST/python:${PYTHONPATH:-}"   # aie resolves to the fork instance (place-tiles), not the wheel
 export AIECC_PATH="$INST/bin/aiecc"
 export PEANO_INSTALL_DIR="$REPO/.venv-iron/lib/python3.14/site-packages/llvm-aie"
