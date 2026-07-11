@@ -1,0 +1,85 @@
+##===- Makefile.resident --------------------------------------------------===##
+#
+# This file licensed under the Apache License v2.0 with LLVM Exceptions.
+# See https://llvm.org/LICENSE.txt for license information.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+#
+# Copyright (C) 2025-2026, Advanced Micro Devices, Inc.
+#
+##===----------------------------------------------------------------------===##
+#
+# PLAIN whole-array (8-column) matmul, no epilogue: C[M,N] = A[M,K] @ B[K,N].
+# Drives the MLIR-emitting generator whole_array_iron.py (NOT the new upstream
+# @iron.jit whole_array.py) through the shared route_b_override.mk, so that:
+#   (a) insts land as insts_${suffix}.txt (the engine + kernel_registry read
+#       insts_*.txt; the rewritten makefile-common names them .bin), and
+#   (b) WA_C_DEPTH=1 single-buffers the L1 C tile -- the wide fast tile
+#       (64x32x128) overflows L1 with the upstream hardcoded fifo_depth=2, which
+#       the @iron.jit whole_array.py has no knob to relax.
+#
+# Used by scripts/build_parakeet_kernels.sh (resident encoder tiles: fast bfp16
+# 64x32x128 + native bf16 32x32x32) and scripts/build_decode_kernels.sh (thin-M
+# GEMV 8x32x32). Copied into the mlir-aie whole_array example dir by
+# scripts/sync_kernels.sh before it runs (srcdir resolves there).
+#
+# Invoke:  make -f Makefile.resident NPU2=1 M=.. K=.. N=.. m=.. k=.. n=.. \
+#              n_aie_cols=8 dtype_in=bf16 dtype_out=f32 \
+#              [emulate_bfloat16_mmul_with_bfp16=1 bfp16_iree=1] \
+#              build/final_${M}x${K}x${N}_${m}x${k}x${n}_8c.xclbin
+#
+srcdir := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
+subdir=whole_array
+targetname=whole_array
+
+# Final GEMM dims
+M?=512
+K?=1024
+N?=1024
+
+# Single AIE-core tile dims (fast bfp16 default; native passes 32x32x32)
+m?=64
+k?=32
+n?=128
+
+n_aie_cols?=8
+b_col_maj?=0
+
+# bf16 in, f32 accumulate/out (plain matmul, host reads f32)
+dtype_in?=bf16
+dtype_out?=f32
+
+# One kernel object: the matmul (mm.cc); the zero kernel is compiled into it.
+kernels=mm_${m}x${k}x${n}
+
+aieargs+=-m $m -k $k -n $n --n-aie-cols ${n_aie_cols} --b-col-maj ${b_col_maj}
+
+# Plain (no mode tag) suffix -- must match npu-parakeet/src/npu.rs and
+# npu-asr decode/ctx load paths: final_${M}x${K}x${N}_${m}x${k}x${n}_${cols}c.
+target_suffix=${M}x${K}x${N}_${m}x${k}x${n}_${n_aie_cols}c
+
+use_iron=1
+aie_py_src=whole_array_iron.py
+
+# Linear buffer allocation (the wide fast tile does not pack bank-aware).
+buffer_aloc_flag=basic-sequential
+
+# mm.cc combo/dim defines (mm.cc names symbols by the bf16->f32 combo; DIM_* default
+# to 64 if unset, so they MUST be passed to match the tile). Mirrors Makefile.modal.
+MM_DEFINES=-Dbf16_f32_ONLY -DDIM_M=${m} -DDIM_K=${k} -DDIM_N=${n} -DVECTORIZED_ONLY
+ifeq (${b_col_maj}, 1)
+	MM_DEFINES+=-DB_COL_MAJ
+endif
+
+include ${srcdir}/../makefile-common
+
+# Re-supply the aiecc-from-MLIR flow the blessed instance's new makefile-common
+# dropped (shared with Makefile.modal). srcdir points at the mlir-aie example dir
+# this Makefile is copied into, so reach back to the source tree.
+include ${srcdir}/../../../../../route_b_kernels/whole_array_fused/route_b_override.mk
+
+# matmul object: bf16 in, f32 acc. KERNEL_DEFINES carries the emulate/BFP16_IREE
+# flags from route_b_override.mk (fast tile) -- without it a fast-flagged build
+# silently compiles the native kernel.
+build/mm_${m}x${k}x${n}.o: ${kernels_dir}/mm.cc
+	mkdir -p ${@D}
+	cd ${@D} && ${KERNEL_CC} ${KERNEL_CFLAGS} ${MM_DEFINES} ${KERNEL_DEFINES} -c $< -o ${@F}

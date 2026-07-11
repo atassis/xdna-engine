@@ -29,6 +29,11 @@ cp "$RB/aie_kernels/mm_silu_epilogue.cc" "$K/mm_silu_epilogue.cc"
 # softmax-400 (pad->416) example
 cp "$RB/softmax400/softmax400.py" "$PE/ml/softmax400/softmax400.py"
 cp "$RB/softmax400/Makefile"      "$PE/ml/softmax400/Makefile"
+# plain resident whole_array matmul (no epilogue) -- MLIR-emitting generator +
+# Makefile.resident (route_b_override .txt-insts + WA_C_DEPTH flow) for the Parakeet
+# resident encoder tiles and the thin-M decode GEMV (build_parakeet/decode_kernels.sh).
+cp "$RB/whole_array_fused/whole_array_iron.py"      "$MM/whole_array/whole_array_iron.py"
+cp "$RB/whole_array_fused/Makefile.resident"        "$MM/whole_array/Makefile.resident"
 # whole_array fused matmul+epilogue design
 cp "$RB/whole_array_fused/whole_array_silu_iron.py" "$MM/whole_array/whole_array_silu_iron.py"
 cp "$RB/whole_array_fused/Makefile.silu"            "$MM/whole_array/Makefile.silu"

@@ -21,6 +21,7 @@
 set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"; cd "$REPO"
 source scripts/iron_env.sh
+bash scripts/sync_kernels.sh >/dev/null   # copy whole_array_iron.py + Makefile.resident into the sandbox
 
 K="${1:-768}"
 N="${2:-768}"
@@ -36,7 +37,9 @@ echo "== decode GEMV: M=${M} K=${K} N=${N} (tile ${m}x${k}x${n}, ${COLS} cols, n
 rm -f "$MMW/build/mm_${m}x${k}x${n}.o"
 rm -f "$MMW/build/aie_${SUFFIX}.mlir"
 
-make -C "$MMW" NPU2=1 M="$M" K="$K" N="$N" m="$m" k="$k" n="$n" \
+# Drive the MLIR-emitting whole_array_iron.py via Makefile.resident: the rewritten upstream
+# makefile-common names insts .bin (engine reads insts_*.txt) and lacks the WA_C_DEPTH knob.
+make -f Makefile.resident -C "$MMW" NPU2=1 M="$M" K="$K" N="$N" m="$m" k="$k" n="$n" \
   dtype_in=bf16 dtype_out=f32 n_aie_cols="$COLS" use_iron=1 \
   "build/final_${SUFFIX}.xclbin"
 
