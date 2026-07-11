@@ -102,15 +102,22 @@ ln -sf "$(command -v gcc)" .venv-iron/cc-shim/gcc-13
 ln -sf "$(command -v g++)" .venv-iron/cc-shim/g++-13
 
 # 4. Ensure a local mlir-aie checkout exists. If it is ALREADY present (the prefetch clones it, or a
-#    prior run initialized the submodule), this is a NO-OP -- we do NOT re-clone and we do NOT run the
-#    broad `git submodule update --init mlir-aie` fallback, which can fetch the wrong (default) branch.
-#    We rely instead on toolchain_up.sh's fetch-BY-SHA (and the fork-branch checkout just below) to
-#    land the exact pinned commit. Only when there is no checkout at all do we bootstrap one.
+#    prior run initialized it), this is a NO-OP -- we do NOT re-clone. When there is no checkout at all
+#    (a bare clone) we bootstrap an empty repo and fetch the pinned fork commit BY SHA; we deliberately
+#    avoid the broad `git submodule update --init mlir-aie` (it errors on the untracked path, and would
+#    fetch the wrong default branch). The fork-branch checkout just below lands the exact pinned commit.
 if [ -e mlir-aie/.git ]; then
   echo "  mlir-aie already present -> skip clone (fork commit ensured by fetch-by-SHA below)"
 else
-  git submodule update --init --depth 1 mlir-aie 2>/dev/null \
-    || git submodule update --init mlir-aie
+  # Bare clone: mlir-aie is UNTRACKED in this repo (a .gitmodules entry with no committed gitlink),
+  # so `git submodule update --init mlir-aie` errors ("pathspec did not match"). Bootstrap an empty
+  # repo and fetch the pinned fork commit BY SHA; the fork-branch checkout block just below lands it.
+  echo "  mlir-aie absent -> bootstrapping fork checkout @ ${MLIR_AIE_FORK_COMMIT:0:12}"
+  mkdir -p mlir-aie
+  git -C mlir-aie init -q
+  git -C mlir-aie remote add fork "${MLIR_AIE_FORK_URL:-https://github.com/atassis/mlir-aie}" 2>/dev/null || true
+  git -C mlir-aie fetch --depth 1 fork "$MLIR_AIE_FORK_COMMIT" 2>/dev/null \
+    || git -C mlir-aie fetch fork xdna2-asr
 fi
 # Check out our FORK INTEGRATION BRANCH: atassis/mlir-aie:xdna2-asr = the upstream base + our toolchain
 # patch stack carried as COMMITS (the CachyOS build fixes + the bf16 mm.cc microkernel + aiecc-jobs are

@@ -9,10 +9,13 @@ Every step is tagged `[CPU]` (no NPU needed -- builds, exports, kernel compiles)
 "Produces", "success signal", and rough "time" are listed per step so you can tell a
 step worked before moving on.
 
-READ THIS FIRST: the chain is now nearly hands-off. One step (0.b) still needs a manual
-command that no script performs today, and two dependency-fetch steps (2, 3) lean on
-assets that can rotate out of upstream indexes. GAP #1 (models/parakeet/), GAP #3 (silent
-Peano miss) and GAP #5 (WER clips) are CLOSED -- see the GAP LIST and the Recreatability
+READ THIS FIRST: the chain is now hands-off on a machine with warm caches (validated by a
+clean-clone from-scratch run: all CPU steps green + a 4-clip device A/B character-identical
+to the shipped baseline). The bare-clone `mlir-aie` bootstrap (was GAP-A / the old manual
+"0.b") is now automated inside `setup_route_b.sh`. Two dependency-fetch steps (2, 3) still
+lean on upstream assets that can rotate out of their indexes on a truly bare machine (GAP
+#2/#4, OPEN -- see the debts table). GAP #1 (models/parakeet/), GAP #3 (silent Peano miss)
+and GAP #5 (WER clips, shipped in VCS) are CLOSED. Read the GAP LIST + the Recreatability
 debts table at the end BEFORE you start.
 
 ---
@@ -65,10 +68,11 @@ Budget ~15-20 GB: ~1.8 GB toolchain wheels, ~2.5 GB Parakeet fp32 encoder + `.da
 
 `mlir-aie` is a git submodule (`.gitmodules` url = Xilinx/mlir-aie, `ignore=all`) but the
 build needs it on the **fork integration branch** `atassis/mlir-aie:xdna2-asr`, pinned by
-`toolchain.lock:MLIR_AIE_FORK_COMMIT`. A plain `git submodule update --init` would fetch
-the WRONG (upstream default) branch. `setup_route_b.sh` (Step 1) has the correct
-fetch-by-SHA + fork-branch checkout logic, so you normally do NOT need to touch the
-submodule by hand -- but you DO need a `mlir-aie/.git` to exist first.
+`toolchain.lock:MLIR_AIE_FORK_COMMIT`. On a bare clone `mlir-aie` is absent (untracked, no
+committed gitlink). `setup_route_b.sh` (Step 1) now bootstraps it automatically: when
+`mlir-aie/.git` is missing it `git init`s an empty repo, adds the `fork` remote, and
+fetches the pinned commit BY SHA, then checks out the fork branch. So Step 0 is just a
+clone -- no manual submodule dance.
 
 ### 0.a  Clone
 ```bash
@@ -77,26 +81,9 @@ cd xdna-engine
 git checkout chore/adopt-upstream-softmax-kwargs   # the validated branch
 ```
 
-### 0.b  Bootstrap the submodule checkout (MANUAL -- see GAP #1)
-`setup_route_b.sh` only bootstraps a checkout when `mlir-aie/.git` is ABSENT, via
-`git submodule update --init` (which needs the submodule URL to serve the pinned fork
-commit -- it does not, the commit lives on the fork). The robust from-scratch sequence,
-which lands the exact pinned commit regardless, is:
-```bash
-git submodule update --init --depth 1 mlir-aie || mkdir -p mlir-aie   # get an empty/base checkout
-git -C mlir-aie remote add fork https://github.com/atassis/mlir-aie 2>/dev/null || true
-# read the pin from toolchain.lock:
-FORK_SHA=$(sed -n 's/^MLIR_AIE_FORK_COMMIT=\([0-9a-f]*\).*/\1/p' toolchain.lock)
-git -C mlir-aie fetch fork xdna2-asr
-git -C mlir-aie checkout -B xdna2-asr "$FORK_SHA"
-```
-- **Produces:** `mlir-aie/` checked out on `xdna2-asr` at the pinned commit.
-- **Success signal:** `git -C mlir-aie rev-parse HEAD` equals `MLIR_AIE_FORK_COMMIT`.
-- **Time:** 2-5 min (fork fetch).
-- **Note:** Step 1 re-runs the remote-add + fetch-by-SHA + checkout idempotently, so if
-  0.a produced a `mlir-aie/.git` at all, you can let Step 1 do the fork checkout. The
-  manual sequence here is the safe belt-and-suspenders when 0.a's submodule fetch cannot
-  serve the fork commit.
+That is all Step 0 requires. The `mlir-aie` fork checkout at the pinned commit happens
+automatically in Step 1 (`setup_route_b.sh`). (Success signal, later: after Step 1,
+`git -C mlir-aie rev-parse HEAD` equals `toolchain.lock:MLIR_AIE_FORK_COMMIT`.)
 
 ---
 
@@ -338,7 +325,7 @@ automated from a clean clone.
 | Gitignored dep | Produced by | Automated? |
 |---|---|---|
 | `.venv-iron` (py3.14 AIE venv) | Step 1 `setup_route_b.sh` | AUTO -- the `mlir_aie` wheel + Peano tree still lean on a warm uv cache / wheelhouse / rotating network index (GAP #2 OPEN), but a miss now HARD-FAILS loudly with the pre-warm command (GAP #3 CLOSED) instead of silently absenting Peano. |
-| `mlir-aie/` submodule on fork branch | Step 0.b (manual) / re-ensured by Step 1 | PARTIAL -- Step 1 does fork remote-add + fetch-by-SHA + checkout, but only if a `mlir-aie/.git` already exists; the initial bootstrap from a bare clone needs the manual 0.b (GAP #1). |
+| `mlir-aie/` on fork branch | Step 1 `setup_route_b.sh` | AUTO -- on a bare clone (no `mlir-aie/.git`) Step 1 `git init`s an empty repo, adds the `fork` remote, fetches the pinned commit BY SHA, and checks out the fork branch (GAP-A CLOSED). |
 | `vendor/wheelhouse/mlir_aie-*.whl` | Step 1 -> `build_wheelhouse.sh` | PARTIAL -- rebuildable ONLY from a warm uv archive cache; empty cache => hard error, falls back to a rotating network index (GAP #2). |
 | MLIR core distro (`~/.cache/xdna2-build/mlir-distro/...`) | Step 2 `fetch_mlir_distro.sh` | AUTO -- needs authenticated `gh`; pin is a dated release asset (GAP #4). |
 | Toolchain instance (`~/.cache/xdna2-build/instances/<hash>`) | Step 3 `toolchain_up.sh` | AUTO (cold = tens of min). |
@@ -369,10 +356,11 @@ automated from a clean clone.
   Idempotent (`cp -Lf` overwrites in place). Verified: the dereferenced file sizes match the
   on-box `models/parakeet/` byte-for-byte (encoder 41770866, decoder_joint 72520893, vocab
   93939) and the filenames are exactly what `extract_parakeet_encoder.py` reads.
-- **Still note (0.b):** the initial bare-clone submodule bootstrap remains manual -- `git
-  submodule update --init` targets the Xilinx URL, which does not carry the pinned fork
-  commit; only the fork remote does. Step 1's explicit fetch-by-SHA handles it once a
-  `mlir-aie/.git` exists, but the first bootstrap still needs the manual 0.b sequence.
+- **Related GAP-A (also CLOSED):** the bare-clone `mlir-aie` bootstrap used to fail --
+  `git submodule update --init` errors on the untracked path (no committed gitlink) and
+  would target the Xilinx URL, which does not carry the pinned fork commit. `setup_route_b.sh`
+  now `git init`s an empty repo + fetches the pinned commit BY SHA from the `fork` remote when
+  `mlir-aie/.git` is absent, so no manual step is needed. Validated on a fresh throwaway clone.
 
 ### GAP #2 -- pinned `mlir_aie` wheel depends on a warm uv cache OR a rotating index  [HIGH -- OPEN, owned by `proper-install-consumable`]
 - **Owner note:** durably hosting the ~290 MB `mlir_aie` wheel (release asset / LFS / object
@@ -447,11 +435,13 @@ automated from a clean clone.
 
 ## Bottom line
 
-The chain is now ~95% automated. GAP #1 (`models/parakeet/`, the hard blocker) is CLOSED --
-`fetch_models.sh` materializes it. GAP #3 is CLOSED -- a missing Peano/wheel now fails loud
-and early with the pre-warm command instead of confusingly at Step 3/4. GAP #5 was a false
-alarm -- the WER clips are committed to VCS. What remains: the manual submodule bootstrap
-(0.b), and the two supply-chain durability debts GAP #2 (~290 MB `mlir_aie` wheel) and GAP
-#4 (MLIR-distro + Peano dated assets), both OPEN and owned by the `proper-install-consumable`
-task. On THIS machine the warm uv cache + content-addressed toolchain cache make the clone
-build work end-to-end; a truly-bare machine still needs those assets vendored.
+The chain is hands-off on a warm-cache machine -- proven by a clean-clone from-scratch run
+(all CPU steps green + a 4-clip device A/B character-identical to the shipped baseline).
+GAP #1 (`models/parakeet/`, the hard blocker) is CLOSED -- `fetch_models.sh` materializes it.
+GAP-A (bare-clone `mlir-aie` bootstrap) is CLOSED -- `setup_route_b.sh` auto-inits + fetches
+by SHA. GAP #3 is CLOSED -- a missing Peano/wheel fails loud and early with the pre-warm
+command. GAP #5 was a false alarm -- the WER clips are committed to VCS. What remains: the
+two supply-chain durability debts GAP #2 (~290 MB `mlir_aie` wheel) and GAP #4 (MLIR-distro
++ Peano dated assets), both OPEN and owned by the `proper-install-consumable` task. On THIS
+machine the warm uv cache + content-addressed toolchain cache make the clone build work
+end-to-end; a truly-bare machine still needs those assets vendored.
