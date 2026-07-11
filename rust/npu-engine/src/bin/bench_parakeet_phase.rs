@@ -58,8 +58,11 @@ fn main() {
         )
         .expect("parse 16k/mono/16-bit WAV");
 
-        // Warmup pass (discarded): pages in kernels/caches so pass-1 is not an outlier.
-        let _ = asr.transcribe(&samples);
+        // Warmup pass (discarded for timing): pages in kernels/caches so pass-1 is not an
+        // outlier. We also print its transcript so Task 6 can run the WER-neutral gate (confirm
+        // instrumentation does not alter the text) without a separate binary.
+        let warm_txt = asr.transcribe(&samples);
+        println!("[PARAKEET_TEXT] clip={name} :: {warm_txt}");
 
         let mut reports: Vec<PhaseReport> = Vec::with_capacity(N_PASSES);
         let pkg_before = rapl_energy_uj();
