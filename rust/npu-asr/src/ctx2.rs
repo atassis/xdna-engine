@@ -218,15 +218,15 @@ impl SharedCtxA {
         // ONE resident kernel = the largest (N=3072) whole-array program; every op runs on it via its
         // per-N (and, modal, per-mode) instruction stream.
         let xclbin = if modal_int8 {
-            wa.join(format!("final_{PAD_M}x{KA}x{NA}_{mt}x{kt}x{nt}_8c_modalint8dq.xclbin"))
+            crate::kernel_registry::xclbin_path(&wa, &format!("{PAD_M}x{KA}x{NA}_{mt}x{kt}x{nt}_8c_modalint8dq"))
         } else if modal {
             // Default = the proven 2-branch modalsilu xclbin (rtp[0]: 0=identity, 1=silu). NPU_ENC_GELU_FUSED
             // opts into the 3-branch modalgelu superset (adds rtp[0]=2 = on-chip GELU for the Whisper encoder
             // fc1 fusion); silu/identity behavior is unchanged (validated baseline-identical without fusion).
             let tag = if std::env::var("NPU_ENC_GELU_FUSED").is_ok() { "modalgelu" } else { "modalsilu" };
-            wa.join(format!("final_{PAD_M}x{KAUG}x{NA}_{mt}x{kt}x{nt}_8c_{tag}.xclbin"))
+            crate::kernel_registry::xclbin_path(&wa, &format!("{PAD_M}x{KAUG}x{NA}_{mt}x{kt}x{nt}_8c_{tag}"))
         } else {
-            wa.join(format!("final_{PAD_M}x{KA}x{NA}_{mt}x{kt}x{nt}_8c.xclbin"))
+            crate::kernel_registry::xclbin_path(&wa, &format!("{PAD_M}x{KA}x{NA}_{mt}x{kt}x{nt}_8c"))
         };
         let kern = dev
             .load_kernel(xclbin.to_str().unwrap(), None)
@@ -256,7 +256,7 @@ impl SharedCtxA {
             const N_AIE_CORES: usize = 32; // 4 rows × 8 cols — one rtp[0] write packet each
             let sentinel = 1.0f32.to_le_bytes(); // the iron bakes 1.0f into every rtp[0] slot
             for &n in CTXA_STREAMS.iter() {
-                let insts = wa.join(format!("insts_{PAD_M}x{KA}x{n}_{mt}x{kt}x{nt}_8c_modalint8dq.txt"));
+                let insts = crate::kernel_registry::insts_path(&wa, &format!("{PAD_M}x{KA}x{n}_{mt}x{kt}x{nt}_8c_modalint8dq"));
                 let (instr_bytes, n_instr) = read_instr_words(&insts);
                 let offsets: Vec<usize> = (0..instr_bytes.len().saturating_sub(3))
                     .step_by(4)
@@ -280,7 +280,7 @@ impl SharedCtxA {
                 // mode: 1=silu, 0=identity (every N); 2=gelu only when NPU_ENC_GELU_FUSED + a stream exists
                 // (built for N=NA, the FFN fc1 width — the only gelu user). All modes run on the loaded xclbin.
                 for (mode, tag) in [(1u8, "modalsilu"), (0u8, "modalid"), (2u8, "modalgelu")] {
-                    let insts = wa.join(format!("insts_{PAD_M}x{KAUG}x{n}_{mt}x{kt}x{nt}_8c_{tag}.txt"));
+                    let insts = crate::kernel_registry::insts_path(&wa, &format!("{PAD_M}x{KAUG}x{n}_{mt}x{kt}x{nt}_8c_{tag}"));
                     if mode == 2 && (!gelu_enabled || !insts.exists()) {
                         continue; // gelu stream only loaded when opted-in + present (NA only)
                     }
@@ -290,7 +290,7 @@ impl SharedCtxA {
             }
         } else {
             for &n in CTXA_STREAMS.iter() {
-                let insts = wa.join(format!("insts_{PAD_M}x{KA}x{n}_{mt}x{kt}x{nt}_8c.txt"));
+                let insts = crate::kernel_registry::insts_path(&wa, &format!("{PAD_M}x{KA}x{n}_{mt}x{kt}x{nt}_8c"));
                 let (bo, n_instr) = load_stream(&insts);
                 streams.push((n, bo, n_instr));
             }

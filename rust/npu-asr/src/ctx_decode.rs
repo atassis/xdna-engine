@@ -182,8 +182,8 @@ impl CtxDecode {
 
         let wa = self.root.join(WA);
         let stem = format!("{M}x{k}x{n_pad}_{TILE}_{COLS}c");
-        let xclbin = wa.join(format!("final_{stem}.xclbin"));
-        let insts = wa.join(format!("insts_{stem}.txt"));
+        let crate::kernel_registry::KernelArtifacts { xclbin, insts } =
+            crate::kernel_registry::resolve(&wa, &stem);
 
         if !xclbin.exists() {
             return Err(format!(
@@ -373,8 +373,9 @@ impl CtxDecode {
             return Ok(Rc::clone(ak));
         }
         let dir = self.root.join(MHA_DIR);
-        let xclbin = dir.join(format!("final_mha_decode_{ATTN_S_MAX}.xclbin"));
-        let insts = dir.join(format!("insts_mha_decode_{ATTN_S_MAX}.txt"));
+        let stem = format!("mha_decode_{ATTN_S_MAX}");
+        let crate::kernel_registry::KernelArtifacts { xclbin, insts } =
+            crate::kernel_registry::resolve(&dir, &stem);
         if !xclbin.exists() {
             return Err(format!(
                 "ctxDecode::attn: missing MHA xclbin {} — build it with: \

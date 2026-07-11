@@ -257,8 +257,8 @@ impl WAEpilogue {
         let kaug = k + TILE;
         let suffix = format!("{PAD_M}x{kaug}x{n}_{TILE}x{TILE}x{TILE}_8c_{mode}");
         let wa = root.join(WA_SUBDIR);
-        let xclbin = wa.join(format!("final_{suffix}.xclbin"));
-        let insts = wa.join(format!("insts_{suffix}.txt"));
+        let crate::kernel_registry::KernelArtifacts { xclbin, insts } =
+            crate::kernel_registry::resolve(&wa, &suffix);
         let kern = dev
             .load_kernel(xclbin.to_str().unwrap(), None)
             .unwrap_or_else(|e| panic!("load {}: {e}", xclbin.display()));
@@ -439,8 +439,8 @@ impl ChainedFFN {
 
         // --- mm1: silu epilogue xclbin (K-augmented) ---
         let suffix1 = format!("{PAD_M}x{kaug1}x{n1}_{TILE}x{TILE}x{TILE}_8c_silu");
-        let xclbin1 = wa.join(format!("final_{suffix1}.xclbin"));
-        let insts1 = wa.join(format!("insts_{suffix1}.txt"));
+        let crate::kernel_registry::KernelArtifacts { xclbin: xclbin1, insts: insts1 } =
+            crate::kernel_registry::resolve(&wa, &suffix1);
         let kern1 = dev
             .load_kernel(xclbin1.to_str().unwrap(), None)
             .unwrap_or_else(|e| panic!("load {}: {e}", xclbin1.display()));
@@ -448,8 +448,8 @@ impl ChainedFFN {
 
         // --- mm2: PLAIN matmul xclbin (no mode suffix), f32 out ---
         let suffix2 = format!("{PAD_M}x{n1}x{n2}_{TILE}x{TILE}x{TILE}_8c");
-        let xclbin2 = wa.join(format!("final_{suffix2}.xclbin"));
-        let insts2 = wa.join(format!("insts_{suffix2}.txt"));
+        let crate::kernel_registry::KernelArtifacts { xclbin: xclbin2, insts: insts2 } =
+            crate::kernel_registry::resolve(&wa, &suffix2);
         let kern2 = dev
             .load_kernel(xclbin2.to_str().unwrap(), None)
             .unwrap_or_else(|e| panic!("load {}: {e}", xclbin2.display()));

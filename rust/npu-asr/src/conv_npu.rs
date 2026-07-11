@@ -41,8 +41,9 @@ impl ConvNpu {
         if let Some(b) = self.bands.borrow().get(&n) {
             return b.clone();
         }
-        let xclbin = self.wa.join(format!("final_mstat_512x768x{n}_16x32x32_8c.xclbin"));
-        let insts = self.wa.join(format!("insts_mstat_512x768x{n}_16x32x32_8c.txt"));
+        let stem = format!("mstat_512x768x{n}_16x32x32_8c");
+        let crate::kernel_registry::KernelArtifacts { xclbin, insts } =
+            crate::kernel_registry::resolve(&self.wa, &stem);
         let kern = self
             .dev
             .load_kernel(xclbin.to_str().unwrap(), None)

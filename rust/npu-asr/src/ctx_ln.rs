@@ -49,8 +49,9 @@ pub struct CtxLn {
 impl CtxLn {
     pub fn new(dev: &Rc<Device>, root: &Path) -> Rc<Self> {
         let dir = root.join(LN_SUBDIR);
-        let xclbin = dir.join(format!("final_ctxln_{LN_ROWS}x{LN_COLS}.xclbin"));
-        let insts = dir.join(format!("insts_ctxln_{LN_ROWS}x{LN_COLS}.txt"));
+        let stem = format!("ctxln_{LN_ROWS}x{LN_COLS}");
+        let crate::kernel_registry::KernelArtifacts { xclbin, insts } =
+            crate::kernel_registry::resolve(&dir, &stem);
         let kern = dev
             .load_kernel(xclbin.to_str().unwrap(), None)
             .unwrap_or_else(|e| panic!("load ctxLN {}: {e}", xclbin.display()));

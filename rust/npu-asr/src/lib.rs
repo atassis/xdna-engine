@@ -6,6 +6,7 @@
 //! `npu_asr_host`. Mirrors `npu_asr/fused.py` (the Python correctness oracle).
 
 pub mod weights;
+pub mod kernel_registry;
 pub mod engines;
 pub mod conv_npu;
 pub mod ctx_decode;
