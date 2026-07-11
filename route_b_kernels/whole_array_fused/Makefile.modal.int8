@@ -67,6 +67,52 @@ endif
 
 include ${srcdir}/../makefile-common
 
+# --- route_b override: the blessed instance's NEW matmul makefile-common dropped the
+# aiecc-from-MLIR flow -- its xclbin rule now drives @iron.jit with compile-only args
+# (--use-chess / --xclbin-path / --insts-path) that our MLIR-only generator rejects, and
+# it no longer defines KERNEL_CC / KERNEL_CFLAGS / kernels_dir / the mlir_target rule.
+# Re-supply the OLD generator -> .mlir -> aiecc flow so the int8 generator keeps working.
+# Idempotent (safe on shared checkout); keep ASCII-clean.
+ifeq ($(devicename),npu2)
+kernels_dir=${srcdir}/../../../../aie_kernels/aie2p
+KERNEL_CC=${PEANO_INSTALL_DIR}/bin/clang++
+KERNEL_CFLAGS=${PEANOWRAP2P_FLAGS}
+else
+kernels_dir=${srcdir}/../../../../aie_kernels/aie2
+KERNEL_CC=${PEANO_INSTALL_DIR}/bin/clang++
+KERNEL_CFLAGS=${PEANOWRAP2_FLAGS}
+endif
+
+# The emulate / bfp16_iree fast-tile defines (the new common no longer sets these).
+ifeq ($(emulate_bfloat16_mmul_with_bfp16),1)
+KERNEL_DEFINES += -DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16
+endif
+ifeq ($(bfp16_iree),1)
+KERNEL_DEFINES += -DBFP16_IREE
+endif
+
+aiecc_peano_flags=--no-xchesscc --no-xbridge --peano ${PEANO_INSTALL_DIR}
+# Prefer the wired fork-instance aiecc (AIECC_PATH from iron_env.sh); fall back to PATH.
+AIECC := $(if $(AIECC_PATH),$(AIECC_PATH),aiecc)
+
+# Generator args: reuse the makefile-common aieargs but drop the compile-only
+# --use-chess the MLIR-only generator does not accept (we never pass --xclbin-path).
+gen_args = $(subst --use-chess $(use_chess),,$(aieargs))
+
+# Pin insts to .txt (engine + Phase-3 kernel_registry expect insts_*.txt, not the new .bin).
+mlir_target := build/aie_${target_suffix}.mlir
+insts_target := build/insts_${target_suffix}.txt
+
+${mlir_target}: ${srcdir}/${aie_py_src}
+	mkdir -p ${@D}
+	python3 $< ${gen_args} --trace_size 0 > $@
+
+${xclbin_target}: ${mlir_target} ${kernels:%=build/%.o}
+	mkdir -p ${@D}
+	cd ${@D} && ${AIECC} --alloc-scheme=${buffer_aloc_flag} --aie-generate-xclbin --no-compile-host \
+	    --xclbin-name=$(notdir ${xclbin_target}) ${aiecc_peano_flags} \
+	    --aie-generate-npu-insts --npu-insts-name=$(notdir ${insts_target}) $(notdir ${mlir_target})
+
 # matmul object: i8 in, i32 acc.
 build/mm_${m}x${k}x${n}.o: ${kernels_dir}/mm.cc
 	mkdir -p ${@D}
