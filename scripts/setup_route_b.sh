@@ -75,6 +75,27 @@ if ! { have_aie && have_peano; }; then
   fi
 fi
 
+# Terminal guard (GAP #3): the tiers above WARN-and-continue on a cache/wheel miss, which under set -e
+# would otherwise surface as a confusing failure deep in the toolchain build (Step 3/4). Fail LOUD and
+# EARLY here instead. Idempotent: on the warm-cache path both checks pass and this is a silent no-op.
+if ! have_peano; then
+  echo "ERROR: Peano (llvm-aie) is missing -- $SITE/llvm-aie/bin/clang was not provided." >&2
+  echo "       The cp310 Peano wheel cannot install into this py3.14 venv, so it is supplied by copying" >&2
+  echo "       the unpacked llvm-aie tree out of the uv archive cache (~/.cache/uv/archive-v0), and that" >&2
+  echo "       cache entry is absent. Pre-warm it with a network fetch of the pinned version, e.g.:" >&2
+  echo "         uv pip install --python 3.14 \"$PEANO_PIN\" \\" >&2
+  echo "           --find-links https://github.com/Xilinx/llvm-aie/releases/expanded_assets/nightly" >&2
+  echo "       (this populates ~/.cache/uv/archive-v0 for the tree-copy), or provide a pre-warmed uv cache." >&2
+  exit 1
+fi
+if ! have_aie; then
+  echo "ERROR: the mlir_aie wheel ($MLIR_AIE_PIN) is not installed -- '.venv-iron import aie' fails." >&2
+  echo "       Its resolution needs a warm uv archive cache, a vendor/wheelhouse/ wheel, or the network" >&2
+  echo "       find-links index (which rotates dated assets out). Pre-warm the uv cache or vendor the" >&2
+  echo "       ~290 MB wheel into vendor/wheelhouse/ (scripts/build_wheelhouse.sh repacks it from the cache)." >&2
+  exit 1
+fi
+
 # 3. gcc-13/g++-13 shims -> real gcc (makefile-common hardcodes CC?=gcc-13; we have gcc16)
 mkdir -p .venv-iron/cc-shim
 ln -sf "$(command -v gcc)" .venv-iron/cc-shim/gcc-13

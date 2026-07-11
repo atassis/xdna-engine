@@ -9,11 +9,11 @@ Every step is tagged `[CPU]` (no NPU needed -- builds, exports, kernel compiles)
 "Produces", "success signal", and rough "time" are listed per step so you can tell a
 step worked before moving on.
 
-READ THIS FIRST: the chain is NOT yet 100% hands-off. Two steps (0.b and 7.b) require
-a manual command that no script performs today, and two dependency-fetch steps (2, 3)
-lean on assets that can rotate out of upstream indexes. See the GAP LIST and the
-Recreatability debts table at the end BEFORE you start -- they are the whole point of
-this document.
+READ THIS FIRST: the chain is now nearly hands-off. One step (0.b) still needs a manual
+command that no script performs today, and two dependency-fetch steps (2, 3) lean on
+assets that can rotate out of upstream indexes. GAP #1 (models/parakeet/), GAP #3 (silent
+Peano miss) and GAP #5 (WER clips) are CLOSED -- see the GAP LIST and the Recreatability
+debts table at the end BEFORE you start.
 
 ---
 
@@ -120,11 +120,14 @@ scripts/setup_route_b.sh
   (3) network find-links `latest-wheels-4`. On a truly cold machine where the uv cache is
   empty AND `vendor/wheelhouse/` is absent, tiers (1) and (2) both fail and you are relying
   on tier (3) -- see GAP #2 for how to pre-warm.
-- **Peano prerequisite (see GAP #3):** `llvm-aie` (Peano) ships only a cp310 wheel that
-  will NOT install into the py3.14 venv, so the script provides it by copying the unpacked
-  tree straight out of `~/.cache/uv/archive-v0`. If that cache entry is missing the script
-  only WARNS ("Peano binaries unavailable") and continues -- Peano is then silently
-  absent and Step 4 will fail. Pre-warm per GAP #3.
+- **Peano prerequisite (see GAP #3, CLOSED):** `llvm-aie` (Peano) ships only a cp310 wheel
+  that will NOT install into the py3.14 venv, so the script provides it by copying the
+  unpacked tree straight out of `~/.cache/uv/archive-v0`. The tree-copy still only WARNS on
+  a cache miss, but the script now ends with a TERMINAL GUARD: if
+  `.venv-iron/lib/python3.14/site-packages/llvm-aie/bin/clang` is still absent (or if the
+  `mlir_aie` wheel left `import aie` broken), it prints exactly what is missing + the
+  pre-warm command and `exit 1`s -- so the gap fails LOUD here, not confusingly at Step 3/4.
+  The warm-cache path is unaffected (both checks pass, guard is a no-op). Pre-warm per GAP #3.
 
 ---
 
@@ -195,34 +198,33 @@ scripts/fetch_models.sh                 # set FETCH_EXTRA=0 to skip the 11 non-A
 ```
 - **Produces:** the HF hub cache populated with `istupakov/parakeet-tdt-0.6b-v3-onnx` +
   `istupakov/gigaam-v3-onnx` (and, unless `FETCH_EXTRA=0`, 11 extra repos for other-arch
-  parity tasks -- NOT needed for ASR serving), and the serve-ready
-  `artifacts/parakeet/{preprocessor.onnx (nemo128 128-mel), decoder_joint.onnx, vocab.txt}`.
-- **Success signal:** prints `[parakeet] assembled .../artifacts/parakeet : ...` and `Done.`
-- **Time:** 5-20 min depending on `FETCH_EXTRA` (the parakeet repo alone is ~2.5 GB).
-- **Does NOT produce:** `artifacts/parakeet/encoder/` (the weight arena -- Step 7) or
-  `models/parakeet/encoder-model.onnx` (Step 7.b, MANUAL). The HF cache near-empty on a
-  clean box, so this is real downloads (set `HF_HUB_OFFLINE=1` only if already cached).
+  parity tasks -- NOT needed for ASR serving), the serve-ready
+  `artifacts/parakeet/{preprocessor.onnx (nemo128 128-mel), decoder_joint.onnx, vocab.txt}`,
+  and (GAP #1 fix) the fp32 encoder source `models/parakeet/{encoder-model.onnx,
+  encoder-model.onnx.data, decoder_joint-model.onnx, vocab.txt}` that Step 7 consumes,
+  `cp -L`-dereferenced from the HF snapshot's symlink farm under their ORIGINAL upstream names.
+- **Success signal:** prints `[parakeet] assembled .../artifacts/parakeet : ...`,
+  `[parakeet-models] materialized .../models/parakeet : ...`, and `Done.`
+- **Time:** 5-20 min depending on `FETCH_EXTRA` (the parakeet repo alone is ~2.5 GB); the
+  `models/parakeet/` materialize adds a local ~2.4 GB `cp` from the cache.
+- **Does NOT produce:** `artifacts/parakeet/encoder/` (the weight arena -- Step 7). The HF
+  cache is near-empty on a clean box, so this is real downloads (set `HF_HUB_OFFLINE=1` only
+  if already cached).
 
 ---
 
 ## Step 7 -- Build the Parakeet encoder weight arena  [CPU]
 
-### 7.b  Materialize `models/parakeet/encoder-model.onnx` (MANUAL -- see GAP #1)
+### 7.b  Materialize `models/parakeet/encoder-model.onnx` (AUTOMATED -- GAP #1 CLOSED)
 `extract_parakeet_encoder.py` reads `models/parakeet/encoder-model.onnx` (+ its external
-`.onnx.data`), but NO script creates `models/parakeet/`. On the reference box this was a
-migration artifact. Recreate it by dereferencing the two HF-cache symlinks into
-`models/parakeet/` WITH THEIR ORIGINAL NAMES (the `.onnx` references the `.data` by
-relative filename):
-```bash
-snap=$(ls -d ~/.cache/huggingface/hub/models--istupakov--parakeet-tdt-0.6b-v3-onnx/snapshots/*/ | head -1)
-mkdir -p models/parakeet
-cp -L "$snap/encoder-model.onnx"       models/parakeet/encoder-model.onnx
-cp -L "$snap/encoder-model.onnx.data"  models/parakeet/encoder-model.onnx.data
-cp -L "$snap/vocab.txt"                models/parakeet/vocab.txt
-cp -L "$snap/decoder_joint-model.onnx" models/parakeet/decoder_joint-model.onnx
-```
+`.onnx.data`). This directory is now produced by `prep_parakeet_models()` in Step 6's
+`fetch_models.sh` (it `cp -L`-derefs `encoder-model.onnx`, `encoder-model.onnx.data`,
+`decoder_joint-model.onnx`, `vocab.txt` from the HF snapshot into `models/parakeet/` under
+their original names; the `.onnx` references the `.data` by relative filename, so both land
+side by side). No manual step is required. If you skipped Step 6 or the snapshot was not
+cached, re-run `scripts/fetch_models.sh` -- it is idempotent.
 - **Produces:** `models/parakeet/encoder-model.onnx` (+ `.onnx.data`, ~2.4 GB).
-- **Success signal:** both files present; total ~2.5 GB.
+- **Success signal:** both files present; total ~2.5 GB (Step 6 prints the `materialized` line).
 
 ### 7.a  Extract the arena
 ```bash
@@ -236,18 +238,20 @@ cp -L "$snap/decoder_joint-model.onnx" models/parakeet/decoder_joint-model.onnx
 
 ---
 
-## Step 8 -- WER / character-identity clips  [CPU, network]
+## Step 8 -- WER / character-identity clips  [NO ACTION -- from VCS]
 
-The install test (Step 11) and the 4-clip A/B gate (Step 12) read
-`artifacts/wer_clips/*.wav`. NO script in the deploy chain invokes the fetcher, so run it
-explicitly (see GAP #5):
+GAP #5 was a FALSE ALARM: the clips the install test (Step 11) and the 4-clip A/B gate
+(Step 12) read are COMMITTED to git, so a clean clone already has them -- there is no fetch
+step and no network needed here.
 ```bash
-.venv-export/bin/python scripts/fetch_wer_clips.py
+git ls-files artifacts/wer_clips/   # 24 tracked files, verify present in your clone
 ```
-- **Produces:** `artifacts/wer_clips/{en_01..en_04,ru_01..ru_13}.wav` + `refs.json` +
-  `SOURCE.md` (FLEURS dev, CC-BY-4.0, range-streamed; converted to 16 kHz mono via ffmpeg).
-- **Success signal:** prints `[refs] N entries -> refs.json`; the wav files exist.
-- **Time:** 1-3 min. **Needs:** `ffmpeg`/`ffprobe`, network to huggingface.co datasets.
+- **Already present from the clone:** `artifacts/wer_clips/{en_01..en_04,ru_01..ru_13}.wav`
+  (17 wavs) + `refs.json` + `SOURCE.md` + the baseline JSONs
+  (`parakeet_eval_results.json`, `int8_eval_results.json`, `whisper_*`, `*_oracle.json`).
+- **Note:** `scripts/fetch_wer_clips.py` still exists to REGENERATE the clips from FLEURS
+  (CC-BY-4.0, 16 kHz mono via ffmpeg) if you ever need to refresh them, but the deploy chain
+  does not need to run it -- the tracked copies are the shipped-baseline reference.
 
 ---
 
@@ -333,7 +337,7 @@ automated from a clean clone.
 
 | Gitignored dep | Produced by | Automated? |
 |---|---|---|
-| `.venv-iron` (py3.14 AIE venv) | Step 1 `setup_route_b.sh` | AUTO -- but the `mlir_aie` wheel + Peano tree lean on a warm uv cache / wheelhouse / a rotating network index (GAP #2, #3). |
+| `.venv-iron` (py3.14 AIE venv) | Step 1 `setup_route_b.sh` | AUTO -- the `mlir_aie` wheel + Peano tree still lean on a warm uv cache / wheelhouse / rotating network index (GAP #2 OPEN), but a miss now HARD-FAILS loudly with the pre-warm command (GAP #3 CLOSED) instead of silently absenting Peano. |
 | `mlir-aie/` submodule on fork branch | Step 0.b (manual) / re-ensured by Step 1 | PARTIAL -- Step 1 does fork remote-add + fetch-by-SHA + checkout, but only if a `mlir-aie/.git` already exists; the initial bootstrap from a bare clone needs the manual 0.b (GAP #1). |
 | `vendor/wheelhouse/mlir_aie-*.whl` | Step 1 -> `build_wheelhouse.sh` | PARTIAL -- rebuildable ONLY from a warm uv archive cache; empty cache => hard error, falls back to a rotating network index (GAP #2). |
 | MLIR core distro (`~/.cache/xdna2-build/mlir-distro/...`) | Step 2 `fetch_mlir_distro.sh` | AUTO -- needs authenticated `gh`; pin is a dated release asset (GAP #4). |
@@ -341,9 +345,9 @@ automated from a clean clone.
 | `.venv-export` (py3.12 export venv) | Step 5 `setup_export_venv.sh` | AUTO (network: PyPI + torch-cpu index). |
 | HF model cache (parakeet, gigaam) | Step 6 `fetch_models.sh` | AUTO (network: HF hub). |
 | `artifacts/parakeet/{preprocessor,decoder_joint,vocab}` | Step 6 `fetch_models.sh` (`prep_parakeet_artifacts`) | AUTO. |
-| `models/parakeet/encoder-model.onnx(.data)` | Step 7.b (manual cp -L from HF cache) | MANUAL -- no script produces it (GAP #1). |
-| `artifacts/parakeet/encoder/` (weight arena) | Step 7.a `extract_parakeet_encoder.py` | AUTO -- but depends on the manual 7.b input. |
-| `artifacts/wer_clips/*.wav` + `refs.json` | Step 8 `fetch_wer_clips.py` | AUTO but UNWIRED -- not called by any deploy script; must be run by hand (GAP #5). Needs ffmpeg. |
+| `models/parakeet/encoder-model.onnx(.data)` | Step 6 `fetch_models.sh` (`prep_parakeet_models`) | AUTO -- `cp -L`-derefs from the HF snapshot under original names (GAP #1 CLOSED). |
+| `artifacts/parakeet/encoder/` (weight arena) | Step 7.a `extract_parakeet_encoder.py` | AUTO -- input now auto-produced by Step 6. |
+| `artifacts/wer_clips/*.wav` + `refs.json` + baseline JSONs | TRACKED IN VCS (committed) | AUTO -- present from the clone, no fetch step (GAP #5 was a false alarm; `fetch_wer_clips.py` only regenerates). |
 | `models/gigaam_v3_encoder_static.onnx` + `models/quant/*` | Step 10 (optional) | AUTO (optional scenario). |
 | Parakeet resident xclbins + insts (under `mlir-aie/.../whole_array/build/`) | Step 9 `build_parakeet_kernels.sh` | AUTO (needs Step 4 green). |
 | `rust/target/` release binaries + onnxruntime lib | Step 11 `install.sh` | AUTO (fetches onnxruntime during build). |
@@ -352,24 +356,29 @@ automated from a clean clone.
 
 ## GAP LIST (ordered by severity)
 
-### GAP #1 -- `models/parakeet/encoder-model.onnx` has NO automated producer  [HIGH]
-- **What breaks:** Step 7 `extract_parakeet_encoder.py` hard-reads
-  `models/parakeet/encoder-model.onnx` (+ external `.onnx.data`). `fetch_models.sh`
-  populates only the HF cache and `artifacts/parakeet/{preprocessor,decoder_joint,vocab}`
-  -- it never creates `models/parakeet/`. On a clean clone Step 7 fails with a missing-file
-  error, so the encoder arena (the core NPU weights) is never built. The in-file comment
-  ("external-data symlink deref'd into models/parakeet/") confirms this was a hand-done
-  migration step.
-- **Also affects:** the initial bare-clone submodule bootstrap (0.b) -- `git submodule
-  update --init` targets the Xilinx URL, which does not carry the pinned fork commit; only
-  the fork remote does. Robustly handled by the explicit fetch-by-SHA in 0.b/Step 1, but a
-  naive `submodule update --init` alone lands the wrong branch.
-- **Suggested fix:** add a `prep_parakeet_models()` to `fetch_models.sh` that
-  `cp -L`'s `encoder-model.onnx` + `.onnx.data` (+ vocab + decoder_joint) from the HF
-  snapshot into `models/parakeet/` (the exact commands are in Step 7.b). Cheap, idempotent,
-  closes the biggest hole.
+### GAP #1 -- `models/parakeet/encoder-model.onnx` has NO automated producer  [HIGH -- CLOSED]
+- **Was:** Step 7 `extract_parakeet_encoder.py` hard-reads
+  `models/parakeet/encoder-model.onnx` (+ external `.onnx.data`), but `fetch_models.sh`
+  populated only the HF cache and `artifacts/parakeet/{preprocessor,decoder_joint,vocab}`
+  -- it never created `models/parakeet/`. On a clean clone Step 7 failed with a missing-file
+  error, so the encoder arena (the core NPU weights) was never built.
+- **Fix (DONE):** added `prep_parakeet_models()` to `fetch_models.sh`, called right after
+  `prep_parakeet_artifacts`. It `cp -L`-derefs `encoder-model.onnx`, `encoder-model.onnx.data`,
+  `decoder_joint-model.onnx`, `vocab.txt` from the HF snapshot into `models/parakeet/` under
+  their original upstream names (so the `.onnx`'s relative `.data` reference resolves).
+  Idempotent (`cp -Lf` overwrites in place). Verified: the dereferenced file sizes match the
+  on-box `models/parakeet/` byte-for-byte (encoder 41770866, decoder_joint 72520893, vocab
+  93939) and the filenames are exactly what `extract_parakeet_encoder.py` reads.
+- **Still note (0.b):** the initial bare-clone submodule bootstrap remains manual -- `git
+  submodule update --init` targets the Xilinx URL, which does not carry the pinned fork
+  commit; only the fork remote does. Step 1's explicit fetch-by-SHA handles it once a
+  `mlir-aie/.git` exists, but the first bootstrap still needs the manual 0.b sequence.
 
-### GAP #2 -- pinned `mlir_aie` wheel depends on a warm uv cache OR a rotating index  [HIGH]
+### GAP #2 -- pinned `mlir_aie` wheel depends on a warm uv cache OR a rotating index  [HIGH -- OPEN, owned by `proper-install-consumable`]
+- **Owner note:** durably hosting the ~290 MB `mlir_aie` wheel (release asset / LFS / object
+  store) is the `proper-install-consumable` task's job. On THIS machine the warm uv cache +
+  content-addressed toolchain cache make the clone build work; a truly-bare machine needs the
+  wheel vendored. GAP #3's guard now makes an absence fail loud instead of silent.
 - **What breaks:** Step 1 installs `mlir_aie==0.0.1.2026033104+e4f35d6`. Its resolution
   order is (1) offline uv archive cache, (2) `vendor/wheelhouse/` (gitignored; rebuilt by
   `build_wheelhouse.sh` -- which itself ONLY repacks from the uv archive cache and hard-errors
@@ -384,20 +393,26 @@ automated from a clean clone.
   provisioning command in `toolchain.lock` next to the pin. Do NOT rely on the nightly
   index staying populated.
 
-### GAP #3 -- Peano (`llvm-aie`) is provided by copy-from-uv-cache, which can be empty  [HIGH]
-- **What breaks:** the cp310 Peano wheel cannot install into py3.14, so Step 1 copies the
-  unpacked `llvm-aie` tree out of `~/.cache/uv/archive-v0`. If that cache entry is absent
-  the script only prints `WARNING: llvm-aie tree not found ... Peano binaries unavailable`
-  and continues (set -e safe) -- Peano is then silently missing and Step 3/Step 4 fail to
-  compile kernels. Nothing in the chain performs the network install that would warm the
-  cache in the first place.
-- **Suggested fix:** add an explicit pre-warm to `setup_route_b.sh` (or DEPLOY): e.g.
-  `uv pip install --python 3.14 "llvm-aie==${PEANO_DIST#llvm_aie-}" --find-links
-  https://github.com/Xilinx/llvm-aie/releases/expanded_assets/nightly` to populate the
-  archive cache before the tree-copy, and turn the "unavailable" warning into a hard error
-  so the gap fails loudly instead of surfacing 2 steps later.
+### GAP #3 -- Peano (`llvm-aie`) silently missing on empty cache  [HIGH -- CLOSED]
+- **Was:** the cp310 Peano wheel cannot install into py3.14, so Step 1 copies the unpacked
+  `llvm-aie` tree out of `~/.cache/uv/archive-v0`. If that cache entry was absent the script
+  only printed `WARNING: ... Peano binaries unavailable` and continued (set -e safe) -- Peano
+  was then silently missing and Step 3/Step 4 failed confusingly two steps later.
+- **Fix (DONE):** added a TERMINAL GUARD to `setup_route_b.sh` after all Peano-provisioning
+  tiers. If `have_peano` (`.venv-iron/lib/python3.14/site-packages/llvm-aie/bin/clang`) is
+  still false, it prints exactly what is missing + the pre-warm command
+  (`uv pip install --python 3.14 "$PEANO_PIN" --find-links .../nightly`) and `exit 1`s. A
+  matching guard hard-fails if the `mlir_aie` wheel left `import aie` broken. The warm-cache
+  path is untouched -- both checks pass and the guard is a silent no-op (verified against the
+  current `.venv-iron`: peano clang present, `import aie` OK). This does NOT itself perform a
+  network fetch (the pre-warm is still a manual/documented step -- GAP #2's supply-chain
+  concern), it just converts a silent absence into a loud, actionable early failure.
 
-### GAP #4 -- MLIR distro + Peano pins are dated release/nightly assets  [MEDIUM]
+### GAP #4 -- MLIR distro + Peano pins are dated release/nightly assets  [MEDIUM -- OPEN, owned by `proper-install-consumable`]
+- **Owner note:** mirroring the pinned MLIR-distro wheel and the Peano/`llvm-aie` dated
+  nightly assets to a project-owned durable location is the `proper-install-consumable`
+  task's job. THIS machine works off the warm uv cache + content-addressed toolchain cache;
+  a truly-bare machine needs these two assets vendored.
 - **What breaks:** Step 2 downloads `MLIR_DISTRO_WHEEL=mlir-23.0.0.2026060107+068c6c5c` and
   Peano `21.0.0.2026062301+cb664e8c` from upstream release/nightly tags. Dated nightly
   assets are pruned upstream over time; once pruned, `gh release download` / find-links
@@ -407,15 +422,15 @@ automated from a clean clone.
   asset / object store) and point the fetch scripts there with the upstream index as a
   fallback, not the primary.
 
-### GAP #5 -- WER clips are needed by the gates but never fetched by the chain  [MEDIUM]
-- **What breaks:** Step 11's `test_install.sh` defaults to
-  `artifacts/wer_clips/ru_01.wav`, and the Step 12 character-identity A/B uses
-  `en_01/en_02/en_03/ru_02`. No install/deploy script calls `fetch_wer_clips.py`, so on a
-  clean clone the verify gates fail with "sample clip not found". (`quantize_encoder_static.py`
-  in the optional GigaAM path also reads these clips for calibration.)
-- **Suggested fix:** either call `fetch_wer_clips.py` from `fetch_models.sh` (it is the
-  natural "get all inputs" step) or add it as an explicit numbered step in the runbook
-  (done here as Step 8). Needs `ffmpeg` + network to HF datasets.
+### GAP #5 -- WER clips "never fetched by the chain"  [MEDIUM -- CLOSED, was a false alarm]
+- **Verdict:** NOT a gap. `git ls-files artifacts/wer_clips/` returns 24 TRACKED files -- all
+  17 wavs (`en_01..en_04`, `ru_01..ru_13`), `refs.json`, `SOURCE.md`, and the baseline JSONs
+  (`parakeet_eval_results.json`, `int8_eval_results.json`, `whisper_npu_wer_{npu,onnx}.json`,
+  `whisper_small_oracle.json`). A clean clone ALREADY has them; the Step 11/12 gates and the
+  GigaAM calibration read straight from the checkout. No fetch step, no network needed.
+- **`fetch_wer_clips.py`** remains only as a REGENERATOR (re-pull FLEURS, CC-BY-4.0, 16 kHz
+  mono via ffmpeg) if the reference set ever needs refreshing -- it is intentionally not in
+  the deploy chain, because the committed copies ARE the shipped-baseline reference.
 
 ### GAP #6 -- systemd unit hardcodes `WorkingDirectory=$REPO`; xclbins are relative  [LOW]
 - **What breaks nothing today, but is fragile:** `install.sh` writes
@@ -432,10 +447,11 @@ automated from a clean clone.
 
 ## Bottom line
 
-The chain is ~85% automated. Four gaps stand between a clean clone and a zero-touch run:
-one is a trivial-to-fix missing copy step that is nonetheless a HARD blocker (GAP #1,
-`models/parakeet/`), and three are supply-chain durability risks (GAP #2/#3/#4) where the
-build depends on upstream nightly/dated assets or a warm local cache that a fresh machine
-lacks. GAP #5 blocks only the verify gates and is a one-line wiring fix. None are deep
-architectural problems -- but GAP #1 and the wheel/Peano pre-warm MUST be resolved (or the
-assets vendored) before a genuine clean-clone run can succeed unattended.
+The chain is now ~95% automated. GAP #1 (`models/parakeet/`, the hard blocker) is CLOSED --
+`fetch_models.sh` materializes it. GAP #3 is CLOSED -- a missing Peano/wheel now fails loud
+and early with the pre-warm command instead of confusingly at Step 3/4. GAP #5 was a false
+alarm -- the WER clips are committed to VCS. What remains: the manual submodule bootstrap
+(0.b), and the two supply-chain durability debts GAP #2 (~290 MB `mlir_aie` wheel) and GAP
+#4 (MLIR-distro + Peano dated assets), both OPEN and owned by the `proper-install-consumable`
+task. On THIS machine the warm uv cache + content-addressed toolchain cache make the clone
+build work end-to-end; a truly-bare machine still needs those assets vendored.

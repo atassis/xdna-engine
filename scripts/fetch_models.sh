@@ -63,11 +63,32 @@ prep_parakeet_artifacts() {
   echo "[parakeet] assembled $dst : preprocessor.onnx(nemo128 128-mel) + decoder_joint.onnx + vocab.txt"
 }
 
+# Materialize models/parakeet/ from the HF snapshot with the ORIGINAL filenames that
+# extract_parakeet_encoder.py hard-reads (models/parakeet/encoder-model.onnx + its external
+# encoder-model.onnx.data; the .onnx references the .data by RELATIVE filename, so both must
+# land side by side under their upstream names). HF snapshots are symlink farms into the blob
+# cache, so cp -L dereferences to real files. Idempotent: cp -f overwrites in place. This closes
+# the GAP #1 recreatability hole (previously a hand-done migration step, no producer in the chain).
+prep_parakeet_models() {
+  local snap dst
+  snap=$(ls -d "$HOME"/.cache/huggingface/hub/models--istupakov--parakeet-tdt-0.6b-v3-onnx/snapshots/*/ 2>/dev/null | head -n1)
+  if [ -z "$snap" ]; then echo "[parakeet-models] HF snapshot not found -- ASR fetch must run first"; return 1; fi
+  dst="$REPO/models/parakeet"; mkdir -p "$dst"
+  cp -Lf "$snap/encoder-model.onnx"       "$dst/encoder-model.onnx"        # fp32 encoder graph (~42 MB)
+  cp -Lf "$snap/encoder-model.onnx.data"  "$dst/encoder-model.onnx.data"   # external weights (~2.4 GB)
+  cp -Lf "$snap/decoder_joint-model.onnx" "$dst/decoder_joint-model.onnx"  # keep upstream name here
+  cp -Lf "$snap/vocab.txt"                "$dst/vocab.txt"
+  echo "[parakeet-models] materialized $dst : encoder-model.onnx(+.data) + decoder_joint-model.onnx + vocab.txt"
+}
+
 echo "== ASR pipeline models =="
 for r in "${ASR_REPOS[@]}"; do fetch "$r"; done
 
 echo "== assemble parakeet serving artifacts =="
 prep_parakeet_artifacts
+
+echo "== materialize parakeet fp32 encoder source (models/parakeet/) =="
+prep_parakeet_models
 
 if [ "${FETCH_EXTRA:-1}" = "1" ]; then
   echo "== extended model set (set FETCH_EXTRA=0 to skip) =="
