@@ -59,14 +59,25 @@ impl FastConformerEncoder {
             let _h = PhaseScope::new("ln", Bucket::Host);
             layernorm(x, &b.v(norm_w), &b.v(norm_b))
         };
-        prof::phase::set_stage(stage);
-        let mut h = self.mm(&n, &b.m(l1), &format!("{blk}.{tag}.l1")); // [T, DFF]
+        // ff_wprep: materialize the (T'-independent) FFN weight matrix for mm(). `b.m()` clones the
+        // whole [D,DFF]/[DFF,D] array out of the weight map + reifies its layout -- pure host data
+        // movement (no math, no device). Kept as a block-local temporary that drops right after its
+        // mm, so its lifetime matches the original mm-arg temporary (no extra weight held live =>
+        // timing behavior unchanged; the scope only NAMES the span that was falling into residual).
+        let mut h = {
+            let w1 = { let _wp = PhaseScope::new("ff_wprep", Bucket::Marshal); b.m(l1) };
+            prof::phase::set_stage(stage);
+            self.mm(&n, &w1, &format!("{blk}.{tag}.l1")) // [T, DFF]
+        };
         {
             let _h = PhaseScope::new("ff_act", Bucket::Host);
             silu_inplace(&mut h);
         }
-        prof::phase::set_stage(stage);
-        self.mm(&h, &b.m(l2), &format!("{blk}.{tag}.l2")) // [T, D]
+        {
+            let w2 = { let _wp = PhaseScope::new("ff_wprep", Bucket::Marshal); b.m(l2) };
+            prof::phase::set_stage(stage);
+            self.mm(&h, &w2, &format!("{blk}.{tag}.l2")) // [T, D]
+        }
     }
 
     pub fn weights(&self) -> &ParakeetWeights {
@@ -131,25 +142,48 @@ impl FastConformerEncoder {
         let (h, dk, d) = (self.cfg.n_heads, self.cfg.head_dim, self.cfg.hidden);
         let t = x.nrows();
         let p = pos_enc.nrows(); // 2T-1
+        // mhsa_wprep: materialize each (T'-independent) attention projection weight for its mm().
+        // Each `b.m()` clones the whole [D,D]/[P,D] matrix out of the weight map -- pure host data
+        // movement (no math, no device). Each qkv/pos weight is a block-local temporary that drops
+        // right after its mm (matching the original mm-arg temporary lifetimes); only the tiny
+        // pos_bias_u/v (consumed later in the score loop) are held, exactly as the original. LEAF
+        // Marshal spans that previously fell into the report-level residual.
         prof::phase::set_stage("mhsa_qkv");
-        let q = self.mm(x, &b.m("self_attn.linear_q.weight"), &format!("{blk}.q")); // [T, D]
+        let q = {
+            let w = { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_q.weight") };
+            self.mm(x, &w, &format!("{blk}.q")) // [T, D]
+        };
         prof::phase::set_stage("mhsa_qkv");
-        let k = self.mm(x, &b.m("self_attn.linear_k.weight"), &format!("{blk}.k"));
+        let k = {
+            let w = { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_k.weight") };
+            self.mm(x, &w, &format!("{blk}.k"))
+        };
         prof::phase::set_stage("mhsa_qkv");
-        let v = self.mm(x, &b.m("self_attn.linear_v.weight"), &format!("{blk}.v"));
+        let v = {
+            let w = { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_v.weight") };
+            self.mm(x, &w, &format!("{blk}.v"))
+        };
         prof::phase::set_stage("mhsa_pos");
-        let pm = self.mm(pos_enc, &b.m("self_attn.linear_pos.weight"), &format!("{blk}.pos")); // [P, D]
-        let ubias = b.m("self_attn.pos_bias_u"); // [H, DK]
-        let vbias = b.m("self_attn.pos_bias_v");
+        let pm = {
+            let w = { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_pos.weight") };
+            self.mm(pos_enc, &w, &format!("{blk}.pos")) // [P, D]
+        };
+        let (ubias, vbias) = {
+            let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal);
+            (b.m("self_attn.pos_bias_u"), b.m("self_attn.pos_bias_v")) // [H, DK] each
+        };
         let scale = (dk as f32).sqrt();
 
         // assemble bd_all [H, T, P] then rel_shift -> [H, T, T]
-        let mut bd_all = Array3::<f32>::zeros((h, t, p));
-        let mut ac_all = Array3::<f32>::zeros((h, t, t));
+        let (mut bd_all, mut ac_all);
         {
             // Per-head QK^T (ac) + QV.pos (bd) score matrices are host ndarray dots (not self.mm):
-            // charged to mhsa_scores. Not one of the plan's named labels; see task report.
+            // charged to mhsa_scores. Not one of the plan's named labels; see task report. The
+            // score-buffer zeros allocations are folded into this scope (were previously an
+            // un-scoped span leaking to the report-level residual).
             let _h = PhaseScope::new("mhsa_scores", Bucket::Host);
+            bd_all = Array3::<f32>::zeros((h, t, p));
+            ac_all = Array3::<f32>::zeros((h, t, t));
             for hh in 0..h {
                 let col = hh * dk;
                 // per-head slices
@@ -209,23 +243,38 @@ impl FastConformerEncoder {
         }
         ctx
         });
+        let wout = { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_out.weight") };
         prof::phase::set_stage("mhsa_qkv");
-        self.mm(&ctx, &b.m("self_attn.linear_out.weight"), &format!("{blk}.out"))
+        self.mm(&ctx, &wout, &format!("{blk}.out"))
     }
 
     fn conv_module(&self, x: &Array2<f32>, blk: usize) -> Array2<f32> {
         let b = self.w.block(blk);
         let d = self.cfg.hidden;
         let t = x.nrows();
-        let pw1 = b.m3("conv.pointwise_conv1.weight"); // [2D, D, 1]
-        let pw1 = pw1.index_axis(Axis(2), 0).to_owned(); // [2D, D]
-        let pw2 = b.m3("conv.pointwise_conv2.weight").index_axis(Axis(2), 0).to_owned(); // [D, D]
-        let dw3 = b.m3("conv.depthwise_conv.weight"); // [D, 1, 9]
-        let taps = dw3.index_axis(Axis(1), 0).to_owned(); // [D, 9]
-        let dwb = b.v("conv.depthwise_conv.bias");
+        // conv_wprep: materialize + reshape the (T'-independent) conv weights for mm(). `b.m3()`
+        // clones the whole [2D,D,1]/[D,D,1]/[D,1,9] tensor out of the weight map; `index_axis(..)
+        // .to_owned()` drops the singleton dim. Pure host data movement (no math, no device). These
+        // owned arrays already had whole-module lifetime in the original, so scoping them here does
+        // NOT extend any lifetime -- it only NAMES the clones that were falling into the residual.
+        let (pw1, pw2, taps, dwb) = {
+            let _wp = PhaseScope::new("conv_wprep", Bucket::Marshal);
+            let pw1 = b.m3("conv.pointwise_conv1.weight"); // [2D, D, 1]
+            let pw1 = pw1.index_axis(Axis(2), 0).to_owned(); // [2D, D]
+            let pw2 = b.m3("conv.pointwise_conv2.weight").index_axis(Axis(2), 0).to_owned(); // [D, D]
+            let dw3 = b.m3("conv.depthwise_conv.weight"); // [D, 1, 9]
+            let taps = dw3.index_axis(Axis(1), 0).to_owned(); // [D, 9]
+            let dwb = b.v("conv.depthwise_conv.bias");
+            (pw1, pw2, taps, dwb)
+        };
 
         prof::phase::set_stage("conv_pw");
-        let h = self.mm(x, &pw1.t().to_owned(), &format!("{blk}.pw1")); // [T, 2D] (pw1.T = [D, 2D])
+        // pw1.t().to_owned() = the [D, 2D] transpose into mm()'s [K,N] layout: a block-local temporary
+        // that drops right after its mm (same lifetime as the original mm-arg temporary). LEAF Marshal.
+        let h = {
+            let pw1_t = { let _wp = PhaseScope::new("conv_wprep", Bucket::Marshal); pw1.t().to_owned() };
+            self.mm(x, &pw1_t, &format!("{blk}.pw1")) // [T, 2D] (pw1.T = [D, 2D])
+        };
         // GLU: a * sigmoid(g)
         let glu = prof::time("glu", || {
             let _h = PhaseScope::new("conv_glu", Bucket::Host);
@@ -247,12 +296,18 @@ impl FastConformerEncoder {
             dwc.t().to_owned() // [T, D]
         });
         prof::phase::set_stage("conv_pw");
-        self.mm(&back, &pw2.t().to_owned(), &format!("{blk}.pw2"))
+        let pw2_t = { let _wp = PhaseScope::new("conv_wprep", Bucket::Marshal); pw2.t().to_owned() }; // [D, D]
+        self.mm(&back, &pw2_t, &format!("{blk}.pw2"))
     }
 
     fn block(&self, x: &Array2<f32>, blk: usize, pos_enc: &Array2<f32>) -> Array2<f32> {
         let b = self.w.block(blk);
-        let mut x = x.clone();
+        // block_io: the [T', D] residual-stream clone at block entry (a working copy the residual
+        // adds mutate). T'-dependent host data movement; scoped LEAF so it doesn't leak to residual.
+        let mut x = {
+            let _h = PhaseScope::new("block_io", Bucket::Marshal);
+            x.clone()
+        };
         let ff1 = prof::time("ff", || self.feed_forward(&x, b, blk, "ff1", "norm_feed_forward1.weight", "norm_feed_forward1.bias",
                                     "feed_forward1.linear1.weight", "feed_forward1.linear2.weight"));
         {
@@ -292,8 +347,13 @@ impl FastConformerEncoder {
     /// Encoder block stack: x [T, hidden] -> [T, hidden]. (Contract entry point;
     /// valid_len is the unpadded length — masking is a no-op for full-length inputs.)
     pub fn forward_last(&self, x: &Array2<f32>, _valid_len: usize) -> Array2<f32> {
-        let pos_enc = rel_pos_encoding(x.nrows(), self.cfg.hidden);
-        let mut x = x.clone();
+        // enc_setup: once-per-transcribe relative-position-encoding table build + input clone,
+        // outside the 24-block loop. Scoped LEAF (host math + data movement, no mm()) so it lands
+        // in a named stage rather than the report-level residual.
+        let (pos_enc, mut x) = {
+            let _h = PhaseScope::new("enc_setup", Bucket::Host);
+            (rel_pos_encoding(x.nrows(), self.cfg.hidden), x.clone())
+        };
         for blk in 0..self.cfg.n_layers {
             x = self.block(&x, blk, &pos_enc);
         }
