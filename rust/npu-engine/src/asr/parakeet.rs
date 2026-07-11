@@ -9,6 +9,7 @@ use ndarray::Array2;
 use npu_onnx::{Env, Session, Tensor};
 use npu_parakeet::config::ModelCfg;
 use npu_parakeet::encoder::FastConformerEncoder;
+use npu_parakeet::prof::phase::{Bucket, PhaseScope};
 
 use crate::config::ScenarioConfig;
 use crate::pipeline::{AsrModel, Encoder};
@@ -128,31 +129,50 @@ impl ParakeetAsr {
 
 impl AsrModel for ParakeetAsr {
     fn transcribe(&self, samples: &[i16]) -> String {
-        let wav: Vec<f32> = samples.iter().map(|&s| s as f32 / 32768.0).collect();
-        let n = wav.len() as i64;
-        let lens = [n];
-        let feat = self
-            .prep
-            .run(
-                &[
-                    ("waveforms", Tensor::F32(&wav, vec![1, n])),
-                    ("waveforms_lens", Tensor::I64(&lens, vec![1])),
-                ],
-                &["features", "features_lens"],
-            )
-            .expect("preprocessor");
-        let t = feat.shape(0)[2] as usize; // [1,128,T]
-        let feats = feat.f32(0); // [128*T] channel-major
-        let teff = t.min(WIN_MEL);
-        let mut mel = Array2::<f32>::zeros((MEL, teff));
-        for c in 0..MEL {
-            for ti in 0..teff {
-                mel[[c, ti]] = feats[c * t + ti];
+        // NO-DOUBLE-COUNT RULE: `report()` SUMS every recorded (stage,bucket). The
+        // FastConformerEncoder self-attributes 100% of `encode()` internally (ff/mhsa/conv/ln/...),
+        // so we deliberately do NOT wrap `self.enc.encode(...)` in a PhaseScope -- a wrapping
+        // "encode" scope would be summed ON TOP of the encoder's own scopes and inflate the total.
+        // The scopes below are LEAF Host stages OUTSIDE the encoder: each contains no encoder scope
+        // and no mm() call.
+        let mel = {
+            // preproc: mel-frontend (preprocessor.onnx run) + host marshal of features into Array2.
+            let _p = PhaseScope::new("preproc", Bucket::Host);
+            let wav: Vec<f32> = samples.iter().map(|&s| s as f32 / 32768.0).collect();
+            let n = wav.len() as i64;
+            let lens = [n];
+            let feat = self
+                .prep
+                .run(
+                    &[
+                        ("waveforms", Tensor::F32(&wav, vec![1, n])),
+                        ("waveforms_lens", Tensor::I64(&lens, vec![1])),
+                    ],
+                    &["features", "features_lens"],
+                )
+                .expect("preprocessor");
+            let t = feat.shape(0)[2] as usize; // [1,128,T]
+            let feats = feat.f32(0); // [128*T] channel-major
+            let teff = t.min(WIN_MEL);
+            let mut mel = Array2::<f32>::zeros((MEL, teff));
+            for c in 0..MEL {
+                for ti in 0..teff {
+                    mel[[c, ti]] = feats[c * t + ti];
+                }
             }
-        }
+            mel
+        };
+        // encode() is OUTSIDE every PhaseScope here (the `preproc` scope was dropped above); the
+        // encoder attributes its own time via its internal scopes.
         let encoded = self.enc.encode(&mel); // [T', 1024] on the NPU
         let valid = encoded.nrows();
-        let ids = self.tdt_decode(&encoded, valid);
+        let ids = {
+            // tdt_decode: TDT greedy decode loop (per-frame decoder_joint.onnx calls). Leaf Host.
+            let _d = PhaseScope::new("tdt_decode", Bucket::Host);
+            self.tdt_decode(&encoded, valid)
+        };
+        // detok: token -> text assembly. Leaf Host.
+        let _t = PhaseScope::new("detok", Bucket::Host);
         self.detokenize(&ids)
     }
 }
