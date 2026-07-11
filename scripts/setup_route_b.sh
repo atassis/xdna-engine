@@ -48,7 +48,9 @@ if ! { have_aie && have_peano; }; then
   # before Peano can be provided. Peano is handled EXCLUSIVELY by the tree-copy block below.
   WHEELHOUSE="$REPO/vendor/wheelhouse"
   if ! uv pip install --python .venv-iron --offline "$MLIR_AIE_PIN" "$NANOBIND_PIN"; then
-    ls "$WHEELHOUSE"/mlir_aie-*.whl >/dev/null 2>&1 || bash "$REPO/scripts/build_wheelhouse.sh"
+    # Rebuild the wheelhouse if absent. A failure here (e.g. empty uv cache off the owner box) must
+    # NOT abort under set -e: fall through so the network tier below can still fetch mlir_aie.
+    ls "$WHEELHOUSE"/mlir_aie-*.whl >/dev/null 2>&1 || bash "$REPO/scripts/build_wheelhouse.sh" || true
     uv pip install --python .venv-iron --find-links "$WHEELHOUSE" --offline \
         "$MLIR_AIE_PIN" "$NANOBIND_PIN" \
       || uv pip install --python .venv-iron \
