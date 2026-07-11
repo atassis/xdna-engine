@@ -41,7 +41,10 @@ impl FastConformerEncoder {
     }
 
     /// Weight matmul C[m,n] = A[m,k] @ B[k,n] — NPU if enabled, else host ndarray. `id` keys the
-    /// NPU weight-BO cache (unique per fixed weight, e.g. "3.ff1.l1").
+    /// NPU weight-BO cache (unique per fixed weight, e.g. "3.ff1.l1"). Eager (non-lazy) sibling of
+    /// [`Self::mm_lazy`]; retained as the general entry point (all encoder call sites use the lazy
+    /// variant, which skips the constant-weight reclone on warm passes).
+    #[allow(dead_code)]
     fn mm(&self, a: &Array2<f32>, b: &Array2<f32>, id: &str) -> Array2<f32> {
         #[cfg(feature = "npu")]
         {
@@ -53,6 +56,22 @@ impl FastConformerEncoder {
         a.dot(b)
     }
 
+    /// Lazy weight matmul: mirrors [`Self::mm`] but the weight matrix is built by `make_b` ONLY on
+    /// a NPU weight-BO cache miss. On warm (cache-hit) passes the closure never runs, so the whole
+    /// constant-weight host reclone/transpose inside it is skipped -- this is the point. The host
+    /// (no-NPU) fallback always runs `make_b` (identical to the eager path).
+    fn mm_lazy<F: FnOnce() -> Array2<f32>>(&self, a: &Array2<f32>, make_b: F, id: &str) -> Array2<f32> {
+        #[cfg(feature = "npu")]
+        {
+            if let Some(npu) = &self.npu {
+                return npu.matmul_id_lazy(a, make_b, id);
+            }
+        }
+        let _ = id;
+        let b = make_b();
+        a.dot(&b)
+    }
+
     fn feed_forward(&self, x: &Array2<f32>, b: &BlockWeights, blk: usize, tag: &str, norm_w: &str, norm_b: &str, l1: &str, l2: &str) -> Array2<f32> {
         let stage: &'static str = if tag == "ff1" { "ff1" } else { "ff2" };
         let n = {
@@ -61,22 +80,21 @@ impl FastConformerEncoder {
         };
         // ff_wprep: materialize the (T'-independent) FFN weight matrix for mm(). `b.m()` clones the
         // whole [D,DFF]/[DFF,D] array out of the weight map + reifies its layout -- pure host data
-        // movement (no math, no device). Kept as a block-local temporary that drops right after its
-        // mm, so its lifetime matches the original mm-arg temporary (no extra weight held live =>
-        // timing behavior unchanged; the scope only NAMES the span that was falling into residual).
+        // movement (no math, no device). Now materialized LAZILY inside mm_lazy's closure: on a warm
+        // (weight-BO cache hit) pass the clone never runs, eliminating the per-pass reclone of the
+        // constant weight (the #0 perf lever). The ff_wprep scope stays inside the closure so a miss
+        // still attributes; a hit skips the closure (and thus the scope) entirely.
         let mut h = {
-            let w1 = { let _wp = PhaseScope::new("ff_wprep", Bucket::Marshal); b.m(l1) };
             prof::phase::set_stage(stage);
-            self.mm(&n, &w1, &format!("{blk}.{tag}.l1")) // [T, DFF]
+            self.mm_lazy(&n, || { let _wp = PhaseScope::new("ff_wprep", Bucket::Marshal); b.m(l1) }, &format!("{blk}.{tag}.l1")) // [T, DFF]
         };
         {
             let _h = PhaseScope::new("ff_act", Bucket::Host);
             silu_inplace(&mut h);
         }
         {
-            let w2 = { let _wp = PhaseScope::new("ff_wprep", Bucket::Marshal); b.m(l2) };
             prof::phase::set_stage(stage);
-            self.mm(&h, &w2, &format!("{blk}.{tag}.l2")) // [T, D]
+            self.mm_lazy(&h, || { let _wp = PhaseScope::new("ff_wprep", Bucket::Marshal); b.m(l2) }, &format!("{blk}.{tag}.l2")) // [T, D]
         }
     }
 
@@ -144,30 +162,18 @@ impl FastConformerEncoder {
         let p = pos_enc.nrows(); // 2T-1
         // mhsa_wprep: materialize each (T'-independent) attention projection weight for its mm().
         // Each `b.m()` clones the whole [D,D]/[P,D] matrix out of the weight map -- pure host data
-        // movement (no math, no device). Each qkv/pos weight is a block-local temporary that drops
-        // right after its mm (matching the original mm-arg temporary lifetimes); only the tiny
-        // pos_bias_u/v (consumed later in the score loop) are held, exactly as the original. LEAF
-        // Marshal spans that previously fell into the report-level residual.
+        // movement (no math, no device). Now materialized LAZILY inside mm_lazy's closure: on a warm
+        // (weight-BO cache hit) pass the clone never runs, eliminating the per-pass reclone of the
+        // constant qkv/pos/out weights. Only the tiny pos_bias_u/v (consumed later in the score
+        // loop, NOT a cached BO) stay eager, exactly as the original.
         prof::phase::set_stage("mhsa_qkv");
-        let q = {
-            let w = { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_q.weight") };
-            self.mm(x, &w, &format!("{blk}.q")) // [T, D]
-        };
+        let q = self.mm_lazy(x, || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_q.weight") }, &format!("{blk}.q")); // [T, D]
         prof::phase::set_stage("mhsa_qkv");
-        let k = {
-            let w = { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_k.weight") };
-            self.mm(x, &w, &format!("{blk}.k"))
-        };
+        let k = self.mm_lazy(x, || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_k.weight") }, &format!("{blk}.k"));
         prof::phase::set_stage("mhsa_qkv");
-        let v = {
-            let w = { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_v.weight") };
-            self.mm(x, &w, &format!("{blk}.v"))
-        };
+        let v = self.mm_lazy(x, || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_v.weight") }, &format!("{blk}.v"));
         prof::phase::set_stage("mhsa_pos");
-        let pm = {
-            let w = { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_pos.weight") };
-            self.mm(pos_enc, &w, &format!("{blk}.pos")) // [P, D]
-        };
+        let pm = self.mm_lazy(pos_enc, || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_pos.weight") }, &format!("{blk}.pos")); // [P, D]
         let (ubias, vbias) = {
             let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal);
             (b.m("self_attn.pos_bias_u"), b.m("self_attn.pos_bias_v")) // [H, DK] each
@@ -243,38 +249,33 @@ impl FastConformerEncoder {
         }
         ctx
         });
-        let wout = { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_out.weight") };
         prof::phase::set_stage("mhsa_qkv");
-        self.mm(&ctx, &wout, &format!("{blk}.out"))
+        self.mm_lazy(&ctx, || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_out.weight") }, &format!("{blk}.out"))
     }
 
     fn conv_module(&self, x: &Array2<f32>, blk: usize) -> Array2<f32> {
         let b = self.w.block(blk);
         let d = self.cfg.hidden;
         let t = x.nrows();
-        // conv_wprep: materialize + reshape the (T'-independent) conv weights for mm(). `b.m3()`
-        // clones the whole [2D,D,1]/[D,D,1]/[D,1,9] tensor out of the weight map; `index_axis(..)
-        // .to_owned()` drops the singleton dim. Pure host data movement (no math, no device). These
-        // owned arrays already had whole-module lifetime in the original, so scoping them here does
-        // NOT extend any lifetime -- it only NAMES the clones that were falling into the residual.
-        let (pw1, pw2, taps, dwb) = {
+        // conv_wprep: materialize + reshape the (T'-independent) conv weights for mm(). The pointwise
+        // conv1/conv2 weights (pw1/pw2) feed a cached NPU weight BO, so they are now materialized
+        // LAZILY inside mm_lazy's closure (whole `b.m3(..).index_axis(..).to_owned().t().to_owned()`
+        // chain) -- skipped on warm cache-hit passes (the #0 lever). The depthwise taps + bias feed
+        // the HOST dwconv1d (no cached BO), so they are genuinely needed every pass and stay eager.
+        let (taps, dwb) = {
             let _wp = PhaseScope::new("conv_wprep", Bucket::Marshal);
-            let pw1 = b.m3("conv.pointwise_conv1.weight"); // [2D, D, 1]
-            let pw1 = pw1.index_axis(Axis(2), 0).to_owned(); // [2D, D]
-            let pw2 = b.m3("conv.pointwise_conv2.weight").index_axis(Axis(2), 0).to_owned(); // [D, D]
             let dw3 = b.m3("conv.depthwise_conv.weight"); // [D, 1, 9]
             let taps = dw3.index_axis(Axis(1), 0).to_owned(); // [D, 9]
             let dwb = b.v("conv.depthwise_conv.bias");
-            (pw1, pw2, taps, dwb)
+            (taps, dwb)
         };
 
         prof::phase::set_stage("conv_pw");
-        // pw1.t().to_owned() = the [D, 2D] transpose into mm()'s [K,N] layout: a block-local temporary
-        // that drops right after its mm (same lifetime as the original mm-arg temporary). LEAF Marshal.
-        let h = {
-            let pw1_t = { let _wp = PhaseScope::new("conv_wprep", Bucket::Marshal); pw1.t().to_owned() };
-            self.mm(x, &pw1_t, &format!("{blk}.pw1")) // [T, 2D] (pw1.T = [D, 2D])
-        };
+        // pw1 chain -> [D, 2D] (mm's [K,N] layout): materialized lazily; skipped on warm passes.
+        let h = self.mm_lazy(x, || {
+            let _wp = PhaseScope::new("conv_wprep", Bucket::Marshal);
+            b.m3("conv.pointwise_conv1.weight").index_axis(Axis(2), 0).to_owned().t().to_owned() // [2D,D,1]->[2D,D]->[D,2D]
+        }, &format!("{blk}.pw1")); // [T, 2D]
         // GLU: a * sigmoid(g)
         let glu = prof::time("glu", || {
             let _h = PhaseScope::new("conv_glu", Bucket::Host);
@@ -296,8 +297,11 @@ impl FastConformerEncoder {
             dwc.t().to_owned() // [T, D]
         });
         prof::phase::set_stage("conv_pw");
-        let pw2_t = { let _wp = PhaseScope::new("conv_wprep", Bucket::Marshal); pw2.t().to_owned() }; // [D, D]
-        self.mm(&back, &pw2_t, &format!("{blk}.pw2"))
+        // pw2 chain -> [D, D]: materialized lazily; skipped on warm passes.
+        self.mm_lazy(&back, || {
+            let _wp = PhaseScope::new("conv_wprep", Bucket::Marshal);
+            b.m3("conv.pointwise_conv2.weight").index_axis(Axis(2), 0).to_owned().t().to_owned() // [D,D,1]->[D,D]->[D,D]
+        }, &format!("{blk}.pw2"))
     }
 
     fn block(&self, x: &Array2<f32>, blk: usize, pos_enc: &Array2<f32>) -> Array2<f32> {

@@ -61,6 +61,7 @@ pub struct NpuMatmul {
     slots: Vec<PipeSlot>, // 2-slot ring for the K-split pipeline (output N=1024)
     streams: RefCell<HashMap<usize, Rc<NStream>>>, // N -> stream
     wcache: RefCell<HashMap<String, Rc<Bo>>>,      // packed weight BOs by id
+    ncache: RefCell<HashMap<String, usize>>,       // weight N (ncols) by id, paired with wcache
     pub stats: RefCell<NpuStats>,
 }
 
@@ -116,6 +117,7 @@ impl NpuMatmul {
             slots,
             streams: RefCell::new(HashMap::new()),
             wcache: RefCell::new(HashMap::new()),
+            ncache: RefCell::new(HashMap::new()),
             stats: RefCell::new(NpuStats::default()),
         }
     }
@@ -153,6 +155,7 @@ impl NpuMatmul {
         self.stats.borrow_mut().weight_load_s += t0.elapsed().as_secs_f64();
         let bo = Rc::new(bo);
         self.wcache.borrow_mut().insert(id.to_string(), bo.clone());
+        self.ncache.borrow_mut().insert(id.to_string(), n);
         bo
     }
 
@@ -226,11 +229,71 @@ impl NpuMatmul {
             let wbo = self.weight_bo(id, b.view());
             return self.dispatch(a.view(), &wbo, n);
         }
-        // K-split (ff.l2: K=4096, N=1024): 2-slot pipeline — submit partial[i] while accumulating
-        // partial[i-1] (mirrors ctx2 forward_pipelined). The partials are independent (summed).
         assert_eq!(k % KRES, 0, "K={k} not a multiple of {KRES}");
         assert_eq!(n, 1024, "K-split path assumes N=1024 (ff.l2)");
         let parts = k / KRES;
+        // Per-partial weight comes straight from the passed `b` (packed/cached on first touch).
+        self.ksplit_dispatch(a, n, parts, |i| {
+            self.weight_bo(&format!("{id}.{i}"), b.slice(s![i * KRES..(i + 1) * KRES, ..]))
+        })
+    }
+
+    /// Lazy variant of [`matmul_id`]: the host weight matrix is materialized by `make_b` ONLY on a
+    /// cache miss. When the weight BO(s) are already cached (every warm pass for a constant encoder
+    /// weight) `make_b` is never called, so the per-pass host reclone/transpose of the constant
+    /// weight is skipped entirely. `id` keys the weight-BO cache (same keying as `matmul_id`, so the
+    /// two are interchangeable per call site). `a`'s ncols selects the K path (K=weight nrows).
+    pub fn matmul_id_lazy<F: FnOnce() -> Array2<f32>>(&self, a: &Array2<f32>, make_b: F, id: &str) -> Array2<f32> {
+        let (m, k) = a.dim();
+        assert!(m <= PAD_M);
+        self.stats.borrow_mut().calls += 1;
+
+        if k == KRES {
+            // single-dispatch path: need the weight BO + its N. On a hit, read N from ncache and
+            // never touch make_b; on a miss, build the weight, then pack+cache it.
+            let cached = self.wcache.borrow().get(id).cloned();
+            let (wbo, n) = if let Some(bo) = cached {
+                let n = *self.ncache.borrow().get(id).expect("ncache miss on wcache hit");
+                (bo, n)
+            } else {
+                let b = make_b();
+                let n = b.ncols();
+                assert_eq!(b.nrows(), KRES, "lazy K={k} weight nrows {} != {KRES}", b.nrows());
+                (self.weight_bo(id, b.view()), n)
+            };
+            return self.dispatch(a.view(), &wbo, n);
+        }
+        // K-split: if ALL of {id}.0..parts-1 are cached, dispatch without make_b; else build `b`
+        // once and pack the partials from it (identical to matmul_id's packing).
+        assert_eq!(k % KRES, 0, "K={k} not a multiple of {KRES}");
+        let parts = k / KRES;
+        let all_cached = (0..parts).all(|i| self.wcache.borrow().contains_key(&format!("{id}.{i}")));
+        let b_opt: Option<Array2<f32>> = if all_cached { None } else { Some(make_b()) };
+        let n = if let Some(ref b) = b_opt {
+            assert_eq!(b.nrows(), k, "lazy K-split weight nrows {} != {k}", b.nrows());
+            b.ncols()
+        } else {
+            *self.ncache.borrow().get(&format!("{id}.0")).expect("ncache miss on wcache hit")
+        };
+        assert_eq!(n, 1024, "K-split path assumes N=1024 (ff.l2)");
+        self.ksplit_dispatch(a, n, parts, |i| {
+            let pid = format!("{id}.{i}");
+            let cached = self.wcache.borrow().get(&pid).cloned();
+            if let Some(bo) = cached {
+                bo
+            } else {
+                let b = b_opt.as_ref().expect("b_opt present on cache miss");
+                self.weight_bo(&pid, b.slice(s![i * KRES..(i + 1) * KRES, ..]))
+            }
+        })
+    }
+
+    /// K-split 2-slot pipeline (ff.l2: K=4096, N=1024): submit partial[i] while accumulating
+    /// partial[i-1] (mirrors ctx2 forward_pipelined). Partials are independent (summed). `get_w(i)`
+    /// yields the cached/packed weight BO for partial i (lazy per-partial so the first partial's
+    /// pack overlaps nothing, matching the original). Numerics identical across callers.
+    fn ksplit_dispatch<G: Fn(usize) -> Rc<Bo>>(&self, a: &Array2<f32>, n: usize, parts: usize, get_w: G) -> Array2<f32> {
+        let m = a.nrows();
         let st = self.stream(n);
         // Phase-timing stage label for this K-split op; each partial's pack/read is Marshal and
         // each dispatch-launch + wait is Npu (the pipeline overlaps them, so per-bucket wall
@@ -268,7 +331,7 @@ impl NpuMatmul {
         };
 
         // submit partial 0
-        let w0 = self.weight_bo(&format!("{id}.0"), b.slice(s![0..KRES, ..]));
+        let w0 = get_w(0);
         pack_into(&self.slots[0], a.slice(s![.., 0..KRES]));
         let t0 = Instant::now();
         let mut prev_run = submit(&self.slots[0], &w0);
@@ -276,7 +339,7 @@ impl NpuMatmul {
         let mut acc = Array2::<f32>::zeros((m, n));
         for i in 1..parts {
             let slot = i % 2;
-            let wi = self.weight_bo(&format!("{id}.{i}"), b.slice(s![i * KRES..(i + 1) * KRES, ..]));
+            let wi = get_w(i);
             pack_into(&self.slots[slot], a.slice(s![.., i * KRES..(i + 1) * KRES])); // overlaps prev NPU exec
             let cur_run = submit(&self.slots[slot], &wi);
             {
