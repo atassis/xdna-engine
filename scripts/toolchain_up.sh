@@ -75,6 +75,7 @@ cmake -G Ninja -B "$INST/build" -S "$SRC" \
 ninja -C "$INST/build" AIEPythonModules aiecc aie-opt >&2
 ln -sfn "$INST/build/python" "$INST/python"
 ln -sfn "$REPO/.venv-iron/lib/python3.14/site-packages/mlir_aie/include/aie_api" "$INST/build/include/aie_api"
+ln -sfn "$REPO/mlir-aie/aie_kernels" "$INST/build/include/aie_kernels"   # aie.iron _default_source_path resolves kernel .cc here (aie2p/mm.cc etc.)
 ln -sfn "$INST/build/bin" "$INST/bin"
 _link_vendored_tools
 echo "$INST"
