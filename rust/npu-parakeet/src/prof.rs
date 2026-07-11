@@ -99,6 +99,20 @@ pub mod phase {
         ACC.with(|a| a.borrow_mut().clear());
     }
 
+    thread_local!(static STAGE: std::cell::Cell<&'static str> = const { std::cell::Cell::new("mm") });
+
+    /// Set the logical stage label that subsequent matmul [`PhaseScope`]s charge to.
+    /// The encoder sets this around each op (ff1/ff2/mhsa_q/...) so the marshal-vs-dispatch
+    /// split inside `matmul` is attributed to the stage it serves. Cheap even when timing is off.
+    pub fn set_stage(s: &'static str) {
+        STAGE.with(|c| c.set(s));
+    }
+
+    /// Current logical stage label (defaults to `"mm"` when the encoder hasn't set one).
+    pub fn current_stage() -> &'static str {
+        STAGE.with(|c| c.get())
+    }
+
     /// RAII guard: times its lifetime and charges the elapsed span to `(stage, bucket)`
     /// on drop. A true no-op (never reads the clock) when [`timing_on`] is false.
     pub struct PhaseScope {

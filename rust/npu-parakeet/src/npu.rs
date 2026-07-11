@@ -160,41 +160,55 @@ impl NpuMatmul {
     fn dispatch(&self, a_km: ArrayView2<f32>, wbo: &Bo, n: usize) -> Array2<f32> {
         let m = a_km.nrows();
         let st = self.stream(n);
+        let stage = crate::prof::phase::current_stage();
+        // (a) input marshaling: pack A -> bf16 + upload (host->device, no math).
         // pack only the m REAL rows of A: matmul row i depends only on A row i, so the kernel's
         // padding rows (m..PAD_M) produce ignored C rows — their (stale) content is harmless.
         let t0 = Instant::now();
-        let a_std = a_km.as_standard_layout();
-        let a_s = a_std.as_slice().unwrap();
-        let mut a_bits = vec![0u16; m * KRES];
-        npu_xrt::pack_f32_to_bf16(&a_s[..m * KRES], &mut a_bits);
-        self.bo_a.write_bytes(u16_bytes(&a_bits)).unwrap(); // writes first m rows; rest stale (ignored)
-        self.bo_a.sync_to_device().unwrap();
+        {
+            let _m = crate::prof::phase::PhaseScope::new(stage, crate::prof::phase::Bucket::Marshal);
+            let a_std = a_km.as_standard_layout();
+            let a_s = a_std.as_slice().unwrap();
+            let mut a_bits = vec![0u16; m * KRES];
+            npu_xrt::pack_f32_to_bf16(&a_s[..m * KRES], &mut a_bits);
+            self.bo_a.write_bytes(u16_bytes(&a_bits)).unwrap(); // writes first m rows; rest stale (ignored)
+            self.bo_a.sync_to_device().unwrap();
+        }
         self.stats.borrow_mut().pack_a_s += t0.elapsed().as_secs_f64();
 
+        // (b) NPU dispatch + wait for completion (run_matmul8 is blocking).
         let t1 = Instant::now();
-        self.kern
-            .run_matmul8(3, &st.instr, st.n_instr, &self.bo_a, wbo, &st.bo_c, &self.bo_tmp, &self.bo_tr)
-            .unwrap();
+        {
+            let _d = crate::prof::phase::PhaseScope::new(stage, crate::prof::phase::Bucket::Npu);
+            self.kern
+                .run_matmul8(3, &st.instr, st.n_instr, &self.bo_a, wbo, &st.bo_c, &self.bo_tmp, &self.bo_tr)
+                .unwrap();
+        }
         {
             let mut s = self.stats.borrow_mut();
             s.dispatch_s += t1.elapsed().as_secs_f64();
             s.dispatches += 1;
         }
 
+        // (c) output marshaling: download C + read rows back into an f32 ndarray (no math).
         let t2 = Instant::now();
-        st.bo_c.sync_from_device().unwrap();
-        // read only the first m rows (row-major); rows m..PAD_M are padding-row garbage
-        let mut c_bytes = vec![0u8; m * n * 4];
-        st.bo_c.read_bytes(&mut c_bytes).unwrap();
-        let mut out = Array2::<f32>::zeros((m, n));
-        for r in 0..m {
-            for c in 0..n {
-                let off = (r * n + c) * 4;
-                out[[r, c]] = f32::from_le_bytes([
-                    c_bytes[off], c_bytes[off + 1], c_bytes[off + 2], c_bytes[off + 3],
-                ]);
+        let out = {
+            let _m2 = crate::prof::phase::PhaseScope::new(stage, crate::prof::phase::Bucket::Marshal);
+            st.bo_c.sync_from_device().unwrap();
+            // read only the first m rows (row-major); rows m..PAD_M are padding-row garbage
+            let mut c_bytes = vec![0u8; m * n * 4];
+            st.bo_c.read_bytes(&mut c_bytes).unwrap();
+            let mut out = Array2::<f32>::zeros((m, n));
+            for r in 0..m {
+                for c in 0..n {
+                    let off = (r * n + c) * 4;
+                    out[[r, c]] = f32::from_le_bytes([
+                        c_bytes[off], c_bytes[off + 1], c_bytes[off + 2], c_bytes[off + 3],
+                    ]);
+                }
             }
-        }
+            out
+        };
         self.stats.borrow_mut().read_s += t2.elapsed().as_secs_f64();
         out
     }
@@ -218,8 +232,13 @@ impl NpuMatmul {
         assert_eq!(n, 1024, "K-split path assumes N=1024 (ff.l2)");
         let parts = k / KRES;
         let st = self.stream(n);
+        // Phase-timing stage label for this K-split op; each partial's pack/read is Marshal and
+        // each dispatch-launch + wait is Npu (the pipeline overlaps them, so per-bucket wall
+        // sums may exceed e2e — report() surfaces that as overlap_ms).
+        let stage = crate::prof::phase::current_stage();
 
         let pack_into = |slot: &PipeSlot, a_p: ArrayView2<f32>| {
+            let _m = crate::prof::phase::PhaseScope::new(stage, crate::prof::phase::Bucket::Marshal);
             let a_std = a_p.as_standard_layout();
             let mut bits = vec![0u16; m * KRES];
             npu_xrt::pack_f32_to_bf16(&a_std.as_slice().unwrap()[..m * KRES], &mut bits);
@@ -227,6 +246,7 @@ impl NpuMatmul {
             slot.bo_a.sync_to_device().unwrap();
         };
         let read_part = |slot: &PipeSlot| -> Array2<f32> {
+            let _m = crate::prof::phase::PhaseScope::new(stage, crate::prof::phase::Bucket::Marshal);
             slot.bo_c.sync_from_device().unwrap();
             let mut cb = vec![0u8; m * n * 4];
             slot.bo_c.read_bytes(&mut cb).unwrap();
@@ -240,6 +260,7 @@ impl NpuMatmul {
             out
         };
         let submit = |slot: &PipeSlot, wbo: &Bo| {
+            let _d = crate::prof::phase::PhaseScope::new(stage, crate::prof::phase::Bucket::Npu);
             self.stats.borrow_mut().dispatches += 1;
             self.kern
                 .run_matmul8_start(3, &st.instr, st.n_instr, &slot.bo_a, wbo, &slot.bo_c, &slot.bo_tmp, &slot.bo_tr)
@@ -258,12 +279,18 @@ impl NpuMatmul {
             let wi = self.weight_bo(&format!("{id}.{i}"), b.slice(s![i * KRES..(i + 1) * KRES, ..]));
             pack_into(&self.slots[slot], a.slice(s![.., i * KRES..(i + 1) * KRES])); // overlaps prev NPU exec
             let cur_run = submit(&self.slots[slot], &wi);
-            prev_run.wait().unwrap();
+            {
+                let _d = crate::prof::phase::PhaseScope::new(stage, crate::prof::phase::Bucket::Npu);
+                prev_run.wait().unwrap();
+            }
             acc += &read_part(&self.slots[prev_slot]); // overlaps cur NPU exec
             prev_run = cur_run;
             prev_slot = slot;
         }
-        prev_run.wait().unwrap();
+        {
+            let _d = crate::prof::phase::PhaseScope::new(stage, crate::prof::phase::Bucket::Npu);
+            prev_run.wait().unwrap();
+        }
         acc += &read_part(&self.slots[prev_slot]);
         self.stats.borrow_mut().dispatch_s += t0.elapsed().as_secs_f64();
         acc
