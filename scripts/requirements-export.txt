@@ -1,0 +1,17 @@
+# Pinned deps for the py3.12 model-EXPORT venv (extract_/export_/convert_*.py + asr_oracle.py).
+# Versions captured 2026-07-11 from the working env that actually runs these exports
+# (<export-venv>, Python 3.12.13). Installed by scripts/setup_export_venv.sh.
+#
+# torch is CPU-only by policy (NPU-first: exports never touch CUDA) -> the +cpu local version
+# requires the PyTorch CPU index, which setup_export_venv.sh adds. onnx-asr bundles the mel
+# preprocessor.onnx used by the ASR pipeline (no separate HF download).
+onnx==1.21.0
+onnxruntime==1.26.0
+numpy==2.4.6
+torch==2.12.0+cpu
+transformers==4.57.6
+safetensors==0.8.0
+soundfile==0.14.0
+huggingface-hub==0.36.2
+optimum==2.1.0
+onnx-asr==0.11.0
