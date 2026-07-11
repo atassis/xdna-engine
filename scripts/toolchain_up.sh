@@ -37,8 +37,17 @@ _link_vendored_tools() {
   done
 }
 
+# Refresh the include/ symlinks aie.iron + the kernel headers resolve against. Run on BOTH the cold
+# build and the warm early-return so a plain re-run against any instance is self-healing (the warm
+# path does not rebuild, so these would otherwise never be recreated if removed).
+_link_include_dirs() {
+  ln -sfn "$REPO/.venv-iron/lib/python3.14/site-packages/mlir_aie/include/aie_api" "$INST/build/include/aie_api"
+  ln -sfn "$REPO/mlir-aie/aie_kernels" "$INST/build/include/aie_kernels"   # aie.iron _default_source_path resolves kernel .cc here (aie2p/mm.cc etc.)
+}
+
 if [ -f "$PYPKG" ] && grep -q "def resolve_program(self, device_name" "$PYPKG"; then
   _link_vendored_tools   # backfill vendored tools into already-built instances
+  _link_include_dirs     # backfill include/ symlinks (aie_api + aie_kernels)
   echo "$INST"; exit 0   # cached, self-consistent
 fi
 echo "[toolchain_up] building instance $LOCKHASH ..." >&2
@@ -74,8 +83,7 @@ cmake -G Ninja -B "$INST/build" -S "$SRC" \
   -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache >&2
 ninja -C "$INST/build" AIEPythonModules aiecc aie-opt >&2
 ln -sfn "$INST/build/python" "$INST/python"
-ln -sfn "$REPO/.venv-iron/lib/python3.14/site-packages/mlir_aie/include/aie_api" "$INST/build/include/aie_api"
-ln -sfn "$REPO/mlir-aie/aie_kernels" "$INST/build/include/aie_kernels"   # aie.iron _default_source_path resolves kernel .cc here (aie2p/mm.cc etc.)
+_link_include_dirs
 ln -sfn "$INST/build/bin" "$INST/bin"
 _link_vendored_tools
 echo "$INST"
