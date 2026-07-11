@@ -40,8 +40,34 @@ EXTRA_REPOS=(
 
 fetch() { echo "[fetch] $1"; "$HF" download "$1" >/dev/null; }
 
+# Assemble the flat, serve-ready Parakeet artifact dir the engine loads
+# (rust/npu-engine/src/asr/parakeet.rs: artifacts/parakeet/{preprocessor.onnx,decoder_joint.onnx,
+# vocab.txt,encoder/}). No HF repo ships this exact layout, so build it here from pinned sources.
+# Idempotent. NOTE: the encoder/ arena is produced separately by extract_parakeet_encoder.py and is
+# NOT assembled here. Two migration bugs this fixes:
+#   - preprocessor.onnx must be onnx_asr's nemo128.onnx (128-mel; Parakeet FastConformer needs 128
+#     mels). Do NOT use gigaam_v3.onnx here -- that is the 64-mel preproc, correct only for GigaAM.
+#   - the engine loads decoder_joint.onnx, but HF ships it as decoder_joint-model.onnx -> rename.
+prep_parakeet_artifacts() {
+  local snap dst pyexe data
+  snap=$(ls -d "$HOME"/.cache/huggingface/hub/models--istupakov--parakeet-tdt-0.6b-v3-onnx/snapshots/*/ 2>/dev/null | head -n1)
+  if [ -z "$snap" ]; then echo "[parakeet] HF snapshot not found -- ASR fetch must run first"; return 1; fi
+  dst="$REPO/artifacts/parakeet"; mkdir -p "$dst"
+
+  # locate onnx_asr's bundled 128-mel preprocessor via the export venv python
+  pyexe="${EXPORT_PY:-$REPO/${EXPORT_VENV:-.venv-export}/bin/python}"
+  data=$("$pyexe" -c "import onnx_asr,os;print(os.path.join(os.path.dirname(onnx_asr.__file__),'preprocessors','data'))")
+  cp -f "$data/nemo128.onnx"              "$dst/preprocessor.onnx"   # 128-mel (NOT gigaam_v3 64-mel)
+  cp -f "$snap/decoder_joint-model.onnx"  "$dst/decoder_joint.onnx"  # HF name -> engine name
+  cp -f "$snap/vocab.txt"                 "$dst/vocab.txt"
+  echo "[parakeet] assembled $dst : preprocessor.onnx(nemo128 128-mel) + decoder_joint.onnx + vocab.txt"
+}
+
 echo "== ASR pipeline models =="
 for r in "${ASR_REPOS[@]}"; do fetch "$r"; done
+
+echo "== assemble parakeet serving artifacts =="
+prep_parakeet_artifacts
 
 if [ "${FETCH_EXTRA:-1}" = "1" ]; then
   echo "== extended model set (set FETCH_EXTRA=0 to skip) =="
