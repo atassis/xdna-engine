@@ -34,18 +34,43 @@ MLIR_AIE_SHA=8373e49165649644f1ec414c2e406c0abbbf51cf
 PEANO_PIN="llvm-aie==${PEANO_DIST#llvm_aie-}"
 MLIR_AIE_PIN='mlir_aie==0.0.1.2026033104+e4f35d6'
 NANOBIND_PIN="nanobind==${NANOBIND:-2.12.0}"
-if ! { .venv-iron/bin/python -c 'import aie' 2>/dev/null && \
-       ls .venv-iron/lib/python3.14/site-packages/llvm-aie/bin/clang >/dev/null 2>&1; }; then
-  # Prefer an OFFLINE install from the uv cache (these exact versions are prefetched). Only if a
-  # cache miss forces a network fetch do we fall back to the rotating release-asset find-links.
-  uv pip install --python .venv-iron --offline "$MLIR_AIE_PIN" "$PEANO_PIN" "$NANOBIND_PIN" \
-    || uv pip install --python .venv-iron \
-      --find-links https://github.com/Xilinx/mlir-aie/releases/expanded_assets/latest-wheels-4 \
-      --find-links https://github.com/Xilinx/llvm-aie/releases/expanded_assets/nightly \
-      "$MLIR_AIE_PIN" "$PEANO_PIN" "$NANOBIND_PIN"
+SITE=".venv-iron/lib/python3.14/site-packages"
+have_aie()   { .venv-iron/bin/python -c 'import aie' 2>/dev/null; }
+have_peano() { ls "$SITE"/llvm-aie/bin/clang >/dev/null 2>&1; }
+if ! { have_aie && have_peano; }; then
+  # Prefer an OFFLINE install from the uv cache (these exact versions are prefetched). On a cache
+  # miss, prefer the LOCAL wheelhouse (vendor/wheelhouse, repacked from the uv archive cache by the
+  # reconstruction step -- offline-safe, does not depend on the rotating release-asset find-links)
+  # BEFORE reaching for the network. mlir_aie repacks cleanly to a cp314 wheel; llvm-aie ships only a
+  # cp310 wheel that pip refuses to install into this py3.14 venv, so it is handled by tree-copy below.
+  WHEELHOUSE="$REPO/vendor/wheelhouse"
+  if ! uv pip install --python .venv-iron --offline "$MLIR_AIE_PIN" "$PEANO_PIN" "$NANOBIND_PIN"; then
+    uv pip install --python .venv-iron --find-links "$WHEELHOUSE" --offline \
+        "$MLIR_AIE_PIN" "$NANOBIND_PIN" \
+      || uv pip install --python .venv-iron \
+        --find-links "$WHEELHOUSE" \
+        --find-links https://github.com/Xilinx/mlir-aie/releases/expanded_assets/latest-wheels-4 \
+        --find-links https://github.com/Xilinx/llvm-aie/releases/expanded_assets/nightly \
+        "$MLIR_AIE_PIN" "$PEANO_PIN" "$NANOBIND_PIN"
+  fi
+
+  # llvm-aie (Peano) ships a cp310-tagged wheel; pip will not install it into this py3.14 venv. If
+  # it is still missing after the steps above, reconstruct it by copying the unpacked archive tree
+  # from the uv cache straight into site-packages (the wheel only vendors binaries; no python import
+  # is needed -- the blessed Peano is the fork instance, this just provides bootgen/clang/etc.).
+  if ! have_peano; then
+    LAR=$(find "$HOME/.cache/uv/archive-v0" -maxdepth 2 \
+            -name 'llvm_aie-'"${PEANO_PIN#llvm-aie==}"'.dist-info' 2>/dev/null | head -1 | xargs -r dirname)
+    if [ -n "${LAR:-}" ] && [ -d "$LAR/llvm-aie" ]; then
+      cp -a "$LAR"/llvm-aie "$LAR"/llvm_aie-*.dist-info "$SITE"/
+      echo "  llvm-aie (Peano) copied from uv archive cache -> $SITE/llvm-aie"
+    else
+      echo "  WARNING: llvm-aie tree not found in uv archive cache; Peano binaries unavailable" >&2
+    fi
+  fi
 fi
 
-# 3. gcc-13/g++-13 shims → real gcc (makefile-common hardcodes CC?=gcc-13; we have gcc16)
+# 3. gcc-13/g++-13 shims -> real gcc (makefile-common hardcodes CC?=gcc-13; we have gcc16)
 mkdir -p .venv-iron/cc-shim
 ln -sf "$(command -v gcc)" .venv-iron/cc-shim/gcc-13
 ln -sf "$(command -v g++)" .venv-iron/cc-shim/g++-13

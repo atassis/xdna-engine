@@ -3,11 +3,16 @@
 .venv-iron/
 __pycache__/
 *.pyc
+
+# local wheelhouse for the two un-fetchable AIE toolchain wheels (~290MB+ each);
+# repacked from the uv archive cache by scripts/setup_route_b.sh, never committed.
+vendor/wheelhouse/
+vendor/
 # NOTE: mlir-aie/ is a pinned git submodule. Its dirty working tree (copy-forward
 # kernels + build artifacts + applied patch) is hidden from the parent via
 # .gitmodules ignore=all.
 
-# model artifacts / weights (too big to commit — keep export scripts + instructions instead)
+# model artifacts / weights (too big to commit -- keep export scripts + instructions instead)
 models/
 # artifacts/ is regenerable: scripts/extract_block0.py + extract_blocks.py from the ONNX
 artifacts/
