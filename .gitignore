@@ -4,9 +4,8 @@
 __pycache__/
 *.pyc
 
-# local wheelhouse for the two un-fetchable AIE toolchain wheels (~290MB+ each);
-# repacked from the uv archive cache by scripts/setup_route_b.sh, never committed.
-vendor/wheelhouse/
+# local wheelhouse for the un-fetchable mlir_aie toolchain wheel (~290MB); repacked from the
+# uv archive cache by scripts/build_wheelhouse.sh, never committed.
 vendor/
 # NOTE: mlir-aie/ is a pinned git submodule. Its dirty working tree (copy-forward
 # kernels + build artifacts + applied patch) is hidden from the parent via

@@ -39,19 +39,22 @@ have_aie()   { .venv-iron/bin/python -c 'import aie' 2>/dev/null; }
 have_peano() { ls "$SITE"/llvm-aie/bin/clang >/dev/null 2>&1; }
 if ! { have_aie && have_peano; }; then
   # Prefer an OFFLINE install from the uv cache (these exact versions are prefetched). On a cache
-  # miss, prefer the LOCAL wheelhouse (vendor/wheelhouse, repacked from the uv archive cache by the
-  # reconstruction step -- offline-safe, does not depend on the rotating release-asset find-links)
-  # BEFORE reaching for the network. mlir_aie repacks cleanly to a cp314 wheel; llvm-aie ships only a
-  # cp310 wheel that pip refuses to install into this py3.14 venv, so it is handled by tree-copy below.
+  # miss, use the LOCAL wheelhouse (vendor/wheelhouse) BEFORE the network -- vendor/ is gitignored, so
+  # a fresh checkout rebuilds the wheel on demand from the uv archive cache via build_wheelhouse.sh
+  # (works off the owner box too, not just where a wheel was hand-repacked).
+  # IMPORTANT: llvm-aie (Peano) ships only a cp310 wheel that is UNRESOLVABLE on this py3.14 venv, so
+  # it is EXCLUDED from every pip tier here -- bundling "$PEANO_PIN" would fail the whole resolve
+  # (installing nothing) and, as the last statement in this block, abort the script under `set -e`
+  # before Peano can be provided. Peano is handled EXCLUSIVELY by the tree-copy block below.
   WHEELHOUSE="$REPO/vendor/wheelhouse"
-  if ! uv pip install --python .venv-iron --offline "$MLIR_AIE_PIN" "$PEANO_PIN" "$NANOBIND_PIN"; then
+  if ! uv pip install --python .venv-iron --offline "$MLIR_AIE_PIN" "$NANOBIND_PIN"; then
+    ls "$WHEELHOUSE"/mlir_aie-*.whl >/dev/null 2>&1 || bash "$REPO/scripts/build_wheelhouse.sh"
     uv pip install --python .venv-iron --find-links "$WHEELHOUSE" --offline \
         "$MLIR_AIE_PIN" "$NANOBIND_PIN" \
       || uv pip install --python .venv-iron \
         --find-links "$WHEELHOUSE" \
         --find-links https://github.com/Xilinx/mlir-aie/releases/expanded_assets/latest-wheels-4 \
-        --find-links https://github.com/Xilinx/llvm-aie/releases/expanded_assets/nightly \
-        "$MLIR_AIE_PIN" "$PEANO_PIN" "$NANOBIND_PIN"
+        "$MLIR_AIE_PIN" "$NANOBIND_PIN"
   fi
 
   # llvm-aie (Peano) ships a cp310-tagged wheel; pip will not install it into this py3.14 venv. If
