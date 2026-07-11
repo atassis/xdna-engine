@@ -13,8 +13,12 @@ VENV="${EXPORT_VENV:-.venv-export}"
 
 # CPU-only torch (NPU-first policy: exports never use CUDA). The PyTorch CPU index carries the
 # torch==2.12.0+cpu wheel; --extra-index-url keeps PyPI as the primary for the other deps.
+# --index-strategy unsafe-best-match: without it uv pins a package to the FIRST index that offers it,
+# which locks numpy to the torch-cpu index and makes pinned versions (e.g. numpy==2.4.6) unresolvable;
+# best-match lets uv pick the wheel across both the torch-cpu index and PyPI.
 uv pip install --python "$VENV" \
   --extra-index-url https://download.pytorch.org/whl/cpu \
+  --index-strategy unsafe-best-match \
   -r scripts/requirements-export.txt
 
 echo "Export venv ready at $VENV."
