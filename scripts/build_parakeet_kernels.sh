@@ -38,6 +38,7 @@ done
 # --- NATIVE bf16, tile 32x32x32 (accurate; NPU_NATIVE=1) ---
 rm -f $MMW/build/mm_32x32x32.o
 for N in 1024 2048 4096; do
+  rm -f $MMW/build/aie_512x1024x${N}_32x32x32_8c.mlir
   echo "== NATIVE bf16 512x1024x${N} 32x32x32 8c =="
   make $MK -C $MMW AIECC_JOBS="${AIECC_JOBS:-0}" NPU2=1 M=512 K=1024 N="$N" m=32 k=32 n=32 dtype_in=bf16 dtype_out=f32 n_aie_cols=8 use_iron=1 \
        build/final_512x1024x${N}_32x32x32_8c.xclbin
