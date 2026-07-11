@@ -70,6 +70,7 @@ cmake -G Ninja -B "$INST/build" -S "$SRC" \
   -DLLVM_INCLUDE_TESTS=OFF -DLLVM_USE_LINKER=lld \
   -DCMAKE_DISABLE_FIND_PACKAGE_XRT=ON -DCMAKE_DISABLE_FIND_PACKAGE_hsa-runtime64=ON \
   -DCMAKE_DISABLE_FIND_PACKAGE_aiebu=ON \
+  -DAIE_ENABLE_XRT_PYTHON_BINDINGS=OFF \
   -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache >&2
 ninja -C "$INST/build" AIEPythonModules aiecc aie-opt >&2
 ln -sfn "$INST/build/python" "$INST/python"
