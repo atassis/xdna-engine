@@ -8,6 +8,7 @@ use ndarray::prelude::*;
 use crate::config::ModelCfg;
 use crate::ops::{conv2d, dwconv1d, layernorm, rel_shift, sigmoid, silu_inplace};
 use crate::prof;
+use crate::prof::phase::{Bucket, PhaseScope};
 use crate::pos::rel_pos_encoding;
 use crate::weights::{BlockWeights, ParakeetWeights};
 
@@ -53,9 +54,18 @@ impl FastConformerEncoder {
     }
 
     fn feed_forward(&self, x: &Array2<f32>, b: &BlockWeights, blk: usize, tag: &str, norm_w: &str, norm_b: &str, l1: &str, l2: &str) -> Array2<f32> {
-        let n = layernorm(x, &b.v(norm_w), &b.v(norm_b));
+        let stage: &'static str = if tag == "ff1" { "ff1" } else { "ff2" };
+        let n = {
+            let _h = PhaseScope::new("ln", Bucket::Host);
+            layernorm(x, &b.v(norm_w), &b.v(norm_b))
+        };
+        prof::phase::set_stage(stage);
         let mut h = self.mm(&n, &b.m(l1), &format!("{blk}.{tag}.l1")); // [T, DFF]
-        silu_inplace(&mut h);
+        {
+            let _h = PhaseScope::new("ff_act", Bucket::Host);
+            silu_inplace(&mut h);
+        }
+        prof::phase::set_stage(stage);
         self.mm(&h, &b.m(l2), &format!("{blk}.{tag}.l2")) // [T, D]
     }
 
@@ -78,6 +88,9 @@ impl FastConformerEncoder {
     /// conv2D ÷8 dw-striding subsample: mel [128, T] -> [T/8, hidden].
     /// ONNX feeds conv as [b,1,time,freq]; flatten is [time, C*freq] (Transpose [0,2,1,3]).
     pub fn subsample(&self, mel: &Array2<f32>) -> Array2<f32> {
+        // Whole subsample stem is host math (conv2d x5 + relu + flatten + final gemm);
+        // no self.mm()/device call lives here, so one Host leaf scope cannot double-count.
+        let _h = PhaseScope::new("subsample", Bucket::Host);
         let pe4 = |k: &str| self.w.pre(k).clone().into_dimensionality::<Ix4>().unwrap();
         let pe1 = |k: &str| self.w.pre(k).clone().into_dimensionality::<Ix1>().unwrap();
         // [1, time, freq]
@@ -109,6 +122,7 @@ impl FastConformerEncoder {
         }
         let wout = self.w.pre("out.weight").clone().into_dimensionality::<Ix2>().unwrap(); // [4096, hidden]
         let bout = self.w.pre("out.bias").clone().into_dimensionality::<Ix1>().unwrap();
+        prof::phase::set_stage("subsample"); // final gemm (host .dot here; labels device path if ever routed via mm)
         flat.dot(&wout) + &bout
     }
 
@@ -117,9 +131,13 @@ impl FastConformerEncoder {
         let (h, dk, d) = (self.cfg.n_heads, self.cfg.head_dim, self.cfg.hidden);
         let t = x.nrows();
         let p = pos_enc.nrows(); // 2T-1
+        prof::phase::set_stage("mhsa_qkv");
         let q = self.mm(x, &b.m("self_attn.linear_q.weight"), &format!("{blk}.q")); // [T, D]
+        prof::phase::set_stage("mhsa_qkv");
         let k = self.mm(x, &b.m("self_attn.linear_k.weight"), &format!("{blk}.k"));
+        prof::phase::set_stage("mhsa_qkv");
         let v = self.mm(x, &b.m("self_attn.linear_v.weight"), &format!("{blk}.v"));
+        prof::phase::set_stage("mhsa_pos");
         let pm = self.mm(pos_enc, &b.m("self_attn.linear_pos.weight"), &format!("{blk}.pos")); // [P, D]
         let ubias = b.m("self_attn.pos_bias_u"); // [H, DK]
         let vbias = b.m("self_attn.pos_bias_v");
@@ -128,56 +146,71 @@ impl FastConformerEncoder {
         // assemble bd_all [H, T, P] then rel_shift -> [H, T, T]
         let mut bd_all = Array3::<f32>::zeros((h, t, p));
         let mut ac_all = Array3::<f32>::zeros((h, t, t));
-        for hh in 0..h {
-            let col = hh * dk;
-            // per-head slices
-            let qh = q.slice(s![.., col..col + dk]); // [T, DK]
-            let kh = k.slice(s![.., col..col + dk]);
-            let ph = pm.slice(s![.., col..col + dk]); // [P, DK]
-            // qu = qh + u[h]; qv = qh + v[h]
-            let mut qu = qh.to_owned();
-            let mut qv = qh.to_owned();
-            for i in 0..t {
-                for c in 0..dk {
-                    qu[[i, c]] += ubias[[hh, c]];
-                    qv[[i, c]] += vbias[[hh, c]];
+        {
+            // Per-head QK^T (ac) + QV.pos (bd) score matrices are host ndarray dots (not self.mm):
+            // charged to mhsa_scores. Not one of the plan's named labels; see task report.
+            let _h = PhaseScope::new("mhsa_scores", Bucket::Host);
+            for hh in 0..h {
+                let col = hh * dk;
+                // per-head slices
+                let qh = q.slice(s![.., col..col + dk]); // [T, DK]
+                let kh = k.slice(s![.., col..col + dk]);
+                let ph = pm.slice(s![.., col..col + dk]); // [P, DK]
+                // qu = qh + u[h]; qv = qh + v[h]
+                let mut qu = qh.to_owned();
+                let mut qv = qh.to_owned();
+                for i in 0..t {
+                    for c in 0..dk {
+                        qu[[i, c]] += ubias[[hh, c]];
+                        qv[[i, c]] += vbias[[hh, c]];
+                    }
                 }
+                ac_all.slice_mut(s![hh, .., ..]).assign(&qu.dot(&kh.t())); // [T, T]
+                bd_all.slice_mut(s![hh, .., ..]).assign(&qv.dot(&ph.t())); // [T, P]
             }
-            ac_all.slice_mut(s![hh, .., ..]).assign(&qu.dot(&kh.t())); // [T, T]
-            bd_all.slice_mut(s![hh, .., ..]).assign(&qv.dot(&ph.t())); // [T, P]
         }
-        let bd = prof::time("rel_shift", || rel_shift(&bd_all, t)); // [H, T, T]
+        let bd = prof::time("rel_shift", || {
+            let _h = PhaseScope::new("mhsa_relshift", Bucket::Host);
+            rel_shift(&bd_all, t)
+        }); // [H, T, T]
 
         // scores -> softmax -> context -> merge -> linear_out
-        let _sm = prof::time("mha_softmax", || {
+        let ctx = prof::time("mha_softmax", || {
         let mut ctx = Array2::<f32>::zeros((t, d));
         for hh in 0..h {
             let col = hh * dk;
             let vh = v.slice(s![.., col..col + dk]); // [T, DK]
             let mut scores = Array2::<f32>::zeros((t, t));
-            for i in 0..t {
-                let mut mx = f32::NEG_INFINITY;
-                for j in 0..t {
-                    let sc = (ac_all[[hh, i, j]] + bd[[hh, i, j]]) / scale;
-                    scores[[i, j]] = sc;
-                    mx = mx.max(sc);
-                }
-                let mut sum = 0.0;
-                for j in 0..t {
-                    let e = (scores[[i, j]] - mx).exp();
-                    scores[[i, j]] = e;
-                    sum += e;
-                }
-                for j in 0..t {
-                    scores[[i, j]] /= sum;
+            {
+                let _h = PhaseScope::new("mhsa_softmax", Bucket::Host);
+                for i in 0..t {
+                    let mut mx = f32::NEG_INFINITY;
+                    for j in 0..t {
+                        let sc = (ac_all[[hh, i, j]] + bd[[hh, i, j]]) / scale;
+                        scores[[i, j]] = sc;
+                        mx = mx.max(sc);
+                    }
+                    let mut sum = 0.0;
+                    for j in 0..t {
+                        let e = (scores[[i, j]] - mx).exp();
+                        scores[[i, j]] = e;
+                        sum += e;
+                    }
+                    for j in 0..t {
+                        scores[[i, j]] /= sum;
+                    }
                 }
             }
-            let ch = scores.dot(&vh); // [T, DK]
-            ctx.slice_mut(s![.., col..col + dk]).assign(&ch);
+            {
+                let _h = PhaseScope::new("mhsa_context", Bucket::Host);
+                let ch = scores.dot(&vh); // [T, DK]
+                ctx.slice_mut(s![.., col..col + dk]).assign(&ch);
+            }
         }
         ctx
         });
-        self.mm(&_sm, &b.m("self_attn.linear_out.weight"), &format!("{blk}.out"))
+        prof::phase::set_stage("mhsa_qkv");
+        self.mm(&ctx, &b.m("self_attn.linear_out.weight"), &format!("{blk}.out"))
     }
 
     fn conv_module(&self, x: &Array2<f32>, blk: usize) -> Array2<f32> {
@@ -191,9 +224,11 @@ impl FastConformerEncoder {
         let taps = dw3.index_axis(Axis(1), 0).to_owned(); // [D, 9]
         let dwb = b.v("conv.depthwise_conv.bias");
 
+        prof::phase::set_stage("conv_pw");
         let h = self.mm(x, &pw1.t().to_owned(), &format!("{blk}.pw1")); // [T, 2D] (pw1.T = [D, 2D])
         // GLU: a * sigmoid(g)
         let glu = prof::time("glu", || {
+            let _h = PhaseScope::new("conv_glu", Bucket::Host);
             let mut glu = Array2::<f32>::zeros((t, d));
             for i in 0..t {
                 for c in 0..d {
@@ -202,11 +237,16 @@ impl FastConformerEncoder {
             }
             glu
         });
-        // depthwise along time: [D, T]
-        let glu_t = glu.t().to_owned();
-        let mut dwc = prof::time("dwconv", || dwconv1d(&glu_t, &taps, &dwb, 9)); // [D, T]
-        silu_inplace(&mut dwc);
-        let back = dwc.t().to_owned(); // [T, D]
+        // depthwise along time: [D, T]. Bracketing transposes + trailing SiLU are host math
+        // with no mm() inside, so they fold into the conv_dwconv Host leaf scope.
+        let back = prof::time("dwconv", || {
+            let _h = PhaseScope::new("conv_dwconv", Bucket::Host);
+            let glu_t = glu.t().to_owned();
+            let mut dwc = dwconv1d(&glu_t, &taps, &dwb, 9); // [D, T]
+            silu_inplace(&mut dwc);
+            dwc.t().to_owned() // [T, D]
+        });
+        prof::phase::set_stage("conv_pw");
         self.mm(&back, &pw2.t().to_owned(), &format!("{blk}.pw2"))
     }
 
@@ -215,15 +255,38 @@ impl FastConformerEncoder {
         let mut x = x.clone();
         let ff1 = prof::time("ff", || self.feed_forward(&x, b, blk, "ff1", "norm_feed_forward1.weight", "norm_feed_forward1.bias",
                                     "feed_forward1.linear1.weight", "feed_forward1.linear2.weight"));
-        x = x + ff1.mapv(|v| 0.5 * v);
-        let satt_in = prof::time("ln", || layernorm(&x, &b.v("norm_self_att.weight"), &b.v("norm_self_att.bias")));
-        x = &x + &prof::time("mhsa", || self.mhsa(&satt_in, blk, pos_enc));
-        let conv_in = prof::time("ln", || layernorm(&x, &b.v("norm_conv.weight"), &b.v("norm_conv.bias")));
-        x = &x + &prof::time("conv_mod", || self.conv_module(&conv_in, blk));
+        {
+            let _h = PhaseScope::new("residual", Bucket::Host);
+            x = x + ff1.mapv(|v| 0.5 * v); // macaron 0.5 scaling + residual add
+        }
+        let satt_in = prof::time("ln", || {
+            let _h = PhaseScope::new("ln", Bucket::Host);
+            layernorm(&x, &b.v("norm_self_att.weight"), &b.v("norm_self_att.bias"))
+        });
+        let mhsa_out = prof::time("mhsa", || self.mhsa(&satt_in, blk, pos_enc));
+        {
+            let _h = PhaseScope::new("residual", Bucket::Host);
+            x = &x + &mhsa_out;
+        }
+        let conv_in = prof::time("ln", || {
+            let _h = PhaseScope::new("ln", Bucket::Host);
+            layernorm(&x, &b.v("norm_conv.weight"), &b.v("norm_conv.bias"))
+        });
+        let conv_out = prof::time("conv_mod", || self.conv_module(&conv_in, blk));
+        {
+            let _h = PhaseScope::new("residual", Bucket::Host);
+            x = &x + &conv_out;
+        }
         let ff2 = prof::time("ff", || self.feed_forward(&x, b, blk, "ff2", "norm_feed_forward2.weight", "norm_feed_forward2.bias",
                                     "feed_forward2.linear1.weight", "feed_forward2.linear2.weight"));
-        x = x + ff2.mapv(|v| 0.5 * v);
-        layernorm(&x, &b.v("norm_out.weight"), &b.v("norm_out.bias"))
+        {
+            let _h = PhaseScope::new("residual", Bucket::Host);
+            x = x + ff2.mapv(|v| 0.5 * v); // macaron 0.5 scaling + residual add
+        }
+        {
+            let _h = PhaseScope::new("ln", Bucket::Host);
+            layernorm(&x, &b.v("norm_out.weight"), &b.v("norm_out.bias"))
+        }
     }
 
     /// Encoder block stack: x [T, hidden] -> [T, hidden]. (Contract entry point;
