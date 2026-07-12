@@ -4,6 +4,15 @@ Out-of-tree patches against the external AMD toolchains we build on, carried her
 "pinned + tethered patch" artifact (upstream PRs are deferred until the service is finished — owner call).
 Each patch names the upstream repo + the pinned commit it applies against.
 
+> STATUS (2026-07-12): the mlir-aie **build-speed** rows below are SUPERSEDED by the fd35e0ca toolchain
+> advance and are NO LONGER carried. The O(n^2)/lowering fixes (materialize-lower-once, slice-strip,
+> datawords-cache, shimdma-symbol-cache, MaterializeBDChains) MERGED upstream (#3178/#3211/#3212/#3216/#3316)
+> and are present in the pinned toolchain. The remaining caches/timers (core-elf-cache, compilecores-kernel-
+> cache, aiecc pass/phase timers) were re-checked and measured marginal on the post-merge base (core-elf-cache
+> 0 wall at B=128; kernel-cache-dedup ~1-3s + needs a rewrite; timers diagnostic-only) -- they are parked for a
+> fresh look, with source on fork branch xdna2-asr. These rows are retained as the design record. The IRON and
+> mlir-air rows remain live.
+
 | Patch | Upstream repo | Pinned at | What it does |
 |---|---|---|---|
 | `mlir-aie-cachyos.patch` | `mlir-aie` submodule | (submodule SHA) | bf16 BFP16 fast-path microkernel + CachyOS build fixes |
