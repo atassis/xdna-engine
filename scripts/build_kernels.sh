@@ -6,11 +6,16 @@
 set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"; cd "$REPO"
 source scripts/iron_env.sh
-bash scripts/sync_kernels.sh   # copy canonical custom kernels/designs into the build sandbox
+source scripts/kernel_sandbox.sh
 
 PE=mlir-aie/programming_examples
 MM=$PE/basic/matrix_multiplication/single_core
 MMW=$PE/basic/matrix_multiplication/whole_array
+for _bd in "$MMW/build" "$MM/build" "$PE/ml/dwconv1d/build" "$PE/ml/layernorm/build" "$PE/ml/silu/build"; do
+  ensure_fresh_sandbox "$_bd"
+done
+
+bash scripts/sync_kernels.sh   # copy canonical custom kernels/designs into the build sandbox
 
 echo "== dwconv1d k=5 =="
 make -C $PE/ml/dwconv1d NPU2=1
