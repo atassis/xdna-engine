@@ -6,6 +6,7 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 set -a; . "$REPO/toolchain.lock"; set +a
 source "$REPO/scripts/fast_build_env.sh"   # ccache + lld (no-ops if absent)
+source "$REPO/scripts/toolchain_gc.sh"
 
 # Resolve the MLIR core distro (the LLVM/MLIR framework aiecc is built ON -- NOT Peano). It is a
 # prebuilt dependency provisioned SEPARATELY by scripts/fetch_mlir_distro.sh (network); this script
@@ -48,6 +49,7 @@ _link_include_dirs() {
 if [ -f "$PYPKG" ] && grep -q "def resolve_program(self, device_name" "$PYPKG"; then
   _link_vendored_tools   # backfill vendored tools into already-built instances
   _link_include_dirs     # backfill include/ symlinks (aie_api + aie_kernels)
+  touch "$INST"          # record last-used (for gc_instances keep-newest-N); warm path never GCs
   echo "$INST"; exit 0   # cached, self-consistent
 fi
 echo "[toolchain_up] building instance $LOCKHASH ..." >&2
@@ -86,4 +88,6 @@ ln -sfn "$INST/build/python" "$INST/python"
 _link_include_dirs
 ln -sfn "$INST/build/bin" "$INST/bin"
 _link_vendored_tools
+touch "$INST"                                          # record last-used before GC (protects it as newest)
+gc_instances "${TOOLCHAIN_HOME:-$HOME/.cache/xdna2-build/instances}" "${TOOLCHAIN_KEEP:-4}" "$INST"
 echo "$INST"
