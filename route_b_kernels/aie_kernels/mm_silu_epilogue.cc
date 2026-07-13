@@ -143,6 +143,47 @@ static inline void mm_silu_epilogue_f32o(const float *__restrict pC_in,
   event1();
 }
 
+// silu(x), higher-precision hybrid: sigmoid via the bf16 tanh (bounded in [0,1],
+// so bf16 is accurate enough), but keep x and the FINAL x*sigmoid multiply in f32.
+// This removes the two bf16 roundings the plain f32o path incurs -- narrowing x
+// before the multiply, and rounding the silu output before the up-convert -- which
+// together cost ~+0.3 RU WER on the Parakeet FFN. The sigmoid stays bf16-tanh (a
+// full-f32 tanh blows the cycle budget, see the GELU note below); only a single
+// extra f32 mul is added, which is proven safe on this unit (the int8 dequant
+// epilogue below ships an f32 aie::mul). f32 acc in -> f32 out.
+template <int size>
+static inline void mm_silu_epilogue_f32o_hiprec(const float *__restrict pC_in,
+                                                float *__restrict pC_out) {
+  event0();
+  static_assert(size % 16 == 0, "tile size must be a multiple of 16");
+  const aie::vector<float, 16> halff = aie::broadcast<float, 16>(0.5f);
+  const aie::vector<bfloat16, 16> one = aie::broadcast<bfloat16, 16>(1.0f);
+  const aie::vector<bfloat16, 16> halfb = aie::broadcast<bfloat16, 16>(0.5f);
+  const float *__restrict in_ptr = pC_in;
+  float *__restrict out_ptr = pC_out;
+  AIE_PREPARE_FOR_PIPELINING
+  AIE_LOOP_MIN_ITERATION_COUNT(2)
+  for (int off = 0; off < size; off += 16) {
+    aie::vector<float, 16> accf = aie::load_v<16>(in_ptr);
+    in_ptr += 16;
+    // Keep the tanh ARGUMENT in f32 (x/2 in f32 from the un-rounded accumulator);
+    // only the tanh OUTPUT is bf16 (bounded in [-1,1], so bf16 is fine). This is the
+    // precision-critical fix vs the all-bf16 f32o path, which rounded x before tanh.
+    aie::vector<float, 16> half_x = aie::mul(accf, halff);
+    aie::vector<bfloat16, 16> tanh_half_x = aie::tanh<bfloat16>(half_x);
+    aie::vector<bfloat16, 16> tanh_p1 = aie::add(tanh_half_x, one);
+    aie::vector<bfloat16, 16> sig = aie::mul(tanh_p1, halfb); // bf16 sigmoid in [0,1]
+    // up-convert sigmoid to f32; final multiply uses the UN-rounded f32 x.
+    aie::accum<accfloat, 16> sacc;
+    sacc.from_vector(sig);
+    aie::vector<float, 16> sigf = sacc.to_vector<float>();
+    aie::vector<float, 16> outv = aie::mul(accf, sigf);
+    aie::store_v(out_ptr, outv);
+    out_ptr += 16;
+  }
+  event1();
+}
+
 // GELU (tanh approx, matches torch gelu(approximate="tanh") + the decode gelu_tile_bf16):
 //   gelu(x) = 0.5*x*(1 + tanh( sqrt(2/pi) * (x + 0.044715*x^3) ))
 // f32 acc in -> bf16 gelu -> f32 out (mirrors the silu f32o path). Used by the modal GELU mode (rtp[0]==2)
@@ -276,7 +317,9 @@ void mm_modal_epilogue_f32_f32(const float *__restrict c_in,
                                const int32_t *__restrict rtp) {
   // rtp[0]: 0=identity, 1=silu, 2=gelu (modal modes; baked per instruction stream).
   if (rtp[0] == 1) {
-    mm_silu_epilogue_f32o<EPI_M * EPI_N>(c_in, c_out);
+    // Higher-precision hybrid silu (f32 x + f32 final multiply, bf16 sigmoid) --
+    // WER-neutral vs the host f32 silu, unlike the all-bf16 f32o path.
+    mm_silu_epilogue_f32o_hiprec<EPI_M * EPI_N>(c_in, c_out);
   } else if (rtp[0] == 2) {
     mm_gelu_epilogue_f32o<EPI_M * EPI_N>(c_in, c_out);
   } else {

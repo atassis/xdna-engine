@@ -59,7 +59,8 @@ pub struct NpuMatmul {
     bo_tmp: Bo,
     bo_tr: Bo,
     slots: Vec<PipeSlot>, // 2-slot ring for the K-split pipeline (output N=1024)
-    streams: RefCell<HashMap<usize, Rc<NStream>>>, // N -> stream
+    modal: bool, // resident is the MODAL xclbin (fused f32-out silu/identity epilogue) vs plain matmul
+    streams: RefCell<HashMap<(usize, bool), Rc<NStream>>>, // (N, silu) -> stream
     wcache: RefCell<HashMap<String, Rc<Bo>>>,      // packed weight BOs by id
     ncache: RefCell<HashMap<String, usize>>,       // weight N (ncols) by id, paired with wcache
     pub stats: RefCell<NpuStats>,
@@ -79,17 +80,28 @@ impl NpuMatmul {
         let xclbin = if let Ok(p) = std::env::var("NPU_RESIDENT_XCLBIN") {
             PathBuf::from(p)
         } else {
-            let mut chosen = None;
-            for n in ["4096", "2048", "1024"] {
-                let cand = base.join(format!("final_512x1024x{n}_{tile}_8c.xclbin"));
-                if cand.exists() {
-                    chosen = Some(cand);
-                    break;
+            // A1 (ff_act on-chip): prefer the MODAL resident xclbin (fused f32-out epilogue; the
+            // per-inst-stream RTP selects silu@N=4096 / identity elsewhere -> the FFN SiLU runs on
+            // chip with zero extra hw-context switches). Fall back to the plain matmul xclbin if the
+            // modal build is absent (then `modal=false` and the host keeps applying silu).
+            let modal = base.join(format!("final_512x1024x4096_{tile}_8c_modalsilu.xclbin"));
+            if modal.exists() {
+                modal
+            } else {
+                let mut chosen = None;
+                for n in ["4096", "2048", "1024"] {
+                    let cand = base.join(format!("final_512x1024x{n}_{tile}_8c.xclbin"));
+                    if cand.exists() {
+                        chosen = Some(cand);
+                        break;
+                    }
                 }
+                chosen.unwrap_or_else(|| base.join(format!("final_512x1024x4096_{tile}_8c.xclbin")))
             }
-            chosen.unwrap_or_else(|| base.join(format!("final_512x1024x4096_{tile}_8c.xclbin")))
         };
-        eprintln!("[npu] resident xclbin = {}", xclbin.display());
+        // The modal resident bakes the silu/identity epilogue; the plain one does not (host silu).
+        let modal = xclbin.file_name().and_then(|s| s.to_str()).is_some_and(|s| s.contains("modal"));
+        eprintln!("[npu] resident xclbin = {} (modal={modal})", xclbin.display());
         let kern = dev
             .load_kernel(xclbin.to_str().unwrap(), None)
             .unwrap_or_else(|e| panic!("load resident {}: {e:?}", xclbin.display()));
@@ -115,6 +127,7 @@ impl NpuMatmul {
             bo_tmp,
             bo_tr,
             slots,
+            modal,
             streams: RefCell::new(HashMap::new()),
             wcache: RefCell::new(HashMap::new()),
             ncache: RefCell::new(HashMap::new()),
@@ -122,12 +135,22 @@ impl NpuMatmul {
         }
     }
 
-    fn stream(&self, n: usize) -> Rc<NStream> {
-        if let Some(s) = self.streams.borrow().get(&n) {
+    /// Per-N instruction stream. On the MODAL resident, `silu` picks the baked-RTP mode: the
+    /// `modalsilu` stream (fc1 / ff.l1, N=4096) applies SiLU on chip, `modalid` is a numerically
+    /// identity epilogue (every other GEMM). On the plain resident, `silu` is ignored (there is no
+    /// on-chip epilogue; the host applies silu) and the classic insts_*_8c.txt stream is used.
+    fn stream(&self, n: usize, silu: bool) -> Rc<NStream> {
+        let key = (n, silu && self.modal);
+        if let Some(s) = self.streams.borrow().get(&key) {
             return s.clone();
         }
         let g = |i| self.kern.group_id(i).unwrap();
-        let insts = self.base.join(format!("insts_512x1024x{n}_{}_8c.txt", self.tile));
+        let insts = if self.modal {
+            let mode = if silu { "modalsilu" } else { "modalid" };
+            self.base.join(format!("insts_512x1024x{n}_{}_8c_{mode}.txt", self.tile))
+        } else {
+            self.base.join(format!("insts_512x1024x{n}_{}_8c.txt", self.tile))
+        };
         let bytes = std::fs::read(&insts).unwrap_or_else(|e| panic!("read {}: {e}", insts.display()));
         let n_instr = bytes.len() / 4;
         let instr = self.dev.alloc_bo(&self.kern, bytes.len(), FLAG_CACHEABLE, g(1)).unwrap();
@@ -135,8 +158,14 @@ impl NpuMatmul {
         instr.sync_to_device().unwrap();
         let bo_c = self.dev.alloc_bo(&self.kern, PAD_M * n * 4, FLAG_HOST_ONLY, g(5)).unwrap();
         let s = Rc::new(NStream { instr, n_instr, bo_c });
-        self.streams.borrow_mut().insert(n, s.clone());
+        self.streams.borrow_mut().insert(key, s.clone());
         s
+    }
+
+    /// True when the resident is the modal xclbin (the NPU applies the FFN SiLU epilogue on chip,
+    /// so the host must NOT re-apply it). False on the plain resident / host fallback.
+    pub fn modal(&self) -> bool {
+        self.modal
     }
 
     fn weight_bo(&self, id: &str, b_km: ArrayView2<f32>) -> Rc<Bo> {
@@ -160,9 +189,10 @@ impl NpuMatmul {
     }
 
     /// One resident-kernel dispatch: A[m,KRES] (zero-padded) @ wbo[KRES,n] -> C[m,n].
-    fn dispatch(&self, a_km: ArrayView2<f32>, wbo: &Bo, n: usize) -> Array2<f32> {
+    /// `silu=true` (only fc1 / ff.l1 on the modal resident) applies the on-chip SiLU epilogue.
+    fn dispatch(&self, a_km: ArrayView2<f32>, wbo: &Bo, n: usize, silu: bool) -> Array2<f32> {
         let m = a_km.nrows();
-        let st = self.stream(n);
+        let st = self.stream(n, silu);
         let stage = crate::prof::phase::current_stage();
         // (a) input marshaling: pack A -> bf16 + upload (host->device, no math).
         // pack only the m REAL rows of A: matmul row i depends only on A row i, so the kernel's
@@ -227,7 +257,7 @@ impl NpuMatmul {
 
         if k == KRES {
             let wbo = self.weight_bo(id, b.view());
-            return self.dispatch(a.view(), &wbo, n);
+            return self.dispatch(a.view(), &wbo, n, false);
         }
         assert_eq!(k % KRES, 0, "K={k} not a multiple of {KRES}");
         assert_eq!(n, 1024, "K-split path assumes N=1024 (ff.l2)");
@@ -261,7 +291,7 @@ impl NpuMatmul {
                 assert_eq!(b.nrows(), KRES, "lazy K={k} weight nrows {} != {KRES}", b.nrows());
                 (self.weight_bo(id, b.view()), n)
             };
-            return self.dispatch(a.view(), &wbo, n);
+            return self.dispatch(a.view(), &wbo, n, false);
         }
         // K-split: if ALL of {id}.0..parts-1 are cached, dispatch without make_b; else build `b`
         // once and pack the partials from it (identical to matmul_id's packing).
@@ -288,13 +318,37 @@ impl NpuMatmul {
         })
     }
 
+    /// Like [`matmul_id_lazy`] but applies the FFN SiLU activation as the on-chip GEMM epilogue
+    /// (A1 / `ff_act` on-chip). Only the single-dispatch K=KRES path is supported (fc1 / ff.l1 is
+    /// always K=1024, N=4096). On the MODAL resident this dispatches the `modalsilu` stream so
+    /// `out = silu(A @ B)` comes back already activated -- the host must NOT re-apply silu. On the
+    /// plain resident (`modal=false`) the epilogue is a no-op (`silu` flag ignored by `stream`), so
+    /// the caller falls back to host silu; use [`Self::modal`] to branch.
+    pub fn matmul_id_lazy_silu<F: FnOnce() -> Array2<f32>>(&self, a: &Array2<f32>, make_b: F, id: &str) -> Array2<f32> {
+        let (m, k) = a.dim();
+        assert!(m <= PAD_M);
+        assert_eq!(k, KRES, "matmul_id_lazy_silu is single-dispatch only (fc1 K={KRES})");
+        self.stats.borrow_mut().calls += 1;
+        let cached = self.wcache.borrow().get(id).cloned();
+        let (wbo, n) = if let Some(bo) = cached {
+            let n = *self.ncache.borrow().get(id).expect("ncache miss on wcache hit");
+            (bo, n)
+        } else {
+            let b = make_b();
+            let n = b.ncols();
+            assert_eq!(b.nrows(), KRES, "lazy-silu K={k} weight nrows {} != {KRES}", b.nrows());
+            (self.weight_bo(id, b.view()), n)
+        };
+        self.dispatch(a.view(), &wbo, n, true)
+    }
+
     /// K-split 2-slot pipeline (ff.l2: K=4096, N=1024): submit partial[i] while accumulating
     /// partial[i-1] (mirrors ctx2 forward_pipelined). Partials are independent (summed). `get_w(i)`
     /// yields the cached/packed weight BO for partial i (lazy per-partial so the first partial's
     /// pack overlaps nothing, matching the original). Numerics identical across callers.
     fn ksplit_dispatch<G: Fn(usize) -> Rc<Bo>>(&self, a: &Array2<f32>, n: usize, parts: usize, get_w: G) -> Array2<f32> {
         let m = a.nrows();
-        let st = self.stream(n);
+        let st = self.stream(n, false); // ff.l2 K-split output has no activation (identity epilogue)
         // Phase-timing stage label for this K-split op; each partial's pack/read is Marshal and
         // each dispatch-launch + wait is Npu (the pipeline overlaps them, so per-bucket wall
         // sums may exceed e2e — report() surfaces that as overlap_ms).

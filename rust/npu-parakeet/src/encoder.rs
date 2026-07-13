@@ -72,6 +72,33 @@ impl FastConformerEncoder {
         a.dot(&b)
     }
 
+    /// Lazy matmul that fuses the FFN SiLU as the on-chip GEMM epilogue when the modal resident is
+    /// loaded (A1 / `ff_act` on-chip). On that path the result is already `silu(a @ b)`; on the
+    /// plain NPU resident or the host fallback it returns the raw `a @ b` and the caller applies
+    /// host silu (gated on [`Self::ff_act_on_chip`]).
+    fn mm_lazy_silu<F: FnOnce() -> Array2<f32>>(&self, a: &Array2<f32>, make_b: F, id: &str) -> Array2<f32> {
+        #[cfg(feature = "npu")]
+        {
+            if let Some(npu) = &self.npu {
+                return npu.matmul_id_lazy_silu(a, make_b, id);
+            }
+        }
+        let _ = id;
+        let b = make_b();
+        a.dot(&b)
+    }
+
+    /// True when the FFN SiLU is applied on chip (modal resident), so the host must skip it.
+    fn ff_act_on_chip(&self) -> bool {
+        #[cfg(feature = "npu")]
+        {
+            if let Some(npu) = &self.npu {
+                return npu.modal();
+            }
+        }
+        false
+    }
+
     fn feed_forward(&self, x: &Array2<f32>, b: &BlockWeights, blk: usize, tag: &str, norm_w: &str, norm_b: &str, l1: &str, l2: &str) -> Array2<f32> {
         let stage: &'static str = if tag == "ff1" { "ff1" } else { "ff2" };
         let n = {
@@ -86,9 +113,12 @@ impl FastConformerEncoder {
         // still attributes; a hit skips the closure (and thus the scope) entirely.
         let mut h = {
             prof::phase::set_stage(stage);
-            self.mm_lazy(&n, || { let _wp = PhaseScope::new("ff_wprep", Bucket::Marshal); b.m(l1) }, &format!("{blk}.{tag}.l1")) // [T, DFF]
+            // A1: fc1 fuses SiLU into the GEMM epilogue on the modal resident (result already
+            // activated). ff_wprep stays inside the lazy closure so a weight-BO miss still attributes.
+            self.mm_lazy_silu(&n, || { let _wp = PhaseScope::new("ff_wprep", Bucket::Marshal); b.m(l1) }, &format!("{blk}.{tag}.l1")) // [T, DFF]
         };
-        {
+        // Host SiLU only when the NPU epilogue did not apply it (plain resident / host fallback).
+        if !self.ff_act_on_chip() {
             let _h = PhaseScope::new("ff_act", Bucket::Host);
             silu_inplace(&mut h);
         }
