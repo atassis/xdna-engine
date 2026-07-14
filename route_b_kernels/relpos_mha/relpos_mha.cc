@@ -469,6 +469,16 @@ extern "C" void relpos_full_bake(bfloat16 *restrict qkv, bfloat16 *restrict qvp,
 #define RELPOS_TQ 8
 #endif
 
+// STEP-C (single-xclbin serves any T <= RELPOS_T): the ACTIVE key count. The buffers
+// (g_ac/g_bd/g_probs) are sized/strided by the BAKED RELPOS_T, but the softmax attends
+// only to RELPOS_TACTIVE keys (and rel_shift uses it), so a MAX-T=172 xclbin computes
+// correct attention for a shorter clip by padding k/p/V to RELPOS_T. Default = RELPOS_T
+// (no padding, identical to before). A future step makes this a per-dispatch runtime
+// value; this compile-time form de-risks the pad-and-attend-active-T compute first.
+#ifndef RELPOS_TACTIVE
+#define RELPOS_TACTIVE RELPOS_T
+#endif
+
 // ---------------------------------------------------------------------------
 // BRICK 2 (row-tiled) -- rel_shift + score add/scale + exp2 softmax, GENERALIZED
 // to a query-tile row count Tq DISTINCT from the key count T, with the rel_shift
@@ -483,33 +493,42 @@ extern "C" void relpos_full_bake(bfloat16 *restrict qkv, bfloat16 *restrict qvp,
 static inline void relpos_scores_softmax_rows(float *restrict AC,
                                               float *restrict BD,
                                               bfloat16 *restrict probs, int Tq,
-                                              int T, int P, int q0,
+                                              int T, int P, int t_active, int q0,
                                               float inv_scale) {
+  // T = BAKED buffer stride (RELPOS_T); t_active = ACTIVE key count (<= T). Row strides
+  // (ac_row/prob_row = base + il*T, bd_row stride P) use T; the softmax attends only
+  // t_active keys and rel_shift uses t_active. So a MAX-T xclbin serves a shorter clip:
+  // pad k/p/V to T, and because pad V rows are zero, ctx ignores the pad keys without
+  // touching probs beyond t_active. t_active == T recovers the original behavior.
   alignas(aie::vector_decl_align) static float srow[RELPOS_TMAX];
   aie::vector<float, VL> inv_scale_v = aie::broadcast<float, VL>(inv_scale);
   aie::vector<float, VL> log2e_v = aie::broadcast<float, VL>(LOG2E);
 
   for (int il = 0; il < Tq; il++) {
+    if (q0 + il >= t_active) continue; // pad query row (output discarded); skipping
+                                       // also avoids a negative rel_shift base (OOB BD).
     const float *ac_row = AC + il * T;
-    // GLOBAL-INDEX rel_shift: contiguous length-T window of BD row il starting at
-    // column (T-1) - (q0 + il). q0=0 (single tile) recovers the (T-1-il) form.
-    const float *bd_row = BD + il * P + (T - 1 - (q0 + il));
+    // GLOBAL-INDEX rel_shift over t_active keys: length-t_active window of BD row il at
+    // column (t_active-1) - (q0+il) (>= 0 since q0+il < t_active). q0=0,t_active=T
+    // recovers the (T-1-il) form. Row stride is the BAKED P (buffer), the window uses
+    // t_active.
+    const float *bd_row = BD + il * P + (t_active - 1 - (q0 + il));
     bfloat16 *prob_row = probs + il * T;
 
     // pass 1: scores = (AC + BD_shifted) * inv_scale ; row max (f32)
     float rowmax = -3.0e38f;
     int j = 0;
-    for (; j + VL <= T; j += VL) {
+    for (; j + VL <= t_active; j += VL) {
       // ac_row/prob_row have row stride T (or P), which is NOT a multiple of VL for
       // real T (e.g. T=172 -> 172%16=12), so the per-row base is unaligned. Aligned
       // load_v/store_v truncate to 128b and corrupt -> use unaligned everywhere the
       // stride is T/P (same root cause as the bd_row rel_shift load above).
       aie::vector<float, VL> a = aie::load_unaligned_v<VL>(ac_row + j);
-      // bd_row = BD + i*P + (T-1-i): the rel_shift base is NEVER VL-aligned (the
-      // (T-1-i) shift is not a multiple of 16), so this MUST be an unaligned load.
-      // aie::load_v is an ALIGNED load -> on aie2p it truncates the address to the
-      // 128b boundary and returns shifted/garbage BD (masked when BD<<AC, e.g. real
-      // block-0 after rescale; exposed the moment BD ~ AC, e.g. synth / spread).
+      // bd_row = BD + i*P + (t_active-1-i): the rel_shift base is NEVER VL-aligned (the
+      // shift is not a multiple of 16), so this MUST be an unaligned load. aie::load_v
+      // is an ALIGNED load -> on aie2p it truncates the address to the 128b boundary and
+      // returns shifted/garbage BD (masked when BD<<AC, e.g. real block-0 after rescale;
+      // exposed the moment BD ~ AC, e.g. synth / spread).
       aie::vector<float, VL> b = aie::load_unaligned_v<VL>(bd_row + j);
       aie::vector<float, VL> s =
           aie::mul(aie::add(a, b), inv_scale_v).to_vector<float>();
@@ -517,7 +536,7 @@ static inline void relpos_scores_softmax_rows(float *restrict AC,
       float cm = aie::reduce_max(s);
       if (cm > rowmax) rowmax = cm;
     }
-    for (; j < T; j++) {
+    for (; j < t_active; j++) {
       float s = (ac_row[j] + bd_row[j]) * inv_scale;
       srow[j] = s;
       if (s > rowmax) rowmax = s;
@@ -527,7 +546,7 @@ static inline void relpos_scores_softmax_rows(float *restrict AC,
     aie::vector<float, VL> maxv = aie::broadcast<float, VL>(rowmax);
     aie::accum<accfloat, VL> sumacc = aie::zeros<accfloat, VL>();
     j = 0;
-    for (; j + VL <= T; j += VL) {
+    for (; j + VL <= t_active; j += VL) {
       aie::vector<float, VL> s = aie::load_v<VL>(srow + j);
       aie::vector<float, VL> d = aie::sub(s, maxv);
       aie::vector<float, VL> sl = aie::mul(d, log2e_v).to_vector<float>();
@@ -536,22 +555,23 @@ static inline void relpos_scores_softmax_rows(float *restrict AC,
       sumacc = aie::add(sumacc, e);
     }
     float sum = aie::reduce_add(sumacc.to_vector<float>());
-    for (; j < T; j++) {
+    for (; j < t_active; j++) {
       float e = exp2_scalar((srow[j] - rowmax) * LOG2E);
       prob_row[j] = (bfloat16)e;
       sum += e;
     }
 
-    // pass 3: normalize probs *= 1/sum
+    // pass 3: normalize probs *= 1/sum  (only the t_active real keys; pad keys are
+    // nulled by zero pad-V in ctx, so probs[t_active..T) need not be touched)
     bfloat16 inv_sum = (bfloat16)aie::inv(sum);
     aie::vector<bfloat16, VL> inv_sum_v = aie::broadcast<bfloat16, VL>(inv_sum);
     j = 0;
-    for (; j + VL <= T; j += VL) {
+    for (; j + VL <= t_active; j += VL) {
       aie::vector<bfloat16, VL> e = aie::load_unaligned_v<VL>(prob_row + j);
       aie::store_unaligned_v(prob_row + j,
                              aie::mul(e, inv_sum_v).to_vector<bfloat16>());
     }
-    for (; j < T; j++) {
+    for (; j < t_active; j++) {
       prob_row[j] = (bfloat16)((float)prob_row[j] * (float)inv_sum);
     }
   }
@@ -633,7 +653,7 @@ extern "C" void relpos_rowtiled_bake(bfloat16 *restrict quv,
     bfloat16 *ctx_t = ctx + q0 * DK;         // [tq, DK]
     relpos_dot_matmul(qu_t, k, g_ac, tq, T); // AC_tile = qu_t @ k^T  [tq,T]
     relpos_dot_matmul(qv_t, p, g_bd, tq, P); // BD_tile = qv_t @ p^T  [tq,P]
-    relpos_scores_softmax_rows(g_ac, g_bd, g_probs, tq, T, P, q0, inv_scale);
+    relpos_scores_softmax_rows(g_ac, g_bd, g_probs, tq, T, P, T, q0, inv_scale);
     relpos_ctx_matmul_rows(g_probs, V, ctx_t, tq, T); // ctx_tile = probs @ V
   }
   event1();
@@ -809,7 +829,7 @@ extern "C" void relpos_kpvstream_bake(bfloat16 *restrict quv,
       relpos_dot_block(qv_t, p + j0 * DK, g_bd, tq, pb, j0, P);
     }
     // -- softmax over the assembled full score rows (GLOBAL-index rel_shift) --
-    relpos_scores_softmax_rows(g_ac, g_bd, g_probs, tq, T, P, q0, inv_scale);
+    relpos_scores_softmax_rows(g_ac, g_bd, g_probs, tq, T, P, T, q0, inv_scale);
     // -- phase V: stream V in KB-row blocks, accumulate ctx in resident f32 --
     relpos_ctx_zero(g_ctxf, tq);
     for (int j0 = 0; j0 < T; j0 += KB) {
@@ -872,7 +892,9 @@ extern "C" void relpos_stream_softmax(float *restrict AC, float *restrict BD,
                                       int32_t T, int32_t P, int32_t q0) {
   static_assert(DK == 128, "baked inv_scale is 1/sqrt(128)");
   event0();
-  relpos_scores_softmax_rows(AC, BD, probs, Tq, T, P, q0, 0.08838834764831843f);
+  // STEP-C knob: attend RELPOS_TACTIVE keys (default RELPOS_T). A MAX-T build with
+  // RELPOS_TACTIVE < RELPOS_T computes correct attention for a shorter clip padded to T.
+  relpos_scores_softmax_rows(AC, BD, probs, Tq, T, P, RELPOS_TACTIVE, q0, 0.08838834764831843f);
   event1();
 }
 

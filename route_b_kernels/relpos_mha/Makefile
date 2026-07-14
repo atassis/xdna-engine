@@ -21,6 +21,10 @@ TQ ?= 8
 # Key-block row count for STEP>=7 (block-streamed k/p/V); baked as -DRELPOS_KB.
 # T=172=4*43 -> KB=43 blocks k/V with no pad. Ignored by STEP<7.
 KB ?= 43
+# STEP-C: active key count (baked -DRELPOS_TACTIVE). Default = T (full length, no pad).
+# A MAX-T build (T=172) with TACTIVE<T computes correct attention for a shorter clip
+# padded to T -- de-risks the single-xclbin-serves-any-T path.
+TACTIVE ?= ${T}
 
 # STEP selects which entry point / generator this xclbin drives:
 #   STEP=1 (default) -- relpos_scores_softmax : host-fed AC + BD -> probs (no matmul).
@@ -81,7 +85,7 @@ endif
 build/%.cc.o: %.cc
 	mkdir -p ${@D}
 ifeq ($(devicename),npu2)
-	cd ${@D} && ${PEANO_INSTALL_DIR}/bin/clang++ ${PEANOWRAP2P_FLAGS} -DRELPOS_T=${T} -DRELPOS_TQ=${TQ} -DRELPOS_KB=${KB} -c $< -o ${@F}
+	cd ${@D} && ${PEANO_INSTALL_DIR}/bin/clang++ ${PEANOWRAP2P_FLAGS} -DRELPOS_T=${T} -DRELPOS_TQ=${TQ} -DRELPOS_KB=${KB} -DRELPOS_TACTIVE=${TACTIVE} -c $< -o ${@F}
 else
 	echo "Only npu2 supported for this example"
 endif
