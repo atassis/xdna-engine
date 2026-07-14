@@ -96,7 +96,7 @@ import argparse
 import numpy as np
 from ml_dtypes import bfloat16
 
-from aie.iron import Buffer, Kernel, ObjectFifo, Program, Runtime, Worker
+from aie.iron import Buffer, Kernel, ObjectFifo, Program, Runtime, Worker, WorkerRuntimeBarrier
 from aie.iron.device import NPU1, NPU2
 from aie.iron.controlflow import range_
 from aie.helpers.taplib import TensorTiler2D
@@ -117,7 +117,12 @@ def ceildiv(a, b):
     return (a + b - 1) // b
 
 
-def my_relpos_stream(dev, T, TQ, KB):
+def my_relpos_stream(dev, T, TQ, KB, t_active=None):
+    # STEP-C: T is the BAKED buffer/dataflow size (the single MAX-T xclbin, e.g. 172);
+    # t_active <= T is the ACTIVE key count the softmax attends (a per-insts constant on
+    # the SAME xclbin, so one xclbin serves any clip padded to T). Default = T (full).
+    if t_active is None:
+        t_active = T
     P = 2 * T - 1
     n_qt = ceildiv(T, TQ)   # query tiles
     n_kb = ceildiv(T, KB)   # k-blocks (also V-blocks)
@@ -150,6 +155,15 @@ def my_relpos_stream(dev, T, TQ, KB):
     g_probs = Buffer(probs_ty, name="g_probs")
     g_ctxf = Buffer(ctxf_ty, name="g_ctxf")
 
+    # STEP-C: t_active RTP register (int32[16], use_write_rtp). The softmax kernel reads
+    # rtp[0] at runtime, so the ELF is t_active-agnostic => ONE xclbin serves any t_active.
+    # The value is written into the instruction stream (inline_ops const below => per-insts
+    # on the same xclbin, the modal-matmul pattern). A barrier makes the write visible to
+    # the worker before it reads rtp[0].
+    rtp_ty = np.ndarray[(16,), np.dtype[np.int32]]
+    tactive_rtp = Buffer(rtp_ty, name="tactive_rtp", use_write_rtp=True)
+    rtp_barrier = WorkerRuntimeBarrier()
+
     # ---- ObjectFifos ----
     # BOTH input channels are DIRECT block fifos whose obj_type IS the streamed
     # block (of_quv=[TQ,DK], of_kpv=[KB,DK]); the shim streams a large fill as many
@@ -181,7 +195,7 @@ def my_relpos_stream(dev, T, TQ, KB):
     dot_p = Kernel("relpos_stream_dot_p", "kernels.a",
                    [quv_blk_ty, kblk_ty, bd_ty, np.int32, np.int32, np.int32, np.int32])
     softmax_k = Kernel("relpos_stream_softmax", "kernels.a",
-                       [ac_ty, bd_ty, probs_ty, np.int32, np.int32, np.int32, np.int32])
+                       [ac_ty, bd_ty, probs_ty, rtp_ty, np.int32, np.int32, np.int32, np.int32])
     ctxzero_k = Kernel("relpos_stream_ctx_zero", "kernels.a", [ctxf_ty, np.int32])
     ctx_k = Kernel("relpos_stream_ctx", "kernels.a",
                    [probs_ty, kblk_ty, ctxf_ty, np.int32, np.int32, np.int32, np.int32])
@@ -198,7 +212,7 @@ def my_relpos_stream(dev, T, TQ, KB):
     Pp_full = (P // KB) * KB          # p full-block rows
     p_rag = P - Pp_full               # ragged p block rows (42 at P=343,KB=43)
 
-    def core_body(quv_in, kpv_in, ctx_out, ac, bd, probs, ctxf,
+    def core_body(quv_in, kpv_in, ctx_out, ac, bd, probs, ctxf, rtp, bar,
                   dotk, dotp, smax, czero, ctxb, narrow):
         # ONE per-query-tile body, emitted ONCE inside a real hardware loop over
         # the query tiles (the 22x multiplier -- range_, index_cast'd runtime q0)
@@ -237,8 +251,9 @@ def my_relpos_stream(dev, T, TQ, KB):
                 kpv_in.release(1)
             quv_in.release(1)
 
-            # -- softmax over assembled full score rows (GLOBAL-index rel_shift q0) --
-            smax(ac, bd, probs, tq, T, P, q0)
+            # -- softmax over the first rtp[0]=t_active keys (GLOBAL-index rel_shift q0);
+            #    buffer stride stays T so a MAX-T xclbin serves any t_active <= T --
+            smax(ac, bd, probs, rtp, tq, T, P, q0)
 
             # -- phase V: V full-blocks then ragged -> ctx (resident f32 accumulate) --
             eo = ctx_out.acquire(1)
@@ -254,6 +269,9 @@ def my_relpos_stream(dev, T, TQ, KB):
             narrow(ctxf, eo, tq)
             ctx_out.release(1)
 
+        # STEP-C: wait until the runtime sequence has written rtp[0]=t_active before the
+        # softmax (which reads rtp[0]) runs. Mirrors the modal-matmul RTP barrier.
+        bar.wait_for_value(1)
         # range_(0, Tq_full, TQ) yields q0 = 0, TQ, 2*TQ, ... directly (NO multiply);
         # tq == TQ for every full tile.
         for q0iv in range_(0, Tq_full, TQ):
@@ -265,7 +283,7 @@ def my_relpos_stream(dev, T, TQ, KB):
     worker = Worker(
         core_body,
         [of_quv.cons(), of_kpv.cons(), of_ctx.prod(),
-         g_ac, g_bd, g_probs, g_ctxf,
+         g_ac, g_bd, g_probs, g_ctxf, tactive_rtp, rtp_barrier,
          dot_k, dot_p, softmax_k, ctxzero_k, ctx_k, narrow_k],
     )
 
@@ -281,6 +299,14 @@ def my_relpos_stream(dev, T, TQ, KB):
 
     rt = Runtime()
     with rt.sequence(quv_arg_ty, kpv_ty, ctx_arg_ty) as (QUV, KPV, CX):
+        # STEP-C: bake t_active into this instruction stream's RTP, then release the
+        # barrier so the worker reads it. Same xclbin, different t_active => different
+        # insts (the modal-matmul per-insts pattern). t_active == T is the full-length
+        # stream. (A host-set variant would source this from a runtime input instead.)
+        def set_tactive(p):
+            p[0] = t_active
+        rt.inline_ops(set_tactive, [tactive_rtp])
+        rt.set_barrier(rtp_barrier, 1)
         rt.start(worker)
         rt.fill(of_quv.prod(), QUV)              # tile-interleaved qu/qv blocks
         rt.fill(of_kpv.prod(), KPV, tap=kpv_tap)  # 1 BD, whole kpv replayed n_qt as [KB,DK] blocks
@@ -295,6 +321,9 @@ p.add_argument("-T", "--frames", required=True, dest="T", type=int,
                help="encoder frame count T (P = 2T-1); must match -DRELPOS_T")
 p.add_argument("--tq", type=int, default=TQ, help="query-tile rows; must match -DRELPOS_TQ")
 p.add_argument("--kb", type=int, default=KB, help="key-block rows; must match -DRELPOS_KB")
+p.add_argument("--tactive", type=int, default=0,
+               help="STEP-C active key count (<= T); 0 => T (full). One MAX-T xclbin serves "
+                    "any t_active by baking it into the instruction stream (ELF is t_active-agnostic).")
 opts = p.parse_args(sys.argv[1:])
 
 if opts.device == "npu":
@@ -304,4 +333,4 @@ elif opts.device == "npu2":
 else:
     raise ValueError(f"unknown device {opts.device}")
 
-print(my_relpos_stream(dev, opts.T, opts.tq, opts.kb))
+print(my_relpos_stream(dev, opts.T, opts.tq, opts.kb, opts.tactive or opts.T))

@@ -96,7 +96,7 @@ build/kernels.a: build/relpos_mha.cc.o
 # STEP=8 (streaming) generator also needs TQ/KB to compute block counts + unroll;
 # STEP<=7 bake TQ/KB in the .cc only, so pass just -T there.
 ifeq ($(STEP),8)
-GEN_EXTRA = --tq ${TQ} --kb ${KB}
+GEN_EXTRA = --tq ${TQ} --kb ${KB} --tactive ${TACTIVE}
 else
 GEN_EXTRA =
 endif

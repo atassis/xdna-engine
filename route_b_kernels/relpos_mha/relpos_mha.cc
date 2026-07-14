@@ -888,13 +888,18 @@ extern "C" void relpos_stream_ctx(bfloat16 *restrict probs,
 }
 
 extern "C" void relpos_stream_softmax(float *restrict AC, float *restrict BD,
-                                      bfloat16 *restrict probs, int32_t Tq,
+                                      bfloat16 *restrict probs,
+                                      int32_t *restrict rtp, int32_t Tq,
                                       int32_t T, int32_t P, int32_t q0) {
   static_assert(DK == 128, "baked inv_scale is 1/sqrt(128)");
   event0();
-  // STEP-C knob: attend RELPOS_TACTIVE keys (default RELPOS_T). A MAX-T build with
-  // RELPOS_TACTIVE < RELPOS_T computes correct attention for a shorter clip padded to T.
-  relpos_scores_softmax_rows(AC, BD, probs, Tq, T, P, RELPOS_TACTIVE, q0, 0.08838834764831843f);
+  // STEP-C: t_active is read from an RTP register (rtp[0]) at RUNTIME, so the ELF is
+  // t_active-agnostic and ONE MAX-T=RELPOS_T xclbin serves any t_active <= T. The value
+  // is set in the instruction stream (per-insts via inline_ops, or host-set per dispatch);
+  // buffer strides stay the baked T. A shorter clip padded to T gets correct attention
+  // over its real t_active keys (pad-V=0 nulls the pad keys in ctx).
+  int32_t t_active = rtp[0];
+  relpos_scores_softmax_rows(AC, BD, probs, Tq, T, P, t_active, q0, 0.08838834764831843f);
   event1();
 }
 
