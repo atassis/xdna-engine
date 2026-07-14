@@ -38,7 +38,7 @@ device (`fuser`). Do NOT auto-restart services mid-run.
 
 ```bash
 # from the PUBLIC checkout root (has the gitignored artifacts + toolchain):
-cd $XDNA_ENGINE
+cd "$XDNA_ENGINE"  # your xdna-engine checkout
 fuser -v /dev/accel/accel0 2>&1 || true      # confirm the NPU is free
 ```
 
@@ -51,7 +51,7 @@ FORWARD into the disposable mlir-aie sandbox (route_b_kernels is the source of
 truth -- never edit the mlir-aie copy).
 
 ```bash
-cd $XDNA_ENGINE
+cd "$XDNA_ENGINE"  # your xdna-engine checkout
 bash scripts/setup_route_b.sh            # idempotent: env + checkout + first sync
 source scripts/iron_env.sh               # PEANO_INSTALL_DIR, MLIR_AIE_DIR, aiecc on PATH
 bash scripts/sync_kernels.sh             # re-copy after any route_b_kernels edit
@@ -80,7 +80,7 @@ path (the oracle uses the identical effective scale). Use `--raw` for the true
 saturating regime.
 
 ```bash
-cd $XDNA_ENGINE
+cd "$XDNA_ENGINE"  # your xdna-engine checkout
 .venv-iron/bin/python scripts/run_npu_relpos_scores.py \
     --xclbin mlir-aie/programming_examples/ml/relpos_mha/build/final.xclbin \
     --insts  mlir-aie/programming_examples/ml/relpos_mha/build/insts.bin \
@@ -153,7 +153,7 @@ receives PACKED `qk[2T,DK]` bf16 (`qu = qk[0:T]`, `k = qk[T:2T]`) + host-fed
 ## (a2) Build the STEP-2 xclbin (T=32)
 
 ```bash
-cd $XDNA_ENGINE
+cd "$XDNA_ENGINE"  # your xdna-engine checkout
 bash scripts/setup_route_b.sh            # idempotent
 source scripts/iron_env.sh
 bash scripts/sync_kernels.sh             # copies the new step-2 generator too
@@ -177,7 +177,7 @@ the runner DEFAULTS to the rescaled non-degenerate softmax (divides qu/BD by std
 `--raw` drives the saturating regime.
 
 ```bash
-cd $XDNA_ENGINE
+cd "$XDNA_ENGINE"  # your xdna-engine checkout
 .venv-iron/bin/python scripts/run_npu_relpos_ac_scores.py \
     --xclbin mlir-aie/programming_examples/ml/relpos_mha/build/final.xclbin \
     --insts  mlir-aie/programming_examples/ml/relpos_mha/build/insts.bin \
