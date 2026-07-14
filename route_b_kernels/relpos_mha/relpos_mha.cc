@@ -114,6 +114,66 @@ static inline float exp2_scalar(float x) {
   return (float)e.get(0);
 }
 
+// SOFTWARE f32 2^x (x <= 0). The hw aie::exp2 is a bf16-OUTPUT LUT and, MEASURED on aie2p,
+// ~2-4% inaccurate -> ~0.024 ctx / +0.7% WER in the softmax; this poly is ~1e-4 accurate.
+// x = k + f, k = floor(x), f in [0,1); 2^x = 2^k * poly5(2^f).
+// NOINLINE is LOAD-BEARING: this function is device-correct standalone (probe_floor: full 2^x
+// rel-err 8.5e-5) but INLINING it into the big 3-pass softmax loop makes Peano -O2 miscompile it
+// to NaN (register-pressure codegen bug; candidate llvm-aie issue). noinline keeps it correct.
+static __attribute__((noinline)) aie::vector<float, VL> exp2f_vec(aie::vector<float, VL> x) {
+  aie::vector<int32_t, VL> ki = aie::to_fixed<int32_t>(x);          // round-to-nearest on aie2p
+  aie::vector<float, VL> kf = aie::to_float<float>(ki);
+  // floor: where x < kf, k -= 1 (correct even though to_fixed rounds, not truncates)
+  aie::vector<int32_t, VL> one = aie::broadcast<int32_t, VL>(1);
+  aie::vector<int32_t, VL> zero = aie::broadcast<int32_t, VL>(0);
+  ki = aie::sub(ki, aie::select(zero, one, aie::lt(x, kf)));
+  aie::vector<float, VL> f = aie::sub(x, aie::to_float<float>(ki)); // f in [0,1)
+  aie::vector<float, VL> p = aie::broadcast<float, VL>(0.0013333558f);
+  p = aie::add(aie::mul(p, f).to_vector<float>(), aie::broadcast<float, VL>(0.0096181291f));
+  p = aie::add(aie::mul(p, f).to_vector<float>(), aie::broadcast<float, VL>(0.0555041087f));
+  p = aie::add(aie::mul(p, f).to_vector<float>(), aie::broadcast<float, VL>(0.2402265069f));
+  p = aie::add(aie::mul(p, f).to_vector<float>(), aie::broadcast<float, VL>(0.6931471805f));
+  p = aie::add(aie::mul(p, f).to_vector<float>(), aie::broadcast<float, VL>(1.0f));
+  aie::vector<int32_t, VL> ebits =
+      aie::upshift(aie::add(ki, aie::broadcast<int32_t, VL>(127)), 23);
+  aie::vector<float, VL> p2k = ebits.cast_to<float>();
+  return aie::mul(p, p2k).to_vector<float>();
+}
+static inline float exp2f_scalar(float x) {
+  return exp2f_vec(aie::broadcast<float, VL>(x)).get(0);
+}
+
+// ---------------------------------------------------------------------------
+// MICRO-PROBE (STEP=9) -- isolate which aie2p f32<->int vector op mangles the
+// software exp2 floor. in[PROBE_N] f32 (a ramp) -> out[4*PROBE_N] f32, laid out as
+// [trunc | floor | frac | pow2k], each PROBE_N wide, so ONE device run vs numpy
+// pinpoints the failing op (to_fixed / to_float / select+lt / upshift+cast).
+// ---------------------------------------------------------------------------
+#ifndef PROBE_N
+#define PROBE_N 1024
+#endif
+extern "C" void probe_floor(float *restrict in, float *restrict out) {
+  event0();
+  for (int i = 0; i < PROBE_N; i += VL) {
+    aie::vector<float, VL> x = aie::load_v<VL>(in + i);
+    aie::vector<int32_t, VL> ki = aie::to_fixed<int32_t>(x);        // trunc toward 0
+    aie::vector<float, VL> trunc = aie::to_float<float>(ki);
+    aie::vector<int32_t, VL> one = aie::broadcast<int32_t, VL>(1);
+    aie::vector<int32_t, VL> zero = aie::broadcast<int32_t, VL>(0);
+    aie::vector<int32_t, VL> kf = aie::sub(ki, aie::select(zero, one, aie::lt(x, trunc)));
+    aie::vector<float, VL> flr = aie::to_float<float>(kf);          // floor(x)
+    aie::vector<float, VL> frac = aie::sub(x, flr);                 // f in [0,1)
+    aie::vector<int32_t, VL> ebits =
+        aie::upshift(aie::add(kf, aie::broadcast<int32_t, VL>(127)), 23);
+    aie::vector<float, VL> p2k = ebits.cast_to<float>();            // 2^floor(x)
+    aie::store_v(out + 0 * PROBE_N + i, frac);
+    aie::store_v(out + 1 * PROBE_N + i, p2k);
+    aie::store_v(out + 2 * PROBE_N + i, flr);
+    aie::store_v(out + 3 * PROBE_N + i, exp2f_vec(x)); // the EXACT softmax helper (noinline)
+  }
+  event1();
+}
+
 // ---------------------------------------------------------------------------
 // BRICK 2 -- rel_shift (strided relayout) FUSED with the score add/scale and the
 // vectorized-exp2 softmax over keys.
@@ -542,37 +602,38 @@ static inline void relpos_scores_softmax_rows(float *restrict AC,
       if (s > rowmax) rowmax = s;
     }
 
-    // pass 2: exp2((s - max) * log2e) -> bf16 probs ; running f32 sum
+    // pass 2: 2^((s - max) * log2e) via the SOFTWARE f32 exp2 (exp stays f32 in srow; the
+    // bf16-output hw exp2 was the dominant softmax error). SPLIT into an exp2 loop then a sum
+    // loop -- fusing exp2f + the accfloat sum in ONE loop miscompiles to NaN on aie2p (the
+    // helper is device-correct standalone; the dense fused loop trips codegen at -O1 AND -O2).
     aie::vector<float, VL> maxv = aie::broadcast<float, VL>(rowmax);
+    j = 0;
+    for (; j + VL <= t_active; j += VL) {
+      aie::vector<float, VL> sl =
+          aie::mul(aie::sub(aie::load_v<VL>(srow + j), maxv), log2e_v).to_vector<float>();
+      aie::store_v(srow + j, exp2f_vec(sl));      // f32 exp back into srow
+    }
+    for (; j < t_active; j++)
+      srow[j] = exp2f_scalar((srow[j] - rowmax) * LOG2E);
     aie::accum<accfloat, VL> sumacc = aie::zeros<accfloat, VL>();
     j = 0;
-    for (; j + VL <= t_active; j += VL) {
-      aie::vector<float, VL> s = aie::load_v<VL>(srow + j);
-      aie::vector<float, VL> d = aie::sub(s, maxv);
-      aie::vector<float, VL> sl = aie::mul(d, log2e_v).to_vector<float>();
-      aie::vector<bfloat16, VL> e = aie::exp2<bfloat16>(sl);
-      aie::store_unaligned_v(prob_row + j, e);
-      sumacc = aie::add(sumacc, e);
-    }
+    for (; j + VL <= t_active; j += VL)
+      sumacc = aie::add(sumacc, aie::load_v<VL>(srow + j));
     float sum = aie::reduce_add(sumacc.to_vector<float>());
-    for (; j < t_active; j++) {
-      float e = exp2_scalar((srow[j] - rowmax) * LOG2E);
-      prob_row[j] = (bfloat16)e;
-      sum += e;
-    }
+    for (; j < t_active; j++)
+      sum += srow[j];
 
-    // pass 3: normalize probs *= 1/sum  (only the t_active real keys; pad keys are
-    // nulled by zero pad-V in ctx, so probs[t_active..T) need not be touched)
-    bfloat16 inv_sum = (bfloat16)aie::inv(sum);
-    aie::vector<bfloat16, VL> inv_sum_v = aie::broadcast<bfloat16, VL>(inv_sum);
+    // pass 3: normalize probs = exp / sum in f32 (srow holds f32 exp) -> bf16 probs. Only the
+    // t_active real keys; pad keys are nulled by zero pad-V in ctx, so probs[t_active..T) unset.
+    float inv_sum = 1.0f / sum;
+    aie::vector<float, VL> inv_sum_v = aie::broadcast<float, VL>(inv_sum);
     j = 0;
     for (; j + VL <= t_active; j += VL) {
-      aie::vector<bfloat16, VL> e = aie::load_unaligned_v<VL>(prob_row + j);
-      aie::store_unaligned_v(prob_row + j,
-                             aie::mul(e, inv_sum_v).to_vector<bfloat16>());
+      aie::vector<float, VL> e = aie::load_v<VL>(srow + j);
+      aie::store_unaligned_v(prob_row + j, aie::mul(e, inv_sum_v).to_vector<bfloat16>());
     }
     for (; j < t_active; j++) {
-      prob_row[j] = (bfloat16)((float)prob_row[j] * (float)inv_sum);
+      prob_row[j] = (bfloat16)(srow[j] * inv_sum);
     }
   }
 }

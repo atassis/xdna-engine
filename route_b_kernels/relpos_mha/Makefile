@@ -48,7 +48,10 @@ TACTIVE ?= ${T}
 #                       wall. Needs the runner's --stream packing (tile-interleaved
 #                       QUV + padded KPV); see BUILD-AND-BENCH.md.
 STEP ?= 1
-ifeq ($(STEP),8)
+ifeq ($(STEP),9)
+targetname = probe_floor
+aie_py_src = probe_floor_iron.py
+else ifeq ($(STEP),8)
 targetname = relpos_rowtiled_stream
 aie_py_src = relpos_rowtiled_stream_iron.py
 else ifeq ($(STEP),7)
