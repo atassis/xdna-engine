@@ -172,36 +172,37 @@ KB must match `-DRELPOS_KB`; T=172=4*43 blocks k/V with no pad, p is 7 full + a
 
 Gate (both): `rel-L2 <= 0.08 AND corr >= 0.99` vs the fp32 host ctx.
 
-### 3e. CORE = REAL HARDWARE LOOPS (program-memory fix)
+### 3e. CORE = QUERY range_ + UNROLLED BLOCKS (two device-found bugs)
 
-The STEP=8 core sweeps are `aie.iron` `range_` loops (the whole_array_modal
-core_fn pattern: ObjectFifo acquire/release INSIDE `range_`), NOT static Python
-unrolling. The first cut unrolled everything (n_qt=22 query tiles x ~16 block
-calls = ~352 `func.call`s) and the ELF/CDO stage overflowed CORE PROGRAM memory
-(`_XAie_LoadProgMemSection(): Overflow` / `XAie_LoadElf failed`) -- an
-INSTRUCTION-count problem; the 54 KB L1 DATA budget (3b) was fine and the MLIR
-generated. Loop topology now (bounded to a handful of call sites):
+The core loop topology went through two device-driven corrections:
 
-  - query tiles: `range_(0, Tq_full, TQ)` -- the induction Value IS q0 (0, TQ,
-    2*TQ, ...; NO multiply). tq == TQ every iteration. The ragged final query
-    tile (tq = T % TQ = 4 at T=172) is PEELED as ONE static iteration so tq stays
-    a Python constant (no runtime min()).
-  - k / V blocks: `range_(0, Tk_full, KB)` (j0 = the induction Value); at
-    T=172,KB=43 there is no ragged block (172 = 4*43).
-  - p blocks: `range_(0, Pp_full, KB)` for the 7 full blocks + a peeled ragged
-    final block (pb = 42). 
-  Runtime i32 scalars (q0, j0) = `index_cast(induction_value, to=i32)` -- the
-  exact helper `python/helpers/dialects/scf.py` uses. tq/kb are Python constants
-  throughout (peeling avoids runtime `min`). So the emitted core is ~1 query-loop
-  body + 1 peeled tile = a small, fixed number of `func.call`s regardless of T.
+1. PROGRAM-MEMORY overflow. Fully unrolling everything (n_qt=22 query tiles x ~16
+   block calls = ~352 `func.call`s) overflowed CORE PROGRAM memory at ELF/CDO
+   (`_XAie_LoadProgMemSection(): Overflow`) -- an INSTRUCTION-count problem (the
+   54 KB L1 DATA budget, 3b, was always fine). Fix: make the 22x QUERY-tile sweep
+   a `range_` hardware loop.
 
-VERIFY (no device): `... | grep -c 'scf.for'` is SMALL (4 range_ loops per
-emitted body: query + k + p + V), NOT ~352 unrolled calls; L1 memref allocs
-unchanged (3b).
+2. NESTED-range_ j0 delivered wrong on device. Making the k/p/V BLOCK loops nested
+   `range_` loops (j0 = `index_cast` of the inner induction Value) BUILT and PASSED
+   at T=32 but FAILED at T=172 (corr 0.65). Root cause (numpy-reproduced, see
+   `scripts/relpos_block_model_check.py` + a stuck/iter-index j0 model): the nested
+   loop's runtime j0 did NOT take the per-iteration value 0,KB,2KB,... on device.
+   T=32 masked it -- there `Tk_full = (32//43)*43 = 0`, so the k/V block loops are
+   EMPTY (k/V come from static peels) and p runs a single j0=0 iteration; the
+   multi-iteration nested j0 is first exercised at T>=86. The OUTER query range_'s
+   `index_cast` q0 is fine (T=32 runs 4 query tiles and passes).
 
-PROBE 1 (do int32 kernel scalars lower?) is now RESOLVED: the static build
-generated valid MLIR and reached the ELF stage, so int scalar args lower fine;
-the loop version passes q0/j0 as `index_cast`'d i32 Values (same operand slot).
+Shipped topology:
+  - query tiles: `range_(0, Tq_full, TQ)` hardware loop; q0 = `index_cast(iv)`
+    (the induction Value IS q0). Ragged final tile PEELED (tq a Python constant).
+  - k / p / V blocks: UNROLLED Python loops -- `for j0 in range(0, *_full, KB)`
+    with j0 a Python-int CONSTANT, + a static ragged peel. 16 blocks/tile.
+  Emitted: ~32 block calls (query-loop body + peeled tile) -- far under the ~352
+  that overflowed, and j0 is a proven-good compile-time constant (the peels
+  already used static j0 and passed at T=32). Only runtime i32 is the query q0.
+
+VERIFY (no device): `... | grep -c 'scf.for'` is SMALL (1 query hardware loop;
+block loops Python-unrolled inside it); L1 memref allocs unchanged (3b).
 
 ### 3f. KPV replay (single-BD shim) + the corr=0.65 delivery bug
 
@@ -221,26 +222,30 @@ Block-fill accounting (T=172, TQ=8, KB=43): per query tile = 4 k (172/43) + 8 p
 (7 full + 1 ragged pb=42) + 4 V = 16 blocks; x n_qt=22 tiles (21 full q0=0..160 +
 1 peeled ragged tq=4) = 352 blocks.
 
-THE corr=0.65 BUG (compute vs delivery). All three replay mechanisms above gave
-the IDENTICAL wrong device output (rel-L2 0.82, corr 0.65) -> the replay was never
-the bug. `scripts` scratch numpy model (`block_model.py`) reproduces the EXACT
-block-decomposed path (column-slice AC/BD fills + per-block f32 ctx accumulate) on
-the EXACT --stream padded packing and it is BIT-EXACT to the proven monolithic
-tiled model (rel-L2 1e-8 at T=32 and T=172). So the block bricks + --stream packing
-are NOT the bug; the error is in the objectFIFO DELIVERY (which numpy cannot model)
--- the one mechanism common to all three variants was `of_kpv_l3l2(obj=whole
-kpv).forward(obj_type=[KB,DK])`: a forward whose dest obj is SMALLER than its
-source (16x). That is not the standard 1:1 forward. FIX: make `of_kpv` a DIRECT
-block fifo (obj = [KB,DK]) exactly like the working `of_quv`; the shim streams the
-repeat-tap read as [KB,DK] blocks in address order, no forward-split. L1 budget
-UNCHANGED (one [KB,DK] block; 54.3 KB, 3b); L2 no longer stages the 172 KB whole
-kpv.
+TWO device-found corr=0.65 bugs (both distinct from the replay). All the replay
+mechanisms gave the IDENTICAL wrong output (rel-L2 0.82, corr 0.65) -> the replay
+was never the bug. `scripts/relpos_block_model_check.py` reproduces the EXACT
+block-decomposed path on the EXACT --stream packing and is BIT-EXACT to the proven
+monolithic tiled model (rel-L2 1e-8 at T=32 and T=172), so the block bricks +
+packing LOGIC are correct; the bug is device dataflow (which numpy cannot model).
 
-BISECTION if this does not fix it (on device, no numpy): build+gate STEP=7
-(`make NPU2=1 STEP=7 T=32 TQ=8 KB=43`, run WITHOUT --stream) -- the monolithic
-driver uses the SAME block bricks but the STEP=6 packing. If STEP=7 PASSES, the
-bug is isolated to the STREAM dataflow (of_quv / of_kpv delivery); if STEP=7 FAILS,
-it is in the block bricks' compiled C (not their logic, which numpy proved).
+  BUG 1 (fixed, validated at T=32): `of_kpv_l3l2(obj=whole kpv).forward(obj_type=
+  [KB,DK])` -- a forward whose dest obj is 16x SMALLER than its source (not the
+  standard 1:1 forward). Fix: make `of_kpv` a DIRECT block fifo (obj = [KB,DK])
+  like the working `of_quv`; the shim streams the repeat-tap read as [KB,DK] blocks
+  in address order. STEP=8 T=32 --stream then PASSED (rel-L2 6.8e-3, == STEP=6).
+
+  BUG 2 (fixed): nested-`range_` block-loop j0. See 3e(2). Ruled OUT the --synth
+  harness first (`scripts/relpos_synth_ref_check.py`: the runner's f32 oracle
+  matches the block model at T=32/64/86/129/172, all rel-L2 ~4e-3 -> reference is
+  correct). Then localized to the nested-range_ j0 (T=32 passes because its k/V
+  block loops are empty; multi-iteration j0 first bites at T>=86). Fix: unroll the
+  block loops (Python-int j0); keep the query sweep a `range_`.
+
+L1 budget UNCHANGED (one [KB,DK] block; 54.3 KB, 3b); L2 no longer stages the whole
+kpv. If T=172 STILL fails after both fixes, the STEP=7 bisection (`make NPU2=1
+STEP=7 T=32 TQ=8 KB=43`, run WITHOUT --stream) isolates STREAM dataflow vs compiled
+block bricks; and gate an intermediate multi-block T (e.g. T=86, n_kb=2) to confirm.
 
 VERIFY (no device):
 

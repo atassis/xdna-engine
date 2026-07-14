@@ -46,20 +46,23 @@
 # assemble the full [TQ,*] score rows across key-blocks, then softmax -- the score
 # rows fit L1, the input k/p/V do not.
 #
-# ============================ CORE = REAL HARDWARE LOOPS =====================
-# The query-tile sweep AND the k/p/V block sweeps are aie.iron range_ loops (the
-# whole_array_modal core_fn pattern: acquire/release inside range_), NOT static
-# Python unrolling -- static unrolling emitted ~352 func.calls and overflowed the
-# core PROGRAM memory (_XAie_LoadProgMemSection overflow) even though the 54 KB L1
-# DATA budget held. Loop counts: query tiles run as range_(0, Tq_full, TQ) so the
-# induction Value IS q0 (no multiply); the ragged final query tile is PEELED as
-# one static iteration so tq stays a Python constant. k/V/p full-blocks loop with
-# range_(0, *_full, KB) (j0 = the induction Value); the ragged final block of each
-# section is peeled. Runtime i32 scalars (q0, j0) come from index_cast of the
-# range_ induction Value -- the exact helper python/helpers/dialects/scf.py uses.
-# PROBE 1 (was: do Python-int kernel scalars lower?) is RESOLVED: the static build
-# generated valid MLIR and reached the ELF stage, so int scalar args lower fine;
-# the loop version passes the derived-index scalars as index_cast'd i32 Values.
+# ============================ CORE = QUERY range_ + UNROLLED BLOCKS ===========
+# The QUERY-tile sweep is an aie.iron range_ hardware loop (the 22x multiplier;
+# fully unrolling all 22 tiles overflowed core PROGRAM memory,
+# _XAie_LoadProgMemSection). Its runtime i32 q0 = index_cast(induction Value) --
+# range_(0, Tq_full, TQ) so the Value IS q0 (no multiply); q0 is exercised + VERIFIED
+# on device (T=32 runs 4 query tiles and passes). The ragged final query tile is
+# PEELED as one static iteration so tq stays a Python constant.
+# The k/p/V BLOCK loops are UNROLLED in Python (j0 a Python-int CONSTANT), NOT nested
+# range_ loops: a nested range_'s index_cast'd induction j0 did NOT deliver the
+# per-iteration value on device (corr 0.65 at T=172; T=32 masked it -- its k/V block
+# loops are empty and p is a single j0=0 iteration). Unrolling 16 blocks/tile emits
+# ~32 block calls total (query-body + peel), far under the ~352 that overflowed, and
+# j0 is a proven-good compile-time constant (the ragged peels already used static j0
+# and passed at T=32). The 54 KB L1 DATA budget is unchanged.
+# PROBE 1 (do Python-int kernel scalars lower?) is RESOLVED: the static build reached
+# ELF and T=32 passes, so Python-int scalar args lower fine. The ONLY runtime i32 is
+# the query q0 (index_cast of the query range_ induction Value), verified on device.
 #
 # ============================ KPV REPLAY = STREAM-A, SINGLE-BD SHIM REPLAY ====
 # Two mechanisms were rejected first:
@@ -80,8 +83,8 @@
 # budget UNCHANGED (one [KB,DK] block at a time; 54.3 KB). A future optimization can
 # revisit a WORKING resident-L2 replay to cut the DDR re-fetch; correctness first.
 # SMALLEST PROBE: `python3 relpos_rowtiled_stream_iron.py -d npu2 -T 172 --tq 8 \
-#   --kb 43 | grep -iEc 'scf.for'` should be SMALL (the loops are real, not
-#   unrolled -- 4 range_ loops: 1 query + k + p + V), and
+#   --kb 43 | grep -iEc 'scf.for'` should be SMALL (1 query hardware loop; the
+#   k/p/V block loops are Python-unrolled inside it), and
 #   `... | grep -iE 'memref|memtile_dma|objectfifo'` should show L1 memref allocs
 # of [KB,DK] + the [TQ,*] scratch, never [T|P,DK].
 #
@@ -198,17 +201,21 @@ def my_relpos_stream(dev, T, TQ, KB):
     def core_body(quv_in, kpv_in, ctx_out, ac, bd, probs, ctxf,
                   dotk, dotp, smax, czero, ctxb, narrow):
         # ONE per-query-tile body, emitted ONCE inside a real hardware loop over
-        # the query tiles (the 22x multiplier) + ONCE for the peeled ragged tile.
-        # The k/p/V block sweeps are ALSO real range_ loops (nested, whole_array_
-        # modal core_fn pattern), so the emitted instruction count is BOUNDED (a
-        # handful of func.call sites), not the ~352 of the static unrolling that
-        # overflowed core program memory. q0/j0 become runtime i32 (index_cast of
-        # the range_ induction Value); tq/kb stay Python constants via peeling.
+        # the query tiles (the 22x multiplier -- range_, index_cast'd runtime q0)
+        # + ONCE for the peeled ragged tile. The k/p/V BLOCK loops are UNROLLED in
+        # Python (j0 a Python-int CONSTANT per block), NOT nested range_ loops:
+        # a nested range_'s index_cast'd induction j0 did NOT deliver the correct
+        # per-iteration value on device (T=32 passed because its k/V block loops are
+        # empty and p runs a single j0=0 iteration -- multi-iteration nested j0 is
+        # only exercised at T>=86; T=172 then failed corr 0.65, numpy-reproduced by
+        # a stuck/iter-index j0). The OUTER query range_'s index_cast q0 DOES work
+        # (T=32's 4 query tiles pass). Unrolling 16 blocks per tile emits ~32 block
+        # calls total (query-body + peel) -- far under the ~352 fully-unrolled that
+        # overflowed program memory, and j0 is a proven-good compile-time constant.
         def emit_tile(tq, q0):
             # -- phase K: qu_tile resident; k full-blocks then ragged -> AC[:, j0:] --
             equ = quv_in.acquire(1)
-            for jiv in range_(0, Tk_full, KB):
-                j0 = index_cast(jiv, to=Ty.i32())
+            for j0 in range(0, Tk_full, KB):           # Python-int j0 (0,KB,2KB,..)
                 ek = kpv_in.acquire(1)
                 dotk(equ, ek, ac, tq, KB, j0, T)
                 kpv_in.release(1)
@@ -220,8 +227,7 @@ def my_relpos_stream(dev, T, TQ, KB):
 
             # -- phase P: qv_tile resident; p full-blocks then ragged -> BD[:, j0:] --
             eqv = quv_in.acquire(1)
-            for jiv in range_(0, Pp_full, KB):
-                j0 = index_cast(jiv, to=Ty.i32())
+            for j0 in range(0, Pp_full, KB):
                 ep = kpv_in.acquire(1)
                 dotp(eqv, ep, bd, tq, KB, j0, P)
                 kpv_in.release(1)
@@ -237,8 +243,7 @@ def my_relpos_stream(dev, T, TQ, KB):
             # -- phase V: V full-blocks then ragged -> ctx (resident f32 accumulate) --
             eo = ctx_out.acquire(1)
             czero(ctxf, tq)
-            for jiv in range_(0, Tk_full, KB):
-                j0 = index_cast(jiv, to=Ty.i32())
+            for j0 in range(0, Tk_full, KB):
                 ev = kpv_in.acquire(1)
                 ctxb(probs, ev, ctxf, tq, T, KB, j0)
                 kpv_in.release(1)
