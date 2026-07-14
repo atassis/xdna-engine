@@ -113,11 +113,18 @@ impl FastConformerEncoder {
                     let gamma = b.v(norm_w);
                     let beta = b.v(norm_b);
                     prof::phase::set_stage(stage);
-                    let h = {
-                        let _h = PhaseScope::new("ff_resident", Bucket::Npu);
-                        npu.resident_ff1_fc1(x, gamma.as_slice().unwrap(), beta.as_slice().unwrap(),
-                            || b.m(l1), &format!("{blk}.{tag}.l1"), self.cfg.ff)
-                    };
+                    let _h = PhaseScope::new("ff_resident", Bucket::Npu);
+                    // FULL FFN device-side (LN->fc1->fc2) is ~20% faster BUT the K=4096 bfp16 fc2
+                    // accumulation differs from the host K-split enough to regress WER +0.4pp -- so it
+                    // is OPT-IN (PARAKEET_RESIDENT_FFN=1) until the fc2 numerics match. DEFAULT is the
+                    // WER-NEUTRAL LN->fc1 seam + host fc2.
+                    if std::env::var("PARAKEET_RESIDENT_FFN").is_ok() {
+                        return npu.resident_ffn(x, gamma.as_slice().unwrap(), beta.as_slice().unwrap(),
+                            || b.m(l1), &format!("{blk}.{tag}.l1"),
+                            || b.m(l2), &format!("{blk}.{tag}.l2"));
+                    }
+                    let h = npu.resident_ff1_fc1(x, gamma.as_slice().unwrap(), beta.as_slice().unwrap(),
+                        || b.m(l1), &format!("{blk}.{tag}.l1"), self.cfg.ff);
                     prof::phase::set_stage(stage);
                     return self.mm_lazy(&h, || { let _wp = PhaseScope::new("ff_wprep", Bucket::Marshal); b.m(l2) }, &format!("{blk}.{tag}.l2"));
                 }

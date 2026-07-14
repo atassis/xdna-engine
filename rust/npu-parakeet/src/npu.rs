@@ -116,13 +116,30 @@ struct ResidentLn {
     bo_ln: Bo,   // [PAD_M, KRES] f32   (ctxLN output = affine_cast input, ln g4 / ac g3)
     bo_gb: Bo,   // [2*KRES] f32        (gamma|beta params, ac g4)
     bo_bf16: Bo, // [PAD_M, KRES] bf16  (affine_cast output = modal fc1 A, ac g5)
+    // fc1->fc2 device-side (full FFN): cast the [PAD_M,DFF] fc1 output to bf16 then a K=DFF fc2
+    // matmul reads it directly (no host K-split / accumulate).
+    c4_kern: Rc<Kernel>,  // cast @ DFF (fc1 f32 -> bf16)
+    c4_instr: Bo,
+    c4_n: usize,
+    fc2_kern: Rc<Kernel>, // K=DFF whole_array matmul (identity epilogue), N=KRES
+    fc2_instr: Bo,
+    fc2_n: usize,
+    bo_fc1bf16: Bo, // [PAD_M, DFF] bf16  (cast@DFF output = fc2 A, c4 g4)
+    bo_fc2out: Bo,  // [PAD_M, KRES] f32  (fc2 output, fc2 g5)
     // per-kernel dummy placeholders (0-size segfaults)
     ln_c: Bo,
     ln_tmp: Bo,
     ln_tr: Bo,
     ac_tmp: Bo,
     ac_tr: Bo,
+    c4_c: Bo,
+    c4_tmp: Bo,
+    c4_tr: Bo,
+    fc2_tmp: Bo,
+    fc2_tr: Bo,
 }
+
+const DFF: usize = 4096; // Parakeet FFN inner dim (fc1 N / fc2 K)
 
 impl NpuMatmul {
     pub fn open(root: &Path) -> Self {
@@ -298,10 +315,14 @@ impl NpuMatmul {
         // Graceful: if the ctxln+affcast xclbins aren't present, the FFN LN->fc1 stays on the host
         // path (no panic) -- so the resident seam can be the DEFAULT without breaking builds/branches
         // that haven't built these kernels.
-        let present = ["ctxln", "affcast"].iter().all(|n| {
+        let seam = ["ctxln", "affcast"].iter().all(|n| {
             self.ln_dir.join(format!("final_{n}_{PAD_M}x{KRES}.xclbin")).exists()
                 && self.ln_dir.join(format!("insts_{n}_{PAD_M}x{KRES}.txt")).exists()
         });
+        // full FFN also needs cast@DFF + the K=DFF fc2 resident
+        let fc2ok = self.ln_dir.join(format!("final_cast_{PAD_M}x{DFF}.xclbin")).exists()
+            && self.ln_dir.join(format!("final_{PAD_M}x{DFF}x{KRES}_{}_8c_modalid.xclbin", self.tile)).exists();
+        let present = seam && fc2ok;
         let result = if present {
             Some(self.load_resident_ln())
         } else {
@@ -329,19 +350,45 @@ impl NpuMatmul {
         };
         let (ln_kern, ln_instr, ln_n) = load("ctxln");
         let (ac_kern, ac_instr, ac_n) = load("affcast");
+        // cast @ DFF + the K=DFF fc2 matmul (explicit filenames, not the {name}_PADxKRES pattern)
+        let load_path = |xcl: PathBuf, ins: PathBuf| -> (Rc<Kernel>, Bo, usize) {
+            let kern = self.dev.load_kernel(xcl.to_str().unwrap(), None).unwrap_or_else(|e| panic!("load {} : {e:?}", xcl.display()));
+            let ib = std::fs::read(&ins).unwrap_or_else(|e| panic!("read {}: {e}", ins.display()));
+            let n = ib.len() / 4;
+            let bo = self.dev.alloc_bo(&kern, ib.len(), FLAG_CACHEABLE, kern.group_id(1).unwrap()).unwrap();
+            bo.write_bytes(&ib).unwrap();
+            bo.sync_to_device().unwrap();
+            (kern, bo, n)
+        };
+        let (c4_kern, c4_instr, c4_n) = load_path(
+            self.ln_dir.join(format!("final_cast_{PAD_M}x{DFF}.xclbin")),
+            self.ln_dir.join(format!("insts_cast_{PAD_M}x{DFF}.txt")));
+        let (fc2_kern, fc2_instr, fc2_n) = load_path(
+            self.ln_dir.join(format!("final_{PAD_M}x{DFF}x{KRES}_{}_8c_modalid.xclbin", self.tile)),
+            self.ln_dir.join(format!("insts_{PAD_M}x{DFF}x{KRES}_{}_8c_modalid.txt", self.tile)));
         let gl = |i| ln_kern.group_id(i).unwrap();
         let ga = |i| ac_kern.group_id(i).unwrap();
+        let gc4 = |i| c4_kern.group_id(i).unwrap();
+        let gf2 = |i| fc2_kern.group_id(i).unwrap();
         let rl = Rc::new(ResidentLn {
             bo_x: self.dev.alloc_bo(&ln_kern, PAD_M * KRES * 4, FLAG_HOST_ONLY, gl(3)).unwrap(),
             bo_ln: self.dev.alloc_bo(&ln_kern, PAD_M * KRES * 4, FLAG_HOST_ONLY, gl(4)).unwrap(),
             bo_gb: self.dev.alloc_bo(&ac_kern, 2 * KRES * 4, FLAG_HOST_ONLY, ga(4)).unwrap(),
             bo_bf16: self.dev.alloc_bo(&ac_kern, PAD_M * KRES * 2, FLAG_HOST_ONLY, ga(5)).unwrap(),
+            bo_fc1bf16: self.dev.alloc_bo(&c4_kern, PAD_M * DFF * 2, FLAG_HOST_ONLY, gc4(4)).unwrap(),
+            bo_fc2out: self.dev.alloc_bo(&fc2_kern, PAD_M * KRES * 4, FLAG_HOST_ONLY, gf2(5)).unwrap(),
             ln_c: self.dev.alloc_bo(&ln_kern, 1, FLAG_HOST_ONLY, gl(5)).unwrap(),
             ln_tmp: self.dev.alloc_bo(&ln_kern, 8, FLAG_HOST_ONLY, gl(6)).unwrap(),
             ln_tr: self.dev.alloc_bo(&ln_kern, 1, FLAG_HOST_ONLY, gl(7)).unwrap(),
             ac_tmp: self.dev.alloc_bo(&ac_kern, 8, FLAG_HOST_ONLY, ga(6)).unwrap(),
             ac_tr: self.dev.alloc_bo(&ac_kern, 1, FLAG_HOST_ONLY, ga(7)).unwrap(),
+            c4_c: self.dev.alloc_bo(&c4_kern, 1, FLAG_HOST_ONLY, gc4(5)).unwrap(),
+            c4_tmp: self.dev.alloc_bo(&c4_kern, 8, FLAG_HOST_ONLY, gc4(6)).unwrap(),
+            c4_tr: self.dev.alloc_bo(&c4_kern, 1, FLAG_HOST_ONLY, gc4(7)).unwrap(),
+            fc2_tmp: self.dev.alloc_bo(&fc2_kern, 8, FLAG_HOST_ONLY, gf2(6)).unwrap(),
+            fc2_tr: self.dev.alloc_bo(&fc2_kern, 1, FLAG_HOST_ONLY, gf2(7)).unwrap(),
             ln_kern, ln_instr, ln_n, ac_kern, ac_instr, ac_n,
+            c4_kern, c4_instr, c4_n, fc2_kern, fc2_instr, fc2_n,
         });
         rl
     }
@@ -422,6 +469,55 @@ impl NpuMatmul {
             self.weight_bo(id, w.view())
         };
         self.dispatch_with_a(&rl.bo_bf16, m, &wbo, n, self.modal)
+    }
+
+    /// Full FFN device-side (LN -> fc1 -> SiLU -> fc2), the fc1->fc2 frontier step. Everything on-NPU,
+    /// the activation stream never touching host across the whole FFN:
+    ///   ctxLN -> affine_cast -> modal fc1 (on-chip silu, [t,DFF]) -> cast@DFF (bf16) -> K=DFF fc2
+    ///   (identity, on-chip K-reduce, [t,KRES]) -> read [t,KRES] f32.
+    /// No host K-split / accumulate. `make_w1` = [KRES,DFF] fc1 weight; `make_w2` = [DFF,KRES] fc2.
+    pub fn resident_ffn<F1: FnOnce() -> Array2<f32>, F2: FnOnce() -> Array2<f32>>(
+        &self, x: &Array2<f32>, gamma: &[f32], beta: &[f32],
+        make_w1: F1, id1: &str, make_w2: F2, id2: &str,
+    ) -> Array2<f32> {
+        self.stats.borrow_mut().calls += 1;
+        let m = x.nrows();
+        let rl = self.ln_affine_cast(x, gamma, beta); // bo_bf16 = affine_LN bf16 [PAD_M,KRES]
+        // fc1: modal, A=bo_bf16, W1, on-chip SiLU -> st1.bo_c (f32 [PAD_M,DFF]) -- stays DEVICE
+        let w1 = {
+            let c = self.wcache.borrow().get(id1).cloned();
+            c.unwrap_or_else(|| {
+                let w = make_w1();
+                assert_eq!(w.dim(), (KRES, DFF), "fc1 W1 dim");
+                self.weight_bo(id1, w.view())
+            })
+        };
+        let st1 = self.stream(DFF, self.modal);
+        self.kern.run_matmul8(3, &st1.instr, st1.n_instr, &rl.bo_bf16, &w1, &st1.bo_c, &self.bo_tmp, &self.bo_tr).unwrap();
+        // cast@DFF: st1.bo_c (f32) -> rl.bo_fc1bf16 (bf16 [PAD_M,DFF]) -- device-side, no host round-trip
+        rl.c4_kern.run_matmul8(3, &rl.c4_instr, rl.c4_n, &st1.bo_c, &rl.bo_fc1bf16, &rl.c4_c, &rl.c4_tmp, &rl.c4_tr).unwrap();
+        // fc2: K=DFF matmul (identity epilogue), A=bo_fc1bf16, W2 -> rl.bo_fc2out (f32 [PAD_M,KRES])
+        let w2 = {
+            let c = self.wcache.borrow().get(id2).cloned();
+            c.unwrap_or_else(|| {
+                let w = make_w2();
+                assert_eq!(w.dim(), (DFF, KRES), "fc2 W2 dim");
+                self.weight_bo(id2, w.view())
+            })
+        };
+        rl.fc2_kern.run_matmul8(3, &rl.fc2_instr, rl.fc2_n, &rl.bo_fc1bf16, &w2, &rl.bo_fc2out, &rl.fc2_tmp, &rl.fc2_tr).unwrap();
+        self.stats.borrow_mut().dispatches += 3;
+        rl.bo_fc2out.sync_from_device().unwrap();
+        let mut cb = vec![0u8; m * KRES * 4];
+        rl.bo_fc2out.read_bytes(&mut cb).unwrap();
+        let mut out = Array2::<f32>::zeros((m, KRES));
+        for r in 0..m {
+            for c in 0..KRES {
+                let off = (r * KRES + c) * 4;
+                out[[r, c]] = f32::from_le_bytes([cb[off], cb[off + 1], cb[off + 2], cb[off + 3]]);
+            }
+        }
+        out
     }
 
     /// Per-N instruction stream. On the MODAL resident, `silu` picks the baked-RTP mode: the
