@@ -74,8 +74,9 @@
 # shim_dma_single_bd_task set BD repeat_count=n_qt-1: ONE BD replayed n_qt times,
 # each re-reading the whole kpv from DDR offset 0. That re-read gives every query
 # tile k|p|V from the START (the restart (1) lacked), within the BD budget (1 BD,
-# not 22). n_qt whole-kpv objects -> forward -> 22*16 = 352 blocks = what the core
-# acquires. kpv streamed from DDR n_qt times (STREAM-A data-movement cost); L1
+# not 22). of_kpv obj = [KB,DK], so each replay's kpv read = 16 blocks -> 22*16 =
+# 352 blocks in address order = what the core acquires. kpv streamed from DDR n_qt
+# times (STREAM-A data-movement cost); L1
 # budget UNCHANGED (one [KB,DK] block at a time; 54.3 KB). A future optimization can
 # revisit a WORKING resident-L2 replay to cut the DDR re-fetch; correctness first.
 # SMALLEST PROBE: `python3 relpos_rowtiled_stream_iron.py -d npu2 -T 172 --tq 8 \
@@ -147,23 +148,28 @@ def my_relpos_stream(dev, T, TQ, KB):
     g_ctxf = Buffer(ctxf_ty, name="g_ctxf")
 
     # ---- ObjectFifos ----
-    # Channel A: quv tile stream (L3 -> L1), read once, 2 blocks/qtile.
+    # BOTH input channels are DIRECT block fifos whose obj_type IS the streamed
+    # block (of_quv=[TQ,DK], of_kpv=[KB,DK]); the shim streams a large fill as many
+    # obj-sized blocks in address order. This is the proven pattern; the previous
+    # of_kpv used of_kpv_l3l2(obj=whole kpv).forward(obj=[KB,DK]) -- a forward with
+    # a SMALLER obj than its source (split a [kpv_pad_rows,DK] L2 object into
+    # [KB,DK] blocks). That is NOT the standard forward (forward is 1:1 size), it
+    # was the one mechanism COMMON to all three replay variants that all produced
+    # the identical wrong output (corr 0.65) even though the block-decomposed
+    # compute + --stream packing are numpy-proven bit-exact to the monolithic
+    # model. Numpy cannot model the objectFIFO delivery; using the same direct
+    # obj=block form as of_quv (which computes qu/qv correctly) removes the
+    # forward-split as the delivery variable.
+    # Channel A: quv tile stream. Per query tile the core acquires qu_tile (phase
+    # K) then qv_tile (phase P); 2*n_qt blocks, read ONCE (no replay).
     of_quv = ObjectFifo(quv_blk_ty, name="quv", depth=2)
-    # Channel B: kpv key-block stream -- STREAM-A via a single-BD SHIM replay. The
-    # whole padded kpv is staged L3 -> L2 and forwarded L2 -> L1 in [KB,DK] blocks
-    # (16 blocks per whole-kpv object). The runtime fills of_kpv_l3l2 ONCE with a
-    # tap that RE-READS the whole kpv from DDR offset 0 n_qt times (outer sizes[0]
-    # =n_qt at stride 0 -> shim BD repeat_count=n_qt-1; see the rt.fill below), so
-    # every query tile deterministically gets kpv from the START (k0..k3, p0..p7,
-    # V0..V3). This REPLACES the L2->L1 repeat_count replay, which on-device did NOT
-    # restart the L2 read per tile (corr 0.65), AND the naive per-tile fill loop,
-    # which emitted 22 shim BDs > the 16-BD limit. Tradeoff: kpv is streamed from
-    # DDR n_qt times (STREAM-A data-movement cost); L1 budget UNCHANGED (one [KB,DK]
-    # block at a time). depth=1 on the whole-kpv stage keeps L2 at ~172 KB.
-    of_kpv_l3l2 = ObjectFifo(kpv_ty, name="kpv_l3l2", depth=1)
-    of_kpv = of_kpv_l3l2.cons().forward(
-        obj_type=kblk_ty, name="kpv_l2l1", depth=2
-    )
+    # Channel B: kpv key-block stream. obj = ONE [KB,DK] block; the shim re-reads
+    # the whole padded kpv (16 blocks) from DDR offset 0 n_qt times via the repeat
+    # tap (single BD, repeat_count=n_qt-1 -- see the rt.fill below), so each query
+    # tile gets k0..k3,p0..p7,V0..V3 from the start. 16*n_qt = 352 blocks in address
+    # order = exactly what the core acquires. No MemTile staging needed (kpv is
+    # re-read from DDR anyway); L1 holds one [KB,DK] block at a time.
+    of_kpv = ObjectFifo(kblk_ty, name="kpv", depth=2)
     of_ctx = ObjectFifo(ctx_blk_ty, name="ctx", depth=2)
 
     # ---- block-brick kernels (int32-scalar ABI; see PROBE 1) ----
@@ -258,24 +264,21 @@ def my_relpos_stream(dev, T, TQ, KB):
          dot_k, dot_p, softmax_k, ctxzero_k, ctx_k, narrow_k],
     )
 
-    # STREAM-A via a SINGLE-BD SHIM REPLAY (fixes the 22-BD overflow). A per-tile
-    # rt.fill loop emitted 22 static shim DMA tasks (22 BDs > the 16-BD shim limit
-    # on tile (0,0)). Instead, one rt.fill with a tap whose OUTER dim is n_qt at
-    # stride 0: sizes=[n_qt,1,kpv_pad_rows,DK], strides=[0,0,DK,1]. shim_dma_single
-    # _bd_task turns sizes[0]>1 into BD repeat_count=n_qt-1 -> ONE BD replayed n_qt
-    # times, each RE-READING the whole kpv from DDR offset 0 (stride-0 outer). That
-    # re-read gives every query tile k|p|V from the START -- the restart the L2->L1
-    # repeat_count did NOT provide (it replayed a staged L2 buffer without re-read).
-    # 1 BD, n_qt replays -> n_qt whole-kpv objects -> forward -> 22*16 = 352 blocks
-    # = exactly what the core acquires. Same DDR traffic as the per-tile loop, but
-    # within the BD budget.
+    # SINGLE-BD SHIM REPLAY (fixes the 22-BD overflow of a per-tile fill loop). One
+    # rt.fill with a tap whose OUTER dim is n_qt at stride 0: sizes=[n_qt,1,
+    # kpv_pad_rows,DK], strides=[0,0,DK,1]. shim_dma_single_bd_task turns sizes[0]>1
+    # into BD repeat_count=n_qt-1 -> ONE BD replayed n_qt times, each RE-READING the
+    # whole kpv from DDR offset 0 (stride-0 outer). Every query tile gets k|p|V from
+    # the START. of_kpv obj = [KB,DK], so each replay's kpv_pad_rows-row read is
+    # delivered as 16 blocks -> 16*n_qt = 352 blocks in address order = what the
+    # core acquires. (kpv_tap verified standalone: sizes=[22,1,688,128] at T=172.)
     kpv_tap = TensorTiler2D.simple_tiler([kpv_pad_rows, DK], pattern_repeat=n_qt)[0]
 
     rt = Runtime()
     with rt.sequence(quv_arg_ty, kpv_ty, ctx_arg_ty) as (QUV, KPV, CX):
         rt.start(worker)
-        rt.fill(of_quv.prod(), QUV)                  # tile-interleaved qu/qv blocks
-        rt.fill(of_kpv_l3l2.prod(), KPV, tap=kpv_tap)  # 1 BD, replayed n_qt from offset 0
+        rt.fill(of_quv.prod(), QUV)              # tile-interleaved qu/qv blocks
+        rt.fill(of_kpv.prod(), KPV, tap=kpv_tap)  # 1 BD, whole kpv replayed n_qt as [KB,DK] blocks
         rt.drain(of_ctx.cons(), CX, wait=True)
 
     return Program(dev, rt).resolve_program()

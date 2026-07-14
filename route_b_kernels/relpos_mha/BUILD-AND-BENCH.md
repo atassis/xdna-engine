@@ -103,12 +103,14 @@ The NPU2 CORE tile has exactly 2 input (S2MM) + 2 output (MM2S) DMA channels
   Channel A  `of_quv` [TQ,DK] bf16, depth 2 -- per query tile the core acquires
              qu_tile (phase K) then qv_tile (phase P); 2*n_qt blocks, read ONCE
              (no replay). Host packs QUV TILE-INTERLEAVED.
-  Channel B  `of_kpv` [KB,DK] bf16, depth 2 -- `of_kpv_l3l2` stages the whole
-             padded kpv L3->L2; `.forward(obj_type=[KB,DK])` delivers it L2->L1 in
-             16 KB-blocks per whole-kpv object. ONE shim BD re-reads kpv from DDR
-             offset 0 n_qt times (stride-0 outer tap dim -> BD repeat_count=n_qt-1,
-             STREAM-A 3f), so each tile gets k0..k3,p0..p7,V0..V3 from the start.
-             Per query tile: n_kb k-blocks, n_pb p-blocks, n_vb V-blocks.
+  Channel B  `of_kpv` [KB,DK] bf16, depth 2 -- a DIRECT block fifo (obj = one
+             [KB,DK] block, same style as of_quv). ONE shim BD re-reads the whole
+             padded kpv from DDR offset 0 n_qt times (stride-0 outer tap dim -> BD
+             repeat_count=n_qt-1, 3f); each replay's kpv_pad_rows read is delivered
+             as 16 blocks in address order, so each tile gets k0..k3,p0..p7,V0..V3
+             from the start. Per query tile: n_kb k-blocks, n_pb p, n_vb V.
+             (Earlier this used of_kpv_l3l2(obj=whole kpv).forward(obj=[KB,DK]) --
+             a forward with a SMALLER obj than its source; removed, see 3f.)
   Output     `of_ctx` [TQ,DK] bf16, depth 2 -- one block per query tile.
 
 `split`/`forward`/`repeat_count` API: `python/iron/dataflow/objectfifo.py`
@@ -139,9 +141,11 @@ Contrast -- what overflowed: whole kpv resident [2T+P,DK] = 687*128*2 = 171.8 KB
 PLUS whole quv [2T,DK] = 86 KB -> ~258 KB in a 64 KB L1. Streaming replaces both
 whole buffers with one 11 KB block + the TQ-sized scratch.
 
-L2 (MemTile) = 512 KB. Staged padded kpv = (Tp + Pp + Tp)*DK*2 with Tp=n_kb*KB=172
-(no pad), Pp=n_pb*KB=344 (1 pad row) -> 688*128*2 = 176128 B = 172.0 KB < 512 KB.
-quv streams L3->L1 (no whole-L2 stage); of_ctx is transient. So L2 ~172 KB, ample.
+L2 (MemTile) = 512 KB. Both inputs are DIRECT block fifos (obj = [KB,DK] / [TQ,DK]),
+so nothing stages the whole 172 KB kpv in L2 -- if IRON routes the block fifos
+through a MemTile at all it is only [KB,DK]/[TQ,DK] double-buffers (tens of KB). The
+padded kpv (Tp+Pp+Tp = 688 rows = 176 KB) lives only in DDR and is re-streamed as
+[KB,DK] blocks. L2 usage is negligible.
 
 ### 3c. build (orchestrator, toolchain box)
 
@@ -199,39 +203,44 @@ PROBE 1 (do int32 kernel scalars lower?) is now RESOLVED: the static build
 generated valid MLIR and reached the ELF stage, so int scalar args lower fine;
 the loop version passes q0/j0 as `index_cast`'d i32 Values (same operand slot).
 
-### 3f. KPV REPLAY = STREAM-A (repeat_count rejected on device)
+### 3f. KPV replay (single-BD shim) + the corr=0.65 delivery bug
 
-PROBE 2 (resident-L2 `repeat_count` replay) was tried and REJECTED on silicon:
-`of_kpv.forward(obj_type=[KB,DK], repeat_count=n_qt)` from a whole-kpv L2 buffer
-BUILT (8 scf.for, ELF/CDO pass) but FAILED parity -- rel-L2 0.82, corr 0.65: the
-L2 read did NOT restart per query tile, so tile q consumed the wrong key-blocks
-(systematic, not garbage).
-
-A naive per-tile fill loop (`for _q in range(n_qt): rt.fill(of_kpv_l3l2.prod(),
-KPV)`) is correct in principle but emits 22 STATIC shim DMA tasks = 22 BDs > the
-16-BD shim limit on tile (0,0) (`aiex.dma_configure_task: Too many simultaneously
-active buffer descriptors`).
-
-SHIPPED FIX = STREAM-A via a SINGLE-BD SHIM REPLAY. One `rt.fill` with a tap whose
-OUTER dim is n_qt at stride 0:
+REPLAY mechanism (shipped): ONE shim BD re-reads the whole padded kpv from DDR
+offset 0, n_qt times. `rt.fill(of_kpv.prod(), KPV, tap=kpv_tap)` with
 
     kpv_tap = TensorTiler2D.simple_tiler([kpv_pad_rows, DK], pattern_repeat=n_qt)[0]
     # -> sizes=[n_qt,1,kpv_pad_rows,DK], strides=[0,0,DK,1], offset 0
-    rt.fill(of_kpv_l3l2.prod(), KPV, tap=kpv_tap)
 
-`shim_dma_single_bd_task` turns `sizes[0] > 1` into BD `repeat_count = n_qt-1`, so
-ONE BD is replayed n_qt times, each RE-READING the whole kpv from DDR offset 0
-(stride-0 outer dim). That DDR re-read gives every query tile k|p|V from the START
-(k0..k3, p0..p7, V0..V3) -- the restart the L2->L1 replay lacked -- with 1 BD
-instead of 22. n_qt whole-kpv objects -> `of_kpv` forward (obj [KB,DK], depth 2)
--> 22 x 16 = 352 blocks = exactly what the core acquires. L1 budget UNCHANGED (one
-[KB,DK] block at a time; 54.3 KB from 3b). Cost: kpv streamed from DDR n_qt times
-(the documented STREAM-A data-movement tradeoff) -- correctness ships first; a
-working resident-L2 replay to cut the re-fetch is a later optimization.
+`shim_dma_single_bd_task` turns `sizes[0]>1` into BD `repeat_count=n_qt-1` -> ONE
+BD replayed n_qt times, each re-reading from DDR offset 0. Two earlier variants
+were rejected: (1) L2->L1 `forward(repeat_count=n_qt)` -- replays a STAGED L2
+buffer without re-reading L3, so it never restarts per tile; (2) a per-tile fill
+loop -- 22 BDs > the 16-BD shim limit. This single-BD tap is correct + 1 BD.
 
 Block-fill accounting (T=172, TQ=8, KB=43): per query tile = 4 k (172/43) + 8 p
 (7 full + 1 ragged pb=42) + 4 V = 16 blocks; x n_qt=22 tiles (21 full q0=0..160 +
 1 peeled ragged tq=4) = 352 blocks.
+
+THE corr=0.65 BUG (compute vs delivery). All three replay mechanisms above gave
+the IDENTICAL wrong device output (rel-L2 0.82, corr 0.65) -> the replay was never
+the bug. `scripts` scratch numpy model (`block_model.py`) reproduces the EXACT
+block-decomposed path (column-slice AC/BD fills + per-block f32 ctx accumulate) on
+the EXACT --stream padded packing and it is BIT-EXACT to the proven monolithic
+tiled model (rel-L2 1e-8 at T=32 and T=172). So the block bricks + --stream packing
+are NOT the bug; the error is in the objectFIFO DELIVERY (which numpy cannot model)
+-- the one mechanism common to all three variants was `of_kpv_l3l2(obj=whole
+kpv).forward(obj_type=[KB,DK])`: a forward whose dest obj is SMALLER than its
+source (16x). That is not the standard 1:1 forward. FIX: make `of_kpv` a DIRECT
+block fifo (obj = [KB,DK]) exactly like the working `of_quv`; the shim streams the
+repeat-tap read as [KB,DK] blocks in address order, no forward-split. L1 budget
+UNCHANGED (one [KB,DK] block; 54.3 KB, 3b); L2 no longer stages the 172 KB whole
+kpv.
+
+BISECTION if this does not fix it (on device, no numpy): build+gate STEP=7
+(`make NPU2=1 STEP=7 T=32 TQ=8 KB=43`, run WITHOUT --stream) -- the monolithic
+driver uses the SAME block bricks but the STEP=6 packing. If STEP=7 PASSES, the
+bug is isolated to the STREAM dataflow (of_quv / of_kpv delivery); if STEP=7 FAILS,
+it is in the block bricks' compiled C (not their logic, which numpy proved).
 
 VERIFY (no device):
 
