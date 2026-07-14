@@ -105,9 +105,10 @@ The NPU2 CORE tile has exactly 2 input (S2MM) + 2 output (MM2S) DMA channels
              (no replay). Host packs QUV TILE-INTERLEAVED.
   Channel B  `of_kpv` [KB,DK] bf16, depth 2 -- `of_kpv_l3l2` stages the whole
              padded kpv L3->L2; `.forward(obj_type=[KB,DK])` delivers it L2->L1 in
-             16 KB-blocks per fill. The runtime re-fills the whole kpv per query
-             tile (STREAM-A, 3f), so each tile gets k0..k3,p0..p7,V0..V3 from the
-             start. Per query tile: n_kb k-blocks, n_pb p-blocks, n_vb V-blocks.
+             16 KB-blocks per whole-kpv object. ONE shim BD re-reads kpv from DDR
+             offset 0 n_qt times (stride-0 outer tap dim -> BD repeat_count=n_qt-1,
+             STREAM-A 3f), so each tile gets k0..k3,p0..p7,V0..V3 from the start.
+             Per query tile: n_kb k-blocks, n_pb p-blocks, n_vb V-blocks.
   Output     `of_ctx` [TQ,DK] bf16, depth 2 -- one block per query tile.
 
 `split`/`forward`/`repeat_count` API: `python/iron/dataflow/objectfifo.py`
@@ -206,19 +207,27 @@ BUILT (8 scf.for, ELF/CDO pass) but FAILED parity -- rel-L2 0.82, corr 0.65: the
 L2 read did NOT restart per query tile, so tile q consumed the wrong key-blocks
 (systematic, not garbage).
 
-SHIPPED FIX = STREAM-A. Drop `repeat_count`; the runtime RE-FILLS the whole padded
-kpv ONCE PER QUERY TILE:
+A naive per-tile fill loop (`for _q in range(n_qt): rt.fill(of_kpv_l3l2.prod(),
+KPV)`) is correct in principle but emits 22 STATIC shim DMA tasks = 22 BDs > the
+16-BD shim limit on tile (0,0) (`aiex.dma_configure_task: Too many simultaneously
+active buffer descriptors`).
 
-    for _q in range(n_qt):
-        rt.fill(of_kpv_l3l2.prod(), KPV)   # each fill -> forward -> 16 blocks
+SHIPPED FIX = STREAM-A via a SINGLE-BD SHIM REPLAY. One `rt.fill` with a tap whose
+OUTER dim is n_qt at stride 0:
 
-so every query tile deterministically gets kpv from the START (k0..k3, p0..p7,
-V0..V3). `of_kpv_l3l2` (whole padded kpv, depth 1) -> `of_kpv` (forward, obj
-[KB,DK], depth 2) delivers 16 blocks per fill; n_qt fills = 22 x 16 = 352 blocks =
-exactly what the core acquires. L1 budget UNCHANGED (one [KB,DK] block at a time;
-54.3 KB from 3b). Cost: kpv is streamed from DDR n_qt times (the documented
-STREAM-A data-movement tradeoff) -- correctness ships first; a working resident-L2
-replay to cut the re-fetch is a later optimization.
+    kpv_tap = TensorTiler2D.simple_tiler([kpv_pad_rows, DK], pattern_repeat=n_qt)[0]
+    # -> sizes=[n_qt,1,kpv_pad_rows,DK], strides=[0,0,DK,1], offset 0
+    rt.fill(of_kpv_l3l2.prod(), KPV, tap=kpv_tap)
+
+`shim_dma_single_bd_task` turns `sizes[0] > 1` into BD `repeat_count = n_qt-1`, so
+ONE BD is replayed n_qt times, each RE-READING the whole kpv from DDR offset 0
+(stride-0 outer dim). That DDR re-read gives every query tile k|p|V from the START
+(k0..k3, p0..p7, V0..V3) -- the restart the L2->L1 replay lacked -- with 1 BD
+instead of 22. n_qt whole-kpv objects -> `of_kpv` forward (obj [KB,DK], depth 2)
+-> 22 x 16 = 352 blocks = exactly what the core acquires. L1 budget UNCHANGED (one
+[KB,DK] block at a time; 54.3 KB from 3b). Cost: kpv streamed from DDR n_qt times
+(the documented STREAM-A data-movement tradeoff) -- correctness ships first; a
+working resident-L2 replay to cut the re-fetch is a later optimization.
 
 Block-fill accounting (T=172, TQ=8, KB=43): per query tile = 4 k (172/43) + 8 p
 (7 full + 1 ragged pb=42) + 4 V = 16 blocks; x n_qt=22 tiles (21 full q0=0..160 +
