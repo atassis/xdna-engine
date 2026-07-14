@@ -92,7 +92,32 @@ pub struct NpuMatmul {
     ncache: RefCell<HashMap<String, usize>>,       // weight N (ncols) by id, paired with wcache
     relpos_dir: PathBuf,                           // {root}/artifacts/relpos (per-T xclbin cache)
     relpos: RefCell<HashMap<usize, Rc<RelposK>>>,  // T -> loaded resident block
+    ln_dir: PathBuf,                               // {root}/artifacts/parakeet/ln (ctxln + cast xclbins)
+    resident_ln: RefCell<Option<Rc<ResidentLn>>>,  // co-resident on-chip LN + f32->bf16 cast chain
     pub stats: RefCell<NpuStats>,
+}
+
+/// Co-resident on-chip LayerNorm (normalize-only, f32) + f32->bf16 cast, chained device-side
+/// (resident-rails LN->fc1 seam). x[512,1024] f32 -> ctxLN -> bo_ln[512,1024] f32 (device) ->
+/// cast -> bo_bf16[512,1024] bf16 (device), the modal fc1's A input -- no host round-trip on the
+/// intermediate (feasibility: scripts/prototype_ln_cast_resident.py). Built at PAD_M x KRES.
+struct ResidentLn {
+    ln_kern: Rc<Kernel>,
+    ln_instr: Bo,
+    ln_n: usize,
+    cast_kern: Rc<Kernel>,
+    cast_instr: Bo,
+    cast_n: usize,
+    bo_x: Bo,    // [PAD_M, KRES] f32   (ctxLN input,  ln g3)
+    bo_ln: Bo,   // [PAD_M, KRES] f32   (ctxLN output = cast input, ln g4)
+    bo_bf16: Bo, // [PAD_M, KRES] bf16  (cast output = modal fc1 A, cast g4)
+    // per-kernel dummy placeholders (g5/g6/g7; 0-size segfaults)
+    ln_c: Bo,
+    ln_tmp: Bo,
+    ln_tr: Bo,
+    cast_c: Bo,
+    cast_tmp: Bo,
+    cast_tr: Bo,
 }
 
 impl NpuMatmul {
@@ -162,6 +187,8 @@ impl NpuMatmul {
             ncache: RefCell::new(HashMap::new()),
             relpos_dir: root.join("artifacts/relpos"),
             relpos: RefCell::new(HashMap::new()),
+            ln_dir: root.join("artifacts/parakeet/ln"),
+            resident_ln: RefCell::new(None),
             stats: RefCell::new(NpuStats::default()),
         }
     }
@@ -256,6 +283,106 @@ impl NpuMatmul {
             }
         }
         ctx
+    }
+
+    /// Lazy-load the co-resident ctxLN + cast xclbins from {root}/artifacts/parakeet/ln (built at
+    /// PAD_M x KRES = 512 x 1024). Two extra hw-contexts alongside the modal matmul.
+    fn resident_ln(&self) -> Rc<ResidentLn> {
+        if let Some(k) = self.resident_ln.borrow().as_ref() {
+            return k.clone();
+        }
+        let load = |name: &str| -> (Rc<Kernel>, Bo, usize) {
+            let xcl = self.ln_dir.join(format!("final_{name}_{PAD_M}x{KRES}.xclbin"));
+            let ins = self.ln_dir.join(format!("insts_{name}_{PAD_M}x{KRES}.txt"));
+            let kern = self
+                .dev
+                .load_kernel(xcl.to_str().unwrap(), None)
+                .unwrap_or_else(|e| panic!("load resident-ln {} : {e:?}\n  prebuild: build ctxln+cast at {PAD_M}x{KRES} and copy to artifacts/parakeet/ln", xcl.display()));
+            let ib = std::fs::read(&ins).unwrap_or_else(|e| panic!("read {}: {e}", ins.display()));
+            let n = ib.len() / 4;
+            let bo = self.dev.alloc_bo(&kern, ib.len(), FLAG_CACHEABLE, kern.group_id(1).unwrap()).unwrap();
+            bo.write_bytes(&ib).unwrap();
+            bo.sync_to_device().unwrap();
+            (kern, bo, n)
+        };
+        let (ln_kern, ln_instr, ln_n) = load("ctxln");
+        let (cast_kern, cast_instr, cast_n) = load("cast");
+        let gl = |i| ln_kern.group_id(i).unwrap();
+        let gc = |i| cast_kern.group_id(i).unwrap();
+        let rl = Rc::new(ResidentLn {
+            bo_x: self.dev.alloc_bo(&ln_kern, PAD_M * KRES * 4, FLAG_HOST_ONLY, gl(3)).unwrap(),
+            bo_ln: self.dev.alloc_bo(&ln_kern, PAD_M * KRES * 4, FLAG_HOST_ONLY, gl(4)).unwrap(),
+            bo_bf16: self.dev.alloc_bo(&cast_kern, PAD_M * KRES * 2, FLAG_HOST_ONLY, gc(4)).unwrap(),
+            ln_c: self.dev.alloc_bo(&ln_kern, 1, FLAG_HOST_ONLY, gl(5)).unwrap(),
+            ln_tmp: self.dev.alloc_bo(&ln_kern, 8, FLAG_HOST_ONLY, gl(6)).unwrap(),
+            ln_tr: self.dev.alloc_bo(&ln_kern, 1, FLAG_HOST_ONLY, gl(7)).unwrap(),
+            cast_c: self.dev.alloc_bo(&cast_kern, 1, FLAG_HOST_ONLY, gc(5)).unwrap(),
+            cast_tmp: self.dev.alloc_bo(&cast_kern, 8, FLAG_HOST_ONLY, gc(6)).unwrap(),
+            cast_tr: self.dev.alloc_bo(&cast_kern, 1, FLAG_HOST_ONLY, gc(7)).unwrap(),
+            ln_kern, ln_instr, ln_n, cast_kern, cast_instr, cast_n,
+        });
+        *self.resident_ln.borrow_mut() = Some(rl.clone());
+        rl
+    }
+
+    /// On-chip normalize-only LN then f32->bf16 cast, chained DEVICE-SIDE (the intermediate bo_ln
+    /// never touches host). Pads x[t,KRES] to [PAD_M,KRES]; returns the resident block whose bo_bf16
+    /// holds cast(LN(x)) ready as the modal fc1's A input.
+    fn ln_cast(&self, x: &Array2<f32>) -> Rc<ResidentLn> {
+        let (t, d) = x.dim();
+        assert_eq!(d, KRES, "resident LN needs D=KRES={KRES}");
+        assert!(t <= PAD_M, "T={t} exceeds PAD_M={PAD_M}");
+        let rl = self.resident_ln();
+        let x_std = x.as_standard_layout();
+        let mut buf = vec![0f32; PAD_M * KRES];
+        buf[..t * KRES].copy_from_slice(&x_std.as_slice().unwrap()[..t * KRES]);
+        rl.bo_x.write_bytes(f32_bytes(&buf)).unwrap();
+        rl.bo_x.sync_to_device().unwrap();
+        // (1) ctxLN: bo_x -> bo_ln  (NO sync back -- stays device-resident)
+        rl.ln_kern.run_matmul8(3, &rl.ln_instr, rl.ln_n, &rl.bo_x, &rl.bo_ln, &rl.ln_c, &rl.ln_tmp, &rl.ln_tr).unwrap();
+        // (2) cast: bo_ln -> bo_bf16  (device-side hand-off, no host round-trip)
+        rl.cast_kern.run_matmul8(3, &rl.cast_instr, rl.cast_n, &rl.bo_ln, &rl.bo_bf16, &rl.cast_c, &rl.cast_tmp, &rl.cast_tr).unwrap();
+        self.stats.borrow_mut().dispatches += 2;
+        rl
+    }
+
+    /// One modal-resident matmul dispatch whose A input is an ALREADY-device-resident bf16 BO
+    /// (a_bo), skipping dispatch()'s host pack+upload. Output read to host (C[m,n] f32).
+    fn dispatch_with_a(&self, a_bo: &Bo, m: usize, wbo: &Bo, n: usize, silu: bool) -> Array2<f32> {
+        let st = self.stream(n, silu);
+        self.kern.run_matmul8(3, &st.instr, st.n_instr, a_bo, wbo, &st.bo_c, &self.bo_tmp, &self.bo_tr).unwrap();
+        self.stats.borrow_mut().dispatches += 1;
+        st.bo_c.sync_from_device().unwrap();
+        let mut cb = vec![0u8; m * n * 4];
+        st.bo_c.read_bytes(&mut cb).unwrap();
+        let mut out = Array2::<f32>::zeros((m, n));
+        for r in 0..m {
+            for c in 0..n {
+                let off = (r * n + c) * 4;
+                out[[r, c]] = f32::from_le_bytes([cb[off], cb[off + 1], cb[off + 2], cb[off + 3]]);
+            }
+        }
+        out
+    }
+
+    /// Resident FF1 fc1 (LN->fc1 seam, the first frontier advance): on-chip normalize-only LN + cast
+    /// (device-side) -> modal fc1 (identity epilogue) with the GAMMA-FOLDED weight. Returns raw
+    /// `norm(x) @ (diag(gamma).W1)` [t,n] f32; the caller adds the beta.W1 bias + SiLU (the affine is
+    /// folded into W1/bias exactly, validated in numpy). `id` keys the folded-weight BO cache.
+    pub fn resident_ff1_fc1<F: FnOnce() -> Array2<f32>>(&self, x: &Array2<f32>, make_w1f: F, id: &str, n: usize) -> Array2<f32> {
+        self.stats.borrow_mut().calls += 1;
+        let m = x.nrows();
+        let rl = self.ln_cast(x);
+        let cached = self.wcache.borrow().get(id).cloned();
+        let wbo = if let Some(bo) = cached {
+            bo
+        } else {
+            let w = make_w1f();
+            assert_eq!(w.nrows(), KRES, "folded W1 nrows {} != {KRES}", w.nrows());
+            assert_eq!(w.ncols(), n, "folded W1 ncols {} != {n}", w.ncols());
+            self.weight_bo(id, w.view())
+        };
+        self.dispatch_with_a(&rl.bo_bf16, m, &wbo, n, false)
     }
 
     /// Per-N instruction stream. On the MODAL resident, `silu` picks the baked-RTP mode: the
@@ -539,6 +666,10 @@ impl NpuMatmul {
 
 fn u16_bytes(v: &[u16]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 2) }
+}
+
+fn f32_bytes(v: &[f32]) -> &[u8] {
+    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) }
 }
 
 /// Append `take` rows of `m` (starting at row `start`) to `dst`, then zero-pad to `n_total` rows
