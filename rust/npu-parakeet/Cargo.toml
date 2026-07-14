@@ -32,3 +32,8 @@ path = "src/bin/parakeet_encode_npu.rs"
 name = "verify_tdt_decoder"
 path = "src/bin/verify_tdt_decoder.rs"
 
+[[bin]]
+name = "relpos_parity"
+path = "src/bin/relpos_parity.rs"
+required-features = ["npu"]
+
