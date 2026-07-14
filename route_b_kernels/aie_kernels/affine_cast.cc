@@ -22,6 +22,9 @@ template <int N>
 void affine_cast_row(const float *restrict input, const float *restrict gb,
                      bfloat16 *restrict output, int32_t cols) {
   event0();
+  // Round-to-nearest-even, matching the host AVX512 pack_f32_to_bf16 (default is truncation,
+  // which biases toward zero and regressed WER vs the round-nearest host path).
+  ::aie::set_rounding(::aie::rounding_mode::conv_even);
   const float *gamma = gb;
   const float *beta = gb + cols;
   for (int i = 0; i < cols; i += N) {
