@@ -101,14 +101,15 @@ impl FastConformerEncoder {
 
     fn feed_forward(&self, x: &Array2<f32>, b: &BlockWeights, blk: usize, tag: &str, norm_w: &str, norm_b: &str, l1: &str, l2: &str) -> Array2<f32> {
         let stage: &'static str = if tag == "ff1" { "ff1" } else { "ff2" };
-        // RESIDENT FF1 seam (opt-in PARAKEET_RESIDENT_FF=1, modal resident): LN + fc1 + SiLU run
-        // FULLY on-NPU device-side (ctxLN -> affine_cast(gamma,beta) -> modal fc1 on-chip silu), the
-        // activation stream never touching host across LN->fc1. Returns silu(affine_LN(x)@W1); fc2
-        // stays on the existing host-fed path for now (the next frontier step is fc1->fc2).
+        // RESIDENT FF1 seam (DEFAULT on the modal resident; opt out with PARAKEET_RESIDENT_FF=0):
+        // LN + fc1 + SiLU run FULLY on-NPU device-side (ctxLN -> affine_cast(gamma,beta) -> modal fc1
+        // on-chip silu), the activation stream never touching host across LN->fc1. WER-neutral (==
+        // baseline). Returns silu(affine_LN(x)@W1); fc2 stays host-fed for now (next frontier step).
+        // Falls back to the host LN path when the resident xclbins aren't built (resident_ff_available).
         #[cfg(feature = "npu")]
-        if std::env::var("PARAKEET_RESIDENT_FF").is_ok() {
+        if std::env::var("PARAKEET_RESIDENT_FF").map(|v| v != "0").unwrap_or(true) {
             if let Some(npu) = &self.npu {
-                if npu.modal() {
+                if npu.resident_ff_available() {
                     let gamma = b.v(norm_w);
                     let beta = b.v(norm_b);
                     prof::phase::set_stage(stage);

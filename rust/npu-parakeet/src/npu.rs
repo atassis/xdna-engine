@@ -92,8 +92,10 @@ pub struct NpuMatmul {
     ncache: RefCell<HashMap<String, usize>>,       // weight N (ncols) by id, paired with wcache
     relpos_dir: PathBuf,                           // {root}/artifacts/relpos (per-T xclbin cache)
     relpos: RefCell<HashMap<usize, Rc<RelposK>>>,  // T -> loaded resident block
-    ln_dir: PathBuf,                               // {root}/artifacts/parakeet/ln (ctxln + cast xclbins)
-    resident_ln: RefCell<Option<Rc<ResidentLn>>>,  // co-resident on-chip LN + f32->bf16 cast chain
+    ln_dir: PathBuf,                               // {root}/artifacts/parakeet/ln (ctxln + affcast xclbins)
+    // Tri-state cache: None = untried; Some(None) = xclbins absent, FF stays host (no retry);
+    // Some(Some) = co-resident on-chip LN + affine-cast chain loaded.
+    resident_ln: RefCell<Option<Option<Rc<ResidentLn>>>>,
     pub stats: RefCell<NpuStats>,
 }
 
@@ -289,10 +291,28 @@ impl NpuMatmul {
 
     /// Lazy-load the co-resident ctxLN + cast xclbins from {root}/artifacts/parakeet/ln (built at
     /// PAD_M x KRES = 512 x 1024). Two extra hw-contexts alongside the modal matmul.
-    fn resident_ln(&self) -> Rc<ResidentLn> {
-        if let Some(k) = self.resident_ln.borrow().as_ref() {
-            return k.clone();
+    fn resident_ln(&self) -> Option<Rc<ResidentLn>> {
+        if let Some(cached) = self.resident_ln.borrow().as_ref() {
+            return cached.clone();
         }
+        // Graceful: if the ctxln+affcast xclbins aren't present, the FFN LN->fc1 stays on the host
+        // path (no panic) -- so the resident seam can be the DEFAULT without breaking builds/branches
+        // that haven't built these kernels.
+        let present = ["ctxln", "affcast"].iter().all(|n| {
+            self.ln_dir.join(format!("final_{n}_{PAD_M}x{KRES}.xclbin")).exists()
+                && self.ln_dir.join(format!("insts_{n}_{PAD_M}x{KRES}.txt")).exists()
+        });
+        let result = if present {
+            Some(self.load_resident_ln())
+        } else {
+            eprintln!("[npu] resident-ln xclbins absent in {} -- FFN LN->fc1 stays host (build ctxln+affcast for the on-NPU seam)", self.ln_dir.display());
+            None
+        };
+        *self.resident_ln.borrow_mut() = Some(result.clone());
+        result
+    }
+
+    fn load_resident_ln(&self) -> Rc<ResidentLn> {
         let load = |name: &str| -> (Rc<Kernel>, Bo, usize) {
             let xcl = self.ln_dir.join(format!("final_{name}_{PAD_M}x{KRES}.xclbin"));
             let ins = self.ln_dir.join(format!("insts_{name}_{PAD_M}x{KRES}.txt"));
@@ -323,8 +343,13 @@ impl NpuMatmul {
             ac_tr: self.dev.alloc_bo(&ac_kern, 1, FLAG_HOST_ONLY, ga(7)).unwrap(),
             ln_kern, ln_instr, ln_n, ac_kern, ac_instr, ac_n,
         });
-        *self.resident_ln.borrow_mut() = Some(rl.clone());
         rl
+    }
+
+    /// True when the resident on-NPU LN->fc1 seam is usable (modal resident + ctxln/affcast xclbins
+    /// present). Lets `feed_forward` default to the resident path and fall back to host otherwise.
+    pub fn resident_ff_available(&self) -> bool {
+        self.modal && self.resident_ln().is_some()
     }
 
     /// On-chip normalize-only LN then AFFINE cast (*gamma+beta), chained DEVICE-SIDE (the
@@ -337,7 +362,8 @@ impl NpuMatmul {
         assert!(t <= PAD_M, "T={t} exceeds PAD_M={PAD_M}");
         assert_eq!(gamma.len(), KRES);
         assert_eq!(beta.len(), KRES);
-        let rl = self.resident_ln();
+        // Only called on the resident path (gated by resident_ff_available), so the load succeeded.
+        let rl = self.resident_ln().expect("ln_affine_cast without resident_ff_available()");
         let x_std = x.as_standard_layout();
         let mut buf = vec![0f32; PAD_M * KRES];
         buf[..t * KRES].copy_from_slice(&x_std.as_slice().unwrap()[..t * KRES]);

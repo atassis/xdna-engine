@@ -45,3 +45,19 @@ ls -la $MMW/build/final_512x1024x4096_64x32x128_8c_modalsilu.xclbin \
        $MMW/build/insts_512x1024x4096_64x32x128_8c_modalsilu.txt \
        $MMW/build/insts_512x1024x1024_64x32x128_8c_modalid.txt \
        $MMW/build/insts_512x1024x2048_64x32x128_8c_modalid.txt
+
+# --- RESIDENT-LN SEAM (DEFAULT LN->fc1 on-NPU): ctxLN(normalize-only) + affine_cast(gamma,beta) at
+#     PAD_M x KRES = 512 x 1024. Loaded co-resident by npu.rs::resident_ln; the encoder defaults to
+#     the device-side LN->fc1 seam when these are present (opt out: PARAKEET_RESIDENT_FF=0). ---
+LNML=mlir-aie/programming_examples/ml/layernorm
+LNDIR=artifacts/parakeet/ln
+mkdir -p "$LNDIR"
+echo "== RESIDENT-LN: ctxLN + affine_cast (+ plain cast) 512x1024 =="
+make -C $LNML -f Makefile.ctxln      NPU2=1 rows=512 cols=1024 build/final_ctxln_512x1024.xclbin
+make -C $LNML -f Makefile.affinecast NPU2=1 rows=512 cols=1024 build/final_affcast_512x1024.xclbin
+make -C $LNML -f Makefile.cast       NPU2=1 rows=512 cols=1024 build/final_cast_512x1024.xclbin
+for tag in ctxln_512x1024 affcast_512x1024 cast_512x1024; do
+  cp "$LNML/build/final_${tag}.xclbin" "$LNML/build/insts_${tag}.txt" "$LNDIR/"
+done
+echo "Built + staged resident-LN seam xclbins -> $LNDIR"
+ls -la $LNDIR/
