@@ -30,6 +30,27 @@ struct NStream {
     bo_c: Bo, // [PAD_M, n] f32
 }
 
+// Resident relpos-MHA block (STEP=8). One xclbin per encoder frame count T (the kernel bakes
+// RELPOS_T); loaded + cached per T from {root}/artifacts/relpos/T<T>/. TQ/KB match the build.
+const RELPOS_TQ: usize = 8;
+const RELPOS_KB: usize = 43;
+const RELPOS_DK: usize = 128; // Parakeet head_dim (kernel bakes DK=128)
+
+/// A loaded per-T resident relpos block: its own xclbin/kernel, instr stream, and reusable
+/// QUV/KPV/CTX BOs sized for this T. Dispatched per head via run_dwconv6(3, instr, n, quv, kpv, ctx).
+struct RelposK {
+    kern: Rc<Kernel>,
+    instr: Bo,
+    n_instr: usize,
+    bo_quv: Bo,
+    bo_kpv: Bo,
+    bo_ctx: Bo,
+    n_qt: usize,   // ceil(T/TQ)
+    tp: usize,     // n_kb*KB (k/V padded rows)
+    pp: usize,     // n_pb*KB (p padded rows)
+    ctx_rows: usize, // n_qt*TQ (CTX readback rows, take [:T])
+}
+
 #[derive(Default)]
 pub struct NpuStats {
     pub pack_a_s: f64,
@@ -63,6 +84,8 @@ pub struct NpuMatmul {
     streams: RefCell<HashMap<(usize, bool), Rc<NStream>>>, // (N, silu) -> stream
     wcache: RefCell<HashMap<String, Rc<Bo>>>,      // packed weight BOs by id
     ncache: RefCell<HashMap<String, usize>>,       // weight N (ncols) by id, paired with wcache
+    relpos_dir: PathBuf,                           // {root}/artifacts/relpos (per-T xclbin cache)
+    relpos: RefCell<HashMap<usize, Rc<RelposK>>>,  // T -> loaded resident block
     pub stats: RefCell<NpuStats>,
 }
 
@@ -131,8 +154,90 @@ impl NpuMatmul {
             streams: RefCell::new(HashMap::new()),
             wcache: RefCell::new(HashMap::new()),
             ncache: RefCell::new(HashMap::new()),
+            relpos_dir: root.join("artifacts/relpos"),
+            relpos: RefCell::new(HashMap::new()),
             stats: RefCell::new(NpuStats::default()),
         }
+    }
+
+    /// Load (and cache) the resident relpos block for encoder frame count `t`. The xclbin bakes
+    /// RELPOS_T, so there is one per T under {root}/artifacts/relpos/T<t>/ (pre-build with
+    /// scripts/relpos_prebuild.sh). Panics with a build hint if the artifacts are missing.
+    fn relpos_kern(&self, t: usize) -> Rc<RelposK> {
+        if let Some(k) = self.relpos.borrow().get(&t) {
+            return k.clone();
+        }
+        let p = 2 * t - 1;
+        let cdiv = |a: usize, b: usize| (a + b - 1) / b;
+        let n_qt = cdiv(t, RELPOS_TQ);
+        let tp = cdiv(t, RELPOS_KB) * RELPOS_KB;
+        let pp = cdiv(p, RELPOS_KB) * RELPOS_KB;
+        let ctx_rows = n_qt * RELPOS_TQ;
+        let dir = self.relpos_dir.join(format!("T{t}"));
+        let xclbin = dir.join("final.xclbin");
+        let insts = dir.join("insts.bin");
+        let kern = self
+            .dev
+            .load_kernel(xclbin.to_str().unwrap(), None)
+            .unwrap_or_else(|e| panic!("load relpos T={t} ({}): {e:?}\n  pre-build: scripts/relpos_prebuild.sh {t}", xclbin.display()));
+        let ib = std::fs::read(&insts).unwrap_or_else(|e| panic!("read {}: {e}", insts.display()));
+        let n_instr = ib.len() / 4;
+        let g = |i| kern.group_id(i).unwrap();
+        let instr = self.dev.alloc_bo(&kern, ib.len(), FLAG_CACHEABLE, g(1)).unwrap();
+        instr.write_bytes(&ib).unwrap();
+        instr.sync_to_device().unwrap();
+        let bo_quv = self.dev.alloc_bo(&kern, 2 * n_qt * RELPOS_TQ * RELPOS_DK * 2, FLAG_HOST_ONLY, g(3)).unwrap();
+        let bo_kpv = self.dev.alloc_bo(&kern, (tp + pp + tp) * RELPOS_DK * 2, FLAG_HOST_ONLY, g(4)).unwrap();
+        let bo_ctx = self.dev.alloc_bo(&kern, ctx_rows * RELPOS_DK * 2, FLAG_HOST_ONLY, g(5)).unwrap();
+        let rk = Rc::new(RelposK { kern, instr, n_instr, bo_quv, bo_kpv, bo_ctx, n_qt, tp, pp, ctx_rows });
+        self.relpos.borrow_mut().insert(t, rk.clone());
+        rk
+    }
+
+    /// Resident relpos-MHA block for ONE head. qu/qv/k [t,DK], p [2t-1,DK], v [t,DK] (f32) ->
+    /// ctx [t,DK] (f32). Packs the STEP=8 stream layout (tile-interleaved QUV, padded KPV),
+    /// dispatches via the 3-BO ABI, unpacks the bf16 CTX. Mirrors run_npu_relpos_rowtiled.py.
+    pub fn relpos_mha(&self, qu: &Array2<f32>, qv: &Array2<f32>, k: &Array2<f32>, p: &Array2<f32>, v: &Array2<f32>) -> Array2<f32> {
+        let t = qu.nrows();
+        let rk = self.relpos_kern(t);
+        let mut quv = Vec::<f32>::with_capacity(2 * rk.n_qt * RELPOS_TQ * RELPOS_DK);
+        for q in 0..rk.n_qt {
+            let q0 = q * RELPOS_TQ;
+            let take = RELPOS_TQ.min(t - q0);
+            push_pad_rows(&mut quv, qu, q0, take, RELPOS_TQ);
+            push_pad_rows(&mut quv, qv, q0, take, RELPOS_TQ);
+        }
+        let mut kpv = Vec::<f32>::with_capacity((rk.tp + rk.pp + rk.tp) * RELPOS_DK);
+        push_pad_rows(&mut kpv, k, 0, t, rk.tp);
+        push_pad_rows(&mut kpv, p, 0, p.nrows(), rk.pp);
+        push_pad_rows(&mut kpv, v, 0, t, rk.tp);
+        let mut qb = vec![0u16; quv.len()];
+        let mut kb = vec![0u16; kpv.len()];
+        npu_xrt::pack_f32_to_bf16(&quv, &mut qb);
+        npu_xrt::pack_f32_to_bf16(&kpv, &mut kb);
+        let t0 = Instant::now();
+        rk.bo_quv.write_bytes(u16_bytes(&qb)).unwrap();
+        rk.bo_quv.sync_to_device().unwrap();
+        rk.bo_kpv.write_bytes(u16_bytes(&kb)).unwrap();
+        rk.bo_kpv.sync_to_device().unwrap();
+        rk.kern.run_dwconv6(3, &rk.instr, rk.n_instr, &rk.bo_quv, &rk.bo_kpv, &rk.bo_ctx).unwrap();
+        rk.bo_ctx.sync_from_device().unwrap();
+        {
+            let mut s = self.stats.borrow_mut();
+            s.dispatch_s += t0.elapsed().as_secs_f64();
+            s.dispatches += 1;
+        }
+        let mut cb = vec![0u8; rk.ctx_rows * RELPOS_DK * 2];
+        rk.bo_ctx.read_bytes(&mut cb).unwrap();
+        let mut ctx = Array2::<f32>::zeros((t, RELPOS_DK));
+        for i in 0..t {
+            for d in 0..RELPOS_DK {
+                let off = (i * RELPOS_DK + d) * 2;
+                let u = u16::from_le_bytes([cb[off], cb[off + 1]]);
+                ctx[[i, d]] = f32::from_bits((u as u32) << 16);
+            }
+        }
+        ctx
     }
 
     /// Per-N instruction stream. On the MODAL resident, `silu` picks the baked-RTP mode: the
@@ -416,4 +521,14 @@ impl NpuMatmul {
 
 fn u16_bytes(v: &[u16]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 2) }
+}
+
+/// Append `take` rows of `m` (starting at row `start`) to `dst`, then zero-pad to `n_total` rows
+/// (each row `m.ncols()` wide). Used to build the STEP=8 QUV/KPV packing (ragged tiles + block pad).
+fn push_pad_rows(dst: &mut Vec<f32>, m: &Array2<f32>, start: usize, take: usize, n_total: usize) {
+    let dk = m.ncols();
+    for r in 0..take {
+        dst.extend(m.row(start + r).iter().copied());
+    }
+    dst.extend(std::iter::repeat(0.0f32).take((n_total - take) * dk));
 }

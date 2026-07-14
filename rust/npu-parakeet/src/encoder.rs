@@ -210,6 +210,36 @@ impl FastConformerEncoder {
         };
         let scale = (dk as f32).sqrt();
 
+        // RESIDENT MHA (opt-in PARAKEET_RESIDENT_MHA=1): replace the host per-head
+        // scores/rel_shift/softmax/context with the on-chip STEP=8 block, one dispatch per head.
+        // The kernel bakes inv_scale=1/sqrt(128), so pass qu=qh+u / qv=qh+v / k / p / v directly.
+        #[cfg(feature = "npu")]
+        if std::env::var("PARAKEET_RESIDENT_MHA").is_ok() {
+            if let Some(npu) = &self.npu {
+                let _h = PhaseScope::new("mhsa_resident", Bucket::Npu);
+                let mut ctx = Array2::<f32>::zeros((t, d));
+                for hh in 0..h {
+                    let col = hh * dk;
+                    let qh = q.slice(s![.., col..col + dk]);
+                    let kh = k.slice(s![.., col..col + dk]).to_owned();
+                    let ph = pm.slice(s![.., col..col + dk]).to_owned();
+                    let vh = v.slice(s![.., col..col + dk]).to_owned();
+                    let mut qu = qh.to_owned();
+                    let mut qv = qh.to_owned();
+                    for i in 0..t {
+                        for c in 0..dk {
+                            qu[[i, c]] += ubias[[hh, c]];
+                            qv[[i, c]] += vbias[[hh, c]];
+                        }
+                    }
+                    let ch = npu.relpos_mha(&qu, &qv, &kh, &ph, &vh);
+                    ctx.slice_mut(s![.., col..col + dk]).assign(&ch);
+                }
+                prof::phase::set_stage("mhsa_qkv");
+                return self.mm_lazy(&ctx, || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_out.weight") }, &format!("{blk}.out"));
+            }
+        }
+
         // assemble bd_all [H, T, P] then rel_shift -> [H, T, T]
         let (mut bd_all, mut ac_all);
         {
