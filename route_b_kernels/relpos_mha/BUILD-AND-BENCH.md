@@ -86,11 +86,13 @@ ARITHMETIC risk and the DATAFLOW risk are gated separately:
   precision non-regression, far below the ctx rel-L2 gate (0.08).
 
 - STEP=8 `relpos_rowtiled_stream` (`relpos_rowtiled_stream_iron.py`) -- the FULL-T
-  block. k/p/V staged ONCE in the 512 KB MemTile, streamed to L1 in KB-row
-  key-blocks, REPLAYED once per query tile via ObjectFifo `repeat_count`. L1 then
-  holds only ONE key-block + the `[TQ,*]` scratch. Same block bricks as STEP=7,
-  exposed as `relpos_stream_dot/_softmax/_ctx*` and driven from the IRON Worker's
-  acquire/release loop. This adds ONLY the dataflow the golden cannot validate.
+  block. k/p/V staged in the 512 KB MemTile and streamed to L1 in KB-row
+  key-blocks, RE-STREAMED once per query tile (STEP-A: the runtime re-fills the
+  whole kpv per tile -- see 3f; `repeat_count` replay was rejected on device). L1
+  then holds only ONE key-block + the `[TQ,*]` scratch. Same block bricks as
+  STEP=7, exposed as `relpos_stream_dot/_softmax/_ctx*` and driven from the IRON
+  Worker's acquire/release loop. This adds ONLY the dataflow the golden cannot
+  validate.
 
 ### 3a. ObjectFifo topology (2 input DMA channels -- HARD limit)
 
@@ -102,9 +104,10 @@ The NPU2 CORE tile has exactly 2 input (S2MM) + 2 output (MM2S) DMA channels
              qu_tile (phase K) then qv_tile (phase P); 2*n_qt blocks, read ONCE
              (no replay). Host packs QUV TILE-INTERLEAVED.
   Channel B  `of_kpv` [KB,DK] bf16, depth 2 -- `of_kpv_l3l2` stages the whole
-             padded kpv L3->L2 once; `.forward(obj_type=[KB,DK], repeat_count=n_qt)`
-             re-streams it L2->L1 in KB-blocks, n_qt times, WITHOUT re-fetching
-             from DDR. Per query tile: n_kb k-blocks, n_pb p-blocks, n_vb V-blocks.
+             padded kpv L3->L2; `.forward(obj_type=[KB,DK])` delivers it L2->L1 in
+             16 KB-blocks per fill. The runtime re-fills the whole kpv per query
+             tile (STREAM-A, 3f), so each tile gets k0..k3,p0..p7,V0..V3 from the
+             start. Per query tile: n_kb k-blocks, n_pb p-blocks, n_vb V-blocks.
   Output     `of_ctx` [TQ,DK] bf16, depth 2 -- one block per query tile.
 
 `split`/`forward`/`repeat_count` API: `python/iron/dataflow/objectfifo.py`
@@ -195,27 +198,37 @@ PROBE 1 (do int32 kernel scalars lower?) is now RESOLVED: the static build
 generated valid MLIR and reached the ELF stage, so int scalar args lower fine;
 the loop version passes q0/j0 as `index_cast`'d i32 Values (same operand slot).
 
-### 3f. THE ONE REMAINING BUILD PROBE (not numpy-validatable, STEP=8)
+### 3f. KPV REPLAY = STREAM-A (repeat_count rejected on device)
 
-PROBE 2 (resident-L2 replay in blocks). `of_kpv_l3l2` stages the whole padded
-kpv in L2 (one L3->L2 fill); `of_kpv` forwards it to L1 with `obj_type=[KB,DK]`
-(smaller than the source) + `repeat_count=n_qt`. CONFIRM this lowers to an
-`aie.memtile_dma` that keeps kpv resident and emits KB-blocks n_qt times, NOT
-n_qt fresh L3 DMAs. If forward-with-smaller-obj_type + repeat_count does not
-lower that way, fall back to STREAM-A: runtime re-fills kpv blocks per query
-tile (the proven whole_array pattern; correct, same L1 budget, re-fetches kpv
-from DDR each tile -> worse data movement, to be optimized back to replay).
+PROBE 2 (resident-L2 `repeat_count` replay) was tried and REJECTED on silicon:
+`of_kpv.forward(obj_type=[KB,DK], repeat_count=n_qt)` from a whole-kpv L2 buffer
+BUILT (8 scf.for, ELF/CDO pass) but FAILED parity -- rel-L2 0.82, corr 0.65: the
+L2 read did NOT restart per query tile, so tile q consumed the wrong key-blocks
+(systematic, not garbage).
 
-SMALLEST PROBE (toolchain box, no bench):
+SHIPPED FIX = STREAM-A. Drop `repeat_count`; the runtime RE-FILLS the whole padded
+kpv ONCE PER QUERY TILE:
+
+    for _q in range(n_qt):
+        rt.fill(of_kpv_l3l2.prod(), KPV)   # each fill -> forward -> 16 blocks
+
+so every query tile deterministically gets kpv from the START (k0..k3, p0..p7,
+V0..V3). `of_kpv_l3l2` (whole padded kpv, depth 1) -> `of_kpv` (forward, obj
+[KB,DK], depth 2) delivers 16 blocks per fill; n_qt fills = 22 x 16 = 352 blocks =
+exactly what the core acquires. L1 budget UNCHANGED (one [KB,DK] block at a time;
+54.3 KB from 3b). Cost: kpv is streamed from DDR n_qt times (the documented
+STREAM-A data-movement tradeoff) -- correctness ships first; a working resident-L2
+replay to cut the re-fetch is a later optimization.
+
+Block-fill accounting (T=172, TQ=8, KB=43): per query tile = 4 k (172/43) + 8 p
+(7 full + 1 ragged pb=42) + 4 V = 16 blocks; x n_qt=22 tiles (21 full q0=0..160 +
+1 peeled ragged tq=4) = 352 blocks.
+
+VERIFY (no device):
 
     python3 relpos_rowtiled_stream_iron.py -d npu2 -T 172 --tq 8 --kb 43 \
-        | grep -iE 'memref|memtile_dma|objectfifo|repeat|scf.for'
+        | grep -iE 'memref|objectfifo|scf.for'
 
-Inspect (a) L1 memref allocs are `[KB,DK]` + the `[TQ,*]` scratch and NEVER
-`[T,DK]`/`[P,DK]` (byte budget on silicon), (b) the kpv path is one resident
-MemTile buffer with a replayed BD (PROBE 2), and (c) `scf.for` count is small
-(loops, not unrolled).
-
-Until PROBE 2 is closed by a build, STEP=7 gates the block-decomposed arithmetic
-on silicon (the compute half of STEP=8, kpv-fits-L1); STEP=8 is the dataflow-only
-remainder, and the byte budget above proves it FITS once it lowers.
+L1 memref allocs are `[KB,DK]` + the `[TQ,*]` scratch, never `[T,DK]`/`[P,DK]`;
+`scf.for` count small (loops, not unrolled). Device gate: 3d STEP=8 command,
+`rel-L2 <= 0.08 AND corr >= 0.99`.

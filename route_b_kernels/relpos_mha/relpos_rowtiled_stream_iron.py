@@ -1,9 +1,11 @@
 # relpos_rowtiled_stream_iron.py -- STEP 8: the FULL-T (T up to 172) MemTile-
 # STREAMED rel-pos MHA block. This is the dataflow that removes the last L1 wall:
-# k/p/V are staged ONCE in the 512 KB MemTile (L2) and STREAMED to the compute
-# tile's L1 in KB-row KEY-BLOCKS, REPLAYED once per query tile (ObjectFifo
-# repeat_count). The compute-tile L1 then only ever holds ONE key-block + the
-# [TQ,*] score/prob/ctx scratch -- never the whole ~176 KB k/p/V (p alone is
+# k/p/V are staged in the 512 KB MemTile (L2) and STREAMED to the compute tile's
+# L1 in KB-row KEY-BLOCKS, RE-STREAMED once per query tile (STREAM-A: the runtime
+# re-fills the whole kpv per tile; the repeat_count L2 replay was rejected on
+# device -- see the STREAM-A note below). The compute-tile L1 then only ever holds
+# ONE key-block + the [TQ,*] score/prob/ctx scratch -- never the whole ~176 KB
+# k/p/V (p alone is
 # 86 KB > 64 KB L1 at T=172). Arithmetic is the block-decomposed bricks in
 # relpos_mha.cc (relpos_stream_dot / _softmax / _ctx*), device-gated by the
 # monolithic STEP=7 driver (relpos_kpvstream_bake) at the T where kpv fits L1;
@@ -22,8 +24,9 @@
 #   Channel B  of_kpv : obj_type [KB,DK] bf16. Per query tile the core acquires
 #              n_kb k-blocks, then n_pb p-blocks, then n_vb V-blocks (the L2
 #              buffer laid out k | p | V, each section padded to a KB multiple).
-#              REPLAYED n_qt times via repeat_count so k/p/V are fetched from L3
-#              (DDR) ONCE, then re-streamed from L2 for every query tile.
+#              STREAM-A: the runtime re-fills the whole kpv per query tile so each
+#              tile gets k|p|V from the START (the repeat_count L2 replay delivered
+#              the wrong blocks per tile on device -- corr 0.65 -- and was dropped).
 #   Output     of_ctx : obj_type [TQ,DK] bf16, 1 block per query tile.
 #
 # Per query tile q (q0 = q*TQ, tq = min(TQ, T-q0)) the core:
@@ -55,22 +58,22 @@
 # generated valid MLIR and reached the ELF stage, so int scalar args lower fine;
 # the loop version passes the derived-index scalars as index_cast'd i32 Values.
 #
-# ============================ ONE BUILD PROBE (cannot numpy-validate) ========
-# PROBE 2 (resident-L2 replay in blocks): of_kpv_l3l2 stages the WHOLE padded kpv
-# in L2 (one L3->L2 fill); of_kpv forwards it to L1 with obj_type=[KB,DK] (smaller
-# than the source) and repeat_count=n_qt. Confirm this lowers to a MemTile DMA
-# that keeps kpv resident and emits it as KB-blocks n_qt times (aie.memtile_dma
-# with the replay), NOT n_qt fresh L3 DMAs. If forward()-with-smaller-obj_type +
-# repeat_count does not lower that way, fall back to STREAM-A (documented in
-# BUILD-AND-BENCH.md): runtime re-fills kpv blocks per query tile (proven
-# whole_array pattern; correct, re-fetches kpv from DDR each tile -- same L1
-# budget, worse data movement).
+# ============================ KPV REPLAY = STREAM-A (repeat_count REJECTED) ===
+# PROBE 2 outcome: the repeat_count=n_qt replay of a resident L2 kpv buffer BUILT
+# but FAILED on-device parity (corr 0.65, rel-L2 0.82) -- the L2 read did NOT
+# restart per query tile, so tile q saw the wrong key-blocks. REPLACED with
+# STREAM-A: the runtime RE-FILLS the whole padded kpv once per query tile (n_qt
+# rt.fill calls), so of_kpv_l3l2 -> of_kpv (forward, obj [KB,DK]) delivers a fresh
+# k0..k3,p0..p7,V0..V3 sequence from the START for every tile. Deterministic,
+# correct; kpv is streamed from DDR n_qt times (the documented STREAM-A
+# data-movement cost). L1 budget UNCHANGED (one [KB,DK] block at a time; 54.3 KB).
+# A future optimization can revisit a WORKING resident-L2 replay to cut the DDR
+# re-fetch, but correctness ships first.
 # SMALLEST PROBE: `python3 relpos_rowtiled_stream_iron.py -d npu2 -T 172 --tq 8 \
 #   --kb 43 | grep -iEc 'scf.for'` should be SMALL (the loops are real, not
 #   unrolled -- 4 range_ loops: 1 query + k + p + V), and
-#   `... | grep -iE 'memref|memtile_dma|objectfifo|repeat'` should show (a) L1
-# memref allocs of [KB,DK] + the [TQ,*] scratch, never [T|P,DK], and (b) the kpv
-# path as one resident MemTile buffer with a replayed BD.
+#   `... | grep -iE 'memref|memtile_dma|objectfifo'` should show L1 memref allocs
+# of [KB,DK] + the [TQ,*] scratch, never [T|P,DK].
 #
 # PLACE-TILES toolchain: bare Program(dev, rt).resolve_program(), NO SequentialPlacer.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
@@ -136,11 +139,19 @@ def my_relpos_stream(dev, T, TQ, KB):
     # ---- ObjectFifos ----
     # Channel A: quv tile stream (L3 -> L1), read once, 2 blocks/qtile.
     of_quv = ObjectFifo(quv_blk_ty, name="quv", depth=2)
-    # Channel B: kpv key-block stream. Whole padded kpv staged L3 -> L2 once, then
-    # forwarded L2 -> L1 in [KB,DK] blocks, REPLAYED n_qt times (repeat_count).
+    # Channel B: kpv key-block stream -- STREAM-A. The whole padded kpv is staged
+    # L3 -> L2 and forwarded L2 -> L1 in [KB,DK] blocks (16 blocks per whole-kpv
+    # object). The runtime RE-FILLS the whole kpv ONCE PER QUERY TILE (the n_qt
+    # rt.fill loop below), so every query tile deterministically gets kpv from the
+    # START (k0..k3, p0..p7, V0..V3). This REPLACES repeat_count replay, which
+    # on-device did NOT restart the L2 read per tile (corr 0.65: tile q saw the
+    # wrong blocks). Tradeoff: kpv is streamed from DDR n_qt times (documented
+    # STREAM-A data-movement cost); L1 budget is UNCHANGED (still one [KB,DK] block
+    # at a time). depth=1 on the whole-kpv stage keeps L2 at ~172 KB (no double
+    # buffer of the 172 KB object).
     of_kpv_l3l2 = ObjectFifo(kpv_ty, name="kpv_l3l2", depth=1)
     of_kpv = of_kpv_l3l2.cons().forward(
-        obj_type=kblk_ty, name="kpv_l2l1", depth=2, repeat_count=n_qt
+        obj_type=kblk_ty, name="kpv_l2l1", depth=2
     )
     of_ctx = ObjectFifo(ctx_blk_ty, name="ctx", depth=2)
 
@@ -240,7 +251,12 @@ def my_relpos_stream(dev, T, TQ, KB):
     with rt.sequence(quv_arg_ty, kpv_ty, ctx_arg_ty) as (QUV, KPV, CX):
         rt.start(worker)
         rt.fill(of_quv.prod(), QUV)       # tile-interleaved qu/qv blocks stream out
-        rt.fill(of_kpv_l3l2.prod(), KPV)  # one L3->L2 fill; replayed to L1 by repeat_count
+        # STREAM-A: re-fill the whole padded kpv ONCE PER QUERY TILE so each tile
+        # gets kpv from the start (16 blocks/fill -> forward -> core). n_qt fills
+        # = the 22 * 16 = 352 blocks the core acquires. Deterministic; no reliance
+        # on repeat_count replay semantics.
+        for _q in range(n_qt):
+            rt.fill(of_kpv_l3l2.prod(), KPV)
         rt.drain(of_ctx.cons(), CX, wait=True)
 
     return Program(dev, rt).resolve_program()
