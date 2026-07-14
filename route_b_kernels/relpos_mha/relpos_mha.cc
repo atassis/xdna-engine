@@ -336,3 +336,49 @@ extern "C" void relpos_qkp_scores_softmax_bake(bfloat16 *restrict qk,
   relpos_dot_matmul(qv, p, g_bd, T, P); // BD = qv @ p^T  [T,P]
   relpos_scores_softmax(g_ac, g_bd, probs, T, P, inv_scale);
 }
+
+// ---------------------------------------------------------------------------
+// STEP-4 BRICK 4 -- the context matmul ctx = probs @ V (the AV half). Weighted-
+// sum form: ctx[i, :] = sum_j probs[i,j] * V[j, :] -- for each output row, a
+// running DK-wide f32 accumulation of the value rows weighted by the attention
+// probabilities. This is the natural resident form (probs row + V rows both
+// row-major, no transpose); the contraction is over the T keys (not DK like the
+// score matmuls). bf16 in, f32 accumulate, bf16 out (ctx feeds the bf16 out proj).
+//   probs : [T, T]  row-major bf16  (softmax output; resident in the full block)
+//   V     : [T, DK] row-major bf16  (one head)
+//   ctx   : [T, DK] row-major bf16
+// ---------------------------------------------------------------------------
+static inline void relpos_ctx_matmul(const bfloat16 *restrict probs,
+                                     const bfloat16 *restrict V,
+                                     bfloat16 *restrict ctx, int T) {
+  static_assert(DK % VL == 0, "DK must be a multiple of the vector width");
+  for (int i = 0; i < T; i++) {
+    const bfloat16 *p_row = probs + i * T;
+    bfloat16 *ctx_row = ctx + i * DK;
+    // One accumulator strip per VL-wide slice of the DK output; accumulate the
+    // weighted value rows over the T keys, then narrow to bf16.
+    for (int d = 0; d < DK; d += VL) {
+      aie::accum<accfloat, VL> acc = aie::zeros<accfloat, VL>();
+      for (int j = 0; j < T; j++) {
+        aie::vector<bfloat16, VL> wv = aie::broadcast<bfloat16, VL>(p_row[j]);
+        aie::vector<bfloat16, VL> vv = aie::load_v<VL>(V + j * DK + d);
+        acc = aie::mac(acc, wv, vv); // bf16*bf16 -> f32
+      }
+      aie::store_v(ctx_row + d, acc.to_vector<bfloat16>());
+    }
+  }
+}
+
+// STEP-4 STANDALONE ENTRY -- the AV matmul in isolation (host-fed probs + V),
+// mirroring step 1 (host-fed scores). Validates the context brick before it is
+// composed into the full resident block (step 5, where probs come resident from
+// the softmax). T is baked (must match the generator -T / -DRELPOS_T).
+//   probs : [T, T]  row-major bf16
+//   V     : [T, DK] row-major bf16
+//   ctx   : [T, DK] row-major bf16
+extern "C" void relpos_ctx_bake(bfloat16 *restrict probs, bfloat16 *restrict V,
+                                bfloat16 *restrict ctx) {
+  event0();
+  relpos_ctx_matmul(probs, V, ctx, RELPOS_T);
+  event1();
+}
