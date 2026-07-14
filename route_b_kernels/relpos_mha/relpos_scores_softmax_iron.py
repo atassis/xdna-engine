@@ -24,7 +24,6 @@ import sys
 
 from aie.iron import Kernel, ObjectFifo, Program, Runtime, Worker
 from aie.iron.device import NPU1, NPU2
-from aie.iron.placers import SequentialPlacer
 
 
 def my_relpos_scores_softmax(dev, T):
@@ -65,7 +64,7 @@ def my_relpos_scores_softmax(dev, T):
         rt.fill(of_bd.prod(), BD)
         rt.drain(of_probs.cons(), PR, wait=True)
 
-    return Program(dev, rt).resolve_program(SequentialPlacer())
+    return Program(dev, rt).resolve_program()
 
 
 p = argparse.ArgumentParser()
