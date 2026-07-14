@@ -121,6 +121,10 @@ static inline float exp2_scalar(float x) {
 // rel-err 8.5e-5) but INLINING it into the big 3-pass softmax loop makes Peano -O2 miscompile it
 // to NaN (register-pressure codegen bug; candidate llvm-aie issue). noinline keeps it correct.
 static __attribute__((noinline)) aie::vector<float, VL> exp2f_vec(aie::vector<float, VL> x) {
+  // CLAMP: 2^k is reconstructed from the exponent bits, which breaks for k < -127 (k+127 < 0).
+  // Peaked (real) attention drives sl very negative (< -127) for non-max keys, so clamp to -100
+  // (2^-100 ~ 8e-31 ~ 0 -> those keys have ~0 weight, harmless). Synth-spread tests never hit this.
+  x = aie::max(x, aie::broadcast<float, VL>(-100.0f));
   aie::vector<int32_t, VL> ki = aie::to_fixed<int32_t>(x);          // round-to-nearest on aie2p
   aie::vector<float, VL> kf = aie::to_float<float>(ki);
   // floor: where x < kf, k -= 1 (correct even though to_fixed rounds, not truncates)
