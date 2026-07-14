@@ -99,6 +99,12 @@ def main():
     ap.add_argument("--raw", action="store_true", help="true saturating (one-hot) regime")
     ap.add_argument("--synth-T", type=int, default=0,
                     help="synthesize an N-frame case (e.g. 172) instead of the real block")
+    ap.add_argument("--stream", action="store_true",
+                    help="STEP=8 packing: tile-interleaved QUV + padded KPV/CTX for the "
+                         "MemTile-streamed block (relpos_rowtiled_stream). Requires --tq/--kb "
+                         "matching the build.")
+    ap.add_argument("--tq", type=int, default=8, help="query-tile rows (must match -DRELPOS_TQ)")
+    ap.add_argument("--kb", type=int, default=43, help="key-block rows (must match -DRELPOS_KB)")
     a = ap.parse_args()
 
     T, qu, qv, kh, ph, Vh, inv_scale = build_head(a.block, a.head, a.synth_T)
@@ -117,12 +123,41 @@ def main():
     _, ctx_ref = host_probs_ctx(qu_d, qv_d, kh, ph, Vh, sc)  # [T,DK] f32 golden
 
     def bf(x): return np.ascontiguousarray(x, np.float32).astype(bfloat16).reshape(-1)
-    QUV = np.concatenate([bf(qu_d), bf(qv_d)])                 # [2T,DK]
-    KPV = np.concatenate([bf(kh), bf(ph), bf(Vh)])            # [(2T+P),DK]
+
+    def ceildiv(x, y): return (x + y - 1) // y
+
+    def pad_rows(x, n):  # [r,DK] float32 -> [n,DK] bf16, zero-padded (pad rows unread by core)
+        r = x.shape[0]
+        if r < n:
+            x = np.concatenate([x, np.zeros((n - r, DK), np.float32)], 0)
+        return x
+
+    if a.stream:
+        # STEP=8 MemTile-streamed packing (relpos_rowtiled_stream_iron.py):
+        #   QUV tile-interleaved [qu_t0, qv_t0, qu_t1, qv_t1, ...], each tile TQ rows
+        #     (ragged final tile zero-padded to TQ); CTX read back n_qt*TQ rows -> [:T].
+        #   KPV = k(pad Tp) | p(pad Pp) | V(pad Tp), Tp=n_kb*KB, Pp=n_pb*KB.
+        TQ, KB = a.tq, a.kb
+        n_qt = ceildiv(T, TQ); n_kb = ceildiv(T, KB); n_pb = ceildiv(P, KB)
+        Tp, Pp = n_kb * KB, n_pb * KB
+        quv_tiles = []
+        for q in range(n_qt):
+            q0 = q * TQ
+            quv_tiles.append(pad_rows(qu_d[q0:q0 + TQ], TQ))
+            quv_tiles.append(pad_rows(qv_d[q0:q0 + TQ], TQ))
+        QUV = bf(np.concatenate(quv_tiles, 0))                # [2*n_qt*TQ, DK]
+        KPV = np.concatenate([bf(pad_rows(kh, Tp)),
+                              bf(pad_rows(ph, Pp)),
+                              bf(pad_rows(Vh, Tp))])           # [Tp+Pp+Tp, DK]
+        ctx_rows = n_qt * TQ
+    else:
+        QUV = np.concatenate([bf(qu_d), bf(qv_d)])             # [2T,DK]
+        KPV = np.concatenate([bf(kh), bf(ph), bf(Vh)])         # [(2T+P),DK]
+        ctx_rows = T
 
     import pyxrt
     instr = np.fromfile(a.insts, dtype=np.uint32)
-    QUVbytes, KPVbytes, Cbytes = QUV.nbytes, KPV.nbytes, (T * DK * 2)
+    QUVbytes, KPVbytes, Cbytes = QUV.nbytes, KPV.nbytes, (ctx_rows * DK * 2)
     d = pyxrt.device(0)
     xclbin = pyxrt.xclbin(a.xclbin)
     kname = xclbin.get_kernels()[0].get_name()
@@ -154,7 +189,7 @@ def main():
     dt = (time.perf_counter() - t0) / iters
 
     bo_cx.sync(FROM)
-    CX = np.frombuffer(bo_cx.read(Cbytes, 0), dtype=np.uint16).view(bfloat16).reshape(T, DK).astype(np.float32)
+    CX = np.frombuffer(bo_cx.read(Cbytes, 0), dtype=np.uint16).view(bfloat16).reshape(-1, DK).astype(np.float32)[:T]
     af, rf = CX.ravel(), ctx_ref.ravel()
     rel_l2 = float(np.linalg.norm(af - rf) / (np.linalg.norm(rf) + 1e-12))
     corr = float(np.corrcoef(af, rf)[0, 1])

@@ -618,3 +618,233 @@ extern "C" void relpos_rowtiled_bake(bfloat16 *restrict quv,
   }
   event1();
 }
+
+// ===========================================================================
+// STEP-7 KEY-BLOCK-STREAMED bricks + monolithic reference driver.
+//
+// WHY: step-6 relpos_rowtiled_bake still takes FULL k/p/V pointers (kpv resident
+// in L1), so it caps at the T where kpv fits L1. p alone is 86 KB > 64 KB L1 at
+// T=172. The dataflow fix (relpos_rowtiled_stream_iron.py) STREAMS k/p/V from the
+// 512 KB MemTile in KB-row key-blocks, so L1 only ever holds ONE key-block plus
+// the Tq-sized score/prob/ctx scratch. That streaming core must consume k/p/V a
+// block at a time and ASSEMBLE the full [Tq,*] score rows across blocks before the
+// softmax (design (a): the score rows fit L1, the INPUT k/p/V do not).
+//
+// This section provides the per-block compute bricks the streaming core calls,
+// and a MONOLITHIC driver (relpos_kpvstream_bake) that walks query-tiles x
+// key-blocks calling exactly those bricks with the SAME packed (quv, kpv) ABI as
+// step-6. The monolithic driver is buildable/device-gateable at the T where kpv
+// fits L1 (same runner, STEP=7): it de-risks the BLOCK-DECOMPOSED ARITHMETIC
+// (column-slice AC/BD fill + f32-running ctx accumulate across V-blocks) on
+// silicon, independent of the MemTile dataflow wiring. Once the arithmetic is
+// gated here, relpos_rowtiled_stream_iron.py only has to prove the DATAFLOW
+// (the 2-channel ObjectFifo topology + repeat_count replay) at T=172.
+//
+// NUMERICS vs the proven step-6 bricks:
+//  * AC/BD: relpos_dot_block fills a COLUMN SLICE [Tq, kb] of the row-major score
+//    row at column j0. Each output element is a single full-DK dot (DK is NOT
+//    blocked) -> BIT-IDENTICAL to relpos_dot_matmul; only the key dim is tiled and
+//    each key column is independent.
+//  * ctx: relpos_ctx_block accumulates each V-block's partial into a RESIDENT f32
+//    ctx buffer (g_ctxf[Tq*DK]), narrowed to bf16 once at the end. The proven
+//    relpos_ctx_matmul_rows keeps ONE accfloat over all T keys; block-summing in
+//    f32 re-associates the reduction but stays in f32 the whole way (the bf16 hop
+//    is only the final narrow, same as the proven brick), so the delta is far
+//    below the ctx rel-L2 tolerance (golden 3.8e-3). This is the only numeric
+//    difference from step-6 and it is a strict precision non-regression.
+// ===========================================================================
+
+// Key-block row count baked for the streamed block bricks. T=172 = 4*43, so
+// KB=43 blocks k and V with NO padding; p (P=343) is 7 full blocks + a 42-row
+// ragged tail (the driver/core pass the real kb per block). Override -DRELPOS_KB.
+#ifndef RELPOS_KB
+#define RELPOS_KB 43
+#endif
+
+// COLUMN-SLICE dot-matmul: out[il, j0+jj] = dot(A[il,:DK], Bblk[jj,:DK]) for
+// il in [0,Tq), jj in [0,kb). out is row-major [Tq, ncol] (ncol = T for AC,
+// P for BD); this fills the kb columns [j0, j0+kb) of every row. A is the
+// resident query tile ([Tq,DK]); Bblk is ONE streamed key/pos block ([kb,DK]).
+static inline void relpos_dot_block(const bfloat16 *restrict A,
+                                    const bfloat16 *restrict Bblk,
+                                    float *restrict out, int Tq, int kb, int j0,
+                                    int ncol) {
+  static_assert(DK % VL == 0, "DK must be a multiple of the vector width");
+  for (int il = 0; il < Tq; il++) {
+    const bfloat16 *a_row = A + il * DK;
+    float *o_row = out + il * ncol + j0;
+    for (int jj = 0; jj < kb; jj++) {
+      const bfloat16 *b_row = Bblk + jj * DK;
+      aie::accum<accfloat, VL> acc = aie::zeros<accfloat, VL>();
+      for (int d = 0; d < DK; d += VL) {
+        aie::vector<bfloat16, VL> av = aie::load_v<VL>(a_row + d);
+        aie::vector<bfloat16, VL> bv = aie::load_v<VL>(b_row + d);
+        acc = aie::mac(acc, av, bv);
+      }
+      o_row[jj] = aie::reduce_add(acc.to_vector<float>());
+    }
+  }
+}
+
+// Zero the resident f32 ctx accumulator [Tq, DK] at the start of a query tile.
+static inline void relpos_ctx_zero(float *restrict ctxf, int Tq) {
+  aie::vector<float, VL> z = aie::zeros<float, VL>();
+  for (int il = 0; il < Tq; il++)
+    for (int d = 0; d < DK; d += VL)
+      aie::store_v(ctxf + il * DK + d, z);
+}
+
+// ctx BLOCK accumulate: ctxf[il,:DK] += sum_{jj<kb} probs[il, j0+jj] * Vblk[jj,:].
+// probs is the resident [Tq,T] softmax output; Vblk is ONE streamed value block
+// ([kb,DK]); ctxf is the resident f32 running accumulator. Called once per
+// V-block; the running f32 buffer is the cross-block carry the streaming core
+// cannot hold in a register (separate kernel calls).
+static inline void relpos_ctx_block(const bfloat16 *restrict probs,
+                                    const bfloat16 *restrict Vblk,
+                                    float *restrict ctxf, int Tq, int T, int kb,
+                                    int j0) {
+  static_assert(DK % VL == 0, "DK must be a multiple of the vector width");
+  for (int il = 0; il < Tq; il++) {
+    const bfloat16 *p_row = probs + il * T + j0;
+    float *c_row = ctxf + il * DK;
+    for (int d = 0; d < DK; d += VL) {
+      aie::accum<accfloat, VL> acc = aie::zeros<accfloat, VL>();
+      for (int jj = 0; jj < kb; jj++) {
+        aie::vector<bfloat16, VL> wv = aie::broadcast<bfloat16, VL>(p_row[jj]);
+        aie::vector<bfloat16, VL> vv = aie::load_v<VL>(Vblk + jj * DK + d);
+        acc = aie::mac(acc, wv, vv); // bf16*bf16 -> f32 block partial
+      }
+      // add block partial to the running f32 ctx (stays in f32 across blocks).
+      aie::vector<float, VL> part = acc.to_vector<float>();
+      aie::vector<float, VL> run = aie::load_v<VL>(c_row + d);
+      aie::store_v(c_row + d, aie::add(run, part));
+    }
+  }
+}
+
+// Narrow the resident f32 ctx accumulator [Tq,DK] -> bf16 ctx tile (final hop,
+// same single bf16 narrow as the proven ctx brick). ctx is the output tile.
+static inline void relpos_ctx_narrow(const float *restrict ctxf,
+                                     bfloat16 *restrict ctx, int Tq) {
+  for (int il = 0; il < Tq; il++) {
+    for (int d = 0; d < DK; d += VL) {
+      aie::vector<float, VL> v = aie::load_v<VL>(ctxf + il * DK + d);
+      aie::accum<accfloat, VL> a;
+      a.from_vector(v); // f32 vector -> accum -> bf16 narrow (proven idiom)
+      aie::store_v(ctx + il * DK + d, a.to_vector<bfloat16>());
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// STEP-7 MONOLITHIC REFERENCE DRIVER -- walks query-tiles x key-blocks calling
+// the streamed block bricks, with FULL k/p/V pointers (kpv resident, same packed
+// ABI as step-6 relpos_rowtiled_bake). This reproduces the EXACT accumulation
+// order the streaming core will execute (AC/BD filled column-slice per k/p block;
+// ctx accumulated in a resident f32 buffer across V-blocks), so gating it on the
+// existing runner (STEP=7, at the T where kpv fits L1) validates the block bricks
+// on silicon. The block LOOPS here are what the streaming core replaces with
+// ObjectFifo acquire/release over MemTile-streamed blocks (same brick calls).
+//   quv : [2*T, DK]     bf16  PACKED (qu = quv[0:T], qv = quv[T:2T])
+//   kpv : [(2*T+P), DK] bf16  PACKED (k = kpv[0:T], p = kpv[T:T+P], V = kpv[T+P:])
+//   ctx : [T, DK]       bf16  (out)
+// ---------------------------------------------------------------------------
+extern "C" void relpos_kpvstream_bake(bfloat16 *restrict quv,
+                                      bfloat16 *restrict kpv,
+                                      bfloat16 *restrict ctx) {
+  constexpr int T = RELPOS_T;
+  constexpr int P = 2 * T - 1;
+  constexpr int Tq = RELPOS_TQ;
+  constexpr int KB = RELPOS_KB;
+  static_assert(DK == 128,
+                "baked inv_scale is 1/sqrt(128); regenerate for a different DK");
+  constexpr float inv_scale = 0.08838834764831843f; // 1/sqrt(128)
+
+  alignas(aie::vector_decl_align) static float g_ac[Tq * T];
+  alignas(aie::vector_decl_align) static float g_bd[Tq * P];
+  alignas(aie::vector_decl_align) static bfloat16 g_probs[Tq * T];
+  alignas(aie::vector_decl_align) static float g_ctxf[Tq * DK];
+
+  bfloat16 *qu = quv;               // [T, DK]
+  bfloat16 *qv = quv + T * DK;      // [T, DK]
+  bfloat16 *k = kpv;                // [T, DK]
+  bfloat16 *p = kpv + T * DK;       // [P, DK]
+  bfloat16 *V = kpv + (T + P) * DK; // [T, DK]
+
+  event0();
+  for (int q0 = 0; q0 < T; q0 += Tq) {
+    int tq = (T - q0 < Tq) ? (T - q0) : Tq; // ragged final query tile
+    const bfloat16 *qu_t = qu + q0 * DK;    // [tq, DK]
+    const bfloat16 *qv_t = qv + q0 * DK;    // [tq, DK]
+    bfloat16 *ctx_t = ctx + q0 * DK;        // [tq, DK]
+
+    // -- phase K: stream k in KB-row blocks, fill AC[:, j0:j0+kb] --
+    for (int j0 = 0; j0 < T; j0 += KB) {
+      int kb = (T - j0 < KB) ? (T - j0) : KB;
+      relpos_dot_block(qu_t, k + j0 * DK, g_ac, tq, kb, j0, T);
+    }
+    // -- phase P: stream p in KB-row blocks, fill BD[:, j0:j0+kb] --
+    for (int j0 = 0; j0 < P; j0 += KB) {
+      int pb = (P - j0 < KB) ? (P - j0) : KB;
+      relpos_dot_block(qv_t, p + j0 * DK, g_bd, tq, pb, j0, P);
+    }
+    // -- softmax over the assembled full score rows (GLOBAL-index rel_shift) --
+    relpos_scores_softmax_rows(g_ac, g_bd, g_probs, tq, T, P, q0, inv_scale);
+    // -- phase V: stream V in KB-row blocks, accumulate ctx in resident f32 --
+    relpos_ctx_zero(g_ctxf, tq);
+    for (int j0 = 0; j0 < T; j0 += KB) {
+      int vb = (T - j0 < KB) ? (T - j0) : KB;
+      relpos_ctx_block(g_probs, V + j0 * DK, g_ctxf, tq, T, vb, j0);
+    }
+    relpos_ctx_narrow(g_ctxf, ctx_t, tq); // f32 ctx -> bf16 out tile
+  }
+  event1();
+}
+
+// ---------------------------------------------------------------------------
+// STEP-7 STREAMING-CORE extern "C" bricks -- the SAME block compute the
+// monolithic driver calls, exposed as separately-callable kernels for the
+// MemTile-streaming core (relpos_rowtiled_stream_iron.py). The streaming core
+// drives the query-tile x key-block loop in the IRON Worker (ObjectFifo
+// acquire/release per block) and calls these per block, passing the resident
+// scratch buffers (g_ac/g_bd/g_probs/g_ctxf as core-local Buffers) plus the
+// runtime block descriptors (Tq, kb, j0, ...) as int32 scalars.
+//
+// The int32 scalar ABI here is deliberate: it is the ONE thing the streaming
+// generator needs the IRON toolchain to support -- passing a range_-loop-derived
+// int32 into a Kernel call (see relpos_rowtiled_stream_iron.py "PROBE 1"). The
+// compute itself is identical to the device-gateable monolithic driver above.
+// ---------------------------------------------------------------------------
+extern "C" void relpos_stream_dot(bfloat16 *restrict Aq, bfloat16 *restrict Bblk,
+                                  float *restrict out, int32_t Tq, int32_t kb,
+                                  int32_t j0, int32_t ncol) {
+  event0();
+  relpos_dot_block(Aq, Bblk, out, Tq, kb, j0, ncol);
+  event1();
+}
+
+extern "C" void relpos_stream_ctx_zero(float *restrict ctxf, int32_t Tq) {
+  relpos_ctx_zero(ctxf, Tq);
+}
+
+extern "C" void relpos_stream_ctx(bfloat16 *restrict probs,
+                                  bfloat16 *restrict Vblk, float *restrict ctxf,
+                                  int32_t Tq, int32_t T, int32_t kb, int32_t j0) {
+  event0();
+  relpos_ctx_block(probs, Vblk, ctxf, Tq, T, kb, j0);
+  event1();
+}
+
+extern "C" void relpos_stream_softmax(float *restrict AC, float *restrict BD,
+                                      bfloat16 *restrict probs, int32_t Tq,
+                                      int32_t T, int32_t P, int32_t q0) {
+  static_assert(DK == 128, "baked inv_scale is 1/sqrt(128)");
+  event0();
+  relpos_scores_softmax_rows(AC, BD, probs, Tq, T, P, q0, 0.08838834764831843f);
+  event1();
+}
+
+extern "C" void relpos_stream_narrow(float *restrict ctxf, bfloat16 *restrict ctx,
+                                     int32_t Tq) {
+  relpos_ctx_narrow(ctxf, ctx, Tq);
+}

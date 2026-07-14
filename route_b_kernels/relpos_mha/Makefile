@@ -15,9 +15,12 @@ include ${srcdir}/../../makefile-common
 
 devicename ?= $(if $(filter 1,$(NPU2)),npu2,npu)
 T ?= 32
-# Query-tile row count for STEP=6 (row-tiled block); baked as -DRELPOS_TQ. Need
+# Query-tile row count for STEP>=6 (row-tiled block); baked as -DRELPOS_TQ. Need
 # not divide T (kernel handles a ragged final tile). Ignored by STEP<6.
 TQ ?= 8
+# Key-block row count for STEP>=7 (block-streamed k/p/V); baked as -DRELPOS_KB.
+# T=172=4*43 -> KB=43 blocks k/V with no pad. Ignored by STEP<7.
+KB ?= 43
 
 # STEP selects which entry point / generator this xclbin drives:
 #   STEP=1 (default) -- relpos_scores_softmax : host-fed AC + BD -> probs (no matmul).
@@ -30,8 +33,24 @@ TQ ?= 8
 # All build the SAME build/kernels.a from relpos_mha.cc (which holds every entry);
 # only the generated .mlir / xclbin differ. `make clean` when switching STEP (the
 # xclbin/insts names are fixed, so a stale build/ from the other step would linger).
+#   STEP=7           -- relpos_kpvstream : MONOLITHIC reference for the block-
+#                       decomposed arithmetic (column-slice AC/BD + resident-f32
+#                       ctx accumulate over V-blocks). Same packed (quv,kpv,ctx)
+#                       ABI as STEP=6 -> gated by the SAME runner at the T where
+#                       kpv fits L1; de-risks the streaming core's compute half.
+#   STEP=8           -- relpos_rowtiled_stream : FULL-T (up to 172) MemTile-
+#                       STREAMED block (k/p/V staged in L2, streamed to L1 in
+#                       KB-row blocks, replayed per query tile). Removes the L1
+#                       wall. Needs the runner's --stream packing (tile-interleaved
+#                       QUV + padded KPV); see BUILD-AND-BENCH.md.
 STEP ?= 1
-ifeq ($(STEP),6)
+ifeq ($(STEP),8)
+targetname = relpos_rowtiled_stream
+aie_py_src = relpos_rowtiled_stream_iron.py
+else ifeq ($(STEP),7)
+targetname = relpos_kpvstream
+aie_py_src = relpos_kpvstream_iron.py
+else ifeq ($(STEP),6)
 targetname = relpos_rowtiled
 aie_py_src = relpos_rowtiled_iron.py
 else ifeq ($(STEP),5)
@@ -62,7 +81,7 @@ endif
 build/%.cc.o: %.cc
 	mkdir -p ${@D}
 ifeq ($(devicename),npu2)
-	cd ${@D} && ${PEANO_INSTALL_DIR}/bin/clang++ ${PEANOWRAP2P_FLAGS} -DRELPOS_T=${T} -DRELPOS_TQ=${TQ} -c $< -o ${@F}
+	cd ${@D} && ${PEANO_INSTALL_DIR}/bin/clang++ ${PEANOWRAP2P_FLAGS} -DRELPOS_T=${T} -DRELPOS_TQ=${TQ} -DRELPOS_KB=${KB} -c $< -o ${@F}
 else
 	echo "Only npu2 supported for this example"
 endif
@@ -70,9 +89,17 @@ endif
 build/kernels.a: build/relpos_mha.cc.o
 	ar rvs $@ $+
 
+# STEP=8 (streaming) generator also needs TQ/KB to compute block counts + unroll;
+# STEP<=7 bake TQ/KB in the .cc only, so pass just -T there.
+ifeq ($(STEP),8)
+GEN_EXTRA = --tq ${TQ} --kb ${KB}
+else
+GEN_EXTRA =
+endif
+
 build/${targetname}.mlir: ${srcdir}/${aie_py_src}
 	mkdir -p ${@D}
-	python3 $< -d ${devicename} -T ${T} > $@
+	python3 $< -d ${devicename} -T ${T} ${GEN_EXTRA} > $@
 
 build/final.xclbin: build/${targetname}.mlir build/kernels.a
 	mkdir -p ${@D}
