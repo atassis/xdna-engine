@@ -216,3 +216,79 @@ extern "C" void relpos_scores_softmax_bake(float *restrict AC,
   constexpr float inv_scale = 0.08838834764831843f; // 1/sqrt(128)
   relpos_scores_softmax(AC, BD, probs, T, P, inv_scale);
 }
+
+// ---------------------------------------------------------------------------
+// STEP-2 BRICK 3 -- the AC score matmul AC = qu @ k^T, ROW-MAJOR f32 out.
+//   qu : [T, DK] row-major bf16  (q + pos_bias_u, one head)
+//   k  : [T, DK] row-major bf16  (one head; k^T is IMPLICIT -- AC[i,j] is the dot
+//                                 of qu row i with k row j, so no transpose buffer
+//                                 and no strided load are needed)
+//   AC : [T, T]  row-major f32   (RESIDENT L1 accumulator; handed straight to the
+//                                 softmax epilogue below, never DMA'd to host)
+// bf16 inputs, f32 (accfloat) accumulate + f32 lane-reduce -- the SAME numeric
+// path as the aie::mmul tile (bf16*bf16 -> accfloat), mirrored from the proven
+// q.K dot in mha_decode.cc (L128). Producing AC ROW-MAJOR (not the mmul-blocked
+// r*t layout) is deliberate: the softmax epilogue does a per-row rel_shift +
+// softmax-over-keys, which needs row-major AC; the aie::mmul microkernel would
+// emit a blocked tile that then needs an extra L1 de-block pass. For the tiny
+// [T,DK]x[DK,T] score matmul (T=32, DK=128) this dot-product tile is the clean
+// single-core resident form; the aie::mmul-blocked variant is the perf follow-up.
+// DK is a compile-time multiple of VL (Parakeet = 128 = 8 VL), so the reduction
+// fully vectorizes with no ragged tail.
+// ---------------------------------------------------------------------------
+extern "C" void relpos_ac_matmul(bfloat16 *restrict qu, bfloat16 *restrict k,
+                                 float *restrict AC, int32_t T) {
+  event0();
+  static_assert(DK % VL == 0, "DK must be a multiple of the vector width");
+  for (int i = 0; i < T; i++) {
+    const bfloat16 *qu_row = qu + i * DK;
+    float *ac_row = AC + i * T;
+    for (int j = 0; j < T; j++) {
+      const bfloat16 *k_row = k + j * DK;
+      aie::accum<accfloat, VL> acc = aie::zeros<accfloat, VL>();
+      for (int d = 0; d < DK; d += VL) {
+        aie::vector<bfloat16, VL> qv = aie::load_v<VL>(qu_row + d);
+        aie::vector<bfloat16, VL> kv = aie::load_v<VL>(k_row + d);
+        acc = aie::mac(acc, qv, kv); // bf16*bf16 accumulated in f32
+      }
+      ac_row[j] = aie::reduce_add(acc.to_vector<float>());
+    }
+  }
+  event1();
+}
+
+// ---------------------------------------------------------------------------
+// STEP-2 COMPOSED ENTRY -- the FIRST resident-block test: the AC score matmul
+// feeds the scores->softmax brick with the f32 score tile staying RESIDENT in L1
+// (never round-tripping to host). This mirrors the modal generator's
+// matmul -> f32 acc in L1 -> epilogue shape; here the "epilogue" is
+// rel_shift(BD) + scale + softmax over keys instead of SiLU.
+//   qk   : [2*T, DK] row-major bf16  (PACKED: qu = qk[0:T], k = qk[T:2T]). qu and
+//          k share ONE input buffer so the core stays within the NPU2 compute
+//          tile's 2 input-DMA-channel budget (qk + BD), the same 2-input
+//          discipline the modal design uses (bias folded, not a 3rd stream).
+//   BD   : [T, P] row-major f32      (host-fed, P = 2T-1; unchanged from step 1)
+//   probs: [T, T] row-major bf16     (softmax over keys of rel_shift(BD)+AC, scaled)
+// The AC[T,T] f32 tile lives in a static L1 scratch (g_ac): written by the matmul,
+// read IN PLACE by relpos_scores_softmax. That resident L1 hand-off IS the thesis
+// this step exists to prove.  T is baked (must match the generator -T / -DRELPOS_T).
+// ---------------------------------------------------------------------------
+extern "C" void relpos_ac_scores_softmax_bake(bfloat16 *restrict qk,
+                                              float *restrict BD,
+                                              bfloat16 *restrict probs) {
+  constexpr int T = RELPOS_T;
+  constexpr int P = 2 * T - 1;
+  static_assert(DK == 128,
+                "baked inv_scale is 1/sqrt(128); regenerate for a different DK");
+  constexpr float inv_scale = 0.08838834764831843f; // 1/sqrt(128)
+
+  // RESIDENT L1 score tile: the matmul writes it, the softmax reads it -- no host
+  // hop. Sized by the BAKED T (T=32 -> 4 KB), not RELPOS_TMAX (a T*T f32 tile at
+  // 512 would be 1 MB -- far past L1; this de-risk variant is small-T by design).
+  alignas(aie::vector_decl_align) static float g_ac[T * T];
+
+  bfloat16 *qu = qk;         // [T, DK]
+  bfloat16 *k = qk + T * DK; // [T, DK]
+  relpos_ac_matmul(qu, k, g_ac, T);
+  relpos_scores_softmax(g_ac, BD, probs, T, P, inv_scale);
+}

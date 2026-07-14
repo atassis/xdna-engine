@@ -14,16 +14,29 @@ srcdir := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
 include ${srcdir}/../../makefile-common
 
 devicename ?= $(if $(filter 1,$(NPU2)),npu2,npu)
-targetname = relpos_scores_softmax
 T ?= 32
+
+# STEP selects which entry point / generator this xclbin drives:
+#   STEP=1 (default) -- relpos_scores_softmax : host-fed AC + BD -> probs (no matmul).
+#   STEP=2           -- relpos_ac_scores_softmax : on-chip AC=qu@k^T matmul feeding
+#                       the resident-in-L1 f32 score tile -> scores->softmax -> probs.
+# Both build the SAME build/kernels.a from relpos_mha.cc (which holds both entries);
+# only the generated .mlir / xclbin differ. `make clean` when switching STEP (the
+# xclbin/insts names are fixed, so a stale build/ from the other step would linger).
+STEP ?= 1
+ifeq ($(STEP),2)
+targetname = relpos_ac_scores_softmax
+aie_py_src = relpos_ac_scores_softmax_iron.py
+else
+targetname = relpos_scores_softmax
+aie_py_src = relpos_scores_softmax_iron.py
+endif
 
 ifeq ($(devicename),npu2)
 VPATH :=${srcdir}/../../../aie_kernels/aie2p
 else
 VPATH :=${srcdir}/../../../aie_kernels/aie2
 endif
-
-aie_py_src=relpos_scores_softmax_iron.py
 
 .PHONY all: build/${targetname}.mlir build/final.xclbin
 

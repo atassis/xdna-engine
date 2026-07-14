@@ -33,6 +33,9 @@ cp "$RB/softmax400/Makefile"      "$PE/ml/softmax400/Makefile"
 # vectorized-exp2 softmax, no matmul) -- de-risks the two hard rel-pos bricks.
 cp "$RB/relpos_mha/relpos_mha.cc"                    "$K/relpos_mha.cc"
 cp "$RB/relpos_mha/relpos_scores_softmax_iron.py"    "$PE/ml/relpos_mha/relpos_scores_softmax_iron.py"
+# relpos MHA STEP-2 composed kernel: on-chip AC=qu@k^T matmul feeding the resident
+# L1 f32 score tile -> scores->softmax (first resident-block test). make STEP=2.
+cp "$RB/relpos_mha/relpos_ac_scores_softmax_iron.py" "$PE/ml/relpos_mha/relpos_ac_scores_softmax_iron.py"
 cp "$RB/relpos_mha/Makefile"                         "$PE/ml/relpos_mha/Makefile"
 # plain resident whole_array matmul (no epilogue) -- MLIR-emitting generator +
 # Makefile.resident (route_b_override .txt-insts + WA_C_DEPTH flow) for the Parakeet
