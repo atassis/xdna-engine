@@ -34,9 +34,9 @@ def my_relpos_qkp_scores_softmax(dev, T):
     qvp_ty = np.ndarray[((T + P) * DK,), np.dtype[bfloat16]]
     probs_ty = np.ndarray[(T * T,), np.dtype[bfloat16]]
 
-    of_qk = ObjectFifo(qk_ty, name="qk")
-    of_qvp = ObjectFifo(qvp_ty, name="qvp")
-    of_probs = ObjectFifo(probs_ty, name="probs")
+    of_qk = ObjectFifo(qk_ty, name="qk", depth=1)
+    of_qvp = ObjectFifo(qvp_ty, name="qvp", depth=1)
+    of_probs = ObjectFifo(probs_ty, name="probs", depth=1)
 
     # Zero-scalar-arg kernel: T, P, DK and inv_scale are baked into the .cc wrapper.
     relpos = Kernel(
