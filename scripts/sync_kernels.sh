@@ -39,6 +39,7 @@ cp "$RB/relpos_mha/relpos_ac_scores_softmax_iron.py" "$PE/ml/relpos_mha/relpos_a
 # relpos MHA STEP-3 composed kernel: BOTH AC=qu@k^T and BD=qv@p^T on-chip (resident).
 cp "$RB/relpos_mha/relpos_qkp_scores_softmax_iron.py" "$PE/ml/relpos_mha/relpos_qkp_scores_softmax_iron.py"
 cp "$RB/relpos_mha/relpos_ctx_iron.py" "$PE/ml/relpos_mha/relpos_ctx_iron.py"
+cp "$RB/relpos_mha/relpos_full_iron.py" "$PE/ml/relpos_mha/relpos_full_iron.py"
 cp "$RB/relpos_mha/Makefile"                         "$PE/ml/relpos_mha/Makefile"
 # plain resident whole_array matmul (no epilogue) -- MLIR-emitting generator +
 # Makefile.resident (route_b_override .txt-insts + WA_C_DEPTH flow) for the Parakeet

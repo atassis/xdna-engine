@@ -24,7 +24,10 @@ T ?= 32
 # only the generated .mlir / xclbin differ. `make clean` when switching STEP (the
 # xclbin/insts names are fixed, so a stale build/ from the other step would linger).
 STEP ?= 1
-ifeq ($(STEP),4)
+ifeq ($(STEP),5)
+targetname = relpos_full
+aie_py_src = relpos_full_iron.py
+else ifeq ($(STEP),4)
 targetname = relpos_ctx
 aie_py_src = relpos_ctx_iron.py
 else ifeq ($(STEP),3)

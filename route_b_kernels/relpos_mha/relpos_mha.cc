@@ -382,3 +382,36 @@ extern "C" void relpos_ctx_bake(bfloat16 *restrict probs, bfloat16 *restrict V,
   relpos_ctx_matmul(probs, V, ctx, RELPOS_T);
   event1();
 }
+
+// ---------------------------------------------------------------------------
+// STEP-5 FULL COMPOSED ENTRY -- the ENTIRE per-head MHA node in one dispatch:
+// AC + BD matmuls -> rel_shift + softmax -> ctx matmul, all resident. k, p AND v
+// are all resident (softmax needs every key, ctx needs every value), packed into
+// two input buffers to stay in the 2 input-DMA-channel budget.
+//   qkv : [3*T, DK] bf16  PACKED (qu = qkv[0:T], k = qkv[T:2T], V = qkv[2T:3T])
+//   qvp : [(T+P), DK] bf16 PACKED (qv = qvp[0:T], p = qvp[T:T+P])
+//   ctx : [T, DK] bf16 out
+// NOTE: single-tile, small-T only. At T=172 the resident k/p/v ([172,128] + [343,128]
+// + [172,128] bf16 = ~176 KB) exceed L1 (64 KB) -- the full-T block MUST stage k/p/v in
+// MemTile (512 KB) and tile the query rows. This entry proves the COMPOSITION; the
+// row-tiled MemTile design is the scaling step.
+// ---------------------------------------------------------------------------
+extern "C" void relpos_full_bake(bfloat16 *restrict qkv, bfloat16 *restrict qvp,
+                                 bfloat16 *restrict ctx) {
+  constexpr int T = RELPOS_T;
+  constexpr int P = 2 * T - 1;
+  static_assert(DK == 128, "baked inv_scale is 1/sqrt(128)");
+  constexpr float inv_scale = 0.08838834764831843f;
+  alignas(aie::vector_decl_align) static float g_ac[T * T];
+  alignas(aie::vector_decl_align) static float g_bd[T * P];
+  alignas(aie::vector_decl_align) static bfloat16 g_probs[T * T];
+  bfloat16 *qu = qkv;              // [T, DK]
+  bfloat16 *k = qkv + T * DK;      // [T, DK]
+  bfloat16 *V = qkv + 2 * T * DK;  // [T, DK]
+  bfloat16 *qv = qvp;              // [T, DK]
+  bfloat16 *p = qvp + T * DK;      // [P, DK]
+  relpos_dot_matmul(qu, k, g_ac, T, T);                   // AC = qu @ k^T
+  relpos_dot_matmul(qv, p, g_bd, T, P);                   // BD = qv @ p^T
+  relpos_scores_softmax(g_ac, g_bd, g_probs, T, P, inv_scale); // probs
+  relpos_ctx_matmul(g_probs, V, ctx, T);                  // ctx = probs @ V
+}
