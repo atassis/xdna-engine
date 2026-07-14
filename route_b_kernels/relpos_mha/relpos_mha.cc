@@ -145,8 +145,17 @@ extern "C" void relpos_scores_softmax(float *restrict AC, float *restrict BD,
     float rowmax = -3.0e38f;
     int j = 0;
     for (; j + VL <= T; j += VL) {
-      aie::vector<float, VL> a = aie::load_v<VL>(ac_row + j);
-      aie::vector<float, VL> b = aie::load_v<VL>(bd_row + j);
+      // ac_row/prob_row have row stride T (or P), which is NOT a multiple of VL for
+      // real T (e.g. T=172 -> 172%16=12), so the per-row base is unaligned. Aligned
+      // load_v/store_v truncate to 128b and corrupt -> use unaligned everywhere the
+      // stride is T/P (same root cause as the bd_row rel_shift load above).
+      aie::vector<float, VL> a = aie::load_unaligned_v<VL>(ac_row + j);
+      // bd_row = BD + i*P + (T-1-i): the rel_shift base is NEVER VL-aligned (the
+      // (T-1-i) shift is not a multiple of 16), so this MUST be an unaligned load.
+      // aie::load_v is an ALIGNED load -> on aie2p it truncates the address to the
+      // 128b boundary and returns shifted/garbage BD (masked when BD<<AC, e.g. real
+      // block-0 after rescale; exposed the moment BD ~ AC, e.g. synth / spread).
+      aie::vector<float, VL> b = aie::load_unaligned_v<VL>(bd_row + j);
       aie::vector<float, VL> s =
           aie::mul(aie::add(a, b), inv_scale_v).to_vector<float>();
       aie::store_v(srow + j, s);
@@ -168,7 +177,7 @@ extern "C" void relpos_scores_softmax(float *restrict AC, float *restrict BD,
       aie::vector<float, VL> d = aie::sub(s, maxv);
       aie::vector<float, VL> sl = aie::mul(d, log2e_v).to_vector<float>();
       aie::vector<bfloat16, VL> e = aie::exp2<bfloat16>(sl);
-      aie::store_v(prob_row + j, e);
+      aie::store_unaligned_v(prob_row + j, e);
       sumacc = aie::add(sumacc, e); // widen bf16 -> f32 accumulate
     }
     float sum = aie::reduce_add(sumacc.to_vector<float>());
@@ -183,8 +192,9 @@ extern "C" void relpos_scores_softmax(float *restrict AC, float *restrict BD,
     aie::vector<bfloat16, VL> inv_sum_v = aie::broadcast<bfloat16, VL>(inv_sum);
     j = 0;
     for (; j + VL <= T; j += VL) {
-      aie::vector<bfloat16, VL> e = aie::load_v<VL>(prob_row + j);
-      aie::store_v(prob_row + j, aie::mul(e, inv_sum_v).to_vector<bfloat16>());
+      aie::vector<bfloat16, VL> e = aie::load_unaligned_v<VL>(prob_row + j);
+      aie::store_unaligned_v(prob_row + j,
+                             aie::mul(e, inv_sum_v).to_vector<bfloat16>());
     }
     for (; j < T; j++) {
       prob_row[j] = (bfloat16)((float)prob_row[j] * (float)inv_sum);
@@ -490,8 +500,17 @@ static inline void relpos_scores_softmax_rows(float *restrict AC,
     float rowmax = -3.0e38f;
     int j = 0;
     for (; j + VL <= T; j += VL) {
-      aie::vector<float, VL> a = aie::load_v<VL>(ac_row + j);
-      aie::vector<float, VL> b = aie::load_v<VL>(bd_row + j);
+      // ac_row/prob_row have row stride T (or P), which is NOT a multiple of VL for
+      // real T (e.g. T=172 -> 172%16=12), so the per-row base is unaligned. Aligned
+      // load_v/store_v truncate to 128b and corrupt -> use unaligned everywhere the
+      // stride is T/P (same root cause as the bd_row rel_shift load above).
+      aie::vector<float, VL> a = aie::load_unaligned_v<VL>(ac_row + j);
+      // bd_row = BD + i*P + (T-1-i): the rel_shift base is NEVER VL-aligned (the
+      // (T-1-i) shift is not a multiple of 16), so this MUST be an unaligned load.
+      // aie::load_v is an ALIGNED load -> on aie2p it truncates the address to the
+      // 128b boundary and returns shifted/garbage BD (masked when BD<<AC, e.g. real
+      // block-0 after rescale; exposed the moment BD ~ AC, e.g. synth / spread).
+      aie::vector<float, VL> b = aie::load_unaligned_v<VL>(bd_row + j);
       aie::vector<float, VL> s =
           aie::mul(aie::add(a, b), inv_scale_v).to_vector<float>();
       aie::store_v(srow + j, s);
@@ -513,7 +532,7 @@ static inline void relpos_scores_softmax_rows(float *restrict AC,
       aie::vector<float, VL> d = aie::sub(s, maxv);
       aie::vector<float, VL> sl = aie::mul(d, log2e_v).to_vector<float>();
       aie::vector<bfloat16, VL> e = aie::exp2<bfloat16>(sl);
-      aie::store_v(prob_row + j, e);
+      aie::store_unaligned_v(prob_row + j, e);
       sumacc = aie::add(sumacc, e);
     }
     float sum = aie::reduce_add(sumacc.to_vector<float>());
@@ -528,8 +547,9 @@ static inline void relpos_scores_softmax_rows(float *restrict AC,
     aie::vector<bfloat16, VL> inv_sum_v = aie::broadcast<bfloat16, VL>(inv_sum);
     j = 0;
     for (; j + VL <= T; j += VL) {
-      aie::vector<bfloat16, VL> e = aie::load_v<VL>(prob_row + j);
-      aie::store_v(prob_row + j, aie::mul(e, inv_sum_v).to_vector<bfloat16>());
+      aie::vector<bfloat16, VL> e = aie::load_unaligned_v<VL>(prob_row + j);
+      aie::store_unaligned_v(prob_row + j,
+                             aie::mul(e, inv_sum_v).to_vector<bfloat16>());
     }
     for (; j < T; j++) {
       prob_row[j] = (bfloat16)((float)prob_row[j] * (float)inv_sum);

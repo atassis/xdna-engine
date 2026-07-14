@@ -10,6 +10,17 @@ Single-tenant NPU: the orchestrator gates the device serially. Announce + `fuser
 the device, stop `npu-serve`/`npu-asr` before any timed run (do NOT auto-restart
 mid-run). This file is AUTHOR + build-recipe only; it does not touch the device.
 
+STATUS: STEP=8 T=172 DEVICE-GATED (rel-L2 0.025 synth / 7e-3 real-tiled, corr 0.9998,
+both <= 0.08 gate). The full-length resident block is validated on silicon.
+
+ALIGNMENT (load-bearing): the softmax reads scores at row stride T (or P) and the
+rel_shift base `BD + i*P + (T-1-i)` is NEVER 128b-aligned. aie2p `aie::load_v` is an
+ALIGNED load and TRUNCATES an unaligned address to the 128b boundary (returns shifted
+data) -- so those score/prob accesses MUST use `aie::load_unaligned_v` /
+`aie::store_unaligned_v`. This is silent unless BD ~ AC: real block-0 is content-
+dominated (BD << AC after rescale) so it hid the bug; a spread/synth softmax (BD ~ AC)
+exposes it. Gate any softmax kernel change with a `--synth-T` run, not only real data.
+
 ## 0. numpy correctness (already GREEN, no device)
 
     ~/npuvox-asr-bench/.venv/bin/python scripts/parakeet_relpos_mha_golden.py
