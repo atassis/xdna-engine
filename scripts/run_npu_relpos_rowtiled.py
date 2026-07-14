@@ -61,8 +61,21 @@ def host_probs_ctx(qu, qv, k, p, V, scale):  # f32 oracle: probs[T,T], ctx[T,DK]
     return a.astype(np.float32), (a @ V).astype(np.float32)
 
 
-def build_head(block, head, synth_T):
+def build_head(block, head, synth_T, real_tiled_T=0):
     inv_scale = np.float32(1.0 / np.sqrt(DK))
+    if real_tiled_T:
+        # DISCRIMINATOR mode: take the REAL block-0 head tensors and tile/repeat
+        # them up to real_tiled_T frames. Device input AND reference then derive
+        # from ONE trusted array set (no synth RNG), so a multi-block failure here
+        # is a genuine device bug, not a synth-data / packing divergence. The tiled
+        # data is not physically meaningful (repeated frames) but is a valid
+        # numeric parity test: both sides compute attention on the same arrays.
+        _, qu0, qv0, k0, p0, V0, _ = build_head(block, head, 0)
+        Tn = real_tiled_T
+        Pn = 2 * Tn - 1
+        def tile(x, n): return np.resize(x, (n, DK)).astype(np.float32)
+        return Tn, tile(qu0, Tn), tile(qv0, Tn), tile(k0, Tn), tile(p0, Pn), \
+            tile(V0, Tn), inv_scale
     if synth_T:
         T = synth_T
         rng = np.random.default_rng(1)
@@ -99,6 +112,10 @@ def main():
     ap.add_argument("--raw", action="store_true", help="true saturating (one-hot) regime")
     ap.add_argument("--synth-T", type=int, default=0,
                     help="synthesize an N-frame case (e.g. 172) instead of the real block")
+    ap.add_argument("--real-tiled-T", type=int, default=0,
+                    help="DISCRIMINATOR: tile the REAL block-0 tensors up to N frames so "
+                         "device input + reference derive from ONE array (no synth RNG). A "
+                         "failure here at multi-block N is a real device bug, not a synth issue.")
     ap.add_argument("--stream", action="store_true",
                     help="STEP=8 packing: tile-interleaved QUV + padded KPV/CTX for the "
                          "MemTile-streamed block (relpos_rowtiled_stream). Requires --tq/--kb "
@@ -107,7 +124,7 @@ def main():
     ap.add_argument("--kb", type=int, default=43, help="key-block rows (must match -DRELPOS_KB)")
     a = ap.parse_args()
 
-    T, qu, qv, kh, ph, Vh, inv_scale = build_head(a.block, a.head, a.synth_T)
+    T, qu, qv, kh, ph, Vh, inv_scale = build_head(a.block, a.head, a.synth_T, a.real_tiled_T)
     P = 2 * T - 1
 
     # non-degenerate softmax: fold 1/std(scores) into qu/qv (shrinks AC and BD by
@@ -150,6 +167,28 @@ def main():
                               bf(pad_rows(ph, Pp)),
                               bf(pad_rows(Vh, Tp))])           # [Tp+Pp+Tp, DK]
         ctx_rows = n_qt * TQ
+
+        # SELF-CHECK: de-pack the EXACT bytes about to be sent to the QUV/KPV BOs,
+        # per the kernel's expected layout, and assert they reconstruct qu_d/qv_d/
+        # kh/ph/Vh byte-for-byte. This verifies device-input packing vs the data the
+        # reference is computed on (the reference uses the same qu_d/qv_d/kh/ph/Vh).
+        # Runs on the ACTUAL synth data (real sig/RNG); a mismatch is THE bug.
+        def _bf_rows(x): return np.frombuffer(bf(x).tobytes(), np.uint16).view(bfloat16).reshape(-1, DK).astype(np.float32)
+        QUVr = np.frombuffer(QUV.view(np.uint16).tobytes(), np.uint16).view(bfloat16).reshape(2 * n_qt, TQ, DK).astype(np.float32)
+        KPVr = np.frombuffer(KPV.view(np.uint16).tobytes(), np.uint16).view(bfloat16).reshape(-1, DK).astype(np.float32)
+        qu_dp = np.zeros((T, DK), np.float32); qv_dp = np.zeros((T, DK), np.float32)
+        for q in range(n_qt):
+            q0 = q * TQ; tq = min(TQ, T - q0)
+            qu_dp[q0:q0 + tq] = QUVr[2 * q][:tq]; qv_dp[q0:q0 + tq] = QUVr[2 * q + 1][:tq]
+        checks = {"qu": (qu_dp, _bf_rows(qu_d)), "qv": (qv_dp, _bf_rows(qv_d)),
+                  "k": (KPVr[0:Tp][:T], _bf_rows(kh)),
+                  "p": (KPVr[Tp:Tp + Pp][:P], _bf_rows(ph)),
+                  "V": (KPVr[Tp + Pp:2 * Tp + Pp][:T], _bf_rows(Vh))}
+        bad = {n: float(np.abs(a - r).max()) for n, (a, r) in checks.items() if not np.array_equal(a, r)}
+        if bad:
+            print(f"[pack-check] FAIL: device-BO de-pack != reference: {bad}")
+        else:
+            print(f"[pack-check] OK: QUV/KPV bytes de-pack to the reference qu/qv/k/p/V exactly")
     else:
         QUV = np.concatenate([bf(qu_d), bf(qv_d)])             # [2T,DK]
         KPV = np.concatenate([bf(kh), bf(ph), bf(Vh)])         # [(2T+P),DK]
@@ -161,8 +200,9 @@ def main():
     d = pyxrt.device(0)
     xclbin = pyxrt.xclbin(a.xclbin)
     kname = xclbin.get_kernels()[0].get_name()
+    _mode = 'real-tiled' if a.real_tiled_T else ('synth' if a.synth_T else 'real')
     print(f"[artifacts] kernel='{kname}' instr_words={instr.size}  T={T} P={P} "
-          f"regime={'raw' if a.raw else 'rescaled'}{' synth' if a.synth_T else ''}")
+          f"regime={'raw' if a.raw else 'rescaled'} data={_mode}")
     d.register_xclbin(xclbin)
     ctx = pyxrt.hw_context(d, xclbin.get_uuid())
     kk = pyxrt.kernel(ctx, kname)

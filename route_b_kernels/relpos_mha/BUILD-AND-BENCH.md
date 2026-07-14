@@ -169,8 +169,20 @@ KB must match `-DRELPOS_KB`; T=172=4*43 blocks k/V with no pad, p is 7 full + a
     # STEP=8 (streamed packing: tile-interleaved QUV + padded KPV/CTX):
     scripts/run_npu_relpos_rowtiled.py --xclbin .../build/final.xclbin \
         --insts .../build/insts.bin --synth-T 172 --stream --tq 8 --kb 43
+    # STEP=8 DISCRIMINATOR (device input + reference from ONE tiled real array):
+    scripts/run_npu_relpos_rowtiled.py --xclbin .../build/final.xclbin \
+        --insts .../build/insts.bin --real-tiled-T 172 --stream --tq 8 --kb 43
 
 Gate (both): `rel-L2 <= 0.08 AND corr >= 0.99` vs the fp32 host ctx.
+
+The --stream runner now prints a `[pack-check]` line: it de-packs the exact QUV/KPV
+BO bytes per the kernel's expected layout and asserts they reconstruct the reference
+qu/qv/k/p/V. `scripts/relpos_stream_packing_check.py` runs the same check standalone
+and PASSES byte-exact at T=32 AND T=172 -> the --stream device-input packing is
+consistent with the reference; a synth-only failure is NOT a packing/reference
+divergence. `--real-tiled-T N` is the discriminator: if T=172 FAILS with --synth but
+PASSES with --real-tiled-T (or fails identically), it isolates synth-data vs a real
+device multi-block bug.
 
 ### 3e. CORE = QUERY range_ + UNROLLED BLOCKS (two device-found bugs)
 
