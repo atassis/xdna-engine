@@ -164,36 +164,58 @@ KB must match `-DRELPOS_KB`; T=172=4*43 blocks k/V with no pad, p is 7 full + a
 
 Gate (both): `rel-L2 <= 0.08 AND corr >= 0.99` vs the fp32 host ctx.
 
-### 3e. TWO BUILD PROBES -- the only things not numpy-validatable (STEP=8)
+### 3e. CORE = REAL HARDWARE LOOPS (program-memory fix)
 
-Both are pure toolchain-lowering questions; neither can be closed without emitting
-MLIR / building. Characterized, not hand-waved:
+The STEP=8 core sweeps are `aie.iron` `range_` loops (the whole_array_modal
+core_fn pattern: ObjectFifo acquire/release INSIDE `range_`), NOT static Python
+unrolling. The first cut unrolled everything (n_qt=22 query tiles x ~16 block
+calls = ~352 `func.call`s) and the ELF/CDO stage overflowed CORE PROGRAM memory
+(`_XAie_LoadProgMemSection(): Overflow` / `XAie_LoadElf failed`) -- an
+INSTRUCTION-count problem; the 54 KB L1 DATA budget (3b) was fine and the MLIR
+generated. Loop topology now (bounded to a handful of call sites):
 
-- PROBE 1 (scalar kernel args). The block bricks take int32 scalars (tq, kb, j0,
-  q0, ncol). `relpos_rowtiled_stream_iron.py` unrolls the core statically (n_qt,
-  n_kb, n_pb, n_vb are compile-time) and passes each as a Python int.
-  `Kernel.__call__` forwards non-Buffer args untouched to `func.call`
-  (python/iron/kernel.py). CONFIRM a Python int materializes as an i32
-  `arith.constant` operand; if not, wrap with an explicit `arith.constant`.
-- PROBE 2 (resident-L2 replay in blocks). `of_kpv_l3l2` stages the whole padded
-  kpv in L2 (one L3->L2 fill); `of_kpv` forwards it to L1 with `obj_type=[KB,DK]`
-  (smaller than the source) + `repeat_count=n_qt`. CONFIRM this lowers to an
-  `aie.memtile_dma` that keeps kpv resident and emits KB-blocks n_qt times, NOT
-  n_qt fresh L3 DMAs. If forward-with-smaller-obj_type + repeat_count does not
-  lower that way, fall back to STREAM-A: runtime re-fills kpv blocks per query
-  tile (the proven whole_array pattern; correct, same L1 budget, re-fetches kpv
-  from DDR each tile -> worse data movement, to be optimized back to replay).
+  - query tiles: `range_(0, Tq_full, TQ)` -- the induction Value IS q0 (0, TQ,
+    2*TQ, ...; NO multiply). tq == TQ every iteration. The ragged final query
+    tile (tq = T % TQ = 4 at T=172) is PEELED as ONE static iteration so tq stays
+    a Python constant (no runtime min()).
+  - k / V blocks: `range_(0, Tk_full, KB)` (j0 = the induction Value); at
+    T=172,KB=43 there is no ragged block (172 = 4*43).
+  - p blocks: `range_(0, Pp_full, KB)` for the 7 full blocks + a peeled ragged
+    final block (pb = 42). 
+  Runtime i32 scalars (q0, j0) = `index_cast(induction_value, to=i32)` -- the
+  exact helper `python/helpers/dialects/scf.py` uses. tq/kb are Python constants
+  throughout (peeling avoids runtime `min`). So the emitted core is ~1 query-loop
+  body + 1 peeled tile = a small, fixed number of `func.call`s regardless of T.
+
+VERIFY (no device): `... | grep -c 'scf.for'` is SMALL (4 range_ loops per
+emitted body: query + k + p + V), NOT ~352 unrolled calls; L1 memref allocs
+unchanged (3b).
+
+PROBE 1 (do int32 kernel scalars lower?) is now RESOLVED: the static build
+generated valid MLIR and reached the ELF stage, so int scalar args lower fine;
+the loop version passes q0/j0 as `index_cast`'d i32 Values (same operand slot).
+
+### 3f. THE ONE REMAINING BUILD PROBE (not numpy-validatable, STEP=8)
+
+PROBE 2 (resident-L2 replay in blocks). `of_kpv_l3l2` stages the whole padded
+kpv in L2 (one L3->L2 fill); `of_kpv` forwards it to L1 with `obj_type=[KB,DK]`
+(smaller than the source) + `repeat_count=n_qt`. CONFIRM this lowers to an
+`aie.memtile_dma` that keeps kpv resident and emits KB-blocks n_qt times, NOT
+n_qt fresh L3 DMAs. If forward-with-smaller-obj_type + repeat_count does not
+lower that way, fall back to STREAM-A: runtime re-fills kpv blocks per query
+tile (the proven whole_array pattern; correct, same L1 budget, re-fetches kpv
+from DDR each tile -> worse data movement, to be optimized back to replay).
 
 SMALLEST PROBE (toolchain box, no bench):
 
     python3 relpos_rowtiled_stream_iron.py -d npu2 -T 172 --tq 8 --kb 43 \
-        | grep -iE 'memref|memtile_dma|objectfifo|repeat|arith.constant'
+        | grep -iE 'memref|memtile_dma|objectfifo|repeat|scf.for'
 
 Inspect (a) L1 memref allocs are `[KB,DK]` + the `[TQ,*]` scratch and NEVER
-`[T,DK]`/`[P,DK]` (proves the byte budget on silicon), (b) the kpv path is one
-resident MemTile buffer with a replayed BD (PROBE 2), and (c) the scalar args
-appear as `arith.constant` operands to the `func.call`s (PROBE 1).
+`[T,DK]`/`[P,DK]` (byte budget on silicon), (b) the kpv path is one resident
+MemTile buffer with a replayed BD (PROBE 2), and (c) `scf.for` count is small
+(loops, not unrolled).
 
-Until PROBES 1-2 are closed by a build, STEP=7 gates the block-decomposed
-arithmetic on silicon (the compute half of STEP=8, kpv-fits-L1); STEP=8 is the
-dataflow-only remainder, and the byte budget above proves it FITS once it lowers.
+Until PROBE 2 is closed by a build, STEP=7 gates the block-decomposed arithmetic
+on silicon (the compute half of STEP=8, kpv-fits-L1); STEP=8 is the dataflow-only
+remainder, and the byte budget above proves it FITS once it lowers.

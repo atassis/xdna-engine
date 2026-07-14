@@ -40,13 +40,22 @@
 # assemble the full [TQ,*] score rows across key-blocks, then softmax -- the score
 # rows fit L1, the input k/p/V do not.
 #
-# ============================ TWO BUILD PROBES (cannot numpy-validate) ========
-# PROBE 1 (scalar kernel args): the block bricks take int32 scalars (tq,kb,j0,...).
-# This generator passes them as Python ints in a STATICALLY-UNROLLED core (n_qt,
-# n_kb,n_pb,n_vb are compile-time), so each is a constant. Confirm IRON's
-# Kernel.__call__ materializes a Python int as an i32 arith.constant operand; if
-# not, wrap: arith.constant(i32, v). (Kernel.__call__ passes non-Buffer args
-# through untouched to func.call -- python/iron/kernel.py.)
+# ============================ CORE = REAL HARDWARE LOOPS =====================
+# The query-tile sweep AND the k/p/V block sweeps are aie.iron range_ loops (the
+# whole_array_modal core_fn pattern: acquire/release inside range_), NOT static
+# Python unrolling -- static unrolling emitted ~352 func.calls and overflowed the
+# core PROGRAM memory (_XAie_LoadProgMemSection overflow) even though the 54 KB L1
+# DATA budget held. Loop counts: query tiles run as range_(0, Tq_full, TQ) so the
+# induction Value IS q0 (no multiply); the ragged final query tile is PEELED as
+# one static iteration so tq stays a Python constant. k/V/p full-blocks loop with
+# range_(0, *_full, KB) (j0 = the induction Value); the ragged final block of each
+# section is peeled. Runtime i32 scalars (q0, j0) come from index_cast of the
+# range_ induction Value -- the exact helper python/helpers/dialects/scf.py uses.
+# PROBE 1 (was: do Python-int kernel scalars lower?) is RESOLVED: the static build
+# generated valid MLIR and reached the ELF stage, so int scalar args lower fine;
+# the loop version passes the derived-index scalars as index_cast'd i32 Values.
+#
+# ============================ ONE BUILD PROBE (cannot numpy-validate) ========
 # PROBE 2 (resident-L2 replay in blocks): of_kpv_l3l2 stages the WHOLE padded kpv
 # in L2 (one L3->L2 fill); of_kpv forwards it to L1 with obj_type=[KB,DK] (smaller
 # than the source) and repeat_count=n_qt. Confirm this lowers to a MemTile DMA
@@ -56,10 +65,12 @@
 # BUILD-AND-BENCH.md): runtime re-fills kpv blocks per query tile (proven
 # whole_array pattern; correct, re-fetches kpv from DDR each tile -- same L1
 # budget, worse data movement).
-# SMALLEST PROBE: `python3 relpos_rowtiled_stream_iron.py -d npu2 -T 172 | \
-#   grep -iE 'memref|memtile_dma|objectfifo|repeat'` and inspect (a) the L1
-# memref alloc sizes (must be [KB,DK] + the [TQ,*] scratch, never [T|P,DK]) and
-# (b) that the kpv path is one resident MemTile buffer with a replayed BD.
+# SMALLEST PROBE: `python3 relpos_rowtiled_stream_iron.py -d npu2 -T 172 --tq 8 \
+#   --kb 43 | grep -iEc 'scf.for'` should be SMALL (the loops are real, not
+#   unrolled -- 4 range_ loops: 1 query + k + p + V), and
+#   `... | grep -iE 'memref|memtile_dma|objectfifo|repeat'` should show (a) L1
+# memref allocs of [KB,DK] + the [TQ,*] scratch, never [T|P,DK], and (b) the kpv
+# path as one resident MemTile buffer with a replayed BD.
 #
 # PLACE-TILES toolchain: bare Program(dev, rt).resolve_program(), NO SequentialPlacer.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
@@ -71,6 +82,11 @@ from ml_dtypes import bfloat16
 
 from aie.iron import Buffer, Kernel, ObjectFifo, Program, Runtime, Worker
 from aie.iron.device import NPU1, NPU2
+from aie.iron.controlflow import range_
+# index_cast + types: the exact helpers python/helpers/dialects/scf.py uses to turn
+# a range_ induction Value (index type) into an i32 kernel-scalar operand.
+from aie.extras.dialects.arith import index_cast
+from aie.extras import types as Ty
 
 DK = 128
 # Defaults; overridden by --tq / --kb so they always match the kernel's
@@ -131,7 +147,7 @@ def my_relpos_stream(dev, T, TQ, KB):
     # ---- block-brick kernels (int32-scalar ABI; see PROBE 1) ----
     dot_k = Kernel("relpos_stream_dot", "kernels.a",
                    [quv_blk_ty, kblk_ty, ac_ty, np.int32, np.int32, np.int32, np.int32])
-    dot_p = Kernel("relpos_stream_dot", "kernels.a",
+    dot_p = Kernel("relpos_stream_dot_p", "kernels.a",
                    [quv_blk_ty, kblk_ty, bd_ty, np.int32, np.int32, np.int32, np.int32])
     softmax_k = Kernel("relpos_stream_softmax", "kernels.a",
                        [ac_ty, bd_ty, probs_ty, np.int32, np.int32, np.int32, np.int32])
@@ -140,47 +156,78 @@ def my_relpos_stream(dev, T, TQ, KB):
                    [probs_ty, kblk_ty, ctxf_ty, np.int32, np.int32, np.int32, np.int32])
     narrow_k = Kernel("relpos_stream_narrow", "kernels.a", [ctxf_ty, ctx_blk_ty, np.int32])
 
+    # ---- loop-bound split constants (peel the ragged tail; loop the full body) ----
+    # Query tiles: loop q0 over the n_full FULL tiles (tq == TQ), peel the ragged
+    # final tile (tq < TQ) as ONE static iteration so tq stays a Python constant.
+    Tq_full = (T // TQ) * TQ          # rows covered by full query tiles
+    q_rag = T - Tq_full               # ragged final-tile rows (0 if TQ | T)
+    # Key/pos/value sections: loop the full KB-blocks, peel the ragged final block.
+    Tk_full = (T // KB) * KB          # k / V full-block rows
+    k_rag = T - Tk_full               # ragged k/V block rows (0 at T=172,KB=43)
+    Pp_full = (P // KB) * KB          # p full-block rows
+    p_rag = P - Pp_full               # ragged p block rows (42 at P=343,KB=43)
+
     def core_body(quv_in, kpv_in, ctx_out, ac, bd, probs, ctxf,
                   dotk, dotp, smax, czero, ctxb, narrow):
-        # STATICALLY UNROLLED over query tiles / key-blocks (all counts baked).
-        for q in range(n_qt):
-            q0 = q * TQ
-            tq = min(TQ, T - q0)
-
-            # -- phase K: qu_tile then k-blocks -> AC[:, j0:j0+kb] --
+        # ONE per-query-tile body, emitted ONCE inside a real hardware loop over
+        # the query tiles (the 22x multiplier) + ONCE for the peeled ragged tile.
+        # The k/p/V block sweeps are ALSO real range_ loops (nested, whole_array_
+        # modal core_fn pattern), so the emitted instruction count is BOUNDED (a
+        # handful of func.call sites), not the ~352 of the static unrolling that
+        # overflowed core program memory. q0/j0 become runtime i32 (index_cast of
+        # the range_ induction Value); tq/kb stay Python constants via peeling.
+        def emit_tile(tq, q0):
+            # -- phase K: qu_tile resident; k full-blocks then ragged -> AC[:, j0:] --
             equ = quv_in.acquire(1)
-            for b in range(n_kb):
-                j0 = b * KB
-                kb = min(KB, T - j0)
+            for jiv in range_(0, Tk_full, KB):
+                j0 = index_cast(jiv, to=Ty.i32())
                 ek = kpv_in.acquire(1)
-                dotk(equ, ek, ac, tq, kb, j0, T)
+                dotk(equ, ek, ac, tq, KB, j0, T)
+                kpv_in.release(1)
+            if k_rag:
+                ek = kpv_in.acquire(1)
+                dotk(equ, ek, ac, tq, k_rag, Tk_full, T)
                 kpv_in.release(1)
             quv_in.release(1)
 
-            # -- phase P: qv_tile then p-blocks -> BD[:, j0:j0+pb] --
+            # -- phase P: qv_tile resident; p full-blocks then ragged -> BD[:, j0:] --
             eqv = quv_in.acquire(1)
-            for b in range(n_pb):
-                j0 = b * KB
-                pb = min(KB, P - j0)
+            for jiv in range_(0, Pp_full, KB):
+                j0 = index_cast(jiv, to=Ty.i32())
                 ep = kpv_in.acquire(1)
-                dotp(eqv, ep, bd, tq, pb, j0, P)
+                dotp(eqv, ep, bd, tq, KB, j0, P)
+                kpv_in.release(1)
+            if p_rag:
+                ep = kpv_in.acquire(1)
+                dotp(eqv, ep, bd, tq, p_rag, Pp_full, P)
                 kpv_in.release(1)
             quv_in.release(1)
 
-            # -- softmax over assembled full score rows (GLOBAL-index rel_shift) --
+            # -- softmax over assembled full score rows (GLOBAL-index rel_shift q0) --
             smax(ac, bd, probs, tq, T, P, q0)
 
-            # -- phase V: V-blocks -> ctx (resident f32 accumulate) --
+            # -- phase V: V full-blocks then ragged -> ctx (resident f32 accumulate) --
             eo = ctx_out.acquire(1)
             czero(ctxf, tq)
-            for b in range(n_vb):
-                j0 = b * KB
-                vb = min(KB, T - j0)
+            for jiv in range_(0, Tk_full, KB):
+                j0 = index_cast(jiv, to=Ty.i32())
                 ev = kpv_in.acquire(1)
-                ctxb(probs, ev, ctxf, tq, T, vb, j0)
+                ctxb(probs, ev, ctxf, tq, T, KB, j0)
+                kpv_in.release(1)
+            if k_rag:
+                ev = kpv_in.acquire(1)
+                ctxb(probs, ev, ctxf, tq, T, k_rag, Tk_full)
                 kpv_in.release(1)
             narrow(ctxf, eo, tq)
             ctx_out.release(1)
+
+        # range_(0, Tq_full, TQ) yields q0 = 0, TQ, 2*TQ, ... directly (NO multiply);
+        # tq == TQ for every full tile.
+        for q0iv in range_(0, Tq_full, TQ):
+            emit_tile(TQ, index_cast(q0iv, to=Ty.i32()))
+        # peeled ragged final query tile (tq < TQ), q0 a Python constant.
+        if q_rag:
+            emit_tile(q_rag, Tq_full)
 
     worker = Worker(
         core_body,

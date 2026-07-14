@@ -823,6 +823,18 @@ extern "C" void relpos_stream_dot(bfloat16 *restrict Aq, bfloat16 *restrict Bblk
   event1();
 }
 
+// Distinct symbol for the BD (p-block) call so the generator can declare a second
+// Kernel with the [Tq,P] output type without redefining relpos_stream_dot's symbol
+// (IRON emits one func.func per Kernel object; same symbol + different type => MLIR
+// redefinition). Identical compute.
+extern "C" void relpos_stream_dot_p(bfloat16 *restrict Aq, bfloat16 *restrict Bblk,
+                                    float *restrict out, int32_t Tq, int32_t pb,
+                                    int32_t j0, int32_t ncol) {
+  event0();
+  relpos_dot_block(Aq, Bblk, out, Tq, pb, j0, ncol);
+  event1();
+}
+
 extern "C" void relpos_stream_ctx_zero(float *restrict ctxf, int32_t Tq) {
   relpos_ctx_zero(ctxf, Tq);
 }

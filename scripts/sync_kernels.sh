@@ -43,6 +43,8 @@ cp "$RB/relpos_mha/relpos_full_iron.py" "$PE/ml/relpos_mha/relpos_full_iron.py"
 # relpos MHA STEP-6: ROW-TILED, MemTile-staged block (T up to 172). k/p/V staged in
 # L2, T query rows tiled by TQ with the GLOBAL-index rel_shift. make STEP=6 T=172.
 cp "$RB/relpos_mha/relpos_rowtiled_iron.py" "$PE/ml/relpos_mha/relpos_rowtiled_iron.py"
+cp "$RB/relpos_mha/relpos_kpvstream_iron.py" "$PE/ml/relpos_mha/relpos_kpvstream_iron.py"
+cp "$RB/relpos_mha/relpos_rowtiled_stream_iron.py" "$PE/ml/relpos_mha/relpos_rowtiled_stream_iron.py"
 cp "$RB/relpos_mha/Makefile"                         "$PE/ml/relpos_mha/Makefile"
 # plain resident whole_array matmul (no epilogue) -- MLIR-emitting generator +
 # Makefile.resident (route_b_override .txt-insts + WA_C_DEPTH flow) for the Parakeet
