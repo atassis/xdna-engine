@@ -132,6 +132,18 @@ impl FastConformerEncoder {
         &self.w
     }
 
+    /// Public shim over the private [`Self::feed_forward`] for the FF1 macaron, used by the
+    /// `ff1_parity` gate harness (resident-rails work). Runs `LN -> fc1 -> SiLU -> fc2` for block
+    /// `blk` with the ff1 weight keys; the caller applies the `0.5*` residual (as `block()` does).
+    pub fn feed_forward_ff1(&self, x: &Array2<f32>, blk: usize) -> Array2<f32> {
+        let b = self.w.block(blk);
+        self.feed_forward(
+            x, b, blk, "ff1",
+            "norm_feed_forward1.weight", "norm_feed_forward1.bias",
+            "feed_forward1.linear1.weight", "feed_forward1.linear2.weight",
+        )
+    }
+
     /// NPU timing breakdown (feature `npu`, NPU path only).
     #[cfg(feature = "npu")]
     pub fn npu_stats_string(&self) -> Option<String> {
