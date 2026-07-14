@@ -128,6 +128,59 @@ def relpos_ac_scores_softmax_model(qu, k, BD, inv_scale):
     ac = mm_bf16(qu, k.T)                          # [T,T] f32 (bf16 mmul, f32 acc)
     return relpos_scores_softmax_model(ac, BD, inv_scale)
 
+# STEP-6 ROW-TILED brick: numpy MODEL of relpos_rowtiled_bake(.cc). Processes the
+# T query rows in TILES of Tq (Tq need NOT divide T -- ragged final tile), reading
+# resident k/p/V. Mirrors the on-chip arithmetic exactly: per query tile it runs
+# AC_tile = qu_tile @ k^T (bf16 mmul) and BD_tile = qv_tile @ p^T, then the strided
+# rel_shift + exp2 softmax with the GLOBAL query index into the rel_shift base
+# ((T-1) - (q0+il)), then ctx_tile = probs @ V. Returns probs[T,T], ctx[T,DK].
+# Tq == T recovers the single-tile (untiled) result -- so tiled(Tq<T) == tiled(T)
+# is the bit-exact cross-tile rel_shift correctness check (the #1 risk).
+def relpos_rowtiled_model(qu, qv, k, p, V, Tq, inv_scale):
+    T, DKc = qu.shape[0], qu.shape[1]
+    P = p.shape[0]
+    kb, pb, Vb = bf16(k), bf16(p), bf16(V)
+    probs = np.zeros((T, T), np.float32)
+    ctx = np.zeros((T, V.shape[1]), np.float32)
+    for q0 in range(0, T, Tq):
+        tq = min(Tq, T - q0)
+        ac = mm_bf16(bf16(qu[q0:q0 + tq]), kb.T)      # [tq,T] f32
+        bd = mm_bf16(bf16(qv[q0:q0 + tq]), pb.T)      # [tq,P] f32
+        for il in range(tq):
+            i = q0 + il
+            base = (T - 1) - (q0 + il)                 # GLOBAL-index rel_shift base
+            bd_row = bd[il, base:base + T]             # contiguous length-T window
+            scores = (ac[il] + bd_row) * inv_scale
+            probs[i] = softmax_kernel(scores)          # bf16 exp2 softmax, bf16 probs
+        # ctx_tile = probs @ V; bf16 acc-narrow to match the kernel's bf16 ctx store.
+        ctx[q0:q0 + tq] = bf16(mm_bf16(bf16(probs[q0:q0 + tq]), Vb))
+    return probs, ctx
+
+# tiled rel_shift assembly via the SAME global-index query-tile loop the kernel
+# uses (integer index only) -- compared bit-exact to the NeMo pad/reshape oracle.
+def rel_shift_tiled(bd, Tq):  # bd [T,P] -> [T,T]
+    T, P = bd.shape
+    out = np.zeros((T, T), bd.dtype)
+    for q0 in range(0, T, Tq):
+        tq = min(Tq, T - q0)
+        for il in range(tq):
+            i = q0 + il
+            base = (T - 1) - (q0 + il)
+            out[i] = bd[i, base:base + T]
+    return out
+
+# f32 host oracle (one head) from qu/qv/k/p/V -- probs[T,T] + ctx[T,DK].
+def host_probs_ctx(qu, qv, k, p, V, inv_scale):
+    T = qu.shape[0]
+    ac = (qu.astype(np.float32) @ k.astype(np.float32).T)     # [T,T]
+    bd = (qv.astype(np.float32) @ p.astype(np.float32).T)     # [T,P]
+    bd_sh = rel_shift_host(bd[None])[0]                        # [T,T]
+    s = (ac + bd_sh) * inv_scale
+    s = s - s.max(-1, keepdims=True)
+    a = np.exp(s); a /= a.sum(-1, keepdims=True)
+    ctx = (a @ V.astype(np.float32))
+    return a.astype(np.float32), ctx.astype(np.float32)
+
 def mhsa_kernel(x, blk, pos_enc):
     T = x.shape[0]
     Wq, Wk, Wv = (W(blk, f"self_attn.linear_{n}.weight") for n in ("q", "k", "v"))
@@ -260,8 +313,76 @@ def main():
     print(f"G5a step-2 composed brick, real regime  : rel={g5a_worst:.3e}  DIAGNOSTIC (one-hot; {g5a_flips} near-tie argmax flip(s) across {H} heads; washes out in G3)")
     print(f"G5b step-2 composed brick, non-degen sm : rel={g5b_worst:.3e}  GATE<= {GATE}  {'PASS' if g5b_worst <= GATE else 'FAIL'}  (worst of {H} heads; on-chip matmul + exp2 softmax)")
 
+    # ========================================================================
+    # STEP-6 ROW-TILED, MemTile-staged block. The per-query-row computation is
+    # independent, so tiling the query rows must be NUMERICALLY IDENTICAL to the
+    # single tile -- PROVIDED the rel_shift window uses the GLOBAL query index
+    # (base = (T-1) - (q0+il), NOT (T-1) - il). This is the #1 correctness risk;
+    # the checks below prove it BOTH at the real block-0 T=32 AND at the target
+    # real-block T=172 (synthesized realistic tensors -- only real T=32 activations
+    # exist locally, but the rel_shift index math is data-independent).
+    print("\n--- STEP-6 row-tiled, MemTile-staged block (T up to 172, one head) ---")
+
+    # G6: tiled global-index rel_shift assembly == NeMo rel_shift, BIT-EXACT, over
+    # several (T, Tq) incl. ragged tiles (Tq does NOT divide T) and the target T=172.
+    g6_fail = False
+    for (Tg, Tq) in [(32, 8), (32, 16), (172, 8), (172, 16), (172, 24)]:
+        bdt = rng.standard_normal((Tg, 2 * Tg - 1)).astype(np.float32)
+        d = rel(rel_shift_tiled(bdt, Tq), rel_shift_host(bdt[None])[0])
+        ragged = "ragged" if (Tg % Tq) else "exact"
+        ok6 = d < 1e-12
+        g6_fail = g6_fail or (not ok6)
+        print(f"G6  tiled rel_shift(T={Tg:3d},Tq={Tq:2d}) == NeMo : rel={d:.2e} {ragged:6s} {'PASS' if ok6 else 'FAIL'}")
+
+    # G7: row-tiled numeric block. (a) tiled(Tq) == single-tile (Tq=T): bit-exact
+    # cross-tile equivalence -- the load-bearing q0 check. (b) tiled bf16 model vs
+    # f32 host oracle: rel-L2 <= 0.08 gate. Run at T=32 REAL (block-0 head-0) and
+    # T=172 synthesized (realistic scale so softmax is non-degenerate).
+    def run_g7(tag, qu, qv, kk, pp, VV, Tq):
+        inv = np.float32(1.0 / np.sqrt(DK))
+        # non-degenerate scale (as G4b/G5b): rescale so post-scale scores ~ std 1.
+        ac = qu.astype(np.float32) @ kk.astype(np.float32).T
+        bd = qv.astype(np.float32) @ pp.astype(np.float32).T
+        bd_sh = rel_shift_host(bd[None])[0]
+        std = float(((ac + bd_sh) * inv).std()) + 1e-6
+        qu_s, qv_s, sc = qu / std, qv / std, inv  # fold 1/std into qu,qv (shrinks ac,bd)
+        pr_t, cx_t = relpos_rowtiled_model(qu_s, qv_s, kk, pp, VV, Tq, sc)      # tiled
+        pr_1, cx_1 = relpos_rowtiled_model(qu_s, qv_s, kk, pp, VV, len(qu), sc) # single-tile
+        pr_h, cx_h = host_probs_ctx(qu_s, qv_s, kk, pp, VV, sc)                 # f32 host
+        d_eq_p, d_eq_c = rel(pr_t, pr_1), rel(cx_t, cx_1)
+        d_h_p, d_h_c = rel(pr_t, pr_h), rel(cx_t, cx_h)
+        eq_ok = (d_eq_p < 1e-12) and (d_eq_c < 1e-12)
+        h_ok = (d_h_p <= GATE) and (d_h_c <= GATE)
+        print(f"G7 {tag} tiled(Tq={Tq})==single-tile : probs rel={d_eq_p:.2e} ctx rel={d_eq_c:.2e}  {'PASS' if eq_ok else 'FAIL'}")
+        print(f"G7 {tag} tiled bf16 vs f32 host      : probs rel={d_h_p:.3e} ctx rel={d_h_c:.3e}  GATE<= {GATE}  {'PASS' if h_ok else 'FAIL'}")
+        return eq_ok and h_ok
+
+    # T=32 real block-0 head-0.
+    h0 = 0
+    qu32 = (q[:, h0] + u[h0]).astype(np.float32)
+    qv32 = (q[:, h0] + vv[h0]).astype(np.float32)
+    k32 = k[:, h0].astype(np.float32)
+    p32 = pm[:, h0].astype(np.float32)
+    v32 = (x @ W(blk, "self_attn.linear_v.weight")).reshape(T, H, DK)[:, h0].astype(np.float32)
+    g7_32 = run_g7("T=32 real  ", qu32, qv32, k32, p32, v32, 8)
+
+    # T=172 synthesized realistic tensors (data-independent index math; realistic
+    # std so the softmax is non-degenerate). Same tensors feed tiled/single/host.
+    T172 = 172
+    rng2 = np.random.default_rng(1)
+    sig = float(q[:, h0].std())  # match real projection scale
+    qu172 = rng2.standard_normal((T172, DK)).astype(np.float32) * sig
+    qv172 = rng2.standard_normal((T172, DK)).astype(np.float32) * sig
+    k172 = rng2.standard_normal((T172, DK)).astype(np.float32) * sig
+    p172 = rng2.standard_normal((2 * T172 - 1, DK)).astype(np.float32) * sig
+    v172 = rng2.standard_normal((T172, DK)).astype(np.float32) * sig
+    g7_172_8 = run_g7("T=172 synth", qu172, qv172, k172, p172, v172, 8)
+    g7_172_16 = run_g7("T=172 synth", qu172, qv172, k172, p172, v172, 16)
+
+    step6_ok = (not g6_fail) and g7_32 and g7_172_8 and g7_172_16
+
     ok = (g1 < 1e-12) and (g2 < 1e-6) and (g3 <= GATE) and (g4a_worst <= GATE) and (g4b_worst <= GATE) \
-         and (g5b_worst <= GATE)
+         and (g5b_worst <= GATE) and step6_ok
     print("\nRESULT:", "ALL PASS" if ok else "FAIL")
     sys.exit(0 if ok else 1)
 

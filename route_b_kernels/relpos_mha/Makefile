@@ -15,16 +15,26 @@ include ${srcdir}/../../makefile-common
 
 devicename ?= $(if $(filter 1,$(NPU2)),npu2,npu)
 T ?= 32
+# Query-tile row count for STEP=6 (row-tiled block); baked as -DRELPOS_TQ. Need
+# not divide T (kernel handles a ragged final tile). Ignored by STEP<6.
+TQ ?= 8
 
 # STEP selects which entry point / generator this xclbin drives:
 #   STEP=1 (default) -- relpos_scores_softmax : host-fed AC + BD -> probs (no matmul).
 #   STEP=2           -- relpos_ac_scores_softmax : on-chip AC=qu@k^T matmul feeding
 #                       the resident-in-L1 f32 score tile -> scores->softmax -> probs.
-# Both build the SAME build/kernels.a from relpos_mha.cc (which holds both entries);
+#   STEP=3/4/5       -- both score matmuls resident / ctx AV matmul / full composition.
+#   STEP=6           -- relpos_rowtiled : ROW-TILED, MemTile-staged block. quv[2T,DK]
+#                       + kpv[(2T+P),DK] packed bf16 -> ctx[T,DK]; T query rows tiled
+#                       by TQ (=RELPOS_TQ), GLOBAL-index rel_shift. Target T up to 172.
+# All build the SAME build/kernels.a from relpos_mha.cc (which holds every entry);
 # only the generated .mlir / xclbin differ. `make clean` when switching STEP (the
 # xclbin/insts names are fixed, so a stale build/ from the other step would linger).
 STEP ?= 1
-ifeq ($(STEP),5)
+ifeq ($(STEP),6)
+targetname = relpos_rowtiled
+aie_py_src = relpos_rowtiled_iron.py
+else ifeq ($(STEP),5)
 targetname = relpos_full
 aie_py_src = relpos_full_iron.py
 else ifeq ($(STEP),4)
@@ -52,7 +62,7 @@ endif
 build/%.cc.o: %.cc
 	mkdir -p ${@D}
 ifeq ($(devicename),npu2)
-	cd ${@D} && ${PEANO_INSTALL_DIR}/bin/clang++ ${PEANOWRAP2P_FLAGS} -DRELPOS_T=${T} -c $< -o ${@F}
+	cd ${@D} && ${PEANO_INSTALL_DIR}/bin/clang++ ${PEANOWRAP2P_FLAGS} -DRELPOS_T=${T} -DRELPOS_TQ=${TQ} -c $< -o ${@F}
 else
 	echo "Only npu2 supported for this example"
 endif

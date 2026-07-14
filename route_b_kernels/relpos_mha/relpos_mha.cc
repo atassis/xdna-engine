@@ -415,3 +415,206 @@ extern "C" void relpos_full_bake(bfloat16 *restrict qkv, bfloat16 *restrict qvp,
   relpos_scores_softmax(g_ac, g_bd, g_probs, T, P, inv_scale); // probs
   relpos_ctx_matmul(g_probs, V, ctx, T);                  // ctx = probs @ V
 }
+
+// ===========================================================================
+// STEP-6 ROW-TILED, MemTile-STAGED resident MHA block (T up to 172, one head).
+//
+// WHY: relpos_full_bake (step 5) needs k[T,DK], p[P,DK] AND V[T,DK] ALL resident
+// in L1 (softmax reads every key, ctx every value). At the real T'=172 that is
+// ~172 KB (k 43 + p 86 + V 43) >> the 64 KB L1 -- and p ALONE (86 KB) already
+// overflows L1. So single-tile is impossible for real T; this step removes the
+// wall by (a) STAGING k/p/V once in the 512 KB MemTile (L2) and (b) processing
+// the T query rows in TILES of Tq so only per-tile [Tq,*] working set lives in L1.
+//
+// The per-QUERY-row computation is INDEPENDENT (row i of the output depends on
+// qu[i], qv[i], ALL k, ALL p, ALL V -- softmax is per-row over the keys), so
+// tiling the query rows changes NOTHING numerically PROVIDED the rel_shift window
+// uses the GLOBAL query index. That is the one load-bearing correctness subtlety:
+//
+//   single-tile row i:      BD_shifted[i,j] = BD[i, (T-1) - i + j]
+//   tiled  local row il in a tile whose global base is q0 (i_global = q0 + il):
+//                           BD_shifted[il,j] = BD_tile[il, (T-1) - (q0+il) + j]
+//
+// i.e. the strided rel_shift base is (T-1) - (q0 + il), NOT (T-1) - il. Get the
+// GLOBAL index into that offset and the tiled block is bit-identical to the
+// single tile (golden: scripts/parakeet_relpos_mha_golden.py, G6/G7).
+//
+// L1 BUDGET (per query tile): AC_tile[Tq,T] f32 + BD_tile[Tq,P] f32 + probs[Tq,T]
+// bf16 + one streamed k/p/V block. At Tq=8, T=172: g_ac 5.5 KB + g_bd 11 KB +
+// g_probs 2.75 KB = ~19 KB of resident score scratch (vs 172 KB for full k/p/V) --
+// the score/prob tiles shrink Tq/T-fold, and k/p/V are STREAMED (never fully
+// resident). The MemTile holds the 172 KB k/p/V staging (fits the 512 KB L2), and
+// the L2->L1 DMA is REPLAYED once per query tile (IRON ObjectFifo repeat_count),
+// so k/p/V are fetched from host DDR ONCE, not per tile.
+// ===========================================================================
+
+// Encoder frame count T baked for the row-tiled block. Real Parakeet blocks run
+// T' up to 172 (P = 2T-1 = 343). Override with -DRELPOS_T at compile time.
+// (RELPOS_T also feeds the small-T standalone/composed de-risk entries above.)
+
+// Query-tile row count Tq for the row-tiled block. Chosen so the per-tile score
+// scratch (AC_tile[Tq,T] + BD_tile[Tq,P] f32) fits L1 with margin. Tq need NOT
+// divide T -- the driver handles a ragged final tile (tq = min(Tq, T-q0)).
+#ifndef RELPOS_TQ
+#define RELPOS_TQ 8
+#endif
+
+// ---------------------------------------------------------------------------
+// BRICK 2 (row-tiled) -- rel_shift + score add/scale + exp2 softmax, GENERALIZED
+// to a query-tile row count Tq DISTINCT from the key count T, with the rel_shift
+// window keyed on the GLOBAL query index (base row q0). Identical numerics to
+// relpos_scores_softmax; the ONLY change is Tq rows and the (T-1)-(q0+il) offset.
+//   AC   : [Tq, T] row-major f32  (qu_tile @ k^T)
+//   BD   : [Tq, P] row-major f32  (qv_tile @ p^T, P = 2T-1)
+//   probs: [Tq, T] row-major bf16 (out)
+//   q0   : global row index of this tile's first row (i_global = q0 + il)
+// Per local row il:  scores[j] = (AC[il,j] + BD[il, (T-1)-(q0+il)+j]) * inv_scale
+// ---------------------------------------------------------------------------
+static inline void relpos_scores_softmax_rows(float *restrict AC,
+                                              float *restrict BD,
+                                              bfloat16 *restrict probs, int Tq,
+                                              int T, int P, int q0,
+                                              float inv_scale) {
+  alignas(aie::vector_decl_align) static float srow[RELPOS_TMAX];
+  aie::vector<float, VL> inv_scale_v = aie::broadcast<float, VL>(inv_scale);
+  aie::vector<float, VL> log2e_v = aie::broadcast<float, VL>(LOG2E);
+
+  for (int il = 0; il < Tq; il++) {
+    const float *ac_row = AC + il * T;
+    // GLOBAL-INDEX rel_shift: contiguous length-T window of BD row il starting at
+    // column (T-1) - (q0 + il). q0=0 (single tile) recovers the (T-1-il) form.
+    const float *bd_row = BD + il * P + (T - 1 - (q0 + il));
+    bfloat16 *prob_row = probs + il * T;
+
+    // pass 1: scores = (AC + BD_shifted) * inv_scale ; row max (f32)
+    float rowmax = -3.0e38f;
+    int j = 0;
+    for (; j + VL <= T; j += VL) {
+      aie::vector<float, VL> a = aie::load_v<VL>(ac_row + j);
+      aie::vector<float, VL> b = aie::load_v<VL>(bd_row + j);
+      aie::vector<float, VL> s =
+          aie::mul(aie::add(a, b), inv_scale_v).to_vector<float>();
+      aie::store_v(srow + j, s);
+      float cm = aie::reduce_max(s);
+      if (cm > rowmax) rowmax = cm;
+    }
+    for (; j < T; j++) {
+      float s = (ac_row[j] + bd_row[j]) * inv_scale;
+      srow[j] = s;
+      if (s > rowmax) rowmax = s;
+    }
+
+    // pass 2: exp2((s - max) * log2e) -> bf16 probs ; running f32 sum
+    aie::vector<float, VL> maxv = aie::broadcast<float, VL>(rowmax);
+    aie::accum<accfloat, VL> sumacc = aie::zeros<accfloat, VL>();
+    j = 0;
+    for (; j + VL <= T; j += VL) {
+      aie::vector<float, VL> s = aie::load_v<VL>(srow + j);
+      aie::vector<float, VL> d = aie::sub(s, maxv);
+      aie::vector<float, VL> sl = aie::mul(d, log2e_v).to_vector<float>();
+      aie::vector<bfloat16, VL> e = aie::exp2<bfloat16>(sl);
+      aie::store_v(prob_row + j, e);
+      sumacc = aie::add(sumacc, e);
+    }
+    float sum = aie::reduce_add(sumacc.to_vector<float>());
+    for (; j < T; j++) {
+      float e = exp2_scalar((srow[j] - rowmax) * LOG2E);
+      prob_row[j] = (bfloat16)e;
+      sum += e;
+    }
+
+    // pass 3: normalize probs *= 1/sum
+    bfloat16 inv_sum = (bfloat16)aie::inv(sum);
+    aie::vector<bfloat16, VL> inv_sum_v = aie::broadcast<bfloat16, VL>(inv_sum);
+    j = 0;
+    for (; j + VL <= T; j += VL) {
+      aie::vector<bfloat16, VL> e = aie::load_v<VL>(prob_row + j);
+      aie::store_v(prob_row + j, aie::mul(e, inv_sum_v).to_vector<bfloat16>());
+    }
+    for (; j < T; j++) {
+      prob_row[j] = (bfloat16)((float)prob_row[j] * (float)inv_sum);
+    }
+  }
+}
+
+// BRICK 4 (row-tiled) -- ctx = probs @ V, GENERALIZED to a query-tile row count
+// Tq distinct from the key count T. ctx[il,:] = sum_j probs[il,j] * V[j,:].
+//   probs: [Tq, T]  row-major bf16   V: [T, DK] row-major bf16
+//   ctx  : [Tq, DK] row-major bf16
+static inline void relpos_ctx_matmul_rows(const bfloat16 *restrict probs,
+                                          const bfloat16 *restrict V,
+                                          bfloat16 *restrict ctx, int Tq, int T) {
+  static_assert(DK % VL == 0, "DK must be a multiple of the vector width");
+  for (int i = 0; i < Tq; i++) {
+    const bfloat16 *p_row = probs + i * T;
+    bfloat16 *ctx_row = ctx + i * DK;
+    for (int d = 0; d < DK; d += VL) {
+      aie::accum<accfloat, VL> acc = aie::zeros<accfloat, VL>();
+      for (int j = 0; j < T; j++) {
+        aie::vector<bfloat16, VL> wv = aie::broadcast<bfloat16, VL>(p_row[j]);
+        aie::vector<bfloat16, VL> vv = aie::load_v<VL>(V + j * DK + d);
+        acc = aie::mac(acc, wv, vv);
+      }
+      aie::store_v(ctx_row + d, acc.to_vector<bfloat16>());
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// STEP-6 ROW-TILED DRIVER -- one head, T query rows processed in Tq-row tiles,
+// reading the resident k/p/V. This is the on-chip ARITHMETIC of the row-tiled
+// block; it is what the numpy row-tiled golden (G6/G7) mirrors. Reuses the four
+// device-validated bricks (dot_matmul x2, softmax_rows, ctx_matmul_rows) on the
+// [Tq,*] tiles, with the GLOBAL-index rel_shift (q0) -- the load-bearing new bit.
+//
+//   quv : [2*T, DK]     bf16  PACKED (qu = quv[0:T], qv = quv[T:2T])
+//   kpv : [(2*T+P), DK] bf16  PACKED (k = kpv[0:T], p = kpv[T:T+P], V = kpv[T+P:])
+//   ctx : [T, DK]       bf16  (out)
+// TWO packed inputs keep the core within the NPU2 compute tile's 2 input-DMA-
+// channel budget (same discipline as steps 3/5); the pos_bias adds (qu=q+u,
+// qv=q+v) are folded host-side. kpv is the RESIDENT staging (k/p/V); quv is the
+// per-block query stream.
+//
+// Score/prob scratch is sized by Tq (NOT T): g_ac[Tq*T] + g_bd[Tq*P] + g_probs
+// [Tq*T]. This monolithic bake takes FULL k/p/V pointers (kpv resident in L1), so
+// on its own it caps at the T where kpv still fits L1 (bring-up / arithmetic gate
+// -- but note the Tq-shrunk score scratch already raises that ceiling vs step-5
+// relpos_full_bake). Reaching T=172 needs k/p/V STREAMED in key-blocks from the
+// 512 KB MemTile (p alone is 86 KB > L1), which the row-tiled generator stages via
+// ObjectFifo repeat_count; that block-streamed variant is the device-gate step
+// (see relpos_rowtiled_iron.py + BUILD-AND-BENCH.md). The query-row loop and its
+// GLOBAL-index rel_shift are bit-identical either way (golden G6/G7).
+// ---------------------------------------------------------------------------
+extern "C" void relpos_rowtiled_bake(bfloat16 *restrict quv,
+                                     bfloat16 *restrict kpv,
+                                     bfloat16 *restrict ctx) {
+  constexpr int T = RELPOS_T;
+  constexpr int P = 2 * T - 1;
+  constexpr int Tq = RELPOS_TQ;
+  static_assert(DK == 128,
+                "baked inv_scale is 1/sqrt(128); regenerate for a different DK");
+  constexpr float inv_scale = 0.08838834764831843f; // 1/sqrt(128)
+
+  alignas(aie::vector_decl_align) static float g_ac[Tq * T];
+  alignas(aie::vector_decl_align) static float g_bd[Tq * P];
+  alignas(aie::vector_decl_align) static bfloat16 g_probs[Tq * T];
+
+  bfloat16 *qu = quv;                  // [T, DK]
+  bfloat16 *qv = quv + T * DK;         // [T, DK]
+  bfloat16 *k = kpv;                   // [T, DK]
+  bfloat16 *p = kpv + T * DK;          // [P, DK]
+  bfloat16 *V = kpv + (T + P) * DK;    // [T, DK]
+
+  event0();
+  for (int q0 = 0; q0 < T; q0 += Tq) {
+    int tq = (T - q0 < Tq) ? (T - q0) : Tq; // ragged final tile
+    const bfloat16 *qu_t = qu + q0 * DK;     // [tq, DK]
+    const bfloat16 *qv_t = qv + q0 * DK;     // [tq, DK]
+    bfloat16 *ctx_t = ctx + q0 * DK;         // [tq, DK]
+    relpos_dot_matmul(qu_t, k, g_ac, tq, T); // AC_tile = qu_t @ k^T  [tq,T]
+    relpos_dot_matmul(qv_t, p, g_bd, tq, P); // BD_tile = qv_t @ p^T  [tq,P]
+    relpos_scores_softmax_rows(g_ac, g_bd, g_probs, tq, T, P, q0, inv_scale);
+    relpos_ctx_matmul_rows(g_probs, V, ctx_t, tq, T); // ctx_tile = probs @ V
+  }
+  event1();
+}
