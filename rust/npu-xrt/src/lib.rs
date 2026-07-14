@@ -56,6 +56,7 @@ extern "C" {
         flag: c_int,
         gid: c_int,
     ) -> *mut CBo;
+    fn shim_bo_subbuffer(parent: *mut CBo, size: usize, offset: usize) -> *mut CBo;
     fn shim_bo_free(b: *mut CBo);
     fn shim_bo_write(b: *mut CBo, src: *const c_void, n: usize, off: usize) -> c_int;
     fn shim_bo_read(b: *mut CBo, dst: *mut c_void, n: usize, off: usize) -> c_int;
@@ -709,6 +710,18 @@ impl FusedArena {
 impl Bo {
     pub fn nbytes(&self) -> usize {
         self.nbytes
+    }
+
+    /// A device-side sub-buffer view `[offset, offset+size)` of this BO, sharing its memory (no host
+    /// round-trip, XRT-native). Lets a kernel read/write a slice of a larger BO -- e.g. one chunk of
+    /// a chunk-major fc2 A buffer, or a KV-cache window. The parent BO must outlive the view.
+    pub fn sub(&self, offset: usize, size: usize) -> Result<Bo> {
+        let ptr = unsafe { shim_bo_subbuffer(self.ptr, size, offset) };
+        if ptr.is_null() {
+            Err(format!("sub(offset={offset}, size={size}): {}", last_error()))
+        } else {
+            Ok(Bo { ptr, nbytes: size })
+        }
     }
 
     pub fn write_bytes(&self, bytes: &[u8]) -> Result<()> {

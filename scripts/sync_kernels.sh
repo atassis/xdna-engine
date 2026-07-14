@@ -82,6 +82,8 @@ cp "$RB/ctx_ln/Makefile.cast"         "$PE/ml/layernorm/Makefile.cast"
 cp "$RB/aie_kernels/affine_cast.cc"   "$K/affine_cast.cc"
 cp "$RB/ctx_ln/affine_cast_iron.py"   "$PE/ml/layernorm/affine_cast_iron.py"
 cp "$RB/ctx_ln/Makefile.affinecast"   "$PE/ml/layernorm/Makefile.affinecast"
+cp "$RB/ctx_ln/deint_cast_iron.py"   "$PE/ml/layernorm/deint_cast_iron.py"
+cp "$RB/ctx_ln/Makefile.deint"        "$PE/ml/layernorm/Makefile.deint"
 # mha_decode — on-chip single-query MHA for the Whisper decoder (M1 Task 0): kernel + design
 mkdir -p "$PE/ml/mha_decode"
 cp "$RB/mha_decode/mha_decode.cc"      "$K/mha_decode.cc"

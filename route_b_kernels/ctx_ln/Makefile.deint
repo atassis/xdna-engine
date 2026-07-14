@@ -1,0 +1,32 @@
+##===- Makefile.deint ----------------------------------------------------===##
+#
+# Deinterleave + f32->bf16 cast xclbin (fc1->fc2 seam, Variant B). Reuses the plain cast kernel
+# object (cast_f32_bf16.o); the chunk-major reorg is in the drain TAP. Build:
+#   make -f Makefile.deint NPU2=1 rows=512 cols=4096 build/final_deint_512x4096.xclbin
+#
+srcdir := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
+include ${srcdir}/../../makefile-common
+VPATH := ${srcdir}/../../../aie_kernels/aie2p
+
+devicename ?= $(if $(filter 1,$(NPU2)),npu2,npu)
+rows ?= 512
+cols ?= 4096
+tag = deint_${rows}x${cols}
+
+aie_py_src = deint_cast_iron.py
+
+all: build/final_${tag}.xclbin
+
+build/cast_f32_bf16.o: cast_f32_bf16.cc
+	mkdir -p ${@D}
+	cd ${@D} && ${PEANO_INSTALL_DIR}/bin/clang++ ${PEANOWRAP2P_FLAGS} -c $< -o ${@F}
+
+build/aie_${tag}.mlir: ${srcdir}/${aie_py_src}
+	mkdir -p ${@D}
+	python3 $< -d ${devicename} -r ${rows} -c ${cols} -t 0 > $@
+
+build/final_${tag}.xclbin: build/aie_${tag}.mlir build/cast_f32_bf16.o
+	mkdir -p ${@D}
+	cd ${@D} && aiecc --aie-generate-xclbin --aie-generate-npu-insts --no-compile-host \
+		--no-xchesscc --no-xbridge --peano ${PEANO_INSTALL_DIR} \
+		--xclbin-name=${@F} --npu-insts-name=insts_${tag}.txt aie_${tag}.mlir

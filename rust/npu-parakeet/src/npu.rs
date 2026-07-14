@@ -116,35 +116,28 @@ struct ResidentLn {
     bo_ln: Bo,   // [PAD_M, KRES] f32   (ctxLN output = affine_cast input, ln g4 / ac g3)
     bo_gb: Bo,   // [2*KRES] f32        (gamma|beta params, ac g4)
     bo_bf16: Bo, // [PAD_M, KRES] bf16  (affine_cast output = modal fc1 A, ac g5)
-    // fc1->fc2 device-side (full FFN): cast the [PAD_M,DFF] fc1 output to bf16 then a K=DFF fc2
-    // matmul reads it directly (no host K-split / accumulate).
-    c4_kern: Rc<Kernel>,  // cast @ DFF (fc1 f32 -> bf16)
-    c4_instr: Bo,
-    c4_n: usize,
-    fc2_kern: Rc<Kernel>, // K=DFF whole_array matmul (identity epilogue), N=KRES
-    fc2_instr: Bo,
-    fc2_n: usize,
-    bo_fc1bf16: Bo, // [PAD_M, DFF] bf16  (cast@DFF output = fc2 A, c4 g4)
-    bo_fc2out: Bo,  // [PAD_M, KRES] f32  (fc2 output, fc2 g5)
+    // fc1->fc2 device-side (full FFN, Variant B): deinterleave+cast the [PAD_M,DFF] fc1 output into a
+    // CHUNK-MAJOR [n_chunks,PAD_M,KRES] bf16 buffer (one dispatch, 3D drain TAP), then the fc2 K-split
+    // reads each K=KRES chunk as a device SUB-BUFFER (Bo::sub) into the K=KRES modal -- bit-identical
+    // to the host 4xK=1024 K-split (WER-neutral), A fed device-side.
+    deint_kern: Rc<Kernel>,
+    deint_instr: Bo,
+    deint_n: usize,
+    bo_deint: Bo, // [n_chunks*PAD_M*KRES] bf16 chunk-major (deint output, deint g4)
     // per-kernel dummy placeholders (0-size segfaults)
     ln_c: Bo,
     ln_tmp: Bo,
     ln_tr: Bo,
     ac_tmp: Bo,
     ac_tr: Bo,
-    c4_c: Bo,
-    c4_tmp: Bo,
-    c4_tr: Bo,
-    fc2_tmp: Bo,
-    fc2_tr: Bo,
+    deint_c: Bo,
+    deint_tmp: Bo,
+    deint_tr: Bo,
 }
 
 const DFF: usize = 4096; // Parakeet FFN inner dim (fc1 N / fc2 K)
-// The resident K=DFF fc2 uses the SAME fast-bfp16 tile as fc1/host (weight_bo packs for THIS tiling;
-// the native 32x32x32 tile expects a different weight/A layout -> garbage, 100% WER). The K=DFF
-// bfp16 fc2 is bf16-class but still +0.4pp WER vs the host 4xK=1024 K-split (accumulation/bfp16-block
-// difference) -- so the full FFN stays OPT-IN until the fc2 matches the host K-split numerics.
-const FC2_TILE: &str = "64x32x128";
+// Variant B fc2 = deinterleave -> 4x K=KRES modal (same tile as host) on device sub-buffers +
+// host-accumulate = bit-identical to the host K-split (WER-neutral), A device-side.
 
 impl NpuMatmul {
     pub fn open(root: &Path) -> Self {
@@ -324,9 +317,8 @@ impl NpuMatmul {
             self.ln_dir.join(format!("final_{n}_{PAD_M}x{KRES}.xclbin")).exists()
                 && self.ln_dir.join(format!("insts_{n}_{PAD_M}x{KRES}.txt")).exists()
         });
-        // full FFN also needs cast@DFF + the K=DFF fc2 resident
-        let fc2ok = self.ln_dir.join(format!("final_cast_{PAD_M}x{DFF}.xclbin")).exists()
-            && self.ln_dir.join(format!("final_{PAD_M}x{DFF}x{KRES}_{FC2_TILE}_8c_modalid.xclbin")).exists();
+        // full FFN (Variant B) also needs the deinterleave xclbin
+        let fc2ok = self.ln_dir.join(format!("final_deint_{PAD_M}x{DFF}.xclbin")).exists();
         let present = seam && fc2ok;
         let result = if present {
             Some(self.load_resident_ln())
@@ -365,35 +357,28 @@ impl NpuMatmul {
             bo.sync_to_device().unwrap();
             (kern, bo, n)
         };
-        let (c4_kern, c4_instr, c4_n) = load_path(
-            self.ln_dir.join(format!("final_cast_{PAD_M}x{DFF}.xclbin")),
-            self.ln_dir.join(format!("insts_cast_{PAD_M}x{DFF}.txt")));
-        let (fc2_kern, fc2_instr, fc2_n) = load_path(
-            self.ln_dir.join(format!("final_{PAD_M}x{DFF}x{KRES}_{FC2_TILE}_8c_modalid.xclbin")),
-            self.ln_dir.join(format!("insts_{PAD_M}x{DFF}x{KRES}_{FC2_TILE}_8c_modalid.txt")));
+        let (deint_kern, deint_instr, deint_n) = load_path(
+            self.ln_dir.join(format!("final_deint_{PAD_M}x{DFF}.xclbin")),
+            self.ln_dir.join(format!("insts_deint_{PAD_M}x{DFF}.txt")));
         let gl = |i| ln_kern.group_id(i).unwrap();
         let ga = |i| ac_kern.group_id(i).unwrap();
-        let gc4 = |i| c4_kern.group_id(i).unwrap();
-        let gf2 = |i| fc2_kern.group_id(i).unwrap();
+        let gd = |i| deint_kern.group_id(i).unwrap();
         let rl = Rc::new(ResidentLn {
             bo_x: self.dev.alloc_bo(&ln_kern, PAD_M * KRES * 4, FLAG_HOST_ONLY, gl(3)).unwrap(),
             bo_ln: self.dev.alloc_bo(&ln_kern, PAD_M * KRES * 4, FLAG_HOST_ONLY, gl(4)).unwrap(),
             bo_gb: self.dev.alloc_bo(&ac_kern, 2 * KRES * 4, FLAG_HOST_ONLY, ga(4)).unwrap(),
             bo_bf16: self.dev.alloc_bo(&ac_kern, PAD_M * KRES * 2, FLAG_HOST_ONLY, ga(5)).unwrap(),
-            bo_fc1bf16: self.dev.alloc_bo(&c4_kern, PAD_M * DFF * 2, FLAG_HOST_ONLY, gc4(4)).unwrap(),
-            bo_fc2out: self.dev.alloc_bo(&fc2_kern, PAD_M * KRES * 4, FLAG_HOST_ONLY, gf2(5)).unwrap(),
+            bo_deint: self.dev.alloc_bo(&deint_kern, (DFF / KRES) * PAD_M * KRES * 2, FLAG_HOST_ONLY, gd(4)).unwrap(),
             ln_c: self.dev.alloc_bo(&ln_kern, 1, FLAG_HOST_ONLY, gl(5)).unwrap(),
             ln_tmp: self.dev.alloc_bo(&ln_kern, 8, FLAG_HOST_ONLY, gl(6)).unwrap(),
             ln_tr: self.dev.alloc_bo(&ln_kern, 1, FLAG_HOST_ONLY, gl(7)).unwrap(),
             ac_tmp: self.dev.alloc_bo(&ac_kern, 8, FLAG_HOST_ONLY, ga(6)).unwrap(),
             ac_tr: self.dev.alloc_bo(&ac_kern, 1, FLAG_HOST_ONLY, ga(7)).unwrap(),
-            c4_c: self.dev.alloc_bo(&c4_kern, 1, FLAG_HOST_ONLY, gc4(5)).unwrap(),
-            c4_tmp: self.dev.alloc_bo(&c4_kern, 8, FLAG_HOST_ONLY, gc4(6)).unwrap(),
-            c4_tr: self.dev.alloc_bo(&c4_kern, 1, FLAG_HOST_ONLY, gc4(7)).unwrap(),
-            fc2_tmp: self.dev.alloc_bo(&fc2_kern, 8, FLAG_HOST_ONLY, gf2(6)).unwrap(),
-            fc2_tr: self.dev.alloc_bo(&fc2_kern, 1, FLAG_HOST_ONLY, gf2(7)).unwrap(),
+            deint_c: self.dev.alloc_bo(&deint_kern, 1, FLAG_HOST_ONLY, gd(5)).unwrap(),
+            deint_tmp: self.dev.alloc_bo(&deint_kern, 8, FLAG_HOST_ONLY, gd(6)).unwrap(),
+            deint_tr: self.dev.alloc_bo(&deint_kern, 1, FLAG_HOST_ONLY, gd(7)).unwrap(),
             ln_kern, ln_instr, ln_n, ac_kern, ac_instr, ac_n,
-            c4_kern, c4_instr, c4_n, fc2_kern, fc2_instr, fc2_n,
+            deint_kern, deint_instr, deint_n,
         });
         rl
     }
@@ -499,30 +484,38 @@ impl NpuMatmul {
         };
         let st1 = self.stream(DFF, self.modal);
         self.kern.run_matmul8(3, &st1.instr, st1.n_instr, &rl.bo_bf16, &w1, &st1.bo_c, &self.bo_tmp, &self.bo_tr).unwrap();
-        // cast@DFF: st1.bo_c (f32) -> rl.bo_fc1bf16 (bf16 [PAD_M,DFF]) -- device-side, no host round-trip
-        rl.c4_kern.run_matmul8(3, &rl.c4_instr, rl.c4_n, &st1.bo_c, &rl.bo_fc1bf16, &rl.c4_c, &rl.c4_tmp, &rl.c4_tr).unwrap();
-        // fc2: K=DFF matmul (identity epilogue), A=bo_fc1bf16, W2 -> rl.bo_fc2out (f32 [PAD_M,KRES])
-        let w2 = {
-            let c = self.wcache.borrow().get(id2).cloned();
-            c.unwrap_or_else(|| {
-                let w = make_w2();
-                assert_eq!(w.dim(), (DFF, KRES), "fc2 W2 dim");
-                self.weight_bo(id2, w.view())
-            })
+        // deinterleave+cast: st1.bo_c (f32 [PAD_M,DFF]) -> rl.bo_deint (bf16 [parts,PAD_M,KRES]
+        // chunk-major), device-side. One dispatch (chunk-major drain TAP). NOTE: this n-D output DMA
+        // HANGS ("run did not complete") when the deint is a co-resident hw-context alongside the
+        // modal (it works standalone) -- a multi-context n-D-DMA toolchain issue; see the debug note.
+        rl.deint_kern.run_matmul8(3, &rl.deint_instr, rl.deint_n, &st1.bo_c, &rl.bo_deint, &rl.deint_c, &rl.deint_tmp, &rl.deint_tr).unwrap();
+        self.stats.borrow_mut().dispatches += 2; // fc1 + deint
+        // fc2 K-split: each K=KRES chunk is a device SUB-BUFFER of bo_deint; K=KRES modal (identity),
+        // host-accumulate the `parts` partials in f32 -- bit-identical to the host K-split (WER-neutral).
+        let parts = DFF / KRES;
+        let chunk_bytes = PAD_M * KRES * 2;
+        let need_w2 = (0..parts).any(|c| !self.wcache.borrow().contains_key(&format!("{id2}.{c}")));
+        let w2 = if need_w2 {
+            let w = make_w2();
+            assert_eq!(w.dim(), (DFF, KRES), "fc2 W2 dim");
+            Some(w)
+        } else {
+            None
         };
-        rl.fc2_kern.run_matmul8(3, &rl.fc2_instr, rl.fc2_n, &rl.bo_fc1bf16, &w2, &rl.bo_fc2out, &rl.fc2_tmp, &rl.fc2_tr).unwrap();
-        self.stats.borrow_mut().dispatches += 3;
-        rl.bo_fc2out.sync_from_device().unwrap();
-        let mut cb = vec![0u8; m * KRES * 4];
-        rl.bo_fc2out.read_bytes(&mut cb).unwrap();
-        let mut out = Array2::<f32>::zeros((m, KRES));
-        for r in 0..m {
-            for c in 0..KRES {
-                let off = (r * KRES + c) * 4;
-                out[[r, c]] = f32::from_le_bytes([cb[off], cb[off + 1], cb[off + 2], cb[off + 3]]);
-            }
+        let mut acc = Array2::<f32>::zeros((m, KRES));
+        for c in 0..parts {
+            let chunk = rl.bo_deint.sub(c * chunk_bytes, chunk_bytes).unwrap();
+            let sid = format!("{id2}.{c}");
+            let w2c = {
+                let cc = self.wcache.borrow().get(&sid).cloned();
+                cc.unwrap_or_else(|| {
+                    let w = w2.as_ref().expect("w2 present on cache miss");
+                    self.weight_bo(&sid, w.slice(s![c * KRES..(c + 1) * KRES, ..]))
+                })
+            };
+            acc += &self.dispatch_with_a(&chunk, m, &w2c, KRES, false);
         }
-        out
+        acc
     }
 
     /// Per-N instruction stream. On the MODAL resident, `silu` picks the baked-RTP mode: the

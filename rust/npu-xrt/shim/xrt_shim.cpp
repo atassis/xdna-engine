@@ -89,6 +89,12 @@ static xrt::bo::flags to_flags(int f) {
 ShimBo* shim_bo_alloc(ShimDevice* d, ShimKernel* /*k*/, size_t nbytes, int flag, int group_id) {
   GUARD_PTR( return new ShimBo{ xrt::bo(d->dev, nbytes, to_flags(flag), group_id) }; )
 }
+// Sub-buffer view: a device-side [offset, offset+size) window of `parent`, sharing its memory
+// (XRT-native xrt::bo(parent, size, offset)). Lets a kernel read/write a slice of a larger BO with
+// no host round-trip -- e.g. a chunk of a chunk-major fc2 A buffer, or a KV-cache slice.
+ShimBo* shim_bo_subbuffer(ShimBo* parent, size_t size, size_t offset) {
+  GUARD_PTR( return new ShimBo{ xrt::bo(parent->bo, size, offset) }; )
+}
 void shim_bo_free(ShimBo* b) { delete b; }
 
 int shim_bo_write(ShimBo* b, const void* src, size_t nbytes, size_t offset) {
