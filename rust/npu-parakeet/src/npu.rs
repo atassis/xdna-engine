@@ -30,25 +30,31 @@ struct NStream {
     bo_c: Bo, // [PAD_M, n] f32
 }
 
-// Resident relpos-MHA block (STEP=8). One xclbin per encoder frame count T (the kernel bakes
-// RELPOS_T); loaded + cached per T from {root}/artifacts/relpos/T<T>/. TQ/KB match the build.
+// Resident relpos-MHA block (STEP=8, STEP-C runtime-t_active). ONE xclbin sized for the MAX
+// frame count RELPOS_BUILT_T serves ANY clip T <= it: the softmax reads t_active from an RTP
+// baked into the instruction stream at word RELPOS_TACTIVE_WORD, so per clip we PATCH that one
+// word of a template insts (zero build) and pad k/p/V to RELPOS_BUILT_T. Loaded once, resident.
 const RELPOS_TQ: usize = 8;
 const RELPOS_KB: usize = 43;
-const RELPOS_DK: usize = 128; // Parakeet head_dim (kernel bakes DK=128)
+const RELPOS_DK: usize = 128;   // Parakeet head_dim (kernel bakes DK=128)
+const RELPOS_BUILT_T: usize = 172; // baked buffer/dataflow size of the single xclbin
+const RELPOS_TACTIVE_WORD: usize = 8; // insts word holding t_active (verified device-side)
 
-/// A loaded per-T resident relpos block: its own xclbin/kernel, instr stream, and reusable
-/// QUV/KPV/CTX BOs sized for this T. Dispatched per head via run_dwconv6(3, instr, n, quv, kpv, ctx).
+/// The single resident relpos block (built at RELPOS_BUILT_T). BOs are sized for BUILT_T; per
+/// dispatch we patch the instr template's t_active word and pad data to BUILT_T. Dispatched per
+/// head via run_dwconv6(3, instr, n, quv, kpv, ctx).
 struct RelposK {
     kern: Rc<Kernel>,
-    instr: Bo,
+    instr_template: Vec<u32>, // insts as u32 words; word[RELPOS_TACTIVE_WORD] = t_active (patched)
     n_instr: usize,
+    bo_instr: Bo,
     bo_quv: Bo,
     bo_kpv: Bo,
     bo_ctx: Bo,
-    n_qt: usize,   // ceil(T/TQ)
-    tp: usize,     // n_kb*KB (k/V padded rows)
-    pp: usize,     // n_pb*KB (p padded rows)
-    ctx_rows: usize, // n_qt*TQ (CTX readback rows, take [:T])
+    n_qt: usize,     // ceil(BUILT_T/TQ)
+    tp: usize,       // k/V padded rows (n_kb*KB for BUILT_T)
+    pp: usize,       // p padded rows (n_pb*KB for BUILT_T)
+    ctx_rows: usize, // n_qt*TQ (CTX readback rows, take [:active_t])
 }
 
 #[derive(Default)]
@@ -160,53 +166,59 @@ impl NpuMatmul {
         }
     }
 
-    /// Load (and cache) the resident relpos block for encoder frame count `t`. The xclbin bakes
-    /// RELPOS_T, so there is one per T under {root}/artifacts/relpos/T<t>/ (pre-build with
-    /// scripts/relpos_prebuild.sh). Panics with a build hint if the artifacts are missing.
-    fn relpos_kern(&self, t: usize) -> Rc<RelposK> {
-        if let Some(k) = self.relpos.borrow().get(&t) {
+    /// Load (once) the SINGLE resident relpos block built at RELPOS_BUILT_T. Reads the xclbin +
+    /// template insts from {root}/artifacts/relpos/single/ (pre-build: scripts/relpos_prebuild.sh).
+    /// The same xclbin serves any clip T <= BUILT_T; per dispatch we patch the insts t_active word.
+    fn relpos_block(&self) -> Rc<RelposK> {
+        if let Some(k) = self.relpos.borrow().get(&RELPOS_BUILT_T) {
             return k.clone();
         }
-        let p = 2 * t - 1;
+        let bt = RELPOS_BUILT_T;
+        let p = 2 * bt - 1;
         let cdiv = |a: usize, b: usize| (a + b - 1) / b;
-        let n_qt = cdiv(t, RELPOS_TQ);
-        let tp = cdiv(t, RELPOS_KB) * RELPOS_KB;
+        let n_qt = cdiv(bt, RELPOS_TQ);
+        let tp = cdiv(bt, RELPOS_KB) * RELPOS_KB;
         let pp = cdiv(p, RELPOS_KB) * RELPOS_KB;
         let ctx_rows = n_qt * RELPOS_TQ;
-        let dir = self.relpos_dir.join(format!("T{t}"));
+        let dir = self.relpos_dir.join("single");
         let xclbin = dir.join("final.xclbin");
         let insts = dir.join("insts.bin");
         let kern = self
             .dev
             .load_kernel(xclbin.to_str().unwrap(), None)
-            .unwrap_or_else(|e| panic!("load relpos T={t} ({}): {e:?}\n  pre-build: scripts/relpos_prebuild.sh {t}", xclbin.display()));
+            .unwrap_or_else(|e| panic!("load relpos single ({}): {e:?}\n  pre-build: scripts/relpos_prebuild.sh", xclbin.display()));
         let ib = std::fs::read(&insts).unwrap_or_else(|e| panic!("read {}: {e}", insts.display()));
-        let n_instr = ib.len() / 4;
+        let instr_template: Vec<u32> = ib
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let n_instr = instr_template.len();
         let g = |i| kern.group_id(i).unwrap();
-        let instr = self.dev.alloc_bo(&kern, ib.len(), FLAG_CACHEABLE, g(1)).unwrap();
-        instr.write_bytes(&ib).unwrap();
-        instr.sync_to_device().unwrap();
+        let bo_instr = self.dev.alloc_bo(&kern, ib.len(), FLAG_CACHEABLE, g(1)).unwrap();
         let bo_quv = self.dev.alloc_bo(&kern, 2 * n_qt * RELPOS_TQ * RELPOS_DK * 2, FLAG_HOST_ONLY, g(3)).unwrap();
         let bo_kpv = self.dev.alloc_bo(&kern, (tp + pp + tp) * RELPOS_DK * 2, FLAG_HOST_ONLY, g(4)).unwrap();
         let bo_ctx = self.dev.alloc_bo(&kern, ctx_rows * RELPOS_DK * 2, FLAG_HOST_ONLY, g(5)).unwrap();
-        let rk = Rc::new(RelposK { kern, instr, n_instr, bo_quv, bo_kpv, bo_ctx, n_qt, tp, pp, ctx_rows });
-        self.relpos.borrow_mut().insert(t, rk.clone());
+        let rk = Rc::new(RelposK { kern, instr_template, n_instr, bo_instr, bo_quv, bo_kpv, bo_ctx, n_qt, tp, pp, ctx_rows });
+        self.relpos.borrow_mut().insert(RELPOS_BUILT_T, rk.clone());
         rk
     }
 
     /// Resident relpos-MHA block for ONE head. qu/qv/k [t,DK], p [2t-1,DK], v [t,DK] (f32) ->
-    /// ctx [t,DK] (f32). Packs the STEP=8 stream layout (tile-interleaved QUV, padded KPV),
-    /// dispatches via the 3-BO ABI, unpacks the bf16 CTX. Mirrors run_npu_relpos_rowtiled.py.
+    /// ctx [t,DK] (f32), t <= RELPOS_BUILT_T. STEP-C: pad the stream layout to BUILT_T, PATCH the
+    /// insts t_active word to `t`, dispatch the single resident block (3-BO ABI), unpack bf16 CTX.
     pub fn relpos_mha(&self, qu: &Array2<f32>, qv: &Array2<f32>, k: &Array2<f32>, p: &Array2<f32>, v: &Array2<f32>) -> Array2<f32> {
         let t = qu.nrows();
-        let rk = self.relpos_kern(t);
+        assert!(t <= RELPOS_BUILT_T, "clip T={t} exceeds relpos BUILT_T={RELPOS_BUILT_T}");
+        let rk = self.relpos_block();
+        // QUV tile-interleaved over the BUILT_T tiles; real rows only where q0 < t (rest zero pad).
         let mut quv = Vec::<f32>::with_capacity(2 * rk.n_qt * RELPOS_TQ * RELPOS_DK);
         for q in 0..rk.n_qt {
             let q0 = q * RELPOS_TQ;
-            let take = RELPOS_TQ.min(t - q0);
+            let take = RELPOS_TQ.min(t.saturating_sub(q0));
             push_pad_rows(&mut quv, qu, q0, take, RELPOS_TQ);
             push_pad_rows(&mut quv, qv, q0, take, RELPOS_TQ);
         }
+        // KPV = k(pad tp) | p(pad pp) | V(pad tp); pad rows are zero so ctx ignores pad keys.
         let mut kpv = Vec::<f32>::with_capacity((rk.tp + rk.pp + rk.tp) * RELPOS_DK);
         push_pad_rows(&mut kpv, k, 0, t, rk.tp);
         push_pad_rows(&mut kpv, p, 0, p.nrows(), rk.pp);
@@ -216,11 +228,17 @@ impl NpuMatmul {
         npu_xrt::pack_f32_to_bf16(&quv, &mut qb);
         npu_xrt::pack_f32_to_bf16(&kpv, &mut kb);
         let t0 = Instant::now();
+        // STEP-C: patch the instruction stream's t_active word to this clip's T, then upload.
+        let mut insts = rk.instr_template.clone();
+        insts[RELPOS_TACTIVE_WORD] = t as u32;
+        let instr_bytes: Vec<u8> = insts.iter().flat_map(|w| w.to_le_bytes()).collect();
+        rk.bo_instr.write_bytes(&instr_bytes).unwrap();
+        rk.bo_instr.sync_to_device().unwrap();
         rk.bo_quv.write_bytes(u16_bytes(&qb)).unwrap();
         rk.bo_quv.sync_to_device().unwrap();
         rk.bo_kpv.write_bytes(u16_bytes(&kb)).unwrap();
         rk.bo_kpv.sync_to_device().unwrap();
-        rk.kern.run_dwconv6(3, &rk.instr, rk.n_instr, &rk.bo_quv, &rk.bo_kpv, &rk.bo_ctx).unwrap();
+        rk.kern.run_dwconv6(3, &rk.bo_instr, rk.n_instr, &rk.bo_quv, &rk.bo_kpv, &rk.bo_ctx).unwrap();
         rk.bo_ctx.sync_from_device().unwrap();
         {
             let mut s = self.stats.borrow_mut();
