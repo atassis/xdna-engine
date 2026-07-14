@@ -101,6 +101,27 @@ impl FastConformerEncoder {
 
     fn feed_forward(&self, x: &Array2<f32>, b: &BlockWeights, blk: usize, tag: &str, norm_w: &str, norm_b: &str, l1: &str, l2: &str) -> Array2<f32> {
         let stage: &'static str = if tag == "ff1" { "ff1" } else { "ff2" };
+        // RESIDENT FF1 seam (opt-in PARAKEET_RESIDENT_FF=1, modal resident): LN + fc1 + SiLU run
+        // FULLY on-NPU device-side (ctxLN -> affine_cast(gamma,beta) -> modal fc1 on-chip silu), the
+        // activation stream never touching host across LN->fc1. Returns silu(affine_LN(x)@W1); fc2
+        // stays on the existing host-fed path for now (the next frontier step is fc1->fc2).
+        #[cfg(feature = "npu")]
+        if std::env::var("PARAKEET_RESIDENT_FF").is_ok() {
+            if let Some(npu) = &self.npu {
+                if npu.modal() {
+                    let gamma = b.v(norm_w);
+                    let beta = b.v(norm_b);
+                    prof::phase::set_stage(stage);
+                    let h = {
+                        let _h = PhaseScope::new("ff_resident", Bucket::Npu);
+                        npu.resident_ff1_fc1(x, gamma.as_slice().unwrap(), beta.as_slice().unwrap(),
+                            || b.m(l1), &format!("{blk}.{tag}.l1"), self.cfg.ff)
+                    };
+                    prof::phase::set_stage(stage);
+                    return self.mm_lazy(&h, || { let _wp = PhaseScope::new("ff_wprep", Bucket::Marshal); b.m(l2) }, &format!("{blk}.{tag}.l2"));
+                }
+            }
+        }
         let n = {
             let _h = PhaseScope::new("ln", Bucket::Host);
             layernorm(x, &b.v(norm_w), &b.v(norm_b))
