@@ -97,27 +97,29 @@ pub struct NpuMatmul {
     pub stats: RefCell<NpuStats>,
 }
 
-/// Co-resident on-chip LayerNorm (normalize-only, f32) + f32->bf16 cast, chained device-side
+/// Co-resident on-chip LayerNorm (normalize-only, f32) + AFFINE cast, chained device-side
 /// (resident-rails LN->fc1 seam). x[512,1024] f32 -> ctxLN -> bo_ln[512,1024] f32 (device) ->
-/// cast -> bo_bf16[512,1024] bf16 (device), the modal fc1's A input -- no host round-trip on the
-/// intermediate (feasibility: scripts/prototype_ln_cast_resident.py). Built at PAD_M x KRES.
+/// affine_cast(*gamma+beta) -> bo_bf16[512,1024] bf16 (device) = affine_LN(x), the modal fc1's A
+/// input -- no host round-trip on the intermediate (feasibility: prototype_ln_cast_resident.py).
+/// The affine folds into the cast so fc1 uses the EXISTING modalsilu xclbin (on-chip SiLU) with the
+/// UNMODIFIED weight. gamma|beta packed in bo_gb[2*KRES] on ONE DMA channel. Built at PAD_M x KRES.
 struct ResidentLn {
     ln_kern: Rc<Kernel>,
     ln_instr: Bo,
     ln_n: usize,
-    cast_kern: Rc<Kernel>,
-    cast_instr: Bo,
-    cast_n: usize,
+    ac_kern: Rc<Kernel>, // affine_cast
+    ac_instr: Bo,
+    ac_n: usize,
     bo_x: Bo,    // [PAD_M, KRES] f32   (ctxLN input,  ln g3)
-    bo_ln: Bo,   // [PAD_M, KRES] f32   (ctxLN output = cast input, ln g4)
-    bo_bf16: Bo, // [PAD_M, KRES] bf16  (cast output = modal fc1 A, cast g4)
-    // per-kernel dummy placeholders (g5/g6/g7; 0-size segfaults)
+    bo_ln: Bo,   // [PAD_M, KRES] f32   (ctxLN output = affine_cast input, ln g4 / ac g3)
+    bo_gb: Bo,   // [2*KRES] f32        (gamma|beta params, ac g4)
+    bo_bf16: Bo, // [PAD_M, KRES] bf16  (affine_cast output = modal fc1 A, ac g5)
+    // per-kernel dummy placeholders (0-size segfaults)
     ln_c: Bo,
     ln_tmp: Bo,
     ln_tr: Bo,
-    cast_c: Bo,
-    cast_tmp: Bo,
-    cast_tr: Bo,
+    ac_tmp: Bo,
+    ac_tr: Bo,
 }
 
 impl NpuMatmul {
@@ -306,42 +308,51 @@ impl NpuMatmul {
             (kern, bo, n)
         };
         let (ln_kern, ln_instr, ln_n) = load("ctxln");
-        let (cast_kern, cast_instr, cast_n) = load("cast");
+        let (ac_kern, ac_instr, ac_n) = load("affcast");
         let gl = |i| ln_kern.group_id(i).unwrap();
-        let gc = |i| cast_kern.group_id(i).unwrap();
+        let ga = |i| ac_kern.group_id(i).unwrap();
         let rl = Rc::new(ResidentLn {
             bo_x: self.dev.alloc_bo(&ln_kern, PAD_M * KRES * 4, FLAG_HOST_ONLY, gl(3)).unwrap(),
             bo_ln: self.dev.alloc_bo(&ln_kern, PAD_M * KRES * 4, FLAG_HOST_ONLY, gl(4)).unwrap(),
-            bo_bf16: self.dev.alloc_bo(&cast_kern, PAD_M * KRES * 2, FLAG_HOST_ONLY, gc(4)).unwrap(),
+            bo_gb: self.dev.alloc_bo(&ac_kern, 2 * KRES * 4, FLAG_HOST_ONLY, ga(4)).unwrap(),
+            bo_bf16: self.dev.alloc_bo(&ac_kern, PAD_M * KRES * 2, FLAG_HOST_ONLY, ga(5)).unwrap(),
             ln_c: self.dev.alloc_bo(&ln_kern, 1, FLAG_HOST_ONLY, gl(5)).unwrap(),
             ln_tmp: self.dev.alloc_bo(&ln_kern, 8, FLAG_HOST_ONLY, gl(6)).unwrap(),
             ln_tr: self.dev.alloc_bo(&ln_kern, 1, FLAG_HOST_ONLY, gl(7)).unwrap(),
-            cast_c: self.dev.alloc_bo(&cast_kern, 1, FLAG_HOST_ONLY, gc(5)).unwrap(),
-            cast_tmp: self.dev.alloc_bo(&cast_kern, 8, FLAG_HOST_ONLY, gc(6)).unwrap(),
-            cast_tr: self.dev.alloc_bo(&cast_kern, 1, FLAG_HOST_ONLY, gc(7)).unwrap(),
-            ln_kern, ln_instr, ln_n, cast_kern, cast_instr, cast_n,
+            ac_tmp: self.dev.alloc_bo(&ac_kern, 8, FLAG_HOST_ONLY, ga(6)).unwrap(),
+            ac_tr: self.dev.alloc_bo(&ac_kern, 1, FLAG_HOST_ONLY, ga(7)).unwrap(),
+            ln_kern, ln_instr, ln_n, ac_kern, ac_instr, ac_n,
         });
         *self.resident_ln.borrow_mut() = Some(rl.clone());
         rl
     }
 
-    /// On-chip normalize-only LN then f32->bf16 cast, chained DEVICE-SIDE (the intermediate bo_ln
-    /// never touches host). Pads x[t,KRES] to [PAD_M,KRES]; returns the resident block whose bo_bf16
-    /// holds cast(LN(x)) ready as the modal fc1's A input.
-    fn ln_cast(&self, x: &Array2<f32>) -> Rc<ResidentLn> {
+    /// On-chip normalize-only LN then AFFINE cast (*gamma+beta), chained DEVICE-SIDE (the
+    /// intermediate bo_ln never touches host). Pads x[t,KRES] to [PAD_M,KRES]; gamma/beta [KRES]
+    /// packed into bo_gb. Returns the resident block whose bo_bf16 holds affine_LN(x) as bf16, ready
+    /// as the modal fc1's A input.
+    fn ln_affine_cast(&self, x: &Array2<f32>, gamma: &[f32], beta: &[f32]) -> Rc<ResidentLn> {
         let (t, d) = x.dim();
         assert_eq!(d, KRES, "resident LN needs D=KRES={KRES}");
         assert!(t <= PAD_M, "T={t} exceeds PAD_M={PAD_M}");
+        assert_eq!(gamma.len(), KRES);
+        assert_eq!(beta.len(), KRES);
         let rl = self.resident_ln();
         let x_std = x.as_standard_layout();
         let mut buf = vec![0f32; PAD_M * KRES];
         buf[..t * KRES].copy_from_slice(&x_std.as_slice().unwrap()[..t * KRES]);
         rl.bo_x.write_bytes(f32_bytes(&buf)).unwrap();
         rl.bo_x.sync_to_device().unwrap();
+        // gamma|beta packed on one channel
+        let mut gb = vec![0f32; 2 * KRES];
+        gb[..KRES].copy_from_slice(gamma);
+        gb[KRES..].copy_from_slice(beta);
+        rl.bo_gb.write_bytes(f32_bytes(&gb)).unwrap();
+        rl.bo_gb.sync_to_device().unwrap();
         // (1) ctxLN: bo_x -> bo_ln  (NO sync back -- stays device-resident)
         rl.ln_kern.run_matmul8(3, &rl.ln_instr, rl.ln_n, &rl.bo_x, &rl.bo_ln, &rl.ln_c, &rl.ln_tmp, &rl.ln_tr).unwrap();
-        // (2) cast: bo_ln -> bo_bf16  (device-side hand-off, no host round-trip)
-        rl.cast_kern.run_matmul8(3, &rl.cast_instr, rl.cast_n, &rl.bo_ln, &rl.bo_bf16, &rl.cast_c, &rl.cast_tmp, &rl.cast_tr).unwrap();
+        // (2) affine_cast: (bo_ln * gamma + beta) -> bo_bf16  (device-side, no host round-trip)
+        rl.ac_kern.run_matmul8(3, &rl.ac_instr, rl.ac_n, &rl.bo_ln, &rl.bo_gb, &rl.bo_bf16, &rl.ac_tmp, &rl.ac_tr).unwrap();
         self.stats.borrow_mut().dispatches += 2;
         rl
     }
@@ -365,24 +376,26 @@ impl NpuMatmul {
         out
     }
 
-    /// Resident FF1 fc1 (LN->fc1 seam, the first frontier advance): on-chip normalize-only LN + cast
-    /// (device-side) -> modal fc1 (identity epilogue) with the GAMMA-FOLDED weight. Returns raw
-    /// `norm(x) @ (diag(gamma).W1)` [t,n] f32; the caller adds the beta.W1 bias + SiLU (the affine is
-    /// folded into W1/bias exactly, validated in numpy). `id` keys the folded-weight BO cache.
-    pub fn resident_ff1_fc1<F: FnOnce() -> Array2<f32>>(&self, x: &Array2<f32>, make_w1f: F, id: &str, n: usize) -> Array2<f32> {
+    /// Resident FF1 fc1 (LN->fc1 seam, the first frontier advance): on-chip normalize-only LN +
+    /// AFFINE cast (device-side) -> modal fc1 with ON-CHIP SiLU and the UNMODIFIED weight W1.
+    /// Returns `silu(affine_LN(x) @ W1)` [t,n] f32 -- exactly the host feed_forward fc1 (bf16-class),
+    /// fully on-chip, no host reduction / bias / silu on this seam. `id` keys the W1 BO cache.
+    /// (On a non-modal resident the on-chip silu is absent; the caller must apply host silu -- use
+    /// [`Self::modal`] to branch, mirroring feed_forward.)
+    pub fn resident_ff1_fc1<F: FnOnce() -> Array2<f32>>(&self, x: &Array2<f32>, gamma: &[f32], beta: &[f32], make_w1: F, id: &str, n: usize) -> Array2<f32> {
         self.stats.borrow_mut().calls += 1;
         let m = x.nrows();
-        let rl = self.ln_cast(x);
+        let rl = self.ln_affine_cast(x, gamma, beta);
         let cached = self.wcache.borrow().get(id).cloned();
         let wbo = if let Some(bo) = cached {
             bo
         } else {
-            let w = make_w1f();
-            assert_eq!(w.nrows(), KRES, "folded W1 nrows {} != {KRES}", w.nrows());
-            assert_eq!(w.ncols(), n, "folded W1 ncols {} != {n}", w.ncols());
+            let w = make_w1();
+            assert_eq!(w.nrows(), KRES, "W1 nrows {} != {KRES}", w.nrows());
+            assert_eq!(w.ncols(), n, "W1 ncols {} != {n}", w.ncols());
             self.weight_bo(id, w.view())
         };
-        self.dispatch_with_a(&rl.bo_bf16, m, &wbo, n, false)
+        self.dispatch_with_a(&rl.bo_bf16, m, &wbo, n, self.modal)
     }
 
     /// Per-N instruction stream. On the MODAL resident, `silu` picks the baked-RTP mode: the

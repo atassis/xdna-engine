@@ -1,0 +1,32 @@
+##===- Makefile.affinecast -----------------------------------------------===##
+#
+# Device-side affine + f32->bf16 cast xclbin (resident-rails LN affine seam). Build:
+#   make -f Makefile.affinecast NPU2=1 rows=512 cols=1024 build/final_affcast_512x1024.xclbin
+# Produces final_affcast_${rows}x${cols}.xclbin + insts_affcast_${rows}x${cols}.txt.
+#
+srcdir := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
+include ${srcdir}/../../makefile-common
+VPATH := ${srcdir}/../../../aie_kernels/aie2p
+
+devicename ?= $(if $(filter 1,$(NPU2)),npu2,npu)
+rows ?= 512
+cols ?= 1024
+tag = affcast_${rows}x${cols}
+
+aie_py_src = affine_cast_iron.py
+
+all: build/final_${tag}.xclbin
+
+build/affine_cast.o: affine_cast.cc
+	mkdir -p ${@D}
+	cd ${@D} && ${PEANO_INSTALL_DIR}/bin/clang++ ${PEANOWRAP2P_FLAGS} -c $< -o ${@F}
+
+build/aie_${tag}.mlir: ${srcdir}/${aie_py_src}
+	mkdir -p ${@D}
+	python3 $< -d ${devicename} -r ${rows} -c ${cols} -t 0 > $@
+
+build/final_${tag}.xclbin: build/aie_${tag}.mlir build/affine_cast.o
+	mkdir -p ${@D}
+	cd ${@D} && aiecc --aie-generate-xclbin --aie-generate-npu-insts --no-compile-host \
+		--no-xchesscc --no-xbridge --peano ${PEANO_INSTALL_DIR} \
+		--xclbin-name=${@F} --npu-insts-name=insts_${tag}.txt aie_${tag}.mlir

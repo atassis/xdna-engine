@@ -78,6 +78,10 @@ cp "$RB/ctx_ln/Makefile.ctxln"       "$PE/ml/layernorm/Makefile.ctxln"
 cp "$RB/aie_kernels/cast_f32_bf16.cc" "$K/cast_f32_bf16.cc"
 cp "$RB/ctx_ln/cast_f32_bf16_iron.py" "$PE/ml/layernorm/cast_f32_bf16_iron.py"
 cp "$RB/ctx_ln/Makefile.cast"         "$PE/ml/layernorm/Makefile.cast"
+# device-side affine + f32->bf16 cast (resident-rails LN affine seam)
+cp "$RB/aie_kernels/affine_cast.cc"   "$K/affine_cast.cc"
+cp "$RB/ctx_ln/affine_cast_iron.py"   "$PE/ml/layernorm/affine_cast_iron.py"
+cp "$RB/ctx_ln/Makefile.affinecast"   "$PE/ml/layernorm/Makefile.affinecast"
 # mha_decode — on-chip single-query MHA for the Whisper decoder (M1 Task 0): kernel + design
 mkdir -p "$PE/ml/mha_decode"
 cp "$RB/mha_decode/mha_decode.cc"      "$K/mha_decode.cc"
