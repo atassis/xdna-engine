@@ -236,24 +236,34 @@ extern "C" void relpos_scores_softmax_bake(float *restrict AC,
 // DK is a compile-time multiple of VL (Parakeet = 128 = 8 VL), so the reduction
 // fully vectorizes with no ragged tail.
 // ---------------------------------------------------------------------------
+// General row-major score matmul: out[i,j] = dot(A row i, B row j), A is [T,DK],
+// B is [N,DK] (B^T implicit -- no transpose buffer, no strided load). N=T gives
+// AC=qu@k^T; N=P gives BD=qv@p^T (step 3). bf16*bf16 -> f32 accfloat, f32 out.
+static inline void relpos_dot_matmul(const bfloat16 *restrict A,
+                                     const bfloat16 *restrict B,
+                                     float *restrict out, int T, int N) {
+  static_assert(DK % VL == 0, "DK must be a multiple of the vector width");
+  for (int i = 0; i < T; i++) {
+    const bfloat16 *a_row = A + i * DK;
+    float *o_row = out + i * N;
+    for (int j = 0; j < N; j++) {
+      const bfloat16 *b_row = B + j * DK;
+      aie::accum<accfloat, VL> acc = aie::zeros<accfloat, VL>();
+      for (int d = 0; d < DK; d += VL) {
+        aie::vector<bfloat16, VL> av = aie::load_v<VL>(a_row + d);
+        aie::vector<bfloat16, VL> bv = aie::load_v<VL>(b_row + d);
+        acc = aie::mac(acc, av, bv); // bf16*bf16 accumulated in f32
+      }
+      o_row[j] = aie::reduce_add(acc.to_vector<float>());
+    }
+  }
+}
+
+// STEP-2 AC matmul: qu @ k^T -> [T,T]. Thin wrapper over the general dot-matmul.
 extern "C" void relpos_ac_matmul(bfloat16 *restrict qu, bfloat16 *restrict k,
                                  float *restrict AC, int32_t T) {
   event0();
-  static_assert(DK % VL == 0, "DK must be a multiple of the vector width");
-  for (int i = 0; i < T; i++) {
-    const bfloat16 *qu_row = qu + i * DK;
-    float *ac_row = AC + i * T;
-    for (int j = 0; j < T; j++) {
-      const bfloat16 *k_row = k + j * DK;
-      aie::accum<accfloat, VL> acc = aie::zeros<accfloat, VL>();
-      for (int d = 0; d < DK; d += VL) {
-        aie::vector<bfloat16, VL> qv = aie::load_v<VL>(qu_row + d);
-        aie::vector<bfloat16, VL> kv = aie::load_v<VL>(k_row + d);
-        acc = aie::mac(acc, qv, kv); // bf16*bf16 accumulated in f32
-      }
-      ac_row[j] = aie::reduce_add(acc.to_vector<float>());
-    }
-  }
+  relpos_dot_matmul(qu, k, AC, T, T);
   event1();
 }
 
@@ -291,4 +301,38 @@ extern "C" void relpos_ac_scores_softmax_bake(bfloat16 *restrict qk,
   bfloat16 *k = qk + T * DK; // [T, DK]
   relpos_ac_matmul(qu, k, g_ac, T);
   relpos_scores_softmax(g_ac, BD, probs, T, P, inv_scale);
+}
+
+// ---------------------------------------------------------------------------
+// STEP-3 COMPOSED ENTRY -- BOTH score matmuls resident. Adds BD = qv @ p^T on
+// chip (step 2 host-fed it), so AC and BD both live in L1 and the softmax brick
+// consumes both with NO host score buffer at all. The rel_shift is the strided
+// read INSIDE relpos_scores_softmax (BD + i*P + (T-1-i)), so the resident g_bd is
+// laid out [T,P] row-major exactly as the host BD was.
+//   qk  : [2*T, DK] bf16  PACKED (qu = qk[0:T], k = qk[T:2T])   -- input DMA ch 1
+//   qvp : [(T+P), DK] bf16 PACKED (qv = qvp[0:T], p = qvp[T:T+P]) -- input DMA ch 2
+//   probs: [T, T] bf16 out
+// Two packed inputs keep the core within the NPU2 2-input-DMA-channel budget (the
+// pos_bias adds qu=q+u / qv=q+v are folded host-side into the packed buffers).
+// g_ac[T*T] + g_bd[T*P] both resident f32 (T=32: 4KB + ~8KB). Single-tile, small-T.
+// ---------------------------------------------------------------------------
+extern "C" void relpos_qkp_scores_softmax_bake(bfloat16 *restrict qk,
+                                               bfloat16 *restrict qvp,
+                                               bfloat16 *restrict probs) {
+  constexpr int T = RELPOS_T;
+  constexpr int P = 2 * T - 1;
+  static_assert(DK == 128,
+                "baked inv_scale is 1/sqrt(128); regenerate for a different DK");
+  constexpr float inv_scale = 0.08838834764831843f; // 1/sqrt(128)
+
+  alignas(aie::vector_decl_align) static float g_ac[T * T];
+  alignas(aie::vector_decl_align) static float g_bd[T * P];
+
+  bfloat16 *qu = qk;          // [T, DK]
+  bfloat16 *k = qk + T * DK;  // [T, DK]
+  bfloat16 *qv = qvp;         // [T, DK]
+  bfloat16 *p = qvp + T * DK; // [P, DK]
+  relpos_dot_matmul(qu, k, g_ac, T, T); // AC = qu @ k^T  [T,T]
+  relpos_dot_matmul(qv, p, g_bd, T, P); // BD = qv @ p^T  [T,P]
+  relpos_scores_softmax(g_ac, g_bd, probs, T, P, inv_scale);
 }

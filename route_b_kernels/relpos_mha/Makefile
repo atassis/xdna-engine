@@ -24,7 +24,10 @@ T ?= 32
 # only the generated .mlir / xclbin differ. `make clean` when switching STEP (the
 # xclbin/insts names are fixed, so a stale build/ from the other step would linger).
 STEP ?= 1
-ifeq ($(STEP),2)
+ifeq ($(STEP),3)
+targetname = relpos_qkp_scores_softmax
+aie_py_src = relpos_qkp_scores_softmax_iron.py
+else ifeq ($(STEP),2)
 targetname = relpos_ac_scores_softmax
 aie_py_src = relpos_ac_scores_softmax_iron.py
 else
