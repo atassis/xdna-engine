@@ -140,6 +140,11 @@ struct ResidentLn {
 }
 
 const DFF: usize = 4096; // Parakeet FFN inner dim (fc1 N / fc2 K)
+// The resident K=DFF fc2 uses the SAME fast-bfp16 tile as fc1/host (weight_bo packs for THIS tiling;
+// the native 32x32x32 tile expects a different weight/A layout -> garbage, 100% WER). The K=DFF
+// bfp16 fc2 is bf16-class but still +0.4pp WER vs the host 4xK=1024 K-split (accumulation/bfp16-block
+// difference) -- so the full FFN stays OPT-IN until the fc2 matches the host K-split numerics.
+const FC2_TILE: &str = "64x32x128";
 
 impl NpuMatmul {
     pub fn open(root: &Path) -> Self {
@@ -321,7 +326,7 @@ impl NpuMatmul {
         });
         // full FFN also needs cast@DFF + the K=DFF fc2 resident
         let fc2ok = self.ln_dir.join(format!("final_cast_{PAD_M}x{DFF}.xclbin")).exists()
-            && self.ln_dir.join(format!("final_{PAD_M}x{DFF}x{KRES}_{}_8c_modalid.xclbin", self.tile)).exists();
+            && self.ln_dir.join(format!("final_{PAD_M}x{DFF}x{KRES}_{FC2_TILE}_8c_modalid.xclbin")).exists();
         let present = seam && fc2ok;
         let result = if present {
             Some(self.load_resident_ln())
@@ -364,8 +369,8 @@ impl NpuMatmul {
             self.ln_dir.join(format!("final_cast_{PAD_M}x{DFF}.xclbin")),
             self.ln_dir.join(format!("insts_cast_{PAD_M}x{DFF}.txt")));
         let (fc2_kern, fc2_instr, fc2_n) = load_path(
-            self.ln_dir.join(format!("final_{PAD_M}x{DFF}x{KRES}_{}_8c_modalid.xclbin", self.tile)),
-            self.ln_dir.join(format!("insts_{PAD_M}x{DFF}x{KRES}_{}_8c_modalid.txt", self.tile)));
+            self.ln_dir.join(format!("final_{PAD_M}x{DFF}x{KRES}_{FC2_TILE}_8c_modalid.xclbin")),
+            self.ln_dir.join(format!("insts_{PAD_M}x{DFF}x{KRES}_{FC2_TILE}_8c_modalid.txt")));
         let gl = |i| ln_kern.group_id(i).unwrap();
         let ga = |i| ac_kern.group_id(i).unwrap();
         let gc4 = |i| c4_kern.group_id(i).unwrap();
