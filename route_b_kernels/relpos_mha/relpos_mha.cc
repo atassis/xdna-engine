@@ -76,6 +76,16 @@ static constexpr int VL = 16;
 static constexpr int DK = RELPOS_DK;
 static_assert(DK % VL == 0, "DK must be a multiple of the vector width");
 
+// Encoder frame count T baked at build time for the STANDALONE step-1 kernel
+// (relpos_scores_softmax_bake below). Parakeet block 0 = 32 frames (P = 2T-1).
+// Single-tile design: AC[T,T]+BD[T,P]+probs[T,T] must fit L1, which caps this
+// standalone variant (T=32 uses ~14 KB; large T needs the row-tiled resident
+// block, not this de-risk kernel). Override with -DRELPOS_T at compile time to
+// match the IRON generator's -T.
+#ifndef RELPOS_T
+#define RELPOS_T 32
+#endif
+
 // ---------------------------------------------------------------------------
 // BRICK 1 -- broadcast pos_bias add.  q_in [T, DK] (row-major, one head) plus
 // bias [DK] -> q_out [T, DK].  Vectorized over DK; called twice/head (u, v).
@@ -181,4 +191,28 @@ extern "C" void relpos_scores_softmax(float *restrict AC, float *restrict BD,
     }
   }
   event1();
+}
+
+// ---------------------------------------------------------------------------
+// STEP-1 STANDALONE ENTRY -- zero-scalar-arg wrapper over relpos_scores_softmax
+// with T, P and inv_scale baked at build time. This is what the IRON generator
+// (relpos_scores_softmax_iron.py) declares as its core Kernel, so the (AC, BD,
+// probs) 3-buffer ABI carries no runtime scalars (mirrors dwconv1d_k9_bf16).
+// It proves the two hard rel-pos bricks -- the zero-arithmetic strided-relayout
+// rel_shift and the vectorized-exp2 softmax -- as one dataflow WITHOUT any matmul.
+//   AC   : [T, T] row-major f32
+//   BD   : [T, P] row-major f32   (P = 2T-1)
+//   probs: [T, T] row-major bf16  (softmax over keys of rel_shift(BD)+AC, scaled)
+// ---------------------------------------------------------------------------
+extern "C" void relpos_scores_softmax_bake(float *restrict AC,
+                                           float *restrict BD,
+                                           bfloat16 *restrict probs) {
+  constexpr int T = RELPOS_T;
+  constexpr int P = 2 * T - 1;
+  // inv_scale = 1/sqrt(DK). DK is compile-time (Parakeet = 128); the literal is
+  // guarded so a DK change is caught at build instead of silently mis-scaling.
+  static_assert(DK == 128,
+                "baked inv_scale is 1/sqrt(128); regenerate for a different DK");
+  constexpr float inv_scale = 0.08838834764831843f; // 1/sqrt(128)
+  relpos_scores_softmax(AC, BD, probs, T, P, inv_scale);
 }

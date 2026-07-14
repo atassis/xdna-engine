@@ -28,7 +28,16 @@ except Exception as e:  # pragma: no cover
     print("need ml_dtypes (use ~/npuvox-asr-bench/.venv):", e); sys.exit(2)
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-ENC = os.path.join(REPO, "artifacts", "parakeet", "encoder")
+# Encoder artifacts. Overridable via PARAKEET_ENC_DIR; if the local worktree copy
+# is absent (split-out worktrees do not carry the gitignored artifacts) fall back
+# to the sibling public checkout so this pure-numpy golden runs read-only anywhere.
+ENC = os.environ.get("PARAKEET_ENC_DIR",
+                     os.path.join(REPO, "artifacts", "parakeet", "encoder"))
+if not os.path.isdir(ENC):
+    _sib = os.path.join(os.path.dirname(REPO), "xdna-engine",
+                        "artifacts", "parakeet", "encoder")
+    if os.path.isdir(_sib):
+        ENC = _sib
 D, H, DK = 1024, 8, 128
 GATE = 0.08
 LOG2E = np.float32(1.4426950408889634)
@@ -91,6 +100,25 @@ def softmax_kernel(scores_row):  # f32 [T] -> bf16-modeled probs [T]
     inv = bf16(np.float32(1.0) / s)        # bf16 reciprocal
     return bf16(e * inv)                   # bf16 probs
 
+# STANDALONE step-1 brick: numpy MODEL of relpos_scores_softmax_bake(.cc). Given
+# AC[T,T] f32 and BD[T,P] f32 it reproduces the on-chip dataflow bit-for-bit at
+# the algorithm level: the strided rel_shift read (BD[i, (T-1)-i : (T-1)-i+T]),
+# scale by inv_scale, then the f32-max / bf16-exp2 / f32-sum / bf16-reciprocal
+# softmax with bf16 probs out. No matmul -- this is exactly what the xclbin runs.
+def relpos_scores_softmax_model(AC, BD, inv_scale):
+    T, P = AC.shape[0], BD.shape[1]
+    probs = np.zeros((T, T), np.float32)
+    for i in range(T):
+        base = (T - 1) - i                       # strided rel_shift window start
+        bd_row = BD[i, base:base + T]            # contiguous length-T read
+        scores = ((AC[i] + bd_row) * inv_scale).astype(np.float32)
+        m = scores.max()
+        e = np.exp2(((scores - m) * LOG2E).astype(np.float32)).astype(BF16).astype(np.float32)
+        s = e.sum(dtype=np.float32)              # f32 accumulate of bf16 exps
+        inv = bf16(np.float32(1.0) / s)          # bf16 reciprocal
+        probs[i] = bf16(e * inv)                 # bf16 probs
+    return probs
+
 def mhsa_kernel(x, blk, pos_enc):
     T = x.shape[0]
     Wq, Wk, Wv = (W(blk, f"self_attn.linear_{n}.weight") for n in ("q", "k", "v"))
@@ -145,7 +173,45 @@ def main():
     g3 = rel(kern, ref)
     print(f"G3  kernel bf16 model vs f32 host mhsa  : rel={g3:.3e}  GATE<= {GATE}  {'PASS' if g3 <= GATE else 'FAIL'}")
 
-    ok = (g1 < 1e-12) and (g2 < 1e-6) and (g3 <= GATE)
+    # G4: STANDALONE step-1 brick (relpos_scores_softmax_bake) in ISOLATION.
+    # Feed IDENTICAL f32 AC/BD to the on-chip model and to the host softmax, so
+    # this measures ONLY the two de-risked bricks (strided rel_shift + exp2
+    # softmax, bf16 probs) -- no matmul error folded in. Gate rel-L2 <= 0.08,
+    # reported per head and worst-case (this is exactly what the xclbin computes).
+    q = (x @ W(blk, "self_attn.linear_q.weight")).reshape(T, H, DK)
+    k = (x @ W(blk, "self_attn.linear_k.weight")).reshape(T, H, DK)
+    pm = (pos_enc @ W(blk, "self_attn.linear_pos.weight")).reshape(-1, H, DK)
+    u = W(blk, "self_attn.pos_bias_u"); vv = W(blk, "self_attn.pos_bias_v")
+    inv_scale = np.float32(1.0 / np.sqrt(DK))
+    def host_probs(ac, bd, scale):  # exact f32 softmax over keys of shifted+scaled
+        bd_sh = rel_shift_host(bd[None])[0]
+        hs = (ac + bd_sh) * scale
+        hs = hs - hs.max(-1, keepdims=True)
+        hp = np.exp(hs); hp /= hp.sum(-1, keepdims=True)
+        return hp
+
+    g4a_worst = 0.0   # real operating regime (block-0 scores saturate -> ~one-hot)
+    g4b_worst = 0.0   # rescaled: NON-degenerate softmax that exercises bf16 exp2
+    for h in range(H):
+        qu = (q[:, h] + u[h]).astype(np.float32)
+        qv = (q[:, h] + vv[h]).astype(np.float32)
+        ac = (qu @ k[:, h].T).astype(np.float32)                       # [T,T]
+        bd = (qv @ pm[:, h].T).astype(np.float32)                      # [T,P]
+        # G4a: real AC/BD as the xclbin receives them.
+        kp = relpos_scores_softmax_model(ac, bd, inv_scale)
+        g4a_worst = max(g4a_worst, rel(kp, host_probs(ac, bd, inv_scale)))
+        # G4b: rescale so post-scale scores have std ~1 (healthy softmax spread),
+        # preserving the REAL strided rel_shift structure -- this is what actually
+        # exercises the vectorized-exp2 / bf16-reciprocal softmax numerics.
+        bd_sh = rel_shift_host(bd[None])[0]
+        std = float(((ac + bd_sh) * inv_scale).std()) + 1e-6
+        rescale = np.float32(inv_scale / std)
+        kpb = relpos_scores_softmax_model(ac, bd, rescale)
+        g4b_worst = max(g4b_worst, rel(kpb, host_probs(ac, bd, rescale)))
+    print(f"G4a standalone brick, real regime       : rel={g4a_worst:.3e}  GATE<= {GATE}  {'PASS' if g4a_worst <= GATE else 'FAIL'}  (worst of {H} heads; scores saturate -> ~one-hot)")
+    print(f"G4b standalone brick, non-degenerate sm : rel={g4b_worst:.3e}  GATE<= {GATE}  {'PASS' if g4b_worst <= GATE else 'FAIL'}  (worst of {H} heads; exercises exp2 softmax)")
+
+    ok = (g1 < 1e-12) and (g2 < 1e-6) and (g3 <= GATE) and (g4a_worst <= GATE) and (g4b_worst <= GATE)
     print("\nRESULT:", "ALL PASS" if ok else "FAIL")
     sys.exit(0 if ok else 1)
 

@@ -18,7 +18,7 @@ MM=$PE/basic/matrix_multiplication
 K=$AIEROOT/aie_kernels/aie2p
 
 [ -d "$AIEROOT" ] || { echo "$AIEROOT not present — run scripts/setup_route_b.sh first" >&2; exit 1; }
-mkdir -p "$PE/ml/dwconv1d" "$PE/ml/softmax400" "$PE/ml/layernorm"
+mkdir -p "$PE/ml/dwconv1d" "$PE/ml/softmax400" "$PE/ml/layernorm" "$PE/ml/relpos_mha"
 
 # dwconv1d k=5 (docs/08) — last missing Conformer primitive
 cp "$RB/dwconv1d/dwconv1d.cc" "$K/dwconv1d.cc"
@@ -29,6 +29,11 @@ cp "$RB/aie_kernels/mm_silu_epilogue.cc" "$K/mm_silu_epilogue.cc"
 # softmax-400 (pad->416) example
 cp "$RB/softmax400/softmax400.py" "$PE/ml/softmax400/softmax400.py"
 cp "$RB/softmax400/Makefile"      "$PE/ml/softmax400/Makefile"
+# relpos MHA scores->softmax STANDALONE step-1 kernel (rel_shift strided-read +
+# vectorized-exp2 softmax, no matmul) -- de-risks the two hard rel-pos bricks.
+cp "$RB/relpos_mha/relpos_mha.cc"                    "$K/relpos_mha.cc"
+cp "$RB/relpos_mha/relpos_scores_softmax_iron.py"    "$PE/ml/relpos_mha/relpos_scores_softmax_iron.py"
+cp "$RB/relpos_mha/Makefile"                         "$PE/ml/relpos_mha/Makefile"
 # plain resident whole_array matmul (no epilogue) -- MLIR-emitting generator +
 # Makefile.resident (route_b_override .txt-insts + WA_C_DEPTH flow) for the Parakeet
 # resident encoder tiles and the thin-M decode GEMV (build_parakeet/decode_kernels.sh).
