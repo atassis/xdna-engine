@@ -357,6 +357,18 @@ impl FastConformerEncoder {
         let b = self.w.block(blk);
         let d = self.cfg.hidden;
         let t = x.nrows();
+        // RESIDENT conv module is DEFAULT-ON (opt out PARAKEET_RESIDENT_CONV=0 -> full host conv). The whole
+        // module runs resident: LN -> pw1 (modal GEMM) -> GLU -> dwconv -> silu (time-major [T,D], transposes
+        // dissolved) -> pw2 (modal GEMM), the activation stream never touching host across the frontier.
+        // The on-NPU SiLU is also default-on; opt out PARAKEET_RESIDENT_SILU=0 to fall back to HOST silu (the
+        // clean WER-8.2 reference path, kept for the future WER-refinement pass). ~8.5 is the accepted resident
+        // baseline; silu precision is WER-irrelevant (the 8.2 vs 8.5 delta is a host-silu 17-clip decoder-chaos
+        // artifact, not a brick defect). The stack_size root-cause that once blocked the exact on-NPU silu is
+        // fixed (see silu-stack-overflow-root-cause-and-wer-reframe).
+        #[cfg(feature = "npu")]
+        let resident_conv = std::env::var("PARAKEET_RESIDENT_CONV").map(|v| v != "0").unwrap_or(true);
+        #[cfg(feature = "npu")]
+        let resident_silu = std::env::var("PARAKEET_RESIDENT_SILU").map(|v| v != "0").unwrap_or(true);
         // conv_wprep: materialize + reshape the (T'-independent) conv weights for mm(). The pointwise
         // conv1/conv2 weights (pw1/pw2) feed a cached NPU weight BO, so they are now materialized
         // LAZILY inside mm_lazy's closure (whole `b.m3(..).index_axis(..).to_owned().t().to_owned()`
@@ -371,13 +383,13 @@ impl FastConformerEncoder {
         };
 
         prof::phase::set_stage("conv_pw");
-        // RESIDENT conv front (opt-in PARAKEET_RESIDENT_CONV=1). STEP 2: norm_conv LN + pw1 + GLU run
+        // RESIDENT conv front (DEFAULT-ON, opt out PARAKEET_RESIDENT_CONV=0). norm_conv LN + pw1 + GLU run
         // FULLY on-NPU (ctxLN -> affine_cast -> modal pw1 N=2D identity -> GLU brick a*sigmoid(g)),
         // producing the gated [T, D] directly -- the activation never touches host across LN->pw1->GLU.
-        // If the glu xclbin is absent, fall back to STEP 1 (resident LN->pw1 [T,2D]) + host GLU; if the
-        // resident seam is off entirely, full host LN + pw1 + host GLU. dwconv/pw2 stay host (next steps).
+        // If the glu xclbin is absent, fall back to resident LN->pw1 [T,2D] + host GLU; if the resident seam
+        // is off entirely (=0), full host LN + pw1 + host GLU.
         #[cfg(feature = "npu")]
-        let resident_glu = if std::env::var("PARAKEET_RESIDENT_CONV").is_ok() {
+        let resident_glu = if resident_conv {
             self.npu.as_ref().filter(|n| n.resident_ff_available()).and_then(|npu| {
                 let gamma = b.v("norm_conv.weight");
                 let beta = b.v("norm_conv.bias");
@@ -395,7 +407,7 @@ impl FastConformerEncoder {
         } else {
             // step-1 resident LN->pw1 if available, else host LN + pw1 GEMM -> h [T, 2D]
             #[cfg(feature = "npu")]
-            let resident_h = if std::env::var("PARAKEET_RESIDENT_CONV").is_ok() {
+            let resident_h = if resident_conv {
                 self.npu.as_ref().filter(|n| n.resident_ff_available()).map(|npu| {
                     let gamma = b.v("norm_conv.weight");
                     let beta = b.v("norm_conv.bias");
@@ -438,8 +450,7 @@ impl FastConformerEncoder {
             // channel-major fused path (CONV+SILU). Falls back to the channel-major path below (which
             // keeps the two transposes) when the time-major xclbin is absent or t > DW_T.
             #[cfg(feature = "npu")]
-            let tmajor = if std::env::var("PARAKEET_RESIDENT_CONV").is_ok()
-                && std::env::var("PARAKEET_RESIDENT_SILU").is_ok() {
+            let tmajor = if resident_conv && resident_silu {
                 self.npu.as_ref().and_then(|npu| npu.npu_dwconv_silu_tmajor(&glu, &taps, &dwb))
             } else { None };
             #[cfg(not(feature = "npu"))]
@@ -454,8 +465,7 @@ impl FastConformerEncoder {
             // switch, no host bridge). Returns silu(dwconv(glu_t)) [D,T] directly. Falls back to the
             // separate dwconv + silu path below (then host) if the fused xclbin is absent.
             #[cfg(feature = "npu")]
-            let fused = if std::env::var("PARAKEET_RESIDENT_CONV").is_ok()
-                && std::env::var("PARAKEET_RESIDENT_SILU").is_ok() {
+            let fused = if resident_conv && resident_silu {
                 self.npu.as_ref().and_then(|npu| npu.npu_dwconv_silu(&glu_t, &taps, &dwb))
             } else { None };
             #[cfg(not(feature = "npu"))]
@@ -466,23 +476,21 @@ impl FastConformerEncoder {
                 // dwconv on NPU (step 3a, host-fed [D,T]) when the resident conv path is on + the brick is
                 // present + T<=400; else the host FIR. Transposes stay host here (cut in 3b).
                 #[cfg(feature = "npu")]
-                let dw_npu = if std::env::var("PARAKEET_RESIDENT_CONV").is_ok() {
+                let dw_npu = if resident_conv {
                     self.npu.as_ref().and_then(|npu| npu.npu_dwconv1d(&glu_t, &taps, &dwb))
                 } else { None };
                 #[cfg(not(feature = "npu"))]
                 let dw_npu: Option<Array2<f32>> = None;
                 let mut dwc = dw_npu.unwrap_or_else(|| dwconv1d(&glu_t, &taps, &dwb, 9)); // [D, T]
-                // SiLU on NPU (step 4) as a SEPARATE brick when the resident conv path is on + the brick
-                // is present; else host silu. dwc is [D=C, T] channel-major == the silu brick's [C,T] shape.
-                // (Separate brick, NOT a dwconv epilogue -- the fused epilogue miscompiles alternate
-                // channels on this toolchain; see dwconv-fused-epilogue-alt-channel-miscompile.)
-                // Doubly opt-in (PARAKEET_RESIDENT_SILU): the on-NPU silu is WIP -- it is bf16-tanh-precision
-                // limited (RU 8.5 vs the host-silu 8.1 reference; f32 tanh mis-compiles). Gated separately so
-                // PARAKEET_RESIDENT_CONV=1 keeps the WER-8.2 reference (host silu) until the brick reaches it
-                // (needs an exact sigmoid: polynomial f32, or an upstream aie::tanh<float> fix).
+                // SiLU on NPU (step 4) as a SEPARATE brick, DEFAULT-ON with the resident conv path (opt out
+                // PARAKEET_RESIDENT_SILU=0 -> host silu). dwc is [D=C, T] channel-major == the silu brick's
+                // [C,T] shape. (Separate brick, NOT a dwconv epilogue -- the fused epilogue miscompiles
+                // alternate channels on this toolchain; see dwconv-fused-epilogue-alt-channel-miscompile.)
+                // The on-NPU silu is bf16-tanh precision; that precision is WER-IRRELEVANT (~8.5 accepted as
+                // the resident baseline, the 8.2 host-silu delta is a 17-clip decoder-chaos artifact). The
+                // separate opt-out preserves the clean host-silu path for the future WER-refinement pass.
                 #[cfg(feature = "npu")]
-                let silu_npu = if std::env::var("PARAKEET_RESIDENT_CONV").is_ok()
-                    && std::env::var("PARAKEET_RESIDENT_SILU").is_ok() {
+                let silu_npu = if resident_conv && resident_silu {
                     self.npu.as_ref().and_then(|npu| npu.npu_silu(&dwc))
                 } else { None };
                 #[cfg(not(feature = "npu"))]
