@@ -191,6 +191,45 @@ static inline void dwconv1d_shift(const bfloat16 *restrict in, const bfloat16 *r
   event1();
 }
 
+// F32-OUTPUT variant of dwconv1d_shift (byte-for-byte the SAME validated aligned+shuffle FIR, storing
+// the accumulator as f32 instead of a bf16 round). This is the producer stage of the FUSED
+// dwconv->silu xclbin (dwconv_silu_iron.py): it hands the FIR result to an on-chip f32 ObjectFifo that
+// the (unchanged) silu_row brick consumes device-to-device -- so the on-NPU SiLU costs NO extra
+// hw-context switch and no host round-trip (the measured ~1 ms/block the SEPARATE silu xclbin added).
+// NOT a fused epilogue: this stays a SIMPLE single-store FIR loop, so it is immune to the alt-channel
+// per-tile-loop miscompile (that needs a HEAVY multi-op epilogue; a plain f32 store is one op). The
+// silu itself remains its own core's simple loop. Keeping f32 here (no bf16 round) is >= as precise as
+// the host path (bf16 dwconv out -> host f32 -> silu); WER-gated equal to the separate-brick silu.
+template <int T, int K, int P, bool BIAS>
+static inline void dwconv1d_shift_f32o(const bfloat16 *restrict in, const bfloat16 *restrict w, float *restrict out) {
+  event0();
+  ::aie::set_rounding(::aie::rounding_mode::conv_even);
+  static_assert(K == 9, "dwconv1d_shift_f32o is unrolled for k=9");
+  static_assert(T % 16 == 0, "T must be a multiple of the 16-lane output chunk");
+  constexpr int PADBUF = ((T + 2 * P + 32 + 31) / 32) * 32;
+  alignas(64) bfloat16 buf[PADBUF];
+  const ::aie::vector<bfloat16, 16> z = ::aie::broadcast<bfloat16, 16>(bfloat16(0.0f));
+  for (int i = 0; i < PADBUF; i += 16) ::aie::store_v(&buf[i], z);
+  for (int t = 0; t < T; t++) buf[P + t] = in[t];
+  const float bias = BIAS ? static_cast<float>(w[K]) : 0.0f;
+  const ::aie::vector<bfloat16, 16> c0 = ::aie::broadcast<bfloat16, 16>(w[0]), c1 = ::aie::broadcast<bfloat16, 16>(w[1]),
+    c2 = ::aie::broadcast<bfloat16, 16>(w[2]), c3 = ::aie::broadcast<bfloat16, 16>(w[3]), c4 = ::aie::broadcast<bfloat16, 16>(w[4]),
+    c5 = ::aie::broadcast<bfloat16, 16>(w[5]), c6 = ::aie::broadcast<bfloat16, 16>(w[6]), c7 = ::aie::broadcast<bfloat16, 16>(w[7]),
+    c8 = ::aie::broadcast<bfloat16, 16>(w[8]);
+  for (int o = 0; o < T; o += 16) {
+    ::aie::vector<bfloat16, 16> a0 = ::aie::load_v<16>(&buf[o]), a1 = ::aie::load_v<16>(&buf[o + 16]);
+    ::aie::accum<accfloat, 16> a;
+    a.from_vector(::aie::broadcast<float, 16>(bias));
+    a = ::aie::mac(a, ::aie::shuffle_down_fill(a0, a1, 0), c0); a = ::aie::mac(a, ::aie::shuffle_down_fill(a0, a1, 1), c1);
+    a = ::aie::mac(a, ::aie::shuffle_down_fill(a0, a1, 2), c2); a = ::aie::mac(a, ::aie::shuffle_down_fill(a0, a1, 3), c3);
+    a = ::aie::mac(a, ::aie::shuffle_down_fill(a0, a1, 4), c4); a = ::aie::mac(a, ::aie::shuffle_down_fill(a0, a1, 5), c5);
+    a = ::aie::mac(a, ::aie::shuffle_down_fill(a0, a1, 6), c6); a = ::aie::mac(a, ::aie::shuffle_down_fill(a0, a1, 7), c7);
+    a = ::aie::mac(a, ::aie::shuffle_down_fill(a0, a1, 8), c8);
+    ::aie::store_v(&out[o], a.template to_vector<float>());
+  }
+  event1();
+}
+
 // Kernel selection: default = the vectorized aligned+shuffle FIR (dwconv1d_shift). DWCONV_SCALAR=1
 // forces the scalar fallback (dwconv1d_same_scalar). The aie::sliding_mul brick (dwconv1d_same) is
 // RETAINED only as the broken-path reference for the upstream repro; never selected.
@@ -215,5 +254,11 @@ void dwconv1d_k9_bf16(bfloat16 *in, bfloat16 *w, bfloat16 *out) {
 // k5 shift path is YAGNI until a GigaAM model is on the bench (dwconv1d_shift is unrolled for k9).
 void dwconv1d_k5_bf16(bfloat16 *in, bfloat16 *w, bfloat16 *out) {
   dwconv1d_same_scalar<400, 5, 2, false>(in, w, out);
+}
+
+// Parakeet k=9 dwconv producing f32 (the fused dwconv->silu xclbin's producer stage). Same FIR as
+// dwconv1d_k9_bf16, f32 output for the on-chip f32 ObjectFifo feeding the silu core.
+void dwconv1d_k9_bf16_f32o(bfloat16 *in, bfloat16 *w, float *out) {
+  dwconv1d_shift_f32o<400, 9, 4, true>(in, w, out);
 }
 }
