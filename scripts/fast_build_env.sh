@@ -21,7 +21,8 @@
 # =============================================================================
 
 # ---- 0. locate ccache (system first, then the user-local static binary) -----
-_fb_cache_home="${XDG_CACHE_HOME:-$HOME/.cache}/xdna2-build"
+. "$(dirname "${BASH_SOURCE[0]}")/cache_env.sh"   # -> XDNA_CACHE (in-workspace build cache)
+_fb_cache_home="$XDNA_CACHE"
 if command -v ccache >/dev/null 2>&1; then
   FB_CCACHE="$(command -v ccache)"
 elif [ -x "$_fb_cache_home/bin/ccache" ]; then
