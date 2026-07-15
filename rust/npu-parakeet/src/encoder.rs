@@ -433,10 +433,18 @@ impl FastConformerEncoder {
         // with no mm() inside, so they fold into the conv_dwconv Host leaf scope.
         let back = prof::time("dwconv", || {
             let _h = PhaseScope::new("conv_dwconv", Bucket::Host);
-            let glu_t = glu.t().to_owned();
-            let mut dwc = dwconv1d(&glu_t, &taps, &dwb, 9); // [D, T]
+            let glu_t = glu.t().to_owned(); // [T,D] -> [D,T]  (transpose 1, killed in step 3b)
+            // dwconv on NPU (step 3a, host-fed [D,T]) when the resident conv path is on + the brick is
+            // present + T<=400; else the host FIR. Transposes + SiLU stay host here (cut in 3b/step 4).
+            #[cfg(feature = "npu")]
+            let dw_npu = if std::env::var("PARAKEET_RESIDENT_CONV").is_ok() {
+                self.npu.as_ref().and_then(|npu| npu.npu_dwconv1d(&glu_t, &taps, &dwb))
+            } else { None };
+            #[cfg(not(feature = "npu"))]
+            let dw_npu: Option<Array2<f32>> = None;
+            let mut dwc = dw_npu.unwrap_or_else(|| dwconv1d(&glu_t, &taps, &dwb, 9)); // [D, T]
             silu_inplace(&mut dwc);
-            dwc.t().to_owned() // [T, D]
+            dwc.t().to_owned() // [D,T] -> [T,D]  (transpose 2, killed in step 3b)
         });
         prof::phase::set_stage("conv_pw");
         // pw2 chain -> [D, D]: materialized lazily; skipped on warm passes.

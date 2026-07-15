@@ -17,7 +17,7 @@ import sys
 
 from aie.iron import Kernel, ObjectFifo, Program, Runtime, Worker
 from aie.iron.device import NPU1, NPU2
-from aie.helpers.taplib.tap import TensorAccessPattern
+from aie.helpers.taplib import TensorTiler2D
 from aie.iron.controlflow import range_
 
 C = 1024  # channels (Parakeet d_model)
@@ -65,26 +65,22 @@ def my_dwconv(dev, num_columns):
         for i in range(num_columns)
     ]
 
-    in_taps = [
-        TensorAccessPattern((1, C * T), cpc * T * i, [1, 1, 1, cpc * T], [0, 0, 0, 1])
-        for i in range(num_columns)
-    ]
-    w_taps = [
-        TensorAccessPattern((1, C * KW), cpc * KW * i, [1, 1, 1, cpc * KW], [0, 0, 0, 1])
-        for i in range(num_columns)
-    ]
-    out_taps = in_taps
+    # Modern IRON idiom (place-tiles toolchain): TensorTiler2D.simple_tiler + plain fill/drain, mirroring
+    # affine_cast_iron.py / glu_iron.py (which route correctly). The OLD idiom (manual TensorAccessPattern +
+    # rt.task_group) built but produced garbage under place-tiles -- even an identity tap failed 0/1024 rows.
+    # Each column i handles cpc contiguous channels; the (cpc, *) block streams as cpc per-channel tiles.
+    in_taps = TensorTiler2D.simple_tiler((C, T), (cpc, T))
+    w_taps = TensorTiler2D.simple_tiler((C, KW), (cpc, KW))
+    out_taps = TensorTiler2D.simple_tiler((C, T), (cpc, T))
 
     rt = Runtime()
     with rt.sequence(in_tensor_ty, w_tensor_ty, out_tensor_ty) as (X, W, Y):
         rt.start(*workers)
-        tg = rt.task_group()
         for i in range(num_columns):
-            rt.fill(of_ins[i].prod(), X, in_taps[i], task_group=tg)
-            rt.fill(of_ws[i].prod(), W, w_taps[i], task_group=tg)
+            rt.fill(of_ins[i].prod(), X, in_taps[i])
+            rt.fill(of_ws[i].prod(), W, w_taps[i])
         for i in range(num_columns):
-            rt.drain(of_outs[i].cons(), Y, out_taps[i], wait=True, task_group=tg)
-        rt.finish_task_group(tg)
+            rt.drain(of_outs[i].cons(), Y, out_taps[i], wait=True)
 
     # place-tiles model (fork toolchain): bare resolve_program (aiecc's place-tiles pass assigns
     # physical tiles). The old aie.iron.placers.SequentialPlacer is gone in the fork instance.

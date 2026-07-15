@@ -97,18 +97,54 @@ static inline void dwconv1d_same(const bfloat16 *restrict in,
   event1();
 }
 
+// SCALAR FIR (correct on the current toolchain). Same 'same'-padded cross-correlation math as
+// dwconv1d_same, but plain per-element MACs -- NO aie::sliding_mul. The vectorized sliding_mul path
+// above is MISCOMPILED for bf16 (K=9, XDNA2) under toolchain.lock fb1f7095: it emits ~half-corrupted
+// output (fails at L=16 and L=32), while this scalar path + the dataflow are both proven bit-correct
+// (identity 1024/1024, random rel-L2 0.003). See the step-3 dwconv investigation. Depthwise conv is
+// compute-cheap (C*T*K MACs), so the scalar cost is small; flip back to the sliding_mul brick by
+// building with -DDWCONV_SCALAR=0 once the vectorized path is fixed/root-caused.
+template <int T, int K, int P, bool BIAS>
+static inline void dwconv1d_same_scalar(const bfloat16 *restrict in,
+                                        const bfloat16 *restrict w,
+                                        bfloat16 *restrict out) {
+  event0();
+  for (int t = 0; t < T; t++) {
+    float acc = BIAS ? static_cast<float>(w[K]) : 0.0f; // BN-folded bias @ w[K] (=w[9] for k=9)
+    for (int p = 0; p < K; p++) {
+      int idx = t - P + p; // 'same' cross-correlation, zero outside [0,T)
+      if (idx >= 0 && idx < T)
+        acc += static_cast<float>(w[p]) * static_cast<float>(in[idx]);
+    }
+    out[t] = static_cast<bfloat16>(acc);
+  }
+  event1();
+}
+
+#ifndef DWCONV_SCALAR
+#define DWCONV_SCALAR 1 // vectorized sliding_mul broken on current toolchain -> scalar default
+#endif
+
 extern "C" {
 
 // Parakeet-TDT FastConformer depthwise conv: k=9, 'same' (pad=4), per-channel,
 // with BatchNorm-folded bias carried in w[9]. in/out: T samples; w: 16-tile
 // (taps [0..8], bias [9]). T = the encoder frame count baked at build time.
 void dwconv1d_k9_bf16(bfloat16 *in, bfloat16 *w, bfloat16 *out) {
+#if DWCONV_SCALAR
+  dwconv1d_same_scalar<400, 9, 4, true>(in, w, out);
+#else
   dwconv1d_same<400, 9, 4, 32, true>(in, w, out);
+#endif
 }
 
 // GigaAM-v3 Conformer depthwise conv: k=5, 'same' (pad=2), bias-free.
 // in/out: 400 samples; w: 16-tile (first 5 = taps).
 void dwconv1d_k5_bf16(bfloat16 *in, bfloat16 *w, bfloat16 *out) {
+#if DWCONV_SCALAR
+  dwconv1d_same_scalar<400, 5, 2, false>(in, w, out);
+#else
   dwconv1d_same<400, 5, 2, 32, false>(in, w, out);
+#endif
 }
 }

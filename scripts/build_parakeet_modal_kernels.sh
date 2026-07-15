@@ -68,5 +68,14 @@ for tag in ctxln_512x1024 affcast_512x1024 cast_512x1024 cast_512x4096 glu_512x1
   cp "$LNML/build/final_${tag}.xclbin" "$LNML/build/insts_${tag}.txt" "$LNDIR/"
 done
 cp "$MMW/build/final_512x4096x1024_64x32x128_8c_modalid.xclbin" "$MMW/build/insts_512x4096x1024_64x32x128_8c_modalid.txt" "$LNDIR/"
-echo "Built + staged resident FFN xclbins (LN->fc1 seam + fc1->fc2) -> $LNDIR"
+# RESIDENT-CONV: depthwise conv1d (conv-module step 3), k9/C=1024/T=400, 8 columns. NOTE: builds the
+# SCALAR FIR (the vectorized aie::sliding_mul path is miscompiled for bf16 on the current toolchain --
+# ~half-corrupted output; scalar + dataflow proven bit-correct. See the step-3 dwconv investigation.
+# Flip to the vectorized brick with -DDWCONV_SCALAR=0 once that's fixed). Distinct name/insts.bin ABI.
+echo "== RESIDENT-CONV: dwconv1d k9 (scalar FIR) 1024x400 =="
+DWML=mlir-aie/programming_examples/ml/dwconv1d
+make -C $DWML NPU2=1 cols=8 build/final.xclbin
+cp "$DWML/build/final.xclbin" "$LNDIR/final_dwconv_1024x400.xclbin"
+cp "$DWML/build/insts.bin"    "$LNDIR/insts_dwconv_1024x400.txt"
+echo "Built + staged resident FFN + conv xclbins (LN->fc1 seam + fc1->fc2 + GLU + dwconv) -> $LNDIR"
 ls -la $LNDIR/

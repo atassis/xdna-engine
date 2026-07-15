@@ -128,6 +128,8 @@ struct ResidentLn {
     // device-side (the pw1 GEMM output stays resident; GLU reads it as its A/g3 input, no host). OPTIONAL:
     // absent when the glu xclbin isn't built, so the FFN LN->fc1 seam + step-1 resident pw1 still load.
     glu: Option<ConvGlu>,
+    // conv-module depthwise conv1d (step 3), OPTIONAL like glu.
+    dwconv: Option<ConvDw>,
     // per-kernel dummy placeholders (0-size segfaults)
     ln_c: Bo,
     ln_tmp: Bo,
@@ -147,6 +149,25 @@ struct ConvGlu {
     n: usize,
     bo_out: Bo, // [PAD_M, KRES] f32 (glu output, g4)
     dummy_c: Bo,
+    dummy_tmp: Bo,
+    dummy_tr: Bo,
+}
+
+// Conv-module depthwise conv1d (step 3): sliding_mul FIR along time, [C,T] channel-major bf16.
+// T=400 is Parakeet's ~30s frame cap (>subsample); the brick bakes it. C=1024 = d_model.
+const DW_C: usize = 1024; // channels (d_model)
+const DW_T: usize = 400; // baked time steps (Parakeet frame cap)
+const DW_KW: usize = 16; // weight tile: taps[0..8] + BN-folded bias[9]
+
+/// Device-side depthwise conv1d brick (dwconv1d_k9_bf16). 3-buffer ABI: in[C,T] bf16 (g3), w[C,16]
+/// bf16 (g4), out[C,T] bf16 (g5). Host-fed in step 3a (transposes still host); device-fed in 3b.
+struct ConvDw {
+    kern: Rc<Kernel>,
+    instr: Bo,
+    n: usize,
+    bo_in: Bo,  // [C, T] bf16 (g3)
+    bo_w: Bo,   // [C, 16] bf16 (g4)
+    bo_out: Bo, // [C, T] bf16 (g5)
     dummy_tmp: Bo,
     dummy_tr: Bo,
 }
@@ -396,6 +417,26 @@ impl NpuMatmul {
                 None
             }
         };
+        // conv-module depthwise conv1d (step 3), OPTIONAL. 3-buffer ABI in[C,T]/w[C,16]/out[C,T] bf16.
+        let dwconv = {
+            let xcl = self.ln_dir.join(format!("final_dwconv_{DW_C}x{DW_T}.xclbin"));
+            let ins = self.ln_dir.join(format!("insts_dwconv_{DW_C}x{DW_T}.txt"));
+            if xcl.exists() && ins.exists() {
+                let (kern, instr, n) = load_path(xcl, ins);
+                let gw = |i| kern.group_id(i).unwrap();
+                Some(ConvDw {
+                    bo_in: self.dev.alloc_bo(&kern, DW_C * DW_T * 2, FLAG_HOST_ONLY, gw(3)).unwrap(),
+                    bo_w: self.dev.alloc_bo(&kern, DW_C * DW_KW * 2, FLAG_HOST_ONLY, gw(4)).unwrap(),
+                    bo_out: self.dev.alloc_bo(&kern, DW_C * DW_T * 2, FLAG_HOST_ONLY, gw(5)).unwrap(),
+                    dummy_tmp: self.dev.alloc_bo(&kern, 8, FLAG_HOST_ONLY, gw(6)).unwrap(),
+                    dummy_tr: self.dev.alloc_bo(&kern, 1, FLAG_HOST_ONLY, gw(7)).unwrap(),
+                    kern, instr, n,
+                })
+            } else {
+                eprintln!("[npu] dwconv xclbin absent in {} -- conv dwconv stays host (build final_dwconv_{DW_C}x{DW_T})", self.ln_dir.display());
+                None
+            }
+        };
         let gl = |i| ln_kern.group_id(i).unwrap();
         let ga = |i| ac_kern.group_id(i).unwrap();
         let gd = |i| deint_kern.group_id(i).unwrap();
@@ -414,7 +455,7 @@ impl NpuMatmul {
             deint_tmp: self.dev.alloc_bo(&deint_kern, 8, FLAG_HOST_ONLY, gd(6)).unwrap(),
             deint_tr: self.dev.alloc_bo(&deint_kern, 1, FLAG_HOST_ONLY, gd(7)).unwrap(),
             ln_kern, ln_instr, ln_n, ac_kern, ac_instr, ac_n,
-            deint_kern, deint_instr, deint_n, glu,
+            deint_kern, deint_instr, deint_n, glu, dwconv,
         });
         rl
     }
@@ -538,6 +579,58 @@ impl NpuMatmul {
             for c in 0..KRES {
                 let off = (r * KRES + c) * 4;
                 out[[r, c]] = f32::from_le_bytes([cb[off], cb[off + 1], cb[off + 2], cb[off + 3]]);
+            }
+        }
+        Some(out)
+    }
+
+    /// Host-fed on-NPU depthwise conv1d (conv step 3a): the sliding_mul FIR brick. `x_ct` = [C=1024, T]
+    /// channel-major f32 (T <= 400), `taps` [C,9], `bias` [C]. Packs to bf16, runs the brick (in->w->out
+    /// 3-buffer ABI), returns [C, T] f32. Transposes stay on host (killed in 3b, when x_ct is fed
+    /// device-to-device from the GLU output). None if the dwconv xclbin is absent or T exceeds the baked
+    /// DW_T (caller keeps the host dwconv1d).
+    pub fn npu_dwconv1d(&self, x_ct: &Array2<f32>, taps: &Array2<f32>, bias: &Array1<f32>) -> Option<Array2<f32>> {
+        let rl = self.resident_ln()?;
+        let dw = rl.dwconv.as_ref()?;
+        let (c, t) = x_ct.dim();
+        if c != DW_C || t > DW_T {
+            return None; // shape outside the baked brick -> host fallback
+        }
+        self.stats.borrow_mut().calls += 1;
+        // pack input [C, t] f32 -> bf16 [C, DW_T] channel-major, zero-padding the time tail (t..DW_T).
+        // 'same' conv sees zeros past the sequence end == correct end-padding; the pad outputs are sliced off.
+        let x_std = x_ct.as_standard_layout();
+        let xs = x_std.as_slice().unwrap();
+        let mut in_bits = vec![0u16; DW_C * DW_T];
+        for ch in 0..c {
+            npu_xrt::pack_f32_to_bf16(&xs[ch * t..ch * t + t], &mut in_bits[ch * DW_T..ch * DW_T + t]);
+        }
+        dw.bo_in.write_bytes(u16_bytes(&in_bits)).unwrap();
+        dw.bo_in.sync_to_device().unwrap();
+        // pack weights [C,9] + bias[C] -> [C,16] bf16 (taps in [0..8], BN-folded bias in [9]).
+        let taps_std = taps.as_standard_layout();
+        let tp = taps_std.as_slice().unwrap();
+        let mut w_bits = vec![0u16; DW_C * DW_KW];
+        for ch in 0..c {
+            let mut row = [0f32; DW_KW];
+            row[..9].copy_from_slice(&tp[ch * 9..ch * 9 + 9]);
+            row[9] = bias[ch];
+            npu_xrt::pack_f32_to_bf16(&row, &mut w_bits[ch * DW_KW..ch * DW_KW + DW_KW]);
+        }
+        dw.bo_w.write_bytes(u16_bytes(&w_bits)).unwrap();
+        dw.bo_w.sync_to_device().unwrap();
+        // dispatch + read [C, DW_T] bf16 -> f32, slice to [C, t].
+        dw.kern.run_matmul8(3, &dw.instr, dw.n, &dw.bo_in, &dw.bo_w, &dw.bo_out, &dw.dummy_tmp, &dw.dummy_tr).unwrap();
+        self.stats.borrow_mut().dispatches += 1;
+        dw.bo_out.sync_from_device().unwrap();
+        let mut ob = vec![0u8; DW_C * DW_T * 2];
+        dw.bo_out.read_bytes(&mut ob).unwrap();
+        let mut out = Array2::<f32>::zeros((c, t));
+        for ch in 0..c {
+            for ti in 0..t {
+                let off = (ch * DW_T + ti) * 2;
+                let u = u16::from_le_bytes([ob[off], ob[off + 1]]);
+                out[[ch, ti]] = f32::from_bits((u as u32) << 16);
             }
         }
         Some(out)
