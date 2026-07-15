@@ -17,7 +17,6 @@ import sys
 
 from aie.iron import Kernel, ObjectFifo, Program, Runtime, Worker
 from aie.iron.device import NPU1, NPU2
-from aie.iron.placers import SequentialPlacer
 from aie.helpers.taplib.tap import TensorAccessPattern
 from aie.iron.controlflow import range_
 
@@ -87,7 +86,9 @@ def my_dwconv(dev, num_columns):
             rt.drain(of_outs[i].cons(), Y, out_taps[i], wait=True, task_group=tg)
         rt.finish_task_group(tg)
 
-    return Program(dev, rt).resolve_program(SequentialPlacer())
+    # place-tiles model (fork toolchain): bare resolve_program (aiecc's place-tiles pass assigns
+    # physical tiles). The old aie.iron.placers.SequentialPlacer is gone in the fork instance.
+    return Program(dev, rt).resolve_program()
 
 
 p = argparse.ArgumentParser()
