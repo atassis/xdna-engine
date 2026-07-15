@@ -101,11 +101,10 @@ impl FastConformerEncoder {
 
     fn feed_forward(&self, x: &Array2<f32>, b: &BlockWeights, blk: usize, tag: &str, norm_w: &str, norm_b: &str, l1: &str, l2: &str) -> Array2<f32> {
         let stage: &'static str = if tag == "ff1" { "ff1" } else { "ff2" };
-        // RESIDENT FF1 seam (DEFAULT on the modal resident; opt out with PARAKEET_RESIDENT_FF=0):
-        // LN + fc1 + SiLU run FULLY on-NPU device-side (ctxLN -> affine_cast(gamma,beta) -> modal fc1
-        // on-chip silu), the activation stream never touching host across LN->fc1. WER-neutral (==
-        // baseline). Returns silu(affine_LN(x)@W1); fc2 stays host-fed for now (next frontier step).
-        // Falls back to the host LN path when the resident xclbins aren't built (resident_ff_available).
+        // RESIDENT FFN (DEFAULT on the modal resident; opt out with PARAKEET_RESIDENT_FF=0):
+        // LN + fc1 + SiLU run FULLY on-NPU (ctxLN -> affine_cast(gamma,beta) -> modal fc1 on-chip silu),
+        // the activation stream never touching host across LN->fc1. Falls back to the host LN path when
+        // the resident xclbins aren't built (resident_ff_available).
         #[cfg(feature = "npu")]
         if std::env::var("PARAKEET_RESIDENT_FF").map(|v| v != "0").unwrap_or(true) {
             if let Some(npu) = &self.npu {
@@ -114,11 +113,11 @@ impl FastConformerEncoder {
                     let beta = b.v(norm_b);
                     prof::phase::set_stage(stage);
                     let _h = PhaseScope::new("ff_resident", Bucket::Npu);
-                    // FULL FFN device-side (LN->fc1->fc2) is ~20% faster BUT the K=4096 bfp16 fc2
-                    // accumulation differs from the host K-split enough to regress WER +0.4pp -- so it
-                    // is OPT-IN (PARAKEET_RESIDENT_FFN=1) until the fc2 numerics match. DEFAULT is the
-                    // WER-NEUTRAL LN->fc1 seam + host fc2.
-                    if std::env::var("PARAKEET_RESIDENT_FFN").is_ok() {
+                    // FULL FFN device-side (LN->fc1->fc2, Variant B, DEFAULT; opt out PARAKEET_RESIDENT_FFN=0):
+                    // fc2's K-split partials stay on-device (deinterleave -> sub-BO chunks + host-sum),
+                    // bit-identical to the host 4xK-split -> WER-NEUTRAL. resident_ff_available() requires the
+                    // deint xclbin, so this falls back to the host-fed fc2 (below) when that xclbin is absent.
+                    if std::env::var("PARAKEET_RESIDENT_FFN").map(|v| v != "0").unwrap_or(true) {
                         return npu.resident_ffn(x, gamma.as_slice().unwrap(), beta.as_slice().unwrap(),
                             || b.m(l1), &format!("{blk}.{tag}.l1"),
                             || b.m(l2), &format!("{blk}.{tag}.l2"));
