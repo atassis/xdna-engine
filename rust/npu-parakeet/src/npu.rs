@@ -445,7 +445,9 @@ impl NpuMatmul {
     /// fully on-chip, no host reduction / bias / silu on this seam. `id` keys the W1 BO cache.
     /// (On a non-modal resident the on-chip silu is absent; the caller must apply host silu -- use
     /// [`Self::modal`] to branch, mirroring feed_forward.)
-    pub fn resident_ff1_fc1<F: FnOnce() -> Array2<f32>>(&self, x: &Array2<f32>, gamma: &[f32], beta: &[f32], make_w1: F, id: &str, n: usize) -> Array2<f32> {
+    /// Resident LN -> GEMM: ctxLN -> affine_cast(gamma,beta) -> modal GEMM [m,n], with the on-chip
+    /// SiLU epilogue applied iff `silu` (n=DFF fc1 wants silu; conv pw1 / plain GEMMs want identity).
+    pub fn resident_ff1_fc1<F: FnOnce() -> Array2<f32>>(&self, x: &Array2<f32>, gamma: &[f32], beta: &[f32], make_w1: F, id: &str, n: usize, silu: bool) -> Array2<f32> {
         self.stats.borrow_mut().calls += 1;
         let m = x.nrows();
         let rl = self.ln_affine_cast(x, gamma, beta);
@@ -458,7 +460,7 @@ impl NpuMatmul {
             assert_eq!(w.ncols(), n, "W1 ncols {} != {n}", w.ncols());
             self.weight_bo(id, w.view())
         };
-        self.dispatch_with_a(&rl.bo_bf16, m, &wbo, n, self.modal)
+        self.dispatch_with_a(&rl.bo_bf16, m, &wbo, n, silu && self.modal)
     }
 
     /// Full FFN device-side (LN -> fc1 -> SiLU -> fc2), the fc1->fc2 frontier step. Everything on-NPU,
