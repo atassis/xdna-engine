@@ -21,7 +21,8 @@
 # A beep sounds when the whole suite finishes.
 # =============================================================================
 set -u
-IRON=~/repositories/ns/amd/IRON
+. "$(dirname "${BASH_SOURCE[0]}")/amd_paths.sh"   # -> IRON_DIR (relocatable; env-overridable)
+IRON="$IRON_DIR"
 # WT = repo root (derived from this script's location), so the suite runs from any worktree —
 # including main, which (unlike the fresh fused worktree) HAS the built encoder xclbins, so the
 # full-transcription e2e + WER sections actually run instead of panicking on a missing xclbin.
