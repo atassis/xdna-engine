@@ -443,7 +443,22 @@ impl FastConformerEncoder {
             #[cfg(not(feature = "npu"))]
             let dw_npu: Option<Array2<f32>> = None;
             let mut dwc = dw_npu.unwrap_or_else(|| dwconv1d(&glu_t, &taps, &dwb, 9)); // [D, T]
-            silu_inplace(&mut dwc);
+            // SiLU on NPU (step 4) as a SEPARATE brick when the resident conv path is on + the brick
+            // is present; else host silu. dwc is [D=C, T] channel-major == the silu brick's [C,T] shape.
+            // (Separate brick, NOT a dwconv epilogue -- the fused epilogue miscompiles alternate
+            // channels on this toolchain; see dwconv-fused-epilogue-alt-channel-miscompile.)
+            // Doubly opt-in (PARAKEET_RESIDENT_SILU): the on-NPU silu is WIP -- it is bf16-tanh-precision
+            // limited (RU 8.5 vs the host-silu 8.1 reference; f32 tanh mis-compiles). Gated separately so
+            // PARAKEET_RESIDENT_CONV=1 keeps the WER-8.2 reference (host silu) until the brick reaches it
+            // (needs an exact sigmoid: polynomial f32, or an upstream aie::tanh<float> fix).
+            #[cfg(feature = "npu")]
+            let silu_npu = if std::env::var("PARAKEET_RESIDENT_CONV").is_ok()
+                && std::env::var("PARAKEET_RESIDENT_SILU").is_ok() {
+                self.npu.as_ref().and_then(|npu| npu.npu_silu(&dwc))
+            } else { None };
+            #[cfg(not(feature = "npu"))]
+            let silu_npu: Option<Array2<f32>> = None;
+            let dwc = silu_npu.unwrap_or_else(|| { silu_inplace(&mut dwc); dwc });
             dwc.t().to_owned() // [D,T] -> [T,D]  (transpose 2, killed in step 3b)
         });
         prof::phase::set_stage("conv_pw");

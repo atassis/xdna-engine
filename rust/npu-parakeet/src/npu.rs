@@ -130,6 +130,9 @@ struct ResidentLn {
     glu: Option<ConvGlu>,
     // conv-module depthwise conv1d (step 3), OPTIONAL like glu.
     dwconv: Option<ConvDw>,
+    // conv-module post-dwconv SiLU (step 4), OPTIONAL like glu/dwconv. SEPARATE single-op-loop
+    // brick (NOT a dwconv epilogue) -- immune to the fused-epilogue per-channel-loop miscompile.
+    silu: Option<ConvSilu>,
     // per-kernel dummy placeholders (0-size segfaults)
     ln_c: Bo,
     ln_tmp: Bo,
@@ -170,6 +173,21 @@ struct ConvDw {
     bo_out: Bo, // [C, T] bf16 (g5)
     dummy_tmp: Bo,
     dummy_tr: Bo,
+}
+
+// Conv-module post-dwconv SiLU brick (step 4): out[c,t] = silu(in[c,t]), [C,T] f32 -> f32, per-row
+// (one channel's T-row per core loop). A SEPARATE single-op-loop kernel (silu_row), fed the dwconv
+// output host-side (device-to-device in a later step). Same [C=1024,T=400] shape as the dwconv brick.
+// 2-buffer ABI: in[C,T] f32 (g3), out[C,T] f32 (g4); tmp/ctrl/trace dummies (g5/g6/g7) -- like ctx_ln/glu.
+struct ConvSilu {
+    kern: Rc<Kernel>,
+    instr: Bo,
+    n: usize,
+    bo_in: Bo,      // [C, T] f32 (g3)
+    bo_out: Bo,     // [C, T] f32 (g4)
+    dummy_tmp: Bo,  // g5
+    dummy_ctrl: Bo, // g6
+    dummy_tr: Bo,   // g7
 }
 
 const DFF: usize = 4096; // Parakeet FFN inner dim (fc1 N / fc2 K)
@@ -437,6 +455,26 @@ impl NpuMatmul {
                 None
             }
         };
+        // conv-module post-dwconv SiLU (step 4), OPTIONAL. 2-buffer ABI in[C,T]/out[C,T] f32.
+        let silu = {
+            let xcl = self.ln_dir.join(format!("final_silu_{DW_C}x{DW_T}.xclbin"));
+            let ins = self.ln_dir.join(format!("insts_silu_{DW_C}x{DW_T}.txt"));
+            if xcl.exists() && ins.exists() {
+                let (kern, instr, n) = load_path(xcl, ins);
+                let gs = |i| kern.group_id(i).unwrap();
+                Some(ConvSilu {
+                    bo_in: self.dev.alloc_bo(&kern, DW_C * DW_T * 4, FLAG_HOST_ONLY, gs(3)).unwrap(),
+                    bo_out: self.dev.alloc_bo(&kern, DW_C * DW_T * 4, FLAG_HOST_ONLY, gs(4)).unwrap(),
+                    dummy_tmp: self.dev.alloc_bo(&kern, 8, FLAG_HOST_ONLY, gs(5)).unwrap(),
+                    dummy_ctrl: self.dev.alloc_bo(&kern, 8, FLAG_HOST_ONLY, gs(6)).unwrap(),
+                    dummy_tr: self.dev.alloc_bo(&kern, 1, FLAG_HOST_ONLY, gs(7)).unwrap(),
+                    kern, instr, n,
+                })
+            } else {
+                eprintln!("[npu] silu xclbin absent in {} -- conv SiLU stays host (build final_silu_{DW_C}x{DW_T})", self.ln_dir.display());
+                None
+            }
+        };
         let gl = |i| ln_kern.group_id(i).unwrap();
         let ga = |i| ac_kern.group_id(i).unwrap();
         let gd = |i| deint_kern.group_id(i).unwrap();
@@ -455,7 +493,7 @@ impl NpuMatmul {
             deint_tmp: self.dev.alloc_bo(&deint_kern, 8, FLAG_HOST_ONLY, gd(6)).unwrap(),
             deint_tr: self.dev.alloc_bo(&deint_kern, 1, FLAG_HOST_ONLY, gd(7)).unwrap(),
             ln_kern, ln_instr, ln_n, ac_kern, ac_instr, ac_n,
-            deint_kern, deint_instr, deint_n, glu, dwconv,
+            deint_kern, deint_instr, deint_n, glu, dwconv, silu,
         });
         rl
     }
@@ -631,6 +669,44 @@ impl NpuMatmul {
                 let off = (ch * DW_T + ti) * 2;
                 let u = u16::from_le_bytes([ob[off], ob[off + 1]]);
                 out[[ch, ti]] = f32::from_bits((u as u32) << 16);
+            }
+        }
+        Some(out)
+    }
+
+    /// Host-fed on-NPU SiLU (conv step 4): the post-dwconv activation as a SEPARATE brick (silu_row).
+    /// `x_ct` = [C=1024, T] channel-major f32 (T <= 400). Packs f32 -> device (zero-padding the time
+    /// tail; silu(0)=0 so pad rows are 0 and sliced off), runs the 2-buffer brick, returns [C, T] f32.
+    /// This replaces the host `silu_inplace` on the dwconv output -- advancing the single-hardware graph
+    /// WITHOUT fusing silu into dwconv (which miscompiles alternate channels; see the KB log). None if
+    /// the silu xclbin is absent or T exceeds the baked DW_T (caller keeps the host silu).
+    pub fn npu_silu(&self, x_ct: &Array2<f32>) -> Option<Array2<f32>> {
+        let rl = self.resident_ln()?;
+        let s = rl.silu.as_ref()?;
+        let (c, t) = x_ct.dim();
+        if c != DW_C || t > DW_T {
+            return None; // shape outside the baked brick -> host fallback
+        }
+        self.stats.borrow_mut().calls += 1;
+        let x_std = x_ct.as_standard_layout();
+        let xs = x_std.as_slice().unwrap();
+        let mut in_f = vec![0f32; DW_C * DW_T];
+        for ch in 0..c {
+            in_f[ch * DW_T..ch * DW_T + t].copy_from_slice(&xs[ch * t..ch * t + t]);
+        }
+        s.bo_in.write_bytes(f32_bytes(&in_f)).unwrap();
+        s.bo_in.sync_to_device().unwrap();
+        // 2-buffer ABI: in(g3) -> out(g4); tmp/ctrl/trace dummies (g5/g6/g7).
+        s.kern.run_matmul8(3, &s.instr, s.n, &s.bo_in, &s.bo_out, &s.dummy_tmp, &s.dummy_ctrl, &s.dummy_tr).unwrap();
+        self.stats.borrow_mut().dispatches += 1;
+        s.bo_out.sync_from_device().unwrap();
+        let mut ob = vec![0u8; DW_C * DW_T * 4];
+        s.bo_out.read_bytes(&mut ob).unwrap();
+        let mut out = Array2::<f32>::zeros((c, t));
+        for ch in 0..c {
+            for ti in 0..t {
+                let off = (ch * DW_T + ti) * 4;
+                out[[ch, ti]] = f32::from_le_bytes([ob[off], ob[off + 1], ob[off + 2], ob[off + 3]]);
             }
         }
         Some(out)
