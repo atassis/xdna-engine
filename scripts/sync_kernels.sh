@@ -24,6 +24,11 @@ mkdir -p "$PE/ml/dwconv1d" "$PE/ml/softmax400" "$PE/ml/layernorm" "$PE/ml/relpos
 cp "$RB/dwconv1d/dwconv1d.cc" "$K/dwconv1d.cc"
 cp "$RB/dwconv1d/dwconv1d.py" "$PE/ml/dwconv1d/dwconv1d.py"
 cp "$RB/dwconv1d/Makefile"    "$PE/ml/dwconv1d/Makefile"
+# FUSED dwconv->SiLU in one xclbin (conv step 3+4, roadmap 5-A): dwconv f32-out core -> on-chip
+# f32 fifo -> silu core (two separate cores, immune to the alt-channel miscompile). Needs both
+# dwconv1d.cc (above) and silu_brick.cc (synced below) in $K.
+cp "$RB/dwconv1d/dwconv_silu_iron.py" "$PE/ml/dwconv1d/dwconv_silu_iron.py"
+cp "$RB/dwconv1d/Makefile.dwsilu"     "$PE/ml/dwconv1d/Makefile.dwsilu"
 # fused bias+SiLU / narrow epilogue kernel (docs/10)
 cp "$RB/aie_kernels/mm_silu_epilogue.cc" "$K/mm_silu_epilogue.cc"
 # softmax-400 (pad->416) example
