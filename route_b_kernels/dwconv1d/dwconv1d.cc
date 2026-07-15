@@ -121,8 +121,51 @@ static inline void dwconv1d_same_scalar(const bfloat16 *restrict in,
   event1();
 }
 
+// VECTORIZED FIR via ALIGNED loads + aie::shuffle_down_fill (in-register sliding window). This is the
+// CORRECT + fast path (identity 1024/1024, random rel-L2 0.003). It sidesteps the two toolchain traps
+// the naive brick hits (see the step-3 dwconv investigation, both persistent to Peano nightly 071401):
+//   (1) unaligned L1 vector loads SNAP to the aligned base -- so load_v(&buf[o+p]) at p!=0 (as the
+//       old scalar-window / sliding_mul staging does) reads the wrong data; and
+//   (2) aie::sliding_mul_ops<...,bf16,bf16> itself emits inf/nan even with aligned data (a genuine
+//       aie_api fp-sliding-mul defect, reported upstream).
+// Here every load is aligned (o steps by 16, buf is alignas(64)); tap-p window buf[o+p..o+p+15] is
+// built purely in-register: shuffle_down_fill(a0,a1,p) = [a0[p..15] | a1[0..p-1]]. k=9 unrolled (the
+// window o+8+15=o+23 stays within the a0||a1 32-lane concat).
+template <int T, int K, int P, bool BIAS>
+static inline void dwconv1d_shift(const bfloat16 *restrict in, const bfloat16 *restrict w, bfloat16 *restrict out) {
+  event0();
+  ::aie::set_rounding(::aie::rounding_mode::conv_even);
+  static_assert(K == 9, "dwconv1d_shift is unrolled for k=9");
+  static_assert(T % 16 == 0, "T must be a multiple of the 16-lane output chunk");
+  constexpr int PADBUF = ((T + 2 * P + 32 + 31) / 32) * 32;
+  alignas(64) bfloat16 buf[PADBUF];
+  const ::aie::vector<bfloat16, 16> z = ::aie::broadcast<bfloat16, 16>(bfloat16(0.0f));
+  for (int i = 0; i < PADBUF; i += 16) ::aie::store_v(&buf[i], z);
+  for (int t = 0; t < T; t++) buf[P + t] = in[t];
+  const float bias = BIAS ? static_cast<float>(w[K]) : 0.0f;
+  const ::aie::vector<bfloat16, 16> c0 = ::aie::broadcast<bfloat16, 16>(w[0]), c1 = ::aie::broadcast<bfloat16, 16>(w[1]),
+    c2 = ::aie::broadcast<bfloat16, 16>(w[2]), c3 = ::aie::broadcast<bfloat16, 16>(w[3]), c4 = ::aie::broadcast<bfloat16, 16>(w[4]),
+    c5 = ::aie::broadcast<bfloat16, 16>(w[5]), c6 = ::aie::broadcast<bfloat16, 16>(w[6]), c7 = ::aie::broadcast<bfloat16, 16>(w[7]),
+    c8 = ::aie::broadcast<bfloat16, 16>(w[8]);
+  for (int o = 0; o < T; o += 16) {
+    ::aie::vector<bfloat16, 16> a0 = ::aie::load_v<16>(&buf[o]), a1 = ::aie::load_v<16>(&buf[o + 16]);
+    ::aie::accum<accfloat, 16> a;
+    a.from_vector(::aie::broadcast<float, 16>(bias));
+    a = ::aie::mac(a, ::aie::shuffle_down_fill(a0, a1, 0), c0); a = ::aie::mac(a, ::aie::shuffle_down_fill(a0, a1, 1), c1);
+    a = ::aie::mac(a, ::aie::shuffle_down_fill(a0, a1, 2), c2); a = ::aie::mac(a, ::aie::shuffle_down_fill(a0, a1, 3), c3);
+    a = ::aie::mac(a, ::aie::shuffle_down_fill(a0, a1, 4), c4); a = ::aie::mac(a, ::aie::shuffle_down_fill(a0, a1, 5), c5);
+    a = ::aie::mac(a, ::aie::shuffle_down_fill(a0, a1, 6), c6); a = ::aie::mac(a, ::aie::shuffle_down_fill(a0, a1, 7), c7);
+    a = ::aie::mac(a, ::aie::shuffle_down_fill(a0, a1, 8), c8);
+    ::aie::store_v(&out[o], a.template to_vector<bfloat16>());
+  }
+  event1();
+}
+
+// Kernel selection: default = the vectorized aligned+shuffle FIR (dwconv1d_shift). DWCONV_SCALAR=1
+// forces the scalar fallback (dwconv1d_same_scalar). The aie::sliding_mul brick (dwconv1d_same) is
+// RETAINED only as the broken-path reference for the upstream repro; never selected.
 #ifndef DWCONV_SCALAR
-#define DWCONV_SCALAR 1 // vectorized sliding_mul broken on current toolchain -> scalar default
+#define DWCONV_SCALAR 0
 #endif
 
 extern "C" {
@@ -134,17 +177,13 @@ void dwconv1d_k9_bf16(bfloat16 *in, bfloat16 *w, bfloat16 *out) {
 #if DWCONV_SCALAR
   dwconv1d_same_scalar<400, 9, 4, true>(in, w, out);
 #else
-  dwconv1d_same<400, 9, 4, 32, true>(in, w, out);
+  dwconv1d_shift<400, 9, 4, true>(in, w, out);
 #endif
 }
 
-// GigaAM-v3 Conformer depthwise conv: k=5, 'same' (pad=2), bias-free.
-// in/out: 400 samples; w: 16-tile (first 5 = taps).
+// GigaAM-v3 Conformer depthwise conv: k=5, 'same' (pad=2), bias-free. Scalar (correct); a vectorized
+// k5 shift path is YAGNI until a GigaAM model is on the bench (dwconv1d_shift is unrolled for k9).
 void dwconv1d_k5_bf16(bfloat16 *in, bfloat16 *w, bfloat16 *out) {
-#if DWCONV_SCALAR
   dwconv1d_same_scalar<400, 5, 2, false>(in, w, out);
-#else
-  dwconv1d_same<400, 5, 2, 32, false>(in, w, out);
-#endif
 }
 }

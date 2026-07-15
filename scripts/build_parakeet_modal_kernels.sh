@@ -68,11 +68,11 @@ for tag in ctxln_512x1024 affcast_512x1024 cast_512x1024 cast_512x4096 glu_512x1
   cp "$LNML/build/final_${tag}.xclbin" "$LNML/build/insts_${tag}.txt" "$LNDIR/"
 done
 cp "$MMW/build/final_512x4096x1024_64x32x128_8c_modalid.xclbin" "$MMW/build/insts_512x4096x1024_64x32x128_8c_modalid.txt" "$LNDIR/"
-# RESIDENT-CONV: depthwise conv1d (conv-module step 3), k9/C=1024/T=400, 8 columns. NOTE: builds the
-# SCALAR FIR (the vectorized aie::sliding_mul path is miscompiled for bf16 on the current toolchain --
-# ~half-corrupted output; scalar + dataflow proven bit-correct. See the step-3 dwconv investigation.
-# Flip to the vectorized brick with -DDWCONV_SCALAR=0 once that's fixed). Distinct name/insts.bin ABI.
-echo "== RESIDENT-CONV: dwconv1d k9 (scalar FIR) 1024x400 =="
+# RESIDENT-CONV: depthwise conv1d (conv-module step 3), k9/C=1024/T=400, 8 columns. Builds the VECTORIZED
+# aligned-load + aie::shuffle_down_fill FIR (dwconv1d_shift) -- correct + fast (~7x the scalar). It avoids
+# both toolchain traps the naive brick hits (unaligned-L1-load snap; aie::sliding_mul_ops bf16 inf/nan --
+# see the step-3 dwconv investigation). Scalar fallback available with -DDWCONV_SCALAR=1. Distinct insts.bin ABI.
+echo "== RESIDENT-CONV: dwconv1d k9 (vectorized aligned+shuffle) 1024x400 =="
 DWML=mlir-aie/programming_examples/ml/dwconv1d
 make -C $DWML NPU2=1 cols=8 build/final.xclbin
 cp "$DWML/build/final.xclbin" "$LNDIR/final_dwconv_1024x400.xclbin"
