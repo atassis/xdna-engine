@@ -26,7 +26,20 @@
 #define SILU_MODE 0
 #endif
 
-#if SILU_MODE >= 1
+#if SILU_MODE == 7
+// MINIMAL HANG REPRO (no exp2f): a noinline vector helper + a value held live across the
+// call + a reciprocal/select composition after it. Reproduces the same 23-slot spill
+// pressure as the exp2f path -> isolates the codegen bug from exp2f/int<->float.
+static __attribute__((noinline)) ::aie::vector<float, 16>
+heavy16(::aie::vector<float, 16> x) {
+  ::aie::vector<float, 16> a = ::aie::mul(x, x).to_vector<float>();
+  ::aie::vector<float, 16> b = ::aie::add(a, x);
+  ::aie::vector<float, 16> c = ::aie::mul(b, a).to_vector<float>();
+  return ::aie::add(c, b);
+}
+#endif
+
+#if SILU_MODE >= 1 && SILU_MODE != 7
 // SOFTWARE f32 2^x for x <= 0 (the hw aie::exp2 is a bf16-output LUT, ~2-4% inaccurate;
 // this poly is ~1e-4). From relpos_mha.cc exp2f_vec, fixed at 16 lanes. NOINLINE is
 // LOAD-BEARING: inlining it makes Peano -O2 miscompile to NaN (register-pressure codegen bug).
@@ -155,6 +168,19 @@ void silu_row(const float *restrict input, float *restrict output, int32_t cols)
     ::aie::vector<float, N> r = ::aie::mul(r0, ::aie::sub(two, dr0)).template to_vector<float>();
     ::aie::vector<float, N> num = ::aie::select(one, s, ::aie::lt(xv, zero));
     ::aie::vector<float, N> sig = ::aie::mul(num, r).template to_vector<float>();
+    ::aie::vector<float, N> outv = ::aie::mul(xv, sig).template to_vector<float>();
+    ::aie::store_v(output + i, outv);
+  }
+#elif SILU_MODE == 7
+  // --- MINIMAL HANG REPRO (dummy heavy16, no exp2f) ---
+  const ::aie::vector<float, N> one = ::aie::broadcast<float, N>(1.0f);
+  const ::aie::vector<float, N> two = ::aie::broadcast<float, N>(2.0f);
+  for (int i = 0; i < cols; i += N) {
+    ::aie::vector<float, N> xv = ::aie::load_v<N>(input + i);
+    ::aie::vector<float, N> s = heavy16(xv);                    // xv held across the call
+    ::aie::vector<float, N> r0 = ::aie::inv(::aie::add(one, s));
+    ::aie::vector<float, N> num = ::aie::select(one, s, ::aie::lt(xv, two));
+    ::aie::vector<float, N> sig = ::aie::mul(num, r0).template to_vector<float>();
     ::aie::vector<float, N> outv = ::aie::mul(xv, sig).template to_vector<float>();
     ::aie::store_v(output + i, outv);
   }
