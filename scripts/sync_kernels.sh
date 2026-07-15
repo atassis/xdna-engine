@@ -88,6 +88,11 @@ cp "$RB/ctx_ln/Makefile.deint"        "$PE/ml/layernorm/Makefile.deint"
 cp "$RB/aie_kernels/glu.cc"           "$K/glu.cc"
 cp "$RB/ctx_ln/glu_iron.py"           "$PE/ml/layernorm/glu_iron.py"
 cp "$RB/ctx_ln/Makefile.glu"          "$PE/ml/layernorm/Makefile.glu"
+# post-dwconv SiLU brick (conv step 4) -- SEPARATE single-op-loop brick (immune to the
+# fused-epilogue per-channel-loop miscompile; see dwconv-fused-epilogue-alt-channel-miscompile).
+cp "$RB/ctx_ln/silu_brick.cc"         "$K/silu_brick.cc"
+cp "$RB/ctx_ln/silu_iron.py"          "$PE/ml/layernorm/silu_iron.py"
+cp "$RB/ctx_ln/Makefile.silu2"        "$PE/ml/layernorm/Makefile.silu2"
 # mha_decode — on-chip single-query MHA for the Whisper decoder (M1 Task 0): kernel + design
 mkdir -p "$PE/ml/mha_decode"
 cp "$RB/mha_decode/mha_decode.cc"      "$K/mha_decode.cc"
