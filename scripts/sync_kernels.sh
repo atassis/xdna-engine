@@ -29,6 +29,12 @@ cp "$RB/dwconv1d/Makefile"    "$PE/ml/dwconv1d/Makefile"
 # dwconv1d.cc (above) and silu_brick.cc (synced below) in $K.
 cp "$RB/dwconv1d/dwconv_silu_iron.py" "$PE/ml/dwconv1d/dwconv_silu_iron.py"
 cp "$RB/dwconv1d/Makefile.dwsilu"     "$PE/ml/dwconv1d/Makefile.dwsilu"
+# TIME-MAJOR fused dwconv->SiLU (conv step 3b, transpose-dissolving): [T,D] dwconv (dwconv1d_k9_tmajor)
+# -> on-chip f32 fifo -> silu core. Consumes GLU's [T,D] directly + emits pw2's [T,D] directly, so BOTH
+# host transposes are dissolved (no shuffle, no cross-column DMA -> no n-D-DMA hang). Same dwconv1d.cc +
+# silu_brick.cc objects as the channel-major fused brick.
+cp "$RB/dwconv1d/dwconv_silu_tmajor_iron.py" "$PE/ml/dwconv1d/dwconv_silu_tmajor_iron.py"
+cp "$RB/dwconv1d/Makefile.dwsilu_t"          "$PE/ml/dwconv1d/Makefile.dwsilu_t"
 # on-chip COMPUTE-tile transpose brick (conv step 3b enabler): element transpose in-core
 # (transpose_tile.cc), shim DMA does only contiguous read + unit-inner-stride scatter --
 # AVOIDS the transposing n-D DMA that hangs when co-resident (blocker npu.rs:740).
