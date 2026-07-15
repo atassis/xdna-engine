@@ -184,6 +184,36 @@ void silu_row(const float *restrict input, float *restrict output, int32_t cols)
     ::aie::vector<float, N> outv = ::aie::mul(xv, sig).template to_vector<float>();
     ::aie::store_v(output + i, outv);
   }
+#elif SILU_MODE == 8
+  // --- LOW-PRESSURE inline Horner-poly tanh sigmoid (no call, no exp2f, no int-bit tricks) ---
+  // tanh(t) ~ t*Horner(t^2), deg-11 odd fit on [-3,3] (clamped). silu rel-L2 ~1e-3 (beats bf16-tanh
+  // 6.7e-3). Horner reuses one accumulator -> few live vectors -> small frame -> avoids the
+  // cross-call spill fault AND the spill/objectfifo-buffer collision. sigmoid=0.5*(1+tanh(x/2)).
+  const ::aie::vector<float, N> half = ::aie::broadcast<float, N>(0.5f);
+  const ::aie::vector<float, N> one = ::aie::broadcast<float, N>(1.0f);
+  const ::aie::vector<float, N> c3 = ::aie::broadcast<float, N>(3.0f);
+  const ::aie::vector<float, N> cm3 = ::aie::broadcast<float, N>(-3.0f);
+  const ::aie::vector<float, N> a0 = ::aie::broadcast<float, N>(0.98904683f);
+  const ::aie::vector<float, N> a1 = ::aie::broadcast<float, N>(-0.28778211f);
+  const ::aie::vector<float, N> a2 = ::aie::broadcast<float, N>(0.072722501f);
+  const ::aie::vector<float, N> a3 = ::aie::broadcast<float, N>(-0.01140079f);
+  const ::aie::vector<float, N> a4 = ::aie::broadcast<float, N>(0.00095127754f);
+  const ::aie::vector<float, N> a5 = ::aie::broadcast<float, N>(-3.1999843e-05f);
+  for (int i = 0; i < cols; i += N) {
+    ::aie::vector<float, N> xv = ::aie::load_v<N>(input + i);
+    ::aie::vector<float, N> t = ::aie::min(::aie::max(::aie::mul(xv, half).template to_vector<float>(), cm3), c3);
+    ::aie::vector<float, N> u = ::aie::mul(t, t).template to_vector<float>();
+    ::aie::vector<float, N> acc = a5;
+    acc = ::aie::add(::aie::mul(acc, u).template to_vector<float>(), a4);
+    acc = ::aie::add(::aie::mul(acc, u).template to_vector<float>(), a3);
+    acc = ::aie::add(::aie::mul(acc, u).template to_vector<float>(), a2);
+    acc = ::aie::add(::aie::mul(acc, u).template to_vector<float>(), a1);
+    acc = ::aie::add(::aie::mul(acc, u).template to_vector<float>(), a0);
+    ::aie::vector<float, N> th = ::aie::mul(t, acc).template to_vector<float>();      // tanh(x/2)
+    ::aie::vector<float, N> sig = ::aie::mul(half, ::aie::add(one, th)).template to_vector<float>();
+    ::aie::vector<float, N> outv = ::aie::mul(xv, sig).template to_vector<float>();
+    ::aie::store_v(output + i, outv);
+  }
 #elif SILU_MODE == 2
   // --- FULL f32-poly sigmoid (exact; HANGS -- bisect target) ---
   const ::aie::vector<float, N> one = ::aie::broadcast<float, N>(1.0f);
