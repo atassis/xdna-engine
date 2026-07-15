@@ -1,0 +1,48 @@
+##===- Makefile.raspill --------------------------------------------------===##
+#
+# Self-contained build for the minimal non-Parakeet RA/spill-around-call repro.
+# Does NOT depend on sync_kernels.sh / the mlir-aie programming_examples tree --
+# it resolves the aie_api include by path and drives aiecc directly, so it builds
+# in-place from route_b_kernels/probes/.
+#
+# Prereq: source the fork toolchain env first (PEANO_INSTALL_DIR + aiecc on PATH):
+#   source ../../../xdna-engine/scripts/iron_env.sh
+# Build (both variants):
+#   make -f Makefile.raspill NPU2=1 HOLD=1 all   # REPRO   (xv held across call)
+#   make -f Makefile.raspill NPU2=1 HOLD=0 all   # CONTROL (nothing held)
+# Produces build/final_raspill_h${HOLD}_${rows}x${cols}.xclbin + matching insts.
+#
+srcdir  := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
+repo    := $(realpath $(srcdir)/../..)
+ws      := $(realpath $(repo)/..)
+AIE_INC := $(ws)/mlir-aie/third_party/aie_api/include
+
+devicename ?= $(if $(filter 1,$(NPU2)),npu2,npu)
+HOLD  ?= 1
+rows  ?= 32
+cols  ?= 64
+ncores ?= 2
+tag = raspill_h${HOLD}_${rows}x${cols}
+
+PEANO ?= $(PEANO_INSTALL_DIR)
+PEANOWRAP2P_FLAGS = -O2 -std=c++20 --target=aie2p-none-unknown-elf -DNDEBUG -I $(AIE_INC)
+
+all: build/final_${tag}.xclbin
+
+build/ra_spill_repro_h${HOLD}.o: ra_spill_repro.cc
+	mkdir -p ${@D}
+	$(PEANO)/bin/clang++ $(PEANOWRAP2P_FLAGS) -DRA_HOLD=${HOLD} -c $< -o $@
+
+build/aie_${tag}.mlir: ra_spill_repro_iron.py
+	mkdir -p ${@D}
+	python3 $< -d ${devicename} -r ${rows} -c ${cols} -n ${ncores} > $@
+
+# aiecc expects the kernel object next to the mlir as ra_spill_repro.o (the Kernel() name).
+build/final_${tag}.xclbin: build/aie_${tag}.mlir build/ra_spill_repro_h${HOLD}.o
+	cp build/ra_spill_repro_h${HOLD}.o build/ra_spill_repro.o
+	cd build && aiecc --aie-generate-xclbin --aie-generate-npu-insts --no-compile-host \
+		--no-xchesscc --no-xbridge --peano $(PEANO) \
+		--xclbin-name=final_${tag}.xclbin --npu-insts-name=insts_${tag}.txt aie_${tag}.mlir
+
+clean:
+	rm -rf build
