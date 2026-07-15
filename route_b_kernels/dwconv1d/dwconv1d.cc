@@ -37,6 +37,13 @@
 
 using namespace aie;
 
+// STEP-4 fused-SiLU epilogue probe (opt-in; default OFF so normal builds are unchanged).
+// Build with -DDWCONV_SILU=1 to fuse silu into dwconv1d_shift's tail (guarded block below).
+// MUST be defined before dwconv1d_shift, which uses it. Reproduces the reverted step-4 attempt.
+#ifndef DWCONV_SILU
+#define DWCONV_SILU 0
+#endif
+
 // Emit L conv outputs starting at time `off`, storing to out[off .. off+L-1].
 //   data window = in_pad[off .. off + L + K - 2]  (load VD >= L+K-1 contiguous)
 template <int L, int K, int VD, bool BIAS>
@@ -156,7 +163,30 @@ static inline void dwconv1d_shift(const bfloat16 *restrict in, const bfloat16 *r
     a = ::aie::mac(a, ::aie::shuffle_down_fill(a0, a1, 4), c4); a = ::aie::mac(a, ::aie::shuffle_down_fill(a0, a1, 5), c5);
     a = ::aie::mac(a, ::aie::shuffle_down_fill(a0, a1, 6), c6); a = ::aie::mac(a, ::aie::shuffle_down_fill(a0, a1, 7), c7);
     a = ::aie::mac(a, ::aie::shuffle_down_fill(a0, a1, 8), c8);
+#if DWCONV_SILU
+    // FUSED-SiLU REPRODUCER (opt-in, default OFF; -DDWCONV_SILU=1). Fuses SiLU as the
+    // dwconv epilogue, hiprec recipe (matches glu.cc / mm_silu_epilogue_f32o_hiprec).
+    // This MISCOMPILES on toolchain.lock fb1f7095: adding ANY multi-op epilogue to this
+    // objectfifo-driven per-channel loop corrupts alternate (even) channel iterations
+    // (ping-pong buffer 0), odd bit-exact; NOT the SFU, accum-feed, or objectfifo depth
+    // (all refuted on device). => SiLU MUST be a SEPARATE brick, not fused here.
+    // Full isolation: docs/log/2026-07/dwconv-fused-epilogue-alt-channel-miscompile.md
+    //   silu(x) = x * sigmoid(x),  sigmoid(x) = 0.5*(1 + tanh(x/2))
+    ::aie::vector<float, 16> xf = a.template to_vector<float>();
+    ::aie::vector<float, 16> hx = ::aie::mul(xf, ::aie::broadcast<float, 16>(0.5f));
+    ::aie::vector<bfloat16, 16> th = ::aie::tanh<bfloat16>(hx);
+    ::aie::vector<bfloat16, 16> tp1 = ::aie::add(th, ::aie::broadcast<bfloat16, 16>(1.0f));
+    ::aie::vector<bfloat16, 16> sig = ::aie::mul(tp1, ::aie::broadcast<bfloat16, 16>(0.5f));
+    ::aie::accum<accfloat, 16> sacc;
+    sacc.from_vector(sig);
+    ::aie::vector<float, 16> sigf = sacc.template to_vector<float>();
+    ::aie::vector<float, 16> ov = ::aie::mul(xf, sigf);
+    ::aie::accum<accfloat, 16> oacc;
+    oacc.from_vector(ov);
+    ::aie::store_v(&out[o], oacc.template to_vector<bfloat16>());
+#else
     ::aie::store_v(&out[o], a.template to_vector<bfloat16>());
+#endif
   }
   event1();
 }
