@@ -433,7 +433,22 @@ impl FastConformerEncoder {
         // with no mm() inside, so they fold into the conv_dwconv Host leaf scope.
         let back = prof::time("dwconv", || {
             let _h = PhaseScope::new("conv_dwconv", Bucket::Host);
-            let glu_t = glu.t().to_owned(); // [T,D] -> [D,T]  (transpose 1, killed in step 3b)
+            // TIME-MAJOR fused dwconv+silu (step 3b): consumes GLU [T,D] DIRECTLY and emits [T,D]
+            // DIRECTLY -- BOTH host transposes DISSOLVED (no glu.t() in, no dwc.t() out). Gated like the
+            // channel-major fused path (CONV+SILU). Falls back to the channel-major path below (which
+            // keeps the two transposes) when the time-major xclbin is absent or t > DW_T.
+            #[cfg(feature = "npu")]
+            let tmajor = if std::env::var("PARAKEET_RESIDENT_CONV").is_ok()
+                && std::env::var("PARAKEET_RESIDENT_SILU").is_ok() {
+                self.npu.as_ref().and_then(|npu| npu.npu_dwconv_silu_tmajor(&glu, &taps, &dwb))
+            } else { None };
+            #[cfg(not(feature = "npu"))]
+            let tmajor: Option<Array2<f32>> = None;
+            if let Some(f) = tmajor {
+                return f; // [T,D] -- dwconv+silu applied on-NPU, transposes dissolved (step 3b)
+            }
+            // ---- fallback: channel-major fused / separate bricks / host (transposes stay host) ----
+            let glu_t = glu.t().to_owned(); // [T,D] -> [D,T]  (transpose 1, killed on the time-major path)
             // FUSED dwconv->SiLU (steps 3+4 in ONE xclbin, roadmap 5-A) when CONV+SILU are on + the fused
             // brick is present: one hw-context, the post-dwconv SiLU runs device-to-device (no second
             // switch, no host bridge). Returns silu(dwconv(glu_t)) [D,T] directly. Falls back to the
@@ -474,7 +489,7 @@ impl FastConformerEncoder {
                 let silu_npu: Option<Array2<f32>> = None;
                 silu_npu.unwrap_or_else(|| { silu_inplace(&mut dwc); dwc })
             };
-            dwc.t().to_owned() // [D,T] -> [T,D]  (transpose 2, killed in step 3b)
+            dwc.t().to_owned() // [D,T] -> [T,D]  (transpose 2, killed on the time-major path)
         });
         prof::phase::set_stage("conv_pw");
         // pw2 chain -> [D, D]: materialized lazily; skipped on warm passes.

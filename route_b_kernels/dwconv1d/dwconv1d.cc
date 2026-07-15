@@ -230,6 +230,50 @@ static inline void dwconv1d_shift_f32o(const bfloat16 *restrict in, const bfloat
   event1();
 }
 
+// TIME-MAJOR depthwise conv1d (conv step 3b -- the transpose-DISSOLVING layout). The channel-major
+// FIR above owns TIME within a channel (sliding window along t); this rotates the layout to [T, D]
+// and vectorizes ALONG D (per-lane), with the k=9 'same' halo carried ALONG TIME as consecutive ROW
+// loads. So there is NO in-register shuffle and NO cross-column DMA -- exactly the property that lets
+// it feed GLU's [T,D] directly and emit pw2's [T,D] directly, killing BOTH host transposes without
+// re-hitting the n-D-DMA co-residency hang (transpose+dwconv fighting over rows-vs-channels).
+//
+// Tile ABI (must match dwconv_silu_tmajor_iron.py):
+//   in  [TT+K-1, DD] bf16  -- halo input rows; the host zero-pads the sequence ends, so tiles
+//                              overlap by K-1 rows and out row i reads in rows [i, i+K).
+//   w   [K+1,   DD] bf16    -- TAP-MAJOR: row p (0..K-1) = tap p per-channel (per-lane); row K = the
+//                              BatchNorm-folded per-channel bias. Loading w[p*DD + d] is a contiguous
+//                              DD-vector, so each tap is one per-lane weight vector.
+//   out [TT,    DD] f32     -- out[i,d] = bias[d] + sum_{p=0..K-1} w[p,d] * in[i+p, d].
+// Precision recipe IDENTICAL to dwconv1d_shift_f32o (bf16 in -> accfloat accumulate -> f32 store,
+// set_rounding(conv_even)); only the layout differs (channel-major -> time-major). f32-out producer
+// stage of the fused dwconv->silu xclbin (silu core consumes the on-chip f32 fifo, unchanged).
+template <int TT, int DD, int K, bool BIAS>
+static inline void dwconv1d_tmajor_f32o(const bfloat16 *restrict in, const bfloat16 *restrict w,
+                                        float *restrict out) {
+  event0();
+  ::aie::set_rounding(::aie::rounding_mode::conv_even);
+  constexpr int VL = 16; // per-lane D vector width (32-byte aligned bf16 loads: DD,TT multiples of 16)
+  static_assert(DD % VL == 0, "DD must be a multiple of the D vector width");
+  for (int i = 0; i < TT; i++) {
+    for (int d = 0; d < DD; d += VL) {
+      ::aie::accum<accfloat, VL> acc;
+      if constexpr (BIAS)
+        acc.from_vector(::aie::load_v<VL>(&w[K * DD + d])); // bf16 bias row -> accfloat init
+      else
+        acc.from_vector(::aie::broadcast<float, VL>(0.0f));
+      // k taps: each a consecutive input ROW (halo along time) x its per-lane weight vector.
+      AIE_LOOP_UNROLL_FULL
+      for (int p = 0; p < K; p++) {
+        ::aie::vector<bfloat16, VL> iv = ::aie::load_v<VL>(&in[(i + p) * DD + d]);
+        ::aie::vector<bfloat16, VL> wv = ::aie::load_v<VL>(&w[p * DD + d]);
+        acc = ::aie::mac(acc, iv, wv);
+      }
+      ::aie::store_v(&out[i * DD + d], acc.template to_vector<float>());
+    }
+  }
+  event1();
+}
+
 // Kernel selection: default = the vectorized aligned+shuffle FIR (dwconv1d_shift). DWCONV_SCALAR=1
 // forces the scalar fallback (dwconv1d_same_scalar). The aie::sliding_mul brick (dwconv1d_same) is
 // RETAINED only as the broken-path reference for the upstream repro; never selected.
@@ -260,5 +304,13 @@ void dwconv1d_k5_bf16(bfloat16 *in, bfloat16 *w, bfloat16 *out) {
 // dwconv1d_k9_bf16, f32 output for the on-chip f32 ObjectFifo feeding the silu core.
 void dwconv1d_k9_bf16_f32o(bfloat16 *in, bfloat16 *w, float *out) {
   dwconv1d_shift_f32o<400, 9, 4, true>(in, w, out);
+}
+
+// Parakeet k=9 TIME-MAJOR dwconv, f32 out (the transpose-dissolving fused xclbin's producer stage).
+// TT/DD baked to the tile the dwconv_silu_tmajor_iron.py design streams: mb_T=20 output rows x
+// mb_D=128 D-lanes (D=1024 split over 8 columns). in [TT+8,DD] bf16, w [10,DD] bf16 tap-major,
+// out [TT,DD] f32. Keep TT/DD in lockstep with the iron design (MB_T / C//num_columns).
+void dwconv1d_k9_tmajor(bfloat16 *in, bfloat16 *w, float *out) {
+  dwconv1d_tmajor_f32o<20, 128, 9, true>(in, w, out);
 }
 }

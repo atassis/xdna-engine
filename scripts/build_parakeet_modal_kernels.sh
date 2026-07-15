@@ -89,5 +89,12 @@ echo "== RESIDENT-CONV: FUSED dwconv+silu 1024x400 (one xclbin) =="
 make -C $DWML -f Makefile.dwsilu NPU2=1 cols=8 build/final_dwconv_silu_1024x400.xclbin
 cp "$DWML/build/final_dwconv_silu_1024x400.xclbin" "$LNDIR/final_dwconv_silu_1024x400.xclbin"
 cp "$DWML/build/insts_dwconv_silu_1024x400.txt"    "$LNDIR/insts_dwconv_silu_1024x400.txt"
-echo "Built + staged resident FFN + conv xclbins (LN->fc1 seam + fc1->fc2 + GLU + dwconv + fused dwconv-silu) -> $LNDIR"
+# RESIDENT-CONV: TIME-MAJOR fused dwconv->SiLU (conv step 3b). [T,D] layout -> consumes GLU's [T,D]
+# directly + emits pw2's [T,D] directly, DISSOLVING both host transposes (no shuffle / cross-column
+# DMA -> no n-D-DMA hang). Same two-core pipeline; when present the Rust conv path prefers it.
+echo "== RESIDENT-CONV: TIME-MAJOR fused dwconv+silu 1024x400 (transposes dissolved) =="
+make -C $DWML -f Makefile.dwsilu_t NPU2=1 cols=8 build/final_dwconv_silu_t_1024x400.xclbin
+cp "$DWML/build/final_dwconv_silu_t_1024x400.xclbin" "$LNDIR/final_dwconv_silu_t_1024x400.xclbin"
+cp "$DWML/build/insts_dwconv_silu_t_1024x400.txt"    "$LNDIR/insts_dwconv_silu_t_1024x400.txt"
+echo "Built + staged resident FFN + conv xclbins (LN->fc1 seam + fc1->fc2 + GLU + dwconv + fused dwconv-silu [+ time-major]) -> $LNDIR"
 ls -la $LNDIR/

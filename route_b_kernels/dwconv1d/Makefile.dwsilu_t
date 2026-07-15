@@ -1,0 +1,64 @@
+##===- Makefile.dwsilu_t -------------------------------------------------===##
+#
+# TIME-MAJOR fused depthwise-conv1d -> SiLU xclbin (conv step 3b, transpose-dissolving). Two kernel
+# objects on two core stages in ONE design: dwconv1d.cc (dwconv1d_k9_tmajor, f32 out) + silu_brick.cc
+# (silu). Build:
+#   source ../xdna-engine/scripts/iron_env.sh
+#   make -f Makefile.dwsilu_t NPU2=1 cols=8 build/final_dwconv_silu_t_1024x400.xclbin
+# Produces final_dwconv_silu_t_1024x400.xclbin + insts_dwconv_silu_t_1024x400.txt.
+# (Both kernel .cc live in aie_kernels/aie2p after sync_kernels.sh; one VPATH covers them.)
+#
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+##===----------------------------------------------------------------------===##
+
+srcdir := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
+
+include ${srcdir}/../../makefile-common
+
+devicename ?= $(if $(filter 1,$(NPU2)),npu2,npu)
+cols ?= 8
+# silu_mode selects the silu recipe (silu_brick.cc SILU_MODE). Default 0 = shipped bf16-tanh (fast,
+# WER 8.5). Time-major keeps the IDENTICAL precision recipe to the channel-major brick (mode 0), only
+# the dwconv LAYOUT changes; do NOT raise precision here (WER is not silu-precision-bound).
+silu_mode ?= 0
+tag = dwconv_silu_t_1024x400
+
+ifeq ($(devicename),npu2)
+VPATH :=${srcdir}/../../../aie_kernels/aie2p
+else
+VPATH :=${srcdir}/../../../aie_kernels/aie2
+endif
+
+aie_py_src = dwconv_silu_tmajor_iron.py
+
+all: build/final_${tag}.xclbin
+
+build/%.cc.o: %.cc
+	mkdir -p ${@D}
+ifeq ($(devicename),npu2)
+	cd ${@D} && ${PEANO_INSTALL_DIR}/bin/clang++ ${PEANOWRAP2P_FLAGS} -c $< -o ${@F}
+else
+	echo "Only npu2 supported for this example"
+endif
+
+# dwconv producer object (archive, matches the iron design's "kernels.a")
+build/kernels.a: build/dwconv1d.cc.o
+	ar rvs $@ $+
+
+# silu consumer object (matches the iron design's "silu_brick.o")
+build/silu_brick.o: silu_brick.cc
+	mkdir -p ${@D}
+	cd ${@D} && ${PEANO_INSTALL_DIR}/bin/clang++ ${PEANOWRAP2P_FLAGS} -DSILU_MODE=${silu_mode} -c $< -o ${@F}
+
+build/aie_${tag}.mlir: ${srcdir}/${aie_py_src}
+	mkdir -p ${@D}
+	python3 $< -d ${devicename} -co ${cols} > $@
+
+build/final_${tag}.xclbin: build/aie_${tag}.mlir build/kernels.a build/silu_brick.o
+	mkdir -p ${@D}
+	cd ${@D} && aiecc --aie-generate-xclbin --aie-generate-npu-insts --no-compile-host \
+		--no-xchesscc --no-xbridge --peano ${PEANO_INSTALL_DIR} \
+		--xclbin-name=${@F} --npu-insts-name=insts_${tag}.txt aie_${tag}.mlir
+
+clean:
+	rm -rf build _build inst aie.mlir.prj core_* test.elf
