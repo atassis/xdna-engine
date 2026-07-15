@@ -84,6 +84,10 @@ cp "$RB/ctx_ln/affine_cast_iron.py"   "$PE/ml/layernorm/affine_cast_iron.py"
 cp "$RB/ctx_ln/Makefile.affinecast"   "$PE/ml/layernorm/Makefile.affinecast"
 cp "$RB/ctx_ln/deint_cast_iron.py"   "$PE/ml/layernorm/deint_cast_iron.py"
 cp "$RB/ctx_ln/Makefile.deint"        "$PE/ml/layernorm/Makefile.deint"
+# device-side GLU (conv-module gate step): a*sigmoid(g) over pw1's [T,2D] -> [T,D]
+cp "$RB/aie_kernels/glu.cc"           "$K/glu.cc"
+cp "$RB/ctx_ln/glu_iron.py"           "$PE/ml/layernorm/glu_iron.py"
+cp "$RB/ctx_ln/Makefile.glu"          "$PE/ml/layernorm/Makefile.glu"
 # mha_decode — on-chip single-query MHA for the Whisper decoder (M1 Task 0): kernel + design
 mkdir -p "$PE/ml/mha_decode"
 cp "$RB/mha_decode/mha_decode.cc"      "$K/mha_decode.cc"

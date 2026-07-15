@@ -124,6 +124,10 @@ struct ResidentLn {
     deint_instr: Bo,
     deint_n: usize,
     bo_deint: Bo, // [n_chunks*PAD_M*KRES] bf16 chunk-major (deint output, deint g4)
+    // conv-module GLU (step 2): a*sigmoid(g) over pw1's on-chip [PAD_M,2*KRES] f32 -> [PAD_M,KRES] f32,
+    // device-side (the pw1 GEMM output stays resident; GLU reads it as its A/g3 input, no host). OPTIONAL:
+    // absent when the glu xclbin isn't built, so the FFN LN->fc1 seam + step-1 resident pw1 still load.
+    glu: Option<ConvGlu>,
     // per-kernel dummy placeholders (0-size segfaults)
     ln_c: Bo,
     ln_tmp: Bo,
@@ -133,6 +137,18 @@ struct ResidentLn {
     deint_c: Bo,
     deint_tmp: Bo,
     deint_tr: Bo,
+}
+
+/// Device-side conv-module GLU kernel + its output/dummy BOs. Input (pw1's [PAD_M,2*KRES] f32) is fed
+/// as the A/g3 slot from the modal stream's bo_c; `bo_out` is the [PAD_M,KRES] f32 output on B/g4.
+struct ConvGlu {
+    kern: Rc<Kernel>,
+    instr: Bo,
+    n: usize,
+    bo_out: Bo, // [PAD_M, KRES] f32 (glu output, g4)
+    dummy_c: Bo,
+    dummy_tmp: Bo,
+    dummy_tr: Bo,
 }
 
 const DFF: usize = 4096; // Parakeet FFN inner dim (fc1 N / fc2 K)
@@ -360,6 +376,26 @@ impl NpuMatmul {
         let (deint_kern, deint_instr, deint_n) = load_path(
             self.ln_dir.join(format!("final_deint_{PAD_M}x{DFF}.xclbin")),
             self.ln_dir.join(format!("insts_deint_{PAD_M}x{DFF}.txt")));
+        // conv-module GLU (step 2), OPTIONAL: load only if the glu xclbin was built. A/g3 input is fed
+        // from the modal stream's bo_c (pw1 output); bo_out (g4) is the [PAD_M,KRES] f32 GLU result.
+        let glu = {
+            let xcl = self.ln_dir.join(format!("final_glu_{PAD_M}x{KRES}.xclbin"));
+            let ins = self.ln_dir.join(format!("insts_glu_{PAD_M}x{KRES}.txt"));
+            if xcl.exists() && ins.exists() {
+                let (kern, instr, n) = load_path(xcl, ins);
+                let gg = |i| kern.group_id(i).unwrap();
+                Some(ConvGlu {
+                    bo_out: self.dev.alloc_bo(&kern, PAD_M * KRES * 4, FLAG_HOST_ONLY, gg(4)).unwrap(),
+                    dummy_c: self.dev.alloc_bo(&kern, 1, FLAG_HOST_ONLY, gg(5)).unwrap(),
+                    dummy_tmp: self.dev.alloc_bo(&kern, 8, FLAG_HOST_ONLY, gg(6)).unwrap(),
+                    dummy_tr: self.dev.alloc_bo(&kern, 1, FLAG_HOST_ONLY, gg(7)).unwrap(),
+                    kern, instr, n,
+                })
+            } else {
+                eprintln!("[npu] glu xclbin absent in {} -- conv GLU stays host (build final_glu_{PAD_M}x{KRES})", self.ln_dir.display());
+                None
+            }
+        };
         let gl = |i| ln_kern.group_id(i).unwrap();
         let ga = |i| ac_kern.group_id(i).unwrap();
         let gd = |i| deint_kern.group_id(i).unwrap();
@@ -378,7 +414,7 @@ impl NpuMatmul {
             deint_tmp: self.dev.alloc_bo(&deint_kern, 8, FLAG_HOST_ONLY, gd(6)).unwrap(),
             deint_tr: self.dev.alloc_bo(&deint_kern, 1, FLAG_HOST_ONLY, gd(7)).unwrap(),
             ln_kern, ln_instr, ln_n, ac_kern, ac_instr, ac_n,
-            deint_kern, deint_instr, deint_n,
+            deint_kern, deint_instr, deint_n, glu,
         });
         rl
     }
@@ -461,6 +497,50 @@ impl NpuMatmul {
             self.weight_bo(id, w.view())
         };
         self.dispatch_with_a(&rl.bo_bf16, m, &wbo, n, silu && self.modal)
+    }
+
+    /// Resident conv-module front (LN -> pw1 -> GLU), the conv step-2 frontier advance: the activation
+    /// never touches host across the three ops.
+    ///   ctxLN -> affine_cast -> modal pw1 GEMM (N=2*KRES, identity, output STAYS device in the stream
+    ///   bo_c) -> GLU brick (a*sigmoid(g) over [PAD_M,2*KRES] -> [PAD_M,KRES], device-side) -> read [t,KRES].
+    /// `make_w1` = pw1 weight [KRES, 2*KRES]; `id` keys the pw1 W BO cache (shared with resident_ff1_fc1,
+    /// so warm passes hit). Returns None (caller keeps the host GLU) when the resident seam or the glu
+    /// xclbin is absent -- so a tree without the glu kernel still gets step-1's resident LN->pw1.
+    pub fn resident_conv_pw1_glu<F: FnOnce() -> Array2<f32>>(&self, x: &Array2<f32>, gamma: &[f32], beta: &[f32], make_w1: F, id: &str) -> Option<Array2<f32>> {
+        let rl = self.resident_ln()?;
+        let glu = rl.glu.as_ref()?; // glu xclbin absent -> None, caller falls back
+        self.stats.borrow_mut().calls += 1;
+        let m = x.nrows();
+        let n2 = 2 * KRES; // pw1 output width 2D
+        // LN + affine cast -> bo_bf16 = affine_LN(x) bf16 [PAD_M, KRES] (device).
+        let rlc = self.ln_affine_cast(x, gamma, beta);
+        // pw1 GEMM: A=bo_bf16, W1=[KRES,2D] identity-modal -> st.bo_c [PAD_M,2D] f32, STAYS on device.
+        let cached = self.wcache.borrow().get(id).cloned();
+        let wbo = if let Some(bo) = cached {
+            bo
+        } else {
+            let w = make_w1();
+            assert_eq!(w.nrows(), KRES, "pw1 W nrows {} != {KRES}", w.nrows());
+            assert_eq!(w.ncols(), n2, "pw1 W ncols {} != {n2}", w.ncols());
+            self.weight_bo(id, w.view())
+        };
+        let st = self.stream(n2, false); // identity modal (no on-chip silu on pw1)
+        self.kern.run_matmul8(3, &st.instr, st.n_instr, &rlc.bo_bf16, &wbo, &st.bo_c, &self.bo_tmp, &self.bo_tr).unwrap();
+        // GLU: st.bo_c [PAD_M,2D] f32 (A/g3) -> glu.bo_out [PAD_M,D] f32 (B/g4), device-side.
+        glu.kern.run_matmul8(3, &glu.instr, glu.n, &st.bo_c, &glu.bo_out, &glu.dummy_c, &glu.dummy_tmp, &glu.dummy_tr).unwrap();
+        self.stats.borrow_mut().dispatches += 2; // pw1 + glu
+        // read the D-wide GLU output for the m real rows (row-major, first m rows contiguous).
+        glu.bo_out.sync_from_device().unwrap();
+        let mut cb = vec![0u8; m * KRES * 4];
+        glu.bo_out.read_bytes(&mut cb).unwrap();
+        let mut out = Array2::<f32>::zeros((m, KRES));
+        for r in 0..m {
+            for c in 0..KRES {
+                let off = (r * KRES + c) * 4;
+                out[[r, c]] = f32::from_le_bytes([cb[off], cb[off + 1], cb[off + 2], cb[off + 3]]);
+            }
+        }
+        Some(out)
     }
 
     /// Full FFN device-side (LN -> fc1 -> SiLU -> fc2), the fc1->fc2 frontier step. Everything on-NPU,

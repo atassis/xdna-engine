@@ -371,45 +371,64 @@ impl FastConformerEncoder {
         };
 
         prof::phase::set_stage("conv_pw");
-        // pw1 = pointwise_conv1(LN(x)). RESIDENT conv-front seam (opt-in PARAKEET_RESIDENT_CONV=1):
-        // norm_conv LN + pw1 run FULLY on-NPU (ctxLN -> affine_cast -> modal pw1 N=2D identity),
-        // reusing the LN->fc1 bricks -- the stream never touches host across LN->pw1. Otherwise host
-        // LN then pw1 GEMM. h is [T, 2D] (mm's [K,N] layout) either way; GLU/dwconv/pw2 stay host.
+        // RESIDENT conv front (opt-in PARAKEET_RESIDENT_CONV=1). STEP 2: norm_conv LN + pw1 + GLU run
+        // FULLY on-NPU (ctxLN -> affine_cast -> modal pw1 N=2D identity -> GLU brick a*sigmoid(g)),
+        // producing the gated [T, D] directly -- the activation never touches host across LN->pw1->GLU.
+        // If the glu xclbin is absent, fall back to STEP 1 (resident LN->pw1 [T,2D]) + host GLU; if the
+        // resident seam is off entirely, full host LN + pw1 + host GLU. dwconv/pw2 stay host (next steps).
         #[cfg(feature = "npu")]
-        let resident_h = if std::env::var("PARAKEET_RESIDENT_CONV").is_ok() {
-            self.npu.as_ref().filter(|n| n.resident_ff_available()).map(|npu| {
+        let resident_glu = if std::env::var("PARAKEET_RESIDENT_CONV").is_ok() {
+            self.npu.as_ref().filter(|n| n.resident_ff_available()).and_then(|npu| {
                 let gamma = b.v("norm_conv.weight");
                 let beta = b.v("norm_conv.bias");
-                let _hh = PhaseScope::new("conv_resident_pw1", Bucket::Npu);
-                npu.resident_ff1_fc1(x, gamma.as_slice().unwrap(), beta.as_slice().unwrap(),
+                let _hh = PhaseScope::new("conv_resident_glu", Bucket::Npu);
+                npu.resident_conv_pw1_glu(x, gamma.as_slice().unwrap(), beta.as_slice().unwrap(),
                     || b.m3("conv.pointwise_conv1.weight").index_axis(Axis(2), 0).to_owned().t().to_owned(),
-                    &format!("{blk}.pw1"), 2 * d, false)
+                    &format!("{blk}.pw1"))
             })
         } else { None };
         #[cfg(not(feature = "npu"))]
-        let resident_h: Option<Array2<f32>> = None;
-        // fall back to host LN + pw1 GEMM when the resident seam is off/unavailable
-        let h = resident_h.unwrap_or_else(|| {
-            let conv_in = prof::time("ln", || {
-                let _hh = PhaseScope::new("ln", Bucket::Host);
-                layernorm(x, &b.v("norm_conv.weight"), &b.v("norm_conv.bias"))
-            });
-            self.mm_lazy(&conv_in, || {
-                let _wp = PhaseScope::new("conv_wprep", Bucket::Marshal);
-                b.m3("conv.pointwise_conv1.weight").index_axis(Axis(2), 0).to_owned().t().to_owned() // [2D,D,1]->[2D,D]->[D,2D]
-            }, &format!("{blk}.pw1"))
-        }); // [T, 2D]
-        // GLU: a * sigmoid(g)
-        let glu = prof::time("glu", || {
-            let _h = PhaseScope::new("conv_glu", Bucket::Host);
-            let mut glu = Array2::<f32>::zeros((t, d));
-            for i in 0..t {
-                for c in 0..d {
-                    glu[[i, c]] = h[[i, c]] * sigmoid(h[[i, d + c]]);
+        let resident_glu: Option<Array2<f32>> = None;
+
+        let glu = if let Some(g) = resident_glu {
+            g // [T, D] -- GLU already applied on-NPU (step 2)
+        } else {
+            // step-1 resident LN->pw1 if available, else host LN + pw1 GEMM -> h [T, 2D]
+            #[cfg(feature = "npu")]
+            let resident_h = if std::env::var("PARAKEET_RESIDENT_CONV").is_ok() {
+                self.npu.as_ref().filter(|n| n.resident_ff_available()).map(|npu| {
+                    let gamma = b.v("norm_conv.weight");
+                    let beta = b.v("norm_conv.bias");
+                    let _hh = PhaseScope::new("conv_resident_pw1", Bucket::Npu);
+                    npu.resident_ff1_fc1(x, gamma.as_slice().unwrap(), beta.as_slice().unwrap(),
+                        || b.m3("conv.pointwise_conv1.weight").index_axis(Axis(2), 0).to_owned().t().to_owned(),
+                        &format!("{blk}.pw1"), 2 * d, false)
+                })
+            } else { None };
+            #[cfg(not(feature = "npu"))]
+            let resident_h: Option<Array2<f32>> = None;
+            let h = resident_h.unwrap_or_else(|| {
+                let conv_in = prof::time("ln", || {
+                    let _hh = PhaseScope::new("ln", Bucket::Host);
+                    layernorm(x, &b.v("norm_conv.weight"), &b.v("norm_conv.bias"))
+                });
+                self.mm_lazy(&conv_in, || {
+                    let _wp = PhaseScope::new("conv_wprep", Bucket::Marshal);
+                    b.m3("conv.pointwise_conv1.weight").index_axis(Axis(2), 0).to_owned().t().to_owned() // [2D,D,1]->[2D,D]->[D,2D]
+                }, &format!("{blk}.pw1"))
+            }); // [T, 2D]
+            // GLU host: a * sigmoid(g)
+            prof::time("glu", || {
+                let _h = PhaseScope::new("conv_glu", Bucket::Host);
+                let mut glu = Array2::<f32>::zeros((t, d));
+                for i in 0..t {
+                    for c in 0..d {
+                        glu[[i, c]] = h[[i, c]] * sigmoid(h[[i, d + c]]);
+                    }
                 }
-            }
-            glu
-        });
+                glu
+            })
+        };
         // depthwise along time: [D, T]. Bracketing transposes + trailing SiLU are host math
         // with no mm() inside, so they fold into the conv_dwconv Host leaf scope.
         let back = prof::time("dwconv", || {

@@ -1,0 +1,33 @@
+##===- Makefile.glu ------------------------------------------------------===##
+#
+# Device-side GLU xclbin (Conformer conv-module gate step). Build:
+#   make -f Makefile.glu NPU2=1 rows=512 cols=1024 build/final_glu_512x1024.xclbin
+# Produces final_glu_${rows}x${cols}.xclbin + insts_glu_${rows}x${cols}.txt.
+# `cols` is the OUTPUT width D; the pw1-output input row is 2*cols wide.
+#
+srcdir := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
+include ${srcdir}/../../makefile-common
+VPATH := ${srcdir}/../../../aie_kernels/aie2p
+
+devicename ?= $(if $(filter 1,$(NPU2)),npu2,npu)
+rows ?= 512
+cols ?= 1024
+tag = glu_${rows}x${cols}
+
+aie_py_src = glu_iron.py
+
+all: build/final_${tag}.xclbin
+
+build/glu.o: glu.cc
+	mkdir -p ${@D}
+	cd ${@D} && ${PEANO_INSTALL_DIR}/bin/clang++ ${PEANOWRAP2P_FLAGS} -c $< -o ${@F}
+
+build/aie_${tag}.mlir: ${srcdir}/${aie_py_src}
+	mkdir -p ${@D}
+	python3 $< -d ${devicename} -r ${rows} -c ${cols} -t 0 > $@
+
+build/final_${tag}.xclbin: build/aie_${tag}.mlir build/glu.o
+	mkdir -p ${@D}
+	cd ${@D} && aiecc --aie-generate-xclbin --aie-generate-npu-insts --no-compile-host \
+		--no-xchesscc --no-xbridge --peano ${PEANO_INSTALL_DIR} \
+		--xclbin-name=${@F} --npu-insts-name=insts_${tag}.txt aie_${tag}.mlir
