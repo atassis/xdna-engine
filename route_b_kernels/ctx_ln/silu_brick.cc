@@ -6,14 +6,24 @@
 // dwconv epilogue) -- immune to the fused-epilogue per-channel-loop miscompile (KB log
 // dwconv-fused-epilogue-alt-channel-miscompile). Fed the dwconv output host-side.
 //
-// SILU_MODE (opt-in probes; default 0 = the SHIPPED brick, behavior unchanged):
-//   0  hybrid bf16-tanh sigmoid (tanh<bfloat16>, everything else f32). WORKS, RU 8.5
-//      (bf16-tanh precision floor). The committed default.
+// SILU_MODE (default 0 = the SHIPPED brick; the conv-module Makefiles build mode 0. mode 2 is
+// the EXACT f32 variant, now runnable via the enlarged worker stack -- see the mode-2 note):
+//   0  hybrid bf16-tanh sigmoid (tanh<bfloat16>, everything else f32). WORKS, RU 8.5. The
+//      committed default -- fast, and WER-equivalent to the exact mode 2 (WER is NOT silu-
+//      precision-bound; the 8.2->8.5 conv-silu gap is encoder hypersensitivity, not silu math).
 //   1  EXP2-ONLY probe: out = 2^(-|x|*log2e). Isolates the software f32 exp2f in this
 //      kernel context (does exp2f alone hang here?).
-//   2  FULL f32-poly sigmoid (exact, no bf16 LUT): sigmoid via exp2f + inv + 1 Newton
-//      step. This is the exact-8.2 path AND the candidate CRVO-7950 emulation, but it
-//      HANGS on device ("kernel run did not complete") -- bisect target.
+//   2  FULL f32-poly sigmoid (EXACT, no bf16 LUT): sigmoid via exp2f + inv + 1 Newton step.
+//      standalone rel-L2 ~6e-6 vs host silu(x)=x/(1+e^-x), EVEN 0 / ODD 0, no hang -- build it
+//      with silu_mode=2 (Makefile.silu2 / Makefile.dwsilu). NOT shipped: ~3.5x slower than
+//      mode 0 with NO WER gain (8.2->8.5 conv-silu gap is encoder sensitivity, not silu math).
+//      NOTE the earlier "HANGS on device" verdict was NOT a Peano/RA codegen defect -- it is a
+//      STACK-WINDOW overflow: the exact-f32 body spills a >1024 B frame, and at the IRON default
+//      1024 B worker stack the frame overflows into the adjacent EVEN objectfifo output buffer
+//      (out_buff_0, placed right after the stack -> even/odd corruption) or the lock region
+//      (hang). FIXED entirely IRON-side by sizing the worker stack past the frame (silu_iron.py
+//      / dwconv_silu_iron.py stack_size=8192). Root cause + ld.script memory map + WER reframe:
+//      docs/log/2026-07/dwconv-fused-epilogue-alt-channel-miscompile.md.
 //
 // Runtime ABI (mirrors glu_iron / ctx_ln): 1=instr, 3=in, 4=out, 5=tmp, 6=ctrl, 7=trace.
 // TRACKED COPY -- installed into mlir-aie/.../layernorm by sync_kernels.sh.

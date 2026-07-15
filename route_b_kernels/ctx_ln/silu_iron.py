@@ -47,8 +47,18 @@ def silu(dev, rows, cols, trace_size):
             of_in.release(1)
             of_out.release(1)
 
+    # STACK WINDOW (root-cause fix that makes the EXACT-f32 silu, SILU_MODE=2, run correctly;
+    # harmless no-op for the shipped bf16 mode 0 which spills nothing): the IRON default worker
+    # stack is 1024 B (0x400), and the allocator places out_buff_0 (the EVEN output ping-pong
+    # buffer) IMMEDIATELY after it (out_0_buff_0 @ stack_top). A heavy exact-f32 body spills a
+    # >1024 B frame, so the stack overflows past its window and clobbers out_buff_0 -> EVEN rows
+    # garbage, ODD (out_buff_1, next bank) bit-exact (and a bigger cross-call frame wedges the
+    # lock region -> the "f32-silu hang"). Root-caused via the ld.script memory map + .stack_sizes;
+    # NOT a Peano/llvm-aie RA defect. Sizing the window past the worst-case frame fixes both faces.
+    stack_size = 8192
     workers = [
-        Worker(core_body, fn_args=[of_in[i].cons(), of_out[i].prod(), kern])
+        Worker(core_body, fn_args=[of_in[i].cons(), of_out[i].prod(), kern],
+               stack_size=stack_size)
         for i in range(n_cores)
     ]
 

@@ -16,6 +16,11 @@ include ${srcdir}/../../makefile-common
 
 devicename ?= $(if $(filter 1,$(NPU2)),npu2,npu)
 cols ?= 8
+# silu_mode selects the silu recipe (silu_brick.cc SILU_MODE). Default 0 = shipped bf16-tanh
+# (fast, WER 8.5). silu_mode=2 = exact f32 (needs the enlarged silu-core stack in
+# dwconv_silu_iron.py to avoid the frame overflowing the even objectfifo buffer); runs clean
+# but ~3.5x slower with no WER gain, so not shipped. See the silu-brick root-cause log.
+silu_mode ?= 0
 tag = dwconv_silu_1024x400
 
 ifeq ($(devicename),npu2)
@@ -43,7 +48,7 @@ build/kernels.a: build/dwconv1d.cc.o
 # silu consumer object (matches silu_iron.py's "silu_brick.o")
 build/silu_brick.o: silu_brick.cc
 	mkdir -p ${@D}
-	cd ${@D} && ${PEANO_INSTALL_DIR}/bin/clang++ ${PEANOWRAP2P_FLAGS} -c $< -o ${@F}
+	cd ${@D} && ${PEANO_INSTALL_DIR}/bin/clang++ ${PEANOWRAP2P_FLAGS} -DSILU_MODE=${silu_mode} -c $< -o ${@F}
 
 build/aie_${tag}.mlir: ${srcdir}/${aie_py_src}
 	mkdir -p ${@D}

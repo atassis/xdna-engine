@@ -86,9 +86,16 @@ def my_dwconv_silu(dev, num_columns):
         workers.append(
             Worker(dwconv_body, [of_ins[i].cons(), of_ws[i].cons(), of_mids[i].prod(), dwconv])
         )
+    # EXACT-f32 silu (SILU_MODE=2) spills a >1024 B frame. The IRON default worker stack is
+    # 1024 B and the allocator places the EVEN objectfifo output buffer immediately after it,
+    # so an oversize frame overflows into that buffer (even/odd corruption) or the lock region
+    # (hang). Size the silu-core stack window past the exact-f32 frame. Root cause + fix:
+    # docs/log/2026-07/dwconv-fused-epilogue-alt-channel-miscompile.md.
+    silu_stack = 8192
     for i in range(num_columns):
         workers.append(
-            Worker(silu_body, [of_mids[i].cons(), of_outs[i].prod(), silu])
+            Worker(silu_body, [of_mids[i].cons(), of_outs[i].prod(), silu],
+                   stack_size=silu_stack)
         )
 
     # Modern IRON idiom (place-tiles toolchain): simple_tiler + plain fill/drain (mirrors dwconv1d.py /

@@ -13,15 +13,25 @@ VPATH := ${srcdir}/../../../aie_kernels/aie2p
 devicename ?= $(if $(filter 1,$(NPU2)),npu2,npu)
 rows ?= 1024
 cols ?= 400
+# silu_mode selects the silu recipe (silu_brick.cc SILU_MODE). Default 0 = the SHIPPED hybrid
+# bf16-tanh brick (fast, WER 8.5). silu_mode=2 = the EXACT f32 sigmoid (exp2f+inv+Newton,
+# rel-L2 ~6e-6 vs host silu) -- now that silu_iron.py sizes the worker stack past the exact-f32
+# frame it runs CLEAN (EVEN/ODD 0, no hang); but it is ~3.5x slower with NO WER gain (WER is not
+# silu-precision-bound -- see docs/log/2026-07/dwconv-fused-epilogue-alt-channel-miscompile.md
+# "Stack-overflow root cause + WER reframe"), so it is not the shipped default.
+silu_mode ?= 0
 tag = silu_${rows}x${cols}
 
 aie_py_src = silu_iron.py
 
 all: build/final_${tag}.xclbin
 
+# silu_mode selects the SILU_MODE probe (default 0 = the shipped hybrid bf16-tanh brick).
+# Pass silu_mode=N to build a probe variant; .o carries the mode so downstream xclbin/insts
+# keep the canonical name (rebuild the .o when switching modes: rm build/silu_brick.o).
 build/silu_brick.o: silu_brick.cc
 	mkdir -p ${@D}
-	cd ${@D} && ${PEANO_INSTALL_DIR}/bin/clang++ ${PEANOWRAP2P_FLAGS} -c $< -o ${@F}
+	cd ${@D} && ${PEANO_INSTALL_DIR}/bin/clang++ ${PEANOWRAP2P_FLAGS} -DSILU_MODE=${silu_mode} -c $< -o ${@F}
 
 build/aie_${tag}.mlir: ${srcdir}/${aie_py_src}
 	mkdir -p ${@D}
