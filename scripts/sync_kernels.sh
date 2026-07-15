@@ -29,6 +29,12 @@ cp "$RB/dwconv1d/Makefile"    "$PE/ml/dwconv1d/Makefile"
 # dwconv1d.cc (above) and silu_brick.cc (synced below) in $K.
 cp "$RB/dwconv1d/dwconv_silu_iron.py" "$PE/ml/dwconv1d/dwconv_silu_iron.py"
 cp "$RB/dwconv1d/Makefile.dwsilu"     "$PE/ml/dwconv1d/Makefile.dwsilu"
+# on-chip COMPUTE-tile transpose brick (conv step 3b enabler): element transpose in-core
+# (transpose_tile.cc), shim DMA does only contiguous read + unit-inner-stride scatter --
+# AVOIDS the transposing n-D DMA that hangs when co-resident (blocker npu.rs:740).
+cp "$RB/aie_kernels/transpose_tile.cc"  "$K/transpose_tile.cc"
+cp "$RB/dwconv1d/transpose_iron.py"     "$PE/ml/dwconv1d/transpose_iron.py"
+cp "$RB/dwconv1d/Makefile.transpose"    "$PE/ml/dwconv1d/Makefile.transpose"
 # fused bias+SiLU / narrow epilogue kernel (docs/10)
 cp "$RB/aie_kernels/mm_silu_epilogue.cc" "$K/mm_silu_epilogue.cc"
 # softmax-400 (pad->416) example

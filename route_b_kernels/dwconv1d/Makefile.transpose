@@ -1,0 +1,68 @@
+##===- Makefile.transpose ------------------------------------------------===##
+#
+# On-chip COMPUTE-tile transpose xclbin (conv-module Task 0.1). ONE kernel object
+# (transpose_tile.cc, element transpose in-core) on `cols` cores. Build e.g.:
+#   source ../xdna-engine/scripts/iron_env.sh
+#   # forward [D=1024,T=400] -> [T,D], bf16:
+#   make -f Makefile.transpose NPU2=1 M=1024 N=400 mb=8 cols=8 dt=bf16 \
+#        build/final_transpose_1024x400_bf16.xclbin
+#   # f32: dt=f32 (compiles transpose_tile.cc with -DTPOSE_i32)
+# Produces final_transpose_<tag>.xclbin + insts_transpose_<tag>.txt.
+#
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+##===----------------------------------------------------------------------===##
+
+srcdir := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
+
+include ${srcdir}/../../makefile-common
+
+devicename ?= $(if $(filter 1,$(NPU2)),npu2,npu)
+M    ?= 1024
+N    ?= 400
+mb   ?= 8
+nb   ?= 0
+cols ?= 8
+dt   ?= bf16
+tag  = $(M)x$(N)_$(dt)
+
+# f32 -> 4-byte elements (uint32); bf16 -> default 2-byte (uint16)
+ifeq ($(dt),f32)
+DT_FLAG := -DTPOSE_i32
+else
+DT_FLAG :=
+endif
+
+ifeq ($(devicename),npu2)
+VPATH :=${srcdir}/../../../aie_kernels/aie2p
+else
+VPATH :=${srcdir}/../../../aie_kernels/aie2
+endif
+
+aie_py_src = transpose_iron.py
+
+all: build/final_transpose_${tag}.xclbin
+
+# transpose kernel object (element type selected by DT_FLAG). Object filename is
+# dt-specific so switching bf16<->f32 always recompiles with the right -D.
+obj = transpose_tile_${dt}.o
+
+build/${obj}: transpose_tile.cc
+	mkdir -p ${@D}
+ifeq ($(devicename),npu2)
+	cd ${@D} && ${PEANO_INSTALL_DIR}/bin/clang++ ${PEANOWRAP2P_FLAGS} ${DT_FLAG} -c $< -o ${obj}
+else
+	echo "Only npu2 supported for this example"
+endif
+
+build/aie_transpose_${tag}.mlir: ${srcdir}/${aie_py_src}
+	mkdir -p ${@D}
+	python3 $< -d ${devicename} -M ${M} -N ${N} -mb ${mb} -nb ${nb} -co ${cols} -dt ${dt} -obj ${obj} > $@
+
+build/final_transpose_${tag}.xclbin: build/aie_transpose_${tag}.mlir build/${obj}
+	mkdir -p ${@D}
+	cd ${@D} && aiecc --aie-generate-xclbin --aie-generate-npu-insts --no-compile-host \
+		--no-xchesscc --no-xbridge --peano ${PEANO_INSTALL_DIR} \
+		--xclbin-name=${@F} --npu-insts-name=insts_transpose_${tag}.txt aie_transpose_${tag}.mlir
+
+clean:
+	rm -rf build _build inst aie.mlir.prj core_* test.elf
