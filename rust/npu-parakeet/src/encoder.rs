@@ -237,11 +237,60 @@ impl FastConformerEncoder {
         // constant qkv/pos/out weights. Only the tiny pos_bias_u/v (consumed later in the score
         // loop, NOT a cached BO) stay eager, exactly as the original.
         prof::phase::set_stage("mhsa_qkv");
-        let q = self.mm_lazy(x, || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_q.weight") }, &format!("{blk}.q")); // [T, D]
-        prof::phase::set_stage("mhsa_qkv");
-        let k = self.mm_lazy(x, || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_k.weight") }, &format!("{blk}.k"));
-        prof::phase::set_stage("mhsa_qkv");
-        let v = self.mm_lazy(x, || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_v.weight") }, &format!("{blk}.v"));
+        // x is pre-LN. RESIDENT LN->QKV seam (opt-in PARAKEET_RESIDENT_MHA): norm_self_att LN runs
+        // on-NPU (ctxLN -> affine_cast) and feeds the q/k/v modal GEMMs device-side off one resident
+        // bf16 A -- the host LN is off the MHSA frontier. Falls back to host layernorm + mm_lazy when
+        // the seam is off or the resident xclbins are absent (WER-identical to the old block()-level LN).
+        #[cfg(feature = "npu")]
+        let resident_mha = std::env::var("PARAKEET_RESIDENT_MHA").is_ok();
+        #[cfg(not(feature = "npu"))]
+        let resident_mha = false;
+        #[cfg(feature = "npu")]
+        let resident_qkv = if resident_mha {
+            self.npu.as_ref().filter(|n| n.resident_ff_available()).map(|npu| {
+                let gamma = b.v("norm_self_att.weight");
+                let beta = b.v("norm_self_att.bias");
+                let _hh = PhaseScope::new("mha_resident_qkv", Bucket::Npu);
+                npu.resident_mha_ln_qkv(x, gamma.as_slice().unwrap(), beta.as_slice().unwrap(),
+                    || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_q.weight") }, &format!("{blk}.q"),
+                    || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_k.weight") }, &format!("{blk}.k"),
+                    || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_v.weight") }, &format!("{blk}.v"))
+            })
+        } else { None };
+        #[cfg(not(feature = "npu"))]
+        let resident_qkv: Option<(Array2<f32>, Array2<f32>, Array2<f32>)> = None;
+        let (q, k, v) = if let Some((q, k, v)) = resident_qkv {
+            (q, k, v)
+        } else {
+            // Host LN (or no-npu) + mm_lazy projections. x is pre-LN, so do the norm_self_att LN here
+            // -- identical to the old block()-level LN, so this path (incl. the host-MHA DEFAULT) is
+            // WER-neutral. The resident seam replaces exactly this LN + these three GEMMs.
+            let ln_x = {
+                let _h = PhaseScope::new("ln", Bucket::Host);
+                layernorm(x, &b.v("norm_self_att.weight"), &b.v("norm_self_att.bias"))
+            };
+            let q = self.mm_lazy(&ln_x, || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_q.weight") }, &format!("{blk}.q")); // [T, D]
+            let k = self.mm_lazy(&ln_x, || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_k.weight") }, &format!("{blk}.k"));
+            let v = self.mm_lazy(&ln_x, || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_v.weight") }, &format!("{blk}.v"));
+            (q, k, v)
+        };
+        // A/B (PARAKEET_MHA_QKV_AB=1): resident LN->QKV vs host layernorm(x)@W, rel-L2 per projection.
+        #[cfg(feature = "npu")]
+        if resident_mha && std::env::var("PARAKEET_MHA_QKV_AB").is_ok()
+            && self.npu.as_ref().map(|n| n.resident_ff_available()).unwrap_or(false) {
+            let ln_x = layernorm(x, &b.v("norm_self_att.weight"), &b.v("norm_self_att.bias"));
+            let rel = |dev: &Array2<f32>, wname: &str| {
+                let host = ln_x.dot(&b.m(wname));
+                let mut num = 0f64; let mut den = 0f64;
+                for i in 0..dev.nrows() { for j in 0..dev.ncols() {
+                    let e = (dev[[i, j]] - host[[i, j]]) as f64; let g = host[[i, j]] as f64;
+                    num += e * e; den += g * g;
+                } }
+                if den > 0.0 { (num / den).sqrt() } else { 0.0 }
+            };
+            eprintln!("[MHA_QKV_AB] blk={blk} T={t} q_relL2={:.4e} k_relL2={:.4e} v_relL2={:.4e}",
+                rel(&q, "self_attn.linear_q.weight"), rel(&k, "self_attn.linear_k.weight"), rel(&v, "self_attn.linear_v.weight"));
+        }
         prof::phase::set_stage("mhsa_pos");
         let pm = self.mm_lazy(pos_enc, || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_pos.weight") }, &format!("{blk}.pos")); // [P, D]
         let (ubias, vbias) = {
@@ -551,11 +600,9 @@ impl FastConformerEncoder {
             let _h = PhaseScope::new("residual", Bucket::Host);
             x = x + ff1.mapv(|v| 0.5 * v); // macaron 0.5 scaling + residual add
         }
-        let satt_in = prof::time("ln", || {
-            let _h = PhaseScope::new("ln", Bucket::Host);
-            layernorm(&x, &b.v("norm_self_att.weight"), &b.v("norm_self_att.bias"))
-        });
-        let mhsa_out = prof::time("mhsa", || self.mhsa(&satt_in, blk, pos_enc));
+        // mhsa now does its own norm_self_att LN (resident LN->QKV seam or host fallback), so pass
+        // pre-LN x -- mirroring conv_module. The residual below still adds mhsa_out to pre-LN x.
+        let mhsa_out = prof::time("mhsa", || self.mhsa(&x, blk, pos_enc));
         {
             let _h = PhaseScope::new("residual", Bucket::Host);
             x = &x + &mhsa_out;
