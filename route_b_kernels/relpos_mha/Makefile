@@ -25,6 +25,10 @@ KB ?= 43
 # A MAX-T build (T=172) with TACTIVE<T computes correct attention for a shorter clip
 # padded to T -- de-risks the single-xclbin-serves-any-T path.
 TACTIVE ?= ${T}
+# STEP=8 spatial-parallel heads: number of attention heads run on H parallel cores
+# (one Worker/head), one dispatch/block. HEADS=8 = Parakeet n_heads. HEADS=1 = the
+# original single-Worker block. Only the STEP=8 generator consumes it.
+HEADS ?= 1
 
 # STEP selects which entry point / generator this xclbin drives:
 #   STEP=1 (default) -- relpos_scores_softmax : host-fed AC + BD -> probs (no matmul).
@@ -99,7 +103,7 @@ build/kernels.a: build/relpos_mha.cc.o
 # STEP=8 (streaming) generator also needs TQ/KB to compute block counts + unroll;
 # STEP<=7 bake TQ/KB in the .cc only, so pass just -T there.
 ifeq ($(STEP),8)
-GEN_EXTRA = --tq ${TQ} --kb ${KB} --tactive ${TACTIVE}
+GEN_EXTRA = --tq ${TQ} --kb ${KB} --tactive ${TACTIVE} --heads ${HEADS}
 # SPLITP=1 -> split-bf16 positional operand (BD = qv.p_hi + qv.p_lo). Closes the
 # resident-MHA WER gap (the p-rounding precision sink). Host packs k|p_hi|p_lo|V.
 ifeq ($(SPLITP),1)

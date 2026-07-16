@@ -315,24 +315,26 @@ impl FastConformerEncoder {
             && self.npu.as_ref().map(|n| t <= n.relpos_max_t()).unwrap_or(false) {
             if let Some(npu) = &self.npu {
                 let _h = PhaseScope::new("mhsa_resident", Bucket::Npu);
-                let mut ctx = Array2::<f32>::zeros((t, d));
-                for hh in 0..h {
-                    let col = hh * dk;
-                    let qh = q.slice(s![.., col..col + dk]);
-                    let kh = k.slice(s![.., col..col + dk]).to_owned();
-                    let ph = pm.slice(s![.., col..col + dk]).to_owned();
-                    let vh = v.slice(s![.., col..col + dk]).to_owned();
-                    let mut qu = qh.to_owned();
-                    let mut qv = qh.to_owned();
-                    for i in 0..t {
-                        for c in 0..dk {
-                            qu[[i, c]] += ubias[[hh, c]];
-                            qv[[i, c]] += vbias[[hh, c]];
+                // Phase-2: ALL h heads in ONE dispatch (h parallel cores) -> ctx [t, d].
+                let ctx = npu.relpos_mha_batched(&q, &k, &pm, &v, &ubias, &vbias);
+                // A/B localizer (PARAKEET_MHA_AB=1): compare resident ctx vs f32 host golden for
+                // head 0 AND a non-zero head (parallelism must not change per-head numerics).
+                if std::env::var("PARAKEET_MHA_AB").is_ok() {
+                    for &hh in &[0usize, (h / 2).min(h - 1)] {
+                        let col = hh * dk;
+                        let qh = q.slice(s![.., col..col + dk]);
+                        let kh = k.slice(s![.., col..col + dk]).to_owned();
+                        let ph = pm.slice(s![.., col..col + dk]).to_owned();
+                        let vh = v.slice(s![.., col..col + dk]).to_owned();
+                        let mut qu = qh.to_owned();
+                        let mut qv = qh.to_owned();
+                        for i in 0..t {
+                            for c in 0..dk {
+                                qu[[i, c]] += ubias[[hh, c]];
+                                qv[[i, c]] += vbias[[hh, c]];
+                            }
                         }
-                    }
-                    let ch = npu.relpos_mha(&qu, &qv, &kh, &ph, &vh);
-                    // A/B localizer (PARAKEET_MHA_AB=1): compare head-0 resident ctx vs f32 host golden.
-                    if hh == 0 && std::env::var("PARAKEET_MHA_AB").is_ok() {
+                        let ch = ctx.slice(s![.., col..col + dk]).to_owned();
                         let pp = ph.nrows();
                         let ac = qu.dot(&kh.t()); // [T,T]
                         let mut bd_all1 = Array3::<f32>::zeros((1, t, pp));
@@ -358,15 +360,15 @@ impl FastConformerEncoder {
                             let rrel = if rd > 0.0 { (rn / rd).sqrt() } else { 0.0 };
                             if rrel > maxrow.1 { maxrow = (i, rrel); }
                         }
-                        eprintln!("[MHA_AB] blk={blk} h0 T={t} ctx_relL2={:.4e} worst_row={} row_relL2={:.4e}",
+                        eprintln!("[MHA_AB] blk={blk} h{hh} T={t} ctx_relL2={:.4e} worst_row={} row_relL2={:.4e}",
                             (num / den).sqrt(), maxrow.0, maxrow.1);
 
-                        // ---- PROBE (Ladder step 1): decompose the ~1% bf16 I/O quantization. Feed
+                      // ---- PROBE (Ladder step 1, head-0 only): decompose the ~1% bf16 I/O quantization. Feed
                         // bf16-rounded operands into the SAME f32 host golden and measure ctx rel-L2
                         // vs pure-f32 (ch_host). Pure host math, no device -- isolates which rounding
                         // hop (AC inputs / BD inputs / probs narrow / V narrow / ctx-out narrow) owns
                         // the gap, and whether the full emulation reproduces the resident ~1.05e-2.
-                        {
+                        if hh == 0 {
                             let rb = |x: f32| npu_xrt::bf16_bits_to_f32(npu_xrt::f32_to_bf16_bits(x));
                             let rl2 = |a: &Array2<f32>| -> f64 {
                                 let mut n = 0f64; let mut dd = 0f64;
@@ -436,7 +438,6 @@ impl FastConformerEncoder {
                             eprintln!("[MHA_PROBE] blk={blk} h0 T={t} bd_in={bd_in:.4e} bd_qv={bd_qv:.4e} bd_p={bd_p:.4e} emul_full={emul:.4e} FIX_split_p={split_p:.4e} FIX_split_x3={split_x3:.4e}");
                         }
                     }
-                    ctx.slice_mut(s![.., col..col + dk]).assign(&ch);
                 }
                 prof::phase::set_stage("mhsa_qkv");
                 return self.mm_lazy(&ctx, || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_out.weight") }, &format!("{blk}.out"));
