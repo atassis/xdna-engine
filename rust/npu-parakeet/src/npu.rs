@@ -30,21 +30,33 @@ struct NStream {
     bo_c: Bo, // [PAD_M, n] f32
 }
 
-// Resident relpos-MHA block (STEP=8, STEP-C runtime-t_active). ONE xclbin sized for the MAX
-// frame count RELPOS_BUILT_T serves ANY clip T <= it: the softmax reads t_active from per-head RTPs
+// Resident relpos-MHA block (STEP=8, STEP-C runtime-t_active). Each xclbin is sized for a MAX
+// frame count BUILT_T and serves ANY clip T <= it: the softmax reads t_active from per-head RTPs
 // baked into the instruction stream (RELPOS_HEADS words, all == BUILT_T), so per clip we PATCH every
-// such word of a template insts (zero build) and pad k/p/V to RELPOS_BUILT_T. Loaded once, resident.
+// such word of a template insts (zero build) and pad k/p/V to that bucket's BUILT_T. Loaded once each,
+// co-resident.
+//
+// T-BUCKETING: the kernel dots every query-tile against ALL BUILT_T padded keys regardless of the
+// clip's runtime t_active (softmax masks, but the DOT COMPUTE is already spent), so a clip padded from
+// T=90 up to BUILT_T=172 wastes ~1.9x the relpos compute. Measured: BUILT_T 172->100 cut relpos
+// dispatch ~29% on clips that fit (WER-neutral). So we hold SEVERAL buckets co-resident and dispatch
+// the SMALLEST whose BUILT_T >= the clip's T. Each bucket = (BUILT_T, KB, subdir under artifacts/relpos)
+// -- KB (key-block rows) is baked into the xclbin's buffer sizes so it MUST match the build. Ascending
+// by BUILT_T; the last (largest) is the ceiling served by relpos_max_t(). Add a bucket by building its
+// xclbin (scripts/relpos_prebuild.sh with BUILT_T/KB) into its subdir and listing it here.
 const RELPOS_TQ: usize = 8;
-const RELPOS_KB: usize = 43;
 const RELPOS_DK: usize = 128;   // Parakeet head_dim (kernel bakes DK=128)
-const RELPOS_BUILT_T: usize = 172; // baked buffer/dataflow size of the single xclbin
+const RELPOS_BUCKETS: &[(usize, usize, &str)] = &[
+    (100, 25, "bucket_100"), // short clips (T<=100): ~29% less relpos padding compute (measured)
+    (172, 43, "single"),     // ceiling bucket; serves any T in (100, 172]
+];
 // Phase-2 spatial-parallel: the H=8 attention heads run on H PARALLEL cores (one head/core),
 // ONE dispatch/block. The BOs concatenate all H heads; each head's Worker reads/writes its own
 // slice via a per-head shim OFFSET tap. The insts template holds H t_active words (one per head's
 // RTP write), all == RELPOS_BUILT_T at build; per clip we patch EVERY word == BUILT_T to t.
 const RELPOS_HEADS: usize = 8; // = Parakeet n_heads; must match the xclbin's --heads build
 
-/// The single resident relpos block (built at RELPOS_BUILT_T). BOs are sized for BUILT_T; per
+/// One resident relpos block for a single T-bucket (built at `built_t`). BOs are sized for BUILT_T; per
 /// dispatch we patch the instr template's t_active word and pad data to BUILT_T. Dispatched per
 /// head via run_dwconv6(3, instr, n, quv, kpv, ctx).
 struct RelposK {
@@ -55,6 +67,7 @@ struct RelposK {
     bo_quv: Bo,
     bo_kpv: Bo,
     bo_ctx: Bo,
+    built_t: usize,  // this bucket's baked BUILT_T (t_active words in the template == this; patched per clip)
     n_qt: usize,     // ceil(BUILT_T/TQ)
     tp: usize,       // k/V padded rows (n_kb*KB for BUILT_T)
     pp: usize,       // p padded rows (n_pb*KB for BUILT_T)
@@ -316,32 +329,45 @@ impl NpuMatmul {
         }
     }
 
-    /// Max clip length T the resident relpos block can serve (the baked BUILT_T). Callers MUST gate
-    /// the resident MHA path on `t <= relpos_max_t()` and fall back to the host attention for longer
-    /// clips -- the resident BOs/dataflow are sized for BUILT_T and cannot serve T beyond it.
-    pub fn relpos_max_t(&self) -> usize { RELPOS_BUILT_T }
+    /// Max clip length T the resident relpos block can serve (the largest bucket's baked BUILT_T).
+    /// Callers MUST gate the resident MHA path on `t <= relpos_max_t()` and fall back to the host
+    /// attention for longer clips -- the resident BOs/dataflow are sized for BUILT_T and cannot serve
+    /// T beyond it.
+    pub fn relpos_max_t(&self) -> usize { RELPOS_BUCKETS.last().unwrap().0 }
 
-    /// Load (once) the SINGLE resident relpos block built at RELPOS_BUILT_T. Reads the xclbin +
-    /// template insts from {root}/artifacts/relpos/single/ (pre-build: scripts/relpos_prebuild.sh).
-    /// The same xclbin serves any clip T <= BUILT_T; per dispatch we patch the insts t_active word.
-    fn relpos_block(&self) -> Rc<RelposK> {
-        if let Some(k) = self.relpos.borrow().get(&RELPOS_BUILT_T) {
+    /// Pick the SMALLEST bucket whose BUILT_T >= t (RELPOS_BUCKETS is ascending). Panics only if t
+    /// exceeds the ceiling bucket -- callers gate on relpos_max_t() first.
+    /// A/B toggle: PARAKEET_RELPOS_NO_BUCKET=1 forces the ceiling bucket for EVERY clip (the pre-
+    /// T-bucketing baseline), so one binary runs the rigorous same-session A/B (no rebuild drift).
+    fn relpos_bucket_for(t: usize) -> (usize, usize, &'static str) {
+        if std::env::var_os("PARAKEET_RELPOS_NO_BUCKET").is_some() {
+            return *RELPOS_BUCKETS.last().unwrap();
+        }
+        *RELPOS_BUCKETS.iter().find(|(bt, _, _)| *bt >= t)
+            .unwrap_or_else(|| panic!("clip T={t} exceeds relpos ceiling BUILT_T={}", RELPOS_BUCKETS.last().unwrap().0))
+    }
+
+    /// Load (once) the resident relpos block for one T-bucket (BUILT_T, KB, subdir). Reads the xclbin +
+    /// template insts from {root}/artifacts/relpos/{subdir}/ (pre-build: scripts/relpos_prebuild.sh).
+    /// The bucket serves any clip T <= its BUILT_T; per dispatch we patch the insts t_active word.
+    /// Cached in `self.relpos` keyed by BUILT_T so each bucket loads once and stays co-resident.
+    fn relpos_block(&self, bt: usize, kb: usize, subdir: &str) -> Rc<RelposK> {
+        if let Some(k) = self.relpos.borrow().get(&bt) {
             return k.clone();
         }
-        let bt = RELPOS_BUILT_T;
         let p = 2 * bt - 1;
         let cdiv = |a: usize, b: usize| (a + b - 1) / b;
         let n_qt = cdiv(bt, RELPOS_TQ);
-        let tp = cdiv(bt, RELPOS_KB) * RELPOS_KB;
-        let pp = cdiv(p, RELPOS_KB) * RELPOS_KB;
+        let tp = cdiv(bt, kb) * kb;
+        let pp = cdiv(p, kb) * kb;
         let ctx_rows = n_qt * RELPOS_TQ;
-        let dir = self.relpos_dir.join("single");
+        let dir = self.relpos_dir.join(subdir);
         let xclbin = dir.join("final.xclbin");
         let insts = dir.join("insts.bin");
         let kern = self
             .dev
             .load_kernel(xclbin.to_str().unwrap(), None)
-            .unwrap_or_else(|e| panic!("load relpos single ({}): {e:?}\n  pre-build: scripts/relpos_prebuild.sh", xclbin.display()));
+            .unwrap_or_else(|e| panic!("load relpos bucket {bt} ({}): {e:?}\n  pre-build: scripts/relpos_prebuild.sh", xclbin.display()));
         let ib = std::fs::read(&insts).unwrap_or_else(|e| panic!("read {}: {e}", insts.display()));
         let instr_template: Vec<u32> = ib
             .chunks_exact(4)
@@ -357,8 +383,8 @@ impl NpuMatmul {
         // BD precision -- the resident-MHA WER fix). Two padded p-sections (2*pp). Per-head, x H.
         let bo_kpv = self.dev.alloc_bo(&kern, RELPOS_HEADS * (tp + pp + pp + tp) * RELPOS_DK * 2, FLAG_HOST_ONLY, g(4)).unwrap();
         let bo_ctx = self.dev.alloc_bo(&kern, RELPOS_HEADS * ctx_rows * RELPOS_DK * 2, FLAG_HOST_ONLY, g(5)).unwrap();
-        let rk = Rc::new(RelposK { kern, instr_template, n_instr, bo_instr, bo_quv, bo_kpv, bo_ctx, n_qt, tp, pp, ctx_rows });
-        self.relpos.borrow_mut().insert(RELPOS_BUILT_T, rk.clone());
+        let rk = Rc::new(RelposK { kern, instr_template, n_instr, bo_instr, bo_quv, bo_kpv, bo_ctx, built_t: bt, n_qt, tp, pp, ctx_rows });
+        self.relpos.borrow_mut().insert(bt, rk.clone());
         rk
     }
 
@@ -375,9 +401,12 @@ impl NpuMatmul {
         let d = q.ncols();
         let dk = RELPOS_DK;
         let h = RELPOS_HEADS;
-        assert!(t <= RELPOS_BUILT_T, "clip T={t} exceeds relpos BUILT_T={RELPOS_BUILT_T}");
         assert_eq!(d, h * dk, "hidden D must be RELPOS_HEADS*RELPOS_DK");
-        let rk = self.relpos_block();
+        // T-bucketing: dispatch the SMALLEST bucket whose BUILT_T >= this clip's T, so short clips run
+        // a smaller padded dataflow (less wasted relpos padding compute). Callers gate on relpos_max_t().
+        let (bt, kb, subdir) = Self::relpos_bucket_for(t);
+        let rk = self.relpos_block(bt, kb, subdir);
+        assert!(t <= rk.built_t, "clip T={t} exceeds relpos bucket BUILT_T={}", rk.built_t);
         let quv_head = 2 * rk.n_qt * RELPOS_TQ * RELPOS_DK;
         let kpv_head = (rk.tp + rk.pp + rk.pp + rk.tp) * RELPOS_DK;
         // Concatenate all H heads' quv / kpv (head hh at slice hh*head_len -- the generator scatters
@@ -421,7 +450,7 @@ impl NpuMatmul {
         // this clip's t. All H heads share the clip's single t_active. (prebuild asserts count==H.)
         let mut insts = rk.instr_template.clone();
         for w in insts.iter_mut() {
-            if *w == RELPOS_BUILT_T as u32 {
+            if *w == rk.built_t as u32 {
                 *w = t as u32;
             }
         }
