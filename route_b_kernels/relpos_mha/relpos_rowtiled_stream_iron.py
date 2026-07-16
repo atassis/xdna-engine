@@ -117,21 +117,29 @@ def ceildiv(a, b):
     return (a + b - 1) // b
 
 
-def my_relpos_stream(dev, T, TQ, KB, t_active=None):
+def my_relpos_stream(dev, T, TQ, KB, t_active=None, splitp=False):
     # STEP-C: T is the BAKED buffer/dataflow size (the single MAX-T xclbin, e.g. 172);
     # t_active <= T is the ACTIVE key count the softmax attends (a per-insts constant on
     # the SAME xclbin, so one xclbin serves any clip padded to T). Default = T (full).
+    #
+    # SPLITP (split-bf16 positional operand): the decomposition probe pinned the resident
+    # block's ~1% WER-gap ENTIRELY to bf16 rounding of the positional p in BD = qv.p^T
+    # (bd_p owns it; qv/k/V round fine). With --splitp the host feeds p as TWO bf16 streams
+    # p_hi=bf16(p), p_lo=bf16(p-p_hi); the core computes BD = qv.p_hi (overwrite) + qv.p_lo
+    # (ADD), recovering ~f32 precision on p. kpv layout becomes k | p_hi | p_lo | V (one
+    # extra p-section on the SAME channel-B kpv stream; 2 input DMA channels preserved).
     if t_active is None:
         t_active = T
     P = 2 * T - 1
     n_qt = ceildiv(T, TQ)   # query tiles
     n_kb = ceildiv(T, KB)   # k-blocks (also V-blocks)
-    n_pb = ceildiv(P, KB)   # p-blocks
+    n_pb = ceildiv(P, KB)   # p-blocks (p_hi; p_lo mirrors it under --splitp)
     n_vb = n_kb
     # Padded section sizes (fixed [KB,DK] stream objects need whole-block sections).
     Tp = n_kb * KB          # padded k / V rows
     Pp = n_pb * KB          # padded p rows
-    kpv_pad_rows = Tp + Pp + Tp  # L2-resident padded kpv layout: k | p | V
+    # L2/DDR padded kpv layout: k | p_hi | [p_lo] | V (p_lo section only when splitp).
+    kpv_pad_rows = Tp + Pp + (Pp if splitp else 0) + Tp
 
     # ---- tensor types ----
     quv_blk_ty = np.ndarray[(TQ * DK,), np.dtype[bfloat16]]          # qu/qv tile
@@ -194,6 +202,9 @@ def my_relpos_stream(dev, T, TQ, KB, t_active=None):
                    [quv_blk_ty, kblk_ty, ac_ty, np.int32, np.int32, np.int32, np.int32])
     dot_p = Kernel("relpos_stream_dot_p", "kernels.a",
                    [quv_blk_ty, kblk_ty, bd_ty, np.int32, np.int32, np.int32, np.int32])
+    # split-bf16 p_lo pass: BD += qv @ p_lo^T (ADDS into g_bd). Only wired under --splitp.
+    dot_p_lo = Kernel("relpos_stream_dot_p_lo", "kernels.a",
+                      [quv_blk_ty, kblk_ty, bd_ty, np.int32, np.int32, np.int32, np.int32])
     softmax_k = Kernel("relpos_stream_softmax", "kernels.a",
                        [ac_ty, bd_ty, probs_ty, rtp_ty, np.int32, np.int32, np.int32, np.int32])
     ctxzero_k = Kernel("relpos_stream_ctx_zero", "kernels.a", [ctxf_ty, np.int32])
@@ -213,7 +224,7 @@ def my_relpos_stream(dev, T, TQ, KB, t_active=None):
     p_rag = P - Pp_full               # ragged p block rows (42 at P=343,KB=43)
 
     def core_body(quv_in, kpv_in, ctx_out, ac, bd, probs, ctxf, rtp, bar,
-                  dotk, dotp, smax, czero, ctxb, narrow):
+                  dotk, dotp, dotplo, smax, czero, ctxb, narrow):
         # ONE per-query-tile body, emitted ONCE inside a real hardware loop over
         # the query tiles (the 22x multiplier -- range_, index_cast'd runtime q0)
         # + ONCE for the peeled ragged tile. The k/p/V BLOCK loops are UNROLLED in
@@ -239,7 +250,9 @@ def my_relpos_stream(dev, T, TQ, KB, t_active=None):
                 kpv_in.release(1)
             quv_in.release(1)
 
-            # -- phase P: qv_tile resident; p full-blocks then ragged -> BD[:, j0:] --
+            # -- phase P: qv_tile resident; p_hi full-blocks then ragged -> BD[:, j0:]
+            #    (overwrite). Under --splitp, immediately follow with the p_lo section
+            #    (same qv_tile, same block layout) ADDING qv.p_lo into BD -> ~f32 p. --
             eqv = quv_in.acquire(1)
             for j0 in range(0, Pp_full, KB):
                 ep = kpv_in.acquire(1)
@@ -249,6 +262,15 @@ def my_relpos_stream(dev, T, TQ, KB, t_active=None):
                 ep = kpv_in.acquire(1)
                 dotp(eqv, ep, bd, tq, p_rag, Pp_full, P)
                 kpv_in.release(1)
+            if splitp:
+                for j0 in range(0, Pp_full, KB):
+                    ep = kpv_in.acquire(1)
+                    dotplo(eqv, ep, bd, tq, KB, j0, P)  # BD += qv @ p_lo^T
+                    kpv_in.release(1)
+                if p_rag:
+                    ep = kpv_in.acquire(1)
+                    dotplo(eqv, ep, bd, tq, p_rag, Pp_full, P)
+                    kpv_in.release(1)
             quv_in.release(1)
 
             # -- softmax over the first rtp[0]=t_active keys (GLOBAL-index rel_shift q0);
@@ -284,7 +306,7 @@ def my_relpos_stream(dev, T, TQ, KB, t_active=None):
         core_body,
         [of_quv.cons(), of_kpv.cons(), of_ctx.prod(),
          g_ac, g_bd, g_probs, g_ctxf, tactive_rtp, rtp_barrier,
-         dot_k, dot_p, softmax_k, ctxzero_k, ctx_k, narrow_k],
+         dot_k, dot_p, dot_p_lo, softmax_k, ctxzero_k, ctx_k, narrow_k],
     )
 
     # SINGLE-BD SHIM REPLAY (fixes the 22-BD overflow of a per-tile fill loop). One
@@ -324,6 +346,9 @@ p.add_argument("--kb", type=int, default=KB, help="key-block rows; must match -D
 p.add_argument("--tactive", type=int, default=0,
                help="STEP-C active key count (<= T); 0 => T (full). One MAX-T xclbin serves "
                     "any t_active by baking it into the instruction stream (ELF is t_active-agnostic).")
+p.add_argument("--splitp", action="store_true",
+               help="split-bf16 positional operand: stream p as p_hi|p_lo, BD = qv.p_hi + qv.p_lo "
+                    "(near-f32 p). Closes the resident-MHA WER gap (probe: p rounding owns it).")
 opts = p.parse_args(sys.argv[1:])
 
 if opts.device == "npu":
@@ -333,4 +358,4 @@ elif opts.device == "npu2":
 else:
     raise ValueError(f"unknown device {opts.device}")
 
-print(my_relpos_stream(dev, opts.T, opts.tq, opts.kb, opts.tactive or opts.T))
+print(my_relpos_stream(dev, opts.T, opts.tq, opts.kb, opts.tactive or opts.T, opts.splitp))
