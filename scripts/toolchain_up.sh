@@ -13,7 +13,7 @@ source "$REPO/scripts/toolchain_gc.sh"
 # stays local-only and just resolves the path. Prefer the single-file pin MLIR_DISTRO_WHEEL (bumping
 # the MLIR core = one line in toolchain.lock); fall back to a repo-relative MLIR_DISTRO_DIR for old locks.
 if [ -n "${MLIR_DISTRO_WHEEL:-}" ]; then
-  MLIR_DISTRO_ABS="$HOME/.cache/xdna2-build/mlir-distro/${MLIR_DISTRO_WHEEL#mlir-}/mlir"
+  MLIR_DISTRO_ABS="$XDNA_CACHE/mlir-distro/${MLIR_DISTRO_WHEEL#mlir-}/mlir"
   [ -e "$MLIR_DISTRO_ABS/bin/mlir-tblgen" ] || {
     echo "[toolchain_up] MLIR distro $MLIR_DISTRO_WHEEL not provisioned. Run: scripts/fetch_mlir_distro.sh" >&2
     exit 1
@@ -23,7 +23,7 @@ else
 fi
 
 LOCKHASH="$(sha256sum "$REPO/toolchain.lock" | cut -c1-12)"
-INST="${TOOLCHAIN_HOME:-$HOME/.cache/xdna2-build/instances}/$LOCKHASH"
+INST="${TOOLCHAIN_HOME:-$XDNA_CACHE/instances}/$LOCKHASH"
 PYPKG="$INST/python/aie/iron/program.py"
 WHEEL_BIN="$REPO/.venv-iron/lib/python3.14/site-packages/mlir_aie/bin"
 
@@ -89,5 +89,5 @@ _link_include_dirs
 ln -sfn "$INST/build/bin" "$INST/bin"
 _link_vendored_tools
 touch "$INST"                                          # record last-used before GC (protects it as newest)
-gc_instances "${TOOLCHAIN_HOME:-$HOME/.cache/xdna2-build/instances}" "${TOOLCHAIN_KEEP:-4}" "$INST"
+gc_instances "${TOOLCHAIN_HOME:-$XDNA_CACHE/instances}" "${TOOLCHAIN_KEEP:-4}" "$INST"
 echo "$INST"

@@ -15,8 +15,9 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 set -a; . "$REPO/toolchain.lock"; set +a
 
 MLIR_AIE="$REPO/mlir-aie"
-IRON="${IRON:-~/repositories/ns/amd/IRON}"
-MLIR_AIR="${MLIR_AIR:-~/mlir-air}"
+. "$REPO/scripts/amd_paths.sh"       # -> IRON_DIR (relocatable; env-overridable)
+IRON="${IRON:-$IRON_DIR}"
+MLIR_AIR="${MLIR_AIR:-$XDNA_WS/mlir-air}"   # was a dead ~/mlir-air path; XDNA_WS from amd_paths.sh above
 FETCH="${REFRESH_FETCH:-1}"
 
 hr(){ printf '%s\n' "------------------------------------------------------------------------"; }

@@ -35,7 +35,8 @@ source "$REPO/scripts/air_env.sh"
 
 # ELF output needs the aiebu-asm assembler (only in IRON ironenv).
 if [[ "$OUTPUT_FORMAT" == "elf" ]]; then
-  export PATH="$HOME/repositories/ns/amd/IRON/ironenv/bin:$PATH"
+  . "$REPO/scripts/amd_paths.sh"      # -> IRON_DIR (relocatable; env-overridable)
+  export PATH="$IRON_DIR/ironenv/bin:$PATH"
   command -v aiebu-asm >/dev/null || { echo "[build] ERROR: aiebu-asm not on PATH (need ironenv)"; exit 1; }
 fi
 

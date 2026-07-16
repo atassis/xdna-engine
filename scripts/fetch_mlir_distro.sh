@@ -16,7 +16,8 @@ if [ -z "$WHEEL" ]; then
 fi
 [ -n "$WHEEL" ] || { echo "fetch_mlir_distro: no MLIR_DISTRO_WHEEL (pass as arg or set in toolchain.lock)" >&2; exit 2; }
 
-CACHE="$HOME/.cache/xdna2-build/mlir-distro/${WHEEL#mlir-}"
+. "$REPO/scripts/cache_env.sh"   # -> XDNA_CACHE (in-workspace build cache)
+CACHE="$XDNA_CACHE/mlir-distro/${WHEEL#mlir-}"
 if [ ! -e "$CACHE/mlir/bin/mlir-tblgen" ]; then
   echo "[fetch_mlir_distro] fetching $WHEEL from Xilinx/mlir-aie mlir-distro release ..." >&2
   mkdir -p "$CACHE"

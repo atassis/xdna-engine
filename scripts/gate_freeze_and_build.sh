@@ -17,8 +17,9 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 B="${B:-128}"; NL="${NL:-1}"
 FROZEN_DIR="${FROZEN_DIR:-$REPO/artifacts/gate_frozen_B${B}_L${NL}}"
 VENV_IRON="$REPO/.venv-iron"
-IRON="~/repositories/ns/amd/IRON"
-AIEBU_DIR="~/repositories/ns/amd/XRT-src/src/runtime_src/core/common/aiebu/build/Release/src/cpp/utils/asm"
+. "$REPO/scripts/amd_paths.sh"       # -> IRON_DIR, AIEBU_ASM_DIR (relocatable; env-overridable)
+IRON="$IRON_DIR"
+AIEBU_DIR="$AIEBU_ASM_DIR"
 WEIGHTS="$REPO/artifacts/whisper-small/whisper_decoder"
 GENDIR="$REPO/route_b_kernels/decode_fused"
 
