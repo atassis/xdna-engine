@@ -968,6 +968,48 @@ impl NpuMatmul {
         acc
     }
 
+    /// bf16-arena sibling of [`Self::resident_ffn`]: `bits1`/`bits2` are pre-packed bf16 straight
+    /// from a bf16-baked `NPU_WEIGHTS_ARENA` (fc1 `[KRES,DFF]`, fc2 `[DFF,KRES]`, both verbatim
+    /// layout), so every weight-BO build on a cache miss skips the host f32->bf16 pack entirely.
+    /// Same device-side LN->fc1->deint->fc2(K-split) dataflow as `resident_ffn`; only the weight
+    /// source differs.
+    pub fn resident_ffn_bf16(
+        &self, x: &Array2<f32>, gamma: &[f32], beta: &[f32],
+        id1: &str, k1: usize, n1: usize, bits1: &[u16],
+        id2: &str, k2: usize, n2: usize, bits2: &[u16],
+    ) -> Array2<f32> {
+        self.stats.borrow_mut().calls += 1;
+        let m = x.nrows();
+        assert_eq!((k1, n1), (KRES, DFF), "fc1 W1 dim");
+        assert_eq!((k2, n2), (DFF, KRES), "fc2 W2 dim");
+        let rl = self.ln_affine_cast(x, gamma, beta); // bo_bf16 = affine_LN bf16 [PAD_M,KRES]
+        let w1 = {
+            let c = self.wcache.borrow().get(id1).cloned();
+            c.unwrap_or_else(|| self.weight_bo_bf16(id1, k1, n1, bits1))
+        };
+        let st1 = self.stream(DFF, self.modal);
+        self.kern.run_matmul8(3, &st1.instr, st1.n_instr, &rl.bo_bf16, &w1, &st1.bo_c, &self.bo_tmp, &self.bo_tr).unwrap();
+        rl.deint_kern.run_matmul8(3, &rl.deint_instr, rl.deint_n, &st1.bo_c, &rl.bo_deint, &rl.deint_c, &rl.deint_tmp, &rl.deint_tr).unwrap();
+        self.stats.borrow_mut().dispatches += 2; // fc1 + deint
+        let parts = DFF / KRES;
+        let chunk_bytes = PAD_M * KRES * 2;
+        let mut acc = Array2::<f32>::zeros((m, KRES));
+        for c in 0..parts {
+            let chunk = rl.bo_deint.sub(c * chunk_bytes, chunk_bytes).unwrap();
+            let sid = format!("{id2}.{c}");
+            let w2c = {
+                let cc = self.wcache.borrow().get(&sid).cloned();
+                cc.unwrap_or_else(|| {
+                    // bits2 is row-major [DFF, KRES]; a KRES-row chunk is a contiguous slice.
+                    let part_bits = &bits2[c * KRES * KRES..(c + 1) * KRES * KRES];
+                    self.weight_bo_bf16(&sid, KRES, KRES, part_bits)
+                })
+            };
+            acc += &self.dispatch_with_a(&chunk, m, &w2c, KRES, false);
+        }
+        acc
+    }
+
     /// Per-N instruction stream. On the MODAL resident, `silu` picks the baked-RTP mode: the
     /// `modalsilu` stream (fc1 / ff.l1, N=4096) applies SiLU on chip, `modalid` is a numerically
     /// identity epilogue (every other GEMM). On the plain resident, `silu` is ignored (there is no
@@ -1013,6 +1055,27 @@ impl NpuMatmul {
         npu_xrt::pack_f32_to_bf16(b_std.as_slice().unwrap(), &mut bits);
         let bo = self.dev.alloc_bo(&self.kern, k * n * 2, FLAG_HOST_ONLY, g4).unwrap();
         bo.write_bytes(u16_bytes(&bits)).unwrap();
+        bo.sync_to_device().unwrap();
+        self.stats.borrow_mut().weight_load_s += t0.elapsed().as_secs_f64();
+        let bo = Rc::new(bo);
+        self.wcache.borrow_mut().insert(id.to_string(), bo.clone());
+        self.ncache.borrow_mut().insert(id.to_string(), n);
+        bo
+    }
+
+    /// bf16-native sibling of [`Self::weight_bo`]: `bits` are ALREADY-packed bf16 (row-major
+    /// `[k, n]`), straight from a bf16-baked `NPU_WEIGHTS_ARENA` arena tensor, so this writes them
+    /// to the device BO directly and skips `pack_f32_to_bf16` entirely. Same wcache/ncache keying
+    /// as `weight_bo`, so the two are interchangeable per `id` (a cache hit on either serves both).
+    fn weight_bo_bf16(&self, id: &str, k: usize, n: usize, bits: &[u16]) -> Rc<Bo> {
+        if let Some(bo) = self.wcache.borrow().get(id) {
+            return bo.clone();
+        }
+        debug_assert_eq!(bits.len(), k * n, "weight_bo_bf16: bits.len() != k*n for id={id}");
+        let t0 = Instant::now();
+        let g4 = self.kern.group_id(4).unwrap();
+        let bo = self.dev.alloc_bo(&self.kern, k * n * 2, FLAG_HOST_ONLY, g4).unwrap();
+        bo.write_bytes(u16_bytes(bits)).unwrap();
         bo.sync_to_device().unwrap();
         self.stats.borrow_mut().weight_load_s += t0.elapsed().as_secs_f64();
         let bo = Rc::new(bo);
@@ -1099,6 +1162,21 @@ impl NpuMatmul {
         self.ksplit_dispatch(a, n, parts, |i| {
             self.weight_bo(&format!("{id}.{i}"), b.slice(s![i * KRES..(i + 1) * KRES, ..]))
         })
+    }
+
+    /// bf16-arena sibling of [`Self::matmul_id`]: single-dispatch (K=KRES) only -- the shape every
+    /// mhsa q/k/v/pos/out projection uses. `bits` are pre-packed bf16 `[k, n]` row-major straight
+    /// from a bf16-baked `NPU_WEIGHTS_ARENA` tensor (verbatim layout, no transpose), so this skips
+    /// the host f32->bf16 pack entirely on a cache miss.
+    pub fn matmul_id_bf16(&self, a: &Array2<f32>, id: &str, k: usize, n: usize, bits: &[u16]) -> Array2<f32> {
+        let (m, ka) = a.dim();
+        assert_eq!(ka, k);
+        assert!(m <= PAD_M);
+        assert_eq!(k, KRES, "matmul_id_bf16 is single-dispatch only (K=KRES)");
+        self.stats.borrow_mut().calls += 1;
+        let cached = self.wcache.borrow().get(id).cloned();
+        let wbo = cached.unwrap_or_else(|| self.weight_bo_bf16(id, k, n, bits));
+        self.dispatch(a.view(), &wbo, n, false)
     }
 
     /// Lazy variant of [`matmul_id`]: the host weight matrix is materialized by `make_b` ONLY on a

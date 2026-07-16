@@ -88,6 +88,27 @@ impl FastConformerEncoder {
         a.dot(&b)
     }
 
+    /// bf16-arena fast path for a plain (non-K-split, K=KRES) weight matmul: when `b.bf16_m(key)`
+    /// yields pre-packed bf16 bits (NPU_WEIGHTS_ARENA loaded), dispatch straight from those bits,
+    /// skipping the host f32->bf16 pack entirely on a cache miss. Returns `None` on the npy path
+    /// (bf16_m always None there) or without the NPU feature/instance, so the caller falls back to
+    /// the existing `mm_lazy(.., || b.m(key), id)` path unchanged.
+    fn mm_arena(&self, a: &Array2<f32>, b: &BlockWeights, key: &str, id: &str) -> Option<Array2<f32>> {
+        #[cfg(feature = "npu")]
+        {
+            if let Some(npu) = &self.npu {
+                if let Some((k, n, bits)) = b.bf16_m(key) {
+                    return Some(npu.matmul_id_bf16(a, id, k, n, bits));
+                }
+            }
+        }
+        #[cfg(not(feature = "npu"))]
+        {
+            let _ = (a, b, key, id);
+        }
+        None
+    }
+
     /// True when the FFN SiLU is applied on chip (modal resident), so the host must skip it.
     fn ff_act_on_chip(&self) -> bool {
         #[cfg(feature = "npu")]
@@ -118,9 +139,21 @@ impl FastConformerEncoder {
                     // bit-identical to the host 4xK-split -> WER-NEUTRAL. resident_ff_available() requires the
                     // deint xclbin, so this falls back to the host-fed fc2 (below) when that xclbin is absent.
                     if std::env::var("PARAKEET_RESIDENT_FFN").map(|v| v != "0").unwrap_or(true) {
+                        let id1 = format!("{blk}.{tag}.l1");
+                        let id2 = format!("{blk}.{tag}.l2");
+                        // bf16-arena fast path (NPU_WEIGHTS_ARENA): fc1/fc2 are both baked bf16
+                        // verbatim [K,N], so when both are available skip the host f32->bf16 pack
+                        // entirely on a cache miss. Falls back to the f32 path below (byte-identical
+                        // to before) when the arena isn't loaded (bf16_m always None on npy).
+                        if let (Some((k1, n1, bits1)), Some((k2, n2, bits2))) =
+                            (b.bf16_m(l1), b.bf16_m(l2))
+                        {
+                            return npu.resident_ffn_bf16(x, gamma.as_slice().unwrap(), beta.as_slice().unwrap(),
+                                &id1, k1, n1, bits1, &id2, k2, n2, bits2);
+                        }
                         return npu.resident_ffn(x, gamma.as_slice().unwrap(), beta.as_slice().unwrap(),
-                            || b.m(l1), &format!("{blk}.{tag}.l1"),
-                            || b.m(l2), &format!("{blk}.{tag}.l2"));
+                            || b.m(l1), &id1,
+                            || b.m(l2), &id2);
                     }
                     let h = npu.resident_ff1_fc1(x, gamma.as_slice().unwrap(), beta.as_slice().unwrap(),
                         || b.m(l1), &format!("{blk}.{tag}.l1"), self.cfg.ff, true);
@@ -190,8 +223,8 @@ impl FastConformerEncoder {
         // Whole subsample stem is host math (conv2d x5 + relu + flatten + final gemm);
         // no self.mm()/device call lives here, so one Host leaf scope cannot double-count.
         let _h = PhaseScope::new("subsample", Bucket::Host);
-        let pe4 = |k: &str| self.w.pre(k).clone().into_dimensionality::<Ix4>().unwrap();
-        let pe1 = |k: &str| self.w.pre(k).clone().into_dimensionality::<Ix1>().unwrap();
+        let pe4 = |k: &str| self.w.pre(k).into_dimensionality::<Ix4>().unwrap();
+        let pe1 = |k: &str| self.w.pre(k).into_dimensionality::<Ix1>().unwrap();
         // [1, time, freq]
         let (f, t) = mel.dim();
         let mut x = Array3::<f32>::zeros((1, t, f));
@@ -219,8 +252,8 @@ impl FastConformerEncoder {
                 }
             }
         }
-        let wout = self.w.pre("out.weight").clone().into_dimensionality::<Ix2>().unwrap(); // [4096, hidden]
-        let bout = self.w.pre("out.bias").clone().into_dimensionality::<Ix1>().unwrap();
+        let wout = self.w.pre("out.weight").into_dimensionality::<Ix2>().unwrap(); // [4096, hidden]
+        let bout = self.w.pre("out.bias").into_dimensionality::<Ix1>().unwrap();
         prof::phase::set_stage("subsample"); // final gemm (host .dot here; labels device path if ever routed via mm)
         flat.dot(&wout) + &bout
     }
@@ -237,13 +270,21 @@ impl FastConformerEncoder {
         // constant qkv/pos/out weights. Only the tiny pos_bias_u/v (consumed later in the score
         // loop, NOT a cached BO) stay eager, exactly as the original.
         prof::phase::set_stage("mhsa_qkv");
-        let q = self.mm_lazy(x, || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_q.weight") }, &format!("{blk}.q")); // [T, D]
+        let id_q = format!("{blk}.q");
+        let q = self.mm_arena(x, b, "self_attn.linear_q.weight", &id_q)
+            .unwrap_or_else(|| self.mm_lazy(x, || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_q.weight") }, &id_q)); // [T, D]
         prof::phase::set_stage("mhsa_qkv");
-        let k = self.mm_lazy(x, || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_k.weight") }, &format!("{blk}.k"));
+        let id_k = format!("{blk}.k");
+        let k = self.mm_arena(x, b, "self_attn.linear_k.weight", &id_k)
+            .unwrap_or_else(|| self.mm_lazy(x, || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_k.weight") }, &id_k));
         prof::phase::set_stage("mhsa_qkv");
-        let v = self.mm_lazy(x, || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_v.weight") }, &format!("{blk}.v"));
+        let id_v = format!("{blk}.v");
+        let v = self.mm_arena(x, b, "self_attn.linear_v.weight", &id_v)
+            .unwrap_or_else(|| self.mm_lazy(x, || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_v.weight") }, &id_v));
         prof::phase::set_stage("mhsa_pos");
-        let pm = self.mm_lazy(pos_enc, || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_pos.weight") }, &format!("{blk}.pos")); // [P, D]
+        let id_pos = format!("{blk}.pos");
+        let pm = self.mm_arena(pos_enc, b, "self_attn.linear_pos.weight", &id_pos)
+            .unwrap_or_else(|| self.mm_lazy(pos_enc, || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_pos.weight") }, &id_pos)); // [P, D]
         let (ubias, vbias) = {
             let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal);
             (b.m("self_attn.pos_bias_u"), b.m("self_attn.pos_bias_v")) // [H, DK] each
@@ -276,7 +317,9 @@ impl FastConformerEncoder {
                     ctx.slice_mut(s![.., col..col + dk]).assign(&ch);
                 }
                 prof::phase::set_stage("mhsa_qkv");
-                return self.mm_lazy(&ctx, || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_out.weight") }, &format!("{blk}.out"));
+                let id_out = format!("{blk}.out");
+                return self.mm_arena(&ctx, b, "self_attn.linear_out.weight", &id_out)
+                    .unwrap_or_else(|| self.mm_lazy(&ctx, || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_out.weight") }, &id_out));
             }
         }
 
@@ -350,7 +393,9 @@ impl FastConformerEncoder {
         ctx
         });
         prof::phase::set_stage("mhsa_qkv");
-        self.mm_lazy(&ctx, || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_out.weight") }, &format!("{blk}.out"))
+        let id_out = format!("{blk}.out");
+        self.mm_arena(&ctx, b, "self_attn.linear_out.weight", &id_out)
+            .unwrap_or_else(|| self.mm_lazy(&ctx, || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_out.weight") }, &id_out))
     }
 
     fn conv_module(&self, x: &Array2<f32>, blk: usize) -> Array2<f32> {
