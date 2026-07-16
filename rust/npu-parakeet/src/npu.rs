@@ -666,6 +666,47 @@ impl NpuMatmul {
         self.dispatch_with_a(&rl.bo_bf16, m, &wbo, n, silu && self.modal)
     }
 
+    /// One q/k/v modal projection off an ALREADY-resident bf16 A (the shared affine_LN(x)): fetch/build
+    /// the cached [KRES,n] weight BO, then a single identity (no-silu) modal dispatch -> C[m,n] f32.
+    fn qkv_proj<F: FnOnce() -> Array2<f32>>(&self, a_bo: &Bo, m: usize, n: usize, make_w: F, id: &str) -> Array2<f32> {
+        let cached = self.wcache.borrow().get(id).cloned();
+        let wbo = if let Some(bo) = cached {
+            bo
+        } else {
+            let w = make_w();
+            assert_eq!(w.nrows(), KRES, "qkv W nrows {} != {KRES}", w.nrows());
+            assert_eq!(w.ncols(), n, "qkv W ncols {} != {n}", w.ncols());
+            self.weight_bo(id, w.view())
+        };
+        self.dispatch_with_a(a_bo, m, &wbo, n, false)
+    }
+
+    /// Resident MHA LN->QKV seam (norm_self_att on-NPU), the MHSA head frontier advance: ctxLN ->
+    /// affine_cast(gamma,beta) -> bf16 affine_LN(x) BO (device-side), then the q/k/v modal GEMMs
+    /// (N=KRES=D identity, no silu) ALL run off that ONE resident bf16 A -- so the host norm_self_att
+    /// LN is off the MHSA frontier. Returns (q,k,v) [t,D] f32, exactly host layernorm(x)@Wq/k/v
+    /// (bf16-class). `pos` is NOT normalized, so it stays a plain mm_lazy in the caller. Requires the
+    /// resident seam (caller gates on resident_ff_available); `idq/idk/idv` key the per-weight BO cache.
+    pub fn resident_mha_ln_qkv<Fq, Fk, Fv>(
+        &self, x: &Array2<f32>, gamma: &[f32], beta: &[f32],
+        make_wq: Fq, idq: &str, make_wk: Fk, idk: &str, make_wv: Fv, idv: &str,
+    ) -> (Array2<f32>, Array2<f32>, Array2<f32>)
+    where
+        Fq: FnOnce() -> Array2<f32>,
+        Fk: FnOnce() -> Array2<f32>,
+        Fv: FnOnce() -> Array2<f32>,
+    {
+        self.stats.borrow_mut().calls += 1;
+        let m = x.nrows();
+        let n = KRES; // q/k/v projections are [D,D]; N = D = KRES
+        // LN + affine cast ONCE -> bo_bf16 = affine_LN(x) bf16 [PAD_M, KRES] (device-resident).
+        let rl = self.ln_affine_cast(x, gamma, beta);
+        let q = self.qkv_proj(&rl.bo_bf16, m, n, make_wq, idq);
+        let k = self.qkv_proj(&rl.bo_bf16, m, n, make_wk, idk);
+        let v = self.qkv_proj(&rl.bo_bf16, m, n, make_wv, idv);
+        (q, k, v)
+    }
+
     /// Resident conv-module front (LN -> pw1 -> GLU), the conv step-2 frontier advance: the activation
     /// never touches host across the three ops.
     ///   ctxLN -> affine_cast -> modal pw1 GEMM (N=2*KRES, identity, output STAYS device in the stream
