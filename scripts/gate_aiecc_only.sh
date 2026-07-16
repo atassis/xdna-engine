@@ -14,7 +14,8 @@ B="${B:-128}"; NL="${NL:-1}"
 FROZEN_DIR="${FROZEN_DIR:-$REPO/artifacts/gate_frozen_B${B}_L${NL}}"
 MLIR="${MLIR:-$FROZEN_DIR/decode_b_frozen.mlir}"
 VENV_IRON="$REPO/.venv-iron"
-AIEBU_DIR="~/repositories/ns/amd/XRT-src/src/runtime_src/core/common/aiebu/build/Release/src/cpp/utils/asm"
+. "$REPO/scripts/amd_paths.sh"       # -> AIEBU_ASM_DIR (relocatable; env-overridable)
+AIEBU_DIR="$AIEBU_ASM_DIR"
 PEANO="$VENV_IRON/lib/python3.14/site-packages/llvm-aie"
 
 export AIECC_PATH="${AIECC_PATH:-$("$REPO/scripts/toolchain_up.sh")/bin/aiecc}"

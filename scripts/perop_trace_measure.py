@@ -12,7 +12,7 @@
 #
 # Run (production stack, NPU free -> stop npu-asr first):
 #   IRON_TRACE_SIZE=65536 \
-#   PYTHONPATH=route_b_kernels/decode_fused:$HOME/repositories/ns/amd/IRON \
+#   PYTHONPATH=route_b_kernels/decode_fused:$HOME/repositories/ns/atassis/xdna-engine-workspace/amd/IRON \
 #   .venv-iron/bin/python scripts/perop_trace_measure.py [op1 op2 ...]
 #
 # Results appended to artifacts/perop_trace_results.json (keyed by label).

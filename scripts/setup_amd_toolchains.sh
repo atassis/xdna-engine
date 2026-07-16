@@ -24,12 +24,13 @@ P="$REPO/route_b_kernels/patches"
 APPLY="$REPO/scripts/apply_patches.sh"
 RESET="${RESET:-}"
 
-# Target repos. mlir-aie is the in-repo submodule (relative); the rest are
-# sibling checkouts whose paths come from ENV with sane fallbacks.
+# Target repos. mlir-aie is the in-repo submodule (relative); the rest are sibling
+# checkouts under the workspace, located via the relocatable anchor (env-overridable).
+. "$REPO/scripts/amd_paths.sh"      # -> IRON_DIR, XRT_SRC_DIR, AIEBU_ASM_DIR (relative to workspace root)
 MLIR_AIE_DIR="${MLIR_AIE_DIR:-$REPO/mlir-aie}"
-IRON_DIR="${IRON_DIR:-${HOME}/repositories/ns/amd/IRON}"
-LLVM_AIE_DIR="${LLVM_AIE_DIR:-}"   # set when we start patching Peano
-MLIR_AIR_DIR="${MLIR_AIR_DIR:-}"   # set when we start patching mlir-air
+# IRON_DIR now comes from amd_paths.sh (default: $XDNA_WS/amd/IRON).
+LLVM_AIE_DIR="${LLVM_AIE_DIR:-}"   # empty = do NOT patch Peano (set to opt in)
+MLIR_AIR_DIR="${MLIR_AIR_DIR:-}"   # empty = do NOT patch mlir-air (set to opt in)
 
 fail=0
 SUMMARY=()

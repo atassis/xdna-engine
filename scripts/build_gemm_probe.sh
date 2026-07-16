@@ -17,8 +17,9 @@ NUM_COLS="${NUM_COLS:-1}"
 TILE_N="${TILE_N:-16}"
 SUF=""; [ "$NUM_COLS" != "1" ] && SUF="_c${NUM_COLS}"
 VENV_IRON="${VENV_IRON:-$REPO/.venv-iron}"
-IRON="${IRON:-~/repositories/ns/amd/IRON}"
-AIEBU_DIR="${AIEBU_DIR:-~/repositories/ns/amd/XRT-src/src/runtime_src/core/common/aiebu/build/Release/src/cpp/utils/asm}"
+. "$REPO/scripts/amd_paths.sh"       # -> IRON_DIR, AIEBU_ASM_DIR (relocatable; env-overridable)
+IRON="${IRON:-$IRON_DIR}"
+AIEBU_DIR="${AIEBU_DIR:-$AIEBU_ASM_DIR}"
 WEIGHTS="${WEIGHTS:-$REPO/artifacts/whisper-small/whisper_decoder}"
 GEN="$REPO/route_b_kernels/decode_fused/gen_gemm_probe.py"
 
