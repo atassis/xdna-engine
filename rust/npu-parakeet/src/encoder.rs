@@ -118,6 +118,17 @@ impl FastConformerEncoder {
                     // bit-identical to the host 4xK-split -> WER-NEUTRAL. resident_ff_available() requires the
                     // deint xclbin, so this falls back to the host-fed fc2 (below) when that xclbin is absent.
                     if std::env::var("PARAKEET_RESIDENT_FFN").map(|v| v != "0").unwrap_or(true) {
+                        // GATE (PARAKEET_FFN_DEVACC): accumulate fc2 ON-DEVICE (acc_add brick) then read
+                        // back at the FFN boundary -- ONLY the accumulation moved on-device (block
+                        // dataflow unchanged). A WER-neutral result proves the device-accumulate is
+                        // bit-identical to the host K-split. Falls through to resident_ffn if acc_add absent.
+                        if std::env::var("PARAKEET_FFN_DEVACC").map(|v| v != "0").unwrap_or(false) {
+                            if let Some(out) = npu.resident_ffn_devacc_readback(x, gamma.as_slice().unwrap(), beta.as_slice().unwrap(),
+                                || b.m(l1), &format!("{blk}.{tag}.l1"),
+                                || b.m(l2), &format!("{blk}.{tag}.l2")) {
+                                return out;
+                            }
+                        }
                         return npu.resident_ffn(x, gamma.as_slice().unwrap(), beta.as_slice().unwrap(),
                             || b.m(l1), &format!("{blk}.{tag}.l1"),
                             || b.m(l2), &format!("{blk}.{tag}.l2"));

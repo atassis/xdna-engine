@@ -105,6 +105,10 @@ cp "$RB/ctx_ln/Makefile.deint"        "$PE/ml/layernorm/Makefile.deint"
 cp "$RB/aie_kernels/glu.cc"           "$K/glu.cc"
 cp "$RB/ctx_ln/glu_iron.py"           "$PE/ml/layernorm/glu_iron.py"
 cp "$RB/ctx_ln/Makefile.glu"          "$PE/ml/layernorm/Makefile.glu"
+# device-side f32 accumulate-add (resident-FFN fc2 on-device K-split accum): out = a + b, f32
+cp "$RB/aie_kernels/acc_add.cc"       "$K/acc_add.cc"
+cp "$RB/ctx_ln/acc_add_iron.py"       "$PE/ml/layernorm/acc_add_iron.py"
+cp "$RB/ctx_ln/Makefile.accadd"       "$PE/ml/layernorm/Makefile.accadd"
 # post-dwconv SiLU brick (conv step 4) -- SEPARATE single-op-loop brick (immune to the
 # fused-epilogue per-channel-loop miscompile; see dwconv-fused-epilogue-alt-channel-miscompile).
 cp "$RB/ctx_ln/silu_brick.cc"         "$K/silu_brick.cc"

@@ -177,6 +177,9 @@ struct ResidentLn {
     // device-side (the pw1 GEMM output stays resident; GLU reads it as its A/g3 input, no host). OPTIONAL:
     // absent when the glu xclbin isn't built, so the FFN LN->fc1 seam + step-1 resident pw1 still load.
     glu: Option<ConvGlu>,
+    // resident-FFN fc2 on-device K-split accumulate (out = a + b, f32), OPTIONAL like glu. When
+    // present, resident_ffn_dev sums the fc2 partials on-chip into ONE device BO (no host acc).
+    acc_add: Option<AccAdd>,
     // conv-module depthwise conv1d (step 3), OPTIONAL like glu.
     dwconv: Option<ConvDw>,
     // conv-module post-dwconv SiLU (step 4), OPTIONAL like glu/dwconv. SEPARATE single-op-loop
@@ -207,6 +210,22 @@ struct ConvGlu {
     n: usize,
     bo_out: Bo, // [PAD_M, KRES] f32 (glu output, g4)
     dummy_c: Bo,
+    dummy_tmp: Bo,
+    dummy_tr: Bo,
+}
+
+/// Device-side f32 accumulate-add brick (resident-FFN fc2 on-device K-split accumulation).
+/// out[g5] = a[g3] + b[g4] over [PAD_M,KRES] f32. Used to sum the DFF/KRES fc2 partials into
+/// ONE device BO (ping-pong `acc0`/`acc1`) instead of a host `Array2` -- bit-identical to the
+/// host sequential f32 K-split (WER-neutral), but the FFN output stays device-resident. `zero`
+/// (a persistent zeroed BO) seeds the first partial (acc = partial0 + 0). OPTIONAL like glu.
+struct AccAdd {
+    kern: Rc<Kernel>,
+    instr: Bo,
+    n: usize,
+    acc0: Rc<Bo>, // [PAD_M, KRES] f32 ping accumulator
+    acc1: Rc<Bo>, // [PAD_M, KRES] f32 pong accumulator
+    zero: Bo,     // [PAD_M, KRES] f32, zeroed once (seed for the first partial)
     dummy_tmp: Bo,
     dummy_tr: Bo,
 }
@@ -736,6 +755,30 @@ impl NpuMatmul {
                 None
             }
         };
+        // resident-FFN fc2 on-device accumulate (out=a+b f32), OPTIONAL: load only if built. acc0/acc1
+        // ping-pong the running sum; `zero` (zeroed once) seeds the first partial (acc = partial0 + 0).
+        let acc_add = {
+            let xcl = self.ln_dir.join(format!("final_accadd_{PAD_M}x{KRES}.xclbin"));
+            let ins = self.ln_dir.join(format!("insts_accadd_{PAD_M}x{KRES}.txt"));
+            if xcl.exists() && ins.exists() {
+                let (kern, instr, n) = load_path(xcl, ins);
+                let gaa = |i| kern.group_id(i).unwrap();
+                let zero = self.dev.alloc_bo(&kern, PAD_M * KRES * 4, FLAG_HOST_ONLY, gaa(4)).unwrap();
+                zero.write_bytes(&vec![0u8; PAD_M * KRES * 4]).unwrap();
+                zero.sync_to_device().unwrap();
+                Some(AccAdd {
+                    acc0: Rc::new(self.dev.alloc_bo(&kern, PAD_M * KRES * 4, FLAG_HOST_ONLY, gaa(5)).unwrap()),
+                    acc1: Rc::new(self.dev.alloc_bo(&kern, PAD_M * KRES * 4, FLAG_HOST_ONLY, gaa(5)).unwrap()),
+                    zero,
+                    dummy_tmp: self.dev.alloc_bo(&kern, 8, FLAG_HOST_ONLY, gaa(6)).unwrap(),
+                    dummy_tr: self.dev.alloc_bo(&kern, 1, FLAG_HOST_ONLY, gaa(7)).unwrap(),
+                    kern, instr, n,
+                })
+            } else {
+                eprintln!("[npu] acc_add xclbin absent in {} -- resident_ffn_dev unavailable (build final_accadd_{PAD_M}x{KRES})", self.ln_dir.display());
+                None
+            }
+        };
         // conv-module depthwise conv1d (step 3), OPTIONAL. 3-buffer ABI in[C,T]/w[C,16]/out[C,T] bf16.
         let dwconv = {
             let xcl = self.ln_dir.join(format!("final_dwconv_{DW_C}x{DW_T}.xclbin"));
@@ -837,7 +880,7 @@ impl NpuMatmul {
             deint_tmp: self.dev.alloc_bo(&deint_kern, 8, FLAG_HOST_ONLY, gd(6)).unwrap(),
             deint_tr: self.dev.alloc_bo(&deint_kern, 1, FLAG_HOST_ONLY, gd(7)).unwrap(),
             ln_kern, ln_instr, ln_n, ac_kern, ac_instr, ac_n,
-            deint_kern, deint_instr, deint_n, glu, dwconv, silu, dwconv_silu, dwconv_silu_t,
+            deint_kern, deint_instr, deint_n, glu, acc_add, dwconv, silu, dwconv_silu, dwconv_silu_t,
         });
         rl
     }
@@ -1222,6 +1265,130 @@ impl NpuMatmul {
             acc += &self.dispatch_with_a(&chunk, m, &w2c, KRES, false);
         }
         acc
+    }
+
+    /// Same as [`Self::resident_ffn`] but the fc2 K-split partials are accumulated ON-DEVICE (the
+    /// acc_add brick) so the FFN output lands in ONE device BO `[PAD_M, KRES]` f32 -- no host `acc`,
+    /// no `sync_from`/`read`. Returns the device accumulator (the fused seam's resident-stream handle).
+    /// `None` when the acc_add xclbin is absent, so callers fall back to the host-accum resident_ffn.
+    /// Bit-identical to resident_ffn: SAME partials (same modal GEMM into st.bo_c) summed in the SAME
+    /// sequential f32 order (acc=0, +partial0, +partial1, ...). The returned Rc is AccAdd scratch,
+    /// overwritten by the next resident_ffn_dev call -- the caller must consume it before the next.
+    pub fn resident_ffn_dev<F1: FnOnce() -> Array2<f32>, F2: FnOnce() -> Array2<f32>>(
+        &self, x: &Array2<f32>, gamma: &[f32], beta: &[f32],
+        make_w1: F1, id1: &str, make_w2: F2, id2: &str,
+    ) -> Option<Rc<Bo>> {
+        let rl = self.resident_ln()?;
+        let aa = rl.acc_add.as_ref()?;
+        self.stats.borrow_mut().calls += 1;
+        let rl2 = self.ln_affine_cast(x, gamma, beta); // bo_bf16 = affine_LN bf16 [PAD_M,KRES]
+        // fc1: modal, A=bo_bf16, W1, on-chip SiLU -> st1.bo_c (f32 [PAD_M,DFF]) -- stays DEVICE
+        let w1 = {
+            let c = self.wcache.borrow().get(id1).cloned();
+            c.unwrap_or_else(|| {
+                let w = make_w1();
+                assert_eq!(w.dim(), (KRES, DFF), "fc1 W1 dim");
+                self.weight_bo(id1, w.view())
+            })
+        };
+        let st1 = self.stream(DFF, self.modal);
+        self.kern.run_matmul8(3, &st1.instr, st1.n_instr, &rl2.bo_bf16, &w1, &st1.bo_c, &self.bo_tmp, &self.bo_tr).unwrap();
+        // deinterleave+cast: st1.bo_c (f32 [PAD_M,DFF]) -> rl2.bo_deint (bf16 chunk-major), device-side.
+        rl2.deint_kern.run_matmul8(3, &rl2.deint_instr, rl2.deint_n, &st1.bo_c, &rl2.bo_deint, &rl2.deint_c, &rl2.deint_tmp, &rl2.deint_tr).unwrap();
+        self.stats.borrow_mut().dispatches += 2; // fc1 + deint
+        // fc2 K-split with ON-DEVICE accumulate: each partial modal GEMM -> st.bo_c (device); acc_add
+        // sums it into the acc0/acc1 ping-pong (seed acc=0 for partial0). Result stays device-resident.
+        let parts = DFF / KRES;
+        let chunk_bytes = PAD_M * KRES * 2;
+        let need_w2 = (0..parts).any(|c| !self.wcache.borrow().contains_key(&format!("{id2}.{c}")));
+        let w2 = if need_w2 {
+            let w = make_w2();
+            assert_eq!(w.dim(), (DFF, KRES), "fc2 W2 dim");
+            Some(w)
+        } else {
+            None
+        };
+        let st = self.stream(KRES, false);
+        let mut cur = aa.acc0.clone();
+        let mut nxt = aa.acc1.clone();
+        for c in 0..parts {
+            let chunk = rl2.bo_deint.sub(c * chunk_bytes, chunk_bytes).unwrap();
+            let sid = format!("{id2}.{c}");
+            let w2c = {
+                let cc = self.wcache.borrow().get(&sid).cloned();
+                cc.unwrap_or_else(|| {
+                    let w = w2.as_ref().expect("w2 present on cache miss");
+                    self.weight_bo(&sid, w.slice(s![c * KRES..(c + 1) * KRES, ..]))
+                })
+            };
+            // modal identity GEMM: partial c -> st.bo_c (device, NO sync_from/read).
+            self.kern.run_matmul8(3, &st.instr, st.n_instr, &chunk, &w2c, &st.bo_c, &self.bo_tmp, &self.bo_tr).unwrap();
+            // accumulate on-chip: nxt = (c==0 ? zero : cur) + st.bo_c, then ping-pong.
+            let a_in: &Bo = if c == 0 { &aa.zero } else { &cur };
+            aa.kern.run_matmul8(3, &aa.instr, aa.n, a_in, &st.bo_c, &nxt, &aa.dummy_tmp, &aa.dummy_tr).unwrap();
+            self.stats.borrow_mut().dispatches += 2; // partial GEMM + acc_add
+            std::mem::swap(&mut cur, &mut nxt);
+        }
+        Some(cur) // device BO [PAD_M, KRES] f32 holding sum of all `parts` partials
+    }
+
+    /// Host-readback wrapper over [`Self::resident_ffn_dev`] for the FFN-boundary gate
+    /// (`PARAKEET_FFN_DEVACC`): device-accumulate the FFN, then `sync_from`+read the first `m` rows.
+    /// So ONLY the accumulation moved on-device vs resident_ffn; the block dataflow is unchanged.
+    pub fn resident_ffn_devacc_readback<F1: FnOnce() -> Array2<f32>, F2: FnOnce() -> Array2<f32>>(
+        &self, x: &Array2<f32>, gamma: &[f32], beta: &[f32],
+        make_w1: F1, id1: &str, make_w2: F2, id2: &str,
+    ) -> Option<Array2<f32>> {
+        let m = x.nrows();
+        let acc_bo = self.resident_ffn_dev(x, gamma, beta, make_w1, id1, make_w2, id2)?;
+        acc_bo.sync_from_device().unwrap();
+        let mut cb = vec![0u8; m * KRES * 4];
+        acc_bo.read_bytes(&mut cb).unwrap();
+        let mut out = Array2::<f32>::zeros((m, KRES));
+        for r in 0..m {
+            for c in 0..KRES {
+                let off = (r * KRES + c) * 4;
+                out[[r, c]] = f32::from_le_bytes([cb[off], cb[off + 1], cb[off + 2], cb[off + 3]]);
+            }
+        }
+        Some(out)
+    }
+
+    /// Device-parity self-test for Task 1 (on-device fc2 accumulation). Runs [`Self::resident_ffn`]
+    /// (host-accum reference) and [`Self::resident_ffn_dev`] (device-accum) on the SAME synthetic
+    /// input + weights, returns both `[t, KRES]` host arrays. The accumulation is the ONLY difference,
+    /// so rel-L2 must be ~0. `None` when the modal/resident/acc_add xclbins are absent. No encoder
+    /// weights needed -- synthetic weights fully exercise the K-split accumulate path.
+    pub fn ffn_devacc_selftest(&self, t: usize, seed: u64) -> Option<(Array2<f32>, Array2<f32>)> {
+        if !self.modal || self.resident_ln()?.acc_add.is_none() {
+            return None;
+        }
+        // Deterministic splitmix64 fill in [-scale, scale].
+        let fill = |rows: usize, cols: usize, sd: u64, scale: f32| -> Array2<f32> {
+            let mut s = sd.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            Array2::from_shape_fn((rows, cols), |_| {
+                s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                let mut z = s;
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                z ^= z >> 31;
+                let u = (z >> 40) as f32 / (1u32 << 24) as f32;
+                (u * 2.0 - 1.0) * scale
+            })
+        };
+        let x = fill(t, KRES, seed, 1.0);
+        let gamma: Vec<f32> = fill(1, KRES, seed ^ 0xA1, 0.1).iter().copied().collect();
+        let beta: Vec<f32> = fill(1, KRES, seed ^ 0xB2, 0.1).iter().copied().collect();
+        let w1 = fill(KRES, DFF, seed ^ 0xC3, 0.05);
+        let w2 = fill(DFF, KRES, seed ^ 0xD4, 0.05);
+        // Same ids -> the host path caches w1/w2c on first touch; the dev path hits the cache, so both
+        // paths use bit-identical partials (only host-sum vs device-sum differs).
+        let (w1a, w2a) = (w1.clone(), w2.clone());
+        let host = self.resident_ffn(&x, &gamma, &beta,
+            move || w1a, "selftest.ffn.l1", move || w2a, "selftest.ffn.l2");
+        let dev = self.resident_ffn_devacc_readback(&x, &gamma, &beta,
+            move || w1, "selftest.ffn.l1", move || w2, "selftest.ffn.l2")?;
+        Some((host, dev))
     }
 
     /// Per-N instruction stream. On the MODAL resident, `silu` picks the baked-RTP mode: the

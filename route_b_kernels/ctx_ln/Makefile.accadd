@@ -1,0 +1,34 @@
+##===- Makefile.accadd --------------------------------------------------===##
+#
+# Device-side f32 accumulate-add xclbin (resident-FFN fc2 on-device K-split accum).
+# Build:
+#   make -f Makefile.accadd NPU2=1 rows=512 cols=1024 build/final_accadd_512x1024.xclbin
+# Produces final_accadd_${rows}x${cols}.xclbin + insts_accadd_${rows}x${cols}.txt.
+# `cols` is the row width D (= KRES); rows = PAD_M. out[t,c] = a[t,c] + b[t,c], f32.
+#
+srcdir := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
+include ${srcdir}/../../makefile-common
+VPATH := ${srcdir}/../../../aie_kernels/aie2p
+
+devicename ?= $(if $(filter 1,$(NPU2)),npu2,npu)
+rows ?= 512
+cols ?= 1024
+tag = accadd_${rows}x${cols}
+
+aie_py_src = acc_add_iron.py
+
+all: build/final_${tag}.xclbin
+
+build/acc_add.o: acc_add.cc
+	mkdir -p ${@D}
+	cd ${@D} && ${PEANO_INSTALL_DIR}/bin/clang++ ${PEANOWRAP2P_FLAGS} -c $< -o ${@F}
+
+build/aie_${tag}.mlir: ${srcdir}/${aie_py_src}
+	mkdir -p ${@D}
+	python3 $< -d ${devicename} -r ${rows} -c ${cols} -t 0 > $@
+
+build/final_${tag}.xclbin: build/aie_${tag}.mlir build/acc_add.o
+	mkdir -p ${@D}
+	cd ${@D} && aiecc --aie-generate-xclbin --aie-generate-npu-insts --no-compile-host \
+		--no-xchesscc --no-xbridge --peano ${PEANO_INSTALL_DIR} \
+		--xclbin-name=${@F} --npu-insts-name=insts_${tag}.txt aie_${tag}.mlir
