@@ -251,16 +251,40 @@ impl FastConformerEncoder {
         #[cfg(feature = "npu")]
         let resident_mha_qkv = resident_mha && std::env::var("PARAKEET_MHA_HOSTQKV").is_err();
         #[cfg(feature = "npu")]
-        let resident_qkv = if resident_mha_qkv {
-            self.npu.as_ref().filter(|n| n.resident_ff_available()).map(|npu| {
-                let gamma = b.v("norm_self_att.weight");
-                let beta = b.v("norm_self_att.bias");
+        let resident_qkv: Option<(Array2<f32>, Array2<f32>, Array2<f32>)> = if resident_mha_qkv
+            && self.npu.as_ref().map(|n| n.resident_ff_available()).unwrap_or(false) {
+            let npu = self.npu.as_ref().unwrap();
+            let gamma = b.v("norm_self_att.weight");
+            let beta = b.v("norm_self_att.bias");
+            // bf16x2 device-A is ON by default for the resident path (opt-out PARAKEET_MHA_SPLITA=0 ->
+            // old single-bf16-A path, WER 8.9). It makes the opt-in resident MHA WER-NEUTRAL (8.5),
+            // unblocking the (owner-deferred) DEFAULT flip. The shipped host-MHA default is untouched.
+            let split_a = std::env::var("PARAKEET_MHA_SPLITA").map(|v| v != "0").unwrap_or(true);
+            if split_a {
+                // Split the DEVICE ctxLN affine_LN(x) into A_hi + A_lo (near-f32) and feed the QKV modal
+                // GEMM twice (q = A_hi@W + A_lo@W), summing on host. The +0.4pp seam was the bf16-round
+                // coin-flip of the device A (host golden HOSTQKV=8.5 vs full-resident bf16-A 8.9); near-f32
+                // A recovers 8.5. Reuses mm_lazy unchanged -> no shared default-infra touch. NOTE: reads the
+                // device A back to host to split it (a residency step-back, compute stays on-NPU); the clean
+                // follow-on is a device-side affine_cast_split (A_hi+A_lo on-device, no readback).
                 let _hh = PhaseScope::new("mha_resident_qkv", Bucket::Npu);
-                npu.resident_mha_ln_qkv(x, gamma.as_slice().unwrap(), beta.as_slice().unwrap(),
+                let a = npu.resident_mha_affine_ln_f32(x, gamma.as_slice().unwrap(), beta.as_slice().unwrap());
+                let a_hi = a.mapv(|v| npu_xrt::bf16_bits_to_f32(npu_xrt::f32_to_bf16_bits(v)));
+                let a_lo = &a - &a_hi;
+                let q = { let hi = self.mm_lazy(&a_hi, || b.m("self_attn.linear_q.weight"), &format!("{blk}.q"));
+                          let lo = self.mm_lazy(&a_lo, || b.m("self_attn.linear_q.weight"), &format!("{blk}.q")); hi + &lo };
+                let k = { let hi = self.mm_lazy(&a_hi, || b.m("self_attn.linear_k.weight"), &format!("{blk}.k"));
+                          let lo = self.mm_lazy(&a_lo, || b.m("self_attn.linear_k.weight"), &format!("{blk}.k")); hi + &lo };
+                let v = { let hi = self.mm_lazy(&a_hi, || b.m("self_attn.linear_v.weight"), &format!("{blk}.v"));
+                          let lo = self.mm_lazy(&a_lo, || b.m("self_attn.linear_v.weight"), &format!("{blk}.v")); hi + &lo };
+                Some((q, k, v))
+            } else {
+                let _hh = PhaseScope::new("mha_resident_qkv", Bucket::Npu);
+                Some(npu.resident_mha_ln_qkv(x, gamma.as_slice().unwrap(), beta.as_slice().unwrap(),
                     || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_q.weight") }, &format!("{blk}.q"),
                     || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_k.weight") }, &format!("{blk}.k"),
-                    || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_v.weight") }, &format!("{blk}.v"))
-            })
+                    || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_v.weight") }, &format!("{blk}.v")))
+            }
         } else { None };
         #[cfg(not(feature = "npu"))]
         let resident_qkv: Option<(Array2<f32>, Array2<f32>, Array2<f32>)> = None;
