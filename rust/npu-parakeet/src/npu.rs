@@ -46,6 +46,11 @@ const CONV_TQ: usize = 8;
 const CONV_DK: usize = 128;
 const CONV_BUILT_T: usize = 176; // 172 padded to a VL-multiple; the 8-head conveyor's baked T
 const CONV_GJ: usize = 4;        // heads per MemTile group (must match the generator's join)
+// Key-mask sentinel packed into the BD_shifted belt for pad keys kk >= t. The conveyor kernel has no
+// t_active word, so it softmaxes over all CONV_BUILT_T keys; k[pad]=0 makes q.k[pad]=0, so a large
+// negative BD makes scores[pad]=CONV_KEY_MASK*inv_scale ~= -884 -> exp2 clamps to ~0 (masked). Host-only
+// fix (no kernel change): reproduces the shipped relpos t_active masking for variable-length clips.
+const CONV_KEY_MASK: f32 = -1.0e4;
 
 /// BD-carriage precision for the conveyor query belt (open-item C / SPLITP). Default PLAIN per the
 /// Deliverable-1 gate (scripts/conveyor_bd_precision_check.py). Env PARAKEET_CONVEYOR_BD=split flips
@@ -534,8 +539,9 @@ impl NpuMatmul {
             let ph = pm.slice(s![.., col..col + dk]); // [P, DK]
             bd_all.slice_mut(s![h, .., ..]).assign(&qv.dot(&ph.t())); // [T, P]
         }
-        // rel_shift the whole [H,T,P] -> [H,T,T] (reuses the shipped host brick). BD_shifted keys are
-        // the REAL t; the belt zero-pads keys T..BUILT_T (pad keys weigh ~0 under t_active softmax).
+        // rel_shift the whole [H,T,P] -> [H,T,T] (reuses the shipped host brick). BD_shifted covers the
+        // REAL t keys; pad keys kk >= t get CONV_KEY_MASK in the belt so the mask-free conveyor softmax
+        // drives them to ~0 (see CONV_KEY_MASK). This makes the conveyor correct for variable-length T.
         let bd_sh = crate::ops::rel_shift(&bd_all, t); // [H,T,T]
 
         // ---- per-head belt: [N_QT * QELEM] f32, tile-major (q0 = qt*TQ) ----
@@ -556,7 +562,11 @@ impl NpuMatmul {
                     for r in 0..CONV_TQ {
                         let i = q0 + r;
                         for kk in 0..CONV_BUILT_T {
-                            let val = if i < t && kk < t { bd_sh[[h, i, kk]] } else { 0.0 };
+                            // pad keys (kk >= t) get the mask sentinel; real query rows get real BD;
+                            // pad query rows (i >= t) are discarded on de-interleave so 0.0 is fine.
+                            let val = if kk >= t { CONV_KEY_MASK }
+                                      else if i < t { bd_sh[[h, i, kk]] }
+                                      else { 0.0 };
                             belt.push(transform(val));
                         }
                     }
