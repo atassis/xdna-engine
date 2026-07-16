@@ -760,6 +760,30 @@ impl NpuMatmul {
         (q, k, v)
     }
 
+    /// bf16x2 device-A gate helper (opt-in `PARAKEET_MHA_SPLITA`): run the resident ctxLN+affine and
+    /// return the DEVICE affine_LN(x) in f32 [m, KRES] (read `bo_ln` back + apply the affine on host).
+    /// The caller splits it into A_hi + A_lo (near-f32) and feeds the QKV GEMM twice, testing whether a
+    /// near-f32 device A closes the LN->QKV seam WER gap (host golden `HOSTQKV=1` 8.5 vs full-resident
+    /// bf16-A 8.9). Uses the SAME device ctxLN as `resident_mha_ln_qkv` (so it is faithful to the 8.9
+    /// path's LN), reads no shared default infra, and mutates nothing on the FFN/conv paths.
+    pub fn resident_mha_affine_ln_f32(&self, x: &Array2<f32>, gamma: &[f32], beta: &[f32]) -> Array2<f32> {
+        self.stats.borrow_mut().calls += 1;
+        let m = x.nrows();
+        let rl = self.ln_affine_cast(x, gamma, beta); // device ctxLN -> bo_ln (f32); affine_cast -> bo_bf16
+        rl.bo_ln.sync_from_device().unwrap();
+        let mut cb = vec![0u8; PAD_M * KRES * 4];
+        rl.bo_ln.read_bytes(&mut cb).unwrap();
+        let mut out = Array2::<f32>::zeros((m, KRES));
+        for r in 0..m {
+            for c in 0..KRES {
+                let off = (r * KRES + c) * 4;
+                let ln = f32::from_le_bytes([cb[off], cb[off + 1], cb[off + 2], cb[off + 3]]);
+                out[[r, c]] = ln * gamma[c] + beta[c];
+            }
+        }
+        out
+    }
+
     /// Resident conv-module front (LN -> pw1 -> GLU), the conv step-2 frontier advance: the activation
     /// never touches host across the three ops.
     ///   ctxLN -> affine_cast -> modal pw1 GEMM (N=2*KRES, identity, output STAYS device in the stream
