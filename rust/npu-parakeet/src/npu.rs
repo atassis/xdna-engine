@@ -38,6 +38,30 @@ const RELPOS_TQ: usize = 8;
 const RELPOS_KB: usize = 43;
 const RELPOS_DK: usize = 128;   // Parakeet head_dim (kernel bakes DK=128)
 const RELPOS_BUILT_T: usize = 172; // baked buffer/dataflow size of the single xclbin
+
+// 8-head relpos-MHA CONVEYOR (opt-in PARAKEET_CONVEYOR_MHA=1). Real Parakeet dims, must match the
+// conveyor_attn_iron.py 8-head build: TQ=8, DK=128, T padded 172->176 (a VL(16) multiple), GJ=4
+// heads per MemTile group (the validated 3-MemTile-op recipe: split q+k, v-direct, ctx-join).
+const CONV_TQ: usize = 8;
+const CONV_DK: usize = 128;
+const CONV_BUILT_T: usize = 176; // 172 padded to a VL-multiple; the 8-head conveyor's baked T
+const CONV_GJ: usize = 4;        // heads per MemTile group (must match the generator's join)
+
+/// BD-carriage precision for the conveyor query belt (open-item C / SPLITP). Default PLAIN per the
+/// Deliverable-1 gate (scripts/conveyor_bd_precision_check.py). Env PARAKEET_CONVEYOR_BD=split flips
+/// to two-bf16 (hi+lo, ~14 mantissa bits) if the device 17-clip WER ever regresses vs 8.5.
+#[derive(Clone, Copy, PartialEq)]
+pub enum BdCarry { Plain, Split }
+impl BdCarry {
+    fn from_env() -> Self {
+        match std::env::var("PARAKEET_CONVEYOR_BD").as_deref() {
+            Ok("split") => BdCarry::Split,
+            _ => BdCarry::Plain, // Deliverable-1 verdict: plain sufficient, half the BD belt bytes
+        }
+    }
+    fn factor(self) -> usize { match self { BdCarry::Plain => 1, BdCarry::Split => 2 } }
+    fn name(self) -> &'static str { match self { BdCarry::Plain => "plain-bf16", BdCarry::Split => "split-bf16" } }
+}
 const RELPOS_TACTIVE_WORD: usize = 8; // insts word holding t_active (verified device-side)
 
 /// The single resident relpos block (built at RELPOS_BUILT_T). BOs are sized for BUILT_T; per
@@ -402,6 +426,144 @@ impl NpuMatmul {
             }
         }
         ctx
+    }
+
+    /// 8-head relpos-MHA CONVEYOR (opt-in PARAKEET_CONVEYOR_MHA=1). Replaces the per-head
+    /// `relpos_mha` LOOP (8 dispatches) with ONE 8-head conveyor dispatch (scores(relpos) ->
+    /// softmax -> ctx, 8 heads x 3 tiles = 24 tiles, device-validated H=8 rel-L2 4.69e-3).
+    ///
+    /// This method owns the HOST-SIDE belt packing (the reviewable part):
+    ///   * qu_h        = q_h + pos_bias_u[h]                              -> AC query, packed bf16.
+    ///   * BD_shifted_h = rel_shift( (q_h + pos_bias_v[h]) @ p_h^T )      -> host-precomputed, packed
+    ///                    into the belt AFTER qu_h (the conveyor's BD-in-belt design; no p resident).
+    /// Carriage precision = `BdCarry` (env PARAKEET_CONVEYOR_BD, default PLAIN). Deliverable-1 gate
+    /// (scripts/conveyor_bd_precision_check.py, block-0/T=32) found PLAIN sufficient: total ctx
+    /// rel-L2 2.43e-3 == split, ~2x under the 5e-3 bf16 gate; the plain-vs-split carriage delta
+    /// (2.4e-4 vs 3.8e-5) sits ~10x below the bf16 pipeline floor, so it never reaches ctx. SPLIT
+    /// DOUBLES the BD belt bytes (BD is already why the relpos q belt runs depth-1) for no measured
+    /// gain -> default PLAIN; flip to split only if the device 17-clip WER regresses vs 8.5.
+    ///
+    /// Inputs (host f32, as encoder.rs already has them): q/k/v [T, H*DK], pm [P, H*DK],
+    /// ubias/vbias [H, DK]. Returns merged ctx [T, H*DK] (pre-linear_out; caller applies linear_out).
+    ///
+    /// NOTE: the actual 8-head xclbin LOAD + DISPATCH + output de-interleave is a TODO STUB below
+    /// (needs artifacts/conveyor/single/{final.xclbin,insts.bin} from scripts/conveyor_prebuild.sh
+    /// and the group-major join ABI from conveyor_attn_iron.py -- see CONVEYOR_INTEGRATION_RUNBOOK.md).
+    pub fn relpos_mha_conveyor(
+        &self,
+        q: &Array2<f32>, k: &Array2<f32>, v: &Array2<f32>, pm: &Array2<f32>,
+        ubias: &Array2<f32>, vbias: &Array2<f32>, n_heads: usize,
+    ) -> Array2<f32> {
+        let carry = BdCarry::from_env();
+        let t = q.nrows();
+        let p = pm.nrows(); // 2T-1
+        let dk = CONV_DK;
+        assert_eq!(dk, RELPOS_DK, "conveyor DK must match the baked head_dim");
+        assert!(t <= CONV_BUILT_T, "clip T={t} exceeds conveyor BUILT_T={CONV_BUILT_T}");
+        let n_qt = CONV_BUILT_T / CONV_TQ;                       // query tiles streamed (176/8 = 22)
+        // per-tile query-belt element count: qu [TQ*DK] then BD_shifted [carry_factor * TQ*BUILT_T].
+        let qelem = CONV_TQ * dk + carry.factor() * CONV_TQ * CONV_BUILT_T;
+
+        // ---- host-side belt inputs: qu_all [H,T,DK] and BD (pre-shift) [H,T,P] ----
+        let mut qu_all = Array3::<f32>::zeros((n_heads, t, dk));
+        let mut bd_all = Array3::<f32>::zeros((n_heads, t, p));
+        for h in 0..n_heads {
+            let col = h * dk;
+            let mut qv = Array2::<f32>::zeros((t, dk));
+            for i in 0..t {
+                for c in 0..dk {
+                    let qi = q[[i, col + c]];
+                    qu_all[[h, i, c]] = qi + ubias[[h, c]];
+                    qv[[i, c]] = qi + vbias[[h, c]];
+                }
+            }
+            let ph = pm.slice(s![.., col..col + dk]); // [P, DK]
+            bd_all.slice_mut(s![h, .., ..]).assign(&qv.dot(&ph.t())); // [T, P]
+        }
+        // rel_shift the whole [H,T,P] -> [H,T,T] (reuses the shipped host brick). BD_shifted keys are
+        // the REAL t; the belt zero-pads keys T..BUILT_T (pad keys weigh ~0 under t_active softmax).
+        let bd_sh = crate::ops::rel_shift(&bd_all, t); // [H,T,T]
+
+        // ---- per-head belt: [N_QT * QELEM] f32, tile-major (q0 = qt*TQ) ----
+        // per tile: qu rows [TQ,DK] (zero past t) then BD_shifted rows. PLAIN packs the bf16 value;
+        // SPLIT packs hi(BUILT_T) then lo(BUILT_T) so the split kernel reconstructs (float)hi+(float)lo.
+        let build_head_belt = |h: usize| -> Vec<f32> {
+            let mut belt = Vec::<f32>::with_capacity(n_qt * qelem);
+            for qt in 0..n_qt {
+                let q0 = qt * CONV_TQ;
+                // qu block
+                for r in 0..CONV_TQ {
+                    let i = q0 + r;
+                    if i < t { belt.extend(qu_all.slice(s![h, i, ..]).iter().copied()); }
+                    else { belt.extend(std::iter::repeat(0.0f32).take(dk)); }
+                }
+                // BD_shifted block(s): width BUILT_T, real keys in [0,t), zero pad beyond.
+                let mut push_bd = |transform: &dyn Fn(f32) -> f32| {
+                    for r in 0..CONV_TQ {
+                        let i = q0 + r;
+                        for kk in 0..CONV_BUILT_T {
+                            let val = if i < t && kk < t { bd_sh[[h, i, kk]] } else { 0.0 };
+                            belt.push(transform(val));
+                        }
+                    }
+                };
+                match carry {
+                    BdCarry::Plain => push_bd(&|x| x),                       // pack rounds to bf16
+                    BdCarry::Split => {                                       // hi then lo
+                        push_bd(&|x| bf16_round_f32(x));                     // hi (already bf16-valued)
+                        push_bd(&|x| x - bf16_round_f32(x));                 // lo residual (pack rounds)
+                    }
+                }
+            }
+            debug_assert_eq!(belt.len(), n_qt * qelem);
+            belt
+        };
+
+        // ---- group-major (GJ heads/MemTile group) step-interleave: per group, per tile, per head ----
+        // matches conveyor_attn_iron.py's split q fill (stack heads-in-group on axis 1). k/v head-major.
+        let head_belts: Vec<Vec<f32>> = (0..n_heads).map(build_head_belt).collect();
+        let mut q_belt = Vec::<f32>::with_capacity(n_heads * n_qt * qelem);
+        for g in (0..n_heads).step_by(CONV_GJ) {
+            let gsz = CONV_GJ.min(n_heads - g);
+            for qt in 0..n_qt {
+                for i in 0..gsz {
+                    let off = qt * qelem;
+                    q_belt.extend_from_slice(&head_belts[g + i][off..off + qelem]);
+                }
+            }
+        }
+        // k / v head-major, each [H * BUILT_T * DK] with real rows in [0,t), zero pad (acquire-once).
+        let mut k_pack = Vec::<f32>::with_capacity(n_heads * CONV_BUILT_T * dk);
+        let mut v_pack = Vec::<f32>::with_capacity(n_heads * CONV_BUILT_T * dk);
+        for h in 0..n_heads {
+            let col = h * dk;
+            push_pad_rows(&mut k_pack, &k.slice(s![.., col..col + dk]).to_owned(), 0, t, CONV_BUILT_T);
+            push_pad_rows(&mut v_pack, &v.slice(s![.., col..col + dk]).to_owned(), 0, t, CONV_BUILT_T);
+        }
+        // pack f32 -> bf16 (device belt dtype).
+        let mut qb = vec![0u16; q_belt.len()];
+        let mut kb = vec![0u16; k_pack.len()];
+        let mut vb = vec![0u16; v_pack.len()];
+        npu_xrt::pack_f32_to_bf16(&q_belt, &mut qb);
+        npu_xrt::pack_f32_to_bf16(&k_pack, &mut kb);
+        npu_xrt::pack_f32_to_bf16(&v_pack, &mut vb);
+
+        // ================= TODO STUB: 8-head conveyor xclbin dispatch =================
+        // Not yet wired (device build gated -- another human is on the NPU). To complete:
+        //  1. Build artifacts/conveyor/single/{final.xclbin,insts.bin} (STEP 8-head, T=BUILT_T,
+        //     RELPOS, carriage-matched kernel) via scripts/conveyor_prebuild.sh (see the runbook).
+        //  2. Lazy-load + cache the xclbin (mirror `relpos_block()` -> a `ConveyorK` holding
+        //     kern + template insts + bo_q/bo_k/bo_v/bo_ctx sized to the group-major ABI).
+        //  3. Upload qb/kb/vb, dispatch ONE run (kern.run_dwconv6 or the 4-BO conveyor ABI), sync.
+        //  4. De-interleave bo_ctx: heads grouped by GJ drain contiguously as [N_QT, gsz, TQ, DK];
+        //     transpose (H<->N_QT) per group -> per-head [T, DK] -> assign into ctx[:, h*DK..].
+        //     (Exact de-interleave is run_conveyor_attn.py lines 86-96.)
+        // Belts are fully packed above (qb/kb/vb ready); only the device I/O remains.
+        unimplemented!(
+            "conveyor 8-head dispatch not wired yet (carriage={}, q_belt={} k={} v={} bf16 elems, \
+             n_qt={n_qt}, qelem={qelem}); build the xclbin + wire dispatch per CONVEYOR_INTEGRATION_RUNBOOK.md",
+            carry.name(), qb.len(), kb.len(), vb.len()
+        )
     }
 
     /// Lazy-load the co-resident ctxLN + cast xclbins from {root}/artifacts/parakeet/ln (built at
@@ -1253,6 +1415,16 @@ fn u16_bytes(v: &[u16]) -> &[u8] {
 
 fn f32_bytes(v: &[f32]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) }
+}
+
+/// Round an f32 to the nearest bf16 value, returned as f32 (round-to-nearest-even, top 16 bits).
+/// Used to split BD into hi+lo bf16 halves (hi = bf16_round_f32(x); lo = x - hi). Mirrors the
+/// device pack_f32_to_bf16 rounding so the split reconstruction matches on-device arithmetic.
+fn bf16_round_f32(x: f32) -> f32 {
+    if !x.is_finite() { return x; }
+    let bits = x.to_bits();
+    let rounded = bits.wrapping_add(0x7fff + ((bits >> 16) & 1));
+    f32::from_bits(rounded & 0xffff_0000)
 }
 
 /// Append `take` rows of `m` (starting at row `start`) to `dst`, then zero-pad to `n_total` rows
