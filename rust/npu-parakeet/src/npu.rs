@@ -180,6 +180,8 @@ struct ResidentLn {
     // resident-FFN fc2 on-device K-split accumulate (out = a + b, f32), OPTIONAL like glu. When
     // present, resident_ffn_dev sums the fc2 partials on-chip into ONE device BO (no host acc).
     acc_add: Option<AccAdd>,
+    // scaled residual-add (out = a + 0.5*b, f32), OPTIONAL. The Macaron FFN residual x+0.5*ff on-chip.
+    resadd_s050: Option<ResidualAdd>,
     // conv-module depthwise conv1d (step 3), OPTIONAL like glu.
     dwconv: Option<ConvDw>,
     // conv-module post-dwconv SiLU (step 4), OPTIONAL like glu/dwconv. SEPARATE single-op-loop
@@ -226,6 +228,19 @@ struct AccAdd {
     acc0: Rc<Bo>, // [PAD_M, KRES] f32 ping accumulator
     acc1: Rc<Bo>, // [PAD_M, KRES] f32 pong accumulator
     zero: Bo,     // [PAD_M, KRES] f32, zeroed once (seed for the first partial)
+    dummy_tmp: Bo,
+    dummy_tr: Bo,
+}
+
+/// Device-side f32 scaled residual-add brick (whole-block fusion residual). out[g5] = a[g3] +
+/// scale*b[g4] over [PAD_M,KRES] f32, `scale` baked into the xclbin (one per value: s050 = 0.5).
+/// Keeps `x = x + scale*sublayer` on-chip so the residual never round-trips. OPTIONAL like acc_add.
+struct ResidualAdd {
+    kern: Rc<Kernel>,
+    instr: Bo,
+    n: usize,
+    scale: f32,   // baked scale this xclbin applies (asserted against the caller's requested scale)
+    bo_out: Rc<Bo>, // [PAD_M, KRES] f32 result (scratch; overwritten by the next call)
     dummy_tmp: Bo,
     dummy_tr: Bo,
 }
@@ -779,6 +794,25 @@ impl NpuMatmul {
                 None
             }
         };
+        // scaled residual-add s050 (out = a + 0.5*b, f32), OPTIONAL: the Macaron FFN residual on-chip.
+        let resadd_s050 = {
+            let xcl = self.ln_dir.join(format!("final_resadd_{PAD_M}x{KRES}_s050.xclbin"));
+            let ins = self.ln_dir.join(format!("insts_resadd_{PAD_M}x{KRES}_s050.txt"));
+            if xcl.exists() && ins.exists() {
+                let (kern, instr, n) = load_path(xcl, ins);
+                let gr = |i| kern.group_id(i).unwrap();
+                Some(ResidualAdd {
+                    scale: 0.5,
+                    bo_out: Rc::new(self.dev.alloc_bo(&kern, PAD_M * KRES * 4, FLAG_HOST_ONLY, gr(5)).unwrap()),
+                    dummy_tmp: self.dev.alloc_bo(&kern, 8, FLAG_HOST_ONLY, gr(6)).unwrap(),
+                    dummy_tr: self.dev.alloc_bo(&kern, 1, FLAG_HOST_ONLY, gr(7)).unwrap(),
+                    kern, instr, n,
+                })
+            } else {
+                eprintln!("[npu] resadd_s050 xclbin absent in {} -- residual_add_dev(0.5) unavailable (build final_resadd_{PAD_M}x{KRES}_s050)", self.ln_dir.display());
+                None
+            }
+        };
         // conv-module depthwise conv1d (step 3), OPTIONAL. 3-buffer ABI in[C,T]/w[C,16]/out[C,T] bf16.
         let dwconv = {
             let xcl = self.ln_dir.join(format!("final_dwconv_{DW_C}x{DW_T}.xclbin"));
@@ -880,7 +914,7 @@ impl NpuMatmul {
             deint_tmp: self.dev.alloc_bo(&deint_kern, 8, FLAG_HOST_ONLY, gd(6)).unwrap(),
             deint_tr: self.dev.alloc_bo(&deint_kern, 1, FLAG_HOST_ONLY, gd(7)).unwrap(),
             ln_kern, ln_instr, ln_n, ac_kern, ac_instr, ac_n,
-            deint_kern, deint_instr, deint_n, glu, acc_add, dwconv, silu, dwconv_silu, dwconv_silu_t,
+            deint_kern, deint_instr, deint_n, glu, acc_add, resadd_s050, dwconv, silu, dwconv_silu, dwconv_silu_t,
         });
         rl
     }
@@ -1388,6 +1422,72 @@ impl NpuMatmul {
             move || w1a, "selftest.ffn.l1", move || w2a, "selftest.ffn.l2");
         let dev = self.resident_ffn_devacc_readback(&x, &gamma, &beta,
             move || w1, "selftest.ffn.l1", move || w2, "selftest.ffn.l2")?;
+        Some((host, dev))
+    }
+
+    /// On-chip scaled residual add: out = a + scale*b, f32 [PAD_M,KRES], device-resident. Selects
+    /// the baked-scale xclbin (only s050 = 0.5 built so far). `a_bo`/`b_bo` are device f32 [PAD_M,KRES]
+    /// BOs; returns the device result (ResidualAdd scratch, overwritten by the next call). `None` when
+    /// the resident-ln xclbins are absent; PANICS if the requested `scale` has no built xclbin.
+    pub fn residual_add_dev(&self, a_bo: &Bo, b_bo: &Bo, scale: f32, _m: usize) -> Option<Rc<Bo>> {
+        let rl = self.resident_ln()?;
+        let ra = if (scale - 0.5).abs() < 1e-6 {
+            rl.resadd_s050.as_ref()?
+        } else {
+            panic!("residual_add_dev: scale {scale} has no built xclbin (only s050=0.5); build final_resadd_{PAD_M}x{KRES}_s<stag>");
+        };
+        debug_assert!((ra.scale - scale).abs() < 1e-6);
+        ra.kern.run_matmul8(3, &ra.instr, ra.n, a_bo, b_bo, &ra.bo_out, &ra.dummy_tmp, &ra.dummy_tr).unwrap();
+        self.stats.borrow_mut().dispatches += 1;
+        Some(ra.bo_out.clone())
+    }
+
+    /// Device-parity self-test for Task 2 (on-chip residual add). Uploads synthetic a,b to device BOs,
+    /// runs [`Self::residual_add_dev`], returns (host `a + scale*b`, device out) as `[t, KRES]`. f32
+    /// mul+add is near-exact, so rel-L2 must be ~0. `None` when the resadd xclbin is absent.
+    pub fn residual_add_selftest(&self, t: usize, seed: u64, scale: f32) -> Option<(Array2<f32>, Array2<f32>)> {
+        let rl = self.resident_ln()?;
+        let ra = rl.resadd_s050.as_ref()?;
+        let fill = |rows: usize, cols: usize, sd: u64, sc: f32| -> Array2<f32> {
+            let mut s = sd.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            Array2::from_shape_fn((rows, cols), |_| {
+                s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                let mut z = s;
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                z ^= z >> 31;
+                let u = (z >> 40) as f32 / (1u32 << 24) as f32;
+                (u * 2.0 - 1.0) * sc
+            })
+        };
+        let a = fill(t, KRES, seed, 1.0);
+        let b = fill(t, KRES, seed ^ 0x51, 1.0);
+        // Upload a,b into device BOs [PAD_M,KRES] f32 (first t rows real; the rest stale -> ignored).
+        let mkbo = |arr: &Array2<f32>, gid: i32| -> Bo {
+            let bo = self.dev.alloc_bo(&ra.kern, PAD_M * KRES * 4, FLAG_HOST_ONLY, ra.kern.group_id(gid).unwrap()).unwrap();
+            let mut buf = vec![0f32; PAD_M * KRES];
+            let s = arr.as_standard_layout();
+            buf[..t * KRES].copy_from_slice(&s.as_slice().unwrap()[..t * KRES]);
+            bo.write_bytes(f32_bytes(&buf)).unwrap();
+            bo.sync_to_device().unwrap();
+            bo
+        };
+        let a_bo = mkbo(&a, 3);
+        let b_bo = mkbo(&b, 4);
+        let out_bo = self.residual_add_dev(&a_bo, &b_bo, scale, t)?;
+        out_bo.sync_from_device().unwrap();
+        let mut cb = vec![0u8; t * KRES * 4];
+        out_bo.read_bytes(&mut cb).unwrap();
+        let mut dev = Array2::<f32>::zeros((t, KRES));
+        for r in 0..t {
+            for c in 0..KRES {
+                let off = (r * KRES + c) * 4;
+                dev[[r, c]] = f32::from_le_bytes([cb[off], cb[off + 1], cb[off + 2], cb[off + 3]]);
+            }
+        }
+        // Host ref in the kernel's op order (scale*b, then a + that).
+        let sb = b.mapv(|x| scale * x);
+        let host = &a + &sb;
         Some((host, dev))
     }
 

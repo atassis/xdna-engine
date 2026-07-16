@@ -4,13 +4,16 @@
 //! match its host-assembled reference within the seam's rel-L2 tolerance? Fast (synthetic input),
 //! run BEFORE the full 17-clip WER regression.
 //!
-//!   ffn   -- Task 1: on-device fc2 accumulation. resident_ffn (host-accum) vs resident_ffn_dev
-//!            (acc_add on-chip). Accumulation is the ONLY change -> rel-L2 must be ~0 (<= 1e-4).
+//!   ffn      -- Task 1: on-device fc2 accumulation. resident_ffn (host-accum) vs resident_ffn_dev
+//!               (acc_add on-chip). Accumulation is the ONLY change -> rel-L2 must be ~0 (<= 1e-4).
+//!   residual -- Task 2: on-chip scaled residual add. host `a + 0.5*b` vs residual_add_dev.
+//!               f32 mul+add near-exact -> rel-L2 must be ~0 (<= 1e-4).
 //!
 //! Run (NPU quiesced, from the repo root):
 //!   NPU_XCLBIN_ROOT=$PWD cargo run --features npu --release --bin fused_seam_parity -- ffn
-//! Needs the resident modal xclbin + artifacts/parakeet/ln/{ctxln,affcast,deint,accadd} (built by
-//! scripts/build_parakeet_modal_kernels.sh).
+//!   NPU_XCLBIN_ROOT=$PWD cargo run --features npu --release --bin fused_seam_parity -- residual
+//! Needs the resident modal xclbin + artifacts/parakeet/ln/{ctxln,affcast,deint,accadd,resadd} (built
+//! by scripts/build_parakeet_modal_kernels.sh).
 
 use ndarray::Array2;
 use npu_parakeet::npu::NpuMatmul;
@@ -57,8 +60,18 @@ fn main() {
             assert!(l2_rel <= 1e-4, "FFN device-accum parity FAILED: rel-L2 {l2_rel:.3e} > 1e-4");
             println!("[fused_seam_parity] PASS (rel-L2 <= 1e-4)");
         }
+        "residual" => {
+            let (host, dev) = npu.residual_add_selftest(t, seed, 0.5).unwrap_or_else(|| {
+                panic!("[fused_seam_parity] residual: resadd_s050 xclbin absent -- build \
+                        scripts/build_parakeet_modal_kernels.sh (needs final_resadd_512x1024_s050)");
+            });
+            let (max_rel, l2_rel) = rel_err(&host, &dev);
+            println!("[fused_seam_parity] seam=residual scale=0.5 t={t} seed={seed}  max_rel={max_rel:.3e} rel-L2={l2_rel:.3e}");
+            assert!(l2_rel <= 1e-4, "residual_add parity FAILED: rel-L2 {l2_rel:.3e} > 1e-4");
+            println!("[fused_seam_parity] PASS (rel-L2 <= 1e-4)");
+        }
         other => {
-            eprintln!("[fused_seam_parity] unknown seam '{other}' (known: ffn)");
+            eprintln!("[fused_seam_parity] unknown seam '{other}' (known: ffn, residual)");
             std::process::exit(2);
         }
     }

@@ -64,6 +64,11 @@ make -C $LNML -f Makefile.glu        NPU2=1 rows=512 cols=1024 build/final_glu_5
 # (deletes the host Array2 accumulation; bit-identical to the host sequential f32 K-split). rows=PAD_M, cols=KRES.
 echo "== RESIDENT-FFN: acc_add 512x1024 =="
 make -C $LNML -f Makefile.accadd     NPU2=1 rows=512 cols=1024 build/final_accadd_512x1024.xclbin
+# RESIDENT-BLOCK: scaled residual-add (whole-block fusion residual). out[t,c]=a[t,c]+scale*b[t,c], f32.
+# s050 (scale=0.5) = the Macaron FFN residual x+0.5*ff. scale is baked (2-input-DMA limit -> one xclbin
+# per scale); the full-residual s100 (scale=1.0) is built when the MHSA/conv seams need it. rows=PAD_M, cols=KRES.
+echo "== RESIDENT-BLOCK: residual_add s050 (x+0.5*ff) 512x1024 =="
+make -C $LNML -f Makefile.resadd     NPU2=1 rows=512 cols=1024 scale=0.5 stag=050 build/final_resadd_512x1024_s050.xclbin
 # RESIDENT-CONV: post-dwconv SiLU brick (conv-module step 4). silu(x) over [C,T]=[1024,400] f32 -> f32.
 # SEPARATE single-op-loop brick (NOT a dwconv epilogue -- the fused epilogue miscompiles alternate
 # channels on this toolchain; see dwconv-fused-epilogue-alt-channel-miscompile). rows=C, cols=T.
@@ -74,7 +79,7 @@ echo "== RESIDENT-FFN: cast@4096 + K=4096 fc2 (identity) =="
 make -C $LNML -f Makefile.cast       NPU2=1 rows=512 cols=4096 build/final_cast_512x4096.xclbin
 WA_C_DEPTH=1 make -C $MMW -f Makefile.modal NPU2=1 M=512 K=4096 N=1024 m=64 k=32 n=128 n_aie_cols=8 \
   emulate_bfloat16_mmul_with_bfp16=1 bfp16_iree=1 no_silu=1 build/final_512x4096x1024_64x32x128_8c_modalid.xclbin
-for tag in ctxln_512x1024 affcast_512x1024 cast_512x1024 cast_512x4096 glu_512x1024 accadd_512x1024 silu_1024x400; do
+for tag in ctxln_512x1024 affcast_512x1024 cast_512x1024 cast_512x4096 glu_512x1024 accadd_512x1024 resadd_512x1024_s050 silu_1024x400; do
   cp "$LNML/build/final_${tag}.xclbin" "$LNML/build/insts_${tag}.txt" "$LNDIR/"
 done
 cp "$MMW/build/final_512x4096x1024_64x32x128_8c_modalid.xclbin" "$MMW/build/insts_512x4096x1024_64x32x128_8c_modalid.txt" "$LNDIR/"
