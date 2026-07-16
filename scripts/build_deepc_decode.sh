@@ -12,9 +12,9 @@
 #                  uv venv .venv-iron --python 3.14 ; uv pip install --python .venv-iron <mlir_aie wheel> torch
 #                default: <repo>/.venv-iron
 #   IRON       = amd/IRON operator-library checkout. The deep-C patch (patches/amd-IRON-deepc.patch)
-#                is applied to it if not already present.  default: ~/repositories/ns/atassis/xdna-engine-workspace/amd/IRON
+#                is applied to it if not already present.  default: $WS/amd/IRON
 #   AIEBU_DIR  = dir containing aiebu-asm (from the XRT aiebu submodule build)
-#                default: ~/repositories/ns/atassis/xdna-engine-workspace/amd/XRT-src/src/runtime_src/core/common/aiebu/build/Release/src/cpp/utils/asm
+#                default: $WS/amd/XRT-src/src/runtime_src/core/common/aiebu/build/Release/src/cpp/utils/asm
 #   WEIGHTS    = whisper decoder weights dir.  default: <repo>/artifacts/whisper-small/whisper_decoder
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

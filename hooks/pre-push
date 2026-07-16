@@ -28,6 +28,14 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     fi
   done
 done
+# Content-level guard: no public file may LINK to private material (private repo name,
+# private-KB paths, private tooling, or a local dev-workspace path). Whole-tree scan of
+# the tip being pushed; pattern list lives in the scanner (single source of truth).
+if [ -x scripts/check_no_private_refs.sh ]; then
+  if ! scripts/check_no_private_refs.sh >&2; then
+    echo "BLOCKED: the tree contains a reference to private material (see above)"; fail=1
+  fi
+fi
 if [ "$fail" -ne 0 ]; then
   echo "pre-push guard refused the push. Do NOT use --no-verify unless you are certain." >&2
   exit 1

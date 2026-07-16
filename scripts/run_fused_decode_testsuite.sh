@@ -53,7 +53,8 @@ for s in whisper-npu-decode-e2e whisper-npu-decode-dispatches whisper-npu-decode
          decode-attn-block-dispatch-latency decode-attn-overhead-bound energy-offload context-switch-cost \
          asr-serve-e2e-parakeet embeddings-e2e-latency esm-native-latency \
          decode-fused-elf-self-attn decode-fused-elf-cross-attn decode-fused-elf-whole-decode decode-fused-elf-wer-safe; do
-  echo -e "\n--- $s ---" | tee -a "$LOG"; "$WT/scripts/kb.sh" show "$s" 2>/dev/null | grep -E "^value:|^conditions:" | tee -a "$LOG"
+  # Optional local baseline cross-check: set KB_SHOW to a 'show <slug>' tool if you have one; skipped otherwise.
+  [ -n "${KB_SHOW:-}" ] && { echo -e "\n--- $s ---" | tee -a "$LOG"; "$KB_SHOW" "$s" 2>/dev/null | grep -E "^value:|^conditions:" | tee -a "$LOG"; }
 done
 
 # ---------------------------------------------------------------------------
