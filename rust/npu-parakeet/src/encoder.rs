@@ -302,8 +302,12 @@ impl FastConformerEncoder {
         // RESIDENT MHA (opt-in PARAKEET_RESIDENT_MHA=1): replace the host per-head
         // scores/rel_shift/softmax/context with the on-chip STEP=8 block, one dispatch per head.
         // The kernel bakes inv_scale=1/sqrt(128), so pass qu=qh+u / qv=qh+v / k / p / v directly.
+        // The resident relpos block is baked at RELPOS_BUILT_T (=172); it cannot serve longer clips.
+        // Gate on t <= relpos_max_t() PER-CLIP: a T>BUILT_T clip skips the resident per-head loop and
+        // falls through to the host attention path below (whole-block golden), so no crash/corruption.
         #[cfg(feature = "npu")]
-        if std::env::var("PARAKEET_RESIDENT_MHA").is_ok() {
+        if std::env::var("PARAKEET_RESIDENT_MHA").is_ok()
+            && self.npu.as_ref().map(|n| t <= n.relpos_max_t()).unwrap_or(false) {
             if let Some(npu) = &self.npu {
                 let _h = PhaseScope::new("mhsa_resident", Bucket::Npu);
                 let mut ctx = Array2::<f32>::zeros((t, d));

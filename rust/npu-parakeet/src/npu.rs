@@ -312,6 +312,11 @@ impl NpuMatmul {
         }
     }
 
+    /// Max clip length T the resident relpos block can serve (the baked BUILT_T). Callers MUST gate
+    /// the resident MHA path on `t <= relpos_max_t()` and fall back to the host attention for longer
+    /// clips -- the resident BOs/dataflow are sized for BUILT_T and cannot serve T beyond it.
+    pub fn relpos_max_t(&self) -> usize { RELPOS_BUILT_T }
+
     /// Load (once) the SINGLE resident relpos block built at RELPOS_BUILT_T. Reads the xclbin +
     /// template insts from {root}/artifacts/relpos/single/ (pre-build: scripts/relpos_prebuild.sh).
     /// The same xclbin serves any clip T <= BUILT_T; per dispatch we patch the insts t_active word.
