@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Validate the FUSED dwconv->silu xclbin (final_dwconv_silu_1024x400) standalone on device.
 
-Structural check for roadmap 5-A rung: dwconv (f32 out) -> on-chip f32 fifo -> silu, one
+Structural check for the fused dwconv->silu brick: dwconv (f32 out) -> on-chip f32 fifo -> silu, one
 xclbin, two separate cores. The alt-channel per-tile-loop miscompile corrupts EVEN channels
 when a HEAVY epilogue rides one loop; here the two ops are separate simple cores, so EVEN and
 ODD must BOTH be clean. We compare vs an exact-f32 silu(dwconv(x)) golden (the NPU silu is

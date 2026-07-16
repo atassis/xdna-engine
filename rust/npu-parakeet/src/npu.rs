@@ -133,7 +133,7 @@ struct ResidentLn {
     // conv-module post-dwconv SiLU (step 4), OPTIONAL like glu/dwconv. SEPARATE single-op-loop
     // brick (NOT a dwconv epilogue) -- immune to the fused-epilogue per-channel-loop miscompile.
     silu: Option<ConvSilu>,
-    // FUSED dwconv->SiLU (step 3+4 in one xclbin, roadmap 5-A), OPTIONAL. When present it replaces the
+    // FUSED dwconv->SiLU (step 3+4 in one xclbin), OPTIONAL. When present it replaces the
     // separate dwconv + silu dispatches (one hw-context, no host bridge); absent -> the two-brick path.
     dwconv_silu: Option<ConvDwSilu>,
     // TIME-MAJOR fused dwconv->SiLU (step 3b), OPTIONAL. When present the conv path prefers it: [T,D]
@@ -201,7 +201,7 @@ struct ConvSilu {
     dummy_tr: Bo,   // g7
 }
 
-// FUSED conv-module dwconv->SiLU brick (step 3+4 in ONE xclbin, roadmap 5-A rung). A two-stage on-chip
+// FUSED conv-module dwconv->SiLU brick (step 3+4 in ONE xclbin). A two-stage on-chip
 // pipeline (dwconv core -> f32 ObjectFifo -> silu core, per column): the post-dwconv SiLU runs
 // device-to-device with NO second hw-context switch and NO host round-trip -- collapsing the two
 // separate ConvDw + ConvSilu xclbins (which each cost a ~1.9 ms switch) into one resident dispatch.
@@ -800,7 +800,7 @@ impl NpuMatmul {
         Some(out)
     }
 
-    /// FUSED on-NPU dwconv->SiLU (conv steps 3+4 in ONE xclbin, roadmap 5-A rung). Replaces the two
+    /// FUSED on-NPU dwconv->SiLU (conv steps 3+4 in ONE xclbin). Replaces the two
     /// separate npu_dwconv1d + npu_silu dispatches: one hw-context, the post-dwconv SiLU runs
     /// device-to-device (dwconv core -> on-chip f32 fifo -> silu core), so the on-NPU SiLU costs NO
     /// extra hw-context switch and no host round-trip (the ~1 ms/block the separate silu xclbin added).

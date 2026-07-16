@@ -1,6 +1,6 @@
 # dwconv1d/dwconv_silu_iron.py -*- Python -*-
 #
-# FUSED depthwise-conv1d -> SiLU in ONE xclbin (conv-module step 3+4, roadmap 5-A rung).
+# FUSED depthwise-conv1d -> SiLU in ONE xclbin (conv-module step 3+4).
 # A TWO-STAGE on-chip pipeline per column: a dwconv core (row 0) computes the k=9 FIR and
 # hands its f32 result to an on-chip f32 ObjectFifo that a silu core (row 1) consumes
 # device-to-device -- the post-dwconv SiLU never touches host, and there is NO second

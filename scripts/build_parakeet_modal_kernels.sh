@@ -82,7 +82,7 @@ DWML=mlir-aie/programming_examples/ml/dwconv1d
 make -C $DWML NPU2=1 cols=8 build/final.xclbin
 cp "$DWML/build/final.xclbin" "$LNDIR/final_dwconv_1024x400.xclbin"
 cp "$DWML/build/insts.bin"    "$LNDIR/insts_dwconv_1024x400.txt"
-# RESIDENT-CONV: FUSED dwconv->SiLU in ONE xclbin (conv step 3+4, roadmap 5-A). Collapses the separate
+# RESIDENT-CONV: FUSED dwconv->SiLU in ONE xclbin (conv step 3+4). Collapses the separate
 # dwconv + silu xclbins into a single resident hw-context (dwconv f32-out core -> on-chip f32 fifo ->
 # silu core), so the on-NPU post-dwconv SiLU costs no extra hw-context switch / host round-trip.
 echo "== RESIDENT-CONV: FUSED dwconv+silu 1024x400 (one xclbin) =="

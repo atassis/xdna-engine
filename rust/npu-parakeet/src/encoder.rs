@@ -460,7 +460,7 @@ impl FastConformerEncoder {
             }
             // ---- fallback: channel-major fused / separate bricks / host (transposes stay host) ----
             let glu_t = glu.t().to_owned(); // [T,D] -> [D,T]  (transpose 1, killed on the time-major path)
-            // FUSED dwconv->SiLU (steps 3+4 in ONE xclbin, roadmap 5-A) when CONV+SILU are on + the fused
+            // FUSED dwconv->SiLU (steps 3+4 in ONE xclbin) when CONV+SILU are on + the fused
             // brick is present: one hw-context, the post-dwconv SiLU runs device-to-device (no second
             // switch, no host bridge). Returns silu(dwconv(glu_t)) [D,T] directly. Falls back to the
             // separate dwconv + silu path below (then host) if the fused xclbin is absent.
