@@ -23,7 +23,7 @@ if [ -f "$out/final.xclbin" ] && [ -f "$out/insts.bin" ] && [ -z "${FORCE:-}" ];
 fi
 echo "[prebuild] building the single STEP=8 T=$BUILT_T TQ=$TQ KB=$KB xclbin (runtime t_active) ..."
 ( cd "$EX" && make clean >/dev/null 2>&1; \
-  make NPU2=1 STEP=8 T="$BUILT_T" TQ="$TQ" KB="$KB" TACTIVE="$BUILT_T" >/dev/null 2>&1 )
+  make NPU2=1 STEP=8 SPLITP=1 T="$BUILT_T" TQ="$TQ" KB="$KB" TACTIVE="$BUILT_T" >/dev/null 2>&1 )
 if [ ! -f "$EX/build/final.xclbin" ]; then
   echo "[prebuild] FAILED (no final.xclbin)"; exit 1
 fi

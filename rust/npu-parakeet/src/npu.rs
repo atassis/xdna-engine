@@ -347,7 +347,9 @@ impl NpuMatmul {
         let g = |i| kern.group_id(i).unwrap();
         let bo_instr = self.dev.alloc_bo(&kern, ib.len(), FLAG_CACHEABLE, g(1)).unwrap();
         let bo_quv = self.dev.alloc_bo(&kern, 2 * n_qt * RELPOS_TQ * RELPOS_DK * 2, FLAG_HOST_ONLY, g(3)).unwrap();
-        let bo_kpv = self.dev.alloc_bo(&kern, (tp + pp + tp) * RELPOS_DK * 2, FLAG_HOST_ONLY, g(4)).unwrap();
+        // SPLITP: kpv is k | p_hi | p_lo | V (the positional operand p split-bf16 for ~f32
+        // BD precision -- the resident-MHA WER fix). Two padded p-sections (2*pp).
+        let bo_kpv = self.dev.alloc_bo(&kern, (tp + pp + pp + tp) * RELPOS_DK * 2, FLAG_HOST_ONLY, g(4)).unwrap();
         let bo_ctx = self.dev.alloc_bo(&kern, ctx_rows * RELPOS_DK * 2, FLAG_HOST_ONLY, g(5)).unwrap();
         let rk = Rc::new(RelposK { kern, instr_template, n_instr, bo_instr, bo_quv, bo_kpv, bo_ctx, n_qt, tp, pp, ctx_rows });
         self.relpos.borrow_mut().insert(RELPOS_BUILT_T, rk.clone());
@@ -369,10 +371,16 @@ impl NpuMatmul {
             push_pad_rows(&mut quv, qu, q0, take, RELPOS_TQ);
             push_pad_rows(&mut quv, qv, q0, take, RELPOS_TQ);
         }
-        // KPV = k(pad tp) | p(pad pp) | V(pad tp); pad rows are zero so ctx ignores pad keys.
-        let mut kpv = Vec::<f32>::with_capacity((rk.tp + rk.pp + rk.tp) * RELPOS_DK);
+        // KPV = k(pad tp) | p_hi(pad pp) | p_lo(pad pp) | V(pad tp); pad rows are zero so ctx
+        // ignores pad keys. SPLITP: p is split-bf16 -- p_hi = bf16(p), p_lo = bf16(p - p_hi).
+        // Pushing p (f32) lets pack_f32_to_bf16 round it to p_hi; p_lo carries the residual so
+        // the kernel's BD = qv.p_hi + qv.p_lo recovers ~f32 precision on the positional operand
+        // (the probe-localized ~1% attention sink). k/qv/V stay single bf16 (they round fine).
+        let p_lo = p.mapv(|x| x - npu_xrt::bf16_bits_to_f32(npu_xrt::f32_to_bf16_bits(x)));
+        let mut kpv = Vec::<f32>::with_capacity((rk.tp + rk.pp + rk.pp + rk.tp) * RELPOS_DK);
         push_pad_rows(&mut kpv, k, 0, t, rk.tp);
         push_pad_rows(&mut kpv, p, 0, p.nrows(), rk.pp);
+        push_pad_rows(&mut kpv, &p_lo, 0, p.nrows(), rk.pp);
         push_pad_rows(&mut kpv, v, 0, t, rk.tp);
         let mut qb = vec![0u16; quv.len()];
         let mut kb = vec![0u16; kpv.len()];

@@ -100,6 +100,11 @@ build/kernels.a: build/relpos_mha.cc.o
 # STEP<=7 bake TQ/KB in the .cc only, so pass just -T there.
 ifeq ($(STEP),8)
 GEN_EXTRA = --tq ${TQ} --kb ${KB} --tactive ${TACTIVE}
+# SPLITP=1 -> split-bf16 positional operand (BD = qv.p_hi + qv.p_lo). Closes the
+# resident-MHA WER gap (the p-rounding precision sink). Host packs k|p_hi|p_lo|V.
+ifeq ($(SPLITP),1)
+GEN_EXTRA += --splitp
+endif
 else
 GEN_EXTRA =
 endif

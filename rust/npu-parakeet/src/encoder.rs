@@ -245,8 +245,13 @@ impl FastConformerEncoder {
         let resident_mha = std::env::var("PARAKEET_RESIDENT_MHA").is_ok();
         #[cfg(not(feature = "npu"))]
         let resident_mha = false;
+        // DIAGNOSTIC (PARAKEET_MHA_HOSTQKV=1): keep the resident attention block but feed it
+        // HOST f32-LN + mm_lazy q/k/v (the DEFAULT path's qkv), decoupling the LN->QKV seam from
+        // the resident attention to isolate which owns any WER gap. No effect unless RESIDENT_MHA.
         #[cfg(feature = "npu")]
-        let resident_qkv = if resident_mha {
+        let resident_mha_qkv = resident_mha && std::env::var("PARAKEET_MHA_HOSTQKV").is_err();
+        #[cfg(feature = "npu")]
+        let resident_qkv = if resident_mha_qkv {
             self.npu.as_ref().filter(|n| n.resident_ff_available()).map(|npu| {
                 let gamma = b.v("norm_self_att.weight");
                 let beta = b.v("norm_self_att.bias");
@@ -355,6 +360,81 @@ impl FastConformerEncoder {
                         }
                         eprintln!("[MHA_AB] blk={blk} h0 T={t} ctx_relL2={:.4e} worst_row={} row_relL2={:.4e}",
                             (num / den).sqrt(), maxrow.0, maxrow.1);
+
+                        // ---- PROBE (Ladder step 1): decompose the ~1% bf16 I/O quantization. Feed
+                        // bf16-rounded operands into the SAME f32 host golden and measure ctx rel-L2
+                        // vs pure-f32 (ch_host). Pure host math, no device -- isolates which rounding
+                        // hop (AC inputs / BD inputs / probs narrow / V narrow / ctx-out narrow) owns
+                        // the gap, and whether the full emulation reproduces the resident ~1.05e-2.
+                        {
+                            let rb = |x: f32| npu_xrt::bf16_bits_to_f32(npu_xrt::f32_to_bf16_bits(x));
+                            let rl2 = |a: &Array2<f32>| -> f64 {
+                                let mut n = 0f64; let mut dd = 0f64;
+                                for i in 0..t { for c in 0..dk {
+                                    let e = (a[[i, c]] - ch_host[[i, c]]) as f64; let g = ch_host[[i, c]] as f64;
+                                    n += e * e; dd += g * g;
+                                } }
+                                if dd > 0.0 { (n / dd).sqrt() } else { 0.0 }
+                            };
+                            // f32 attention over (possibly bf16-rounded) operands; rprobs/rout narrow.
+                            let fwd = |qu_: &Array2<f32>, qv_: &Array2<f32>, kh_: &Array2<f32>,
+                                       ph_: &Array2<f32>, vh_: &Array2<f32>, rprobs: bool, rout: bool| -> Array2<f32> {
+                                let ac = qu_.dot(&kh_.t());
+                                let mut bd3 = Array3::<f32>::zeros((1, t, ph_.nrows()));
+                                bd3.slice_mut(s![0, .., ..]).assign(&qv_.dot(&ph_.t()));
+                                let bd = rel_shift(&bd3, t);
+                                let mut probs = Array2::<f32>::zeros((t, t));
+                                for i in 0..t {
+                                    let mut mx = f32::NEG_INFINITY;
+                                    for j in 0..t { let sc = (ac[[i, j]] + bd[[0, i, j]]) / scale; probs[[i, j]] = sc; mx = mx.max(sc); }
+                                    let mut sum = 0.0;
+                                    for j in 0..t { let e = (probs[[i, j]] - mx).exp(); probs[[i, j]] = e; sum += e; }
+                                    let inv = 1.0 / sum;
+                                    for j in 0..t { let mut pv = probs[[i, j]] * inv; if rprobs { pv = rb(pv); } probs[[i, j]] = pv; }
+                                }
+                                let mut out = probs.dot(vh_);
+                                if rout { out.mapv_inplace(|x| rb(x)); }
+                                out
+                            };
+                            let qu_b = qu.mapv(|x| rb(x)); let qv_b = qv.mapv(|x| rb(x));
+                            let kh_b = kh.mapv(|x| rb(x)); let ph_b = ph.mapv(|x| rb(x));
+                            let vh_b = vh.mapv(|x| rb(x));
+                            let bd_in  = rl2(&fwd(&qu, &qv_b, &kh, &ph_b, &vh, false, false));
+                            let bd_qv  = rl2(&fwd(&qu, &qv_b, &kh, &ph, &vh, false, false));
+                            let bd_p   = rl2(&fwd(&qu, &qv, &kh, &ph_b, &vh, false, false));
+                            let emul   = rl2(&fwd(&qu_b, &qv_b, &kh_b, &ph_b, &vh_b, true, true));
+                            // Split-bf16 emulation of the BD (qv.p^T) matmul: hi=bf16(x), lo=bf16(x-hi).
+                            // A@B = Ahi.Bhi + Ahi.Blo + Alo.Bhi (+Alo.Blo), each an exact bf16-input dot.
+                            // The rest of the pipeline stays at emul precision (AC bf16-in, probs/V/ctx bf16).
+                            let lo = |x: &Array2<f32>, hi: &Array2<f32>| -> Array2<f32> {
+                                let mut r = x - hi; r.mapv_inplace(|z| rb(z)); r
+                            };
+                            let qv_lo = lo(&qv, &qv_b); let ph_lo = lo(&ph, &ph_b);
+                            // full-pipeline fwd but with a caller-supplied precomputed BD [t, P] (pre-shift).
+                            let fwd_bd = |bd_full: &Array2<f32>| -> Array2<f32> {
+                                let ac = qu_b.dot(&kh_b.t());
+                                let mut bd3 = Array3::<f32>::zeros((1, t, bd_full.ncols()));
+                                bd3.slice_mut(s![0, .., ..]).assign(bd_full);
+                                let bd = rel_shift(&bd3, t);
+                                let mut probs = Array2::<f32>::zeros((t, t));
+                                for i in 0..t {
+                                    let mut mx = f32::NEG_INFINITY;
+                                    for j in 0..t { let sc = (ac[[i, j]] + bd[[0, i, j]]) / scale; probs[[i, j]] = sc; mx = mx.max(sc); }
+                                    let mut sum = 0.0;
+                                    for j in 0..t { let e = (probs[[i, j]] - mx).exp(); probs[[i, j]] = e; sum += e; }
+                                    let inv = 1.0 / sum;
+                                    for j in 0..t { probs[[i, j]] = rb(probs[[i, j]] * inv); }
+                                }
+                                let mut out = probs.dot(&vh_b); out.mapv_inplace(|x| rb(x)); out
+                            };
+                            // bd_x2p: split p only (qv single bf16)  -> qv_b.(ph_hi+ph_lo)
+                            let bd_x2p = &qv_b.dot(&ph_b.t()) + &qv_b.dot(&ph_lo.t());
+                            // bd_x3: split both, drop lo.lo -> qv_b.ph_hi + qv_b.ph_lo + qv_lo.ph_hi
+                            let bd_x3 = &(&qv_b.dot(&ph_b.t()) + &qv_b.dot(&ph_lo.t())) + &qv_lo.dot(&ph_b.t());
+                            let split_p  = rl2(&fwd_bd(&bd_x2p));
+                            let split_x3 = rl2(&fwd_bd(&bd_x3));
+                            eprintln!("[MHA_PROBE] blk={blk} h0 T={t} bd_in={bd_in:.4e} bd_qv={bd_qv:.4e} bd_p={bd_p:.4e} emul_full={emul:.4e} FIX_split_p={split_p:.4e} FIX_split_x3={split_x3:.4e}");
+                        }
                     }
                     ctx.slice_mut(s![.., col..col + dk]).assign(&ch);
                 }
