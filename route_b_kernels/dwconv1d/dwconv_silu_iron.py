@@ -10,7 +10,7 @@
 # Both cores stay SIMPLE single-op loops (dwconv core = FIR only; silu core = silu only),
 # so this is IMMUNE to the alt-channel per-tile-loop miscompile (that needs a HEAVY fused
 # epilogue in one loop; here the two ops live on two separate cores). See
-# docs/log/2026-07/dwconv-fused-epilogue-alt-channel-miscompile.md.
+# the dwconv-fused-epilogue-alt-channel-miscompile notes.
 #
 # Layout: [C=1024, T=400]. One ObjectFifo tile == one channel's time series (dwconv) ==
 # one row (silu -- a channel IS a row). C channels split across `columns`; each column's
@@ -90,7 +90,7 @@ def my_dwconv_silu(dev, num_columns):
     # 1024 B and the allocator places the EVEN objectfifo output buffer immediately after it,
     # so an oversize frame overflows into that buffer (even/odd corruption) or the lock region
     # (hang). Size the silu-core stack window past the exact-f32 frame. Root cause + fix:
-    # docs/log/2026-07/dwconv-fused-epilogue-alt-channel-miscompile.md.
+    # the dwconv-fused-epilogue-alt-channel-miscompile notes.
     silu_stack = 8192
     for i in range(num_columns):
         workers.append(

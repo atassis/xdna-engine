@@ -170,7 +170,7 @@ static inline void dwconv1d_shift(const bfloat16 *restrict in, const bfloat16 *r
     // objectfifo-driven per-channel loop corrupts alternate (even) channel iterations
     // (ping-pong buffer 0), odd bit-exact; NOT the SFU, accum-feed, or objectfifo depth
     // (all refuted on device). => SiLU MUST be a SEPARATE brick, not fused here.
-    // Full isolation: docs/log/2026-07/dwconv-fused-epilogue-alt-channel-miscompile.md
+    // Full isolation: the dwconv-fused-epilogue-alt-channel-miscompile notes
     //   silu(x) = x * sigmoid(x),  sigmoid(x) = 0.5*(1 + tanh(x/2))
     ::aie::vector<float, 16> xf = a.template to_vector<float>();
     ::aie::vector<float, 16> hx = ::aie::mul(xf, ::aie::broadcast<float, 16>(0.5f));

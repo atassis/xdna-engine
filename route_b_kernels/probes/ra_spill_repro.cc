@@ -4,8 +4,8 @@
 // allocation / spill-around-noinline-call codegen defect that gates the resident
 // conv module's DEFAULT flip.
 //
-// Full characterization: xdna-engine-private journal log
-//   dwconv-fused-epilogue-alt-channel-miscompile.md ("UNIFICATION" section).
+// Full characterization: see the project engineering notes on the dwconv
+//   fused-epilogue alt-channel miscompile (the "UNIFICATION" analysis).
 //
 // The defect (one bug, two faces) on an objectfifo-driven per-tile loop with a
 // HEAVY f32 body:

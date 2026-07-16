@@ -17,7 +17,7 @@ cols ?= 400
 # bf16-tanh brick (fast, WER 8.5). silu_mode=2 = the EXACT f32 sigmoid (exp2f+inv+Newton,
 # rel-L2 ~6e-6 vs host silu) -- now that silu_iron.py sizes the worker stack past the exact-f32
 # frame it runs CLEAN (EVEN/ODD 0, no hang); but it is ~3.5x slower with NO WER gain (WER is not
-# silu-precision-bound -- see docs/log/2026-07/dwconv-fused-epilogue-alt-channel-miscompile.md
+# silu-precision-bound -- see the dwconv-fused-epilogue-alt-channel-miscompile notes
 # "Stack-overflow root cause + WER reframe"), so it is not the shipped default.
 silu_mode ?= 0
 tag = silu_${rows}x${cols}

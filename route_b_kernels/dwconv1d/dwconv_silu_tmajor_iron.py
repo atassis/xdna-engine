@@ -105,7 +105,7 @@ def my_dwconv_silu_tmajor(dev, num_columns):
         )
     # Keep the silu-core stack past the frame (the same guard the channel-major brick carries: the IRON
     # default 1024 B stack overflows into the adjacent EVEN objectfifo output buffer -> even/odd
-    # corruption or hang). See docs/log/2026-07/silu-stack-overflow-root-cause-and-wer-reframe.md.
+    # corruption or hang). See the silu-stack-overflow-root-cause notes.
     silu_stack = 8192
     for i in range(num_columns):
         workers.append(

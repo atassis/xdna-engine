@@ -23,7 +23,7 @@
 //      (out_buff_0, placed right after the stack -> even/odd corruption) or the lock region
 //      (hang). FIXED entirely IRON-side by sizing the worker stack past the frame (silu_iron.py
 //      / dwconv_silu_iron.py stack_size=8192). Root cause + ld.script memory map + WER reframe:
-//      docs/log/2026-07/dwconv-fused-epilogue-alt-channel-miscompile.md.
+//      the dwconv-fused-epilogue-alt-channel-miscompile notes.
 //
 // Runtime ABI (mirrors glu_iron / ctx_ln): 1=instr, 3=in, 4=out, 5=tmp, 6=ctrl, 7=trace.
 // TRACKED COPY -- installed into mlir-aie/.../layernorm by sync_kernels.sh.
