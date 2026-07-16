@@ -956,6 +956,74 @@ impl NpuMatmul {
         rl
     }
 
+    /// Device-in variant of [`Self::ln_affine_cast`]: the ctxLN input is an ALREADY-device-resident
+    /// f32 [PAD_M,KRES] BO `a_bo` (the previous brick's output = FFN/residual output), so the host
+    /// `bo_x` write+`sync_to` is SKIPPED -- the LN never round-trips to host. gamma/beta stay
+    /// host-written (small per-block const). Returns the shared ResidentLn whose `bo_bf16` holds
+    /// affine_LN(a) bf16 [PAD_M,KRES], ready as the next modal GEMM's device A input.
+    fn ln_affine_cast_dev(&self, a_bo: &Bo, gamma: &[f32], beta: &[f32]) -> Rc<ResidentLn> {
+        assert_eq!(gamma.len(), KRES);
+        assert_eq!(beta.len(), KRES);
+        let rl = self.resident_ln().expect("ln_affine_cast_dev without resident_ff_available()");
+        // gamma|beta packed on one channel (host-written, small per-block const)
+        let mut gb = vec![0f32; 2 * KRES];
+        gb[..KRES].copy_from_slice(gamma);
+        gb[KRES..].copy_from_slice(beta);
+        rl.bo_gb.write_bytes(f32_bytes(&gb)).unwrap();
+        rl.bo_gb.sync_to_device().unwrap();
+        // (1) ctxLN: a_bo -> bo_ln  (DEVICE-IN: no host write of x; stays device-resident)
+        rl.ln_kern.run_matmul8(3, &rl.ln_instr, rl.ln_n, a_bo, &rl.bo_ln, &rl.ln_c, &rl.ln_tmp, &rl.ln_tr).unwrap();
+        // (2) affine_cast: (bo_ln * gamma + beta) -> bo_bf16  (device-side)
+        rl.ac_kern.run_matmul8(3, &rl.ac_instr, rl.ac_n, &rl.bo_ln, &rl.bo_gb, &rl.bo_bf16, &rl.ac_tmp, &rl.ac_tr).unwrap();
+        self.stats.borrow_mut().dispatches += 2;
+        rl
+    }
+
+    /// Device-parity self-test for Task 3 (device-in LN). Uploads synthetic x to a device BO, runs
+    /// [`Self::ln_affine_cast_dev`], reads `bo_bf16` back, compares to host `ops::layernorm(x,g,b)`.
+    /// bf16 output -> rel-L2 <= 5e-3. `None` when the resident-ln (ctxln/affcast) xclbins are absent.
+    pub fn ln_affine_cast_dev_selftest(&self, t: usize, seed: u64) -> Option<(Array2<f32>, Array2<f32>)> {
+        let rl = self.resident_ln()?;
+        let fill = |rows: usize, cols: usize, sd: u64, sc: f32| -> Array2<f32> {
+            let mut s = sd.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            Array2::from_shape_fn((rows, cols), |_| {
+                s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                let mut z = s;
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                z ^= z >> 31;
+                let u = (z >> 40) as f32 / (1u32 << 24) as f32;
+                (u * 2.0 - 1.0) * sc
+            })
+        };
+        let x = fill(t, KRES, seed, 1.0);
+        let gv: Vec<f32> = fill(1, KRES, seed ^ 0x1A, 1.0).iter().copied().collect(); // affine scale ~1
+        let bv: Vec<f32> = fill(1, KRES, seed ^ 0x2B, 0.1).iter().copied().collect();
+        // Upload x into a device f32 [PAD_M,KRES] BO (first t rows real; the rest zero -> ignored).
+        let a_bo = self.dev.alloc_bo(&rl.ln_kern, PAD_M * KRES * 4, FLAG_HOST_ONLY, rl.ln_kern.group_id(3).unwrap()).unwrap();
+        let mut buf = vec![0f32; PAD_M * KRES];
+        let xs = x.as_standard_layout();
+        buf[..t * KRES].copy_from_slice(&xs.as_slice().unwrap()[..t * KRES]);
+        a_bo.write_bytes(f32_bytes(&buf)).unwrap();
+        a_bo.sync_to_device().unwrap();
+        let rl2 = self.ln_affine_cast_dev(&a_bo, &gv, &bv);
+        rl2.bo_bf16.sync_from_device().unwrap();
+        let mut cb = vec![0u8; t * KRES * 2]; // bf16, first t rows (row-major)
+        rl2.bo_bf16.read_bytes(&mut cb).unwrap();
+        let mut dev = Array2::<f32>::zeros((t, KRES));
+        for r in 0..t {
+            for c in 0..KRES {
+                let off = (r * KRES + c) * 2;
+                let bits = u16::from_le_bytes([cb[off], cb[off + 1]]);
+                dev[[r, c]] = f32::from_bits((bits as u32) << 16);
+            }
+        }
+        let g1 = Array1::from(gv);
+        let b1 = Array1::from(bv);
+        let host = crate::ops::layernorm(&x, &g1, &b1);
+        Some((host, dev))
+    }
+
     /// One modal-resident matmul dispatch whose A input is an ALREADY-device-resident bf16 BO
     /// (a_bo), skipping dispatch()'s host pack+upload. Output read to host (C[m,n] f32).
     fn dispatch_with_a(&self, a_bo: &Bo, m: usize, wbo: &Bo, n: usize, silu: bool) -> Array2<f32> {

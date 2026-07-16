@@ -8,6 +8,8 @@
 //!               (acc_add on-chip). Accumulation is the ONLY change -> rel-L2 must be ~0 (<= 1e-4).
 //!   residual -- Task 2: on-chip scaled residual add. host `a + 0.5*b` vs residual_add_dev.
 //!               f32 mul+add near-exact -> rel-L2 must be ~0 (<= 1e-4).
+//!   ln       -- Task 3: device-in LN. host ops::layernorm(x,g,b) vs ln_affine_cast_dev (device-in
+//!               ctxLN+affine). bf16 output -> rel-L2 <= 5e-3.
 //!
 //! Run (NPU quiesced, from the repo root):
 //!   NPU_XCLBIN_ROOT=$PWD cargo run --features npu --release --bin fused_seam_parity -- ffn
@@ -70,8 +72,18 @@ fn main() {
             assert!(l2_rel <= 1e-4, "residual_add parity FAILED: rel-L2 {l2_rel:.3e} > 1e-4");
             println!("[fused_seam_parity] PASS (rel-L2 <= 1e-4)");
         }
+        "ln" => {
+            let (host, dev) = npu.ln_affine_cast_dev_selftest(t, seed).unwrap_or_else(|| {
+                panic!("[fused_seam_parity] ln: ctxln/affcast xclbins absent -- build \
+                        scripts/build_parakeet_modal_kernels.sh (needs final_ctxln/affcast_512x1024)");
+            });
+            let (max_rel, l2_rel) = rel_err(&host, &dev);
+            println!("[fused_seam_parity] seam=ln t={t} seed={seed}  max_rel={max_rel:.3e} rel-L2={l2_rel:.3e}");
+            assert!(l2_rel <= 5e-3, "ln device-in parity FAILED: rel-L2 {l2_rel:.3e} > 5e-3");
+            println!("[fused_seam_parity] PASS (rel-L2 <= 5e-3)");
+        }
         other => {
-            eprintln!("[fused_seam_parity] unknown seam '{other}' (known: ffn, residual)");
+            eprintln!("[fused_seam_parity] unknown seam '{other}' (known: ffn, residual, ln)");
             std::process::exit(2);
         }
     }
