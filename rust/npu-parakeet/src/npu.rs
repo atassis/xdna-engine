@@ -48,7 +48,8 @@ const RELPOS_TQ: usize = 8;
 const RELPOS_DK: usize = 128;   // Parakeet head_dim (kernel bakes DK=128)
 const RELPOS_BUCKETS: &[(usize, usize, &str)] = &[
     (100, 25, "bucket_100"), // short clips (T<=100): ~29% less relpos padding compute (measured)
-    (172, 43, "single"),     // ceiling bucket; serves any T in (100, 172]
+    (152, 38, "bucket_152"), // mid clips (100<T<=152): ~12% less padding vs the 172 ceiling
+    (172, 43, "single"),     // ceiling bucket; serves any T in (152, 172]
 ];
 // Phase-2 spatial-parallel: the H=8 attention heads run on H PARALLEL cores (one head/core),
 // ONE dispatch/block. The BOs concatenate all H heads; each head's Worker reads/writes its own
@@ -343,7 +344,15 @@ impl NpuMatmul {
         if std::env::var_os("PARAKEET_RELPOS_NO_BUCKET").is_some() {
             return *RELPOS_BUCKETS.last().unwrap();
         }
-        *RELPOS_BUCKETS.iter().find(|(bt, _, _)| *bt >= t)
+        // A/B toggle: PARAKEET_RELPOS_2BUCKET=1 uses only the first + ceiling bucket (skips the mids),
+        // so one binary A/Bs {100,172} vs the full {100,152,172} same-session (measure the mid bucket).
+        let two = std::env::var_os("PARAKEET_RELPOS_2BUCKET").is_some();
+        let last = RELPOS_BUCKETS.len() - 1;
+        RELPOS_BUCKETS.iter().enumerate()
+            .filter(|(i, _)| !two || *i == 0 || *i == last)
+            .map(|(_, b)| b)
+            .find(|(bt, _, _)| *bt >= t)
+            .copied()
             .unwrap_or_else(|| panic!("clip T={t} exceeds relpos ceiling BUILT_T={}", RELPOS_BUCKETS.last().unwrap().0))
     }
 
