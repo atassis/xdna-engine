@@ -12,7 +12,7 @@ numpy golden, so the Rust `fused_elf_probe` can load the ELF through our NEW `sh
 correctly on device — WITHOUT any device access here (compile + golden are host-only).
 
 Run inside the IRON env:
-    cd ~/repositories/ns/amd/IRON && source ironenv/bin/activate
+    cd ~/repositories/ns/atassis/xdna-engine-workspace/amd/IRON && source ironenv/bin/activate
     python <this>  --out <worktree>/artifacts/fused_spike
 
 Outputs (in --out): spike2gemv.elf, input_arena.bin, scratch_arena.bin, golden_output.bin, meta.json

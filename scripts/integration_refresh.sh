@@ -123,7 +123,10 @@ def plan_repo(name, cfg, apply=False):
     ib = cfg["integration_branch"]
     # Assemble in an ISOLATED worktree -- never disturb the primary checkout, which may
     # hold other sessions' uncommitted work (shared-checkout hazard).
-    wt = os.path.join(os.path.expanduser("~/.cache/xdna2-build/integration-wt"), name)
+    # XDNA_CACHE (in-workspace build cache); fall back to the workspace root's .cache derived from this file.
+    _xdna_cache = os.environ.get("XDNA_CACHE") or os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), ".cache")
+    wt = os.path.join(_xdna_cache, "integration-wt", name)
     run(["git", "worktree", "remove", "--force", wt], cwd, check=False)
     run(["git", "worktree", "add", "-B", ib, wt, wt_base], cwd, check=False, capture=False)
     print(f"    APPLYING in worktree {wt}: cherry-pick {len(picks)} commits ...")

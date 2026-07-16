@@ -5,8 +5,9 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT="${1:-$REPO/artifacts/projout_elf}"
 VENV_IRON="${VENV_IRON:-$REPO/.venv-iron}"
-IRON="${IRON:-~/repositories/ns/amd/IRON}"
-AIEBU_DIR="${AIEBU_DIR:-~/repositories/ns/amd/XRT-src/src/runtime_src/core/common/aiebu/build/Release/src/cpp/utils/asm}"
+. "$REPO/scripts/amd_paths.sh"       # -> IRON_DIR, AIEBU_ASM_DIR (relocatable; env-overridable)
+IRON="${IRON:-$IRON_DIR}"
+AIEBU_DIR="${AIEBU_DIR:-$AIEBU_ASM_DIR}"
 WEIGHTS="${WEIGHTS:-$REPO/artifacts/whisper-small/whisper_decoder}"
 GEN="$REPO/route_b_kernels/decode_fused/gen_projout.py"
 [ -x "$VENV_IRON/bin/python" ] || { echo "ERROR: $VENV_IRON/bin/python missing"; exit 1; }

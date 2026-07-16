@@ -21,7 +21,8 @@
 # =============================================================================
 
 # ---- 0. locate ccache (system first, then the user-local static binary) -----
-_fb_cache_home="${XDG_CACHE_HOME:-$HOME/.cache}/xdna2-build"
+. "$(dirname "${BASH_SOURCE[0]}")/cache_env.sh"   # -> XDNA_CACHE (in-workspace build cache)
+_fb_cache_home="$XDNA_CACHE"
 if command -v ccache >/dev/null 2>&1; then
   FB_CCACHE="$(command -v ccache)"
 elif [ -x "$_fb_cache_home/bin/ccache" ]; then
@@ -38,6 +39,13 @@ export FB_CCACHE
 export CCACHE_DIR="${CCACHE_DIR:-$_fb_cache_home/ccache}"
 export CCACHE_MAXSIZE="${CCACHE_MAXSIZE:-40G}"   # an LLVM tree alone is ~10-15G of objects
 export CCACHE_COMPRESS="${CCACHE_COMPRESS:-1}"
+# base_dir: rewrite absolute paths under the workspace to relative so cache entries are REUSABLE
+# across build trees / reconfigures / fresh clones. Without this, LLVM's absolute -I<build>/include
+# flags differ per build dir -> every new tree is a full cold miss even with a warm cache. With it,
+# a second tree (or a nuked+reconfigured one) REPLAYS from cache instead of recompiling. sloppiness
+# lets locale/time-macro/include-mtime differences still hit (standard for a shared LLVM ccache).
+export CCACHE_BASEDIR="${CCACHE_BASEDIR:-$XDNA_WS}"
+export CCACHE_SLOPPINESS="${CCACHE_SLOPPINESS:-locale,time_macros,include_file_ctime,include_file_mtime,pch_defines}"
 mkdir -p "$CCACHE_DIR" 2>/dev/null || true
 
 # ---- 1. pick the fastest available linker -----------------------------------
@@ -79,8 +87,18 @@ fb_linker_flag_generic() {
 }
 
 # -----------------------------------------------------------------------------
-# Peano / llvm-aie (the heavy one). AIE backend + host only, no tests/docs/
-# examples/benchmarks, Release, optimized tablegen, ccache + lld.
+# Peano / llvm-aie (the heavy one). Full AIE toolchain (clang;lld) + AIE backend,
+# no tests/docs/examples/benchmarks, Release, optimized tablegen, ccache + lld.
+#
+# The DYLIB flags are the load-bearing incremental lever: with a shared
+# libLLVM.so / libclang-cpp.so, an AIE-backend one-file edit relinks ONE .so
+# instead of statically relinking the ~1 GB clang/llc/opt/lld on every change --
+# the difference between a >5 min and a <1 min patch->rebuild loop.
+#
+# Overrides:
+#   FB_LLVM_PROJECTS  project list (default "clang;lld"; set "" for llc/opt only)
+#   FB_LINK_JOBS      parallel link jobs (default 6; lower on <32 GB RAM to
+#                     avoid OOM when several libLLVM.so links overlap)
 # Add LLVM_ENABLE_ASSERTIONS=ON only for a debug/bisect build (build-asserts).
 # -----------------------------------------------------------------------------
 fb_llvm_fast_flags() {
@@ -94,11 +112,17 @@ fb_llvm_fast_flags() {
 -DLLVM_INCLUDE_EXAMPLES=OFF \
 -DLLVM_INCLUDE_BENCHMARKS=OFF \
 -DLLVM_INCLUDE_DOCS=OFF \
--DLLVM_ENABLE_PROJECTS= \
+-DLLVM_ENABLE_PROJECTS=${FB_LLVM_PROJECTS-clang;lld} \
+-DLLVM_BUILD_LLVM_DYLIB=ON -DLLVM_LINK_LLVM_DYLIB=ON -DCLANG_LINK_CLANG_DYLIB=ON \
+-DLLVM_PARALLEL_LINK_JOBS=${FB_LINK_JOBS:-6} \
 -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ "
   fb_linker_flag
   fb_ccache_flags
 }
+# NOTE: deliberately NOT stripping. `-Wl,--strip-all` recovers ~19% on libLLVM.so (81->66 MB) with no
+# runtime/correctness cost, but it drops the .symtab that LLVM's own crash backtrace + perf/gdb use --
+# and these trees exist to DEVELOP+debug backend patches. If you ever need a lean SHIPPABLE toolchain,
+# strip the install (`ninja install-distribution` then `strip`), never the dev tree.
 
 # -----------------------------------------------------------------------------
 # mlir-aie / mlir-air: build against a PREBUILT MLIR distro wheel (never
