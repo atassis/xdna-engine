@@ -280,6 +280,22 @@ impl FastConformerEncoder {
             }
         }
 
+        // CONVEYOR MHA (opt-in PARAKEET_CONVEYOR_MHA=1): replace the per-head relpos_mha LOOP (8
+        // dispatches) with ONE 8-head conveyor dispatch. The host packs the query belt (qu = q+u[h];
+        // BD_shifted = rel_shift((q+v[h]) @ p^T), carriage per PARAKEET_CONVEYOR_BD -- default plain,
+        // see scripts/conveyor_bd_precision_check.py). npu.relpos_mha_conveyor returns merged ctx
+        // [T, D]; the 8-head xclbin dispatch inside it is a TODO stub until the artifact is built
+        // (see CONVEYOR_INTEGRATION_RUNBOOK.md). Falls back to the host score path when unset.
+        #[cfg(feature = "npu")]
+        if std::env::var("PARAKEET_CONVEYOR_MHA").is_ok() {
+            if let Some(npu) = &self.npu {
+                let _h = PhaseScope::new("mhsa_conveyor", Bucket::Npu);
+                let ctx = npu.relpos_mha_conveyor(&q, &k, &v, &pm, &ubias, &vbias, h);
+                prof::phase::set_stage("mhsa_qkv");
+                return self.mm_lazy(&ctx, || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_out.weight") }, &format!("{blk}.out"));
+            }
+        }
+
         // assemble bd_all [H, T, P] then rel_shift -> [H, T, T]
         let (mut bd_all, mut ac_all);
         {
