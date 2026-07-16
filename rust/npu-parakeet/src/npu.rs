@@ -31,21 +31,25 @@ struct NStream {
 }
 
 // Resident relpos-MHA block (STEP=8, STEP-C runtime-t_active). ONE xclbin sized for the MAX
-// frame count RELPOS_BUILT_T serves ANY clip T <= it: the softmax reads t_active from an RTP
-// baked into the instruction stream at word RELPOS_TACTIVE_WORD, so per clip we PATCH that one
-// word of a template insts (zero build) and pad k/p/V to RELPOS_BUILT_T. Loaded once, resident.
+// frame count RELPOS_BUILT_T serves ANY clip T <= it: the softmax reads t_active from per-head RTPs
+// baked into the instruction stream (RELPOS_HEADS words, all == BUILT_T), so per clip we PATCH every
+// such word of a template insts (zero build) and pad k/p/V to RELPOS_BUILT_T. Loaded once, resident.
 const RELPOS_TQ: usize = 8;
 const RELPOS_KB: usize = 43;
 const RELPOS_DK: usize = 128;   // Parakeet head_dim (kernel bakes DK=128)
 const RELPOS_BUILT_T: usize = 172; // baked buffer/dataflow size of the single xclbin
-const RELPOS_TACTIVE_WORD: usize = 8; // insts word holding t_active (verified device-side)
+// Phase-2 spatial-parallel: the H=8 attention heads run on H PARALLEL cores (one head/core),
+// ONE dispatch/block. The BOs concatenate all H heads; each head's Worker reads/writes its own
+// slice via a per-head shim OFFSET tap. The insts template holds H t_active words (one per head's
+// RTP write), all == RELPOS_BUILT_T at build; per clip we patch EVERY word == BUILT_T to t.
+const RELPOS_HEADS: usize = 8; // = Parakeet n_heads; must match the xclbin's --heads build
 
 /// The single resident relpos block (built at RELPOS_BUILT_T). BOs are sized for BUILT_T; per
 /// dispatch we patch the instr template's t_active word and pad data to BUILT_T. Dispatched per
 /// head via run_dwconv6(3, instr, n, quv, kpv, ctx).
 struct RelposK {
     kern: Rc<Kernel>,
-    instr_template: Vec<u32>, // insts as u32 words; word[RELPOS_TACTIVE_WORD] = t_active (patched)
+    instr_template: Vec<u32>, // insts as u32 words; every word == BUILT_T is a per-head t_active (patched)
     n_instr: usize,
     bo_instr: Bo,
     bo_quv: Bo,
@@ -346,50 +350,81 @@ impl NpuMatmul {
         let n_instr = instr_template.len();
         let g = |i| kern.group_id(i).unwrap();
         let bo_instr = self.dev.alloc_bo(&kern, ib.len(), FLAG_CACHEABLE, g(1)).unwrap();
-        let bo_quv = self.dev.alloc_bo(&kern, 2 * n_qt * RELPOS_TQ * RELPOS_DK * 2, FLAG_HOST_ONLY, g(3)).unwrap();
+        // BOs concatenate all RELPOS_HEADS heads (head h at slice h*head_len). One dispatch fills
+        // all H heads; the generator scatters each head's slice to its own core via an offset tap.
+        let bo_quv = self.dev.alloc_bo(&kern, RELPOS_HEADS * 2 * n_qt * RELPOS_TQ * RELPOS_DK * 2, FLAG_HOST_ONLY, g(3)).unwrap();
         // SPLITP: kpv is k | p_hi | p_lo | V (the positional operand p split-bf16 for ~f32
-        // BD precision -- the resident-MHA WER fix). Two padded p-sections (2*pp).
-        let bo_kpv = self.dev.alloc_bo(&kern, (tp + pp + pp + tp) * RELPOS_DK * 2, FLAG_HOST_ONLY, g(4)).unwrap();
-        let bo_ctx = self.dev.alloc_bo(&kern, ctx_rows * RELPOS_DK * 2, FLAG_HOST_ONLY, g(5)).unwrap();
+        // BD precision -- the resident-MHA WER fix). Two padded p-sections (2*pp). Per-head, x H.
+        let bo_kpv = self.dev.alloc_bo(&kern, RELPOS_HEADS * (tp + pp + pp + tp) * RELPOS_DK * 2, FLAG_HOST_ONLY, g(4)).unwrap();
+        let bo_ctx = self.dev.alloc_bo(&kern, RELPOS_HEADS * ctx_rows * RELPOS_DK * 2, FLAG_HOST_ONLY, g(5)).unwrap();
         let rk = Rc::new(RelposK { kern, instr_template, n_instr, bo_instr, bo_quv, bo_kpv, bo_ctx, n_qt, tp, pp, ctx_rows });
         self.relpos.borrow_mut().insert(RELPOS_BUILT_T, rk.clone());
         rk
     }
 
-    /// Resident relpos-MHA block for ONE head. qu/qv/k [t,DK], p [2t-1,DK], v [t,DK] (f32) ->
-    /// ctx [t,DK] (f32), t <= RELPOS_BUILT_T. STEP-C: pad the stream layout to BUILT_T, PATCH the
-    /// insts t_active word to `t`, dispatch the single resident block (3-BO ABI), unpack bf16 CTX.
-    pub fn relpos_mha(&self, qu: &Array2<f32>, qv: &Array2<f32>, k: &Array2<f32>, p: &Array2<f32>, v: &Array2<f32>) -> Array2<f32> {
-        let t = qu.nrows();
+    /// Resident relpos-MHA block for ALL RELPOS_HEADS heads in ONE dispatch (H parallel cores, one
+    /// head/core). q/k/v are [t, D=H*DK], pm is [P=2t-1, D], ubias/vbias are [H, DK]. Returns ctx
+    /// [t, D] with head h in columns [h*DK..(h+1)*DK]. t <= RELPOS_BUILT_T. STEP-C: pad each head's
+    /// stream to BUILT_T, PATCH every t_active word of the insts template (one per head's RTP) to t,
+    /// dispatch the single resident block (3-BO ABI, all H heads concatenated), unpack bf16 CTX.
+    /// This REPLACES the old per-head loop (H sequential dispatches on 1 core) with 1 dispatch that
+    /// runs the H heads in parallel -- the Phase-2 perf rework.
+    pub fn relpos_mha_batched(&self, q: &Array2<f32>, k: &Array2<f32>, pm: &Array2<f32>,
+                              v: &Array2<f32>, ubias: &Array2<f32>, vbias: &Array2<f32>) -> Array2<f32> {
+        let t = q.nrows();
+        let d = q.ncols();
+        let dk = RELPOS_DK;
+        let h = RELPOS_HEADS;
         assert!(t <= RELPOS_BUILT_T, "clip T={t} exceeds relpos BUILT_T={RELPOS_BUILT_T}");
+        assert_eq!(d, h * dk, "hidden D must be RELPOS_HEADS*RELPOS_DK");
         let rk = self.relpos_block();
-        // QUV tile-interleaved over the BUILT_T tiles; real rows only where q0 < t (rest zero pad).
-        let mut quv = Vec::<f32>::with_capacity(2 * rk.n_qt * RELPOS_TQ * RELPOS_DK);
-        for q in 0..rk.n_qt {
-            let q0 = q * RELPOS_TQ;
-            let take = RELPOS_TQ.min(t.saturating_sub(q0));
-            push_pad_rows(&mut quv, qu, q0, take, RELPOS_TQ);
-            push_pad_rows(&mut quv, qv, q0, take, RELPOS_TQ);
+        let quv_head = 2 * rk.n_qt * RELPOS_TQ * RELPOS_DK;
+        let kpv_head = (rk.tp + rk.pp + rk.pp + rk.tp) * RELPOS_DK;
+        // Concatenate all H heads' quv / kpv (head hh at slice hh*head_len -- the generator scatters
+        // each slice to its own core). Per head: QUV tile-interleaved [qu_t0,qv_t0,...]; KPV = k(pad
+        // tp) | p_hi(pad pp) | p_lo(pad pp) | V(pad tp) with p split-bf16 (SPLITP: p_hi=bf16(p),
+        // p_lo=bf16(p-p_hi); BD=qv.p_hi+qv.p_lo recovers ~f32 p -- the probe-localized ~1% sink).
+        let mut quv = Vec::<f32>::with_capacity(h * quv_head);
+        let mut kpv = Vec::<f32>::with_capacity(h * kpv_head);
+        for hh in 0..h {
+            let col = hh * dk;
+            let qh = q.slice(s![.., col..col + dk]);
+            let kh = k.slice(s![.., col..col + dk]).to_owned();
+            let ph = pm.slice(s![.., col..col + dk]).to_owned();
+            let vh = v.slice(s![.., col..col + dk]).to_owned();
+            let mut qu = qh.to_owned();
+            let mut qv = qh.to_owned();
+            for i in 0..t {
+                for c in 0..dk {
+                    qu[[i, c]] += ubias[[hh, c]];
+                    qv[[i, c]] += vbias[[hh, c]];
+                }
+            }
+            for qi in 0..rk.n_qt {
+                let q0 = qi * RELPOS_TQ;
+                let take = RELPOS_TQ.min(t.saturating_sub(q0));
+                push_pad_rows(&mut quv, &qu, q0, take, RELPOS_TQ);
+                push_pad_rows(&mut quv, &qv, q0, take, RELPOS_TQ);
+            }
+            let p_lo = ph.mapv(|x| x - npu_xrt::bf16_bits_to_f32(npu_xrt::f32_to_bf16_bits(x)));
+            push_pad_rows(&mut kpv, &kh, 0, t, rk.tp);
+            push_pad_rows(&mut kpv, &ph, 0, ph.nrows(), rk.pp);
+            push_pad_rows(&mut kpv, &p_lo, 0, ph.nrows(), rk.pp);
+            push_pad_rows(&mut kpv, &vh, 0, t, rk.tp);
         }
-        // KPV = k(pad tp) | p_hi(pad pp) | p_lo(pad pp) | V(pad tp); pad rows are zero so ctx
-        // ignores pad keys. SPLITP: p is split-bf16 -- p_hi = bf16(p), p_lo = bf16(p - p_hi).
-        // Pushing p (f32) lets pack_f32_to_bf16 round it to p_hi; p_lo carries the residual so
-        // the kernel's BD = qv.p_hi + qv.p_lo recovers ~f32 precision on the positional operand
-        // (the probe-localized ~1% attention sink). k/qv/V stay single bf16 (they round fine).
-        let p_lo = p.mapv(|x| x - npu_xrt::bf16_bits_to_f32(npu_xrt::f32_to_bf16_bits(x)));
-        let mut kpv = Vec::<f32>::with_capacity((rk.tp + rk.pp + rk.pp + rk.tp) * RELPOS_DK);
-        push_pad_rows(&mut kpv, k, 0, t, rk.tp);
-        push_pad_rows(&mut kpv, p, 0, p.nrows(), rk.pp);
-        push_pad_rows(&mut kpv, &p_lo, 0, p.nrows(), rk.pp);
-        push_pad_rows(&mut kpv, v, 0, t, rk.tp);
         let mut qb = vec![0u16; quv.len()];
         let mut kb = vec![0u16; kpv.len()];
         npu_xrt::pack_f32_to_bf16(&quv, &mut qb);
         npu_xrt::pack_f32_to_bf16(&kpv, &mut kb);
         let t0 = Instant::now();
-        // STEP-C: patch the instruction stream's t_active word to this clip's T, then upload.
+        // STEP-C: patch EVERY t_active word (one per head's RTP, all == BUILT_T in the template) to
+        // this clip's t. All H heads share the clip's single t_active. (prebuild asserts count==H.)
         let mut insts = rk.instr_template.clone();
-        insts[RELPOS_TACTIVE_WORD] = t as u32;
+        for w in insts.iter_mut() {
+            if *w == RELPOS_BUILT_T as u32 {
+                *w = t as u32;
+            }
+        }
         let instr_bytes: Vec<u8> = insts.iter().flat_map(|w| w.to_le_bytes()).collect();
         rk.bo_instr.write_bytes(&instr_bytes).unwrap();
         rk.bo_instr.sync_to_device().unwrap();
@@ -404,14 +439,19 @@ impl NpuMatmul {
             s.dispatch_s += t0.elapsed().as_secs_f64();
             s.dispatches += 1;
         }
-        let mut cb = vec![0u8; rk.ctx_rows * RELPOS_DK * 2];
+        let mut cb = vec![0u8; h * rk.ctx_rows * RELPOS_DK * 2];
         rk.bo_ctx.read_bytes(&mut cb).unwrap();
-        let mut ctx = Array2::<f32>::zeros((t, RELPOS_DK));
-        for i in 0..t {
-            for d in 0..RELPOS_DK {
-                let off = (i * RELPOS_DK + d) * 2;
-                let u = u16::from_le_bytes([cb[off], cb[off + 1]]);
-                ctx[[i, d]] = f32::from_bits((u as u32) << 16);
+        // Unpack: head hh's ctx (first t of ctx_rows) -> columns [hh*DK..(hh+1)*DK] of [t, D].
+        let mut ctx = Array2::<f32>::zeros((t, d));
+        for hh in 0..h {
+            let base = hh * rk.ctx_rows * RELPOS_DK;
+            let col = hh * dk;
+            for i in 0..t {
+                for dd in 0..RELPOS_DK {
+                    let off = (base + i * RELPOS_DK + dd) * 2;
+                    let u = u16::from_le_bytes([cb[off], cb[off + 1]]);
+                    ctx[[i, col + dd]] = f32::from_bits((u as u32) << 16);
+                }
             }
         }
         ctx

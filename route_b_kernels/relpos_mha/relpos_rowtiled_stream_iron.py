@@ -99,7 +99,7 @@ from ml_dtypes import bfloat16
 from aie.iron import Buffer, Kernel, ObjectFifo, Program, Runtime, Worker, WorkerRuntimeBarrier
 from aie.iron.device import NPU1, NPU2
 from aie.iron.controlflow import range_
-from aie.helpers.taplib import TensorTiler2D
+from aie.helpers.taplib import TensorTiler2D, TensorAccessPattern
 # index_cast + types: the exact helpers python/helpers/dialects/scf.py uses to turn
 # a range_ induction Value (index type) into an i32 kernel-scalar operand.
 from aie.extras.dialects.arith import index_cast
@@ -117,7 +117,30 @@ def ceildiv(a, b):
     return (a + b - 1) // b
 
 
-def my_relpos_stream(dev, T, TQ, KB, t_active=None, splitp=False):
+# ============================ HEADS = SPATIAL PARALLELISM (H cores) ===========
+# Phase-2 perf: the 8 attention heads are INDEPENDENT (distinct q/k/p/V, distinct
+# ctx) and the single-Worker block used 1 of the NPU2's 32 cores, running the 8
+# heads SEQUENTIALLY (device-compute-bound: ~1.1 s/clip dispatch). With --heads H
+# this file emits H WORKERS (one head/core), each running the EXACT single-head
+# STREAM-A relpos compute on its own of_quv/of_kpv/of_ctx fifos + its own L1 scratch
+# (g_ac/g_bd/g_probs/g_ctxf) + its own t_active RTP. The H heads run in PARALLEL, so
+# the dominant device compute collapses ~Hx in wall-clock and the host dispatches
+# ONCE per block (all heads) instead of per head.
+#
+# SCATTER (heads do NOT share data -- NOT a broadcast): the host packs all H heads'
+# quv/kpv/ctx CONCATENATED in one BO each. Head h's Worker reads/writes its own
+# slice via a per-head OFFSET tap (TensorAccessPattern offset = h*head_len): a
+# SCATTER of H distinct streams from the shim. Each head keeps the split-p kpv layout
+# k|p_hi|p_lo|V on its single channel-B stream (2 input-DMA-channel budget preserved
+# per core), and the STREAM-A single-BD n_qt-replay tap (unchanged, +offset). Placed
+# on H columns (place-tiles), each column's shim does that head's 3 BDs (quv+kpv+ctx)
+# = well under the 16-BD shim limit; the 24 total tasks NEVER land on one shim.
+#
+# RTP: one SHARED WorkerRuntimeBarrier + H per-core t_active RTP buffers, all written
+# by ONE inline_ops (the whole-array modal-matmul pattern). All heads share the clip's
+# single t_active, so the host patches every t_active word of the template insts.
+# ============================================================================
+def my_relpos_stream(dev, T, TQ, KB, t_active=None, splitp=False, heads=1):
     # STEP-C: T is the BAKED buffer/dataflow size (the single MAX-T xclbin, e.g. 172);
     # t_active <= T is the ACTIVE key count the softmax attends (a per-insts constant on
     # the SAME xclbin, so one xclbin serves any clip padded to T). Default = T (full).
@@ -150,26 +173,35 @@ def my_relpos_stream(dev, T, TQ, KB, t_active=None, splitp=False):
     # (n_qt*TQ rows) because the fixed [TQ,DK] stream/drain blocks emit whole tiles
     # even for the ragged final tile (tq<TQ); the host reads back only the first T
     # rows of CTX. QUV is tile-interleaved: [qu_t0, qv_t0, qu_t1, qv_t1, ...].
-    quv_arg_ty = np.ndarray[(2 * n_qt * TQ * DK,), np.dtype[bfloat16]]
-    ctx_arg_ty = np.ndarray[(n_qt * TQ * DK,), np.dtype[bfloat16]]
+    # Per-head lengths (a single head's slice of each concatenated H-head arg).
+    quv_head_len = 2 * n_qt * TQ * DK
+    kpv_head_len = kpv_pad_rows * DK
+    ctx_head_len = n_qt * TQ * DK
+    # H-head concatenated runtime args: head h occupies [h*head_len : (h+1)*head_len].
+    quv_arg_ty = np.ndarray[(heads * quv_head_len,), np.dtype[bfloat16]]
+    kpv_arg_ty = np.ndarray[(heads * kpv_head_len,), np.dtype[bfloat16]]
+    ctx_arg_ty = np.ndarray[(heads * ctx_head_len,), np.dtype[bfloat16]]
 
-    # ---- core-local resident score/prob/ctx scratch (L1 Buffers) ----
+    # ---- core-local resident score/prob/ctx scratch (L1 Buffers), PER HEAD ----
+    # Each head runs on its own core, so it needs its OWN L1 scratch (buffers are
+    # tile-local; different cores cannot share one). H sets of g_ac/g_bd/g_probs/g_ctxf.
     ac_ty = np.ndarray[(TQ * T,), np.dtype[np.float32]]
     bd_ty = np.ndarray[(TQ * P,), np.dtype[np.float32]]
     probs_ty = np.ndarray[(TQ * T,), np.dtype[bfloat16]]
     ctxf_ty = np.ndarray[(TQ * DK,), np.dtype[np.float32]]
-    g_ac = Buffer(ac_ty, name="g_ac")
-    g_bd = Buffer(bd_ty, name="g_bd")
-    g_probs = Buffer(probs_ty, name="g_probs")
-    g_ctxf = Buffer(ctxf_ty, name="g_ctxf")
+    g_ac = [Buffer(ac_ty, name=f"g_ac{h}") for h in range(heads)]
+    g_bd = [Buffer(bd_ty, name=f"g_bd{h}") for h in range(heads)]
+    g_probs = [Buffer(probs_ty, name=f"g_probs{h}") for h in range(heads)]
+    g_ctxf = [Buffer(ctxf_ty, name=f"g_ctxf{h}") for h in range(heads)]
 
-    # STEP-C: t_active RTP register (int32[16], use_write_rtp). The softmax kernel reads
-    # rtp[0] at runtime, so the ELF is t_active-agnostic => ONE xclbin serves any t_active.
-    # The value is written into the instruction stream (inline_ops const below => per-insts
-    # on the same xclbin, the modal-matmul pattern). A barrier makes the write visible to
-    # the worker before it reads rtp[0].
+    # STEP-C: t_active RTP register (int32[16], use_write_rtp), PER HEAD. The softmax kernel
+    # reads rtp[0] at runtime, so the ELF is t_active-agnostic => ONE xclbin serves any
+    # t_active. The value is written into the instruction stream (inline_ops const below =>
+    # per-insts on the same xclbin, the modal-matmul pattern). A SINGLE shared barrier makes
+    # every worker wait for the RTP writes before reading rtp[0] (whole-array modal pattern:
+    # per-core RTP buffers, one barrier). All heads share the clip's single t_active value.
     rtp_ty = np.ndarray[(16,), np.dtype[np.int32]]
-    tactive_rtp = Buffer(rtp_ty, name="tactive_rtp", use_write_rtp=True)
+    tactive_rtp = [Buffer(rtp_ty, name=f"tactive_rtp{h}", use_write_rtp=True) for h in range(heads)]
     rtp_barrier = WorkerRuntimeBarrier()
 
     # ---- ObjectFifos ----
@@ -187,15 +219,17 @@ def my_relpos_stream(dev, T, TQ, KB, t_active=None, splitp=False):
     # forward-split as the delivery variable.
     # Channel A: quv tile stream. Per query tile the core acquires qu_tile (phase
     # K) then qv_tile (phase P); 2*n_qt blocks, read ONCE (no replay).
-    of_quv = ObjectFifo(quv_blk_ty, name="quv", depth=2)
+    # PER HEAD: each head's Worker gets its own quv/kpv/ctx fifos (H distinct streams,
+    # scattered from the shim by a per-head OFFSET tap -- heads do NOT share data).
+    of_quv = [ObjectFifo(quv_blk_ty, name=f"quv{h}", depth=2) for h in range(heads)]
     # Channel B: kpv key-block stream. obj = ONE [KB,DK] block; the shim re-reads
     # the whole padded kpv (16 blocks) from DDR offset 0 n_qt times via the repeat
     # tap (single BD, repeat_count=n_qt-1 -- see the rt.fill below), so each query
     # tile gets k0..k3,p0..p7,V0..V3 from the start. 16*n_qt = 352 blocks in address
     # order = exactly what the core acquires. No MemTile staging needed (kpv is
     # re-read from DDR anyway); L1 holds one [KB,DK] block at a time.
-    of_kpv = ObjectFifo(kblk_ty, name="kpv", depth=2)
-    of_ctx = ObjectFifo(ctx_blk_ty, name="ctx", depth=2)
+    of_kpv = [ObjectFifo(kblk_ty, name=f"kpv{h}", depth=2) for h in range(heads)]
+    of_ctx = [ObjectFifo(ctx_blk_ty, name=f"ctx{h}", depth=2) for h in range(heads)]
 
     # ---- block-brick kernels (int32-scalar ABI; see PROBE 1) ----
     dot_k = Kernel("relpos_stream_dot", "kernels.a",
@@ -302,37 +336,48 @@ def my_relpos_stream(dev, T, TQ, KB, t_active=None, splitp=False):
         if q_rag:
             emit_tile(q_rag, Tq_full)
 
-    worker = Worker(
-        core_body,
-        [of_quv.cons(), of_kpv.cons(), of_ctx.prod(),
-         g_ac, g_bd, g_probs, g_ctxf, tactive_rtp, rtp_barrier,
-         dot_k, dot_p, dot_p_lo, softmax_k, ctxzero_k, ctx_k, narrow_k],
-    )
-
-    # SINGLE-BD SHIM REPLAY (fixes the 22-BD overflow of a per-tile fill loop). One
-    # rt.fill with a tap whose OUTER dim is n_qt at stride 0: sizes=[n_qt,1,
-    # kpv_pad_rows,DK], strides=[0,0,DK,1]. shim_dma_single_bd_task turns sizes[0]>1
-    # into BD repeat_count=n_qt-1 -> ONE BD replayed n_qt times, each RE-READING the
-    # whole kpv from DDR offset 0 (stride-0 outer). Every query tile gets k|p|V from
-    # the START. of_kpv obj = [KB,DK], so each replay's kpv_pad_rows-row read is
-    # delivered as 16 blocks -> 16*n_qt = 352 blocks in address order = what the
-    # core acquires. (kpv_tap verified standalone: sizes=[22,1,688,128] at T=172.)
-    kpv_tap = TensorTiler2D.simple_tiler([kpv_pad_rows, DK], pattern_repeat=n_qt)[0]
+    # One Worker per head (H cores). Kernels + the shared barrier are common; each head
+    # gets its OWN fifos + L1 scratch + t_active RTP. place-tiles assigns the H workers to
+    # distinct compute tiles (H<=8 fits one row) with no explicit Tile() pinning.
+    workers = [
+        Worker(
+            core_body,
+            [of_quv[h].cons(), of_kpv[h].cons(), of_ctx[h].prod(),
+             g_ac[h], g_bd[h], g_probs[h], g_ctxf[h], tactive_rtp[h], rtp_barrier,
+             dot_k, dot_p, dot_p_lo, softmax_k, ctxzero_k, ctx_k, narrow_k],
+        )
+        for h in range(heads)
+    ]
 
     rt = Runtime()
-    with rt.sequence(quv_arg_ty, kpv_ty, ctx_arg_ty) as (QUV, KPV, CX):
-        # STEP-C: bake t_active into this instruction stream's RTP, then release the
-        # barrier so the worker reads it. Same xclbin, different t_active => different
-        # insts (the modal-matmul per-insts pattern). t_active == T is the full-length
-        # stream. (A host-set variant would source this from a runtime input instead.)
-        def set_tactive(p):
-            p[0] = t_active
-        rt.inline_ops(set_tactive, [tactive_rtp])
+    with rt.sequence(quv_arg_ty, kpv_arg_ty, ctx_arg_ty) as (QUV, KPV, CX):
+        # STEP-C: bake t_active into this instruction stream's RTP (per-head buffers, all the
+        # same clip t_active), then release the SHARED barrier so every worker reads it. Same
+        # xclbin, different t_active => different insts (the modal-matmul per-insts pattern).
+        # ONE inline_ops writes all H RTP buffers (whole-array modal pattern set_modes).
+        def set_tactive(*ps):
+            for p in ps:
+                p[0] = t_active
+        rt.inline_ops(set_tactive, [tactive_rtp[h] for h in range(heads)])
         rt.set_barrier(rtp_barrier, 1)
-        rt.start(worker)
-        rt.fill(of_quv.prod(), QUV)              # tile-interleaved qu/qv blocks
-        rt.fill(of_kpv.prod(), KPV, tap=kpv_tap)  # 1 BD, whole kpv replayed n_qt as [KB,DK] blocks
-        rt.drain(of_ctx.cons(), CX, wait=True)
+        rt.start(*workers)
+        # SCATTER: head h reads/writes its own slice of each concatenated H-head arg via a
+        # per-head OFFSET tap (heads do NOT share data). The kpv tap keeps the STREAM-A single-
+        # BD n_qt-replay (sizes=[n_qt,1,kpv_pad_rows,DK], strides=[0,0,DK,1]) -- only the base
+        # OFFSET differs per head (h*kpv_head_len). place-tiles routes each head's 3 shim BDs
+        # (quv fill + kpv fill + ctx drain) onto its own column's shim (24 tasks NEVER on one
+        # shim -> the 16-BD limit is never approached).
+        for h in range(heads):
+            quv_tap = TensorAccessPattern(
+                [heads * quv_head_len], h * quv_head_len, [quv_head_len], [1])
+            kpv_tap = TensorAccessPattern(
+                [heads * kpv_head_len], h * kpv_head_len,
+                [n_qt, 1, kpv_pad_rows, DK], [0, 0, DK, 1])
+            ctx_tap = TensorAccessPattern(
+                [heads * ctx_head_len], h * ctx_head_len, [ctx_head_len], [1])
+            rt.fill(of_quv[h].prod(), QUV, tap=quv_tap)   # tile-interleaved qu/qv blocks
+            rt.fill(of_kpv[h].prod(), KPV, tap=kpv_tap)   # 1 BD, whole kpv replayed n_qt
+            rt.drain(of_ctx[h].cons(), CX, tap=ctx_tap, wait=True)
 
     return Program(dev, rt).resolve_program()
 
@@ -349,6 +394,10 @@ p.add_argument("--tactive", type=int, default=0,
 p.add_argument("--splitp", action="store_true",
                help="split-bf16 positional operand: stream p as p_hi|p_lo, BD = qv.p_hi + qv.p_lo "
                     "(near-f32 p). Closes the resident-MHA WER gap (probe: p rounding owns it).")
+p.add_argument("--heads", type=int, default=1,
+               help="number of attention heads to run in PARALLEL (one Worker/core each). "
+                    "H=8 = Parakeet's n_heads -> one dispatch/block, 8x-parallel attention. "
+                    "H=1 = the original single-Worker block (per-head host dispatch).")
 opts = p.parse_args(sys.argv[1:])
 
 if opts.device == "npu":
@@ -358,4 +407,4 @@ elif opts.device == "npu2":
 else:
     raise ValueError(f"unknown device {opts.device}")
 
-print(my_relpos_stream(dev, opts.T, opts.tq, opts.kb, opts.tactive or opts.T, opts.splitp))
+print(my_relpos_stream(dev, opts.T, opts.tq, opts.kb, opts.tactive or opts.T, opts.splitp, opts.heads))
