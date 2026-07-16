@@ -273,6 +273,36 @@ impl FastConformerEncoder {
                         }
                     }
                     let ch = npu.relpos_mha(&qu, &qv, &kh, &ph, &vh);
+                    // A/B localizer (PARAKEET_MHA_AB=1): compare head-0 resident ctx vs f32 host golden.
+                    if hh == 0 && std::env::var("PARAKEET_MHA_AB").is_ok() {
+                        let pp = ph.nrows();
+                        let ac = qu.dot(&kh.t()); // [T,T]
+                        let mut bd_all1 = Array3::<f32>::zeros((1, t, pp));
+                        bd_all1.slice_mut(s![0, .., ..]).assign(&qv.dot(&ph.t()));
+                        let bd = rel_shift(&bd_all1, t); // [1,T,T]
+                        let mut scores = Array2::<f32>::zeros((t, t));
+                        for i in 0..t {
+                            let mut mx = f32::NEG_INFINITY;
+                            for j in 0..t { let sc = (ac[[i, j]] + bd[[0, i, j]]) / scale; scores[[i, j]] = sc; mx = mx.max(sc); }
+                            let mut sum = 0.0;
+                            for j in 0..t { let e = (scores[[i, j]] - mx).exp(); scores[[i, j]] = e; sum += e; }
+                            for j in 0..t { scores[[i, j]] /= sum; }
+                        }
+                        let ch_host = scores.dot(&vh); // [T,DK]
+                        let mut num = 0.0f64; let mut den = 0.0f64; let mut maxrow = (0usize, 0.0f64);
+                        for i in 0..t {
+                            let mut rn = 0.0f64; let mut rd = 0.0f64;
+                            for c in 0..dk {
+                                let d = (ch[[i, c]] - ch_host[[i, c]]) as f64; let g = ch_host[[i, c]] as f64;
+                                rn += d * d; rd += g * g;
+                            }
+                            num += rn; den += rd;
+                            let rrel = if rd > 0.0 { (rn / rd).sqrt() } else { 0.0 };
+                            if rrel > maxrow.1 { maxrow = (i, rrel); }
+                        }
+                        eprintln!("[MHA_AB] blk={blk} h0 T={t} ctx_relL2={:.4e} worst_row={} row_relL2={:.4e}",
+                            (num / den).sqrt(), maxrow.0, maxrow.1);
+                    }
                     ctx.slice_mut(s![.., col..col + dk]).assign(&ch);
                 }
                 prof::phase::set_stage("mhsa_qkv");
