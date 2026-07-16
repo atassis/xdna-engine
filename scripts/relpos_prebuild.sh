@@ -19,7 +19,7 @@ TQ=8
 # (Phase-2 spatial-parallel relpos). HEADS=1 rebuilds the original single-Worker block.
 HEADS="${HEADS:-8}"
 # BUILT_T:KB:subdir -- keep in sync with RELPOS_BUCKETS in npu.rs.
-BUCKETS="${BUCKETS:-100:25:bucket_100 172:43:single}"
+BUCKETS="${BUCKETS:-100:25:bucket_100 152:38:bucket_152 172:43:single}"
 EX=mlir-aie/programming_examples/ml/relpos_mha
 
 setup_env() { source scripts/iron_env.sh; }
