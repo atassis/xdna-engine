@@ -81,6 +81,24 @@ struct RelposK {
     ctx_rows: usize, // n_qt*TQ (CTX readback rows, take [:active_t])
 }
 
+/// Loaded 8-head relpos CONVEYOR (scores(relpos) -> softmax -> ctx across 24 tiles, ONE dispatch).
+/// 4-BO ABI (instr | q | k | v | ctx), mirroring run_conveyor_attn.py. H + belt layout are baked into
+/// the xclbin, so this is a single cached instance (not a per-T map). NOTE: unlike RelposK there is NO
+/// t_active word to patch -- the conveyor kernel has no key-mask, so it softmaxes over all CONV_BUILT_T
+/// keys (correct only when the clip's real T == CONV_BUILT_T; short clips need a kernel key-mask).
+struct ConveyorK {
+    kern: Rc<Kernel>,
+    n_instr: usize,
+    bo_instr: Bo,
+    bo_q: Bo,
+    bo_k: Bo,
+    bo_v: Bo,
+    bo_ctx: Bo,
+    n_qt: usize,    // CONV_BUILT_T / CONV_TQ (query tiles streamed)
+    qelem: usize,   // per-tile query-belt elems (carriage-dependent; asserts the xclbin match)
+    n_heads: usize, // baked head count (columns)
+}
+
 #[derive(Default)]
 pub struct NpuStats {
     pub pack_a_s: f64,
@@ -116,6 +134,8 @@ pub struct NpuMatmul {
     ncache: RefCell<HashMap<String, usize>>,       // weight N (ncols) by id, paired with wcache
     relpos_dir: PathBuf,                           // {root}/artifacts/relpos (per-T xclbin cache)
     relpos: RefCell<HashMap<usize, Rc<RelposK>>>,  // T -> loaded resident block
+    conveyor_dir: PathBuf,                         // {root}/artifacts/conveyor (8-head xclbin)
+    conveyor: RefCell<Option<Rc<ConveyorK>>>,      // loaded 8-head conveyor (H baked, single instance)
     ln_dir: PathBuf,                               // {root}/artifacts/parakeet/ln (ctxln + affcast xclbins)
     // Tri-state cache: None = untried; Some(None) = xclbins absent, FF stays host (no retry);
     // Some(Some) = co-resident on-chip LN + affine-cast chain loaded.
@@ -330,6 +350,8 @@ impl NpuMatmul {
             ncache: RefCell::new(HashMap::new()),
             relpos_dir: root.join("artifacts/relpos"),
             relpos: RefCell::new(HashMap::new()),
+            conveyor_dir: root.join("artifacts/conveyor"),
+            conveyor: RefCell::new(None),
             ln_dir: root.join("artifacts/parakeet/ln"),
             resident_ln: RefCell::new(None),
             stats: RefCell::new(NpuStats::default()),
@@ -371,6 +393,38 @@ impl NpuMatmul {
         let rk = Rc::new(RelposK { kern, instr_template, n_instr, bo_instr, bo_quv, bo_kpv, bo_ctx, n_qt, tp, pp, ctx_rows });
         self.relpos.borrow_mut().insert(RELPOS_BUILT_T, rk.clone());
         rk
+    }
+
+    /// Load (once) the 8-head relpos CONVEYOR built at CONV_BUILT_T by scripts/conveyor_prebuild.sh
+    /// into {root}/artifacts/conveyor/single/. Static insts (no per-clip t_active patch), 4-BO ABI.
+    fn conveyor_block(&self, n_heads: usize, qelem: usize) -> Rc<ConveyorK> {
+        if let Some(k) = self.conveyor.borrow().as_ref() {
+            assert_eq!(k.n_heads, n_heads, "conveyor xclbin baked for H={}, got {n_heads}", k.n_heads);
+            assert_eq!(k.qelem, qelem, "conveyor belt qelem mismatch (carriage changed since load?)");
+            return k.clone();
+        }
+        let dk = CONV_DK;
+        let n_qt = CONV_BUILT_T / CONV_TQ;
+        let dir = self.conveyor_dir.join("single");
+        let xclbin = dir.join("final.xclbin");
+        let insts = dir.join("insts.bin");
+        let kern = self
+            .dev
+            .load_kernel(xclbin.to_str().unwrap(), None)
+            .unwrap_or_else(|e| panic!("load conveyor single ({}): {e:?}\n  pre-build: scripts/conveyor_prebuild.sh", xclbin.display()));
+        let ib = std::fs::read(&insts).unwrap_or_else(|e| panic!("read {}: {e}", insts.display()));
+        let n_instr = ib.len() / 4;
+        let g = |i| kern.group_id(i).unwrap();
+        let bo_instr = self.dev.alloc_bo(&kern, ib.len(), FLAG_CACHEABLE, g(1)).unwrap();
+        let bo_q = self.dev.alloc_bo(&kern, n_heads * n_qt * qelem * 2, FLAG_HOST_ONLY, g(3)).unwrap();
+        let bo_k = self.dev.alloc_bo(&kern, n_heads * CONV_BUILT_T * dk * 2, FLAG_HOST_ONLY, g(4)).unwrap();
+        let bo_v = self.dev.alloc_bo(&kern, n_heads * CONV_BUILT_T * dk * 2, FLAG_HOST_ONLY, g(5)).unwrap();
+        let bo_ctx = self.dev.alloc_bo(&kern, n_heads * n_qt * CONV_TQ * dk * 2, FLAG_HOST_ONLY, g(6)).unwrap();
+        bo_instr.write_bytes(&ib).unwrap(); // static instr stream -> upload once
+        bo_instr.sync_to_device().unwrap();
+        let ck = Rc::new(ConveyorK { kern, n_instr, bo_instr, bo_q, bo_k, bo_v, bo_ctx, n_qt, qelem, n_heads });
+        *self.conveyor.borrow_mut() = Some(ck.clone());
+        ck
     }
 
     /// Resident relpos-MHA block for ONE head. qu/qv/k [t,DK], p [2t-1,DK], v [t,DK] (f32) ->
@@ -548,22 +602,52 @@ impl NpuMatmul {
         npu_xrt::pack_f32_to_bf16(&k_pack, &mut kb);
         npu_xrt::pack_f32_to_bf16(&v_pack, &mut vb);
 
-        // ================= TODO STUB: 8-head conveyor xclbin dispatch =================
-        // Not yet wired (device build gated -- another human is on the NPU). To complete:
-        //  1. Build artifacts/conveyor/single/{final.xclbin,insts.bin} (STEP 8-head, T=BUILT_T,
-        //     RELPOS, carriage-matched kernel) via scripts/conveyor_prebuild.sh (see the runbook).
-        //  2. Lazy-load + cache the xclbin (mirror `relpos_block()` -> a `ConveyorK` holding
-        //     kern + template insts + bo_q/bo_k/bo_v/bo_ctx sized to the group-major ABI).
-        //  3. Upload qb/kb/vb, dispatch ONE run (kern.run_dwconv6 or the 4-BO conveyor ABI), sync.
-        //  4. De-interleave bo_ctx: heads grouped by GJ drain contiguously as [N_QT, gsz, TQ, DK];
-        //     transpose (H<->N_QT) per group -> per-head [T, DK] -> assign into ctx[:, h*DK..].
-        //     (Exact de-interleave is run_conveyor_attn.py lines 86-96.)
-        // Belts are fully packed above (qb/kb/vb ready); only the device I/O remains.
-        unimplemented!(
-            "conveyor 8-head dispatch not wired yet (carriage={}, q_belt={} k={} v={} bf16 elems, \
-             n_qt={n_qt}, qelem={qelem}); build the xclbin + wire dispatch per CONVEYOR_INTEGRATION_RUNBOOK.md",
-            carry.name(), qb.len(), kb.len(), vb.len()
-        )
+        // ---- device dispatch: 4-BO conveyor ABI (instr | q | k | v | ctx), ONE run ----
+        let ck = self.conveyor_block(n_heads, qelem);
+        debug_assert_eq!(qb.len(), n_heads * n_qt * qelem);
+        let t0 = Instant::now();
+        ck.bo_q.write_bytes(u16_bytes(&qb)).unwrap();
+        ck.bo_q.sync_to_device().unwrap();
+        ck.bo_k.write_bytes(u16_bytes(&kb)).unwrap();
+        ck.bo_k.sync_to_device().unwrap();
+        ck.bo_v.write_bytes(u16_bytes(&vb)).unwrap();
+        ck.bo_v.sync_to_device().unwrap();
+        ck.kern.run_mha(3, &ck.bo_instr, ck.n_instr, &ck.bo_q, &ck.bo_k, &ck.bo_v, &ck.bo_ctx).unwrap();
+        ck.bo_ctx.sync_from_device().unwrap();
+        {
+            let mut s = self.stats.borrow_mut();
+            s.dispatch_s += t0.elapsed().as_secs_f64();
+            s.dispatches += 1;
+        }
+        // ---- de-interleave bo_ctx -> merged ctx [t, H*DK] (run_conveyor_attn.py 88-96) ----
+        // Heads group by CONV_GJ; each group drains contiguously as [N_QT, gsz, TQ, DK]. Per group,
+        // element (qt,i,r,d) lives at group_base + (((qt*gsz + i)*TQ + r)*DK + d); it maps to head
+        // h=g+i, ctx row (qt*TQ + r). Take the first t rows (pad rows qt*TQ+r >= t are dropped).
+        let mut cb = vec![0u8; n_heads * n_qt * CONV_TQ * dk * 2];
+        ck.bo_ctx.read_bytes(&mut cb).unwrap();
+        let rd = |e: usize| -> f32 {
+            let o = e * 2;
+            f32::from_bits((u16::from_le_bytes([cb[o], cb[o + 1]]) as u32) << 16)
+        };
+        let mut ctx = Array2::<f32>::zeros((t, n_heads * dk));
+        let mut base = 0usize;
+        for g in (0..n_heads).step_by(CONV_GJ) {
+            let gsz = CONV_GJ.min(n_heads - g);
+            for i in 0..gsz {
+                let h = g + i;
+                for qt in 0..n_qt {
+                    for r in 0..CONV_TQ {
+                        let row = qt * CONV_TQ + r;
+                        if row >= t { continue; }
+                        for d in 0..dk {
+                            ctx[[row, h * dk + d]] = rd(base + (((qt * gsz + i) * CONV_TQ + r) * dk + d));
+                        }
+                    }
+                }
+            }
+            base += n_qt * gsz * CONV_TQ * dk;
+        }
+        ctx
     }
 
     /// Lazy-load the co-resident ctxLN + cast xclbins from {root}/artifacts/parakeet/ln (built at
