@@ -67,6 +67,30 @@ pub struct BertEncoder {
     blocks: Vec<BertBlock>,
 }
 
+// --- K=768 GELU resident-rail seam (prep, not yet active) --------------------------------------
+// BERT-base (hidden=768, intermediate=3072, GELU) shares its FFN shape with Whisper-small and the
+// ESM-2 ctx2 zero-pad convention, so ONE (K=768, DFF<=3072, GELU, residual-scale=1.0) resident rail
+// serves three of the four shipped encoders (scout: generalization.md). The rail ENGINE lives in
+// npu-parakeet (npu.rs), but is baked to Parakeet's KRES=1024/PAD_M=512 -- every brick asserts KRES,
+// so it panics on BERT's K=768 until those consts become rail parameters. The K=768 GELU/identity
+// xclbins are also not built yet (recipe: scripts/build_k768_gelu_rail.sh; GELU epilogue is TANH-approx
+// bf16, so BERT's exact-GELU parity must be gated on rel-L2 vs host truth, NOT the chaotic WER).
+//
+// Schedule wiring for the device session (attention stays HOST-routed this step -- a legitimate
+// front-to-back partial advance, FFN frontier first, exactly like Parakeet's FFN->conv->MHSA order):
+//   post-norm FFN sublayer  x -> cast(x)->bf16 -> fc1_gelu(K_aug=800,N=3072) -> cast->bf16
+//                             -> fc2_collapse(K=3072,N=768) + host b2 -> resadd_s100(x, y) -> LN
+//   (BERT is POST-norm: the trailing LN moves AFTER the residual add, vs Parakeet's pre-norm order.)
+// Full turnkey: xdna-engine-private/journal/docs/handoffs/active/2026-07-17-k768-gelu-rail-device.md
+impl BertEncoder {
+    /// Opt-in flag (reserved) for the K=768 GELU resident FFN rail. Returns false unless
+    /// `BERT_RESIDENT_FFN=1`. The rail itself is not yet built/genericized (see the seam note
+    /// above), so a set flag currently only emits a one-time notice and keeps the host FFN path.
+    fn resident_ffn_requested() -> bool {
+        std::env::var("BERT_RESIDENT_FFN").map(|v| v == "1").unwrap_or(false)
+    }
+}
+
 impl BertEncoder {
     pub fn new(dev: Rc<Device>, root: &Path, weights: &BertWeights, n_heads: usize, head_dim: usize) -> Self {
         let cfg = crate::tuning_profile::resolve(root, npu_asr::ctx2::Precision::from_env());
@@ -80,6 +104,15 @@ impl BertEncoder {
 
 impl Encoder for BertEncoder {
     fn forward_last(&self, x: &Array2<f32>, valid_len: usize) -> Array2<f32> {
+        if Self::resident_ffn_requested() {
+            // K=768 GELU resident FFN rail is prep-staged (build recipe + turnkey doc) but not yet
+            // wired: npu-parakeet's rail is KRES=1024-locked and the K=768 xclbins are unbuilt.
+            // Fall through to the host path (gelu on host) until the device session lands it.
+            eprintln!(
+                "[bert] BERT_RESIDENT_FFN=1 set, but the K=768 GELU resident rail is not built/genericized yet; \
+                 using host FFN (see handoffs/active/2026-07-17-k768-gelu-rail-device.md)"
+            );
+        }
         let mut x = x.clone();
         for b in &self.blocks {
             x = b.forward(&x, valid_len);
