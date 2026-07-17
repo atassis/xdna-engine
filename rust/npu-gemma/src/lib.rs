@@ -48,7 +48,16 @@
 //! See `internal notes` for the full op-coverage audit + resume plan.
 
 pub mod config;
+pub mod parity;
+pub mod schedule;
 pub use config::{GemmaConfig, GEMMA3_1B, GEMMA3_270M};
+pub use schedule::{decode_schedule, Brick};
+
+/// On-NPU decode routing (host driver + per-token protocol) for the fused decode ELF. Gated behind the
+/// `npu` feature: the routing STRUCTURE + schedule compile CPU-only (no XRT); the device backend is
+/// wired in by the execution agent. See `route_b_kernels/decode_fused/gen_gemma_decode.py`.
+#[cfg(feature = "npu")]
+pub mod npu;
 
 /// Host RMSNorm reference (the Gemma normalize: x / rms(x) * (1 + weight), NO mean-subtract).
 /// The correctness oracle for the future on-NPU RMSNorm kernel (reduction + invsqrt SFU). f32 host.
