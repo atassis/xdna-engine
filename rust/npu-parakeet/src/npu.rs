@@ -1093,6 +1093,17 @@ impl NpuMatmul {
 
     /// True when the whole-block fused seam (PARAKEET_FUSED_BLOCK) can run: modal resident + the
     /// resident-ln seam + the fc2-accumulate (acc_add) + the Macaron residual (resadd_s050) bricks.
+    /// Contraction dim (D) the resident rail xclbins are built for. Consumers on a DIFFERENT
+    /// model dim (e.g. the K=768 BERT/Whisper/ESM rail) must gate on this before dispatching a
+    /// resident brick -- every brick asserts `KRES`, so a mismatched D panics. Today this is the
+    /// baked Parakeet KRES=1024; the K=768 rail lands when these consts become rail parameters
+    /// (see handoffs/active/2026-07-17-k768-gelu-rail-device.md).
+    pub fn resident_kres(&self) -> usize { KRES }
+
+    /// Max padded rows (T) the resident rail xclbins are built for. BERT short seqs fit PAD_M=512;
+    /// Whisper-small's fixed T=1500 needs a PAD_M=1536 rebuild of the same kernel source.
+    pub fn resident_pad_m(&self) -> usize { PAD_M }
+
     pub fn resident_fused_available(&self) -> bool {
         if !self.modal {
             return false;
