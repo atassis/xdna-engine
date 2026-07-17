@@ -52,6 +52,21 @@ const CONV_GJ: usize = 4;        // heads per MemTile group (must match the gene
 // fix (no kernel change): reproduces the shipped relpos t_active masking for variable-length clips.
 const CONV_KEY_MASK: f32 = -1.0e4;
 
+// BD-ON-CHIP conveyor (opt-in PARAKEET_CONVEYOR_MHA_BDONCHIP=1). The 4th BD stage computes
+// BD = rel_shift((q+bias_v) @ p^T) ON-CHIP (deletes the host BD precompute = the +19% regression),
+// so the belt carries qpv (qu||qv) only + p resident, dispatched via the 5-BO run_bd_conveyor ABI.
+// All-direct head-major layout (NOT the group-major join of the host-BD conveyor): the bd_onchip
+// generator packs H heads head-major and drains ctx head-major. Shipped as H_BD heads/xclbin,
+// ceil(n_heads/H_BD) dispatches (H=4x2 = the spec's 8-head fallback until H=8-in-1 clears the
+// .split() deadlock). Real dims: TQ=8 DK=128 BUILT_T=176 P=2*BUILT_T-1=351 N_QT=22.
+const CONV_BD_HEADS: usize = 4;                  // heads baked per BD-onchip xclbin dispatch (H_BD)
+const CONV_BD_P: usize = 2 * CONV_BUILT_T - 1;   // 351 = ATTN_P, the baked rel-pos table rows
+// insts word(s) holding the per-head t_active RTP immediate (baked default = CONV_BUILT_T). Filled by
+// the device-side probe (dump insts.bin, find the CONV_BUILT_T occurrences at the RTP-write sites);
+// EMPTY = no patch = full-length passthrough (correct for T==BUILT_T + the standalone gate). Short
+// clips (t<BUILT_T) need these patched per dispatch -- see the turnkey device doc.
+const CONV_BD_TACTIVE_WORDS: &[usize] = &[];
+
 /// BD-carriage precision for the conveyor query belt (open-item C / SPLITP). Default PLAIN per the
 /// Deliverable-1 gate (scripts/conveyor_bd_precision_check.py). Env PARAKEET_CONVEYOR_BD=split flips
 /// to two-bf16 (hi+lo, ~14 mantissa bits) if the device 17-clip WER ever regresses vs 8.5.
@@ -104,6 +119,23 @@ struct ConveyorK {
     n_heads: usize, // baked head count (columns)
 }
 
+/// Loaded BD-ON-CHIP conveyor (BD->scores->softmax->ctx, H_BD heads/xclbin, all-direct head-major).
+/// 5-BO ABI (instr | qpv | p | k | v | ctx), mirroring run_bd_onchip.py. Unlike ConveyorK the instr
+/// stream MAY be patched per dispatch (the t_active RTP immediate) so a MAX-T xclbin serves any t.
+struct ConveyorBdK {
+    kern: Rc<Kernel>,
+    instr_template: Vec<u32>, // insts as u32 words; words[CONV_BD_TACTIVE_WORDS] = t_active (patched)
+    n_instr: usize,
+    bo_instr: Bo,
+    bo_qpv: Bo,
+    bo_p: Bo,
+    bo_k: Bo,
+    bo_v: Bo,
+    bo_ctx: Bo,
+    n_qt: usize,     // CONV_BUILT_T / CONV_TQ
+    n_heads: usize,  // baked heads per dispatch (H_BD)
+}
+
 #[derive(Default)]
 pub struct NpuStats {
     pub pack_a_s: f64,
@@ -141,6 +173,8 @@ pub struct NpuMatmul {
     relpos: RefCell<HashMap<usize, Rc<RelposK>>>,  // T -> loaded resident block
     conveyor_dir: PathBuf,                         // {root}/artifacts/conveyor (8-head xclbin)
     conveyor: RefCell<Option<Rc<ConveyorK>>>,      // loaded 8-head conveyor (H baked, single instance)
+    conveyor_bd_dir: PathBuf,                       // {root}/artifacts/conveyor_bd (BD-onchip xclbin)
+    conveyor_bd: RefCell<Option<Rc<ConveyorBdK>>>,  // loaded BD-onchip conveyor (H_BD baked per dispatch)
     ln_dir: PathBuf,                               // {root}/artifacts/parakeet/ln (ctxln + affcast xclbins)
     // Tri-state cache: None = untried; Some(None) = xclbins absent, FF stays host (no retry);
     // Some(Some) = co-resident on-chip LN + affine-cast chain loaded.
@@ -413,6 +447,8 @@ impl NpuMatmul {
             relpos: RefCell::new(HashMap::new()),
             conveyor_dir: root.join("artifacts/conveyor"),
             conveyor: RefCell::new(None),
+            conveyor_bd_dir: root.join("artifacts/conveyor_bd"),
+            conveyor_bd: RefCell::new(None),
             ln_dir: root.join("artifacts/parakeet/ln"),
             resident_ln: RefCell::new(None),
             stats: RefCell::new(NpuStats::default()),
@@ -485,6 +521,45 @@ impl NpuMatmul {
         bo_instr.sync_to_device().unwrap();
         let ck = Rc::new(ConveyorK { kern, n_instr, bo_instr, bo_q, bo_k, bo_v, bo_ctx, n_qt, qelem, n_heads });
         *self.conveyor.borrow_mut() = Some(ck.clone());
+        ck
+    }
+
+    /// Load (once) the BD-ONCHIP conveyor built at CONV_BUILT_T for H_BD heads by
+    /// scripts/conveyor_bd_prebuild.sh into {root}/artifacts/conveyor_bd/single/. 5-BO ABI
+    /// (instr | qpv | p | k | v | ctx). The insts template is cached so the t_active RTP word(s)
+    /// can be patched per dispatch (short clips); default-baked t_active = CONV_BUILT_T.
+    fn conveyor_bd_block(&self, n_heads: usize) -> Rc<ConveyorBdK> {
+        if let Some(k) = self.conveyor_bd.borrow().as_ref() {
+            assert_eq!(k.n_heads, n_heads, "bd-onchip xclbin baked for H_BD={}, got {n_heads}", k.n_heads);
+            return k.clone();
+        }
+        let dk = CONV_DK;
+        let n_qt = CONV_BUILT_T / CONV_TQ;
+        let dir = self.conveyor_bd_dir.join("single");
+        let xclbin = dir.join("final.xclbin");
+        let insts = dir.join("insts.bin");
+        let kern = self
+            .dev
+            .load_kernel(xclbin.to_str().unwrap(), None)
+            .unwrap_or_else(|e| panic!("load conveyor_bd single ({}): {e:?}\n  pre-build: scripts/conveyor_bd_prebuild.sh", xclbin.display()));
+        let ib = std::fs::read(&insts).unwrap_or_else(|e| panic!("read {}: {e}", insts.display()));
+        let n_instr = ib.len() / 4;
+        let instr_template: Vec<u32> = ib
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let g = |i| kern.group_id(i).unwrap();
+        // 5 data BOs: qpv (g3) | p (g4) | k (g5) | v (g6) | ctx (g7). Sizes head-major over H_BD.
+        let bo_instr = self.dev.alloc_bo(&kern, ib.len(), FLAG_CACHEABLE, g(1)).unwrap();
+        let bo_qpv = self.dev.alloc_bo(&kern, n_heads * n_qt * 2 * CONV_TQ * dk * 2, FLAG_HOST_ONLY, g(3)).unwrap();
+        let bo_p = self.dev.alloc_bo(&kern, n_heads * CONV_BD_P * dk * 2, FLAG_HOST_ONLY, g(4)).unwrap();
+        let bo_k = self.dev.alloc_bo(&kern, n_heads * CONV_BUILT_T * dk * 2, FLAG_HOST_ONLY, g(5)).unwrap();
+        let bo_v = self.dev.alloc_bo(&kern, n_heads * CONV_BUILT_T * dk * 2, FLAG_HOST_ONLY, g(6)).unwrap();
+        let bo_ctx = self.dev.alloc_bo(&kern, n_heads * n_qt * CONV_TQ * dk * 2, FLAG_HOST_ONLY, g(7)).unwrap();
+        let ck = Rc::new(ConveyorBdK {
+            kern, instr_template, n_instr, bo_instr, bo_qpv, bo_p, bo_k, bo_v, bo_ctx, n_qt, n_heads,
+        });
+        *self.conveyor_bd.borrow_mut() = Some(ck.clone());
         ck
     }
 
@@ -712,6 +787,153 @@ impl NpuMatmul {
                 }
             }
             base += n_qt * gsz * CONV_TQ * dk;
+        }
+        ctx
+    }
+
+    /// BD-ON-CHIP 8-head MHSA conveyor (opt-in PARAKEET_CONVEYOR_MHA_BDONCHIP=1). This is the WIN
+    /// variant of `relpos_mha_conveyor`: it DELETES the host BD precompute (the qv@p^T matmuls +
+    /// rel_shift that doubled the mhsa host bucket = the measured +19% regression) and computes
+    /// BD = rel_shift((q+bias_v) @ p^T) ON-CHIP as the 4th conveyor stage. The host now packs only:
+    ///   * qu_h = q_h + pos_bias_u[h]   (the AC query, = q_pass in the belt head)
+    ///   * qv_h = q_h + pos_bias_v[h]   (the BD query; the kernel dots it against p on-chip)
+    ///   * p_h  = pm[:,h] real [2t-1,DK] table, zero-padded to the baked P=CONV_BD_P (rel_shift is a
+    ///           function of key distance j-i only, so the real table + t_active base is correct).
+    /// Belt = qpv (qu||qv per tile), head-major; p/k/v resident per head; 5-BO run_bd_conveyor.
+    /// Dispatched CONV_BD_HEADS heads per xclbin (ceil(n_heads/H_BD) dispatches; H=4x2 fallback).
+    ///
+    /// t_active: the BD-onchip scores stage has NO host belt-sentinel (BD is in-kernel), so pad keys
+    /// j>=t are masked in-kernel via the t_active RTP; the BD emit ALSO uses t_active for the
+    /// rel_shift base (short clips t<BUILT_T). Host sets t_active by patching CONV_BD_TACTIVE_WORDS in
+    /// the insts template per dispatch (empty until the device probe fills the offsets -> unpatched =
+    /// full-length passthrough, correct for t==BUILT_T). See the turnkey device doc.
+    ///
+    /// Needs artifacts/conveyor_bd/single/{final.xclbin,insts.bin} (scripts/conveyor_bd_prebuild.sh
+    /// built with --tactive-mask). Returns merged ctx [t, H*DK]; caller applies linear_out.
+    pub fn relpos_mha_conveyor_bdonchip(
+        &self,
+        q: &Array2<f32>, k: &Array2<f32>, v: &Array2<f32>, pm: &Array2<f32>,
+        ubias: &Array2<f32>, vbias: &Array2<f32>, n_heads: usize,
+    ) -> Array2<f32> {
+        let t = q.nrows();
+        let p = pm.nrows(); // 2t-1
+        let dk = CONV_DK;
+        assert_eq!(dk, RELPOS_DK, "conveyor DK must match the baked head_dim");
+        assert!(t <= CONV_BUILT_T, "clip T={t} exceeds conveyor BUILT_T={CONV_BUILT_T}");
+        let n_qt = CONV_BUILT_T / CONV_TQ; // 22
+
+        // ---- host-side belt inputs: qu_all [H,T,DK] and qv_all [H,T,DK] (NO BD precompute) ----
+        let mut qu_all = Array3::<f32>::zeros((n_heads, t, dk));
+        let mut qv_all = Array3::<f32>::zeros((n_heads, t, dk));
+        for h in 0..n_heads {
+            let col = h * dk;
+            for i in 0..t {
+                for c in 0..dk {
+                    let qi = q[[i, col + c]];
+                    qu_all[[h, i, c]] = qi + ubias[[h, c]];
+                    qv_all[[h, i, c]] = qi + vbias[[h, c]];
+                }
+            }
+        }
+
+        let ck = self.conveyor_bd_block(CONV_BD_HEADS);
+        // t_active: patch the insts template once (same t for every group), upload once, reuse.
+        let mut insts = ck.instr_template.clone();
+        for &w in CONV_BD_TACTIVE_WORDS {
+            insts[w] = t as u32;
+        }
+        let instr_bytes: Vec<u8> = insts.iter().flat_map(|w| w.to_le_bytes()).collect();
+        ck.bo_instr.write_bytes(&instr_bytes).unwrap();
+        ck.bo_instr.sync_to_device().unwrap();
+
+        // per-tile query-belt = qu block [TQ,DK] then qv block [TQ,DK] (pad rows past t are zero).
+        let build_head_qpv = |h: usize, out: &mut Vec<f32>| {
+            for qt in 0..n_qt {
+                let q0 = qt * CONV_TQ;
+                for r in 0..CONV_TQ {
+                    let i = q0 + r;
+                    if i < t { out.extend(qu_all.slice(s![h, i, ..]).iter().copied()); }
+                    else { out.extend(std::iter::repeat(0.0f32).take(dk)); }
+                }
+                for r in 0..CONV_TQ {
+                    let i = q0 + r;
+                    if i < t { out.extend(qv_all.slice(s![h, i, ..]).iter().copied()); }
+                    else { out.extend(std::iter::repeat(0.0f32).take(dk)); }
+                }
+            }
+        };
+
+        let mut ctx = Array2::<f32>::zeros((t, n_heads * dk));
+        // ---- per head-group (H_BD heads/xclbin) pack -> dispatch -> de-interleave ----
+        for g in (0..n_heads).step_by(CONV_BD_HEADS) {
+            let gsz = CONV_BD_HEADS.min(n_heads - g);
+            // buffers are baked for exactly H_BD heads; a ragged final group (gsz < H_BD) pads the
+            // trailing head slots with zeros (their ctx is discarded below).
+            let hb = CONV_BD_HEADS;
+            let mut qpv_pack = Vec::<f32>::with_capacity(hb * n_qt * 2 * CONV_TQ * dk);
+            let mut p_pack = Vec::<f32>::with_capacity(hb * CONV_BD_P * dk);
+            let mut k_pack = Vec::<f32>::with_capacity(hb * CONV_BUILT_T * dk);
+            let mut v_pack = Vec::<f32>::with_capacity(hb * CONV_BUILT_T * dk);
+            for slot in 0..hb {
+                let h = g + slot;
+                if h < n_heads {
+                    build_head_qpv(h, &mut qpv_pack);
+                    let col = h * dk;
+                    push_pad_rows(&mut p_pack, &pm.slice(s![.., col..col + dk]).to_owned(), 0, p, CONV_BD_P);
+                    push_pad_rows(&mut k_pack, &k.slice(s![.., col..col + dk]).to_owned(), 0, t, CONV_BUILT_T);
+                    push_pad_rows(&mut v_pack, &v.slice(s![.., col..col + dk]).to_owned(), 0, t, CONV_BUILT_T);
+                } else {
+                    qpv_pack.extend(std::iter::repeat(0.0f32).take(n_qt * 2 * CONV_TQ * dk));
+                    p_pack.extend(std::iter::repeat(0.0f32).take(CONV_BD_P * dk));
+                    k_pack.extend(std::iter::repeat(0.0f32).take(CONV_BUILT_T * dk));
+                    v_pack.extend(std::iter::repeat(0.0f32).take(CONV_BUILT_T * dk));
+                }
+            }
+            let mut qb = vec![0u16; qpv_pack.len()];
+            let mut pb = vec![0u16; p_pack.len()];
+            let mut kb = vec![0u16; k_pack.len()];
+            let mut vb = vec![0u16; v_pack.len()];
+            npu_xrt::pack_f32_to_bf16(&qpv_pack, &mut qb);
+            npu_xrt::pack_f32_to_bf16(&p_pack, &mut pb);
+            npu_xrt::pack_f32_to_bf16(&k_pack, &mut kb);
+            npu_xrt::pack_f32_to_bf16(&v_pack, &mut vb);
+
+            let t0 = Instant::now();
+            ck.bo_qpv.write_bytes(u16_bytes(&qb)).unwrap();
+            ck.bo_qpv.sync_to_device().unwrap();
+            ck.bo_p.write_bytes(u16_bytes(&pb)).unwrap();
+            ck.bo_p.sync_to_device().unwrap();
+            ck.bo_k.write_bytes(u16_bytes(&kb)).unwrap();
+            ck.bo_k.sync_to_device().unwrap();
+            ck.bo_v.write_bytes(u16_bytes(&vb)).unwrap();
+            ck.bo_v.sync_to_device().unwrap();
+            ck.kern.run_bd_conveyor(3, &ck.bo_instr, ck.n_instr, &ck.bo_qpv, &ck.bo_p, &ck.bo_k, &ck.bo_v, &ck.bo_ctx).unwrap();
+            ck.bo_ctx.sync_from_device().unwrap();
+            {
+                let mut s = self.stats.borrow_mut();
+                s.dispatch_s += t0.elapsed().as_secs_f64();
+                s.dispatches += 1;
+            }
+            // de-interleave: head-major ctx, head slot at slot*n_qt*TQ*DK, row = qt*TQ+r (take [0,t)).
+            let mut cb = vec![0u8; hb * n_qt * CONV_TQ * dk * 2];
+            ck.bo_ctx.read_bytes(&mut cb).unwrap();
+            let rd = |e: usize| -> f32 {
+                let o = e * 2;
+                f32::from_bits((u16::from_le_bytes([cb[o], cb[o + 1]]) as u32) << 16)
+            };
+            for slot in 0..gsz {
+                let h = g + slot;
+                let base = slot * n_qt * CONV_TQ * dk;
+                for qt in 0..n_qt {
+                    for r in 0..CONV_TQ {
+                        let row = qt * CONV_TQ + r;
+                        if row >= t { continue; }
+                        for d in 0..dk {
+                            ctx[[row, h * dk + d]] = rd(base + ((qt * CONV_TQ + r) * dk + d));
+                        }
+                    }
+                }
+            }
         }
         ctx
     }

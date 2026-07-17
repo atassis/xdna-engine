@@ -322,6 +322,22 @@ impl FastConformerEncoder {
             }
         }
 
+        // BD-ONCHIP CONVEYOR MHA (opt-in PARAKEET_CONVEYOR_MHA_BDONCHIP=1): the WIN variant -- same
+        // 1-dispatch/block conveyor but BD = rel_shift((q+v[h])@p^T) is computed ON-CHIP (4th stage),
+        // deleting the host BD precompute that made PARAKEET_CONVEYOR_MHA +19%. Needs the BD-onchip
+        // xclbin (scripts/conveyor_bd_prebuild.sh --tactive-mask); falls back to the host score path
+        // when the artifact is absent (relpos_mha_conveyor_bdonchip panics on load -> keep unset until
+        // built). Checked BEFORE the host-BD conveyor so it wins when both flags are set.
+        #[cfg(feature = "npu")]
+        if std::env::var("PARAKEET_CONVEYOR_MHA_BDONCHIP").is_ok() {
+            if let Some(npu) = &self.npu {
+                let _h = PhaseScope::new("mhsa_conveyor_bd", Bucket::Npu);
+                let ctx = npu.relpos_mha_conveyor_bdonchip(q, k, v, pm, &ubias, &vbias, h);
+                prof::phase::set_stage("mhsa_qkv");
+                return ctx; // merged [T,D]; linear_out applied by the caller (mhsa / mhsa_dev)
+            }
+        }
+
         // CONVEYOR MHA (opt-in PARAKEET_CONVEYOR_MHA=1): replace the per-head relpos_mha LOOP (8
         // dispatches) with ONE 8-head conveyor dispatch. The host packs the query belt (qu = q+u[h];
         // BD_shifted = rel_shift((q+v[h]) @ p^T), carriage per PARAKEET_CONVEYOR_BD -- default plain,
