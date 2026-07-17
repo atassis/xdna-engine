@@ -164,7 +164,7 @@ struct ResidentLn {
     bo_x: Bo,    // [PAD_M, KRES] f32   (ctxLN input,  ln g3)
     bo_ln: Bo,   // [PAD_M, KRES] f32   (ctxLN output = affine_cast input, ln g4 / ac g3)
     bo_gb: Bo,   // [2*KRES] f32        (gamma|beta params, ac g4)
-    bo_bf16: Bo, // [PAD_M, KRES] bf16  (affine_cast output = modal fc1 A, ac g5)
+    bo_bf16: Rc<Bo>, // [PAD_M, KRES] bf16  (affine_cast output = modal fc1 A / device-in satt, ac g5)
     // fc1->fc2 device-side (full FFN, Variant B): deinterleave+cast the [PAD_M,DFF] fc1 output into a
     // CHUNK-MAJOR [n_chunks,PAD_M,KRES] bf16 buffer (one dispatch, 3D drain TAP), then the fc2 K-split
     // reads each K=KRES chunk as a device SUB-BUFFER (Bo::sub) into the K=KRES modal -- bit-identical
@@ -903,7 +903,7 @@ impl NpuMatmul {
             bo_x: self.dev.alloc_bo(&ln_kern, PAD_M * KRES * 4, FLAG_HOST_ONLY, gl(3)).unwrap(),
             bo_ln: self.dev.alloc_bo(&ln_kern, PAD_M * KRES * 4, FLAG_HOST_ONLY, gl(4)).unwrap(),
             bo_gb: self.dev.alloc_bo(&ac_kern, 2 * KRES * 4, FLAG_HOST_ONLY, ga(4)).unwrap(),
-            bo_bf16: self.dev.alloc_bo(&ac_kern, PAD_M * KRES * 2, FLAG_HOST_ONLY, ga(5)).unwrap(),
+            bo_bf16: Rc::new(self.dev.alloc_bo(&ac_kern, PAD_M * KRES * 2, FLAG_HOST_ONLY, ga(5)).unwrap()),
             bo_deint: self.dev.alloc_bo(&deint_kern, (DFF / KRES) * PAD_M * KRES * 2, FLAG_HOST_ONLY, gd(4)).unwrap(),
             ln_c: self.dev.alloc_bo(&ln_kern, 1, FLAG_HOST_ONLY, gl(5)).unwrap(),
             ln_tmp: self.dev.alloc_bo(&ln_kern, 8, FLAG_HOST_ONLY, gl(6)).unwrap(),
@@ -1022,6 +1022,75 @@ impl NpuMatmul {
         let b1 = Array1::from(bv);
         let host = crate::ops::layernorm(&x, &g1, &b1);
         Some((host, dev))
+    }
+
+    /// True when the whole-block fused seam (PARAKEET_FUSED_BLOCK) can run: modal resident + the
+    /// resident-ln seam + the fc2-accumulate (acc_add) + the Macaron residual (resadd_s050) bricks.
+    pub fn resident_fused_available(&self) -> bool {
+        if !self.modal {
+            return false;
+        }
+        match self.resident_ln() {
+            Some(rl) => rl.acc_add.is_some() && rl.resadd_s050.is_some(),
+            None => false,
+        }
+    }
+
+    /// Upload a host activation `x` [m, KRES] into a fresh device f32 [PAD_M,KRES] BO (the resident
+    /// stream head): the block uploads x ONCE here, then every brick reads/writes device BOs.
+    pub fn upload_stream(&self, x: &Array2<f32>) -> Rc<Bo> {
+        let m = x.nrows();
+        assert!(m <= PAD_M, "T={m} exceeds PAD_M={PAD_M}");
+        assert_eq!(x.ncols(), KRES, "stream needs D=KRES={KRES}");
+        let bo = self.dev.alloc_bo(&self.kern, PAD_M * KRES * 4, FLAG_HOST_ONLY, self.kern.group_id(3).unwrap()).unwrap();
+        let xs = x.as_standard_layout();
+        let mut buf = vec![0f32; PAD_M * KRES];
+        buf[..m * KRES].copy_from_slice(&xs.as_slice().unwrap()[..m * KRES]);
+        bo.write_bytes(f32_bytes(&buf)).unwrap();
+        bo.sync_to_device().unwrap();
+        Rc::new(bo)
+    }
+
+    /// Read a device f32 [PAD_M,KRES] BO back to a host [m, KRES] array (the block/encoder boundary).
+    pub fn readback_stream(&self, bo: &Bo, m: usize) -> Array2<f32> {
+        bo.sync_from_device().unwrap();
+        let mut cb = vec![0u8; m * KRES * 4];
+        bo.read_bytes(&mut cb).unwrap();
+        let mut out = Array2::<f32>::zeros((m, KRES));
+        for r in 0..m {
+            for c in 0..KRES {
+                let off = (r * KRES + c) * 4;
+                out[[r, c]] = f32::from_le_bytes([cb[off], cb[off + 1], cb[off + 2], cb[off + 3]]);
+            }
+        }
+        out
+    }
+
+    /// Device-in LN for the seam: run [`Self::ln_affine_cast_dev`] and hand back the shared `bo_bf16`
+    /// (affine_LN(a_bo) bf16 [PAD_M,KRES]) as an owned handle, ready to feed the MHSA projections via
+    /// [`Self::proj_from_bf16`]. `None` when the resident-ln xclbins are absent.
+    pub fn ln_affine_cast_dev_bf16(&self, a_bo: &Bo, gamma: &[f32], beta: &[f32]) -> Option<Rc<Bo>> {
+        self.resident_ln()?;
+        let rl = self.ln_affine_cast_dev(a_bo, gamma, beta);
+        Some(rl.bo_bf16.clone())
+    }
+
+    /// Device-in projection: A[m,KRES] bf16 device BO `a_bo` @ W[KRES,n] -> C[m,n] f32 (read to host).
+    /// The device-in twin of `matmul_id_lazy` (k=KRES path): the input is ALREADY device-resident bf16
+    /// (a resident-stream LN output), so the host pack+upload of A is SKIPPED. `id` shares the weight-BO
+    /// cache with the host path, so warm passes hit. Identity modal (no silu) -- for q/k/v/out projections.
+    pub fn proj_from_bf16<F: FnOnce() -> Array2<f32>>(&self, a_bo: &Bo, m: usize, make_b: F, id: &str, n: usize) -> Array2<f32> {
+        self.stats.borrow_mut().calls += 1;
+        let cached = self.wcache.borrow().get(id).cloned();
+        let wbo = if let Some(bo) = cached {
+            bo
+        } else {
+            let b = make_b();
+            assert_eq!(b.nrows(), KRES, "proj weight nrows {} != {KRES}", b.nrows());
+            assert_eq!(b.ncols(), n, "proj weight ncols {} != {n}", b.ncols());
+            self.weight_bo(id, b.view())
+        };
+        self.dispatch_with_a(a_bo, m, &wbo, n, false)
     }
 
     /// One modal-resident matmul dispatch whose A input is an ALREADY-device-resident bf16 BO
@@ -1369,21 +1438,14 @@ impl NpuMatmul {
         acc
     }
 
-    /// Same as [`Self::resident_ffn`] but the fc2 K-split partials are accumulated ON-DEVICE (the
-    /// acc_add brick) so the FFN output lands in ONE device BO `[PAD_M, KRES]` f32 -- no host `acc`,
-    /// no `sync_from`/`read`. Returns the device accumulator (the fused seam's resident-stream handle).
-    /// `None` when the acc_add xclbin is absent, so callers fall back to the host-accum resident_ffn.
-    /// Bit-identical to resident_ffn: SAME partials (same modal GEMM into st.bo_c) summed in the SAME
-    /// sequential f32 order (acc=0, +partial0, +partial1, ...). The returned Rc is AccAdd scratch,
-    /// overwritten by the next resident_ffn_dev call -- the caller must consume it before the next.
-    pub fn resident_ffn_dev<F1: FnOnce() -> Array2<f32>, F2: FnOnce() -> Array2<f32>>(
-        &self, x: &Array2<f32>, gamma: &[f32], beta: &[f32],
-        make_w1: F1, id1: &str, make_w2: F2, id2: &str,
-    ) -> Option<Rc<Bo>> {
-        let rl = self.resident_ln()?;
-        let aa = rl.acc_add.as_ref()?;
-        self.stats.borrow_mut().calls += 1;
-        let rl2 = self.ln_affine_cast(x, gamma, beta); // bo_bf16 = affine_LN bf16 [PAD_M,KRES]
+    /// Shared fc1 -> deint -> fc2 ON-DEVICE-accumulate core for the resident FFN device path. `rl`
+    /// must already hold `bo_bf16 = affine_LN(input)` (from `ln_affine_cast` host-in or
+    /// `ln_affine_cast_dev` device-in) AND have the acc_add brick loaded. Returns the device BO
+    /// [PAD_M,KRES] f32 = sum of the DFF/KRES fc2 partials (acc=0, +partial0, +partial1, ...).
+    fn ffn_dev_accum<F1: FnOnce() -> Array2<f32>, F2: FnOnce() -> Array2<f32>>(
+        &self, rl: &Rc<ResidentLn>, make_w1: F1, id1: &str, make_w2: F2, id2: &str,
+    ) -> Rc<Bo> {
+        let aa = rl.acc_add.as_ref().expect("ffn_dev_accum without acc_add");
         // fc1: modal, A=bo_bf16, W1, on-chip SiLU -> st1.bo_c (f32 [PAD_M,DFF]) -- stays DEVICE
         let w1 = {
             let c = self.wcache.borrow().get(id1).cloned();
@@ -1394,9 +1456,9 @@ impl NpuMatmul {
             })
         };
         let st1 = self.stream(DFF, self.modal);
-        self.kern.run_matmul8(3, &st1.instr, st1.n_instr, &rl2.bo_bf16, &w1, &st1.bo_c, &self.bo_tmp, &self.bo_tr).unwrap();
-        // deinterleave+cast: st1.bo_c (f32 [PAD_M,DFF]) -> rl2.bo_deint (bf16 chunk-major), device-side.
-        rl2.deint_kern.run_matmul8(3, &rl2.deint_instr, rl2.deint_n, &st1.bo_c, &rl2.bo_deint, &rl2.deint_c, &rl2.deint_tmp, &rl2.deint_tr).unwrap();
+        self.kern.run_matmul8(3, &st1.instr, st1.n_instr, &rl.bo_bf16, &w1, &st1.bo_c, &self.bo_tmp, &self.bo_tr).unwrap();
+        // deinterleave+cast: st1.bo_c (f32 [PAD_M,DFF]) -> rl.bo_deint (bf16 chunk-major), device-side.
+        rl.deint_kern.run_matmul8(3, &rl.deint_instr, rl.deint_n, &st1.bo_c, &rl.bo_deint, &rl.deint_c, &rl.deint_tmp, &rl.deint_tr).unwrap();
         self.stats.borrow_mut().dispatches += 2; // fc1 + deint
         // fc2 K-split with ON-DEVICE accumulate: each partial modal GEMM -> st.bo_c (device); acc_add
         // sums it into the acc0/acc1 ping-pong (seed acc=0 for partial0). Result stays device-resident.
@@ -1414,7 +1476,7 @@ impl NpuMatmul {
         let mut cur = aa.acc0.clone();
         let mut nxt = aa.acc1.clone();
         for c in 0..parts {
-            let chunk = rl2.bo_deint.sub(c * chunk_bytes, chunk_bytes).unwrap();
+            let chunk = rl.bo_deint.sub(c * chunk_bytes, chunk_bytes).unwrap();
             let sid = format!("{id2}.{c}");
             let w2c = {
                 let cc = self.wcache.borrow().get(&sid).cloned();
@@ -1431,7 +1493,39 @@ impl NpuMatmul {
             self.stats.borrow_mut().dispatches += 2; // partial GEMM + acc_add
             std::mem::swap(&mut cur, &mut nxt);
         }
-        Some(cur) // device BO [PAD_M, KRES] f32 holding sum of all `parts` partials
+        cur // device BO [PAD_M, KRES] f32 holding sum of all `parts` partials
+    }
+
+    /// Same as [`Self::resident_ffn`] but the fc2 K-split partials are accumulated ON-DEVICE (the
+    /// acc_add brick) so the FFN output lands in ONE device BO `[PAD_M, KRES]` f32 -- no host `acc`,
+    /// no `sync_from`/`read`. Returns the device accumulator (the fused seam's resident-stream handle).
+    /// `None` when the acc_add xclbin is absent, so callers fall back to the host-accum resident_ffn.
+    /// Bit-identical to resident_ffn: SAME partials (same modal GEMM into st.bo_c) summed in the SAME
+    /// sequential f32 order. The returned Rc is AccAdd scratch, overwritten by the next call.
+    pub fn resident_ffn_dev<F1: FnOnce() -> Array2<f32>, F2: FnOnce() -> Array2<f32>>(
+        &self, x: &Array2<f32>, gamma: &[f32], beta: &[f32],
+        make_w1: F1, id1: &str, make_w2: F2, id2: &str,
+    ) -> Option<Rc<Bo>> {
+        let rl = self.resident_ln()?;
+        rl.acc_add.as_ref()?;
+        self.stats.borrow_mut().calls += 1;
+        let rl2 = self.ln_affine_cast(x, gamma, beta); // host-in LN: bo_bf16 = affine_LN(x)
+        Some(self.ffn_dev_accum(&rl2, make_w1, id1, make_w2, id2))
+    }
+
+    /// Device-in FFN for the fused seam: like [`Self::resident_ffn_dev`] but the LN input is the
+    /// ALREADY-device-resident f32 [PAD_M,KRES] BO `a_bo` (previous op's output) -- the LN uses
+    /// `ln_affine_cast_dev`, so the FFN's own input never round-trips to host either. Returns the
+    /// device fc2 accumulator BO. `None` when the resident/acc_add xclbins are absent.
+    pub fn resident_ffn_dev_bo<F1: FnOnce() -> Array2<f32>, F2: FnOnce() -> Array2<f32>>(
+        &self, a_bo: &Bo, gamma: &[f32], beta: &[f32],
+        make_w1: F1, id1: &str, make_w2: F2, id2: &str,
+    ) -> Option<Rc<Bo>> {
+        let rl = self.resident_ln()?;
+        rl.acc_add.as_ref()?;
+        self.stats.borrow_mut().calls += 1;
+        let rl2 = self.ln_affine_cast_dev(a_bo, gamma, beta); // device-in LN: bo_bf16 = affine_LN(a_bo)
+        Some(self.ffn_dev_accum(&rl2, make_w1, id1, make_w2, id2))
     }
 
     /// Host-readback wrapper over [`Self::resident_ffn_dev`] for the FFN-boundary gate

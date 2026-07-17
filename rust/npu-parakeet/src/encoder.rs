@@ -238,15 +238,11 @@ impl FastConformerEncoder {
 
     fn mhsa(&self, x: &Array2<f32>, blk: usize, pos_enc: &Array2<f32>) -> Array2<f32> {
         let b = self.w.block(blk);
-        let (h, dk, d) = (self.cfg.n_heads, self.cfg.head_dim, self.cfg.hidden);
         let t = x.nrows();
-        let p = pos_enc.nrows(); // 2T-1
         // mhsa_wprep: materialize each (T'-independent) attention projection weight for its mm().
         // Each `b.m()` clones the whole [D,D]/[P,D] matrix out of the weight map -- pure host data
-        // movement (no math, no device). Now materialized LAZILY inside mm_lazy's closure: on a warm
-        // (weight-BO cache hit) pass the clone never runs, eliminating the per-pass reclone of the
-        // constant qkv/pos/out weights. Only the tiny pos_bias_u/v (consumed later in the score
-        // loop, NOT a cached BO) stay eager, exactly as the original.
+        // movement (no math, no device). Materialized LAZILY inside mm_lazy's closure: on a warm
+        // (weight-BO cache hit) pass the clone never runs, eliminating the per-pass reclone.
         prof::phase::set_stage("mhsa_qkv");
         let q = self.mm_lazy(x, || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_q.weight") }, &format!("{blk}.q")); // [T, D]
         prof::phase::set_stage("mhsa_qkv");
@@ -255,6 +251,36 @@ impl FastConformerEncoder {
         let v = self.mm_lazy(x, || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_v.weight") }, &format!("{blk}.v"));
         prof::phase::set_stage("mhsa_pos");
         let pm = self.mm_lazy(pos_enc, || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_pos.weight") }, &format!("{blk}.pos")); // [P, D]
+        self.attention_core(&q, &k, &v, &pm, blk, t)
+    }
+
+    /// Device-in MHSA for the fused seam: the attention input is the resident-stream LN output
+    /// `satt_bo` (device bf16 [PAD_M,KRES]); q/k/v are projected DEVICE-IN (no host re-upload of satt).
+    /// pm stays host-in (pos_enc != satt). Then the shared [`Self::attention_core`].
+    #[cfg(feature = "npu")]
+    fn mhsa_dev(&self, satt_bo: &npu_xrt::Bo, m: usize, blk: usize, pos_enc: &Array2<f32>) -> Array2<f32> {
+        let b = self.w.block(blk);
+        let npu = self.npu.as_ref().expect("mhsa_dev without npu");
+        let d = self.cfg.hidden;
+        prof::phase::set_stage("mhsa_qkv");
+        let q = npu.proj_from_bf16(satt_bo, m, || b.m("self_attn.linear_q.weight"), &format!("{blk}.q"), d);
+        prof::phase::set_stage("mhsa_qkv");
+        let k = npu.proj_from_bf16(satt_bo, m, || b.m("self_attn.linear_k.weight"), &format!("{blk}.k"), d);
+        prof::phase::set_stage("mhsa_qkv");
+        let v = npu.proj_from_bf16(satt_bo, m, || b.m("self_attn.linear_v.weight"), &format!("{blk}.v"), d);
+        prof::phase::set_stage("mhsa_pos");
+        let pm = self.mm_lazy(pos_enc, || b.m("self_attn.linear_pos.weight"), &format!("{blk}.pos"));
+        self.attention_core(&q, &k, &v, &pm, blk, m)
+    }
+
+    /// The attention core shared by the host-in [`Self::mhsa`] and the device-in [`Self::mhsa_dev`]:
+    /// given the projected q/k/v [T,D] and pos-projection pm [P,D], compute rel-pos scores -> softmax
+    /// -> context -> merge -> linear_out. Identical to the pre-refactor mhsa tail (the 3 attention
+    /// variants: resident / conveyor / host score loop).
+    fn attention_core(&self, q: &Array2<f32>, k: &Array2<f32>, v: &Array2<f32>, pm: &Array2<f32>, blk: usize, t: usize) -> Array2<f32> {
+        let b = self.w.block(blk);
+        let (h, dk, d) = (self.cfg.n_heads, self.cfg.head_dim, self.cfg.hidden);
+        let p = pm.nrows(); // 2T-1
         let (ubias, vbias) = {
             let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal);
             (b.m("self_attn.pos_bias_u"), b.m("self_attn.pos_bias_v")) // [H, DK] each
@@ -301,7 +327,7 @@ impl FastConformerEncoder {
         if std::env::var("PARAKEET_CONVEYOR_MHA").is_ok() {
             if let Some(npu) = &self.npu {
                 let _h = PhaseScope::new("mhsa_conveyor", Bucket::Npu);
-                let ctx = npu.relpos_mha_conveyor(&q, &k, &v, &pm, &ubias, &vbias, h);
+                let ctx = npu.relpos_mha_conveyor(q, k, v, pm, &ubias, &vbias, h);
                 prof::phase::set_stage("mhsa_qkv");
                 return self.mm_lazy(&ctx, || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_out.weight") }, &format!("{blk}.out"));
             }
@@ -542,6 +568,39 @@ impl FastConformerEncoder {
             let _h = PhaseScope::new("block_io", Bucket::Marshal);
             x.clone()
         };
+        // FUSED-BLOCK seam (opt-in PARAKEET_FUSED_BLOCK): keep the [T,D] activation RESIDENT across
+        // FFN1 -> Macaron residual -> satt-LN -> MHSA q/k/v projections (no host round-trip inside that
+        // frontier). For THIS seam, after MHSA read back to host and rejoin the default conv/FFN2 path.
+        // Falls through to the default path when the fused bricks (acc_add/resadd/resident-ln) are absent.
+        #[cfg(feature = "npu")]
+        if std::env::var("PARAKEET_FUSED_BLOCK").is_ok() {
+            if let Some(npu) = &self.npu {
+                if npu.resident_fused_available() {
+                    let _h = PhaseScope::new("fused_ff1_mhsa", Bucket::Npu);
+                    let m = x.nrows();
+                    let ff1n_g = b.v("norm_feed_forward1.weight");
+                    let ff1n_b = b.v("norm_feed_forward1.bias");
+                    let satt_g = b.v("norm_self_att.weight");
+                    let satt_b = b.v("norm_self_att.bias");
+                    let x_bo = npu.upload_stream(&x);
+                    let ff1_bo = npu.resident_ffn_dev_bo(&x_bo, ff1n_g.as_slice().unwrap(), ff1n_b.as_slice().unwrap(),
+                        || b.m("feed_forward1.linear1.weight"), &format!("{blk}.ff1.l1"),
+                        || b.m("feed_forward1.linear2.weight"), &format!("{blk}.ff1.l2")).expect("resident_ffn_dev_bo");
+                    let x_bo = npu.residual_add_dev(&x_bo, &ff1_bo, 0.5, m).expect("residual_add_dev(0.5)");
+                    let satt_bo = npu.ln_affine_cast_dev_bf16(&x_bo, satt_g.as_slice().unwrap(), satt_b.as_slice().unwrap()).expect("ln_affine_cast_dev");
+                    let mhsa_out = self.mhsa_dev(&satt_bo, m, blk, pos_enc);
+                    // rejoin host: x = (x + 0.5*ff1) + mhsa_out, then conv/FFN2/out as the default path.
+                    let mut x = npu.readback_stream(&x_bo, m);
+                    x = &x + &mhsa_out;
+                    let conv_out = prof::time("conv_mod", || self.conv_module(&x, blk));
+                    x = &x + &conv_out;
+                    let ff2 = prof::time("ff", || self.feed_forward(&x, b, blk, "ff2", "norm_feed_forward2.weight", "norm_feed_forward2.bias",
+                                                "feed_forward2.linear1.weight", "feed_forward2.linear2.weight"));
+                    x = x + ff2.mapv(|v| 0.5 * v);
+                    return layernorm(&x, &b.v("norm_out.weight"), &b.v("norm_out.bias"));
+                }
+            }
+        }
         let ff1 = prof::time("ff", || self.feed_forward(&x, b, blk, "ff1", "norm_feed_forward1.weight", "norm_feed_forward1.bias",
                                     "feed_forward1.linear1.weight", "feed_forward1.linear2.weight"));
         {
