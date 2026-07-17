@@ -81,7 +81,7 @@ pub struct BertEncoder {
 //   post-norm FFN sublayer  x -> cast(x)->bf16 -> fc1_gelu(K_aug=800,N=3072) -> cast->bf16
 //                             -> fc2_collapse(K=3072,N=768) + host b2 -> resadd_s100(x, y) -> LN
 //   (BERT is POST-norm: the trailing LN moves AFTER the residual add, vs Parakeet's pre-norm order.)
-// Full turnkey: xdna-engine-private/journal/docs/handoffs/active/2026-07-17-k768-gelu-rail-device.md
+// The device build + rel-L2 gate for this rail is a staged task (build_k768_gelu_rail.sh).
 impl BertEncoder {
     /// Opt-in flag (reserved) for the K=768 GELU resident FFN rail. Returns false unless
     /// `BERT_RESIDENT_FFN=1`. The rail itself is not yet built/genericized (see the seam note
