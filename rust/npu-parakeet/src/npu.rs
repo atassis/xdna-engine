@@ -61,11 +61,11 @@ const CONV_KEY_MASK: f32 = -1.0e4;
 // .split() deadlock). Real dims: TQ=8 DK=128 BUILT_T=176 P=2*BUILT_T-1=351 N_QT=22.
 const CONV_BD_HEADS: usize = 4;                  // heads baked per BD-onchip xclbin dispatch (H_BD)
 const CONV_BD_P: usize = 2 * CONV_BUILT_T - 1;   // 351 = ATTN_P, the baked rel-pos table rows
-// insts word(s) holding the per-head t_active RTP immediate (baked default = CONV_BUILT_T). Filled by
-// the device-side probe (dump insts.bin, find the CONV_BUILT_T occurrences at the RTP-write sites);
-// EMPTY = no patch = full-length passthrough (correct for T==BUILT_T + the standalone gate). Short
-// clips (t<BUILT_T) need these patched per dispatch -- see the turnkey device doc.
-const CONV_BD_TACTIVE_WORDS: &[usize] = &[];
+// The per-head t_active RTP immediate is baked as CONV_BUILT_T into 2*CONV_BD_HEADS use_write_rtp
+// sites (H scores-cores + H BD-emit-cores). Rather than hardcode the insts offsets (they shift on
+// every rebuild -- the exact trap that shipped a broken short-clip path), we DISCOVER them at
+// dispatch time by scanning the insts template for the baked default (see relpos_mha_conveyor_bdonchip).
+const CONV_BD_TACTIVE_SITES: usize = 2 * CONV_BD_HEADS;
 
 /// BD-carriage precision for the conveyor query belt (open-item C / SPLITP). Default PLAIN per the
 /// Deliverable-1 gate (scripts/conveyor_bd_precision_check.py). Env PARAKEET_CONVEYOR_BD=split flips
@@ -838,8 +838,22 @@ impl NpuMatmul {
 
         let ck = self.conveyor_bd_block(CONV_BD_HEADS);
         // t_active: patch the insts template once (same t for every group), upload once, reuse.
+        // The generator bakes t_active = CONV_BUILT_T into 2*CONV_BD_HEADS use_write_rtp sites; find
+        // them by scanning for the baked default (robust across rebuilds), assert the expected count
+        // so an insts-layout change fails LOUD instead of silently corrupting short clips, then patch
+        // each to this clip's real length t. (t==BUILT_T -> no-op == the unmasked standalone gate.)
         let mut insts = ck.instr_template.clone();
-        for &w in CONV_BD_TACTIVE_WORDS {
+        let tactive_words: Vec<usize> = ck.instr_template.iter().enumerate()
+            .filter(|(_, &w)| w == CONV_BUILT_T as u32)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            tactive_words.len(), CONV_BD_TACTIVE_SITES,
+            "BD-onchip t_active RTP discovery: expected {} insts words == BUILT_T ({}), found {} at {:?} \
+             -- insts layout changed; refusing to patch (would corrupt short clips)",
+            CONV_BD_TACTIVE_SITES, CONV_BUILT_T, tactive_words.len(), tactive_words
+        );
+        for &w in &tactive_words {
             insts[w] = t as u32;
         }
         let instr_bytes: Vec<u8> = insts.iter().flat_map(|w| w.to_le_bytes()).collect();
