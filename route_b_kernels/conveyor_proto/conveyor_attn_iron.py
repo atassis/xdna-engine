@@ -190,21 +190,25 @@ def build(dev, mono=False, TRIVIAL=False, relpos=False, bd_onchip=False, tactive
             f_p.release(1)
 
         def stg_a(f_bd, f_k, f_ac, k_sc):
-            ek = f_k.acquire(1)
+            # RELOAD FIX: re-acquire k PER TILE to match the stride-0 replay fill (kvtap outer dim
+            # N_QT). Acquire-once-and-hold left N_QT-1 replayed fills pending -> corrupted the next
+            # dispatch's fifo state (only the first dispatch per hw-context activation was correct).
+            # Per-tile acquire re-reads the SAME on-chip k (stride 0) but cycles the lock cleanly, so
+            # every dispatch reloads its own weights -- the shipped relpos + host-BD conveyor pattern.
             for _ in range_(N_QT):
+                ek = f_k.acquire(1)
                 ebd = f_bd.acquire(1); eac = f_ac.acquire(1); k_sc(ebd, ek, eac)
-                f_bd.release(1); f_ac.release(1)
-            f_k.release(1)
+                f_bd.release(1); f_ac.release(1); f_k.release(1)
 
         # t_active-masked scores worker: waits for the runtime to write rtp[0]=t_active, then passes rtp
         # into the mask kernel each tile so pad keys j>=t_active are nulled in the softmax.
         def stg_a_mask(f_bd, f_k, f_ac, k_sc, rtp, bar):
             bar.wait_for_value(1)
-            ek = f_k.acquire(1)
+            # RELOAD FIX: per-tile k acquire (see stg_a) so each dispatch reloads its own k.
             for _ in range_(N_QT):
+                ek = f_k.acquire(1)
                 ebd = f_bd.acquire(1); eac = f_ac.acquire(1); k_sc(ebd, ek, eac, rtp)
-                f_bd.release(1); f_ac.release(1)
-            f_k.release(1)
+                f_bd.release(1); f_ac.release(1); f_k.release(1)
 
         def stg_b(f_ac, f_probs, k_sm):
             for _ in range_(N_QT):
@@ -212,11 +216,11 @@ def build(dev, mono=False, TRIVIAL=False, relpos=False, bd_onchip=False, tactive
                 f_ac.release(1); f_probs.release(1)
 
         def stg_c(f_probs, f_v, f_ctx, k_cx):
-            ev = f_v.acquire(1)
+            # RELOAD FIX: per-tile v acquire (see stg_a) so each dispatch reloads its own v.
             for _ in range_(N_QT):
+                ev = f_v.acquire(1)
                 ep2 = f_probs.acquire(1); ec = f_ctx.acquire(1); k_cx(ep2, ev, ec)
-                f_probs.release(1); f_ctx.release(1)
-            f_v.release(1)
+                f_probs.release(1); f_ctx.release(1); f_v.release(1)
 
         wl = []
         for h in range(H):
