@@ -1092,13 +1092,16 @@ impl NpuMatmul {
     }
 
     /// True when the whole-block fused seam (PARAKEET_FUSED_BLOCK) can run: modal resident + the
-    /// resident-ln seam + the fc2-accumulate (acc_add) + the Macaron residual (resadd_s050) bricks.
+    /// resident-ln seam + the fc2-accumulate (acc_add) + BOTH residual scales (resadd_s050 for the
+    /// Macaron residual AND resadd_s100 for the MHSA residual). block()'s FUSED_BLOCK branch
+    /// hard-`.expect()`s the s100 residual mid-block, so it must be gated here or a tree with only
+    /// s050 built would green-light the fused path and then panic after FF1 already dispatched.
     pub fn resident_fused_available(&self) -> bool {
         if !self.modal {
             return false;
         }
         match self.resident_ln() {
-            Some(rl) => rl.acc_add.is_some() && rl.resadd_s050.is_some(),
+            Some(rl) => rl.acc_add.is_some() && rl.resadd_s050.is_some() && rl.resadd_s100.is_some(),
             None => false,
         }
     }
@@ -1120,6 +1123,7 @@ impl NpuMatmul {
 
     /// Read a device f32 [PAD_M,KRES] BO back to a host [m, KRES] array (the block/encoder boundary).
     pub fn readback_stream(&self, bo: &Bo, m: usize) -> Array2<f32> {
+        assert!(m <= PAD_M, "readback_stream: m={m} exceeds PAD_M={PAD_M}");
         bo.sync_from_device().unwrap();
         let mut cb = vec![0u8; m * KRES * 4];
         bo.read_bytes(&mut cb).unwrap();
@@ -1163,6 +1167,7 @@ impl NpuMatmul {
     /// One modal-resident matmul dispatch whose A input is an ALREADY-device-resident bf16 BO
     /// (a_bo), skipping dispatch()'s host pack+upload. Output read to host (C[m,n] f32).
     fn dispatch_with_a(&self, a_bo: &Bo, m: usize, wbo: &Bo, n: usize, silu: bool) -> Array2<f32> {
+        assert!(m <= PAD_M, "dispatch_with_a: m={m} exceeds PAD_M={PAD_M}");
         let st = self.stream(n, silu);
         self.kern.run_matmul8(3, &st.instr, st.n_instr, a_bo, wbo, &st.bo_c, &self.bo_tmp, &self.bo_tr).unwrap();
         self.stats.borrow_mut().dispatches += 1;
@@ -1835,9 +1840,10 @@ impl NpuMatmul {
     }
 
     /// On-chip scaled residual add: out = a + scale*b, f32 [PAD_M,KRES], device-resident. Selects
-    /// the baked-scale xclbin (only s050 = 0.5 built so far). `a_bo`/`b_bo` are device f32 [PAD_M,KRES]
-    /// BOs; returns the device result (ResidualAdd scratch, overwritten by the next call). `None` when
-    /// the resident-ln xclbins are absent; PANICS if the requested `scale` has no built xclbin.
+    /// the baked-scale xclbin: s050 = 0.5 (Macaron residual) and s100 = 1.0 (MHSA residual) are both
+    /// built; the FUSED_BLOCK path requires BOTH (gated by `resident_fused_available`). `a_bo`/`b_bo`
+    /// are device f32 [PAD_M,KRES] BOs; returns the device result (ResidualAdd scratch, overwritten by
+    /// the next call). `None` when the selected-scale xclbin is absent; PANICS on an unbuilt scale.
     pub fn residual_add_dev(&self, a_bo: &Bo, b_bo: &Bo, scale: f32, _m: usize) -> Option<Rc<Bo>> {
         let rl = self.resident_ln()?;
         let ra = if (scale - 0.5).abs() < 1e-6 {
