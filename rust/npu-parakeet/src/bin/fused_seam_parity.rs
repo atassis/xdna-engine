@@ -63,12 +63,13 @@ fn main() {
             println!("[fused_seam_parity] PASS (rel-L2 <= 1e-4)");
         }
         "residual" => {
-            let (host, dev) = npu.residual_add_selftest(t, seed, 0.5).unwrap_or_else(|| {
-                panic!("[fused_seam_parity] residual: resadd_s050 xclbin absent -- build \
-                        scripts/build_parakeet_modal_kernels.sh (needs final_resadd_512x1024_s050)");
+            let scale: f32 = arg_val("--scale", "0.5").parse().unwrap();
+            let (host, dev) = npu.residual_add_selftest(t, seed, scale).unwrap_or_else(|| {
+                panic!("[fused_seam_parity] residual: resadd xclbin absent for scale={scale} -- build \
+                        scripts/build_parakeet_modal_kernels.sh (needs final_resadd_512x1024_s050/s100)");
             });
             let (max_rel, l2_rel) = rel_err(&host, &dev);
-            println!("[fused_seam_parity] seam=residual scale=0.5 t={t} seed={seed}  max_rel={max_rel:.3e} rel-L2={l2_rel:.3e}");
+            println!("[fused_seam_parity] seam=residual scale={scale} t={t} seed={seed}  max_rel={max_rel:.3e} rel-L2={l2_rel:.3e}");
             assert!(l2_rel <= 1e-4, "residual_add parity FAILED: rel-L2 {l2_rel:.3e} > 1e-4");
             println!("[fused_seam_parity] PASS (rel-L2 <= 1e-4)");
         }
@@ -82,8 +83,22 @@ fn main() {
             assert!(l2_rel <= 5e-3, "ln device-in parity FAILED: rel-L2 {l2_rel:.3e} > 5e-3");
             println!("[fused_seam_parity] PASS (rel-L2 <= 5e-3)");
         }
+        "linout" => {
+            let (host, dev) = npu.linout_selftest(t, seed).expect("linout_selftest: modal absent");
+            let (max_rel, l2_rel) = rel_err(&host, &dev);
+            println!("[fused_seam_parity] seam=linout t={t} seed={seed}  max_rel={max_rel:.3e} rel-L2={l2_rel:.3e}");
+            assert!(l2_rel <= 1e-4, "linout parity FAILED: rel-L2 {l2_rel:.3e} > 1e-4");
+            println!("[fused_seam_parity] PASS (rel-L2 <= 1e-4)");
+        }
+        "convfront" => {
+            let (host, dev) = npu.conv_front_selftest(t, seed).expect("conv_front_selftest: xclbins absent");
+            let (max_rel, l2_rel) = rel_err(&host, &dev);
+            println!("[fused_seam_parity] seam=convfront t={t} seed={seed}  max_rel={max_rel:.3e} rel-L2={l2_rel:.3e}");
+            assert!(l2_rel <= 1e-4, "convfront parity FAILED: rel-L2 {l2_rel:.3e} > 1e-4");
+            println!("[fused_seam_parity] PASS (rel-L2 <= 1e-4)");
+        }
         other => {
-            eprintln!("[fused_seam_parity] unknown seam '{other}' (known: ffn, residual, ln)");
+            eprintln!("[fused_seam_parity] unknown seam '{other}' (known: ffn, residual, ln, linout, convfront)");
             std::process::exit(2);
         }
     }

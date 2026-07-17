@@ -19,6 +19,10 @@ template <int N>
 void residual_add_row(const float *restrict a, const float *restrict b,
                       float *restrict out, float scale, int32_t cols) {
   event0();
+  // Round-to-nearest-even so the on-chip f32 add matches the host round-nearest add bit-for-bit
+  // (default AIE rounding is truncation -> 1-ULP drift that accumulates over blocks; the WER-path
+  // rounding rule, same as glu.cc / affine_cast.cc).
+  ::aie::set_rounding(::aie::rounding_mode::conv_even);
   const ::aie::vector<float, N> sv = ::aie::broadcast<float, N>(scale);
   for (int i = 0; i < cols; i += N) {
     ::aie::vector<float, N> av = ::aie::load_v<N>(a + i);

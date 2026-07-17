@@ -182,6 +182,8 @@ struct ResidentLn {
     acc_add: Option<AccAdd>,
     // scaled residual-add (out = a + 0.5*b, f32), OPTIONAL. The Macaron FFN residual x+0.5*ff on-chip.
     resadd_s050: Option<ResidualAdd>,
+    // scaled residual-add (out = a + 1.0*b, f32), OPTIONAL. The full MHSA/conv residual x+sublayer.
+    resadd_s100: Option<ResidualAdd>,
     // conv-module depthwise conv1d (step 3), OPTIONAL like glu.
     dwconv: Option<ConvDw>,
     // conv-module post-dwconv SiLU (step 4), OPTIONAL like glu/dwconv. SEPARATE single-op-loop
@@ -813,6 +815,25 @@ impl NpuMatmul {
                 None
             }
         };
+        // scaled residual-add s100 (out=a+1.0*b f32), OPTIONAL: the full MHSA/conv residual x+sublayer.
+        let resadd_s100 = {
+            let xcl = self.ln_dir.join(format!("final_resadd_{PAD_M}x{KRES}_s100.xclbin"));
+            let ins = self.ln_dir.join(format!("insts_resadd_{PAD_M}x{KRES}_s100.txt"));
+            if xcl.exists() && ins.exists() {
+                let (kern, instr, n) = load_path(xcl, ins);
+                let gr = |i| kern.group_id(i).unwrap();
+                Some(ResidualAdd {
+                    scale: 1.0,
+                    bo_out: Rc::new(self.dev.alloc_bo(&kern, PAD_M * KRES * 4, FLAG_HOST_ONLY, gr(5)).unwrap()),
+                    dummy_tmp: self.dev.alloc_bo(&kern, 8, FLAG_HOST_ONLY, gr(6)).unwrap(),
+                    dummy_tr: self.dev.alloc_bo(&kern, 1, FLAG_HOST_ONLY, gr(7)).unwrap(),
+                    kern, instr, n,
+                })
+            } else {
+                eprintln!("[npu] resadd_s100 xclbin absent in {} -- residual_add_dev(1.0) unavailable (build final_resadd_{PAD_M}x{KRES}_s100)", self.ln_dir.display());
+                None
+            }
+        };
         // conv-module depthwise conv1d (step 3), OPTIONAL. 3-buffer ABI in[C,T]/w[C,16]/out[C,T] bf16.
         let dwconv = {
             let xcl = self.ln_dir.join(format!("final_dwconv_{DW_C}x{DW_T}.xclbin"));
@@ -914,7 +935,7 @@ impl NpuMatmul {
             deint_tmp: self.dev.alloc_bo(&deint_kern, 8, FLAG_HOST_ONLY, gd(6)).unwrap(),
             deint_tr: self.dev.alloc_bo(&deint_kern, 1, FLAG_HOST_ONLY, gd(7)).unwrap(),
             ln_kern, ln_instr, ln_n, ac_kern, ac_instr, ac_n,
-            deint_kern, deint_instr, deint_n, glu, acc_add, resadd_s050, dwconv, silu, dwconv_silu, dwconv_silu_t,
+            deint_kern, deint_instr, deint_n, glu, acc_add, resadd_s050, resadd_s100, dwconv, silu, dwconv_silu, dwconv_silu_t,
         });
         rl
     }
@@ -1178,6 +1199,77 @@ impl NpuMatmul {
             }
         }
         Some(out)
+    }
+
+    /// Device-in variant of [`Self::resident_conv_pw1_glu`]: the conv-module LN input is the ALREADY-
+    /// device f32 [PAD_M,KRES] BO `a_bo` (the MHSA-residual result), so the conv front's own input never
+    /// round-trips to host. Returns the host GLU output [m, KRES] (the rest of the conv module continues
+    /// host-fed for this seam). `None` when the resident-ln / glu xclbins are absent.
+    pub fn resident_conv_pw1_glu_dev<F: FnOnce() -> Array2<f32>>(&self, a_bo: &Bo, m: usize, gamma: &[f32], beta: &[f32], make_w1: F, id: &str) -> Option<Array2<f32>> {
+        let rl = self.resident_ln()?;
+        let glu = rl.glu.as_ref()?;
+        self.stats.borrow_mut().calls += 1;
+        let n2 = 2 * KRES; // pw1 output width 2D
+        let rlc = self.ln_affine_cast_dev(a_bo, gamma, beta); // device-in LN
+        let cached = self.wcache.borrow().get(id).cloned();
+        let wbo = if let Some(bo) = cached {
+            bo
+        } else {
+            let w = make_w1();
+            assert_eq!(w.nrows(), KRES, "pw1 W nrows {} != {KRES}", w.nrows());
+            assert_eq!(w.ncols(), n2, "pw1 W ncols {} != {n2}", w.ncols());
+            self.weight_bo(id, w.view())
+        };
+        let st = self.stream(n2, false);
+        self.kern.run_matmul8(3, &st.instr, st.n_instr, &rlc.bo_bf16, &wbo, &st.bo_c, &self.bo_tmp, &self.bo_tr).unwrap();
+        glu.kern.run_matmul8(3, &glu.instr, glu.n, &st.bo_c, &glu.bo_out, &glu.dummy_c, &glu.dummy_tmp, &glu.dummy_tr).unwrap();
+        self.stats.borrow_mut().dispatches += 2; // pw1 + glu
+        glu.bo_out.sync_from_device().unwrap();
+        let mut cb = vec![0u8; m * KRES * 4];
+        glu.bo_out.read_bytes(&mut cb).unwrap();
+        let mut out = Array2::<f32>::zeros((m, KRES));
+        for r in 0..m {
+            for c in 0..KRES {
+                let off = (r * KRES + c) * 4;
+                out[[r, c]] = f32::from_le_bytes([cb[off], cb[off + 1], cb[off + 2], cb[off + 3]]);
+            }
+        }
+        Some(out)
+    }
+
+    /// Host-in -> DEVICE-OUT matmul: A[m,KRES] @ W[KRES,n] -> C[m,n] f32 left in a FRESH device BO (no
+    /// read). The device-out twin of the k=KRES `matmul_id_lazy` path: packs+uploads A, GEMMs into a new
+    /// BO, returns it -- so a projection result (e.g. MHSA linear_out) stays resident for the next seam.
+    pub fn matmul_id_to_bo<F: FnOnce() -> Array2<f32>>(&self, a: &Array2<f32>, make_w: F, id: &str, n: usize) -> Rc<Bo> {
+        let m = a.nrows();
+        assert_eq!(a.ncols(), KRES, "matmul_id_to_bo needs K=KRES={KRES}");
+        self.stats.borrow_mut().calls += 1;
+        let cached = self.wcache.borrow().get(id).cloned();
+        let wbo = if let Some(bo) = cached {
+            bo
+        } else {
+            let w = make_w();
+            assert_eq!(w.nrows(), KRES, "weight nrows {} != {KRES}", w.nrows());
+            assert_eq!(w.ncols(), n, "weight ncols {} != {n}", w.ncols());
+            self.weight_bo(id, w.view())
+        };
+        // pack A -> bf16 -> bo_a. ZERO-PAD rows m..PAD_M: unlike dispatch() (whose stale padding rows
+        // are harmless because the result is read back at m rows), the output here stays DEVICE-resident
+        // and flows into the next seam (residual -> conv front) which processes all PAD_M rows -- garbage
+        // padding then corrupts valid rows sharing a partial m-tile. Zero input padding -> zero output
+        // padding (0 @ W = 0), matching the host path's clean zero-padding invariant.
+        let a_std = a.as_standard_layout();
+        let a_s = a_std.as_slice().unwrap();
+        let mut a_bits = vec![0u16; PAD_M * KRES]; // rows m..PAD_M stay zero
+        npu_xrt::pack_f32_to_bf16(&a_s[..m * KRES], &mut a_bits[..m * KRES]);
+        self.bo_a.write_bytes(u16_bytes(&a_bits)).unwrap();
+        self.bo_a.sync_to_device().unwrap();
+        // GEMM into a FRESH device f32 BO (identity modal, NO read).
+        let out = self.dev.alloc_bo(&self.kern, PAD_M * n * 4, FLAG_HOST_ONLY, self.kern.group_id(5).unwrap()).unwrap();
+        let st = self.stream(n, false);
+        self.kern.run_matmul8(3, &st.instr, st.n_instr, &self.bo_a, &wbo, &out, &self.bo_tmp, &self.bo_tr).unwrap();
+        self.stats.borrow_mut().dispatches += 1;
+        Rc::new(out)
     }
 
     /// Host-fed on-NPU depthwise conv1d (conv step 3a): the sliding_mul FIR brick. `x_ct` = [C=1024, T]
@@ -1587,6 +1679,62 @@ impl NpuMatmul {
         Some((host, dev))
     }
 
+    /// Task-5 debug parity: `matmul_id` (host-read reference) vs `matmul_id_to_bo` (device-out) on the
+    /// SAME synthetic ctx + weight (shared id -> same weight BO). Must be bit-identical (same GEMM).
+    pub fn linout_selftest(&self, t: usize, seed: u64) -> Option<(Array2<f32>, Array2<f32>)> {
+        if !self.modal {
+            return None;
+        }
+        let fill = |rows: usize, cols: usize, sd: u64, sc: f32| -> Array2<f32> {
+            let mut s = sd.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            Array2::from_shape_fn((rows, cols), |_| {
+                s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                let mut z = s; z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB); z ^= z >> 31;
+                ((z >> 40) as f32 / (1u32 << 24) as f32 * 2.0 - 1.0) * sc
+            })
+        };
+        let ctx = fill(t, KRES, seed, 1.0);
+        let w = fill(KRES, KRES, seed ^ 0x7E, 0.05);
+        let host = self.matmul_id(&ctx, &w, "selftest.linout");
+        let wc = w.clone();
+        let dev_bo = self.matmul_id_to_bo(&ctx, move || wc, "selftest.linout", KRES);
+        dev_bo.sync_from_device().unwrap();
+        let mut cb = vec![0u8; t * KRES * 4];
+        dev_bo.read_bytes(&mut cb).unwrap();
+        let mut dev = Array2::<f32>::zeros((t, KRES));
+        for r in 0..t { for c in 0..KRES {
+            let off = (r * KRES + c) * 4;
+            dev[[r, c]] = f32::from_le_bytes([cb[off], cb[off + 1], cb[off + 2], cb[off + 3]]);
+        }}
+        Some((host, dev))
+    }
+
+    /// Task-5 debug parity: `resident_conv_pw1_glu` (host-in) vs `resident_conv_pw1_glu_dev` (device-in,
+    /// input uploaded) on the SAME synthetic x + weights (shared id). Must be bit-identical.
+    pub fn conv_front_selftest(&self, t: usize, seed: u64) -> Option<(Array2<f32>, Array2<f32>)> {
+        let rl = self.resident_ln()?;
+        rl.glu.as_ref()?;
+        let fill = |rows: usize, cols: usize, sd: u64, sc: f32| -> Array2<f32> {
+            let mut s = sd.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            Array2::from_shape_fn((rows, cols), |_| {
+                s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                let mut z = s; z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB); z ^= z >> 31;
+                ((z >> 40) as f32 / (1u32 << 24) as f32 * 2.0 - 1.0) * sc
+            })
+        };
+        let x = fill(t, KRES, seed, 1.0);
+        let gv: Vec<f32> = fill(1, KRES, seed ^ 0x1A, 1.0).iter().copied().collect();
+        let bv: Vec<f32> = fill(1, KRES, seed ^ 0x2B, 0.1).iter().copied().collect();
+        let pw1 = fill(KRES, 2 * KRES, seed ^ 0x3C, 0.05);
+        let pw1a = pw1.clone();
+        let host = self.resident_conv_pw1_glu(&x, &gv, &bv, move || pw1a, "selftest.convpw1")?;
+        let a_bo = self.upload_stream(&x);
+        let dev = self.resident_conv_pw1_glu_dev(&a_bo, t, &gv, &bv, move || pw1, "selftest.convpw1")?;
+        Some((host, dev))
+    }
+
     /// On-chip scaled residual add: out = a + scale*b, f32 [PAD_M,KRES], device-resident. Selects
     /// the baked-scale xclbin (only s050 = 0.5 built so far). `a_bo`/`b_bo` are device f32 [PAD_M,KRES]
     /// BOs; returns the device result (ResidualAdd scratch, overwritten by the next call). `None` when
@@ -1595,8 +1743,10 @@ impl NpuMatmul {
         let rl = self.resident_ln()?;
         let ra = if (scale - 0.5).abs() < 1e-6 {
             rl.resadd_s050.as_ref()?
+        } else if (scale - 1.0).abs() < 1e-6 {
+            rl.resadd_s100.as_ref()?
         } else {
-            panic!("residual_add_dev: scale {scale} has no built xclbin (only s050=0.5); build final_resadd_{PAD_M}x{KRES}_s<stag>");
+            panic!("residual_add_dev: scale {scale} has no built xclbin (only s050=0.5, s100=1.0); build final_resadd_{PAD_M}x{KRES}_s<stag>");
         };
         debug_assert!((ra.scale - scale).abs() < 1e-6);
         ra.kern.run_matmul8(3, &ra.instr, ra.n, a_bo, b_bo, &ra.bo_out, &ra.dummy_tmp, &ra.dummy_tr).unwrap();

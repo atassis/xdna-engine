@@ -251,14 +251,17 @@ impl FastConformerEncoder {
         let v = self.mm_lazy(x, || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_v.weight") }, &format!("{blk}.v"));
         prof::phase::set_stage("mhsa_pos");
         let pm = self.mm_lazy(pos_enc, || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_pos.weight") }, &format!("{blk}.pos")); // [P, D]
-        self.attention_core(&q, &k, &v, &pm, blk, t)
+        let ctx = self.attention_core(&q, &k, &v, &pm, blk, t);
+        prof::phase::set_stage("mhsa_qkv");
+        self.mm_lazy(&ctx, || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_out.weight") }, &format!("{blk}.out"))
     }
 
     /// Device-in MHSA for the fused seam: the attention input is the resident-stream LN output
     /// `satt_bo` (device bf16 [PAD_M,KRES]); q/k/v are projected DEVICE-IN (no host re-upload of satt).
-    /// pm stays host-in (pos_enc != satt). Then the shared [`Self::attention_core`].
+    /// pm stays host-in (pos_enc != satt). attention_core runs host; the OUTPUT linear_out lands in a
+    /// DEVICE BO ([`NpuMatmul::matmul_id_to_bo`]) so the MHSA output stays resident for the conv seam.
     #[cfg(feature = "npu")]
-    fn mhsa_dev(&self, satt_bo: &npu_xrt::Bo, m: usize, blk: usize, pos_enc: &Array2<f32>) -> Array2<f32> {
+    fn mhsa_dev(&self, satt_bo: &npu_xrt::Bo, m: usize, blk: usize, pos_enc: &Array2<f32>) -> std::rc::Rc<npu_xrt::Bo> {
         let b = self.w.block(blk);
         let npu = self.npu.as_ref().expect("mhsa_dev without npu");
         let d = self.cfg.hidden;
@@ -270,7 +273,9 @@ impl FastConformerEncoder {
         let v = npu.proj_from_bf16(satt_bo, m, || b.m("self_attn.linear_v.weight"), &format!("{blk}.v"), d);
         prof::phase::set_stage("mhsa_pos");
         let pm = self.mm_lazy(pos_enc, || b.m("self_attn.linear_pos.weight"), &format!("{blk}.pos"));
-        self.attention_core(&q, &k, &v, &pm, blk, m)
+        let ctx = self.attention_core(&q, &k, &v, &pm, blk, m);
+        prof::phase::set_stage("mhsa_qkv");
+        npu.matmul_id_to_bo(&ctx, || b.m("self_attn.linear_out.weight"), &format!("{blk}.out"), d)
     }
 
     /// The attention core shared by the host-in [`Self::mhsa`] and the device-in [`Self::mhsa_dev`]:
@@ -313,7 +318,7 @@ impl FastConformerEncoder {
                     ctx.slice_mut(s![.., col..col + dk]).assign(&ch);
                 }
                 prof::phase::set_stage("mhsa_qkv");
-                return self.mm_lazy(&ctx, || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_out.weight") }, &format!("{blk}.out"));
+                return ctx; // merged [T,D]; linear_out applied by the caller (mhsa / mhsa_dev)
             }
         }
 
@@ -329,7 +334,7 @@ impl FastConformerEncoder {
                 let _h = PhaseScope::new("mhsa_conveyor", Bucket::Npu);
                 let ctx = npu.relpos_mha_conveyor(q, k, v, pm, &ubias, &vbias, h);
                 prof::phase::set_stage("mhsa_qkv");
-                return self.mm_lazy(&ctx, || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_out.weight") }, &format!("{blk}.out"));
+                return ctx; // merged [T,D]; linear_out applied by the caller (mhsa / mhsa_dev)
             }
         }
 
@@ -402,11 +407,13 @@ impl FastConformerEncoder {
         }
         ctx
         });
-        prof::phase::set_stage("mhsa_qkv");
-        self.mm_lazy(&ctx, || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_out.weight") }, &format!("{blk}.out"))
+        ctx // merged [T,D]; linear_out applied by the caller (mhsa / mhsa_dev)
     }
 
-    fn conv_module(&self, x: &Array2<f32>, blk: usize) -> Array2<f32> {
+    /// `precomputed_glu`: Some when the caller (the fused seam) already ran the conv front DEVICE-IN
+    /// (LN->pw1->GLU from a device BO) -- then the resident/host front here is skipped and the rest of
+    /// the module (dwconv->silu->pw2) continues from it. None = the normal self-contained conv module.
+    fn conv_module(&self, x: &Array2<f32>, blk: usize, precomputed_glu: Option<Array2<f32>>) -> Array2<f32> {
         let b = self.w.block(blk);
         let d = self.cfg.hidden;
         let t = x.nrows();
@@ -442,7 +449,7 @@ impl FastConformerEncoder {
         // If the glu xclbin is absent, fall back to resident LN->pw1 [T,2D] + host GLU; if the resident seam
         // is off entirely (=0), full host LN + pw1 + host GLU.
         #[cfg(feature = "npu")]
-        let resident_glu = if resident_conv {
+        let resident_glu = if resident_conv && precomputed_glu.is_none() {
             self.npu.as_ref().filter(|n| n.resident_ff_available()).and_then(|npu| {
                 let gamma = b.v("norm_conv.weight");
                 let beta = b.v("norm_conv.bias");
@@ -455,7 +462,9 @@ impl FastConformerEncoder {
         #[cfg(not(feature = "npu"))]
         let resident_glu: Option<Array2<f32>> = None;
 
-        let glu = if let Some(g) = resident_glu {
+        let glu = if let Some(g) = precomputed_glu {
+            g // [T, D] -- conv front already ran DEVICE-IN in the fused seam
+        } else if let Some(g) = resident_glu {
             g // [T, D] -- GLU already applied on-NPU (step 2)
         } else {
             // step-1 resident LN->pw1 if available, else host LN + pw1 GEMM -> h [T, 2D]
@@ -588,11 +597,19 @@ impl FastConformerEncoder {
                         || b.m("feed_forward1.linear2.weight"), &format!("{blk}.ff1.l2")).expect("resident_ffn_dev_bo");
                     let x_bo = npu.residual_add_dev(&x_bo, &ff1_bo, 0.5, m).expect("residual_add_dev(0.5)");
                     let satt_bo = npu.ln_affine_cast_dev_bf16(&x_bo, satt_g.as_slice().unwrap(), satt_b.as_slice().unwrap()).expect("ln_affine_cast_dev");
-                    let mhsa_out = self.mhsa_dev(&satt_bo, m, blk, pos_enc);
-                    // rejoin host: x = (x + 0.5*ff1) + mhsa_out, then conv/FFN2/out as the default path.
-                    let mut x = npu.readback_stream(&x_bo, m);
-                    x = &x + &mhsa_out;
-                    let conv_out = prof::time("conv_mod", || self.conv_module(&x, blk));
+                    // MHSA output stays on device (linear_out -> device BO).
+                    let mhsa_out_bo = self.mhsa_dev(&satt_bo, m, blk, pos_enc);
+                    // MHSA residual ON-DEVICE: conv_in = (x + 0.5*ff1) + mhsa_out (scale 1.0), no host round-trip.
+                    let conv_in_bo = npu.residual_add_dev(&x_bo, &mhsa_out_bo, 1.0, m).expect("residual_add_dev(1.0)");
+                    // Conv FRONT device-in: norm_conv LN + pw1 + GLU consume conv_in_bo directly (no host
+                    // round-trip between MHSA and conv); returns the host GLU output for the conv rest.
+                    let conv_g = b.v("norm_conv.weight");
+                    let conv_b = b.v("norm_conv.bias");
+                    let glu = npu.resident_conv_pw1_glu_dev(&conv_in_bo, m, conv_g.as_slice().unwrap(), conv_b.as_slice().unwrap(),
+                        || b.m3("conv.pointwise_conv1.weight").index_axis(Axis(2), 0).to_owned().t().to_owned(), &format!("{blk}.pw1"));
+                    // rejoin host: x = (x + 0.5*ff1) + mhsa_out (the conv residual base), then conv rest / FFN2 / out.
+                    let mut x = npu.readback_stream(&conv_in_bo, m);
+                    let conv_out = prof::time("conv_mod", || self.conv_module(&x, blk, glu));
                     x = &x + &conv_out;
                     let ff2 = prof::time("ff", || self.feed_forward(&x, b, blk, "ff2", "norm_feed_forward2.weight", "norm_feed_forward2.bias",
                                                 "feed_forward2.linear1.weight", "feed_forward2.linear2.weight"));
@@ -617,7 +634,7 @@ impl FastConformerEncoder {
             x = &x + &mhsa_out;
         }
         // conv_module now does its own norm_conv LN (resident seam or host fallback), so pass pre-LN x.
-        let conv_out = prof::time("conv_mod", || self.conv_module(&x, blk));
+        let conv_out = prof::time("conv_mod", || self.conv_module(&x, blk, None));
         {
             let _h = PhaseScope::new("residual", Bucket::Host);
             x = &x + &conv_out;
