@@ -184,6 +184,8 @@ struct ResidentLn {
     resadd_s050: Option<ResidualAdd>,
     // scaled residual-add (out = a + 1.0*b, f32), OPTIONAL. The full MHSA/conv residual x+sublayer.
     resadd_s100: Option<ResidualAdd>,
+    // one-dispatch K=4096 fc2 (cast@4096 -> K=4096 modal), OPTIONAL. Collapses the 4x K=1024 + acc_add.
+    fc2_k4096: Option<Fc2K4096>,
     // conv-module depthwise conv1d (step 3), OPTIONAL like glu.
     dwconv: Option<ConvDw>,
     // conv-module post-dwconv SiLU (step 4), OPTIONAL like glu/dwconv. SEPARATE single-op-loop
@@ -232,6 +234,24 @@ struct AccAdd {
     zero: Bo,     // [PAD_M, KRES] f32, zeroed once (seed for the first partial)
     dummy_tmp: Bo,
     dummy_tr: Bo,
+}
+
+/// One-dispatch fc2 (K=DFF=4096) brick: replaces the 4x K=1024 chunk GEMMs + acc_add (which cost
+/// separate hw-context dispatches) with `cast@4096 (f32->bf16 row-major) -> K=4096 modal GEMM (internal
+/// L1 K-accumulation over 4096) -> f32 [PAD_M,KRES] device BO`. NOT bit-identical to the 4-way split
+/// (different L1 accumulation order + bfp16), so gated by the sound rel-L2 gate, not per-op bit-parity.
+struct Fc2K4096 {
+    cast_kern: Rc<Kernel>,
+    cast_instr: Bo,
+    cast_n: usize,
+    cast_out: Bo, // bf16 [PAD_M, DFF] row-major (cast output = K=4096 modal A input)
+    cast_dc: Bo,
+    cast_dt: Bo,
+    cast_dr: Bo,
+    mm_kern: Rc<Kernel>, // K=4096 modal (identity epilogue)
+    mm_instr: Bo,
+    mm_n: usize,
+    mm_c: Rc<Bo>, // f32 [PAD_M, KRES] fc2 output (device-resident)
 }
 
 /// Device-side f32 scaled residual-add brick (whole-block fusion residual). out[g5] = a[g3] +
@@ -834,6 +854,32 @@ impl NpuMatmul {
                 None
             }
         };
+        // one-dispatch K=DFF fc2 (cast@DFF row-major bf16 -> K=DFF modal), OPTIONAL: collapses the
+        // deint + 4x K=1024 chunk GEMMs + 4x acc_add into cast + 1 K=4096 modal. Both xclbins are
+        // built+staged by build_parakeet_modal_kernels.sh (cast_512x4096, 512x4096x1024 modalid).
+        let fc2_k4096 = {
+            let cast_x = self.ln_dir.join(format!("final_cast_{PAD_M}x{DFF}.xclbin"));
+            let cast_i = self.ln_dir.join(format!("insts_cast_{PAD_M}x{DFF}.txt"));
+            let mm_x = self.ln_dir.join(format!("final_{PAD_M}x{DFF}x{KRES}_{}_8c_modalid.xclbin", self.tile));
+            let mm_i = self.ln_dir.join(format!("insts_{PAD_M}x{DFF}x{KRES}_{}_8c_modalid.txt", self.tile));
+            if cast_x.exists() && cast_i.exists() && mm_x.exists() && mm_i.exists() {
+                let (cast_kern, cast_instr, cast_n) = load_path(cast_x, cast_i);
+                let (mm_kern, mm_instr, mm_n) = load_path(mm_x, mm_i);
+                let gc = |i| cast_kern.group_id(i).unwrap();
+                let gm = |i| mm_kern.group_id(i).unwrap();
+                Some(Fc2K4096 {
+                    cast_out: self.dev.alloc_bo(&cast_kern, PAD_M * DFF * 2, FLAG_HOST_ONLY, gc(4)).unwrap(),
+                    cast_dc: self.dev.alloc_bo(&cast_kern, 1, FLAG_HOST_ONLY, gc(5)).unwrap(),
+                    cast_dt: self.dev.alloc_bo(&cast_kern, 8, FLAG_HOST_ONLY, gc(6)).unwrap(),
+                    cast_dr: self.dev.alloc_bo(&cast_kern, 1, FLAG_HOST_ONLY, gc(7)).unwrap(),
+                    mm_c: Rc::new(self.dev.alloc_bo(&mm_kern, PAD_M * KRES * 4, FLAG_HOST_ONLY, gm(5)).unwrap()),
+                    cast_kern, cast_instr, cast_n, mm_kern, mm_instr, mm_n,
+                })
+            } else {
+                eprintln!("[npu] fc2_k4096 xclbins absent in {} -- one-dispatch fc2 unavailable (build cast_{PAD_M}x{DFF} + {PAD_M}x{DFF}x{KRES} modal)", self.ln_dir.display());
+                None
+            }
+        };
         // conv-module depthwise conv1d (step 3), OPTIONAL. 3-buffer ABI in[C,T]/w[C,16]/out[C,T] bf16.
         let dwconv = {
             let xcl = self.ln_dir.join(format!("final_dwconv_{DW_C}x{DW_T}.xclbin"));
@@ -935,7 +981,7 @@ impl NpuMatmul {
             deint_tmp: self.dev.alloc_bo(&deint_kern, 8, FLAG_HOST_ONLY, gd(6)).unwrap(),
             deint_tr: self.dev.alloc_bo(&deint_kern, 1, FLAG_HOST_ONLY, gd(7)).unwrap(),
             ln_kern, ln_instr, ln_n, ac_kern, ac_instr, ac_n,
-            deint_kern, deint_instr, deint_n, glu, acc_add, resadd_s050, resadd_s100, dwconv, silu, dwconv_silu, dwconv_silu_t,
+            deint_kern, deint_instr, deint_n, glu, acc_add, resadd_s050, resadd_s100, fc2_k4096, dwconv, silu, dwconv_silu, dwconv_silu_t,
         });
         rl
     }
@@ -1549,6 +1595,27 @@ impl NpuMatmul {
         };
         let st1 = self.stream(DFF, self.modal);
         self.kern.run_matmul8(3, &st1.instr, st1.n_instr, &rl.bo_bf16, &w1, &st1.bo_c, &self.bo_tmp, &self.bo_tr).unwrap();
+        // ONE-DISPATCH fc2 (K=DFF): cast fc1's f32 [PAD_M,DFF] -> bf16 row-major, then a SINGLE K=DFF
+        // modal GEMM that accumulates all DFF K internally in L1 -> f32 [PAD_M,KRES] device. Collapses
+        // deint + 4x K=1024 GEMM + 4x acc_add (8 dispatches) into cast + 1 modal (2). NOT bit-identical
+        // to the 4-way split (different L1 accum + bfp16) -> validated by the sound rel-L2 gate.
+        if std::env::var("PARAKEET_FC2_K4096").map(|v| v != "0").unwrap_or(false) {
+            if let Some(k4) = rl.fc2_k4096.as_ref() {
+                k4.cast_kern.run_matmul8(3, &k4.cast_instr, k4.cast_n, &st1.bo_c, &k4.cast_out, &k4.cast_dc, &k4.cast_dt, &k4.cast_dr).unwrap();
+                let wid = format!("{id2}.full");
+                let cached = self.wcache.borrow().get(&wid).cloned();
+                let w2f = if let Some(bo) = cached {
+                    bo
+                } else {
+                    let w = make_w2();
+                    assert_eq!(w.dim(), (DFF, KRES), "fc2 W2 dim");
+                    self.weight_bo(&wid, w.view())
+                };
+                k4.mm_kern.run_matmul8(3, &k4.mm_instr, k4.mm_n, &k4.cast_out, &w2f, &k4.mm_c, &self.bo_tmp, &self.bo_tr).unwrap();
+                self.stats.borrow_mut().dispatches += 3; // fc1 + cast + K=DFF modal
+                return k4.mm_c.clone();
+            }
+        }
         // deinterleave+cast: st1.bo_c (f32 [PAD_M,DFF]) -> rl.bo_deint (bf16 chunk-major), device-side.
         rl.deint_kern.run_matmul8(3, &rl.deint_instr, rl.deint_n, &st1.bo_c, &rl.bo_deint, &rl.deint_c, &rl.deint_tmp, &rl.deint_tr).unwrap();
         self.stats.borrow_mut().dispatches += 2; // fc1 + deint
