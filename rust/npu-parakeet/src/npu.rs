@@ -1524,6 +1524,31 @@ impl NpuMatmul {
     ///   ctxLN -> affine_cast -> modal fc1 (on-chip silu, [t,DFF]) -> cast@DFF (bf16) -> K=DFF fc2
     ///   (identity, on-chip K-reduce, [t,KRES]) -> read [t,KRES] f32.
     /// No host K-split / accumulate. `make_w1` = [KRES,DFF] fc1 weight; `make_w2` = [DFF,KRES] fc2.
+    /// True when the one-dispatch K=DFF fc2 collapse is enabled (opt-in `PARAKEET_FC2_K4096`).
+    fn fc2_k4096_on(&self) -> bool {
+        std::env::var("PARAKEET_FC2_K4096").map(|v| v != "0").unwrap_or(false)
+    }
+
+    /// Shared one-dispatch K=DFF fc2: cast the fc1 output (`fc1_out` f32 [PAD_M,DFF]) to bf16 row-major,
+    /// then ONE K=DFF modal GEMM (internal L1 K-accum over DFF) with the full fc2 weight -> f32
+    /// [PAD_M,KRES] device BO. Counts 2 dispatches (cast + modal); the caller counts fc1. Full fc2
+    /// weight cached under "{id2}.full". Collapses the deint + 4x K=1024 GEMM + 4x acc_add.
+    fn fc2_k4096_dev<F2: FnOnce() -> Array2<f32>>(&self, k4: &Fc2K4096, fc1_out: &Bo, make_w2: F2, id2: &str) -> Rc<Bo> {
+        k4.cast_kern.run_matmul8(3, &k4.cast_instr, k4.cast_n, fc1_out, &k4.cast_out, &k4.cast_dc, &k4.cast_dt, &k4.cast_dr).unwrap();
+        let wid = format!("{id2}.full");
+        let cached = self.wcache.borrow().get(&wid).cloned();
+        let w2f = if let Some(bo) = cached {
+            bo
+        } else {
+            let w = make_w2();
+            assert_eq!(w.dim(), (DFF, KRES), "fc2 W2 dim");
+            self.weight_bo(&wid, w.view())
+        };
+        k4.mm_kern.run_matmul8(3, &k4.mm_instr, k4.mm_n, &k4.cast_out, &w2f, &k4.mm_c, &self.bo_tmp, &self.bo_tr).unwrap();
+        self.stats.borrow_mut().dispatches += 2; // cast + K=DFF modal
+        k4.mm_c.clone()
+    }
+
     pub fn resident_ffn<F1: FnOnce() -> Array2<f32>, F2: FnOnce() -> Array2<f32>>(
         &self, x: &Array2<f32>, gamma: &[f32], beta: &[f32],
         make_w1: F1, id1: &str, make_w2: F2, id2: &str,
@@ -1542,6 +1567,24 @@ impl NpuMatmul {
         };
         let st1 = self.stream(DFF, self.modal);
         self.kern.run_matmul8(3, &st1.instr, st1.n_instr, &rl.bo_bf16, &w1, &st1.bo_c, &self.bo_tmp, &self.bo_tr).unwrap();
+        // ONE-DISPATCH K=DFF fc2 (opt-in): cast@DFF -> K=DFF modal -> readback to host [m,KRES].
+        if self.fc2_k4096_on() {
+            if let Some(k4) = rl.fc2_k4096.as_ref() {
+                self.stats.borrow_mut().dispatches += 1; // fc1
+                let bo = self.fc2_k4096_dev(k4, &st1.bo_c, make_w2, id2);
+                bo.sync_from_device().unwrap();
+                let mut cb = vec![0u8; m * KRES * 4];
+                bo.read_bytes(&mut cb).unwrap();
+                let mut out = Array2::<f32>::zeros((m, KRES));
+                for r in 0..m {
+                    for c in 0..KRES {
+                        let off = (r * KRES + c) * 4;
+                        out[[r, c]] = f32::from_le_bytes([cb[off], cb[off + 1], cb[off + 2], cb[off + 3]]);
+                    }
+                }
+                return out;
+            }
+        }
         // deinterleave+cast: st1.bo_c (f32 [PAD_M,DFF]) -> rl.bo_deint (bf16 [parts,PAD_M,KRES]
         // chunk-major), device-side. One dispatch (chunk-major drain TAP). NOTE: this n-D output DMA
         // HANGS ("run did not complete") when the deint is a co-resident hw-context alongside the
@@ -1599,21 +1642,10 @@ impl NpuMatmul {
         // modal GEMM that accumulates all DFF K internally in L1 -> f32 [PAD_M,KRES] device. Collapses
         // deint + 4x K=1024 GEMM + 4x acc_add (8 dispatches) into cast + 1 modal (2). NOT bit-identical
         // to the 4-way split (different L1 accum + bfp16) -> validated by the sound rel-L2 gate.
-        if std::env::var("PARAKEET_FC2_K4096").map(|v| v != "0").unwrap_or(false) {
+        if self.fc2_k4096_on() {
             if let Some(k4) = rl.fc2_k4096.as_ref() {
-                k4.cast_kern.run_matmul8(3, &k4.cast_instr, k4.cast_n, &st1.bo_c, &k4.cast_out, &k4.cast_dc, &k4.cast_dt, &k4.cast_dr).unwrap();
-                let wid = format!("{id2}.full");
-                let cached = self.wcache.borrow().get(&wid).cloned();
-                let w2f = if let Some(bo) = cached {
-                    bo
-                } else {
-                    let w = make_w2();
-                    assert_eq!(w.dim(), (DFF, KRES), "fc2 W2 dim");
-                    self.weight_bo(&wid, w.view())
-                };
-                k4.mm_kern.run_matmul8(3, &k4.mm_instr, k4.mm_n, &k4.cast_out, &w2f, &k4.mm_c, &self.bo_tmp, &self.bo_tr).unwrap();
-                self.stats.borrow_mut().dispatches += 3; // fc1 + cast + K=DFF modal
-                return k4.mm_c.clone();
+                self.stats.borrow_mut().dispatches += 1; // fc1
+                return self.fc2_k4096_dev(k4, &st1.bo_c, make_w2, id2);
             }
         }
         // deinterleave+cast: st1.bo_c (f32 [PAD_M,DFF]) -> rl.bo_deint (bf16 chunk-major), device-side.
