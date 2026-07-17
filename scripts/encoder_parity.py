@@ -3,8 +3,7 @@
 validating numerically-equivalent changes).
 
 The 17-clip greedy-decode WER is CHAOTIC at ~1e-5: perturbing the SHIPPED encoder by a meaningless
-+-1e-5 per-element noise swings its WER across an ~8.2-9.2 band (see
-docs superpowers plan whole-block-resident-fusion / memory seventeen-clip-wer-gate-is-chaotic). So it
++-1e-5 per-element noise swings its WER across an ~8.2-9.2 band. So the greedy WER on a small clip set
 CANNOT tell a correct device change from the shipped path. This gate instead measures each path's
 distance from the TRUE f32 encoder and asks: is the candidate any further from truth than the shipped
 baseline? (both device paths are ~8.5% off f32 -- the bf16 matmul noise floor.)
