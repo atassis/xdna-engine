@@ -118,6 +118,17 @@ impl FastConformerEncoder {
                     // bit-identical to the host 4xK-split -> WER-NEUTRAL. resident_ff_available() requires the
                     // deint xclbin, so this falls back to the host-fed fc2 (below) when that xclbin is absent.
                     if std::env::var("PARAKEET_RESIDENT_FFN").map(|v| v != "0").unwrap_or(true) {
+                        // GATE (PARAKEET_FFN_DEVACC): accumulate fc2 ON-DEVICE (acc_add brick) then read
+                        // back at the FFN boundary -- ONLY the accumulation moved on-device (block
+                        // dataflow unchanged). A WER-neutral result proves the device-accumulate is
+                        // bit-identical to the host K-split. Falls through to resident_ffn if acc_add absent.
+                        if std::env::var("PARAKEET_FFN_DEVACC").map(|v| v != "0").unwrap_or(false) {
+                            if let Some(out) = npu.resident_ffn_devacc_readback(x, gamma.as_slice().unwrap(), beta.as_slice().unwrap(),
+                                || b.m(l1), &format!("{blk}.{tag}.l1"),
+                                || b.m(l2), &format!("{blk}.{tag}.l2")) {
+                                return out;
+                            }
+                        }
                         return npu.resident_ffn(x, gamma.as_slice().unwrap(), beta.as_slice().unwrap(),
                             || b.m(l1), &format!("{blk}.{tag}.l1"),
                             || b.m(l2), &format!("{blk}.{tag}.l2"));
@@ -227,15 +238,11 @@ impl FastConformerEncoder {
 
     fn mhsa(&self, x: &Array2<f32>, blk: usize, pos_enc: &Array2<f32>) -> Array2<f32> {
         let b = self.w.block(blk);
-        let (h, dk, d) = (self.cfg.n_heads, self.cfg.head_dim, self.cfg.hidden);
         let t = x.nrows();
-        let p = pos_enc.nrows(); // 2T-1
         // mhsa_wprep: materialize each (T'-independent) attention projection weight for its mm().
         // Each `b.m()` clones the whole [D,D]/[P,D] matrix out of the weight map -- pure host data
-        // movement (no math, no device). Now materialized LAZILY inside mm_lazy's closure: on a warm
-        // (weight-BO cache hit) pass the clone never runs, eliminating the per-pass reclone of the
-        // constant qkv/pos/out weights. Only the tiny pos_bias_u/v (consumed later in the score
-        // loop, NOT a cached BO) stay eager, exactly as the original.
+        // movement (no math, no device). Materialized LAZILY inside mm_lazy's closure: on a warm
+        // (weight-BO cache hit) pass the clone never runs, eliminating the per-pass reclone.
         prof::phase::set_stage("mhsa_qkv");
         let q = self.mm_lazy(x, || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_q.weight") }, &format!("{blk}.q")); // [T, D]
         prof::phase::set_stage("mhsa_qkv");
@@ -244,6 +251,41 @@ impl FastConformerEncoder {
         let v = self.mm_lazy(x, || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_v.weight") }, &format!("{blk}.v"));
         prof::phase::set_stage("mhsa_pos");
         let pm = self.mm_lazy(pos_enc, || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_pos.weight") }, &format!("{blk}.pos")); // [P, D]
+        let ctx = self.attention_core(&q, &k, &v, &pm, blk, t);
+        prof::phase::set_stage("mhsa_qkv");
+        self.mm_lazy(&ctx, || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_out.weight") }, &format!("{blk}.out"))
+    }
+
+    /// Device-in MHSA for the fused seam: the attention input is the resident-stream LN output
+    /// `satt_bo` (device bf16 [PAD_M,KRES]); q/k/v are projected DEVICE-IN (no host re-upload of satt).
+    /// pm stays host-in (pos_enc != satt). attention_core runs host; the OUTPUT linear_out lands in a
+    /// DEVICE BO ([`NpuMatmul::matmul_id_to_bo`]) so the MHSA output stays resident for the conv seam.
+    #[cfg(feature = "npu")]
+    fn mhsa_dev(&self, satt_bo: &npu_xrt::Bo, m: usize, blk: usize, pos_enc: &Array2<f32>) -> std::rc::Rc<npu_xrt::Bo> {
+        let b = self.w.block(blk);
+        let npu = self.npu.as_ref().expect("mhsa_dev without npu");
+        let d = self.cfg.hidden;
+        prof::phase::set_stage("mhsa_qkv");
+        let q = npu.proj_from_bf16(satt_bo, m, || b.m("self_attn.linear_q.weight"), &format!("{blk}.q"), d);
+        prof::phase::set_stage("mhsa_qkv");
+        let k = npu.proj_from_bf16(satt_bo, m, || b.m("self_attn.linear_k.weight"), &format!("{blk}.k"), d);
+        prof::phase::set_stage("mhsa_qkv");
+        let v = npu.proj_from_bf16(satt_bo, m, || b.m("self_attn.linear_v.weight"), &format!("{blk}.v"), d);
+        prof::phase::set_stage("mhsa_pos");
+        let pm = self.mm_lazy(pos_enc, || b.m("self_attn.linear_pos.weight"), &format!("{blk}.pos"));
+        let ctx = self.attention_core(&q, &k, &v, &pm, blk, m);
+        prof::phase::set_stage("mhsa_qkv");
+        npu.matmul_id_to_bo(&ctx, || b.m("self_attn.linear_out.weight"), &format!("{blk}.out"), d)
+    }
+
+    /// The attention core shared by the host-in [`Self::mhsa`] and the device-in [`Self::mhsa_dev`]:
+    /// given the projected q/k/v [T,D] and pos-projection pm [P,D], compute rel-pos scores -> softmax
+    /// -> context -> merge -> linear_out. Identical to the pre-refactor mhsa tail (the 3 attention
+    /// variants: resident / conveyor / host score loop).
+    fn attention_core(&self, q: &Array2<f32>, k: &Array2<f32>, v: &Array2<f32>, pm: &Array2<f32>, blk: usize, t: usize) -> Array2<f32> {
+        let b = self.w.block(blk);
+        let (h, dk, d) = (self.cfg.n_heads, self.cfg.head_dim, self.cfg.hidden);
+        let p = pm.nrows(); // 2T-1
         let (ubias, vbias) = {
             let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal);
             (b.m("self_attn.pos_bias_u"), b.m("self_attn.pos_bias_v")) // [H, DK] each
@@ -276,7 +318,23 @@ impl FastConformerEncoder {
                     ctx.slice_mut(s![.., col..col + dk]).assign(&ch);
                 }
                 prof::phase::set_stage("mhsa_qkv");
-                return self.mm_lazy(&ctx, || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_out.weight") }, &format!("{blk}.out"));
+                return ctx; // merged [T,D]; linear_out applied by the caller (mhsa / mhsa_dev)
+            }
+        }
+
+        // CONVEYOR MHA (opt-in PARAKEET_CONVEYOR_MHA=1): replace the per-head relpos_mha LOOP (8
+        // dispatches) with ONE 8-head conveyor dispatch. The host packs the query belt (qu = q+u[h];
+        // BD_shifted = rel_shift((q+v[h]) @ p^T), carriage per PARAKEET_CONVEYOR_BD -- default plain,
+        // see scripts/conveyor_bd_precision_check.py). npu.relpos_mha_conveyor returns merged ctx
+        // [T, D]; the 8-head xclbin dispatch inside it is a TODO stub until the artifact is built
+        // (see CONVEYOR_INTEGRATION_RUNBOOK.md). Falls back to the host score path when unset.
+        #[cfg(feature = "npu")]
+        if std::env::var("PARAKEET_CONVEYOR_MHA").is_ok() {
+            if let Some(npu) = &self.npu {
+                let _h = PhaseScope::new("mhsa_conveyor", Bucket::Npu);
+                let ctx = npu.relpos_mha_conveyor(q, k, v, pm, &ubias, &vbias, h);
+                prof::phase::set_stage("mhsa_qkv");
+                return ctx; // merged [T,D]; linear_out applied by the caller (mhsa / mhsa_dev)
             }
         }
 
@@ -349,11 +407,13 @@ impl FastConformerEncoder {
         }
         ctx
         });
-        prof::phase::set_stage("mhsa_qkv");
-        self.mm_lazy(&ctx, || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_out.weight") }, &format!("{blk}.out"))
+        ctx // merged [T,D]; linear_out applied by the caller (mhsa / mhsa_dev)
     }
 
-    fn conv_module(&self, x: &Array2<f32>, blk: usize) -> Array2<f32> {
+    /// `precomputed_glu`: Some when the caller (the fused seam) already ran the conv front DEVICE-IN
+    /// (LN->pw1->GLU from a device BO) -- then the resident/host front here is skipped and the rest of
+    /// the module (dwconv->silu->pw2) continues from it. None = the normal self-contained conv module.
+    fn conv_module(&self, x: &Array2<f32>, blk: usize, precomputed_glu: Option<Array2<f32>>) -> Array2<f32> {
         let b = self.w.block(blk);
         let d = self.cfg.hidden;
         let t = x.nrows();
@@ -389,7 +449,7 @@ impl FastConformerEncoder {
         // If the glu xclbin is absent, fall back to resident LN->pw1 [T,2D] + host GLU; if the resident seam
         // is off entirely (=0), full host LN + pw1 + host GLU.
         #[cfg(feature = "npu")]
-        let resident_glu = if resident_conv {
+        let resident_glu = if resident_conv && precomputed_glu.is_none() {
             self.npu.as_ref().filter(|n| n.resident_ff_available()).and_then(|npu| {
                 let gamma = b.v("norm_conv.weight");
                 let beta = b.v("norm_conv.bias");
@@ -402,7 +462,9 @@ impl FastConformerEncoder {
         #[cfg(not(feature = "npu"))]
         let resident_glu: Option<Array2<f32>> = None;
 
-        let glu = if let Some(g) = resident_glu {
+        let glu = if let Some(g) = precomputed_glu {
+            g // [T, D] -- conv front already ran DEVICE-IN in the fused seam
+        } else if let Some(g) = resident_glu {
             g // [T, D] -- GLU already applied on-NPU (step 2)
         } else {
             // step-1 resident LN->pw1 if available, else host LN + pw1 GEMM -> h [T, 2D]
@@ -515,6 +577,47 @@ impl FastConformerEncoder {
             let _h = PhaseScope::new("block_io", Bucket::Marshal);
             x.clone()
         };
+        // FUSED-BLOCK seam (opt-in PARAKEET_FUSED_BLOCK): keep the [T,D] activation RESIDENT across
+        // FFN1 -> Macaron residual -> satt-LN -> MHSA q/k/v projections (no host round-trip inside that
+        // frontier). For THIS seam, after MHSA read back to host and rejoin the default conv/FFN2 path.
+        // Falls through to the default path when the fused bricks (acc_add/resadd/resident-ln) are absent.
+        #[cfg(feature = "npu")]
+        if std::env::var("PARAKEET_FUSED_BLOCK").is_ok() {
+            if let Some(npu) = &self.npu {
+                if npu.resident_fused_available() {
+                    let _h = PhaseScope::new("fused_ff1_mhsa", Bucket::Npu);
+                    let m = x.nrows();
+                    let ff1n_g = b.v("norm_feed_forward1.weight");
+                    let ff1n_b = b.v("norm_feed_forward1.bias");
+                    let satt_g = b.v("norm_self_att.weight");
+                    let satt_b = b.v("norm_self_att.bias");
+                    let x_bo = npu.upload_stream(&x);
+                    let ff1_bo = npu.resident_ffn_dev_bo(&x_bo, ff1n_g.as_slice().unwrap(), ff1n_b.as_slice().unwrap(),
+                        || b.m("feed_forward1.linear1.weight"), &format!("{blk}.ff1.l1"),
+                        || b.m("feed_forward1.linear2.weight"), &format!("{blk}.ff1.l2")).expect("resident_ffn_dev_bo");
+                    let x_bo = npu.residual_add_dev(&x_bo, &ff1_bo, 0.5, m).expect("residual_add_dev(0.5)");
+                    let satt_bo = npu.ln_affine_cast_dev_bf16(&x_bo, satt_g.as_slice().unwrap(), satt_b.as_slice().unwrap()).expect("ln_affine_cast_dev");
+                    // MHSA output stays on device (linear_out -> device BO).
+                    let mhsa_out_bo = self.mhsa_dev(&satt_bo, m, blk, pos_enc);
+                    // MHSA residual ON-DEVICE: conv_in = (x + 0.5*ff1) + mhsa_out (scale 1.0), no host round-trip.
+                    let conv_in_bo = npu.residual_add_dev(&x_bo, &mhsa_out_bo, 1.0, m).expect("residual_add_dev(1.0)");
+                    // Conv FRONT device-in: norm_conv LN + pw1 + GLU consume conv_in_bo directly (no host
+                    // round-trip between MHSA and conv); returns the host GLU output for the conv rest.
+                    let conv_g = b.v("norm_conv.weight");
+                    let conv_b = b.v("norm_conv.bias");
+                    let glu = npu.resident_conv_pw1_glu_dev(&conv_in_bo, m, conv_g.as_slice().unwrap(), conv_b.as_slice().unwrap(),
+                        || b.m3("conv.pointwise_conv1.weight").index_axis(Axis(2), 0).to_owned().t().to_owned(), &format!("{blk}.pw1"));
+                    // rejoin host: x = (x + 0.5*ff1) + mhsa_out (the conv residual base), then conv rest / FFN2 / out.
+                    let mut x = npu.readback_stream(&conv_in_bo, m);
+                    let conv_out = prof::time("conv_mod", || self.conv_module(&x, blk, glu));
+                    x = &x + &conv_out;
+                    let ff2 = prof::time("ff", || self.feed_forward(&x, b, blk, "ff2", "norm_feed_forward2.weight", "norm_feed_forward2.bias",
+                                                "feed_forward2.linear1.weight", "feed_forward2.linear2.weight"));
+                    x = x + ff2.mapv(|v| 0.5 * v);
+                    return layernorm(&x, &b.v("norm_out.weight"), &b.v("norm_out.bias"));
+                }
+            }
+        }
         let ff1 = prof::time("ff", || self.feed_forward(&x, b, blk, "ff1", "norm_feed_forward1.weight", "norm_feed_forward1.bias",
                                     "feed_forward1.linear1.weight", "feed_forward1.linear2.weight"));
         {
@@ -531,7 +634,7 @@ impl FastConformerEncoder {
             x = &x + &mhsa_out;
         }
         // conv_module now does its own norm_conv LN (resident seam or host fallback), so pass pre-LN x.
-        let conv_out = prof::time("conv_mod", || self.conv_module(&x, blk));
+        let conv_out = prof::time("conv_mod", || self.conv_module(&x, blk, None));
         {
             let _h = PhaseScope::new("residual", Bucket::Host);
             x = &x + &conv_out;

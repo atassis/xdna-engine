@@ -1,0 +1,37 @@
+##===- Makefile.resadd --------------------------------------------------===##
+#
+# Device-side f32 scaled residual-add xclbin (whole-block-resident fusion). Build:
+#   make -f Makefile.resadd NPU2=1 rows=512 cols=1024 scale=0.5 stag=050 \
+#        build/final_resadd_512x1024_s050.xclbin
+# Produces final_resadd_${rows}x${cols}_s${stag}.xclbin + insts_resadd_${rows}x${cols}_s${stag}.txt.
+# out[t,c] = a[t,c] + scale*b[t,c], f32. `scale` is baked into the MLIR/insts (one xclbin per
+# value); `stag` is the filename tag (050 = 0.5, 100 = 1.0). residual_add.o is scale-independent.
+#
+srcdir := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
+include ${srcdir}/../../makefile-common
+VPATH := ${srcdir}/../../../aie_kernels/aie2p
+
+devicename ?= $(if $(filter 1,$(NPU2)),npu2,npu)
+rows ?= 512
+cols ?= 1024
+scale ?= 0.5
+stag ?= 050
+tag = resadd_${rows}x${cols}_s${stag}
+
+aie_py_src = residual_add_iron.py
+
+all: build/final_${tag}.xclbin
+
+build/residual_add.o: residual_add.cc
+	mkdir -p ${@D}
+	cd ${@D} && ${PEANO_INSTALL_DIR}/bin/clang++ ${PEANOWRAP2P_FLAGS} -c $< -o ${@F}
+
+build/aie_${tag}.mlir: ${srcdir}/${aie_py_src}
+	mkdir -p ${@D}
+	python3 $< -d ${devicename} -r ${rows} -c ${cols} -s ${scale} -t 0 > $@
+
+build/final_${tag}.xclbin: build/aie_${tag}.mlir build/residual_add.o
+	mkdir -p ${@D}
+	cd ${@D} && aiecc --aie-generate-xclbin --aie-generate-npu-insts --no-compile-host \
+		--no-xchesscc --no-xbridge --peano ${PEANO_INSTALL_DIR} \
+		--xclbin-name=${@F} --npu-insts-name=insts_${tag}.txt aie_${tag}.mlir

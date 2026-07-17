@@ -37,3 +37,13 @@ name = "relpos_parity"
 path = "src/bin/relpos_parity.rs"
 required-features = ["npu"]
 
+[[bin]]
+name = "conveyor_parity"
+path = "src/bin/conveyor_parity.rs"
+required-features = ["npu"]
+
+[[bin]]
+name = "fused_seam_parity"
+path = "src/bin/fused_seam_parity.rs"
+required-features = ["npu"]
+

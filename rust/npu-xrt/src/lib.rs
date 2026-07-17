@@ -95,6 +95,18 @@ extern "C" {
         o: *mut CBo,
     ) -> c_int;
     #[allow(clippy::too_many_arguments)]
+    fn shim_run_bd8(
+        k: *mut CKernel,
+        opcode: c_uint,
+        instr: *mut CBo,
+        count: usize,
+        qpv: *mut CBo,
+        p: *mut CBo,
+        kk: *mut CBo,
+        v: *mut CBo,
+        ctx: *mut CBo,
+    ) -> c_int;
+    #[allow(clippy::too_many_arguments)]
     fn shim_run_matmul8_start(
         k: *mut CKernel,
         opcode: c_uint,
@@ -454,6 +466,30 @@ impl Kernel {
         };
         if r != 0 {
             Err(format!("run_mha: {}", last_error()))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Dispatch the BD-onchip conveyor ABI: (opcode, instr, count, qpv, p, k, v, ctx). 5 data BOs
+    /// (the 4th BD stage adds p). Blocks until the run completes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_bd_conveyor(
+        &self,
+        opcode: u32,
+        instr: &Bo,
+        count: usize,
+        qpv: &Bo,
+        p: &Bo,
+        k: &Bo,
+        v: &Bo,
+        ctx: &Bo,
+    ) -> Result<()> {
+        let r = unsafe {
+            shim_run_bd8(self.ptr, opcode, instr.ptr, count, qpv.ptr, p.ptr, k.ptr, v.ptr, ctx.ptr)
+        };
+        if r != 0 {
+            Err(format!("run_bd_conveyor: {}", last_error()))
         } else {
             Ok(())
         }

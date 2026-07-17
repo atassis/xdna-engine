@@ -143,6 +143,18 @@ int shim_run_mha7(ShimKernel* k, unsigned int opcode, ShimBo* instr, size_t inst
   )
 }
 
+// BD-onchip conveyor ABI: (opcode, instr, count, qpv, p, k, v, ctx). 5 data BOs (the 4th conveyor
+// stage adds p), mirroring the IRON rt.sequence(qpv, p, k, v, ctx). Blocks until the run completes.
+int shim_run_bd8(ShimKernel* k, unsigned int opcode, ShimBo* instr, size_t instr_count,
+                 ShimBo* qpv, ShimBo* p, ShimBo* kk, ShimBo* v, ShimBo* ctx) {
+  GUARD_INT(
+    auto run = k->kern(opcode, instr->bo, instr_count, qpv->bo, p->bo, kk->bo, v->bo, ctx->bo);
+    ert_cmd_state st = run.wait();
+    if (st != ERT_CMD_STATE_COMPLETED) { set_err("kernel run did not complete"); return -1; }
+    return 0;
+  )
+}
+
 // xrt::kernel::operator() constructs a run AND starts it (enqueues the command); the wait is
 // separate. So building the run here = the async "start"; the host returns immediately while the
 // NPU executes. Same arg layout as shim_run_matmul8.
