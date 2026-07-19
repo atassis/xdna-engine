@@ -11,10 +11,13 @@
 // <adf.h> dependency, so a fused multi-core K-reduction (mmul + cascade) can be
 // written as an ordinary kernel.
 //
-// STATUS: the int32-vector path below is COMPILE-VERIFIED against
-//   llvm-aie clang (acc2a72c) --target=aie2p-none-unknown-elf (see fix_adf_free_cascade.cc).
-// The acc32 path is the one K-reduction actually wants; it is drafted here and
-// the aie::accum<->v16acc32 native conversion is the one thing to finalize on review.
+// STATUS: BOTH paths below are COMPILE-VERIFIED against
+//   llvm-aie clang (acc2a72c) --target=aie2p-none-unknown-elf (see fix_adf_free_cascade.cc
+//   for the int32 path and test_wrapper.cc for the acc32 round-trip).
+// The accum<->v16acc32 native conversion (the one open detail flagged in PR_DRAFT.md)
+// is resolved via aie_api's own accum interface: accum<acc32,16>::to_native() yields the
+// native v16acc32 the builtin takes, and the implicit accum(storage_t) constructor rebuilds
+// the accum from the builtin's return. No hand-rolled reinterpret_cast is needed.
 #pragma once
 #include <aie_api/aie.hpp>
 
@@ -28,12 +31,15 @@ inline vector<int32_t, 16> cascade_in_i32() {
   return __builtin_aie2p_scd_read_vec(/*conf=*/0);
 }
 
-// --- acc32 cascade (the fused-K-reduction target; finalize accum<->native on review) ---
-// inline void cascade_out(const accum<acc32, 16> &a) {
-//   __builtin_aie2p_mcd_write_acc32(a /* .to_native()? */, 0);
-// }
-// inline accum<acc32, 16> cascade_in_acc32() {
-//   return __builtin_aie2p_scd_read_acc32(0);
-// }
+// --- acc32 cascade (the fused-K-reduction target; compile-verified) ---
+// The partial sums a multi-core K-reduction wants to move travel as accumulators.
+// accum<acc32,16>::to_native() -> v16acc32 (the builtin's V16n arg); the builtin's
+// V16n return -> accum via the implicit accum(storage_t) constructor.
+inline void cascade_out(const accum<acc32, 16> &a) {
+  __builtin_aie2p_mcd_write_acc32(a.to_native(), /*conf=*/0);
+}
+inline accum<acc32, 16> cascade_in_acc32() {
+  return accum<acc32, 16>(__builtin_aie2p_scd_read_acc32(/*conf=*/0));
+}
 
 } // namespace aie

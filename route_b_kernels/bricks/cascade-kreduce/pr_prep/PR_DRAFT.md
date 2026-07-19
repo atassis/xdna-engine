@@ -1,6 +1,6 @@
 # PR-DRAFT (for owner review -- NOT filed): adf-free cascade accessor in aie_api
 
-Status: prepped, verified against source. **Owner-gated: nothing filed.** Decide target repo + voice, then I finalize.
+Status: prepped, verified against source, both int32 and acc32 accessors compile-verified. **Owner-gated: nothing filed.** Only owner policy calls remain (target repo + scope + voice).
 
 ## One-line
 
@@ -19,14 +19,17 @@ builtins. Add a thin adf-free `aie::cascade_out()/cascade_in()` wrapper over tho
 
 1. **Gap reproduced** -- `gap_adf_cascade.cc` (includes `aie_api/aie_adf.hpp`) -> `fatal error: 'adf.h' file not found`.
 2. **Adf-free path exists in the ISA** -- `BuiltinsAIE2P.def` declares `__builtin_aie2p_mcd_write_{acc32,vec}` (put) and `__builtin_aie2p_scd_read_{acc32,vec}` / `scd_ACC2048` / `scd_expand_*` (get). 14 cascade builtins, no adf dependency.
-3. **Fix compiles clean** -- `fix_adf_free_cascade.cc` and `test_wrapper.cc` (using the candidate `aie::cascade_out`/`cascade_in_i32`) both build to a valid AIE2P object with rc=0. Cascade is reachable adf-free; aie_api just doesn't wrap it.
+3. **Fix compiles clean, both element types** -- `fix_adf_free_cascade.cc` and `test_wrapper.cc` build to valid AIE2P objects with rc=0. `test_wrapper.cc` now exercises BOTH round-trips: the int32-vector path (`cascade_out`/`cascade_in_i32`, symbol `t_i32`) and the acc32 path (`cascade_out`/`cascade_in_acc32`, symbol `t_acc32`) -- both symbols emit into the object (`llvm-nm`). Cascade is reachable adf-free; aie_api just doesn't wrap it.
 
 ## Proposed fix
 
 `aie_cascade_bare.hpp` (this dir): a header in `namespace aie` wrapping the `mcd_write`/`scd_read` builtins,
-no `<adf.h>`. The int32-vector accessors are compile-verified. The **acc32 accessors are the ones fused
-K-reduction wants** (partial sums travel as accumulators); the only open detail is the `aie::accum<acc32,16>`
-<-> native `v16acc32` conversion at the builtin boundary -- to finalize on review.
+no `<adf.h>`. Both element types are compile-verified. The **acc32 accessors are the ones fused
+K-reduction wants** (partial sums travel as accumulators), and the `accum<acc32,16>` <-> native `v16acc32`
+conversion at the builtin boundary is now resolved through aie_api's own accum interface: the write uses
+`accum<acc32,16>::to_native()` (yields the `v16acc32` the builtin's `V16n` arg expects), and the read
+feeds the builtin's `v16acc32` return into the implicit `accum(storage_t)` constructor. No hand-rolled
+reinterpret_cast, and it stays inside the public accum API rather than poking at the storage representation.
 
 ## Why it matters
 
