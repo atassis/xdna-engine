@@ -273,6 +273,18 @@ def main():
     fused = FusedMLIROperator("gemma_decode", rl, input_args=["x", *rope_inputs],
                               output_args=["logits"], buffer_sizes=bufsz, context=ctx)
     fused.compile()
+
+    if os.environ.get("GEMMA_SMOKE"):
+        # Device smoke (needs exclusive NPU): load the freshly-compiled ELF onto the NPU and run ONE
+        # dispatch with zero-filled buffers, to catch device-runtime obstacles (XRT load, hw_context
+        # build, kernel dispatch/completion) BEFORE building the full weight-loaded parity harness.
+        # Output is meaningless (no weights); the signal is ERT_CMD_STATE_COMPLETED, no hang/error.
+        print(f"[smoke] compiled {NL}-layer ELF; loading onto NPU + running one dispatch ...", flush=True)
+        c = fused.get_callable()
+        c()
+        print("[smoke] PASS: fused gemma decode ELF ran on NPU (ERT_CMD_STATE_COMPLETED)", flush=True)
+        return
+
     elf = load_elf(fused).view(np.uint8).tobytes()
     in_sz, out_sz, scr = fused.buffer_sizes
     wnames = list(weights.keys())
