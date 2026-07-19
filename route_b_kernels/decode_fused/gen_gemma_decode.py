@@ -114,7 +114,7 @@ def main():
     op_qk_norm = RMSNorm(size=HD, num_aie_columns=1, num_channels=1, tile_size=HD, weighted=True, context=ctx)
     # projections as GEMV (M=out, K=in). bias-free -> no ElementwiseAdd after (simpler than Whisper).
     op_q = GEMV(M=QD, K=D, num_aie_columns=8, tile_size_input=4, tile_size_output=QD // 8, context=ctx)
-    op_kv = GEMV(M=KVD, K=D, num_aie_columns=8, tile_size_input=4, tile_size_output=HD // 2, context=ctx)
+    op_kv = GEMV(M=KVD, K=D, num_aie_columns=8, tile_size_input=4, tile_size_output=KVD // 8, context=ctx)  # GEMMA: tile_size_output must be <= M/cols (=KVD/8); the old HD/2 violated it
     op_o = GEMV(M=D, K=QD, num_aie_columns=8, tile_size_input=4, tile_size_output=D // 8, context=ctx)
     # GEMMA: dual-theta RoPE -- one op shape, TWO angle tables (host precomputes local & global).
     # decode = 1 query token -> rows = heads, angle_rows = 1.
@@ -137,7 +137,11 @@ def main():
     # GEMMA: score scale = query_pre_attn_scalar**-0.5 (== 1/16 here). Elementwise mul by a constant buffer.
     op_scale = ElementwiseMul(size=Hq * S, tile_size=S // 8, num_aie_columns=8, context=ctx)
     # softmax with deep-C runtime width param "sm_mask" (= n_past+1 causal). See NOTE for the window band.
-    op_softmax = Softmax(rows=Hq, cols=S, num_aie_columns=1, num_channels=1, rtp_vector_size=S,
+    # GEMMA: the Softmax op requires rows % 16 == 0, so pad the Hq=4 heads to 16 (mirrors the whisper
+    # gen_decode rows=16). Softmax is per-row, so the 12 dummy rows never touch the real heads; the
+    # scores/scale ops fill only the first Hq rows and op_ctx (num_batches=Hq) reads only the first Hq.
+    SM_ROWS = 16
+    op_softmax = Softmax(rows=SM_ROWS, cols=S, num_aie_columns=1, num_channels=1, rtp_vector_size=S,
                          vector_size_parameter="sm_mask", context=ctx)
     # V transpose per head (for the context GEMV), then context = V^T @ weights.
     op_trv = Transpose(M=S, N=HD, num_aie_columns=2, num_channels=1, m=256, n=32, s=8, context=ctx)
@@ -151,7 +155,10 @@ def main():
     op_down = GEMV(M=D, K=FF, num_aie_columns=8, tile_size_input=4, tile_size_output=D // 8, context=ctx)
     op_add = ElementwiseAdd(size=D, tile_size=D // 8, num_aie_columns=8, context=ctx)
     # tied lm-head: logits = embed @ x_final. VOCAB % 8 == 0 -> no pad.
-    op_head = GEMV(M=VOCAB, K=D, num_aie_columns=8, tile_size_input=4, tile_size_output=VOCAB // 8, context=ctx)
+    # GEMMA: VOCAB=262144 -> tile_size_output=VOCAB//8=32768 makes a 64KB (double-buffered 128KB) C tile
+    # that overflows L1. Split the output finer (VOCAB//64=4096 -> 8KB/tile, 8 iterations/column) so it
+    # fits; correctness-identical, just more passes on the one-shot lm-head.
+    op_head = GEMV(M=VOCAB, K=D, num_aie_columns=8, tile_size_input=4, tile_size_output=VOCAB // 64, context=ctx)
 
     weights = {}   # name -> bf16 array
     bufsz = {}
@@ -191,7 +198,7 @@ def main():
             p + "q": QD * 2, p + "k": KVD * 2, p + "v": KVD * 2,
             p + "kc": Hkv * S * HD * 2, p + "vc": Hkv * S * HD * 2,
             p + "kr": Hq * S * HD * 2, p + "vr": Hq * S * HD * 2, p + "vt": Hq * S * HD * 2,
-            p + "sc": Hq * S * 2, p + "sw": Hq * S * 2,
+            p + "sc": SM_ROWS * S * 2, p + "sw": SM_ROWS * S * 2,   # padded to 16 rows for Softmax (rows%16)
             p + "cx": QD * 2, p + "a": D * 2,
             p + "g": FF * 2, p + "u": FF * 2, p + "gh": FF * 2, p + "d": D * 2,
         })
@@ -212,11 +219,14 @@ def main():
             (op_scv, p + "v", p + "vc"),
             (op_rep_k, p + "kc", p + "kr"),
             (op_rep_v, p + "vc", p + "vr"),
-            (op_scores, p + "kr", p + "q", p + "sc"),
-            (op_scale, p + "sc", "attn_scale", p + "sc"),
+            # GEMMA: sc/sw are padded to SM_ROWS(16) rows for the Softmax rows%16 rule, but scores/scale
+            # /context only touch the first Hq rows -- slice the sub-region so the fused buffer layout
+            # agrees on one size (mirrors whisper gen_decode's scs[0:H*S]). Softmax alone spans all 16.
+            (op_scores, p + "kr", p + "q", f"{p}sc[0:{Hq*S*2}]"),
+            (op_scale, f"{p}sc[0:{Hq*S*2}]", "attn_scale", f"{p}sc[0:{Hq*S*2}]"),
             (op_softmax, p + "sc", p + "sw"),
             *[(op_trv, f"{p}vr[{h*S*HD*2}:{(h+1)*S*HD*2}]", f"{p}vt[{h*S*HD*2}:{(h+1)*S*HD*2}]") for h in range(Hq)],
-            (op_ctx, p + "vt", p + "sw", p + "cx"),
+            (op_ctx, p + "vt", f"{p}sw[0:{Hq*S*2}]", p + "cx"),
             (op_o, p + "Wo", p + "cx", p + "a"),
             # GEMMA: post-attn sandwich norm BEFORE the residual add (un-foldable).
             (op_norm, p + "a", p + "n_pa", p + "a"),
@@ -256,7 +266,11 @@ def main():
         import sys
         sys.exit(0)
 
-    fused = FusedMLIROperator("gemma_decode", rl, input_args=["x", "rope_local", "rope_global"],
+    # Only declare the rope tables actually referenced: with a small --layers (e.g. 2) every layer is
+    # sliding (global is every SW_PATTERN-th, first at layer 5), so rope_global would be an unused input
+    # and the fused layout rejects it. The full 18-layer build declares both.
+    rope_inputs = ["rope_local"] + (["rope_global"] if any(is_global(l) for l in range(NL)) else [])
+    fused = FusedMLIROperator("gemma_decode", rl, input_args=["x", *rope_inputs],
                               output_args=["logits"], buffer_sizes=bufsz, context=ctx)
     fused.compile()
     elf = load_elf(fused).view(np.uint8).tobytes()
