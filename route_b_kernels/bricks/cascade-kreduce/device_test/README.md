@@ -26,10 +26,13 @@ the aie_api accessor instead of raw `put_mcd`/`get_scd`:
 4. Restart decode: `systemctl --user start npu-serve.service`.
 
 ## Risks to check at build/run time (this was prepared blind)
-- **Cascade direction on aie2p**: the topology is mirrored from the npu1
-  cascade_flows test (`cascade_flow(0,3)->(1,3)->(1,2)`). If the aie2p target
-  model routes cascade differently, aiecc/place-tiles will flag it; adjust the
-  tile coords in `cascade.mlir`.
+- **Cascade direction on aie2p**: LARGELY DE-RISKED by source review. The lower-
+  cascade-flows pass requires dst to be East (col+1) or South (row-1) of src;
+  both flows here qualify -- `(0,3)->(1,3)` is East, `(1,3)->(1,2)` is South. And
+  NPU2 (aie2p) inherits AIE2TargetModel with a 512-bit accumulator/cascade
+  (= 16x int32, the accessor's width). So the topology is valid by the pass's own
+  rule and it is the proven-on-aie2 layout. If place-tiles still objects, adjust
+  the tile coords in `cascade.mlir`.
 - **aiecc peano flag**: the `--peano` invocation in build.sh is best-effort;
   cross-check against `cascade_flows/run.lit` + live `aiecc --help` if rejected.
 - **Read-race**: if `buf[5]` reads back as 0/stale, suspect the known unfenced
