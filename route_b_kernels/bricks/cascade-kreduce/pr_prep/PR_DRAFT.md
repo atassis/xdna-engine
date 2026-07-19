@@ -41,14 +41,27 @@ issues `cascade_out`/`cascade_in`, `RUN: %clang ... --target=aie2p ... -c`, `exp
 needed; this is a toolchain-exposure fix. Numerical behavior is covered separately by the on-NPU
 `brick-wave1-device-verify` cascade-kreduce entry.)
 
+## BASE IS STALE -- re-verify before filing
+
+Our `aie_api` submodule is pinned at `2a40805` (2025-02-19, ~5 months old) with remote
+`github.com/jgmelber/aie_api` (a personal fork -- and, notably, what `Xilinx/mlir-aie`'s own `.gitmodules`
+vendors from). Canonical `Xilinx/aie_api` HEAD is `bec000fd`. **Before filing:** re-verify the adf.h gap on
+canonical-latest (5 months of churn may have restructured the cascade path), and rebase the diff there
+([[validate-upstream-pr-against-matching-base]], [[prefer-latest-over-stale-toolchain]]). The gap + evidence
+in this dir are verified only against our stale pin so far.
+
 ## Open decisions for the owner
 
-1. **Target repo.** aie_api is vendored as a submodule; is the fix (a) upstream to the aie_api source, (b) a
-   fork-carried patch in `mlir-aie/third_party/aie_api`, or (c) an IRON-side helper? aie_api's cascade design
-   is ADF-centric, so upstream may prefer an ADF-shaped API -- your call on where this lands and how it's framed.
-2. **Scope.** Ship just the vec+acc accessors, or a fuller `cascade<T>` type matching aie_api conventions?
-3. Voice/base per [[upstream-pr-hygiene]]: ASCII owner voice, base off true upstream/main, validate against a
-   matching base, confirm-before-file.
+1. **Target repo.** `Xilinx/aie_api` (canonical, `bec000fd`) vs `jgmelber/aie_api` (what mlir-aie tracks) vs a
+   fork-carried patch vs an IRON-side helper. You know the upstream relationships; this is your call.
+2. **Scope -- RECOMMENDED: typed free-function accessors, matching the idiom.** aie_api exposes primitives as
+   TYPED FREE-FUNCTION TEMPLATES (`load_v`/`store_v`/`broadcast`), and the ADF cascade dispatches by size with
+   `if constexpr`. So the convention-matching design is `aie::cascade_out<T>(const T&)` / `aie::cascade_in<T>()`
+   templated on the `accum`/`vector` type -> right builtin. NOT a new `cascade<T>` object type (over-building),
+   NOT raw untyped builtins (under-idiomatic). Position it explicitly as the NON-ADF path (does not compete
+   with the existing ADF cascade). Float the API shape in a short issue/RFC PR before the full drop.
+3. Voice/base per [[upstream-pr-hygiene]]: ASCII owner voice, base off canonical upstream/main, validate
+   against a matching base, confirm-before-file.
 
 ## Artifacts in this dir
 `gap_adf_cascade.cc` (repro) - `fix_adf_free_cascade.cc` (adf-free proof) - `aie_cascade_bare.hpp` (candidate fix) - `test_wrapper.cc` (wrapper compile test).
