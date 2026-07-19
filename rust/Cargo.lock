@@ -1037,6 +1037,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "npu-sr"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ndarray",
+ "ndarray-npy",
+ "npu-engine",
+ "npu-weights",
+ "npu-xrt",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "npu-sr-capi"
+version = "0.1.0"
+dependencies = [
+ "cbindgen",
+ "cc",
+ "npu-sr",
+]
+
+[[package]]
 name = "npu-weights"
 version = "0.1.0"
 dependencies = [

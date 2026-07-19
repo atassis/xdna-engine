@@ -1,0 +1,12 @@
+{
+  "name": "espcn",
+  "scale": 3,
+  "arena": "target/test-arenas/espcn.safetensors",
+  "ops": [
+    { "op": "conv2d", "weights": "conv1", "k": 5, "pad": 2, "relu": true,  "cin": 1,  "cout": 64 },
+    { "op": "conv2d", "weights": "conv2", "k": 3, "pad": 1, "relu": true,  "cin": 64, "cout": 64 },
+    { "op": "conv2d", "weights": "conv3", "k": 3, "pad": 1, "relu": true,  "cin": 64, "cout": 32 },
+    { "op": "conv2d", "weights": "conv4", "k": 3, "pad": 1, "relu": false, "cin": 32, "cout": 9  },
+    { "op": "pixel_shuffle", "r": 3 }
+  ]
+}
