@@ -49,7 +49,7 @@ import ml_dtypes
 
 import newstack_compat  # noqa: F401 -- MUST precede iron imports (new-mlir-aie port shim)
 from iron.common import AIEContext
-from iron.common.fusion import FusedMLIROperator, load_elf
+from iron.common.sequence import OperatorSequence  # migrated off the carried iron.common.fusion (FusedMLIROperator)
 from iron.operators.gemv.op import GEMV
 from iron.operators.rms_norm.op import RMSNorm
 from iron.operators.rope.op import RoPE
@@ -270,8 +270,8 @@ def main():
     # sliding (global is every SW_PATTERN-th, first at layer 5), so rope_global would be an unused input
     # and the fused layout rejects it. The full 18-layer build declares both.
     rope_inputs = ["rope_local"] + (["rope_global"] if any(is_global(l) for l in range(NL)) else [])
-    fused = FusedMLIROperator("gemma_decode", rl, input_args=["x", *rope_inputs],
-                              output_args=["logits"], buffer_sizes=bufsz, context=ctx)
+    fused = OperatorSequence("gemma_decode", rl, input_args=["x", *rope_inputs],
+                             output_args=["logits"], buffer_sizes=bufsz, dispatch="fused", context=ctx)
     fused.compile()
 
     if os.environ.get("GEMMA_SMOKE"):
@@ -285,7 +285,66 @@ def main():
         print("[smoke] PASS: fused gemma decode ELF ran on NPU (ERT_CMD_STATE_COMPLETED)", flush=True)
         return
 
-    elf = load_elf(fused).view(np.uint8).tobytes()
+    if os.environ.get("GEMMA_PARITY"):
+        # Weight-loaded greedy token-parity on device vs the host oracle. GEMMA_PARITY=<oracle_dir>
+        # (dir with oracle.json: {prompt_ids, step_argmax}). Needs exclusive NPU. Uses the OperatorSequence
+        # ParameterScratchpad runtime (per-token kv_off/sm_mask) -- unblocked by the rebuilt py3.14 pyxrt.
+        import glob as _glob
+        import struct as _struct
+        oracle = json.load(open(os.path.join(os.environ["GEMMA_PARITY"], "oracle.json")))
+        prompt_ids, step_argmax = oracle["prompt_ids"], oracle["step_argmax"]
+        c = fused.get_callable()
+        # 1) lay all weights + zero KV caches into the scratch arena, sync once.
+        for nm, arr in weights.items():
+            b = c.get_buffer(nm)
+            np.copyto(b.data, np.asarray(arr, BF16).reshape(-1))
+        c.scratch_buffer.to("npu")
+        # 2) pure-Python scratchpad writer (mirrors test_utils::ParameterScratchpad: addr=raw, core=<<2).
+        pp = sorted(_glob.glob(os.path.join(os.getcwd(), "**", "params.txt"), recursive=True), key=os.path.getmtime)
+        params = {}
+        for line in open(pp[-1]).read().splitlines()[1:]:
+            nm, idx, _ty, kind = line.split()
+            params[nm] = (int(idx), kind)
+        import pyxrt as _pyxrt
+        sbo = c.run_handle.get_ctrl_scratchpad_bo()
+        smv = memoryview(sbo.map()).cast("B")           # writable byte view of the ctrl scratchpad
+        def _wp(nm, val):
+            idx, kind = params[nm]
+            enc = ((int(val) << 2) if kind == "core" else int(val)) & 0xFFFFFFFF
+            smv[idx * 4:idx * 4 + 4] = _struct.pack("<I", enc)
+        # 3) rope angle tables (interleaved cos/sin, [S,HD]); Gemma dual base.
+        def rope_tab(base):
+            inv = 1.0 / (base ** (np.arange(0, HD, 2, dtype=np.float64) / HD))
+            fr = np.outer(np.arange(S), inv)                    # [S, HD/2]
+            a = np.empty((S, HD), np.float64); a[:, 0::2] = np.cos(fr); a[:, 1::2] = np.sin(fr)
+            return a.astype(BF16)
+        rl_tab, rg_tab = rope_tab(10000.0), rope_tab(1000000.0)  # local 1e4, global 1e6
+        emb = weights["W_head"].reshape(VOCAB, D)               # tied embedding, bf16
+        norm = float(np.sqrt(D))
+        xin, rloc, rglob, lg = c.get_buffer("x"), c.get_buffer("rope_local"), c.get_buffer("rope_global"), c.get_buffer("logits")
+        # 4) prefill prompt then greedy-decode; compare argmax chain to the oracle.
+        got, tok, npos = [], None, 0
+        gen_steps = len(step_argmax)
+        seq = list(prompt_ids)                                  # positions we FEED
+        for i in range(len(prompt_ids) + gen_steps - 1):
+            t = seq[npos]
+            np.copyto(xin.data, (emb[t].astype(np.float32) * norm).astype(BF16))
+            np.copyto(rloc.data, rl_tab[npos, :rloc.data.size]); np.copyto(rglob.data, rg_tab[npos, :rglob.data.size])
+            _wp("kv_off", npos * HD); _wp("sm_mask", npos + 1)
+            sbo.sync(_pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
+            c()
+            nt = int(np.argmax(lg.data[:VOCAB].astype(np.float32)))
+            if npos >= len(prompt_ids) - 1:                     # logits after the last prompt tok = gen[0]
+                got.append(nt); seq.append(nt)
+            npos += 1
+        match = sum(1 for a, b in zip(got, step_argmax) if a == b)
+        print(f"[parity] oracle: {step_argmax}", flush=True)
+        print(f"[parity] device: {got}", flush=True)
+        print(f"[parity] {match}/{len(step_argmax)} tokens match" + (" -- PASS" if match == len(step_argmax) else ""), flush=True)
+        return
+
+    # migrated off fusion.load_elf: read the built full-ELF straight from the sequence's artifact.
+    elf = np.fromfile(fused.artifacts[0].filename, dtype=np.uint32).view(np.uint8).tobytes()
     in_sz, out_sz, scr = fused.buffer_sizes
     wnames = list(weights.keys())
     lay = {n: fused.get_layout_for_buffer(n) for n in ["x", "logits"] + wnames}
