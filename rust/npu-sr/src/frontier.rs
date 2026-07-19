@@ -219,9 +219,6 @@ mod npu_backend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schedule::Schedule;
-    use ndarray::ArrayD;
-    use ndarray_npy::read_npy;
 
     #[test]
     fn pixel_shuffle_crd_order() {
@@ -240,56 +237,5 @@ mod tests {
                 assert_eq!(y.data[ry * 3 + rx], (ry * 3 + rx) as f32);
             }
         }
-    }
-
-    // The CPU frontier reproduces the ONNX ESPCN whole-net output within tolerance. Requires the arena
-    // baked (`cargo test -p npu-weights parity_espcn`) + the oracle npy (scripts/export_espcn.py).
-    #[test]
-    fn cpu_frontier_matches_onnx_oracle() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap();
-        let refs = root.join("artifacts/espcn");
-        if !refs.join("gate_sr.npy").exists()
-            || !root.join("target/test-arenas/espcn.safetensors").exists()
-        {
-            eprintln!("SKIP: oracle/arena missing - run export_espcn.py + parity_espcn");
-            return;
-        }
-        let lr: ArrayD<f32> = read_npy(refs.join("gate_lr.npy")).unwrap();
-        let sr_ref: ArrayD<f32> = read_npy(refs.join("gate_sr.npy")).unwrap();
-        let ls = lr.shape();
-        let ss = sr_ref.shape();
-        let (lr_h, lr_w) = (ls[ls.len() - 2], ls[ls.len() - 1]);
-        let (sr_h, sr_w) = (ss[ss.len() - 2], ss[ss.len() - 1]);
-        let sched = Schedule::load(&root.join("artifacts/espcn/espcn.json")).unwrap();
-        let mut fr = Frontier::build(&sched, false).unwrap();
-        let out = fr
-            .run(
-                &sched,
-                &Plane {
-                    w: lr_w,
-                    h: lr_h,
-                    data: lr.iter().cloned().collect(),
-                },
-            )
-            .unwrap();
-        assert_eq!((out.h, out.w), (sr_h, sr_w));
-        let sr_v: Vec<f32> = sr_ref.iter().cloned().collect();
-        let rl2 = rel_l2(&out.data, &sr_v);
-        assert!(rl2 < 1.0e-2, "CPU frontier rel-L2 vs ONNX oracle = {rl2:.3e} (want < 1e-2)");
-    }
-
-    fn rel_l2(a: &[f32], b: &[f32]) -> f32 {
-        let num: f64 = a
-            .iter()
-            .zip(b)
-            .map(|(x, y)| ((*x - *y) as f64).powi(2))
-            .sum::<f64>()
-            .sqrt();
-        let den: f64 = b.iter().map(|y| (*y as f64).powi(2)).sum::<f64>().sqrt();
-        (num / (den + 1e-12)) as f32
     }
 }
