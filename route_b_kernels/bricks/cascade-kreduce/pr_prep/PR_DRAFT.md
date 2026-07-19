@@ -58,14 +58,29 @@ follow-on is an ENHANCEMENT, never a correction of PR 1; opt-in ("if there's int
 dictated to the maintainers; grounded in the K-reduction use case; invites their design ownership. Do NOT
 over-promise or make merge of PR 1 contingent on PR 2.
 
-## BASE IS STALE -- re-verify before filing
+## CANONICAL RE-VERIFY (done 2026-07-19) -- the fix is DESIGN-LEVEL, RFC-first
 
-Our `aie_api` submodule is pinned at `2a40805` (2025-02-19, ~5 months old) with remote
-`github.com/jgmelber/aie_api` (a personal fork -- and, notably, what `Xilinx/mlir-aie`'s own `.gitmodules`
-vendors from). Canonical `Xilinx/aie_api` HEAD is `bec000fd`. **Before filing:** re-verify the adf.h gap on
-canonical-latest (5 months of churn may have restructured the cascade path), and rebase the diff there
-([[validate-upstream-pr-against-matching-base]], [[prefer-latest-over-stale-toolchain]]). The gap + evidence
-in this dir are verified only against our stale pin so far.
+Re-verified against a fresh clone of canonical `Xilinx/aie_api` `bec000f` ("Sync to latest 2026.1",
+2026-05-13): **gap CONFIRMED** -- `adf/stream.hpp:12` still `#include <adf.h>` (moved from :10, minor reorg),
+`adf.h` still unvendored, no adf-free cascade primitive added upstream.
+
+**But canonical code shows the mergeable fix is bigger than a wrapper:**
+- aie_api's cascade is ADF-NATIVE throughout -- the only surface is `readincr_v<N>(input_cascade)` /
+  `writeincr(output_cascade,...)` over ADF stream TYPES (adf.hpp: `accum<acc48,8> = readincr_v<8>(input_cascade)`).
+  No framework-agnostic cascade primitive exists to extend.
+- aie_api NEVER calls `__builtin_aie2p_*` (0 in detail/). Intrinsics are feature-macro-guarded
+  (`__AIE_API_HAS_*`), multi-COMPILER (chess + peano) and multi-ARCH (aie2/2p/2ps). Our PoC calls the raw
+  Peano builtin -> compiles, but is NOT idiomatic and would fail under chess / other arches.
+- => an adf-free cascade primitive is a NEW intrinsic-access path across their compiler x arch matrix =
+  maintainer-design territory, not a droppable diff.
+
+**Split the deliverable:**
+1. **Canonical `Xilinx/aie_api` -> RFC/issue FIRST** (owner target choice, confirmed). Document the gap +
+   show the adf-free path is reachable (PoC = evidence) + ask how they'd structure an adf-free cascade
+   primitive across chess/peano/arch. NOT a code PR until they weigh in. (Note: `Xilinx/aie_api` reads as a
+   periodic release-sync MIRROR, so the channel may be issue + internal port, not a direct merge -- confirm.)
+2. **Our flow -> fork-carried patch** in `mlir-aie/third_party/aie_api` (aie2p/peano only), the builtin
+   wrapper here, to unblock K-reduction now -- explicitly separate from the upstream RFC.
 
 ## Open decisions for the owner
 
