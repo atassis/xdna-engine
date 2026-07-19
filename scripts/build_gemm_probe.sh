@@ -32,8 +32,8 @@ GEN="$REPO/route_b_kernels/decode_fused/gen_gemm_probe.py"
 # Require the checkout to be on it (gemm-fusion-prefix needed for any GEMM under FusedMLIROperator;
 # m-stationary is the opt-in --m-stationary mode, default N-stationary unchanged).
 on="$(git -C "$IRON" rev-parse --abbrev-ref HEAD 2>/dev/null)"
-[ "$on" = xdna2-asr ] || { echo "ERROR: $IRON must be on xdna2-asr (got '$on'). Run: git -C \"$IRON\" checkout xdna2-asr"; exit 1; }
-echo "[build] IRON on xdna2-asr @ $(git -C "$IRON" rev-parse --short HEAD)"
+case "$on" in integration-stack|xdna2-asr) ;; *) echo "ERROR: $IRON must be on integration-stack (or legacy xdna2-asr); got '$on'. Run: git -C \"$IRON\" checkout integration-stack"; exit 1;; esac
+echo "[build] IRON on $on @ $(git -C "$IRON" rev-parse --short HEAD)"
 
 export PATH="$VENV_IRON/bin:$VENV_IRON/cc-shim:$AIEBU_DIR:$PATH"
 export PEANO_INSTALL_DIR="$VENV_IRON/lib/python3.14/site-packages/llvm-aie"
