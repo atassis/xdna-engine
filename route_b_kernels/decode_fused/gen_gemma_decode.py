@@ -110,8 +110,8 @@ def main():
 
     # ---- op vocabulary (created ONCE, reused across all layers; same dims per layer) ----
     # GEMMA: weighted RMSNorm. Body norm (size D) and the per-head q/k norm (size HD) are separate ops.
-    op_norm = RMSNorm(size=D, num_aie_columns=1, num_channels=1, tile_size=D, weighted=True, context=ctx)
-    op_qk_norm = RMSNorm(size=HD, num_aie_columns=1, num_channels=1, tile_size=HD, weighted=True, context=ctx)
+    op_norm = RMSNorm(size=D, num_aie_columns=1, num_channels=1, tile_size=D, weighted=True, epsilon=EPS, context=ctx)
+    op_qk_norm = RMSNorm(size=HD, num_aie_columns=1, num_channels=1, tile_size=HD, weighted=True, epsilon=EPS, context=ctx)
     # projections as GEMV (M=out, K=in). bias-free -> no ElementwiseAdd after (simpler than Whisper).
     op_q = GEMV(M=QD, K=D, num_aie_columns=8, tile_size_input=4, tile_size_output=QD // 8, context=ctx)
     op_kv = GEMV(M=KVD, K=D, num_aie_columns=8, tile_size_input=4, tile_size_output=HD // 2, context=ctx)
