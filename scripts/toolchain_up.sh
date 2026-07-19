@@ -63,10 +63,23 @@ if [ ! -e "$SRC/tools/aiecc/aiecc.cpp" ]; then
   git -C "$REPO/mlir-aie" cat-file -e "${MLIR_AIE_FORK_COMMIT}^{commit}" 2>/dev/null \
     || git -C "$REPO/mlir-aie" fetch -q fork "$MLIR_AIE_FORK_COMMIT"
   git -C "$REPO/mlir-aie" worktree add -q --detach "$SRC" "$MLIR_AIE_FORK_COMMIT" >&2
-  # The worktree has empty nested-submodule dirs; point them at the submodule's populated, validated versions
-  # (version-stable build deps: cmake helpers, aie-rt/xaiengine, bootgen, aie_api). Symlink avoids worktree+
-  # submodule object-store quirks and reuses exactly what the validated build linked.
+  # Point the worktree's empty nested-submodule dirs at the main checkout's populated versions -- but FIRST
+  # pin each to the exact commit MLIR_AIE_FORK_COMMIT records for it. These deps are NOT version-stable:
+  # bumping the pin can bump a submodule (e.g. aie-rt 6a15e48 -> e2aca220), and mlir-aie's own vendor
+  # patches (third_party/patches/aie-rt/*.patch) only apply to the pinned version -- symlinking a stale
+  # main-checkout submodule then fails `apply_aie_rt_vendor_patches` at CMake time. The pin is authoritative.
   for nested in cmake/modulesXilinx third_party/aie-rt third_party/bootgen third_party/aie_api; do
+    git -C "$REPO/mlir-aie" ls-tree "$MLIR_AIE_FORK_COMMIT" "$nested" >/dev/null 2>&1 || continue
+    want=$(git -C "$REPO/mlir-aie" rev-parse "${MLIR_AIE_FORK_COMMIT}:$nested" 2>/dev/null) || continue
+    # fresh clone: the submodule dir is empty/uninitialized -> init it so it has an object store to pin
+    [ -e "$REPO/mlir-aie/$nested/.git" ] || git -C "$REPO/mlir-aie" submodule update --init -- "$nested" >/dev/null 2>&1 || true
+    cur=$(git -C "$REPO/mlir-aie/$nested" rev-parse HEAD 2>/dev/null || echo none)
+    if [ "$want" != "$cur" ]; then
+      git -C "$REPO/mlir-aie/$nested" cat-file -e "${want}^{commit}" 2>/dev/null \
+        || git -C "$REPO/mlir-aie/$nested" fetch -q origin "$want" 2>/dev/null || true
+      git -C "$REPO/mlir-aie/$nested" checkout -q --force --detach "$want" 2>/dev/null \
+        || echo "[toolchain_up] WARN: could not pin $nested to ${want:0:10} (have ${cur:0:10}); build may fail" >&2
+    fi
     [ -e "$REPO/mlir-aie/$nested" ] && { rm -rf "$SRC/$nested"; ln -sfn "$REPO/mlir-aie/$nested" "$SRC/$nested"; }
   done
   bash "$REPO/scripts/sync_kernels.sh" "$SRC" >&2
