@@ -41,6 +41,23 @@ issues `cascade_out`/`cascade_in`, `RUN: %clang ... --target=aie2p ... -c`, `exp
 needed; this is a toolchain-exposure fix. Numerical behavior is covered separately by the on-NPU
 `brick-wave1-device-verify` cascade-kreduce entry.)
 
+## Future work (PR-body text -- goes in the description; NOT a commitment)
+
+> This PR is deliberately the minimal, non-ADF accessor for the raw cascade put/get -- enough for a
+> bare-metal / IRON kernel to hand-write a cross-core reduction, which is not possible through aie_api today.
+> It stands on its own: it exposes a capability that is simply missing outside the ADF flow.
+>
+> A natural follow-on -- which I'd be glad to raise as a separate RFC if there's interest -- is folding the
+> cascade into the `mmul` / `accum` path so multi-core K-reduction fuses natively (today it lowers to
+> buffer-copy + software-add). The hand-written reduction this accessor enables is exactly the instance that
+> would inform that larger design, so it makes sense to land this first and discuss the fused form separately.
+> Happy to align on the API shape (typed free functions vs a typed port type) before expanding.
+
+Tone rules for this footer (per [[upstream-pr-hygiene]]): PR 1 is complete-and-valuable on its own; the
+follow-on is an ENHANCEMENT, never a correction of PR 1; opt-in ("if there's interest"), not a roadmap
+dictated to the maintainers; grounded in the K-reduction use case; invites their design ownership. Do NOT
+over-promise or make merge of PR 1 contingent on PR 2.
+
 ## BASE IS STALE -- re-verify before filing
 
 Our `aie_api` submodule is pinned at `2a40805` (2025-02-19, ~5 months old) with remote
