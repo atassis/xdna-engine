@@ -343,6 +343,20 @@ def main():
         print(f"[parity] {match}/{len(step_argmax)} tokens match" + (" -- PASS" if match == len(step_argmax) else ""), flush=True)
         return
 
+    if os.environ.get("DUMP_LAYOUT"):
+        # host-only: is a node buffer's arena region reused by a LATER-written buffer (-> post-run read is
+        # an alias, not the node's value)? Print overlaps for the DIAG nodes.
+        lay = {n: fused.get_layout_for_buffer(n) for n in fused.subbuffer_layout}
+        def rng(n):
+            t, o, l = lay[n]; return (t, o, o + l)
+        for probe in ["L0_hn", "L0_q", "L0_k", "L0_v"]:
+            if probe not in lay:
+                continue
+            pt, ps, pe = rng(probe)
+            over = [n for n in lay if n != probe and rng(n)[0] == pt and rng(n)[1] < pe and rng(n)[2] > ps]
+            print(f"[layout] {probe} = {pt}[{ps}:{pe}]  overlaps: {over}", flush=True)
+        return
+
     if os.environ.get("GEMMA_DIAG"):
         # Per-node rel-L2: run ONE forward at DIAG_POS (default 0, where RoPE is identity so norm/GEMV/
         # qk-norm are isolated) with token DIAG_TOK (default BOS=2), read layer-0 node buffers from the
