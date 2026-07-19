@@ -38,13 +38,16 @@ echo "== [2/3] aiecc -> cascade.xclbin + insts.bin (peano backend) =="
 # invocation is rejected, compare against mlir-aie/test/npu-xrt/cascade_flows/run.lit
 # and the live aiecc --help for the current peano flag.
 cd "$HERE"
-"$AIECC" --no-aiesim --peano "$PEANO_INSTALL_DIR" \
+# --no-xchesscc: compile AND link with Peano (disables xbridge/chess). Without
+# it aiecc falls back to the chess toolchain (chess-llvm-link), which is absent.
+"$AIECC" --no-aiesim --no-xchesscc --peano "$PEANO_INSTALL_DIR" \
   --aie-generate-xclbin --aie-generate-npu-insts --no-compile-host \
   --xclbin-name=cascade.xclbin --npu-insts-name=insts.bin \
   cascade.mlir
 
 echo "== [3/3] build the host test (XRT) =="
-"${HOST_CXX:-clang++}" "$HERE/test.cpp" -o "$HERE/test.exe" -std=c++17 -Wall \
+"${HOST_CXX:-clang++}" "$HERE/test.cpp" "$TEST_LIB/test_utils.cpp" -o "$HERE/test.exe" \
+  -std=c++17 -Wall \
   -I"$TEST_LIB" -I"${XRT_INC_DIR:-/usr/include}" \
   -L"${XRT_LIB_DIR:-/usr/lib}" \
   -lxrt_coreutil -luuid -lstdc++ -ldl -lrt -lpthread

@@ -13,11 +13,15 @@ the aie_api accessor instead of raw `put_mcd`/`get_scd`:
   accessor. (Structure mirrors mlir-aie `test/npu-xrt/cascade_flows`, retargeted
   to aie2p and routed through the typed accessor.)
 
-## Status (prepared, NOT yet run on device)
-- The 3 kernels COMPILE CLEAN for aie2p (Peano + fork aie_api) and emit the real
-  cascade moves (`vmov mcd,x0` / `vmov x0,scd`) -- verified on CPU.
-- `cascade.mlir` (device `npu2_2col`), `test.cpp` (host), `build.sh`, `run.sh`
-  are ready. The xclbin build + on-silicon run are the remaining step.
+## Status: DEVICE-VALIDATED (PASS on aie2p, 2026-07-19)
+- Ran on the aie2p NPU: `index 5: 214 == 214`, `PASS!`, stable across 3 runs (no
+  read-race flakiness). The value propagated 14 -> 114 -> 214 through two cascade
+  hops via `aie::cascade_out` / `aie::cascade_in_i32`. This is the on-silicon
+  validation of the aie_api cascade accessor.
+- The 3 kernels compile clean for aie2p (Peano + fork aie_api) and emit the real
+  cascade moves (`vmov mcd,x0` / `vmov x0,scd`).
+- `build.sh` builds the xclbin end-to-end with Peano (`--no-xchesscc`); place-tiles
+  accepted the `npu2_2col` cascade_flow topology (risk #1 confirmed on-toolchain).
 
 ## To run (in a coordinated device window)
 1. Pause the decode session (shared NPU + shared toolchain): `systemctl --user stop npu-serve.service`.
