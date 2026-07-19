@@ -17,6 +17,11 @@ Discovered port deltas (keep this list as the canonical record):
      whose design.py the deep-C patch already ported, so this delta surfaced only when GEMM was first
      built on the new stack for the lever-3 batching probe). We rename the kwarg at call time so the
      unported GEMM design.py runs unchanged. No-op on the old stack (this branch never runs there).
+  3. The device geometry helpers `get_shim_tiles` / `get_num_connections` / `get_mem_tiles` were all
+     removed (hunhoffe #3213 moved placement into the compiler placer), breaking amd/IRON's
+     `get_shim_dma_limit`. We patch `iron.common.utils.get_shim_dma_limit` to derive the ShimDMA
+     budget from the surviving `dev._tm` (AIETargetModel): (#shim tiles) * 2 output channels = 16 on
+     NPU2. See the block below for the validation. No-op on the old stack.
 """
 import functools
 import sys
@@ -70,17 +75,40 @@ except ImportError:
     ):
         setattr(_cls, _meth, _rename_placement(getattr(_cls, _meth)))
 
-    # Delta 3: the device method `get_num_connections(tile, output)` was removed from the aie.iron
-    # device object between the e4f35d6 wheel (Mar-2026, HAS it) and current upstream (Jun, removed it);
-    # `get_shim_tiles` survived. amd/IRON's `get_shim_dma_limit` (iron/common/utils.py, added by #114 in
-    # May) sums it across shim tiles to size the ShimDMA budget. Restore it with the AIE2P/NPU2 hardware
-    # constants -- verified against the wheel: shim/compute tiles expose 2 DMA channels per direction, mem
-    # tiles 6. No-op on the old stack (this whole branch only runs where aie.iron.placers is absent).
+    # Delta 3: amd/IRON's per-tile device-geometry helpers were deleted upstream -- hunhoffe's #3213
+    # (+ 789e8bc1dc3) moved placement into the compiler placer, so the NPU2 device object lost BOTH
+    # `get_shim_tiles` AND `get_num_connections`, and the older-wheel shim that once restored the latter
+    # leaned on `get_mem_tiles`, itself now gone. amd/IRON's `get_shim_dma_limit`
+    # (iron/common/utils.py, added by #114) is `sum(get_num_connections(t, output=True) for t in
+    # get_shim_tiles())` -- it crashes on all three at the current pins (fb1f7095 and fa85bb34).
+    # Fix at the source (do NOT resurrect the deleted per-tile methods): derive the ShimDMA budget
+    # purely from the device target model `dev._tm` (an `aie._mlir_libs._aie.AIETargetModel`, which
+    # survived). Each shim tile exposes 2 ShimDMA output (MM2S) channels on AIE2P/NPU2 (validated vs
+    # the e4f35d6 wheel: 2 DMA channels/direction); the budget is (#shim tiles) * 2. Verified on both
+    # pins: NPU2 has 8 shim tiles -> 16, identical to the wheel's native sum. Note `_tm.columns()` /
+    # `_tm.rows()` are methods, and `is_shim_noc_or_pl_tile(col,row)` is on `_tm`, not the device.
+    # No-op on the old stack (this whole branch only runs where aie.iron.placers is absent).
+    import iron.common.utils as _iron_utils
+
+    def _get_shim_dma_limit(dev):
+        tm = dev._tm
+        cols, rows = tm.columns(), tm.rows()
+        n_shim = sum(
+            1
+            for c in range(cols)
+            for r in range(rows)
+            if tm.is_shim_noc_or_pl_tile(c, r)
+        )
+        return n_shim * 2  # 2 ShimDMA output channels per shim tile (AIE2P/NPU2)
+
+    _iron_utils.get_shim_dma_limit = _get_shim_dma_limit
+
+    # Belt-and-suspenders: if any other op path still calls the removed `get_num_connections`,
+    # provide it deriving mem-tile rows from `_tm` (the old shim's `get_mem_tiles()` is also gone).
     from aie.iron.device import NPU2 as _NPU2
 
     def _get_num_connections(self, tile, output=True):
-        mem_rc = {(t.col, t.row) for t in self.get_mem_tiles()}
-        return 6 if (tile.col, tile.row) in mem_rc else 2
+        return 6 if self._tm.is_mem_tile(tile.col, tile.row) else 2
 
     if not hasattr(_NPU2(), "get_num_connections"):
         _NPU2.get_num_connections = _get_num_connections
