@@ -4,6 +4,7 @@
 pub mod schedule;
 pub mod color;
 pub mod frontier;
+pub mod pipeline;
 
 use std::path::Path;
 
@@ -64,6 +65,18 @@ impl SrEngine {
     /// The schedule's integer scale factor (e.g. 3 for ESPCN x3).
     pub fn scale(&self) -> usize {
         self.sched.scale
+    }
+
+    /// Upscale a whole video file (the CLI path): decode -> upscale -> encode via ffmpeg. Returns timing.
+    pub fn upscale_file(
+        &mut self,
+        input: impl AsRef<Path>,
+        output: impl AsRef<Path>,
+    ) -> Result<pipeline::Stats, SrError> {
+        let start = std::time::Instant::now();
+        pipeline::upscale_file(self, input.as_ref(), output.as_ref(), move || {
+            start.elapsed().as_secs_f64() * 1000.0
+        })
     }
 }
 

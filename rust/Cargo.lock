@@ -1041,6 +1041,7 @@ name = "npu-sr"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "clap",
  "ndarray",
  "ndarray-npy",
  "npu-engine",
