@@ -343,6 +343,57 @@ def main():
         print(f"[parity] {match}/{len(step_argmax)} tokens match" + (" -- PASS" if match == len(step_argmax) else ""), flush=True)
         return
 
+    if os.environ.get("GEMMA_DIAG"):
+        # Per-node rel-L2: run ONE forward at DIAG_POS (default 0, where RoPE is identity so norm/GEMV/
+        # qk-norm are isolated) with token DIAG_TOK (default BOS=2), read layer-0 node buffers from the
+        # scratch arena, and compare to a host f32 reference to LOCALIZE the first divergence. Needs NPU.
+        import glob as _glob, struct as _struct, pyxrt as _pyxrt
+        f32 = lambda a: np.asarray(a).astype(np.float32)
+        pos = int(os.environ.get("DIAG_POS", "0")); tok = int(os.environ.get("DIAG_TOK", "2"))
+        c = fused.get_callable()
+        for nm, arr in weights.items():
+            np.copyto(c.get_buffer(nm).data, np.asarray(arr, BF16).reshape(-1))
+        c.scratch_buffer.to("npu")
+        pp = sorted(_glob.glob(os.path.join(os.getcwd(), "**", "params.txt"), recursive=True), key=os.path.getmtime)
+        prm = {ln.split()[0]: (int(ln.split()[1]), ln.split()[3]) for ln in open(pp[-1]).read().splitlines()[1:] if ln.strip()}
+        sbo = c.run_handle.get_ctrl_scratchpad_bo(); smv = memoryview(sbo.map()).cast("B")
+        def _wp(nm, val):
+            idx, kind = prm[nm]; smv[idx*4:idx*4+4] = _struct.pack("<I", (((val << 2) if kind == "core" else val) & 0xFFFFFFFF))
+        def rope_tab(base):
+            inv = 1.0 / (base ** (np.arange(0, HD, 2, dtype=np.float64) / HD)); fr = np.outer(np.arange(S), inv)
+            a = np.empty((S, HD)); a[:, 0::2] = np.cos(fr); a[:, 1::2] = np.sin(fr); return a
+        emb = weights["W_head"].reshape(VOCAB, D)
+        x0 = f32(emb[tok]) * float(np.sqrt(D))
+        np.copyto(c.get_buffer("x").data, x0.astype(BF16))
+        rlt, rgt = rope_tab(10000.0), rope_tab(1000000.0)
+        np.copyto(c.get_buffer("rope_local").data, rlt[pos, :c.get_buffer("rope_local").data.size].astype(BF16))
+        if "rope_global" in fused.input_args:
+            np.copyto(c.get_buffer("rope_global").data, rgt[pos, :c.get_buffer("rope_global").data.size].astype(BF16))
+        _wp("kv_off", pos*HD); _wp("sm_mask", pos+1); sbo.sync(_pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
+        c(); c.scratch_buffer.to("cpu")
+        # ---- host f32 reference for layer 0 (up to attention input) ----
+        def wrms(x, w1p): x = f32(x); return (x / np.sqrt(np.mean(x*x) + EPS)) * f32(w1p)   # w1p already = 1+w
+        def gemv(W, x, M, K): return f32(W).reshape(M, K) @ f32(x)
+        hn = wrms(x0, weights["L0_n_in"])
+        qh = gemv(weights["L0_Wq"], hn, QD, D).reshape(Hq, HD)
+        kh = gemv(weights["L0_Wk"], hn, KVD, D).reshape(Hkv, HD)
+        vh = gemv(weights["L0_Wv"], hn, KVD, D)
+        qh = np.stack([wrms(qh[h], weights["L0_n_qn"]) for h in range(Hq)])
+        kh = np.stack([wrms(kh[h], weights["L0_n_kn"]) for h in range(Hkv)])
+        def rope_half(v1, ang):     # v:[...,HD], ang:[HD] interleaved cos/sin; half-split rotation
+            cos, sin = ang[0::2], ang[1::2]; a, b = v1[..., :HD//2], v1[..., HD//2:]
+            out = np.empty_like(v1); out[..., :HD//2] = a*cos - b*sin; out[..., HD//2:] = a*sin + b*cos; return out
+        ang = (rgt if is_global(0) else rlt)[pos]
+        qh = np.stack([rope_half(qh[h], ang) for h in range(Hq)]).reshape(-1)
+        kh = np.stack([rope_half(kh[h], ang) for h in range(Hkv)]).reshape(-1)
+        def rel(name, host):
+            dev = f32(c.get_buffer(name).data[:host.size])
+            n = np.linalg.norm(host); r = np.linalg.norm(dev - host) / (n if n else 1.0)
+            print(f"[diag] {name:8} rel-L2 = {r:.4f}  {'OK' if r < 0.06 else '<-- DIVERGES' }  (|host|={n:.3f} |dev|={np.linalg.norm(dev):.3f})", flush=True)
+        print(f"[diag] pos={pos} tok={tok} (RoPE {'identity' if pos==0 else 'active'}); layer-0 nodes:", flush=True)
+        rel("L0_hn", hn); rel("L0_v", vh); rel("L0_q", qh); rel("L0_k", kh)
+        return
+
     # migrated off fusion.load_elf: read the built full-ELF straight from the sequence's artifact.
     elf = np.fromfile(fused.artifacts[0].filename, dtype=np.uint32).view(np.uint8).tobytes()
     in_sz, out_sz, scr = fused.buffer_sizes
