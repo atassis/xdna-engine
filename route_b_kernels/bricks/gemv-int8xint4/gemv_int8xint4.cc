@@ -118,7 +118,10 @@ void gemv_int8xint4(const int8 *restrict a, const int4 *restrict b, int32_t *res
       }
       ::aie::vector<int8, MMUL::size_A> A = ::aie::load_v<MMUL::size_A>(a_stage);
 
-      const int4 *b_block = b + (static_cast<size_t>(kt) * kNTiles + nt) * (GEMV_K_NATIVE * GEMV_N_NATIVE);
+      // (K_NATIVE*N_NATIVE)/2 bytes/block: int4* advances 1 byte/lane on Peano,
+      // and a contiguously packed 16x16 int4 block is 128 bytes (= size_B/2).
+      // See gemm_int8xint4.cc / int4-gemm-kernel-stride-fix.
+      const int4 *b_block = b + (static_cast<size_t>(kt) * kNTiles + nt) * ((GEMV_K_NATIVE * GEMV_N_NATIVE) / 2);
       ::aie::vector<int4, MMUL::size_B> B = ::aie::load_v<MMUL::size_B>(b_block);
 
       if (kt == 0)

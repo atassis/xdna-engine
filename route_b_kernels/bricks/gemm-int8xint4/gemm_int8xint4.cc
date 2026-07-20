@@ -63,11 +63,19 @@
 // A/B/C all held resident (no host round-trip) -- the atomic op this brick
 // tiles across for M/K/N > the native 4x16x16 shape.
 //
-// pB is a packed int4 buffer: each K x N int4 tile of size MMUL::size_B
-// (=K*N=256 int4 lanes) occupies size_B/2 = 128 bytes, addressed via
-// aie::vector<int4, size_B> / aie::load_v<size_B> exactly like any other
-// aie_api sub-byte vector (the packing/addressing is handled by the vector
-// type itself, not by this kernel).
+// pB is a CONTIGUOUSLY packed int4 buffer: each K x N int4 tile of size
+// MMUL::size_B (=K*N=256 int4 lanes) occupies size_B/2 = 128 bytes, addressed
+// via aie::vector<int4, size_B> / aie::load_v<size_B> exactly like any other
+// aie_api sub-byte vector (the load itself reads the packed 128 bytes).
+//
+// BLOCK STRIDE (fixed 2026-07-20, int4-gemm-kernel-stride-fix): on this Peano
+// toolchain int4* pointer arithmetic advances ONE BYTE per int4 lane (sub-byte
+// pointers round up), so stepping to the next packed 128-byte block is
+// `pB + block_idx * (size_B/2)`, NOT `pB + block_idx * size_B` -- the latter
+// strides 256 bytes and skips into a padded/garbage slot, which is only masked
+// if the host pre-pads each block to a 256-byte slot. Striding by size_B/2
+// makes a CONTIGUOUS packed weight (the golden's pack_int4, 2 int4/byte, no
+// gaps -- what a real consumer emits, half the LPDDR bytes) correct.
 template <unsigned M, unsigned K, unsigned N>
 static inline void gemm_int8xint4_tile(const int8_t *__restrict pA,
                                        const int4 *__restrict pB,
@@ -91,7 +99,9 @@ static inline void gemm_int8xint4_tile(const int8_t *__restrict pA,
 
       for (unsigned ki = 0; ki < kSteps; ++ki) {
         const int8_t *pA_tile = pA + (mi * kSteps + ki) * MMUL::size_A;
-        const int4 *pB_tile = pB + (ki * nTiles + ni) * MMUL::size_B;
+        // size_B/2 bytes/block: int4* advances 1 byte/lane on Peano, and a
+        // contiguously packed 16x16 int4 block is size_B/2 = 128 bytes.
+        const int4 *pB_tile = pB + (ki * nTiles + ni) * (MMUL::size_B / 2);
 
         aie::vector<int8_t, MMUL::size_A> A =
             aie::load_v<MMUL::size_A>(pA_tile);

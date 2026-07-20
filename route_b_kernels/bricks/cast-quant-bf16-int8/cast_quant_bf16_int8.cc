@@ -52,10 +52,11 @@ void quantize_bf16_to_int8_row(const bfloat16 *restrict input,
     aw.from_vector(v); // widen bf16 -> f32
     ::aie::vector<float, N> vf = aw.template to_vector<float>();
     ::aie::vector<float, N> scaled = ::aie::mul(vf, inv_scale); // x / scale
-    ::aie::accum<accfloat, N> a;
-    a.from_vector(scaled);
-    // Saturating round-to-nearest into signed int8 -- clamps to [-128,127].
-    ::aie::store_v(output + i, a.template to_vector<int8_t>());
+    // Round-to-nearest + saturate to signed int8 [-128,127]. Use to_fixed (the
+    // float->int vector convert honoring the current rounding mode); the previous
+    // accfloat accumulator -> to_vector<int8_t> path reinterpreted the float bits
+    // as fixed-point and produced garbage (device rel-L2 2.377 vs the golden).
+    ::aie::store_v(output + i, ::aie::to_fixed<int8_t>(scaled));
   }
   event1();
 }

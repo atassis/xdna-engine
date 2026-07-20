@@ -61,7 +61,9 @@ namespace {
 constexpr unsigned kRotHalf = ROPE_ROT / 2;
 // Fetch granularity of aie::parallel_lookup for a bf16-valued LUT (see
 // output_lanes(sizeof(bfloat16)==2) == 512/8/2 == 32 in aie2/parallel_lookup.hpp).
-constexpr unsigned kFetchW = 32;
+constexpr unsigned kFetchW = 16;  // one 16-lane parallel_lookup group per fetch
+                                  // (the fetch de-interleaves within a 16-group; we
+                                  // undo it per-group, so process one group at a time)
 constexpr unsigned kRotHalfPad = ((kRotHalf + kFetchW - 1) / kFetchW) * kFetchW;
 constexpr unsigned kVec = 16;  // f32/bf16 elementwise apply width (matches norm_gemv_prologue.cc)
 constexpr float kPi = 3.14159265358979323846f;  // avoid relying on libm M_PI macro
@@ -89,26 +91,36 @@ void rope_lut_prologue(bfloat16 *restrict qk, const int32_t *restrict pos,
   ::aie::parallel_lookup<int8, ::aie::lut<4, bfloat16>> sin_look(sin_lut, /*step_bits=*/0, /*bias=*/128);
   ::aie::parallel_lookup<int8, ::aie::lut<4, bfloat16>> cos_look(cos_lut, /*step_bits=*/0, /*bias=*/128);
 
-  int8_t key_buf[kRotHalfPad];
-  bfloat16 sin_buf[kRotHalfPad];
-  bfloat16 cos_buf[kRotHalfPad];
+  alignas(::aie::vector_decl_align) int8_t key_buf[kRotHalfPad];
+  alignas(::aie::vector_decl_align) bfloat16 sin_buf[kRotHalfPad];
+  alignas(::aie::vector_decl_align) bfloat16 cos_buf[kRotHalfPad];
+
+  ::aie::set_rounding(::aie::rounding_mode::conv_even);
+  constexpr float kTwoPi = 2.0f * kPi;
 
   for (unsigned m = 0; m < ROPE_M; ++m) {
-    const float posf = (float)pos[m] * (float)ROPE_SCALE_INV;
-
-    // --- build the quantized angle keys for this row (plain arithmetic) ---
-    for (unsigned i = 0; i < kRotHalf; ++i) {
-      const float theta = posf * inv_freq[i];
-      // wrap to [-pi, pi): manual round-to-nearest (no libm roundf on device)
-      const float k_wrap = theta * (1.0f / (2.0f * kPi));
-      const int k = (int)(k_wrap + (k_wrap >= 0.0f ? 0.5f : -0.5f));
-      const float wrapped = theta - (float)k * (2.0f * kPi);
-      // quantize to int8 key in [-128,127], bias=128 (full-range LUT index)
-      const float q = wrapped * (128.0f / kPi);
-      int key = (int)(q + (q >= 0.0f ? 0.5f : -0.5f));
-      if (key > 127) key = 127;
-      if (key < -128) key = -128;
-      key_buf[i] = (int8_t)key;
+    // --- build the quantized angle keys for this row, VECTORIZED ---
+    // The aie2p scalar-f32 path miscompiles (scalar `(float)pos[m]` / scalar float
+    // mul collapse to a constant on device -> key_buf becomes row-invariant), so
+    // compute the whole angle+quantize with vector ops. posf via a VECTOR int->float.
+    const int32_t p = pos[m];
+    ::aie::vector<float, kVec> posf =
+        ::aie::mul(::aie::to_float(::aie::broadcast<int32, kVec>(p)), (float)ROPE_SCALE_INV);
+    for (unsigned i = 0; i < kRotHalf; i += kVec) {
+      ::aie::vector<float, kVec> invf = ::aie::load_v<kVec>(inv_freq + i);
+      ::aie::vector<float, kVec> theta = ::aie::mul(posf, invf);
+      // wrap to [-pi, pi): k = round(theta/2pi); wrapped = theta - k*2pi. Each
+      // aie::mul/sub is materialized into a concrete vector (the lazy op expr does
+      // not bind to to_fixed/sub's vector& param).
+      ::aie::vector<float, kVec> kwf = ::aie::mul(theta, 1.0f / kTwoPi);
+      ::aie::vector<int32, kVec> k = ::aie::to_fixed<int32>(kwf);
+      ::aie::vector<float, kVec> kf = ::aie::to_float(k);
+      ::aie::vector<float, kVec> ktwopi = ::aie::mul(kf, kTwoPi);
+      ::aie::vector<float, kVec> wrapped = ::aie::sub(theta, ktwopi);
+      // quantize to int8 key in [-128,127] (round-to-nearest + saturate), bias=128
+      ::aie::vector<float, kVec> q = ::aie::mul(wrapped, 128.0f / kPi);
+      ::aie::vector<int8, kVec> key = ::aie::to_fixed<int8>(q);
+      ::aie::store_v(key_buf + i, key);
     }
     for (unsigned i = kRotHalf; i < kRotHalfPad; ++i) key_buf[i] = 0;  // pad, unused
 
@@ -117,6 +129,12 @@ void rope_lut_prologue(bfloat16 *restrict qk, const int32_t *restrict pos,
       ::aie::vector<int8, kFetchW> keys = ::aie::load_v<kFetchW>(key_buf + i);
       ::aie::vector<bfloat16, kFetchW> s = sin_look.fetch(keys);
       ::aie::vector<bfloat16, kFetchW> c = cos_look.fetch(keys);
+      // parallel_lookup returns the gathered values DE-INTERLEAVED within the
+      // 16-lane group: output lane j holds the value for key at input lane
+      // perm(j), perm = [0,8,1,9,2,10,...] (verified on device). Restore key
+      // order with concat(filter_even, filter_odd) = the inverse interleave.
+      s = ::aie::concat(::aie::filter_even(s), ::aie::filter_odd(s));
+      c = ::aie::concat(::aie::filter_even(c), ::aie::filter_odd(c));
       ::aie::store_v(sin_buf + i, s);
       ::aie::store_v(cos_buf + i, c);
     }

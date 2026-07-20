@@ -87,7 +87,10 @@ static inline void gemm_int8xint4_dequant_tile(const int8_t *__restrict pA,
         for (unsigned ks = 0; ks < kStepsPerGroup; ++ks) {
           const unsigned ki = g * kStepsPerGroup + ks;
           const int8_t *pA_tile = pA + (mi * kSteps + ki) * MMUL::size_A;
-          const int4 *pB_tile = pB + (ki * nTiles + ni) * MMUL::size_B;
+          // size_B/2 bytes/block: int4* advances 1 byte/lane on Peano, and a
+          // contiguously packed 16x16 int4 block is size_B/2 = 128 bytes (see
+          // gemm_int8xint4.cc / int4-gemm-kernel-stride-fix).
+          const int4 *pB_tile = pB + (ki * nTiles + ni) * (MMUL::size_B / 2);
 
           ::aie::vector<int8_t, MMUL::size_A> A =
               ::aie::load_v<MMUL::size_A>(pA_tile);

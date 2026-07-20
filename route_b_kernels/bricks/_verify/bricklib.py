@@ -1,0 +1,236 @@
+#!/usr/bin/env python3
+"""Shared rail for brick device-verify (brick-wave1-device-verify).
+
+Generalizes the proven rmsnorm rail: a thin pure-buffer verify-shim (scalars baked via
+-D) #include's the brick .cc; an @iron.jit design streams rows of a [m, in_cols] input
+through the kernel on aie2p (optionally with ONE packed resident const buffer, to stay
+within a core tile's 2-input DMA channels); rel-L2 vs the numpy golden gates it.
+Run-twice self-check guards the CLFLUSH read race.
+"""
+from pathlib import Path
+import numpy as np
+
+import aie.iron as iron
+from aie.iron import CompileTime, In, ObjectFifo, Out, Program, Runtime, Worker
+from aie.iron.controlflow import range_
+from aie.iron.kernel import ExternalFunction
+from aie.helpers.taplib import TensorTiler2D
+
+GEN = Path(__file__).parent / "gen"
+GEN.mkdir(exist_ok=True)
+
+
+def _npty(shape, dt):
+    return np.ndarray[shape, np.dtype[dt]]
+
+
+def _build_rowwise(symbol, shim, m, in_cols, out_cols, const_len, compile_flags,
+                   in_dt, out_dt, const_dt):
+    """Return an @iron.jit design. If const_len==0 the const fifo is omitted."""
+    has_const = const_len > 0
+
+    if has_const:
+        def design(inp: In, cst: In, out: Out):
+            in_row = _npty((in_cols,), in_dt)
+            out_row = _npty((out_cols,), out_dt)
+            cst_ty = _npty((const_len,), const_dt)
+            in_full = _npty((m * in_cols,), in_dt)
+            out_full = _npty((m * out_cols,), out_dt)
+            kern = ExternalFunction(symbol, source_file=str(shim),
+                                    arg_types=[in_row, cst_ty, out_row],
+                                    compile_flags=compile_flags)
+            inf = ObjectFifo(in_row, name="inf")
+            cf = ObjectFifo(cst_ty, name="cf")
+            of = ObjectFifo(out_row, name="of")
+
+            def core(inf, cf, of, kern):
+                ec = cf.acquire(1)
+                for _ in range_(m):
+                    ei = inf.acquire(1)
+                    eo = of.acquire(1)
+                    kern(ei, ec, eo)
+                    of.release(1)
+                    inf.release(1)
+                cf.release(1)
+
+            worker = Worker(core, fn_args=[inf.cons(), cf.cons(), of.prod(), kern])
+            in_tap = TensorTiler2D.group_tiler((m, in_cols), (1, in_cols), (m, 1))[0]
+            out_tap = TensorTiler2D.group_tiler((m, out_cols), (1, out_cols), (m, 1))[0]
+            cst_tap = TensorTiler2D.group_tiler((1, const_len), (1, const_len), (1, 1))[0]
+            rt = Runtime()
+            with rt.sequence(in_full, cst_ty, out_full) as (a, c, o):
+                rt.start(worker)
+                rt.fill(inf.prod(), a, in_tap)
+                rt.fill(cf.prod(), c, cst_tap)
+                rt.drain(of.cons(), o, out_tap, wait=True)
+            return Program(iron.get_current_device(), rt).resolve_program()
+        design.__name__ = design.__qualname__ = f"design_{symbol}"
+        return iron.jit(design, use_cache=False)
+
+    def design(inp: In, out: Out):
+        in_row = _npty((in_cols,), in_dt)
+        out_row = _npty((out_cols,), out_dt)
+        in_full = _npty((m * in_cols,), in_dt)
+        out_full = _npty((m * out_cols,), out_dt)
+        kern = ExternalFunction(symbol, source_file=str(shim),
+                                arg_types=[in_row, out_row],
+                                compile_flags=compile_flags)
+        inf = ObjectFifo(in_row, name="inf")
+        of = ObjectFifo(out_row, name="of")
+
+        def core(inf, of, kern):
+            for _ in range_(m):
+                ei = inf.acquire(1)
+                eo = of.acquire(1)
+                kern(ei, eo)
+                of.release(1)
+                inf.release(1)
+
+        worker = Worker(core, fn_args=[inf.cons(), of.prod(), kern])
+        in_tap = TensorTiler2D.group_tiler((m, in_cols), (1, in_cols), (m, 1))[0]
+        out_tap = TensorTiler2D.group_tiler((m, out_cols), (1, out_cols), (m, 1))[0]
+        rt = Runtime()
+        with rt.sequence(in_full, out_full) as (a, o):
+            rt.start(worker)
+            rt.fill(inf.prod(), a, in_tap)
+            rt.drain(of.cons(), o, out_tap, wait=True)
+        return Program(iron.get_current_device(), rt).resolve_program()
+    design.__name__ = design.__qualname__ = f"design_{symbol}"
+    return iron.jit(design, use_cache=False)
+
+
+def _build_oneshot(symbol, shim, in_numels, out_numel, in_dts, out_dt, compile_flags):
+    """Whole-buffer inputs, ONE kernel call, one output. For GEMM/GEMV-style bricks.
+    In/Out params are signature markers for iron.jit's tensor-arg count; data flows
+    through rt.sequence."""
+    nin = len(in_numels)
+
+    def build_program():
+        in_tys = [_npty((in_numels[i],), in_dts[i]) for i in range(nin)]
+        out_ty = _npty((out_numel,), out_dt)
+        kern = ExternalFunction(symbol, source_file=str(shim),
+                                arg_types=list(in_tys) + [out_ty],
+                                compile_flags=compile_flags)
+        in_fifos = [ObjectFifo(in_tys[i], name=f"in{i}") for i in range(nin)]
+        of = ObjectFifo(out_ty, name="of")
+
+        def core(*args):
+            *cons, ofc, k = args
+            elems = [c.acquire(1) for c in cons]
+            eo = ofc.acquire(1)
+            k(*elems, eo)
+            ofc.release(1)
+            for c in cons:
+                c.release(1)
+
+        worker = Worker(core, fn_args=[f.cons() for f in in_fifos] + [of.prod(), kern])
+        rt = Runtime()
+        seq_tys = list(in_tys) + [out_ty]
+        with rt.sequence(*seq_tys) as bufs:
+            *ins, o = bufs
+            rt.start(worker)
+            for i in range(nin):
+                rt.fill(in_fifos[i].prod(), ins[i])
+            rt.drain(of.cons(), o, wait=True)
+        return Program(iron.get_current_device(), rt).resolve_program()
+
+    if nin == 1:
+        def design(a: In, out: Out):
+            return build_program()
+    elif nin == 2:
+        def design(a: In, b: In, out: Out):
+            return build_program()
+    elif nin == 3:
+        def design(a: In, b: In, c: In, out: Out):
+            return build_program()
+    elif nin == 4:
+        def design(a: In, b: In, c: In, d: In, out: Out):
+            return build_program()
+    else:
+        raise ValueError(f"_build_oneshot supports 1-4 inputs, got {nin}")
+
+    design.__name__ = design.__qualname__ = f"design_{symbol}"
+    return iron.jit(design, use_cache=False)
+
+
+def verify_oneshot(name, brick_cc, shim_body, symbol, inputs, out_numel, out_shape,
+                   unpack, golden, gate, compile_flags=None, out_dt=np.int32):
+    """inputs: list of (packed_1d_np, dtype). unpack(dev_flat)->got array (native shape).
+    golden: reference array (native shape). Returns result dict."""
+    compile_flags = list(compile_flags or [])
+    shim = GEN / f"{name}_shim.cc"
+    shim.write_text(
+        f'// AUTO-GENERATED verify shim for the {name} brick.\n'
+        f'#include <stdint.h>\n#include "{brick_cc}"\n{shim_body}\n'
+    )
+    in_numels = [int(np.asarray(a).size) for a, _ in inputs]
+    in_dts = [dt for _, dt in inputs]
+    design = _build_oneshot(symbol, shim, in_numels, out_numel, in_dts, out_dt, compile_flags)
+
+    def run_once():
+        in_ts = [iron.tensor(np.ascontiguousarray(np.asarray(a).reshape(-1)), dtype=dt,
+                             device="npu") for a, dt in inputs]
+        out_t = iron.zeros((out_numel,), dtype=out_dt, device="npu")
+        design(*in_ts, out_t)
+        return out_t.numpy().reshape(-1).copy()
+
+    dev1 = run_once()
+    dev2 = run_once()
+    got = np.asarray(unpack(dev1), np.float64)
+    exp = np.asarray(golden, np.float64)
+    num = np.linalg.norm((got - exp).ravel())
+    den = np.linalg.norm(exp.ravel())
+    rl2 = float(num / den) if den else float(num)
+    determ = float(np.linalg.norm((dev1.astype(np.float64) - dev2.astype(np.float64)).ravel()))
+    nz = float(np.abs(dev1).sum())
+    ok = (nz > 0.0) and (rl2 <= gate)
+    status = "PASS" if ok else ("FAIL-ZERO" if nz == 0.0 else "FAIL")
+    print(f"[{name:22s}] rel_l2={rl2:.3e} gate={gate:.1e} nz={nz:.2e} "
+          f"run2run={determ:.2e} -> {status}")
+    return dict(name=name, rel_l2=rl2, gate=gate, nonzero=nz, run2run=determ,
+                status=status, ok=ok)
+
+
+def verify_rowwise(name, brick_cc, shim_body, symbol, m, in_cols, out_cols,
+                   x, expected, gate, const=None, compile_flags=None,
+                   in_dt=np.float32, out_dt=np.float32, const_dt=np.float32):
+    """Generate shim, build+run the design twice on device, gate rel-L2.
+
+    x: (m, in_cols) input.  const: 1-D packed const or None.  expected: (m, out_cols).
+    Returns a result dict.
+    """
+    compile_flags = list(compile_flags or [])
+    shim = GEN / f"{name}_shim.cc"
+    shim.write_text(
+        f'// AUTO-GENERATED verify shim for the {name} brick.\n'
+        f'#include <stdint.h>\n#include "{brick_cc}"\n{shim_body}\n'
+    )
+    const_len = 0 if const is None else int(np.asarray(const).size)
+    design = _build_rowwise(symbol, shim, m, in_cols, out_cols, const_len,
+                            compile_flags, in_dt, out_dt, const_dt)
+
+    def run_once():
+        x_t = iron.tensor(np.ascontiguousarray(x.reshape(-1)), dtype=in_dt, device="npu")
+        out_t = iron.zeros((m * out_cols,), dtype=out_dt, device="npu")
+        if const_len:
+            c_t = iron.tensor(np.ascontiguousarray(np.asarray(const).reshape(-1)),
+                              dtype=const_dt, device="npu")
+            design(x_t, c_t, out_t)
+        else:
+            design(x_t, out_t)
+        return out_t.numpy().reshape(m, out_cols).astype(np.float64).copy()
+
+    dev1 = run_once()
+    dev2 = run_once()
+    exp = np.asarray(expected, np.float64)
+    num = np.linalg.norm((dev1 - exp).ravel())
+    den = np.linalg.norm(exp.ravel())
+    rl2 = float(num / den) if den else float(num)
+    determ = float(np.linalg.norm((dev1 - dev2).ravel()))
+    nz = float(np.abs(dev1).sum())
+    ok = (nz > 0.0) and (rl2 <= gate)
+    status = "PASS" if ok else ("FAIL-ZERO" if nz == 0.0 else "FAIL")
+    print(f"[{name:22s}] rel_l2={rl2:.3e} gate={gate:.1e} nz={nz:.2e} "
+          f"run2run={determ:.2e} -> {status}")
+    return dict(name=name, rel_l2=rl2, gate=gate, nonzero=nz, run2run=determ,
+                status=status, ok=ok)
