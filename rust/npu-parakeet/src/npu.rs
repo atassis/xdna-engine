@@ -23,6 +23,32 @@ const KRES: usize = 1024; // resident kernel contraction dim
 const WA_SUBDIR: &str =
     "mlir-aie/programming_examples/basic/matrix_multiplication/whole_array/build";
 
+/// Activation epilogue baked into the modal resident's per-N instruction stream (RTP-selected at
+/// generate time -- `whole_array_modal_iron.py` sets `mode_val` and `set_modes` bakes it into that
+/// stream's RTP). The modal FFN epilogue kernel compiles all three branches; the host selects the
+/// mode by dispatching the matching insts stream. `Silu` -> `modalsilu` (Parakeet fc1 / ff.l1),
+/// `Identity` -> `modalid` (every plain GEMM, conv pw1, K-collapse fc2), `Gelu` -> `modalgelu`
+/// (the K=768 GELU FFN rail: BERT/Whisper/ESM). On the PLAIN (non-modal) resident there is no
+/// on-chip epilogue, so the activation is a no-op there (the host applies it) -- `stream()`
+/// normalizes to `Identity` so the stream cache stays 1:1 with the single plain insts file.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Act {
+    Identity,
+    Silu,
+    Gelu,
+}
+
+impl Act {
+    /// The mode tag baked into the modal insts filename (`insts_..._8c_{tag}.txt`).
+    fn mode_tag(self) -> &'static str {
+        match self {
+            Act::Identity => "modalid",
+            Act::Silu => "modalsilu",
+            Act::Gelu => "modalgelu",
+        }
+    }
+}
+
 /// Per-N instruction stream + its output BO (on the resident kernel).
 struct NStream {
     instr: Bo,
@@ -134,7 +160,7 @@ pub struct NpuMatmul {
     bo_tr: Bo,
     slots: Vec<PipeSlot>, // 2-slot ring for the K-split pipeline (output N=1024)
     modal: bool, // resident is the MODAL xclbin (fused f32-out silu/identity epilogue) vs plain matmul
-    streams: RefCell<HashMap<(usize, bool), Rc<NStream>>>, // (N, silu) -> stream
+    streams: RefCell<HashMap<(usize, Act), Rc<NStream>>>, // (N, activation) -> stream
     wcache: RefCell<HashMap<String, Rc<Bo>>>,      // packed weight BOs by id
     ncache: RefCell<HashMap<String, usize>>,       // weight N (ncols) by id, paired with wcache
     relpos_dir: PathBuf,                           // {root}/artifacts/relpos (per-T xclbin cache)
@@ -992,6 +1018,19 @@ impl NpuMatmul {
         self.modal && self.resident_ln().is_some()
     }
 
+    /// Capability accessors: the resident rail's baked contraction/padding/inner dims. A K=768
+    /// consumer (BERT / Whisper / ESM post-norm FFN) capability-GATES on these before dispatching --
+    /// every resident brick asserts `KRES`, so a mismatched hidden dim panics; the consumer must
+    /// confirm `resident_kres()` matches its `D` first (see `resident_ffn_nonorm`).
+    ///
+    /// These return the compile-time Parakeet defaults (KRES=1024, PAD_M=512, DFF=4096). Turning the
+    /// K=768 rail on is a device-session step that makes KRES/PAD_M/DFF real fields set from the
+    /// loaded xclbin name; keeping them consts here preserves Parakeet's path byte-for-byte (see the
+    /// DEVICE-GATED notes on `resident_ffn_nonorm`).
+    pub fn resident_kres(&self) -> usize { KRES }
+    pub fn resident_pad_m(&self) -> usize { PAD_M }
+    pub fn resident_dff(&self) -> usize { DFF }
+
     /// On-chip normalize-only LN then AFFINE cast (*gamma+beta), chained DEVICE-SIDE (the
     /// intermediate bo_ln never touches host). Pads x[t,KRES] to [PAD_M,KRES]; gamma/beta [KRES]
     /// packed into bo_gb. Returns the resident block whose bo_bf16 holds affine_LN(x) as bf16, ready
@@ -1168,7 +1207,7 @@ impl NpuMatmul {
     /// (a_bo), skipping dispatch()'s host pack+upload. Output read to host (C[m,n] f32).
     fn dispatch_with_a(&self, a_bo: &Bo, m: usize, wbo: &Bo, n: usize, silu: bool) -> Array2<f32> {
         assert!(m <= PAD_M, "dispatch_with_a: m={m} exceeds PAD_M={PAD_M}");
-        let st = self.stream(n, silu);
+        let st = self.stream(n, if silu { Act::Silu } else { Act::Identity });
         self.kern.run_matmul8(3, &st.instr, st.n_instr, a_bo, wbo, &st.bo_c, &self.bo_tmp, &self.bo_tr).unwrap();
         self.stats.borrow_mut().dispatches += 1;
         st.bo_c.sync_from_device().unwrap();
@@ -1233,7 +1272,7 @@ impl NpuMatmul {
             assert_eq!(w.ncols(), n2, "pw1 W ncols {} != {n2}", w.ncols());
             self.weight_bo(id, w.view())
         };
-        let st = self.stream(n2, false); // identity modal (no on-chip silu on pw1)
+        let st = self.stream(n2, Act::Identity); // identity modal (no on-chip silu on pw1)
         self.kern.run_matmul8(3, &st.instr, st.n_instr, &rlc.bo_bf16, &wbo, &st.bo_c, &self.bo_tmp, &self.bo_tr).unwrap();
         // GLU: st.bo_c [PAD_M,2D] f32 (A/g3) -> glu.bo_out [PAD_M,D] f32 (B/g4), device-side.
         glu.kern.run_matmul8(3, &glu.instr, glu.n, &st.bo_c, &glu.bo_out, &glu.dummy_c, &glu.dummy_tmp, &glu.dummy_tr).unwrap();
@@ -1271,7 +1310,7 @@ impl NpuMatmul {
             assert_eq!(w.ncols(), n2, "pw1 W ncols {} != {n2}", w.ncols());
             self.weight_bo(id, w.view())
         };
-        let st = self.stream(n2, false);
+        let st = self.stream(n2, Act::Identity);
         self.kern.run_matmul8(3, &st.instr, st.n_instr, &rlc.bo_bf16, &wbo, &st.bo_c, &self.bo_tmp, &self.bo_tr).unwrap();
         glu.kern.run_matmul8(3, &glu.instr, glu.n, &st.bo_c, &glu.bo_out, &glu.dummy_c, &glu.dummy_tmp, &glu.dummy_tr).unwrap();
         self.stats.borrow_mut().dispatches += 2; // pw1 + glu
@@ -1317,7 +1356,7 @@ impl NpuMatmul {
         self.bo_a.sync_to_device().unwrap();
         // GEMM into a FRESH device f32 BO (identity modal, NO read).
         let out = self.dev.alloc_bo(&self.kern, PAD_M * n * 4, FLAG_HOST_ONLY, self.kern.group_id(5).unwrap()).unwrap();
-        let st = self.stream(n, false);
+        let st = self.stream(n, Act::Identity);
         self.kern.run_matmul8(3, &st.instr, st.n_instr, &self.bo_a, &wbo, &out, &self.bo_tmp, &self.bo_tr).unwrap();
         self.stats.borrow_mut().dispatches += 1;
         Rc::new(out)
@@ -1570,7 +1609,7 @@ impl NpuMatmul {
                 self.weight_bo(id1, w.view())
             })
         };
-        let st1 = self.stream(DFF, self.modal);
+        let st1 = self.stream(DFF, Act::Silu); // fc1 on-chip SiLU iff modal (plain resident ignores it)
         self.kern.run_matmul8(3, &st1.instr, st1.n_instr, &rl.bo_bf16, &w1, &st1.bo_c, &self.bo_tmp, &self.bo_tr).unwrap();
         // ONE-DISPATCH K=DFF fc2 (opt-in): cast@DFF -> K=DFF modal -> readback to host [m,KRES].
         if self.fc2_k4096_on() {
@@ -1641,7 +1680,7 @@ impl NpuMatmul {
                 self.weight_bo(id1, w.view())
             })
         };
-        let st1 = self.stream(DFF, self.modal);
+        let st1 = self.stream(DFF, Act::Silu); // fc1 on-chip SiLU iff modal (plain resident ignores it)
         self.kern.run_matmul8(3, &st1.instr, st1.n_instr, &rl.bo_bf16, &w1, &st1.bo_c, &self.bo_tmp, &self.bo_tr).unwrap();
         // ONE-DISPATCH fc2 (K=DFF): cast fc1's f32 [PAD_M,DFF] -> bf16 row-major, then a SINGLE K=DFF
         // modal GEMM that accumulates all DFF K internally in L1 -> f32 [PAD_M,KRES] device. Collapses
@@ -1668,7 +1707,7 @@ impl NpuMatmul {
         } else {
             None
         };
-        let st = self.stream(KRES, false);
+        let st = self.stream(KRES, Act::Identity);
         let mut cur = aa.acc0.clone();
         let mut nxt = aa.acc1.clone();
         for c in 0..parts {
@@ -1722,6 +1761,57 @@ impl NpuMatmul {
         self.stats.borrow_mut().calls += 1;
         let rl2 = self.ln_affine_cast_dev(a_bo, gamma, beta); // device-in LN: bo_bf16 = affine_LN(a_bo)
         Some(self.ffn_dev_accum(&rl2, make_w1, id1, make_w2, id2))
+    }
+
+    /// K=768 post-norm resident FFN with NO leading LayerNorm (BERT / Whisper-encoder / ESM-2 share
+    /// this shape family). Runs `x + fc2(act(fc1(x)))` on-chip and returns the device BO
+    /// [PAD_M,768] f32 (the residual is added on-device via `resadd s100`; only the trailing
+    /// post-norm LN stays host). The runbook Step-3 schedule:
+    ///   fc1: A = cast(x) bf16 [T,768]; W1 K_aug=800 (768 real + one k=32 block that folds `b1` INTO
+    ///        the matmul, since GELU needs the bias inside the activation); N=3072; `modalgelu`
+    ///        -> h f32 [T,3072] device.
+    ///   cast: h f32 [T,3072] -> bf16 (cast_512x3072).
+    ///   fc2: K=3072 collapse; N=768; `modalid` -> y f32 [T,768] device; `b2` host-added (bias
+    ///        outside the identity epilogue is exact -> no K-aug on fc2).
+    ///   resadd_s100: x + y (scale=1.0 full residual) -> device [T,768].
+    /// `make_w1`/`make_w2` lazily materialize W1 [768,3072] / W2 [3072,768] (id-cached); `b1`/`b2`
+    /// are the fc1/fc2 biases; `act` = `Act::Gelu` for the shipping rail. Returns None on any
+    /// non-K=768 rail, so the caller falls back to the host FFN (the shipped default).
+    ///
+    /// DEVICE-GATED (returns None today on the Parakeet KRES=1024 instance). Lighting this up is a
+    /// DEVICE session, not more CPU work:
+    ///   1. KRES/PAD_M/DFF become RailCfg FIELDS set from the loaded xclbin name so `resident_kres()`
+    ///      can report 768 (kept as consts here to preserve Parakeet byte-for-byte -- runbook Step 2).
+    ///   2. `open()` loads the K=768 rail (built by scripts/build_k768_gelu_rail.sh): fc1
+    ///      512x800x3072 `modalgelu`, fc2 512x3072x768 `modalid`, cast_512x768 + cast_512x3072,
+    ///      resadd_512x768_s100.
+    ///   3. `stream()`'s `insts_512x1024x{n}` literals parameterize by pad_m/kres.
+    ///   4. the K_aug=800 bias-fold packing of `b1` (one k=32 block appended to W1) + the N=768 fc2
+    ///      tile n=96 (768 = 96*8, satisfies the epilogue `(m*n)%16==0`) -- shapes the device session
+    ///      validates on rel-L2 vs host truth.
+    /// With those in place the schedule above dispatches here; until then the capability gate short-
+    /// circuits to None (host FFN) and the `resident_kres()==768` arm is `unimplemented!` so a future
+    /// K=768 build cannot SILENTLY fall through to host (which would look like the rail ran but didn't).
+    pub fn resident_ffn_nonorm<F1, F2>(
+        &self, x_bo: &Bo, m: usize,
+        make_w1: F1, b1: &[f32], id1: &str,
+        make_w2: F2, b2: &[f32], id2: &str,
+        act: Act,
+    ) -> Option<Rc<Bo>>
+    where
+        F1: FnOnce() -> Array2<f32>,
+        F2: FnOnce() -> Array2<f32>,
+    {
+        // Bind the args so the signature the device session wires against is fixed, WITHOUT invoking
+        // the lazy weight closures (no host weight materialization on the fall-through-to-host path).
+        let _ = (x_bo, m, b1, id1, b2, id2, act);
+        drop((make_w1, make_w2));
+        if self.resident_kres() == 768 {
+            // DEVICE-GATED: the K=768 dispatch chain (cast -> fc1 modalgelu -> cast -> fc2 modalid ->
+            // resadd_s100) lands here once (1)-(4) above are in place; not reachable on Parakeet.
+            unimplemented!("resident_ffn_nonorm K=768 dispatch is device-gated (see the doc notes)")
+        }
+        None
     }
 
     /// Host-readback wrapper over [`Self::resident_ffn_dev`] for the FFN-boundary gate
@@ -1908,18 +1998,23 @@ impl NpuMatmul {
         Some((host, dev))
     }
 
-    /// Per-N instruction stream. On the MODAL resident, `silu` picks the baked-RTP mode: the
-    /// `modalsilu` stream (fc1 / ff.l1, N=4096) applies SiLU on chip, `modalid` is a numerically
-    /// identity epilogue (every other GEMM). On the plain resident, `silu` is ignored (there is no
-    /// on-chip epilogue; the host applies silu) and the classic insts_*_8c.txt stream is used.
-    fn stream(&self, n: usize, silu: bool) -> Rc<NStream> {
-        let key = (n, silu && self.modal);
+    /// Per-N instruction stream. On the MODAL resident, `act` picks the baked-RTP mode
+    /// (`Silu`->`modalsilu` = fc1/ff.l1 N=4096 on-chip SiLU, `Identity`->`modalid` = numerically
+    /// identity epilogue for every other GEMM, `Gelu`->`modalgelu` = the K=768 GELU FFN rail). On
+    /// the plain resident there is no on-chip epilogue (the host applies the activation), so `act`
+    /// is normalized to Identity and the classic insts_*_8c.txt stream is used.
+    fn stream(&self, n: usize, act: Act) -> Rc<NStream> {
+        // The plain (non-modal) resident has no epilogue, so the activation is a no-op there; collapse
+        // to Identity so the cache stays 1:1 with the single plain insts file (byte-identical to the
+        // old `silu && self.modal` key).
+        let act = if self.modal { act } else { Act::Identity };
+        let key = (n, act);
         if let Some(s) = self.streams.borrow().get(&key) {
             return s.clone();
         }
         let g = |i| self.kern.group_id(i).unwrap();
         let insts = if self.modal {
-            let mode = if silu { "modalsilu" } else { "modalid" };
+            let mode = act.mode_tag();
             self.base.join(format!("insts_512x1024x{n}_{}_8c_{mode}.txt", self.tile))
         } else {
             self.base.join(format!("insts_512x1024x{n}_{}_8c.txt", self.tile))
@@ -1965,7 +2060,7 @@ impl NpuMatmul {
     /// `silu=true` (only fc1 / ff.l1 on the modal resident) applies the on-chip SiLU epilogue.
     fn dispatch(&self, a_km: ArrayView2<f32>, wbo: &Bo, n: usize, silu: bool) -> Array2<f32> {
         let m = a_km.nrows();
-        let st = self.stream(n, silu);
+        let st = self.stream(n, if silu { Act::Silu } else { Act::Identity });
         let stage = crate::prof::phase::current_stage();
         // (a) input marshaling: pack A -> bf16 + upload (host->device, no math).
         // pack only the m REAL rows of A: matmul row i depends only on A row i, so the kernel's
@@ -2121,7 +2216,7 @@ impl NpuMatmul {
     /// pack overlaps nothing, matching the original). Numerics identical across callers.
     fn ksplit_dispatch<G: Fn(usize) -> Rc<Bo>>(&self, a: &Array2<f32>, n: usize, parts: usize, get_w: G) -> Array2<f32> {
         let m = a.nrows();
-        let st = self.stream(n, false); // ff.l2 K-split output has no activation (identity epilogue)
+        let st = self.stream(n, Act::Identity); // ff.l2 K-split output has no activation (identity epilogue)
         // Phase-timing stage label for this K-split op; each partial's pack/read is Marshal and
         // each dispatch-launch + wait is Npu (the pipeline overlaps them, so per-bucket wall
         // sums may exceed e2e — report() surfaces that as overlap_ms).
