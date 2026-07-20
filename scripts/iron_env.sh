@@ -15,3 +15,7 @@ export PEANO_INSTALL_DIR="$REPO/.venv-iron/lib/python3.14/site-packages/llvm-aie
 # Arch xrt cmake export is broken (missing static .a); point common.cmake at the shared .so
 export XRT_INC_DIR=/usr/include
 export XRT_LIB_DIR=/usr/lib
+# HuggingFace: make the shared big-partition cache explicit (default ~/.cache/huggingface is symlinked
+# to /mnt/data). Respects an existing override; guarantees every HF flow reuses the one cache, no dup.
+export HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
+export HF_HUB_CACHE="${HF_HUB_CACHE:-$HF_HOME/hub}"
