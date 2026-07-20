@@ -190,28 +190,123 @@ fn op_k(op: &Op) -> usize {
     }
 }
 
-// --- NPU backend: real implementation lands in Task 4b (device-gated) ---
+// --- NPU backend: host im2col -> NativeKernel whole-array GEMM (the M1 host-im2col path in Rust) ---
+//
+// One 576x256 whole-array GEMM kernel serves ALL four ESPCN convs: NativeKernel zero-pads each conv's
+// real (Kf=Cin*k*k <= 576, Cout <= 256) up to the kernel dims, so we build ONE xclbin, not four. Per
+// conv: host im2col -> C[M,Cout] = A[M,Kf] @ B[Kf,Cout] (+bias, +relu). M (=H*W) is tiled to PAD_M=512.
+//
+// Requires the whole_array xclbin + insts at:
+//   mlir-aie/programming_examples/basic/matrix_multiplication/whole_array/build/
+//     final_512x576x256_32x32x32_8c.xclbin  +  insts_512x576x256_32x32x32_8c.txt
+// built via `make M=512 K=576 N=256 n_aie_cols=8` under the fork toolchain (insts .bin copied to .txt).
 mod npu_backend {
     use super::{ConvW, Feat};
     use crate::SrError;
+    use ndarray::Array2;
+    use npu_engine::esm::native::{NativeKernel, NativeWeight, PAD_M};
+    use npu_xrt::Device;
+    use std::path::Path;
+    use std::rc::Rc;
 
-    pub struct NpuGemm;
+    const KERNEL_K: usize = 576; // max Cin*k*k across ESPCN convs (conv2/conv3 = 64*9)
+    const KERNEL_N: usize = 256; // whole-array tiling needs N % (32*8) == 0; Cout <= 64 pads up
+    const TILE: &str = "32x32x32";
+    const WA: &str =
+        "mlir-aie/programming_examples/basic/matrix_multiplication/whole_array/build";
+
+    pub struct NpuGemm {
+        kernel: Rc<NativeKernel>,
+        weights: Vec<NativeWeight>, // one per conv2d op, in schedule order
+    }
+
     impl NpuGemm {
-        pub fn build(_w: &[ConvW]) -> Result<NpuGemm, SrError> {
-            Err(SrError::Device(
-                "npu frontier not built yet (Task 4b)".into(),
-            ))
+        pub fn build(convs: &[ConvW]) -> Result<NpuGemm, SrError> {
+            if !crate::npu_available() {
+                return Err(SrError::NotAvailable);
+            }
+            let dev = Rc::new(Device::open(0).map_err(|e| SrError::Device(format!("open: {e}")))?);
+            let kernel = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                NativeKernel::load(&dev, Path::new(WA), KERNEL_K, KERNEL_N, TILE)
+            }))
+            .map_err(|_| {
+                SrError::Device(format!(
+                    "load whole_array xclbin from {WA} (need final_{PAD_M}x{KERNEL_K}x{KERNEL_N}_{TILE}_8c.xclbin + insts .txt)"
+                ))
+            })?;
+            let mut weights = Vec::new();
+            for cw in convs {
+                // B = weight [Cout,Cin,k,k] -> [Cout, Kf] -> transpose -> [Kf, Cout].
+                let kf = cw.cin * cw.k * cw.k;
+                let mut b = Array2::<f32>::zeros((kf, cw.cout));
+                for oc in 0..cw.cout {
+                    for j in 0..kf {
+                        b[[j, oc]] = cw.w[oc * kf + j];
+                    }
+                }
+                weights.push(kernel.weight(&b));
+            }
+            Ok(NpuGemm { kernel, weights })
         }
+
         pub fn conv(
             &mut self,
-            _idx: usize,
-            _x: &Feat,
-            _cw: &ConvW,
-            _k: usize,
-            _pad: usize,
-            _relu: bool,
+            idx: usize,
+            x: &Feat,
+            cw: &ConvW,
+            k: usize,
+            pad: usize,
+            relu: bool,
         ) -> Result<Feat, SrError> {
-            Err(SrError::Device("npu conv not built yet (Task 4b)".into()))
+            let (cin, h, w) = (x.c, x.h, x.w);
+            let kf = cin * k * k;
+            let m = h * w;
+            // Host im2col: A[M, Kf], column order ic*(k*k) + ky*k + kx (matches the weight reshape).
+            let at = |c: usize, yy: isize, xx: isize| -> f32 {
+                if yy < 0 || xx < 0 || yy as usize >= h || xx as usize >= w {
+                    0.0
+                } else {
+                    x.data[c * h * w + yy as usize * w + xx as usize]
+                }
+            };
+            let weight = &self.weights[idx];
+            let mut out = vec![0f32; cw.cout * h * w];
+            // Tile M into chunks of PAD_M so H*W frames larger than 512 px work.
+            let mut p0 = 0usize;
+            while p0 < m {
+                let rows = (m - p0).min(PAD_M);
+                let mut a = Array2::<f32>::zeros((rows, kf));
+                for r in 0..rows {
+                    let p = p0 + r;
+                    let (oy, ox) = (p / w, p % w);
+                    for ic in 0..cin {
+                        for ky in 0..k {
+                            for kx in 0..k {
+                                a[[r, ic * (k * k) + ky * k + kx]] = at(
+                                    ic,
+                                    oy as isize + ky as isize - pad as isize,
+                                    ox as isize + kx as isize - pad as isize,
+                                );
+                            }
+                        }
+                    }
+                }
+                let c = self.kernel.matmul(weight, &a, cw.cout, Some(&cw.b)); // [rows, Cout]
+                for r in 0..rows {
+                    let p = p0 + r;
+                    for oc in 0..cw.cout {
+                        let v = c[[r, oc]];
+                        out[oc * h * w + p] = if relu { v.max(0.0) } else { v };
+                    }
+                }
+                p0 += rows;
+            }
+            Ok(Feat {
+                c: cw.cout,
+                h,
+                w,
+                data: out,
+            })
         }
     }
 }
