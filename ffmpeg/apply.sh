@@ -30,9 +30,11 @@ cd "$FFDIR"
   --extra-cflags="-I$HDR" \
   --extra-ldflags="-L$LIBDIR -Wl,-rpath,$LIBDIR" \
   --extra-libs="-lxdna_sr" \
+  --disable-x86asm \
   --disable-doc --disable-htmlpages --disable-manpages --disable-txtpages \
   >/tmp/xdna-ffconf.log 2>&1 || { echo "configure FAILED (see /tmp/xdna-ffconf.log)"; tail -20 /tmp/xdna-ffconf.log; exit 1; }
-make -j"$(nproc)" ffmpeg >/tmp/xdna-ffmake.log 2>&1 || { echo "make FAILED (see /tmp/xdna-ffmake.log)"; tail -30 /tmp/xdna-ffmake.log; exit 1; }
+JOBS=$(( $(nproc) / 2 )); [ "$JOBS" -lt 1 ] && JOBS=1
+make -j"$JOBS" ffmpeg >/tmp/xdna-ffmake.log 2>&1 || { echo "make FAILED (see /tmp/xdna-ffmake.log)"; tail -30 /tmp/xdna-ffmake.log; exit 1; }
 
 echo "built: $FFDIR/ffmpeg"
 echo "run with: LD_LIBRARY_PATH=$LIBDIR $FFDIR/ffmpeg -i in.mp4 -vf xdna_sr=schedule=artifacts/espcn/espcn.json out.mp4"

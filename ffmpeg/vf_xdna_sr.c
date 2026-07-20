@@ -12,6 +12,7 @@
  * FFmpeg it would carry FFmpeg's LGPL header instead.
  */
 #include "libavutil/opt.h"
+#include "libavutil/mem.h"
 #include "libavutil/imgutils.h"
 #include "avfilter.h"
 #include "filters.h"
