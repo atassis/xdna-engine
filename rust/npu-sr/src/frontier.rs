@@ -254,15 +254,22 @@ mod npu_backend {
     use std::path::Path;
     use std::rc::Rc;
 
-    const KERNEL_K: usize = 576; // max Cin*k*k across ESPCN convs (conv2/conv3 = 64*9)
-    const KERNEL_N: usize = 256; // whole-array tiling needs N % (32*8) == 0; Cout <= 64 pads up
+    const KERNEL_K: usize = 576; // max Cin*k*k across ESPCN+EDSR convs (64*9); smaller convs zero-pad K
+    const KERNEL_N: usize = 256; // whole-array tiling needs N % (32*8) == 0; Cout is N-tiled to <= 256
     const TILE: &str = "32x32x32";
     const WA: &str =
         "mlir-aie/programming_examples/basic/matrix_multiplication/whole_array/build";
 
+    /// One output-channel chunk of a conv's weight (Cout is tiled to <= KERNEL_N).
+    struct NChunk {
+        weight: NativeWeight,
+        off: usize,  // first output channel
+        cols: usize, // channels in this chunk (<= KERNEL_N)
+    }
+
     pub struct NpuGemm {
         kernel: Rc<NativeKernel>,
-        weights: Vec<NativeWeight>, // one per conv2d op, in schedule order
+        convs: Vec<Vec<NChunk>>, // per conv2d op (schedule order), the N-tiled weight chunks
     }
 
     impl NpuGemm {
@@ -279,19 +286,36 @@ mod npu_backend {
                     "load whole_array xclbin from {WA} (need final_{PAD_M}x{KERNEL_K}x{KERNEL_N}_{TILE}_8c.xclbin + insts .txt)"
                 ))
             })?;
-            let mut weights = Vec::new();
+            let mut built = Vec::new();
             for cw in convs {
-                // B = weight [Cout,Cin,k,k] -> [Cout, Kf] -> transpose -> [Kf, Cout].
                 let kf = cw.cin * cw.k * cw.k;
-                let mut b = Array2::<f32>::zeros((kf, cw.cout));
-                for oc in 0..cw.cout {
-                    for j in 0..kf {
-                        b[[j, oc]] = cw.w[oc * kf + j];
-                    }
+                if kf > KERNEL_K {
+                    return Err(SrError::Device(format!(
+                        "conv Kf={kf} exceeds kernel K={KERNEL_K}"
+                    )));
                 }
-                weights.push(kernel.weight(&b));
+                // N-tile Cout into <= KERNEL_N chunks; each chunk's B = weight[:, off..off+cols] as [Kf, cols].
+                let mut chunks = Vec::new();
+                let mut off = 0usize;
+                while off < cw.cout {
+                    let cols = (cw.cout - off).min(KERNEL_N);
+                    let mut b = Array2::<f32>::zeros((kf, cols));
+                    for j in 0..cols {
+                        let oc = off + j;
+                        for kk in 0..kf {
+                            b[[kk, j]] = cw.w[oc * kf + kk];
+                        }
+                    }
+                    chunks.push(NChunk {
+                        weight: kernel.weight(&b),
+                        off,
+                        cols,
+                    });
+                    off += cols;
+                }
+                built.push(chunks);
             }
-            Ok(NpuGemm { kernel, weights })
+            Ok(NpuGemm { kernel, convs: built })
         }
 
         pub fn conv(
@@ -306,7 +330,6 @@ mod npu_backend {
             let (cin, h, w) = (x.c, x.h, x.w);
             let kf = cin * k * k;
             let m = h * w;
-            // Host im2col: A[M, Kf], column order ic*(k*k) + ky*k + kx (matches the weight reshape).
             let at = |c: usize, yy: isize, xx: isize| -> f32 {
                 if yy < 0 || xx < 0 || yy as usize >= h || xx as usize >= w {
                     0.0
@@ -314,9 +337,9 @@ mod npu_backend {
                     x.data[c * h * w + yy as usize * w + xx as usize]
                 }
             };
-            let weight = &self.weights[idx];
+            let chunks = &self.convs[idx];
             let mut out = vec![0f32; cw.cout * h * w];
-            // Tile M into chunks of PAD_M so H*W frames larger than 512 px work.
+            // Tile M into chunks of PAD_M (frames > 512 px); N-tile Cout into the weight chunks.
             let mut p0 = 0usize;
             while p0 < m {
                 let rows = (m - p0).min(PAD_M);
@@ -336,12 +359,15 @@ mod npu_backend {
                         }
                     }
                 }
-                let c = self.kernel.matmul(weight, &a, cw.cout, Some(&cw.b)); // [rows, Cout]
-                for r in 0..rows {
-                    let p = p0 + r;
-                    for oc in 0..cw.cout {
-                        let v = c[[r, oc]];
-                        out[oc * h * w + p] = if relu { v.max(0.0) } else { v };
+                for ch in chunks {
+                    let bias = &cw.b[ch.off..ch.off + ch.cols];
+                    let c = self.kernel.matmul(&ch.weight, &a, ch.cols, Some(bias)); // [rows, cols]
+                    for r in 0..rows {
+                        let p = p0 + r;
+                        for j in 0..ch.cols {
+                            let v = c[[r, j]];
+                            out[(ch.off + j) * h * w + p] = if relu { v.max(0.0) } else { v };
+                        }
                     }
                 }
                 p0 += rows;
