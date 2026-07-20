@@ -1,0 +1,472 @@
+{
+  "name": "edsr",
+  "scale": 3,
+  "arena": "target/test-arenas/edsr.safetensors",
+  "input": "rgb",
+  "ops": [
+    {
+      "op": "conv2d",
+      "weights": "head",
+      "k": 3,
+      "pad": 1,
+      "relu": false,
+      "cin": 3,
+      "cout": 64
+    },
+    {
+      "op": "save",
+      "name": "g"
+    },
+    {
+      "op": "save",
+      "name": "s"
+    },
+    {
+      "op": "conv2d",
+      "weights": "b0_c0",
+      "k": 3,
+      "pad": 1,
+      "relu": true,
+      "cin": 64,
+      "cout": 64
+    },
+    {
+      "op": "conv2d",
+      "weights": "b0_c1",
+      "k": 3,
+      "pad": 1,
+      "relu": false,
+      "cin": 64,
+      "cout": 64
+    },
+    {
+      "op": "add",
+      "name": "s"
+    },
+    {
+      "op": "save",
+      "name": "s"
+    },
+    {
+      "op": "conv2d",
+      "weights": "b1_c0",
+      "k": 3,
+      "pad": 1,
+      "relu": true,
+      "cin": 64,
+      "cout": 64
+    },
+    {
+      "op": "conv2d",
+      "weights": "b1_c1",
+      "k": 3,
+      "pad": 1,
+      "relu": false,
+      "cin": 64,
+      "cout": 64
+    },
+    {
+      "op": "add",
+      "name": "s"
+    },
+    {
+      "op": "save",
+      "name": "s"
+    },
+    {
+      "op": "conv2d",
+      "weights": "b2_c0",
+      "k": 3,
+      "pad": 1,
+      "relu": true,
+      "cin": 64,
+      "cout": 64
+    },
+    {
+      "op": "conv2d",
+      "weights": "b2_c1",
+      "k": 3,
+      "pad": 1,
+      "relu": false,
+      "cin": 64,
+      "cout": 64
+    },
+    {
+      "op": "add",
+      "name": "s"
+    },
+    {
+      "op": "save",
+      "name": "s"
+    },
+    {
+      "op": "conv2d",
+      "weights": "b3_c0",
+      "k": 3,
+      "pad": 1,
+      "relu": true,
+      "cin": 64,
+      "cout": 64
+    },
+    {
+      "op": "conv2d",
+      "weights": "b3_c1",
+      "k": 3,
+      "pad": 1,
+      "relu": false,
+      "cin": 64,
+      "cout": 64
+    },
+    {
+      "op": "add",
+      "name": "s"
+    },
+    {
+      "op": "save",
+      "name": "s"
+    },
+    {
+      "op": "conv2d",
+      "weights": "b4_c0",
+      "k": 3,
+      "pad": 1,
+      "relu": true,
+      "cin": 64,
+      "cout": 64
+    },
+    {
+      "op": "conv2d",
+      "weights": "b4_c1",
+      "k": 3,
+      "pad": 1,
+      "relu": false,
+      "cin": 64,
+      "cout": 64
+    },
+    {
+      "op": "add",
+      "name": "s"
+    },
+    {
+      "op": "save",
+      "name": "s"
+    },
+    {
+      "op": "conv2d",
+      "weights": "b5_c0",
+      "k": 3,
+      "pad": 1,
+      "relu": true,
+      "cin": 64,
+      "cout": 64
+    },
+    {
+      "op": "conv2d",
+      "weights": "b5_c1",
+      "k": 3,
+      "pad": 1,
+      "relu": false,
+      "cin": 64,
+      "cout": 64
+    },
+    {
+      "op": "add",
+      "name": "s"
+    },
+    {
+      "op": "save",
+      "name": "s"
+    },
+    {
+      "op": "conv2d",
+      "weights": "b6_c0",
+      "k": 3,
+      "pad": 1,
+      "relu": true,
+      "cin": 64,
+      "cout": 64
+    },
+    {
+      "op": "conv2d",
+      "weights": "b6_c1",
+      "k": 3,
+      "pad": 1,
+      "relu": false,
+      "cin": 64,
+      "cout": 64
+    },
+    {
+      "op": "add",
+      "name": "s"
+    },
+    {
+      "op": "save",
+      "name": "s"
+    },
+    {
+      "op": "conv2d",
+      "weights": "b7_c0",
+      "k": 3,
+      "pad": 1,
+      "relu": true,
+      "cin": 64,
+      "cout": 64
+    },
+    {
+      "op": "conv2d",
+      "weights": "b7_c1",
+      "k": 3,
+      "pad": 1,
+      "relu": false,
+      "cin": 64,
+      "cout": 64
+    },
+    {
+      "op": "add",
+      "name": "s"
+    },
+    {
+      "op": "save",
+      "name": "s"
+    },
+    {
+      "op": "conv2d",
+      "weights": "b8_c0",
+      "k": 3,
+      "pad": 1,
+      "relu": true,
+      "cin": 64,
+      "cout": 64
+    },
+    {
+      "op": "conv2d",
+      "weights": "b8_c1",
+      "k": 3,
+      "pad": 1,
+      "relu": false,
+      "cin": 64,
+      "cout": 64
+    },
+    {
+      "op": "add",
+      "name": "s"
+    },
+    {
+      "op": "save",
+      "name": "s"
+    },
+    {
+      "op": "conv2d",
+      "weights": "b9_c0",
+      "k": 3,
+      "pad": 1,
+      "relu": true,
+      "cin": 64,
+      "cout": 64
+    },
+    {
+      "op": "conv2d",
+      "weights": "b9_c1",
+      "k": 3,
+      "pad": 1,
+      "relu": false,
+      "cin": 64,
+      "cout": 64
+    },
+    {
+      "op": "add",
+      "name": "s"
+    },
+    {
+      "op": "save",
+      "name": "s"
+    },
+    {
+      "op": "conv2d",
+      "weights": "b10_c0",
+      "k": 3,
+      "pad": 1,
+      "relu": true,
+      "cin": 64,
+      "cout": 64
+    },
+    {
+      "op": "conv2d",
+      "weights": "b10_c1",
+      "k": 3,
+      "pad": 1,
+      "relu": false,
+      "cin": 64,
+      "cout": 64
+    },
+    {
+      "op": "add",
+      "name": "s"
+    },
+    {
+      "op": "save",
+      "name": "s"
+    },
+    {
+      "op": "conv2d",
+      "weights": "b11_c0",
+      "k": 3,
+      "pad": 1,
+      "relu": true,
+      "cin": 64,
+      "cout": 64
+    },
+    {
+      "op": "conv2d",
+      "weights": "b11_c1",
+      "k": 3,
+      "pad": 1,
+      "relu": false,
+      "cin": 64,
+      "cout": 64
+    },
+    {
+      "op": "add",
+      "name": "s"
+    },
+    {
+      "op": "save",
+      "name": "s"
+    },
+    {
+      "op": "conv2d",
+      "weights": "b12_c0",
+      "k": 3,
+      "pad": 1,
+      "relu": true,
+      "cin": 64,
+      "cout": 64
+    },
+    {
+      "op": "conv2d",
+      "weights": "b12_c1",
+      "k": 3,
+      "pad": 1,
+      "relu": false,
+      "cin": 64,
+      "cout": 64
+    },
+    {
+      "op": "add",
+      "name": "s"
+    },
+    {
+      "op": "save",
+      "name": "s"
+    },
+    {
+      "op": "conv2d",
+      "weights": "b13_c0",
+      "k": 3,
+      "pad": 1,
+      "relu": true,
+      "cin": 64,
+      "cout": 64
+    },
+    {
+      "op": "conv2d",
+      "weights": "b13_c1",
+      "k": 3,
+      "pad": 1,
+      "relu": false,
+      "cin": 64,
+      "cout": 64
+    },
+    {
+      "op": "add",
+      "name": "s"
+    },
+    {
+      "op": "save",
+      "name": "s"
+    },
+    {
+      "op": "conv2d",
+      "weights": "b14_c0",
+      "k": 3,
+      "pad": 1,
+      "relu": true,
+      "cin": 64,
+      "cout": 64
+    },
+    {
+      "op": "conv2d",
+      "weights": "b14_c1",
+      "k": 3,
+      "pad": 1,
+      "relu": false,
+      "cin": 64,
+      "cout": 64
+    },
+    {
+      "op": "add",
+      "name": "s"
+    },
+    {
+      "op": "save",
+      "name": "s"
+    },
+    {
+      "op": "conv2d",
+      "weights": "b15_c0",
+      "k": 3,
+      "pad": 1,
+      "relu": true,
+      "cin": 64,
+      "cout": 64
+    },
+    {
+      "op": "conv2d",
+      "weights": "b15_c1",
+      "k": 3,
+      "pad": 1,
+      "relu": false,
+      "cin": 64,
+      "cout": 64
+    },
+    {
+      "op": "add",
+      "name": "s"
+    },
+    {
+      "op": "conv2d",
+      "weights": "btail",
+      "k": 3,
+      "pad": 1,
+      "relu": false,
+      "cin": 64,
+      "cout": 64
+    },
+    {
+      "op": "add",
+      "name": "g"
+    },
+    {
+      "op": "conv2d",
+      "weights": "tail0",
+      "k": 3,
+      "pad": 1,
+      "relu": false,
+      "cin": 64,
+      "cout": 576
+    },
+    {
+      "op": "pixel_shuffle",
+      "r": 3
+    },
+    {
+      "op": "conv2d",
+      "weights": "tail1",
+      "k": 3,
+      "pad": 1,
+      "relu": false,
+      "cin": 64,
+      "cout": 3
+    }
+  ]
+}

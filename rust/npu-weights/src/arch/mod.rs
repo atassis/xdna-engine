@@ -2,6 +2,7 @@
 pub mod bert;
 pub mod clip;
 pub mod dinov2;
+pub mod edsr;
 pub mod espcn;
 pub mod esm;
 pub mod fastconformer;
@@ -35,6 +36,7 @@ pub fn get(name: &str) -> anyhow::Result<Box<dyn Arch>> {
         "bert" => Ok(Box::new(bert::Bert)),
         "clip" => Ok(Box::new(clip::Clip)),
         "dinov2" => Ok(Box::new(dinov2::Dinov2)),
+        "edsr" => Ok(Box::new(edsr::Edsr)),
         "espcn" => Ok(Box::new(espcn::Espcn)),
         "esm" => Ok(Box::new(esm::Esm)),
         "fastconformer" => Ok(Box::new(fastconformer::FastConformer)),

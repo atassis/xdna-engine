@@ -5,6 +5,7 @@ use crate::schedule::{Op, Schedule};
 use crate::{Plane, SrError};
 
 /// A feature map [C, H, W], row-major per channel.
+#[derive(Clone)]
 pub(crate) struct Feat {
     pub c: usize,
     pub h: usize,
@@ -43,13 +44,49 @@ impl Frontier {
         })
     }
 
+    /// Y-only path: a 1-channel plane in, a 1-channel plane out (ESPCN).
     pub fn run(&mut self, sched: &Schedule, y: &Plane) -> Result<Plane, SrError> {
-        let mut feat = Feat {
-            c: 1,
-            h: y.h,
-            w: y.w,
-            data: y.data.clone(),
-        };
+        let out = self.run_feat(
+            sched,
+            Feat {
+                c: 1,
+                h: y.h,
+                w: y.w,
+                data: y.data.clone(),
+            },
+        )?;
+        if out.c != 1 {
+            return Err(SrError::Frame(format!(
+                "final feat has {} channels, want 1",
+                out.c
+            )));
+        }
+        Ok(Plane {
+            w: out.w,
+            h: out.h,
+            data: out.data,
+        })
+    }
+
+    /// Planar entry for multi-channel input (RGB path): [C,H,W] row-major f32 in, (C,H,W,data) out.
+    pub fn run_feat_planar(
+        &mut self,
+        sched: &Schedule,
+        data: Vec<f32>,
+        c: usize,
+        h: usize,
+        w: usize,
+    ) -> Result<(usize, usize, usize, Vec<f32>), SrError> {
+        let out = self.run_feat(sched, Feat { c, h, w, data })?;
+        Ok((out.c, out.h, out.w, out.data))
+    }
+
+    /// Core: run the schedule over a [C,H,W] feature map. Handles conv2d / pixel_shuffle / save / add
+    /// (skip registers for residual connections). The RGB path (EDSR) calls this directly.
+    pub(crate) fn run_feat(&mut self, sched: &Schedule, input: Feat) -> Result<Feat, SrError> {
+        use std::collections::HashMap;
+        let mut feat = input;
+        let mut skips: HashMap<String, Feat> = HashMap::new();
         let mut ci = 0usize;
         for op in &sched.ops {
             match op {
@@ -68,19 +105,27 @@ impl Frontier {
                 Op::PixelShuffle { r } => {
                     feat = pixel_shuffle(&feat, *r);
                 }
+                Op::Save { name } => {
+                    skips.insert(name.clone(), feat.clone());
+                }
+                Op::Add { name } => {
+                    let s = skips
+                        .get(name)
+                        .ok_or_else(|| SrError::Frame(format!("add: no saved skip {name:?}")))?;
+                    if (s.c, s.h, s.w) != (feat.c, feat.h, feat.w) {
+                        return Err(SrError::Frame(format!(
+                            "add {name:?}: shape {:?} != current {:?}",
+                            (s.c, s.h, s.w),
+                            (feat.c, feat.h, feat.w)
+                        )));
+                    }
+                    for (d, v) in feat.data.iter_mut().zip(&s.data) {
+                        *d += *v;
+                    }
+                }
             }
         }
-        if feat.c != 1 {
-            return Err(SrError::Frame(format!(
-                "final feat has {} channels, want 1",
-                feat.c
-            )));
-        }
-        Ok(Plane {
-            w: feat.w,
-            h: feat.h,
-            data: feat.data,
-        })
+        Ok(feat)
     }
 }
 

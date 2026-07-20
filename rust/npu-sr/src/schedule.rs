@@ -21,6 +21,23 @@ pub enum Op {
     /// Depth-to-space upsample by factor r (CRD order), zero compute.
     #[serde(rename = "pixel_shuffle")]
     PixelShuffle { r: usize },
+    /// Save the current stream into a named skip register (residual connections).
+    #[serde(rename = "save")]
+    Save { name: String },
+    /// Add a previously-saved stream (by name) to the current stream, elementwise (same shape).
+    #[serde(rename = "add")]
+    Add { name: String },
+}
+
+/// How the engine feeds pixels to the net.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum InputMode {
+    /// Y-only: net upscales luma; chroma is bicubic (ESPCN). The default.
+    #[default]
+    Y,
+    /// RGB: net upscales all three planar channels (EDSR).
+    Rgb,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -28,6 +45,8 @@ pub struct Schedule {
     pub name: String,
     pub scale: usize,
     pub arena: String, // path to the baked safetensors arena, relative to repo root
+    #[serde(default)]
+    pub input: InputMode,
     pub ops: Vec<Op>,
 }
 
