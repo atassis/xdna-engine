@@ -15,6 +15,7 @@
 pub mod config;
 pub mod decoder;
 pub mod encoder;
+pub mod ffn_rail;
 #[cfg(feature = "npu")]
 pub mod npu;
 pub mod ops;
