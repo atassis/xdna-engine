@@ -25,14 +25,17 @@ Shape mapping -- the rowwise rail already IS the chunked argmax:
 The gate is INDEX-EXACTNESS per tile plus an exact global reduce, never rel-L2 -- a
 near-miss index is a wrong token.
 """
+from pathlib import Path
+
 import numpy as np
 import ml_dtypes
 
 import bricklib
 
 BF16 = ml_dtypes.bfloat16
-ARGMAX_CC = (""
-             "route_b_kernels/decode_fused/argmax_slice.cc")
+# repo-relative: _verify -> bricks -> route_b_kernels -> repo root
+ARGMAX_CC = str(Path(__file__).resolve().parents[3]
+                / "route_b_kernels" / "decode_fused" / "argmax_slice.cc")
 
 COLS, CHUNK = 8, 4096
 NCHUNKS = 8                      # 32768-element slice / 4096 = what Gemma's vocab needs

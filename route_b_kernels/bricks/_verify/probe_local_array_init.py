@@ -15,7 +15,7 @@ and 0/NaN for ni>=2. The only thing tracking ni is WHICH 16-float slice of pScal
 
     a scalar-filled local float[64] is only HALF written (first 32 floats).
 
-This matters beyond the probe: the standing diagnosis in the int4-dequant-brick worklog is
+This matters beyond the probe: the standing diagnosis for this brick is
 "a Peano f32-epilogue codegen bug at a loop boundary", filed as an upstream llvm-aie
 candidate. That was reached using the SAME `scale=1.0 baked into a local array` trick. If
 local arrays are what's broken, the "epilogue miscompile" is a probe artifact and the

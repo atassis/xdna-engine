@@ -2,7 +2,7 @@
 """int4-dequant blocker probe: feed `scale` as a REAL 3rd input instead of packing it
 into the weight buffer.
 
-Background (from the int4-dequant-brick worklog): the fused gemm-int8xint4-dequant brick
+Background: the fused gemm-int8xint4-dequant brick
 delivers `scale` as EXACTLY 0 on device, so C=0 (rel_l2 1.0). The scale was appended to
 the padded-B weight buffer (`wbuf=[B_pad|scale]`) and recovered in the shim as
 `(const float*)(wbuf + b_bytes)`, to stay inside what was believed to be a 2-input DMA
