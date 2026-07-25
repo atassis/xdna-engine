@@ -30,6 +30,7 @@ import newstack_compat  # noqa: F401 -- MUST precede iron imports (new-mlir-aie 
 from iron.common import AIEContext
 from iron.common.fusion import FusedMLIROperator
 from iron.common.sequence import OperatorSequence
+from iron.operators.elementwise_mul.op import ElementwiseMul
 from identity_op import Identity
 
 BF16 = ml_dtypes.bfloat16
@@ -40,23 +41,36 @@ TILE = int(os.environ.get("PROBE_TILE", 1024))
 # PROBE_PATH=sequence -> OperatorSequence, the path gen_gemma_decode drives to token parity
 #                        and the one that received the residency fix in 2970f8a
 PATH = os.environ.get("PROBE_PATH", "fused")
+# PROBE_OP=identity -> the hand-written Identity op in this directory
+# PROBE_OP=memcopy  -> IRON's BUILT-IN MemCopy. This is the discriminator: gen_gemma_decode
+#                     drives built-in operators to 8/8 token parity on this same runtime, so
+#                     if a built-in round-trips and the hand-written one does not, the fault
+#                     is in how a locally-defined MLIROperator declares itself, not the path.
+OP = os.environ.get("PROBE_OP", "identity")
 
 
 def main():
     ctx = AIEContext()
-    op = Identity(N=N, tile=TILE, context=ctx)
-    kwargs = dict(input_args=["src"], output_args=["dst"],
-                  buffer_sizes={"src": N * 2, "dst": N * 2}, context=ctx)
-    if PATH == "sequence":
-        fused = OperatorSequence("roundtrip_seq", [(op, "src", "dst")],
-                                 dispatch="fused", **kwargs)
+    if OP == "emul":
+        op = ElementwiseMul(size=N, tile_size=N // 8, num_aie_columns=8, context=ctx)
+        runlist = [(op, "src", "ones", "dst")]
+        kwargs = dict(input_args=["src", "ones"], output_args=["dst"],
+                      buffer_sizes={"src": N * 2, "ones": N * 2, "dst": N * 2}, context=ctx)
     else:
-        fused = FusedMLIROperator("fusion_roundtrip_probe", [(op, "src", "dst")], **kwargs)
+        op = Identity(N=N, tile=TILE, context=ctx)
+        runlist = [(op, "src", "dst")]
+        kwargs = dict(input_args=["src"], output_args=["dst"],
+                      buffer_sizes={"src": N * 2, "dst": N * 2}, context=ctx)
+    if PATH == "sequence":
+        fused = OperatorSequence("roundtrip_seq", runlist, dispatch="fused", **kwargs)
+    else:
+        fused = FusedMLIROperator("fusion_roundtrip_probe", runlist, **kwargs)
     fused.compile()
-    print(f"[roundtrip] path={PATH} N={N} tile={TILE} ntiles={N // TILE}", flush=True)
+    print(f"[roundtrip] op={OP} path={PATH} N={N} tile={TILE} ntiles={N // TILE}", flush=True)
 
     c = fused.get_callable()
     src, dst = c.get_buffer("src"), c.get_buffer("dst")
+    ones = c.get_buffer("ones") if OP == "emul" else None
 
     # A ramp with no zeros anywhere: then "returned zeros" is unambiguously "never written",
     # and any partial delivery shows up as a prefix/suffix boundary rather than as noise.
@@ -66,6 +80,8 @@ def main():
     npass = 0
     for trial in range(3):
         np.copyto(src.data, x.reshape(-1))
+        if ones is not None:
+            np.copyto(ones.data, np.ones(N, BF16))
         dst.data[:] = 0
         c()
         got = np.array(dst.data, copy=True)
