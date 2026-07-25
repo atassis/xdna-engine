@@ -54,9 +54,17 @@
 // group's int32 partial is scaled by its per-column f32 group scale and summed
 // in f32; the f32 tile is narrowed to bf16 once at the end.
 template <unsigned M, unsigned K, unsigned N, unsigned G>
+// NOTE on __restrict: pScale is deliberately NOT __restrict. A core tile only has 2 input
+// DMA channels (a real 3rd input is rejected by the placer: "tile requires 3 input/1 output
+// DMA channels, but only 2 input/2 output available"), so the harness packs the weights and
+// the scales into ONE buffer -- pB and pScale then point into the SAME allocation. Marking
+// both __restrict asserts they never alias, which is false, and the compiler is entitled to
+// drop or reorder the scale loads on that promise. That is exactly what happened: C came
+// back EXACTLY zero on device while the identical kernel with a locally-baked scale produced
+// nonzero output.
 static inline void gemm_int8xint4_dequant_tile(const int8_t *__restrict pA,
-                                               const int4 *__restrict pB,
-                                               const float *__restrict pScale,
+                                               const int4 *pB,
+                                               const float *pScale,
                                                bfloat16 *__restrict pC) {
   static_assert(M % 4 == 0, "M must be a multiple of 4 (mmul_8_4 tile)");
   static_assert(K % 16 == 0, "K must be a multiple of 16 (mmul_8_4 tile)");
@@ -110,13 +118,21 @@ static inline void gemm_int8xint4_dequant_tile(const int8_t *__restrict pA,
         // per-output-column group scale for columns [ni*16, ni*16+16),
         // replicated across the 4 M rows so it lines up with the row-major
         // [4,16] tile (element r*16 + c uses scale of column c).
+        //
+        // Build this with vector ops only. The obvious form -- a local
+        // `float sbuf[64]` filled by a scalar r/c loop and then load_v'd -- is
+        // MISCOMPILED on aie2p: a device bisect (probe_dequant_bisect2.py) found
+        // the int32 accumulate and to_float bit-exact on all 8 tiles while this
+        // multiply diverged to 0/NaN for exactly the ni>=2 tiles, i.e. the second
+        // half of the stack array, even though every ni fills sbuf identically.
+        // Isolated probes of the same scalar-store -> vector-load pattern hung the
+        // core outright while a known-good brick passed bit-exact right after.
+        // concat of the loaded 16-wide row IS the [4,16] replication (element
+        // r*16 + c = sg[c]), so the stack array buys nothing.
+        static_assert(MMUL::size_C == 64, "scale replication assumes a [4,16] C tile");
         const float *sg = pScale + g * N + ni * 16;
-        float sbuf[MMUL::size_C];
-        for (unsigned r = 0; r < 4; ++r)
-          for (unsigned c = 0; c < 16; ++c)
-            sbuf[r * 16 + c] = sg[c];
-        ::aie::vector<float, MMUL::size_C> sv =
-            ::aie::load_v<MMUL::size_C>(sbuf);
+        ::aie::vector<float, 16> s16 = ::aie::load_v<16>(sg);
+        ::aie::vector<float, MMUL::size_C> sv = ::aie::concat(s16, s16, s16, s16);
 
         // aie::mul of two float vectors yields an accfloat accum; narrow the
         // elementwise product back to a vector before the running f32 add.

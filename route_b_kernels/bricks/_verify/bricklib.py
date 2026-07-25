@@ -259,5 +259,6 @@ def verify_rowwise(name, brick_cc, shim_body, symbol, m, in_cols, out_cols,
     print(f"[{name:22s}] rel_l2={rl2:.3e} gate={gate:.1e} nz={nz:.2e} "
           f"run2run={determ:.2e} -> {status}")
     # `got` is returned so a probe can inspect WHAT is wrong, not just how wrong.
+    # rowwise has no unpack step: dev1 IS the (m, out_cols) device result.
     return dict(name=name, rel_l2=rl2, gate=gate, nonzero=nz, run2run=determ,
-                status=status, ok=ok, got=got)
+                status=status, ok=ok, got=dev1)
