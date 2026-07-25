@@ -142,15 +142,24 @@ def do_gemm_int8xint4_dequant():
     b_bytes = b_pad.size
     # pack scale (row-major [K/G,N] f32) into the weight buffer after B; shim splits.
     wbuf = np.concatenate([b_pad, scale.reshape(-1).view(np.int8)])
-    sym = "gemm_int8xint4_dequant_8x64x64_g64"
+    # The BOUND SYMBOL must be the 3-arg shim, NOT the brick's own exported wrapper.
+    # `gemm_int8xint4_dequant_8x64x64_g64` is declared in the .cc we #include and takes
+    # FOUR pointers (a, b, scale, c). A core tile only has 2 input DMA channels, so the
+    # harness can deliver just 3 buffers (A, wbuf, C) -- binding that 4-arg symbol called
+    # it with 3, landing `scale` on the zero-initialised OUTPUT buffer (the long-recorded
+    # "scale reads as EXACTLY 0") and leaving the real `c` a dangling register, so every
+    # store missed the output and C came back exactly zero. The shim below is the thing
+    # that packs scale out of wbuf, and it is what must be invoked.
+    fname = "gemm_int8xint4_dequant_8x64x64_g64"   # file stem only
+    sym = "gi4dq_verify"                            # the symbol actually called
     shim = ('#include <stdint.h>\n'
             f'#include "{cc}"\n'
-            'extern "C" void gi4dq_verify(const int8_t*a,const int8_t*wbuf,bfloat16*c){'
+            f'extern "C" void {sym}(const int8_t*a,const int8_t*wbuf,bfloat16*c){{'
             'const int4*b=(const int4*)wbuf;'
             f'const float*s=(const float*)(wbuf+{b_bytes});'
             'gemm_int8xint4_dequant_tile<8,64,64,64>(a,b,s,c);}')
-    (GEN / f"{sym}_shim.cc").write_text(shim)
-    design = bricklib._build_oneshot(sym, GEN / f"{sym}_shim.cc",
+    (GEN / f"{fname}_shim.cc").write_text(shim)
+    design = bricklib._build_oneshot(sym, GEN / f"{fname}_shim.cc",
                                      [M * K, wbuf.size], M * N,
                                      [np.int8, np.int8], ml_dtypes.bfloat16, [])
     import aie.iron as iron
