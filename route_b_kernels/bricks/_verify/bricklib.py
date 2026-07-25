@@ -20,6 +20,29 @@ GEN = Path(__file__).parent / "gen"
 GEN.mkdir(exist_ok=True)
 
 
+def _aie_api_include():
+    """Resolve the aie_api include dir and return it as a -I flag, or nothing if the
+    active toolchain instance already exposes the headers.
+
+    Every brick .cc opens with `#include <aie_api/aie.hpp>`, but whether that resolves is
+    a property of WHICH instance is active: instances built with an `include/` tree carry
+    it implicitly, while a leaner one only symlinks `src/third_party/aie_api` and the
+    Peano invocation never sees it (fatal: 'aie_api/aie.hpp' file not found). Deriving the
+    path from the live `aie` package keeps the harness instance-independent rather than
+    tying it to whichever instance happened to be pinned when it was written.
+    """
+    import aie
+
+    inst = Path(aie.__file__).resolve().parent.parent.parent  # <instance>/python/aie/__init__.py
+    for cand in (inst / "include", inst / "src" / "third_party" / "aie_api" / "include"):
+        if (cand / "aie_api" / "aie.hpp").exists():
+            return [f"-I{cand}"]
+    return []
+
+
+_AIE_API_INC = _aie_api_include()
+
+
 def _npty(shape, dt):
     return np.ndarray[shape, np.dtype[dt]]
 
@@ -157,7 +180,7 @@ def verify_oneshot(name, brick_cc, shim_body, symbol, inputs, out_numel, out_sha
                    unpack, golden, gate, compile_flags=None, out_dt=np.int32):
     """inputs: list of (packed_1d_np, dtype). unpack(dev_flat)->got array (native shape).
     golden: reference array (native shape). Returns result dict."""
-    compile_flags = list(compile_flags or [])
+    compile_flags = _AIE_API_INC + list(compile_flags or [])
     shim = GEN / f"{name}_shim.cc"
     shim.write_text(
         f'// AUTO-GENERATED verify shim for the {name} brick.\n'
@@ -199,7 +222,7 @@ def verify_rowwise(name, brick_cc, shim_body, symbol, m, in_cols, out_cols,
     x: (m, in_cols) input.  const: 1-D packed const or None.  expected: (m, out_cols).
     Returns a result dict.
     """
-    compile_flags = list(compile_flags or [])
+    compile_flags = _AIE_API_INC + list(compile_flags or [])
     shim = GEN / f"{name}_shim.cc"
     shim.write_text(
         f'// AUTO-GENERATED verify shim for the {name} brick.\n'

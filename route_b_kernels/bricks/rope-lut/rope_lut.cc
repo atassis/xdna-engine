@@ -66,6 +66,12 @@ constexpr unsigned kFetchW = 16;  // one 16-lane parallel_lookup group per fetch
                                   // undo it per-group, so process one group at a time)
 constexpr unsigned kRotHalfPad = ((kRotHalf + kFetchW - 1) / kFetchW) * kFetchW;
 constexpr unsigned kVec = 16;  // f32/bf16 elementwise apply width (matches norm_gemv_prologue.cc)
+// The fused quantize+gather loop consumes one kVec group per kFetchW fetch, so the two must
+// match, and kRotHalf must tile them exactly -- otherwise the final group silently over-reads
+// inv_freq[kRotHalf]. Fail at compile time instead (ROPE_ROT a multiple of 32 satisfies it;
+// 32/64/128 all do).
+static_assert(kVec == kFetchW, "fused quantize+gather requires the apply and fetch widths to match");
+static_assert(kRotHalf % kVec == 0, "ROPE_ROT/2 must be a whole number of kVec groups (ROPE_ROT % 32 == 0)");
 constexpr float kPi = 3.14159265358979323846f;  // avoid relying on libm M_PI macro
 
 #include "rope_lut_tables.inc"
@@ -91,7 +97,6 @@ void rope_lut_prologue(bfloat16 *restrict qk, const int32_t *restrict pos,
   ::aie::parallel_lookup<int8, ::aie::lut<4, bfloat16>> sin_look(sin_lut, /*step_bits=*/0, /*bias=*/128);
   ::aie::parallel_lookup<int8, ::aie::lut<4, bfloat16>> cos_look(cos_lut, /*step_bits=*/0, /*bias=*/128);
 
-  alignas(::aie::vector_decl_align) int8_t key_buf[kRotHalfPad];
   alignas(::aie::vector_decl_align) bfloat16 sin_buf[kRotHalfPad];
   alignas(::aie::vector_decl_align) bfloat16 cos_buf[kRotHalfPad];
 
@@ -106,6 +111,11 @@ void rope_lut_prologue(bfloat16 *restrict qk, const int32_t *restrict pos,
     const int32_t p = pos[m];
     ::aie::vector<float, kVec> posf =
         ::aie::mul(::aie::to_float(::aie::broadcast<int32, kVec>(p)), (float)ROPE_SCALE_INV);
+    // Quantize AND gather in ONE pass: the keys are consumed by fetch() in the same
+    // iteration that produces them, so they never round-trip through an int8 buffer.
+    // That is what fixes the old bug -- storing a sub-native `vector<int8, 16>` into
+    // `key_buf` wrote past its 16 bytes and corrupted the following keys. Not storing
+    // them at all is both the fix and one less buffer to move.
     for (unsigned i = 0; i < kRotHalf; i += kVec) {
       ::aie::vector<float, kVec> invf = ::aie::load_v<kVec>(inv_freq + i);
       ::aie::vector<float, kVec> theta = ::aie::mul(posf, invf);
@@ -119,14 +129,9 @@ void rope_lut_prologue(bfloat16 *restrict qk, const int32_t *restrict pos,
       ::aie::vector<float, kVec> wrapped = ::aie::sub(theta, ktwopi);
       // quantize to int8 key in [-128,127] (round-to-nearest + saturate), bias=128
       ::aie::vector<float, kVec> q = ::aie::mul(wrapped, 128.0f / kPi);
-      ::aie::vector<int8, kVec> key = ::aie::to_fixed<int8>(q);
-      ::aie::store_v(key_buf + i, key);
-    }
-    for (unsigned i = kRotHalf; i < kRotHalfPad; ++i) key_buf[i] = 0;  // pad, unused
+      ::aie::vector<int8, kVec> keys = ::aie::to_fixed<int8>(q);
 
-    // --- gather sin/cos via the LUT hardware, kFetchW keys per fetch ---
-    for (unsigned i = 0; i < kRotHalfPad; i += kFetchW) {
-      ::aie::vector<int8, kFetchW> keys = ::aie::load_v<kFetchW>(key_buf + i);
+      // --- gather sin/cos via the LUT hardware, straight from the just-computed keys ---
       ::aie::vector<bfloat16, kFetchW> s = sin_look.fetch(keys);
       ::aie::vector<bfloat16, kFetchW> c = cos_look.fetch(keys);
       // parallel_lookup returns the gathered values DE-INTERLEAVED within the
