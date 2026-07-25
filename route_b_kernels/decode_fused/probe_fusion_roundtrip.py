@@ -12,9 +12,24 @@ output sync, mirroring OperatorSequence) and (b) a bisect down to the STOCK un-c
 ASR-size shape, which fails identically. Meanwhile the same argmax kernel is index-exact on
 the brick verify rail. So the fault is the path, not the kernel and not the tiling.
 
-Doubles as the permanent regression guard for that whole class: three separate
+ROOT CAUSE (found 2026-07-26): the unfenced-shim CLFLUSH read race on the
+XRTTensor/XRTSubBuffer device->host sync. Identified from the GEOMETRY of the corruption,
+not from another bisect -- the correct-element counts were 32, 64 and 128 bf16 = 64, 128
+and 256 bytes = exactly 1, 2 and 4 x 64-byte cache lines, varying run to run, with the rest
+reading as stale zeros. Cache-line-quantised staleness is an invalidation problem; a tap or
+offset error would be quantised by tile geometry instead, and a logic error would not move
+between runs. Eliminated on device first: argmax, chunking, vocab size, the residency
+flags, the placer, and hand-written-vs-built-in ops (IRON's own ElementwiseMul as x*1.0
+fails identically to the identity op here).
+
+So this probe is EXPECTED to stay red until the fenced XRT shim lands. It is kept as the
+reproducer and as the regression guard for the day it goes green. Until then, gate device
+work on the iron.tensor rail (bricklib), which ran 22 bricks at run2run=0.00e+00 and is
+unaffected -- NOT on this path.
+
+Doubles as the permanent regression guard for that whole class: four separate
 harness/runtime bugs in one day presented as kernel bugs, and a round-trip assert catches
-every one of them at the point of failure instead of five bisect stages later.
+them at the point of failure instead of five bisect stages later.
 
 Run:
     python probe_fusion_roundtrip.py            # default N=4096, tile=1024
