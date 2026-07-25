@@ -20,8 +20,19 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../../.." && pwd)"
 WS="$(cd "$REPO/.." && pwd)"
-LOCK="$WS/xdna-engine-private/journal/scripts/npu_lock.sh"
 PROG="${1:?usage: run.sh <verify_xxx.py>}"
+
+# The NPU is single-tenant, so device runs must be serialised across every checkout on the
+# box. That lock helper coordinates more than this repo and therefore lives outside it: point
+# NPU_LOCK_SH at it. Contract: `<lock> queue -- <cmd...>` runs <cmd> holding the device lock,
+# waiting up to NPU_WAIT_S, and exits 75 if the device stays busy (caller should DEFER, not
+# force). Without it we still run, but unserialised -- fine on an idle box, not for timing.
+LOCK="${NPU_LOCK_SH:-}"
+if [ -z "$LOCK" ] || [ ! -x "$LOCK" ]; then
+  echo "run.sh: NPU_LOCK_SH unset or not executable -- running WITHOUT the device lock." >&2
+  echo "        Serialise manually if anything else may touch the NPU." >&2
+  LOCK=""
+fi
 
 # Instance: this worktree's pin. Let failures speak -- do not redirect to /dev/null.
 INST="$("$REPO/scripts/toolchain_up.sh")"
@@ -40,7 +51,8 @@ echo "[run.sh] instance $INST" >&2
 echo "[run.sh] venv     $VENV" >&2
 
 export NPU_WAIT_S="${NPU_WAIT_S:-600}"
-exec "$LOCK" queue -- env \
+# With a lock helper: run under it. Without: run directly (warned above).
+exec ${LOCK:+"$LOCK" queue --} env \
   PATH="$VENV/bin:$VENV/cc-shim:$PATH" \
   PYTHONPATH="$INST/python:${PYTHONPATH:-}" \
   AIECC_PATH="$INST/bin/aiecc" \
