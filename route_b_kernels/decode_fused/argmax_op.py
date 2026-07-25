@@ -22,10 +22,16 @@ class Argmax(MLIROperator):
 
     N: int
     cols: int = 8
+    chunk: int = None      # tile each column's slice; None = one object per column (ASR default)
     context: object = field(default=None, repr=False)
 
     def __post_init__(self):
         assert self.N % self.cols == 0, "N must split evenly across cols"
+        slice_n = self.N // self.cols
+        if self.chunk is None:
+            self.chunk = slice_n
+        assert slice_n % self.chunk == 0, "each column's slice must split evenly into chunks"
+        self.nchunks = slice_n // self.chunk
         MLIROperator.__init__(self, context=self.context)
 
     def get_mlir_artifact(self):
@@ -35,7 +41,7 @@ class Argmax(MLIROperator):
                 self.operator_dir / "argmax_design.py",
                 "my_argmax",
                 (aie_utils.get_current_device(), self.N, self.cols),
-                {"kernel_object": "argmax_slice.o"},
+                {"kernel_object": "argmax_slice.o", "chunk": self.chunk},
             ),
         )
 
@@ -51,5 +57,5 @@ class Argmax(MLIROperator):
     def get_arg_spec(self):
         return [
             AIERuntimeArgSpec("in", (self.N,)),            # logits (bf16)
-            AIERuntimeArgSpec("out", (self.cols * 4,)),    # packed [val:f32 | idx:i32] per column (bf16-typed)
+            AIERuntimeArgSpec("out", (self.cols * self.nchunks * 4,)),  # packed [val:f32 | idx:i32] per partial (bf16-typed)
         ]

@@ -13,15 +13,33 @@ from aie.helpers.taplib.tap import TensorAccessPattern
 from aie.iron.controlflow import range_
 
 
-def my_argmax(dev, N, cols, kernel_object="argmax_slice.o", func_prefix="", verbose=False):
+def my_argmax(dev, N, cols, kernel_object="argmax_slice.o", func_prefix="", verbose=False,
+              chunk=None):
+    """`chunk` tiles each column's slice so the L1 working set stays bounded.
+
+    Default (chunk=None) keeps the original one-object-per-column behaviour, which is what
+    the ASR proj_out path uses (VOCAB_PAD=52224 -> 6528 bf16 = 13 KB, fits).
+
+    At an LLM vocab that does NOT fit: Gemma's 262144 gives a 32768 bf16 slice = 64 KB, i.e.
+    the WHOLE L1 of a core, and double-buffered it is 128 KB -- aiecc fails with "allocated
+    buffers exceeded available memory". Passing e.g. chunk=4096 streams the slice as 8 tiles
+    of 8 KB instead. The core loop already acquires one tile at a time, so nothing about the
+    kernel or the core changes; only the fifo type and the taps do. The cost is that each
+    column now emits nchunks partials instead of 1, so the host reduces over cols*nchunks
+    entries -- still bytes, not megabytes.
+    """
     assert N % cols == 0, "N must split evenly across cols"
     slice_n = N // cols
-    PACK = 4  # bf16 slots per column output = 8 bytes = [val:f32 | idx:i32] (fusion is uniform-bf16)
+    if chunk is None:
+        chunk = slice_n
+    assert slice_n % chunk == 0, "each column's slice must split evenly into chunks"
+    nchunks = slice_n // chunk
+    PACK = 4  # bf16 slots per partial = 8 bytes = [val:f32 | idx:i32] (fusion is uniform-bf16)
 
-    in_line_ty = np.ndarray[(slice_n,), np.dtype[bfloat16]]   # one column's slice
-    out_line_ty = np.ndarray[(PACK,), np.dtype[bfloat16]]     # one column's packed (val,idx)
+    in_line_ty = np.ndarray[(chunk,), np.dtype[bfloat16]]     # one tile of a column's slice
+    out_line_ty = np.ndarray[(PACK,), np.dtype[bfloat16]]     # one packed (val, local_idx)
     in_ty = np.ndarray[(N,), np.dtype[bfloat16]]
-    out_ty = np.ndarray[(cols * PACK,), np.dtype[bfloat16]]
+    out_ty = np.ndarray[(cols * nchunks * PACK,), np.dtype[bfloat16]]
 
     of_ins = [ObjectFifo(in_line_ty, name=f"amin{i}", depth=2) for i in range(cols)]
     of_out = [ObjectFifo(out_line_ty, name=f"amout{i}", depth=2) for i in range(cols)]
@@ -36,7 +54,7 @@ def my_argmax(dev, N, cols, kernel_object="argmax_slice.o", func_prefix="", verb
         for _ in range_(0xFFFFFFFF):
             ei = of_in.acquire(1)
             eo = of_o.acquire(1)
-            knl(ei, eo, slice_n)
+            knl(ei, eo, chunk)
             of_in.release(1)
             of_o.release(1)
 
@@ -45,10 +63,12 @@ def my_argmax(dev, N, cols, kernel_object="argmax_slice.o", func_prefix="", verb
         for i in range(cols)
     ]
 
-    # Per-column input slice = contiguous [i*slice_n : (i+1)*slice_n].
-    in_taps = [TensorAccessPattern((1, N), slice_n * i, [1, 1, 1, slice_n], [0, 0, 0, 1]) for i in range(cols)]
-    # Per-column packed output gathers into out[i*PACK : (i+1)*PACK].
-    out_taps = [TensorAccessPattern((1, cols * PACK), PACK * i, [1, 1, 1, PACK], [0, 0, 0, 1]) for i in range(cols)]
+    # Per-column input slice = contiguous [i*slice_n : (i+1)*slice_n], streamed as nchunks tiles.
+    in_taps = [TensorAccessPattern((1, N), slice_n * i, [1, 1, nchunks, chunk], [0, 0, chunk, 1])
+               for i in range(cols)]
+    # Per-column partials gather into out[i*nchunks*PACK : (i+1)*nchunks*PACK].
+    out_taps = [TensorAccessPattern((1, cols * nchunks * PACK), PACK * nchunks * i,
+                                    [1, 1, nchunks, PACK], [0, 0, PACK, 1]) for i in range(cols)]
 
     rt = Runtime()
     with rt.sequence(in_ty, out_ty) as (A, C):
