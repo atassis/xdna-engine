@@ -48,6 +48,7 @@
 //! See `internal notes` for the full op-coverage audit + resume plan.
 
 pub mod config;
+pub mod sampling;
 pub use config::{GemmaConfig, GEMMA3_1B, GEMMA3_270M};
 
 /// Host RMSNorm reference (the Gemma normalize: x / rms(x) * (1 + weight), NO mean-subtract).
