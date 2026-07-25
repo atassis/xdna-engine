@@ -33,10 +33,14 @@ from iron.common.fusion import FusedMLIROperator
 from argmax_op import Argmax
 
 BF16 = ml_dtypes.bfloat16
-N = 262144        # Gemma-3-270M / Gemma-4-E2B tied-embedding vocab
+# Overridable so the same probe can bisect "is the CHUNKED design wrong?" against "is the
+# FusedMLIROperator path wrong at all?":
+#   PROBE_N=52224 PROBE_CHUNK=6528   -> ASR-size, nchunks=1, i.e. the stock un-chunked shape
+#   (defaults)                       -> Gemma vocab, nchunks=8
+N = int(os.environ.get("PROBE_N", 262144))   # Gemma-3-270M / Gemma-4-E2B tied embedding
 COLS = 8
-SLICE = N // COLS  # 32768 bf16 = 64 KB -- the WHOLE L1 of a core, so it must be tiled
-CHUNK = 4096       # 8 KB tiles; 8 per column -> 64 partials total (512 bytes back, vs 512 KB)
+SLICE = N // COLS  # at Gemma vocab: 32768 bf16 = 64 KB = a whole core L1, so it must tile
+CHUNK = int(os.environ.get("PROBE_CHUNK", 4096))
 NCHUNKS = SLICE // CHUNK
 
 
@@ -115,8 +119,10 @@ def main():
         def run_once():
             np.copyto(lg.data, x.reshape(-1))
             am.data[:] = 0
-            c.input_buffer.device = "cpu"
-            c.output_buffer.device = "npu"
+            # NOTE: no manual residency forcing here any more. That workaround
+            # (input_buffer.device="cpu"; output_buffer.device="npu") is now done properly
+            # inside FusedFullELFCallable._sync_inputs/_sync_outputs, matching what
+            # OperatorSequence already did. If zeros come back, the fix did not take.
             c()
             return np.array(am.data, copy=True)
 
