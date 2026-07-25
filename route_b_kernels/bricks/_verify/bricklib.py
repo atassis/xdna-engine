@@ -7,7 +7,9 @@ through the kernel on aie2p (optionally with ONE packed resident const buffer, t
 within a core tile's 2-input DMA channels); rel-L2 vs the numpy golden gates it.
 Run-twice self-check guards the CLFLUSH read race.
 """
+import re
 from pathlib import Path
+
 import numpy as np
 
 import aie.iron as iron
@@ -123,12 +125,76 @@ def _build_rowwise(symbol, shim, m, in_cols, out_cols, const_len, compile_flags,
     return iron.jit(design, use_cache=False)
 
 
+def _find_kernel_params(symbol, shim_path):
+    """Return the parameter-list text of `symbol`, searching the shim and its local includes.
+
+    Returns None if the symbol cannot be located (parse limits, macros, templates) -- callers
+    treat that as "cannot check", never as "wrong".
+    """
+    shim_path = Path(shim_path)
+    seen, queue = set(), [shim_path]
+    while queue:
+        f = queue.pop()
+        if f in seen or not f.exists():
+            continue
+        seen.add(f)
+        try:
+            src = f.read_text()
+        except OSError:
+            continue
+        m = re.search(rf'\b{re.escape(symbol)}\s*\(([^)]*)\)\s*\{{', src, re.S)
+        if m:
+            return m.group(1)
+        for inc in re.findall(r'#include\s+"([^"]+)"', src):
+            queue.append((f.parent / inc).resolve())
+    return None
+
+
+def _check_symbol_arity(symbol, shim, n_buffers):
+    """Guard the exact bug that cost multiple sessions on gemm-int8xint4-dequant.
+
+    A shim can define one function while the harness BINDS a different symbol -- typically
+    the brick .cc's own exported wrapper, pulled in by the `#include`. If that wrapper takes
+    more pointers than the harness can deliver (a core tile has only 2 input DMA channels),
+    the extra parameters silently bind to whatever is in the argument registers: an operand
+    lands on the zero-initialised OUTPUT buffer and the real output pointer dangles. Nothing
+    errors -- no link failure, no verifier complaint -- the op just returns zeros.
+
+    So: whatever symbol is bound must accept exactly the buffers we pass (inputs + output).
+    """
+    params = _find_kernel_params(symbol, shim)
+    if params is None:
+        return  # cannot locate it; do not guess
+    depth, count, stripped = 0, 1, params.strip()
+    if not stripped:
+        count = 0
+    else:
+        for ch in params:
+            if ch in "<([":
+                depth += 1
+            elif ch in ">)]":
+                depth -= 1
+            elif ch == "," and depth == 0:
+                count += 1
+    if count != n_buffers:
+        raise ValueError(
+            f"kernel symbol '{symbol}' takes {count} parameters but the harness delivers "
+            f"{n_buffers} buffers ({n_buffers - 1} in + 1 out).\n"
+            f"  shim: {shim}\n  params: ({params.strip()})\n"
+            "An arity mismatch is SILENT on device -- surplus parameters bind to garbage "
+            "registers, so an operand can alias the output buffer and the real output "
+            "pointer dangles, yielding an all-zero result that looks like a kernel bug. "
+            "Bind the shim's own function, or deliver the operands it actually wants."
+        )
+
+
 def _build_oneshot(symbol, shim, in_numels, out_numel, in_dts, out_dt, compile_flags):
     """Whole-buffer inputs, ONE kernel call, one output. For GEMM/GEMV-style bricks.
     In/Out params are signature markers for iron.jit's tensor-arg count; data flows
     through rt.sequence."""
     compile_flags = _AIE_API_INC + list(compile_flags or [])
     nin = len(in_numels)
+    _check_symbol_arity(symbol, shim, nin + 1)
 
     def build_program():
         in_tys = [_npty((in_numels[i],), in_dts[i]) for i in range(nin)]
