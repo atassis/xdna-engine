@@ -50,6 +50,7 @@ def _npty(shape, dt):
 def _build_rowwise(symbol, shim, m, in_cols, out_cols, const_len, compile_flags,
                    in_dt, out_dt, const_dt):
     """Return an @iron.jit design. If const_len==0 the const fifo is omitted."""
+    compile_flags = _AIE_API_INC + list(compile_flags or [])
     has_const = const_len > 0
 
     if has_const:
@@ -126,6 +127,7 @@ def _build_oneshot(symbol, shim, in_numels, out_numel, in_dts, out_dt, compile_f
     """Whole-buffer inputs, ONE kernel call, one output. For GEMM/GEMV-style bricks.
     In/Out params are signature markers for iron.jit's tensor-arg count; data flows
     through rt.sequence."""
+    compile_flags = _AIE_API_INC + list(compile_flags or [])
     nin = len(in_numels)
 
     def build_program():
@@ -180,7 +182,7 @@ def verify_oneshot(name, brick_cc, shim_body, symbol, inputs, out_numel, out_sha
                    unpack, golden, gate, compile_flags=None, out_dt=np.int32):
     """inputs: list of (packed_1d_np, dtype). unpack(dev_flat)->got array (native shape).
     golden: reference array (native shape). Returns result dict."""
-    compile_flags = _AIE_API_INC + list(compile_flags or [])
+    compile_flags = list(compile_flags or [])
     shim = GEN / f"{name}_shim.cc"
     shim.write_text(
         f'// AUTO-GENERATED verify shim for the {name} brick.\n'
@@ -210,8 +212,9 @@ def verify_oneshot(name, brick_cc, shim_body, symbol, inputs, out_numel, out_sha
     status = "PASS" if ok else ("FAIL-ZERO" if nz == 0.0 else "FAIL")
     print(f"[{name:22s}] rel_l2={rl2:.3e} gate={gate:.1e} nz={nz:.2e} "
           f"run2run={determ:.2e} -> {status}")
+    # `got` is returned so a probe can inspect WHAT is wrong, not just how wrong.
     return dict(name=name, rel_l2=rl2, gate=gate, nonzero=nz, run2run=determ,
-                status=status, ok=ok)
+                status=status, ok=ok, got=got)
 
 
 def verify_rowwise(name, brick_cc, shim_body, symbol, m, in_cols, out_cols,
@@ -222,7 +225,7 @@ def verify_rowwise(name, brick_cc, shim_body, symbol, m, in_cols, out_cols,
     x: (m, in_cols) input.  const: 1-D packed const or None.  expected: (m, out_cols).
     Returns a result dict.
     """
-    compile_flags = _AIE_API_INC + list(compile_flags or [])
+    compile_flags = list(compile_flags or [])
     shim = GEN / f"{name}_shim.cc"
     shim.write_text(
         f'// AUTO-GENERATED verify shim for the {name} brick.\n'
@@ -255,5 +258,6 @@ def verify_rowwise(name, brick_cc, shim_body, symbol, m, in_cols, out_cols,
     status = "PASS" if ok else ("FAIL-ZERO" if nz == 0.0 else "FAIL")
     print(f"[{name:22s}] rel_l2={rl2:.3e} gate={gate:.1e} nz={nz:.2e} "
           f"run2run={determ:.2e} -> {status}")
+    # `got` is returned so a probe can inspect WHAT is wrong, not just how wrong.
     return dict(name=name, rel_l2=rl2, gate=gate, nonzero=nz, run2run=determ,
-                status=status, ok=ok)
+                status=status, ok=ok, got=got)
