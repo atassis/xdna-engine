@@ -179,6 +179,69 @@ def do_gemm_int8xint4_dequant():
 do_gemm_int8xint4_dequant.brick_name = "gemm-int8xint4-dequant"
 
 
+def _dequant_shape(M, K, N, G, seed):
+    """Gate gemm-int8xint4-dequant at an arbitrary exported shape.
+
+    Generalised from the 8x64x64_g64 case so the brick can be pushed toward shapes a real
+    model actually uses. NOTE the symbol discipline: the .cc exports a FOUR-pointer wrapper
+    (a, b, scale, c) per shape, but a core tile has only 2 input DMA channels so the harness
+    delivers 3 buffers (A, wbuf, C). Binding that wrapper silently lands `scale` on the
+    zero-initialised output buffer and dangles the real output pointer. So bind the 3-arg
+    shim below, never the exported name. (bricklib._check_symbol_arity now enforces this.)
+    """
+    g, cc = golden_mod("gemm-int8xint4-dequant", "gemm_int8xint4_dequant.cc")
+    ngrp = K // G
+    rng = np.random.default_rng(seed)
+    a = rng.integers(-127, 128, (M, K), dtype=np.int64).astype(np.int8)
+    b = rng.integers(-7, 8, (K, N), dtype=np.int64).astype(np.int8)
+    scale = rng.uniform(0.005, 0.02, (ngrp, N)).astype(np.float32)
+    _, ref_bf16 = g.dequant_gemm_ref(a, b, scale, G)
+    b_pad = pack_int4_blocks(b, K, N, pack_int4)
+    b_bytes = int(b_pad.size)
+    wbuf = np.concatenate([b_pad, scale.reshape(-1).view(np.int8)])
+
+    fname = f"gemm_int8xint4_dequant_{M}x{K}x{N}_g{G}"
+    sym = f"gi4dq_verify_{M}x{K}x{N}_g{G}"
+    shim = ('#include <stdint.h>\n'
+            f'#include "{cc}"\n'
+            f'extern "C" void {sym}(const int8_t*a,const int8_t*wbuf,bfloat16*c){{'
+            'const int4*b=(const int4*)wbuf;'
+            f'const float*s=(const float*)(wbuf+{b_bytes});'
+            f'gemm_int8xint4_dequant_tile<{M},{K},{N},{G}>(a,b,s,c);}}')
+    (GEN / f"{fname}_shim.cc").write_text(shim)
+    design = bricklib._build_oneshot(sym, GEN / f"{fname}_shim.cc",
+                                     [M * K, wbuf.size], M * N,
+                                     [np.int8, np.int8], ml_dtypes.bfloat16, [])
+    import aie.iron as iron
+    a_t = iron.tensor(np.ascontiguousarray(tile_pack(a, 4, 16)), dtype=np.int8, device="npu")
+    w_t = iron.tensor(np.ascontiguousarray(wbuf), dtype=np.int8, device="npu")
+    c_t = iron.zeros((M * N,), dtype=ml_dtypes.bfloat16, device="npu")
+    design(a_t, w_t, c_t)
+    dev = np.array(c_t.numpy().copy(), copy=True)
+    got = tile_unpack(dev, M, N, 4, 16).astype(np.float32)
+    ref = ref_bf16.astype(np.float32)
+    rl2 = float(np.linalg.norm((got - ref).ravel()) / (np.linalg.norm(ref.ravel()) + 1e-12))
+    ok = rl2 <= 2e-2
+    nm = f"gemm-int8xint4-dequant-{M}x{K}x{N}_g{G}"
+    print(f"[{nm:34s}] rel_l2={rl2:.3e} gate=2e-2 {'PASS' if ok else 'FAIL'}", flush=True)
+    return dict(name=nm, rel_l2=rl2, ok=ok, status="PASS" if ok else "FAIL")
+
+
+def do_gemm_int8xint4_dequant_64x128x128():
+    """The next exported shape up from the gated 8x64x64.
+
+    This is deliberately a load-bearing probe of the RAIL, not just the kernel: bricklib's
+    one-shot builder moves whole operands into L1, and by arithmetic this shape needs
+    roughly A 8 KB + wbuf 9 KB + C 16 KB ~= 33 KB, which at objectFIFO depth 2 is ~66 KB
+    against a 64 KB L1. So it sits right at (or just past) the one-shot ceiling. Either it
+    passes -- int4 extends to a second, larger shape -- or it fails on allocation, which
+    confirms on DEVICE that reaching real model shapes needs a streaming/tiled-operand rail
+    rather than more one-shot shapes.
+    """
+    return _dequant_shape(64, 128, 128, 64, seed=23)
+do_gemm_int8xint4_dequant_64x128x128.brick_name = "gemm-int8xint4-dequant-64x128x128"
+
+
 if __name__ == "__main__":
     for fn in (do_gemm_int8xint4, do_gemv_int8xint4, do_gemm_int8xint4_dequant):
         guard(fn)
