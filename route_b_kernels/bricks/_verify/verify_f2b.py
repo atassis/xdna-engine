@@ -227,6 +227,88 @@ def _dequant_shape(M, K, N, G, seed):
     return dict(name=nm, rel_l2=rl2, ok=ok, status="PASS" if ok else "FAIL")
 
 
+def _dequant_shape_streamed(M, K, N, G, Nt, seed):
+    """Gate gemm-int8xint4-dequant at ANY shape, by streaming the weight in N-tiles.
+
+    The one-shot rail stages A, the whole weight+scale buffer and the whole C into L1, so it
+    stops at the first shape whose working set passes 64 KB (`_dequant_shape` at 64x128x128
+    already fails to BUILD). Tiling the OUTPUT COLUMNS fixes that without touching the kernel:
+
+      C[:, n0:n0+Nt] = f(A, B[:, n0:n0+Nt], scale[:, n0:n0+Nt])
+
+    Every n-tile is an independent M x K x Nt GEMM over the FULL K, so no cross-tile
+    accumulation is needed and the kernel template is simply instantiated at N=Nt. A is the
+    same for every tile -- it is the RESIDENT operand, acquired once for the whole stream --
+    while the weight, which is the operand that actually grows with the model, arrives one
+    tile at a time. L1 then holds A + one weight tile + one C tile instead of the whole
+    weight, and the shape the rail can reach is set by Nt rather than by N.
+
+    Nt tunes the L1 footprint: a tile costs K*Nt/2 weight bytes + (K/G)*Nt*4 scale bytes.
+    """
+    g, cc = golden_mod("gemm-int8xint4-dequant", "gemm_int8xint4_dequant.cc")
+    assert N % Nt == 0 and Nt % 16 == 0, f"Nt={Nt} must be a multiple of 16 dividing N={N}"
+    ngrp = K // G
+    rng = np.random.default_rng(seed)
+    a = rng.integers(-127, 128, (M, K), dtype=np.int64).astype(np.int8)
+    b = rng.integers(-7, 8, (K, N), dtype=np.int64).astype(np.int8)
+    scale = rng.uniform(0.005, 0.02, (ngrp, N)).astype(np.float32)
+    _, ref_bf16 = g.dequant_gemm_ref(a, b, scale, G)
+
+    n_tiles = N // Nt
+    tiles = []
+    for t in range(n_tiles):
+        sl = slice(t * Nt, (t + 1) * Nt)
+        # Each tile is packed as its OWN M x K x Nt problem: (ki, ni) 16x16 int4 blocks for
+        # the slice, then that slice's [K/G, Nt] f32 scales. The kernel indexes both with
+        # nTiles = Nt/16, so it needs the slice's layout, not a view into the full weight.
+        b_t = pack_int4_blocks(b[:, sl], K, Nt, pack_int4)
+        s_t = np.ascontiguousarray(scale[:, sl]).reshape(-1).view(np.int8)
+        tiles.append(np.concatenate([b_t, s_t]))
+    b_tile_bytes = int(pack_int4_blocks(b[:, :Nt], K, Nt, pack_int4).size)
+    in_tiles = np.stack(tiles)
+
+    fname = f"gemm_int8xint4_dequant_{M}x{K}x{N}_g{G}_nt{Nt}_streamed"
+    sym = f"gi4dq_stream_{M}x{K}x{N}_g{G}_nt{Nt}"
+    # Argument order is the streamed-rail contract: (tile_in, resident, tile_out).
+    shim = ('#include <stdint.h>\n'
+            f'#include "{cc}"\n'
+            f'extern "C" void {sym}(const int8_t*wtile,const int8_t*a,bfloat16*c){{'
+            'const int4*b=(const int4*)wtile;'
+            f'const float*s=(const float*)(wtile+{b_tile_bytes});'
+            f'gemm_int8xint4_dequant_tile<{M},{K},{Nt},{G}>(a,b,s,c);}}')
+    (GEN / f"{fname}_shim.cc").write_text(shim)
+
+    def unpack(dev):
+        # dev is (n_tiles, M*Nt) bf16, each tile [mTiles][Nt/16][4x16] -> (M, Nt); the tiles
+        # are consecutive column slices, so the full C is their horizontal concatenation.
+        cols = [tile_unpack(dev[t].reshape(-1), M, Nt, 4, 16) for t in range(n_tiles)]
+        return np.concatenate(cols, axis=1).astype(np.float32)
+
+    nm = f"gi4dq-streamed-{M}x{K}x{N}_g{G}_nt{Nt}"
+    return bricklib.verify_streamed(
+        nm, GEN / f"{fname}_shim.cc", sym,
+        in_tiles=in_tiles, out_tile_numel=M * Nt,
+        resident=tile_pack(a, 4, 16),
+        unpack=unpack, golden=ref_bf16.astype(np.float32), gate=2e-2,
+        in_dt=np.int8, out_dt=ml_dtypes.bfloat16, resident_dt=np.int8)
+
+
+def do_gemm_int8xint4_dequant_64x128x128_streamed():
+    """The shape the one-shot rail cannot BUILD, now reachable by streaming the weight."""
+    return _dequant_shape_streamed(64, 128, 128, 64, Nt=32, seed=23)
+do_gemm_int8xint4_dequant_64x128x128_streamed.brick_name = "gi4dq-streamed-64x128x128"
+
+
+def do_gemm_int8xint4_dequant_tallk_streamed():
+    """The tall-K decode shape -- the reason int4 is a rails-grade lever at all.
+
+    B alone is ~2.1 MB, roughly 33x a core tile's L1, so this is unreachable one-shot by two
+    orders of magnitude. At Nt=16 a tile is 1024*16/2 + 8*16*4 = 8.7 KB.
+    """
+    return _dequant_shape_streamed(4, 1024, 4096, 128, Nt=16, seed=29)
+do_gemm_int8xint4_dequant_tallk_streamed.brick_name = "gi4dq-streamed-4x1024x4096"
+
+
 def do_gemm_int8xint4_dequant_64x128x128():
     """The next exported shape up from the gated 8x64x64.
 
