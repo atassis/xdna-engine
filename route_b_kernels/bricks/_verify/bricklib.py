@@ -18,6 +18,16 @@ from aie.iron.controlflow import range_
 from aie.iron.kernel import ExternalFunction
 from aie.helpers.taplib import TensorTiler2D
 
+# The JIT cache keyed only what it was told about, so editing a kernel .cc did not
+# invalidate it and a stale .o was linked -- hence use_cache=False everywhere here,
+# at ~150 ms of recompilation per design() call against ~0.19 ms cached. Set
+# BRICK_JIT_CACHE=1 to enable it against a toolchain that records what a build
+# actually consumed; do NOT enable it otherwise, and never without re-running the
+# perturb check (edit a kernel, confirm the gate moves).
+import os as _os
+
+_JIT_CACHE = _os.environ.get("BRICK_JIT_CACHE") == "1"
+
 GEN = Path(__file__).parent / "gen"
 GEN.mkdir(exist_ok=True)
 
@@ -105,7 +115,7 @@ def _build_streamed(symbol, shim, n_tiles, in_tile, out_tile, resident_len, comp
                 rt.drain(of.cons(), o, out_tap, wait=True)
             return Program(iron.get_current_device(), rt).resolve_program()
         design.__name__ = design.__qualname__ = f"design_{symbol}"
-        return iron.jit(design, use_cache=False)
+        return iron.jit(design, use_cache=_JIT_CACHE)
 
     def design(inp: In, out: Out):
         in_row = _npty((in_tile,), in_dt)
@@ -136,7 +146,7 @@ def _build_streamed(symbol, shim, n_tiles, in_tile, out_tile, resident_len, comp
             rt.drain(of.cons(), o, out_tap, wait=True)
         return Program(iron.get_current_device(), rt).resolve_program()
     design.__name__ = design.__qualname__ = f"design_{symbol}"
-    return iron.jit(design, use_cache=False)
+    return iron.jit(design, use_cache=_JIT_CACHE)
 
 
 def _build_rowwise(symbol, shim, m, in_cols, out_cols, const_len, compile_flags,
@@ -266,7 +276,7 @@ def _build_oneshot(symbol, shim, in_numels, out_numel, in_dts, out_dt, compile_f
         raise ValueError(f"_build_oneshot supports 1-4 inputs, got {nin}")
 
     design.__name__ = design.__qualname__ = f"design_{symbol}"
-    return iron.jit(design, use_cache=False)
+    return iron.jit(design, use_cache=_JIT_CACHE)
 
 
 def verify_oneshot(name, brick_cc, shim_body, symbol, inputs, out_numel, out_shape,
