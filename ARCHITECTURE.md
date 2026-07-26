@@ -43,6 +43,18 @@ A request enters through a `Frontend` (tokenize / feature-extract), runs the mod
 `Head` (pooling, projection, argmax). The device actor in `npu-runtime` serializes all NPU
 dispatches, since the NPU is single-tenant.
 
+## Model residency
+
+Which models hold the device is a property of the request, not of the config file. A request
+naming a model that is not resident loads it on demand, evicting the least-recently-used
+model when `max_resident` is already full; a model that has served nothing for
+`idle_unload_s` is unloaded and gives the device back. Both happen on the device actor thread,
+between commands, so residency never changes underneath a request in flight and the design
+stays one owner, one thread, no lock. `[server]` keys: `max_resident` (slots),
+`idle_unload_s` (idle window, `0` disables), `sweep_interval_s` (how often the actor looks),
+`evict_policy` (`lru`, or `none` to refuse instead of evicting). `GET /v1/models` reports each
+model's `state` and `idle_s`.
+
 The performance work lives below this seam. The recurring theme is **eliminating data
 movement**, not speeding up arithmetic:
 

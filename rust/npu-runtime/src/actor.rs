@@ -1,7 +1,8 @@
 //! The single device owner. One thread holds the Registry (and the !Send models) and serves a
 //! cloneable Send Handle over an mpsc channel - total serialization of the single-tenant NPU.
-use std::sync::mpsc::{channel, Sender};
+use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
 use std::thread::JoinHandle;
+use std::time::Instant;
 
 use crate::config::Config;
 use crate::loader::ModelLoader;
@@ -53,26 +54,47 @@ pub fn start(cfg: Config, loader: Box<dyn ModelLoader + Send>) -> (Handle, JoinH
         // actor survives, and the panic message is returned as the error the caller sees.
         let _ = guard(|| reconcile(&cfg, &mut reg, loader.as_ref()));
         let _ = ready_tx.send(());
-        while let Ok(cmd) = rx.recv() {
-            match cmd {
-                Cmd::Transcribe { model, pcm, sr, reply } => {
-                    let r = guard(|| run_transcribe(&cfg, &reg, model.as_deref(), &pcm, sr))
+        // `recv_timeout` rather than `recv`: the actor is the ONLY owner of the single-tenant NPU,
+        // so idle unload has to happen on this thread or not at all. Waking on a timeout gives the
+        // timer for free and puts the sweep strictly BETWEEN commands -- an eviction can never race
+        // a request in flight, and no second thread or lock enters the design.
+        //
+        // The wait is computed from a DEADLINE, not passed as a fixed interval. With a fixed
+        // interval the timeout only fires after a fully quiet window, so any client polling
+        // /healthz or /v1/models more often than sweep_interval_s would reset the wait forever and
+        // idle models would never be released.
+        let mut next_sweep = Instant::now() + cfg.server.sweep_interval();
+        loop {
+            match rx.recv_timeout(next_sweep.saturating_duration_since(Instant::now())) {
+                Ok(Cmd::Transcribe { model, pcm, sr, reply }) => {
+                    let r = guard(|| run_transcribe(&cfg, &mut reg, loader.as_ref(), model.as_deref(), &pcm, sr))
                         .unwrap_or_else(|msg| Err(EngineError::Device(msg)));
                     let _ = reply.send(r);
                 }
-                Cmd::Embed { model, text, reply } => {
-                    let r = guard(|| run_embed(&cfg, &reg, model.as_deref(), &text))
+                Ok(Cmd::Embed { model, text, reply }) => {
+                    let r = guard(|| run_embed(&cfg, &mut reg, loader.as_ref(), model.as_deref(), &text))
                         .unwrap_or_else(|msg| Err(EngineError::Device(msg)));
                     let _ = reply.send(r);
                 }
-                Cmd::Reconcile { cfg: newcfg, reply } => {
+                Ok(Cmd::Reconcile { cfg: newcfg, reply }) => {
                     cfg = *newcfg;
                     let rep = guard(|| reconcile(&cfg, &mut reg, loader.as_ref()))
                         .unwrap_or_else(|msg| ReconcileReport { failed: vec![msg], ..Default::default() });
                     let _ = reply.send(rep);
                 }
-                Cmd::Status { reply } => { let _ = reply.send(reg.status()); }
-                Cmd::Shutdown => break,
+                Ok(Cmd::Status { reply }) => { let _ = reply.send(reg.status()); }
+                Ok(Cmd::Shutdown) => break,
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+            let now = Instant::now();
+            if now >= next_sweep {
+                if let Some(idle) = cfg.server.idle_unload() {
+                    for name in guard(|| reg.sweep_idle(now, idle)).unwrap_or_default() {
+                        eprintln!("[npu-runtime] unloaded {name}: idle >= {}s", idle.as_secs());
+                    }
+                }
+                next_sweep = now + cfg.server.sweep_interval();
             }
         }
     });
@@ -80,15 +102,41 @@ pub fn start(cfg: Config, loader: Box<dyn ModelLoader + Send>) -> (Handle, JoinH
     (Handle { tx }, join)
 }
 
-fn run_transcribe(cfg: &Config, reg: &Registry, want: Option<&str>, pcm: &[i16], sr: u32)
-    -> Result<Served<String>, EngineError> {
-    let name = resolve(cfg, reg, Capability::Asr, want)?;
+/// Route the request to a model, make that model resident, and verify it has the capability asked
+/// for. Loading here is what turns "switch models" into a per-request choice instead of a config
+/// edit + reload. Safe to load/evict at this point: the actor serves one command at a time.
+fn serve_ready(cfg: &Config, reg: &mut Registry, loader: &dyn ModelLoader, cap: Capability,
+               want: Option<&str>) -> Result<String, EngineError> {
+    let name = resolve(cfg, reg, cap, want)?;
+    let now = Instant::now();
+    if reg.get_loaded(&name).is_none() {
+        let mcfg = cfg.find(&name).cloned()
+            .ok_or_else(|| EngineError::Load(format!("model {name:?} is not in the config")))?;
+        reg.ensure_resident(&mcfg, loader, &cfg.server, now)?;
+    }
+    // The kind is only a promise until the model is actually loaded (a name resolved on demand has
+    // never reported its capability), so this is the one authoritative check.
+    match reg.get_loaded(&name).map(|m| m.kind()) {
+        Some(k) if k == cap => {
+            // Stamp on selection, not on success: a request that then fails inside the model still
+            // counted as use, and must not be the next thing evicted or swept.
+            reg.touch(&name, now);
+            Ok(name)
+        }
+        Some(got) => Err(EngineError::WrongKind { wanted: cap, got }),
+        None => Err(EngineError::Load(format!("{name} not loaded"))),
+    }
+}
+
+fn run_transcribe(cfg: &Config, reg: &mut Registry, loader: &dyn ModelLoader, want: Option<&str>,
+                  pcm: &[i16], sr: u32) -> Result<Served<String>, EngineError> {
+    let name = serve_ready(cfg, reg, loader, Capability::Asr, want)?;
     let m = reg.get_loaded(&name).ok_or_else(|| EngineError::Load(format!("{name} not loaded")))?;
     Ok(Served { model: name.clone(), value: m.transcribe(pcm, sr)? })
 }
-fn run_embed(cfg: &Config, reg: &Registry, want: Option<&str>, text: &str)
+fn run_embed(cfg: &Config, reg: &mut Registry, loader: &dyn ModelLoader, want: Option<&str>, text: &str)
     -> Result<Served<Vec<f32>>, EngineError> {
-    let name = resolve(cfg, reg, Capability::Embed, want)?;
+    let name = serve_ready(cfg, reg, loader, Capability::Embed, want)?;
     let m = reg.get_loaded(&name).ok_or_else(|| EngineError::Load(format!("{name} not loaded")))?;
     Ok(Served { model: name.clone(), value: m.embed(text)? })
 }
@@ -118,4 +166,97 @@ impl Handle {
         rx.recv().unwrap_or_default()
     }
     pub fn shutdown(&self) { let _ = self.tx.send(Cmd::Shutdown); }
+}
+
+// These live in the crate (not tests/actor.rs, which is behind the `testkit` feature) so the plain
+// `cargo test --workspace` in scripts/ci_gate.sh actually runs them.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Defaults, ModelCfg, ServerCfg};
+    use crate::loader::mock::MockLoader;
+    use crate::registry::LoadState;
+    use npu_engine::ModelKind;
+    use std::collections::BTreeMap;
+    use std::time::Duration;
+
+    /// asr + embed configured, but only ONE slot: serving both means swapping.
+    fn swap_setup(srv: ServerCfg) -> (Handle, JoinHandle<()>) {
+        let mut t = BTreeMap::new();
+        t.insert("asr".to_string(), Ok((ModelKind::Asr, 1)));
+        t.insert("bge".to_string(), Ok((ModelKind::Embed, 1)));
+        let cfg = Config {
+            server: srv,
+            defaults: Defaults { asr: Some("asr".into()), embed: Some("bge".into()) },
+            models: vec![
+                ModelCfg { name: "asr".into(), scenario: "x".into() },
+                ModelCfg { name: "bge".into(), scenario: "y".into() },
+            ],
+        };
+        start(cfg, Box::new(MockLoader { table: t }))
+    }
+    fn state_of(h: &Handle, name: &str) -> LoadState {
+        h.status().into_iter().find(|s| s.name == name).expect("entry").state
+    }
+
+    #[test]
+    fn one_slot_serves_both_models_by_swapping() {
+        // idle_unload off: this test is about max_resident as an evict trigger, nothing else.
+        let (h, j) = swap_setup(ServerCfg { max_resident: 1, idle_unload_s: 0, ..Default::default() });
+        // Boot loaded the first configured model and deferred the second.
+        assert_eq!(state_of(&h, "asr"), LoadState::Loaded);
+        assert_eq!(state_of(&h, "bge"), LoadState::Unloaded);
+        // An embed request pulls bge in on demand, evicting asr...
+        assert_eq!(h.embed(None, "hi").unwrap().model, "bge");
+        assert_eq!(state_of(&h, "bge"), LoadState::Loaded);
+        assert_eq!(state_of(&h, "asr"), LoadState::Unloaded);
+        // ...and asr swaps back for a transcription. Before this, the second model just Failed.
+        let tr = h.transcribe(None, vec![0i16; 4], 16_000).unwrap();
+        assert_eq!((tr.model.as_str(), tr.value.as_str()), ("asr", "mock-text"));
+        assert_eq!(state_of(&h, "asr"), LoadState::Loaded);
+        h.shutdown(); j.join().unwrap();
+    }
+
+    #[test]
+    fn explicit_model_wins_over_the_default() {
+        let (h, j) = swap_setup(ServerCfg { max_resident: 2, idle_unload_s: 0, ..Default::default() });
+        assert_eq!(h.embed(Some("bge"), "hi").unwrap().model, "bge");
+        // Naming an ASR model on the embed route is still a WrongKind error, not a silent swap.
+        assert!(h.embed(Some("asr"), "hi").is_err());
+        h.shutdown(); j.join().unwrap();
+    }
+
+    #[test]
+    fn idle_sweep_releases_the_device_then_reloads_on_demand() {
+        let (h, j) = swap_setup(ServerCfg {
+            max_resident: 2, idle_unload_s: 1, sweep_interval_s: 1, ..Default::default()
+        });
+        assert_eq!(h.embed(None, "hi").unwrap().model, "bge");
+        // Poll until the actor's own sweep releases it. Polling this fast is deliberate: it is the
+        // regression test for the deadline (a fixed recv_timeout interval would be reset by every
+        // poll and never fire).
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while state_of(&h, "bge") == LoadState::Loaded && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let s = h.status().into_iter().find(|s| s.name == "bge").unwrap();
+        assert_eq!(s.state, LoadState::Unloaded, "idle model was never swept: {}", s.detail);
+        assert!(s.detail.contains("idle"), "{}", s.detail);
+        assert_eq!(s.idle_s, None);
+        // The whole point: the next request just works, no /admin/reload.
+        assert_eq!(h.embed(None, "again").unwrap().model, "bge");
+        assert_eq!(state_of(&h, "bge"), LoadState::Loaded);
+        h.shutdown(); j.join().unwrap();
+    }
+
+    #[test]
+    fn idle_unload_zero_keeps_models_resident() {
+        let (h, j) = swap_setup(ServerCfg {
+            max_resident: 2, idle_unload_s: 0, sweep_interval_s: 1, ..Default::default()
+        });
+        assert_eq!(h.embed(None, "hi").unwrap().model, "bge");
+        std::thread::sleep(Duration::from_millis(2500));
+        assert_eq!(state_of(&h, "bge"), LoadState::Loaded, "idle_unload_s = 0 must disable the sweep");
+        h.shutdown(); j.join().unwrap();
+    }
 }

@@ -1,7 +1,9 @@
-//! Actual state: which models are loaded, their status, and the memory accountant.
-use crate::config::{ModelCfg, ServerCfg};
+//! Actual state: which models are loaded, their status, the memory accountant, and residency --
+//! `last_used` per entry, which is what LRU eviction and idle unload both order themselves by.
+use crate::config::{EvictPolicy, ModelCfg, ServerCfg};
 use crate::loader::{Inference, ModelLoader};
-use npu_engine::ModelKind;
+use npu_engine::{EngineError, ModelKind};
+use std::time::{Duration, Instant};
 
 pub type Capability = ModelKind; // Asr -> transcription, Embed -> embeddings
 
@@ -15,12 +17,18 @@ pub struct ModelStatus {
     pub detail: String,
     pub kind: Option<ModelKind>,
     pub bo_bytes: u64,
+    /// Seconds since this model last served a request, for resident models only. `None` when the
+    /// model is not resident (nothing is holding the device on its behalf).
+    pub idle_s: Option<u64>,
 }
 
 pub struct Entry {
     pub cfg: ModelCfg,
     pub model: Option<Box<dyn Inference>>,
     pub status: ModelStatus,
+    /// Last time this entry served a request; set to the load time when it becomes resident. Stale
+    /// but harmless while the entry is not resident -- both readers filter on residency first.
+    pub last_used: Instant,
 }
 
 #[derive(Default)]
@@ -38,14 +46,36 @@ impl Registry {
     pub fn resident_count(&self) -> usize {
         self.entries.iter().filter(|e| e.model.is_some()).count()
     }
-    pub fn status(&self) -> Vec<ModelStatus> {
-        self.entries.iter().map(|e| e.status.clone()).collect()
+    pub fn status(&self) -> Vec<ModelStatus> { self.status_at(Instant::now()) }
+    /// `status()` with the clock passed in, so idle reporting is testable without sleeping.
+    pub fn status_at(&self, now: Instant) -> Vec<ModelStatus> {
+        self.entries.iter().map(|e| {
+            let mut s = e.status.clone();
+            s.idle_s = e.model.as_ref().map(|_| now.saturating_duration_since(e.last_used).as_secs());
+            s
+        }).collect()
+    }
+    /// The capability of an entry: from the live model, else the kind remembered from its last
+    /// successful load. Survives an unload, which is what lets routing stay sweep-invariant.
+    pub fn known_kind(&self, name: &str) -> Option<ModelKind> {
+        let e = self.entries.iter().find(|e| e.cfg.name == name)?;
+        e.model.as_ref().map(|m| m.kind()).or(e.status.kind)
+    }
+    /// Stamp a model as just used. Called once per served request.
+    pub fn touch(&mut self, name: &str, now: Instant) {
+        if let Some(e) = self.entries.iter_mut().find(|e| e.cfg.name == name) { e.last_used = now; }
     }
 
     /// Try to load one model under the budget, recording status. Never panics.
-    pub fn try_load(&mut self, cfg: &ModelCfg, loader: &dyn ModelLoader, srv: &ServerCfg) {
+    ///
+    /// This is the RECONCILE path, and it still refuses over `max_resident` -- booting a config with
+    /// more models than slots must not thrash the device loading and evicting in a loop, and the
+    /// models that do not fit are a capacity decision, not a failure (hence `Unloaded`, not
+    /// `Failed`). The request path is `ensure_resident`, which evicts instead.
+    pub fn try_load(&mut self, cfg: &ModelCfg, loader: &dyn ModelLoader, srv: &ServerCfg, now: Instant) {
         if self.resident_count() >= srv.max_resident {
-            self.set_failed(cfg, format!("over max_resident ({})", srv.max_resident));
+            self.set_deferred(cfg, format!(
+                "not resident: at max_resident ({}); loads on demand", srv.max_resident));
             return;
         }
         match loader.load(cfg) {
@@ -57,11 +87,74 @@ impl Registry {
                 }
                 let status = ModelStatus {
                     name: cfg.name.clone(), state: LoadState::Loaded, detail: String::new(),
-                    kind: Some(m.kind()), bo_bytes: bo,
+                    kind: Some(m.kind()), bo_bytes: bo, idle_s: Some(0),
                 };
-                self.upsert(Entry { cfg: cfg.clone(), model: Some(m), status });
+                self.upsert(Entry { cfg: cfg.clone(), model: Some(m), status, last_used: now });
             }
             Err(e) => self.set_failed(cfg, e.to_string()),
+        }
+    }
+
+    /// Make `name` resident, loading it on demand and freeing a slot first if `max_resident` is
+    /// full. This is the hot-swap path: here `max_resident` is the EVICT TRIGGER, not a refusal.
+    ///
+    /// Only ever called between commands (the actor is the single device owner and is not serving
+    /// anything else while this runs), so an eviction can never pull a model out from under a
+    /// request in flight.
+    pub fn ensure_resident(&mut self, cfg: &ModelCfg, loader: &dyn ModelLoader, srv: &ServerCfg,
+                           now: Instant) -> Result<(), EngineError> {
+        if self.get_loaded(&cfg.name).is_some() { return Ok(()); }
+        while self.resident_count() >= srv.max_resident {
+            if srv.evict_policy == EvictPolicy::None {
+                return Err(EngineError::Unsupported(format!(
+                    "{} is not resident and evict_policy = \"none\" at max_resident ({})",
+                    cfg.name, srv.max_resident)));
+            }
+            // Nothing resident left to evict (max_resident = 0): stop, and let try_load record the
+            // capacity refusal rather than loop forever.
+            match self.lru_victim() {
+                Some(v) => self.release(&v, &format!("evicted for {}", cfg.name)),
+                None => break,
+            }
+        }
+        // NOTE: the memory_ceiling is checked inside try_load and is NOT an evict trigger -- a
+        // model's footprint is unknown until it is loaded, so there is no amount to free "enough"
+        // of. bo_bytes() is 0 for every real model today (backlog R11(f)), so this is moot in
+        // production; when it starts reporting, revisit.
+        self.try_load(cfg, loader, srv, now);
+        if self.get_loaded(&cfg.name).is_some() { return Ok(()); }
+        let why = self.entries.iter().find(|e| e.cfg.name == cfg.name)
+            .map(|e| e.status.detail.clone()).unwrap_or_else(|| "load failed".into());
+        Err(EngineError::Load(format!("{}: {why}", cfg.name)))
+    }
+
+    /// Least-recently-used RESIDENT model, if any.
+    pub fn lru_victim(&self) -> Option<String> {
+        self.entries.iter().filter(|e| e.model.is_some())
+            .min_by_key(|e| e.last_used).map(|e| e.cfg.name.clone())
+    }
+
+    /// Unload every resident model idle for at least `idle`, returning what was released.
+    ///
+    /// The actor calls this from its `recv_timeout` idle branch, i.e. only between commands.
+    pub fn sweep_idle(&mut self, now: Instant, idle: Duration) -> Vec<String> {
+        let expired: Vec<String> = self.entries.iter()
+            .filter(|e| e.model.is_some() && now.saturating_duration_since(e.last_used) >= idle)
+            .map(|e| e.cfg.name.clone()).collect();
+        for n in &expired { self.release(n, &format!("unloaded: idle >= {}s", idle.as_secs())); }
+        expired
+    }
+
+    /// Drop the model but KEEP the entry, so `/v1/models` can still show what happened to it (and
+    /// so routing remembers its capability). Contrast `unload`, which forgets the entry entirely
+    /// because the config no longer asks for it.
+    pub fn release(&mut self, name: &str, reason: &str) {
+        if let Some(e) = self.entries.iter_mut().find(|e| e.cfg.name == name) {
+            e.model = None;
+            e.status.state = LoadState::Unloaded;
+            e.status.detail = reason.to_string();
+            e.status.bo_bytes = 0;
+            e.status.idle_s = None;
         }
     }
     pub fn unload(&mut self, name: &str) {
@@ -69,10 +162,19 @@ impl Registry {
     }
 
     fn set_failed(&mut self, cfg: &ModelCfg, detail: String) {
+        self.set_state(cfg, LoadState::Failed, detail);
+    }
+    /// Configured, wanted, and deliberately not resident -- distinct from a failure.
+    fn set_deferred(&mut self, cfg: &ModelCfg, detail: String) {
+        self.set_state(cfg, LoadState::Unloaded, detail);
+    }
+    fn set_state(&mut self, cfg: &ModelCfg, state: LoadState, detail: String) {
+        // Keep a kind learned from an earlier successful load: it is still true, and routing uses it.
+        let kind = self.known_kind(&cfg.name);
         let status = ModelStatus {
-            name: cfg.name.clone(), state: LoadState::Failed, detail, kind: None, bo_bytes: 0,
+            name: cfg.name.clone(), state, detail, kind, bo_bytes: 0, idle_s: None,
         };
-        self.upsert(Entry { cfg: cfg.clone(), model: None, status });
+        self.upsert(Entry { cfg: cfg.clone(), model: None, status, last_used: Instant::now() });
     }
     fn upsert(&mut self, e: Entry) {
         if let Some(slot) = self.entries.iter_mut().find(|x| x.cfg.name == e.cfg.name) { *slot = e; }
@@ -86,6 +188,11 @@ mod tests {
     use crate::loader::mock::MockLoader;
     use std::collections::BTreeMap;
     fn cfg(name: &str) -> ModelCfg { ModelCfg { name: name.into(), scenario: "x".into() } }
+    fn loader(names: &[&str]) -> MockLoader {
+        let mut t = BTreeMap::new();
+        for n in names { t.insert((*n).to_string(), Ok((ModelKind::Embed, 1))); }
+        MockLoader { table: t }
+    }
 
     #[test]
     fn load_failure_is_recorded_not_fatal() {
@@ -95,24 +202,111 @@ mod tests {
         let l = MockLoader { table: t };
         let srv = ServerCfg { max_resident: 8, ..Default::default() };
         let mut r = Registry::default();
-        r.try_load(&cfg("good"), &l, &srv);
-        r.try_load(&cfg("bad"), &l, &srv);
+        let now = Instant::now();
+        r.try_load(&cfg("good"), &l, &srv, now);
+        r.try_load(&cfg("bad"), &l, &srv, now);
         assert_eq!(r.resident_count(), 1);
         let s = r.status();
         assert!(s.iter().any(|x| x.name == "good" && x.state == LoadState::Loaded));
         assert!(s.iter().any(|x| x.name == "bad" && x.state == LoadState::Failed && x.detail.contains("boom")));
     }
     #[test]
-    fn max_resident_caps_loads() {
+    fn max_resident_defers_the_overflow_instead_of_failing_it() {
+        let l = loader(&["a", "b"]);
+        let srv = ServerCfg { max_resident: 1, ..Default::default() };
+        let mut r = Registry::default();
+        let now = Instant::now();
+        r.try_load(&cfg("a"), &l, &srv, now);
+        r.try_load(&cfg("b"), &l, &srv, now);
+        assert_eq!(r.resident_count(), 1, "reconcile must not evict: booting would thrash");
+        let b = r.status().into_iter().find(|x| x.name == "b").unwrap();
+        assert_eq!(b.state, LoadState::Unloaded, "over capacity is a capacity decision, not a failure");
+        assert!(b.detail.contains("max_resident"), "{}", b.detail);
+    }
+    #[test]
+    fn ensure_resident_evicts_the_lru_not_just_anyone() {
+        let l = loader(&["a", "b", "c"]);
+        let srv = ServerCfg { max_resident: 2, ..Default::default() };
+        let mut r = Registry::default();
+        let t0 = Instant::now();
+        r.try_load(&cfg("a"), &l, &srv, t0);
+        r.try_load(&cfg("b"), &l, &srv, t0);
+        // `a` is used after `b`, so `b` is the cold one.
+        r.touch("a", t0 + Duration::from_secs(10));
+        r.ensure_resident(&cfg("c"), &l, &srv, t0 + Duration::from_secs(20)).unwrap();
+        assert_eq!(r.resident_count(), 2);
+        assert!(r.get_loaded("a").is_some(), "the recently used model must survive");
+        assert!(r.get_loaded("c").is_some());
+        let b = r.status().into_iter().find(|x| x.name == "b").unwrap();
+        assert_eq!(b.state, LoadState::Unloaded);
+        assert!(b.detail.contains("evicted for c"), "{}", b.detail);
+        assert_eq!(b.kind, Some(ModelKind::Embed), "an evicted entry keeps its known capability");
+    }
+    #[test]
+    fn ensure_resident_is_a_noop_when_already_loaded() {
+        let l = loader(&["a"]);
+        let srv = ServerCfg { max_resident: 1, ..Default::default() };
+        let mut r = Registry::default();
+        let t0 = Instant::now();
+        r.try_load(&cfg("a"), &l, &srv, t0);
+        r.ensure_resident(&cfg("a"), &l, &srv, t0 + Duration::from_secs(5)).unwrap();
+        assert_eq!(r.resident_count(), 1);
+        assert_eq!(r.status().into_iter().find(|x| x.name == "a").unwrap().state, LoadState::Loaded);
+    }
+    #[test]
+    fn evict_policy_none_refuses_and_keeps_the_incumbent() {
+        let l = loader(&["a", "b"]);
+        let srv = ServerCfg { max_resident: 1, evict_policy: EvictPolicy::None, ..Default::default() };
+        let mut r = Registry::default();
+        let t0 = Instant::now();
+        r.try_load(&cfg("a"), &l, &srv, t0);
+        let e = r.ensure_resident(&cfg("b"), &l, &srv, t0).unwrap_err();
+        assert!(e.to_string().contains("evict_policy"), "{e}");
+        assert!(r.get_loaded("a").is_some(), "a refusal must not disturb what is resident");
+        assert!(r.get_loaded("b").is_none());
+    }
+    #[test]
+    fn sweep_releases_only_what_is_actually_idle() {
+        let l = loader(&["cold", "warm"]);
+        let srv = ServerCfg { max_resident: 8, ..Default::default() };
+        let mut r = Registry::default();
+        let t0 = Instant::now();
+        r.try_load(&cfg("cold"), &l, &srv, t0);
+        r.try_load(&cfg("warm"), &l, &srv, t0);
+        let now = t0 + Duration::from_secs(900);
+        r.touch("warm", now - Duration::from_secs(10));
+        let freed = r.sweep_idle(now, Duration::from_secs(900));
+        assert_eq!(freed, vec!["cold".to_string()]);
+        assert!(r.get_loaded("cold").is_none(), "expired model must release the device");
+        assert!(r.get_loaded("warm").is_some(), "a model used 10s ago is not idle");
+        let s = r.status_at(now);
+        let cold = s.iter().find(|x| x.name == "cold").unwrap();
+        assert_eq!(cold.state, LoadState::Unloaded);
+        assert!(cold.detail.contains("idle"), "{}", cold.detail);
+        assert_eq!(cold.idle_s, None, "a non-resident model reports no idle time");
+        assert_eq!(s.iter().find(|x| x.name == "warm").unwrap().idle_s, Some(10));
+    }
+    #[test]
+    fn released_model_reloads_on_demand() {
+        let l = loader(&["a"]);
+        let srv = ServerCfg { max_resident: 1, ..Default::default() };
+        let mut r = Registry::default();
+        let t0 = Instant::now();
+        r.try_load(&cfg("a"), &l, &srv, t0);
+        assert_eq!(r.sweep_idle(t0 + Duration::from_secs(900), Duration::from_secs(900)), vec!["a"]);
+        assert_eq!(r.known_kind("a"), Some(ModelKind::Embed), "capability survives the unload");
+        r.ensure_resident(&cfg("a"), &l, &srv, t0 + Duration::from_secs(901)).unwrap();
+        assert!(r.get_loaded("a").is_some());
+        assert_eq!(r.status().into_iter().find(|x| x.name == "a").unwrap().state, LoadState::Loaded);
+    }
+    #[test]
+    fn ensure_resident_reports_why_a_load_failed() {
         let mut t = BTreeMap::new();
-        t.insert("a".into(), Ok((ModelKind::Embed, 1)));
-        t.insert("b".into(), Ok((ModelKind::Embed, 1)));
+        t.insert("bad".to_string(), Err("no such xclbin".to_string()));
         let l = MockLoader { table: t };
         let srv = ServerCfg { max_resident: 1, ..Default::default() };
         let mut r = Registry::default();
-        r.try_load(&cfg("a"), &l, &srv);
-        r.try_load(&cfg("b"), &l, &srv);
-        assert_eq!(r.resident_count(), 1);
-        assert!(r.status().iter().any(|x| x.name == "b" && x.detail.contains("max_resident")));
+        let e = r.ensure_resident(&cfg("bad"), &l, &srv, Instant::now()).unwrap_err();
+        assert!(e.to_string().contains("no such xclbin"), "{e}");
     }
 }
