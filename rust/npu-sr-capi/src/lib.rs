@@ -24,7 +24,7 @@ pub extern "C" fn xdna_sr_available() -> c_int {
 /// Load a schedule (path to `<net>.json`). `use_npu`!=0 uses the NPU frontier. NULL on error
 /// (see `xdna_sr_last_error`).
 #[no_mangle]
-pub extern "C" fn xdna_sr_create(schedule_path: *const c_char, use_npu: c_int) -> *mut XdnaSr {
+pub unsafe extern "C" fn xdna_sr_create(schedule_path: *const c_char, use_npu: c_int) -> *mut XdnaSr {
     let r = catch_unwind(AssertUnwindSafe(|| {
         if schedule_path.is_null() {
             set_error("schedule_path is null");
@@ -53,7 +53,7 @@ pub extern "C" fn xdna_sr_create(schedule_path: *const c_char, use_npu: c_int) -
 
 /// The integer scale factor of the loaded net (e.g. 3), or -1 on error.
 #[no_mangle]
-pub extern "C" fn xdna_sr_scale(h: *const XdnaSr) -> c_int {
+pub unsafe extern "C" fn xdna_sr_scale(h: *const XdnaSr) -> c_int {
     catch_unwind(AssertUnwindSafe(|| {
         let Some(h) = (unsafe { h.as_ref() }) else {
             set_error("handle is null");
@@ -67,7 +67,7 @@ pub extern "C" fn xdna_sr_scale(h: *const XdnaSr) -> c_int {
 /// Upscale one interleaved RGB8 frame. `out_rgb` must hold at least (w*scale)*(h*scale)*3 bytes.
 /// Returns 0 on success (writing out_w/out_h if non-null), <0 on error.
 #[no_mangle]
-pub extern "C" fn xdna_sr_process_rgb8(
+pub unsafe extern "C" fn xdna_sr_process_rgb8(
     h: *mut XdnaSr,
     in_rgb: *const u8,
     w: usize,
@@ -118,7 +118,7 @@ pub extern "C" fn xdna_sr_process_rgb8(
 
 /// Free an engine handle.
 #[no_mangle]
-pub extern "C" fn xdna_sr_free(h: *mut XdnaSr) {
+pub unsafe extern "C" fn xdna_sr_free(h: *mut XdnaSr) {
     if h.is_null() {
         return;
     }

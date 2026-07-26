@@ -26,7 +26,7 @@ pub extern "C" fn npu_available() -> c_int {
 
 /// Load a model from a scenario TOML path. Returns NULL on error (see `npu_last_error`).
 #[no_mangle]
-pub extern "C" fn npu_model_load(scenario_path: *const c_char) -> *mut NpuModel {
+pub unsafe extern "C" fn npu_model_load(scenario_path: *const c_char) -> *mut NpuModel {
     let r = catch_unwind(AssertUnwindSafe(|| {
         if scenario_path.is_null() { set_error("scenario_path is null"); return ptr::null_mut(); }
         let path = match unsafe { CStr::from_ptr(scenario_path) }.to_str() {
@@ -43,7 +43,7 @@ pub extern "C" fn npu_model_load(scenario_path: *const c_char) -> *mut NpuModel 
 
 /// 0 = asr, 1 = embed, -1 = error.
 #[no_mangle]
-pub extern "C" fn npu_model_kind(m: *const NpuModel) -> c_int {
+pub unsafe extern "C" fn npu_model_kind(m: *const NpuModel) -> c_int {
     catch_unwind(AssertUnwindSafe(|| {
         let Some(m) = (unsafe { m.as_ref() }) else { set_error("model is null"); return -1; };
         match m.0.kind() { ModelKind::Asr => 0, ModelKind::Embed => 1 }
@@ -52,7 +52,7 @@ pub extern "C" fn npu_model_kind(m: *const NpuModel) -> c_int {
 
 /// ASR: PCM i16 mono -> malloc'd UTF-8 C string (free with `npu_string_free`). NULL on error.
 #[no_mangle]
-pub extern "C" fn npu_transcribe(m: *mut NpuModel, pcm: *const i16, n: usize, sample_rate: u32)
+pub unsafe extern "C" fn npu_transcribe(m: *mut NpuModel, pcm: *const i16, n: usize, sample_rate: u32)
     -> *mut c_char {
     let r = catch_unwind(AssertUnwindSafe(|| {
         let Some(m) = (unsafe { m.as_ref() }) else { set_error("model is null"); return ptr::null_mut(); };
@@ -70,7 +70,7 @@ pub extern "C" fn npu_transcribe(m: *mut NpuModel, pcm: *const i16, n: usize, sa
 /// Embedding. Call with out_cap==0 (or out==NULL) to get the dimension; call again with a buffer of
 /// at least that many floats to fill it. Returns the dimension, or -1 on error.
 #[no_mangle]
-pub extern "C" fn npu_embed(m: *mut NpuModel, text: *const c_char, out: *mut f32, out_cap: usize)
+pub unsafe extern "C" fn npu_embed(m: *mut NpuModel, text: *const c_char, out: *mut f32, out_cap: usize)
     -> c_int {
     let r = catch_unwind(AssertUnwindSafe(|| {
         let Some(m) = (unsafe { m.as_ref() }) else { set_error("model is null"); return -1; };
@@ -98,14 +98,14 @@ pub extern "C" fn npu_embed(m: *mut NpuModel, text: *const c_char, out: *mut f32
 
 /// Free a string returned by `npu_transcribe`.
 #[no_mangle]
-pub extern "C" fn npu_string_free(s: *mut c_char) {
+pub unsafe extern "C" fn npu_string_free(s: *mut c_char) {
     if s.is_null() { return; }
     let _ = catch_unwind(AssertUnwindSafe(|| unsafe { drop(CString::from_raw(s)); }));
 }
 
 /// Free a model handle.
 #[no_mangle]
-pub extern "C" fn npu_model_free(m: *mut NpuModel) {
+pub unsafe extern "C" fn npu_model_free(m: *mut NpuModel) {
     if m.is_null() { return; }
     let _ = catch_unwind(AssertUnwindSafe(|| unsafe { drop(Box::from_raw(m)); }));
 }
@@ -128,7 +128,7 @@ pub struct NpuRuntime { handle: RtHandle, join: Option<std::thread::JoinHandle<(
 
 /// Start the control plane from a config TOML path (reconciles its models). NULL on error.
 #[no_mangle]
-pub extern "C" fn npu_runtime_start(config_path: *const c_char) -> *mut NpuRuntime {
+pub unsafe extern "C" fn npu_runtime_start(config_path: *const c_char) -> *mut NpuRuntime {
     let r = catch_unwind(AssertUnwindSafe(|| {
         if config_path.is_null() { set_error("config_path is null"); return ptr::null_mut(); }
         let p = match unsafe { CStr::from_ptr(config_path) }.to_str() {
@@ -145,7 +145,7 @@ pub extern "C" fn npu_runtime_start(config_path: *const c_char) -> *mut NpuRunti
 
 /// ASR through the control plane (model name or NULL for the configured default). Caller frees.
 #[no_mangle]
-pub extern "C" fn npu_runtime_transcribe(rt: *mut NpuRuntime, model: *const c_char,
+pub unsafe extern "C" fn npu_runtime_transcribe(rt: *mut NpuRuntime, model: *const c_char,
     pcm: *const i16, n: usize, sample_rate: u32) -> *mut c_char {
     let r = catch_unwind(AssertUnwindSafe(|| {
         let Some(rt) = (unsafe { rt.as_ref() }) else { set_error("runtime is null"); return ptr::null_mut(); };
@@ -161,7 +161,7 @@ pub extern "C" fn npu_runtime_transcribe(rt: *mut NpuRuntime, model: *const c_ch
 
 /// Embedding through the control plane. Pass a buffer; returns the embedding length (>= written), or -1.
 #[no_mangle]
-pub extern "C" fn npu_runtime_embed(rt: *mut NpuRuntime, model: *const c_char, text: *const c_char,
+pub unsafe extern "C" fn npu_runtime_embed(rt: *mut NpuRuntime, model: *const c_char, text: *const c_char,
     out: *mut f32, out_cap: usize) -> c_int {
     let r = catch_unwind(AssertUnwindSafe(|| {
         let Some(rt) = (unsafe { rt.as_ref() }) else { set_error("runtime is null"); return -1; };
@@ -183,7 +183,7 @@ pub extern "C" fn npu_runtime_embed(rt: *mut NpuRuntime, model: *const c_char, t
 
 /// Re-read the config file and reconcile. Returns 0 on success, -1 on error.
 #[no_mangle]
-pub extern "C" fn npu_runtime_reload(rt: *mut NpuRuntime) -> c_int {
+pub unsafe extern "C" fn npu_runtime_reload(rt: *mut NpuRuntime) -> c_int {
     catch_unwind(AssertUnwindSafe(|| {
         let Some(rt) = (unsafe { rt.as_ref() }) else { set_error("runtime is null"); return -1; };
         let cfg = match Config::load(&rt.cfg_path) { Ok(c) => c, Err(e) => { set_error(e); return -1; } };
@@ -193,7 +193,7 @@ pub extern "C" fn npu_runtime_reload(rt: *mut NpuRuntime) -> c_int {
 
 /// Model statuses as a JSON list (malloc'd; free with npu_string_free). NULL on error.
 #[no_mangle]
-pub extern "C" fn npu_runtime_models_json(rt: *mut NpuRuntime) -> *mut c_char {
+pub unsafe extern "C" fn npu_runtime_models_json(rt: *mut NpuRuntime) -> *mut c_char {
     let r = catch_unwind(AssertUnwindSafe(|| {
         let Some(rt) = (unsafe { rt.as_ref() }) else { set_error("runtime is null"); return ptr::null_mut(); };
         let json = npu_runtime::http::models_json(&rt.handle.status());
@@ -204,7 +204,7 @@ pub extern "C" fn npu_runtime_models_json(rt: *mut NpuRuntime) -> *mut c_char {
 
 /// Stop the control plane and free the handle.
 #[no_mangle]
-pub extern "C" fn npu_runtime_stop(rt: *mut NpuRuntime) {
+pub unsafe extern "C" fn npu_runtime_stop(rt: *mut NpuRuntime) {
     if rt.is_null() { return; }
     let _ = catch_unwind(AssertUnwindSafe(|| {
         let mut rt = unsafe { Box::from_raw(rt) };

@@ -47,3 +47,11 @@ name = "fused_seam_parity"
 path = "src/bin/fused_seam_parity.rs"
 required-features = ["npu"]
 
+# Device probes whose whole body is `#![cfg(feature = "npu")]`. Declared explicitly (not
+# auto-discovered) so a default-feature build skips them instead of failing on a missing `main`
+# -- the crate must keep building alone, without XRT, per the lib.rs decoupling contract.
+[[bin]]
+name = "resident_ff1_probe"
+path = "src/bin/resident_ff1_probe.rs"
+required-features = ["npu"]
+
