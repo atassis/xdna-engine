@@ -7,8 +7,14 @@ on:
 
 jobs:
   # A hosted runner has neither XRT nor onnxruntime, so it cannot build the crates that link them.
-  # It CAN build the pure-host crates, which hold 90 of the 146 workspace tests. The full gate
-  # (whole workspace, clippy + test + the no-features build) is scripts/ci_gate.sh on the dev box.
+  # It CAN build the three pure-host crates, which run 73 of the 146 workspace tests (measured, not
+  # counted from #[test] attributes -- several npu-weights integration tests need artifacts that are
+  # not in the repo and execute nothing).
+  #
+  # This is deliberately the WEAKER half of the gate. It does NOT cover npu-parakeet, npu-xrt,
+  # npu-capi or npu-sr-capi, so of the three breakages that motivated scripts/ci_gate.sh it would
+  # have caught only one (the npu-asr-host deny-lint). The real gate is scripts/ci_gate.sh on the
+  # dev box; promoting this to a self-hosted runner there is what would close the gap.
   host-crates:
     runs-on: ubuntu-latest
     steps:
