@@ -1,24 +1,28 @@
 #!/usr/bin/env bash
 #
-# install.sh — build & install the open GigaAM-v3 NPU ASR backend (Route B encoder)
+# install.sh — build & install xdna-engine (ASR + embeddings on the XDNA2 NPU)
 #              as a systemd --user service, replacing the FLM-Whisper ASR endpoint.
 #
 # What this does (idempotent):
 #   1. Resolve & sanity-check the repo.
 #   2. Preflight: cargo, onnx-asr venv (import onnx_asr), XRT headers/libs.
-#   3. Build the Rust workspace (--release) -> rust/target/release/encode_server.
-#   4. Ensure encoder/asr artifacts exist (generate only if missing).
-#   5. Install the systemd --user unit at ~/.config/systemd/user/npu-asr.service,
-#      with absolute REPO/venv paths substituted in.
+#   3. Build the Rust workspace (--release) -> rust/target/release/npu.
+#  3a. INSTALL that binary to ~/.local/bin/npu  <- the step whose absence used to make
+#      every "successful" install a silent no-op against a stale binary.
+#   4. Ensure model artifacts exist (generate only if missing), then PREFLIGHT the engine
+#      config: every scenario it references must resolve to weights on disk, or we refuse.
+#   5. Install the systemd --user unit at ~/.config/systemd/user/xdna-engine.service and
+#      retire the superseded npu-asr.service / npu-serve.service.
 #   6. daemon-reload + verify the unit.
 #   7. Print "Next steps" — does NOT start/stop/enable anything or touch the NPU,
 #      because the NPU is single-tenant and may be in use right now.
 #
-# The service itself: rust/target/release/asr_serve — a single self-contained Rust
-#   binary (no Python at runtime) exposing POST /v1/audio/transcriptions
-#   (multipart WAV -> {"text":...}). It runs the mel preprocessor + RNNT decoder/joint
+# The service itself: `npu serve` — the engine multitool, one process owning the
+#   single-tenant NPU and serving every model in ~/.config/npu/engine.toml. Exposes
+#   POST /v1/audio/transcriptions (multipart WAV -> {"text":...}), /v1/embeddings,
+#   /v1/models and the /admin/* control plane. It runs the mel preprocessor + decoder/joint
 #   ONNX via the system onnxruntime (linked from the onnx-asr venv), and the encoder on
-#   the NPU in-process. (A Python equivalent, scripts/asr_service.py, also exists.)
+#   the NPU in-process. No Python at runtime.
 #
 # It listens on :11434 — the SAME port FLM serves on. Both FLM and we need the
 # single-tenant XDNA2 NPU, so they are mutually exclusive anyway; reusing the port
@@ -51,20 +55,33 @@ XRT_LIB_DIR="${XRT_LIB_DIR:-/usr/lib}"
 PORT=11434
 
 UNIT_DIR="$HOME/.config/systemd/user"
-UNIT_PATH="$UNIT_DIR/npu-asr.service"
+SERVICE="xdna-engine"
+UNIT_PATH="$UNIT_DIR/$SERVICE.service"
+DESC="xdna-engine -- ASR + embeddings on the XDNA2 NPU, :$PORT"
+
+# Units this supersedes. Both named the same thing badly: npu-asr.service was what this script
+# used to write (a bare per-model ASR binary), npu-serve.service was what was actually deployed
+# by hand. One service, one name now. They are stopped/disabled on install (see step 5b).
+LEGACY_UNITS="npu-asr.service npu-serve.service"
+
+# The engine is driven by the `npu` multitool, not a per-model binary: one process owns the
+# single-tenant NPU and serves every configured model (ASR + embeddings today) from a
+# desired-state config. The binary keeps its own name; the SERVICE is the product name.
+ENGINE_BIN_DIR="${ENGINE_BIN_DIR:-$HOME/.local/bin}"
+ENGINE_BIN="$ENGINE_BIN_DIR/npu"
+BUILT_BIN="$REPO/rust/target/release/npu"
+ENGINE_CONFIG="${ENGINE_CONFIG:-$HOME/.config/npu/engine.toml}"
 
 # Stable runtime dir for libonnxruntime, decoupled from the volatile cargo target/ build tree
 # (which `cargo clean` wipes). The unit puts this on LD_LIBRARY_PATH so the service resolves
 # its .so here regardless of build-tree churn. Override with STABLE_LIB_DIR=...
-STABLE_LIB_DIR="${STABLE_LIB_DIR:-$HOME/.local/lib/npu-asr}"
+STABLE_LIB_DIR="${STABLE_LIB_DIR:-$HOME/.local/lib/xdna-engine}"
 
-# Model selection: parakeet (multilingual RU+EN, DEFAULT) | gigaam (RU-only, legacy).
+# Model selection drives only the ARTIFACT preflight below; which models the service actually
+# loads comes from $ENGINE_CONFIG. parakeet (multilingual RU+EN, DEFAULT) | gigaam (RU-only).
 MODEL="${MODEL:-parakeet}"
 case "$MODEL" in
-  parakeet) SERVE_BIN="$REPO/rust/target/release/parakeet_serve"
-            DESC="NPU Parakeet-tdt-0.6b-v3 ASR (multilingual RU+EN) on :$PORT" ;;
-  gigaam)   SERVE_BIN="$REPO/rust/target/release/asr_serve"
-            DESC="NPU GigaAM-v3 ASR (open Route B encoder) on :$PORT" ;;
+  parakeet|gigaam) ;;
   *) printf '[fail] unknown MODEL=%s (use parakeet|gigaam)\n' "$MODEL" >&2; exit 1 ;;
 esac
 
@@ -110,19 +127,34 @@ ok "XRT: inc=$XRT_INC_DIR lib=$XRT_LIB_DIR"
 # ---------------------------------------------------------------------------
 # 3. Build the Rust workspace
 # ---------------------------------------------------------------------------
-info "Building Rust workspace (cargo build --release) for MODEL=$MODEL..."
+info "Building Rust workspace (cargo build --release)..."
 (
   cd "$REPO/rust"
-  if [ "$MODEL" = parakeet ]; then
-    # parakeet_serve needs the `npu` feature (NPU encoder + onnx C-shim).
-    XRT_INC_DIR="$XRT_INC_DIR" XRT_LIB_DIR="$XRT_LIB_DIR" \
-      cargo build --release -p npu-parakeet --features npu --bin parakeet_serve
-  else
-    XRT_INC_DIR="$XRT_INC_DIR" XRT_LIB_DIR="$XRT_LIB_DIR" cargo build --release
-  fi
+  XRT_INC_DIR="$XRT_INC_DIR" XRT_LIB_DIR="$XRT_LIB_DIR" cargo build --release
 )
-[ -x "$SERVE_BIN" ] || die "Build finished but $SERVE_BIN is missing/not executable."
-ok "Built service binary: $SERVE_BIN"
+[ -x "$BUILT_BIN" ] || die "Build finished but $BUILT_BIN is missing/not executable."
+ok "Built engine binary: $BUILT_BIN"
+
+# ---------------------------------------------------------------------------
+# 3a. INSTALL the engine binary
+# ---------------------------------------------------------------------------
+# This is the step whose absence made every previous "successful" install a no-op: the unit
+# runs $ENGINE_BIN, but nothing ever copied the freshly built binary there. A stale binary in
+# ~/.local/bin would keep serving while the build reported green.
+info "Installing engine binary -> $ENGINE_BIN"
+mkdir -p "$ENGINE_BIN_DIR"
+if [ -x "$ENGINE_BIN" ] && cmp -s "$BUILT_BIN" "$ENGINE_BIN"; then
+  ok "Engine binary already current: $ENGINE_BIN"
+else
+  # NB: `[ ... ] && info ...` would abort under `set -e` when the test is false (first install).
+  if [ -x "$ENGINE_BIN" ]; then
+    info "  replacing existing binary (was $(date -r "$ENGINE_BIN" '+%Y-%m-%d %H:%M'))"
+  fi
+  # install(1) replaces atomically-ish and preserves the mode; a running service keeps its
+  # open inode until restarted, so this is safe to do while the old one is serving.
+  install -m 0755 "$BUILT_BIN" "$ENGINE_BIN"
+  ok "Installed: $ENGINE_BIN ($(date -r "$ENGINE_BIN" '+%Y-%m-%d %H:%M'))"
+fi
 
 # ---------------------------------------------------------------------------
 # 3b. Stable onnxruntime .so (decouple the runtime from the cargo build tree)
@@ -213,6 +245,43 @@ fi
 fi  # end MODEL=gigaam artifact block
 
 # ---------------------------------------------------------------------------
+# 4c. Engine-config preflight — FAIL LOUD, never install a service that cannot serve
+# ---------------------------------------------------------------------------
+# The service loads $ENGINE_CONFIG, not this script's MODEL variable. A config pointing at a
+# missing scenario, or a scenario pointing at missing weights, produces a unit that installs
+# clean and then dies (or worse, serves nothing) at runtime. A re-pin silently broke the shipped
+# ASR service for five days exactly this way. So: resolve the whole chain here and refuse.
+info "Preflighting engine config: $ENGINE_CONFIG"
+[ -f "$ENGINE_CONFIG" ] || die "engine config missing: $ENGINE_CONFIG
+  Create it (see the [server]/[defaults]/[[model]] example in the README), or point
+  ENGINE_CONFIG=... at an existing one."
+
+# Every scenario the config references must exist, parse, and have its weights on disk.
+scen_count=0
+while IFS= read -r scen; do
+  [ -n "$scen" ] || continue
+  scen_count=$((scen_count + 1))
+  # Relative scenario paths resolve against the repo (WorkingDirectory at runtime).
+  case "$scen" in /*) scen_abs="$scen" ;; *) scen_abs="$REPO/$scen" ;; esac
+  [ -f "$scen_abs" ] || die "engine config references a missing scenario: $scen_abs
+  (from $ENGINE_CONFIG)"
+
+  kind=$(grep -oP '^\s*kind\s*=\s*"\K[^"]+' "$scen_abs" | head -1)
+  wdir=$(grep -oP '^\s*weights\s*=\s*"\K[^"]+' "$scen_abs" | head -1)
+  [ -n "$kind" ] || die "scenario has no [scenario].kind: $scen_abs"
+  if [ -n "$wdir" ]; then
+    case "$wdir" in /*) wabs="$wdir" ;; *) wabs="$REPO/$wdir" ;; esac
+    [ -d "$wabs" ] && [ -n "$(ls -A "$wabs" 2>/dev/null)" ] \
+      || die "scenario '$scen_abs' points at missing/empty weights: $wabs"
+  fi
+  ok "  scenario OK: $(basename "$scen_abs") (kind=$kind, weights=${wdir:-<none>})"
+done < <(grep -oP '^\s*scenario\s*=\s*"\K[^"]+' "$ENGINE_CONFIG")
+
+[ "$scen_count" -gt 0 ] || die "engine config declares no [[model]] scenario: $ENGINE_CONFIG
+  The service would start and serve nothing."
+ok "Engine config preflight passed ($scen_count model(s) resolvable)."
+
+# ---------------------------------------------------------------------------
 # 5. Install the systemd --user unit
 # ---------------------------------------------------------------------------
 info "Installing systemd --user unit -> $UNIT_PATH"
@@ -239,7 +308,7 @@ Environment=LD_LIBRARY_PATH=$STABLE_LIB_DIR
 # Pure-Rust single binary: runs onnx preproc/decode (system onnxruntime) + the NPU encoder
 # in-process. No Python needed at runtime; cwd resolves artifacts/. (Parakeet: cwd also resolves
 # the NPU xclbins under mlir-aie/.../whole_array/build via NpuMatmul root=".".)
-ExecStart=$SERVE_BIN $PORT
+ExecStart=$ENGINE_BIN serve --config $ENGINE_CONFIG --port $PORT
 Restart=on-failure
 RestartSec=3
 
@@ -247,6 +316,31 @@ RestartSec=3
 WantedBy=default.target
 EOF
 ok "Wrote unit."
+
+# ---------------------------------------------------------------------------
+# 5b. Retire the superseded units
+# ---------------------------------------------------------------------------
+# npu-asr.service (what this script used to write) and npu-serve.service (what was actually
+# deployed by hand) are the same service under two names. Leaving either enabled means two
+# units racing for the single-tenant NPU and for :$PORT.
+for old in $LEGACY_UNITS; do
+  [ "$old" = "$SERVICE.service" ] && continue
+  if [ -f "$UNIT_DIR/$old" ] || systemctl --user list-unit-files "$old" >/dev/null 2>&1; then
+    if systemctl --user is-active --quiet "$old" 2>/dev/null; then
+      info "  stopping superseded unit: $old"
+      systemctl --user stop "$old" || true
+    fi
+    if systemctl --user is-enabled --quiet "$old" 2>/dev/null; then
+      info "  disabling superseded unit: $old"
+      systemctl --user disable "$old" || true
+    fi
+    if [ -f "$UNIT_DIR/$old" ]; then
+      mv -f "$UNIT_DIR/$old" "$UNIT_DIR/$old.superseded-by-$SERVICE"
+      info "  archived $old -> $old.superseded-by-$SERVICE"
+    fi
+  fi
+done
+ok "Superseded units retired."
 
 # ---------------------------------------------------------------------------
 # 6. daemon-reload + verify
@@ -269,35 +363,47 @@ fi
 cat <<EOF
 
 ============================================================================
- Done. Built encode_server + installed npu-asr.service (NOT started).
- Nothing touched the NPU or any running service.
+ Done. Built + installed the engine and $SERVICE.service (NOT started).
+ The NPU was not touched. Superseded units (npu-asr/npu-serve) WERE stopped and
+ disabled, since they contend for the same device and port.
 ============================================================================
+
+ Installed
+ ---------
+   engine binary : $ENGINE_BIN
+   unit          : $UNIT_PATH
+   config        : $ENGINE_CONFIG
+   onnxruntime   : $STABLE_LIB_DIR
 
  Next steps
  ----------
- Activate now (stops flm-asr automatically, frees the NPU + :$PORT;
+ Activate now (stops flm-asr automatically, freeing the NPU + :$PORT;
  voxd keeps running and now transcribes via our backend on :$PORT):
 
-     systemctl --user start npu-asr.service
+     systemctl --user start $SERVICE.service
 
  Make it the default at login:
 
-     systemctl --user enable npu-asr.service
+     systemctl --user enable $SERVICE.service
      systemctl --user disable flm-asr.service
 
  Revert to FLM:
 
-     systemctl --user stop npu-asr.service
+     systemctl --user stop $SERVICE.service
      systemctl --user start flm-asr.service
 
  Notes
  -----
+ * The service is the single owner of the single-tenant NPU. It serves every model
+   in $ENGINE_CONFIG (ASR + embeddings); edit that file and
+   \`systemctl --user reload-or-restart $SERVICE\` (or POST /admin/reload).
  * voxd needs NO config change: its default endpoint is
    http://127.0.0.1:$PORT/v1/audio/transcriptions, which we now serve.
- * FLM also served an LLM (qwen); this backend is ASR-only. If voxd relies
-   on that LLM (e.g. for post-processing), that capability is not provided here.
+ * Re-run this script after any \`git pull\`: it rebuilds AND reinstalls the binary.
+   Without the reinstall step the service keeps running whatever was in
+   $ENGINE_BIN_DIR, however old.
  * Check status / logs:
-     systemctl --user status npu-asr.service
-     journalctl --user -u npu-asr.service -f
+     systemctl --user status $SERVICE.service
+     journalctl --user -u $SERVICE.service -f
 ============================================================================
 EOF
