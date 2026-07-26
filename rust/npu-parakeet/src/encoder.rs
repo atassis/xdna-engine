@@ -88,6 +88,27 @@ impl FastConformerEncoder {
         a.dot(&b)
     }
 
+    /// bf16-arena fast path for a plain (non-K-split, K=KRES) weight matmul: when `b.bf16_m(key)`
+    /// yields pre-packed bf16 bits (NPU_WEIGHTS_ARENA loaded), dispatch straight from those bits,
+    /// skipping the host f32->bf16 pack entirely on a cache miss. Returns `None` on the npy path
+    /// (bf16_m always None there) or without the NPU feature/instance, so the caller falls back to
+    /// the existing `mm_lazy(.., || b.m(key), id)` path unchanged.
+    fn mm_arena(&self, a: &Array2<f32>, b: &BlockWeights, key: &str, id: &str) -> Option<Array2<f32>> {
+        #[cfg(feature = "npu")]
+        {
+            if let Some(npu) = &self.npu {
+                if let Some((k, n, bits)) = b.bf16_m(key) {
+                    return Some(npu.matmul_id_bf16(a, id, k, n, bits));
+                }
+            }
+        }
+        #[cfg(not(feature = "npu"))]
+        {
+            let _ = (a, b, key, id);
+        }
+        None
+    }
+
     /// True when the FFN SiLU is applied on chip (modal resident), so the host must skip it.
     fn ff_act_on_chip(&self) -> bool {
         #[cfg(feature = "npu")]
@@ -122,16 +143,28 @@ impl FastConformerEncoder {
                         // back at the FFN boundary -- ONLY the accumulation moved on-device (block
                         // dataflow unchanged). A WER-neutral result proves the device-accumulate is
                         // bit-identical to the host K-split. Falls through to resident_ffn if acc_add absent.
+                        let id1 = format!("{blk}.{tag}.l1");
+                        let id2 = format!("{blk}.{tag}.l2");
                         if std::env::var("PARAKEET_FFN_DEVACC").map(|v| v != "0").unwrap_or(false) {
                             if let Some(out) = npu.resident_ffn_devacc_readback(x, gamma.as_slice().unwrap(), beta.as_slice().unwrap(),
-                                || b.m(l1), &format!("{blk}.{tag}.l1"),
-                                || b.m(l2), &format!("{blk}.{tag}.l2")) {
+                                || b.m(l1), &id1,
+                                || b.m(l2), &id2) {
                                 return out;
                             }
                         }
+                        // bf16-arena fast path (NPU_WEIGHTS_ARENA): fc1/fc2 are both baked bf16
+                        // verbatim [K,N], so when both are available skip the host f32->bf16 pack
+                        // entirely on a cache miss. Falls back to the f32 path below (byte-identical
+                        // to before) when the arena isn't loaded (bf16_m always None on npy).
+                        if let (Some((k1, n1, bits1)), Some((k2, n2, bits2))) =
+                            (b.bf16_m(l1), b.bf16_m(l2))
+                        {
+                            return npu.resident_ffn_bf16(x, gamma.as_slice().unwrap(), beta.as_slice().unwrap(),
+                                &id1, k1, n1, bits1, &id2, k2, n2, bits2);
+                        }
                         return npu.resident_ffn(x, gamma.as_slice().unwrap(), beta.as_slice().unwrap(),
-                            || b.m(l1), &format!("{blk}.{tag}.l1"),
-                            || b.m(l2), &format!("{blk}.{tag}.l2"));
+                            || b.m(l1), &id1,
+                            || b.m(l2), &id2);
                     }
                     let h = npu.resident_ff1_fc1(x, gamma.as_slice().unwrap(), beta.as_slice().unwrap(),
                         || b.m(l1), &format!("{blk}.{tag}.l1"), self.cfg.ff, true);
@@ -201,8 +234,8 @@ impl FastConformerEncoder {
         // Whole subsample stem is host math (conv2d x5 + relu + flatten + final gemm);
         // no self.mm()/device call lives here, so one Host leaf scope cannot double-count.
         let _h = PhaseScope::new("subsample", Bucket::Host);
-        let pe4 = |k: &str| self.w.pre(k).clone().into_dimensionality::<Ix4>().unwrap();
-        let pe1 = |k: &str| self.w.pre(k).clone().into_dimensionality::<Ix1>().unwrap();
+        let pe4 = |k: &str| self.w.pre(k).into_dimensionality::<Ix4>().unwrap();
+        let pe1 = |k: &str| self.w.pre(k).into_dimensionality::<Ix1>().unwrap();
         // [1, time, freq]
         let (f, t) = mel.dim();
         let mut x = Array3::<f32>::zeros((1, t, f));
@@ -230,8 +263,8 @@ impl FastConformerEncoder {
                 }
             }
         }
-        let wout = self.w.pre("out.weight").clone().into_dimensionality::<Ix2>().unwrap(); // [4096, hidden]
-        let bout = self.w.pre("out.bias").clone().into_dimensionality::<Ix1>().unwrap();
+        let wout = self.w.pre("out.weight").into_dimensionality::<Ix2>().unwrap(); // [4096, hidden]
+        let bout = self.w.pre("out.bias").into_dimensionality::<Ix1>().unwrap();
         prof::phase::set_stage("subsample"); // final gemm (host .dot here; labels device path if ever routed via mm)
         flat.dot(&wout) + &bout
     }
@@ -243,17 +276,32 @@ impl FastConformerEncoder {
         // Each `b.m()` clones the whole [D,D]/[P,D] matrix out of the weight map -- pure host data
         // movement (no math, no device). Materialized LAZILY inside mm_lazy's closure: on a warm
         // (weight-BO cache hit) pass the clone never runs, eliminating the per-pass reclone.
+        // Each projection prefers the bf16-arena fast path (NPU_WEIGHTS_ARENA); `mm_arena` returns
+        // None on the npy path, so the `unwrap_or_else` fallback is the pre-existing f32 mm_lazy
+        // call, byte-identical to before.
         prof::phase::set_stage("mhsa_qkv");
-        let q = self.mm_lazy(x, || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_q.weight") }, &format!("{blk}.q")); // [T, D]
+        let id_q = format!("{blk}.q");
+        let q = self.mm_arena(x, b, "self_attn.linear_q.weight", &id_q)
+            .unwrap_or_else(|| self.mm_lazy(x, || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_q.weight") }, &id_q)); // [T, D]
         prof::phase::set_stage("mhsa_qkv");
-        let k = self.mm_lazy(x, || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_k.weight") }, &format!("{blk}.k"));
+        let id_k = format!("{blk}.k");
+        let k = self.mm_arena(x, b, "self_attn.linear_k.weight", &id_k)
+            .unwrap_or_else(|| self.mm_lazy(x, || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_k.weight") }, &id_k));
         prof::phase::set_stage("mhsa_qkv");
-        let v = self.mm_lazy(x, || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_v.weight") }, &format!("{blk}.v"));
+        let id_v = format!("{blk}.v");
+        let v = self.mm_arena(x, b, "self_attn.linear_v.weight", &id_v)
+            .unwrap_or_else(|| self.mm_lazy(x, || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_v.weight") }, &id_v));
         prof::phase::set_stage("mhsa_pos");
-        let pm = self.mm_lazy(pos_enc, || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_pos.weight") }, &format!("{blk}.pos")); // [P, D]
+        let id_pos = format!("{blk}.pos");
+        let pm = self.mm_arena(pos_enc, b, "self_attn.linear_pos.weight", &id_pos)
+            .unwrap_or_else(|| self.mm_lazy(pos_enc, || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_pos.weight") }, &id_pos)); // [P, D]
         let ctx = self.attention_core(&q, &k, &v, &pm, blk, t);
+        // linear_out moved to this caller in main's mhsa/attention_core split, so the arena fast
+        // path attaches here rather than inside the attention body as on the original branch.
         prof::phase::set_stage("mhsa_qkv");
-        self.mm_lazy(&ctx, || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_out.weight") }, &format!("{blk}.out"))
+        let id_out = format!("{blk}.out");
+        self.mm_arena(&ctx, b, "self_attn.linear_out.weight", &id_out)
+            .unwrap_or_else(|| self.mm_lazy(&ctx, || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_out.weight") }, &id_out))
     }
 
     /// Device-in MHSA for the fused seam: the attention input is the resident-stream LN output
@@ -272,7 +320,12 @@ impl FastConformerEncoder {
         prof::phase::set_stage("mhsa_qkv");
         let v = npu.proj_from_bf16(satt_bo, m, || b.m("self_attn.linear_v.weight"), &format!("{blk}.v"), d);
         prof::phase::set_stage("mhsa_pos");
-        let pm = self.mm_lazy(pos_enc, || b.m("self_attn.linear_pos.weight"), &format!("{blk}.pos"));
+        // pos stays host-in on the device-in path (pos_enc != satt), so it takes the arena fast path
+        // too. q/k/v go through `proj_from_bf16` and linear_out through `matmul_id_to_bo` -- both are
+        // device-in/device-out and have no bf16-arena sibling, so they are deliberately untouched.
+        let id_pos = format!("{blk}.pos");
+        let pm = self.mm_arena(pos_enc, b, "self_attn.linear_pos.weight", &id_pos)
+            .unwrap_or_else(|| self.mm_lazy(pos_enc, || b.m("self_attn.linear_pos.weight"), &id_pos));
         let ctx = self.attention_core(&q, &k, &v, &pm, blk, m);
         prof::phase::set_stage("mhsa_qkv");
         npu.matmul_id_to_bo(&ctx, || b.m("self_attn.linear_out.weight"), &format!("{blk}.out"), d)

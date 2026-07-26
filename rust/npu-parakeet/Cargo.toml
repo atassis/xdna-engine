@@ -14,8 +14,10 @@ path = "src/lib.rs"
 npu = ["dep:npu-xrt", "dep:npu-onnx"]
 
 [dependencies]
+anyhow = "1"
 ndarray = "0.16"
 ndarray-npy = { version = "0.9", default-features = false }
+npu-weights = { path = "../npu-weights" }
 npu-xrt = { path = "../npu-xrt", optional = true }
 npu-onnx = { path = "../npu-onnx", optional = true }
 rayon = "1"
