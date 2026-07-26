@@ -29,7 +29,7 @@ an OpenAI-style `/v1/audio/transcriptions` endpoint on :11434. GigaAM-v3 (RU) is
 optional second ASR scenario.
 
 The reproduction is decoupled from any build tree: the AIE toolchain is built into a
-content-addressed instance under `~/.cache/xdna2-build/`, and the model weight arena +
+content-addressed instance under `~/.cache/xdna2-build/`, and the model weight checkpoint +
 xclbins are regenerated from pinned upstream sources.
 
 ---
@@ -194,13 +194,13 @@ scripts/fetch_models.sh                 # set FETCH_EXTRA=0 to skip the 11 non-A
   `[parakeet-models] materialized .../models/parakeet : ...`, and `Done.`
 - **Time:** 5-20 min depending on `FETCH_EXTRA` (the parakeet repo alone is ~2.5 GB); the
   `models/parakeet/` materialize adds a local ~2.4 GB `cp` from the cache.
-- **Does NOT produce:** `artifacts/parakeet/encoder/` (the weight arena -- Step 7). The HF
+- **Does NOT produce:** `artifacts/parakeet/encoder/` (the weight checkpoint -- Step 7). The HF
   cache is near-empty on a clean box, so this is real downloads (set `HF_HUB_OFFLINE=1` only
   if already cached).
 
 ---
 
-## Step 7 -- Build the Parakeet encoder weight arena  [CPU]
+## Step 7 -- Build the Parakeet encoder weight checkpoint  [CPU]
 
 ### 7.b  Materialize `models/parakeet/encoder-model.onnx` (AUTOMATED -- GAP #1 CLOSED)
 `extract_parakeet_encoder.py` reads `models/parakeet/encoder-model.onnx` (+ its external
@@ -213,7 +213,7 @@ cached, re-run `scripts/fetch_models.sh` -- it is idempotent.
 - **Produces:** `models/parakeet/encoder-model.onnx` (+ `.onnx.data`, ~2.4 GB).
 - **Success signal:** both files present; total ~2.5 GB (Step 6 prints the `materialized` line).
 
-### 7.a  Extract the arena
+### 7.a  Extract the checkpoint
 ```bash
 .venv-export/bin/python scripts/extract_parakeet_encoder.py
 ```
@@ -333,7 +333,7 @@ automated from a clean clone.
 | HF model cache (parakeet, gigaam) | Step 6 `fetch_models.sh` | AUTO (network: HF hub). |
 | `artifacts/parakeet/{preprocessor,decoder_joint,vocab}` | Step 6 `fetch_models.sh` (`prep_parakeet_artifacts`) | AUTO. |
 | `models/parakeet/encoder-model.onnx(.data)` | Step 6 `fetch_models.sh` (`prep_parakeet_models`) | AUTO -- `cp -L`-derefs from the HF snapshot under original names (GAP #1 CLOSED). |
-| `artifacts/parakeet/encoder/` (weight arena) | Step 7.a `extract_parakeet_encoder.py` | AUTO -- input now auto-produced by Step 6. |
+| `artifacts/parakeet/encoder/` (weight checkpoint) | Step 7.a `extract_parakeet_encoder.py` | AUTO -- input now auto-produced by Step 6. |
 | `artifacts/wer_clips/*.wav` + `refs.json` + baseline JSONs | TRACKED IN VCS (committed) | AUTO -- present from the clone, no fetch step (GAP #5 was a false alarm; `fetch_wer_clips.py` only regenerates). |
 | `models/gigaam_v3_encoder_static.onnx` + `models/quant/*` | Step 10 (optional) | AUTO (optional scenario). |
 | Parakeet resident xclbins + insts (under `mlir-aie/.../whole_array/build/`) | Step 9 `build_parakeet_kernels.sh` | AUTO (needs Step 4 green). |
@@ -348,7 +348,7 @@ automated from a clean clone.
   `models/parakeet/encoder-model.onnx` (+ external `.onnx.data`), but `fetch_models.sh`
   populated only the HF cache and `artifacts/parakeet/{preprocessor,decoder_joint,vocab}`
   -- it never created `models/parakeet/`. On a clean clone Step 7 failed with a missing-file
-  error, so the encoder arena (the core NPU weights) was never built.
+  error, so the encoder checkpoint (the core NPU weights) was never built.
 - **Fix (DONE):** added `prep_parakeet_models()` to `fetch_models.sh`, called right after
   `prep_parakeet_artifacts`. It `cp -L`-derefs `encoder-model.onnx`, `encoder-model.onnx.data`,
   `decoder_joint-model.onnx`, `vocab.txt` from the HF snapshot into `models/parakeet/` under

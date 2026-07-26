@@ -2,7 +2,7 @@
 //
 // OPT-125m arch (facebook/opt-125m, decoder weights used as an encoder-style weight bag). Mirrors
 // scripts/convert_opt125m.py EXACTLY. Source = raw HF safetensors (model.decoder.*). Reference npy
-// layout (verify --refs dir is `artifacts/opt-125m`, so arena names equal npy paths relative to it):
+// layout (verify --refs dir is `artifacts/opt-125m`, so checkpoint names equal npy paths relative to it):
 //   - embed_tokens              <- model.decoder.embed_tokens.weight   ([vocab,d] VERBATIM bf16)
 //   - embed_positions           <- model.decoder.embed_positions.weight ([2050,d] VERBATIM bf16; offset +2)
 //   - ln_final.{weight,bias}    <- model.decoder.final_layer_norm.{w,b}  (f32, verbatim)

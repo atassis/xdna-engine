@@ -2,7 +2,7 @@
 """Oracle for the EDSR-base arch converter (M3 ship net) + the npu-sr whole-net gate.
 
 Exports EDSR-base xR: (1) the weights as a safetensors bag the `edsr` arch bakes from (torch keys,
-`module.` stripped), (2) per-tensor .npy under artifacts/edsr/ named by the ARENA names edsr.rs emits
+`module.` stripped), (2) per-tensor .npy under artifacts/edsr/ named by the CHECKPOINT names edsr.rs emits
 (for parity_edsr), (3) a small fixed LR RGB tile + its CPU EDSR SR output (gate_lr/gate_sr) for the
 frontier gate. Mirrors scripts/export_espcn.py. Run with a venv that has super_image + torch + safetensors:
     <venv>/bin/python scripts/export_edsr.py [--scale 3]
@@ -24,9 +24,9 @@ sd = {k[len("module."):] if k.startswith("module.") else k: v for k, v in m.stat
 # (1) safetensors source (contiguous f32) -- the `path:` bake source.
 save_file({k: v.contiguous().float() for k, v in sd.items()}, str(OUT / "edsr_base.safetensors"))
 
-# (2) per-tensor npy refs, named by the arena names edsr.rs emits.
-def dump(arena_name, torch_key):
-    np.save(OUT / f"{arena_name}.npy", sd[torch_key].numpy().astype(np.float32))
+# (2) per-tensor npy refs, named by the checkpoint names edsr.rs emits.
+def dump(checkpoint_name, torch_key):
+    np.save(OUT / f"{checkpoint_name}.npy", sd[torch_key].numpy().astype(np.float32))
 
 dump("sub_mean_w", "sub_mean.weight");  dump("sub_mean_b", "sub_mean.bias")
 dump("head_w", "head.0.weight");        dump("head_b", "head.0.bias")
@@ -40,7 +40,7 @@ dump("tail1_w", "tail.1.weight");       dump("tail1_b", "tail.1.bias")
 dump("add_mean_w", "add_mean.weight");  dump("add_mean_b", "add_mean.bias")
 print(f"EDSR-base x{r}: {n_blocks} residual blocks; dumped weights to {OUT}")
 
-# (2b) emit edsr.json (the net-as-data schedule) matching the arena names + this scale.
+# (2b) emit edsr.json (the net-as-data schedule) matching the checkpoint names + this scale.
 import json
 # NOTE: super_image EdsrModel.forward is head -> body(+global skip) -> tail. It does NOT apply the
 # sub_mean/add_mean MeanShift layers (they exist in the state_dict but are unused), so they are NOT in
@@ -63,7 +63,7 @@ ops += [
     {"op": "pixel_shuffle", "r": r},
     {"op": "conv2d", "weights": "tail1", "k": 3, "pad": 1, "relu": False, "cin": 64, "cout": 3},
 ]
-sched = {"name": "edsr", "scale": r, "arena": "target/test-arenas/edsr.safetensors", "input": "rgb", "ops": ops}
+sched = {"name": "edsr", "scale": r, "checkpoint": "target/test-checkpoints/edsr.safetensors", "input": "rgb", "ops": ops}
 (OUT / "edsr.json").write_text(json.dumps(sched, indent=2))
 print(f"edsr.json: {len(ops)} ops")
 

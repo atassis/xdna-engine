@@ -5,7 +5,7 @@
 // (the NeMo export anonymises every MatMul weight, so the linear weights are reached via their
 // consuming node's name, e.g. `/layers.0/self_attn/linear_q/MatMul`).
 //
-// Per-block layout (24 blocks, d_model 1024, d_ff 4096, 8 heads x 128). Arena names equal the
+// Per-block layout (24 blocks, d_model 1024, d_ff 4096, 8 heads x 128). Checkpoint names equal the
 // oracle npy paths relative to artifacts/parakeet/encoder, so verify maps name -> <refs>/<name>.npy:
 //   - L{i}/norm_feed_forward1.{weight,bias}  <- LayerNormalization (f32 verbatim)
 //   - L{i}/norm_self_att.{weight,bias}        <- LayerNormalization (f32 verbatim)
@@ -48,7 +48,7 @@ impl FastConformer {
     /// initializers (`layers.{i}....`); the linear/ffn weights are node-name ALIASES
     /// (`/layers.{i}/.../MatMul`); the convs are named initializers (`layers.{i}.conv...`).
     fn block_keys(i: usize) -> Vec<(String, String, bool)> {
-        // (arena_dst, source_key, bf16)
+        // (checkpoint_dst, source_key, bf16)
         let mut v = Vec::new();
         // LayerNorms (f32 verbatim)
         for nm in ["norm_feed_forward1", "norm_self_att", "norm_conv", "norm_feed_forward2", "norm_out"] {

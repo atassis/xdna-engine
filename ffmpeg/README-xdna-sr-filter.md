@@ -20,7 +20,7 @@ local dev build; **upstreaming the filter is a separate, owner-gated act.**
     git clone --depth 1 -b n8.0 https://git.ffmpeg.org/ffmpeg.git target/ffmpeg-xdna
     # 3. patch + configure + build
     bash ffmpeg/apply.sh
-    # 4. run (the lib must be on LD_LIBRARY_PATH; run from the repo root so the schedule's arena resolves)
+    # 4. run (the lib must be on LD_LIBRARY_PATH; run from the repo root so the schedule's checkpoint resolves)
     LD_LIBRARY_PATH=rust/target/debug target/ffmpeg-xdna/ffmpeg \
       -i in.mp4 -vf xdna_sr=schedule=artifacts/espcn/espcn.json:npu=0 out.mp4
 

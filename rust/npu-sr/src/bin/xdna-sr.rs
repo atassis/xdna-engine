@@ -1,6 +1,6 @@
 //! xdna-sr: offline video upscaler. `xdna-sr in.mp4 out.mp4 [--net espcn] [--cpu] [--bench]`.
 //! A thin adapter over the npu-sr engine library (SrEngine::upscale_file). Run from the repo root so the
-//! schedule's relative arena path resolves.
+//! schedule's relative checkpoint path resolves.
 use clap::Parser;
 use npu_sr::SrEngine;
 

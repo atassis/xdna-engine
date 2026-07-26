@@ -2,7 +2,7 @@
 //
 // Whisper encoder arch (openai/whisper-small). Mirrors scripts/extract_whisper_encoder.py EXACTLY.
 // Source = raw HF safetensors names (model.encoder.*). Reference npy layout (the verify --refs dir is
-// `artifacts/whisper-small`, so arena names equal the npy paths relative to it):
+// `artifacts/whisper-small`, so checkpoint names equal the npy paths relative to it):
 //   - conv/conv1.weight          <- model.encoder.conv1.weight     (3D [768,80,3], VERBATIM, bf16)
 //   - conv/conv1.bias            <- model.encoder.conv1.bias        (f32, verbatim)
 //   - conv/conv2.weight          <- model.encoder.conv2.weight     (3D [768,768,3], VERBATIM, bf16)

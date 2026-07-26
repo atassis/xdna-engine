@@ -3,7 +3,7 @@
 name = "npu-weights"
 version = "0.1.0"
 edition = "2021"
-description = "Rust-native weight loader: bake HF safetensors/ONNX into a mmap BF16 arena"
+description = "Rust-native weight loader: bake HF safetensors/ONNX into a mmap BF16 checkpoint"
 
 [lib]
 name = "npu_weights"

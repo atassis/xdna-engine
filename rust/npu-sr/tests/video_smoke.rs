@@ -1,5 +1,5 @@
 //! Generate a 5-frame test clip with ffmpeg, upscale it via the CLI pipeline, assert the output opens
-//! with the right dims + frame count. Runs from repo root (arena path is repo-root-relative).
+//! with the right dims + frame count. Runs from repo root (checkpoint path is repo-root-relative).
 use std::path::Path;
 use std::process::Command;
 
@@ -11,8 +11,8 @@ fn upscales_generated_clip_cpu() {
         .parent()
         .unwrap()
         .to_path_buf();
-    if !root.join("target/test-arenas/espcn.safetensors").exists() {
-        eprintln!("SKIP: arena missing");
+    if !root.join("target/test-checkpoints/espcn.safetensors").exists() {
+        eprintln!("SKIP: checkpoint missing");
         return;
     }
     std::env::set_current_dir(&root).unwrap();

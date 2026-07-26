@@ -4,7 +4,7 @@
 # The "gitignored = recreatable" principle (npu-weights roadmap T8): nothing under artifacts/ is
 # precious IF it has a proven regeneration path. This tool codifies the keep/delete RULE:
 #   * PRUNABLE = has a verified regen command (the regen script/tool exists on disk) AND is either a
-#     transient A/B validation snapshot (leading `_`) or a per-model oracle/arena regenerable on demand.
+#     transient A/B validation snapshot (leading `_`) or a per-model oracle/checkpoint regenerable on demand.
 #   * KEEP     = tracked in git (a checked-in reference like goldens/), OR a load-bearing artifact the
 #     live engine currently loads (regenerable, but in active use -> not reclaimed by default).
 #   * REVIEW   = regenerable in principle but no regen script found here, or large/ambiguous -> owner decides.

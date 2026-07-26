@@ -1,6 +1,6 @@
 //! M3 device gate: the whole EDSR-base net runs on the NPU (host im2col -> N-tiled whole-array bf16 GEMM
 //! + host skips/pixel_shuffle) and matches the CPU frontier + the torch oracle within tolerance. Skips if
-//! no NPU / xclbin / arena. Runs from repo root. Serialize device access under scripts/npu_lock.sh.
+//! no NPU / xclbin / checkpoint. Runs from repo root. Serialize device access under scripts/npu_lock.sh.
 use ndarray::ArrayD;
 use ndarray_npy::read_npy;
 use npu_sr::SrEngine;
@@ -23,8 +23,8 @@ fn npu_edsr_matches_cpu_and_oracle() {
         eprintln!("SKIP: no NPU device");
         return;
     }
-    if !refs.join("gate_sr.npy").exists() || !root.join("target/test-arenas/edsr.safetensors").exists() || !xclbin.exists() {
-        eprintln!("SKIP: edsr oracle/arena/xclbin missing");
+    if !refs.join("gate_sr.npy").exists() || !root.join("target/test-checkpoints/edsr.safetensors").exists() || !xclbin.exists() {
+        eprintln!("SKIP: edsr oracle/checkpoint/xclbin missing");
         return;
     }
     std::env::set_current_dir(&root).unwrap();

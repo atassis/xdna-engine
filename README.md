@@ -49,7 +49,7 @@ control-plane service.
     npu embed "some text"        # run embeddings
     npu models                   # list loaded models
 
-Weight arenas are baked from Hugging Face checkpoints with `npu bake` (see
+Weight checkpoints are baked from Hugging Face checkpoints with `npu bake` (see
 `rust/npu-weights`). Model export/convert scripts live in `scripts/`.
 
 ## Layout

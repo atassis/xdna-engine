@@ -9,17 +9,17 @@ fn check_one(sub: &str, hf: &str) {
         eprintln!("SKIP {sub}: oracle missing - run .venv/bin/python scripts/export_esm.py {hf} {sub}");
         return;
     }
-    let arena = root.join(format!("target/test-arenas/{sub}.safetensors"));
+    let checkpoint = root.join(format!("target/test-checkpoints/{sub}.safetensors"));
     let bin = env!("CARGO_BIN_EXE_npu-weights");
     let st = Command::new(bin)
         .current_dir(root)
         .args(["bake", "--source", &format!("hf:{hf}"), "--arch", "esm",
-               "--arena", arena.to_str().unwrap(), "--force"])
+               "--checkpoint", checkpoint.to_str().unwrap(), "--force"])
         .status().unwrap();
     assert!(st.success(), "bake failed for {sub}");
     let out = Command::new(bin)
         .current_dir(root)
-        .args(["verify", "--arena", arena.to_str().unwrap(), "--arch", "esm",
+        .args(["verify", "--checkpoint", checkpoint.to_str().unwrap(), "--arch", "esm",
                "--refs", refs.to_str().unwrap()])
         .output().unwrap();
     let s = String::from_utf8_lossy(&out.stdout);
@@ -28,11 +28,11 @@ fn check_one(sub: &str, hf: &str) {
 }
 
 #[test]
-fn esm2_8m_arena_matches_python_oracle() {
+fn esm2_8m_checkpoint_matches_python_oracle() {
     check_one("esm2-8m", "facebook/esm2_t6_8M_UR50D");
 }
 
 #[test]
-fn esm2_35m_arena_matches_python_oracle() {
+fn esm2_35m_checkpoint_matches_python_oracle() {
     check_one("esm2-35m", "facebook/esm2_t12_35M_UR50D");
 }

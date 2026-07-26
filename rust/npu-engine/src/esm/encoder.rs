@@ -86,7 +86,7 @@ impl EsmBlock {
     fn new(shared: Rc<SharedCtxA>, l: &EsmLayer, hidden: usize, ff: usize, n_heads: usize, head_dim: usize) -> Self {
         let proj_n = round_stream(hidden); // 320/480 -> 768
         let ff_n = round_stream(ff); // 1280 -> 1536, 1920 -> 3072
-        // Build a bf16 GEMV op, preferring the pre-packed arena bf16 bits (fast restart: no per-start
+        // Build a bf16 GEMV op, preferring the pre-packed checkpoint bf16 bits (fast restart: no per-start
         // f32->bf16 pack) when (a) this layer carries bf16 for `wk`, (b) the bits are already the exact
         // [KA, n] device layout (i.e. NO host pad is needed -- hidden==KA and n matches), and (c) the
         // shared context accepts the plain bf16 BO (non-modal, non-int8). Otherwise fall back to the

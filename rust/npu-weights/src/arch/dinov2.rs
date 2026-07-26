@@ -2,7 +2,7 @@
 //
 // DINOv2 backbone arch (facebook/dinov2-{small,base,large}). Mirrors scripts/convert_dinov2.py
 // EXACTLY. Source = raw HF safetensors (NO `vit.` prefix). Reference npy layout (refs dir is the
-// model root `artifacts/dinov2-base`, so arena names equal npy paths relative to it):
+// model root `artifacts/dinov2-base`, so checkpoint names equal npy paths relative to it):
 //   - patch_proj.weight   <- embeddings.patch_embeddings.projection.weight (Conv2d [768,3,14,14])
 //                            FAITHFUL im2col-flatten: reshape row-major to [768, 3*14*14] then
 //                            TRANSPOSE -> [K,N] bf16 (the oracle does .reshape(out,-1).T).

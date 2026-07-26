@@ -12,7 +12,7 @@ transformer or conv model plugs into, rather than a per-model stack.
    npu-engine ......... general multi-model pipeline
         |
    npu-runtime ........ control plane: desired-state config, reconcile, one device actor
-   npu-weights ........ bake HF safetensors/ONNX -> mmap bf16 weight arena
+   npu-weights ........ bake HF safetensors/ONNX -> mmap bf16 weight checkpoint
         |
    npu-xrt ............ safe Rust bindings over a C++ XRT shim -> the NPU
         |
@@ -27,7 +27,7 @@ transformer or conv model plugs into, rather than a per-model stack.
 | `npu-xrt` | Safe Rust bindings to drive the XDNA2 NPU via a thin C++ XRT shim. |
 | `npu-engine` | General multi-model engine over the kernel kit: a `Frontend / Encoder / Head` pipeline serving ASR and embeddings. |
 | `npu-runtime` | Control plane over `npu-engine`: desired-state config, reconcile, and a single device actor that serializes NPU work. |
-| `npu-weights` | Rust-native weight loader: bakes HF safetensors / ONNX into an mmap-able bf16 arena with a content fingerprint and parity gate. |
+| `npu-weights` | Rust-native weight loader: bakes HF safetensors / ONNX into an mmap-able bf16 checkpoint with a content fingerprint and parity gate. |
 | `npu-onnx` | Runs ONNX graphs from Rust via a thin C shim over the system onnxruntime (oracles + fallback). |
 | `npu-asr` / `npu-asr-host` | GigaAM-v3 encoder on the NPU (`npu-asr`) and its pure host-CPU reference math (`npu-asr-host`). |
 | `npu-parakeet` | Parakeet-TDT FastConformer encoder (rel-pos attention, depthwise conv1d k=9, /8 conv2D subsample). |

@@ -62,7 +62,7 @@ pub struct Model {
 
 impl Model {
     /// Load a model from a scenario TOML, using the current working directory as the repo root
-    /// (where artifacts/ live). Bakes the npu-weights arena on miss (A4 declarative path).
+    /// (where artifacts/ live). Bakes the npu-weights checkpoint on miss (A4 declarative path).
     pub fn load(scenario: impl AsRef<Path>) -> Result<Model, EngineError> {
         let root = std::env::current_dir()
             .map_err(|e| EngineError::Load(format!("cwd: {e}")))?;

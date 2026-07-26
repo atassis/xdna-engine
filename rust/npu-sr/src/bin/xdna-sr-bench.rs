@@ -1,7 +1,7 @@
 //! Bench: upscale a clip on CPU and (if a device is present) NPU, print ms/frame + extrapolated FHD->4K
 //! fps for each. When both run, decode both outputs and report the max per-frame Y rel-L2 NPU-vs-CPU =
 //! the parity gate (must be <= 1.1e-2, the M1 regime). Usage: xdna-sr-bench <clip> [--net espcn].
-//! Run from the repo root (schedule arena path is repo-root-relative). Gate on rel-L2/PSNR, never WER.
+//! Run from the repo root (schedule checkpoint path is repo-root-relative). Gate on rel-L2/PSNR, never WER.
 use npu_sr::SrEngine;
 
 fn main() -> anyhow::Result<()> {

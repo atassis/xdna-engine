@@ -6,7 +6,7 @@
 //
 // Two towers, each a stack of the SAME CLIPEncoderLayer (q/k/v/out_proj WITH bias, layer_norm1/2,
 // mlp.fc1/fc2 with bias, gelu), plus joint projections + a logit_scale scalar. Reference npy layout
-// (refs dir = model root `artifacts/clip-vit-b32`, arena names = npy paths):
+// (refs dir = model root `artifacts/clip-vit-b32`, checkpoint names = npy paths):
 //   TEXT (hidden 512, 12 layers, ffn 2048):
 //     text/tok_emb            <- text_model.embeddings.token_embedding.weight ([vocab,512] VERBATIM bf16)
 //     text/pos_emb            <- text_model.embeddings.position_embedding.weight ([77,512] bf16)

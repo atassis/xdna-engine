@@ -36,7 +36,7 @@ pub struct SrEngine {
 }
 
 impl SrEngine {
-    /// Load a schedule (espcn.json) + its baked weights arena. `use_npu`=false forces the CPU frontier.
+    /// Load a schedule (espcn.json) + its baked weights checkpoint. `use_npu`=false forces the CPU frontier.
     pub fn load(schedule_path: impl AsRef<Path>, use_npu: bool) -> Result<SrEngine, SrError> {
         let sched = schedule::Schedule::load(schedule_path.as_ref())?;
         let frontier = frontier::Frontier::build(&sched, use_npu)?;

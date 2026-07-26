@@ -56,7 +56,7 @@ optimization outright. The achievable, rigorous contract is:
 - **End-to-end accuracy backstop:** WER 0.1172 on the M=1 decode, plus the
   automatable argmax-token parity surrogate (16/16 identical). Every variant is
   WER-gated.
-- **Weight-load gate:** weight-arena parity max-rel-err < 5e-2 (bf16 floor ~3.89e-3).
+- **Weight-load gate:** weight-checkpoint parity max-rel-err < 5e-2 (bf16 floor ~3.89e-3).
 - **Precision is a per-node POLICY, not a default:** bf16 (emulated mmul) where we
   want parity; bfp16 (true 512-MAC systolic) or int8/int4 only where the WER gate
   says the accuracy cost is affordable (decode weights are an energy lever; encoder

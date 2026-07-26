@@ -2,7 +2,7 @@
 //
 // ESPCN sub-pixel CNN (sub_pixel_cnn_2016): 4 conv layers + a pixel-shuffle upsample. Source = the
 // pretrained ONNX (onnx: source). Conv weights stay native [Cout,Cin,kh,kw] (the im2col->GEMM frontier
-// flattens them per-layer, like resnet.rs keeps conv-native). Weights -> bf16, biases -> f32. Flat arena
+// flattens them per-layer, like resnet.rs keeps conv-native). Weights -> bf16, biases -> f32. Flat checkpoint
 // names match the oracle npy (scripts/export_espcn.py): conv{1..4}_w / conv{1..4}_b.
 //
 // ONNX initializer names are model-specific, so we discover the 4 conv weights (4-D) and 4 biases (1-D)

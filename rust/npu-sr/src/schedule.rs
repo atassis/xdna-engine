@@ -1,10 +1,10 @@
-//! A super-resolution net as DATA: an ordered list of ops over the brick vocabulary + a weights arena
+//! A super-resolution net as DATA: an ordered list of ops over the brick vocabulary + a weights checkpoint
 //! ref + the integer scale. `espcn.json` is one instance; `abpn.json` (M3) is another over the schema.
 use crate::SrError;
 use serde::Deserialize;
 use std::path::Path;
 
-/// One op in the schedule. `weights` names the arena tensors (e.g. "conv1" -> conv1_w / conv1_b).
+/// One op in the schedule. `weights` names the checkpoint tensors (e.g. "conv1" -> conv1_w / conv1_b).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "op")]
 pub enum Op {
@@ -44,7 +44,10 @@ pub enum InputMode {
 pub struct Schedule {
     pub name: String,
     pub scale: usize,
-    pub arena: String, // path to the baked safetensors arena, relative to repo root
+    /// Path to the baked safetensors checkpoint, relative to the repo root. `alias` keeps every
+    /// schedule JSON generated before the arena->checkpoint rename loadable.
+    #[serde(alias = "arena")]
+    pub checkpoint: String,
     #[serde(default)]
     pub input: InputMode,
     pub ops: Vec<Op>,
