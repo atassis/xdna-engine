@@ -7,7 +7,7 @@ use std::time::Instant;
 use crate::config::Config;
 use crate::loader::ModelLoader;
 use crate::reconcile::{reconcile, ReconcileReport};
-use crate::registry::{Capability, ModelStatus, Registry};
+use crate::registry::{deep_release_due, release_free_memory, Capability, ModelStatus, Registry};
 use crate::select::resolve;
 use npu_engine::EngineError;
 
@@ -89,19 +89,28 @@ fn spawn(cfg: Config, loader: Box<dyn ModelLoader + Send>, eager: bool) -> (Hand
         // /healthz or /v1/models more often than sweep_interval_s would reset the wait forever and
         // idle models would never be released.
         let mut next_sweep = Instant::now() + cfg.server.sweep_interval();
+        // Second level of idleness. `last_request` deliberately tracks REQUESTS, not commands: a
+        // /healthz or /v1/models poll must not be able to hold the process at its working-set size
+        // forever (the same starvation the sweep deadline above avoids). `released` latches so the
+        // trim runs once per idle stretch, and is re-armed by a request or by an unload freeing more.
+        let mut last_request = Instant::now();
+        let mut released = false;
         loop {
             match rx.recv_timeout(next_sweep.saturating_duration_since(Instant::now())) {
                 Ok(Cmd::Transcribe { model, pcm, sr, reply }) => {
+                    last_request = Instant::now(); released = false;
                     let r = guard(|| run_transcribe(&cfg, &mut reg, loader.as_ref(), model.as_deref(), &pcm, sr))
                         .unwrap_or_else(|msg| Err(EngineError::Device(msg)));
                     let _ = reply.send(r);
                 }
                 Ok(Cmd::Embed { model, text, reply }) => {
+                    last_request = Instant::now(); released = false;
                     let r = guard(|| run_embed(&cfg, &mut reg, loader.as_ref(), model.as_deref(), &text))
                         .unwrap_or_else(|msg| Err(EngineError::Device(msg)));
                     let _ = reply.send(r);
                 }
                 Ok(Cmd::Reconcile { cfg: newcfg, reply }) => {
+                    last_request = Instant::now(); released = false;
                     cfg = *newcfg;
                     let rep = guard(|| reconcile(&cfg, &mut reg, loader.as_ref()))
                         .unwrap_or_else(|msg| ReconcileReport { failed: vec![msg], ..Default::default() });
@@ -115,8 +124,19 @@ fn spawn(cfg: Config, loader: Box<dyn ModelLoader + Send>, eager: bool) -> (Hand
             let now = Instant::now();
             if now >= next_sweep {
                 if let Some(idle) = cfg.server.idle_unload() {
-                    for name in guard(|| reg.sweep_idle(now, idle)).unwrap_or_default() {
+                    let freed = guard(|| reg.sweep_idle(now, idle)).unwrap_or_default();
+                    for name in &freed {
                         eprintln!("[npu-runtime] unloaded {name}: idle >= {}s", idle.as_secs());
+                    }
+                    // An unload just freed a working set; there is something new worth trimming.
+                    if !freed.is_empty() { released = false; }
+                }
+                // Level 2: the models are gone but the allocator is still holding their pages.
+                if deep_release_due(cfg.server.idle_release(), now.saturating_duration_since(last_request), released) {
+                    released = true;
+                    if release_free_memory() {
+                        eprintln!("[npu-runtime] released free memory to the OS: idle >= {}s",
+                            cfg.server.idle_release_s);
                     }
                 }
                 next_sweep = now + cfg.server.sweep_interval();

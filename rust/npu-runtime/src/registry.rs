@@ -7,6 +7,49 @@ use std::time::{Duration, Instant};
 
 pub type Capability = ModelKind; // Asr -> transcription, Embed -> embeddings
 
+// glibc's malloc_trim(3). Declared directly rather than pulling in the libc crate: no crate in this
+// workspace depends on it, and this is one symbol with a stable signature.
+#[cfg(target_env = "gnu")]
+extern "C" {
+    fn malloc_trim(pad: usize) -> i32;
+}
+
+/// Hand memory that an unload freed back to the OS -- the second, deeper level of idleness.
+///
+/// Unloading a model frees its allocations, but the allocator keeps the pages: measured on this
+/// engine, a process holding NO model still sat on ~2.5 GB of anonymous private-dirty pages spread
+/// over ~200 glibc arena mappings, none of it referenced by anything. Only `malloc_trim` walks those
+/// arenas and returns what is free.
+///
+/// Milliseconds, and only ever called from the actor's idle sweep -- never on a request path.
+/// Returns whether a trim was actually available on this target.
+pub fn release_free_memory() -> bool {
+    #[cfg(target_env = "gnu")]
+    {
+        // SAFETY: malloc_trim takes no pointer of ours and only releases pages the allocator already
+        // considers free; live allocations are untouched.
+        unsafe { malloc_trim(0) };
+        true
+    }
+    #[cfg(not(target_env = "gnu"))]
+    {
+        false
+    }
+}
+
+/// Whether the deep release is due: idle for `idle_release`, and not already done since the last
+/// request or unload. Pure, so the policy is testable without a clock or an allocator.
+pub fn deep_release_due(
+    idle_release: Option<Duration>,
+    since_activity: Duration,
+    already_released: bool,
+) -> bool {
+    match idle_release {
+        Some(window) => !already_released && since_activity >= window,
+        None => false,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoadState { Loaded, Failed, Unloaded }
 
@@ -318,6 +361,24 @@ mod tests {
         r.ensure_resident(&cfg("a"), &l, &srv, t0 + Duration::from_secs(901)).unwrap();
         assert!(r.get_loaded("a").is_some());
         assert_eq!(r.status().into_iter().find(|x| x.name == "a").unwrap().state, LoadState::Loaded);
+    }
+    #[test]
+    fn deep_release_fires_once_per_idle_stretch() {
+        let w = Some(Duration::from_secs(1800));
+        // not idle long enough yet
+        assert!(!deep_release_due(w, Duration::from_secs(1799), false));
+        // idle long enough, not yet released -> due
+        assert!(deep_release_due(w, Duration::from_secs(1800), false));
+        // ...but only once: the latch stops a trim on every sweep of a quiet night
+        assert!(!deep_release_due(w, Duration::from_secs(9999), true));
+        // switched off
+        assert!(!deep_release_due(None, Duration::from_secs(9999), false));
+    }
+    #[test]
+    fn release_free_memory_is_available_on_this_target() {
+        // Not a memory assertion (RSS is not a unit-testable quantity) -- just that the platform has
+        // the call, so a green test suite cannot hide a silently no-op second idle level.
+        assert!(release_free_memory(), "glibc target should have malloc_trim");
     }
     #[test]
     fn ensure_resident_reports_why_a_load_failed() {

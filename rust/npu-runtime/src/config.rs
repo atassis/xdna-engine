@@ -27,6 +27,11 @@ pub struct ServerCfg {
     /// How often the device actor looks for expired models. It sweeps only *between* commands, so
     /// this is also the worst-case delay before an idle model is released.
     #[serde(default = "default_sweep_interval_s")] pub sweep_interval_s: u64,
+    /// The SECOND level of idleness, and a deeper one. `idle_unload_s` gives back the device; this
+    /// gives back the memory the unload freed but the allocator kept (~2.5 GB after a parakeet
+    /// unload, measured). Counts from the last REQUEST -- a `/healthz` or `/v1/models` poll must not
+    /// be able to keep the process fat forever. `0` disables it.
+    #[serde(default = "default_idle_release_s")] pub idle_release_s: u64,
     /// What to drop when a load needs a slot and `max_resident` is already full.
     #[serde(default)] pub evict_policy: EvictPolicy,
 }
@@ -35,6 +40,7 @@ fn default_memory_ceiling_mb() -> u64 { 4096 }
 fn default_max_resident() -> usize { 1 }
 fn default_idle_unload_s() -> u64 { 900 }
 fn default_sweep_interval_s() -> u64 { 30 }
+fn default_idle_release_s() -> u64 { 1800 }
 impl Default for ServerCfg {
     fn default() -> Self {
         ServerCfg {
@@ -43,6 +49,7 @@ impl Default for ServerCfg {
             max_resident: default_max_resident(),
             idle_unload_s: default_idle_unload_s(),
             sweep_interval_s: default_sweep_interval_s(),
+            idle_release_s: default_idle_release_s(),
             evict_policy: EvictPolicy::default(),
         }
     }
@@ -55,6 +62,10 @@ impl ServerCfg {
     /// How long the actor waits for a command before it sweeps. Clamped to >= 1s: a
     /// `sweep_interval_s = 0` config would otherwise spin the device thread.
     pub fn sweep_interval(&self) -> Duration { Duration::from_secs(self.sweep_interval_s.max(1)) }
+    /// The deep-release window, or `None` when that second level is switched off.
+    pub fn idle_release(&self) -> Option<Duration> {
+        if self.idle_release_s == 0 { None } else { Some(Duration::from_secs(self.idle_release_s)) }
+    }
 }
 
 /// Which resident model gives up its slot when another one has to load.
