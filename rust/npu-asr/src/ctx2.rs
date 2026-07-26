@@ -210,11 +210,13 @@ impl SharedCtxA {
         // of the plain int8 one; its epilogue dequants the i32 accumulator to f32 on-core (×S from rtp[0]).
         let modal_int8 = prec.is_int8() && cfg.int8_onchip_dequant;
         let ka_dev = if modal { KAUG } else { KA };
-        eprintln!(
-            "[ctx2] V2 encoder precision = {prec:?} (tile {mt}x{kt}x{nt}){}{}",
-            if modal { "  [modal on-chip epilogue: K-aug bias + on-chip SiLU, f32 out]" } else { "" },
-            if modal_int8 { "  [L3 on-chip int8 dequant: i32->f32 ×S on-core, host bias/silu, seq]" } else { "" }
-        );
+        if !npu_xrt::quiet() {
+            eprintln!(
+                "[ctx2] V2 encoder precision = {prec:?} (tile {mt}x{kt}x{nt}){}{}",
+                if modal { "  [modal on-chip epilogue: K-aug bias + on-chip SiLU, f32 out]" } else { "" },
+                if modal_int8 { "  [L3 on-chip int8 dequant: i32->f32 ×S on-core, host bias/silu, seq]" } else { "" }
+            );
+        }
         // ONE resident kernel = the largest (N=3072) whole-array program; every op runs on it via its
         // per-N (and, modal, per-mode) instruction stream.
         let xclbin = if modal_int8 {
@@ -312,7 +314,9 @@ impl SharedCtxA {
         let pipeline = !modal_int8 && cfg.mm2_pipeline;
         let mut pipe = Vec::new();
         if pipeline {
-            eprintln!("[ctx2] async mm2 pipeline ENABLED (default; set NPU_MM2_PIPELINE=0 to disable)");
+            if !npu_xrt::quiet() {
+                eprintln!("[ctx2] async mm2 pipeline ENABLED (default; set NPU_MM2_PIPELINE=0 to disable)");
+            }
             for _ in 0..2 {
                 // modal: K-aug pipe activation (ones-column at KA) so the mm2 partials' identity stream
                 // adds their (zero) bias correctly; sized ka_dev.
@@ -370,7 +374,7 @@ impl SharedCtxA {
             modal_streams,
             fast_int8: {
                 let on = prec.is_int8() && cfg.int8_fast_epi;
-                if prec.is_int8() {
+                if prec.is_int8() && !npu_xrt::quiet() {
                     eprintln!(
                         "[ctx2] int8 host fast-path {} (parallel amax + division-free dequant; NPU_INT8_FASTEPI=0 disables)",
                         if on { "ENABLED" } else { "DISABLED" }

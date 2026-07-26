@@ -424,7 +424,9 @@ impl NpuMatmul {
         };
         // The modal resident bakes the silu/identity epilogue; the plain one does not (host silu).
         let modal = xclbin.file_name().and_then(|s| s.to_str()).is_some_and(|s| s.contains("modal"));
-        eprintln!("[npu] resident xclbin = {} (modal={modal})", xclbin.display());
+        if !npu_xrt::quiet() {
+            eprintln!("[npu] resident xclbin = {} (modal={modal})", xclbin.display());
+        }
         let kern = dev
             .load_kernel(xclbin.to_str().unwrap(), None)
             .unwrap_or_else(|e| panic!("load resident {}: {e:?}", xclbin.display()));

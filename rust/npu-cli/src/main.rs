@@ -70,6 +70,16 @@ fn main() -> Result<()> {
 
 fn load_cfg(path: &Path) -> Result<Config> { Config::load(path).map_err(|e| anyhow!(e)) }
 
+/// A one-shot invocation's output is its VALUE -- an embedding, a transcript -- so the engine's
+/// load-time banners ("which precision", "which resident xclbin") are noise in front of it. The
+/// service keeps them: there they are the record of what the device is actually running. Only a
+/// default: `NPU_QUIET=0 npu embed ...` brings them back.
+fn quiet_one_shot() {
+    if std::env::var_os("NPU_QUIET").is_none() {
+        std::env::set_var("NPU_QUIET", "1");
+    }
+}
+
 /// Repo root that a scenario's relative `artifacts.weights` path resolves against.
 ///
 /// This used to be plain `current_dir()`, which is only correct when you happen to be standing in
@@ -139,6 +149,7 @@ fn serve(path: &Path, port: Option<u16>) -> Result<()> {
 }
 
 fn transcribe(path: &Path, wav: &Path, model: Option<&str>) -> Result<()> {
+    quiet_one_shot();
     let cfg = load_cfg(path)?;
     let root = root(&cfg)?;
     // Lazy: a one-shot run should load the model it serves, and nothing else.
@@ -152,6 +163,7 @@ fn transcribe(path: &Path, wav: &Path, model: Option<&str>) -> Result<()> {
 }
 
 fn embed(path: &Path, text: &str, model: Option<&str>) -> Result<()> {
+    quiet_one_shot();
     let cfg = load_cfg(path)?;
     let root = root(&cfg)?;
     // Lazy: `npu embed` against an ASR-only config used to pay a full parakeet load before it could

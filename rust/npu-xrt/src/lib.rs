@@ -9,6 +9,19 @@ use std::collections::HashMap;
 use std::ffi::{c_void, CStr, CString};
 use std::os::raw::{c_char, c_int, c_uint};
 use std::rc::Rc;
+use std::sync::OnceLock;
+
+/// Whether to suppress the load-time informational banners (which precision was picked, which
+/// resident xclbin was loaded, ...).
+///
+/// Those lines are worth having in the service log, where they are the record of what the device is
+/// actually running, and are pure noise on a one-shot `npu embed` whose whole output is one vector.
+/// `NPU_QUIET=1` suppresses them; the one-shot CLI paths set it for you, and `NPU_QUIET=0` forces
+/// them back on. Read once: set the variable before the first model load.
+pub fn quiet() -> bool {
+    static QUIET: OnceLock<bool> = OnceLock::new();
+    *QUIET.get_or_init(|| std::env::var("NPU_QUIET").map(|v| v != "0").unwrap_or(false))
+}
 
 #[repr(C)]
 struct CDevice {
