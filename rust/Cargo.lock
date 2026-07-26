@@ -1019,9 +1019,11 @@ dependencies = [
 name = "npu-parakeet"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "ndarray",
  "ndarray-npy",
  "npu-onnx",
+ "npu-weights",
  "npu-xrt",
  "rayon",
 ]
