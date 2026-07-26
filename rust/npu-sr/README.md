@@ -35,14 +35,14 @@ out to them for decode and encode), and the AIE toolchain for building the NPU k
     cd rust
     cargo build --release -p npu-sr -p npu-sr-capi
 
-Bake the weights arena for the network you want (uses the declarative weight intake; the source is a
+Bake the weights checkpoint for the network you want (uses the declarative weight intake; the source is a
 pretrained model, converted by the `espcn` / `edsr` arch):
 
     # from the repo root; needs a Python env with onnx/torch/super_image for the oracle export
     <venv>/bin/python scripts/export_edsr.py --scale 3     # writes artifacts/edsr/{edsr.json, edsr_base.safetensors}
     cargo run -p npu-weights -- bake \
       --source path:artifacts/edsr/edsr_base.safetensors --arch edsr \
-      --arena target/test-arenas/edsr.safetensors --force
+      --checkpoint target/test-checkpoints/edsr.safetensors --force
 
 Build the whole-array GEMM kernel the NPU frontier uses (once; aie2p / NPU2, bf16):
 
@@ -53,7 +53,7 @@ Build the whole-array GEMM kernel the NPU frontier uses (once; aie2p / NPU2, bf1
 
 ## Use it
 
-Command line (run from the repo root so the schedule's arena path resolves):
+Command line (run from the repo root so the schedule's checkpoint path resolves):
 
     # NPU by default if a device is present; --cpu forces the reference CPU path
     xdna-sr input.mp4 output.mp4 --net edsr
@@ -71,7 +71,7 @@ FFmpeg filter (compiles the filter into a local FFmpeg build; see `ffmpeg/README
 The engine is the durable piece: a library that owns the schedule load, the resident NPU frontier, the
 pixel-format and colorspace conversion, and the decode / upscale / encode pipeline. A network is data, an
 ordered list of typed ops (`conv2d`, `pixel_shuffle`, residual `save` / `add`) over a small brick
-vocabulary, plus a weights arena. Adding a network is writing its schedule and, only if needed, one new
+vocabulary, plus a weights checkpoint. Adding a network is writing its schedule and, only if needed, one new
 op-type; the two shipped nets share the same rails. The CLI and the FFmpeg filter are thin adapters over
 the library's frame API.
 

@@ -5,21 +5,21 @@ use std::path::Path;
 use std::process::Command;
 
 #[test]
-fn espcn_arena_matches_python_oracle() {
+fn espcn_checkpoint_matches_python_oracle() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
     let refs = root.join("artifacts/espcn");
     if !refs.join("conv1_w.npy").exists() {
         eprintln!("SKIP espcn: oracle missing - run <venv>/bin/python scripts/export_espcn.py");
         return;
     }
-    let arena = root.join("target/test-arenas/espcn.safetensors");
+    let checkpoint = root.join("target/test-checkpoints/espcn.safetensors");
     let bin = env!("CARGO_BIN_EXE_npu-weights");
     let src = format!("path:{}", refs.join("espcn_x3_dyn.onnx").to_str().unwrap());
     let st = Command::new(bin)
         .current_dir(root)
         .args([
             "bake", "--source", &src, "--arch", "espcn",
-            "--arena", arena.to_str().unwrap(), "--force",
+            "--checkpoint", checkpoint.to_str().unwrap(), "--force",
         ])
         .status()
         .unwrap();
@@ -27,7 +27,7 @@ fn espcn_arena_matches_python_oracle() {
     let out = Command::new(bin)
         .current_dir(root)
         .args([
-            "verify", "--arena", arena.to_str().unwrap(), "--arch", "espcn",
+            "verify", "--checkpoint", checkpoint.to_str().unwrap(), "--arch", "espcn",
             "--refs", refs.to_str().unwrap(),
         ])
         .output()

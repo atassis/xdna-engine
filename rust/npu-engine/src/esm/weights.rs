@@ -7,7 +7,7 @@ use ndarray_npy::read_npy;
 pub struct EsmLayer {
     map: HashMap<String, ArrayD<f32>>,
     /// Optional parallel bf16 representation, populated ONLY when this layer was loaded from a
-    /// bf16-baked `NPU_WEIGHTS_ARENA` (key -> (shape, bf16 bits)). Lets the device-side consumer
+    /// bf16-baked `NPU_WEIGHTS_CHECKPOINT` (key -> (shape, bf16 bits)). Lets the device-side consumer
     /// hand pre-packed bf16 straight to the BO without re-packing f32->bf16 every startup. Empty
     /// (so every accessor returns `None`) on the default npy path, keeping that path byte-identical.
     bf16: HashMap<String, (Vec<usize>, Vec<u16>)>,
@@ -24,7 +24,7 @@ impl EsmLayer {
         self.map.keys()
     }
     /// Pre-packed bf16 bits for tensor `k` as (shape, bits), iff this layer was loaded from a
-    /// bf16-baked arena AND `k` was stored bf16. `None` on the npy path or for an f32 tensor -- the
+    /// bf16-baked checkpoint AND `k` was stored bf16. `None` on the npy path or for an f32 tensor -- the
     /// caller then takes the existing f32 pack path unchanged.
     pub fn bf16_bits(&self, k: &str) -> Option<&(Vec<usize>, Vec<u16>)> {
         self.bf16.get(k)
@@ -55,10 +55,10 @@ impl EsmWeights {
     /// Uniform declarative entry point: load weights for a scenario from the best available source.
     ///
     /// Resolution order (host-only, no NPU):
-    /// 1. `artifacts.source` set -> ensure (bake-on-missing) the `npu-weights` arena via the
+    /// 1. `artifacts.source` set -> ensure (bake-on-missing) the `npu-weights` checkpoint via the
     ///    declarative `ModelSpec` and load from it. This is how "add a model" becomes config + an
     ///    arch fn rather than a code fork.
-    /// 2. else `NPU_WEIGHTS_ARENA` env points at a baked arena -> load it (legacy staged path).
+    /// 2. else `NPU_WEIGHTS_CHECKPOINT` env points at a baked checkpoint -> load it (legacy staged path).
     /// 3. else the legacy npy `artifacts.weights` dir (default; byte-identical to before).
     ///
     pub fn load_for(
@@ -67,22 +67,22 @@ impl EsmWeights {
         n_layers: usize,
     ) -> anyhow::Result<Self> {
         if let Some(spec) = artifacts.model_spec()? {
-            let arena = spec.ensure_arena(root, false)?;
-            return Self::load_arena(&arena, &spec.arch, n_layers);
+            let checkpoint = spec.ensure_checkpoint(root, false)?;
+            return Self::load_checkpoint(&checkpoint, &spec.arch, n_layers);
         }
-        // No declarative source: legacy path. `load()` still honors NPU_WEIGHTS_ARENA internally
-        // (env-arena path, arch="bert"), else reads the npy `weights` dir -- both unchanged.
+        // No declarative source: legacy path. `load()` still honors NPU_WEIGHTS_CHECKPOINT internally
+        // (env-checkpoint path, arch="bert"), else reads the npy `weights` dir -- both unchanged.
         let wpath = root.join(&artifacts.weights);
         Self::load(&wpath, n_layers)
             .map_err(|e| anyhow::anyhow!("esm weights load {}: {e}", wpath.display()))
     }
 
     pub fn load(weights: &Path, n_layers: usize) -> std::io::Result<Self> {
-        // Staged arena loader (default OFF): if NPU_WEIGHTS_ARENA points at a baked .safetensors
-        // arena, load from it instead of the npy dirs. When the var is unset the npy path below is
+        // Staged checkpoint loader (default OFF): if NPU_WEIGHTS_CHECKPOINT points at a baked .safetensors
+        // checkpoint, load from it instead of the npy dirs. When the var is unset the npy path below is
         // taken UNCHANGED, so default behavior is byte-identical.
-        if let Some(arena) = std::env::var_os("NPU_WEIGHTS_ARENA") {
-            return Self::load_arena(&PathBuf::from(arena), "bert", n_layers)
+        if let Some(checkpoint) = std::env::var_os("NPU_WEIGHTS_CHECKPOINT") {
+            return Self::load_checkpoint(&PathBuf::from(checkpoint), "bert", n_layers)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()));
         }
         let emb = load_dir(&weights.join("emb"))?;
@@ -103,16 +103,16 @@ impl EsmWeights {
         Ok(EsmWeights { emb, layers, final_ln })
     }
 
-    /// Load EsmWeights from a baked safetensors arena (mmap, bf16 upcast to f32). Tensor names use
+    /// Load EsmWeights from a baked safetensors checkpoint (mmap, bf16 upcast to f32). Tensor names use
     /// the same keying as the npy path: `emb/<k>` -> emb map, `L{i}/<k>` -> layers[i] map, and
     /// `final_ln_w`/`final_ln_b` at the root -> Option. Produces the same in-memory EsmWeights as
     /// the npy loader for a matching export.
-    pub fn load_arena(arena_path: &Path, arch: &str, n_layers: usize) -> anyhow::Result<Self> {
-        let loaded = npu_weights::arena::load(arena_path, arch)?;
+    pub fn load_checkpoint(checkpoint_path: &Path, arch: &str, n_layers: usize) -> anyhow::Result<Self> {
+        let loaded = npu_weights::checkpoint::load(checkpoint_path, arch)?;
         let mut emb: HashMap<String, ArrayD<f32>> = HashMap::new();
         let mut layer_maps: Vec<HashMap<String, ArrayD<f32>>> =
             (0..n_layers).map(|_| HashMap::new()).collect();
-        // Parallel bf16 bits per layer, kept for any tensor the arena baked as BF16. Used by the
+        // Parallel bf16 bits per layer, kept for any tensor the checkpoint baked as BF16. Used by the
         // device consumer to skip the per-start f32->bf16 weight pack; host-reference paths keep
         // reading the f32 `layer_maps` above.
         let mut layer_bf16: Vec<HashMap<String, (Vec<usize>, Vec<u16>)>> =
@@ -123,7 +123,7 @@ impl EsmWeights {
         for name in &loaded.names {
             let (shape, data) = loaded.tensor_f32(name)?;
             let arr = ArrayD::<f32>::from_shape_vec(shape, data)
-                .map_err(|e| anyhow::anyhow!("arena tensor {name}: bad shape: {e}"))?;
+                .map_err(|e| anyhow::anyhow!("checkpoint tensor {name}: bad shape: {e}"))?;
             if let Some(k) = name.strip_prefix("emb/") {
                 emb.insert(k.to_string(), arr);
             } else if name == "final_ln_w" {
@@ -134,10 +134,10 @@ impl EsmWeights {
                 // "L{i}/{k}"
                 let (idx_s, k) = rest
                     .split_once('/')
-                    .ok_or_else(|| anyhow::anyhow!("arena tensor {name}: missing layer key"))?;
+                    .ok_or_else(|| anyhow::anyhow!("checkpoint tensor {name}: missing layer key"))?;
                 let i: usize = idx_s
                     .parse()
-                    .map_err(|_| anyhow::anyhow!("arena tensor {name}: bad layer index"))?;
+                    .map_err(|_| anyhow::anyhow!("checkpoint tensor {name}: bad layer index"))?;
                 if i < n_layers {
                     layer_maps[i].insert(k.to_string(), arr);
                     // If this tensor was baked bf16, stash its raw bits alongside the f32 copy.

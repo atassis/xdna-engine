@@ -44,7 +44,7 @@ pub struct Artifacts {
     #[serde(default)]
     pub onnx_ref: String,
     /// Declarative weight source: `"hf:<repo>[@rev]"` or `"path:/abs"`. When set, the engine
-    /// resolves + bakes (on missing) a `npu-weights` arena via this spec instead of reading the
+    /// resolves + bakes (on missing) a `npu-weights` checkpoint via this spec instead of reading the
     /// legacy npy `weights` dir. Optional and additive: omit it and the npy path is unchanged.
     #[serde(default)]
     pub source: String,
@@ -52,14 +52,15 @@ pub struct Artifacts {
     /// Required when `source` is set; ignored otherwise.
     #[serde(default)]
     pub arch: String,
-    /// Optional explicit arena `.safetensors` path. When empty the arena path is derived
-    /// (`${XDNA_ARENA_DIR:-<root>/artifacts/arenas}/<arch>__<src>__<fp>.safetensors`).
+    /// Optional explicit checkpoint `.safetensors` path. When empty the checkpoint path is derived
+    /// (`${XDNA_CHECKPOINT_DIR:-<root>/artifacts/checkpoints}/<arch>__<src>__<fp>.safetensors`).
     #[serde(default)]
-    pub arena: String,
+    #[serde(alias = "arena")]
+    pub checkpoint: String,
 }
 
 impl Artifacts {
-    /// Build a declarative `npu_weights::spec::ModelSpec` from the `source`/`arch`/`arena` fields,
+    /// Build a declarative `npu_weights::spec::ModelSpec` from the `source`/`arch`/`checkpoint` fields,
     /// or `None` when no `source` is configured (legacy npy path). Errors on a malformed source or
     /// a `source` without an `arch`.
     pub fn model_spec(&self) -> anyhow::Result<Option<npu_weights::spec::ModelSpec>> {
@@ -69,12 +70,12 @@ impl Artifacts {
         anyhow::ensure!(!self.arch.is_empty(),
             "artifacts.source is set but artifacts.arch is empty (need bert|esm|vit|opt|whisper|fastconformer|gigaam)");
         let source = npu_weights::spec::Source::parse(&self.source)?;
-        let arena = if self.arena.is_empty() {
+        let checkpoint = if self.checkpoint.is_empty() {
             None
         } else {
-            Some(std::path::PathBuf::from(&self.arena))
+            Some(std::path::PathBuf::from(&self.checkpoint))
         };
-        Ok(Some(npu_weights::spec::ModelSpec { source, arch: self.arch.clone(), arena }))
+        Ok(Some(npu_weights::spec::ModelSpec { source, arch: self.arch.clone(), checkpoint }))
     }
 }
 

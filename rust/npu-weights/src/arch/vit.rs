@@ -1,7 +1,7 @@
 // rust/npu-weights/src/arch/vit.rs
 //
 // ViT-base arch (google/vit-base-patch16-224). Mirrors scripts/convert_vit.py EXACTLY. Source = raw HF
-// safetensors (vit.*). Reference npy layout (verify --refs dir is `artifacts/vit-base`, so arena names
+// safetensors (vit.*). Reference npy layout (verify --refs dir is `artifacts/vit-base`, so checkpoint names
 // equal npy paths relative to it):
 //   - patch_proj.weight   <- vit.embeddings.patch_embeddings.projection.weight  (Conv2d [768,3,16,16])
 //                            FAITHFUL im2col-flatten: reshape row-major to [768, 3*16*16=768] then

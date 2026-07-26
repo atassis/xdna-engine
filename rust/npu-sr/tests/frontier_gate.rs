@@ -1,5 +1,5 @@
 //! The CPU frontier reproduces the ONNX ESPCN whole-net output within tolerance -- the M2 correctness
-//! spine. Requires the arena baked (`cargo test -p npu-weights parity_espcn`) + the oracle npy
+//! spine. Requires the checkpoint baked (`cargo test -p npu-weights parity_espcn`) + the oracle npy
 //! (scripts/export_espcn.py). Runs from the repo root (the engine's production convention); a single
 //! test per binary makes set_current_dir race-free.
 use ndarray::ArrayD;
@@ -26,11 +26,11 @@ fn cpu_frontier_matches_onnx_oracle() {
         .unwrap()
         .to_path_buf();
     let refs = root.join("artifacts/espcn");
-    if !refs.join("gate_sr.npy").exists() || !root.join("target/test-arenas/espcn.safetensors").exists() {
-        eprintln!("SKIP: oracle/arena missing - run export_espcn.py + parity_espcn first");
+    if !refs.join("gate_sr.npy").exists() || !root.join("target/test-checkpoints/espcn.safetensors").exists() {
+        eprintln!("SKIP: oracle/checkpoint missing - run export_espcn.py + parity_espcn first");
         return;
     }
-    // The engine resolves the schedule's relative arena path from cwd = repo root (production convention).
+    // The engine resolves the schedule's relative checkpoint path from cwd = repo root (production convention).
     std::env::set_current_dir(&root).unwrap();
 
     let lr: ArrayD<f32> = read_npy(refs.join("gate_lr.npy")).unwrap();

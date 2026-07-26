@@ -1,7 +1,7 @@
 //! Device parity gate (Task 4b): the NPU frontier (host im2col -> whole-array bf16 GEMM) reproduces the
 //! CPU frontier AND the ONNX oracle within the M1 regime (rel-L2 <= 1.1e-2). Gate on rel-L2, NEVER WER.
 //! Skips cleanly if no NPU device or the whole_array xclbin is absent. Runs from repo root (xclbin +
-//! arena paths are repo-root-relative). Serialize device access under scripts/npu_lock.sh externally.
+//! checkpoint paths are repo-root-relative). Serialize device access under scripts/npu_lock.sh externally.
 use ndarray::ArrayD;
 use ndarray_npy::read_npy;
 use npu_sr::{Plane, SrEngine};
@@ -24,8 +24,8 @@ fn npu_frontier_matches_cpu_and_oracle() {
         eprintln!("SKIP: no NPU device");
         return;
     }
-    if !refs.join("gate_sr.npy").exists() || !root.join("target/test-arenas/espcn.safetensors").exists() {
-        eprintln!("SKIP: oracle/arena missing");
+    if !refs.join("gate_sr.npy").exists() || !root.join("target/test-checkpoints/espcn.safetensors").exists() {
+        eprintln!("SKIP: oracle/checkpoint missing");
         return;
     }
     if !xclbin.exists() {

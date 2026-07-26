@@ -6,7 +6,7 @@
 // gate+value, mlp.Wo back to hidden), pre-norm with weight-only LayerNorm (no bias). Layer 0's
 // attn_norm is nn.Identity (absent in the checkpoint) since the embedding norm already normalizes.
 // Only the encoder BACKBONE is baked (not the MaskedLM head/decoder), like the bert/vit arches.
-// Reference npy layout (refs dir = model root `artifacts/modernbert-base`, arena names = npy paths):
+// Reference npy layout (refs dir = model root `artifacts/modernbert-base`, checkpoint names = npy paths):
 //   - emb/tok_emb        <- model.embeddings.tok_embeddings.weight  ([vocab,hidden] VERBATIM, bf16)
 //   - emb/norm_w         <- model.embeddings.norm.weight            (f32, weight-only LayerNorm)
 //   - final_norm_w       <- model.final_norm.weight                 (f32)

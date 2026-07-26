@@ -38,7 +38,7 @@ fn load_dir(dir: &Path) -> std::io::Result<HashMap<String, ArrayD<f32>>> {
 
 impl BertWeights {
     /// Uniform declarative entry point (host-only, no NPU): resolve weights for a scenario.
-    /// 1. `artifacts.source` set -> ensure (bake-on-missing) the `npu-weights` arena via the
+    /// 1. `artifacts.source` set -> ensure (bake-on-missing) the `npu-weights` checkpoint via the
     ///    declarative `ModelSpec` and load from it ("add a model" = config + arch fn).
     /// 2. else the legacy npy `artifacts.weights` dir (default; byte-identical to before).
     pub fn load_for(
@@ -47,8 +47,8 @@ impl BertWeights {
         n_layers: usize,
     ) -> anyhow::Result<Self> {
         if let Some(spec) = artifacts.model_spec()? {
-            let arena = spec.ensure_arena(root, false)?;
-            return Self::load_arena(&arena, &spec.arch, n_layers);
+            let checkpoint = spec.ensure_checkpoint(root, false)?;
+            return Self::load_checkpoint(&checkpoint, &spec.arch, n_layers);
         }
         let wpath = root.join(&artifacts.weights);
         Self::load(&wpath, n_layers)
@@ -66,27 +66,27 @@ impl BertWeights {
         Ok(BertWeights { emb, layers })
     }
 
-    /// Load BertWeights from a baked safetensors arena (mmap, bf16 upcast to f32). Tensor names use
+    /// Load BertWeights from a baked safetensors checkpoint (mmap, bf16 upcast to f32). Tensor names use
     /// the same keying as the npy path: `emb/<k>` -> emb map, `L{i}/<k>` -> layers[i] map. Produces
     /// the same in-memory BertWeights as the npy loader for a matching export.
-    pub fn load_arena(arena_path: &Path, arch: &str, n_layers: usize) -> anyhow::Result<Self> {
-        let loaded = npu_weights::arena::load(arena_path, arch)?;
+    pub fn load_checkpoint(checkpoint_path: &Path, arch: &str, n_layers: usize) -> anyhow::Result<Self> {
+        let loaded = npu_weights::checkpoint::load(checkpoint_path, arch)?;
         let mut emb: HashMap<String, ArrayD<f32>> = HashMap::new();
         let mut layer_maps: Vec<HashMap<String, ArrayD<f32>>> =
             (0..n_layers).map(|_| HashMap::new()).collect();
         for name in &loaded.names {
             let (shape, data) = loaded.tensor_f32(name)?;
             let arr = ArrayD::<f32>::from_shape_vec(shape, data)
-                .map_err(|e| anyhow::anyhow!("arena tensor {name}: bad shape: {e}"))?;
+                .map_err(|e| anyhow::anyhow!("checkpoint tensor {name}: bad shape: {e}"))?;
             if let Some(k) = name.strip_prefix("emb/") {
                 emb.insert(k.to_string(), arr);
             } else if let Some(rest) = name.strip_prefix('L') {
                 let (idx_s, k) = rest
                     .split_once('/')
-                    .ok_or_else(|| anyhow::anyhow!("arena tensor {name}: missing layer key"))?;
+                    .ok_or_else(|| anyhow::anyhow!("checkpoint tensor {name}: missing layer key"))?;
                 let i: usize = idx_s
                     .parse()
-                    .map_err(|_| anyhow::anyhow!("arena tensor {name}: bad layer index"))?;
+                    .map_err(|_| anyhow::anyhow!("checkpoint tensor {name}: bad layer index"))?;
                 if i < n_layers {
                     layer_maps[i].insert(k.to_string(), arr);
                 }

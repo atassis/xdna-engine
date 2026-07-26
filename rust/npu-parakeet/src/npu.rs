@@ -1824,8 +1824,8 @@ impl NpuMatmul {
         acc
     }
 
-    /// bf16-arena sibling of [`Self::resident_ffn`]: `bits1`/`bits2` are pre-packed bf16 straight
-    /// from a bf16-baked `NPU_WEIGHTS_ARENA` (fc1 `[KRES,DFF]`, fc2 `[DFF,KRES]`, both verbatim
+    /// bf16-checkpoint sibling of [`Self::resident_ffn`]: `bits1`/`bits2` are pre-packed bf16 straight
+    /// from a bf16-baked `NPU_WEIGHTS_CHECKPOINT` (fc1 `[KRES,DFF]`, fc2 `[DFF,KRES]`, both verbatim
     /// layout), so every weight-BO build on a cache miss skips the host f32->bf16 pack entirely.
     /// Same device-side LN->fc1->deint->fc2(K-split) dataflow as `resident_ffn`; only the weight
     /// source differs.
@@ -2262,7 +2262,7 @@ impl NpuMatmul {
     }
 
     /// bf16-native sibling of [`Self::weight_bo`]: `bits` are ALREADY-packed bf16 (row-major
-    /// `[k, n]`), straight from a bf16-baked `NPU_WEIGHTS_ARENA` arena tensor, so this writes them
+    /// `[k, n]`), straight from a bf16-baked `NPU_WEIGHTS_CHECKPOINT` checkpoint tensor, so this writes them
     /// to the device BO directly and skips `pack_f32_to_bf16` entirely. Same wcache/ncache keying
     /// as `weight_bo`, so the two are interchangeable per `id` (a cache hit on either serves both).
     fn weight_bo_bf16(&self, id: &str, k: usize, n: usize, bits: &[u16]) -> Rc<Bo> {
@@ -2362,9 +2362,9 @@ impl NpuMatmul {
         })
     }
 
-    /// bf16-arena sibling of [`Self::matmul_id`]: single-dispatch (K=KRES) only -- the shape every
+    /// bf16-checkpoint sibling of [`Self::matmul_id`]: single-dispatch (K=KRES) only -- the shape every
     /// mhsa q/k/v/pos/out projection uses. `bits` are pre-packed bf16 `[k, n]` row-major straight
-    /// from a bf16-baked `NPU_WEIGHTS_ARENA` tensor (verbatim layout, no transpose), so this skips
+    /// from a bf16-baked `NPU_WEIGHTS_CHECKPOINT` tensor (verbatim layout, no transpose), so this skips
     /// the host f32->bf16 pack entirely on a cache miss.
     pub fn matmul_id_bf16(&self, a: &Array2<f32>, id: &str, k: usize, n: usize, bits: &[u16]) -> Array2<f32> {
         let (m, ka) = a.dim();

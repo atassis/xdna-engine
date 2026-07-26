@@ -1,6 +1,6 @@
 //! End-to-end CPU upscale of a small synthetic image -> correct output dims + no panic. Proves the whole
 //! API path (RGB8 -> YCbCr -> Y-frontier + bicubic chroma -> RGB8) composes. Real-image PSNR lives in
-//! the frontier gate + bench. Runs from repo root (arena path is repo-root-relative).
+//! the frontier gate + bench. Runs from repo root (checkpoint path is repo-root-relative).
 use npu_sr::SrEngine;
 
 #[test]
@@ -11,8 +11,8 @@ fn upscales_synthetic_image_cpu() {
         .parent()
         .unwrap()
         .to_path_buf();
-    if !root.join("target/test-arenas/espcn.safetensors").exists() {
-        eprintln!("SKIP: arena missing - run `cargo test -p npu-weights parity_espcn` first");
+    if !root.join("target/test-checkpoints/espcn.safetensors").exists() {
+        eprintln!("SKIP: checkpoint missing - run `cargo test -p npu-weights parity_espcn` first");
         return;
     }
     std::env::set_current_dir(&root).unwrap();

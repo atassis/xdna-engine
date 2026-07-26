@@ -6,7 +6,7 @@
 // export, GigaAM anonymises every MatMul WEIGHT initializer (onnx::MatMul_*), so linear weights
 // are reached via their consuming node's name; linear BIASES + norms + convs are NAMED inits.
 //
-// Per-block layout (16 blocks, d_model 768, d_ff 3072, conv kernel 5). Arena names equal the
+// Per-block layout (16 blocks, d_model 768, d_ff 3072, conv kernel 5). Checkpoint names equal the
 // oracle npy paths relative to artifacts/encoder, so verify maps name -> <refs>/<name>.npy:
 //   - L{i}/norm_feed_forward1.{weight,bias}   <- LayerNormalization (f32 verbatim)
 //   - L{i}/norm_self_att.{weight,bias}         <- LayerNormalization (f32 verbatim)
@@ -44,7 +44,7 @@ impl Gigaam {
         Ok(OutTensor { shape: t.shape, data: t.data, bf16 })
     }
 
-    /// (arena_dst, source_key, bf16) for block `i`.
+    /// (checkpoint_dst, source_key, bf16) for block `i`.
     fn block_keys(i: usize) -> Vec<(String, String, bool)> {
         let mut v = Vec::new();
         // LayerNorms incl. the folded conv batch_norm (all f32 verbatim)
@@ -78,7 +78,7 @@ impl Gigaam {
     }
 
     /// pre_encode (/4 conv1d subsample): two named Conv inits (conv.0, conv.2), each weight+bias.
-    /// The oracle writes them under the `pre_encode.` npy prefix, so the arena dst carries it too.
+    /// The oracle writes them under the `pre_encode.` npy prefix, so the checkpoint dst carries it too.
     fn pre_encode_keys() -> Vec<(String, String, bool)> {
         let mut v = Vec::new();
         for idx in ["0", "2"] {

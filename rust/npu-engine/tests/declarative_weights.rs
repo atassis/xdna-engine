@@ -1,7 +1,7 @@
 //! Host-only (no NPU) test for A4: declarative weight loading wired into the scenario config.
 //!
-//! Proves the uniform entry point: a scenario TOML that declares `source/arch/arena` parses,
-//! resolves a `npu_weights::spec::ModelSpec`, bakes the arena on-missing, and loads it into the
+//! Proves the uniform entry point: a scenario TOML that declares `source/arch/checkpoint` parses,
+//! resolves a `npu_weights::spec::ModelSpec`, bakes the checkpoint on-missing, and loads it into the
 //! engine's `BertWeights` -- all without touching XRT/the NPU. Also pins backward-compat: a legacy
 //! `weights = "dir"` scenario still parses with NO declarative source (None spec).
 
@@ -59,7 +59,7 @@ fn declarative_source_parses_bakes_and_loads_bert_weights() {
     let root = tmp.path();
     let src_dir = root.join("src");
     write_tiny_bert_source(&src_dir);
-    let arena = root.join("arena.safetensors");
+    let checkpoint = root.join("checkpoint.safetensors");
 
     let toml = format!(
         r#"
@@ -76,10 +76,10 @@ max_seq = 4
 [artifacts]
 source = "path:{src}"
 arch = "bert"
-arena = "{arena}"
+checkpoint = "{checkpoint}"
 "#,
         src = src_dir.display(),
-        arena = arena.display(),
+        checkpoint = checkpoint.display(),
     );
 
     let cfg = ScenarioConfig::from_toml_str(&toml).expect("parse declarative scenario");
@@ -90,14 +90,14 @@ arena = "{arena}"
     // Uniform entry point: ensure (bake-on-missing) + load -- no NPU.
     let w = BertWeights::load_for(&cfg.artifacts, root, cfg.model.n_layers)
         .expect("declarative load_for must bake + load");
-    assert!(arena.exists(), "arena was baked to the configured path");
+    assert!(checkpoint.exists(), "checkpoint was baked to the configured path");
     assert_eq!(w.n_layers(), 12);
     // word_emb came through (bf16-baked -> upcast on read; 1,2,3,4 are exactly representable).
     let we = w.word_emb();
     assert_eq!(we.shape(), &[2, 2]);
     assert_eq!(we.iter().copied().collect::<Vec<f32>>(), vec![1., 2., 3., 4.]);
 
-    // Second load finds the arena FRESH (no re-bake) and returns the same shapes.
+    // Second load finds the checkpoint FRESH (no re-bake) and returns the same shapes.
     let w2 = BertWeights::load_for(&cfg.artifacts, root, cfg.model.n_layers).expect("fresh reload");
     assert_eq!(w2.n_layers(), 12);
 }

@@ -88,12 +88,12 @@ impl FastConformerEncoder {
         a.dot(&b)
     }
 
-    /// bf16-arena fast path for a plain (non-K-split, K=KRES) weight matmul: when `b.bf16_m(key)`
-    /// yields pre-packed bf16 bits (NPU_WEIGHTS_ARENA loaded), dispatch straight from those bits,
+    /// bf16-checkpoint fast path for a plain (non-K-split, K=KRES) weight matmul: when `b.bf16_m(key)`
+    /// yields pre-packed bf16 bits (NPU_WEIGHTS_CHECKPOINT loaded), dispatch straight from those bits,
     /// skipping the host f32->bf16 pack entirely on a cache miss. Returns `None` on the npy path
     /// (bf16_m always None there) or without the NPU feature/instance, so the caller falls back to
     /// the existing `mm_lazy(.., || b.m(key), id)` path unchanged.
-    fn mm_arena(&self, a: &Array2<f32>, b: &BlockWeights, key: &str, id: &str) -> Option<Array2<f32>> {
+    fn mm_checkpoint(&self, a: &Array2<f32>, b: &BlockWeights, key: &str, id: &str) -> Option<Array2<f32>> {
         #[cfg(feature = "npu")]
         {
             if let Some(npu) = &self.npu {
@@ -152,10 +152,10 @@ impl FastConformerEncoder {
                                 return out;
                             }
                         }
-                        // bf16-arena fast path (NPU_WEIGHTS_ARENA): fc1/fc2 are both baked bf16
+                        // bf16-checkpoint fast path (NPU_WEIGHTS_CHECKPOINT): fc1/fc2 are both baked bf16
                         // verbatim [K,N], so when both are available skip the host f32->bf16 pack
                         // entirely on a cache miss. Falls back to the f32 path below (byte-identical
-                        // to before) when the arena isn't loaded (bf16_m always None on npy).
+                        // to before) when the checkpoint isn't loaded (bf16_m always None on npy).
                         if let (Some((k1, n1, bits1)), Some((k2, n2, bits2))) =
                             (b.bf16_m(l1), b.bf16_m(l2))
                         {
@@ -276,7 +276,7 @@ impl FastConformerEncoder {
         // Each `b.m()` clones the whole [D,D]/[P,D] matrix out of the weight map -- pure host data
         // movement (no math, no device). Materialized LAZILY inside mm_lazy's closure: on a warm
         // (weight-BO cache hit) pass the clone never runs, eliminating the per-pass reclone.
-        // Each projection prefers the bf16-arena fast path (NPU_WEIGHTS_ARENA); `mm_arena` returns
+        // Each projection prefers the bf16-checkpoint fast path (NPU_WEIGHTS_CHECKPOINT); `mm_checkpoint` returns
         // None on the npy path, so the `unwrap_or_else` fallback is the pre-existing f32 mm_lazy
         // call, byte-identical to before.
         prof::phase::set_stage("mhsa_qkv");
@@ -341,16 +341,16 @@ impl FastConformerEncoder {
                 let _h = PhaseScope::new("ln", Bucket::Host);
                 layernorm(x, &b.v("norm_self_att.weight"), &b.v("norm_self_att.bias"))
             };
-            // Each projection prefers the bf16-arena fast path (NPU_WEIGHTS_ARENA); `mm_arena`
+            // Each projection prefers the bf16-checkpoint fast path (NPU_WEIGHTS_CHECKPOINT); `mm_checkpoint`
             // returns None on the npy path, so the fallback is the pre-existing f32 mm_lazy call.
             let id_q = format!("{blk}.q");
-            let q = self.mm_arena(&ln_x, b, "self_attn.linear_q.weight", &id_q)
+            let q = self.mm_checkpoint(&ln_x, b, "self_attn.linear_q.weight", &id_q)
                 .unwrap_or_else(|| self.mm_lazy(&ln_x, || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_q.weight") }, &id_q)); // [T, D]
             let id_k = format!("{blk}.k");
-            let k = self.mm_arena(&ln_x, b, "self_attn.linear_k.weight", &id_k)
+            let k = self.mm_checkpoint(&ln_x, b, "self_attn.linear_k.weight", &id_k)
                 .unwrap_or_else(|| self.mm_lazy(&ln_x, || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_k.weight") }, &id_k));
             let id_v = format!("{blk}.v");
-            let v = self.mm_arena(&ln_x, b, "self_attn.linear_v.weight", &id_v)
+            let v = self.mm_checkpoint(&ln_x, b, "self_attn.linear_v.weight", &id_v)
                 .unwrap_or_else(|| self.mm_lazy(&ln_x, || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_v.weight") }, &id_v));
             (q, k, v)
         };
@@ -373,14 +373,14 @@ impl FastConformerEncoder {
         }
         prof::phase::set_stage("mhsa_pos");
         let id_pos = format!("{blk}.pos");
-        let pm = self.mm_arena(pos_enc, b, "self_attn.linear_pos.weight", &id_pos)
+        let pm = self.mm_checkpoint(pos_enc, b, "self_attn.linear_pos.weight", &id_pos)
             .unwrap_or_else(|| self.mm_lazy(pos_enc, || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_pos.weight") }, &id_pos)); // [P, D]
         let ctx = self.attention_core(&q, &k, &v, &pm, blk, t);
-        // linear_out moved to this caller in main's mhsa/attention_core split, so the arena fast
+        // linear_out moved to this caller in main's mhsa/attention_core split, so the checkpoint fast
         // path attaches here rather than inside the attention body as on the original branch.
         prof::phase::set_stage("mhsa_qkv");
         let id_out = format!("{blk}.out");
-        self.mm_arena(&ctx, b, "self_attn.linear_out.weight", &id_out)
+        self.mm_checkpoint(&ctx, b, "self_attn.linear_out.weight", &id_out)
             .unwrap_or_else(|| self.mm_lazy(&ctx, || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_out.weight") }, &id_out))
     }
 
@@ -400,11 +400,11 @@ impl FastConformerEncoder {
         prof::phase::set_stage("mhsa_qkv");
         let v = npu.proj_from_bf16(satt_bo, m, || b.m("self_attn.linear_v.weight"), &format!("{blk}.v"), d);
         prof::phase::set_stage("mhsa_pos");
-        // pos stays host-in on the device-in path (pos_enc != satt), so it takes the arena fast path
+        // pos stays host-in on the device-in path (pos_enc != satt), so it takes the checkpoint fast path
         // too. q/k/v go through `proj_from_bf16` and linear_out through `matmul_id_to_bo` -- both are
-        // device-in/device-out and have no bf16-arena sibling, so they are deliberately untouched.
+        // device-in/device-out and have no bf16-checkpoint sibling, so they are deliberately untouched.
         let id_pos = format!("{blk}.pos");
-        let pm = self.mm_arena(pos_enc, b, "self_attn.linear_pos.weight", &id_pos)
+        let pm = self.mm_checkpoint(pos_enc, b, "self_attn.linear_pos.weight", &id_pos)
             .unwrap_or_else(|| self.mm_lazy(pos_enc, || b.m("self_attn.linear_pos.weight"), &id_pos));
         let ctx = self.attention_core(&q, &k, &v, &pm, blk, m);
         prof::phase::set_stage("mhsa_qkv");

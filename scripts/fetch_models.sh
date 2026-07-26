@@ -43,7 +43,7 @@ fetch() { echo "[fetch] $1"; "$HF" download "$1" >/dev/null; }
 # Assemble the flat, serve-ready Parakeet artifact dir the engine loads
 # (rust/npu-engine/src/asr/parakeet.rs: artifacts/parakeet/{preprocessor.onnx,decoder_joint.onnx,
 # vocab.txt,encoder/}). No HF repo ships this exact layout, so build it here from pinned sources.
-# Idempotent. NOTE: the encoder/ arena is produced separately by extract_parakeet_encoder.py and is
+# Idempotent. NOTE: the encoder/ checkpoint is produced separately by extract_parakeet_encoder.py and is
 # NOT assembled here. Two migration bugs this fixes:
 #   - preprocessor.onnx must be onnx_asr's nemo128.onnx (128-mel; Parakeet FastConformer needs 128
 #     mels). Do NOT use gigaam_v3.onnx here -- that is the 64-mel preproc, correct only for GigaAM.

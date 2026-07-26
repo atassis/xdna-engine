@@ -106,14 +106,14 @@ no 2D output strides at all, so there is no stride wall, and it builds at large 
 
 This GEMV form had actually been the original foundation of the projection work;
 the earlier design had moved away from where it ran, not from the math. The one
-real obstacle the earlier inline attempt had hit was memory arena size: an inline
+real obstacle the earlier inline attempt had hit was memory checkpoint size: an inline
 elementwise bias-add had forced the padded vocabulary up to 65,536, blowing the
-arena past 400 MB.
+checkpoint past 400 MB.
 
 I fixed both problems at once:
 
 - I built it as a standalone ELF dispatched once per token after the main decode
-  ELF, rather than inlining it. On its own the arena is just weight plus the hidden
+  ELF, rather than inlining it. On its own the checkpoint is just weight plus the hidden
   input plus the logits output, about 80 MB, with none of the ~250 MB decode
   scratch.
 - I folded the bias into the GEMV itself using K-augmentation instead of a

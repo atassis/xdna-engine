@@ -33,7 +33,7 @@ enum Cmd {
     Models { #[arg(long)] port: Option<u16> },
     /// Ask a running server to re-read the config and reconcile.
     Reload { #[arg(long)] port: Option<u16> },
-    /// Pre-bake a model's weight arena (host-only, no device).
+    /// Pre-bake a model's weight checkpoint (host-only, no device).
     Bake { name: String },
     /// Inspect / edit the desired-state config.
     Config { #[command(subcommand)] action: ConfigCmd },
@@ -196,7 +196,7 @@ fn bake(path: &Path, name: &str) -> Result<()> {
     let sc = npu_engine::config::ScenarioConfig::load(Path::new(&m.scenario))
         .with_context(|| format!("scenario {}", m.scenario))?;
     match sc.artifacts.model_spec()? {
-        Some(spec) => { let p = spec.ensure_arena(&root(&cfg)?, false)?; println!("baked: {}", p.display()); }
+        Some(spec) => { let p = spec.ensure_checkpoint(&root(&cfg)?, false)?; println!("baked: {}", p.display()); }
         None => println!("nothing to bake ({} uses legacy npy weights)", name),
     }
     Ok(())

@@ -1,5 +1,5 @@
 //! M3 CPU frontier gate: the EDSR-base whole net (skip registers + RGB + pixel_shuffle) reproduces the
-//! torch EDSR oracle within tolerance. Requires the arena baked (`cargo test -p npu-weights parity_edsr`)
+//! torch EDSR oracle within tolerance. Requires the checkpoint baked (`cargo test -p npu-weights parity_edsr`)
 //! + the oracle npy (scripts/export_edsr.py). Runs from repo root. Gate on rel-L2, never WER.
 use ndarray::ArrayD;
 use ndarray_npy::read_npy;
@@ -16,8 +16,8 @@ fn cpu_edsr_matches_torch_oracle() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent().unwrap().parent().unwrap().to_path_buf();
     let refs = root.join("artifacts/edsr");
-    if !refs.join("gate_sr.npy").exists() || !root.join("target/test-arenas/edsr.safetensors").exists() {
-        eprintln!("SKIP: edsr oracle/arena missing - run export_edsr.py + parity_edsr");
+    if !refs.join("gate_sr.npy").exists() || !root.join("target/test-checkpoints/edsr.safetensors").exists() {
+        eprintln!("SKIP: edsr oracle/checkpoint missing - run export_edsr.py + parity_edsr");
         return;
     }
     std::env::set_current_dir(&root).unwrap();

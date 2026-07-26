@@ -1,4 +1,4 @@
-// rust/npu-weights/src/arena.rs
+// rust/npu-weights/src/checkpoint.rs
 use crate::arch::OutTensor;
 use half::bf16;
 use memmap2::Mmap;
@@ -6,12 +6,12 @@ use safetensors::tensor::{Dtype, TensorView};
 use std::collections::BTreeMap;
 use std::path::Path;
 
-pub struct ArenaMeta { pub format_version: u32, pub arch: String,
+pub struct CheckpointMeta { pub format_version: u32, pub arch: String,
                        pub source_ref: String, pub source_fingerprint: String }
 
 /// Bake OutTensors -> a safetensors file (bf16/f32 per OutTensor.bf16), metadata embedded,
 /// written atomically (unique tmp + rename).
-pub fn bake(path: &Path, tensors: &BTreeMap<String, OutTensor>, meta: &ArenaMeta) -> anyhow::Result<()> {
+pub fn bake(path: &Path, tensors: &BTreeMap<String, OutTensor>, meta: &CheckpointMeta) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
     // Build owned byte buffers (bf16 or f32 LE) so TensorViews can borrow them.
     let mut bufs: Vec<(String, Vec<usize>, Dtype, Vec<u8>)> = Vec::new();
@@ -45,17 +45,17 @@ pub fn bake(path: &Path, tensors: &BTreeMap<String, OutTensor>, meta: &ArenaMeta
 pub struct Loaded { _mmap: memmap2::Mmap, pub meta_version: u32, pub arch: String,
                     pub names: Vec<String> }
 
-/// mmap-load an arena; verifies magic/header via safetensors and format_version.
+/// mmap-load an checkpoint; verifies magic/header via safetensors and format_version.
 pub fn load(path: &Path, expect_arch: &str) -> anyhow::Result<Loaded> {
     let file = std::fs::File::open(path)?;
     let mmap = unsafe { Mmap::map(&file)? };
     let (_n, md) = safetensors::SafeTensors::read_metadata(&mmap)?;
     let meta = md.metadata().clone().unwrap_or_default();
     let arch = meta.get("arch").cloned().unwrap_or_default();
-    anyhow::ensure!(arch == expect_arch, "arena arch {arch:?} != expected {expect_arch:?}");
+    anyhow::ensure!(arch == expect_arch, "checkpoint arch {arch:?} != expected {expect_arch:?}");
     let version: u32 = meta.get("format_version").and_then(|s| s.parse().ok()).unwrap_or(0);
     anyhow::ensure!(version == crate::FORMAT_VERSION,
-        "arena format_version {version} != {} (rebake)", crate::FORMAT_VERSION);
+        "checkpoint format_version {version} != {} (rebake)", crate::FORMAT_VERSION);
     let st = safetensors::SafeTensors::deserialize(&mmap)?;
     let names = st.names().into_iter().map(|s| s.to_string()).collect();
     Ok(Loaded { _mmap: mmap, meta_version: version, arch, names })
@@ -71,12 +71,12 @@ impl Loaded {
         let data: Vec<f32> = match v.dtype() {
             Dtype::F32 => raw.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect(),
             Dtype::BF16 => raw.chunks_exact(2).map(|b| bf16::from_le_bytes(b.try_into().unwrap()).to_f32()).collect(),
-            d => anyhow::bail!("unexpected arena dtype {d:?}"),
+            d => anyhow::bail!("unexpected checkpoint dtype {d:?}"),
         };
         Ok((shape, data))
     }
 
-    /// Raw bf16 bits of a tensor, in the arena's stored byte order (no f32 upcast). Returns the
+    /// Raw bf16 bits of a tensor, in the checkpoint's stored byte order (no f32 upcast). Returns the
     /// shape plus a `Vec<u16>` of the bf16 bit patterns, ready to write straight to a device BO that
     /// expects bf16 weights -- this is the fast-restart path that skips re-packing f32->bf16 every
     /// startup. Only valid for tensors baked as BF16; an F32 tensor returns `Ok(None)` so the caller
@@ -109,7 +109,7 @@ mod tests {
         let mut t = BTreeMap::new();
         t.insert("L0/q_w".to_string(), OutTensor { shape: vec![2,2], data: vec![1.,2.,3.,4.], bf16: true });
         t.insert("L0/q_b".to_string(), OutTensor { shape: vec![2], data: vec![0.5,-0.5], bf16: false });
-        let meta = ArenaMeta { format_version: crate::FORMAT_VERSION, arch: "bert".into(),
+        let meta = CheckpointMeta { format_version: crate::FORMAT_VERSION, arch: "bert".into(),
                                source_ref: "test".into(), source_fingerprint: "deadbeef".into() };
         bake(&p, &t, &meta).unwrap();
         let l = load(&p, "bert").unwrap();
@@ -128,7 +128,7 @@ mod tests {
         // bf16 weight (exactly representable values) + an f32 bias.
         t.insert("L0/q_w".to_string(), OutTensor { shape: vec![2, 2], data: vec![1., 2., 3., 4.], bf16: true });
         t.insert("L0/q_b".to_string(), OutTensor { shape: vec![2], data: vec![0.5, -0.5], bf16: false });
-        let meta = ArenaMeta { format_version: crate::FORMAT_VERSION, arch: "bert".into(),
+        let meta = CheckpointMeta { format_version: crate::FORMAT_VERSION, arch: "bert".into(),
                                source_ref: "test".into(), source_fingerprint: "deadbeef".into() };
         bake(&p, &t, &meta).unwrap();
         let l = load(&p, "bert").unwrap();
@@ -147,7 +147,7 @@ mod tests {
         let p = dir.path().join("a.safetensors");
         let mut t = BTreeMap::new();
         t.insert("x".to_string(), OutTensor { shape: vec![1], data: vec![1.], bf16: false });
-        let meta = ArenaMeta { format_version: crate::FORMAT_VERSION, arch: "bert".into(),
+        let meta = CheckpointMeta { format_version: crate::FORMAT_VERSION, arch: "bert".into(),
                                source_ref: "t".into(), source_fingerprint: "d".into() };
         bake(&p, &t, &meta).unwrap();
         assert!(load(&p, "whisper").is_err());

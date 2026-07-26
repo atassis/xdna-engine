@@ -25,8 +25,8 @@ pub struct EsmEmbedPipeline {
 }
 impl EsmEmbedPipeline {
     pub fn build(cfg: &ScenarioConfig, root: &Path, dev: Rc<Device>) -> Self {
-        // Uniform declarative entry point: arena (bake-on-missing) when artifacts.source is set,
-        // else NPU_WEIGHTS_ARENA env, else the legacy npy dir -- all behind one call.
+        // Uniform declarative entry point: checkpoint (bake-on-missing) when artifacts.source is set,
+        // else NPU_WEIGHTS_CHECKPOINT env, else the legacy npy dir -- all behind one call.
         let w = Rc::new(
             EsmWeights::load_for(&cfg.artifacts, root, cfg.model.n_layers).expect("esm weights"),
         );

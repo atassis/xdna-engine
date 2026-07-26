@@ -626,7 +626,7 @@ impl CtxAOp {
     /// Fast-restart constructor: build a [`CtxAOp`] from PRE-PACKED bf16 weight bits (the exact
     /// `[KA, n]` row-major bf16 the device BO expects) instead of an f32 `[KA, n]` matrix, skipping
     /// the per-startup f32->bf16 pack done in [`new`]. The bits come straight from a bf16-baked
-    /// `NPU_WEIGHTS_ARENA` (see `npu_weights::arena::Loaded::tensor_bf16`).
+    /// `NPU_WEIGHTS_CHECKPOINT` (see `npu_weights::checkpoint::Loaded::tensor_bf16`).
     ///
     /// Additive and conservative: this only handles the plain non-modal, non-int8 bf16 BO layout
     /// (`[KA, n]` u16). If the shared context is modal (K-aug epilogue) or int8 -- where the BO

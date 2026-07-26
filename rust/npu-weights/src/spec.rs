@@ -11,7 +11,7 @@ pub enum Source {
 pub struct ModelSpec {
     pub source: Source,
     pub arch: String,
-    pub arena: Option<PathBuf>,
+    pub checkpoint: Option<PathBuf>,
 }
 
 impl Source {
@@ -45,48 +45,48 @@ impl Source {
 }
 
 impl ModelSpec {
-    /// Derived arena path when `arena` is None:
-    /// ${XDNA_ARENA_DIR:-<root>/artifacts/arenas}/<arch>__<sanitized>__<disc>.safetensors
-    pub fn arena_path(&self, root: &std::path::Path, disc: &str) -> PathBuf {
-        if let Some(a) = &self.arena {
+    /// Derived checkpoint path when `checkpoint` is None:
+    /// ${XDNA_CHECKPOINT_DIR:-<root>/artifacts/checkpoints}/<arch>__<sanitized>__<disc>.safetensors
+    pub fn checkpoint_path(&self, root: &std::path::Path, disc: &str) -> PathBuf {
+        if let Some(a) = &self.checkpoint {
             return a.clone();
         }
-        let base = std::env::var("XDNA_ARENA_DIR")
+        let base = std::env::var("XDNA_CHECKPOINT_DIR")
             .map(PathBuf::from)
-            .unwrap_or_else(|_| root.join("artifacts/arenas"));
+            .unwrap_or_else(|_| root.join("artifacts/checkpoints"));
         base.join(format!("{}__{}__{}.safetensors", self.arch, self.source.sanitized(), disc))
     }
 
-    /// Resolve this spec to a usable arena on disk: resolve source files, fingerprint them, pick the
-    /// arena path, and BAKE if it is missing/stale (unless a fresh one is already present and
-    /// `force` is false). Returns the path to a verified-loadable arena.
+    /// Resolve this spec to a usable checkpoint on disk: resolve source files, fingerprint them, pick the
+    /// checkpoint path, and BAKE if it is missing/stale (unless a fresh one is already present and
+    /// `force` is false). Returns the path to a verified-loadable checkpoint.
     ///
     /// This is the single uniform entry point a consumer (engine) calls to turn a declarative
-    /// `{source, arch, arena?}` spec into a baked arena, with no shelling out to the `npu-weights`
+    /// `{source, arch, checkpoint?}` spec into a baked checkpoint, with no shelling out to the `npu-weights`
     /// binary. It is host-only (no NPU): it reads source weights, runs the arch transform, and
-    /// writes a `.safetensors` arena atomically.
-    pub fn ensure_arena(&self, root: &std::path::Path, force: bool) -> anyhow::Result<PathBuf> {
+    /// writes a `.safetensors` checkpoint atomically.
+    pub fn ensure_checkpoint(&self, root: &std::path::Path, force: bool) -> anyhow::Result<PathBuf> {
         let files = crate::source::resolve_files(&self.source)?;
         let fref: Vec<(String, &std::path::Path)> = files
             .iter()
             .map(|p| (p.file_name().unwrap().to_string_lossy().into_owned(), p.as_path()))
             .collect();
         let fp = crate::fingerprint::multi_sha256(&fref)?;
-        let path = self.arena_path(root, &fp[..12]);
+        let path = self.checkpoint_path(root, &fp[..12]);
         if path.exists() && !force {
-            if crate::arena::load(&path, &self.arch).is_ok() {
+            if crate::checkpoint::load(&path, &self.arch).is_ok() {
                 return Ok(path);
             }
         }
         let bag = crate::source::read_weights(&files)?;
         let out = crate::arch::get(&self.arch)?.transform(&bag)?;
-        let meta = crate::arena::ArenaMeta {
+        let meta = crate::checkpoint::CheckpointMeta {
             format_version: crate::FORMAT_VERSION,
             arch: self.arch.clone(),
             source_ref: self.source.sanitized(),
             source_fingerprint: fp,
         };
-        crate::arena::bake(&path, &out, &meta)?;
+        crate::checkpoint::bake(&path, &out, &meta)?;
         Ok(path)
     }
 }
@@ -112,9 +112,9 @@ mod tests {
     #[test]
     fn derived_path_includes_arch_and_disc() {
         let spec = ModelSpec { source: Source::parse("hf:BAAI/bge-base-en-v1.5@abc").unwrap(),
-                               arch: "bert".into(), arena: None };
-        let p = spec.arena_path(std::path::Path::new("/repo"), "abc123def456");
+                               arch: "bert".into(), checkpoint: None };
+        let p = spec.checkpoint_path(std::path::Path::new("/repo"), "abc123def456");
         assert_eq!(p, PathBuf::from(
-            "/repo/artifacts/arenas/bert__hf_BAAI_bge-base-en-v1.5_abc__abc123def456.safetensors"));
+            "/repo/artifacts/checkpoints/bert__hf_BAAI_bge-base-en-v1.5_abc__abc123def456.safetensors"));
     }
 }

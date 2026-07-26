@@ -5,21 +5,21 @@ use std::path::Path;
 use std::process::Command;
 
 #[test]
-fn edsr_arena_matches_python_oracle() {
+fn edsr_checkpoint_matches_python_oracle() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
     let refs = root.join("artifacts/edsr");
     if !refs.join("head_w.npy").exists() {
         eprintln!("SKIP edsr: oracle missing - run <venv>/bin/python scripts/export_edsr.py");
         return;
     }
-    let arena = root.join("target/test-arenas/edsr.safetensors");
+    let checkpoint = root.join("target/test-checkpoints/edsr.safetensors");
     let bin = env!("CARGO_BIN_EXE_npu-weights");
     let src = format!("path:{}", refs.join("edsr_base.safetensors").to_str().unwrap());
     let st = Command::new(bin)
         .current_dir(root)
         .args([
             "bake", "--source", &src, "--arch", "edsr",
-            "--arena", arena.to_str().unwrap(), "--force",
+            "--checkpoint", checkpoint.to_str().unwrap(), "--force",
         ])
         .status()
         .unwrap();
@@ -27,7 +27,7 @@ fn edsr_arena_matches_python_oracle() {
     let out = Command::new(bin)
         .current_dir(root)
         .args([
-            "verify", "--arena", arena.to_str().unwrap(), "--arch", "edsr",
+            "verify", "--checkpoint", checkpoint.to_str().unwrap(), "--arch", "edsr",
             "--refs", refs.to_str().unwrap(),
         ])
         .output()

@@ -13,17 +13,17 @@ fn check_one(sub: &str, hf: &str) {
         eprintln!("SKIP {sub}: oracle missing - run .venv/bin/python scripts/export_minilm.py {hf} {sub}");
         return;
     }
-    let arena = root.join(format!("target/test-arenas/{sub}.safetensors"));
+    let checkpoint = root.join(format!("target/test-checkpoints/{sub}.safetensors"));
     let bin = env!("CARGO_BIN_EXE_npu-weights");
     let st = Command::new(bin)
         .current_dir(root)
         .args(["bake", "--source", &format!("hf:{hf}"), "--arch", "bert",
-               "--arena", arena.to_str().unwrap(), "--force"])
+               "--checkpoint", checkpoint.to_str().unwrap(), "--force"])
         .status().unwrap();
     assert!(st.success(), "bake failed for {sub}");
     let out = Command::new(bin)
         .current_dir(root)
-        .args(["verify", "--arena", arena.to_str().unwrap(), "--arch", "bert",
+        .args(["verify", "--checkpoint", checkpoint.to_str().unwrap(), "--arch", "bert",
                "--refs", refs.to_str().unwrap()])
         .output().unwrap();
     let s = String::from_utf8_lossy(&out.stdout);
@@ -32,22 +32,22 @@ fn check_one(sub: &str, hf: &str) {
 }
 
 #[test]
-fn minilm_l6_arena_matches_python_oracle() {
+fn minilm_l6_checkpoint_matches_python_oracle() {
     check_one("minilm-l6", "sentence-transformers/all-MiniLM-L6-v2");
 }
 
 #[test]
-fn bge_small_arena_matches_python_oracle() {
+fn bge_small_checkpoint_matches_python_oracle() {
     check_one("bge-small", "BAAI/bge-small-en-v1.5");
 }
 
 #[test]
-fn e5_small_arena_matches_python_oracle() {
+fn e5_small_checkpoint_matches_python_oracle() {
     check_one("e5-small", "intfloat/e5-small-v2");
 }
 
 #[test]
-fn multilingual_e5_small_arena_matches_python_oracle() {
+fn multilingual_e5_small_checkpoint_matches_python_oracle() {
     // multilingual-e5-small reports model_type=bert / BertModel (12 layers, hidden 384) - a
     // multilingual MiniLM backbone, so it rides the generalized `bert` arch unchanged. Only the
     // word-embedding vocab is larger (multilingual); the XLM-R tokenizer omits token_type_ids

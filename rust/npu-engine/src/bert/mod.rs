@@ -22,7 +22,7 @@ pub struct EmbedPipeline {
 
 impl EmbedPipeline {
     pub fn build(cfg: &ScenarioConfig, root: &Path, dev: Rc<Device>) -> Self {
-        // Uniform declarative entry point: arena (bake-on-missing) when artifacts.source is set,
+        // Uniform declarative entry point: checkpoint (bake-on-missing) when artifacts.source is set,
         // else the legacy npy dir -- all behind one call.
         let weights = Rc::new(
             BertWeights::load_for(&cfg.artifacts, root, cfg.model.n_layers).expect("bert weights"),

@@ -13,7 +13,7 @@ pub(crate) struct Feat {
     pub data: Vec<f32>,
 }
 
-/// Baked conv weights [Cout, Cin, k, k] + bias [Cout], loaded from the arena.
+/// Baked conv weights [Cout, Cin, k, k] + bias [Cout], loaded from the checkpoint.
 pub(crate) struct ConvW {
     pub cout: usize,
     pub cin: usize,
@@ -199,10 +199,10 @@ fn pixel_shuffle(x: &Feat, r: usize) -> Feat {
     }
 }
 
-/// Load the baked conv weights from the arena the converter produced.
+/// Load the baked conv weights from the checkpoint the converter produced.
 fn load_conv_weights(sched: &Schedule) -> Result<Vec<ConvW>, SrError> {
-    let loaded = npu_weights::arena::load(std::path::Path::new(&sched.arena), &sched.name)
-        .map_err(|e| SrError::Load(format!("arena {}: {e}", sched.arena)))?;
+    let loaded = npu_weights::checkpoint::load(std::path::Path::new(&sched.checkpoint), &sched.name)
+        .map_err(|e| SrError::Load(format!("checkpoint {}: {e}", sched.checkpoint)))?;
     let mut out = Vec::new();
     for op in &sched.ops {
         if let Op::Conv2d {
