@@ -128,9 +128,17 @@ ok "XRT: inc=$XRT_INC_DIR lib=$XRT_LIB_DIR"
 # 3. Build the Rust workspace
 # ---------------------------------------------------------------------------
 info "Building Rust workspace (cargo build --release)..."
+# Bake an RPATH to the stable onnxruntime dir so the binary resolves libonnxruntime.so.1 on its
+# own. Without it only the SERVICE works (its unit sets LD_LIBRARY_PATH) and plain CLI use --
+# `npu --help`, `npu models`, `npu transcribe` -- dies with
+#   npu: error while loading shared libraries: libonnxruntime.so.1
+# NB: setting RUSTFLAGS here OVERRIDES rust/.cargo/config.toml's build.rustflags rather than
+# appending to it, so -C target-cpu=native must be repeated or the build silently loses AVX-512.
 (
   cd "$REPO/rust"
-  XRT_INC_DIR="$XRT_INC_DIR" XRT_LIB_DIR="$XRT_LIB_DIR" cargo build --release
+  XRT_INC_DIR="$XRT_INC_DIR" XRT_LIB_DIR="$XRT_LIB_DIR" \
+  RUSTFLAGS="${RUSTFLAGS:-} -C target-cpu=native -C link-arg=-Wl,-rpath,$STABLE_LIB_DIR" \
+    cargo build --release
 )
 [ -x "$BUILT_BIN" ] || die "Build finished but $BUILT_BIN is missing/not executable."
 ok "Built engine binary: $BUILT_BIN"
