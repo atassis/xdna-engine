@@ -226,8 +226,8 @@ fn config_cmd(path: &Path, action: &ConfigCmd) -> Result<()> {
 fn render(cfg: &Config) -> String {
     let mut s = format!("port {}  max_resident {}  memory_ceiling_mb {}\n",
         cfg.server.port, cfg.server.max_resident, cfg.server.memory_ceiling_mb);
-    s.push_str(&format!("residency: idle_unload_s {}  sweep_interval_s {}  evict_policy {}\n",
-        cfg.server.idle_unload_s, cfg.server.sweep_interval_s,
+    s.push_str(&format!("residency: idle_unload_s {}  idle_release_s {}  sweep_interval_s {}  evict_policy {}\n",
+        cfg.server.idle_unload_s, cfg.server.idle_release_s, cfg.server.sweep_interval_s,
         match cfg.server.evict_policy { EvictPolicy::Lru => "lru", EvictPolicy::None => "none" }));
     s.push_str(&format!("defaults: asr={:?} embed={:?}\n", cfg.defaults.asr, cfg.defaults.embed));
     if cfg.models.is_empty() { s.push_str("models: (none)\n"); }
@@ -269,6 +269,7 @@ mod tests {
         let r = render(&c);
         assert!(r.contains("model parakeet -> scenarios/asr.toml"));
         assert!(r.contains("asr=Some(\"parakeet\")"));
-        assert!(r.contains("idle_unload_s 900") && r.contains("evict_policy lru"), "{r}");
+        assert!(r.contains("idle_unload_s 900") && r.contains("idle_release_s 1800")
+            && r.contains("evict_policy lru"), "{r}");
     }
 }
