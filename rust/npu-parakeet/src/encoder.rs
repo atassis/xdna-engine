@@ -848,6 +848,46 @@ impl FastConformerEncoder {
         }, &format!("{blk}.pw2"), self.cfg.hidden))
     }
 
+    /// Device-in / device-out conformer block (whole-encoder residency): consumes the previous
+    /// block's f32 [PAD_M,KRES] output BO and returns this block's, so the activation stream never
+    /// touches host between blocks. The chain is the same one `block()`'s fused branch runs; the only
+    /// difference is the ends -- no `upload_stream` at entry, and the exit LN stores f32 to a BO
+    /// (`ln_affine_f32_dev`) instead of narrowing to bf16 and reading back.
+    #[cfg(feature = "npu")]
+    fn block_dev(&self, a_bo: &npu_xrt::Bo, blk: usize, pos_enc: &Array2<f32>, m: usize) -> std::rc::Rc<npu_xrt::Bo> {
+        let b = self.w.block(blk);
+        let npu = self.npu.as_ref().expect("block_dev without npu");
+        let _h = PhaseScope::new("fused_block_dev", Bucket::Npu);
+        let ff1n_g = b.v("norm_feed_forward1.weight");
+        let ff1n_b = b.v("norm_feed_forward1.bias");
+        let satt_g = b.v("norm_self_att.weight");
+        let satt_b = b.v("norm_self_att.bias");
+        let ff1_bo = npu.resident_ffn_dev_bo(a_bo, ff1n_g.as_slice().unwrap(), ff1n_b.as_slice().unwrap(),
+            || b.m("feed_forward1.linear1.weight"), &format!("{blk}.ff1.l1"),
+            || b.m("feed_forward1.linear2.weight"), &format!("{blk}.ff1.l2")).expect("resident_ffn_dev_bo");
+        let x_bo = npu.residual_add_dev(a_bo, &ff1_bo, 0.5, m).expect("residual_add_dev(0.5)");
+        let satt_bo = npu.ln_affine_cast_dev_bf16(&x_bo, satt_g.as_slice().unwrap(), satt_b.as_slice().unwrap()).expect("ln_affine_cast_dev");
+        let mhsa_out_bo = self.mhsa_dev(&satt_bo, m, blk, pos_enc);
+        let conv_in_bo = npu.residual_add_dev(&x_bo, &mhsa_out_bo, 1.0, m).expect("residual_add_dev(1.0)");
+        let conv_g = b.v("norm_conv.weight");
+        let conv_b = b.v("norm_conv.bias");
+        let glu = npu.resident_conv_pw1_glu_dev(&conv_in_bo, m, conv_g.as_slice().unwrap(), conv_b.as_slice().unwrap(),
+            || b.m3("conv.pointwise_conv1.weight").index_axis(Axis(2), 0).to_owned().t().to_owned(), &format!("{blk}.pw1"))
+            .expect("resident_conv_pw1_glu_dev (block_dev requires the glu xclbin)");
+        let conv_out_bo = self.conv_module_to_bo(&glu, blk).expect("conv_module_to_bo");
+        let x_bo = npu.residual_add_dev(&conv_in_bo, &conv_out_bo, 1.0, m).expect("residual_add_dev(conv 1.0)");
+        let ff2n_g = b.v("norm_feed_forward2.weight");
+        let ff2n_b = b.v("norm_feed_forward2.bias");
+        let ff2_bo = npu.resident_ffn_dev_bo(&x_bo, ff2n_g.as_slice().unwrap(), ff2n_b.as_slice().unwrap(),
+            || b.m("feed_forward2.linear1.weight"), &format!("{blk}.ff2.l1"),
+            || b.m("feed_forward2.linear2.weight"), &format!("{blk}.ff2.l2")).expect("resident_ffn_dev_bo(ff2)");
+        let x_bo = npu.residual_add_dev(&x_bo, &ff2_bo, 0.5, m).expect("residual_add_dev(ff2 0.5)");
+        let out_g = b.v("norm_out.weight");
+        let out_b = b.v("norm_out.bias");
+        npu.ln_affine_f32_dev(&x_bo, out_g.as_slice().unwrap(), out_b.as_slice().unwrap())
+            .expect("ln_affine_f32_dev (block_dev requires the f32-out block-exit LN)")
+    }
+
     fn block(&self, x: &Array2<f32>, blk: usize, pos_enc: &Array2<f32>) -> Array2<f32> {
         let b = self.w.block(blk);
         // block_io: the [T', D] residual-stream clone at block entry (a working copy the residual
@@ -863,6 +903,14 @@ impl FastConformerEncoder {
         #[cfg(feature = "npu")]
         if std::env::var("PARAKEET_FUSED_BLOCK").is_ok() {
             if let Some(npu) = &self.npu {
+                // Whole-encoder residency: when the f32-out block-exit LN exists, forward_last drives
+                // `block_dev` in a loop and this per-block upload/readback pair never runs at all.
+                if npu.resident_encoder_available() {
+                    let m = x.nrows();
+                    let a_bo = npu.upload_stream(&x);
+                    let out_bo = self.block_dev(&a_bo, blk, pos_enc, m);
+                    return npu.readback_stream(&out_bo, m);
+                }
                 if npu.resident_fused_available() {
                     let _h = PhaseScope::new("fused_ff1_mhsa", Bucket::Npu);
                     let m = x.nrows();
@@ -969,6 +1017,22 @@ impl FastConformerEncoder {
             let _h = PhaseScope::new("enc_setup", Bucket::Host);
             (rel_pos_encoding(x.nrows(), self.cfg.hidden), x.clone())
         };
+        // WHOLE-ENCODER RESIDENCY: upload the stream ONCE, run all 24 blocks device-to-device, read
+        // back ONCE. The per-block upload/readback pair disappears entirely (24 of each per clip).
+        #[cfg(feature = "npu")]
+        if std::env::var("PARAKEET_FUSED_BLOCK").is_ok() {
+            if let Some(npu) = &self.npu {
+                if npu.resident_encoder_available() {
+                    let m = x.nrows();
+                    let _h = PhaseScope::new("resident_encoder", Bucket::Npu);
+                    let mut bo = npu.upload_stream(&x);
+                    for blk in 0..self.cfg.n_layers {
+                        bo = self.block_dev(&bo, blk, &pos_enc, m);
+                    }
+                    return npu.readback_stream(&bo, m);
+                }
+            }
+        }
         for blk in 0..self.cfg.n_layers {
             x = self.block(&x, blk, &pos_enc);
         }

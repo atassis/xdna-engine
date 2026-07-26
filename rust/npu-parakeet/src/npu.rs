@@ -237,6 +237,8 @@ struct ResidentLn {
     // `resident_mha_affine_ln_f32` reads the intermediate f32 `bo_ln`, which the fused kernel never
     // materializes.
     lnaffcast: Option<LnAffCast>,
+    // f32-out block-exit LN (see LnAffineF32). Absent -> the block boundary stays host-mediated.
+    lnaffinef32: Option<LnAffineF32>,
     // scaled residual-add (out = a + 0.5*b, f32), OPTIONAL. The Macaron FFN residual x+0.5*ff on-chip.
     resadd_s050: Option<ResidualAdd>,
     // scaled residual-add (out = a + 1.0*b, f32), OPTIONAL. The full MHSA/conv residual x+sublayer.
@@ -322,6 +324,22 @@ struct LnAffCast {
     kern: Rc<Kernel>,
     instr: Bo,
     n: usize,
+    dummy_tmp: Bo,
+    dummy_tr: Bo,
+}
+
+/// Fused normalize+affine with an **f32** store (`ln_affine_f32.cc`) -- the BLOCK-EXIT LN for the
+/// block-to-block resident stream. Its bf16-out sibling `LnAffCast` is right for feeding a bf16-in
+/// matmul; it is WRONG at a block boundary, where the reference keeps f32 and the next block's entry
+/// LN consumes f32. Ping-pong output for the same reason ResidualAdd has one: block N's output is read
+/// all the way through block N+1 and would otherwise be the buffer block N+1 overwrites at its exit.
+struct LnAffineF32 {
+    kern: Rc<Kernel>,
+    instr: Bo,
+    n: usize,
+    bo_out: Rc<Bo>,  // [PAD_M, KRES] f32 ping
+    bo_out1: Rc<Bo>, // [PAD_M, KRES] f32 pong
+    flip: std::cell::Cell<bool>,
     dummy_tmp: Bo,
     dummy_tr: Bo,
 }
@@ -1031,6 +1049,25 @@ impl NpuMatmul {
                 None
             }
         };
+        let lnaffinef32 = {
+            let xcl = self.ln_dir.join(format!("final_lnaffinef32_{PAD_M}x{KRES}.xclbin"));
+            let ins = self.ln_dir.join(format!("insts_lnaffinef32_{PAD_M}x{KRES}.txt"));
+            if xcl.exists() && ins.exists() {
+                let (kern, instr, n) = load_path(xcl, ins);
+                let gr = |i| kern.group_id(i).unwrap();
+                Some(LnAffineF32 {
+                    bo_out: Rc::new(self.dev.alloc_bo(&kern, PAD_M * KRES * 4, FLAG_HOST_ONLY, gr(5)).unwrap()),
+                    bo_out1: Rc::new(self.dev.alloc_bo(&kern, PAD_M * KRES * 4, FLAG_HOST_ONLY, gr(5)).unwrap()),
+                    flip: std::cell::Cell::new(false),
+                    dummy_tmp: self.dev.alloc_bo(&kern, 8, FLAG_HOST_ONLY, gr(6)).unwrap(),
+                    dummy_tr: self.dev.alloc_bo(&kern, 1, FLAG_HOST_ONLY, gr(7)).unwrap(),
+                    kern, instr, n,
+                })
+            } else {
+                eprintln!("[npu] lnaffinef32 xclbin absent in {} -- block-to-block residency unavailable, block exit stays host-mediated (build final_lnaffinef32_{PAD_M}x{KRES})", self.ln_dir.display());
+                None
+            }
+        };
         let acc_add = {
             let xcl = self.ln_dir.join(format!("final_accadd_{PAD_M}x{KRES}.xclbin"));
             let ins = self.ln_dir.join(format!("insts_accadd_{PAD_M}x{KRES}.txt"));
@@ -1222,7 +1259,7 @@ impl NpuMatmul {
             deint_tmp: self.dev.alloc_bo(&deint_kern, 8, FLAG_HOST_ONLY, gd(6)).unwrap(),
             deint_tr: self.dev.alloc_bo(&deint_kern, 1, FLAG_HOST_ONLY, gd(7)).unwrap(),
             ln_kern, ln_instr, ln_n, ac_kern, ac_instr, ac_n,
-            deint_kern, deint_instr, deint_n, glu, lnaffcast, acc_add, resadd_s050, resadd_s100, fc2_k4096, dwconv, silu, dwconv_silu, dwconv_silu_t,
+            deint_kern, deint_instr, deint_n, glu, lnaffcast, lnaffinef32, acc_add, resadd_s050, resadd_s100, fc2_k4096, dwconv, silu, dwconv_silu, dwconv_silu_t,
         });
         rl
     }
@@ -1410,6 +1447,39 @@ impl NpuMatmul {
         self.resident_ln()?;
         let rl = self.ln_affine_cast_dev(a_bo, gamma, beta);
         Some(rl.bo_bf16.clone())
+    }
+
+    /// True when the whole ENCODER can stay resident across blocks: the fused block plus the f32-out
+    /// block-exit LN, so block N's output feeds block N+1 without touching host.
+    /// OFF BY DEFAULT -- opt in with `PARAKEET_RESIDENT_ENCODER=1`.
+    ///
+    /// BROKEN as of 2026-07-27: carrying the stream across blocks produces garbage (encoder rel-L2
+    /// **1.1443** vs a 0.0891 baseline) and intermittently fails a dispatch. Leading hypothesis is the
+    /// PAD_M padding rows: `upload_stream` zeroes rows m..PAD_M, and the per-block path re-zeroed them
+    /// every block, but the resident loop only zeroes them ONCE. The block-exit LN then normalizes those
+    /// zero rows into large values that propagate, and `matmul_id_to_bo`'s own comment already warns
+    /// that garbage padding "corrupts valid rows sharing a partial m-tile". Not yet confirmed.
+    pub fn resident_encoder_available(&self) -> bool {
+        std::env::var("PARAKEET_RESIDENT_ENCODER").map(|v| v != "0").unwrap_or(false)
+            && self.resident_fused_available()
+            && self.resident_ln().map(|rl| rl.lnaffinef32.is_some()).unwrap_or(false)
+    }
+
+    /// Block-EXIT LN, f32 device-out: affine_LN(a_bo) -> a device f32 [PAD_M,KRES] BO that the NEXT
+    /// block consumes directly. One dispatch. `None` when the f32-out xclbin is absent.
+    pub fn ln_affine_f32_dev(&self, a_bo: &Bo, gamma: &[f32], beta: &[f32]) -> Option<Rc<Bo>> {
+        let rl = self.resident_ln()?;
+        let lf = rl.lnaffinef32.as_ref()?;
+        let mut gb = vec![0f32; 2 * KRES];
+        gb[..KRES].copy_from_slice(gamma);
+        gb[KRES..].copy_from_slice(beta);
+        rl.bo_gb.write_bytes(f32_bytes(&gb)).unwrap();
+        rl.bo_gb.sync_to_device().unwrap();
+        let out = if lf.flip.get() { &lf.bo_out1 } else { &lf.bo_out };
+        lf.flip.set(!lf.flip.get());
+        lf.kern.run_matmul8(3, &lf.instr, lf.n, a_bo, &rl.bo_gb, out, &lf.dummy_tmp, &lf.dummy_tr).unwrap();
+        self.stats.borrow_mut().dispatches += 1;
+        Some(out.clone())
     }
 
     /// Block-EXIT LN (fusion T6): device-in affine LN of `a_bo`, read back to host [m,KRES] f32.
