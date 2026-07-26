@@ -52,14 +52,18 @@ pub fn route(req: &Request, handle: &Handle, cfg_path: &Path) -> Response {
 }
 
 /// Render model statuses as the `/v1/models` JSON list (reused by the C ABI control surface).
+///
+/// `state` + `idle_s` are what make a hot swap observable from outside: `idle_s` counts seconds since
+/// the model last served a request and is `null` while it is not resident.
 pub fn models_json(status: &[ModelStatus]) -> String {
     let mut data = String::new();
     for (i, s) in status.iter().enumerate() {
         if i > 0 { data.push(','); }
         let kind = match s.kind { Some(ModelKind::Asr) => "asr", Some(ModelKind::Embed) => "embed", None => "unknown" };
         let state = match s.state { LoadState::Loaded => "loaded", LoadState::Failed => "failed", LoadState::Unloaded => "unloaded" };
+        let idle = match s.idle_s { Some(n) => n.to_string(), None => "null".to_string() };
         data.push_str(&format!(
-            "{{\"id\":\"{}\",\"object\":\"model\",\"kind\":\"{kind}\",\"state\":\"{state}\",\"detail\":\"{}\",\"bo_bytes\":{}}}",
+            "{{\"id\":\"{}\",\"object\":\"model\",\"kind\":\"{kind}\",\"state\":\"{state}\",\"detail\":\"{}\",\"bo_bytes\":{},\"idle_s\":{idle}}}",
             s.name, parse::json_escape(&s.detail), s.bo_bytes));
     }
     format!("{{\"object\":\"list\",\"data\":[{data}]}}")
@@ -93,7 +97,11 @@ fn transcriptions(req: &Request, handle: &Handle) -> Response {
         Some(s) if !s.is_empty() => s,
         _ => return (400, "{\"error\":\"bad wav (need 16k mono 16-bit)\"}".into()),
     };
-    match handle.transcribe(None, samples, 16_000) {
+    // OpenAI's transcription request carries `model` as a form field. This route used to drop it and
+    // always serve the default, which left ASR -- the capability this engine actually ships -- with
+    // no way to pick a model per request even though the actor has always taken one.
+    let model = parse::extract_form_field(&req.body, &req.boundary, "model");
+    match handle.transcribe(model.as_deref(), samples, 16_000) {
         Ok(s) => (200, format!("{{\"text\":\"{}\",\"model\":\"{}\"}}",
             parse::json_escape(&s.value), parse::json_escape(&s.model))),
         Err(e) => (500, format!("{{\"error\":\"{}\"}}", parse::json_escape(&e.to_string()))),
@@ -103,8 +111,8 @@ fn transcriptions(req: &Request, handle: &Handle) -> Response {
 fn admin_reload(handle: &Handle, cfg_path: &Path) -> Response {
     match Config::load(cfg_path) {
         Ok(cfg) => match handle.reconcile(cfg) {
-            Ok(rep) => (200, format!("{{\"loaded\":{},\"unloaded\":{},\"failed\":{}}}",
-                rep.loaded.len(), rep.unloaded.len(), rep.failed.len())),
+            Ok(rep) => (200, format!("{{\"loaded\":{},\"unloaded\":{},\"failed\":{},\"deferred\":{}}}",
+                rep.loaded.len(), rep.unloaded.len(), rep.failed.len(), rep.deferred.len())),
             Err(e) => (500, format!("{{\"error\":\"{}\"}}", parse::json_escape(&e.to_string()))),
         },
         Err(e) => (400, format!("{{\"error\":\"{}\"}}", parse::json_escape(&e))),
@@ -145,8 +153,8 @@ fn mutate_and_reconcile(handle: &Handle, cfg_path: &Path, f: impl FnOnce(&mut Co
     f(&mut cfg);
     if let Err(e) = cfg.save(cfg_path) { return (500, format!("{{\"error\":\"{}\"}}", parse::json_escape(&e))); }
     match handle.reconcile(cfg) {
-        Ok(rep) => (200, format!("{{\"loaded\":{},\"unloaded\":{},\"failed\":{}}}",
-            rep.loaded.len(), rep.unloaded.len(), rep.failed.len())),
+        Ok(rep) => (200, format!("{{\"loaded\":{},\"unloaded\":{},\"failed\":{},\"deferred\":{}}}",
+            rep.loaded.len(), rep.unloaded.len(), rep.failed.len(), rep.deferred.len())),
         Err(e) => (500, format!("{{\"error\":\"{}\"}}", parse::json_escape(&e.to_string()))),
     }
 }
@@ -262,6 +270,23 @@ pub mod parse {
         }
         None
     }
+    /// Value of a plain (non-file) multipart form field, e.g. `model` on a transcription request.
+    /// Parts carrying a `filename=` are skipped: those are uploads, handled by `extract_file_part`.
+    pub fn extract_form_field(body: &[u8], boundary: &str, field: &str) -> Option<String> {
+        if boundary.is_empty() { return None; }
+        let delim = format!("--{boundary}");
+        let want = format!("name=\"{}\"", field.to_ascii_lowercase());
+        for part in split_on(body, delim.as_bytes()) {
+            let hdr_end = match find(part, b"\r\n\r\n") { Some(h) => h, None => continue };
+            let headers = String::from_utf8_lossy(&part[..hdr_end]).to_ascii_lowercase();
+            if !headers.contains(&want) || headers.contains("filename=") { continue; }
+            let mut data = &part[hdr_end + 4..];
+            if data.ends_with(b"\r\n") { data = &data[..data.len() - 2]; }
+            let v = String::from_utf8_lossy(data).trim().to_string();
+            return if v.is_empty() { None } else { Some(v) };
+        }
+        None
+    }
     pub fn split_on<'a>(hay: &'a [u8], sep: &[u8]) -> Vec<&'a [u8]> {
         let mut out = Vec::new();
         let (mut start, mut i) = (0usize, 0usize);
@@ -317,6 +342,19 @@ pub mod parse {
         fn json_escape_quotes_and_newlines() { assert_eq!(json_escape("a\"b\nc"), "a\\\"b\\nc"); }
         #[test]
         fn parse_wav_rejects_non_riff() { assert!(parse_wav_i16(b"not a wav").is_none()); }
+        #[test]
+        fn form_field_reads_model_and_ignores_the_upload() {
+            let b = "X";
+            let body = concat!(
+                "--X\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\ngigaam\r\n",
+                "--X\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\n\r\nRIFF\r\n",
+                "--X--\r\n").as_bytes();
+            assert_eq!(extract_form_field(body, b, "model").as_deref(), Some("gigaam"));
+            assert_eq!(extract_form_field(body, b, "language"), None);
+            // The file part must not be mistaken for a text field even when asked for by name.
+            assert_eq!(extract_form_field(body, b, "file"), None);
+            assert_eq!(extract_file_part(body, b), Some(&b"RIFF"[..]));
+        }
     }
 }
 
@@ -354,6 +392,8 @@ mod route_tests {
         let (code, body) = route(&get("/v1/models"), &h, &p);
         assert_eq!(code, 200);
         assert!(body.contains("\"id\":\"bge\"") && body.contains("\"state\":\"loaded\""));
+        // A resident model reports how long it has been idle, so a swap is observable from outside.
+        assert!(body.contains("\"idle_s\":0"), "{body}");
         assert_eq!(route(&post("/v1/chat/completions", "{}"), &h, &p).0, 501);
         assert_eq!(route(&get("/nope"), &h, &p).0, 404);
         assert_eq!(route(&get("/health"), &h, &p), (200, "{\"status\":\"ok\"}".to_string()));
@@ -377,6 +417,33 @@ mod route_tests {
         // and it persisted to the config file
         let cfg = Config::load(&p).unwrap();
         assert!(cfg.find("c").is_some());
+        h.shutdown(); j.join().unwrap();
+    }
+    #[test]
+    fn models_shows_a_swap_at_one_slot() {
+        // One slot, two configured models: /v1/models is where an operator sees which one holds the
+        // device right now, and what happened to the other.
+        let mut t = BTreeMap::new();
+        t.insert("bge".to_string(), Ok((ModelKind::Embed, 1)));
+        t.insert("e5".to_string(), Ok((ModelKind::Embed, 1)));
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("engine.toml");
+        let cfg = Config {
+            server: ServerCfg { max_resident: 1, idle_unload_s: 0, ..Default::default() },
+            models: vec![
+                ModelCfg { name: "bge".into(), scenario: "x".into() },
+                ModelCfg { name: "e5".into(), scenario: "y".into() },
+            ],
+            ..Default::default()
+        };
+        cfg.save(&p).unwrap();
+        let (h, j) = start(cfg, Box::new(MockLoader { table: t }));
+        let (code, body) = route(&post("/v1/embeddings", r#"{"model":"e5","input":"hi"}"#), &h, &p);
+        assert_eq!(code, 200, "{body}");
+        assert!(body.contains("\"model\":\"e5\""), "{body}");
+        let (_, models) = route(&get("/v1/models"), &h, &p);
+        assert!(models.contains("\"id\":\"e5\",\"object\":\"model\",\"kind\":\"embed\",\"state\":\"loaded\""), "{models}");
+        assert!(models.contains("\"idle_s\":null"), "the evicted model reports no idle time: {models}");
         h.shutdown(); j.join().unwrap();
     }
 }

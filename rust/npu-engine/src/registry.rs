@@ -20,8 +20,10 @@ pub fn try_build(cfg_path: &Path, root: &Path) -> Result<Scenario, EngineError> 
             .map(Rc::new)
             .map_err(|e| EngineError::Device(format!("open NPU (stop other ASR/embeddings service first): {e}")))
     };
-    let scen = match cfg.scenario.kind.as_str() {
-        "embeddings" => {
+    // Dispatch on the SAME answer `ModelKind::from_scenario_kind` gives the control plane before any
+    // load, so a declared capability and the built one cannot disagree.
+    let scen = match crate::ModelKind::from_scenario_kind(&cfg.scenario.kind) {
+        Some(crate::ModelKind::Embed) => {
             let dev = open_dev()?;
             if cfg.scenario.name.to_lowercase().starts_with("esm") {
                 Scenario::Embed(Box::new(crate::esm::EsmEmbedPipeline::build(&cfg, root, dev)))
@@ -29,7 +31,7 @@ pub fn try_build(cfg_path: &Path, root: &Path) -> Result<Scenario, EngineError> 
                 Scenario::Embed(Box::new(crate::bert::EmbedPipeline::build(&cfg, root, dev)))
             }
         }
-        "asr" => {
+        Some(crate::ModelKind::Asr) => {
             if cfg.scenario.name.to_lowercase().contains("parakeet") {
                 Scenario::Asr(Box::new(crate::asr::parakeet::ParakeetAsr::build(&cfg, root)))
             } else if cfg.scenario.name.to_lowercase().contains("whisper") {
@@ -39,7 +41,7 @@ pub fn try_build(cfg_path: &Path, root: &Path) -> Result<Scenario, EngineError> 
                 Scenario::Asr(Box::new(crate::asr::AsrPipeline::build(&cfg, root, dev)))
             }
         }
-        other => return Err(EngineError::Load(format!("unknown scenario kind {other:?}"))),
+        None => return Err(EngineError::Load(format!("unknown scenario kind {:?}", cfg.scenario.kind))),
     };
     Ok(scen)
 }

@@ -14,6 +14,13 @@ pub trait Inference {
 
 pub trait ModelLoader {
     fn load(&self, cfg: &ModelCfg) -> Result<Box<dyn Inference>, EngineError>;
+
+    /// What capability this model DECLARES, without loading it: cheap, host-only, no device.
+    ///
+    /// Routing needs the capability of a model that is not resident, and the only alternative is to
+    /// load one to find out -- which on this engine means seconds and the whole device. `None` means
+    /// "cannot tell cheaply"; the caller then falls back to loading.
+    fn declared_kind(&self, _cfg: &ModelCfg) -> Option<ModelKind> { None }
 }
 
 /// Real loader: turns a ModelCfg's scenario TOML into a live npu_engine::Model. `Capability` is
@@ -32,6 +39,12 @@ impl ModelLoader for EngineLoader {
     fn load(&self, cfg: &ModelCfg) -> Result<Box<dyn Inference>, EngineError> {
         let model = npu_engine::Model::load_in(&cfg.scenario, &self.root)?;
         Ok(Box::new(EngineModel { model }))
+    }
+    /// Read the scenario's `[scenario] kind`. Parsing one small TOML costs nothing next to a load,
+    /// and it is the same field `registry::try_build` dispatches on.
+    fn declared_kind(&self, cfg: &ModelCfg) -> Option<ModelKind> {
+        let sc = npu_engine::config::ScenarioConfig::load(std::path::Path::new(&cfg.scenario)).ok()?;
+        ModelKind::from_scenario_kind(&sc.scenario.kind)
     }
 }
 
@@ -62,6 +75,10 @@ pub mod mock {
                 Some(Err(e)) => Err(EngineError::Load(e.clone())),
                 None => Err(EngineError::Load(format!("no mock entry for {}", cfg.name))),
             }
+        }
+        /// The scripted kind, standing in for the scenario TOML the real loader reads.
+        fn declared_kind(&self, cfg: &ModelCfg) -> Option<ModelKind> {
+            match self.table.get(&cfg.name) { Some(Ok((k, _))) => Some(*k), _ => None }
         }
     }
 }

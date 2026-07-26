@@ -15,6 +15,20 @@ impl std::fmt::Display for ModelKind {
     }
 }
 
+impl ModelKind {
+    /// The capability a scenario's `[scenario] kind` declares -- known from the TOML alone, with no
+    /// device, no weights and no build. `registry::try_build` dispatches on this same answer, so the
+    /// two cannot drift; the control plane uses it to route a request to the right model without
+    /// having to load a wrong one first to find out what it was.
+    pub fn from_scenario_kind(s: &str) -> Option<ModelKind> {
+        match s {
+            "asr" => Some(ModelKind::Asr),
+            "embeddings" => Some(ModelKind::Embed),
+            _ => None,
+        }
+    }
+}
+
 /// Engine error surface. Internal errors are flattened into these variants with a message.
 #[derive(thiserror::Error, Debug)]
 pub enum EngineError {
