@@ -21,7 +21,28 @@ echo "== dwconv1d k=5 =="
 make -C $PE/ml/dwconv1d NPU2=1
 
 echo "== layernorm [400x768] =="
-make -C $PE/ml/layernorm NPU2=1 rows=400 cols=768
+# Upstream renamed this example ml/layernorm -> ml/norm and reworked its knobs (rows/cols became
+# sequence_length/embedding_dim, and it grew an `op` selector for rms vs layer). This step still
+# said `make -C $PE/ml/layernorm NPU2=1 rows=400 cols=768`, which has no `-f` and so needs a plain
+# Makefile -- and $PE/ml/layernorm is OUR directory, created by sync_kernels.sh, which copies only
+# NAMED makefiles (Makefile.ctxln, Makefile.silu2, ...). There was no plain Makefile, so the step
+# died under `set -euo pipefail` and the script never reached the K=768 matmul section below. That
+# is why the whole K=768/K=800 family was missing from the whole_array build dir.
+# Build it where it now lives, then place the artifacts where every consumer already looks
+# (run_npu_layernorm.py, ctx_ln.rs, ln_probe.rs, test_repro_vendoring.sh all read
+# ml/layernorm/build/final.xclbin + insts.bin).
+#
+# CAVEAT, measured 2026-07-26 on device: upstream's `op=layer` is a different, lower-precision design
+# than the one run_npu_layernorm.py's ULP-level check was written against -- it runs (0.189 ms/iter,
+# 400x768) but reports max|d|=0.104 / mean|d|=0.035 vs f32 truth, 5/400 rows over 0.1. Upstream's own
+# tolerance for this op is atol=0.1, so the kernel is behaving as upstream expects and the probe's
+# elementwise gate is the wrong instrument for it (cf. the project rule: guard bf16 norms with an
+# aggregate rel-L2, not an elementwise atol). Deciding between re-gating the probe and restoring the
+# older design is open -- the step is here because the SCRIPT ABORTING is what starved the K=768
+# family, and that part is fixed.
+make -C $PE/ml/norm NPU2=1 op=layer sequence_length=400 embedding_dim=768
+cp $PE/ml/norm/build/final.xclbin $PE/ml/layernorm/build/final.xclbin
+cp $PE/ml/norm/build/insts.bin    $PE/ml/layernorm/build/insts.bin
 
 echo "== ctxLN [512x768] (encoder LayerNorm on NPU, Step D — f32 two-pass, NPU_LN_NPU=1) =="
 make -C $PE/ml/layernorm -f Makefile.ctxln NPU2=1 rows=512 cols=768 build/final_ctxln_512x768.xclbin
