@@ -49,19 +49,33 @@ def _npty(shape, dt):
     return np.ndarray[shape, np.dtype[dt]]
 
 
-def _build_rowwise(symbol, shim, m, in_cols, out_cols, const_len, compile_flags,
-                   in_dt, out_dt, const_dt):
-    """Return an @iron.jit design. If const_len==0 the const fifo is omitted."""
-    compile_flags = _AIE_API_INC + list(compile_flags or [])
-    has_const = const_len > 0
+def _build_streamed(symbol, shim, n_tiles, in_tile, out_tile, resident_len, compile_flags,
+                    in_dt, out_dt, resident_dt):
+    """Stream `n_tiles` fixed-size operand tiles past ONE resident operand.
 
-    if has_const:
+    This is the general resident-stream `[tile, D]` delivery: the core acquires the
+    resident buffer ONCE for the whole stream, then consumes one `in_tile`-element tile
+    and produces one `out_tile`-element tile per iteration. L1 therefore has to hold one
+    TILE of the streamed operand rather than the whole thing, which is the entire
+    difference between a gate that fits a 64 KB core tile and one that does not.
+
+    The kernel is invoked as `kern(tile_in, resident, tile_out)`. If resident_len == 0 the
+    resident fifo is omitted and it is `kern(tile_in, tile_out)`.
+
+    Row-wise verification (`_build_rowwise`) is the special case where one tile is one row
+    of a matrix; `verify_streamed` is the tiled-operand case. Both are the same design.
+    """
+    compile_flags = _AIE_API_INC + list(compile_flags or [])
+    has_resident = resident_len > 0
+    _check_symbol_arity(symbol, shim, 3 if has_resident else 2)
+
+    if has_resident:
         def design(inp: In, cst: In, out: Out):
-            in_row = _npty((in_cols,), in_dt)
-            out_row = _npty((out_cols,), out_dt)
-            cst_ty = _npty((const_len,), const_dt)
-            in_full = _npty((m * in_cols,), in_dt)
-            out_full = _npty((m * out_cols,), out_dt)
+            in_row = _npty((in_tile,), in_dt)
+            out_row = _npty((out_tile,), out_dt)
+            cst_ty = _npty((resident_len,), resident_dt)
+            in_full = _npty((n_tiles * in_tile,), in_dt)
+            out_full = _npty((n_tiles * out_tile,), out_dt)
             kern = ExternalFunction(symbol, source_file=str(shim),
                                     arg_types=[in_row, cst_ty, out_row],
                                     compile_flags=compile_flags)
@@ -71,7 +85,7 @@ def _build_rowwise(symbol, shim, m, in_cols, out_cols, const_len, compile_flags,
 
             def core(inf, cf, of, kern):
                 ec = cf.acquire(1)
-                for _ in range_(m):
+                for _ in range_(n_tiles):
                     ei = inf.acquire(1)
                     eo = of.acquire(1)
                     kern(ei, ec, eo)
@@ -80,9 +94,9 @@ def _build_rowwise(symbol, shim, m, in_cols, out_cols, const_len, compile_flags,
                 cf.release(1)
 
             worker = Worker(core, fn_args=[inf.cons(), cf.cons(), of.prod(), kern])
-            in_tap = TensorTiler2D.group_tiler((m, in_cols), (1, in_cols), (m, 1))[0]
-            out_tap = TensorTiler2D.group_tiler((m, out_cols), (1, out_cols), (m, 1))[0]
-            cst_tap = TensorTiler2D.group_tiler((1, const_len), (1, const_len), (1, 1))[0]
+            in_tap = TensorTiler2D.group_tiler((n_tiles, in_tile), (1, in_tile), (n_tiles, 1))[0]
+            out_tap = TensorTiler2D.group_tiler((n_tiles, out_tile), (1, out_tile), (n_tiles, 1))[0]
+            cst_tap = TensorTiler2D.group_tiler((1, resident_len), (1, resident_len), (1, 1))[0]
             rt = Runtime()
             with rt.sequence(in_full, cst_ty, out_full) as (a, c, o):
                 rt.start(worker)
@@ -94,10 +108,10 @@ def _build_rowwise(symbol, shim, m, in_cols, out_cols, const_len, compile_flags,
         return iron.jit(design, use_cache=False)
 
     def design(inp: In, out: Out):
-        in_row = _npty((in_cols,), in_dt)
-        out_row = _npty((out_cols,), out_dt)
-        in_full = _npty((m * in_cols,), in_dt)
-        out_full = _npty((m * out_cols,), out_dt)
+        in_row = _npty((in_tile,), in_dt)
+        out_row = _npty((out_tile,), out_dt)
+        in_full = _npty((n_tiles * in_tile,), in_dt)
+        out_full = _npty((n_tiles * out_tile,), out_dt)
         kern = ExternalFunction(symbol, source_file=str(shim),
                                 arg_types=[in_row, out_row],
                                 compile_flags=compile_flags)
@@ -105,7 +119,7 @@ def _build_rowwise(symbol, shim, m, in_cols, out_cols, const_len, compile_flags,
         of = ObjectFifo(out_row, name="of")
 
         def core(inf, of, kern):
-            for _ in range_(m):
+            for _ in range_(n_tiles):
                 ei = inf.acquire(1)
                 eo = of.acquire(1)
                 kern(ei, eo)
@@ -113,8 +127,8 @@ def _build_rowwise(symbol, shim, m, in_cols, out_cols, const_len, compile_flags,
                 inf.release(1)
 
         worker = Worker(core, fn_args=[inf.cons(), of.prod(), kern])
-        in_tap = TensorTiler2D.group_tiler((m, in_cols), (1, in_cols), (m, 1))[0]
-        out_tap = TensorTiler2D.group_tiler((m, out_cols), (1, out_cols), (m, 1))[0]
+        in_tap = TensorTiler2D.group_tiler((n_tiles, in_tile), (1, in_tile), (n_tiles, 1))[0]
+        out_tap = TensorTiler2D.group_tiler((n_tiles, out_tile), (1, out_tile), (n_tiles, 1))[0]
         rt = Runtime()
         with rt.sequence(in_full, out_full) as (a, o):
             rt.start(worker)
@@ -123,6 +137,17 @@ def _build_rowwise(symbol, shim, m, in_cols, out_cols, const_len, compile_flags,
         return Program(iron.get_current_device(), rt).resolve_program()
     design.__name__ = design.__qualname__ = f"design_{symbol}"
     return iron.jit(design, use_cache=False)
+
+
+def _build_rowwise(symbol, shim, m, in_cols, out_cols, const_len, compile_flags,
+                   in_dt, out_dt, const_dt):
+    """Rows-of-a-matrix view of `_build_streamed`: one tile is one row.
+
+    Kept as its own name because that IS what the row-wise bricks mean, and their call
+    sites read better for it. The generated design is identical.
+    """
+    return _build_streamed(symbol, shim, m, in_cols, out_cols, const_len, compile_flags,
+                           in_dt, out_dt, const_dt)
 
 
 def _find_kernel_params(symbol, shim_path):
@@ -279,6 +304,60 @@ def verify_oneshot(name, brick_cc, shim_body, symbol, inputs, out_numel, out_sha
     print(f"[{name:22s}] rel_l2={rl2:.3e} gate={gate:.1e} nz={nz:.2e} "
           f"run2run={determ:.2e} -> {status}")
     # `got` is returned so a probe can inspect WHAT is wrong, not just how wrong.
+    return dict(name=name, rel_l2=rl2, gate=gate, nonzero=nz, run2run=determ,
+                status=status, ok=ok, got=got)
+
+
+def verify_streamed(name, shim, symbol, in_tiles, out_tile_numel, resident,
+                    unpack, golden, gate, in_dt, out_dt, resident_dt=None,
+                    compile_flags=None):
+    """Gate a brick whose operands are too big to stage whole into L1.
+
+    `verify_oneshot` moves every operand into L1 in one piece, so it can only gate shapes
+    whose entire working set fits a 64 KB core tile (half that at objectFIFO depth 2).
+    That ceiling is not a kernel property and it is not negotiable by picking better
+    shapes -- a tall-K decode weight is megabytes. Here the big operand arrives as a
+    stream of equal tiles and the small one stays resident, so L1 holds one tile.
+
+    in_tiles:  (n_tiles, in_tile) -- tile i is the slice of the streamed operand that
+               the kernel needs for output tile i, already in the kernel's own layout.
+    resident:  1-D operand acquired once for the whole stream, or None.
+    unpack:    (n_tiles, out_tile_numel) device result -> `got` in the golden's shape.
+
+    Returns the same result dict as `verify_oneshot`, including the run-twice self-check
+    that guards the CLFLUSH read race.
+    """
+    in_tiles = np.ascontiguousarray(np.asarray(in_tiles))
+    n_tiles, in_tile = in_tiles.shape
+    resident_len = 0 if resident is None else int(np.asarray(resident).size)
+    design = _build_streamed(symbol, shim, n_tiles, in_tile, out_tile_numel, resident_len,
+                             compile_flags, in_dt, out_dt, resident_dt)
+
+    def run_once():
+        in_t = iron.tensor(np.ascontiguousarray(in_tiles.reshape(-1)), dtype=in_dt,
+                           device="npu")
+        out_t = iron.zeros((n_tiles * out_tile_numel,), dtype=out_dt, device="npu")
+        if resident_len:
+            r_t = iron.tensor(np.ascontiguousarray(np.asarray(resident).reshape(-1)),
+                              dtype=resident_dt, device="npu")
+            design(in_t, r_t, out_t)
+        else:
+            design(in_t, out_t)
+        return out_t.numpy().reshape(n_tiles, out_tile_numel).copy()
+
+    dev1 = run_once()
+    dev2 = run_once()
+    got = np.asarray(unpack(dev1), np.float64)
+    exp = np.asarray(golden, np.float64)
+    num = np.linalg.norm((got - exp).ravel())
+    den = np.linalg.norm(exp.ravel())
+    rl2 = float(num / den) if den else float(num)
+    determ = float(np.linalg.norm((dev1.astype(np.float64) - dev2.astype(np.float64)).ravel()))
+    nz = float(np.abs(dev1.astype(np.float64)).sum())
+    ok = (nz > 0.0) and (rl2 <= gate)
+    status = "PASS" if ok else ("FAIL-ZERO" if nz == 0.0 else "FAIL")
+    print(f"[{name:34s}] rel_l2={rl2:.3e} gate={gate:.1e} nz={nz:.2e} "
+          f"run2run={determ:.2e} tiles={n_tiles}x{in_tile} -> {status}", flush=True)
     return dict(name=name, rel_l2=rl2, gate=gate, nonzero=nz, run2run=determ,
                 status=status, ok=ok, got=got)
 
