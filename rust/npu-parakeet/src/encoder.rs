@@ -280,17 +280,97 @@ impl FastConformerEncoder {
         // None on the npy path, so the `unwrap_or_else` fallback is the pre-existing f32 mm_lazy
         // call, byte-identical to before.
         prof::phase::set_stage("mhsa_qkv");
-        let id_q = format!("{blk}.q");
-        let q = self.mm_arena(x, b, "self_attn.linear_q.weight", &id_q)
-            .unwrap_or_else(|| self.mm_lazy(x, || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_q.weight") }, &id_q)); // [T, D]
-        prof::phase::set_stage("mhsa_qkv");
-        let id_k = format!("{blk}.k");
-        let k = self.mm_arena(x, b, "self_attn.linear_k.weight", &id_k)
-            .unwrap_or_else(|| self.mm_lazy(x, || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_k.weight") }, &id_k));
-        prof::phase::set_stage("mhsa_qkv");
-        let id_v = format!("{blk}.v");
-        let v = self.mm_arena(x, b, "self_attn.linear_v.weight", &id_v)
-            .unwrap_or_else(|| self.mm_lazy(x, || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_v.weight") }, &id_v));
+        // x is pre-LN. RESIDENT LN->QKV seam (opt-in PARAKEET_RESIDENT_MHA): norm_self_att LN runs
+        // on-NPU (ctxLN -> affine_cast) and feeds the q/k/v modal GEMMs device-side off one resident
+        // bf16 A -- the host LN is off the MHSA frontier. Falls back to host layernorm + mm_lazy when
+        // the seam is off or the resident xclbins are absent (WER-identical to the old block()-level LN).
+        #[cfg(feature = "npu")]
+        let resident_mha = std::env::var("PARAKEET_RESIDENT_MHA").is_ok();
+        #[cfg(not(feature = "npu"))]
+        let resident_mha = false;
+        // DIAGNOSTIC (PARAKEET_MHA_HOSTQKV=1): keep the resident attention block but feed it
+        // HOST f32-LN + mm_lazy q/k/v (the DEFAULT path's qkv), decoupling the LN->QKV seam from
+        // the resident attention to isolate which owns any WER gap. No effect unless RESIDENT_MHA.
+        #[cfg(feature = "npu")]
+        let resident_mha_qkv = resident_mha && std::env::var("PARAKEET_MHA_HOSTQKV").is_err();
+        #[cfg(feature = "npu")]
+        let resident_qkv: Option<(Array2<f32>, Array2<f32>, Array2<f32>)> = if resident_mha_qkv
+            && self.npu.as_ref().map(|n| n.resident_ff_available()).unwrap_or(false) {
+            let npu = self.npu.as_ref().unwrap();
+            let gamma = b.v("norm_self_att.weight");
+            let beta = b.v("norm_self_att.bias");
+            // bf16x2 device-A is ON by default for the resident path (opt-out PARAKEET_MHA_SPLITA=0 ->
+            // old single-bf16-A path, WER 8.9). It makes the opt-in resident MHA WER-NEUTRAL (8.5),
+            // unblocking the (owner-deferred) DEFAULT flip. The shipped host-MHA default is untouched.
+            let split_a = std::env::var("PARAKEET_MHA_SPLITA").map(|v| v != "0").unwrap_or(true);
+            if split_a {
+                // Split the DEVICE ctxLN affine_LN(x) into A_hi + A_lo (near-f32) and feed the QKV modal
+                // GEMM twice (q = A_hi@W + A_lo@W), summing on host. The +0.4pp seam was the bf16-round
+                // coin-flip of the device A (host golden HOSTQKV=8.5 vs full-resident bf16-A 8.9); near-f32
+                // A recovers 8.5. Reuses mm_lazy unchanged -> no shared default-infra touch. NOTE: reads the
+                // device A back to host to split it (a residency step-back, compute stays on-NPU); the clean
+                // follow-on is a device-side affine_cast_split (A_hi+A_lo on-device, no readback).
+                let _hh = PhaseScope::new("mha_resident_qkv", Bucket::Npu);
+                let a = npu.resident_mha_affine_ln_f32(x, gamma.as_slice().unwrap(), beta.as_slice().unwrap());
+                let a_hi = a.mapv(|v| npu_xrt::bf16_bits_to_f32(npu_xrt::f32_to_bf16_bits(v)));
+                let a_lo = &a - &a_hi;
+                let q = { let hi = self.mm_lazy(&a_hi, || b.m("self_attn.linear_q.weight"), &format!("{blk}.q"));
+                          let lo = self.mm_lazy(&a_lo, || b.m("self_attn.linear_q.weight"), &format!("{blk}.q")); hi + &lo };
+                let k = { let hi = self.mm_lazy(&a_hi, || b.m("self_attn.linear_k.weight"), &format!("{blk}.k"));
+                          let lo = self.mm_lazy(&a_lo, || b.m("self_attn.linear_k.weight"), &format!("{blk}.k")); hi + &lo };
+                let v = { let hi = self.mm_lazy(&a_hi, || b.m("self_attn.linear_v.weight"), &format!("{blk}.v"));
+                          let lo = self.mm_lazy(&a_lo, || b.m("self_attn.linear_v.weight"), &format!("{blk}.v")); hi + &lo };
+                Some((q, k, v))
+            } else {
+                let _hh = PhaseScope::new("mha_resident_qkv", Bucket::Npu);
+                Some(npu.resident_mha_ln_qkv(x, gamma.as_slice().unwrap(), beta.as_slice().unwrap(),
+                    || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_q.weight") }, &format!("{blk}.q"),
+                    || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_k.weight") }, &format!("{blk}.k"),
+                    || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_v.weight") }, &format!("{blk}.v")))
+            }
+        } else { None };
+        #[cfg(not(feature = "npu"))]
+        let resident_qkv: Option<(Array2<f32>, Array2<f32>, Array2<f32>)> = None;
+        let (q, k, v) = if let Some((q, k, v)) = resident_qkv {
+            (q, k, v)
+        } else {
+            // Host LN (or no-npu) + mm_lazy projections. x is pre-LN, so do the norm_self_att LN here
+            // -- identical to the old block()-level LN, so this path (incl. the host-MHA DEFAULT) is
+            // WER-neutral. The resident seam replaces exactly this LN + these three GEMMs.
+            let ln_x = {
+                let _h = PhaseScope::new("ln", Bucket::Host);
+                layernorm(x, &b.v("norm_self_att.weight"), &b.v("norm_self_att.bias"))
+            };
+            // Each projection prefers the bf16-arena fast path (NPU_WEIGHTS_ARENA); `mm_arena`
+            // returns None on the npy path, so the fallback is the pre-existing f32 mm_lazy call.
+            let id_q = format!("{blk}.q");
+            let q = self.mm_arena(&ln_x, b, "self_attn.linear_q.weight", &id_q)
+                .unwrap_or_else(|| self.mm_lazy(&ln_x, || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_q.weight") }, &id_q)); // [T, D]
+            let id_k = format!("{blk}.k");
+            let k = self.mm_arena(&ln_x, b, "self_attn.linear_k.weight", &id_k)
+                .unwrap_or_else(|| self.mm_lazy(&ln_x, || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_k.weight") }, &id_k));
+            let id_v = format!("{blk}.v");
+            let v = self.mm_arena(&ln_x, b, "self_attn.linear_v.weight", &id_v)
+                .unwrap_or_else(|| self.mm_lazy(&ln_x, || { let _wp = PhaseScope::new("mhsa_wprep", Bucket::Marshal); b.m("self_attn.linear_v.weight") }, &id_v));
+            (q, k, v)
+        };
+        // A/B (PARAKEET_MHA_QKV_AB=1): resident LN->QKV vs host layernorm(x)@W, rel-L2 per projection.
+        #[cfg(feature = "npu")]
+        if resident_mha && std::env::var("PARAKEET_MHA_QKV_AB").is_ok()
+            && self.npu.as_ref().map(|n| n.resident_ff_available()).unwrap_or(false) {
+            let ln_x = layernorm(x, &b.v("norm_self_att.weight"), &b.v("norm_self_att.bias"));
+            let rel = |dev: &Array2<f32>, wname: &str| {
+                let host = ln_x.dot(&b.m(wname));
+                let mut num = 0f64; let mut den = 0f64;
+                for i in 0..dev.nrows() { for j in 0..dev.ncols() {
+                    let e = (dev[[i, j]] - host[[i, j]]) as f64; let g = host[[i, j]] as f64;
+                    num += e * e; den += g * g;
+                } }
+                if den > 0.0 { (num / den).sqrt() } else { 0.0 }
+            };
+            eprintln!("[MHA_QKV_AB] blk={blk} T={t} q_relL2={:.4e} k_relL2={:.4e} v_relL2={:.4e}",
+                rel(&q, "self_attn.linear_q.weight"), rel(&k, "self_attn.linear_k.weight"), rel(&v, "self_attn.linear_v.weight"));
+        }
         prof::phase::set_stage("mhsa_pos");
         let id_pos = format!("{blk}.pos");
         let pm = self.mm_arena(pos_enc, b, "self_attn.linear_pos.weight", &id_pos)
@@ -348,27 +428,137 @@ impl FastConformerEncoder {
         // RESIDENT MHA (opt-in PARAKEET_RESIDENT_MHA=1): replace the host per-head
         // scores/rel_shift/softmax/context with the on-chip STEP=8 block, one dispatch per head.
         // The kernel bakes inv_scale=1/sqrt(128), so pass qu=qh+u / qv=qh+v / k / p / v directly.
+        // The resident relpos block is baked at RELPOS_BUILT_T (=172); it cannot serve longer clips.
+        // Gate on t <= relpos_max_t() PER-CLIP: a T>BUILT_T clip skips the resident per-head loop and
+        // falls through to the host attention path below (whole-block golden), so no crash/corruption.
         #[cfg(feature = "npu")]
-        if std::env::var("PARAKEET_RESIDENT_MHA").is_ok() {
+        if std::env::var("PARAKEET_RESIDENT_MHA").is_ok()
+            && self.npu.as_ref().map(|n| t <= n.relpos_max_t()).unwrap_or(false) {
             if let Some(npu) = &self.npu {
                 let _h = PhaseScope::new("mhsa_resident", Bucket::Npu);
-                let mut ctx = Array2::<f32>::zeros((t, d));
-                for hh in 0..h {
-                    let col = hh * dk;
-                    let qh = q.slice(s![.., col..col + dk]);
-                    let kh = k.slice(s![.., col..col + dk]).to_owned();
-                    let ph = pm.slice(s![.., col..col + dk]).to_owned();
-                    let vh = v.slice(s![.., col..col + dk]).to_owned();
-                    let mut qu = qh.to_owned();
-                    let mut qv = qh.to_owned();
-                    for i in 0..t {
-                        for c in 0..dk {
-                            qu[[i, c]] += ubias[[hh, c]];
-                            qv[[i, c]] += vbias[[hh, c]];
+                // Phase-2: ALL h heads in ONE dispatch (h parallel cores) -> ctx [t, d].
+                let ctx = npu.relpos_mha_batched(&q, &k, &pm, &v, &ubias, &vbias);
+                // A/B localizer (PARAKEET_MHA_AB=1): compare resident ctx vs f32 host golden for
+                // head 0 AND a non-zero head (parallelism must not change per-head numerics).
+                if std::env::var("PARAKEET_MHA_AB").is_ok() {
+                    for &hh in &[0usize, (h / 2).min(h - 1)] {
+                        let col = hh * dk;
+                        let qh = q.slice(s![.., col..col + dk]);
+                        let kh = k.slice(s![.., col..col + dk]).to_owned();
+                        let ph = pm.slice(s![.., col..col + dk]).to_owned();
+                        let vh = v.slice(s![.., col..col + dk]).to_owned();
+                        let mut qu = qh.to_owned();
+                        let mut qv = qh.to_owned();
+                        for i in 0..t {
+                            for c in 0..dk {
+                                qu[[i, c]] += ubias[[hh, c]];
+                                qv[[i, c]] += vbias[[hh, c]];
+                            }
+                        }
+                        let ch = ctx.slice(s![.., col..col + dk]).to_owned();
+                        let pp = ph.nrows();
+                        let ac = qu.dot(&kh.t()); // [T,T]
+                        let mut bd_all1 = Array3::<f32>::zeros((1, t, pp));
+                        bd_all1.slice_mut(s![0, .., ..]).assign(&qv.dot(&ph.t()));
+                        let bd = rel_shift(&bd_all1, t); // [1,T,T]
+                        let mut scores = Array2::<f32>::zeros((t, t));
+                        for i in 0..t {
+                            let mut mx = f32::NEG_INFINITY;
+                            for j in 0..t { let sc = (ac[[i, j]] + bd[[0, i, j]]) / scale; scores[[i, j]] = sc; mx = mx.max(sc); }
+                            let mut sum = 0.0;
+                            for j in 0..t { let e = (scores[[i, j]] - mx).exp(); scores[[i, j]] = e; sum += e; }
+                            for j in 0..t { scores[[i, j]] /= sum; }
+                        }
+                        let ch_host = scores.dot(&vh); // [T,DK]
+                        let mut num = 0.0f64; let mut den = 0.0f64; let mut maxrow = (0usize, 0.0f64);
+                        for i in 0..t {
+                            let mut rn = 0.0f64; let mut rd = 0.0f64;
+                            for c in 0..dk {
+                                let d = (ch[[i, c]] - ch_host[[i, c]]) as f64; let g = ch_host[[i, c]] as f64;
+                                rn += d * d; rd += g * g;
+                            }
+                            num += rn; den += rd;
+                            let rrel = if rd > 0.0 { (rn / rd).sqrt() } else { 0.0 };
+                            if rrel > maxrow.1 { maxrow = (i, rrel); }
+                        }
+                        eprintln!("[MHA_AB] blk={blk} h{hh} T={t} ctx_relL2={:.4e} worst_row={} row_relL2={:.4e}",
+                            (num / den).sqrt(), maxrow.0, maxrow.1);
+
+                      // ---- PROBE (Ladder step 1, head-0 only): decompose the ~1% bf16 I/O quantization. Feed
+                        // bf16-rounded operands into the SAME f32 host golden and measure ctx rel-L2
+                        // vs pure-f32 (ch_host). Pure host math, no device -- isolates which rounding
+                        // hop (AC inputs / BD inputs / probs narrow / V narrow / ctx-out narrow) owns
+                        // the gap, and whether the full emulation reproduces the resident ~1.05e-2.
+                        if hh == 0 {
+                            let rb = |x: f32| npu_xrt::bf16_bits_to_f32(npu_xrt::f32_to_bf16_bits(x));
+                            let rl2 = |a: &Array2<f32>| -> f64 {
+                                let mut n = 0f64; let mut dd = 0f64;
+                                for i in 0..t { for c in 0..dk {
+                                    let e = (a[[i, c]] - ch_host[[i, c]]) as f64; let g = ch_host[[i, c]] as f64;
+                                    n += e * e; dd += g * g;
+                                } }
+                                if dd > 0.0 { (n / dd).sqrt() } else { 0.0 }
+                            };
+                            // f32 attention over (possibly bf16-rounded) operands; rprobs/rout narrow.
+                            let fwd = |qu_: &Array2<f32>, qv_: &Array2<f32>, kh_: &Array2<f32>,
+                                       ph_: &Array2<f32>, vh_: &Array2<f32>, rprobs: bool, rout: bool| -> Array2<f32> {
+                                let ac = qu_.dot(&kh_.t());
+                                let mut bd3 = Array3::<f32>::zeros((1, t, ph_.nrows()));
+                                bd3.slice_mut(s![0, .., ..]).assign(&qv_.dot(&ph_.t()));
+                                let bd = rel_shift(&bd3, t);
+                                let mut probs = Array2::<f32>::zeros((t, t));
+                                for i in 0..t {
+                                    let mut mx = f32::NEG_INFINITY;
+                                    for j in 0..t { let sc = (ac[[i, j]] + bd[[0, i, j]]) / scale; probs[[i, j]] = sc; mx = mx.max(sc); }
+                                    let mut sum = 0.0;
+                                    for j in 0..t { let e = (probs[[i, j]] - mx).exp(); probs[[i, j]] = e; sum += e; }
+                                    let inv = 1.0 / sum;
+                                    for j in 0..t { let mut pv = probs[[i, j]] * inv; if rprobs { pv = rb(pv); } probs[[i, j]] = pv; }
+                                }
+                                let mut out = probs.dot(vh_);
+                                if rout { out.mapv_inplace(|x| rb(x)); }
+                                out
+                            };
+                            let qu_b = qu.mapv(|x| rb(x)); let qv_b = qv.mapv(|x| rb(x));
+                            let kh_b = kh.mapv(|x| rb(x)); let ph_b = ph.mapv(|x| rb(x));
+                            let vh_b = vh.mapv(|x| rb(x));
+                            let bd_in  = rl2(&fwd(&qu, &qv_b, &kh, &ph_b, &vh, false, false));
+                            let bd_qv  = rl2(&fwd(&qu, &qv_b, &kh, &ph, &vh, false, false));
+                            let bd_p   = rl2(&fwd(&qu, &qv, &kh, &ph_b, &vh, false, false));
+                            let emul   = rl2(&fwd(&qu_b, &qv_b, &kh_b, &ph_b, &vh_b, true, true));
+                            // Split-bf16 emulation of the BD (qv.p^T) matmul: hi=bf16(x), lo=bf16(x-hi).
+                            // A@B = Ahi.Bhi + Ahi.Blo + Alo.Bhi (+Alo.Blo), each an exact bf16-input dot.
+                            // The rest of the pipeline stays at emul precision (AC bf16-in, probs/V/ctx bf16).
+                            let lo = |x: &Array2<f32>, hi: &Array2<f32>| -> Array2<f32> {
+                                let mut r = x - hi; r.mapv_inplace(|z| rb(z)); r
+                            };
+                            let qv_lo = lo(&qv, &qv_b); let ph_lo = lo(&ph, &ph_b);
+                            // full-pipeline fwd but with a caller-supplied precomputed BD [t, P] (pre-shift).
+                            let fwd_bd = |bd_full: &Array2<f32>| -> Array2<f32> {
+                                let ac = qu_b.dot(&kh_b.t());
+                                let mut bd3 = Array3::<f32>::zeros((1, t, bd_full.ncols()));
+                                bd3.slice_mut(s![0, .., ..]).assign(bd_full);
+                                let bd = rel_shift(&bd3, t);
+                                let mut probs = Array2::<f32>::zeros((t, t));
+                                for i in 0..t {
+                                    let mut mx = f32::NEG_INFINITY;
+                                    for j in 0..t { let sc = (ac[[i, j]] + bd[[0, i, j]]) / scale; probs[[i, j]] = sc; mx = mx.max(sc); }
+                                    let mut sum = 0.0;
+                                    for j in 0..t { let e = (probs[[i, j]] - mx).exp(); probs[[i, j]] = e; sum += e; }
+                                    let inv = 1.0 / sum;
+                                    for j in 0..t { probs[[i, j]] = rb(probs[[i, j]] * inv); }
+                                }
+                                let mut out = probs.dot(&vh_b); out.mapv_inplace(|x| rb(x)); out
+                            };
+                            // bd_x2p: split p only (qv single bf16)  -> qv_b.(ph_hi+ph_lo)
+                            let bd_x2p = &qv_b.dot(&ph_b.t()) + &qv_b.dot(&ph_lo.t());
+                            // bd_x3: split both, drop lo.lo -> qv_b.ph_hi + qv_b.ph_lo + qv_lo.ph_hi
+                            let bd_x3 = &(&qv_b.dot(&ph_b.t()) + &qv_b.dot(&ph_lo.t())) + &qv_lo.dot(&ph_b.t());
+                            let split_p  = rl2(&fwd_bd(&bd_x2p));
+                            let split_x3 = rl2(&fwd_bd(&bd_x3));
+                            eprintln!("[MHA_PROBE] blk={blk} h0 T={t} bd_in={bd_in:.4e} bd_qv={bd_qv:.4e} bd_p={bd_p:.4e} emul_full={emul:.4e} FIX_split_p={split_p:.4e} FIX_split_x3={split_x3:.4e}");
                         }
                     }
-                    let ch = npu.relpos_mha(&qu, &qv, &kh, &ph, &vh);
-                    ctx.slice_mut(s![.., col..col + dk]).assign(&ch);
                 }
                 prof::phase::set_stage("mhsa_qkv");
                 return ctx; // merged [T,D]; linear_out applied by the caller (mhsa / mhsa_dev)
@@ -470,18 +660,21 @@ impl FastConformerEncoder {
         let b = self.w.block(blk);
         let d = self.cfg.hidden;
         let t = x.nrows();
-        // RESIDENT conv module is DEFAULT-ON (opt out PARAKEET_RESIDENT_CONV=0 -> full host conv). The whole
-        // module runs resident: LN -> pw1 (modal GEMM) -> GLU -> dwconv -> silu (time-major [T,D], transposes
-        // dissolved) -> pw2 (modal GEMM), the activation stream never touching host across the frontier.
-        // The on-NPU SiLU is also default-on; opt out PARAKEET_RESIDENT_SILU=0 to fall back to HOST silu (the
-        // clean WER-8.2 reference path, kept for the future WER-refinement pass). ~8.5 is the accepted resident
-        // baseline; silu precision is WER-irrelevant (the 8.2 vs 8.5 delta is a host-silu 17-clip decoder-chaos
-        // artifact, not a brick defect). The stack_size root-cause that once blocked the exact on-NPU silu is
-        // fixed (see silu-stack-overflow-root-cause-and-wer-reframe).
+        // RESIDENT conv module: the whole module can run resident -- LN -> pw1 (modal GEMM) -> GLU ->
+        // dwconv -> silu (time-major [T,D], transposes dissolved) -> pw2 (modal GEMM), the activation
+        // stream never touching host across the frontier. On-NPU SiLU is part of it.
+        //
+        // OPT-IN (PARAKEET_RESIDENT_CONV=1 / PARAKEET_RESIDENT_SILU=1). The originating branch had
+        // these DEFAULT-ON, flipped on a 17-clip WER read (RU 8.5 / EN 8.6 / ALL 8.5). That flip is
+        // held back deliberately and is NOT part of this merge, for two reasons: a shipped-default
+        // flip is an owner decision, and the 17-clip greedy WER gate is chaotic at ~1e-5 -- it cannot
+        // validate a device change of this kind, so it is the wrong instrument to flip on. The
+        // capability lands here in full; flipping the default is a two-line change once a rel-L2
+        // -vs-shipped number or a larger eval backs it.
         #[cfg(feature = "npu")]
-        let resident_conv = std::env::var("PARAKEET_RESIDENT_CONV").map(|v| v != "0").unwrap_or(true);
+        let resident_conv = std::env::var("PARAKEET_RESIDENT_CONV").map(|v| v != "0").unwrap_or(false);
         #[cfg(feature = "npu")]
-        let resident_silu = std::env::var("PARAKEET_RESIDENT_SILU").map(|v| v != "0").unwrap_or(true);
+        let resident_silu = std::env::var("PARAKEET_RESIDENT_SILU").map(|v| v != "0").unwrap_or(false);
         // conv_wprep: materialize + reshape the (T'-independent) conv weights for mm(). The pointwise
         // conv1/conv2 weights (pw1/pw2) feed a cached NPU weight BO, so they are now materialized
         // LAZILY inside mm_lazy's closure (whole `b.m3(..).index_axis(..).to_owned().t().to_owned()`
@@ -677,11 +870,9 @@ impl FastConformerEncoder {
             let _h = PhaseScope::new("residual", Bucket::Host);
             x = x + ff1.mapv(|v| 0.5 * v); // macaron 0.5 scaling + residual add
         }
-        let satt_in = prof::time("ln", || {
-            let _h = PhaseScope::new("ln", Bucket::Host);
-            layernorm(&x, &b.v("norm_self_att.weight"), &b.v("norm_self_att.bias"))
-        });
-        let mhsa_out = prof::time("mhsa", || self.mhsa(&satt_in, blk, pos_enc));
+        // mhsa now does its own norm_self_att LN (resident LN->QKV seam or host fallback), so pass
+        // pre-LN x -- mirroring conv_module. The residual below still adds mhsa_out to pre-LN x.
+        let mhsa_out = prof::time("mhsa", || self.mhsa(&x, blk, pos_enc));
         {
             let _h = PhaseScope::new("residual", Bucket::Host);
             x = &x + &mhsa_out;

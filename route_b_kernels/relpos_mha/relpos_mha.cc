@@ -940,6 +940,44 @@ extern "C" void relpos_stream_dot_p(bfloat16 *restrict Aq, bfloat16 *restrict Bb
   event1();
 }
 
+// COLUMN-SLICE dot-matmul that ADDS into out (the split-bf16 2nd pass): out[il, j0+jj]
+// += dot(A[il,:DK], Bblk[jj,:DK]). Identical bf16-in / f32-accfloat numerics to
+// relpos_dot_block; ONLY the store is `+=` instead of `=`. Used for BD = qv.(p_hi+p_lo):
+// the p_hi p-blocks fill BD (relpos_dot_block, overwrite), then the p_lo p-blocks ADD their
+// contribution here -- recovering ~f32 precision of the POSITIONAL operand p, which the
+// decomposition probe pinned as the SOLE ~1% attention-precision sink (bd_p owns the gap;
+// qv/k/V round fine). p is fed as two bf16 streams p_hi=bf16(p), p_lo=bf16(p-p_hi).
+static inline void relpos_dot_block_acc(const bfloat16 *restrict A,
+                                        const bfloat16 *restrict Bblk,
+                                        float *restrict out, int Tq, int kb, int j0,
+                                        int ncol) {
+  static_assert(DK % VL == 0, "DK must be a multiple of the vector width");
+  for (int il = 0; il < Tq; il++) {
+    const bfloat16 *a_row = A + il * DK;
+    float *o_row = out + il * ncol + j0;
+    for (int jj = 0; jj < kb; jj++) {
+      const bfloat16 *b_row = Bblk + jj * DK;
+      aie::accum<accfloat, VL> acc = aie::zeros<accfloat, VL>();
+      for (int d = 0; d < DK; d += VL) {
+        aie::vector<bfloat16, VL> av = aie::load_v<VL>(a_row + d);
+        aie::vector<bfloat16, VL> bv = aie::load_v<VL>(b_row + d);
+        acc = aie::mac(acc, av, bv);
+      }
+      o_row[jj] += aie::reduce_add(acc.to_vector<float>()); // ADD the p_lo partial
+    }
+  }
+}
+
+// STEP-8 split-bf16 p_lo pass: BD += qv @ p_lo^T (column-slice, ADDS into g_bd). Distinct
+// symbol from relpos_stream_dot_p so the generator can declare it as a separate Kernel.
+extern "C" void relpos_stream_dot_p_lo(bfloat16 *restrict Aq, bfloat16 *restrict Bblk,
+                                       float *restrict out, int32_t Tq, int32_t pb,
+                                       int32_t j0, int32_t ncol) {
+  event0();
+  relpos_dot_block_acc(Aq, Bblk, out, Tq, pb, j0, ncol);
+  event1();
+}
+
 extern "C" void relpos_stream_ctx_zero(float *restrict ctxf, int32_t Tq) {
   relpos_ctx_zero(ctxf, Tq);
 }

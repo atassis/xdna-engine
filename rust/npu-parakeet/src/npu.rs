@@ -56,14 +56,14 @@ struct NStream {
     bo_c: Bo, // [PAD_M, n] f32
 }
 
-// Resident relpos-MHA block (STEP=8, STEP-C runtime-t_active). ONE xclbin sized for the MAX
-// frame count RELPOS_BUILT_T serves ANY clip T <= it: the softmax reads t_active from an RTP
-// baked into the instruction stream at word RELPOS_TACTIVE_WORD, so per clip we PATCH that one
-// word of a template insts (zero build) and pad k/p/V to RELPOS_BUILT_T. Loaded once, resident.
+// Resident relpos-MHA block (STEP=8, STEP-C runtime-t_active). An xclbin sized for a bucket's
+// BUILT_T serves ANY clip T <= it: the softmax reads t_active from RTP words baked into the
+// instruction stream, so per clip we PATCH those words of a template insts (zero build) and pad
+// k/p/V to that bucket's BUILT_T. Loaded once per bucket, resident. See RELPOS_BUCKETS below --
+// it carries the per-bucket (BUILT_T, KB, subdir); the old single-block RELPOS_BUILT_T/RELPOS_KB/
+// RELPOS_TACTIVE_WORD constants went away with the per-head `relpos_mha` the buckets replaced.
 const RELPOS_TQ: usize = 8;
-const RELPOS_KB: usize = 43;
 const RELPOS_DK: usize = 128;   // Parakeet head_dim (kernel bakes DK=128)
-const RELPOS_BUILT_T: usize = 172; // baked buffer/dataflow size of the single xclbin
 
 // 8-head relpos-MHA CONVEYOR (opt-in PARAKEET_CONVEYOR_MHA=1). Real Parakeet dims, must match the
 // conveyor_attn_iron.py 8-head build: TQ=8, DK=128, T padded 172->176 (a VL(16) multiple), GJ=4
@@ -93,19 +93,38 @@ impl BdCarry {
     fn factor(self) -> usize { match self { BdCarry::Plain => 1, BdCarry::Split => 2 } }
     fn name(self) -> &'static str { match self { BdCarry::Plain => "plain-bf16", BdCarry::Split => "split-bf16" } }
 }
-const RELPOS_TACTIVE_WORD: usize = 8; // insts word holding t_active (verified device-side)
+
+// --- Phase-2 spatial-parallel relpos (opt-in PARAKEET_RESIDENT_MHA) -----------------------------
+// Independent of the CONVEYOR above: that path loads via `conveyor_block` behind
+// PARAKEET_CONVEYOR_MHA, this one via `relpos_block` behind PARAKEET_RESIDENT_MHA. Both are kept.
+// This path carries the positional operand as SPLIT bf16 (p_hi + p_lo), preserving the WER-critical
+// precision the shipped relpos block uses; the conveyor's BD-in-belt defaults to plain bf16.
+//
+// T-bucketing: dispatch the SMALLEST bucket whose BUILT_T >= this clip's T, so short clips run a
+// smaller padded dataflow.
+const RELPOS_BUCKETS: &[(usize, usize, &str)] = &[
+    (100, 25, "bucket_100"), // short clips (T<=100): ~29% less relpos padding compute (measured)
+    (152, 38, "bucket_152"), // mid clips (100<T<=152): ~12% less padding vs the 172 ceiling
+    (172, 43, "single"),     // ceiling bucket; serves any T in (152, 172]
+];
+// The H=8 attention heads run on H PARALLEL cores (one head/core), ONE dispatch/block. The BOs
+// concatenate all H heads; each head's Worker reads/writes its own slice via a per-head shim OFFSET
+// tap. The insts template holds H t_active words (one per head's RTP write), all == RELPOS_BUILT_T
+// at build; per clip we patch EVERY word == BUILT_T to t.
+const RELPOS_HEADS: usize = 8; // = Parakeet n_heads; must match the xclbin's --heads build
 
 /// The single resident relpos block (built at RELPOS_BUILT_T). BOs are sized for BUILT_T; per
 /// dispatch we patch the instr template's t_active word and pad data to BUILT_T. Dispatched per
 /// head via run_dwconv6(3, instr, n, quv, kpv, ctx).
 struct RelposK {
     kern: Rc<Kernel>,
-    instr_template: Vec<u32>, // insts as u32 words; word[RELPOS_TACTIVE_WORD] = t_active (patched)
+    instr_template: Vec<u32>, // insts as u32 words; every word == BUILT_T is a per-head t_active (patched)
     n_instr: usize,
     bo_instr: Bo,
     bo_quv: Bo,
     bo_kpv: Bo,
     bo_ctx: Bo,
+    built_t: usize,  // this bucket's baked BUILT_T (t_active words in the template == this; patched per clip)
     n_qt: usize,     // ceil(BUILT_T/TQ)
     tp: usize,       // k/V padded rows (n_kb*KB for BUILT_T)
     pp: usize,       // p padded rows (n_pb*KB for BUILT_T)
@@ -445,42 +464,6 @@ impl NpuMatmul {
         }
     }
 
-    /// Load (once) the SINGLE resident relpos block built at RELPOS_BUILT_T. Reads the xclbin +
-    /// template insts from {root}/artifacts/relpos/single/ (pre-build: scripts/relpos_prebuild.sh).
-    /// The same xclbin serves any clip T <= BUILT_T; per dispatch we patch the insts t_active word.
-    fn relpos_block(&self) -> Rc<RelposK> {
-        if let Some(k) = self.relpos.borrow().get(&RELPOS_BUILT_T) {
-            return k.clone();
-        }
-        let bt = RELPOS_BUILT_T;
-        let p = 2 * bt - 1;
-        let cdiv = |a: usize, b: usize| (a + b - 1) / b;
-        let n_qt = cdiv(bt, RELPOS_TQ);
-        let tp = cdiv(bt, RELPOS_KB) * RELPOS_KB;
-        let pp = cdiv(p, RELPOS_KB) * RELPOS_KB;
-        let ctx_rows = n_qt * RELPOS_TQ;
-        let dir = self.relpos_dir.join("single");
-        let xclbin = dir.join("final.xclbin");
-        let insts = dir.join("insts.bin");
-        let kern = self
-            .dev
-            .load_kernel(xclbin.to_str().unwrap(), None)
-            .unwrap_or_else(|e| panic!("load relpos single ({}): {e:?}\n  pre-build: scripts/relpos_prebuild.sh", xclbin.display()));
-        let ib = std::fs::read(&insts).unwrap_or_else(|e| panic!("read {}: {e}", insts.display()));
-        let instr_template: Vec<u32> = ib
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
-        let n_instr = instr_template.len();
-        let g = |i| kern.group_id(i).unwrap();
-        let bo_instr = self.dev.alloc_bo(&kern, ib.len(), FLAG_CACHEABLE, g(1)).unwrap();
-        let bo_quv = self.dev.alloc_bo(&kern, 2 * n_qt * RELPOS_TQ * RELPOS_DK * 2, FLAG_HOST_ONLY, g(3)).unwrap();
-        let bo_kpv = self.dev.alloc_bo(&kern, (tp + pp + tp) * RELPOS_DK * 2, FLAG_HOST_ONLY, g(4)).unwrap();
-        let bo_ctx = self.dev.alloc_bo(&kern, ctx_rows * RELPOS_DK * 2, FLAG_HOST_ONLY, g(5)).unwrap();
-        let rk = Rc::new(RelposK { kern, instr_template, n_instr, bo_instr, bo_quv, bo_kpv, bo_ctx, n_qt, tp, pp, ctx_rows });
-        self.relpos.borrow_mut().insert(RELPOS_BUILT_T, rk.clone());
-        rk
-    }
 
     /// Load (once) the 8-head relpos CONVEYOR built at CONV_BUILT_T by scripts/conveyor_prebuild.sh
     /// into {root}/artifacts/conveyor/single/. Static insts (no per-clip t_active patch), 4-BO ABI.
@@ -514,34 +497,139 @@ impl NpuMatmul {
         ck
     }
 
-    /// Resident relpos-MHA block for ONE head. qu/qv/k [t,DK], p [2t-1,DK], v [t,DK] (f32) ->
-    /// ctx [t,DK] (f32), t <= RELPOS_BUILT_T. STEP-C: pad the stream layout to BUILT_T, PATCH the
-    /// insts t_active word to `t`, dispatch the single resident block (3-BO ABI), unpack bf16 CTX.
-    pub fn relpos_mha(&self, qu: &Array2<f32>, qv: &Array2<f32>, k: &Array2<f32>, p: &Array2<f32>, v: &Array2<f32>) -> Array2<f32> {
-        let t = qu.nrows();
-        assert!(t <= RELPOS_BUILT_T, "clip T={t} exceeds relpos BUILT_T={RELPOS_BUILT_T}");
-        let rk = self.relpos_block();
-        // QUV tile-interleaved over the BUILT_T tiles; real rows only where q0 < t (rest zero pad).
-        let mut quv = Vec::<f32>::with_capacity(2 * rk.n_qt * RELPOS_TQ * RELPOS_DK);
-        for q in 0..rk.n_qt {
-            let q0 = q * RELPOS_TQ;
-            let take = RELPOS_TQ.min(t.saturating_sub(q0));
-            push_pad_rows(&mut quv, qu, q0, take, RELPOS_TQ);
-            push_pad_rows(&mut quv, qv, q0, take, RELPOS_TQ);
+    /// Max clip length T the resident relpos block can serve (the largest bucket's baked BUILT_T).
+    /// Callers MUST gate the resident MHA path on `t <= relpos_max_t()` and fall back to the host
+    /// attention for longer clips -- the resident BOs/dataflow are sized for BUILT_T and cannot serve
+    /// T beyond it.
+    pub fn relpos_max_t(&self) -> usize { RELPOS_BUCKETS.last().unwrap().0 }
+
+    /// Pick the SMALLEST bucket whose BUILT_T >= t (RELPOS_BUCKETS is ascending). Panics only if t
+    /// exceeds the ceiling bucket -- callers gate on relpos_max_t() first.
+    /// A/B toggle: PARAKEET_RELPOS_NO_BUCKET=1 forces the ceiling bucket for EVERY clip (the pre-
+    /// T-bucketing baseline), so one binary runs the rigorous same-session A/B (no rebuild drift).
+    fn relpos_bucket_for(t: usize) -> (usize, usize, &'static str) {
+        if std::env::var_os("PARAKEET_RELPOS_NO_BUCKET").is_some() {
+            return *RELPOS_BUCKETS.last().unwrap();
         }
-        // KPV = k(pad tp) | p(pad pp) | V(pad tp); pad rows are zero so ctx ignores pad keys.
-        let mut kpv = Vec::<f32>::with_capacity((rk.tp + rk.pp + rk.tp) * RELPOS_DK);
-        push_pad_rows(&mut kpv, k, 0, t, rk.tp);
-        push_pad_rows(&mut kpv, p, 0, p.nrows(), rk.pp);
-        push_pad_rows(&mut kpv, v, 0, t, rk.tp);
+        // A/B toggle: PARAKEET_RELPOS_2BUCKET=1 uses only the first + ceiling bucket (skips the mids),
+        // so one binary A/Bs {100,172} vs the full {100,152,172} same-session (measure the mid bucket).
+        let two = std::env::var_os("PARAKEET_RELPOS_2BUCKET").is_some();
+        let last = RELPOS_BUCKETS.len() - 1;
+        RELPOS_BUCKETS.iter().enumerate()
+            .filter(|(i, _)| !two || *i == 0 || *i == last)
+            .map(|(_, b)| b)
+            .find(|(bt, _, _)| *bt >= t)
+            .copied()
+            .unwrap_or_else(|| panic!("clip T={t} exceeds relpos ceiling BUILT_T={}", RELPOS_BUCKETS.last().unwrap().0))
+    }
+
+    /// Load (once) the resident relpos block for one T-bucket (BUILT_T, KB, subdir). Reads the xclbin +
+    /// template insts from {root}/artifacts/relpos/{subdir}/ (pre-build: scripts/relpos_prebuild.sh).
+    /// The bucket serves any clip T <= its BUILT_T; per dispatch we patch the insts t_active word.
+    /// Cached in `self.relpos` keyed by BUILT_T so each bucket loads once and stays co-resident.
+    fn relpos_block(&self, bt: usize, kb: usize, subdir: &str) -> Rc<RelposK> {
+        if let Some(k) = self.relpos.borrow().get(&bt) {
+            return k.clone();
+        }
+        let p = 2 * bt - 1;
+        let cdiv = |a: usize, b: usize| (a + b - 1) / b;
+        let n_qt = cdiv(bt, RELPOS_TQ);
+        let tp = cdiv(bt, kb) * kb;
+        let pp = cdiv(p, kb) * kb;
+        let ctx_rows = n_qt * RELPOS_TQ;
+        let dir = self.relpos_dir.join(subdir);
+        let xclbin = dir.join("final.xclbin");
+        let insts = dir.join("insts.bin");
+        let kern = self
+            .dev
+            .load_kernel(xclbin.to_str().unwrap(), None)
+            .unwrap_or_else(|e| panic!("load relpos bucket {bt} ({}): {e:?}\n  pre-build: scripts/relpos_prebuild.sh", xclbin.display()));
+        let ib = std::fs::read(&insts).unwrap_or_else(|e| panic!("read {}: {e}", insts.display()));
+        let instr_template: Vec<u32> = ib
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let n_instr = instr_template.len();
+        let g = |i| kern.group_id(i).unwrap();
+        let bo_instr = self.dev.alloc_bo(&kern, ib.len(), FLAG_CACHEABLE, g(1)).unwrap();
+        // BOs concatenate all RELPOS_HEADS heads (head h at slice h*head_len). One dispatch fills
+        // all H heads; the generator scatters each head's slice to its own core via an offset tap.
+        let bo_quv = self.dev.alloc_bo(&kern, RELPOS_HEADS * 2 * n_qt * RELPOS_TQ * RELPOS_DK * 2, FLAG_HOST_ONLY, g(3)).unwrap();
+        // SPLITP: kpv is k | p_hi | p_lo | V (the positional operand p split-bf16 for ~f32
+        // BD precision -- the resident-MHA WER fix). Two padded p-sections (2*pp). Per-head, x H.
+        let bo_kpv = self.dev.alloc_bo(&kern, RELPOS_HEADS * (tp + pp + pp + tp) * RELPOS_DK * 2, FLAG_HOST_ONLY, g(4)).unwrap();
+        let bo_ctx = self.dev.alloc_bo(&kern, RELPOS_HEADS * ctx_rows * RELPOS_DK * 2, FLAG_HOST_ONLY, g(5)).unwrap();
+        let rk = Rc::new(RelposK { kern, instr_template, n_instr, bo_instr, bo_quv, bo_kpv, bo_ctx, built_t: bt, n_qt, tp, pp, ctx_rows });
+        self.relpos.borrow_mut().insert(bt, rk.clone());
+        rk
+    }
+
+    /// Resident relpos-MHA block for ALL RELPOS_HEADS heads in ONE dispatch (H parallel cores, one
+    /// head/core). q/k/v are [t, D=H*DK], pm is [P=2t-1, D], ubias/vbias are [H, DK]. Returns ctx
+    /// [t, D] with head h in columns [h*DK..(h+1)*DK]. t <= RELPOS_BUILT_T. STEP-C: pad each head's
+    /// stream to BUILT_T, PATCH every t_active word of the insts template (one per head's RTP) to t,
+    /// dispatch the single resident block (3-BO ABI, all H heads concatenated), unpack bf16 CTX.
+    /// This REPLACES the old per-head loop (H sequential dispatches on 1 core) with 1 dispatch that
+    /// runs the H heads in parallel -- the Phase-2 perf rework.
+    pub fn relpos_mha_batched(&self, q: &Array2<f32>, k: &Array2<f32>, pm: &Array2<f32>,
+                              v: &Array2<f32>, ubias: &Array2<f32>, vbias: &Array2<f32>) -> Array2<f32> {
+        let t = q.nrows();
+        let d = q.ncols();
+        let dk = RELPOS_DK;
+        let h = RELPOS_HEADS;
+        assert_eq!(d, h * dk, "hidden D must be RELPOS_HEADS*RELPOS_DK");
+        // T-bucketing: dispatch the SMALLEST bucket whose BUILT_T >= this clip's T, so short clips run
+        // a smaller padded dataflow (less wasted relpos padding compute). Callers gate on relpos_max_t().
+        let (bt, kb, subdir) = Self::relpos_bucket_for(t);
+        let rk = self.relpos_block(bt, kb, subdir);
+        assert!(t <= rk.built_t, "clip T={t} exceeds relpos bucket BUILT_T={}", rk.built_t);
+        let quv_head = 2 * rk.n_qt * RELPOS_TQ * RELPOS_DK;
+        let kpv_head = (rk.tp + rk.pp + rk.pp + rk.tp) * RELPOS_DK;
+        // Concatenate all H heads' quv / kpv (head hh at slice hh*head_len -- the generator scatters
+        // each slice to its own core). Per head: QUV tile-interleaved [qu_t0,qv_t0,...]; KPV = k(pad
+        // tp) | p_hi(pad pp) | p_lo(pad pp) | V(pad tp) with p split-bf16 (SPLITP: p_hi=bf16(p),
+        // p_lo=bf16(p-p_hi); BD=qv.p_hi+qv.p_lo recovers ~f32 p -- the probe-localized ~1% sink).
+        let mut quv = Vec::<f32>::with_capacity(h * quv_head);
+        let mut kpv = Vec::<f32>::with_capacity(h * kpv_head);
+        for hh in 0..h {
+            let col = hh * dk;
+            let qh = q.slice(s![.., col..col + dk]);
+            let kh = k.slice(s![.., col..col + dk]).to_owned();
+            let ph = pm.slice(s![.., col..col + dk]).to_owned();
+            let vh = v.slice(s![.., col..col + dk]).to_owned();
+            let mut qu = qh.to_owned();
+            let mut qv = qh.to_owned();
+            for i in 0..t {
+                for c in 0..dk {
+                    qu[[i, c]] += ubias[[hh, c]];
+                    qv[[i, c]] += vbias[[hh, c]];
+                }
+            }
+            for qi in 0..rk.n_qt {
+                let q0 = qi * RELPOS_TQ;
+                let take = RELPOS_TQ.min(t.saturating_sub(q0));
+                push_pad_rows(&mut quv, &qu, q0, take, RELPOS_TQ);
+                push_pad_rows(&mut quv, &qv, q0, take, RELPOS_TQ);
+            }
+            let p_lo = ph.mapv(|x| x - npu_xrt::bf16_bits_to_f32(npu_xrt::f32_to_bf16_bits(x)));
+            push_pad_rows(&mut kpv, &kh, 0, t, rk.tp);
+            push_pad_rows(&mut kpv, &ph, 0, ph.nrows(), rk.pp);
+            push_pad_rows(&mut kpv, &p_lo, 0, ph.nrows(), rk.pp);
+            push_pad_rows(&mut kpv, &vh, 0, t, rk.tp);
+        }
         let mut qb = vec![0u16; quv.len()];
         let mut kb = vec![0u16; kpv.len()];
         npu_xrt::pack_f32_to_bf16(&quv, &mut qb);
         npu_xrt::pack_f32_to_bf16(&kpv, &mut kb);
         let t0 = Instant::now();
-        // STEP-C: patch the instruction stream's t_active word to this clip's T, then upload.
+        // STEP-C: patch EVERY t_active word (one per head's RTP, all == BUILT_T in the template) to
+        // this clip's t. All H heads share the clip's single t_active. (prebuild asserts count==H.)
         let mut insts = rk.instr_template.clone();
-        insts[RELPOS_TACTIVE_WORD] = t as u32;
+        for w in insts.iter_mut() {
+            if *w == rk.built_t as u32 {
+                *w = t as u32;
+            }
+        }
         let instr_bytes: Vec<u8> = insts.iter().flat_map(|w| w.to_le_bytes()).collect();
         rk.bo_instr.write_bytes(&instr_bytes).unwrap();
         rk.bo_instr.sync_to_device().unwrap();
@@ -556,18 +644,89 @@ impl NpuMatmul {
             s.dispatch_s += t0.elapsed().as_secs_f64();
             s.dispatches += 1;
         }
-        let mut cb = vec![0u8; rk.ctx_rows * RELPOS_DK * 2];
+        let mut cb = vec![0u8; h * rk.ctx_rows * RELPOS_DK * 2];
         rk.bo_ctx.read_bytes(&mut cb).unwrap();
-        let mut ctx = Array2::<f32>::zeros((t, RELPOS_DK));
-        for i in 0..t {
-            for d in 0..RELPOS_DK {
-                let off = (i * RELPOS_DK + d) * 2;
-                let u = u16::from_le_bytes([cb[off], cb[off + 1]]);
-                ctx[[i, d]] = f32::from_bits((u as u32) << 16);
+        // Unpack: head hh's ctx (first t of ctx_rows) -> columns [hh*DK..(hh+1)*DK] of [t, D].
+        let mut ctx = Array2::<f32>::zeros((t, d));
+        for hh in 0..h {
+            let base = hh * rk.ctx_rows * RELPOS_DK;
+            let col = hh * dk;
+            for i in 0..t {
+                for dd in 0..RELPOS_DK {
+                    let off = (base + i * RELPOS_DK + dd) * 2;
+                    let u = u16::from_le_bytes([cb[off], cb[off + 1]]);
+                    ctx[[i, col + dd]] = f32::from_bits((u as u32) << 16);
+                }
             }
         }
         ctx
     }
+
+    /// bf16x2 device-A gate helper (opt-in `PARAKEET_MHA_SPLITA`): run the resident ctxLN+affine and
+    /// return the DEVICE affine_LN(x) in f32 [m, KRES] (read `bo_ln` back + apply the affine on host).
+    /// The caller splits it into A_hi + A_lo (near-f32) and feeds the QKV GEMM twice, testing whether a
+    /// near-f32 device A closes the LN->QKV seam WER gap (host golden `HOSTQKV=1` 8.5 vs full-resident
+    /// bf16-A 8.9). Uses the SAME device ctxLN as `resident_mha_ln_qkv` (so it is faithful to the 8.9
+    /// path's LN), reads no shared default infra, and mutates nothing on the FFN/conv paths.
+    pub fn resident_mha_affine_ln_f32(&self, x: &Array2<f32>, gamma: &[f32], beta: &[f32]) -> Array2<f32> {
+        self.stats.borrow_mut().calls += 1;
+        let m = x.nrows();
+        let rl = self.ln_affine_cast(x, gamma, beta); // device ctxLN -> bo_ln (f32); affine_cast -> bo_bf16
+        rl.bo_ln.sync_from_device().unwrap();
+        let mut cb = vec![0u8; PAD_M * KRES * 4];
+        rl.bo_ln.read_bytes(&mut cb).unwrap();
+        let mut out = Array2::<f32>::zeros((m, KRES));
+        for r in 0..m {
+            for c in 0..KRES {
+                let off = (r * KRES + c) * 4;
+                let ln = f32::from_le_bytes([cb[off], cb[off + 1], cb[off + 2], cb[off + 3]]);
+                out[[r, c]] = ln * gamma[c] + beta[c];
+            }
+        }
+        out
+    }
+
+    /// Resident MHA LN->QKV seam (norm_self_att on-NPU), the MHSA head frontier advance: ctxLN ->
+    /// affine_cast(gamma,beta) -> bf16 affine_LN(x) BO (device-side), then the q/k/v modal GEMMs
+    /// (N=KRES=D identity, no silu) ALL run off that ONE resident bf16 A -- so the host norm_self_att
+    /// LN is off the MHSA frontier. Returns (q,k,v) [t,D] f32, exactly host layernorm(x)@Wq/k/v
+    /// (bf16-class). `pos` is NOT normalized, so it stays a plain mm_lazy in the caller. Requires the
+    /// resident seam (caller gates on resident_ff_available); `idq/idk/idv` key the per-weight BO cache.
+    pub fn resident_mha_ln_qkv<Fq, Fk, Fv>(
+        &self, x: &Array2<f32>, gamma: &[f32], beta: &[f32],
+        make_wq: Fq, idq: &str, make_wk: Fk, idk: &str, make_wv: Fv, idv: &str,
+    ) -> (Array2<f32>, Array2<f32>, Array2<f32>)
+    where
+        Fq: FnOnce() -> Array2<f32>,
+        Fk: FnOnce() -> Array2<f32>,
+        Fv: FnOnce() -> Array2<f32>,
+    {
+        self.stats.borrow_mut().calls += 1;
+        let m = x.nrows();
+        let n = KRES; // q/k/v projections are [D,D]; N = D = KRES
+        // LN + affine cast ONCE -> bo_bf16 = affine_LN(x) bf16 [PAD_M, KRES] (device-resident).
+        let rl = self.ln_affine_cast(x, gamma, beta);
+        let q = self.qkv_proj(&rl.bo_bf16, m, n, make_wq, idq);
+        let k = self.qkv_proj(&rl.bo_bf16, m, n, make_wk, idk);
+        let v = self.qkv_proj(&rl.bo_bf16, m, n, make_wv, idv);
+        (q, k, v)
+    }
+
+    /// One q/k/v modal projection off an ALREADY-resident bf16 A (the shared affine_LN(x)): fetch/build
+    /// the cached [KRES,n] weight BO, then a single identity (no-silu) modal dispatch -> C[m,n] f32.
+    fn qkv_proj<F: FnOnce() -> Array2<f32>>(&self, a_bo: &Bo, m: usize, n: usize, make_w: F, id: &str) -> Array2<f32> {
+        let cached = self.wcache.borrow().get(id).cloned();
+        let wbo = if let Some(bo) = cached {
+            bo
+        } else {
+            let w = make_w();
+            assert_eq!(w.nrows(), KRES, "qkv W nrows {} != {KRES}", w.nrows());
+            assert_eq!(w.ncols(), n, "qkv W ncols {} != {n}", w.ncols());
+            self.weight_bo(id, w.view())
+        };
+        self.dispatch_with_a(a_bo, m, &wbo, n, false)
+    }
+
 
     /// 8-head relpos-MHA CONVEYOR (opt-in PARAKEET_CONVEYOR_MHA=1). Replaces the per-head
     /// `relpos_mha` LOOP (8 dispatches) with ONE 8-head conveyor dispatch (scores(relpos) ->
