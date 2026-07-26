@@ -673,8 +673,7 @@ impl FastConformerEncoder {
         // -vs-shipped number or a larger eval backs it.
         #[cfg(feature = "npu")]
         let resident_conv = std::env::var("PARAKEET_RESIDENT_CONV").map(|v| v != "0").unwrap_or(false);
-        #[cfg(feature = "npu")]
-        let resident_silu = std::env::var("PARAKEET_RESIDENT_SILU").map(|v| v != "0").unwrap_or(false);
+        // (PARAKEET_RESIDENT_SILU is read inside conv_dwconv_silu, which owns the silu decision now.)
         // conv_wprep: materialize + reshape the (T'-independent) conv weights for mm(). The pointwise
         // conv1/conv2 weights (pw1/pw2) feed a cached NPU weight BO, so they are now materialized
         // LAZILY inside mm_lazy's closure (whole `b.m3(..).index_axis(..).to_owned().t().to_owned()`
@@ -749,9 +748,25 @@ impl FastConformerEncoder {
                 glu
             })
         };
+        let back = self.conv_dwconv_silu(&glu, &taps, &dwb);
+        prof::phase::set_stage("conv_pw");
+        // pw2 chain -> [D, D]: materialized lazily; skipped on warm passes.
+        self.mm_lazy(&back, || {
+            let _wp = PhaseScope::new("conv_wprep", Bucket::Marshal);
+            b.m3("conv.pointwise_conv2.weight").index_axis(Axis(2), 0).to_owned().t().to_owned() // [D,D,1]->[D,D]->[D,D]
+        }, &format!("{blk}.pw2"))
+    }
+
+    /// dwconv (+SiLU) over the GLU output: [T,D] -> [T,D]. Extracted so the host `conv_module` tail and
+    /// the fused `conv_module_to_bo` tail (fusion T6) run the SAME conv middle and cannot drift apart.
+    fn conv_dwconv_silu(&self, glu: &Array2<f32>, taps: &Array2<f32>, dwb: &Array1<f32>) -> Array2<f32> {
+        #[cfg(feature = "npu")]
+        let resident_conv = std::env::var("PARAKEET_RESIDENT_CONV").map(|v| v != "0").unwrap_or(false);
+        #[cfg(feature = "npu")]
+        let resident_silu = std::env::var("PARAKEET_RESIDENT_SILU").map(|v| v != "0").unwrap_or(false);
         // depthwise along time: [D, T]. Bracketing transposes + trailing SiLU are host math
         // with no mm() inside, so they fold into the conv_dwconv Host leaf scope.
-        let back = prof::time("dwconv", || {
+        prof::time("dwconv", || {
             let _h = PhaseScope::new("conv_dwconv", Bucket::Host);
             // TIME-MAJOR fused dwconv+silu (step 3b): consumes GLU [T,D] DIRECTLY and emits [T,D]
             // DIRECTLY -- BOTH host transposes DISSOLVED (no glu.t() in, no dwc.t() out). Gated like the
@@ -759,7 +774,7 @@ impl FastConformerEncoder {
             // keeps the two transposes) when the time-major xclbin is absent or t > DW_T.
             #[cfg(feature = "npu")]
             let tmajor = if resident_conv && resident_silu {
-                self.npu.as_ref().and_then(|npu| npu.npu_dwconv_silu_tmajor(&glu, &taps, &dwb))
+                self.npu.as_ref().and_then(|npu| npu.npu_dwconv_silu_tmajor(glu, taps, dwb))
             } else { None };
             #[cfg(not(feature = "npu"))]
             let tmajor: Option<Array2<f32>> = None;
@@ -774,7 +789,7 @@ impl FastConformerEncoder {
             // separate dwconv + silu path below (then host) if the fused xclbin is absent.
             #[cfg(feature = "npu")]
             let fused = if resident_conv && resident_silu {
-                self.npu.as_ref().and_then(|npu| npu.npu_dwconv_silu(&glu_t, &taps, &dwb))
+                self.npu.as_ref().and_then(|npu| npu.npu_dwconv_silu(&glu_t, taps, dwb))
             } else { None };
             #[cfg(not(feature = "npu"))]
             let fused: Option<Array2<f32>> = None;
@@ -785,11 +800,11 @@ impl FastConformerEncoder {
                 // present + T<=400; else the host FIR. Transposes stay host here (cut in 3b).
                 #[cfg(feature = "npu")]
                 let dw_npu = if resident_conv {
-                    self.npu.as_ref().and_then(|npu| npu.npu_dwconv1d(&glu_t, &taps, &dwb))
+                    self.npu.as_ref().and_then(|npu| npu.npu_dwconv1d(&glu_t, taps, dwb))
                 } else { None };
                 #[cfg(not(feature = "npu"))]
                 let dw_npu: Option<Array2<f32>> = None;
-                let mut dwc = dw_npu.unwrap_or_else(|| dwconv1d(&glu_t, &taps, &dwb, 9)); // [D, T]
+                let mut dwc = dw_npu.unwrap_or_else(|| dwconv1d(&glu_t, taps, dwb, 9)); // [D, T]
                 // SiLU on NPU (step 4) as a SEPARATE brick, DEFAULT-ON with the resident conv path (opt out
                 // PARAKEET_RESIDENT_SILU=0 -> host silu). dwc is [D=C, T] channel-major == the silu brick's
                 // [C,T] shape. (Separate brick, NOT a dwconv epilogue -- the fused epilogue miscompiles
@@ -806,13 +821,31 @@ impl FastConformerEncoder {
                 silu_npu.unwrap_or_else(|| { silu_inplace(&mut dwc); dwc })
             };
             dwc.t().to_owned() // [D,T] -> [T,D]  (transpose 2, killed on the time-major path)
-        });
+        })
+    }
+
+    /// Fused-block conv tail (fusion T6): the conv middle + pw2 landing DIRECTLY in a device BO via
+    /// `matmul_id_to_bo`, so the conv output never round-trips to host on its way to the conv residual.
+    /// The host twin is `conv_module`'s `mm_lazy` tail; both share `conv_dwconv_silu` (so the conv middle
+    /// cannot drift) and both key the same `{blk}.pw2` weight-BO cache, so warm passes hit either way.
+    ///
+    /// The dwconv middle itself is still HOST-bracketed (the GLU comes back to host from
+    /// `resident_conv_pw1_glu_dev`), so this closes the conv->FFN2 seam, not the conv interior.
+    #[cfg(feature = "npu")]
+    fn conv_module_to_bo(&self, glu: &Array2<f32>, blk: usize) -> Option<std::rc::Rc<npu_xrt::Bo>> {
+        let npu = self.npu.as_ref()?;
+        let b = self.w.block(blk);
+        let (taps, dwb) = {
+            let _wp = PhaseScope::new("conv_wprep", Bucket::Marshal);
+            let dw3 = b.m3("conv.depthwise_conv.weight"); // [D, 1, 9]
+            (dw3.index_axis(Axis(1), 0).to_owned(), b.v("conv.depthwise_conv.bias"))
+        };
+        let back = self.conv_dwconv_silu(glu, &taps, &dwb);
         prof::phase::set_stage("conv_pw");
-        // pw2 chain -> [D, D]: materialized lazily; skipped on warm passes.
-        self.mm_lazy(&back, || {
+        Some(npu.matmul_id_to_bo(&back, || {
             let _wp = PhaseScope::new("conv_wprep", Bucket::Marshal);
             b.m3("conv.pointwise_conv2.weight").index_axis(Axis(2), 0).to_owned().t().to_owned() // [D,D,1]->[D,D]->[D,D]
-        }, &format!("{blk}.pw2"))
+        }, &format!("{blk}.pw2"), self.cfg.hidden))
     }
 
     fn block(&self, x: &Array2<f32>, blk: usize, pos_enc: &Array2<f32>) -> Array2<f32> {
@@ -853,6 +886,37 @@ impl FastConformerEncoder {
                     let conv_b = b.v("norm_conv.bias");
                     let glu = npu.resident_conv_pw1_glu_dev(&conv_in_bo, m, conv_g.as_slice().unwrap(), conv_b.as_slice().unwrap(),
                         || b.m3("conv.pointwise_conv1.weight").index_axis(Axis(2), 0).to_owned().t().to_owned(), &format!("{blk}.pw1"));
+                    // ---- T6: conv rest -> conv residual -> FFN2 -> Macaron residual -> block-exit LN ----
+                    // The whole tail stays in device BOs; the block's ONE readback is the block-exit LN.
+                    // Needs the device-out conv tail, which needs the device-in conv front's GLU: when the
+                    // GLU xclbin is absent `glu` is None and we take the T5 host rejoin instead.
+                    if let Some(glu) = glu.as_ref() {
+                        if let Some(conv_out_bo) = self.conv_module_to_bo(glu, blk) {
+                            // conv residual ON-DEVICE: x = conv_in + conv_out (scale 1.0).
+                            let x_bo = npu.residual_add_dev(&conv_in_bo, &conv_out_bo, 1.0, m).expect("residual_add_dev(conv 1.0)");
+                            // FFN2 device-in/device-out -- its norm_feed_forward2 LN runs device-in too.
+                            let ff2n_g = b.v("norm_feed_forward2.weight");
+                            let ff2n_b = b.v("norm_feed_forward2.bias");
+                            let ff2_bo = npu.resident_ffn_dev_bo(&x_bo, ff2n_g.as_slice().unwrap(), ff2n_b.as_slice().unwrap(),
+                                || b.m("feed_forward2.linear1.weight"), &format!("{blk}.ff2.l1"),
+                                || b.m("feed_forward2.linear2.weight"), &format!("{blk}.ff2.l2")).expect("resident_ffn_dev_bo(ff2)");
+                            // Macaron 0.5 residual ON-DEVICE.
+                            let x_bo = npu.residual_add_dev(&x_bo, &ff2_bo, 0.5, m).expect("residual_add_dev(ff2 0.5)");
+                            let out_g = b.v("norm_out.weight");
+                            let out_b = b.v("norm_out.bias");
+                            // Block-exit LN. Device by default (the frontier runs to the block boundary);
+                            // PARAKEET_FUSED_OUTLN_HOST=1 keeps the f32 host LN so the bf16 block-boundary
+                            // rounding can be A/B'd against it on rel-L2 rather than assumed harmless.
+                            if !std::env::var("PARAKEET_FUSED_OUTLN_HOST").map(|v| v != "0").unwrap_or(false) {
+                                if let Some(out) = npu.ln_affine_cast_dev_readback(&x_bo, out_g.as_slice().unwrap(), out_b.as_slice().unwrap(), m) {
+                                    return out;
+                                }
+                            }
+                            let x = npu.readback_stream(&x_bo, m);
+                            let _h = PhaseScope::new("ln", Bucket::Host);
+                            return layernorm(&x, &out_g, &out_b);
+                        }
+                    }
                     // rejoin host: x = (x + 0.5*ff1) + mhsa_out (the conv residual base), then conv rest / FFN2 / out.
                     let mut x = npu.readback_stream(&conv_in_bo, m);
                     let conv_out = prof::time("conv_mod", || self.conv_module(&x, blk, glu));

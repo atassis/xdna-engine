@@ -307,7 +307,14 @@ struct ResidualAdd {
     instr: Bo,
     n: usize,
     scale: f32,   // baked scale this xclbin applies (asserted against the caller's requested scale)
-    bo_out: Rc<Bo>, // [PAD_M, KRES] f32 result (scratch; overwritten by the next call)
+    // PING-PONG result scratch. A single shared out-BO aliases as soon as one block chains two adds
+    // at the SAME scale -- the fused block does exactly that (MHSA residual then conv residual, both
+    // s100), which would make the second dispatch read and write one buffer. Alternating means a
+    // call's output never collides with the buffer the previous call handed the caller. Same shape as
+    // AccAdd's acc0/acc1, and for the same reason.
+    bo_out: Rc<Bo>,  // [PAD_M, KRES] f32 ping
+    bo_out1: Rc<Bo>, // [PAD_M, KRES] f32 pong
+    flip: std::cell::Cell<bool>,
     dummy_tmp: Bo,
     dummy_tr: Bo,
 }
@@ -1013,6 +1020,8 @@ impl NpuMatmul {
                 Some(ResidualAdd {
                     scale: 0.5,
                     bo_out: Rc::new(self.dev.alloc_bo(&kern, PAD_M * KRES * 4, FLAG_HOST_ONLY, gr(5)).unwrap()),
+                    bo_out1: Rc::new(self.dev.alloc_bo(&kern, PAD_M * KRES * 4, FLAG_HOST_ONLY, gr(5)).unwrap()),
+                    flip: std::cell::Cell::new(false),
                     dummy_tmp: self.dev.alloc_bo(&kern, 8, FLAG_HOST_ONLY, gr(6)).unwrap(),
                     dummy_tr: self.dev.alloc_bo(&kern, 1, FLAG_HOST_ONLY, gr(7)).unwrap(),
                     kern, instr, n,
@@ -1032,6 +1041,8 @@ impl NpuMatmul {
                 Some(ResidualAdd {
                     scale: 1.0,
                     bo_out: Rc::new(self.dev.alloc_bo(&kern, PAD_M * KRES * 4, FLAG_HOST_ONLY, gr(5)).unwrap()),
+                    bo_out1: Rc::new(self.dev.alloc_bo(&kern, PAD_M * KRES * 4, FLAG_HOST_ONLY, gr(5)).unwrap()),
+                    flip: std::cell::Cell::new(false),
                     dummy_tmp: self.dev.alloc_bo(&kern, 8, FLAG_HOST_ONLY, gr(6)).unwrap(),
                     dummy_tr: self.dev.alloc_bo(&kern, 1, FLAG_HOST_ONLY, gr(7)).unwrap(),
                     kern, instr, n,
@@ -1344,6 +1355,32 @@ impl NpuMatmul {
         self.resident_ln()?;
         let rl = self.ln_affine_cast_dev(a_bo, gamma, beta);
         Some(rl.bo_bf16.clone())
+    }
+
+    /// Block-EXIT LN (fusion T6): device-in affine LN of `a_bo`, read back to host [m,KRES] f32.
+    /// This is THE single readback of a fully-fused block -- everything from the block's `upload_stream`
+    /// to here stays in device BOs. `None` when the resident-ln xclbins are absent.
+    ///
+    /// PRECISION NOTE: the affine_cast epilogue emits **bf16**, so the block output carries bf16
+    /// rounding where the host `layernorm` tail is f32. That is a real numerical change repeated at
+    /// every one of the 24 block boundaries, so it is gated by the rel-L2-vs-f32-truth check, not
+    /// assumed benign; `PARAKEET_FUSED_OUTLN_HOST=1` keeps the f32 host tail for the A/B.
+    pub fn ln_affine_cast_dev_readback(&self, a_bo: &Bo, gamma: &[f32], beta: &[f32], m: usize) -> Option<Array2<f32>> {
+        assert!(m <= PAD_M, "ln_affine_cast_dev_readback: m={m} exceeds PAD_M={PAD_M}");
+        self.resident_ln()?;
+        let rl = self.ln_affine_cast_dev(a_bo, gamma, beta);
+        rl.bo_bf16.sync_from_device().unwrap();
+        let mut cb = vec![0u8; m * KRES * 2]; // bf16, first m rows (row-major)
+        rl.bo_bf16.read_bytes(&mut cb).unwrap();
+        let mut out = Array2::<f32>::zeros((m, KRES));
+        for r in 0..m {
+            for c in 0..KRES {
+                let off = (r * KRES + c) * 2;
+                let bits = u16::from_le_bytes([cb[off], cb[off + 1]]);
+                out[[r, c]] = f32::from_bits((bits as u32) << 16);
+            }
+        }
+        Some(out)
     }
 
     /// Device-in projection: A[m,KRES] bf16 device BO `a_bo` @ W[KRES,n] -> C[m,n] f32 (read to host).
@@ -2137,8 +2174,9 @@ impl NpuMatmul {
     /// On-chip scaled residual add: out = a + scale*b, f32 [PAD_M,KRES], device-resident. Selects
     /// the baked-scale xclbin: s050 = 0.5 (Macaron residual) and s100 = 1.0 (MHSA residual) are both
     /// built; the FUSED_BLOCK path requires BOTH (gated by `resident_fused_available`). `a_bo`/`b_bo`
-    /// are device f32 [PAD_M,KRES] BOs; returns the device result (ResidualAdd scratch, overwritten by
-    /// the next call). `None` when the selected-scale xclbin is absent; PANICS on an unbuilt scale.
+    /// are device f32 [PAD_M,KRES] BOs; returns the device result (a ping-pong scratch: safe to hold
+    /// across ONE further same-scale call, overwritten by the one after). `None` when the selected-scale
+    /// xclbin is absent; PANICS on an unbuilt scale.
     pub fn residual_add_dev(&self, a_bo: &Bo, b_bo: &Bo, scale: f32, _m: usize) -> Option<Rc<Bo>> {
         let rl = self.resident_ln()?;
         let ra = if (scale - 0.5).abs() < 1e-6 {
@@ -2149,9 +2187,14 @@ impl NpuMatmul {
             panic!("residual_add_dev: scale {scale} has no built xclbin (only s050=0.5, s100=1.0); build final_resadd_{PAD_M}x{KRES}_s<stag>");
         };
         debug_assert!((ra.scale - scale).abs() < 1e-6);
-        ra.kern.run_matmul8(3, &ra.instr, ra.n, a_bo, b_bo, &ra.bo_out, &ra.dummy_tmp, &ra.dummy_tr).unwrap();
+        // Alternate ping/pong so this dispatch never writes the buffer the PREVIOUS same-scale call
+        // returned (which the caller may still be reading as `a_bo`/`b_bo` -- the fused block chains
+        // two s100 adds exactly that way).
+        let out = if ra.flip.get() { &ra.bo_out1 } else { &ra.bo_out };
+        ra.flip.set(!ra.flip.get());
+        ra.kern.run_matmul8(3, &ra.instr, ra.n, a_bo, b_bo, out, &ra.dummy_tmp, &ra.dummy_tr).unwrap();
         self.stats.borrow_mut().dispatches += 1;
-        Some(ra.bo_out.clone())
+        Some(out.clone())
     }
 
     /// Device-parity self-test for Task 2 (on-chip residual add). Uploads synthetic a,b to device BOs,
