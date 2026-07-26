@@ -82,7 +82,26 @@ def build():
     return design, in_t, r_t, out_t, r_host
 
 
+# CACHE=1 measures the DEVICE, not the harness. bricklib builds with use_cache=False as a
+# correctness workaround (the JIT external-kernel cache keys on the shim, not on what it
+# #includes, so a kernel edit does not invalidate it -- jit-external-kernel-cache-staleness).
+# That workaround costs ~150 ms of recompilation PER CALL, which is ~800x the actual dispatch
+# and buries every host-path delta this probe exists to measure. Enabling the cache is safe
+# HERE and only here: nothing edits a kernel between calls, the design is built once up front.
+if _os.environ.get("CACHE") == "1":
+    _orig_jit = iron.jit
+
+    def _cached_jit(fn=None, **kw):
+        kw["use_cache"] = True
+        return _orig_jit(fn, **kw) if fn is not None else _orig_jit(**kw)
+
+    iron.jit = _cached_jit
+    bricklib.iron.jit = _cached_jit
+
 design, in_t, r_t, out_t, r_host = build()
+if _os.environ.get("CACHE") == "1":
+    iron.jit = _orig_jit
+    bricklib.iron.jit = _orig_jit
 design(in_t, r_t, out_t)
 print(f"[rt] design built + warmed; {ITERS} iters per mode, shape {M}x{K}x{N}_g{G} Nt={Nt}",
       flush=True)
