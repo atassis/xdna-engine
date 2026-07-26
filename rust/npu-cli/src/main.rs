@@ -4,7 +4,7 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 use npu_runtime::actor::start;
 use npu_runtime::config::Config;
@@ -69,18 +69,79 @@ fn main() -> Result<()> {
 }
 
 fn load_cfg(path: &Path) -> Result<Config> { Config::load(path).map_err(|e| anyhow!(e)) }
-fn root() -> Result<PathBuf> { std::env::current_dir().context("cwd") }
+
+/// Repo root that a scenario's relative `artifacts.weights` path resolves against.
+///
+/// This used to be plain `current_dir()`, which is only correct when you happen to be standing in
+/// the repo. The service never noticed because its unit sets `WorkingDirectory=$REPO`; every other
+/// invocation (`npu embed`, `npu transcribe`, `npu serve` from a shell) resolved
+/// `artifacts/parakeet/...` against the caller's cwd and died on a missing file.
+///
+/// Order: explicit env override, then derive from an absolute scenario path
+/// (`<repo>/scenarios/x.toml` -> `<repo>`), then cwd as the last resort.
+fn root(cfg: &Config) -> Result<PathBuf> {
+    if let Ok(p) = std::env::var("XDNA_ENGINE_ROOT") {
+        return Ok(PathBuf::from(p));
+    }
+    for m in &cfg.models {
+        let s = Path::new(&m.scenario);
+        if !s.is_absolute() { continue; }
+        let dir = match s.parent() { Some(d) => d, None => continue };
+        if dir.file_name().map(|n| n == "scenarios").unwrap_or(false) {
+            if let Some(r) = dir.parent() { return Ok(r.to_path_buf()); }
+        }
+    }
+    std::env::current_dir().context("cwd")
+}
+
+/// Fail SOFTLY when the port is already taken, instead of loading models first and dying on an
+/// opaque "Address already in use" (os error 98) after a panic.
+///
+/// 11434 is NOT ours exclusively -- ollama, FLM and others default to it too -- so we do not claim
+/// to know who is there. Probe `/healthz` and only name xdna-engine when the reply is actually
+/// ours; otherwise report an unidentified listener and let the operator decide.
+fn preflight_serve(port: u16) -> Result<()> {
+    use std::time::Duration;
+    let addr = match format!("127.0.0.1:{port}").parse() { Ok(a) => a, Err(_) => return Ok(()) };
+    if TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_err() {
+        // Nothing listening; the port is ours to bind.
+        return if npu_engine::Engine::available() {
+            Ok(())
+        } else {
+            bail!("no XDNA2 NPU device at /dev/accel/accel0 (is the amdxdna driver loaded?)")
+        };
+    }
+    // Something is listening. Ask it who it is rather than assuming.
+    let mine = http_get(port, "/healthz").map(|b| b.contains("\"npu\"")).unwrap_or(false);
+    if mine {
+        bail!(
+            "port {port} is already served by an xdna-engine instance.\n  \
+             status : systemctl --user status xdna-engine\n  \
+             stop   : systemctl --user stop xdna-engine\n  \
+             or use another port: npu serve --port <other>"
+        );
+    }
+    bail!(
+        "port {port} is already in use by another process (it did not answer /healthz as an\n  \
+         xdna-engine, so it is likely ollama, FLM or a different server -- {port} is a shared\n  \
+         default). Identify it with:  ss -ltnp 'sport = :{port}'\n  \
+         Then stop it, or use another port: npu serve --port <other>"
+    );
+}
 
 fn serve(path: &Path, port: Option<u16>) -> Result<()> {
     let cfg = load_cfg(path)?;
     let port = port.unwrap_or(cfg.server.port);
-    let (handle, _join) = start(cfg, Box::new(EngineLoader { root: root()? }));
+    preflight_serve(port)?;
+    let root = root(&cfg)?;
+    let (handle, _join) = start(cfg, Box::new(EngineLoader { root }));
     http::serve(handle, path.to_path_buf(), port).context("serve")
 }
 
 fn transcribe(path: &Path, wav: &Path, model: Option<&str>) -> Result<()> {
     let cfg = load_cfg(path)?;
-    let (handle, join) = start(cfg, Box::new(EngineLoader { root: root()? }));
+    let root = root(&cfg)?;
+    let (handle, join) = start(cfg, Box::new(EngineLoader { root }));
     let bytes = std::fs::read(wav).with_context(|| format!("read {}", wav.display()))?;
     let samples = http::parse::parse_wav_i16(&bytes).ok_or_else(|| anyhow!("bad wav (need 16k mono 16-bit)"))?;
     let out = handle.transcribe(model, samples, 16_000).map_err(|e| anyhow!(e.to_string()));
@@ -91,7 +152,8 @@ fn transcribe(path: &Path, wav: &Path, model: Option<&str>) -> Result<()> {
 
 fn embed(path: &Path, text: &str, model: Option<&str>) -> Result<()> {
     let cfg = load_cfg(path)?;
-    let (handle, join) = start(cfg, Box::new(EngineLoader { root: root()? }));
+    let root = root(&cfg)?;
+    let (handle, join) = start(cfg, Box::new(EngineLoader { root }));
     let out = handle.embed(model, text).map_err(|e| anyhow!(e.to_string()));
     handle.shutdown(); let _ = join.join();
     let v = out?.value;
@@ -119,7 +181,7 @@ fn bake(path: &Path, name: &str) -> Result<()> {
     let sc = npu_engine::config::ScenarioConfig::load(Path::new(&m.scenario))
         .with_context(|| format!("scenario {}", m.scenario))?;
     match sc.artifacts.model_spec()? {
-        Some(spec) => { let p = spec.ensure_arena(&root()?, false)?; println!("baked: {}", p.display()); }
+        Some(spec) => { let p = spec.ensure_arena(&root(&cfg)?, false)?; println!("baked: {}", p.display()); }
         None => println!("nothing to bake ({} uses legacy npy weights)", name),
     }
     Ok(())
