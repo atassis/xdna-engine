@@ -230,6 +230,13 @@ struct ResidentLn {
     // resident-FFN fc2 on-device K-split accumulate (out = a + b, f32), OPTIONAL like glu. When
     // present, resident_ffn_dev sums the fc2 partials on-chip into ONE device BO (no host acc).
     acc_add: Option<AccAdd>,
+    // FUSED normalize+affine+cast in ONE kernel, OPTIONAL: replaces the ctxLN -> affine_cast chain on
+    // the DEVICE-IN path, deleting one dispatch (one hw-context switch) per LN site. The fused block
+    // hits 5 LN sites per block (ff1, satt, conv-front, ff2, block-exit), so this is 5 dispatches/block.
+    // Device-in ONLY: the host-in `ln_affine_cast` still runs the 2-kernel chain because
+    // `resident_mha_affine_ln_f32` reads the intermediate f32 `bo_ln`, which the fused kernel never
+    // materializes.
+    lnaffcast: Option<LnAffCast>,
     // scaled residual-add (out = a + 0.5*b, f32), OPTIONAL. The Macaron FFN residual x+0.5*ff on-chip.
     resadd_s050: Option<ResidualAdd>,
     // scaled residual-add (out = a + 1.0*b, f32), OPTIONAL. The full MHSA/conv residual x+sublayer.
@@ -307,6 +314,18 @@ struct Fc2K4096 {
 /// Device-side f32 scaled residual-add brick (whole-block fusion residual). out[g5] = a[g3] +
 /// scale*b[g4] over [PAD_M,KRES] f32, `scale` baked into the xclbin (one per value: s050 = 0.5).
 /// Keeps `x = x + scale*sublayer` on-chip so the residual never round-trips. OPTIONAL like acc_add.
+/// Fused normalize-only LN + affine + f32->bf16 cast (one dispatch). ABI matches affine_cast:
+/// (x f32 [PAD_M,KRES], gb f32 [2*KRES]) -> bf16 [PAD_M,KRES], i.e. 2 inputs + 1 output, inside the
+/// AIE2 compute-tile input-DMA budget. Writes the SHARED `bo_bf16`/`bo_gb`, so it is a drop-in for the
+/// chain's output and needs no extra buffers.
+struct LnAffCast {
+    kern: Rc<Kernel>,
+    instr: Bo,
+    n: usize,
+    dummy_tmp: Bo,
+    dummy_tr: Bo,
+}
+
 struct ResidualAdd {
     kern: Rc<Kernel>,
     instr: Bo,
@@ -994,6 +1013,24 @@ impl NpuMatmul {
         };
         // resident-FFN fc2 on-device accumulate (out=a+b f32), OPTIONAL: load only if built. acc0/acc1
         // ping-pong the running sum; `zero` (zeroed once) seeds the first partial (acc = partial0 + 0).
+        // FUSED ln+affine+cast (device-in path). Absent -> the 2-kernel chain, same numbers, one more
+        // dispatch per LN site.
+        let lnaffcast = {
+            let xcl = self.ln_dir.join(format!("final_lnaffcast_{PAD_M}x{KRES}.xclbin"));
+            let ins = self.ln_dir.join(format!("insts_lnaffcast_{PAD_M}x{KRES}.txt"));
+            if xcl.exists() && ins.exists() {
+                let (kern, instr, n) = load_path(xcl, ins);
+                let gr = |i| kern.group_id(i).unwrap();
+                Some(LnAffCast {
+                    dummy_tmp: self.dev.alloc_bo(&kern, 8, FLAG_HOST_ONLY, gr(6)).unwrap(),
+                    dummy_tr: self.dev.alloc_bo(&kern, 1, FLAG_HOST_ONLY, gr(7)).unwrap(),
+                    kern, instr, n,
+                })
+            } else {
+                eprintln!("[npu] lnaffcast xclbin absent in {} -- device-in LN runs the 2-kernel ctxLN->affcast chain (build final_lnaffcast_{PAD_M}x{KRES})", self.ln_dir.display());
+                None
+            }
+        };
         let acc_add = {
             let xcl = self.ln_dir.join(format!("final_accadd_{PAD_M}x{KRES}.xclbin"));
             let ins = self.ln_dir.join(format!("insts_accadd_{PAD_M}x{KRES}.txt"));
@@ -1185,7 +1222,7 @@ impl NpuMatmul {
             deint_tmp: self.dev.alloc_bo(&deint_kern, 8, FLAG_HOST_ONLY, gd(6)).unwrap(),
             deint_tr: self.dev.alloc_bo(&deint_kern, 1, FLAG_HOST_ONLY, gd(7)).unwrap(),
             ln_kern, ln_instr, ln_n, ac_kern, ac_instr, ac_n,
-            deint_kern, deint_instr, deint_n, glu, acc_add, resadd_s050, resadd_s100, fc2_k4096, dwconv, silu, dwconv_silu, dwconv_silu_t,
+            deint_kern, deint_instr, deint_n, glu, lnaffcast, acc_add, resadd_s050, resadd_s100, fc2_k4096, dwconv, silu, dwconv_silu, dwconv_silu_t,
         });
         rl
     }
@@ -1255,6 +1292,18 @@ impl NpuMatmul {
         gb[KRES..].copy_from_slice(beta);
         rl.bo_gb.write_bytes(f32_bytes(&gb)).unwrap();
         rl.bo_gb.sync_to_device().unwrap();
+        // FUSED: normalize+affine+cast in ONE dispatch, skipping the bo_ln round-trip between two
+        // hw-contexts. The reductions in ln_affine_cast.cc are deliberately left under the AIE default
+        // rounding to stay bit-matched to ctxLN (conv_even is applied only around the bf16 narrowing,
+        // as affcast does) -- setting it up front regressed WER over 24 layers. Opt out with
+        // PARAKEET_LN_FUSED=0.
+        if std::env::var("PARAKEET_LN_FUSED").map(|v| v != "0").unwrap_or(true) {
+            if let Some(lf) = rl.lnaffcast.as_ref() {
+                lf.kern.run_matmul8(3, &lf.instr, lf.n, a_bo, &rl.bo_gb, &rl.bo_bf16, &lf.dummy_tmp, &lf.dummy_tr).unwrap();
+                self.stats.borrow_mut().dispatches += 1;
+                return rl;
+            }
+        }
         // (1) ctxLN: a_bo -> bo_ln  (DEVICE-IN: no host write of x; stays device-resident)
         rl.ln_kern.run_matmul8(3, &rl.ln_instr, rl.ln_n, a_bo, &rl.bo_ln, &rl.ln_c, &rl.ln_tmp, &rl.ln_tr).unwrap();
         // (2) affine_cast: (bo_ln * gamma + beta) -> bo_bf16  (device-side)
