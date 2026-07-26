@@ -34,7 +34,7 @@ from bench.backends import FLM, ours
 
 ROOT = Path(__file__).resolve().parent.parent
 RESULTS_DIR = ROOT / "bench" / "results"
-LIB = os.path.expanduser("~/.local/lib/npu-asr")
+LIB = os.path.expanduser("~/.local/lib/xdna-engine")
 OUR_PORT = 11435
 
 # --- WER (mirrors scripts/whisper_cpu_oracle.py: same normalize + edit-distance) ---
