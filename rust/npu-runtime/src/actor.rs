@@ -13,6 +13,22 @@ use npu_engine::EngineError;
 /// Result carrying which model served (the echo).
 pub struct Served<T> { pub model: String, pub value: T }
 
+/// Run `f`, converting a panic into `Err(message)` instead of unwinding out of the actor thread.
+///
+/// The engine's model constructors still `.expect()` on missing artifacts (a moved weights dir, a
+/// stale scenario), so a panic here is reachable from ordinary misconfiguration. Before this, such
+/// a panic killed the actor and every later request returned the useless "actor stopped" while the
+/// real message went only to stderr. `AssertUnwindSafe` is required because the registry holds
+/// `Box<dyn Inference>`; the actor owns that state exclusively and does not observe it again after
+/// a caught panic beyond reporting, so no torn state escapes.
+fn guard<T>(f: impl FnOnce() -> T) -> Result<T, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).map_err(|p| {
+        if let Some(s) = p.downcast_ref::<&str>() { (*s).to_string() }
+        else if let Some(s) = p.downcast_ref::<String>() { s.clone() }
+        else { "panic in engine (no message)".to_string() }
+    })
+}
+
 enum Cmd {
     Transcribe { model: Option<String>, pcm: Vec<i16>, sr: u32, reply: Sender<Result<Served<String>, EngineError>> },
     Embed { model: Option<String>, text: String, reply: Sender<Result<Served<Vec<f32>>, EngineError>> },
@@ -31,19 +47,28 @@ pub fn start(cfg: Config, loader: Box<dyn ModelLoader + Send>) -> (Handle, JoinH
     let join = std::thread::spawn(move || {
         let mut reg = Registry::default();
         let mut cfg = cfg;
-        let _ = reconcile(&cfg, &mut reg, loader.as_ref());
+        // A panic anywhere below used to kill this thread, after which every request failed with
+        // "actor stopped" and the real cause was gone. Model constructors still `.expect()` on
+        // missing artifacts, so a bad config or a moved weights dir landed here. Catch it: the
+        // actor survives, and the panic message is returned as the error the caller sees.
+        let _ = guard(|| reconcile(&cfg, &mut reg, loader.as_ref()));
         let _ = ready_tx.send(());
         while let Ok(cmd) = rx.recv() {
             match cmd {
                 Cmd::Transcribe { model, pcm, sr, reply } => {
-                    let _ = reply.send(run_transcribe(&cfg, &reg, model.as_deref(), &pcm, sr));
+                    let r = guard(|| run_transcribe(&cfg, &reg, model.as_deref(), &pcm, sr))
+                        .unwrap_or_else(|msg| Err(EngineError::Device(msg)));
+                    let _ = reply.send(r);
                 }
                 Cmd::Embed { model, text, reply } => {
-                    let _ = reply.send(run_embed(&cfg, &reg, model.as_deref(), &text));
+                    let r = guard(|| run_embed(&cfg, &reg, model.as_deref(), &text))
+                        .unwrap_or_else(|msg| Err(EngineError::Device(msg)));
+                    let _ = reply.send(r);
                 }
                 Cmd::Reconcile { cfg: newcfg, reply } => {
                     cfg = *newcfg;
-                    let rep = reconcile(&cfg, &mut reg, loader.as_ref());
+                    let rep = guard(|| reconcile(&cfg, &mut reg, loader.as_ref()))
+                        .unwrap_or_else(|msg| ReconcileReport { failed: vec![msg], ..Default::default() });
                     let _ = reply.send(rep);
                 }
                 Cmd::Status { reply } => { let _ = reply.send(reg.status()); }
