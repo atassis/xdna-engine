@@ -24,7 +24,7 @@ TS="$(date +%Y%m%d_%H%M%S)"; LOG="$WT/artifacts/lever3_isolate_${TS}.log"; WERDI
 PORT=11434; URL="http://127.0.0.1:${PORT}/v1/audio/transcriptions"
 mkdir -p "$WT/artifacts" "$WERDIR"; : > "$LOG"
 log(){ echo -e "$*" | tee -a "$LOG"; }
-restart(){ systemctl --user start npu-asr.service voxd.service >/dev/null 2>&1; echo "[svc] npu services restarted" | tee -a "$LOG"; }
+restart(){ systemctl --user start xdna-engine.service voxd.service >/dev/null 2>&1; echo "[svc] npu services restarted" | tee -a "$LOG"; }
 beep(){ ( speaker-test -t sine -f 1000 -l 1 >/dev/null 2>&1 & local p=$!; sleep 2; kill -9 "$p" >/dev/null 2>&1 ); }
 trap 'restart; beep; echo "[done] log: $LOG"' EXIT
 
@@ -37,7 +37,7 @@ for d in fused_decode12 fd12_cross fd12_self; do
   [ -f "$WT/artifacts/$d/decode.elf" ] || { log "[ERR] missing ELF: artifacts/$d/decode.elf (build the isolation variants first)"; exit 1; }
 done
 
-log "[svc] stopping npu-asr + voxd ..."; systemctl --user stop npu-asr.service voxd.service; sleep 2
+log "[svc] stopping npu-asr + voxd ..."; systemctl --user stop xdna-engine.service voxd.service; sleep 2
 fuser /dev/accel/accel0 2>/dev/null && { log "[ERR] device busy — another session running. Aborting."; exit 1; }
 log "[svc] device clear — single-tenant"
 

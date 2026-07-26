@@ -28,7 +28,7 @@ TS="$(date +%Y%m%d_%H%M%S)"
 LOG="$WT/artifacts/gemm_probe_sweep_${TS}.log"
 mkdir -p "$WT/artifacts"; : > "$LOG"
 log(){ echo -e "$*" | tee -a "$LOG"; }
-restart(){ systemctl --user start npu-asr.service voxd.service >/dev/null 2>&1; log "[svc] npu services restarted"; }
+restart(){ systemctl --user start xdna-engine.service voxd.service >/dev/null 2>&1; log "[svc] npu services restarted"; }
 beep(){ ( speaker-test -t sine -f 1000 -l 1 >/dev/null 2>&1 & local p=$!; sleep 1; kill -9 "$p" >/dev/null 2>&1 ); }
 trap 'restart; beep; log "[done] log: $LOG"' EXIT
 
@@ -46,7 +46,7 @@ log "[build] fused_elf_probe (release)"
 
 # 3) claim the single-tenant NPU
 log "[svc] stopping npu-asr / voxd"
-systemctl --user stop npu-asr.service voxd.service >/dev/null 2>&1
+systemctl --user stop xdna-engine.service voxd.service >/dev/null 2>&1
 sleep 1
 if fuser /dev/accel/accel0 >/dev/null 2>&1; then
   log "FATAL: /dev/accel/accel0 still busy — another session holds the NPU. Aborting (serialize, see [[npu-timing-check-fuser-first]])."

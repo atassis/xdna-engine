@@ -32,14 +32,14 @@ CONFIGS=(
 )
 BASE=(en_01 en_02 en_03 en_04 ru_01 ru_02 ru_03 ru_04 ru_05 ru_06 ru_07 ru_08 ru_09 ru_10 ru_11 ru_12)
 
-restart(){ systemctl --user start npu-asr.service voxd.service >/dev/null 2>&1; log "[svc] npu services restarted"; }
+restart(){ systemctl --user start xdna-engine.service voxd.service >/dev/null 2>&1; log "[svc] npu services restarted"; }
 beep(){ ( speaker-test -t sine -f 1000 -l 1 >/dev/null 2>&1 & local p=$!; sleep 1; kill -9 "$p" >/dev/null 2>&1 ); }
 trap 'restart; beep; log "\n[done] full log: $LOG"; print_summary' EXIT
 
 declare -a SUMMARY
 for f in "$VERIFY" "$BULK"; do [ -e "$f" ] || { log "FATAL missing bin (prebuild): $f"; exit 1; }; done
 
-log "[svc] stopping npu-asr / voxd"; systemctl --user stop npu-asr.service voxd.service >/dev/null 2>&1; sleep 1
+log "[svc] stopping npu-asr / voxd"; systemctl --user stop xdna-engine.service voxd.service >/dev/null 2>&1; sleep 1
 if fuser /dev/accel/accel0 >/dev/null 2>&1; then
   log "FATAL: /dev/accel/accel0 busy — another session holds the NPU. Aborting."; fuser -v /dev/accel/accel0 2>&1 | tee -a "$LOG"; exit 1
 fi

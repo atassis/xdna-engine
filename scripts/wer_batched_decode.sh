@@ -14,7 +14,7 @@ VERIFY="$WT/rust/target/release/verify_batched_decode"
 CLIPDIR="$WT/artifacts/wer_clips"
 TS="$(date +%Y%m%d_%H%M%S)"; OUT="$WT/artifacts/wer_batched_${TS}.tsv"; LOG="$WT/artifacts/wer_batched_${TS}.log"
 log(){ echo -e "$*" | tee -a "$LOG"; }
-restart(){ systemctl --user start npu-asr.service voxd.service >/dev/null 2>&1; log "[svc] npu services restarted"; }
+restart(){ systemctl --user start xdna-engine.service voxd.service >/dev/null 2>&1; log "[svc] npu services restarted"; }
 trap 'restart; log "[done] tsv: $OUT"' EXIT
 
 [ -e "$VERIFY" ] || { log "FATAL missing (prebuild): $VERIFY"; exit 1; }
@@ -36,7 +36,7 @@ log "batch width B=$BW (clips cycled from 16 base)"
 log "================ BATCHED WER GATE  $TS ================"
 log "batch dir: $BATCH_DIR"
 log "[svc] stopping npu-asr / voxd"
-systemctl --user stop npu-asr.service voxd.service >/dev/null 2>&1; sleep 1
+systemctl --user stop xdna-engine.service voxd.service >/dev/null 2>&1; sleep 1
 if fuser /dev/accel/accel0 >/dev/null 2>&1; then
   log "FATAL: /dev/accel/accel0 busy — another session holds the NPU. Aborting."; fuser -v /dev/accel/accel0 2>&1 | tee -a "$LOG"; exit 1
 fi

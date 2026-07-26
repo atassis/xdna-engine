@@ -25,7 +25,7 @@ CLIPDIR="$WT/artifacts/wer_clips"
 TS="$(date +%Y%m%d_%H%M%S)"; LOG="$WT/artifacts/bench_batched_${TS}.log"
 mkdir -p "$WT/artifacts"; : > "$LOG"
 log(){ echo -e "$*" | tee -a "$LOG"; }
-restart(){ systemctl --user start npu-asr.service voxd.service >/dev/null 2>&1; log "[svc] npu services restarted"; }
+restart(){ systemctl --user start xdna-engine.service voxd.service >/dev/null 2>&1; log "[svc] npu services restarted"; }
 beep(){ ( speaker-test -t sine -f 1000 -l 1 >/dev/null 2>&1 & local p=$!; sleep 1; kill -9 "$p" >/dev/null 2>&1 ); }
 trap 'restart; beep; log "[done] log: $LOG"' EXIT
 
@@ -42,7 +42,7 @@ log "M=1 dir:   $M1_DIR"
 log "batch dir: $BATCH_DIR  ($(python3 -c "import json;print('scratch %.0f MB'%(json.load(open('$BATCH_DIR/meta.json'))['scratch_size']/1e6))" 2>/dev/null))"
 
 log "[svc] stopping npu-asr / voxd"
-systemctl --user stop npu-asr.service voxd.service >/dev/null 2>&1; sleep 1
+systemctl --user stop xdna-engine.service voxd.service >/dev/null 2>&1; sleep 1
 if fuser /dev/accel/accel0 >/dev/null 2>&1; then
   log "FATAL: /dev/accel/accel0 busy — another session holds the NPU. Aborting."; fuser -v /dev/accel/accel0 2>&1 | tee -a "$LOG"; exit 1
 fi

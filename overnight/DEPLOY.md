@@ -287,7 +287,7 @@ scripts/install.sh
 ```
 - **Produces:** the `npu` + `npu-weights` release binaries in `~/.local/bin`, the
   onnxruntime lib in `~/.local/lib/npu-asr`, `~/.config/npu/engine.toml`, and the
-  `npu-serve.service` systemd --user unit (WorkingDirectory=$REPO), started on :11434.
+  `xdna-engine.service` systemd --user unit (WorkingDirectory=$REPO), started on :11434.
 - **Success signal:** prints `npu-serve active on :11434`.
 - **Time:** 5-15 min (cold Rust release build) + seconds to start.
 

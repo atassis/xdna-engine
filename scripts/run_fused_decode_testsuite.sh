@@ -41,7 +41,7 @@ section(){ echo -e "\n\n========================================================
 run(){ echo -e "\n\$ $*" | tee -a "$LOG"; { eval "$@"; } >>"$LOG" 2>&1; local rc=$?; tail -n 40 "$LOG" | sed 's/^/    /'; echo "  [exit $rc]" | tee -a "$LOG"; }
 note(){ echo -e "# $*" | tee -a "$LOG"; }
 
-restart_svc(){ systemctl --user start npu-asr.service voxd.service >/dev/null 2>&1; }
+restart_svc(){ systemctl --user start xdna-engine.service voxd.service >/dev/null 2>&1; }
 beep(){ ( speaker-test -t sine -f 1000 -l 1 >/dev/null 2>&1 & local p=$!; sleep 3; kill -9 $p >/dev/null 2>&1 ) ; }
 trap 'restart_svc; echo "[services restarted on exit]" | tee -a "$LOG"; beep' EXIT
 
@@ -82,7 +82,7 @@ gen decode      "gen_decode.py --weights $WDIR --layers 12 --out $WT/artifacts/f
 
 # ===========================================================================
 section "DEVICE TESTS — stopping npu-asr/voxd (single-tenant)"
-run "systemctl --user stop npu-asr.service voxd.service; sleep 2"
+run "systemctl --user stop xdna-engine.service voxd.service; sleep 2"
 run "fuser -v /dev/accel/accel0 2>&1 || echo device-free"
 
 section "1a. Fused block CORRECTNESS (rel-L2, gate <=0.08)"
@@ -114,7 +114,7 @@ run "cd $WT/rust && WHISPER_ROOT=$WT LD_LIBRARY_PATH=$LDLIB cargo run -q -p npu-
 run "cd $WT/rust && WHISPER_ROOT=$WT LD_LIBRARY_PATH=$LDLIB cargo run -q -p npu-engine --release --bin verify_whisper_decode -- --npu-attn"
 
 # restart services for the harnesses that manage their own engine_serve
-run "systemctl --user start npu-asr.service voxd.service; sleep 2"
+run "systemctl --user start xdna-engine.service voxd.service; sleep 2"
 
 # ===========================================================================
 section "5. Whisper WER (FULL transcription accuracy, 17 clips) — ONNX vs NPU pooled WER vs known 0.1136"

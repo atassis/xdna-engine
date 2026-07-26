@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # RUN the DMA-occupancy sweep on the NPU (needs a window). Single-tenant device discipline:
 # stop the NPU services, fuser-check the device is free, timeout-guard the run, and ALWAYS
-# restart the services on exit (trap). Canonical units = npu-serve.service + voxd.service
-# (NOT the stale npu-asr.service the older occupancy runner names). CUDA disabled.
+# restart the services on exit (trap). Canonical units = xdna-engine.service + voxd.service
+# (NOT the stale xdna-engine.service the older occupancy runner names). CUDA disabled.
 #
 # Usage:
 #   scripts/run_parakeet_dma_occupancy.sh                       # 3 existing N points (no builds)
@@ -21,10 +21,10 @@ TO="${TIMEOUT:-300}"
 LOG="$REPO/artifacts/parakeet/occupancy/dma_run.log"; mkdir -p "$(dirname "$LOG")"
 log(){ echo "$@" | tee -a "$LOG"; }
 
-restart(){ systemctl --user start npu-serve.service voxd.service >/dev/null 2>&1 || true; log "[svc] npu-serve + voxd restarted"; }
+restart(){ systemctl --user start xdna-engine.service voxd.service >/dev/null 2>&1 || true; log "[svc] npu-serve + voxd restarted"; }
 
 log "[svc] stopping npu-serve / voxd (quiesce for clean timing)"
-systemctl --user stop npu-serve.service voxd.service >/dev/null 2>&1 || true
+systemctl --user stop xdna-engine.service voxd.service >/dev/null 2>&1 || true
 trap restart EXIT
 sleep 1
 # fuser-check the device is actually free before dispatching (serialize -- npu-timing-check-fuser-first)

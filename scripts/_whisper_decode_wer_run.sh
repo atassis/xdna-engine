@@ -12,11 +12,11 @@ SCEN="scenarios/asr-whisper-small.toml"
 LOGDIR=/tmp/whisper_decode_wer
 mkdir -p "$LOGDIR"
 
-restart_services() { echo "[run] restarting npu services"; systemctl --user start npu-asr.service voxd.service; }
+restart_services() { echo "[run] restarting npu services"; systemctl --user start xdna-engine.service voxd.service; }
 trap restart_services EXIT
 
 echo "[run] stopping npu services (single-tenant device)"
-systemctl --user stop npu-asr.service voxd.service
+systemctl --user stop xdna-engine.service voxd.service
 sleep 2
 if fuser /dev/accel/accel0 2>/dev/null; then echo "[run] ERROR: device still busy"; exit 1; fi
 echo "[run] device clear"

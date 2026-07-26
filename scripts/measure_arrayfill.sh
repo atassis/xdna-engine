@@ -15,7 +15,7 @@ VERIFY="$WT/rust/target/release/verify_batched_decode"
 CLIP="$WT/artifacts/wer_clips/en_04.wav"
 TS="$(date +%Y%m%d_%H%M%S)"; LOG="$WT/artifacts/arrayfill_${TS}.log"
 log(){ echo -e "$*" | tee -a "$LOG"; }
-restart(){ systemctl --user start npu-asr.service voxd.service >/dev/null 2>&1; }
+restart(){ systemctl --user start xdna-engine.service voxd.service >/dev/null 2>&1; }
 trap 'restart; log "[done] $LOG"' EXIT
 
 measure_one(){  # $1=dir -> echoes "B<nl> dispatch_ms per_tok"
@@ -33,7 +33,7 @@ measure_one(){  # $1=dir -> echoes "B<nl> dispatch_ms per_tok"
 
 [ $# -eq 2 ] || { echo "usage: measure_arrayfill.sh <B16_dir> <B128_dir>"; exit 1; }
 log "================ ARRAY-FILL  $TS ================"
-log "[svc] stopping npu services"; systemctl --user stop npu-asr.service voxd.service >/dev/null 2>&1; sleep 1
+log "[svc] stopping npu services"; systemctl --user stop xdna-engine.service voxd.service >/dev/null 2>&1; sleep 1
 if fuser /dev/accel/accel0 >/dev/null 2>&1; then log "FATAL device busy"; fuser -v /dev/accel/accel0 2>&1|tee -a "$LOG"; exit 1; fi
 log "[svc] device clear"
 

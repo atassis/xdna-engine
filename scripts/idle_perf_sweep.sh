@@ -38,7 +38,7 @@ URL="http://127.0.0.1:${PORT}/v1/audio/transcriptions"
 mkdir -p "$WT/artifacts" "$WERDIR"; : > "$LOG"
 
 log(){ echo -e "$*" | tee -a "$LOG"; }
-restart(){ systemctl --user start npu-asr.service voxd.service >/dev/null 2>&1; echo "[svc] npu services restarted" | tee -a "$LOG"; }
+restart(){ systemctl --user start xdna-engine.service voxd.service >/dev/null 2>&1; echo "[svc] npu services restarted" | tee -a "$LOG"; }
 beep(){ ( speaker-test -t sine -f 1000 -l 1 >/dev/null 2>&1 & local p=$!; sleep 2; kill -9 "$p" >/dev/null 2>&1 ); }
 trap 'restart; beep; echo "[done] log: $LOG" ' EXIT
 
@@ -80,7 +80,7 @@ fi
 
 # ---- single-tenant ----
 log "\n[svc] stopping npu-asr + voxd for single-tenant NPU ..."
-systemctl --user stop npu-asr.service voxd.service; sleep 2
+systemctl --user stop xdna-engine.service voxd.service; sleep 2
 if fuser /dev/accel/accel0 2>/dev/null; then
   log "[ERR] /dev/accel/accel0 still busy after stopping services — aborting (services will be restarted)."; exit 1
 fi

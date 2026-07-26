@@ -15,7 +15,7 @@ CLIP="$WT/artifacts/wer_clips/en_01.wav"
 TS="$(date +%Y%m%d_%H%M%S)"; LOG="$WT/artifacts/coalesce_e2e_ab_${TS}.log"
 mkdir -p "$WT/artifacts"; : > "$LOG"
 log(){ echo -e "$*" | tee -a "$LOG"; }
-restart(){ systemctl --user start npu-asr.service voxd.service >/dev/null 2>&1; echo "[svc] npu services restarted" | tee -a "$LOG"; }
+restart(){ systemctl --user start xdna-engine.service voxd.service >/dev/null 2>&1; echo "[svc] npu services restarted" | tee -a "$LOG"; }
 trap 'restart; echo "[done] log: $LOG"' EXIT
 
 [ -x "$W3" ] || { log "[ERR] whisper_e2e_timing missing — build: (cd rust && cargo build -p npu-engine --release --bin whisper_e2e_timing)"; exit 1; }
@@ -35,7 +35,7 @@ fi
 
 log "================ COALESCE E2E A/B  $TS ================"
 log "[svc] stopping npu-asr + voxd (single-tenant) ..."
-systemctl --user stop npu-asr.service voxd.service; sleep 2
+systemctl --user stop xdna-engine.service voxd.service; sleep 2
 fuser /dev/accel/accel0 2>/dev/null && { log "[ERR] device busy — aborting"; exit 1; }
 log "[svc] device clear"
 

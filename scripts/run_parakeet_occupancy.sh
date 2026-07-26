@@ -20,7 +20,7 @@ ITERS="${ITERS:-50}"
 LOG="$REPO/artifacts/parakeet/occupancy/run.log"; mkdir -p "$(dirname "$LOG")"
 log(){ echo "$@" | tee -a "$LOG"; }
 
-restart(){ systemctl --user start npu-asr.service voxd.service >/dev/null 2>&1 || true; log "[svc] npu services restarted"; }
+restart(){ systemctl --user start xdna-engine.service voxd.service >/dev/null 2>&1 || true; log "[svc] npu services restarted"; }
 
 # --- CPU-side prep (no NPU) ---
 log "[1/4] CPU goldens + roofline"
@@ -37,7 +37,7 @@ TILE="$TILE" scripts/build_parakeet_occupancy_stub.sh 2>&1 | tee -a "$LOG"
 
 # --- NPU run (serialize) ---
 log "[svc] stopping npu-asr / voxd"
-systemctl --user stop npu-asr.service voxd.service >/dev/null 2>&1 || true; sleep 1
+systemctl --user stop xdna-engine.service voxd.service >/dev/null 2>&1 || true; sleep 1
 trap restart EXIT
 if fuser /dev/accel/accel0 >/dev/null 2>&1; then
   log "FATAL: /dev/accel/accel0 busy -- another session holds the NPU. Aborting (serialize)."
