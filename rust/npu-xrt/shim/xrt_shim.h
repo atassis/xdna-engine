@@ -44,6 +44,11 @@ int shim_run_dwconv6(ShimKernel*, unsigned int opcode, ShimBo* instr, size_t ins
 int shim_run_mha7(ShimKernel*, unsigned int opcode, ShimBo* instr, size_t instr_count,
                   ShimBo* q, ShimBo* kk, ShimBo* v, ShimBo* o);
 
+/* BD-onchip conveyor ABI: kernel(opcode, instr, instr_count, qpv, p, K, V, ctx) — 5 data BOs
+ * (the 4th conveyor stage computes BD on-chip, adding the p input). */
+int shim_run_bd8(ShimKernel*, unsigned int opcode, ShimBo* instr, size_t instr_count,
+                 ShimBo* qpv, ShimBo* p, ShimBo* kk, ShimBo* v, ShimBo* ctx);
+
 /* ASYNC split of shim_run_matmul8: _start submits the run (xrt::kernel::operator() enqueues +
  * starts execution) and returns a run handle WITHOUT waiting, so the host can do other work (prep
  * the next dispatch, post-process the previous) while the NPU computes. _wait blocks for completion.
