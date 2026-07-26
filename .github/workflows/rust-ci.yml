@@ -1,0 +1,35 @@
+name: rust
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # A hosted runner has neither XRT nor onnxruntime, so it cannot build the crates that link them.
+  # It CAN build the pure-host crates, which hold 90 of the 146 workspace tests. The full gate
+  # (whole workspace, clippy + test + the no-features build) is scripts/ci_gate.sh on the dev box.
+  host-crates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      # target-cpu=native in rust/.cargo/config.toml is correct for the single dev host but wrong for
+      # a runner of unknown vintage, so override it here.
+      - name: clippy (host-only crates)
+        working-directory: rust
+        env:
+          RUSTFLAGS: ""
+        run: cargo clippy -p npu-asr-host -p npu-gemma -p npu-weights --all-targets
+
+      - name: test (host-only crates)
+        working-directory: rust
+        env:
+          RUSTFLAGS: ""
+        run: cargo test -p npu-asr-host -p npu-gemma -p npu-weights

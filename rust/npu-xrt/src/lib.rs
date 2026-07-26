@@ -1094,6 +1094,9 @@ mod bf16_pack_tests {
     }
 
     #[test]
+    // The literals below are an arbitrary spread of f32 bit patterns to sweep the packer; 3.14159 and
+    // 2.71828 are sample values, not PI/E. Substituting the constants would change the patterns tested.
+    #[allow(clippy::approx_constant)]
     fn pack_f32_to_bf16_byte_identical_to_scalar() {
         let mut src: Vec<f32> = vec![
             0.0, -0.0, 1.0, -1.0, 0.5, -0.5, 1e-30, -1e-30, 1e30, -1e30,

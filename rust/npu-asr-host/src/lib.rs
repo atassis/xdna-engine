@@ -35,10 +35,16 @@ fn bf16_round_finite(x: f32) -> f32 {
 /// (Branch-free, auto-vectorizable; ~5-8x faster than libm `expf` here.)
 #[doc(hidden)]
 #[inline(always)]
+// The 2^f minimax coefficients below are FITTED constants, transcribed at full reference precision so
+// they stay verifiable against the fit. Coefficient 1 numerically coincides with ln 2 (the leading term
+// of the 2^f expansion), which trips `approx_constant` -- substituting `LN_2` there would assert a
+// mathematical identity the later coefficients do not obey. Both lints are therefore scoped off here.
+#[allow(clippy::approx_constant, clippy::excessive_precision)]
 pub fn fast_exp_nonpos(x: f32) -> f32 {
     // clamp very negative inputs to 0 (e^-100 underflows anyway) to keep the exponent in range
     let x = if x < -87.0 { -87.0 } else { x };
-    const LOG2E: f32 = 1.442695040888963;
+    // bit-identical as f32 to the previous literal 1.442695040888963 (both -> 0x3fb8aa3b)
+    const LOG2E: f32 = std::f32::consts::LOG2_E;
     let y = x * LOG2E; // e^x = 2^y, y <= 0
     let yf = y.floor(); // integer part (<= 0)
     let f = y - yf; // fractional part in [0,1)
@@ -873,6 +879,9 @@ mod tests {
     }
 
     #[test]
+    // 3.14159 here is an arbitrary sample value paired with its exact bf16 image (3.140625), not a use
+    // of PI -- swapping in the constant would change the value under test.
+    #[allow(clippy::approx_constant)]
     fn test_bf16_round() {
         assert_eq!(bf16_round(1.0), 1.0);
         assert_eq!(bf16_round(1.0001), 1.0);
