@@ -29,16 +29,27 @@
 #                upstream passthrough_dmas reference design, known-good). Moves `bytes`
 #                each direction concurrently; aggregate = 2*bytes / t.
 #
-# Multi-column (`--cols C`): declare C independent per-column chains, each with its OWN
-# runtime buffer arg and disjoint L3 region; aiecc's place-tiles pass maps them onto C
-# columns to run concurrently. Tests whether aggregate LPDDR bandwidth scales with shim
-# DMAs (the encoder uses 8 columns). cols=1 is the clean single-stream number; cols=8 the
-# aggregate. (Column spread is confirmed post-placement on a healthy fork instance.)
+# Multi-column (`--cols C`): declare C independent chains, each with its OWN runtime buffer
+# arg and disjoint L3 region, and pin chain c to column c so they run on distinct shim DMAs.
+# Tests whether aggregate LPDDR bandwidth scales with shim DMAs (the encoder uses 8 columns).
+# cols=1 is the clean single-stream number; cols=8 the full-width aggregate; cols>8 wraps to
+# hold spread fixed and raise streams-per-shim.
+#
+# CORRECTION (2026-07-26): this header previously claimed "Column spread is confirmed
+# post-placement on a healthy fork instance." That was WRONG and was measured to be wrong.
+# Without the column pins added the same day, `aie-opt --aie-place-tiles` on this design's
+# own output gave: cols=2 -> 1 shim column, cols=4 -> 2, cols=8 -> 4 shim columns with 6 of
+# 8 chains sharing ONE mem tile. The placer derives a non-core tile's column from its
+# CoreTile peers and this design has none, so every chain fell to the same fallback column
+# and was packed by DMA capacity. Any fan-out number taken before the pins is measuring a
+# ~2-way spread, not an N-way one. Verify placement, do not assume it.
 #
 # TOOLCHAIN: this targets the FORK place-tiles model (atassis/mlir-aie, the project's single
 # blessed toolchain via toolchain.lock / toolchain_up.sh) -- bare resolve_program(), logical
-# tiles placed by the compiler pass, NO Python-side placer and NO explicit Tile() pinning.
-# Do NOT run this against the stale wheel python (old Python-placer model).
+# tiles placed by the compiler pass, NO Python-side placer. The `--cols` pins are partial
+# Tile(col=N) constraints (column only, row still assigned by the pass), which is the
+# place-tiles model's documented middle ground -- NOT the explicit Tile(col,row) pinning the
+# fork model rejects. Do NOT run this against the stale wheel python (old Python-placer model).
 #
 # No compute tile arithmetic is emitted in ANY mode: workers only acquire/release the
 # objectFIFO (the DMA engines, not the VPU, do all the work). That is the whole point --
@@ -65,10 +76,41 @@ import sys
 import numpy as np
 
 from aie.iron import ObjectFifo, Program, Runtime, Worker
-from aie.iron.device import NPU2, NPU2Col1
+from aie.iron.device import (
+    NPU2,
+    NPU2Col1,
+    AnyComputeTile,
+    AnyMemTile,
+    AnyShimTile,
+    Tile,
+)
 
 ELEM = np.int32
 ELEM_BYTES = 4
+
+
+# ---- column pinning -------------------------------------------------------------------
+# A partially-placed Tile(col=N) constrains only the COLUMN and leaves the row to the
+# place-tiles pass (`aie.logical_tile` carries an optional `col`, read by the placer's
+# tryGetCol()). This is NOT the explicit Tile(col,row) pinning the fork model rejects --
+# the placer still assigns physical tiles; we only tell it which column each independent
+# chain belongs to.
+#
+# WHY IT IS NEEDED: the placer derives a non-core tile's target column from its CoreTile
+# peers. This design has no compute tiles, so every chain resolves to the same fallback
+# column and the placer packs them by DMA capacity -- measured, --cols 8 landed on 4 shim
+# columns with 6 of 8 chains sharing ONE mem tile. That silently turns an N-way fan-out
+# benchmark into a ~2-way one.
+#
+# Two logical shim tiles per chain (fill side + drain side) both constrained to the SAME
+# column is deliberate: the default merge collapses them onto ONE physical shim, so a chain
+# uses that column's MM2S and S2MM, and the column constraint is what keeps DIFFERENT chains
+# off each other. cols > device columns wraps, which is a legitimate configuration -- it
+# holds spatial spread fixed and raises streams-per-shim (a shim has 2 MM2S + 2 S2MM, so
+# cols=16 on 8 columns is still within channel budget).
+def _pinned(col, any_tile):
+    """Tile constrained to `col` (row left to the placer), or `any_tile` when unpinned."""
+    return any_tile if col is None else Tile(col=col)
 
 
 def _consume_fn(of_cons):
@@ -85,7 +127,7 @@ def _produce_fn(of_prod):
     of_prod.release(1)
 
 
-def build_module(dev, mode, total_bytes, line_bytes, cols, depth):
+def build_module(dev, mode, total_bytes, line_bytes, cols, depth, pin_cols=True):
     assert mode in ("read", "write", "rdwr")
     assert total_bytes % (cols * line_bytes) == 0, (
         f"bytes ({total_bytes}) must divide evenly into cols*line "
@@ -102,25 +144,32 @@ def build_module(dev, mode, total_bytes, line_bytes, cols, depth):
     workers = []
     fifos_in = []   # producer handles the runtime fills (read / rdwr)
     fifos_out = []  # consumer handles the runtime drains (write / rdwr)
+    shims_in = []   # per-chain shim placement for each fill  (parallel to fifos_in)
+    shims_out = []  # per-chain shim placement for each drain (parallel to fifos_out)
 
     for c in range(cols):
-        # Fork place-tiles model: NO explicit Tile placement. We declare `cols` independent
-        # objectFIFO chains (+ workers) and aiecc's place-tiles pass maps them onto distinct
-        # columns/shim DMAs (the same idiom the whole_array generator uses for its per-column
-        # A/B/C fifos). cols=1 is the clean single-stream number; cols=8 the aggregate.
+        # Chain c owns column c (wrapping past the device width). Fresh Tile objects per
+        # endpoint -- see the _pinned() header for why both shim endpoints share a column.
+        col = (c % dev.cols) if pin_cols else None
         of_in = ObjectFifo(line_ty, name=f"in{c}", depth=depth)
 
         if mode == "rdwr":
-            of_out = of_in.cons().forward()
+            of_out = of_in.cons().forward(tile=_pinned(col, AnyMemTile))
             fifos_in.append(of_in)
+            shims_in.append(_pinned(col, AnyShimTile))
             fifos_out.append(of_out)
+            shims_out.append(_pinned(col, AnyShimTile))
         elif mode == "read":
-            workers.append(Worker(_consume_fn, [of_in.cons()]))
+            workers.append(Worker(_consume_fn, [of_in.cons()],
+                                  tile=_pinned(col, AnyComputeTile)))
             fifos_in.append(of_in)
+            shims_in.append(_pinned(col, AnyShimTile))
         else:  # write
             of_out = ObjectFifo(line_ty, name=f"out{c}", depth=depth)
-            workers.append(Worker(_produce_fn, [of_out.prod()]))
+            workers.append(Worker(_produce_fn, [of_out.prod()],
+                                  tile=_pinned(col, AnyComputeTile)))
             fifos_out.append(of_out)
+            shims_out.append(_pinned(col, AnyShimTile))
 
     # Runtime sequence: one buffer arg per active L3 region. read=C inputs; write=C
     # outputs; rdwr=C inputs then C outputs. The harness mirrors this argument order.
@@ -139,13 +188,13 @@ def build_module(dev, mode, total_bytes, line_bytes, cols, depth):
         # full L3->L1 read has landed.
         for i, of_in in enumerate(fifos_in):
             wait = (mode == "read") and (i == n_in - 1)
-            rt.fill(of_in.prod(), args[ai], wait=wait)
+            rt.fill(of_in.prod(), args[ai], wait=wait, tile=shims_in[i])
             ai += 1
         # Drains (write + rdwr): wait=True on the last drain so the dispatch blocks until
         # the full L1->L3 write (and, for rdwr, the round-trip) has completed.
         for i, of_out in enumerate(fifos_out):
             wait = (i == n_out - 1)
-            rt.drain(of_out.cons(), args[ai], wait=wait)
+            rt.drain(of_out.cons(), args[ai], wait=wait, tile=shims_out[i])
             ai += 1
 
     # Fork place-tiles model: bare resolve_program() -- aiecc's place-tiles pass assigns
@@ -160,13 +209,20 @@ def main():
                    help="total LPDDR bytes per direction (across all columns)")
     p.add_argument("--line", type=int, default=4096,
                    help="objectFIFO transfer granularity in bytes (BD size)")
-    p.add_argument("--cols", type=int, default=1, help="number of shim columns (1..8)")
+    p.add_argument("--cols", type=int, default=1,
+                   help="number of independent DMA chains (>8 wraps: 2+ chains per column)")
     p.add_argument("--depth", type=int, default=2, help="objectFIFO depth (double-buffer)")
     p.add_argument("--dev", choices=["npu2"], default="npu2")
+    p.add_argument("--no-pin-cols", dest="pin_cols", action="store_false",
+                   help="do NOT constrain each chain to its own column -- reproduces the "
+                        "packed placement (4 shim cols / 2 mem tiles at --cols 8). Kept for "
+                        "the pinned-vs-packed A/B; do not use for a fan-out number.")
+    p.set_defaults(pin_cols=True)
     a = p.parse_args()
 
     dev = NPU2() if a.cols > 1 else NPU2Col1()
-    module = build_module(dev, a.mode, a.bytes, a.line, a.cols, a.depth)
+    module = build_module(dev, a.mode, a.bytes, a.line, a.cols, a.depth,
+                          pin_cols=a.pin_cols)
     print(module)
 
 

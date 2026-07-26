@@ -53,16 +53,24 @@ SWEEP_DEPTH="${SWEEP_DEPTH:-2 4}"
 # 64KB .. 64MB, x4 steps. Small points pin the fixed floor; large points the BW slope.
 SWEEP_BYTES="${SWEEP_BYTES:-65536 262144 1048576 4194304 16777216 67108864}"
 
+# Column pinning (default ON). PIN_COLS=0 reproduces the PACKED placement -- kept only for
+# the pinned-vs-packed A/B. The tag carries the state so the two never share a filename:
+# a packed cols=8 xclbin actually spans 4 shim columns, and silently benchmarking it as if
+# it were 8-way is exactly the error this suffix exists to prevent.
+PIN_COLS="${PIN_COLS:-1}"
+if [[ "$PIN_COLS" == "0" ]]; then PINFLAG="--no-pin-cols"; PINTAG="_nopin"; else PINFLAG=""; PINTAG="_pin"; fi
+
 build_one() {  # $1=mode $2=cols $3=line $4=depth $5=bytes
   local mode=$1 cols=$2 line=$3 depth=$4 bytes=$5
   if (( bytes % (cols * line) != 0 )); then
     echo "  skip ${mode} c${cols} l${line} d${depth} ${bytes}: not divisible by cols*line"; return 0
   fi
-  local tag="lpddr_${mode}_c${cols}_l${line}_d${depth}_${bytes}"
+  local tag="lpddr_${mode}_c${cols}_l${line}_d${depth}_${bytes}${PINTAG}"
   local mlir="$WORK/${tag}.mlir"
   echo "== gen+build ${tag} =="
   .venv-iron/bin/python "$GEN" \
-      --mode "$mode" --bytes "$bytes" --line "$line" --depth "$depth" --cols "$cols" --dev npu2 > "$mlir"
+      --mode "$mode" --bytes "$bytes" --line "$line" --depth "$depth" --cols "$cols" --dev npu2 \
+      $PINFLAG > "$mlir"
   ( cd "$WORK" && "$AIECC" --aie-generate-xclbin --xclbin-name="${tag}.xclbin" \
         --no-xchesscc --no-xbridge \
         --aie-generate-npu-insts --npu-insts-name="${tag}.insts.bin" "$mlir" )

@@ -33,10 +33,14 @@ xclbin/insts naming (produced by scripts/build_lpddr_bw_microbench.sh):
 import argparse
 import json
 import os
+import random
 import sys
 import time
 
 import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from npu_power_mode import require_pinned  # noqa: E402
 
 REPO = os.environ.get("PARAKEET_TOOLROOT",
                       os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -53,9 +57,15 @@ def moved_bytes(mode, total_bytes):
     return 2 * total_bytes if mode == "rdwr" else total_bytes
 
 
-def artifact_paths(build_dir, mode, cols, line, depth, total_bytes):
+def artifact_paths(build_dir, mode, cols, line, depth, total_bytes, pin=True):
+    """Locate a built (mode, cols, line, depth, bytes) pair.
+
+    `pin` selects the column-pinned artifacts (chain c on column c) vs the packed ones
+    built with PIN_COLS=0. They are DIFFERENT TOPOLOGIES at the same `cols` -- a packed
+    cols=8 design occupies 4 shim columns -- so they must never resolve to one filename."""
+    suffix = "_pin" if pin else "_nopin"
     base = os.path.join(build_dir,
-                        f"lpddr_{mode}_c{cols}_l{line}_d{depth}_{total_bytes}")
+                        f"lpddr_{mode}_c{cols}_l{line}_d{depth}_{total_bytes}{suffix}")
     return base + ".xclbin", base + ".insts.bin"
 
 
@@ -121,6 +131,94 @@ def regress(points):
     }
 
 
+def spread(vals):
+    """max/min ratio of a sample -- the honesty check on whether an effect is resolvable."""
+    lo, hi = min(vals), max(vals)
+    return (hi / lo) if lo > 0 else float("inf")
+
+
+def inst_bw(mode, total_bytes, t_us):
+    """Instantaneous GB/s for one timed dispatch (no overhead subtraction)."""
+    return (moved_bytes(mode, total_bytes) / 1e6) / (t_us / 1e6) / 1e3
+
+
+def report_interleaved(results):
+    """Report an interleaved multi-round sweep: per-config median + spread, and the
+    per-round RATIO against the fan-out baseline.
+
+    The ratio is the reported quantity, not the absolute. Configs are visited adjacent
+    in time so any residual clock drift moves them together and cancels in the ratio;
+    the absolute still carries whatever drift the round sat on. If a config's own
+    round-to-round spread exceeds the ratio being claimed, the effect is NOT resolved
+    and this says so rather than quoting a number."""
+    mode, rounds = results["mode"], results["rounds"]
+    obs = results["observations"]  # [{round, cols, line, depth, bytes, t_us}]
+    print(f"\n=== interleaved LPDDR sweep: mode={mode} rounds={rounds} "
+          f"iters={results['iters']} power={results.get('power_mode')} ===")
+
+    keyed = {}
+    for o in obs:
+        keyed.setdefault((o["cols"], o["line"], o["depth"], o["bytes"]), []).append(o)
+
+    print(f"\n  {'cols':>5} {'line':>6} {'depth':>6} {'bytes':>10} {'med_GB/s':>9} "
+          f"{'spread':>7} {'n':>3}")
+    per_cfg = {}
+    for key in sorted(keyed):
+        cols, line, depth, tb = key
+        bws = sorted(inst_bw(mode, tb, o["t_us"]) for o in keyed[key])
+        med = bws[len(bws) // 2]
+        sp = spread(bws)
+        per_cfg[key] = {"median_GB_s": med, "spread": sp, "n": len(bws),
+                        "all_GB_s": [round(b, 3) for b in bws]}
+        print(f"  {cols:>5} {line:>6} {depth:>6} {tb:>10} {med:9.2f} {sp:7.2f}x {len(bws):>3}")
+
+    # Fan-out ratio: for each (line, depth, bytes), compare each cols against the
+    # smallest cols measured, ROUND BY ROUND, then median the per-round ratios.
+    all_cols = sorted({k[0] for k in keyed})
+    ratios = {}
+    if len(all_cols) > 1:
+        base_cols = all_cols[0]
+        print(f"\n  -- fan-out ratio vs cols={base_cols} (per-round, drift common-mode) --")
+        for cols in all_cols[1:]:
+            per_round = []
+            for shape in sorted({(k[1], k[2], k[3]) for k in keyed}):
+                bkey, ckey = (base_cols,) + shape, (cols,) + shape
+                if bkey not in keyed or ckey not in keyed:
+                    continue
+                bybase = {o["round"]: o["t_us"] for o in keyed[bkey]}
+                for o in keyed[ckey]:
+                    if o["round"] in bybase:
+                        per_round.append(inst_bw(mode, shape[2], o["t_us"]) /
+                                         inst_bw(mode, shape[2], bybase[o["round"]]))
+            if not per_round:
+                continue
+            per_round.sort()
+            med_r = per_round[len(per_round) // 2]
+            # RESOLUTION TEST: a sign test on the per-round ratios. The ratio is already
+            # drift-immune (numerator and denominator sit in the same round), so the
+            # question is only whether every round agrees on the DIRECTION. A range that
+            # straddles 1.0 means some rounds saw fan-out help and others saw it hurt --
+            # that is noise, whatever the median says. Comparing against the within-config
+            # spread instead would be wrong: that spread is inflated by the very drift the
+            # ratio cancels, so it would reject real effects.
+            lo, hi = per_round[0], per_round[-1]
+            resolved = lo > 1.0 or hi < 1.0
+            worst_spread = max(per_cfg[k]["spread"] for k in keyed if k[0] in (base_cols, cols))
+            ratios[cols] = {"median_ratio": med_r, "min": lo, "max": hi,
+                            "n": len(per_round), "worst_within_config_spread": worst_spread,
+                            "resolved": bool(resolved)}
+            verdict = ("RESOLVED" if resolved else
+                       "NOT RESOLVED (per-round ratios straddle 1.0)")
+            print(f"  cols={cols:>2}: median {med_r:5.2f}x  range {lo:.2f}-{hi:.2f}x  "
+                  f"n={len(per_round):>3}  (abs spread {worst_spread:.2f}x)  -> {verdict}")
+        if ratios and not any(r["resolved"] for r in ratios.values()):
+            print("\n  ==> NO fan-out factor is established by this run. Do not quote one.")
+
+    results["per_config"] = {"/".join(map(str, k)): v for k, v in per_cfg.items()}
+    results["fanout_ratios"] = ratios
+    return results
+
+
 def report_config(cfg, mode):
     """Print one (line,depth) config's bytes-sweep + regression; return its regression dict."""
     print(f"\n  -- line={cfg['line']}B depth={cfg['depth']} --")
@@ -175,11 +273,36 @@ def main():
     ap.add_argument("--sweep-bytes", type=int, nargs="*",
                     default=[65536, 262144, 1048576, 4194304, 16777216, 67108864],
                     help="total bytes per direction (default 64KB..64MB x4 steps)")
+    ap.add_argument("--sweep-cols", type=int, nargs="*", default=None,
+                    help="column counts to compare AS AN INTERLEAVED AXIS (the fan-out "
+                         "question). Implies --rounds>1; needs xclbins built per cols.")
+    ap.add_argument("--rounds", type=int, default=1,
+                    help="interleaved repeats. >1 visits every config each round so clock "
+                         "drift is common-mode and cancels in the reported RATIO. Default 1 "
+                         "= legacy sequential sweep + regression.")
+    ap.add_argument("--shuffle", action="store_true",
+                    help="randomise config order within each round (defeats residual "
+                         "order effects that survive interleaving)")
+    ap.add_argument("--seed", type=int, default=0, help="RNG seed for --shuffle")
+    ap.add_argument("--packed", dest="pin", action="store_false",
+                    help="use the PACKED-placement artifacts (built with PIN_COLS=0) instead "
+                         "of the column-pinned ones. Different topology at the same --cols; "
+                         "for the pinned-vs-packed A/B only.")
+    ap.set_defaults(pin=True)
+    ap.add_argument("--allow-unpinned", action="store_true",
+                    help="run even if the NPU power mode is unpinned. Numbers so taken are "
+                         "NOT canonical -- they alias the DVFS ramp into the swept variable.")
     a = ap.parse_args()
 
     if a.analyze_only:
-        report(json.load(open(a.analyze_only)))
+        doc = json.load(open(a.analyze_only))
+        report_interleaved(doc) if doc.get("observations") else report(doc)
         return 0
+
+    # Gate BEFORE touching the device: an unpinned sweep is not worth the device window.
+    if a.allow_unpinned:
+        os.environ["NPU_ALLOW_UNPINNED"] = "1"
+    power_mode = require_pinned()
 
     try:
         import pyxrt
@@ -187,26 +310,61 @@ def main():
         sys.exit(f"pyxrt import failed ({e}); run inside .venv-iron with the NPU free")
     dev = pyxrt.device(0)
     os.makedirs(OUTDIR, exist_ok=True)
-    results = {"mode": a.mode, "cols": a.cols, "iters": a.iters, "configs": []}
-    for line in a.sweep_line:
-        for depth in a.sweep_depth:
-            cfg = {"line": line, "depth": depth, "points": []}
-            for tb in a.sweep_bytes:
-                if tb % (a.cols * line) != 0:
-                    continue
-                xclbin, insts = artifact_paths(a.build_dir, a.mode, a.cols, line, depth, tb)
-                if not (os.path.exists(xclbin) and os.path.exists(insts)):
-                    print(f"  skip l{line} d{depth} bytes={tb}: missing "
-                          f"{os.path.basename(xclbin)} -- build it first")
-                    continue
-                t_med, t_min = measure_one(pyxrt, dev, xclbin, insts, a.mode, a.cols, tb, a.iters)
-                cfg["points"].append({"bytes": tb, "t_med_us": round(t_med, 2),
-                                      "t_min_us": round(t_min, 2)})
-                print(f"  l{line} d{depth} bytes={tb}: t_med={t_med:.1f}us t_min={t_min:.1f}us")
-            if cfg["points"]:
-                results["configs"].append(cfg)
-    report(results)
-    outp = os.path.join(OUTDIR, f"lpddr_bw_{a.mode}_c{a.cols}_results.json")
+
+    cols_axis = a.sweep_cols if a.sweep_cols else [a.cols]
+    rounds = max(a.rounds, 2) if a.sweep_cols else a.rounds
+    interleaved = rounds > 1 or len(cols_axis) > 1
+
+    # Materialise the config list once; skip anything whose xclbin is not built.
+    plan = []
+    for cols in cols_axis:
+        for line in a.sweep_line:
+            for depth in a.sweep_depth:
+                for tb in a.sweep_bytes:
+                    if tb % (cols * line) != 0:
+                        continue
+                    xclbin, insts = artifact_paths(a.build_dir, a.mode, cols, line, depth,
+                                                   tb, pin=a.pin)
+                    if not (os.path.exists(xclbin) and os.path.exists(insts)):
+                        print(f"  skip c{cols} l{line} d{depth} bytes={tb}: missing "
+                              f"{os.path.basename(xclbin)} -- build it first")
+                        continue
+                    plan.append((cols, line, depth, tb, xclbin, insts))
+    if not plan:
+        sys.exit("no built configs matched the sweep -- build the xclbins first")
+
+    if not interleaved:
+        results = {"mode": a.mode, "cols": a.cols, "iters": a.iters,
+                   "power_mode": power_mode, "configs": []}
+        bycfg = {}
+        for cols, line, depth, tb, xclbin, insts in plan:
+            t_med, t_min = measure_one(pyxrt, dev, xclbin, insts, a.mode, cols, tb, a.iters)
+            bycfg.setdefault((line, depth), []).append(
+                {"bytes": tb, "t_med_us": round(t_med, 2), "t_min_us": round(t_min, 2)})
+            print(f"  l{line} d{depth} bytes={tb}: t_med={t_med:.1f}us t_min={t_min:.1f}us")
+        for (line, depth), points in bycfg.items():
+            results["configs"].append({"line": line, "depth": depth, "points": points})
+        report(results)
+        outp = os.path.join(OUTDIR, f"lpddr_bw_{a.mode}_c{a.cols}_results.json")
+    else:
+        rng = random.Random(a.seed)
+        results = {"mode": a.mode, "cols": cols_axis, "iters": a.iters, "rounds": rounds,
+                   "shuffled": a.shuffle, "power_mode": power_mode, "observations": []}
+        print(f"[plan] {len(plan)} configs x {rounds} rounds = {len(plan) * rounds} timed visits")
+        for r in range(rounds):
+            order = list(plan)
+            if a.shuffle:
+                rng.shuffle(order)
+            for cols, line, depth, tb, xclbin, insts in order:
+                t_med, _ = measure_one(pyxrt, dev, xclbin, insts, a.mode, cols, tb, a.iters)
+                results["observations"].append(
+                    {"round": r, "cols": cols, "line": line, "depth": depth,
+                     "bytes": tb, "t_us": round(t_med, 2)})
+            print(f"  round {r + 1}/{rounds} done")
+        report_interleaved(results)
+        tag = "-".join(map(str, cols_axis))
+        outp = os.path.join(OUTDIR, f"lpddr_bw_{a.mode}_c{tag}_interleaved.json")
+
     json.dump(results, open(outp, "w"), indent=2)
     print(f"\nwrote {outp}")
     return 0
