@@ -97,7 +97,11 @@ fn transcriptions(req: &Request, handle: &Handle) -> Response {
         Some(s) if !s.is_empty() => s,
         _ => return (400, "{\"error\":\"bad wav (need 16k mono 16-bit)\"}".into()),
     };
-    match handle.transcribe(None, samples, 16_000) {
+    // OpenAI's transcription request carries `model` as a form field. This route used to drop it and
+    // always serve the default, which left ASR -- the capability this engine actually ships -- with
+    // no way to pick a model per request even though the actor has always taken one.
+    let model = parse::extract_form_field(&req.body, &req.boundary, "model");
+    match handle.transcribe(model.as_deref(), samples, 16_000) {
         Ok(s) => (200, format!("{{\"text\":\"{}\",\"model\":\"{}\"}}",
             parse::json_escape(&s.value), parse::json_escape(&s.model))),
         Err(e) => (500, format!("{{\"error\":\"{}\"}}", parse::json_escape(&e.to_string()))),
@@ -266,6 +270,23 @@ pub mod parse {
         }
         None
     }
+    /// Value of a plain (non-file) multipart form field, e.g. `model` on a transcription request.
+    /// Parts carrying a `filename=` are skipped: those are uploads, handled by `extract_file_part`.
+    pub fn extract_form_field(body: &[u8], boundary: &str, field: &str) -> Option<String> {
+        if boundary.is_empty() { return None; }
+        let delim = format!("--{boundary}");
+        let want = format!("name=\"{}\"", field.to_ascii_lowercase());
+        for part in split_on(body, delim.as_bytes()) {
+            let hdr_end = match find(part, b"\r\n\r\n") { Some(h) => h, None => continue };
+            let headers = String::from_utf8_lossy(&part[..hdr_end]).to_ascii_lowercase();
+            if !headers.contains(&want) || headers.contains("filename=") { continue; }
+            let mut data = &part[hdr_end + 4..];
+            if data.ends_with(b"\r\n") { data = &data[..data.len() - 2]; }
+            let v = String::from_utf8_lossy(data).trim().to_string();
+            return if v.is_empty() { None } else { Some(v) };
+        }
+        None
+    }
     pub fn split_on<'a>(hay: &'a [u8], sep: &[u8]) -> Vec<&'a [u8]> {
         let mut out = Vec::new();
         let (mut start, mut i) = (0usize, 0usize);
@@ -321,6 +342,19 @@ pub mod parse {
         fn json_escape_quotes_and_newlines() { assert_eq!(json_escape("a\"b\nc"), "a\\\"b\\nc"); }
         #[test]
         fn parse_wav_rejects_non_riff() { assert!(parse_wav_i16(b"not a wav").is_none()); }
+        #[test]
+        fn form_field_reads_model_and_ignores_the_upload() {
+            let b = "X";
+            let body = concat!(
+                "--X\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\ngigaam\r\n",
+                "--X\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\n\r\nRIFF\r\n",
+                "--X--\r\n").as_bytes();
+            assert_eq!(extract_form_field(body, b, "model").as_deref(), Some("gigaam"));
+            assert_eq!(extract_form_field(body, b, "language"), None);
+            // The file part must not be mistaken for a text field even when asked for by name.
+            assert_eq!(extract_form_field(body, b, "file"), None);
+            assert_eq!(extract_file_part(body, b), Some(&b"RIFF"[..]));
+        }
     }
 }
 
