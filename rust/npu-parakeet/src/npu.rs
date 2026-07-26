@@ -2322,14 +2322,22 @@ impl NpuMatmul {
     /// xclbin is absent; PANICS on an unbuilt scale.
     pub fn residual_add_dev(&self, a_bo: &Bo, b_bo: &Bo, scale: f32, _m: usize) -> Option<Rc<Bo>> {
         let rl = self.resident_ln()?;
-        let ra = if (scale - 0.5).abs() < 1e-6 {
+        // TIMING PROBE ONLY (PARAKEET_RESADD_ONESCALE=1): force every residual through the s100
+        // xclbin. The MATH IS WRONG wherever scale=0.5 was wanted -- this exists solely to measure what
+        // the s050<->s100 alternation costs in hw-context switches (4x per block = 96/clip), i.e. what
+        // putting `scale` on an RTP slot would buy. NEVER a correctness path; the rel-L2 gate will and
+        // should fail under it. See [[rtp-slot-not-dma-channel-for-runtime-params]].
+        let one_scale = std::env::var("PARAKEET_RESADD_ONESCALE").map(|v| v != "0").unwrap_or(false);
+        let ra = if one_scale {
+            rl.resadd_s100.as_ref()?
+        } else if (scale - 0.5).abs() < 1e-6 {
             rl.resadd_s050.as_ref()?
         } else if (scale - 1.0).abs() < 1e-6 {
             rl.resadd_s100.as_ref()?
         } else {
             panic!("residual_add_dev: scale {scale} has no built xclbin (only s050=0.5, s100=1.0); build final_resadd_{PAD_M}x{KRES}_s<stag>");
         };
-        debug_assert!((ra.scale - scale).abs() < 1e-6);
+        debug_assert!(one_scale || (ra.scale - scale).abs() < 1e-6);
         // Alternate ping/pong so this dispatch never writes the buffer the PREVIOUS same-scale call
         // returned (which the caller may still be reading as `a_bo`/`b_bo` -- the fused block chains
         // two s100 adds exactly that way).
