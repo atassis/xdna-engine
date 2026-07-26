@@ -190,6 +190,11 @@ pub struct NpuMatmul {
     // Tri-state cache: None = untried; Some(None) = xclbins absent, FF stays host (no retry);
     // Some(Some) = co-resident on-chip LN + affine-cast chain loaded.
     resident_ln: RefCell<Option<Option<Rc<ResidentLn>>>>,
+    // Scoped override for the K=DFF fc2 collapse, so a caller can pin the fc2 path without touching
+    // process env. Used by ffn_devacc_selftest, whose whole claim is that host-sum and device-sum of the
+    // SAME K-split partials are bit-identical -- a claim the K=DFF collapse does not make (different L1
+    // accumulation, bfp16), so it must gate the 4-split explicitly rather than inherit the default.
+    k4096_override: std::cell::Cell<Option<bool>>,
     pub stats: RefCell<NpuStats>,
 }
 
@@ -469,6 +474,7 @@ impl NpuMatmul {
             conveyor: RefCell::new(None),
             ln_dir: root.join("artifacts/parakeet/ln"),
             resident_ln: RefCell::new(None),
+            k4096_override: std::cell::Cell::new(None),
             stats: RefCell::new(NpuStats::default()),
         }
     }
@@ -1767,8 +1773,21 @@ impl NpuMatmul {
     ///   (identity, on-chip K-reduce, [t,KRES]) -> read [t,KRES] f32.
     /// No host K-split / accumulate. `make_w1` = [KRES,DFF] fc1 weight; `make_w2` = [DFF,KRES] fc2.
     /// True when the one-dispatch K=DFF fc2 collapse is enabled (opt-in `PARAKEET_FC2_K4096`).
+    /// Whether fc2 takes the one-dispatch K=DFF collapse.
+    ///
+    /// DEFAULT-ON INSIDE THE FUSED BLOCK, off otherwise. Measured worth exactly -336 dispatches/clip
+    /// there (9 -> 2 dispatches per device-FFN call, x2 FFN/block since the fused block runs ff1 AND ff2
+    /// on device, x24 blocks) and it is already covered by the rel-L2 gate. It is NOT flipped on for the
+    /// shipped default path: that is a shipped-default flip, which is an owner gate.
+    /// `PARAKEET_FC2_K4096=0`/`=1` overrides either way; the in-process override wins over both.
     fn fc2_k4096_on(&self) -> bool {
-        std::env::var("PARAKEET_FC2_K4096").map(|v| v != "0").unwrap_or(false)
+        if let Some(f) = self.k4096_override.get() {
+            return f;
+        }
+        match std::env::var("PARAKEET_FC2_K4096") {
+            Ok(v) => v != "0",
+            Err(_) => std::env::var("PARAKEET_FUSED_BLOCK").is_ok(),
+        }
     }
 
     /// Shared one-dispatch K=DFF fc2: cast the fc1 output (`fc1_out` f32 [PAD_M,DFF]) to bf16 row-major,
@@ -2108,11 +2127,16 @@ impl NpuMatmul {
         // Same ids -> the host path caches w1/w2c on first touch; the dev path hits the cache, so both
         // paths use bit-identical partials (only host-sum vs device-sum differs).
         let (w1a, w2a) = (w1.clone(), w2.clone());
+        // This test's claim is host-sum vs device-sum of the SAME K-split partials -> bit-identical.
+        // The K=DFF collapse is a different computation and does not make that claim, so pin the 4-split
+        // for the duration regardless of env/default. (Its own correctness is covered by the rel-L2 gate.)
+        let prev = self.k4096_override.replace(Some(false));
         let host = self.resident_ffn(&x, &gamma, &beta,
             move || w1a, "selftest.ffn.l1", move || w2a, "selftest.ffn.l2");
         let dev = self.resident_ffn_devacc_readback(&x, &gamma, &beta,
-            move || w1, "selftest.ffn.l1", move || w2, "selftest.ffn.l2")?;
-        Some((host, dev))
+            move || w1, "selftest.ffn.l1", move || w2, "selftest.ffn.l2");
+        self.k4096_override.set(prev);
+        Some((host, dev?))
     }
 
     /// Task-5 debug parity: `matmul_id` (host-read reference) vs `matmul_id_to_bo` (device-out) on the
