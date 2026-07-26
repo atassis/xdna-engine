@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
-use npu_runtime::actor::start;
+use npu_runtime::actor::{start, start_lazy};
 use npu_runtime::config::{Config, EvictPolicy};
 use npu_runtime::http;
 use npu_runtime::loader::EngineLoader;
@@ -141,7 +141,8 @@ fn serve(path: &Path, port: Option<u16>) -> Result<()> {
 fn transcribe(path: &Path, wav: &Path, model: Option<&str>) -> Result<()> {
     let cfg = load_cfg(path)?;
     let root = root(&cfg)?;
-    let (handle, join) = start(cfg, Box::new(EngineLoader { root }));
+    // Lazy: a one-shot run should load the model it serves, and nothing else.
+    let (handle, join) = start_lazy(cfg, Box::new(EngineLoader { root }));
     let bytes = std::fs::read(wav).with_context(|| format!("read {}", wav.display()))?;
     let samples = http::parse::parse_wav_i16(&bytes).ok_or_else(|| anyhow!("bad wav (need 16k mono 16-bit)"))?;
     let out = handle.transcribe(model, samples, 16_000).map_err(|e| anyhow!(e.to_string()));
@@ -153,7 +154,9 @@ fn transcribe(path: &Path, wav: &Path, model: Option<&str>) -> Result<()> {
 fn embed(path: &Path, text: &str, model: Option<&str>) -> Result<()> {
     let cfg = load_cfg(path)?;
     let root = root(&cfg)?;
-    let (handle, join) = start(cfg, Box::new(EngineLoader { root }));
+    // Lazy: `npu embed` against an ASR-only config used to pay a full parakeet load before it could
+    // say there was no embed model at all.
+    let (handle, join) = start_lazy(cfg, Box::new(EngineLoader { root }));
     let out = handle.embed(model, text).map_err(|e| anyhow!(e.to_string()));
     handle.shutdown(); let _ = join.join();
     let v = out?.value;

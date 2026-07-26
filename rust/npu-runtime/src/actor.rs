@@ -42,7 +42,25 @@ enum Cmd {
 pub struct Handle { tx: Sender<Cmd> }
 
 /// Spawn the actor with an initial config + a loader; performs the initial reconcile before returning.
+/// This is the SERVICE start: a server should come up warm and answer `/v1/models` with what is
+/// really resident. For a one-shot invocation use [`start_lazy`].
 pub fn start(cfg: Config, loader: Box<dyn ModelLoader + Send>) -> (Handle, JoinHandle<()>) {
+    spawn(cfg, loader, true)
+}
+
+/// Spawn the actor WITHOUT loading anything: models are declared from their scenarios (host-only,
+/// no device) and load when a request routes to one.
+///
+/// For a one-shot `npu embed` / `npu transcribe`, the eager reconcile is pure waste and worse than
+/// waste: with `max_resident = 1` it loads the first configured model, and the request then evicts it
+/// to load the one it actually wanted -- two full device loads to serve one request. Worse, `npu
+/// embed` against an ASR-only config paid a complete parakeet load before it could report that no
+/// embed model was configured at all. Declaring is enough to route correctly.
+pub fn start_lazy(cfg: Config, loader: Box<dyn ModelLoader + Send>) -> (Handle, JoinHandle<()>) {
+    spawn(cfg, loader, false)
+}
+
+fn spawn(cfg: Config, loader: Box<dyn ModelLoader + Send>, eager: bool) -> (Handle, JoinHandle<()>) {
     let (tx, rx) = channel::<Cmd>();
     let (ready_tx, ready_rx) = channel::<()>();
     let join = std::thread::spawn(move || {
@@ -52,7 +70,14 @@ pub fn start(cfg: Config, loader: Box<dyn ModelLoader + Send>) -> (Handle, JoinH
         // "actor stopped" and the real cause was gone. Model constructors still `.expect()` on
         // missing artifacts, so a bad config or a moved weights dir landed here. Catch it: the
         // actor survives, and the panic message is returned as the error the caller sees.
-        let _ = guard(|| reconcile(&cfg, &mut reg, loader.as_ref()));
+        if eager {
+            let _ = guard(|| reconcile(&cfg, &mut reg, loader.as_ref()));
+        } else {
+            for m in &cfg.models {
+                let kind = guard(|| loader.declared_kind(m)).unwrap_or(None);
+                reg.declare(m, kind);
+            }
+        }
         let _ = ready_tx.send(());
         // `recv_timeout` rather than `recv`: the actor is the ONLY owner of the single-tenant NPU,
         // so idle unload has to happen on this thread or not at all. Waking on a timeout gives the
@@ -246,6 +271,52 @@ mod tests {
         // The whole point: the next request just works, no /admin/reload.
         assert_eq!(h.embed(None, "again").unwrap().model, "bge");
         assert_eq!(state_of(&h, "bge"), LoadState::Loaded);
+        h.shutdown(); j.join().unwrap();
+    }
+
+    #[test]
+    fn lazy_start_declares_without_loading_then_loads_only_what_it_serves() {
+        let mut t = BTreeMap::new();
+        t.insert("asr".to_string(), Ok((ModelKind::Asr, 1)));
+        t.insert("bge".to_string(), Ok((ModelKind::Embed, 1)));
+        let cfg = Config {
+            server: ServerCfg { max_resident: 1, idle_unload_s: 0, ..Default::default() },
+            defaults: Defaults { asr: Some("asr".into()), embed: Some("bge".into()) },
+            models: vec![
+                ModelCfg { name: "asr".into(), scenario: "x".into() },
+                ModelCfg { name: "bge".into(), scenario: "y".into() },
+            ],
+        };
+        let (h, j) = start_lazy(cfg, Box::new(MockLoader { table: t }));
+        // Nothing loaded, but both are known -- including their capability, read from the scenario.
+        let s = h.status();
+        assert!(s.iter().all(|x| x.state == LoadState::Unloaded), "lazy start must not load: {s:?}");
+        assert_eq!(s.iter().find(|x| x.name == "bge").unwrap().kind, Some(ModelKind::Embed));
+        // The embed request loads bge and ONLY bge -- eagerly, this would have loaded asr first and
+        // then evicted it at max_resident = 1.
+        assert_eq!(h.embed(None, "hi").unwrap().model, "bge");
+        assert_eq!(state_of(&h, "bge"), LoadState::Loaded);
+        assert_eq!(state_of(&h, "asr"), LoadState::Unloaded);
+        h.shutdown(); j.join().unwrap();
+    }
+
+    #[test]
+    fn lazy_start_reports_a_missing_capability_without_touching_the_device() {
+        // The shipped shape: one ASR model, no embed model anywhere. `npu embed` must say so, not
+        // load an ASR model to find out.
+        let mut t = BTreeMap::new();
+        t.insert("asr".to_string(), Ok((ModelKind::Asr, 1)));
+        let cfg = Config {
+            server: ServerCfg { max_resident: 1, idle_unload_s: 0, ..Default::default() },
+            defaults: Defaults { asr: Some("asr".into()), embed: None },
+            models: vec![ModelCfg { name: "asr".into(), scenario: "x".into() }],
+        };
+        let (h, j) = start_lazy(cfg, Box::new(MockLoader { table: t }));
+        let e = match h.embed(None, "hi") { Err(e) => e.to_string(), Ok(s) => panic!("served {}", s.model) };
+        assert!(e.contains("no embed model"), "{e}");
+        assert_eq!(state_of(&h, "asr"), LoadState::Unloaded, "nothing may load to answer this");
+        // ...and ASR still works on the same actor.
+        assert_eq!(h.transcribe(None, vec![0i16; 4], 16_000).unwrap().model, "asr");
         h.shutdown(); j.join().unwrap();
     }
 

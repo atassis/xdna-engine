@@ -128,6 +128,26 @@ impl Registry {
         Err(EngineError::Load(format!("{}: {why}", cfg.name)))
     }
 
+    /// Record a configured model WITHOUT loading it, keeping the capability its scenario declares so
+    /// routing can pick it (and `/v1/models` can show it) before anything touches the device. A no-op
+    /// on a model the registry already knows: a live entry always outranks a declaration.
+    pub fn declare(&mut self, cfg: &ModelCfg, kind: Option<ModelKind>) {
+        if self.entries.iter().any(|e| e.cfg.name == cfg.name) { return; }
+        let detail = match kind {
+            Some(_) => "declared: loads on demand".to_string(),
+            // Nothing to route on: the request path will have to load it to find out what it is.
+            None => "declared: capability unknown until loaded".to_string(),
+        };
+        self.entries.push(Entry {
+            cfg: cfg.clone(),
+            model: None,
+            status: ModelStatus {
+                name: cfg.name.clone(), state: LoadState::Unloaded, detail, kind, bo_bytes: 0, idle_s: None,
+            },
+            last_used: Instant::now(),
+        });
+    }
+
     /// Least-recently-used RESIDENT model, if any.
     pub fn lru_victim(&self) -> Option<String> {
         self.entries.iter().filter(|e| e.model.is_some())

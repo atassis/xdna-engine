@@ -9,7 +9,7 @@ pub mod actor;
 pub mod http;
 
 pub use config::Config;
-pub use actor::{start, Handle, Served};
+pub use actor::{start, start_lazy, Handle, Served};
 pub use reconcile::ReconcileReport;
 pub use registry::{Capability, LoadState, ModelStatus};
 pub use npu_engine::EngineError;
