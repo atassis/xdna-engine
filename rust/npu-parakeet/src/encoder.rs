@@ -913,7 +913,7 @@ impl FastConformerEncoder {
         // frontier). For THIS seam, after MHSA read back to host and rejoin the default conv/FFN2 path.
         // Falls through to the default path when the fused bricks (acc_add/resadd/resident-ln) are absent.
         #[cfg(feature = "npu")]
-        if std::env::var("PARAKEET_FUSED_BLOCK").is_ok() {
+        if self.npu.as_ref().map(|n| n.full_npu_rail()).unwrap_or(false) {
             if let Some(npu) = &self.npu {
                 // Whole-encoder residency: when the f32-out block-exit LN exists, forward_last drives
                 // `block_dev` in a loop and this per-block upload/readback pair never runs at all.
@@ -1032,7 +1032,7 @@ impl FastConformerEncoder {
         // WHOLE-ENCODER RESIDENCY: upload the stream ONCE, run all 24 blocks device-to-device, read
         // back ONCE. The per-block upload/readback pair disappears entirely (24 of each per clip).
         #[cfg(feature = "npu")]
-        if std::env::var("PARAKEET_FUSED_BLOCK").is_ok() {
+        if self.npu.as_ref().map(|n| n.full_npu_rail()).unwrap_or(false) {
             if let Some(npu) = &self.npu {
                 if npu.resident_encoder_available() {
                     let m = x.nrows();

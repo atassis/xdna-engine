@@ -205,6 +205,13 @@ pub struct NpuMatmul {
     // SAME K-split partials are bit-identical -- a claim the K=DFF collapse does not make (different L1
     // accumulation, bfp16), so it must gate the 4-split explicitly rather than inherit the default.
     k4096_override: std::cell::Cell<Option<bool>>,
+    /// In-process override for `lean_load()`. Set BEFORE the first `resident_ln()` (the load is
+    /// lazy + cached). Exists so gates that need a brick the lean rail sheds -- e.g.
+    /// `ffn_devacc_selftest`, whose whole claim is the 4-split's bit-parity and which therefore
+    /// needs acc_add -- keep working under the default full-NPU rail.
+    lean_override: std::cell::Cell<Option<bool>>,
+    /// In-process override for the LN write-pass variant. Set BEFORE the first `resident_ln()`.
+    ln_bf16_override: std::cell::Cell<Option<bool>>,
     pub stats: RefCell<NpuStats>,
 }
 
@@ -522,6 +529,8 @@ impl NpuMatmul {
             ln_dir: root.join("artifacts/parakeet/ln"),
             resident_ln: RefCell::new(None),
             k4096_override: std::cell::Cell::new(None),
+            lean_override: std::cell::Cell::new(None),
+            ln_bf16_override: std::cell::Cell::new(None),
             stats: RefCell::new(NpuStats::default()),
         }
     }
@@ -1034,6 +1043,33 @@ impl NpuMatmul {
         result
     }
 
+    /// THE FULL-NPU RAIL IS THE DEFAULT (owner decision 2026-07-27). Opt OUT with
+    /// `PARAKEET_FUSED_BLOCK=0`, not in.
+    ///
+    /// This is a deliberate burning of the boats. The hybrid CPU+NPU path was measurably FASTER
+    /// (+23% at the flip: 1.037 -> 1.277 s/clip) and more WRONG (rel-L2 0.0891 vs 0.0886), and the
+    /// per-seam opt-in structure is exactly what kept the graph hybrid for weeks -- every op moved
+    /// alone reads as a regression, so nothing ever moved. Making residency the default means the
+    /// remaining work (one-xclbin-per-block, then the conv middle) is felt rather than deferred.
+    ///
+    /// Cost is per-COMMAND, not per-flop ([[dispatch-cost-is-per-dispatch-not-per-flop]]), so the
+    /// route back to parity is DELETING command submissions, not speeding kernels up.
+    pub fn full_npu_rail(&self) -> bool {
+        std::env::var("PARAKEET_FUSED_BLOCK").map(|v| v != "0").unwrap_or(true)
+    }
+
+    /// Force the LN write-pass variant in-process. MUST be called before the first `resident_ln()`.
+    /// Used by gates that must hold the LN variable CONSTANT to test their actual claim.
+    pub fn set_ln_bf16(&self, on: bool) {
+        self.ln_bf16_override.set(Some(on));
+    }
+
+    /// Force `lean_load()` on/off in-process. MUST be called before the first `resident_ln()`,
+    /// because the co-resident load is lazy and cached.
+    pub fn set_lean_load(&self, on: bool) {
+        self.lean_override.set(Some(on));
+    }
+
     /// Should the co-resident kernels that the ACTIVE config never dispatches be skipped at load?
     ///
     /// The measured dispatch split shows the fused block dispatches none of `acc_add`, `deint`,
@@ -1046,8 +1082,10 @@ impl NpuMatmul {
     /// Opt-in (`PARAKEET_LEAN_LOAD=1`) and only meaningful with the fused block on; the shipped path
     /// dispatches acc_add/deint and must keep them.
     fn lean_load(&self) -> bool {
-        std::env::var("PARAKEET_LEAN_LOAD").map(|v| v == "1").unwrap_or(false)
-            && std::env::var("PARAKEET_FUSED_BLOCK").map(|v| v == "1").unwrap_or(false)
+        if let Some(f) = self.lean_override.get() {
+            return f;
+        }
+        std::env::var("PARAKEET_LEAN_LOAD").map(|v| v != "0").unwrap_or(true) && self.full_npu_rail()
     }
 
     fn load_resident_ln(&self) -> Rc<ResidentLn> {
@@ -1109,7 +1147,9 @@ impl NpuMatmul {
             // -DLN_BF16_WRITE=1): identical reductions, write pass moved off emulated-f32
             // elementwise onto bf16-operand MACs (60 -> 9 vector ops per 16-lane chunk). Separate
             // xclbin so the change is bisectable; falls back to the f32 build if it is not present.
-            let bf16 = std::env::var("PARAKEET_LN_BF16").map(|v| v == "1").unwrap_or(false);
+            let bf16 = self.ln_bf16_override.get().unwrap_or_else(|| {
+                std::env::var("PARAKEET_LN_BF16").map(|v| v != "0").unwrap_or(true)
+            });
             let tag = if bf16 { "lnaffcastb" } else { "lnaffcast" };
             let xcl = self.ln_dir.join(format!("final_{tag}_{PAD_M}x{KRES}.xclbin"));
             let ins = self.ln_dir.join(format!("insts_{tag}_{PAD_M}x{KRES}.txt"));
@@ -1560,7 +1600,7 @@ impl NpuMatmul {
     /// zero rows into large values that propagate, and `matmul_id_to_bo`'s own comment already warns
     /// that garbage padding "corrupts valid rows sharing a partial m-tile". Not yet confirmed.
     pub fn resident_encoder_available(&self) -> bool {
-        std::env::var("PARAKEET_RESIDENT_ENCODER").map(|v| v != "0").unwrap_or(false)
+        std::env::var("PARAKEET_RESIDENT_ENCODER").map(|v| v != "0").unwrap_or(true)
             && self.resident_fused_available()
             && self.resident_ln().map(|rl| rl.lnaffinef32.is_some()).unwrap_or(false)
     }
@@ -2061,7 +2101,7 @@ impl NpuMatmul {
         }
         match std::env::var("PARAKEET_FC2_K4096") {
             Ok(v) => v != "0",
-            Err(_) => std::env::var("PARAKEET_FUSED_BLOCK").is_ok(),
+            Err(_) => self.full_npu_rail(),
         }
     }
 

@@ -53,6 +53,10 @@ fn main() {
 
     match seam.as_str() {
         "ffn" => {
+            // This gate's claim is that host-sum and device-sum of the SAME 4-split partials are
+            // bit-identical, so it needs the acc_add brick that the default lean rail sheds (the
+            // K=DFF collapse supersedes it in the block, but not here).
+            npu.set_lean_load(false);
             let (host, dev) = npu.ffn_devacc_selftest(t, seed).unwrap_or_else(|| {
                 panic!("[fused_seam_parity] ffn: modal/resident/acc_add xclbins absent -- build \
                         scripts/build_parakeet_modal_kernels.sh (needs final_accadd_512x1024)");
@@ -119,9 +123,18 @@ fn main() {
             println!("[fused_seam_parity] PASS (rel-L2 <= 1e-4)");
         }
         "convfront" => {
+            // HOLD THE LN VARIABLE CONSTANT. The reference side (`resident_conv_pw1_glu`, host-in)
+            // structurally ALWAYS runs the ctxLN->affcast two-kernel chain; only the device-in side
+            // runs the fused `lnaffcast`. With the bf16 write pass default-on, this gate would be
+            // comparing a bf16 LN against an f32 one and calling the (intended) difference a parity
+            // failure -- it cannot tell "device-in delivery is broken" from "the LN variant changed".
+            // Pinning the f32 variant makes it test the one thing it actually claims: that device-in
+            // delivery equals host-in delivery. The bf16 LN's own numerics are gated by the `ln` seam
+            // (3.398e-3 vs 5e-3) and the encoder rel-L2 (0.0886 vs shipped 0.0891).
+            npu.set_ln_bf16(false);
             let (host, dev) = npu.conv_front_selftest(t, seed).expect("conv_front_selftest: xclbins absent");
             let (max_rel, l2_rel) = rel_err(&host, &dev);
-            println!("[fused_seam_parity] seam=convfront t={t} seed={seed}  max_rel={max_rel:.3e} rel-L2={l2_rel:.3e}");
+            println!("[fused_seam_parity] seam=convfront t={t} seed={seed}  max_rel={max_rel:.3e} rel-L2={l2_rel:.3e} (ln pinned f32)");
             assert!(l2_rel <= 1e-4, "convfront parity FAILED: rel-L2 {l2_rel:.3e} > 1e-4");
             println!("[fused_seam_parity] PASS (rel-L2 <= 1e-4)");
         }
