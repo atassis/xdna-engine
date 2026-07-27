@@ -21,6 +21,18 @@
 #ifndef ATTN_NO_CTX
 #define ATTN_NO_CTX 0
 #endif
+// aie2p load_v is an ALIGNED op: an unaligned base is SILENTLY truncated to the 128b boundary
+// (see the aie2p-unaligned-vector-load-truncation note). Every tile offset here is naturally
+// aligned, so only the objectFIFO buffer BASE can break it -- and that is allocator-dependent,
+// i.e. it can differ between two designs compiled from the same kernel source.
+#ifndef ATTN_MMUL_UNALIGNED
+#define ATTN_MMUL_UNALIGNED 0
+#endif
+#if ATTN_MMUL_UNALIGNED
+#define MM_LOAD(N, P) aie::load_unaligned_v<N>(P)
+#else
+#define MM_LOAD(N, P) aie::load_v<N>(P)
+#endif
 
 #ifndef ATTN_TQ
 #define ATTN_TQ 8
@@ -164,11 +176,11 @@ static inline void mm_2x2_bf16_f32(const bfloat16 *__restrict pA,
         MMUL C11;
 
         for (unsigned i = 0; i < colA; ++i) {
-          A0 = aie::load_v<MMUL::size_A>(pA1); pA1 += MMUL::size_A;
-          A1 = aie::load_v<MMUL::size_A>(pA2); pA2 += MMUL::size_A;
-          B0 = aie::transpose(aie::load_v<MMUL::size_B>(pB1), MM_T, MM_S);
+          A0 = MM_LOAD(MMUL::size_A, pA1); pA1 += MMUL::size_A;
+          A1 = MM_LOAD(MMUL::size_A, pA2); pA2 += MMUL::size_A;
+          B0 = aie::transpose(MM_LOAD(MMUL::size_B, pB1), MM_T, MM_S);
           pB1 += MMUL::size_B;
-          B1 = aie::transpose(aie::load_v<MMUL::size_B>(pB2), MM_T, MM_S);
+          B1 = aie::transpose(MM_LOAD(MMUL::size_B, pB2), MM_T, MM_S);
           pB2 += MMUL::size_B;
           C00.mac(A0, B0);
           C01.mac(A0, B1);
@@ -496,10 +508,10 @@ static inline void mm_jpair(const bfloat16 *__restrict q_tiled,
   MMUL C00; MMUL C01; MMUL C10; MMUL C11;
   for (unsigned i = 0; i < colA; ++i)
     chess_prepare_for_pipelining chess_loop_range(16, ) {
-      A0 = aie::load_v<MMUL::size_A>(pA1); pA1 += MMUL::size_A;
-      A1 = aie::load_v<MMUL::size_A>(pA2); pA2 += MMUL::size_A;
-      B0 = aie::transpose(aie::load_v<MMUL::size_B>(pB1), MM_T, MM_S); pB1 += MMUL::size_B;
-      B1 = aie::transpose(aie::load_v<MMUL::size_B>(pB2), MM_T, MM_S); pB2 += MMUL::size_B;
+      A0 = MM_LOAD(MMUL::size_A, pA1); pA1 += MMUL::size_A;
+      A1 = MM_LOAD(MMUL::size_A, pA2); pA2 += MMUL::size_A;
+      B0 = aie::transpose(MM_LOAD(MMUL::size_B, pB1), MM_T, MM_S); pB1 += MMUL::size_B;
+      B1 = aie::transpose(MM_LOAD(MMUL::size_B, pB2), MM_T, MM_S); pB2 += MMUL::size_B;
       C00.mac(A0, B0); C01.mac(A0, B1);
       C10.mac(A1, B0); C11.mac(A1, B1);
     }
@@ -545,22 +557,20 @@ static inline void mm_epilogue(float *__restrict scores, const bfloat16 *__restr
 // (relpos_mha_conveyor_bdonchip, CONV_BD_HEADS=4, g0/g1). k is the 44 KB resident buffer delivered
 // PRE-TILED by the shim: in this branch k is per-head, so the 4-D tiling tap is [T/8, DK/8, 8, 8]
 // with an outer size of 22, well under the 6-bit ITER_WRAP limit that blocked the grouped H=8 case.
+extern "C" void stage_scores_relpos_bd_mmul(const bfloat16 *, const bfloat16 *, float *);
 extern "C" void stage_scores_relpos_bd_mask_mmul_whole(const bfloat16 *__restrict qbd,
                                                        const bfloat16 *__restrict ktiled,
                                                        float *__restrict scores,
                                                        const int32_t *__restrict rtp) {
-  constexpr int TQ = ATTN_TQ, T = ATTN_T, DK = ATTN_DK;
-  constexpr unsigned rowA = TQ / MM_R, colA = DK / MM_S, colB = T / MM_T;
-  alignas(32) static char mm_scratch2[MM_SCRATCH_BYTES];
-  bfloat16 *__restrict q_tiled = reinterpret_cast<bfloat16 *>(mm_scratch2);
-  float *__restrict row_scratch = reinterpret_cast<float *>(mm_scratch2);
-  event0();
-  mm_tile_rows<MM_R, MM_S, ATTN_DK>(qbd, q_tiled, TQ);
-  for (unsigned jp = 0; jp < colB / 2; jp++)
-    mm_jpair<rowA, colA, colB>(q_tiled, ktiled + jp * 2u * colA * (MM_S * MM_T), scores, jp);
-  mm_epilogue<rowA, colA, colB>(scores, qbd + TQ * DK,
-                                qbd + TQ * DK + (BD_SPLIT ? TQ * T : 0), row_scratch, rtp[0]);
-  event1();
+  // Masked = the proven unmasked whole-k path, then the pad-key fill. Built this way so the two
+  // entries cannot diverge; the earlier hand-written variant did exactly that and cost a day.
+  constexpr int TQ = ATTN_TQ, T = ATTN_T;
+  const int t_active = rtp[0];
+  stage_scores_relpos_bd_mmul(qbd, ktiled, scores);
+  for (int li = 0; li < TQ; li++) {
+    float *sc = scores + li * T;
+    for (int j = t_active; j < T; j++) sc[j] = ATTN_KEY_MASK;
+  }
 }
 
 #endif
@@ -613,16 +623,16 @@ extern "C" void stage_scores_mmul_block(const bfloat16 *__restrict qbd,
 
     for (unsigned i = 0; i < colA; ++i)
       chess_prepare_for_pipelining chess_loop_range(16, ) {
-        A0 = aie::load_v<MMUL::size_A>(pA1); pA1 += MMUL::size_A;
-        A1 = aie::load_v<MMUL::size_A>(pA2); pA2 += MMUL::size_A;
+        A0 = MM_LOAD(MMUL::size_A, pA1); pA1 += MMUL::size_A;
+        A1 = MM_LOAD(MMUL::size_A, pA2); pA2 += MMUL::size_A;
         // NO aie::transpose. B tiles arrive as [ss][tt] (mm.cc's b_row_maj=true content), which is
         // what mmul wants, so the per-tile in-register transpose that the b_row_maj=false path needs
         // is gone from the inner loop -- 2 per iteration x colA x NBLK per query tile. We tile k
         // host-side anyway, so emitting the transposed content there is free; the ONLY reason the
         // b_row_maj=false route existed was to avoid transposing k, and that reason is now stale.
         // Tile ORDER stays j-major so a j-pair remains a contiguous block.
-        B0 = aie::transpose(aie::load_v<MMUL::size_B>(pB1), MM_T, MM_S); pB1 += MMUL::size_B;
-        B1 = aie::transpose(aie::load_v<MMUL::size_B>(pB2), MM_T, MM_S); pB2 += MMUL::size_B;
+        B0 = aie::transpose(MM_LOAD(MMUL::size_B, pB1), MM_T, MM_S); pB1 += MMUL::size_B;
+        B1 = aie::transpose(MM_LOAD(MMUL::size_B, pB2), MM_T, MM_S); pB2 += MMUL::size_B;
         C00.mac(A0, B0); C01.mac(A0, B1);
         C10.mac(A1, B0); C11.mac(A1, B1);
       }
