@@ -10,7 +10,8 @@ import argparse
 import numpy as np
 
 from aie.iron import Buffer, Kernel, ObjectFifo, Program, Runtime, Worker, WorkerRuntimeBarrier
-from aie.iron.device import NPU1, NPU2
+from aie.iron.dataflow import ObjectFifoLink
+from aie.iron.device import NPU1, NPU2, AnyMemTile
 from aie.helpers.taplib import TensorAccessPattern
 from aie.iron.controlflow import range_
 
@@ -179,13 +180,25 @@ def build(dev, mono=False, TRIVIAL=False, relpos=False, bd_onchip=False, tactive
         # obj_types/depths/repeat_counts but has no consumer_obj_type parameter. So the second hop has to
         # be built explicitly (candidate: construct the L2 fifo with both kwargs and join the hops with
         # an ObjectFifoLink on AnyMemTile) -- verify at H=1 with run_bd_onchip.py rel-L2<=5e-3 BEFORE H=4.
-        if p_resident:
-            raise SystemExit(
-                "--p-resident needs the explicit two-hop L3->MemTile->L1 fifo (see the note above): "
-                "repeat_count is MemTile-only, and forward() cannot carry consumer_obj_type. "
-                "Build without --p-resident (STREAM-A) until that topology is device-validated.")
         of_qpv = [ObjectFifo(qpv_ty, name=f"qpv{h}", depth=2) for h in range(H)]
-        of_p = [ObjectFifo(pblk_ty if stream_p else p_full_ty, name=f"p{h}", depth=2 if stream_p else 1) for h in range(H)]
+        of_p_l3 = None
+        if p_resident:
+            if not stream_p:
+                raise SystemExit("--p-resident targets the streaming-p real-dims path (p > L1)")
+            assert P % BD_KB == 0, f"p-resident needs P({P}) % BD_KB({BD_KB}) == 0"
+            # Hop 1: L3 -> MemTile, the WHOLE P-row table, ONCE per dispatch (no N_QT outer replay).
+            of_p_l3 = [ObjectFifo(p_full_ty, name=f"pL3{h}", depth=1) for h in range(H)]
+            # Hop 2: MemTile -> L1. The fifo's OBJECT is the whole table (so the replayed BD spans the
+            # table and re-anchors at row 0 every replay), while the CONSUMER takes BD_KB-row blocks --
+            # that asymmetry is the whole trick, and it is why forward() could not express this.
+            of_p = [ObjectFifo(p_full_ty, name=f"p{h}", depth=1,
+                               consumer_obj_type=pblk_ty, repeat_count=N_QT) for h in range(H)]
+            # Join the hops on a MemTile (mirrors what split() does internally: build the link and drop
+            # it -- it registers itself as the endpoints' link).
+            for h in range(H):
+                _ = ObjectFifoLink(of_p_l3[h].cons(), [of_p[h].prod()], AnyMemTile, [], [0])
+        else:
+            of_p = [ObjectFifo(pblk_ty if stream_p else p_full_ty, name=f"p{h}", depth=2 if stream_p else 1) for h in range(H)]
         of_bd = [ObjectFifo(qbd_ty, name=f"bd{h}", depth=1) for h in range(H)]
         of_k = [ObjectFifo(k_ty, name=f"k{h}", depth=1) for h in range(H)]
         of_v = [ObjectFifo(v_ty, name=f"v{h}", depth=1) for h in range(H)]
@@ -344,13 +357,16 @@ def build(dev, mono=False, TRIVIAL=False, relpos=False, bd_onchip=False, tactive
                     ctap = TensorAccessPattern([H * N_QT * TQ * DK], h * N_QT * TQ * DK, [N_QT, 1, TQ, DK], [TQ * DK, 0, DK, 1])
                 rt.fill(of_qpv[h].prod(), QPV, tap=qtap)
                 if p_resident:
-                    # ONE pass over p: no N_QT outer replay from L3. The MemTile does the replaying.
+                    # ONE pass over p straight into hop 1: no N_QT outer replay from L3. The MemTile
+                    # does the replaying, so the shim fill is a single table read per dispatch.
                     ptap = TensorAccessPattern([H * P * DK], h * P * DK, [1, 1, P, DK], [0, 0, DK, 1])
-                elif stream_p:
-                    ptap = TensorAccessPattern([H * P * DK], h * P * DK, [N_QT, NBLK, BD_KB, DK], [0, BD_KB * DK, DK, 1])
+                    rt.fill(of_p_l3[h].prod(), PP, tap=ptap)
                 else:
-                    ptap = TensorAccessPattern([H * P * DK], h * P * DK, [N_QT, 1, P, DK], [0, 0, DK, 1])
-                rt.fill(of_p[h].prod(), PP, tap=ptap)
+                    if stream_p:
+                        ptap = TensorAccessPattern([H * P * DK], h * P * DK, [N_QT, NBLK, BD_KB, DK], [0, BD_KB * DK, DK, 1])
+                    else:
+                        ptap = TensorAccessPattern([H * P * DK], h * P * DK, [N_QT, 1, P, DK], [0, 0, DK, 1])
+                    rt.fill(of_p[h].prod(), PP, tap=ptap)
                 rt.fill(of_k[h].prod(), K, tap=kvtap)
                 rt.fill(of_v[h].prod(), V, tap=kvtap)
                 rt.drain(of_ctxh[h].cons(), CTX, tap=ctap, wait=True)
