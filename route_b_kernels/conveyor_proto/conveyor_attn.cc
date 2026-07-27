@@ -405,7 +405,7 @@ extern "C" void stage_scores_relpos_bd_mask_mmul(const bfloat16 *__restrict qbd,
           for (unsigned c = 0; c < colA; c++)
             for (int ss = 0; ss < MM_S; ss++)
               acc += (float)q_tiled[((z * colA + c) * MM_R + rr) * MM_S + ss] *
-                     (float)ktiled[((j * colA + c) * MM_T + tt) * MM_S + ss];
+                     (float)ktiled[((j * colA + c) * MM_S + ss) * MM_T + tt];
           scores[((z * colB + j) * MM_R + rr) * MM_T + tt] = acc;
         }
 #else
@@ -491,8 +491,14 @@ extern "C" void stage_scores_mmul_block(const bfloat16 *__restrict qbd,
       chess_prepare_for_pipelining chess_loop_range(16, ) {
         A0 = aie::load_v<MMUL::size_A>(pA1); pA1 += MMUL::size_A;
         A1 = aie::load_v<MMUL::size_A>(pA2); pA2 += MMUL::size_A;
-        B0 = aie::transpose(aie::load_v<MMUL::size_B>(pB1), MM_T, MM_S); pB1 += MMUL::size_B;
-        B1 = aie::transpose(aie::load_v<MMUL::size_B>(pB2), MM_T, MM_S); pB2 += MMUL::size_B;
+        // NO aie::transpose. B tiles arrive as [ss][tt] (mm.cc's b_row_maj=true content), which is
+        // what mmul wants, so the per-tile in-register transpose that the b_row_maj=false path needs
+        // is gone from the inner loop -- 2 per iteration x colA x NBLK per query tile. We tile k
+        // host-side anyway, so emitting the transposed content there is free; the ONLY reason the
+        // b_row_maj=false route existed was to avoid transposing k, and that reason is now stale.
+        // Tile ORDER stays j-major so a j-pair remains a contiguous block.
+        B0 = aie::load_v<MMUL::size_B>(pB1); pB1 += MMUL::size_B;
+        B1 = aie::load_v<MMUL::size_B>(pB2); pB2 += MMUL::size_B;
         C00.mac(A0, B0); C01.mac(A0, B1);
         C10.mac(A1, B0); C11.mac(A1, B1);
       }
