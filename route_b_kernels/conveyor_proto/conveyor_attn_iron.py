@@ -39,7 +39,7 @@ P = 2 * T - 1  # relative-position length (NeMo/Parakeet rel-pos)
 
 def build(dev, mono=False, TRIVIAL=False, relpos=False, bd_onchip=False, tactive_mask=False,
           trace_size=0, trace_worker=0,
-          p_resident=False, stream_io=False):
+          p_resident=False, stream_io=False, mmul=False):
     if stream_io and not bd_onchip:
         raise SystemExit("--stream-io is a bd_onchip-path option (device-in/out taps on the 4-stage column)")
     if bd_onchip:
@@ -72,9 +72,11 @@ def build(dev, mono=False, TRIVIAL=False, relpos=False, bd_onchip=False, tactive
     # any t_active<=T; t_active==T is unmasked passthrough (== stage_scores_relpos_bd byte-for-byte).
     rtp_ty = np.ndarray[(16,), np.dtype[np.int32]]
     if bd_onchip and tactive_mask:
-        scores = Kernel("stage_scores_relpos_bd_mask", "kernels.a", [qbd_ty, k_ty, ac_ty, rtp_ty])
+        scores = Kernel("stage_scores_relpos_bd_mask_mmul" if mmul else "stage_scores_relpos_bd_mask",
+                        "kernels.a", [qbd_ty, k_ty, ac_ty, rtp_ty])
     elif relpos:
-        scores = Kernel("stage_scores_relpos_bd", "kernels.a", [qbd_ty, k_ty, ac_ty])
+        scores = Kernel("stage_scores_relpos_bd_mmul" if mmul else "stage_scores_relpos_bd",
+                        "kernels.a", [qbd_ty, k_ty, ac_ty])
     else:
         scores = Kernel("stage_scores" + sc_sfx, "kernels.a", [q_ty, k_ty, ac_ty])
     softmax = Kernel("stage_softmax" + sm_sfx, "kernels.a", [ac_ty, probs_ty])
@@ -242,6 +244,25 @@ def build(dev, mono=False, TRIVIAL=False, relpos=False, bd_onchip=False, tactive
                 f_qpv.release(1); f_bd.release(1)
             f_p.release(1)
 
+        # MMUL variant: k is filled ONCE per dispatch (the tiling tap spent the 4th dim, so the
+        # N_QT stride-0 replay is gone), so acquire it ONCE and hold. This is the pairing the old
+        # comment below warns about -- acquire-once was only broken while the FILL still had N_QT
+        # replays pending. Both sides move together here, which is what makes it consistent.
+        def stg_a_mmul(f_bd, f_k, f_ac, k_sc):
+            ek = f_k.acquire(1)
+            for _ in range_(N_QT):
+                ebd = f_bd.acquire(1); eac = f_ac.acquire(1); k_sc(ebd, ek, eac)
+                f_bd.release(1); f_ac.release(1)
+            f_k.release(1)
+
+        def stg_a_mask_mmul(f_bd, f_k, f_ac, k_sc, rtp, bar):
+            bar.wait_for_value(1)
+            ek = f_k.acquire(1)
+            for _ in range_(N_QT):
+                ebd = f_bd.acquire(1); eac = f_ac.acquire(1); k_sc(ebd, ek, eac, rtp)
+                f_bd.release(1); f_ac.release(1)
+            f_k.release(1)
+
         def stg_a(f_bd, f_k, f_ac, k_sc):
             # RELOAD FIX: re-acquire k PER TILE to match the stride-0 replay fill (kvtap outer dim
             # N_QT). Acquire-once-and-hold left N_QT-1 replayed fills pending -> corrupted the next
@@ -285,10 +306,12 @@ def build(dev, mono=False, TRIVIAL=False, relpos=False, bd_onchip=False, tactive
             else:
                 wl.append(Worker(bd_res_w, [of_qpv[h].cons(), of_p[h].cons(), of_bd[h].prod(), bd_k], stack_size=0x1000))
             if tactive_mask:
-                wl.append(Worker(stg_a_mask, [of_bd[h].cons(), of_k[h].cons(), of_ac[h].prod(), scores,
-                                              tactive_rtp[h], rtp_bar[h]]))
+                wl.append(Worker(stg_a_mask_mmul if mmul else stg_a_mask,
+                                 [of_bd[h].cons(), of_k[h].cons(), of_ac[h].prod(), scores,
+                                  tactive_rtp[h], rtp_bar[h]]))
             else:
-                wl.append(Worker(stg_a, [of_bd[h].cons(), of_k[h].cons(), of_ac[h].prod(), scores]))
+                wl.append(Worker(stg_a_mmul if mmul else stg_a,
+                                 [of_bd[h].cons(), of_k[h].cons(), of_ac[h].prod(), scores]))
             wl.append(Worker(stg_b, [of_ac[h].cons(), of_pr[h].prod(), softmax], stack_size=0x1000))
             wl.append(Worker(stg_c, [of_pr[h].cons(), of_v[h].cons(), of_ctxh[h].prod(), ctx_k]))
 
@@ -349,12 +372,25 @@ def build(dev, mono=False, TRIVIAL=False, relpos=False, bd_onchip=False, tactive
                     qtap = TensorAccessPattern([2 * PAD_M * SD], h * DK,
                                                [N_QT, 2, TQ, DK], [TQ * SD, PAD_M * SD, SD, 1])
                     # k/v: whole [T, DK] head slice, stride-0 replayed per query tile (as before).
-                    kvtap = TensorAccessPattern([PAD_M * SD], h * DK, [N_QT, 1, T, DK], [0, 0, SD, 1])
+                    # MMUL: hand the scores core a PRE-TILED k. The mmul tile order is only a 4-D
+                    # strided read of the same L3 bytes -- sizes [T/t, DK/s, t, s], strides
+                    # [t*SD, s, SD, 1] -- so the shim does the tiling for free. It costs the N_QT
+                    # stride-0 replay (4 dims is the shim's limit), which is a WIN not a price: k is
+                    # then read from L3 ONCE per dispatch instead of 22x. Worker acquires once to match.
+                    kvtap = (TensorAccessPattern([PAD_M * SD], h * DK,
+                                                 [T // 8, DK // 8, 8, 8], [8 * SD, 8, SD, 1])
+                             if mmul else
+                             TensorAccessPattern([PAD_M * SD], h * DK, [N_QT, 1, T, DK], [0, 0, SD, 1]))
+                    vtap = TensorAccessPattern([PAD_M * SD], h * DK, [N_QT, 1, T, DK], [0, 0, SD, 1])
                     ctap = TensorAccessPattern([PAD_M * SD], h * DK,
                                                [N_QT, 1, TQ, DK], [TQ * SD, 0, SD, 1])
                 else:
                     qtap = TensorAccessPattern([H * QPVE], h * QPVE, [N_QT, 1, 1, 2 * TQ * DK], [2 * TQ * DK, 0, 0, 1])
-                    kvtap = TensorAccessPattern([H * T * DK], h * T * DK, [N_QT, 1, T, DK], [0, 0, DK, 1])
+                    kvtap = (TensorAccessPattern([H * T * DK], h * T * DK,
+                                                 [T // 8, DK // 8, 8, 8], [8 * DK, 8, DK, 1])
+                             if mmul else
+                             TensorAccessPattern([H * T * DK], h * T * DK, [N_QT, 1, T, DK], [0, 0, DK, 1]))
+                    vtap = TensorAccessPattern([H * T * DK], h * T * DK, [N_QT, 1, T, DK], [0, 0, DK, 1])
                     ctap = TensorAccessPattern([H * N_QT * TQ * DK], h * N_QT * TQ * DK, [N_QT, 1, TQ, DK], [TQ * DK, 0, DK, 1])
                 rt.fill(of_qpv[h].prod(), QPV, tap=qtap)
                 if p_resident:
@@ -369,7 +405,7 @@ def build(dev, mono=False, TRIVIAL=False, relpos=False, bd_onchip=False, tactive
                         ptap = TensorAccessPattern([H * P * DK], h * P * DK, [N_QT, 1, P, DK], [0, 0, DK, 1])
                     rt.fill(of_p[h].prod(), PP, tap=ptap)
                 rt.fill(of_k[h].prod(), K, tap=kvtap)
-                rt.fill(of_v[h].prod(), V, tap=kvtap)
+                rt.fill(of_v[h].prod(), V, tap=vtap)
                 rt.drain(of_ctxh[h].cons(), CTX, tap=ctap, wait=True)
             # Per-stage occupancy instrument. `trace_size=0` (production) leaves the design
             # byte-identical; non-zero appends a dedicated trace buffer at the TAIL of the
@@ -508,6 +544,9 @@ ap.add_argument("--trace-worker", type=int, default=0, dest="trace_worker",
 ap.add_argument("-t", "--trace_size", type=int, default=0, dest="trace_size",
                 help="non-zero enables per-stage IRON trace on head 0 (build with ATTN_HEADS=1; "
                      "trace egress needs a free shim channel). 0 = production, byte-identical.")
+ap.add_argument("--mmul", dest="mmul", action="store_true",
+                help="scores stage via the vendored aie::mmul 2x2 register block (r,s,t)=(4,8,8); "
+                     "k is DMA-tiled and read once per dispatch instead of replayed 22x")
 ap.add_argument("--stream-io", dest="stream_io", action="store_true",
                 help="device-in/out taps: read q/k/v from row-major [PAD_M,SD] bf16 GEMM outputs and "
                      "drain ctx into one, deleting the host pack (ATTN_SD / ATTN_PAD_M set the geometry)")
@@ -515,4 +554,5 @@ opts = ap.parse_args(sys.argv[1:])
 dev = NPU2() if opts.device == "npu2" else NPU1()
 print(build(dev, mono=opts.mono, TRIVIAL=opts.trivial, relpos=opts.relpos, bd_onchip=opts.bd_onchip,
             tactive_mask=opts.tactive_mask, p_resident=opts.p_resident, stream_io=opts.stream_io,
+            mmul=opts.mmul,
             trace_size=opts.trace_size, trace_worker=opts.trace_worker))

@@ -37,7 +37,7 @@ echo "[conveyor-prebuild] building 8-head conveyor (VARIANT=attn RELPOS=1, TQ=$T
   ATTN_TQ=$TQ ATTN_T=$T ATTN_DK=$DK ATTN_NQT=$NQT ATTN_HEADS=$HEADS \
   make NPU2=1 VARIANT=attn RELPOS=1 \
        ATTN_TQ=$TQ ATTN_T=$T ATTN_DK=$DK ATTN_NQT=$NQT ATTN_HEADS=$HEADS \
-       KFLAGS="-DATTN_TQ=$TQ -DATTN_T=$T -DATTN_DK=$DK -DATTN_SCALE=${INV_SCALE}f" >/dev/null 2>&1 )
+       KFLAGS="-DATTN_TQ=$TQ -DATTN_T=$T -DATTN_DK=$DK -DATTN_NQT=$NQT -DATTN_SCALE=${INV_SCALE}f" >/dev/null 2>&1 )
 if [ ! -f "$EX/build/final.xclbin" ]; then
   echo "[conveyor-prebuild] FAILED (no final.xclbin) -- check the fork branch (conveyor-proto-real-dims) + KFLAGS"; exit 1
 fi
