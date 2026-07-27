@@ -82,12 +82,19 @@ make -C $LNML -f Makefile.resadd     NPU2=1 rows=512 cols=1024 scale=0.5 stag=05
 # s100 (scale=1.0) = the full MHSA/conv residual x+sublayer (Task 5/6 seams).
 echo "== RESIDENT-BLOCK: residual_add s100 (x+1.0*sublayer) 512x1024 =="
 make -C $LNML -f Makefile.resadd     NPU2=1 rows=512 cols=1024 scale=1.0 stag=100 build/final_resadd_512x1024_s100.xclbin
-# FUSED resadd->LN, both scales. cores=4 is NOT a tuning choice: a, b in + sum, out out already fill
-# a column's 2+2 shim DMA channels and gb needs a fifth, so 8 columns does not place. See the note on
-# PARAKEET_RESADD_LN in encoder.rs for the fix (gamma/beta via a host-written L1 buffer).
+# FUSED resadd->LN, both scales, at the FULL 8 columns. The first build capped out at cores=4 because
+# a(8) + b(8) + gb(1) = 17 shim MM2S against the 16 the array has, and half the columns halved the
+# parallelism into a measured wash. resadd_ln_iron.py now stages ONE core pair's `a` through a MemTile
+# split, so `a` costs 7 channels and the design fits at 16 exactly.
+#
+# spread=1 pins each resadd/LN pair to its own column. Without it the column-major placer packs all 16
+# workers into columns 0..3 and leaves compute columns 4..7 empty while their shims still route across
+# the array; measured 1.899 ms/command spread vs 2.011 packed, numerics identical (rel-L2 1.648e-3
+# either way). This is the configuration that is STAGED and MEASURED -- do not drop the flag without
+# re-measuring, or a clean rebuild silently deploys the slower placement.
 echo "== RESIDENT-BLOCK: FUSED resadd->LN 512x1024 (s050 + s100) =="
-make -C $LNML -f Makefile.resaddln   NPU2=1 rows=512 cols=1024 scale=0.5 stag=050 cores=4 build/final_resaddln_512x1024_s050.xclbin
-make -C $LNML -f Makefile.resaddln   NPU2=1 rows=512 cols=1024 scale=1.0 stag=100 cores=4 build/final_resaddln_512x1024_s100.xclbin
+make -C $LNML -f Makefile.resaddln   NPU2=1 rows=512 cols=1024 scale=0.5 stag=050 cores=8 spread=1 build/final_resaddln_512x1024_s050.xclbin
+make -C $LNML -f Makefile.resaddln   NPU2=1 rows=512 cols=1024 scale=1.0 stag=100 cores=8 spread=1 build/final_resaddln_512x1024_s100.xclbin
 # RESIDENT-CONV: post-dwconv SiLU brick (conv-module step 4). silu(x) over [C,T]=[1024,400] f32 -> f32.
 # SEPARATE single-op-loop brick (NOT a dwconv epilogue -- the fused epilogue miscompiles alternate
 # channels on this toolchain; see dwconv-fused-epilogue-alt-channel-miscompile). rows=C, cols=T.

@@ -127,6 +127,10 @@ cp "$RB/ctx_ln/Makefile.accadd"       "$PE/ml/layernorm/Makefile.accadd"
 cp "$RB/aie_kernels/residual_add.cc"  "$K/residual_add.cc"
 cp "$RB/ctx_ln/residual_add_iron.py"  "$PE/ml/layernorm/residual_add_iron.py"
 cp "$RB/ctx_ln/Makefile.resadd"       "$PE/ml/layernorm/Makefile.resadd"
+# FUSED resadd -> LN+affine+cast in ONE xclbin (the first one-xclbin-per-block collapse). Reuses the
+# residual_add.cc and ln_affine_cast.cc objects copied above; only the IRON design is new.
+cp "$RB/ctx_ln/resadd_ln_iron.py"     "$PE/ml/layernorm/resadd_ln_iron.py"
+cp "$RB/ctx_ln/Makefile.resaddln"     "$PE/ml/layernorm/Makefile.resaddln"
 # post-dwconv SiLU brick (conv step 4) -- SEPARATE single-op-loop brick (immune to the
 # fused-epilogue per-channel-loop miscompile; see dwconv-fused-epilogue-alt-channel-miscompile).
 cp "$RB/ctx_ln/silu_brick.cc"         "$K/silu_brick.cc"
