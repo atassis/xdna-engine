@@ -58,10 +58,20 @@ static constexpr int VL = 16;
 // m % (2*r) == 0, i.e. TQ=16 -- which is why the bfp16 brick and the two-query-tile pairing are one
 // change, not two. TQ=16/N_QT=11 keeps N_QT*TQ = 176 = T, so the pairing costs no restructuring.
 #ifdef AIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16
-static constexpr int MM_R = 8, MM_S = 8, MM_T = 8;
+#define MM_R_V 8
 #else
-static constexpr int MM_R = 4, MM_S = 8, MM_T = 8;
+#define MM_R_V 4
 #endif
+static constexpr int MM_R = MM_R_V, MM_S = 8, MM_T = 8;
+// The 2x2 block needs an even rowA, i.e. ATTN_TQ % (2*MM_R) == 0. That is a property of the
+// BUILD, not of the kernel, so the mmul entry points are compiled out when the shape does not
+// admit them -- otherwise their static_asserts break the plain (non-mmul) build at the same TQ.
+#define MM_SHAPE_OK (ATTN_TQ % (2 * MM_R_V) == 0)
+// The BLOCKED variant additionally hardcodes a single z-iteration, so it wants rowA == 2 exactly.
+#define MM_BLK_OK (ATTN_TQ == 2 * MM_R_V)
+// One scratch shared by the q tiling and the C de-tile (never live together); size by the larger.
+#define MM_SCRATCH_BYTES \
+  ((MM_R_V * ATTN_T * 4) > (ATTN_TQ * ATTN_DK * 2) ? (MM_R_V * ATTN_T * 4) : (ATTN_TQ * ATTN_DK * 2))
 
 // WHERE THE TILING HAPPENS, and why it is not here.
 // mm.cc wants A as r x s tiles and (with b_row_maj=false) B as t x s tiles, the tiles themselves in
@@ -357,7 +367,7 @@ extern "C" void stage_scores_relpos_bd_mask(const bfloat16 *__restrict qbd,
 //   * k arrives PRE-TILED (t x s blocks, tiles row-major) -- kvtap does this, and must therefore
 //     drop its N_QT stride-0 replay, so the worker acquires k ONCE per dispatch, not per tile.
 //   * the belt head q_pass arrives PRE-TILED (r x s blocks) -- bd_emit_bake* does this.
-#if ATTN_MMUL
+#if ATTN_MMUL && MM_SHAPE_OK
 extern "C" void stage_scores_relpos_bd_mask_mmul(const bfloat16 *__restrict qbd,
                                                  const bfloat16 *__restrict ktiled,
                                                  float *__restrict scores,
@@ -371,7 +381,7 @@ extern "C" void stage_scores_relpos_bd_mask_mmul(const bfloat16 *__restrict qbd,
   // ONE scratch, aliased. L1 on this core already carries the 44 KB k, and two separate scratches
   // overflowed .bss by 1568 B. They are never live together: q_tiled is dead the moment mm_2x2
   // returns, and row_scratch is only touched after it. Sized by the larger of the two.
-  alignas(32) static char mm_scratch[MM_R * ATTN_T * sizeof(float)];
+  alignas(32) static char mm_scratch[MM_SCRATCH_BYTES];
   static_assert(sizeof(mm_scratch) >= ATTN_TQ * ATTN_DK * sizeof(bfloat16), "scratch too small for q");
   bfloat16 *__restrict q_tiled = reinterpret_cast<bfloat16 *>(mm_scratch);
   float *__restrict row_scratch = reinterpret_cast<float *>(mm_scratch);
@@ -432,6 +442,95 @@ extern "C" void stage_scores_relpos_bd_mask_mmul(const bfloat16 *__restrict qbd,
   }
   event1();
 }
+
+// ---------------- BLOCKED scores: k streamed from the MemTile in j-pair blocks ----------------
+// Holding k whole costs 44 KB of L1 and is what makes TQ=16 (and therefore r=8, and therefore the
+// native bfp16 512-MAC brick) impossible. But k has NO reuse inside a query tile beyond the j-pair
+// being consumed, so the 2x2 block can take it 2*t = 16 rows at a time: 4 KB instead of 44 KB.
+//
+// The tiled layout makes the chop free. Tile (j,c) lives at (j*colA + c)*size_B, so j-pair jp owns
+// the CONTIGUOUS 2*colA*size_B run at jp*(2*colA*size_B) -- streaming blocks in order is just
+// slicing the tiled k, no repacking anywhere.
+//
+// One call per j-pair. q is tiled once per query tile (jp==0) and the epilogue fires on the last
+// block, so `scores` must be held by the worker across all NBLK calls.
+#if ATTN_MMUL && MM_BLK_OK
+extern "C" void stage_scores_mmul_block(const bfloat16 *__restrict qbd,
+                                        const bfloat16 *__restrict kblk,
+                                        float *__restrict scores) {
+  using MMUL = aie::mmul<MM_R, MM_S, MM_T, bfloat16, bfloat16, accauto>;
+  constexpr int TQ = ATTN_TQ, T = ATTN_T, DK = ATTN_DK;
+  constexpr float inv_scale = ATTN_SCALE;
+  constexpr unsigned rowA = TQ / MM_R, colA = DK / MM_S, colB = T / MM_T;
+  constexpr unsigned NBLK = colB / 2;
+  static_assert(rowA == 2, "the 2x2 block wants exactly two block-rows here (TQ = 2*MM_R)");
+  static_assert(colB % 2 == 0, "j must pair evenly");
+
+  alignas(32) static char mm_scratch[MM_SCRATCH_BYTES];
+  static_assert(sizeof(mm_scratch) >= ATTN_TQ * ATTN_DK * sizeof(bfloat16), "scratch too small for q");
+  bfloat16 *__restrict q_tiled = reinterpret_cast<bfloat16 *>(mm_scratch);
+  float *__restrict row_scratch = reinterpret_cast<float *>(mm_scratch);
+  static int jp = 0;
+
+  event0();
+  if (jp == 0) mm_tile_rows<MM_R, MM_S, ATTN_DK>(qbd, q_tiled, TQ);
+
+  {   // ONE j-pair, the vendored 2x2 register block (mm.cc:78-211), unwidened.
+    float *__restrict pC1 = scores + (0u * colB + 2u * jp) * MMUL::size_C;
+    float *__restrict pC2 = scores + (1u * colB + 2u * jp) * MMUL::size_C;
+    const bfloat16 *__restrict pA1 = q_tiled + (0u * colA) * MMUL::size_A;
+    const bfloat16 *__restrict pA2 = q_tiled + (1u * colA) * MMUL::size_A;
+    const bfloat16 *__restrict pB1 = kblk;                        // j = 2*jp
+    const bfloat16 *__restrict pB2 = kblk + colA * MMUL::size_B;  // j = 2*jp + 1
+
+    aie::vector<bfloat16, MMUL::size_A> A0, A1;
+    aie::vector<bfloat16, MMUL::size_B> B0, B1;
+    MMUL C00; MMUL C01; MMUL C10; MMUL C11;   // default ctor => zero=true => first mac is a mul
+
+    for (unsigned i = 0; i < colA; ++i)
+      chess_prepare_for_pipelining chess_loop_range(16, ) {
+        A0 = aie::load_v<MMUL::size_A>(pA1); pA1 += MMUL::size_A;
+        A1 = aie::load_v<MMUL::size_A>(pA2); pA2 += MMUL::size_A;
+        B0 = aie::transpose(aie::load_v<MMUL::size_B>(pB1), MM_T, MM_S); pB1 += MMUL::size_B;
+        B1 = aie::transpose(aie::load_v<MMUL::size_B>(pB2), MM_T, MM_S); pB2 += MMUL::size_B;
+        C00.mac(A0, B0); C01.mac(A0, B1);
+        C10.mac(A1, B0); C11.mac(A1, B1);
+      }
+
+    aie::store_v(pC1, C00.template to_vector<float>()); pC1 += MMUL::size_C;
+    aie::store_v(pC1, C01.template to_vector<float>());
+    aie::store_v(pC2, C10.template to_vector<float>()); pC2 += MMUL::size_C;
+    aie::store_v(pC2, C11.template to_vector<float>());
+  }
+
+  if (++jp == (int)NBLK) {   // last block of this query tile -> de-tile + BD + scale, in place
+    jp = 0;
+    const bfloat16 *bdhi = qbd + TQ * DK;
+    const bfloat16 *bdlo = bdhi + (BD_SPLIT ? TQ * T : 0);
+    for (unsigned z = 0; z < rowA; z++) {
+      float *grp = scores + z * MM_R * T;
+      for (int i = 0; i < MM_R * T; i++) row_scratch[i] = grp[i];
+      for (int rr = 0; rr < MM_R; rr++) {
+        const int li = z * MM_R + rr;
+        const bfloat16 *hir = bdhi + li * T;
+        const bfloat16 *lor = bdlo + li * T;
+        float *sc = grp + rr * T;
+        for (unsigned j = 0; j < colB; j++) {
+          const float *ct = row_scratch + (j * MM_R + rr) * MM_T;
+          for (int tt = 0; tt < MM_T; tt++) {
+            float bd = (float)hir[j * MM_T + tt];
+#if BD_SPLIT
+            bd += (float)lor[j * MM_T + tt];
+#endif
+            sc[j * MM_T + tt] = (ct[tt] + bd) * inv_scale;
+          }
+        }
+      }
+    }
+  }
+  event1();
+}
+#endif // ATTN_MMUL
 
 // Unmasked twin (t_active == T), for the no-mask build.
 extern "C" void stage_scores_relpos_bd_mmul(const bfloat16 *__restrict qbd,

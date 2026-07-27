@@ -442,6 +442,15 @@ def build(dev, mono=False, TRIVIAL=False, relpos=False, bd_onchip=False, tactive
         # column (data-parallel heads, no cross-head data). Per-head fifos (unique names).
         H = N_HEADS
         qd = 1 if relpos else 2
+        # k streamed in j-pair blocks: 2*t rows, which in the TILED layout is a contiguous
+        # 2*colA*size_B run -- so blocking is a slice, not a repack.
+        KBLK_ROWS = 2 * 8
+        kblk_ty = np.ndarray[(KBLK_ROWS * DK,), np.dtype[bfloat16]]
+        NBLK_K = (T // 8) // 2                      # j-pairs per query tile
+        if mmul and TQ % 16 != 0:
+            raise SystemExit("--mmul blocked scores needs ATTN_TQ %% 16 == 0 (r=8 -> 2*r); got %d" % TQ)
+        scores_blk = (Kernel("stage_scores_mmul_block", "kernels.a", [qbd_ty, kblk_ty, ac_ty])
+                      if mmul else None)
         of_vh = [ObjectFifo(v_ty, name=f"v{h}", depth=1) for h in range(H)]
         of_ach = [ObjectFifo(ac_ty, name=f"ac{h}", depth=2) for h in range(H)]
         of_ph = [ObjectFifo(probs_ty, name=f"probs{h}", depth=2) for h in range(H)]
@@ -452,14 +461,32 @@ def build(dev, mono=False, TRIVIAL=False, relpos=False, bd_onchip=False, tactive
         groups = [list(range(g, min(g + GJ, H))) for g in range(0, H, GJ)]
         q_subs = [None] * H; k_subs = [None] * H; ctx_subs = [None] * H
         of_q_bigs, of_k_bigs, of_ctx_bigs = [], [], []
+        k_fill_srcs = []   # the fifo whose .prod() takes the shim fill (hop1 under mmul)
         for gi, hs in enumerate(groups):
             gsz = len(hs)
             ofq = ObjectFifo(np.ndarray[(gsz * QELEM,), np.dtype[bfloat16]], name=f"qbig{gi}", depth=2)
             qs = ofq.cons().split([i * QELEM for i in range(gsz)], obj_types=[qbelt_ty] * gsz,
                                   depths=[qd] * gsz, names=[f"qs{gi}_{i}" for i in range(gsz)])
-            ofk = ObjectFifo(np.ndarray[(gsz * T * DK,), np.dtype[bfloat16]], name=f"kbig{gi}", depth=2)
-            ks = ofk.cons().split([i * T * DK for i in range(gsz)], obj_types=[k_ty] * gsz,
-                                  depths=[1] * gsz, names=[f"ks{gi}_{i}" for i in range(gsz)])
+            if mmul:
+                # TWO-HOP k: L3 -> MemTile (whole table, once) -> L1 (j-pair blocks, replayed per
+                # query tile). This REPLACES the k split, so the MemTile op count per group is
+                # unchanged at 3 (q-split + this + ctx-join) -- 4 is the count that deadlocked.
+                # The asymmetry (producer = whole table, consumer = block) is why split() cannot
+                # express it: split forwards obj_types/depths/repeat_counts but has no
+                # consumer_obj_type. Holding k whole costs 44 KB of L1 and is the only reason
+                # TQ=16 -- and therefore r=8 and the native bfp16 brick -- did not fit.
+                assert gsz == 1, "two-hop k block replay is validated at H=1 first (gsz==1)"
+                ofk_l3 = ObjectFifo(k_ty, name=f"kL3{gi}", depth=1)
+                ofk = ObjectFifo(k_ty, name=f"kbig{gi}", depth=1,
+                                 consumer_obj_type=kblk_ty, repeat_count=N_QT)
+                _ = ObjectFifoLink(ofk_l3.cons(), [ofk.prod()], AnyMemTile, [], [0])
+                ks = [ofk]
+                k_fill_srcs.append(ofk_l3)
+            else:
+                ofk = ObjectFifo(np.ndarray[(gsz * T * DK,), np.dtype[bfloat16]], name=f"kbig{gi}", depth=2)
+                ks = ofk.cons().split([i * T * DK for i in range(gsz)], obj_types=[k_ty] * gsz,
+                                      depths=[1] * gsz, names=[f"ks{gi}_{i}" for i in range(gsz)])
+                k_fill_srcs.append(ofk)
             ofb = ObjectFifo(np.ndarray[(gsz * TQ * DK,), np.dtype[bfloat16]], name=f"ctxbig{gi}", depth=2)
             cs = ofb.prod().join([i * TQ * DK for i in range(gsz)],
                                  obj_types=[ctx_ty] * gsz, names=[f"ctxj{gi}_{i}" for i in range(gsz)])
@@ -474,6 +501,17 @@ def build(dev, mono=False, TRIVIAL=False, relpos=False, bd_onchip=False, tactive
                 k_sc(eq, ek, eac)
                 f_q.release(1); f_ac.release(1)
             f_k.release(1)
+
+        # BLOCKED scores: q and ac are held across the NBLK_K k-block calls; the kernel accumulates
+        # into `ac` per j-pair and runs the de-tile+BD epilogue on the last block.
+        def stage_a_blk(f_q, f_k, f_ac, k_sc):
+            for _ in range_(N_QT):
+                eq = f_q.acquire(1); eac = f_ac.acquire(1)
+                for _ in range_(NBLK_K):
+                    ek = f_k.acquire(1)
+                    k_sc(eq, ek, eac)
+                    f_k.release(1)
+                f_q.release(1); f_ac.release(1)
 
         def stage_b(f_ac, f_probs, k_sm):
             for _ in range_(N_QT):
@@ -493,7 +531,9 @@ def build(dev, mono=False, TRIVIAL=False, relpos=False, bd_onchip=False, tactive
         # overflows the 1 KB default -> silent hang). stage A (relpos BD-in-belt) / C need no bump.
         wl = []
         for h in range(H):
-            wl += [Worker(stage_a, [q_subs[h].cons(), k_subs[h].cons(), of_ach[h].prod(), scores]),
+            wl += [Worker(stage_a_blk if mmul else stage_a,
+                          [q_subs[h].cons(), k_subs[h].cons(), of_ach[h].prod(),
+                           scores_blk if mmul else scores]),
                    Worker(stage_b, [of_ach[h].cons(), of_ph[h].prod(), softmax], stack_size=0x1000),
                    Worker(stage_c, [of_ph[h].cons(), of_vh[h].cons(), ctx_subs[h].prod(), ctx_k])]
 
@@ -509,12 +549,12 @@ def build(dev, mono=False, TRIVIAL=False, relpos=False, bd_onchip=False, tactive
                 vh = TensorAccessPattern([H * VT], h * VT, [1, 1, T, DK], [0, 0, DK, 1])
                 rt.fill(of_vh[h].prod(), V, tap=vh)
             qoff = koff = 0
-            for (ofq, hs), (ofk, _) in zip(of_q_bigs, of_k_bigs):
+            for gi_, ((ofq, hs), (ofk, _)) in enumerate(zip(of_q_bigs, of_k_bigs)):
                 gsz = len(hs)
                 qtap = TensorAccessPattern([N_QT * H * QELEM], qoff, [N_QT, 1, 1, gsz * QELEM], [gsz * QELEM, 0, 0, 1])
                 ktap = TensorAccessPattern([H * KT], koff, [1, 1, 1, gsz * T * DK], [0, 0, 0, 1])  # k once, group slice
                 rt.fill(ofq.prod(), Q, tap=qtap)
-                rt.fill(ofk.prod(), K, tap=ktap)
+                rt.fill(k_fill_srcs[gi_].prod(), K, tap=ktap)
                 qoff += N_QT * gsz * QELEM; koff += gsz * T * DK
             coff = 0   # per-group ctx drain (each group -> its own shim drain, contiguous slice of C_all)
             for ofb, hs in of_ctx_bigs:
