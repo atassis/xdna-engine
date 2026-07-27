@@ -48,7 +48,42 @@ ifeq ($(bfp16_iree),1)
 KERNEL_DEFINES += -DBFP16_IREE
 endif
 
-aiecc_peano_flags=--no-xchesscc --no-xbridge --peano ${PEANO_INSTALL_DIR}
+# ---- BUILD PROFILES ---------------------------------------------------------------------------
+# ONE place that answers "what does this build actually pass", so a profiling or debug build cannot
+# silently diverge from the shipped artifact -- and so a required setting cannot be forgotten.
+#
+# Every wall hit while first profiling this design was a build-configuration mistake that LOOKED like
+# a hardware or toolchain limit:
+#   * WA_C_DEPTH unset -> C double-buffered (64 KB) -> "allocated buffers exceeded available memory".
+#     It is read from os.environ by the generator, so omitting it from a hand-written make line is silent.
+#   * --trace_size passed twice -> argparse takes the last -> trace silently OFF, run produces 0 bytes.
+#   * --dump-intermediates missing -> the trace decoder cannot find input_with_addresses.mlir.
+# Profiles make each of those a named mode instead of folklore, and the $(info) line below prints the
+# resolved configuration on every build so a wrong one is visible immediately.
+#
+#   PROFILE=production (default) -- exactly what ships. No trace, no intermediates.
+#   PROFILE=trace                -- production flags PLUS hardware trace + aiecc intermediates.
+#   PROFILE=dev                  -- same as production today; kept as a separate name so fast-iteration
+#                                   flags can be added without touching the shipped configuration.
+PROFILE ?= production
+ifeq ($(filter $(PROFILE),production trace dev),)
+$(error unknown PROFILE='$(PROFILE)' -- use one of: production | trace | dev)
+endif
+
+# Single-buffer the L1 C tile. REQUIRED on the wide fast tiles: a double-buffered f32 C is 2x32 KB and
+# fills L1 on its own. Exported because the generator reads it from the environment.
+WA_C_DEPTH ?= 1
+export WA_C_DEPTH
+
+ifeq ($(PROFILE),trace)
+wa_trace_size ?= 65536
+else
+wa_trace_size ?= 0
+endif
+
+$(info [whole_array] PROFILE=$(PROFILE) WA_C_DEPTH=$(WA_C_DEPTH) wa_trace_size=$(wa_trace_size))
+
+aiecc_peano_flags=$(if $(filter-out 0,$(wa_trace_size)),--dump-intermediates,) --no-xchesscc --no-xbridge --peano ${PEANO_INSTALL_DIR}
 # Prefer the wired fork-instance aiecc (AIECC_PATH from iron_env.sh); fall back to PATH.
 AIECC := $(if $(AIECC_PATH),$(AIECC_PATH),aiecc)
 
@@ -64,7 +99,7 @@ insts_target := build/insts_${target_suffix}.txt
 
 ${mlir_target}: ${srcdir}/${aie_py_src}
 	mkdir -p ${@D}
-	python3 $< ${gen_args} --trace_size 0 > $@
+	python3 $< ${gen_args} --trace_size ${wa_trace_size} > $@
 
 # Grouped co-target (&:): ONE aiecc invocation produces BOTH the xclbin AND the .txt insts,
 # so make treats insts_${target_suffix}.txt as a real target (a direct `make .../insts_*.txt`
