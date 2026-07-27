@@ -192,8 +192,30 @@ struct ConveyorBdIoK {
     n_instr: usize,
     bo_instr: Bo,
     bo_p: Bo,        // [H_BD, P, DK] bf16, host-packed head-major (pos_enc is outside the frontier)
+    // Scratch owned here and REUSED every block. These were once allocated per call, which cost
+    // ~7 BO allocations x 24 blocks x every clip; the seam is called in a tight per-block loop, so
+    // the buffers must live as long as the loader (same discipline as ResidentLn's buffers). Safe to
+    // reuse because blocks run strictly sequentially: linear_out consumes bo_ctx before the next
+    // block's MHSA overwrites it.
+    bo_qf32: Bo,     // [PAD_M,KRES] f32   q projection output (device-resident)
+    bo_kf32: Bo,
+    bo_vf32: Bo,
+    bo_qpv: Bo,      // [2,PAD_M,KRES] bf16  qu plane | qv plane
+    bo_k: Bo,        // [PAD_M,KRES] bf16
+    bo_v: Bo,
+    bo_ctx: Rc<Bo>,  // [PAD_M,KRES] bf16  = linear_out's A input
+    // Per head-group column views (offset g*DK). `None` = group 0, which uses the base BOs directly.
+    groups: Vec<Option<BdIoGroup>>,
     n_qt: usize,
     n_heads: usize,  // baked heads per dispatch (H_BD)
+}
+
+/// A head-group's column window into the shared [PAD_M,KRES] stream buffers (sub-buffer at g*DK).
+struct BdIoGroup {
+    qpv: Bo,
+    k: Bo,
+    v: Bo,
+    ctx: Bo,
 }
 
 #[derive(Default)]
@@ -616,10 +638,38 @@ impl NpuMatmul {
             .collect();
         let g = |i| kern.group_id(i).unwrap();
         let bo_instr = self.dev.alloc_bo(&kern, ib.len(), FLAG_CACHEABLE, g(1)).unwrap();
-        // Only p is owned here; qpv/k/v/ctx are the caller's resident-stream BOs (g3/g5/g6/g7).
         let bo_p = self.dev.alloc_bo(&kern, n_heads * CONV_BD_P * CONV_DK * 2, FLAG_HOST_ONLY, g(4)).unwrap();
+        // Stream scratch, allocated ONCE (see the struct note on per-call allocation).
+        let plane = PAD_M * KRES * 2; // bytes per [PAD_M,KRES] bf16 plane
+        let g5 = self.kern.group_id(5).unwrap();
+        let f32_bytes_n = PAD_M * KRES * 4;
+        let bo_qf32 = self.dev.alloc_bo(&self.kern, f32_bytes_n, FLAG_HOST_ONLY, g5).unwrap();
+        let bo_kf32 = self.dev.alloc_bo(&self.kern, f32_bytes_n, FLAG_HOST_ONLY, g5).unwrap();
+        let bo_vf32 = self.dev.alloc_bo(&self.kern, f32_bytes_n, FLAG_HOST_ONLY, g5).unwrap();
+        let bo_qpv = self.dev.alloc_bo(&self.kern, 2 * plane, FLAG_HOST_ONLY, g5).unwrap();
+        let bo_k = self.dev.alloc_bo(&self.kern, plane, FLAG_HOST_ONLY, g5).unwrap();
+        let bo_v = self.dev.alloc_bo(&self.kern, plane, FLAG_HOST_ONLY, g5).unwrap();
+        let bo_ctx = Rc::new(self.dev.alloc_bo(&self.kern, plane, FLAG_HOST_ONLY, g5).unwrap());
+        // Total heads is fixed by the stream width (D == KRES), so the group windows are known here.
+        let total_heads = KRES / CONV_DK;
+        let mut groups = Vec::new();
+        for gg in (0..total_heads).step_by(n_heads) {
+            let off = gg * CONV_DK * 2;
+            groups.push(if off == 0 {
+                None
+            } else {
+                Some(BdIoGroup {
+                    qpv: bo_qpv.sub(off, 2 * plane - off).unwrap(),
+                    k: bo_k.sub(off, plane - off).unwrap(),
+                    v: bo_v.sub(off, plane - off).unwrap(),
+                    ctx: bo_ctx.sub(off, plane - off).unwrap(),
+                })
+            });
+        }
         let ck = Rc::new(ConveyorBdIoK {
-            kern, instr_template, n_instr, bo_instr, bo_p, n_qt: CONV_BUILT_T / CONV_TQ, n_heads,
+            kern, instr_template, n_instr, bo_instr, bo_p,
+            bo_qf32, bo_kf32, bo_vf32, bo_qpv, bo_k, bo_v, bo_ctx, groups,
+            n_qt: CONV_BUILT_T / CONV_TQ, n_heads,
         });
         *self.conveyor_bd_io.borrow_mut() = Some(ck.clone());
         Some(ck)
@@ -665,9 +715,9 @@ impl NpuMatmul {
         let ck = self.conveyor_bd_io_block(CONV_BD_HEADS)?;
 
         // ---- q/k/v projections, outputs stay on device (f32 [PAD_M, KRES]) ----
-        let q_f32 = self.proj_from_bf16_to_bo(satt_bo, m, make_wq, id_q, d);
-        let k_f32 = self.proj_from_bf16_to_bo(satt_bo, m, make_wk, id_k, d);
-        let v_f32 = self.proj_from_bf16_to_bo(satt_bo, m, make_wv, id_v, d);
+        self.proj_from_bf16_into(satt_bo, m, make_wq, id_q, d, &ck.bo_qf32);
+        self.proj_from_bf16_into(satt_bo, m, make_wk, id_k, d, &ck.bo_kf32);
+        self.proj_from_bf16_into(satt_bo, m, make_wv, id_v, d, &ck.bo_vf32);
 
         // ---- cast to bf16 in the layout the taps expect; fold pos_bias into BETA ----
         // ubias/vbias are [H,DK]; flattening to [D] lands head h's bias on columns h*DK..(h+1)*DK,
@@ -678,15 +728,10 @@ impl NpuMatmul {
             o
         };
         let plane = PAD_M * KRES * 2; // bytes per [PAD_M,KRES] bf16 plane
-        let g5 = self.kern.group_id(5).unwrap();
-        let bo_qpv = self.dev.alloc_bo(&self.kern, 2 * plane, FLAG_HOST_ONLY, g5).unwrap();
-        let bo_k = self.dev.alloc_bo(&self.kern, plane, FLAG_HOST_ONLY, g5).unwrap();
-        let bo_v = self.dev.alloc_bo(&self.kern, plane, FLAG_HOST_ONLY, g5).unwrap();
-        let bo_ctx = Rc::new(self.dev.alloc_bo(&self.kern, plane, FLAG_HOST_ONLY, g5).unwrap());
-        self.affine_cast_into(&q_f32, &bo_qpv.sub(0, plane).unwrap(), Some(&flat(ubias)))?;
-        self.affine_cast_into(&q_f32, &bo_qpv.sub(plane, plane).unwrap(), Some(&flat(vbias)))?;
-        self.affine_cast_into(&k_f32, &bo_k, None)?;
-        self.affine_cast_into(&v_f32, &bo_v, None)?;
+        self.affine_cast_into(&ck.bo_qf32, &ck.bo_qpv.sub(0, plane).unwrap(), Some(&flat(ubias)))?;
+        self.affine_cast_into(&ck.bo_qf32, &ck.bo_qpv.sub(plane, plane).unwrap(), Some(&flat(vbias)))?;
+        self.affine_cast_into(&ck.bo_kf32, &ck.bo_k, None)?;
+        self.affine_cast_into(&ck.bo_vf32, &ck.bo_v, None)?;
 
         // ---- t_active: patch every baked BUILT_T immediate to this clip's m (see the host-packed twin) ----
         let mut insts = ck.instr_template.clone();
@@ -721,24 +766,18 @@ impl NpuMatmul {
             ck.bo_p.write_bytes(u16_bytes(&pb)).unwrap();
             ck.bo_p.sync_to_device().unwrap();
 
-            let off = g * dk * 2; // byte offset of this group's first head column
-            let t0 = Instant::now();
-            let (sq, sk, sv, sc);
-            let (aq, ak, av, ac) = if off == 0 {
-                (&bo_qpv, &bo_k, &bo_v, &*bo_ctx)
-            } else {
-                sq = bo_qpv.sub(off, 2 * plane - off).unwrap();
-                sk = bo_k.sub(off, plane - off).unwrap();
-                sv = bo_v.sub(off, plane - off).unwrap();
-                sc = bo_ctx.sub(off, plane - off).unwrap();
-                (&sq, &sk, &sv, &sc)
+            // Column window for this head group (pre-built at load; None = group 0 = the base BOs).
+            let (aq, ak, av, ac) = match &ck.groups[g / CONV_BD_HEADS] {
+                None => (&ck.bo_qpv, &ck.bo_k, &ck.bo_v, &*ck.bo_ctx),
+                Some(w) => (&w.qpv, &w.k, &w.v, &w.ctx),
             };
+            let t0 = Instant::now();
             ck.kern.run_bd_conveyor(3, &ck.bo_instr, ck.n_instr, aq, &ck.bo_p, ak, av, ac).unwrap();
             let mut st = self.stats.borrow_mut();
             st.dispatch_s += t0.elapsed().as_secs_f64();
             st.dispatches += 1;
         }
-        Some(bo_ctx)
+        Some(ck.bo_ctx.clone())
     }
 
     /// Max clip length T the resident relpos block can serve (the largest bucket's baked BUILT_T).
@@ -1758,7 +1797,15 @@ impl NpuMatmul {
     /// SHARED per-N stream buffer `stream(n).bo_c`, so three q/k/v projections in a row would each
     /// clobber the previous. Callers holding q AND k AND v device-side need three distinct BOs.
     pub fn proj_from_bf16_to_bo<F: FnOnce() -> Array2<f32>>(&self, a_bo: &Bo, m: usize, make_b: F, id: &str, n: usize) -> Rc<Bo> {
-        assert!(m <= PAD_M, "proj_from_bf16_to_bo: m={m} exceeds PAD_M={PAD_M}");
+        let out = self.dev.alloc_bo(&self.kern, PAD_M * n * 4, FLAG_HOST_ONLY, self.kern.group_id(5).unwrap()).unwrap();
+        self.proj_from_bf16_into(a_bo, m, make_b, id, n, &out);
+        Rc::new(out)
+    }
+
+    /// [`Self::proj_from_bf16_to_bo`] into a CALLER-OWNED output BO, so a per-block loop can reuse
+    /// one buffer instead of allocating every call.
+    fn proj_from_bf16_into<F: FnOnce() -> Array2<f32>>(&self, a_bo: &Bo, m: usize, make_b: F, id: &str, n: usize, out: &Bo) {
+        assert!(m <= PAD_M, "proj_from_bf16_into: m={m} exceeds PAD_M={PAD_M}");
         self.stats.borrow_mut().calls += 1;
         let cached = self.wcache.borrow().get(id).cloned();
         let wbo = if let Some(bo) = cached {
@@ -1769,11 +1816,9 @@ impl NpuMatmul {
             assert_eq!(b.ncols(), n, "proj weight ncols {} != {n}", b.ncols());
             self.weight_bo(id, b.view())
         };
-        let out = self.dev.alloc_bo(&self.kern, PAD_M * n * 4, FLAG_HOST_ONLY, self.kern.group_id(5).unwrap()).unwrap();
         let st = self.stream(n, Act::Identity);
-        self.kern.run_matmul8(3, &st.instr, st.n_instr, a_bo, &wbo, &out, &self.bo_tmp, &self.bo_tr).unwrap();
+        self.kern.run_matmul8(3, &st.instr, st.n_instr, a_bo, &wbo, out, &self.bo_tmp, &self.bo_tr).unwrap();
         self.stats.borrow_mut().dispatches += 1;
-        Rc::new(out)
     }
 
     /// Affine-cast a device f32 [PAD_M,KRES] BO into a CALLER-CHOSEN device bf16 BO: out = a*gamma+beta,
