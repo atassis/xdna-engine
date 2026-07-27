@@ -36,7 +36,7 @@ endif
 build/kernels.a: ${kernel_obj}
 	ar rvs $@ $+
 
-GEN_EXTRA = $(if $(filter 1,$(MONO)),--mono,) $(if $(TRIVIAL),--trivial $(TRIVIAL),) $(if $(filter 1,$(RELPOS)),--relpos,) $(if $(filter 1,$(BDON)),--relpos-bd-onchip,) $(if $(filter 1,$(MASK)),--tactive-mask,) $(if $(filter 1,$(PRES)),--p-resident,) $(if $(filter 1,$(SIO)),--stream-io,)
+GEN_EXTRA = $(if $(filter 1,$(MONO)),--mono,) $(if $(TRIVIAL),--trivial $(TRIVIAL),) $(if $(filter 1,$(RELPOS)),--relpos,) $(if $(filter 1,$(BDON)),--relpos-bd-onchip,) $(if $(filter 1,$(MASK)),--tactive-mask,) $(if $(filter 1,$(PRES)),--p-resident,) $(if $(filter 1,$(SIO)),--stream-io,) $(if $(filter 1,$(MMUL)),--mmul,) $(if $(TRACE),-t $(TRACE) --trace-worker $(TW),)
 
 build/${targetname}.mlir: ${srcdir}/${aie_py_src}
 	mkdir -p ${@D}

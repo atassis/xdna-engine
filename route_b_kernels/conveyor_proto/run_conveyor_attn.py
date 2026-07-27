@@ -66,7 +66,7 @@ if os.environ.get("ATTN_MMUL", "0") == "1":
     _kt = kpack.reshape(H, T, DK).reshape(H, T // _t8, _t8, DK // _s, _s)   # [H, j, tt, c, ss]
     # -> [H, j, c, ss, tt]: tile ORDER stays j-major (keeps a j-pair contiguous) but tile CONTENT is
     # [ss][tt], so the kernel needs no aie::transpose in its inner loop.
-    kpack = _kt.transpose(0, 1, 3, 4, 2).reshape(-1)
+    kpack = _kt.transpose(0, 1, 3, 2, 4).reshape(-1)   # [H, j, c, tt, ss]
 v_all = np.concatenate([hd[2] for hd in heads])           # [H * VT] bf16
 ctx_ref = np.concatenate([hd[3] for hd in heads], axis=0)  # [H*NQ, DK] f32
 

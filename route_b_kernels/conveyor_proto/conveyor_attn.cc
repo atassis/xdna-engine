@@ -15,6 +15,12 @@
 #ifndef ATTN_NO_BDSCALE
 #define ATTN_NO_BDSCALE 0
 #endif
+#ifndef ATTN_NO_SOFTMAX
+#define ATTN_NO_SOFTMAX 0
+#endif
+#ifndef ATTN_NO_CTX
+#define ATTN_NO_CTX 0
+#endif
 
 #ifndef ATTN_TQ
 #define ATTN_TQ 8
@@ -414,7 +420,7 @@ extern "C" void stage_scores_relpos_bd_mask_mmul(const bfloat16 *__restrict qbd,
           for (unsigned c = 0; c < colA; c++)
             for (int ss = 0; ss < MM_S; ss++)
               acc += (float)q_tiled[((z * colA + c) * MM_R + rr) * MM_S + ss] *
-                     (float)ktiled[((j * colA + c) * MM_S + ss) * MM_T + tt];
+                     (float)ktiled[((j * colA + c) * MM_T + tt) * MM_S + ss];
           scores[((z * colB + j) * MM_R + rr) * MM_T + tt] = acc;
         }
 #else
@@ -451,6 +457,97 @@ extern "C" void stage_scores_relpos_bd_mask_mmul(const bfloat16 *__restrict qbd,
   }
   event1();
 }
+
+#if ATTN_MMUL && MM_SHAPE_OK
+
+// ONE j-pair of the vendored 2x2 register block, writing C tiles for j = 2*jp and 2*jp+1.
+// Shared by the blocked entry (k arrives as a 4 KB MemTile block) and the whole-k entry (k is the
+// 44 KB resident buffer, indexed by jp). Extracted so both use the SAME proven compute -- the
+// earlier hand-written whole-k variant diverged here and failed parity at 1.06.
+template <unsigned rowA, unsigned colA, unsigned colB>
+static inline void mm_jpair(const bfloat16 *__restrict q_tiled,
+                            const bfloat16 *__restrict kblk, float *__restrict scores,
+                            unsigned jp) {
+  using MMUL = aie::mmul<MM_R, MM_S, MM_T, bfloat16, bfloat16, accauto>;
+  float *__restrict pC1 = scores + (0u * colB + 2u * jp) * MMUL::size_C;
+  float *__restrict pC2 = scores + (1u * colB + 2u * jp) * MMUL::size_C;
+  const bfloat16 *__restrict pA1 = q_tiled + (0u * colA) * MMUL::size_A;
+  const bfloat16 *__restrict pA2 = q_tiled + (1u * colA) * MMUL::size_A;
+  const bfloat16 *__restrict pB1 = kblk;
+  const bfloat16 *__restrict pB2 = kblk + colA * MMUL::size_B;
+  aie::vector<bfloat16, MMUL::size_A> A0, A1;
+  aie::vector<bfloat16, MMUL::size_B> B0, B1;
+  MMUL C00; MMUL C01; MMUL C10; MMUL C11;
+  for (unsigned i = 0; i < colA; ++i)
+    chess_prepare_for_pipelining chess_loop_range(16, ) {
+      A0 = aie::load_v<MMUL::size_A>(pA1); pA1 += MMUL::size_A;
+      A1 = aie::load_v<MMUL::size_A>(pA2); pA2 += MMUL::size_A;
+      B0 = aie::transpose(aie::load_v<MMUL::size_B>(pB1), MM_T, MM_S); pB1 += MMUL::size_B;
+      B1 = aie::transpose(aie::load_v<MMUL::size_B>(pB2), MM_T, MM_S); pB2 += MMUL::size_B;
+      C00.mac(A0, B0); C01.mac(A0, B1);
+      C10.mac(A1, B0); C11.mac(A1, B1);
+    }
+  aie::store_v(pC1, C00.template to_vector<float>()); pC1 += MMUL::size_C;
+  aie::store_v(pC1, C01.template to_vector<float>());
+  aie::store_v(pC2, C10.template to_vector<float>()); pC2 += MMUL::size_C;
+  aie::store_v(pC2, C11.template to_vector<float>());
+}
+
+// De-tile + BD + scale + t_active key mask, vectorised MM_T wide. Shared epilogue.
+template <unsigned rowA, unsigned colA, unsigned colB>
+static inline void mm_epilogue(float *__restrict scores, const bfloat16 *__restrict bdhi,
+                               const bfloat16 *__restrict bdlo, float *__restrict row_scratch,
+                               int t_active) {
+  constexpr int T = ATTN_T;
+  constexpr float inv_scale = ATTN_SCALE;
+  for (unsigned z = 0; z < rowA; z++) {
+    float *grp = scores + z * MM_R * T;
+    for (int i = 0; i < MM_R * T; i++) row_scratch[i] = grp[i];
+    for (int rr = 0; rr < MM_R; rr++) {
+      const int li = z * MM_R + rr;
+      const bfloat16 *hir = bdhi + li * T;
+      const bfloat16 *lor = bdlo + li * T;
+      float *sc = grp + rr * T;
+      for (unsigned j = 0; j < colB; j++) {
+        const float *ct = row_scratch + (j * MM_R + rr) * MM_T;
+        aie::vector<float, MM_T> cv = aie::load_v<MM_T>(ct);
+        aie::vector<bfloat16, MM_T> bv = aie::load_v<MM_T>(hir + j * MM_T);
+        aie::vector<float, MM_T> bdf = aie::mul(bv, bfloat16(1.0f)).template to_vector<float>();
+#if BD_SPLIT
+        aie::vector<bfloat16, MM_T> lv = aie::load_v<MM_T>(lor + j * MM_T);
+        bdf = aie::add(bdf, aie::mul(lv, bfloat16(1.0f)).template to_vector<float>());
+#endif
+        aie::store_v(sc + j * MM_T,
+                     aie::mul(aie::add(cv, bdf), inv_scale).template to_vector<float>());
+      }
+      for (int j = t_active; j < T; j++) sc[j] = ATTN_KEY_MASK;   // pad keys -> softmax ~0
+    }
+  }
+}
+
+// WHOLE-K masked entry -- the shape the ENCODER's default rail actually dispatches
+// (relpos_mha_conveyor_bdonchip, CONV_BD_HEADS=4, g0/g1). k is the 44 KB resident buffer delivered
+// PRE-TILED by the shim: in this branch k is per-head, so the 4-D tiling tap is [T/8, DK/8, 8, 8]
+// with an outer size of 22, well under the 6-bit ITER_WRAP limit that blocked the grouped H=8 case.
+extern "C" void stage_scores_relpos_bd_mask_mmul_whole(const bfloat16 *__restrict qbd,
+                                                       const bfloat16 *__restrict ktiled,
+                                                       float *__restrict scores,
+                                                       const int32_t *__restrict rtp) {
+  constexpr int TQ = ATTN_TQ, T = ATTN_T, DK = ATTN_DK;
+  constexpr unsigned rowA = TQ / MM_R, colA = DK / MM_S, colB = T / MM_T;
+  alignas(32) static char mm_scratch2[MM_SCRATCH_BYTES];
+  bfloat16 *__restrict q_tiled = reinterpret_cast<bfloat16 *>(mm_scratch2);
+  float *__restrict row_scratch = reinterpret_cast<float *>(mm_scratch2);
+  event0();
+  mm_tile_rows<MM_R, MM_S, ATTN_DK>(qbd, q_tiled, TQ);
+  for (unsigned jp = 0; jp < colB / 2; jp++)
+    mm_jpair<rowA, colA, colB>(q_tiled, ktiled + jp * 2u * colA * (MM_S * MM_T), scores, jp);
+  mm_epilogue<rowA, colA, colB>(scores, qbd + TQ * DK,
+                                qbd + TQ * DK + (BD_SPLIT ? TQ * T : 0), row_scratch, rtp[0]);
+  event1();
+}
+
+#endif
 
 // ---------------- BLOCKED scores: k streamed from the MemTile in j-pair blocks ----------------
 // Holding k whole costs 44 KB of L1 and is what makes TQ=16 (and therefore r=8, and therefore the
@@ -508,8 +605,8 @@ extern "C" void stage_scores_mmul_block(const bfloat16 *__restrict qbd,
         // host-side anyway, so emitting the transposed content there is free; the ONLY reason the
         // b_row_maj=false route existed was to avoid transposing k, and that reason is now stale.
         // Tile ORDER stays j-major so a j-pair remains a contiguous block.
-        B0 = aie::load_v<MMUL::size_B>(pB1); pB1 += MMUL::size_B;
-        B1 = aie::load_v<MMUL::size_B>(pB2); pB2 += MMUL::size_B;
+        B0 = aie::transpose(aie::load_v<MMUL::size_B>(pB1), MM_T, MM_S); pB1 += MMUL::size_B;
+        B1 = aie::transpose(aie::load_v<MMUL::size_B>(pB2), MM_T, MM_S); pB2 += MMUL::size_B;
         C00.mac(A0, B0); C01.mac(A0, B1);
         C10.mac(A1, B0); C11.mac(A1, B1);
       }
@@ -570,8 +667,10 @@ extern "C" void stage_scores_mmul_block(const bfloat16 *__restrict qbd,
 extern "C" void stage_scores_relpos_bd_mmul(const bfloat16 *__restrict qbd,
                                             const bfloat16 *__restrict ktiled,
                                             float *__restrict scores) {
+  // Route to the PROVEN whole-k body (t_active = T is the unmasked case). Previously this called
+  // the hand-written non-blocked variant, which fails parity at 1.06 and is now unreferenced.
   const int32_t rtp_full[1] = {ATTN_T};
-  stage_scores_relpos_bd_mask_mmul(qbd, ktiled, scores, rtp_full);
+  stage_scores_relpos_bd_mask_mmul_whole(qbd, ktiled, scores, rtp_full);
 }
 #endif // ATTN_MMUL
 
@@ -664,6 +763,10 @@ extern "C" void stage_ctx_t(const bfloat16 *__restrict probs, const bfloat16 *__
 // already takes q+k). f32 accumulate, single bf16 narrow at the end.
 extern "C" void stage_ctx(const bfloat16 *__restrict probs,
                           const bfloat16 *__restrict V, bfloat16 *__restrict ctx) {
+#if ATTN_NO_CTX
+  for (int i = 0; i < ATTN_TQ * ATTN_DK; i++) ctx[i] = (bfloat16)0.0f;
+  return;
+#endif
   constexpr int TQ = ATTN_TQ, T = ATTN_T, DK = ATTN_DK;
   event0();
   for (int i = 0; i < TQ; i++) {
@@ -682,6 +785,11 @@ extern "C" void stage_ctx(const bfloat16 *__restrict probs,
 // STAGE B -- row softmax. probs[i,:] = softmax(ac[i,:]). f32 in, bf16 out. 3-pass (max, exp+sum,
 // normalize), exp/sum SPLIT into separate loops (fusing exp2f_vec + accfloat sum -> NaN on aie2p).
 extern "C" void stage_softmax(const float *__restrict ac, bfloat16 *__restrict probs) {
+#if ATTN_NO_SOFTMAX
+  // ABLATION: preserve the fifo traffic, drop the math (WRONG numerics on purpose).
+  for (int i = 0; i < ATTN_TQ * ATTN_T; i++) probs[i] = (bfloat16)ac[i];
+  return;
+#endif
   constexpr int TQ = ATTN_TQ, T = ATTN_T;
   float srow[ATTN_T];   // was static -- static may alias the odd ping-pong belt buffer in L1
   aie::vector<float, VL> log2e_v = aie::broadcast<float, VL>(LOG2E);

@@ -72,7 +72,11 @@ def build(dev, mono=False, TRIVIAL=False, relpos=False, bd_onchip=False, tactive
     # any t_active<=T; t_active==T is unmasked passthrough (== stage_scores_relpos_bd byte-for-byte).
     rtp_ty = np.ndarray[(16,), np.dtype[np.int32]]
     if bd_onchip and tactive_mask:
-        scores = Kernel("stage_scores_relpos_bd_mask_mmul" if mmul else "stage_scores_relpos_bd_mask",
+        # The ENCODER's default rail dispatches THIS one (relpos_mha_conveyor_bdonchip, H=4, g0/g1).
+        # Whole-k mmul: k stays the 44 KB resident buffer but arrives PRE-TILED from the shim -- per
+        # head here, so the 4-D tap's outer size is T/8 = 22, far under the 6-bit ITER_WRAP limit
+        # that blocked the grouped H=8 case and forced host tiling there.
+        scores = Kernel("stage_scores_relpos_bd_mask_mmul_whole" if mmul else "stage_scores_relpos_bd_mask",
                         "kernels.a", [qbd_ty, k_ty, ac_ty, rtp_ty])
     elif relpos:
         scores = Kernel("stage_scores_relpos_bd_mmul" if mmul else "stage_scores_relpos_bd",

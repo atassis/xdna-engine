@@ -69,6 +69,39 @@ const RELPOS_DK: usize = 128;   // Parakeet head_dim (kernel bakes DK=128)
 // conveyor_attn_iron.py 8-head build: TQ=8, DK=128, T padded 172->176 (a VL(16) multiple), GJ=4
 // heads per MemTile group (the validated 3-MemTile-op recipe: split q+k, v-direct, ctx-join).
 const CONV_TQ: usize = 8;
+
+/// aie::mmul conveyor (opt-in `PARAKEET_CONVEYOR_MMUL=1`). The scores stage uses the vendored 2x2
+/// register block with k streamed from the MemTile in j-pair blocks; measured ~2.9x on the conveyor
+/// unit gate at bit-equivalent numerics (rel-L2 4.6855e-03 vs 4.6854e-03). It needs TWO things the
+/// stock path does not: its own xclbin (artifacts/conveyor/single_mmul/) and k delivered PRE-TILED.
+fn conveyor_mmul() -> bool {
+    std::env::var("PARAKEET_CONVEYOR_MMUL").map(|v| v == "1").unwrap_or(false)
+}
+
+/// Re-order k into the mmul tile layout, per head. Tiles are s x t blocks laid out j-major, tile
+/// CONTENT [ss][tt]:  dst[((j*colA + c)*8 + ss)*8 + tt] = k[(j*8 + tt)*DK + c*8 + ss]
+/// The shim cannot do this (a grouped multi-head k needs 5 DMA dims against the 4 available, and
+/// merging head+group overflows the 6-bit ITER_WRAP field), so the host does it -- free here, since
+/// this buffer is being materialised anyway.
+fn tile_k_for_mmul(kb: &[u16], n_heads: usize, t_built: usize, dk: usize) -> Vec<u16> {
+    const B: usize = 8;
+    let ca = dk / B;
+    let mut out = vec![0u16; kb.len()];
+    for h in 0..n_heads {
+        let base = h * t_built * dk;
+        for j in 0..(t_built / B) {
+            for c in 0..ca {
+                for ss in 0..B {
+                    for tt in 0..B {
+                        out[base + ((j * ca + c) * B + ss) * B + tt] =
+                            kb[base + (j * B + tt) * dk + c * B + ss];
+                    }
+                }
+            }
+        }
+    }
+    out
+}
 const CONV_DK: usize = 128;
 const CONV_BUILT_T: usize = 176; // 172 padded to a VL-multiple; the 8-head conveyor's baked T
 const CONV_GJ: usize = 4;        // heads per MemTile group (must match the generator's join)
@@ -641,7 +674,9 @@ impl NpuMatmul {
         }
         let dk = CONV_DK;
         let n_qt = CONV_BUILT_T / CONV_TQ;
-        let dir = self.conveyor_dir.join("single");
+        let dir = self
+            .conveyor_dir
+            .join(if conveyor_mmul() { "single_mmul" } else { "single" });
         let xclbin = dir.join("final.xclbin");
         let insts = dir.join("insts.bin");
         let kern = self
@@ -674,7 +709,13 @@ impl NpuMatmul {
         }
         let dk = CONV_DK;
         let n_qt = CONV_BUILT_T / CONV_TQ;
-        let dir = self.conveyor_bd_dir.join("single");
+        // The BD-onchip conveyor is what the DEFAULT rail dispatches (g0/g1). Under
+        // PARAKEET_CONVEYOR_MMUL its scores stage uses the vendored mmul block and k arrives
+        // pre-tiled straight from the shim -- no host re-order needed on this path, unlike the
+        // grouped H=8 one, because k is per-head here.
+        let dir = self
+            .conveyor_bd_dir
+            .join(if conveyor_mmul() { "single_mmul" } else { "single" });
         let xclbin = dir.join("final.xclbin");
         let insts = dir.join("insts.bin");
         let kern = self
@@ -710,7 +751,10 @@ impl NpuMatmul {
             assert_eq!(k.n_heads, n_heads, "bd-io xclbin baked for H_BD={}, got {n_heads}", k.n_heads);
             return Some(k.clone());
         }
-        let dir = self.conveyor_bd_io_dir.join("single");
+        // THIS is what the default rail dispatches (relpos_mha_conveyor_bdonchip_dev, g0/g1).
+        let dir = self
+            .conveyor_bd_io_dir
+            .join(if conveyor_mmul() { "single_mmul" } else { "single" });
         let xclbin = dir.join("final.xclbin");
         let insts = dir.join("insts.bin");
         if !xclbin.exists() || !insts.exists() {
@@ -1221,6 +1265,9 @@ impl NpuMatmul {
         let mut vb = vec![0u16; v_pack.len()];
         npu_xrt::pack_f32_to_bf16(&q_belt, &mut qb);
         npu_xrt::pack_f32_to_bf16(&k_pack, &mut kb);
+        if conveyor_mmul() {
+            kb = tile_k_for_mmul(&kb, n_heads, CONV_BUILT_T, dk);
+        }
         npu_xrt::pack_f32_to_bf16(&v_pack, &mut vb);
 
         // ---- device dispatch: 4-BO conveyor ABI (instr | q | k | v | ctx), ONE run ----
