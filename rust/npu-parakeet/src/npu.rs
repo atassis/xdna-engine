@@ -1487,7 +1487,16 @@ impl NpuMatmul {
         let x = fill(t, KRES, seed, 1.0);
         let gv: Vec<f32> = fill(1, KRES, seed ^ 0x1A, 1.0).iter().copied().collect();
         let bv: Vec<f32> = fill(1, KRES, seed ^ 0x2B, 0.1).iter().copied().collect();
-        let a_bo = self.upload_stream(&x);
+        // Allocate the input BO against THIS kernel (as the bf16 sibling's selftest does) rather than
+        // via upload_stream, which allocates against the modal GEMM kernel. Isolates BO provenance from
+        // kernel correctness.
+        let lf_kern = rl.lnaffinef32.as_ref().unwrap();
+        let a_bo = self.dev.alloc_bo(&lf_kern.kern, PAD_M * KRES * 4, FLAG_HOST_ONLY, lf_kern.kern.group_id(3).unwrap()).unwrap();
+        let mut buf = vec![0f32; PAD_M * KRES];
+        let xs = x.as_standard_layout();
+        buf[..t * KRES].copy_from_slice(&xs.as_slice().unwrap()[..t * KRES]);
+        a_bo.write_bytes(f32_bytes(&buf)).unwrap();
+        a_bo.sync_to_device().unwrap();
         let out_bo = self.ln_affine_f32_dev(&a_bo, &gv, &bv)?;
         out_bo.sync_from_device().unwrap();
         let mut cb = vec![0u8; t * KRES * 4];
