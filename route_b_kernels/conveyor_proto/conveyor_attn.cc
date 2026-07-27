@@ -179,8 +179,19 @@ extern "C" void stage_scores_relpos_bd_mask(const bfloat16 *__restrict qbd,
     const bfloat16 *hir = bdhi + li * T;
     const bfloat16 *lor = bdlo + li * T;
     float *sc = scores + li * T;
-    for (int j = 0; j < T; j++) {
-      if (j >= t_active) { sc[j] = ATTN_KEY_MASK; continue; }  // key-mask: pad key -> softmax ~0
+    // MASK HOISTED OUT OF THE INNER LOOP. This was `for j<T { if (j>=t_active) {...; continue;} ... }`
+    // -- a data-dependent branch on every one of the TQ*T=1408 output elements, which on a VLIW core
+    // blocks software pipelining of the loop it guards. Splitting it into a clean active range plus a
+    // straight tail fill is EXACTLY equivalent (same values, same order, same rounding) and lets the
+    // compiler pipeline the hot loop.
+    //
+    // Measured baseline before this change: 291,668 cycles/query-tile, i.e. 207 cycles per output for
+    // 8 vector MACs of arithmetic (207x off the 128 MAC/cyc/core peak). The internal control is the
+    // ctx stage: identical MAC count (180,224) but 68,713 cycles, because its contraction axis lets it
+    // vectorize along the output instead of doing a horizontal reduce_add per element. This change
+    // separates the BRANCH cost from the reduce_add cost, which decides how much an aie::mmul rewrite
+    // can actually claim.
+    for (int j = 0; j < t_active; j++) {
       const bfloat16 *kr = k + j * DK;
       aie::accum<accfloat, VL> acc = aie::zeros<accfloat, VL>();
       for (int d = 0; d < DK; d += VL)
@@ -192,6 +203,7 @@ extern "C" void stage_scores_relpos_bd_mask(const bfloat16 *__restrict qbd,
 #endif
       sc[j] = (ac + bd) * inv_scale;
     }
+    for (int j = t_active; j < T; j++) sc[j] = ATTN_KEY_MASK;  // pad keys -> softmax ~0
   }
   event1();
 }
@@ -431,7 +443,20 @@ extern "C" void bd_block_bake(const bfloat16 *__restrict qpv, const bfloat16 *__
   static int j0 = 0;
   const bfloat16 *qv = qpv + ATTN_TQ * ATTN_DK;       // qpv = q_pass[TQ,DK] || qv[TQ,DK]
   int pb = (ATTN_P - j0 < BD_KB) ? (ATTN_P - j0) : BD_KB;
+  // TRACE MARKERS. The BD core is the ONLY stage of the 4-stage conveyor that decoded zero
+  // invocations, and the reason turned out to be trivial: this bake wrapper and bd_emit_bake_ta are
+  // the two functions the BD core actually calls, and NEITHER carried event0/event1. The instrumented
+  // siblings (bd_stream_block / bd_stream_emit) are different entry points this build never uses. So
+  // the core emitted no core-trace events at all -- not a ring overflow (its dedicated 1 MB ring came
+  // back only 54% full) and not a correctness problem.
+  //
+  // Marked HERE and not in bd_emit_bake_ta on purpose: parse.py pairs event0->event1 without regard to
+  // which function raised them, so instrumenting both would interleave 9 block pairs with 1 emit pair
+  // per query tile and blur the result. This wrapper carries bd_dot_block, which is the matmul we want
+  // to compare against the scores stage; emit is a copy + rel_shift and can be marked separately later.
+  event0();
   bd_dot_block(qv, pblk, pb, j0);
+  event1();
   j0 += BD_KB; if (j0 >= ATTN_P) j0 = 0;              // wrap per query tile (BD_KB blocks each)
 }
 extern "C" void bd_emit_bake(const bfloat16 *__restrict qpv, bfloat16 *__restrict out) {
