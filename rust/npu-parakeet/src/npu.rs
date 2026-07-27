@@ -860,7 +860,13 @@ impl NpuMatmul {
             };
             let t0 = Instant::now();
             ck.kern.run_bd_conveyor(3, &ck.bo_instr, ck.n_instr, aq, &ck.bo_p, ak, av, ac).unwrap();
-            self.note_dispatch_tag(t0, 1, "conveyor_bd_dev");
+            // Tagged PER HEAD-GROUP, not as one bucket. Everything bracketing this loop runs on the
+            // resident modal xclbin while `ck.kern` is a separately loaded one, so group 0 should pay
+            // a hw-context switch-in (~2.4 ms measured elsewhere) and group 1 should find the context
+            // warm. If the two tags differ by ~2.4 ms the cost is a context switch and the lever is
+            // keeping the array in this context; if they are equal the cost is the pipeline itself
+            // and the lever is H=8-in-1. Costs one re-run and no rebuild.
+            self.note_dispatch_tag(t0, 1, if g == 0 { "conveyor_bd_g0" } else { "conveyor_bd_g1" });
         }
         Some(ck.bo_ctx.clone())
     }
