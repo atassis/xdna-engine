@@ -12,6 +12,9 @@
 #ifndef ATTN_NO_QTILE
 #define ATTN_NO_QTILE 0
 #endif
+#ifndef ATTN_NO_BDSCALE
+#define ATTN_NO_BDSCALE 0
+#endif
 
 #ifndef ATTN_TQ
 #define ATTN_TQ 8
@@ -535,15 +538,26 @@ extern "C" void stage_scores_mmul_block(const bfloat16 *__restrict qbd,
         const bfloat16 *hir = bdhi + li * T;
         const bfloat16 *lor = bdlo + li * T;
         float *sc = grp + rr * T;
+        // VECTORISED de-tile + BD + scale, MM_T (=8) wide. Ablation showed the de-tile itself is
+        // free and that this line -- 1408 SCALAR bf16->float converts per query tile -- was 58% of
+        // the whole dispatch. All three operands are contiguous 8-element runs at this point
+        // (ct in the scratch, hir in the belt, sc in the output), so no gather is needed; the
+        // scalar version was leaving an 8-wide lane completely unused.
         for (unsigned j = 0; j < colB; j++) {
           const float *ct = row_scratch + (j * MM_R + rr) * MM_T;
-          for (int tt = 0; tt < MM_T; tt++) {
-            float bd = (float)hir[j * MM_T + tt];
+#if ATTN_NO_BDSCALE
+          for (int tt = 0; tt < MM_T; tt++) sc[j * MM_T + tt] = ct[tt];   // ABLATION
+#else
+          aie::vector<float, MM_T> cv = aie::load_v<MM_T>(ct);
+          aie::vector<bfloat16, MM_T> bv = aie::load_v<MM_T>(hir + j * MM_T);
+          aie::vector<float, MM_T> bdf = aie::mul(bv, bfloat16(1.0f)).template to_vector<float>();
 #if BD_SPLIT
-            bd += (float)lor[j * MM_T + tt];
+          aie::vector<bfloat16, MM_T> lv = aie::load_v<MM_T>(lor + j * MM_T);
+          bdf = aie::add(bdf, aie::mul(lv, bfloat16(1.0f)).template to_vector<float>());
 #endif
-            sc[j * MM_T + tt] = (ct[tt] + bd) * inv_scale;
-          }
+          aie::vector<float, MM_T> sum = aie::add(cv, bdf);
+          aie::store_v(sc + j * MM_T, aie::mul(sum, inv_scale).template to_vector<float>());
+#endif
         }
       }
     }
