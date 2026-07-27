@@ -599,6 +599,12 @@ def build(dev, mono=False, TRIVIAL=False, relpos=False, bd_onchip=False, tactive
                                            [N_QT, 1, 1, gsz * TQ * DK], [gsz * TQ * DK, 0, 0, 1])
                 rt.drain(ofb.cons(), CTX, tap=gtap, wait=True)
                 coff += N_QT * gsz * TQ * DK
+            # Per-stage trace for the 3-STAGE path (this branch had none; enable_trace lived only in
+            # the bd_onchip branch). Worker order per head is [scores, softmax, ctx], so
+            # --trace-worker 0=scores 1=softmax 2=ctx. Build at ATTN_HEADS=1: egress needs a free
+            # shim channel. trace_size=0 leaves the design byte-identical to production.
+            if trace_size:
+                rt.enable_trace(trace_size=trace_size, workers=[wl[trace_worker]], egress_shim_col=1)
 
     return Program(dev, rt).resolve_program()
 

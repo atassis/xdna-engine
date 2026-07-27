@@ -90,10 +90,26 @@ bo_q.write(qb.tobytes(), 0); bo_q.sync(TO)
 bo_k.write(kb.tobytes(), 0); bo_k.sync(TO)
 bo_v.write(vb.tobytes(), 0); bo_v.sync(TO)
 
+# Optional trace BO, appended at the TAIL of the runtime sequence (group_id 7) so the q/k/v/ctx
+# group ids and the ABI above are untouched. ATTN_TRACE = trace buffer bytes; 0 = production.
+TRACE = int(os.environ.get("ATTN_TRACE", 0))
+bo_t = pyxrt.bo(d, TRACE, pyxrt.bo.host_only, kern.group_id(7)) if TRACE else None
+if bo_t is not None:
+    bo_t.write(bytearray(TRACE), 0); bo_t.sync(TO)
+
 def once():
-    r = kern(3, bo_instr, instr.size, bo_q, bo_k, bo_v, bo_c); r.wait()
+    if bo_t is not None:
+        r = kern(3, bo_instr, instr.size, bo_q, bo_k, bo_v, bo_c, bo_t)
+    else:
+        r = kern(3, bo_instr, instr.size, bo_q, bo_k, bo_v, bo_c)
+    r.wait()
 
 once()
+if bo_t is not None:
+    bo_t.sync(FROM)
+    open(os.environ.get("ATTN_TRACE_FILE", "trace.txt"), "w").write(
+        "\n".join("0x%08X" % w for w in np.frombuffer(bo_t.read(TRACE, 0), dtype=np.uint32)))
+    print(f"[trace] wrote {TRACE} bytes -> {os.environ.get('ATTN_TRACE_FILE','trace.txt')}")
 bo_c.sync(FROM)
 # joined ctx: heads grouped by GJ into MemTiles; each group drains contiguously as [N_QT, gsz, TQ, DK].
 # de-interleave per group (H<->N_QT) then concat -> per-head [H*NQ, DK]. (GJ must match the generator.)

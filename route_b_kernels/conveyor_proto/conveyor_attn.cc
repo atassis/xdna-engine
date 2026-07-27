@@ -6,6 +6,12 @@
 // helper from relpos_mha.cc (hw exp2 is ~2-4% off on aie2p; NOINLINE avoids the -O2 NaN bug).
 #include <aie_api/aie.hpp>
 #include <stdint.h>
+#ifndef ATTN_NO_EPILOGUE
+#define ATTN_NO_EPILOGUE 0
+#endif
+#ifndef ATTN_NO_QTILE
+#define ATTN_NO_QTILE 0
+#endif
 
 #ifndef ATTN_TQ
 #define ATTN_TQ 8
@@ -473,7 +479,9 @@ extern "C" void stage_scores_mmul_block(const bfloat16 *__restrict qbd,
   static int jp = 0;
 
   event0();
+#if !ATTN_NO_QTILE
   if (jp == 0) mm_tile_rows<MM_R, MM_S, ATTN_DK>(qbd, q_tiled, TQ);
+#endif
 
   {   // ONE j-pair, the vendored 2x2 register block (mm.cc:78-211), unwidened.
     float *__restrict pC1 = scores + (0u * colB + 2u * jp) * MMUL::size_C;
@@ -509,7 +517,13 @@ extern "C" void stage_scores_mmul_block(const bfloat16 *__restrict qbd,
     aie::store_v(pC2, C11.template to_vector<float>());
   }
 
+  // ABLATION (-DATTN_NO_EPILOGUE=1 / -DATTN_NO_QTILE=1): numerically WRONG on purpose. The trace
+  // parser finds no tiles in our trace dump, so cost is attributed differentially instead -- skip a
+  // phase, measure the delta. Never enable in a build whose numbers are quoted as correct.
   if (++jp == (int)NBLK) {   // last block of this query tile -> de-tile + BD + scale, in place
+#if ATTN_NO_EPILOGUE
+    jp = 0; event1(); return;
+#endif
     jp = 0;
     const bfloat16 *bdhi = qbd + TQ * DK;
     const bfloat16 *bdlo = bdhi + (BD_SPLIT ? TQ * T : 0);
