@@ -138,6 +138,20 @@ fn main() {
             assert!(l2_rel <= 1e-4, "convfront parity FAILED: rel-L2 {l2_rel:.3e} > 1e-4");
             println!("[fused_seam_parity] PASS (rel-L2 <= 1e-4)");
         }
+        "resaddln" => {
+            // Isolation gate for the FIRST one-xclbin-per-block collapse: LN(a + scale*b)*gamma+beta
+            // in one command, with the intermediate sum handed core-to-core on-chip. Tolerance is the
+            // bf16-out LN's, same as the `ln` seam -- the output narrows to bf16 either way.
+            let scale: f32 = arg_val("--scale", "0.5").parse().unwrap();
+            let (host, dev) = npu.resadd_ln_selftest(t, seed, scale).unwrap_or_else(|| {
+                panic!("[fused_seam_parity] resaddln: fused xclbin absent for scale={scale} -- build \
+                        Makefile.resaddln (final_resaddln_512x1024_s050/s100)");
+            });
+            let (max_rel, l2_rel) = rel_err(&host, &dev);
+            println!("[fused_seam_parity] seam=resaddln scale={scale} t={t} seed={seed}  max_rel={max_rel:.3e} rel-L2={l2_rel:.3e}");
+            assert!(l2_rel <= 5e-3, "resadd_ln parity FAILED: rel-L2 {l2_rel:.3e} > 5e-3");
+            println!("[fused_seam_parity] PASS (rel-L2 <= 5e-3)");
+        }
         other => {
             eprintln!("[fused_seam_parity] unknown seam '{other}' (known: ffn, residual, ln, linout, convfront)");
             std::process::exit(2);

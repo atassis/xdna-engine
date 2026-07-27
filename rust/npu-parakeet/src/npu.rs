@@ -331,6 +331,8 @@ struct ResidentLn {
     lnaffinef32: Option<LnAffineF32>,
     // scaled residual-add (out = a + 0.5*b, f32), OPTIONAL. The Macaron FFN residual x+0.5*ff on-chip.
     resadd_s050: Option<ResidualAdd>,
+    resaddln_s050: Option<ResAddLn>,
+    resaddln_s100: Option<ResAddLn>,
     // scaled residual-add (out = a + 1.0*b, f32), OPTIONAL. The full MHSA/conv residual x+sublayer.
     resadd_s100: Option<ResidualAdd>,
     // one-dispatch K=4096 fc2 (cast@4096 -> K=4096 modal), OPTIONAL. Collapses the 4x K=1024 + acc_add.
@@ -405,6 +407,22 @@ struct Fc2K4096 {
 
 /// Device-side f32 scaled residual-add brick (whole-block fusion residual). out[g5] = a[g3] +
 /// scale*b[g4] over [PAD_M,KRES] f32, `scale` baked into the xclbin (one per value: s050 = 0.5).
+/// FUSED residual-add -> LN+affine+cast, ONE hardware context (the first one-xclbin-per-block
+/// collapse). Emits BOTH the f32 sum (the residual stream, reused downstream) and the bf16 LN result,
+/// with the intermediate sum handed core-to-core ON-CHIP instead of through DDR. Scale baked per
+/// xclbin exactly as `ResidualAdd`.
+struct ResAddLn {
+    scale: f32,
+    bo_sum: Rc<Bo>,
+    bo_sum1: Rc<Bo>,
+    bo_out: Rc<Bo>,
+    bo_out1: Rc<Bo>,
+    flip: std::cell::Cell<bool>,
+    kern: Rc<Kernel>,
+    instr: Bo,
+    n: usize,
+}
+
 /// Keeps `x = x + scale*sublayer` on-chip so the residual never round-trips. OPTIONAL like acc_add.
 /// Fused normalize-only LN + affine + f32->bf16 cast (one dispatch). ABI matches affine_cast:
 /// (x f32 [PAD_M,KRES], gb f32 [2*KRES]) -> bf16 [PAD_M,KRES], i.e. 2 inputs + 1 output, inside the
@@ -1659,6 +1677,31 @@ impl NpuMatmul {
             }
         };
         // scaled residual-add s050 (out = a + 0.5*b, f32), OPTIONAL: the Macaron FFN residual on-chip.
+        // FUSED resadd->LN, one xclbin per scale. ABI (a, b, gb, sum, out) lands on g3..g7, i.e.
+        // exactly run_matmul8's five BO slots.
+        let load_resaddln = |scale: f32, stag: &str| -> Option<ResAddLn> {
+            let xcl = self.ln_dir.join(format!("final_resaddln_{PAD_M}x{KRES}_s{stag}.xclbin"));
+            let ins = self.ln_dir.join(format!("insts_resaddln_{PAD_M}x{KRES}_s{stag}.txt"));
+            if !(xcl.exists() && ins.exists()) {
+                return None;
+            }
+            let (kern, instr, n) = load_path(xcl, ins);
+            let gr = |i| kern.group_id(i).unwrap();
+            Some(ResAddLn {
+                scale,
+                bo_sum: Rc::new(self.dev.alloc_bo(&kern, PAD_M * KRES * 4, FLAG_HOST_ONLY, gr(6)).unwrap()),
+                bo_sum1: Rc::new(self.dev.alloc_bo(&kern, PAD_M * KRES * 4, FLAG_HOST_ONLY, gr(6)).unwrap()),
+                bo_out: Rc::new(self.dev.alloc_bo(&kern, PAD_M * KRES * 2, FLAG_HOST_ONLY, gr(7)).unwrap()),
+                bo_out1: Rc::new(self.dev.alloc_bo(&kern, PAD_M * KRES * 2, FLAG_HOST_ONLY, gr(7)).unwrap()),
+                flip: std::cell::Cell::new(false),
+                kern, instr, n,
+            })
+        };
+        let resaddln_s050 = load_resaddln(0.5, "050");
+        let resaddln_s100 = load_resaddln(1.0, "100");
+        if resaddln_s050.is_none() {
+            eprintln!("[npu] resaddln xclbins absent in {} -- the fused resadd->LN collapse is unavailable (build final_resaddln_{PAD_M}x{KRES}_s050/s100)", self.ln_dir.display());
+        }
         let resadd_s050 = {
             let xcl = self.ln_dir.join(format!("final_resadd_{PAD_M}x{KRES}_s050.xclbin"));
             let ins = self.ln_dir.join(format!("insts_resadd_{PAD_M}x{KRES}_s050.txt"));
@@ -1844,7 +1887,7 @@ impl NpuMatmul {
             deint_tmp: self.dev.alloc_bo(&deint_kern, 8, FLAG_HOST_ONLY, gd(6)).unwrap(),
             deint_tr: self.dev.alloc_bo(&deint_kern, 1, FLAG_HOST_ONLY, gd(7)).unwrap(),
             ln_kern, ln_instr, ln_n, ac_kern, ac_instr, ac_n,
-            deint_kern, deint_instr, deint_n, glu, lnaffcast, lnaffinef32, acc_add, resadd_s050, resadd_s100, fc2_k4096, dwconv, silu, dwconv_silu, dwconv_silu_t,
+            deint_kern, deint_instr, deint_n, glu, lnaffcast, lnaffinef32, acc_add, resadd_s050, resadd_s100, resaddln_s050, resaddln_s100, fc2_k4096, dwconv, silu, dwconv_silu, dwconv_silu_t,
         });
         rl
     }
@@ -3113,6 +3156,72 @@ impl NpuMatmul {
         let host = self.resident_conv_pw1_glu(&x, &gv, &bv, move || pw1a, "selftest.convpw1")?;
         let a_bo = self.upload_stream(&x);
         let dev = self.resident_conv_pw1_glu_dev(&a_bo, t, &gv, &bv, move || pw1, "selftest.convpw1")?;
+        Some((host, dev))
+    }
+
+    /// FUSED `LN(a + scale*b)*gamma + beta` in ONE command submission. Returns
+    /// `(sum_f32, ln_bf16)` -- the residual stream (reused downstream) and the LN result.
+    ///
+    /// This is the first one-xclbin-per-block collapse. It replaces a `residual_add_dev` followed by
+    /// an `ln_affine_cast_dev`, and the saving is NOT mainly the deleted command: the intermediate sum
+    /// is handed core-to-core through an ON-CHIP ObjectFifo, so its 2 MB DDR read disappears. Per the
+    /// tightened frontier invariant, inside a block the stream should never leave L2.
+    ///
+    /// `None` when the fused xclbin for this scale is absent, so callers fall back to the two-command
+    /// path unchanged.
+    pub fn resadd_ln_dev(&self, a_bo: &Bo, b_bo: &Bo, scale: f32, gamma: &[f32], beta: &[f32]) -> Option<(Rc<Bo>, Rc<Bo>)> {
+        let rl = self.resident_ln()?;
+        let rn = if scale == 0.5 { rl.resaddln_s050.as_ref()? } else { rl.resaddln_s100.as_ref()? };
+        assert!((rn.scale - scale).abs() < 1e-6, "resadd_ln_dev scale {scale} != baked {}", rn.scale);
+        let mut gb = vec![0f32; 2 * KRES];
+        gb[..KRES].copy_from_slice(gamma);
+        gb[KRES..].copy_from_slice(beta);
+        rl.bo_gb.write_bytes(f32_bytes(&gb)).unwrap();
+        rl.bo_gb.sync_to_device().unwrap();
+        let f = rn.flip.get();
+        rn.flip.set(!f);
+        let (sum, out) = if f { (&rn.bo_sum1, &rn.bo_out1) } else { (&rn.bo_sum, &rn.bo_out) };
+        let __d0 = std::time::Instant::now();
+        rn.kern.run_matmul8(3, &rn.instr, rn.n, a_bo, b_bo, &rl.bo_gb, sum, out).unwrap();
+        self.note_dispatch_tag(__d0, 1, "resadd_ln");
+        Some((sum.clone(), out.clone()))
+    }
+
+    /// Isolation gate for [`Self::resadd_ln_dev`]: host `LN(a + scale*b)*gamma+beta` vs the fused
+    /// device brick. Returns (host, dev_ln_bf16_as_f32) for the FIRST `t` rows.
+    pub fn resadd_ln_selftest(&self, t: usize, seed: u64, scale: f32) -> Option<(Array2<f32>, Array2<f32>)> {
+        let rl = self.resident_ln()?;
+        if scale == 0.5 { rl.resaddln_s050.as_ref()?; } else { rl.resaddln_s100.as_ref()?; }
+        let fill = |rows: usize, cols: usize, sd: u64, sc: f32| -> Array2<f32> {
+            let mut s = sd.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            Array2::from_shape_fn((rows, cols), |_| {
+                s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                let mut z = s; z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB); z ^= z >> 31;
+                ((z >> 40) as f32 / (1u32 << 24) as f32 * 2.0 - 1.0) * sc
+            })
+        };
+        let a = fill(t, KRES, seed, 1.0);
+        let b = fill(t, KRES, seed ^ 0x5D, 1.0);
+        let gv: Vec<f32> = fill(1, KRES, seed ^ 0x1A, 1.0).iter().copied().collect();
+        let bv: Vec<f32> = fill(1, KRES, seed ^ 0x2B, 0.1).iter().copied().collect();
+        let a_bo = self.upload_stream(&a);
+        let b_bo = self.upload_stream(&b);
+        let (_sum, ln_bo) = self.resadd_ln_dev(&a_bo, &b_bo, scale, &gv, &bv)?;
+        ln_bo.sync_from_device().unwrap();
+        let mut cb = vec![0u8; t * KRES * 2];
+        ln_bo.read_bytes(&mut cb).unwrap();
+        let mut dev = Array2::<f32>::zeros((t, KRES));
+        for r in 0..t {
+            for c in 0..KRES {
+                let off = (r * KRES + c) * 2;
+                let bits = u16::from_le_bytes([cb[off], cb[off + 1]]);
+                dev[[r, c]] = f32::from_bits((bits as u32) << 16);
+            }
+        }
+        let mut sum_h = a.clone();
+        sum_h.zip_mut_with(&b, |x, y| *x += scale * *y);
+        let host = crate::ops::layernorm(&sum_h, &Array1::from(gv), &Array1::from(bv));
         Some((host, dev))
     }
 

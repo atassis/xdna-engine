@@ -937,8 +937,33 @@ impl FastConformerEncoder {
         let ff1_bo = npu.resident_ffn_dev_bo(a_bo, ff1n_g.as_slice().unwrap(), ff1n_b.as_slice().unwrap(),
             || b.m("feed_forward1.linear1.weight"), &format!("{blk}.ff1.l1"),
             || b.m("feed_forward1.linear2.weight"), &format!("{blk}.ff1.l2")).expect("resident_ffn_dev_bo");
-        let x_bo = npu.residual_add_dev(a_bo, &ff1_bo, 0.5, m).expect("residual_add_dev(0.5)");
-        let satt_bo = npu.ln_affine_cast_dev_bf16(&x_bo, satt_g.as_slice().unwrap(), satt_b.as_slice().unwrap()).expect("ln_affine_cast_dev");
+        // COLLAPSE 1 of the one-xclbin-per-block work: `resadd(0.5) -> satt LN` is ONE command, with
+        // the intermediate residual handed core-to-core on-chip instead of through DDR.
+        //
+        // OPT-IN (`PARAKEET_RESADD_LN=1`), NOT default, and the reason is measured rather than
+        // cautious: the fused brick is correct (isolation gate 6/6, rel-L2 1.65e-3) and does delete
+        // exactly 1 command per block, but it is a WASH -- 2.4 ms/clip. The shim DMA budget forced it
+        // to 4 columns instead of 8 (a, b in + sum, out out already fills a column's 2+2 channels, and
+        // gb needs a fifth), so it runs at HALF the parallelism, and that gives back almost exactly
+        // what the on-chip hand-off saves: 1.76 ms/command fused vs 1.86 ms for the pair it replaces.
+        // Turning it on by default would trade a real halving of column count for a 5% saving.
+        //
+        // THE FIX IS KNOWN: put gamma/beta in a host-written L1 buffer instead of a DMA input --
+        // an RTP is an L1 address, not a DMA channel ([[rtp-slot-not-dma-channel-for-runtime-params]],
+        // and mm_silu_epilogue.cc already does exactly this for its mode select). That frees the fifth
+        // channel, the design goes back to 8 columns, and the collapse should pay properly.
+        let fused_rl = std::env::var("PARAKEET_RESADD_LN").map(|v| v == "1").unwrap_or(false);
+        let (x_bo, satt_bo) = match fused_rl
+            .then(|| npu.resadd_ln_dev(a_bo, &ff1_bo, 0.5, satt_g.as_slice().unwrap(), satt_b.as_slice().unwrap()))
+            .flatten()
+        {
+            Some(pair) => pair,
+            None => {
+                let x_bo = npu.residual_add_dev(a_bo, &ff1_bo, 0.5, m).expect("residual_add_dev(0.5)");
+                let satt_bo = npu.ln_affine_cast_dev_bf16(&x_bo, satt_g.as_slice().unwrap(), satt_b.as_slice().unwrap()).expect("ln_affine_cast_dev");
+                (x_bo, satt_bo)
+            }
+        };
         let mhsa_out_bo = self.mhsa_dev(&satt_bo, m, blk, pos_enc);
         let conv_in_bo = npu.residual_add_dev(&x_bo, &mhsa_out_bo, 1.0, m).expect("residual_add_dev(1.0)");
         let conv_g = b.v("norm_conv.weight");

@@ -82,6 +82,12 @@ make -C $LNML -f Makefile.resadd     NPU2=1 rows=512 cols=1024 scale=0.5 stag=05
 # s100 (scale=1.0) = the full MHSA/conv residual x+sublayer (Task 5/6 seams).
 echo "== RESIDENT-BLOCK: residual_add s100 (x+1.0*sublayer) 512x1024 =="
 make -C $LNML -f Makefile.resadd     NPU2=1 rows=512 cols=1024 scale=1.0 stag=100 build/final_resadd_512x1024_s100.xclbin
+# FUSED resadd->LN, both scales. cores=4 is NOT a tuning choice: a, b in + sum, out out already fill
+# a column's 2+2 shim DMA channels and gb needs a fifth, so 8 columns does not place. See the note on
+# PARAKEET_RESADD_LN in encoder.rs for the fix (gamma/beta via a host-written L1 buffer).
+echo "== RESIDENT-BLOCK: FUSED resadd->LN 512x1024 (s050 + s100) =="
+make -C $LNML -f Makefile.resaddln   NPU2=1 rows=512 cols=1024 scale=0.5 stag=050 cores=4 build/final_resaddln_512x1024_s050.xclbin
+make -C $LNML -f Makefile.resaddln   NPU2=1 rows=512 cols=1024 scale=1.0 stag=100 cores=4 build/final_resaddln_512x1024_s100.xclbin
 # RESIDENT-CONV: post-dwconv SiLU brick (conv-module step 4). silu(x) over [C,T]=[1024,400] f32 -> f32.
 # SEPARATE single-op-loop brick (NOT a dwconv epilogue -- the fused epilogue miscompiles alternate
 # channels on this toolchain; see dwconv-fused-epilogue-alt-channel-miscompile). rows=C, cols=T.
@@ -92,7 +98,7 @@ echo "== RESIDENT-FFN: cast@4096 + K=4096 fc2 (identity) =="
 make -C $LNML -f Makefile.cast       NPU2=1 rows=512 cols=4096 build/final_cast_512x4096.xclbin
 WA_C_DEPTH=1 make -C $MMW -f Makefile.modal NPU2=1 M=512 K=4096 N=1024 m=64 k=32 n=128 n_aie_cols=8 \
   emulate_bfloat16_mmul_with_bfp16=1 bfp16_iree=1 no_silu=1 build/final_512x4096x1024_64x32x128_8c_modalid.xclbin
-for tag in ctxln_512x1024 affcast_512x1024 lnaffcast_512x1024 lnaffcastb_512x1024 lnaffinef32_512x1024 cast_512x1024 cast_512x4096 glu_512x1024 accadd_512x1024 resadd_512x1024_s050 resadd_512x1024_s100 silu_1024x400; do
+for tag in ctxln_512x1024 affcast_512x1024 lnaffcast_512x1024 lnaffcastb_512x1024 lnaffinef32_512x1024 cast_512x1024 cast_512x4096 glu_512x1024 accadd_512x1024 resadd_512x1024_s050 resadd_512x1024_s100 resaddln_512x1024_s050 resaddln_512x1024_s100 silu_1024x400; do
   cp "$LNML/build/final_${tag}.xclbin" "$LNML/build/insts_${tag}.txt" "$LNDIR/"
 done
 cp "$MMW/build/final_512x4096x1024_64x32x128_8c_modalid.xclbin" "$MMW/build/insts_512x4096x1024_64x32x128_8c_modalid.txt" "$LNDIR/"
