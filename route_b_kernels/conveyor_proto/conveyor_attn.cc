@@ -90,6 +90,17 @@ static constexpr int VL = 16;
 #define MM_R_V 4
 #endif
 static constexpr int MM_R = MM_R_V, MM_S = 8, MM_T = 8;
+
+// ALIGNMENT, and why this cost a debugging round. aie::load_v is an ALIGNED access and XDNA2's
+// documented requirement scales with the ACCESS SIZE, not with some fixed boundary:
+// 128b->16B, 256b->32B, 512b->64B (aie_doc.hpp, "Data Loading And Vector Alignment"). MMUL::size_A
+// here is 32 bf16 = 64 B = a 512b access, so it needs 64-BYTE alignment. These scratch buffers were
+// alignas(32) -- one row short of the table -- which is UNDEFINED BEHAVIOUR, and on aie2p it
+// silently truncates the address to the boundary instead of faulting. It was LATENT: whether a
+// 32B-aligned object also lands 64B-aligned depends on where the linker places it, so identical
+// kernel source passed on the 3-stage design and failed on the 4-stage one at rel-L2 1.25e-01.
+// Use aie::vector_decl_align -- the API's own "works for any vector size" constant -- never a
+// hand-picked number.
 // The 2x2 block needs an even rowA, i.e. ATTN_TQ % (2*MM_R) == 0. That is a property of the
 // BUILD, not of the kernel, so the mmul entry points are compiled out when the shape does not
 // admit them -- otherwise their static_asserts break the plain (non-mmul) build at the same TQ.
@@ -408,7 +419,7 @@ extern "C" void stage_scores_relpos_bd_mask_mmul(const bfloat16 *__restrict qbd,
   // ONE scratch, aliased. L1 on this core already carries the 44 KB k, and two separate scratches
   // overflowed .bss by 1568 B. They are never live together: q_tiled is dead the moment mm_2x2
   // returns, and row_scratch is only touched after it. Sized by the larger of the two.
-  alignas(32) static char mm_scratch[MM_SCRATCH_BYTES];
+  alignas(aie::vector_decl_align) static char mm_scratch[MM_SCRATCH_BYTES];
   static_assert(sizeof(mm_scratch) >= ATTN_TQ * ATTN_DK * sizeof(bfloat16), "scratch too small for q");
   bfloat16 *__restrict q_tiled = reinterpret_cast<bfloat16 *>(mm_scratch);
   float *__restrict row_scratch = reinterpret_cast<float *>(mm_scratch);
@@ -598,7 +609,7 @@ extern "C" void stage_scores_mmul_block(const bfloat16 *__restrict qbd,
   static_assert(rowA == 2, "the 2x2 block wants exactly two block-rows here (TQ = 2*MM_R)");
   static_assert(colB % 2 == 0, "j must pair evenly");
 
-  alignas(32) static char mm_scratch[MM_SCRATCH_BYTES];
+  alignas(aie::vector_decl_align) static char mm_scratch[MM_SCRATCH_BYTES];
   static_assert(sizeof(mm_scratch) >= ATTN_TQ * ATTN_DK * sizeof(bfloat16), "scratch too small for q");
   bfloat16 *__restrict q_tiled = reinterpret_cast<bfloat16 *>(mm_scratch);
   float *__restrict row_scratch = reinterpret_cast<float *>(mm_scratch);
@@ -876,7 +887,7 @@ extern "C" void stage_softmax(const float *__restrict ac, bfloat16 *__restrict p
 #define BD_KB 39   // p key-block rows (P=2T-1=351 = 9*39, no ragged tail at real dims)
 #endif
 
-alignas(32) static float g_bd[ATTN_TQ * ATTN_P]; // resident per-query-tile f32 score scratch (~11 KB)
+alignas(aie::vector_decl_align) static float g_bd[ATTN_TQ * ATTN_P]; // resident per-query-tile f32 score scratch (~11 KB)
 
 // COLUMN-SLICE dot: g_bd[il, j0+jj] = dot(qv[il,:], pblk[jj,:]). bf16*bf16 -> f32 accfloat (= relpos_mha.cc).
 static inline void bd_dot_block(const bfloat16 *__restrict qv, const bfloat16 *__restrict pblk, int pb, int j0) {
