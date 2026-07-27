@@ -455,7 +455,10 @@ def build(dev, mono=False, TRIVIAL=False, relpos=False, bd_onchip=False, tactive
             raise SystemExit("--mmul blocked scores needs ATTN_TQ in (8, 16) = 2*MM_R; got %d" % TQ)
         scores_blk = (Kernel("stage_scores_mmul_block", "kernels.a", [qbd_ty, kblk_ty, ac_ty])
                       if mmul else None)
-        of_vh = [ObjectFifo(v_ty, name=f"v{h}", depth=1) for h in range(H)]
+        # v is per-head DIRECT normally (8 shim MM2S). Under mmul, k takes those 8 for its per-head
+        # two-hop, so v must give them back: group-split it (2 MM2S) -> q 2 + k 8 + v 2 + ctx 2 = 14.
+        # k and v are the same size, so which one is split is arbitrary; only the stream count matters.
+        of_vh = ([] if mmul else [ObjectFifo(v_ty, name=f"v{h}", depth=1) for h in range(H)])
         of_ach = [ObjectFifo(ac_ty, name=f"ac{h}", depth=2) for h in range(H)]
         of_ph = [ObjectFifo(probs_ty, name=f"probs{h}", depth=2) for h in range(H)]
         # 8-head fit: split q AND k (v stays per-head DIRECT) + ctx JOIN = 3 MemTile ops/group. Shim math
@@ -463,7 +466,8 @@ def build(dev, mono=False, TRIVIAL=False, relpos=False, bd_onchip=False, tactive
         # ops (q+k+v split + join) DEADLOCKED at runtime; 2 (q-split+join) worked -> 3 is the target.
         GJ = 4
         groups = [list(range(g, min(g + GJ, H))) for g in range(0, H, GJ)]
-        q_subs = [None] * H; k_subs = [None] * H; ctx_subs = [None] * H
+        q_subs = [None] * H; k_subs = [None] * H; ctx_subs = [None] * H; v_subs = [None] * H
+        of_v_bigs = []
         of_q_bigs, of_k_bigs, of_ctx_bigs = [], [], []
         k_fill_srcs = []   # the fifo whose .prod() takes the shim fill (hop1 under mmul)
         for gi, hs in enumerate(groups):
@@ -479,21 +483,34 @@ def build(dev, mono=False, TRIVIAL=False, relpos=False, bd_onchip=False, tactive
                 # express it: split forwards obj_types/depths/repeat_counts but has no
                 # consumer_obj_type. Holding k whole costs 44 KB of L1 and is the only reason
                 # TQ=16 -- and therefore r=8 and the native bfp16 brick -- did not fit.
-                assert gsz == 1, "two-hop k block replay is validated at H=1 first (gsz==1)"
-                ofk_l3 = ObjectFifo(k_ty, name=f"kL3{gi}", depth=1)
-                ofk = ObjectFifo(k_ty, name=f"kbig{gi}", depth=1,
-                                 consumer_obj_type=kblk_ty, repeat_count=N_QT)
-                _ = ObjectFifoLink(ofk_l3.cons(), [ofk.prod()], AnyMemTile, [], [0])
-                ks = [ofk]
-                k_fill_srcs.append(ofk_l3)
+                # PER-HEAD two-hop. The block consumer is per-head, and split() cannot carry
+                # consumer_obj_type, so each head needs its own L3->MemTile->L1 pair. At H=1 that is
+                # 1 shim stream; at H=8 it is 8, which is what the group fill existed to avoid --
+                # so this is exactly where the shim budget gets tested.
+                ks = []
+                for h_ in hs:
+                    ofk_l3 = ObjectFifo(k_ty, name=f"kL3{h_}", depth=1)
+                    ofk_h = ObjectFifo(k_ty, name=f"kbig{h_}", depth=1,
+                                       consumer_obj_type=kblk_ty, repeat_count=N_QT)
+                    _ = ObjectFifoLink(ofk_l3.cons(), [ofk_h.prod()], AnyMemTile, [], [0])
+                    ks.append(ofk_h)
+                    k_fill_srcs.append((ofk_l3, h_))
+                ofk = ks[0]
             else:
                 ofk = ObjectFifo(np.ndarray[(gsz * T * DK,), np.dtype[bfloat16]], name=f"kbig{gi}", depth=2)
                 ks = ofk.cons().split([i * T * DK for i in range(gsz)], obj_types=[k_ty] * gsz,
                                       depths=[1] * gsz, names=[f"ks{gi}_{i}" for i in range(gsz)])
-                k_fill_srcs.append(ofk)
+                k_fill_srcs.append((ofk, hs[0]))
             ofb = ObjectFifo(np.ndarray[(gsz * TQ * DK,), np.dtype[bfloat16]], name=f"ctxbig{gi}", depth=2)
             cs = ofb.prod().join([i * TQ * DK for i in range(gsz)],
                                  obj_types=[ctx_ty] * gsz, names=[f"ctxj{gi}_{i}" for i in range(gsz)])
+            if mmul:
+                ofv = ObjectFifo(np.ndarray[(gsz * T * DK,), np.dtype[bfloat16]], name=f"vbig{gi}", depth=2)
+                vs = ofv.cons().split([i * T * DK for i in range(gsz)], obj_types=[v_ty] * gsz,
+                                      depths=[1] * gsz, names=[f"vs{gi}_{i}" for i in range(gsz)])
+                of_v_bigs.append((ofv, hs))
+                for i_, h_ in enumerate(hs):
+                    v_subs[h_] = vs[i_]
             of_q_bigs.append((ofq, hs)); of_k_bigs.append((ofk, hs)); of_ctx_bigs.append((ofb, hs))
             for i, h in enumerate(hs):
                 q_subs[h] = qs[i]; k_subs[h] = ks[i]; ctx_subs[h] = cs[i]
@@ -539,7 +556,9 @@ def build(dev, mono=False, TRIVIAL=False, relpos=False, bd_onchip=False, tactive
                           [q_subs[h].cons(), k_subs[h].cons(), of_ach[h].prod(),
                            scores_blk if mmul else scores]),
                    Worker(stage_b, [of_ach[h].cons(), of_ph[h].prod(), softmax], stack_size=0x1000),
-                   Worker(stage_c, [of_ph[h].cons(), of_vh[h].cons(), ctx_subs[h].prod(), ctx_k])]
+                   Worker(stage_c, [of_ph[h].cons(),
+                                    (v_subs[h] if mmul else of_vh[h]).cons(),
+                                    ctx_subs[h].prod(), ctx_k])]
 
         # q GROUP-MAJOR (split): per group [N_QT, gsz, QELEM]. k/v head-major, filled ONCE (acquire-once).
         KT, VT = T * DK, T * DK
@@ -549,16 +568,29 @@ def build(dev, mono=False, TRIVIAL=False, relpos=False, bd_onchip=False, tactive
         c_all_ty = np.ndarray[(N_QT * H * TQ * DK,), np.dtype[bfloat16]]
         with rt.sequence(q_all_ty, k_all_ty, v_all_ty, c_all_ty) as (Q, K, V, CTX):
             rt.start(*wl)
-            for h in range(H):   # v stays per-head direct, filled ONCE (acquire-once)
-                vh = TensorAccessPattern([H * VT], h * VT, [1, 1, T, DK], [0, 0, DK, 1])
-                rt.fill(of_vh[h].prod(), V, tap=vh)
+            if mmul:
+                voff = 0
+                for (ofv, hs_) in of_v_bigs:
+                    gszv = len(hs_)
+                    rt.fill(ofv.prod(), V, tap=TensorAccessPattern(
+                        [H * VT], voff, [1, 1, 1, gszv * T * DK], [0, 0, 0, 1]))
+                    voff += gszv * T * DK
+            else:
+                for h in range(H):   # v stays per-head direct, filled ONCE (acquire-once)
+                    vh = TensorAccessPattern([H * VT], h * VT, [1, 1, T, DK], [0, 0, DK, 1])
+                    rt.fill(of_vh[h].prod(), V, tap=vh)
             qoff = koff = 0
             for gi_, ((ofq, hs), (ofk, _)) in enumerate(zip(of_q_bigs, of_k_bigs)):
                 gsz = len(hs)
                 qtap = TensorAccessPattern([N_QT * H * QELEM], qoff, [N_QT, 1, 1, gsz * QELEM], [gsz * QELEM, 0, 0, 1])
                 ktap = TensorAccessPattern([H * KT], koff, [1, 1, 1, gsz * T * DK], [0, 0, 0, 1])  # k once, group slice
                 rt.fill(ofq.prod(), Q, tap=qtap)
-                rt.fill(k_fill_srcs[gi_].prod(), K, tap=ktap)
+                if mmul:
+                    for (f_, h_) in [x for x in k_fill_srcs if x[1] in hs]:
+                        rt.fill(f_.prod(), K,
+                                tap=TensorAccessPattern([H * KT], h_ * KT, [1, 1, T, DK], [0, 0, DK, 1]))
+                else:
+                    rt.fill(k_fill_srcs[gi_][0].prod(), K, tap=ktap)
                 qoff += N_QT * gsz * QELEM; koff += gsz * T * DK
             coff = 0   # per-group ctx drain (each group -> its own shim drain, contiguous slice of C_all)
             for ofb, hs in of_ctx_bigs:
