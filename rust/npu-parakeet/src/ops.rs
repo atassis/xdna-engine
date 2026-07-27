@@ -1,5 +1,5 @@
 //! Host ops (ndarray f32) — kept local so the reference matches the verified NumPy exactly.
-//! Phase 3 replaces the matmuls (`.dot`) with `npu_asr::ctx2` NPU dispatches.
+//! Phase 3 replaces the matmuls (`.dot`) with `npu_asr::ctx2` NPU commands.
 
 use ndarray::prelude::*;
 use rayon::prelude::*;

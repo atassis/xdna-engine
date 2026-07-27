@@ -242,8 +242,8 @@ impl FastConformerEncoder {
                 format!("\nnpu submit/wait split: submit={:.2}s wait={:.2}s", s.submit_s, s.wait_s)
             } else { String::new() };
             format!(
-                "npu breakdown: calls={} dispatches={} weight_load={:.2}s pack_a={:.2}s dispatch={:.2}s read={:.2}s accum={:.2}s\nnpu dispatch split:{}{}",
-                s.calls, s.dispatches, s.weight_load_s, s.pack_a_s, s.dispatch_s, s.read_s, s.accum_s, split, sw
+                "npu breakdown: calls={} commands={} weight_load={:.2}s pack_a={:.2}s cmd={:.2}s read={:.2}s accum={:.2}s\nnpu per-command split:{}{}",
+                s.calls, s.commands, s.weight_load_s, s.pack_a_s, s.cmd_s, s.read_s, s.accum_s, split, sw
             )
         })
     }
@@ -634,7 +634,7 @@ impl FastConformerEncoder {
         }
 
         // CONVEYOR MHA (opt-in PARAKEET_CONVEYOR_MHA=1): replace the per-head relpos_mha LOOP (8
-        // dispatches) with ONE 8-head conveyor dispatch. The host packs the query belt (qu = q+u[h];
+        // commands) with ONE 8-head conveyor dispatch. The host packs the query belt (qu = q+u[h];
         // BD_shifted = rel_shift((q+v[h]) @ p^T), carriage per PARAKEET_CONVEYOR_BD -- default plain,
         // see scripts/conveyor_bd_precision_check.py). npu.relpos_mha_conveyor returns merged ctx
         // [T, D]; the 8-head xclbin dispatch inside it is a TODO stub until the artifact is built

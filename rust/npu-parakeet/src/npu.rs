@@ -66,6 +66,15 @@ const RELPOS_TQ: usize = 8;
 const RELPOS_DK: usize = 128;   // Parakeet head_dim (kernel bakes DK=128)
 
 // 8-head relpos-MHA CONVEYOR (opt-in PARAKEET_CONVEYOR_MHA=1). Real Parakeet dims, must match the
+// TERMINOLOGY: this file counts COMMANDS, not "dispatches". Neither layer we sit on uses that
+// word -- XRT's user-facing unit is a `run` (xrt::run) and the XDNA driver's is a command
+// (amdxdna_cmd / amdxdna_cmd_chain / amdxdna_sched_job). "Dispatch" is borrowed GPU vocabulary
+// (CUDA/Vulkan: launch a grid) and it quietly imports a FIXED PER-LAUNCH cost model -- which this
+// project already measured to be wrong: the cost tracks BYTES at ~6 GB/s, not a flat per-launch
+// constant. So "dispatch-bound" asserts in its name the thing the data refuted. Say "command" for
+// the unit we count, "run" for the XRT call, and name the mechanism ("per-command cost, which
+// scales with bytes") instead of presuming it. See [[use-canonical-domain-vocabulary]].
+
 // conveyor_attn_iron.py 8-head build: TQ=8, DK=128, T padded 172->176 (a VL(16) multiple), GJ=4
 // heads per MemTile group (the validated 3-MemTile-op recipe: split q+k, v-direct, ctx-join).
 const CONV_TQ: usize = 8;
@@ -116,7 +125,7 @@ const CONV_KEY_MASK: f32 = -1.0e4;
 // so the belt carries qpv (qu||qv) only + p resident, dispatched via the 5-BO run_bd_conveyor ABI.
 // All-direct head-major layout (NOT the group-major join of the host-BD conveyor): the bd_onchip
 // generator packs H heads head-major and drains ctx head-major. Shipped as H_BD heads/xclbin,
-// ceil(n_heads/H_BD) dispatches (H=4x2 = the spec's 8-head fallback until H=8-in-1 clears the
+// ceil(n_heads/H_BD) commands (H=4x2 = the spec's 8-head fallback until H=8-in-1 clears the
 // .split() deadlock). Real dims: TQ=8 DK=128 BUILT_T=176 P=2*BUILT_T-1=351 N_QT=22.
 const CONV_BD_HEADS: usize = 4;                  // heads baked per BD-onchip xclbin dispatch (H_BD)
 const CONV_BD_P: usize = 2 * CONV_BUILT_T - 1;   // 351 = ATTN_P, the baked rel-pos table rows
@@ -254,21 +263,21 @@ struct BdIoGroup {
 #[derive(Default)]
 pub struct NpuStats {
     pub pack_a_s: f64,
-    pub dispatch_s: f64,
+    pub submit_s: f64,
     pub read_s: f64,
     pub weight_load_s: f64,
     pub accum_s: f64,
     pub calls: usize,
-    pub dispatches: usize,
+    pub commands: usize,
     /// Per-KERNEL dispatch accounting: tag -> (count, seconds). Without this the aggregate
-    /// `dispatch_s` says the fused path is slower but not WHICH dispatch is slower, and every
+    /// `cmd_s` says the fused path is slower but not WHICH command is slower, and every
     /// cost model built on the aggregate so far has been falsified.
     pub by_tag: std::collections::BTreeMap<&'static str, (usize, f64)>,
     /// `PARAKEET_SPLIT_SUBMIT=1` probe: the same blocking dispatch, split into the SUBMIT (enqueue one
     /// instruction buffer on the hardware context) and the COMPLETION WAIT. "Dispatch" bundles both,
     /// which is precisely the ambiguity that lets a cost model hide -- INSTR_VECTOR counts instruction
-    /// dispatch on the AIE core while `dispatches` counts command submissions to the device.
-    pub submit_s: f64,
+    /// dispatch on the AIE core while `commands` counts command submissions to the device.
+    pub cmd_s: f64,
     pub wait_s: f64,
 }
 
@@ -355,7 +364,7 @@ struct ResidentLn {
     acc_add: Option<AccAdd>,
     // FUSED normalize+affine+cast in ONE kernel, OPTIONAL: replaces the ctxLN -> affine_cast chain on
     // the DEVICE-IN path, deleting one dispatch (one hw-context switch) per LN site. The fused block
-    // hits 5 LN sites per block (ff1, satt, conv-front, ff2, block-exit), so this is 5 dispatches/block.
+    // hits 5 LN sites per block (ff1, satt, conv-front, ff2, block-exit), so this is 5 commands/block.
     // Device-in ONLY: the host-in `ln_affine_cast` still runs the 2-kernel chain because
     // `resident_mha_affine_ln_f32` reads the intermediate f32 `bo_ln`, which the fused kernel never
     // materializes.
@@ -376,7 +385,7 @@ struct ResidentLn {
     // brick (NOT a dwconv epilogue) -- immune to the fused-epilogue per-channel-loop miscompile.
     silu: Option<ConvSilu>,
     // FUSED dwconv->SiLU (step 3+4 in one xclbin), OPTIONAL. When present it replaces the
-    // separate dwconv + silu dispatches (one hw-context, no host bridge); absent -> the two-brick path.
+    // separate dwconv + silu commands (one hw-context, no host bridge); absent -> the two-brick path.
     dwconv_silu: Option<ConvDwSilu>,
     // TIME-MAJOR fused dwconv->SiLU (step 3b), OPTIONAL. When present the conv path prefers it: [T,D]
     // in/out DISSOLVES both host transposes (vs the channel-major dwconv_silu which keeps them).
@@ -421,7 +430,7 @@ struct AccAdd {
 }
 
 /// One-dispatch fc2 (K=DFF=4096) brick: replaces the 4x K=1024 chunk GEMMs + acc_add (which cost
-/// separate hw-context dispatches) with `cast@4096 (f32->bf16 row-major) -> K=4096 modal GEMM (internal
+/// separate hw-context commands) with `cast@4096 (f32->bf16 row-major) -> K=4096 modal GEMM (internal
 /// L1 K-accumulation over 4096) -> f32 [PAD_M,KRES] device BO`. NOT bit-identical to the 4-way split
 /// (different L1 accumulation order + bfp16), so gated by the sound rel-L2 gate, not per-op bit-parity.
 struct Fc2K4096 {
@@ -709,7 +718,7 @@ impl NpuMatmul {
         }
         let dk = CONV_DK;
         let n_qt = CONV_BUILT_T / CONV_TQ;
-        // The BD-onchip conveyor is what the DEFAULT rail dispatches (g0/g1). Under
+        // The BD-onchip conveyor is what the DEFAULT rail commands (g0/g1). Under
         // PARAKEET_CONVEYOR_MMUL its scores stage uses the vendored mmul block and k arrives
         // pre-tiled straight from the shim -- no host re-order needed on this path, unlike the
         // grouped H=8 one, because k is per-head here.
@@ -751,7 +760,7 @@ impl NpuMatmul {
             assert_eq!(k.n_heads, n_heads, "bd-io xclbin baked for H_BD={}, got {n_heads}", k.n_heads);
             return Some(k.clone());
         }
-        // THIS is what the default rail dispatches (relpos_mha_conveyor_bdonchip_dev, g0/g1).
+        // THIS is what the default rail commands (relpos_mha_conveyor_bdonchip_dev, g0/g1).
         let dir = self
             .conveyor_bd_io_dir
             .join(if conveyor_mmul() { "single_mmul" } else { "single" });
@@ -910,7 +919,7 @@ impl NpuMatmul {
             // warm. If the two tags differ by ~2.4 ms the cost is a context switch and the lever is
             // keeping the array in this context; if they are equal the cost is the pipeline itself
             // and the lever is H=8-in-1. Costs one re-run and no rebuild.
-            self.note_dispatch_tag(t0, 1, if g == 0 { "conveyor_bd_g0" } else { "conveyor_bd_g1" });
+            self.note_command_tag(t0, 1, if g == 0 { "conveyor_bd_g0" } else { "conveyor_bd_g1" });
         }
         Some(ck.bo_ctx.clone())
     }
@@ -987,7 +996,7 @@ impl NpuMatmul {
     /// [t, D] with head h in columns [h*DK..(h+1)*DK]. t <= RELPOS_BUILT_T. STEP-C: pad each head's
     /// stream to BUILT_T, PATCH every t_active word of the insts template (one per head's RTP) to t,
     /// dispatch the single resident block (3-BO ABI, all H heads concatenated), unpack bf16 CTX.
-    /// This REPLACES the old per-head loop (H sequential dispatches on 1 core) with 1 dispatch that
+    /// This REPLACES the old per-head loop (H sequential commands on 1 core) with 1 dispatch that
     /// runs the H heads in parallel -- the Phase-2 perf rework.
     pub fn relpos_mha_batched(&self, q: &Array2<f32>, k: &Array2<f32>, pm: &Array2<f32>,
                               v: &Array2<f32>, ubias: &Array2<f32>, vbias: &Array2<f32>) -> Array2<f32> {
@@ -1057,7 +1066,7 @@ impl NpuMatmul {
         rk.bo_kpv.sync_to_device().unwrap();
         rk.kern.run_dwconv6(3, &rk.bo_instr, rk.n_instr, &rk.bo_quv, &rk.bo_kpv, &rk.bo_ctx).unwrap();
         rk.bo_ctx.sync_from_device().unwrap();
-        self.note_dispatch_tag(t0, 1, "relpos_batched");
+        self.note_command_tag(t0, 1, "relpos_batched");
         let mut cb = vec![0u8; h * rk.ctx_rows * RELPOS_DK * 2];
         rk.bo_ctx.read_bytes(&mut cb).unwrap();
         // Unpack: head hh's ctx (first t of ctx_rows) -> columns [hh*DK..(hh+1)*DK] of [t, D].
@@ -1143,7 +1152,7 @@ impl NpuMatmul {
 
 
     /// 8-head relpos-MHA CONVEYOR (opt-in PARAKEET_CONVEYOR_MHA=1). Replaces the per-head
-    /// `relpos_mha` LOOP (8 dispatches) with ONE 8-head conveyor dispatch (scores(relpos) ->
+    /// `relpos_mha` LOOP (8 commands) with ONE 8-head conveyor dispatch (scores(relpos) ->
     /// softmax -> ctx, 8 heads x 3 tiles = 24 tiles, device-validated H=8 rel-L2 4.69e-3).
     ///
     /// This method owns the HOST-SIDE belt packing (the reviewable part):
@@ -1282,7 +1291,7 @@ impl NpuMatmul {
         ck.bo_v.sync_to_device().unwrap();
         ck.kern.run_mha(3, &ck.bo_instr, ck.n_instr, &ck.bo_q, &ck.bo_k, &ck.bo_v, &ck.bo_ctx).unwrap();
         ck.bo_ctx.sync_from_device().unwrap();
-        self.note_dispatch_tag(t0, 1, "mha_conveyor");
+        self.note_command_tag(t0, 1, "mha_conveyor");
         // ---- de-interleave bo_ctx -> merged ctx [t, H*DK] (run_conveyor_attn.py 88-96) ----
         // Heads group by CONV_GJ; each group drains contiguously as [N_QT, gsz, TQ, DK]. Per group,
         // element (qt,i,r,d) lives at group_base + (((qt*gsz + i)*TQ + r)*DK + d); it maps to head
@@ -1323,7 +1332,7 @@ impl NpuMatmul {
     ///   * p_h  = pm[:,h] real [2t-1,DK] table, zero-padded to the baked P=CONV_BD_P (rel_shift is a
     ///           function of key distance j-i only, so the real table + t_active base is correct).
     /// Belt = qpv (qu||qv per tile), head-major; p/k/v resident per head; 5-BO run_bd_conveyor.
-    /// Dispatched CONV_BD_HEADS heads per xclbin (ceil(n_heads/H_BD) dispatches; H=4x2 fallback).
+    /// Dispatched CONV_BD_HEADS heads per xclbin (ceil(n_heads/H_BD) commands; H=4x2 fallback).
     ///
     /// t_active: the BD-onchip scores stage has NO host belt-sentinel (BD is in-kernel), so pad keys
     /// j>=t are masked in-kernel via the t_active RTP; the BD emit ALSO uses t_active for the
@@ -1446,7 +1455,7 @@ impl NpuMatmul {
             ck.bo_v.sync_to_device().unwrap();
             ck.kern.run_bd_conveyor(3, &ck.bo_instr, ck.n_instr, &ck.bo_qpv, &ck.bo_p, &ck.bo_k, &ck.bo_v, &ck.bo_ctx).unwrap();
             ck.bo_ctx.sync_from_device().unwrap();
-            self.note_dispatch_tag(t0, 1, "conveyor_bd_host");
+            self.note_command_tag(t0, 1, "conveyor_bd_host");
             // de-interleave: head-major ctx, head slot at slot*n_qt*TQ*DK, row = qt*TQ+r (take [0,t)).
             let mut cb = vec![0u8; hb * n_qt * CONV_TQ * dk * 2];
             ck.bo_ctx.read_bytes(&mut cb).unwrap();
@@ -1483,14 +1492,14 @@ impl NpuMatmul {
     /// accounted for only ~7% of the fused encode wall while reading as if they explained it. Three
     /// cost models had already been falsified against that instrument.
     #[inline]
-    fn note_dispatch(&self, t0: std::time::Instant, n: usize) {
-        self.note_dispatch_tag(t0, n, "other")
+    fn note_command(&self, t0: std::time::Instant, n: usize) {
+        self.note_command_tag(t0, n, "other")
     }
 
-    /// As `note_dispatch`, attributing the time to a named kernel so the breakdown is per-op.
+    /// As `note_command`, attributing the time to a named kernel so the breakdown is per-op.
     /// Split-cost variant of one blocking dispatch: submit the command, then wait for completion,
     /// booking the two separately. Enabled by `PARAKEET_SPLIT_SUBMIT=1`; otherwise identical timing to
-    /// the blocking path. Returns the total so callers still book one `note_dispatch_tag`.
+    /// the blocking path. Returns the total so callers still book one `note_command_tag`.
     #[allow(clippy::too_many_arguments)]
     fn run_split(&self, kern: &Kernel, opcode: u32, instr: &Bo, count: usize,
                  a: &Bo, b: &Bo, c: &Bo, tmp: &Bo, tr: &Bo) {
@@ -1509,11 +1518,11 @@ impl NpuMatmul {
     }
 
     #[inline]
-    fn note_dispatch_tag(&self, t0: std::time::Instant, n: usize, tag: &'static str) {
+    fn note_command_tag(&self, t0: std::time::Instant, n: usize, tag: &'static str) {
         let dt = t0.elapsed().as_secs_f64();
         let mut s = self.stats.borrow_mut();
-        s.dispatch_s += dt;
-        s.dispatches += n;
+        s.cmd_s += dt;
+        s.commands += n;
         let e = s.by_tag.entry(tag).or_insert((0, 0.0));
         e.0 += n;
         e.1 += dt;
@@ -1570,9 +1579,9 @@ impl NpuMatmul {
         self.lean_override.set(Some(on));
     }
 
-    /// Should the co-resident kernels that the ACTIVE config never dispatches be skipped at load?
+    /// Should the co-resident kernels that the ACTIVE config never commands be skipped at load?
     ///
-    /// The measured dispatch split shows the fused block dispatches none of `acc_add`, `deint`,
+    /// The measured dispatch split shows the fused block commands none of `acc_add`, `deint`,
     /// `dwconv`, `silu` or `dwconv_silu` -- they are loaded as hw-contexts and never used. Loading
     /// them is not free: it is weight_load time, and it is co-residency pressure on a device where a
     /// blocking dispatch already costs ~1 ms whatever it computes
@@ -1580,7 +1589,7 @@ impl NpuMatmul {
     /// an OPEN question this flag exists to answer -- it is a measurement lever first, tidiness second.
     ///
     /// Opt-in (`PARAKEET_LEAN_LOAD=1`) and only meaningful with the fused block on; the shipped path
-    /// dispatches acc_add/deint and must keep them.
+    /// commands acc_add/deint and must keep them.
     fn lean_load(&self) -> bool {
         if let Some(f) = self.lean_override.get() {
             return f;
@@ -1690,7 +1699,7 @@ impl NpuMatmul {
         };
         // Lean-loadable now that resident_fused_available() accepts fc2_k4096 in its place. Before
         // that fix this was a never-dispatched context that the GATE still required, so dropping it
-        // silently fell the block back to host (dispatches 9384 -> 6936, read 0.24 -> 1.12s).
+        // silently fell the block back to host (commands 9384 -> 6936, read 0.24 -> 1.12s).
         let acc_add = if self.lean_load() {
             None   // superseded by fc2_k4096 inside the fused block -- see lean_load()
         } else {
@@ -1853,7 +1862,7 @@ impl NpuMatmul {
             }
         };
         // FUSED dwconv->SiLU (step 3+4, one xclbin), OPTIONAL. 3-buffer ABI in[C,T] bf16 / w[C,16] bf16 /
-        // out[C,T] f32 (== ConvDw ABI, f32 out). Present -> replaces the separate dwconv+silu dispatches.
+        // out[C,T] f32 (== ConvDw ABI, f32 out). Present -> replaces the separate dwconv+silu commands.
         let dwconv_silu = if self.lean_load() {
             None   // never dispatched by the fused block -- see lean_load()
         } else {
@@ -1978,7 +1987,7 @@ impl NpuMatmul {
         // (2) affine_cast: (bo_ln * gamma + beta) -> bo_bf16  (device-side, no host round-trip)
         let __d0 = std::time::Instant::now();
         rl.ac_kern.run_matmul8(3, &rl.ac_instr, rl.ac_n, &rl.bo_ln, &rl.bo_gb, &rl.bo_bf16, &rl.ac_tmp, &rl.ac_tr).unwrap();
-        self.note_dispatch_tag(__d0, 2, "ln_affine_cast");
+        self.note_command_tag(__d0, 2, "ln_affine_cast");
         rl
     }
 
@@ -2006,7 +2015,7 @@ impl NpuMatmul {
             if let Some(lf) = rl.lnaffcast.as_ref() {
                 let __d0 = std::time::Instant::now();
                 self.run_split(&lf.kern, 3, &lf.instr, lf.n, a_bo, &rl.bo_gb, &rl.bo_bf16, &lf.dummy_tmp, &lf.dummy_tr);
-                self.note_dispatch_tag(__d0, 1, "ln_affcast");
+                self.note_command_tag(__d0, 1, "ln_affcast");
                 return rl;
             }
         }
@@ -2015,7 +2024,7 @@ impl NpuMatmul {
         // (2) affine_cast: (bo_ln * gamma + beta) -> bo_bf16  (device-side)
         let __d0 = std::time::Instant::now();
         rl.ac_kern.run_matmul8(3, &rl.ac_instr, rl.ac_n, &rl.bo_ln, &rl.bo_gb, &rl.bo_bf16, &rl.ac_tmp, &rl.ac_tr).unwrap();
-        self.note_dispatch_tag(__d0, 2, "ln_affcast");
+        self.note_command_tag(__d0, 2, "ln_affcast");
         rl
     }
 
@@ -2077,7 +2086,7 @@ impl NpuMatmul {
             // acc_add OR fc2_k4096: the K=DFF collapse is default-on inside the fused block and
             // supersedes the 4x K=1024 + acc_add accumulate, so acc_add is never dispatched there.
             // Requiring it anyway made a never-used hw-context load-bearing for the gate -- and
-            // dropping it silently fell the whole block back to host (dispatches 9384 -> 6936).
+            // dropping it silently fell the whole block back to host (commands 9384 -> 6936).
             Some(rl) => (rl.acc_add.is_some() || rl.fc2_k4096.is_some())
                 && rl.resadd_s050.is_some()
                 && rl.resadd_s100.is_some(),
@@ -2199,7 +2208,7 @@ impl NpuMatmul {
         lf.flip.set(!lf.flip.get());
         let __d0 = std::time::Instant::now();
         self.run_split(&lf.kern, 3, &lf.instr, lf.n, a_bo, &rl.bo_gb, out, &lf.dummy_tmp, &lf.dummy_tr);
-        self.note_dispatch_tag(__d0, 1, "ln_f32");
+        self.note_command_tag(__d0, 1, "ln_f32");
         Some(out.clone())
     }
 
@@ -2259,7 +2268,7 @@ impl NpuMatmul {
         let st = self.stream(n, Act::Identity);
         let __d0 = std::time::Instant::now();
         self.kern.run_matmul8(3, &st.instr, st.n_instr, a_bo, &wbo, out, &self.bo_tmp, &self.bo_tr).unwrap();
-        self.note_dispatch_tag(__d0, 1, "proj_dev");
+        self.note_command_tag(__d0, 1, "proj_dev");
     }
 
     /// Affine-cast a device f32 [PAD_M,KRES] BO into a CALLER-CHOSEN device bf16 BO: out = a*gamma+beta,
@@ -2285,7 +2294,7 @@ impl NpuMatmul {
         rl.bo_gb.sync_to_device().unwrap();
         let __d0 = std::time::Instant::now();
         rl.ac_kern.run_matmul8(3, &rl.ac_instr, rl.ac_n, a_bo, &rl.bo_gb, out, &rl.ac_tmp, &rl.ac_tr).unwrap();
-        self.note_dispatch_tag(__d0, 1, "affcast_into");
+        self.note_command_tag(__d0, 1, "affcast_into");
         Some(())
     }
 
@@ -2314,7 +2323,7 @@ impl NpuMatmul {
         let st = self.stream(n, if silu { Act::Silu } else { Act::Identity });
         let __d0 = std::time::Instant::now();
         self.kern.run_matmul8(3, &st.instr, st.n_instr, a_bo, wbo, &st.bo_c, &self.bo_tmp, &self.bo_tr).unwrap();
-        self.note_dispatch_tag(__d0, 1, "gemm_dev_in");
+        self.note_command_tag(__d0, 1, "gemm_dev_in");
         st.bo_c.sync_from_device().unwrap();
         let mut cb = vec![0u8; m * n * 4];
         st.bo_c.read_bytes(&mut cb).unwrap();
@@ -2382,7 +2391,7 @@ impl NpuMatmul {
         // GLU: st.bo_c [PAD_M,2D] f32 (A/g3) -> glu.bo_out [PAD_M,D] f32 (B/g4), device-side.
         let __d0 = std::time::Instant::now();
         glu.kern.run_matmul8(3, &glu.instr, glu.n, &st.bo_c, &glu.bo_out, &glu.dummy_c, &glu.dummy_tmp, &glu.dummy_tr).unwrap();
-        self.note_dispatch_tag(__d0, 2, "conv_pw1_glu"); // pw1 + glu
+        self.note_command_tag(__d0, 2, "conv_pw1_glu"); // pw1 + glu
         // read the D-wide GLU output for the m real rows (row-major, first m rows contiguous).
         glu.bo_out.sync_from_device().unwrap();
         let mut cb = vec![0u8; m * KRES * 4];
@@ -2420,7 +2429,7 @@ impl NpuMatmul {
         self.kern.run_matmul8(3, &st.instr, st.n_instr, &rlc.bo_bf16, &wbo, &st.bo_c, &self.bo_tmp, &self.bo_tr).unwrap();
         let __d0 = std::time::Instant::now();
         glu.kern.run_matmul8(3, &glu.instr, glu.n, &st.bo_c, &glu.bo_out, &glu.dummy_c, &glu.dummy_tmp, &glu.dummy_tr).unwrap();
-        self.note_dispatch_tag(__d0, 2, "conv_pw1_glu_dev"); // pw1 + glu
+        self.note_command_tag(__d0, 2, "conv_pw1_glu_dev"); // pw1 + glu
         // THE CONV-MIDDLE HOST EXCURSION, first half. This is where the "full-NPU" rail stops being
         // full-NPU: the GLU result is read back and unpacked into a host ndarray so the host can run
         // dwconv+SiLU, then repacked and re-uploaded by matmul_id_to_bo. 24 round-trips per clip,
@@ -2479,7 +2488,7 @@ impl NpuMatmul {
         let st = self.stream(n, Act::Identity);
         let __d0 = std::time::Instant::now();
         self.kern.run_matmul8(3, &st.instr, st.n_instr, &self.bo_a, &wbo, &out, &self.bo_tmp, &self.bo_tr).unwrap();
-        self.note_dispatch_tag(__d0, 1, "gemm_to_bo");
+        self.note_command_tag(__d0, 1, "gemm_to_bo");
         Rc::new(out)
     }
 
@@ -2521,7 +2530,7 @@ impl NpuMatmul {
         // dispatch + read [C, DW_T] bf16 -> f32, slice to [C, t].
         let __d0 = std::time::Instant::now();
         dw.kern.run_matmul8(3, &dw.instr, dw.n, &dw.bo_in, &dw.bo_w, &dw.bo_out, &dw.dummy_tmp, &dw.dummy_tr).unwrap();
-        self.note_dispatch_tag(__d0, 1, "dwconv");
+        self.note_command_tag(__d0, 1, "dwconv");
         dw.bo_out.sync_from_device().unwrap();
         let mut ob = vec![0u8; DW_C * DW_T * 2];
         dw.bo_out.read_bytes(&mut ob).unwrap();
@@ -2561,7 +2570,7 @@ impl NpuMatmul {
         // 2-buffer ABI: in(g3) -> out(g4); tmp/ctrl/trace dummies (g5/g6/g7).
         let __d0 = std::time::Instant::now();
         s.kern.run_matmul8(3, &s.instr, s.n, &s.bo_in, &s.bo_out, &s.dummy_tmp, &s.dummy_ctrl, &s.dummy_tr).unwrap();
-        self.note_dispatch_tag(__d0, 1, "silu");
+        self.note_command_tag(__d0, 1, "silu");
         s.bo_out.sync_from_device().unwrap();
         let mut ob = vec![0u8; DW_C * DW_T * 4];
         s.bo_out.read_bytes(&mut ob).unwrap();
@@ -2576,7 +2585,7 @@ impl NpuMatmul {
     }
 
     /// FUSED on-NPU dwconv->SiLU (conv steps 3+4 in ONE xclbin). Replaces the two
-    /// separate npu_dwconv1d + npu_silu dispatches: one hw-context, the post-dwconv SiLU runs
+    /// separate npu_dwconv1d + npu_silu commands: one hw-context, the post-dwconv SiLU runs
     /// device-to-device (dwconv core -> on-chip f32 fifo -> silu core), so the on-NPU SiLU costs NO
     /// extra hw-context switch and no host round-trip (the ~1 ms/block the separate silu xclbin added).
     /// `x_ct` = [C=1024, T] channel-major f32 (T <= 400, the transposed GLU output), taps [C,9], bias
@@ -2614,7 +2623,7 @@ impl NpuMatmul {
         // 3-buffer ABI (== dwconv): in(g3), w(g4), out(g5) f32; tmp/trace dummies (g6/g7).
         let __d0 = std::time::Instant::now();
         ds.kern.run_matmul8(3, &ds.instr, ds.n, &ds.bo_in, &ds.bo_w, &ds.bo_out, &ds.dummy_tmp, &ds.dummy_tr).unwrap();
-        self.note_dispatch_tag(__d0, 1, "dwconv_silu");
+        self.note_command_tag(__d0, 1, "dwconv_silu");
         ds.bo_out.sync_from_device().unwrap();
         let mut ob = vec![0u8; DW_C * DW_T * 4];
         ds.bo_out.read_bytes(&mut ob).unwrap();
@@ -2672,7 +2681,7 @@ impl NpuMatmul {
         self.kern.run_matmul8(3, &st.instr, st.n_instr, &rlc.bo_bf16, &wbo, &st.bo_c, &self.bo_tmp, &self.bo_tr).unwrap();
         let __d0 = std::time::Instant::now();
         glu.kern.run_matmul8(3, &glu.instr, glu.n, &st.bo_c, &glu.bo_out, &glu.dummy_c, &glu.dummy_tmp, &glu.dummy_tr).unwrap();
-        self.note_dispatch_tag(__d0, 2, "resident_conv_pw1_glu_dw_dev"); // pw1 + glu
+        self.note_command_tag(__d0, 2, "resident_conv_pw1_glu_dw_dev"); // pw1 + glu
 
         // ---- GLU -> dwconv input, device-side: cast + 'same' top pad in ONE dispatch ----
         let row = DW_C * 2;
@@ -2703,7 +2712,7 @@ impl NpuMatmul {
         ds.bo_w.sync_to_device().unwrap();
         let __d0 = std::time::Instant::now();
         ds.kern.run_matmul8(3, &ds.instr, ds.n, &ds.bo_in, &ds.bo_w, &ds.bo_out, &ds.dummy_tmp, &ds.dummy_tr).unwrap();
-        self.note_dispatch_tag(__d0, 1, "resident_conv_pw1_glu_dw_dev");
+        self.note_command_tag(__d0, 1, "resident_conv_pw1_glu_dw_dev");
 
         ds.bo_out.sync_from_device().unwrap();
         let mut ob = vec![0u8; DW_T * DW_C * 4];
@@ -2755,7 +2764,7 @@ impl NpuMatmul {
         // 3-buffer ABI (== dwconv): in(g3), w(g4), out(g5) f32; tmp/trace dummies (g6/g7).
         let __d0 = std::time::Instant::now();
         ds.kern.run_matmul8(3, &ds.instr, ds.n, &ds.bo_in, &ds.bo_w, &ds.bo_out, &ds.dummy_tmp, &ds.dummy_tr).unwrap();
-        self.note_dispatch_tag(__d0, 1, "dwconv_silu_t");
+        self.note_command_tag(__d0, 1, "dwconv_silu_t");
         ds.bo_out.sync_from_device().unwrap();
         let mut ob = vec![0u8; DW_T * DW_C * 4];
         ds.bo_out.read_bytes(&mut ob).unwrap();
@@ -2778,8 +2787,8 @@ impl NpuMatmul {
     /// True when the one-dispatch K=DFF fc2 collapse is enabled (opt-in `PARAKEET_FC2_K4096`).
     /// Whether fc2 takes the one-dispatch K=DFF collapse.
     ///
-    /// DEFAULT-ON INSIDE THE FUSED BLOCK, off otherwise. Measured worth exactly -336 dispatches/clip
-    /// there (9 -> 2 dispatches per device-FFN call, x2 FFN/block since the fused block runs ff1 AND ff2
+    /// DEFAULT-ON INSIDE THE FUSED BLOCK, off otherwise. Measured worth exactly -336 commands/clip
+    /// there (9 -> 2 commands per device-FFN call, x2 FFN/block since the fused block runs ff1 AND ff2
     /// on device, x24 blocks) and it is already covered by the rel-L2 gate. It is NOT flipped on for the
     /// shipped default path: that is a shipped-default flip, which is an owner gate.
     /// `PARAKEET_FC2_K4096=0`/`=1` overrides either way; the in-process override wins over both.
@@ -2795,7 +2804,7 @@ impl NpuMatmul {
 
     /// Shared one-dispatch K=DFF fc2: cast the fc1 output (`fc1_out` f32 [PAD_M,DFF]) to bf16 row-major,
     /// then ONE K=DFF modal GEMM (internal L1 K-accum over DFF) with the full fc2 weight -> f32
-    /// [PAD_M,KRES] device BO. Counts 2 dispatches (cast + modal); the caller counts fc1. Full fc2
+    /// [PAD_M,KRES] device BO. Counts 2 commands (cast + modal); the caller counts fc1. Full fc2
     /// weight cached under "{id2}.full". Collapses the deint + 4x K=1024 GEMM + 4x acc_add.
     fn fc2_k4096_dev<F2: FnOnce() -> Array2<f32>>(&self, k4: &Fc2K4096, fc1_out: &Bo, make_w2: F2, id2: &str) -> Rc<Bo> {
         k4.cast_kern.run_matmul8(3, &k4.cast_instr, k4.cast_n, fc1_out, &k4.cast_out, &k4.cast_dc, &k4.cast_dt, &k4.cast_dr).unwrap();
@@ -2810,7 +2819,7 @@ impl NpuMatmul {
         };
         let __d0 = std::time::Instant::now();
         k4.mm_kern.run_matmul8(3, &k4.mm_instr, k4.mm_n, &k4.cast_out, &w2f, &k4.mm_c, &self.bo_tmp, &self.bo_tr).unwrap();
-        self.note_dispatch_tag(__d0, 2, "fc2_k4096"); // cast + K=DFF modal
+        self.note_command_tag(__d0, 2, "fc2_k4096"); // cast + K=DFF modal
         k4.mm_c.clone()
     }
 
@@ -2833,7 +2842,7 @@ impl NpuMatmul {
         let st1 = self.stream(DFF, Act::Silu); // fc1 on-chip SiLU iff modal (plain resident ignores it)
         let __d0 = std::time::Instant::now();
         self.kern.run_matmul8(3, &st1.instr, st1.n_instr, &rl.bo_bf16, &w1, &st1.bo_c, &self.bo_tmp, &self.bo_tr).unwrap();
-        self.note_dispatch_tag(__d0, 1, "fc1_n4096");
+        self.note_command_tag(__d0, 1, "fc1_n4096");
         // ONE-DISPATCH K=DFF fc2 (opt-in): cast@DFF -> K=DFF modal -> readback to host [m,KRES].
         if self.fc2_k4096_on() {
             if let Some(k4) = rl.fc2_k4096.as_ref() {
@@ -2857,7 +2866,7 @@ impl NpuMatmul {
         // modal (it works standalone) -- a multi-context n-D-DMA toolchain issue; see the debug note.
         let __d0 = std::time::Instant::now();
         rl.deint_kern.run_matmul8(3, &rl.deint_instr, rl.deint_n, &st1.bo_c, &rl.bo_deint, &rl.deint_c, &rl.deint_tmp, &rl.deint_tr).unwrap();
-        self.note_dispatch_tag(__d0, 2, "ffn"); // fc1 + deint
+        self.note_command_tag(__d0, 2, "ffn"); // fc1 + deint
         // fc2 K-split: each K=KRES chunk is a device SUB-BUFFER of bo_deint; K=KRES modal (identity),
         // host-accumulate the `parts` partials in f32 -- bit-identical to the host K-split (WER-neutral).
         let parts = DFF / KRES;
@@ -2910,10 +2919,10 @@ impl NpuMatmul {
         let st1 = self.stream(DFF, Act::Silu); // fc1 on-chip SiLU iff modal (plain resident ignores it)
         let __d0 = std::time::Instant::now();
         self.kern.run_matmul8(3, &st1.instr, st1.n_instr, &rl.bo_bf16, &w1, &st1.bo_c, &self.bo_tmp, &self.bo_tr).unwrap();
-        self.note_dispatch_tag(__d0, 1, "fc1_n4096");
+        self.note_command_tag(__d0, 1, "fc1_n4096");
         let __d0 = std::time::Instant::now();
         rl.deint_kern.run_matmul8(3, &rl.deint_instr, rl.deint_n, &st1.bo_c, &rl.bo_deint, &rl.deint_c, &rl.deint_tmp, &rl.deint_tr).unwrap();
-        self.note_dispatch_tag(__d0, 2, "resident_ffn_bf16"); // fc1 + deint
+        self.note_command_tag(__d0, 2, "resident_ffn_bf16"); // fc1 + deint
         let parts = DFF / KRES;
         let chunk_bytes = PAD_M * KRES * 2;
         let mut acc = Array2::<f32>::zeros((m, KRES));
@@ -2960,10 +2969,10 @@ impl NpuMatmul {
         let st1 = self.stream(DFF, Act::Silu); // fc1 on-chip SiLU iff modal (plain resident ignores it)
         let __d0 = std::time::Instant::now();
         self.kern.run_matmul8(3, &st1.instr, st1.n_instr, a_bf16, &w1, &st1.bo_c, &self.bo_tmp, &self.bo_tr).unwrap();
-        self.note_dispatch_tag(__d0, 1, "fc1_n4096");
+        self.note_command_tag(__d0, 1, "fc1_n4096");
         // ONE-DISPATCH fc2 (K=DFF): cast fc1's f32 [PAD_M,DFF] -> bf16 row-major, then a SINGLE K=DFF
         // modal GEMM that accumulates all DFF K internally in L1 -> f32 [PAD_M,KRES] device. Collapses
-        // deint + 4x K=1024 GEMM + 4x acc_add (8 dispatches) into cast + 1 modal (2). NOT bit-identical
+        // deint + 4x K=1024 GEMM + 4x acc_add (8 commands) into cast + 1 modal (2). NOT bit-identical
         // to the 4-way split (different L1 accum + bfp16) -> validated by the sound rel-L2 gate.
         if self.fc2_k4096_on() {
             if let Some(k4) = rl.fc2_k4096.as_ref() {
@@ -2973,7 +2982,7 @@ impl NpuMatmul {
         // deinterleave+cast: st1.bo_c (f32 [PAD_M,DFF]) -> rl.bo_deint (bf16 chunk-major), device-side.
         let __d0 = std::time::Instant::now();
         rl.deint_kern.run_matmul8(3, &rl.deint_instr, rl.deint_n, &st1.bo_c, &rl.bo_deint, &rl.deint_c, &rl.deint_tmp, &rl.deint_tr).unwrap();
-        self.note_dispatch_tag(__d0, 2, "ffn_devacc"); // fc1 + deint
+        self.note_command_tag(__d0, 2, "ffn_devacc"); // fc1 + deint
         let aa = acc_add_opt.expect("ffn_dev_accum 4-split without acc_add");
         // fc2 K-split with ON-DEVICE accumulate: each partial modal GEMM -> st.bo_c (device); acc_add
         // sums it into the acc0/acc1 ping-pong (seed acc=0 for partial0). Result stays device-resident.
@@ -3006,7 +3015,7 @@ impl NpuMatmul {
             let a_in: &Bo = if c == 0 { &aa.zero } else { &cur };
             let __d0 = std::time::Instant::now();
             aa.kern.run_matmul8(3, &aa.instr, aa.n, a_in, &st.bo_c, &nxt, &aa.dummy_tmp, &aa.dummy_tr).unwrap();
-            self.note_dispatch_tag(__d0, 2, "ffn_devacc"); // partial GEMM + acc_add
+            self.note_command_tag(__d0, 2, "ffn_devacc"); // partial GEMM + acc_add
             std::mem::swap(&mut cur, &mut nxt);
         }
         cur // device BO [PAD_M, KRES] f32 holding sum of all `parts` partials
@@ -3074,7 +3083,7 @@ impl NpuMatmul {
     ///   4. the K_aug=800 bias-fold packing of `b1` (one k=32 block appended to W1) + the N=768 fc2
     ///      tile n=96 (768 = 96*8, satisfies the epilogue `(m*n)%16==0`) -- shapes the device session
     ///      validates on rel-L2 vs host truth.
-    /// With those in place the schedule above dispatches here; until then the capability gate short-
+    /// With those in place the schedule above commands here; until then the capability gate short-
     /// circuits to None (host FFN) and the `resident_kres()==768` arm is `unimplemented!` so a future
     /// K=768 build cannot SILENTLY fall through to host (which would look like the rail ran but didn't).
     pub fn resident_ffn_nonorm<F1, F2>(
@@ -3243,7 +3252,7 @@ impl NpuMatmul {
         let (sum, out) = if f { (&rn.bo_sum1, &rn.bo_out1) } else { (&rn.bo_sum, &rn.bo_out) };
         let __d0 = std::time::Instant::now();
         rn.kern.run_matmul8(3, &rn.instr, rn.n, a_bo, b_bo, &rl.bo_gb, sum, out).unwrap();
-        self.note_dispatch_tag(__d0, 1, "resadd_ln");
+        self.note_command_tag(__d0, 1, "resadd_ln");
         Some((sum.clone(), out.clone()))
     }
 
@@ -3316,7 +3325,7 @@ impl NpuMatmul {
         ra.flip.set(!ra.flip.get());
         let __d0 = std::time::Instant::now();
         self.run_split(&ra.kern, 3, &ra.instr, ra.n, a_bo, b_bo, out, &ra.dummy_tmp, &ra.dummy_tr);
-        self.note_dispatch_tag(__d0, 1, "resadd");
+        self.note_command_tag(__d0, 1, "resadd");
         Some(out.clone())
     }
 
@@ -3477,7 +3486,7 @@ impl NpuMatmul {
                 .run_matmul8(3, &st.instr, st.n_instr, &self.bo_a, wbo, &st.bo_c, &self.bo_tmp, &self.bo_tr)
                 .unwrap();
         }
-        self.note_dispatch_tag(t1, 1, "matmul_host_io");
+        self.note_command_tag(t1, 1, "matmul_host_io");
 
         // (c) output marshaling: download C + read rows back into an f32 ndarray (no math).
         let t2 = Instant::now();
@@ -3502,7 +3511,7 @@ impl NpuMatmul {
         out
     }
 
-    /// C[m,n] = A[m,k] @ B[k,n] on the NPU; `id` keys the weight-BO cache. K=1024 dispatches
+    /// C[m,n] = A[m,k] @ B[k,n] on the NPU; `id` keys the weight-BO cache. K=1024 commands
     /// directly on the resident kernel; K=4096 is K-split into 4× K=1024 partials (host-accumulated).
     pub fn matmul_id(&self, a: &Array2<f32>, b: &Array2<f32>, id: &str) -> Array2<f32> {
         let (m, k) = a.dim();
@@ -3591,7 +3600,7 @@ impl NpuMatmul {
 
     /// Like [`matmul_id_lazy`] but applies the FFN SiLU activation as the on-chip GEMM epilogue
     /// (A1 / `ff_act` on-chip). Only the single-dispatch K=KRES path is supported (fc1 / ff.l1 is
-    /// always K=1024, N=4096). On the MODAL resident this dispatches the `modalsilu` stream so
+    /// always K=1024, N=4096). On the MODAL resident this commands the `modalsilu` stream so
     /// `out = silu(A @ B)` comes back already activated -- the host must NOT re-apply silu. On the
     /// plain resident (`modal=false`) the epilogue is a no-op (`silu` flag ignored by `stream`), so
     /// the caller falls back to host silu; use [`Self::modal`] to branch.
@@ -3648,7 +3657,7 @@ impl NpuMatmul {
             out
         };
         // NOTE: no per-submit counter here -- the whole pipelined span is booked ONCE at the end via
-        // note_dispatch_tag(.., parts, "ksplit"), because these dispatches OVERLAP (start/wait pairs
+        // note_command_tag(.., parts, "ksplit"), because these commands OVERLAP (start/wait pairs
         // with pack/read interleaved). Counting each submit here and the span there would double-count.
         let submit = |slot: &PipeSlot, wbo: &Bo| {
             let _d = crate::prof::phase::PhaseScope::new(stage, crate::prof::phase::Bucket::Npu);
@@ -3682,10 +3691,10 @@ impl NpuMatmul {
             prev_run.wait().unwrap();
         }
         acc += &read_part(&self.slots[prev_slot]);
-        // One span covering `parts` OVERLAPPED dispatches, so its ms/cmd is a pipelined average and
+        // One span covering `parts` OVERLAPPED commands, so its ms/cmd is a pipelined average and
         // is NOT comparable to a blocking brick's ms/cmd. Tagged anyway: an untagged bucket is how
         // fc1 stayed invisible.
-        self.note_dispatch_tag(t0, parts, "ksplit_pipelined");
+        self.note_command_tag(t0, parts, "ksplit_pipelined");
         acc
     }
 }
