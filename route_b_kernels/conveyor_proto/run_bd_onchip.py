@@ -33,11 +33,36 @@ def gen_head(seed):
     return qpv, p.reshape(-1), k.reshape(-1), v.reshape(-1), ctx
 
 heads = [gen_head(h) for h in range(H)]
-qpv_all = np.concatenate([h[0] for h in heads]).astype(bfloat16).view(np.uint16)
 p_all = np.concatenate([h[1] for h in heads]).astype(bfloat16).view(np.uint16)
-k_all = np.concatenate([h[2] for h in heads]).astype(bfloat16).view(np.uint16)
-v_all = np.concatenate([h[3] for h in heads]).astype(bfloat16).view(np.uint16)
 ctx_ref = np.concatenate([h[4] for h in heads], axis=0)   # [H*NQ, DK]
+
+# SIO=1 gates the --stream-io build: q/k/v are read straight out of row-major [PAD_M, SD] bf16
+# GEMM outputs (head h in columns h*DK) instead of host-packed head-major belts, and ctx drains
+# into one. Same numbers, same reference -- only the host LAYOUT changes, so any rel-L2 delta vs
+# the host-packed build is a tap bug, not arithmetic. qu/qv are two [PAD_M, SD] planes of one
+# buffer (the 4-D tap walks tile, plane, row, col to rebuild the interleaved belt object).
+SIO = int(os.environ.get("SIO", 0))
+SD = int(os.environ.get("ATTN_SD", 1024)); PAD_M = int(os.environ.get("ATTN_PAD_M", 512))
+if SIO:
+    assert H * DK <= SD and PAD_M >= NQ and PAD_M >= T, f"SIO geometry: H*DK={H*DK}>SD={SD}?"
+    qu_pl = np.zeros((PAD_M, SD), np.float32); qv_pl = np.zeros((PAD_M, SD), np.float32)
+    k_pl = np.zeros((PAD_M, SD), np.float32); v_pl = np.zeros((PAD_M, SD), np.float32)
+    for h in range(H):
+        qpv_h = heads[h][0].reshape(N_QT, 2, TQ, DK)
+        c = slice(h * DK, (h + 1) * DK)
+        qu_pl[:NQ, c] = qpv_h[:, 0].reshape(NQ, DK)
+        qv_pl[:NQ, c] = qpv_h[:, 1].reshape(NQ, DK)
+        k_pl[:T, c] = heads[h][2].reshape(T, DK)
+        v_pl[:T, c] = heads[h][3].reshape(T, DK)
+    qpv_all = np.concatenate([qu_pl.reshape(-1), qv_pl.reshape(-1)]).astype(bfloat16).view(np.uint16)
+    k_all = k_pl.reshape(-1).astype(bfloat16).view(np.uint16)
+    v_all = v_pl.reshape(-1).astype(bfloat16).view(np.uint16)
+    CTX_ELEMS = PAD_M * SD
+else:
+    qpv_all = np.concatenate([h[0] for h in heads]).astype(bfloat16).view(np.uint16)
+    k_all = np.concatenate([h[2] for h in heads]).astype(bfloat16).view(np.uint16)
+    v_all = np.concatenate([h[3] for h in heads]).astype(bfloat16).view(np.uint16)
+    CTX_ELEMS = H * NQ * DK
 
 instr = np.fromfile(f"{EX}/insts.bin", dtype=np.uint32)
 xclbin = pyxrt.xclbin(f"{EX}/final.xclbin")
@@ -52,7 +77,7 @@ bo_qpv = pyxrt.bo(d, qpv_all.nbytes, pyxrt.bo.host_only, kern.group_id(3))
 bo_p = pyxrt.bo(d, p_all.nbytes, pyxrt.bo.host_only, kern.group_id(4))
 bo_k = pyxrt.bo(d, k_all.nbytes, pyxrt.bo.host_only, kern.group_id(5))
 bo_v = pyxrt.bo(d, v_all.nbytes, pyxrt.bo.host_only, kern.group_id(6))
-bo_c = pyxrt.bo(d, H * NQ * DK * 2, pyxrt.bo.host_only, kern.group_id(7))
+bo_c = pyxrt.bo(d, CTX_ELEMS * 2, pyxrt.bo.host_only, kern.group_id(7))
 for bo, arr in ((bo_instr, instr), (bo_qpv, qpv_all), (bo_p, p_all), (bo_k, k_all), (bo_v, v_all)):
     bo.write(arr.tobytes(), 0); bo.sync(TO)
 
@@ -65,7 +90,13 @@ for _ in range(200):
     r = kern(3, bo_instr, instr.size, bo_qpv, bo_p, bo_k, bo_v, bo_c); r.wait()
 _dt = (time.perf_counter() - _t0) / 200 * 1e3
 print(f"[bd_onchip] {N_QT} tiles/dispatch, H={H} -> {_dt:.4f} ms/dispatch")
-ctx_dev = np.frombuffer(bo_c.read(H * NQ * DK * 2, 0), dtype=np.uint16).view(bfloat16).astype(np.float32).reshape(H * NQ, DK)
+_raw = np.frombuffer(bo_c.read(CTX_ELEMS * 2, 0), dtype=np.uint16).view(bfloat16).astype(np.float32)
+if SIO:
+    # ctx landed row-major [PAD_M, SD]; gather head h's columns back into the [H*NQ, DK] ref order.
+    _pl = _raw.reshape(PAD_M, SD)
+    ctx_dev = np.concatenate([_pl[:NQ, h * DK:(h + 1) * DK] for h in range(H)], axis=0)
+else:
+    ctx_dev = _raw.reshape(H * NQ, DK)
 
 rel = np.linalg.norm(ctx_dev - ctx_ref) / (np.linalg.norm(ctx_ref) + 1e-12)
 ph = [np.linalg.norm(ctx_dev[h*NQ:(h+1)*NQ] - ctx_ref[h*NQ:(h+1)*NQ]) /
