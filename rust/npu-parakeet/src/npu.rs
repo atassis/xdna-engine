@@ -1581,7 +1581,18 @@ impl NpuMatmul {
                 let (kern, instr, n) = load_path(xcl, ins);
                 let gw = |i| kern.group_id(i).unwrap();
                 Some(ConvDwSiluT {
-                    bo_in: self.dev.alloc_bo(&kern, DW_TPAD * DW_C * 2, FLAG_HOST_ONLY, gw(3)).unwrap(),
+                // bo_in is OVER-allocated to DW_P+PAD_M rows (not DW_TPAD=408) so the device-in seam
+                // can affine-cast the GLU output -- which is a fixed PAD_M=512 rows -- straight in at
+                // row offset DW_P, giving the 'same' top pad for free. The kernel still reads only
+                // DW_TPAD rows, so the tail is never looked at. Zeroed once below: the top DW_P pad
+                // rows are never written by the cast and must stay zero.
+                bo_in: {
+                    let rows = (DW_P + PAD_M).max(DW_TPAD);
+                    let b = self.dev.alloc_bo(&kern, rows * DW_C * 2, FLAG_HOST_ONLY, gw(3)).unwrap();
+                    b.write_bytes(&vec![0u8; rows * DW_C * 2]).unwrap();
+                    b.sync_to_device().unwrap();
+                    b
+                },
                     bo_w: self.dev.alloc_bo(&kern, (DW_K + 1) * DW_C * 2, FLAG_HOST_ONLY, gw(4)).unwrap(),
                     bo_out: self.dev.alloc_bo(&kern, DW_T * DW_C * 4, FLAG_HOST_ONLY, gw(5)).unwrap(),
                     dummy_tmp: self.dev.alloc_bo(&kern, 8, FLAG_HOST_ONLY, gw(6)).unwrap(),
@@ -2174,6 +2185,86 @@ impl NpuMatmul {
     /// hang. Precision recipe IDENTICAL to the channel-major fused brick (bf16 in, f32 on-chip mid to
     /// silu, bf16-tanh silu). `taps` [D,9], `bias` [D]. None if the time-major xclbin is absent or
     /// t > DW_T (caller falls back to the channel-major path, then host).
+    /// CONV-MIDDLE device-in seam: norm_conv LN -> pw1 -> GLU -> dwconv+SiLU, all device-side.
+    ///
+    /// The host path runs LN/pw1/GLU on device, reads GLU [t,D] back, then re-uploads it (padded and
+    /// bf16-packed) as the dwconv input -- a full readback plus a full upload per block, for data that
+    /// never left the device. Here the GLU output feeds the dwconv directly:
+    ///   glu.bo_out (f32 [PAD_M,D])  --affine_cast(gamma=1,beta=0)-->  dw.bo_in rows [DW_P, DW_P+PAD_M)
+    /// The cast IS the f32->bf16 pack, and writing it at a sub-buffer offset of DW_P rows IS the
+    /// 'same' top pad -- so the pad/pack/upload all collapse into the one cast dispatch that the dtype
+    /// change required anyway. Rows past t are zero out of GLU, which is exactly the 'same' end pad.
+    ///
+    /// Returns dwconv+SiLU as host [t, D] (pw2 onward is still host; that is the next frontier step).
+    /// `None` when any of the LN/GLU/dwconv-silu-t bricks are absent, or t > DW_T.
+    pub fn resident_conv_pw1_glu_dw_dev<F: FnOnce() -> Array2<f32>>(
+        &self, a_bo: &Bo, m: usize, gamma: &[f32], beta: &[f32], make_w1: F, id: &str,
+        taps: &Array2<f32>, bias: &Array1<f32>,
+    ) -> Option<Array2<f32>> {
+        let rl = self.resident_ln()?;
+        let glu = rl.glu.as_ref()?;
+        let ds = rl.dwconv_silu_t.as_ref()?;
+        if m > DW_T { return None; }
+        assert_eq!(DW_C, KRES, "conv device-in seam assumes DW_C == KRES");
+        self.stats.borrow_mut().calls += 1;
+
+        // ---- LN -> pw1 -> GLU (device); mirrors resident_conv_pw1_glu_dev but keeps the output ----
+        let rlc = self.ln_affine_cast_dev(a_bo, gamma, beta);
+        let cached = self.wcache.borrow().get(id).cloned();
+        let wbo = if let Some(bo) = cached {
+            bo
+        } else {
+            let w = make_w1();
+            self.weight_bo(id, w.view())
+        };
+        let st = self.stream(2 * KRES, Act::Identity);
+        self.kern.run_matmul8(3, &st.instr, st.n_instr, &rlc.bo_bf16, &wbo, &st.bo_c, &self.bo_tmp, &self.bo_tr).unwrap();
+        glu.kern.run_matmul8(3, &glu.instr, glu.n, &st.bo_c, &glu.bo_out, &glu.dummy_c, &glu.dummy_tmp, &glu.dummy_tr).unwrap();
+        self.stats.borrow_mut().dispatches += 2; // pw1 + glu
+
+        // ---- GLU -> dwconv input, device-side: cast + 'same' top pad in ONE dispatch ----
+        let row = DW_C * 2;
+        self.affine_cast_into(&glu.bo_out, &ds.bo_in.sub(DW_P * row, PAD_M * row).unwrap(), None)?;
+        // RE-ZERO the 'same' END PAD. The host path builds the dwconv input from a [t,D] host array,
+        // so everything past row t is genuinely zero. Here the stream is PAD_M rows wide and the
+        // block-entry LN normalizes ALL of them -- rows past t have mean 0 / var 0, so LN maps them to
+        // ~1/sqrt(eps), a LARGE value, which pw1/GLU carry through. Left alone, the 9-tap dwconv window
+        // pulls that garbage into the last real output rows (measured: encoder rel-L2 0.379 vs 0.086).
+        // Output row m-1 reads input rows up to DW_P+m-1+(DW_K-1), so zeroing DW_K rows past the last
+        // real row is exactly enough. Same failure class as the padding rows that broke block-to-block
+        // residency -- on this stream, "unused" rows are never harmlessly zero.
+        let zpad = vec![0u8; DW_K * row];
+        ds.bo_in.write_bytes_at(&zpad, (DW_P + m) * row).ok()?;
+        ds.bo_in.sync_to_device().unwrap();
+
+        // ---- weights (tap-major [K+1, D], row K = BN-folded bias), then dwconv+SiLU ----
+        let taps_std = taps.as_standard_layout();
+        let tp = taps_std.as_slice().unwrap();
+        let mut w_f = vec![0f32; (DW_K + 1) * DW_C];
+        for ch in 0..DW_C {
+            for p in 0..DW_K { w_f[p * DW_C + ch] = tp[ch * DW_K + p]; }
+            w_f[DW_K * DW_C + ch] = bias[ch];
+        }
+        let mut w_bits = vec![0u16; (DW_K + 1) * DW_C];
+        npu_xrt::pack_f32_to_bf16(&w_f, &mut w_bits);
+        ds.bo_w.write_bytes(u16_bytes(&w_bits)).unwrap();
+        ds.bo_w.sync_to_device().unwrap();
+        ds.kern.run_matmul8(3, &ds.instr, ds.n, &ds.bo_in, &ds.bo_w, &ds.bo_out, &ds.dummy_tmp, &ds.dummy_tr).unwrap();
+        self.stats.borrow_mut().dispatches += 1;
+
+        ds.bo_out.sync_from_device().unwrap();
+        let mut ob = vec![0u8; DW_T * DW_C * 4];
+        ds.bo_out.read_bytes(&mut ob).unwrap();
+        let mut out = Array2::<f32>::zeros((m, DW_C));
+        for r in 0..m {
+            for ch in 0..DW_C {
+                let off = (r * DW_C + ch) * 4;
+                out[[r, ch]] = f32::from_le_bytes([ob[off], ob[off + 1], ob[off + 2], ob[off + 3]]);
+            }
+        }
+        Some(out)
+    }
+
     pub fn npu_dwconv_silu_tmajor(&self, x_td: &Array2<f32>, taps: &Array2<f32>, bias: &Array1<f32>) -> Option<Array2<f32>> {
         let rl = self.resident_ln()?;
         let ds = rl.dwconv_silu_t.as_ref()?;

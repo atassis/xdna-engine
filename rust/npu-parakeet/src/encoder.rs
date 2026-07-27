@@ -698,6 +698,18 @@ impl FastConformerEncoder {
     /// `precomputed_glu`: Some when the caller (the fused seam) already ran the conv front DEVICE-IN
     /// (LN->pw1->GLU from a device BO) -- then the resident/host front here is skipped and the rest of
     /// the module (dwconv->silu->pw2) continues from it. None = the normal self-contained conv module.
+    /// The conv module's pw2 tail, split out so a caller that already has the dwconv+SiLU output
+    /// (the device-in conv seam) can finish the module without re-entering the LN/pw1/GLU/dwconv
+    /// chain. Byte-identical to `conv_module`'s own tail.
+    fn conv_pw2(&self, back: &Array2<f32>, blk: usize) -> Array2<f32> {
+        let b = self.w.block(blk);
+        prof::phase::set_stage("conv_pw");
+        self.mm_lazy(back, || {
+            let _wp = PhaseScope::new("conv_wprep", Bucket::Marshal);
+            b.m3("conv.pointwise_conv2.weight").index_axis(Axis(2), 0).to_owned().t().to_owned()
+        }, &format!("{blk}.pw2"))
+    }
+
     fn conv_module(&self, x: &Array2<f32>, blk: usize, precomputed_glu: Option<Array2<f32>>) -> Array2<f32> {
         let b = self.w.block(blk);
         let d = self.cfg.hidden;
@@ -893,11 +905,29 @@ impl FastConformerEncoder {
                     // round-trip between MHSA and conv); returns the host GLU output for the conv rest.
                     let conv_g = b.v("norm_conv.weight");
                     let conv_b = b.v("norm_conv.bias");
-                    let glu = npu.resident_conv_pw1_glu_dev(&conv_in_bo, m, conv_g.as_slice().unwrap(), conv_b.as_slice().unwrap(),
-                        || b.m3("conv.pointwise_conv1.weight").index_axis(Axis(2), 0).to_owned().t().to_owned(), &format!("{blk}.pw1"));
+                    // CONV-MIDDLE device-in (opt-in PARAKEET_CONV_DEV_IO=1): carry the frontier past GLU
+                    // to the dwconv+SiLU output, so the GLU readback AND the dwconv re-upload both
+                    // dissolve (the cast that the bf16 dtype change needs anyway also does the 'same'
+                    // top pad). pw2 onward stays host. Unset / bricks absent -> the GLU hand-off below.
+                    let dw_dev = if std::env::var("PARAKEET_CONV_DEV_IO").is_ok() {
+                        let dw3 = b.m3("conv.depthwise_conv.weight");
+                        let taps = dw3.index_axis(Axis(1), 0).to_owned();
+                        let dwb = b.v("conv.depthwise_conv.bias");
+                        npu.resident_conv_pw1_glu_dw_dev(&conv_in_bo, m, conv_g.as_slice().unwrap(), conv_b.as_slice().unwrap(),
+                            || b.m3("conv.pointwise_conv1.weight").index_axis(Axis(2), 0).to_owned().t().to_owned(),
+                            &format!("{blk}.pw1"), &taps, &dwb)
+                    } else { None };
+                    let glu = if dw_dev.is_some() { None } else {
+                        npu.resident_conv_pw1_glu_dev(&conv_in_bo, m, conv_g.as_slice().unwrap(), conv_b.as_slice().unwrap(),
+                            || b.m3("conv.pointwise_conv1.weight").index_axis(Axis(2), 0).to_owned().t().to_owned(), &format!("{blk}.pw1"))
+                    };
                     // rejoin host: x = (x + 0.5*ff1) + mhsa_out (the conv residual base), then conv rest / FFN2 / out.
                     let mut x = npu.readback_stream(&conv_in_bo, m);
-                    let conv_out = prof::time("conv_mod", || self.conv_module(&x, blk, glu));
+                    let conv_out = match dw_dev {
+                        // dwconv+SiLU already done on device -> only the pw2 chain remains.
+                        Some(back) => prof::time("conv_mod", || self.conv_pw2(&back, blk)),
+                        None => prof::time("conv_mod", || self.conv_module(&x, blk, glu)),
+                    };
                     x = &x + &conv_out;
                     let ff2 = prof::time("ff", || self.feed_forward(&x, b, blk, "ff2", "norm_feed_forward2.weight", "norm_feed_forward2.bias",
                                                 "feed_forward2.linear1.weight", "feed_forward2.linear2.weight"));

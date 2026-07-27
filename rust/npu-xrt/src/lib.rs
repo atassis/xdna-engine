@@ -782,6 +782,18 @@ impl Bo {
         }
     }
 
+    /// [`Self::write_bytes`] at a byte offset into the BO (the C shim always took an offset; this
+    /// just exposes it). Lets a caller patch a sub-range -- e.g. re-zeroing a pad region -- without
+    /// rewriting the whole buffer or minting a sub-buffer.
+    pub fn write_bytes_at(&self, bytes: &[u8], offset: usize) -> Result<()> {
+        let r = unsafe { shim_bo_write(self.ptr, bytes.as_ptr() as *const c_void, bytes.len(), offset) };
+        if r != 0 {
+            Err(format!("bo_write(offset={offset}): {}", last_error()))
+        } else {
+            Ok(())
+        }
+    }
+
     pub fn read_bytes(&self, out: &mut [u8]) -> Result<()> {
         let r = unsafe { shim_bo_read(self.ptr, out.as_mut_ptr() as *mut c_void, out.len(), 0) };
         if r != 0 {
