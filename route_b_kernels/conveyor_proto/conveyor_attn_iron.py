@@ -38,6 +38,7 @@ P = 2 * T - 1  # relative-position length (NeMo/Parakeet rel-pos)
 
 
 def build(dev, mono=False, TRIVIAL=False, relpos=False, bd_onchip=False, tactive_mask=False,
+          trace_size=0,
           p_resident=False, stream_io=False):
     if stream_io and not bd_onchip:
         raise SystemExit("--stream-io is a bd_onchip-path option (device-in/out taps on the 4-stage column)")
@@ -370,6 +371,23 @@ def build(dev, mono=False, TRIVIAL=False, relpos=False, bd_onchip=False, tactive
                 rt.fill(of_k[h].prod(), K, tap=kvtap)
                 rt.fill(of_v[h].prod(), V, tap=kvtap)
                 rt.drain(of_ctxh[h].cons(), CTX, tap=ctap, wait=True)
+            # Per-stage occupancy instrument. `trace_size=0` (production) leaves the design
+            # byte-identical; non-zero appends a dedicated trace buffer at the TAIL of the
+            # runtime_sequence so QPV/PP/K/V/CTX keep their group ids and the Rust ABI is untouched.
+            #
+            # Traces head 0's FOUR stages (bd -> scores -> softmax -> ctx), which is the whole point:
+            # conveyor_bd_dev is the encoder's most expensive op at 3.93 ms/command and we have never
+            # measured WHICH of its four pipeline stages rate-limits it. A pipeline runs at its slowest
+            # stage; the MAC-count argument says BD (8*351*128) is ~2x the scores stage (8*176*128) but
+            # that is arithmetic, not a measurement.
+            #
+            # Build this at ATTN_HEADS=1: trace egress needs a free shim channel and the production H=4
+            # build spends 4 in-streams per head, so the traced variant must shrink (the recipe in
+            # method-profile-a-brick-with-enable-trace, gotcha 1). Every head runs the identical
+            # 4-stage pipeline, so H=1 is representative of the STAGE BALANCE -- it is NOT
+            # representative of production wall time, where 4 heads share the shim.
+            if trace_size:
+                rt.enable_trace(trace_size=trace_size, workers=wl[:4], egress_shim_col=1)
     else:
         # k, V are read-only weights. At real dims (T*DK bf16 = 44 KB) a depth-2 weight fifo blows the
         # 64 KB L1, so depth-1. Structure = the validated per-tile-acquire + stride-0 replay tap (the
@@ -475,10 +493,14 @@ ap.add_argument("--tactive-mask", dest="tactive_mask", action="store_true",
                 help="in-kernel t_active RTP key-mask on the bd_onchip scores stage (variable-length clips)")
 ap.add_argument("--p-resident", dest="p_resident", action="store_true",
                 help="[device-iterated] stage p once in a MemTile, re-stream on-chip (kills the 22x L3 re-read)")
+ap.add_argument("-t", "--trace_size", type=int, default=0, dest="trace_size",
+                help="non-zero enables per-stage IRON trace on head 0 (build with ATTN_HEADS=1; "
+                     "trace egress needs a free shim channel). 0 = production, byte-identical.")
 ap.add_argument("--stream-io", dest="stream_io", action="store_true",
                 help="device-in/out taps: read q/k/v from row-major [PAD_M,SD] bf16 GEMM outputs and "
                      "drain ctx into one, deleting the host pack (ATTN_SD / ATTN_PAD_M set the geometry)")
 opts = ap.parse_args(sys.argv[1:])
 dev = NPU2() if opts.device == "npu2" else NPU1()
 print(build(dev, mono=opts.mono, TRIVIAL=opts.trivial, relpos=opts.relpos, bd_onchip=opts.bd_onchip,
-            tactive_mask=opts.tactive_mask, p_resident=opts.p_resident, stream_io=opts.stream_io))
+            tactive_mask=opts.tactive_mask, p_resident=opts.p_resident, stream_io=opts.stream_io,
+            trace_size=opts.trace_size))
