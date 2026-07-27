@@ -148,10 +148,42 @@ def build(dev, mono=False, TRIVIAL=False, relpos=False, bd_onchip=False, tactive
         # re-anchors at p offset 0 each tile; verify with run_bd_onchip.py rel-L2<=5e-3 at H=1 BEFORE H=4).
         # Guarded off so the default build stays the validated STREAM-A path; flip via --p-resident once
         # the topology below is proven on device.
-        assert not p_resident, (
-            "p-resident-read-once is a device-iterated MemTile step (see TASK 2 HOOK + turnkey doc); "
-            "the naive L2->L1 forward FAILED parity on device. Build without --p-resident (STREAM-A) "
-            "until the restart-per-tile MemTile replay is validated.")
+        # RESOLUTION of the hook above. The failed attempt used `.forward(repeat_count=N_QT)` on a
+        # fifo whose OBJECT was one BD_KB block: the MemTile then replayed a block-sized BD, so the
+        # replay resumed wherever the read pointer happened to sit instead of re-anchoring at p row 0
+        # -- query tile q saw the wrong blocks (corr 0.65, rel-L2 0.82).
+        #
+        # The fix is to make the replayed unit the WHOLE p table rather than a block, using asymmetric
+        # transfer granularity: the producer (L3 -> MemTile) sends one P-row object, the consumer
+        # (MemTile -> L1) receives it as NBLK BD_KB-row objects (consumer_obj_type), and repeat_count
+        # replays that whole-table BD N_QT times "without a new DMA transfer from L3". Re-anchoring at
+        # row 0 each tile is then structural -- it is the start of the replayed BD -- rather than
+        # something the block-sized replay had to be coaxed into. p is read from L3 ONCE per dispatch
+        # instead of N_QT=22 times, which is the movement this whole step exists to kill.
+        # The worker is UNCHANGED: it still acquires NBLK block objects per query tile.
+        # STILL GUARDED, but the blocker is now IDENTIFIED rather than guessed. The old note framed it
+        # as "the replay did not restart", implying a coaxing problem. It is structural:
+        #
+        #   aie.objectfifo verifier: "`repeat_count` unavailable for shim tiles"
+        #
+        # The p fifo's producer IS the shim (L3), so the replay cannot live on it at all -- no amount of
+        # tap or depth tuning on the current one-hop fifo can work. It needs TWO hops, L3 -> MemTile ->
+        # L1, with BOTH of these on the second hop:
+        #   * consumer_obj_type=pblk_ty  -- producer holds the whole P-row table, consumer takes BD_KB
+        #     blocks, so the replayed unit is the TABLE and re-anchoring at row 0 is structural (this is
+        #     what the block-sized replay could never give: it resumed wherever the read pointer sat,
+        #     hence corr 0.65).
+        #   * repeat_count=N_QT          -- replays that whole-table BD "without a new DMA transfer from
+        #     L3", which is the 22x read-once win.
+        # ObjectFifoHandle.forward() CANNOT express this: it delegates to split(), which forwards
+        # obj_types/depths/repeat_counts but has no consumer_obj_type parameter. So the second hop has to
+        # be built explicitly (candidate: construct the L2 fifo with both kwargs and join the hops with
+        # an ObjectFifoLink on AnyMemTile) -- verify at H=1 with run_bd_onchip.py rel-L2<=5e-3 BEFORE H=4.
+        if p_resident:
+            raise SystemExit(
+                "--p-resident needs the explicit two-hop L3->MemTile->L1 fifo (see the note above): "
+                "repeat_count is MemTile-only, and forward() cannot carry consumer_obj_type. "
+                "Build without --p-resident (STREAM-A) until that topology is device-validated.")
         of_qpv = [ObjectFifo(qpv_ty, name=f"qpv{h}", depth=2) for h in range(H)]
         of_p = [ObjectFifo(pblk_ty if stream_p else p_full_ty, name=f"p{h}", depth=2 if stream_p else 1) for h in range(H)]
         of_bd = [ObjectFifo(qbd_ty, name=f"bd{h}", depth=1) for h in range(H)]
@@ -311,7 +343,10 @@ def build(dev, mono=False, TRIVIAL=False, relpos=False, bd_onchip=False, tactive
                     kvtap = TensorAccessPattern([H * T * DK], h * T * DK, [N_QT, 1, T, DK], [0, 0, DK, 1])
                     ctap = TensorAccessPattern([H * N_QT * TQ * DK], h * N_QT * TQ * DK, [N_QT, 1, TQ, DK], [TQ * DK, 0, DK, 1])
                 rt.fill(of_qpv[h].prod(), QPV, tap=qtap)
-                if stream_p:
+                if p_resident:
+                    # ONE pass over p: no N_QT outer replay from L3. The MemTile does the replaying.
+                    ptap = TensorAccessPattern([H * P * DK], h * P * DK, [1, 1, P, DK], [0, 0, DK, 1])
+                elif stream_p:
                     ptap = TensorAccessPattern([H * P * DK], h * P * DK, [N_QT, NBLK, BD_KB, DK], [0, BD_KB * DK, DK, 1])
                 else:
                     ptap = TensorAccessPattern([H * P * DK], h * P * DK, [N_QT, 1, P, DK], [0, 0, DK, 1])
