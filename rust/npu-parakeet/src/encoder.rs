@@ -410,7 +410,13 @@ impl FastConformerEncoder {
         // outputs in place and drain ctx straight into linear_out's A. This deletes the last host
         // excursion in the fused block's residual stream. Falls through to the read-back path below
         // when the artifacts/conveyor_bd_io xclbin is absent, so an unbuilt tree still runs.
-        if std::env::var("PARAKEET_MHSA_DEV_IO").is_ok() && npu.conveyor_bd_io_available() {
+        // PART OF THE DEFAULT FULL-NPU RAIL since 2026-07-27 (opt out with PARAKEET_MHSA_DEV_IO=0).
+        // Costs +144 command submissions/clip and ~+11% wall -- and is the most ACCURATE arm measured
+        // (rel-L2 0.0866 vs the hybrid's 0.0891 and the pre-MHSA rail's 0.0886). Kept on because the
+        // rail's purpose is a single-hardware graph; the wall is bought back by deleting command
+        // submissions (one-xclbin-per-block), not by leaving ops on the host.
+        if std::env::var("PARAKEET_MHSA_DEV_IO").map(|v| v != "0")
+            .unwrap_or_else(|_| npu.full_npu_rail()) && npu.conveyor_bd_io_available() {
             prof::phase::set_stage("mhsa_pos");
             let id_pos = format!("{blk}.pos");
             let pm = self.mm_checkpoint(pos_enc, b, "self_attn.linear_pos.weight", &id_pos)
