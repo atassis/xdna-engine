@@ -26,13 +26,20 @@ T = int(os.environ.get("ATTN_T", 64))
 DK = int(os.environ.get("ATTN_DK", 64))
 N_QT = int(os.environ.get("ATTN_NQT", 16))  # query tiles streamed through the pipeline
 N_HEADS = int(os.environ.get("ATTN_HEADS", 1))  # data-parallel heads, one 3-tile conveyor per column
+# STREAM-IO (--stream-io) geometry: the resident modal-GEMM output shape the taps stride over.
+# SD = model hidden D (row stride of the row-major [PAD_M, SD] q/k/v/ctx buffers), PAD_M = its padded
+# row count. Parakeet: SD=1024 (8 heads x DK=128), PAD_M=512. Unused unless --stream-io is passed.
+SD = int(os.environ.get("ATTN_SD", 1024))
+PAD_M = int(os.environ.get("ATTN_PAD_M", 512))
 
 
 P = 2 * T - 1  # relative-position length (NeMo/Parakeet rel-pos)
 
 
 def build(dev, mono=False, TRIVIAL=False, relpos=False, bd_onchip=False, tactive_mask=False,
-          p_resident=False):
+          p_resident=False, stream_io=False):
+    if stream_io and not bd_onchip:
+        raise SystemExit("--stream-io is a bd_onchip-path option (device-in/out taps on the 4-stage column)")
     if bd_onchip:
         relpos = True   # BD-on-chip reuses the relpos scores kernel (q||BD belt -> stage_scores_relpos_bd)
     q_ty = np.ndarray[(TQ * DK,), np.dtype[bfloat16]]      # one query tile (fifo object)
@@ -240,11 +247,39 @@ def build(dev, mono=False, TRIVIAL=False, relpos=False, bd_onchip=False, tactive
             wl.append(Worker(stg_c, [of_pr[h].cons(), of_v[h].cons(), of_ctxh[h].prod(), ctx_k]))
 
         QPVE = N_QT * 2 * TQ * DK
-        qpv_all_ty = np.ndarray[(H * QPVE,), np.dtype[bfloat16]]
+        # ---- STREAM-IO (device-in/device-out) -------------------------------------------------------
+        # DEFAULT (host-packed): every runtime buffer is head-major and pre-packed by the host --
+        # q+bias into an interleaved qu||qv belt, k/v gathered per head, ctx drained head-major and
+        # re-uploaded for linear_out. That host pack IS the round-trip this seam deletes.
+        #
+        # STREAM-IO instead reads q/k/v straight out of the resident modal-GEMM outputs, which are
+        # row-major bf16 [PAD_M, SD] (SD = model hidden D; head h occupies columns h*DK..(h+1)*DK).
+        # Every per-head gather is then just a STRIDE on the existing fill: the row step becomes SD
+        # instead of DK and the base becomes h*DK. Identical bytes moved, no repack, no kernel change.
+        #   qu/qv: ONE buffer holding two [PAD_M, SD] planes (qu then qv). The 4-D tap walks
+        #          (tile, plane, row, col), so it reproduces the interleaved qu||qv belt object the
+        #          BD stage already consumes -- the 5-BO ABI and every kernel signature are untouched.
+        #          The two planes are what lets the host fold pos_bias_u/v in as the affine-cast BETA
+        #          (gamma=1, beta=bias) rather than adding the bias on host or in-kernel.
+        #   ctx:   drains directly into a [PAD_M, SD] bf16 buffer = linear_out's A input.
+        # p stays host-packed head-major: pos_enc is not on the resident stream (it is a function of
+        # clip length, not of x), so it is genuinely outside the fused frontier.
+        # A group of H<SD/DK heads reads its slice via a host-side sub-buffer (shim_bo_subbuffer),
+        # so H=4x2 needs no second xclbin and H=8-in-1 later needs no host change.
+        if stream_io:
+            assert SD % DK == 0, f"stream-io: SD({SD}) must be a multiple of DK({DK})"
+            assert H * DK <= SD, f"stream-io: H({H})*DK({DK}) exceeds SD({SD})"
+            assert PAD_M >= N_QT * TQ, f"stream-io: PAD_M({PAD_M}) < N_QT*TQ({N_QT * TQ})"
+            qpv_all_ty = np.ndarray[(2 * PAD_M * SD,), np.dtype[bfloat16]]  # qu plane | qv plane
+            k_all_ty = np.ndarray[(PAD_M * SD,), np.dtype[bfloat16]]
+            v_all_ty = np.ndarray[(PAD_M * SD,), np.dtype[bfloat16]]
+            c_all_ty = np.ndarray[(PAD_M * SD,), np.dtype[bfloat16]]
+        else:
+            qpv_all_ty = np.ndarray[(H * QPVE,), np.dtype[bfloat16]]
+            k_all_ty = np.ndarray[(H * T * DK,), np.dtype[bfloat16]]
+            v_all_ty = np.ndarray[(H * T * DK,), np.dtype[bfloat16]]
+            c_all_ty = np.ndarray[(H * N_QT * TQ * DK,), np.dtype[bfloat16]]
         p_all_ty = np.ndarray[(H * P * DK,), np.dtype[bfloat16]]
-        k_all_ty = np.ndarray[(H * T * DK,), np.dtype[bfloat16]]
-        v_all_ty = np.ndarray[(H * T * DK,), np.dtype[bfloat16]]
-        c_all_ty = np.ndarray[(H * N_QT * TQ * DK,), np.dtype[bfloat16]]
         with rt.sequence(qpv_all_ty, p_all_ty, k_all_ty, v_all_ty, c_all_ty) as (QPV, PP, K, V, CTX):
             rt.start(*wl)
             if tactive_mask:
@@ -261,16 +296,29 @@ def build(dev, mono=False, TRIVIAL=False, relpos=False, bd_onchip=False, tactive
                     rt.inline_ops(_mk_set(T), [tactive_bd_rtp[h]])   # BD-stage core: same t_active
                     rt.set_barrier(rtp_bd_bar[h], 1)
             for h in range(H):
-                rt.fill(of_qpv[h].prod(), QPV, tap=TensorAccessPattern([H * QPVE], h * QPVE, [N_QT, 1, 1, 2 * TQ * DK], [2 * TQ * DK, 0, 0, 1]))
+                if stream_io:
+                    # (tile, plane, row, col) over [2, PAD_M, SD]: plane 0 = qu, plane 1 = qv, so one
+                    # tap emits the qu||qv belt object. Tile step = TQ rows; plane step = one PAD_M*SD
+                    # plane; row step = SD (the row-major GEMM stride); col step = 1.
+                    qtap = TensorAccessPattern([2 * PAD_M * SD], h * DK,
+                                               [N_QT, 2, TQ, DK], [TQ * SD, PAD_M * SD, SD, 1])
+                    # k/v: whole [T, DK] head slice, stride-0 replayed per query tile (as before).
+                    kvtap = TensorAccessPattern([PAD_M * SD], h * DK, [N_QT, 1, T, DK], [0, 0, SD, 1])
+                    ctap = TensorAccessPattern([PAD_M * SD], h * DK,
+                                               [N_QT, 1, TQ, DK], [TQ * SD, 0, SD, 1])
+                else:
+                    qtap = TensorAccessPattern([H * QPVE], h * QPVE, [N_QT, 1, 1, 2 * TQ * DK], [2 * TQ * DK, 0, 0, 1])
+                    kvtap = TensorAccessPattern([H * T * DK], h * T * DK, [N_QT, 1, T, DK], [0, 0, DK, 1])
+                    ctap = TensorAccessPattern([H * N_QT * TQ * DK], h * N_QT * TQ * DK, [N_QT, 1, TQ, DK], [TQ * DK, 0, DK, 1])
+                rt.fill(of_qpv[h].prod(), QPV, tap=qtap)
                 if stream_p:
                     ptap = TensorAccessPattern([H * P * DK], h * P * DK, [N_QT, NBLK, BD_KB, DK], [0, BD_KB * DK, DK, 1])
                 else:
                     ptap = TensorAccessPattern([H * P * DK], h * P * DK, [N_QT, 1, P, DK], [0, 0, DK, 1])
                 rt.fill(of_p[h].prod(), PP, tap=ptap)
-                kvtap = TensorAccessPattern([H * T * DK], h * T * DK, [N_QT, 1, T, DK], [0, 0, DK, 1])
                 rt.fill(of_k[h].prod(), K, tap=kvtap)
                 rt.fill(of_v[h].prod(), V, tap=kvtap)
-                rt.drain(of_ctxh[h].cons(), CTX, tap=TensorAccessPattern([H * N_QT * TQ * DK], h * N_QT * TQ * DK, [N_QT, 1, TQ, DK], [TQ * DK, 0, DK, 1]), wait=True)
+                rt.drain(of_ctxh[h].cons(), CTX, tap=ctap, wait=True)
     else:
         # k, V are read-only weights. At real dims (T*DK bf16 = 44 KB) a depth-2 weight fifo blows the
         # 64 KB L1, so depth-1. Structure = the validated per-tile-acquire + stride-0 replay tap (the
@@ -376,7 +424,10 @@ ap.add_argument("--tactive-mask", dest="tactive_mask", action="store_true",
                 help="in-kernel t_active RTP key-mask on the bd_onchip scores stage (variable-length clips)")
 ap.add_argument("--p-resident", dest="p_resident", action="store_true",
                 help="[device-iterated] stage p once in a MemTile, re-stream on-chip (kills the 22x L3 re-read)")
+ap.add_argument("--stream-io", dest="stream_io", action="store_true",
+                help="device-in/out taps: read q/k/v from row-major [PAD_M,SD] bf16 GEMM outputs and "
+                     "drain ctx into one, deleting the host pack (ATTN_SD / ATTN_PAD_M set the geometry)")
 opts = ap.parse_args(sys.argv[1:])
 dev = NPU2() if opts.device == "npu2" else NPU1()
 print(build(dev, mono=opts.mono, TRIVIAL=opts.trivial, relpos=opts.relpos, bd_onchip=opts.bd_onchip,
-            tactive_mask=opts.tactive_mask, p_resident=opts.p_resident))
+            tactive_mask=opts.tactive_mask, p_resident=opts.p_resident, stream_io=opts.stream_io))
