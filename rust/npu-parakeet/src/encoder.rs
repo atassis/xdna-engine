@@ -221,9 +221,18 @@ impl FastConformerEncoder {
     pub fn npu_stats_string(&self) -> Option<String> {
         self.npu.as_ref().map(|n| {
             let s = n.stats.borrow();
+            // Per-kernel dispatch split, costliest first. The aggregate alone says the fused path is
+            // slower without saying WHICH dispatch is slower -- and every cost model built on the
+            // aggregate has been falsified so far, so print the split by default.
+            let mut tags: Vec<_> = s.by_tag.iter().map(|(k, (n, t))| (*k, *n, *t)).collect();
+            tags.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
+            let split: String = tags
+                .iter()
+                .map(|(k, n, t)| format!(" {k}={t:.2}s/{n}"))
+                .collect();
             format!(
-                "npu breakdown: calls={} dispatches={} weight_load={:.2}s pack_a={:.2}s dispatch={:.2}s read={:.2}s accum={:.2}s",
-                s.calls, s.dispatches, s.weight_load_s, s.pack_a_s, s.dispatch_s, s.read_s, s.accum_s
+                "npu breakdown: calls={} dispatches={} weight_load={:.2}s pack_a={:.2}s dispatch={:.2}s read={:.2}s accum={:.2}s\nnpu dispatch split:{}",
+                s.calls, s.dispatches, s.weight_load_s, s.pack_a_s, s.dispatch_s, s.read_s, s.accum_s, split
             )
         })
     }
