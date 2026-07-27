@@ -1,3 +1,57 @@
+# CHEATSHEET -- build one brick from a worktree, stage it, gate it, trace it
+
+The worktree/sandbox split is not obvious and rediscovering it costs a session. Every
+command below was run once to verify it. `$XE` = the MAIN checkout, `$WT` = your worktree.
+
+**What lives where.** Kernel + generator SOURCES are tracked, in `$WT/route_b_kernels/`. The
+`.venv-iron` toolchain and the `mlir-aie/` build sandbox are gitignored and exist ONLY in `$XE`
+-- a worktree has an EMPTY `mlir-aie/`, so you cannot build in one. `sync_kernels.sh` copies
+sources FORWARD (repo -> sandbox, one-directional) and takes the sandbox root as `$1`, which is
+what lets you drive a build in `$XE` from sources in `$WT`. Staged xclbins land in
+`$XE/artifacts/parakeet/ln/` (conveyor: `$XE/artifacts/conveyor/single/`).
+
+```bash
+XE=<...>/xdna-engine; WT=<...>/wt-<your-branch>          # main checkout / your worktree
+(cd "$WT" && bash scripts/sync_kernels.sh "$XE/mlir-aie")   # $WT sources -> $XE sandbox
+cd "$XE" && bash -c 'source scripts/iron_env.sh && \       # MUST be one bash; zsh will not do
+  make -C mlir-aie/programming_examples/ml/layernorm -f Makefile.resadd \
+       NPU2=1 rows=512 cols=1024 scale=0.5 stag=050 build/final_resadd_512x1024_s050.xclbin'
+cp mlir-aie/programming_examples/ml/layernorm/build/{final,insts}_resadd_512x1024_s050.* \
+   artifacts/parakeet/ln/                                  # stage (what build_parakeet_modal_kernels.sh does)
+NPU_XCLBIN_ROOT=$PWD cargo run --features npu --release --bin fused_seam_parity -- residual   # gate
+```
+
+Then the numeric gate (`scripts/encoder_parity.py ref ship cand`, rel-L2 vs f32 truth) -- NOT the
+17-clip WER, which is chaotic at ~1e-5. Wall-clock A/B is `--ab VAR` on `parakeet_encode_npu`
+(interleaved, both arms every clip, order alternated); sequential same-session A/B does not
+survive this device's drift, and the harness noise floor is 1-3%.
+
+**Two traps this split sets.**
+
+1. **`sync_kernels.sh` does NOT cover `conveyor_proto`.** The conveyor kernel + generator are
+   authored IN the mlir-aie fork (`programming_examples/basic/conveyor_proto/`, tracked on branch
+   `xdna2-asr`); `route_b_kernels/conveyor_proto/` is an unsynced manual copy. Editing the
+   `route_b_kernels` copy and re-syncing changes NOTHING -- `scripts/conveyor_prebuild.sh` builds
+   the fork copy. Edit the fork copy, then mirror it back into `route_b_kernels/` by hand.
+2. **The sandbox is shared by every worktree.** Syncing from `$WT` overwrites whatever the last
+   sync put there, so a build launched from `$XE` afterwards silently uses `$WT`'s kernels.
+   Re-sync before switching branches. `ensure_fresh_sandbox` only purges on a `toolchain.lock`
+   change, not on a source change.
+
+Verify the toolchain is the FORK instance, never the wheel -- `aie.__file__` must resolve under
+`.cache/instances/<first-12-of-toolchain.lock-sha256>/`:
+
+```bash
+cd "$XE" && bash -c 'source scripts/iron_env.sh && python3 -c "import aie; print(aie.__file__)"'
+sha256sum "$XE/toolchain.lock" | cut -c1-12      # must match the instance dir in that path
+```
+
+Trace one conveyor stage with `--trace-worker N` (0=BD 1=scores 2=softmax 3=ctx). ONE stage per
+build -- a shared ring lets BD flood it. The `whole_array` GEMM cannot be traced at any column
+count (it occupies the shim south ports).
+
+---
+
 # relpos MHA resident block -- build + device-drive (steps 1 + 2)
 
 Step 1 (below) de-risks the two rel-pos bricks with host-fed AC+BD (no matmul).
