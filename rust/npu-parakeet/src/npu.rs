@@ -181,6 +181,21 @@ struct ConveyorBdK {
     n_heads: usize,  // baked heads per dispatch (H_BD)
 }
 
+/// Loaded DEVICE-IN/OUT BD-onchip conveyor (the `--stream-io` build). Same 5-BO ABI and same kernels
+/// as [`ConveyorBdK`]; what differs is the fill/drain TAPS, which stride over row-major [PAD_M,KRES]
+/// bf16 buffers (head h in columns h*DK) instead of host-packed head-major belts. So the q/k/v/ctx
+/// BOs are CALLER-OWNED (they are the resident-stream GEMM outputs) and only instr + the host-packed
+/// p buffer live here.
+struct ConveyorBdIoK {
+    kern: Rc<Kernel>,
+    instr_template: Vec<u32>, // words[== BUILT_T] = the per-head t_active RTP immediates (patched)
+    n_instr: usize,
+    bo_instr: Bo,
+    bo_p: Bo,        // [H_BD, P, DK] bf16, host-packed head-major (pos_enc is outside the frontier)
+    n_qt: usize,
+    n_heads: usize,  // baked heads per dispatch (H_BD)
+}
+
 #[derive(Default)]
 pub struct NpuStats {
     pub pack_a_s: f64,
@@ -220,6 +235,8 @@ pub struct NpuMatmul {
     conveyor: RefCell<Option<Rc<ConveyorK>>>,      // loaded 8-head conveyor (H baked, single instance)
     conveyor_bd_dir: PathBuf,                       // {root}/artifacts/conveyor_bd (BD-onchip xclbin)
     conveyor_bd: RefCell<Option<Rc<ConveyorBdK>>>,  // loaded BD-onchip conveyor (H_BD baked per dispatch)
+    conveyor_bd_io_dir: PathBuf,                    // {root}/artifacts/conveyor_bd_io (--stream-io build)
+    conveyor_bd_io: RefCell<Option<Rc<ConveyorBdIoK>>>, // loaded device-in/out BD-onchip conveyor
     ln_dir: PathBuf,                               // {root}/artifacts/parakeet/ln (ctxln + affcast xclbins)
     // Tri-state cache: None = untried; Some(None) = xclbins absent, FF stays host (no retry);
     // Some(Some) = co-resident on-chip LN + affine-cast chain loaded.
@@ -496,6 +513,8 @@ impl NpuMatmul {
             conveyor: RefCell::new(None),
             conveyor_bd_dir: root.join("artifacts/conveyor_bd"),
             conveyor_bd: RefCell::new(None),
+            conveyor_bd_io_dir: root.join("artifacts/conveyor_bd_io"),
+            conveyor_bd_io: RefCell::new(None),
             ln_dir: root.join("artifacts/parakeet/ln"),
             resident_ln: RefCell::new(None),
             stats: RefCell::new(NpuStats::default()),
@@ -572,6 +591,154 @@ impl NpuMatmul {
         });
         *self.conveyor_bd.borrow_mut() = Some(ck.clone());
         ck
+    }
+
+    /// Load (once) the DEVICE-IN/OUT BD-onchip conveyor (`--stream-io`) from
+    /// {root}/artifacts/conveyor_bd_io/single/. `None` when the xclbin is absent, so the caller
+    /// falls back rather than panicking (this path is opt-in and its artifact is not built by default).
+    fn conveyor_bd_io_block(&self, n_heads: usize) -> Option<Rc<ConveyorBdIoK>> {
+        if let Some(k) = self.conveyor_bd_io.borrow().as_ref() {
+            assert_eq!(k.n_heads, n_heads, "bd-io xclbin baked for H_BD={}, got {n_heads}", k.n_heads);
+            return Some(k.clone());
+        }
+        let dir = self.conveyor_bd_io_dir.join("single");
+        let xclbin = dir.join("final.xclbin");
+        let insts = dir.join("insts.bin");
+        if !xclbin.exists() || !insts.exists() {
+            return None;
+        }
+        let kern = self.dev.load_kernel(xclbin.to_str().unwrap(), None).ok()?;
+        let ib = std::fs::read(&insts).ok()?;
+        let n_instr = ib.len() / 4;
+        let instr_template: Vec<u32> = ib
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let g = |i| kern.group_id(i).unwrap();
+        let bo_instr = self.dev.alloc_bo(&kern, ib.len(), FLAG_CACHEABLE, g(1)).unwrap();
+        // Only p is owned here; qpv/k/v/ctx are the caller's resident-stream BOs (g3/g5/g6/g7).
+        let bo_p = self.dev.alloc_bo(&kern, n_heads * CONV_BD_P * CONV_DK * 2, FLAG_HOST_ONLY, g(4)).unwrap();
+        let ck = Rc::new(ConveyorBdIoK {
+            kern, instr_template, n_instr, bo_instr, bo_p, n_qt: CONV_BUILT_T / CONV_TQ, n_heads,
+        });
+        *self.conveyor_bd_io.borrow_mut() = Some(ck.clone());
+        Some(ck)
+    }
+
+    /// True when the device-in/out MHSA seam can run (the `--stream-io` xclbin is present).
+    pub fn conveyor_bd_io_available(&self) -> bool {
+        self.conveyor_bd_io_block(CONV_BD_HEADS).is_some()
+    }
+
+    /// DEVICE-IN / DEVICE-OUT MHSA: the whole attention interior stays in device BOs.
+    ///
+    /// This is the seam that removes the last host excursion from the fused block's residual stream.
+    /// The host-in path computes q/k/v on device, reads all three back, packs belts, runs attention,
+    /// then re-uploads ctx for linear_out. Here:
+    ///   satt_bo (resident bf16 LN output)
+    ///     -> 3 modal GEMMs, outputs STAY device-side as f32 [PAD_M,KRES]   (proj_from_bf16_to_bo)
+    ///     -> 4 affine-casts to bf16, folding pos_bias_u/v in as BETA        (affine_cast_into)
+    ///          qu = cast(q, beta=ubias) and qv = cast(q, beta=vbias) into the two planes of ONE BO;
+    ///          k, v = plain casts (beta = 0)
+    ///     -> the conveyor's strided taps read those buffers directly and drain ctx into a bf16
+    ///        [PAD_M,KRES] BO, which IS linear_out's A input.
+    /// Nothing between satt_bo and the returned ctx touches host except `p` (pos_enc depends on clip
+    /// length, not on x, so it is genuinely outside the frontier and stays host-packed head-major).
+    ///
+    /// Returns the ctx BO (bf16 [PAD_M,KRES]); the caller applies linear_out. `None` when the
+    /// `--stream-io` xclbin or the affcast brick is absent.
+    #[allow(clippy::too_many_arguments)]
+    pub fn relpos_mha_conveyor_bdonchip_dev<Fq, Fk, Fv>(
+        &self,
+        satt_bo: &Bo, m: usize,
+        make_wq: Fq, id_q: &str,
+        make_wk: Fk, id_k: &str,
+        make_wv: Fv, id_v: &str,
+        pm: &Array2<f32>, ubias: &Array2<f32>, vbias: &Array2<f32>, n_heads: usize,
+    ) -> Option<Rc<Bo>>
+    where Fq: FnOnce() -> Array2<f32>, Fk: FnOnce() -> Array2<f32>, Fv: FnOnce() -> Array2<f32> {
+        let dk = CONV_DK;
+        let d = n_heads * dk;
+        assert_eq!(d, KRES, "bd-io seam assumes D == KRES == {KRES} (got {d})");
+        assert!(m <= CONV_BUILT_T, "clip T={m} exceeds conveyor BUILT_T={CONV_BUILT_T}");
+        self.resident_ln()?; // affcast brick required for the casts
+        let ck = self.conveyor_bd_io_block(CONV_BD_HEADS)?;
+
+        // ---- q/k/v projections, outputs stay on device (f32 [PAD_M, KRES]) ----
+        let q_f32 = self.proj_from_bf16_to_bo(satt_bo, m, make_wq, id_q, d);
+        let k_f32 = self.proj_from_bf16_to_bo(satt_bo, m, make_wk, id_k, d);
+        let v_f32 = self.proj_from_bf16_to_bo(satt_bo, m, make_wv, id_v, d);
+
+        // ---- cast to bf16 in the layout the taps expect; fold pos_bias into BETA ----
+        // ubias/vbias are [H,DK]; flattening to [D] lands head h's bias on columns h*DK..(h+1)*DK,
+        // which is exactly where head h lives in the row-major stream. No transpose, no host pass.
+        let flat = |b: &Array2<f32>| -> Vec<f32> {
+            let mut o = vec![0f32; d];
+            for h in 0..n_heads { for c in 0..dk { o[h * dk + c] = b[[h, c]]; } }
+            o
+        };
+        let plane = PAD_M * KRES * 2; // bytes per [PAD_M,KRES] bf16 plane
+        let g5 = self.kern.group_id(5).unwrap();
+        let bo_qpv = self.dev.alloc_bo(&self.kern, 2 * plane, FLAG_HOST_ONLY, g5).unwrap();
+        let bo_k = self.dev.alloc_bo(&self.kern, plane, FLAG_HOST_ONLY, g5).unwrap();
+        let bo_v = self.dev.alloc_bo(&self.kern, plane, FLAG_HOST_ONLY, g5).unwrap();
+        let bo_ctx = Rc::new(self.dev.alloc_bo(&self.kern, plane, FLAG_HOST_ONLY, g5).unwrap());
+        self.affine_cast_into(&q_f32, &bo_qpv.sub(0, plane).unwrap(), Some(&flat(ubias)))?;
+        self.affine_cast_into(&q_f32, &bo_qpv.sub(plane, plane).unwrap(), Some(&flat(vbias)))?;
+        self.affine_cast_into(&k_f32, &bo_k, None)?;
+        self.affine_cast_into(&v_f32, &bo_v, None)?;
+
+        // ---- t_active: patch every baked BUILT_T immediate to this clip's m (see the host-packed twin) ----
+        let mut insts = ck.instr_template.clone();
+        let words: Vec<usize> = ck.instr_template.iter().enumerate()
+            .filter(|(_, &w)| w == CONV_BUILT_T as u32).map(|(i, _)| i).collect();
+        assert_eq!(words.len(), CONV_BD_TACTIVE_SITES,
+            "bd-io t_active discovery: expected {} words == BUILT_T ({}), found {} at {:?}",
+            CONV_BD_TACTIVE_SITES, CONV_BUILT_T, words.len(), words);
+        for &w in &words { insts[w] = m as u32; }
+        let instr_bytes: Vec<u8> = insts.iter().flat_map(|w| w.to_le_bytes()).collect();
+        ck.bo_instr.write_bytes(&instr_bytes).unwrap();
+        ck.bo_instr.sync_to_device().unwrap();
+
+        // ---- per head-group dispatch (H_BD heads/xclbin) ----
+        // The taps address head h at column h*DK, so group g reads columns (g+h)*DK via a SUB-BUFFER
+        // offset by g*DK elements. One xclbin serves both groups; H=8-in-1 later drops the loop.
+        let p = pm.nrows();
+        for g in (0..n_heads).step_by(CONV_BD_HEADS) {
+            let hb = CONV_BD_HEADS;
+            let mut p_pack = Vec::<f32>::with_capacity(hb * CONV_BD_P * dk);
+            for slot in 0..hb {
+                let h = g + slot;
+                if h < n_heads {
+                    let col = h * dk;
+                    push_pad_rows(&mut p_pack, &pm.slice(s![.., col..col + dk]).to_owned(), 0, p, CONV_BD_P);
+                } else {
+                    p_pack.extend(std::iter::repeat(0.0f32).take(CONV_BD_P * dk));
+                }
+            }
+            let mut pb = vec![0u16; p_pack.len()];
+            npu_xrt::pack_f32_to_bf16(&p_pack, &mut pb);
+            ck.bo_p.write_bytes(u16_bytes(&pb)).unwrap();
+            ck.bo_p.sync_to_device().unwrap();
+
+            let off = g * dk * 2; // byte offset of this group's first head column
+            let t0 = Instant::now();
+            let (sq, sk, sv, sc);
+            let (aq, ak, av, ac) = if off == 0 {
+                (&bo_qpv, &bo_k, &bo_v, &*bo_ctx)
+            } else {
+                sq = bo_qpv.sub(off, 2 * plane - off).unwrap();
+                sk = bo_k.sub(off, plane - off).unwrap();
+                sv = bo_v.sub(off, plane - off).unwrap();
+                sc = bo_ctx.sub(off, plane - off).unwrap();
+                (&sq, &sk, &sv, &sc)
+            };
+            ck.kern.run_bd_conveyor(3, &ck.bo_instr, ck.n_instr, aq, &ck.bo_p, ak, av, ac).unwrap();
+            let mut st = self.stats.borrow_mut();
+            st.dispatch_s += t0.elapsed().as_secs_f64();
+            st.dispatches += 1;
+        }
+        Some(bo_ctx)
     }
 
     /// Max clip length T the resident relpos block can serve (the largest bucket's baked BUILT_T).
@@ -1581,6 +1748,58 @@ impl NpuMatmul {
         self.resident_ln()?;
         let rl = self.ln_affine_cast_dev(a_bo, gamma, beta);
         Some(rl.bo_bf16.clone())
+    }
+
+    /// FULLY device-side projection: A[m,KRES] bf16 device BO @ W[KRES,n] -> a FRESH f32 [PAD_M,n]
+    /// device BO, never read to host. The device-in/device-OUT twin of [`Self::proj_from_bf16`]
+    /// (which reads its result back) and of [`Self::matmul_id_to_bo`] (whose A is host-packed).
+    ///
+    /// A fresh output BO per call is required, not an optimisation: `dispatch_with_a` writes the
+    /// SHARED per-N stream buffer `stream(n).bo_c`, so three q/k/v projections in a row would each
+    /// clobber the previous. Callers holding q AND k AND v device-side need three distinct BOs.
+    pub fn proj_from_bf16_to_bo<F: FnOnce() -> Array2<f32>>(&self, a_bo: &Bo, m: usize, make_b: F, id: &str, n: usize) -> Rc<Bo> {
+        assert!(m <= PAD_M, "proj_from_bf16_to_bo: m={m} exceeds PAD_M={PAD_M}");
+        self.stats.borrow_mut().calls += 1;
+        let cached = self.wcache.borrow().get(id).cloned();
+        let wbo = if let Some(bo) = cached {
+            bo
+        } else {
+            let b = make_b();
+            assert_eq!(b.nrows(), KRES, "proj weight nrows {} != {KRES}", b.nrows());
+            assert_eq!(b.ncols(), n, "proj weight ncols {} != {n}", b.ncols());
+            self.weight_bo(id, b.view())
+        };
+        let out = self.dev.alloc_bo(&self.kern, PAD_M * n * 4, FLAG_HOST_ONLY, self.kern.group_id(5).unwrap()).unwrap();
+        let st = self.stream(n, Act::Identity);
+        self.kern.run_matmul8(3, &st.instr, st.n_instr, a_bo, &wbo, &out, &self.bo_tmp, &self.bo_tr).unwrap();
+        self.stats.borrow_mut().dispatches += 1;
+        Rc::new(out)
+    }
+
+    /// Affine-cast a device f32 [PAD_M,KRES] BO into a CALLER-CHOSEN device bf16 BO: out = a*gamma+beta,
+    /// with gamma pinned to 1 so this is a pure f32->bf16 cast plus an optional per-column bias.
+    ///
+    /// This is the brick that makes the MHSA device-in seam cheap. The conveyor consumes bf16 while the
+    /// modal GEMM emits f32, so a cast is needed regardless -- and because `beta` is a free [KRES]
+    /// vector, the SAME dispatch folds in the per-head `pos_bias_u`/`pos_bias_v` add (flattened [H,DK]
+    /// -> [D], which is exactly the column layout). So qu = cast(q, beta=ubias) and qv = cast(q,
+    /// beta=vbias) cost one shipped dispatch each and no kernel change, instead of a host bias pass.
+    ///
+    /// `out` must be a [PAD_M,KRES] bf16 BO (a sub-buffer is fine -- that is how the two qu/qv planes
+    /// of one buffer are written). Returns None when the affcast xclbin is absent.
+    fn affine_cast_into(&self, a_bo: &Bo, out: &Bo, beta: Option<&[f32]>) -> Option<()> {
+        let rl = self.resident_ln()?;
+        let mut gb = vec![0f32; 2 * KRES];
+        gb[..KRES].fill(1.0); // gamma = 1 -> pure cast
+        if let Some(b) = beta {
+            assert_eq!(b.len(), KRES, "affine_cast_into beta len {} != {KRES}", b.len());
+            gb[KRES..].copy_from_slice(b);
+        }
+        rl.bo_gb.write_bytes(f32_bytes(&gb)).unwrap();
+        rl.bo_gb.sync_to_device().unwrap();
+        rl.ac_kern.run_matmul8(3, &rl.ac_instr, rl.ac_n, a_bo, &rl.bo_gb, out, &rl.ac_tmp, &rl.ac_tr).unwrap();
+        self.stats.borrow_mut().dispatches += 1;
+        Some(())
     }
 
     /// Device-in projection: A[m,KRES] bf16 device BO `a_bo` @ W[KRES,n] -> C[m,n] f32 (read to host).

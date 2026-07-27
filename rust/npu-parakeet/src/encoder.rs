@@ -393,6 +393,32 @@ impl FastConformerEncoder {
         let b = self.w.block(blk);
         let npu = self.npu.as_ref().expect("mhsa_dev without npu");
         let d = self.cfg.hidden;
+        // FULL DEVICE-IN/OUT interior (opt-in PARAKEET_MHSA_DEV_IO=1): q/k/v never come back to host
+        // and ctx never goes back up -- the BD-onchip conveyor's --stream-io taps read the GEMM
+        // outputs in place and drain ctx straight into linear_out's A. This deletes the last host
+        // excursion in the fused block's residual stream. Falls through to the read-back path below
+        // when the artifacts/conveyor_bd_io xclbin is absent, so an unbuilt tree still runs.
+        if std::env::var("PARAKEET_MHSA_DEV_IO").is_ok() && npu.conveyor_bd_io_available() {
+            prof::phase::set_stage("mhsa_pos");
+            let id_pos = format!("{blk}.pos");
+            let pm = self.mm_checkpoint(pos_enc, b, "self_attn.linear_pos.weight", &id_pos)
+                .unwrap_or_else(|| self.mm_lazy(pos_enc, || b.m("self_attn.linear_pos.weight"), &id_pos));
+            let (ubias, vbias) = (b.m("self_attn.pos_bias_u"), b.m("self_attn.pos_bias_v"));
+            prof::phase::set_stage("mhsa_devio");
+            let ctx_bo = npu.relpos_mha_conveyor_bdonchip_dev(
+                satt_bo, m,
+                || b.m("self_attn.linear_q.weight"), &format!("{blk}.q"),
+                || b.m("self_attn.linear_k.weight"), &format!("{blk}.k"),
+                || b.m("self_attn.linear_v.weight"), &format!("{blk}.v"),
+                &pm, &ubias, &vbias, self.cfg.n_heads,
+            );
+            if let Some(ctx_bo) = ctx_bo {
+                // linear_out device-in (A = the bf16 ctx BO) and device-out, same f32 [PAD_M,D]
+                // contract the host-in path's matmul_id_to_bo returns, so the MHSA residual is unchanged.
+                prof::phase::set_stage("mhsa_qkv");
+                return npu.proj_from_bf16_to_bo(&ctx_bo, m, || b.m("self_attn.linear_out.weight"), &format!("{blk}.out"), d);
+            }
+        }
         prof::phase::set_stage("mhsa_qkv");
         let q = npu.proj_from_bf16(satt_bo, m, || b.m("self_attn.linear_q.weight"), &format!("{blk}.q"), d);
         prof::phase::set_stage("mhsa_qkv");
