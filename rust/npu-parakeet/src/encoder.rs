@@ -230,9 +230,12 @@ impl FastConformerEncoder {
                 .iter()
                 .map(|(k, n, t)| format!(" {k}={t:.2}s/{n}"))
                 .collect();
+            let sw = if s.submit_s > 0.0 || s.wait_s > 0.0 {
+                format!("\nnpu submit/wait split: submit={:.2}s wait={:.2}s", s.submit_s, s.wait_s)
+            } else { String::new() };
             format!(
-                "npu breakdown: calls={} dispatches={} weight_load={:.2}s pack_a={:.2}s dispatch={:.2}s read={:.2}s accum={:.2}s\nnpu dispatch split:{}",
-                s.calls, s.dispatches, s.weight_load_s, s.pack_a_s, s.dispatch_s, s.read_s, s.accum_s, split
+                "npu breakdown: calls={} dispatches={} weight_load={:.2}s pack_a={:.2}s dispatch={:.2}s read={:.2}s accum={:.2}s\nnpu dispatch split:{}{}",
+                s.calls, s.dispatches, s.weight_load_s, s.pack_a_s, s.dispatch_s, s.read_s, s.accum_s, split, sw
             )
         })
     }

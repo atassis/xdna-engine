@@ -162,6 +162,12 @@ pub struct NpuStats {
     /// `dispatch_s` says the fused path is slower but not WHICH dispatch is slower, and every
     /// cost model built on the aggregate so far has been falsified.
     pub by_tag: std::collections::BTreeMap<&'static str, (usize, f64)>,
+    /// `PARAKEET_SPLIT_SUBMIT=1` probe: the same blocking dispatch, split into the SUBMIT (enqueue one
+    /// instruction buffer on the hardware context) and the COMPLETION WAIT. "Dispatch" bundles both,
+    /// which is precisely the ambiguity that lets a cost model hide -- INSTR_VECTOR counts instruction
+    /// dispatch on the AIE core while `dispatches` counts command submissions to the device.
+    pub submit_s: f64,
+    pub wait_s: f64,
 }
 
 /// One pipeline slot: own A/C/tmp/trace so a dispatch in flight isn't clobbered while the host
@@ -973,6 +979,26 @@ impl NpuMatmul {
     }
 
     /// As `note_dispatch`, attributing the time to a named kernel so the breakdown is per-op.
+    /// Split-cost variant of one blocking dispatch: submit the command, then wait for completion,
+    /// booking the two separately. Enabled by `PARAKEET_SPLIT_SUBMIT=1`; otherwise identical timing to
+    /// the blocking path. Returns the total so callers still book one `note_dispatch_tag`.
+    #[allow(clippy::too_many_arguments)]
+    fn run_split(&self, kern: &Kernel, opcode: u32, instr: &Bo, count: usize,
+                 a: &Bo, b: &Bo, c: &Bo, tmp: &Bo, tr: &Bo) {
+        if !std::env::var("PARAKEET_SPLIT_SUBMIT").map(|v| v == "1").unwrap_or(false) {
+            kern.run_matmul8(opcode, instr, count, a, b, c, tmp, tr).unwrap();
+            return;
+        }
+        let t0 = std::time::Instant::now();
+        let run = kern.run_matmul8_start(opcode, instr, count, a, b, c, tmp, tr).unwrap();
+        let t1 = std::time::Instant::now();
+        run.wait().unwrap();
+        let dt_wait = t1.elapsed().as_secs_f64();
+        let mut s = self.stats.borrow_mut();
+        s.submit_s += (t1 - t0).as_secs_f64();
+        s.wait_s += dt_wait;
+    }
+
     #[inline]
     fn note_dispatch_tag(&self, t0: std::time::Instant, n: usize, tag: &'static str) {
         let dt = t0.elapsed().as_secs_f64();
@@ -1006,6 +1032,22 @@ impl NpuMatmul {
         };
         *self.resident_ln.borrow_mut() = Some(result.clone());
         result
+    }
+
+    /// Should the co-resident kernels that the ACTIVE config never dispatches be skipped at load?
+    ///
+    /// The measured dispatch split shows the fused block dispatches none of `acc_add`, `deint`,
+    /// `dwconv`, `silu` or `dwconv_silu` -- they are loaded as hw-contexts and never used. Loading
+    /// them is not free: it is weight_load time, and it is co-residency pressure on a device where a
+    /// blocking dispatch already costs ~1 ms whatever it computes
+    /// ([[dispatch-cost-is-per-dispatch-not-per-flop]]). Whether shedding contexts moves that floor is
+    /// an OPEN question this flag exists to answer -- it is a measurement lever first, tidiness second.
+    ///
+    /// Opt-in (`PARAKEET_LEAN_LOAD=1`) and only meaningful with the fused block on; the shipped path
+    /// dispatches acc_add/deint and must keep them.
+    fn lean_load(&self) -> bool {
+        std::env::var("PARAKEET_LEAN_LOAD").map(|v| v == "1").unwrap_or(false)
+            && std::env::var("PARAKEET_FUSED_BLOCK").map(|v| v == "1").unwrap_or(false)
     }
 
     fn load_resident_ln(&self) -> Rc<ResidentLn> {
@@ -1106,7 +1148,12 @@ impl NpuMatmul {
                 None
             }
         };
-        let acc_add = {
+        // Lean-loadable now that resident_fused_available() accepts fc2_k4096 in its place. Before
+        // that fix this was a never-dispatched context that the GATE still required, so dropping it
+        // silently fell the block back to host (dispatches 9384 -> 6936, read 0.24 -> 1.12s).
+        let acc_add = if self.lean_load() {
+            None   // superseded by fc2_k4096 inside the fused block -- see lean_load()
+        } else {
             let xcl = self.ln_dir.join(format!("final_accadd_{PAD_M}x{KRES}.xclbin"));
             let ins = self.ln_dir.join(format!("insts_accadd_{PAD_M}x{KRES}.txt"));
             if xcl.exists() && ins.exists() {
@@ -1197,7 +1244,9 @@ impl NpuMatmul {
             }
         };
         // conv-module depthwise conv1d (step 3), OPTIONAL. 3-buffer ABI in[C,T]/w[C,16]/out[C,T] bf16.
-        let dwconv = {
+        let dwconv = if self.lean_load() {
+            None   // never dispatched by the fused block -- see lean_load()
+        } else {
             let xcl = self.ln_dir.join(format!("final_dwconv_{DW_C}x{DW_T}.xclbin"));
             let ins = self.ln_dir.join(format!("insts_dwconv_{DW_C}x{DW_T}.txt"));
             if xcl.exists() && ins.exists() {
@@ -1217,7 +1266,9 @@ impl NpuMatmul {
             }
         };
         // conv-module post-dwconv SiLU (step 4), OPTIONAL. 2-buffer ABI in[C,T]/out[C,T] f32.
-        let silu = {
+        let silu = if self.lean_load() {
+            None   // never dispatched by the fused block -- see lean_load()
+        } else {
             let xcl = self.ln_dir.join(format!("final_silu_{DW_C}x{DW_T}.xclbin"));
             let ins = self.ln_dir.join(format!("insts_silu_{DW_C}x{DW_T}.txt"));
             if xcl.exists() && ins.exists() {
@@ -1238,7 +1289,9 @@ impl NpuMatmul {
         };
         // FUSED dwconv->SiLU (step 3+4, one xclbin), OPTIONAL. 3-buffer ABI in[C,T] bf16 / w[C,16] bf16 /
         // out[C,T] f32 (== ConvDw ABI, f32 out). Present -> replaces the separate dwconv+silu dispatches.
-        let dwconv_silu = {
+        let dwconv_silu = if self.lean_load() {
+            None   // never dispatched by the fused block -- see lean_load()
+        } else {
             let xcl = self.ln_dir.join(format!("final_dwconv_silu_{DW_C}x{DW_T}.xclbin"));
             let ins = self.ln_dir.join(format!("insts_dwconv_silu_{DW_C}x{DW_T}.txt"));
             if xcl.exists() && ins.exists() {
@@ -1376,7 +1429,7 @@ impl NpuMatmul {
         if std::env::var("PARAKEET_LN_FUSED").map(|v| v != "0").unwrap_or(true) {
             if let Some(lf) = rl.lnaffcast.as_ref() {
                 let __d0 = std::time::Instant::now();
-                lf.kern.run_matmul8(3, &lf.instr, lf.n, a_bo, &rl.bo_gb, &rl.bo_bf16, &lf.dummy_tmp, &lf.dummy_tr).unwrap();
+                self.run_split(&lf.kern, 3, &lf.instr, lf.n, a_bo, &rl.bo_gb, &rl.bo_bf16, &lf.dummy_tmp, &lf.dummy_tr);
                 self.note_dispatch_tag(__d0, 1, "ln_affcast");
                 return rl;
             }
@@ -1445,7 +1498,13 @@ impl NpuMatmul {
             return false;
         }
         match self.resident_ln() {
-            Some(rl) => rl.acc_add.is_some() && rl.resadd_s050.is_some() && rl.resadd_s100.is_some(),
+            // acc_add OR fc2_k4096: the K=DFF collapse is default-on inside the fused block and
+            // supersedes the 4x K=1024 + acc_add accumulate, so acc_add is never dispatched there.
+            // Requiring it anyway made a never-used hw-context load-bearing for the gate -- and
+            // dropping it silently fell the whole block back to host (dispatches 9384 -> 6936).
+            Some(rl) => (rl.acc_add.is_some() || rl.fc2_k4096.is_some())
+                && rl.resadd_s050.is_some()
+                && rl.resadd_s100.is_some(),
             None => false,
         }
     }
@@ -1566,7 +1625,7 @@ impl NpuMatmul {
         let out = if lf.flip.get() { &lf.bo_out1 } else { &lf.bo_out };
         lf.flip.set(!lf.flip.get());
         let __d0 = std::time::Instant::now();
-        lf.kern.run_matmul8(3, &lf.instr, lf.n, a_bo, &rl.bo_gb, out, &lf.dummy_tmp, &lf.dummy_tr).unwrap();
+        self.run_split(&lf.kern, 3, &lf.instr, lf.n, a_bo, &rl.bo_gb, out, &lf.dummy_tmp, &lf.dummy_tr);
         self.note_dispatch_tag(__d0, 1, "ln_f32");
         Some(out.clone())
     }
@@ -2150,7 +2209,10 @@ impl NpuMatmul {
     fn ffn_dev_accum<F1: FnOnce() -> Array2<f32>, F2: FnOnce() -> Array2<f32>>(
         &self, rl: &Rc<ResidentLn>, make_w1: F1, id1: &str, make_w2: F2, id2: &str,
     ) -> Rc<Bo> {
-        let aa = rl.acc_add.as_ref().expect("ffn_dev_accum without acc_add");
+        // acc_add is needed ONLY by the 4x K=1024 split below; the fc2_k4096 collapse (default-on in
+        // the fused block) returns before ever touching it. Resolve it lazily so a tree that sheds the
+        // superseded brick still runs the collapse path.
+        let acc_add_opt = rl.acc_add.as_ref();
         // fc1: modal, A=bo_bf16, W1, on-chip SiLU -> st1.bo_c (f32 [PAD_M,DFF]) -- stays DEVICE
         let w1 = {
             let c = self.wcache.borrow().get(id1).cloned();
@@ -2176,6 +2238,7 @@ impl NpuMatmul {
         let __d0 = std::time::Instant::now();
         rl.deint_kern.run_matmul8(3, &rl.deint_instr, rl.deint_n, &st1.bo_c, &rl.bo_deint, &rl.deint_c, &rl.deint_tmp, &rl.deint_tr).unwrap();
         self.note_dispatch_tag(__d0, 2, "ffn_devacc"); // fc1 + deint
+        let aa = acc_add_opt.expect("ffn_dev_accum 4-split without acc_add");
         // fc2 K-split with ON-DEVICE accumulate: each partial modal GEMM -> st.bo_c (device); acc_add
         // sums it into the acc0/acc1 ping-pong (seed acc=0 for partial0). Result stays device-resident.
         let parts = DFF / KRES;
@@ -2224,7 +2287,9 @@ impl NpuMatmul {
         make_w1: F1, id1: &str, make_w2: F2, id2: &str,
     ) -> Option<Rc<Bo>> {
         let rl = self.resident_ln()?;
-        rl.acc_add.as_ref()?;
+        if rl.acc_add.is_none() && rl.fc2_k4096.is_none() {
+            return None;   // need EITHER accumulator: the 4-split's acc_add or the K=DFF collapse
+        }
         self.stats.borrow_mut().calls += 1;
         let rl2 = self.ln_affine_cast(x, gamma, beta); // host-in LN: bo_bf16 = affine_LN(x)
         Some(self.ffn_dev_accum(&rl2, make_w1, id1, make_w2, id2))
@@ -2239,7 +2304,9 @@ impl NpuMatmul {
         make_w1: F1, id1: &str, make_w2: F2, id2: &str,
     ) -> Option<Rc<Bo>> {
         let rl = self.resident_ln()?;
-        rl.acc_add.as_ref()?;
+        if rl.acc_add.is_none() && rl.fc2_k4096.is_none() {
+            return None;   // need EITHER accumulator: the 4-split's acc_add or the K=DFF collapse
+        }
         self.stats.borrow_mut().calls += 1;
         let rl2 = self.ln_affine_cast_dev(a_bo, gamma, beta); // device-in LN: bo_bf16 = affine_LN(a_bo)
         Some(self.ffn_dev_accum(&rl2, make_w1, id1, make_w2, id2))
@@ -2446,7 +2513,7 @@ impl NpuMatmul {
         let out = if ra.flip.get() { &ra.bo_out1 } else { &ra.bo_out };
         ra.flip.set(!ra.flip.get());
         let __d0 = std::time::Instant::now();
-        ra.kern.run_matmul8(3, &ra.instr, ra.n, a_bo, b_bo, out, &ra.dummy_tmp, &ra.dummy_tr).unwrap();
+        self.run_split(&ra.kern, 3, &ra.instr, ra.n, a_bo, b_bo, out, &ra.dummy_tmp, &ra.dummy_tr);
         self.note_dispatch_tag(__d0, 1, "resadd");
         Some(out.clone())
     }
