@@ -21,7 +21,8 @@ from aie.helpers.taplib import TensorTiler2D
 from aie.iron.controlflow import range_
 
 
-def ln_affine_cast(dev, sequence_length, embedding_dim, trace_size, n_cores=8):
+def ln_affine_cast(dev, sequence_length, embedding_dim, trace_size, n_cores=8,
+                   obj="ln_affine_cast.o"):
     assert sequence_length % n_cores == 0, "rows must split evenly across 8 cores"
     assert embedding_dim % 16 == 0, "ln_affine_cast_row<16> vectorizes cols by 16"
 
@@ -39,7 +40,7 @@ def ln_affine_cast(dev, sequence_length, embedding_dim, trace_size, n_cores=8):
     of_out = [ObjectFifo(out_chunk, name=f"out_{i}") for i in range(n_cores)]
 
     kern = Kernel(
-        "ln_affine_cast_row", "ln_affine_cast.o",
+        "ln_affine_cast_row", obj,
         [in_chunk, gb_chunk, out_chunk, np.int32],
     )
 
@@ -91,7 +92,11 @@ p.add_argument("-r", "--rows", required=True, dest="rows")
 p.add_argument("-c", "--cols", required=True, dest="cols")
 p.add_argument("-t", "--trace_size", required=False, dest="trace_size", default=0)
 p.add_argument("-n", "--cores", required=False, dest="cores", default=8)
+# object file to link the core against. The bf16-write-pass variant is the SAME source compiled
+# with -DLN_BF16_WRITE=1 into a different .o, so both xclbins can live in one build dir.
+p.add_argument("-k", "--obj", required=False, dest="obj", default="ln_affine_cast.o")
 opts = p.parse_args(sys.argv[1:])
 
 dev = NPU2() if opts.device == "npu2" else NPU1()
-print(ln_affine_cast(dev, int(opts.rows), int(opts.cols), int(opts.trace_size), int(opts.cores)))
+print(ln_affine_cast(dev, int(opts.rows), int(opts.cols), int(opts.trace_size), int(opts.cores),
+                     opts.obj))

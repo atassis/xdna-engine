@@ -1034,8 +1034,17 @@ impl NpuMatmul {
         // FUSED ln+affine+cast (device-in path). Absent -> the 2-kernel chain, same numbers, one more
         // dispatch per LN site.
         let lnaffcast = {
-            let xcl = self.ln_dir.join(format!("final_lnaffcast_{PAD_M}x{KRES}.xclbin"));
-            let ins = self.ln_dir.join(format!("insts_lnaffcast_{PAD_M}x{KRES}.txt"));
+            // PARAKEET_LN_BF16=1 selects the NATIVE-LANE build of the same kernel (`lnaffcastb`,
+            // -DLN_BF16_WRITE=1): identical reductions, write pass moved off emulated-f32
+            // elementwise onto bf16-operand MACs (60 -> 9 vector ops per 16-lane chunk). Separate
+            // xclbin so the change is bisectable; falls back to the f32 build if it is not present.
+            let bf16 = std::env::var("PARAKEET_LN_BF16").map(|v| v == "1").unwrap_or(false);
+            let tag = if bf16 { "lnaffcastb" } else { "lnaffcast" };
+            let xcl = self.ln_dir.join(format!("final_{tag}_{PAD_M}x{KRES}.xclbin"));
+            let ins = self.ln_dir.join(format!("insts_{tag}_{PAD_M}x{KRES}.txt"));
+            if bf16 && xcl.exists() {
+                eprintln!("[npu] LN write pass = bf16 native-lane variant ({tag})");
+            }
             if xcl.exists() && ins.exists() {
                 let (kern, instr, n) = load_path(xcl, ins);
                 let gr = |i| kern.group_id(i).unwrap();

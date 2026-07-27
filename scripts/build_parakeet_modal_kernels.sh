@@ -63,6 +63,9 @@ make -C $LNML -f Makefile.cast       NPU2=1 rows=512 cols=1024 build/final_cast_
 echo "== RESIDENT-LN: FUSED ln+affine+cast (bf16 out) + f32-out twin 512x1024 =="
 make -C $LNML -f Makefile.lnaffcast   NPU2=1 rows=512 cols=1024 build/final_lnaffcast_512x1024.xclbin
 make -C $LNML -f Makefile.lnaffinef32 NPU2=1 rows=512 cols=1024 build/final_lnaffinef32_512x1024.xclbin
+# NATIVE-LANE (bf16 write pass) build of the SAME fused LN kernel -- 1.79x fewer cycles/row on device,
+# numerics-neutral over the encoder. Opt-in via PARAKEET_LN_BF16=1; separate xclbin, so bisectable.
+make -C $LNML -f Makefile.lnaffcastb  NPU2=1 rows=512 cols=1024 build/final_lnaffcastb_512x1024.xclbin
 # RESIDENT-CONV: GLU gate (conv-module step 2). a*sigmoid(g) over pw1's [T,2D] -> [T,D], cols=D=1024.
 echo "== RESIDENT-CONV: GLU 512x1024 =="
 make -C $LNML -f Makefile.glu        NPU2=1 rows=512 cols=1024 build/final_glu_512x1024.xclbin
@@ -89,7 +92,7 @@ echo "== RESIDENT-FFN: cast@4096 + K=4096 fc2 (identity) =="
 make -C $LNML -f Makefile.cast       NPU2=1 rows=512 cols=4096 build/final_cast_512x4096.xclbin
 WA_C_DEPTH=1 make -C $MMW -f Makefile.modal NPU2=1 M=512 K=4096 N=1024 m=64 k=32 n=128 n_aie_cols=8 \
   emulate_bfloat16_mmul_with_bfp16=1 bfp16_iree=1 no_silu=1 build/final_512x4096x1024_64x32x128_8c_modalid.xclbin
-for tag in ctxln_512x1024 affcast_512x1024 lnaffcast_512x1024 lnaffinef32_512x1024 cast_512x1024 cast_512x4096 glu_512x1024 accadd_512x1024 resadd_512x1024_s050 resadd_512x1024_s100 silu_1024x400; do
+for tag in ctxln_512x1024 affcast_512x1024 lnaffcast_512x1024 lnaffcastb_512x1024 lnaffinef32_512x1024 cast_512x1024 cast_512x4096 glu_512x1024 accadd_512x1024 resadd_512x1024_s050 resadd_512x1024_s100 silu_1024x400; do
   cp "$LNML/build/final_${tag}.xclbin" "$LNML/build/insts_${tag}.txt" "$LNDIR/"
 done
 cp "$MMW/build/final_512x4096x1024_64x32x128_8c_modalid.xclbin" "$MMW/build/insts_512x4096x1024_64x32x128_8c_modalid.txt" "$LNDIR/"

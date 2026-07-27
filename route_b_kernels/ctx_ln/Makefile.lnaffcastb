@@ -1,0 +1,38 @@
+##===- Makefile.lnaffcastb -----------------------------------------------===##
+#
+# Fused ctxLN + affine + cast, NATIVE-LANE (bf16) write pass. Same source and same design as
+# Makefile.lnaffcast; the ONLY difference is -DLN_BF16_WRITE=1, which swaps the write pass from
+# emulated-f32 elementwise (60 vector ops / 130 issue cycles per 16-lane chunk on this toolchain)
+# to bf16 operands into accfloat accumulators (9 ops / 27 cycles). The reductions are identical.
+#
+# Separate .o + separate xclbin tag on purpose: both variants coexist in one build dir so the
+# change is bisectable in minutes (Rust picks the variant via PARAKEET_LN_BF16).
+#
+#   make -f Makefile.lnaffcastb NPU2=1 rows=512 cols=1024 build/final_lnaffcastb_512x1024.xclbin
+#
+srcdir := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
+include ${srcdir}/../../makefile-common
+VPATH := ${srcdir}/../../../aie_kernels/aie2p
+
+devicename ?= $(if $(filter 1,$(NPU2)),npu2,npu)
+rows ?= 512
+cols ?= 1024
+tag = lnaffcastb_${rows}x${cols}
+
+aie_py_src = ln_affine_cast_iron.py
+
+all: build/final_${tag}.xclbin
+
+build/ln_affine_cast_b.o: ln_affine_cast.cc
+	mkdir -p ${@D}
+	cd ${@D} && ${PEANO_INSTALL_DIR}/bin/clang++ ${PEANOWRAP2P_FLAGS} -DLN_BF16_WRITE=1 -c $< -o ${@F}
+
+build/aie_${tag}.mlir: ${srcdir}/${aie_py_src}
+	mkdir -p ${@D}
+	python3 $< -d ${devicename} -r ${rows} -c ${cols} -t 0 -k ln_affine_cast_b.o > $@
+
+build/final_${tag}.xclbin: build/aie_${tag}.mlir build/ln_affine_cast_b.o
+	mkdir -p ${@D}
+	cd ${@D} && aiecc --aie-generate-xclbin --aie-generate-npu-insts --no-compile-host \
+		--no-xchesscc --no-xbridge --peano ${PEANO_INSTALL_DIR} \
+		--xclbin-name=${@F} --npu-insts-name=insts_${tag}.txt aie_${tag}.mlir
