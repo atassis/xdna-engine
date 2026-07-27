@@ -38,7 +38,7 @@ P = 2 * T - 1  # relative-position length (NeMo/Parakeet rel-pos)
 
 
 def build(dev, mono=False, TRIVIAL=False, relpos=False, bd_onchip=False, tactive_mask=False,
-          trace_size=0,
+          trace_size=0, trace_worker=0,
           p_resident=False, stream_io=False):
     if stream_io and not bd_onchip:
         raise SystemExit("--stream-io is a bd_onchip-path option (device-in/out taps on the 4-stage column)")
@@ -387,7 +387,16 @@ def build(dev, mono=False, TRIVIAL=False, relpos=False, bd_onchip=False, tactive
             # 4-stage pipeline, so H=1 is representative of the STAGE BALANCE -- it is NOT
             # representative of production wall time, where 4 heads share the shim.
             if trace_size:
-                rt.enable_trace(trace_size=trace_size, workers=wl[:4], egress_shim_col=1)
+                # ONE WORKER PER BUILD by default (`trace_worker`, 0=BD 1=scores 2=softmax 3=ctx).
+                # Tracing all four into a SHARED ring does not work here: the BD core emits ~10x the
+                # events of the others (22 tiles x 9 blocks = 198 bd_block_bake calls vs 22 calls per
+                # other stage), so it floods the ring, the other stages capture only 16-17 of their 22
+                # invocations, and BD itself yields ZERO complete event pairs. Measured, not guessed:
+                # at 64 KB the whole ring came back full with 0 decodable invocations on every core,
+                # and at 1 MB three stages decoded partially while BD still decoded nothing.
+                # trace_worker=-1 restores the all-four shared ring for comparison.
+                sel = wl[:4] if trace_worker < 0 else [wl[trace_worker]]
+                rt.enable_trace(trace_size=trace_size, workers=sel, egress_shim_col=1)
     else:
         # k, V are read-only weights. At real dims (T*DK bf16 = 44 KB) a depth-2 weight fifo blows the
         # 64 KB L1, so depth-1. Structure = the validated per-tile-acquire + stride-0 replay tap (the
@@ -493,6 +502,9 @@ ap.add_argument("--tactive-mask", dest="tactive_mask", action="store_true",
                 help="in-kernel t_active RTP key-mask on the bd_onchip scores stage (variable-length clips)")
 ap.add_argument("--p-resident", dest="p_resident", action="store_true",
                 help="[device-iterated] stage p once in a MemTile, re-stream on-chip (kills the 22x L3 re-read)")
+ap.add_argument("--trace-worker", type=int, default=0, dest="trace_worker",
+                help="which head-0 stage to trace: 0=BD 1=scores 2=softmax 3=ctx, -1=all four "
+                     "(shared ring; BD floods it -- see the note at the enable_trace call)")
 ap.add_argument("-t", "--trace_size", type=int, default=0, dest="trace_size",
                 help="non-zero enables per-stage IRON trace on head 0 (build with ATTN_HEADS=1; "
                      "trace egress needs a free shim channel). 0 = production, byte-identical.")
@@ -503,4 +515,4 @@ opts = ap.parse_args(sys.argv[1:])
 dev = NPU2() if opts.device == "npu2" else NPU1()
 print(build(dev, mono=opts.mono, TRIVIAL=opts.trivial, relpos=opts.relpos, bd_onchip=opts.bd_onchip,
             tactive_mask=opts.tactive_mask, p_resident=opts.p_resident, stream_io=opts.stream_io,
-            trace_size=opts.trace_size))
+            trace_size=opts.trace_size, trace_worker=opts.trace_worker))
