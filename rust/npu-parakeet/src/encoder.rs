@@ -216,6 +216,14 @@ impl FastConformerEncoder {
         )
     }
 
+    /// Snapshot of the per-kernel dispatch accounting, for differencing across a single encode.
+    /// The interleaved A/B harness diffs this before/after each clip so a tag's cost is attributed
+    /// to the ARM that ran it, which is what makes drift-cancelled comparison possible at all.
+    #[cfg(feature = "npu")]
+    pub fn npu_tag_snapshot(&self) -> std::collections::BTreeMap<&'static str, (usize, f64)> {
+        self.npu.as_ref().map(|n| n.stats.borrow().by_tag.clone()).unwrap_or_default()
+    }
+
     /// NPU timing breakdown (feature `npu`, NPU path only).
     #[cfg(feature = "npu")]
     pub fn npu_stats_string(&self) -> Option<String> {

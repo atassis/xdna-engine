@@ -2374,17 +2374,25 @@ impl NpuMatmul {
         let __d0 = std::time::Instant::now();
         glu.kern.run_matmul8(3, &glu.instr, glu.n, &st.bo_c, &glu.bo_out, &glu.dummy_c, &glu.dummy_tmp, &glu.dummy_tr).unwrap();
         self.note_dispatch_tag(__d0, 2, "conv_pw1_glu_dev"); // pw1 + glu
-        glu.bo_out.sync_from_device().unwrap();
-        let mut cb = vec![0u8; m * KRES * 4];
-        glu.bo_out.read_bytes(&mut cb).unwrap();
-        let mut out = Array2::<f32>::zeros((m, KRES));
-        for r in 0..m {
-            for c in 0..KRES {
-                let off = (r * KRES + c) * 4;
-                out[[r, c]] = f32::from_le_bytes([cb[off], cb[off + 1], cb[off + 2], cb[off + 3]]);
+        // THE CONV-MIDDLE HOST EXCURSION, first half. This is where the "full-NPU" rail stops being
+        // full-NPU: the GLU result is read back and unpacked into a host ndarray so the host can run
+        // dwconv+SiLU, then repacked and re-uploaded by matmul_id_to_bo. 24 round-trips per clip,
+        // through the MIDDLE of the residual stream. Labelled because it was invisible: prof::time
+        // wrapped only the dwconv itself, so the readback and this scalar m*KRES unpack loop were
+        // charged to nothing and landed in the unexplained wall-clock residual.
+        crate::prof::time("conv_readback", || {
+            glu.bo_out.sync_from_device().unwrap();
+            let mut cb = vec![0u8; m * KRES * 4];
+            glu.bo_out.read_bytes(&mut cb).unwrap();
+            let mut out = Array2::<f32>::zeros((m, KRES));
+            for r in 0..m {
+                for c in 0..KRES {
+                    let off = (r * KRES + c) * 4;
+                    out[[r, c]] = f32::from_le_bytes([cb[off], cb[off + 1], cb[off + 2], cb[off + 3]]);
+                }
             }
-        }
-        Some(out)
+            Some(out)
+        })
     }
 
     /// Host-in -> DEVICE-OUT matmul: A[m,KRES] @ W[KRES,n] -> C[m,n] f32 left in a FRESH device BO (no
@@ -2408,12 +2416,17 @@ impl NpuMatmul {
         // and flows into the next seam (residual -> conv front) which processes all PAD_M rows -- garbage
         // padding then corrupts valid rows sharing a partial m-tile. Zero input padding -> zero output
         // padding (0 @ W = 0), matching the host path's clean zero-padding invariant.
-        let a_std = a.as_standard_layout();
-        let a_s = a_std.as_slice().unwrap();
-        let mut a_bits = vec![0u16; PAD_M * KRES]; // rows m..PAD_M stay zero
-        npu_xrt::pack_f32_to_bf16(&a_s[..m * KRES], &mut a_bits[..m * KRES]);
-        self.bo_a.write_bytes(u16_bytes(&a_bits)).unwrap();
-        self.bo_a.sync_to_device().unwrap();
+        // Second half of the host excursion (see conv_readback): pack the host ndarray back to bf16 and
+        // re-upload. Charged to pack_a_s already, but that bucket is invisible in the host profile, so
+        // label it too -- the conv middle's real cost is readback + dwconv + THIS, not just the dwconv.
+        crate::prof::time("conv_reupload", || {
+            let a_std = a.as_standard_layout();
+            let a_s = a_std.as_slice().unwrap();
+            let mut a_bits = vec![0u16; PAD_M * KRES]; // rows m..PAD_M stay zero
+            npu_xrt::pack_f32_to_bf16(&a_s[..m * KRES], &mut a_bits[..m * KRES]);
+            self.bo_a.write_bytes(u16_bytes(&a_bits)).unwrap();
+            self.bo_a.sync_to_device().unwrap();
+        });
         // GEMM into a FRESH device f32 BO (identity modal, NO read).
         let out = self.dev.alloc_bo(&self.kern, PAD_M * n * 4, FLAG_HOST_ONLY, self.kern.group_id(5).unwrap()).unwrap();
         let st = self.stream(n, Act::Identity);
