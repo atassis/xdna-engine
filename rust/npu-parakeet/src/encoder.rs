@@ -405,6 +405,32 @@ impl FastConformerEncoder {
         let b = self.w.block(blk);
         let npu = self.npu.as_ref().expect("mhsa_dev without npu");
         let d = self.cfg.hidden;
+        // FULL DEVICE-IN/OUT interior (opt-in PARAKEET_MHSA_DEV_IO=1): q/k/v never come back to host
+        // and ctx never goes back up -- the BD-onchip conveyor's --stream-io taps read the GEMM
+        // outputs in place and drain ctx straight into linear_out's A. This deletes the last host
+        // excursion in the fused block's residual stream. Falls through to the read-back path below
+        // when the artifacts/conveyor_bd_io xclbin is absent, so an unbuilt tree still runs.
+        if std::env::var("PARAKEET_MHSA_DEV_IO").is_ok() && npu.conveyor_bd_io_available() {
+            prof::phase::set_stage("mhsa_pos");
+            let id_pos = format!("{blk}.pos");
+            let pm = self.mm_checkpoint(pos_enc, b, "self_attn.linear_pos.weight", &id_pos)
+                .unwrap_or_else(|| self.mm_lazy(pos_enc, || b.m("self_attn.linear_pos.weight"), &id_pos));
+            let (ubias, vbias) = (b.m("self_attn.pos_bias_u"), b.m("self_attn.pos_bias_v"));
+            prof::phase::set_stage("mhsa_devio");
+            let ctx_bo = npu.relpos_mha_conveyor_bdonchip_dev(
+                satt_bo, m,
+                || b.m("self_attn.linear_q.weight"), &format!("{blk}.q"),
+                || b.m("self_attn.linear_k.weight"), &format!("{blk}.k"),
+                || b.m("self_attn.linear_v.weight"), &format!("{blk}.v"),
+                &pm, &ubias, &vbias, self.cfg.n_heads,
+            );
+            if let Some(ctx_bo) = ctx_bo {
+                // linear_out device-in (A = the bf16 ctx BO) and device-out, same f32 [PAD_M,D]
+                // contract the host-in path's matmul_id_to_bo returns, so the MHSA residual is unchanged.
+                prof::phase::set_stage("mhsa_qkv");
+                return npu.proj_from_bf16_to_bo(&ctx_bo, m, || b.m("self_attn.linear_out.weight"), &format!("{blk}.out"), d);
+            }
+        }
         prof::phase::set_stage("mhsa_qkv");
         let q = npu.proj_from_bf16(satt_bo, m, || b.m("self_attn.linear_q.weight"), &format!("{blk}.q"), d);
         prof::phase::set_stage("mhsa_qkv");
@@ -577,6 +603,22 @@ impl FastConformerEncoder {
             }
         }
 
+        // BD-ONCHIP CONVEYOR MHA (opt-in PARAKEET_CONVEYOR_MHA_BDONCHIP=1): the WIN variant -- same
+        // 1-dispatch/block conveyor but BD = rel_shift((q+v[h])@p^T) is computed ON-CHIP (4th stage),
+        // deleting the host BD precompute that made PARAKEET_CONVEYOR_MHA +19%. Needs the BD-onchip
+        // xclbin (scripts/conveyor_bd_prebuild.sh --tactive-mask); falls back to the host score path
+        // when the artifact is absent (relpos_mha_conveyor_bdonchip panics on load -> keep unset until
+        // built). Checked BEFORE the host-BD conveyor so it wins when both flags are set.
+        #[cfg(feature = "npu")]
+        if std::env::var("PARAKEET_CONVEYOR_MHA_BDONCHIP").is_ok() {
+            if let Some(npu) = &self.npu {
+                let _h = PhaseScope::new("mhsa_conveyor_bd", Bucket::Npu);
+                let ctx = npu.relpos_mha_conveyor_bdonchip(q, k, v, pm, &ubias, &vbias, h);
+                prof::phase::set_stage("mhsa_qkv");
+                return ctx; // merged [T,D]; linear_out applied by the caller (mhsa / mhsa_dev)
+            }
+        }
+
         // CONVEYOR MHA (opt-in PARAKEET_CONVEYOR_MHA=1): replace the per-head relpos_mha LOOP (8
         // dispatches) with ONE 8-head conveyor dispatch. The host packs the query belt (qu = q+u[h];
         // BD_shifted = rel_shift((q+v[h]) @ p^T), carriage per PARAKEET_CONVEYOR_BD -- default plain,
@@ -668,6 +710,18 @@ impl FastConformerEncoder {
     /// `precomputed_glu`: Some when the caller (the fused seam) already ran the conv front DEVICE-IN
     /// (LN->pw1->GLU from a device BO) -- then the resident/host front here is skipped and the rest of
     /// the module (dwconv->silu->pw2) continues from it. None = the normal self-contained conv module.
+    /// The conv module's pw2 tail, split out so a caller that already has the dwconv+SiLU output
+    /// (the device-in conv seam) can finish the module without re-entering the LN/pw1/GLU/dwconv
+    /// chain. Byte-identical to `conv_module`'s own tail.
+    fn conv_pw2(&self, back: &Array2<f32>, blk: usize) -> Array2<f32> {
+        let b = self.w.block(blk);
+        prof::phase::set_stage("conv_pw");
+        self.mm_lazy(back, || {
+            let _wp = PhaseScope::new("conv_wprep", Bucket::Marshal);
+            b.m3("conv.pointwise_conv2.weight").index_axis(Axis(2), 0).to_owned().t().to_owned()
+        }, &format!("{blk}.pw2"))
+    }
+
     fn conv_module(&self, x: &Array2<f32>, blk: usize, precomputed_glu: Option<Array2<f32>>) -> Array2<f32> {
         let b = self.w.block(blk);
         let d = self.cfg.hidden;
@@ -944,6 +998,26 @@ impl FastConformerEncoder {
                     // round-trip between MHSA and conv); returns the host GLU output for the conv rest.
                     let conv_g = b.v("norm_conv.weight");
                     let conv_b = b.v("norm_conv.bias");
+                    // CONV-MIDDLE device-in (opt-in PARAKEET_CONV_DEV_IO=1): carry the frontier past GLU
+                    // to the dwconv+SiLU output, so the GLU readback AND the dwconv re-upload both
+                    // dissolve (the cast that the bf16 dtype change needs anyway also does the 'same'
+                    // top pad). pw2 onward stays host. Unset / bricks absent -> the GLU hand-off below.
+                    let dw_dev = if std::env::var("PARAKEET_CONV_DEV_IO").is_ok() {
+                        let dw3 = b.m3("conv.depthwise_conv.weight");
+                        let taps = dw3.index_axis(Axis(1), 0).to_owned();
+                        let dwb = b.v("conv.depthwise_conv.bias");
+                        npu.resident_conv_pw1_glu_dw_dev(&conv_in_bo, m, conv_g.as_slice().unwrap(), conv_b.as_slice().unwrap(),
+                            || b.m3("conv.pointwise_conv1.weight").index_axis(Axis(2), 0).to_owned().t().to_owned(),
+                            &format!("{blk}.pw1"), &taps, &dwb)
+                    } else { None };
+                    let glu = if dw_dev.is_some() { None } else {
+                        npu.resident_conv_pw1_glu_dev(&conv_in_bo, m, conv_g.as_slice().unwrap(), conv_b.as_slice().unwrap(),
+                            || b.m3("conv.pointwise_conv1.weight").index_axis(Axis(2), 0).to_owned().t().to_owned(), &format!("{blk}.pw1"))
+                    };
+                    // T6 BLOCK CLOSE (device all the way to the block exit). Taken only when the conv
+                    // middle did NOT go device-side, because `conv_module_to_bo` continues from the HOST
+                    // `glu` array. Running BOTH -- a device dwconv+SiLU output feeding a device pw2 --
+                    // is the remaining seam (task 7c), not something this merge can assume.
                     let glu = npu.resident_conv_pw1_glu_dev(&conv_in_bo, m, conv_g.as_slice().unwrap(), conv_b.as_slice().unwrap(),
                         || b.m3("conv.pointwise_conv1.weight").index_axis(Axis(2), 0).to_owned().t().to_owned(), &format!("{blk}.pw1"));
                     // ---- T6: conv rest -> conv residual -> FFN2 -> Macaron residual -> block-exit LN ----
@@ -979,7 +1053,11 @@ impl FastConformerEncoder {
                     }
                     // rejoin host: x = (x + 0.5*ff1) + mhsa_out (the conv residual base), then conv rest / FFN2 / out.
                     let mut x = npu.readback_stream(&conv_in_bo, m);
-                    let conv_out = prof::time("conv_mod", || self.conv_module(&x, blk, glu));
+                    let conv_out = match dw_dev {
+                        // dwconv+SiLU already done on device -> only the pw2 chain remains.
+                        Some(back) => prof::time("conv_mod", || self.conv_pw2(&back, blk)),
+                        None => prof::time("conv_mod", || self.conv_module(&x, blk, glu)),
+                    };
                     x = &x + &conv_out;
                     let ff2 = prof::time("ff", || self.feed_forward(&x, b, blk, "ff2", "norm_feed_forward2.weight", "norm_feed_forward2.bias",
                                                 "feed_forward2.linear1.weight", "feed_forward2.linear2.weight"));
