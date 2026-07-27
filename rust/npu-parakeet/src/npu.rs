@@ -1465,6 +1465,44 @@ impl NpuMatmul {
             && self.resident_ln().map(|rl| rl.lnaffinef32.is_some()).unwrap_or(false)
     }
 
+    /// Isolation gate for the f32-out block-exit LN. Uploads synthetic x to a device BO, runs
+    /// [`Self::ln_affine_f32_dev`], reads the f32 result back, compares to host `ops::layernorm`.
+    /// f32 out (no bf16 narrowing) so this should be TIGHTER than the bf16 sibling's 5e-3 -- if it is
+    /// not, the kernel is wrong, which is the first thing to rule out before blaming the seam.
+    pub fn ln_affine_f32_selftest(&self, t: usize, seed: u64) -> Option<(Array2<f32>, Array2<f32>)> {
+        let rl = self.resident_ln()?;
+        rl.lnaffinef32.as_ref()?;
+        let fill = |rows: usize, cols: usize, sd: u64, sc: f32| -> Array2<f32> {
+            let mut s = sd.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            Array2::from_shape_fn((rows, cols), |_| {
+                s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                let mut z = s;
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                z ^= z >> 31;
+                let u = (z >> 40) as f32 / (1u32 << 24) as f32;
+                (u * 2.0 - 1.0) * sc
+            })
+        };
+        let x = fill(t, KRES, seed, 1.0);
+        let gv: Vec<f32> = fill(1, KRES, seed ^ 0x1A, 1.0).iter().copied().collect();
+        let bv: Vec<f32> = fill(1, KRES, seed ^ 0x2B, 0.1).iter().copied().collect();
+        let a_bo = self.upload_stream(&x);
+        let out_bo = self.ln_affine_f32_dev(&a_bo, &gv, &bv)?;
+        out_bo.sync_from_device().unwrap();
+        let mut cb = vec![0u8; t * KRES * 4];
+        out_bo.read_bytes(&mut cb).unwrap();
+        let mut dev = Array2::<f32>::zeros((t, KRES));
+        for r in 0..t {
+            for c in 0..KRES {
+                let off = (r * KRES + c) * 4;
+                dev[[r, c]] = f32::from_le_bytes([cb[off], cb[off + 1], cb[off + 2], cb[off + 3]]);
+            }
+        }
+        let host = crate::ops::layernorm(&x, &Array1::from(gv), &Array1::from(bv));
+        Some((host, dev))
+    }
+
     /// Block-EXIT LN, f32 device-out: affine_LN(a_bo) -> a device f32 [PAD_M,KRES] BO that the NEXT
     /// block consumes directly. One dispatch. `None` when the f32-out xclbin is absent.
     pub fn ln_affine_f32_dev(&self, a_bo: &Bo, gamma: &[f32], beta: &[f32]) -> Option<Rc<Bo>> {

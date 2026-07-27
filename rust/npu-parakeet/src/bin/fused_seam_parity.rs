@@ -83,6 +83,34 @@ fn main() {
             assert!(l2_rel <= 5e-3, "ln device-in parity FAILED: rel-L2 {l2_rel:.3e} > 5e-3");
             println!("[fused_seam_parity] PASS (rel-L2 <= 5e-3)");
         }
+        "lnf32" => {
+            let (host, dev) = npu.ln_affine_f32_selftest(t, seed).unwrap_or_else(|| {
+                panic!("[fused_seam_parity] lnf32: lnaffinef32 xclbin absent -- build \
+                        Makefile.lnaffinef32 (final_lnaffinef32_512x1024)");
+            });
+            let (max_rel, l2_rel) = rel_err(&host, &dev);
+            println!("[fused_seam_parity] seam=lnf32 t={t} seed={seed}  max_rel={max_rel:.3e} rel-L2={l2_rel:.3e}");
+            // pattern dump: is it garbage, scaled, shifted, or only some lanes?
+            for r in [0usize, 1] {
+                let h: Vec<String> = (0..8).map(|c| format!("{:+.4}", host[[r, c]])).collect();
+                let d: Vec<String> = (0..8).map(|c| format!("{:+.4}", dev[[r, c]])).collect();
+                println!("  row{r} host {}", h.join(" "));
+                println!("  row{r} dev  {}", d.join(" "));
+            }
+            let bad: usize = (0..host.nrows()).filter(|&r| (0..host.ncols()).any(|c| (host[[r,c]]-dev[[r,c]]).abs() > 1e-3)).count();
+            println!("  rows with any |err|>1e-3: {bad}/{}", host.nrows());
+            let badrows: Vec<usize> = (0..host.nrows()).filter(|&r| (0..host.ncols()).any(|c| (host[[r,c]]-dev[[r,c]]).abs() > 1e-3)).collect();
+            println!("  bad row indices: {:?}", &badrows[..badrows.len().min(24)]);
+            // are the bad rows zero, stale, or shifted copies of another row?
+            if let Some(&r0) = badrows.first() {
+                let d: Vec<String> = (0..6).map(|c| format!("{:+.4}", dev[[r0, c]])).collect();
+                let h: Vec<String> = (0..6).map(|c| format!("{:+.4}", host[[r0, c]])).collect();
+                println!("  first bad row {r0}: dev {} | host {}", d.join(" "), h.join(" "));
+            }
+            // f32 out, no narrowing -> should beat the bf16 sibling's 5e-3 comfortably.
+            assert!(l2_rel <= 1e-5, "ln f32 device-out parity FAILED: rel-L2 {l2_rel:.3e} > 1e-5");
+            println!("[fused_seam_parity] PASS (rel-L2 <= 1e-5)");
+        }
         "linout" => {
             let (host, dev) = npu.linout_selftest(t, seed).expect("linout_selftest: modal absent");
             let (max_rel, l2_rel) = rel_err(&host, &dev);
