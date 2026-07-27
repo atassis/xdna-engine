@@ -101,6 +101,19 @@ cp "$RB/ctx_ln/affine_cast_iron.py"   "$PE/ml/layernorm/affine_cast_iron.py"
 cp "$RB/ctx_ln/Makefile.affinecast"   "$PE/ml/layernorm/Makefile.affinecast"
 cp "$RB/ctx_ln/deint_cast_iron.py"   "$PE/ml/layernorm/deint_cast_iron.py"
 cp "$RB/ctx_ln/Makefile.deint"        "$PE/ml/layernorm/Makefile.deint"
+# FUSED LN+affine+cast in ONE kernel (device-in LN seam; replaces the ctxLN->affcast two-xclbin chain)
+# and its f32-out twin (the BLOCK-EXIT LN the next block consumes directly). Both were authored
+# straight into the mlir-aie sandbox and lived there UNTRACKED -- lnaffcast is load-bearing for the
+# fused path, so a sandbox wipe would have made the shipped-candidate config unbuildable.
+cp "$RB/aie_kernels/ln_affine_cast.cc" "$K/ln_affine_cast.cc"
+cp "$RB/ctx_ln/ln_affine_cast_iron.py" "$PE/ml/layernorm/ln_affine_cast_iron.py"
+cp "$RB/ctx_ln/Makefile.lnaffcast"     "$PE/ml/layernorm/Makefile.lnaffcast"
+cp "$RB/ctx_ln/Makefile.lnaffcasttr"   "$PE/ml/layernorm/Makefile.lnaffcasttr"
+cp "$RB/aie_kernels/ln_affine_f32.cc"  "$K/ln_affine_f32.cc"
+cp "$RB/ctx_ln/ln_affine_f32_iron.py"  "$PE/ml/layernorm/ln_affine_f32_iron.py"
+cp "$RB/ctx_ln/Makefile.lnaffinef32"   "$PE/ml/layernorm/Makefile.lnaffinef32"
+# per-op trace harness (method-profile-a-brick-with-enable-trace); thin wrapper over DefaultNPURuntime
+cp "$RB/ctx_ln/trace_brick.py"         "$PE/ml/layernorm/trace_brick.py"
 # device-side GLU (conv-module gate step): a*sigmoid(g) over pw1's [T,2D] -> [T,D]
 cp "$RB/aie_kernels/glu.cc"           "$K/glu.cc"
 cp "$RB/ctx_ln/glu_iron.py"           "$PE/ml/layernorm/glu_iron.py"
