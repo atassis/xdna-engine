@@ -52,7 +52,16 @@ static constexpr int VL = 16;
 #define ATTN_MMUL 1
 #endif
 #if ATTN_MMUL
+// r follows the FORMAT, because the two are the same decision. With
+// -DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16 the bf16 mac dims become (8,8,8) and mmul lowers to the
+// native 512-MAC bfp16 VMAC; without it they are (4,8,8) and it lowers to emulated vmac.f. r=8 needs
+// m % (2*r) == 0, i.e. TQ=16 -- which is why the bfp16 brick and the two-query-tile pairing are one
+// change, not two. TQ=16/N_QT=11 keeps N_QT*TQ = 176 = T, so the pairing costs no restructuring.
+#ifdef AIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16
+static constexpr int MM_R = 8, MM_S = 8, MM_T = 8;
+#else
 static constexpr int MM_R = 4, MM_S = 8, MM_T = 8;
+#endif
 
 // WHERE THE TILING HAPPENS, and why it is not here.
 // mm.cc wants A as r x s tiles and (with b_row_maj=false) B as t x s tiles, the tiles themselves in
