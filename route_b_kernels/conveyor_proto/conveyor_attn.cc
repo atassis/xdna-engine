@@ -475,6 +475,22 @@ static inline void mm_jpair(const bfloat16 *__restrict q_tiled,
   const bfloat16 *__restrict pA2 = q_tiled + (1u * colA) * MMUL::size_A;
   const bfloat16 *__restrict pB1 = kblk;
   const bfloat16 *__restrict pB2 = kblk + colA * MMUL::size_B;
+#if ATTN_MMUL_REF
+  // BISECT: scalar dot over the SAME pointers and the SAME assumed tile layout. If this passes and
+  // the vector path fails, mm_jpair is wrong; if both fail, the operand LAYOUT (the DMA tap) is.
+  for (unsigned zz = 0; zz < 2; zz++)
+    for (unsigned jj = 0; jj < 2; jj++)
+      for (int rr = 0; rr < MM_R; rr++)
+        for (int tt = 0; tt < MM_T; tt++) {
+          float acc = 0.f;
+          for (unsigned c = 0; c < colA; c++)
+            for (int ss = 0; ss < MM_S; ss++)
+              acc += (float)q_tiled[((zz * colA + c) * MM_R + rr) * MM_S + ss] *
+                     (float)kblk[((jj * colA + c) * MM_T + tt) * MM_S + ss];
+          scores[((zz * colB + 2 * jp + jj) * MM_R + rr) * MM_T + tt] = acc;
+        }
+  return;
+#endif
   aie::vector<bfloat16, MMUL::size_A> A0, A1;
   aie::vector<bfloat16, MMUL::size_B> B0, B1;
   MMUL C00; MMUL C01; MMUL C10; MMUL C11;
@@ -664,13 +680,24 @@ extern "C" void stage_scores_mmul_block(const bfloat16 *__restrict qbd,
 #endif // ATTN_MMUL
 
 // Unmasked twin (t_active == T), for the no-mask build.
+extern "C" void stage_scores_mmul_block(const bfloat16 *, const bfloat16 *, float *);
 extern "C" void stage_scores_relpos_bd_mmul(const bfloat16 *__restrict qbd,
                                             const bfloat16 *__restrict ktiled,
                                             float *__restrict scores) {
   // Route to the PROVEN whole-k body (t_active = T is the unmasked case). Previously this called
   // the hand-written non-blocked variant, which fails parity at 1.06 and is now unreferenced.
-  const int32_t rtp_full[1] = {ATTN_T};
-  stage_scores_relpos_bd_mask_mmul_whole(qbd, ktiled, scores, rtp_full);
+  // Delegate to the PROVEN blocked entry, once per j-pair. Its static jp counter tiles q on the
+  // first call and runs the epilogue on the last, and NBLK calls wrap it cleanly -- so a whole-k
+  // dispatch is exactly NBLK blocked calls with the pointer walked forward.
+  //
+  // NOT via mm_jpair: that helper was written out as "the same" code and is NOT -- with it the
+  // device-in gate fails at 1.286e-01 while a scalar dot over the identical pointers and layout
+  // passes at 4.39370e-03, which pins the fault inside those ~15 lines of vector code and clears
+  // the tap, the q tiling and the epilogue. Left in place, unused, for that diagnosis.
+  constexpr unsigned colA_ = ATTN_DK / MM_S;
+  constexpr unsigned NBLK_ = (ATTN_T / MM_T) / 2;
+  for (unsigned jp = 0; jp < NBLK_; jp++)
+    stage_scores_mmul_block(qbd, ktiled + jp * 2u * colA_ * (MM_S * MM_T), scores);
 }
 #endif // ATTN_MMUL
 
