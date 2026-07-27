@@ -912,7 +912,10 @@ impl FastConformerEncoder {
             let dw3 = b.m3("conv.depthwise_conv.weight"); // [D, 1, 9]
             (dw3.index_axis(Axis(1), 0).to_owned(), b.v("conv.depthwise_conv.bias"))
         };
-        let back = self.conv_dwconv_silu(glu, &taps, &dwb);
+        // The conv middle is the fused rail's surviving HOST excursion: pw1+GLU returns an ndarray,
+        // dwconv+SiLU run on x86, then pw2 re-uploads. Labelled so it shows in the host profile --
+        // previously only the inner `dwconv` was, which understated the excursion.
+        let back = prof::time("conv_dw_silu", || self.conv_dwconv_silu(glu, &taps, &dwb));
         prof::phase::set_stage("conv_pw");
         Some(npu.matmul_id_to_bo(&back, || {
             let _wp = PhaseScope::new("conv_wprep", Bucket::Marshal);
@@ -940,18 +943,23 @@ impl FastConformerEncoder {
         // COLLAPSE 1 of the one-xclbin-per-block work: `resadd(0.5) -> satt LN` is ONE command, with
         // the intermediate residual handed core-to-core on-chip instead of through DDR.
         //
-        // OPT-IN (`PARAKEET_RESADD_LN=1`), NOT default, and the reason is measured rather than
-        // cautious: the fused brick is correct (isolation gate 6/6, rel-L2 1.65e-3) and does delete
-        // exactly 1 command per block, but it is a WASH -- 2.4 ms/clip. The shim DMA budget forced it
-        // to 4 columns instead of 8 (a, b in + sum, out out already fills a column's 2+2 channels, and
-        // gb needs a fifth), so it runs at HALF the parallelism, and that gives back almost exactly
-        // what the on-chip hand-off saves: 1.76 ms/command fused vs 1.86 ms for the pair it replaces.
-        // Turning it on by default would trade a real halving of column count for a 5% saving.
+        // OPT-IN (`PARAKEET_RESADD_LN=1`). The 4-column shim-budget wash is FIXED: `a`(8) + `b`(8) +
+        // `gb`(1) = 17 shim MM2S against the 16 the array has (AIE2 gives each ShimNOC 2 in/2 out and
+        // NPU2 has 8 columns -- silicon, checked in AIETargetModel, not a placer limit), so the first
+        // build fell to 4 columns = half the cores. resadd_ln_iron.py now stages ONE core pair's `a`
+        // through a MemTile split(), which costs 7 channels instead of 8 and fits at 16 exactly; each
+        // pair is also pinned to its own column so all 8 columns carry compute.
         //
-        // THE FIX IS KNOWN: put gamma/beta in a host-written L1 buffer instead of a DMA input --
-        // an RTP is an L1 address, not a DMA channel ([[rtp-slot-not-dma-channel-for-runtime-params]],
-        // and mm_silu_epilogue.cc already does exactly this for its mode select). That frees the fifth
-        // channel, the design goes back to 8 columns, and the collapse should pay properly.
+        // NOT the RTP fix this comment used to prescribe. An RTP is indeed an L1 address rather than a
+        // DMA channel, but aie/dialects/aie.py emits ONE npu_write_rtp per INDEX and rejects slicing,
+        // so a [2*KRES] gamma|beta costs 2048 write32 per LN core -- ~200 KB of instruction stream per
+        // command on a brick whose whole point is deleting bytes. mm_silu_epilogue.cc's RTP carries one
+        // i32 mode word; that precedent does not extend to 8 KB.
+        //
+        // Measured, same session, drift-normalised against the untouched kernels: 1.899 ms/command vs
+        // 2.328 for the resadd+ln_affcast pair it replaces (was a wash at 4 columns). Still OPT-IN
+        // because at ~0.43 ms x 1 site x 24 blocks it is ~9 ms/clip, inside the wall-clock noise --
+        // it pays properly only once the other sites fold too.
         let fused_rl = std::env::var("PARAKEET_RESADD_LN").map(|v| v == "1").unwrap_or(false);
         let (x_bo, satt_bo) = match fused_rl
             .then(|| npu.resadd_ln_dev(a_bo, &ff1_bo, 0.5, satt_g.as_slice().unwrap(), satt_b.as_slice().unwrap()))

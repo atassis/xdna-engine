@@ -72,4 +72,20 @@ fn main() {
         println!("{s}");
     }
     println!("host profile (desc by time):\n{}", npu_parakeet::prof::report());
+    // PHASE SPLIT (PARAKEET_PHASE_TIMING=1). encoder.rs already brackets every stage with a
+    // PhaseScope, but nothing printed the accumulator, so the Npu/Host/Marshal attribution the
+    // instrumentation exists to produce was invisible -- and `prof::report()` above only covers the
+    // two labels wrapped in prof::time (subsample, dwconv), which leaves most of the wall
+    // unattributed. Same failure mode as the untimed dispatch sites: the instrument was there and
+    // not being read.
+    if npu_parakeet::prof::phase::timing_on() {
+        let r = npu_parakeet::prof::phase::report(std::time::Duration::from_secs_f64(total));
+        println!(
+            "\nphase split over {n} clips: e2e={:.0}ms npu={:.0}ms host={:.0}ms marshal={:.0}ms residual={:.0}ms overlap={:.0}ms",
+            r.e2e_ms, r.npu_ms, r.host_ms, r.marshal_ms, r.residual_ms, r.overlap_ms
+        );
+        for (stage, bucket, ms, calls) in r.rows.iter().take(24) {
+            println!("  {stage:22} {:8} {ms:8.1}ms  x{calls}", format!("{bucket:?}"));
+        }
+    }
 }

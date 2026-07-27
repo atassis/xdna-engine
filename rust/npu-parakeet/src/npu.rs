@@ -860,9 +860,7 @@ impl NpuMatmul {
             };
             let t0 = Instant::now();
             ck.kern.run_bd_conveyor(3, &ck.bo_instr, ck.n_instr, aq, &ck.bo_p, ak, av, ac).unwrap();
-            let mut st = self.stats.borrow_mut();
-            st.dispatch_s += t0.elapsed().as_secs_f64();
-            st.dispatches += 1;
+            self.note_dispatch_tag(t0, 1, "conveyor_bd_dev");
         }
         Some(ck.bo_ctx.clone())
     }
@@ -1009,11 +1007,7 @@ impl NpuMatmul {
         rk.bo_kpv.sync_to_device().unwrap();
         rk.kern.run_dwconv6(3, &rk.bo_instr, rk.n_instr, &rk.bo_quv, &rk.bo_kpv, &rk.bo_ctx).unwrap();
         rk.bo_ctx.sync_from_device().unwrap();
-        {
-            let mut s = self.stats.borrow_mut();
-            s.dispatch_s += t0.elapsed().as_secs_f64();
-            s.dispatches += 1;
-        }
+        self.note_dispatch_tag(t0, 1, "relpos_batched");
         let mut cb = vec![0u8; h * rk.ctx_rows * RELPOS_DK * 2];
         rk.bo_ctx.read_bytes(&mut cb).unwrap();
         // Unpack: head hh's ctx (first t of ctx_rows) -> columns [hh*DK..(hh+1)*DK] of [t, D].
@@ -1235,11 +1229,7 @@ impl NpuMatmul {
         ck.bo_v.sync_to_device().unwrap();
         ck.kern.run_mha(3, &ck.bo_instr, ck.n_instr, &ck.bo_q, &ck.bo_k, &ck.bo_v, &ck.bo_ctx).unwrap();
         ck.bo_ctx.sync_from_device().unwrap();
-        {
-            let mut s = self.stats.borrow_mut();
-            s.dispatch_s += t0.elapsed().as_secs_f64();
-            s.dispatches += 1;
-        }
+        self.note_dispatch_tag(t0, 1, "mha_conveyor");
         // ---- de-interleave bo_ctx -> merged ctx [t, H*DK] (run_conveyor_attn.py 88-96) ----
         // Heads group by CONV_GJ; each group drains contiguously as [N_QT, gsz, TQ, DK]. Per group,
         // element (qt,i,r,d) lives at group_base + (((qt*gsz + i)*TQ + r)*DK + d); it maps to head
@@ -1403,11 +1393,7 @@ impl NpuMatmul {
             ck.bo_v.sync_to_device().unwrap();
             ck.kern.run_bd_conveyor(3, &ck.bo_instr, ck.n_instr, &ck.bo_qpv, &ck.bo_p, &ck.bo_k, &ck.bo_v, &ck.bo_ctx).unwrap();
             ck.bo_ctx.sync_from_device().unwrap();
-            {
-                let mut s = self.stats.borrow_mut();
-                s.dispatch_s += t0.elapsed().as_secs_f64();
-                s.dispatches += 1;
-            }
+            self.note_dispatch_tag(t0, 1, "conveyor_bd_host");
             // de-interleave: head-major ctx, head slot at slot*n_qt*TQ*DK, row = qt*TQ+r (take [0,t)).
             let mut cb = vec![0u8; hb * n_qt * CONV_TQ * dk * 2];
             ck.bo_ctx.read_bytes(&mut cb).unwrap();
@@ -2779,11 +2765,12 @@ impl NpuMatmul {
             })
         };
         let st1 = self.stream(DFF, Act::Silu); // fc1 on-chip SiLU iff modal (plain resident ignores it)
+        let __d0 = std::time::Instant::now();
         self.kern.run_matmul8(3, &st1.instr, st1.n_instr, &rl.bo_bf16, &w1, &st1.bo_c, &self.bo_tmp, &self.bo_tr).unwrap();
+        self.note_dispatch_tag(__d0, 1, "fc1_n4096");
         // ONE-DISPATCH K=DFF fc2 (opt-in): cast@DFF -> K=DFF modal -> readback to host [m,KRES].
         if self.fc2_k4096_on() {
             if let Some(k4) = rl.fc2_k4096.as_ref() {
-                self.stats.borrow_mut().dispatches += 1; // fc1
                 let bo = self.fc2_k4096_dev(k4, &st1.bo_c, make_w2, id2);
                 bo.sync_from_device().unwrap();
                 let mut cb = vec![0u8; m * KRES * 4];
@@ -2855,7 +2842,9 @@ impl NpuMatmul {
         // Ported to the Act enum that `stream()` took on in the k768 rail merge; matches the f32
         // sibling `resident_ffn` exactly (was `self.modal` under the old bool API).
         let st1 = self.stream(DFF, Act::Silu); // fc1 on-chip SiLU iff modal (plain resident ignores it)
+        let __d0 = std::time::Instant::now();
         self.kern.run_matmul8(3, &st1.instr, st1.n_instr, &rl.bo_bf16, &w1, &st1.bo_c, &self.bo_tmp, &self.bo_tr).unwrap();
+        self.note_dispatch_tag(__d0, 1, "fc1_n4096");
         let __d0 = std::time::Instant::now();
         rl.deint_kern.run_matmul8(3, &rl.deint_instr, rl.deint_n, &st1.bo_c, &rl.bo_deint, &rl.deint_c, &rl.deint_tmp, &rl.deint_tr).unwrap();
         self.note_dispatch_tag(__d0, 2, "resident_ffn_bf16"); // fc1 + deint
@@ -2882,8 +2871,12 @@ impl NpuMatmul {
     /// must already hold `bo_bf16 = affine_LN(input)` (from `ln_affine_cast` host-in or
     /// `ln_affine_cast_dev` device-in) AND have the acc_add brick loaded. Returns the device BO
     /// [PAD_M,KRES] f32 = sum of the DFF/KRES fc2 partials (acc=0, +partial0, +partial1, ...).
+    /// `a_bf16` is the ALREADY-NORMALIZED bf16 [PAD_M,KRES] fc1 input. It is a parameter rather than
+    /// `rl.bo_bf16` so a caller that produced the LN somewhere else -- notably the fused
+    /// `resadd -> LN` collapse, whose LN lands in the brick's own output BO -- can feed it directly
+    /// instead of re-running the LN into the shared buffer.
     fn ffn_dev_accum<F1: FnOnce() -> Array2<f32>, F2: FnOnce() -> Array2<f32>>(
-        &self, rl: &Rc<ResidentLn>, make_w1: F1, id1: &str, make_w2: F2, id2: &str,
+        &self, rl: &Rc<ResidentLn>, a_bf16: &Bo, make_w1: F1, id1: &str, make_w2: F2, id2: &str,
     ) -> Rc<Bo> {
         // acc_add is needed ONLY by the 4x K=1024 split below; the fc2_k4096 collapse (default-on in
         // the fused block) returns before ever touching it. Resolve it lazily so a tree that sheds the
@@ -2899,14 +2892,15 @@ impl NpuMatmul {
             })
         };
         let st1 = self.stream(DFF, Act::Silu); // fc1 on-chip SiLU iff modal (plain resident ignores it)
-        self.kern.run_matmul8(3, &st1.instr, st1.n_instr, &rl.bo_bf16, &w1, &st1.bo_c, &self.bo_tmp, &self.bo_tr).unwrap();
+        let __d0 = std::time::Instant::now();
+        self.kern.run_matmul8(3, &st1.instr, st1.n_instr, a_bf16, &w1, &st1.bo_c, &self.bo_tmp, &self.bo_tr).unwrap();
+        self.note_dispatch_tag(__d0, 1, "fc1_n4096");
         // ONE-DISPATCH fc2 (K=DFF): cast fc1's f32 [PAD_M,DFF] -> bf16 row-major, then a SINGLE K=DFF
         // modal GEMM that accumulates all DFF K internally in L1 -> f32 [PAD_M,KRES] device. Collapses
         // deint + 4x K=1024 GEMM + 4x acc_add (8 dispatches) into cast + 1 modal (2). NOT bit-identical
         // to the 4-way split (different L1 accum + bfp16) -> validated by the sound rel-L2 gate.
         if self.fc2_k4096_on() {
             if let Some(k4) = rl.fc2_k4096.as_ref() {
-                self.stats.borrow_mut().dispatches += 1; // fc1
                 return self.fc2_k4096_dev(k4, &st1.bo_c, make_w2, id2);
             }
         }
@@ -2968,7 +2962,7 @@ impl NpuMatmul {
         }
         self.stats.borrow_mut().calls += 1;
         let rl2 = self.ln_affine_cast(x, gamma, beta); // host-in LN: bo_bf16 = affine_LN(x)
-        Some(self.ffn_dev_accum(&rl2, make_w1, id1, make_w2, id2))
+        Some(self.ffn_dev_accum(&rl2, &rl2.bo_bf16.clone(), make_w1, id1, make_w2, id2))
     }
 
     /// Device-in FFN for the fused seam: like [`Self::resident_ffn_dev`] but the LN input is the
@@ -2985,7 +2979,7 @@ impl NpuMatmul {
         }
         self.stats.borrow_mut().calls += 1;
         let rl2 = self.ln_affine_cast_dev(a_bo, gamma, beta); // device-in LN: bo_bf16 = affine_LN(a_bo)
-        Some(self.ffn_dev_accum(&rl2, make_w1, id1, make_w2, id2))
+        Some(self.ffn_dev_accum(&rl2, &rl2.bo_bf16.clone(), make_w1, id1, make_w2, id2))
     }
 
     /// K=768 post-norm resident FFN with NO leading LayerNorm (BERT / Whisper-encoder / ESM-2 share
@@ -3417,11 +3411,7 @@ impl NpuMatmul {
                 .run_matmul8(3, &st.instr, st.n_instr, &self.bo_a, wbo, &st.bo_c, &self.bo_tmp, &self.bo_tr)
                 .unwrap();
         }
-        {
-            let mut s = self.stats.borrow_mut();
-            s.dispatch_s += t1.elapsed().as_secs_f64();
-            s.dispatches += 1;
-        }
+        self.note_dispatch_tag(t1, 1, "matmul_host_io");
 
         // (c) output marshaling: download C + read rows back into an f32 ndarray (no math).
         let t2 = Instant::now();
@@ -3591,9 +3581,11 @@ impl NpuMatmul {
             }
             out
         };
+        // NOTE: no per-submit counter here -- the whole pipelined span is booked ONCE at the end via
+        // note_dispatch_tag(.., parts, "ksplit"), because these dispatches OVERLAP (start/wait pairs
+        // with pack/read interleaved). Counting each submit here and the span there would double-count.
         let submit = |slot: &PipeSlot, wbo: &Bo| {
             let _d = crate::prof::phase::PhaseScope::new(stage, crate::prof::phase::Bucket::Npu);
-            self.stats.borrow_mut().dispatches += 1;
             self.kern
                 .run_matmul8_start(3, &st.instr, st.n_instr, &slot.bo_a, wbo, &slot.bo_c, &slot.bo_tmp, &slot.bo_tr)
                 .unwrap()
@@ -3624,7 +3616,10 @@ impl NpuMatmul {
             prev_run.wait().unwrap();
         }
         acc += &read_part(&self.slots[prev_slot]);
-        self.stats.borrow_mut().dispatch_s += t0.elapsed().as_secs_f64();
+        // One span covering `parts` OVERLAPPED dispatches, so its ms/cmd is a pipelined average and
+        // is NOT comparable to a blocking brick's ms/cmd. Tagged anyway: an untagged bucket is how
+        // fc1 stayed invisible.
+        self.note_dispatch_tag(t0, parts, "ksplit_pipelined");
         acc
     }
 }
