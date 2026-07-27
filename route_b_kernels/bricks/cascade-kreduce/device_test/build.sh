@@ -41,7 +41,7 @@ cd "$HERE"
 # --no-xchesscc: compile AND link with Peano (disables xbridge/chess). Without
 # it aiecc falls back to the chess toolchain (chess-llvm-link), which is absent.
 "$AIECC" --no-aiesim --no-xchesscc --peano "$PEANO_INSTALL_DIR" \
-  --aie-generate-xclbin --aie-generate-npu-insts --no-compile-host \
+  --get-xclbin --get-npu-insts \
   --xclbin-name=cascade.xclbin --npu-insts-name=insts.bin \
   cascade.mlir
 

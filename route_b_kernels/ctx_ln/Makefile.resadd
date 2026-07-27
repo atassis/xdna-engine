@@ -32,6 +32,6 @@ build/aie_${tag}.mlir: ${srcdir}/${aie_py_src}
 
 build/final_${tag}.xclbin: build/aie_${tag}.mlir build/residual_add.o
 	mkdir -p ${@D}
-	cd ${@D} && aiecc --aie-generate-xclbin --aie-generate-npu-insts --no-compile-host \
+	cd ${@D} && aiecc --get-xclbin --get-npu-insts \
 		--no-xchesscc --no-xbridge --peano ${PEANO_INSTALL_DIR} \
 		--xclbin-name=${@F} --npu-insts-name=insts_${tag}.txt aie_${tag}.mlir

@@ -119,7 +119,7 @@ build/${targetname}.mlir: ${srcdir}/${aie_py_src}
 
 build/final.xclbin: build/${targetname}.mlir build/kernels.a
 	mkdir -p ${@D}
-	cd ${@D} && aiecc --aie-generate-xclbin --aie-generate-npu-insts --no-compile-host \
+	cd ${@D} && aiecc --get-xclbin --get-npu-insts \
 		    --xclbin-name=${@F} \
 		    --no-xchesscc --no-xbridge \
 		    --npu-insts-name=insts.bin $(<:%=../%)

@@ -108,6 +108,6 @@ ${mlir_target}: ${srcdir}/${aie_py_src}
 # target" / "ignoring old recipe for target") -- do NOT try to "fix" them.
 ${xclbin_target} ${insts_target} &: ${mlir_target} ${kernels:%=build/%.o}
 	mkdir -p ${@D}
-	cd ${@D} && ${AIECC} --alloc-scheme=${buffer_aloc_flag} --aie-generate-xclbin --no-compile-host \
+	cd ${@D} && ${AIECC} --alloc-scheme=${buffer_aloc_flag} --get-xclbin \
 	    --xclbin-name=$(notdir ${xclbin_target}) ${aiecc_peano_flags} \
-	    --aie-generate-npu-insts --npu-insts-name=$(notdir ${insts_target}) $(notdir ${mlir_target})
+	    --get-npu-insts --npu-insts-name=$(notdir ${insts_target}) $(notdir ${mlir_target})

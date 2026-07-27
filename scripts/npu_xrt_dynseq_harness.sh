@@ -19,7 +19,7 @@
 # Recipe (mirrors test/npu-xrt/matmul_whole_array_dynamic/run.lit):
 #   mm.cc --Peano--> mm.o                  (compute kernel, built once, col-agnostic)
 #   example.py --emit MLIR--> normalize kernel symbol to mm.o
-#   aiecc --aie-generate-xclbin --aie-generate-input-with-addresses
+#   aiecc --get-xclbin --get-input-with-addresses
 #   aie-opt <dyn-seq pass list> --> lowered.mlir
 #   aie-translate --aie-npu-to-cpp --> gen.h   (the runtime C++ TXN builder)
 #   host compiler: test.cpp + test_utils.cpp + gen.h + system XRT --> exe
@@ -110,8 +110,8 @@ build_config() { # <cols>
   log "cols=$cols: aiecc -> xclbin + input_with_addresses"
   ( cd "$WORK" && PATH="$PEANO/bin:$INSTANCE/bin:$PATH" PEANO_INSTALL_DIR="$PEANO" \
     "$VENV_PY" "$INSTANCE/bin/aiecc.py" --no-xchesscc --no-xbridge --no-aiesim \
-      --aie-generate-xclbin --aie-generate-input-with-addresses \
-      --output-dir="$prj" --no-compile-host \
+      --get-xclbin --get-input-with-addresses \
+      --output-dir="$prj" \
       --peano="$PEANO" \
       --xclbin-name="$WORK/$cols.xclbin" --tmpdir="$prj" "$WORK/$cols.norm.mlir" )
 

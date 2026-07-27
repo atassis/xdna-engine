@@ -71,9 +71,9 @@ build_one() {  # $1=mode $2=cols $3=line $4=depth $5=bytes
   .venv-iron/bin/python "$GEN" \
       --mode "$mode" --bytes "$bytes" --line "$line" --depth "$depth" --cols "$cols" --dev npu2 \
       $PINFLAG > "$mlir"
-  ( cd "$WORK" && "$AIECC" --aie-generate-xclbin --xclbin-name="${tag}.xclbin" \
+  ( cd "$WORK" && "$AIECC" --get-xclbin --xclbin-name="${tag}.xclbin" \
         --no-xchesscc --no-xbridge \
-        --aie-generate-npu-insts --npu-insts-name="${tag}.insts.bin" "$mlir" )
+        --get-npu-insts --npu-insts-name="${tag}.insts.bin" "$mlir" )
   mv -f "$WORK/${tag}.xclbin" "$OUTDIR/${tag}.xclbin"
   mv -f "$WORK/${tag}.insts.bin" "$OUTDIR/${tag}.insts.bin"
   echo "   -> $OUTDIR/${tag}.{xclbin,insts.bin}"

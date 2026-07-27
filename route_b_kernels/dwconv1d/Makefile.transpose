@@ -60,7 +60,7 @@ build/aie_transpose_${tag}.mlir: ${srcdir}/${aie_py_src}
 
 build/final_transpose_${tag}.xclbin: build/aie_transpose_${tag}.mlir build/${obj}
 	mkdir -p ${@D}
-	cd ${@D} && aiecc --aie-generate-xclbin --aie-generate-npu-insts --no-compile-host \
+	cd ${@D} && aiecc --get-xclbin --get-npu-insts \
 		--no-xchesscc --no-xbridge --peano ${PEANO_INSTALL_DIR} \
 		--xclbin-name=${@F} --npu-insts-name=insts_transpose_${tag}.txt aie_transpose_${tag}.mlir
 
