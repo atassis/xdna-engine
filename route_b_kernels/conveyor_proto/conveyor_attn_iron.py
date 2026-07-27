@@ -447,8 +447,12 @@ def build(dev, mono=False, TRIVIAL=False, relpos=False, bd_onchip=False, tactive
         KBLK_ROWS = 2 * 8
         kblk_ty = np.ndarray[(KBLK_ROWS * DK,), np.dtype[bfloat16]]
         NBLK_K = (T // 8) // 2                      # j-pairs per query tile
-        if mmul and TQ % 16 != 0:
-            raise SystemExit("--mmul blocked scores needs ATTN_TQ %% 16 == 0 (r=8 -> 2*r); got %d" % TQ)
+        # The blocked kernel needs TQ == 2*MM_R, and MM_R follows
+        # -DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16 (8 with, 4 without) -- which lives in KFLAGS and
+        # is invisible here. So accept both legal heights; a genuine mismatch compiles the kernel out
+        # via MM_BLK_OK and fails loudly at link rather than silently.
+        if mmul and TQ not in (8, 16):
+            raise SystemExit("--mmul blocked scores needs ATTN_TQ in (8, 16) = 2*MM_R; got %d" % TQ)
         scores_blk = (Kernel("stage_scores_mmul_block", "kernels.a", [qbd_ty, kblk_ty, ac_ty])
                       if mmul else None)
         of_vh = [ObjectFifo(v_ty, name=f"v{h}", depth=1) for h in range(H)]
