@@ -96,6 +96,11 @@ static inline void mm_2x2_bf16_f32(const bfloat16 *__restrict pA,
                                    const bfloat16 *__restrict pB,
                                    float *__restrict pC) {
   using MMUL = aie::mmul<MM_R, MM_S, MM_T, bfloat16, bfloat16, accauto>;
+  // The data layout (host tiling + mm_tile_rows + the de-tile) hard-codes r*s / s*t / r*t. If the
+  // API's block sizes differ, the layout and this pointer walk disagree silently.
+  static_assert(MMUL::size_A == MM_R * MM_S, "A block size != r*s");
+  static_assert(MMUL::size_B == MM_S * MM_T, "B block size != s*t");
+  static_assert(MMUL::size_C == MM_R * MM_T, "C block size != r*t");
   static_assert(rowA % 2 == 0, "2x2 block needs an even rowA");
   static_assert(colB % 2 == 0, "2x2 block needs an even colB");
 
@@ -113,10 +118,16 @@ static inline void mm_2x2_bf16_f32(const bfloat16 *__restrict pA,
         aie::vector<bfloat16, MMUL::size_A> A0, A1;
         aie::vector<bfloat16, MMUL::size_B> B0, B1;
 
-        MMUL C00(aie::zeros<accfloat, MMUL::size_C>());
-        MMUL C01(aie::zeros<accfloat, MMUL::size_C>());
-        MMUL C10(aie::zeros<accfloat, MMUL::size_C>());
-        MMUL C11(aie::zeros<accfloat, MMUL::size_C>());
+        // DEFAULT ctor, not a hand-zeroed accumulator. aie_api's C_block carries a `zero` flag --
+        // C_block() sets zero=true, which is what makes the FIRST .mac() emit a mul instead of
+        // reading an uninitialised accumulator. Passing aie::zeros(...) instead selects the
+        // accumulate-onto ctor (zero=false), and the vector overload additionally goes through an
+        // accum(v, shift) conversion. mm.cc gets away with loading C because zero.cc pre-zeroes it;
+        // we accumulate nothing across calls, so the fresh-product idiom is the correct one.
+        MMUL C00;
+        MMUL C01;
+        MMUL C10;
+        MMUL C11;
 
         for (unsigned i = 0; i < colA; ++i) {
           A0 = aie::load_v<MMUL::size_A>(pA1); pA1 += MMUL::size_A;
