@@ -324,7 +324,7 @@ struct Fc2K4096 {
     mm_c: Rc<Bo>, // f32 [PAD_M, KRES] fc2 output (device-resident)
 }
 
-/// fc1 with the K-PANEL PACKING FOLDED INTO ITS OWN C DRAIN, OPTIONAL (`PARAKEET_FC1_PACK_IN_DRAIN=1`).
+/// fc1 with the K-PANEL PACKING FOLDED INTO ITS OWN C DRAIN. DEFAULT ON; `PARAKEET_FC1_PACK_IN_DRAIN=0` opts out.
 ///
 /// The shipped seam is two dispatches on two xclbins: the modal fc1 writes C row-major f32
 /// [PAD_M,DFF], then `deint` casts it to bf16 and reorders it chunk-major so the fc2 K-split can
@@ -340,10 +340,26 @@ struct Fc2K4096 {
 ///     the modal design deleted to make the m=64 fast tile fit. At m=64 L1 overflows by ~11.6 KB, so
 ///     this is built at m=32 and pays ~+0.24 ms/dispatch for the smaller tile.
 ///
-/// Off by default because it is a genuine trade, not a free win: it adds a SECOND full-array design
-/// to the resident set, and a modal<->modal transition costs more than the modal<->deint pair it
-/// replaces (deint is cheap precisely because it is a small design). Measured net over the real
-/// per-FFN sequence: ~+0.5 ms/FFN. See the deint-fold-into-gemm-drain task.
+/// DEFAULT ON since 2026-07-28. It is still a genuine trade, not a free win -- it adds a SECOND
+/// full-array design to the resident set and regresses the fc1 tile from m=64 to m=32 -- but the
+/// trade was measured end to end and it wins:
+///
+///   * -3.4% whole-clip (0.698 -> 0.674 s/clip, min-of-3 over 17 clips), -48 commands and -48
+///     hwctx switches (504 -> 456, 191 -> 143). Note this is SMALLER than an earlier uncommitted
+///     measurement claimed (-4.6%); the modeled ~3.5% was the accurate one.
+///   * Accuracy: the burst-aware parity gate FAILS `new-burst` (+0.42 at ru_02[77]), and that
+///     failure is cosmetic. On that exact clip the fold takes burst frames from 8 to 34 and the
+///     transcript stays IDENTICAL to f32 truth. Across 17 clips the folded path differs from f32
+///     on FEWER clips than the shipped one (2 vs 4) with fewer word edits (3 vs 6), and differing
+///     tokens sit at or below chance on burst frames. Zero frames reach the 1.0 sensitivity knee.
+///
+/// A modal<->modal transition does cost more than the modal<->deint pair it replaces (deint is
+/// cheap precisely because it is a small design), which is why the win is much smaller than the
+/// -48/-48 suggests. Model the whole per-FFN sequence, not the command count.
+///
+/// Revert with `PARAKEET_FC1_PACK_IN_DRAIN=0`. First thing to reconsider if the resident set turns
+/// out to be design-constrained by the LN-into-GEMM-epilogue work, which is worth ~20% against this
+/// 3.4%. See the deint-fold-into-gemm-drain task.
 struct Fc1PanelBf16 {
     kern: Rc<Kernel>,
     instr: Bo,
@@ -1147,9 +1163,11 @@ impl NpuMatmul {
                 None
             }
         };
-        // fc1 with the deint folded into its C drain, OPTIONAL + opt-in (PARAKEET_FC1_PACK_IN_DRAIN=1).
-        // Loaded whenever the artifact is present so the flag alone selects it; the m=32 tile is baked
-        // into the name because bf16-out does not FIT at the m=64 fast tile (L1 overflow, see Fc1PanelBf16).
+        // fc1 with the K-panel packing folded into its C drain. DEFAULT ON (PARAKEET_FC1_PACK_IN_DRAIN=0
+        // opts out). Loaded whenever the artifact is present so the flag alone selects it; the m=32 tile
+        // is baked into the name because bf16-out does not FIT at the m=64 fast tile (L1 overflow, see
+        // Fc1PanelBf16). Absent artifact still falls back cleanly, which is what makes default-on safe
+        // for a tree that has not rebuilt the modal kernels.
         let fc1_panel_bf16 = {
             let tag = format!("{PAD_M}x{KRES}x{DFF}_{FC1_PANEL_BF16_TILE}_8c_modalsilubf16outpanel{KRES}");
             let xcl = self.ln_dir.join(format!("final_{tag}.xclbin"));
@@ -1164,8 +1182,13 @@ impl NpuMatmul {
                     kern, instr, n,
                 })
             } else {
+                // Say why the DEFAULT path is not running. The old wording blamed the env var, which
+                // is now wrong in the common case: the flag defaults on, so an operator who set
+                // nothing would be told they had set something.
                 if !npu_xrt::quiet() && self.fc1_pack_in_drain_on() {
-                    eprintln!("[npu] PARAKEET_FC1_PACK_IN_DRAIN set but final_{tag}.xclbin absent in {} -- staying on fc1+deint", self.ln_dir.display());
+                    eprintln!("[npu] final_{tag}.xclbin absent in {} -- falling back to fc1+deint (slower by ~3.4%/clip). \
+                               Build it with scripts/build_parakeet_modal_kernels.sh, or set PARAKEET_FC1_PACK_IN_DRAIN=0 to silence this.",
+                              self.ln_dir.display());
                 }
                 None
             }
@@ -1876,8 +1899,9 @@ impl NpuMatmul {
         std::env::var("PARAKEET_FC2_K4096").map(|v| v != "0").unwrap_or(false)
     }
 
+    /// DEFAULT ON since 2026-07-28. `PARAKEET_FC1_PACK_IN_DRAIN=0` returns to the fc1+deint pair.
     fn fc1_pack_in_drain_on(&self) -> bool {
-        std::env::var("PARAKEET_FC1_PACK_IN_DRAIN").map(|v| v != "0").unwrap_or(false)
+        std::env::var("PARAKEET_FC1_PACK_IN_DRAIN").map(|v| v != "0").unwrap_or(true)
     }
 
     /// fc1 -> the chunk-major bf16 buffer the fc2 K-split reads, as ONE dispatch instead of two.
