@@ -78,7 +78,7 @@ add a `conveyor_parity` bin mirroring `src/bin/relpos_parity.rs` that feeds ONE 
 through `relpos_mha_conveyor` and diffs ctx vs `npu.relpos_mha` per head. Gate rel-L2 <= ~5e-3.
 
 ```
-cargo run --features npu --bin conveyor_parity      # (bin to be added; gate rel-L2 <= 5e-3)
+cargo run -p npu-probes --bin conveyor_parity      # (bin to be added; gate rel-L2 <= 5e-3)
 ```
 
 ## 4. PAYOFF gate: 17-clip WER + mhsa/encode wall-clock vs the shipped per-head loop
@@ -93,12 +93,12 @@ PY scripts/parakeet_npu_wer.py dump-mels artifacts/wer_mels
 
 # --- A) shipped per-head relpos (baseline) ---
 NPU_XCLBIN_ROOT=$PWD \
-  cargo run --features npu --release --bin parakeet_encode_npu -- artifacts/wer_mels artifacts/wer_enc_shipped
+  cargo run -p npu-probes --release --bin parakeet_encode_npu -- artifacts/wer_mels artifacts/wer_enc_shipped
 PY scripts/parakeet_npu_wer.py decode-wer artifacts/wer_enc_shipped     # expect ~8.5
 
 # --- B) 8-head conveyor (opt-in) ---
 PARAKEET_CONVEYOR_MHA=1 NPU_XCLBIN_ROOT=$PWD \
-  cargo run --features npu --release --bin parakeet_encode_npu -- artifacts/wer_mels artifacts/wer_enc_conveyor
+  cargo run -p npu-probes --release --bin parakeet_encode_npu -- artifacts/wer_mels artifacts/wer_enc_conveyor
 PY scripts/parakeet_npu_wer.py decode-wer artifacts/wer_enc_conveyor    # gate: <= 8.5
 ```
 
@@ -106,9 +106,9 @@ Wall-clock A/B (phase timing splits out the `mhsa_conveyor` / `mhsa_resident` / 
 
 ```
 PARAKEET_PHASE_TIMING=1 NPU_XCLBIN_ROOT=$PWD \
-  cargo run --features npu --release --bin parakeet_encode_npu -- artifacts/wer_mels /tmp/enc_shipped
+  cargo run -p npu-probes --release --bin parakeet_encode_npu -- artifacts/wer_mels /tmp/enc_shipped
 PARAKEET_PHASE_TIMING=1 PARAKEET_CONVEYOR_MHA=1 NPU_XCLBIN_ROOT=$PWD \
-  cargo run --features npu --release --bin parakeet_encode_npu -- artifacts/wer_mels /tmp/enc_conveyor
+  cargo run -p npu-probes --release --bin parakeet_encode_npu -- artifacts/wer_mels /tmp/enc_conveyor
 # compare the per-clip encode wall time printed by each, and the mhsa bucket in the phase report.
 ```
 

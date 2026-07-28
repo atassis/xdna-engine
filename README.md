@@ -74,7 +74,7 @@ does not need it.
 
 ## Layout
 
-- `rust/` - the engine (14 crates; see [ARCHITECTURE.md](ARCHITECTURE.md))
+- `rust/` - the engine (14 product crates + `npu-probes`; see [ARCHITECTURE.md](ARCHITECTURE.md))
 - `route_b_kernels/` - hand-written AIE kernels (GEMM, GEMV, cascade FFN, MHA, conv, LayerNorm, ...)
 - `scripts/` - model export/convert, kernel builds, device probes, eval ([index](scripts/README.md))
 - `bench/` - latency/energy benchmark harness

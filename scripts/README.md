@@ -8,6 +8,9 @@ header line, not a re-description.
 announce it, stop `npu-serve` / `npu-asr`, and check `fuser -v /dev/accel/accel0` first.
 Everything else is CPU-only and safe to run any time.
 
+**The Rust-side siblings of these live in `rust/npu-probes`** (53 device probes, parity checks
+and benchmarks). Several scripts here drive them: `cargo run -p npu-probes --bin <name>`.
+
 ---
 
 ## 1. Environment and toolchain

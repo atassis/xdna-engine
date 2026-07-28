@@ -35,17 +35,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [[bin]]
-name = "verify_encoder"
-path = "src/bin/verify_encoder.rs"
-
-[[bin]]
 name = "encode_server"
 path = "src/bin/encode_server.rs"
 
-[[bin]]
-name = "verify_patch_embed"
-path = "src/bin/verify_patch_embed.rs"
-
-[[bin]]
-name = "verify_resnet"
-path = "src/bin/verify_resnet.rs"

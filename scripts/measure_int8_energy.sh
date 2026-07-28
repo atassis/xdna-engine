@@ -19,7 +19,7 @@ BIN="$REPO/rust/target/release/whisper_e2e_timing"
 # baseline first, then the byte-cut variants in increasing aggressiveness.
 VARIANTS=(fused_decode12 fused_decode12_int8kv fused_decode12_int8ffn fused_decode12_int8sweet fused_decode12_int8all)
 
-[ -x "$BIN" ] || { echo "build first: (cd rust && cargo build -p npu-engine --release --bin whisper_e2e_timing)"; exit 1; }
+[ -x "$BIN" ] || { echo "build first: (cd rust && cargo build -p npu-probes --release --bin whisper_e2e_timing)"; exit 1; }
 
 # ---- quiesce gate ----
 LOAD=$(cut -d' ' -f1 /proc/loadavg)

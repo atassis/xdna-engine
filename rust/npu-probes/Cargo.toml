@@ -1,0 +1,35 @@
+[package]
+name = "npu-probes"
+version = "0.1.0"
+edition = "2021"
+description = "Device probes, parity checks and benchmarks. Dev tooling, not part of the shipped engine."
+
+# Bin-only crate: no lib. Every target is a one-off investigation or a validation gate, kept out
+# of the product crates so `cargo build` at the workspace root builds only what ships. This crate
+# is NOT in [workspace] default-members -- build it explicitly with `cargo build -p npu-probes`.
+
+[features]
+# These bins carry `#[cfg(feature = "npu")]` blocks that used to resolve against whichever host
+# crate they were compiled inside. Now they resolve against THIS crate, so the feature has to
+# exist here or the NPU path vanishes silently -- `resident_ff1_probe` (whose whole `main` is
+# gated) is the only one that failed loudly; four others just compiled their host fallback.
+# Default-on because npu-xrt is an unconditional dependency: there is no XRT-free build here.
+default = ["npu"]
+npu = []
+
+[dependencies]
+npu-xrt = { path = "../npu-xrt" }
+npu-asr = { path = "../npu-asr", features = ["two_ctx"] }
+npu-asr-host = { path = "../npu-asr-host" }
+npu-onnx = { path = "../npu-onnx" }
+npu-engine = { path = "../npu-engine" }
+npu-parakeet = { path = "../npu-parakeet", features = ["npu"] }
+npu-whisper = { path = "../npu-whisper", features = ["npu"] }
+npu-sr = { path = "../npu-sr" }
+
+anyhow = "1"
+ndarray = "0.16"
+ndarray-npy = { version = "0.9", default-features = false }
+rayon = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

@@ -42,7 +42,7 @@ done
 
 # 2) build the probe host bin
 log "[build] fused_elf_probe (release)"
-( cd "$WT/rust" && cargo build --release -p npu-asr --bin fused_elf_probe ) >>"$LOG" 2>&1 || { log "FATAL: probe build failed"; exit 1; }
+( cd "$WT/rust" && cargo build --release -p npu-probes --bin fused_elf_probe ) >>"$LOG" 2>&1 || { log "FATAL: probe build failed"; exit 1; }
 
 # 3) claim the single-tenant NPU
 log "[svc] stopping npu-asr / voxd"

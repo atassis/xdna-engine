@@ -1029,6 +1029,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "npu-probes"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ndarray",
+ "ndarray-npy",
+ "npu-asr",
+ "npu-asr-host",
+ "npu-engine",
+ "npu-onnx",
+ "npu-parakeet",
+ "npu-sr",
+ "npu-whisper",
+ "npu-xrt",
+ "rayon",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "npu-runtime"
 version = "0.1.0"
 dependencies = [

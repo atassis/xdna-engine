@@ -35,7 +35,7 @@ else
 fi
 echo
 echo "==== build (release, CPU-only crate) ===="
-( cd "$R/rust" && cargo build --release -p npu-asr-host --bin glue_contention 2>&1 | tail -3 )
+( cd "$R/rust" && cargo build --release -p npu-probes --bin glue_contention 2>&1 | tail -3 )
 echo
 BIN="$R/rust/target/release/glue_contention"
 for i in $(seq 1 "$RUNS"); do

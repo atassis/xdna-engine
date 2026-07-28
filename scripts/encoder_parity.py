@@ -35,7 +35,7 @@ index responsible, so a regression is localizable rather than merely detected.
 
 Usage:
   # 1. capture the three encode dirs (17-clip mels):
-  cargo run --features npu --release --bin parakeet_encode_npu -- artifacts/wer_mels /tmp/enc_ref --cpu
+  cargo run -p npu-probes --release --bin parakeet_encode_npu -- artifacts/wer_mels /tmp/enc_ref --cpu
   NPU_XCLBIN_ROOT=$PWD cargo run ... --bin parakeet_encode_npu -- artifacts/wer_mels /tmp/enc_ship
   PARAKEET_FUSED_BLOCK=1 NPU_XCLBIN_ROOT=$PWD cargo run ... -- artifacts/wer_mels /tmp/enc_cand
   # 2. gate:

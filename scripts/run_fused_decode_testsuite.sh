@@ -65,8 +65,10 @@ run "sudo -n chmod -R a+r /sys/class/powercap/intel-rapl*/ 2>/dev/null && echo '
 section "BUILD (probes debug; engine bins release)"
 source "$IRON/ironenv/bin/activate" 2>/dev/null
 run "which aiebu-asm || echo MISSING_aiebu-asm"
-run "cd $WT/rust && cargo build -p npu-asr --bin fused_elf_probe 2>&1 | tail -2"
-run "cd $WT/rust && cargo build -p npu-engine --release --bin verify_whisper_decode --bin engine_serve --bin whisper_e2e_timing --bin verify_embeddings --bin verify_esm 2>&1 | tail -3"
+run "cd $WT/rust && cargo build -p npu-probes --bin fused_elf_probe 2>&1 | tail -2"
+# `--bin engine_serve` was here and is dropped: no such cargo target exists in the workspace, so
+# this build command could only ever fail. If a server binary is wanted here it is `npu` (npu-cli).
+run "cd $WT/rust && cargo build -p npu-probes --release --bin verify_whisper_decode --bin whisper_e2e_timing --bin verify_embeddings --bin verify_esm 2>&1 | tail -3"
 
 # ---------------------------------------------------------------------------
 section "REGENERATE FUSED ARTIFACTS (host-only IRON compile; build/ cleaned per-op)"
@@ -109,9 +111,9 @@ done
 note "[WHISPER_ENERGY] lines above give per-transcription RAPL package Joules + avg W per backend (NPU-vs-CPU energy)."
 
 section "4. Whisper decode argmax PARITY vs ONNX (verify_whisper_decode)"
-run "cd $WT/rust && WHISPER_ROOT=$WT LD_LIBRARY_PATH=$LDLIB cargo run -q -p npu-engine --release --bin verify_whisper_decode -- --host"
-run "cd $WT/rust && WHISPER_ROOT=$WT LD_LIBRARY_PATH=$LDLIB cargo run -q -p npu-engine --release --bin verify_whisper_decode -- --npu"
-run "cd $WT/rust && WHISPER_ROOT=$WT LD_LIBRARY_PATH=$LDLIB cargo run -q -p npu-engine --release --bin verify_whisper_decode -- --npu-attn"
+run "cd $WT/rust && WHISPER_ROOT=$WT LD_LIBRARY_PATH=$LDLIB cargo run -q -p npu-probes --release --bin verify_whisper_decode -- --host"
+run "cd $WT/rust && WHISPER_ROOT=$WT LD_LIBRARY_PATH=$LDLIB cargo run -q -p npu-probes --release --bin verify_whisper_decode -- --npu"
+run "cd $WT/rust && WHISPER_ROOT=$WT LD_LIBRARY_PATH=$LDLIB cargo run -q -p npu-probes --release --bin verify_whisper_decode -- --npu-attn"
 
 # restart services for the harnesses that manage their own engine_serve
 run "systemctl --user start xdna-engine.service voxd.service; sleep 2"

@@ -18,7 +18,7 @@ log(){ echo -e "$*" | tee -a "$LOG"; }
 restart(){ systemctl --user start xdna-engine.service voxd.service >/dev/null 2>&1; echo "[svc] npu services restarted" | tee -a "$LOG"; }
 trap 'restart; echo "[done] log: $LOG"' EXIT
 
-[ -x "$W3" ] || { log "[ERR] whisper_e2e_timing missing — build: (cd rust && cargo build -p npu-engine --release --bin whisper_e2e_timing)"; exit 1; }
+[ -x "$W3" ] || { log "[ERR] whisper_e2e_timing missing — build: (cd rust && cargo build -p npu-probes --release --bin whisper_e2e_timing)"; exit 1; }
 ENC="$WT/mlir-aie/programming_examples/basic/matrix_multiplication/whole_array/build/final_512x800x3072_64x32x96_8c_modalsilu.xclbin"
 [ -f "$ENC" ] || { log "[ERR] encoder xclbin missing: $ENC"; exit 1; }
 for d in fused_decode12 fd12_cross fd12_self; do
