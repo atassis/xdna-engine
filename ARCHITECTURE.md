@@ -65,10 +65,12 @@ stays one owner, one thread, no lock. `[server]` keys: `max_resident` (slots),
 `evict_policy` (`lru`, or `none` to refuse instead of evicting). `GET /v1/models` reports each
 model's `state` and `idle_s`.
 
-`max_resident` counts SLOTS, not resources. The accountant's `bo_bytes()` currently reports a
-fixed `0` (`npu-runtime/src/loader.rs`), and the NPU's 8 columns of hw_context budget are not
-tracked at all, so eviction cannot yet reason about the two things that are actually scarce:
-LPDDR bytes and hw_contexts. Making that real is open work.
+`max_resident` counts SLOTS, not resources. Co-residency actually costs two independent budgets:
+pinned XRT buffer-object bytes (what fits resident) and array time (who runs). The accountant's
+`bo_bytes()` currently reports a fixed `0` (`npu-runtime/src/loader.rs`), so the first is untracked;
+the second is not a per-model budget at all, because the kernels here claim the whole array and
+contexts therefore time-slice it rather than running side by side. Making the byte budget real is
+open work.
 
 ## Known seams
 
