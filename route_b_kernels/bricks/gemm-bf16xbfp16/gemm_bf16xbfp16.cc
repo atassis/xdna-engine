@@ -78,6 +78,29 @@ void gemm_bf16xbfp16_core(const bfloat16 *__restrict pA,
   static_assert(MMUL::size_B == sizeB, "B micro-tile size mismatch");
   static_assert(MMUL::size_C == sizeC, "C micro-tile size mismatch");
 
+  // The accfloat -> bfloat16 narrow at the bottom of this loop obeys the core's
+  // GLOBAL rounding register, and aie_api never sets it. Its documented default
+  // is floor -- always toward negative infinity -- so every output element of
+  // this brick was biased down by up to one ulp, on every tile, silently.
+  //
+  // conv_even (round-to-nearest-even) is what the host golden models and what
+  // the rest of our narrowing sites select, so this makes the brick agree with
+  // its own reference instead of accidentally tracking a hardware default
+  // nobody chose.
+  //
+  // Set once per call, not per store: it is a core control register, not an
+  // instruction operand. Note the flip side of that -- because it is global and
+  // sticky, a kernel that leaves it set changes the behaviour of whatever runs
+  // next on the same core. Every narrowing site we own therefore sets what it
+  // wants explicitly rather than inheriting.
+  //
+  // NOT the same defect as Xilinx/mlir-aie#3442. That one is about the A/B
+  // bf16 -> bfp16 conversion INSIDE aie::mmul under the emulation path; here A
+  // stays bf16 and B arrives already bfp16ebs8 via the mixed intrinsic, so no
+  // A/B conversion happens at all. Same family (lossy op on an unchosen
+  // register), different site, and this one is ours to fix.
+  aie::set_rounding(aie::rounding_mode::conv_even);
+
   for (unsigned m = 0; m < RowA; ++m) {
     const bfloat16 *__restrict pA_row0 = pA + m * ColA * sizeA;
 
