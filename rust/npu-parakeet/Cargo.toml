@@ -57,3 +57,31 @@ name = "resident_ff1_probe"
 path = "src/bin/resident_ff1_probe.rs"
 required-features = ["npu"]
 
+[[bin]]
+name = "deint_fold_probe"
+path = "src/bin/deint_fold_probe.rs"
+required-features = ["npu"]
+
+# These four were auto-discovered rather than declared, so `--no-default-features` tried to
+# build them without XRT and the decoupling gate (ci_gate.sh step 3) went red on `unresolved
+# import npu_xrt`. Declaring them is the same fix the comment above prescribes.
+[[bin]]
+name = "switch_cost_probe"
+path = "src/bin/switch_cost_probe.rs"
+required-features = ["npu"]
+
+[[bin]]
+name = "gemm_width_probe"
+path = "src/bin/gemm_width_probe.rs"
+required-features = ["npu"]
+
+[[bin]]
+name = "partition_ab_probe"
+path = "src/bin/partition_ab_probe.rs"
+required-features = ["npu"]
+
+[[bin]]
+name = "ff1_parity"
+path = "src/bin/ff1_parity.rs"
+required-features = ["npu"]
+

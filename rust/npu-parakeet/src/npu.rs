@@ -243,6 +243,8 @@ struct ResidentLn {
     resadd_s100: Option<ResidualAdd>,
     // one-dispatch K=4096 fc2 (cast@4096 -> K=4096 modal), OPTIONAL. Collapses the 4x K=1024 + acc_add.
     fc2_k4096: Option<Fc2K4096>,
+    // fc1 that drains chunk-major bf16 itself, deleting the deint dispatch. OPTIONAL + opt-in.
+    fc1_panel_bf16: Option<Fc1PanelBf16>,
     // conv-module depthwise conv1d (step 3), OPTIONAL like glu.
     dwconv: Option<ConvDw>,
     // conv-module post-dwconv SiLU (step 4), OPTIONAL like glu/dwconv. SEPARATE single-op-loop
@@ -320,6 +322,35 @@ struct Fc2K4096 {
     mm_instr: Bo,
     mm_n: usize,
     mm_c: Rc<Bo>, // f32 [PAD_M, KRES] fc2 output (device-resident)
+}
+
+/// fc1 with the K-PANEL PACKING FOLDED INTO ITS OWN C DRAIN, OPTIONAL (`PARAKEET_FC1_PACK_IN_DRAIN=1`).
+///
+/// The shipped seam is two dispatches on two xclbins: the modal fc1 writes C row-major f32
+/// [PAD_M,DFF], then `deint` casts it to bf16 and reorders it chunk-major so the fc2 K-split can
+/// take each chunk as a sub-buffer. This variant makes the GEMM write that layout directly, so the
+/// deint dispatch -- and one hw-context transition per FFN -- disappear. `bo_out` is bit-compatible
+/// with `bo_deint`: same [n_chunks,PAD_M,KRES] bf16 chunk-major buffer, so nothing downstream moves.
+///
+/// TWO things make this a different xclbin rather than a different instruction stream:
+///   * chunk-major drain alone IS insts-only (a pure re-stride of the same 4-D drain TAP; the PDI is
+///     byte-identical). That half is free.
+///   * bf16 C is not. The modal matmul reduces f32 IN-PLACE into the C tile, which only works while
+///     dtype_out == dtype_acc; a bf16 C tile needs the per-core f32 accumulator back -- the buffer
+///     the modal design deleted to make the m=64 fast tile fit. At m=64 L1 overflows by ~11.6 KB, so
+///     this is built at m=32 and pays ~+0.24 ms/dispatch for the smaller tile.
+///
+/// Off by default because it is a genuine trade, not a free win: it adds a SECOND full-array design
+/// to the resident set, and a modal<->modal transition costs more than the modal<->deint pair it
+/// replaces (deint is cheap precisely because it is a small design). Measured net over the real
+/// per-FFN sequence: ~+0.5 ms/FFN. See the deint-fold-into-gemm-drain task.
+struct Fc1PanelBf16 {
+    kern: Rc<Kernel>,
+    instr: Bo,
+    n: usize,
+    bo_out: Bo, // [n_chunks*PAD_M*KRES] bf16 chunk-major -- same layout deint used to produce
+    dummy_tmp: Bo,
+    dummy_tr: Bo,
 }
 
 /// Device-side f32 scaled residual-add brick (whole-block fusion residual). out[g5] = a[g3] +
@@ -409,6 +440,9 @@ struct ConvDwSiluT {
 }
 
 const DFF: usize = 4096; // Parakeet FFN inner dim (fc1 N / fc2 K)
+// Tile of the bf16-out fc1 (Fc1PanelBf16). NOT `self.tile`: bf16 out needs a per-core f32 accumulator that
+// does not fit alongside the m=64 C tile (L1 overflows by ~11.6 KB), so this variant only exists at m=32.
+const FC1_PANEL_BF16_TILE: &str = "32x32x128";
 // Variant B fc2 = deinterleave -> 4x K=KRES modal (same tile as host) on device sub-buffers +
 // host-accumulate = bit-identical to the host K-split (WER-neutral), A device-side.
 
@@ -1113,6 +1147,29 @@ impl NpuMatmul {
                 None
             }
         };
+        // fc1 with the deint folded into its C drain, OPTIONAL + opt-in (PARAKEET_FC1_PACK_IN_DRAIN=1).
+        // Loaded whenever the artifact is present so the flag alone selects it; the m=32 tile is baked
+        // into the name because bf16-out does not FIT at the m=64 fast tile (L1 overflow, see Fc1PanelBf16).
+        let fc1_panel_bf16 = {
+            let tag = format!("{PAD_M}x{KRES}x{DFF}_{FC1_PANEL_BF16_TILE}_8c_modalsilubf16outpanel{KRES}");
+            let xcl = self.ln_dir.join(format!("final_{tag}.xclbin"));
+            let ins = self.ln_dir.join(format!("insts_{tag}.txt"));
+            if xcl.exists() && ins.exists() {
+                let (kern, instr, n) = load_path(xcl, ins);
+                let gg = |i| kern.group_id(i).unwrap();
+                Some(Fc1PanelBf16 {
+                    bo_out: self.dev.alloc_bo(&kern, (DFF / KRES) * PAD_M * KRES * 2, FLAG_HOST_ONLY, gg(5)).unwrap(),
+                    dummy_tmp: self.dev.alloc_bo(&kern, 1, FLAG_HOST_ONLY, gg(6)).unwrap(),
+                    dummy_tr: self.dev.alloc_bo(&kern, 4, FLAG_HOST_ONLY, gg(7)).unwrap(),
+                    kern, instr, n,
+                })
+            } else {
+                if !npu_xrt::quiet() && self.fc1_pack_in_drain_on() {
+                    eprintln!("[npu] PARAKEET_FC1_PACK_IN_DRAIN set but final_{tag}.xclbin absent in {} -- staying on fc1+deint", self.ln_dir.display());
+                }
+                None
+            }
+        };
         // conv-module depthwise conv1d (step 3), OPTIONAL. 3-buffer ABI in[C,T]/w[C,16]/out[C,T] bf16.
         let dwconv = {
             let xcl = self.ln_dir.join(format!("final_dwconv_{DW_C}x{DW_T}.xclbin"));
@@ -1214,7 +1271,7 @@ impl NpuMatmul {
             deint_tmp: self.dev.alloc_bo(&deint_kern, 8, FLAG_HOST_ONLY, gd(6)).unwrap(),
             deint_tr: self.dev.alloc_bo(&deint_kern, 1, FLAG_HOST_ONLY, gd(7)).unwrap(),
             ln_kern, ln_instr, ln_n, ac_kern, ac_instr, ac_n, lnaffcast,
-            deint_kern, deint_instr, deint_n, glu, acc_add, resadd_s050, resadd_s100, fc2_k4096, dwconv, silu, dwconv_silu, dwconv_silu_t,
+            deint_kern, deint_instr, deint_n, glu, acc_add, resadd_s050, resadd_s100, fc2_k4096, fc1_panel_bf16, dwconv, silu, dwconv_silu, dwconv_silu_t,
         });
         rl
     }
@@ -1819,6 +1876,28 @@ impl NpuMatmul {
         std::env::var("PARAKEET_FC2_K4096").map(|v| v != "0").unwrap_or(false)
     }
 
+    fn fc1_pack_in_drain_on(&self) -> bool {
+        std::env::var("PARAKEET_FC1_PACK_IN_DRAIN").map(|v| v != "0").unwrap_or(false)
+    }
+
+    /// fc1 -> the chunk-major bf16 buffer the fc2 K-split reads, as ONE dispatch instead of two.
+    ///
+    /// `Some(bo)` means the fold ran: the GEMM drained chunk-major bf16 itself and no deint was
+    /// dispatched. `None` means the caller must run the shipped fc1 + deint pair -- either the flag
+    /// is off or the xclbin was not built. The returned BO holds exactly what `bo_deint` would have,
+    /// so callers only need to swap which buffer they sub-slice.
+    fn fc1_pack_in_drain<'a>(&self, rl: &'a ResidentLn, w1: &Bo) -> Option<&'a Bo> {
+        if !self.fc1_pack_in_drain_on() {
+            return None;
+        }
+        let o = rl.fc1_panel_bf16.as_ref()?;
+        o.kern
+            .run_matmul8(3, &o.instr, o.n, &rl.bo_bf16, w1, &o.bo_out, &o.dummy_tmp, &o.dummy_tr)
+            .unwrap();
+        self.stats.borrow_mut().dispatches += 1; // fc1 only -- the deint is folded into its drain
+        Some(&o.bo_out)
+    }
+
     /// Shared one-dispatch K=DFF fc2: cast the fc1 output (`fc1_out` f32 [PAD_M,DFF]) to bf16 row-major,
     /// then ONE K=DFF modal GEMM (internal L1 K-accum over DFF) with the full fc2 weight -> f32
     /// [PAD_M,KRES] device BO. Counts 2 dispatches (cast + modal); the caller counts fc1. Full fc2
@@ -1855,32 +1934,40 @@ impl NpuMatmul {
                 self.weight_bo(id1, w.view())
             })
         };
-        let st1 = self.stream(DFF, Act::Silu); // fc1 on-chip SiLU iff modal (plain resident ignores it)
-        self.kern.run_matmul8(3, &st1.instr, st1.n_instr, &rl.bo_bf16, &w1, &st1.bo_c, &self.bo_tmp, &self.bo_tr).unwrap();
-        // ONE-DISPATCH K=DFF fc2 (opt-in): cast@DFF -> K=DFF modal -> readback to host [m,KRES].
-        if self.fc2_k4096_on() {
-            if let Some(k4) = rl.fc2_k4096.as_ref() {
-                self.stats.borrow_mut().dispatches += 1; // fc1
-                let bo = self.fc2_k4096_dev(k4, &st1.bo_c, make_w2, id2);
-                bo.sync_from_device().unwrap();
-                let mut cb = vec![0u8; m * KRES * 4];
-                bo.read_bytes(&mut cb).unwrap();
-                let mut out = Array2::<f32>::zeros((m, KRES));
-                for r in 0..m {
-                    for c in 0..KRES {
-                        let off = (r * KRES + c) * 4;
-                        out[[r, c]] = f32::from_le_bytes([cb[off], cb[off + 1], cb[off + 2], cb[off + 3]]);
+        // fc1 -> chunk-major bf16. The fold (opt-in) does it in ONE dispatch; otherwise the shipped
+        // fc1 + deint pair. `a_chunks` is the buffer the fc2 K-split sub-slices either way.
+        let a_chunks: &Bo = match self.fc1_pack_in_drain(&rl, &w1) {
+            Some(bo) => bo,
+            None => {
+                let st1 = self.stream(DFF, Act::Silu); // fc1 on-chip SiLU iff modal (plain resident ignores it)
+                self.kern.run_matmul8(3, &st1.instr, st1.n_instr, &rl.bo_bf16, &w1, &st1.bo_c, &self.bo_tmp, &self.bo_tr).unwrap();
+                // ONE-DISPATCH K=DFF fc2 (opt-in): cast@DFF -> K=DFF modal -> readback to host [m,KRES].
+                if self.fc2_k4096_on() {
+                    if let Some(k4) = rl.fc2_k4096.as_ref() {
+                        self.stats.borrow_mut().dispatches += 1; // fc1
+                        let bo = self.fc2_k4096_dev(k4, &st1.bo_c, make_w2, id2);
+                        bo.sync_from_device().unwrap();
+                        let mut cb = vec![0u8; m * KRES * 4];
+                        bo.read_bytes(&mut cb).unwrap();
+                        let mut out = Array2::<f32>::zeros((m, KRES));
+                        for r in 0..m {
+                            for c in 0..KRES {
+                                let off = (r * KRES + c) * 4;
+                                out[[r, c]] = f32::from_le_bytes([cb[off], cb[off + 1], cb[off + 2], cb[off + 3]]);
+                            }
+                        }
+                        return out;
                     }
                 }
-                return out;
+                // deinterleave+cast: st1.bo_c (f32 [PAD_M,DFF]) -> rl.bo_deint (bf16 [parts,PAD_M,KRES]
+                // chunk-major), device-side. One dispatch (chunk-major drain TAP). NOTE: this n-D output DMA
+                // HANGS ("run did not complete") when the deint is a co-resident hw-context alongside the
+                // modal (it works standalone) -- a multi-context n-D-DMA toolchain issue; see the debug note.
+                rl.deint_kern.run_matmul8(3, &rl.deint_instr, rl.deint_n, &st1.bo_c, &rl.bo_deint, &rl.deint_c, &rl.deint_tmp, &rl.deint_tr).unwrap();
+                self.stats.borrow_mut().dispatches += 2; // fc1 + deint
+                &rl.bo_deint
             }
-        }
-        // deinterleave+cast: st1.bo_c (f32 [PAD_M,DFF]) -> rl.bo_deint (bf16 [parts,PAD_M,KRES]
-        // chunk-major), device-side. One dispatch (chunk-major drain TAP). NOTE: this n-D output DMA
-        // HANGS ("run did not complete") when the deint is a co-resident hw-context alongside the
-        // modal (it works standalone) -- a multi-context n-D-DMA toolchain issue; see the debug note.
-        rl.deint_kern.run_matmul8(3, &rl.deint_instr, rl.deint_n, &st1.bo_c, &rl.bo_deint, &rl.deint_c, &rl.deint_tmp, &rl.deint_tr).unwrap();
-        self.stats.borrow_mut().dispatches += 2; // fc1 + deint
+        };
         // fc2 K-split: each K=KRES chunk is a device SUB-BUFFER of bo_deint; K=KRES modal (identity),
         // host-accumulate the `parts` partials in f32 -- bit-identical to the host K-split (WER-neutral).
         let parts = DFF / KRES;
@@ -1895,7 +1982,7 @@ impl NpuMatmul {
         };
         let mut acc = Array2::<f32>::zeros((m, KRES));
         for c in 0..parts {
-            let chunk = rl.bo_deint.sub(c * chunk_bytes, chunk_bytes).unwrap();
+            let chunk = a_chunks.sub(c * chunk_bytes, chunk_bytes).unwrap();
             let sid = format!("{id2}.{c}");
             let w2c = {
                 let cc = self.wcache.borrow().get(&sid).cloned();
@@ -1930,15 +2017,21 @@ impl NpuMatmul {
         };
         // Ported to the Act enum that `stream()` took on in the k768 rail merge; matches the f32
         // sibling `resident_ffn` exactly (was `self.modal` under the old bool API).
-        let st1 = self.stream(DFF, Act::Silu); // fc1 on-chip SiLU iff modal (plain resident ignores it)
-        self.kern.run_matmul8(3, &st1.instr, st1.n_instr, &rl.bo_bf16, &w1, &st1.bo_c, &self.bo_tmp, &self.bo_tr).unwrap();
-        rl.deint_kern.run_matmul8(3, &rl.deint_instr, rl.deint_n, &st1.bo_c, &rl.bo_deint, &rl.deint_c, &rl.deint_tmp, &rl.deint_tr).unwrap();
-        self.stats.borrow_mut().dispatches += 2; // fc1 + deint
+        let a_chunks: &Bo = match self.fc1_pack_in_drain(&rl, &w1) {
+            Some(bo) => bo,
+            None => {
+                let st1 = self.stream(DFF, Act::Silu); // fc1 on-chip SiLU iff modal (plain resident ignores it)
+                self.kern.run_matmul8(3, &st1.instr, st1.n_instr, &rl.bo_bf16, &w1, &st1.bo_c, &self.bo_tmp, &self.bo_tr).unwrap();
+                rl.deint_kern.run_matmul8(3, &rl.deint_instr, rl.deint_n, &st1.bo_c, &rl.bo_deint, &rl.deint_c, &rl.deint_tmp, &rl.deint_tr).unwrap();
+                self.stats.borrow_mut().dispatches += 2; // fc1 + deint
+                &rl.bo_deint
+            }
+        };
         let parts = DFF / KRES;
         let chunk_bytes = PAD_M * KRES * 2;
         let mut acc = Array2::<f32>::zeros((m, KRES));
         for c in 0..parts {
-            let chunk = rl.bo_deint.sub(c * chunk_bytes, chunk_bytes).unwrap();
+            let chunk = a_chunks.sub(c * chunk_bytes, chunk_bytes).unwrap();
             let sid = format!("{id2}.{c}");
             let w2c = {
                 let cc = self.wcache.borrow().get(&sid).cloned();
@@ -1970,21 +2063,27 @@ impl NpuMatmul {
                 self.weight_bo(id1, w.view())
             })
         };
-        let st1 = self.stream(DFF, Act::Silu); // fc1 on-chip SiLU iff modal (plain resident ignores it)
-        self.kern.run_matmul8(3, &st1.instr, st1.n_instr, &rl.bo_bf16, &w1, &st1.bo_c, &self.bo_tmp, &self.bo_tr).unwrap();
-        // ONE-DISPATCH fc2 (K=DFF): cast fc1's f32 [PAD_M,DFF] -> bf16 row-major, then a SINGLE K=DFF
-        // modal GEMM that accumulates all DFF K internally in L1 -> f32 [PAD_M,KRES] device. Collapses
-        // deint + 4x K=1024 GEMM + 4x acc_add (8 dispatches) into cast + 1 modal (2). NOT bit-identical
-        // to the 4-way split (different L1 accum + bfp16) -> validated by the sound rel-L2 gate.
-        if self.fc2_k4096_on() {
-            if let Some(k4) = rl.fc2_k4096.as_ref() {
-                self.stats.borrow_mut().dispatches += 1; // fc1
-                return self.fc2_k4096_dev(k4, &st1.bo_c, make_w2, id2);
+        let a_chunks: &Bo = match self.fc1_pack_in_drain(rl, &w1) {
+            Some(bo) => bo,
+            None => {
+                let st1 = self.stream(DFF, Act::Silu); // fc1 on-chip SiLU iff modal (plain resident ignores it)
+                self.kern.run_matmul8(3, &st1.instr, st1.n_instr, &rl.bo_bf16, &w1, &st1.bo_c, &self.bo_tmp, &self.bo_tr).unwrap();
+                // ONE-DISPATCH fc2 (K=DFF): cast fc1's f32 [PAD_M,DFF] -> bf16 row-major, then a SINGLE K=DFF
+                // modal GEMM that accumulates all DFF K internally in L1 -> f32 [PAD_M,KRES] device. Collapses
+                // deint + 4x K=1024 GEMM + 4x acc_add (8 dispatches) into cast + 1 modal (2). NOT bit-identical
+                // to the 4-way split (different L1 accum + bfp16) -> validated by the sound rel-L2 gate.
+                if self.fc2_k4096_on() {
+                    if let Some(k4) = rl.fc2_k4096.as_ref() {
+                        self.stats.borrow_mut().dispatches += 1; // fc1
+                        return self.fc2_k4096_dev(k4, &st1.bo_c, make_w2, id2);
+                    }
+                }
+                // deinterleave+cast: st1.bo_c (f32 [PAD_M,DFF]) -> rl.bo_deint (bf16 chunk-major), device-side.
+                rl.deint_kern.run_matmul8(3, &rl.deint_instr, rl.deint_n, &st1.bo_c, &rl.bo_deint, &rl.deint_c, &rl.deint_tmp, &rl.deint_tr).unwrap();
+                self.stats.borrow_mut().dispatches += 2; // fc1 + deint
+                &rl.bo_deint
             }
-        }
-        // deinterleave+cast: st1.bo_c (f32 [PAD_M,DFF]) -> rl.bo_deint (bf16 chunk-major), device-side.
-        rl.deint_kern.run_matmul8(3, &rl.deint_instr, rl.deint_n, &st1.bo_c, &rl.bo_deint, &rl.deint_c, &rl.deint_tmp, &rl.deint_tr).unwrap();
-        self.stats.borrow_mut().dispatches += 2; // fc1 + deint
+        };
         // fc2 K-split with ON-DEVICE accumulate: each partial modal GEMM -> st.bo_c (device); acc_add
         // sums it into the acc0/acc1 ping-pong (seed acc=0 for partial0). Result stays device-resident.
         let parts = DFF / KRES;
@@ -2001,7 +2100,7 @@ impl NpuMatmul {
         let mut cur = aa.acc0.clone();
         let mut nxt = aa.acc1.clone();
         for c in 0..parts {
-            let chunk = rl.bo_deint.sub(c * chunk_bytes, chunk_bytes).unwrap();
+            let chunk = a_chunks.sub(c * chunk_bytes, chunk_bytes).unwrap();
             let sid = format!("{id2}.{c}");
             let w2c = {
                 let cc = self.wcache.borrow().get(&sid).cloned();
