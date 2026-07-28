@@ -10,9 +10,12 @@ include ${srcdir}/../../makefile-common
 VPATH := ${srcdir}/../../../aie_kernels/aie2p
 
 devicename ?= $(if $(filter 1,$(NPU2)),npu2,npu)
+partcols ?=
+partflag = $(if ${partcols},-p ${partcols},)
+partsuf  = $(if ${partcols},_p${partcols}c,)
 rows ?= 512
 cols ?= 1024
-tag = cast_${rows}x${cols}
+tag = cast_${rows}x${cols}${partsuf}
 
 aie_py_src = cast_f32_bf16_iron.py
 
@@ -24,7 +27,7 @@ build/cast_f32_bf16.o: cast_f32_bf16.cc
 
 build/aie_${tag}.mlir: ${srcdir}/${aie_py_src}
 	mkdir -p ${@D}
-	python3 $< -d ${devicename} -r ${rows} -c ${cols} -t 0 > $@
+	python3 $< -d ${devicename} -r ${rows} -c ${cols} -t 0 ${partflag} > $@
 
 build/final_${tag}.xclbin: build/aie_${tag}.mlir build/cast_f32_bf16.o
 	mkdir -p ${@D}

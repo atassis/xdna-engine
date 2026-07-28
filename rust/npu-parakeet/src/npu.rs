@@ -206,6 +206,18 @@ struct ResidentLn {
     ac_kern: Rc<Kernel>, // affine_cast
     ac_instr: Bo,
     ac_n: usize,
+    // FUSED ctxLN->affine_cast in ONE dispatch (x, gamma|beta) -> bf16, skipping the f32 bo_ln
+    // intermediate entirely. OPTIONAL like glu: absent -> the two-dispatch chain.
+    //
+    // This is a TRANSITION lever, not a dispatch-count one. Measured in place on the shipped path
+    // (`NPU_DISPATCH_LOG=1`): a dispatch that FOLLOWS a different xclbin costs 1.669 ms mean against
+    // 0.267 ms for one on the same xclbin, and 239 of 552 dispatches/clip follow a switch. Collapsing
+    // this pair removes 48 dispatches AND the 48 ctxln->affcast transitions with them.
+    //
+    // NOT usable by `resident_mha_affine_ln_f32`, which reads the f32 `bo_ln` the fused kernel never
+    // materializes -- that caller goes through `ln_affine_cast_chained`. `PARAKEET_LN_FUSED=0`
+    // restores the chain everywhere.
+    lnaffcast: Option<LnFused>,
     bo_x: Bo,    // [PAD_M, KRES] f32   (ctxLN input,  ln g3)
     bo_ln: Bo,   // [PAD_M, KRES] f32   (ctxLN output = affine_cast input, ln g4 / ac g3)
     bo_gb: Bo,   // [2*KRES] f32        (gamma|beta params, ac g4)
@@ -261,6 +273,17 @@ struct ConvGlu {
     n: usize,
     bo_out: Bo, // [PAD_M, KRES] f32 (glu output, g4)
     dummy_c: Bo,
+    dummy_tmp: Bo,
+    dummy_tr: Bo,
+}
+
+/// Fused ctxLN -> affine_cast brick: `(x f32[PAD_M,KRES], gamma|beta f32[2*KRES]) -> bf16[PAD_M,KRES]`
+/// in one dispatch. Same 8-arg host ABI as the bricks it replaces (x g3, gb g4, out g5), so it drops
+/// straight into either call site. Reuses the chain's `bo_gb`/`bo_bf16`, owning only its dummies.
+struct LnFused {
+    kern: Rc<Kernel>,
+    instr: Bo,
+    n: usize,
     dummy_tmp: Bo,
     dummy_tr: Bo,
 }
@@ -673,7 +696,9 @@ impl NpuMatmul {
     pub fn resident_mha_affine_ln_f32(&self, x: &Array2<f32>, gamma: &[f32], beta: &[f32]) -> Array2<f32> {
         self.stats.borrow_mut().calls += 1;
         let m = x.nrows();
-        let rl = self.ln_affine_cast(x, gamma, beta); // device ctxLN -> bo_ln (f32); affine_cast -> bo_bf16
+        // CHAINED on purpose: this path reads the f32 `bo_ln` back, and the fused ctxLN->affine_cast
+        // kernel never materializes it.
+        let rl = self.ln_affine_cast_chained(x, gamma, beta);
         rl.bo_ln.sync_from_device().unwrap();
         let mut cb = vec![0u8; PAD_M * KRES * 4];
         rl.bo_ln.read_bytes(&mut cb).unwrap();
@@ -959,6 +984,27 @@ impl NpuMatmul {
         let (deint_kern, deint_instr, deint_n) = load_path(
             self.ln_dir.join(format!("final_deint_{PAD_M}x{DFF}.xclbin")),
             self.ln_dir.join(format!("insts_deint_{PAD_M}x{DFF}.txt")));
+        // FUSED ctxLN->affine_cast, OPTIONAL like glu. Default ON when built; PARAKEET_LN_FUSED=0
+        // forces the two-dispatch chain back (two-way, not a one-way flip).
+        let lnaffcast = {
+            let want = std::env::var("PARAKEET_LN_FUSED").map(|v| v != "0").unwrap_or(true);
+            let xcl = self.ln_dir.join(format!("final_lnaffcast_{PAD_M}x{KRES}.xclbin"));
+            let ins = self.ln_dir.join(format!("insts_lnaffcast_{PAD_M}x{KRES}.txt"));
+            if want && xcl.exists() && ins.exists() {
+                let (kern, instr, n) = load_path(xcl, ins);
+                let gg = |i| kern.group_id(i).unwrap();
+                Some(LnFused {
+                    dummy_tmp: self.dev.alloc_bo(&kern, 8, FLAG_HOST_ONLY, gg(6)).unwrap(),
+                    dummy_tr: self.dev.alloc_bo(&kern, 1, FLAG_HOST_ONLY, gg(7)).unwrap(),
+                    kern, instr, n,
+                })
+            } else {
+                if !npu_xrt::quiet() && want {
+                    eprintln!("[npu] lnaffcast xclbin absent in {} -- LN seam stays a 2-dispatch chain", self.ln_dir.display());
+                }
+                None
+            }
+        };
         // conv-module GLU (step 2), OPTIONAL: load only if the glu xclbin was built. A/g3 input is fed
         // from the modal stream's bo_c (pw1 output); bo_out (g4) is the [PAD_M,KRES] f32 GLU result.
         let glu = {
@@ -1167,7 +1213,7 @@ impl NpuMatmul {
             deint_c: self.dev.alloc_bo(&deint_kern, 1, FLAG_HOST_ONLY, gd(5)).unwrap(),
             deint_tmp: self.dev.alloc_bo(&deint_kern, 8, FLAG_HOST_ONLY, gd(6)).unwrap(),
             deint_tr: self.dev.alloc_bo(&deint_kern, 1, FLAG_HOST_ONLY, gd(7)).unwrap(),
-            ln_kern, ln_instr, ln_n, ac_kern, ac_instr, ac_n,
+            ln_kern, ln_instr, ln_n, ac_kern, ac_instr, ac_n, lnaffcast,
             deint_kern, deint_instr, deint_n, glu, acc_add, resadd_s050, resadd_s100, fc2_k4096, dwconv, silu, dwconv_silu, dwconv_silu_t,
         });
         rl
@@ -1215,9 +1261,39 @@ impl NpuMatmul {
         gb[KRES..].copy_from_slice(beta);
         rl.bo_gb.write_bytes(f32_bytes(&gb)).unwrap();
         rl.bo_gb.sync_to_device().unwrap();
-        // (1) ctxLN: bo_x -> bo_ln  (NO sync back -- stays device-resident)
+        match rl.lnaffcast.as_ref() {
+            // ONE dispatch: (bo_x, gamma|beta) -> bo_bf16. bo_ln is never materialized.
+            Some(f) => {
+                f.kern.run_matmul8(3, &f.instr, f.n, &rl.bo_x, &rl.bo_gb, &rl.bo_bf16, &f.dummy_tmp, &f.dummy_tr).unwrap();
+                self.stats.borrow_mut().dispatches += 1;
+            }
+            None => {
+                // (1) ctxLN: bo_x -> bo_ln  (NO sync back -- stays device-resident)
+                rl.ln_kern.run_matmul8(3, &rl.ln_instr, rl.ln_n, &rl.bo_x, &rl.bo_ln, &rl.ln_c, &rl.ln_tmp, &rl.ln_tr).unwrap();
+                // (2) affine_cast: (bo_ln * gamma + beta) -> bo_bf16  (device-side, no host round-trip)
+                rl.ac_kern.run_matmul8(3, &rl.ac_instr, rl.ac_n, &rl.bo_ln, &rl.bo_gb, &rl.bo_bf16, &rl.ac_tmp, &rl.ac_tr).unwrap();
+                self.stats.borrow_mut().dispatches += 2;
+            }
+        }
+        rl
+    }
+
+    /// [`Self::ln_affine_cast`] forced onto the two-dispatch chain, so `bo_ln` (the f32 LN output)
+    /// IS materialized. Only for callers that read it back -- the fused kernel skips it.
+    fn ln_affine_cast_chained(&self, x: &Array2<f32>, gamma: &[f32], beta: &[f32]) -> Rc<ResidentLn> {
+        let rl = self.resident_ln().expect("ln_affine_cast_chained without resident_ff_available()");
+        let x_std = x.as_standard_layout();
+        let t = x.nrows();
+        let mut buf = vec![0f32; PAD_M * KRES];
+        buf[..t * KRES].copy_from_slice(&x_std.as_slice().unwrap()[..t * KRES]);
+        rl.bo_x.write_bytes(f32_bytes(&buf)).unwrap();
+        rl.bo_x.sync_to_device().unwrap();
+        let mut gb = vec![0f32; 2 * KRES];
+        gb[..KRES].copy_from_slice(gamma);
+        gb[KRES..].copy_from_slice(beta);
+        rl.bo_gb.write_bytes(f32_bytes(&gb)).unwrap();
+        rl.bo_gb.sync_to_device().unwrap();
         rl.ln_kern.run_matmul8(3, &rl.ln_instr, rl.ln_n, &rl.bo_x, &rl.bo_ln, &rl.ln_c, &rl.ln_tmp, &rl.ln_tr).unwrap();
-        // (2) affine_cast: (bo_ln * gamma + beta) -> bo_bf16  (device-side, no host round-trip)
         rl.ac_kern.run_matmul8(3, &rl.ac_instr, rl.ac_n, &rl.bo_ln, &rl.bo_gb, &rl.bo_bf16, &rl.ac_tmp, &rl.ac_tr).unwrap();
         self.stats.borrow_mut().dispatches += 2;
         rl
@@ -1238,11 +1314,20 @@ impl NpuMatmul {
         gb[KRES..].copy_from_slice(beta);
         rl.bo_gb.write_bytes(f32_bytes(&gb)).unwrap();
         rl.bo_gb.sync_to_device().unwrap();
-        // (1) ctxLN: a_bo -> bo_ln  (DEVICE-IN: no host write of x; stays device-resident)
-        rl.ln_kern.run_matmul8(3, &rl.ln_instr, rl.ln_n, a_bo, &rl.bo_ln, &rl.ln_c, &rl.ln_tmp, &rl.ln_tr).unwrap();
-        // (2) affine_cast: (bo_ln * gamma + beta) -> bo_bf16  (device-side)
-        rl.ac_kern.run_matmul8(3, &rl.ac_instr, rl.ac_n, &rl.bo_ln, &rl.bo_gb, &rl.bo_bf16, &rl.ac_tmp, &rl.ac_tr).unwrap();
-        self.stats.borrow_mut().dispatches += 2;
+        match rl.lnaffcast.as_ref() {
+            // ONE dispatch, DEVICE-IN: (a_bo, gamma|beta) -> bo_bf16.
+            Some(f) => {
+                f.kern.run_matmul8(3, &f.instr, f.n, a_bo, &rl.bo_gb, &rl.bo_bf16, &f.dummy_tmp, &f.dummy_tr).unwrap();
+                self.stats.borrow_mut().dispatches += 1;
+            }
+            None => {
+                // (1) ctxLN: a_bo -> bo_ln  (DEVICE-IN: no host write of x; stays device-resident)
+                rl.ln_kern.run_matmul8(3, &rl.ln_instr, rl.ln_n, a_bo, &rl.bo_ln, &rl.ln_c, &rl.ln_tmp, &rl.ln_tr).unwrap();
+                // (2) affine_cast: (bo_ln * gamma + beta) -> bo_bf16  (device-side)
+                rl.ac_kern.run_matmul8(3, &rl.ac_instr, rl.ac_n, &rl.bo_ln, &rl.bo_gb, &rl.bo_bf16, &rl.ac_tmp, &rl.ac_tr).unwrap();
+                self.stats.borrow_mut().dispatches += 2;
+            }
+        }
         rl
     }
 

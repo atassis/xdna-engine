@@ -11,9 +11,14 @@ include ${srcdir}/../../makefile-common
 VPATH := ${srcdir}/../../../aie_kernels/aie2p
 
 devicename ?= $(if $(filter 1,$(NPU2)),npu2,npu)
+# partcols=N restricts the PARTITION to N columns (default: full device). A brick that uses 2
+# columns but claims 8 blocks co-residency, making every xclbin transition an array reprogram.
+partcols ?=
+partflag = $(if ${partcols},-p ${partcols},)
+partsuf  = $(if ${partcols},_p${partcols}c,)
 rows ?= 400
 cols ?= 768
-tag = ctxln_${rows}x${cols}
+tag = ctxln_${rows}x${cols}${partsuf}
 
 aie_py_src = ctx_ln_iron.py
 
@@ -25,7 +30,7 @@ build/ln_2pass.o: ln_2pass.cc
 
 build/aie_${tag}.mlir: ${srcdir}/${aie_py_src}
 	mkdir -p ${@D}
-	python3 $< -d ${devicename} -r ${rows} -c ${cols} -t 0 > $@
+	python3 $< -d ${devicename} -r ${rows} -c ${cols} -t 0 ${partflag} > $@
 
 build/final_${tag}.xclbin: build/aie_${tag}.mlir build/ln_2pass.o
 	mkdir -p ${@D}

@@ -56,6 +56,9 @@ fn main() {
     let mut n = 0;
     for p in &names {
         let mel = load_mel(p);
+        // Reset per clip so the report below describes ONE warm clip, not the whole set.
+        #[cfg(feature = "npu")]
+        npu_xrt::dispatch_log::reset();
         let t0 = Instant::now();
         let enc_out = enc.encode(&mel); // [T', 1024]
         let dt = t0.elapsed().as_secs_f64();
@@ -72,4 +75,14 @@ fn main() {
         println!("{s}");
     }
     println!("host profile (desc by time):\n{}", npu_parakeet::prof::report());
+    // NPU_DISPATCH_LOG=1: xclbin-transition accounting for the LAST clip. 0.99 ms/switch is the
+    // measured modal<->relpos hw-context-switch cost (`modal-relpos-per-switch-cost`).
+    #[cfg(feature = "npu")]
+    if npu_xrt::dispatch_log::enabled() {
+        println!("\ndispatch transitions (last clip):\n{}", npu_xrt::dispatch_log::report(0.99));
+        if let Ok(p) = std::env::var("NPU_DISPATCH_SEQ") {
+            npu_xrt::dispatch_log::write_sequence(&p).unwrap();
+            println!("wrote dispatch sequence -> {p}");
+        }
+    }
 }

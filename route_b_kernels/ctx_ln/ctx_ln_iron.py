@@ -21,7 +21,7 @@ import argparse
 import sys
 
 from aie.iron import Kernel, ObjectFifo, Program, Runtime, Worker
-from aie.iron.device import NPU1, NPU2
+from aie.iron.device import NPU1, NPU2, from_name
 from aie.helpers.taplib import TensorTiler2D
 from aie.iron.controlflow import range_
 
@@ -89,7 +89,12 @@ p.add_argument("-d", "--dev", required=True, dest="device")
 p.add_argument("-r", "--rows", required=True, dest="rows")
 p.add_argument("-c", "--cols", required=True, dest="cols")
 p.add_argument("-t", "--trace_size", required=False, dest="trace_size", default=0)
+# Partition WIDTH in columns. Default = full device (the shipped behaviour). A brick that uses
+# 2 columns but claims 8 cannot co-reside with any other design, so every xclbin-to-xclbin
+# transition becomes a full array reprogram -- this flag exists to measure that.
+p.add_argument("-p", "--part-cols", required=False, type=int, default=None, dest="part_cols")
 opts = p.parse_args(sys.argv[1:])
 
-dev = NPU2() if opts.device == "npu2" else NPU1()
+dev = (from_name(opts.device, n_cols=opts.part_cols) if opts.part_cols
+       else (NPU2() if opts.device == "npu2" else NPU1()))
 print(ctx_ln(dev, int(opts.rows), int(opts.cols), int(opts.trace_size)))

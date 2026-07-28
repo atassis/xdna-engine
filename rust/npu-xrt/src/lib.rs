@@ -23,6 +23,134 @@ pub fn quiet() -> bool {
     *QUIET.get_or_init(|| std::env::var("NPU_QUIET").map(|v| v != "0").unwrap_or(false))
 }
 
+/// Per-dispatch xclbin-TRANSITION accounting, gated by `NPU_DISPATCH_LOG=1`.
+///
+/// Every dispatch funnels through a [`Kernel`] method, so counting here covers every call site with
+/// no per-site edits. What we want is not the dispatch COUNT (already known) but how many of those
+/// dispatches land on a DIFFERENT xclbin than the previous one -- a transition between whole-array
+/// hw_contexts costs ~0.99 ms (`modal-relpos-per-switch-cost`) against ~0.05-0.1 ms for a warm
+/// same-context dispatch, so the transition count is what predicts wall clock.
+pub mod dispatch_log {
+    use std::cell::RefCell;
+    use std::collections::BTreeMap;
+    use std::sync::OnceLock;
+
+    pub fn enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var("NPU_DISPATCH_LOG").map(|v| v != "0").unwrap_or(false))
+    }
+
+    #[derive(Default)]
+    struct Log {
+        prev: Option<String>,
+        dispatches: usize,
+        transitions: usize,
+        per_kernel: BTreeMap<String, usize>,
+        /// (from -> to) transition pairs, so we can separate GEMM<->brick from brick<->brick.
+        pairs: BTreeMap<(String, String), usize>,
+        /// Full dispatch order, so a probe can REPLAY the real sequence rather than approximate it.
+        seq: Vec<String>,
+        /// Blocking wall time per kernel, and the same split by whether this dispatch FOLLOWED a
+        /// different xclbin. A standalone probe cannot get this right (it has to guess which
+        /// instruction stream each dispatch used); measuring in place cannot get it wrong.
+        secs_by_kernel: BTreeMap<String, f64>,
+        secs_switched: f64,
+        secs_same: f64,
+        n_switched: usize,
+        n_same: usize,
+    }
+
+    thread_local!(static L: RefCell<Log> = RefCell::new(Log::default()));
+
+    /// Record one dispatch on `label`, having taken `secs` of blocking wall time. Cheap no-op
+    /// unless `NPU_DISPATCH_LOG` is set.
+    pub fn note(label: &str, secs: f64) {
+        if !enabled() {
+            return;
+        }
+        L.with(|l| {
+            let mut l = l.borrow_mut();
+            l.dispatches += 1;
+            *l.per_kernel.entry(label.to_string()).or_insert(0) += 1;
+            *l.secs_by_kernel.entry(label.to_string()).or_insert(0.0) += secs;
+            let switched = l.prev.as_deref().is_some_and(|p| p != label);
+            if switched {
+                l.transitions += 1;
+                let from = l.prev.clone().unwrap();
+                *l.pairs.entry((from, label.to_string())).or_insert(0) += 1;
+                l.secs_switched += secs;
+                l.n_switched += 1;
+            } else if l.prev.is_some() {
+                l.secs_same += secs;
+                l.n_same += 1;
+            }
+            l.prev = Some(label.to_string());
+            l.seq.push(label.to_string());
+        })
+    }
+
+    pub fn reset() {
+        L.with(|l| *l.borrow_mut() = Log::default())
+    }
+
+    /// The recorded dispatch order, one label per line. Feed to the switch-cost probe so its
+    /// "rotating" arm is the REAL sequence and its "grouped" arm is that same multiset sorted --
+    /// identical bytes and compute, only the transition count differs.
+    pub fn write_sequence(path: &str) -> std::io::Result<()> {
+        L.with(|l| std::fs::write(path, l.borrow().seq.join("\n")))
+    }
+
+    /// Dispatches, transitions, and the transition breakdown -- newline-separated, most-frequent
+    /// pair first. `switch_ms` is applied to the transition count to give a predicted switch tax.
+    pub fn report(switch_ms: f64) -> String {
+        L.with(|l| {
+            let l = l.borrow();
+            let mut out = vec![format!(
+                "dispatches {} | transitions {} ({:.1}%) | predicted switch tax {:.3} s @ {:.2} ms/switch",
+                l.dispatches,
+                l.transitions,
+                100.0 * l.transitions as f64 / l.dispatches.max(1) as f64,
+                l.transitions as f64 * switch_ms / 1e3,
+                switch_ms,
+            )];
+            let total: f64 = l.secs_by_kernel.values().sum();
+            out.push(format!("  total BLOCKING dispatch time {total:.3} s"));
+            out.push("  per-kernel  (count, total s, mean ms):".into());
+            let mut ks: Vec<_> = l.per_kernel.iter().collect();
+            ks.sort_by(|a, b| b.1.cmp(a.1));
+            for (k, n) in ks {
+                let s = l.secs_by_kernel.get(k).copied().unwrap_or(0.0);
+                out.push(format!("    {k:<34} x{n:<5} {s:>7.3}s  {:>7.3} ms", s * 1e3 / *n as f64));
+            }
+            // The load-bearing split: same-xclbin dispatches vs those that FOLLOWED a different one.
+            let (ms_sw, ms_sa) = (
+                l.secs_switched * 1e3 / l.n_switched.max(1) as f64,
+                l.secs_same * 1e3 / l.n_same.max(1) as f64,
+            );
+            out.push(format!(
+                "  after a SWITCH: {} dispatches, {:.3}s, {:.3} ms mean",
+                l.n_switched, l.secs_switched, ms_sw
+            ));
+            out.push(format!(
+                "  same xclbin   : {} dispatches, {:.3}s, {:.3} ms mean",
+                l.n_same, l.secs_same, ms_sa
+            ));
+            out.push(format!(
+                "  => excess attributable to switching: {:.3} s ({:.1}% of blocking time)",
+                (ms_sw - ms_sa) * l.n_switched as f64 / 1e3,
+                100.0 * (ms_sw - ms_sa) * l.n_switched as f64 / 1e3 / total.max(1e-9)
+            ));
+            out.push("  transitions (from -> to):".into());
+            let mut ps: Vec<_> = l.pairs.iter().collect();
+            ps.sort_by(|a, b| b.1.cmp(a.1));
+            for ((f, t), n) in ps.iter().take(20) {
+                out.push(format!("    {f:<28} -> {t:<28} x{n}"));
+            }
+            out.join("\n")
+        })
+    }
+}
+
 #[repr(C)]
 struct CDevice {
     _private: [u8; 0],
@@ -195,6 +323,8 @@ pub struct Device {
 /// An xclbin loaded into a hw_context with its kernel resolved.
 pub struct Kernel {
     ptr: *mut CKernel,
+    /// xclbin basename, used only by [`dispatch_log`] to identify hw_context transitions.
+    label: String,
 }
 
 /// A fused full-ELF kernel: the IRON `FusedMLIROperator` dispatch path. Built from raw ELF bytes
@@ -290,7 +420,12 @@ impl Device {
         if ptr.is_null() {
             return Err(format!("load_kernel({xclbin_path}): {}", last_error()));
         }
-        let k = Rc::new(Kernel { ptr });
+        let label = std::path::Path::new(xclbin_path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(xclbin_path)
+            .to_string();
+        let k = Rc::new(Kernel { ptr, label });
         self.kernels.borrow_mut().insert(key, k.clone());
         Ok(k)
     }
@@ -402,11 +537,13 @@ impl Kernel {
         tmp: &Bo,
         trace: &Bo,
     ) -> Result<()> {
+        let _t = std::time::Instant::now();
         let r = unsafe {
             shim_run_matmul8(
                 self.ptr, opcode, instr.ptr, count, a.ptr, b.ptr, c.ptr, tmp.ptr, trace.ptr,
             )
         };
+        dispatch_log::note(&self.label, _t.elapsed().as_secs_f64());
         if r != 0 {
             Err(format!("run_matmul8: {}", last_error()))
         } else {
@@ -429,6 +566,7 @@ impl Kernel {
         tmp: &Bo,
         trace: &Bo,
     ) -> Result<Run> {
+        dispatch_log::note(&self.label, 0.0);
         let ptr = unsafe {
             shim_run_matmul8_start(
                 self.ptr, opcode, instr.ptr, count, a.ptr, b.ptr, c.ptr, tmp.ptr, trace.ptr,
@@ -451,9 +589,11 @@ impl Kernel {
         w: &Bo,
         y: &Bo,
     ) -> Result<()> {
+        let _t = std::time::Instant::now();
         let r = unsafe {
             shim_run_dwconv6(self.ptr, opcode, instr.ptr, count, x.ptr, w.ptr, y.ptr)
         };
+        dispatch_log::note(&self.label, _t.elapsed().as_secs_f64());
         if r != 0 {
             Err(format!("run_dwconv6: {}", last_error()))
         } else {
@@ -474,9 +614,11 @@ impl Kernel {
         v: &Bo,
         o: &Bo,
     ) -> Result<()> {
+        let _t = std::time::Instant::now();
         let r = unsafe {
             shim_run_mha7(self.ptr, opcode, instr.ptr, count, q.ptr, k.ptr, v.ptr, o.ptr)
         };
+        dispatch_log::note(&self.label, _t.elapsed().as_secs_f64());
         if r != 0 {
             Err(format!("run_mha: {}", last_error()))
         } else {
@@ -498,9 +640,11 @@ impl Kernel {
         v: &Bo,
         ctx: &Bo,
     ) -> Result<()> {
+        let _t = std::time::Instant::now();
         let r = unsafe {
             shim_run_bd8(self.ptr, opcode, instr.ptr, count, qpv.ptr, p.ptr, k.ptr, v.ptr, ctx.ptr)
         };
+        dispatch_log::note(&self.label, _t.elapsed().as_secs_f64());
         if r != 0 {
             Err(format!("run_bd_conveyor: {}", last_error()))
         } else {
