@@ -1169,7 +1169,12 @@ impl NpuMatmul {
         // Fc1PanelBf16). Absent artifact still falls back cleanly, which is what makes default-on safe
         // for a tree that has not rebuilt the modal kernels.
         let fc1_panel_bf16 = {
-            let tag = format!("{PAD_M}x{KRES}x{DFF}_{FC1_PANEL_BF16_TILE}_8c_modalsilubf16outpanel{KRES}");
+            // Same PARAKEET_MODAL_EPI_SUFFIX hook as the modal streams. The panel fc1 carries its
+            // OWN copy of the epilogue, so an epilogue variant has to be built and selected here
+            // too -- otherwise the variant reaches only the identity-mode GEMMs and misses fc1,
+            // which is the one dispatch whose SiLU branch the variant actually changes.
+            let sfx = std::env::var("PARAKEET_MODAL_EPI_SUFFIX").unwrap_or_default();
+            let tag = format!("{PAD_M}x{KRES}x{DFF}_{FC1_PANEL_BF16_TILE}_8c_modalsilubf16outpanel{KRES}{sfx}");
             let xcl = self.ln_dir.join(format!("final_{tag}.xclbin"));
             let ins = self.ln_dir.join(format!("insts_{tag}.txt"));
             if xcl.exists() && ins.exists() {
@@ -2427,8 +2432,14 @@ impl NpuMatmul {
         }
         let g = |i| self.kern.group_id(i).unwrap();
         let insts = if self.modal {
+            // PARAKEET_MODAL_EPI_SUFFIX appends the Makefile.modal epilogue-variant tag (`re`,
+            // `ft`, `fh`, `refh`, ...) to the mode tag, so an epilogue A/B can select its own
+            // instruction streams. Pair it with NPU_RESIDENT_XCLBIN, which already overrides the
+            // xclbin: the variant is a different EPI_DEFINES build, so both the array program and
+            // every per-N stream carry the suffix and the two must not be mixed.
             let mode = act.mode_tag();
-            self.base.join(format!("insts_512x1024x{n}_{}_8c_{mode}.txt", self.tile))
+            let sfx = std::env::var("PARAKEET_MODAL_EPI_SUFFIX").unwrap_or_default();
+            self.base.join(format!("insts_512x1024x{n}_{}_8c_{mode}{sfx}.txt", self.tile))
         } else {
             self.base.join(format!("insts_512x1024x{n}_{}_8c.txt", self.tile))
         };
