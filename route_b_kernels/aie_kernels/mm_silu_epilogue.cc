@@ -157,6 +157,7 @@ static inline void mm_silu_epilogue_f32o_hiprec(const float *__restrict pC_in,
   event0();
   static_assert(size % 16 == 0, "tile size must be a multiple of 16");
   const aie::vector<float, 16> halff = aie::broadcast<float, 16>(0.5f);
+  const aie::vector<float, 16> onef = aie::broadcast<float, 16>(1.0f);
   const aie::vector<bfloat16, 16> one = aie::broadcast<bfloat16, 16>(1.0f);
   const aie::vector<bfloat16, 16> halfb = aie::broadcast<bfloat16, 16>(0.5f);
   const float *__restrict in_ptr = pC_in;
@@ -170,6 +171,20 @@ static inline void mm_silu_epilogue_f32o_hiprec(const float *__restrict pC_in,
     // only the tanh OUTPUT is bf16 (bounded in [-1,1], so bf16 is fine). This is the
     // precision-critical fix vs the all-bf16 f32o path, which rounded x before tanh.
     aie::vector<float, 16> half_x = aie::mul(accf, halff);
+#if defined(SILU_F32_TANH)
+    // No bf16 narrow anywhere in the sigmoid: tanh returns f32, so the (t+1)*0.5 tail is f32 too.
+    // Removes BOTH lossy roundings rather than merely de-biasing them.
+    aie::vector<float, 16> tf = aie::tanh<float>(half_x);
+    aie::vector<float, 16> sigf = aie::mul(aie::add(tf, onef), halff);
+#elif defined(SILU_F32_TAIL)
+    // Keep tanh's bf16 output (one narrow, unavoidable without an f32 tanh) but do the +1 and the
+    // *0.5 in f32. The bf16 add was the SECOND lossy rounding; *0.5 is exact either way.
+    aie::vector<bfloat16, 16> tanh_half_x = aie::tanh<bfloat16>(half_x);
+    aie::accum<accfloat, 16> tacc;
+    tacc.from_vector(tanh_half_x);
+    aie::vector<float, 16> tf = tacc.to_vector<float>();
+    aie::vector<float, 16> sigf = aie::mul(aie::add(tf, onef), halff);
+#else
     aie::vector<bfloat16, 16> tanh_half_x = aie::tanh<bfloat16>(half_x);
     aie::vector<bfloat16, 16> tanh_p1 = aie::add(tanh_half_x, one);
     aie::vector<bfloat16, 16> sig = aie::mul(tanh_p1, halfb); // bf16 sigmoid in [0,1]
@@ -177,6 +192,7 @@ static inline void mm_silu_epilogue_f32o_hiprec(const float *__restrict pC_in,
     aie::accum<accfloat, 16> sacc;
     sacc.from_vector(sig);
     aie::vector<float, 16> sigf = sacc.to_vector<float>();
+#endif
     aie::vector<float, 16> outv = aie::mul(accf, sigf);
     aie::store_v(out_ptr, outv);
     out_ptr += 16;
@@ -243,6 +259,117 @@ static inline void mm_identity_epilogue_f32o(const float *__restrict pC_in,
   for (int off = 0; off < size; off += 16) {
     aie::store_v(out_ptr, aie::load_v<16>(in_ptr));
     in_ptr += 16;
+    out_ptr += 16;
+  }
+  event1();
+}
+
+// --- bf16-OUT modal variants (fc1 -> fc2 seam, deinterleave folded away) ------
+// Same math as the f32-out modal epilogue above; only the STORE narrows to bf16.
+//
+// Why a bf16-out C at all, when the f32-out note above says bf16 out MEASURED as
+// a net loss: that verdict was about a HOST consumer, which then had to re-expand
+// bf16->f32 for its own math. Here the consumer is the fc2 GEMM, which wants bf16
+// in. Paired with the chunk-major C drain (--c-chunk-width) the GEMM writes
+// exactly the buffer fc2 reads, so the separate deinterleave+cast dispatch -- and
+// the two hardware-context transitions around it -- disappear, along with the f32
+// intermediate's DDR write and read-back.
+//
+// NUMERICS: bit-identical to the f32-out epilogue followed by cast_f32_bf16_row,
+// which is what this replaces. The activation math stays exactly as it was (the
+// hiprec silu keeps x and the final multiply in f32); only the final store is
+// narrowed. The rounding mode is LOAD-BEARING, not decoration: an accum narrow
+// TRUNCATES by default, while cast_f32_bf16_row selects round-to-nearest-even to
+// match the host pack. Truncating here would silently shift every fc1 output by
+// up to one ulp against the f32 truth the parity gate compares to.
+template <int size>
+static inline void mm_silu_epilogue_bf16o_hiprec(const float *__restrict pC_in,
+                                                 bfloat16 *__restrict pC_out) {
+  event0();
+  static_assert(size % 16 == 0, "tile size must be a multiple of 16");
+  aie::set_rounding(aie::rounding_mode::conv_even);
+  const aie::vector<float, 16> halff = aie::broadcast<float, 16>(0.5f);
+  const aie::vector<bfloat16, 16> one = aie::broadcast<bfloat16, 16>(1.0f);
+  const aie::vector<bfloat16, 16> halfb = aie::broadcast<bfloat16, 16>(0.5f);
+  const float *__restrict in_ptr = pC_in;
+  bfloat16 *__restrict out_ptr = pC_out;
+  AIE_PREPARE_FOR_PIPELINING
+  AIE_LOOP_MIN_ITERATION_COUNT(2)
+  for (int off = 0; off < size; off += 16) {
+    aie::vector<float, 16> accf = aie::load_v<16>(in_ptr);
+    in_ptr += 16;
+    aie::vector<float, 16> half_x = aie::mul(accf, halff);
+    aie::vector<bfloat16, 16> tanh_half_x = aie::tanh<bfloat16>(half_x);
+    aie::vector<bfloat16, 16> tanh_p1 = aie::add(tanh_half_x, one);
+    aie::vector<bfloat16, 16> sig = aie::mul(tanh_p1, halfb);
+    aie::accum<accfloat, 16> sacc;
+    sacc.from_vector(sig);
+    aie::vector<float, 16> sigf = sacc.to_vector<float>();
+    aie::vector<float, 16> outv = aie::mul(accf, sigf);
+    // the one difference from the f32-out sibling: narrow the f32 result to bf16.
+    aie::accum<accfloat, 16> oacc;
+    oacc.from_vector(outv);
+    aie::store_v(out_ptr, oacc.to_vector<bfloat16>());
+    out_ptr += 16;
+  }
+  event1();
+}
+
+// gelu, bf16 out. Mirrors mm_gelu_epilogue_f32o exactly (same bf16 tanh approx),
+// narrowing at the store instead of up-converting back to f32.
+template <int size>
+static inline void mm_gelu_epilogue_bf16o(const float *__restrict pC_in,
+                                          bfloat16 *__restrict pC_out) {
+  event0();
+  static_assert(size % 16 == 0, "tile size must be a multiple of 16");
+  aie::set_rounding(aie::rounding_mode::conv_even);
+  const aie::vector<bfloat16, 16> half = aie::broadcast<bfloat16, 16>(0.5f);
+  const aie::vector<bfloat16, 16> one = aie::broadcast<bfloat16, 16>(1.0f);
+  const aie::vector<bfloat16, 16> c0 = aie::broadcast<bfloat16, 16>(0.7978845608f);
+  const aie::vector<bfloat16, 16> c1 = aie::broadcast<bfloat16, 16>(0.044715f);
+  const float *__restrict in_ptr = pC_in;
+  bfloat16 *__restrict out_ptr = pC_out;
+  AIE_PREPARE_FOR_PIPELINING
+  AIE_LOOP_MIN_ITERATION_COUNT(2)
+  for (int off = 0; off < size; off += 16) {
+    aie::vector<float, 16> accf = aie::load_v<16>(in_ptr);
+    in_ptr += 16;
+    aie::accum<accfloat, 16> a;
+    a.from_vector(accf);
+    aie::vector<bfloat16, 16> xv = a.to_vector<bfloat16>();
+    aie::vector<bfloat16, 16> x2 = aie::mul(xv, xv);
+    aie::vector<bfloat16, 16> x3 = aie::mul(x2, xv);
+    aie::vector<bfloat16, 16> c1x3 = aie::mul(c1, x3);
+    aie::vector<bfloat16, 16> inner_b = aie::add(xv, c1x3);
+    auto inner = aie::mul(c0, inner_b);
+    aie::vector<bfloat16, 16> t = aie::tanh<bfloat16>(inner.to_vector<float>());
+    aie::vector<bfloat16, 16> t_p1 = aie::add(t, one);
+    aie::vector<bfloat16, 16> xt = aie::mul(xv, t_p1);
+    aie::vector<bfloat16, 16> gx = aie::mul(half, xt);
+    aie::store_v(out_ptr, gx);
+    out_ptr += 16;
+  }
+  event1();
+}
+
+// identity, bf16 out: the plain f32 acc -> bf16 narrow (bias already folded via
+// K-augmentation). Same as cast_f32_bf16_row, done in the epilogue.
+template <int size>
+static inline void mm_identity_epilogue_bf16o(const float *__restrict pC_in,
+                                              bfloat16 *__restrict pC_out) {
+  event0();
+  static_assert(size % 16 == 0, "tile size must be a multiple of 16");
+  aie::set_rounding(aie::rounding_mode::conv_even);
+  const float *__restrict in_ptr = pC_in;
+  bfloat16 *__restrict out_ptr = pC_out;
+  AIE_PREPARE_FOR_PIPELINING
+  AIE_LOOP_MIN_ITERATION_COUNT(2)
+  for (int off = 0; off < size; off += 16) {
+    aie::vector<float, 16> accf = aie::load_v<16>(in_ptr);
+    in_ptr += 16;
+    aie::accum<accfloat, 16> a;
+    a.from_vector(accf);
+    aie::store_v(out_ptr, a.to_vector<bfloat16>());
     out_ptr += 16;
   }
   event1();
@@ -315,6 +442,14 @@ void mm_narrow_epilogue_f32_bf16(const float *__restrict c_in,
 void mm_modal_epilogue_f32_f32(const float *__restrict c_in,
                                float *__restrict c_out,
                                const int32_t *__restrict rtp) {
+#ifdef MODAL_ROUND_EVEN
+  // Round-to-nearest-even instead of the hardware default (truncate). The rounding mode is a CORE
+  // CONTROL REGISTER, not a per-op argument, so this does not only affect the epilogue below -- it
+  // persists and governs the bfp16 conversions inside the NEXT tile's matmul. That is the point:
+  // under `emulate_bfloat16_mmul_with_bfp16` every A/B tile is converted bf16 -> bfp16, and doing
+  // that with truncation biases every product low.
+  aie::set_rounding(aie::rounding_mode::conv_even);
+#endif
   // rtp[0]: 0=identity, 1=silu, 2=gelu (modal modes; baked per instruction stream).
   if (rtp[0] == 1) {
     // Higher-precision hybrid silu (f32 x + f32 final multiply, bf16 sigmoid) --
@@ -324,6 +459,22 @@ void mm_modal_epilogue_f32_f32(const float *__restrict c_in,
     mm_gelu_epilogue_f32o<EPI_M * EPI_N>(c_in, c_out);
   } else {
     mm_identity_epilogue_f32o<EPI_M * EPI_N>(c_in, c_out);
+  }
+}
+
+// MODAL bf16-out epilogue: same rtp[0] mode selection as the f32-out sibling, but
+// the C tile is stored bf16. Used by the fc1 build that drains chunk-major straight
+// into the fc2 K-split's input buffer, so no separate deinterleave+cast runs.
+void mm_modal_epilogue_f32_bf16(const float *__restrict c_in,
+                                bfloat16 *__restrict c_out,
+                                const int32_t *__restrict rtp) {
+  // rtp[0]: 0=identity, 1=silu, 2=gelu (same encoding as mm_modal_epilogue_f32_f32).
+  if (rtp[0] == 1) {
+    mm_silu_epilogue_bf16o_hiprec<EPI_M * EPI_N>(c_in, c_out);
+  } else if (rtp[0] == 2) {
+    mm_gelu_epilogue_bf16o<EPI_M * EPI_N>(c_in, c_out);
+  } else {
+    mm_identity_epilogue_bf16o<EPI_M * EPI_N>(c_in, c_out);
   }
 }
 

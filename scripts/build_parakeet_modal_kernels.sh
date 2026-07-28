@@ -87,6 +87,17 @@ make -C $LNML -f Makefile.resadd     NPU2=1 rows=512 cols=1024 scale=1.0 stag=10
 # channels on this toolchain; see dwconv-fused-epilogue-alt-channel-miscompile). rows=C, cols=T.
 echo "== RESIDENT-CONV: SiLU brick 1024x400 =="
 make -C $LNML -f Makefile.silu2      NPU2=1 rows=1024 cols=400 build/final_silu_1024x400.xclbin
+# fc1 with the fc1->fc2 K-PANEL PACKING FOLDED INTO ITS OWN C DRAIN (PARAKEET_FC1_PACK_IN_DRAIN=1, opt-in).
+# bf16 C + panel-major drain, so the GEMM writes exactly the [DFF/KRES, PAD_M, KRES] buffer the fc2
+# K-split reads and the separate packing command disappears. m=32, NOT the m=64 fast tile: bf16 out needs
+# a per-core f32 accumulator back (the matmul can no longer reduce in-place into a bf16 C) and at m=64
+# that overflows L1 by ~11.6 KB. c_panel_width must equal n_aie_cols*n = 8*128 = KRES.
+echo "== RESIDENT-FFN: fc1 bf16-out + panel-major drain (packing folded), m=32 =="
+make -C $MMW -f Makefile.modal NPU2=1 M=512 K=1024 N=4096 m=32 k=32 n=128 n_aie_cols=8 \
+  dtype_in=bf16 dtype_out=bf16 emulate_bfloat16_mmul_with_bfp16=1 bfp16_iree=1 c_panel_width=1024 \
+  build/final_512x1024x4096_32x32x128_8c_modalsilubf16outpanel1024.xclbin
+cp "$MMW/build/final_512x1024x4096_32x32x128_8c_modalsilubf16outpanel1024.xclbin" \
+   "$MMW/build/insts_512x1024x4096_32x32x128_8c_modalsilubf16outpanel1024.txt" "$LNDIR/"
 # full FFN fc1->fc2 device-side: cast@DFF (fc1 f32 [T,4096] -> bf16) + the K=4096 fc2 resident (identity)
 echo "== RESIDENT-FFN: cast@4096 + K=4096 fc2 (identity) =="
 make -C $LNML -f Makefile.cast       NPU2=1 rows=512 cols=4096 build/final_cast_512x4096.xclbin

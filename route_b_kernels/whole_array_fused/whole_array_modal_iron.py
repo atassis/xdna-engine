@@ -53,7 +53,11 @@ from aie.iron import (
 )
 from aie.iron.device import NPU1Col1, NPU1Col2, NPU1, NPU2
 from aie.iron.controlflow import range_
-from aie.helpers.taplib import TensorAccessSequence, TensorTiler2D
+from aie.helpers.taplib import (
+    TensorAccessPattern,
+    TensorAccessSequence,
+    TensorTiler2D,
+)
 
 microkernel_mac_dim_map = {
     "npu": {
@@ -76,6 +80,77 @@ def ceildiv(a, b):
     return (a + b - 1) // b
 
 
+def panel_major_c_taps(C_tiles, M, N, m, n, n_aie_rows, n_aie_cols, panel_w):
+    """Re-stride the C drain TAPs so the shim writes C panel-major, not row-major.
+
+    Row-major C is [M, N]; panel-major is [N//panel_w, M, panel_w], i.e.
+        out[c, i, j] = C[i, c*panel_w + j].
+    A consumer that contracts over a panel_w-wide K-slice of C can then take panel c
+    as a plain contiguous device sub-buffer, which is the whole point: it deletes the
+    separate packing command that used to materialise that layout.
+
+    This is a pure re-stride of the SAME rank, the SAME sizes and the SAME walk order,
+    so it changes only the shim BD in the runtime sequence -- the array program (cores,
+    objectFIFOs, L1/L2 buffers) is untouched and the xclbin is unchanged.
+
+    Each row-major drain TAP is the 4-D pattern [rb, g, r, j]
+        C[ rb*(m*n_aie_rows) + r , g*(n_aie_cols*n) + col*n + j ]
+    with offset col*n and strides [(m*n_aie_rows)*N, n_aie_cols*n, N, 1]. It only
+    factors into panel-major without gaining a dimension when the panel boundary lands
+    on the g stride, i.e. panel_w == n_aie_cols*n -- otherwise g would have to split
+    into (panel, within-panel group) and the pattern would need 5 dims against the
+    shim's 4. That is a hard requirement, not a preference, so assert it.
+    """
+    mb = m * n_aie_rows  # rows drained per tile-block
+    group_w = n_aie_cols * n  # N covered by one pass across the columns
+    if panel_w != group_w:
+        raise AssertionError(
+            f"c_panel_width={panel_w} must equal n_aie_cols*n={group_w}: the panel "
+            "boundary has to coincide with the drain TAP's group stride, else the "
+            "panel-major pattern needs 5 dims and will not fit a shim BD"
+        )
+    assert N % panel_w == 0, "N must be a whole number of panels"
+    assert M % mb == 0, "M must be a whole number of tile-blocks"
+    n_panels = N // panel_w
+
+    # The STRIDES are the invariant that makes the re-stride valid; the outermost SIZE is
+    # not (it is the tile-block group the runtime loop drains at a time, which equals
+    # M//mb only when the two happen to coincide -- at m=64 they do, at m=32 they do not).
+    # So assert the strides and the inner sizes, and read the rest off the TAP.
+    want_strides = [mb * N, group_w, N, 1]
+    # Same walk, new destination: g becomes the panel index, rb/r index rows within the
+    # panel's [M, panel_w] plane, j stays the contiguous run.
+    new_strides = [mb * panel_w, M * panel_w, panel_w, 1]
+
+    out = []
+    for t in C_tiles:
+        sizes = list(t.sizes)
+        if len(sizes) != 4 or list(t.strides) != want_strides:
+            raise AssertionError(
+                "C drain TAP is not the expected row-major [rb, g, r, j] pattern "
+                f"(sizes {sizes} strides {list(t.strides)}, expected strides "
+                f"{want_strides}); the panel-major re-stride assumes that structure"
+            )
+        if sizes[1:] != [N // group_w, mb, n]:
+            raise AssertionError(
+                f"C drain TAP inner sizes {sizes[1:]} != [{N // group_w}, {mb}, {n}]"
+            )
+        # The row-major offset carries two things: which tile-block row this drain starts
+        # at, and this column's column start. Re-base only the row part -- under
+        # panel_w == group_w the column part is already a within-panel column.
+        row_base, col_start = divmod(t.offset, mb * N)
+        assert col_start < group_w, "column offset must lie inside one panel"
+        out.append(
+            TensorAccessPattern(
+                (n_panels * M, panel_w),
+                row_base * mb * panel_w + col_start,
+                sizes,
+                new_strides,
+            )
+        )
+    return out
+
+
 def my_matmul(
     dev,
     M,
@@ -91,14 +166,21 @@ def my_matmul(
     trace_size,
     generate_taps=False,
     do_gelu=False,
+    c_panel_width=0,
+    dtype_out_str="f32",
 ):
     n_aie_rows = 4
     n_aie_cores = n_aie_rows * n_aie_cols
 
-    # MODAL design: bf16 in / f32 accumulate / f32 OUT (no host re-expand; see internal notes).
+    # MODAL design: bf16 in / f32 accumulate. The OUTPUT dtype is f32 by default -- a HOST
+    # consumer would otherwise have to re-expand bf16->f32 for its own math, which measured as
+    # a net loss. bf16 out is for the one case where the consumer is another GEMM (bf16 in):
+    # the fc1->fc2 seam, where it also halves the intermediate's DDR traffic. Note this changes
+    # the L1/L2 C buffer sizes, i.e. the array program -- unlike --c-panel-width it is NOT an
+    # instruction-stream-only change and produces a genuinely different xclbin.
     dtype_in_str = "bf16"
     dtype_acc_str = "f32"
-    dtype_out_str = "f32"
+    assert dtype_out_str in ("f32", "bf16"), "modal C is f32 or bf16"
 
     dtype_in = str_to_dtype(dtype_in_str)
     dtype_acc = str_to_dtype(dtype_acc_str)
@@ -185,7 +267,7 @@ def my_matmul(
     # serves both via the inst-stream-baked rtp value (the do_silu build flag sets that value below).
     rtp_ty = np.ndarray[(16,), np.dtype[np.int32]]
     epilogue_kernel = Kernel(
-        "mm_modal_epilogue_f32_f32",
+        f"mm_modal_epilogue_f32_{dtype_out_str}",
         f"mm_silu_epilogue_{m}x{k}x{n}.o",
         [cacc_ty, C_l1_ty, rtp_ty],
     )
@@ -295,6 +377,31 @@ def my_matmul(
             epilogue(elem_out, elem_out, rtp_buff)  # in-place; rtp[0]: 1=silu, 0=identity
             out_c.release(1)
 
+    # bf16-out sibling: the matmul reduces f32, so it CANNOT reduce into a bf16 C tile. This
+    # variant keeps a core-local f32 accumulator and the epilogue narrows acc -> C on the way
+    # out. That costs an extra m*n*4 L1 buffer per core, which is exactly the buffer the f32-out
+    # modal deleted to make the wide-N fast tile fit -- so a bf16-out build has a tighter L1
+    # budget and may need a smaller m. The allocator, not this comment, is the authority.
+    def core_fn_split_acc(
+        in_a, in_b, out_c, acc, rtp_buff, barrier, zero, matmul, epilogue
+    ):
+        barrier.wait_for_value(1)
+        loop = range(1)  # Workaround for issue #1547
+        if n_tiles_per_core > 1:
+            loop = range_(n_tiles_per_core)
+        for _ in loop:
+            elem_out = out_c.acquire(1)
+            zero(acc)
+
+            for _ in range_(K // k):
+                elem_in_a = in_a.acquire(1)
+                elem_in_b = in_b.acquire(1)
+                matmul(elem_in_a, elem_in_b, acc)
+                in_a.release(1)
+                in_b.release(1)
+            epilogue(acc, elem_out, rtp_buff)  # f32 acc -> bf16 C; rtp[0] selects the mode
+            out_c.release(1)
+
     # Per-core RTP (epilogue mode) + a shared runtime barrier. Each worker reads rtp[0].
     rtp_barrier = WorkerRuntimeBarrier()
     rtp_bufs = [
@@ -305,23 +412,30 @@ def my_matmul(
         for row in range(n_aie_rows)
     ]
 
-    # Set up compute tiles. In-place modal epilogue -> no per-core acc_buf (matmul reduces into C).
+    # Set up compute tiles. f32 out: in-place modal epilogue -> no per-core acc_buf (the matmul
+    # reduces straight into C). bf16 out: a per-core f32 accumulator, narrowed by the epilogue.
+    split_acc = dtype_out_str != dtype_acc_str
     workers = []
     for row in range(n_aie_rows):
         for col in range(n_aie_cols):
+            args = [
+                A_l2l1_fifos[row].cons(),
+                B_l2l1_fifos[col].cons(),
+                C_l1l2_fifos[row][col].prod(),
+            ]
+            if split_acc:
+                args.append(Buffer(cacc_ty, name=f"cacc_{row}_{col}"))
+            args += [
+                rtp_bufs[row][col],
+                rtp_barrier,
+                zero_kernel,
+                matmul_kernel,
+                epilogue_kernel,
+            ]
             workers.append(
                 Worker(
-                    core_fn,
-                    [
-                        A_l2l1_fifos[row].cons(),
-                        B_l2l1_fifos[col].cons(),
-                        C_l1l2_fifos[row][col].prod(),
-                        rtp_bufs[row][col],
-                        rtp_barrier,
-                        zero_kernel,
-                        matmul_kernel,
-                        epilogue_kernel,
-                    ],
+                    core_fn_split_acc if split_acc else core_fn,
+                    args,
                     stack_size=0xD00,
                 )
             )
@@ -360,6 +474,12 @@ def my_matmul(
         tile_group_steps=(1, n_aie_cols),
         prune_step=False,
     )
+    if c_panel_width:
+        # Drain C straight into the [N//c_panel_width, M, c_panel_width] panel-major layout
+        # the consumer wants. Insts-only: same rank/sizes/order, new strides.
+        C_tiles = panel_major_c_taps(
+            C_tiles, M, N, m, n, n_aie_rows, n_aie_cols, c_panel_width
+        )
     c_index = 0
 
     def sequence(A, B, C, A_prods, B_prods, C_conses):
@@ -479,9 +599,20 @@ def main():
     # Accepted for makefile-common compatibility; this design is fixed to
     # bf16 in / f32 accumulate / bf16 out.
     argparser.add_argument("--dtype_in", type=str, default="bf16", choices=["bf16"])
-    argparser.add_argument("--dtype_out", type=str, default="f32", choices=["f32"])
+    argparser.add_argument(
+        "--dtype_out", type=str, default="f32", choices=["f32", "bf16"]
+    )
     argparser.add_argument("--trace_size", type=int, default=0)
     argparser.add_argument("--generate-taps", action="store_true")
+    argparser.add_argument(
+        "--c-panel-width",
+        type=int,
+        default=0,
+        help="drain C panel-major as [N/W, M, W] instead of row-major [M, N] (0 = off). "
+        "Must equal n_aie_cols*n. Lets a K-split consumer take each panel as a contiguous "
+        "device sub-buffer, deleting the separate deinterleave dispatch. Insts-only: the "
+        "xclbin is byte-identical to the row-major build.",
+    )
     args = argparser.parse_args()
     maybe_module = my_matmul(
         args.dev,
@@ -498,6 +629,8 @@ def main():
         args.trace_size,
         args.generate_taps,
         args.gelu,
+        args.c_panel_width,
+        args.dtype_out,
     )
     if args.generate_taps:
         return maybe_module

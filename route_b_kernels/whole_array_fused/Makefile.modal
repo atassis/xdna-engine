@@ -40,6 +40,21 @@ dtype_out?=f32
 no_silu?=0
 gelu?=0
 
+# Round-to-nearest-even for the f32-out modal epilogue (and, because rounding is a core control
+# register, for the following tile's bfp16 matmul conversions). Default 0 = hardware default.
+round_even?=0
+
+# SiLU sigmoid precision ladder: _tail does the (t+1)*0.5 in f32 (kills the bf16 add);
+# _tanh also returns tanh in f32 (kills the narrow entirely). Both default off.
+silu_f32_tail?=0
+silu_f32_tanh?=0
+
+# Drain C panel-major as [N/W, M, W] instead of row-major [M, N] (0 = off). Must equal
+# n_aie_cols*n. Folds the fc1->fc2 K-panel packing into the GEMM's own output DMA, so the
+# K-split consumer reads each panel as a contiguous device sub-buffer. CONTROL-CODE-ONLY: the
+# xclbin is byte-identical to the row-major build, only the instruction stream differs.
+c_panel_width?=0
+
 # Two kernel objects: the matmul (mm.cc) and the fused epilogue.
 kernels=mm_${m}x${k}x${n} mm_silu_epilogue_${m}x${k}x${n}
 
@@ -50,10 +65,21 @@ endif
 ifeq (${gelu}, 1)
 aieargs+=--gelu
 endif
+ifneq (${c_panel_width}, 0)
+aieargs+=--c-panel-width ${c_panel_width}
+endif
 
 # Distinct suffix so silu/bias/gelu artifacts never collide with the plain matmul's.
 mode_tag=$(if $(filter 1,${gelu}),modalgelu,$(if $(filter 1,${no_silu}),modalid,modalsilu))
-target_suffix=${M}x${K}x${N}_${m}x${k}x${n}_${n_aie_cols}c_${mode_tag}
+# ...and a panel-major drain is a DIFFERENT instruction stream on the SAME xclbin, so it
+# needs its own artifact name or it would overwrite the row-major stream. A bf16-out build
+# is a different xclbin outright (the C buffers resize), so it is tagged too.
+dep_tag=$(if $(filter 2,$(WA_C_DEPTH)),d2,)
+nat_tag=$(if $(filter 1,${emulate_bfloat16_mmul_with_bfp16}),,nat)
+re_tag=$(if $(filter 1,${round_even}),re,)$(if $(filter 1,${silu_f32_tail}),ft,)$(if $(filter 1,${silu_f32_tanh}),fh,)
+panel_tag=$(if $(filter 0,${c_panel_width}),,panel${c_panel_width})
+out_tag=$(if $(filter bf16,${dtype_out}),bf16out,)
+target_suffix=${M}x${K}x${N}_${m}x${k}x${n}_${n_aie_cols}c_${mode_tag}${out_tag}${panel_tag}${dep_tag}${re_tag}${nat_tag}
 
 use_iron=1
 aie_py_src=whole_array_modal_iron.py
@@ -63,7 +89,7 @@ buffer_aloc_flag=basic-sequential
 
 # matmul object needs the bf16_f32 combo defines (mm.cc names symbols by combo).
 MM_DEFINES=-Dbf16_f32_ONLY -DDIM_M=${m} -DDIM_K=${k} -DDIM_N=${n} -DVECTORIZED_ONLY
-EPI_DEFINES=-DEPI_M=${m} -DEPI_N=${n}
+EPI_DEFINES=-DEPI_M=${m} -DEPI_N=${n}$(if $(filter 1,${round_even}), -DMODAL_ROUND_EVEN,)$(if $(filter 1,${silu_f32_tail}), -DSILU_F32_TAIL,)$(if $(filter 1,${silu_f32_tanh}), -DSILU_F32_TANH,)
 ifeq (${b_col_maj}, 1)
 	MM_DEFINES+=-DB_COL_MAJ
 endif
@@ -77,11 +103,32 @@ include ${srcdir}/../../../../../route_b_kernels/whole_array_fused/route_b_overr
 
 # matmul object: bf16 in, f32 acc. KERNEL_DEFINES carries the BFP16_IREE / emulate flags from
 # route_b_override.mk (fast tile) -- without it a fast-flagged build silently compiles the native kernel.
-build/mm_${m}x${k}x${n}.o: ${kernels_dir}/mm.cc
+# Same identity trap as the epilogue object below: the name carries only m/k/n, but the content
+# depends on MM_DEFINES + KERNEL_DEFINES (bfp16_iree, emulate_bfloat16_mmul_with_bfp16, B_COL_MAJ).
+# Without the stamp, flipping any of those relinks the PREVIOUS variant's object into a new xclbin.
+build/.mm_defines.stamp: FORCE
+	@mkdir -p ${@D}
+	@echo '${MM_DEFINES} emu=${emulate_bfloat16_mmul_with_bfp16} iree=${bfp16_iree} bcm=${b_col_maj}' | cmp -s - $@ \
+	  || echo '${MM_DEFINES} emu=${emulate_bfloat16_mmul_with_bfp16} iree=${bfp16_iree} bcm=${b_col_maj}' > $@
+
+build/mm_${m}x${k}x${n}.o: ${kernels_dir}/mm.cc build/.mm_defines.stamp
 	mkdir -p ${@D}
 	cd ${@D} && ${KERNEL_CC} ${KERNEL_CFLAGS} ${MM_DEFINES} ${KERNEL_DEFINES} -c $< -o ${@F}
 
 # Epilogue object: f32 acc -> silu/narrow -> bf16 out.
-build/mm_silu_epilogue_${m}x${k}x${n}.o: ${kernels_dir}/mm_silu_epilogue.cc
+#
+# The object name carries only m/k/n, but its CONTENT depends on EPI_DEFINES (round_even,
+# silu_f32_tail, silu_f32_tanh, ...). Without the stamp below, make sees an up-to-date .o and
+# silently links the PREVIOUS variant's object into a differently-named xclbin -- so an A/B over
+# those knobs compares two identical binaries and reports "no effect". That produced a false
+# negative here on 2026-07-28 and nearly shipped a wrong conclusion; the stamp makes a defines
+# change dirty the object.
+build/.epi_defines.stamp: FORCE
+	@mkdir -p ${@D}
+	@echo '${EPI_DEFINES}' | cmp -s - $@ || echo '${EPI_DEFINES}' > $@
+FORCE:
+.PHONY: FORCE
+
+build/mm_silu_epilogue_${m}x${k}x${n}.o: ${kernels_dir}/mm_silu_epilogue.cc build/.epi_defines.stamp
 	mkdir -p ${@D}
 	cd ${@D} && ${KERNEL_CC} ${KERNEL_CFLAGS} ${EPI_DEFINES} -c $< -o ${@F}
