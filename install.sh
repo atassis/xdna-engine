@@ -94,7 +94,10 @@ die()  { printf '\033[1;31m[fail]\033[0m %s\n' "$*" >&2; exit 1; }
 # 1. Resolve & sanity-check the repo
 # ---------------------------------------------------------------------------
 info "Repo:            $REPO"
-[ -f "$REPO/scripts/asr_service.py" ] || die "scripts/asr_service.py not found — is \$REPO ($REPO) really the asr-engine repo?"
+# Identity check on a file this script actually USES (step 4 runs it), not on the retired
+# asr_service.py: the Rust `npu serve` replaced that Python service and nothing references it,
+# so gating here meant deleting dead code broke the install.
+[ -f "$REPO/scripts/asr_oracle.py" ] || die "scripts/asr_oracle.py not found — is \$REPO ($REPO) really the xdna-engine repo?"
 [ -f "$REPO/rust/Cargo.toml" ]       || die "rust/Cargo.toml not found — is \$REPO ($REPO) really the asr-engine repo?"
 ok "Repo layout looks correct."
 
@@ -304,8 +307,8 @@ mkdir -p "$UNIT_DIR"
 
 # Absolute paths are baked in at install time (no $-expansion at runtime).
 #   Conflicts=flm-asr.service  -> starting ours auto-stops FLM, freeing NPU + :11434.
-#   WorkingDirectory=$REPO     -> asr_service.py spawns encode_server via the relative
-#                                 path rust/target/release/encode_server, so cwd matters.
+#   WorkingDirectory=$REPO     -> the engine resolves artifacts/ and scenario paths relative
+#                                 to cwd (npu_engine::Model::load uses the working dir as root).
 cat > "$UNIT_PATH" <<EOF
 [Unit]
 Description=$DESC
