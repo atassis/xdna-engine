@@ -67,10 +67,11 @@ def sh(*cmd):
 
 def stop_all_npu():
     """Free the NPU: stop every known NPU tenant. Single-tenant device."""
-    for svc in ("voxd.service", "flm-asr.service"):
+    for svc in ("xdna-engine.service", "npu-vox.service", "voxd.service", "flm-asr.service"):
         sh("systemctl", "--user", "stop", svc)
-    # kill any stray engine_serve we may have left behind
-    sh("pkill", "-f", "target/release/engine_serve")
+    # kill any stray server we may have left behind
+    sh("pkill", "-f", "release/npu serve")
+    sh("pkill", "-f", "flm serve")
     time.sleep(2)
 
 
@@ -116,20 +117,27 @@ def poll_ready(url_base, timeout=40):
 
 
 # --- per-backend runners ----------------------------------------------------
-def run_ours(scenario, clips, refs):
+def run_ours(scenario, clips, refs, model_name="parakeet"):
+    """Serve our engine via the `npu serve` CLI (the shipped entry point).
+
+    `scenario` here is the engine.toml config path -- the CLI takes a config that
+    names the resident models, not a bare scenario file.
+    """
     stop_all_npu()
     env = dict(os.environ)
     env["LD_LIBRARY_PATH"] = f"{LIB}:{env.get('LD_LIBRARY_PATH', '')}"
-    binpath = str(ROOT / "rust" / "target" / "release" / "engine_serve")
+    binpath = str(ROOT / "rust" / "target" / "release" / "npu")
+    if not Path(binpath).exists():
+        binpath = os.path.expanduser("~/.local/bin/npu")
     proc = subprocess.Popen(
-        [binpath, scenario, str(OUR_PORT)],
+        [binpath, "serve", "--config", scenario, "--port", str(OUR_PORT)],
         cwd=str(ROOT), env=env,
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
-    backend = ours(OUR_PORT)
+    backend = ours(OUR_PORT, model_name)
     try:
-        if not poll_ready(backend.url, timeout=40):
-            raise RuntimeError("ours engine_serve did not become ready")
+        if not poll_ready(backend.url, timeout=120):
+            raise RuntimeError("ours `npu serve` did not become ready")
         rows = measure(backend, clips, refs, pid=proc.pid)
     finally:
         proc.send_signal(signal.SIGINT)
@@ -137,7 +145,7 @@ def run_ours(scenario, clips, refs):
             proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
             proc.kill()
-        sh("pkill", "-f", "target/release/engine_serve")
+        sh("pkill", "-f", "release/npu serve")
         time.sleep(1)
     return rows
 
@@ -157,19 +165,31 @@ def flm_pid():
     return None
 
 
-def run_flm(clips, refs):
+def run_flm(clips, refs, companion="qwen3:0.6b", pmode="performance"):
+    """Serve FLM's Whisper directly.
+
+    `flm serve whisper-v3:turbo` auto-pulls an LLM, so we serve an already-installed
+    small LLM with `-a 1` (load ASR alongside) instead -- the documented way in. The
+    companion must be version-compatible with the installed flm or serve refuses.
+    """
     stop_all_npu()
     backend = FLM
-    sh("systemctl", "--user", "start", "flm-asr.service")
-    time.sleep(3)
+    proc = subprocess.Popen(
+        ["flm", "serve", companion, "-a", "1", "--pmode", pmode, "--port", "11434"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
     try:
-        if not poll_ready(backend.url, timeout=60):
-            raise RuntimeError("flm-asr.service did not become ready on :11434")
-        pid = flm_pid()
-        rows = measure(backend, clips, refs, pid=pid)
+        if not poll_ready(backend.url, timeout=180):
+            raise RuntimeError("flm serve did not become ready on :11434")
+        rows = measure(backend, clips, refs, pid=proc.pid)
     finally:
-        sh("systemctl", "--user", "stop", "flm-asr.service")
-        time.sleep(1)
+        proc.terminate()
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        sh("pkill", "-f", "flm serve")
+        time.sleep(2)
     return rows
 
 
@@ -205,7 +225,8 @@ def measure(backend, clips, refs, pid):
             "rss_kb": rss,
             "hyp": text,
         })
-        print(f"  {backend.name} {name}: {latency:5.2f}s  WER={w:.3f}  {em.joules:6.1f}J")
+        j = f"{em.joules:6.1f}J" if em.joules is not None else "   n/a"
+        print(f"  {backend.name} {name}: {latency:5.2f}s  WER={w:.3f}  {j}")
     return {"backend": backend.name, "model": backend.model, "rows": rows, "peak_rss_kb": peak_rss}
 
 
@@ -213,7 +234,8 @@ def measure(backend, clips, refs, pid):
 def aggregate(result):
     rows = result["rows"]
     def mean(xs):
-        return sum(xs) / len(xs) if xs else 0.0
+        xs = [x for x in xs if x is not None]
+        return sum(xs) / len(xs) if xs else None
     en = [r["wer"] for r in rows if r["lang"] == "en"]
     ru = [r["wer"] for r in rows if r["lang"] == "ru"]
     lat = [r["latency_s"] for r in rows]
@@ -231,9 +253,8 @@ def aggregate(result):
     }
 
 
-def write_outputs(results, aggs, scenario):
+def write_outputs(results, aggs, scenario, stem="whisper-small-vs-flm-turbo", title=None):
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    stem = "whisper-small-vs-flm-turbo"
     # raw JSON (per-clip)
     raw = {
         "scenario": scenario,
@@ -248,9 +269,9 @@ def write_outputs(results, aggs, scenario):
     def rss_gb(kb):
         return f"{kb / 1024 / 1024:.2f} GB" if kb else "n/a"
     lines = [
-        f"# Whisper-small (ours, NPU) vs FastFlowLM whisper-v3:turbo (NPU)",
+        f"# {title or 'Whisper-small (ours, NPU) vs FastFlowLM whisper-v3:turbo (NPU)'}",
         "",
-        f"First real head-to-head over **{aggs[0]['n_clips'] if aggs else 0} FLEURS clips** "
+        f"Head-to-head over **{aggs[0]['n_clips'] if aggs else 0} FLEURS clips** "
         f"(4 EN + 13 RU). Scenario: `{scenario}`. Run: {raw['timestamp']}.",
         "",
         "All backends run **sequentially** on the single-tenant NPU. Latency = wall time of the",
@@ -261,17 +282,18 @@ def write_outputs(results, aggs, scenario):
         "| backend | model | EN WER | RU WER | median latency | J/clip | peak RAM | CPU-idle% |",
         "|---|---|---|---|---|---|---|---|",
     ]
+    def num(v, fmt, dash="n/a"):
+        return format(v, fmt) if v is not None else dash
     for a in aggs:
         lines.append(
-            f"| {a['backend']} | {a['model']} | {a['en_wer']:.3f} | {a['ru_wer']:.3f} | "
-            f"{a['median_latency_s']:.2f}s | {a['mean_joules']:.1f} | {rss_gb(a['peak_rss_kb'])} | "
-            f"{a['mean_idle_frac']*100:.1f}% |"
+            f"| {a['backend']} | {a['model']} | {num(a['en_wer'], '.3f')} | {num(a['ru_wer'], '.3f')} | "
+            f"{num(a['median_latency_s'], '.2f')}s | {num(a['mean_joules'], '.1f')} | "
+            f"{rss_gb(a['peak_rss_kb'])} | {num(a['mean_idle_frac'] and a['mean_idle_frac']*100, '.1f')}% |"
         )
-    lines += [
-        "",
-        "Reference (CPU whisper-small oracle): EN WER 0.174 / RU WER 0.119.",
-        "",
-    ]
+    if not raw["energy_readable"]:
+        lines += ["", "Energy is `n/a`: the RAPL counter was root-only for this run "
+                  "(`sudo chmod a+r /sys/class/powercap/intel-rapl:0/energy_uj` to enable)."]
+    lines += [""]
     (RESULTS_DIR / f"{stem}.md").write_text("\n".join(lines))
     return RESULTS_DIR / f"{stem}.md", RESULTS_DIR / f"{stem}.json"
 
@@ -288,10 +310,15 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--backends", default="ours,flm")
     ap.add_argument("--scenario", default="scenarios/asr-whisper-small.toml")
+    ap.add_argument("--model-name", default="parakeet", help="model name our engine serves")
+    ap.add_argument("--flm-companion", default="qwen3:0.6b",
+                    help="installed LLM to serve with -a 1 so Whisper loads without an auto-pull")
+    ap.add_argument("--stem", default="whisper-small-vs-flm-turbo", help="output basename")
+    ap.add_argument("--title", default=None)
     args = ap.parse_args()
 
     if not readable():
-        print("[warn] RAPL energy counter not readable — joules will be 0.", file=sys.stderr)
+        print("[warn] RAPL energy counter not readable - joules will be n/a.", file=sys.stderr)
 
     clips, refs = load_corpus()
     which = [b.strip() for b in args.backends.split(",") if b.strip()]
@@ -302,24 +329,23 @@ def main():
         for b in which:
             print(f"\n=== backend: {b} ===")
             if b == "ours":
-                res = run_ours(args.scenario, clips, refs)
+                res = run_ours(args.scenario, clips, refs, args.model_name)
             elif b == "flm":
-                res = run_flm(clips, refs)
+                res = run_flm(clips, refs, args.flm_companion)
             else:
                 print(f"  unknown backend {b!r}, skipping", file=sys.stderr)
                 continue
             results.append(res)
             aggs.append(aggregate(res))
     finally:
-        # ALWAYS restore the default NPU tenant.
-        print("\nRestarting voxd.service ...")
-        sh("systemctl", "--user", "start", "voxd.service")
+        stop_all_npu()
 
-    md, js = write_outputs(results, aggs, args.scenario)
+    md, js = write_outputs(results, aggs, args.scenario, args.stem, args.title)
     print(f"\nWrote {md}\n      {js}\n")
     for a in aggs:
+        j = f"{a['mean_joules']:.1f}" if a["mean_joules"] is not None else "n/a"
         print(f"  {a['backend']:5s} EN={a['en_wer']:.3f} RU={a['ru_wer']:.3f} "
-              f"lat={a['median_latency_s']:.2f}s J/clip={a['mean_joules']:.1f} "
+              f"lat={a['median_latency_s']:.2f}s J/clip={j} "
               f"RSS={a['peak_rss_kb']/1024/1024:.2f}GB idle={a['mean_idle_frac']*100:.1f}%")
 
 
