@@ -199,9 +199,16 @@ if [ "$MODEL" = parakeet ]; then
   for f in preprocessor.onnx decoder_joint.onnx vocab.txt; do
     [ -f "$PK/$f" ] || die "Parakeet artifact missing: $PK/$f (copy nemo128.onnx / decoder_joint-model.onnx / vocab.txt from the cached istupakov repo + onnx-asr)."
   done
+  # Accept EITHER the modal build or the plain one, in the runtime's own preference order
+  # (npu.rs picks modalsilu > modalid > plain and falls back silently). Checking only for the
+  # plain fallback failed a tree that has just the modal xclbins the engine actually loads.
   for n in 1024 2048 4096; do
-    [ -f "$WA/final_512x1024x${n}_64x32x128_8c.xclbin" ] \
-      || die "Parakeet NPU xclbin missing: final_512x1024x${n}_64x32x128_8c.xclbin — run scripts/build_parakeet_kernels.sh (needs the mlir-aie toolchain)."
+    have=""
+    for v in "_modalsilu" "_modalid" ""; do
+      [ -f "$WA/final_512x1024x${n}_64x32x128_8c${v}.xclbin" ] && { have="$v"; break; }
+    done
+    [ -n "${have+x}" ] && [ -f "$WA/final_512x1024x${n}_64x32x128_8c${have}.xclbin" ] \
+      || die "Parakeet NPU xclbin missing: final_512x1024x${n}_64x32x128_8c{_modalsilu,_modalid,}.xclbin — run scripts/build_parakeet_kernels.sh (needs the mlir-aie toolchain)."
   done
   ok "Parakeet artifacts present: $PK (encoder weights + preproc/decoder_joint/vocab) + NPU xclbins"
   # skip the GigaAM artifact generation below
