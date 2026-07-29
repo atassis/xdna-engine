@@ -104,31 +104,31 @@ fn main() {
     let wa = root.join(WA);
     let ln = root.join(LN);
 
-    // The 4 kernels the shipped encoder dispatches (measured: 408 modal + 48 each of the bricks).
+    // The kernels the shipped encoder dispatches TODAY. Re-derived 2026-07-30 from a fresh
+    // `NPU_DISPATCH_LOG=1` dump: 456 dispatches/clip over THREE xclbins (360 fc-modal + 48
+    // lnaffcast + 48 bf16-outpanel fc1), not the four this probe was first written against.
+    // ctxln/affcast were fused into lnaffcast and deint was folded away, so loading those three
+    // made the REPLAY arm panic on an unknown kernel name. BO sizes copied from deint_fold_probe.
+    let c_bytes_f32 = PAD_M * DFF * 4;
+    let c_bytes_bf16 = PAD_M * DFF * 2;
     let bricks = vec![
         Brick::load(
             &dev,
             &wa.join("final_512x1024x4096_64x32x128_8c_modalsilu.xclbin"),
             &wa.join("insts_512x1024x4096_64x32x128_8c_modalsilu.txt"),
-            [PAD_M * KRES * 2, KRES * DFF * 2, PAD_M * DFF * 4, 1, 4],
+            [PAD_M * KRES * 2, KRES * DFF * 2, c_bytes_f32, 1, 4],
         ),
         Brick::load(
             &dev,
-            &ln.join("final_ctxln_512x1024.xclbin"),
-            &ln.join("insts_ctxln_512x1024.txt"),
-            [PAD_M * KRES * 4, PAD_M * KRES * 4, 1, 8, 1],
-        ),
-        Brick::load(
-            &dev,
-            &ln.join("final_affcast_512x1024.xclbin"),
-            &ln.join("insts_affcast_512x1024.txt"),
+            &ln.join("final_lnaffcast_512x1024.xclbin"),
+            &ln.join("insts_lnaffcast_512x1024.txt"),
             [PAD_M * KRES * 4, 2 * KRES * 4, PAD_M * KRES * 2, 8, 1],
         ),
         Brick::load(
             &dev,
-            &ln.join("final_deint_512x4096.xclbin"),
-            &ln.join("insts_deint_512x4096.txt"),
-            [PAD_M * DFF * 4, (DFF / KRES) * PAD_M * KRES * 2, 1, 8, 1],
+            &wa.join("final_512x1024x4096_32x32x128_8c_modalsilubf16outpanel1024.xclbin"),
+            &wa.join("insts_512x1024x4096_32x32x128_8c_modalsilubf16outpanel1024.txt"),
+            [PAD_M * KRES * 2, KRES * DFF * 2, c_bytes_bf16, 1, 4],
         ),
     ];
     let idx: BTreeMap<&str, usize> =
