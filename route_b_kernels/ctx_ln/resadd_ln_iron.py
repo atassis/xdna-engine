@@ -167,16 +167,14 @@ def resadd_ln(dev, sequence_length, embedding_dim, scale, n_cores=8, spread=Fals
         workers.append(Worker(ln_body, tile=_tile(i),
                               fn_args=[of_sum[i].cons(), of_gb.cons(), of_out[i].prod(), ln_kern]))
 
-    rt = Runtime()
     a_ty = np.ndarray[(total,), np.dtype[f32]]
     b_ty = np.ndarray[(total,), np.dtype[f32]]
     gb_ty = np.ndarray[(gb_len,), np.dtype[f32]]
     sum_ty = np.ndarray[(total,), np.dtype[f32]]
     out_ty = np.ndarray[(total,), np.dtype[bfloat16]]
-    with rt.sequence(a_ty, b_ty, gb_ty, sum_ty, out_ty) as (a, b, gb, s_out, out):
-        rt.start(*workers)
+    def sequence(a, b, gb, s_out, out, a_prods, a_pair_prods, b_prods, gb_prod, sum_conses, out_conses):
         for i in range(n_solo_a):
-            rt.fill(of_a[i].prod(), a, taps[i])
+            a_prods[i].fill(a, taps[i])
         for p in range(share_pairs):
             lo = n_solo_a + 2 * p
             # Interleave the two cores' row ranges so each [2,embedding_dim] object is
@@ -194,19 +192,36 @@ def resadd_ln(dev, sequence_length, embedding_dim, scale, n_cores=8, spread=Fals
                 assert inner % 2 == 0, f"cannot factor embedding_dim={embedding_dim} under the 1023 D0 wrap"
                 inner //= 2
                 inner_n *= 2
-            rt.fill(of_a_pair[p].prod(), a, TensorAccessPattern(
+            a_pair_prods[p].fill(a, TensorAccessPattern(
                 (sequence_length, embedding_dim),
                 offset=lo * rows_per_core * embedding_dim,
                 sizes=[rows_per_core, 2, inner_n, inner],
                 strides=[embedding_dim, rows_per_core * embedding_dim, inner, 1],
             ))
         for i in range(n_cores):
-            rt.fill(of_b[i].prod(), b, taps[i])
-        rt.fill(of_gb.prod(), gb)             # ONE broadcast fill for all LN cores
+            b_prods[i].fill(b, taps[i])
+        gb_prod.fill(gb)                      # ONE broadcast fill for all LN cores
         for i in range(n_cores):
-            rt.drain(of_sum[i].cons(), s_out, taps[i], wait=True)
-            rt.drain(of_out[i].cons(), out, taps[i], wait=True)
-    return Program(dev, rt).resolve_program()
+            sum_conses[i].drain(s_out, taps[i], wait=True)
+            out_conses[i].drain(out, taps[i], wait=True)
+
+    rt = Runtime(
+        sequence,
+        [
+            a_ty,
+            b_ty,
+            gb_ty,
+            sum_ty,
+            out_ty,
+            [of_a[i].prod() for i in range(n_solo_a)],
+            [of_a_pair[p].prod() for p in range(share_pairs)],
+            [of_b[i].prod() for i in range(n_cores)],
+            of_gb.prod(),
+            [of_sum[i].cons() for i in range(n_cores)],
+            [of_out[i].cons() for i in range(n_cores)],
+        ],
+    )
+    return Program(dev, rt, workers=workers).resolve_program()
 
 
 p = argparse.ArgumentParser()

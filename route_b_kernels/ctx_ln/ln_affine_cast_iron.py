@@ -62,28 +62,42 @@ def ln_affine_cast(dev, sequence_length, embedding_dim, trace_size, n_cores=8,
         for i in range(n_cores)
     ]
 
-    rt = Runtime()
     x_ty = np.ndarray[(total,), np.dtype[f32]]
     gb_ty = np.ndarray[(gb_len,), np.dtype[f32]]
     out_ty = np.ndarray[(total,), np.dtype[bfloat16]]
-    with rt.sequence(x_ty, gb_ty, out_ty) as (x, gb, out):
-        # Per-op occupancy instrument. `trace_size=0` (the production build) leaves the design
-        # byte-identical; a non-zero size appends a DEDICATED trace buffer at the TAIL of the
-        # runtime_sequence (reuse_output_buffer=False), so x/gb/out keep group ids 3/4/5 and the trace
-        # buffer becomes the next argument -- the slot the Rust ABI currently fills with a dummy.
-        if trace_size:
-            # Trace ONE worker, not all 8. Tracing every worker collides on the shim's south ports
-            # ("aie.masterset op targets same destination South: 3") because this design already
-            # streams 8 cores x (in, gb, out) through them. One core is representative: every core
-            # runs the identical row loop over rows_per_core rows.
-            rt.enable_trace(trace_size=trace_size, workers=[workers[0]], egress_shim_col=1)
-        rt.start(*workers)
+
+    def sequence(x, gb, out, in_prods, gb_prods, out_conses):
         for i in range(n_cores):
-            rt.fill(of_in[i].prod(), x, taps_in[i])
-            rt.fill(of_gb[i].prod(), gb)  # full [gamma|beta] to every core (broadcast)
+            in_prods[i].fill(x, taps_in[i])
+            gb_prods[i].fill(gb)  # full [gamma|beta] to every core (broadcast)
         for i in range(n_cores):
-            rt.drain(of_out[i].cons(), out, taps_out[i], wait=True)
-    return Program(dev, rt).resolve_program()
+            out_conses[i].drain(out, taps_out[i], wait=True)
+
+    rt = Runtime(
+        sequence,
+        [
+            x_ty,
+            gb_ty,
+            out_ty,
+            [of_in[i].prod() for i in range(n_cores)],
+            [of_gb[i].prod() for i in range(n_cores)],
+            [of_out[i].cons() for i in range(n_cores)],
+        ],
+    )
+    prog = Program(dev, rt, workers=workers)
+    # Per-op occupancy instrument. `trace_size=0` (the production build) leaves the design
+    # byte-identical; a non-zero size appends a DEDICATED trace buffer at the TAIL of the
+    # runtime_sequence (reuse_output_buffer=False), so x/gb/out keep group ids 3/4/5 and the trace
+    # buffer becomes the next argument -- the slot the Rust ABI currently fills with a dummy.
+    # enable_trace moved Runtime -> Program in #3387; the sequence body is still emitted last, so
+    # the tail-append ordering above is unchanged.
+    if trace_size:
+        # Trace ONE worker, not all 8. Tracing every worker collides on the shim's south ports
+        # ("aie.masterset op targets same destination South: 3") because this design already
+        # streams 8 cores x (in, gb, out) through them. One core is representative: every core
+        # runs the identical row loop over rows_per_core rows.
+        prog.enable_trace(trace_size=trace_size, workers=[workers[0]], egress_shim_col=1)
+    return prog.resolve_program()
 
 
 p = argparse.ArgumentParser()

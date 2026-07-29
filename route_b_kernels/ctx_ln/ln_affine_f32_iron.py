@@ -62,7 +62,6 @@ def ln_affine_f32(dev, sequence_length, embedding_dim, trace_size, n_cores=8):
         for i in range(n_cores)
     ]
 
-    rt = Runtime()
     x_ty = np.ndarray[(total,), np.dtype[f32]]
     gb_ty = np.ndarray[(gb_len,), np.dtype[f32]]
     # f32 OUT. This was `bfloat16` -- copied verbatim from the bf16 sibling and never changed when the
@@ -72,14 +71,25 @@ def ln_affine_f32(dev, sequence_length, embedding_dim, trace_size, n_cores=8):
     # on top of f32 rows 32-63. That is the whole "128 KiB cap" -- 64*1024*2 = 131072 is not a limit,
     # it is the wrong element size. See the retraction in the worklog.
     out_ty = np.ndarray[(total,), np.dtype[f32]]
-    with rt.sequence(x_ty, gb_ty, out_ty) as (x, gb, out):
-        rt.start(*workers)
+    def sequence(x, gb, out, in_prods, gb_prods, out_conses):
         for i in range(n_cores):
-            rt.fill(of_in[i].prod(), x, taps_in[i])
-            rt.fill(of_gb[i].prod(), gb)  # full [gamma|beta] to every core (broadcast)
+            in_prods[i].fill(x, taps_in[i])
+            gb_prods[i].fill(gb)  # full [gamma|beta] to every core (broadcast)
         for i in range(n_cores):
-            rt.drain(of_out[i].cons(), out, taps_out[i], wait=True)
-    return Program(dev, rt).resolve_program()
+            out_conses[i].drain(out, taps_out[i], wait=True)
+
+    rt = Runtime(
+        sequence,
+        [
+            x_ty,
+            gb_ty,
+            out_ty,
+            [of_in[i].prod() for i in range(n_cores)],
+            [of_gb[i].prod() for i in range(n_cores)],
+            [of_out[i].cons() for i in range(n_cores)],
+        ],
+    )
+    return Program(dev, rt, workers=workers).resolve_program()
 
 
 p = argparse.ArgumentParser()
