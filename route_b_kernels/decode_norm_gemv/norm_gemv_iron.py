@@ -36,7 +36,7 @@
 import argparse
 import numpy as np
 
-from aie.iron import Kernel, ObjectFifo, Program, Runtime, Worker, str_to_dtype
+from aie.iron import Kernel, ObjectFifo, Program, Runtime, TaskGroup, Worker, str_to_dtype
 from aie.iron.device import NPU2
 from aie.iron.controlflow import range_
 from aie.helpers.taplib import TensorAccessSequence, TensorTiler2D
@@ -181,10 +181,9 @@ def my_norm_gemv(M, K, N, m, k, n, n_aie_cols, generate_taps=False):
     )
     c_index = 0
 
-    rt = Runtime()
-    with rt.sequence(A_ty, B_ty, C_ty) as (A, B, C):
-        rt.start(*workers)
-        tg = rt.task_group()
+    def sequence(A, B, C, A_prods, B_prods, C_conses):
+        nonlocal c_index
+        tg = TaskGroup()
         for tb in range(ceildiv(M // m // n_aie_rows, tb_max_n_rows)):
             for pingpong in [0, 1]:
                 if c_index >= len(C_tiles):
@@ -193,19 +192,35 @@ def my_norm_gemv(M, K, N, m, k, n, n_aie_cols, generate_taps=False):
                 current_tb_n_rows = min([tb_max_n_rows // 2, M // m // n_aie_rows - row_base])
                 for col in range(n_aie_cols):
                     C_taps.append(C_tiles[c_index])
-                    rt.drain(C_l2l3_fifos[col].cons(), C, tap=C_tiles[c_index], wait=True, task_group=tg)
+                    C_conses[col].drain(C, tap=C_tiles[c_index], wait=True, group=tg)
                     c_index += 1
                     for tile_row in range(current_tb_n_rows):
                         tile_offset = ((row_base + tile_row) * n_shim_mem_A + col) % len(A_tiles)
                         if col < n_aie_rows:
-                            rt.fill(A_l3l2_fifos[col].prod(), A, tap=A_tiles[tile_offset], task_group=tg)
-                        rt.fill(B_l3l2_fifos[col].prod(), B, tap=B_tiles[col], task_group=tg)
+                            A_prods[col].fill(A, tap=A_tiles[tile_offset], group=tg)
+                        B_prods[col].fill(B, tap=B_tiles[col], group=tg)
                         A_taps.append(A_tiles[tile_offset])
                         B_taps.append(B_tiles[col])
                 if tb > 0 or (tb == 0 and pingpong > 0):
-                    rt.finish_task_group(tg)
-                    tg = rt.task_group()
-        rt.finish_task_group(tg)
+                    tg.finish()
+                    tg = TaskGroup()
+        tg.finish()
+
+    rt = Runtime(
+        sequence,
+        [
+            A_ty,
+            B_ty,
+            C_ty,
+            [f.prod() for f in A_l3l2_fifos],
+            [f.prod() for f in B_l3l2_fifos],
+            [f.cons() for f in C_l2l3_fifos],
+        ],
+    )
+
+    # seq_fn now runs at resolve time, so the tap lists are only populated after
+    # this call -- generate_taps must return AFTER it, not before.
+    module = Program(dev_ty, rt, workers=workers).resolve_program()
 
     if generate_taps:
         return (
@@ -213,7 +228,7 @@ def my_norm_gemv(M, K, N, m, k, n, n_aie_cols, generate_taps=False):
             TensorAccessSequence.from_taps(B_taps),
             TensorAccessSequence.from_taps(C_taps),
         )
-    return Program(dev_ty, rt).resolve_program()
+    return module
 
 
 def main():

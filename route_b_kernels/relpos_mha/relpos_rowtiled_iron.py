@@ -80,14 +80,17 @@ def my_relpos_rowtiled(dev, T):
         [of_quv.cons(), of_kpv.cons(), of_ctx.prod(), relpos],
     )
 
-    rt = Runtime()
-    with rt.sequence(quv_ty, kpv_ty, ctx_ty) as (QUV, KPV, CX):
-        rt.start(worker)
-        rt.fill(of_quv.prod(), QUV)
-        rt.fill(of_kpv_l3l2.prod(), KPV)
-        rt.drain(of_ctx.cons(), CX, wait=True)
+    def sequence(QUV, KPV, CX, quv_h, kpv_h, ctx_h):
+        quv_h.fill(QUV)
+        kpv_h.fill(KPV)
+        ctx_h.drain(CX, wait=True)
 
-    return Program(dev, rt).resolve_program()
+    rt = Runtime(
+        sequence,
+        [quv_ty, kpv_ty, ctx_ty, of_quv.prod(), of_kpv_l3l2.prod(), of_ctx.cons()],
+    )
+
+    return Program(dev, rt, workers=[worker]).resolve_program()
 
 
 p = argparse.ArgumentParser()

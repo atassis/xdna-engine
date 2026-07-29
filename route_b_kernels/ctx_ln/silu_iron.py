@@ -62,15 +62,24 @@ def silu(dev, rows, cols, trace_size):
         for i in range(n_cores)
     ]
 
-    rt = Runtime()
     tensor_ty = np.ndarray[(total,), np.dtype[f32]]
-    with rt.sequence(tensor_ty, tensor_ty) as (a_in, c_out):
-        rt.start(*workers)
+
+    def sequence(a_in, c_out, in_prods, out_conses):
         for i in range(n_cores):
-            rt.fill(of_in[i].prod(), a_in, taps[i])
+            in_prods[i].fill(a_in, taps[i])
         for i in range(n_cores):
-            rt.drain(of_out[i].cons(), c_out, taps[i], wait=True)
-    return Program(dev, rt).resolve_program()
+            out_conses[i].drain(c_out, taps[i], wait=True)
+
+    rt = Runtime(
+        sequence,
+        [
+            tensor_ty,
+            tensor_ty,
+            [of_in[i].prod() for i in range(n_cores)],
+            [of_out[i].cons() for i in range(n_cores)],
+        ],
+    )
+    return Program(dev, rt, workers=workers).resolve_program()
 
 
 p = argparse.ArgumentParser()

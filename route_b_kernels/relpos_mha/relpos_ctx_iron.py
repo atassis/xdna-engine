@@ -45,14 +45,17 @@ def my_relpos_ctx(dev, T):
         [of_probs.cons(), of_v.cons(), of_ctx.prod(), relpos],
     )
 
-    rt = Runtime()
-    with rt.sequence(probs_ty, v_ty, ctx_ty) as (PR, V, CX):
-        rt.start(worker)
-        rt.fill(of_probs.prod(), PR)
-        rt.fill(of_v.prod(), V)
-        rt.drain(of_ctx.cons(), CX, wait=True)
+    def sequence(PR, V, CX, probs_h, v_h, ctx_h):
+        probs_h.fill(PR)
+        v_h.fill(V)
+        ctx_h.drain(CX, wait=True)
 
-    return Program(dev, rt).resolve_program()
+    rt = Runtime(
+        sequence,
+        [probs_ty, v_ty, ctx_ty, of_probs.prod(), of_v.prod(), of_ctx.cons()],
+    )
+
+    return Program(dev, rt, workers=[worker]).resolve_program()
 
 
 p = argparse.ArgumentParser()

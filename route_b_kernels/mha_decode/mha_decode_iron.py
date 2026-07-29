@@ -104,13 +104,16 @@ def mha_decode(dev, S, trace_size):
     #   q  : 12 * [HD]          (head order)
     #   kv : 12 * n_tiles * [2*TKV*HD]  (head-major, tile order: K-tile|V-tile)
     #   ctx: 12 * [HD]          (head order)
-    rt = Runtime()
-    with rt.sequence(q_all_ty, kv_all_ty, ctx_all_ty) as (q, kv, ctx):
-        rt.start(worker)
-        rt.fill(of_q.prod(), q)
-        rt.fill(of_kv.prod(), kv)
-        rt.drain(of_ctx.cons(), ctx, wait=True)
-    return Program(dev, rt).resolve_program()
+    def sequence(q, kv, ctx, q_h, kv_h, ctx_h):
+        q_h.fill(q)
+        kv_h.fill(kv)
+        ctx_h.drain(ctx, wait=True)
+
+    rt = Runtime(
+        sequence,
+        [q_all_ty, kv_all_ty, ctx_all_ty, of_q.prod(), of_kv.prod(), of_ctx.cons()],
+    )
+    return Program(dev, rt, workers=[worker]).resolve_program()
 
 
 p = argparse.ArgumentParser()

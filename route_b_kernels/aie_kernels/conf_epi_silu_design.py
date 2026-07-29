@@ -14,7 +14,7 @@ import numpy as np
 import argparse
 import sys
 
-from aie.iron import Kernel, ObjectFifo, Program, Runtime, Worker
+from aie.iron import Kernel, ObjectFifo, Program, Runtime, TaskGroup, Worker
 from aie.iron.device import NPU1, NPU2
 from aie.iron.placers import SequentialPlacer
 from aie.helpers.taplib.tap import TensorAccessPattern
@@ -63,17 +63,25 @@ def my_silu(dev, num_columns):
     ]
     out_taps = in_taps
 
-    rt = Runtime()
-    with rt.sequence(in_tensor_ty, out_tensor_ty) as (X, Y):
-        rt.start(*workers)
-        tg = rt.task_group()
+    def sequence(X, Y, in_prods, out_conses):
+        tg = TaskGroup()
         for i in range(num_columns):
-            rt.fill(of_ins[i].prod(), X, in_taps[i], task_group=tg)
+            in_prods[i].fill(X, in_taps[i], group=tg)
         for i in range(num_columns):
-            rt.drain(of_outs[i].cons(), Y, out_taps[i], wait=True, task_group=tg)
-        rt.finish_task_group(tg)
+            out_conses[i].drain(Y, out_taps[i], wait=True, group=tg)
+        tg.finish()
 
-    return Program(dev, rt).resolve_program(SequentialPlacer())
+    rt = Runtime(
+        sequence,
+        [
+            in_tensor_ty,
+            out_tensor_ty,
+            [of_ins[i].prod() for i in range(num_columns)],
+            [of_outs[i].cons() for i in range(num_columns)],
+        ],
+    )
+
+    return Program(dev, rt, workers=workers).resolve_program(SequentialPlacer())
 
 
 p = argparse.ArgumentParser()

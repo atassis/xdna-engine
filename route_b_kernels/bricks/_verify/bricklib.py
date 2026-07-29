@@ -107,13 +107,18 @@ def _build_streamed(symbol, shim, n_tiles, in_tile, out_tile, resident_len, comp
             in_tap = TensorTiler2D.group_tiler((n_tiles, in_tile), (1, in_tile), (n_tiles, 1))[0]
             out_tap = TensorTiler2D.group_tiler((n_tiles, out_tile), (1, out_tile), (n_tiles, 1))[0]
             cst_tap = TensorTiler2D.group_tiler((1, resident_len), (1, resident_len), (1, 1))[0]
-            rt = Runtime()
-            with rt.sequence(in_full, cst_ty, out_full) as (a, c, o):
-                rt.start(worker)
-                rt.fill(inf.prod(), a, in_tap)
-                rt.fill(cf.prod(), c, cst_tap)
-                rt.drain(of.cons(), o, out_tap, wait=True)
-            return Program(iron.get_current_device(), rt).resolve_program()
+            def sequence(a, c, o, in_h, cst_h, out_h):
+                in_h.fill(a, in_tap)
+                cst_h.fill(c, cst_tap)
+                out_h.drain(o, out_tap, wait=True)
+
+            rt = Runtime(
+                sequence,
+                [in_full, cst_ty, out_full, inf.prod(), cf.prod(), of.cons()],
+            )
+            return Program(
+                iron.get_current_device(), rt, workers=[worker]
+            ).resolve_program()
         design.__name__ = design.__qualname__ = f"design_{symbol}"
         return iron.jit(design, use_cache=_JIT_CACHE)
 
@@ -139,12 +144,14 @@ def _build_streamed(symbol, shim, n_tiles, in_tile, out_tile, resident_len, comp
         worker = Worker(core, fn_args=[inf.cons(), of.prod(), kern])
         in_tap = TensorTiler2D.group_tiler((n_tiles, in_tile), (1, in_tile), (n_tiles, 1))[0]
         out_tap = TensorTiler2D.group_tiler((n_tiles, out_tile), (1, out_tile), (n_tiles, 1))[0]
-        rt = Runtime()
-        with rt.sequence(in_full, out_full) as (a, o):
-            rt.start(worker)
-            rt.fill(inf.prod(), a, in_tap)
-            rt.drain(of.cons(), o, out_tap, wait=True)
-        return Program(iron.get_current_device(), rt).resolve_program()
+        def sequence(a, o, in_h, out_h):
+            in_h.fill(a, in_tap)
+            out_h.drain(o, out_tap, wait=True)
+
+        rt = Runtime(sequence, [in_full, out_full, inf.prod(), of.cons()])
+        return Program(
+            iron.get_current_device(), rt, workers=[worker]
+        ).resolve_program()
     design.__name__ = design.__qualname__ = f"design_{symbol}"
     return iron.jit(design, use_cache=_JIT_CACHE)
 
@@ -250,15 +257,21 @@ def _build_oneshot(symbol, shim, in_numels, out_numel, in_dts, out_dt, compile_f
                 c.release(1)
 
         worker = Worker(core, fn_args=[f.cons() for f in in_fifos] + [of.prod(), kern])
-        rt = Runtime()
         seq_tys = list(in_tys) + [out_ty]
-        with rt.sequence(*seq_tys) as bufs:
-            *ins, o = bufs
-            rt.start(worker)
+
+        def sequence(*params):
+            *ins, o, in_prods, out_h = params
             for i in range(nin):
-                rt.fill(in_fifos[i].prod(), ins[i])
-            rt.drain(of.cons(), o, wait=True)
-        return Program(iron.get_current_device(), rt).resolve_program()
+                in_prods[i].fill(ins[i])
+            out_h.drain(o, wait=True)
+
+        rt = Runtime(
+            sequence,
+            [*seq_tys, [f.prod() for f in in_fifos], of.cons()],
+        )
+        return Program(
+            iron.get_current_device(), rt, workers=[worker]
+        ).resolve_program()
 
     if nin == 1:
         def design(a: In, out: Out):

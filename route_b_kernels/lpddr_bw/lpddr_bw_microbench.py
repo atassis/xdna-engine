@@ -177,29 +177,35 @@ def build_module(dev, mode, total_bytes, line_bytes, cols, depth, pin_cols=True)
     n_out = len(fifos_out)
     arg_types = [col_ty] * (n_in + n_out)
 
-    rt = Runtime()
-    with rt.sequence(*arg_types) as args:
-        if not isinstance(args, tuple):
-            args = (args,)
-        for w in workers:
-            rt.start(w)
+    n_args = len(arg_types)
+    # Shim placement moved from the old fill/drain `tile=` onto the handle itself
+    # (prod(tile=)/cons(tile=)); the handles are bound eagerly at Runtime construction.
+    in_prods = [of_in.prod(tile=shims_in[i]) for i, of_in in enumerate(fifos_in)]
+    out_conses = [of_out.cons(tile=shims_out[i]) for i, of_out in enumerate(fifos_out)]
+
+    def sequence(*params):
+        args = params[:n_args]
+        prods = params[n_args : n_args + n_in]
+        conses = params[n_args + n_in :]
         ai = 0
         # Fills (read + rdwr): wait=True on the LAST fill so the dispatch blocks until the
         # full L3->L1 read has landed.
-        for i, of_in in enumerate(fifos_in):
+        for i in range(n_in):
             wait = (mode == "read") and (i == n_in - 1)
-            rt.fill(of_in.prod(), args[ai], wait=wait, tile=shims_in[i])
+            prods[i].fill(args[ai], wait=wait)
             ai += 1
         # Drains (write + rdwr): wait=True on the last drain so the dispatch blocks until
         # the full L1->L3 write (and, for rdwr, the round-trip) has completed.
-        for i, of_out in enumerate(fifos_out):
-            wait = (i == n_out - 1)
-            rt.drain(of_out.cons(), args[ai], wait=wait, tile=shims_out[i])
+        for i in range(n_out):
+            wait = i == n_out - 1
+            conses[i].drain(args[ai], wait=wait)
             ai += 1
+
+    rt = Runtime(sequence, [*arg_types, *in_prods, *out_conses])
 
     # Fork place-tiles model: bare resolve_program() -- aiecc's place-tiles pass assigns
     # physical tiles to the logical objectFIFOs/workers (NO Python-side placer).
-    return Program(dev, rt).resolve_program()
+    return Program(dev, rt, workers=workers).resolve_program()
 
 
 def main():

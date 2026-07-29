@@ -115,15 +115,23 @@ def my_transpose(dev, M, N, mb, nb, num_cores, dt, objname):
         for i in range(num_cores)
     ]
 
-    rt = Runtime()
-    with rt.sequence(in_tensor_ty, out_tensor_ty) as (X, Y):
-        rt.start(*workers)
+    def sequence(X, Y, in_prods, out_conses):
         for i in range(num_cores):
-            rt.fill(of_ins[i].prod(), X, in_taps[i])
+            in_prods[i].fill(X, in_taps[i])
         for i in range(num_cores):
-            rt.drain(of_outs[i].cons(), Y, out_taps[i], wait=True)
+            out_conses[i].drain(Y, out_taps[i], wait=True)
 
-    return Program(dev, rt).resolve_program()
+    rt = Runtime(
+        sequence,
+        [
+            in_tensor_ty,
+            out_tensor_ty,
+            [of_ins[i].prod() for i in range(num_cores)],
+            [of_outs[i].cons() for i in range(num_cores)],
+        ],
+    )
+
+    return Program(dev, rt, workers=workers).resolve_program()
 
 
 p = argparse.ArgumentParser()

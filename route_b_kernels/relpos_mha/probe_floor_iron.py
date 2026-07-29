@@ -24,12 +24,12 @@ def my_probe(dev):
         pout.release(1)
 
     worker = Worker(core_body, [of_in.cons(), of_out.prod(), probe])
-    rt = Runtime()
-    with rt.sequence(in_ty, out_ty) as (I, O):
-        rt.start(worker)
-        rt.fill(of_in.prod(), I)
-        rt.drain(of_out.cons(), O, wait=True)
-    return Program(dev, rt).resolve_program()
+    def sequence(I, O, in_h, out_h):
+        in_h.fill(I)
+        out_h.drain(O, wait=True)
+
+    rt = Runtime(sequence, [in_ty, out_ty, of_in.prod(), of_out.cons()])
+    return Program(dev, rt, workers=[worker]).resolve_program()
 
 
 p = argparse.ArgumentParser()

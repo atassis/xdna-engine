@@ -62,18 +62,29 @@ def residual_add(dev, sequence_length, embedding_dim, scale, trace_size):
         for i in range(n_cores)
     ]
 
-    rt = Runtime()
     a_ty = np.ndarray[(total,), np.dtype[f32]]
     b_ty = np.ndarray[(total,), np.dtype[f32]]
     out_ty = np.ndarray[(total,), np.dtype[f32]]
-    with rt.sequence(a_ty, b_ty, out_ty) as (a, b, out):
-        rt.start(*workers)
+
+    def sequence(a, b, out, a_prods, b_prods, out_conses):
         for i in range(n_cores):
-            rt.fill(of_a[i].prod(), a, taps_a[i])
-            rt.fill(of_b[i].prod(), b, taps_b[i])
+            a_prods[i].fill(a, taps_a[i])
+            b_prods[i].fill(b, taps_b[i])
         for i in range(n_cores):
-            rt.drain(of_out[i].cons(), out, taps_out[i], wait=True)
-    return Program(dev, rt).resolve_program()
+            out_conses[i].drain(out, taps_out[i], wait=True)
+
+    rt = Runtime(
+        sequence,
+        [
+            a_ty,
+            b_ty,
+            out_ty,
+            [of_a[i].prod() for i in range(n_cores)],
+            [of_b[i].prod() for i in range(n_cores)],
+            [of_out[i].cons() for i in range(n_cores)],
+        ],
+    )
+    return Program(dev, rt, workers=workers).resolve_program()
 
 
 p = argparse.ArgumentParser()

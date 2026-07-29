@@ -96,14 +96,19 @@ def rmsnorm_design(
     in_tap = TensorTiler2D.group_tiler((m, cols), (1, cols), (m, 1))[0]
     gb_tap = TensorTiler2D.group_tiler((1, 2 * cols), (1, 2 * cols), (1, 1))[0]
 
-    rt = Runtime()
-    with rt.sequence(in_ty, gb_ty, in_ty) as (a, g, c):
-        rt.start(worker)
-        rt.fill(in_fifo.prod(), a, in_tap)
-        rt.fill(gb_fifo.prod(), g, gb_tap)
-        rt.drain(out_fifo.cons(), c, in_tap, wait=True)
+    def sequence(a, g, c, in_h, gb_h, out_h):
+        in_h.fill(a, in_tap)
+        gb_h.fill(g, gb_tap)
+        out_h.drain(c, in_tap, wait=True)
 
-    return Program(iron.get_current_device(), rt).resolve_program()
+    rt = Runtime(
+        sequence,
+        [in_ty, gb_ty, in_ty, in_fifo.prod(), gb_fifo.prod(), out_fifo.cons()],
+    )
+
+    return Program(
+        iron.get_current_device(), rt, workers=[worker]
+    ).resolve_program()
 
 
 def run_once(x, gamma, beta):

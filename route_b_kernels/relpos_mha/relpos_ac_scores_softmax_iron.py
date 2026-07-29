@@ -70,14 +70,17 @@ def my_relpos_ac_scores_softmax(dev, T):
         [of_qk.cons(), of_bd.cons(), of_probs.prod(), relpos],
     )
 
-    rt = Runtime()
-    with rt.sequence(qk_ty, bd_ty, probs_ty) as (QK, BD, PR):
-        rt.start(worker)
-        rt.fill(of_qk.prod(), QK)
-        rt.fill(of_bd.prod(), BD)
-        rt.drain(of_probs.cons(), PR, wait=True)
+    def sequence(QK, BD, PR, qk_h, bd_h, probs_h):
+        qk_h.fill(QK)
+        bd_h.fill(BD)
+        probs_h.drain(PR, wait=True)
 
-    return Program(dev, rt).resolve_program()
+    rt = Runtime(
+        sequence,
+        [qk_ty, bd_ty, probs_ty, of_qk.prod(), of_bd.prod(), of_probs.cons()],
+    )
+
+    return Program(dev, rt, workers=[worker]).resolve_program()
 
 
 p = argparse.ArgumentParser()

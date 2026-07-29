@@ -148,16 +148,26 @@ def my_dwconv_silu_tmajor(dev, num_columns):
         for i in range(num_columns)
     ]
 
-    rt = Runtime()
-    with rt.sequence(in_tensor_ty, w_tensor_ty, out_tensor_ty) as (X, W, Y):
-        rt.start(*workers)
+    def sequence(X, W, Y, in_prods, w_prods, out_conses):
         for i in range(num_columns):
-            rt.fill(of_ins[i].prod(), X, in_taps[i])
-            rt.fill(of_ws[i].prod(), W, w_taps[i])
+            in_prods[i].fill(X, in_taps[i])
+            w_prods[i].fill(W, w_taps[i])
         for i in range(num_columns):
-            rt.drain(of_outs[i].cons(), Y, out_taps[i], wait=True)
+            out_conses[i].drain(Y, out_taps[i], wait=True)
 
-    return Program(dev, rt).resolve_program()
+    rt = Runtime(
+        sequence,
+        [
+            in_tensor_ty,
+            w_tensor_ty,
+            out_tensor_ty,
+            [of_ins[i].prod() for i in range(num_columns)],
+            [of_ws[i].prod() for i in range(num_columns)],
+            [of_outs[i].cons() for i in range(num_columns)],
+        ],
+    )
+
+    return Program(dev, rt, workers=workers).resolve_program()
 
 
 p = argparse.ArgumentParser()

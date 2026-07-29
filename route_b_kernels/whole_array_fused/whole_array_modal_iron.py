@@ -46,6 +46,7 @@ from aie.iron import (
     ObjectFifo,
     Program,
     Runtime,
+    TaskGroup,
     Worker,
     WorkerRuntimeBarrier,
     str_to_dtype,
@@ -361,23 +362,18 @@ def my_matmul(
     )
     c_index = 0
 
-    rt = Runtime()
-    with rt.sequence(A_ty, B_ty, C_ty) as (A, B, C):
+    def sequence(A, B, C, A_prods, B_prods, C_conses):
+        nonlocal c_index
         # bake the epilogue mode into this instruction stream's RTP (1=silu, 0=identity), then
         # release the barrier so the cores read it. A silu-built stream and an identity-built stream
         # are two .txt insts on the SAME xclbin -> the host picks mode by choosing the stream.
         mode_val = 2 if do_gelu else (1 if do_silu else 0)  # rtp[0]: 0=identity, 1=silu, 2=gelu
-        flat_rtps = [rtp_bufs[r][c] for r in range(n_aie_rows) for c in range(n_aie_cols)]
+        for r in range(n_aie_rows):
+            for c in range(n_aie_cols):
+                rtp_bufs[r][c][0] = mode_val
+        rtp_barrier.set(1)
 
-        def set_modes(*ps):
-            for p in ps:
-                p[0] = mode_val
-
-        rt.inline_ops(set_modes, flat_rtps)
-        rt.set_barrier(rtp_barrier, 1)
-        rt.start(*workers)
-
-        tg = rt.task_group()
+        tg = TaskGroup()
         for tb in range(ceildiv(M // m // n_aie_rows, tb_max_n_rows)):
             for pingpong in [0, 1]:
                 if c_index >= len(C_tiles):
@@ -390,12 +386,11 @@ def my_matmul(
 
                 for col in range(n_aie_cols):
                     C_taps.append(C_tiles[c_index])
-                    rt.drain(
-                        C_l2l3_fifos[col].cons(),
+                    C_conses[col].drain(
                         C,
                         tap=C_tiles[c_index],
                         wait=True,
-                        task_group=tg,
+                        group=tg,
                     )
                     c_index += 1
 
@@ -405,26 +400,41 @@ def my_matmul(
                         ) % len(A_tiles)
 
                         if col < n_aie_rows:
-                            rt.fill(
-                                A_l3l2_fifos[col].prod(),
+                            A_prods[col].fill(
                                 A,
                                 tap=A_tiles[tile_offset],
-                                task_group=tg,
+                                group=tg,
                             )
 
-                        rt.fill(
-                            B_l3l2_fifos[col].prod(),
+                        B_prods[col].fill(
                             B,
                             tap=B_tiles[col],
-                            task_group=tg,
+                            group=tg,
                         )
 
                         A_taps.append(A_tiles[tile_offset])
                         B_taps.append(B_tiles[col])
                 if tb > 0 or (tb == 0 and pingpong > 0):
-                    rt.finish_task_group(tg)
-                    tg = rt.task_group()
-        rt.finish_task_group(tg)
+                    tg.finish()
+                    tg = TaskGroup()
+        tg.finish()
+
+    rt = Runtime(
+        sequence,
+        [
+            A_ty,
+            B_ty,
+            C_ty,
+            [f.prod() for f in A_l3l2_fifos],
+            [f.prod() for f in B_l3l2_fifos],
+            [f.cons() for f in C_l2l3_fifos],
+        ],
+    )
+
+    my_program = Program(dev_ty, rt, workers=workers)
+    # seq_fn now runs at resolve time, so the tap lists are only populated after
+    # this call -- generate_taps must return AFTER it, not before.
+    module = my_program.resolve_program()
 
     if generate_taps:
         return (
@@ -433,8 +443,6 @@ def my_matmul(
             TensorAccessSequence.from_taps(C_taps),
         )
 
-    my_program = Program(dev_ty, rt)
-    module = my_program.resolve_program()
     return module
 
 

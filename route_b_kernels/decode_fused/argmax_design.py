@@ -7,7 +7,7 @@
 import numpy as np
 from ml_dtypes import bfloat16
 
-from aie.iron import Kernel, ObjectFifo, Program, Runtime, Worker
+from aie.iron import Kernel, ObjectFifo, Program, Runtime, TaskGroup, Worker
 from aie.iron.placers import SequentialPlacer
 from aie.helpers.taplib.tap import TensorAccessPattern
 from aie.iron.controlflow import range_
@@ -70,14 +70,22 @@ def my_argmax(dev, N, cols, kernel_object="argmax_slice.o", func_prefix="", verb
     out_taps = [TensorAccessPattern((1, cols * nchunks * PACK), PACK * nchunks * i,
                                     [1, 1, nchunks, PACK], [0, 0, PACK, 1]) for i in range(cols)]
 
-    rt = Runtime()
-    with rt.sequence(in_ty, out_ty) as (A, C):
-        rt.start(*workers)
-        tg = rt.task_group()
+    def sequence(A, C, in_prods, out_conses):
+        tg = TaskGroup()
         for i in range(cols):
-            rt.fill(of_ins[i].prod(), A, in_taps[i], task_group=tg)
+            in_prods[i].fill(A, in_taps[i], group=tg)
         for i in range(cols):
-            rt.drain(of_out[i].cons(), C, out_taps[i], wait=True, task_group=tg)
-        rt.finish_task_group(tg)
+            out_conses[i].drain(C, out_taps[i], wait=True, group=tg)
+        tg.finish()
 
-    return Program(dev, rt).resolve_program(SequentialPlacer())
+    rt = Runtime(
+        sequence,
+        [
+            in_ty,
+            out_ty,
+            [of_ins[i].prod() for i in range(cols)],
+            [of_out[i].cons() for i in range(cols)],
+        ],
+    )
+
+    return Program(dev, rt, workers=workers).resolve_program(SequentialPlacer())

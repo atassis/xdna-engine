@@ -73,18 +73,28 @@ def my_dwconv(dev, num_columns):
     w_taps = TensorTiler2D.simple_tiler((C, KW), (cpc, KW))
     out_taps = TensorTiler2D.simple_tiler((C, T), (cpc, T))
 
-    rt = Runtime()
-    with rt.sequence(in_tensor_ty, w_tensor_ty, out_tensor_ty) as (X, W, Y):
-        rt.start(*workers)
+    def sequence(X, W, Y, in_prods, w_prods, out_conses):
         for i in range(num_columns):
-            rt.fill(of_ins[i].prod(), X, in_taps[i])
-            rt.fill(of_ws[i].prod(), W, w_taps[i])
+            in_prods[i].fill(X, in_taps[i])
+            w_prods[i].fill(W, w_taps[i])
         for i in range(num_columns):
-            rt.drain(of_outs[i].cons(), Y, out_taps[i], wait=True)
+            out_conses[i].drain(Y, out_taps[i], wait=True)
+
+    rt = Runtime(
+        sequence,
+        [
+            in_tensor_ty,
+            w_tensor_ty,
+            out_tensor_ty,
+            [of_ins[i].prod() for i in range(num_columns)],
+            [of_ws[i].prod() for i in range(num_columns)],
+            [of_outs[i].cons() for i in range(num_columns)],
+        ],
+    )
 
     # place-tiles model (fork toolchain): bare resolve_program (aiecc's place-tiles pass assigns
     # physical tiles). The old aie.iron.placers.SequentialPlacer is gone in the fork instance.
-    return Program(dev, rt).resolve_program()
+    return Program(dev, rt, workers=workers).resolve_program()
 
 
 p = argparse.ArgumentParser()

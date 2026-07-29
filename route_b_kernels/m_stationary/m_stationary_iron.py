@@ -28,7 +28,7 @@
 import argparse
 import numpy as np
 
-from aie.iron import Kernel, ObjectFifo, Program, Runtime, Worker, str_to_dtype
+from aie.iron import Kernel, ObjectFifo, Program, Runtime, TaskGroup, Worker, str_to_dtype
 from aie.iron.device import NPU2
 from aie.iron.controlflow import range_
 from aie.helpers.taplib import TensorAccessSequence, TensorTiler2D
@@ -246,23 +246,38 @@ def my_matmul(
 
     # --- Runtime: per chunk, fill all columns' A bands + this chunk of B (kick off all 32 cores),
     # then drain all columns' C. Each column is an independent M-stationary unit. ---
-    rt = Runtime()
-    with rt.sequence(A_ty, B_ty, C_ty) as (A, B, C):
-        rt.start(*workers)
+    def sequence(A, B, C, A_prods, B_prods, C_conses):
         for c in range(n_chunks):
-            tg = rt.task_group()
+            tg = TaskGroup()
             for col in range(n_aie_cols):
-                rt.fill(A_l3l2_fifos[col].prod(), A, tap=A_tiles[col], task_group=tg)
-                rt.fill(B_l3l2_fifos[col].prod(), B, tap=B_tiles[c], task_group=tg)
+                A_prods[col].fill(A, tap=A_tiles[col], group=tg)
+                B_prods[col].fill(B, tap=B_tiles[c], group=tg)
                 A_taps.append(A_tiles[col])
                 B_taps.append(B_tiles[c])
             for col in range(n_aie_cols):
-                rt.drain(
-                    C_l2l3_fifos[col].cons(), C,
-                    tap=C_tiles[col * n_chunks + c], wait=True, task_group=tg,
+                C_conses[col].drain(
+                    C,
+                    tap=C_tiles[col * n_chunks + c], wait=True, group=tg,
                 )
                 C_taps.append(C_tiles[col * n_chunks + c])
-            rt.finish_task_group(tg)
+            tg.finish()
+
+    rt = Runtime(
+        sequence,
+        [
+            A_ty,
+            B_ty,
+            C_ty,
+            [f.prod() for f in A_l3l2_fifos],
+            [f.prod() for f in B_l3l2_fifos],
+            [f.cons() for f in C_l2l3_fifos],
+        ],
+    )
+
+    my_program = Program(dev_ty, rt, workers=workers)
+    # seq_fn now runs at resolve time, so the tap lists are only populated after
+    # this call -- generate_taps must return AFTER it, not before.
+    module = my_program.resolve_program()
 
     if generate_taps:
         return (
@@ -270,9 +285,6 @@ def my_matmul(
             TensorAccessSequence.from_taps(B_taps),
             TensorAccessSequence.from_taps(C_taps),
         )
-
-    my_program = Program(dev_ty, rt)
-    module = my_program.resolve_program()
     return module
 
 

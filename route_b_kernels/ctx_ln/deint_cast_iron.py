@@ -75,14 +75,22 @@ def deint_cast(dev, sequence_length, embedding_dim, trace_size):
         for i in range(n_cores)
     ]
 
-    rt = Runtime()
-    with rt.sequence(in_dtype, out_dtype) as (a_in, c_out):
-        rt.start(*workers)
+    def sequence(a_in, c_out, in_prods, out_conses):
         for i in range(n_cores):
-            rt.fill(of_in[i].prod(), a_in, taps_in[i])
+            in_prods[i].fill(a_in, taps_in[i])
         for i in range(n_cores):
-            rt.drain(of_out[i].cons(), c_out, out_tap(i), wait=True)
-    return Program(dev, rt).resolve_program()
+            out_conses[i].drain(c_out, out_tap(i), wait=True)
+
+    rt = Runtime(
+        sequence,
+        [
+            in_dtype,
+            out_dtype,
+            [of_in[i].prod() for i in range(n_cores)],
+            [of_out[i].cons() for i in range(n_cores)],
+        ],
+    )
+    return Program(dev, rt, workers=workers).resolve_program()
 
 
 p = argparse.ArgumentParser()

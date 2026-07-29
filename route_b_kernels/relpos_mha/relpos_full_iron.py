@@ -40,14 +40,17 @@ def my_relpos_full(dev, T):
 
     worker = Worker(core_body, [of_qkv.cons(), of_qvp.cons(), of_ctx.prod(), relpos])
 
-    rt = Runtime()
-    with rt.sequence(qkv_ty, qvp_ty, ctx_ty) as (QKV, QVP, CX):
-        rt.start(worker)
-        rt.fill(of_qkv.prod(), QKV)
-        rt.fill(of_qvp.prod(), QVP)
-        rt.drain(of_ctx.cons(), CX, wait=True)
+    def sequence(QKV, QVP, CX, qkv_h, qvp_h, ctx_h):
+        qkv_h.fill(QKV)
+        qvp_h.fill(QVP)
+        ctx_h.drain(CX, wait=True)
 
-    return Program(dev, rt).resolve_program()
+    rt = Runtime(
+        sequence,
+        [qkv_ty, qvp_ty, ctx_ty, of_qkv.prod(), of_qvp.prod(), of_ctx.cons()],
+    )
+
+    return Program(dev, rt, workers=[worker]).resolve_program()
 
 
 p = argparse.ArgumentParser()

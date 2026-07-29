@@ -17,7 +17,7 @@
 import argparse
 import numpy as np
 
-from aie.iron import Buffer, Kernel, ObjectFifo, Program, Runtime, Worker, str_to_dtype
+from aie.iron import Buffer, Kernel, ObjectFifo, Program, Runtime, TaskGroup, Worker, str_to_dtype
 from aie.iron.device import NPU2
 from aie.iron.controlflow import range_
 from aie.helpers.taplib import TensorAccessSequence, TensorTiler2D
@@ -169,19 +169,33 @@ def my_matmul(
         B_tiles = TensorTiler2D.group_tiler((K, N), (k, n), (K_div_k, CH), tile_group_col_major=True, prune_step=False)
     C_tiles = TensorTiler2D.group_tiler((M, N), (m * n_aie_rows, n), (1, CH), prune_step=False)
 
-    rt = Runtime()
-    with rt.sequence(A_ty, B_ty, C_ty) as (A, B, C):
-        rt.start(*workers)
+    def sequence(A, B, C, A_prods, B_prods, C_conses):
         for c in range(n_chunks):
-            tg = rt.task_group()
+            tg = TaskGroup()
             for col in range(n_aie_cols):
-                rt.fill(A_l3l2_fifos[col].prod(), A, tap=A_tiles[col], task_group=tg)
-                rt.fill(B_l3l2_fifos[col].prod(), B, tap=B_tiles[c], task_group=tg)
+                A_prods[col].fill(A, tap=A_tiles[col], group=tg)
+                B_prods[col].fill(B, tap=B_tiles[c], group=tg)
                 A_taps.append(A_tiles[col]); B_taps.append(B_tiles[c])
             for col in range(n_aie_cols):
-                rt.drain(C_l2l3_fifos[col].cons(), C, tap=C_tiles[col * n_chunks + c], wait=True, task_group=tg)
+                C_conses[col].drain(C, tap=C_tiles[col * n_chunks + c], wait=True, group=tg)
                 C_taps.append(C_tiles[col * n_chunks + c])
-            rt.finish_task_group(tg)
+            tg.finish()
+
+    rt = Runtime(
+        sequence,
+        [
+            A_ty,
+            B_ty,
+            C_ty,
+            [f.prod() for f in A_l3l2_fifos],
+            [f.prod() for f in B_l3l2_fifos],
+            [f.cons() for f in C_l2l3_fifos],
+        ],
+    )
+
+    # seq_fn now runs at resolve time, so the tap lists are only populated after
+    # this call -- generate_taps must return AFTER it, not before.
+    module = Program(dev_ty, rt, workers=workers).resolve_program()
 
     if generate_taps:
         return (
@@ -189,7 +203,7 @@ def my_matmul(
             TensorAccessSequence.from_taps(B_taps),
             TensorAccessSequence.from_taps(C_taps),
         )
-    return Program(dev_ty, rt).resolve_program()
+    return module
 
 
 def main():

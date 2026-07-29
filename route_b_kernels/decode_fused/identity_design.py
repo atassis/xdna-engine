@@ -5,7 +5,7 @@
 import numpy as np
 from ml_dtypes import bfloat16
 
-from aie.iron import Kernel, ObjectFifo, Program, Runtime, Worker
+from aie.iron import Kernel, ObjectFifo, Program, Runtime, TaskGroup, Worker
 from aie.helpers.taplib.tap import TensorAccessPattern
 from aie.iron.controlflow import range_
 
@@ -42,16 +42,16 @@ def my_identity(dev, N, tile=None, kernel_object="identity_copy.o", func_prefix=
     in_tap = TensorAccessPattern((1, N), 0, [1, 1, ntiles, tile], [0, 0, tile, 1])
     out_tap = TensorAccessPattern((1, N), 0, [1, 1, ntiles, tile], [0, 0, tile, 1])
 
-    rt = Runtime()
-    with rt.sequence(in_ty, out_ty) as (A, C):
-        rt.start(worker)
-        tg = rt.task_group()
-        rt.fill(of_in.prod(), A, in_tap, task_group=tg)
-        rt.drain(of_out.cons(), C, out_tap, wait=True, task_group=tg)
-        rt.finish_task_group(tg)
+    def sequence(A, C, in_h, out_h):
+        tg = TaskGroup()
+        in_h.fill(A, in_tap, group=tg)
+        out_h.drain(C, out_tap, wait=True, group=tg)
+        tg.finish()
+
+    rt = Runtime(sequence, [in_ty, out_ty, of_in.prod(), of_out.cons()])
 
     # BARE resolve_program: this toolchain is the place-tiles model -- generators emit
     # aie.logical_tile and aiecc's place-tiles pass assigns physical tiles. Passing a
     # Python-side placer (SequentialPlacer) is the OLD model and is wrong here; every
     # design that actually works on device (bricklib, iron/operators/gemv) resolves bare.
-    return Program(dev, rt).resolve_program()
+    return Program(dev, rt, workers=[worker]).resolve_program()

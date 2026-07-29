@@ -94,14 +94,14 @@ def vector_softmax(dev, trace_size, N, ROW):
         )
 
     # Runtime operations to move data to/from the AIE-array
-    rt = Runtime()
-    with rt.sequence(tensor_ty, tensor_ty) as (A, C):
-        rt.start(*workers)
-        rt.fill(inA.prod(), A)
-        rt.drain(outC.cons(), C, wait=True)
+    def sequence(A, C, inA_prod, outC_cons):
+        inA_prod.fill(A)
+        outC_cons.drain(C, wait=True)
+
+    rt = Runtime(sequence, [tensor_ty, tensor_ty, inA.prod(), outC.cons()])
 
     # Place components and generate an MLIR module
-    return Program(dev, rt).resolve_program()
+    return Program(dev, rt, workers=workers).resolve_program()
 
 
 def main():

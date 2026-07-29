@@ -349,18 +349,14 @@ def my_relpos_stream(dev, T, TQ, KB, t_active=None, splitp=False, heads=1):
         for h in range(heads)
     ]
 
-    rt = Runtime()
-    with rt.sequence(quv_arg_ty, kpv_arg_ty, ctx_arg_ty) as (QUV, KPV, CX):
+    def sequence(QUV, KPV, CX, quv_prods, kpv_prods, ctx_conses):
         # STEP-C: bake t_active into this instruction stream's RTP (per-head buffers, all the
         # same clip t_active), then release the SHARED barrier so every worker reads it. Same
         # xclbin, different t_active => different insts (the modal-matmul per-insts pattern).
-        # ONE inline_ops writes all H RTP buffers (whole-array modal pattern set_modes).
-        def set_tactive(*ps):
-            for p in ps:
-                p[0] = t_active
-        rt.inline_ops(set_tactive, [tactive_rtp[h] for h in range(heads)])
-        rt.set_barrier(rtp_barrier, 1)
-        rt.start(*workers)
+        # The body is eager now, so writing the H RTP buffers is a plain loop (was inline_ops).
+        for h in range(heads):
+            tactive_rtp[h][0] = t_active
+        rtp_barrier.set(1)
         # SCATTER: head h reads/writes its own slice of each concatenated H-head arg via a
         # per-head OFFSET tap (heads do NOT share data). The kpv tap keeps the STREAM-A single-
         # BD n_qt-replay (sizes=[n_qt,1,kpv_pad_rows,DK], strides=[0,0,DK,1]) -- only the base
@@ -375,11 +371,23 @@ def my_relpos_stream(dev, T, TQ, KB, t_active=None, splitp=False, heads=1):
                 [n_qt, 1, kpv_pad_rows, DK], [0, 0, DK, 1])
             ctx_tap = TensorAccessPattern(
                 [heads * ctx_head_len], h * ctx_head_len, [ctx_head_len], [1])
-            rt.fill(of_quv[h].prod(), QUV, tap=quv_tap)   # tile-interleaved qu/qv blocks
-            rt.fill(of_kpv[h].prod(), KPV, tap=kpv_tap)   # 1 BD, whole kpv replayed n_qt
-            rt.drain(of_ctx[h].cons(), CX, tap=ctx_tap, wait=True)
+            quv_prods[h].fill(QUV, tap=quv_tap)   # tile-interleaved qu/qv blocks
+            kpv_prods[h].fill(KPV, tap=kpv_tap)   # 1 BD, whole kpv replayed n_qt
+            ctx_conses[h].drain(CX, tap=ctx_tap, wait=True)
 
-    return Program(dev, rt).resolve_program()
+    rt = Runtime(
+        sequence,
+        [
+            quv_arg_ty,
+            kpv_arg_ty,
+            ctx_arg_ty,
+            [of_quv[h].prod() for h in range(heads)],
+            [of_kpv[h].prod() for h in range(heads)],
+            [of_ctx[h].cons() for h in range(heads)],
+        ],
+    )
+
+    return Program(dev, rt, workers=workers).resolve_program()
 
 
 p = argparse.ArgumentParser()

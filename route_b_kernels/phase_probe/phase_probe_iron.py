@@ -123,17 +123,24 @@ def build(dev, mode, m, k, n):
     C_rows = TensorTiler2D.simple_tiler((2, gm * gn), (1, gm * gn))
 
     dev_ty = NPU1() if dev == "npu" else NPU2()
-    rt = Runtime()
-    with rt.sequence(A_ty, B_ty, C_ty) as (A, B, C):
-        rt.start(*workers)
+    # The fifos only exist for the enabled phases, so the handle lists are built
+    # conditionally and stay empty for a phase this mode does not run.
+    gemm_handles = [inA.prod(), inB.prod(), outC.cons()] if want_gemm else []
+    ln_handles = [inLN.prod(), outLN.cons()] if want_ln else []
+
+    def sequence(A, B, C, gemm_hs, ln_hs):
         if want_gemm:
-            rt.fill(inA.prod(), A, A_tap)
-            rt.fill(inB.prod(), B, B_tap)
-            rt.drain(outC.cons(), C, C_rows[0], wait=True)
+            a_h, b_h, c_h = gemm_hs
+            a_h.fill(A, A_tap)
+            b_h.fill(B, B_tap)
+            c_h.drain(C, C_rows[0], wait=True)
         if want_ln:
-            rt.fill(inLN.prod(), C, C_rows[1])  # LN reads row1 (host pre-filled)
-            rt.drain(outLN.cons(), C, C_rows[1], wait=True)  # LN writes row1
-    return Program(dev_ty, rt).resolve_program()
+            ln_in, ln_out = ln_hs
+            ln_in.fill(C, C_rows[1])  # LN reads row1 (host pre-filled)
+            ln_out.drain(C, C_rows[1], wait=True)  # LN writes row1
+
+    rt = Runtime(sequence, [A_ty, B_ty, C_ty, gemm_handles, ln_handles])
+    return Program(dev_ty, rt, workers=workers).resolve_program()
 
 
 def main():
