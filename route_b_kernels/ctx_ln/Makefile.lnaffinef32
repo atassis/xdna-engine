@@ -1,0 +1,33 @@
+##===- Makefile.lnaffinef32 ------------------------------------------------===##
+#
+# Fused ctxLN + affine + cast xclbin (one dispatch replacing the ctxLN->affcast chain). Build:
+#   make -f Makefile.lnaffinef32 NPU2=1 rows=512 cols=1024 build/final_lnaffinef32_512x1024.xclbin
+# Produces final_lnaffinef32_${rows}x${cols}.xclbin + insts_lnaffinef32_${rows}x${cols}.txt.
+#
+srcdir := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
+include ${srcdir}/../../makefile-common
+VPATH := ${srcdir}/../../../aie_kernels/aie2p
+
+devicename ?= $(if $(filter 1,$(NPU2)),npu2,npu)
+cores ?= 8
+rows ?= 512
+cols ?= 1024
+tag = lnaffinef32_${rows}x${cols}
+
+aie_py_src = ln_affine_f32_iron.py
+
+all: build/final_${tag}.xclbin
+
+build/ln_affine_f32.o: ln_affine_f32.cc
+	mkdir -p ${@D}
+	cd ${@D} && ${PEANO_INSTALL_DIR}/bin/clang++ ${PEANOWRAP2P_FLAGS} -c $< -o ${@F}
+
+build/aie_${tag}.mlir: ${srcdir}/${aie_py_src}
+	mkdir -p ${@D}
+	python3 $< -d ${devicename} -r ${rows} -c ${cols} -t 0 -n ${cores} > $@
+
+build/final_${tag}.xclbin: build/aie_${tag}.mlir build/ln_affine_f32.o
+	mkdir -p ${@D}
+	cd ${@D} && aiecc --get-xclbin --get-npu-insts \
+		--no-xchesscc --no-xbridge --peano ${PEANO_INSTALL_DIR} \
+		--xclbin-name=${@F} --npu-insts-name=insts_${tag}.txt aie_${tag}.mlir

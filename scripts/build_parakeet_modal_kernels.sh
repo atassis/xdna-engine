@@ -56,6 +56,16 @@ echo "== RESIDENT-LN: ctxLN + affine_cast (+ plain cast) 512x1024 =="
 make -C $LNML -f Makefile.ctxln      NPU2=1 rows=512 cols=1024 build/final_ctxln_512x1024.xclbin
 make -C $LNML -f Makefile.affinecast NPU2=1 rows=512 cols=1024 build/final_affcast_512x1024.xclbin
 make -C $LNML -f Makefile.cast       NPU2=1 rows=512 cols=1024 build/final_cast_512x1024.xclbin
+# FUSED ctxLN+affine+cast in ONE dispatch (replaces the ctxLN->affcast chain). The engine loads this
+# by name (npu.rs `final_lnaffcast_{PAD_M}x{KRES}.xclbin`), so it is shipped-critical. It was NOT
+# built here until 2026-07-29: its Makefile/generator/kernel existed only in the gitignored sandbox,
+# so nothing tracked could rebuild it and the aiecc flag migration skipped it.
+echo "== RESIDENT-LN: FUSED lnaffcast (ctxLN+affine+cast) 512x1024 =="
+make -C $LNML -f Makefile.lnaffcast  NPU2=1 rows=512 cols=1024 build/final_lnaffcast_512x1024.xclbin
+# De-interleave+cast at DFF: the engine loads final_deint_{PAD_M}x{DFF}.xclbin (npu.rs). Makefile was
+# tracked but no build step existed here, so the artifact was equally unreproducible.
+echo "== RESIDENT-FFN: deint@4096 512x4096 =="
+make -C $LNML -f Makefile.deint      NPU2=1 rows=512 cols=4096 build/final_deint_512x4096.xclbin
 # RESIDENT-CONV: GLU gate (conv-module step 2). a*sigmoid(g) over pw1's [T,2D] -> [T,D], cols=D=1024.
 echo "== RESIDENT-CONV: GLU 512x1024 =="
 make -C $LNML -f Makefile.glu        NPU2=1 rows=512 cols=1024 build/final_glu_512x1024.xclbin
@@ -82,7 +92,7 @@ echo "== RESIDENT-FFN: cast@4096 + K=4096 fc2 (identity) =="
 make -C $LNML -f Makefile.cast       NPU2=1 rows=512 cols=4096 build/final_cast_512x4096.xclbin
 WA_C_DEPTH=1 make -C $MMW -f Makefile.modal NPU2=1 M=512 K=4096 N=1024 m=64 k=32 n=128 n_aie_cols=8 \
   emulate_bfloat16_mmul_with_bfp16=1 bfp16_iree=1 no_silu=1 build/final_512x4096x1024_64x32x128_8c_modalid.xclbin
-for tag in ctxln_512x1024 affcast_512x1024 cast_512x1024 cast_512x4096 glu_512x1024 accadd_512x1024 resadd_512x1024_s050 resadd_512x1024_s100 silu_1024x400; do
+for tag in ctxln_512x1024 affcast_512x1024 cast_512x1024 cast_512x4096 lnaffcast_512x1024 deint_512x4096 glu_512x1024 accadd_512x1024 resadd_512x1024_s050 resadd_512x1024_s100 silu_1024x400; do
   cp "$LNML/build/final_${tag}.xclbin" "$LNML/build/insts_${tag}.txt" "$LNDIR/"
 done
 cp "$MMW/build/final_512x4096x1024_64x32x128_8c_modalid.xclbin" "$MMW/build/insts_512x4096x1024_64x32x128_8c_modalid.txt" "$LNDIR/"

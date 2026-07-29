@@ -118,6 +118,23 @@ cp "$RB/ctx_ln/Makefile.resadd"       "$PE/ml/layernorm/Makefile.resadd"
 cp "$RB/ctx_ln/silu_brick.cc"         "$K/silu_brick.cc"
 cp "$RB/ctx_ln/silu_iron.py"          "$PE/ml/layernorm/silu_iron.py"
 cp "$RB/ctx_ln/Makefile.silu2"        "$PE/ml/layernorm/Makefile.silu2"
+# FUSED ctxLN+affine+cast (lnaffcast) -- the ENGINE loads final_lnaffcast_{PAD_M}x{KRES}.xclbin
+# (npu.rs), so this one is shipped-critical, not a probe. Its generator/kernel/Makefile used to
+# live ONLY in the gitignored sandbox: nothing tracked could rebuild it, and the 2026-07-27 aiecc
+# flag migration skipped it for the same reason. Tracked here now; see the fixed-encoder-xclbins log.
+cp "$RB/aie_kernels/ln_affine_cast.cc"   "$K/ln_affine_cast.cc"
+cp "$RB/ctx_ln/ln_affine_cast_iron.py"   "$PE/ml/layernorm/ln_affine_cast_iron.py"
+cp "$RB/ctx_ln/Makefile.lnaffcast"       "$PE/ml/layernorm/Makefile.lnaffcast"
+# RETIRED variants -- kept in tree so the work is not lost, NOT built by build_parakeet_modal_kernels.sh:
+#   lnaffcastb/-tr/-btr : bias / transposed spins of the same generator, no consumer
+#   lnaffinef32         : f32-affine spin, no consumer
+#   resaddln            : fused resadd->LN, measured a WASH (xdna-engine dec9c2c), engine wiring removed
+cp "$RB/aie_kernels/ln_affine_f32.cc"    "$K/ln_affine_f32.cc"
+cp "$RB/ctx_ln/ln_affine_f32_iron.py"    "$PE/ml/layernorm/ln_affine_f32_iron.py"
+cp "$RB/ctx_ln/resadd_ln_iron.py"        "$PE/ml/layernorm/resadd_ln_iron.py"
+for _m in lnaffcastb lnaffcastbtr lnaffcasttr lnaffinef32 resaddln; do
+  cp "$RB/ctx_ln/Makefile.$_m"           "$PE/ml/layernorm/Makefile.$_m"
+done
 # mha_decode — on-chip single-query MHA for the Whisper decoder (M1 Task 0): kernel + design
 mkdir -p "$PE/ml/mha_decode"
 cp "$RB/mha_decode/mha_decode.cc"      "$K/mha_decode.cc"

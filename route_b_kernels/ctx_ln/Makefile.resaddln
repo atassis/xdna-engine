@@ -1,0 +1,44 @@
+##===- Makefile.resaddln --------------------------------------------------===##
+#
+# FUSED residual-add -> LN+affine+cast, one xclbin (the first one-xclbin-per-block collapse).
+#   make -f Makefile.resaddln NPU2=1 rows=512 cols=1024 scale=0.5 stag=050 \
+#        build/final_resaddln_512x1024_s050.xclbin
+# Scale is baked per xclbin exactly as residual_add does; both scales (050/100) are built.
+#
+srcdir := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
+include ${srcdir}/../../makefile-common
+VPATH := ${srcdir}/../../../aie_kernels/aie2p
+
+devicename ?= $(if $(filter 1,$(NPU2)),npu2,npu)
+cores ?= 8
+# spread=1 pins each resadd/LN pair to its own column (0..7); default lets the column-major
+# placer pack all 16 workers into columns 0..3.
+spread ?=
+spread_flag = $(if $(filter 1,$(spread)),--spread,)
+rows ?= 512
+cols ?= 1024
+scale ?= 0.5
+stag ?= 050
+tag = resaddln_${rows}x${cols}_s${stag}
+
+aie_py_src = resadd_ln_iron.py
+
+all: build/final_${tag}.xclbin
+
+build/residual_add.o: residual_add.cc
+	mkdir -p ${@D}
+	cd ${@D} && ${PEANO_INSTALL_DIR}/bin/clang++ ${PEANOWRAP2P_FLAGS} -c $< -o ${@F}
+
+build/ln_affine_cast.o: ln_affine_cast.cc
+	mkdir -p ${@D}
+	cd ${@D} && ${PEANO_INSTALL_DIR}/bin/clang++ ${PEANOWRAP2P_FLAGS} -c $< -o ${@F}
+
+build/aie_${tag}.mlir: ${srcdir}/${aie_py_src}
+	mkdir -p ${@D}
+	python3 $< -d ${devicename} -r ${rows} -c ${cols} -s ${scale} -n ${cores} ${spread_flag} > $@
+
+build/final_${tag}.xclbin: build/aie_${tag}.mlir build/residual_add.o build/ln_affine_cast.o
+	mkdir -p ${@D}
+	cd ${@D} && aiecc --get-xclbin --get-npu-insts \
+		--no-xchesscc --no-xbridge --peano ${PEANO_INSTALL_DIR} \
+		--xclbin-name=${@F} --npu-insts-name=insts_${tag}.txt aie_${tag}.mlir
