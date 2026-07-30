@@ -1024,6 +1024,7 @@ dependencies = [
  "anyhow",
  "ndarray",
  "ndarray-npy",
+ "npu-asr",
  "npu-onnx",
  "npu-weights",
  "npu-xrt",
