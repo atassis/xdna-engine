@@ -15,10 +15,20 @@ Usage: python3 golden.py    # prints max abs err of the emulation vs np.sin, and
 import numpy as np
 
 TWO_PI = 2.0 * np.pi
-LUT_ENTRIES = 256          # 256 * 24 B = 6 KB, inside the 8 KB budget the KB note measures
+# 256 entries * 24 B/entry (4 B float offset + 2 B bf16 slope, x4 copies) = 6 KB, inside the 8 KB
+# budget the KB note measured. Entry count is bounded ABOVE by bf16 input resolution, not by memory:
+# linear_approx indexes off the bf16 input, and bf16 has an 8-bit mantissa, so at |u| ~ 128 the input
+# spacing is 0.5 entries. Pushing to 512 entries would quantize the input to ~1 entry and throw away
+# the interpolation the primitive exists for.
+LUT_ENTRIES = 256
 LUT_LO = -np.pi
 LUT_HI = np.pi
 STEP = (LUT_HI - LUT_LO) / LUT_ENTRIES
+# The kernel pre-scales the reduced argument into ENTRY UNITS and calls compute() with step_bits=0:
+# hardware computes index = int(u) and returns offset[e] + slope[e]*u against the FULL u, so the
+# table stores y-INTERCEPTS in u coordinates, not within-cell values.
+SCALE = 1.0 / STEP                     # r -> u,  u in [-128, 128)
+BIAS = LUT_ENTRIES // 2                # entry 0 <-> u = -128
 
 
 def bf16(x):
@@ -42,23 +52,33 @@ def sin_ref(x):
 
 
 def lut_tables():
-    """(offset, slope) per entry: value at the left edge and the slope across the cell."""
-    edges = LUT_LO + STEP * np.arange(LUT_ENTRIES + 1, dtype=np.float64)
-    vals = np.sin(edges)
-    offset = vals[:-1].astype(np.float32)
-    slope = ((vals[1:] - vals[:-1]) / STEP).astype(np.float32)
-    return offset, slope
+    """(offset, slope) per entry in U COORDINATES, matching what the hardware evaluates.
+
+    aie2 linear_approx computes  offset[e] + slope[e] * u  where u is the (delayed) FULL input,
+    so offset must be the line's y-INTERCEPT, not the cell's left-edge value.
+
+    The slope is stored as bfloat16, and the intercept is then computed FROM THE ROUNDED SLOPE.
+    That matters more than it looks: the intercept is O(1) while slope*u is O(pi), so pairing an
+    exact intercept with a rounded slope leaves an uncancelled error of eps_bf16 * |slope*u| ~ 1e-2.
+    Deriving the intercept from the rounded slope makes the residual O(slope * cell_width) instead.
+    """
+    u_edges = np.arange(LUT_ENTRIES + 1, dtype=np.float64) - BIAS      # left edges in u units
+    r_edges = u_edges / SCALE
+    vals = np.sin(r_edges)
+    slope = ((vals[1:] - vals[:-1]) / 1.0).astype(np.float32)          # per UNIT of u
+    slope_b = bf16(slope)                                              # what the table really holds
+    offset = (vals[:-1] - slope_b.astype(np.float64) * u_edges[:-1]).astype(np.float32)
+    return offset, slope_b
 
 
 def sin_lut_emulated(x):
-    """Bit-faithful emulation of the device path: reduce, narrow to bf16, interpolate."""
+    """Bit-faithful emulation of the device path: reduce, scale to u, narrow to bf16, interpolate."""
     r = range_reduce(x)
-    r_b = bf16(r)
-    offset, slope = lut_tables()
-    idx = np.clip(((r_b - LUT_LO) / STEP).astype(np.int32), 0, LUT_ENTRIES - 1)
-    frac = (r_b - (LUT_LO + idx * STEP)).astype(np.float32)
-    # linear_approx narrows the table to bfloat16 and accumulates in f32
-    return (bf16(offset[idx]) + bf16(slope[idx]) * frac).astype(np.float32)
+    u = bf16(np.asarray(r, dtype=np.float32) * np.float32(SCALE))      # compute() takes bf16 input
+    offset, slope_b = lut_tables()
+    idx = np.clip((np.floor(u).astype(np.int32) + BIAS), 0, LUT_ENTRIES - 1)
+    # offset is float in the table; slope is bf16; the mac accumulates in f32
+    return (offset[idx] + slope_b[idx].astype(np.float32) * u).astype(np.float32)
 
 
 def rel_l2(a, b):
@@ -70,11 +90,22 @@ def rel_l2(a, b):
 
 
 def emit_inc(path):
-    """Emit the aie::lut<4,bfloat16> ab/cd tables. 4 copies, 128-bit-bank interleaved.
+    """Emit the aie::lut<4,float,bfloat16> ab/cd tables.
 
-    Layout follows bricks/rope-lut/rope_lut_tables.inc; the bank-granularity rationale is in
-    log/2026-07/2026-07-25-rope-lut-root-cause-bank-granularity.md. ab holds (offset,slope) pairs for
-    even entries, cd for odd, each replicated 4x.
+    !! THE ab/cd PACKING BELOW IS UNVERIFIED. !!
+    The values (intercept + bf16 slope, above) are correct and self-checked; how they must be
+    INTERLEAVED across the ab/cd banks is not. aie2's linear_approx reads them with
+    `load_lut_2x_float(LUT_ab_, LUT_cd_, index, coeff0, coeff1)` and then splits the pair via
+    `shuffle(coeff0, coeff1, T32_16x2_hi)` for the f32 offset and `shuffle(..., T16_16x4_lo)` for the
+    bf16 slope (aie_api/detail/aie2/linear_approx.hpp:346-420). That packing is expressed only
+    through those shuffle patterns, and there is NO working linear_approx call site anywhere in this
+    repo to copy -- bricks/rope-lut uses parallel_lookup, a different primitive, and
+    _verify/probe_lut_ab_cd.py probes parallel_lookup's banks, not these.
+
+    So the even/odd split written here is a GUESS and must be established empirically before the
+    kernel can be trusted. See the probe task in the Lane C stage-1 plan; model it on
+    probe_lut_ab_cd.py (discriminating tables + known keys, so each lane reveals which bank and
+    which entry it actually read).
     """
     offset, slope = lut_tables()
     def fmt(vals):
@@ -83,7 +114,7 @@ def emit_inc(path):
     for i in range(LUT_ENTRIES):
         (inter_ab if i % 2 == 0 else inter_cd).extend([offset[i], slope[i]])
     body = f"""// AUTO-GENERATED by bricks/sin/golden.py -- do not hand-edit.
-// aie::lut<4,bfloat16> tables for sin over [{LUT_LO:.8f}, {LUT_HI:.8f}), {LUT_ENTRIES} entries.
+// aie::lut<4,float,bfloat16> tables for sin over [{LUT_LO:.8f}, {LUT_HI:.8f}), {LUT_ENTRIES} entries.
 #pragma once
 static const float kSinApproxAb[] = {{
   {fmt(inter_ab * 4)}
