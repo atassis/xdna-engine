@@ -6,7 +6,7 @@ with weights, bias and dilation taken from the S2-Pro GGUF, at all three dilatio
 (1, 3, 9 for .block.2/.3/.4). Dilation is the whole point of this brick, so gating one value of it
 would not mean much.
 
-Streamed rail, one output channel per tile: [c_in, c_out, k] f32 is 258 KB and no core tile holds
+Streamed rail, one output channel per tile: [c_out, c_in, k] f32 is 258 KB and no core tile holds
 it, while the [c_in, t] activation is 12 KB and does. Each tile carries that channel's weights and
 its own bias, so the kernel never needs to know which call it is on. Same split as the fused
 upsample stage, which is deliberate -- the residual unit composes these two.
@@ -49,14 +49,15 @@ ok = True
 for tensor, dilation in UNITS:
     w = gx.load(str(GGUF), f"{tensor}.weight").astype(np.float32)
     bias = gx.load(str(GGUF), f"{tensor}.bias").astype(np.float32).reshape(-1)
-    assert w.shape == (C_IN, C_OUT, K), f"{tensor}: weight shape {w.shape}"
+    # [c_out, c_in, k]: ggml_conv_1d's layout, the TRANSPOSE of conv_transpose_1d's.
+    assert w.shape == (C_OUT, C_IN, K), f"{tensor}: weight shape {w.shape}"
 
     ref = golden.conv_1d_causal_ref(x, w, bias, dilation)
 
     TILE = C_IN * K + 1
     tiles = np.zeros((C_OUT, TILE), np.float32)
     for co in range(C_OUT):
-        tiles[co, :C_IN * K] = w[:, co, :].reshape(-1)
+        tiles[co, :C_IN * K] = w[co].reshape(-1)   # already contiguous [c_in, k]
         tiles[co, C_IN * K] = bias[co]
 
     _cb = int(time.time() * 1000) % 10**9

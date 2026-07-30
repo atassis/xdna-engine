@@ -11,9 +11,17 @@ and with stride 1 that is exactly (k-1)*d zeros on the LEFT and none that affect
 right, so out_len == in_len and output t depends only on inputs <= t. Written here in the equivalent
 direct form, which is what a kernel can evaluate without materialising the padded copy:
 
-    y[co, t] = bias[co] + sum_ci sum_j w[ci, co, j] * x[ci, t - (k-1-j)*d]     (x[.., <0] = 0)
+    y[co, t] = bias[co] + sum_ci sum_j w[co, ci, j] * x[ci, t - (k-1-j)*d]     (x[.., <0] = 0)
 
-Layout matches the other codec bricks: ggml ne=[k, c_out, c_in] is numpy C-order [c_in, c_out, k].
+LAYOUT IS [c_out, c_in, k], WHICH IS NOT WHAT conv_transpose_1d USES. ggml_conv_1d reshapes its
+kernel as "[OC, IC, K] => [OC, IC * K]" (ggml/src/ggml.c:4495), so ne=[k, c_in, c_out] and the
+numpy C-order view gguf_extract returns is [c_out, c_in, k]. ggml_conv_transpose_1d takes
+ne=[k, c_out, c_in] instead, i.e. numpy [c_in, c_out, k] -- the convention the conv-transpose-1d
+brick documents. The two are transposes of each other and every residual-unit weight in this codec
+is SQUARE (96x96), so getting it backwards is invisible to a shape check and to any self-consistent
+gate. Confirmed against the one non-square conv_1d in the decoder: c.decoder.model.0.conv.weight is
+ne=[7, 1024, 1536] and maps the 1024-wide transformer output to the 1536 channels stage 1 consumes,
+which only parses as [k, c_in, c_out].
 
 Usage: python3 golden.py
 """
@@ -21,20 +29,20 @@ import numpy as np
 
 
 def conv_1d_causal_ref(x, w, bias, dilation=1):
-    """x: [c_in, t] f32. w: [c_in, c_out, k] f32. bias: [c_out] f32. Returns [c_out, t]."""
+    """x: [c_in, t] f32. w: [c_out, c_in, k] f32. bias: [c_out] f32. Returns [c_out, t]."""
     x = np.asarray(x, dtype=np.float32)
     w = np.asarray(w, dtype=np.float32)
     c_in, t = x.shape
-    c_in_w, c_out, k = w.shape
+    c_out, c_in_w, k = w.shape
     assert c_in == c_in_w, f"channel mismatch: x has {c_in}, w has {c_in_w}"
     y = np.zeros((c_out, t), dtype=np.float64)
     for ci in range(c_in):
         for j in range(k):
             shift = (k - 1 - j) * dilation
             if shift == 0:
-                y += np.outer(w[ci, :, j], x[ci])
+                y += np.outer(w[:, ci, j], x[ci])
             elif shift < t:
-                y[:, shift:] += np.outer(w[ci, :, j], x[ci, :t - shift])
+                y[:, shift:] += np.outer(w[:, ci, j], x[ci, :t - shift])
     y += np.asarray(bias, dtype=np.float64).reshape(-1, 1)
     return y.astype(np.float32)
 
@@ -51,7 +59,7 @@ if __name__ == "__main__":
     rng = np.random.default_rng(0)
     c_in, c_out, k, t = 3, 4, 7, 32
     x = rng.standard_normal((c_in, t)).astype(np.float32)
-    w = (rng.standard_normal((c_in, c_out, k)).astype(np.float32) * 0.3)
+    w = (rng.standard_normal((c_out, c_in, k)).astype(np.float32) * 0.3)
     b = (rng.standard_normal(c_out).astype(np.float32) * 0.1)
 
     for d in (1, 3, 9):
@@ -65,7 +73,7 @@ if __name__ == "__main__":
         y2 = np.zeros((c_out, t), np.float64)
         for ci in range(c_in):
             for j in range(k):
-                y2 += np.outer(w[ci, :, j], xp[ci, j * d:j * d + t])
+                y2 += np.outer(w[:, ci, j], xp[ci, j * d:j * d + t])
         y2 += b.astype(np.float64).reshape(-1, 1)
         assert rel_l2(y, y2.astype(np.float32)) < 1e-6, f"direct != pad-then-valid at dilation {d}"
 

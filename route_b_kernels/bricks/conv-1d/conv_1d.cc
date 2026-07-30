@@ -14,7 +14,7 @@
 // golden.py asserts the two forms agree, and asserts causality directly, because a sign error in
 // the shift is invisible to a shape check.
 //
-// ONE OUTPUT CHANNEL PER CALL. The residual-unit weights are [c_in, c_out, k] = 96*96*7 f32 =
+// ONE OUTPUT CHANNEL PER CALL. The residual-unit weights are [c_out, c_in, k] = 96*96*7 f32 =
 // 258 KB and no core tile holds that, so the caller streams one output channel's slice at a time
 // past a resident activation -- the same split the fused upsample stage uses, and for the same
 // reason. The caller owns that decomposition; this kernel just does one channel.
@@ -30,7 +30,9 @@
 
 namespace route_b_bricks {
 
-// w_row: [c_in * k] weights for ONE output channel, laid out [ci*k + j].
+// w_row: [c_in * k] weights for ONE output channel, laid out [ci*k + j]. With ggml_conv_1d's
+//        [c_out, c_in, k] layout that slice is w[co] and is already contiguous -- no gather.
+//        Note conv_transpose_1d uses the TRANSPOSED layout; see conv-1d/golden.py.
 // x:     [c_in, t] activation.
 // out:   [t] for that output channel.
 static inline void conv_1d_causal_core(const float *restrict x, const float *restrict w_row,

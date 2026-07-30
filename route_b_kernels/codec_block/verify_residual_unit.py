@@ -69,6 +69,9 @@ for prefix, dilation in UNITS:
     a2 = gx.load(str(GGUF), f"{prefix}.block.2.alpha").astype(np.float32).reshape(-1)
     w3 = gx.load(str(GGUF), f"{prefix}.block.3.conv.weight").astype(np.float32)
     b3 = gx.load(str(GGUF), f"{prefix}.block.3.conv.bias").astype(np.float32).reshape(-1)
+    # Both are [c_out, c_in, k] -- ggml_conv_1d layout. Square here, so a transpose
+    # would be invisible to this assert; the layout is settled from the one
+    # non-square conv_1d in the decoder (see conv-1d/golden.py).
     assert w1.shape == (C, C, K) and w3.shape == (C, C, 1), f"{prefix}: {w1.shape} {w3.shape}"
 
     h = conv_g.conv_1d_causal_ref(snake_g.snake_ref(x, a0), w1, b1, dilation)
@@ -79,13 +82,13 @@ for prefix, dilation in UNITS:
     TILE = C * K + 4
     tiles = np.zeros((2 * C, TILE), np.float32)
     for co in range(C):                                     # phase A: the dilated conv
-        tiles[co, :C * K] = w1[:, co, :].reshape(-1)
+        tiles[co, :C * K] = w1[co].reshape(-1)
         tiles[co, C * K] = b1[co]
         tiles[co, C * K + 3] = co
     tiles[0, C * K + 2] = 1.0                               # activate x with alpha0 on tile 0
     for co in range(C):                                     # phase B: the 1x1 conv + residual
         r = C + co
-        tiles[r, :C * 1] = w3[:, co, :].reshape(-1)
+        tiles[r, :C * 1] = w3[co].reshape(-1)
         tiles[r, C * K] = b3[co]
         tiles[r, C * K + 1] = 1.0
         tiles[r, C * K + 3] = co
