@@ -30,45 +30,47 @@
 
 namespace route_b_bricks {
 
+// Vector-level sin: fold to [-pi, pi] then a 6-term odd Taylor. Exposed so composites (snake)
+// can use it without a scratch buffer or a second pass over memory.
+//
+// REGISTER PRESSURE IS THE BINDING CONSTRAINT, not arithmetic. An earlier version kept every Horner
+// intermediate in its own named vector (~17 live) plus hoisted broadcast constants; on device the
+// results came back ALIASED -- p3 returned r2's value, res returned p4's, zeros interleaved. That is
+// spill codegen (llvm-aie #1155 territory), not maths. So: one accumulator reassigned in place, and
+// constants materialised at point of use.
+template <int N>
+static inline ::aie::vector<float, N> sin_v(::aie::vector<float, N> r) {
+  // fold: r -= 2*pi*round(r/2*pi). round() via the f32 (q + 2^23) - 2^23 identity, because
+  // aie::to_float on a vector<int32,16> does not instantiate on aie2p (it fails inside aie_api's
+  // own elementary.hpp, Fix2Float -> cast_to<uint16>).
+  ::aie::vector<float, N> k = ::aie::mul(r, ::aie::broadcast<float, N>(0.15915494309189535f));
+  k = ::aie::add(k, ::aie::broadcast<float, N>(8388608.0f));
+  k = ::aie::sub(k, ::aie::broadcast<float, N>(8388608.0f));
+  ::aie::vector<float, N> kt = ::aie::mul(k, ::aie::broadcast<float, N>(6.28318530717958648f));
+  r = ::aie::sub(r, kt);
+
+  // 6-term odd Taylor, Horner in r^2: accurate to 4.5e-4 over ALL of [-pi, pi] (host-checked over
+  // 2e5 points), so no second reduction stage and no conditional ops are needed.
+  ::aie::vector<float, N> r2 = ::aie::mul(r, r);
+  ::aie::vector<float, N> p = ::aie::mul(r2, ::aie::broadcast<float, N>(-2.50521083854417188e-08f));
+  p = ::aie::add(p, ::aie::broadcast<float, N>(2.75573192239858907e-06f));
+  p = ::aie::mul(p, r2);
+  p = ::aie::add(p, ::aie::broadcast<float, N>(-1.98412698412698413e-04f));
+  p = ::aie::mul(p, r2);
+  p = ::aie::add(p, ::aie::broadcast<float, N>(8.33333333333333322e-03f));
+  p = ::aie::mul(p, r2);
+  p = ::aie::add(p, ::aie::broadcast<float, N>(-1.66666666666666657e-01f));
+  p = ::aie::mul(p, r2);
+  p = ::aie::add(p, ::aie::broadcast<float, N>(1.0f));
+  return ::aie::mul(p, r);
+}
+
 template <int N>
 void sin_core(const float *restrict input, float *restrict output, int32_t n) {
   event0();
   const int chunks = n / N;
-
   for (int i = 0; i < chunks; i++) {
-    // REGISTER PRESSURE IS THE BINDING CONSTRAINT, not arithmetic. An earlier version kept every
-    // Horner intermediate in its own named vector (~17 live) plus 9 hoisted broadcast constants; on
-    // device the results came back ALIASED -- p3 returned r2's value, p2 returned r's, res returned
-    // p4's, with zeros interleaved. That is spill codegen, not maths (and spills in this area are
-    // what the pinned Peano carries llvm-aie #1155 for). So: one accumulator reassigned in place,
-    // constants materialised at point of use, and nothing kept live that is already consumed.
-    ::aie::vector<float, N> r = ::aie::load_v<N>(input + i * N);
-
-    // fold to [-pi, pi]: r -= 2*pi*round(r/2*pi), rounding via the f32 (q + 2^23) - 2^23 identity
-    // because aie::to_float on vector<int32,16> does not instantiate on aie2p.
-    {
-      ::aie::vector<float, N> k = ::aie::mul(r, ::aie::broadcast<float, N>(0.15915494309189535f));
-      k = ::aie::add(k, ::aie::broadcast<float, N>(8388608.0f));
-      k = ::aie::sub(k, ::aie::broadcast<float, N>(8388608.0f));
-      ::aie::vector<float, N> kt = ::aie::mul(k, ::aie::broadcast<float, N>(6.28318530717958648f));
-      r = ::aie::sub(r, kt);
-    }
-
-    // 6-term odd Taylor, Horner in r^2. Accurate to 4.5e-4 over all of [-pi, pi] (host-checked over
-    // 2e5 points), so no second reduction stage and no conditional ops are needed.
-    ::aie::vector<float, N> r2 = ::aie::mul(r, r);
-    ::aie::vector<float, N> p = ::aie::mul(r2, ::aie::broadcast<float, N>(-2.50521083854417188e-08f));
-    p = ::aie::add(p, ::aie::broadcast<float, N>(2.75573192239858907e-06f));
-    p = ::aie::mul(p, r2);
-    p = ::aie::add(p, ::aie::broadcast<float, N>(-1.98412698412698413e-04f));
-    p = ::aie::mul(p, r2);
-    p = ::aie::add(p, ::aie::broadcast<float, N>(8.33333333333333322e-03f));
-    p = ::aie::mul(p, r2);
-    p = ::aie::add(p, ::aie::broadcast<float, N>(-1.66666666666666657e-01f));
-    p = ::aie::mul(p, r2);
-    p = ::aie::add(p, ::aie::broadcast<float, N>(1.0f));
-    p = ::aie::mul(p, r);
-    ::aie::store_v(output + i * N, p);
+    ::aie::store_v(output + i * N, sin_v<N>(::aie::load_v<N>(input + i * N)));
   }
   event1();
 }
