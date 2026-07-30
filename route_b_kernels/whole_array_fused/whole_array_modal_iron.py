@@ -188,6 +188,7 @@ def my_matmul(
     do_gelu=False,
     c_panel_width=0,
     dtype_out_str="f32",
+    k_loop_rtp=False,
 ):
     n_aie_rows = 4
     n_aie_cores = n_aie_rows * n_aie_cols
@@ -381,6 +382,12 @@ def my_matmul(
     # which is what lets the wide-N fast tile (64x32x96) fit in L1.
     def core_fn(in_a, in_b, out_c, rtp_buff, barrier, zero, matmul, epilogue):
         barrier.wait_for_value(1)  # wait for the host to write the epilogue mode into rtp
+        # k-loop-bound-as-rtp PoC: rtp[1] carries the K-tile trip count, written by sequence()
+        # alongside rtp[0]'s epilogue mode, so ONE compiled core body serves any K value --
+        # the loop bound is a runtime memref.load, not a Python-baked constant. range_/_for
+        # accepts an MLIR Value as the loop stop, and AIESCFToControlFlow lowers it generically,
+        # so no toolchain change is needed for this to work.
+        k_trip = rtp_buff[1] if k_loop_rtp else K // k
         loop = range(1)  # Workaround for issue #1547
         if n_tiles_per_core > 1:
             loop = range_(n_tiles_per_core)
@@ -388,7 +395,7 @@ def my_matmul(
             elem_out = out_c.acquire(1)
             zero(elem_out)
 
-            for _ in range_(K // k):
+            for _ in range_(k_trip):
                 elem_in_a = in_a.acquire(1)
                 elem_in_b = in_b.acquire(1)
                 matmul(elem_in_a, elem_in_b, elem_out)
@@ -406,6 +413,8 @@ def my_matmul(
         in_a, in_b, out_c, acc, rtp_buff, barrier, zero, matmul, epilogue
     ):
         barrier.wait_for_value(1)
+        # k-loop-bound-as-rtp PoC: same rtp[1]-driven bound as core_fn above.
+        k_trip = rtp_buff[1] if k_loop_rtp else K // k
         loop = range(1)  # Workaround for issue #1547
         if n_tiles_per_core > 1:
             loop = range_(n_tiles_per_core)
@@ -413,7 +422,7 @@ def my_matmul(
             elem_out = out_c.acquire(1)
             zero(acc)
 
-            for _ in range_(K // k):
+            for _ in range_(k_trip):
                 elem_in_a = in_a.acquire(1)
                 elem_in_b = in_b.acquire(1)
                 matmul(elem_in_a, elem_in_b, acc)
@@ -511,6 +520,8 @@ def my_matmul(
         for r in range(n_aie_rows):
             for c in range(n_aie_cols):
                 rtp_bufs[r][c][0] = mode_val
+                if k_loop_rtp:
+                    rtp_bufs[r][c][1] = K // k  # k-loop-bound-as-rtp PoC: K-tile trip count
         rtp_barrier.set(1)
 
         tg = TaskGroup()
@@ -633,6 +644,14 @@ def main():
         "device sub-buffer, deleting the separate deinterleave dispatch. Insts-only: the "
         "xclbin is byte-identical to the row-major build.",
     )
+    argparser.add_argument(
+        "--k-loop-rtp",
+        action="store_true",
+        help="k-loop-bound-as-rtp PoC: drive the core's K-tile loop bound from rtp[1] "
+        "(a runtime memref.load) instead of baking K//k as a compile-time constant. "
+        "Claim under test: the xclbin/core-ELF becomes independent of K, so only the "
+        "insts stream (A/B tap counts + the rtp[1] write) needs to vary per K value.",
+    )
     args = argparser.parse_args()
     maybe_module = my_matmul(
         args.dev,
@@ -651,6 +670,7 @@ def main():
         args.gelu,
         args.c_panel_width,
         args.dtype_out,
+        args.k_loop_rtp,
     )
     if args.generate_taps:
         return maybe_module
