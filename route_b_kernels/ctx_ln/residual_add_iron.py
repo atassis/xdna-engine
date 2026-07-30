@@ -21,8 +21,7 @@ from aie.helpers.taplib import TensorTiler2D
 from aie.iron.controlflow import range_
 
 
-def residual_add(dev, sequence_length, embedding_dim, scale, trace_size):
-    n_cores = 8
+def residual_add(dev, sequence_length, embedding_dim, scale, trace_size, n_cores=8):
     assert sequence_length % n_cores == 0, "rows must split evenly across 8 cores"
     assert embedding_dim % 16 == 0, "residual_add_row<16> vectorizes cols by 16"
 
@@ -84,7 +83,18 @@ def residual_add(dev, sequence_length, embedding_dim, scale, trace_size):
             [of_out[i].cons() for i in range(n_cores)],
         ],
     )
-    return Program(dev, rt, workers=workers).resolve_program()
+    prog = Program(dev, rt, workers=workers)
+    # Per-op occupancy instrument (wired 2026-07-30, connecting the trace_size knob this file
+    # already accepted but never called -- see ln_affine_cast_iron.py for the established recipe).
+    # trace_size=0 (the production build) leaves the design byte-identical.
+    if trace_size:
+        # Trace ONE worker, not all n_cores. Tracing every worker collides on the shim's south
+        # ports ("aie.masterset op targets same destination South: 3") once n_cores gets large
+        # enough to saturate them -- build the traced variant with -n/--cores reduced (cores=1
+        # is representative of the per-row MATH, not production wall time; see the enable_trace
+        # recipe established for ln_affine_cast_iron.py, which this mirrors).
+        prog.enable_trace(trace_size=trace_size, workers=[workers[0]], egress_shim_col=1)
+    return prog.resolve_program()
 
 
 p = argparse.ArgumentParser()
@@ -93,7 +103,9 @@ p.add_argument("-r", "--rows", required=True, dest="rows")
 p.add_argument("-c", "--cols", required=True, dest="cols")
 p.add_argument("-s", "--scale", required=True, dest="scale")
 p.add_argument("-t", "--trace_size", required=False, dest="trace_size", default=0)
+p.add_argument("-n", "--cores", required=False, dest="cores", default=8)
 opts = p.parse_args(sys.argv[1:])
 
 dev = NPU2() if opts.device == "npu2" else NPU1()
-print(residual_add(dev, int(opts.rows), int(opts.cols), float(opts.scale), int(opts.trace_size)))
+print(residual_add(dev, int(opts.rows), int(opts.cols), float(opts.scale), int(opts.trace_size),
+                   int(opts.cores)))

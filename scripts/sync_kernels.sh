@@ -105,6 +105,7 @@ cp "$RB/ctx_ln/Makefile.deint"        "$PE/ml/layernorm/Makefile.deint"
 cp "$RB/aie_kernels/glu.cc"           "$K/glu.cc"
 cp "$RB/ctx_ln/glu_iron.py"           "$PE/ml/layernorm/glu_iron.py"
 cp "$RB/ctx_ln/Makefile.glu"          "$PE/ml/layernorm/Makefile.glu"
+cp "$RB/ctx_ln/Makefile.glutr"        "$PE/ml/layernorm/Makefile.glutr"
 # device-side f32 accumulate-add (resident-FFN fc2 on-device K-split accum): out = a + b, f32
 cp "$RB/aie_kernels/acc_add.cc"       "$K/acc_add.cc"
 cp "$RB/ctx_ln/acc_add_iron.py"       "$PE/ml/layernorm/acc_add_iron.py"
@@ -113,11 +114,20 @@ cp "$RB/ctx_ln/Makefile.accadd"       "$PE/ml/layernorm/Makefile.accadd"
 cp "$RB/aie_kernels/residual_add.cc"  "$K/residual_add.cc"
 cp "$RB/ctx_ln/residual_add_iron.py"  "$PE/ml/layernorm/residual_add_iron.py"
 cp "$RB/ctx_ln/Makefile.resadd"       "$PE/ml/layernorm/Makefile.resadd"
+# TRACED variants (aie-trace-wire-existing-enable-trace, 2026-07-30): per-op device occupancy
+# via IRON enable_trace, connected in residual_add_iron.py/glu_iron.py/silu_iron.py above. The
+# device harnesses (trace_brick*.py, thin wrappers over DefaultNPURuntime.run_test -- promoted
+# from an ad-hoc sandbox script) are per-ABI siblings of the ln_affine_cast one.
+cp "$RB/ctx_ln/trace_brick.py"        "$PE/ml/layernorm/trace_brick.py"
+cp "$RB/ctx_ln/trace_brick_resadd.py" "$PE/ml/layernorm/trace_brick_resadd.py"
+cp "$RB/ctx_ln/trace_brick_glu.py"    "$PE/ml/layernorm/trace_brick_glu.py"
+cp "$RB/ctx_ln/Makefile.resaddtr"     "$PE/ml/layernorm/Makefile.resaddtr"
 # post-dwconv SiLU brick (conv step 4) -- SEPARATE single-op-loop brick (immune to the
 # fused-epilogue per-channel-loop miscompile; see dwconv-fused-epilogue-alt-channel-miscompile).
 cp "$RB/ctx_ln/silu_brick.cc"         "$K/silu_brick.cc"
 cp "$RB/ctx_ln/silu_iron.py"          "$PE/ml/layernorm/silu_iron.py"
 cp "$RB/ctx_ln/Makefile.silu2"        "$PE/ml/layernorm/Makefile.silu2"
+cp "$RB/ctx_ln/Makefile.silutr"       "$PE/ml/layernorm/Makefile.silutr"
 # FUSED ctxLN+affine+cast (lnaffcast) -- the ENGINE loads final_lnaffcast_{PAD_M}x{KRES}.xclbin
 # (npu.rs), so this one is shipped-critical, not a probe. Its generator/kernel/Makefile used to
 # live ONLY in the gitignored sandbox: nothing tracked could rebuild it, and the 2026-07-27 aiecc

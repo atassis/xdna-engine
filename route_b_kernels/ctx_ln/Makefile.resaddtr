@@ -1,0 +1,42 @@
+##===- Makefile.resaddtr --------------------------------------------------===##
+#
+# TRACED variant of Makefile.resadd -- per-op device occupancy instrument (IRON enable_trace),
+# connected 2026-07-30 in residual_add_iron.py (trace_size was already plumbed through the CLI/
+# function signature but never wired to Program.enable_trace; this mirrors the enable_trace
+# recipe already established for Makefile.lnaffcasttr verbatim). Build:
+#   make -f Makefile.resaddtr NPU2=1 rows=512 cols=1024 scale=0.5 stag=050 \
+#        build/final_resaddtr_512x1024_s050.xclbin
+# `cores` defaults to 1: production runs 8 cores and saturates the shim's south ports, so trace
+# egress has nowhere to go (aie.masterset error) -- one core measures the per-row MATH faithfully
+# and the stall behaviour NOT at all (see the method note's caveat).
+#
+srcdir := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
+include ${srcdir}/../../makefile-common
+VPATH := ${srcdir}/../../../aie_kernels/aie2p
+
+devicename ?= $(if $(filter 1,$(NPU2)),npu2,npu)
+trace_size ?= 65536
+cores ?= 1
+rows ?= 512
+cols ?= 1024
+scale ?= 0.5
+stag ?= 050
+tag = resaddtr_${rows}x${cols}_s${stag}
+
+aie_py_src = residual_add_iron.py
+
+all: build/final_${tag}.xclbin
+
+build/residual_add.o: residual_add.cc
+	mkdir -p ${@D}
+	cd ${@D} && ${PEANO_INSTALL_DIR}/bin/clang++ ${PEANOWRAP2P_FLAGS} -c $< -o ${@F}
+
+build/aie_${tag}.mlir: ${srcdir}/${aie_py_src}
+	mkdir -p ${@D}
+	python3 $< -d ${devicename} -r ${rows} -c ${cols} -s ${scale} -t ${trace_size} -n ${cores} > $@
+
+build/final_${tag}.xclbin: build/aie_${tag}.mlir build/residual_add.o
+	mkdir -p ${@D}
+	cd ${@D} && aiecc --dump-intermediates --get-xclbin --get-npu-insts \
+		--no-xchesscc --no-xbridge --peano ${PEANO_INSTALL_DIR} \
+		--xclbin-name=${@F} --npu-insts-name=insts_${tag}.txt aie_${tag}.mlir
