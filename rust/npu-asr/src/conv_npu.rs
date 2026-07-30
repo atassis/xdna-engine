@@ -42,8 +42,17 @@ impl ConvNpu {
             return b.clone();
         }
         let stem = format!("mstat_512x768x{n}_16x32x32_8c");
+        // Opt-in manifest verification (engine-op-manifest-and-dynamic-xclbin): NPU_KERNEL_MANIFEST_VERIFY=1
+        // re-hashes {xclbin,insts} against dir/kernel_manifest.json (see kernel_registry::resolve_checked)
+        // before loading, so a wrong/stale artifact at this path fails loud here instead of loading
+        // silently. Default OFF -- existing behavior (`resolve`, no check) is unchanged.
         let crate::kernel_registry::KernelArtifacts { xclbin, insts } =
-            crate::kernel_registry::resolve(&self.wa, &stem);
+            if std::env::var("NPU_KERNEL_MANIFEST_VERIFY").is_ok() {
+                crate::kernel_registry::resolve_checked(&self.wa, &stem)
+                    .unwrap_or_else(|e| panic!("kernel manifest check failed for stem={stem}: {e}"))
+            } else {
+                crate::kernel_registry::resolve(&self.wa, &stem)
+            };
         let kern = self
             .dev
             .load_kernel(xclbin.to_str().unwrap(), None)
