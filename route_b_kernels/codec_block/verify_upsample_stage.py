@@ -29,10 +29,10 @@ sys.path.insert(0, str(ROOT / "route_b_kernels" / "bricks" / "_verify"))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import bricklib  # noqa: E402
+import codec_paths  # noqa: E402
 import gguf_extract as gx  # noqa: E402
 
-GGUF = Path(
-    "$WORKSPACE/s2.cpp/models/s2-pro-q6_k.gguf")
+GGUF = Path(codec_paths.gguf())
 PREFIX = "c.decoder.model.4"
 C_IN, C_OUT, K, STRIDE, T = 192, 96, 4, 2, 16
 OUT_LEN = T * STRIDE                       # crop_right == stride, so out_len is exactly t*stride

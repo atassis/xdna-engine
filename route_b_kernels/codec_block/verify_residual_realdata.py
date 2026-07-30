@@ -52,10 +52,10 @@ sys.path.insert(0, str(ROOT / "route_b_kernels" / "bricks" / "_verify"))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import bricklib  # noqa: E402
+import codec_paths  # noqa: E402
 import gguf_extract as gx  # noqa: E402
 
-GGUF = ("$WORKSPACE/"
-        "s2.cpp/models/s2-pro-q6_k.gguf")
+GGUF = codec_paths.gguf()
 C, K = 96, 7
 import os
 STAGE_T = int(os.environ.get("RU_T", 16))   # measured .bss budget caps this; see below

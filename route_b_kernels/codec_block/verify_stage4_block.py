@@ -34,10 +34,10 @@ sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import window_driver as wd  # noqa: E402
+import codec_paths  # noqa: E402
 import gguf_extract as gx  # noqa: E402
 
-GGUF = ("$WORKSPACE/"
-        "s2.cpp/models/s2-pro-q6_k.gguf")
+GGUF = codec_paths.gguf()
 P = "c.decoder.model.4"
 STRIDE = 2
 UP_CTX = 2                                  # ceil((k-1)/stride) with k = 2*stride

@@ -40,10 +40,10 @@ import numpy as np
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
+import codec_paths  # noqa: E402
 import gguf_extract as gx  # noqa: E402
 
-DEFAULT_GGUF = ("$WORKSPACE/"
-                "s2.cpp/models/s2-pro-q6_k.gguf")
+DEFAULT_GGUF = codec_paths.gguf()
 PREFIX = "c.decoder"
 DECODER_RATES = [8, 8, 4, 2]
 

@@ -37,10 +37,10 @@ sys.path.insert(0, str(ROOT / "route_b_kernels" / "bricks" / "_verify"))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import bricklib  # noqa: E402
+import codec_paths  # noqa: E402
 import gguf_extract as gx  # noqa: E402
 
-GGUF = ("$WORKSPACE/"
-        "s2.cpp/models/s2-pro-q6_k.gguf")
+GGUF = codec_paths.gguf()
 SNAKE = (ROOT / "route_b_kernels" / "bricks" / "snake" / "snake.cc").resolve()
 CONV = (ROOT / "route_b_kernels" / "bricks" / "conv-1d" / "conv_1d.cc").resolve()
 C, K = 96, 7

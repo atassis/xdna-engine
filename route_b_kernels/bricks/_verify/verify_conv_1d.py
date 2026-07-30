@@ -26,10 +26,10 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent.parent.parent
 BRICK = (HERE.parent / "conv-1d").resolve()
 sys.path.insert(0, str(ROOT / "scripts"))
+import codec_paths  # noqa: E402
 import gguf_extract as gx  # noqa: E402
 
-GGUF = Path(
-    "$WORKSPACE/s2.cpp/models/s2-pro-q6_k.gguf")
+GGUF = Path(codec_paths.gguf())
 import os
 # CV_T overrides t: this brick has NO static scratches, so sweeping it measures what the streamed
 # rail alone can deliver, independent of any kernel's own buffers. Measured: t=64 passes at

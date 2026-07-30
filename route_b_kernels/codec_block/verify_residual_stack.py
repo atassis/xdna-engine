@@ -33,10 +33,10 @@ sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import window_driver as wd  # noqa: E402
+import codec_paths  # noqa: E402
 import gguf_extract as gx  # noqa: E402
 
-GGUF = ("$WORKSPACE/"
-        "s2.cpp/models/s2-pro-q6_k.gguf")
+GGUF = codec_paths.gguf()
 S = 40000
 V = 128
 UNITS = [("c.decoder.model.4.block.2", 1), ("c.decoder.model.4.block.3", 3),
