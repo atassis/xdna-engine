@@ -140,12 +140,14 @@ Design for this FIRST; it is not a detail to discover mid-port.
                                                                             repo already crosses
                                                                             elsewhere.
 
-REGIME NOTE (per docs/kb/npu-optimization-map.md / the brick-catalog doctrine's "regime rule"): T
+REGIME NOTE. T
 (code-frame count) runs from the tens to low hundreds in real utterances, i.e. M=T is almost always
 >= 8 -- this is the COMPUTE-BOUND batched/encoder regime, not the M=1 decode/overhead regime. That is
 why every GEMM above is mapped to gemm-bf16xbfp16 (a COMPUTE/FORMAT brick) rather than a gemv-int8
 decode brick: the regime rule says COMPUTE/FORMAT bricks win at M>=8, and this segment runs once per
-utterance over the WHOLE code-frame sequence, never per-token.
+utterance over the WHOLE code-frame sequence, never per-token. (The rule of thumb: compute- and
+format-oriented primitives pay at M>=8, while at M=1 the wins come from data movement and op count
+instead.)
 
 AWKWARD ON-NPU (deliverable 4):
 
