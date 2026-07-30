@@ -28,12 +28,26 @@ GEN="$REPO/route_b_kernels/decode_fused/gen_gemm_probe.py"
 [ -x "$AIEBU_DIR/aiebu-asm" ] || { echo "ERROR: aiebu-asm not at $AIEBU_DIR"; exit 1; }
 [ -f "$WEIGHTS/L0/fc1.weight.npy" ] || { echo "ERROR: weights not at $WEIGHTS"; exit 1; }
 
-# GEMM fusion-prefix + M-stationary are now COMMITS on the atassis/IRON:xdna2-asr fork branch (not .patch).
-# Require the checkout to be on it (gemm-fusion-prefix needed for any GEMM under FusedMLIROperator;
-# m-stationary is the opt-in --m-stationary mode, default N-stationary unchanged).
+# GEMM fusion-prefix + M-stationary need the atassis/IRON fork API (gemm-fusion-prefix for any GEMM
+# under FusedMLIROperator; m-stationary is the opt-in --m-stationary mode, default N-stationary
+# unchanged). Originally hard-pinned to branch xdna2-asr; post-toolchain-bump the shared IRON checkout
+# moved to `integration-stack` (branch consolidation, see toolchain.lock). Accept either -- verify the
+# API surface directly (class defs) instead of trusting a branch name, since that is what actually
+# matters and branch names have already drifted once (2026-07-30, probe worktree).
 on="$(git -C "$IRON" rev-parse --abbrev-ref HEAD 2>/dev/null)"
-[ "$on" = xdna2-asr ] || { echo "ERROR: $IRON must be on xdna2-asr (got '$on'). Run: git -C \"$IRON\" checkout xdna2-asr"; exit 1; }
-echo "[build] IRON on xdna2-asr @ $(git -C "$IRON" rev-parse --short HEAD)"
+merge_base_ok=0
+for ref in xdna2-asr integration-stack; do
+  git -C "$IRON" merge-base --is-ancestor "$ref" HEAD 2>/dev/null && merge_base_ok=1
+done
+[ "$merge_base_ok" = 1 ] || [ "$on" = xdna2-asr ] || [ "$on" = integration-stack ] || {
+  echo "ERROR: $IRON ('$on') is not based on xdna2-asr or integration-stack"; exit 1; }
+python3 -c "
+import ast,sys
+for f,cls in [('$IRON/iron/common/fusion.py','FusedMLIROperator'),('$IRON/iron/operators/gemm/op.py','GEMM')]:
+    src=open(f).read()
+    assert f'class {cls}' in src, f'{cls} missing from {f}'
+" || { echo "ERROR: IRON API surface check failed (gen_gemm_probe.py deps)"; exit 1; }
+echo "[build] IRON on $on @ $(git -C "$IRON" rev-parse --short HEAD) (API surface verified)"
 
 export PATH="$VENV_IRON/bin:$VENV_IRON/cc-shim:$AIEBU_DIR:$PATH"
 export PEANO_INSTALL_DIR="$VENV_IRON/lib/python3.14/site-packages/llvm-aie"
