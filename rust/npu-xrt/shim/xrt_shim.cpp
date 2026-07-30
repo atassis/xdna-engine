@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 
 #include "xrt/xrt_device.h"
 #include "xrt/xrt_bo.h"
@@ -17,6 +18,16 @@
 #include "xrt/experimental/xrt_elf.h"
 #include "xrt/experimental/xrt_ext.h"
 #include "xrt/experimental/xrt_module.h"
+
+// Build the one-entry {"priority": value} cfg_param map for a QOS_PRIORITY_* level (never called
+// with QOS_PRIORITY_NONE -- every call site below branches NONE to the plain 2-arg hw_context ctor
+// instead, so the unconfigured path never goes through the cfg_param overload at all and stays
+// byte-identical to before QoS existed).
+static xrt::hw_context::cfg_param_type qos_cfg(int qos_priority) {
+  xrt::hw_context::cfg_param_type cfg;
+  cfg["priority"] = static_cast<uint32_t>(qos_priority);
+  return cfg;
+}
 
 struct ShimDevice { xrt::device dev; };
 struct ShimKernel { xrt::hw_context ctx; xrt::kernel kern; };
@@ -60,11 +71,16 @@ ShimDevice* shim_device_open(unsigned int index) {
 }
 void shim_device_close(ShimDevice* d) { delete d; }
 
-ShimKernel* shim_kernel_load(ShimDevice* d, const char* xclbin_path, const char* kernel_name) {
+ShimKernel* shim_kernel_load(ShimDevice* d, const char* xclbin_path, const char* kernel_name,
+                             int qos_priority) {
   GUARD_PTR(
     xrt::xclbin xb(std::string(xclbin_path ? xclbin_path : ""));
     auto uuid = d->dev.register_xclbin(xb);
-    xrt::hw_context ctx(d->dev, uuid);
+    // QOS_PRIORITY_NONE keeps the exact old 2-arg ctor (no cfg_param overload involved at all),
+    // so an empty/default caller is byte-identical to before QoS existed.
+    xrt::hw_context ctx = (qos_priority == QOS_PRIORITY_NONE)
+                             ? xrt::hw_context(d->dev, uuid)
+                             : xrt::hw_context(d->dev, uuid, qos_cfg(qos_priority));
     std::string name = (kernel_name && kernel_name[0])
                          ? std::string(kernel_name)
                          : xb.get_kernels().front().get_name();
@@ -180,14 +196,20 @@ void shim_run_free(ShimRun* r) { delete r; }
 // --- Fused full-ELF dispatch (IRON FusedMLIROperator path) ---------------------------------------
 
 ShimElfKernel* shim_elf_kernel_load(ShimDevice* d, const void* elf_bytes, size_t nbytes,
-                                    const char* kernel_name) {
+                                    const char* kernel_name, int qos_priority) {
   GUARD_PTR(
     const bool tm = elf_timing();
     auto t0 = shim_clock::now();
     // xrt::elf copies the bytes (data,size ctor), so the caller's buffer can be reused/patched.
     xrt::elf elf(elf_bytes, nbytes);
     double t_elf = tm ? ms_since(t0) : 0.0; auto t1 = shim_clock::now();
-    xrt::hw_context ctx(d->dev, elf);
+    // QOS_PRIORITY_NONE keeps the plain 2-arg ctor; the cfg_param overload additionally requires
+    // an access_mode, so declare `shared` (the 2-arg ctor's implicit default) to keep the ONLY
+    // change the priority field.
+    xrt::hw_context ctx = (qos_priority == QOS_PRIORITY_NONE)
+                             ? xrt::hw_context(d->dev, elf)
+                             : xrt::hw_context(d->dev, elf, qos_cfg(qos_priority),
+                                               xrt::hw_context::access_mode::shared);
     double t_ctx = tm ? ms_since(t1) : 0.0; auto t2 = shim_clock::now();
     std::string name = (kernel_name && kernel_name[0]) ? std::string(kernel_name)
                                                        : std::string("main:sequence");
@@ -232,10 +254,16 @@ ShimRun* shim_run_elf_start(ShimElfKernel* k, ShimBo* const* bos, size_t n_bos) 
 
 // --- Persistent-hw_context path ---------------------------------------------------------------
 
-ShimElfCtx* shim_elf_ctx_open(ShimDevice* d, const void* base_elf, size_t nbytes) {
+ShimElfCtx* shim_elf_ctx_open(ShimDevice* d, const void* base_elf, size_t nbytes, int qos_priority) {
   GUARD_PTR(
     xrt::elf elf(base_elf, nbytes);
-    xrt::hw_context ctx(d->dev, elf);   // partition config ONCE — the recurring cost we hoist out
+    // partition config ONCE — the recurring cost we hoist out. This context stays resident for the
+    // life of the caller's token loop, so it is the context where a background/best-effort caller
+    // actually wants QOS_PRIORITY_LOW declared (see xrt_shim.h).
+    xrt::hw_context ctx = (qos_priority == QOS_PRIORITY_NONE)
+                             ? xrt::hw_context(d->dev, elf)
+                             : xrt::hw_context(d->dev, elf, qos_cfg(qos_priority),
+                                               xrt::hw_context::access_mode::shared);
     return new ShimElfCtx{ std::move(elf), std::move(ctx) };
   )
 }
@@ -291,10 +319,13 @@ struct ShimElfResident {
 };
 
 ShimElfResident* shim_elf_resident_open(ShimDevice* d, const void* elf_bytes, size_t nbytes,
-                                        const char* kernel_name) {
+                                        const char* kernel_name, int qos_priority) {
   GUARD_PTR(
     xrt::elf elf(elf_bytes, nbytes);
-    xrt::hw_context ctx(d->dev, elf);
+    xrt::hw_context ctx = (qos_priority == QOS_PRIORITY_NONE)
+                             ? xrt::hw_context(d->dev, elf)
+                             : xrt::hw_context(d->dev, elf, qos_cfg(qos_priority),
+                                               xrt::hw_context::access_mode::shared);
     std::string name = (kernel_name && kernel_name[0]) ? std::string(kernel_name)
                                                        : std::string("main:sequence");
     xrt::ext::kernel k(ctx, name);

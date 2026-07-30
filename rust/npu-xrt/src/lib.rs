@@ -187,7 +187,12 @@ struct CElfResident {
 extern "C" {
     fn shim_device_open(index: c_uint) -> *mut CDevice;
     fn shim_device_close(d: *mut CDevice);
-    fn shim_kernel_load(d: *mut CDevice, path: *const c_char, name: *const c_char) -> *mut CKernel;
+    fn shim_kernel_load(
+        d: *mut CDevice,
+        path: *const c_char,
+        name: *const c_char,
+        qos_priority: c_int,
+    ) -> *mut CKernel;
     fn shim_kernel_close(k: *mut CKernel);
     fn shim_kernel_group_id(k: *mut CKernel, arg: c_int) -> c_int;
     fn shim_bo_alloc(
@@ -266,11 +271,17 @@ extern "C" {
         elf_bytes: *const c_void,
         nbytes: usize,
         name: *const c_char,
+        qos_priority: c_int,
     ) -> *mut CElfKernel;
     fn shim_elf_kernel_close(k: *mut CElfKernel);
     fn shim_run_elf(k: *mut CElfKernel, bos: *const *mut CBo, n_bos: usize) -> c_int;
     fn shim_run_elf_start(k: *mut CElfKernel, bos: *const *mut CBo, n_bos: usize) -> *mut CRun;
-    fn shim_elf_ctx_open(d: *mut CDevice, base_elf: *const c_void, nbytes: usize) -> *mut CElfCtx;
+    fn shim_elf_ctx_open(
+        d: *mut CDevice,
+        base_elf: *const c_void,
+        nbytes: usize,
+        qos_priority: c_int,
+    ) -> *mut CElfCtx;
     fn shim_elf_ctx_close(c: *mut CElfCtx);
     fn shim_elf_kernel_rebind(
         c: *mut CElfCtx,
@@ -285,6 +296,7 @@ extern "C" {
         elf_bytes: *const c_void,
         nbytes: usize,
         name: *const c_char,
+        qos_priority: c_int,
     ) -> *mut CElfResident;
     fn shim_elf_resident_close(r: *mut CElfResident);
     fn shim_elf_resident_scratchpad_size(r: *mut CElfResident) -> usize;
@@ -303,6 +315,37 @@ extern "C" {
 pub const FLAG_NORMAL: i32 = 0;
 pub const FLAG_CACHEABLE: i32 = 1; // instruction buffer
 pub const FLAG_HOST_ONLY: i32 = 2; // data buffers
+
+/// `xrt::hw_context::cfg_param_type` "priority" level (amdxdna_uapi.h `AMDXDNA_QOS_*`), mirroring
+/// `QOS_PRIORITY_*` in `shim/xrt_shim.h`. `None` (not a variant here) means "declare nothing" — the
+/// plain 2-arg hw_context ctor, byte-identical to before QoS existed. Measured
+/// (`qos-priority-is-a-scheduling-knob`): priority reaches the firmware scheduler, not just DPM, and
+/// declaring ANY level can only LOWER the clock from the unconfigured max_dpm_level default — so a
+/// foreground/latency-sensitive context should stay `None`, not `Normal`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QosPriority {
+    Realtime,
+    High,
+    Normal,
+    Low,
+}
+
+impl QosPriority {
+    fn as_raw(self) -> c_int {
+        match self {
+            QosPriority::Realtime => 0x100,
+            QosPriority::High => 0x180,
+            QosPriority::Normal => 0x200,
+            QosPriority::Low => 0x280,
+        }
+    }
+}
+
+/// Sentinel for "no cfg_param map" — must match `QOS_PRIORITY_NONE` in `shim/xrt_shim.h`.
+const QOS_PRIORITY_NONE: c_int = -1;
+fn qos_raw(qos: Option<QosPriority>) -> c_int {
+    qos.map_or(QOS_PRIORITY_NONE, QosPriority::as_raw)
+}
 
 fn last_error() -> String {
     unsafe { CStr::from_ptr(shim_last_error()).to_string_lossy().into_owned() }
@@ -404,9 +447,23 @@ impl Device {
 
     /// Load an xclbin and resolve its kernel. `name=None` uses the first kernel in the xclbin.
     /// Cached by (path, name): repeated loads of the same xclbin return the SAME shared kernel
-    /// (one hw_context), so many engines coexist within the 8-column budget.
+    /// (one hw_context), so many engines coexist within the 8-column budget. No QoS declared (the
+    /// unconfigured context, `max_dpm_level`); use [`load_kernel_qos`](Self::load_kernel_qos) for a
+    /// background/best-effort context.
     pub fn load_kernel(&self, xclbin_path: &str, name: Option<&str>) -> Result<Rc<Kernel>> {
-        let key = format!("{xclbin_path}\u{0}{}", name.unwrap_or(""));
+        self.load_kernel_qos(xclbin_path, name, None)
+    }
+
+    /// [`load_kernel`](Self::load_kernel) with an explicit QoS priority (`None` = identical to
+    /// `load_kernel`). Cache key includes `qos` so a LOW_PRIORITY and an unconfigured request for the
+    /// same xclbin never share a hw_context.
+    pub fn load_kernel_qos(
+        &self,
+        xclbin_path: &str,
+        name: Option<&str>,
+        qos: Option<QosPriority>,
+    ) -> Result<Rc<Kernel>> {
+        let key = format!("{xclbin_path}\u{0}{}\u{0}{:?}", name.unwrap_or(""), qos);
         if let Some(k) = self.kernels.borrow().get(&key) {
             return Ok(k.clone());
         }
@@ -416,7 +473,7 @@ impl Device {
             None => None,
         };
         let name_ptr = cname.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
-        let ptr = unsafe { shim_kernel_load(self.ptr, cpath.as_ptr(), name_ptr) };
+        let ptr = unsafe { shim_kernel_load(self.ptr, cpath.as_ptr(), name_ptr, qos_raw(qos)) };
         if ptr.is_null() {
             return Err(format!("load_kernel({xclbin_path}): {}", last_error()));
         }
@@ -452,8 +509,19 @@ impl Device {
 
     /// Load a fused full-ELF kernel from raw ELF bytes. `name=None` uses `"main:sequence"` (IRON's
     /// default `device:sequence`). Unlike [`load_kernel`], this is NOT cached — each fused ELF (and
-    /// each per-token patched variant) is its own hw_context. The bytes are copied into XRT.
+    /// each per-token patched variant) is its own hw_context. The bytes are copied into XRT. No QoS
+    /// declared; use [`load_elf_kernel_qos`](Self::load_elf_kernel_qos) for a background context.
     pub fn load_elf_kernel(&self, elf_bytes: &[u8], name: Option<&str>) -> Result<ElfKernel> {
+        self.load_elf_kernel_qos(elf_bytes, name, None)
+    }
+
+    /// [`load_elf_kernel`](Self::load_elf_kernel) with an explicit QoS priority.
+    pub fn load_elf_kernel_qos(
+        &self,
+        elf_bytes: &[u8],
+        name: Option<&str>,
+        qos: Option<QosPriority>,
+    ) -> Result<ElfKernel> {
         let cname = match name {
             Some(s) => Some(CString::new(s).map_err(|e| e.to_string())?),
             None => None,
@@ -465,6 +533,7 @@ impl Device {
                 elf_bytes.as_ptr() as *const c_void,
                 elf_bytes.len(),
                 name_ptr,
+                qos_raw(qos),
             )
         };
         if ptr.is_null() {
@@ -476,10 +545,19 @@ impl Device {
 
     /// Build a persistent [`ElfCtx`] (hw_context) ONCE from a base fused ELF. Per-token patched ELFs
     /// are then bound via [`ElfCtx::rebind`] without re-running the partition config. `base_elf` is
-    /// any same-shape ELF (e.g. the unpatched base); the bytes are copied into XRT.
+    /// any same-shape ELF (e.g. the unpatched base); the bytes are copied into XRT. No QoS declared;
+    /// use [`open_elf_ctx_qos`](Self::open_elf_ctx_qos) for a background/best-effort resident context
+    /// — this is the context that actually stays around for the life of a token loop, so it is the
+    /// one worth declaring LOW_PRIORITY on for bulk/offline work.
     pub fn open_elf_ctx(&self, base_elf: &[u8]) -> Result<ElfCtx> {
-        let ptr =
-            unsafe { shim_elf_ctx_open(self.ptr, base_elf.as_ptr() as *const c_void, base_elf.len()) };
+        self.open_elf_ctx_qos(base_elf, None)
+    }
+
+    /// [`open_elf_ctx`](Self::open_elf_ctx) with an explicit QoS priority.
+    pub fn open_elf_ctx_qos(&self, base_elf: &[u8], qos: Option<QosPriority>) -> Result<ElfCtx> {
+        let ptr = unsafe {
+            shim_elf_ctx_open(self.ptr, base_elf.as_ptr() as *const c_void, base_elf.len(), qos_raw(qos))
+        };
         if ptr.is_null() {
             Err(format!("open_elf_ctx({} bytes): {}", base_elf.len(), last_error()))
         } else {
@@ -489,15 +567,32 @@ impl Device {
 
     /// Open a resident runner for a CONSTANT scratchpad-parameter ELF (Option C). Registers the ELF
     /// ONCE. Returns `Err` if the ELF has no ctrl scratchpad (i.e. not a scratchpad-parameter build —
-    /// caller should fall back to the patch path). `name=None` uses `"main:sequence"`.
+    /// caller should fall back to the patch path). `name=None` uses `"main:sequence"`. No QoS
+    /// declared; use [`open_elf_resident_qos`](Self::open_elf_resident_qos) for a background context.
     pub fn open_elf_resident(&self, elf_bytes: &[u8], name: Option<&str>) -> Result<ElfResident> {
+        self.open_elf_resident_qos(elf_bytes, name, None)
+    }
+
+    /// [`open_elf_resident`](Self::open_elf_resident) with an explicit QoS priority.
+    pub fn open_elf_resident_qos(
+        &self,
+        elf_bytes: &[u8],
+        name: Option<&str>,
+        qos: Option<QosPriority>,
+    ) -> Result<ElfResident> {
         let cname = match name {
             Some(s) => Some(CString::new(s).map_err(|e| e.to_string())?),
             None => None,
         };
         let name_ptr = cname.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
         let ptr = unsafe {
-            shim_elf_resident_open(self.ptr, elf_bytes.as_ptr() as *const c_void, elf_bytes.len(), name_ptr)
+            shim_elf_resident_open(
+                self.ptr,
+                elf_bytes.as_ptr() as *const c_void,
+                elf_bytes.len(),
+                name_ptr,
+                qos_raw(qos),
+            )
         };
         if ptr.is_null() {
             Err(format!("open_elf_resident({} bytes): {}", elf_bytes.len(), last_error()))
@@ -1157,6 +1252,28 @@ impl FusedElfPatcher {
             elf_set_u32(&mut out, loc, context_len, 0xFFFF_FFFF);
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod qos_tests {
+    use super::*;
+
+    // Mirrors the QOS_PRIORITY_* #defines in shim/xrt_shim.h (amdxdna_uapi.h AMDXDNA_QOS_*). A
+    // real device test belongs at the integration level (needs an open hw_context); this pins the
+    // Rust<->C++ constant mapping so the two sides cannot silently drift.
+    #[test]
+    fn priority_levels_match_the_c_shim_defines() {
+        assert_eq!(QosPriority::Realtime.as_raw(), 0x100);
+        assert_eq!(QosPriority::High.as_raw(), 0x180);
+        assert_eq!(QosPriority::Normal.as_raw(), 0x200);
+        assert_eq!(QosPriority::Low.as_raw(), 0x280);
+    }
+
+    #[test]
+    fn none_is_the_sentinel_that_keeps_the_old_2_arg_path() {
+        assert_eq!(qos_raw(None), QOS_PRIORITY_NONE);
+        assert_eq!(qos_raw(Some(QosPriority::Low)), 0x280);
     }
 }
 
