@@ -49,15 +49,24 @@
 // bytes moved, not speeding up an op that has none to speed up. The right primitive is a
 // MOVEMENT brick: have the DMA/BD engine read codebook rows directly in INDEX order (a
 // data-dependent tap/offset pattern), so the "kernel" is a copy or nothing at all, and the
-// T indices never need a compute-core round trip at all. bricklib AS IT EXISTS TODAY CANNOT
-// EXPRESS THIS: every design in bricklib.py drives a fixed, index-INDEPENDENT
-// TensorTiler2D access pattern (in_tap/out_tap/cst_tap are all built once from static
-// shapes) -- there is no hook for a runtime-index-dependent BD/tap, and verify_streamed's
-// contract is exactly one streamed + one resident operand consumed by a COMPUTE core, not a
-// data-dependent DMA descriptor. Expressing (b) would need a new bricklib._build_* (or a new
-// Runtime `sequence`) that can drive an objectFIFO/tap from a host- or device-computed
-// offset list per tile -- and it is UNVERIFIED whether AIE2P's BD engine even supports
-// data-dependent offsets at all (flagged as open in codec_quantizer_ref.py's AWKWARD #1).
+// T indices never need a compute-core round trip at all. `bricklib` cannot express this: every
+// design in bricklib.py drives a fixed, index-INDEPENDENT TensorTiler2D access pattern
+// (in_tap/out_tap/cst_tap are all built once from static shapes), so expressing (b) needs a new
+// `bricklib._build_*` that can drive an objectFIFO from a per-tile offset.
+//
+// CORRECTED 2026-07-31 -- that is a bricklib limitation ONLY, and this header previously
+// overstated it as a hardware unknown. The HARDWARE and the IRON API both support it:
+//   * `ObjectFifoHandle.fill(..., offset_parameter=...)` takes a `ScratchpadParameter` directly
+//     (instance `python/aie/iron/dataflow/objectfifo.py:629,696-700`), so no new op is needed.
+//   * It is ALREADY SHIPPING in this repo: the Whisper decode path drives a per-token KV-write
+//     offset this way -- `route_b_kernels/decode_fused/gen_decode.py` builds a StridedCopy with
+//     `output_offset_parameter="kv_off"`, and `rust/npu-engine/src/asr/whisper_decoder.rs` writes
+//     that scratchpad word per token from the host. The decode ELF is CONSTANT across tokens
+//     precisely because the offset moved into a scratchpad parameter.
+// So the offset is HOST-written per dispatch, which is the caveat that matters for a gather: it
+// serves an embedding lookup (host knows the token id) but NOT an on-chip data-dependent gather
+// where the index is computed mid-dispatch. A genuinely device-computed BD field is an unshipped
+// toolchain milestone, not a hardware fact. See `docs/s2-bd-gather-feasibility.md`.
 // This brick ships (a), the gateable version, and leaves (b) as the real follow-up target.
 //
 // HARD CONSTRAINTS OBSERVED (route_b_kernels/bricks header conventions):
