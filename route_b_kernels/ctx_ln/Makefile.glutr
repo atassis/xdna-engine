@@ -1,0 +1,37 @@
+##===- Makefile.glutr -----------------------------------------------------===##
+#
+# TRACED variant of Makefile.glu -- per-op device occupancy instrument (IRON enable_trace),
+# connected 2026-07-30 in glu_iron.py (trace_size was already plumbed through the CLI/function
+# signature but never wired to Program.enable_trace; this mirrors the enable_trace recipe
+# already established for Makefile.lnaffcasttr verbatim). Build:
+#   make -f Makefile.glutr NPU2=1 rows=512 cols=1024 build/final_glutr_512x1024.xclbin
+# `cores` defaults to 1 (production 8 cores saturates the shim south ports for trace egress).
+#
+srcdir := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
+include ${srcdir}/../../makefile-common
+VPATH := ${srcdir}/../../../aie_kernels/aie2p
+
+devicename ?= $(if $(filter 1,$(NPU2)),npu2,npu)
+trace_size ?= 65536
+cores ?= 1
+rows ?= 512
+cols ?= 1024
+tag = glutr_${rows}x${cols}
+
+aie_py_src = glu_iron.py
+
+all: build/final_${tag}.xclbin
+
+build/glu.o: glu.cc
+	mkdir -p ${@D}
+	cd ${@D} && ${PEANO_INSTALL_DIR}/bin/clang++ ${PEANOWRAP2P_FLAGS} -c $< -o ${@F}
+
+build/aie_${tag}.mlir: ${srcdir}/${aie_py_src}
+	mkdir -p ${@D}
+	python3 $< -d ${devicename} -r ${rows} -c ${cols} -t ${trace_size} -n ${cores} > $@
+
+build/final_${tag}.xclbin: build/aie_${tag}.mlir build/glu.o
+	mkdir -p ${@D}
+	cd ${@D} && aiecc --dump-intermediates --get-xclbin --get-npu-insts \
+		--no-xchesscc --no-xbridge --peano ${PEANO_INSTALL_DIR} \
+		--xclbin-name=${@F} --npu-insts-name=insts_${tag}.txt aie_${tag}.mlir

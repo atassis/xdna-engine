@@ -19,10 +19,84 @@ from aie.iron import Kernel, ObjectFifo, Program, Runtime, Worker
 from aie.iron.device import NPU1, NPU2
 from aie.helpers.taplib import TensorTiler2D
 from aie.iron.controlflow import range_
+from aie.utils.trace.events import CoreEvent
+
+# Explicit coretile_events override (2026-07-30): names the ~65-68% of traced span the 8
+# HARDWARE-DEFAULT counters left uncharacterized on this same brick, same span, measured via
+# a device trace histogram across resadd/glu. Keeps INSTR_VECTOR/
+# MEMORY_STALL/STREAM_STALL/LOCK_STALL for direct comparability to that run; swaps out
+# INSTR_EVENT_0/1 (function-entry/exit markers, already ~0.02% each) and PORT_RUNNING_0/1
+# (DMA port activity, already characterized, MOVEMENT not CORE side) for CASCADE_STALL
+# (completes the 4-way stall family -- GROUP_STALL siblings are MEMORY/STREAM/CASCADE/LOCK),
+# INSTR_LOAD + INSTR_STORE (the only per-instruction-type events for scalar load/store --
+# AIE2/2p exposes no generic "scalar ALU" event, load/store is the closest to
+# "address-generation activity"), and ACTIVE (the core-status-group event that is the
+# genuine busy/not-disabled/not-stalled signal -- its complement is genuine core idle).
+# Numeric codes from aie.dialects._aie_enum_gen.CoreEventAIE2P (TableGen-generated from the
+# aie-rt headers per aie/utils/trace/events/__init__.py's docstring); CoreEventAIE2 (what
+# CoreEvent aliases to) carries IDENTICAL numeric codes for all 8 of these names, so which
+# alias is used does not change what gets programmed into the hardware monitor slots.
+# NOTE: dropping INSTR_EVENT_0/1 means get_trace_summary.py's invocation-boundary parse
+# (which pairs INSTR_EVENT_0/1 B-events to find "cycles/invocation") no longer applies to
+# this capture -- use total captured span instead.
+BAND_NAMING_CORETILE_EVENTS = [
+    CoreEvent.INSTR_VECTOR,
+    CoreEvent.MEMORY_STALL,
+    CoreEvent.STREAM_STALL,
+    CoreEvent.LOCK_STALL,
+    CoreEvent.CASCADE_STALL,
+    CoreEvent.INSTR_LOAD,
+    CoreEvent.INSTR_STORE,
+    CoreEvent.ACTIVE,
+]
+
+# PERF_CNT_0-3 probe (2026-07-30, adversarial-review follow-up): CoreEventAIE2/2P codes 5-8.
+# These are trace-EVENT-SELECTION slots, not a call to XAie_PerfCounterControlSet -- IRON's
+# Program.enable_trace / aie.dialects.aie's trace_event op has no parameter to program a
+# counter's Start/Stop event pair (grep of aie/Dialect/AIE/IR/AIETraceOps.td: AIE_TraceEventOp
+# takes only a single `event` attr). XAie_PerfCounterControlSet exists only in vendored aie-rt
+# C (driver/src/perfcnt/xaie_perfcnt.c) and in the legacy host-driven runtime_lib/test_lib
+# EventMonitor helper (a different, non-IRON execution model); libxaiefal, which ships the
+# XAieActiveCycles(Start=ACTIVE_CORE, Stop=DISABLED_CORE) canonical helper the task named, is
+# not even built in this toolchain instance (searched build/ tree, zero libxaiefal artifacts).
+# So selecting PERF_CNT_0-3 here traces whatever hardware POR/default start/stop state those
+# counters are in -- UNCONFIGURED, since nothing in this design's runtime sequence programs
+# them. This list exists to make that empirically visible, not because it is expected to name
+# the unaccounted band. INSTR_VECTOR/LOCK_STALL kept as a sanity anchor (known strongly
+# non-zero) to confirm the capture/decode path itself still works.
+PERFCNT_PROBE_CORETILE_EVENTS = [
+    CoreEvent.INSTR_VECTOR,
+    CoreEvent.LOCK_STALL,
+    CoreEvent.PERF_CNT_0,
+    CoreEvent.PERF_CNT_1,
+    CoreEvent.PERF_CNT_2,
+    CoreEvent.PERF_CNT_3,
+    CoreEvent.MEMORY_STALL,
+    CoreEvent.STREAM_STALL,
+]
+
+# Denominator-validation probe (2026-07-30): same accounted-side events as
+# BAND_NAMING_CORETILE_EVENTS (INSTR_VECTOR/LOAD/STORE + LOCK/MEMORY_STALL) but swaps
+# CASCADE_STALL/ACTIVE (both uninformative in the band-naming pass) back for INSTR_EVENT_0/1
+# (function entry/exit markers) so this capture keeps the invocation-boundary parse
+# get_trace_summary.py depends on. Lets the idle-before-first-invocation /
+# idle-after-last-invocation bracket be measured DIRECTLY on a capture whose accounted-%
+# is comparable to the band-naming run's 58.57%, instead of only on the original
+# default-8-event capture (which lacks INSTR_LOAD/STORE) and extrapolated across.
+DENOM_CHECK_CORETILE_EVENTS = [
+    CoreEvent.INSTR_EVENT_0,
+    CoreEvent.INSTR_EVENT_1,
+    CoreEvent.INSTR_VECTOR,
+    CoreEvent.LOCK_STALL,
+    CoreEvent.MEMORY_STALL,
+    CoreEvent.STREAM_STALL,
+    CoreEvent.INSTR_LOAD,
+    CoreEvent.INSTR_STORE,
+]
 
 
-def residual_add(dev, sequence_length, embedding_dim, scale, trace_size):
-    n_cores = 8
+def residual_add(dev, sequence_length, embedding_dim, scale, trace_size, n_cores=8,
+                  event_set="band-naming"):
     assert sequence_length % n_cores == 0, "rows must split evenly across 8 cores"
     assert embedding_dim % 16 == 0, "residual_add_row<16> vectorizes cols by 16"
 
@@ -84,7 +158,25 @@ def residual_add(dev, sequence_length, embedding_dim, scale, trace_size):
             [of_out[i].cons() for i in range(n_cores)],
         ],
     )
-    return Program(dev, rt, workers=workers).resolve_program()
+    prog = Program(dev, rt, workers=workers)
+    # Per-op occupancy instrument (wired 2026-07-30, connecting the trace_size knob this file
+    # already accepted but never called -- see ln_affine_cast_iron.py for the established recipe).
+    # trace_size=0 (the production build) leaves the design byte-identical.
+    if trace_size:
+        # Trace ONE worker, not all n_cores. Tracing every worker collides on the shim's south
+        # ports ("aie.masterset op targets same destination South: 3") once n_cores gets large
+        # enough to saturate them -- build the traced variant with -n/--cores reduced (cores=1
+        # is representative of the per-row MATH, not production wall time; see the enable_trace
+        # recipe established for ln_affine_cast_iron.py, which this mirrors).
+        events = {
+            "perfcnt-probe": PERFCNT_PROBE_CORETILE_EVENTS,
+            "denom-check": DENOM_CHECK_CORETILE_EVENTS,
+        }.get(event_set, BAND_NAMING_CORETILE_EVENTS)
+        prog.enable_trace(
+            trace_size=trace_size, workers=[workers[0]], egress_shim_col=1,
+            coretile_events=events,
+        )
+    return prog.resolve_program()
 
 
 p = argparse.ArgumentParser()
@@ -93,7 +185,11 @@ p.add_argument("-r", "--rows", required=True, dest="rows")
 p.add_argument("-c", "--cols", required=True, dest="cols")
 p.add_argument("-s", "--scale", required=True, dest="scale")
 p.add_argument("-t", "--trace_size", required=False, dest="trace_size", default=0)
+p.add_argument("-n", "--cores", required=False, dest="cores", default=8)
+p.add_argument("-e", "--event-set", required=False, dest="event_set", default="band-naming",
+                choices=["band-naming", "perfcnt-probe", "denom-check"])
 opts = p.parse_args(sys.argv[1:])
 
 dev = NPU2() if opts.device == "npu2" else NPU1()
-print(residual_add(dev, int(opts.rows), int(opts.cols), float(opts.scale), int(opts.trace_size)))
+print(residual_add(dev, int(opts.rows), int(opts.cols), float(opts.scale), int(opts.trace_size),
+                   int(opts.cores), opts.event_set))

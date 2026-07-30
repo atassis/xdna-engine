@@ -23,10 +23,24 @@ from aie.iron import Kernel, ObjectFifo, Program, Runtime, Worker
 from aie.iron.device import NPU1, NPU2
 from aie.helpers.taplib import TensorTiler2D
 from aie.iron.controlflow import range_
+from aie.utils.trace.events import CoreEvent
+
+# See residual_add_iron.py for the full rationale (verbatim identical list): names the
+# ~65-68% of traced span the 8 hardware-default counters left uncharacterized, same span,
+# same brick family, measured via a device trace histogram across resadd/glu.
+BAND_NAMING_CORETILE_EVENTS = [
+    CoreEvent.INSTR_VECTOR,
+    CoreEvent.MEMORY_STALL,
+    CoreEvent.STREAM_STALL,
+    CoreEvent.LOCK_STALL,
+    CoreEvent.CASCADE_STALL,
+    CoreEvent.INSTR_LOAD,
+    CoreEvent.INSTR_STORE,
+    CoreEvent.ACTIVE,
+]
 
 
-def glu(dev, sequence_length, embedding_dim, trace_size):
-    n_cores = 8
+def glu(dev, sequence_length, embedding_dim, trace_size, n_cores=8):
     assert sequence_length % n_cores == 0, "rows must split evenly across 8 cores"
     assert embedding_dim % 16 == 0, "glu_row<16> vectorizes cols by 16"
 
@@ -78,7 +92,19 @@ def glu(dev, sequence_length, embedding_dim, trace_size):
             [of_out[i].cons() for i in range(n_cores)],
         ],
     )
-    return Program(dev, rt, workers=workers).resolve_program()
+    prog = Program(dev, rt, workers=workers)
+    # Per-op occupancy instrument (wired 2026-07-30; trace_size was already plumbed through this
+    # file's CLI/signature but never connected -- see ln_affine_cast_iron.py for the recipe).
+    # trace_size=0 (the production build) leaves the design byte-identical.
+    if trace_size:
+        # Trace ONE worker; tracing all n_cores collides on the shim's south ports once n_cores
+        # saturates them. Build the traced variant with -n/--cores reduced (cores=1 is
+        # representative of the per-row MATH, not production wall time).
+        prog.enable_trace(
+            trace_size=trace_size, workers=[workers[0]], egress_shim_col=1,
+            coretile_events=BAND_NAMING_CORETILE_EVENTS,
+        )
+    return prog.resolve_program()
 
 
 p = argparse.ArgumentParser()
@@ -86,7 +112,8 @@ p.add_argument("-d", "--dev", required=True, dest="device")
 p.add_argument("-r", "--rows", required=True, dest="rows")
 p.add_argument("-c", "--cols", required=True, dest="cols")
 p.add_argument("-t", "--trace_size", required=False, dest="trace_size", default=0)
+p.add_argument("-n", "--cores", required=False, dest="cores", default=8)
 opts = p.parse_args(sys.argv[1:])
 
 dev = NPU2() if opts.device == "npu2" else NPU1()
-print(glu(dev, int(opts.rows), int(opts.cols), int(opts.trace_size)))
+print(glu(dev, int(opts.rows), int(opts.cols), int(opts.trace_size), int(opts.cores)))
