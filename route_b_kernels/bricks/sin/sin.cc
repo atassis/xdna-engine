@@ -40,12 +40,33 @@ namespace route_b_bricks {
 // constants materialised at point of use.
 template <int N>
 static inline ::aie::vector<float, N> sin_v(::aie::vector<float, N> r) {
-  // fold: r -= 2*pi*round(r/2*pi). round() via the f32 (q + 2^23) - 2^23 identity, because
+  // fold: r -= 2*pi*round(r/2*pi). round() via the f32 (q + C) - C magic-number identity, because
   // aie::to_float on a vector<int32,16> does not instantiate on aie2p (it fails inside aie_api's
   // own elementary.hpp, Fix2Float -> cast_to<uint16>).
+  //
+  // C IS 1.5*2^23, NOT 2^23. With C = 2^23 a NEGATIVE q lands in [2^22, 2^23), where the f32 ulp
+  // is 0.5 rather than 1, so the identity rounds to the nearest HALF-integer. Measured on host over
+  // x in [-12, 12]: exact on all 100k positive samples, off by 0.5 on 49996/100000 negative ones.
+  // A half-integer k folds by an odd multiple of pi, so sin returns SIGN-FLIPPED. In host
+  // simulation of this exact kernel on verify_sin.py's own input, bare 2^23 gives rel-L2 1.0045
+  // and 1.5*2^23 gives 1.2747e-04. C = 1.5*2^23 keeps q in [2^23, 2^24) where the ulp is exactly 1
+  // for BOTH signs (host max |err| vs rint: 0.0).
+  //
+  // HONEST SCOPE OF THIS FIX, MEASURED 2026-07-31: on device it changed NOTHING. verify_sin.py
+  // returned 7.091e-01 bit-identical before and after. A mutation probe (scale the output by 3)
+  // moved it to 1.022e+02, so edits genuinely reach the device and the artifact cache is sound --
+  // the constant really is device-neutral here, i.e. aie::add/sub on vector<float,N> do not round
+  // the way the host f32 model does. So this is a latent-correctness fix on any correctly-rounding
+  // f32 path, NOT the cause of this brick's device failure. The 7.091e-01 has a different cause;
+  // the streamed-rail codegen instability described in verify_sin.py's header stands.
+  //
+  // Worth noting against that header's claim that the recorded 1.275e-04 green was purely a
+  // stale-cache artifact: a CORRECT fold reproduces 1.2747e-04 in host simulation of this kernel,
+  // so that number is exactly what a working sin brick produces. Whatever the cache did, the value
+  // itself was not fabricated.
   ::aie::vector<float, N> k = ::aie::mul(r, ::aie::broadcast<float, N>(0.15915494309189535f));
-  k = ::aie::add(k, ::aie::broadcast<float, N>(8388608.0f));
-  k = ::aie::sub(k, ::aie::broadcast<float, N>(8388608.0f));
+  k = ::aie::add(k, ::aie::broadcast<float, N>(12582912.0f));
+  k = ::aie::sub(k, ::aie::broadcast<float, N>(12582912.0f));
   ::aie::vector<float, N> kt = ::aie::mul(k, ::aie::broadcast<float, N>(6.28318530717958648f));
   r = ::aie::sub(r, kt);
 
