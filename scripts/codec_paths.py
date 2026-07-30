@@ -24,9 +24,18 @@ def _repo_root():
 
 
 def _candidates(name):
+    """Every plausible location, nearest first.
+
+    Walks ANCESTORS rather than checking only the repo's immediate parent: a git worktree can sit
+    arbitrarily deep (an agent worktree lives at <repo>/.claude/worktrees/<id>/, whose parent is
+    not the workspace), and the one-level version failed there with a confusing "not found" for a
+    model that was present the whole time.
+    """
     root = _repo_root()
-    # Sibling checkout (workspace layout), then a copy vendored under this repo.
-    return [root.parent / "s2.cpp" / "models" / name, root / "models" / name]
+    out = [root / "models" / name]
+    for anc in [root] + list(root.parents)[:6]:
+        out.append(anc / "s2.cpp" / "models" / name)
+    return out
 
 
 def _resolve(env_var, name):
