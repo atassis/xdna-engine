@@ -30,6 +30,8 @@ import sys  # noqa: E402
 sys.path.insert(0, str(ROOT / "route_b_kernels" / "bricks" / "_verify"))
 import bricklib  # noqa: E402
 
+UPSAMPLE_CC = (HERE / "upsample_stage.cc").resolve()
+CT_CHAN_CC = (HERE / "conv_transpose_channel.cc").resolve()
 SNAKE_CC = (ROOT / "route_b_kernels" / "bricks" / "snake" / "snake.cc").resolve()
 CONV_CC = (ROOT / "route_b_kernels" / "bricks" / "conv-1d" / "conv_1d.cc").resolve()
 
@@ -51,7 +53,7 @@ def reset_stats():
         _stats[k] = 0
 
 
-def _run(name, shim_text, symbol, tiles, out_numel, resident):
+def _run(name, shim_text, symbol, tiles, out_numel, resident, flags=None):
     shim = bricklib.GEN / f"wd_{name}_shim.cc"
     shim.write_text(shim_text)
     r = bricklib.verify_streamed(
@@ -59,7 +61,7 @@ def _run(name, shim_text, symbol, tiles, out_numel, resident):
         resident=(None if resident is None else resident.reshape(-1).astype(np.float32)),
         unpack=lambda d: np.asarray(d), golden=np.zeros((tiles.shape[0], out_numel)),
         gate=np.inf,      # intermediates are not gated; the stitched stage output is
-        in_dt=np.float32, out_dt=np.float32,
+        in_dt=np.float32, out_dt=np.float32, compile_flags=flags,
         resident_dt=(None if resident is None else np.float32))
     _stats["dispatches"] += 1
     return np.asarray(r["got"], np.float32)
@@ -137,3 +139,100 @@ def residual_unit(x, wts, dilation, tag):
     s2 = snake(h, a2, f"{tag}b")
     # The residual reads x at the OUTPUT's positions, i.e. shifted by this unit's own context.
     return conv(s2, w3, b3, 1, 1, f"{tag}1x1", add=x[:, ctx:])
+
+
+# The fused upsample stage keeps a [c_in, t] static scratch for snake's output, so its t is capped
+# far below the convs' 64 -- 16 at c_in=192. That is fine: it is the one op whose fusion still pays,
+# because snake there is consumed by a conv that reads every input channel, so materialising it once
+# saves c_out-fold recomputation.
+UPSAMPLE_T = 16
+
+
+def upsample(x, alpha, w, bias, stride, tag, t=UPSAMPLE_T):
+    """[c_in, L] -> [c_out, (L - ctx) * stride], fused snake -> conv_transpose_1d.
+
+    A transposed conv with k = 2*stride and crop_right = stride maps t inputs to exactly t*stride
+    outputs, and output p draws on inputs in [(p-k+1)/stride, p/stride] -- so it reaches back
+    ceil((k-1)/stride) = 2 inputs. Two samples of lead-in per window, and the first ctx*stride
+    outputs of each window are dropped.
+    """
+    c_in, L = x.shape
+    k = 2 * stride
+    ctx = -(-(k - 1) // stride)              # 2 for every codec rate
+    c_out = w.shape[1]
+    M = L - ctx
+    step = t - ctx
+    out = np.zeros((c_out, M * stride), np.float32)
+
+    tile_w = c_in * k
+    tiles = np.zeros((c_out, tile_w + 2), np.float32)
+    for co in range(c_out):
+        tiles[co, :tile_w] = w[:, co, :].reshape(-1)   # conv_transpose layout: [c_in, c_out, k]
+        tiles[co, tile_w] = bias[co]
+    tiles[0, tile_w + 1] = 1.0                          # compute snake once per stream
+
+    shim_text = (f"// window_driver upsample {tag} cb {_CB}\n#include <stdint.h>\n"
+                 f'#include "{UPSAMPLE_CC}"\n'
+                 f'extern "C" void wd_up_{tag}(float *wtile, float *resident, float *out) {{\n'
+                 f"  route_b_bricks::upsample_stage_core(wtile, resident, out);\n}}\n")
+
+    for o in range(0, M, step):
+        n = min(step, M - o)
+        win = np.zeros((c_in, t), np.float32)
+        take = min(t, L - o)
+        win[:, :take] = x[:, o:o + take]
+        resident = np.concatenate([alpha, win.reshape(-1)]).astype(np.float32)
+        got = _run(f"up_{tag}_{o}", shim_text, f"wd_up_{tag}", tiles, t * stride, resident,
+                   flags=[f"-DSTAGE_C_IN={c_in}", f"-DSTAGE_T={t}",
+                          f"-DSTAGE_K={k}", f"-DSTAGE_STRIDE={stride}"])
+        got = got.reshape(c_out, t * stride)
+        out[:, o * stride:(o + n) * stride] = got[:, ctx * stride:(ctx + n) * stride]
+        _stats["computed"] += c_out * t * stride
+        _stats["useful"] += c_out * n * stride
+    return out
+
+
+def conv_transpose(x, w, bias, stride, tag, t=UPSAMPLE_T):
+    """[c_in, L] -> [c_out, (L - ctx) * stride]. No static state anywhere in the pass.
+
+    Replaces the fused upsample for the driver. The fused kernel was measured green twice and then
+    began returning NaN with its source unchanged; every kernel in this codec that keeps a static L1
+    scratch has been fragile and every one that keeps none has been stable, so the driver buys
+    stability by paying for snake as a separate pass. See conv_transpose_channel.cc.
+    """
+    c_in, L = x.shape
+    k = 2 * stride
+    ctx = -(-(k - 1) // stride)
+    c_out = w.shape[1]
+    M = L - ctx
+    step = t - ctx
+    out = np.zeros((c_out, M * stride), np.float32)
+
+    tile_w = c_in * k
+    tiles = np.zeros((c_out, tile_w + 1), np.float32)
+    for co in range(c_out):
+        tiles[co, :tile_w] = w[:, co, :].reshape(-1)   # [c_in, c_out, k] -> this channel's [c_in,k]
+        tiles[co, tile_w] = bias[co]
+
+    shim_text = (f"// window_driver ct {tag} cb {_CB}\n#include <stdint.h>\n"
+                 f'#include "{CT_CHAN_CC}"\n'
+                 f'extern "C" void wd_ct_{tag}(float *tile, float *resident, float *out) {{\n'
+                 f"  route_b_bricks::conv_transpose_channel_core(resident, tile, tile[{tile_w}],\n"
+                 f"                                              out, {c_in}, {k}, {t}, {stride});\n}}\n")
+
+    for o in range(0, M, step):
+        n = min(step, M - o)
+        win = np.zeros((c_in, t), np.float32)
+        take = min(t, L - o)
+        win[:, :take] = x[:, o:o + take]
+        got = _run(f"ct_{tag}_{o}", shim_text, f"wd_ct_{tag}", tiles, t * stride, win)
+        got = got.reshape(c_out, t * stride)
+        out[:, o * stride:(o + n) * stride] = got[:, ctx * stride:(ctx + n) * stride]
+        _stats["computed"] += c_out * t * stride
+        _stats["useful"] += c_out * n * stride
+    return out
+
+
+def upsample_unfused(x, alpha, w, bias, stride, tag, t=UPSAMPLE_T):
+    """snake then conv_transpose_1d as TWO passes, neither holding static state."""
+    return conv_transpose(snake(x, alpha, f"{tag}sn"), w, bias, stride, f"{tag}ct", t)
