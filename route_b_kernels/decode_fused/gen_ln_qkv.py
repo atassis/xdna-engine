@@ -8,7 +8,7 @@ Decode token (M=1) self-attention front half on real whisper-small layer weights
              = x_norm @ W'' + bias'                #   bias' = beta@W + b  (added host-side after read)
 
 IRON's layer_norm is non-affine, so Whisper's affine LN folds into the projection exactly (the same
-host pre-norm fold as [[decode-norm-gemv]]). IRON gemv computes matrix[M,K] @ vec[K] = out[M], so the
+host pre-norm fold as the M=1 decode GEMV path). IRON gemv computes matrix[M,K] @ vec[K] = out[M], so the
 device matrix is W''ᵀ with M=2304 (q|k|v concat), K=768.
 
 On-device gate (generic `fused_elf_probe`): rel-L2(device qkv_nobias, buffers/qkv.bin) <= 0.08, where

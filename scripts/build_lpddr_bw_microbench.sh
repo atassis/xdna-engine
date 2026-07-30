@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build the pure-DMA LPDDR bandwidth microbench xclbins for a transfer-size sweep.
 # CPU-only (no NPU) BUT it invokes aiecc against the SHARED mlir-aie/amd-IRON toolchain
-# -> serialize / run in a coordinated window (see [[shared-iron-checkout-hazard]]).
+# -> serialize / run in a coordinated window.
 #
 # Outputs (consumed by scripts/lpddr_bw_microbench_harness.py):
 #   <OUTDIR>/lpddr_{mode}_c{cols}_{bytes}.xclbin

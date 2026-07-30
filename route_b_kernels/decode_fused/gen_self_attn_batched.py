@@ -14,7 +14,7 @@ q/k/v + its own KV cache, and attention runs per (stream,head) via num_batches=B
 
 v1 SCOPE (spec YAGNI = offline-bulk lockstep): all streams share the SAME decode position, so the KV
 write offset + softmax context are CONSTANTS baked in (no per-stream scratchpad vector — that is the
-later dynamic-batching scope, overlaps [[generalize-resident-scratchpad-decode]]). We validate with a
+later dynamic-batching scope). We validate with a
 FULL cache (S = context length, P = S-1 prefilled + current), so softmax needs no mask. Gate: rel-L2
 (device attn_out, per-stream bf16 golden) <= 0.08. Run inside the IRON env.
 """

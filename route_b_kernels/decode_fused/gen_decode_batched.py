@@ -2,12 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """Batched fused decode — Tasks 5+6: the WHOLE Whisper decoder stack (N layers) for B streams as ONE
 fused full ELF. Forked from gen_decode.py (M=1), composing the device-validated batched blocks:
-  self-attn ([[batched-selfattn-block]]) + residual + cross-attn (Task 4) + residual + FFN
-  ([[batched-decode-elf-ffn]]) + residual, all stream-major [B,feat] with GEMM-N=B projections.
+  self-attn (Task 3) + residual + cross-attn (Task 4) + residual + FFN
+  (Task 1) + residual, all stream-major [B,feat] with GEMM-N=B projections.
 
 v1 SCOPE (offline-bulk lockstep): all B streams share the decode position, so the self KV-write offset
 is a CONSTANT (position P) and softmax needs no mask (S = self context, TP = cross context). Per-stream
-position vectors (dynamic batching) are the deferred scope ([[generalize-resident-scratchpad-decode]]).
+position vectors (dynamic batching) are deferred to a later pass.
 
 Ops are created ONCE and reused across all layers (same shapes); per-layer weight + cache buffers.
 MEMORY: self KV [B,H,S,HD] + cross Kenc/Venc [B,H,TP,HD] per layer scale with B·layers — use a small

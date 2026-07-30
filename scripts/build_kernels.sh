@@ -113,7 +113,7 @@ make -C $MMW -f Makefile.silu NPU2=1 M=512 K=800  N=768  n_aie_cols=8 no_silu=1 
 # RTP-selected epilogue; 6 streams = 3 N x {silu(no_silu=0), identity(no_silu=1)}. The silu/identity
 # xclbins are identical modulo the per-build UUID, so the silu one is the resident; both insts are used.
 # Clean BOTH the epilogue AND the matmul objects: `make` mtime-tracking can reuse a stale mm_*.o across
-# kernel-source changes, producing a silently-wrong xclbin (bit us 2026-06-20, [[encoder-gelu-fusion-attempt]]).
+# kernel-source changes, producing a silently-wrong xclbin (bit us 2026-06-20).
 rm -f $MMW/build/mm_silu_epilogue_*.o $MMW/build/mm_64x32x96.o $MMW/build/mm_32x32x32.o
 for N in 3072 1536 768; do
   # FAST (64x32x96 BFP16_IREE) modal -- the shipped default precision

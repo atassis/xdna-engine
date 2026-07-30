@@ -4,7 +4,7 @@
 Reads a TSV of `path<TAB>hypothesis` lines (verify_batched_decode stdout) and the refs.json
 (file -> ground-truth) map, normalizes both (lowercase, strip punct, collapse ws, NFC), computes
 per-clip WER + the aggregate per-stream WER (total edits / total ref words), and gates against the
-batched-decode threshold 0.1172 ([[batched-decode-engine-wer]]).
+batched-decode threshold 0.1172.
 
     python3 scripts/_score_batched_wer.py <transcripts.tsv> [refs.json] [--gate 0.1172]
 exit 0 if aggregate WER <= gate, else 1.

@@ -2,7 +2,7 @@
 //!
 //! Dims are from the HF `config.json` of the ungated mirrors `unsloth/gemma-3-{270m,1b}-it`
 //! (same weights as the HF-gated `google/gemma-3-*`). 270M is the de-risk first pass; 1B is the
-//! ~1B-class target ([[run-small-llms-goal]]).
+//! ~1B-class target.
 
 /// One Gemma 3 text-decoder configuration.
 #[derive(Debug, Clone, Copy, PartialEq)]

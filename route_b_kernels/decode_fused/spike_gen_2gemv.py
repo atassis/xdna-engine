@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """FE1 Task-0 spike generator: a minimal 2-GEMV *fused full ELF* via IRON's FusedMLIROperator.
 
-This is the artifact side of the dispatch-shim crux ([[decode-fused-elf-handoff]] /
-2026-06-15-iron-fused-elf-whisper-porting.md step 1). It produces a fused ELF that chains
+This is the artifact side of the dispatch-shim crux -- proving a fused ELF can dispatch through
+the new xrt::elf path end to end. It produces a fused ELF that chains
     y0 = W0 @ x        (GEMV, M=K=128)
     y1 = W1 @ y0       (GEMV, M=K=128)
 into ONE program with the 3-arena (input/output/scratch) ABI, plus pre-assembled arena blobs and a

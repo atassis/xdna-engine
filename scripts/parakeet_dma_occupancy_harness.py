@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """Parakeet encoder DMA-occupancy harness -- split DMA-wait from dispatch/BD/lock/stall
-inside the 91-95% "movement" window the per-op occupancy A/B lumps together
-([[parakeet-occupancy-measured-ab]]). Gates the byte-dedup lever from
-[[encoder-lpddr-traffic-map]]: how much of "movement" is actually LPDDR DMA (=on the
+inside the 91-95% "movement" window the per-op occupancy A/B lumps together.
+Gates the byte-dedup lever: how much of "movement" is actually LPDDR DMA (=on the
 critical path, dedup-able) vs fixed dispatch overhead (NOT byte-reducible)?
 
 WHY a sweep, not a single A/B: the existing FULL-vs-STUB twin isolates COMPUTE

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Phase-0 per-op occupancy run for the Parakeet encoder (brick #8, measure-first gate).
 # RUN phase (needs the NPU). Single-tenant: stops npu-asr/voxd, ALWAYS restarts on
-# exit, fuser-checks the device first (serialize -- [[npu-timing-check-fuser-first]]).
+# exit, fuser-checks the device first (serialize -- single-tenant NPU).
 #
 # Pipeline:
 #   1. CPU goldens + roofline (parakeet_occupancy_golden.py)            [no NPU]

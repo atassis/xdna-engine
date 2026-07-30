@@ -56,7 +56,7 @@ needed; this is a toolchain-exposure fix. Numerical behavior is covered separate
 > would inform that larger design, so it makes sense to land this first and discuss the fused form separately.
 > Happy to align on the API shape (typed free functions vs a typed port type) before expanding.
 
-Tone rules for this footer (per [[upstream-pr-hygiene]]): PR 1 is complete-and-valuable on its own; the
+Tone rules for this footer: PR 1 is complete-and-valuable on its own; the
 follow-on is an ENHANCEMENT, never a correction of PR 1; opt-in ("if there's interest"), not a roadmap
 dictated to the maintainers; grounded in the K-reduction use case; invites their design ownership. Do NOT
 over-promise or make merge of PR 1 contingent on PR 2.
@@ -95,7 +95,7 @@ Re-verified against a fresh clone of canonical `Xilinx/aie_api` `bec000f` ("Sync
    templated on the `accum`/`vector` type -> right builtin. NOT a new `cascade<T>` object type (over-building),
    NOT raw untyped builtins (under-idiomatic). Position it explicitly as the NON-ADF path (does not compete
    with the existing ADF cascade). Float the API shape in a short issue/RFC PR before the full drop.
-3. Voice/base per [[upstream-pr-hygiene]]: ASCII owner voice, base off canonical upstream/main, validate
+3. Voice/base: ASCII owner voice, base off canonical upstream/main, validate
    against a matching base, confirm-before-file.
 
 ## Artifacts in this dir

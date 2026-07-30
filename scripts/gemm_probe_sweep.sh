@@ -49,7 +49,7 @@ log "[svc] stopping npu-asr / voxd"
 systemctl --user stop xdna-engine.service voxd.service >/dev/null 2>&1
 sleep 1
 if fuser /dev/accel/accel0 >/dev/null 2>&1; then
-  log "FATAL: /dev/accel/accel0 still busy — another session holds the NPU. Aborting (serialize, see [[npu-timing-check-fuser-first]])."
+  log "FATAL: /dev/accel/accel0 still busy — another session holds the NPU. Aborting (single-tenant NPU, serialize with other sessions)."
   fuser -v /dev/accel/accel0 2>&1 | tee -a "$LOG"
   exit 1
 fi

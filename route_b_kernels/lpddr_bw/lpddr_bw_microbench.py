@@ -9,7 +9,8 @@
 # ===========================================================================
 # PURE-DMA LPDDR BANDWIDTH MICROBENCHMARK (no compute, no GEMM tiling).
 #
-# WHY: the encoder GEMM measured ~57 GB/s *effective* DMA ([[encoder-dma-occupancy]]),
+# WHY: the encoder GEMM measured ~57 GB/s *effective* DMA (measured separately via a
+# per-op DMA-occupancy harness),
 # but that number is contaminated by tiling/dispatch/BD overhead and re-reads. This
 # design streams a large CONTIGUOUS buffer L3(LPDDR) <-> L1 through a minimal objectFIFO
 # with ZERO arithmetic, so the regression t = c0 + bytes / BW measures the *silicon's
