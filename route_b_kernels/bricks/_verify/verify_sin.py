@@ -1,19 +1,32 @@
 #!/usr/bin/env python3
 """Device rel-L2 verify for the sin brick. Gate 3e-2. Run under the device lock.
 
-Uses the ROWWISE rail, like verify_rmsnorm, not verify_oneshot. Measured reason: with oneshot the
-kernel only ever receives the first 64 floats (256 B) of the buffer -- at N=256/512/1024 the first
-wrong element is index 64 every time, and the values past it are UNBOUNDED (sin cannot exceed 1), so
-the kernel is computing sin of whatever follows the delivered tile. The same kernel passes oneshot at
-N=64 exactly (rel-L2 1.2e-4). Rowwise streams m rows of in_cols and is the rail the shipped norm
-bricks verify on.
+THIS GATE CURRENTLY FAILS, AND THAT IS THE CORRECT RESULT. rel-L2 0.709 at 64x64, run2run 0.
 
-Two cache notes, both of which invalidated earlier runs of this file:
-  * The JIT cache key hashes the SHIM text only, not the brick .cc it #includes, so editing sin.cc
-    alone silently reuses a stale xclbin. Proven: a kernel edited to store the constant 42 still
-    returned sin values. The `_cb` marker keeps the shim text unique per run.
-  * `brick_cc` must be an ABSOLUTE path -- the shim compiles from the cache dir, so a relative
-    include resolves to nothing.
+The 1.275e-04 this brick was recorded green at was a STALE-CACHE ARTIFACT, not a measurement. The
+harness keyed its artifact cache on the design NAME, and this file reuses the symbol `sin_verify`
+on every run, so once any build of that name succeeded every later run re-reported it no matter
+what sin.cc said. bricklib._design_name now keys on the actual build inputs; re-run under the fixed
+harness, the committed brick fails at its own recorded configuration. The `// cachebust` marker
+below never helped -- it only ever changed the shim TEXT, which was not the key.
+
+What is actually wrong is a codegen instability, not a size limit and not the loop bound:
+  * A copy kernel is bit-exact on this same rail at 32x512 and 8x512 (probe_rail_512.py,
+    rel-L2 exactly 0), so nothing is truncated in delivery.
+  * On the ONESHOT rail the same kernel passes to 1024. The defect needs the streamed rail, where
+    the kernel is invoked once per tile -- the first invocation is right and later ones are not.
+  * Rewriting the trip count as a compile-time template parameter fixes it in one arrangement and
+    breaks it in the next; adding or REMOVING unrelated functions from the translation unit flips
+    the verdict, and always_inline made a green arrangement fail. That is the register-pressure
+    aliasing sin.cc's own header warns about (llvm-aie #1155 territory), reached by this kernel's
+    live set, not something to be fixed by shuffling source.
+
+snake, which inlines sin_v into its own loop rather than calling this path, is genuinely green
+(5.143e-06, reproduces exactly under the fixed harness), as is conv_transpose_1d (3.894e-08). The
+codec upsample stage needs those two, so it is not blocked on this.
+
+`brick_cc` must be an ABSOLUTE path -- the shim compiles from the cache dir, so a relative include
+resolves to nothing.
 """
 import importlib.util
 import time

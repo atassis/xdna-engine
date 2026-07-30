@@ -33,6 +33,53 @@ GEN = Path(__file__).parent / "gen"
 GEN.mkdir(exist_ok=True)
 
 
+def _shim_digest(shim):
+    """Hash the shim and every local header it pulls in, transitively.
+
+    This is ONE PART of the cache key, not the whole of it -- see `_design_key`, which also
+    carries shapes, dtypes and flags. The two guard different failures and neither subsumes
+    the other: `_design_key` alone serves one shape's output BO to every later shape, while
+    this alone lets two different shapes with identical source collide.
+
+    The original note on why the source half is needed:
+
+    A design name that CHANGES whenever the build inputs change.
+
+    THE CACHE KEY IS THIS NAME, NOT THE SHIM TEXT. That is the opposite of what this harness
+    documented for weeks, and it silently invalidated an unknown number of runs. Measured
+    head-to-head: two builds in one process, same brick, same shim body apart from a comment, one
+    bound to the symbol `sin_verify` (reused from earlier runs) and one to `sin_verify_<nonce>` --
+    the reused name returned a stale xclbin at rel-L2 2.052e+01 with output in [-110.9, +124.96],
+    the fresh name returned rel-L2 1.275e-04 in [-1, 1]. Passing `use_cache=False` does not disable
+    that layer; only a different name does.
+
+    The cost of getting this wrong is not a failed run, it is a PASSING one: a verify whose symbol
+    never changes keeps re-reporting whatever the first build of that name produced, so edits to
+    the kernel look like no-ops and a brick can be recorded green on code that no longer exists.
+    The per-shim `// cachebust <ms>` markers were written to prevent exactly this and could not,
+    since they only ever changed the text.
+
+    So key the name on the real inputs: the shim, every local header it pulls in (transitively --
+    the brick .cc lives behind one), and the compile flags. Identical inputs still reuse the
+    artifact, which is the property that made caching worth having.
+    """
+    h = hashlib.sha256()
+    seen, queue = set(), [Path(shim)]
+    while queue:
+        f = queue.pop()
+        if f in seen or not f.exists():
+            continue
+        seen.add(f)
+        try:
+            src = f.read_text()
+        except OSError:
+            continue
+        h.update(src.encode())
+        for inc in re.findall(r'#include\s+"([^"]+)"', src):
+            queue.append((f.parent / inc).resolve())
+    return h.hexdigest()[:16]
+
+
 def _aie_api_include():
     """Resolve the aie_api include dir and return it as a -I flag, or nothing if the
     active toolchain instance already exposes the headers.
@@ -178,7 +225,7 @@ def _build_streamed(symbol, shim, n_tiles, in_tile, out_tile, resident_len, comp
             ).resolve_program()
         design.__name__ = design.__qualname__ = _design_key(
             symbol, n_tiles, in_tile, out_tile, resident_len, in_dt, out_dt, resident_dt,
-            compile_flags)
+            compile_flags, _shim_digest(shim))
         return iron.jit(design, use_cache=_JIT_CACHE)
 
     def design(inp: In, out: Out):
@@ -213,7 +260,7 @@ def _build_streamed(symbol, shim, n_tiles, in_tile, out_tile, resident_len, comp
         ).resolve_program()
     design.__name__ = design.__qualname__ = _design_key(
         symbol, n_tiles, in_tile, out_tile, resident_len, in_dt, out_dt, resident_dt,
-        compile_flags)
+        compile_flags, _shim_digest(shim))
     return iron.jit(design, use_cache=_JIT_CACHE)
 
 
@@ -353,7 +400,7 @@ def _build_oneshot(symbol, shim, in_numels, out_numel, in_dts, out_dt, compile_f
         raise ValueError(f"_build_oneshot supports 1-4 inputs, got {nin}")
 
     design.__name__ = design.__qualname__ = _design_key(
-        symbol, in_numels, out_numel, in_dts, out_dt, compile_flags)
+        symbol, in_numels, out_numel, in_dts, out_dt, compile_flags, _shim_digest(shim))
     return iron.jit(design, use_cache=_JIT_CACHE)
 
 
