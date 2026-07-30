@@ -113,10 +113,10 @@ for prefix, dil, in_key, out_key in UNITS:
     shim.write_text(
         f"// AUTO-GENERATED verify shim, residual unit on real data, dilation {dil}. cb {_cb}\n"
         "#include <stdint.h>\n"
-        f'#include "{(HERE / "residual_unit.cc").resolve()}"\n'
+        f'#include "{(HERE / os.environ.get("RU_SRC", "residual_unit.cc")).resolve()}"\n'
         f'extern "C" void residual_real_d{dil}(float *tile, float *resident, float *out) {{\n'
         "  using namespace route_b_bricks;\n"
-        "  ROUTE_B_RESIDUAL_UNIT_BODY(tile, resident, out)\n"
+        f"  {os.environ.get('RU_MACRO', 'ROUTE_B_RESIDUAL_UNIT_BODY')}(tile, resident, out)\n"
         "}\n"
     )
 
@@ -132,7 +132,7 @@ for prefix, dil, in_key, out_key in UNITS:
         golden=ref_win,
         gate=GATE,
         in_dt=np.float32, out_dt=np.float32, resident_dt=np.float32,
-        compile_flags=[f"-DRU_C={C}", f"-DRU_T={STAGE_T}", f"-DRU_K={K}",
+        compile_flags=[*os.environ.get("RU_EXTRA","").split(), f"-DRU_C={C}", f"-DRU_T={STAGE_T}", f"-DRU_K={K}",
                        f"-DRU_DILATION={dil}"],
     )
     got = np.asarray(res["got"], np.float32)

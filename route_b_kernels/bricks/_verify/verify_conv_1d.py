@@ -30,7 +30,11 @@ import gguf_extract as gx  # noqa: E402
 
 GGUF = Path(
     "$WORKSPACE/s2.cpp/models/s2-pro-q6_k.gguf")
-C_IN, C_OUT, K, T = 96, 96, 7, 32
+import os
+# CV_T overrides t: this brick has NO static scratches, so sweeping it measures what the streamed
+# rail alone can deliver, independent of any kernel's own buffers. Measured: t=64 passes at
+# rel-L2 4.592e-07, t=128 exceeds available memory.
+C_IN, C_OUT, K, T = 96, 96, 7, int(os.environ.get('CV_T', 32))
 GATE = 3e-2
 # .block.2/.3/.4 of a decoder stage are the three residual units, at dilations 1/3/9.
 UNITS = [("c.decoder.model.4.block.2.block.1.conv", 1),
