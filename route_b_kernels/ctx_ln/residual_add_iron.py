@@ -50,8 +50,53 @@ BAND_NAMING_CORETILE_EVENTS = [
     CoreEvent.ACTIVE,
 ]
 
+# PERF_CNT_0-3 probe (2026-07-30, adversarial-review follow-up): CoreEventAIE2/2P codes 5-8.
+# These are trace-EVENT-SELECTION slots, not a call to XAie_PerfCounterControlSet -- IRON's
+# Program.enable_trace / aie.dialects.aie's trace_event op has no parameter to program a
+# counter's Start/Stop event pair (grep of aie/Dialect/AIE/IR/AIETraceOps.td: AIE_TraceEventOp
+# takes only a single `event` attr). XAie_PerfCounterControlSet exists only in vendored aie-rt
+# C (driver/src/perfcnt/xaie_perfcnt.c) and in the legacy host-driven runtime_lib/test_lib
+# EventMonitor helper (a different, non-IRON execution model); libxaiefal, which ships the
+# XAieActiveCycles(Start=ACTIVE_CORE, Stop=DISABLED_CORE) canonical helper the task named, is
+# not even built in this toolchain instance (searched build/ tree, zero libxaiefal artifacts).
+# So selecting PERF_CNT_0-3 here traces whatever hardware POR/default start/stop state those
+# counters are in -- UNCONFIGURED, since nothing in this design's runtime sequence programs
+# them. This list exists to make that empirically visible, not because it is expected to name
+# the unaccounted band. INSTR_VECTOR/LOCK_STALL kept as a sanity anchor (known strongly
+# non-zero) to confirm the capture/decode path itself still works.
+PERFCNT_PROBE_CORETILE_EVENTS = [
+    CoreEvent.INSTR_VECTOR,
+    CoreEvent.LOCK_STALL,
+    CoreEvent.PERF_CNT_0,
+    CoreEvent.PERF_CNT_1,
+    CoreEvent.PERF_CNT_2,
+    CoreEvent.PERF_CNT_3,
+    CoreEvent.MEMORY_STALL,
+    CoreEvent.STREAM_STALL,
+]
 
-def residual_add(dev, sequence_length, embedding_dim, scale, trace_size, n_cores=8):
+# Denominator-validation probe (2026-07-30): same accounted-side events as
+# BAND_NAMING_CORETILE_EVENTS (INSTR_VECTOR/LOAD/STORE + LOCK/MEMORY_STALL) but swaps
+# CASCADE_STALL/ACTIVE (both uninformative in the band-naming pass) back for INSTR_EVENT_0/1
+# (function entry/exit markers) so this capture keeps the invocation-boundary parse
+# get_trace_summary.py depends on. Lets the idle-before-first-invocation /
+# idle-after-last-invocation bracket be measured DIRECTLY on a capture whose accounted-%
+# is comparable to the band-naming run's 58.57%, instead of only on the original
+# default-8-event capture (which lacks INSTR_LOAD/STORE) and extrapolated across.
+DENOM_CHECK_CORETILE_EVENTS = [
+    CoreEvent.INSTR_EVENT_0,
+    CoreEvent.INSTR_EVENT_1,
+    CoreEvent.INSTR_VECTOR,
+    CoreEvent.LOCK_STALL,
+    CoreEvent.MEMORY_STALL,
+    CoreEvent.STREAM_STALL,
+    CoreEvent.INSTR_LOAD,
+    CoreEvent.INSTR_STORE,
+]
+
+
+def residual_add(dev, sequence_length, embedding_dim, scale, trace_size, n_cores=8,
+                  event_set="band-naming"):
     assert sequence_length % n_cores == 0, "rows must split evenly across 8 cores"
     assert embedding_dim % 16 == 0, "residual_add_row<16> vectorizes cols by 16"
 
@@ -123,9 +168,13 @@ def residual_add(dev, sequence_length, embedding_dim, scale, trace_size, n_cores
         # enough to saturate them -- build the traced variant with -n/--cores reduced (cores=1
         # is representative of the per-row MATH, not production wall time; see the enable_trace
         # recipe established for ln_affine_cast_iron.py, which this mirrors).
+        events = {
+            "perfcnt-probe": PERFCNT_PROBE_CORETILE_EVENTS,
+            "denom-check": DENOM_CHECK_CORETILE_EVENTS,
+        }.get(event_set, BAND_NAMING_CORETILE_EVENTS)
         prog.enable_trace(
             trace_size=trace_size, workers=[workers[0]], egress_shim_col=1,
-            coretile_events=BAND_NAMING_CORETILE_EVENTS,
+            coretile_events=events,
         )
     return prog.resolve_program()
 
@@ -137,8 +186,10 @@ p.add_argument("-c", "--cols", required=True, dest="cols")
 p.add_argument("-s", "--scale", required=True, dest="scale")
 p.add_argument("-t", "--trace_size", required=False, dest="trace_size", default=0)
 p.add_argument("-n", "--cores", required=False, dest="cores", default=8)
+p.add_argument("-e", "--event-set", required=False, dest="event_set", default="band-naming",
+                choices=["band-naming", "perfcnt-probe", "denom-check"])
 opts = p.parse_args(sys.argv[1:])
 
 dev = NPU2() if opts.device == "npu2" else NPU1()
 print(residual_add(dev, int(opts.rows), int(opts.cols), float(opts.scale), int(opts.trace_size),
-                   int(opts.cores)))
+                   int(opts.cores), opts.event_set))
