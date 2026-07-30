@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
-# say.sh -- synthesize speech from text, write a timestamped wav, play it.
+# s2say -- synthesize speech from text, write a timestamped wav, play it.
 #
-#   scripts/say.sh "some text to speak"
-#   scripts/say.sh --no-play "text"          write the file, do not play
-#   scripts/say.sh --voice alice "text"      use a saved .s2voice profile
-#   scripts/say.sh --out-dir ~/clips "text"
+#   s2say "some text to speak"
+#   s2say --no-play "text"           write the file, do not play
+#   s2say --voice alice "text"       use a saved .s2voice profile
+#   s2say --out-dir ~/clips "text"
+#   s2say --where                    show which binary, model and config are in use
+#
+# Installed by cli/install.sh. Paths resolve env -> ~/.config/s2say/config -> repo-relative, so an
+# installed copy does not depend on the checkout staying where it was when it was installed.
 #
 # WHICH HARDWARE THIS USES, stated plainly because it is the whole question right now:
 # this runs the s2.cpp CPU reference end to end. It is NOT the NPU path.
@@ -24,11 +28,19 @@
 # gets shorter.
 set -euo pipefail
 
-WS="$WORKSPACE"
-S2="${S2_BIN:-$WS/s2.cpp/build-cpu/s2}"
-MODEL="${S2_MODEL:-$WS/s2.cpp/models/s2-pro-q6_k.gguf}"
-TOKENIZER="${S2_TOKENIZER:-$WS/s2.cpp/models/tokenizer.json}"
-OUT_DIR="${SAY_OUT_DIR:-$HOME/Music/s2}"
+CONFIG="${S2SAY_CONFIG:-$HOME/.config/s2say/config}"
+# Config first, then env wins: sourcing before the defaults lets an env var override an installed
+# config without editing it.
+[[ -r "$CONFIG" ]] && . "$CONFIG"
+
+# Repo-relative fallback, so the script also works when run straight out of a checkout.
+_here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+_ws="$(cd "$_here/../.." 2>/dev/null && pwd || echo /nonexistent)"
+
+S2="${S2_BIN:-${S2_BIN_CFG:-$_ws/s2.cpp/build-cpu/s2}}"
+MODEL="${S2_MODEL:-${S2_MODEL_CFG:-$_ws/s2.cpp/models/s2-pro-q6_k.gguf}}"
+TOKENIZER="${S2_TOKENIZER:-${S2_TOKENIZER_CFG:-$_ws/s2.cpp/models/tokenizer.json}}"
+OUT_DIR="${S2SAY_OUT_DIR:-${S2SAY_OUT_DIR_CFG:-$HOME/Music/s2}}"
 PLAY=1
 VOICE=""
 
@@ -37,7 +49,14 @@ while [[ $# -gt 0 ]]; do
     --no-play) PLAY=0; shift ;;
     --out-dir) OUT_DIR="$2"; shift 2 ;;
     --voice)   VOICE="$2"; shift 2 ;;
-    -h|--help) sed -n '2,10p' "$0"; exit 0 ;;
+    --where)
+      printf 'binary    %s%s\nmodel     %s%s\ntokenizer %s%s\nconfig    %s%s\nout-dir   %s\n' \
+        "$S2" "$([[ -x $S2 ]] || echo '   [MISSING]')" \
+        "$MODEL" "$([[ -e $MODEL ]] || echo '   [MISSING]')" \
+        "$TOKENIZER" "$([[ -e $TOKENIZER ]] || echo '   [MISSING]')" \
+        "$CONFIG" "$([[ -r $CONFIG ]] || echo '   [none, using defaults]')" "$OUT_DIR"
+      exit 0 ;;
+    -h|--help) sed -n '2,12p' "$0" | sed 's/^# \?//'; exit 0 ;;
     *) break ;;
   esac
 done
@@ -49,7 +68,11 @@ if [[ -z "$TEXT" ]]; then
 fi
 
 for f in "$S2" "$MODEL" "$TOKENIZER"; do
-  [[ -e "$f" ]] || { echo "missing: $f" >&2; exit 1; }
+  [[ -e "$f" ]] || {
+    echo "missing: $f" >&2
+    echo "run 's2say --where' to see resolved paths, or re-run cli/install.sh" >&2
+    exit 1
+  }
 done
 
 mkdir -p "$OUT_DIR"
