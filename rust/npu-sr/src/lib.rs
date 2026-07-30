@@ -8,6 +8,8 @@ pub mod pipeline;
 
 use std::path::Path;
 
+use npu_engine::EngineError;
+
 /// Engine error surface (mirrors `npu_engine::api::EngineError` style).
 #[derive(thiserror::Error, Debug)]
 pub enum SrError {
@@ -124,4 +126,31 @@ impl SrEngine {
 /// True if an XDNA2 NPU device node is present (cheap file check; mirrors `npu_engine::Engine::available`).
 pub fn npu_available() -> bool {
     std::path::Path::new("/dev/accel/accel0").exists()
+}
+
+// engine-open-capability-contract probe instance #2: image in, image out, genuinely &mut self --
+// this is the island the task exists to open: `SrEngine` has never implemented `AsrModel`,
+// `Embedder`, or npu-runtime's `Inference`; nothing here routes it through `ModelKind`/`Scenario`/
+// `Cmd`. `npu_sr` already depends on `npu_engine` (for `esm::native`'s conv-as-GEMM rail,
+// `frontier.rs:252`), so this adapter costs no new Cargo dependency.
+impl npu_engine::capability::Servable for SrEngine {
+    fn capabilities(&self) -> npu_engine::capability::Capability {
+        npu_engine::capability::Capability("image-sr")
+    }
+    fn run(&mut self, req: npu_engine::capability::Request) -> Result<npu_engine::capability::Response, EngineError> {
+        use npu_engine::capability::{Request, Response};
+        match req {
+            Request::Image { rgb, w, h } => {
+                // SrError -> EngineError: no `From` impl (orphan rule -- neither type is local to
+                // this crate for that trait), so the mapping is inline here. `to_string()` loses
+                // SrError's variant identity (NotAvailable/Load/Device/Frame all fold to `Device`);
+                // acceptable for a probe, a real integration would want EngineError variants that
+                // actually distinguish them.
+                let (rgb, w, h) = self.upscale_rgb8(&rgb, w, h).map_err(|e| EngineError::Device(e.to_string()))?;
+                Ok(Response::Image { rgb, w, h })
+            }
+            Request::Text(_) =>
+                Err(EngineError::Unsupported("SrEngine: expected Request::Image, got Request::Text".into())),
+        }
+    }
 }

@@ -14,3 +14,7 @@ pub use api::{Engine, EngineError, Model, ModelKind};
 #[doc(hidden)] pub mod esm;
 #[doc(hidden)] pub mod asr;
 #[doc(hidden)] pub mod tuning_profile;
+// PROBE (engine-open-capability-contract): the open request-surface trait. `#[doc(hidden)]` for now
+// like the other internals above -- it is a candidate contract validated against two instances, not
+// yet the wired-in replacement for `pipeline::Scenario` / `npu-runtime`'s closed routing.
+#[doc(hidden)] pub mod capability;

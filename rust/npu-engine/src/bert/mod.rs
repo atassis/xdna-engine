@@ -52,3 +52,18 @@ impl crate::pipeline::Embedder for EmbedPipeline {
         Ok(self.embed(text))
     }
 }
+
+// engine-open-capability-contract probe instance #1: text in, vector out, genuinely &self (no
+// interior mutability laundering needed -- `&mut self` on `run` just reborrows).
+impl crate::capability::Servable for EmbedPipeline {
+    fn capabilities(&self) -> crate::capability::Capability {
+        crate::capability::Capability("embed")
+    }
+    fn run(&mut self, req: crate::capability::Request) -> Result<crate::capability::Response, EngineError> {
+        match req {
+            crate::capability::Request::Text(text) => Ok(crate::capability::Response::Vector(self.embed(text))),
+            crate::capability::Request::Image { .. } =>
+                Err(EngineError::Unsupported("EmbedPipeline: expected Request::Text, got Request::Image".into())),
+        }
+    }
+}
