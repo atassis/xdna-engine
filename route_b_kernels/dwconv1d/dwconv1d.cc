@@ -133,8 +133,15 @@ static inline void dwconv1d_same_scalar(const bfloat16 *restrict in,
 // the naive brick hits (see the step-3 dwconv investigation, both persistent to Peano nightly 071401):
 //   (1) unaligned L1 vector loads SNAP to the aligned base -- so load_v(&buf[o+p]) at p!=0 (as the
 //       old scalar-window / sliding_mul staging does) reads the wrong data; and
-//   (2) aie::sliding_mul_ops<...,bf16,bf16> itself emits inf/nan even with aligned data (a genuine
-//       aie_api fp-sliding-mul defect, reported upstream).
+//   (2) RETRACTED 2026-07-30. This previously read "aie::sliding_mul_ops<...,bf16,bf16> itself
+//       emits inf/nan even with aligned data (a genuine aie_api defect, reported upstream)".
+//       That was wrong and was never reported. An isolated single-core repro of exactly that
+//       call found it CORRECT for K=1/4/9/16 at the bf16 noise floor with no non-finite output.
+//       The original numbers came from the full multi-channel pipeline, not an isolated test,
+//       so the fault was in the dataflow around it. Root cause (1) above is unaffected and
+//       still stands. The shift-and-shuffle path below is kept because it is the shipped,
+//       WER-gated form, not because the library primitive is broken; the two have never been
+//       benchmarked against each other.
 // Here every load is aligned (o steps by 16, buf is alignas(64)); tap-p window buf[o+p..o+p+15] is
 // built purely in-register: shuffle_down_fill(a0,a1,p) = [a0[p..15] | a1[0..p-1]]. k=9 unrolled (the
 // window o+8+15=o+23 stays within the a0||a1 32-lane concat).

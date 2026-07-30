@@ -58,7 +58,12 @@ void ln_affine_cast_row(const float *restrict input, const float *restrict gb,
 
   // write: out = ((x - mean) * inv) * gamma + beta -> bf16. conv_even ONLY here (the bf16 narrowing +
   // affine), matching affcast; the reductions above ran under the default mode, matching ctxLN.
-  ::aie::set_rounding(::aie::rounding_mode::conv_even);
+  // The core's rounding mode is a single sticky register shared by every kernel
+  // that runs on this core, so overriding it without restoring makes the NEXT
+  // kernel's narrowing depend on whether this one ran first. Save and restore,
+  // matching aie_kernels/aie2p/mm.cc upstream.
+  const auto saved_rounding =
+      ::aie::swap_rounding(::aie::rounding_mode::conv_even);
 #if LN_BF16_WRITE
   // NATIVE-LANE write pass. On aie2p there is no f32 vector ALU: `aie::mul`/`aie::add` on
   // vector<float> lower to a bf16 DECOMPOSITION (measured on this toolchain, -O2 aie2p: 18 vmul.f +
@@ -103,6 +108,7 @@ void ln_affine_cast_row(const float *restrict input, const float *restrict gb,
     ::aie::store_v(output + i * N, a.template to_vector<bfloat16>());
   }
 #endif
+  ::aie::set_rounding(saved_rounding);
   event1();
 }
 
