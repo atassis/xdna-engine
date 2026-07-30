@@ -53,7 +53,7 @@ NLINES=$(wc -l < "$OUT")
 log "[verify] produced $NLINES transcript lines (expected $BW)"
 
 log "\n---- WER vs refs.json (gate = no-regression vs reproducible batched baseline; M=1 ref 0.1167) ----"
-# Gate 0.1245 = reproducible batched baseline ([[batched-decode-wer-gate-reconciliation]]); the batched
+# Gate 0.1245 = reproducible batched baseline; the batched
 # bf16 floor sits 2 edits above the M=1-derived 0.1172 (benign argmax noise on OOD proper nouns).
 python3 "$WT/scripts/_score_batched_wer.py" "$OUT" "$CLIPDIR/refs.json" --gate=0.1246 | tee -a "$LOG"
 exit "${PIPESTATUS[0]}"

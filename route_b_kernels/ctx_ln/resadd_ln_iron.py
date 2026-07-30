@@ -11,8 +11,8 @@
 # WHAT IT SAVES, and it is not mainly the command. Per fusion the intermediate sum no longer makes a
 # DDR round-trip into the LN: that is 2 MB of read deleted per site, 192 MB/clip, against a measured
 # ~6 GB/s effective rate. The command submission goes away too. See the tightened frontier invariant
-# in AGENTS.md ("inside a block, the stream never leaves L2") and
-# [[l2-resident-stream-is-the-real-prize]].
+# in AGENTS.md ("inside a block, the stream never leaves L2") -- keeping the intermediate ON-CHIP,
+# not merely off the host, is the actual saving.
 #
 # TWO CORES PER COLUMN, joined by an on-chip ObjectFifo -- the dwconv_silu_iron.py pattern, whose own
 # header records the separate-xclbin version costing ~1 ms/block. Two cores rather than one fused loop

@@ -1,7 +1,7 @@
 //! # npu-gemma -- Gemma 3 small-LLM decoder on the XDNA2 NPU engine (Phase 0 scaffold)
 //!
 //! The "run-any-model" proof: a Gemma 3 decoder is the SAME transformer-decoder shape as the Whisper
-//! decoder we already run on-NPU ([[decode-microop-fusion-map]]), so it reuses our resident-FFN +
+//! decoder we already run on-NPU, so it reuses our resident-FFN +
 //! fused-decode + KV primitives directly. Honest framing: LLM *decode* is LPDDR-bandwidth-bound (weights
 //! stream per token), so the NPU win is **energy / CPU-offload**, not raw tok/s -- the milestone is CORRECT
 //! e2e generation through the engine.

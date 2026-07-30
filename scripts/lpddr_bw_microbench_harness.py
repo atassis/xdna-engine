@@ -11,8 +11,8 @@ WHAT IT MEASURES (per mode, from the generator):
   write : pure L1->L3.  moved_bytes = bytes
   rdwr  : L3->L1->L3 round-trip (concurrent). moved_bytes = 2*bytes (aggregate)
 The regression slope (us per moved-MB) inverts to GB/s; the intercept is the byte-
-independent dispatch/launch floor (compare to the GEMM's ~91 us fixed floor in
-[[encoder-dma-occupancy]]).
+independent dispatch/launch floor (compare to the GEMM's ~91 us fixed floor,
+measured separately via the encoder's per-op DMA-occupancy harness).
 
 ABI (matches the upstream passthrough_dmas test.cpp + the occupancy harness measure_one):
   opcode 3; kernel(3, instr_bo@gid1, instr_size, buf0@gid3, buf1@gid4, ...). The number of

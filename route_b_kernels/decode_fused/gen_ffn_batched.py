@@ -3,7 +3,7 @@
 """Batched fused decode — Task 1: the Whisper FFN block for B token-streams at once, as a fused full ELF.
 
 Forked from gen_ffn.py (M=1). The whole point is to prove the LAYOUT strategy for batched decode
-([[lever3-batched-gemm-amortizes]] proved GEMM-N=B amortises; this proves the inter-op plumbing):
+(GEMM-N=B amortisation was proved separately; this proves the inter-op plumbing):
 
   X[B,D] -> LN(num_channels=B) -> fc1 GEMM-N=B -> +bias -> GELU(num_channels=B) -> fc2 GEMM-N=B -> +bias
 

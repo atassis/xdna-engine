@@ -3,7 +3,7 @@
 """Batched fused decode — Task 2: the Whisper self-attn LN→QKV front-half for B streams as a fused ELF.
 
 Forked from gen_ln_qkv.py (M=1) + the gen_decode.py fold. Same stream-major [B,feat] layout proven in
-Task 1 ([[batched-decode-elf-ffn]]):
+Task 1 (the batched FFN block):
 
   X[B,D] -> LN(num_channels chunks) -> qkv GEMM-N=B (folded W'') -> +bias' -> qkv[B,QKV]
 

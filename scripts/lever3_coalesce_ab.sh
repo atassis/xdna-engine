@@ -5,8 +5,8 @@
 #   bash scripts/lever3_coalesce_ab.sh
 #
 # Tests whether collapsing the per-head V transposes (612 -> 336 micro-launches/token) cuts the
-# fused-decode NPU dispatch — i.e. confirms the decode is launch-OVERHEAD-bound, not bandwidth-bound
-# ([[lever3-dispatch-overhead-bound]]). POST-DEEP-C (new mlir-aie 1.3.2 stack, constant resident ELF):
+# fused-decode NPU dispatch — i.e. confirms the decode is launch-OVERHEAD-bound, not bandwidth-bound.
+# POST-DEEP-C (new mlir-aie 1.3.2 stack, constant resident ELF):
 # baseline moved to ~75 ms/tok (~CPU floor), so the single-stream win is now SMALL — this run re-baselines
 # and quantifies it (and any J/token benefit). Fully unattended: builds, runs, ALWAYS restarts
 # npu-asr/voxd on exit, beeps when done. Everything -> artifacts/lever3_ab_<ts>.log.
@@ -21,7 +21,7 @@
 #
 # CORRECTNESS GATE (the load-bearing check): coalesced WER must == baseline (0.1172) AND the en_01
 # transcription text must be IDENTICAL baseline-vs-coalesced (argmax-identity => WER-safe, the canonical
-# gate [[decode-fused-elf-wer-safe]]). A finer rel-L2 via verify_fused_decode.py is NOT run here — it
+# gate). A finer rel-L2 via verify_fused_decode.py is NOT run here — it
 # rebuilds its own runlist and would need syncing to the coalesced structure (follow-up if WER disagrees).
 #
 # NOTE: FUSED_PHASE cannot split WITHIN the single 12-layer 'dispatch' (one opaque NPU run); the A/B
