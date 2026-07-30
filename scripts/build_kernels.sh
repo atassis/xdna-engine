@@ -17,6 +17,11 @@ done
 
 bash scripts/sync_kernels.sh   # copy canonical custom kernels/designs into the build sandbox
 
+# kernels_dir (route_b_override.mk) resolves into the mlir-aie SUBMODULE, not the pinned
+# toolchain instance -- a correctly-bumped toolchain.lock can still compile stale kernel source
+# with no error (see scripts/verify_kernel_source.sh's header). FAIL LOUD before spending a build.
+scripts/verify_kernel_source.sh Makefile.modal Makefile.modal.int8
+
 echo "== dwconv1d k=5 =="
 make -C $PE/ml/dwconv1d NPU2=1
 

@@ -20,6 +20,11 @@ MMW=mlir-aie/programming_examples/basic/matrix_multiplication/whole_array
 ensure_fresh_sandbox "$MMW/build"           # wipe old-pin xclbins/objects on a toolchain change
 bash scripts/sync_kernels.sh >/dev/null   # copy whole_array_iron.py + Makefile.resident into the sandbox
 
+# kernels_dir (route_b_override.mk) resolves into the mlir-aie SUBMODULE, not the pinned
+# toolchain instance -- a correctly-bumped toolchain.lock can still compile stale kernel source
+# with no error (see scripts/verify_kernel_source.sh's header). FAIL LOUD before spending a build.
+scripts/verify_kernel_source.sh Makefile.resident
+
 # The blessed toolchain instance rewrote matrix_multiplication/makefile-common to an @iron.jit flow
 # (stock whole_array.py) that (a) names insts .bin -- the engine reads insts_*.txt -- and (b) has no
 # WA_C_DEPTH knob, so the wide fast tile (64x32x128) overflows L1. So drive the MLIR-emitting
