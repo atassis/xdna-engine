@@ -17,10 +17,8 @@
 //                                                       (q + 2^23) - 2^23 identity, because
 //                                                       aie::to_float on vector<int32,16> does not
 //                                                       instantiate on aie2p.
-//   2. wrap by +/-2*pi (safety net; stage 1 already lands in range)
-//   3. reflect about +/-pi/2, since sin(pi - t) = sin(t)  -> [-pi/2, pi/2]
-// Then the odd Taylor polynomial r*(1 + c1 r^2 + c2 r^4 + c3 r^6), exact to ~1e-7 on that interval,
-// so the error budget is dominated by the f32 fold rather than by truncation order.
+// Then a 6-term odd Taylor polynomial, accurate to 4.5e-4 across all of [-pi, pi] -- so no second
+// reduction stage and no conditional ops at all.
 //
 // Kept in f32 throughout: 4 multiplies + 3 adds per element is well short of the per-tile cycle
 // budget that makes an all-f32 SiLU/GELU hang on this bf16-native unit (see mm_silu_epilogue's
@@ -39,49 +37,49 @@ void sin_core(const float *restrict input, float *restrict output, int32_t n) {
 
   const ::aie::vector<float, N> two_pi = ::aie::broadcast<float, N>(6.28318530717958648f);
   const ::aie::vector<float, N> inv_two_pi = ::aie::broadcast<float, N>(0.15915494309189535f);
-  const ::aie::vector<float, N> pi_v = ::aie::broadcast<float, N>(3.14159265358979324f);
-  const ::aie::vector<float, N> neg_pi_v = ::aie::broadcast<float, N>(-3.14159265358979324f);
-  const ::aie::vector<float, N> half_pi = ::aie::broadcast<float, N>(1.57079632679489662f);
-  const ::aie::vector<float, N> neg_half_pi = ::aie::broadcast<float, N>(-1.57079632679489662f);
-  const ::aie::vector<float, N> c1 = ::aie::broadcast<float, N>(-0.16666666666666666f);
-  const ::aie::vector<float, N> c2 = ::aie::broadcast<float, N>(0.00833333333333333f);
-  const ::aie::vector<float, N> c3 = ::aie::broadcast<float, N>(-0.00019841269841270f);
-  const ::aie::vector<float, N> one = ::aie::broadcast<float, N>(1.0f);
   const ::aie::vector<float, N> magic = ::aie::broadcast<float, N>(8388608.0f);  // 2^23
+  const ::aie::vector<float, N> one = ::aie::broadcast<float, N>(1.0f);
+  const ::aie::vector<float, N> c1 = ::aie::broadcast<float, N>(-1.66666666666666657e-01f);
+  const ::aie::vector<float, N> c2 = ::aie::broadcast<float, N>(8.33333333333333322e-03f);
+  const ::aie::vector<float, N> c3 = ::aie::broadcast<float, N>(-1.98412698412698413e-04f);
+  const ::aie::vector<float, N> c4 = ::aie::broadcast<float, N>(2.75573192239858907e-06f);
+  const ::aie::vector<float, N> c5 = ::aie::broadcast<float, N>(-2.50521083854417188e-08f);
 
   for (int i = 0; i < chunks; i++) {
     ::aie::vector<float, N> x = ::aie::load_v<N>(input + i * N);
 
-    // stage 1: drop whole periods. NOTE: no int round-trip -- aie::to_float on a vector<int32,16>
-    // fails to instantiate inside aie_api's own elementary.hpp on aie2p (Fix2Float ->
-    // cast_to<uint16>). Instead (q + 2^23) - 2^23 rounds q to nearest in pure f32, valid for
-    // |q| < 2^22 which covers any argument this brick will see. IEEE-exact, so the compiler cannot
-    // fold it away without -ffast-math (which this build does not use).
-    // NOTE: aie::mul returns an accum<accfloat,N>, not a vector. It converts on initialisation of
-    // a vector (as layernorm.cc relies on) but is NOT accepted as an argument to sub/add/store_v, so
-    // every product is materialised into a named vector first.
+    // Fold to [-pi, pi]: r = x - 2*pi*round(x/2*pi). round() is the f32 (q + 2^23) - 2^23 identity,
+    // because aie::to_float on a vector<int32,16> does not instantiate on aie2p (it fails inside
+    // aie_api's own elementary.hpp, Fix2Float -> cast_to<uint16>).
+    //
+    // NO further range reduction and NO aie::select: a 6-term odd Taylor is accurate to 4.5e-4 over
+    // the WHOLE of [-pi, pi] (checked on host over 2e5 points), so the usual reflect-into-[-pi/2,pi/2]
+    // step buys nothing and would only add conditional ops whose mask polarity is one more thing to
+    // get wrong. Branch-free, using only ops proven on this unit by layernorm.cc.
+    //
+    // aie::mul returns accum<accfloat,N>, not vector: it converts on vector initialisation but is
+    // rejected as an argument to add/sub/store_v, so every product is materialised.
     ::aie::vector<float, N> q = ::aie::mul(x, inv_two_pi);
     ::aie::vector<float, N> k = ::aie::sub(::aie::add(q, magic), magic);
     ::aie::vector<float, N> kt = ::aie::mul(k, two_pi);
     ::aie::vector<float, N> r = ::aie::sub(x, kt);
 
-    // stage 2: wrap into [-pi, pi] (safety net; stage 1 already lands in range)
-    r = ::aie::select(r, ::aie::sub(r, two_pi), ::aie::gt(r, pi_v));
-    r = ::aie::select(r, ::aie::add(r, two_pi), ::aie::lt(r, neg_pi_v));
-
-    // stage 3: reflect into [-pi/2, pi/2] using sin(pi - t) = sin(t)
-    r = ::aie::select(r, ::aie::sub(pi_v, r), ::aie::gt(r, half_pi));
-    r = ::aie::select(r, ::aie::sub(neg_pi_v, r), ::aie::lt(r, neg_half_pi));
-
-    // odd Taylor polynomial, Horner in r^2
+    // odd Taylor, Horner in r^2. Every step is a fresh INITIALISATION from the accum, never an
+    // assignment: initialisation is the only accum->vector form layernorm.cc uses, and it is the only
+    // one confirmed correct on this unit. Reassigning a live vector from a mul() produced wrong
+    // results here even though it compiled.
     ::aie::vector<float, N> r2 = ::aie::mul(r, r);
-    ::aie::vector<float, N> t0 = ::aie::mul(c3, r2);
-    ::aie::vector<float, N> p = ::aie::add(t0, c2);
-    ::aie::vector<float, N> t1 = ::aie::mul(p, r2);
-    p = ::aie::add(t1, c1);
-    ::aie::vector<float, N> t2 = ::aie::mul(p, r2);
-    p = ::aie::add(t2, one);
-    ::aie::vector<float, N> res = ::aie::mul(p, r);
+    ::aie::vector<float, N> m5 = ::aie::mul(c5, r2);
+    ::aie::vector<float, N> p4 = ::aie::add(m5, c4);
+    ::aie::vector<float, N> m4 = ::aie::mul(p4, r2);
+    ::aie::vector<float, N> p3 = ::aie::add(m4, c3);
+    ::aie::vector<float, N> m3 = ::aie::mul(p3, r2);
+    ::aie::vector<float, N> p2 = ::aie::add(m3, c2);
+    ::aie::vector<float, N> m2 = ::aie::mul(p2, r2);
+    ::aie::vector<float, N> p1 = ::aie::add(m2, c1);
+    ::aie::vector<float, N> m1 = ::aie::mul(p1, r2);
+    ::aie::vector<float, N> p0 = ::aie::add(m1, one);
+    ::aie::vector<float, N> res = ::aie::mul(p0, r);
     ::aie::store_v(output + i * N, res);
   }
   event1();

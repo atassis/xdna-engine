@@ -28,6 +28,8 @@ HALF_PI = 0.5 * np.pi
 C1 = -1.0 / 6.0
 C2 = 1.0 / 120.0
 C3 = -1.0 / 5040.0
+C4 = 1.0 / 362880.0
+C5 = -1.0 / 39916800.0
 
 
 def bf16(x):
@@ -39,23 +41,15 @@ def bf16(x):
 
 
 def fold(x):
-    """Fold x into [-pi/2, pi/2] preserving sin, using only ops the kernel has.
+    """Fold x into [-pi, pi]: r = x - 2*pi*round(x/2*pi).
 
-    Three stages, each a compare+select in the kernel:
-      1. subtract 2*pi*round(x/2*pi)      -> [-pi, pi]   (the kernel rounds in pure f32; no int
-                                                          round-trip, aie::to_float does not
-                                                          instantiate on aie2p)
-      2. wrap by +/-2*pi                  -> [-pi, pi]   (safety net)
-      3. reflect about +/-pi/2 via sin(pi - t) = sin(t)  -> [-pi/2, pi/2]
+    One stage only. The kernel rounds with the f32 (q + 2^23) - 2^23 identity (no int round-trip --
+    aie::to_float does not instantiate on aie2p) and does NO further reduction: the 6-term polynomial
+    below holds across the whole of [-pi, pi], so there are no conditional ops to get wrong.
     """
     x = np.asarray(x, dtype=np.float32)
-    k = np.rint(x / TWO_PI).astype(np.float32)   # kernel rounds via (q + 2^23) - 2^23
-    r = (x - TWO_PI * k).astype(np.float32)
-    r = np.where(r > PI, r - TWO_PI, r).astype(np.float32)
-    r = np.where(r < -PI, r + TWO_PI, r).astype(np.float32)
-    r = np.where(r > HALF_PI, PI - r, r).astype(np.float32)
-    r = np.where(r < -HALF_PI, -PI - r, r).astype(np.float32)
-    return r
+    k = np.rint(x / TWO_PI).astype(np.float32)
+    return (x - TWO_PI * k).astype(np.float32)
 
 
 def sin_ref(x):
@@ -64,16 +58,12 @@ def sin_ref(x):
 
 
 def sin_poly_emulated(x):
-    """Bit-faithful emulation of the kernel: f32 fold, then an f32 Horner polynomial.
-
-    The kernel stays f32 end to end (4 mults + 3 adds is well short of the per-tile budget that hangs
-    an all-f32 SiLU), so this emulation must be f32 too -- narrowing here would make the golden
-    disagree with the thing it is supposed to predict.
-    """
-    r = fold(x).astype(np.float32)
+    """Bit-faithful emulation of the kernel: f32 fold, then the f32 6-term Horner polynomial."""
+    r = fold(x)
     r2 = (r * r).astype(np.float32)
-    p = (np.float32(C3) * r2 + np.float32(C2)).astype(np.float32)
-    p = (p * r2 + np.float32(C1)).astype(np.float32)
+    p = (np.float32(C5) * r2 + np.float32(C4)).astype(np.float32)
+    for c in (C3, C2, C1):
+        p = (p * r2 + np.float32(c)).astype(np.float32)
     p = (p * r2 + np.float32(1.0)).astype(np.float32)
     return (p * r).astype(np.float32)
 
@@ -99,5 +89,5 @@ if __name__ == "__main__":
     # The fold must actually land in [-pi/2, pi/2]; a fold bug is the likeliest failure and would
     # otherwise show up only as a mysterious device mismatch at large |x|.
     r = fold(x)
-    assert np.all(np.abs(r) <= HALF_PI + 1e-5), f"fold escaped range: max |r| = {np.max(np.abs(r))}"
+    assert np.all(np.abs(r) <= PI + 1e-5), f"fold escaped range: max |r| = {np.max(np.abs(r))}"
     print("fold range OK, max |r| =", float(np.max(np.abs(r))))

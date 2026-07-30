@@ -31,11 +31,11 @@ res = bricklib.verify_oneshot(
     name="sin",
     brick_cc=BRICK / "sin.cc",
     shim_body=(
-        'extern "C" void sin_verify(float *x, float *out) {\n'
+        'extern "C" void sin_verify_v3(float *x, float *out) {\n'
         f"  sin_f32(x, out, {N});\n"
         "}\n"
     ),
-    symbol="sin_verify",
+    symbol="sin_verify_v3",
     inputs=[(x, np.float32)],
     out_numel=N,
     out_shape=(N,),
