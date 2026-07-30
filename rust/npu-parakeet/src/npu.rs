@@ -16,6 +16,7 @@ use std::rc::Rc;
 use std::time::Instant;
 
 use ndarray::prelude::*;
+use npu_asr::kernel_registry;
 use npu_xrt::{Bo, Device, Kernel, FLAG_CACHEABLE, FLAG_HOST_ONLY};
 
 const PAD_M: usize = 512;
@@ -462,6 +463,29 @@ const FC1_PANEL_BF16_TILE: &str = "32x32x128";
 // Variant B fc2 = deinterleave -> 4x K=KRES modal (same tile as host) on device sub-buffers +
 // host-accumulate = bit-identical to the host K-split (WER-neutral), A device-side.
 
+/// Resolve one kernel artifact pair by `stem` under `dir`, routed through the shared
+/// `kernel_registry` naming convention (`engine-op-manifest-and-dynamic-xclbin`) instead of a
+/// hand-built `format!("final_{stem}.xclbin")` literal. This fn does not decide "built or not" --
+/// callers that need graceful degradation on a missing artifact keep their own `.exists()` gate
+/// before calling it (unchanged from before this routing pass); this only replaces how the PATH
+/// is built for a stem already known to be present (or about to be loaded unconditionally, same
+/// as the pre-existing `dev.load_kernel(...).unwrap_or_else(|e| panic!(...))` callers already do
+/// on a missing file). When `NPU_KERNEL_MANIFEST_VERIFY=1`, the artifact bytes are additionally
+/// re-hashed against `dir/kernel_manifest.json` (`kernel_registry::resolve_checked`) and a
+/// MISMATCH panics here, loud, instead of loading a silently-wrong xclbin -- unlike "missing"
+/// (still handled by each call site's own gate/panic), "wrong content at the expected path" is
+/// exactly the silent-wrong-load bug class the manifest exists to catch (see `kernel_registry`
+/// module docs: this project's xclbin containers carry no independent op-identity signal to
+/// check tokens against otherwise). Mirrors `npu_asr::conv_npu::ConvNpu::band()`'s existing wiring.
+fn resolve_verified(dir: &Path, stem: &str) -> kernel_registry::KernelArtifacts {
+    if std::env::var("NPU_KERNEL_MANIFEST_VERIFY").is_ok() {
+        kernel_registry::resolve_checked(dir, stem)
+            .unwrap_or_else(|e| panic!("kernel manifest check failed for stem={stem}: {e}"))
+    } else {
+        kernel_registry::resolve(dir, stem)
+    }
+}
+
 impl NpuMatmul {
     pub fn open(root: &Path) -> Self {
         let dev = Device::open(0).expect("open NPU (single-tenant: stop npu-asr/voxd)");
@@ -473,30 +497,47 @@ impl NpuMatmul {
         // dispatch), so ANY surviving N works as the resident. Prefer the largest N present;
         // fall back to a smaller surviving build (the N=4096/2048 twins were deleted by the
         // an earlier occupancy run; N=1024 survives). Env NPU_RESIDENT_XCLBIN overrides.
-        let xclbin = if let Ok(p) = std::env::var("NPU_RESIDENT_XCLBIN") {
-            PathBuf::from(p)
+        let (xclbin, modal) = if let Ok(p) = std::env::var("NPU_RESIDENT_XCLBIN") {
+            let path = PathBuf::from(p);
+            // Arbitrary override path (a manual/debug knob): no guaranteed `final_{stem}.xclbin`
+            // convention to recover a stem from, so this branch keeps the raw filename check it
+            // always used rather than force-fitting kernel_registry's stem grammar onto it.
+            let modal = path.file_name().and_then(|s| s.to_str()).is_some_and(|s| s.contains("modal"));
+            (path, modal)
         } else {
             // A1 (ff_act on-chip): prefer the MODAL resident xclbin (fused f32-out epilogue; the
             // per-inst-stream RTP selects silu@N=4096 / identity elsewhere -> the FFN SiLU runs on
             // chip with zero extra hw-context switches). Fall back to the plain matmul xclbin if the
             // modal build is absent (then `modal=false` and the host keeps applying silu).
-            let modal = base.join(format!("final_512x1024x4096_{tile}_8c_modalsilu.xclbin"));
-            if modal.exists() {
-                modal
+            let modal_stem = format!("512x1024x4096_{tile}_8c_modalsilu");
+            let stem = if kernel_registry::xclbin_path(&base, &modal_stem).exists() {
+                modal_stem
             } else {
                 let mut chosen = None;
                 for n in ["4096", "2048", "1024"] {
-                    let cand = base.join(format!("final_512x1024x{n}_{tile}_8c.xclbin"));
-                    if cand.exists() {
-                        chosen = Some(cand);
+                    let cand_stem = format!("512x1024x{n}_{tile}_8c");
+                    if kernel_registry::xclbin_path(&base, &cand_stem).exists() {
+                        chosen = Some(cand_stem);
                         break;
                     }
                 }
-                chosen.unwrap_or_else(|| base.join(format!("final_512x1024x4096_{tile}_8c.xclbin")))
-            }
+                chosen.unwrap_or_else(|| format!("512x1024x4096_{tile}_8c"))
+            };
+            // Opt-in manifest verification (engine-op-manifest-and-dynamic-xclbin): this xclbin is
+            // REQUIRED (no host fallback exists for a missing resident matmul kernel -- a missing
+            // file already panics below at `load_kernel`), so a content mismatch under
+            // NPU_KERNEL_MANIFEST_VERIFY=1 panics too rather than degrading, mirroring
+            // conv_npu.rs::band()'s existing wiring (see `resolve_verified`).
+            let path = resolve_verified(&base, &stem).xclbin;
+            // The modal resident bakes the silu/identity epilogue; the plain one does not (host
+            // silu). Derived from the stem's parsed tokens (kernel_registry::parse_stem_tokens),
+            // not a raw filename substring match -- the stem is what actually carries this; the
+            // filename was always just `final_{stem}.xclbin` (engine-op-manifest-and-dynamic-xclbin
+            // item 4).
+            let modal =
+                kernel_registry::parse_stem_tokens(&stem).variant.is_some_and(|v| v.contains("modal"));
+            (path, modal)
         };
-        // The modal resident bakes the silu/identity epilogue; the plain one does not (host silu).
-        let modal = xclbin.file_name().and_then(|s| s.to_str()).is_some_and(|s| s.contains("modal"));
         if !npu_xrt::quiet() {
             eprintln!("[npu] resident xclbin = {} (modal={modal})", xclbin.display());
         }
@@ -988,11 +1029,16 @@ impl NpuMatmul {
         // path (no panic) -- so the resident seam can be the DEFAULT without breaking builds/branches
         // that haven't built these kernels.
         let seam = ["ctxln", "affcast"].iter().all(|n| {
-            self.ln_dir.join(format!("final_{n}_{PAD_M}x{KRES}.xclbin")).exists()
-                && self.ln_dir.join(format!("insts_{n}_{PAD_M}x{KRES}.txt")).exists()
+            let stem = format!("{n}_{PAD_M}x{KRES}");
+            kernel_registry::xclbin_path(&self.ln_dir, &stem).exists()
+                && kernel_registry::insts_path(&self.ln_dir, &stem).exists()
         });
-        // full FFN (Variant B) also needs the deinterleave xclbin
-        let fc2ok = self.ln_dir.join(format!("final_deint_{PAD_M}x{DFF}.xclbin")).exists();
+        // full FFN (Variant B) also needs the deinterleave xclbin. Pre-existing asymmetry,
+        // preserved as-is: this checks only the xclbin, not its insts counterpart (unlike every
+        // other presence gate in this function) -- a behavior-preserving routing pass is not the
+        // place to also change what "present" means here.
+        let fc2ok =
+            kernel_registry::xclbin_path(&self.ln_dir, &format!("deint_{PAD_M}x{DFF}")).exists();
         let present = seam && fc2ok;
         let result = if present {
             Some(self.load_resident_ln())
@@ -1006,13 +1052,12 @@ impl NpuMatmul {
 
     fn load_resident_ln(&self) -> Rc<ResidentLn> {
         let load = |name: &str| -> (Rc<Kernel>, Bo, usize) {
-            let xcl = self.ln_dir.join(format!("final_{name}_{PAD_M}x{KRES}.xclbin"));
-            let ins = self.ln_dir.join(format!("insts_{name}_{PAD_M}x{KRES}.txt"));
+            let art = resolve_verified(&self.ln_dir, &format!("{name}_{PAD_M}x{KRES}"));
             let kern = self
                 .dev
-                .load_kernel(xcl.to_str().unwrap(), None)
-                .unwrap_or_else(|e| panic!("load resident-ln {} : {e:?}\n  prebuild: build ctxln+cast at {PAD_M}x{KRES} and copy to artifacts/parakeet/ln", xcl.display()));
-            let ib = std::fs::read(&ins).unwrap_or_else(|e| panic!("read {}: {e}", ins.display()));
+                .load_kernel(art.xclbin.to_str().unwrap(), None)
+                .unwrap_or_else(|e| panic!("load resident-ln {} : {e:?}\n  prebuild: build ctxln+cast at {PAD_M}x{KRES} and copy to artifacts/parakeet/ln", art.xclbin.display()));
+            let ib = std::fs::read(&art.insts).unwrap_or_else(|e| panic!("read {}: {e}", art.insts.display()));
             let n = ib.len() / 4;
             let bo = self.dev.alloc_bo(&kern, ib.len(), FLAG_CACHEABLE, kern.group_id(1).unwrap()).unwrap();
             bo.write_bytes(&ib).unwrap();
@@ -1021,27 +1066,28 @@ impl NpuMatmul {
         };
         let (ln_kern, ln_instr, ln_n) = load("ctxln");
         let (ac_kern, ac_instr, ac_n) = load("affcast");
-        // cast @ DFF + the K=DFF fc2 matmul (explicit filenames, not the {name}_PADxKRES pattern)
-        let load_path = |xcl: PathBuf, ins: PathBuf| -> (Rc<Kernel>, Bo, usize) {
-            let kern = self.dev.load_kernel(xcl.to_str().unwrap(), None).unwrap_or_else(|e| panic!("load {} : {e:?}", xcl.display()));
-            let ib = std::fs::read(&ins).unwrap_or_else(|e| panic!("read {}: {e}", ins.display()));
+        // cast @ DFF + the K=DFF fc2 matmul (explicit stems, not the {name}_PADxKRES pattern)
+        let load_path = |dir: &Path, stem: &str| -> (Rc<Kernel>, Bo, usize) {
+            let art = resolve_verified(dir, stem);
+            let kern = self.dev.load_kernel(art.xclbin.to_str().unwrap(), None).unwrap_or_else(|e| panic!("load {} : {e:?}", art.xclbin.display()));
+            let ib = std::fs::read(&art.insts).unwrap_or_else(|e| panic!("read {}: {e}", art.insts.display()));
             let n = ib.len() / 4;
             let bo = self.dev.alloc_bo(&kern, ib.len(), FLAG_CACHEABLE, kern.group_id(1).unwrap()).unwrap();
             bo.write_bytes(&ib).unwrap();
             bo.sync_to_device().unwrap();
             (kern, bo, n)
         };
-        let (deint_kern, deint_instr, deint_n) = load_path(
-            self.ln_dir.join(format!("final_deint_{PAD_M}x{DFF}.xclbin")),
-            self.ln_dir.join(format!("insts_deint_{PAD_M}x{DFF}.txt")));
+        let (deint_kern, deint_instr, deint_n) =
+            load_path(&self.ln_dir, &format!("deint_{PAD_M}x{DFF}"));
         // FUSED ctxLN->affine_cast, OPTIONAL like glu. Default ON when built; PARAKEET_LN_FUSED=0
         // forces the two-dispatch chain back (two-way, not a one-way flip).
         let lnaffcast = {
             let want = std::env::var("PARAKEET_LN_FUSED").map(|v| v != "0").unwrap_or(true);
-            let xcl = self.ln_dir.join(format!("final_lnaffcast_{PAD_M}x{KRES}.xclbin"));
-            let ins = self.ln_dir.join(format!("insts_lnaffcast_{PAD_M}x{KRES}.txt"));
-            if want && xcl.exists() && ins.exists() {
-                let (kern, instr, n) = load_path(xcl, ins);
+            let stem = format!("lnaffcast_{PAD_M}x{KRES}");
+            let present = kernel_registry::xclbin_path(&self.ln_dir, &stem).exists()
+                && kernel_registry::insts_path(&self.ln_dir, &stem).exists();
+            if want && present {
+                let (kern, instr, n) = load_path(&self.ln_dir, &stem);
                 let gg = |i| kern.group_id(i).unwrap();
                 Some(LnFused {
                     dummy_tmp: self.dev.alloc_bo(&kern, 8, FLAG_HOST_ONLY, gg(6)).unwrap(),
@@ -1058,10 +1104,11 @@ impl NpuMatmul {
         // conv-module GLU (step 2), OPTIONAL: load only if the glu xclbin was built. A/g3 input is fed
         // from the modal stream's bo_c (pw1 output); bo_out (g4) is the [PAD_M,KRES] f32 GLU result.
         let glu = {
-            let xcl = self.ln_dir.join(format!("final_glu_{PAD_M}x{KRES}.xclbin"));
-            let ins = self.ln_dir.join(format!("insts_glu_{PAD_M}x{KRES}.txt"));
-            if xcl.exists() && ins.exists() {
-                let (kern, instr, n) = load_path(xcl, ins);
+            let stem = format!("glu_{PAD_M}x{KRES}");
+            let present = kernel_registry::xclbin_path(&self.ln_dir, &stem).exists()
+                && kernel_registry::insts_path(&self.ln_dir, &stem).exists();
+            if present {
+                let (kern, instr, n) = load_path(&self.ln_dir, &stem);
                 let gg = |i| kern.group_id(i).unwrap();
                 Some(ConvGlu {
                     bo_out: self.dev.alloc_bo(&kern, PAD_M * KRES * 4, FLAG_HOST_ONLY, gg(4)).unwrap(),
@@ -1078,10 +1125,11 @@ impl NpuMatmul {
         // resident-FFN fc2 on-device accumulate (out=a+b f32), OPTIONAL: load only if built. acc0/acc1
         // ping-pong the running sum; `zero` (zeroed once) seeds the first partial (acc = partial0 + 0).
         let acc_add = {
-            let xcl = self.ln_dir.join(format!("final_accadd_{PAD_M}x{KRES}.xclbin"));
-            let ins = self.ln_dir.join(format!("insts_accadd_{PAD_M}x{KRES}.txt"));
-            if xcl.exists() && ins.exists() {
-                let (kern, instr, n) = load_path(xcl, ins);
+            let stem = format!("accadd_{PAD_M}x{KRES}");
+            let present = kernel_registry::xclbin_path(&self.ln_dir, &stem).exists()
+                && kernel_registry::insts_path(&self.ln_dir, &stem).exists();
+            if present {
+                let (kern, instr, n) = load_path(&self.ln_dir, &stem);
                 let gaa = |i| kern.group_id(i).unwrap();
                 let zero = self.dev.alloc_bo(&kern, PAD_M * KRES * 4, FLAG_HOST_ONLY, gaa(4)).unwrap();
                 zero.write_bytes(&vec![0u8; PAD_M * KRES * 4]).unwrap();
@@ -1101,10 +1149,11 @@ impl NpuMatmul {
         };
         // scaled residual-add s050 (out = a + 0.5*b, f32), OPTIONAL: the Macaron FFN residual on-chip.
         let resadd_s050 = {
-            let xcl = self.ln_dir.join(format!("final_resadd_{PAD_M}x{KRES}_s050.xclbin"));
-            let ins = self.ln_dir.join(format!("insts_resadd_{PAD_M}x{KRES}_s050.txt"));
-            if xcl.exists() && ins.exists() {
-                let (kern, instr, n) = load_path(xcl, ins);
+            let stem = format!("resadd_{PAD_M}x{KRES}_s050");
+            let present = kernel_registry::xclbin_path(&self.ln_dir, &stem).exists()
+                && kernel_registry::insts_path(&self.ln_dir, &stem).exists();
+            if present {
+                let (kern, instr, n) = load_path(&self.ln_dir, &stem);
                 let gr = |i| kern.group_id(i).unwrap();
                 Some(ResidualAdd {
                     scale: 0.5,
@@ -1120,10 +1169,11 @@ impl NpuMatmul {
         };
         // scaled residual-add s100 (out=a+1.0*b f32), OPTIONAL: the full MHSA/conv residual x+sublayer.
         let resadd_s100 = {
-            let xcl = self.ln_dir.join(format!("final_resadd_{PAD_M}x{KRES}_s100.xclbin"));
-            let ins = self.ln_dir.join(format!("insts_resadd_{PAD_M}x{KRES}_s100.txt"));
-            if xcl.exists() && ins.exists() {
-                let (kern, instr, n) = load_path(xcl, ins);
+            let stem = format!("resadd_{PAD_M}x{KRES}_s100");
+            let present = kernel_registry::xclbin_path(&self.ln_dir, &stem).exists()
+                && kernel_registry::insts_path(&self.ln_dir, &stem).exists();
+            if present {
+                let (kern, instr, n) = load_path(&self.ln_dir, &stem);
                 let gr = |i| kern.group_id(i).unwrap();
                 Some(ResidualAdd {
                     scale: 1.0,
@@ -1141,13 +1191,15 @@ impl NpuMatmul {
         // deint + 4x K=1024 chunk GEMMs + 4x acc_add into cast + 1 K=4096 modal. Both xclbins are
         // built+staged by build_parakeet_modal_kernels.sh (cast_512x4096, 512x4096x1024 modalid).
         let fc2_k4096 = {
-            let cast_x = self.ln_dir.join(format!("final_cast_{PAD_M}x{DFF}.xclbin"));
-            let cast_i = self.ln_dir.join(format!("insts_cast_{PAD_M}x{DFF}.txt"));
-            let mm_x = self.ln_dir.join(format!("final_{PAD_M}x{DFF}x{KRES}_{}_8c_modalid.xclbin", self.tile));
-            let mm_i = self.ln_dir.join(format!("insts_{PAD_M}x{DFF}x{KRES}_{}_8c_modalid.txt", self.tile));
-            if cast_x.exists() && cast_i.exists() && mm_x.exists() && mm_i.exists() {
-                let (cast_kern, cast_instr, cast_n) = load_path(cast_x, cast_i);
-                let (mm_kern, mm_instr, mm_n) = load_path(mm_x, mm_i);
+            let cast_stem = format!("cast_{PAD_M}x{DFF}");
+            let mm_stem = format!("{PAD_M}x{DFF}x{KRES}_{}_8c_modalid", self.tile);
+            let present = kernel_registry::xclbin_path(&self.ln_dir, &cast_stem).exists()
+                && kernel_registry::insts_path(&self.ln_dir, &cast_stem).exists()
+                && kernel_registry::xclbin_path(&self.ln_dir, &mm_stem).exists()
+                && kernel_registry::insts_path(&self.ln_dir, &mm_stem).exists();
+            if present {
+                let (cast_kern, cast_instr, cast_n) = load_path(&self.ln_dir, &cast_stem);
+                let (mm_kern, mm_instr, mm_n) = load_path(&self.ln_dir, &mm_stem);
                 let gc = |i| cast_kern.group_id(i).unwrap();
                 let gm = |i| mm_kern.group_id(i).unwrap();
                 Some(Fc2K4096 {
@@ -1175,10 +1227,10 @@ impl NpuMatmul {
             // which is the one dispatch whose SiLU branch the variant actually changes.
             let sfx = std::env::var("PARAKEET_MODAL_EPI_SUFFIX").unwrap_or_default();
             let tag = format!("{PAD_M}x{KRES}x{DFF}_{FC1_PANEL_BF16_TILE}_8c_modalsilubf16outpanel{KRES}{sfx}");
-            let xcl = self.ln_dir.join(format!("final_{tag}.xclbin"));
-            let ins = self.ln_dir.join(format!("insts_{tag}.txt"));
-            if xcl.exists() && ins.exists() {
-                let (kern, instr, n) = load_path(xcl, ins);
+            let present = kernel_registry::xclbin_path(&self.ln_dir, &tag).exists()
+                && kernel_registry::insts_path(&self.ln_dir, &tag).exists();
+            if present {
+                let (kern, instr, n) = load_path(&self.ln_dir, &tag);
                 let gg = |i| kern.group_id(i).unwrap();
                 Some(Fc1PanelBf16 {
                     bo_out: self.dev.alloc_bo(&kern, (DFF / KRES) * PAD_M * KRES * 2, FLAG_HOST_ONLY, gg(5)).unwrap(),
@@ -1200,10 +1252,11 @@ impl NpuMatmul {
         };
         // conv-module depthwise conv1d (step 3), OPTIONAL. 3-buffer ABI in[C,T]/w[C,16]/out[C,T] bf16.
         let dwconv = {
-            let xcl = self.ln_dir.join(format!("final_dwconv_{DW_C}x{DW_T}.xclbin"));
-            let ins = self.ln_dir.join(format!("insts_dwconv_{DW_C}x{DW_T}.txt"));
-            if xcl.exists() && ins.exists() {
-                let (kern, instr, n) = load_path(xcl, ins);
+            let stem = format!("dwconv_{DW_C}x{DW_T}");
+            let present = kernel_registry::xclbin_path(&self.ln_dir, &stem).exists()
+                && kernel_registry::insts_path(&self.ln_dir, &stem).exists();
+            if present {
+                let (kern, instr, n) = load_path(&self.ln_dir, &stem);
                 let gw = |i| kern.group_id(i).unwrap();
                 Some(ConvDw {
                     bo_in: self.dev.alloc_bo(&kern, DW_C * DW_T * 2, FLAG_HOST_ONLY, gw(3)).unwrap(),
@@ -1220,10 +1273,11 @@ impl NpuMatmul {
         };
         // conv-module post-dwconv SiLU (step 4), OPTIONAL. 2-buffer ABI in[C,T]/out[C,T] f32.
         let silu = {
-            let xcl = self.ln_dir.join(format!("final_silu_{DW_C}x{DW_T}.xclbin"));
-            let ins = self.ln_dir.join(format!("insts_silu_{DW_C}x{DW_T}.txt"));
-            if xcl.exists() && ins.exists() {
-                let (kern, instr, n) = load_path(xcl, ins);
+            let stem = format!("silu_{DW_C}x{DW_T}");
+            let present = kernel_registry::xclbin_path(&self.ln_dir, &stem).exists()
+                && kernel_registry::insts_path(&self.ln_dir, &stem).exists();
+            if present {
+                let (kern, instr, n) = load_path(&self.ln_dir, &stem);
                 let gs = |i| kern.group_id(i).unwrap();
                 Some(ConvSilu {
                     bo_in: self.dev.alloc_bo(&kern, DW_C * DW_T * 4, FLAG_HOST_ONLY, gs(3)).unwrap(),
@@ -1241,10 +1295,11 @@ impl NpuMatmul {
         // FUSED dwconv->SiLU (step 3+4, one xclbin), OPTIONAL. 3-buffer ABI in[C,T] bf16 / w[C,16] bf16 /
         // out[C,T] f32 (== ConvDw ABI, f32 out). Present -> replaces the separate dwconv+silu dispatches.
         let dwconv_silu = {
-            let xcl = self.ln_dir.join(format!("final_dwconv_silu_{DW_C}x{DW_T}.xclbin"));
-            let ins = self.ln_dir.join(format!("insts_dwconv_silu_{DW_C}x{DW_T}.txt"));
-            if xcl.exists() && ins.exists() {
-                let (kern, instr, n) = load_path(xcl, ins);
+            let stem = format!("dwconv_silu_{DW_C}x{DW_T}");
+            let present = kernel_registry::xclbin_path(&self.ln_dir, &stem).exists()
+                && kernel_registry::insts_path(&self.ln_dir, &stem).exists();
+            if present {
+                let (kern, instr, n) = load_path(&self.ln_dir, &stem);
                 let gw = |i| kern.group_id(i).unwrap();
                 Some(ConvDwSilu {
                     bo_in: self.dev.alloc_bo(&kern, DW_C * DW_T * 2, FLAG_HOST_ONLY, gw(3)).unwrap(),
@@ -1263,10 +1318,11 @@ impl NpuMatmul {
         // host-padded), w [K+1,D] bf16 tap-major (g4), out [T,D] f32 (g5). Present -> conv path prefers
         // it (dissolves both host transposes); absent -> channel-major dwconv_silu / separate bricks.
         let dwconv_silu_t = {
-            let xcl = self.ln_dir.join(format!("final_dwconv_silu_t_{DW_C}x{DW_T}.xclbin"));
-            let ins = self.ln_dir.join(format!("insts_dwconv_silu_t_{DW_C}x{DW_T}.txt"));
-            if xcl.exists() && ins.exists() {
-                let (kern, instr, n) = load_path(xcl, ins);
+            let stem = format!("dwconv_silu_t_{DW_C}x{DW_T}");
+            let present = kernel_registry::xclbin_path(&self.ln_dir, &stem).exists()
+                && kernel_registry::insts_path(&self.ln_dir, &stem).exists();
+            if present {
+                let (kern, instr, n) = load_path(&self.ln_dir, &stem);
                 let gw = |i| kern.group_id(i).unwrap();
                 Some(ConvDwSiluT {
                     bo_in: self.dev.alloc_bo(&kern, DW_TPAD * DW_C * 2, FLAG_HOST_ONLY, gw(3)).unwrap(),
@@ -2439,9 +2495,14 @@ impl NpuMatmul {
             // every per-N stream carry the suffix and the two must not be mixed.
             let mode = act.mode_tag();
             let sfx = std::env::var("PARAKEET_MODAL_EPI_SUFFIX").unwrap_or_default();
-            self.base.join(format!("insts_512x1024x{n}_{}_8c_{mode}{sfx}.txt", self.tile))
+            // insts-only stem (engine-op-manifest-and-dynamic-xclbin): most (n, mode) combos here
+            // have NO co-resident `final_*.xclbin` at this same stem -- they all dispatch on the
+            // ONE resident kernel loaded in `open()`, only the instruction stream differs per call
+            // -- so this stays `insts_path` only, never `resolve`/`resolve_checked` (those assume
+            // a paired xclbin at the same stem, which does not exist for most of these).
+            kernel_registry::insts_path(&self.base, &format!("512x1024x{n}_{}_8c_{mode}{sfx}", self.tile))
         } else {
-            self.base.join(format!("insts_512x1024x{n}_{}_8c.txt", self.tile))
+            kernel_registry::insts_path(&self.base, &format!("512x1024x{n}_{}_8c", self.tile))
         };
         let bytes = std::fs::read(&insts).unwrap_or_else(|e| panic!("read {}: {e}", insts.display()));
         let n_instr = bytes.len() / 4;
@@ -2768,4 +2829,31 @@ fn push_pad_rows(dst: &mut Vec<f32>, m: &Array2<f32>, start: usize, take: usize,
         dst.extend(m.row(start + r).iter().copied());
     }
     dst.extend(std::iter::repeat(0.0f32).take((n_total - take) * dk));
+}
+
+#[cfg(test)]
+mod resolve_verified_tests {
+    use super::*;
+
+    // Deterministic (no filesystem, no device): with NPU_KERNEL_MANIFEST_VERIFY unset -- the
+    // default for every existing build/CI invocation -- `resolve_verified` must be an exact
+    // passthrough to `kernel_registry::resolve`, not just "close to it". This is the guarantee the
+    // whole routing pass rests on: every call site converted in this pass keeps its pre-existing
+    // default-path behavior byte-for-byte, only gaining opt-in verification on top.
+    #[test]
+    fn default_is_unchecked_passthrough_matching_kernel_registry_resolve() {
+        std::env::remove_var("NPU_KERNEL_MANIFEST_VERIFY");
+        let dir = Path::new("/does/not/need/to/exist");
+        for stem in [
+            "512x1024x4096_64x32x128_8c_modalsilu",
+            "ctxln_512x1024",
+            "resadd_512x1024_s050",
+            "dwconv_silu_t_1024x448",
+        ] {
+            let got = resolve_verified(dir, stem);
+            let want = kernel_registry::resolve(dir, stem);
+            assert_eq!(got.xclbin, want.xclbin, "stem={stem}");
+            assert_eq!(got.insts, want.insts, "stem={stem}");
+        }
+    }
 }
