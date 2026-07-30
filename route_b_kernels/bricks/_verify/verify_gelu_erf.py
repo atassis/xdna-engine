@@ -21,7 +21,10 @@ import bricklib
 HERE = Path(__file__).parent
 BRICK = (HERE.parent / "gelu-erf").resolve()
 
-M, COLS = 64, 64
+# COLS=16 is REQUIRED, not a tuning choice: the kernel now takes exactly one 16-wide
+# vector per call (no element count, no internal loop), because a loop of ANY trip count
+# miscompiles for this body. M carries the volume instead. See gelu_erf_core's header.
+M, COLS = 256, 16
 GATE = 3e-2
 
 spec = importlib.util.spec_from_file_location("gelu_erf_golden", BRICK / "golden.py")
@@ -51,7 +54,7 @@ res = bricklib.verify_rowwise(
     shim_body=(
         f"// cachebust {_cb}\n"
         f'extern "C" void gelu_erf_verify(float *x, float *out) '
-        f'{{ gelu_erf_f32(x, out, {COLS}); }}\n'
+        f'{{ gelu_erf_f32(x, out); }}\n'
     ),
     symbol="gelu_erf_verify",
     m=M, in_cols=COLS, out_cols=COLS,

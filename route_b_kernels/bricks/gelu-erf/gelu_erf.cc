@@ -170,14 +170,27 @@ static inline ::aie::vector<float, N> gelu_erf_v(::aie::vector<float, N> x) {
 // Symptom to bisect toward: large POSITIVE x returns exactly 0.0 (x=+11.9882 -> +0.00000e+00)
 // while x=+1 is right to six digits. Note 50% of outputs being exactly 0 is NOT a clue -- the test
 // pool is ~50% negative, where GELU legitimately underflows to 0. That coincidence cost time.
+// ONE N-wide chunk per call, NO loop and NO runtime bound. Both are required, measured 2026-07-31.
+// Volume comes from the harness's tile loop (bricklib streams n_tiles of N elements), so this costs
+// nothing -- the iteration just moves from inside the kernel to the objectFIFO driver, which is
+// where the resident-stream contract wants it anyway.
+//
+// The grid that forces this (probe_gelu_degree_chunks.py, this exact body, compile-time bounds):
+//
+//   Horner degree   live vecs    1 chunk        2 chunks
+//         1             2        4.796e-09      4.493e-09   ok
+//         2             3        3.458e-08      7.077e-01   FAIL
+//         3             4        4.467e-08      8.651e-01   FAIL
+//         5             6        1.151e-07      1.007e+01   FAIL
+//         9            10        1.275e-07      6.048e+03   FAIL
+//
+// Every degree is correct at one chunk; only degree 1 survives two, and the error grows with both
+// degree and chunk count. A runtime loop bound fails too, at ANY chunk count, and NOT because of
+// the integer division -- passing the trip count in directly fails identically.
 template <int N>
-void gelu_erf_core(const float *restrict input, float *restrict output, int32_t n) {
+void gelu_erf_core(const float *restrict input, float *restrict output) {
   event0();
-  const int chunks = n / N;
-  #pragma clang loop unroll(disable)
-  for (int i = 0; i < chunks; i++) {
-    ::aie::store_v(output + i * N, gelu_erf_v<N>(::aie::load_v<N>(input + i * N)));
-  }
+  ::aie::store_v(output, gelu_erf_v<N>(::aie::load_v<N>(input)));
   event1();
 }
 
@@ -185,13 +198,14 @@ void gelu_erf_core(const float *restrict input, float *restrict output, int32_t 
 
 extern "C" {
 
-// GELU over `n` f32 elements (n must be a multiple of the vector width).
+// GELU over EXACTLY 16 f32 elements -- one vector, no element count, no loop.
 //
-// KNOWN RED ON DEVICE at n=64 (4 chunks/call): rel-L2 9.538e+00. Green at n=16 (1 chunk/call) at
-// 1.515e-07 with identical maths. See gelu_erf_core's header for the four causes already excluded
-// on device -- do NOT re-tune the polynomial, that is not what is wrong.
-void gelu_erf_f32(float *input, float *output, int32_t n) {
-  route_b_bricks::gelu_erf_core<16>(input, output, n);
+// The caller supplies volume by invoking this once per streamed tile; bricklib's rowwise/streamed
+// rails already do exactly that. Taking an `n` and looping internally is what made every earlier
+// version of this brick fail, at any n, for reasons that have nothing to do with the maths -- see
+// gelu_erf_core's header for the measured grid and the six hypotheses excluded on device.
+void gelu_erf_f32(float *input, float *output) {
+  route_b_bricks::gelu_erf_core<16>(input, output);
 }
 
 } // extern "C"
