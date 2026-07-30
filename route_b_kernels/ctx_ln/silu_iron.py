@@ -20,6 +20,21 @@ from aie.iron import Kernel, ObjectFifo, Program, Runtime, Worker
 from aie.iron.device import NPU1, NPU2
 from aie.helpers.taplib import TensorTiler2D
 from aie.iron.controlflow import range_
+from aie.utils.trace.events import CoreEvent
+
+# See residual_add_iron.py for the full rationale (verbatim identical list): names the
+# ~65-68% of traced span the 8 hardware-default counters left uncharacterized, same span,
+# same brick family, measured via a device trace histogram across resadd/glu.
+BAND_NAMING_CORETILE_EVENTS = [
+    CoreEvent.INSTR_VECTOR,
+    CoreEvent.MEMORY_STALL,
+    CoreEvent.STREAM_STALL,
+    CoreEvent.LOCK_STALL,
+    CoreEvent.CASCADE_STALL,
+    CoreEvent.INSTR_LOAD,
+    CoreEvent.INSTR_STORE,
+    CoreEvent.ACTIVE,
+]
 
 
 def silu(dev, rows, cols, trace_size, n_cores=8):
@@ -86,7 +101,10 @@ def silu(dev, rows, cols, trace_size, n_cores=8):
         # Trace ONE worker; tracing all n_cores collides on the shim's south ports once n_cores
         # saturates them. Build the traced variant with -n/--cores reduced (cores=1 is
         # representative of the per-row MATH, not production wall time).
-        prog.enable_trace(trace_size=trace_size, workers=[workers[0]], egress_shim_col=1)
+        prog.enable_trace(
+            trace_size=trace_size, workers=[workers[0]], egress_shim_col=1,
+            coretile_events=BAND_NAMING_CORETILE_EVENTS,
+        )
     return prog.resolve_program()
 
 

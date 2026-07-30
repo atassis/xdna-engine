@@ -19,6 +19,36 @@ from aie.iron import Kernel, ObjectFifo, Program, Runtime, Worker
 from aie.iron.device import NPU1, NPU2
 from aie.helpers.taplib import TensorTiler2D
 from aie.iron.controlflow import range_
+from aie.utils.trace.events import CoreEvent
+
+# Explicit coretile_events override (2026-07-30): names the ~65-68% of traced span the 8
+# HARDWARE-DEFAULT counters left uncharacterized on this same brick, same span, measured via
+# a device trace histogram across resadd/glu. Keeps INSTR_VECTOR/
+# MEMORY_STALL/STREAM_STALL/LOCK_STALL for direct comparability to that run; swaps out
+# INSTR_EVENT_0/1 (function-entry/exit markers, already ~0.02% each) and PORT_RUNNING_0/1
+# (DMA port activity, already characterized, MOVEMENT not CORE side) for CASCADE_STALL
+# (completes the 4-way stall family -- GROUP_STALL siblings are MEMORY/STREAM/CASCADE/LOCK),
+# INSTR_LOAD + INSTR_STORE (the only per-instruction-type events for scalar load/store --
+# AIE2/2p exposes no generic "scalar ALU" event, load/store is the closest to
+# "address-generation activity"), and ACTIVE (the core-status-group event that is the
+# genuine busy/not-disabled/not-stalled signal -- its complement is genuine core idle).
+# Numeric codes from aie.dialects._aie_enum_gen.CoreEventAIE2P (TableGen-generated from the
+# aie-rt headers per aie/utils/trace/events/__init__.py's docstring); CoreEventAIE2 (what
+# CoreEvent aliases to) carries IDENTICAL numeric codes for all 8 of these names, so which
+# alias is used does not change what gets programmed into the hardware monitor slots.
+# NOTE: dropping INSTR_EVENT_0/1 means get_trace_summary.py's invocation-boundary parse
+# (which pairs INSTR_EVENT_0/1 B-events to find "cycles/invocation") no longer applies to
+# this capture -- use total captured span instead.
+BAND_NAMING_CORETILE_EVENTS = [
+    CoreEvent.INSTR_VECTOR,
+    CoreEvent.MEMORY_STALL,
+    CoreEvent.STREAM_STALL,
+    CoreEvent.LOCK_STALL,
+    CoreEvent.CASCADE_STALL,
+    CoreEvent.INSTR_LOAD,
+    CoreEvent.INSTR_STORE,
+    CoreEvent.ACTIVE,
+]
 
 
 def residual_add(dev, sequence_length, embedding_dim, scale, trace_size, n_cores=8):
@@ -93,7 +123,10 @@ def residual_add(dev, sequence_length, embedding_dim, scale, trace_size, n_cores
         # enough to saturate them -- build the traced variant with -n/--cores reduced (cores=1
         # is representative of the per-row MATH, not production wall time; see the enable_trace
         # recipe established for ln_affine_cast_iron.py, which this mirrors).
-        prog.enable_trace(trace_size=trace_size, workers=[workers[0]], egress_shim_col=1)
+        prog.enable_trace(
+            trace_size=trace_size, workers=[workers[0]], egress_shim_col=1,
+            coretile_events=BAND_NAMING_CORETILE_EVENTS,
+        )
     return prog.resolve_program()
 
 

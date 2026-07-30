@@ -128,6 +128,7 @@ cp "$RB/ctx_ln/silu_brick.cc"         "$K/silu_brick.cc"
 cp "$RB/ctx_ln/silu_iron.py"          "$PE/ml/layernorm/silu_iron.py"
 cp "$RB/ctx_ln/Makefile.silu2"        "$PE/ml/layernorm/Makefile.silu2"
 cp "$RB/ctx_ln/Makefile.silutr"       "$PE/ml/layernorm/Makefile.silutr"
+cp "$RB/ctx_ln/trace_brick_silu.py"   "$PE/ml/layernorm/trace_brick_silu.py"
 # FUSED ctxLN+affine+cast (lnaffcast) -- the ENGINE loads final_lnaffcast_{PAD_M}x{KRES}.xclbin
 # (npu.rs), so this one is shipped-critical, not a probe. Its generator/kernel/Makefile used to
 # live ONLY in the gitignored sandbox: nothing tracked could rebuild it, and the 2026-07-27 aiecc
