@@ -121,9 +121,10 @@ Design for this FIRST; it is not a detail to discover mid-port.
                                          + verified for the decoder)      parameter, not new code);
                                                                             k==stride==2 so no
                                                                             fractional-crop case.
-  ConvNeXt depthwise conv (x2)          NONE -- conv-1d is DENSE, not     see AWKWARD #4.
-                                         grouped/depthwise; no depthwise
-                                         brick exists in this catalog
+  ConvNeXt depthwise conv (x2)          dwconv1d_same_scalar<T,K,P,BIAS>  NOT a gap -- AWKWARD #4 is
+                                         (route_b_kernels/dwconv1d/,      CORRECTED below. Reuse via
+                                         Parakeet's shipped kernel)       P=K-1, device-green
+                                                                            2026-07-31.
   ConvNeXt LayerNorm affine (x2)        layernorm (layernorm_ln_affine)   exact 2-pass mean-centered
                                                                             match. [1024,T] -> tiled.
   ConvNeXt pwconv1 / pwconv2 (x2)       gemm-bf16xbfp16                   1x1 convs = linear layers,
@@ -176,9 +177,35 @@ AWKWARD ON-NPU (deliverable 4):
   #3 No softmax brick exists at all (see kernel map row). Small in this segment (T<=65 keys), but
      still unwritten: exp (SFU) + causal-masked reduce-sum over the key axis + reciprocal-multiply.
 
-  #4 No depthwise/grouped conv-1d brick exists; conv-1d is dense (full c_in x c_out mixing). Faking
-     depthwise with dense conv-1d and a diagonal/identity-block weight wastes >99% of the MACs
-     (1024x1024 dense vs 1024x1 depthwise per tap); a real depthwise-1d primitive is the honest ask.
+  #4 CORRECTED 2026-07-31, DEVICE-GREEN -- this was never a gap. The original claim ("no depthwise
+     brick exists in this catalog") was true only as scoped to bricks/: route_b_kernels/dwconv1d/
+     dwconv1d.cc, Parakeet's shipped depthwise-1d kernel, lives OUTSIDE bricks/ and is directly
+     reusable here by reparameterization -- the same reuse class as mha_decode HD=64->128.
+
+     dwconv1d_same_scalar<T,K,P,BIAS> (dwconv1d.cc:114-129) computes
+     out[t] = bias + sum_p w[p]*in[t-P+p], with the padding offset P a FREE TEMPLATE PARAMETER.
+     Parakeet instantiates P=(K-1)/2 (centered 'same') at every call site (dwconv1d.cc:296-322) --
+     a call-site choice, not a kernel property. Causal, which is what dwconv_1d_causal below needs
+     (shift = K-1-j), is simply P=K-1.
+
+     That distinction is load-bearing and is exactly the silent-shift failure class this project has
+     paid for twice (the conv-1d weight transpose, the RoPE pairing convention): host-checked, P=K-1
+     matches dwconv_1d_causal at rel-L2 3.1e-08 while the stock centered P=(K-1)/2 gives 0.92, i.e.
+     unrelated output that no self-consistent gate would catch.
+
+     S2's real weight (c.quantizer.upsample.{0,1}.1.dwconv.conv.weight, read from the shipped GGUF)
+     is K=7, C=1024, and T is data-dependent (110, 220, ...). Use the SCALAR FIR form: the vectorized
+     dwconv1d_shift hardcodes static_assert(K==9) (dwconv1d.cc:152,:214) and requires T%16==0
+     (dwconv1d.cc:153), neither of which holds here; dwconv1d_same_scalar asserts neither, so K=7 and
+     an arbitrary T compile unmodified. It also has no fused SiLU (that lives behind -DDWCONV_SILU on
+     the shift variant, default off), which is what this block wants -- bias-add only.
+
+     Device-gated by bricks/_verify/verify_dwconv_causal.py: upsample.0 (T=110) rel-L2 4.185e-03 and
+     upsample.1 (T=220) 4.031e-03, run2run 0, three fresh builds. L1 is a non-issue: the kernel is
+     per-channel-row, so ~1.8 KB/core at depth 2, independent of C.
+
+     Which FIR form is FASTER (scalar vs the vectorized shift path, with K zero-padded to 9 and T
+     padded to a multiple of 16) is an open, unmeasured perf question -- not settled here.
 
   #5 No plain (single-input, ungated) GELU brick exists, exact-erf or otherwise; geglu.cc is both the
      wrong formula (tanh-approx, not erf) and the wrong arity (gated, needs 2 inputs) for this block's
