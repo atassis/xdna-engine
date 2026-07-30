@@ -69,6 +69,12 @@ template <int N>
 void sin_core(const float *restrict input, float *restrict output, int32_t n) {
   event0();
   const int chunks = n / N;
+  // Unrolling is DISABLED deliberately. A copy kernel delivers bit-exact tiles at 1024 floats
+  // (_verify/probe_tile_limit.py), so there is no delivery limit -- but this kernel was exact at 64
+  // floats per call and wrong above that, with results ALIASED across variables. That is spill
+  // codegen, and the trigger is the unroller: sin_v's live set is already near the register file, so
+  // unrolling two or more copies of it spills. Capping unrolling keeps one copy live.
+  #pragma clang loop unroll(disable)
   for (int i = 0; i < chunks; i++) {
     ::aie::store_v(output + i * N, sin_v<N>(::aie::load_v<N>(input + i * N)));
   }

@@ -26,10 +26,11 @@ import bricklib
 HERE = Path(__file__).parent
 BRICK = (HERE.parent / "sin").resolve()
 
-M, COLS = 64, 64          # 4096 elements. COLS=64 per call is the size proven exact on
-                          # device (oneshot N=64 -> rel-L2 1.2e-4); every larger single
-                          # call goes wrong from element 64 on, so the row IS 64 wide
-                          # and m carries the volume.
+M, COLS = 64, 64          # 4096 elements. 64 per CALL is required by this kernel: a copy kernel
+                          # delivers bit-exact tiles at 1024 (probe_tile_limit.py), so this is NOT a
+                          # delivery limit -- sin specifically goes wrong above 64/call with ALIASED,
+                          # unbounded output. Disabling loop unrolling did not change it, so the
+                          # mechanism is still unidentified. Volume comes from the row count.
 GATE = 3e-2
 
 spec = importlib.util.spec_from_file_location("sin_golden", BRICK / "golden.py")
