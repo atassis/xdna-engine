@@ -44,7 +44,7 @@ fn main() {
     // Build once so the weights/resident xclbins are warm for every clip. `ParakeetAsr::build`
     // opens its own NPU device and reads artifacts relative to `root` (CWD = repo root) unless
     // NPU_XCLBIN_ROOT overrides the xclbin location -- same contract as the other NPU bins.
-    let asr = ParakeetAsr::build(&cfg, Path::new("."));
+    let asr = ParakeetAsr::build(&cfg, Path::new(".")).expect("build parakeet asr");
     eprintln!("[bench] model built; {} clip(s), {N_PASSES} measured pass(es) each", clips.len());
 
     for clip in &clips {
@@ -61,7 +61,7 @@ fn main() {
         // Warmup pass (discarded for timing): pages in kernels/caches so pass-1 is not an
         // outlier. We also print its transcript so Task 6 can run the WER-neutral gate (confirm
         // instrumentation does not alter the text) without a separate binary.
-        let warm_txt = asr.transcribe(&samples);
+        let warm_txt = asr.transcribe(&samples).expect("transcribe");
         println!("[PARAKEET_TEXT] clip={name} :: {warm_txt}");
 
         let mut reports: Vec<PhaseReport> = Vec::with_capacity(N_PASSES);
@@ -69,7 +69,7 @@ fn main() {
         for _ in 0..N_PASSES {
             phase::reset();
             let t0 = Instant::now();
-            let _txt = asr.transcribe(&samples);
+            let _txt = asr.transcribe(&samples).expect("transcribe");
             let e2e = t0.elapsed();
             reports.push(phase::report(e2e));
         }

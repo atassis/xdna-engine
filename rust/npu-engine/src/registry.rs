@@ -26,19 +26,19 @@ pub fn try_build(cfg_path: &Path, root: &Path) -> Result<Scenario, EngineError> 
         Some(crate::ModelKind::Embed) => {
             let dev = open_dev()?;
             if cfg.scenario.name.to_lowercase().starts_with("esm") {
-                Scenario::Embed(Box::new(crate::esm::EsmEmbedPipeline::build(&cfg, root, dev)))
+                Scenario::Embed(Box::new(crate::esm::EsmEmbedPipeline::build(&cfg, root, dev)?))
             } else {
-                Scenario::Embed(Box::new(crate::bert::EmbedPipeline::build(&cfg, root, dev)))
+                Scenario::Embed(Box::new(crate::bert::EmbedPipeline::build(&cfg, root, dev)?))
             }
         }
         Some(crate::ModelKind::Asr) => {
             if cfg.scenario.name.to_lowercase().contains("parakeet") {
-                Scenario::Asr(Box::new(crate::asr::parakeet::ParakeetAsr::build(&cfg, root)))
+                Scenario::Asr(Box::new(crate::asr::parakeet::ParakeetAsr::build(&cfg, root)?))
             } else if cfg.scenario.name.to_lowercase().contains("whisper") {
-                Scenario::Asr(Box::new(crate::asr::whisper::WhisperAsr::build(&cfg, root)))
+                Scenario::Asr(Box::new(crate::asr::whisper::WhisperAsr::build(&cfg, root)?))
             } else {
                 let dev = open_dev()?;
-                Scenario::Asr(Box::new(crate::asr::AsrPipeline::build(&cfg, root, dev)))
+                Scenario::Asr(Box::new(crate::asr::AsrPipeline::build(&cfg, root, dev)?))
             }
         }
         None => return Err(EngineError::Load(format!("unknown scenario kind {:?}", cfg.scenario.kind))),

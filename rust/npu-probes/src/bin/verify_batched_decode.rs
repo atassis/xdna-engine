@@ -37,7 +37,7 @@ fn main() {
 
     eprintln!("[verify_batched] {} clips", paths.len());
     let cfg = ScenarioConfig::load(Path::new(SCENARIO)).expect("load scenario");
-    let asr = WhisperAsr::build(&cfg, Path::new("."));
+    let asr = WhisperAsr::build(&cfg, Path::new(".")).expect("build whisper asr");
 
     let refs: Vec<&[i16]> = samples.iter().map(|v| v.as_slice()).collect();
     let t = std::time::Instant::now();

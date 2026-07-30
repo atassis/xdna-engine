@@ -3,6 +3,8 @@
 
 use ndarray::Array2;
 
+use crate::api::EngineError;
+
 /// The genuinely-shared, genuinely-hard NPU stage. INTERFACE CONTRACT for sibling models
 /// (GigaAM Conformer, Parakeet FastConformer, BERT): implement this and the registry can host it.
 pub trait Encoder {
@@ -12,9 +14,11 @@ pub trait Encoder {
 
 /// A full ASR backend: raw PCM samples -> text. Different ASR models (GigaAM RNNT, Parakeet TDT)
 /// have different preproc + decode, so the whole transcription path is the trait; the encoder stage
-/// inside each still implements `Encoder`.
+/// inside each still implements `Encoder`. Fallible: an ONNX session or a decode step can fail at
+/// runtime (a moved artifact, a malformed clip), and that must reach the caller as `Err`, not a panic
+/// (engine-errors-are-real).
 pub trait AsrModel {
-    fn transcribe(&self, samples: &[i16]) -> String;
+    fn transcribe(&self, samples: &[i16]) -> Result<String, EngineError>;
 }
 
 /// Raw input -> encoder input activations + valid_len.
@@ -34,7 +38,7 @@ pub trait Head {
 /// either behind one `Scenario::Embed` arm. Distinct method name (`embed_one`) delegates to each
 /// pipeline's inherent `embed` (no recursion, inherent methods preserved for the verify bins).
 pub trait Embedder {
-    fn embed_one(&self, text: String) -> Vec<f32>;
+    fn embed_one(&self, text: String) -> Result<Vec<f32>, EngineError>;
 }
 
 /// One assembled, ready-to-serve pipeline. The registry returns this; `engine_serve` matches on it.

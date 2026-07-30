@@ -55,7 +55,7 @@ fn main() {
 
     // Warmup pass (not counted): primes ONNX session arenas, NPU kernels, governor, page-ins.
     eprintln!("[bench] --- warmup pass (untimed) ---");
-    let warm = pipe.transcribe(&samples);
+    let warm = pipe.transcribe(&samples).expect("transcribe");
     eprintln!("[bench] warmup text: {warm:?}");
 
     eprintln!("[bench] --- {PASSES} timed passes (with RAPL package energy) ---");
@@ -64,7 +64,7 @@ fn main() {
     let t0 = std::time::Instant::now();
     for p in 0..PASSES {
         eprintln!("[bench] timed pass {}/{PASSES}", p + 1);
-        let _ = pipe.transcribe(&samples);
+        let _ = pipe.transcribe(&samples).expect("transcribe");
     }
     let wall_s = t0.elapsed().as_secs_f64();
     if let (Some(b), Some(a)) = (e0, rapl_uj(RAPL_PKG)) {

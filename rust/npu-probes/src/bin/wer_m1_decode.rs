@@ -18,11 +18,11 @@ fn main() {
     let paths: Vec<String> = std::env::args().skip(1).collect();
     assert!(!paths.is_empty(), "usage: wer_m1_decode <clip1.wav> ...");
     let cfg = ScenarioConfig::load(Path::new(SCENARIO)).expect("load scenario");
-    let asr = WhisperAsr::build(&cfg, Path::new("."));
+    let asr = WhisperAsr::build(&cfg, Path::new(".")).expect("build whisper asr");
     for p in &paths {
         let samples = parse_wav_i16(&std::fs::read(p).unwrap_or_else(|e| panic!("read {p}: {e}")))
             .expect("parse 16k/mono/16-bit WAV");
-        let txt = asr.transcribe(&samples);
+        let txt = asr.transcribe(&samples).expect("transcribe");
         println!("{p}\t{txt}");
     }
 }

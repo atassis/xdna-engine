@@ -44,7 +44,12 @@ pub struct Handle { tx: Sender<Cmd> }
 /// Spawn the actor with an initial config + a loader; performs the initial reconcile before returning.
 /// This is the SERVICE start: a server should come up warm and answer `/v1/models` with what is
 /// really resident. For a one-shot invocation use [`start_lazy`].
-pub fn start(cfg: Config, loader: Box<dyn ModelLoader + Send>) -> (Handle, JoinHandle<()>) {
+///
+/// `Err` means the initial reconcile PANICKED (e.g. a bug outside the normal per-model load-failure
+/// path, which `reconcile` already reports via `ModelStatus` without panicking) -- the actor thread
+/// is shut down before returning, so a caller never holds a `Handle` to a half-dead actor that was
+/// never actually reconciled.
+pub fn start(cfg: Config, loader: Box<dyn ModelLoader + Send>) -> Result<(Handle, JoinHandle<()>), EngineError> {
     spawn(cfg, loader, true)
 }
 
@@ -56,29 +61,40 @@ pub fn start(cfg: Config, loader: Box<dyn ModelLoader + Send>) -> (Handle, JoinH
 /// to load the one it actually wanted -- two full device loads to serve one request. Worse, `npu
 /// embed` against an ASR-only config paid a complete parakeet load before it could report that no
 /// embed model was configured at all. Declaring is enough to route correctly.
-pub fn start_lazy(cfg: Config, loader: Box<dyn ModelLoader + Send>) -> (Handle, JoinHandle<()>) {
+pub fn start_lazy(cfg: Config, loader: Box<dyn ModelLoader + Send>) -> Result<(Handle, JoinHandle<()>), EngineError> {
     spawn(cfg, loader, false)
 }
 
-fn spawn(cfg: Config, loader: Box<dyn ModelLoader + Send>, eager: bool) -> (Handle, JoinHandle<()>) {
+fn spawn(cfg: Config, loader: Box<dyn ModelLoader + Send>, eager: bool) -> Result<(Handle, JoinHandle<()>), EngineError> {
     let (tx, rx) = channel::<Cmd>();
-    let (ready_tx, ready_rx) = channel::<()>();
+    let (ready_tx, ready_rx) = channel::<Result<(), String>>();
     let join = std::thread::spawn(move || {
         let mut reg = Registry::default();
         let mut cfg = cfg;
         // A panic anywhere below used to kill this thread, after which every request failed with
         // "actor stopped" and the real cause was gone. Model constructors still `.expect()` on
         // missing artifacts, so a bad config or a moved weights dir landed here. Catch it: the
-        // actor survives, and the panic message is returned as the error the caller sees.
-        if eager {
-            let _ = guard(|| reconcile(&cfg, &mut reg, loader.as_ref()));
+        // actor survives, and the panic message is sent back to `spawn` instead of being dropped on
+        // the floor (`let _ = ready_rx.recv()` used to discard it, handing the caller a `Handle` to
+        // an actor whose initial reconcile silently never ran).
+        let init: Result<(), String> = if eager {
+            guard(|| reconcile(&cfg, &mut reg, loader.as_ref())).map(|_report| ())
         } else {
             for m in &cfg.models {
                 let kind = guard(|| loader.declared_kind(m)).unwrap_or(None);
                 reg.declare(m, kind);
             }
+            Ok(())
+        };
+        let init_failed = init.is_err();
+        let _ = ready_tx.send(init);
+        // The caller already got (and will act on) the Err above; if the init panicked, don't run
+        // the serve loop on a registry that was never actually reconciled -- exit so the thread this
+        // function spawned does not idle forever un-owned (spawn() sends Shutdown, but only after
+        // learning the send above failed; exiting here makes that race harmless either way).
+        if init_failed {
+            return;
         }
-        let _ = ready_tx.send(());
         // `recv_timeout` rather than `recv`: the actor is the ONLY owner of the single-tenant NPU,
         // so idle unload has to happen on this thread or not at all. Waking on a timeout gives the
         // timer for free and puts the sweep strictly BETWEEN commands -- an eviction can never race
@@ -143,8 +159,20 @@ fn spawn(cfg: Config, loader: Box<dyn ModelLoader + Send>, eager: bool) -> (Hand
             }
         }
     });
-    let _ = ready_rx.recv();
-    (Handle { tx }, join)
+    match ready_rx.recv() {
+        Ok(Ok(())) => Ok((Handle { tx }, join)),
+        Ok(Err(msg)) => {
+            // The thread already exited on its own (init_failed branch above); Shutdown is a no-op if
+            // it beat us here, harmless either way. join() cannot hang: the thread returns right after
+            // sending on ready_tx.
+            let _ = tx.send(Cmd::Shutdown);
+            let _ = join.join();
+            Err(EngineError::Load(format!("initial reconcile: {msg}")))
+        }
+        // The sender was dropped without sending -- the thread panicked before reaching guard()
+        // itself (e.g. inside Registry::default()). No Handle to hand back; nothing to shut down.
+        Err(_) => Err(EngineError::Device("actor thread died before completing its initial reconcile".into())),
+    }
 }
 
 /// Route the request to a model, make that model resident, and verify it has the capability asked
@@ -225,7 +253,8 @@ mod tests {
     use std::collections::BTreeMap;
     use std::time::Duration;
 
-    /// asr + embed configured, but only ONE slot: serving both means swapping.
+    /// asr + embed configured, but only ONE slot: serving both means swapping. `.unwrap()`: a mock
+    /// loader's initial reconcile does not panic, so a start() failure here is a real regression.
     fn swap_setup(srv: ServerCfg) -> (Handle, JoinHandle<()>) {
         let mut t = BTreeMap::new();
         t.insert("asr".to_string(), Ok((ModelKind::Asr, 1)));
@@ -238,7 +267,7 @@ mod tests {
                 ModelCfg { name: "bge".into(), scenario: "y".into() },
             ],
         };
-        start(cfg, Box::new(MockLoader { table: t }))
+        start(cfg, Box::new(MockLoader { table: t })).unwrap()
     }
     fn state_of(h: &Handle, name: &str) -> LoadState {
         h.status().into_iter().find(|s| s.name == name).expect("entry").state
@@ -307,7 +336,7 @@ mod tests {
                 ModelCfg { name: "bge".into(), scenario: "y".into() },
             ],
         };
-        let (h, j) = start_lazy(cfg, Box::new(MockLoader { table: t }));
+        let (h, j) = start_lazy(cfg, Box::new(MockLoader { table: t })).unwrap();
         // Nothing loaded, but both are known -- including their capability, read from the scenario.
         let s = h.status();
         assert!(s.iter().all(|x| x.state == LoadState::Unloaded), "lazy start must not load: {s:?}");
@@ -331,7 +360,7 @@ mod tests {
             defaults: Defaults { asr: Some("asr".into()), embed: None },
             models: vec![ModelCfg { name: "asr".into(), scenario: "x".into() }],
         };
-        let (h, j) = start_lazy(cfg, Box::new(MockLoader { table: t }));
+        let (h, j) = start_lazy(cfg, Box::new(MockLoader { table: t })).unwrap();
         let e = match h.embed(None, "hi") { Err(e) => e.to_string(), Ok(s) => panic!("served {}", s.model) };
         assert!(e.contains("no embed model"), "{e}");
         assert_eq!(state_of(&h, "asr"), LoadState::Unloaded, "nothing may load to answer this");
@@ -349,5 +378,32 @@ mod tests {
         std::thread::sleep(Duration::from_millis(2500));
         assert_eq!(state_of(&h, "bge"), LoadState::Loaded, "idle_unload_s = 0 must disable the sweep");
         h.shutdown(); j.join().unwrap();
+    }
+
+    /// A loader whose `load()` panics instead of returning `Err` -- simulates a bug outside the
+    /// normal per-model load-failure path (which `reconcile` already records as `Failed`, no panic
+    /// involved). Before this fix `start()` swallowed this via `let _ = ready_rx.recv()` and handed
+    /// back a `Handle` to an actor whose initial reconcile silently never completed.
+    struct PanicLoader;
+    impl ModelLoader for PanicLoader {
+        fn load(&self, _cfg: &ModelCfg) -> Result<Box<dyn crate::loader::Inference>, EngineError> {
+            panic!("boom: simulated load-time bug");
+        }
+    }
+
+    #[test]
+    fn a_panicking_initial_reconcile_returns_err_not_a_half_dead_handle() {
+        let cfg = Config {
+            server: ServerCfg { max_resident: 1, idle_unload_s: 0, ..Default::default() },
+            defaults: Defaults { asr: Some("asr".into()), embed: None },
+            models: vec![ModelCfg { name: "asr".into(), scenario: "x".into() }],
+        };
+        // `unwrap_err()` needs `(Handle, JoinHandle<()>): Debug`, which `Handle` deliberately isn't
+        // (it just wraps a `Sender`); match instead.
+        let err = match start(cfg, Box::new(PanicLoader)) {
+            Err(e) => e,
+            Ok(_) => panic!("a panicking initial reconcile must not hand back a live Handle"),
+        };
+        assert!(err.to_string().contains("boom"), "{err}");
     }
 }

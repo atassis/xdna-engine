@@ -144,7 +144,7 @@ fn serve(path: &Path, port: Option<u16>) -> Result<()> {
     let port = port.unwrap_or(cfg.server.port);
     preflight_serve(port)?;
     let root = root(&cfg)?;
-    let (handle, _join) = start(cfg, Box::new(EngineLoader { root }));
+    let (handle, _join) = start(cfg, Box::new(EngineLoader { root }))?;
     http::serve(handle, path.to_path_buf(), port).context("serve")
 }
 
@@ -153,7 +153,7 @@ fn transcribe(path: &Path, wav: &Path, model: Option<&str>) -> Result<()> {
     let cfg = load_cfg(path)?;
     let root = root(&cfg)?;
     // Lazy: a one-shot run should load the model it serves, and nothing else.
-    let (handle, join) = start_lazy(cfg, Box::new(EngineLoader { root }));
+    let (handle, join) = start_lazy(cfg, Box::new(EngineLoader { root }))?;
     let bytes = std::fs::read(wav).with_context(|| format!("read {}", wav.display()))?;
     let samples = http::parse::parse_wav_i16(&bytes).ok_or_else(|| anyhow!("bad wav (need 16k mono 16-bit)"))?;
     let out = handle.transcribe(model, samples, 16_000).map_err(|e| anyhow!(e.to_string()));
@@ -168,7 +168,7 @@ fn embed(path: &Path, text: &str, model: Option<&str>) -> Result<()> {
     let root = root(&cfg)?;
     // Lazy: `npu embed` against an ASR-only config used to pay a full parakeet load before it could
     // say there was no embed model at all.
-    let (handle, join) = start_lazy(cfg, Box::new(EngineLoader { root }));
+    let (handle, join) = start_lazy(cfg, Box::new(EngineLoader { root }))?;
     let out = handle.embed(model, text).map_err(|e| anyhow!(e.to_string()));
     handle.shutdown(); let _ = join.join();
     let v = out?.value;
