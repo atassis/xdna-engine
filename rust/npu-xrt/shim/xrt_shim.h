@@ -13,12 +13,27 @@ typedef struct ShimBo        ShimBo;
 typedef struct ShimRun       ShimRun;
 typedef struct ShimElfKernel ShimElfKernel;
 
+/* xrt::hw_context::cfg_param_type "priority" values (amdxdna_uapi.h AMDXDNA_QOS_*). Passed as the
+ * qos_priority arg below; QOS_PRIORITY_NONE (-1) means "no cfg_param map at all" -- the plain 2-arg
+ * hw_context ctor, byte-identical to before QoS existed. Any other value builds a one-entry
+ * {"priority": value} map and uses the QoS-aware overload. See docs/12 (kernel kit) for the tuple's
+ * remaining fields (gops/fps/latency/...), not yet plumbed -- priority alone is independently useful
+ * (xdna-driver src/shim/hwctx.cpp:258-259 gates it before the rest of the tuple validates).
+ * qos-priority-is-a-scheduling-knob: priority reaches the firmware scheduler, not just DPM. */
+#define QOS_PRIORITY_NONE     (-1)
+#define QOS_PRIORITY_REALTIME 0x100
+#define QOS_PRIORITY_HIGH     0x180
+#define QOS_PRIORITY_NORMAL   0x200
+#define QOS_PRIORITY_LOW      0x280
+
 ShimDevice* shim_device_open(unsigned int index);
 void        shim_device_close(ShimDevice*);
 
 /* Load xclbin -> register with device -> hw_context -> kernel. NULL/empty kernel_name uses the
- * first kernel in the xclbin (what our pyxrt runners do). Returns NULL on failure. */
-ShimKernel* shim_kernel_load(ShimDevice*, const char* xclbin_path, const char* kernel_name);
+ * first kernel in the xclbin (what our pyxrt runners do). qos_priority: QOS_PRIORITY_NONE for the
+ * old unconfigured context, else one of the QOS_PRIORITY_* levels above. Returns NULL on failure. */
+ShimKernel* shim_kernel_load(ShimDevice*, const char* xclbin_path, const char* kernel_name,
+                             int qos_priority);
 void        shim_kernel_close(ShimKernel*);
 int         shim_kernel_group_id(ShimKernel*, int arg_index); /* -1 on error */
 
@@ -62,9 +77,10 @@ void     shim_run_free(ShimRun*);
  * A full ELF carries its own instructions+config (no xclbin, no insts BO). Mirrors IRON's
  * fusion.py FullELFCallable: xrt::elf(bytes) -> hw_context(device, elf) -> ext::kernel(ctx, name).
  * kernel_name NULL/empty defaults to "main:sequence" (IRON's device:sequence default). The ELF bytes
- * are copied in, so the caller may patch+reload its own buffer freely. Returns NULL on failure. */
+ * are copied in, so the caller may patch+reload its own buffer freely. Returns NULL on failure.
+ * qos_priority: see QOS_PRIORITY_* above. */
 ShimElfKernel* shim_elf_kernel_load(ShimDevice*, const void* elf_bytes, size_t nbytes,
-                                    const char* kernel_name);
+                                    const char* kernel_name, int qos_priority);
 void           shim_elf_kernel_close(ShimElfKernel*);
 
 /* Dispatch a full-ELF kernel with N buffer-object args (run.set_arg(i, bo) for i in 0..n_bos),
@@ -89,7 +105,9 @@ ShimRun* shim_run_elf_start(ShimElfKernel*, ShimBo* const* bos, size_t n_bos);
  * every kernel rebound onto it. ShimElfKernel2 borrows the ctx; close it before the ctx. */
 typedef struct ShimElfCtx     ShimElfCtx;
 typedef struct ShimElfKernel2 ShimElfKernel2;
-ShimElfCtx*     shim_elf_ctx_open(ShimDevice*, const void* base_elf, size_t nbytes);
+/* qos_priority: see QOS_PRIORITY_* above -- this is the context that stays resident, so this is
+ * where a background/best-effort caller actually wants to declare LOW_PRIORITY. */
+ShimElfCtx*     shim_elf_ctx_open(ShimDevice*, const void* base_elf, size_t nbytes, int qos_priority);
 void            shim_elf_ctx_close(ShimElfCtx*);
 ShimElfKernel2* shim_elf_kernel_rebind(ShimElfCtx*, const void* elf_bytes, size_t nbytes,
                                        const char* kernel_name);
@@ -105,7 +123,7 @@ int             shim_run_elf2(ShimElfKernel2*, ShimBo* const* bos, size_t n_bos)
  * (so the caller can fall back). scratchpad_size()==0 likewise signals no scratchpad. */
 typedef struct ShimElfResident ShimElfResident;
 ShimElfResident* shim_elf_resident_open(ShimDevice*, const void* elf_bytes, size_t nbytes,
-                                        const char* kernel_name);
+                                        const char* kernel_name, int qos_priority);
 void             shim_elf_resident_close(ShimElfResident*);
 size_t           shim_elf_resident_scratchpad_size(ShimElfResident*);
 /* Bind the N arena BOs to run args 0..N once (same handles reused every dispatch). 0 on success. */

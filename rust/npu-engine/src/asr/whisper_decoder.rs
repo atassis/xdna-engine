@@ -545,7 +545,7 @@ impl HostDecoder {
 // =============================================================================================
 use npu_xrt::{
     pack_f32_to_bf16, unpack_bf16_to_f32, Arena, ElfCtx, ElfKernel, ElfKernel2, ElfResident,
-    FusedArena, FusedElfPatcher, Run,
+    FusedArena, FusedElfPatcher, QosPriority, Run,
 };
 
 /// Deep-C resident-scratchpad state: the decode ELF is CONSTANT (registered ONCE via
@@ -1613,8 +1613,13 @@ impl BatchedFusedDecoder {
         let sm_off_byte = sp["params"][smn]["byte_offset"].as_u64().expect("sm byte_offset") as usize;
         let sm_core = sp["params"][smn]["kind"].as_str() == Some("core");
         let head_dim = sp["head_dim"].as_u64().unwrap_or(HEAD_DIM as u64) as u32;
+        // Offline-bulk decode is background/best-effort work (Subsystem B, opt-in via
+        // NPU_DECODE_FUSED_BATCH), never in the single-stream interactive path -- declare
+        // LOW_PRIORITY (engine-declare-qos-contexts: the first rung of QoS-aware, mixed-criticality
+        // scheduling; DPM can only drop from here, never rise, so this cannot regress this context's
+        // own throughput ceiling -- it only affects arbitration against a concurrent foreground one).
         let res = dev
-            .open_elf_resident(&base_elf, Some("main:sequence"))
+            .open_elf_resident_qos(&base_elf, Some("main:sequence"), Some(QosPriority::Low))
             .expect("open_elf_resident (batched decode ELF lacks scratchpad?)");
         arena.bind_resident(&res).expect("bind resident arena BOs");
         eprintln!("[batched] B={b} t_enc={t_enc} resident scratchpad decode (scratch {:.0} MB)", scr_sz as f64 / 1e6);
