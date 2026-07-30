@@ -55,7 +55,13 @@ def reset_stats():
         _stats[k] = 0
 
 
-def _run(name, shim_text, symbol, tiles, out_numel, resident, flags=None):
+def _run(name, shim_text, symbol, tiles, out_numel, resident, flags=None, resident_depth=2):
+    """resident_depth is the objectFIFO depth of the RESIDENT operand only (default 2, the IRON
+    default -- unchanged behaviour for every existing caller). Every op here acquires its resident
+    operand ONCE before the streamed-tile loop and releases it once after (bricklib's
+    `_build_streamed`), so resident_depth=1 is always numerically safe; it exists as a knob because
+    the front stages' resident activation window is large enough that depth 2's doubling is what
+    pushes the design over a 64 KiB core tile. See stage_shapes.py for the arithmetic."""
     shim = bricklib.GEN / f"wd_{name}_shim.cc"
     shim.write_text(shim_text)
     # bricklib prints a PASS/FAIL line per call, and every call here is an UNGATED intermediate
@@ -68,7 +74,7 @@ def _run(name, shim_text, symbol, tiles, out_numel, resident, flags=None):
             unpack=lambda d: np.asarray(d), golden=np.zeros((tiles.shape[0], out_numel)),
             gate=np.inf,      # intermediates are not gated; the stitched stage output is
             in_dt=np.float32, out_dt=np.float32, compile_flags=flags,
-            resident_dt=(None if resident is None else np.float32))
+            resident_dt=(None if resident is None else np.float32), resident_depth=resident_depth)
     _stats["dispatches"] += 1
     return np.asarray(r["got"], np.float32)
 
@@ -94,7 +100,7 @@ def snake(x, alpha, tag):
     return out
 
 
-def conv(x, w, bias, k, dilation, tag, add=None, ci_chunk=None):
+def conv(x, w, bias, k, dilation, tag, add=None, ci_chunk=None, resident_depth=2):
     """[c_in, L] -> [c_out, L - (k-1)*dilation]. Output j corresponds to input position ctx + j.
 
     `add` supplies the residual connection, already aligned to the OUTPUT. It rides in the tile
@@ -111,6 +117,9 @@ def conv(x, w, bias, k, dilation, tag, add=None, ci_chunk=None):
     The last chunk is zero-padded to ci_chunk rather than being its own size: zero weights times zero
     activations contribute nothing, and it keeps every chunk on ONE compiled design instead of
     forcing a second build for the remainder.
+
+    resident_depth: forwarded to `_run` (default 2, unchanged for every caller that does not pass
+    it). See stage_shapes.py for when 1 is required rather than merely smaller.
     """
     c_in, L = x.shape
     c_out = w.shape[0]
@@ -129,11 +138,11 @@ def conv(x, w, bias, k, dilation, tag, add=None, ci_chunk=None):
         first = (c0 == 0)
         out += _conv_chunk(xc, wc, bias if first else np.zeros(c_out, np.float32),
                            k, dilation, f"{tag}_k{ci_chunk}",
-                           add=(add if first else None))
+                           add=(add if first else None), resident_depth=resident_depth)
     return out
 
 
-def _conv_chunk(x, w, bias, k, dilation, tag, add=None):
+def _conv_chunk(x, w, bias, k, dilation, tag, add=None, resident_depth=2):
     """One input-channel chunk of `conv`. Same windowing; the tag is shared across chunks so they
     all reuse a single compiled design."""
     c_in, L = x.shape
@@ -167,22 +176,23 @@ def _conv_chunk(x, w, bias, k, dilation, tag, add=None):
             if add is not None:
                 seg = add[co, o:o + n]
                 tiles[co, c_in * k + 1 + ctx:c_in * k + 1 + ctx + len(seg)] = seg
-        got = _run(f"conv_{tag}_{o}", shim_text, sym, tiles, T, win)
+        got = _run(f"conv_{tag}_{o}", shim_text, sym, tiles, T, win, resident_depth=resident_depth)
         out[:, o:o + n] = got.reshape(c_out, T)[:, ctx:ctx + n]
         _stats["computed"] += c_out * T
         _stats["useful"] += c_out * n
     return out
 
 
-def residual_unit(x, wts, dilation, tag, ci_chunk=None):
+def residual_unit(x, wts, dilation, tag, ci_chunk=None, resident_depth=2):
     """[C, L] -> [C, L - 6*dilation]. snake -> conv_dilated -> snake -> conv_1x1 + residual."""
     a0, w1, b1, a2, w3, b3 = wts
     ctx = 6 * dilation
     s1 = snake(x, a0, f"{tag}a")
-    h = conv(s1, w1, b1, 7, dilation, f"{tag}dil", ci_chunk=ci_chunk)
+    h = conv(s1, w1, b1, 7, dilation, f"{tag}dil", ci_chunk=ci_chunk, resident_depth=resident_depth)
     s2 = snake(h, a2, f"{tag}b")
     # The residual reads x at the OUTPUT's positions, i.e. shifted by this unit's own context.
-    return conv(s2, w3, b3, 1, 1, f"{tag}1x1", add=x[:, ctx:], ci_chunk=ci_chunk)
+    return conv(s2, w3, b3, 1, 1, f"{tag}1x1", add=x[:, ctx:], ci_chunk=ci_chunk,
+               resident_depth=resident_depth)
 
 
 # The fused upsample stage keeps a [c_in, t] static scratch for snake's output, so its t is capped
@@ -236,14 +246,49 @@ def upsample(x, alpha, w, bias, stride, tag, t=UPSAMPLE_T):
     return out
 
 
-def conv_transpose(x, w, bias, stride, tag, t=UPSAMPLE_T):
+def conv_transpose(x, w, bias, stride, tag, t=UPSAMPLE_T, ci_chunk=None, resident_depth=2):
     """[c_in, L] -> [c_out, (L - ctx) * stride]. No static state anywhere in the pass.
 
     Replaces the fused upsample for the driver. The fused kernel was measured green twice and then
     began returning NaN with its source unchanged; every kernel in this codec that keeps a static L1
     scratch has been fragile and every one that keeps none has been stable, so the driver buys
     stability by paying for snake as a separate pass. See conv_transpose_channel.cc.
+
+    ci_chunk splits the INPUT channels and accumulates partials ON THE HOST, exactly like conv()'s
+    ci_chunk (same reasoning: an on-device accumulator would be the static L1 state that made the
+    fused kernels unreproducible). This is the lever the front stages actually need: the streamed
+    weight row is c_in*k+1 floats REGARDLESS of the window length t, so a stage whose c_in*k alone
+    exceeds a 64 KiB core tile (stage 1: 1536*16 = 24576 floats = 96 KiB, before the resident window
+    or output tile are even counted) cannot be fixed by shrinking t -- only by shrinking c_in. See
+    stage_shapes.py for the per-stage arithmetic and the chosen chunk sizes.
+
+    resident_depth: forwarded to `_run` (default 2, unchanged for every caller that does not pass
+    it -- verify_stage4_block.py's stage-4 call is bit-for-bit the same design as before this param
+    existed).
     """
+    c_in, L = x.shape
+    k = 2 * stride
+    if ci_chunk is None or ci_chunk > c_in:
+        ci_chunk = c_in
+    c_out = w.shape[1]
+    ctx = -(-(k - 1) // stride)
+    M = L - ctx
+    out = np.zeros((c_out, M * stride), np.float32)
+    for c0 in range(0, c_in, ci_chunk):
+        cs = min(ci_chunk, c_in - c0)
+        xc = np.zeros((ci_chunk, L), np.float32)
+        xc[:cs] = x[c0:c0 + cs]
+        wc = np.zeros((ci_chunk, c_out, k), np.float32)
+        wc[:cs] = w[c0:c0 + cs]
+        first = (c0 == 0)
+        out += _conv_transpose_chunk(xc, wc, bias if first else np.zeros(c_out, np.float32),
+                                     stride, f"{tag}_k{ci_chunk}", t, resident_depth)
+    return out
+
+
+def _conv_transpose_chunk(x, w, bias, stride, tag, t, resident_depth):
+    """One input-channel chunk of `conv_transpose`. Same windowing conv_transpose always used; the
+    tag carries ci_chunk so every chunk of the same width reuses one compiled design."""
     c_in, L = x.shape
     k = 2 * stride
     ctx = -(-(k - 1) // stride)
@@ -269,7 +314,8 @@ def conv_transpose(x, w, bias, stride, tag, t=UPSAMPLE_T):
         win = np.zeros((c_in, t), np.float32)
         take = min(t, L - o)
         win[:, :take] = x[:, o:o + take]
-        got = _run(f"ct_{tag}_{o}", shim_text, f"wd_ct_{tag}", tiles, t * stride, win)
+        got = _run(f"ct_{tag}_{o}", shim_text, f"wd_ct_{tag}", tiles, t * stride, win,
+                   resident_depth=resident_depth)
         got = got.reshape(c_out, t * stride)
         out[:, o * stride:(o + n) * stride] = got[:, ctx * stride:(ctx + n) * stride]
         _stats["computed"] += c_out * t * stride
@@ -277,6 +323,7 @@ def conv_transpose(x, w, bias, stride, tag, t=UPSAMPLE_T):
     return out
 
 
-def upsample_unfused(x, alpha, w, bias, stride, tag, t=UPSAMPLE_T):
+def upsample_unfused(x, alpha, w, bias, stride, tag, t=UPSAMPLE_T, ci_chunk=None, resident_depth=2):
     """snake then conv_transpose_1d as TWO passes, neither holding static state."""
-    return conv_transpose(snake(x, alpha, f"{tag}sn"), w, bias, stride, f"{tag}ct", t)
+    return conv_transpose(snake(x, alpha, f"{tag}sn"), w, bias, stride, f"{tag}ct", t,
+                          ci_chunk=ci_chunk, resident_depth=resident_depth)
