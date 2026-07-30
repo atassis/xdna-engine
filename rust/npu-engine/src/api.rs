@@ -93,7 +93,7 @@ impl Model {
             return Err(EngineError::Unsupported(format!("sample_rate {sample_rate} (need 16000)")));
         }
         match &self.scen {
-            Scenario::Asr(m) => Ok(m.transcribe(pcm)),
+            Scenario::Asr(m) => m.transcribe(pcm),
             Scenario::Embed(_) =>
                 Err(EngineError::WrongKind { wanted: ModelKind::Asr, got: ModelKind::Embed }),
         }
@@ -102,7 +102,7 @@ impl Model {
     /// Embedding: text -> vector.
     pub fn embed(&self, text: &str) -> Result<Vec<f32>, EngineError> {
         match &self.scen {
-            Scenario::Embed(m) => Ok(m.embed_one(text.to_string())),
+            Scenario::Embed(m) => m.embed_one(text.to_string()),
             Scenario::Asr(_) =>
                 Err(EngineError::WrongKind { wanted: ModelKind::Embed, got: ModelKind::Asr }),
         }

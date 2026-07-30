@@ -381,7 +381,7 @@ mod route_tests {
             ..Default::default()
         };
         cfg.save(&cfg_path).unwrap();
-        let (h, j) = start(cfg, Box::new(MockLoader { table: t }));
+        let (h, j) = start(cfg, Box::new(MockLoader { table: t })).unwrap();
         (h, j, dir, cfg_path)
     }
 
@@ -437,7 +437,7 @@ mod route_tests {
             ..Default::default()
         };
         cfg.save(&p).unwrap();
-        let (h, j) = start(cfg, Box::new(MockLoader { table: t }));
+        let (h, j) = start(cfg, Box::new(MockLoader { table: t })).unwrap();
         let (code, body) = route(&post("/v1/embeddings", r#"{"model":"e5","input":"hi"}"#), &h, &p);
         assert_eq!(code, 200, "{body}");
         assert!(body.contains("\"model\":\"e5\""), "{body}");

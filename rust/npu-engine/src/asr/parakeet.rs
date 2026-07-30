@@ -11,6 +11,7 @@ use npu_parakeet::config::ModelCfg;
 use npu_parakeet::encoder::FastConformerEncoder;
 use npu_parakeet::prof::phase::{Bucket, PhaseScope};
 
+use crate::api::EngineError;
 use crate::config::ScenarioConfig;
 use crate::pipeline::{AsrModel, Encoder};
 
@@ -23,6 +24,9 @@ const STATE_DIM: usize = 640;
 const STATE_LAYERS: usize = 2;
 const MAX_TOK: usize = 10;
 const WIN_MEL: usize = 2040;
+
+/// `run_dj`'s (out, next_state_1, next_state_2) triple.
+type DjOut = (Vec<f32>, Vec<f32>, Vec<f32>);
 
 /// Engine `Encoder`-trait seam for the Parakeet FastConformerEncoder (the contract the parakeet
 /// crate was built to fit). `ParakeetAsr` uses the proven `encode()` path internally; this adapter
@@ -45,26 +49,26 @@ pub struct ParakeetAsr {
 impl ParakeetAsr {
     /// `cfg.artifacts.weights` points at the parakeet artifact dir (contains preprocessor.onnx,
     /// decoder_joint.onnx, vocab.txt, encoder/). Opens its own NPU device via `new_npu`.
-    pub fn build(cfg: &ScenarioConfig, root: &Path) -> Self {
-        let env = Env::new().expect("onnx env"); // Env::new() returns Rc<Env>
+    pub fn build(cfg: &ScenarioConfig, root: &Path) -> Result<Self, EngineError> {
+        let env = Env::new().map_err(|e| EngineError::Load(format!("onnx env: {e}")))?; // Env::new() returns Rc<Env>
         let pk = root.join(&cfg.artifacts.weights);
-        let load = |f: &str| {
+        let load = |f: &str| -> Result<Session, EngineError> {
             Session::load(&env, pk.join(f).to_str().unwrap())
-                .unwrap_or_else(|e| panic!("load {f}: {e}"))
+                .map_err(|e| EngineError::Load(format!("load {f}: {e}")))
         };
-        let prep = load("preprocessor.onnx");
-        let dj = load("decoder_joint.onnx");
+        let prep = load("preprocessor.onnx")?;
+        let dj = load("decoder_joint.onnx")?;
         let xroot = std::env::var("NPU_XCLBIN_ROOT")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| root.to_path_buf());
         let enc = FastConformerEncoder::new_npu(&pk.join("encoder"), ModelCfg::PARAKEET_V3, &xroot);
-        let vocab = load_vocab(&pk.join("vocab.txt"));
-        ParakeetAsr { prep, dj, enc, vocab, _env: env }
+        let vocab = load_vocab(&pk.join("vocab.txt"))?;
+        Ok(ParakeetAsr { prep, dj, enc, vocab, _env: env })
     }
 
     /// TDT duration-split greedy decode (mirrors onnx-asr _AsrWithTransducerDecoding +
     /// NemoConformerTdt). Lifted verbatim from parakeet_serve.rs.
-    fn tdt_decode(&self, encoded: &Array2<f32>, valid: usize) -> Vec<i64> {
+    fn tdt_decode(&self, encoded: &Array2<f32>, valid: usize) -> Result<Vec<i64>, EngineError> {
         let mut st1 = vec![0f32; STATE_LAYERS * STATE_DIM];
         let mut st2 = vec![0f32; STATE_LAYERS * STATE_DIM];
         let mut tokens: Vec<i64> = Vec::new();
@@ -72,7 +76,7 @@ impl ParakeetAsr {
         while t < valid {
             let frame = encoded.row(t).to_vec(); // [1024]
             let last = *tokens.last().unwrap_or(&BLANK) as i32;
-            let (out, nst1, nst2) = self.run_dj(&frame, last, &st1, &st2);
+            let (out, nst1, nst2) = self.run_dj(&frame, last, &st1, &st2)?;
             let token = argmax(&out[..VOCAB]); // 8193 token logits
             let step = argmax(&out[VOCAB..VOCAB + N_DUR]) as usize; // duration 0..4
             if token != BLANK {
@@ -89,7 +93,7 @@ impl ParakeetAsr {
                 emitted = 0;
             }
         }
-        tokens
+        Ok(tokens)
     }
 
     fn run_dj(
@@ -98,7 +102,7 @@ impl ParakeetAsr {
         last_tok: i32,
         st1: &[f32],
         st2: &[f32],
-    ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    ) -> Result<DjOut, EngineError> {
         let targets = [last_tok];
         let tlen = [1i32];
         let sd = vec![STATE_LAYERS as i64, 1, STATE_DIM as i64];
@@ -114,8 +118,8 @@ impl ParakeetAsr {
                 ],
                 &["outputs", "output_states_1", "output_states_2"],
             )
-            .expect("decoder_joint");
-        (out.f32(0).to_vec(), out.f32(1).to_vec(), out.f32(2).to_vec())
+            .map_err(|e| EngineError::Device(format!("decoder_joint: {e}")))?;
+        Ok((out.f32(0).to_vec(), out.f32(1).to_vec(), out.f32(2).to_vec()))
     }
 
     fn detokenize(&self, ids: &[i64]) -> String {
@@ -128,7 +132,7 @@ impl ParakeetAsr {
 }
 
 impl AsrModel for ParakeetAsr {
-    fn transcribe(&self, samples: &[i16]) -> String {
+    fn transcribe(&self, samples: &[i16]) -> Result<String, EngineError> {
         // NO-DOUBLE-COUNT RULE: `report()` SUMS every recorded (stage,bucket). The
         // FastConformerEncoder self-attributes 100% of `encode()` internally (ff/mhsa/conv/ln/...),
         // so we deliberately do NOT wrap `self.enc.encode(...)` in a PhaseScope -- a wrapping
@@ -150,7 +154,7 @@ impl AsrModel for ParakeetAsr {
                     ],
                     &["features", "features_lens"],
                 )
-                .expect("preprocessor");
+                .map_err(|e| EngineError::Device(format!("preprocessor: {e}")))?;
             let t = feat.shape(0)[2] as usize; // [1,128,T]
             let feats = feat.f32(0); // [128*T] channel-major
             let teff = t.min(WIN_MEL);
@@ -169,16 +173,17 @@ impl AsrModel for ParakeetAsr {
         let ids = {
             // tdt_decode: TDT greedy decode loop (per-frame decoder_joint.onnx calls). Leaf Host.
             let _d = PhaseScope::new("tdt_decode", Bucket::Host);
-            self.tdt_decode(&encoded, valid)
+            self.tdt_decode(&encoded, valid)?
         };
         // detok: token -> text assembly. Leaf Host.
         let _t = PhaseScope::new("detok", Bucket::Host);
-        self.detokenize(&ids)
+        Ok(self.detokenize(&ids))
     }
 }
 
-fn load_vocab(path: &Path) -> HashMap<i64, String> {
-    let txt = std::fs::read_to_string(path).expect("vocab");
+fn load_vocab(path: &Path) -> Result<HashMap<i64, String>, EngineError> {
+    let txt = std::fs::read_to_string(path)
+        .map_err(|e| EngineError::Load(format!("vocab {}: {e}", path.display())))?;
     let mut m = HashMap::new();
     for line in txt.lines() {
         if let Some((tok, id)) = line.rsplit_once(' ') {
@@ -187,7 +192,7 @@ fn load_vocab(path: &Path) -> HashMap<i64, String> {
             }
         }
     }
-    m
+    Ok(m)
 }
 
 fn argmax(v: &[f32]) -> i64 {

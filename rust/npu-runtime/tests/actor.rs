@@ -20,7 +20,7 @@ fn actor_serves_and_echoes_model() {
             ModelCfg { name: "asr".into(), scenario: "y".into() },
         ],
     };
-    let (h, join) = start(cfg, Box::new(MockLoader { table: t }));
+    let (h, join) = start(cfg, Box::new(MockLoader { table: t })).unwrap();
     let e = h.embed(None, "hi").unwrap();
     assert_eq!(e.model, "bge");
     assert_eq!(e.value.len(), 8);
@@ -46,7 +46,7 @@ fn actor_hot_swaps_at_one_slot() {
             ModelCfg { name: "bge".into(), scenario: "y".into() },
         ],
     };
-    let (h, join) = start(cfg, Box::new(MockLoader { table: t }));
+    let (h, join) = start(cfg, Box::new(MockLoader { table: t })).unwrap();
     for _ in 0..2 {
         assert_eq!(h.embed(None, "hi").unwrap().model, "bge");
         assert_eq!(h.transcribe(None, vec![0i16; 4], 16_000).unwrap().model, "asr");

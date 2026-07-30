@@ -6,6 +6,7 @@ pub mod head;
 use std::path::Path;
 use std::rc::Rc;
 
+use crate::api::EngineError;
 use crate::config::ScenarioConfig;
 use crate::pipeline::{Frontend, Head};
 use encoder::BertEncoder;
@@ -21,11 +22,12 @@ pub struct EmbedPipeline {
 }
 
 impl EmbedPipeline {
-    pub fn build(cfg: &ScenarioConfig, root: &Path, dev: Rc<Device>) -> Self {
+    pub fn build(cfg: &ScenarioConfig, root: &Path, dev: Rc<Device>) -> Result<Self, EngineError> {
         // Uniform declarative entry point: checkpoint (bake-on-missing) when artifacts.source is set,
         // else the legacy npy dir -- all behind one call.
         let weights = Rc::new(
-            BertWeights::load_for(&cfg.artifacts, root, cfg.model.n_layers).expect("bert weights"),
+            BertWeights::load_for(&cfg.artifacts, root, cfg.model.n_layers)
+                .map_err(|e| EngineError::Load(format!("bert weights: {e}")))?,
         );
         let frontend = EmbedFrontend::new(
             &root.join(&cfg.artifacts.tokenizer), weights.clone(), cfg.model.max_seq);
@@ -34,7 +36,7 @@ impl EmbedPipeline {
             pooling: Pooling::parse(&cfg.embeddings.pooling),
             normalize: cfg.embeddings.normalize,
         };
-        EmbedPipeline { frontend, encoder, head }
+        Ok(EmbedPipeline { frontend, encoder, head })
     }
 
     /// Full pipeline: text -> embedding vector.
@@ -46,7 +48,7 @@ impl EmbedPipeline {
 }
 
 impl crate::pipeline::Embedder for EmbedPipeline {
-    fn embed_one(&self, text: String) -> Vec<f32> {
-        self.embed(text)
+    fn embed_one(&self, text: String) -> Result<Vec<f32>, EngineError> {
+        Ok(self.embed(text))
     }
 }

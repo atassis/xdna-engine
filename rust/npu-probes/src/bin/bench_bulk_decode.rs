@@ -36,7 +36,7 @@ fn main() {
     let sort_key: Vec<usize> = samples.iter().map(|s| s.len()).collect();
 
     let cfg = ScenarioConfig::load(Path::new(SCENARIO)).expect("load scenario");
-    let asr = WhisperAsr::build(&cfg, Path::new("."));
+    let asr = WhisperAsr::build(&cfg, Path::new(".")).expect("build whisper asr");
     let n = refs.len();
     eprintln!("[bulk] encoding {n} clips (sequential NPU encoder)...");
     let (encs, _prep, _enc) = asr.encode_clips_timed(&refs);

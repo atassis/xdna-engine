@@ -44,7 +44,7 @@ fn main() {
 
     // our pipeline
     let dev = Rc::new(Device::open(0).expect("open NPU (stop flm-asr/voxd first)"));
-    let pipe = EmbedPipeline::build(&cfg, root, dev);
+    let pipe = EmbedPipeline::build(&cfg, root, dev).expect("build embed pipeline");
 
     // oracle: onnx session + a frontend reused only to get matching token ids
     let env = Env::new().expect("onnx env");

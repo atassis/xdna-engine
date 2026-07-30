@@ -137,7 +137,10 @@ pub unsafe extern "C" fn npu_runtime_start(config_path: *const c_char) -> *mut N
         };
         let cfg = match Config::load(&p) { Ok(c) => c, Err(e) => { set_error(e); return ptr::null_mut(); } };
         let root = std::env::current_dir().unwrap_or_else(|_| ".".into());
-        let (handle, join) = npu_runtime::start(cfg, Box::new(EngineLoader { root }));
+        let (handle, join) = match npu_runtime::start(cfg, Box::new(EngineLoader { root })) {
+            Ok(hj) => hj,
+            Err(e) => { set_error(e.to_string()); return ptr::null_mut(); }
+        };
         Box::into_raw(Box::new(NpuRuntime { handle, join: Some(join), cfg_path: p }))
     }));
     r.unwrap_or_else(|_| { set_error("panic in npu_runtime_start"); ptr::null_mut() })

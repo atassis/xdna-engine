@@ -35,7 +35,7 @@ fn main() {
     println!("tokenizer OK ({} ids match HF)", ours_ids.len());
 
     let dev = Rc::new(Device::open(0).expect("open NPU (stop other NPU services first)"));
-    let pipe = EsmEmbedPipeline::build(&cfg, root, dev);
+    let pipe = EsmEmbedPipeline::build(&cfg, root, dev).expect("build esm pipeline");
     let ours = pipe.embed(seq);
 
     let cos = cosine(&ours, &oracle);

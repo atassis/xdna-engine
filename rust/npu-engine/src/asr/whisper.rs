@@ -23,6 +23,7 @@ use npu_whisper::config::WhisperCfg;
 use npu_whisper::encoder::WhisperEncoder;
 use tokenizers::Tokenizer;
 
+use crate::api::EngineError;
 use crate::asr::whisper_decoder::{BatchedFusedDecoder, FusedDecoder, HostDecoder, WhisperDecoderWeights};
 use crate::config::ScenarioConfig;
 use crate::pipeline::AsrModel;
@@ -217,22 +218,24 @@ pub struct WhisperAsr {
 impl WhisperAsr {
     /// `cfg.artifacts.weights` points at `artifacts/whisper-small` (weights + `onnx/` + the exported
     /// `preprocessor.onnx` + `tokenizer.json`). Opens its own NPU device inside `new_npu`.
-    pub fn build(cfg: &ScenarioConfig, root: &Path) -> Self {
-        let env = Env::new().expect("onnx env");
+    pub fn build(cfg: &ScenarioConfig, root: &Path) -> Result<Self, EngineError> {
+        let env = Env::new().map_err(|e| EngineError::Load(format!("onnx env: {e}")))?;
         let ws = root.join(&cfg.artifacts.weights); // artifacts/whisper-small
-        let load = |p: std::path::PathBuf| {
+        let load = |p: std::path::PathBuf| -> Result<Session, EngineError> {
             Session::load(&env, p.to_str().unwrap())
-                .unwrap_or_else(|e| panic!("load {}: {e}", p.display()))
+                .map_err(|e| EngineError::Load(format!("load {}: {e}", p.display())))
         };
-        let prep = load(ws.join("preprocessor.onnx"));
-        let decoder = load(ws.join("onnx/decoder_model.onnx"));
-        let decoder_past = load(ws.join("onnx/decoder_with_past_model.onnx"));
+        let prep = load(ws.join("preprocessor.onnx"))?;
+        let decoder = load(ws.join("onnx/decoder_model.onnx"))?;
+        let decoder_past = load(ws.join("onnx/decoder_with_past_model.onnx"))?;
         let xroot = std::env::var("NPU_XCLBIN_ROOT")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| root.to_path_buf());
+        // WhisperEncoder::new_npu still panics internally on failure (npu-whisper crate, out of
+        // scope for this pass -- see engine-errors-are-real worklog).
         let enc = WhisperEncoder::new_npu(&ws, WhisperCfg::SMALL, &xroot);
         let tok = Tokenizer::from_file(ws.join("tokenizer.json"))
-            .unwrap_or_else(|e| panic!("load tokenizer.json: {e}"));
+            .map_err(|e| EngineError::Load(format!("load tokenizer.json: {e}")))?;
 
         // NPU_DECODE: route the per-token decoder matmuls to the NPU (HostDecoder::new_npu) instead
         // of the ONNX decoder graphs. Built ONCE here (weights + resident CtxDecode kernels), sharing
@@ -245,18 +248,19 @@ impl WhisperAsr {
         let npu_on = std::env::var("NPU_DECODE").is_ok();
         let batch_on = std::env::var("NPU_DECODE_FUSED_BATCH").is_ok();
         let (npu_decoder, npu_fused, npu_fused_batch) = if fused_on || npu_on || batch_on {
-            let dev = enc
-                .device()
-                .expect("NPU decode: encoder must hold an open NPU device (built via new_npu)");
+            let dev = enc.device().ok_or_else(|| EngineError::Load(
+                "NPU decode: encoder must hold an open NPU device (built via new_npu)".into()))?;
             let weights = Rc::new(
                 WhisperDecoderWeights::load(&ws.join("whisper_decoder"))
-                    .expect("NPU decode: load whisper_decoder host weights"),
+                    .map_err(|e| EngineError::Load(format!("load whisper_decoder host weights: {e}")))?,
             );
             // Subsystem B: batched decoder (offline-bulk), independent of the single-stream backend.
+            // BatchedFusedDecoder::new still panics internally on failure (whisper_decoder.rs, out of
+            // scope for this pass).
             let nfb = if batch_on {
                 let bdir = std::path::PathBuf::from(
-                    std::env::var("NPU_DECODE_FUSED_BATCH_DIR")
-                        .expect("NPU_DECODE_FUSED_BATCH requires NPU_DECODE_FUSED_BATCH_DIR"),
+                    std::env::var("NPU_DECODE_FUSED_BATCH_DIR").map_err(|_| EngineError::Load(
+                        "NPU_DECODE_FUSED_BATCH requires NPU_DECODE_FUSED_BATCH_DIR".into()))?,
                 );
                 eprintln!("[whisper] batched fused decode dir: {}", bdir.display());
                 // O1: share the encoder's resident ctx2 kernel so the batched cross-K/V fold runs on
@@ -276,10 +280,13 @@ impl WhisperAsr {
                 };
                 eprintln!("[whisper] fused decode ELF dir: {}", fdir.display());
                 // Share the encoder's resident ctx2 kernel so the cross-K/V fold runs on the NPU.
+                // FusedDecoder::new still panics internally on failure (whisper_decoder.rs, out of
+                // scope for this pass).
                 let fd = FusedDecoder::new(weights, &dev, &fdir, enc.shared());
                 eprintln!("[whisper] NPU_DECODE_FUSED=1: whole 12-layer decode in ONE fused-ELF dispatch/token");
                 (None, Some(RefCell::new(fd)), nfb)
             } else {
+                // HostDecoder::new_npu still panics internally on failure, same scope note as above.
                 let dec = HostDecoder::new_npu(weights, &dev, &xroot);
                 eprintln!("[whisper] NPU_DECODE=1: per-token decoder matmuls on the NPU");
                 (Some(RefCell::new(dec)), None, nfb)
@@ -288,7 +295,7 @@ impl WhisperAsr {
             (None, None, None)
         };
 
-        WhisperAsr { prep, decoder, decoder_past, enc, tok, npu_decoder, npu_fused, npu_fused_batch, _env: env }
+        Ok(WhisperAsr { prep, decoder, decoder_past, enc, tok, npu_decoder, npu_fused, npu_fused_batch, _env: env })
     }
 
     /// Step 0: run the no-past graph over the full prompt + encoder hidden states. Delegates to the
@@ -679,7 +686,7 @@ impl WhisperAsr {
 }
 
 impl AsrModel for WhisperAsr {
-    fn transcribe(&self, samples: &[i16]) -> String {
+    fn transcribe(&self, samples: &[i16]) -> Result<String, EngineError> {
         let timing = std::env::var("WHISPER_TIMING").is_ok();
         let t_e2e = std::time::Instant::now();
 
@@ -696,7 +703,7 @@ impl AsrModel for WhisperAsr {
                 &[("waveform", Tensor::F32(&wav, vec![1, N_SAMPLES as i64]))],
                 &["input_features"],
             )
-            .expect("preprocessor");
+            .map_err(|e| EngineError::Device(format!("preprocessor: {e}")))?;
         // input_features: [1, 80, 3000] flat channel-major -> Array2 [80, 3000] for the encoder.
         let feats = feat.f32(0);
         let mut mel = Array2::<f32>::zeros((N_MELS, N_FRAMES));
@@ -719,6 +726,10 @@ impl AsrModel for WhisperAsr {
             dec.borrow().reset_npu_dispatches();
         }
         let t_dec = std::time::Instant::now();
+        // greedy_decode (and the NPU_DECODE*/fused decode machinery it dispatches into,
+        // whisper_decoder.rs) still panics internally on a decode failure -- out of scope for this
+        // pass (engine-errors-are-real): converting that whole resident-context/KV-cache chain is its
+        // own follow-up, not a narrow LOAD/INFERENCE-signature conversion.
         let ids = self.greedy_decode(&flat);
         let dec_ms = t_dec.elapsed().as_secs_f64() * 1e3;
 
@@ -742,7 +753,7 @@ impl AsrModel for WhisperAsr {
                  ms_per_tok={ms_per_tok:.3} disp_per_tok={disp_per_tok:.2}"
             );
         }
-        text
+        Ok(text)
     }
 }
 

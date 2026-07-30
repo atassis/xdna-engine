@@ -9,6 +9,7 @@ pub use frontend::EsmFrontend;
 use std::path::Path;
 use std::rc::Rc;
 
+use crate::api::EngineError;
 use crate::bert::head::{EmbedHead, Pooling};
 use crate::config::ScenarioConfig;
 use crate::esm::{encoder::{EsmEncoder, EsmEncoderNative}, frontend::EsmFrontend as Frontend_, weights::EsmWeights};
@@ -24,11 +25,12 @@ pub struct EsmEmbedPipeline {
     head: EmbedHead,
 }
 impl EsmEmbedPipeline {
-    pub fn build(cfg: &ScenarioConfig, root: &Path, dev: Rc<Device>) -> Self {
+    pub fn build(cfg: &ScenarioConfig, root: &Path, dev: Rc<Device>) -> Result<Self, EngineError> {
         // Uniform declarative entry point: checkpoint (bake-on-missing) when artifacts.source is set,
         // else NPU_WEIGHTS_CHECKPOINT env, else the legacy npy dir -- all behind one call.
         let w = Rc::new(
-            EsmWeights::load_for(&cfg.artifacts, root, cfg.model.n_layers).expect("esm weights"),
+            EsmWeights::load_for(&cfg.artifacts, root, cfg.model.n_layers)
+                .map_err(|e| EngineError::Load(format!("esm weights: {e}")))?,
         );
         let frontend = Frontend_::new(w.clone(), cfg.model.max_seq);
         let m = &cfg.model;
@@ -41,7 +43,7 @@ impl EsmEmbedPipeline {
             pooling: Pooling::parse(&cfg.embeddings.pooling),
             normalize: cfg.embeddings.normalize,
         };
-        EsmEmbedPipeline { frontend, encoder, head }
+        Ok(EsmEmbedPipeline { frontend, encoder, head })
     }
     /// Full pipeline: protein string -> embedding vector.
     pub fn embed(&self, seq: String) -> Vec<f32> {
@@ -52,7 +54,7 @@ impl EsmEmbedPipeline {
 }
 
 impl crate::pipeline::Embedder for EsmEmbedPipeline {
-    fn embed_one(&self, text: String) -> Vec<f32> {
-        self.embed(text)
+    fn embed_one(&self, text: String) -> Result<Vec<f32>, EngineError> {
+        Ok(self.embed(text))
     }
 }
