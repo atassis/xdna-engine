@@ -45,6 +45,9 @@ RES_CTX = 6 * 1 + 6 * 3 + 6 * 9             # 78, at the OUTPUT rate
 V = 128                                     # target valid outputs
 S = 20000                                   # stage-4 INPUT index the segment starts at
 L_IN = UP_CTX + (V + RES_CTX) // STRIDE     # 105
+import os
+# Force chunking on a stage that does not need it: same answer proves the split is correct.
+CI_CHUNK = int(os.environ.get('CI_CHUNK', '0')) or None
 GATE = 3e-2
 
 
@@ -74,7 +77,7 @@ print(f"  upsample -> {up.shape}", flush=True)
 
 cur = up
 for i, (sub, dil) in enumerate((("block.2", 1), ("block.3", 3), ("block.4", 9))):
-    cur = wd.residual_unit(cur, unit_weights(sub), dil, f"s4u{i}")
+    cur = wd.residual_unit(cur, unit_weights(sub), dil, f"s4u{i}", ci_chunk=CI_CHUNK)
     print(f"  residual dil {dil} -> {cur.shape}", flush=True)
 
 assert cur.shape == truth.shape, f"{cur.shape} vs {truth.shape}"
