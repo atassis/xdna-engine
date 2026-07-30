@@ -25,6 +25,25 @@
 #     `.o:` rules (grep on the tracked text Make itself parses) -- not an assumed list, not a
 #     directory walk (so untracked/generated files sitting in kernels_dir, e.g. .o/.stamp/.mlir
 #     build output, are never touched or flagged).
+#  3. KERNEL_CC (the compiler that actually turns those .cc files into .o -- route_b_override.mk:
+#     `KERNEL_CC=${PEANO_INSTALL_DIR}/bin/clang++`): resolved the SAME way, via the SAME --eval
+#     call, never re-derived. This is a SECOND, independent provenance axis found by the
+#     FindPeano lane 2026-07-30: a Peano `clang`/`clang++` embeds its own build SHA in
+#     `--version`'s VCS banner (LLVM_REPOSITORY/LLVM_REVISION, clang/lib/Basic/Version.cpp), e.g.
+#       clang version 21.0.0git (https://github.com/Xilinx/llvm-aie.git dfadd0855266e8898cd675c2eba2ea0df32baa9f)
+#     confirmed to match toolchain.lock's PEANO_FORK_COMMIT exactly on the pinned install. Kernel
+#     SOURCE and COMPILER IDENTITY are independent failure axes -- correct source through a wrong
+#     or unresolved compiler is just as silent a miscompile as wrong source through the right
+#     compiler -- so both are gated here. Two caveats the FindPeano lane confirmed and this script
+#     therefore does NOT rely on: `llc`/`opt`/`llvm-ar --version` print only a bare "LLVM version
+#     21.0.0git" with no repo/SHA (clang/clang++ specifically is the one carrying provenance, so
+#     that is the only binary this checks); and no Peano install ships a CMake package config
+#     (no `lib/cmake/*Config.cmake` to read instead). Separately, the same lane found
+#     mlir-aie's CMakeLists.txt:71-76 takes PEANO_INSTALL_DIR from the environment into a CACHE
+#     STRING with zero existence check -- this script does not depend on that path at all (it
+#     invokes the resolved clang/clang++ binary directly and fails loud itself if absent), so it
+#     is unaffected whether or not that lane's fix (branch cmake/validate-peano-install-dir,
+#     unmerged) is present.
 #
 # GROUND TRUTH is picked PER FILE, by CONTENT-comparison, never by comparing paths (comparing
 # paths would flag "kernels_dir points at the submodule" even when that submodule happens to be
@@ -39,13 +58,20 @@
 #    these against the toolchain instance would be a false positive (upstream may not even have
 #    the file, or has the unpatched original) -- sync_kernels.sh's own contract is the copy at
 #    kernels_dir must equal route_b_kernels/, so that is what we check.
+#  - KERNEL_CC (compiler identity): ground truth = toolchain.lock's PEANO_FORK_COMMIT, checked
+#    against the resolved clang/clang++'s own --version VCS banner (see point 3 above). If
+#    toolchain.lock has no PEANO_FORK_COMMIT (a future lock shape using PEANO_DIST only), this
+#    sub-check is SKIPPED with a loud note rather than failed -- PEANO_FORK_COMMIT is today's
+#    "active Peano" field per toolchain.lock's own header comment, not guaranteed forever, and an
+#    inapplicable axis should not block the kernel-source axis it is additive to.
 #
 # Usage: scripts/verify_kernel_source.sh [Makefile.modal|Makefile.modal.int8|Makefile.resident ...]
-#   No args = check the full family. Exit 0 = every resolved source matches its ground truth and
-#   an OK line is printed per file; also stamps build/.kernel_source_manifest (verified-hash
-#   record, informational -- the exit code is the gate, not the file). Exit 1 = drift or a
-#   resolution failure; message names the Makefile, the file, both paths, both hashes, and how to
-#   fix it. Never mutates kernels_dir or the pin -- read-only except for the manifest stamp.
+#   No args = check the full family. Exit 0 = every resolved source AND the resolved compiler
+#   match their ground truth; an OK line is printed per check; also stamps
+#   build/.kernel_source_manifest (verified-hash record, informational -- the exit code is the
+#   gate, not the file). Exit 1 = drift or a resolution failure; message names the Makefile, the
+#   file/binary, both paths, both hashes/SHAs, and how to fix it. Never mutates kernels_dir,
+#   PEANO_INSTALL_DIR, or the pin -- read-only except for the manifest stamp.
 set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"; cd "$REPO"
 
@@ -61,11 +87,29 @@ family=("$@")
 # kernels_dir depend on something else, asking Make (not this list) is still what answers it.
 npu2_var="${NPU2:-1}"
 
-resolve_kernels_dir() {
+# PEANO_INSTALL_DIR drives KERNEL_CC (see point 3 above). Every real call site already exports it
+# via `source scripts/iron_env.sh` before invoking this script, so it is normally just inherited;
+# self-source as a fallback only for standalone/manual invocation, so this script works on its own.
+if [ -z "${PEANO_INSTALL_DIR:-}" ]; then
+  echo "[verify_kernel_source] PEANO_INSTALL_DIR not in env -- sourcing scripts/iron_env.sh to resolve it (same as every build script does before calling this)" >&2
+  # shellcheck disable=SC1091
+  source scripts/iron_env.sh >/dev/null
+fi
+
+# toolchain.lock's own "active Peano" field (see its header comment); empty on an older/future
+# lock shape that doesn't use it, in which case the KERNEL_CC sub-check is skipped, not failed.
+peano_fork_commit="$(sed -n 's/^PEANO_FORK_COMMIT=\([0-9a-f]*\).*/\1/p' toolchain.lock | head -1)"
+
+# Resolves kernels_dir AND KERNEL_CC in ONE make process (both are plain variable reads off the
+# same real Makefile + real vars -- no reason to pay two process-spawns for two answers). Combines
+# stdout+stderr (sed below only keeps the __KD__/__CC__ lines, so make's own warnings are silently
+# dropped on success) so a genuine make failure -- which `set -e` would otherwise abort on with NO
+# diagnostic, since the caller checks the exit status explicitly via `||` -- is still visible.
+resolve_make_vars() {
   local mk="$1"
   make -s -C "$MMW" -f "$mk" "NPU2=$npu2_var" \
-    --eval='__pf_kdir__: ; @echo __KD__=$(kernels_dir)' __pf_kdir__ 2>/dev/null \
-    | sed -n 's/^__KD__=//p'
+    --eval='__pf_print__: ; @echo __KD__=$(kernels_dir); echo __CC__=$(KERNEL_CC)' \
+    __pf_print__ 2>&1
 }
 
 echo "[verify_kernel_source] resolving pinned toolchain instance (toolchain_up.sh) ..." >&2
@@ -84,12 +128,49 @@ for mk in "${family[@]}"; do
     fail=1; continue
   fi
 
-  kdir_raw="$(resolve_kernels_dir "$mk")"
+  if ! vars_out="$(resolve_make_vars "$mk")"; then
+    echo "[verify_kernel_source] FAIL: make itself failed resolving kernels_dir/KERNEL_CC for $mk:" >&2
+    echo "$vars_out" >&2
+    fail=1; continue
+  fi
+  kdir_raw="$(sed -n 's/^__KD__=//p' <<<"$vars_out")"
+  cc_raw="$(sed -n 's/^__CC__=//p' <<<"$vars_out")"
   if [ -z "$kdir_raw" ]; then
     echo "[verify_kernel_source] FAIL: could not resolve kernels_dir for $mk (make --eval produced nothing -- Makefile shape changed?)" >&2
     fail=1; continue
   fi
   kdir="$(realpath -m "$kdir_raw")"
+
+  # --- axis 2: compiler identity (independent of kernel source; see point 3 in the header) ---
+  checked=$((checked + 1))
+  if [ -z "$cc_raw" ]; then
+    echo "[verify_kernel_source] FAIL $mk: could not resolve KERNEL_CC (make --eval produced nothing -- Makefile shape changed?)" >&2
+    fail=1
+  elif [ ! -x "$cc_raw" ]; then
+    echo "[verify_kernel_source] FAIL $mk: KERNEL_CC resolved to $cc_raw, which is not an executable file -- PEANO_INSTALL_DIR (\"${PEANO_INSTALL_DIR:-<unset>}\") is wrong or the Peano install is missing." >&2
+    fail=1
+  else
+    cc_ver="$("$cc_raw" --version 2>/dev/null | head -1)"
+    cc_sha="$(grep -oP '\(https://\S+\.git \K[0-9a-f]{40}(?=\))' <<<"$cc_ver" || true)"
+    if [ -z "$cc_sha" ]; then
+      echo "[verify_kernel_source] FAIL $mk: KERNEL_CC=$cc_raw produced no VCS/SHA provenance banner (--version: \"$cc_ver\") -- this is not (or no longer looks like) the pinned Peano fork clang; llc/opt/llvm-ar never carry this banner, only clang/clang++ do, so an empty result here means the wrong binary, not the wrong tool." >&2
+      fail=1
+    elif [ -z "$peano_fork_commit" ]; then
+      echo "[verify_kernel_source] NOTE $mk: KERNEL_CC=$cc_raw self-reports $cc_sha, but toolchain.lock has no PEANO_FORK_COMMIT to compare against -- skipping this sub-check (not a failure)." >&2
+    elif [ "$cc_sha" != "$peano_fork_commit" ]; then
+      echo "[verify_kernel_source] FAIL $mk: KERNEL_CC=$cc_raw self-reports build SHA
+    $cc_sha
+  which does NOT match toolchain.lock's PEANO_FORK_COMMIT
+    $peano_fork_commit
+  -- the build would compile with the WRONG compiler (right or wrong kernel source either way).
+  FIX: PEANO_INSTALL_DIR (\"$PEANO_INSTALL_DIR\") is not the toolchain.lock-pinned Peano build --
+  re-run scripts/toolchain_up.sh's Peano provisioning (install_peano_local.sh) for the current pin." >&2
+      fail=1
+    else
+      echo "[verify_kernel_source] OK   $mk KERNEL_CC=$cc_raw self-reports $cc_sha == toolchain.lock PEANO_FORK_COMMIT"
+      manifest_lines+=("$mk KERNEL_CC compiler $cc_sha")
+    fi
+  fi
 
   mapfile -t srcs < <(grep -oP '\$\{kernels_dir\}/\K[A-Za-z0-9_./]+\.cc' "$mkpath" | sort -u)
   if [ ${#srcs[@]} -eq 0 ]; then
@@ -145,7 +226,7 @@ if [ "$checked" -eq 0 ]; then
 fi
 
 if [ "$fail" -ne 0 ]; then
-  echo "[verify_kernel_source] kernel-source provenance check FAILED -- refusing to build stale/drifted kernels." >&2
+  echo "[verify_kernel_source] kernel-source / compiler-identity provenance check FAILED -- refusing to build stale/drifted kernels." >&2
   exit 1
 fi
 
@@ -161,4 +242,4 @@ mkdir -p "$(dirname "$manifest")"
   printf '%s\n' "${manifest_lines[@]}"
 } > "$manifest"
 
-echo "[verify_kernel_source] kernel-source provenance OK ($checked file(s) verified against ground truth)."
+echo "[verify_kernel_source] kernel-source + compiler-identity provenance OK ($checked check(s) verified against ground truth)."
