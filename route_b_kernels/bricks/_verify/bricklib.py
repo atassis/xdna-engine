@@ -45,6 +45,11 @@ def _shim_digest(shim):
 
     A design name that CHANGES whenever the build inputs change.
 
+    `extra` carries build inputs that are NOT in the shim text or the compile flags -- currently the
+    resident objectFIFO depth, which changes the generated design and therefore must change the key.
+    Anything added to the design that is neither source nor a compile flag belongs here, or the
+    cache silently serves an artifact built with different structure.
+
     THE CACHE KEY IS THIS NAME, NOT THE SHIM TEXT. That is the opposite of what this harness
     documented for weeks, and it silently invalidated an unknown number of runs. Measured
     head-to-head: two builds in one process, same brick, same shim body apart from a comment, one
@@ -161,7 +166,7 @@ def _design_key(symbol, *parts):
 
 
 def _build_streamed(symbol, shim, n_tiles, in_tile, out_tile, resident_len, compile_flags,
-                    in_dt, out_dt, resident_dt):
+                    in_dt, out_dt, resident_dt, resident_depth=2):
     """Stream `n_tiles` fixed-size operand tiles past ONE resident operand.
 
     This is the general resident-stream `[tile, D]` delivery: the core acquires the
@@ -172,6 +177,16 @@ def _build_streamed(symbol, shim, n_tiles, in_tile, out_tile, resident_len, comp
 
     The kernel is invoked as `kern(tile_in, resident, tile_out)`. If resident_len == 0 the
     resident fifo is omitted and it is `kern(tile_in, tile_out)`.
+
+    `resident_depth` is the objectFIFO depth of the RESIDENT operand only. It defaults to 2, the
+    IRON default, so every brick gated before this parameter existed is unaffected. Pass 1 when the
+    resident is large: the core acquires it ONCE before the loop and releases it after (see `core`
+    below), so exactly one buffer is ever live and the second is pure waste -- and it is waste of
+    the scarcest resource, since a core tile has 64 KB total. Measured: gather-rows' 1024x8 f32
+    codebook is 32 KB, which at depth 2 asks for 64 KB on that fifo alone and aiecc fails with
+    "'aie.tile' op Basic sequential allocation also failed"; at depth 1 the same design fits.
+    Depth 2 remains the default because a STREAMED operand genuinely wants double buffering (that
+    is what overlaps the next tile's DMA with this tile's compute); a resident one never does.
 
     Row-wise verification (`_build_rowwise`) is the special case where one tile is one row
     of a matrix; `verify_streamed` is the tiled-operand case. Both are the same design.
@@ -194,7 +209,7 @@ def _build_streamed(symbol, shim, n_tiles, in_tile, out_tile, resident_len, comp
                                     arg_types=[in_row, cst_ty, out_row],
                                     compile_flags=compile_flags)
             inf = ObjectFifo(in_row, name="inf")
-            cf = ObjectFifo(cst_ty, name="cf")
+            cf = ObjectFifo(cst_ty, name="cf", depth=resident_depth)
             of = ObjectFifo(out_row, name="of")
 
             def core(inf, cf, of, kern):
@@ -225,7 +240,7 @@ def _build_streamed(symbol, shim, n_tiles, in_tile, out_tile, resident_len, comp
             ).resolve_program()
         design.__name__ = design.__qualname__ = _design_key(
             symbol, n_tiles, in_tile, out_tile, resident_len, in_dt, out_dt, resident_dt,
-            compile_flags, _shim_digest(shim))
+            compile_flags, resident_depth, _shim_digest(shim))
         return iron.jit(design, use_cache=_JIT_CACHE)
 
     def design(inp: In, out: Out):
@@ -445,7 +460,7 @@ def verify_oneshot(name, brick_cc, shim_body, symbol, inputs, out_numel, out_sha
 
 def verify_streamed(name, shim, symbol, in_tiles, out_tile_numel, resident,
                     unpack, golden, gate, in_dt, out_dt, resident_dt=None,
-                    compile_flags=None):
+                    compile_flags=None, resident_depth=2):
     """Gate a brick whose operands are too big to stage whole into L1.
 
     `verify_oneshot` moves every operand into L1 in one piece, so it can only gate shapes
@@ -466,7 +481,7 @@ def verify_streamed(name, shim, symbol, in_tiles, out_tile_numel, resident,
     n_tiles, in_tile = in_tiles.shape
     resident_len = 0 if resident is None else int(np.asarray(resident).size)
     design = _build_streamed(symbol, shim, n_tiles, in_tile, out_tile_numel, resident_len,
-                             compile_flags, in_dt, out_dt, resident_dt)
+                             compile_flags, in_dt, out_dt, resident_dt, resident_depth)
 
     def run_once():
         in_t = iron.tensor(np.ascontiguousarray(in_tiles.reshape(-1)), dtype=in_dt,
