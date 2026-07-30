@@ -28,6 +28,8 @@ use npu_asr::engines::PAD_M;
 use npu_asr_host::gelu;
 use npu_xrt::Device;
 
+use crate::api::EngineError;
+
 const D: usize = 768;
 const N_LAYERS: usize = 12;
 const N_HEADS: usize = 12;
@@ -300,18 +302,18 @@ impl HostDecoder {
     /// the `whole_array/build` xclbins live). Registers every per-token weight ONCE (fused self-QKV,
     /// self out, cross q/out, fc1, fc2) — this loads the needed resident xclbins and panics with a
     /// clear message if a shape's xclbin is missing (build via scripts/build_decode_kernels.sh).
-    pub fn new_npu(w: Rc<WhisperDecoderWeights>, dev: &Rc<Device>, root: &Path) -> Self {
+    pub fn new_npu(w: Rc<WhisperDecoderWeights>, dev: &Rc<Device>, root: &Path) -> Result<Self, EngineError> {
         let mut decode = CtxDecode::new(dev, root);
         let layers = w
             .layers
             .iter()
-            .map(|lw| {
+            .map(|lw| -> Result<NpuLayer, EngineError> {
                 // Fused self-QKV: concat q|k|v weights [768,768] each -> [768,2304]; biases likewise.
                 let qkv_w = ndarray::concatenate(
                     Axis(1),
                     &[lw.q_w.view(), lw.k_w.view(), lw.v_w.view()],
                 )
-                .expect("concat self qkv weights");
+                .map_err(|e| EngineError::Load(format!("concat self qkv weights: {e}")))?;
                 let mut qkv_b = Vec::with_capacity(3 * D);
                 qkv_b.extend_from_slice(lw.q_b.as_slice().unwrap());
                 qkv_b.extend_from_slice(lw.k_b.as_slice().unwrap());
@@ -328,7 +330,7 @@ impl HostDecoder {
                     &qkv_b,
                 );
 
-                NpuLayer {
+                Ok(NpuLayer {
                     qkv: decode.register_weight(&qkv_w, DecodeEpi::Bias, &qkv_b),
                     qkv_fused,
                     self_out: decode.register_weight(
@@ -356,9 +358,9 @@ impl HostDecoder {
                         DecodeEpi::Bias,
                         lw.fc2_b.as_slice().unwrap(),
                     ),
-                }
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
         let state = (0..N_LAYERS).map(|_| LayerState::default()).collect();
         // On-NPU self-attention is opt-in via NPU_DECODE_ATTN (only meaningful with the NPU active).
         let npu_attn = std::env::var("NPU_DECODE_ATTN").is_ok();
@@ -366,10 +368,10 @@ impl HostDecoder {
             // Preload the MHA xclbin so a missing artifact fails loudly at construction, not mid-decode.
             decode
                 .ensure_attn_loaded()
-                .unwrap_or_else(|e| panic!("NPU_DECODE_ATTN set but MHA kernel unavailable: {e}"));
+                .map_err(|e| EngineError::Load(format!("NPU_DECODE_ATTN set but MHA kernel unavailable: {e}")))?;
             eprintln!("[whisper_decoder] NPU_DECODE_ATTN: on-chip SELF-attention enabled (cross+FFN stay host/step-1)");
         }
-        HostDecoder { w, state, npu: Some(NpuCtx { decode, layers }), npu_attn }
+        Ok(HostDecoder { w, state, npu: Some(NpuCtx { decode, layers }), npu_attn })
     }
 
     /// Clear the self-KV caches for a new utterance. (Cross-KV must be re-set via `precompute_cross`.)
@@ -398,7 +400,7 @@ impl HostDecoder {
 
     /// One decode step: token `token` at position `pos`. Updates the self-KV cache and returns the
     /// vocab logits `[51865]`.
-    pub fn step(&mut self, token: i64, pos: usize) -> Vec<f32> {
+    pub fn step(&mut self, token: i64, pos: usize) -> Result<Vec<f32>, EngineError> {
         // input embedding: embed_tokens[token] + embed_positions[pos]
         let tok = token as usize;
         // MAX_DECODE (200, in whisper.rs) must stay < embed_positions rows (448).
@@ -442,13 +444,13 @@ impl HostDecoder {
                             &mut st.self_v,
                             n_before,
                         )
-                        .expect("npu collapsed self-attn (QKV→MHA→O)");
+                        .map_err(|e| EngineError::Device(format!("npu collapsed self-attn (QKV→MHA→O): {e}")))?;
                     st.n_self += 1;
                     out
                 } else {
                     // NPU step-1: host LN_self + fused qkv gemv, host attend_one, npu self-out gemv.
                     let ln = ln_row(&x, &lw.ln_self_w, &lw.ln_self_b);
-                    let qkv = ctx.decode.gemv(&nl.qkv, &ln).expect("npu self-qkv gemv");
+                    let qkv = ctx.decode.gemv(&nl.qkv, &ln).map_err(|e| EngineError::Device(format!("npu self-qkv gemv: {e}")))?;
                     let (q, k, v) = (
                         &qkv[0..D],
                         &qkv[D..2 * D],
@@ -460,7 +462,7 @@ impl HostDecoder {
                     st.n_self += 1;
                     let st = &self.state[li];
                     let ctx_vec = attend_one(q, &st.self_k, &st.self_v, st.n_self);
-                    ctx.decode.gemv(&nl.self_out, &ctx_vec).expect("npu self-out gemv")
+                    ctx.decode.gemv(&nl.self_out, &ctx_vec).map_err(|e| EngineError::Device(format!("npu self-out gemv: {e}")))?
                 }
             } else {
                 // Pure host path.
@@ -483,7 +485,7 @@ impl HostDecoder {
             // --- 2. cross-attention (pre-norm) ---
             let ln = ln_row(&x, &lw.ln_cross_w, &lw.ln_cross_b);
             let q = match (npu, npu_layer) {
-                (Some(ctx), Some(nl)) => ctx.decode.gemv(&nl.cross_q, &ln).expect("npu cross-q gemv"),
+                (Some(ctx), Some(nl)) => ctx.decode.gemv(&nl.cross_q, &ln).map_err(|e| EngineError::Device(format!("npu cross-q gemv: {e}")))?,
                 _ => linear_row(&ln, &lw.cross_q_w, &lw.cross_q_b),
             };
             let st = &self.state[li];
@@ -492,7 +494,7 @@ impl HostDecoder {
             let cv = st.cross_v.as_standard_layout();
             let ctx_vec = attend_one(&q, ck.as_slice().unwrap(), cv.as_slice().unwrap(), t_enc);
             let attn = match (npu, npu_layer) {
-                (Some(ctx), Some(nl)) => ctx.decode.gemv(&nl.cross_out, &ctx_vec).expect("npu cross-out gemv"),
+                (Some(ctx), Some(nl)) => ctx.decode.gemv(&nl.cross_out, &ctx_vec).map_err(|e| EngineError::Device(format!("npu cross-out gemv: {e}")))?,
                 _ => linear_row(&ctx_vec, &lw.cross_out_w, &lw.cross_out_b),
             };
             for d in 0..D {
@@ -502,13 +504,13 @@ impl HostDecoder {
             // --- 3. feed-forward (pre-norm) ---
             let ln = ln_row(&x, &lw.ln_final_w, &lw.ln_final_b);
             let h1 = match (npu, npu_layer) {
-                (Some(ctx), Some(nl)) => ctx.decode.gemv(&nl.fc1, &ln).expect("npu fc1 gemv"),
+                (Some(ctx), Some(nl)) => ctx.decode.gemv(&nl.fc1, &ln).map_err(|e| EngineError::Device(format!("npu fc1 gemv: {e}")))?,
                 _ => linear_row(&ln, &lw.fc1_w, &lw.fc1_b),
             }; // [3072]
             debug_assert_eq!(h1.len(), FFN);
             let h1 = gelu_row(&h1); // GELU stays on host
             let h2 = match (npu, npu_layer) {
-                (Some(ctx), Some(nl)) => ctx.decode.gemv(&nl.fc2, &h1).expect("npu fc2 gemv"),
+                (Some(ctx), Some(nl)) => ctx.decode.gemv(&nl.fc2, &h1).map_err(|e| EngineError::Device(format!("npu fc2 gemv: {e}")))?,
                 _ => linear_row(&h1, &lw.fc2_w, &lw.fc2_b),
             }; // [768]
             for d in 0..D {
@@ -531,7 +533,7 @@ impl HostDecoder {
                 logits[j] += xi * row[j];
             }
         }
-        logits
+        Ok(logits)
     }
 }
 
@@ -604,12 +606,14 @@ struct ProjOutElf {
 }
 
 impl ProjOutElf {
-    fn load(dev: &Rc<Device>, dir: &Path, _w: &WhisperDecoderWeights) -> Self {
+    fn load(dev: &Rc<Device>, dir: &Path, _w: &WhisperDecoderWeights) -> Result<Self, EngineError> {
         let elf = std::fs::read(dir.join("projout.elf"))
-            .unwrap_or_else(|e| panic!("read projout.elf: {e} (run scripts/build_projout_elf.sh)"));
-        let meta: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(dir.join("meta.json")).expect("read projout meta.json"))
-                .expect("parse projout meta.json");
+            .map_err(|e| EngineError::Load(format!("read projout.elf: {e} (run scripts/build_projout_elf.sh)")))?;
+        let meta: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(dir.join("meta.json"))
+                .map_err(|e| EngineError::Load(format!("read projout meta.json: {e}")))?,
+        )
+        .map_err(|e| EngineError::Load(format!("parse projout meta.json: {e}")))?;
         let usz = |k: &str| meta[k].as_u64().expect(k) as usize;
         let (in_sz, out_sz, scr_sz) = (usz("input_size"), usz("output_size"), usz("scratch_size"));
         let vocab = usz("vocab");
@@ -626,14 +630,16 @@ impl ProjOutElf {
                 BufLoc { arena, off: e["offset"].as_u64().unwrap() as usize, len: e["len"].as_u64().unwrap() as usize },
             );
         }
-        let arena = FusedArena::new(dev, in_sz, out_sz, scr_sz).expect("alloc projout arena");
+        let arena = FusedArena::new(dev, in_sz, out_sz, scr_sz)
+            .map_err(|e| EngineError::Load(format!("alloc projout arena: {e}")))?;
         for name in meta["weights"].as_array().expect("projout weights") {
             let name = name.as_str().unwrap();
             let bytes = std::fs::read(dir.join("buffers").join(format!("{name}.bin")))
-                .unwrap_or_else(|e| panic!("read projout buffer {name}.bin: {e}"));
+                .map_err(|e| EngineError::Load(format!("read projout buffer {name}.bin: {e}")))?;
             let loc = &layout[name];
             assert_eq!(bytes.len(), loc.len, "{name}: blob {} != layout {}", bytes.len(), loc.len);
-            arena.write_at(loc.arena, loc.off, &bytes).unwrap();
+            arena.write_at(loc.arena, loc.off, &bytes)
+                .map_err(|e| EngineError::Load(format!("write projout buffer {name}: {e}")))?;
         }
         // K-aug bias: write the input tail [1, 0…0] (vs elems) at element offset D ONCE. The β·W bias is
         // folded into the GEMV weight's column D, so GEMV(mat, [nrm, 1, 0…]) = norm·(γ⊙W) + β·W = complete
@@ -643,19 +649,21 @@ impl ProjOutElf {
         let x_loc = layout["x"];
         let mut tail = vec![0f32; vs];
         tail[0] = 1.0;
-        arena.write_at(x_loc.arena, x_loc.off + d * 2, &pack_bf16_bytes(&tail)).unwrap();
-        arena.sync_input().unwrap();
-        let kern = dev.load_elf_kernel(&elf, Some("main:sequence")).expect("register projout ELF");
+        arena.write_at(x_loc.arena, x_loc.off + d * 2, &pack_bf16_bytes(&tail))
+            .map_err(|e| EngineError::Load(format!("write projout K-aug tail: {e}")))?;
+        arena.sync_input().map_err(|e| EngineError::Load(format!("sync projout input arena: {e}")))?;
+        let kern = dev.load_elf_kernel(&elf, Some("main:sequence"))
+            .map_err(|e| EngineError::Load(format!("register projout ELF: {e}")))?;
         let has_argmax = meta.get("argmax").and_then(|v| v.as_bool()).unwrap_or(false);
         let cols = meta.get("cols").and_then(|v| v.as_u64()).unwrap_or(8) as usize;
         let vocab_pad = usz("vocab_pad");
         let amax_loc = if has_argmax { Some(layout["amax"]) } else { None };
         eprintln!("[whisper_decoder] NPU_DECODE_PROJOUT_ELF: proj_out GEMV ELF, 1 dispatch/token (vocab_pad={}, K-aug bias{}, weight {:.0} MB)",
             vocab_pad, if has_argmax { ", +on-NPU argmax (validating)" } else { "" }, scr_sz as f64 / 1e6);
-        ProjOutElf {
+        Ok(ProjOutElf {
             arena, kern, x_loc, logits_loc: layout["logits"], vocab, amax_loc, cols, vocab_pad,
             amax_mismatch: std::cell::Cell::new(0), amax_checked: std::cell::Cell::new(0),
-        }
+        })
     }
 
     /// Host cols-way reduce of the NPU per-column partials: `amax` = cols × [val:f32 | idx:i32] (8 B each).
@@ -678,20 +686,23 @@ impl ProjOutElf {
 
     /// `nrm` = affine-free normalized hidden [D]. One NPU dispatch → logits[0:vocab] (β·W bias is folded
     /// into the GEMV via K-aug — the device emits complete logits, no host bias-add).
-    fn logits(&self, nrm: &[f32]) -> Vec<f32> {
+    fn logits(&self, nrm: &[f32]) -> Result<Vec<f32>, EngineError> {
         let xb = pack_bf16_bytes(nrm);
-        self.arena.write_at(self.x_loc.arena, self.x_loc.off, &xb).unwrap();
-        self.arena.sync_input().unwrap();
-        self.arena.dispatch(&self.kern).expect("projout dispatch");
-        self.arena.sync_from_device().unwrap();
+        self.arena.write_at(self.x_loc.arena, self.x_loc.off, &xb)
+            .map_err(|e| EngineError::Device(format!("projout write x: {e}")))?;
+        self.arena.sync_input().map_err(|e| EngineError::Device(format!("projout sync input: {e}")))?;
+        self.arena.dispatch(&self.kern).map_err(|e| EngineError::Device(format!("projout dispatch: {e}")))?;
+        self.arena.sync_from_device().map_err(|e| EngineError::Device(format!("projout sync output: {e}")))?;
         let mut ob = vec![0u8; self.logits_loc.len];
-        self.arena.read_at(self.logits_loc.arena, self.logits_loc.off, &mut ob).unwrap();
+        self.arena.read_at(self.logits_loc.arena, self.logits_loc.off, &mut ob)
+            .map_err(|e| EngineError::Device(format!("projout read logits: {e}")))?;
         let mut logits = unpack_bf16_bytes(&ob); // [vocab_pad]
         logits.truncate(self.vocab);
         // step-2 validation: compare the on-NPU argmax (host cols-way reduce of `amax`) vs host argmax(logits).
         if let Some(al) = self.amax_loc {
             let mut ab = vec![0u8; al.len];
-            self.arena.read_at(al.arena, al.off, &mut ab).unwrap();
+            self.arena.read_at(al.arena, al.off, &mut ab)
+                .map_err(|e| EngineError::Device(format!("projout read amax: {e}")))?;
             let id_npu = self.argmax_from_amax(&ab);
             let mut id_host = 0usize;
             for i in 1..self.vocab {
@@ -709,21 +720,23 @@ impl ProjOutElf {
                 }
             }
         }
-        logits
+        Ok(logits)
     }
 
     /// e2e/NPU steady-state: dispatch + read ONLY the 64-B `amax` partials → token id (host cols-way
     /// reduce). Drops the 104 KB logits readback + host argmax. Requires the argmax-fused ELF.
-    fn token_id(&self, nrm: &[f32]) -> i64 {
-        let al = self.amax_loc.expect("token_id needs the argmax-fused proj_out ELF");
+    fn token_id(&self, nrm: &[f32]) -> Result<i64, EngineError> {
+        let al = self.amax_loc.ok_or_else(|| EngineError::Device("token_id needs the argmax-fused proj_out ELF".into()))?;
         let xb = pack_bf16_bytes(nrm);
-        self.arena.write_at(self.x_loc.arena, self.x_loc.off, &xb).unwrap();
-        self.arena.sync_input().unwrap();
-        self.arena.dispatch(&self.kern).expect("projout dispatch");
-        self.arena.sync_from_device().unwrap();
+        self.arena.write_at(self.x_loc.arena, self.x_loc.off, &xb)
+            .map_err(|e| EngineError::Device(format!("projout write x: {e}")))?;
+        self.arena.sync_input().map_err(|e| EngineError::Device(format!("projout sync input: {e}")))?;
+        self.arena.dispatch(&self.kern).map_err(|e| EngineError::Device(format!("projout dispatch: {e}")))?;
+        self.arena.sync_from_device().map_err(|e| EngineError::Device(format!("projout sync output: {e}")))?;
         let mut ab = vec![0u8; al.len];
-        self.arena.read_at(al.arena, al.off, &mut ab).unwrap();
-        self.argmax_from_amax(&ab)
+        self.arena.read_at(al.arena, al.off, &mut ab)
+            .map_err(|e| EngineError::Device(format!("projout read amax: {e}")))?;
+        Ok(self.argmax_from_amax(&ab))
     }
 
     fn has_argmax(&self) -> bool {
@@ -870,12 +883,14 @@ impl FusedDecoder {
         dev: &Rc<Device>,
         fused_dir: &Path,
         shared: Option<Rc<SharedCtxA>>,
-    ) -> Self {
+    ) -> Result<Self, EngineError> {
         let base_elf = std::fs::read(fused_dir.join("decode.elf"))
-            .unwrap_or_else(|e| panic!("read decode.elf: {e} (run gen_decode.py --layers 12)"));
-        let meta: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(fused_dir.join("meta.json")).expect("read meta.json"))
-                .expect("parse meta.json");
+            .map_err(|e| EngineError::Load(format!("read decode.elf: {e} (run gen_decode.py --layers 12)")))?;
+        let meta: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(fused_dir.join("meta.json"))
+                .map_err(|e| EngineError::Load(format!("read meta.json: {e}")))?,
+        )
+        .map_err(|e| EngineError::Load(format!("parse meta.json: {e}")))?;
         let usz = |k: &str| meta[k].as_u64().expect(k) as usize;
         let (in_sz, out_sz, scr_sz) = (usz("input_size"), usz("output_size"), usz("scratch_size"));
         let output = meta["output"].as_str().expect("output").to_string();
@@ -894,7 +909,8 @@ impl FusedDecoder {
             );
         }
 
-        let arena = FusedArena::new(dev, in_sz, out_sz, scr_sz).expect("alloc fused arenas");
+        let arena = FusedArena::new(dev, in_sz, out_sz, scr_sz)
+            .map_err(|e| EngineError::Load(format!("alloc fused arenas: {e}")))?;
 
         // Write static weight buffers (everything except the per-utterance encoder-K/V and self-KV
         // caches, which we populate in precompute_cross).
@@ -908,10 +924,11 @@ impl FusedDecoder {
                 continue;
             }
             let bytes = std::fs::read(fused_dir.join("buffers").join(format!("{name}.bin")))
-                .unwrap_or_else(|e| panic!("read buffer {name}.bin: {e}"));
+                .map_err(|e| EngineError::Load(format!("read buffer {name}.bin: {e}")))?;
             let loc = &layout[name];
             assert_eq!(bytes.len(), loc.len, "{name}: blob {} != layout {}", bytes.len(), loc.len);
-            arena.write_at(loc.arena, loc.off, &bytes).unwrap();
+            arena.write_at(loc.arena, loc.off, &bytes)
+                .map_err(|e| EngineError::Load(format!("write buffer {name}: {e}")))?;
         }
 
         // BIAS FUSION (K-aug): write the augmentation tail [1, 0..0] (VS elems) ONCE at element offset k of
@@ -927,7 +944,8 @@ impl FusedDecoder {
                 let k = kval.as_u64().expect("fuse_bias_aug k") as usize;
                 for li in 0..nl {
                     let loc = &layout[&format!("L{li}_{suffix}")];
-                    arena.write_at(loc.arena, loc.off + k * 2, &tail_bytes).unwrap();
+                    arena.write_at(loc.arena, loc.off + k * 2, &tail_bytes)
+                        .map_err(|e| EngineError::Load(format!("write K-aug tail L{li}_{suffix}: {e}")))?;
                 }
             }
             if !aug.is_empty() {
@@ -983,8 +1001,8 @@ impl FusedDecoder {
             let sp_head_dim = sp["head_dim"].as_u64().unwrap_or(HEAD_DIM as u64) as u32;
             let res = dev
                 .open_elf_resident(&base_elf, Some("main:sequence"))
-                .expect("open_elf_resident: decode ELF lacks a ctrl scratchpad (rebuild gen_decode.py)");
-            arena.bind_resident(&res).expect("bind resident arena BOs");
+                .map_err(|e| EngineError::Load(format!("open_elf_resident: decode ELF lacks a ctrl scratchpad (rebuild gen_decode.py): {e}")))?;
+            arena.bind_resident(&res).map_err(|e| EngineError::Load(format!("bind resident arena BOs: {e}")))?;
             eprintln!(
                 "[whisper_decoder] DEEP-C resident scratchpad decode: register-once + per-token \
                  kv_off(byte {kv_off_byte})/sm_mask(byte {sm_off_byte}, core={sm_core}) — no patch/reload"
@@ -999,7 +1017,7 @@ impl FusedDecoder {
             eprintln!("[whisper_decoder] FUSED_PHASE_TIMING: per-phase decode breakdown enabled");
         }
         let reuse_ctx = if std::env::var("NPU_DECODE_FUSED_REUSECTX").is_ok() {
-            let c = dev.open_elf_ctx(&base_elf).expect("open persistent fused-ELF hw_context");
+            let c = dev.open_elf_ctx(&base_elf).map_err(|e| EngineError::Load(format!("open persistent fused-ELF hw_context: {e}")))?;
             eprintln!("[whisper_decoder] NPU_DECODE_FUSED_REUSECTX: persistent hw_context — per-token rebind, no re-registration");
             Some(c)
         } else {
@@ -1039,7 +1057,7 @@ impl FusedDecoder {
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|_| fused_dir.parent().unwrap_or(fused_dir).join("projout_elf"));
             if dir.join("projout.elf").exists() {
-                Some(ProjOutElf::load(dev, &dir, &w))
+                Some(ProjOutElf::load(dev, &dir, &w)?)
             } else {
                 eprintln!(
                     "[whisper_decoder] proj_out ELF absent at {} -- host lm-head fallback (build scripts/build_projout_elf.sh to enable the on-NPU lm-head; set NPU_DECODE_PROJOUT_ELF=0 to silence)",
@@ -1071,7 +1089,7 @@ impl FusedDecoder {
             }
             _ => None,
         };
-        FusedDecoder {
+        Ok(FusedDecoder {
             dev: Rc::clone(dev),
             w,
             arena,
@@ -1093,21 +1111,22 @@ impl FusedDecoder {
             proj_out_elf,
             next_kern: None,
             resident,
-        }
+        })
     }
 
-    fn write_buf(&self, name: &str, f: &[f32]) {
+    fn write_buf(&self, name: &str, f: &[f32]) -> Result<(), EngineError> {
         let loc = &self.layout[name];
         let bytes = pack_bf16_bytes(f);
         assert_eq!(bytes.len(), loc.len, "{name}: {} != {}", bytes.len(), loc.len);
-        self.arena.write_at(loc.arena, loc.off, &bytes).unwrap();
+        self.arena.write_at(loc.arena, loc.off, &bytes)
+            .map_err(|e| EngineError::Device(format!("write_buf {name}: {e}")))
     }
 
     /// int8 cross-K: quantize f32 -> int8 with PER-CHANNEL (h,d) scales and write the int8 BYTES into the
     /// bf16-typed buffer (the GEMV kernel reinterprets them as int8). 1 byte/elem -> buffer is half-size.
     /// `scales` is [H*HD] in (h,d) order; the padded `f` is [N_HEADS, T_PAD, HEAD_DIM] head-major, so
     /// element idx -> channel (h = idx/(T_PAD*HEAD_DIM), d = idx%HEAD_DIM).
-    fn write_buf_i8(&self, name: &str, f: &[f32], scales: &[f32]) {
+    fn write_buf_i8(&self, name: &str, f: &[f32], scales: &[f32]) -> Result<(), EngineError> {
         let loc = &self.layout[name];
         let tphd = T_PAD * HEAD_DIM;
         let bytes: Vec<u8> = f.iter().enumerate().map(|(idx, &v)| {
@@ -1116,13 +1135,14 @@ impl FusedDecoder {
             ((v * inv).round().clamp(-127.0, 127.0) as i8) as u8
         }).collect();
         assert_eq!(bytes.len(), loc.len, "{name} (i8): {} != {}", bytes.len(), loc.len);
-        self.arena.write_at(loc.arena, loc.off, &bytes).unwrap();
+        self.arena.write_at(loc.arena, loc.off, &bytes)
+            .map_err(|e| EngineError::Device(format!("write_buf_i8 {name}: {e}")))
     }
 
     /// int8 cross-V: like `write_buf_i8` but for the PRE-TRANSPOSED Venc layout [H,HD,TP]. The contiguous
     /// inner dim is T_PAD, so element idx -> channel (h,d) = idx / T_PAD (and `scales` is [H*HD] in (h,d)
     /// order, matching the L*_s_cv buffer op_mul_cv reads).
-    fn write_buf_i8_venc(&self, name: &str, f: &[f32], scales: &[f32]) {
+    fn write_buf_i8_venc(&self, name: &str, f: &[f32], scales: &[f32]) -> Result<(), EngineError> {
         let loc = &self.layout[name];
         let bytes: Vec<u8> = f.iter().enumerate().map(|(idx, &v)| {
             let s = scales[idx / T_PAD];
@@ -1130,17 +1150,19 @@ impl FusedDecoder {
             ((v * inv).round().clamp(-127.0, 127.0) as i8) as u8
         }).collect();
         assert_eq!(bytes.len(), loc.len, "{name} (i8v): {} != {}", bytes.len(), loc.len);
-        self.arena.write_at(loc.arena, loc.off, &bytes).unwrap();
+        self.arena.write_at(loc.arena, loc.off, &bytes)
+            .map_err(|e| EngineError::Device(format!("write_buf_i8_venc {name}: {e}")))
     }
 
-    fn zero_buf(&self, name: &str) {
+    fn zero_buf(&self, name: &str) -> Result<(), EngineError> {
         let loc = &self.layout[name];
-        self.arena.write_at(loc.arena, loc.off, &vec![0u8; loc.len]).unwrap();
+        self.arena.write_at(loc.arena, loc.off, &vec![0u8; loc.len])
+            .map_err(|e| EngineError::Device(format!("zero_buf {name}: {e}")))
     }
 
     /// Encoder cross-K/V → per-layer resident scratch (head-major, padded T_enc→T_PAD); also clears
     /// the self-KV caches and the position counter. Mirrors gen_decode.py's heads_pad layout exactly.
-    pub fn precompute_cross(&mut self, enc_hidden: &Array2<f32>) {
+    pub fn precompute_cross(&mut self, enc_hidden: &Array2<f32>) -> Result<(), EngineError> {
         // New utterance: start a fresh per-phase breakdown (so each dumped line is one utterance).
         if self.timing {
             self.ph = PhaseAcc::default();
@@ -1200,8 +1222,8 @@ impl FusedDecoder {
                         if a > s_hd[ch] { s_hd[ch] = a; }
                     }
                     for s in s_hd.iter_mut() { *s = if *s > 0.0 { *s * headroom / 127.0 } else { 1.0 }; }
-                    self.write_buf_i8(&name, &padded, &s_hd);
-                    self.write_buf(&format!("L{li}_s_cq"), &s_hd);
+                    self.write_buf_i8(&name, &padded, &s_hd)?;
+                    self.write_buf(&format!("L{li}_s_cq"), &s_hd)?;
                 } else if self.int8_cross_v && name.ends_with("Venc") {
                     // `padded` here is pre-transposed [H,HD,TP] (coalesce_cross is enforced for int8_cross_v),
                     // so the contiguous inner dim is T_PAD and channel (h,d) = idx / T_PAD. Per-channel scale
@@ -1215,74 +1237,79 @@ impl FusedDecoder {
                         if a > s_cv[ch] { s_cv[ch] = a; }
                     }
                     for s in s_cv.iter_mut() { *s = if *s > 0.0 { *s * headroom / 127.0 } else { 1.0 }; }
-                    self.write_buf_i8_venc(&name, &padded, &s_cv);
-                    self.write_buf(&format!("L{li}_s_cv"), &s_cv);
+                    self.write_buf_i8_venc(&name, &padded, &s_cv)?;
+                    self.write_buf(&format!("L{li}_s_cv"), &s_cv)?;
                 } else {
-                    self.write_buf(&name, &padded);
+                    self.write_buf(&name, &padded)?;
                 }
             }
-            self.zero_buf(&format!("L{li}_kcache"));
-            self.zero_buf(&format!("L{li}_vcache"));
+            self.zero_buf(&format!("L{li}_kcache"))?;
+            self.zero_buf(&format!("L{li}_vcache"))?;
         }
-        self.arena.sync_to_device().unwrap();
+        self.arena.sync_to_device().map_err(|e| EngineError::Device(format!("sync cross-K/V to device: {e}")))?;
         self.n_self = 0;
         self.next_kern = None; // PIPE: n_self rewound — any prefetched kernel is now mispatched.
         tmr.lap(&mut self.ph.cross_fold);
         self.ph.utterances += 1;
+        Ok(())
     }
 
     /// Fresh self-KV for a new prompt (cross-K/V unchanged for this utterance).
-    pub fn reset(&mut self) {
+    pub fn reset(&mut self) -> Result<(), EngineError> {
         for li in 0..N_LAYERS {
-            self.zero_buf(&format!("L{li}_kcache"));
-            self.zero_buf(&format!("L{li}_vcache"));
+            self.zero_buf(&format!("L{li}_kcache"))?;
+            self.zero_buf(&format!("L{li}_vcache"))?;
         }
-        self.arena.sync_to_device().unwrap();
+        self.arena.sync_to_device().map_err(|e| EngineError::Device(format!("sync reset KV to device: {e}")))?;
         self.n_self = 0;
         self.next_kern = None; // PIPE: n_self rewound — any prefetched kernel is now mispatched.
+        Ok(())
     }
 
     /// One decode step → vocab logits `[51865]`. Embeds token+pos, dispatches the whole 12-layer ELF
     /// (KV write slot + softmax mask patched for this position), then host ln_post + proj_out.
     /// Shared decode preamble: embed the token, dispatch the fused decode ELF, return the 768-hidden `x12`.
-    fn run_hidden(&mut self, token: i64, pos: usize, tmr: &mut Lap) -> Vec<f32> {
+    fn run_hidden(&mut self, token: i64, pos: usize, tmr: &mut Lap) -> Result<Vec<f32>, EngineError> {
         let tok = token as usize;
         let x: Vec<f32> = (0..D)
             .map(|d| self.w.embed_tokens[[tok, d]] + self.w.embed_positions[[pos, d]])
             .collect();
         tmr.lap(&mut self.ph.embed);
-        self.write_buf("x", &x);
+        self.write_buf("x", &x)?;
         tmr.lap(&mut self.ph.write_x);
 
         // Deep-C (default when the ELF carries scratchpad params): register-once + per-token scratchpad
         // writes, no patch/reload. Else PIPE (async-prefetch the next position's ELF registration under
         // this dispatch) is the default; the REUSECTX diagnostic opts out to the synchronous rebind path.
         if self.resident.is_some() {
-            self.dispatch_resident(tmr);
+            self.dispatch_resident(tmr)?;
         } else if self.reuse_ctx.is_some() {
-            self.dispatch_sync(tmr);
+            self.dispatch_sync(tmr)?;
         } else {
-            self.dispatch_pipe(tmr);
+            self.dispatch_pipe(tmr)?;
         }
 
         let oloc = &self.layout[&self.output];
         let mut out_bytes = vec![0u8; oloc.len];
-        self.arena.read_at(oloc.arena, oloc.off, &mut out_bytes).unwrap();
+        self.arena.read_at(oloc.arena, oloc.off, &mut out_bytes)
+            .map_err(|e| EngineError::Device(format!("read decode output: {e}")))?;
         let x12 = unpack_bf16_bytes(&out_bytes);
         tmr.lap(&mut self.ph.read_unpack);
-        x12
+        Ok(x12)
     }
 
     /// e2e/NPU steady-state: hidden → proj_out + argmax ON THE NPU → token id (only the 64-B partials are
     /// read back, not the 104 KB logits). Requires the argmax-fused proj_out ELF (`gen_projout --argmax`).
-    pub fn step_token(&mut self, token: i64, pos: usize) -> i64 {
+    pub fn step_token(&mut self, token: i64, pos: usize) -> Result<i64, EngineError> {
         let mut tmr = Lap::start(self.timing);
-        let x12 = self.run_hidden(token, pos, &mut tmr);
+        let x12 = self.run_hidden(token, pos, &mut tmr)?;
         let nrm = ln_norm_only(&x12[0..D]);
-        let id = self.proj_out_elf.as_ref().expect("step_token needs proj_out_elf").token_id(&nrm);
+        let pe = self.proj_out_elf.as_ref()
+            .ok_or_else(|| EngineError::Device("step_token needs proj_out_elf".into()))?;
+        let id = pe.token_id(&nrm)?;
         tmr.lap(&mut self.ph.lm_head);
         self.ph.steps += 1;
-        id
+        Ok(id)
     }
 
     /// Whether the steady-state token-id path (`step_token`) is available (argmax-fused ELF loaded).
@@ -1290,25 +1317,25 @@ impl FusedDecoder {
         self.proj_out_elf.as_ref().is_some_and(|pe| pe.has_argmax())
     }
 
-    pub fn step(&mut self, token: i64, pos: usize) -> Vec<f32> {
+    pub fn step(&mut self, token: i64, pos: usize) -> Result<Vec<f32>, EngineError> {
         let mut tmr = Lap::start(self.timing);
-        let x12 = self.run_hidden(token, pos, &mut tmr);
+        let x12 = self.run_hidden(token, pos, &mut tmr)?;
 
         // e2e/NPU: the ELF already computed ln_post + proj_out → logits[VOCAB_PAD]. Return logits[0:VOCAB]
         // directly (host argmax over them); the ~40M-MAC host proj_out matmul is gone.
         if self.npu_logits {
             self.ph.steps += 1;
-            return x12[0..VOCAB].to_vec();
+            return Ok(x12[0..VOCAB].to_vec());
         }
 
         // e2e/NPU wide-dispatch lm-head: the standalone proj_out GEMV ELF — ONE dispatch/token (vs the 17
         // ctx2 chunks). Highest precedence. The LN affine + β·W bias are handled inside `logits()`.
         if let Some(ref pe) = self.proj_out_elf {
             let nrm = ln_norm_only(&x12[0..D]);
-            let logits = pe.logits(&nrm);
+            let logits = pe.logits(&nrm)?;
             tmr.lap(&mut self.ph.lm_head);
             self.ph.steps += 1;
-            return logits;
+            return Ok(logits);
         }
 
         // e2e/NPU step-1: ln_post + proj_out on the NPU ctx2 kernel (17 chunks of N=NA). The LN affine
@@ -1328,7 +1355,7 @@ impl FusedDecoder {
             }
             tmr.lap(&mut self.ph.lm_head);
             self.ph.steps += 1;
-            return logits;
+            return Ok(logits);
         }
 
         // final LN + proj_out → logits (host f32, like every other backend).
@@ -1345,7 +1372,7 @@ impl FusedDecoder {
         }
         tmr.lap(&mut self.ph.lm_head);
         self.ph.steps += 1;
-        logits
+        Ok(logits)
     }
 
     /// Deep-C dispatch: the constant ELF is already registered (resident) and the arena BOs bound, so
@@ -1353,57 +1380,68 @@ impl FusedDecoder {
     /// re-registration (removes the ~14 ms load_elf + ~1.2 ms patch the patch path pays per token).
     ///   kv_off (addr-kind): raw element-units BD offset = n_self*head_dim
     ///   sm_mask (core-kind): context length n_self+1, shifted <<2 (firmware UPDATE_REG; core >>2)
-    fn dispatch_resident(&mut self, tmr: &mut Lap) {
+    fn dispatch_resident(&mut self, tmr: &mut Lap) -> Result<(), EngineError> {
         let n = self.n_self as u32;
         {
             let r = self.resident.as_ref().unwrap();
             let kv_val = n.wrapping_mul(r.head_dim);
             r.res
                 .write_scratchpad(r.kv_off_byte, &kv_val.to_le_bytes())
-                .expect("write kv_off scratchpad");
+                .map_err(|e| EngineError::Device(format!("write kv_off scratchpad: {e}")))?;
             let sm_raw = n + 1;
             let sm_val = if r.sm_core { sm_raw << 2 } else { sm_raw };
             r.res
                 .write_scratchpad(r.sm_off_byte, &sm_val.to_le_bytes())
-                .expect("write sm_mask scratchpad");
+                .map_err(|e| EngineError::Device(format!("write sm_mask scratchpad: {e}")))?;
             // M0.5: transposed self-vcache write column = n_self (raw addr, no *head_dim).
             if let Some(vb) = r.vcache_off_byte {
-                r.res.write_scratchpad(vb, &n.to_le_bytes()).expect("write vcache_off scratchpad");
+                r.res.write_scratchpad(vb, &n.to_le_bytes())
+                    .map_err(|e| EngineError::Device(format!("write vcache_off scratchpad: {e}")))?;
             }
         }
         tmr.lap(&mut self.ph.patch); // scratchpad writes (~µs) occupy the old per-token "patch" slot
-        self.arena.sync_input().unwrap();
+        self.arena.sync_input().map_err(|e| EngineError::Device(format!("sync input (resident): {e}")))?;
         tmr.lap(&mut self.ph.sync_in);
-        self.resident.as_ref().unwrap().res.dispatch().expect("resident decode dispatch");
+        self.resident.as_ref().unwrap().res.dispatch()
+            .map_err(|e| EngineError::Device(format!("resident decode dispatch: {e}")))?;
         tmr.lap(&mut self.ph.dispatch);
-        self.arena.sync_from_device().unwrap();
+        self.arena.sync_from_device().map_err(|e| EngineError::Device(format!("sync output (resident): {e}")))?;
         tmr.lap(&mut self.ph.sync_out);
         self.n_self += 1;
+        Ok(())
     }
 
     /// Synchronous registration + dispatch for one token (the REUSECTX diagnostic path only — the
     /// default decode path is `dispatch_pipe`): patch the position-only KV-write offset + softmax mask,
     /// rebind onto the persistent ctx (or, defensively, freshly register), sync the input arena,
     /// dispatch (start+wait), sync the output back, advance `n_self`. `x` is already in the input arena.
-    fn dispatch_sync(&mut self, tmr: &mut Lap) {
+    fn dispatch_sync(&mut self, tmr: &mut Lap) -> Result<(), EngineError> {
         let patched = self.patcher.patch(&self.base_elf, self.n_self as u32);
         tmr.lap(&mut self.ph.patch);
         let kern = match &self.reuse_ctx {
-            Some(ctx) => FusedKern::Reuse(ctx.rebind(&patched, Some("main:sequence")).expect("rebind fused ELF")),
-            None => FusedKern::Fresh(self.dev.load_elf_kernel(&patched, Some("main:sequence")).expect("load fused ELF")),
+            Some(ctx) => FusedKern::Reuse(
+                ctx.rebind(&patched, Some("main:sequence"))
+                    .map_err(|e| EngineError::Device(format!("rebind fused ELF: {e}")))?,
+            ),
+            None => FusedKern::Fresh(
+                self.dev
+                    .load_elf_kernel(&patched, Some("main:sequence"))
+                    .map_err(|e| EngineError::Device(format!("load fused ELF: {e}")))?,
+            ),
         };
         tmr.lap(&mut self.ph.load_elf);
-        self.arena.sync_input().unwrap();
+        self.arena.sync_input().map_err(|e| EngineError::Device(format!("sync input (sync): {e}")))?;
         tmr.lap(&mut self.ph.sync_in);
         match &kern {
             FusedKern::Reuse(k) => self.arena.dispatch2(k),
             FusedKern::Fresh(k) => self.arena.dispatch(k),
         }
-        .expect("fused decode dispatch");
+        .map_err(|e| EngineError::Device(format!("fused decode dispatch: {e}")))?;
         tmr.lap(&mut self.ph.dispatch);
-        self.arena.sync_from_device().unwrap();
+        self.arena.sync_from_device().map_err(|e| EngineError::Device(format!("sync output (sync): {e}")))?;
         tmr.lap(&mut self.ph.sync_out);
         self.n_self += 1;
+        Ok(())
     }
 
     /// PIPE registration + dispatch for one token: the patched ELF for position `n_self` was already
@@ -1414,7 +1452,7 @@ impl FusedDecoder {
     /// first after a `reset` have no predecessor to hide under, so they register synchronously here
     /// (counted into `load_elf`); every steady-state token registers under the dispatch (counted into
     /// `prefetch`, which is OFF the critical path → `load_elf` leaves the per-token `step_sum`).
-    fn dispatch_pipe(&mut self, tmr: &mut Lap) {
+    fn dispatch_pipe(&mut self, tmr: &mut Lap) -> Result<(), EngineError> {
         // Current kernel: the prefetch from the previous step iff it was built for this exact n_self;
         // otherwise (first token / post-reset) register it now, on the critical path.
         let cur = match self.next_kern.take() {
@@ -1425,15 +1463,16 @@ impl FusedDecoder {
                 let k = self
                     .dev
                     .load_elf_kernel(&patched, Some("main:sequence"))
-                    .expect("load fused ELF");
+                    .map_err(|e| EngineError::Device(format!("load fused ELF: {e}")))?;
                 tmr.lap(&mut self.ph.load_elf);
                 k
             }
         };
-        self.arena.sync_input().unwrap();
+        self.arena.sync_input().map_err(|e| EngineError::Device(format!("sync input (pipe): {e}")))?;
         tmr.lap(&mut self.ph.sync_in);
         // Start the NPU run; it returns immediately. `cur` + the arena must outlive `run` (held below).
-        let run: Run = self.arena.dispatch_start(&cur).expect("fused decode dispatch start");
+        let run: Run = self.arena.dispatch_start(&cur)
+            .map_err(|e| EngineError::Device(format!("fused decode dispatch start: {e}")))?;
         // Overlap window: build + register the NEXT position's patched ELF while the NPU computes.
         let pf_mark = self.timing.then(std::time::Instant::now);
         let next_pos = self.n_self + 1;
@@ -1441,21 +1480,22 @@ impl FusedDecoder {
         let next_k = self
             .dev
             .load_elf_kernel(&patched_next, Some("main:sequence"))
-            .expect("load next fused ELF");
+            .map_err(|e| EngineError::Device(format!("load next fused ELF: {e}")))?;
         self.next_kern = Some((next_pos, next_k));
         if let Some(m) = pf_mark {
             self.ph.prefetch += std::time::Instant::now().duration_since(m).as_nanos();
         }
         // Block for the NPU run. `dispatch` thus times start + overlapped prefetch + wait = the true
         // per-token critical path (if XRT serialized the host build behind the run, it shows up here).
-        run.wait().expect("fused decode dispatch wait");
+        run.wait().map_err(|e| EngineError::Device(format!("fused decode dispatch wait: {e}")))?;
         tmr.lap(&mut self.ph.dispatch);
-        self.arena.sync_from_device().unwrap();
+        self.arena.sync_from_device().map_err(|e| EngineError::Device(format!("sync output (pipe): {e}")))?;
         tmr.lap(&mut self.ph.sync_out);
         self.n_self += 1;
         // `cur` owns the in-flight run's hw_context; it MUST NOT drop before run.wait() above. Owned
         // values drop at lexical scope end (not last-use), so this explicit drop only documents intent.
         drop(cur);
+        Ok(())
     }
 
     /// Dump the per-phase breakdown accumulated since the last `precompute_cross` (one utterance).
@@ -1566,12 +1606,14 @@ impl BatchedFusedDecoder {
     /// Load the prebuilt batched decode ELF + resident weight arena. `dir` holds decode_b.elf,
     /// meta.json (with a `scratchpad` block + dims.B/T), buffers/<name>.bin. `shared` = the encoder's
     /// resident ctx2 kernel (Some → O1 NPU cross-K/V fold; None → host f32 fold).
-    pub fn new(w: Rc<WhisperDecoderWeights>, dev: &Rc<Device>, dir: &Path, shared: Option<Rc<SharedCtxA>>) -> Self {
+    pub fn new(w: Rc<WhisperDecoderWeights>, dev: &Rc<Device>, dir: &Path, shared: Option<Rc<SharedCtxA>>) -> Result<Self, EngineError> {
         let base_elf = std::fs::read(dir.join("decode_b.elf"))
-            .unwrap_or_else(|e| panic!("read decode_b.elf: {e} (gen_decode_batched.py --scratchpad)"));
-        let meta: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(dir.join("meta.json")).expect("read meta.json"))
-                .expect("parse meta.json");
+            .map_err(|e| EngineError::Load(format!("read decode_b.elf: {e} (gen_decode_batched.py --scratchpad)")))?;
+        let meta: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(dir.join("meta.json"))
+                .map_err(|e| EngineError::Load(format!("read meta.json: {e}")))?,
+        )
+        .map_err(|e| EngineError::Load(format!("parse meta.json: {e}")))?;
         let usz = |k: &str| meta[k].as_u64().expect(k) as usize;
         let (in_sz, out_sz, scr_sz) = (usz("input_size"), usz("output_size"), usz("scratch_size"));
         let output = meta["output"].as_str().expect("output").to_string();
@@ -1593,7 +1635,8 @@ impl BatchedFusedDecoder {
                 BufLoc { arena, off: e["offset"].as_u64().unwrap() as usize, len: e["len"].as_u64().unwrap() as usize },
             );
         }
-        let arena = FusedArena::new(dev, in_sz, out_sz, scr_sz).expect("alloc batched fused arenas");
+        let arena = FusedArena::new(dev, in_sz, out_sz, scr_sz)
+            .map_err(|e| EngineError::Load(format!("alloc batched fused arenas: {e}")))?;
         // static weights (skip per-utterance encoder-K/V + self-KV caches).
         for name in meta["weights"].as_array().expect("weights") {
             let name = name.as_str().unwrap();
@@ -1601,10 +1644,11 @@ impl BatchedFusedDecoder {
                 continue;
             }
             let bytes = std::fs::read(dir.join("buffers").join(format!("{name}.bin")))
-                .unwrap_or_else(|e| panic!("read buffer {name}.bin: {e}"));
+                .map_err(|e| EngineError::Load(format!("read buffer {name}.bin: {e}")))?;
             let loc = &layout[name];
             assert_eq!(bytes.len(), loc.len, "{name}: blob {} != layout {}", bytes.len(), loc.len);
-            arena.write_at(loc.arena, loc.off, &bytes).unwrap();
+            arena.write_at(loc.arena, loc.off, &bytes)
+                .map_err(|e| EngineError::Load(format!("write buffer {name}: {e}")))?;
         }
         let sp = &meta["scratchpad"];
         let kvn = sp["kv_param"].as_str().expect("scratchpad.kv_param");
@@ -1620,8 +1664,8 @@ impl BatchedFusedDecoder {
         // own throughput ceiling -- it only affects arbitration against a concurrent foreground one).
         let res = dev
             .open_elf_resident_qos(&base_elf, Some("main:sequence"), Some(QosPriority::Low))
-            .expect("open_elf_resident (batched decode ELF lacks scratchpad?)");
-        arena.bind_resident(&res).expect("bind resident arena BOs");
+            .map_err(|e| EngineError::Load(format!("open_elf_resident (batched decode ELF lacks scratchpad?): {e}")))?;
+        arena.bind_resident(&res).map_err(|e| EngineError::Load(format!("bind resident arena BOs: {e}")))?;
         eprintln!("[batched] B={b} t_enc={t_enc} resident scratchpad decode (scratch {:.0} MB)", scr_sz as f64 / 1e6);
         let timing = std::env::var("FUSED_PHASE_TIMING").is_ok();
         // O1: register per-layer cross-K/V GEMM ops on the encoder's shared ctx2 kernel (NPU fold),
@@ -1653,10 +1697,10 @@ impl BatchedFusedDecoder {
                 None
             }
         };
-        BatchedFusedDecoder {
+        Ok(BatchedFusedDecoder {
             w, arena, layout, output, b, nl, t_enc, t_pad, n_self: 0, res, kv_off_byte, sm_off_byte, sm_core, head_dim,
             timing, ph: PhaseAcc::default(), cross_ops,
-        }
+        })
     }
 
     pub fn batch(&self) -> usize {
@@ -1669,23 +1713,25 @@ impl BatchedFusedDecoder {
         self.ph.steps as usize
     }
 
-    fn zero_buf(&self, name: &str) {
+    fn zero_buf(&self, name: &str) -> Result<(), EngineError> {
         let loc = &self.layout[name];
-        self.arena.write_at(loc.arena, loc.off, &vec![0u8; loc.len]).unwrap();
+        self.arena.write_at(loc.arena, loc.off, &vec![0u8; loc.len])
+            .map_err(|e| EngineError::Device(format!("zero_buf {name}: {e}")))
     }
 
     /// Write one stream's row into a B-wide buffer (`x` input, [B, D] stream-major).
-    fn write_row(&self, name: &str, bi: usize, f: &[f32]) {
+    fn write_row(&self, name: &str, bi: usize, f: &[f32]) -> Result<(), EngineError> {
         let loc = &self.layout[name];
         let bytes = pack_bf16_bytes(f);
         let row = bytes.len();
         assert_eq!(loc.len, self.b * row, "{name} not B-wide ({} != {}*{})", loc.len, self.b, row);
-        self.arena.write_at(loc.arena, loc.off + bi * row, &bytes).unwrap();
+        self.arena.write_at(loc.arena, loc.off + bi * row, &bytes)
+            .map_err(|e| EngineError::Device(format!("write_row {name}[{bi}]: {e}")))
     }
 
     /// Fold B encoders' cross-K/V into the B-wide per-layer resident scratch (head-major, padded
     /// T_enc->T_PAD per stream); clear self-KV; reset position. Host f32 fold (per-stream, parallel).
-    pub fn precompute_cross_batch(&mut self, encs: &[Array2<f32>]) {
+    pub fn precompute_cross_batch(&mut self, encs: &[Array2<f32>]) -> Result<(), EngineError> {
         assert_eq!(encs.len(), self.b, "need exactly B={} encoder outputs", self.b);
         // Fresh per-phase counters for this batch/bucket (so last_steps() == this bucket's dispatches,
         // O3; and each FUSED_PHASE_TIMING dump is one batch).
@@ -1730,30 +1776,33 @@ impl BatchedFusedDecoder {
                 let loc = &self.layout[&name];
                 let bytes = pack_bf16_bytes(src);
                 assert_eq!(bytes.len(), loc.len, "{name}: {} != {}", bytes.len(), loc.len);
-                self.arena.write_at(loc.arena, loc.off, &bytes).unwrap();
+                self.arena.write_at(loc.arena, loc.off, &bytes)
+                    .map_err(|e| EngineError::Device(format!("write batched {name}: {e}")))?;
             }
-            self.zero_buf(&format!("L{li}_kcache"));
-            self.zero_buf(&format!("L{li}_vcache"));
+            self.zero_buf(&format!("L{li}_kcache"))?;
+            self.zero_buf(&format!("L{li}_vcache"))?;
         }
-        self.arena.sync_to_device().unwrap();
+        self.arena.sync_to_device().map_err(|e| EngineError::Device(format!("sync batched cross-K/V: {e}")))?;
         self.n_self = 0;
         tmr.lap(&mut self.ph.cross_fold);
         self.ph.utterances += 1;
+        Ok(())
     }
 
     /// Fresh self-KV for a new prompt (cross-K/V unchanged for this utterance batch).
-    pub fn reset(&mut self) {
+    pub fn reset(&mut self) -> Result<(), EngineError> {
         for li in 0..self.nl {
-            self.zero_buf(&format!("L{li}_kcache"));
-            self.zero_buf(&format!("L{li}_vcache"));
+            self.zero_buf(&format!("L{li}_kcache"))?;
+            self.zero_buf(&format!("L{li}_vcache"))?;
         }
-        self.arena.sync_to_device().unwrap();
+        self.arena.sync_to_device().map_err(|e| EngineError::Device(format!("sync batched reset: {e}")))?;
         self.n_self = 0;
+        Ok(())
     }
 
     /// One lockstep decode step for all B streams. `tokens[bi]` is stream bi's current token; `pos` is
     /// the shared position (lockstep). Returns B logit vectors [VOCAB].
-    pub fn step_batch(&mut self, tokens: &[i64], pos: usize) -> Vec<Vec<f32>> {
+    pub fn step_batch(&mut self, tokens: &[i64], pos: usize) -> Result<Vec<Vec<f32>>, EngineError> {
         assert_eq!(tokens.len(), self.b, "need B={} tokens", self.b);
         let mut tmr = Lap::start(self.timing);
         for (bi, &tok) in tokens.iter().enumerate() {
@@ -1761,28 +1810,31 @@ impl BatchedFusedDecoder {
             let x: Vec<f32> = (0..D)
                 .map(|d| self.w.embed_tokens[[t, d]] + self.w.embed_positions[[pos, d]])
                 .collect();
-            self.write_row("x", bi, &x);
+            self.write_row("x", bi, &x)?;
         }
         tmr.lap(&mut self.ph.write_x); // B embed lookups + pack + write
         let n = self.n_self as u32;
         let kv_val = n.wrapping_mul(self.head_dim);
-        self.res.write_scratchpad(self.kv_off_byte, &kv_val.to_le_bytes()).expect("kv_off");
+        self.res.write_scratchpad(self.kv_off_byte, &kv_val.to_le_bytes())
+            .map_err(|e| EngineError::Device(format!("kv_off: {e}")))?;
         let sm_raw = n + 1;
         let sm_val = if self.sm_core { sm_raw << 2 } else { sm_raw };
-        self.res.write_scratchpad(self.sm_off_byte, &sm_val.to_le_bytes()).expect("sm_mask");
+        self.res.write_scratchpad(self.sm_off_byte, &sm_val.to_le_bytes())
+            .map_err(|e| EngineError::Device(format!("sm_mask: {e}")))?;
         tmr.lap(&mut self.ph.patch); // scratchpad writes
-        self.arena.sync_input().unwrap();
+        self.arena.sync_input().map_err(|e| EngineError::Device(format!("sync batched input: {e}")))?;
         tmr.lap(&mut self.ph.sync_in);
-        self.res.dispatch().expect("batched decode dispatch");
+        self.res.dispatch().map_err(|e| EngineError::Device(format!("batched decode dispatch: {e}")))?;
         tmr.lap(&mut self.ph.dispatch);
-        self.arena.sync_from_device().unwrap();
+        self.arena.sync_from_device().map_err(|e| EngineError::Device(format!("sync batched output: {e}")))?;
         tmr.lap(&mut self.ph.sync_out);
         self.n_self += 1;
 
         let oloc = &self.layout[&self.output];
         let row = D * 2;
         let mut out_bytes = vec![0u8; oloc.len];
-        self.arena.read_at(oloc.arena, oloc.off, &mut out_bytes).unwrap();
+        self.arena.read_at(oloc.arena, oloc.off, &mut out_bytes)
+            .map_err(|e| EngineError::Device(format!("read batched output: {e}")))?;
         tmr.lap(&mut self.ph.read_unpack);
         // O2: batched lm-head. Build LN_all [B,D] (per-stream ln_post), then ONE GEMM
         // LN_all @ proj_out_w[D,VOCAB] -> logits [B,VOCAB] (ndarray .dot, cache-blocked/SIMD),
@@ -1797,7 +1849,7 @@ impl BatchedFusedDecoder {
         let all: Vec<Vec<f32>> = (0..self.b).map(|bi| logits_mat.row(bi).to_vec()).collect();
         tmr.lap(&mut self.ph.lm_head); // batched ln_post + one proj_out GEMM
         self.ph.steps += 1;
-        all
+        Ok(all)
     }
 
     /// Per-phase batched-decode breakdown (env FUSED_PHASE_TIMING). `steps` = dispatches; each dispatch

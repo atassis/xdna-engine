@@ -41,7 +41,7 @@ fn main() {
 
     let refs: Vec<&[i16]> = samples.iter().map(|v| v.as_slice()).collect();
     let t = std::time::Instant::now();
-    let texts = asr.transcribe_batch(&refs);
+    let texts = asr.transcribe_batch(&refs).expect("batched transcribe");
     let ms = t.elapsed().as_secs_f64() * 1e3;
     eprintln!("[verify_batched] batched transcribe of B={} done in {ms:.0} ms", texts.len());
 

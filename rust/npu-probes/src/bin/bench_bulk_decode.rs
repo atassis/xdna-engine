@@ -45,12 +45,12 @@ fn main() {
     let nbuckets = n.div_ceil(b);
 
     // warmup
-    let _ = asr.decode_bulk_ids(&encs, &sort_key, false);
+    let _ = asr.decode_bulk_ids(&encs, &sort_key, false).expect("warmup bulk decode");
 
     let run = |sort: bool| {
         let e0 = rapl_uj(RAPL_PKG);
         let t0 = std::time::Instant::now();
-        let (ids, slots) = asr.decode_bulk_ids(&encs, &sort_key, sort);
+        let (ids, slots) = asr.decode_bulk_ids(&encs, &sort_key, sort).expect("bulk decode");
         let ms = t0.elapsed().as_secs_f64() * 1e3;
         let j = match (e0, rapl_uj(RAPL_PKG)) {
             (Some(a), Some(c)) => Some(uj_delta(a, c, rmax) as f64 / 1e6),

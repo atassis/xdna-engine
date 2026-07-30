@@ -118,7 +118,7 @@ fn main() {
         );
         _dev = Rc::clone(&dev);
         // root for CtxDecode = WHISPER_ROOT (worktree root; holds the `mlir-aie` symlink + xclbins).
-        HostDecoder::new_npu(Rc::clone(&weights), &dev, &root)
+        HostDecoder::new_npu(Rc::clone(&weights), &dev, &root).expect("build NPU host decoder")
     } else {
         HostDecoder::new(Rc::clone(&weights))
     };
@@ -139,7 +139,7 @@ fn main() {
 
     // step 0
     let (onnx_logits0, mut kv) = onnx.step0(&[SOT], &enc_shape, &enc_flat);
-    let host_logits0 = hostdec.step(SOT, 0);
+    let host_logits0 = hostdec.step(SOT, 0).expect("host decoder step 0");
     let r0 = rel_l2(&host_logits0, &onnx_logits0);
     let a_onnx = argmax(&onnx_logits0);
     let a_host = argmax(&host_logits0);
@@ -157,7 +157,7 @@ fn main() {
     for step in 1..N_STEPS {
         let (onnx_logits, new_kv) = onnx.step_cached(onnx_tok, &kv);
         kv = new_kv;
-        let host_logits = hostdec.step(host_tok, step);
+        let host_logits = hostdec.step(host_tok, step).expect("host decoder step");
         let r = rel_l2(&host_logits, &onnx_logits);
         let a_onnx = argmax(&onnx_logits);
         let a_host = argmax(&host_logits);
