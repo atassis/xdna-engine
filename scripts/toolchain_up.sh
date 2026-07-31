@@ -46,9 +46,24 @@ _link_include_dirs() {
   ln -sfn "$REPO/mlir-aie/aie_kernels" "$INST/build/include/aie_kernels"   # aie.iron _default_source_path resolves kernel .cc here (aie2p/mm.cc etc.)
 }
 
+# Point the generated lit config at the Peano we actually run. Without PEANO_INSTALL_DIR at configure
+# time it is "<unset>", detect_peano fails, and the 126 tests that say `REQUIRES: peano` report
+# UNSUPPORTED instead of running -- a local `lit` then finds 1211 tests where CI finds 1219 and says
+# nothing about the difference. That is how Xilinx/mlir-aie#3461 shipped a routing regression that
+# two aie2 unit tests catch: they were never executed here. Same self-healing contract as
+# _link_include_dirs, since the warm path never re-runs cmake.
+_wire_peano_lit() {
+  local cfg="$INST/build/test/lit.site.cfg.py"
+  local peano="$REPO/.venv-iron/lib/python3.14/site-packages/llvm-aie"
+  [ -f "$cfg" ] && [ -x "$peano/bin/clang" ] || return 0
+  grep -q "^config.peano_install_dir = r\"\"\"$peano\"\"\"$" "$cfg" && return 0
+  sed -i "s|^config\.peano_install_dir = r\"\"\".*\"\"\"$|config.peano_install_dir = r\"\"\"$peano\"\"\"|" "$cfg"
+}
+
 if [ -f "$PYPKG" ] && grep -q "def resolve_program(self, device_name" "$PYPKG"; then
   _link_vendored_tools   # backfill vendored tools into already-built instances
   _link_include_dirs     # backfill include/ symlinks (aie_api + aie_kernels)
+  _wire_peano_lit        # backfill the lit peano path (else `REQUIRES: peano` tests silently skip)
   touch "$INST"          # record last-used (for gc_instances keep-newest-N); warm path never GCs
   echo "$INST"; exit 0   # cached, self-consistent
 fi
@@ -95,10 +110,12 @@ cmake -G Ninja -B "$INST/build" -S "$SRC" \
   -DCMAKE_DISABLE_FIND_PACKAGE_XRT=ON -DCMAKE_DISABLE_FIND_PACKAGE_hsa-runtime64=ON \
   -DCMAKE_DISABLE_FIND_PACKAGE_aiebu=ON \
   -DAIE_ENABLE_XRT_PYTHON_BINDINGS=OFF \
+  -DPEANO_INSTALL_DIR="$REPO/.venv-iron/lib/python3.14/site-packages/llvm-aie" \
   -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache >&2
 ninja -C "$INST/build" AIEPythonModules aiecc aie-opt >&2
 ln -sfn "$INST/build/python" "$INST/python"
 _link_include_dirs
+_wire_peano_lit
 ln -sfn "$INST/build/bin" "$INST/bin"
 _link_vendored_tools
 touch "$INST"                                          # record last-used before GC (protects it as newest)
