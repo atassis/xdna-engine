@@ -1,4 +1,17 @@
 #!/usr/bin/env python3
+"""SUPERSEDED ABI -- retained as evidence, NOT runnable against the current bricks.
+
+This probe calls the pre-2026-07-31 entry points `gelu_erf_f32(x, out, n)` /
+`sin_f32(x, out, n)`, which took an element count and looped internally. Both bricks now
+take ONE 16-wide vector per call with no count and no loop -- that change is what took
+`gelu-erf` to 1.138e-03 and `sin` to 1.275e-04, after each had been red.
+See kb/kernel-internal-loops-miscompile-put-volume-in-the-worker.
+
+Kept rather than deleted because the KB cites its measurements. To re-run it you would have
+to restore the old ABI, which would reintroduce the defect -- so its numbers stand as a
+historical record of the broken form, not as a live gate.
+"""
+
 """Is gelu-erf's device failure NUMERICS, or the streamed rail?
 
 verify_gelu_erf.py gates 64 rows x 64 cols through verify_rowwise, i.e. 64 SEPARATE kernel calls
