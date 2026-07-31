@@ -160,8 +160,12 @@ _assert_archive_roundtrip() {
 _activate() {
   local inst="$1"
   [ -d "$inst" ] || die "no such install: $inst"
+  # Absolutize: ln resolves a relative target against the SYMLINK's dir, not the cwd, so a
+  # relative --activate arg passes the -d check above and still lands on a dangling link.
+  inst="$(cd "$inst" && pwd -P)"
   [ -d "$VENV_PKGS" ] || die "no venv site-packages at $VENV_PKGS"
   ln -sfn "$inst" "$VENV_LINK"
+  [ -x "$VENV_LINK/bin/clang++" ] || die "activated link is broken: $VENV_LINK -> $inst"
   log "activated: $VENV_LINK -> $inst"
 }
 
