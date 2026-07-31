@@ -52,18 +52,13 @@ static inline ::aie::vector<float, N> sin_v(::aie::vector<float, N> r) {
   // and 1.5*2^23 gives 1.2747e-04. C = 1.5*2^23 keeps q in [2^23, 2^24) where the ulp is exactly 1
   // for BOTH signs (host max |err| vs rint: 0.0).
   //
-  // HONEST SCOPE OF THIS FIX, MEASURED 2026-07-31: on device it changed NOTHING. verify_sin.py
-  // returned 7.091e-01 bit-identical before and after. A mutation probe (scale the output by 3)
-  // moved it to 1.022e+02, so edits genuinely reach the device and the artifact cache is sound --
-  // the constant really is device-neutral here, i.e. aie::add/sub on vector<float,N> do not round
-  // the way the host f32 model does. So this is a latent-correctness fix on any correctly-rounding
-  // f32 path, NOT the cause of this brick's device failure. The 7.091e-01 has a different cause;
-  // the streamed-rail codegen instability described in verify_sin.py's header stands.
-  //
-  // Worth noting against that header's claim that the recorded 1.275e-04 green was purely a
-  // stale-cache artifact: a CORRECT fold reproduces 1.2747e-04 in host simulation of this kernel,
-  // so that number is exactly what a working sin brick produces. Whatever the cache did, the value
-  // itself was not fabricated.
+  // DEVICE-NEUTRAL HERE, and the A/B is now clean. 2^23 vs 1.5*2^23 are BIT-IDENTICAL on device at
+  // ONE chunk per call (7.114e-01 both, back when the brick was still red for the loop reason).
+  // An earlier A/B ran at 4 chunks and so was confounded by the loop defect; re-running it at one
+  // chunk removed that confound and the answer did not change. So this is a latent-correctness fix
+  // for any correctly-rounding f32 path, not something this hardware observes.
+  // The brick is now GREEN at 1.275e-04 -- exactly what host simulation predicts for a correct fold
+  // (1.2747e-04), which also retires the old claim that that number was a stale-cache artifact.
   ::aie::vector<float, N> k = ::aie::mul(r, ::aie::broadcast<float, N>(0.15915494309189535f));
   k = ::aie::add(k, ::aie::broadcast<float, N>(12582912.0f));
   k = ::aie::sub(k, ::aie::broadcast<float, N>(12582912.0f));
@@ -86,19 +81,20 @@ static inline ::aie::vector<float, N> sin_v(::aie::vector<float, N> r) {
   return ::aie::mul(p, r);
 }
 
+// ONE N-wide vector per call. No loop, no element count -- both are required, and this is what
+// took the brick from red to green after it had been failing across sessions.
+//
+// The previous form derived `chunks = n / N` from a runtime `int32_t n`, and was red at 7.09e-01
+// even at n=16 (one chunk). Measured 2026-07-31: input range is not the cause (|x|<=12 gives
+// 7.035e-01, same as |x|<=64), and the fold constant is not the cause (2^23 vs 1.5*2^23 are
+// BIT-IDENTICAL at one chunk, 7.114e-01 both). What fixed it is removing the runtime bound, the
+// same fix that took `gelu-erf` from 9.538e+00 to 1.138e-03.
+// See [[kernel-internal-loops-miscompile-put-volume-in-the-worker]] -- volume belongs in the
+// objectFIFO worker loop, which costs nothing since the iteration merely moves to the driver.
 template <int N>
-void sin_core(const float *restrict input, float *restrict output, int32_t n) {
+void sin_core(const float *restrict input, float *restrict output) {
   event0();
-  const int chunks = n / N;
-  // Unrolling is DISABLED deliberately. A copy kernel delivers bit-exact tiles at 1024 floats
-  // (_verify/probe_tile_limit.py), so there is no delivery limit -- but this kernel was exact at 64
-  // floats per call and wrong above that, with results ALIASED across variables. That is spill
-  // codegen, and the trigger is the unroller: sin_v's live set is already near the register file, so
-  // unrolling two or more copies of it spills. Capping unrolling keeps one copy live.
-  #pragma clang loop unroll(disable)
-  for (int i = 0; i < chunks; i++) {
-    ::aie::store_v(output + i * N, sin_v<N>(::aie::load_v<N>(input + i * N)));
-  }
+  ::aie::store_v(output, sin_v<N>(::aie::load_v<N>(input)));
   event1();
 }
 
@@ -107,8 +103,8 @@ void sin_core(const float *restrict input, float *restrict output, int32_t n) {
 extern "C" {
 
 // sin over `n` f32 elements (n must be a multiple of the vector width).
-void sin_f32(float *input, float *output, int32_t n) {
-  route_b_bricks::sin_core<16>(input, output, n);
+void sin_f32(float *input, float *output) {
+  route_b_bricks::sin_core<16>(input, output);
 }
 
 } // extern "C"

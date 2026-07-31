@@ -1,29 +1,27 @@
 #!/usr/bin/env python3
 """Device rel-L2 verify for the sin brick. Gate 3e-2. Run under the device lock.
 
-THIS GATE CURRENTLY FAILS, AND THAT IS THE CORRECT RESULT. rel-L2 0.709 at 64x64, run2run 0.
+GREEN as of 2026-07-31: **rel-L2 1.275e-04**, three consecutive fresh builds, run2run 0, at 256x16
+over x in [-64, 64] (~10 periods, so the argument fold is genuinely exercised).
 
-The 1.275e-04 this brick was recorded green at was a STALE-CACHE ARTIFACT, not a measurement. The
-harness keyed its artifact cache on the design NAME, and this file reuses the symbol `sin_verify`
-on every run, so once any build of that name succeeded every later run re-reported it no matter
-what sin.cc said. bricklib._design_name now keys on the actual build inputs; re-run under the fixed
-harness, the committed brick fails at its own recorded configuration. The `// cachebust` marker
-below never helped -- it only ever changed the shim TEXT, which was not the key.
+THE FIX WAS THE LOOP, NOT THE MATHS. `sin_core` used to derive `chunks = n / N` from a runtime
+`int32_t n`; it now takes ONE 16-wide vector per call, with no element count and no loop, and volume
+comes from the harness's tile loop. Same change that took `gelu-erf` from 9.538e+00 to 1.138e-03.
+See kb/kernel-internal-loops-miscompile-put-volume-in-the-worker.
 
-What is actually wrong is a codegen instability, not a size limit and not the loop bound:
-  * A copy kernel is bit-exact on this same rail at 32x512 and 8x512 (probe_rail_512.py,
-    rel-L2 exactly 0), so nothing is truncated in delivery.
-  * On the ONESHOT rail the same kernel passes to 1024. The defect needs the streamed rail, where
-    the kernel is invoked once per tile -- the first invocation is right and later ones are not.
-  * Rewriting the trip count as a compile-time template parameter fixes it in one arrangement and
-    breaks it in the next; adding or REMOVING unrelated functions from the translation unit flips
-    the verdict, and always_inline made a green arrangement fail. That is the register-pressure
-    aliasing sin.cc's own header warns about (llvm-aie #1155 territory), reached by this kernel's
-    live set, not something to be fixed by shuffling source.
+TWO CLAIMS THIS DOCSTRING USED TO MAKE, BOTH NOW FALSIFIED -- kept so they are not re-derived:
 
-snake, which inlines sin_v into its own loop rather than calling this path, is genuinely green
-(5.143e-06, reproduces exactly under the fixed harness), as is conv_transpose_1d (3.894e-08). The
-codec upsample stage needs those two, so it is not blocked on this.
+  * "The 1.275e-04 was a STALE-CACHE ARTIFACT, not a measurement." **Wrong.** The brick now measures
+    exactly 1.275e-04 under the content-hash-keyed harness across three fresh builds. That number is
+    simply what a correct sin brick produces here; host simulation of this kernel with a correct fold
+    independently predicts 1.2747e-04. Whatever the old cache did, the value was not fabricated.
+  * "The defect needs the STREAMED rail -- the first invocation is right and later ones are not."
+    **Wrong.** Measured: it fails on the ONESHOT rail too, and it fails at ONE chunk per call
+    (7.114e-01 at n=16). Also ruled out by measurement: input range (|x|<=12 gives 7.035e-01, same as
+    |x|<=64) and the fold constant (2^23 vs 1.5*2^23 are BIT-IDENTICAL at one chunk).
+
+snake stays green at 5.143e-06 across this change -- it composes `sin_v` directly and never used
+`sin_core`, so its own loop is untouched. conv_transpose_1d 3.894e-08.
 
 `brick_cc` must be an ABSOLUTE path -- the shim compiles from the cache dir, so a relative include
 resolves to nothing.
@@ -39,7 +37,7 @@ import bricklib
 HERE = Path(__file__).parent
 BRICK = (HERE.parent / "sin").resolve()
 
-M, COLS = 64, 64          # 4096 elements. 64 per CALL is required by this kernel: a copy kernel
+M, COLS = 256, 16          # 4096 elements. 64 per CALL is required by this kernel: a copy kernel
                           # delivers bit-exact tiles at 1024 (probe_tile_limit.py), so this is NOT a
                           # delivery limit -- sin specifically goes wrong above 64/call with ALIASED,
                           # unbounded output. Disabling loop unrolling did not change it, so the
@@ -62,7 +60,7 @@ res = bricklib.verify_rowwise(
     brick_cc=BRICK / "sin.cc",
     shim_body=(
         f"// cachebust {_cb}\n"
-        f'extern "C" void sin_verify(float *x, float *out) {{ sin_f32(x, out, {COLS}); }}\n'
+        f'extern "C" void sin_verify(float *x, float *out) {{ sin_f32(x, out); }}\n'
     ),
     symbol="sin_verify",
     m=M, in_cols=COLS, out_cols=COLS,
