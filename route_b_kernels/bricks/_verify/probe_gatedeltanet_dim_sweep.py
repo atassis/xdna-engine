@@ -87,30 +87,50 @@ def run_shape(T, DK, DV):
     )
 
 
-# T first (iteration count, the axis the NaN-at-t=2 signature points at), then DK/DV
-# (live vectors and work per iteration). 32/32/64 is the shape the brick currently gates at.
-SHAPES = [(64, 32, 32), (128, 32, 32), (256, 32, 32), (64, 64, 64), (128, 64, 64)]
+# HOLD THE L1 FOOTPRINT ROUGHLY CONSTANT WHILE VARYING THE ITERATION COUNT. The first version of
+# this sweep raised T at DK=DV=32 and raised DK/DV at fixed T, and FOUR of five shapes died in
+# aiecc with "'aie.tile' op allocated buffers exceeded available memory" -- the whole T-sequence
+# (k, v, q, gates, out) is resident in L1, so T and D both scale the footprint directly. A build
+# that never ran says NOTHING about a numerics hypothesis, so those arms were not evidence.
+#
+# Bytes scale as T*D (packed operands and output) plus D^2*4 (the state). Halving D and doubling T
+# therefore keeps the operand bytes identical while DOUBLING the recurrence's iteration count --
+# which isolates the axis the NaN-at-t=2 signature actually points at.
+SHAPES = [
+    (64, 32, 32),    # the shape the brick gates at today -- control
+    (128, 16, 16),   # same operand bytes as the control, 2x the iterations
+    (256, 16, 16),   # 2x operand bytes, 4x the iterations
+    (32, 32, 32),    # half the iterations, same D -- the other direction
+]
 
 rows = []
 for T, DK, DV in SHAPES:
     try:
         r = run_shape(T, DK, DV)
-        rl2 = r.get("rel_l2")
-        rows.append((T, DK, DV, r.get("status"), rl2))
+        rows.append((T, DK, DV, r.get("status"), r.get("rel_l2")))
     except Exception as e:
-        rows.append((T, DK, DV, f"ERROR {type(e).__name__}", None))
-        print(f"  T={T} DK={DK} DV={DV}: {e}", flush=True)
+        # Distinguish a BUILD failure from a wrong answer. Conflating them is how the first run of
+        # this probe printed a confident verdict off four arms that never reached the device.
+        msg = str(e)
+        kind = "BUILD-FAIL" if "exceeded available memory" in msg or "aiecc" in msg else "ERROR"
+        rows.append((T, DK, DV, kind, None))
+        print(f"  T={T} DK={DK} DV={DV}: {kind}", flush=True)
 
 print("\n===== gatedeltanet dim sweep (gate 3e-2) =====", flush=True)
 for T, DK, DV, status, rl2 in rows:
     s = f"{rl2:.3e}" if isinstance(rl2, float) else "--"
-    print(f"  T={T:4d} DK={DK:3d} DV={DV:3d}  {str(status):16s} rel_l2={s}", flush=True)
+    print(f"  T={T:4d} DK={DK:3d} DV={DV:3d}  {str(status):12s} rel_l2={s}", flush=True)
 
-clean = [r for r in rows if isinstance(r[4], float) and r[4] <= 3e-2]
-print(f"\n{len(clean)}/{len(rows)} shapes within gate")
-if len(clean) == len(rows):
-    print("VERDICT: no dim dependence found -- the internal-loop hypothesis is NOT supported by "
-          "this sweep, and the gatedeltanet mechanism stays OPEN")
+ran = [r for r in rows if isinstance(r[4], float)]
+bad = [r for r in ran if r[4] > 3e-2 or not np.isfinite(r[4])]
+built = len(ran)
+print(f"\n{built}/{len(rows)} shapes actually built and ran; {len(bad)} of those are outside gate")
+if built < 2:
+    print("VERDICT: INCONCLUSIVE -- fewer than two shapes reached the device, so nothing is "
+          "comparable. Shrink the shapes until they fit L1 and re-run.")
+elif not bad:
+    print("VERDICT: every shape that RAN is within gate -- this sweep does NOT support the "
+          "internal-loop hypothesis, and the gatedeltanet mechanism stays OPEN")
 else:
-    print("VERDICT: error depends on the shape -- consistent with the kernel-internal-loop "
-          "miscompile; the fix is pressure-dependent, not principled")
+    print("VERDICT: rel-L2 degrades with iteration count at comparable footprint -- consistent "
+          "with the kernel-internal-loop miscompile; the fix is pressure-dependent")
