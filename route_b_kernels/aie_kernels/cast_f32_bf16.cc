@@ -21,7 +21,11 @@ void cast_f32_bf16_row(const float *restrict input, bfloat16 *restrict output,
                        int32_t cols) {
   event0();
   // Round-to-nearest-even to match the host AVX512 pack (default accum narrow truncates).
-  ::aie::set_rounding(::aie::rounding_mode::conv_even);
+  // crRnd is a single sticky register shared by every kernel that runs on this core, so the mode
+  // has to be handed back: leaving it set makes the NEXT kernel's narrowing depend on whether this
+  // one happened to run first, which is invisible in every artifact we diff.
+  const auto saved_rounding =
+      ::aie::swap_rounding(::aie::rounding_mode::conv_even);
   for (int i = 0; i < cols; i += N) {
     // f32 -> bf16 narrow via an accumulator (the aie_api idiom, see
     // mm_silu_epilogue.cc / norm_gemv_prologue.cc): vector<float> has no
@@ -31,6 +35,7 @@ void cast_f32_bf16_row(const float *restrict input, bfloat16 *restrict output,
     a.from_vector(v);
     ::aie::store_v(output + i, a.template to_vector<bfloat16>());
   }
+  ::aie::set_rounding(saved_rounding);
   event1();
 }
 

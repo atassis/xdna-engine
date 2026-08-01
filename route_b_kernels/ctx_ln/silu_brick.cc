@@ -78,7 +78,10 @@ exp2f_neg16(::aie::vector<float, 16> x) {
 template <int N>
 void silu_row(const float *restrict input, float *restrict output, int32_t cols) {
   event0();
-  ::aie::set_rounding(::aie::rounding_mode::conv_even);
+  // Hand the mode back. crRnd is one sticky per-core register, and the fused dwconv->silu xclbin
+  // puts this kernel and dwconv1d on the same core, so a mode left set here reaches the other.
+  const auto saved_rounding =
+      ::aie::swap_rounding(::aie::rounding_mode::conv_even);
 #if SILU_MODE == 0
   // --- shipped hybrid: bf16 tanh, everything else f32 (RU 8.5) ---
   const ::aie::vector<float, N> halff = ::aie::broadcast<float, N>(0.5f);
@@ -244,6 +247,7 @@ void silu_row(const float *restrict input, float *restrict output, int32_t cols)
     ::aie::store_v(output + i, outv);
   }
 #endif
+  ::aie::set_rounding(saved_rounding);
   event1();
 }
 

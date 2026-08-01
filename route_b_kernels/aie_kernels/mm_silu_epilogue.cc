@@ -287,7 +287,10 @@ static inline void mm_silu_epilogue_bf16o_hiprec(const float *__restrict pC_in,
                                                  bfloat16 *__restrict pC_out) {
   event0();
   static_assert(size % 16 == 0, "tile size must be a multiple of 16");
-  aie::set_rounding(aie::rounding_mode::conv_even);
+  // Hand the mode back. crRnd is one sticky per-core register and this epilogue shares its core
+  // with the matmul, so a mode left set here governs the bf16 -> bfp16 conversions of the NEXT
+  // tile's mmul -- an accuracy coupling between two kernels that share nothing else.
+  const auto saved_rounding = aie::swap_rounding(aie::rounding_mode::conv_even);
   const aie::vector<float, 16> halff = aie::broadcast<float, 16>(0.5f);
   const aie::vector<bfloat16, 16> one = aie::broadcast<bfloat16, 16>(1.0f);
   const aie::vector<bfloat16, 16> halfb = aie::broadcast<bfloat16, 16>(0.5f);
@@ -312,6 +315,7 @@ static inline void mm_silu_epilogue_bf16o_hiprec(const float *__restrict pC_in,
     aie::store_v(out_ptr, oacc.to_vector<bfloat16>());
     out_ptr += 16;
   }
+  aie::set_rounding(saved_rounding);
   event1();
 }
 
@@ -322,7 +326,7 @@ static inline void mm_gelu_epilogue_bf16o(const float *__restrict pC_in,
                                           bfloat16 *__restrict pC_out) {
   event0();
   static_assert(size % 16 == 0, "tile size must be a multiple of 16");
-  aie::set_rounding(aie::rounding_mode::conv_even);
+  const auto saved_rounding = aie::swap_rounding(aie::rounding_mode::conv_even);
   const aie::vector<bfloat16, 16> half = aie::broadcast<bfloat16, 16>(0.5f);
   const aie::vector<bfloat16, 16> one = aie::broadcast<bfloat16, 16>(1.0f);
   const aie::vector<bfloat16, 16> c0 = aie::broadcast<bfloat16, 16>(0.7978845608f);
@@ -349,6 +353,7 @@ static inline void mm_gelu_epilogue_bf16o(const float *__restrict pC_in,
     aie::store_v(out_ptr, gx);
     out_ptr += 16;
   }
+  aie::set_rounding(saved_rounding);
   event1();
 }
 
@@ -359,7 +364,7 @@ static inline void mm_identity_epilogue_bf16o(const float *__restrict pC_in,
                                               bfloat16 *__restrict pC_out) {
   event0();
   static_assert(size % 16 == 0, "tile size must be a multiple of 16");
-  aie::set_rounding(aie::rounding_mode::conv_even);
+  const auto saved_rounding = aie::swap_rounding(aie::rounding_mode::conv_even);
   const float *__restrict in_ptr = pC_in;
   bfloat16 *__restrict out_ptr = pC_out;
   AIE_PREPARE_FOR_PIPELINING
@@ -372,6 +377,7 @@ static inline void mm_identity_epilogue_bf16o(const float *__restrict pC_in,
     aie::store_v(out_ptr, a.to_vector<bfloat16>());
     out_ptr += 16;
   }
+  aie::set_rounding(saved_rounding);
   event1();
 }
 

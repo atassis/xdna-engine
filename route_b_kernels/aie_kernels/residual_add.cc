@@ -22,7 +22,11 @@ void residual_add_row(const float *restrict a, const float *restrict b,
   // Round-to-nearest-even so the on-chip f32 add matches the host round-nearest add bit-for-bit
   // (default AIE rounding is truncation -> 1-ULP drift that accumulates over blocks; the WER-path
   // rounding rule, same as glu.cc / affine_cast.cc).
-  ::aie::set_rounding(::aie::rounding_mode::conv_even);
+  // crRnd is a single sticky register shared by every kernel that runs on this core, so the mode
+  // has to be handed back: leaving it set makes the NEXT kernel's narrowing depend on whether this
+  // one happened to run first, which is invisible in every artifact we diff.
+  const auto saved_rounding =
+      ::aie::swap_rounding(::aie::rounding_mode::conv_even);
   const ::aie::vector<float, N> sv = ::aie::broadcast<float, N>(scale);
   for (int i = 0; i < cols; i += N) {
     ::aie::vector<float, N> av = ::aie::load_v<N>(a + i);
@@ -30,6 +34,7 @@ void residual_add_row(const float *restrict a, const float *restrict b,
     ::aie::vector<float, N> sb = ::aie::mul(bv, sv);  // scale*b
     ::aie::store_v(out + i, ::aie::add(av, sb));      // a + scale*b
   }
+  ::aie::set_rounding(saved_rounding);
   event1();
 }
 
