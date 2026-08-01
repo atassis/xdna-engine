@@ -6,12 +6,19 @@ The per-module __main__ often runs only the CPU self-check; the do_*() functions
 are the deferred DEVICE step. This driver runs them. One do_*() crashing (e.g. a
 backend codegen bug) is caught and reported, not fatal to the rest of the drain.
 
-Modules to drain are listed in TARGETS (run.sh forwards no argv).
+Modules to drain are listed in TARGETS (run.sh forwards no argv). TARGETS must
+stay the FULL gate set: it listed 7 modules / 12 of the 27 gates until
+2026-08-01, which read as full coverage while 15 gates went unrun. Use
+drain_mods.py (DRAIN_MODS=) to iterate on a subset; do not trim this list.
 """
 import importlib
 import traceback
 
 TARGETS = [
+    "verify_f1",  # norm + elementwise (6 gates)
+    "verify_f2",  # int8 (2)
+    "verify_f2b",  # int8 gemv (6)
+    "verify_f3",  # transpose (1)
     "verify_bfp16",
     "verify_cast_quant",
     "verify_rope_lut",
