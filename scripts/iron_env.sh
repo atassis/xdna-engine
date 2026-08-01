@@ -11,6 +11,7 @@ INST="$("$REPO/scripts/toolchain_up.sh")" || { echo "iron_env: toolchain_up.sh f
 [ -n "$INST" ] || { echo "iron_env: empty instance dir from toolchain_up.sh" >&2; return 1; }
 export PYTHONPATH="$INST/python:${PYTHONPATH:-}"   # aie resolves to the fork instance (place-tiles), not the wheel
 export AIECC_PATH="$INST/bin/aiecc"
+export MLIR_AIE_INSTANCE="$INST"   # kernel .cc sources resolve here, at the pin -- see route_b_override.mk
 export PEANO_INSTALL_DIR="$REPO/.venv-iron/lib/python3.14/site-packages/llvm-aie"
 # Arch xrt cmake export is broken (missing static .a); point common.cmake at the shared .so
 export XRT_INC_DIR=/usr/include
