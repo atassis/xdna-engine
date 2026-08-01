@@ -96,18 +96,19 @@ static inline aie::vector<float, DV> gdn_state_read(const float *__restrict S,
 }
 
 // In-place gated delta-rule state update:
-//   S[i,:] = alpha * S[i,:] + (beta * k[i]) * err[:]     for i=0..DK-1
+//   S[i,:] = alpha * S[i,:] + bk[i] * err[:]     for i=0..DK-1
+// bk is beta*k, precomputed by the caller in the VECTOR domain: the aie2p
+// scalar-f32 path miscompiles (see rope_lut.cc's header), and the `beta*k[i]`
+// this loop used to do was a scalar float mul.
 template <unsigned DK, unsigned DV>
 static inline void gdn_state_write(float *__restrict S,
-                                    const aie::vector<float, DK> &k,
+                                    const aie::vector<float, DK> &bk,
                                     const aie::vector<float, DV> &err,
-                                    float alpha, float beta) {
-  const aie::vector<float, DV> alpha_v = aie::broadcast<float, DV>(alpha);
+                                    const aie::vector<float, DV> &alpha_v) {
   for (unsigned i = 0; i < DK; ++i) {
     aie::vector<float, DV> row = aie::load_v<DV>(&S[i * DV]);
-    float bk = beta * k[i];
-    aie::accum<accfloat, DV> acc = aie::mul(row, alpha_v); // alpha * S[i,:]
-    acc = aie::mac(acc, err, aie::broadcast<float, DV>(bk)); // + (beta*k[i]) * err
+    aie::accum<accfloat, DV> acc = aie::mul(row, alpha_v);  // alpha * S[i,:]
+    acc = aie::mac(acc, err, aie::broadcast<float, DV>(bk[i]));
     aie::store_v(&S[i * DV], acc.template to_vector<float>());
   }
 }
@@ -153,15 +154,20 @@ static inline void gatedeltanet_core(const bfloat16 *__restrict k,
     vacc.from_vector(vb);
     aie::vector<float, DV> vf = vacc.template to_vector<float>();
 
-    const float alpha = gates[t * 2 + 0];
-    const float beta = gates[t * 2 + 1];
+    // Both gates go straight from their scalar load into the vector domain;
+    // no scalar float arithmetic happens on this path.
+    const aie::vector<float, DV> alpha_v =
+        aie::broadcast<float, DV>(gates[t * 2 + 0]);
+    const aie::vector<float, DK> bk =
+        aie::mul(kf, aie::broadcast<float, DK>(gates[t * 2 + 1]))
+            .template to_vector<float>();
 
     // 1) predict what the (pre-update) state already stores for this key.
     aie::vector<float, DV> pred = gdn_state_read<DK, DV>(s_out, kf);
     // 2) delta / correction term.
     aie::vector<float, DV> err = aie::sub(vf, pred);
     // 3) decay + delta-rule write (in place on s_out).
-    gdn_state_write<DK, DV>(s_out, kf, err, alpha, beta);
+    gdn_state_write<DK, DV>(s_out, bk, err, alpha_v);
     // 4) read the just-updated state back out with the query.
     aie::vector<float, DV> ov = gdn_state_read<DK, DV>(s_out, qf);
 
