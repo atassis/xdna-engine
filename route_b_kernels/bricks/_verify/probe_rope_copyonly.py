@@ -25,38 +25,61 @@ from bricklib import GEN, iron, _build_oneshot
 M, D = 16, 128
 N = M * D
 
-SHIM = f"""#include <aie_api/aie.hpp>
+CBUF_N = M + 64  # same packed-const shape the rope harness passes: pos[M] | inv_freq[ROT/2]
+
+SHIM_1IN = f"""#include <aie_api/aie.hpp>
 #include <stdint.h>
 extern "C" void copy_only(bfloat16 *restrict qk_in, bfloat16 *restrict qk_out) {{
   for (unsigned i = 0; i < {N}u; ++i) qk_out[i] = qk_in[i];
 }}
 """
 
+# Same copy, but with the rope harness's exact THREE-buffer signature (qk_in, cbuf, qk_out).
+# cbuf is deliberately unread: if only row 0 arrives here, nothing in rope_lut.cc is implicated
+# and the fault is the two-input oneshot rail, i.e. the brick has been failing on its test rig.
+SHIM_2IN = f"""#include <aie_api/aie.hpp>
+#include <stdint.h>
+extern "C" void copy_only2(bfloat16 *restrict qk_in, int32_t *restrict cbuf,
+                           bfloat16 *restrict qk_out) {{
+  (void)cbuf;
+  for (unsigned i = 0; i < {N}u; ++i) qk_out[i] = qk_in[i];
+}}
+"""
 
-def main():
-    p = GEN / "copy_only_shim.cc"
-    p.write_text(SHIM)
-    design = _build_oneshot(
-        "copy_only", p, [N], N, [ml_dtypes.bfloat16], ml_dtypes.bfloat16, []
-    )
-    rng = np.random.default_rng(0)
-    src = rng.standard_normal(N).astype(np.float32).astype(ml_dtypes.bfloat16)
-    it = iron.tensor(np.ascontiguousarray(src), dtype=ml_dtypes.bfloat16, device="npu")
-    ot = iron.zeros((N,), dtype=ml_dtypes.bfloat16, device="npu")
-    design(it, ot)
 
-    got = ot.numpy().astype(np.float32).reshape(M, D)
-    want = src.astype(np.float32).reshape(M, D)
+def check(label, got, want):
     bad = got != want
-    print(f"elements exactly equal: {N - int(bad.sum())}/{N}")
     rows = sorted(set(np.nonzero(bad)[0].tolist()))
-    print(f"rows with any mismatch: {rows if rows else 'none'}")
+    print(f"{label}: exact {N - int(bad.sum())}/{N}   damaged rows {rows if rows else 'NONE'}")
     if rows:
         r = rows[0]
-        cols = np.nonzero(bad[r])[0]
-        print(f"  row {r}: {cols.size} bad cols, first {cols[:12].tolist()}")
-        print(f"  want[:8] {want[r][:8].tolist()}")
-        print(f"  got [:8] {got[r][:8].tolist()}")
+        print(f"    row {r} want[:6] {want[r][:6].tolist()}")
+        print(f"    row {r} got [:6] {got[r][:6].tolist()}")
+
+
+def main():
+    rng = np.random.default_rng(0)
+    src = rng.standard_normal(N).astype(np.float32).astype(ml_dtypes.bfloat16)
+    want = src.astype(np.float32).reshape(M, D)
+
+    p1 = GEN / "copy_only_shim.cc"
+    p1.write_text(SHIM_1IN)
+    d1 = _build_oneshot("copy_only", p1, [N], N, [ml_dtypes.bfloat16], ml_dtypes.bfloat16, [])
+    it = iron.tensor(np.ascontiguousarray(src), dtype=ml_dtypes.bfloat16, device="npu")
+    o1 = iron.zeros((N,), dtype=ml_dtypes.bfloat16, device="npu")
+    d1(it, o1)
+    check("1 input ", o1.numpy().astype(np.float32).reshape(M, D), want)
+
+    p2 = GEN / "copy_only2_shim.cc"
+    p2.write_text(SHIM_2IN)
+    d2 = _build_oneshot(
+        "copy_only2", p2, [N, CBUF_N], N,
+        [ml_dtypes.bfloat16, np.int32], ml_dtypes.bfloat16, [],
+    )
+    cb = iron.tensor(np.zeros(CBUF_N, dtype=np.int32), dtype=np.int32, device="npu")
+    o2 = iron.zeros((N,), dtype=ml_dtypes.bfloat16, device="npu")
+    d2(it, cb, o2)
+    check("2 inputs", o2.numpy().astype(np.float32).reshape(M, D), want)
 
 
 if __name__ == "__main__":

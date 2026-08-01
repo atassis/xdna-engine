@@ -97,9 +97,6 @@ void rope_lut_prologue(bfloat16 *restrict qk, const int32_t *restrict pos,
   ::aie::parallel_lookup<int8, ::aie::lut<4, bfloat16>> sin_look(sin_lut, /*step_bits=*/0, /*bias=*/128);
   ::aie::parallel_lookup<int8, ::aie::lut<4, bfloat16>> cos_look(cos_lut, /*step_bits=*/0, /*bias=*/128);
 
-  alignas(::aie::vector_decl_align) bfloat16 sin_buf[kRotHalfPad];
-  alignas(::aie::vector_decl_align) bfloat16 cos_buf[kRotHalfPad];
-
   ::aie::set_rounding(::aie::rounding_mode::conv_even);
   constexpr float kTwoPi = 2.0f * kPi;
 
@@ -111,6 +108,7 @@ void rope_lut_prologue(bfloat16 *restrict qk, const int32_t *restrict pos,
     const int32_t p = pos[m];
     ::aie::vector<float, kVec> posf =
         ::aie::mul(::aie::to_float(::aie::broadcast<int32, kVec>(p)), (float)ROPE_SCALE_INV);
+    bfloat16 *row = qk + (size_t)m * ROPE_D;
     // Quantize AND gather in ONE pass: the keys are consumed by fetch() in the same
     // iteration that produces them, so they never round-trip through an int8 buffer.
     // That is what fixes the old bug -- storing a sub-native `vector<int8, 16>` into
@@ -134,20 +132,19 @@ void rope_lut_prologue(bfloat16 *restrict qk, const int32_t *restrict pos,
       // --- gather sin/cos via the LUT hardware, straight from the just-computed keys ---
       // The tables are laid out for the hardware's four-slot read (see
       // rope_lut_tables.inc), so lane order needs no correction here.
-      ::aie::vector<bfloat16, kFetchW> s = sin_look.fetch(keys);
-      ::aie::vector<bfloat16, kFetchW> c = cos_look.fetch(keys);
-      ::aie::store_v(sin_buf + i, s);
-      ::aie::store_v(cos_buf + i, c);
-    }
+      ::aie::vector<bfloat16, kFetchW> sv = sin_look.fetch(keys);
+      ::aie::vector<bfloat16, kFetchW> cv = cos_look.fetch(keys);
 
-    // --- apply the rotation, vectorized over kVec lanes (f32 math, bf16 store,
-    //     same pattern as norm_gemv_prologue.cc's accum round-trip) ---
-    bfloat16 *row = qk + (size_t)m * ROPE_D;
-    for (unsigned j = 0; j < kRotHalf; j += kVec) {
-      ::aie::accum<accfloat, kVec> x1a; x1a.from_vector(::aie::load_v<kVec>(row + j), 0);
-      ::aie::accum<accfloat, kVec> x2a; x2a.from_vector(::aie::load_v<kVec>(row + kRotHalf + j), 0);
-      ::aie::accum<accfloat, kVec> sina; sina.from_vector(::aie::load_v<kVec>(sin_buf + j), 0);
-      ::aie::accum<accfloat, kVec> cosa; cosa.from_vector(::aie::load_v<kVec>(cos_buf + j), 0);
+      // --- rotate this group in place, from the values still in registers ---
+      // Group i's sin/cos is exactly what group i of the rotation needs, so the two loops
+      // fuse and neither sin_buf nor cos_buf has to exist. Staging them in function-local
+      // arrays instead made every row after the first read them UNWRITTEN -- at ROPE_M=16
+      // only row 0 survived and rows 1-15 came back all-zero, while ROPE_M=1 was bit-exact.
+      // f32 math, bf16 store, the norm_gemv_prologue.cc accum round-trip.
+      ::aie::accum<accfloat, kVec> x1a; x1a.from_vector(::aie::load_v<kVec>(row + i), 0);
+      ::aie::accum<accfloat, kVec> x2a; x2a.from_vector(::aie::load_v<kVec>(row + kRotHalf + i), 0);
+      ::aie::accum<accfloat, kVec> sina; sina.from_vector(sv, 0);
+      ::aie::accum<accfloat, kVec> cosa; cosa.from_vector(cv, 0);
 
       ::aie::vector<float, kVec> x1 = x1a.to_vector<float>();
       ::aie::vector<float, kVec> x2 = x2a.to_vector<float>();
@@ -161,8 +158,8 @@ void rope_lut_prologue(bfloat16 *restrict qk, const int32_t *restrict pos,
 
       ::aie::accum<accfloat, kVec> out1a; out1a.from_vector(out1, 0);
       ::aie::accum<accfloat, kVec> out2a; out2a.from_vector(out2, 0);
-      ::aie::store_v(row + j, out1a.template to_vector<bfloat16>());
-      ::aie::store_v(row + kRotHalf + j, out2a.template to_vector<bfloat16>());
+      ::aie::store_v(row + i, out1a.template to_vector<bfloat16>());
+      ::aie::store_v(row + kRotHalf + i, out2a.template to_vector<bfloat16>());
     }
     // dims [ROPE_ROT, ROPE_D) are untouched: already correct in place
     // (partial rotary pass-through).
