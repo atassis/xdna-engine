@@ -60,6 +60,45 @@ def _npty(shape, dt):
     return np.ndarray[shape, np.dtype[dt]]
 
 
+def _include_closure_digest(source, compile_flags):
+    """Hash the CONTENT of everything `source` transitively #includes by quoted path.
+
+    ExternalFunction._content_digest hashes the source file's own text plus the include
+    DIRECTORIES' mtimes -- and a directory mtime does not move when a file inside it is edited in
+    place. So editing an #included table (rope_lut_tables.inc, a *_tables.inc, a shared header) is
+    invisible to the JIT cache key and the previous xclbin is served. That cost two sessions once:
+    a fix "did not work" because the build never happened.
+
+    compile_flags IS in the digest, so returning this as a -D makes those edits visible without
+    touching upstream. Quoted includes only -- system/angle-bracket headers come from the toolchain
+    and are already pinned by toolchain.lock.
+    """
+    inc_dirs = [f[2:] for f in compile_flags if f.startswith("-I")]
+    seen, pending, h = set(), [Path(source)], hashlib.sha256()
+    while pending:
+        cur = pending.pop()
+        try:
+            key = cur.resolve()
+        except OSError:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            text = key.read_text()
+        except OSError:
+            continue
+        h.update(str(key).encode())
+        h.update(text.encode())
+        for inc in re.findall(r'^\s*#\s*include\s+"([^"]+)"', text, re.M):
+            cand = [key.parent / inc] + [Path(d) / inc for d in inc_dirs]
+            for c in cand:
+                if c.exists():
+                    pending.append(c)
+                    break
+    return h.hexdigest()[:16]
+
+
 def _design_key(symbol, *parts):
     """JIT cache key for a built design.
 
@@ -91,6 +130,9 @@ def _build_streamed(symbol, shim, n_tiles, in_tile, out_tile, resident_len, comp
     of a matrix; `verify_streamed` is the tiled-operand case. Both are the same design.
     """
     compile_flags = _AIE_API_INC + list(compile_flags or [])
+    # Make edits to #included files visible to the JIT cache key (see _include_closure_digest).
+    compile_flags = compile_flags + [
+        f"-DBRICK_INCLUDE_DIGEST={_include_closure_digest(shim, compile_flags)}"]
     has_resident = resident_len > 0
     _check_symbol_arity(symbol, shim, 3 if has_resident else 2)
 
@@ -254,6 +296,9 @@ def _build_oneshot(symbol, shim, in_numels, out_numel, in_dts, out_dt, compile_f
     In/Out params are signature markers for iron.jit's tensor-arg count; data flows
     through rt.sequence."""
     compile_flags = _AIE_API_INC + list(compile_flags or [])
+    # Make edits to #included files visible to the JIT cache key (see _include_closure_digest).
+    compile_flags = compile_flags + [
+        f"-DBRICK_INCLUDE_DIGEST={_include_closure_digest(shim, compile_flags)}"]
     nin = len(in_numels)
     _check_symbol_arity(symbol, shim, nin + 1)
 
