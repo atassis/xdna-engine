@@ -34,7 +34,10 @@ if __name__ == "__main__":
         rl2 = r.get("rel_l2")
         rl2s = f"rel_l2={rl2:.3e}" if isinstance(rl2, float) else "rel_l2=--"
         print(f"  {r['name']:34s} {r['status']:10s} {rl2s}")
-    print(f"streamed: {sum(1 for r in results if r.get('ok'))}/{len(results)} PASS")
+    npass = sum(1 for r in results if r.get("ok"))
+    print(f"streamed: {npass}/{len(results)} PASS")
     print("JSON " + json.dumps([{k: v for k, v in r.items() if k != 'got'} for r in results]))
     import os
-    os._exit(0)
+    # os._exit skips teardown on purpose (a clean exit has hung here), but it was hard-coded to 0,
+    # so this gate reported success no matter what the rel-L2s were. Carry the real verdict.
+    os._exit(0 if npass == len(results) and results else 1)

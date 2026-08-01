@@ -61,3 +61,6 @@ ok = (nz > 0) and (r_model <= 3e-2) and (r_fp32 <= 0.08)
 print(f"[gemm-bfp16-ebs8 64x64x64] dev_vs_bfp16model={r_model:.3e} (gate 3e-2) "
       f"dev_vs_fp32={r_fp32:.3e} (gate 8e-2) run2run={run2run:.2e} nz={nz:.2e} "
       f"-> {'PASS' if ok else 'FAIL'}")
+# Without this the gate printed FAIL and still exited 0, so no drain could ever fail on it.
+assert ok, (f"gemm-bfp16-ebs8 gate failed: dev_vs_bfp16model={r_model:.3e} "
+            f"dev_vs_fp32={r_fp32:.3e} nz={nz:.2e}")
