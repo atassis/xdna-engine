@@ -16,7 +16,6 @@ import sys
 
 from aie.iron import Kernel, ObjectFifo, Program, Runtime, TaskGroup, Worker
 from aie.iron.device import NPU1, NPU2
-from aie.iron.placers import SequentialPlacer
 from aie.helpers.taplib.tap import TensorAccessPattern
 from aie.iron.controlflow import range_
 
@@ -81,7 +80,7 @@ def my_silu(dev, num_columns):
         ],
     )
 
-    return Program(dev, rt, workers=workers).resolve_program(SequentialPlacer())
+    return Program(dev, rt, workers=workers).resolve_program()
 
 
 p = argparse.ArgumentParser()
