@@ -86,12 +86,19 @@ def build_case():
 
 
 # --- pure-buffer verify shim: split the packed const, copy qk_in->qk_out, rotate in place ---
+# ROTATE FIRST, COPY OUT SECOND -- the order matters and is not cosmetic. The old body copied
+# qk_in into qk_out and then rotated qk_out IN PLACE, i.e. a scalar store loop immediately followed
+# by a vector load loop over the SAME buffer. Under the pinned aie_api that is miscompiled: the
+# rotate's first-iteration loads are scheduled ahead of the copy's stores, so row 0 read the
+# buffer's initial zeros (128/256 at ROPE_M=2, bit-exact at ROPE_M=1, clean under the wheel).
+# Rotating the INPUT buffer -- which the host has already filled, so no kernel store precedes the
+# loads -- and copying out afterwards is the same work and is bit-exact under BOTH header sets.
 SHIM_BODY = (
     'extern "C" void rope_lut_verify(bfloat16 *qk_in, int32_t *cbuf, bfloat16 *qk_out) {\n'
-    '  for (unsigned i = 0; i < (unsigned)(ROPE_M * ROPE_D); ++i) qk_out[i] = qk_in[i];\n'
     '  const int32_t *pos = cbuf;                       // [ROPE_M] runtime positions\n'
     '  const float *inv_freq = (const float *)(cbuf + ROPE_M);  // [ROPE_ROT/2] host-folded\n'
-    '  rope_lut_prologue(qk_out, pos, inv_freq);        // rotates qk_out IN PLACE\n'
+    '  rope_lut_prologue(qk_in, pos, inv_freq);         // rotates qk_in IN PLACE\n'
+    '  for (unsigned i = 0; i < (unsigned)(ROPE_M * ROPE_D); ++i) qk_out[i] = qk_in[i];\n'
     '}\n'
 )
 

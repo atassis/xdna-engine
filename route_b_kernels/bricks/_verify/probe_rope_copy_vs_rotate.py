@@ -54,12 +54,19 @@ ARMS = {
         '  const float *inv_freq = (const float *)(cbuf + ROPE_M);\n'
         '  rope_lut_prologue(qk_out, pos, inv_freq);\n'
         '}\n'),
-    "B rotate-only": (
+    # ARM B IS RETIRED AND MUST NOT COME BACK. It pre-filled the OUTPUT tensor on the host and had
+    # the shim rotate it without copying. iron output tensors are NOT uploaded, so the kernel
+    # rotated zeros: 0/256 on BOTH arms, including the wheel, which is clean under every other test.
+    # That impossible result is the only reason the arm was caught. To get data into a buffer the
+    # kernel reads, it must arrive as an INPUT.
+    "C rotate-input-first": (
         'extern "C" void rope_probe(bfloat16 *qk_in, int32_t *cbuf, bfloat16 *qk_out) {\n'
-        '  (void)qk_in;   // host pre-fills qk_out; NO kernel store precedes the rotate\n'
         '  const int32_t *pos = cbuf;\n'
         '  const float *inv_freq = (const float *)(cbuf + ROPE_M);\n'
-        '  rope_lut_prologue(qk_out, pos, inv_freq);\n'
+        '  // Rotate the INPUT buffer in place -- the host already uploaded real data there, so no\n'
+        '  // kernel store precedes the rotate\'s loads. Copy out only afterwards.\n'
+        '  rope_lut_prologue(qk_in, pos, inv_freq);\n'
+        '  for (unsigned i = 0; i < (unsigned)(ROPE_M * ROPE_D); ++i) qk_out[i] = qk_in[i];\n'
         '}\n'),
 }
 
@@ -70,10 +77,7 @@ for label, body in ARMS.items():
                                      [BF, np.int32], BF, FLAGS)
     i0 = iron.tensor(np.ascontiguousarray(qk.reshape(-1)), dtype=BF, device="npu")
     i1 = iron.tensor(np.ascontiguousarray(cbuf), dtype=np.int32, device="npu")
-    # Arm B needs the data ALREADY in the output buffer; arm A must not get it there, or the copy
-    # would be masked by a correct pre-existing value.
-    init = qk.reshape(-1) if label.startswith("B") else np.zeros(M * D, BF)
-    o = iron.tensor(np.ascontiguousarray(init), dtype=BF, device="npu")
+    o = iron.zeros((M * D,), dtype=BF, device="npu")
     design(i0, i1, o)
     got = np.asarray(np.array(o.numpy(), copy=True), np.float32).reshape(M, D)
 
