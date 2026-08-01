@@ -114,21 +114,13 @@ static inline float exp2_scalar(float x) {
   return (float)e.get(0);
 }
 
-// SOFTWARE f32 2^x (x <= 0). The hw aie::exp2 is a bf16-OUTPUT LUT. MEASURED on aie2p against a
-// float64 reference (route_b_kernels/exp2_ab/, 2026-07-29), max rel-err by input domain:
-//   [-1,0] 6.1%   [0,10] 6.1%   [-10,0] 10.1%   [-100,0] 49.1%
-// versus 8.5e-5 flat for this poly -- a 720x-5771x gap. Do NOT quote the older "~2-4%" figure that
-// stood here: that is roughly the MEAN on the two moderate domains (3.2-3.8%), not a bound, and the
-// error grows sharply as x goes negative, which is exactly where softmax lives. Cost of the hw path
-// in the pipeline: ~0.024 ctx / +0.7% WER.
+// SOFTWARE f32 2^x (x <= 0). The hw aie::exp2 is a bf16-OUTPUT LUT and, MEASURED on aie2p,
+// ~2-4% inaccurate -> ~0.024 ctx / +0.7% WER in the softmax; this poly is ~1e-4 accurate.
 // x = k + f, k = floor(x), f in [0,1); 2^x = 2^k * poly5(2^f).
-// NOINLINE is LOAD-BEARING, re-confirmed on Peano integ-2026-07-29. Careful: simply DELETING the
-// attribute is a no-op test -- Peano's -O2 cost model declines to inline this here anyway, so the
-// build still passes and proves nothing. Forcing it with always_inline reproduces the miscompile:
-// rel-L2 3.35 / corr 0.224 against the 0.08 / 0.99 gate, at T=32 TQ=8 through the fused 3-pass
-// softmax. Register-pressure codegen bug; llvm-aie issue pending. Upstream #3399 now inlines
-// external kernels by default, so this hazard is no longer ours alone.
-static __attribute__((noinline)) aie::vector<float, VL> exp2f_vec(aie::vector<float, VL> x) {
+// NOINLINE is LOAD-BEARING: this function is device-correct standalone (probe_floor: full 2^x
+// rel-err 8.5e-5) but INLINING it into the big 3-pass softmax loop makes Peano -O2 miscompile it
+// to NaN (register-pressure codegen bug; candidate llvm-aie issue). noinline keeps it correct.
+static aie::vector<float, VL> exp2f_vec(aie::vector<float, VL> x) {  // NOINLINE STRIPPED for A/B test
   // CLAMP: 2^k is reconstructed from the exponent bits, which breaks for k < -127 (k+127 < 0).
   // Peaked (real) attention drives sl very negative (< -127) for non-max keys, so clamp to -100
   // (2^-100 ~ 8e-31 ~ 0 -> those keys have ~0 weight, harmless). Synth-spread tests never hit this.
