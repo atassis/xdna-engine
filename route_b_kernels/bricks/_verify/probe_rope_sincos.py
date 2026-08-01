@@ -56,8 +56,6 @@ extern "C" void rope_sincos(int32_t *restrict cbuf, bfloat16 *restrict out) {{
     ::aie::vector<int8, kVec> keys = ::aie::to_fixed<int8>(q);
     ::aie::vector<bfloat16, kFetchW> s = sin_look.fetch(keys);
     ::aie::vector<bfloat16, kFetchW> c = cos_look.fetch(keys);
-    s = ::aie::concat(::aie::filter_even(s), ::aie::filter_odd(s));
-    c = ::aie::concat(::aie::filter_even(c), ::aie::filter_odd(c));
     ::aie::store_v(out + i, s);
     ::aie::store_v(out + kRotHalf + i, c);
   }}

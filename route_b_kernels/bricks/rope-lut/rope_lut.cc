@@ -132,14 +132,10 @@ void rope_lut_prologue(bfloat16 *restrict qk, const int32_t *restrict pos,
       ::aie::vector<int8, kVec> keys = ::aie::to_fixed<int8>(q);
 
       // --- gather sin/cos via the LUT hardware, straight from the just-computed keys ---
+      // The tables are laid out for the hardware's four-slot read (see
+      // rope_lut_tables.inc), so lane order needs no correction here.
       ::aie::vector<bfloat16, kFetchW> s = sin_look.fetch(keys);
       ::aie::vector<bfloat16, kFetchW> c = cos_look.fetch(keys);
-      // parallel_lookup returns the gathered values DE-INTERLEAVED within the
-      // 16-lane group: output lane j holds the value for key at input lane
-      // perm(j), perm = [0,8,1,9,2,10,...] (verified on device). Restore key
-      // order with concat(filter_even, filter_odd) = the inverse interleave.
-      s = ::aie::concat(::aie::filter_even(s), ::aie::filter_odd(s));
-      c = ::aie::concat(::aie::filter_even(c), ::aie::filter_odd(c));
       ::aie::store_v(sin_buf + i, s);
       ::aie::store_v(cos_buf + i, c);
     }
