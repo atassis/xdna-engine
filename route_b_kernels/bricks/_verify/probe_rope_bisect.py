@@ -73,7 +73,46 @@ KEYS_POS = '''      ::aie::vector<float, kVec> invf = ::aie::load_v<kVec>(inv_fr
 '''
 
 
+def body_loop(arm):
+    """The per-row work, identical text for the inline and the separate-function arms."""
+    s = f'  for (unsigned m = 0; m < {M}u; ++m) {{\n    bfloat16 *row = qk + (size_t)m * {D}u;\n'
+    s += '''    const int32_t p = pos[m];
+    ::aie::vector<float, kVec> posf =
+        ::aie::mul(::aie::to_float(::aie::broadcast<int32, kVec>(p)), 1.0f);
+'''
+    s += "    for (unsigned i = 0; i < kRotHalf; i += kVec) {\n"
+    s += KEYS_POS
+    s += '''      ::aie::vector<bfloat16, kVec> sv = sin_look.fetch(keys);
+      ::aie::vector<bfloat16, kVec> cv = cos_look.fetch(keys);
+'''
+    return s + ROT_BODY + "    }\n  }\n"
+
+
+def shim_fn(name):
+    """Arm D: arm C's body moved into a SEPARATE extern "C" function, called from the entry
+    point -- exactly rope_lut.cc's structure. Everything else is byte-identical to arm C."""
+    return PRE + f'''extern "C" void {name}_body(bfloat16 *restrict qk, const int32_t *restrict pos,
+                                const float *restrict inv_freq) {{
+  const ::aie::lut<4, bfloat16> sin_lut(256, kSinLutAb, kSinLutCd);
+  const ::aie::lut<4, bfloat16> cos_lut(256, kCosLutAb, kCosLutCd);
+  ::aie::parallel_lookup<int8, ::aie::lut<4, bfloat16>> sin_look(sin_lut, 0, 128);
+  ::aie::parallel_lookup<int8, ::aie::lut<4, bfloat16>> cos_look(cos_lut, 0, 128);
+  ::aie::set_rounding(::aie::rounding_mode::conv_even);
+{body_loop("rot_pos0")}}}
+
+extern "C" void {name}(bfloat16 *restrict qk_in, int32_t *restrict cbuf,
+                     bfloat16 *restrict qk_out) {{
+  for (unsigned i = 0; i < {N}u; ++i) qk_out[i] = qk_in[i];
+  const int32_t *pos = cbuf;
+  const float *inv_freq = (const float *)(cbuf + {M});
+  {name}_body(qk_out, pos, inv_freq);
+}}
+'''
+
+
 def shim(name, arm):
+    if arm == "fn":
+        return shim_fn(name)
     s = PRE + f'''extern "C" void {name}(bfloat16 *restrict qk_in, int32_t *restrict cbuf,
                      bfloat16 *restrict qk_out) {{
   for (unsigned i = 0; i < {N}u; ++i) qk_out[i] = qk_in[i];
@@ -134,6 +173,7 @@ def main():
     run("A rmw     ", "bis_rmw", "rmw", src, want, cbuf)
     run("B rot0    ", "bis_rot0", "rot0", src, want, cbuf)
     run("C rot_pos0", "bis_rotpos", "rot_pos0", src, want, cbuf)
+    run("D separate", "bis_fn", "fn", src, want, cbuf)
 
 
 if __name__ == "__main__":

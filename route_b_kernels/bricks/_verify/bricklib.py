@@ -7,6 +7,7 @@ through the kernel on aie2p (optionally with ONE packed resident const buffer, t
 within a core tile's 2-input DMA channels); rel-L2 vs the numpy golden gates it.
 Run-twice self-check guards the CLFLUSH read race.
 """
+import hashlib
 import re
 from pathlib import Path
 
@@ -57,6 +58,20 @@ _AIE_API_INC = _aie_api_include()
 
 def _npty(shape, dt):
     return np.ndarray[shape, np.dtype[dt]]
+
+
+def _design_key(symbol, *parts):
+    """JIT cache key for a built design.
+
+    The design's __name__ IS the cache key, so it must carry everything that changes the PROGRAM --
+    buffer sizes, dtypes, compile flags -- not just the kernel symbol. Keying on the symbol alone
+    silently serves the FIRST build to every later shape: a sweep reusing one symbol gets the first
+    shape's output BO for all of them, so exactly that many elements come back correct and the rest
+    of the host buffer reads as zero. That masqueraded as a kernel defect for a full session --
+    docs/log/2026-08, rope-lut "only row 0 survives".
+    """
+    blob = "|".join(str(x) for x in parts)
+    return f"design_{symbol}_{hashlib.sha1(blob.encode()).hexdigest()[:10]}"
 
 
 def _build_streamed(symbol, shim, n_tiles, in_tile, out_tile, resident_len, compile_flags,
@@ -119,7 +134,9 @@ def _build_streamed(symbol, shim, n_tiles, in_tile, out_tile, resident_len, comp
             return Program(
                 iron.get_current_device(), rt, workers=[worker]
             ).resolve_program()
-        design.__name__ = design.__qualname__ = f"design_{symbol}"
+        design.__name__ = design.__qualname__ = _design_key(
+            symbol, n_tiles, in_tile, out_tile, resident_len, in_dt, out_dt, resident_dt,
+            compile_flags)
         return iron.jit(design, use_cache=_JIT_CACHE)
 
     def design(inp: In, out: Out):
@@ -152,7 +169,9 @@ def _build_streamed(symbol, shim, n_tiles, in_tile, out_tile, resident_len, comp
         return Program(
             iron.get_current_device(), rt, workers=[worker]
         ).resolve_program()
-    design.__name__ = design.__qualname__ = f"design_{symbol}"
+    design.__name__ = design.__qualname__ = _design_key(
+        symbol, n_tiles, in_tile, out_tile, resident_len, in_dt, out_dt, resident_dt,
+        compile_flags)
     return iron.jit(design, use_cache=_JIT_CACHE)
 
 
@@ -288,7 +307,8 @@ def _build_oneshot(symbol, shim, in_numels, out_numel, in_dts, out_dt, compile_f
     else:
         raise ValueError(f"_build_oneshot supports 1-4 inputs, got {nin}")
 
-    design.__name__ = design.__qualname__ = f"design_{symbol}"
+    design.__name__ = design.__qualname__ = _design_key(
+        symbol, in_numels, out_numel, in_dts, out_dt, compile_flags)
     return iron.jit(design, use_cache=_JIT_CACHE)
 
 
