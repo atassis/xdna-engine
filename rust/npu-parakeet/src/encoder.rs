@@ -882,7 +882,9 @@ impl FastConformerEncoder {
                     let ff2 = prof::time("ff", || self.feed_forward(&x, b, blk, "ff2", "norm_feed_forward2.weight", "norm_feed_forward2.bias",
                                                 "feed_forward2.linear1.weight", "feed_forward2.linear2.weight"));
                     x = x + ff2.mapv(|v| 0.5 * v);
-                    return layernorm(&x, &b.v("norm_out.weight"), &b.v("norm_out.bias"));
+                    let out = layernorm(&x, &b.v("norm_out.weight"), &b.v("norm_out.bias"));
+                    dump_convin("fused_out", blk, &out);
+                    return out;
                 }
             }
         }
@@ -915,7 +917,10 @@ impl FastConformerEncoder {
         }
         {
             let _h = PhaseScope::new("ln", Bucket::Host);
-            layernorm(&x, &b.v("norm_out.weight"), &b.v("norm_out.bias"))
+            let out = layernorm(&x, &b.v("norm_out.weight"), &b.v("norm_out.bias"));
+            #[cfg(feature = "npu")]
+            dump_convin("ship_out", blk, &out);
+            out
         }
     }
 
