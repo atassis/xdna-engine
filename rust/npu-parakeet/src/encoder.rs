@@ -19,6 +19,27 @@ pub struct FastConformerEncoder {
     npu: Option<crate::npu::NpuMatmul>,
 }
 
+/// Debug: dump the conv-INPUT activation for one block when `PARAKEET_DUMP_CONVIN=<dir>` is set.
+///
+/// The fused seam and the default path reach the same logical tensor -- `(x + 0.5*ff1) + mhsa_out`,
+/// the conv residual base -- by different routes, so dumping it from both arms at the same block
+/// bisects a parity failure into "upstream of the conv front" vs "created by the conv front".
+/// Off unless the env var is set; writes `{dir}/{tag}_b{blk}.npy` as raw f32 [T, D] with a tiny
+/// header so numpy can read it via np.fromfile + reshape.
+#[cfg(feature = "npu")]
+fn dump_convin(tag: &str, blk: usize, x: &Array2<f32>) {
+    let Ok(dir) = std::env::var("PARAKEET_DUMP_CONVIN") else { return };
+    let _ = std::fs::create_dir_all(&dir);
+    let (t, d) = x.dim();
+    let mut buf = Vec::with_capacity(8 + t * d * 4);
+    buf.extend_from_slice(&(t as u32).to_le_bytes());
+    buf.extend_from_slice(&(d as u32).to_le_bytes());
+    for v in x.iter() {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+    let _ = std::fs::write(format!("{dir}/{tag}_b{blk}.bin"), buf);
+}
+
 impl FastConformerEncoder {
     pub fn new(artifacts: &Path, cfg: ModelCfg) -> Self {
         let w = ParakeetWeights::load(artifacts).expect("load parakeet weights");
@@ -855,6 +876,7 @@ impl FastConformerEncoder {
                         || b.m3("conv.pointwise_conv1.weight").index_axis(Axis(2), 0).to_owned().t().to_owned(), &format!("{blk}.pw1"));
                     // rejoin host: x = (x + 0.5*ff1) + mhsa_out (the conv residual base), then conv rest / FFN2 / out.
                     let mut x = npu.readback_stream(&conv_in_bo, m);
+                    dump_convin("fused", blk, &x);
                     let conv_out = prof::time("conv_mod", || self.conv_module(&x, blk, glu));
                     x = &x + &conv_out;
                     let ff2 = prof::time("ff", || self.feed_forward(&x, b, blk, "ff2", "norm_feed_forward2.weight", "norm_feed_forward2.bias",
@@ -877,6 +899,8 @@ impl FastConformerEncoder {
             let _h = PhaseScope::new("residual", Bucket::Host);
             x = &x + &mhsa_out;
         }
+        #[cfg(feature = "npu")]
+        dump_convin("ship", blk, &x);
         // conv_module now does its own norm_conv LN (resident seam or host fallback), so pass pre-LN x.
         let conv_out = prof::time("conv_mod", || self.conv_module(&x, blk, None));
         {
