@@ -30,13 +30,8 @@ import ml_dtypes
 BRICKS = Path(__file__).parent.parent
 
 # --- brick geometry (small: qk = M*D*2 = 4KB, comfortably inside 64KB L1) ---
-# ROPE_ROT MUST keep kRotHalfPad = ceil(ROT/2/32)*32 a MULTIPLE OF 64: the Peano
-# aie2p backend (peano 31084c4c) CRASHES for ROT=64 (kRotHalfPad=32) with
-# "immediate operand value -184 is not a multiple of 64" while assembling
-# rope_lut_prologue (a 32-elem bf16 store emits a non-64-aligned offset). ROT=128
-# (kRotHalfPad=64) and ROT=96 compile clean -- verified by standalone clang probe.
-# So we verify at full rotary ROT=D=128; a device run at ROT=64 needs a toolchain
-# fix (llvm-aie codegen) first. See DEVICE-GATED RISKS in the handoff.
+# Full rotary. Partial rotary (ROT < D) is gated by probe_rope_partial_rotary.py,
+# which sweeps ROT over the shapes the kernel's %32 static_assert admits.
 D = 128       # ROPE_D   head_dim / feature width per Q/K row
 ROT = 128     # ROPE_ROT rotary width (== D here: full rotary; ROT<D = partial)
 M = 16        # ROPE_M   resident tile rows (tokens) processed this call
