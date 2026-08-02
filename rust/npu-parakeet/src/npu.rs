@@ -486,7 +486,34 @@ fn resolve_verified(dir: &Path, stem: &str) -> kernel_registry::KernelArtifacts 
     }
 }
 
+
+/// Times a device dispatch into [`NpuStats::dispatch_s`] for as long as it is alive.
+///
+/// WHY AN RAII GUARD AND NOT A LINE AT EACH CALL SITE: a census on 2026-08-02 found 25 of 32
+/// `run_matmul8` call sites incremented `dispatches` (the count) and never `dispatch_s` (the time).
+/// Only ONE site was timed, so `dispatch_s` reported a single path and read as if it were the whole
+/// device total -- which is how the phase profiler and NpuStats came to disagree ~4x about where
+/// encode time goes. An instrument that has to be remembered at 32 sites will be forgotten at 25;
+/// this makes the timing a scoped object so a dispatch cannot be added without one being visible.
+struct DispatchTimer<'a> {
+    stats: &'a std::cell::RefCell<NpuStats>,
+    t: Instant,
+}
+
+impl Drop for DispatchTimer<'_> {
+    fn drop(&mut self) {
+        self.stats.borrow_mut().dispatch_s += self.t.elapsed().as_secs_f64();
+    }
+}
+
 impl NpuMatmul {
+    /// Scope a device dispatch so its wall time lands in `dispatch_s`. Hold it in a `{ }` block
+    /// around the `run_matmul8` call; it must not straddle another `self.stats.borrow_mut()`.
+    #[inline]
+    fn dtimer(&self) -> DispatchTimer<'_> {
+        DispatchTimer { stats: &self.stats, t: Instant::now() }
+    }
+
     pub fn open(root: &Path) -> Self {
         let dev = Device::open(0).expect("open NPU (single-tenant: stop npu-asr/voxd)");
         let base = root.join(WA_SUBDIR);
@@ -1405,14 +1432,14 @@ impl NpuMatmul {
         match rl.lnaffcast.as_ref() {
             // ONE dispatch: (bo_x, gamma|beta) -> bo_bf16. bo_ln is never materialized.
             Some(f) => {
-                f.kern.run_matmul8(3, &f.instr, f.n, &rl.bo_x, &rl.bo_gb, &rl.bo_bf16, &f.dummy_tmp, &f.dummy_tr).unwrap();
+                { let _dt = self.dtimer(); f.kern.run_matmul8(3, &f.instr, f.n, &rl.bo_x, &rl.bo_gb, &rl.bo_bf16, &f.dummy_tmp, &f.dummy_tr).unwrap(); }
                 self.stats.borrow_mut().dispatches += 1;
             }
             None => {
                 // (1) ctxLN: bo_x -> bo_ln  (NO sync back -- stays device-resident)
-                rl.ln_kern.run_matmul8(3, &rl.ln_instr, rl.ln_n, &rl.bo_x, &rl.bo_ln, &rl.ln_c, &rl.ln_tmp, &rl.ln_tr).unwrap();
+                { let _dt = self.dtimer(); rl.ln_kern.run_matmul8(3, &rl.ln_instr, rl.ln_n, &rl.bo_x, &rl.bo_ln, &rl.ln_c, &rl.ln_tmp, &rl.ln_tr).unwrap(); }
                 // (2) affine_cast: (bo_ln * gamma + beta) -> bo_bf16  (device-side, no host round-trip)
-                rl.ac_kern.run_matmul8(3, &rl.ac_instr, rl.ac_n, &rl.bo_ln, &rl.bo_gb, &rl.bo_bf16, &rl.ac_tmp, &rl.ac_tr).unwrap();
+                { let _dt = self.dtimer(); rl.ac_kern.run_matmul8(3, &rl.ac_instr, rl.ac_n, &rl.bo_ln, &rl.bo_gb, &rl.bo_bf16, &rl.ac_tmp, &rl.ac_tr).unwrap(); }
                 self.stats.borrow_mut().dispatches += 2;
             }
         }
@@ -1434,8 +1461,8 @@ impl NpuMatmul {
         gb[KRES..].copy_from_slice(beta);
         rl.bo_gb.write_bytes(f32_bytes(&gb)).unwrap();
         rl.bo_gb.sync_to_device().unwrap();
-        rl.ln_kern.run_matmul8(3, &rl.ln_instr, rl.ln_n, &rl.bo_x, &rl.bo_ln, &rl.ln_c, &rl.ln_tmp, &rl.ln_tr).unwrap();
-        rl.ac_kern.run_matmul8(3, &rl.ac_instr, rl.ac_n, &rl.bo_ln, &rl.bo_gb, &rl.bo_bf16, &rl.ac_tmp, &rl.ac_tr).unwrap();
+        { let _dt = self.dtimer(); rl.ln_kern.run_matmul8(3, &rl.ln_instr, rl.ln_n, &rl.bo_x, &rl.bo_ln, &rl.ln_c, &rl.ln_tmp, &rl.ln_tr).unwrap(); }
+        { let _dt = self.dtimer(); rl.ac_kern.run_matmul8(3, &rl.ac_instr, rl.ac_n, &rl.bo_ln, &rl.bo_gb, &rl.bo_bf16, &rl.ac_tmp, &rl.ac_tr).unwrap(); }
         self.stats.borrow_mut().dispatches += 2;
         rl
     }
@@ -1458,14 +1485,14 @@ impl NpuMatmul {
         match rl.lnaffcast.as_ref() {
             // ONE dispatch, DEVICE-IN: (a_bo, gamma|beta) -> bo_bf16.
             Some(f) => {
-                f.kern.run_matmul8(3, &f.instr, f.n, a_bo, &rl.bo_gb, &rl.bo_bf16, &f.dummy_tmp, &f.dummy_tr).unwrap();
+                { let _dt = self.dtimer(); f.kern.run_matmul8(3, &f.instr, f.n, a_bo, &rl.bo_gb, &rl.bo_bf16, &f.dummy_tmp, &f.dummy_tr).unwrap(); }
                 self.stats.borrow_mut().dispatches += 1;
             }
             None => {
                 // (1) ctxLN: a_bo -> bo_ln  (DEVICE-IN: no host write of x; stays device-resident)
-                rl.ln_kern.run_matmul8(3, &rl.ln_instr, rl.ln_n, a_bo, &rl.bo_ln, &rl.ln_c, &rl.ln_tmp, &rl.ln_tr).unwrap();
+                { let _dt = self.dtimer(); rl.ln_kern.run_matmul8(3, &rl.ln_instr, rl.ln_n, a_bo, &rl.bo_ln, &rl.ln_c, &rl.ln_tmp, &rl.ln_tr).unwrap(); }
                 // (2) affine_cast: (bo_ln * gamma + beta) -> bo_bf16  (device-side)
-                rl.ac_kern.run_matmul8(3, &rl.ac_instr, rl.ac_n, &rl.bo_ln, &rl.bo_gb, &rl.bo_bf16, &rl.ac_tmp, &rl.ac_tr).unwrap();
+                { let _dt = self.dtimer(); rl.ac_kern.run_matmul8(3, &rl.ac_instr, rl.ac_n, &rl.bo_ln, &rl.bo_gb, &rl.bo_bf16, &rl.ac_tmp, &rl.ac_tr).unwrap(); }
                 self.stats.borrow_mut().dispatches += 2;
             }
         }
@@ -1595,7 +1622,7 @@ impl NpuMatmul {
     fn dispatch_with_a(&self, a_bo: &Bo, m: usize, wbo: &Bo, n: usize, silu: bool) -> Array2<f32> {
         assert!(m <= PAD_M, "dispatch_with_a: m={m} exceeds PAD_M={PAD_M}");
         let st = self.stream(n, if silu { Act::Silu } else { Act::Identity });
-        self.kern.run_matmul8(3, &st.instr, st.n_instr, a_bo, wbo, &st.bo_c, &self.bo_tmp, &self.bo_tr).unwrap();
+        { let _dt = self.dtimer(); self.kern.run_matmul8(3, &st.instr, st.n_instr, a_bo, wbo, &st.bo_c, &self.bo_tmp, &self.bo_tr).unwrap(); }
         self.stats.borrow_mut().dispatches += 1;
         st.bo_c.sync_from_device().unwrap();
         let mut cb = vec![0u8; m * n * 4];
@@ -1660,9 +1687,9 @@ impl NpuMatmul {
             self.weight_bo(id, w.view())
         };
         let st = self.stream(n2, Act::Identity); // identity modal (no on-chip silu on pw1)
-        self.kern.run_matmul8(3, &st.instr, st.n_instr, &rlc.bo_bf16, &wbo, &st.bo_c, &self.bo_tmp, &self.bo_tr).unwrap();
+        { let _dt = self.dtimer(); self.kern.run_matmul8(3, &st.instr, st.n_instr, &rlc.bo_bf16, &wbo, &st.bo_c, &self.bo_tmp, &self.bo_tr).unwrap(); }
         // GLU: st.bo_c [PAD_M,2D] f32 (A/g3) -> glu.bo_out [PAD_M,D] f32 (B/g4), device-side.
-        glu.kern.run_matmul8(3, &glu.instr, glu.n, &st.bo_c, &glu.bo_out, &glu.dummy_c, &glu.dummy_tmp, &glu.dummy_tr).unwrap();
+        { let _dt = self.dtimer(); glu.kern.run_matmul8(3, &glu.instr, glu.n, &st.bo_c, &glu.bo_out, &glu.dummy_c, &glu.dummy_tmp, &glu.dummy_tr).unwrap(); }
         self.stats.borrow_mut().dispatches += 2; // pw1 + glu
         // read the D-wide GLU output for the m real rows (row-major, first m rows contiguous).
         glu.bo_out.sync_from_device().unwrap();
@@ -1698,8 +1725,8 @@ impl NpuMatmul {
             self.weight_bo(id, w.view())
         };
         let st = self.stream(n2, Act::Identity);
-        self.kern.run_matmul8(3, &st.instr, st.n_instr, &rlc.bo_bf16, &wbo, &st.bo_c, &self.bo_tmp, &self.bo_tr).unwrap();
-        glu.kern.run_matmul8(3, &glu.instr, glu.n, &st.bo_c, &glu.bo_out, &glu.dummy_c, &glu.dummy_tmp, &glu.dummy_tr).unwrap();
+        { let _dt = self.dtimer(); self.kern.run_matmul8(3, &st.instr, st.n_instr, &rlc.bo_bf16, &wbo, &st.bo_c, &self.bo_tmp, &self.bo_tr).unwrap(); }
+        { let _dt = self.dtimer(); glu.kern.run_matmul8(3, &glu.instr, glu.n, &st.bo_c, &glu.bo_out, &glu.dummy_c, &glu.dummy_tmp, &glu.dummy_tr).unwrap(); }
         self.stats.borrow_mut().dispatches += 2; // pw1 + glu
         glu.bo_out.sync_from_device().unwrap();
         let mut cb = vec![0u8; m * KRES * 4];
@@ -1744,7 +1771,7 @@ impl NpuMatmul {
         // GEMM into a FRESH device f32 BO (identity modal, NO read).
         let out = self.dev.alloc_bo(&self.kern, PAD_M * n * 4, FLAG_HOST_ONLY, self.kern.group_id(5).unwrap()).unwrap();
         let st = self.stream(n, Act::Identity);
-        self.kern.run_matmul8(3, &st.instr, st.n_instr, &self.bo_a, &wbo, &out, &self.bo_tmp, &self.bo_tr).unwrap();
+        { let _dt = self.dtimer(); self.kern.run_matmul8(3, &st.instr, st.n_instr, &self.bo_a, &wbo, &out, &self.bo_tmp, &self.bo_tr).unwrap(); }
         self.stats.borrow_mut().dispatches += 1;
         Rc::new(out)
     }
@@ -1785,7 +1812,7 @@ impl NpuMatmul {
         dw.bo_w.write_bytes(u16_bytes(&w_bits)).unwrap();
         dw.bo_w.sync_to_device().unwrap();
         // dispatch + read [C, DW_T] bf16 -> f32, slice to [C, t].
-        dw.kern.run_matmul8(3, &dw.instr, dw.n, &dw.bo_in, &dw.bo_w, &dw.bo_out, &dw.dummy_tmp, &dw.dummy_tr).unwrap();
+        { let _dt = self.dtimer(); dw.kern.run_matmul8(3, &dw.instr, dw.n, &dw.bo_in, &dw.bo_w, &dw.bo_out, &dw.dummy_tmp, &dw.dummy_tr).unwrap(); }
         self.stats.borrow_mut().dispatches += 1;
         dw.bo_out.sync_from_device().unwrap();
         let mut ob = vec![0u8; DW_C * DW_T * 2];
@@ -1824,7 +1851,7 @@ impl NpuMatmul {
         s.bo_in.write_bytes(f32_bytes(&in_f)).unwrap();
         s.bo_in.sync_to_device().unwrap();
         // 2-buffer ABI: in(g3) -> out(g4); tmp/ctrl/trace dummies (g5/g6/g7).
-        s.kern.run_matmul8(3, &s.instr, s.n, &s.bo_in, &s.bo_out, &s.dummy_tmp, &s.dummy_ctrl, &s.dummy_tr).unwrap();
+        { let _dt = self.dtimer(); s.kern.run_matmul8(3, &s.instr, s.n, &s.bo_in, &s.bo_out, &s.dummy_tmp, &s.dummy_ctrl, &s.dummy_tr).unwrap(); }
         self.stats.borrow_mut().dispatches += 1;
         s.bo_out.sync_from_device().unwrap();
         let mut ob = vec![0u8; DW_C * DW_T * 4];
@@ -1876,7 +1903,7 @@ impl NpuMatmul {
         ds.bo_w.write_bytes(u16_bytes(&w_bits)).unwrap();
         ds.bo_w.sync_to_device().unwrap();
         // 3-buffer ABI (== dwconv): in(g3), w(g4), out(g5) f32; tmp/trace dummies (g6/g7).
-        ds.kern.run_matmul8(3, &ds.instr, ds.n, &ds.bo_in, &ds.bo_w, &ds.bo_out, &ds.dummy_tmp, &ds.dummy_tr).unwrap();
+        { let _dt = self.dtimer(); ds.kern.run_matmul8(3, &ds.instr, ds.n, &ds.bo_in, &ds.bo_w, &ds.bo_out, &ds.dummy_tmp, &ds.dummy_tr).unwrap(); }
         self.stats.borrow_mut().dispatches += 1;
         ds.bo_out.sync_from_device().unwrap();
         let mut ob = vec![0u8; DW_C * DW_T * 4];
@@ -1934,7 +1961,7 @@ impl NpuMatmul {
         ds.bo_w.write_bytes(u16_bytes(&w_bits)).unwrap();
         ds.bo_w.sync_to_device().unwrap();
         // 3-buffer ABI (== dwconv): in(g3), w(g4), out(g5) f32; tmp/trace dummies (g6/g7).
-        ds.kern.run_matmul8(3, &ds.instr, ds.n, &ds.bo_in, &ds.bo_w, &ds.bo_out, &ds.dummy_tmp, &ds.dummy_tr).unwrap();
+        { let _dt = self.dtimer(); ds.kern.run_matmul8(3, &ds.instr, ds.n, &ds.bo_in, &ds.bo_w, &ds.bo_out, &ds.dummy_tmp, &ds.dummy_tr).unwrap(); }
         self.stats.borrow_mut().dispatches += 1;
         ds.bo_out.sync_from_device().unwrap();
         let mut ob = vec![0u8; DW_T * DW_C * 4];
@@ -1976,9 +2003,12 @@ impl NpuMatmul {
             return None;
         }
         let o = rl.fc1_panel_bf16.as_ref()?;
-        o.kern
-            .run_matmul8(3, &o.instr, o.n, &rl.bo_bf16, w1, &o.bo_out, &o.dummy_tmp, &o.dummy_tr)
-            .unwrap();
+        {
+            let _dt = self.dtimer();
+            o.kern
+                .run_matmul8(3, &o.instr, o.n, &rl.bo_bf16, w1, &o.bo_out, &o.dummy_tmp, &o.dummy_tr)
+                .unwrap();
+        }
         self.stats.borrow_mut().dispatches += 1; // fc1 only -- the deint is folded into its drain
         Some(&o.bo_out)
     }
@@ -1988,7 +2018,7 @@ impl NpuMatmul {
     /// [PAD_M,KRES] device BO. Counts 2 dispatches (cast + modal); the caller counts fc1. Full fc2
     /// weight cached under "{id2}.full". Collapses the deint + 4x K=1024 GEMM + 4x acc_add.
     fn fc2_k4096_dev<F2: FnOnce() -> Array2<f32>>(&self, k4: &Fc2K4096, fc1_out: &Bo, make_w2: F2, id2: &str) -> Rc<Bo> {
-        k4.cast_kern.run_matmul8(3, &k4.cast_instr, k4.cast_n, fc1_out, &k4.cast_out, &k4.cast_dc, &k4.cast_dt, &k4.cast_dr).unwrap();
+        { let _dt = self.dtimer(); k4.cast_kern.run_matmul8(3, &k4.cast_instr, k4.cast_n, fc1_out, &k4.cast_out, &k4.cast_dc, &k4.cast_dt, &k4.cast_dr).unwrap(); }
         let wid = format!("{id2}.full");
         let cached = self.wcache.borrow().get(&wid).cloned();
         let w2f = if let Some(bo) = cached {
@@ -1998,7 +2028,7 @@ impl NpuMatmul {
             assert_eq!(w.dim(), (DFF, KRES), "fc2 W2 dim");
             self.weight_bo(&wid, w.view())
         };
-        k4.mm_kern.run_matmul8(3, &k4.mm_instr, k4.mm_n, &k4.cast_out, &w2f, &k4.mm_c, &self.bo_tmp, &self.bo_tr).unwrap();
+        { let _dt = self.dtimer(); k4.mm_kern.run_matmul8(3, &k4.mm_instr, k4.mm_n, &k4.cast_out, &w2f, &k4.mm_c, &self.bo_tmp, &self.bo_tr).unwrap(); }
         self.stats.borrow_mut().dispatches += 2; // cast + K=DFF modal
         k4.mm_c.clone()
     }
@@ -2025,7 +2055,9 @@ impl NpuMatmul {
             Some(bo) => bo,
             None => {
                 let st1 = self.stream(DFF, Act::Silu); // fc1 on-chip SiLU iff modal (plain resident ignores it)
+                let t_fc1 = Instant::now();
                 self.kern.run_matmul8(3, &st1.instr, st1.n_instr, &rl.bo_bf16, &w1, &st1.bo_c, &self.bo_tmp, &self.bo_tr).unwrap();
+                self.stats.borrow_mut().dispatch_s += t_fc1.elapsed().as_secs_f64();
                 // ONE-DISPATCH K=DFF fc2 (opt-in): cast@DFF -> K=DFF modal -> readback to host [m,KRES].
                 if self.fc2_k4096_on() {
                     if let Some(k4) = rl.fc2_k4096.as_ref() {
@@ -2048,7 +2080,9 @@ impl NpuMatmul {
                 // chunk-major), device-side. One dispatch (chunk-major drain TAP). NOTE: this n-D output DMA
                 // HANGS ("run did not complete") when the deint is a co-resident hw-context alongside the
                 // modal (it works standalone) -- a multi-context n-D-DMA toolchain issue; see the debug note.
+                let t_deint = Instant::now();
                 rl.deint_kern.run_matmul8(3, &rl.deint_instr, rl.deint_n, &st1.bo_c, &rl.bo_deint, &rl.deint_c, &rl.deint_tmp, &rl.deint_tr).unwrap();
+                self.stats.borrow_mut().dispatch_s += t_deint.elapsed().as_secs_f64();
                 self.stats.borrow_mut().dispatches += 2; // fc1 + deint
                 &rl.bo_deint
             }
@@ -2106,8 +2140,12 @@ impl NpuMatmul {
             Some(bo) => bo,
             None => {
                 let st1 = self.stream(DFF, Act::Silu); // fc1 on-chip SiLU iff modal (plain resident ignores it)
+                let t_fc1 = Instant::now();
                 self.kern.run_matmul8(3, &st1.instr, st1.n_instr, &rl.bo_bf16, &w1, &st1.bo_c, &self.bo_tmp, &self.bo_tr).unwrap();
+                self.stats.borrow_mut().dispatch_s += t_fc1.elapsed().as_secs_f64();
+                let t_deint = Instant::now();
                 rl.deint_kern.run_matmul8(3, &rl.deint_instr, rl.deint_n, &st1.bo_c, &rl.bo_deint, &rl.deint_c, &rl.deint_tmp, &rl.deint_tr).unwrap();
+                self.stats.borrow_mut().dispatch_s += t_deint.elapsed().as_secs_f64();
                 self.stats.borrow_mut().dispatches += 2; // fc1 + deint
                 &rl.bo_deint
             }
@@ -2152,7 +2190,9 @@ impl NpuMatmul {
             Some(bo) => bo,
             None => {
                 let st1 = self.stream(DFF, Act::Silu); // fc1 on-chip SiLU iff modal (plain resident ignores it)
+                let t_fc1 = Instant::now();
                 self.kern.run_matmul8(3, &st1.instr, st1.n_instr, &rl.bo_bf16, &w1, &st1.bo_c, &self.bo_tmp, &self.bo_tr).unwrap();
+                self.stats.borrow_mut().dispatch_s += t_fc1.elapsed().as_secs_f64();
                 // ONE-DISPATCH fc2 (K=DFF): cast fc1's f32 [PAD_M,DFF] -> bf16 row-major, then a SINGLE K=DFF
                 // modal GEMM that accumulates all DFF K internally in L1 -> f32 [PAD_M,KRES] device. Collapses
                 // deint + 4x K=1024 GEMM + 4x acc_add (8 dispatches) into cast + 1 modal (2). NOT bit-identical
@@ -2164,7 +2204,9 @@ impl NpuMatmul {
                     }
                 }
                 // deinterleave+cast: st1.bo_c (f32 [PAD_M,DFF]) -> rl.bo_deint (bf16 chunk-major), device-side.
+                let t_deint = Instant::now();
                 rl.deint_kern.run_matmul8(3, &rl.deint_instr, rl.deint_n, &st1.bo_c, &rl.bo_deint, &rl.deint_c, &rl.deint_tmp, &rl.deint_tr).unwrap();
+                self.stats.borrow_mut().dispatch_s += t_deint.elapsed().as_secs_f64();
                 self.stats.borrow_mut().dispatches += 2; // fc1 + deint
                 &rl.bo_deint
             }
@@ -2195,10 +2237,10 @@ impl NpuMatmul {
                 })
             };
             // modal identity GEMM: partial c -> st.bo_c (device, NO sync_from/read).
-            self.kern.run_matmul8(3, &st.instr, st.n_instr, &chunk, &w2c, &st.bo_c, &self.bo_tmp, &self.bo_tr).unwrap();
+            { let _dt = self.dtimer(); self.kern.run_matmul8(3, &st.instr, st.n_instr, &chunk, &w2c, &st.bo_c, &self.bo_tmp, &self.bo_tr).unwrap(); }
             // accumulate on-chip: nxt = (c==0 ? zero : cur) + st.bo_c, then ping-pong.
             let a_in: &Bo = if c == 0 { &aa.zero } else { &cur };
-            aa.kern.run_matmul8(3, &aa.instr, aa.n, a_in, &st.bo_c, &nxt, &aa.dummy_tmp, &aa.dummy_tr).unwrap();
+            { let _dt = self.dtimer(); aa.kern.run_matmul8(3, &aa.instr, aa.n, a_in, &st.bo_c, &nxt, &aa.dummy_tmp, &aa.dummy_tr).unwrap(); }
             self.stats.borrow_mut().dispatches += 2; // partial GEMM + acc_add
             std::mem::swap(&mut cur, &mut nxt);
         }
@@ -2418,7 +2460,7 @@ impl NpuMatmul {
             panic!("residual_add_dev: scale {scale} has no built xclbin (only s050=0.5, s100=1.0); build final_resadd_{PAD_M}x{KRES}_s<stag>");
         };
         debug_assert!((ra.scale - scale).abs() < 1e-6);
-        ra.kern.run_matmul8(3, &ra.instr, ra.n, a_bo, b_bo, &ra.bo_out, &ra.dummy_tmp, &ra.dummy_tr).unwrap();
+        { let _dt = self.dtimer(); ra.kern.run_matmul8(3, &ra.instr, ra.n, a_bo, b_bo, &ra.bo_out, &ra.dummy_tmp, &ra.dummy_tr).unwrap(); }
         self.stats.borrow_mut().dispatches += 1;
         Some(ra.bo_out.clone())
     }
