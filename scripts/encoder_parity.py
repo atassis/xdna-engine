@@ -154,7 +154,19 @@ def main():
                          "Policy knob, not a noise floor: the device is bit-deterministic, so a "
                          "same-config rerun measures exactly 0.0 here and any value above 0 is "
                          "real. Default matches --burst-floor: no frame may gain as much error "
-                         "as it takes to call a frame bursty in the first place.")
+                         "as it takes to call a frame bursty in the first place. "
+                         "CAVEAT, MEASURED 2026-08-03 -- this default is NOT priced against "
+                         "transcript risk and is roughly 3x conservative. burst_sensitivity.py "
+                         "run against the DEVICE baseline (n=5712) puts P(transcript changes) at "
+                         "the 0.004 noise floor across 0.05-0.42, i.e. a 0.05 negative control "
+                         "scores the same as 0.42; it reaches 0.015 at 0.80 and only turns up at "
+                         "1.20 (0.092). Separately, the conveyor arm FAILS this check at 0.1755 "
+                         "while being transcript-BETTER than the baseline it fails against (WER "
+                         "8.06 vs 8.42, fewer burst frames, same word edits), and only 2 of 16 "
+                         "differing-token frames sit on a burst against 0.77 expected by chance. "
+                         "Raising the default is a shipping-policy decision, deliberately NOT "
+                         "taken here; know that a FAIL on this statistic alone has no demonstrated "
+                         "transcript cost.")
     ap.add_argument("--survey", action="store_true", help="baseline-only error profile, no gate")
     ap.add_argument("--per-clip", action="store_true", help="print the per-clip table")
     ap.add_argument("--json", metavar="PATH", default=None, help="also write the full result as JSON")
