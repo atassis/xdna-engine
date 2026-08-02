@@ -729,6 +729,9 @@ impl FastConformerEncoder {
         #[cfg(not(feature = "npu"))]
         let resident_glu: Option<Array2<f32>> = None;
 
+        // Tag which producer supplied the GLU so a two-arm dump is directly comparable.
+        #[cfg(feature = "npu")]
+        let glu_src = if precomputed_glu.is_some() { "glu_dev" } else { "glu_host" };
         let glu = if let Some(g) = precomputed_glu {
             g // [T, D] -- conv front already ran DEVICE-IN in the fused seam
         } else if let Some(g) = resident_glu {
@@ -770,6 +773,8 @@ impl FastConformerEncoder {
                 glu
             })
         };
+        #[cfg(feature = "npu")]
+        dump_convin(glu_src, blk, &glu);
         // depthwise along time: [D, T]. Bracketing transposes + trailing SiLU are host math
         // with no mm() inside, so they fold into the conv_dwconv Host leaf scope.
         let back = prof::time("dwconv", || {
