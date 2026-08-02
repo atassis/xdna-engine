@@ -129,7 +129,8 @@ static inline void gatedeltanet_core(const bfloat16 *__restrict k,
                                      bfloat16 *__restrict o,        // [T,DV]
                                      float *__restrict s_out) {     // [DK,DV]
   event0();
-  ::aie::set_rounding(::aie::rounding_mode::conv_even);
+  const auto saved_rounding =
+      ::aie::swap_rounding(::aie::rounding_mode::conv_even);
 
   // Working state lives in s_out for the duration of the call (avoids a
   // second DK*DV-sized on-chip buffer); seed it from s_in.
@@ -176,6 +177,7 @@ static inline void gatedeltanet_core(const bfloat16 *__restrict k,
     aie::store_v(&o[t * DV], oacc.template to_vector<bfloat16>());
   }
 
+  ::aie::set_rounding(saved_rounding);
   event1();
 }
 

@@ -106,8 +106,8 @@ def _design_key(symbol, *parts):
     buffer sizes, dtypes, compile flags -- not just the kernel symbol. Keying on the symbol alone
     silently serves the FIRST build to every later shape: a sweep reusing one symbol gets the first
     shape's output BO for all of them, so exactly that many elements come back correct and the rest
-    of the host buffer reads as zero. That masqueraded as a kernel defect for a full session --
-    docs/log/2026-08, rope-lut "only row 0 survives".
+    of the host buffer reads as zero. That reads as a kernel returning partial rows, not as a cache
+    hit, so it can absorb a lot of debugging before anyone suspects the key.
     """
     blob = "|".join(str(x) for x in parts)
     return f"design_{symbol}_{hashlib.sha1(blob.encode()).hexdigest()[:10]}"

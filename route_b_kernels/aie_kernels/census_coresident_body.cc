@@ -48,7 +48,8 @@ template <int N>
 void census_residual_add_row(const float *restrict a, const float *restrict b,
                              float *restrict out, float scale, int32_t cols) {
   event0();
-  ::aie::set_rounding(::aie::rounding_mode::conv_even);
+  const auto saved_rounding =
+      ::aie::swap_rounding(::aie::rounding_mode::conv_even);
   const ::aie::vector<float, N> sv = ::aie::broadcast<float, N>(scale);
   for (int i = 0; i < cols; i += N) {
     ::aie::vector<float, N> av = ::aie::load_v<N>(a + i);
@@ -56,6 +57,7 @@ void census_residual_add_row(const float *restrict a, const float *restrict b,
     ::aie::vector<float, N> sb = ::aie::mul(bv, sv);
     ::aie::store_v(out + i, ::aie::add(av, sb));
   }
+  ::aie::set_rounding(saved_rounding);
   event1();
 }
 

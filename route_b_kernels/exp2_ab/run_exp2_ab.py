@@ -11,9 +11,8 @@ Pattern (pyxrt buffer wiring) copied from scripts/run_npu_relpos_scores.py, redu
 to the exp2_ab probe's 1-in/1-out ABI (group_id(3)=in, group_id(4)=out; group_id(1)
 =cacheable instr bo, same as every other route_b probe runner in this repo).
 
-Usage (run under the single-tenant NPU lock):
-  xdna-engine-private/journal/scripts/npu_lock.sh run -- \\
-      .venv-iron/bin/python route_b_kernels/exp2_ab/run_exp2_ab.py \\
+Usage (the NPU is single-tenant -- serialize against any other on-device work):
+  .venv-iron/bin/python route_b_kernels/exp2_ab/run_exp2_ab.py \\
       --xclbin mlir-aie/programming_examples/ml/exp2_ab/build/final.xclbin \\
       --insts  mlir-aie/programming_examples/ml/exp2_ab/build/insts.bin
 """

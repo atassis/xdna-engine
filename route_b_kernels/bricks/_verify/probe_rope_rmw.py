@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Do the per-row loads inside rope_lut.cc return the data, or zero?
 
-[[rope-lut-buffers-and-rail-both-exonerated]] narrowed the only-row-0-survives defect by arithmetic:
+The buffers and the rail were both exonerated first, narrowing the defect by arithmetic:
 rows 1+ come back with out1 AND out2 exactly zero, and since out1 = x1*c - x2*s, out2 = x1*s + x2*c
 and sin^2+cos^2 = 1, no LUT read can make both vanish. Only x1 = x2 = 0 can. So the loads from
 `row + i` should be returning zero for every m >= 1.

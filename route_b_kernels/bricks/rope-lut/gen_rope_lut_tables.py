@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Generate rope_lut_tables.inc under the MEASURED aie::lut<4,bfloat16> placement rule.
 
-The hardware reads four slots per logical entry j (measured over all 256 keys, see
-docs/log/2026-08/lut4-bf16-address-map-measured.md):
+The hardware reads four slots per logical entry j (measured over all 256 keys by
+probe_lut_layout_model.py, which asserts this rule against the device):
 
     s0 = 16*(j // 16) + (j % 16) // 2      s1 = s0 + 8      half = j % 2
 

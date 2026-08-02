@@ -97,7 +97,8 @@ void rope_lut_prologue(bfloat16 *restrict qk, const int32_t *restrict pos,
   ::aie::parallel_lookup<int8, ::aie::lut<4, bfloat16>> sin_look(sin_lut, /*step_bits=*/0, /*bias=*/128);
   ::aie::parallel_lookup<int8, ::aie::lut<4, bfloat16>> cos_look(cos_lut, /*step_bits=*/0, /*bias=*/128);
 
-  ::aie::set_rounding(::aie::rounding_mode::conv_even);
+  const auto saved_rounding =
+      ::aie::swap_rounding(::aie::rounding_mode::conv_even);
   constexpr float kTwoPi = 2.0f * kPi;
 
   for (unsigned m = 0; m < ROPE_M; ++m) {
@@ -165,6 +166,7 @@ void rope_lut_prologue(bfloat16 *restrict qk, const int32_t *restrict pos,
     // (partial rotary pass-through).
   }
 
+  ::aie::set_rounding(saved_rounding);
   event1();
 }
 
