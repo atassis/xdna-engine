@@ -10,7 +10,9 @@ from pathlib import Path
 from bricklib import _build_oneshot, iron, GEN
 from verify_f2 import tile_pack, tile_unpack, golden_mod
 
-WD=Path("artifacts/upscaler/wholenet")
+# Anchored at the repo root: run.sh cds into _verify/, so a relative "artifacts/..." never resolved.
+# Regenerate the fixtures with scripts/make_espcn_gate_fixtures.py.
+WD=Path(__file__).resolve().parents[3]/"artifacts/upscaler/wholenet"
 def L(n): return np.load(WD/n)
 T=64; BF=ml_dtypes.bfloat16
 def bf16(x): return x.astype(BF).astype(np.float32)
@@ -57,3 +59,5 @@ rl2=float(np.linalg.norm((sr-ref).ravel())/(np.linalg.norm(ref.ravel())+1e-12))
 mse=np.mean((sr-ref)**2); ps=10*np.log10((ref.max()-ref.min())**2/mse)
 print(f"\nNPU image {sr.shape}: bf16 NPU vs fp32 CPU  rel-L2={rl2:.3e}  PSNR={ps:.1f}dB  "
       f"-> {'PASS' if rl2<=0.06 else 'FAIL'}. NPU SR saved.")
+# Without this the gate printed FAIL and still exited 0, so no drain could ever fail on it.
+assert rl2<=0.06, f"ESPCN image gate failed: rel-L2={rl2:.3e} > 0.06"

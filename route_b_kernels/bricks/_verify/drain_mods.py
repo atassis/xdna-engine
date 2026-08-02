@@ -8,14 +8,37 @@ every xclbin). This is the same driver keyed off an env var instead:
     DRAIN_MODS=verify_cast_quant ./run.sh drain_mods.py
 
 run.sh forwards no argv, so the selection has to arrive through the environment.
+
+Only do_*() modules belong here. A SCRIPT-STYLE module (module-level code, no functions)
+would run its gate as an import side effect and then record nothing, because there is no
+do_*() to find -- so it would silently read as covered. Those are run as subprocesses by
+drain_device.py's SCRIPT_TARGETS phase; this driver rejects them rather than pretending.
 """
+import ast
 import importlib
 import os
 import traceback
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
 
 TARGETS = [m for m in os.environ.get("DRAIN_MODS", "").split(",") if m]
 if not TARGETS:
     raise SystemExit("set DRAIN_MODS=mod1,mod2 (comma-separated verify module names)")
+
+_script_style = []
+for _m in TARGETS:
+    _src = HERE / f"{_m}.py"
+    if not _src.exists():
+        raise SystemExit(f"no such verify module: {_m}")
+    if not any(isinstance(n, ast.FunctionDef) and n.name.startswith("do_")
+               for n in ast.parse(_src.read_text()).body):
+        _script_style.append(_m)
+if _script_style:
+    raise SystemExit(
+        "these are SCRIPT-STYLE modules with no do_*(); importing one runs its gate as a side\n"
+        "effect and records nothing. Run them directly (./run.sh <mod>.py) or via\n"
+        f"drain_device.py's SCRIPT_TARGETS phase:\n  " + "\n  ".join(_script_style))
 
 results = []
 for modname in TARGETS:

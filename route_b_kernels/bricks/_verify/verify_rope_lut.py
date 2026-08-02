@@ -30,13 +30,8 @@ import ml_dtypes
 BRICKS = Path(__file__).parent.parent
 
 # --- brick geometry (small: qk = M*D*2 = 4KB, comfortably inside 64KB L1) ---
-# ROPE_ROT MUST keep kRotHalfPad = ceil(ROT/2/32)*32 a MULTIPLE OF 64: the Peano
-# aie2p backend (peano 31084c4c) CRASHES for ROT=64 (kRotHalfPad=32) with
-# "immediate operand value -184 is not a multiple of 64" while assembling
-# rope_lut_prologue (a 32-elem bf16 store emits a non-64-aligned offset). ROT=128
-# (kRotHalfPad=64) and ROT=96 compile clean -- verified by standalone clang probe.
-# So we verify at full rotary ROT=D=128; a device run at ROT=64 needs a toolchain
-# fix (llvm-aie codegen) first. See DEVICE-GATED RISKS in the handoff.
+# Full rotary. Partial rotary (ROT < D) is gated by probe_rope_partial_rotary.py,
+# which sweeps ROT over the shapes the kernel's %32 static_assert admits.
 D = 128       # ROPE_D   head_dim / feature width per Q/K row
 ROT = 128     # ROPE_ROT rotary width (== D here: full rotary; ROT<D = partial)
 M = 16        # ROPE_M   resident tile rows (tokens) processed this call
@@ -86,12 +81,19 @@ def build_case():
 
 
 # --- pure-buffer verify shim: split the packed const, copy qk_in->qk_out, rotate in place ---
+# ROTATE FIRST, COPY OUT SECOND -- the order matters and is not cosmetic. The old body copied
+# qk_in into qk_out and then rotated qk_out IN PLACE, i.e. a scalar store loop immediately followed
+# by a vector load loop over the SAME buffer. Under the pinned aie_api that is miscompiled: the
+# rotate's first-iteration loads are scheduled ahead of the copy's stores, so row 0 read the
+# buffer's initial zeros (128/256 at ROPE_M=2, bit-exact at ROPE_M=1, clean under the wheel).
+# Rotating the INPUT buffer -- which the host has already filled, so no kernel store precedes the
+# loads -- and copying out afterwards is the same work and is bit-exact under BOTH header sets.
 SHIM_BODY = (
     'extern "C" void rope_lut_verify(bfloat16 *qk_in, int32_t *cbuf, bfloat16 *qk_out) {\n'
-    '  for (unsigned i = 0; i < (unsigned)(ROPE_M * ROPE_D); ++i) qk_out[i] = qk_in[i];\n'
     '  const int32_t *pos = cbuf;                       // [ROPE_M] runtime positions\n'
     '  const float *inv_freq = (const float *)(cbuf + ROPE_M);  // [ROPE_ROT/2] host-folded\n'
-    '  rope_lut_prologue(qk_out, pos, inv_freq);        // rotates qk_out IN PLACE\n'
+    '  rope_lut_prologue(qk_in, pos, inv_freq);         // rotates qk_in IN PLACE\n'
+    '  for (unsigned i = 0; i < (unsigned)(ROPE_M * ROPE_D); ++i) qk_out[i] = qk_in[i];\n'
     '}\n'
 )
 

@@ -27,7 +27,8 @@ void glu_row(const float *restrict input, float *restrict output, int32_t cols) 
   event0();
   // Round-to-nearest-even on the bf16 narrowings (banked: WER-path bf16 casts
   // MUST round-nearest; default truncation biases toward zero and regressed WER).
-  ::aie::set_rounding(::aie::rounding_mode::conv_even);
+  const auto saved_rounding =
+      ::aie::swap_rounding(::aie::rounding_mode::conv_even);
   const float *a = input;        // value half:  in[0..cols]
   const float *g = input + cols; // gate  half:  in[cols..2cols]
   const ::aie::vector<float, N> halff = ::aie::broadcast<float, N>(0.5f);
@@ -48,6 +49,7 @@ void glu_row(const float *restrict input, float *restrict output, int32_t cols) 
     ::aie::vector<float, N> outv = ::aie::mul(av, sigf);
     ::aie::store_v(output + i, outv);
   }
+  ::aie::set_rounding(saved_rounding);
   event1();
 }
 

@@ -32,11 +32,20 @@
 
 # KERNEL_CC is identical in both device branches; only kernels_dir / CFLAGS differ.
 KERNEL_CC=${PEANO_INSTALL_DIR}/bin/clang++
+
+# kernels_dir resolves against the toolchain INSTANCE, not ${srcdir}. srcdir is inside the mlir-aie
+# submodule sandbox, which tracks its own HEAD and drifted 23 commits behind the pin: the shipped
+# resident matmul compiled a pre-#3442 mm.cc and ran floor-rounding bfp16 emulation (zero crrnd in
+# the xclbin) while toolchain.lock said otherwise, for 5 days. Fail loud rather than fall back --
+# a silent wrong-source build is the failure this line exists to prevent.
+ifeq ($(MLIR_AIE_INSTANCE),)
+$(error MLIR_AIE_INSTANCE is unset -- source scripts/iron_env.sh before building)
+endif
 ifeq ($(devicename),npu2)
-kernels_dir=${srcdir}/../../../../aie_kernels/aie2p
+kernels_dir=${MLIR_AIE_INSTANCE}/src/aie_kernels/aie2p
 KERNEL_CFLAGS=${PEANOWRAP2P_FLAGS}
 else
-kernels_dir=${srcdir}/../../../../aie_kernels/aie2
+kernels_dir=${MLIR_AIE_INSTANCE}/src/aie_kernels/aie2
 KERNEL_CFLAGS=${PEANOWRAP2_FLAGS}
 endif
 

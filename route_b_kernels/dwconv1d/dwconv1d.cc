@@ -148,7 +148,10 @@ static inline void dwconv1d_same_scalar(const bfloat16 *restrict in,
 template <int T, int K, int P, bool BIAS>
 static inline void dwconv1d_shift(const bfloat16 *restrict in, const bfloat16 *restrict w, bfloat16 *restrict out) {
   event0();
-  ::aie::set_rounding(::aie::rounding_mode::conv_even);
+  // Hand the mode back. crRnd is one sticky per-core register, and the fused dwconv->silu xclbin
+  // puts this kernel and silu_row on the same core, so a mode left set here reaches the other.
+  const auto saved_rounding =
+      ::aie::swap_rounding(::aie::rounding_mode::conv_even);
   static_assert(K == 9, "dwconv1d_shift is unrolled for k=9");
   static_assert(T % 16 == 0, "T must be a multiple of the 16-lane output chunk");
   constexpr int PADBUF = ((T + 2 * P + 32 + 31) / 32) * 32;
@@ -195,6 +198,7 @@ static inline void dwconv1d_shift(const bfloat16 *restrict in, const bfloat16 *r
     ::aie::store_v(&out[o], a.template to_vector<bfloat16>());
 #endif
   }
+  ::aie::set_rounding(saved_rounding);
   event1();
 }
 
@@ -210,7 +214,8 @@ static inline void dwconv1d_shift(const bfloat16 *restrict in, const bfloat16 *r
 template <int T, int K, int P, bool BIAS>
 static inline void dwconv1d_shift_f32o(const bfloat16 *restrict in, const bfloat16 *restrict w, float *restrict out) {
   event0();
-  ::aie::set_rounding(::aie::rounding_mode::conv_even);
+  const auto saved_rounding =
+      ::aie::swap_rounding(::aie::rounding_mode::conv_even);
   static_assert(K == 9, "dwconv1d_shift_f32o is unrolled for k=9");
   static_assert(T % 16 == 0, "T must be a multiple of the 16-lane output chunk");
   constexpr int PADBUF = ((T + 2 * P + 32 + 31) / 32) * 32;
@@ -234,6 +239,7 @@ static inline void dwconv1d_shift_f32o(const bfloat16 *restrict in, const bfloat
     a = ::aie::mac(a, ::aie::shuffle_down_fill(a0, a1, 8), c8);
     ::aie::store_v(&out[o], a.template to_vector<float>());
   }
+  ::aie::set_rounding(saved_rounding);
   event1();
 }
 
@@ -258,7 +264,8 @@ template <int TT, int DD, int K, bool BIAS>
 static inline void dwconv1d_tmajor_f32o(const bfloat16 *restrict in, const bfloat16 *restrict w,
                                         float *restrict out) {
   event0();
-  ::aie::set_rounding(::aie::rounding_mode::conv_even);
+  const auto saved_rounding =
+      ::aie::swap_rounding(::aie::rounding_mode::conv_even);
   constexpr int VL = 16; // per-lane D vector width (32-byte aligned bf16 loads: DD,TT multiples of 16)
   static_assert(DD % VL == 0, "DD must be a multiple of the D vector width");
   for (int i = 0; i < TT; i++) {
@@ -278,6 +285,7 @@ static inline void dwconv1d_tmajor_f32o(const bfloat16 *restrict in, const bfloa
       ::aie::store_v(&out[i * DD + d], acc.template to_vector<float>());
     }
   }
+  ::aie::set_rounding(saved_rounding);
   event1();
 }
 

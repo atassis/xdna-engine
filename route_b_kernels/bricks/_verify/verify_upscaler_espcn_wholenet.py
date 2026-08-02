@@ -16,8 +16,20 @@ from pathlib import Path
 from bricklib import _build_oneshot, iron, GEN
 from verify_f2 import tile_pack, tile_unpack, golden_mod
 
-WD = Path("artifacts/upscaler/wholenet")
-def L(n): return np.load(WD/n)
+# Fixture resolution. This gate was promoted out of a session scratchpad whose temp dir is long
+# gone, and the promotion rewrote WD to a path that nothing in the tree ever creates -- so the gate
+# has been unrunnable ever since, while still being named like a gate. The SAME real trained ESPCN
+# assets are already committed under artifacts/espcn/ (written by scripts/export_espcn.py), just
+# under the export's own names. Map onto those instead of duplicating them into a second directory.
+# Anchored at the repo root, not cwd: run.sh cds into _verify/, so the original relative
+# "artifacts/..." never resolved from here either -- a second reason this gate never ran.
+ROOT = Path(__file__).resolve().parents[3]
+WD = ROOT / "artifacts/upscaler/wholenet"
+ESPCN = ROOT / "artifacts/espcn"
+_ALIAS = {"input_tile.npy": "gate_lr.npy", "cpu_ref_sr.npy": "gate_sr.npy"}
+def L(n):
+    p = WD / n
+    return np.load(p) if p.exists() else np.load(ESPCN / _ALIAS.get(n, n))
 T = 64
 BF = ml_dtypes.bfloat16
 def bf16(x): return x.astype(BF).astype(np.float32)   # round-trip through bf16
@@ -76,3 +88,5 @@ r=rl2(sr,ref); p=psnr(sr.astype(np.float64),ref.astype(np.float64))
 ok=(r<=0.06)
 print(f"\nWHOLE-NET ESPCN on NPU (bf16) vs CPU: SR {sr.shape} rel-L2={r:.3e} PSNR={p:.1f}dB "
       f"-> {'PASS' if ok else 'FAIL'} (gate rel-L2<=0.06)")
+# Without this the gate printed FAIL and still exited 0, so no drain could ever fail on it.
+assert ok, f"whole-net ESPCN gate failed: rel-L2={r:.3e} > 0.06"

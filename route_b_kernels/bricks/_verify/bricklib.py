@@ -7,6 +7,7 @@ through the kernel on aie2p (optionally with ONE packed resident const buffer, t
 within a core tile's 2-input DMA channels); rel-L2 vs the numpy golden gates it.
 Run-twice self-check guards the CLFLUSH read race.
 """
+import hashlib
 import re
 from pathlib import Path
 
@@ -59,6 +60,59 @@ def _npty(shape, dt):
     return np.ndarray[shape, np.dtype[dt]]
 
 
+def _include_closure_digest(source, compile_flags):
+    """Hash the CONTENT of everything `source` transitively #includes by quoted path.
+
+    ExternalFunction._content_digest hashes the source file's own text plus the include
+    DIRECTORIES' mtimes -- and a directory mtime does not move when a file inside it is edited in
+    place. So editing an #included table (rope_lut_tables.inc, a *_tables.inc, a shared header) is
+    invisible to the JIT cache key and the previous xclbin is served. That cost two sessions once:
+    a fix "did not work" because the build never happened.
+
+    compile_flags IS in the digest, so returning this as a -D makes those edits visible without
+    touching upstream. Quoted includes only -- system/angle-bracket headers come from the toolchain
+    and are already pinned by toolchain.lock.
+    """
+    inc_dirs = [f[2:] for f in compile_flags if f.startswith("-I")]
+    seen, pending, h = set(), [Path(source)], hashlib.sha256()
+    while pending:
+        cur = pending.pop()
+        try:
+            key = cur.resolve()
+        except OSError:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            text = key.read_text()
+        except OSError:
+            continue
+        h.update(str(key).encode())
+        h.update(text.encode())
+        for inc in re.findall(r'^\s*#\s*include\s+"([^"]+)"', text, re.M):
+            cand = [key.parent / inc] + [Path(d) / inc for d in inc_dirs]
+            for c in cand:
+                if c.exists():
+                    pending.append(c)
+                    break
+    return h.hexdigest()[:16]
+
+
+def _design_key(symbol, *parts):
+    """JIT cache key for a built design.
+
+    The design's __name__ IS the cache key, so it must carry everything that changes the PROGRAM --
+    buffer sizes, dtypes, compile flags -- not just the kernel symbol. Keying on the symbol alone
+    silently serves the FIRST build to every later shape: a sweep reusing one symbol gets the first
+    shape's output BO for all of them, so exactly that many elements come back correct and the rest
+    of the host buffer reads as zero. That reads as a kernel returning partial rows, not as a cache
+    hit, so it can absorb a lot of debugging before anyone suspects the key.
+    """
+    blob = "|".join(str(x) for x in parts)
+    return f"design_{symbol}_{hashlib.sha1(blob.encode()).hexdigest()[:10]}"
+
+
 def _build_streamed(symbol, shim, n_tiles, in_tile, out_tile, resident_len, compile_flags,
                     in_dt, out_dt, resident_dt):
     """Stream `n_tiles` fixed-size operand tiles past ONE resident operand.
@@ -76,6 +130,9 @@ def _build_streamed(symbol, shim, n_tiles, in_tile, out_tile, resident_len, comp
     of a matrix; `verify_streamed` is the tiled-operand case. Both are the same design.
     """
     compile_flags = _AIE_API_INC + list(compile_flags or [])
+    # Make edits to #included files visible to the JIT cache key (see _include_closure_digest).
+    compile_flags = compile_flags + [
+        f"-DBRICK_INCLUDE_DIGEST={_include_closure_digest(shim, compile_flags)}"]
     has_resident = resident_len > 0
     _check_symbol_arity(symbol, shim, 3 if has_resident else 2)
 
@@ -119,7 +176,9 @@ def _build_streamed(symbol, shim, n_tiles, in_tile, out_tile, resident_len, comp
             return Program(
                 iron.get_current_device(), rt, workers=[worker]
             ).resolve_program()
-        design.__name__ = design.__qualname__ = f"design_{symbol}"
+        design.__name__ = design.__qualname__ = _design_key(
+            symbol, n_tiles, in_tile, out_tile, resident_len, in_dt, out_dt, resident_dt,
+            compile_flags)
         return iron.jit(design, use_cache=_JIT_CACHE)
 
     def design(inp: In, out: Out):
@@ -152,7 +211,9 @@ def _build_streamed(symbol, shim, n_tiles, in_tile, out_tile, resident_len, comp
         return Program(
             iron.get_current_device(), rt, workers=[worker]
         ).resolve_program()
-    design.__name__ = design.__qualname__ = f"design_{symbol}"
+    design.__name__ = design.__qualname__ = _design_key(
+        symbol, n_tiles, in_tile, out_tile, resident_len, in_dt, out_dt, resident_dt,
+        compile_flags)
     return iron.jit(design, use_cache=_JIT_CACHE)
 
 
@@ -235,6 +296,9 @@ def _build_oneshot(symbol, shim, in_numels, out_numel, in_dts, out_dt, compile_f
     In/Out params are signature markers for iron.jit's tensor-arg count; data flows
     through rt.sequence."""
     compile_flags = _AIE_API_INC + list(compile_flags or [])
+    # Make edits to #included files visible to the JIT cache key (see _include_closure_digest).
+    compile_flags = compile_flags + [
+        f"-DBRICK_INCLUDE_DIGEST={_include_closure_digest(shim, compile_flags)}"]
     nin = len(in_numels)
     _check_symbol_arity(symbol, shim, nin + 1)
 
@@ -288,7 +352,8 @@ def _build_oneshot(symbol, shim, in_numels, out_numel, in_dts, out_dt, compile_f
     else:
         raise ValueError(f"_build_oneshot supports 1-4 inputs, got {nin}")
 
-    design.__name__ = design.__qualname__ = f"design_{symbol}"
+    design.__name__ = design.__qualname__ = _design_key(
+        symbol, in_numels, out_numel, in_dts, out_dt, compile_flags)
     return iron.jit(design, use_cache=_JIT_CACHE)
 
 

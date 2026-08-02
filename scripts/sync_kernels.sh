@@ -152,4 +152,12 @@ cp "$RB/mha_decode/mha_decode.cc"      "$K/mha_decode.cc"
 cp "$RB/mha_decode/mha_decode_iron.py" "$PE/ml/mha_decode/mha_decode_iron.py"
 cp "$RB/mha_decode/Makefile.mha"       "$PE/ml/mha_decode/Makefile.mha"
 
-echo "synced route_b_kernels/ -> mlir-aie build sandbox (edit route_b_kernels/, never mlir-aie/)"
+echo "synced route_b_kernels/ -> $AIEROOT (edit route_b_kernels/, never the sandbox copy)"
+
+# Re-overlay into the toolchain instance as well. route_b_override.mk resolves kernels_dir there, and
+# toolchain_up.sh only syncs on a COLD instance build -- so without this, an edit to a route_b .cc
+# (mm_silu_epilogue.cc et al) never reaches the compiler on a warm instance. Idempotent cp; skipped
+# when this run already targeted the instance, or when iron_env.sh has not been sourced.
+if [ -z "${1:-}" ] && [ -n "${MLIR_AIE_INSTANCE:-}" ] && [ -d "$MLIR_AIE_INSTANCE/src" ]; then
+  exec bash "$0" "$MLIR_AIE_INSTANCE/src"
+fi

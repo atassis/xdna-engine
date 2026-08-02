@@ -8,7 +8,6 @@ import numpy as np
 from ml_dtypes import bfloat16
 
 from aie.iron import Kernel, ObjectFifo, Program, Runtime, TaskGroup, Worker
-from aie.iron.placers import SequentialPlacer
 from aie.helpers.taplib.tap import TensorAccessPattern
 from aie.iron.controlflow import range_
 
@@ -88,4 +87,4 @@ def my_argmax(dev, N, cols, kernel_object="argmax_slice.o", func_prefix="", verb
         ],
     )
 
-    return Program(dev, rt, workers=workers).resolve_program(SequentialPlacer())
+    return Program(dev, rt, workers=workers).resolve_program()
