@@ -23,6 +23,13 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"; cd "$REPO"
 source scripts/iron_env.sh
 bash scripts/sync_kernels.sh >/dev/null   # copy whole_array_iron.py + Makefile.resident into the sandbox
 
+# kernels_dir (route_b_override.mk) resolves into the mlir-aie SUBMODULE, not the pinned toolchain
+# instance -- a correctly-bumped toolchain.lock can still compile stale kernel source with no error
+# (see scripts/verify_kernel_source.sh's header). FAIL LOUD before spending a build. This script
+# builds through Makefile.resident, so that is the family member to gate on; the other three build
+# scripts already gate their own.
+scripts/verify_kernel_source.sh Makefile.resident
+
 K="${1:-768}"
 N="${2:-768}"
 M=64          # smallest legal M for the whole_array 8-col native-bf16 design (see header)
