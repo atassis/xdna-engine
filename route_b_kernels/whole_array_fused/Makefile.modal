@@ -55,6 +55,20 @@ silu_f32_tanh?=0
 # xclbin is byte-identical to the row-major build, only the instruction stream differs.
 c_panel_width?=0
 
+# Drive the core's K-tile loop bound from rtp[1] instead of baking K//k (0 = off). Makes the array
+# program independent of K -- VERIFIED: the region above aie.runtime_sequence is bit-identical at
+# K=1024 and K=4096 with this on, and differs in all 32 core bodies with it off. That is what lets a
+# wide-K GEMM be an instruction stream on an existing resident instead of a whole extra design, which
+# is what made the K=4096 fc2 lose in July. Tagged into the artifact name because the xclbin IS
+# different from the baked one -- and every stream dispatched on it must carry the rtp[1] write.
+k_loop_rtp?=0
+
+# Read A from a [K/W, M, W] panel-major buffer instead of row-major [M, K] (0 = off). Mirror of
+# c_panel_width, for a GEMM whose producer already drained panel-major -- fc1 does, by default, so a
+# wide-K fc2 needs no repack. Insts-only. Needs N/n/n_aie_cols == 1: the panel index spends the A
+# TAP's outer repeat dimension, and the shim BD has only four.
+a_panel_width?=0
+
 # Two kernel objects: the matmul (mm.cc) and the fused epilogue.
 kernels=mm_${m}x${k}x${n} mm_silu_epilogue_${m}x${k}x${n}
 
@@ -68,6 +82,12 @@ endif
 ifneq (${c_panel_width}, 0)
 aieargs+=--c-panel-width ${c_panel_width}
 endif
+ifeq (${k_loop_rtp}, 1)
+aieargs+=--k-loop-rtp
+endif
+ifneq (${a_panel_width}, 0)
+aieargs+=--a-panel-width ${a_panel_width}
+endif
 
 # Distinct suffix so silu/bias/gelu artifacts never collide with the plain matmul's.
 mode_tag=$(if $(filter 1,${gelu}),modalgelu,$(if $(filter 1,${no_silu}),modalid,modalsilu))
@@ -79,7 +99,9 @@ nat_tag=$(if $(filter 1,${emulate_bfloat16_mmul_with_bfp16}),,nat)
 re_tag=$(if $(filter 1,${round_even}),re,)$(if $(filter 1,${silu_f32_tail}),ft,)$(if $(filter 1,${silu_f32_tanh}),fh,)
 panel_tag=$(if $(filter 0,${c_panel_width}),,panel${c_panel_width})
 out_tag=$(if $(filter bf16,${dtype_out}),bf16out,)
-target_suffix=${M}x${K}x${N}_${m}x${k}x${n}_${n_aie_cols}c_${mode_tag}${out_tag}${panel_tag}${dep_tag}${re_tag}${nat_tag}
+krtp_tag=$(if $(filter 1,${k_loop_rtp}),krtp,)
+apanel_tag=$(if $(filter 0,${a_panel_width}),,apanel${a_panel_width})
+target_suffix=${M}x${K}x${N}_${m}x${k}x${n}_${n_aie_cols}c_${mode_tag}${out_tag}${panel_tag}${dep_tag}${re_tag}${nat_tag}${krtp_tag}${apanel_tag}
 
 use_iron=1
 aie_py_src=whole_array_modal_iron.py

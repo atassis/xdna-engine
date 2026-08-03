@@ -171,6 +171,72 @@ def panel_major_c_taps(C_tiles, M, N, m, n, n_aie_rows, n_aie_cols, panel_w):
     return out
 
 
+def panel_major_a_taps(A_tiles, M, K, N, m_rows, k, n_aie_cols, n, panel_w):
+    """Re-stride the A fill TAPs so the shim READS A panel-major, not row-major.
+
+    The mirror of panel_major_c_taps, for the other end of the same seam: fc1 already
+    DRAINS panel-major as [K//panel_w, M, panel_w], so a wide-K consumer can read that
+    buffer directly instead of having it repacked. Same rank, same sizes product, same
+    walk order, new strides -- instruction-stream only, array program untouched.
+
+        A[i, j] == a_panel[j//panel_w, i, j%panel_w]
+
+    The row-major fill TAP is the 4-D pattern [rep, kt, r, j] with strides
+    [0, k, K, 1]: an outer REPEAT (stride 0, it re-reads the same A once per N-group),
+    the k-tile index, the rows of one tile, and the contiguous run inside a k-tile.
+    Panel-major needs the k-tile index split into (panel, k-tile-within-panel), which
+    costs one dimension against the shim's limit of four. The only way it fits is by
+    spending the repeat dimension -- so this is valid EXACTLY when that dimension is
+    degenerate, i.e. when N//n//n_aie_cols == 1. That is a hard requirement, not a
+    preference (it is why the fc2 seam works at N=1024 and would not at N=2048), so
+    assert it rather than let it hold by luck. Same spirit as the panel_w == n_aie_cols*n
+    assert on the C side.
+    """
+    repeat = N // n // n_aie_cols
+    if repeat != 1:
+        raise AssertionError(
+            f"a_panel_width needs the A TAP's outer repeat dimension to be degenerate, "
+            f"but N//n//n_aie_cols = {repeat}: with a real repeat the panel-major pattern "
+            "needs 5 dims and will not fit a shim BD"
+        )
+    if K % panel_w:
+        raise AssertionError(f"K={K} must be a whole number of {panel_w}-wide panels")
+    if panel_w % k:
+        raise AssertionError(
+            f"panel_w={panel_w} must be a whole number of k={k} tiles, else a k-tile "
+            "straddles a panel boundary and the split gains a dimension"
+        )
+    n_panels = K // panel_w
+    want_strides = [0, k, K, 1]
+    want_sizes = [repeat, K // k, m_rows, k]
+    # panel replaces the repeat; kt now counts only within a panel; rows step by panel_w.
+    new_sizes = [n_panels, panel_w // k, m_rows, k]
+    new_strides = [M * panel_w, k, panel_w, 1]
+
+    out = []
+    for t in A_tiles:
+        if list(t.sizes) != want_sizes or list(t.strides) != want_strides:
+            raise AssertionError(
+                "A fill TAP is not the expected row-major [rep, kt, r, j] pattern "
+                f"(sizes {list(t.sizes)} strides {list(t.strides)}, expected "
+                f"{want_sizes} / {want_strides}); the panel-major re-stride assumes it"
+            )
+        # A tap covers a whole row-block across every k-tile, so it starts at column 0
+        # and its offset is purely the row start. Re-base that into a panel's [M, panel_w].
+        row_start, col_start = divmod(t.offset, K)
+        if col_start:
+            raise AssertionError(
+                f"A TAP offset {t.offset} is not a row boundary (col {col_start}); "
+                "the panel-major re-base assumes each tap starts at column 0"
+            )
+        out.append(
+            TensorAccessPattern(
+                (n_panels * M, panel_w), row_start * panel_w, new_sizes, new_strides
+            )
+        )
+    return out
+
+
 def my_matmul(
     dev,
     M,
@@ -189,6 +255,7 @@ def my_matmul(
     c_panel_width=0,
     dtype_out_str="f32",
     k_loop_rtp=False,
+    a_panel_width=0,
 ):
     n_aie_rows = 4
     n_aie_cores = n_aie_rows * n_aie_cols
@@ -487,6 +554,13 @@ def my_matmul(
         pattern_repeat=N // n // n_aie_cols,
         prune_step=False,
     )
+    if a_panel_width:
+        # Read A straight out of the producer's [K//W, M, W] panel-major buffer (fc1's
+        # default bf16 drain), so a wide-K GEMM needs no repack. Insts-only, same as the
+        # C-side panel drain.
+        A_tiles = panel_major_a_taps(
+            A_tiles, M, K, N, m * n_A_tiles_per_shim, k, n_aie_cols, n, a_panel_width
+        )
     if b_col_maj:
         B_tiles = TensorTiler2D.step_tiler(
             (N, K),
@@ -653,6 +727,15 @@ def main():
         "xclbin is byte-identical to the row-major build.",
     )
     argparser.add_argument(
+        "--a-panel-width",
+        type=int,
+        default=0,
+        help="read A from a [K//W, M, W] panel-major buffer instead of row-major [M, K] "
+        "(0 = off). The mirror of --c-panel-width, for consuming a producer that already "
+        "drained panel-major. Insts-only. Requires N//n//n_aie_cols == 1, since the panel "
+        "index spends the A TAP's outer repeat dimension.",
+    )
+    argparser.add_argument(
         "--k-loop-rtp",
         action="store_true",
         help="k-loop-bound-as-rtp PoC: drive the core's K-tile loop bound from rtp[1] "
@@ -679,6 +762,7 @@ def main():
         args.c_panel_width,
         args.dtype_out,
         args.k_loop_rtp,
+        args.a_panel_width,
     )
     if args.generate_taps:
         return maybe_module
