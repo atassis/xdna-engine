@@ -92,6 +92,18 @@ pub mod sim_bf16 {
     }
 }
 
+/// Distinct hw_contexts created so far. The driver's limit is **16** concurrent
+/// (`npu4_family.h` `.hwctx_limit`, divided by the partition count); the 17th `CREATE_HWCTX` fails
+/// with EINVAL. NPU4 is `temporal_only`, so co-resident contexts time-slice and every program
+/// boundary is still a full array reprogram -- co-residency is capacity, never cheapness.
+pub static CONTEXTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// `hw_contexts N/16` -- how much of the driver's budget this configuration has spent.
+pub fn context_report() -> String {
+    let n = CONTEXTS.load(std::sync::atomic::Ordering::Relaxed);
+    format!("hw_contexts: {n}/16 used{}", if n >= 16 { "  <- AT THE LIMIT" } else { "" })
+}
+
 /// Per-dispatch xclbin-TRANSITION accounting, gated by `NPU_DISPATCH_LOG=1`.
 ///
 /// Every dispatch funnels through a [`Kernel`] method, so counting here covers every call site with
@@ -615,6 +627,11 @@ impl Device {
         if let Some(k) = self.kernels.borrow().get(&key) {
             return Ok(k.clone());
         }
+        // Each distinct key is one hw_context, and the driver allows only 16 concurrent
+        // (npu4_family.h `.hwctx_limit`, divided by partition count). Exceeding it fails
+        // CREATE_HWCTX with EINVAL, which is how attention-on-NPU was blocked: the encoder loaded
+        // ~16 bricks it never dispatched. Counted so a config can state its own budget use.
+        CONTEXTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let cpath = CString::new(xclbin_path).map_err(|e| e.to_string())?;
         let cname = match name {
             Some(s) => Some(CString::new(s).map_err(|e| e.to_string())?),

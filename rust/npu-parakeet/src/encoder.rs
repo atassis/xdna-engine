@@ -166,7 +166,7 @@ impl FastConformerEncoder {
                         // bit-identical to the host K-split. Falls through to resident_ffn if acc_add absent.
                         let id1 = format!("{blk}.{tag}.l1");
                         let id2 = format!("{blk}.{tag}.l2");
-                        if std::env::var("PARAKEET_FFN_DEVACC").map(|v| v != "0").unwrap_or(false) {
+                        if Self::resident_on("PARAKEET_FFN_DEVACC") {
                             if let Some(out) = npu.resident_ffn_devacc_readback(x, gamma.as_slice().unwrap(), beta.as_slice().unwrap(),
                                 || b.m(l1), &id1,
                                 || b.m(l2), &id2) {
@@ -239,6 +239,31 @@ impl FastConformerEncoder {
 
     /// NPU timing breakdown (feature `npu`, NPU path only).
     #[cfg(feature = "npu")]
+    /// `PARAKEET_HYBRID=1` restores the pre-2026-08-03 CPU+NPU MIXED path wholesale: attention
+    /// interior, conv middle, residual adds and the fc2 accumulate all go back to the host.
+    ///
+    /// Full residency is the DEFAULT as of 2026-08-03 (owner-authorised). The polarity used to be the
+    /// other way round -- every on-NPU path was opt-in -- which meant the baseline we optimised against
+    /// was the hybrid, exactly what the build methodology says not to do ("single-hardware FIRST, then
+    /// optimize ... even if the all-NPU version is unoptimized / transiently SLOWER"). Now the
+    /// single-hardware graph is what we defend and levers are measured against it; this flag is how you
+    /// get the old mixed graph back for a comparison.
+    ///
+    /// Measured at the flip, 17 clips vs host-f32 truth: full residency matches TRUTH's WER exactly
+    /// (8.425%, 23 edits) and beats the hybrid default (8.791%, 24), at ~2x the wall (1.89 vs 0.98
+    /// s/clip). The wall cost is accepted deliberately -- it is the thing to optimise next, on ONE
+    /// substrate. It also uses 16 of the driver's 16 hw_contexts, so nothing further fits until brick
+    /// loading gets leaner.
+    pub fn hybrid() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("PARAKEET_HYBRID").map(|v| v != "0").unwrap_or(false))
+    }
+
+    /// A residency flag: ON unless explicitly `=0`, and forced OFF by [`Self::hybrid`].
+    fn resident_on(name: &str) -> bool {
+        !Self::hybrid() && std::env::var(name).map(|v| v != "0").unwrap_or(true)
+    }
+
     pub fn npu_stats_string(&self) -> Option<String> {
         self.npu.as_ref().map(|n| {
             let s = n.stats.borrow();
@@ -255,7 +280,7 @@ impl FastConformerEncoder {
                 s.ffn_ln_s, s.ffn_fc1_s, s.ffn_deint_s, s.ffn_fc2_s, s.ffn_weight_prep_s, s.ffn_readback_s,
                 s.rb_sync_s, s.rb_read_s, s.rb_decode_s, s.rb_decode_elems,
                 s.rb_decode_s * 1e9 / s.rb_decode_elems.max(1) as f64
-            ) + "\n" + &npu_xrt::sim_bf16::report() + "\n" + &crate::npu::modal_site_report()
+            ) + "\n" + &npu_xrt::context_report() + "\n" + &npu_xrt::sim_bf16::report() + "\n" + &crate::npu::modal_site_report()
         })
     }
 
@@ -316,7 +341,7 @@ impl FastConformerEncoder {
         // bf16 A -- the host LN is off the MHSA frontier. Falls back to host layernorm + mm_lazy when
         // the seam is off or the resident xclbins are absent (WER-identical to the old block()-level LN).
         #[cfg(feature = "npu")]
-        let resident_mha = std::env::var("PARAKEET_RESIDENT_MHA").is_ok();
+        let resident_mha = Self::resident_on("PARAKEET_RESIDENT_MHA");
         #[cfg(not(feature = "npu"))]
         let resident_mha = false;
         // DIAGNOSTIC (PARAKEET_MHA_HOSTQKV=1): keep the resident attention block but feed it
@@ -463,7 +488,7 @@ impl FastConformerEncoder {
         // Gate on t <= relpos_max_t() PER-CLIP: a T>BUILT_T clip skips the resident per-head loop and
         // falls through to the host attention path below (whole-block golden), so no crash/corruption.
         #[cfg(feature = "npu")]
-        if std::env::var("PARAKEET_RESIDENT_MHA").is_ok()
+        if Self::resident_on("PARAKEET_RESIDENT_MHA")
             && self.npu.as_ref().map(|n| t <= n.relpos_max_t()).unwrap_or(false) {
             if let Some(npu) = &self.npu {
                 let _h = PhaseScope::new("mhsa_resident", Bucket::Npu);
@@ -703,9 +728,9 @@ impl FastConformerEncoder {
         // capability lands here in full; flipping the default is a two-line change once a rel-L2
         // -vs-shipped number or a larger eval backs it.
         #[cfg(feature = "npu")]
-        let resident_conv = std::env::var("PARAKEET_RESIDENT_CONV").map(|v| v != "0").unwrap_or(false);
+        let resident_conv = Self::resident_on("PARAKEET_RESIDENT_CONV");
         #[cfg(feature = "npu")]
-        let resident_silu = std::env::var("PARAKEET_RESIDENT_SILU").map(|v| v != "0").unwrap_or(false);
+        let resident_silu = Self::resident_on("PARAKEET_RESIDENT_SILU");
         // conv_wprep: materialize + reshape the (T'-independent) conv weights for mm(). The pointwise
         // conv1/conv2 weights (pw1/pw2) feed a cached NPU weight BO, so they are now materialized
         // LAZILY inside mm_lazy's closure (whole `b.m3(..).index_axis(..).to_owned().t().to_owned()`
@@ -864,7 +889,7 @@ impl FastConformerEncoder {
         // frontier). For THIS seam, after MHSA read back to host and rejoin the default conv/FFN2 path.
         // Falls through to the default path when the fused bricks (acc_add/resadd/resident-ln) are absent.
         #[cfg(feature = "npu")]
-        if std::env::var("PARAKEET_FUSED_BLOCK").is_ok() {
+        if Self::resident_on("PARAKEET_FUSED_BLOCK") {
             if let Some(npu) = &self.npu {
                 if npu.resident_fused_available() {
                     let _h = PhaseScope::new("fused_ff1_mhsa", Bucket::Npu);

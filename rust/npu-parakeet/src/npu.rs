@@ -1381,10 +1381,23 @@ impl NpuMatmul {
             }
         };
         // conv-module depthwise conv1d (step 3), OPTIONAL. 3-buffer ABI in[C,T]/w[C,16]/out[C,T] bf16.
+        // The dwconv/SiLU bricks are FOUR builds of ONE op, and the conv path has a strict
+        // preference order (time-major fused > channel-major fused > separate dwconv+silu). Loading
+        // all four spends four of the driver's 16 hw_context slots to dispatch at most two of them,
+        // which is what left no slot for attention-on-NPU (EINVAL at CREATE_HWCTX). Decide the
+        // variant ONCE here and load only that one.
+        let have = |stem: &str| {
+            kernel_registry::xclbin_path(&self.ln_dir, stem).exists()
+                && kernel_registry::insts_path(&self.ln_dir, stem).exists()
+        };
+        let want_dws_t = have(&format!("dwconv_silu_t_{DW_C}x{DW_T}"));
+        let want_dws = !want_dws_t && have(&format!("dwconv_silu_{DW_C}x{DW_T}"));
+        // separate dwconv + silu only when neither fused variant exists
+        let want_split = !want_dws_t && !want_dws;
+
         let dwconv = {
             let stem = format!("dwconv_{DW_C}x{DW_T}");
-            let present = kernel_registry::xclbin_path(&self.ln_dir, &stem).exists()
-                && kernel_registry::insts_path(&self.ln_dir, &stem).exists();
+            let present = want_split && have(&stem);
             if present {
                 let (kern, instr, n) = load_path(&self.ln_dir, &stem);
                 let gw = |i| kern.group_id(i).unwrap();
@@ -1404,8 +1417,7 @@ impl NpuMatmul {
         // conv-module post-dwconv SiLU (step 4), OPTIONAL. 2-buffer ABI in[C,T]/out[C,T] f32.
         let silu = {
             let stem = format!("silu_{DW_C}x{DW_T}");
-            let present = kernel_registry::xclbin_path(&self.ln_dir, &stem).exists()
-                && kernel_registry::insts_path(&self.ln_dir, &stem).exists();
+            let present = want_split && have(&stem);
             if present {
                 let (kern, instr, n) = load_path(&self.ln_dir, &stem);
                 let gs = |i| kern.group_id(i).unwrap();
@@ -1426,8 +1438,7 @@ impl NpuMatmul {
         // out[C,T] f32 (== ConvDw ABI, f32 out). Present -> replaces the separate dwconv+silu dispatches.
         let dwconv_silu = {
             let stem = format!("dwconv_silu_{DW_C}x{DW_T}");
-            let present = kernel_registry::xclbin_path(&self.ln_dir, &stem).exists()
-                && kernel_registry::insts_path(&self.ln_dir, &stem).exists();
+            let present = want_dws && have(&stem);
             if present {
                 let (kern, instr, n) = load_path(&self.ln_dir, &stem);
                 let gw = |i| kern.group_id(i).unwrap();
@@ -1449,8 +1460,7 @@ impl NpuMatmul {
         // it (dissolves both host transposes); absent -> channel-major dwconv_silu / separate bricks.
         let dwconv_silu_t = {
             let stem = format!("dwconv_silu_t_{DW_C}x{DW_T}");
-            let present = kernel_registry::xclbin_path(&self.ln_dir, &stem).exists()
-                && kernel_registry::insts_path(&self.ln_dir, &stem).exists();
+            let present = want_dws_t && have(&stem);
             if present {
                 let (kern, instr, n) = load_path(&self.ln_dir, &stem);
                 let gw = |i| kern.group_id(i).unwrap();
