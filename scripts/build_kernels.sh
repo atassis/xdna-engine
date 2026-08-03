@@ -119,9 +119,13 @@ for N in 3072 1536 768; do
   # FAST (64x32x96 BFP16_IREE) modal -- the shipped default precision
   WA_C_DEPTH=1 make -C $MMW -f Makefile.modal NPU2=1 M=512 K=800 N=$N m=64 k=32 n=96 n_aie_cols=8 emulate_bfloat16_mmul_with_bfp16=1 bfp16_iree=1           build/final_512x800x${N}_64x32x96_8c_modalsilu.xclbin
   WA_C_DEPTH=1 make -C $MMW -f Makefile.modal NPU2=1 M=512 K=800 N=$N m=64 k=32 n=96 n_aie_cols=8 emulate_bfloat16_mmul_with_bfp16=1 bfp16_iree=1 no_silu=1 build/final_512x800x${N}_64x32x96_8c_modalid.xclbin
-  # NATIVE (32x32x32) modal -- for NPU_PRECISION=native
-  make -C $MMW -f Makefile.modal NPU2=1 M=512 K=800 N=$N m=32 k=32 n=32 n_aie_cols=8           build/final_512x800x${N}_32x32x32_8c_modalsilu.xclbin
-  make -C $MMW -f Makefile.modal NPU2=1 M=512 K=800 N=$N m=32 k=32 n=32 n_aie_cols=8 no_silu=1 build/final_512x800x${N}_32x32x32_8c_modalid.xclbin
+  # NATIVE (32x32x32) modal -- for NPU_PRECISION=native. The `nat` suffix is Makefile.modal's own
+  # nat_tag: a build without emulate_bfloat16_mmul_with_bfp16=1 is tagged so a fast-flagged build can
+  # never be mistaken for the native kernel. These four target names omitted it and so named targets
+  # that have no rule -- `make` died here, and because the script runs under `set -euo pipefail` that
+  # silently truncated every step after it. ctx2.rs appends the same tag (Precision::nat_tag).
+  make -C $MMW -f Makefile.modal NPU2=1 M=512 K=800 N=$N m=32 k=32 n=32 n_aie_cols=8           build/final_512x800x${N}_32x32x32_8c_modalsilunat.xclbin
+  make -C $MMW -f Makefile.modal NPU2=1 M=512 K=800 N=$N m=32 k=32 n=32 n_aie_cols=8 no_silu=1 build/final_512x800x${N}_32x32x32_8c_modalidnat.xclbin
 done
 # GELU mode (3-branch superset: rtp[0]=2) — only the FFN fc1 width (N=3072). Opt-in via NPU_ENC_GELU_FUSED
 # (folds the Whisper encoder FFN GELU into the fc1 epilogue, ~5-12% encoder / -5% e2e; WER 0.1245 marginal).
