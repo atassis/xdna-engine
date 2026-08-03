@@ -488,12 +488,13 @@ def my_matmul(
         in_a, in_b, out_c, acc, rtp_buff, barrier, zero, matmul, epilogue
     ):
         barrier.wait_for_value(1)
-        # k-loop-bound-as-rtp PoC: same rtp[1]-driven bound as core_fn above.
-        k_trip = rtp_buff[1] if k_loop_rtp else K // k
         loop = range(1)  # Workaround for issue #1547
         if n_tiles_per_core > 1:
             loop = range_(n_tiles_per_core)
         for _ in loop:
+            # Inside the tile loop, for the same reason as core_fn above: a body iteration can
+            # span several dispatches, so a hoisted rtp read pairs with the wrong one.
+            k_trip = rtp_buff[1] if k_loop_rtp else K // k
             elem_out = out_c.acquire(1)
             zero(acc)
 
