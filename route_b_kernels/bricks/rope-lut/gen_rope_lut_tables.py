@@ -54,7 +54,7 @@ def emit(name: str, physical: np.ndarray) -> str:
 def main():
     sin_tab, cos_tab = sincos_lut_tables()
     sin_phys, cos_phys = place(sin_tab), place(cos_tab)
-    OUT.write_text(
+    text = (
         "// Auto-generated sin/cos gather-LUT tables (int8 key, bias=128, 256 logical entries).\n"
         "// L[idx] = sin/cos((idx-128)*pi/128).\n"
         "//\n"
@@ -76,8 +76,25 @@ def main():
             s0 = 16 * (j // 16) + (j % 16) // 2
             for s in (s0, s0 + 8):
                 assert q[2 * s + (j % 2)] == v, f"{name}[{j}] lost at slot {s}"
+    # --check: prove the committed .inc is still what this generator produces, without
+    # touching it. The kernel compiles the COMMITTED file, so a generator that has drifted
+    # from it is a silent divergence between what we can regenerate and what we ship.
+    if "--check" in sys.argv:
+        if not OUT.exists():
+            print(f"FAIL {OUT} missing -- nothing to check against")
+            return 1
+        current = OUT.read_text(encoding="utf-8")
+        if current == text:
+            print(f"PASS {OUT.name} is byte-identical to freshly generated output")
+            return 0
+        print(f"FAIL {OUT.name} differs from freshly generated output -- regenerate or "
+              f"explain the drift (committed {len(current)} B, generated {len(text)} B)")
+        return 1
+
+    OUT.write_text(text, encoding="utf-8")
     print(f"wrote {OUT} (256 logical entries, 4 slots each, round-trip verified)")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
