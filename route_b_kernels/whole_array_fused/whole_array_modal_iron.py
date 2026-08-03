@@ -266,6 +266,7 @@ def my_matmul(
     trace_size,
     generate_taps=False,
     do_gelu=False,
+    do_glu=False,
     c_panel_width=0,
     dtype_out_str="f32",
     k_loop_rtp=False,
@@ -613,7 +614,12 @@ def my_matmul(
         # bake the epilogue mode into this instruction stream's RTP (1=silu, 0=identity), then
         # release the barrier so the cores read it. A silu-built stream and an identity-built stream
         # are two .txt insts on the SAME xclbin -> the host picks mode by choosing the stream.
-        mode_val = 2 if do_gelu else (1 if do_silu else 0)  # rtp[0]: 0=identity, 1=silu, 2=gelu
+        # rtp[0]: 0=identity, 1=silu, 2=gelu, 3=glu. GLU halves the LIVE output width (it writes
+        # into the value half of each tile and leaves the accumulator in the gate half), but the
+        # drain stays FULL width -- a narrower tap would change the TAP SIZES, and the insts-only
+        # property holds only for a re-stride at constant sizes. The consumer reads the strided
+        # subset instead. So no tap change here, deliberately.
+        mode_val = 3 if do_glu else (2 if do_gelu else (1 if do_silu else 0))
         for r in range(n_aie_rows):
             for c in range(n_aie_cols):
                 rtp_bufs[r][c][0] = mode_val
@@ -742,6 +748,14 @@ def main():
         "xclbin is byte-identical to the row-major build.",
     )
     argparser.add_argument(
+        "--glu",
+        action="store_true",
+        help="glu mode: out = a * sigmoid(g) over the tile's [value|gate] halves (rtp[0]=3). Folds the "
+        "conv-module GLU into pw1's epilogue. REQUIRES W1's columns permuted at weight load so each "
+        "tile holds 64 value columns and their 64 gate partners; without that the pairing is wrong and "
+        "silently so. Overrides --gelu/--no-silu. Drain stays full width by design.",
+    )
+    argparser.add_argument(
         "--a-panel-width",
         type=int,
         default=0,
@@ -774,6 +788,7 @@ def main():
         args.trace_size,
         args.generate_taps,
         args.gelu,
+        args.glu,
         args.c_panel_width,
         args.dtype_out,
         args.k_loop_rtp,

@@ -37,6 +37,9 @@ pub enum Act {
     Identity,
     Silu,
     Gelu,
+    /// conv-module pw1 with GLU folded in: out = a * sigmoid(g) over the tile's [value|gate]
+    /// halves. Only valid against a W1 whose columns were permuted at weight load.
+    Glu,
 }
 
 impl Act {
@@ -46,6 +49,7 @@ impl Act {
             Act::Identity => "modalid",
             Act::Silu => "modalsilu",
             Act::Gelu => "modalgelu",
+            Act::Glu => "modalglu",
         }
     }
 }

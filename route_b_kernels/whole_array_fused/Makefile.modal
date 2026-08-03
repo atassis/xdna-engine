@@ -36,9 +36,17 @@ b_col_maj?=0
 dtype_in?=bf16
 dtype_out?=f32
 
-# silu mode (default) vs bias-only (no activation) vs gelu mode
+# silu mode (default) vs bias-only (no activation) vs gelu mode vs glu mode
 no_silu?=0
 gelu?=0
+# glu: out = a*sigmoid(g) over the tile's [value|gate] halves (conv-module pw1). Needs W1's columns
+# permuted at weight load; without that the pairing is wrong and silent. Drain stays full width.
+glu?=0
+
+# mmul sub-tile dims, consumed ONLY by the GLU epilogue (every other mode is per-element and so
+# layout-blind). Must match what mm.cc was built with: 8,8 for the bfp16 path, 4,8 native.
+epi_r?=$(if $(filter 1,${emulate_bfloat16_mmul_with_bfp16}),8,4)
+epi_t?=8
 
 # Round-to-nearest-even for the f32-out modal epilogue (and, because rounding is a core control
 # register, for the following tile's bfp16 matmul conversions). Default 0 = hardware default.
@@ -79,6 +87,9 @@ endif
 ifeq (${gelu}, 1)
 aieargs+=--gelu
 endif
+ifeq (${glu}, 1)
+aieargs+=--glu
+endif
 ifneq (${c_panel_width}, 0)
 aieargs+=--c-panel-width ${c_panel_width}
 endif
@@ -90,7 +101,7 @@ aieargs+=--a-panel-width ${a_panel_width}
 endif
 
 # Distinct suffix so silu/bias/gelu artifacts never collide with the plain matmul's.
-mode_tag=$(if $(filter 1,${gelu}),modalgelu,$(if $(filter 1,${no_silu}),modalid,modalsilu))
+mode_tag=$(if $(filter 1,${glu}),modalglu,$(if $(filter 1,${gelu}),modalgelu,$(if $(filter 1,${no_silu}),modalid,modalsilu)))
 # ...and a panel-major drain is a DIFFERENT instruction stream on the SAME xclbin, so it
 # needs its own artifact name or it would overwrite the row-major stream. A bf16-out build
 # is a different xclbin outright (the C buffers resize), so it is tagged too.
@@ -111,7 +122,7 @@ buffer_aloc_flag=basic-sequential
 
 # matmul object needs the bf16_f32 combo defines (mm.cc names symbols by combo).
 MM_DEFINES=-Dbf16_f32_ONLY -DDIM_M=${m} -DDIM_K=${k} -DDIM_N=${n} -DVECTORIZED_ONLY
-EPI_DEFINES=-DEPI_M=${m} -DEPI_N=${n}$(if $(filter 1,${round_even}), -DMODAL_ROUND_EVEN,)$(if $(filter 1,${silu_f32_tail}), -DSILU_F32_TAIL,)$(if $(filter 1,${silu_f32_tanh}), -DSILU_F32_TANH,)
+EPI_DEFINES=-DEPI_M=${m} -DEPI_N=${n} -DEPI_R=${epi_r} -DEPI_T=${epi_t}$(if $(filter 1,${round_even}), -DMODAL_ROUND_EVEN,)$(if $(filter 1,${silu_f32_tail}), -DSILU_F32_TAIL,)$(if $(filter 1,${silu_f32_tanh}), -DSILU_F32_TANH,)
 ifeq (${b_col_maj}, 1)
 	MM_DEFINES+=-DB_COL_MAJ
 endif
