@@ -246,6 +246,70 @@ static inline void mm_gelu_epilogue_f32o(const float *__restrict pC_in,
   event1();
 }
 
+// --- GLU epilogue (conv-module pw1) ---------------------------------------------
+// out[t, c] = a[t, c] * sigmoid(g[t, c]), where pw1 produces [a | g] over 2*D columns.
+//
+// WHY THIS IS NOT LAYOUT-AWARE, even though GLU pairs two elements while every other
+// epilogue here is per-element. mm.cc stores C as a grid of r x t sub-tiles, row-major,
+// row-major within (`is_c_row_maj`, the default -- C_COL_MAJ is defined nowhere in this
+// tree). Pair that with a W1 COLUMN PERMUTATION applied once at weight load, putting the
+// 64 value columns in tile positions 0..63 and their gate partners in 64..127, and the
+// partner of every element lands at a CONSTANT offset: half a row-block. Verified
+// exhaustively for the shipped config -- 4096 of 4096 (row, position) pairs at +512, with
+// the value half contiguous. So this walks flat runs like the others; the permutation, not
+// the kernel, is what absorbs the blocked order.
+//
+// The result is written INTO the value half, which the C drain tap then takes 64-of-128 of
+// (instruction-stream-only, so the array program and the xclbin are unchanged). In-place is
+// safe: within a row-block we only ever write below the halfway point and only ever read the
+// gate above it.
+//
+// Sigmoid is the hiprec ladder the silu epilogue already ships and that is already WER-gated
+// (tanh ARGUMENT in f32, tanh output bf16, final multiply in f32). Folding GLU here also
+// deletes the separate bf16 round-trip the standalone glu.cc had to do, because this holds
+// the f32 accumulator and never narrows to hand GLU its input.
+template <int rows, int cols, int r, int t>
+static inline void mm_glu_epilogue_f32o(const float *__restrict pC_in,
+                                        float *__restrict pC_out) {
+  event0();
+  static_assert(r == t, "the +half-row-block pairing assumes square mmul sub-tiles");
+  static_assert(cols % (2 * t) == 0, "value/gate split must fall on a sub-tile boundary");
+  static_assert(rows % r == 0, "tile rows must be a whole number of sub-tile rows");
+  // One row-block = r rows x cols columns, laid out contiguously by the blocked store.
+  constexpr int kRowBlock = r * cols;
+  constexpr int kHalf = kRowBlock / 2;  // value half; gate partner sits exactly kHalf on
+  static_assert(kHalf % 16 == 0, "epilogue walks 16-wide chunks");
+
+  const aie::vector<float, 16> halff = aie::broadcast<float, 16>(0.5f);
+  const aie::vector<bfloat16, 16> one = aie::broadcast<bfloat16, 16>(1.0f);
+  const aie::vector<bfloat16, 16> halfb = aie::broadcast<bfloat16, 16>(0.5f);
+
+  for (int blk = 0; blk < rows / r; blk++) {
+    const float *__restrict a_ptr = pC_in + blk * kRowBlock;
+    const float *__restrict g_ptr = a_ptr + kHalf;
+    float *__restrict out_ptr = pC_out + blk * kRowBlock;
+    AIE_PREPARE_FOR_PIPELINING
+    AIE_LOOP_MIN_ITERATION_COUNT(2)
+    for (int off = 0; off < kHalf; off += 16) {
+      aie::vector<float, 16> av = aie::load_v<16>(a_ptr + off);
+      aie::vector<float, 16> gv = aie::load_v<16>(g_ptr + off);
+      // sigmoid(g): keep g/2 in f32 (un-rounded); only the tanh OUTPUT narrows to bf16.
+      aie::vector<float, 16> half_g = aie::mul(gv, halff);
+      aie::vector<bfloat16, 16> tanh_half_g = aie::tanh<bfloat16>(half_g);
+      aie::vector<bfloat16, 16> tanh_p1 = aie::add(tanh_half_g, one);
+      aie::vector<bfloat16, 16> sig = aie::mul(tanh_p1, halfb);
+      aie::accum<accfloat, 16> sacc;
+      sacc.from_vector(sig);
+      aie::vector<float, 16> sigf = sacc.to_vector<float>();
+      // final multiply against the UN-rounded f32 a. Bind to a vector first: aie::mul on two
+      // f32 vectors yields an accum, and only the assignment converts it back.
+      aie::vector<float, 16> outv = aie::mul(av, sigf);
+      aie::store_v(out_ptr + off, outv);
+    }
+  }
+  event1();
+}
+
 // identity: copy f32 acc -> f32 out (the matmul already folded bias via K-aug).
 template <int size>
 static inline void mm_identity_epilogue_f32o(const float *__restrict pC_in,
@@ -428,6 +492,16 @@ extern "C" {
 #ifndef EPI_N
 #define EPI_N 32
 #endif
+// mmul sub-tile dims, needed ONLY by the GLU mode -- the other epilogues are per-element and
+// so are layout-blind. These are the shape mm.cc was compiled with (microkernel_mac_dim_map:
+// 8,8,8 for the bfp16 path we run, 4,8,8 native), and a mismatch would silently pair the wrong
+// elements, so the generator passes them rather than letting this default drift.
+#ifndef EPI_R
+#define EPI_R 8
+#endif
+#ifndef EPI_T
+#define EPI_T 8
+#endif
 
 void mm_silu_epilogue_f32_bf16(const float *__restrict c_in,
                                bfloat16 *__restrict c_out) {
@@ -456,8 +530,11 @@ void mm_modal_epilogue_f32_f32(const float *__restrict c_in,
   // that with truncation biases every product low.
   aie::set_rounding(aie::rounding_mode::conv_even);
 #endif
-  // rtp[0]: 0=identity, 1=silu, 2=gelu (modal modes; baked per instruction stream).
-  if (rtp[0] == 1) {
+  // rtp[0]: 0=identity, 1=silu, 2=gelu, 3=glu (modal modes; baked per instruction stream).
+  if (rtp[0] == 3) {
+    // Halves the live output width -- the drain tap takes 64 of every 128 columns.
+    mm_glu_epilogue_f32o<EPI_M, EPI_N, EPI_R, EPI_T>(c_in, c_out);
+  } else if (rtp[0] == 1) {
     // Higher-precision hybrid silu (f32 x + f32 final multiply, bf16 sigmoid) --
     // WER-neutral vs the host f32 silu, unlike the all-bf16 f32o path.
     mm_silu_epilogue_f32o_hiprec<EPI_M * EPI_N>(c_in, c_out);
