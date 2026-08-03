@@ -170,4 +170,46 @@ fn main() {
         println!("  => measured switch cost {:.3} ms/transition", (t_replay - t_grouped) * 1e3 / (n_r - n_g) as f64);
     }
     println!("  delta grouped-floor    {:>8.3} s  (residual: not order, not solo compute)", t_grouped - floor);
+
+    // --- ARM 4: RESTREAM -- swapping instruction streams WITHIN one hw_context ------------------
+    // The arms above vary the xclbin, so they price a context switch. This one holds the xclbin
+    // fixed and varies only the instruction stream, which is the other thing the encoder already
+    // does: the modal resident serves every N off one hw_context via a per-N stream, and those
+    // streams differ in their BDs' size/stride fields. `load_kernel` caches by path, so both
+    // bricks share ONE Kernel and no switch can occur.
+    //
+    // Same multiset in both orders, so bytes and compute are identical and only the stream-change
+    // count differs -- the delta is the reconfiguration alone. Comparing the two streams against
+    // EACH OTHER would instead measure N=1024 against N=2048.
+    let restream = vec![
+        Brick::load(
+            &dev,
+            &wa.join("final_512x1024x4096_64x32x128_8c_modalsilu.xclbin"),
+            &wa.join("insts_512x1024x1024_64x32x128_8c_modalid.txt"),
+            [PAD_M * KRES * 2, KRES * 1024 * 2, PAD_M * 1024 * 4, 1, 4],
+        ),
+        Brick::load(
+            &dev,
+            &wa.join("final_512x1024x4096_64x32x128_8c_modalsilu.xclbin"),
+            &wa.join("insts_512x1024x2048_64x32x128_8c_modalid.txt"),
+            [PAD_M * KRES * 2, KRES * 2048 * 2, PAD_M * 2048 * 4, 1, 4],
+        ),
+    ];
+    const RS_N: usize = 128; // per stream, so 256 dispatches per arm
+    let alt: Vec<usize> = (0..2 * RS_N).map(|i| i % 2).collect();
+    let mut grp = alt.clone();
+    grp.sort_unstable();
+    let t_alt = time_seq(&restream, &alt, reps);
+    let t_grp = time_seq(&restream, &grp, reps);
+    let (n_a, n_g2) = (transitions(&alt), transitions(&grp));
+    println!("\n== RESTREAM: same xclbin, {} dispatches, two orders ==", alt.len());
+    println!("  ALTERNATING (n=1024/2048)  {:>8.4} s   stream changes {n_a}", t_alt);
+    println!("  GROUPED     (same multiset) {:>7.4} s   stream changes {n_g2}", t_grp);
+    if n_a > n_g2 {
+        println!(
+            "  => restream cost {:.4} ms/change   (vs {:.3} ms/xclbin-transition above)",
+            (t_alt - t_grp) * 1e3 / (n_a - n_g2) as f64,
+            (t_replay - t_grouped) * 1e3 / (n_r - n_g).max(1) as f64,
+        );
+    }
 }
