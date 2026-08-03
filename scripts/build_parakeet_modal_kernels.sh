@@ -131,4 +131,25 @@ make -C $DWML -f Makefile.dwsilu_t NPU2=1 cols=8 build/final_dwconv_silu_t_1024x
 cp "$DWML/build/final_dwconv_silu_t_1024x400.xclbin" "$LNDIR/final_dwconv_silu_t_1024x400.xclbin"
 cp "$DWML/build/insts_dwconv_silu_t_1024x400.txt"    "$LNDIR/insts_dwconv_silu_t_1024x400.txt"
 echo "Built + staged resident FFN + conv xclbins (LN->fc1 seam + fc1->fc2 + GLU + dwconv + fused dwconv-silu [+ time-major]) -> $LNDIR"
+
+# Refresh the artifact manifest for what we just staged. gen_kernel_manifest hashes the files
+# actually sitting in $LNDIR, so it must run AFTER the last cp -- it was called from no build script
+# at all, which is why no kernel_manifest.json existed anywhere on this box and the opt-in artifact
+# gate (NPU_KERNEL_MANIFEST_VERIFY=1 -> kernel_registry::resolve_checked) had nothing to check.
+#
+# Not fatal to the build: the xclbins above are valid whether or not their provenance got recorded,
+# and aborting a completed kernel build over a Rust compile would be disproportionate. But a manifest
+# that no longer describes this directory is WORSE than none -- resolve_checked would pass on stale
+# hashes -- so on failure the old one is removed, leaving the gate to fail closed on "absent".
+echo "== artifact manifest: $LNDIR =="
+# The cargo workspace is rust/, not the repo root, and this script runs from $REPO -- hence the
+# subshell cd, matching the house convention in the other scripts that shell out to cargo.
+if ( cd rust && cargo run -q --release -p npu-asr --bin gen_kernel_manifest -- "../$LNDIR" ); then
+  :
+else
+  rm -f "$LNDIR/kernel_manifest.json"
+  echo "WARNING: gen_kernel_manifest failed -- removed $LNDIR/kernel_manifest.json rather than leave a stale one." >&2
+  echo "         NPU_KERNEL_MANIFEST_VERIFY=1 will now fail closed here until this is re-run." >&2
+fi
+
 ls -la $LNDIR/
