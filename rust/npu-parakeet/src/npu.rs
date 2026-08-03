@@ -1321,7 +1321,12 @@ impl NpuMatmul {
         let fc2_k4096 = {
             let cast_stem = format!("cast_{PAD_M}x{DFF}");
             let mm_stem = format!("{PAD_M}x{DFF}x{KRES}_{}_8c_modalid", self.tile);
-            let present = kernel_registry::xclbin_path(&self.ln_dir, &cast_stem).exists()
+            // TWO hw_context slots (the cast and the K=DFF GEMM) for an OPT-IN path. Loading them
+            // when the flag is off spent 2 of the driver's 16 on programs that can never dispatch;
+            // that budget is what blocked attention-on-NPU. Gate on the flag, not on the artifacts
+            // existing.
+            let present = self.fc2_k4096_on()
+                && kernel_registry::xclbin_path(&self.ln_dir, &cast_stem).exists()
                 && kernel_registry::insts_path(&self.ln_dir, &cast_stem).exists()
                 && kernel_registry::xclbin_path(&self.ln_dir, &mm_stem).exists()
                 && kernel_registry::insts_path(&self.ln_dir, &mm_stem).exists();
