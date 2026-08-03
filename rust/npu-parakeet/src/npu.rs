@@ -519,6 +519,31 @@ const DFF: usize = 4096; // Parakeet FFN inner dim (fc1 N / fc2 K)
 // Tile of the bf16-out fc1 (Fc1PanelBf16). NOT `self.tile`: bf16 out needs a per-core f32 accumulator that
 // does not fit alongside the m=64 C tile (L1 overflows by ~11.6 KB), so this variant only exists at m=32.
 const FC1_PANEL_BF16_TILE: &str = "32x32x128";
+
+/// `PARAKEET_FOLD_FC1=1`: make fc1's bf16-out xclbin the RESIDENT one, so fc1 and every other modal
+/// GEMM share a single hardware context.
+///
+/// The lever: fc1 is the only op in the 3-xclbin rotation that could move, and moving it takes the
+/// rotation from 3 visits per FFN to 2 -- 47-48 transitions/clip at the controlled 1.78 ms each. It
+/// works without any dispatch-site change because `Device::load_kernel` caches by PATH: point the
+/// resident at fc1's own xclbin and both handles resolve to the same `Kernel`, so no switch can occur
+/// between them.
+///
+/// The cost, and why this is opt-in rather than default. `split_acc` bakes `dtype_out` into the array
+/// program, so one xclbin cannot serve an f32-out and a bf16-out GEMM; folding therefore moves EVERY
+/// modal GEMM to bf16 out, and the only bf16-out build that fits L1 is m=32 (at m=64 it overflows by
+/// exactly 11596 B, verified by build). Measured tile penalty: 1.13x at N=1024, 1.27x at N=4096.
+/// Projected net ~-67 ms/clip.
+///
+/// **TIMING-ONLY as it stands.** The host readback still decodes C as f32 while the folded xclbin
+/// writes bf16, so encoder OUTPUT IS WRONG under this flag -- it exists to measure the dispatch
+/// sequence, the transition count and the wall clock end-to-end. Shipping it additionally needs the
+/// readback converted in both crates that dispatch modal GEMMs (here and `npu_asr::ctx2`). The
+/// accuracy side is already priced separately: zero WER cost on 200 clips.
+fn fold_fc1() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PARAKEET_FOLD_FC1").map(|v| v != "0").unwrap_or(false))
+}
 // Variant B fc2 = deinterleave -> 4x K=KRES modal (same tile as host) on device sub-buffers +
 // host-accumulate = bit-identical to the host K-split (WER-neutral), A device-side.
 
@@ -576,14 +601,27 @@ impl NpuMatmul {
     pub fn open(root: &Path) -> Self {
         let dev = Device::open(0).expect("open NPU (single-tenant: stop npu-asr/voxd)");
         let base = root.join(WA_SUBDIR);
-        // resident kernel tile: fast BFP16 64x32x128 (default) or native bf16 32x32x32 (NPU_NATIVE=1)
-        let tile = if std::env::var("NPU_NATIVE").is_ok() { "32x32x32" } else { "64x32x128" }.to_string();
+        // resident kernel tile: fast BFP16 64x32x128 (default) or native bf16 32x32x32 (NPU_NATIVE=1),
+        // or the FOLD's 32x32x128 (see `fold_fc1`).
+        let tile = if fold_fc1() {
+            FC1_PANEL_BF16_TILE.to_string()
+        } else if std::env::var("NPU_NATIVE").is_ok() {
+            "32x32x32".to_string()
+        } else {
+            "64x32x128".to_string()
+        };
         // resident xclbin = a K=1024 whole_array kernel for this tile. The array program is
         // N-independent (per-N differs only in the runtime instruction stream, swapped per
         // dispatch), so ANY surviving N works as the resident. Prefer the largest N present;
         // fall back to a smaller surviving build (the N=4096/2048 twins were deleted by the
         // an earlier occupancy run; N=1024 survives). Env NPU_RESIDENT_XCLBIN overrides.
-        let (xclbin, modal) = if let Ok(p) = std::env::var("NPU_RESIDENT_XCLBIN") {
+        let (xclbin, modal) = if fold_fc1() {
+            // The resident IS fc1's bf16-out xclbin. Same path as `Fc1PanelBf16` resolves, so
+            // load_kernel's path cache hands both the same Kernel and the fc1<->fc2 transition
+            // disappears without touching a dispatch site.
+            let stem = format!("{PAD_M}x{KRES}x{DFF}_{FC1_PANEL_BF16_TILE}_8c_modalsilubf16outpanel{KRES}");
+            (resolve_verified(&base, &stem).xclbin, true)
+        } else if let Ok(p) = std::env::var("NPU_RESIDENT_XCLBIN") {
             let path = PathBuf::from(p);
             // Arbitrary override path (a manual/debug knob): no guaranteed `final_{stem}.xclbin`
             // convention to recover a stem from, so this branch keeps the raw filename check it
@@ -2692,7 +2730,14 @@ impl NpuMatmul {
             // xclbin: the variant is a different EPI_DEFINES build, so both the array program and
             // every per-N stream carry the suffix and the two must not be mixed.
             let mode = act.mode_tag();
-            let sfx = std::env::var("PARAKEET_MODAL_EPI_SUFFIX").unwrap_or_default();
+            // Under the fold every stream is a bf16-out build, so it carries `bf16out`. NOT via
+            // PARAKEET_MODAL_EPI_SUFFIX: that suffix is also appended to fc1's own panel stem, which
+            // would name a stream that does not exist (`...panel1024bf16out`).
+            let sfx = if fold_fc1() {
+                "bf16out".to_string()
+            } else {
+                std::env::var("PARAKEET_MODAL_EPI_SUFFIX").unwrap_or_default()
+            };
             // insts-only stem (engine-op-manifest-and-dynamic-xclbin): most (n, mode) combos here
             // have NO co-resident `final_*.xclbin` at this same stem -- they all dispatch on the
             // ONE resident kernel loaded in `open()`, only the instruction stream differs per call
