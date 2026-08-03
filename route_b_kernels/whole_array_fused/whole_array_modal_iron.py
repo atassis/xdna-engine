@@ -96,6 +96,20 @@ microkernel_mac_dim_map = {
 }
 
 
+def _stack_size():
+    """Per-core stack reservation, overridable via WA_STACK_SIZE.
+
+    0xD00 is a POLICY, not a derivation -- it is copy-pasted across 14 sites in this tree with no
+    recorded frame measurement behind it. That matters because the generated linker script places the
+    stack directly below the objectFIFO buffers with ZERO clearance (measured: 4874 of 4881 core
+    scripts), so this number is the only thing between a kernel frame and silent buffer corruption --
+    no crash, deterministic, surviving tiles bit-exact. Overridable so a suspected overflow can be
+    tested in one build instead of being argued about.
+    """
+    import os as _os
+    return int(_os.environ.get("WA_STACK_SIZE", "0xD00"), 0)
+
+
 def ceildiv(a, b):
     return (a + b - 1) // b
 
@@ -541,7 +555,7 @@ def my_matmul(
                 Worker(
                     core_fn_split_acc if split_acc else core_fn,
                     args,
-                    stack_size=0xD00,
+                    stack_size=_stack_size(),
                 )
             )
 

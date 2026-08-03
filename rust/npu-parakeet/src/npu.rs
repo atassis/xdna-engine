@@ -213,7 +213,18 @@ pub struct NpuMatmul {
     bo_tr: Bo,
     slots: Vec<PipeSlot>, // 2-slot ring for the K-split pipeline (output N=1024)
     modal: bool, // resident is the MODAL xclbin (fused f32-out silu/identity epilogue) vs plain matmul
-    streams: RefCell<HashMap<(usize, Act), Rc<NStream>>>, // (N, activation) -> stream
+    // Resident was built with k_loop_rtp, so its cores read the k-loop bound from rtp[1] and EVERY
+    // stream dispatched on it must carry that write. Derived from the loaded xclbin's own name
+    // rather than an env knob: the resident is the authority on what its streams must look like,
+    // and a separate knob could be set to disagree with it. (PARAKEET_MODAL_EPI_SUFFIX cannot serve
+    // here -- it is also appended to fc1's panel stem, which knocks fc1 onto its fallback path.)
+    krtp: bool,
+    streams: RefCell<HashMap<(usize, usize, Act), Rc<NStream>>>, // (K, N, activation) -> stream
+    // fc2 output for the one-dispatch K=DFF collapse. Its own BO against self.kern's C group --
+    // NOT the stream's shared bo_c (every N=1024 identity dispatch would alias it) and NOT the
+    // accadd scratch (that is another kernel's group). Lazily allocated so the default path,
+    // which never takes this branch, does not spend a buffer on it.
+    fc2_out: RefCell<Option<Rc<Bo>>>,
     wcache: RefCell<HashMap<String, Rc<Bo>>>,      // packed weight BOs by id
     ncache: RefCell<HashMap<String, usize>>,       // weight N (ncols) by id, paired with wcache
     relpos_dir: PathBuf,                           // {root}/artifacts/relpos (per-T xclbin cache)
@@ -667,8 +678,9 @@ impl NpuMatmul {
                 kernel_registry::parse_stem_tokens(&stem).variant.is_some_and(|v| v.contains("modal"));
             (path, modal)
         };
+        let krtp = xclbin.file_name().and_then(|s| s.to_str()).is_some_and(|s| s.contains("krtp"));
         if !npu_xrt::quiet() {
-            eprintln!("[npu] resident xclbin = {} (modal={modal})", xclbin.display());
+            eprintln!("[npu] resident xclbin = {} (modal={modal} krtp={krtp})", xclbin.display());
         }
         let kern = dev
             .load_kernel(xclbin.to_str().unwrap(), None)
@@ -696,7 +708,9 @@ impl NpuMatmul {
             bo_tr,
             slots,
             modal,
+            krtp,
             streams: RefCell::new(HashMap::new()),
+            fc2_out: RefCell::new(None),
             wcache: RefCell::new(HashMap::new()),
             ncache: RefCell::new(HashMap::new()),
             relpos_dir: root.join("artifacts/relpos"),
@@ -2135,6 +2149,27 @@ impl NpuMatmul {
     ///   ctxLN -> affine_cast -> modal fc1 (on-chip silu, [t,DFF]) -> cast@DFF (bf16) -> K=DFF fc2
     ///   (identity, on-chip K-reduce, [t,KRES]) -> read [t,KRES] f32.
     /// No host K-split / accumulate. `make_w1` = [KRES,DFF] fc1 weight; `make_w2` = [DFF,KRES] fc2.
+    /// True when the one-dispatch K=DFF fc2 collapse is enabled (opt-in `PARAKEET_FC2_ONEDISPATCH`).
+    /// Unlike `fc2_k4096_on` this is tested on the DEFAULT path, not inside a `None` arm the default
+    /// never takes -- see the warning in `ffn_dev_accum`.
+    fn fc2_onedispatch_on(&self) -> bool {
+        std::env::var("PARAKEET_FC2_ONEDISPATCH").map(|v| v != "0").unwrap_or(false)
+    }
+
+    /// Output BO for the one-dispatch fc2, lazily allocated against the RESIDENT kernel's C group.
+    /// Deliberately not the stream's `bo_c` (shared by every dispatch on that key) and not the
+    /// accadd scratch (allocated against another kernel's group, whose bank is what makes a
+    /// mis-homed BO corrupt silently).
+    fn fc2_out_bo(&self) -> Rc<Bo> {
+        if let Some(bo) = self.fc2_out.borrow().as_ref() {
+            return bo.clone();
+        }
+        let g5 = self.kern.group_id(5).unwrap();
+        let bo = Rc::new(self.dev.alloc_bo(&self.kern, PAD_M * KRES * 4, FLAG_HOST_ONLY, g5).unwrap());
+        *self.fc2_out.borrow_mut() = Some(bo.clone());
+        bo
+    }
+
     /// True when the one-dispatch K=DFF fc2 collapse is enabled (opt-in `PARAKEET_FC2_K4096`).
     fn fc2_k4096_on(&self) -> bool {
         std::env::var("PARAKEET_FC2_K4096").map(|v| v != "0").unwrap_or(false)
@@ -2422,6 +2457,47 @@ impl NpuMatmul {
                 &rl.bo_deint
             }
         };
+        // ONE-DISPATCH fc2 (opt-in `PARAKEET_FC2_ONEDISPATCH`): contract all DFF of K in a SINGLE
+        // modal dispatch instead of 4 K=KRES partials + 4 acc_add. The accumulator already lives
+        // on-core across the k-loop; the K-split is what threw it away and made acc_add necessary.
+        // Worth -336 of 816 dispatches/clip and deletes the accadd program (one hw_context back).
+        //
+        // Needs the krtp resident AND krtp streams together -- see `stream_k`. A is read straight out
+        // of fc1's panel-major bf16 drain by the stream's own A tap (`--a-panel-width`), so nothing
+        // repacks; that tap fits the shim's 4 dims only because N=KRES makes its outer repeat
+        // degenerate, which is asserted in the generator rather than left to hold by luck.
+        //
+        // NOT bit-identical to the 4-partial path, and that is expected: on-core accumulation rounds
+        // the same products in a different order than four separately-rounded host-order partials
+        // (`acc_add.cc` -- f32 add is deterministic, not exact). Gate on the transcript, not bits.
+        //
+        // Tested HERE, on the path the default actually takes -- unlike `fc2_k4096_on` below, which
+        // sits inside the `None` arm of the `fc1_pack_in_drain` match and is therefore inert under
+        // the default fold. Warn rather than let that stay silent:
+        if self.fc2_k4096_on() && self.fc1_pack_in_drain_on() {
+            eprintln!("[npu] PARAKEET_FC2_K4096 is set but has NO EFFECT: it is only reachable with \
+                       PARAKEET_FC1_PACK_IN_DRAIN=0. Did you mean PARAKEET_FC2_ONEDISPATCH=1?");
+        }
+        if self.fc2_onedispatch_on() {
+            let wid = format!("{id2}.full");
+            let cached = self.wcache.borrow().get(&wid).cloned();
+            let w2f = cached.unwrap_or_else(|| {
+                let w = make_w2();
+                assert_eq!(w.dim(), (DFF, KRES), "fc2 W2 dim");
+                self.weight_bo(&wid, w.view())
+            });
+            let out = self.fc2_out_bo();
+            let st = self.stream_k(DFF, KRES, Act::Identity);
+            modal_site("kern#8.onedispatch");
+            {
+                let _dt = self.dtimer();
+                self.kern
+                    .run_matmul8(3, &st.instr, st.n_instr, a_chunks, &w2f, &out, &self.bo_tmp, &self.bo_tr)
+                    .unwrap();
+            }
+            self.stats.borrow_mut().dispatches += 1;
+            return out;
+        }
         // fc2 K-split with ON-DEVICE accumulate: each partial modal GEMM -> st.bo_c (device); acc_add
         // sums it into the acc0/acc1 ping-pong (seed acc=0 for partial0). Result stays device-resident.
         let parts = DFF / KRES;
@@ -2734,11 +2810,24 @@ impl NpuMatmul {
     /// the plain resident there is no on-chip epilogue (the host applies the activation), so `act`
     /// is normalized to Identity and the classic insts_*_8c.txt stream is used.
     fn stream(&self, n: usize, act: Act) -> Rc<NStream> {
+        // Every shipped stream contracts over K=KRES; only the one-dispatch fc2 collapse varies K.
+        self.stream_k(KRES, n, act)
+    }
+
+    /// `stream()` with the contraction length explicit. K reaches the array ONLY through the
+    /// instruction stream (the A/B tap counts and the rtp[1] trip count), which is why one resident
+    /// xclbin can serve several K -- but that is true only of a `k_loop_rtp` build, where the core
+    /// reads its k-loop bound from rtp[1] instead of baking it. Dispatching a K != the build's K on a
+    /// BAKED resident silently contracts over the wrong length, so the krtp streams and the krtp
+    /// resident must be selected together (`PARAKEET_MODAL_EPI_SUFFIX=krtp` + `NPU_RESIDENT_XCLBIN`).
+    /// A missing stream file panics in the read below rather than falling back, which is what makes
+    /// that pairing fail loud instead of quietly wrong.
+    fn stream_k(&self, k: usize, n: usize, act: Act) -> Rc<NStream> {
         // The plain (non-modal) resident has no epilogue, so the activation is a no-op there; collapse
         // to Identity so the cache stays 1:1 with the single plain insts file (byte-identical to the
         // old `silu && self.modal` key).
         let act = if self.modal { act } else { Act::Identity };
-        let key = (n, act);
+        let key = (k, n, act);
         if let Some(s) = self.streams.borrow().get(&key) {
             return s.clone();
         }
@@ -2763,9 +2852,19 @@ impl NpuMatmul {
             // ONE resident kernel loaded in `open()`, only the instruction stream differs per call
             // -- so this stays `insts_path` only, never `resolve`/`resolve_checked` (those assume
             // a paired xclbin at the same stem, which does not exist for most of these).
-            kernel_registry::insts_path(&self.base, &format!("512x1024x{n}_{}_8c_{mode}{sfx}", self.tile))
+            // A WIDE-K stream contracts over fc1's output, and fc1 drains PANEL-major by default,
+            // so such a stream must carry the matching panel A tap or it reads A row-major and is
+            // silently wrong. That is a property of the PRODUCER, not a free choice, so derive it
+            // here rather than add a second env knob that could disagree with the fc1 path.
+            let krtp = if self.krtp { "krtp" } else { "" };
+            let apanel = if k != KRES && self.fc1_pack_in_drain_on() {
+                format!("apanel{KRES}")
+            } else {
+                String::new()
+            };
+            kernel_registry::insts_path(&self.base, &format!("{PAD_M}x{k}x{n}_{}_8c_{mode}{sfx}{krtp}{apanel}", self.tile))
         } else {
-            kernel_registry::insts_path(&self.base, &format!("512x1024x{n}_{}_8c", self.tile))
+            kernel_registry::insts_path(&self.base, &format!("{PAD_M}x{k}x{n}_{}_8c", self.tile))
         };
         let bytes = std::fs::read(&insts).unwrap_or_else(|e| panic!("read {}: {e}", insts.display()));
         let n_instr = bytes.len() / 4;
@@ -2780,7 +2879,7 @@ impl NpuMatmul {
         // they differ in the BDs' size/stride FIELDS, not in the chain's shape.
         if npu_xrt::dispatch_log::enabled() {
             println!(
-                "[dispatch_log] stream n={n} act={} -> {} insts words, bo 0x{:x}",
+                "[dispatch_log] stream k={k} n={n} act={} -> {} insts words, bo 0x{:x}",
                 act.mode_tag(), s.n_instr, s.instr.addr()
             );
         }
