@@ -22,6 +22,11 @@ MMW=mlir-aie/programming_examples/basic/matrix_multiplication/whole_array
 ensure_fresh_sandbox "$MMW/build"           # wipe old-pin xclbins/objects on a toolchain change
 bash scripts/sync_kernels.sh >/dev/null     # copies Makefile.modal + whole_array_modal_iron.py + mm_silu_epilogue.cc
 
+# kernels_dir (route_b_override.mk) resolves into the mlir-aie SUBMODULE, not the pinned
+# toolchain instance -- a correctly-bumped toolchain.lock can still compile stale kernel source
+# with no error (see scripts/verify_kernel_source.sh's header). FAIL LOUD before spending a build.
+scripts/verify_kernel_source.sh Makefile.modal
+
 MK="-f Makefile.modal"
 COMMON="NPU2=1 M=512 K=1024 m=64 k=32 n=128 dtype_in=bf16 dtype_out=f32 n_aie_cols=8 use_iron=1 \
         emulate_bfloat16_mmul_with_bfp16=1 bfp16_iree=1"
@@ -107,6 +112,20 @@ for tag in ctxln_512x1024 affcast_512x1024 cast_512x1024 cast_512x4096 lnaffcast
   cp "$LNML/build/final_${tag}.xclbin" "$LNML/build/insts_${tag}.txt" "$LNDIR/"
 done
 cp "$MMW/build/final_512x4096x1024_64x32x128_8c_modalid.xclbin" "$MMW/build/insts_512x4096x1024_64x32x128_8c_modalid.txt" "$LNDIR/"
+# PROVENANCE: verify_kernel_source.sh (run above, line 28) already stamped
+# $MMW/build/.kernel_source_manifest at BUILD TIME with the verified per-file kernel-source
+# hashes + resolved KERNEL_CC identity for everything built from Makefile.modal in this run --
+# which includes the two xclbins just copied into $LNDIR above (lines ~104 and ~114). But $LNDIR,
+# not $MMW/build, is what ships (this whole staging block exists because npu.rs's resident-LN/FFN
+# loaders read from here) -- so without this copy the provenance record stays behind in the build
+# dir while the artifact it describes moves on -- a green toolchain.lock is not itself proof of
+# what got built, so provenance has to travel with the shipped artifact, not stay reconstructible
+# only by walking the build dir after the fact. Named ".modal" because it covers ONLY the
+# Makefile.modal-family artifacts staged into $LNDIR (the two
+# just copied) -- it does NOT cover the ctxln/affinecast/cast/lnaffcast/deint/glu/accadd/resadd/
+# silu2/dwconv1d/dwsilu/dwsilu_t families copied below, none of which verify_kernel_source.sh
+# checks yet (out of scope here; see scripts/verify_kernel_source.sh's own header for why).
+cp "$MMW/build/.kernel_source_manifest" "$LNDIR/.kernel_source_manifest.modal"
 # RESIDENT-CONV: depthwise conv1d (conv-module step 3), k9/C=1024/T=400, 8 columns. Builds the VECTORIZED
 # aligned-load + aie::shuffle_down_fill FIR (dwconv1d_shift) -- correct + fast (~7x the scalar). It avoids
 # both toolchain traps the naive brick hits (unaligned-L1-load snap; aie::sliding_mul_ops bf16 inf/nan --
