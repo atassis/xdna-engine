@@ -489,6 +489,36 @@ struct ConvDwSiluT {
     dummy_tr: Bo,
 }
 
+/// Round an f32 to bf16 precision and back, round-to-nearest-even.
+///
+/// Simulation only, for [`sim_bf16_gemm_out`]. RNE rather than truncation on purpose: it is the
+/// OPTIMISTIC case (the modal epilogue only rounds this way with `MODAL_ROUND_EVEN`, hardware default
+/// is coarser), so a failure under RNE is a failure under anything the device would actually do.
+fn bf16_rne(x: f32) -> f32 {
+    let b = x.to_bits();
+    if (b & 0x7f80_0000) == 0x7f80_0000 {
+        return x; // NaN/Inf: leave alone rather than round the payload
+    }
+    f32::from_bits((b + 0x7fff + ((b >> 16) & 1)) & 0xffff_0000)
+}
+
+/// `PARAKEET_SIM_BF16_GEMM_OUT=1`: narrow every GEMM result that returns through
+/// [`NpuMatmul::dispatch_with_a`] to bf16, in host arithmetic.
+///
+/// Prices a change we cannot build yet. Folding fc1 into the resident modal xclbin requires ONE array
+/// program to serve both, and `dtype_out` is baked into it -- f32 out reduces in place with no
+/// accumulator, bf16 out needs a per-core f32 `cacc` PLUS a bf16 C tile (verified 2026-08-03: at m=64
+/// that overflows L1 by exactly 11596 B). So no L1 fix makes the two share a program, and the fold
+/// forces bf16 output on every modal GEMM. This flag asks what that costs in accuracy BEFORE building
+/// it. Off by default; measurement instrument, never a shipping path.
+///
+/// LOWER BOUND on the damage: on the default path this hook only reaches fc2's K-split partials, and
+/// the real fold would narrow the other modal GEMMs too.
+fn sim_bf16_gemm_out() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PARAKEET_SIM_BF16_GEMM_OUT").map(|v| v != "0").unwrap_or(false))
+}
+
 const DFF: usize = 4096; // Parakeet FFN inner dim (fc1 N / fc2 K)
 // Tile of the bf16-out fc1 (Fc1PanelBf16). NOT `self.tile`: bf16 out needs a per-core f32 accumulator that
 // does not fit alongside the m=64 C tile (L1 overflows by ~11.6 KB), so this variant only exists at m=32.
@@ -1684,6 +1714,9 @@ impl NpuMatmul {
             s.rb_read_s += read_s;
             s.rb_decode_s += t_dec.elapsed().as_secs_f64();
             s.rb_decode_elems += m * n;
+        }
+        if sim_bf16_gemm_out() {
+            out.mapv_inplace(bf16_rne);
         }
         out
     }
