@@ -23,6 +23,75 @@ pub fn quiet() -> bool {
     *QUIET.get_or_init(|| std::env::var("NPU_QUIET").map(|v| v != "0").unwrap_or(false))
 }
 
+/// `PARAKEET_SIM_BF16_GEMM_OUT=1`: narrow the f32 C buffer of every RESIDENT MODAL dispatch to bf16,
+/// in place, simulating a bf16-out epilogue.
+///
+/// Prices folding fc1 into the modal xclbin. `split_acc` puts `dtype_out` in the array program (f32 out
+/// reduces in place, bf16 out carries a per-core accumulator), so one xclbin cannot serve both and the
+/// fold moves EVERY modal GEMM to bf16 out. This asks what that costs in accuracy before it is built.
+///
+/// Lives here rather than in npu-parakeet because the modal GEMMs are dispatched from BOTH crates --
+/// fc2's K-split from `npu-parakeet`, the projections and conv pointwise from `npu_asr::ctx2` -- and a
+/// per-call-site census found only 240 of 456 dispatches when hooked in one crate. Keying on the
+/// kernel's own label is what makes coverage complete by construction.
+///
+/// Scoped by label, and the exclusion is load-bearing: `modalsilu` selects the f32-out resident whose
+/// C the fold would change, while `bf16out` excludes the panel fc1 (already bf16, so reinterpreting
+/// its C as f32 would corrupt it). Same reason `lnaffcast`/`deint` are not matched -- their C is bf16.
+///
+/// Round-trips through the host, so it is SLOW and destroys the timing of any run that enables it.
+/// Measurement instrument, never a shipping path.
+pub mod sim_bf16 {
+    use std::sync::OnceLock;
+
+    pub fn enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| {
+            std::env::var("PARAKEET_SIM_BF16_GEMM_OUT").map(|v| v != "0").unwrap_or(false)
+        })
+    }
+
+    /// True for the f32-out resident modal xclbin, false for everything else.
+    pub fn applies(label: &str) -> bool {
+        enabled() && label.contains("modalsilu") && !label.contains("bf16out")
+    }
+
+    /// `PARAKEET_SIM_BF16_ONLY_N=<n>`: restrict the narrowing to dispatches whose output is `n` wide.
+    ///
+    /// Bisects WHICH modal GEMM the fold's accuracy cost lives in. The full narrowing fails the parity
+    /// gate while fc2's partials alone pass, so the damage is in the other modal dispatches, and N
+    /// separates them: 2048 is the conv module's pw1, 1024 is fc2's K-split plus the attention
+    /// projections. Unset = every width.
+    pub fn only_n() -> Option<usize> {
+        static N: OnceLock<Option<usize>> = OnceLock::new();
+        *N.get_or_init(|| std::env::var("PARAKEET_SIM_BF16_ONLY_N").ok().and_then(|v| v.parse().ok()))
+    }
+
+    /// f32 -> bf16 -> f32, round-to-nearest-even. RNE is the OPTIMISTIC case (the modal epilogue only
+    /// rounds this way under `MODAL_ROUND_EVEN`; the hardware default is coarser), so a gate failure
+    /// here is a failure under anything the device would actually do.
+    pub fn rne(x: f32) -> f32 {
+        let b = x.to_bits();
+        if (b & 0x7f80_0000) == 0x7f80_0000 {
+            return x; // NaN/Inf: leave alone rather than round the payload
+        }
+        f32::from_bits((b + 0x7fff + ((b >> 16) & 1)) & 0xffff_0000)
+    }
+
+    /// Elements narrowed so far, so a run can state its own coverage.
+    pub static ELEMS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    pub static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    pub fn report() -> String {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (c, e) = (CALLS.load(Relaxed), ELEMS.load(Relaxed));
+        if !enabled() {
+            return "sim-bf16-gemm-out: OFF".into();
+        }
+        format!("sim-bf16-gemm-out: ON -- narrowed {e} f32 elems over {c} modal dispatches")
+    }
+}
+
 /// Per-dispatch xclbin-TRANSITION accounting, gated by `NPU_DISPATCH_LOG=1`.
 ///
 /// Every dispatch funnels through a [`Kernel`] method, so counting here covers every call site with
@@ -719,10 +788,35 @@ impl Kernel {
         };
         dispatch_log::note(&self.label, instr.ptr as usize, count, Some(_t.elapsed().as_secs_f64()));
         if r != 0 {
-            Err(format!("run_matmul8: {}", last_error()))
-        } else {
-            Ok(())
+            return Err(format!("run_matmul8: {}", last_error()));
         }
+        if sim_bf16::applies(&self.label) {
+            self.sim_narrow_c(c)?;
+        }
+        Ok(())
+    }
+
+    /// Narrow `c`'s f32 contents to bf16 in place. See [`sim_bf16`]; no-op unless it applies.
+    fn sim_narrow_c(&self, c: &Bo) -> Result<()> {
+        use std::sync::atomic::Ordering::Relaxed;
+        // Width of this dispatch's output, from C's own size: PAD_M(512) rows of f32.
+        if let Some(want) = sim_bf16::only_n() {
+            if c.nbytes / (512 * 4) != want {
+                return Ok(());
+            }
+        }
+        c.sync_from_device()?;
+        let mut b = vec![0u8; c.nbytes];
+        c.read_bytes(&mut b)?;
+        for w in b.chunks_exact_mut(4) {
+            let v = sim_bf16::rne(f32::from_le_bytes([w[0], w[1], w[2], w[3]]));
+            w.copy_from_slice(&v.to_le_bytes());
+        }
+        c.write_bytes(&b)?;
+        c.sync_to_device()?;
+        sim_bf16::ELEMS.fetch_add(c.nbytes / 4, Relaxed);
+        sim_bf16::CALLS.fetch_add(1, Relaxed);
+        Ok(())
     }
 
     /// Async variant of [`run_matmul8`]: submit the dispatch and return immediately with a [`Run`]

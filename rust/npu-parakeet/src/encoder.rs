@@ -255,7 +255,7 @@ impl FastConformerEncoder {
                 s.ffn_ln_s, s.ffn_fc1_s, s.ffn_deint_s, s.ffn_fc2_s, s.ffn_weight_prep_s, s.ffn_readback_s,
                 s.rb_sync_s, s.rb_read_s, s.rb_decode_s, s.rb_decode_elems,
                 s.rb_decode_s * 1e9 / s.rb_decode_elems.max(1) as f64
-            )
+            ) + "\n" + &npu_xrt::sim_bf16::report() + "\n" + &crate::npu::modal_site_report()
         })
     }
 
