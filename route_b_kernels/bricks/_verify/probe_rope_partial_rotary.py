@@ -12,6 +12,8 @@ ROT=64 additionally exercises Xilinx/llvm-aie#1155, the reg-offset fallback for 
 VST_dmx_sts_x_spill frame offsets, carried in the pinned Peano. A build failure is caught and
 reported per-shape instead of ending the sweep.
 """
+import sys
+
 import numpy as np
 import ml_dtypes
 
@@ -44,18 +46,30 @@ def run_one(rot):
 
 def main():
     verdicts = {}
+    bad = []
     for rot in ROTS:
         try:
             res = run_one(rot)
             verdicts[rot] = f"rel_l2={res['rel_l2']:.3e} -> {'PASS' if res['ok'] else 'FAIL'}"
+            if not res["ok"]:
+                bad.append(rot)
         except Exception as e:  # a backend crash is a result here, not a run-ender
             verdicts[rot] = f"BUILD/RUN ERROR: {type(e).__name__}: {str(e)[:160]}"
+            bad.append(rot)
         print(f"ROT={rot:4d}  {verdicts[rot]}", flush=True)
 
     print("\n===== partial-rotary summary (gate %.1e) =====" % V.GATE)
     for rot, v in verdicts.items():
         print(f"  ROT={rot:4d}  D={V.D}  {'FULL  ' if rot == V.D else 'PARTIAL'}  {v}")
 
+    # Without this the sweep printed FAIL and still exited 0, so no drain could fail on it.
+    # A build/run error counts as a failure: an un-buildable width is not a passing width.
+    if bad:
+        print(f"FAIL partial-rotary: {len(bad)} of {len(ROTS)} widths bad -> {bad}")
+        return 1
+    print(f"PASS partial-rotary: all {len(ROTS)} widths within {V.GATE:.1e}")
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

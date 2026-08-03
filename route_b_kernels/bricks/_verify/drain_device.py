@@ -52,6 +52,7 @@ TARGETS = [
 ]
 
 SCRIPT_TARGETS = [
+    "probe_rope_partial_rotary",
     "verify_rmsnorm",
     "verify_int4_streamed",
     "verify_upscaler_bf16_conv2d",
