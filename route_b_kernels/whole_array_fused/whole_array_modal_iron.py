@@ -387,11 +387,19 @@ def my_matmul(
         # the loop bound is a runtime memref.load, not a Python-baked constant. range_/_for
         # accepts an MLIR Value as the loop stop, and AIESCFToControlFlow lowers it generically,
         # so no toolchain change is needed for this to work.
-        k_trip = rtp_buff[1] if k_loop_rtp else K // k
         loop = range(1)  # Workaround for issue #1547
         if n_tiles_per_core > 1:
             loop = range_(n_tiles_per_core)
         for _ in loop:
+            # Load INSIDE the tile loop, matching where rtp[0] is read (the epilogue call below).
+            # The core body is an infinite loop whose tile count is baked from the BUILD's N, while
+            # a dispatch delivers the STREAM's N worth of tiles -- the two need not align, so one
+            # body iteration can span several dispatches whenever stream N < build N. rtp is a
+            # side-channel, not fifo-ordered, so anything hoisted above this loop is sampled once
+            # per body iteration and pairs with whichever dispatch happened to enter it. That is
+            # invisible while every stream shares K=1024, and silently wrong the moment two streams
+            # carry different K -- which is the whole point of driving K from rtp.
+            k_trip = rtp_buff[1] if k_loop_rtp else K // k
             elem_out = out_c.acquire(1)
             zero(elem_out)
 

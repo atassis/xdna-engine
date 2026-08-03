@@ -610,9 +610,14 @@ impl NpuMatmul {
         } else {
             "64x32x128".to_string()
         };
-        // resident xclbin = a K=1024 whole_array kernel for this tile. The array program is
-        // N-independent (per-N differs only in the runtime instruction stream, swapped per
-        // dispatch), so ANY surviving N works as the resident. Prefer the largest N present;
+        // resident xclbin = a K=1024 whole_array kernel for this tile. What is N-independent is the
+        // BD-CHAIN SHAPE, not the array program: all three modal insts are 1436 words and N lives in
+        // the BDs' size/stride fields (see `stream()`), while the device region does differ across N
+        // by 32 cores x 4 lines -- each core's tile-loop bound, baked at 2/4/8 for N=1024/2048/4096.
+        // A stream whose N is smaller than the build's therefore spans several dispatches inside one
+        // core-body iteration, which the free-running consumer + order-preserving objectFIFOs absorb.
+        // Anything read from RTP outside that tile loop does NOT survive it -- see the k_trip note in
+        // whole_array_modal_iron.py's core_fn. Prefer the largest N present;
         // fall back to a smaller surviving build (the N=4096/2048 twins were deleted by the
         // an earlier occupancy run; N=1024 survives). Env NPU_RESIDENT_XCLBIN overrides.
         let (xclbin, modal) = if fold_fc1() {
