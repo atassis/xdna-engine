@@ -179,6 +179,19 @@ pub struct NpuStats {
     /// inside the ff_resident phase scope and were charged to `Bucket::Npu`.
     pub ffn_weight_prep_s: f64,
     pub ffn_readback_s: f64,
+    /// The `dispatch_with_a` return path, split. Every GEMM that hands its result back as an
+    /// `Array2` pays these three after the dispatch, and none of them were timed: `ffn_readback_s`
+    /// above sits on the fc2_k4096 branch, which the default path does not take, so it reads 0.00
+    /// and reads as "readback is free". These are HOST time inside the `ff_resident` phase scope,
+    /// charged to `Bucket::Npu` like the other two host leaves.
+    ///
+    /// `rb_decode_elems` is carried so the decode cost can be quoted per element -- the loop is
+    /// scalar `f32::from_le_bytes` over m*n, and at fc2's [512,1024] that is 524288 elements per
+    /// partial, four partials per FFN.
+    pub rb_sync_s: f64,
+    pub rb_read_s: f64,
+    pub rb_decode_s: f64,
+    pub rb_decode_elems: usize,
 }
 
 /// One pipeline slot: own A/C/tmp/trace so a dispatch in flight isn't clobbered while the host
@@ -1650,15 +1663,27 @@ impl NpuMatmul {
         let st = self.stream(n, if silu { Act::Silu } else { Act::Identity });
         { let _dt = self.dtimer(); self.kern.run_matmul8(3, &st.instr, st.n_instr, a_bo, wbo, &st.bo_c, &self.bo_tmp, &self.bo_tr).unwrap(); }
         self.stats.borrow_mut().dispatches += 1;
+        let t_sync = Instant::now();
         st.bo_c.sync_from_device().unwrap();
+        let sync_s = t_sync.elapsed().as_secs_f64();
         let mut cb = vec![0u8; m * n * 4];
+        let t_read = Instant::now();
         st.bo_c.read_bytes(&mut cb).unwrap();
+        let read_s = t_read.elapsed().as_secs_f64();
+        let t_dec = Instant::now();
         let mut out = Array2::<f32>::zeros((m, n));
         for r in 0..m {
             for c in 0..n {
                 let off = (r * n + c) * 4;
                 out[[r, c]] = f32::from_le_bytes([cb[off], cb[off + 1], cb[off + 2], cb[off + 3]]);
             }
+        }
+        {
+            let mut s = self.stats.borrow_mut();
+            s.rb_sync_s += sync_s;
+            s.rb_read_s += read_s;
+            s.rb_decode_s += t_dec.elapsed().as_secs_f64();
+            s.rb_decode_elems += m * n;
         }
         out
     }
