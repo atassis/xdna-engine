@@ -2629,6 +2629,16 @@ impl NpuMatmul {
         instr.sync_to_device().unwrap();
         let bo_c = self.dev.alloc_bo(&self.kern, PAD_M * n * 4, FLAG_HOST_ONLY, g(5)).unwrap();
         let s = Rc::new(NStream { instr, n_instr, bo_c });
+        // The dispatch report identifies streams by BO address only -- it cannot know what one
+        // MEANS. Name it here, where (n, act) is in hand, so the two outputs can be joined.
+        // Note n_instr does NOT identify N: all three modal N stream files are 1436 words, since
+        // they differ in the BDs' size/stride FIELDS, not in the chain's shape.
+        if npu_xrt::dispatch_log::enabled() {
+            println!(
+                "[dispatch_log] stream n={n} act={} -> {} insts words, bo 0x{:x}",
+                act.mode_tag(), s.n_instr, s.instr.addr()
+            );
+        }
         self.streams.borrow_mut().insert(key, s.clone());
         s
     }

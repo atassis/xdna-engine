@@ -40,9 +40,24 @@ pub mod dispatch_log {
         *ON.get_or_init(|| std::env::var("NPU_DISPATCH_LOG").map(|v| v != "0").unwrap_or(false))
     }
 
+    /// One (xclbin, instruction-stream) pair's blocking time, split by what ran before it.
+    #[derive(Default)]
+    struct Pred {
+        ord: usize,
+        insts: usize,
+        /// Predecessor was this same stream: no reconfiguration at all.
+        same: (usize, f64),
+        /// A different stream on the SAME xclbin: DMA/BD reconfigure, no hw_context switch.
+        restream: (usize, f64),
+        /// A different xclbin: a full hw_context transition.
+        xclbin: (usize, f64),
+        /// Async submissions (`run_*_start`), which carry no blocking time to attribute.
+        n_async: usize,
+    }
+
     #[derive(Default)]
     struct Log {
-        prev: Option<String>,
+        prev: Option<(String, usize)>,
         dispatches: usize,
         transitions: usize,
         per_kernel: BTreeMap<String, usize>,
@@ -58,13 +73,22 @@ pub mod dispatch_log {
         secs_same: f64,
         n_switched: usize,
         n_same: usize,
+        /// The same-xclbin bucket resolved one level finer, keyed by (xclbin, instruction stream).
+        ///
+        /// Per-STREAM is load-bearing rather than a refinement: one xclbin serves several
+        /// instruction streams (the modal GEMM has one per N) and they do different amounts of
+        /// work, so `secs_same` above averages reconfiguration cost together with GEMM size.
+        /// Within one stream the work is fixed and only the predecessor varies.
+        by_pred: BTreeMap<(String, usize), Pred>,
     }
 
     thread_local!(static L: RefCell<Log> = RefCell::new(Log::default()));
 
-    /// Record one dispatch on `label`, having taken `secs` of blocking wall time. Cheap no-op
-    /// unless `NPU_DISPATCH_LOG` is set.
-    pub fn note(label: &str, secs: f64) {
+    /// Record one dispatch of `label`'s `insts`-word instruction stream, identified by `stream`
+    /// (the instruction BO's address -- stable for the stream's lifetime). `secs` is blocking wall
+    /// time, or `None` for an async submit, which has none to attribute. Cheap no-op unless
+    /// `NPU_DISPATCH_LOG` is set.
+    pub fn note(label: &str, stream: usize, insts: usize, secs: Option<f64>) {
         if !enabled() {
             return;
         }
@@ -72,19 +96,42 @@ pub mod dispatch_log {
             let mut l = l.borrow_mut();
             l.dispatches += 1;
             *l.per_kernel.entry(label.to_string()).or_insert(0) += 1;
-            *l.secs_by_kernel.entry(label.to_string()).or_insert(0.0) += secs;
-            let switched = l.prev.as_deref().is_some_and(|p| p != label);
+            *l.secs_by_kernel.entry(label.to_string()).or_insert(0.0) += secs.unwrap_or(0.0);
+            let switched = l.prev.as_ref().is_some_and(|(p, _)| p != label);
             if switched {
                 l.transitions += 1;
-                let from = l.prev.clone().unwrap();
+                let from = l.prev.clone().unwrap().0;
                 *l.pairs.entry((from, label.to_string())).or_insert(0) += 1;
-                l.secs_switched += secs;
+                l.secs_switched += secs.unwrap_or(0.0);
                 l.n_switched += 1;
             } else if l.prev.is_some() {
-                l.secs_same += secs;
+                l.secs_same += secs.unwrap_or(0.0);
                 l.n_same += 1;
             }
-            l.prev = Some(label.to_string());
+
+            // Same accounting one level finer. `ord` numbers the streams per xclbin in first-seen
+            // order so the report can name them without printing addresses.
+            let key = (label.to_string(), stream);
+            let ord = l.by_pred.keys().filter(|(k, _)| k == label).count();
+            let prev = l.prev.clone();
+            let e = l.by_pred.entry(key).or_insert_with(|| Pred { ord, insts, ..Pred::default() });
+            match secs {
+                None => e.n_async += 1,
+                Some(s) => {
+                    let slot = match prev {
+                        None => None,
+                        Some((p, _)) if p != label => Some(&mut e.xclbin),
+                        Some((_, ps)) if ps != stream => Some(&mut e.restream),
+                        Some(_) => Some(&mut e.same),
+                    };
+                    if let Some((n, t)) = slot {
+                        *n += 1;
+                        *t += s;
+                    }
+                }
+            }
+
+            l.prev = Some((label.to_string(), stream));
             l.seq.push(label.to_string());
         })
     }
@@ -140,6 +187,38 @@ pub mod dispatch_log {
                 (ms_sw - ms_sa) * l.n_switched as f64 / 1e3,
                 100.0 * (ms_sw - ms_sa) * l.n_switched as f64 / 1e3 / total.max(1e-9)
             ));
+            // The same-xclbin bucket split by predecessor. Compare `same` against `restream` WITHIN
+            // one row: the work is identical there, so the difference is what reconfiguring the
+            // DMA/BD layer inside one hw_context costs. Comparing across rows measures GEMM size.
+            out.push(
+                "  same-xclbin dispatches by PREDECESSOR (mean ms; compare within a row -- across \
+                 rows the work differs):"
+                    .into(),
+            );
+            out.push(format!(
+                "    {:<30} {:>8}  {:>18}  {:>18}  {:>18}",
+                "xclbin#stream", "insts", "prev=same stream", "prev=other stream", "prev=other xclbin"
+            ));
+            let mut bs: Vec<_> = l.by_pred.iter().collect();
+            bs.sort_by_key(|((k, _), p)| (k.clone(), p.ord));
+            for ((k, stream), p) in bs {
+                let f = |(n, t): (usize, f64)| {
+                    if n == 0 {
+                        "         -    ".to_string()
+                    } else {
+                        format!("x{n:<5} {:>7.3}", t * 1e3 / n as f64)
+                    }
+                };
+                let a = if p.n_async > 0 { format!("  (+{} async)", p.n_async) } else { String::new() };
+                out.push(format!(
+                    "    {:<30} {:>8}  {:>18}  {:>18}  {:>18}{a}",
+                    format!("{k}#{}@0x{stream:x}", p.ord),
+                    p.insts,
+                    f(p.same),
+                    f(p.restream),
+                    f(p.xclbin),
+                ));
+            }
             out.push("  transitions (from -> to):".into());
             let mut ps: Vec<_> = l.pairs.iter().collect();
             ps.sort_by(|a, b| b.1.cmp(a.1));
@@ -638,7 +717,7 @@ impl Kernel {
                 self.ptr, opcode, instr.ptr, count, a.ptr, b.ptr, c.ptr, tmp.ptr, trace.ptr,
             )
         };
-        dispatch_log::note(&self.label, _t.elapsed().as_secs_f64());
+        dispatch_log::note(&self.label, instr.ptr as usize, count, Some(_t.elapsed().as_secs_f64()));
         if r != 0 {
             Err(format!("run_matmul8: {}", last_error()))
         } else {
@@ -661,7 +740,7 @@ impl Kernel {
         tmp: &Bo,
         trace: &Bo,
     ) -> Result<Run> {
-        dispatch_log::note(&self.label, 0.0);
+        dispatch_log::note(&self.label, instr.ptr as usize, count, None);
         let ptr = unsafe {
             shim_run_matmul8_start(
                 self.ptr, opcode, instr.ptr, count, a.ptr, b.ptr, c.ptr, tmp.ptr, trace.ptr,
@@ -688,7 +767,7 @@ impl Kernel {
         let r = unsafe {
             shim_run_dwconv6(self.ptr, opcode, instr.ptr, count, x.ptr, w.ptr, y.ptr)
         };
-        dispatch_log::note(&self.label, _t.elapsed().as_secs_f64());
+        dispatch_log::note(&self.label, instr.ptr as usize, count, Some(_t.elapsed().as_secs_f64()));
         if r != 0 {
             Err(format!("run_dwconv6: {}", last_error()))
         } else {
@@ -713,7 +792,7 @@ impl Kernel {
         let r = unsafe {
             shim_run_mha7(self.ptr, opcode, instr.ptr, count, q.ptr, k.ptr, v.ptr, o.ptr)
         };
-        dispatch_log::note(&self.label, _t.elapsed().as_secs_f64());
+        dispatch_log::note(&self.label, instr.ptr as usize, count, Some(_t.elapsed().as_secs_f64()));
         if r != 0 {
             Err(format!("run_mha: {}", last_error()))
         } else {
@@ -739,7 +818,7 @@ impl Kernel {
         let r = unsafe {
             shim_run_bd8(self.ptr, opcode, instr.ptr, count, qpv.ptr, p.ptr, k.ptr, v.ptr, ctx.ptr)
         };
-        dispatch_log::note(&self.label, _t.elapsed().as_secs_f64());
+        dispatch_log::note(&self.label, instr.ptr as usize, count, Some(_t.elapsed().as_secs_f64()));
         if r != 0 {
             Err(format!("run_bd_conveyor: {}", last_error()))
         } else {
@@ -998,6 +1077,13 @@ impl FusedArena {
 impl Bo {
     pub fn nbytes(&self) -> usize {
         self.nbytes
+    }
+
+    /// This BO's handle address, the same value [`dispatch_log`] keys an instruction stream on.
+    /// Lets a caller that knows what a stream MEANS print a line tying its own name to the
+    /// `xclbin#stream` rows in the dispatch report.
+    pub fn addr(&self) -> usize {
+        self.ptr as usize
     }
 
     /// A device-side sub-buffer view `[offset, offset+size)` of this BO, sharing its memory (no host
