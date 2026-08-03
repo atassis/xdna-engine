@@ -242,9 +242,16 @@ impl FastConformerEncoder {
     pub fn npu_stats_string(&self) -> Option<String> {
         self.npu.as_ref().map(|n| {
             let s = n.stats.borrow();
+            // ffn_* is the LEAF breakdown of resident_ffn (~90% of encoder NPU time). WALL-CLOCK
+            // spans, not a partition of `dispatch`: fc1/deint wrap one run_matmul8, but ln and fc2
+            // also carry host work, so the four sum slightly above `dispatch`. wprep/readback are
+            // HOST work that the ff_resident phase scope charges to Bucket::Npu.
+            // deint reads 0 while the fc1 fold is on (default) -- it is folded into fc1's drain.
             format!(
-                "npu breakdown: calls={} dispatches={} weight_load={:.2}s pack_a={:.2}s dispatch={:.2}s read={:.2}s accum={:.2}s",
-                s.calls, s.dispatches, s.weight_load_s, s.pack_a_s, s.dispatch_s, s.read_s, s.accum_s
+                "npu breakdown: calls={} dispatches={} weight_load={:.2}s pack_a={:.2}s dispatch={:.2}s read={:.2}s accum={:.2}s\n\
+                 ffn breakdown: ln={:.2}s fc1={:.2}s deint={:.2}s fc2={:.2}s | host wprep={:.2}s readback={:.2}s",
+                s.calls, s.dispatches, s.weight_load_s, s.pack_a_s, s.dispatch_s, s.read_s, s.accum_s,
+                s.ffn_ln_s, s.ffn_fc1_s, s.ffn_deint_s, s.ffn_fc2_s, s.ffn_weight_prep_s, s.ffn_readback_s
             )
         })
     }

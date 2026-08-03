@@ -159,6 +159,26 @@ pub struct NpuStats {
     pub accum_s: f64,
     pub calls: usize,
     pub dispatches: usize,
+    /// Per-stage LEAF breakdown of `resident_ffn`, which is ~90% of encoder NPU time and was only
+    /// ever visible as one aggregate. Disjoint in time, but READ THE UNITS: these are WALL-CLOCK
+    /// spans, not subsets of `dispatch_s`. `ffn_fc1_s` and `ffn_deint_s` wrap a single
+    /// `run_matmul8` and so are dispatch to within a few instructions, but `ffn_ln_s` spans
+    /// `ln_affine_cast` and `ffn_fc2_s` spans the whole fc2 K-split loop -- both include host work
+    /// (weight-cache lookups, sub-buffer setup, the f32 `acc +=`). Measured 2026-08-03: the four
+    /// sum to 8.20 s against a `dispatch_s` of 8.07 s, and that 0.13 s excess IS the host work
+    /// inside them. Do not treat the leaves as a partition of `dispatch_s`.
+    ///
+    /// Plain `Instant` rather than the `DispatchTimer` RAII on purpose: the guard borrows
+    /// `self.stats` at drop, and these regions straddle other `self.stats.borrow_mut()` calls,
+    /// which would panic with a double borrow.
+    pub ffn_ln_s: f64,
+    pub ffn_fc1_s: f64,
+    pub ffn_deint_s: f64,
+    pub ffn_fc2_s: f64,
+    /// HOST, not device: weight cache-miss packing, and the f32 readback + decode loop. Both sit
+    /// inside the ff_resident phase scope and were charged to `Bucket::Npu`.
+    pub ffn_weight_prep_s: f64,
+    pub ffn_readback_s: f64,
 }
 
 /// One pipeline slot: own A/C/tmp/trace so a dispatch in flight isn't clobbered while the host
@@ -2003,13 +2023,22 @@ impl NpuMatmul {
             return None;
         }
         let o = rl.fc1_panel_bf16.as_ref()?;
+        // This is the DEFAULT fc1 path, so the leaf breakdown has to charge it here -- the
+        // fc1/deint timers on the fallback branch never run while the fold is on, and reported 0.
+        // Timed outside the dtimer scope: that guard borrows self.stats at drop.
+        let t_fc1 = Instant::now();
         {
             let _dt = self.dtimer();
             o.kern
                 .run_matmul8(3, &o.instr, o.n, &rl.bo_bf16, w1, &o.bo_out, &o.dummy_tmp, &o.dummy_tr)
                 .unwrap();
         }
-        self.stats.borrow_mut().dispatches += 1; // fc1 only -- the deint is folded into its drain
+        let fc1_s = t_fc1.elapsed().as_secs_f64();
+        {
+            let mut s = self.stats.borrow_mut();
+            s.dispatches += 1; // fc1 only -- the deint is folded into its drain
+            s.ffn_fc1_s += fc1_s; // includes the folded deint, which no longer has its own dispatch
+        }
         Some(&o.bo_out)
     }
 
@@ -2039,8 +2068,12 @@ impl NpuMatmul {
     ) -> Array2<f32> {
         self.stats.borrow_mut().calls += 1;
         let m = x.nrows();
+        let t_ln = Instant::now();
         let rl = self.ln_affine_cast(x, gamma, beta); // bo_bf16 = affine_LN bf16 [PAD_M,KRES]
+        let ln_s = t_ln.elapsed().as_secs_f64();
+        self.stats.borrow_mut().ffn_ln_s += ln_s;
         // fc1: modal, A=bo_bf16, W1, on-chip SiLU -> st1.bo_c (f32 [PAD_M,DFF]) -- stays DEVICE
+        let t_wp = Instant::now();
         let w1 = {
             let c = self.wcache.borrow().get(id1).cloned();
             c.unwrap_or_else(|| {
@@ -2049,6 +2082,7 @@ impl NpuMatmul {
                 self.weight_bo(id1, w.view())
             })
         };
+        self.stats.borrow_mut().ffn_weight_prep_s += t_wp.elapsed().as_secs_f64();
         // fc1 -> chunk-major bf16. The fold (opt-in) does it in ONE dispatch; otherwise the shipped
         // fc1 + deint pair. `a_chunks` is the buffer the fc2 K-split sub-slices either way.
         let a_chunks: &Bo = match self.fc1_pack_in_drain(&rl, &w1) {
@@ -2057,12 +2091,20 @@ impl NpuMatmul {
                 let st1 = self.stream(DFF, Act::Silu); // fc1 on-chip SiLU iff modal (plain resident ignores it)
                 let t_fc1 = Instant::now();
                 self.kern.run_matmul8(3, &st1.instr, st1.n_instr, &rl.bo_bf16, &w1, &st1.bo_c, &self.bo_tmp, &self.bo_tr).unwrap();
-                self.stats.borrow_mut().dispatch_s += t_fc1.elapsed().as_secs_f64();
+                let fc1_s = t_fc1.elapsed().as_secs_f64();
+                {
+                    let mut s = self.stats.borrow_mut();
+                    s.dispatch_s += fc1_s;
+                    s.ffn_fc1_s += fc1_s;
+                }
                 // ONE-DISPATCH K=DFF fc2 (opt-in): cast@DFF -> K=DFF modal -> readback to host [m,KRES].
                 if self.fc2_k4096_on() {
                     if let Some(k4) = rl.fc2_k4096.as_ref() {
                         self.stats.borrow_mut().dispatches += 1; // fc1
                         let bo = self.fc2_k4096_dev(k4, &st1.bo_c, make_w2, id2);
+                        // HOST from here: sync, copy out, decode f32. Inside the ff_resident phase
+                        // scope this was charged to Bucket::Npu.
+                        let t_rb = Instant::now();
                         bo.sync_from_device().unwrap();
                         let mut cb = vec![0u8; m * KRES * 4];
                         bo.read_bytes(&mut cb).unwrap();
@@ -2073,6 +2115,7 @@ impl NpuMatmul {
                                 out[[r, c]] = f32::from_le_bytes([cb[off], cb[off + 1], cb[off + 2], cb[off + 3]]);
                             }
                         }
+                        self.stats.borrow_mut().ffn_readback_s += t_rb.elapsed().as_secs_f64();
                         return out;
                     }
                 }
@@ -2082,7 +2125,12 @@ impl NpuMatmul {
                 // modal (it works standalone) -- a multi-context n-D-DMA toolchain issue; see the debug note.
                 let t_deint = Instant::now();
                 rl.deint_kern.run_matmul8(3, &rl.deint_instr, rl.deint_n, &st1.bo_c, &rl.bo_deint, &rl.deint_c, &rl.deint_tmp, &rl.deint_tr).unwrap();
-                self.stats.borrow_mut().dispatch_s += t_deint.elapsed().as_secs_f64();
+                let deint_s = t_deint.elapsed().as_secs_f64();
+                {
+                    let mut s = self.stats.borrow_mut();
+                    s.dispatch_s += deint_s;
+                    s.ffn_deint_s += deint_s;
+                }
                 self.stats.borrow_mut().dispatches += 2; // fc1 + deint
                 &rl.bo_deint
             }
@@ -2100,6 +2148,7 @@ impl NpuMatmul {
             None
         };
         let mut acc = Array2::<f32>::zeros((m, KRES));
+        let t_fc2 = Instant::now();
         for c in 0..parts {
             let chunk = a_chunks.sub(c * chunk_bytes, chunk_bytes).unwrap();
             let sid = format!("{id2}.{c}");
@@ -2112,6 +2161,7 @@ impl NpuMatmul {
             };
             acc += &self.dispatch_with_a(&chunk, m, &w2c, KRES, false);
         }
+        self.stats.borrow_mut().ffn_fc2_s += t_fc2.elapsed().as_secs_f64();
         acc
     }
 
@@ -2142,10 +2192,20 @@ impl NpuMatmul {
                 let st1 = self.stream(DFF, Act::Silu); // fc1 on-chip SiLU iff modal (plain resident ignores it)
                 let t_fc1 = Instant::now();
                 self.kern.run_matmul8(3, &st1.instr, st1.n_instr, &rl.bo_bf16, &w1, &st1.bo_c, &self.bo_tmp, &self.bo_tr).unwrap();
-                self.stats.borrow_mut().dispatch_s += t_fc1.elapsed().as_secs_f64();
+                let fc1_s = t_fc1.elapsed().as_secs_f64();
+                {
+                    let mut s = self.stats.borrow_mut();
+                    s.dispatch_s += fc1_s;
+                    s.ffn_fc1_s += fc1_s;
+                }
                 let t_deint = Instant::now();
                 rl.deint_kern.run_matmul8(3, &rl.deint_instr, rl.deint_n, &st1.bo_c, &rl.bo_deint, &rl.deint_c, &rl.deint_tmp, &rl.deint_tr).unwrap();
-                self.stats.borrow_mut().dispatch_s += t_deint.elapsed().as_secs_f64();
+                let deint_s = t_deint.elapsed().as_secs_f64();
+                {
+                    let mut s = self.stats.borrow_mut();
+                    s.dispatch_s += deint_s;
+                    s.ffn_deint_s += deint_s;
+                }
                 self.stats.borrow_mut().dispatches += 2; // fc1 + deint
                 &rl.bo_deint
             }
@@ -2192,7 +2252,12 @@ impl NpuMatmul {
                 let st1 = self.stream(DFF, Act::Silu); // fc1 on-chip SiLU iff modal (plain resident ignores it)
                 let t_fc1 = Instant::now();
                 self.kern.run_matmul8(3, &st1.instr, st1.n_instr, &rl.bo_bf16, &w1, &st1.bo_c, &self.bo_tmp, &self.bo_tr).unwrap();
-                self.stats.borrow_mut().dispatch_s += t_fc1.elapsed().as_secs_f64();
+                let fc1_s = t_fc1.elapsed().as_secs_f64();
+                {
+                    let mut s = self.stats.borrow_mut();
+                    s.dispatch_s += fc1_s;
+                    s.ffn_fc1_s += fc1_s;
+                }
                 // ONE-DISPATCH fc2 (K=DFF): cast fc1's f32 [PAD_M,DFF] -> bf16 row-major, then a SINGLE K=DFF
                 // modal GEMM that accumulates all DFF K internally in L1 -> f32 [PAD_M,KRES] device. Collapses
                 // deint + 4x K=1024 GEMM + 4x acc_add (8 dispatches) into cast + 1 modal (2). NOT bit-identical
@@ -2206,7 +2271,12 @@ impl NpuMatmul {
                 // deinterleave+cast: st1.bo_c (f32 [PAD_M,DFF]) -> rl.bo_deint (bf16 chunk-major), device-side.
                 let t_deint = Instant::now();
                 rl.deint_kern.run_matmul8(3, &rl.deint_instr, rl.deint_n, &st1.bo_c, &rl.bo_deint, &rl.deint_c, &rl.deint_tmp, &rl.deint_tr).unwrap();
-                self.stats.borrow_mut().dispatch_s += t_deint.elapsed().as_secs_f64();
+                let deint_s = t_deint.elapsed().as_secs_f64();
+                {
+                    let mut s = self.stats.borrow_mut();
+                    s.dispatch_s += deint_s;
+                    s.ffn_deint_s += deint_s;
+                }
                 self.stats.borrow_mut().dispatches += 2; // fc1 + deint
                 &rl.bo_deint
             }
