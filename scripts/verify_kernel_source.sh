@@ -31,6 +31,7 @@
 #     FindPeano lane 2026-07-30: a Peano `clang`/`clang++` embeds its own build SHA in
 #     `--version`'s VCS banner (LLVM_REPOSITORY/LLVM_REVISION, clang/lib/Basic/Version.cpp), e.g.
 #       clang version 21.0.0git (https://github.com/Xilinx/llvm-aie.git dfadd0855266e8898cd675c2eba2ea0df32baa9f)
+#       clang version 21.0.0git (git@github.com:atassis/llvm-aie.git 0c8fe2df9d36aaa1ba4666f5f3721397701aa8a8)
 #     confirmed to match toolchain.lock's PEANO_FORK_COMMIT exactly on the pinned install. Kernel
 #     SOURCE and COMPILER IDENTITY are independent failure axes -- correct source through a wrong
 #     or unresolved compiler is just as silent a miscompile as wrong source through the right
@@ -77,6 +78,44 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"; cd "$REPO"
 
 MMW=mlir-aie/programming_examples/basic/matrix_multiplication/whole_array
 RB_KERNELS=route_b_kernels/aie_kernels
+# The TRACKED originals of the Makefiles sync_kernels.sh copies into $MMW. Ground truth for the
+# sandbox copies, which are untracked inside the submodule working tree.
+RB_MAKEFILES=route_b_kernels/whole_array_fused
+
+# Transitive closure of quoted `#include "..."` starting from the Makefile's declared prerequisites,
+# printed one relative path per line (input order first, then discovered).
+#
+# Quoted includes resolve relative to the INCLUDING file's own directory, which is what this walks.
+# Angle-bracket includes are toolchain headers -- they come from the pinned instance and are covered
+# by the KERNEL_CC identity axis, not by hashing files in kernels_dir. A quoted include that does not
+# resolve under kernels_dir is likewise found via -I in the toolchain, so it is skipped rather than
+# failed: a gate that cries wolf on legitimate toolchain headers gets switched off, and this one has
+# to survive being run on every build.
+include_closure() {
+  local kdir="$1"; shift
+  local -a work=("$@")
+  local -A seen=()
+  local rel path base inc next
+  while [ ${#work[@]} -gt 0 ]; do
+    rel="${work[0]}"; work=("${work[@]:1}")
+    [ -n "${seen[$rel]:-}" ] && continue
+    seen[$rel]=1
+    printf '%s\n' "$rel"
+    path="$kdir/$rel"
+    [ -f "$path" ] || continue      # missing declared file: the caller's existence check reports it
+    base="$(dirname "$rel")"
+    while IFS= read -r inc; do
+      [ -n "$inc" ] || continue
+      if [ "$base" = "." ]; then next="$inc"; else next="$base/$inc"; fi
+      # Normalise ./ and ../ so the same file cannot enter the set under two spellings.
+      next="$(realpath -m --relative-to="$kdir" "$kdir/$next" 2>/dev/null || printf '%s' "$next")"
+      case "$next" in
+        ../*|/*) continue ;;        # escapes kernels_dir -> not our ground truth
+      esac
+      [ -f "$kdir/$next" ] && work+=("$next")
+    done < <(grep -oP '^\s*#\s*include\s+"\K[^"]+' "$path" 2>/dev/null || true)
+  done
+}
 
 family=("$@")
 [ ${#family[@]} -gt 0 ] || family=(Makefile.modal Makefile.modal.int8 Makefile.resident)
@@ -128,6 +167,29 @@ for mk in "${family[@]}"; do
     fail=1; continue
   fi
 
+  # HOLE 1 (closed): this Makefile is an untracked `cp` target INSIDE the mlir-aie submodule working
+  # tree -- invisible to `git status` in both the outer repo and the submodule. Checking only that it
+  # EXISTS anchored the entire gate (kernels_dir, KERNEL_CC, the prerequisite list) on a file that
+  # could be stale or hand-edited with no trail anywhere, so the gate would report green fast and
+  # consistently against a drifted world. That is the tool's own failure class pointed at itself: a
+  # gate whose ground truth is untracked has MOVED the drift, not removed it.
+  canon="$RB_MAKEFILES/$mk"
+  if [ ! -f "$canon" ]; then
+    echo "[verify_kernel_source] FAIL: $mk has no canonical source at $canon -- cannot establish that the sandbox copy is current" >&2
+    fail=1; continue
+  fi
+  if ! cmp -s "$canon" "$mkpath"; then
+    echo "[verify_kernel_source] FAIL $mk: the sandbox copy differs from its canonical source
+    sandbox   $mkpath   sha256=$(sha256sum "$mkpath" | cut -d' ' -f1)
+    canonical $canon   sha256=$(sha256sum "$canon" | cut -d' ' -f1)
+  Everything below is resolved THROUGH this file (kernels_dir, KERNEL_CC, which .cc files are
+  prerequisites), so a stale or hand-edited copy silently narrows what the gate checks. FIX:
+  re-run scripts/sync_kernels.sh; if the sandbox copy is the one you meant to change, edit
+  $canon instead -- it is the tracked one." >&2
+    fail=1; continue
+  fi
+  manifest_lines+=("$mk makefile $(sha256sum "$canon" | cut -d' ' -f1)")
+
   if ! vars_out="$(resolve_make_vars "$mk")"; then
     echo "[verify_kernel_source] FAIL: make itself failed resolving kernels_dir/KERNEL_CC for $mk:" >&2
     echo "$vars_out" >&2
@@ -151,7 +213,12 @@ for mk in "${family[@]}"; do
     fail=1
   else
     cc_ver="$("$cc_raw" --version 2>/dev/null | head -1)"
-    cc_sha="$(grep -oP '\(https://\S+\.git \K[0-9a-f]{40}(?=\))' <<<"$cc_ver" || true)"
+    # Any remote spelling, not just https://. The banner records whatever URL the build used, and
+    # the ACTIVE Peano is a local build of a fork cloned over SSH -- `(git@github.com:atassis/
+    # llvm-aie.git <sha>)`. The old https-only pattern therefore matched nothing and the gate FAILED
+    # on a correctly-pinned toolchain, which is a false positive that gets a gate switched off. The
+    # SHA is what we compare; the URL is not evidence of anything.
+    cc_sha="$(grep -oP '\(\S+ \K[0-9a-f]{40}(?=\))' <<<"$cc_ver" || true)"
     if [ -z "$cc_sha" ]; then
       echo "[verify_kernel_source] FAIL $mk: KERNEL_CC=$cc_raw produced no VCS/SHA provenance banner (--version: \"$cc_ver\") -- this is not (or no longer looks like) the pinned Peano fork clang; llc/opt/llvm-ar never carry this banner, only clang/clang++ do, so an empty result here means the wrong binary, not the wrong tool." >&2
       fail=1
@@ -172,11 +239,15 @@ for mk in "${family[@]}"; do
     fi
   fi
 
-  mapfile -t srcs < <(grep -oP '\$\{kernels_dir\}/\K[A-Za-z0-9_./]+\.cc' "$mkpath" | sort -u)
-  if [ ${#srcs[@]} -eq 0 ]; then
+  mapfile -t declared < <(grep -oP '\$\{kernels_dir\}/\K[A-Za-z0-9_./]+\.cc' "$mkpath" | sort -u)
+  if [ ${#declared[@]} -eq 0 ]; then
     echo "[verify_kernel_source] FAIL: $mk declares no \${kernels_dir}/*.cc prerequisite -- Makefile shape changed, nothing to verify against" >&2
     fail=1; continue
   fi
+  # HOLE 2 (closed): the Makefile NAMES prerequisites, but the compiler READS the transitive closure.
+  # `mm.cc` does `#include "zero.cc"`, which appeared in no prerequisite list, so the entire
+  # modal/resident family could report green while zero.cc drifted and changed every compiled object.
+  mapfile -t srcs < <(include_closure "$kdir" "${declared[@]}")
 
   for f in "${srcs[@]}"; do
     checked=$((checked + 1))
