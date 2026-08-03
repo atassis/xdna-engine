@@ -66,6 +66,13 @@ endif
 
 include ${srcdir}/../makefile-common
 
+# Re-supply the aiecc-from-MLIR flow that the blessed instance's new makefile-common dropped, exactly
+# as Makefile.modal already does. Without it, makefile-common drives compile THROUGH the generator
+# with --use-chess/--xclbin-path/--insts-path, which this generator (still print-MLIR, two-step)
+# rejects -- so every silu build dies at "unrecognized arguments" before any device work.
+# This is also where kernels_dir / KERNEL_CC / KERNEL_CFLAGS come from; the objects below need them.
+include ${srcdir}/../../../../../route_b_kernels/whole_array_fused/route_b_override.mk
+
 # matmul object: bf16 in, f32 acc.
 build/mm_${m}x${k}x${n}.o: ${kernels_dir}/mm.cc
 	mkdir -p ${@D}

@@ -10,6 +10,9 @@ export PEANO_INSTALL_DIR="$REPO/.venv-iron/lib/python3.14/site-packages/llvm-aie
 export PATH="$REPO/.venv-iron/bin:$PATH"   # make's `python3` = venv python (deps: ml_dtypes etc.)...
 export PYTHONPATH="$INST/python:${PYTHONPATH:-}"   # ...while `aie` resolves to the fork instance (place-tiles)
 export AIECC_PATH="$INST/bin/aiecc"
+export MLIR_AIE_INSTANCE="$INST"   # route_b_override.mk hard-requires this; without it the gate
+                                   # dies in make before compiling anything, which reads as a
+                                   # toolchain failure rather than the missing export it is.
 MMW="$REPO/mlir-aie/programming_examples/basic/matrix_multiplication/whole_array"
 cp "$REPO/route_b_kernels/whole_array_fused/whole_array_modal_iron.py" "$MMW/"   # bare-resolve_program generator
 cp "$REPO/route_b_kernels/whole_array_fused/Makefile.modal" "$MMW/"

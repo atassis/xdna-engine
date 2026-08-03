@@ -50,6 +50,12 @@ EPI_DEFINES=-DDIM_M=${m} -DDIM_N=${n} -DDIM_R=4 -DDIM_T=8
 
 include ${srcdir}/../makefile-common
 
+# Same re-supply Makefile.modal/Makefile.silu carry: the blessed instance's makefile-common
+# drives compile THROUGH the generator (--use-chess/--xclbin-path/--insts-path), which this
+# print-MLIR generator rejects, and it is also where kernels_dir / KERNEL_CC / KERNEL_CFLAGS
+# come from. Without it every build dies at "unrecognized arguments".
+include ${srcdir}/../../../../../route_b_kernels/whole_array_fused/route_b_override.mk
+
 build/mm_${m}x${k}x${n}.o: ${kernels_dir}/mm.cc
 	mkdir -p ${@D}
 	cd ${@D} && ${KERNEL_CC} ${KERNEL_CFLAGS} ${MM_DEFINES} ${KERNEL_DEFINES} -c $< -o ${@F}
