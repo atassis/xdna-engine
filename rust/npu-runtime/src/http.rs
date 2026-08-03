@@ -10,7 +10,7 @@ use std::time::Duration;
 use crate::actor::Handle;
 use crate::config::{Config, ModelCfg};
 use crate::registry::{LoadState, ModelStatus};
-use npu_engine::capability::Capability;
+use npu_engine::capability::{Capability, Request as EngineReq, Response as EngineResp};
 
 const MAX_BODY: usize = 16 * 1024 * 1024;
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(60);
@@ -23,8 +23,39 @@ pub struct Request {
     pub body: Vec<u8>,
 }
 
-/// (status code, JSON body).
-pub type Response = (u16, String);
+/// A response body. Not always JSON: `/v1/audio/speech` returns audio bytes, the same way OpenAI's
+/// does, so the body cannot be a `String`.
+#[derive(Debug, PartialEq)]
+pub enum Body {
+    Json(String),
+    Wav(Vec<u8>),
+}
+
+impl Body {
+    /// The body as text -- the JSON for a JSON body, empty for audio. For tests and logging.
+    pub fn text(&self) -> &str {
+        match self { Body::Json(s) => s, Body::Wav(_) => "" }
+    }
+    pub fn content_type(&self) -> &'static str {
+        match self { Body::Json(_) => "application/json", Body::Wav(_) => "audio/wav" }
+    }
+    pub fn bytes(&self) -> &[u8] {
+        match self { Body::Json(s) => s.as_bytes(), Body::Wav(v) => v }
+    }
+}
+impl std::fmt::Display for Body {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Body::Json(s) => f.write_str(s),
+            Body::Wav(v) => write!(f, "<{} bytes of audio/wav>", v.len()),
+        }
+    }
+}
+impl From<String> for Body { fn from(s: String) -> Body { Body::Json(s) } }
+impl From<&str> for Body { fn from(s: &str) -> Body { Body::Json(s.to_string()) } }
+
+/// (status code, body).
+pub type Response = (u16, Body);
 
 /// Pure routing decision. Mutating admin routes load/edit/save the config at `cfg_path` then ask the
 /// actor to reconcile. No socket here -> unit-testable with a mock-backed Handle.
@@ -34,12 +65,12 @@ pub fn route(req: &Request, handle: &Handle, cfg_path: &Path) -> Response {
         ("GET", "/healthz") => {
             let npu = npu_engine::Engine::available();
             let n = handle.status().iter().filter(|s| s.state == LoadState::Loaded).count();
-            (200, format!("{{\"ok\":true,\"npu\":{npu},\"loaded\":{n}}}"))
+            (200, format!("{{\"ok\":true,\"npu\":{npu},\"loaded\":{n}}}").into())
         }
-        ("GET", "/v1/models") => (200, models_json(&handle.status())),
-        ("POST", "/v1/chat/completions") =>
-            (501, "{\"error\":\"not implemented: LLM decode track pending\"}".into()),
+        ("GET", "/v1/models") => (200, models_json(&handle.status()).into()),
+        ("POST", "/v1/chat/completions") => chat_completions(req, handle),
         ("POST", "/v1/embeddings") => embeddings(req, handle),
+        ("POST", "/v1/audio/speech") => audio_speech(req, handle),
         ("POST", "/v1/audio/transcriptions") => transcriptions(req, handle),
         ("POST", "/admin/reload") => admin_reload(handle, cfg_path),
         ("POST", "/admin/models") => admin_add_model(req, handle, cfg_path),
@@ -69,13 +100,74 @@ pub fn models_json(status: &[ModelStatus]) -> String {
     format!("{{\"object\":\"list\",\"data\":[{data}]}}")
 }
 
+/// Map an engine error onto a status code. `NoModel` is 503, not 400: nothing is wrong with the
+/// request -- the server has no model for that capability, and a client cannot fix it by retrying
+/// differently. This is what `/v1/chat/completions` and `/v1/audio/speech` answer today, since no
+/// generate or tts model is configured yet; both routes are otherwise complete.
+fn engine_err(e: &npu_engine::EngineError) -> Response {
+    let code = match e {
+        npu_engine::EngineError::NoModel(_) | npu_engine::EngineError::NotAvailable => 503,
+        npu_engine::EngineError::WrongKind { .. } | npu_engine::EngineError::Unsupported(_) => 400,
+        npu_engine::EngineError::Load(_) | npu_engine::EngineError::Device(_) => 500,
+    };
+    (code, format!("{{\"error\":\"{}\"}}", parse::json_escape(&e.to_string())).into())
+}
+
+/// OpenAI chat completions. Serves `Capability::GENERATE`; the prompt is the last message's content,
+/// which is what a single-turn client sends and all any current model could use.
+fn chat_completions(req: &Request, handle: &Handle) -> Response {
+    let body = String::from_utf8_lossy(&req.body).to_string();
+    let model = extract_str_field(&body, "model");
+    let prompt = match parse::parse_last_message(&body) {
+        Ok(p) => p,
+        Err(e) => return (400, format!("{{\"error\":\"{}\"}}", parse::json_escape(&e)).into()),
+    };
+    let served = match handle.serve(Capability::GENERATE, model.as_deref(), EngineReq::Text(prompt)) {
+        Ok(s) => s,
+        Err(e) => return engine_err(&e),
+    };
+    match served.value {
+        EngineResp::Text(text) => (200, format!(
+            "{{\"object\":\"chat.completion\",\"model\":\"{}\",\"choices\":[{{\"index\":0,\
+             \"message\":{{\"role\":\"assistant\",\"content\":\"{}\"}},\"finish_reason\":\"stop\"}}]}}",
+            parse::json_escape(&served.model), parse::json_escape(&text)).into()),
+        other => (500, format!("{{\"error\":\"{} returned a {} response\"}}",
+            parse::json_escape(&served.model), other.shape()).into()),
+    }
+}
+
+/// OpenAI speech synthesis. Serves `Capability::TTS` and returns audio bytes, not JSON.
+///
+/// `voice` is accepted and currently ignored: no model resolves one yet, and silently accepting a
+/// field that does nothing is better than rejecting requests a real client sends.
+fn audio_speech(req: &Request, handle: &Handle) -> Response {
+    let body = String::from_utf8_lossy(&req.body).to_string();
+    let model = extract_str_field(&body, "model");
+    let input = match parse::parse_inputs(&body) {
+        Ok(v) => match v.into_iter().next() {
+            Some(t) => t,
+            None => return (400, "{\"error\":\"input is empty\"}".into()),
+        },
+        Err(e) => return (400, format!("{{\"error\":\"{}\"}}", parse::json_escape(&e)).into()),
+    };
+    let served = match handle.serve(Capability::TTS, model.as_deref(), EngineReq::Text(input)) {
+        Ok(s) => s,
+        Err(e) => return engine_err(&e),
+    };
+    match served.value {
+        EngineResp::Audio { pcm, sample_rate } => (200, Body::Wav(parse::wav_from_i16(&pcm, sample_rate))),
+        other => (500, format!("{{\"error\":\"{} returned a {} response\"}}",
+            parse::json_escape(&served.model), other.shape()).into()),
+    }
+}
+
 fn embeddings(req: &Request, handle: &Handle) -> Response {
     let body = String::from_utf8_lossy(&req.body).to_string();
     let model = extract_str_field(&body, "model");
     let inputs = match parse::parse_inputs(&body) {
         Ok(v) if v.is_empty() => return (400, "{\"error\":\"input is empty\"}".into()),
         Ok(v) => v,
-        Err(e) => return (400, format!("{{\"error\":\"{}\"}}", parse::json_escape(&e))),
+        Err(e) => return (400, format!("{{\"error\":\"{}\"}}", parse::json_escape(&e)).into()),
     };
     let mut data = String::new();
     let mut served = String::new();
@@ -87,10 +179,10 @@ fn embeddings(req: &Request, handle: &Handle) -> Response {
                 if i > 0 { data.push(','); }
                 data.push_str(&format!("{{\"object\":\"embedding\",\"index\":{i},\"embedding\":[{arr}]}}"));
             }
-            Err(e) => return (400, format!("{{\"error\":\"{}\"}}", parse::json_escape(&e.to_string()))),
+            Err(e) => return (400, format!("{{\"error\":\"{}\"}}", parse::json_escape(&e.to_string())).into()),
         }
     }
-    (200, format!("{{\"object\":\"list\",\"data\":[{data}],\"model\":\"{}\"}}", parse::json_escape(&served)))
+    (200, format!("{{\"object\":\"list\",\"data\":[{data}],\"model\":\"{}\"}}", parse::json_escape(&served)).into())
 }
 
 fn transcriptions(req: &Request, handle: &Handle) -> Response {
@@ -107,8 +199,8 @@ fn transcriptions(req: &Request, handle: &Handle) -> Response {
     let model = parse::extract_form_field(&req.body, &req.boundary, "model");
     match handle.transcribe(model.as_deref(), samples, 16_000) {
         Ok(s) => (200, format!("{{\"text\":\"{}\",\"model\":\"{}\"}}",
-            parse::json_escape(&s.value), parse::json_escape(&s.model))),
-        Err(e) => (500, format!("{{\"error\":\"{}\"}}", parse::json_escape(&e.to_string()))),
+            parse::json_escape(&s.value), parse::json_escape(&s.model)).into()),
+        Err(e) => engine_err(&e),
     }
 }
 
@@ -116,10 +208,10 @@ fn admin_reload(handle: &Handle, cfg_path: &Path) -> Response {
     match Config::load(cfg_path) {
         Ok(cfg) => match handle.reconcile(cfg) {
             Ok(rep) => (200, format!("{{\"loaded\":{},\"unloaded\":{},\"failed\":{},\"deferred\":{}}}",
-                rep.loaded.len(), rep.unloaded.len(), rep.failed.len(), rep.deferred.len())),
-            Err(e) => (500, format!("{{\"error\":\"{}\"}}", parse::json_escape(&e.to_string()))),
+                rep.loaded.len(), rep.unloaded.len(), rep.failed.len(), rep.deferred.len()).into()),
+            Err(e) => engine_err(&e),
         },
-        Err(e) => (400, format!("{{\"error\":\"{}\"}}", parse::json_escape(&e))),
+        Err(e) => (400, format!("{{\"error\":\"{}\"}}", parse::json_escape(&e)).into()),
     }
 }
 
@@ -150,19 +242,19 @@ fn admin_set_default(req: &Request, handle: &Handle, cfg_path: &Path) -> Respons
     // dropped anything that was not asr/embed, so `/admin/defaults` reported 200 and changed nothing.
     let cap = match Capability::from_name(&cap) {
         Some(c) => c,
-        None => return (400, format!("{{\"error\":\"unknown capability {}\"}}", parse::json_escape(&cap))),
+        None => return (400, format!("{{\"error\":\"unknown capability {}\"}}", parse::json_escape(&cap)).into()),
     };
     mutate_and_reconcile(handle, cfg_path, |cfg| cfg.defaults.set(cap, model.clone()))
 }
 
 fn mutate_and_reconcile(handle: &Handle, cfg_path: &Path, f: impl FnOnce(&mut Config)) -> Response {
-    let mut cfg = match Config::load(cfg_path) { Ok(c) => c, Err(e) => return (400, format!("{{\"error\":\"{}\"}}", parse::json_escape(&e))) };
+    let mut cfg = match Config::load(cfg_path) { Ok(c) => c, Err(e) => return (400, format!("{{\"error\":\"{}\"}}", parse::json_escape(&e)).into()) };
     f(&mut cfg);
-    if let Err(e) = cfg.save(cfg_path) { return (500, format!("{{\"error\":\"{}\"}}", parse::json_escape(&e))); }
+    if let Err(e) = cfg.save(cfg_path) { return (500, format!("{{\"error\":\"{}\"}}", parse::json_escape(&e)).into()); }
     match handle.reconcile(cfg) {
         Ok(rep) => (200, format!("{{\"loaded\":{},\"unloaded\":{},\"failed\":{},\"deferred\":{}}}",
-            rep.loaded.len(), rep.unloaded.len(), rep.failed.len(), rep.deferred.len())),
-        Err(e) => (500, format!("{{\"error\":\"{}\"}}", parse::json_escape(&e.to_string()))),
+            rep.loaded.len(), rep.unloaded.len(), rep.failed.len(), rep.deferred.len()).into()),
+        Err(e) => engine_err(&e),
     }
 }
 
@@ -213,7 +305,7 @@ fn handle_conn(mut stream: TcpStream, handle: &Handle, cfg_path: &Path) -> std::
             if let Some(idx) = l.find("boundary=") { boundary = h[idx + "boundary=".len()..].trim().trim_matches('"').to_string(); }
         }
     }
-    if content_len > MAX_BODY { return respond(&mut stream, 413, "{\"error\":\"too large\"}"); }
+    if content_len > MAX_BODY { return respond(&mut stream, 413, &"{\"error\":\"too large\"}".into()); }
     let mut body = vec![0u8; content_len];
     reader.read_exact(&mut body)?;
     let req = Request { method, path, boundary, body };
@@ -221,15 +313,19 @@ fn handle_conn(mut stream: TcpStream, handle: &Handle, cfg_path: &Path) -> std::
     respond(&mut stream, code, &body)
 }
 
-fn respond(stream: &mut TcpStream, code: u16, body: &str) -> std::io::Result<()> {
+fn respond(stream: &mut TcpStream, code: u16, body: &Body) -> std::io::Result<()> {
     let reason = match code {
         200 => "OK", 400 => "Bad Request", 404 => "Not Found", 413 => "Payload Too Large",
-        500 => "Internal Server Error", 501 => "Not Implemented", _ => "Error",
+        500 => "Internal Server Error", 501 => "Not Implemented", 503 => "Service Unavailable",
+        _ => "Error",
     };
-    let resp = format!(
-        "HTTP/1.1 {code} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.as_bytes().len());
-    stream.write_all(resp.as_bytes())?;
+    let data = body.bytes();
+    // Header and body are written separately because the body is not always UTF-8 (audio/wav).
+    let head = format!(
+        "HTTP/1.1 {code} {reason}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.content_type(), data.len());
+    stream.write_all(head.as_bytes())?;
+    stream.write_all(data)?;
     stream.flush()
 }
 
@@ -344,6 +440,61 @@ pub mod parse {
         if !(0xDC00..0xE000).contains(&lo) { return Err("high surrogate not followed by a low one".into()); }
         let cp = 0x10000 + (((hi - 0xD800) as u32) << 10) + (lo - 0xDC00) as u32;
         Ok((char::from_u32(cp).ok_or("invalid surrogate pair")?, i + 10))
+    }
+
+    /// The `content` of the LAST message in a chat-completions body.
+    ///
+    /// Scans string literals the same way `parse_inputs` does, so a `"content"` appearing inside
+    /// message text is not mistaken for the key. Takes the last occurrence because that is the new
+    /// turn; earlier ones are history no current model consumes.
+    pub fn parse_last_message(body: &str) -> Result<String, String> {
+        let b = body.as_bytes();
+        let (mut i, mut last) = (0usize, None);
+        while i < b.len() {
+            if b[i] != b'"' { i += 1; continue; }
+            let (key, after) = scan_json_string(body, i)?;
+            let mut j = after;
+            while j < b.len() && b[j].is_ascii_whitespace() { j += 1; }
+            if j < b.len() && b[j] == b':' {
+                if key == "content" {
+                    let mut k = j + 1;
+                    while k < b.len() && b[k].is_ascii_whitespace() { k += 1; }
+                    // A non-string content (OpenAI's multi-part array form) is not something any
+                    // model here can consume; skip it rather than guess at a flattening.
+                    if b.get(k) == Some(&b'"') {
+                        let (v, n) = scan_json_string(body, k)?;
+                        last = Some(v);
+                        i = n;
+                        continue;
+                    }
+                }
+                i = j + 1;
+            } else {
+                i = after;
+            }
+        }
+        last.ok_or_else(|| "no message with string content".to_string())
+    }
+
+    /// Wrap mono i16 PCM in a 44-byte canonical WAV header. The rate comes from the model, not a
+    /// constant: TTS does not output at the 16 kHz the ASR side works in.
+    pub fn wav_from_i16(pcm: &[i16], sample_rate: u32) -> Vec<u8> {
+        let data_len = (pcm.len() * 2) as u32;
+        let mut w = Vec::with_capacity(44 + data_len as usize);
+        w.extend_from_slice(b"RIFF");
+        w.extend_from_slice(&(36 + data_len).to_le_bytes());
+        w.extend_from_slice(b"WAVEfmt ");
+        w.extend_from_slice(&16u32.to_le_bytes());            // PCM fmt chunk size
+        w.extend_from_slice(&1u16.to_le_bytes());             // format = PCM
+        w.extend_from_slice(&1u16.to_le_bytes());             // channels = mono
+        w.extend_from_slice(&sample_rate.to_le_bytes());
+        w.extend_from_slice(&(sample_rate * 2).to_le_bytes()); // byte rate = rate * blockalign
+        w.extend_from_slice(&2u16.to_le_bytes());             // block align = channels * 2
+        w.extend_from_slice(&16u16.to_le_bytes());            // bits per sample
+        w.extend_from_slice(b"data");
+        w.extend_from_slice(&data_len.to_le_bytes());
+        for s in pcm { w.extend_from_slice(&s.to_le_bytes()); }
+        w
     }
 
     fn hex4(b: &[u8], i: usize) -> Result<u16, String> {
@@ -576,20 +727,76 @@ mod route_tests {
         assert_eq!(route(&get("/healthz"), &h, &p).0, 200);
         let (code, body) = route(&get("/v1/models"), &h, &p);
         assert_eq!(code, 200);
-        assert!(body.contains("\"id\":\"bge\"") && body.contains("\"state\":\"loaded\""));
+        assert!(body.text().contains("\"id\":\"bge\"") && body.text().contains("\"state\":\"loaded\""));
         // A resident model reports how long it has been idle, so a swap is observable from outside.
-        assert!(body.contains("\"idle_s\":0"), "{body}");
-        assert_eq!(route(&post("/v1/chat/completions", "{}"), &h, &p).0, 501);
+        assert!(body.text().contains("\"idle_s\":0"), "{body}");
         assert_eq!(route(&get("/nope"), &h, &p).0, 404);
-        assert_eq!(route(&get("/health"), &h, &p), (200, "{\"status\":\"ok\"}".to_string()));
+        assert_eq!(route(&get("/health"), &h, &p).1.text(), "{\"status\":\"ok\"}");
         h.shutdown(); j.join().unwrap();
     }
+    /// Both new routes resolve a capability through the rail. With no generate or tts model
+    /// configured they answer 503 (a server-configuration fact) rather than the old hardcoded 501,
+    /// and rather than 400, which would blame the client for the server having no model.
+    #[test]
+    fn chat_and_speech_report_no_model_as_503() {
+        let (h, j, _d, p) = mock_handle();
+        let (code, body) = route(&post("/v1/chat/completions",
+            r#"{"messages":[{"role":"user","content":"hi"}]}"#), &h, &p);
+        assert_eq!(code, 503, "{body}");
+        assert!(body.text().contains("no generate model configured"), "{body}");
+        let (code, body) = route(&post("/v1/audio/speech", r#"{"input":"hi"}"#), &h, &p);
+        assert_eq!(code, 503, "{body}");
+        assert!(body.text().contains("no tts model configured"), "{body}");
+        // A malformed body is still the client's fault, and is distinguished from the above.
+        assert_eq!(route(&post("/v1/chat/completions", "{}"), &h, &p).0, 400);
+        assert_eq!(route(&post("/v1/audio/speech", "{}"), &h, &p).0, 400);
+        h.shutdown(); j.join().unwrap();
+    }
+
+    /// The same two routes against models that DO declare the capabilities: the rail carries them
+    /// end to end, and speech comes back as audio bytes rather than JSON.
+    #[test]
+    fn chat_and_speech_serve_when_a_model_declares_the_capability() {
+        let mut t = BTreeMap::new();
+        t.insert("llm".to_string(), Ok((Capability::GENERATE, 1)));
+        t.insert("tts".to_string(), Ok((Capability::TTS, 1)));
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("engine.toml");
+        let cfg = Config {
+            server: ServerCfg { max_resident: 2, idle_unload_s: 0, ..Default::default() },
+            models: vec![
+                ModelCfg { name: "llm".into(), scenario: "x".into() },
+                ModelCfg { name: "tts".into(), scenario: "y".into() },
+            ],
+            ..Default::default()
+        };
+        cfg.save(&p).unwrap();
+        let (h, j) = start(cfg, Box::new(MockLoader { table: t })).unwrap();
+
+        let (code, body) = route(&post("/v1/chat/completions",
+            r#"{"messages":[{"role":"system","content":"be brief"},{"role":"user","content":"hi"}]}"#), &h, &p);
+        assert_eq!(code, 200, "{body}");
+        assert!(body.text().contains("\"content\":\"mock-completion\""), "{body}");
+        assert!(body.text().contains("\"model\":\"llm\""), "{body}");
+
+        let (code, body) = route(&post("/v1/audio/speech", r#"{"input":"hello"}"#), &h, &p);
+        assert_eq!(code, 200, "{body}");
+        assert_eq!(body.content_type(), "audio/wav");
+        let wav = body.bytes();
+        assert_eq!(&wav[..4], b"RIFF");
+        // The mock speaks at 24 kHz; the header must carry the model's rate, not a 16 kHz constant.
+        assert_eq!(u32::from_le_bytes([wav[24], wav[25], wav[26], wav[27]]), 24_000);
+        assert_eq!(parse::parse_wav_i16(wav).map(|v| v.len()), None,
+            "parse_wav_i16 only accepts the 16 kHz ASR shape, so it must reject 24 kHz speech");
+        h.shutdown(); j.join().unwrap();
+    }
+
     #[test]
     fn embeddings_echoes_model() {
         let (h, j, _d, p) = mock_handle();
         let (code, body) = route(&post("/v1/embeddings", r#"{"input":"hi"}"#), &h, &p);
         assert_eq!(code, 200);
-        assert!(body.contains("\"model\":\"bge\""), "{body}");
+        assert!(body.text().contains("\"model\":\"bge\""), "{body}");
         h.shutdown(); j.join().unwrap();
     }
     #[test]
@@ -598,7 +805,7 @@ mod route_tests {
         let (code, _) = route(&post("/admin/models", r#"{"name":"c","scenario":"z.toml"}"#), &h, &p);
         assert_eq!(code, 200);
         let (_, body) = route(&get("/v1/models"), &h, &p);
-        assert!(body.contains("\"id\":\"c\""), "added model missing: {body}");
+        assert!(body.text().contains("\"id\":\"c\""), "added model missing: {body}");
         // and it persisted to the config file
         let cfg = Config::load(&p).unwrap();
         assert!(cfg.find("c").is_some());
@@ -625,10 +832,10 @@ mod route_tests {
         let (h, j) = start(cfg, Box::new(MockLoader { table: t })).unwrap();
         let (code, body) = route(&post("/v1/embeddings", r#"{"model":"e5","input":"hi"}"#), &h, &p);
         assert_eq!(code, 200, "{body}");
-        assert!(body.contains("\"model\":\"e5\""), "{body}");
+        assert!(body.text().contains("\"model\":\"e5\""), "{body}");
         let (_, models) = route(&get("/v1/models"), &h, &p);
-        assert!(models.contains("\"id\":\"e5\",\"object\":\"model\",\"kind\":\"embed\",\"state\":\"loaded\""), "{models}");
-        assert!(models.contains("\"idle_s\":null"), "the evicted model reports no idle time: {models}");
+        assert!(models.text().contains("\"id\":\"e5\",\"object\":\"model\",\"kind\":\"embed\",\"state\":\"loaded\""), "{models}");
+        assert!(models.text().contains("\"idle_s\":null"), "the evicted model reports no idle time: {models}");
         h.shutdown(); j.join().unwrap();
     }
 }

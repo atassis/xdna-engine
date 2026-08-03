@@ -50,6 +50,10 @@ pub enum EngineError {
     /// able to name a capability no `ModelKind` variant exists for (`tts`, `generate`, `image-sr`).
     #[error("wrong model kind: wanted {wanted}, got {got}")]
     WrongKind { wanted: crate::capability::Capability, got: crate::capability::Capability },
+    /// No configured model declares this capability. Distinct from `Unsupported` because it is a
+    /// SERVER-configuration fact, not a bad request -- the HTTP surface answers it 503, not 400.
+    #[error("no {0} model configured")]
+    NoModel(crate::capability::Capability),
     #[error("unsupported: {0}")]
     Unsupported(String),
     #[error("device error: {0}")]

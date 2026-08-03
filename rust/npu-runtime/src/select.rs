@@ -44,7 +44,7 @@ pub fn resolve(cfg: &Config, reg: &Registry, cap: Capability, want: Option<&str>
         .map(|e| e.cfg.name.clone());
     match (candidates.next(), candidates.next()) {
         (Some(only), None) => Ok(only),
-        (None, _) => Err(EngineError::Unsupported(format!("no {cap} model available"))),
+        (None, _) => Err(EngineError::NoModel(cap)),
         (Some(_), Some(_)) => Err(EngineError::Unsupported(format!("model required for {cap} (multiple configured)"))),
     }
 }
