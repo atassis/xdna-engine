@@ -46,5 +46,8 @@ fn sr_engine_through_servable_matches_the_direct_call() {
 
     // Capability mismatch is a real Err, not a panic or a silently-wrong result.
     let err = boxed.run(Request::Text("wrong shape".into())).unwrap_err();
-    assert!(err.to_string().contains("Request::Image"), "{err}");
+    // Matches on the SHAPE words, not the Rust variant path: the message is built from
+    // `Request::shape()` so it stays readable when a request carries megabytes of PCM.
+    let msg = err.to_string();
+    assert!(msg.contains("image") && msg.contains("text"), "{err}");
 }
