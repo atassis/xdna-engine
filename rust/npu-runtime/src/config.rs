@@ -1,5 +1,6 @@
 //! Desired state: the persisted engine config. The file IS the persistence (restart-survival is
 //! automatic). Atomic save (temp + rename).
+use npu_engine::capability::Capability;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::time::Duration;
@@ -78,10 +79,23 @@ pub enum EvictPolicy {
     /// before hot-swap existed, kept as an opt-out for a box that must not pay reload latency.
     None,
 }
+/// Which model serves a capability when a request does not name one, keyed by capability name.
+///
+/// A map, not the `{ asr, embed }` struct it replaces: that struct was the config half of the closed
+/// request surface -- `[defaults] tts = "kokoro"` was not a missing feature but an unrepresentable
+/// one. `#[serde(transparent)]` keeps every shipped `engine.toml` parsing unchanged, because
+/// `[defaults] asr = "parakeet"` is already exactly this map's TOML form.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct Defaults {
-    #[serde(default)] pub asr: Option<String>,
-    #[serde(default)] pub embed: Option<String>,
+#[serde(transparent)]
+pub struct Defaults(pub std::collections::BTreeMap<String, String>);
+
+impl Defaults {
+    pub fn get(&self, cap: Capability) -> Option<&String> { self.0.get(cap.0) }
+    pub fn set(&mut self, cap: Capability, model: String) { self.0.insert(cap.0.to_string(), model); }
+    /// Build from `(capability, model)` pairs -- the shape tests and `npu init` want.
+    pub fn from_pairs<I: IntoIterator<Item = (Capability, String)>>(it: I) -> Defaults {
+        Defaults(it.into_iter().map(|(c, m)| (c.0.to_string(), m)).collect())
+    }
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelCfg { pub name: String, pub scenario: String }
@@ -130,7 +144,7 @@ scenario = "scenarios/asr.toml"
 "#;
         let c = Config::from_str(toml).unwrap();
         assert_eq!(c.server.port, 11434);
-        assert_eq!(c.defaults.asr.as_deref(), Some("parakeet"));
+        assert_eq!(c.defaults.get(Capability::ASR).map(String::as_str), Some("parakeet"));
         assert_eq!(c.find("parakeet").unwrap().scenario, "scenarios/asr.toml");
         // missing file -> default empty
         let missing = Config::load(Path::new("/nope/x.toml")).unwrap();
@@ -166,10 +180,23 @@ scenario = "scenarios/asr.toml"
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("engine.toml");
         let c = Config {
-            defaults: Defaults { asr: Some("a".into()), embed: None },
+            defaults: Defaults::from_pairs([(Capability::ASR, "a".to_string())]),
             models: vec![ModelCfg { name: "a".into(), scenario: "s.toml".into() }],
             ..Default::default()
         };
+        c.save(&p).unwrap();
+        assert_eq!(Config::load(&p).unwrap(), c);
+    }
+
+    /// A capability with no `ModelKind` variant must survive a config round-trip -- the whole point
+    /// of the map. `[defaults] tts = ...` was previously dropped silently on save.
+    #[test]
+    fn defaults_carry_a_capability_the_old_struct_could_not_name() {
+        let c = Config::from_str("[defaults]\nasr = \"parakeet\"\ntts = \"kokoro\"\n").unwrap();
+        assert_eq!(c.defaults.get(Capability::TTS).map(String::as_str), Some("kokoro"));
+        assert_eq!(c.defaults.get(Capability::EMBED), None);
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("engine.toml");
         c.save(&p).unwrap();
         assert_eq!(Config::load(&p).unwrap(), c);
     }

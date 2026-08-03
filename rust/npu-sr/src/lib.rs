@@ -135,7 +135,7 @@ pub fn npu_available() -> bool {
 // `frontier.rs:252`), so this adapter costs no new Cargo dependency.
 impl npu_engine::capability::Servable for SrEngine {
     fn capabilities(&self) -> npu_engine::capability::Capability {
-        npu_engine::capability::Capability("image-sr")
+        npu_engine::capability::Capability::IMAGE_SR
     }
     fn run(&mut self, req: npu_engine::capability::Request) -> Result<npu_engine::capability::Response, EngineError> {
         use npu_engine::capability::{Request, Response};
@@ -149,8 +149,8 @@ impl npu_engine::capability::Servable for SrEngine {
                 let (rgb, w, h) = self.upscale_rgb8(&rgb, w, h).map_err(|e| EngineError::Device(e.to_string()))?;
                 Ok(Response::Image { rgb, w, h })
             }
-            Request::Text(_) =>
-                Err(EngineError::Unsupported("SrEngine: expected Request::Image, got Request::Text".into())),
+            other => Err(EngineError::Unsupported(
+                format!("SrEngine: expected an image request, got {}", other.shape()))),
         }
     }
 }

@@ -27,6 +27,16 @@ impl ModelKind {
             _ => None,
         }
     }
+
+    /// This kind as a routing capability. `ModelKind` stays the engine's own scenario-dispatch enum
+    /// (and the C ABI's `npu_model_kind`); `Capability` is what the control plane routes on, and it
+    /// is open where this is closed.
+    pub fn capability(self) -> crate::capability::Capability {
+        match self {
+            ModelKind::Asr => crate::capability::Capability::ASR,
+            ModelKind::Embed => crate::capability::Capability::EMBED,
+        }
+    }
 }
 
 /// Engine error surface. Internal errors are flattened into these variants with a message.
@@ -36,8 +46,14 @@ pub enum EngineError {
     NotAvailable,
     #[error("load failed: {0}")]
     Load(String),
+    /// Carries `Capability`, not `ModelKind`: this is raised by capability routing, which must be
+    /// able to name a capability no `ModelKind` variant exists for (`tts`, `generate`, `image-sr`).
     #[error("wrong model kind: wanted {wanted}, got {got}")]
-    WrongKind { wanted: ModelKind, got: ModelKind },
+    WrongKind { wanted: crate::capability::Capability, got: crate::capability::Capability },
+    /// No configured model declares this capability. Distinct from `Unsupported` because it is a
+    /// SERVER-configuration fact, not a bad request -- the HTTP surface answers it 503, not 400.
+    #[error("no {0} model configured")]
+    NoModel(crate::capability::Capability),
     #[error("unsupported: {0}")]
     Unsupported(String),
     #[error("device error: {0}")]
@@ -94,8 +110,8 @@ impl Model {
         }
         match &self.scen {
             Scenario::Asr(m) => m.transcribe(pcm),
-            Scenario::Embed(_) =>
-                Err(EngineError::WrongKind { wanted: ModelKind::Asr, got: ModelKind::Embed }),
+            Scenario::Embed(_) => Err(EngineError::WrongKind {
+                wanted: ModelKind::Asr.capability(), got: ModelKind::Embed.capability() }),
         }
     }
 
@@ -103,8 +119,8 @@ impl Model {
     pub fn embed(&self, text: &str) -> Result<Vec<f32>, EngineError> {
         match &self.scen {
             Scenario::Embed(m) => m.embed_one(text.to_string()),
-            Scenario::Asr(_) =>
-                Err(EngineError::WrongKind { wanted: ModelKind::Embed, got: ModelKind::Asr }),
+            Scenario::Asr(_) => Err(EngineError::WrongKind {
+                wanted: ModelKind::Embed.capability(), got: ModelKind::Asr.capability() }),
         }
     }
 
@@ -120,7 +136,8 @@ mod tests {
     fn error_and_kind_display() {
         assert_eq!(ModelKind::Asr.to_string(), "asr");
         assert_eq!(ModelKind::Embed.to_string(), "embed");
-        let e = EngineError::WrongKind { wanted: ModelKind::Asr, got: ModelKind::Embed };
+        let e = EngineError::WrongKind {
+            wanted: ModelKind::Asr.capability(), got: ModelKind::Embed.capability() };
         assert_eq!(e.to_string(), "wrong model kind: wanted asr, got embed");
         assert_eq!(EngineError::NotAvailable.to_string(), "no XDNA2 NPU device available");
     }

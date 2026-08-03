@@ -1,7 +1,7 @@
 // Integration test for the device actor + Handle, using the mock loader (gated behind `testkit`).
 // Run with: cargo test -p npu-runtime --features testkit
 #![cfg(feature = "testkit")]
-use npu_engine::ModelKind;
+use npu_engine::capability::{Capability, Request, Response};
 use npu_runtime::actor::start;
 use npu_runtime::config::{Config, Defaults, ModelCfg, ServerCfg};
 use npu_runtime::loader::mock::MockLoader;
@@ -10,11 +10,12 @@ use std::collections::BTreeMap;
 #[test]
 fn actor_serves_and_echoes_model() {
     let mut t = BTreeMap::new();
-    t.insert("bge".to_string(), Ok((ModelKind::Embed, 1)));
-    t.insert("asr".to_string(), Ok((ModelKind::Asr, 1)));
+    t.insert("bge".to_string(), Ok((Capability::EMBED, 1)));
+    t.insert("asr".to_string(), Ok((Capability::ASR, 1)));
     let cfg = Config {
         server: ServerCfg { max_resident: 8, ..Default::default() },
-        defaults: Defaults { asr: Some("asr".into()), embed: Some("bge".into()) },
+        defaults: Defaults::from_pairs([
+            (Capability::ASR, "asr".to_string()), (Capability::EMBED, "bge".to_string())]),
         models: vec![
             ModelCfg { name: "bge".into(), scenario: "x".into() },
             ModelCfg { name: "asr".into(), scenario: "y".into() },
@@ -36,11 +37,12 @@ fn actor_serves_and_echoes_model() {
 #[test]
 fn actor_hot_swaps_at_one_slot() {
     let mut t = BTreeMap::new();
-    t.insert("bge".to_string(), Ok((ModelKind::Embed, 1)));
-    t.insert("asr".to_string(), Ok((ModelKind::Asr, 1)));
+    t.insert("bge".to_string(), Ok((Capability::EMBED, 1)));
+    t.insert("asr".to_string(), Ok((Capability::ASR, 1)));
     let cfg = Config {
         server: ServerCfg { max_resident: 1, idle_unload_s: 0, ..Default::default() },
-        defaults: Defaults { asr: Some("asr".into()), embed: Some("bge".into()) },
+        defaults: Defaults::from_pairs([
+            (Capability::ASR, "asr".to_string()), (Capability::EMBED, "bge".to_string())]),
         models: vec![
             ModelCfg { name: "asr".into(), scenario: "x".into() },
             ModelCfg { name: "bge".into(), scenario: "y".into() },
@@ -53,6 +55,31 @@ fn actor_hot_swaps_at_one_slot() {
     }
     assert_eq!(h.status().iter().filter(|s| s.idle_s.is_some()).count(), 1,
         "exactly one model may hold the single-tenant device");
+    h.shutdown();
+    join.join().unwrap();
+}
+
+/// A capability with no typed `Handle` helper and no `ModelKind` variant, served end to end through
+/// `Handle::serve`. This is the property the whole rewiring exists for: adding TTS cost a scenario
+/// entry and nothing in the actor, the registry or the router.
+#[test]
+fn actor_serves_a_capability_with_no_typed_helper() {
+    let mut t = BTreeMap::new();
+    t.insert("kokoro".to_string(), Ok((Capability::TTS, 1)));
+    let cfg = Config {
+        server: ServerCfg { max_resident: 1, idle_unload_s: 0, ..Default::default() },
+        defaults: Defaults::from_pairs([(Capability::TTS, "kokoro".to_string())]),
+        models: vec![ModelCfg { name: "kokoro".into(), scenario: "x".into() }],
+    };
+    let (h, join) = start(cfg, Box::new(MockLoader { table: t })).unwrap();
+    let s = h.serve(Capability::TTS, None, Request::Text("hello".into())).unwrap();
+    assert_eq!(s.model, "kokoro");
+    match s.value {
+        Response::Audio { pcm, sample_rate } => { assert_eq!(pcm.len(), 8); assert_eq!(sample_rate, 24_000); }
+        other => panic!("tts returned a {} response", other.shape()),
+    }
+    // ...and asking that model for a capability it does not have is still an error, not a swap.
+    assert!(h.serve(Capability::ASR, Some("kokoro"), Request::Audio { pcm: vec![0i16; 4], sample_rate: 16_000 }).is_err());
     h.shutdown();
     join.join().unwrap();
 }

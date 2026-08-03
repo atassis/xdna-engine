@@ -38,7 +38,7 @@ fn sr_engine_through_servable_matches_the_direct_call() {
     let resp = boxed.run(Request::Image { rgb: rgb.clone(), w, h }).unwrap();
     let (via_rgb, via_w, via_h) = match resp {
         Response::Image { rgb, w, h } => (rgb, w, h),
-        Response::Vector(_) => panic!("SrEngine::run returned a Vector for an Image request"),
+        other => panic!("SrEngine::run returned a {} response for an Image request", other.shape()),
     };
 
     assert_eq!((via_w, via_h), (direct_w, direct_h));

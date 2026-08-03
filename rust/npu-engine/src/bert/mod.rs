@@ -57,13 +57,13 @@ impl crate::pipeline::Embedder for EmbedPipeline {
 // interior mutability laundering needed -- `&mut self` on `run` just reborrows).
 impl crate::capability::Servable for EmbedPipeline {
     fn capabilities(&self) -> crate::capability::Capability {
-        crate::capability::Capability("embed")
+        crate::capability::Capability::EMBED
     }
     fn run(&mut self, req: crate::capability::Request) -> Result<crate::capability::Response, EngineError> {
         match req {
             crate::capability::Request::Text(text) => Ok(crate::capability::Response::Vector(self.embed(text))),
-            crate::capability::Request::Image { .. } =>
-                Err(EngineError::Unsupported("EmbedPipeline: expected Request::Text, got Request::Image".into())),
+            other => Err(EngineError::Unsupported(
+                format!("EmbedPipeline: expected a text request, got {}", other.shape()))),
         }
     }
 }

@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 use npu_runtime::actor::{start, start_lazy};
+use npu_engine::capability::Capability;
 use npu_runtime::config::{Config, EvictPolicy};
 use npu_runtime::http;
 use npu_runtime::loader::EngineLoader;
@@ -24,11 +25,18 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// Run the HTTP service (single device owner).
-    Serve { #[arg(long)] port: Option<u16> },
+    Serve {
+        #[arg(long)] port: Option<u16>,
+        /// Bind even when a configured model failed to load. `/healthz` still reports 503.
+        #[arg(long)] allow_degraded: bool,
+    },
     /// One-shot transcription of a 16 kHz mono 16-bit WAV.
     Transcribe { wav: PathBuf, #[arg(long)] model: Option<String> },
     /// One-shot embedding of a text string.
-    Embed { text: String, #[arg(long)] model: Option<String> },
+    /// `allow_hyphen_values`: the text to embed is prose, and prose begins with `-` all the time
+    /// (every Markdown bullet). Without it clap read a bullet as an unknown flag and failed with a
+    /// usage error, so the CLI rejected inputs the HTTP route accepted.
+    Embed { #[arg(allow_hyphen_values = true)] text: String, #[arg(long)] model: Option<String> },
     /// List models on a running server.
     Models { #[arg(long)] port: Option<u16> },
     /// Ask a running server to re-read the config and reconcile.
@@ -58,7 +66,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let path = config_path(&cli);
     match &cli.cmd {
-        Cmd::Serve { port } => serve(&path, *port),
+        Cmd::Serve { port, allow_degraded } => serve(&path, *port, *allow_degraded),
         Cmd::Transcribe { wav, model } => transcribe(&path, wav, model.as_deref()),
         Cmd::Embed { text, model } => embed(&path, text, model.as_deref()),
         Cmd::Models { port } => models(&path, *port),
@@ -139,12 +147,29 @@ fn preflight_serve(port: u16) -> Result<()> {
     );
 }
 
-fn serve(path: &Path, port: Option<u16>) -> Result<()> {
+fn serve(path: &Path, port: Option<u16>, allow_degraded: bool) -> Result<()> {
     let cfg = load_cfg(path)?;
     let port = port.unwrap_or(cfg.server.port);
     preflight_serve(port)?;
     let root = root(&cfg)?;
     let (handle, _join) = start(cfg, Box::new(EngineLoader { root }))?;
+    // Do not bind a port the service cannot serve from. The initial reconcile records a load
+    // failure as `Failed` rather than panicking, so before this the socket came up and every
+    // request answered "actor dropped reply" while systemd showed active -- how a 5-day outage
+    // went unnoticed. Refuse instead, naming each model and its cause.
+    let failed: Vec<_> = handle.status().into_iter()
+        .filter(|s| s.state == npu_runtime::registry::LoadState::Failed).collect();
+    if !failed.is_empty() {
+        for s in &failed {
+            eprintln!("[npu-serve] FAILED {}: {}", s.name, s.detail);
+        }
+        if !allow_degraded {
+            handle.shutdown();
+            bail!("{} of the configured models failed to load; refusing to bind port {port} \
+                   (use --allow-degraded to serve anyway)", failed.len());
+        }
+        eprintln!("[npu-serve] --allow-degraded: binding anyway, /healthz will report 503");
+    }
     http::serve(handle, path.to_path_buf(), port).context("serve")
 }
 
@@ -211,10 +236,10 @@ fn config_cmd(path: &Path, action: &ConfigCmd) -> Result<()> {
             cfg.models.push(npu_runtime::config::ModelCfg { name: name.clone(), scenario: scenario.clone() });
         }
         ConfigCmd::RemoveModel { name } => cfg.models.retain(|m| &m.name != name),
-        ConfigCmd::SetDefault { capability, model } => match capability.as_str() {
-            "asr" => cfg.defaults.asr = Some(model.clone()),
-            "embed" => cfg.defaults.embed = Some(model.clone()),
-            other => return Err(anyhow!("unknown capability {other:?} (asr|embed)")),
+        ConfigCmd::SetDefault { capability, model } => match Capability::from_name(capability) {
+            Some(cap) => cfg.defaults.set(cap, model.clone()),
+            None => return Err(anyhow!("unknown capability {capability:?} (one of: {})",
+                Capability::ALL.iter().map(|c| c.0).collect::<Vec<_>>().join("|"))),
         },
     }
     cfg.save(path).map_err(|e| anyhow!(e))?;
@@ -229,7 +254,9 @@ fn render(cfg: &Config) -> String {
     s.push_str(&format!("residency: idle_unload_s {}  idle_release_s {}  sweep_interval_s {}  evict_policy {}\n",
         cfg.server.idle_unload_s, cfg.server.idle_release_s, cfg.server.sweep_interval_s,
         match cfg.server.evict_policy { EvictPolicy::Lru => "lru", EvictPolicy::None => "none" }));
-    s.push_str(&format!("defaults: asr={:?} embed={:?}\n", cfg.defaults.asr, cfg.defaults.embed));
+    let defaults = cfg.defaults.0.iter().map(|(c, m)| format!("{c}={m}")).collect::<Vec<_>>();
+    s.push_str(&format!("defaults: {}\n",
+        if defaults.is_empty() { "(none)".to_string() } else { defaults.join(" ") }));
     if cfg.models.is_empty() { s.push_str("models: (none)\n"); }
     for m in &cfg.models { s.push_str(&format!("model {} -> {}\n", m.name, m.scenario)); }
     s
@@ -261,14 +288,17 @@ mod tests {
         let r = render(&empty);
         assert!(r.contains("models: (none)"));
         assert!(r.contains("port 11434"));
+        assert!(r.contains("defaults: (none)"), "{r}");
         let c = Config {
             server: ServerCfg::default(),
-            defaults: Defaults { asr: Some("parakeet".into()), embed: None },
+            defaults: Defaults::from_pairs([
+                (Capability::ASR, "parakeet".to_string()), (Capability::TTS, "kokoro".to_string())]),
             models: vec![ModelCfg { name: "parakeet".into(), scenario: "scenarios/asr.toml".into() }],
         };
         let r = render(&c);
         assert!(r.contains("model parakeet -> scenarios/asr.toml"));
-        assert!(r.contains("asr=Some(\"parakeet\")"));
+        // Every configured default is rendered, including one no `ModelKind` variant can name.
+        assert!(r.contains("asr=parakeet") && r.contains("tts=kokoro"), "{r}");
         assert!(r.contains("idle_unload_s 900") && r.contains("idle_release_s 1800")
             && r.contains("evict_policy lru"), "{r}");
     }

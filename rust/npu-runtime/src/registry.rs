@@ -1,11 +1,11 @@
 //! Actual state: which models are loaded, their status, the memory accountant, and residency --
 //! `last_used` per entry, which is what LRU eviction and idle unload both order themselves by.
 use crate::config::{EvictPolicy, ModelCfg, ServerCfg};
-use crate::loader::{Inference, ModelLoader};
-use npu_engine::{EngineError, ModelKind};
+use crate::loader::{ModelLoader, Servable};
+use npu_engine::EngineError;
 use std::time::{Duration, Instant};
 
-pub type Capability = ModelKind; // Asr -> transcription, Embed -> embeddings
+pub use npu_engine::capability::Capability;
 
 // glibc's malloc_trim(3). Declared directly rather than pulling in the libc crate: no crate in this
 // workspace depends on it, and this is one symbol with a stable signature.
@@ -58,7 +58,7 @@ pub struct ModelStatus {
     pub name: String,
     pub state: LoadState,
     pub detail: String,
-    pub kind: Option<ModelKind>,
+    pub capability: Option<Capability>,
     pub bo_bytes: u64,
     /// Seconds since this model last served a request, for resident models only. `None` when the
     /// model is not resident (nothing is holding the device on its behalf).
@@ -67,7 +67,7 @@ pub struct ModelStatus {
 
 pub struct Entry {
     pub cfg: ModelCfg,
-    pub model: Option<Box<dyn Inference>>,
+    pub model: Option<Box<dyn Servable>>,
     pub status: ModelStatus,
     /// Last time this entry served a request; set to the load time when it becomes resident. Stale
     /// but harmless while the entry is not resident -- both readers filter on residency first.
@@ -80,11 +80,16 @@ pub struct Registry {
 }
 
 impl Registry {
-    pub fn get_loaded(&self, name: &str) -> Option<&Box<dyn Inference>> {
-        self.entries.iter().find(|e| e.cfg.name == name).and_then(|e| e.model.as_ref())
+    pub fn get_loaded(&self, name: &str) -> Option<&(dyn Servable + 'static)> {
+        self.entries.iter().find(|e| e.cfg.name == name).and_then(|e| e.model.as_deref())
+    }
+    /// `Servable::run` takes `&mut self` (every shipped model is mutable in truth -- some launder it
+    /// through a `RefCell`), so serving needs this and not `get_loaded`.
+    pub fn get_loaded_mut(&mut self, name: &str) -> Option<&mut (dyn Servable + 'static)> {
+        self.entries.iter_mut().find(|e| e.cfg.name == name).and_then(|e| e.model.as_deref_mut())
     }
     pub fn resident_bytes(&self) -> u64 {
-        self.entries.iter().filter_map(|e| e.model.as_ref().map(|m| m.bo_bytes())).sum()
+        self.entries.iter().filter_map(|e| e.model.as_ref().map(|m| m.footprint())).sum()
     }
     pub fn resident_count(&self) -> usize {
         self.entries.iter().filter(|e| e.model.is_some()).count()
@@ -100,9 +105,9 @@ impl Registry {
     }
     /// The capability of an entry: from the live model, else the kind remembered from its last
     /// successful load. Survives an unload, which is what lets routing stay sweep-invariant.
-    pub fn known_kind(&self, name: &str) -> Option<ModelKind> {
+    pub fn known_capability(&self, name: &str) -> Option<Capability> {
         let e = self.entries.iter().find(|e| e.cfg.name == name)?;
-        e.model.as_ref().map(|m| m.kind()).or(e.status.kind)
+        e.model.as_ref().map(|m| m.capabilities()).or(e.status.capability)
     }
     /// Stamp a model as just used. Called once per served request.
     pub fn touch(&mut self, name: &str, now: Instant) {
@@ -121,16 +126,19 @@ impl Registry {
                 "not resident: at max_resident ({}); loads on demand", srv.max_resident));
             return;
         }
-        match loader.load(cfg) {
+        // The loader can PANIC, not just Err: model constructors still `.expect()` on missing
+        // artifacts. Catch it here, where a load failure is already the expected outcome, so it is
+        // recorded as Failed instead of unwinding through whichever caller happened to trigger it.
+        match crate::actor::guard(|| loader.load(cfg)).unwrap_or_else(|msg| Err(EngineError::Load(msg))) {
             Ok(m) => {
-                let bo = m.bo_bytes();
+                let bo = m.footprint();
                 if self.resident_bytes() + bo > srv.memory_ceiling_mb * 1024 * 1024 {
                     self.set_failed(cfg, "over memory_ceiling".into());
                     return;
                 }
                 let status = ModelStatus {
                     name: cfg.name.clone(), state: LoadState::Loaded, detail: String::new(),
-                    kind: Some(m.kind()), bo_bytes: bo, idle_s: Some(0),
+                    capability: Some(m.capabilities()), bo_bytes: bo, idle_s: Some(0),
                 };
                 self.upsert(Entry { cfg: cfg.clone(), model: Some(m), status, last_used: now });
             }
@@ -174,9 +182,9 @@ impl Registry {
     /// Record a configured model WITHOUT loading it, keeping the capability its scenario declares so
     /// routing can pick it (and `/v1/models` can show it) before anything touches the device. A no-op
     /// on a model the registry already knows: a live entry always outranks a declaration.
-    pub fn declare(&mut self, cfg: &ModelCfg, kind: Option<ModelKind>) {
+    pub fn declare(&mut self, cfg: &ModelCfg, capability: Option<Capability>) {
         if self.entries.iter().any(|e| e.cfg.name == cfg.name) { return; }
-        let detail = match kind {
+        let detail = match capability {
             Some(_) => "declared: loads on demand".to_string(),
             // Nothing to route on: the request path will have to load it to find out what it is.
             None => "declared: capability unknown until loaded".to_string(),
@@ -185,7 +193,7 @@ impl Registry {
             cfg: cfg.clone(),
             model: None,
             status: ModelStatus {
-                name: cfg.name.clone(), state: LoadState::Unloaded, detail, kind, bo_bytes: 0, idle_s: None,
+                name: cfg.name.clone(), state: LoadState::Unloaded, detail, capability, bo_bytes: 0, idle_s: None,
             },
             last_used: Instant::now(),
         });
@@ -224,6 +232,30 @@ impl Registry {
         self.entries.retain(|e| e.cfg.name != name);
     }
 
+    /// Record that a RESIDENT model failed while serving, and drop it.
+    ///
+    /// Without this a model that loads and then dies on every dispatch -- the shipped failure mode
+    /// when an instruction stream is missing -- stays `Loaded` forever while every request errors,
+    /// which is precisely the "reports healthy while broken" defect. Dropping the model is also what
+    /// makes recovery automatic: the next request re-runs `ensure_resident`, so a transient fault
+    /// self-heals and only a persistent one keeps the entry `Failed`.
+    pub fn mark_failed(&mut self, name: &str, detail: &str) {
+        if let Some(e) = self.entries.iter_mut().find(|e| e.cfg.name == name) {
+            e.model = None;
+            e.status.state = LoadState::Failed;
+            e.status.detail = detail.to_string();
+            e.status.bo_bytes = 0;
+            e.status.idle_s = None;
+        }
+    }
+
+    /// Names of every configured model currently in `Failed`. This is the health signal: `Unloaded`
+    /// is deliberate (deferred by `max_resident`, or swept for being idle) and must never count.
+    pub fn failed(&self) -> Vec<String> {
+        self.entries.iter().filter(|e| e.status.state == LoadState::Failed)
+            .map(|e| e.cfg.name.clone()).collect()
+    }
+
     fn set_failed(&mut self, cfg: &ModelCfg, detail: String) {
         self.set_state(cfg, LoadState::Failed, detail);
     }
@@ -232,10 +264,10 @@ impl Registry {
         self.set_state(cfg, LoadState::Unloaded, detail);
     }
     fn set_state(&mut self, cfg: &ModelCfg, state: LoadState, detail: String) {
-        // Keep a kind learned from an earlier successful load: it is still true, and routing uses it.
-        let kind = self.known_kind(&cfg.name);
+        // Keep a capability learned from an earlier successful load: still true, and routing uses it.
+        let capability = self.known_capability(&cfg.name);
         let status = ModelStatus {
-            name: cfg.name.clone(), state, detail, kind, bo_bytes: 0, idle_s: None,
+            name: cfg.name.clone(), state, detail, capability, bo_bytes: 0, idle_s: None,
         };
         self.upsert(Entry { cfg: cfg.clone(), model: None, status, last_used: Instant::now() });
     }
@@ -253,14 +285,14 @@ mod tests {
     fn cfg(name: &str) -> ModelCfg { ModelCfg { name: name.into(), scenario: "x".into() } }
     fn loader(names: &[&str]) -> MockLoader {
         let mut t = BTreeMap::new();
-        for n in names { t.insert((*n).to_string(), Ok((ModelKind::Embed, 1))); }
+        for n in names { t.insert((*n).to_string(), Ok((Capability::EMBED, 1))); }
         MockLoader { table: t }
     }
 
     #[test]
     fn load_failure_is_recorded_not_fatal() {
         let mut t = BTreeMap::new();
-        t.insert("good".to_string(), Ok((ModelKind::Embed, 10)));
+        t.insert("good".to_string(), Ok((Capability::EMBED, 10)));
         t.insert("bad".to_string(), Err("boom".to_string()));
         let l = MockLoader { table: t };
         let srv = ServerCfg { max_resident: 8, ..Default::default() };
@@ -303,7 +335,7 @@ mod tests {
         let b = r.status().into_iter().find(|x| x.name == "b").unwrap();
         assert_eq!(b.state, LoadState::Unloaded);
         assert!(b.detail.contains("evicted for c"), "{}", b.detail);
-        assert_eq!(b.kind, Some(ModelKind::Embed), "an evicted entry keeps its known capability");
+        assert_eq!(b.capability, Some(Capability::EMBED), "an evicted entry keeps its known capability");
     }
     #[test]
     fn ensure_resident_is_a_noop_when_already_loaded() {
@@ -357,7 +389,7 @@ mod tests {
         let t0 = Instant::now();
         r.try_load(&cfg("a"), &l, &srv, t0);
         assert_eq!(r.sweep_idle(t0 + Duration::from_secs(900), Duration::from_secs(900)), vec!["a"]);
-        assert_eq!(r.known_kind("a"), Some(ModelKind::Embed), "capability survives the unload");
+        assert_eq!(r.known_capability("a"), Some(Capability::EMBED), "capability survives the unload");
         r.ensure_resident(&cfg("a"), &l, &srv, t0 + Duration::from_secs(901)).unwrap();
         assert!(r.get_loaded("a").is_some());
         assert_eq!(r.status().into_iter().find(|x| x.name == "a").unwrap().state, LoadState::Loaded);
