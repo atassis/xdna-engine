@@ -62,10 +62,20 @@ pub type Response = (u16, Body);
 pub fn route(req: &Request, handle: &Handle, cfg_path: &Path) -> Response {
     match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/health") => (200, "{\"status\":\"ok\"}".into()),
+        // `ok` is COMPUTED, not asserted. It used to be the literal `true`, so a service whose model
+        // had failed to load reported healthy to systemd while answering every request with an error
+        // -- the shape that hid a 5-day outage. A Failed model makes this 503; `Unloaded` never does,
+        // because that is deliberate (deferred by max_resident, or swept for being idle).
         ("GET", "/healthz") => {
             let npu = npu_engine::Engine::available();
-            let n = handle.status().iter().filter(|s| s.state == LoadState::Loaded).count();
-            (200, format!("{{\"ok\":true,\"npu\":{npu},\"loaded\":{n}}}").into())
+            let st = handle.status();
+            let n = st.iter().filter(|s| s.state == LoadState::Loaded).count();
+            let failed: Vec<&ModelStatus> = st.iter().filter(|s| s.state == LoadState::Failed).collect();
+            let names = failed.iter()
+                .map(|s| format!("\"{}\"", parse::json_escape(&s.name))).collect::<Vec<_>>().join(",");
+            let ok = failed.is_empty();
+            (if ok { 200 } else { 503 },
+             format!("{{\"ok\":{ok},\"npu\":{npu},\"loaded\":{n},\"failed\":[{names}]}}").into())
         }
         ("GET", "/v1/models") => (200, models_json(&handle.status()).into()),
         ("POST", "/v1/chat/completions") => chat_completions(req, handle),
@@ -788,6 +798,55 @@ mod route_tests {
         assert_eq!(u32::from_le_bytes([wav[24], wav[25], wav[26], wav[27]]), 24_000);
         assert_eq!(parse::parse_wav_i16(wav).map(|v| v.len()), None,
             "parse_wav_i16 only accepts the 16 kHz ASR shape, so it must reject 24 kHz speech");
+        h.shutdown(); j.join().unwrap();
+    }
+
+    /// `/healthz` must go 503 once a model has failed, and must NOT be tripped by a model that is
+    /// merely unloaded -- deferral and idle-sweep are deliberate, and a health check that cries wolf
+    /// on them gets ignored.
+    /// Build a server from (name, load-result) pairs, so a test can put a model in a chosen state.
+    fn health_setup(models: &[(&str, bool)], max_resident: usize)
+        -> (Handle, std::thread::JoinHandle<()>, tempfile::TempDir, PathBuf) {
+        let mut t = BTreeMap::new();
+        for (n, ok) in models {
+            t.insert((*n).to_string(),
+                if *ok { Ok((Capability::EMBED, 1)) } else { Err("no such xclbin".to_string()) });
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("engine.toml");
+        let cfg = Config {
+            server: ServerCfg { max_resident, idle_unload_s: 0, ..Default::default() },
+            models: models.iter()
+                .map(|(n, _)| ModelCfg { name: (*n).into(), scenario: "x".into() }).collect(),
+            ..Default::default()
+        };
+        cfg.save(&p).unwrap();
+        let (h, j) = start(cfg, Box::new(MockLoader { table: t })).unwrap();
+        (h, j, dir, p)
+    }
+
+    /// A model left unloaded by `max_resident` is deliberate. A health check that cries wolf on it
+    /// gets ignored, which would defeat the point of the one below.
+    #[test]
+    fn healthz_is_ok_when_a_model_is_merely_deferred() {
+        let (h, j, _d, p) = health_setup(&[("bge", true), ("e5", true)], 1);
+        let (code, body) = route(&get("/healthz"), &h, &p);
+        assert_eq!(code, 200, "{body}");
+        assert!(body.text().contains("\"ok\":true") && body.text().contains("\"failed\":[]"), "{body}");
+        h.shutdown(); j.join().unwrap();
+    }
+
+    /// ...but a model that FAILED to load makes the service unhealthy and names itself. `ok` used to
+    /// be the literal `true`, which is how a 5-day outage looked healthy to systemd.
+    #[test]
+    fn healthz_is_503_and_names_the_model_that_failed() {
+        // Two slots so `broken` is actually attempted rather than deferred by capacity.
+        let (h, j, _d, p) = health_setup(&[("bge", true), ("broken", false)], 2);
+        let (code, body) = route(&get("/healthz"), &h, &p);
+        assert_eq!(code, 503, "a failed model must make the service unhealthy: {body}");
+        assert!(body.text().contains("\"ok\":false"), "{body}");
+        assert!(body.text().contains("\"broken\""), "the failing model is named: {body}");
+        assert!(body.text().contains("\"loaded\":1"), "the healthy one is still counted: {body}");
         h.shutdown(); j.join().unwrap();
     }
 

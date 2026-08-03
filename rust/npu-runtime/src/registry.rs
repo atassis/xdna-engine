@@ -126,7 +126,10 @@ impl Registry {
                 "not resident: at max_resident ({}); loads on demand", srv.max_resident));
             return;
         }
-        match loader.load(cfg) {
+        // The loader can PANIC, not just Err: model constructors still `.expect()` on missing
+        // artifacts. Catch it here, where a load failure is already the expected outcome, so it is
+        // recorded as Failed instead of unwinding through whichever caller happened to trigger it.
+        match crate::actor::guard(|| loader.load(cfg)).unwrap_or_else(|msg| Err(EngineError::Load(msg))) {
             Ok(m) => {
                 let bo = m.footprint();
                 if self.resident_bytes() + bo > srv.memory_ceiling_mb * 1024 * 1024 {
@@ -227,6 +230,30 @@ impl Registry {
     }
     pub fn unload(&mut self, name: &str) {
         self.entries.retain(|e| e.cfg.name != name);
+    }
+
+    /// Record that a RESIDENT model failed while serving, and drop it.
+    ///
+    /// Without this a model that loads and then dies on every dispatch -- the shipped failure mode
+    /// when an instruction stream is missing -- stays `Loaded` forever while every request errors,
+    /// which is precisely the "reports healthy while broken" defect. Dropping the model is also what
+    /// makes recovery automatic: the next request re-runs `ensure_resident`, so a transient fault
+    /// self-heals and only a persistent one keeps the entry `Failed`.
+    pub fn mark_failed(&mut self, name: &str, detail: &str) {
+        if let Some(e) = self.entries.iter_mut().find(|e| e.cfg.name == name) {
+            e.model = None;
+            e.status.state = LoadState::Failed;
+            e.status.detail = detail.to_string();
+            e.status.bo_bytes = 0;
+            e.status.idle_s = None;
+        }
+    }
+
+    /// Names of every configured model currently in `Failed`. This is the health signal: `Unloaded`
+    /// is deliberate (deferred by `max_resident`, or swept for being idle) and must never count.
+    pub fn failed(&self) -> Vec<String> {
+        self.entries.iter().filter(|e| e.status.state == LoadState::Failed)
+            .map(|e| e.cfg.name.clone()).collect()
     }
 
     fn set_failed(&mut self, cfg: &ModelCfg, detail: String) {

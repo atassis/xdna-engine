@@ -25,7 +25,11 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// Run the HTTP service (single device owner).
-    Serve { #[arg(long)] port: Option<u16> },
+    Serve {
+        #[arg(long)] port: Option<u16>,
+        /// Bind even when a configured model failed to load. `/healthz` still reports 503.
+        #[arg(long)] allow_degraded: bool,
+    },
     /// One-shot transcription of a 16 kHz mono 16-bit WAV.
     Transcribe { wav: PathBuf, #[arg(long)] model: Option<String> },
     /// One-shot embedding of a text string.
@@ -62,7 +66,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let path = config_path(&cli);
     match &cli.cmd {
-        Cmd::Serve { port } => serve(&path, *port),
+        Cmd::Serve { port, allow_degraded } => serve(&path, *port, *allow_degraded),
         Cmd::Transcribe { wav, model } => transcribe(&path, wav, model.as_deref()),
         Cmd::Embed { text, model } => embed(&path, text, model.as_deref()),
         Cmd::Models { port } => models(&path, *port),
@@ -143,12 +147,29 @@ fn preflight_serve(port: u16) -> Result<()> {
     );
 }
 
-fn serve(path: &Path, port: Option<u16>) -> Result<()> {
+fn serve(path: &Path, port: Option<u16>, allow_degraded: bool) -> Result<()> {
     let cfg = load_cfg(path)?;
     let port = port.unwrap_or(cfg.server.port);
     preflight_serve(port)?;
     let root = root(&cfg)?;
     let (handle, _join) = start(cfg, Box::new(EngineLoader { root }))?;
+    // Do not bind a port the service cannot serve from. The initial reconcile records a load
+    // failure as `Failed` rather than panicking, so before this the socket came up and every
+    // request answered "actor dropped reply" while systemd showed active -- how a 5-day outage
+    // went unnoticed. Refuse instead, naming each model and its cause.
+    let failed: Vec<_> = handle.status().into_iter()
+        .filter(|s| s.state == npu_runtime::registry::LoadState::Failed).collect();
+    if !failed.is_empty() {
+        for s in &failed {
+            eprintln!("[npu-serve] FAILED {}: {}", s.name, s.detail);
+        }
+        if !allow_degraded {
+            handle.shutdown();
+            bail!("{} of the configured models failed to load; refusing to bind port {port} \
+                   (use --allow-degraded to serve anyway)", failed.len());
+        }
+        eprintln!("[npu-serve] --allow-degraded: binding anyway, /healthz will report 503");
+    }
     http::serve(handle, path.to_path_buf(), port).context("serve")
 }
 

@@ -30,7 +30,7 @@ fn wrong_shape(cap: Capability, model: &str, got: &Response) -> EngineError {
 /// real message went only to stderr. `AssertUnwindSafe` is required because the registry holds
 /// `Box<dyn Inference>`; the actor owns that state exclusively and does not observe it again after
 /// a caught panic beyond reporting, so no torn state escapes.
-fn guard<T>(f: impl FnOnce() -> T) -> Result<T, String> {
+pub(crate) fn guard<T>(f: impl FnOnce() -> T) -> Result<T, String> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).map_err(|p| {
         if let Some(s) = p.downcast_ref::<&str>() { (*s).to_string() }
         else if let Some(s) = p.downcast_ref::<String>() { s.clone() }
@@ -129,8 +129,29 @@ fn spawn(cfg: Config, loader: Box<dyn ModelLoader + Send>, eager: bool) -> Resul
             match rx.recv_timeout(next_sweep.saturating_duration_since(Instant::now())) {
                 Ok(Cmd::Serve { cap, model, req, reply }) => {
                     last_request = Instant::now(); released = false;
-                    let r = guard(|| run_serve(&cfg, &mut reg, loader.as_ref(), cap, model.as_deref(), req))
+                    // Two guarded steps rather than one, so the model NAME is known when the second
+                    // fails. The shipped failure is a PANIC inside the dispatch (a missing insts
+                    // file panics in npu-asr), which unwinds past any Result handling inside the
+                    // call -- so condemning the model has to happen out here, after catch_unwind.
+                    let ready = guard(|| serve_ready(&cfg, &mut reg, loader.as_ref(), cap, model.as_deref()))
                         .unwrap_or_else(|msg| Err(EngineError::Device(msg)));
+                    let r = match ready {
+                        Err(e) => Err(e),
+                        Ok(name) => {
+                            let out = guard(|| run_named(&mut reg, &name, req))
+                                .unwrap_or_else(|msg| Err(EngineError::Device(msg)));
+                            match out {
+                                Ok(value) => Ok(Served { model: name, value }),
+                                Err(e) => {
+                                    if condemns_model(&e) {
+                                        reg.mark_failed(&name, &e.to_string());
+                                        eprintln!("[npu-runtime] {name} FAILED serving {cap}: {e}");
+                                    }
+                                    Err(e)
+                                }
+                            }
+                        }
+                    };
                     let _ = reply.send(r);
                 }
                 Ok(Cmd::Reconcile { cfg: newcfg, reply }) => {
@@ -209,12 +230,18 @@ fn serve_ready(cfg: &Config, reg: &mut Registry, loader: &dyn ModelLoader, cap: 
     }
 }
 
-fn run_serve(cfg: &Config, reg: &mut Registry, loader: &dyn ModelLoader, cap: Capability,
-             want: Option<&str>, req: Request) -> Result<Served<Response>, EngineError> {
-    let name = serve_ready(cfg, reg, loader, cap, want)?;
-    let m = reg.get_loaded_mut(&name).ok_or_else(|| EngineError::Load(format!("{name} not loaded")))?;
-    let value = m.run(req)?;
-    Ok(Served { model: name, value })
+fn run_named(reg: &mut Registry, name: &str, req: Request) -> Result<Response, EngineError> {
+    let m = reg.get_loaded_mut(name).ok_or_else(|| EngineError::Load(format!("{name} not loaded")))?;
+    m.run(req)
+}
+
+/// Whether a failure condemns the MODEL or just this request.
+///
+/// A device or load error is a property of the model -- a missing instruction stream fails
+/// identically for every caller, forever. WrongKind/Unsupported/NoModel are the caller's problem and
+/// must never condemn a working model.
+fn condemns_model(e: &EngineError) -> bool {
+    matches!(e, EngineError::Device(_) | EngineError::Load(_))
 }
 
 impl Handle {
@@ -406,19 +433,91 @@ mod tests {
         }
     }
 
+    /// A model that loads fine and then PANICS on every dispatch -- the shipped failure when an
+    /// instruction stream is missing. It must be marked Failed, not stay Loaded while every request
+    /// errors, which is the "reports healthy while broken" defect.
+    struct PanicOnRun;
+    impl crate::loader::Servable for PanicOnRun {
+        fn capabilities(&self) -> Capability { Capability::EMBED }
+        fn run(&mut self, _req: Request) -> Result<Response, EngineError> {
+            panic!("read instr insts_512x800x768.txt: No such file or directory");
+        }
+    }
+    struct PanicOnRunLoader;
+    impl ModelLoader for PanicOnRunLoader {
+        fn load(&self, _cfg: &ModelCfg) -> Result<Box<dyn crate::loader::Servable>, EngineError> {
+            Ok(Box::new(PanicOnRun))
+        }
+        fn declared_capability(&self, _cfg: &ModelCfg) -> Option<Capability> { Some(Capability::EMBED) }
+    }
+
     #[test]
-    fn a_panicking_initial_reconcile_returns_err_not_a_half_dead_handle() {
+    fn a_model_that_panics_while_serving_is_marked_failed() {
+        let cfg = Config {
+            server: ServerCfg { max_resident: 1, idle_unload_s: 0, ..Default::default() },
+            defaults: Defaults::from_pairs([(Capability::EMBED, "bge".to_string())]),
+            models: vec![ModelCfg { name: "bge".into(), scenario: "x".into() }],
+        };
+        let (h, j) = start(cfg, Box::new(PanicOnRunLoader)).unwrap();
+        assert_eq!(state_of(&h, "bge"), LoadState::Loaded, "it loads fine; the panic is at dispatch");
+        let e = match h.embed(None, "hi") { Err(e) => e.to_string(), Ok(s) => panic!("served {}", s.model) };
+        assert!(e.contains("No such file"), "the real cause must reach the caller: {e}");
+        // The point: the failure STICKS to the model instead of vanishing with the request.
+        let s = h.status().into_iter().find(|s| s.name == "bge").unwrap();
+        assert_eq!(s.state, LoadState::Failed, "a dispatch panic must condemn the model");
+        assert!(s.detail.contains("No such file"), "{}", s.detail);
+        h.shutdown(); j.join().unwrap();
+    }
+
+    /// ...but a request-shaped error must NOT condemn a working model.
+    #[test]
+    fn a_wrong_capability_request_does_not_condemn_the_model() {
+        let (h, j) = swap_setup(ServerCfg { max_resident: 2, idle_unload_s: 0, ..Default::default() });
+        assert_eq!(h.embed(None, "hi").unwrap().model, "bge");
+        assert!(h.embed(Some("asr"), "hi").is_err(), "asr cannot embed");
+        assert_ne!(state_of(&h, "asr"), LoadState::Failed, "a routing error is the caller's fault");
+        assert_eq!(h.embed(None, "hi").unwrap().model, "bge", "and bge still serves");
+        h.shutdown(); j.join().unwrap();
+    }
+
+    /// A panicking loader is recorded as Failed rather than unwinding through whoever triggered it.
+    #[test]
+    fn a_panicking_load_on_the_request_path_is_recorded_not_propagated() {
+        let cfg = Config {
+            server: ServerCfg { max_resident: 1, idle_unload_s: 0, ..Default::default() },
+            defaults: Defaults::from_pairs([(Capability::EMBED, "bge".to_string())]),
+            models: vec![ModelCfg { name: "bge".into(), scenario: "x".into() }],
+        };
+        // start_lazy: nothing loads until the request, so the panic happens on the REQUEST path.
+        let (h, j) = start_lazy(cfg, Box::new(PanicLoader)).unwrap();
+        let e = match h.embed(None, "hi") { Err(e) => e.to_string(), Ok(s) => panic!("served {}", s.model) };
+        assert!(e.contains("boom"), "{e}");
+        assert_eq!(state_of(&h, "bge"), LoadState::Failed);
+        h.shutdown(); j.join().unwrap();
+    }
+
+    /// A panicking LOAD during the initial reconcile is now recorded as `Failed`, not propagated as
+    /// a `start()` error.
+    ///
+    /// This changed deliberately when `try_load` started catching loader panics. The old contract
+    /// ("start() returns Err") collapsed every model into one panic string; the new one names each
+    /// model and its cause, which is what `npu serve` prints before refusing to bind. The protective
+    /// intent is unchanged and asserted here: the caller must never be left believing the model
+    /// loaded.
+    #[test]
+    fn a_panicking_load_during_reconcile_is_recorded_as_failed() {
         let cfg = Config {
             server: ServerCfg { max_resident: 1, idle_unload_s: 0, ..Default::default() },
             defaults: Defaults::from_pairs([(Capability::ASR, "asr".to_string())]),
             models: vec![ModelCfg { name: "asr".into(), scenario: "x".into() }],
         };
-        // `unwrap_err()` needs `(Handle, JoinHandle<()>): Debug`, which `Handle` deliberately isn't
-        // (it just wraps a `Sender`); match instead.
-        let err = match start(cfg, Box::new(PanicLoader)) {
-            Err(e) => e,
-            Ok(_) => panic!("a panicking initial reconcile must not hand back a live Handle"),
+        let (h, j) = match start(cfg, Box::new(PanicLoader)) {
+            Ok(v) => v,
+            Err(e) => panic!("a load panic is a per-model failure, not a start() error: {e}"),
         };
-        assert!(err.to_string().contains("boom"), "{err}");
+        let s = h.status().into_iter().find(|s| s.name == "asr").expect("entry");
+        assert_eq!(s.state, LoadState::Failed, "the model must not look healthy");
+        assert!(s.detail.contains("boom"), "the panic message is the cause: {}", s.detail);
+        h.shutdown(); j.join().unwrap();
     }
 }
