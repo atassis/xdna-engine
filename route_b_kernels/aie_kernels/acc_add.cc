@@ -8,8 +8,10 @@
 // FFN output is host-assembled and cannot stay device-resident). This brick sums
 // the running accumulator (a) with the next partial (b) into a third BO (out), so
 // the fc2 output lands in ONE device BO -- deleting the host accumulation. f32 add
-// is exact, so seeding acc=0 then adding the partials IN ORDER is bit-identical to
-// the host sequential f32 K-split (WER-neutral).
+// is DETERMINISTIC (not exact -- it rounds), so seeding acc=0 and adding the partials
+// IN THE SAME ORDER as the host is bit-identical to the host sequential f32 K-split
+// (WER-neutral). The ORDER is what licenses that, not exactness -- a tree or parallel
+// reduction over the same partials is not a safe substitute.
 //
 // 2-input ABI: a (g3), b (g4), out (g5) -- an AIE2 tile has only 2 input DMA
 // channels, so a + b sits exactly at the limit (mirrors affine_cast's in + gb).

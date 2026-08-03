@@ -110,11 +110,11 @@ const RELPOS_BUCKETS: &[(usize, usize, &str)] = &[
 ];
 // The H=8 attention heads run on H PARALLEL cores (one head/core), ONE dispatch/block. The BOs
 // concatenate all H heads; each head's Worker reads/writes its own slice via a per-head shim OFFSET
-// tap. The insts template holds H t_active words (one per head's RTP write), all == RELPOS_BUILT_T
+// tap. The insts template holds H t_active words (one per head's RTP write), all == the bucket's BUILT_T
 // at build; per clip we patch EVERY word == BUILT_T to t.
 const RELPOS_HEADS: usize = 8; // = Parakeet n_heads; must match the xclbin's --heads build
 
-/// The single resident relpos block (built at RELPOS_BUILT_T). BOs are sized for BUILT_T; per
+/// The single resident relpos block (built at its bucket's BUILT_T -- see RELPOS_BUCKETS). BOs are sized for BUILT_T; per
 /// dispatch we patch the instr template's t_active word and pad data to BUILT_T. Dispatched per
 /// head via run_dwconv6(3, instr, n, quv, kpv, ctx).
 struct RelposK {
@@ -811,7 +811,7 @@ impl NpuMatmul {
 
     /// Resident relpos-MHA block for ALL RELPOS_HEADS heads in ONE dispatch (H parallel cores, one
     /// head/core). q/k/v are [t, D=H*DK], pm is [P=2t-1, D], ubias/vbias are [H, DK]. Returns ctx
-    /// [t, D] with head h in columns [h*DK..(h+1)*DK]. t <= RELPOS_BUILT_T. STEP-C: pad each head's
+    /// [t, D] with head h in columns [h*DK..(h+1)*DK]. t <= relpos_max_t(). STEP-C: pad each head's
     /// stream to BUILT_T, PATCH every t_active word of the insts template (one per head's RTP) to t,
     /// dispatch the single resident block (3-BO ABI, all H heads concatenated), unpack bf16 CTX.
     /// This REPLACES the old per-head loop (H sequential dispatches on 1 core) with 1 dispatch that
