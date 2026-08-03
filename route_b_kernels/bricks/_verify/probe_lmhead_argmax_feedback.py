@@ -2,11 +2,9 @@
 """P1 end-to-end: vocab GEMM -> on-core argmax -> resident-embedding row read, ONE dispatch.
 
 Two halves were device-validated separately: `lm-head-argmax` fuses the vocab projection with an
-argmax and emits (best_value, best_index), and
-[[decode-feedback-is-a-scalar-indexed-row-read-and-it-works-on-device]] showed a device-computed
-scalar index can address a resident buffer in the dispatch that produced it. This joins them, which is
-what `onchip-decode-feedback-prototype` P1 asks for: logits -> argmax -> next input, nothing crossing
-to host in between.
+argmax and emits (best_value, best_index), and a separate probe showed a device-computed scalar index
+can address a resident buffer in the dispatch that produced it, with logits supplied as an input. This
+joins them: logits -> argmax -> next input, nothing crossing to host in between.
 
 WHAT IS CHECKED, and why it is the right check. The claim under test is the COMPOSITION: does the
 index the GEMM+argmax computes on core correctly drive the row read on the same core, same dispatch?
