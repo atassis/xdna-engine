@@ -1,50 +1,61 @@
-//! How the registry turns a ModelCfg into something servable. The real impl wraps npu_engine::Model
-//! (Phase 2); the mock makes the whole control plane host-testable with no device.
+//! How the registry turns a ModelCfg into something servable. The real impl wraps npu_engine::Model;
+//! the mock makes the whole control plane host-testable with no device.
+//!
+//! The servable trait is `npu_engine::capability::Servable` itself, not a runtime-local one. This
+//! crate used to declare its own `Inference { kind, bo_bytes, transcribe, embed }`, which is what
+//! closed the request surface at two modalities: a third capability meant a new method on the trait,
+//! a new `Cmd`, and a new `ModelKind` variant. `Servable`'s single `run(Request)` costs none of
+//! those, and a model that already implements it -- `npu_sr::SrEngine` -- becomes loadable here with
+//! no adapter at all.
 use crate::config::ModelCfg;
-use npu_engine::{EngineError, ModelKind};
+use npu_engine::capability::{Capability, Request, Response};
+use npu_engine::EngineError;
 
-/// A loaded, servable model. Object-safe so the registry can hold `Box<dyn Inference>` (the real one
-/// is !Send and lives only in the device-actor thread).
-pub trait Inference {
-    fn kind(&self) -> ModelKind;
-    fn bo_bytes(&self) -> u64;
-    fn transcribe(&self, pcm: &[i16], sample_rate: u32) -> Result<String, EngineError>;
-    fn embed(&self, text: &str) -> Result<Vec<f32>, EngineError>;
-}
+pub use npu_engine::capability::Servable;
 
 pub trait ModelLoader {
-    fn load(&self, cfg: &ModelCfg) -> Result<Box<dyn Inference>, EngineError>;
+    fn load(&self, cfg: &ModelCfg) -> Result<Box<dyn Servable>, EngineError>;
 
     /// What capability this model DECLARES, without loading it: cheap, host-only, no device.
     ///
     /// Routing needs the capability of a model that is not resident, and the only alternative is to
     /// load one to find out -- which on this engine means seconds and the whole device. `None` means
     /// "cannot tell cheaply"; the caller then falls back to loading.
-    fn declared_kind(&self, _cfg: &ModelCfg) -> Option<ModelKind> { None }
+    fn declared_capability(&self, _cfg: &ModelCfg) -> Option<Capability> { None }
 }
 
-/// Real loader: turns a ModelCfg's scenario TOML into a live npu_engine::Model. `Capability` is
-/// `npu_engine::ModelKind`, so `kind()` is a direct passthrough.
+/// Real loader: turns a ModelCfg's scenario TOML into a live npu_engine::Model.
 pub struct EngineLoader { pub root: std::path::PathBuf }
 struct EngineModel { model: npu_engine::Model }
-impl Inference for EngineModel {
-    fn kind(&self) -> ModelKind { self.model.kind() }
+
+impl Servable for EngineModel {
+    fn capabilities(&self) -> Capability { self.model.kind().capability() }
     // Best-effort BO footprint: not yet measured per-model (backlog R11(f)); report 0 until then so
     // the accountant is a no-op rather than wrong. A later task wires real BO byte totals.
-    fn bo_bytes(&self) -> u64 { 0 }
-    fn transcribe(&self, pcm: &[i16], sr: u32) -> Result<String, EngineError> { self.model.transcribe(pcm, sr) }
-    fn embed(&self, text: &str) -> Result<Vec<f32>, EngineError> { self.model.embed(text) }
+    fn footprint(&self) -> u64 { 0 }
+    fn run(&mut self, req: Request) -> Result<Response, EngineError> {
+        match req {
+            Request::Audio { pcm, sample_rate } =>
+                self.model.transcribe(&pcm, sample_rate).map(Response::Text),
+            Request::Text(text) => self.model.embed(&text).map(Response::Vector),
+            // Neither engine scenario takes an image, so this is a routing bug rather than a user
+            // error -- but still a Result, because the actor must not be panicked by one.
+            Request::Image { .. } => Err(EngineError::WrongKind {
+                wanted: Capability::IMAGE_SR, got: self.model.kind().capability() }),
+        }
+    }
 }
+
 impl ModelLoader for EngineLoader {
-    fn load(&self, cfg: &ModelCfg) -> Result<Box<dyn Inference>, EngineError> {
+    fn load(&self, cfg: &ModelCfg) -> Result<Box<dyn Servable>, EngineError> {
         let model = npu_engine::Model::load_in(&cfg.scenario, &self.root)?;
         Ok(Box::new(EngineModel { model }))
     }
     /// Read the scenario's `[scenario] kind`. Parsing one small TOML costs nothing next to a load,
     /// and it is the same field `registry::try_build` dispatches on.
-    fn declared_kind(&self, cfg: &ModelCfg) -> Option<ModelKind> {
+    fn declared_capability(&self, cfg: &ModelCfg) -> Option<Capability> {
         let sc = npu_engine::config::ScenarioConfig::load(std::path::Path::new(&cfg.scenario)).ok()?;
-        ModelKind::from_scenario_kind(&sc.scenario.kind)
+        Capability::from_scenario_kind(&sc.scenario.kind)
     }
 }
 
@@ -53,32 +64,36 @@ impl ModelLoader for EngineLoader {
 pub mod mock {
     use super::*;
     use std::collections::BTreeMap;
-    /// name -> Ok((kind, bo_bytes)) | Err(reason).
-    pub struct MockLoader { pub table: BTreeMap<String, Result<(ModelKind, u64), String>> }
-    pub struct MockModel { kind: ModelKind, bo: u64 }
-    impl Inference for MockModel {
-        fn kind(&self) -> ModelKind { self.kind }
-        fn bo_bytes(&self) -> u64 { self.bo }
-        fn transcribe(&self, _: &[i16], _: u32) -> Result<String, EngineError> {
-            if self.kind == ModelKind::Asr { Ok("mock-text".into()) }
-            else { Err(EngineError::WrongKind { wanted: ModelKind::Asr, got: ModelKind::Embed }) }
-        }
-        fn embed(&self, _: &str) -> Result<Vec<f32>, EngineError> {
-            if self.kind == ModelKind::Embed { Ok(vec![0.0; 8]) }
-            else { Err(EngineError::WrongKind { wanted: ModelKind::Embed, got: ModelKind::Asr }) }
+    /// name -> Ok((capability, footprint)) | Err(reason).
+    pub struct MockLoader { pub table: BTreeMap<String, Result<(Capability, u64), String>> }
+    pub struct MockModel { cap: Capability, bo: u64 }
+    impl Servable for MockModel {
+        fn capabilities(&self) -> Capability { self.cap }
+        fn footprint(&self) -> u64 { self.bo }
+        /// Answers in the shape the capability implies, so a request of the wrong shape is an error
+        /// rather than a plausible-looking wrong answer.
+        fn run(&mut self, req: Request) -> Result<Response, EngineError> {
+            match (self.cap, &req) {
+                (Capability::ASR, Request::Audio { .. }) => Ok(Response::Text("mock-text".into())),
+                (Capability::EMBED, Request::Text(_)) => Ok(Response::Vector(vec![0.0; 8])),
+                (Capability::GENERATE, Request::Text(_)) => Ok(Response::Text("mock-completion".into())),
+                (Capability::TTS, Request::Text(_)) =>
+                    Ok(Response::Audio { pcm: vec![0i16; 8], sample_rate: 24_000 }),
+                (cap, _) => Err(EngineError::Unsupported(format!("{cap} cannot serve this request shape"))),
+            }
         }
     }
     impl ModelLoader for MockLoader {
-        fn load(&self, cfg: &ModelCfg) -> Result<Box<dyn Inference>, EngineError> {
+        fn load(&self, cfg: &ModelCfg) -> Result<Box<dyn Servable>, EngineError> {
             match self.table.get(&cfg.name) {
-                Some(Ok((k, bo))) => Ok(Box::new(MockModel { kind: *k, bo: *bo })),
+                Some(Ok((c, bo))) => Ok(Box::new(MockModel { cap: *c, bo: *bo })),
                 Some(Err(e)) => Err(EngineError::Load(e.clone())),
                 None => Err(EngineError::Load(format!("no mock entry for {}", cfg.name))),
             }
         }
-        /// The scripted kind, standing in for the scenario TOML the real loader reads.
-        fn declared_kind(&self, cfg: &ModelCfg) -> Option<ModelKind> {
-            match self.table.get(&cfg.name) { Some(Ok((k, _))) => Some(*k), _ => None }
+        /// The scripted capability, standing in for the scenario TOML the real loader reads.
+        fn declared_capability(&self, cfg: &ModelCfg) -> Option<Capability> {
+            match self.table.get(&cfg.name) { Some(Ok((c, _))) => Some(*c), _ => None }
         }
     }
 }

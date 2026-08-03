@@ -25,37 +25,108 @@ use crate::api::EngineError;
 /// task's eventual `defaults: BTreeMap<Capability, String>` needs -- not built here, just not
 /// blocked by this type when it is.
 ///
-/// NOTE for whoever wires this into `npu-runtime`: that crate already has a DIFFERENT `Capability`
-/// (`npu_runtime::registry::Capability`, a type alias for `npu_engine::ModelKind`). The two names
-/// collide in meaning, not just spelling, once routing moves onto this type -- rename one at that
-/// point rather than let both stand.
+/// `npu-runtime` routes on this type; the `Capability` alias for `ModelKind` that used to live in
+/// `npu_runtime::registry` is gone, so only one type by that name remains.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Capability(pub &'static str);
+
+impl std::fmt::Display for Capability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(self.0) }
+}
+
+impl Capability {
+    pub const ASR: Capability = Capability("asr");
+    pub const EMBED: Capability = Capability("embed");
+    pub const GENERATE: Capability = Capability("generate");
+    pub const TTS: Capability = Capability("tts");
+    pub const IMAGE_SR: Capability = Capability("image-sr");
+
+    /// Every capability this binary can serve. `&'static str` is kept rather than widened to an
+    /// owned string precisely because of this list: a capability name that no compiled-in model
+    /// implements cannot be served, so an arbitrary runtime string would only ever name something
+    /// that fails. Adding a capability is one const plus one entry HERE -- one file, versus the five
+    /// (`api`, `pipeline`, `loader`, `actor`, `select`) that a `ModelKind` variant used to cost.
+    pub const ALL: &'static [Capability] =
+        &[Self::ASR, Self::EMBED, Self::GENERATE, Self::TTS, Self::IMAGE_SR];
+
+    /// Resolve a capability written in config -- an `/admin/defaults` body, a `?capability=` -- against
+    /// `ALL`. `None` for a name nothing implements.
+    pub fn from_name(s: &str) -> Option<Capability> {
+        Self::ALL.iter().find(|c| c.0 == s).copied()
+    }
+
+    /// A scenario's `[scenario] kind`, which is NOT the same vocabulary as a capability name: every
+    /// shipped embedding scenario says `kind = "embeddings"` while the capability is `embed`. Kept as
+    /// an alias rather than renamed on either side -- the scenario files are user data.
+    pub fn from_scenario_kind(s: &str) -> Option<Capability> {
+        match s {
+            "embeddings" => Some(Self::EMBED),
+            other => Self::from_name(other),
+        }
+    }
+}
 
 /// The request payload. An enum over data SHAPES, not a generic-per-capability associated type --
 /// deliberate, not a default: `Box<dyn Servable>` (the whole point of collapsing `Scenario`'s two
 /// variants into one trait) requires the trait to be object-safe, and an associated `type Input`
-/// that varies per impl breaks that immediately. Two variants because two real instances need
-/// exactly two shapes today; a third instance that doesn't fit either is the earned trigger to add
-/// a third variant, not a reason to genericize pre-emptively.
+/// that varies per impl breaks that immediately.
+///
+/// Variants are earned per instance, never added speculatively. `Text`/`Image` came from
+/// `EmbedPipeline` and `SrEngine`; `Audio` from wiring the shipped ASR models onto this trait --
+/// `Text` cannot carry PCM. Note `Text` serves three capabilities (embed, generate, tts): the enum
+/// discriminates SHAPES, not capabilities, so a new capability that reuses a shape costs nothing.
 #[derive(Debug)]
 pub enum Request {
     /// `EmbedPipeline`/`EsmEmbedPipeline`'s shape: one string in.
     Text(String),
+    /// `Model::transcribe`'s shape: mono PCM plus the rate it was sampled at. The rate travels with
+    /// the samples rather than being assumed 16 kHz -- the models resample, and a silently wrong
+    /// rate is a wrong transcript, not an error.
+    Audio { pcm: Vec<i16>, sample_rate: u32 },
     /// `SrEngine::upscale_rgb8`'s shape: interleaved RGB8 + explicit dims (the real per-frame ABI
     /// the C ABI / ffmpeg filter already calls -- `npu-sr-capi/src/lib.rs:90`, not the lower-level
     /// `upscale_plane`/`upscale_planar_rgb` used only by the parity gates).
     Image { rgb: Vec<u8>, w: usize, h: usize },
 }
 
-/// The response payload. Mirrors `Request`'s shapes one-for-one for the two earned instances.
+impl Request {
+    /// The variant name, for error messages. `Debug` is not usable there: `Audio` holds the whole
+    /// PCM buffer and would render a mismatch as megabytes of samples.
+    pub fn shape(&self) -> &'static str {
+        match self {
+            Request::Text(_) => "text",
+            Request::Audio { .. } => "audio",
+            Request::Image { .. } => "image",
+        }
+    }
+}
+
+/// The response payload. Same rule as `Request`: shapes, earned per instance.
 #[derive(Debug)]
 pub enum Response {
     /// `EmbedPipeline::embed`'s shape: one embedding vector out.
     Vector(Vec<f32>),
+    /// A transcript or a generated completion -- ASR and generate differ in what produces the text,
+    /// not in its shape.
+    Text(String),
+    /// Synthesised speech. Carries its own rate for the same reason `Request::Audio` does, and
+    /// because TTS output is not the 16 kHz the ASR side works in.
+    Audio { pcm: Vec<i16>, sample_rate: u32 },
     /// `SrEngine::upscale_rgb8`'s shape: interleaved RGB8 + the OUTPUT dims (upscaled, so these
     /// differ from the request's `w`/`h` by the schedule's integer scale factor).
     Image { rgb: Vec<u8>, w: usize, h: usize },
+}
+
+impl Response {
+    /// The variant name, for error messages. Same reason as `Request::shape`.
+    pub fn shape(&self) -> &'static str {
+        match self {
+            Response::Vector(_) => "vector",
+            Response::Text(_) => "text",
+            Response::Audio { .. } => "audio",
+            Response::Image { .. } => "image",
+        }
+    }
 }
 
 /// The open, object-safe request-surface trait. `Box<dyn Servable>` is meant to be able to replace

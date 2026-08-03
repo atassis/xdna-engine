@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 use npu_runtime::actor::{start, start_lazy};
+use npu_engine::capability::Capability;
 use npu_runtime::config::{Config, EvictPolicy};
 use npu_runtime::http;
 use npu_runtime::loader::EngineLoader;
@@ -211,10 +212,10 @@ fn config_cmd(path: &Path, action: &ConfigCmd) -> Result<()> {
             cfg.models.push(npu_runtime::config::ModelCfg { name: name.clone(), scenario: scenario.clone() });
         }
         ConfigCmd::RemoveModel { name } => cfg.models.retain(|m| &m.name != name),
-        ConfigCmd::SetDefault { capability, model } => match capability.as_str() {
-            "asr" => cfg.defaults.asr = Some(model.clone()),
-            "embed" => cfg.defaults.embed = Some(model.clone()),
-            other => return Err(anyhow!("unknown capability {other:?} (asr|embed)")),
+        ConfigCmd::SetDefault { capability, model } => match Capability::from_name(capability) {
+            Some(cap) => cfg.defaults.set(cap, model.clone()),
+            None => return Err(anyhow!("unknown capability {capability:?} (one of: {})",
+                Capability::ALL.iter().map(|c| c.0).collect::<Vec<_>>().join("|"))),
         },
     }
     cfg.save(path).map_err(|e| anyhow!(e))?;
@@ -229,7 +230,9 @@ fn render(cfg: &Config) -> String {
     s.push_str(&format!("residency: idle_unload_s {}  idle_release_s {}  sweep_interval_s {}  evict_policy {}\n",
         cfg.server.idle_unload_s, cfg.server.idle_release_s, cfg.server.sweep_interval_s,
         match cfg.server.evict_policy { EvictPolicy::Lru => "lru", EvictPolicy::None => "none" }));
-    s.push_str(&format!("defaults: asr={:?} embed={:?}\n", cfg.defaults.asr, cfg.defaults.embed));
+    let defaults = cfg.defaults.0.iter().map(|(c, m)| format!("{c}={m}")).collect::<Vec<_>>();
+    s.push_str(&format!("defaults: {}\n",
+        if defaults.is_empty() { "(none)".to_string() } else { defaults.join(" ") }));
     if cfg.models.is_empty() { s.push_str("models: (none)\n"); }
     for m in &cfg.models { s.push_str(&format!("model {} -> {}\n", m.name, m.scenario)); }
     s
@@ -261,14 +264,17 @@ mod tests {
         let r = render(&empty);
         assert!(r.contains("models: (none)"));
         assert!(r.contains("port 11434"));
+        assert!(r.contains("defaults: (none)"), "{r}");
         let c = Config {
             server: ServerCfg::default(),
-            defaults: Defaults { asr: Some("parakeet".into()), embed: None },
+            defaults: Defaults::from_pairs([
+                (Capability::ASR, "parakeet".to_string()), (Capability::TTS, "kokoro".to_string())]),
             models: vec![ModelCfg { name: "parakeet".into(), scenario: "scenarios/asr.toml".into() }],
         };
         let r = render(&c);
         assert!(r.contains("model parakeet -> scenarios/asr.toml"));
-        assert!(r.contains("asr=Some(\"parakeet\")"));
+        // Every configured default is rendered, including one no `ModelKind` variant can name.
+        assert!(r.contains("asr=parakeet") && r.contains("tts=kokoro"), "{r}");
         assert!(r.contains("idle_unload_s 900") && r.contains("idle_release_s 1800")
             && r.contains("evict_policy lru"), "{r}");
     }

@@ -10,7 +10,7 @@ use std::time::Duration;
 use crate::actor::Handle;
 use crate::config::{Config, ModelCfg};
 use crate::registry::{LoadState, ModelStatus};
-use npu_engine::ModelKind;
+use npu_engine::capability::Capability;
 
 const MAX_BODY: usize = 16 * 1024 * 1024;
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(60);
@@ -59,7 +59,7 @@ pub fn models_json(status: &[ModelStatus]) -> String {
     let mut data = String::new();
     for (i, s) in status.iter().enumerate() {
         if i > 0 { data.push(','); }
-        let kind = match s.kind { Some(ModelKind::Asr) => "asr", Some(ModelKind::Embed) => "embed", None => "unknown" };
+        let kind = s.capability.map(|c| c.0).unwrap_or("unknown");
         let state = match s.state { LoadState::Loaded => "loaded", LoadState::Failed => "failed", LoadState::Unloaded => "unloaded" };
         let idle = match s.idle_s { Some(n) => n.to_string(), None => "null".to_string() };
         data.push_str(&format!(
@@ -142,10 +142,13 @@ fn admin_set_default(req: &Request, handle: &Handle, cfg_path: &Path) -> Respons
         (Some(c), Some(m)) => (c, m),
         _ => return (400, "{\"error\":\"need capability + model\"}".into()),
     };
-    mutate_and_reconcile(handle, cfg_path, |cfg| {
-        let d = &mut cfg.defaults;
-        match cap.as_str() { "asr" => d.asr = Some(model.clone()), "embed" => d.embed = Some(model.clone()), _ => {} }
-    })
+    // A capability nothing implements is rejected rather than written: the old match silently
+    // dropped anything that was not asr/embed, so `/admin/defaults` reported 200 and changed nothing.
+    let cap = match Capability::from_name(&cap) {
+        Some(c) => c,
+        None => return (400, format!("{{\"error\":\"unknown capability {}\"}}", parse::json_escape(&cap))),
+    };
+    mutate_and_reconcile(handle, cfg_path, |cfg| cfg.defaults.set(cap, model.clone()))
 }
 
 fn mutate_and_reconcile(handle: &Handle, cfg_path: &Path, f: impl FnOnce(&mut Config)) -> Response {
@@ -371,8 +374,8 @@ mod route_tests {
 
     fn mock_handle() -> (Handle, std::thread::JoinHandle<()>, tempfile::TempDir, PathBuf) {
         let mut t = BTreeMap::new();
-        t.insert("bge".to_string(), Ok((ModelKind::Embed, 1)));
-        t.insert("c".to_string(), Ok((ModelKind::Embed, 1)));
+        t.insert("bge".to_string(), Ok((Capability::EMBED, 1)));
+        t.insert("c".to_string(), Ok((Capability::EMBED, 1)));
         let dir = tempfile::tempdir().unwrap();
         let cfg_path = dir.path().join("engine.toml");
         let cfg = Config {
@@ -424,8 +427,8 @@ mod route_tests {
         // One slot, two configured models: /v1/models is where an operator sees which one holds the
         // device right now, and what happened to the other.
         let mut t = BTreeMap::new();
-        t.insert("bge".to_string(), Ok((ModelKind::Embed, 1)));
-        t.insert("e5".to_string(), Ok((ModelKind::Embed, 1)));
+        t.insert("bge".to_string(), Ok((Capability::EMBED, 1)));
+        t.insert("e5".to_string(), Ok((Capability::EMBED, 1)));
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("engine.toml");
         let cfg = Config {

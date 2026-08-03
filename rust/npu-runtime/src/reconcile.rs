@@ -51,12 +51,12 @@ mod tests {
     use super::*;
     use crate::config::{Config, ModelCfg, ServerCfg};
     use crate::loader::mock::MockLoader;
-    use npu_engine::ModelKind;
+    use npu_engine::capability::Capability;
     use std::collections::BTreeMap;
     fn loader(names: &[(&str, bool)]) -> MockLoader {
         let mut t = BTreeMap::new();
         for (n, ok) in names {
-            t.insert((*n).to_string(), if *ok { Ok((ModelKind::Embed, 1)) } else { Err("fail".into()) });
+            t.insert((*n).to_string(), if *ok { Ok((Capability::EMBED, 1)) } else { Err("fail".into()) });
         }
         MockLoader { table: t }
     }
