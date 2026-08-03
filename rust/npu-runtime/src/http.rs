@@ -72,7 +72,11 @@ pub fn models_json(status: &[ModelStatus]) -> String {
 fn embeddings(req: &Request, handle: &Handle) -> Response {
     let body = String::from_utf8_lossy(&req.body).to_string();
     let model = extract_str_field(&body, "model");
-    let inputs = parse::parse_inputs(&body);
+    let inputs = match parse::parse_inputs(&body) {
+        Ok(v) if v.is_empty() => return (400, "{\"error\":\"input is empty\"}".into()),
+        Ok(v) => v,
+        Err(e) => return (400, format!("{{\"error\":\"{}\"}}", parse::json_escape(&e))),
+    };
     let mut data = String::new();
     let mut served = String::new();
     for (i, text) in inputs.iter().enumerate() {
@@ -231,21 +235,121 @@ fn respond(stream: &mut TcpStream, code: u16, body: &str) -> std::io::Result<()>
 
 /// HTTP/JSON/WAV parsing helpers (ported from the C3 npu-serve), pure + unit-tested.
 pub mod parse {
-    pub fn parse_inputs(body: &str) -> Vec<String> {
-        if let Some(idx) = body.find("\"input\"") {
-            let rest = &body[idx + 7..];
-            if let Some(open) = rest.find('[') {
-                let arr = &rest[open + 1..];
-                let end = arr.find(']').unwrap_or(arr.len());
-                return arr[..end].split('"').enumerate()
-                    .filter(|(i, _)| i % 2 == 1).map(|(_, s)| s.to_string()).collect();
-            }
-            if let Some(q1) = rest.find('"') {
-                let s = &rest[q1 + 1..];
-                if let Some(q2) = s.find('"') { return vec![s[..q2].to_string()]; }
+    /// The `input` of an embeddings request: one string, or an array of them.
+    ///
+    /// A real scan over JSON string literals, not a search for `[` and `]`. The previous version
+    /// looked for those characters anywhere in the body, so a `[` inside a string value started an
+    /// "array", a `]` inside one ended it, and splitting on unescaped `"` cut an input in half at
+    /// every `\"`. All three returned a wrong answer under HTTP 200; prose with links, quotes or
+    /// brackets is the common case, not the corner case.
+    ///
+    /// `Err` rather than a best guess: the old fallback treated an unparseable body as the text to
+    /// embed, which turned a client bug into a plausible-looking vector.
+    pub fn parse_inputs(body: &str) -> Result<Vec<String>, String> {
+        let b = body.as_bytes();
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] != b'"' { i += 1; continue; }
+            let (key, after) = scan_json_string(body, i)?;
+            // A string is a KEY only if a colon follows it; otherwise it is a value, and scanning
+            // past it as a unit is exactly what stops `"input"` inside a value from matching.
+            let mut j = after;
+            while j < b.len() && b[j].is_ascii_whitespace() { j += 1; }
+            if j < b.len() && b[j] == b':' {
+                if key == "input" { return scan_input_value(body, j + 1); }
+                i = j + 1;
+            } else {
+                i = after;
             }
         }
-        vec![body.trim().to_string()]
+        Err("missing \"input\" field".into())
+    }
+
+    /// The value after `"input":` -- a string, or an array of strings.
+    fn scan_input_value(s: &str, mut i: usize) -> Result<Vec<String>, String> {
+        let b = s.as_bytes();
+        while i < b.len() && b[i].is_ascii_whitespace() { i += 1; }
+        match b.get(i) {
+            Some(b'"') => Ok(vec![scan_json_string(s, i)?.0]),
+            Some(b'[') => {
+                let mut out = Vec::new();
+                i += 1;
+                loop {
+                    while i < b.len() && b[i].is_ascii_whitespace() { i += 1; }
+                    match b.get(i) {
+                        Some(b']') => return Ok(out),
+                        Some(b',') => i += 1,
+                        Some(b'"') => { let (v, n) = scan_json_string(s, i)?; out.push(v); i = n; }
+                        Some(c) => return Err(format!("input array: expected a string, got {:?}", *c as char)),
+                        None => return Err("unterminated input array".into()),
+                    }
+                }
+            }
+            Some(c) => Err(format!("input must be a string or an array of strings, got {:?}", *c as char)),
+            None => Err("input has no value".into()),
+        }
+    }
+
+    /// Decode the JSON string literal starting at `start` (which must be its opening quote).
+    /// Returns the decoded text and the index just past the closing quote.
+    fn scan_json_string(s: &str, start: usize) -> Result<(String, usize), String> {
+        let b = s.as_bytes();
+        if b.get(start) != Some(&b'"') { return Err("expected a string".into()); }
+        let mut out = String::new();
+        let mut i = start + 1;
+        while i < b.len() {
+            match b[i] {
+                b'"' => return Ok((out, i + 1)),
+                b'\\' => {
+                    i += 1;
+                    match *b.get(i).ok_or("string ends inside an escape")? {
+                        b'"' => out.push('"'),
+                        b'\\' => out.push('\\'),
+                        b'/' => out.push('/'),
+                        b'b' => out.push('\u{8}'),
+                        b'f' => out.push('\u{c}'),
+                        b'n' => out.push('\n'),
+                        b'r' => out.push('\r'),
+                        b't' => out.push('\t'),
+                        b'u' => { let (c, n) = scan_unicode_escape(b, i + 1)?; out.push(c); i = n - 1; }
+                        c => return Err(format!("bad escape \\{:?}", c as char)),
+                    }
+                    i += 1;
+                }
+                // Not ASCII-indexable: step by whole chars so multi-byte UTF-8 is copied intact.
+                // Slicing `s` is O(1), so this stays linear over the body.
+                _ => {
+                    let c = s[i..].chars().next().ok_or("invalid UTF-8 in string")?;
+                    out.push(c);
+                    i += c.len_utf8();
+                }
+            }
+        }
+        Err("unterminated string".into())
+    }
+
+    /// A `\uXXXX` escape, including the surrogate PAIR a non-BMP character needs. Returns the
+    /// character and the index just past the escape. A lone surrogate is an error, not a
+    /// replacement char: it means the client sent something it could not have meant.
+    fn scan_unicode_escape(b: &[u8], i: usize) -> Result<(char, usize), String> {
+        let hi = hex4(b, i)?;
+        if !(0xD800..0xDC00).contains(&hi) {
+            let c = char::from_u32(hi as u32).ok_or("invalid \\u escape")?;
+            return Ok((c, i + 4));
+        }
+        if b.get(i + 4) != Some(&b'\\') || b.get(i + 5) != Some(&b'u') {
+            return Err("high surrogate without a following \\u escape".into());
+        }
+        let lo = hex4(b, i + 6)?;
+        if !(0xDC00..0xE000).contains(&lo) { return Err("high surrogate not followed by a low one".into()); }
+        let cp = 0x10000 + (((hi - 0xD800) as u32) << 10) + (lo - 0xDC00) as u32;
+        Ok((char::from_u32(cp).ok_or("invalid surrogate pair")?, i + 10))
+    }
+
+    fn hex4(b: &[u8], i: usize) -> Result<u16, String> {
+        let s = b.get(i..i + 4).ok_or("truncated \\u escape")?;
+        let s = std::str::from_utf8(s).map_err(|_| "bad \\u escape".to_string())?;
+        u16::from_str_radix(s, 16).map_err(|_| format!("bad \\u escape {s:?}"))
     }
     pub fn json_escape(s: &str) -> String {
         let mut o = String::with_capacity(s.len());
@@ -336,10 +440,88 @@ pub mod parse {
     #[cfg(test)]
     mod tests {
         use super::*;
+        fn ok(body: &str) -> Vec<String> { parse_inputs(body).expect("should parse") }
+
         #[test]
         fn parse_inputs_single_and_array() {
-            assert_eq!(parse_inputs(r#"{"input":"hello"}"#), vec!["hello".to_string()]);
-            assert_eq!(parse_inputs(r#"{"input":["a","b"]}"#), vec!["a".to_string(), "b".to_string()]);
+            assert_eq!(ok(r#"{"input":"hello"}"#), vec!["hello".to_string()]);
+            assert_eq!(ok(r#"{"input":["a","b"]}"#), vec!["a".to_string(), "b".to_string()]);
+        }
+
+        /// The three defects found by indexing the KB through the engine (2026-07-27). Each returned
+        /// a WRONG answer with HTTP 200, which is worse than an error: `rest.find('[')` treated a
+        /// bracket inside a string value as the start of an array, `arr.find(']')` ended the array at
+        /// the first bracket inside a string, and `split('"')` on odd indices was escape-unaware.
+        #[test]
+        fn parse_inputs_survives_the_three_measured_defects() {
+            // 1. a bracket in a single input parsed as an array of nothing -> 0 embeddings, HTTP 200.
+            // `rest.find('[')` fired on the FIRST bracket wherever it sat, so one is enough to
+            // reproduce; the case that found this in the wild carried a doubled-bracket link.
+            assert_eq!(ok(r#"{"input":"see [a link] here"}"#),
+                vec!["see [a link] here".to_string()]);
+            // 2. a `]` inside one element truncated the batch
+            let many: Vec<String> = (0..64)
+                .map(|i| if i == 7 { "a ] bracket".to_string() } else { format!("t{i}") }).collect();
+            let body = format!("{{\"input\":[{}]}}",
+                many.iter().map(|t| format!("\"{}\"", t)).collect::<Vec<_>>().join(","));
+            assert_eq!(ok(&body), many);
+            // 3. an escaped quote split one input into two
+            assert_eq!(ok(r#"{"input":["a","he said \"hi\"","c"]}"#),
+                vec!["a".to_string(), "he said \"hi\"".to_string(), "c".to_string()]);
+        }
+
+        /// Gate 1's corpus. Every case asserts a specific value -- "did not crash" is not a pass,
+        /// because the defining bug returned 200 with an empty body.
+        #[test]
+        fn parse_inputs_adversarial_corpus() {
+            // brackets, braces, backslashes, leading dashes
+            assert_eq!(ok(r#"{"input":"- a bullet"}"#), vec!["- a bullet".to_string()]);
+            assert_eq!(ok(r#"{"input":"-- a flag"}"#), vec!["-- a flag".to_string()]);
+            assert_eq!(ok(r#"{"input":"a lone { brace"}"#), vec!["a lone { brace".to_string()]);
+            assert_eq!(ok(r#"{"input":"back\\slash"}"#), vec!["back\\slash".to_string()]);
+            // whitespace escapes survive as characters, not as literals
+            assert_eq!(ok(r#"{"input":"line\nnext\ttab"}"#), vec!["line\nnext\ttab".to_string()]);
+            // empty and whitespace-only are inputs, not absences
+            assert_eq!(ok(r#"{"input":""}"#), vec![String::new()]);
+            assert_eq!(ok(r#"{"input":"   "}"#), vec!["   ".to_string()]);
+            // non-ASCII and emoji, literal and \u-escaped, including a surrogate pair
+            assert_eq!(ok(r#"{"input":"привет 🌍"}"#), vec!["привет 🌍".to_string()]);
+            assert_eq!(ok(r#"{"input":"при"}"#), vec!["при".to_string()]);
+            assert_eq!(ok(r#"{"input":"🌍"}"#), vec!["🌍".to_string()]);
+            // field order must not matter, and `model` must never be mistaken for the input
+            assert_eq!(ok(r#"{"model":"bge","input":"x"}"#), vec!["x".to_string()]);
+            assert_eq!(ok(r#"{"input":"x","model":"bge"}"#), vec!["x".to_string()]);
+            // a value that merely CONTAINS the key name is not the key
+            assert_eq!(ok(r#"{"model":"has \"input\": inside","input":"real"}"#),
+                vec!["real".to_string()]);
+            // longer than any model window: length is the caller's problem, not the parser's
+            let long = "x".repeat(100_000);
+            assert_eq!(ok(&format!("{{\"input\":\"{long}\"}}")), vec![long]);
+            // a batch mixing all of the above
+            assert_eq!(ok(r#"{"input":["[l]","he \"said\"","- b","🌍",""]}"#),
+                vec!["[l]".to_string(), "he \"said\"".to_string(), "- b".to_string(),
+                     "🌍".to_string(), String::new()]);
+            assert_eq!(ok(r#"{"input":[]}"#), Vec::<String>::new());
+        }
+
+        /// Malformed input must be an error the route can turn into a 400 -- never a silent empty
+        /// `data` list, and never the old "treat the whole body as the text" fallback.
+        #[test]
+        fn parse_inputs_rejects_malformed_instead_of_guessing() {
+            for bad in [
+                "",                              // no body at all
+                "not json",
+                r#"{"model":"bge"}"#,            // no input field
+                r#"{"input":}"#,                 // no value
+                r#"{"input":"unterminated"#,     // unterminated string
+                r#"{"input":["a","b""#,          // unterminated array
+                r#"{"input":123}"#,              // wrong type
+                r#"{"input":[1,2]}"#,            // wrong element type
+                r#"{"input":"bad \q escape"}"#,
+                r#"{"input":"\ud83c only a high surrogate"}"#,
+            ] {
+                assert!(parse_inputs(bad).is_err(), "must reject {bad:?}");
+            }
         }
         #[test]
         fn json_escape_quotes_and_newlines() { assert_eq!(json_escape("a\"b\nc"), "a\\\"b\\nc"); }

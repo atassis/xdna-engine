@@ -29,7 +29,10 @@ enum Cmd {
     /// One-shot transcription of a 16 kHz mono 16-bit WAV.
     Transcribe { wav: PathBuf, #[arg(long)] model: Option<String> },
     /// One-shot embedding of a text string.
-    Embed { text: String, #[arg(long)] model: Option<String> },
+    /// `allow_hyphen_values`: the text to embed is prose, and prose begins with `-` all the time
+    /// (every Markdown bullet). Without it clap read a bullet as an unknown flag and failed with a
+    /// usage error, so the CLI rejected inputs the HTTP route accepted.
+    Embed { #[arg(allow_hyphen_values = true)] text: String, #[arg(long)] model: Option<String> },
     /// List models on a running server.
     Models { #[arg(long)] port: Option<u16> },
     /// Ask a running server to re-read the config and reconcile.
