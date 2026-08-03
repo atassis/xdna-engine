@@ -1142,7 +1142,11 @@ impl NpuMatmul {
                     kern, instr, n,
                 })
             } else {
-                if !npu_xrt::quiet() && want {
+                // NOT quiet-gated: NPU_QUIET suppresses BANNERS (which precision, which xclbin),
+                // and this is a DEGRADATION -- the run is slower than the one that was asked for.
+                // `npu transcribe`/`embed` set NPU_QUIET=1 by default, which is exactly where a
+                // silently-missing artifact would otherwise go unreported.
+                if want {
                     eprintln!("[npu] lnaffcast xclbin absent in {} -- LN seam stays a 2-dispatch chain", self.ln_dir.display());
                 }
                 None
@@ -1289,7 +1293,9 @@ impl NpuMatmul {
                 // Say why the DEFAULT path is not running. The old wording blamed the env var, which
                 // is now wrong in the common case: the flag defaults on, so an operator who set
                 // nothing would be told they had set something.
-                if !npu_xrt::quiet() && self.fc1_pack_in_drain_on() {
+                // NOT quiet-gated, same reason as the lnaffcast warning above: a missing artifact
+                // that silently costs ~3.4%/clip is a degradation, not a banner.
+                if self.fc1_pack_in_drain_on() {
                     eprintln!("[npu] final_{tag}.xclbin absent in {} -- falling back to fc1+deint (slower by ~3.4%/clip). \
                                Build it with scripts/build_parakeet_modal_kernels.sh, or set PARAKEET_FC1_PACK_IN_DRAIN=0 to silence this.",
                               self.ln_dir.display());
