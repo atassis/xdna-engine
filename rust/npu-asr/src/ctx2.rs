@@ -70,6 +70,20 @@ impl Precision {
             _ => Precision::FastBf16,
         }
     }
+
+    /// `Makefile.modal`'s `nat_tag`, which every `Makefile.modal` artifact name ends with:
+    ///
+    /// ```make
+    /// nat_tag=$(if $(filter 1,${emulate_bfloat16_mmul_with_bfp16}),,nat)
+    /// ```
+    ///
+    /// i.e. a build WITHOUT the bfp16 emulation flag is tagged `nat`, so a fast-flagged build can
+    /// never be mistaken for the native kernel. We are the consumer side of that guard: only
+    /// `NativeBf16` omits the flag, so only it carries the tag. Int8 is unaffected -- it is built by
+    /// `Makefile.modal.int8`, whose `target_suffix` has no `nat_tag` at all.
+    fn nat_tag(self) -> &'static str {
+        if self == Precision::NativeBf16 { "nat" } else { "" }
+    }
 }
 /// ctxA fixed contraction / padded output width.
 pub const KA: usize = 768;
@@ -226,7 +240,8 @@ impl SharedCtxA {
             // opts into the 3-branch modalgelu superset (adds rtp[0]=2 = on-chip GELU for the Whisper encoder
             // fc1 fusion); silu/identity behavior is unchanged (validated baseline-identical without fusion).
             let tag = if std::env::var("NPU_ENC_GELU_FUSED").is_ok() { "modalgelu" } else { "modalsilu" };
-            crate::kernel_registry::xclbin_path(&wa, &format!("{PAD_M}x{KAUG}x{NA}_{mt}x{kt}x{nt}_8c_{tag}"))
+            let nat = prec.nat_tag();
+            crate::kernel_registry::xclbin_path(&wa, &format!("{PAD_M}x{KAUG}x{NA}_{mt}x{kt}x{nt}_8c_{tag}{nat}"))
         } else {
             crate::kernel_registry::xclbin_path(&wa, &format!("{PAD_M}x{KA}x{NA}_{mt}x{kt}x{nt}_8c"))
         };
@@ -282,7 +297,8 @@ impl SharedCtxA {
                 // mode: 1=silu, 0=identity (every N); 2=gelu only when NPU_ENC_GELU_FUSED + a stream exists
                 // (built for N=NA, the FFN fc1 width — the only gelu user). All modes run on the loaded xclbin.
                 for (mode, tag) in [(1u8, "modalsilu"), (0u8, "modalid"), (2u8, "modalgelu")] {
-                    let insts = crate::kernel_registry::insts_path(&wa, &format!("{PAD_M}x{KAUG}x{n}_{mt}x{kt}x{nt}_8c_{tag}"));
+                    let nat = prec.nat_tag();
+                    let insts = crate::kernel_registry::insts_path(&wa, &format!("{PAD_M}x{KAUG}x{n}_{mt}x{kt}x{nt}_8c_{tag}{nat}"));
                     if mode == 2 && (!gelu_enabled || !insts.exists()) {
                         continue; // gelu stream only loaded when opted-in + present (NA only)
                     }
@@ -1447,5 +1463,46 @@ fn i8_bytes(v: &[i8]) -> &[u8] {
 impl SharedCtxA {
     fn dev_alloc_b(&self, nbytes: usize) -> Result<Bo, String> {
         self.dev.alloc_bo(&self.kern, nbytes, FLAG_HOST_ONLY, self.g_b)
+    }
+}
+
+#[cfg(test)]
+mod nat_tag_tests {
+    use super::Precision;
+
+    #[test]
+    fn only_native_carries_the_nat_tag() {
+        assert_eq!(Precision::NativeBf16.nat_tag(), "nat");
+        assert_eq!(Precision::FastBf16.nat_tag(), "");
+        // int8 is built by Makefile.modal.int8, whose target_suffix has no nat_tag at all.
+        assert_eq!(Precision::Int8.nat_tag(), "");
+    }
+
+    /// Cross-language pin. `nat_tag` above mirrors a rule in `Makefile.modal`; nothing else couples
+    /// them, and they have already drifted once -- `build_kernels.sh` asked for `..._modalid` after
+    /// the makefile started emitting `..._modalidnat`, which under `set -euo pipefail` silently
+    /// truncated the rest of the build. If upstream changes the rule, fail HERE rather than at the
+    /// next missing-artifact panic.
+    ///
+    /// Skips when the submodule is absent, so a checkout without `mlir-aie` does not fail; a test
+    /// that cannot see its subject must not claim to have checked it.
+    #[test]
+    fn nat_tag_still_matches_the_makefile_rule() {
+        let mk = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../mlir-aie/programming_examples/basic/matrix_multiplication/whole_array/Makefile.modal");
+        let src = match std::fs::read_to_string(&mk) {
+            Ok(s) => s,
+            Err(_) => { eprintln!("skip: {} absent", mk.display()); return; }
+        };
+        assert!(
+            src.contains("nat_tag=$(if $(filter 1,${emulate_bfloat16_mmul_with_bfp16}),,nat)"),
+            "Makefile.modal's nat_tag rule changed; Precision::nat_tag and build_kernels.sh's \
+             native target names must be updated to match:\n{}",
+            src.lines().filter(|l| l.contains("nat_tag")).collect::<Vec<_>>().join("\n"));
+        // ...and that the tag is actually the LAST component of the artifact name, which is what
+        // makes appending it to our format! strings correct.
+        assert!(
+            src.contains("${re_tag}${nat_tag}"),
+            "nat_tag is no longer the final suffix component; the append order in ctx2 is wrong");
     }
 }
