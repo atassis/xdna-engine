@@ -147,6 +147,21 @@ fn main() {
             &wa.join("insts_512x1024x4096_32x32x128_8c_modalsilubf16outpanel1024.txt"),
             [PAD_M * KRES * 2, KRES * DFF * 2, c_bytes_bf16, 1, 4],
         ),
+        // M=256 vs M=512 at identical K/N/tile: prices the PAD_M padding axis. Every encoder clip is
+        // T'<=172 and relpos caps at 172, so M=256 covers the whole set -- the question is only what
+        // the halved row count buys, since W (K x N) does not shrink with M.
+        Brick::load(
+            &dev,
+            &wa.join("final_256x1024x4096_64x32x128_8c_modalsilukrtp.xclbin"),
+            &wa.join("insts_256x1024x4096_64x32x128_8c_modalsilukrtp.txt"),
+            [256 * KRES * 2, KRES * DFF * 2, 256 * DFF * 4, 1, 4],
+        ),
+        Brick::load(
+            &dev,
+            &wa.join("final_512x1024x4096_64x32x128_8c_modalsilukrtp.xclbin"),
+            &wa.join("insts_512x1024x4096_64x32x128_8c_modalsilukrtp.txt"),
+            [PAD_M * KRES * 2, KRES * DFF * 2, PAD_M * DFF * 4, 1, 4],
+        ),
         // The six bricks the fc2/conv/MHSA path adds. Without them REPLAY panics on an unknown
         // name, so the probe could only ever see 3 of the 9 kernels the encoder alternates among
         // -- and the three it saw are the CHEAP ones. Sizes copied from npu.rs's own alloc sites.

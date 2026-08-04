@@ -561,7 +561,13 @@ def my_matmul(
             )
 
     tb_max_n_rows = 4
-    tb_n_rows = tb_max_n_rows // 2
+    # DERIVED, not `tb_max_n_rows // 2`: the C tiler below asks for exactly this many row-blocks, so a
+    # bare 2 forces M % (2 * m * n_aie_rows) == 0 -- i.e. M % 512 == 0 for the shipped 64x32x128 tile.
+    # That constraint is what makes PAD_M 512 and leaves 66-90% of every modal GEMM's rows as padding
+    # at the encoder's T=52..172. The RUNTIME loop already clamps the same quantity
+    # (`min(tb_max_n_rows // 2, M // m // n_aie_rows - row_base)`), so the tiler was the only place
+    # assuming two blocks exist.
+    tb_n_rows = min(tb_max_n_rows // 2, M // m // n_aie_rows)
 
     A_tiles = TensorTiler2D.group_tiler(
         (M, K),
