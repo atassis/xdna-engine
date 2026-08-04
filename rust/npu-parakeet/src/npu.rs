@@ -679,8 +679,16 @@ impl NpuMatmul {
             // per-inst-stream RTP selects silu@N=4096 / identity elsewhere -> the FFN SiLU runs on
             // chip with zero extra hw-context switches). Fall back to the plain matmul xclbin if the
             // modal build is absent (then `modal=false` and the host keeps applying silu).
+            // PREFER the krtp resident: its cores read the k-loop bound from rtp[1], which is what
+            // lets ONE resident serve K=KRES and the K=DFF one-dispatch fc2. Without it the fc2
+            // K-split (4 partials + 4 acc_add) is the only correct path, and that is 336 extra
+            // transitions/clip -- measured at 2.32 ms each. Falls back to the baked resident when the
+            // krtp artifact is absent, which is correct, just slower.
+            let krtp_stem = format!("512x1024x4096_{tile}_8c_modalsilukrtp");
             let modal_stem = format!("512x1024x4096_{tile}_8c_modalsilu");
-            let stem = if kernel_registry::xclbin_path(&base, &modal_stem).exists() {
+            let stem = if kernel_registry::xclbin_path(&base, &krtp_stem).exists() {
+                krtp_stem
+            } else if kernel_registry::xclbin_path(&base, &modal_stem).exists() {
                 modal_stem
             } else {
                 let mut chosen = None;
@@ -2395,8 +2403,28 @@ impl NpuMatmul {
     /// True when the one-dispatch K=DFF fc2 collapse is enabled (opt-in `PARAKEET_FC2_ONEDISPATCH`).
     /// Unlike `fc2_k4096_on` this is tested on the DEFAULT path, not inside a `None` arm the default
     /// never takes -- see the warning in `ffn_dev_accum`.
+    /// One-dispatch fc2: contract all DFF of K in ONE modal dispatch instead of 4 K=KRES partials +
+    /// 4 acc_add. DEFAULT ON; `PARAKEET_FC2_ONEDISPATCH=0` is a kill switch, matching the house
+    /// pattern for the other resident seams.
+    ///
+    /// It REQUIRES the krtp resident -- at `k != KRES` the k-loop bound comes from rtp[1], and a BAKED
+    /// resident would contract over its own K instead. Today a mispairing happens to panic on a
+    /// missing `...apanel1024` insts file, but that is safety by an artifact's ABSENCE: build that
+    /// artifact and the protection disappears. So the requirement is checked here explicitly, and the
+    /// path declines rather than dispatching a wrong contraction.
     fn fc2_onedispatch_on(&self) -> bool {
-        std::env::var("PARAKEET_FC2_ONEDISPATCH").map(|v| v != "0").unwrap_or(false)
+        if !std::env::var("PARAKEET_FC2_ONEDISPATCH").map(|v| v != "0").unwrap_or(true) {
+            return false;
+        }
+        if !self.krtp {
+            // Not an error: the K-split path below is correct and is what a non-krtp resident wants.
+            if !npu_xrt::quiet() {
+                eprintln!("[npu] one-dispatch fc2 needs the krtp resident -- using the K-split fc2 \
+                           (build/select final_{PAD_M}x{KRES}x{DFF}_..._modalsilukrtp to enable it)");
+            }
+            return false;
+        }
+        true
     }
 
     /// Output BO for the one-dispatch fc2, lazily allocated against the RESIDENT kernel's C group.
