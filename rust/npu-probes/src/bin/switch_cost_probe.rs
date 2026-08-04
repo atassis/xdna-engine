@@ -34,6 +34,23 @@ const PAD_M: usize = 512;
 const KRES: usize = 1024;
 const DFF: usize = 4096;
 
+// dwconv_silu_t, mirroring npu.rs's DW_* block.
+const DW_C: usize = 1024;
+const DW_T: usize = 400;
+const DW_K: usize = 9;
+const DW_TPAD: usize = DW_T + 2 * 4; // 'same' pad = (K-1)/2 = 4
+
+// relpos bucket_152, derived exactly as `relpos_block` does rather than written as three magic
+// byte counts: RELPOS_BUCKETS says (BUILT_T, KB) = (152, 38).
+const RELPOS_TQ: usize = 8;
+const RELPOS_DK: usize = 128;
+const RELPOS_HEADS: usize = 8;
+const RELPOS_BT: usize = 152;
+const RELPOS_KB: usize = 38;
+const RELPOS_NQT: usize = RELPOS_BT.div_ceil(RELPOS_TQ);
+const RELPOS_TP: usize = RELPOS_BT.div_ceil(RELPOS_KB) * RELPOS_KB;
+const RELPOS_PP: usize = (2 * RELPOS_BT - 1).div_ceil(RELPOS_KB) * RELPOS_KB;
+
 /// One dispatchable brick, with the BO sizes the shipped encoder gives it (args 3,4,5,6,7 of the
 /// matmul8 ABI). Sizes are copied from `npu-parakeet/src/npu.rs` so per-dispatch bytes are real.
 struct Brick {
@@ -129,6 +146,54 @@ fn main() {
             &wa.join("final_512x1024x4096_32x32x128_8c_modalsilubf16outpanel1024.xclbin"),
             &wa.join("insts_512x1024x4096_32x32x128_8c_modalsilubf16outpanel1024.txt"),
             [PAD_M * KRES * 2, KRES * DFF * 2, c_bytes_bf16, 1, 4],
+        ),
+        // The six bricks the fc2/conv/MHSA path adds. Without them REPLAY panics on an unknown
+        // name, so the probe could only ever see 3 of the 9 kernels the encoder alternates among
+        // -- and the three it saw are the CHEAP ones. Sizes copied from npu.rs's own alloc sites.
+        Brick::load(
+            &dev,
+            &ln.join("final_accadd_512x1024.xclbin"),
+            &ln.join("insts_accadd_512x1024.txt"),
+            [PAD_M * KRES * 4, PAD_M * KRES * 4, PAD_M * KRES * 4, 8, 1],
+        ),
+        Brick::load(
+            &dev,
+            &ln.join("final_glu_512x1024.xclbin"),
+            &ln.join("insts_glu_512x1024.txt"),
+            [PAD_M * 2 * KRES * 4, PAD_M * KRES * 4, 1, 8, 1],
+        ),
+        Brick::load(
+            &dev,
+            &ln.join("final_resadd_512x1024_s050.xclbin"),
+            &ln.join("insts_resadd_512x1024_s050.txt"),
+            [PAD_M * KRES * 4, PAD_M * KRES * 4, PAD_M * KRES * 4, 8, 1],
+        ),
+        Brick::load(
+            &dev,
+            &ln.join("final_resadd_512x1024_s100.xclbin"),
+            &ln.join("insts_resadd_512x1024_s100.txt"),
+            [PAD_M * KRES * 4, PAD_M * KRES * 4, PAD_M * KRES * 4, 8, 1],
+        ),
+        Brick::load(
+            &dev,
+            &ln.join("final_dwconv_silu_t_1024x400.xclbin"),
+            &ln.join("insts_dwconv_silu_t_1024x400.txt"),
+            [DW_TPAD * DW_C * 2, (DW_K + 1) * DW_C * 2, DW_T * DW_C * 4, 8, 1],
+        ),
+        // relpos: the priciest dispatch in the encoder (9.9 ms in place) and the one this probe
+        // has never covered. Its artifact is literally named `final.xclbin`, which is why it shows
+        // up as the bare label `final` in every dispatch report.
+        Brick::load(
+            &dev,
+            &root.join("artifacts/relpos/bucket_152/final.xclbin"),
+            &root.join("artifacts/relpos/bucket_152/insts.bin"),
+            [
+                RELPOS_HEADS * 2 * RELPOS_NQT * RELPOS_TQ * RELPOS_DK * 2,
+                RELPOS_HEADS * (RELPOS_TP + RELPOS_PP + RELPOS_PP + RELPOS_TP) * RELPOS_DK * 2,
+                RELPOS_HEADS * RELPOS_NQT * RELPOS_TQ * RELPOS_DK * 2,
+                1,
+                4,
+            ],
         ),
     ];
     let idx: BTreeMap<&str, usize> =
