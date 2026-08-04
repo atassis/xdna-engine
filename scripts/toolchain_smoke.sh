@@ -14,6 +14,11 @@ export MLIR_AIE_INSTANCE="$INST"   # route_b_override.mk hard-requires this; wit
                                    # dies in make before compiling anything, which reads as a
                                    # toolchain failure rather than the missing export it is.
 MMW="$REPO/mlir-aie/programming_examples/basic/matrix_multiplication/whole_array"
+# This gate COPIES generator + Makefile into the mlir-aie submodule and builds there, which is the
+# exact drift surface verify_kernel_source.sh exists to catch: a correctly-bumped toolchain.lock can
+# still compile stale kernel source with no error. Check before spending the build, same as the four
+# build_*.sh scripts. (Left unwired until now only because another session held this file modified.)
+"$REPO/scripts/verify_kernel_source.sh" Makefile.modal
 cp "$REPO/route_b_kernels/whole_array_fused/whole_array_modal_iron.py" "$MMW/"   # bare-resolve_program generator
 cp "$REPO/route_b_kernels/whole_array_fused/Makefile.modal" "$MMW/"
 rm -f "$MMW"/build/mm_silu_epilogue_64x32x96.o "$MMW"/build/mm_64x32x96.o "$MMW"/build/aie_512x800x3072_64x32x96_8c_modalsilu.mlir
