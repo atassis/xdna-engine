@@ -247,7 +247,45 @@ def my_relpos_stream(dev, T, TQ, KB, t_active=None, splitp=False, heads=1, tskip
     # K) then qv_tile (phase P); 2*n_qt blocks, read ONCE (no replay).
     # PER HEAD: each head's Worker gets its own quv/kpv/ctx fifos (H distinct streams,
     # scattered from the shim by a per-head OFFSET tap -- heads do NOT share data).
-    of_quv = [ObjectFifo(quv_blk_ty, name=f"quv{c}", depth=2) for c in range(n_cores)]
+    # MEMTILE STAGING (rows>1) -- forced by the SHIM DMA CHANNEL budget, not by bandwidth.
+    # A ShimNOC tile has 2 DMA channels per direction (AIE2TargetModel::getNumDest/
+    # SourceShimMuxConnections(DMA)), so the array's 8 shim tiles give 16 MM2S total -- and the
+    # rows=1 design already uses ALL 16 (8 quv fills + 8 kpv fills). Attaching per-core fifos to
+    # the shim wants 4*8+8 = 40 and place-tiles rejects it outright. So each head keeps exactly
+    # ONE shim MM2S for quv and ONE shim S2MM for ctx, and the fan-out to its `rows` cores happens
+    # in the MemTile (6 DMA channels per direction), via split()/join(). Shim usage is then
+    # IDENTICAL to rows=1 no matter how many cores a head drives.
+    #
+    # The L2 object is one ROUND = `rows` blocks, one per core. Because the core acquires qu and
+    # qv as two separate blocks, a round carries qu for all `rows` cores, then qv for all of them;
+    # the shim fill tap below re-orders L3 into that sequence, so the HOST packing is unchanged.
+    if rows > 1:
+        quv_round_ty = np.ndarray[(rows * TQ * DK,), np.dtype[bfloat16]]
+        ctx_round_ty = np.ndarray[(rows * TQ * DK,), np.dtype[bfloat16]]
+        of_quv_l2 = [ObjectFifo(quv_round_ty, name=f"quvl2{h}", depth=2) for h in range(heads)]
+        of_ctx_l2 = [ObjectFifo(ctx_round_ty, name=f"ctxl2{h}", depth=2) for h in range(heads)]
+        # split(): one L2 consumer -> `rows` per-core producers, core r taking block r of the round.
+        of_quv_split = [
+            of_quv_l2[h].cons().split(
+                [r * TQ * DK for r in range(rows)],
+                obj_types=[quv_blk_ty] * rows,
+                names=[f"quv{h}_{r}" for r in range(rows)],
+            )
+            for h in range(heads)
+        ]
+        # join(): `rows` per-core consumers -> one L2 producer, reassembling the round in tile order.
+        of_ctx_join = [
+            of_ctx_l2[h].prod().join(
+                [r * TQ * DK for r in range(rows)],
+                obj_types=[ctx_blk_ty] * rows,
+                names=[f"ctx{h}_{r}" for r in range(rows)],
+            )
+            for h in range(heads)
+        ]
+        of_quv = [of_quv_split[c // rows][c % rows] for c in range(n_cores)]
+        of_ctx = [of_ctx_join[c // rows][c % rows] for c in range(n_cores)]
+    else:
+        of_quv = [ObjectFifo(quv_blk_ty, name=f"quv{c}", depth=2) for c in range(n_cores)]
     # Channel B: kpv key-block stream. obj = ONE [KB,DK] block; the shim re-reads
     # the whole padded kpv (16 blocks) from DDR offset 0 n_qt times via the repeat
     # tap (single BD, repeat_count=n_qt-1 -- see the rt.fill below), so each query
@@ -257,7 +295,8 @@ def my_relpos_stream(dev, T, TQ, KB, t_active=None, splitp=False, heads=1, tskip
     # of_kpv is PER HEAD (not per core): head h's `rows` cores share one k/p/V stream via
     # multicast, so the shim sends n_qt_core replays instead of n_qt and every core sees them all.
     of_kpv = [ObjectFifo(kblk_ty, name=f"kpv{h}", depth=2) for h in range(heads)]
-    of_ctx = [ObjectFifo(ctx_blk_ty, name=f"ctx{c}", depth=2) for c in range(n_cores)]
+    if rows == 1:
+        of_ctx = [ObjectFifo(ctx_blk_ty, name=f"ctx{c}", depth=2) for c in range(n_cores)]
 
     # ---- block-brick kernels (int32-scalar ABI; see PROBE 1) ----
     # TSKIP: the _ts bricks take the softmax's rtp register + the tile's global q0 and
@@ -444,22 +483,31 @@ def my_relpos_stream(dev, T, TQ, KB, t_active=None, splitp=False, heads=1, tskip
                 [heads * kpv_head_len], h * kpv_head_len,
                 [n_qt_core, 1, kpv_pad_rows, DK], [0, 0, DK, 1])
             kpv_prods[h].fill(KPV, tap=kpv_tap)
-        # quv / ctx: per CORE. Core (h,r) owns the round-robin tile set r, r+rows, r+2*rows, ...
-        # so its slice of the tile-interleaved QUV (and of CTX) is STRIDED by rows tiles, not
-        # contiguous -- one extra tap dim, no extra BD.
-        for h in range(heads):
-            for r in range(rows):
-                c = h * rows + r
-                quv_tile = 2 * TQ * DK          # one tile's qu+qv pair
-                ctx_tile = TQ * DK
+        if rows == 1:
+            for h in range(heads):
                 quv_tap = TensorAccessPattern(
-                    [heads * quv_head_len], h * quv_head_len + r * quv_tile,
-                    [n_qt_core, quv_tile], [rows * quv_tile, 1])
+                    [heads * quv_head_len], h * quv_head_len, [quv_head_len], [1])
                 ctx_tap = TensorAccessPattern(
-                    [heads * ctx_head_len], h * ctx_head_len + r * ctx_tile,
-                    [n_qt_core, ctx_tile], [rows * ctx_tile, 1])
-                quv_prods[c].fill(QUV, tap=quv_tap)
-                ctx_conses[c].drain(CX, tap=ctx_tap, wait=True)
+                    [heads * ctx_head_len], h * ctx_head_len, [ctx_head_len], [1])
+                quv_prods[h].fill(QUV, tap=quv_tap)
+                ctx_conses[h].drain(CX, tap=ctx_tap, wait=True)
+        else:
+            # ONE shim MM2S + ONE shim S2MM per head; the MemTile split/join fans out to the cores.
+            # QUV re-order tap: L3 is tile-interleaved [qu(t),qv(t),qu(t+1),...] but a round must
+            # arrive as qu for all `rows` cores, then qv for all of them (the core acquires qu and
+            # qv as separate blocks). 4 dims: round, u/v selector, core, element.
+            blk = TQ * DK
+            for h in range(heads):
+                quv_tap = TensorAccessPattern(
+                    [heads * quv_head_len], h * quv_head_len,
+                    [n_qt_core, 2, rows, blk],
+                    [rows * 2 * blk, blk, 2 * blk, 1])
+                # CTX needs no re-order: round i holds tiles i*rows .. i*rows+rows-1, which is
+                # exactly their L3 order, so the head's whole ctx slice drains contiguously.
+                ctx_tap = TensorAccessPattern(
+                    [heads * ctx_head_len], h * ctx_head_len, [ctx_head_len], [1])
+                quv_prods[h].fill(QUV, tap=quv_tap)
+                ctx_conses[h].drain(CX, tap=ctx_tap, wait=True)
 
     rt = Runtime(
         sequence,
@@ -467,9 +515,11 @@ def my_relpos_stream(dev, T, TQ, KB, t_active=None, splitp=False, heads=1, tskip
             quv_arg_ty,
             kpv_arg_ty,
             ctx_arg_ty,
-            [of_quv[c].prod() for c in range(n_cores)],
+            # rows>1 attaches the runtime to the per-head L2 relay, not to the per-core fifos --
+            # that is what holds shim usage at 16 MM2S / 8 S2MM regardless of core count.
+            [(of_quv_l2[h] if rows > 1 else of_quv[h]).prod() for h in range(heads)],
             [of_kpv[h].prod() for h in range(heads)],
-            [of_ctx[c].cons() for c in range(n_cores)],
+            [(of_ctx_l2[h] if rows > 1 else of_ctx[h]).cons() for h in range(heads)],
         ],
     )
 

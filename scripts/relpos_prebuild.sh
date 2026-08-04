@@ -26,6 +26,9 @@ BUCKETS="${BUCKETS:-112:28:bucket_112 152:38:bucket_152 176:44:single}"
 # TSKIP=1 builds the runtime t_active block-skip arm (drop the blocks the softmax never reads).
 # OUT_ROOT redirects the artifacts so both arms can sit side by side for a swap A/B.
 TSKIP="${TSKIP:-0}"
+# ROWS>1 row-tiles each head across ROWS cores (k/p/V multicast + MemTile split/join). Each CORE
+# carries its own t_active RTP, so the insts hold HEADS*ROWS t_active words, not HEADS.
+ROWS="${ROWS:-1}"
 OUT_ROOT="${OUT_ROOT:-artifacts/relpos}"
 EX=mlir-aie/programming_examples/ml/relpos_mha
 
@@ -41,7 +44,7 @@ build_bucket() {
   fi
   echo "[prebuild] building STEP=8 T=$BUILT_T TQ=$TQ KB=$KB HEADS=$HEADS -> $out ..."
   ( cd "$EX" && make clean >/dev/null 2>&1; \
-    make NPU2=1 STEP=8 SPLITP=1 TSKIP="$TSKIP" T="$BUILT_T" TQ="$TQ" KB="$KB" TACTIVE="$BUILT_T" HEADS="$HEADS" >/dev/null 2>&1 )
+    make NPU2=1 STEP=8 SPLITP=1 TSKIP="$TSKIP" ROWS="$ROWS" T="$BUILT_T" TQ="$TQ" KB="$KB" TACTIVE="$BUILT_T" HEADS="$HEADS" >/dev/null 2>&1 )
   if [ ! -f "$EX/build/final.xclbin" ]; then
     echo "[prebuild] FAILED bucket $BUILT_T (no final.xclbin)"; return 1
   fi
@@ -57,8 +60,9 @@ w = [struct.unpack("<I", b[i:i+4])[0] for i in range(0, len(b), 4)]
 print(sum(1 for x in w if x == v))
 PY
 )
-  if [ "$nt" != "$HEADS" ]; then
-    echo "[prebuild] WARN: bucket $BUILT_T found $nt insts words == BUILT_T, expected HEADS=$HEADS t_active words."
+  local want=$(( HEADS * ROWS ))
+  if [ "$nt" != "$want" ]; then
+    echo "[prebuild] WARN: bucket $BUILT_T found $nt insts words == BUILT_T, expected HEADS*ROWS=$want t_active words."
     echo "[prebuild]       npu.rs patches all of them; a mismatch means a BUILT_T value collision -- inspect before use."
   fi
   mkdir -p "$out"

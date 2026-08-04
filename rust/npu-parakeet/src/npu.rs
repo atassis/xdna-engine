@@ -132,9 +132,25 @@ const RELPOS_BUCKETS_NOPEEL: &[(usize, usize, &str)] = &[
     (176, 44, "single"),     // ceiling bucket; serves any T in (152, 176] (max clip T is 172)
 ];
 
-/// Which bucket set this process dispatches. Shipped unless PARAKEET_RELPOS_NOPEEL is set.
+/// Opt-in ROW-TILED bucket set (PARAKEET_RELPOS_ROWTILE=1 + a matching PARAKEET_RELPOS_DIR).
+/// Each head runs on `rows` cores instead of one, so BUILT_T must additionally satisfy
+/// n_qt % rows == 0 -- with TQ=8 and rows=4 that is BUILT_T % 32 == 0. Every consumer of the
+/// broadcast k/p/V fifo has to take the same object count, which is what forces it.
+/// Only TWO buckets: BUILT_T=128 is poisoned. Its insts carry 8 extra words equal to 128 -- one
+/// per head's kpv tap, where DK=128 is a stride -- so the by-value t_active patch would rewrite
+/// them every clip. Same class as BUILT_T=104 (the header constant), and the reason a BUILT_T must
+/// be checked against the built insts rather than just picked. A collision-free short bucket is
+/// still open; with the t_active block-skip the padding it would save is largely skipped anyway.
+const RELPOS_BUCKETS_ROWTILE: &[(usize, usize, &str)] = &[
+    (160, 40, "bucket_152"), // clips T<=160, n_qt=20
+    (192, 48, "single"),     // ceiling bucket, n_qt=24 (max clip T is 172)
+];
+
+/// Which bucket set this process dispatches. Shipped unless an arm env var selects another.
 fn relpos_buckets() -> &'static [(usize, usize, &'static str)] {
-    if std::env::var_os("PARAKEET_RELPOS_NOPEEL").is_some() {
+    if std::env::var_os("PARAKEET_RELPOS_ROWTILE").is_some() {
+        RELPOS_BUCKETS_ROWTILE
+    } else if std::env::var_os("PARAKEET_RELPOS_NOPEEL").is_some() {
         RELPOS_BUCKETS_NOPEEL
     } else {
         RELPOS_BUCKETS_SHIPPED
