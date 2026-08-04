@@ -893,29 +893,43 @@ impl NpuMatmul {
             let kh = k.slice(s![.., col..col + dk]).to_owned();
             let ph = pm.slice(s![.., col..col + dk]).to_owned();
             let vh = v.slice(s![.., col..col + dk]).to_owned();
-            let mut qu = qh.to_owned();
-            let mut qv = qh.to_owned();
-            for i in 0..t {
-                for c in 0..dk {
-                    qu[[i, c]] += ubias[[hh, c]];
-                    qv[[i, c]] += vbias[[hh, c]];
+            {
+                let _c = crate::prof::phase::PhaseScope::new("mh_cc_qbias", crate::prof::phase::Bucket::Host);
+                let mut qu = qh.to_owned();
+                let mut qv = qh.to_owned();
+                for i in 0..t {
+                    for c in 0..dk {
+                        qu[[i, c]] += ubias[[hh, c]];
+                        qv[[i, c]] += vbias[[hh, c]];
+                    }
+                }
+                drop(_c);
+                let _i = crate::prof::phase::PhaseScope::new("mh_cc_qinterleave", crate::prof::phase::Bucket::Host);
+                for qi in 0..rk.n_qt {
+                    let q0 = qi * RELPOS_TQ;
+                    let take = RELPOS_TQ.min(t.saturating_sub(q0));
+                    push_pad_rows(&mut quv, &qu, q0, take, RELPOS_TQ);
+                    push_pad_rows(&mut quv, &qv, q0, take, RELPOS_TQ);
                 }
             }
-            for qi in 0..rk.n_qt {
-                let q0 = qi * RELPOS_TQ;
-                let take = RELPOS_TQ.min(t.saturating_sub(q0));
-                push_pad_rows(&mut quv, &qu, q0, take, RELPOS_TQ);
-                push_pad_rows(&mut quv, &qv, q0, take, RELPOS_TQ);
+            let p_lo = {
+                let _s = crate::prof::phase::PhaseScope::new("mh_cc_psplit", crate::prof::phase::Bucket::Host);
+                ph.mapv(|x| x - npu_xrt::bf16_bits_to_f32(npu_xrt::f32_to_bf16_bits(x)))
+            };
+            {
+                let _k = crate::prof::phase::PhaseScope::new("mh_cc_kpvpush", crate::prof::phase::Bucket::Host);
+                push_pad_rows(&mut kpv, &kh, 0, t, rk.tp);
+                push_pad_rows(&mut kpv, &ph, 0, ph.nrows(), rk.pp);
+                push_pad_rows(&mut kpv, &p_lo, 0, ph.nrows(), rk.pp);
+                push_pad_rows(&mut kpv, &vh, 0, t, rk.tp);
             }
-            let p_lo = ph.mapv(|x| x - npu_xrt::bf16_bits_to_f32(npu_xrt::f32_to_bf16_bits(x)));
-            push_pad_rows(&mut kpv, &kh, 0, t, rk.tp);
-            push_pad_rows(&mut kpv, &ph, 0, ph.nrows(), rk.pp);
-            push_pad_rows(&mut kpv, &p_lo, 0, ph.nrows(), rk.pp);
-            push_pad_rows(&mut kpv, &vh, 0, t, rk.tp);
         }
         (quv, kpv)
         };
         let (qb, kb) = {
+            // Keep the f32 intermediate: it is what lets the conversion run through
+            // `pack_f32_to_bf16`'s AVX-512 path. Converting per element during the copy instead
+            // MEASURED WORSE (concat 63.8 -> 78.0 ms, net +4.7 after deleting this pass).
             let _p = crate::prof::phase::PhaseScope::new("mh_pack", crate::prof::phase::Bucket::Host);
             let mut qb = vec![0u16; quv.len()];
             let mut kb = vec![0u16; kpv.len()];
