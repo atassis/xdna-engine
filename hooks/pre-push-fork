@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# Guard: refuse to push private material into an UPSTREAM FORK (mlir-aie, llvm-aie,
+# IRON, aie_api, iree-amd-aie ...). Install per fork with:
+#     cp xdna-engine/hooks/pre-push-fork <fork>/.git/hooks/pre-push && chmod +x it
+# (.git/hooks is untracked, so this never appears in a PR diff.)
+#
+# WHY THIS IS NOT hooks/pre-push. That one is for OUR public repo and does two things
+# this must not do:
+#
+#  1. It scans the WHOLE TREE. A fork's tree is upstream code, so the shared patterns
+#     (`/home/[a-z]`, `docs/(reference|log|...)/`) match upstream files we never wrote.
+#  2. It applies the WIKILINK pattern `[[slug]]`. That shape is also the C++ attribute
+#     syntax and the FileCheck variable syntax. MEASURED on the forks: llvm-aie carries
+#     1712 `[[nodiscard]]`, 1294 `[[fallthrough]]`, 272 `[[noreturn]]`, 121
+#     `[[unlikely]]`, plus FileCheck vars (`[[sz]]` 565, `[[p]]` 211, `[[foo]]` 144)
+#     across 1280 files.
+#
+# Either would fire thousands of times on a normal upstream push, and a guard that
+# cries wolf gets --no-verify'd, which is strictly worse than no guard. So this variant
+# scans ONLY what we are actually adding: the ADDED lines of the commits being pushed,
+# plus their commit messages. Upstream content cannot trip it.
+set -euo pipefail
+Z=0000000000000000000000000000000000000000
+
+# Deliberately NOT sourced from private_ref_patterns.sh: that set includes the wikilink
+# and broad-path patterns this context must exclude, and silently inheriting a new one
+# would re-introduce the false-positive flood. Keep it narrow and unambiguous -- every
+# pattern here names private material that cannot legitimately appear in upstream code.
+fork_private_regex='xdna-engine-private|xdna-engine-workspace|~/repositories/|/home/[a-z]|(^|[^A-Za-z0-9_./-])(journal|strategy|internal)/|(^|[^A-Za-z0-9_])(kb|tasks)\.sh([^A-Za-z0-9]|$)|autonomous session|two-Sonnet'
+
+fail=0
+while read -r local_ref local_sha remote_ref remote_sha; do
+  [ "$local_sha" = "$Z" ] && continue
+  if [ "$remote_sha" = "$Z" ]; then
+    revs=$(git rev-list "$local_sha" --not --remotes)
+  else
+    revs=$(git rev-list "$remote_sha..$local_sha")
+  fi
+  for c in $revs; do
+    # commit MESSAGE: a leak here cannot be fixed after push without a history rewrite.
+    if git log -1 --format='%B' "$c" | grep -Eiq "$fork_private_regex"; then
+      echo "BLOCKED: $c commit message references private material" >&2
+      git log -1 --format='%B' "$c" | grep -Eni "$fork_private_regex" >&2 || true
+      fail=1
+    fi
+    # ADDED lines only ('^+', minus the +++ header). Upstream code we did not touch is
+    # invisible to this, which is the whole point.
+    added=$(git diff-tree -p --no-commit-id -r "$c" | grep '^+' | grep -v '^+++' || true)
+    if [ -n "$added" ] && printf '%s\n' "$added" | grep -Eiq "$fork_private_regex"; then
+      echo "BLOCKED: $c adds a line referencing private material" >&2
+      printf '%s\n' "$added" | grep -Eni "$fork_private_regex" | head -20 >&2
+      fail=1
+    fi
+  done
+done
+
+if [ "$fail" -ne 0 ]; then
+  echo "pre-push guard refused the push. Do NOT use --no-verify unless you are certain." >&2
+  exit 1
+fi
+exit 0
