@@ -223,6 +223,11 @@ pub struct NpuMatmul {
     // and a separate knob could be set to disagree with it. (PARAKEET_MODAL_EPI_SUFFIX cannot serve
     // here -- it is also appended to fc1's panel stem, which knocks fc1 onto its fallback path.)
     krtp: bool,
+    // Resident's epilogue was compiled with the GLU branch (`rtp[0]==3`). Derived from the xclbin
+    // name for the same reason as `krtp`. This one has teeth: a modalglu STREAM dispatched on a
+    // resident built before that branch existed takes the `else` arm and returns pw1's raw [a|g]
+    // -- a wrong answer, not a failure. The shipped `modalsilu` resident is such a build.
+    glu_epi: bool,
     streams: RefCell<HashMap<(usize, usize, Act), Rc<NStream>>>, // (K, N, activation) -> stream
     // fc2 output for the one-dispatch K=DFF collapse. Its own BO against self.kern's C group --
     // NOT the stream's shared bo_c (every N=1024 identity dispatch would alias it) and NOT the
@@ -559,6 +564,21 @@ fn fold_fc1() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("PARAKEET_FOLD_FC1").map(|v| v != "0").unwrap_or(false))
 }
+
+/// `PARAKEET_FOLD_GLU=1`: apply the conv-module gate in pw1's OWN epilogue (`rtp[0]==3`), taking the
+/// resident conv front from two dispatches (pw1-identity + the standalone GLU brick) to one -- 24/clip
+/// on the 24-block encoder. It also deletes a narrowing: the epilogue still holds pw1's f32
+/// accumulator, so it never rounds to bf16 to hand GLU its input the way `glu.cc` had to.
+///
+/// Opt-in, and it carries a pairing requirement rather than just a flag. The mode is selected by the
+/// instruction stream, but the BRANCH lives in the resident's compiled epilogue, so it must be paired
+/// with `NPU_RESIDENT_XCLBIN=<...modalglu...>`. On a resident built before that branch existed --
+/// which the shipped `modalsilu` one is -- `rtp[0]=3` falls through to identity and returns pw1's raw
+/// `[a|g]`: a wrong answer, not a failed run. `conv_pw1_glu_folded` asserts the pairing.
+fn fold_glu() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PARAKEET_FOLD_GLU").map(|v| v != "0").unwrap_or(false))
+}
 // Variant B fc2 = deinterleave -> 4x K=KRES modal (same tile as host) on device sub-buffers +
 // host-accumulate = bit-identical to the host K-split (WER-neutral), A device-side.
 
@@ -683,8 +703,9 @@ impl NpuMatmul {
             (path, modal)
         };
         let krtp = xclbin.file_name().and_then(|s| s.to_str()).is_some_and(|s| s.contains("krtp"));
+        let glu_epi = xclbin.file_name().and_then(|s| s.to_str()).is_some_and(|s| s.contains("modalglu"));
         if !npu_xrt::quiet() {
-            eprintln!("[npu] resident xclbin = {} (modal={modal} krtp={krtp})", xclbin.display());
+            eprintln!("[npu] resident xclbin = {} (modal={modal} krtp={krtp} glu_epi={glu_epi})", xclbin.display());
         }
         let kern = dev
             .load_kernel(xclbin.to_str().unwrap(), None)
@@ -713,6 +734,7 @@ impl NpuMatmul {
             slots,
             modal,
             krtp,
+            glu_epi,
             streams: RefCell::new(HashMap::new()),
             fc2_out: RefCell::new(None),
             wcache: RefCell::new(HashMap::new()),
@@ -1823,6 +1845,101 @@ impl NpuMatmul {
         self.dispatch_with_a(&rl.bo_bf16, m, &wbo, n, silu && self.modal)
     }
 
+    /// Width of one modal C tile (`EPI_N`), parsed from the resident's tile spec ("64x32x128" -> 128).
+    /// The GLU value/gate split is defined in units of it, so a tile change with a stale literal here
+    /// would pair the wrong elements silently -- derive it, do not write 128.
+    fn epi_n(&self) -> usize {
+        self.tile
+            .rsplit('x')
+            .next()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| panic!("resident tile {:?} has no parsable N", self.tile))
+    }
+
+    /// The W1 column permutation the GLU epilogue's pairing requires. pw1's natural
+    /// `[a(0..D) | g(0..D)]` becomes, per C tile, `[64 values | their 64 gate partners]` -- which is
+    /// what puts each element's partner at a constant half-row-block offset in mm.cc's blocked C
+    /// order, so the epilogue can walk flat runs instead of being layout-aware.
+    ///
+    /// Value `c` lands in tile `c/half` at position `c%half`; its gate lands `half` further on. This
+    /// is the exact inverse of `glu_strided_read` -- the two only make sense as a pair.
+    fn permute_w1_glu(&self, w: ArrayView2<f32>) -> Array2<f32> {
+        let (k, n2) = w.dim();
+        let tile_n = self.epi_n();
+        assert_eq!(n2 % tile_n, 0, "pw1 N={n2} is not a whole number of {tile_n}-wide C tiles");
+        let half = tile_n / 2;
+        let d = n2 / 2;
+        assert_eq!(d % half, 0, "pw1 value width {d} does not split into {half}-wide tile halves");
+        let mut p = Array2::<f32>::zeros((k, n2));
+        for c in 0..d {
+            let base = (c / half) * tile_n + (c % half);
+            for r in 0..k {
+                p[[r, base]] = w[[r, c]]; // value column
+                p[[r, base + half]] = w[[r, d + c]]; // its gate partner
+            }
+        }
+        p
+    }
+
+    /// Read the folded GLU result out of the FULL-width C drain. The epilogue writes the gated value
+    /// into the value half of each tile and leaves the gate half holding the raw accumulator, and the
+    /// drain tap was deliberately left full width (narrowing it would resize `C_l1_ty` into a new
+    /// array program, costing the insts-only property). So the live output is `half` of every
+    /// `tile_n` columns. Inverse of `permute_w1_glu`.
+    fn glu_strided_read(&self, bo: &Bo, m: usize, d: usize) -> Array2<f32> {
+        let tile_n = self.epi_n();
+        let half = tile_n / 2;
+        let n2 = 2 * d;
+        bo.sync_from_device().unwrap();
+        let mut cb = vec![0u8; m * n2 * 4]; // first m rows are contiguous, as in the two-dispatch read
+        bo.read_bytes(&mut cb).unwrap();
+        let mut out = Array2::<f32>::zeros((m, d));
+        for r in 0..m {
+            for c in 0..d {
+                let off = (r * n2 + (c / half) * tile_n + (c % half)) * 4;
+                out[[r, c]] = f32::from_le_bytes([cb[off], cb[off + 1], cb[off + 2], cb[off + 3]]);
+            }
+        }
+        out
+    }
+
+    /// `PARAKEET_FOLD_GLU=1` body, shared by the host-in and device-in conv fronts (they differ only
+    /// in how the LN'd bf16 A was produced). One modal GEMM whose epilogue applies `a * sigmoid(g)`.
+    fn conv_pw1_glu_folded<F: FnOnce() -> Array2<f32>>(
+        &self, a_bf16: &Bo, m: usize, make_w1: F, id: &str,
+    ) -> Option<Array2<f32>> {
+        assert!(
+            self.glu_epi,
+            "PARAKEET_FOLD_GLU=1 needs a resident whose epilogue carries the GLU branch, and this \
+             one does not. Pair it with NPU_RESIDENT_XCLBIN=<...modalglu...xclbin>: on a pre-GLU \
+             resident rtp[0]=3 falls through to identity and silently returns pw1's raw [a|g]."
+        );
+        let n2 = 2 * KRES;
+        // The permuted weight gets its OWN cache id: `{blk}.pw1` is shared with resident_ff1_fc1's
+        // unpermuted path, and handing that path a permuted W1 would corrupt the fallback arm.
+        let pid = format!("{id}.gluperm");
+        let cached = self.wcache.borrow().get(&pid).cloned();
+        let wbo = if let Some(bo) = cached {
+            bo
+        } else {
+            let w = make_w1();
+            assert_eq!(w.nrows(), KRES, "pw1 W nrows {} != {KRES}", w.nrows());
+            assert_eq!(w.ncols(), n2, "pw1 W ncols {} != {n2}", w.ncols());
+            let wp = self.permute_w1_glu(w.view());
+            self.weight_bo(&pid, wp.view())
+        };
+        let st = self.stream(n2, Act::Glu);
+        modal_site("glu.fold");
+        {
+            let _dt = self.dtimer();
+            self.kern
+                .run_matmul8(3, &st.instr, st.n_instr, a_bf16, &wbo, &st.bo_c, &self.bo_tmp, &self.bo_tr)
+                .unwrap();
+        }
+        self.stats.borrow_mut().dispatches += 1; // pw1 + gate in one
+        Some(self.glu_strided_read(&st.bo_c, m, KRES))
+    }
+
     /// Resident conv-module front (LN -> pw1 -> GLU), the conv step-2 frontier advance: the activation
     /// never touches host across the three ops.
     ///   ctxLN -> affine_cast -> modal pw1 GEMM (N=2*KRES, identity, output STAYS device in the stream
@@ -1832,12 +1949,20 @@ impl NpuMatmul {
     /// xclbin is absent -- so a tree without the glu kernel still gets step-1's resident LN->pw1.
     pub fn resident_conv_pw1_glu<F: FnOnce() -> Array2<f32>>(&self, x: &Array2<f32>, gamma: &[f32], beta: &[f32], make_w1: F, id: &str) -> Option<Array2<f32>> {
         let rl = self.resident_ln()?;
-        let glu = rl.glu.as_ref()?; // glu xclbin absent -> None, caller falls back
+        // Only the two-dispatch arm needs the standalone GLU xclbin -- the fold applies the gate in
+        // pw1's own epilogue. Checked before the LN so a missing xclbin still costs no dispatch.
+        if !fold_glu() && rl.glu.is_none() {
+            return None; // caller falls back to resident LN->pw1 + host GLU
+        }
         self.stats.borrow_mut().calls += 1;
         let m = x.nrows();
         let n2 = 2 * KRES; // pw1 output width 2D
         // LN + affine cast -> bo_bf16 = affine_LN(x) bf16 [PAD_M, KRES] (device).
         let rlc = self.ln_affine_cast(x, gamma, beta);
+        if fold_glu() {
+            return self.conv_pw1_glu_folded(&rlc.bo_bf16, m, make_w1, id);
+        }
+        let glu = rl.glu.as_ref().unwrap(); // presence checked above
         // pw1 GEMM: A=bo_bf16, W1=[KRES,2D] identity-modal -> st.bo_c [PAD_M,2D] f32, STAYS on device.
         let cached = self.wcache.borrow().get(id).cloned();
         let wbo = if let Some(bo) = cached {
@@ -1875,10 +2000,16 @@ impl NpuMatmul {
     /// host-fed for this seam). `None` when the resident-ln / glu xclbins are absent.
     pub fn resident_conv_pw1_glu_dev<F: FnOnce() -> Array2<f32>>(&self, a_bo: &Bo, m: usize, gamma: &[f32], beta: &[f32], make_w1: F, id: &str) -> Option<Array2<f32>> {
         let rl = self.resident_ln()?;
-        let glu = rl.glu.as_ref()?;
+        if !fold_glu() && rl.glu.is_none() {
+            return None; // see resident_conv_pw1_glu
+        }
         self.stats.borrow_mut().calls += 1;
         let n2 = 2 * KRES; // pw1 output width 2D
         let rlc = self.ln_affine_cast_dev(a_bo, gamma, beta); // device-in LN
+        if fold_glu() {
+            return self.conv_pw1_glu_folded(&rlc.bo_bf16, m, make_w1, id);
+        }
+        let glu = rl.glu.as_ref().unwrap(); // presence checked above
         let cached = self.wcache.borrow().get(id).cloned();
         let wbo = if let Some(bo) = cached {
             bo

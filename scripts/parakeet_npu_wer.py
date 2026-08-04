@@ -55,6 +55,10 @@ def main():
     ap.add_argument("mode", choices=["dump-mels", "decode-wer"])
     ap.add_argument("dir")
     ap.add_argument("--cpu-oracle", action="store_true")
+    ap.add_argument("--per-clip", action="store_true",
+                    help="also print per-clip WER, edit count and hypothesis, so two encode dirs can be "
+                         "diffed clip-by-clip. The aggregate hides which clips moved, and at 17 clips the "
+                         "aggregate is chaotic at ~1e-5 -- clip identity is the informative comparison.")
     a = ap.parse_args()
     os.makedirs(a.dir, exist_ok=True)
     asr = onnx_asr.load_model(MODEL, providers=["CPUExecutionProvider"]).asr
@@ -84,11 +88,19 @@ def main():
         for tok, ts, lp in asr._decoding(eo, lens):
             ids = [int(x) for x in tok]
         hyp = normalize(asr._decode_tokens(ids, None, None).text)
-        rows.append({"name": stem, "lang": stem.split("_")[0], "wer": wer(normalize(refs[n]), hyp), "hyp": hyp})
+        ref_n = normalize(refs[n])
+        w = wer(ref_n, hyp)
+        rows.append({"name": stem, "lang": stem.split("_")[0], "wer": w, "hyp": hyp,
+                     "edits": round(w * len(ref_n.split())), "words": len(ref_n.split())})
     A = agg(rows)
     print(f"\n=== Parakeet (swapped encoder from {a.dir}) WER ===")
     for lab in ("RU", "EN", "ALL"):
         if lab in A: print(f"  {lab:<4}(n={A[lab]['n']:>2})  {A[lab]['wer']*100:5.1f}%")
+    if a.per_clip:
+        tot = sum(r["edits"] for r in rows)
+        print(f"  total edits {tot} over {sum(r['words'] for r in rows)} words")
+        for r in rows:
+            print(f"  {r['name']:<8} {r['wer']*100:5.1f}%  {r['edits']:>3} edits  {r['hyp']}")
 
     if a.cpu_oracle:
         orows = []
