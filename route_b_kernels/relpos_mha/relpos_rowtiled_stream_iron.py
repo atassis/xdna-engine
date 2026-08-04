@@ -140,7 +140,8 @@ def ceildiv(a, b):
 # by ONE inline_ops (the whole-array modal-matmul pattern). All heads share the clip's
 # single t_active, so the host patches every t_active word of the template insts.
 # ============================================================================
-def my_relpos_stream(dev, T, TQ, KB, t_active=None, splitp=False, heads=1, tskip=False, rows=1):
+def my_relpos_stream(dev, T, TQ, KB, t_active=None, splitp=False, heads=1, tskip=False, rows=1,
+                     stage=False):
     # STEP-C: T is the BAKED buffer/dataflow size (the single MAX-T xclbin, e.g. 172);
     # t_active <= T is the ACTIVE key count the softmax attends (a per-insts constant on
     # the SAME xclbin, so one xclbin serves any clip padded to T). Default = T (full).
@@ -259,7 +260,10 @@ def my_relpos_stream(dev, T, TQ, KB, t_active=None, splitp=False, heads=1, tskip
     # The L2 object is one ROUND = `rows` blocks, one per core. Because the core acquires qu and
     # qv as two separate blocks, a round carries qu for all `rows` cores, then qv for all of them;
     # the shim fill tap below re-orders L3 into that sequence, so the HOST packing is unchanged.
-    if rows > 1:
+    # `stage` forces the MemTile path at rows=1 -- a control that isolates the cost of the
+    # extra L3->L2->L1 hop from the cost of fanning out to several cores.
+    memtile_stage = stage or rows > 1
+    if memtile_stage:
         quv_round_ty = np.ndarray[(rows * TQ * DK,), np.dtype[bfloat16]]
         ctx_round_ty = np.ndarray[(rows * TQ * DK,), np.dtype[bfloat16]]
         of_quv_l2 = [ObjectFifo(quv_round_ty, name=f"quvl2{h}", depth=2) for h in range(heads)]
@@ -295,7 +299,7 @@ def my_relpos_stream(dev, T, TQ, KB, t_active=None, splitp=False, heads=1, tskip
     # of_kpv is PER HEAD (not per core): head h's `rows` cores share one k/p/V stream via
     # multicast, so the shim sends n_qt_core replays instead of n_qt and every core sees them all.
     of_kpv = [ObjectFifo(kblk_ty, name=f"kpv{h}", depth=2) for h in range(heads)]
-    if rows == 1:
+    if not memtile_stage:
         of_ctx = [ObjectFifo(ctx_blk_ty, name=f"ctx{c}", depth=2) for c in range(n_cores)]
 
     # ---- block-brick kernels (int32-scalar ABI; see PROBE 1) ----
@@ -483,7 +487,7 @@ def my_relpos_stream(dev, T, TQ, KB, t_active=None, splitp=False, heads=1, tskip
                 [heads * kpv_head_len], h * kpv_head_len,
                 [n_qt_core, 1, kpv_pad_rows, DK], [0, 0, DK, 1])
             kpv_prods[h].fill(KPV, tap=kpv_tap)
-        if rows == 1:
+        if not memtile_stage:
             for h in range(heads):
                 quv_tap = TensorAccessPattern(
                     [heads * quv_head_len], h * quv_head_len, [quv_head_len], [1])
@@ -517,9 +521,9 @@ def my_relpos_stream(dev, T, TQ, KB, t_active=None, splitp=False, heads=1, tskip
             ctx_arg_ty,
             # rows>1 attaches the runtime to the per-head L2 relay, not to the per-core fifos --
             # that is what holds shim usage at 16 MM2S / 8 S2MM regardless of core count.
-            [(of_quv_l2[h] if rows > 1 else of_quv[h]).prod() for h in range(heads)],
+            [(of_quv_l2[h] if memtile_stage else of_quv[h]).prod() for h in range(heads)],
             [of_kpv[h].prod() for h in range(heads)],
-            [(of_ctx_l2[h] if rows > 1 else of_ctx[h]).cons() for h in range(heads)],
+            [(of_ctx_l2[h] if memtile_stage else of_ctx[h]).cons() for h in range(heads)],
         ],
     )
 
@@ -542,6 +546,9 @@ p.add_argument("--rows", type=int, default=1,
                help="ROW-TILE each head across R cores (heads*R workers). Needs R | n_qt and "
                     "T %% TQ == 0. Head h's R cores share one k/p/V stream by MULTICAST and take "
                     "the query tiles round-robin. R=1 = the original one-core-per-head block.")
+p.add_argument("--stage", action="store_true",
+               help="force the MemTile quv/ctx staging even at --rows 1. A CONTROL: it isolates the\n"
+                    "cost of the extra L3->L2->L1 hop from the cost of fanning out to several cores.")
 p.add_argument("--tskip", action="store_true",
                help="runtime t_active BLOCK-SKIP: drop the k/p/V blocks whose results the "
                     "softmax never loads for this clip's t_active (bit-exact; delivery "
@@ -560,4 +567,4 @@ else:
     raise ValueError(f"unknown device {opts.device}")
 
 print(my_relpos_stream(dev, opts.T, opts.tq, opts.kb, opts.tactive or opts.T, opts.splitp,
-                       opts.heads, opts.tskip, opts.rows))
+                       opts.heads, opts.tskip, opts.rows, opts.stage))

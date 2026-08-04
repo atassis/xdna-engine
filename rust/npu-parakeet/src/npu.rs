@@ -148,6 +148,8 @@ const RELPOS_BUCKETS_ROWTILE: &[(usize, usize, &str)] = &[
 
 /// Which bucket set this process dispatches. Shipped unless an arm env var selects another.
 fn relpos_buckets() -> &'static [(usize, usize, &'static str)] {
+    // PARAKEET_RELPOS_ROWTILE selects the row-tiled bucket table; the arm's `rows` lives in the
+    // artifact set chosen by PARAKEET_RELPOS_DIR, so rows=2 and rows=4 share this table.
     if std::env::var_os("PARAKEET_RELPOS_ROWTILE").is_some() {
         RELPOS_BUCKETS_ROWTILE
     } else if std::env::var_os("PARAKEET_RELPOS_NOPEEL").is_some() {

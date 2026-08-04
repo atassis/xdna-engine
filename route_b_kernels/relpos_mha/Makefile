@@ -123,6 +123,10 @@ endif
 ifeq ($(TSKIP),1)
 GEN_EXTRA += --tskip
 endif
+# STAGE=1 forces the MemTile quv/ctx staging even at ROWS=1 (a control for its cost).
+ifeq ($(STAGE),1)
+GEN_EXTRA += --stage
+endif
 # ROWS>1 row-tiles each head across ROWS cores (heads*ROWS workers, k/p/V multicast).
 # Needs ROWS | n_qt and T % TQ == 0; the generator rejects violations.
 ifneq ($(ROWS),)
