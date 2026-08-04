@@ -140,7 +140,7 @@ def ceildiv(a, b):
 # by ONE inline_ops (the whole-array modal-matmul pattern). All heads share the clip's
 # single t_active, so the host patches every t_active word of the template insts.
 # ============================================================================
-def my_relpos_stream(dev, T, TQ, KB, t_active=None, splitp=False, heads=1, tskip=False):
+def my_relpos_stream(dev, T, TQ, KB, t_active=None, splitp=False, heads=1, tskip=False, rows=1):
     # STEP-C: T is the BAKED buffer/dataflow size (the single MAX-T xclbin, e.g. 172);
     # t_active <= T is the ACTIVE key count the softmax attends (a per-insts constant on
     # the SAME xclbin, so one xclbin serves any clip padded to T). Default = T (full).
@@ -155,6 +155,30 @@ def my_relpos_stream(dev, T, TQ, KB, t_active=None, splitp=False, heads=1, tskip
         t_active = T
     P = 2 * T - 1
     n_qt = ceildiv(T, TQ)   # query tiles
+    # ---- ROW-TILING (--rows R): split each head's query tiles across R cores ----
+    # The heads axis is exhausted at 8 of the array's 32 compute tiles, so the second axis is
+    # the query tiles. Head h's R cores all need the SAME k/p/V, which is a MULTICAST: one
+    # of_kpv per head with R consumer handles (ObjectFifo.cons() returns a new handle per call).
+    #
+    # Two constraints, both load-bearing:
+    #  * n_qt % R == 0. Every consumer of a broadcast fifo must take the SAME number of objects,
+    #    so all R cores must run the same tile count -- one kpv replay each. Uneven counts leave
+    #    a consumer holding objects nobody releases.
+    #  * tiles are dealt ROUND-ROBIN (core r takes r, r+R, r+2R, ...), NOT in contiguous chunks.
+    #    With the t_active skip, live tiles are the LOW ones; contiguous chunks would give core 0
+    #    every live tile and leave core R-1 idle, and the dispatch is the slowest core. Round-robin
+    #    spreads the live tiles evenly. Delivery is unaffected: each core still takes exactly one
+    #    replay per tile it runs, whichever tiles those are.
+    if rows > 1:
+        if T % TQ:
+            raise ValueError(
+                f"--rows {rows} needs no ragged query tile: T={T} must be a multiple of TQ={TQ}")
+        if n_qt % rows:
+            raise ValueError(
+                f"--rows {rows} must divide n_qt={n_qt} (T={T}, TQ={TQ}); a broadcast fifo's "
+                f"consumers must all take the same object count")
+    n_qt_core = n_qt // rows        # query tiles per core = kpv replays the shim must send
+    n_cores = heads * rows
     n_kb = ceildiv(T, KB)   # k-blocks (also V-blocks)
     n_pb = ceildiv(P, KB)   # p-blocks (p_hi; p_lo mirrors it under --splitp)
     n_vb = n_kb
@@ -189,10 +213,12 @@ def my_relpos_stream(dev, T, TQ, KB, t_active=None, splitp=False, heads=1, tskip
     bd_ty = np.ndarray[(TQ * P,), np.dtype[np.float32]]
     probs_ty = np.ndarray[(TQ * T,), np.dtype[bfloat16]]
     ctxf_ty = np.ndarray[(TQ * DK,), np.dtype[np.float32]]
-    g_ac = [Buffer(ac_ty, name=f"g_ac{h}") for h in range(heads)]
-    g_bd = [Buffer(bd_ty, name=f"g_bd{h}") for h in range(heads)]
-    g_probs = [Buffer(probs_ty, name=f"g_probs{h}") for h in range(heads)]
-    g_ctxf = [Buffer(ctxf_ty, name=f"g_ctxf{h}") for h in range(heads)]
+    # Indexed by the FLAT core id c = h*rows + r (buffers are tile-local, so every core needs
+    # its own set -- row-tiling multiplies these by `rows`, it does not share them per head).
+    g_ac = [Buffer(ac_ty, name=f"g_ac{c}") for c in range(n_cores)]
+    g_bd = [Buffer(bd_ty, name=f"g_bd{c}") for c in range(n_cores)]
+    g_probs = [Buffer(probs_ty, name=f"g_probs{c}") for c in range(n_cores)]
+    g_ctxf = [Buffer(ctxf_ty, name=f"g_ctxf{c}") for c in range(n_cores)]
 
     # STEP-C: t_active RTP register (int32[16], use_write_rtp), PER HEAD. The softmax kernel
     # reads rtp[0] at runtime, so the ELF is t_active-agnostic => ONE xclbin serves any
@@ -201,7 +227,7 @@ def my_relpos_stream(dev, T, TQ, KB, t_active=None, splitp=False, heads=1, tskip
     # every worker wait for the RTP writes before reading rtp[0] (whole-array modal pattern:
     # per-core RTP buffers, one barrier). All heads share the clip's single t_active value.
     rtp_ty = np.ndarray[(16,), np.dtype[np.int32]]
-    tactive_rtp = [Buffer(rtp_ty, name=f"tactive_rtp{h}", use_write_rtp=True) for h in range(heads)]
+    tactive_rtp = [Buffer(rtp_ty, name=f"tactive_rtp{c}", use_write_rtp=True) for c in range(n_cores)]
     rtp_barrier = WorkerRuntimeBarrier()
 
     # ---- ObjectFifos ----
@@ -221,15 +247,17 @@ def my_relpos_stream(dev, T, TQ, KB, t_active=None, splitp=False, heads=1, tskip
     # K) then qv_tile (phase P); 2*n_qt blocks, read ONCE (no replay).
     # PER HEAD: each head's Worker gets its own quv/kpv/ctx fifos (H distinct streams,
     # scattered from the shim by a per-head OFFSET tap -- heads do NOT share data).
-    of_quv = [ObjectFifo(quv_blk_ty, name=f"quv{h}", depth=2) for h in range(heads)]
+    of_quv = [ObjectFifo(quv_blk_ty, name=f"quv{c}", depth=2) for c in range(n_cores)]
     # Channel B: kpv key-block stream. obj = ONE [KB,DK] block; the shim re-reads
     # the whole padded kpv (16 blocks) from DDR offset 0 n_qt times via the repeat
     # tap (single BD, repeat_count=n_qt-1 -- see the rt.fill below), so each query
     # tile gets k0..k3,p0..p7,V0..V3 from the start. 16*n_qt = 352 blocks in address
     # order = exactly what the core acquires. No MemTile staging needed (kpv is
     # re-read from DDR anyway); L1 holds one [KB,DK] block at a time.
+    # of_kpv is PER HEAD (not per core): head h's `rows` cores share one k/p/V stream via
+    # multicast, so the shim sends n_qt_core replays instead of n_qt and every core sees them all.
     of_kpv = [ObjectFifo(kblk_ty, name=f"kpv{h}", depth=2) for h in range(heads)]
-    of_ctx = [ObjectFifo(ctx_blk_ty, name=f"ctx{h}", depth=2) for h in range(heads)]
+    of_ctx = [ObjectFifo(ctx_blk_ty, name=f"ctx{c}", depth=2) for c in range(n_cores)]
 
     # ---- block-brick kernels (int32-scalar ABI; see PROBE 1) ----
     # TSKIP: the _ts bricks take the softmax's rtp register + the tile's global q0 and
@@ -276,8 +304,12 @@ def my_relpos_stream(dev, T, TQ, KB, t_active=None, splitp=False, heads=1, tskip
     Pp_full = (P // KB) * KB          # p full-block rows
     p_rag = P - Pp_full               # ragged p block rows (42 at P=343,KB=43)
 
+    # q_start / q_step are this CORE's query-tile range (trailing params so the tracer still sees
+    # a plain function; make_core_body below binds them per core). rows=1 gives (0, TQ), the
+    # original whole-head sweep. The emitted code is identical in SIZE at any rows -- the sweep is
+    # a hardware loop, so only its bounds differ and row-tiling does not grow .text.
     def core_body(quv_in, kpv_in, ctx_out, ac, bd, probs, ctxf, rtp, bar,
-                  dotk, dotp, dotplo, smax, czero, ctxb, narrow):
+                  dotk, dotp, dotplo, smax, czero, ctxb, narrow, q_start=0, q_step=TQ):
         # TSKIP threads rtp + the tile's q0 into the block bricks so they can drop
         # never-read blocks; the plain bricks take neither. Bind the difference once
         # here so emit_tile below stays single-form.
@@ -360,25 +392,34 @@ def my_relpos_stream(dev, T, TQ, KB, t_active=None, splitp=False, heads=1, tskip
         # STEP-C: wait until the runtime sequence has written rtp[0]=t_active before the
         # softmax (which reads rtp[0]) runs. Mirrors the modal-matmul RTP barrier.
         bar.wait_for_value(1)
-        # range_(0, Tq_full, TQ) yields q0 = 0, TQ, 2*TQ, ... directly (NO multiply);
-        # tq == TQ for every full tile.
-        for q0iv in range_(0, Tq_full, TQ):
+        # range_(q_start, Tq_full, q_step) yields this core's q0 values directly (NO multiply);
+        # tq == TQ for every full tile. At rows=1 this is (0, Tq_full, TQ), the original sweep;
+        # at rows=R core r takes the round-robin set r, r+R, r+2R, ... (q_start=r*TQ, step=R*TQ).
+        for q0iv in range_(q_start, Tq_full, q_step):
             emit_tile(TQ, index_cast(q0iv, to=Ty.i32()))
-        # peeled ragged final query tile (tq < TQ), q0 a Python constant.
+        # peeled ragged final query tile (tq < TQ), q0 a Python constant. rows>1 rejects q_rag.
         if q_rag:
             emit_tile(q_rag, Tq_full)
 
-    # One Worker per head (H cores). Kernels + the shared barrier are common; each head
-    # gets its OWN fifos + L1 scratch + t_active RTP. place-tiles assigns the H workers to
-    # distinct compute tiles (H<=8 fits one row) with no explicit Tile() pinning.
+    def make_core_body(q_start, q_step):
+        """Bind one core's query-tile range, keeping the traced callable a plain function."""
+        def body(*fn_args):
+            return core_body(*fn_args, q_start=q_start, q_step=q_step)
+        return body
+
+    # One Worker per (head, row) = heads*rows cores. Kernels + the shared barrier are common;
+    # each CORE gets its own quv/ctx fifos + L1 scratch + t_active RTP, and shares its head's
+    # of_kpv through an extra cons() handle (the multicast). place-tiles assigns them to distinct
+    # compute tiles with no explicit Tile() pinning; at heads=8 rows=4 that is all 32.
     workers = [
         Worker(
-            core_body,
-            [of_quv[h].cons(), of_kpv[h].cons(), of_ctx[h].prod(),
-             g_ac[h], g_bd[h], g_probs[h], g_ctxf[h], tactive_rtp[h], rtp_barrier,
+            make_core_body(r * TQ, rows * TQ),
+            [of_quv[h * rows + r].cons(), of_kpv[h].cons(), of_ctx[h * rows + r].prod(),
+             g_ac[h * rows + r], g_bd[h * rows + r], g_probs[h * rows + r],
+             g_ctxf[h * rows + r], tactive_rtp[h * rows + r], rtp_barrier,
              dot_k, dot_p, dot_p_lo, softmax_k, ctxzero_k, ctx_k, narrow_k],
         )
-        for h in range(heads)
+        for h in range(heads) for r in range(rows)
     ]
 
     def sequence(QUV, KPV, CX, quv_prods, kpv_prods, ctx_conses):
@@ -386,8 +427,8 @@ def my_relpos_stream(dev, T, TQ, KB, t_active=None, splitp=False, heads=1, tskip
         # same clip t_active), then release the SHARED barrier so every worker reads it. Same
         # xclbin, different t_active => different insts (the modal-matmul per-insts pattern).
         # The body is eager now, so writing the H RTP buffers is a plain loop (was inline_ops).
-        for h in range(heads):
-            tactive_rtp[h][0] = t_active
+        for c in range(n_cores):
+            tactive_rtp[c][0] = t_active
         rtp_barrier.set(1)
         # SCATTER: head h reads/writes its own slice of each concatenated H-head arg via a
         # per-head OFFSET tap (heads do NOT share data). The kpv tap keeps the STREAM-A single-
@@ -395,17 +436,30 @@ def my_relpos_stream(dev, T, TQ, KB, t_active=None, splitp=False, heads=1, tskip
         # OFFSET differs per head (h*kpv_head_len). place-tiles routes each head's 3 shim BDs
         # (quv fill + kpv fill + ctx drain) onto its own column's shim (24 tasks NEVER on one
         # shim -> the 16-BD limit is never approached).
+        # kpv: ONE fill per head, replayed n_qt_core times (not n_qt) -- the multicast hands each
+        # replay to all `rows` cores of the head, so the DDR re-read drops by `rows` as a side
+        # effect. Still a single BD (repeat_count = n_qt_core-1).
         for h in range(heads):
-            quv_tap = TensorAccessPattern(
-                [heads * quv_head_len], h * quv_head_len, [quv_head_len], [1])
             kpv_tap = TensorAccessPattern(
                 [heads * kpv_head_len], h * kpv_head_len,
-                [n_qt, 1, kpv_pad_rows, DK], [0, 0, DK, 1])
-            ctx_tap = TensorAccessPattern(
-                [heads * ctx_head_len], h * ctx_head_len, [ctx_head_len], [1])
-            quv_prods[h].fill(QUV, tap=quv_tap)   # tile-interleaved qu/qv blocks
-            kpv_prods[h].fill(KPV, tap=kpv_tap)   # 1 BD, whole kpv replayed n_qt
-            ctx_conses[h].drain(CX, tap=ctx_tap, wait=True)
+                [n_qt_core, 1, kpv_pad_rows, DK], [0, 0, DK, 1])
+            kpv_prods[h].fill(KPV, tap=kpv_tap)
+        # quv / ctx: per CORE. Core (h,r) owns the round-robin tile set r, r+rows, r+2*rows, ...
+        # so its slice of the tile-interleaved QUV (and of CTX) is STRIDED by rows tiles, not
+        # contiguous -- one extra tap dim, no extra BD.
+        for h in range(heads):
+            for r in range(rows):
+                c = h * rows + r
+                quv_tile = 2 * TQ * DK          # one tile's qu+qv pair
+                ctx_tile = TQ * DK
+                quv_tap = TensorAccessPattern(
+                    [heads * quv_head_len], h * quv_head_len + r * quv_tile,
+                    [n_qt_core, quv_tile], [rows * quv_tile, 1])
+                ctx_tap = TensorAccessPattern(
+                    [heads * ctx_head_len], h * ctx_head_len + r * ctx_tile,
+                    [n_qt_core, ctx_tile], [rows * ctx_tile, 1])
+                quv_prods[c].fill(QUV, tap=quv_tap)
+                ctx_conses[c].drain(CX, tap=ctx_tap, wait=True)
 
     rt = Runtime(
         sequence,
@@ -413,9 +467,9 @@ def my_relpos_stream(dev, T, TQ, KB, t_active=None, splitp=False, heads=1, tskip
             quv_arg_ty,
             kpv_arg_ty,
             ctx_arg_ty,
-            [of_quv[h].prod() for h in range(heads)],
+            [of_quv[c].prod() for c in range(n_cores)],
             [of_kpv[h].prod() for h in range(heads)],
-            [of_ctx[h].cons() for h in range(heads)],
+            [of_ctx[c].cons() for c in range(n_cores)],
         ],
     )
 
@@ -434,6 +488,10 @@ p.add_argument("--tactive", type=int, default=0,
 p.add_argument("--splitp", action="store_true",
                help="split-bf16 positional operand: stream p as p_hi|p_lo, BD = qv.p_hi + qv.p_lo "
                     "(near-f32 p). Closes the resident-MHA WER gap (probe: p rounding owns it).")
+p.add_argument("--rows", type=int, default=1,
+               help="ROW-TILE each head across R cores (heads*R workers). Needs R | n_qt and "
+                    "T %% TQ == 0. Head h's R cores share one k/p/V stream by MULTICAST and take "
+                    "the query tiles round-robin. R=1 = the original one-core-per-head block.")
 p.add_argument("--tskip", action="store_true",
                help="runtime t_active BLOCK-SKIP: drop the k/p/V blocks whose results the "
                     "softmax never loads for this clip's t_active (bit-exact; delivery "
@@ -452,4 +510,4 @@ else:
     raise ValueError(f"unknown device {opts.device}")
 
 print(my_relpos_stream(dev, opts.T, opts.tq, opts.kb, opts.tactive or opts.T, opts.splitp,
-                       opts.heads, opts.tskip))
+                       opts.heads, opts.tskip, opts.rows))

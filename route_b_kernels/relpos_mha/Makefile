@@ -123,6 +123,11 @@ endif
 ifeq ($(TSKIP),1)
 GEN_EXTRA += --tskip
 endif
+# ROWS>1 row-tiles each head across ROWS cores (heads*ROWS workers, k/p/V multicast).
+# Needs ROWS | n_qt and T % TQ == 0; the generator rejects violations.
+ifneq ($(ROWS),)
+GEN_EXTRA += --rows ${ROWS}
+endif
 else
 GEN_EXTRA =
 endif
