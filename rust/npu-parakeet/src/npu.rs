@@ -883,10 +883,10 @@ impl NpuMatmul {
         // p_lo=bf16(p-p_hi); BD=qv.p_hi+qv.p_lo recovers ~f32 p -- the probe-localized ~1% sink).
         // HOST work, inside a scope (`mhsa_resident`) that is bucketed Npu -- so until this leaf
         // existed, ~57 ms/clip of host data shuffling was counted as NPU time.
-        let (quv, kpv) = {
+        let (qb, kb) = {
         let _p_concat = crate::prof::phase::PhaseScope::new("mh_concat", crate::prof::phase::Bucket::Host);
-        let mut quv = Vec::<f32>::with_capacity(h * quv_head);
-        let mut kpv = Vec::<f32>::with_capacity(h * kpv_head);
+        let mut quv = Vec::<u16>::with_capacity(h * quv_head);
+        let mut kpv = Vec::<u16>::with_capacity(h * kpv_head);
         for hh in 0..h {
             let col = hh * dk;
             let qh = q.slice(s![.., col..col + dk]);
@@ -908,8 +908,8 @@ impl NpuMatmul {
                 for qi in 0..rk.n_qt {
                     let q0 = qi * RELPOS_TQ;
                     let take = RELPOS_TQ.min(t.saturating_sub(q0));
-                    push_pad_rows(&mut quv, &qu, q0, take, RELPOS_TQ);
-                    push_pad_rows(&mut quv, &qv, q0, take, RELPOS_TQ);
+                    push_pad_rows_bf16(&mut quv, &qu, q0, take, RELPOS_TQ);
+                    push_pad_rows_bf16(&mut quv, &qv, q0, take, RELPOS_TQ);
                 }
             }
             let p_lo = {
@@ -918,24 +918,13 @@ impl NpuMatmul {
             };
             {
                 let _k = crate::prof::phase::PhaseScope::new("mh_cc_kpvpush", crate::prof::phase::Bucket::Host);
-                push_pad_rows(&mut kpv, &kh, 0, t, rk.tp);
-                push_pad_rows(&mut kpv, &ph, 0, ph.nrows(), rk.pp);
-                push_pad_rows(&mut kpv, &p_lo, 0, ph.nrows(), rk.pp);
-                push_pad_rows(&mut kpv, &vh, 0, t, rk.tp);
+                push_pad_rows_bf16(&mut kpv, &kh, 0, t, rk.tp);
+                push_pad_rows_bf16(&mut kpv, &ph, 0, ph.nrows(), rk.pp);
+                push_pad_rows_bf16(&mut kpv, &p_lo, 0, ph.nrows(), rk.pp);
+                push_pad_rows_bf16(&mut kpv, &vh, 0, t, rk.tp);
             }
         }
         (quv, kpv)
-        };
-        let (qb, kb) = {
-            // Keep the f32 intermediate: it is what lets the conversion run through
-            // `pack_f32_to_bf16`'s AVX-512 path. Converting per element during the copy instead
-            // MEASURED WORSE (concat 63.8 -> 78.0 ms, net +4.7 after deleting this pass).
-            let _p = crate::prof::phase::PhaseScope::new("mh_pack", crate::prof::phase::Bucket::Host);
-            let mut qb = vec![0u16; quv.len()];
-            let mut kb = vec![0u16; kpv.len()];
-            npu_xrt::pack_f32_to_bf16(&quv, &mut qb);
-            npu_xrt::pack_f32_to_bf16(&kpv, &mut kb);
-            (qb, kb)
         };
         let t0 = Instant::now();
         // STEP-C: patch EVERY t_active word (one per head's RTP, all == BUILT_T in the template) to
@@ -3468,6 +3457,25 @@ fn push_pad_rows(dst: &mut Vec<f32>, m: &Array2<f32>, start: usize, take: usize,
         dst.extend(m.row(start + r).iter().copied());
     }
     dst.extend(std::iter::repeat(0.0f32).take((n_total - take) * dk));
+}
+
+/// `push_pad_rows` that converts as it copies, appending bf16 bits.
+///
+/// The device only ever sees bf16, so the f32 staging buffer is a HOST-only artifact. Building the
+/// operands in bf16 directly halves the staging bytes and is the layout a BO write -- and eventually
+/// a DMA-side scatter -- actually wants.
+///
+/// It is ~4.7 ms/clip SLOWER today, and that is accepted deliberately: `pack_f32_to_bf16` reaches an
+/// AVX-512 path that a per-element convert inside the copy loop cannot, but AVX-512 is HOST execution
+/// and the single-hardware collapse deletes this work regardless. Judging it on hybrid wall clock is
+/// the wrong criterion; the direction is fewer host artifacts, and latency comes after residency.
+fn push_pad_rows_bf16(dst: &mut Vec<u16>, m: &Array2<f32>, start: usize, take: usize, n_total: usize) {
+    let dk = m.ncols();
+    for r in 0..take {
+        dst.extend(m.row(start + r).iter().map(|&x| npu_xrt::f32_to_bf16_bits(x)));
+    }
+    // bf16 zero is the all-zero bit pattern, as it is for f32 -- padding stays a memset.
+    dst.extend(std::iter::repeat(0u16).take((n_total - take) * dk));
 }
 
 #[cfg(test)]
