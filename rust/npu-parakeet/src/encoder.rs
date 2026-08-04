@@ -306,27 +306,38 @@ impl FastConformerEncoder {
             }
         }
         let relu = |a: &mut Array3<f32>| a.mapv_inplace(|v| v.max(0.0));
-        let mut x = conv2d(&x, &pe4("conv.0.weight"), &pe1("conv.0.bias"), 2, 1, 1);
-        relu(&mut x);
-        let x = conv2d(&x, &pe4("conv.2.weight"), &pe1("conv.2.bias"), 2, 1, 256);
-        let mut x = conv2d(&x, &pe4("conv.3.weight"), &pe1("conv.3.bias"), 1, 0, 1);
-        relu(&mut x);
-        let x = conv2d(&x, &pe4("conv.5.weight"), &pe1("conv.5.bias"), 2, 1, 256);
-        let mut x = conv2d(&x, &pe4("conv.6.weight"), &pe1("conv.6.bias"), 1, 0, 1);
-        relu(&mut x);
+        // Nested `ss_*` leaves: subsample is the last real host op, so its internal split decides
+        // whether moving it on-NPU means porting one conv or five.
+        let x = {
+            let _s = PhaseScope::new("ss_conv2d_x5", Bucket::Host);
+            let mut x = conv2d(&x, &pe4("conv.0.weight"), &pe1("conv.0.bias"), 2, 1, 1);
+            relu(&mut x);
+            let x = conv2d(&x, &pe4("conv.2.weight"), &pe1("conv.2.bias"), 2, 1, 256);
+            let mut x = conv2d(&x, &pe4("conv.3.weight"), &pe1("conv.3.bias"), 1, 0, 1);
+            relu(&mut x);
+            let x = conv2d(&x, &pe4("conv.5.weight"), &pe1("conv.5.bias"), 2, 1, 256);
+            let mut x = conv2d(&x, &pe4("conv.6.weight"), &pe1("conv.6.bias"), 1, 0, 1);
+            relu(&mut x);
+            x
+        };
         // x: [C=256, H=time, W=freq]; flatten -> [time, C*freq]
         let (c, ht, wf) = x.dim();
-        let mut flat = Array2::<f32>::zeros((ht, c * wf));
-        for ti in 0..ht {
-            for ci in 0..c {
-                for fi in 0..wf {
-                    flat[[ti, ci * wf + fi]] = x[[ci, ti, fi]];
+        let flat = {
+            let _s = PhaseScope::new("ss_flatten", Bucket::Host);
+            let mut flat = Array2::<f32>::zeros((ht, c * wf));
+            for ti in 0..ht {
+                for ci in 0..c {
+                    for fi in 0..wf {
+                        flat[[ti, ci * wf + fi]] = x[[ci, ti, fi]];
+                    }
                 }
             }
-        }
+            flat
+        };
         let wout = self.w.pre("out.weight").into_dimensionality::<Ix2>().unwrap(); // [4096, hidden]
         let bout = self.w.pre("out.bias").into_dimensionality::<Ix1>().unwrap();
         prof::phase::set_stage("subsample"); // final gemm (host .dot here; labels device path if ever routed via mm)
+        let _s = PhaseScope::new("ss_out_gemm", Bucket::Host);
         flat.dot(&wout) + &bout
     }
 

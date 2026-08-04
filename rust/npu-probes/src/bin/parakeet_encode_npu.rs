@@ -85,21 +85,30 @@ fn main() {
         // `ffn_*` scopes sit INSIDE ff_resident / fx_ff1_resident: they decompose the FFN rather
         // than partitioning the clip. Counting them in the totals is the same double-count that made
         // the old `fused_ff1_mhsa` wrapper read 135.7%, so split them out and subtract.
-        let is_detail = |s: &str| s.starts_with("ffn_");
-        let det: f64 = r.rows.iter().filter(|(s, _, _, _)| is_detail(s)).map(|(_, _, ms, _)| ms).sum();
-        let (npu, e2e) = (r.npu_ms - det, r.e2e_ms);
+        let is_detail = |s: &str| s.starts_with("ffn_") || s.starts_with("mh_") || s.starts_with("ss_");
+        // Subtract the nested detail from ITS OWN bucket -- `ss_*`/`mh_pack` are Host, `ffn_*` are Npu.
+        // Taking it all off `npu` inflated host by the Host-bucketed detail and deflated npu by it.
+        let det = |bk: npu_parakeet::prof::phase::Bucket| -> f64 {
+            r.rows.iter()
+                .filter(|(s, b, _, _)| is_detail(s) && std::mem::discriminant(b) == std::mem::discriminant(&bk))
+                .map(|(_, _, ms, _)| ms).sum()
+        };
+        let (npu, host, marshal) = (
+            r.npu_ms - det(npu_parakeet::prof::phase::Bucket::Npu),
+            r.host_ms - det(npu_parakeet::prof::phase::Bucket::Host),
+            r.marshal_ms - det(npu_parakeet::prof::phase::Bucket::Marshal),
+        );
+        let e2e = r.e2e_ms;
         println!(
-            "\nphase buckets (last clip): e2e {e2e:.1} ms = npu {npu:.1} ({:.1}%) + host {:.1} ({:.1}%) + marshal {:.1} ({:.1}%) | residual {:.1} overlap {:.1}",
-            100.0 * npu / e2e,
-            r.host_ms, 100.0 * r.host_ms / e2e,
-            r.marshal_ms, 100.0 * r.marshal_ms / e2e,
-            (e2e - npu - r.host_ms - r.marshal_ms).max(0.0),
-            (npu + r.host_ms + r.marshal_ms - e2e).max(0.0),
+            "\nphase buckets (last clip): e2e {e2e:.1} ms = npu {npu:.1} ({:.1}%) + host {host:.1} ({:.1}%) + marshal {marshal:.1} ({:.1}%) | residual {:.1} overlap {:.1}",
+            100.0 * npu / e2e, 100.0 * host / e2e, 100.0 * marshal / e2e,
+            (e2e - npu - host - marshal).max(0.0),
+            (npu + host + marshal - e2e).max(0.0),
         );
         for (stage, bucket, ms, calls) in r.rows.iter().filter(|(s, _, _, _)| !is_detail(s)).take(24) {
             println!("  {stage:<22} {:<8} {ms:8.1} ms  x{calls}", format!("{bucket:?}"));
         }
-        if det > 0.0 {
+        if r.rows.iter().any(|(s, _, _, _)| is_detail(s)) {
             println!("  -- detail, NESTED inside the rows above (not in the totals) --");
             for (stage, _, ms, calls) in r.rows.iter().filter(|(s, _, _, _)| is_detail(s)) {
                 println!("  {stage:<22} {:<8} {ms:8.1} ms  x{calls}  ({:.2} ms/disp)", "nested", ms / *calls as f64);

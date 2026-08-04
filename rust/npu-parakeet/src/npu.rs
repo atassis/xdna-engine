@@ -902,33 +902,47 @@ impl NpuMatmul {
             push_pad_rows(&mut kpv, &p_lo, 0, ph.nrows(), rk.pp);
             push_pad_rows(&mut kpv, &vh, 0, t, rk.tp);
         }
-        let mut qb = vec![0u16; quv.len()];
-        let mut kb = vec![0u16; kpv.len()];
-        npu_xrt::pack_f32_to_bf16(&quv, &mut qb);
-        npu_xrt::pack_f32_to_bf16(&kpv, &mut kb);
+        let (qb, kb) = {
+            let _p = crate::prof::phase::PhaseScope::new("mh_pack", crate::prof::phase::Bucket::Host);
+            let mut qb = vec![0u16; quv.len()];
+            let mut kb = vec![0u16; kpv.len()];
+            npu_xrt::pack_f32_to_bf16(&quv, &mut qb);
+            npu_xrt::pack_f32_to_bf16(&kpv, &mut kb);
+            (qb, kb)
+        };
         let t0 = Instant::now();
         // STEP-C: patch EVERY t_active word (one per head's RTP, all == BUILT_T in the template) to
         // this clip's t. All H heads share the clip's single t_active. (prebuild asserts count==H.)
-        let mut insts = rk.instr_template.clone();
-        for w in insts.iter_mut() {
-            if *w == rk.built_t as u32 {
-                *w = t as u32;
+        {
+            let _p = crate::prof::phase::PhaseScope::new("mh_instpatch", crate::prof::phase::Bucket::Marshal);
+            let mut insts = rk.instr_template.clone();
+            for w in insts.iter_mut() {
+                if *w == rk.built_t as u32 {
+                    *w = t as u32;
+                }
             }
+            let instr_bytes: Vec<u8> = insts.iter().flat_map(|w| w.to_le_bytes()).collect();
+            rk.bo_instr.write_bytes(&instr_bytes).unwrap();
+            rk.bo_instr.sync_to_device().unwrap();
         }
-        let instr_bytes: Vec<u8> = insts.iter().flat_map(|w| w.to_le_bytes()).collect();
-        rk.bo_instr.write_bytes(&instr_bytes).unwrap();
-        rk.bo_instr.sync_to_device().unwrap();
-        rk.bo_quv.write_bytes(u16_bytes(&qb)).unwrap();
-        rk.bo_quv.sync_to_device().unwrap();
-        rk.bo_kpv.write_bytes(u16_bytes(&kb)).unwrap();
-        rk.bo_kpv.sync_to_device().unwrap();
-        rk.kern.run_dwconv6(3, &rk.bo_instr, rk.n_instr, &rk.bo_quv, &rk.bo_kpv, &rk.bo_ctx).unwrap();
-        rk.bo_ctx.sync_from_device().unwrap();
+        {
+            let _p = crate::prof::phase::PhaseScope::new("mh_upload", crate::prof::phase::Bucket::Marshal);
+            rk.bo_quv.write_bytes(u16_bytes(&qb)).unwrap();
+            rk.bo_quv.sync_to_device().unwrap();
+            rk.bo_kpv.write_bytes(u16_bytes(&kb)).unwrap();
+            rk.bo_kpv.sync_to_device().unwrap();
+        }
+        {
+            let _p = crate::prof::phase::PhaseScope::new("mh_kernel", crate::prof::phase::Bucket::Npu);
+            rk.kern.run_dwconv6(3, &rk.bo_instr, rk.n_instr, &rk.bo_quv, &rk.bo_kpv, &rk.bo_ctx).unwrap();
+            rk.bo_ctx.sync_from_device().unwrap();
+        }
         {
             let mut s = self.stats.borrow_mut();
             s.dispatch_s += t0.elapsed().as_secs_f64();
             s.dispatches += 1;
         }
+        let _p_unpack = crate::prof::phase::PhaseScope::new("mh_unpack", crate::prof::phase::Bucket::Host);
         let mut cb = vec![0u8; h * rk.ctx_rows * RELPOS_DK * 2];
         rk.bo_ctx.read_bytes(&mut cb).unwrap();
         // Unpack: head hh's ctx (first t of ctx_rows) -> columns [hh*DK..(hh+1)*DK] of [t, D].
