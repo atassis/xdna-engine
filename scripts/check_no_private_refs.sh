@@ -48,7 +48,7 @@ if [ "${1:-}" = "--message" ]; then
 fi
 
 # Files that are ALLOWED to name these patterns (the guards themselves + the ignore list).
-allow='^(scripts/check_no_private_refs\.sh|scripts/private_ref_patterns\.sh|hooks/pre-push|\.githooks-install\.md|\.gitignore)$'
+allow='^(scripts/check_no_private_refs\.sh|scripts/private_ref_patterns\.sh|hooks/pre-push|hooks/pre-push-fork|\.githooks-install\.md|\.gitignore)$'
 
 cd "$(git rev-parse --show-toplevel)"
 
@@ -62,10 +62,10 @@ else
   # whole tree, minus the allowed guard files and lockfiles
   hits="$(git grep -nIEi "$regex" -- . ':!*.lock' \
             ':!scripts/check_no_private_refs.sh' ':!scripts/private_ref_patterns.sh' \
-            ':!hooks/pre-push' ':!.githooks-install.md' ':!.gitignore' 2>/dev/null || true)"
+            ':!hooks/pre-push' ':!hooks/pre-push-fork' ':!.githooks-install.md' ':!.gitignore' 2>/dev/null || true)"
   wiki_hits="$(git grep -nIE "$wikilink_re" -- . ':!*.lock' \
             ':!scripts/check_no_private_refs.sh' ':!scripts/private_ref_patterns.sh' \
-            ':!hooks/pre-push' ':!.githooks-install.md' ':!.gitignore' 2>/dev/null | grep -viE "$benign_wikilink_re" || true)"
+            ':!hooks/pre-push' ':!hooks/pre-push-fork' ':!.githooks-install.md' ':!.gitignore' 2>/dev/null | grep -viE "$benign_wikilink_re" || true)"
 fi
 
 if [ -n "$wiki_hits" ]; then
