@@ -82,16 +82,28 @@ fn main() {
     // window as the dispatch-transition report below so the two join. `residual` is wall time no
     // scope claimed; `overlap` is buckets summing past the wall clock, i.e. real concurrency.
     if let Some(r) = last_phase.filter(|r| r.npu_ms + r.host_ms + r.marshal_ms > 0.0) {
+        // `ffn_*` scopes sit INSIDE ff_resident / fx_ff1_resident: they decompose the FFN rather
+        // than partitioning the clip. Counting them in the totals is the same double-count that made
+        // the old `fused_ff1_mhsa` wrapper read 135.7%, so split them out and subtract.
+        let is_detail = |s: &str| s.starts_with("ffn_");
+        let det: f64 = r.rows.iter().filter(|(s, _, _, _)| is_detail(s)).map(|(_, _, ms, _)| ms).sum();
+        let (npu, e2e) = (r.npu_ms - det, r.e2e_ms);
         println!(
-            "\nphase buckets (last clip): e2e {:.1} ms = npu {:.1} ({:.1}%) + host {:.1} ({:.1}%) + marshal {:.1} ({:.1}%) | residual {:.1} overlap {:.1}",
-            r.e2e_ms,
-            r.npu_ms, 100.0 * r.npu_ms / r.e2e_ms,
-            r.host_ms, 100.0 * r.host_ms / r.e2e_ms,
-            r.marshal_ms, 100.0 * r.marshal_ms / r.e2e_ms,
-            r.residual_ms, r.overlap_ms,
+            "\nphase buckets (last clip): e2e {e2e:.1} ms = npu {npu:.1} ({:.1}%) + host {:.1} ({:.1}%) + marshal {:.1} ({:.1}%) | residual {:.1} overlap {:.1}",
+            100.0 * npu / e2e,
+            r.host_ms, 100.0 * r.host_ms / e2e,
+            r.marshal_ms, 100.0 * r.marshal_ms / e2e,
+            (e2e - npu - r.host_ms - r.marshal_ms).max(0.0),
+            (npu + r.host_ms + r.marshal_ms - e2e).max(0.0),
         );
-        for (stage, bucket, ms, calls) in r.rows.iter().take(24) {
+        for (stage, bucket, ms, calls) in r.rows.iter().filter(|(s, _, _, _)| !is_detail(s)).take(24) {
             println!("  {stage:<22} {:<8} {ms:8.1} ms  x{calls}", format!("{bucket:?}"));
+        }
+        if det > 0.0 {
+            println!("  -- detail, NESTED inside the rows above (not in the totals) --");
+            for (stage, _, ms, calls) in r.rows.iter().filter(|(s, _, _, _)| is_detail(s)) {
+                println!("  {stage:<22} {:<8} {ms:8.1} ms  x{calls}  ({:.2} ms/disp)", "nested", ms / *calls as f64);
+            }
         }
     }
     // NPU_DISPATCH_LOG=1: xclbin-transition accounting for the LAST clip. 0.99 ms/switch is the

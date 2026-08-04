@@ -2331,6 +2331,7 @@ impl NpuMatmul {
         // Timed outside the dtimer scope: that guard borrows self.stats at drop.
         let t_fc1 = Instant::now();
         {
+            let _p = crate::prof::phase::PhaseScope::new("ffn_fc1", crate::prof::phase::Bucket::Npu);
             let _dt = self.dtimer();
             o.kern
                 .run_matmul8(3, &o.instr, o.n, &rl.bo_bf16, w1, &o.bo_out, &o.dummy_tmp, &o.dummy_tr)
@@ -2660,11 +2661,19 @@ impl NpuMatmul {
             };
             // modal identity GEMM: partial c -> st.bo_c (device, NO sync_from/read).
             modal_site("kern#8");
-            { let _dt = self.dtimer(); self.kern.run_matmul8(3, &st.instr, st.n_instr, &chunk, &w2c, &st.bo_c, &self.bo_tmp, &self.bo_tr).unwrap(); }
+            {
+                let _p = crate::prof::phase::PhaseScope::new("ffn_fc2_gemm", crate::prof::phase::Bucket::Npu);
+                let _dt = self.dtimer();
+                self.kern.run_matmul8(3, &st.instr, st.n_instr, &chunk, &w2c, &st.bo_c, &self.bo_tmp, &self.bo_tr).unwrap();
+            }
             // accumulate on-chip: nxt = (c==0 ? zero : cur) + st.bo_c, then ping-pong.
             let a_in: &Bo = if c == 0 { &aa.zero } else { &cur };
             modal_site("aa.kern#1");
-            { let _dt = self.dtimer(); aa.kern.run_matmul8(3, &aa.instr, aa.n, a_in, &st.bo_c, &nxt, &aa.dummy_tmp, &aa.dummy_tr).unwrap(); }
+            {
+                let _p = crate::prof::phase::PhaseScope::new("ffn_fc2_accadd", crate::prof::phase::Bucket::Npu);
+                let _dt = self.dtimer();
+                aa.kern.run_matmul8(3, &aa.instr, aa.n, a_in, &st.bo_c, &nxt, &aa.dummy_tmp, &aa.dummy_tr).unwrap();
+            }
             self.stats.borrow_mut().dispatches += 2; // partial GEMM + acc_add
             std::mem::swap(&mut cur, &mut nxt);
         }
