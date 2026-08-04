@@ -162,6 +162,17 @@ fn main() {
             &wa.join("insts_512x1024x4096_64x32x128_8c_modalsilukrtp.txt"),
             [PAD_M * KRES * 2, KRES * DFF * 2, PAD_M * DFF * 4, 1, 4],
         ),
+        // M=256 vs M=512 at the OTHER dispatched shapes, so the padding pricing covers the real mix
+        // rather than one N.
+        Brick::load(&dev, &wa.join("final_256x1024x1024_64x32x128_8c_modalidkrtp.xclbin"),
+                    &wa.join("insts_256x1024x1024_64x32x128_8c_modalidkrtp.txt"),
+                    [256*KRES*2, KRES*KRES*2, 256*KRES*4, 1, 4]),
+        Brick::load(&dev, &wa.join("final_512x1024x1024_64x32x128_8c_modalidkrtp.xclbin"),
+                    &wa.join("insts_512x1024x1024_64x32x128_8c_modalidkrtp.txt"),
+                    [PAD_M*KRES*2, KRES*KRES*2, PAD_M*KRES*4, 1, 4]),
+        Brick::load(&dev, &wa.join("final_256x4096x1024_64x32x128_8c_modalidkrtp.xclbin"),
+                    &wa.join("insts_256x4096x1024_64x32x128_8c_modalidkrtp.txt"),
+                    [256*DFF*2, DFF*KRES*2, 256*KRES*4, 1, 4]),
         // The six bricks the fc2/conv/MHSA path adds. Without them REPLAY panics on an unknown
         // name, so the probe could only ever see 3 of the 9 kernels the encoder alternates among
         // -- and the three it saw are the CHEAP ones. Sizes copied from npu.rs's own alloc sites.
