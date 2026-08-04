@@ -892,37 +892,74 @@ impl FastConformerEncoder {
         if Self::resident_on("PARAKEET_FUSED_BLOCK") {
             if let Some(npu) = &self.npu {
                 if npu.resident_fused_available() {
-                    let _h = PhaseScope::new("fused_ff1_mhsa", Bucket::Npu);
+                    // NO outer scope here. One `fused_ff1_mhsa` Npu scope used to wrap this whole
+                    // branch, which both DOUBLE-COUNTED the inner scopes (the report read npu 135.7%
+                    // of e2e with 1030 ms of "overlap") and HID every host step inside it -- ~1.13 s
+                    // per clip attributed to nothing finer. Each step is a leaf below instead, so the
+                    // buckets sum to the wall clock and `residual` means genuinely unscoped.
                     let m = x.nrows();
                     let ff1n_g = b.v("norm_feed_forward1.weight");
                     let ff1n_b = b.v("norm_feed_forward1.bias");
                     let satt_g = b.v("norm_self_att.weight");
                     let satt_b = b.v("norm_self_att.bias");
-                    let x_bo = npu.upload_stream(&x);
-                    let ff1_bo = npu.resident_ffn_dev_bo(&x_bo, ff1n_g.as_slice().unwrap(), ff1n_b.as_slice().unwrap(),
-                        || b.m("feed_forward1.linear1.weight"), &format!("{blk}.ff1.l1"),
-                        || b.m("feed_forward1.linear2.weight"), &format!("{blk}.ff1.l2")).expect("resident_ffn_dev_bo");
-                    let x_bo = npu.residual_add_dev(&x_bo, &ff1_bo, 0.5, m).expect("residual_add_dev(0.5)");
-                    let satt_bo = npu.ln_affine_cast_dev_bf16(&x_bo, satt_g.as_slice().unwrap(), satt_b.as_slice().unwrap()).expect("ln_affine_cast_dev");
+                    let x_bo = {
+                        let _h = PhaseScope::new("fx_upload", Bucket::Marshal);
+                        npu.upload_stream(&x)
+                    };
+                    // ff1 takes the DEV-BO path, not `feed_forward`, so it never passed through the
+                    // `ff_resident` scope -- the block's single biggest op was landing in `residual`.
+                    let ff1_bo = {
+                        let _h = PhaseScope::new("fx_ff1_resident", Bucket::Npu);
+                        npu.resident_ffn_dev_bo(&x_bo, ff1n_g.as_slice().unwrap(), ff1n_b.as_slice().unwrap(),
+                            || b.m("feed_forward1.linear1.weight"), &format!("{blk}.ff1.l1"),
+                            || b.m("feed_forward1.linear2.weight"), &format!("{blk}.ff1.l2")).expect("resident_ffn_dev_bo")
+                    };
+                    let x_bo = {
+                        let _h = PhaseScope::new("fx_resadd_macaron", Bucket::Npu);
+                        npu.residual_add_dev(&x_bo, &ff1_bo, 0.5, m).expect("residual_add_dev(0.5)")
+                    };
+                    let satt_bo = {
+                        let _h = PhaseScope::new("fx_satt_ln", Bucket::Npu);
+                        npu.ln_affine_cast_dev_bf16(&x_bo, satt_g.as_slice().unwrap(), satt_b.as_slice().unwrap()).expect("ln_affine_cast_dev")
+                    };
                     // MHSA output stays on device (linear_out -> device BO).
                     let mhsa_out_bo = self.mhsa_dev(&satt_bo, m, blk, pos_enc);
                     // MHSA residual ON-DEVICE: conv_in = (x + 0.5*ff1) + mhsa_out (scale 1.0), no host round-trip.
-                    let conv_in_bo = npu.residual_add_dev(&x_bo, &mhsa_out_bo, 1.0, m).expect("residual_add_dev(1.0)");
+                    let conv_in_bo = {
+                        let _h = PhaseScope::new("fx_resadd_mhsa", Bucket::Npu);
+                        npu.residual_add_dev(&x_bo, &mhsa_out_bo, 1.0, m).expect("residual_add_dev(1.0)")
+                    };
                     // Conv FRONT device-in: norm_conv LN + pw1 + GLU consume conv_in_bo directly (no host
                     // round-trip between MHSA and conv); returns the host GLU output for the conv rest.
                     let conv_g = b.v("norm_conv.weight");
                     let conv_b = b.v("norm_conv.bias");
-                    let glu = npu.resident_conv_pw1_glu_dev(&conv_in_bo, m, conv_g.as_slice().unwrap(), conv_b.as_slice().unwrap(),
-                        || b.m3("conv.pointwise_conv1.weight").index_axis(Axis(2), 0).to_owned().t().to_owned(), &format!("{blk}.pw1"));
+                    let glu = {
+                        let _h = PhaseScope::new("fx_conv_front", Bucket::Npu);
+                        npu.resident_conv_pw1_glu_dev(&conv_in_bo, m, conv_g.as_slice().unwrap(), conv_b.as_slice().unwrap(),
+                            || b.m3("conv.pointwise_conv1.weight").index_axis(Axis(2), 0).to_owned().t().to_owned(), &format!("{blk}.pw1"))
+                    };
                     // rejoin host: x = (x + 0.5*ff1) + mhsa_out (the conv residual base), then conv rest / FFN2 / out.
-                    let mut x = npu.readback_stream(&conv_in_bo, m);
+                    // THIS is the block's one surviving device->host crossing.
+                    let mut x = {
+                        let _h = PhaseScope::new("fx_readback", Bucket::Marshal);
+                        npu.readback_stream(&conv_in_bo, m)
+                    };
                     dump_convin("fused", blk, &x);
                     let conv_out = prof::time("conv_mod", || self.conv_module(&x, blk, glu));
-                    x = &x + &conv_out;
+                    {
+                        let _h = PhaseScope::new("fx_resadd_conv_host", Bucket::Host);
+                        x = &x + &conv_out;
+                    }
                     let ff2 = prof::time("ff", || self.feed_forward(&x, b, blk, "ff2", "norm_feed_forward2.weight", "norm_feed_forward2.bias",
                                                 "feed_forward2.linear1.weight", "feed_forward2.linear2.weight"));
-                    x = x + ff2.mapv(|v| 0.5 * v);
-                    let out = layernorm(&x, &b.v("norm_out.weight"), &b.v("norm_out.bias"));
+                    {
+                        let _h = PhaseScope::new("fx_resadd_ff2_host", Bucket::Host);
+                        x = x + ff2.mapv(|v| 0.5 * v);
+                    }
+                    let out = {
+                        let _h = PhaseScope::new("fx_norm_out_host", Bucket::Host);
+                        layernorm(&x, &b.v("norm_out.weight"), &b.v("norm_out.bias"))
+                    };
                     dump_convin("fused_out", blk, &out);
                     return out;
                 }
