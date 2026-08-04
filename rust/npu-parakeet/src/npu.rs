@@ -972,10 +972,18 @@ impl NpuMatmul {
         // this clip's t. All H heads share the clip's single t_active. (prebuild asserts count==H.)
         {
             let _p = crate::prof::phase::PhaseScope::new("mh_instpatch", crate::prof::phase::Bucket::Marshal);
+            // TIMING PROBE (PARAKEET_RELPOS_TACTIVE_PROBE=<n>): dispatch a FALSE t_active to
+            // partition the relpos dispatch. With the t_active block-skip bricks, a tiny t_active
+            // elides nearly all block arithmetic, so what remains is the fixed + delivery floor.
+            // Output is GARBAGE by construction -- timing only, never a correctness run.
+            let t_patch = std::env::var("PARAKEET_RELPOS_TACTIVE_PROBE")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(t);
             let mut insts = rk.instr_template.clone();
             for w in insts.iter_mut() {
                 if *w == rk.built_t as u32 {
-                    *w = t as u32;
+                    *w = t_patch as u32;
                 }
             }
             let instr_bytes: Vec<u8> = insts.iter().flat_map(|w| w.to_le_bytes()).collect();
