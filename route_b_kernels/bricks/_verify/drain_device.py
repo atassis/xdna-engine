@@ -53,6 +53,7 @@ TARGETS = [
 
 SCRIPT_TARGETS = [
     "probe_rope_partial_rotary",
+    "verify_rope_lut_tables_repro",  # device-free: the committed .inc still matches its generator
     "verify_rmsnorm",
     "verify_int4_streamed",
     "verify_upscaler_bf16_conv2d",
