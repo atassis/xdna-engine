@@ -337,6 +337,22 @@ impl FastConformerEncoder {
         let wout = self.w.pre("out.weight").into_dimensionality::<Ix2>().unwrap(); // [4096, hidden]
         let bout = self.w.pre("out.bias").into_dimensionality::<Ix1>().unwrap();
         prof::phase::set_stage("subsample"); // final gemm (host .dot here; labels device path if ever routed via mm)
+        // `PARAKEET_SUBSAMPLE_OUT_NPU=1`: run the [T,4096]x[4096,1024] output projection on the
+        // resident instead of the host. It is the SAME K=4096 contraction the one-dispatch fc2 already
+        // performs, so it needs no new kernel and no new hw_context. Returns None (host path kept) when
+        // the resident is not krtp -- at k != KRES a baked resident contracts over the wrong length.
+        // The bias stays host: [T,1024] is negligible next to the GEMM.
+        // OPT-IN, deliberately NOT `resident_on` -- that helper defaults to TRUE when the var is
+        // unset, so using it here would have flipped a shipped default silently.
+        #[cfg(feature = "npu")]
+        if std::env::var("PARAKEET_SUBSAMPLE_OUT_NPU").map(|v| v != "0").unwrap_or(false) {
+            if let Some(npu) = self.npu.as_ref() {
+                let _s = PhaseScope::new("ss_out_gemm", Bucket::Npu);
+                if let Some(c) = npu.matmul_k4096(&flat, || wout.to_owned(), "subsample.out") {
+                    return c + &bout;
+                }
+            }
+        }
         let _s = PhaseScope::new("ss_out_gemm", Bucket::Host);
         flat.dot(&wout) + &bout
     }

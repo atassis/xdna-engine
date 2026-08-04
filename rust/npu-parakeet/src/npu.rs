@@ -228,12 +228,18 @@ pub struct NpuMatmul {
     // resident built before that branch existed takes the `else` arm and returns pw1's raw [a|g]
     // -- a wrong answer, not a failure. The shipped `modalsilu` resident is such a build.
     glu_epi: bool,
-    streams: RefCell<HashMap<(usize, usize, Act), Rc<NStream>>>, // (K, N, activation) -> stream
+    // (K, N, activation, a_panel) -> stream. `a_panel` is part of the KEY, not just the filename:
+    // at k!=KRES the same (k,n,act) has both a panel-major and a row-major stream, and letting them
+    // collide would hand one consumer the other's A tap and be silently wrong.
+    streams: RefCell<HashMap<(usize, usize, Act, bool), Rc<NStream>>>,
     // fc2 output for the one-dispatch K=DFF collapse. Its own BO against self.kern's C group --
     // NOT the stream's shared bo_c (every N=1024 identity dispatch would alias it) and NOT the
     // accadd scratch (that is another kernel's group). Lazily allocated so the default path,
     // which never takes this branch, does not spend a buffer on it.
     fc2_out: RefCell<Option<Rc<Bo>>>,
+    // A buffer for the K=DFF host-fed GEMM (subsample out). PAD_M x DFF bf16 = 4 MB, 4x bo_a's
+    // width, so it is separate and lazily allocated -- a run that never takes that path pays nothing.
+    bo_a4: RefCell<Option<Rc<Bo>>>,
     wcache: RefCell<HashMap<String, Rc<Bo>>>,      // packed weight BOs by id
     ncache: RefCell<HashMap<String, usize>>,       // weight N (ncols) by id, paired with wcache
     relpos_dir: PathBuf,                           // {root}/artifacts/relpos (per-T xclbin cache)
@@ -737,6 +743,7 @@ impl NpuMatmul {
             glu_epi,
             streams: RefCell::new(HashMap::new()),
             fc2_out: RefCell::new(None),
+            bo_a4: RefCell::new(None),
             wcache: RefCell::new(HashMap::new()),
             ncache: RefCell::new(HashMap::new()),
             relpos_dir: root.join("artifacts/relpos"),
@@ -2072,6 +2079,70 @@ impl NpuMatmul {
         Some(out)
     }
 
+    /// Host-in -> host-out `A[m,DFF] @ W[DFF,KRES]` on the RESIDENT xclbin, for the subsample stem's
+    /// output projection. Same K=4096 contraction the one-dispatch fc2 already runs, so it needs no
+    /// new kernel and -- because it dispatches on the resident -- no new hw_context, which matters at
+    /// 14/16 used.
+    ///
+    /// Requires the krtp resident: at `k != KRES` the k-loop bound comes from rtp[1], and a BAKED
+    /// resident would silently contract over its own K instead. Returns `None` rather than dispatching
+    /// wrong, so the caller keeps the host path.
+    ///
+    /// A is HOST-fed and therefore row-major, which is why this asks `stream_k_ex` for the row-major
+    /// tap explicitly instead of letting it derive fc1's panel-major layout.
+    pub fn matmul_k4096<F: FnOnce() -> Array2<f32>>(&self, a: &Array2<f32>, make_w: F, id: &str) -> Option<Array2<f32>> {
+        if !self.krtp || !self.modal {
+            return None;
+        }
+        let m = a.nrows();
+        assert_eq!(a.ncols(), DFF, "matmul_k4096 needs K=DFF={DFF}");
+        assert!(m <= PAD_M, "m={m} exceeds PAD_M={PAD_M}");
+        self.stats.borrow_mut().calls += 1;
+        let cached = self.wcache.borrow().get(id).cloned();
+        let wbo = if let Some(bo) = cached {
+            bo
+        } else {
+            let w = make_w();
+            assert_eq!(w.dim(), (DFF, KRES), "matmul_k4096 W dim");
+            self.weight_bo(id, w.view())
+        };
+        // A needs PAD_M x DFF bf16 = 4 MB, four times `bo_a`'s KRES width, so it gets its own buffer.
+        // Lazily, so a run that never takes this path does not pay for it.
+        let bo_a4 = {
+            let mut slot = self.bo_a4.borrow_mut();
+            if slot.is_none() {
+                let g3 = self.kern.group_id(3).unwrap();
+                *slot = Some(Rc::new(self.dev.alloc_bo(&self.kern, PAD_M * DFF * 2, FLAG_HOST_ONLY, g3).unwrap()));
+            }
+            slot.as_ref().unwrap().clone()
+        };
+        let a_std = a.as_standard_layout();
+        let mut bits = vec![0u16; PAD_M * DFF]; // rows m..PAD_M stay zero
+        npu_xrt::pack_f32_to_bf16(&a_std.as_slice().unwrap()[..m * DFF], &mut bits[..m * DFF]);
+        bo_a4.write_bytes(u16_bytes(&bits)).unwrap();
+        bo_a4.sync_to_device().unwrap();
+        let st = self.stream_k_ex(DFF, KRES, Act::Identity, false);
+        modal_site("kern#ss_out");
+        {
+            let _dt = self.dtimer();
+            self.kern
+                .run_matmul8(3, &st.instr, st.n_instr, &bo_a4, &wbo, &st.bo_c, &self.bo_tmp, &self.bo_tr)
+                .unwrap();
+        }
+        self.stats.borrow_mut().dispatches += 1;
+        st.bo_c.sync_from_device().unwrap();
+        let mut cb = vec![0u8; m * KRES * 4];
+        st.bo_c.read_bytes(&mut cb).unwrap();
+        let mut out = Array2::<f32>::zeros((m, KRES));
+        for r in 0..m {
+            for c in 0..KRES {
+                let off = (r * KRES + c) * 4;
+                out[[r, c]] = f32::from_le_bytes([cb[off], cb[off + 1], cb[off + 2], cb[off + 3]]);
+            }
+        }
+        Some(out)
+    }
+
     /// Host-in -> DEVICE-OUT matmul: A[m,KRES] @ W[KRES,n] -> C[m,n] f32 left in a FRESH device BO (no
     /// read). The device-out twin of the k=KRES `matmul_id_lazy` path: packs+uploads A, GEMMs into a new
     /// BO, returns it -- so a projection result (e.g. MHSA linear_out) stays resident for the next seam.
@@ -3001,11 +3072,19 @@ impl NpuMatmul {
     /// A missing stream file panics in the read below rather than falling back, which is what makes
     /// that pairing fail loud instead of quietly wrong.
     fn stream_k(&self, k: usize, n: usize, act: Act) -> Rc<NStream> {
+        // Derived, because for a DEVICE-fed A the layout is a property of the producer (fc1's drain).
+        let a_panel = k != KRES && self.fc1_pack_in_drain_on();
+        self.stream_k_ex(k, n, act, a_panel)
+    }
+
+    /// `stream_k` with the A-tap layout stated rather than derived -- for a HOST-fed A, which is
+    /// row-major regardless of what fc1's drain does.
+    fn stream_k_ex(&self, k: usize, n: usize, act: Act, a_panel: bool) -> Rc<NStream> {
         // The plain (non-modal) resident has no epilogue, so the activation is a no-op there; collapse
         // to Identity so the cache stays 1:1 with the single plain insts file (byte-identical to the
         // old `silu && self.modal` key).
         let act = if self.modal { act } else { Act::Identity };
-        let key = (k, n, act);
+        let key = (k, n, act, a_panel);
         if let Some(s) = self.streams.borrow().get(&key) {
             return s.clone();
         }
@@ -3035,11 +3114,7 @@ impl NpuMatmul {
             // silently wrong. That is a property of the PRODUCER, not a free choice, so derive it
             // here rather than add a second env knob that could disagree with the fc1 path.
             let krtp = if self.krtp { "krtp" } else { "" };
-            let apanel = if k != KRES && self.fc1_pack_in_drain_on() {
-                format!("apanel{KRES}")
-            } else {
-                String::new()
-            };
+            let apanel = if a_panel { format!("apanel{KRES}") } else { String::new() };
             kernel_registry::insts_path(&self.base, &format!("{PAD_M}x{k}x{n}_{}_8c_{mode}{sfx}{krtp}{apanel}", self.tile))
         } else {
             kernel_registry::insts_path(&self.base, &format!("{PAD_M}x{k}x{n}_{}_8c", self.tile))
