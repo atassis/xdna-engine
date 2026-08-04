@@ -928,6 +928,13 @@ extern "C" void relpos_kpvstream_bake(bfloat16 *restrict quv,
 // int32 into a Kernel call (see relpos_rowtiled_stream_iron.py "PROBE 1"). The
 // compute itself is identical to the device-gateable monolithic driver above.
 // ---------------------------------------------------------------------------
+// kernels.a is a SINGLE archive member, so every symbol in this file is linked into
+// the core whether the design calls it or not, and the STEP=8 core sits near the
+// program-memory ceiling (see the generator's unroll note). The plain and _ts block
+// bricks are therefore mutually exclusive: -DRELPOS_TSKIP (Makefile TSKIP=1, which
+// also passes the generator --tskip) selects the set. A mismatch between the two
+// fails loud as an undefined symbol at link.
+#ifndef RELPOS_TSKIP
 extern "C" void relpos_stream_dot(bfloat16 *restrict Aq, bfloat16 *restrict Bblk,
                                   float *restrict out, int32_t Tq, int32_t kb,
                                   int32_t j0, int32_t ncol) {
@@ -947,6 +954,7 @@ extern "C" void relpos_stream_dot_p(bfloat16 *restrict Aq, bfloat16 *restrict Bb
   relpos_dot_block(Aq, Bblk, out, Tq, pb, j0, ncol);
   event1();
 }
+#endif // !RELPOS_TSKIP
 
 // COLUMN-SLICE dot-matmul that ADDS into out (the split-bf16 2nd pass): out[il, j0+jj]
 // += dot(A[il,:DK], Bblk[jj,:DK]). Identical bf16-in / f32-accfloat numerics to
@@ -978,6 +986,7 @@ static inline void relpos_dot_block_acc(const bfloat16 *restrict A,
 
 // STEP-8 split-bf16 p_lo pass: BD += qv @ p_lo^T (column-slice, ADDS into g_bd). Distinct
 // symbol from relpos_stream_dot_p so the generator can declare it as a separate Kernel.
+#ifndef RELPOS_TSKIP
 extern "C" void relpos_stream_dot_p_lo(bfloat16 *restrict Aq, bfloat16 *restrict Bblk,
                                        float *restrict out, int32_t Tq, int32_t pb,
                                        int32_t j0, int32_t ncol) {
@@ -986,16 +995,18 @@ extern "C" void relpos_stream_dot_p_lo(bfloat16 *restrict Aq, bfloat16 *restrict
   event1();
 }
 
-extern "C" void relpos_stream_ctx_zero(float *restrict ctxf, int32_t Tq) {
-  relpos_ctx_zero(ctxf, Tq);
-}
-
 extern "C" void relpos_stream_ctx(bfloat16 *restrict probs,
                                   bfloat16 *restrict Vblk, float *restrict ctxf,
                                   int32_t Tq, int32_t T, int32_t kb, int32_t j0) {
   event0();
   relpos_ctx_block(probs, Vblk, ctxf, Tq, T, kb, j0);
   event1();
+}
+#endif // !RELPOS_TSKIP
+
+// Shared by both arms (the skip is per-block; zeroing the tile accumulator is not).
+extern "C" void relpos_stream_ctx_zero(float *restrict ctxf, int32_t Tq) {
+  relpos_ctx_zero(ctxf, Tq);
 }
 
 extern "C" void relpos_stream_softmax(float *restrict AC, float *restrict BD,
@@ -1018,3 +1029,92 @@ extern "C" void relpos_stream_narrow(float *restrict ctxf, bfloat16 *restrict ct
                                      int32_t Tq) {
   relpos_ctx_narrow(ctxf, ctx, Tq);
 }
+
+// ---------------------------------------------------------------------------
+// RUNTIME t_active BLOCK-SKIP variants (generator --tskip).
+//
+// The bricks above compute every block the dataflow delivers; only the softmax
+// reads t_active. A clip shorter than the bucket's BUILT_T therefore pays full
+// BUILT_T dot compute and the softmax then discards it. These variants take the
+// same rtp register the softmax reads, plus the tile's global q0, and drop the
+// blocks whose results relpos_scores_softmax_rows provably never loads. The
+// Worker still acquires and releases every block, so the objectFIFO delivery
+// contract, the shim BD replay and the 2-input-channel budget are untouched --
+// only arithmetic goes away.
+//
+// Derived from relpos_scores_softmax_rows, which for tile row il reads
+//   ac_row[j], j < t_active                             (stride T)
+//   bd_row[j] = BD[il*P + (t_active-1-(q0+il)) + j],  j < t_active
+// and skips the row entirely when q0 + il >= t_active:
+//   whole tile   q0 >= t_active      -- every row hits that `continue`.
+//   AC k-block   j0 >= t_active      -- those columns are never loaded.
+//   ctx V-block  j0 >= t_active      -- probs there are unset and already nulled
+//                                       by zero pad-V, so the term is +0 today.
+//   BD p-block   outside [t_active-q0-tq_act, 2*t_active-2-q0], the union of the
+//                per-row windows over the tile's live rows (il = 0 gives the
+//                largest index, il = tq_act-1 the smallest).
+// Dropping only never-read blocks makes this bit-exact against the full path,
+// which is the gate: a non-zero rel-L2 means the bounds are wrong.
+// ---------------------------------------------------------------------------
+
+#ifdef RELPOS_TSKIP
+// Live rows of a tile at global q0: the rows the softmax does not `continue` past.
+static inline int relpos_tq_active(int Tq, int q0, int t_active) {
+  int tq_act = t_active - q0;
+  return (tq_act < Tq) ? tq_act : Tq;
+}
+
+extern "C" void relpos_stream_dot_ts(bfloat16 *restrict Aq, bfloat16 *restrict Bblk,
+                                     float *restrict out, int32_t *restrict rtp,
+                                     int32_t Tq, int32_t kb, int32_t j0,
+                                     int32_t ncol, int32_t q0) {
+  int32_t t_active = rtp[0];
+  if (q0 >= t_active || j0 >= t_active) return;
+  event0();
+  relpos_dot_block(Aq, Bblk, out, Tq, kb, j0, ncol);
+  event1();
+}
+
+// p-block liveness: the block [j0, j0+pb) must intersect the tile's rel_shift window.
+static inline int relpos_p_block_live(int j0, int pb, int Tq, int q0, int t_active) {
+  int tq_act = relpos_tq_active(Tq, q0, t_active);
+  int lo = t_active - q0 - tq_act;   // >= 0: tq_act is clamped to t_active - q0
+  int hi = 2 * t_active - 2 - q0;    // largest index the il = 0 row reads
+  return (j0 + pb > lo) && (j0 <= hi);
+}
+
+extern "C" void relpos_stream_dot_p_ts(bfloat16 *restrict Aq, bfloat16 *restrict Bblk,
+                                       float *restrict out, int32_t *restrict rtp,
+                                       int32_t Tq, int32_t pb, int32_t j0,
+                                       int32_t ncol, int32_t q0) {
+  int32_t t_active = rtp[0];
+  if (q0 >= t_active) return;
+  if (!relpos_p_block_live(j0, pb, Tq, q0, t_active)) return;
+  event0();
+  relpos_dot_block(Aq, Bblk, out, Tq, pb, j0, ncol);
+  event1();
+}
+
+extern "C" void relpos_stream_dot_p_lo_ts(bfloat16 *restrict Aq, bfloat16 *restrict Bblk,
+                                          float *restrict out, int32_t *restrict rtp,
+                                          int32_t Tq, int32_t pb, int32_t j0,
+                                          int32_t ncol, int32_t q0) {
+  int32_t t_active = rtp[0];
+  if (q0 >= t_active) return;
+  if (!relpos_p_block_live(j0, pb, Tq, q0, t_active)) return;
+  event0();
+  relpos_dot_block_acc(Aq, Bblk, out, Tq, pb, j0, ncol);
+  event1();
+}
+
+extern "C" void relpos_stream_ctx_ts(bfloat16 *restrict probs,
+                                     bfloat16 *restrict Vblk, float *restrict ctxf,
+                                     int32_t *restrict rtp, int32_t Tq, int32_t T,
+                                     int32_t kb, int32_t j0, int32_t q0) {
+  int32_t t_active = rtp[0];
+  if (q0 >= t_active || j0 >= t_active) return;
+  event0();
+  relpos_ctx_block(probs, Vblk, ctxf, Tq, T, kb, j0);
+  event1();
+}
+#endif // RELPOS_TSKIP

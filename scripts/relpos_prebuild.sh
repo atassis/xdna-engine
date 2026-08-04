@@ -19,7 +19,14 @@ TQ=8
 # (Phase-2 spatial-parallel relpos). HEADS=1 rebuilds the original single-Worker block.
 HEADS="${HEADS:-8}"
 # BUILT_T:KB:subdir -- keep in sync with RELPOS_BUCKETS in npu.rs.
-BUCKETS="${BUCKETS:-100:25:bucket_100 152:38:bucket_152 172:43:single}"
+# Every BUILT_T must be a multiple of TQ (else the generator peels a ragged query tile and
+# re-emits every block call -- 20% of the core's 16 KB program memory) and must not be 104
+# (the insts header word[2] constant; the per-clip patch is by value). See RELPOS_BUCKETS.
+BUCKETS="${BUCKETS:-112:28:bucket_112 152:38:bucket_152 176:44:single}"
+# TSKIP=1 builds the runtime t_active block-skip arm (drop the blocks the softmax never reads).
+# OUT_ROOT redirects the artifacts so both arms can sit side by side for a swap A/B.
+TSKIP="${TSKIP:-0}"
+OUT_ROOT="${OUT_ROOT:-artifacts/relpos}"
 EX=mlir-aie/programming_examples/ml/relpos_mha
 
 setup_env() { source scripts/iron_env.sh; }
@@ -28,13 +35,13 @@ python3 -c "import aie.iron" 2>/dev/null || { echo "[prebuild] iron env not gree
 scripts/sync_kernels.sh >/dev/null 2>&1
 
 build_bucket() {
-  local BUILT_T="$1" KB="$2" out="artifacts/relpos/$3"
+  local BUILT_T="$1" KB="$2" out="$OUT_ROOT/$3"
   if [ -f "$out/final.xclbin" ] && [ -f "$out/insts.bin" ] && [ -z "${FORCE:-}" ]; then
     echo "[prebuild] bucket $BUILT_T present -> $out (FORCE=1 to rebuild)"; return 0
   fi
   echo "[prebuild] building STEP=8 T=$BUILT_T TQ=$TQ KB=$KB HEADS=$HEADS -> $out ..."
   ( cd "$EX" && make clean >/dev/null 2>&1; \
-    make NPU2=1 STEP=8 SPLITP=1 T="$BUILT_T" TQ="$TQ" KB="$KB" TACTIVE="$BUILT_T" HEADS="$HEADS" >/dev/null 2>&1 )
+    make NPU2=1 STEP=8 SPLITP=1 TSKIP="$TSKIP" T="$BUILT_T" TQ="$TQ" KB="$KB" TACTIVE="$BUILT_T" HEADS="$HEADS" >/dev/null 2>&1 )
   if [ ! -f "$EX/build/final.xclbin" ]; then
     echo "[prebuild] FAILED bucket $BUILT_T (no final.xclbin)"; return 1
   fi

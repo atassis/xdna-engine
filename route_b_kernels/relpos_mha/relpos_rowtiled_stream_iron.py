@@ -140,7 +140,7 @@ def ceildiv(a, b):
 # by ONE inline_ops (the whole-array modal-matmul pattern). All heads share the clip's
 # single t_active, so the host patches every t_active word of the template insts.
 # ============================================================================
-def my_relpos_stream(dev, T, TQ, KB, t_active=None, splitp=False, heads=1):
+def my_relpos_stream(dev, T, TQ, KB, t_active=None, splitp=False, heads=1, tskip=False):
     # STEP-C: T is the BAKED buffer/dataflow size (the single MAX-T xclbin, e.g. 172);
     # t_active <= T is the ACTIVE key count the softmax attends (a per-insts constant on
     # the SAME xclbin, so one xclbin serves any clip padded to T). Default = T (full).
@@ -232,18 +232,37 @@ def my_relpos_stream(dev, T, TQ, KB, t_active=None, splitp=False, heads=1):
     of_ctx = [ObjectFifo(ctx_blk_ty, name=f"ctx{h}", depth=2) for h in range(heads)]
 
     # ---- block-brick kernels (int32-scalar ABI; see PROBE 1) ----
-    dot_k = Kernel("relpos_stream_dot", "kernels.a",
-                   [quv_blk_ty, kblk_ty, ac_ty, np.int32, np.int32, np.int32, np.int32])
-    dot_p = Kernel("relpos_stream_dot_p", "kernels.a",
-                   [quv_blk_ty, kblk_ty, bd_ty, np.int32, np.int32, np.int32, np.int32])
-    # split-bf16 p_lo pass: BD += qv @ p_lo^T (ADDS into g_bd). Only wired under --splitp.
-    dot_p_lo = Kernel("relpos_stream_dot_p_lo", "kernels.a",
-                      [quv_blk_ty, kblk_ty, bd_ty, np.int32, np.int32, np.int32, np.int32])
+    # TSKIP: the _ts bricks take the softmax's rtp register + the tile's global q0 and
+    # drop every block whose result the softmax never loads (a clip shorter than this
+    # bucket's BUILT_T otherwise pays full-BUILT_T dot compute). Delivery is identical --
+    # the Worker still acquires/releases every block -- so only arithmetic goes away, and
+    # the result is bit-exact against the full path. Derivation: relpos_mha.cc.
+    if tskip:
+        dot_k = Kernel("relpos_stream_dot_ts", "kernels.a",
+                       [quv_blk_ty, kblk_ty, ac_ty, rtp_ty,
+                        np.int32, np.int32, np.int32, np.int32, np.int32])
+        dot_p = Kernel("relpos_stream_dot_p_ts", "kernels.a",
+                       [quv_blk_ty, kblk_ty, bd_ty, rtp_ty,
+                        np.int32, np.int32, np.int32, np.int32, np.int32])
+        dot_p_lo = Kernel("relpos_stream_dot_p_lo_ts", "kernels.a",
+                          [quv_blk_ty, kblk_ty, bd_ty, rtp_ty,
+                           np.int32, np.int32, np.int32, np.int32, np.int32])
+        ctx_k = Kernel("relpos_stream_ctx_ts", "kernels.a",
+                       [probs_ty, kblk_ty, ctxf_ty, rtp_ty,
+                        np.int32, np.int32, np.int32, np.int32, np.int32])
+    else:
+        dot_k = Kernel("relpos_stream_dot", "kernels.a",
+                       [quv_blk_ty, kblk_ty, ac_ty, np.int32, np.int32, np.int32, np.int32])
+        dot_p = Kernel("relpos_stream_dot_p", "kernels.a",
+                       [quv_blk_ty, kblk_ty, bd_ty, np.int32, np.int32, np.int32, np.int32])
+        # split-bf16 p_lo pass: BD += qv @ p_lo^T (ADDS into g_bd). Only wired under --splitp.
+        dot_p_lo = Kernel("relpos_stream_dot_p_lo", "kernels.a",
+                          [quv_blk_ty, kblk_ty, bd_ty, np.int32, np.int32, np.int32, np.int32])
+        ctx_k = Kernel("relpos_stream_ctx", "kernels.a",
+                       [probs_ty, kblk_ty, ctxf_ty, np.int32, np.int32, np.int32, np.int32])
     softmax_k = Kernel("relpos_stream_softmax", "kernels.a",
                        [ac_ty, bd_ty, probs_ty, rtp_ty, np.int32, np.int32, np.int32, np.int32])
     ctxzero_k = Kernel("relpos_stream_ctx_zero", "kernels.a", [ctxf_ty, np.int32])
-    ctx_k = Kernel("relpos_stream_ctx", "kernels.a",
-                   [probs_ty, kblk_ty, ctxf_ty, np.int32, np.int32, np.int32, np.int32])
     narrow_k = Kernel("relpos_stream_narrow", "kernels.a", [ctxf_ty, ctx_blk_ty, np.int32])
 
     # ---- loop-bound split constants (peel the ragged tail; loop the full body) ----
@@ -259,6 +278,19 @@ def my_relpos_stream(dev, T, TQ, KB, t_active=None, splitp=False, heads=1):
 
     def core_body(quv_in, kpv_in, ctx_out, ac, bd, probs, ctxf, rtp, bar,
                   dotk, dotp, dotplo, smax, czero, ctxb, narrow):
+        # TSKIP threads rtp + the tile's q0 into the block bricks so they can drop
+        # never-read blocks; the plain bricks take neither. Bind the difference once
+        # here so emit_tile below stays single-form.
+        if tskip:
+            def c_dotk(a, b, o, tq, kb, j0, ncol, q0):  dotk(a, b, o, rtp, tq, kb, j0, ncol, q0)
+            def c_dotp(a, b, o, tq, pb, j0, ncol, q0):  dotp(a, b, o, rtp, tq, pb, j0, ncol, q0)
+            def c_dotplo(a, b, o, tq, pb, j0, ncol, q0): dotplo(a, b, o, rtp, tq, pb, j0, ncol, q0)
+            def c_ctxb(pr, v, cf, tq, T_, kb, j0, q0):  ctxb(pr, v, cf, rtp, tq, T_, kb, j0, q0)
+        else:
+            def c_dotk(a, b, o, tq, kb, j0, ncol, q0):  dotk(a, b, o, tq, kb, j0, ncol)
+            def c_dotp(a, b, o, tq, pb, j0, ncol, q0):  dotp(a, b, o, tq, pb, j0, ncol)
+            def c_dotplo(a, b, o, tq, pb, j0, ncol, q0): dotplo(a, b, o, tq, pb, j0, ncol)
+            def c_ctxb(pr, v, cf, tq, T_, kb, j0, q0):  ctxb(pr, v, cf, tq, T_, kb, j0)
         # ONE per-query-tile body, emitted ONCE inside a real hardware loop over
         # the query tiles (the 22x multiplier -- range_, index_cast'd runtime q0)
         # + ONCE for the peeled ragged tile. The k/p/V BLOCK loops are UNROLLED in
@@ -276,11 +308,11 @@ def my_relpos_stream(dev, T, TQ, KB, t_active=None, splitp=False, heads=1):
             equ = quv_in.acquire(1)
             for j0 in range(0, Tk_full, KB):           # Python-int j0 (0,KB,2KB,..)
                 ek = kpv_in.acquire(1)
-                dotk(equ, ek, ac, tq, KB, j0, T)
+                c_dotk(equ, ek, ac, tq, KB, j0, T, q0)
                 kpv_in.release(1)
             if k_rag:
                 ek = kpv_in.acquire(1)
-                dotk(equ, ek, ac, tq, k_rag, Tk_full, T)
+                c_dotk(equ, ek, ac, tq, k_rag, Tk_full, T, q0)
                 kpv_in.release(1)
             quv_in.release(1)
 
@@ -290,20 +322,20 @@ def my_relpos_stream(dev, T, TQ, KB, t_active=None, splitp=False, heads=1):
             eqv = quv_in.acquire(1)
             for j0 in range(0, Pp_full, KB):
                 ep = kpv_in.acquire(1)
-                dotp(eqv, ep, bd, tq, KB, j0, P)
+                c_dotp(eqv, ep, bd, tq, KB, j0, P, q0)
                 kpv_in.release(1)
             if p_rag:
                 ep = kpv_in.acquire(1)
-                dotp(eqv, ep, bd, tq, p_rag, Pp_full, P)
+                c_dotp(eqv, ep, bd, tq, p_rag, Pp_full, P, q0)
                 kpv_in.release(1)
             if splitp:
                 for j0 in range(0, Pp_full, KB):
                     ep = kpv_in.acquire(1)
-                    dotplo(eqv, ep, bd, tq, KB, j0, P)  # BD += qv @ p_lo^T
+                    c_dotplo(eqv, ep, bd, tq, KB, j0, P, q0)  # BD += qv @ p_lo^T
                     kpv_in.release(1)
                 if p_rag:
                     ep = kpv_in.acquire(1)
-                    dotplo(eqv, ep, bd, tq, p_rag, Pp_full, P)
+                    c_dotplo(eqv, ep, bd, tq, p_rag, Pp_full, P, q0)
                     kpv_in.release(1)
             quv_in.release(1)
 
@@ -316,11 +348,11 @@ def my_relpos_stream(dev, T, TQ, KB, t_active=None, splitp=False, heads=1):
             czero(ctxf, tq)
             for j0 in range(0, Tk_full, KB):
                 ev = kpv_in.acquire(1)
-                ctxb(probs, ev, ctxf, tq, T, KB, j0)
+                c_ctxb(probs, ev, ctxf, tq, T, KB, j0, q0)
                 kpv_in.release(1)
             if k_rag:
                 ev = kpv_in.acquire(1)
-                ctxb(probs, ev, ctxf, tq, T, k_rag, Tk_full)
+                c_ctxb(probs, ev, ctxf, tq, T, k_rag, Tk_full, q0)
                 kpv_in.release(1)
             narrow(ctxf, eo, tq)
             ctx_out.release(1)
@@ -402,6 +434,10 @@ p.add_argument("--tactive", type=int, default=0,
 p.add_argument("--splitp", action="store_true",
                help="split-bf16 positional operand: stream p as p_hi|p_lo, BD = qv.p_hi + qv.p_lo "
                     "(near-f32 p). Closes the resident-MHA WER gap (probe: p rounding owns it).")
+p.add_argument("--tskip", action="store_true",
+               help="runtime t_active BLOCK-SKIP: drop the k/p/V blocks whose results the "
+                    "softmax never loads for this clip's t_active (bit-exact; delivery "
+                    "unchanged). Deletes the intra-bucket BUILT_T padding compute.")
 p.add_argument("--heads", type=int, default=1,
                help="number of attention heads to run in PARALLEL (one Worker/core each). "
                     "H=8 = Parakeet's n_heads -> one dispatch/block, 8x-parallel attention. "
@@ -415,4 +451,5 @@ elif opts.device == "npu2":
 else:
     raise ValueError(f"unknown device {opts.device}")
 
-print(my_relpos_stream(dev, opts.T, opts.tq, opts.kb, opts.tactive or opts.T, opts.splitp, opts.heads))
+print(my_relpos_stream(dev, opts.T, opts.tq, opts.kb, opts.tactive or opts.T, opts.splitp,
+                       opts.heads, opts.tskip))

@@ -25,6 +25,16 @@ KB ?= 43
 # A MAX-T build (T=172) with TACTIVE<T computes correct attention for a shorter clip
 # padded to T -- de-risks the single-xclbin-serves-any-T path.
 TACTIVE ?= ${T}
+# TSKIP=1 selects the runtime t_active block-skip bricks (-DRELPOS_TSKIP) AND the
+# generator's --tskip. The two must move together: the .cc compiles only ONE of the
+# two brick sets (kernels.a is a single archive member, so both would be linked and
+# the STEP=8 core overflows program memory), so a half-set build fails at link.
+TSKIP ?= 0
+ifeq ($(TSKIP),1)
+TSKIP_DEF = -DRELPOS_TSKIP
+else
+TSKIP_DEF =
+endif
 # STEP=8 spatial-parallel heads: number of attention heads run on H parallel cores
 # (one Worker/head), one dispatch/block. HEADS=8 = Parakeet n_heads. HEADS=1 = the
 # original single-Worker block. Only the STEP=8 generator consumes it.
@@ -92,7 +102,7 @@ endif
 build/%.cc.o: %.cc
 	mkdir -p ${@D}
 ifeq ($(devicename),npu2)
-	cd ${@D} && ${PEANO_INSTALL_DIR}/bin/clang++ ${PEANOWRAP2P_FLAGS} -DRELPOS_T=${T} -DRELPOS_TQ=${TQ} -DRELPOS_KB=${KB} -DRELPOS_TACTIVE=${TACTIVE} -c $< -o ${@F}
+	cd ${@D} && ${PEANO_INSTALL_DIR}/bin/clang++ ${PEANOWRAP2P_FLAGS} -DRELPOS_T=${T} -DRELPOS_TQ=${TQ} -DRELPOS_KB=${KB} -DRELPOS_TACTIVE=${TACTIVE} ${TSKIP_DEF} -c $< -o ${@F}
 else
 	echo "Only npu2 supported for this example"
 endif
@@ -108,6 +118,10 @@ GEN_EXTRA = --tq ${TQ} --kb ${KB} --tactive ${TACTIVE} --heads ${HEADS}
 # resident-MHA WER gap (the p-rounding precision sink). Host packs k|p_hi|p_lo|V.
 ifeq ($(SPLITP),1)
 GEN_EXTRA += --splitp
+endif
+# TSKIP=1 -> runtime t_active block-skip (drop blocks the softmax never reads).
+ifeq ($(TSKIP),1)
+GEN_EXTRA += --tskip
 endif
 else
 GEN_EXTRA =
