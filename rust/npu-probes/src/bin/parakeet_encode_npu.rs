@@ -85,7 +85,7 @@ fn main() {
         // `ffn_*` scopes sit INSIDE ff_resident / fx_ff1_resident: they decompose the FFN rather
         // than partitioning the clip. Counting them in the totals is the same double-count that made
         // the old `fused_ff1_mhsa` wrapper read 135.7%, so split them out and subtract.
-        let is_detail = |s: &str| s.starts_with("ffn_") || s.starts_with("mh_") || s.starts_with("ss_");
+        let is_detail = |s: &str| ["ffn_", "mh_", "ss_", "cf_"].iter().any(|p| s.starts_with(p));
         // Subtract the nested detail from ITS OWN bucket -- `ss_*`/`mh_pack` are Host, `ffn_*` are Npu.
         // Taking it all off `npu` inflated host by the Host-bucketed detail and deflated npu by it.
         let det = |bk: npu_parakeet::prof::phase::Bucket| -> f64 {

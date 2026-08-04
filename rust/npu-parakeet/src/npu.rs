@@ -874,6 +874,10 @@ impl NpuMatmul {
         // each slice to its own core). Per head: QUV tile-interleaved [qu_t0,qv_t0,...]; KPV = k(pad
         // tp) | p_hi(pad pp) | p_lo(pad pp) | V(pad tp) with p split-bf16 (SPLITP: p_hi=bf16(p),
         // p_lo=bf16(p-p_hi); BD=qv.p_hi+qv.p_lo recovers ~f32 p -- the probe-localized ~1% sink).
+        // HOST work, inside a scope (`mhsa_resident`) that is bucketed Npu -- so until this leaf
+        // existed, ~57 ms/clip of host data shuffling was counted as NPU time.
+        let (quv, kpv) = {
+        let _p_concat = crate::prof::phase::PhaseScope::new("mh_concat", crate::prof::phase::Bucket::Host);
         let mut quv = Vec::<f32>::with_capacity(h * quv_head);
         let mut kpv = Vec::<f32>::with_capacity(h * kpv_head);
         for hh in 0..h {
@@ -902,6 +906,8 @@ impl NpuMatmul {
             push_pad_rows(&mut kpv, &p_lo, 0, ph.nrows(), rk.pp);
             push_pad_rows(&mut kpv, &vh, 0, t, rk.tp);
         }
+        (quv, kpv)
+        };
         let (qb, kb) = {
             let _p = crate::prof::phase::PhaseScope::new("mh_pack", crate::prof::phase::Bucket::Host);
             let mut qb = vec![0u16; quv.len()];
@@ -2035,13 +2041,27 @@ impl NpuMatmul {
         };
         let st = self.stream(n2, Act::Identity);
         modal_site("kern#3");
-        { let _dt = self.dtimer(); self.kern.run_matmul8(3, &st.instr, st.n_instr, &rlc.bo_bf16, &wbo, &st.bo_c, &self.bo_tmp, &self.bo_tr).unwrap(); }
+        {
+            let _p = crate::prof::phase::PhaseScope::new("cf_pw1", crate::prof::phase::Bucket::Npu);
+            let _dt = self.dtimer();
+            self.kern.run_matmul8(3, &st.instr, st.n_instr, &rlc.bo_bf16, &wbo, &st.bo_c, &self.bo_tmp, &self.bo_tr).unwrap();
+        }
         modal_site("glu.kern#2");
-        { let _dt = self.dtimer(); glu.kern.run_matmul8(3, &glu.instr, glu.n, &st.bo_c, &glu.bo_out, &glu.dummy_c, &glu.dummy_tmp, &glu.dummy_tr).unwrap(); }
+        {
+            let _p = crate::prof::phase::PhaseScope::new("cf_glu", crate::prof::phase::Bucket::Npu);
+            let _dt = self.dtimer();
+            glu.kern.run_matmul8(3, &glu.instr, glu.n, &st.bo_c, &glu.bo_out, &glu.dummy_c, &glu.dummy_tmp, &glu.dummy_tr).unwrap();
+        }
         self.stats.borrow_mut().dispatches += 2; // pw1 + glu
+        // Device->host readback of the gated [m,KRES] stream, plus a SCALAR f32 decode loop. The
+        // decode is host CPU, not DMA, and at m*KRES elements it is not obviously small -- scope it
+        // separately from the sync so the two do not hide in each other.
+        let _p = crate::prof::phase::PhaseScope::new("cf_readback", crate::prof::phase::Bucket::Marshal);
         glu.bo_out.sync_from_device().unwrap();
         let mut cb = vec![0u8; m * KRES * 4];
         glu.bo_out.read_bytes(&mut cb).unwrap();
+        drop(_p);
+        let _p2 = crate::prof::phase::PhaseScope::new("cf_decode", crate::prof::phase::Bucket::Host);
         let mut out = Array2::<f32>::zeros((m, KRES));
         for r in 0..m {
             for c in 0..KRES {
