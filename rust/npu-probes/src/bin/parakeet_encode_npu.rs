@@ -54,14 +54,17 @@ fn main() {
 
     let mut total = 0f64;
     let mut n = 0;
+    let mut last_phase: Option<npu_parakeet::prof::phase::PhaseReport> = None;
     for p in &names {
         let mel = load_mel(p);
         // Reset per clip so the report below describes ONE warm clip, not the whole set.
         #[cfg(feature = "npu")]
         npu_xrt::dispatch_log::reset();
+        npu_parakeet::prof::phase::reset(); // same window as dispatch_log, so the two reports join
         let t0 = Instant::now();
         let enc_out = enc.encode(&mel); // [T', 1024]
         let dt = t0.elapsed().as_secs_f64();
+        last_phase = Some(npu_parakeet::prof::phase::report(t0.elapsed()));
         total += dt;
         n += 1;
         let stem = p.file_stem().unwrap().to_string_lossy();
@@ -75,6 +78,22 @@ fn main() {
         println!("{s}");
     }
     println!("host profile (desc by time):\n{}", npu_parakeet::prof::report());
+    // PARAKEET_PHASE_TIMING=1: the non-overlapping bucket split for the LAST clip, on the same
+    // window as the dispatch-transition report below so the two join. `residual` is wall time no
+    // scope claimed; `overlap` is buckets summing past the wall clock, i.e. real concurrency.
+    if let Some(r) = last_phase.filter(|r| r.npu_ms + r.host_ms + r.marshal_ms > 0.0) {
+        println!(
+            "\nphase buckets (last clip): e2e {:.1} ms = npu {:.1} ({:.1}%) + host {:.1} ({:.1}%) + marshal {:.1} ({:.1}%) | residual {:.1} overlap {:.1}",
+            r.e2e_ms,
+            r.npu_ms, 100.0 * r.npu_ms / r.e2e_ms,
+            r.host_ms, 100.0 * r.host_ms / r.e2e_ms,
+            r.marshal_ms, 100.0 * r.marshal_ms / r.e2e_ms,
+            r.residual_ms, r.overlap_ms,
+        );
+        for (stage, bucket, ms, calls) in r.rows.iter().take(24) {
+            println!("  {stage:<22} {:<8} {ms:8.1} ms  x{calls}", format!("{bucket:?}"));
+        }
+    }
     // NPU_DISPATCH_LOG=1: xclbin-transition accounting for the LAST clip. 0.99 ms/switch is the
     // measured modal<->relpos hw-context-switch cost (`modal-relpos-per-switch-cost`).
     #[cfg(feature = "npu")]
