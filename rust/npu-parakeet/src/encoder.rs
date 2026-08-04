@@ -151,8 +151,13 @@ impl FastConformerEncoder {
         if std::env::var("PARAKEET_RESIDENT_FF").map(|v| v != "0").unwrap_or(true) {
             if let Some(npu) = &self.npu {
                 if npu.resident_ff_available() {
-                    let gamma = b.v(norm_w);
-                    let beta = b.v(norm_b);
+                    // These lookups MATERIALIZE the norm vectors and sat outside every scope, so they
+                    // landed in the report's residual: the flat `ff` timer read ~69 ms/clip more than
+                    // `ff_resident` for exactly this.
+                    let (gamma, beta) = {
+                        let _w = PhaseScope::new("wlookup_ff", Bucket::Marshal);
+                        (b.v(norm_w), b.v(norm_b))
+                    };
                     prof::phase::set_stage(stage);
                     let _h = PhaseScope::new("ff_resident", Bucket::Npu);
                     // FULL FFN device-side (LN->fc1->fc2, Variant B, DEFAULT; opt out PARAKEET_RESIDENT_FFN=0):
@@ -449,12 +454,17 @@ impl FastConformerEncoder {
         let b = self.w.block(blk);
         let npu = self.npu.as_ref().expect("mhsa_dev without npu");
         let d = self.cfg.hidden;
-        prof::phase::set_stage("mhsa_qkv");
-        let q = npu.proj_from_bf16(satt_bo, m, || b.m("self_attn.linear_q.weight"), &format!("{blk}.q"), d);
-        prof::phase::set_stage("mhsa_qkv");
-        let k = npu.proj_from_bf16(satt_bo, m, || b.m("self_attn.linear_k.weight"), &format!("{blk}.k"), d);
-        prof::phase::set_stage("mhsa_qkv");
-        let v = npu.proj_from_bf16(satt_bo, m, || b.m("self_attn.linear_v.weight"), &format!("{blk}.v"), d);
+        // q/k/v go through `proj_from_bf16`, which dispatches run_matmul8 DIRECTLY rather than through
+        // the scoped helpers -- so `set_stage` alone named a stage nothing ever charged to, and these
+        // 3 dispatches/block landed in the report's residual.
+        let (q, k, v) = {
+            let _h = PhaseScope::new("mhsa_qkv", Bucket::Npu);
+            prof::phase::set_stage("mhsa_qkv");
+            let q = npu.proj_from_bf16(satt_bo, m, || b.m("self_attn.linear_q.weight"), &format!("{blk}.q"), d);
+            let k = npu.proj_from_bf16(satt_bo, m, || b.m("self_attn.linear_k.weight"), &format!("{blk}.k"), d);
+            let v = npu.proj_from_bf16(satt_bo, m, || b.m("self_attn.linear_v.weight"), &format!("{blk}.v"), d);
+            (q, k, v)
+        };
         prof::phase::set_stage("mhsa_pos");
         // pos stays host-in on the device-in path (pos_enc != satt), so it takes the checkpoint fast path
         // too. q/k/v go through `proj_from_bf16` and linear_out through `matmul_id_to_bo` -- both are
@@ -463,6 +473,7 @@ impl FastConformerEncoder {
         let pm = self.mm_checkpoint(pos_enc, b, "self_attn.linear_pos.weight", &id_pos)
             .unwrap_or_else(|| self.mm_lazy(pos_enc, || b.m("self_attn.linear_pos.weight"), &id_pos));
         let ctx = self.attention_core(&q, &k, &v, &pm, blk, m);
+        let _h = PhaseScope::new("mhsa_linear_out", Bucket::Npu);
         prof::phase::set_stage("mhsa_qkv");
         npu.matmul_id_to_bo(&ctx, || b.m("self_attn.linear_out.weight"), &format!("{blk}.out"), d)
     }
@@ -813,21 +824,31 @@ impl FastConformerEncoder {
         // depthwise along time: [D, T]. Bracketing transposes + trailing SiLU are host math
         // with no mm() inside, so they fold into the conv_dwconv Host leaf scope.
         let back = prof::time("dwconv", || {
-            let _h = PhaseScope::new("conv_dwconv", Bucket::Host);
             // TIME-MAJOR fused dwconv+silu (step 3b): consumes GLU [T,D] DIRECTLY and emits [T,D]
             // DIRECTLY -- BOTH host transposes DISSOLVED (no glu.t() in, no dwc.t() out). Gated like the
             // channel-major fused path (CONV+SILU). Falls back to the channel-major path below (which
             // keeps the two transposes) when the time-major xclbin is absent or t > DW_T.
+            //
+            // BUCKET: this is the LIVE path and it is ONE NPU DISPATCH, so it is Npu. It was tagged
+            // Host -- the comment describing "bracketing transposes + trailing SiLU are host math"
+            // belongs to the FALLBACK below, which does not run. That mis-tag put 50 ms/clip of NPU
+            // work in the host column and made the encoder look less resident than it is.
             #[cfg(feature = "npu")]
-            let tmajor = if resident_conv && resident_silu {
-                self.npu.as_ref().and_then(|npu| npu.npu_dwconv_silu_tmajor(&glu, &taps, &dwb))
-            } else { None };
+            let tmajor = {
+                let _h = PhaseScope::new("conv_dwconv", Bucket::Npu);
+                if resident_conv && resident_silu {
+                    self.npu.as_ref().and_then(|npu| npu.npu_dwconv_silu_tmajor(&glu, &taps, &dwb))
+                } else { None }
+            };
             #[cfg(not(feature = "npu"))]
             let tmajor: Option<Array2<f32>> = None;
             if let Some(f) = tmajor {
                 return f; // [T,D] -- dwconv+silu applied on-NPU, transposes dissolved (step 3b)
             }
             // ---- fallback: channel-major fused / separate bricks / host (transposes stay host) ----
+            // Genuinely host-heavy (two transposes + possibly a host FIR/SiLU), hence its own Host
+            // scope. Distinct name so a report tells you WHICH path ran instead of averaging them.
+            let _h = PhaseScope::new("conv_dwconv_hostfallback", Bucket::Host);
             let glu_t = glu.t().to_owned(); // [T,D] -> [D,T]  (transpose 1, killed on the time-major path)
             // FUSED dwconv->SiLU (steps 3+4 in ONE xclbin) when CONV+SILU are on + the fused
             // brick is present: one hw-context, the post-dwconv SiLU runs device-to-device (no second
@@ -898,10 +919,11 @@ impl FastConformerEncoder {
                     // per clip attributed to nothing finer. Each step is a leaf below instead, so the
                     // buckets sum to the wall clock and `residual` means genuinely unscoped.
                     let m = x.nrows();
-                    let ff1n_g = b.v("norm_feed_forward1.weight");
-                    let ff1n_b = b.v("norm_feed_forward1.bias");
-                    let satt_g = b.v("norm_self_att.weight");
-                    let satt_b = b.v("norm_self_att.bias");
+                    let (ff1n_g, ff1n_b, satt_g, satt_b) = {
+                        let _w = PhaseScope::new("wlookup_block", Bucket::Marshal);
+                        (b.v("norm_feed_forward1.weight"), b.v("norm_feed_forward1.bias"),
+                         b.v("norm_self_att.weight"), b.v("norm_self_att.bias"))
+                    };
                     let x_bo = {
                         let _h = PhaseScope::new("fx_upload", Bucket::Marshal);
                         npu.upload_stream(&x)
@@ -931,8 +953,10 @@ impl FastConformerEncoder {
                     };
                     // Conv FRONT device-in: norm_conv LN + pw1 + GLU consume conv_in_bo directly (no host
                     // round-trip between MHSA and conv); returns the host GLU output for the conv rest.
-                    let conv_g = b.v("norm_conv.weight");
-                    let conv_b = b.v("norm_conv.bias");
+                    let (conv_g, conv_b) = {
+                        let _w = PhaseScope::new("wlookup_block", Bucket::Marshal);
+                        (b.v("norm_conv.weight"), b.v("norm_conv.bias"))
+                    };
                     let glu = {
                         let _h = PhaseScope::new("fx_conv_front", Bucket::Npu);
                         npu.resident_conv_pw1_glu_dev(&conv_in_bo, m, conv_g.as_slice().unwrap(), conv_b.as_slice().unwrap(),
