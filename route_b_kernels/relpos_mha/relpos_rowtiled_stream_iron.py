@@ -141,7 +141,7 @@ def ceildiv(a, b):
 # single t_active, so the host patches every t_active word of the template insts.
 # ============================================================================
 def my_relpos_stream(dev, T, TQ, KB, t_active=None, splitp=False, heads=1, tskip=False, rows=1,
-                     stage=False):
+                     stage=False, core_depth=2):
     # STEP-C: T is the BAKED buffer/dataflow size (the single MAX-T xclbin, e.g. 172);
     # t_active <= T is the ACTIVE key count the softmax attends (a per-insts constant on
     # the SAME xclbin, so one xclbin serves any clip padded to T). Default = T (full).
@@ -269,10 +269,14 @@ def my_relpos_stream(dev, T, TQ, KB, t_active=None, splitp=False, heads=1, tskip
         of_quv_l2 = [ObjectFifo(quv_round_ty, name=f"quvl2{h}", depth=2) for h in range(heads)]
         of_ctx_l2 = [ObjectFifo(ctx_round_ty, name=f"ctxl2{h}", depth=2) for h in range(heads)]
         # split(): one L2 consumer -> `rows` per-core producers, core r taking block r of the round.
+        # core_depth: per-core quv/ctx buffering. Deeper lets a core run ahead of its siblings
+        # instead of rendezvousing with them every round. Only quv/ctx can afford it -- their
+        # objects are TQ*DK*2 = 2 KB, against of_kpv's KB*DK*2 = 12 KB at KB=48.
         of_quv_split = [
             of_quv_l2[h].cons().split(
                 [r * TQ * DK for r in range(rows)],
                 obj_types=[quv_blk_ty] * rows,
+                depths=[core_depth] * rows,
                 names=[f"quv{h}_{r}" for r in range(rows)],
             )
             for h in range(heads)
@@ -282,6 +286,7 @@ def my_relpos_stream(dev, T, TQ, KB, t_active=None, splitp=False, heads=1, tskip
             of_ctx_l2[h].prod().join(
                 [r * TQ * DK for r in range(rows)],
                 obj_types=[ctx_blk_ty] * rows,
+                depths=[core_depth] * rows,
                 names=[f"ctx{h}_{r}" for r in range(rows)],
             )
             for h in range(heads)
@@ -546,6 +551,9 @@ p.add_argument("--rows", type=int, default=1,
                help="ROW-TILE each head across R cores (heads*R workers). Needs R | n_qt and "
                     "T %% TQ == 0. Head h's R cores share one k/p/V stream by MULTICAST and take "
                     "the query tiles round-robin. R=1 = the original one-core-per-head block.")
+p.add_argument("--core-depth", type=int, default=2, dest="core_depth",
+               help="per-core quv/ctx objectFIFO depth under --rows (default 2). Deeper decouples\n"
+                    "a head's cores from each other; L1-bound, and only quv/ctx are cheap enough.")
 p.add_argument("--stage", action="store_true",
                help="force the MemTile quv/ctx staging even at --rows 1. A CONTROL: it isolates the\n"
                     "cost of the extra L3->L2->L1 hop from the cost of fanning out to several cores.")
@@ -567,4 +575,4 @@ else:
     raise ValueError(f"unknown device {opts.device}")
 
 print(my_relpos_stream(dev, opts.T, opts.tq, opts.kb, opts.tactive or opts.T, opts.splitp,
-                       opts.heads, opts.tskip, opts.rows, opts.stage))
+                       opts.heads, opts.tskip, opts.rows, opts.stage, opts.core_depth))

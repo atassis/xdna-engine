@@ -127,6 +127,9 @@ endif
 ifeq ($(STAGE),1)
 GEN_EXTRA += --stage
 endif
+ifneq ($(CORE_DEPTH),)
+GEN_EXTRA += --core-depth ${CORE_DEPTH}
+endif
 # ROWS>1 row-tiles each head across ROWS cores (heads*ROWS workers, k/p/V multicast).
 # Needs ROWS | n_qt and T % TQ == 0; the generator rejects violations.
 ifneq ($(ROWS),)
