@@ -72,4 +72,12 @@ fi
 "$REPO/scripts/install_peano_local.sh" --check >/dev/null 2>&1 \
   || { echo "SMOKE FAIL: Peano archiver check failed -- run scripts/install_peano_local.sh --check"; exit 1; }
 
-echo "SMOKE PASS (CPU): logical_tile=$logical -> $placed_how, xclbin built, llvm-ar OK"
+# 5) the aie_api headers the kernels just compiled against are the ones the last gate signed off on.
+#    They are NOT the pinned ones -- the instance symlinks the wheel copy while toolchain.lock pins
+#    the submodule -- and this does not assert otherwise. It ratchets: a pin bump that moves the
+#    headers under the kernels, or a repoint of the symlink, fails HERE rather than being found later
+#    by grepping whichever copy came to hand. See scripts/check_aie_api_pin.sh.
+"$REPO/scripts/check_aie_api_pin.sh" >/dev/null \
+  || { echo "SMOKE FAIL: aie_api header state drifted -- run scripts/check_aie_api_pin.sh"; exit 1; }
+
+echo "SMOKE PASS (CPU): logical_tile=$logical -> $placed_how, xclbin built, llvm-ar OK, aie_api pin OK"

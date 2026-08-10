@@ -41,6 +41,11 @@ _link_vendored_tools() {
 # Refresh the include/ symlinks aie.iron + the kernel headers resolve against. Run on BOTH the cold
 # build and the warm early-return so a plain re-run against any instance is self-healing (the warm
 # path does not rebuild, so these would otherwise never be recreated if removed).
+# NOTE the aie_api source: the WHEEL, not `mlir-aie/third_party/aie_api` which toolchain.lock pins.
+# The two are structurally decoupled -- bumping MLIR_AIE_FORK_COMMIT moves the pinned headers and
+# leaves this symlink untouched -- so the headers kernels compile against are not the ones the lock
+# describes. Repointing it is a measured behaviour change, not a cleanup; scripts/check_aie_api_pin.sh
+# ratchets the current state so a bump cannot move it silently.
 _link_include_dirs() {
   ln -sfn "$REPO/.venv-iron/lib/python3.14/site-packages/mlir_aie/include/aie_api" "$INST/build/include/aie_api"
   ln -sfn "$REPO/mlir-aie/aie_kernels" "$INST/build/include/aie_kernels"   # aie.iron _default_source_path resolves kernel .cc here (aie2p/mm.cc etc.)
