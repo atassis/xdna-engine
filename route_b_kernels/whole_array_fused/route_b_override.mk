@@ -92,7 +92,7 @@ endif
 
 $(info [whole_array] PROFILE=$(PROFILE) WA_C_DEPTH=$(WA_C_DEPTH) wa_trace_size=$(wa_trace_size))
 
-aiecc_peano_flags=$(if $(filter-out 0,$(wa_trace_size)),--dump-intermediates,) --no-xchesscc --no-xbridge --peano ${PEANO_INSTALL_DIR}
+aiecc_peano_flags=$(if $(filter-out 0,$(wa_trace_size)),--dump-intermediates,) --peano ${PEANO_INSTALL_DIR}
 # Prefer the wired fork-instance aiecc (AIECC_PATH from iron_env.sh); fall back to PATH.
 AIECC := $(if $(AIECC_PATH),$(AIECC_PATH),aiecc)
 

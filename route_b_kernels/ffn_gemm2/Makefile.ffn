@@ -68,7 +68,7 @@ ${mlir_target}: ${srcdir}/ffn_gemm2_iron.py
 ${xclbin_target}: ${mlir_target} ${kobj1} ${kobj2}
 	cd build && aiecc --alloc-scheme=basic-sequential --get-xclbin \
 	   --xclbin-name=$(notdir $@) \
-	   --no-xchesscc --no-xbridge --peano ${PEANO_INSTALL_DIR} \
+	   --peano ${PEANO_INSTALL_DIR} \
 	   --get-npu-insts --npu-insts-name=$(notdir ${insts_target}) \
 	   ../$<
 

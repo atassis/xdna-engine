@@ -40,7 +40,7 @@ echo "== [2/3] aiecc -> cascade.xclbin + insts.bin (peano backend) =="
 cd "$HERE"
 # --no-xchesscc: compile AND link with Peano (disables xbridge/chess). Without
 # it aiecc falls back to the chess toolchain (chess-llvm-link), which is absent.
-"$AIECC" --no-aiesim --no-xchesscc --peano "$PEANO_INSTALL_DIR" \
+"$AIECC" --peano "$PEANO_INSTALL_DIR" \
   --get-xclbin --get-npu-insts \
   --xclbin-name=cascade.xclbin --npu-insts-name=insts.bin \
   cascade.mlir

@@ -109,7 +109,7 @@ build_config() { # <cols>
 
   log "cols=$cols: aiecc -> xclbin + input_with_addresses"
   ( cd "$WORK" && PATH="$PEANO/bin:$INSTANCE/bin:$PATH" PEANO_INSTALL_DIR="$PEANO" \
-    "$VENV_PY" "$INSTANCE/bin/aiecc.py" --no-xchesscc --no-xbridge --no-aiesim \
+    "$VENV_PY" "$INSTANCE/bin/aiecc.py" \
       --get-xclbin --get-input-with-addresses \
       --output-dir="$prj" \
       --peano="$PEANO" \

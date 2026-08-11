@@ -44,7 +44,7 @@ build/final.xclbin: build/${targetname}.mlir build/kernels.a
 	mkdir -p ${@D}
 	cd ${@D} && aiecc --get-xclbin --get-npu-insts \
 		    --xclbin-name=${@F} \
-		    --no-xchesscc --no-xbridge \
+		    \
 		    --npu-insts-name=insts.bin $(<:%=../%)
 
 clean:

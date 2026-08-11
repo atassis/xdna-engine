@@ -40,8 +40,8 @@ OUT="$WORK/decode_b.elf"
 echo "[gate-aiecc] aiecc=$AIECC_PATH  mlir=$MLIR  work=$WORK  JOBS=$AIECC_JOBS"
 
 t0=$(date +%s)
-( cd "$WORK" && "$AIECC_PATH" -v -j"$AIECC_JOBS" --no-xchesscc \
-    --no-xbridge --peano "$PEANO" --disable-repeater-scripts --generate-full-elf \
+( cd "$WORK" && "$AIECC_PATH" -v -j"$AIECC_JOBS" \
+    --peano "$PEANO" --disable-repeater-scripts --get-full-elf \
     --full-elf-name "$OUT" "$MLIR" ) > "$WORK/aiecc.stdout.log" 2>&1
 rc=$?
 t1=$(date +%s)

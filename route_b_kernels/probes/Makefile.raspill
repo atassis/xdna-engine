@@ -41,7 +41,7 @@ build/aie_${tag}.mlir: ra_spill_repro_iron.py
 build/final_${tag}.xclbin: build/aie_${tag}.mlir build/ra_spill_repro_h${HOLD}.o
 	cp build/ra_spill_repro_h${HOLD}.o build/ra_spill_repro.o
 	cd build && aiecc --get-xclbin --get-npu-insts \
-		--no-xchesscc --no-xbridge --peano $(PEANO) \
+		--peano $(PEANO) \
 		--xclbin-name=final_${tag}.xclbin --npu-insts-name=insts_${tag}.txt aie_${tag}.mlir
 
 clean:

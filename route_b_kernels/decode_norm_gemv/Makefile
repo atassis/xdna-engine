@@ -95,7 +95,7 @@ ${mlir}: ${srcdir}/norm_gemv_iron.py
 ${xclbin} ${insts} &: ${mlir} build/kernels_${m}x${k}x${n}.a
 	mkdir -p ${@D}
 	cd ${@D} && ${AIECC} --alloc-scheme=basic-sequential --get-xclbin \
-	  --xclbin-name=$(notdir ${xclbin}) --no-xchesscc --no-xbridge \
+	  --xclbin-name=$(notdir ${xclbin}) \
 	  --peano ${PEANO_INSTALL_DIR} \
 	  --get-npu-insts --npu-insts-name=$(notdir ${insts}) $(notdir ${mlir})
 

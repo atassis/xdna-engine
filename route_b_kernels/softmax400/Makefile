@@ -253,14 +253,14 @@ build/aie_trace.mlir: ${srcdir}/${aie_py_src} build/.config_stamp
 build/final.xclbin: build/aie.mlir build/kernels.a
 	mkdir -p ${@D}
 	cd ${@D} && aiecc --get-xclbin --xclbin-name=${@F} \
-		--no-xchesscc --no-xbridge --peano ${PEANO_INSTALL_DIR} \
+		--peano ${PEANO_INSTALL_DIR} \
 		--get-npu-insts --npu-insts-name=insts.bin $(<:%=../%)
 
 # Build xclbin with tracing enabled
 build/final_trace.xclbin: build/aie_trace.mlir build/kernels.a
 	mkdir -p ${@D}
 	cd ${@D} && aiecc --get-xclbin --xclbin-name=${@F} \
-		--no-xchesscc --no-xbridge --peano ${PEANO_INSTALL_DIR} \
+		--peano ${PEANO_INSTALL_DIR} \
 		--get-npu-insts --npu-insts-name=insts.bin $(<:%=../%)
 
 #------------------------------------------------------------------------------
