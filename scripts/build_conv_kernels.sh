@@ -13,3 +13,7 @@ for N in 64 128 256 512; do
     build/final_mstat_512x768x${N}_16x32x32_8c.xclbin
 done
 ls -1 build/final_mstat_512x768x*_16x32x32_8c.xclbin
+
+# Must run AFTER the last build: the manifest hashes the files actually sitting here. cwd is $WA
+# (this script cd'd there); the helper resolves the path either way.
+bash "$REPO/scripts/refresh_kernel_manifest.sh" build

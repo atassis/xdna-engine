@@ -66,4 +66,7 @@ if [[ "${SWEEP:-}" == "K" ]]; then
   echo "NOTE: K-sweep points also need their own FULL+STUB twins -- relink each via"
   echo "      scripts/build_parakeet_occupancy_stub.sh after building the FULL set."
 fi
+# Must run AFTER the last build: the manifest hashes the files actually sitting here.
+bash scripts/refresh_kernel_manifest.sh "$MMW/build"
+
 echo "Done. Run: scripts/parakeet_dma_occupancy_harness.py --sweep-N 1024 2048 3072 4096"

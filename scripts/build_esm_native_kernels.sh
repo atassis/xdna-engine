@@ -27,3 +27,6 @@ build_shape 480 2048
 build_shape 1920 512
 
 echo "ESM native xclbins built. Verify: ./rust/target/debug/verify_esm scenarios/esm2-8m-native.toml"
+
+# Must run AFTER the last build: the manifest hashes the files actually sitting here.
+bash scripts/refresh_kernel_manifest.sh "$MMW/build"

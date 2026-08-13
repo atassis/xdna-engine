@@ -52,19 +52,5 @@ for N in 1024 2048 4096; do
 done
 echo "Built Parakeet resident xclbins + per-N instruction streams (fast + native tiles)."
 
-# Refresh the artifact manifest for this dir, mirroring build_parakeet_modal_kernels.sh's step for
-# $LNDIR. Both dirs are read by npu-parakeet's resolve_verified, but only that one regenerated, so
-# NPU_KERNEL_MANIFEST_VERIFY=1 aborted a correct load here with MissingManifest -- the check was
-# enabled against a directory nothing had ever generated a manifest for.
-#
-# Must run AFTER the last build: gen_kernel_manifest hashes the files actually sitting here. On
-# failure the old manifest is removed rather than left stale -- resolve_checked would pass on stale
-# hashes, so failing closed on "absent" is the safer of the two.
-echo "== artifact manifest: $MMW/build =="
-if ( cd rust && cargo run -q --release -p npu-asr --bin gen_kernel_manifest -- "../$MMW/build" ); then
-  :
-else
-  rm -f "$MMW/build/kernel_manifest.json"
-  echo "WARNING: gen_kernel_manifest failed -- removed $MMW/build/kernel_manifest.json rather than leave a stale one." >&2
-  echo "         NPU_KERNEL_MANIFEST_VERIFY=1 will now fail closed here until this is re-run." >&2
-fi
+# Must run AFTER the last build: the manifest hashes the files actually sitting here.
+bash scripts/refresh_kernel_manifest.sh "$MMW/build"
