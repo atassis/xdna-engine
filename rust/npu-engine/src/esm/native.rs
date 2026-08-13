@@ -46,11 +46,26 @@ pub struct NativeWeight {
     bo_b: Bo,
 }
 
+/// The kernel-registry stem for a native GEMM of shape (k, n) at `tile`, e.g. "32x32x32".
+fn native_stem(k: usize, n: usize, tile: &str) -> String {
+    format!("{PAD_M}x{k}x{n}_{tile}_8c")
+}
+
 impl NativeKernel {
     /// Load `final_{PAD_M}x{k}x{n}_{tile}_8c.xclbin` + insts from `wa`. `tile` e.g. "32x32x32".
     pub fn load(dev: &Rc<Device>, wa: &Path, k: usize, n: usize, tile: &str) -> Rc<Self> {
-        let xclbin = wa.join(format!("final_{PAD_M}x{k}x{n}_{tile}_8c.xclbin"));
-        let insts = wa.join(format!("insts_{PAD_M}x{k}x{n}_{tile}_8c.txt"));
+        let stem = native_stem(k, n, tile);
+        // Opt-in manifest verification (engine-op-manifest-and-dynamic-xclbin): NPU_KERNEL_MANIFEST_VERIFY=1
+        // re-hashes {xclbin,insts} against dir/kernel_manifest.json (see kernel_registry::resolve_checked)
+        // before loading, so a wrong/stale artifact at this path fails loud here instead of loading
+        // silently. Default OFF -- existing behavior (`resolve`, no check) is unchanged.
+        let npu_asr::kernel_registry::KernelArtifacts { xclbin, insts } =
+            if std::env::var("NPU_KERNEL_MANIFEST_VERIFY").is_ok() {
+                npu_asr::kernel_registry::resolve_checked(wa, &stem)
+                    .unwrap_or_else(|e| panic!("kernel manifest check failed for stem={stem}: {e}"))
+            } else {
+                npu_asr::kernel_registry::resolve(wa, &stem)
+            };
         let kern = dev.load_kernel(xclbin.to_str().unwrap(), None).unwrap_or_else(|e| panic!("load {}: {e}", xclbin.display()));
         let g_instr = kern.group_id(1).unwrap();
         let g_a = kern.group_id(3).unwrap();
@@ -133,5 +148,22 @@ impl NativeGemm {
     pub fn matmul(&self, a: &Array2<f32>, bias: Option<&[f32]>) -> Array2<f32> {
         let n = self.kernel.n;
         self.kernel.matmul(self.weight.as_ref().expect("set_weight first"), a, n, bias)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Routing through `kernel_registry` must not move any artifact: the resolved paths stay
+    /// byte-identical to the inline `format!` this site used before (engine-op-manifest-and-dynamic-xclbin).
+    #[test]
+    fn registry_paths_match_the_previous_inline_format() {
+        let wa = Path::new("/tmp/wa");
+        for (k, n, tile) in [(320, 512, "32x32x32"), (768, 3072, "16x32x32")] {
+            let got = npu_asr::kernel_registry::resolve(wa, &native_stem(k, n, tile));
+            assert_eq!(got.xclbin, wa.join(format!("final_{PAD_M}x{k}x{n}_{tile}_8c.xclbin")));
+            assert_eq!(got.insts, wa.join(format!("insts_{PAD_M}x{k}x{n}_{tile}_8c.txt")));
+        }
     }
 }
