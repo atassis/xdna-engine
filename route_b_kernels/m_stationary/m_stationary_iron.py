@@ -46,6 +46,16 @@ def ceildiv(a, b):
     return (a + b - 1) // b
 
 
+def _str2bool(v):
+    # Robustly parse 0/1/true/false. argparse type=bool is broken: bool("0") is True (any
+    # non-empty string), so the native (emulate=0) build selected the r=8 bfp16 microkernel
+    # dims while route_b_override.mk -- whose `ifeq (...,1)` parses 0 correctly -- dropped
+    # -DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16 and mm.cc compiled the r=4 native kernel.
+    # An r=8 data layout feeding an r=4 microkernel is why the mstat bands measured
+    # max|d|=3.0875 against a ref_max of 0.513. Same fix whole_array_iron.py already carries.
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
+
+
 def my_matmul(
     dev,
     M,
@@ -299,7 +309,7 @@ def main():
     p.add_argument("-n", type=int, default=32)
     p.add_argument("--n-aie-cols", type=int, choices=[1, 2, 4, 8], default=8)
     p.add_argument("--b-col-maj", type=int, choices=[0, 1], default=0)
-    p.add_argument("--emulate-bf16-mmul-with-bfp16", type=bool, default=False)
+    p.add_argument("--emulate-bf16-mmul-with-bfp16", type=_str2bool, default=False)
     p.add_argument("--dtype_in", type=str, default="bf16", choices=["bf16", "i8", "i16"])
     p.add_argument("--dtype_out", type=str, default="f32", choices=["f32", "i32", "bf16", "i16", "i8"])
     p.add_argument("--trace_size", type=int, default=0)

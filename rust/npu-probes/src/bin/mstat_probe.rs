@@ -101,8 +101,19 @@ fn main() {
             nchk += 1;
         }
     }
-    println!("[mstat_probe] verify ({nchk} elems): max|Δ|={max_abs:.4e}  rel={:.3e}  (ref_max={ref_max:.3})",
+    // Three DISTINCT numbers, each named for what it is. Until 2026-08-13 the label `rel` was
+    // printed over max_abs/ref_max while max_rel was computed and dropped, so the headline number
+    // was not the one it claimed to be.
+    println!("[mstat_probe] verify ({nchk} elems): max|Δ|={max_abs:.4e}  max_rel={max_rel:.3e}  \
+              max_abs/ref_max={:.3e}  (ref_max={ref_max:.3})",
              max_abs / (ref_max + 1e-9));
+
+    // MSTAT_DUMP=<path>: write C row-major f32 [m,n] so the error STRUCTURE (which rows/columns
+    // are wrong, whether it is a permutation) can be analysed offline from one device run.
+    if let Ok(path) = std::env::var("MSTAT_DUMP") {
+        std::fs::write(&path, &c_bytes).unwrap_or_else(|e| panic!("write {path}: {e}"));
+        println!("[mstat_probe] dumped C[{m},{n}] f32 -> {path}");
+    }
 
     // --- warm + time ---
     for _ in 0..10 {
