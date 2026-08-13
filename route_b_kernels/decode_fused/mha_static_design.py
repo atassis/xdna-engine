@@ -47,6 +47,15 @@ microkernel_mac_dim_map = {
 }
 
 
+def _str2bool(v):
+    # Robustly parse 0/1/true/false. argparse type=bool is broken: bool("0") is True (any
+    # non-empty string), so a CLI `--emulate-bf16-mmul-with-bfp16 0` reached the assert below
+    # as True and silently produced the r=8 bfp16 layout instead of failing. The only in-tree
+    # caller (gen_encoder_mha.py) calls fused_mha() directly with True and never goes through
+    # argparse, so this makes an unsupported CLI build fail loudly rather than build wrong.
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
+
+
 def main():
     argparser = argparse.ArgumentParser(
         prog="AIE Matrix Multiplication MLIR Design (Single Core)",
@@ -65,7 +74,7 @@ def main():
         help="Number of heads for Key-Value pairs",
     )
     argparser.add_argument("--number-of-pipeline", type=int, default=1)
-    argparser.add_argument("--emulate-bf16-mmul-with-bfp16", type=bool, default=False)
+    argparser.add_argument("--emulate-bf16-mmul-with-bfp16", type=_str2bool, default=False)
     argparser.add_argument("--trace_size", type=int, default=0)
     argparser.add_argument(
         "--output-file-path",

@@ -31,6 +31,15 @@ def ceildiv(a, b):
     return (a + b - 1) // b
 
 
+def _str2bool(v):
+    # Robustly parse 0/1/true/false. argparse type=bool is broken: bool("0") is True (any
+    # non-empty string), so makefile-common's unconditional `--emulate-bf16-mmul-with-bfp16 0`
+    # selected the r=8 bfp16 tile layout while route_b_override.mk's make-level `ifeq (...,1)`
+    # parsed the same 0 correctly and dropped -DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16, so
+    # mm.cc compiled the r=4 native kernel. Same fix whole_array_iron.py already carries.
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
+
+
 def my_matmul(
     dev, M, K, N, m, k, n, n_aie_cols, b_col_maj,
     emulate_bf16_mmul_with_bfp16, dtype_in_str, trace_size, generate_taps=False,
@@ -217,7 +226,7 @@ def main():
     p.add_argument("-n", type=int, default=64)
     p.add_argument("--n-aie-cols", type=int, choices=[1, 2, 4, 8], default=8)
     p.add_argument("--b-col-maj", type=int, choices=[0, 1], default=0)
-    p.add_argument("--emulate-bf16-mmul-with-bfp16", type=bool, default=False)
+    p.add_argument("--emulate-bf16-mmul-with-bfp16", type=_str2bool, default=False)
     p.add_argument("--dtype_in", type=str, default="bf16", choices=["bf16"])
     # output is always bf16 for the fused path; accept --dtype_out from makefile-common and ignore it.
     p.add_argument("--dtype_out", type=str, default="bf16")

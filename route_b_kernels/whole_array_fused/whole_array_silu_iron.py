@@ -66,6 +66,15 @@ def ceildiv(a, b):
     return (a + b - 1) // b
 
 
+def _str2bool(v):
+    # Robustly parse 0/1/true/false. argparse type=bool is broken: bool("0") is True (any
+    # non-empty string), so makefile-common's unconditional `--emulate-bf16-mmul-with-bfp16 0`
+    # selected the r=8 bfp16 tile layout while route_b_override.mk's make-level `ifeq (...,1)`
+    # parsed the same 0 correctly and dropped -DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16, so
+    # mm.cc compiled the r=4 native kernel. Same fix whole_array_iron.py already carries.
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
+
+
 def my_matmul(
     dev,
     M,
@@ -430,7 +439,7 @@ def main():
         "Default is silu mode: out = silu(A@B+bias).",
     )
     argparser.add_argument(
-        "--emulate-bf16-mmul-with-bfp16", type=bool, default=False
+        "--emulate-bf16-mmul-with-bfp16", type=_str2bool, default=False
     )
     # Accepted for makefile-common compatibility; this design is fixed to
     # bf16 in / f32 accumulate / bf16 out.
