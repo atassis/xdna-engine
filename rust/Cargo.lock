@@ -974,9 +974,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "npu-asr",
  "npu-engine",
+ "npu-parakeet",
  "npu-runtime",
  "npu-weights",
+ "tempfile",
 ]
 
 [[package]]

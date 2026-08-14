@@ -12,5 +12,14 @@ path = "src/main.rs"
 npu-runtime = { path = "../npu-runtime" }
 npu-engine = { path = "../npu-engine" }
 npu-weights = { path = "../npu-weights" }
+# artifact-preflight-and-fail-loud: device-free check of the resident whole_array build dir,
+# called from `serve()` before `start()` opens the device. `npu-engine` already pulls this crate
+# in transitively with `features = ["npu"]`; naming it directly here is what lets `serve()` call
+# `npu_parakeet::npu::preflight()` without reaching through npu-engine's own re-exports.
+npu-parakeet = { path = "../npu-parakeet", features = ["npu"] }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
+
+[dev-dependencies]
+tempfile = "3"
+npu-asr = { path = "../npu-asr" }

@@ -21,8 +21,32 @@ use npu_xrt::{Bo, Device, Kernel, FLAG_CACHEABLE, FLAG_HOST_ONLY};
 
 const PAD_M: usize = 512;
 const KRES: usize = 1024; // resident kernel contraction dim
-const WA_SUBDIR: &str =
+/// `pub` so `preflight()` below and the CLI's startup check (`npu-cli`) can both name the same
+/// directory `open()` actually loads from -- one definition, not a path literal duplicated at
+/// the call site that could drift out of sync with it.
+pub const WA_SUBDIR: &str =
     "mlir-aie/programming_examples/basic/matrix_multiplication/whole_array/build";
+
+/// Verify the resident whole_array build dir is present AND built against the CURRENT
+/// `toolchain.lock` pin, before anything opens the device. Pure filesystem (see
+/// `kernel_registry::check_toolchain_freshness`) -- safe to call standalone at CLI startup, not
+/// only from inside `open()`.
+///
+/// This is `artifact-preflight-and-fail-loud`'s defect #3 closed: `ensure_fresh_sandbox` purges
+/// this dir on a toolchain re-pin, and until now nothing checked whether the rebuild that should
+/// follow ever happened -- a re-pin with no rebuild ran silently for 5 days because `open()`'s own
+/// `load_kernel` panic only fires once something already has the device open (and, before
+/// `feat/serve-fail-loud`, that panic did not even stop the service from reporting healthy).
+pub fn preflight(root: &Path) -> Result<(), String> {
+    let base = root.join(WA_SUBDIR);
+    kernel_registry::check_toolchain_freshness(&base, root).map_err(|e| {
+        format!(
+            "resident encoder artifacts stale or missing: {e}\n  rebuild: \
+             scripts/build_parakeet_kernels.sh (and scripts/build_parakeet_modal_kernels.sh if \
+             the modal resident is in use)"
+        )
+    })
+}
 
 /// Activation epilogue baked into the modal resident's per-N instruction stream (RTP-selected at
 /// generate time -- `whole_array_modal_iron.py` sets `mode_val` and `set_modes` bakes it into that
@@ -599,6 +623,12 @@ impl NpuMatmul {
     }
 
     pub fn open(root: &Path) -> Self {
+        // Fail on a stale/missing resident build BEFORE spending a device open on a load that is
+        // going to panic anyway -- see `preflight()`. Callers that already ran it (the `npu serve`
+        // CLI path) pay a second cheap filesystem check; callers that did not (tests, capi, other
+        // embedders of this crate) still get the loud, specific message instead of the bare
+        // `load_kernel` ENOENT below.
+        preflight(root).unwrap_or_else(|e| panic!("{e}"));
         let dev = Device::open(0).expect("open NPU (single-tenant: stop npu-asr/voxd)");
         let base = root.join(WA_SUBDIR);
         // resident kernel tile: fast BFP16 64x32x128 (default) or native bf16 32x32x32 (NPU_NATIVE=1),
