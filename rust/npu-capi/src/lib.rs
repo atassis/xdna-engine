@@ -152,6 +152,10 @@ pub unsafe extern "C" fn npu_runtime_transcribe(rt: *mut NpuRuntime, model: *con
     pcm: *const i16, n: usize, sample_rate: u32) -> *mut c_char {
     let r = catch_unwind(AssertUnwindSafe(|| {
         let Some(rt) = (unsafe { rt.as_ref() }) else { set_error("runtime is null"); return ptr::null_mut(); };
+        // Same guard as npu_transcribe: a null pcm with n != 0 would reach from_raw_parts and is UB.
+        // The two entry points took different paths here, so the identical call returned a clean
+        // error through one and dereferenced null through the other.
+        if pcm.is_null() && n != 0 { set_error("pcm is null"); return ptr::null_mut(); }
         let model = opt_str(model);
         let samples = if n == 0 { Vec::new() } else { unsafe { std::slice::from_raw_parts(pcm, n) }.to_vec() };
         match rt.handle.transcribe(model.as_deref(), samples, sample_rate) {
