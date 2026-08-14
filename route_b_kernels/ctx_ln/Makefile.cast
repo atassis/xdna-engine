@@ -15,7 +15,13 @@ partflag = $(if ${partcols},-p ${partcols},)
 partsuf  = $(if ${partcols},_p${partcols}c,)
 rows ?= 512
 cols ?= 1024
-tag = cast_${rows}x${cols}${partsuf}
+# L2_GROUPS=G stages DDR<->core traffic through G MemTiles instead of one shim fifo per core.
+# Unset/0 keeps the shipped per-core path (verified to emit byte-identical MLIR). The tag
+# carries G so an L2 arm never collides with the shipped artifact.
+l2groups ?=
+l2flag = $(if ${l2groups},--l2-groups ${l2groups},)
+l2suf  = $(if ${l2groups},_l2g${l2groups},)
+tag = cast_${rows}x${cols}${partsuf}${l2suf}
 
 aie_py_src = cast_f32_bf16_iron.py
 
@@ -27,7 +33,7 @@ build/cast_f32_bf16.o: cast_f32_bf16.cc
 
 build/aie_${tag}.mlir: ${srcdir}/${aie_py_src}
 	mkdir -p ${@D}
-	python3 $< -d ${devicename} -r ${rows} -c ${cols} -t 0 ${partflag} > $@
+	python3 $< -d ${devicename} -r ${rows} -c ${cols} -t 0 ${partflag} ${l2flag} > $@
 
 build/final_${tag}.xclbin: build/aie_${tag}.mlir build/cast_f32_bf16.o
 	mkdir -p ${@D}
