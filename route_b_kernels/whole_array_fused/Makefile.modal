@@ -122,7 +122,7 @@ buffer_aloc_flag=basic-sequential
 
 # matmul object needs the bf16_f32 combo defines (mm.cc names symbols by combo).
 MM_DEFINES=-Dbf16_f32_ONLY -DDIM_M=${m} -DDIM_K=${k} -DDIM_N=${n} -DVECTORIZED_ONLY
-EPI_DEFINES=-DEPI_M=${m} -DEPI_N=${n} -DEPI_R=${epi_r} -DEPI_T=${epi_t}$(if $(filter 1,${round_even}), -DMODAL_ROUND_EVEN,)$(if $(filter 1,${silu_f32_tail}), -DSILU_F32_TAIL,)$(if $(filter 1,${silu_f32_tanh}), -DSILU_F32_TANH,)
+EPI_DEFINES=-DEPI_M=${m} -DEPI_N=${n} -DEPI_R=${epi_r} -DEPI_T=${epi_t}$(if $(filter 1,${round_even}), -DMODAL_ROUND_EVEN,)$(if $(filter 1,${drain_round_floor}), -DMODAL_DRAIN_ROUND_FLOOR,)$(if $(filter 1,${silu_f32_tail}), -DSILU_F32_TAIL,)$(if $(filter 1,${silu_f32_tanh}), -DSILU_F32_TANH,)
 ifeq (${b_col_maj}, 1)
 	MM_DEFINES+=-DB_COL_MAJ
 endif

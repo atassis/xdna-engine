@@ -551,6 +551,17 @@ void mm_modal_epilogue_f32_f32(const float *__restrict c_in,
 void mm_modal_epilogue_f32_bf16(const float *__restrict c_in,
                                 bfloat16 *__restrict c_out,
                                 const int32_t *__restrict rtp) {
+#ifdef MODAL_DRAIN_ROUND_FLOOR
+  // A/B arm for ru02-frame77-convergent-signature. Unlike the f32-out sibling above, this
+  // drain sets NO rounding mode, so its bf16 narrow runs under whatever crRnd the previous
+  // kernel on this core happened to leave -- the ambient-state dependence the frame-77
+  // convergence is hypothesised to come from. Forcing floor EXPLICITLY (rather than just
+  // omitting the set, which is what leaves it ambient) makes the drain deterministic, so a
+  // damage delta against the shipped arm is attributable to the rounding mode and not to
+  // whichever kernel ran first. Restored on exit -- this arm must not itself become the
+  // ambient-state bug it is testing for.
+  const auto saved_rounding = aie::swap_rounding(aie::rounding_mode::floor);
+#endif
   // rtp[0]: 0=identity, 1=silu, 2=gelu (same encoding as mm_modal_epilogue_f32_f32).
   if (rtp[0] == 1) {
     mm_silu_epilogue_bf16o_hiprec<EPI_M * EPI_N>(c_in, c_out);
@@ -559,6 +570,9 @@ void mm_modal_epilogue_f32_bf16(const float *__restrict c_in,
   } else {
     mm_identity_epilogue_bf16o<EPI_M * EPI_N>(c_in, c_out);
   }
+#ifdef MODAL_DRAIN_ROUND_FLOOR
+  aie::set_rounding(saved_rounding);
+#endif
 }
 
 // MODAL int8 DEQUANT epilogue (L3): i32 acc -> f32 out, scaled by the per-dispatch
