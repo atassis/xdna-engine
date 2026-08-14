@@ -14,3 +14,8 @@ npu-engine = { path = "../npu-engine" }
 npu-weights = { path = "../npu-weights" }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
+
+[dev-dependencies]
+# Ground truth for the CLI/HTTP embeddings fuzz differential: an encoder independent of the
+# `parse_inputs` scanner under test, so a passing case can't mean the two share a bug.
+serde_json = "1"

@@ -977,6 +977,7 @@ dependencies = [
  "npu-engine",
  "npu-runtime",
  "npu-weights",
+ "serde_json",
 ]
 
 [[package]]

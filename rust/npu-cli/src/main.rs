@@ -303,3 +303,139 @@ mod tests {
             && r.contains("evict_policy lru"), "{r}");
     }
 }
+
+/// Differential fuzz: does `npu embed <text>` extract the same string that `/v1/embeddings`
+/// extracts from `{"input":<text>}`? Both paths hand the extracted string to the identical
+/// `Handle::embed`, so this boundary is the only place they CAN diverge -- and it is host-only
+/// (no NPU), unlike the vector-equality gate this task also names, which needs the device.
+#[cfg(test)]
+mod embed_cli_http_fuzz {
+    use super::*;
+
+    /// The text `npu embed` hands to `Handle::embed`, going through the real clap parser (not a
+    /// reimplementation of it).
+    fn cli_extract(text: &str) -> Result<String, String> {
+        match Cli::try_parse_from(["npu", "embed", text]) {
+            Ok(cli) => match cli.cmd { Cmd::Embed { text, .. } => Ok(text), _ => unreachable!() },
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// The text `/v1/embeddings` hands to `Handle::embed`. `serde_json` builds the request body
+    /// so the reference encoding is independent of `parse_inputs`, the scanner under test.
+    fn http_extract(text: &str) -> Result<String, String> {
+        let body = format!("{{\"input\":{}}}", serde_json::to_string(text).unwrap());
+        http::parse::parse_inputs(&body).map(|v| v[0].clone())
+    }
+
+    /// One divergence record: what a passing case must never produce.
+    struct Divergence { input: String, cli: Result<String, String>, http: Result<String, String> }
+
+    fn check(input: &str, out: &mut Vec<Divergence>) {
+        let (cli, http) = (cli_extract(input), http_extract(input));
+        if cli.as_deref().ok() != http.as_deref().ok() {
+            out.push(Divergence { input: input.to_string(), cli, http });
+        }
+    }
+
+    /// Splitmix64 -- self-contained so the fuzz corpus needs no new crate.
+    struct Rng(u64);
+    impl Rng {
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E3779B97F4A7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+            z ^ (z >> 31)
+        }
+        fn u32(&mut self) -> u32 { (self.next_u64() >> 32) as u32 }
+    }
+
+    /// A random string biased toward CLI/JSON metacharacters (quotes, brackets, backslashes,
+    /// leading `-`, control chars, RTL/zero-width marks) with a random-Unicode-scalar filler, so
+    /// the fuzzer spends most of its budget near the two parsers' actual decision points.
+    fn random_string(rng: &mut Rng, max_len: usize) -> String {
+        const HOT: &[char] = &[
+            '"', '\\', '[', ']', '{', '}', ':', ',', '-', '\'', '`',
+            '\n', '\r', '\t', ' ', '\u{7f}', '\u{200b}', '\u{feff}', '\u{202e}',
+            'п', 'р', 'и', '🌍', '🧵', '\u{1f469}', '\u{200d}',
+        ];
+        let len = rng.u32() as usize % (max_len + 1);
+        let mut s = String::new();
+        for _ in 0..len {
+            if rng.u32().is_multiple_of(2) {
+                s.push(HOT[rng.u32() as usize % HOT.len()]);
+            } else {
+                // Any scalar value except the surrogate range D800-DFFF, which `char` cannot
+                // represent anyway (a lone surrogate is exactly what a client can never send as a
+                // valid Rust/JSON string -- `scan_unicode_escape` rejects the wire form of that).
+                let cp = 0x20 + rng.u32() % (0x2FFFF - 0x20);
+                if let Some(c) = char::from_u32(cp) { s.push(c); }
+            }
+        }
+        s
+    }
+
+    /// Gate 1's fixture list (this task's own corpus), run through the real CLI parser this time
+    /// instead of asserting `parse_inputs` alone. `-`/`--`-leading text is the case
+    /// `allow_hyphen_values` exists for.
+    #[test]
+    fn curated_adversarial_corpus_agrees() {
+        let mut div = Vec::new();
+        for s in [
+            "hello", "", "   ", "- a markdown bullet", "-- a flag", "---",
+            "see [[dispatch-cost]] here", "a [bracket] and a ] stray one",
+            "he said \"hi\"", "back\\slash", "a lone { brace", "line\nnext\ttab",
+            "привет 🌍", "🌍", "\u{200b}zero-width", "\u{202e}rtl-override",
+            &"x".repeat(10_000),
+        ] {
+            check(s, &mut div);
+        }
+        assert!(div.is_empty(), "{} divergence(s) on the curated corpus: {:#?}", div.len(),
+            div.iter().map(|d| (&d.input, &d.cli, &d.http)).collect::<Vec<_>>());
+    }
+
+    /// 4 seeds x 20k cases, lengths up to 96. A failure prints every divergence found, not just the
+    /// first, since the point of this task is to enumerate them.
+    #[test]
+    fn random_corpus_agrees() {
+        let mut div = Vec::new();
+        let mut n = 0u32;
+        for seed in [0x2545F4914F6CDD1D, 0x853C49E6748FEA9B, 0x1FFFFFFFFFFFFFF, 0xD1B54A32D192ED03] {
+            let mut rng = Rng(seed);
+            for _ in 0..20_000u32 {
+                let s = random_string(&mut rng, 96);
+                check(&s, &mut div);
+                n += 1;
+            }
+        }
+        assert!(div.is_empty(), "{} divergence(s) out of {n} random cases: {:#?}", div.len(),
+            div.iter().take(20).map(|d| (&d.input, &d.cli, &d.http)).collect::<Vec<_>>());
+    }
+
+    /// `allow_hyphen_values` does not cover text that is an EXACT match for a flag `clap` already
+    /// knows about at that parse position: `-h`/`--help` (built in), `-V`/`--version` is NOT
+    /// defined at the subcommand level so it passes through, but `--model` (this subcommand's own
+    /// flag) and `--config` (the top-level global flag) still swallow the positional and error
+    /// asking for a value, and a bare `--` is consumed as the "rest is positional" separator and
+    /// leaves nothing behind. HTTP has none of this: `{"input":"--model"}` embeds the four
+    /// literal characters. Measured with `Cli::try_parse_from`, not asserted:
+    /// `"-h"`/`"--help"` -> Err (clap prints help as the error body); `"--model"`/`"--config"` ->
+    /// Err ("a value is required for ... but none was supplied"); `"--"` alone -> Err ("required
+    /// arguments were not provided"). A `-- <text>` prefix is the workaround for a caller building
+    /// argv programmatically; a real document is exceedingly unlikely to consist of exactly one of
+    /// these four literals, which is why the corpora above never hit it. Documented here as a
+    /// known divergence, not fixed: removing help/version at this subcommand is a behavior change
+    /// this task was not scoped to make.
+    #[test]
+    fn known_divergence_exact_flag_literal_collision() {
+        for text in ["-h", "--help", "--model", "--config", "--"] {
+            assert!(cli_extract(text).is_err(), "expected {text:?} to still trip clap");
+            assert_eq!(http_extract(text).as_deref(), Ok(text), "HTTP must embed it literally");
+        }
+        // Not a divergence: no flag named `-V`/`--version` is declared on the `Embed` subcommand
+        // itself (only auto-generated at the top level), so this one round-trips.
+        assert_eq!(cli_extract("-V").as_deref(), Ok("-V"));
+        assert_eq!(http_extract("-V").as_deref(), Ok("-V"));
+    }
+}
