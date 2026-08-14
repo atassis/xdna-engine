@@ -12,6 +12,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 import numpy as np
+from ml_dtypes import bfloat16
 import argparse
 import sys
 
@@ -96,24 +97,36 @@ DENOM_CHECK_CORETILE_EVENTS = [
 
 
 def residual_add(dev, sequence_length, embedding_dim, scale, trace_size, n_cores=8,
-                  event_set="band-naming"):
+                  event_set="band-naming", dtype="f32"):
     assert sequence_length % n_cores == 0, "rows must split evenly across 8 cores"
     assert embedding_dim % 16 == 0, "residual_add_row<16> vectorizes cols by 16"
 
+    # dtype selects the WIRE format of a/b/out; the arithmetic is f32 in both arms (the bf16
+    # kernel widens on load and narrows on store). All six streaming buffers follow it, which
+    # is the whole L1 lever: 6 x D x 4 B = 24588 B at f32, 12300 B at bf16 on a 64 KB core.
+    # Must move together with the kernel's -DRESADD_BF16 -- the Kernel() arg types below are
+    # what the compiled entry expects, so a half-set build is a silent type mismatch.
+    assert dtype in ("f32", "bf16"), "dtype must be f32 or bf16"
     f32 = np.float32
+    elem = np.float32 if dtype == "f32" else bfloat16
     total = sequence_length * embedding_dim
     rows_per_core = sequence_length // n_cores
 
-    a_chunk = np.ndarray[(embedding_dim,), np.dtype[f32]]
-    b_chunk = np.ndarray[(embedding_dim,), np.dtype[f32]]
-    out_chunk = np.ndarray[(embedding_dim,), np.dtype[f32]]
+    a_chunk = np.ndarray[(embedding_dim,), np.dtype[elem]]
+    b_chunk = np.ndarray[(embedding_dim,), np.dtype[elem]]
+    out_chunk = np.ndarray[(embedding_dim,), np.dtype[elem]]
 
     of_a = [ObjectFifo(a_chunk, name=f"a_{i}") for i in range(n_cores)]
     of_b = [ObjectFifo(b_chunk, name=f"b_{i}") for i in range(n_cores)]
     of_out = [ObjectFifo(out_chunk, name=f"out_{i}") for i in range(n_cores)]
 
+    # The OBJECT name must follow dtype too. Both arms export the same symbol, so linking the
+    # f32 object into a bf16 design is silent: the fifos hand it bf16 buffers, it reads them as
+    # f32, runs off the end of every row and returns NaN. Measured, not hypothetical -- 6480
+    # NaNs on the first build that got this wrong.
     kern = Kernel(
-        "residual_add_row", "residual_add.o",
+        "residual_add_row",
+        "residual_add.o" if dtype == "f32" else f"residual_add_{dtype}.o",
         [a_chunk, b_chunk, out_chunk, np.float32, np.int32],
     )
 
@@ -136,9 +149,9 @@ def residual_add(dev, sequence_length, embedding_dim, scale, trace_size, n_cores
         for i in range(n_cores)
     ]
 
-    a_ty = np.ndarray[(total,), np.dtype[f32]]
-    b_ty = np.ndarray[(total,), np.dtype[f32]]
-    out_ty = np.ndarray[(total,), np.dtype[f32]]
+    a_ty = np.ndarray[(total,), np.dtype[elem]]
+    b_ty = np.ndarray[(total,), np.dtype[elem]]
+    out_ty = np.ndarray[(total,), np.dtype[elem]]
 
     def sequence(a, b, out, a_prods, b_prods, out_conses):
         for i in range(n_cores):
@@ -186,10 +199,13 @@ p.add_argument("-c", "--cols", required=True, dest="cols")
 p.add_argument("-s", "--scale", required=True, dest="scale")
 p.add_argument("-t", "--trace_size", required=False, dest="trace_size", default=0)
 p.add_argument("-n", "--cores", required=False, dest="cores", default=8)
+p.add_argument("--dtype", required=False, dest="dtype", default="f32",
+               choices=("f32", "bf16"),
+               help="wire format of a/b/out; must match the kernel's -DRESADD_BF16")
 p.add_argument("-e", "--event-set", required=False, dest="event_set", default="band-naming",
                 choices=["band-naming", "perfcnt-probe", "denom-check"])
 opts = p.parse_args(sys.argv[1:])
 
 dev = NPU2() if opts.device == "npu2" else NPU1()
 print(residual_add(dev, int(opts.rows), int(opts.cols), float(opts.scale), int(opts.trace_size),
-                   int(opts.cores), opts.event_set))
+                   int(opts.cores), opts.event_set, opts.dtype))

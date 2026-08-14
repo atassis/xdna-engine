@@ -15,6 +15,43 @@
 #include <aie_api/aie.hpp>
 #include <stdint.h>
 
+// RESADD_BF16 selects the bf16-stream arm: same arithmetic in f32, but a/b/out are bf16 on the
+// wire. Six streaming buffers halve, 24588 B -> 12300 B of the core's 64 KB. Exactly ONE arm
+// compiles per build (not two entry points) so the L1 figure a build reports is its own.
+#ifdef RESADD_BF16
+template <int N>
+void residual_add_row(const bfloat16 *restrict a, const bfloat16 *restrict b,
+                      bfloat16 *restrict out, float scale, int32_t cols) {
+  event0();
+  // Same conv_even discipline as the f32 arm, and it matters more here: the narrow back to
+  // bf16 is a rounding site the f32 arm does not have.
+  const auto saved_rounding =
+      ::aie::swap_rounding(::aie::rounding_mode::conv_even);
+  const ::aie::vector<float, N> sv = ::aie::broadcast<float, N>(scale);
+  for (int i = 0; i < cols; i += N) {
+    // bf16 -> f32 is exact (bf16 is a truncated f32), so widening costs nothing numerically
+    // and the add/mul run at f32 exactly as in the f32 arm.
+    ::aie::accum<accfloat, N> aa;
+    aa.from_vector(::aie::load_v<N>(a + i), 0);
+    ::aie::accum<accfloat, N> ba;
+    ba.from_vector(::aie::load_v<N>(b + i), 0);
+    ::aie::vector<float, N> sb = ::aie::mul(ba.template to_vector<float>(), sv);
+    ::aie::vector<float, N> y = ::aie::add(aa.template to_vector<float>(), sb);
+    ::aie::accum<accfloat, N> ya;
+    ya.from_vector(y);
+    ::aie::store_v(out + i, ya.template to_vector<bfloat16>());
+  }
+  ::aie::set_rounding(saved_rounding);
+  event1();
+}
+
+extern "C" {
+void residual_add_row(bfloat16 *a, bfloat16 *b, bfloat16 *out, float scale,
+                      int32_t cols) {
+  residual_add_row<16>(a, b, out, scale, cols);
+}
+}
+#else
 template <int N>
 void residual_add_row(const float *restrict a, const float *restrict b,
                       float *restrict out, float scale, int32_t cols) {
@@ -43,3 +80,4 @@ void residual_add_row(float *a, float *b, float *out, float scale, int32_t cols)
   residual_add_row<16>(a, b, out, scale, cols);
 }
 }
+#endif  // RESADD_BF16

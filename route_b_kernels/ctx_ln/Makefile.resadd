@@ -16,21 +16,33 @@ rows ?= 512
 cols ?= 1024
 scale ?= 0.5
 stag ?= 050
-tag = resadd_${rows}x${cols}_s${stag}
+# dtype=bf16 halves every streaming buffer (6 x D x 4B = 24588 B -> 12300 B of the core's
+# 64 KB) and the DDR traffic with it. The generator's --dtype and the kernel's -DRESADD_BF16
+# MUST move together -- they are two halves of one ABI -- so this one knob drives both, and
+# the object name carries it so an f32 build never links a bf16 .o. Tag carries it too.
+dtype ?= f32
+ifeq ($(dtype),bf16)
+RESADD_DEFINES = -DRESADD_BF16
+dtsuf = _bf16
+else
+RESADD_DEFINES =
+dtsuf =
+endif
+tag = resadd_${rows}x${cols}_s${stag}${dtsuf}
 
 aie_py_src = residual_add_iron.py
 
 all: build/final_${tag}.xclbin
 
-build/residual_add.o: residual_add.cc
+build/residual_add${dtsuf}.o: residual_add.cc
 	mkdir -p ${@D}
-	cd ${@D} && ${PEANO_INSTALL_DIR}/bin/clang++ ${PEANOWRAP2P_FLAGS} -c $< -o ${@F}
+	cd ${@D} && ${PEANO_INSTALL_DIR}/bin/clang++ ${PEANOWRAP2P_FLAGS} ${RESADD_DEFINES} -c $< -o ${@F}
 
 build/aie_${tag}.mlir: ${srcdir}/${aie_py_src}
 	mkdir -p ${@D}
-	python3 $< -d ${devicename} -r ${rows} -c ${cols} -s ${scale} -t 0 > $@
+	python3 $< -d ${devicename} -r ${rows} -c ${cols} -s ${scale} -t 0 --dtype ${dtype} > $@
 
-build/final_${tag}.xclbin: build/aie_${tag}.mlir build/residual_add.o
+build/final_${tag}.xclbin: build/aie_${tag}.mlir build/residual_add${dtsuf}.o
 	mkdir -p ${@D}
 	cd ${@D} && aiecc --get-xclbin --get-npu-insts \
 		--peano ${PEANO_INSTALL_DIR} \
