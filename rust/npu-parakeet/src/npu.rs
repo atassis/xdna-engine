@@ -206,6 +206,10 @@ struct PipeSlot {
 pub struct NpuMatmul {
     dev: Device,
     base: PathBuf,
+    // Resident contraction dim. A FIELD, not the `KRES` const, because the K=768 GELU rail
+    // (BERT/Whisper-small/ESM) needs a second value while shipped Parakeet stays on 1024 --
+    // `open()` passes the const, so that path is unchanged by construction.
+    kres: usize,
     tile: String, // "64x32x128" (fast BFP16, default) or "32x32x32" (native bf16, accurate)
     kern: Rc<Kernel>,
     bo_a: Bo, // [PAD_M, KRES] bf16 (resident, single-dispatch path)
@@ -599,6 +603,12 @@ impl NpuMatmul {
     }
 
     pub fn open(root: &Path) -> Self {
+        Self::open_with_kres(root, KRES)
+    }
+
+    /// `open()` with the resident contraction dim chosen by the caller. Parakeet passes `KRES`;
+    /// the K=768 rail passes 768. Every artifact stem and BO size below derives from `kres`.
+    pub fn open_with_kres(root: &Path, kres: usize) -> Self {
         let dev = Device::open(0).expect("open NPU (single-tenant: stop npu-asr/voxd)");
         let base = root.join(WA_SUBDIR);
         // resident kernel tile: fast BFP16 64x32x128 (default) or native bf16 32x32x32 (NPU_NATIVE=1),
@@ -619,7 +629,7 @@ impl NpuMatmul {
             // The resident IS fc1's bf16-out xclbin. Same path as `Fc1PanelBf16` resolves, so
             // load_kernel's path cache hands both the same Kernel and the fc1<->fc2 transition
             // disappears without touching a dispatch site.
-            let stem = format!("{PAD_M}x{KRES}x{DFF}_{FC1_PANEL_BF16_TILE}_8c_modalsilubf16outpanel{KRES}");
+            let stem = format!("{PAD_M}x{kres}x{DFF}_{FC1_PANEL_BF16_TILE}_8c_modalsilubf16outpanel{kres}");
             (resolve_verified(&base, &stem).xclbin, true)
         } else if let Ok(p) = std::env::var("NPU_RESIDENT_XCLBIN") {
             let path = PathBuf::from(p);
@@ -669,13 +679,13 @@ impl NpuMatmul {
             .load_kernel(xclbin.to_str().unwrap(), None)
             .unwrap_or_else(|e| panic!("load resident {}: {e:?}", xclbin.display()));
         let g = |i| kern.group_id(i).unwrap();
-        let bo_a = dev.alloc_bo(&kern, PAD_M * KRES * 2, FLAG_HOST_ONLY, g(3)).unwrap();
+        let bo_a = dev.alloc_bo(&kern, PAD_M * kres * 2, FLAG_HOST_ONLY, g(3)).unwrap();
         let bo_tmp = dev.alloc_bo(&kern, 1, FLAG_HOST_ONLY, g(6)).unwrap();
         let bo_tr = dev.alloc_bo(&kern, 4, FLAG_HOST_ONLY, g(7)).unwrap();
         // 2-slot ring for the K-split pipeline (ff.l2 output N=1024)
         let slots = (0..2)
             .map(|_| PipeSlot {
-                bo_a: dev.alloc_bo(&kern, PAD_M * KRES * 2, FLAG_HOST_ONLY, g(3)).unwrap(),
+                bo_a: dev.alloc_bo(&kern, PAD_M * kres * 2, FLAG_HOST_ONLY, g(3)).unwrap(),
                 bo_c: dev.alloc_bo(&kern, PAD_M * 1024 * 4, FLAG_HOST_ONLY, g(5)).unwrap(),
                 bo_tmp: dev.alloc_bo(&kern, 1, FLAG_HOST_ONLY, g(6)).unwrap(),
                 bo_tr: dev.alloc_bo(&kern, 4, FLAG_HOST_ONLY, g(7)).unwrap(),
@@ -684,6 +694,7 @@ impl NpuMatmul {
         NpuMatmul {
             dev,
             base,
+            kres,
             tile,
             kern,
             bo_a,
@@ -909,18 +920,19 @@ impl NpuMatmul {
     /// bf16-A 8.9). Uses the SAME device ctxLN as `resident_mha_ln_qkv` (so it is faithful to the 8.9
     /// path's LN), reads no shared default infra, and mutates nothing on the FFN/conv paths.
     pub fn resident_mha_affine_ln_f32(&self, x: &Array2<f32>, gamma: &[f32], beta: &[f32]) -> Array2<f32> {
+        let kres = self.kres;
         self.stats.borrow_mut().calls += 1;
         let m = x.nrows();
         // CHAINED on purpose: this path reads the f32 `bo_ln` back, and the fused ctxLN->affine_cast
         // kernel never materializes it.
         let rl = self.ln_affine_cast_chained(x, gamma, beta);
         rl.bo_ln.sync_from_device().unwrap();
-        let mut cb = vec![0u8; PAD_M * KRES * 4];
+        let mut cb = vec![0u8; PAD_M * kres * 4];
         rl.bo_ln.read_bytes(&mut cb).unwrap();
-        let mut out = Array2::<f32>::zeros((m, KRES));
+        let mut out = Array2::<f32>::zeros((m, kres));
         for r in 0..m {
-            for c in 0..KRES {
-                let off = (r * KRES + c) * 4;
+            for c in 0..kres {
+                let off = (r * kres + c) * 4;
                 let ln = f32::from_le_bytes([cb[off], cb[off + 1], cb[off + 2], cb[off + 3]]);
                 out[[r, c]] = ln * gamma[c] + beta[c];
             }
@@ -943,9 +955,10 @@ impl NpuMatmul {
         Fk: FnOnce() -> Array2<f32>,
         Fv: FnOnce() -> Array2<f32>,
     {
+        let kres = self.kres;
         self.stats.borrow_mut().calls += 1;
         let m = x.nrows();
-        let n = KRES; // q/k/v projections are [D,D]; N = D = KRES
+        let n = kres; // q/k/v projections are [D,D]; N = D = KRES
         // LN + affine cast ONCE -> bo_bf16 = affine_LN(x) bf16 [PAD_M, KRES] (device-resident).
         let rl = self.ln_affine_cast(x, gamma, beta);
         let q = self.qkv_proj(&rl.bo_bf16, m, n, make_wq, idq);
@@ -957,12 +970,13 @@ impl NpuMatmul {
     /// One q/k/v modal projection off an ALREADY-resident bf16 A (the shared affine_LN(x)): fetch/build
     /// the cached [KRES,n] weight BO, then a single identity (no-silu) modal dispatch -> C[m,n] f32.
     fn qkv_proj<F: FnOnce() -> Array2<f32>>(&self, a_bo: &Bo, m: usize, n: usize, make_w: F, id: &str) -> Array2<f32> {
+        let kres = self.kres;
         let cached = self.wcache.borrow().get(id).cloned();
         let wbo = if let Some(bo) = cached {
             bo
         } else {
             let w = make_w();
-            assert_eq!(w.nrows(), KRES, "qkv W nrows {} != {KRES}", w.nrows());
+            assert_eq!(w.nrows(), kres, "qkv W nrows {} != {kres}", w.nrows());
             assert_eq!(w.ncols(), n, "qkv W ncols {} != {n}", w.ncols());
             self.weight_bo(id, w.view())
         };
@@ -1146,6 +1160,7 @@ impl NpuMatmul {
     /// Lazy-load the co-resident ctxLN + cast xclbins from {root}/artifacts/parakeet/ln (built at
     /// PAD_M x KRES = 512 x 1024). Two extra hw-contexts alongside the modal matmul.
     fn resident_ln(&self) -> Option<Rc<ResidentLn>> {
+        let kres = self.kres;
         if let Some(cached) = self.resident_ln.borrow().as_ref() {
             return cached.clone();
         }
@@ -1153,7 +1168,7 @@ impl NpuMatmul {
         // path (no panic) -- so the resident seam can be the DEFAULT without breaking builds/branches
         // that haven't built these kernels.
         let seam = ["ctxln", "affcast"].iter().all(|n| {
-            let stem = format!("{n}_{PAD_M}x{KRES}");
+            let stem = format!("{n}_{PAD_M}x{kres}");
             kernel_registry::xclbin_path(&self.ln_dir, &stem).exists()
                 && kernel_registry::insts_path(&self.ln_dir, &stem).exists()
         });
@@ -1175,12 +1190,13 @@ impl NpuMatmul {
     }
 
     fn load_resident_ln(&self) -> Rc<ResidentLn> {
+        let kres = self.kres;
         let load = |name: &str| -> (Rc<Kernel>, Bo, usize) {
-            let art = resolve_verified(&self.ln_dir, &format!("{name}_{PAD_M}x{KRES}"));
+            let art = resolve_verified(&self.ln_dir, &format!("{name}_{PAD_M}x{kres}"));
             let kern = self
                 .dev
                 .load_kernel(art.xclbin.to_str().unwrap(), None)
-                .unwrap_or_else(|e| panic!("load resident-ln {} : {e:?}\n  prebuild: build ctxln+cast at {PAD_M}x{KRES} and copy to artifacts/parakeet/ln", art.xclbin.display()));
+                .unwrap_or_else(|e| panic!("load resident-ln {} : {e:?}\n  prebuild: build ctxln+cast at {PAD_M}x{kres} and copy to artifacts/parakeet/ln", art.xclbin.display()));
             let ib = std::fs::read(&art.insts).unwrap_or_else(|e| panic!("read {}: {e}", art.insts.display()));
             let n = ib.len() / 4;
             let bo = self.dev.alloc_bo(&kern, ib.len(), FLAG_CACHEABLE, kern.group_id(1).unwrap()).unwrap();
@@ -1207,7 +1223,7 @@ impl NpuMatmul {
         // forces the two-dispatch chain back (two-way, not a one-way flip).
         let lnaffcast = {
             let want = std::env::var("PARAKEET_LN_FUSED").map(|v| v != "0").unwrap_or(true);
-            let stem = format!("lnaffcast_{PAD_M}x{KRES}");
+            let stem = format!("lnaffcast_{PAD_M}x{kres}");
             let present = kernel_registry::xclbin_path(&self.ln_dir, &stem).exists()
                 && kernel_registry::insts_path(&self.ln_dir, &stem).exists();
             if want && present {
@@ -1232,52 +1248,52 @@ impl NpuMatmul {
         // conv-module GLU (step 2), OPTIONAL: load only if the glu xclbin was built. A/g3 input is fed
         // from the modal stream's bo_c (pw1 output); bo_out (g4) is the [PAD_M,KRES] f32 GLU result.
         let glu = {
-            let stem = format!("glu_{PAD_M}x{KRES}");
+            let stem = format!("glu_{PAD_M}x{kres}");
             let present = kernel_registry::xclbin_path(&self.ln_dir, &stem).exists()
                 && kernel_registry::insts_path(&self.ln_dir, &stem).exists();
             if present {
                 let (kern, instr, n) = load_path(&self.ln_dir, &stem);
                 let gg = |i| kern.group_id(i).unwrap();
                 Some(ConvGlu {
-                    bo_out: self.dev.alloc_bo(&kern, PAD_M * KRES * 4, FLAG_HOST_ONLY, gg(4)).unwrap(),
+                    bo_out: self.dev.alloc_bo(&kern, PAD_M * kres * 4, FLAG_HOST_ONLY, gg(4)).unwrap(),
                     dummy_c: self.dev.alloc_bo(&kern, 1, FLAG_HOST_ONLY, gg(5)).unwrap(),
                     dummy_tmp: self.dev.alloc_bo(&kern, 8, FLAG_HOST_ONLY, gg(6)).unwrap(),
                     dummy_tr: self.dev.alloc_bo(&kern, 1, FLAG_HOST_ONLY, gg(7)).unwrap(),
                     kern, instr, n,
                 })
             } else {
-                eprintln!("[npu] glu xclbin absent in {} -- conv GLU stays host (build final_glu_{PAD_M}x{KRES})", self.ln_dir.display());
+                eprintln!("[npu] glu xclbin absent in {} -- conv GLU stays host (build final_glu_{PAD_M}x{kres})", self.ln_dir.display());
                 None
             }
         };
         // resident-FFN fc2 on-device accumulate (out=a+b f32), OPTIONAL: load only if built. acc0/acc1
         // ping-pong the running sum; `zero` (zeroed once) seeds the first partial (acc = partial0 + 0).
         let acc_add = {
-            let stem = format!("accadd_{PAD_M}x{KRES}");
+            let stem = format!("accadd_{PAD_M}x{kres}");
             let present = kernel_registry::xclbin_path(&self.ln_dir, &stem).exists()
                 && kernel_registry::insts_path(&self.ln_dir, &stem).exists();
             if present {
                 let (kern, instr, n) = load_path(&self.ln_dir, &stem);
                 let gaa = |i| kern.group_id(i).unwrap();
-                let zero = self.dev.alloc_bo(&kern, PAD_M * KRES * 4, FLAG_HOST_ONLY, gaa(4)).unwrap();
-                zero.write_bytes(&vec![0u8; PAD_M * KRES * 4]).unwrap();
+                let zero = self.dev.alloc_bo(&kern, PAD_M * kres * 4, FLAG_HOST_ONLY, gaa(4)).unwrap();
+                zero.write_bytes(&vec![0u8; PAD_M * kres * 4]).unwrap();
                 zero.sync_to_device().unwrap();
                 Some(AccAdd {
-                    acc0: Rc::new(self.dev.alloc_bo(&kern, PAD_M * KRES * 4, FLAG_HOST_ONLY, gaa(5)).unwrap()),
-                    acc1: Rc::new(self.dev.alloc_bo(&kern, PAD_M * KRES * 4, FLAG_HOST_ONLY, gaa(5)).unwrap()),
+                    acc0: Rc::new(self.dev.alloc_bo(&kern, PAD_M * kres * 4, FLAG_HOST_ONLY, gaa(5)).unwrap()),
+                    acc1: Rc::new(self.dev.alloc_bo(&kern, PAD_M * kres * 4, FLAG_HOST_ONLY, gaa(5)).unwrap()),
                     zero,
                     dummy_tmp: self.dev.alloc_bo(&kern, 8, FLAG_HOST_ONLY, gaa(6)).unwrap(),
                     dummy_tr: self.dev.alloc_bo(&kern, 1, FLAG_HOST_ONLY, gaa(7)).unwrap(),
                     kern, instr, n,
                 })
             } else {
-                eprintln!("[npu] acc_add xclbin absent in {} -- resident_ffn_dev unavailable (build final_accadd_{PAD_M}x{KRES})", self.ln_dir.display());
+                eprintln!("[npu] acc_add xclbin absent in {} -- resident_ffn_dev unavailable (build final_accadd_{PAD_M}x{kres})", self.ln_dir.display());
                 None
             }
         };
         // scaled residual-add s050 (out = a + 0.5*b, f32), OPTIONAL: the Macaron FFN residual on-chip.
         let resadd_s050 = {
-            let stem = format!("resadd_{PAD_M}x{KRES}_s050");
+            let stem = format!("resadd_{PAD_M}x{kres}_s050");
             let present = kernel_registry::xclbin_path(&self.ln_dir, &stem).exists()
                 && kernel_registry::insts_path(&self.ln_dir, &stem).exists();
             if present {
@@ -1285,19 +1301,19 @@ impl NpuMatmul {
                 let gr = |i| kern.group_id(i).unwrap();
                 Some(ResidualAdd {
                     scale: 0.5,
-                    bo_out: Rc::new(self.dev.alloc_bo(&kern, PAD_M * KRES * 4, FLAG_HOST_ONLY, gr(5)).unwrap()),
+                    bo_out: Rc::new(self.dev.alloc_bo(&kern, PAD_M * kres * 4, FLAG_HOST_ONLY, gr(5)).unwrap()),
                     dummy_tmp: self.dev.alloc_bo(&kern, 8, FLAG_HOST_ONLY, gr(6)).unwrap(),
                     dummy_tr: self.dev.alloc_bo(&kern, 1, FLAG_HOST_ONLY, gr(7)).unwrap(),
                     kern, instr, n,
                 })
             } else {
-                eprintln!("[npu] resadd_s050 xclbin absent in {} -- residual_add_dev(0.5) unavailable (build final_resadd_{PAD_M}x{KRES}_s050)", self.ln_dir.display());
+                eprintln!("[npu] resadd_s050 xclbin absent in {} -- residual_add_dev(0.5) unavailable (build final_resadd_{PAD_M}x{kres}_s050)", self.ln_dir.display());
                 None
             }
         };
         // scaled residual-add s100 (out=a+1.0*b f32), OPTIONAL: the full MHSA/conv residual x+sublayer.
         let resadd_s100 = {
-            let stem = format!("resadd_{PAD_M}x{KRES}_s100");
+            let stem = format!("resadd_{PAD_M}x{kres}_s100");
             let present = kernel_registry::xclbin_path(&self.ln_dir, &stem).exists()
                 && kernel_registry::insts_path(&self.ln_dir, &stem).exists();
             if present {
@@ -1305,13 +1321,13 @@ impl NpuMatmul {
                 let gr = |i| kern.group_id(i).unwrap();
                 Some(ResidualAdd {
                     scale: 1.0,
-                    bo_out: Rc::new(self.dev.alloc_bo(&kern, PAD_M * KRES * 4, FLAG_HOST_ONLY, gr(5)).unwrap()),
+                    bo_out: Rc::new(self.dev.alloc_bo(&kern, PAD_M * kres * 4, FLAG_HOST_ONLY, gr(5)).unwrap()),
                     dummy_tmp: self.dev.alloc_bo(&kern, 8, FLAG_HOST_ONLY, gr(6)).unwrap(),
                     dummy_tr: self.dev.alloc_bo(&kern, 1, FLAG_HOST_ONLY, gr(7)).unwrap(),
                     kern, instr, n,
                 })
             } else {
-                eprintln!("[npu] resadd_s100 xclbin absent in {} -- residual_add_dev(1.0) unavailable (build final_resadd_{PAD_M}x{KRES}_s100)", self.ln_dir.display());
+                eprintln!("[npu] resadd_s100 xclbin absent in {} -- residual_add_dev(1.0) unavailable (build final_resadd_{PAD_M}x{kres}_s100)", self.ln_dir.display());
                 None
             }
         };
@@ -1320,7 +1336,7 @@ impl NpuMatmul {
         // built+staged by build_parakeet_modal_kernels.sh (cast_512x4096, 512x4096x1024 modalid).
         let fc2_k4096 = {
             let cast_stem = format!("cast_{PAD_M}x{DFF}");
-            let mm_stem = format!("{PAD_M}x{DFF}x{KRES}_{}_8c_modalid", self.tile);
+            let mm_stem = format!("{PAD_M}x{DFF}x{kres}_{}_8c_modalid", self.tile);
             // TWO hw_context slots (the cast and the K=DFF GEMM) for an OPT-IN path. Loading them
             // when the flag is off spent 2 of the driver's 16 on programs that can never dispatch;
             // that budget is what blocked attention-on-NPU. Gate on the flag, not on the artifacts
@@ -1340,11 +1356,11 @@ impl NpuMatmul {
                     cast_dc: self.dev.alloc_bo(&cast_kern, 1, FLAG_HOST_ONLY, gc(5)).unwrap(),
                     cast_dt: self.dev.alloc_bo(&cast_kern, 8, FLAG_HOST_ONLY, gc(6)).unwrap(),
                     cast_dr: self.dev.alloc_bo(&cast_kern, 1, FLAG_HOST_ONLY, gc(7)).unwrap(),
-                    mm_c: Rc::new(self.dev.alloc_bo(&mm_kern, PAD_M * KRES * 4, FLAG_HOST_ONLY, gm(5)).unwrap()),
+                    mm_c: Rc::new(self.dev.alloc_bo(&mm_kern, PAD_M * kres * 4, FLAG_HOST_ONLY, gm(5)).unwrap()),
                     cast_kern, cast_instr, cast_n, mm_kern, mm_instr, mm_n,
                 })
             } else {
-                eprintln!("[npu] fc2_k4096 xclbins absent in {} -- one-dispatch fc2 unavailable (build cast_{PAD_M}x{DFF} + {PAD_M}x{DFF}x{KRES} modal)", self.ln_dir.display());
+                eprintln!("[npu] fc2_k4096 xclbins absent in {} -- one-dispatch fc2 unavailable (build cast_{PAD_M}x{DFF} + {PAD_M}x{DFF}x{kres} modal)", self.ln_dir.display());
                 None
             }
         };
@@ -1359,14 +1375,14 @@ impl NpuMatmul {
             // too -- otherwise the variant reaches only the identity-mode GEMMs and misses fc1,
             // which is the one dispatch whose SiLU branch the variant actually changes.
             let sfx = std::env::var("PARAKEET_MODAL_EPI_SUFFIX").unwrap_or_default();
-            let tag = format!("{PAD_M}x{KRES}x{DFF}_{FC1_PANEL_BF16_TILE}_8c_modalsilubf16outpanel{KRES}{sfx}");
+            let tag = format!("{PAD_M}x{kres}x{DFF}_{FC1_PANEL_BF16_TILE}_8c_modalsilubf16outpanel{kres}{sfx}");
             let present = kernel_registry::xclbin_path(&self.ln_dir, &tag).exists()
                 && kernel_registry::insts_path(&self.ln_dir, &tag).exists();
             if present {
                 let (kern, instr, n) = load_path(&self.ln_dir, &tag);
                 let gg = |i| kern.group_id(i).unwrap();
                 Some(Fc1PanelBf16 {
-                    bo_out: self.dev.alloc_bo(&kern, (DFF / KRES) * PAD_M * KRES * 2, FLAG_HOST_ONLY, gg(5)).unwrap(),
+                    bo_out: self.dev.alloc_bo(&kern, (DFF / kres) * PAD_M * kres * 2, FLAG_HOST_ONLY, gg(5)).unwrap(),
                     dummy_tmp: self.dev.alloc_bo(&kern, 1, FLAG_HOST_ONLY, gg(6)).unwrap(),
                     dummy_tr: self.dev.alloc_bo(&kern, 4, FLAG_HOST_ONLY, gg(7)).unwrap(),
                     kern, instr, n,
@@ -1486,11 +1502,11 @@ impl NpuMatmul {
         let ga = |i| ac_kern.group_id(i).unwrap();
         let gd = |i| deint_kern.group_id(i).unwrap();
         let rl = Rc::new(ResidentLn {
-            bo_x: self.dev.alloc_bo(&ln_kern, PAD_M * KRES * 4, FLAG_HOST_ONLY, gl(3)).unwrap(),
-            bo_ln: self.dev.alloc_bo(&ln_kern, PAD_M * KRES * 4, FLAG_HOST_ONLY, gl(4)).unwrap(),
-            bo_gb: self.dev.alloc_bo(&ac_kern, 2 * KRES * 4, FLAG_HOST_ONLY, ga(4)).unwrap(),
-            bo_bf16: Rc::new(self.dev.alloc_bo(&ac_kern, PAD_M * KRES * 2, FLAG_HOST_ONLY, ga(5)).unwrap()),
-            bo_deint: self.dev.alloc_bo(&deint_kern, (DFF / KRES) * PAD_M * KRES * 2, FLAG_HOST_ONLY, gd(4)).unwrap(),
+            bo_x: self.dev.alloc_bo(&ln_kern, PAD_M * kres * 4, FLAG_HOST_ONLY, gl(3)).unwrap(),
+            bo_ln: self.dev.alloc_bo(&ln_kern, PAD_M * kres * 4, FLAG_HOST_ONLY, gl(4)).unwrap(),
+            bo_gb: self.dev.alloc_bo(&ac_kern, 2 * kres * 4, FLAG_HOST_ONLY, ga(4)).unwrap(),
+            bo_bf16: Rc::new(self.dev.alloc_bo(&ac_kern, PAD_M * kres * 2, FLAG_HOST_ONLY, ga(5)).unwrap()),
+            bo_deint: self.dev.alloc_bo(&deint_kern, (DFF / kres) * PAD_M * kres * 2, FLAG_HOST_ONLY, gd(4)).unwrap(),
             ln_c: self.dev.alloc_bo(&ln_kern, 1, FLAG_HOST_ONLY, gl(5)).unwrap(),
             ln_tmp: self.dev.alloc_bo(&ln_kern, 8, FLAG_HOST_ONLY, gl(6)).unwrap(),
             ln_tr: self.dev.alloc_bo(&ln_kern, 1, FLAG_HOST_ONLY, gl(7)).unwrap(),
@@ -1520,7 +1536,7 @@ impl NpuMatmul {
     /// K=768 rail on is a device-session step that makes KRES/PAD_M/DFF real fields set from the
     /// loaded xclbin name; keeping them consts here preserves Parakeet's path byte-for-byte (see the
     /// DEVICE-GATED notes on `resident_ffn_nonorm`).
-    pub fn resident_kres(&self) -> usize { KRES }
+    pub fn resident_kres(&self) -> usize { self.kres }
     pub fn resident_pad_m(&self) -> usize { PAD_M }
     pub fn resident_dff(&self) -> usize { DFF }
 
@@ -1529,22 +1545,23 @@ impl NpuMatmul {
     /// packed into bo_gb. Returns the resident block whose bo_bf16 holds affine_LN(x) as bf16, ready
     /// as the modal fc1's A input.
     fn ln_affine_cast(&self, x: &Array2<f32>, gamma: &[f32], beta: &[f32]) -> Rc<ResidentLn> {
+        let kres = self.kres;
         let (t, d) = x.dim();
-        assert_eq!(d, KRES, "resident LN needs D=KRES={KRES}");
+        assert_eq!(d, kres, "resident LN needs D=kres={kres}");
         assert!(t <= PAD_M, "T={t} exceeds PAD_M={PAD_M}");
-        assert_eq!(gamma.len(), KRES);
-        assert_eq!(beta.len(), KRES);
+        assert_eq!(gamma.len(), kres);
+        assert_eq!(beta.len(), kres);
         // Only called on the resident path (gated by resident_ff_available), so the load succeeded.
         let rl = self.resident_ln().expect("ln_affine_cast without resident_ff_available()");
         let x_std = x.as_standard_layout();
-        let mut buf = vec![0f32; PAD_M * KRES];
-        buf[..t * KRES].copy_from_slice(&x_std.as_slice().unwrap()[..t * KRES]);
+        let mut buf = vec![0f32; PAD_M * kres];
+        buf[..t * kres].copy_from_slice(&x_std.as_slice().unwrap()[..t * kres]);
         rl.bo_x.write_bytes(f32_bytes(&buf)).unwrap();
         rl.bo_x.sync_to_device().unwrap();
         // gamma|beta packed on one channel
-        let mut gb = vec![0f32; 2 * KRES];
-        gb[..KRES].copy_from_slice(gamma);
-        gb[KRES..].copy_from_slice(beta);
+        let mut gb = vec![0f32; 2 * kres];
+        gb[..kres].copy_from_slice(gamma);
+        gb[kres..].copy_from_slice(beta);
         rl.bo_gb.write_bytes(f32_bytes(&gb)).unwrap();
         rl.bo_gb.sync_to_device().unwrap();
         match rl.lnaffcast.as_ref() {
@@ -1570,16 +1587,17 @@ impl NpuMatmul {
     /// [`Self::ln_affine_cast`] forced onto the two-dispatch chain, so `bo_ln` (the f32 LN output)
     /// IS materialized. Only for callers that read it back -- the fused kernel skips it.
     fn ln_affine_cast_chained(&self, x: &Array2<f32>, gamma: &[f32], beta: &[f32]) -> Rc<ResidentLn> {
+        let kres = self.kres;
         let rl = self.resident_ln().expect("ln_affine_cast_chained without resident_ff_available()");
         let x_std = x.as_standard_layout();
         let t = x.nrows();
-        let mut buf = vec![0f32; PAD_M * KRES];
-        buf[..t * KRES].copy_from_slice(&x_std.as_slice().unwrap()[..t * KRES]);
+        let mut buf = vec![0f32; PAD_M * kres];
+        buf[..t * kres].copy_from_slice(&x_std.as_slice().unwrap()[..t * kres]);
         rl.bo_x.write_bytes(f32_bytes(&buf)).unwrap();
         rl.bo_x.sync_to_device().unwrap();
-        let mut gb = vec![0f32; 2 * KRES];
-        gb[..KRES].copy_from_slice(gamma);
-        gb[KRES..].copy_from_slice(beta);
+        let mut gb = vec![0f32; 2 * kres];
+        gb[..kres].copy_from_slice(gamma);
+        gb[kres..].copy_from_slice(beta);
         rl.bo_gb.write_bytes(f32_bytes(&gb)).unwrap();
         rl.bo_gb.sync_to_device().unwrap();
         modal_site("rl.ln_kern#2");
@@ -1596,13 +1614,14 @@ impl NpuMatmul {
     /// host-written (small per-block const). Returns the shared ResidentLn whose `bo_bf16` holds
     /// affine_LN(a) bf16 [PAD_M,KRES], ready as the next modal GEMM's device A input.
     fn ln_affine_cast_dev(&self, a_bo: &Bo, gamma: &[f32], beta: &[f32]) -> Rc<ResidentLn> {
-        assert_eq!(gamma.len(), KRES);
-        assert_eq!(beta.len(), KRES);
+        let kres = self.kres;
+        assert_eq!(gamma.len(), kres);
+        assert_eq!(beta.len(), kres);
         let rl = self.resident_ln().expect("ln_affine_cast_dev without resident_ff_available()");
         // gamma|beta packed on one channel (host-written, small per-block const)
-        let mut gb = vec![0f32; 2 * KRES];
-        gb[..KRES].copy_from_slice(gamma);
-        gb[KRES..].copy_from_slice(beta);
+        let mut gb = vec![0f32; 2 * kres];
+        gb[..kres].copy_from_slice(gamma);
+        gb[kres..].copy_from_slice(beta);
         rl.bo_gb.write_bytes(f32_bytes(&gb)).unwrap();
         rl.bo_gb.sync_to_device().unwrap();
         match rl.lnaffcast.as_ref() {
@@ -1629,6 +1648,7 @@ impl NpuMatmul {
     /// [`Self::ln_affine_cast_dev`], reads `bo_bf16` back, compares to host `ops::layernorm(x,g,b)`.
     /// bf16 output -> rel-L2 <= 5e-3. `None` when the resident-ln (ctxln/affcast) xclbins are absent.
     pub fn ln_affine_cast_dev_selftest(&self, t: usize, seed: u64) -> Option<(Array2<f32>, Array2<f32>)> {
+        let kres = self.kres;
         let rl = self.resident_ln()?;
         let fill = |rows: usize, cols: usize, sd: u64, sc: f32| -> Array2<f32> {
             let mut s = sd.wrapping_add(0x9E37_79B9_7F4A_7C15);
@@ -1642,24 +1662,24 @@ impl NpuMatmul {
                 (u * 2.0 - 1.0) * sc
             })
         };
-        let x = fill(t, KRES, seed, 1.0);
-        let gv: Vec<f32> = fill(1, KRES, seed ^ 0x1A, 1.0).iter().copied().collect(); // affine scale ~1
-        let bv: Vec<f32> = fill(1, KRES, seed ^ 0x2B, 0.1).iter().copied().collect();
+        let x = fill(t, kres, seed, 1.0);
+        let gv: Vec<f32> = fill(1, kres, seed ^ 0x1A, 1.0).iter().copied().collect(); // affine scale ~1
+        let bv: Vec<f32> = fill(1, kres, seed ^ 0x2B, 0.1).iter().copied().collect();
         // Upload x into a device f32 [PAD_M,KRES] BO (first t rows real; the rest zero -> ignored).
-        let a_bo = self.dev.alloc_bo(&rl.ln_kern, PAD_M * KRES * 4, FLAG_HOST_ONLY, rl.ln_kern.group_id(3).unwrap()).unwrap();
-        let mut buf = vec![0f32; PAD_M * KRES];
+        let a_bo = self.dev.alloc_bo(&rl.ln_kern, PAD_M * kres * 4, FLAG_HOST_ONLY, rl.ln_kern.group_id(3).unwrap()).unwrap();
+        let mut buf = vec![0f32; PAD_M * kres];
         let xs = x.as_standard_layout();
-        buf[..t * KRES].copy_from_slice(&xs.as_slice().unwrap()[..t * KRES]);
+        buf[..t * kres].copy_from_slice(&xs.as_slice().unwrap()[..t * kres]);
         a_bo.write_bytes(f32_bytes(&buf)).unwrap();
         a_bo.sync_to_device().unwrap();
         let rl2 = self.ln_affine_cast_dev(&a_bo, &gv, &bv);
         rl2.bo_bf16.sync_from_device().unwrap();
-        let mut cb = vec![0u8; t * KRES * 2]; // bf16, first t rows (row-major)
+        let mut cb = vec![0u8; t * kres * 2]; // bf16, first t rows (row-major)
         rl2.bo_bf16.read_bytes(&mut cb).unwrap();
-        let mut dev = Array2::<f32>::zeros((t, KRES));
+        let mut dev = Array2::<f32>::zeros((t, kres));
         for r in 0..t {
-            for c in 0..KRES {
-                let off = (r * KRES + c) * 2;
+            for c in 0..kres {
+                let off = (r * kres + c) * 2;
                 let bits = u16::from_le_bytes([cb[off], cb[off + 1]]);
                 dev[[r, c]] = f32::from_bits((bits as u32) << 16);
             }
@@ -1688,13 +1708,14 @@ impl NpuMatmul {
     /// Upload a host activation `x` [m, KRES] into a fresh device f32 [PAD_M,KRES] BO (the resident
     /// stream head): the block uploads x ONCE here, then every brick reads/writes device BOs.
     pub fn upload_stream(&self, x: &Array2<f32>) -> Rc<Bo> {
+        let kres = self.kres;
         let m = x.nrows();
         assert!(m <= PAD_M, "T={m} exceeds PAD_M={PAD_M}");
-        assert_eq!(x.ncols(), KRES, "stream needs D=KRES={KRES}");
-        let bo = self.dev.alloc_bo(&self.kern, PAD_M * KRES * 4, FLAG_HOST_ONLY, self.kern.group_id(3).unwrap()).unwrap();
+        assert_eq!(x.ncols(), kres, "stream needs D=kres={kres}");
+        let bo = self.dev.alloc_bo(&self.kern, PAD_M * kres * 4, FLAG_HOST_ONLY, self.kern.group_id(3).unwrap()).unwrap();
         let xs = x.as_standard_layout();
-        let mut buf = vec![0f32; PAD_M * KRES];
-        buf[..m * KRES].copy_from_slice(&xs.as_slice().unwrap()[..m * KRES]);
+        let mut buf = vec![0f32; PAD_M * kres];
+        buf[..m * kres].copy_from_slice(&xs.as_slice().unwrap()[..m * kres]);
         bo.write_bytes(f32_bytes(&buf)).unwrap();
         bo.sync_to_device().unwrap();
         Rc::new(bo)
@@ -1702,14 +1723,15 @@ impl NpuMatmul {
 
     /// Read a device f32 [PAD_M,KRES] BO back to a host [m, KRES] array (the block/encoder boundary).
     pub fn readback_stream(&self, bo: &Bo, m: usize) -> Array2<f32> {
+        let kres = self.kres;
         assert!(m <= PAD_M, "readback_stream: m={m} exceeds PAD_M={PAD_M}");
         bo.sync_from_device().unwrap();
-        let mut cb = vec![0u8; m * KRES * 4];
+        let mut cb = vec![0u8; m * kres * 4];
         bo.read_bytes(&mut cb).unwrap();
-        let mut out = Array2::<f32>::zeros((m, KRES));
+        let mut out = Array2::<f32>::zeros((m, kres));
         for r in 0..m {
-            for c in 0..KRES {
-                let off = (r * KRES + c) * 4;
+            for c in 0..kres {
+                let off = (r * kres + c) * 4;
                 out[[r, c]] = f32::from_le_bytes([cb[off], cb[off + 1], cb[off + 2], cb[off + 3]]);
             }
         }
@@ -1730,13 +1752,14 @@ impl NpuMatmul {
     /// (a resident-stream LN output), so the host pack+upload of A is SKIPPED. `id` shares the weight-BO
     /// cache with the host path, so warm passes hit. Identity modal (no silu) -- for q/k/v/out projections.
     pub fn proj_from_bf16<F: FnOnce() -> Array2<f32>>(&self, a_bo: &Bo, m: usize, make_b: F, id: &str, n: usize) -> Array2<f32> {
+        let kres = self.kres;
         self.stats.borrow_mut().calls += 1;
         let cached = self.wcache.borrow().get(id).cloned();
         let wbo = if let Some(bo) = cached {
             bo
         } else {
             let b = make_b();
-            assert_eq!(b.nrows(), KRES, "proj weight nrows {} != {KRES}", b.nrows());
+            assert_eq!(b.nrows(), kres, "proj weight nrows {} != {kres}", b.nrows());
             assert_eq!(b.ncols(), n, "proj weight ncols {} != {n}", b.ncols());
             self.weight_bo(id, b.view())
         };
@@ -1785,6 +1808,7 @@ impl NpuMatmul {
     /// Resident LN -> GEMM: ctxLN -> affine_cast(gamma,beta) -> modal GEMM [m,n], with the on-chip
     /// SiLU epilogue applied iff `silu` (n=DFF fc1 wants silu; conv pw1 / plain GEMMs want identity).
     pub fn resident_ff1_fc1<F: FnOnce() -> Array2<f32>>(&self, x: &Array2<f32>, gamma: &[f32], beta: &[f32], make_w1: F, id: &str, n: usize, silu: bool) -> Array2<f32> {
+        let kres = self.kres;
         self.stats.borrow_mut().calls += 1;
         let m = x.nrows();
         let rl = self.ln_affine_cast(x, gamma, beta);
@@ -1793,7 +1817,7 @@ impl NpuMatmul {
             bo
         } else {
             let w = make_w1();
-            assert_eq!(w.nrows(), KRES, "W1 nrows {} != {KRES}", w.nrows());
+            assert_eq!(w.nrows(), kres, "W1 nrows {} != {kres}", w.nrows());
             assert_eq!(w.ncols(), n, "W1 ncols {} != {n}", w.ncols());
             self.weight_bo(id, w.view())
         };
@@ -1808,11 +1832,12 @@ impl NpuMatmul {
     /// so warm passes hit). Returns None (caller keeps the host GLU) when the resident seam or the glu
     /// xclbin is absent -- so a tree without the glu kernel still gets step-1's resident LN->pw1.
     pub fn resident_conv_pw1_glu<F: FnOnce() -> Array2<f32>>(&self, x: &Array2<f32>, gamma: &[f32], beta: &[f32], make_w1: F, id: &str) -> Option<Array2<f32>> {
+        let kres = self.kres;
         let rl = self.resident_ln()?;
         let glu = rl.glu.as_ref()?; // glu xclbin absent -> None, caller falls back
         self.stats.borrow_mut().calls += 1;
         let m = x.nrows();
-        let n2 = 2 * KRES; // pw1 output width 2D
+        let n2 = 2 * kres; // pw1 output width 2D
         // LN + affine cast -> bo_bf16 = affine_LN(x) bf16 [PAD_M, KRES] (device).
         let rlc = self.ln_affine_cast(x, gamma, beta);
         // pw1 GEMM: A=bo_bf16, W1=[KRES,2D] identity-modal -> st.bo_c [PAD_M,2D] f32, STAYS on device.
@@ -1821,7 +1846,7 @@ impl NpuMatmul {
             bo
         } else {
             let w = make_w1();
-            assert_eq!(w.nrows(), KRES, "pw1 W nrows {} != {KRES}", w.nrows());
+            assert_eq!(w.nrows(), kres, "pw1 W nrows {} != {kres}", w.nrows());
             assert_eq!(w.ncols(), n2, "pw1 W ncols {} != {n2}", w.ncols());
             self.weight_bo(id, w.view())
         };
@@ -1834,12 +1859,12 @@ impl NpuMatmul {
         self.stats.borrow_mut().dispatches += 2; // pw1 + glu
         // read the D-wide GLU output for the m real rows (row-major, first m rows contiguous).
         glu.bo_out.sync_from_device().unwrap();
-        let mut cb = vec![0u8; m * KRES * 4];
+        let mut cb = vec![0u8; m * kres * 4];
         glu.bo_out.read_bytes(&mut cb).unwrap();
-        let mut out = Array2::<f32>::zeros((m, KRES));
+        let mut out = Array2::<f32>::zeros((m, kres));
         for r in 0..m {
-            for c in 0..KRES {
-                let off = (r * KRES + c) * 4;
+            for c in 0..kres {
+                let off = (r * kres + c) * 4;
                 out[[r, c]] = f32::from_le_bytes([cb[off], cb[off + 1], cb[off + 2], cb[off + 3]]);
             }
         }
@@ -1851,17 +1876,18 @@ impl NpuMatmul {
     /// round-trips to host. Returns the host GLU output [m, KRES] (the rest of the conv module continues
     /// host-fed for this seam). `None` when the resident-ln / glu xclbins are absent.
     pub fn resident_conv_pw1_glu_dev<F: FnOnce() -> Array2<f32>>(&self, a_bo: &Bo, m: usize, gamma: &[f32], beta: &[f32], make_w1: F, id: &str) -> Option<Array2<f32>> {
+        let kres = self.kres;
         let rl = self.resident_ln()?;
         let glu = rl.glu.as_ref()?;
         self.stats.borrow_mut().calls += 1;
-        let n2 = 2 * KRES; // pw1 output width 2D
+        let n2 = 2 * kres; // pw1 output width 2D
         let rlc = self.ln_affine_cast_dev(a_bo, gamma, beta); // device-in LN
         let cached = self.wcache.borrow().get(id).cloned();
         let wbo = if let Some(bo) = cached {
             bo
         } else {
             let w = make_w1();
-            assert_eq!(w.nrows(), KRES, "pw1 W nrows {} != {KRES}", w.nrows());
+            assert_eq!(w.nrows(), kres, "pw1 W nrows {} != {kres}", w.nrows());
             assert_eq!(w.ncols(), n2, "pw1 W ncols {} != {n2}", w.ncols());
             self.weight_bo(id, w.view())
         };
@@ -1872,12 +1898,12 @@ impl NpuMatmul {
         { let _dt = self.dtimer(); glu.kern.run_matmul8(3, &glu.instr, glu.n, &st.bo_c, &glu.bo_out, &glu.dummy_c, &glu.dummy_tmp, &glu.dummy_tr).unwrap(); }
         self.stats.borrow_mut().dispatches += 2; // pw1 + glu
         glu.bo_out.sync_from_device().unwrap();
-        let mut cb = vec![0u8; m * KRES * 4];
+        let mut cb = vec![0u8; m * kres * 4];
         glu.bo_out.read_bytes(&mut cb).unwrap();
-        let mut out = Array2::<f32>::zeros((m, KRES));
+        let mut out = Array2::<f32>::zeros((m, kres));
         for r in 0..m {
-            for c in 0..KRES {
-                let off = (r * KRES + c) * 4;
+            for c in 0..kres {
+                let off = (r * kres + c) * 4;
                 out[[r, c]] = f32::from_le_bytes([cb[off], cb[off + 1], cb[off + 2], cb[off + 3]]);
             }
         }
@@ -1888,15 +1914,16 @@ impl NpuMatmul {
     /// read). The device-out twin of the k=KRES `matmul_id_lazy` path: packs+uploads A, GEMMs into a new
     /// BO, returns it -- so a projection result (e.g. MHSA linear_out) stays resident for the next seam.
     pub fn matmul_id_to_bo<F: FnOnce() -> Array2<f32>>(&self, a: &Array2<f32>, make_w: F, id: &str, n: usize) -> Rc<Bo> {
+        let kres = self.kres;
         let m = a.nrows();
-        assert_eq!(a.ncols(), KRES, "matmul_id_to_bo needs K=KRES={KRES}");
+        assert_eq!(a.ncols(), kres, "matmul_id_to_bo needs K=kres={kres}");
         self.stats.borrow_mut().calls += 1;
         let cached = self.wcache.borrow().get(id).cloned();
         let wbo = if let Some(bo) = cached {
             bo
         } else {
             let w = make_w();
-            assert_eq!(w.nrows(), KRES, "weight nrows {} != {KRES}", w.nrows());
+            assert_eq!(w.nrows(), kres, "weight nrows {} != {kres}", w.nrows());
             assert_eq!(w.ncols(), n, "weight ncols {} != {n}", w.ncols());
             self.weight_bo(id, w.view())
         };
@@ -1907,8 +1934,8 @@ impl NpuMatmul {
         // padding (0 @ W = 0), matching the host path's clean zero-padding invariant.
         let a_std = a.as_standard_layout();
         let a_s = a_std.as_slice().unwrap();
-        let mut a_bits = vec![0u16; PAD_M * KRES]; // rows m..PAD_M stay zero
-        npu_xrt::pack_f32_to_bf16(&a_s[..m * KRES], &mut a_bits[..m * KRES]);
+        let mut a_bits = vec![0u16; PAD_M * kres]; // rows m..PAD_M stay zero
+        npu_xrt::pack_f32_to_bf16(&a_s[..m * kres], &mut a_bits[..m * kres]);
         self.bo_a.write_bytes(u16_bytes(&a_bits)).unwrap();
         self.bo_a.sync_to_device().unwrap();
         // GEMM into a FRESH device f32 BO (identity modal, NO read).
@@ -2175,6 +2202,7 @@ impl NpuMatmul {
     /// [PAD_M,KRES] device BO. Counts 2 dispatches (cast + modal); the caller counts fc1. Full fc2
     /// weight cached under "{id2}.full". Collapses the deint + 4x K=1024 GEMM + 4x acc_add.
     fn fc2_k4096_dev<F2: FnOnce() -> Array2<f32>>(&self, k4: &Fc2K4096, fc1_out: &Bo, make_w2: F2, id2: &str) -> Rc<Bo> {
+        let kres = self.kres;
         modal_site("k4.cast_kern#1");
         { let _dt = self.dtimer(); k4.cast_kern.run_matmul8(3, &k4.cast_instr, k4.cast_n, fc1_out, &k4.cast_out, &k4.cast_dc, &k4.cast_dt, &k4.cast_dr).unwrap(); }
         let wid = format!("{id2}.full");
@@ -2183,7 +2211,7 @@ impl NpuMatmul {
             bo
         } else {
             let w = make_w2();
-            assert_eq!(w.dim(), (DFF, KRES), "fc2 W2 dim");
+            assert_eq!(w.dim(), (DFF, kres), "fc2 W2 dim");
             self.weight_bo(&wid, w.view())
         };
         modal_site("k4.mm_kern#1");
@@ -2196,6 +2224,7 @@ impl NpuMatmul {
         &self, x: &Array2<f32>, gamma: &[f32], beta: &[f32],
         make_w1: F1, id1: &str, make_w2: F2, id2: &str,
     ) -> Array2<f32> {
+        let kres = self.kres;
         self.stats.borrow_mut().calls += 1;
         let m = x.nrows();
         let t_ln = Instant::now();
@@ -2208,7 +2237,7 @@ impl NpuMatmul {
             let c = self.wcache.borrow().get(id1).cloned();
             c.unwrap_or_else(|| {
                 let w = make_w1();
-                assert_eq!(w.dim(), (KRES, DFF), "fc1 W1 dim");
+                assert_eq!(w.dim(), (kres, DFF), "fc1 W1 dim");
                 self.weight_bo(id1, w.view())
             })
         };
@@ -2237,12 +2266,12 @@ impl NpuMatmul {
                         // scope this was charged to Bucket::Npu.
                         let t_rb = Instant::now();
                         bo.sync_from_device().unwrap();
-                        let mut cb = vec![0u8; m * KRES * 4];
+                        let mut cb = vec![0u8; m * kres * 4];
                         bo.read_bytes(&mut cb).unwrap();
-                        let mut out = Array2::<f32>::zeros((m, KRES));
+                        let mut out = Array2::<f32>::zeros((m, kres));
                         for r in 0..m {
-                            for c in 0..KRES {
-                                let off = (r * KRES + c) * 4;
+                            for c in 0..kres {
+                                let off = (r * kres + c) * 4;
                                 out[[r, c]] = f32::from_le_bytes([cb[off], cb[off + 1], cb[off + 2], cb[off + 3]]);
                             }
                         }
@@ -2269,17 +2298,17 @@ impl NpuMatmul {
         };
         // fc2 K-split: each K=KRES chunk is a device SUB-BUFFER of bo_deint; K=KRES modal (identity),
         // host-accumulate the `parts` partials in f32 -- bit-identical to the host K-split (WER-neutral).
-        let parts = DFF / KRES;
-        let chunk_bytes = PAD_M * KRES * 2;
+        let parts = DFF / kres;
+        let chunk_bytes = PAD_M * kres * 2;
         let need_w2 = (0..parts).any(|c| !self.wcache.borrow().contains_key(&format!("{id2}.{c}")));
         let w2 = if need_w2 {
             let w = make_w2();
-            assert_eq!(w.dim(), (DFF, KRES), "fc2 W2 dim");
+            assert_eq!(w.dim(), (DFF, kres), "fc2 W2 dim");
             Some(w)
         } else {
             None
         };
-        let mut acc = Array2::<f32>::zeros((m, KRES));
+        let mut acc = Array2::<f32>::zeros((m, kres));
         let t_fc2 = Instant::now();
         for c in 0..parts {
             let chunk = a_chunks.sub(c * chunk_bytes, chunk_bytes).unwrap();
@@ -2288,10 +2317,10 @@ impl NpuMatmul {
                 let cc = self.wcache.borrow().get(&sid).cloned();
                 cc.unwrap_or_else(|| {
                     let w = w2.as_ref().expect("w2 present on cache miss");
-                    self.weight_bo(&sid, w.slice(s![c * KRES..(c + 1) * KRES, ..]))
+                    self.weight_bo(&sid, w.slice(s![c * kres..(c + 1) * kres, ..]))
                 })
             };
-            acc += &self.dispatch_with_a(&chunk, m, &w2c, KRES, false);
+            acc += &self.dispatch_with_a(&chunk, m, &w2c, kres, false);
         }
         self.stats.borrow_mut().ffn_fc2_s += t_fc2.elapsed().as_secs_f64();
         acc
@@ -2307,10 +2336,11 @@ impl NpuMatmul {
         id1: &str, k1: usize, n1: usize, bits1: &[u16],
         id2: &str, k2: usize, n2: usize, bits2: &[u16],
     ) -> Array2<f32> {
+        let kres = self.kres;
         self.stats.borrow_mut().calls += 1;
         let m = x.nrows();
-        assert_eq!((k1, n1), (KRES, DFF), "fc1 W1 dim");
-        assert_eq!((k2, n2), (DFF, KRES), "fc2 W2 dim");
+        assert_eq!((k1, n1), (kres, DFF), "fc1 W1 dim");
+        assert_eq!((k2, n2), (DFF, kres), "fc2 W2 dim");
         let rl = self.ln_affine_cast(x, gamma, beta); // bo_bf16 = affine_LN bf16 [PAD_M,KRES]
         let w1 = {
             let c = self.wcache.borrow().get(id1).cloned();
@@ -2344,9 +2374,9 @@ impl NpuMatmul {
                 &rl.bo_deint
             }
         };
-        let parts = DFF / KRES;
-        let chunk_bytes = PAD_M * KRES * 2;
-        let mut acc = Array2::<f32>::zeros((m, KRES));
+        let parts = DFF / kres;
+        let chunk_bytes = PAD_M * kres * 2;
+        let mut acc = Array2::<f32>::zeros((m, kres));
         for c in 0..parts {
             let chunk = a_chunks.sub(c * chunk_bytes, chunk_bytes).unwrap();
             let sid = format!("{id2}.{c}");
@@ -2354,11 +2384,11 @@ impl NpuMatmul {
                 let cc = self.wcache.borrow().get(&sid).cloned();
                 cc.unwrap_or_else(|| {
                     // bits2 is row-major [DFF, KRES]; a KRES-row chunk is a contiguous slice.
-                    let part_bits = &bits2[c * KRES * KRES..(c + 1) * KRES * KRES];
-                    self.weight_bo_bf16(&sid, KRES, KRES, part_bits)
+                    let part_bits = &bits2[c * kres * kres..(c + 1) * kres * kres];
+                    self.weight_bo_bf16(&sid, kres, kres, part_bits)
                 })
             };
-            acc += &self.dispatch_with_a(&chunk, m, &w2c, KRES, false);
+            acc += &self.dispatch_with_a(&chunk, m, &w2c, kres, false);
         }
         acc
     }
@@ -2370,13 +2400,14 @@ impl NpuMatmul {
     fn ffn_dev_accum<F1: FnOnce() -> Array2<f32>, F2: FnOnce() -> Array2<f32>>(
         &self, rl: &Rc<ResidentLn>, make_w1: F1, id1: &str, make_w2: F2, id2: &str,
     ) -> Rc<Bo> {
+        let kres = self.kres;
         let aa = rl.acc_add.as_ref().expect("ffn_dev_accum without acc_add");
         // fc1: modal, A=bo_bf16, W1, on-chip SiLU -> st1.bo_c (f32 [PAD_M,DFF]) -- stays DEVICE
         let w1 = {
             let c = self.wcache.borrow().get(id1).cloned();
             c.unwrap_or_else(|| {
                 let w = make_w1();
-                assert_eq!(w.dim(), (KRES, DFF), "fc1 W1 dim");
+                assert_eq!(w.dim(), (kres, DFF), "fc1 W1 dim");
                 self.weight_bo(id1, w.view())
             })
         };
@@ -2419,17 +2450,17 @@ impl NpuMatmul {
         };
         // fc2 K-split with ON-DEVICE accumulate: each partial modal GEMM -> st.bo_c (device); acc_add
         // sums it into the acc0/acc1 ping-pong (seed acc=0 for partial0). Result stays device-resident.
-        let parts = DFF / KRES;
-        let chunk_bytes = PAD_M * KRES * 2;
+        let parts = DFF / kres;
+        let chunk_bytes = PAD_M * kres * 2;
         let need_w2 = (0..parts).any(|c| !self.wcache.borrow().contains_key(&format!("{id2}.{c}")));
         let w2 = if need_w2 {
             let w = make_w2();
-            assert_eq!(w.dim(), (DFF, KRES), "fc2 W2 dim");
+            assert_eq!(w.dim(), (DFF, kres), "fc2 W2 dim");
             Some(w)
         } else {
             None
         };
-        let st = self.stream(KRES, Act::Identity);
+        let st = self.stream(kres, Act::Identity);
         let mut cur = aa.acc0.clone();
         let mut nxt = aa.acc1.clone();
         for c in 0..parts {
@@ -2439,7 +2470,7 @@ impl NpuMatmul {
                 let cc = self.wcache.borrow().get(&sid).cloned();
                 cc.unwrap_or_else(|| {
                     let w = w2.as_ref().expect("w2 present on cache miss");
-                    self.weight_bo(&sid, w.slice(s![c * KRES..(c + 1) * KRES, ..]))
+                    self.weight_bo(&sid, w.slice(s![c * kres..(c + 1) * kres, ..]))
                 })
             };
             // modal identity GEMM: partial c -> st.bo_c (device, NO sync_from/read).
@@ -2545,15 +2576,16 @@ impl NpuMatmul {
         &self, x: &Array2<f32>, gamma: &[f32], beta: &[f32],
         make_w1: F1, id1: &str, make_w2: F2, id2: &str,
     ) -> Option<Array2<f32>> {
+        let kres = self.kres;
         let m = x.nrows();
         let acc_bo = self.resident_ffn_dev(x, gamma, beta, make_w1, id1, make_w2, id2)?;
         acc_bo.sync_from_device().unwrap();
-        let mut cb = vec![0u8; m * KRES * 4];
+        let mut cb = vec![0u8; m * kres * 4];
         acc_bo.read_bytes(&mut cb).unwrap();
-        let mut out = Array2::<f32>::zeros((m, KRES));
+        let mut out = Array2::<f32>::zeros((m, kres));
         for r in 0..m {
-            for c in 0..KRES {
-                let off = (r * KRES + c) * 4;
+            for c in 0..kres {
+                let off = (r * kres + c) * 4;
                 out[[r, c]] = f32::from_le_bytes([cb[off], cb[off + 1], cb[off + 2], cb[off + 3]]);
             }
         }
@@ -2566,6 +2598,7 @@ impl NpuMatmul {
     /// so rel-L2 must be ~0. `None` when the modal/resident/acc_add xclbins are absent. No encoder
     /// weights needed -- synthetic weights fully exercise the K-split accumulate path.
     pub fn ffn_devacc_selftest(&self, t: usize, seed: u64) -> Option<(Array2<f32>, Array2<f32>)> {
+        let kres = self.kres;
         if !self.modal || self.resident_ln()?.acc_add.is_none() {
             return None;
         }
@@ -2582,11 +2615,11 @@ impl NpuMatmul {
                 (u * 2.0 - 1.0) * scale
             })
         };
-        let x = fill(t, KRES, seed, 1.0);
-        let gamma: Vec<f32> = fill(1, KRES, seed ^ 0xA1, 0.1).iter().copied().collect();
-        let beta: Vec<f32> = fill(1, KRES, seed ^ 0xB2, 0.1).iter().copied().collect();
-        let w1 = fill(KRES, DFF, seed ^ 0xC3, 0.05);
-        let w2 = fill(DFF, KRES, seed ^ 0xD4, 0.05);
+        let x = fill(t, kres, seed, 1.0);
+        let gamma: Vec<f32> = fill(1, kres, seed ^ 0xA1, 0.1).iter().copied().collect();
+        let beta: Vec<f32> = fill(1, kres, seed ^ 0xB2, 0.1).iter().copied().collect();
+        let w1 = fill(kres, DFF, seed ^ 0xC3, 0.05);
+        let w2 = fill(DFF, kres, seed ^ 0xD4, 0.05);
         // Same ids -> the host path caches w1/w2c on first touch; the dev path hits the cache, so both
         // paths use bit-identical partials (only host-sum vs device-sum differs).
         let (w1a, w2a) = (w1.clone(), w2.clone());
@@ -2600,6 +2633,7 @@ impl NpuMatmul {
     /// Task-5 debug parity: `matmul_id` (host-read reference) vs `matmul_id_to_bo` (device-out) on the
     /// SAME synthetic ctx + weight (shared id -> same weight BO). Must be bit-identical (same GEMM).
     pub fn linout_selftest(&self, t: usize, seed: u64) -> Option<(Array2<f32>, Array2<f32>)> {
+        let kres = self.kres;
         if !self.modal {
             return None;
         }
@@ -2612,17 +2646,17 @@ impl NpuMatmul {
                 ((z >> 40) as f32 / (1u32 << 24) as f32 * 2.0 - 1.0) * sc
             })
         };
-        let ctx = fill(t, KRES, seed, 1.0);
-        let w = fill(KRES, KRES, seed ^ 0x7E, 0.05);
+        let ctx = fill(t, kres, seed, 1.0);
+        let w = fill(kres, kres, seed ^ 0x7E, 0.05);
         let host = self.matmul_id(&ctx, &w, "selftest.linout");
         let wc = w.clone();
-        let dev_bo = self.matmul_id_to_bo(&ctx, move || wc, "selftest.linout", KRES);
+        let dev_bo = self.matmul_id_to_bo(&ctx, move || wc, "selftest.linout", kres);
         dev_bo.sync_from_device().unwrap();
-        let mut cb = vec![0u8; t * KRES * 4];
+        let mut cb = vec![0u8; t * kres * 4];
         dev_bo.read_bytes(&mut cb).unwrap();
-        let mut dev = Array2::<f32>::zeros((t, KRES));
-        for r in 0..t { for c in 0..KRES {
-            let off = (r * KRES + c) * 4;
+        let mut dev = Array2::<f32>::zeros((t, kres));
+        for r in 0..t { for c in 0..kres {
+            let off = (r * kres + c) * 4;
             dev[[r, c]] = f32::from_le_bytes([cb[off], cb[off + 1], cb[off + 2], cb[off + 3]]);
         }}
         Some((host, dev))
@@ -2631,6 +2665,7 @@ impl NpuMatmul {
     /// Task-5 debug parity: `resident_conv_pw1_glu` (host-in) vs `resident_conv_pw1_glu_dev` (device-in,
     /// input uploaded) on the SAME synthetic x + weights (shared id). Must be bit-identical.
     pub fn conv_front_selftest(&self, t: usize, seed: u64) -> Option<(Array2<f32>, Array2<f32>)> {
+        let kres = self.kres;
         let rl = self.resident_ln()?;
         rl.glu.as_ref()?;
         let fill = |rows: usize, cols: usize, sd: u64, sc: f32| -> Array2<f32> {
@@ -2642,10 +2677,10 @@ impl NpuMatmul {
                 ((z >> 40) as f32 / (1u32 << 24) as f32 * 2.0 - 1.0) * sc
             })
         };
-        let x = fill(t, KRES, seed, 1.0);
-        let gv: Vec<f32> = fill(1, KRES, seed ^ 0x1A, 1.0).iter().copied().collect();
-        let bv: Vec<f32> = fill(1, KRES, seed ^ 0x2B, 0.1).iter().copied().collect();
-        let pw1 = fill(KRES, 2 * KRES, seed ^ 0x3C, 0.05);
+        let x = fill(t, kres, seed, 1.0);
+        let gv: Vec<f32> = fill(1, kres, seed ^ 0x1A, 1.0).iter().copied().collect();
+        let bv: Vec<f32> = fill(1, kres, seed ^ 0x2B, 0.1).iter().copied().collect();
+        let pw1 = fill(kres, 2 * kres, seed ^ 0x3C, 0.05);
         let pw1a = pw1.clone();
         let host = self.resident_conv_pw1_glu(&x, &gv, &bv, move || pw1a, "selftest.convpw1")?;
         let a_bo = self.upload_stream(&x);
@@ -2659,13 +2694,14 @@ impl NpuMatmul {
     /// are device f32 [PAD_M,KRES] BOs; returns the device result (ResidualAdd scratch, overwritten by
     /// the next call). `None` when the selected-scale xclbin is absent; PANICS on an unbuilt scale.
     pub fn residual_add_dev(&self, a_bo: &Bo, b_bo: &Bo, scale: f32, _m: usize) -> Option<Rc<Bo>> {
+        let kres = self.kres;
         let rl = self.resident_ln()?;
         let ra = if (scale - 0.5).abs() < 1e-6 {
             rl.resadd_s050.as_ref()?
         } else if (scale - 1.0).abs() < 1e-6 {
             rl.resadd_s100.as_ref()?
         } else {
-            panic!("residual_add_dev: scale {scale} has no built xclbin (only s050=0.5, s100=1.0); build final_resadd_{PAD_M}x{KRES}_s<stag>");
+            panic!("residual_add_dev: scale {scale} has no built xclbin (only s050=0.5, s100=1.0); build final_resadd_{PAD_M}x{kres}_s<stag>");
         };
         debug_assert!((ra.scale - scale).abs() < 1e-6);
         modal_site("ra.kern#1");
@@ -2678,6 +2714,7 @@ impl NpuMatmul {
     /// runs [`Self::residual_add_dev`], returns (host `a + scale*b`, device out) as `[t, KRES]`. f32
     /// mul+add is near-exact, so rel-L2 must be ~0. `None` when the resadd xclbin is absent.
     pub fn residual_add_selftest(&self, t: usize, seed: u64, scale: f32) -> Option<(Array2<f32>, Array2<f32>)> {
+        let kres = self.kres;
         let rl = self.resident_ln()?;
         let ra = rl.resadd_s050.as_ref()?;
         let fill = |rows: usize, cols: usize, sd: u64, sc: f32| -> Array2<f32> {
@@ -2692,14 +2729,14 @@ impl NpuMatmul {
                 (u * 2.0 - 1.0) * sc
             })
         };
-        let a = fill(t, KRES, seed, 1.0);
-        let b = fill(t, KRES, seed ^ 0x51, 1.0);
+        let a = fill(t, kres, seed, 1.0);
+        let b = fill(t, kres, seed ^ 0x51, 1.0);
         // Upload a,b into device BOs [PAD_M,KRES] f32 (first t rows real; the rest stale -> ignored).
         let mkbo = |arr: &Array2<f32>, gid: i32| -> Bo {
-            let bo = self.dev.alloc_bo(&ra.kern, PAD_M * KRES * 4, FLAG_HOST_ONLY, ra.kern.group_id(gid).unwrap()).unwrap();
-            let mut buf = vec![0f32; PAD_M * KRES];
+            let bo = self.dev.alloc_bo(&ra.kern, PAD_M * kres * 4, FLAG_HOST_ONLY, ra.kern.group_id(gid).unwrap()).unwrap();
+            let mut buf = vec![0f32; PAD_M * kres];
             let s = arr.as_standard_layout();
-            buf[..t * KRES].copy_from_slice(&s.as_slice().unwrap()[..t * KRES]);
+            buf[..t * kres].copy_from_slice(&s.as_slice().unwrap()[..t * kres]);
             bo.write_bytes(f32_bytes(&buf)).unwrap();
             bo.sync_to_device().unwrap();
             bo
@@ -2708,12 +2745,12 @@ impl NpuMatmul {
         let b_bo = mkbo(&b, 4);
         let out_bo = self.residual_add_dev(&a_bo, &b_bo, scale, t)?;
         out_bo.sync_from_device().unwrap();
-        let mut cb = vec![0u8; t * KRES * 4];
+        let mut cb = vec![0u8; t * kres * 4];
         out_bo.read_bytes(&mut cb).unwrap();
-        let mut dev = Array2::<f32>::zeros((t, KRES));
+        let mut dev = Array2::<f32>::zeros((t, kres));
         for r in 0..t {
-            for c in 0..KRES {
-                let off = (r * KRES + c) * 4;
+            for c in 0..kres {
+                let off = (r * kres + c) * 4;
                 dev[[r, c]] = f32::from_le_bytes([cb[off], cb[off + 1], cb[off + 2], cb[off + 3]]);
             }
         }
@@ -2833,6 +2870,7 @@ impl NpuMatmul {
     /// One resident-kernel dispatch: A[m,KRES] (zero-padded) @ wbo[KRES,n] -> C[m,n].
     /// `silu=true` (only fc1 / ff.l1 on the modal resident) applies the on-chip SiLU epilogue.
     fn dispatch(&self, a_km: ArrayView2<f32>, wbo: &Bo, n: usize, silu: bool) -> Array2<f32> {
+        let kres = self.kres;
         let m = a_km.nrows();
         let st = self.stream(n, if silu { Act::Silu } else { Act::Identity });
         let stage = crate::prof::phase::current_stage();
@@ -2844,8 +2882,8 @@ impl NpuMatmul {
             let _m = crate::prof::phase::PhaseScope::new(stage, crate::prof::phase::Bucket::Marshal);
             let a_std = a_km.as_standard_layout();
             let a_s = a_std.as_slice().unwrap();
-            let mut a_bits = vec![0u16; m * KRES];
-            npu_xrt::pack_f32_to_bf16(&a_s[..m * KRES], &mut a_bits);
+            let mut a_bits = vec![0u16; m * kres];
+            npu_xrt::pack_f32_to_bf16(&a_s[..m * kres], &mut a_bits);
             self.bo_a.write_bytes(u16_bytes(&a_bits)).unwrap(); // writes first m rows; rest stale (ignored)
             self.bo_a.sync_to_device().unwrap();
         }
@@ -2891,22 +2929,23 @@ impl NpuMatmul {
     /// C[m,n] = A[m,k] @ B[k,n] on the NPU; `id` keys the weight-BO cache. K=1024 dispatches
     /// directly on the resident kernel; K=4096 is K-split into 4× K=1024 partials (host-accumulated).
     pub fn matmul_id(&self, a: &Array2<f32>, b: &Array2<f32>, id: &str) -> Array2<f32> {
+        let kres = self.kres;
         let (m, k) = a.dim();
         let (kb, n) = b.dim();
         assert_eq!(k, kb);
         assert!(m <= PAD_M);
         self.stats.borrow_mut().calls += 1;
 
-        if k == KRES {
+        if k == kres {
             let wbo = self.weight_bo(id, b.view());
             return self.dispatch(a.view(), &wbo, n, false);
         }
-        assert_eq!(k % KRES, 0, "K={k} not a multiple of {KRES}");
+        assert_eq!(k % kres, 0, "K={k} not a multiple of {kres}");
         assert_eq!(n, 1024, "K-split path assumes N=1024 (ff.l2)");
-        let parts = k / KRES;
+        let parts = k / kres;
         // Per-partial weight comes straight from the passed `b` (packed/cached on first touch).
         self.ksplit_dispatch(a, n, parts, |i| {
-            self.weight_bo(&format!("{id}.{i}"), b.slice(s![i * KRES..(i + 1) * KRES, ..]))
+            self.weight_bo(&format!("{id}.{i}"), b.slice(s![i * kres..(i + 1) * kres, ..]))
         })
     }
 
@@ -2915,10 +2954,11 @@ impl NpuMatmul {
     /// from a bf16-baked `NPU_WEIGHTS_CHECKPOINT` tensor (verbatim layout, no transpose), so this skips
     /// the host f32->bf16 pack entirely on a cache miss.
     pub fn matmul_id_bf16(&self, a: &Array2<f32>, id: &str, k: usize, n: usize, bits: &[u16]) -> Array2<f32> {
+        let kres = self.kres;
         let (m, ka) = a.dim();
         assert_eq!(ka, k);
         assert!(m <= PAD_M);
-        assert_eq!(k, KRES, "matmul_id_bf16 is single-dispatch only (K=KRES)");
+        assert_eq!(k, kres, "matmul_id_bf16 is single-dispatch only (K=kres)");
         self.stats.borrow_mut().calls += 1;
         let cached = self.wcache.borrow().get(id).cloned();
         let wbo = cached.unwrap_or_else(|| self.weight_bo_bf16(id, k, n, bits));
@@ -2931,11 +2971,12 @@ impl NpuMatmul {
     /// weight is skipped entirely. `id` keys the weight-BO cache (same keying as `matmul_id`, so the
     /// two are interchangeable per call site). `a`'s ncols selects the K path (K=weight nrows).
     pub fn matmul_id_lazy<F: FnOnce() -> Array2<f32>>(&self, a: &Array2<f32>, make_b: F, id: &str) -> Array2<f32> {
+        let kres = self.kres;
         let (m, k) = a.dim();
         assert!(m <= PAD_M);
         self.stats.borrow_mut().calls += 1;
 
-        if k == KRES {
+        if k == kres {
             // single-dispatch path: need the weight BO + its N. On a hit, read N from ncache and
             // never touch make_b; on a miss, build the weight, then pack+cache it.
             let cached = self.wcache.borrow().get(id).cloned();
@@ -2945,15 +2986,15 @@ impl NpuMatmul {
             } else {
                 let b = make_b();
                 let n = b.ncols();
-                assert_eq!(b.nrows(), KRES, "lazy K={k} weight nrows {} != {KRES}", b.nrows());
+                assert_eq!(b.nrows(), kres, "lazy K={k} weight nrows {} != {kres}", b.nrows());
                 (self.weight_bo(id, b.view()), n)
             };
             return self.dispatch(a.view(), &wbo, n, false);
         }
         // K-split: if ALL of {id}.0..parts-1 are cached, dispatch without make_b; else build `b`
         // once and pack the partials from it (identical to matmul_id's packing).
-        assert_eq!(k % KRES, 0, "K={k} not a multiple of {KRES}");
-        let parts = k / KRES;
+        assert_eq!(k % kres, 0, "K={k} not a multiple of {kres}");
+        let parts = k / kres;
         let all_cached = (0..parts).all(|i| self.wcache.borrow().contains_key(&format!("{id}.{i}")));
         let b_opt: Option<Array2<f32>> = if all_cached { None } else { Some(make_b()) };
         let n = if let Some(ref b) = b_opt {
@@ -2970,7 +3011,7 @@ impl NpuMatmul {
                 bo
             } else {
                 let b = b_opt.as_ref().expect("b_opt present on cache miss");
-                self.weight_bo(&pid, b.slice(s![i * KRES..(i + 1) * KRES, ..]))
+                self.weight_bo(&pid, b.slice(s![i * kres..(i + 1) * kres, ..]))
             }
         })
     }
@@ -2982,9 +3023,10 @@ impl NpuMatmul {
     /// plain resident (`modal=false`) the epilogue is a no-op (`silu` flag ignored by `stream`), so
     /// the caller falls back to host silu; use [`Self::modal`] to branch.
     pub fn matmul_id_lazy_silu<F: FnOnce() -> Array2<f32>>(&self, a: &Array2<f32>, make_b: F, id: &str) -> Array2<f32> {
+        let kres = self.kres;
         let (m, k) = a.dim();
         assert!(m <= PAD_M);
-        assert_eq!(k, KRES, "matmul_id_lazy_silu is single-dispatch only (fc1 K={KRES})");
+        assert_eq!(k, kres, "matmul_id_lazy_silu is single-dispatch only (fc1 K={kres})");
         self.stats.borrow_mut().calls += 1;
         let cached = self.wcache.borrow().get(id).cloned();
         let (wbo, n) = if let Some(bo) = cached {
@@ -2993,7 +3035,7 @@ impl NpuMatmul {
         } else {
             let b = make_b();
             let n = b.ncols();
-            assert_eq!(b.nrows(), KRES, "lazy-silu K={k} weight nrows {} != {KRES}", b.nrows());
+            assert_eq!(b.nrows(), kres, "lazy-silu K={k} weight nrows {} != {kres}", b.nrows());
             (self.weight_bo(id, b.view()), n)
         };
         self.dispatch(a.view(), &wbo, n, true)
@@ -3004,6 +3046,7 @@ impl NpuMatmul {
     /// yields the cached/packed weight BO for partial i (lazy per-partial so the first partial's
     /// pack overlaps nothing, matching the original). Numerics identical across callers.
     fn ksplit_dispatch<G: Fn(usize) -> Rc<Bo>>(&self, a: &Array2<f32>, n: usize, parts: usize, get_w: G) -> Array2<f32> {
+        let kres = self.kres;
         let m = a.nrows();
         let st = self.stream(n, Act::Identity); // ff.l2 K-split output has no activation (identity epilogue)
         // Phase-timing stage label for this K-split op; each partial's pack/read is Marshal and
@@ -3014,8 +3057,8 @@ impl NpuMatmul {
         let pack_into = |slot: &PipeSlot, a_p: ArrayView2<f32>| {
             let _m = crate::prof::phase::PhaseScope::new(stage, crate::prof::phase::Bucket::Marshal);
             let a_std = a_p.as_standard_layout();
-            let mut bits = vec![0u16; m * KRES];
-            npu_xrt::pack_f32_to_bf16(&a_std.as_slice().unwrap()[..m * KRES], &mut bits);
+            let mut bits = vec![0u16; m * kres];
+            npu_xrt::pack_f32_to_bf16(&a_std.as_slice().unwrap()[..m * kres], &mut bits);
             slot.bo_a.write_bytes(u16_bytes(&bits)).unwrap();
             slot.bo_a.sync_to_device().unwrap();
         };
@@ -3043,7 +3086,7 @@ impl NpuMatmul {
 
         // submit partial 0
         let w0 = get_w(0);
-        pack_into(&self.slots[0], a.slice(s![.., 0..KRES]));
+        pack_into(&self.slots[0], a.slice(s![.., 0..kres]));
         let t0 = Instant::now();
         let mut prev_run = submit(&self.slots[0], &w0);
         let mut prev_slot = 0usize;
@@ -3051,7 +3094,7 @@ impl NpuMatmul {
         for i in 1..parts {
             let slot = i % 2;
             let wi = get_w(i);
-            pack_into(&self.slots[slot], a.slice(s![.., i * KRES..(i + 1) * KRES])); // overlaps prev NPU exec
+            pack_into(&self.slots[slot], a.slice(s![.., i * kres..(i + 1) * kres])); // overlaps prev NPU exec
             let cur_run = submit(&self.slots[slot], &wi);
             {
                 let _d = crate::prof::phase::PhaseScope::new(stage, crate::prof::phase::Bucket::Npu);
