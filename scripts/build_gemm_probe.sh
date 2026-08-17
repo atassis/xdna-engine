@@ -28,30 +28,27 @@ GEN="$REPO/route_b_kernels/decode_fused/gen_gemm_probe.py"
 [ -x "$AIEBU_DIR/aiebu-asm" ] || { echo "ERROR: aiebu-asm not at $AIEBU_DIR"; exit 1; }
 [ -f "$WEIGHTS/L0/fc1.weight.npy" ] || { echo "ERROR: weights not at $WEIGHTS"; exit 1; }
 
-# GEMM fusion-prefix + M-stationary need the atassis/IRON fork API (gemm-fusion-prefix for any GEMM
-# under FusedMLIROperator; m-stationary is the opt-in --m-stationary mode, default N-stationary
-# unchanged). Originally hard-pinned to branch xdna2-asr; post-toolchain-bump the shared IRON checkout
-# moved to `integration-stack` (branch consolidation, see toolchain.lock). Accept either -- verify the
-# API surface directly (class defs) instead of trusting a branch name, since that is what actually
-# matters and branch names have already drifted once (2026-07-30, probe worktree).
-on="$(git -C "$IRON" rev-parse --abbrev-ref HEAD 2>/dev/null)"
-merge_base_ok=0
-for ref in xdna2-asr integration-stack; do
-  git -C "$IRON" merge-base --is-ancestor "$ref" HEAD 2>/dev/null && merge_base_ok=1
-done
-[ "$merge_base_ok" = 1 ] || [ "$on" = xdna2-asr ] || [ "$on" = integration-stack ] || {
-  echo "ERROR: $IRON ('$on') is not based on xdna2-asr or integration-stack"; exit 1; }
-python3 -c "
-import ast,sys
-for f,cls in [('$IRON/iron/common/fusion.py','FusedMLIROperator'),('$IRON/iron/operators/gemm/op.py','GEMM')]:
-    src=open(f).read()
-    assert f'class {cls}' in src, f'{cls} missing from {f}'
-" || { echo "ERROR: IRON API surface check failed (gen_gemm_probe.py deps)"; exit 1; }
-echo "[build] IRON on $on @ $(git -C "$IRON" rev-parse --short HEAD) (API surface verified)"
+# GEMM fusion-prefix + M-stationary need the fork API (gemm-fusion-prefix for any GEMM under
+# FusedMLIROperator; m-stationary is the opt-in --m-stationary mode, default N-stationary unchanged).
+# This script pioneered checking the API surface instead of a branch name, after names drifted once
+# (2026-07-30, probe worktree); iron_require_api in amd_paths.sh is that check, now shared.
+iron_at="$(iron_require_api "gen_gemm_probe.py" \
+  "iron/common/fusion.py:class FusedMLIROperator" \
+  "iron/operators/gemm/op.py:class GEMM" \
+  "iron/operators/gemm/op.py:m_stationary")" || exit 1
+echo "[build] IRON on $iron_at (API surface verified)"
 
 export PATH="$VENV_IRON/bin:$VENV_IRON/cc-shim:$AIEBU_DIR:$PATH"
 export PEANO_INSTALL_DIR="$VENV_IRON/lib/python3.14/site-packages/llvm-aie"
-export PYTHONPATH="$IRON:$(dirname "$GEN")${PYTHONPATH:+:$PYTHONPATH}"
+
+# Resolve `aie` and aiecc from the FORK INSTANCE at the committed pin, as build_deepc_decode.sh does.
+# Without $INST/python first, `aie` resolved through .venv-iron's aie.pth, which hardcodes ONE instance
+# dir -- so this script silently built against whatever instance that file last pointed at rather than
+# the pin, and said nothing. Measured 2026-08-17: aie.pth -> bf76a7f17b5d while the pin was 185212afd5ca.
+INST="$("$REPO/scripts/toolchain_up.sh")"
+export PYTHONPATH="$INST/python:$IRON:$(dirname "$GEN")${PYTHONPATH:+:$PYTHONPATH}"
+export AIECC_PATH="${AIECC_PATH:-$INST/bin/aiecc}"
+[ -x "$AIECC_PATH" ] || { echo "ERROR: instance aiecc not at $AIECC_PATH (run scripts/toolchain_up.sh)"; exit 1; }
 
 for N in $NS; do
   OUT="${OUT_ROOT}${SUF}_N${N}"

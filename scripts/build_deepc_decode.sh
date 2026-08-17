@@ -31,11 +31,13 @@ GEN="$REPO/route_b_kernels/decode_fused/gen_decode.py"
 [ -d "$IRON/iron" ] || { echo "ERROR: amd/IRON not at $IRON"; exit 1; }
 command -v "$AIEBU_DIR/aiebu-asm" >/dev/null || [ -x "$AIEBU_DIR/aiebu-asm" ] || { echo "ERROR: aiebu-asm not at $AIEBU_DIR"; exit 1; }
 
-# IRON delta (deep-C scratchpad + the rest) = the atassis/IRON:xdna2-asr fork branch (commits, not .patch).
-# Require the checkout to be on it -- no more git-apply over a shared tree.
-on="$(git -C "$IRON" rev-parse --abbrev-ref HEAD 2>/dev/null)"
-[ "$on" = xdna2-asr ] || { echo "ERROR: $IRON must be on the xdna2-asr fork branch (got '$on'). Run: git -C \"$IRON\" checkout xdna2-asr"; exit 1; }
-echo "[build] IRON on xdna2-asr @ $(git -C "$IRON" rev-parse --short HEAD)"
+# IRON delta (deep-C scratchpad + the rest) lives as COMMITS on the fork, not as a .patch. Gate on the
+# symbols gen_decode.py imports rather than a branch name -- see iron_require_api in amd_paths.sh.
+iron_at="$(iron_require_api "gen_decode.py (deep-C)" \
+  "iron/common/fusion.py:class FusedMLIROperator" \
+  "iron/common/fusion.py:def load_elf" \
+  "iron/operators/strided_copy/op.py:output_offset_parameter")" || exit 1
+echo "[build] IRON on $iron_at (API surface verified)"
 
 export PATH="$VENV_IRON/bin:$VENV_IRON/cc-shim:$AIEBU_DIR:$PATH"
 export PEANO_INSTALL_DIR="$VENV_IRON/lib/python3.14/site-packages/llvm-aie"

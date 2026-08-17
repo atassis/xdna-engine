@@ -83,11 +83,15 @@ log "\n################  STEP 0 — build coalesced ELF (new 1.3.2 stack)  #####
 if [ ! -f "$BASE_DIR/decode.elf" ]; then
   log "[ERR] baseline ELF missing: $BASE_DIR/decode.elf (deep-C resident baseline — build via scripts/build_deepc_decode.sh 12). Aborting."; exit 1
 fi
-# The lever-3 transpose num_batches change is now a COMMIT on the atassis/IRON:xdna2-asr fork branch
-# (with the deep-C base + the rest). Require the checkout to be on it -- no more .patch apply.
-on="$(git -C "$IRON" rev-parse --abbrev-ref HEAD 2>/dev/null)"
-[ "$on" = xdna2-asr ] || { log "[ERR] $IRON must be on xdna2-asr (got '$on'). Run: git -C \"$IRON\" checkout xdna2-asr"; exit 1; }
-log "[iron] IRON on xdna2-asr @ $(git -C "$IRON" rev-parse --short HEAD)"
+# The lever-3 transpose num_batches change is a COMMIT on the fork (with the deep-C base + the rest).
+# Gate on the symbol, not a branch name -- see iron_require_api in amd_paths.sh. build_deepc_decode.sh
+# re-checks its own surface below; this is the fast pre-check so the A/B fails before the rust build.
+if ! iron_at="$(iron_require_api "lever3 coalesce A/B" \
+  "iron/operators/transpose/op.py:coalesce_batch_dma" \
+  "iron/common/fusion.py:class FusedMLIROperator")"; then
+  log "[ERR] IRON API surface check failed -- see stderr above"; exit 1
+fi
+log "[iron] IRON on $iron_at (API surface verified)"
 log "[build] building coalesced 12-layer ELF -> $COAL_DIR via build_deepc_decode.sh (compile-only) ..."
 if bash "$WT/scripts/build_deepc_decode.sh" 12 "$COAL_DIR" >>"$LOG" 2>&1; then
   log "[build] coalesced ELF OK: $(ls -la "$COAL_DIR/decode.elf" | awk '{print $5" bytes"}')"
