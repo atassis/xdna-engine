@@ -7,8 +7,15 @@
 # is the host's param handling.
 #
 # Greedy argmax per step -> the token sequence is a hard equality, not a tolerance. NOT a WER gate:
-# the 17-clip WER is chaotic at ~1e-5 and is never the bar. Input is fixed-seed synthetic encoder
-# hidden states (whisper-small has no mel preprocessor.onnx here, and the decoder is what is tested).
+# the 17-clip WER is chaotic at ~1e-5 and is never the bar. Input is the SAVED REAL encoder output
+# (refs/encoded.npy) -- whisper-small has no mel preprocessor.onnx here, and the decoder is what is
+# tested. Fixed-seed synthetic states are NOT usable as the gate: they decode to a 2-token constant
+# that a broadly wrong cache also reproduces (the bin keeps them behind --synthetic).
+#
+# ALSO REPORTS THE SPEED NUMBER, from the same run and so at no extra device cost: the bin times
+# fd.step() alone per step. Arms are timed back-to-back in one quiesced window, and the drift control
+# is that each arm runs TWICE in A,B,B,A order -- if an arm's two medians differ by more than the
+# base-vs-tr delta, the delta is drift and not the arm.
 #
 #   bash scripts/tcache_e2e_parity.sh [BASE_DIR] [TR_DIR] [STEPS]
 set -uo pipefail
@@ -46,14 +53,31 @@ echo "[gate] $STEPS steps/arm, base=$BASE tr=$TR"
 
 # Single-tenant NPU. `systemctl is-active` is NOT the check -- it prints inactive for a service
 # running as a plain process too; fuser + pgrep are.
-echo "[svc] stopping xdna-engine + voxd ..."
-systemctl --user stop xdna-engine.service voxd.service >/dev/null 2>&1
-restart(){ systemctl --user start xdna-engine.service voxd.service >/dev/null 2>&1
-           sleep 2
-           local code; code=$(curl -s -m 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:11434/ 2>/dev/null || echo 000)
-           # any HTTP response means it is serving; `/` is not a route, so 404 is healthy.
-           if [ "$code" = "000" ]; then echo "[svc] WARNING: :11434 not answering (code=$code)"
-           else echo "[svc] restarted; :11434 answering (code=$code)"; fi; }
+# The voice daemon's unit is npu-vox.service. Scripts here inherited `voxd.service`, which does not
+# exist on this box (`systemctl --user stop voxd.service` is a silent no-op, rc ignored), so the
+# daemon stayed UP through timed runs and the single-tenant claim was nominal. Naming a unit that
+# cannot be verified is the same silent failure as a stopped one.
+SVC="xdna-engine.service npu-vox.service"
+echo "[svc] stopping $SVC ..."
+# shellcheck disable=SC2086
+systemctl --user stop $SVC >/dev/null 2>&1
+restart(){ # shellcheck disable=SC2086
+           systemctl --user start $SVC >/dev/null 2>&1
+           # POLL, do not sleep-once: the engine takes ~4 s to answer here, so a fixed `sleep 2`
+           # reported it down (or, with the old check, silently "up") on a box that was merely slow.
+           local code=""
+           for _ in $(seq 15); do
+             # -w always prints a code (000 = no connection), so a `|| echo 000` fallback concatenates
+             # into "000000" and silently passes an equality test against "000" -- report it healthy
+             # while it is down. Test what curl printed, and nothing else.
+             code=$(curl -s -m 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:11434/ 2>/dev/null)
+             # any HTTP response means it is serving; `/` is not a route, so 404 is healthy.
+             case "$code" in ""|000) sleep 1 ;; *) break ;; esac
+           done
+           case "$code" in
+             ""|000) echo "[svc] WARNING: :11434 not answering (code=${code:-none}) -- restart it by hand" ;;
+             *)      echo "[svc] restarted; :11434 answering (code=$code)" ;;
+           esac; }
 trap restart EXIT
 for _ in $(seq 10); do pgrep -f 'npu serve' >/dev/null 2>&1 || break; sleep 1; done
 if fuser /dev/accel/accel0 >/dev/null 2>&1 || pgrep -f 'npu serve' >/dev/null 2>&1; then
@@ -68,8 +92,15 @@ run(){ # $1 label  $2 dir
   echo "[run] $1 rc=$rc steps=$(wc -l < "$OUT/$1.ids") $(grep -c . "$OUT/$1.err" >/dev/null && grep -m1 '^\[enc\]' "$OUT/$1.err")"
   return $rc
 }
+# A,B,B,A: the repeat of each arm is the drift control for the timing half. Parity is gated on the
+# first pair; base-vs-base2 doubles as a determinism check on the harness itself.
 run base "$BASE" || { echo "[ERR] baseline arm failed:"; tail -20 "$OUT/base.err"; exit 1; }
 run tr   "$TR"   || { echo "[ERR] tr arm failed:";       tail -20 "$OUT/tr.err";   exit 1; }
+run tr2  "$TR"   || { echo "[ERR] tr arm (repeat) failed:";       tail -20 "$OUT/tr2.err";  exit 1; }
+run base2 "$BASE" || { echo "[ERR] baseline arm (repeat) failed:"; tail -20 "$OUT/base2.err"; exit 1; }
+cmp -s "$OUT/base.ids" "$OUT/base2.ids" \
+  && echo "[det] baseline reruns bit-identical" \
+  || echo "[det] WARNING: baseline is NOT run-to-run deterministic -- treat the parity gate with suspicion"
 
 echo "=============== TOKEN PARITY ==============="
 # Report WHAT diverged, not just pass/fail: a hash-only difference means the numerics moved while
@@ -99,5 +130,35 @@ for i in hash_bad[:10]:
 sys.exit(1)
 PY
 rc=$?
+
+echo "=============== PER-STEP SPEED ==============="
+grep -h '^\[time\]' "$OUT"/base.err "$OUT"/tr.err "$OUT"/tr2.err "$OUT"/base2.err 2>/dev/null \
+  | sed 's/^/  /' || true
+# The verdict is deliberately conservative: a delta the drift control cannot separate from run-to-run
+# noise is reported as NO MEASURABLE DIFFERENCE, not as a win.
+python3 - "$OUT" <<'PY'
+import re, sys, pathlib
+out = pathlib.Path(sys.argv[1])
+def median(label):
+    p = out / f"{label}.err"
+    if not p.exists(): return None
+    m = re.search(r'\[time\].*?median=([\d.]+) ms', p.read_text(), re.S)
+    return float(m.group(1)) if m else None
+b1, b2, t1, t2 = (median(x) for x in ("base", "base2", "tr", "tr2"))
+if None in (b1, b2, t1, t2):
+    print(f"[speed] incomplete timing (base={b1},{b2} tr={t1},{t2})"); sys.exit(0)
+base, tr = (b1 + b2) / 2, (t1 + t2) / 2
+delta, spread = tr - base, max(abs(b1 - b2), abs(t1 - t2))
+print(f"[speed] baseline median {base:.3f} ms/step (runs {b1:.3f}, {b2:.3f})")
+print(f"[speed] tr arm   median {tr:.3f} ms/step (runs {t1:.3f}, {t2:.3f})")
+print(f"[speed] delta {delta:+.3f} ms/step ({100 * delta / base:+.2f}%); "
+      f"drift control (worst same-arm spread) {spread:.3f} ms")
+if abs(delta) <= spread:
+    print("[speed] VERDICT: NO MEASURABLE DIFFERENCE -- |delta| is within run-to-run drift, so this "
+          "run does not support a speed claim in either direction.")
+else:
+    print(f"[speed] VERDICT: {'REGRESSION' if delta > 0 else 'WIN'} of {abs(delta):.3f} ms/step, "
+          f"{abs(delta) / spread:.1f}x the drift control.")
+PY
 echo "artifacts: $OUT"
 exit $rc

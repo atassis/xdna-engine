@@ -17,6 +17,7 @@
 
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::time::Instant;
 
 use ndarray::Array2;
 use npu_engine::asr::whisper_decoder::{FusedDecoder, WhisperDecoderWeights};
@@ -25,6 +26,9 @@ use npu_xrt::Device;
 const D: usize = 768;
 const T_ENC: usize = 1500;
 const SOT: i64 = 50258; // <|startoftranscript|>
+/// Steps dropped from the latency summary. The first dispatch of a resident ELF pays one-off costs
+/// (page-in, first BD program) that are not per-token cost; they belong in a load number, not here.
+const WARMUP: usize = 8;
 
 /// Deterministic SplitMix64 -> uniform f32 in [-1, 1). The seed is fixed so both arms are fed the
 /// same encoder states without having to materialise them to disk.
@@ -38,6 +42,47 @@ impl Rng {
         z ^= z >> 31;
         ((z >> 40) as f32 / 8_388_608.0) - 1.0
     }
+}
+
+/// Per-step latency to stderr (stdout stays the `argmax:hash` stream the parity gate parses), so one
+/// device run yields both the correctness gate and the speed number.
+///
+/// Median, not mean: the arm-vs-arm delta under test is smaller than a single scheduler hiccup, which
+/// moves a mean and not a median. The per-block medians are reported because a transposed cache that
+/// advances one column per token could plausibly cost more as occupancy grows — a whole-run median
+/// would average exactly that away.
+fn report_latency(lat_us: &[u64]) {
+    if lat_us.len() <= WARMUP {
+        eprintln!("[time] {} steps <= warmup {WARMUP}; no latency summary", lat_us.len());
+        return;
+    }
+    let timed = &lat_us[WARMUP..];
+    let mut s: Vec<u64> = timed.to_vec();
+    s.sort_unstable();
+    let ms = |us: u64| us as f64 / 1000.0;
+    let pct = |q: f64| ms(s[((s.len() - 1) as f64 * q).round() as usize]);
+    let total: u64 = timed.iter().sum();
+    eprintln!(
+        "[time] steps={} (warmup {WARMUP} dropped) median={:.3} ms p10={:.3} p90={:.3} \
+         min={:.3} max={:.3} mean={:.3} total={:.1} ms",
+        timed.len(),
+        pct(0.5),
+        pct(0.10),
+        pct(0.90),
+        ms(s[0]),
+        ms(s[s.len() - 1]),
+        ms(total / timed.len() as u64),
+        ms(total),
+    );
+    let blocks: Vec<String> = timed
+        .chunks((timed.len() + 3) / 4)
+        .map(|c| {
+            let mut b: Vec<u64> = c.to_vec();
+            b.sort_unstable();
+            format!("{:.3}", ms(b[b.len() / 2]))
+        })
+        .collect();
+    eprintln!("[time] quarter medians (ms, growth with cache occupancy): {}", blocks.join(" "));
 }
 
 /// FNV-1a over the logit bytes: a bit-exact fingerprint of the whole vector, so a divergence that
@@ -85,8 +130,13 @@ fn main() {
     fd.precompute_cross(&enc);
 
     let mut token = SOT;
+    let mut lat_us: Vec<u64> = Vec::with_capacity(steps);
     for pos in 0..steps {
+        // Time the dispatch alone: the argmax and the FNV hash below are harness cost, and hashing
+        // 51865 f32 per step is not small next to one decode step.
+        let t0 = Instant::now();
         let logits = fd.step(token, pos);
+        lat_us.push(t0.elapsed().as_micros() as u64);
         // total_cmp, not partial_cmp: a NaN logit must fail as a token mismatch, not a panic that
         // looks like a harness bug.
         token = logits
@@ -97,4 +147,5 @@ fn main() {
             .expect("empty logits");
         println!("{token}:{:016x}", fnv1a(&logits));
     }
+    report_latency(&lat_us);
 }
