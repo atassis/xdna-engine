@@ -692,6 +692,22 @@ def my_matmul(
     )
 
     my_program = Program(dev_ty, rt, workers=workers)
+    # Per-op occupancy instrument. `trace_size=0` (production) leaves the design byte-identical.
+    # Trace ONE worker: every worker runs the identical tile loop, so one is representative.
+    #
+    # DOES NOT ROUTE TODAY, at any width -- this design streams A/B/C through the shim on every
+    # column it uses, leaving trace egress no free channel. Measured 2026-08-17 on the pinned
+    # toolchain, N=1024: cols=1/2 fail `aie.packet_flow ... Trace0 could not be routed to
+    # destination (c, 0) DMA1`, cols=4 `aie.masterset ... same destination South: 3`, cols=8
+    # `Unable to find a legal routing`. egress_shim_col is NOT the lever: 1 and 0 both fail and
+    # only move the reported destination column. Kept wired because the failure is the useful
+    # signal -- before this, --trace_size was accepted and silently dropped, so PROFILE=trace
+    # produced a byte-identical untraced xclbin. Freeing a shim port (C to memtile) is the
+    # candidate fix, not a flag here.
+    if trace_size:
+        my_program.enable_trace(
+            trace_size=trace_size, workers=[workers[0]], egress_shim_col=0
+        )
     # seq_fn now runs at resolve time, so the tap lists are only populated after
     # this call -- generate_taps must return AFTER it, not before.
     module = my_program.resolve_program()
