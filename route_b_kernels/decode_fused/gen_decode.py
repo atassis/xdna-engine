@@ -334,6 +334,19 @@ def main():
             weights_to_write[pre + "s_cq"] = bf16(s_cq)  # per-channel qc scale; host overwrites per utterance
         if int8_cv:
             weights_to_write[pre + "s_cv"] = bf16(s_cv)  # per-channel ctc scale; host overwrites per utterance
+        if co_self_tr:
+            # M0.5: the staged pair must ENTER the run already holding the cache's (base, base+1)
+            # columns, base = first_token & ~1. The carried slot is written back to the cache
+            # verbatim, so with an ODD first column it lands on column base -- a VALID preceding
+            # token -- and a zeroed pair silently destroys it, permanently. Seeding from the cache
+            # is right for both parities: an even first column reads two unwritten (zero) columns.
+            # The HOST owes the same priming whenever it seeds the cache and resumes at an odd
+            # column, which is why this buffer is exported rather than left internal.
+            # MEASURED at P=5 (verify_tcache_parity.py): unseeded, column 4 diverges from the
+            # non-tr arm on the first dispatch and never recovers; from an even column the same
+            # ELF is bit-identical over all 448 columns.
+            b = P & ~1
+            weights_to_write[pre + "vpair"] = vc.transpose(0, 2, 1)[:, :, b:b + 2].copy().reshape(-1)
         patch_offsets_names += [pre + "kcache", pre + "vcache"]
         # explicit sizes for sliced/cache/score buffers
         bufsz.update({
@@ -582,7 +595,10 @@ def main():
         # even base: `vcache_off` (addr) = n_self & ~1, NOT n_self -- an odd element offset truncates down
         # into the 4-byte granule -- and `v_par` (core) = n_self & 1, the slot the token writes. kv_off
         # stays n_self*HD. Writing n_self into vcache_off is the failure mode to look for: even tokens
-        # still land and odd ones overwrite their predecessor.
+        # still land and odd ones overwrite their predecessor. And (c) whenever it seeds the vcache and
+        # RESUMES at an odd column, prime L*_vpair with that column's existing pair -- vcache[:, :,
+        # (n_self & ~1) : (n_self & ~1) + 2] -- or the pair's unwritten slot is written back over the
+        # preceding token's column. gen_decode emits a correctly-seeded L*_vpair for its own P.
         "coalesce_self_tr": bool(co_self_tr),
         **({"vcache_param": "vcache_off", "vparity_param": "v_par"} if co_self_tr else {}),
         # int8 cross-K (per-utterance per-channel): L*_Kenc are int8 [H,TP,HD]; the host quantizes Kenc per
