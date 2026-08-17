@@ -559,9 +559,17 @@ struct ResidentState {
     sm_off_byte: usize,
     sm_core: bool,
     head_dim: u32,
-    /// M0.5 (--coalesce-self-tr): byte offset of the 2nd addr scratchpad `vcache_off` (= n_self, the
-    /// transposed-vcache write column). `None` = deep-C layout ([H,S,HD], no transposed write).
+    /// M0.5 (--coalesce-self-tr): byte offset of the 2nd addr scratchpad `vcache_off`, written
+    /// `n_self & !1` — the EVEN base of the staged column pair. Writing plain `n_self` MEASURES
+    /// IDENTICAL (an odd element offset truncates down into the 4-byte granule, landing the DMA on
+    /// the same address), so the mask is the stated contract, not a fix for an observed break.
+    /// `None` = deep-C layout ([H,S,HD], no transposed write).
     vcache_off_byte: Option<usize>,
+    /// M0.5: byte offset of the `v_par` scratchpad = `n_self & 1`, the slot of the staged pair this
+    /// token writes. This is the load-bearing half of the pair: suppressing it diverges from the
+    /// baseline arm at step 1 (measured). Set together with `vcache_off_byte` or not at all.
+    vpar_off_byte: Option<usize>,
+    vpar_core: bool,
 }
 
 /// Per-token dispatch handle: either a freshly-registered ELF (own hw_context, the original
@@ -793,6 +801,10 @@ pub struct FusedDecoder {
     /// [H,HD,TP] (dropping the per-token op_tr_c cross-V transpose, the #1 inter-op round-trip), so
     /// `precompute_cross` must write each L*_Venc in that layout. Default false = deep-C [H,TP,HD].
     coalesce_cross: bool,
+    /// M0.5 (meta `coalesce_self_tr`): the self-V cache is stored TRANSPOSED [H,HD,S] and advanced
+    /// one column per token through a staged pair, so the per-layer `L*_vpair` buffers are live
+    /// carry state that has to be cleared alongside the caches. Default false.
+    coalesce_self_tr: bool,
     /// int8 cross-K (meta `int8_cross_k`): quantize each per-utterance Kenc to int8 with the fixed
     /// per-layer `cross_k_scales` (s_k folded into mat_cq at build, so it cancels) + write int8 bytes into
     /// the bf16-typed Kenc buffer (halves its LPDDR re-read). Default false.
@@ -946,6 +958,7 @@ impl FusedDecoder {
         let patcher = FusedElfPatcher::build(&base_elf, &kv_offsets, head_dim);
         let t_enc = meta["dims"]["T_enc"].as_u64().expect("dims.T_enc") as usize;
         let coalesce_cross = meta.get("coalesce_cross").and_then(|v| v.as_bool()).unwrap_or(false);
+        let coalesce_self_tr = meta.get("coalesce_self_tr").and_then(|v| v.as_bool()).unwrap_or(false);
         let int8_cross_k = meta.get("int8_cross_k").and_then(|v| v.as_bool()).unwrap_or(false);
         if int8_cross_k {
             eprintln!("[whisper_decoder] int8_cross_k: per-utterance per-channel Kenc int8 (s_cq -> op_mul_cq on qc)");
@@ -977,9 +990,22 @@ impl FusedDecoder {
             let kv_off_byte = pget(kv_name, "byte_offset").as_u64().expect("kv byte_offset") as usize;
             let sm_off_byte = pget(sm_name, "byte_offset").as_u64().expect("sm byte_offset") as usize;
             let sm_core = pget(sm_name, "kind").as_str() == Some("core");
-            // M0.5: optional 2nd addr scratchpad for the transposed self-vcache write column (= n_self).
+            // M0.5: the transposed self-V cache advances through TWO params and they are a unit —
+            // `vcache_off` (addr) = the even column base, `v_par` (core) = the slot this token
+            // writes. Driving one without the other is silently wrong, so require both exactly when
+            // the meta declares the arm.
             let vcache_off_byte = meta.get("vcache_param").and_then(|v| v.as_str())
                 .map(|name| pget(name, "byte_offset").as_u64().expect("vcache byte_offset") as usize);
+            let vpar_name = meta.get("vparity_param").and_then(|v| v.as_str());
+            let vpar_off_byte = vpar_name
+                .map(|name| pget(name, "byte_offset").as_u64().expect("v_par byte_offset") as usize);
+            let vpar_core = vpar_name.is_some_and(|n| pget(n, "kind").as_str() == Some("core"));
+            assert_eq!(
+                coalesce_self_tr,
+                vcache_off_byte.is_some() && vpar_off_byte.is_some(),
+                "coalesce_self_tr={coalesce_self_tr} but vcache_param/vparity_param are \
+                 {vcache_off_byte:?}/{vpar_off_byte:?} — rebuild the artifact with gen_decode.py"
+            );
             let sp_head_dim = sp["head_dim"].as_u64().unwrap_or(HEAD_DIM as u64) as u32;
             let res = dev
                 .open_elf_resident(&base_elf, Some("main:sequence"))
@@ -989,7 +1015,10 @@ impl FusedDecoder {
                 "[whisper_decoder] DEEP-C resident scratchpad decode: register-once + per-token \
                  kv_off(byte {kv_off_byte})/sm_mask(byte {sm_off_byte}, core={sm_core}) — no patch/reload"
             );
-            Some(ResidentState { res, kv_off_byte, sm_off_byte, sm_core, head_dim: sp_head_dim, vcache_off_byte })
+            Some(ResidentState {
+                res, kv_off_byte, sm_off_byte, sm_core, head_dim: sp_head_dim,
+                vcache_off_byte, vpar_off_byte, vpar_core,
+            })
         } else {
             None
         };
@@ -1081,6 +1110,7 @@ impl FusedDecoder {
             output,
             t_enc,
             coalesce_cross,
+            coalesce_self_tr,
             int8_cross_k,
             int8_cross_v,
             npu_logits,
@@ -1223,6 +1253,12 @@ impl FusedDecoder {
             }
             self.zero_buf(&format!("L{li}_kcache"));
             self.zero_buf(&format!("L{li}_vcache"));
+            // M0.5: the staged pair is carry state — the slot a token does NOT write is copied back
+            // into the cache verbatim, so a pair left over from the previous utterance would land as
+            // a real column. Rewinding n_self without clearing it is not a fresh cache.
+            if self.coalesce_self_tr {
+                self.zero_buf(&format!("L{li}_vpair"));
+            }
         }
         self.arena.sync_to_device().unwrap();
         self.n_self = 0;
@@ -1236,6 +1272,9 @@ impl FusedDecoder {
         for li in 0..N_LAYERS {
             self.zero_buf(&format!("L{li}_kcache"));
             self.zero_buf(&format!("L{li}_vcache"));
+            if self.coalesce_self_tr {
+                self.zero_buf(&format!("L{li}_vpair")); // carry state, see precompute_cross
+            }
         }
         self.arena.sync_to_device().unwrap();
         self.n_self = 0;
@@ -1366,9 +1405,19 @@ impl FusedDecoder {
             r.res
                 .write_scratchpad(r.sm_off_byte, &sm_val.to_le_bytes())
                 .expect("write sm_mask scratchpad");
-            // M0.5: transposed self-vcache write column = n_self (raw addr, no *head_dim).
-            if let Some(vb) = r.vcache_off_byte {
-                r.res.write_scratchpad(vb, &n.to_le_bytes()).expect("write vcache_off scratchpad");
+            // M0.5: advance the transposed self-V cache by one column. `vcache_off` is the EVEN
+            // pair base (raw addr, no *head_dim), `v_par` the slot this token writes. `v_par` is
+            // what carries the arm: suppress it and the tr arm diverges from the baseline at step 1.
+            // `n` vs `n & !1` measures identical — an odd offset truncates into the 4-byte granule.
+            if let (Some(vb), Some(pb)) = (r.vcache_off_byte, r.vpar_off_byte) {
+                r.res
+                    .write_scratchpad(vb, &(n & !1).to_le_bytes())
+                    .expect("write vcache_off scratchpad");
+                let par = n & 1;
+                let par_val = if r.vpar_core { par << 2 } else { par };
+                r.res
+                    .write_scratchpad(pb, &par_val.to_le_bytes())
+                    .expect("write v_par scratchpad");
             }
         }
         tmr.lap(&mut self.ph.patch); // scratchpad writes (~µs) occupy the old per-token "patch" slot
