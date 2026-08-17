@@ -31,10 +31,13 @@ export PATH="$VENV_IRON/bin:$VENV_IRON/cc-shim:$AIEBU_DIR:$PATH"
 export PEANO_INSTALL_DIR="$VENV_IRON/lib/python3.14/site-packages/llvm-aie"
 export PYTHONPATH="$IRON:$GENDIR${PYTHONPATH:+:$PYTHONPATH}"
 
-# IRON delta = the atassis/IRON:xdna2-asr fork branch (commits, not .patch). Require the checkout to be on it.
-on="$(git -C "$IRON" rev-parse --abbrev-ref HEAD 2>/dev/null)"
-[ "$on" = xdna2-asr ] || { echo "ERROR: $IRON must be on xdna2-asr (got '$on'). Run: git -C \"$IRON\" checkout xdna2-asr"; exit 1; }
-echo "[freeze] IRON on xdna2-asr @ $(git -C "$IRON" rev-parse --short HEAD)"
+# IRON delta lives as COMMITS on the fork, not as a .patch. Gate on the symbols gen_decode_batched.py
+# imports rather than a branch name -- see iron_require_api in amd_paths.sh.
+iron_at="$(iron_require_api "gen_decode_batched.py (freeze gate)" \
+  "iron/common/fusion.py:class FusedMLIROperator" \
+  "iron/operators/transpose/op.py:coalesce_batch_dma" \
+  "iron/operators/gemv/op.py:dtype_a")" || exit 1
+echo "[freeze] IRON on $iron_at (API surface verified)"
 
 rm -rf "$FROZEN_DIR"; mkdir -p "$FROZEN_DIR/work" "$FROZEN_DIR/out"
 : > "$AIECC_PHASE_TIMERS_FILE"

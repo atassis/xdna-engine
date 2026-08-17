@@ -24,3 +24,28 @@ export AIEBU_ASM_DIR="${AIEBU_ASM_DIR:-$XRT_SRC_DIR/src/runtime_src/core/common/
 # mlir-air / llvm-aie are NOT defaulted here: in setup_amd_toolchains.sh an EMPTY
 # MLIR_AIR_DIR/LLVM_AIE_DIR is the "do not patch this repo" gate. Their canonical
 # location (when you do opt in) is $XDNA_WS/{mlir-air,llvm-aie}.
+
+# iron_require_api -- gate the shared IRON checkout on the API SURFACE the caller needs,
+# NOT on a branch name. Branch names have drifted twice (xdna2-asr -> integration-stack) and
+# each drift broke every script that hard-required the old name, while the checkout was fine.
+# What a build actually depends on is whether the symbols its generators import are present.
+#
+#   iron_require_api <label> <path-under-IRON>:<literal-symbol> ...
+#
+# Names every missing symbol (not just the first) and prints the branch for the report line.
+iron_require_api() {
+  local label="$1"; shift
+  local on spec f sym missing=0
+  on="$(git -C "$IRON_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
+  for spec in "$@"; do
+    f="${spec%%:*}"; sym="${spec#*:}"
+    grep -qF -- "$sym" "$IRON_DIR/$f" 2>/dev/null && continue
+    echo "ERROR: $IRON_DIR ('$on') lacks '$sym' in $f -- required by $label" >&2
+    missing=1
+  done
+  [ "$missing" = 0 ] || {
+    echo "  the fork line carrying it is 'integration-stack'; 'xdna2-asr' is its stale predecessor." >&2
+    return 1
+  }
+  echo "$on @ $(git -C "$IRON_DIR" rev-parse --short HEAD 2>/dev/null)"
+}

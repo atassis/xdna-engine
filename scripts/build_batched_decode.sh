@@ -20,17 +20,28 @@ GENDIR="$REPO/route_b_kernels/decode_fused"
 [ -d "$IRON/iron" ] || { echo "ERROR: amd/IRON not at $IRON"; exit 1; }
 [ -x "$AIEBU_DIR/aiebu-asm" ] || { echo "ERROR: aiebu-asm not at $AIEBU_DIR"; exit 1; }
 
-# IRON delta is the atassis/IRON:xdna2-asr fork branch (commits, not .patch). The deepc base + transpose +
-# fusion-prefix + build-perf + path-override + the consolidated gemv op (coalesce/int8/gelu, default-off) +
-# mstationary are all on it. Require the checkout to be on the branch; git-applying the old separate patches
-# would now CONFLICT with the consolidated gemv op. (gemv levers stay default-off => byte-identical baseline.)
-on="$(git -C "$IRON" rev-parse --abbrev-ref HEAD 2>/dev/null)"
-[ "$on" = xdna2-asr ] || { echo "ERROR: $IRON must be on the xdna2-asr fork branch (got '$on'). Run: git -C \"$IRON\" checkout xdna2-asr"; exit 1; }
-echo "[build] IRON on xdna2-asr @ $(git -C "$IRON" rev-parse --short HEAD)"
+# IRON delta lives as COMMITS on the fork, not as a .patch: the deepc base + transpose + fusion-prefix +
+# the consolidated gemv op (coalesce/int8/gelu, default-off) + mstationary. Gate on those symbols rather
+# than a branch name -- see iron_require_api in amd_paths.sh. (gemv levers stay default-off => baseline
+# byte-identical.)
+iron_at="$(iron_require_api "gen_*_batched.py" \
+  "iron/common/fusion.py:class FusedMLIROperator" \
+  "iron/operators/transpose/op.py:coalesce_batch_dma" \
+  "iron/operators/gemv/op.py:dtype_a" \
+  "iron/operators/gemm/op.py:m_stationary")" || exit 1
+echo "[build] IRON on $iron_at (API surface verified)"
 
 export PATH="$VENV_IRON/bin:$VENV_IRON/cc-shim:$AIEBU_DIR:$PATH"
 export PEANO_INSTALL_DIR="$VENV_IRON/lib/python3.14/site-packages/llvm-aie"
-export PYTHONPATH="$IRON:$GENDIR${PYTHONPATH:+:$PYTHONPATH}"
+
+# Resolve `aie` and aiecc from the FORK INSTANCE at the committed pin, as build_deepc_decode.sh does.
+# Without $INST/python first, `aie` resolved through .venv-iron's aie.pth, which hardcodes ONE instance
+# dir -- so this script silently built against whatever instance that file last pointed at rather than
+# the pin, and said nothing. Measured 2026-08-17: aie.pth -> bf76a7f17b5d while the pin was 185212afd5ca.
+INST="$("$REPO/scripts/toolchain_up.sh")"
+export PYTHONPATH="$INST/python:$IRON:$GENDIR${PYTHONPATH:+:$PYTHONPATH}"
+export AIECC_PATH="${AIECC_PATH:-$INST/bin/aiecc}"
+[ -x "$AIECC_PATH" ] || { echo "ERROR: instance aiecc not at $AIECC_PATH (run scripts/toolchain_up.sh)"; exit 1; }
 # aiecc per-core compile parallelism (the iron-aiecc-jobs patch reads this; default 1 keeps other
 # sessions unchanged). 16 cuts the per-core .o phase ~16x on this 20-core box; the final-ELF assembly
 # stays single-threaded. Override with AIECC_JOBS=N.

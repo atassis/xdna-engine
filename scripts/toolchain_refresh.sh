@@ -57,7 +57,7 @@ echo "TOOLCHAIN REFRESH -- staleness report ($(date -u +%Y-%m-%dT%H:%MZ 2>/dev/n
 echo "Lock pins:  MLIR_AIE_FORK_COMMIT=${MLIR_AIE_FORK_COMMIT:0:12}  PEANO_DIST=$PEANO_DIST  NANOBIND=$NANOBIND"
 
 report_fork "$MLIR_AIE" xdna2-asr upstream/main "mlir-aie (Xilinx)"
-report_fork "$IRON"     xdna2-asr origin/devel  "amd/IRON"
+report_fork "$IRON"     integration-stack origin/devel  "amd/IRON"   # xdna2-asr is its stale predecessor
 report_fork "$MLIR_AIR" main      origin/main    "mlir-air (Xilinx, PRs live on branches)"
 
 hr
