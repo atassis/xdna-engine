@@ -271,6 +271,7 @@ def my_matmul(
     dtype_out_str="f32",
     k_loop_rtp=False,
     a_panel_width=0,
+    trace_worker=0,
 ):
     n_aie_rows = 4
     n_aie_cores = n_aie_rows * n_aie_cols
@@ -695,18 +696,23 @@ def my_matmul(
     # Per-op occupancy instrument. `trace_size=0` (production) leaves the design byte-identical.
     # Trace ONE worker: every worker runs the identical tile loop, so one is representative.
     #
-    # DOES NOT ROUTE TODAY, at any width -- this design streams A/B/C through the shim on every
-    # column it uses, leaving trace egress no free channel. Measured 2026-08-17 on the pinned
-    # toolchain, N=1024: cols=1/2 fail `aie.packet_flow ... Trace0 could not be routed to
-    # destination (c, 0) DMA1`, cols=4 `aie.masterset ... same destination South: 3`, cols=8
-    # `Unable to find a legal routing`. egress_shim_col is NOT the lever: 1 and 0 both fail and
-    # only move the reported destination column. Kept wired because the failure is the useful
-    # signal -- before this, --trace_size was accepted and silently dropped, so PROFILE=trace
-    # produced a byte-identical untraced xclbin. Freeing a shim port (C to memtile) is the
-    # candidate fix, not a flag here.
+    # WHICH worker is not free. A core tile has 4 South egress ports and, in column 0, no West;
+    # this design sends every core's C stream downward, so the bottom tile carries its own C plus
+    # the rows above it. Measured 2026-08-17 on the pinned toolchain (N=1024, m/k/n 64/32/128,
+    # WA_C_DEPTH=1), cols=1 South-out usage is (0,2) 4/4, (0,3) 3/4, (0,4) 2/4, (0,5) 1/4 -- so
+    # tracing workers[0] at row 2 has nowhere to go and the packet never leaves the tile. That is
+    # why no destination-side lever moves it: lateral-routing and egress_shim_col 0/1/4 all fail
+    # identically. Tracing a HIGHER row routes.
+    #
+    # By width: cols=4 builds green (verified through aiecc, not just the pathfinder) with any
+    # worker; cols=1 needs worker >= 1; cols=8 does not route at any worker or egress column,
+    # because its production routing already pins (0,2) and (0,4) at 4/4. Getting cols=8 traced
+    # needs fewer downward C streams per column, not a flag.
     if trace_size:
         my_program.enable_trace(
-            trace_size=trace_size, workers=[workers[0]], egress_shim_col=0
+            trace_size=trace_size,
+            workers=[workers[trace_worker]],
+            egress_shim_col=0,
         )
     # seq_fn now runs at resolve time, so the tap lists are only populated after
     # this call -- generate_taps must return AFTER it, not before.
@@ -759,6 +765,9 @@ def main():
         "--dtype_out", type=str, default="f32", choices=["f32", "bf16"]
     )
     argparser.add_argument("--trace_size", type=int, default=0)
+    # Index into `workers`, not a tile coordinate. Row 2 (index 0) is the C-stream aggregation
+    # point and has no free South port -- see the enable_trace comment for the per-width table.
+    argparser.add_argument("--trace_worker", type=int, default=0)
     argparser.add_argument("--generate-taps", action="store_true")
     argparser.add_argument(
         "--c-panel-width",
@@ -815,6 +824,7 @@ def main():
         args.dtype_out,
         args.k_loop_rtp,
         args.a_panel_width,
+        args.trace_worker,
     )
     if args.generate_taps:
         return maybe_module

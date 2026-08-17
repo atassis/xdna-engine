@@ -90,6 +90,11 @@ else
 wa_trace_size ?= 0
 endif
 
+# Which worker to trace (index, not a tile coord). 0 = row 2, which is the C-stream aggregation
+# point and has no free South egress port: at n_aie_cols=1 it does not route and you need >= 1.
+# n_aie_cols=4 routes with any worker; n_aie_cols=8 routes with none. See whole_array_modal_iron.py.
+wa_trace_worker ?= 0
+
 $(info [whole_array] PROFILE=$(PROFILE) WA_C_DEPTH=$(WA_C_DEPTH) wa_trace_size=$(wa_trace_size))
 
 aiecc_peano_flags=$(if $(filter-out 0,$(wa_trace_size)),--dump-intermediates,) --peano ${PEANO_INSTALL_DIR}
@@ -108,7 +113,7 @@ insts_target := build/insts_${target_suffix}.txt
 
 ${mlir_target}: ${srcdir}/${aie_py_src}
 	mkdir -p ${@D}
-	python3 $< ${gen_args} --trace_size ${wa_trace_size} > $@
+	python3 $< ${gen_args} --trace_size ${wa_trace_size} --trace_worker ${wa_trace_worker} > $@
 
 # Grouped co-target (&:): ONE aiecc invocation produces BOTH the xclbin AND the .txt insts,
 # so make treats insts_${target_suffix}.txt as a real target (a direct `make .../insts_*.txt`
