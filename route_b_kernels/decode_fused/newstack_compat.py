@@ -240,6 +240,10 @@ except ImportError:
 
     # Delta 5. Requesting an output no longer needs a matching negation: asking only for
     # --get-npu-insts already builds nothing else, so --no-compile / --no-compile-host drop out.
+    # --no-xchesscc / --no-xbridge are NOT in that family and must survive: they select the
+    # front-end, not an output, and aiecc still defaults both to Chess (cl::init(true) on
+    # `xchesscc`/`xbridge`, CommandLineOptions.h). Dropping them sent every core down the chess
+    # path, which dies at chess-llvm-link on a box with no aietools.
     _AIECC_FLAGS = {
         "--aie-generate-xclbin": "--get-xclbin",
         "--aie-generate-npu-insts": "--get-npu-insts",
@@ -247,8 +251,6 @@ except ImportError:
         "--generate-full-elf": "--get-full-elf",
         "--no-compile": None,
         "--no-compile-host": None,
-        "--no-xbridge": None,
-        "--no-xchesscc": None,
     }
 
     import os.path as _osp
