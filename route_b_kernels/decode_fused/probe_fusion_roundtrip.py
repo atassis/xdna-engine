@@ -37,9 +37,20 @@ Doubles as the permanent regression guard for that whole class: four separate
 harness/runtime bugs in one day presented as kernel bugs, and a round-trip assert catches
 them at the point of failure instead of five bisect stages later.
 
+Both paths pass as of 2026-08-17. PROBE_PATH=sequence had been recorded as "fails to BUILD,
+dying in the per-core ld.script link"; it does not, and never did. The build succeeds and the
+failure was host-side, in two layers: get_buffer() still constructed XRTSubBuffer directly
+(the subview() migration in IRON e48befe fixed fusion.py and missed this call site), and once
+that was fixed, _sync_inputs did not FORCE the input flush -- it relied on XRTSubBuffer.data
+marking the parent host-dirty, which is exactly what the migration removed, so the device read
+init-zeros. See the log entry for the measurements.
+
 Run:
     python probe_fusion_roundtrip.py            # default N=4096, tile=1024
-    PROBE_N=8192 PROBE_TILE=8192 python ...     # single-tile variant
+    PROBE_N=8192 PROBE_TILE=4096 python ...     # two tiles, the largest that fits L1
+Do NOT use TILE=8192: at 16 KB/buffer the double-buffered in+out fills the 64 KB L1 and aiecc
+fails with "'aie.tile' op allocated buffers exceeded available memory". MEASURED boundary at
+N=8192: tile 1024/2048/4096 all build and pass 3/3; 8192 does not build.
 """
 import os
 import sys
