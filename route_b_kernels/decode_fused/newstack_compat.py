@@ -25,14 +25,56 @@ Port deltas (keep this list as the canonical record):
      `Runtime(seq_fn, fn_args)` call is the current spelling and passes straight through, so our own
      generators and amd/IRON's designs both run in one process.
   5. #3364 made every aiecc output an explicit request (`--get-<name>`), so the `--aie-generate-*`
-     spellings amd/IRON's compilation rules emit are gone, and the Chess/host negations with them
-     (Peano is the default backend, the host program is one more requestable output). Translated on
-     the argv, which covers every rule that shells out to aiecc rather than each rule's flag list.
+     spellings amd/IRON's compilation rules emit are gone, and the host-compile negations with them
+     (the host program is one more requestable output). Translated on the argv, which covers every
+     rule that shells out to aiecc rather than each rule's flag list. The BACKEND negations are not
+     in that family: at this pin aiecc still defaults to Chess and needs them -- see Delta 5 below,
+     and note the pin guard, since upstream #3501 deletes them 38 commits later.
 """
 import contextlib
 import functools
 import sys
 import types
+
+
+def _assert_pinned_aie():
+    """Fail loud when the resolved `aie` package is not this lock's toolchain instance.
+
+    Every delta in this shim is written against ONE mlir-aie commit, so which instance `import aie`
+    resolves to is load-bearing -- and nothing enforced it. `iron_env.sh` exports the right
+    PYTHONPATH, but a generator run directly gets whatever `.venv-iron/aie.pth` happens to say, and
+    that file is only rewritten by `toolchain_wire.sh on`. Measured 2026-08-17: a `.pth` from 08-11
+    resolved builds to instance 185212afd5ca = mlir-aie d91f899ea9d, 38 commits past the pinned
+    62be3ea3133, where upstream #3501 has already deleted --no-xchesscc/--no-xbridge -- so the
+    correct-for-the-pin argv below read as a hard aiecc error and cost a device attempt.
+
+    Set XDNA_ALLOW_PIN_DRIFT=1 to downgrade to a warning (deliberate off-pin A/B).
+    """
+    import hashlib
+    import importlib.util
+    import os
+
+    root = os.path.dirname(os.path.abspath(__file__))
+    while root != "/" and not os.path.exists(os.path.join(root, "toolchain.lock")):
+        root = os.path.dirname(root)
+    lock = os.path.join(root, "toolchain.lock")
+    if not os.path.exists(lock):
+        return  # not in a pinned checkout; nothing to judge against
+    with open(lock, "rb") as f:
+        want = hashlib.sha256(f.read()).hexdigest()[:12]  # keyed exactly as toolchain_up.sh does
+    spec = importlib.util.find_spec("aie")
+    got = (spec.origin or (spec.submodule_search_locations or [""])[0]) if spec else None
+    if got and os.path.join("instances", want, "python") in got:
+        return
+    msg = (f"[newstack_compat] resolved `aie` is not the pinned instance {want}: {got or 'unresolvable'}\n"
+           f"  fix: scripts/toolchain_wire.sh on   (or: source scripts/iron_env.sh)")
+    if os.environ.get("XDNA_ALLOW_PIN_DRIFT") == "1":
+        print(f"WARNING {msg}", file=sys.stderr)
+        return
+    raise RuntimeError(msg)
+
+
+_assert_pinned_aie()
 
 try:
     import aie.iron.placers  # noqa: F401  — present on the OLD stack: nothing to do.
