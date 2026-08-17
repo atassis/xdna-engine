@@ -31,11 +31,12 @@ fork_private_regex='xdna-engine-private|xdna-engine-workspace|~/repositories/|/h
 fail=0
 while read -r local_ref local_sha remote_ref remote_sha; do
   [ "$local_sha" = "$Z" ] && continue
-  if [ "$remote_sha" = "$Z" ]; then
-    revs=$(git rev-list "$local_sha" --not --remotes)
-  else
-    revs=$(git rev-list "$remote_sha..$local_sha")
-  fi
+  # Only commits that exist on no remote, i.e. ours. A remote_sha..local_sha range
+  # looks equivalent and is not: after a rebase onto a newer upstream it also spans
+  # every upstream commit the base advanced over, and `/home/[a-z]` then matches
+  # buildbot paths in their messages. Measured on one llvm-aie bump: 9319 commits
+  # dragged in, blocked on an upstream lldb commit from 2025.
+  revs=$(git rev-list "$local_sha" --not --remotes)
   for c in $revs; do
     # commit MESSAGE: a leak here cannot be fixed after push without a history rewrite.
     if git log -1 --format='%B' "$c" | grep -Eiq "$fork_private_regex"; then
