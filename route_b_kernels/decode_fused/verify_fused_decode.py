@@ -181,11 +181,12 @@ def main():
     elf_data = load_elf(fused)
 
     # ---------- lay weights + REAL encoder K/V into the arena; zero the self-KV caches ----------
-    # XRTSubBuffer.data is the mapped numpy view into the parent arena BO.
+    # overwrite(), not .data: the scratch sync below sends only the ranges recorded as
+    # host-written, and .data records nothing -- the kernels would read init-zeros.
     def put2(name, arr):
-        b = callable_.get_buffer(name)
         flat = np.asarray(arr, dtype=BF16).reshape(-1)
-        np.copyto(b.data, flat)
+        with callable_.get_buffer(name).overwrite() as dst:
+            np.copyto(dst, flat)
     for l in range(NL):
         p = f"L{l}_"; d = LW[l]
         for nm, arr in [("Wqkv", bf16(d["mat_qkv"]).reshape(-1)), ("bias_qkv", bf16(d["bias_qkv"])),

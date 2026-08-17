@@ -151,8 +151,11 @@ def main():
     params_path = sorted(glob.glob("**/params.txt", recursive=True), key=os.path.getmtime)[-1]
     print("params.txt:", params_path, "->", open(params_path).read().strip().replace("\n", " | "))
 
+    # overwrite(), not .data: the scratch sync below sends only the ranges recorded as
+    # host-written, and .data records nothing -- the kernels would read init-zeros.
     def put2(name, arr):
-        np.copyto(callable_.get_buffer(name).data, np.asarray(arr, dtype=BF16).reshape(-1))
+        with callable_.get_buffer(name).overwrite() as dst:
+            np.copyto(dst, np.asarray(arr, dtype=BF16).reshape(-1))
     for l in range(NL):
         p = f"L{l}_"; d = LW[l]
         for nm, arr in [("Wqkv", bf16(d["mat_qkv"]).reshape(-1)), ("bias_qkv", bf16(d["bias_qkv"])),
