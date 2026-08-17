@@ -33,27 +33,43 @@ for d in "$BASE" "$TR"; do
   [ -f "$d/decode.elf" ] || { echo "[ERR] missing $d/decode.elf"; exit 1; }
 done
 # Refuse a comparison whose arms differ in more than the self-V cache.
-python3 - "$BASE" "$TR" <<'PY' || exit 1
-import json, sys
+LADDER="${LADDER:-0}" python3 - "$BASE" "$TR" <<'PY' || exit 1
+import json, os, sys
 b, t = (json.load(open(f"{d}/meta.json")) for d in sys.argv[1:3])
-# Two stackable arms live on this axis, so the pairing rule is "differ in exactly ONE of them":
-# coalesce_self_tr (M0.5, transposed cache) and vstage_direct (M0.6, the stage writes that cache
-# itself and op_scv is gone). Pairing M0.6 against M0.5 isolates the fused write; pairing either
-# against the plain arm isolates the transposed cache. Pairing M0.6 against plain moves both.
+# Two stackable arms live on this axis, so the DEFAULT pairing rule is "differ in exactly ONE of
+# them": coalesce_self_tr (M0.5, transposed cache) and vstage_direct (M0.6, the stage writes that
+# cache itself and op_scv is gone). Pairing M0.6 against M0.5 isolates the fused write; pairing
+# either against the plain arm isolates the transposed cache. Pairing M0.6 against plain moves both,
+# so a delta from it is not attributable to one flag -- refused unless the caller says it wants the
+# LADDER, which is a different question: what the fully-stacked arm buys against today's default,
+# the number the default-flip decision actually turns on. Summing the two one-flag pairings is NOT a
+# substitute; that sum is only defensible while their shared arm times the same in both.
 AXES = ("coalesce_self_tr", "vstage_direct")
+ladder = os.environ.get("LADDER") == "1"
 moved = [k for k in AXES if bool(b.get(k)) != bool(t.get(k))]
-if len(moved) != 1:
-    sys.exit(f"[ERR] arms must differ in exactly one of {AXES}; they differ in {moved or 'none'}")
-axis = moved[0]
-if not bool(t.get(axis)):
-    sys.exit(f"[ERR] {sys.argv[1]} is the {axis} arm; pass it as TR and the other as BASE")
+if not moved:
+    sys.exit(f"[ERR] arms are identical on {AXES}; they differ in none")
+if len(moved) > 1 and not ladder:
+    sys.exit(f"[ERR] arms must differ in exactly one of {AXES}; they differ in {moved}. "
+             f"Set LADDER=1 to compare plain against the fully-stacked arm on purpose -- "
+             f"the delta is then cumulative, NOT attributable to one flag")
+for k in moved:
+    if not bool(t.get(k)):
+        sys.exit(f"[ERR] {sys.argv[1]} is the {k} arm; pass it as TR and the other as BASE")
+if ladder and len(moved) > 1 and any(bool(b.get(k)) for k in AXES):
+    sys.exit(f"[ERR] LADDER wants plain (neither axis) as BASE; {sys.argv[1]} already has "
+             f"{[k for k in AXES if bool(b.get(k))]}")
 for k in ("coalesce_cross", "coalesce_self", "int8_cross_k", "int8_cross_v", "int8_ffn",
-          "int8_attn_w", "npu_logits") + tuple(k for k in AXES if k != axis):
+          "int8_attn_w", "npu_logits") + tuple(k for k in AXES if k not in moved):
     if bool(b.get(k)) != bool(t.get(k)):
-        sys.exit(f"[ERR] arms differ in {k} ({b.get(k)} vs {t.get(k)}) as well as {axis}")
+        sys.exit(f"[ERR] arms differ in {k} ({b.get(k)} vs {t.get(k)}) as well as {moved}")
 if b["dims"] != t["dims"]:
     sys.exit(f"[ERR] arms differ in dims: {b['dims']} vs {t['dims']}")
-print(f"[pair] arms differ in {axis} alone; tr params = {sorted(t['scratchpad']['params'])}")
+if len(moved) > 1:
+    print(f"[pair] LADDER: arms differ in {moved} together -- delta is CUMULATIVE, not "
+          f"attributable to one flag; tr params = {sorted(t['scratchpad']['params'])}")
+else:
+    print(f"[pair] arms differ in {moved[0]} alone; tr params = {sorted(t['scratchpad']['params'])}")
 PY
 
 echo "[gate] $STEPS steps/arm, base=$BASE tr=$TR"

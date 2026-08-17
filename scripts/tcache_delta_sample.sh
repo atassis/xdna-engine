@@ -12,6 +12,12 @@
 # lands on both pairings equally instead of entirely on whichever ran second.
 #
 #   bash scripts/tcache_delta_sample.sh [N]     # N repeats per pairing, default 5
+#   PAIRS='direct|dec12_base|dec12_direct|plain -> stage writes cache' ... [N]
+#
+# PAIRS overrides which pairings run, one `tag|baseArtifact|armArtifact|label` per element,
+# newline-separated. Default is the stacked ladder M0.5 then M0.6. Override it to measure a pairing
+# DIRECTLY rather than by summing two: the stacked plain -> direct figure is a sum of the two default
+# pairings, which is only defensible while their shared arm (`dec12_tr`) times the same in both.
 set -uo pipefail
 WT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$WT"
 N="${1:-5}"
@@ -19,6 +25,8 @@ LOCK="${NPU_LOCK:-}"   # optional device serializer (was an absolute path into a
 TS="$(date +%Y%m%d_%H%M%S)"; OUT="$WT/artifacts/tcache_sample_${TS}"; mkdir -p "$OUT"
 
 # M0.5 = the transposed cache (plain -> tr). M0.6 = the stage writing it (tr -> direct).
+PAIRS="${PAIRS:-m05|dec12_base|dec12_tr|M0.5  plain -> transposed cache
+m06|dec12_tr|dec12_direct|M0.6  tr -> stage writes cache}"
 run_one(){ # $1 tag  $2 base dir  $3 tr dir
   # The parity harness restarts xdna-engine on EXIT, so the device is busy again by the next
   # iteration; npu_lock defers rather than stopping it. Clear it here, every time.
@@ -35,17 +43,32 @@ run_one(){ # $1 tag  $2 base dir  $3 tr dir
     | tee -a "$OUT/deltas.tsv"
 }
 
+# Read the spec into an array ONCE. Do not drive the run loop from a `read` on stdin -- the timed
+# child would be competing for the same fd and could swallow the remaining pairings.
+mapfile -t SPEC <<< "$PAIRS"
+
+# The label sidecar is what the pooling step reads, so a PAIRS override needs no second edit.
+for line in "${SPEC[@]}"; do
+  [ -n "$line" ] || continue
+  IFS='|' read -r tag base arm label <<< "$line"
+  printf '%s\t%s\n' "$tag" "$label" >> "$OUT/pairings.tsv"
+done
+
 echo "[sample] $N repeats per pairing, interleaved; out=$OUT"
 for i in $(seq 1 "$N"); do
-  run_one "m05_$i" dec12_base dec12_tr
-  run_one "m06_$i" dec12_tr   dec12_direct
+  for line in "${SPEC[@]}"; do
+    [ -n "$line" ] || continue
+    IFS='|' read -r tag base arm label <<< "$line"
+    run_one "${tag}_$i" "$base" "$arm" < /dev/null
+  done
 done
 
 echo "=============== POOLED ==============="
-python3 - "$OUT/deltas.tsv" <<'PY'
+python3 - "$OUT/deltas.tsv" "$OUT/pairings.tsv" <<'PY'
 import re, sys, statistics as st
 rows = [l.split('\t') for l in open(sys.argv[1]).read().splitlines() if l.strip()]
-for arm, label in (("m05", "M0.5  plain -> transposed cache"), ("m06", "M0.6  tr -> stage writes cache")):
+pairs = [l.split('\t') for l in open(sys.argv[2]).read().splitlines() if l.strip()]
+for arm, label in pairs:
     d = [float(r[1].split('=')[1]) for r in rows if r[0].startswith(arm) and 'ERR' not in r[1]]
     p = [r[4].split('=')[1] for r in rows if r[0].startswith(arm)]
     if not d:
