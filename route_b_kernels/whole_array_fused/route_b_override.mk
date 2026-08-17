@@ -95,6 +95,11 @@ endif
 # n_aie_cols=4 routes with any worker; n_aie_cols=8 routes with none. See whole_array_modal_iron.py.
 wa_trace_worker ?= 0
 
+# Comma-separated CoreEvent names; empty = the generator's default eight. AIE2 traces 8 events per
+# core, and the default set leaves 66.95% of the span unattributed at cols=4 because none of them is
+# scalar issue or load/store -- keep INSTR_VECTOR in any replacement set so runs stay comparable.
+wa_trace_events ?=
+
 $(info [whole_array] PROFILE=$(PROFILE) WA_C_DEPTH=$(WA_C_DEPTH) wa_trace_size=$(wa_trace_size))
 
 aiecc_peano_flags=$(if $(filter-out 0,$(wa_trace_size)),--dump-intermediates,) --peano ${PEANO_INSTALL_DIR}
@@ -113,7 +118,8 @@ insts_target := build/insts_${target_suffix}.txt
 
 ${mlir_target}: ${srcdir}/${aie_py_src}
 	mkdir -p ${@D}
-	python3 $< ${gen_args} --trace_size ${wa_trace_size} --trace_worker ${wa_trace_worker} > $@
+	python3 $< ${gen_args} --trace_size ${wa_trace_size} --trace_worker ${wa_trace_worker} \
+	    --trace_events "${wa_trace_events}" > $@
 
 # Grouped co-target (&:): ONE aiecc invocation produces BOTH the xclbin AND the .txt insts,
 # so make treats insts_${target_suffix}.txt as a real target (a direct `make .../insts_*.txt`

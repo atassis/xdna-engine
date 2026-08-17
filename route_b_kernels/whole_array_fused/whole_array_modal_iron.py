@@ -272,6 +272,7 @@ def my_matmul(
     k_loop_rtp=False,
     a_panel_width=0,
     trace_worker=0,
+    trace_events=None,
 ):
     n_aie_rows = 4
     n_aie_cores = n_aie_rows * n_aie_cols
@@ -708,11 +709,26 @@ def my_matmul(
     # worker; cols=1 needs worker >= 1; cols=8 does not route at any worker or egress column,
     # because its production routing already pins (0,2) and (0,4) at 4/4. Getting cols=8 traced
     # needs fewer downward C streams per column, not a flag.
+    #
+    # WHICH events is also not free: AIE2 gives 8 per core, so the default set below buys the
+    # stall question and pays for it with everything else. MEASURED on device 2026-08-17 at
+    # cols=4: it accounts for 33.05% of the traced span (23.44% vector issue + 9.61% stall),
+    # and the other 66.95% is dark because no scalar/load-store event is in the set -- not
+    # because the core is idle. Pass --trace_events to re-spend the eight slots, keeping
+    # INSTR_VECTOR as the anchor that lets two runs be composed.
     if trace_size:
+        events = None
+        if trace_events:
+            from aie.utils.trace.events import CoreEvent
+
+            events = [getattr(CoreEvent, e.strip()) for e in trace_events.split(",") if e.strip()]
+            if len(events) > 8:
+                raise ValueError(f"AIE2 traces 8 core events; got {len(events)}")
         my_program.enable_trace(
             trace_size=trace_size,
             workers=[workers[trace_worker]],
             egress_shim_col=0,
+            coretile_events=events,
         )
     # seq_fn now runs at resolve time, so the tap lists are only populated after
     # this call -- generate_taps must return AFTER it, not before.
@@ -768,6 +784,11 @@ def main():
     # Index into `workers`, not a tile coordinate. Row 2 (index 0) is the C-stream aggregation
     # point and has no free South port -- see the enable_trace comment for the per-width table.
     argparser.add_argument("--trace_worker", type=int, default=0)
+    # Comma-separated aie.utils.trace.events.CoreEvent names; empty = the default eight.
+    # AIE2 gives 8 trace events per core, so this is a CHOICE, not a filter: the default set
+    # (vector issue + the three stalls + two DMA ports) accounts for 33.05% of the traced span
+    # at cols=4, leaving 66.95% dark purely because no scalar/load-store event is in it.
+    argparser.add_argument("--trace_events", type=str, default="")
     argparser.add_argument("--generate-taps", action="store_true")
     argparser.add_argument(
         "--c-panel-width",
@@ -825,6 +846,7 @@ def main():
         args.k_loop_rtp,
         args.a_panel_width,
         args.trace_worker,
+        args.trace_events,
     )
     if args.generate_taps:
         return maybe_module

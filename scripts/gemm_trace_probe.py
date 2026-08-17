@@ -32,17 +32,14 @@ from aie.utils.tensor_factory import tensor, zeros
 from aie.utils.trace import TraceConfig
 import aie.utils as aie_utils
 
-# The eight events whole_array_modal_iron.py asks for, grouped by what a share of them means.
-# LOCK_STALL is deliberately its own group: it is measured at the core but its CAUSE is off-core
-# (an objectFIFO acquire that the producer DMA has not filled yet), so folding it into either
-# side would beg the question this task exists to answer.
-GROUPS = {
-    "issue": ["INSTR_VECTOR"],
-    "core_local_stall": ["MEMORY_STALL"],
-    "objectfifo_wait": ["LOCK_STALL"],
-    "stream_stall": ["STREAM_STALL"],
-}
-PORTS = ["PORT_RUNNING_0", "PORT_RUNNING_1"]  # DMA ch0 S2MM (in) / MM2S (out)
+# AIE2 traces 8 core events, so which 8 is a CHOICE and the useful runs use different sets
+# (--trace_events on the generator). Report whatever is present rather than a fixed table.
+#
+# ISSUE_EVENTS get a union as well as a sum, because they OVERLAP: a VLIW bundle can issue a load
+# and a vector op in the same cycle. Measured at cols=4 the sum is 79.98% of span and the union
+# 68.84%, i.e. 11.14pp of double-count -- and the sum happens to land within 0.5pp of ACTIVE
+# (79.50%), which reads as a clean "issue accounts for all active time" and is a coincidence.
+ISSUE_EVENTS = ["INSTR_VECTOR", "INSTR_LOAD", "INSTR_STORE"]
 
 
 def insts_bin(insts_txt, artifacts):
@@ -57,11 +54,11 @@ def insts_bin(insts_txt, artifacts):
     return out
 
 
-def durations(events):
-    """Chrome-trace B/E pairs -> {(pid, name): total cycles}. Unclosed B at end of buffer is
-    dropped, not extrapolated -- the trace buffer truncates mid-run and a guessed tail would
-    silently inflate whichever stall happened to be open when it filled."""
-    out = defaultdict(int)
+def intervals(events):
+    """Chrome-trace B/E pairs -> {(pid, name): [(start, end), ...]}. An unclosed B at the end of
+    the buffer is dropped, not extrapolated -- the trace buffer truncates mid-run and a guessed
+    tail would silently inflate whichever event happened to be open when it filled."""
+    out = defaultdict(list)
     open_at = {}
     for e in events:
         name, ph = e.get("name"), e.get("ph")
@@ -71,8 +68,22 @@ def durations(events):
         if ph == "B":
             open_at[key] = e["ts"]
         elif key in open_at:
-            out[key] += e["ts"] - open_at.pop(key)
+            out[key].append((open_at.pop(key), e["ts"]))
     return out
+
+
+def union_cycles(ivs):
+    """Cycles covered by at least one interval -- the honest total for events that can co-occur."""
+    total, cur_s, cur_e = 0, None, None
+    for s, e in sorted(ivs):
+        if cur_s is None:
+            cur_s, cur_e = s, e
+        elif s <= cur_e:
+            cur_e = max(cur_e, e)
+        else:
+            total += cur_e - cur_s
+            cur_s, cur_e = s, e
+    return total + (cur_e - cur_s) if cur_s is not None else 0
 
 
 def summarize(trace_json):
@@ -82,20 +93,32 @@ def summarize(trace_json):
     if not ts:
         return {"events": len(ev), "error": "no timestamped events"}
 
-    dur = durations(ev)
+    iv = intervals(ev)
     per_tile = {}
     for pid, tile in pids.items():
         tile_ts = [e["ts"] for e in ev if e.get("pid") == pid and "ts" in e]
         if not tile_ts:
             continue
         span = max(tile_ts) - min(tile_ts)
-        row = {"span_cycles": span}
-        for group, names in GROUPS.items():
-            cyc = sum(dur.get((pid, n), 0) for n in names)
-            row[group] = {"cycles": cyc, "pct_of_span": round(100 * cyc / span, 2) if span else None}
-        for p in PORTS:
-            cyc = dur.get((pid, p), 0)
-            row[p] = {"cycles": cyc, "pct_of_span": round(100 * cyc / span, 2) if span else None}
+        pct = lambda c: round(100 * c / span, 2) if span else None
+        row = {"span_cycles": span, "events": {}}
+        for (p, name), ivs in sorted(iv.items()):
+            if p != pid:
+                continue
+            cyc = sum(e - s for s, e in ivs)
+            row["events"][name] = {
+                "cycles": cyc,
+                "pct_of_span": pct(cyc),
+                "count": len(ivs),
+                "mean_cycles": round(cyc / len(ivs), 2) if ivs else None,
+            }
+        issue = [i for n in ISSUE_EVENTS for i in iv.get((pid, n), [])]
+        if issue:
+            s = sum(e - st for st, e in issue)
+            u = union_cycles(issue)
+            row["issue_union"] = {"sum_cycles": s, "sum_pct": pct(s),
+                                  "union_cycles": u, "union_pct": pct(u),
+                                  "overlap_pct": pct(s - u)}
         per_tile[tile] = row
 
     return {
@@ -148,8 +171,13 @@ def main(o):
     print(f"\n=== {o.suffix}: {res['events']} events, span {res.get('global_span_cycles')} cyc ===")
     for tile, row in res.get("per_tile", {}).items():
         print(f"  {tile}  span={row['span_cycles']} cyc")
-        for k in list(GROUPS) + PORTS:
-            print(f"    {k:<20} {row[k]['cycles']:>10} cyc  {row[k]['pct_of_span']:>6}%")
+        for name, d in sorted(row["events"].items(), key=lambda kv: -kv[1]["cycles"]):
+            print(f"    {name:<24} {d['cycles']:>9} cyc {d['pct_of_span']:>6}%  "
+                  f"n={d['count']:<7} mean={d['mean_cycles']}")
+        u = row.get("issue_union")
+        if u:
+            print(f"    {'issue sum/union':<24} {u['sum_cycles']:>9}/{u['union_cycles']} cyc "
+                  f"{u['sum_pct']}/{u['union_pct']}%  overlap {u['overlap_pct']}%")
     print(f"\nwrote {out}")
     aie_utils.DefaultNPURuntime.cleanup()
 
