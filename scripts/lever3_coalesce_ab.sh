@@ -88,7 +88,7 @@ fi
 # re-checks its own surface below; this is the fast pre-check so the A/B fails before the rust build.
 if ! iron_at="$(iron_require_api "lever3 coalesce A/B" \
   "iron/operators/transpose/op.py:coalesce_batch_dma" \
-  "iron/common/fusion.py:class FusedMLIROperator")"; then
+  "iron/common/sequence.py:class OperatorSequence")"; then
   log "[ERR] IRON API surface check failed -- see stderr above"; exit 1
 fi
 log "[iron] IRON on $iron_at (API surface verified)"

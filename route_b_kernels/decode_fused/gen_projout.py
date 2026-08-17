@@ -31,7 +31,7 @@ import ml_dtypes
 
 import newstack_compat  # noqa: F401 — MUST precede iron imports (new-mlir-aie port shim)
 from iron.common import AIEContext
-from iron.common.fusion import FusedMLIROperator, load_elf
+from elf_dispatch_compat import OperatorSequence, load_elf
 from iron.operators.gemv.op import GEMV
 
 BF16 = ml_dtypes.bfloat16
@@ -86,7 +86,7 @@ def main():
         bufsz["amax"] = COLS * 8  # COLS × [val:f32 | idx:i32] = COLS×8 bytes (bf16-typed: COLS×4 elems)
         out_args = ["amax", "logits"]
 
-    fused = FusedMLIROperator("projout", rl, input_args=["x"], output_args=out_args,
+    fused = OperatorSequence("projout", rl, input_args=["x"], output_args=out_args,
                               buffer_sizes=bufsz, context=ctx)
     fused.compile()
     elf = load_elf(fused).view(np.uint8).tobytes()

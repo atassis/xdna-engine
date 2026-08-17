@@ -28,7 +28,7 @@ import ml_dtypes
 
 import newstack_compat  # noqa: F401 — MUST precede iron imports
 from iron.common import AIEContext
-from iron.common.fusion import FusedMLIROperator
+from elf_dispatch_compat import OperatorSequence
 from iron.operators.strided_copy.op import StridedCopy
 from vpair_stage_op import VPairStage
 
@@ -54,7 +54,7 @@ def main():
         input_buffer_size=N * 2, output_buffer_size=H * HD * S,
         num_aie_channels=1, output_offset_parameter="vc_off", context=ctx,
     )
-    fused = FusedMLIROperator(
+    fused = OperatorSequence(
         "vpairprobe",
         [(stage, "v", "pair", "pair"), (pair_write, "pair", "vcache")],
         input_args=["v"], output_args=["vcache"],

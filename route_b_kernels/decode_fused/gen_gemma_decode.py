@@ -49,7 +49,7 @@ import ml_dtypes
 
 import newstack_compat  # noqa: F401 -- MUST precede iron imports (new-mlir-aie port shim)
 from iron.common import AIEContext
-from iron.common.fusion import FusedMLIROperator, load_elf
+from elf_dispatch_compat import OperatorSequence, load_elf
 from iron.operators.gemv.op import GEMV
 from iron.operators.rms_norm.op import RMSNorm
 from iron.operators.rope.op import RoPE
@@ -256,7 +256,7 @@ def main():
         import sys
         sys.exit(0)
 
-    fused = FusedMLIROperator("gemma_decode", rl, input_args=["x", "rope_local", "rope_global"],
+    fused = OperatorSequence("gemma_decode", rl, input_args=["x", "rope_local", "rope_global"],
                               output_args=["logits"], buffer_sizes=bufsz, context=ctx)
     fused.compile()
     elf = load_elf(fused).view(np.uint8).tobytes()

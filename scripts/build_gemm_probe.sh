@@ -33,7 +33,7 @@ GEN="$REPO/route_b_kernels/decode_fused/gen_gemm_probe.py"
 # This script pioneered checking the API surface instead of a branch name, after names drifted once
 # (2026-07-30, probe worktree); iron_require_api in amd_paths.sh is that check, now shared.
 iron_at="$(iron_require_api "gen_gemm_probe.py" \
-  "iron/common/fusion.py:class FusedMLIROperator" \
+  "iron/common/sequence.py:class OperatorSequence" \
   "iron/operators/gemm/op.py:class GEMM" \
   "iron/operators/gemm/op.py:m_stationary")" || exit 1
 echo "[build] IRON on $iron_at (API surface verified)"

@@ -20,7 +20,12 @@ import torch
 
 import newstack_compat  # noqa: F401 — MUST precede iron imports (new-mlir-aie port shim)
 from iron.common import AIEContext
-from iron.common.fusion import FusedMLIROperator, load_elf, patch_elf
+from elf_dispatch_compat import (
+    FusedFullELFCallable,
+    OperatorSequence,
+    load_elf,
+    patch_elf,
+)
 from iron.operators.gemv.op import GEMV
 from iron.operators.layer_norm.op import LayerNorm
 from iron.operators.elementwise_add.op import ElementwiseAdd
@@ -172,12 +177,17 @@ def main():
         bufsz.update({"hn": D * 2, "logits": VOCAB_PAD * 2, "Wproj": VOCAB_PAD * D * 2, "bias_proj": VOCAB_PAD * 2})
         weights_extra = {"Wproj": bf16(mat_pad).reshape(-1), "bias_proj": bf16(bias_pad)}
         out_name = "logits"
-    fused = FusedMLIROperator("decode", rl, input_args=["x"], output_args=[out_name], buffer_sizes=bufsz, context=ctx)
+    fused = OperatorSequence("decode", rl, input_args=["x"], output_args=[out_name], buffer_sizes=bufsz, context=ctx)
     print("compiling fused decode op...")
     fused.compile()
     if a.compile_only:
         import sys; print(f"compile-only: fused op compiled OK (out={out_name}, npu_logits={a.npu_logits})"); sys.exit(0)
-    callable_ = fused.get_callable()  # FusedFullELFCallable
+    # NOT fused.get_callable(): on OperatorSequence that returns upstream's
+    # SequenceFullELFCallable, which loads the ELF from a path once and has no reload_elf --
+    # #131 replaced per-step patching with ctrl-scratchpad params. This harness IS the patching
+    # instrument, so it drives the engine-owned callable. The scratchpad equivalent is
+    # verify_fused_decode_sp.py.
+    callable_ = FusedFullELFCallable(fused)
     elf_data = load_elf(fused)
 
     # ---------- lay weights + REAL encoder K/V into the arena; zero the self-KV caches ----------

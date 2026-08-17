@@ -29,12 +29,12 @@ import ml_dtypes
 
 import newstack_compat  # noqa: F401 -- MUST precede iron imports (new-mlir-aie port shim)
 from iron.common import AIEContext
-from iron.common.fusion import FusedMLIROperator
+from elf_dispatch_compat import OperatorSequence
 from argmax_op import Argmax
 
 BF16 = ml_dtypes.bfloat16
 # Overridable so the same probe can bisect "is the CHUNKED design wrong?" against "is the
-# FusedMLIROperator path wrong at all?":
+# OperatorSequence path wrong at all?":
 #   PROBE_N=52224 PROBE_CHUNK=6528   -> ASR-size, nchunks=1, i.e. the stock un-chunked shape
 #   (defaults)                       -> Gemma vocab, nchunks=8
 N = int(os.environ.get("PROBE_N", 262144))   # Gemma-3-270M / Gemma-4-E2B tied embedding
@@ -88,7 +88,7 @@ def make_case(name, rng):
 def main():
     ctx = AIEContext()
     op = Argmax(N=N, cols=COLS, chunk=CHUNK, context=ctx)
-    fused = FusedMLIROperator(
+    fused = OperatorSequence(
         "argmax_vocab_probe",
         [(op, "logits", "amax")],
         input_args=["logits"],

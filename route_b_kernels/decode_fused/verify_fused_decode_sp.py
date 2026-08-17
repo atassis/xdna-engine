@@ -18,7 +18,7 @@ import newstack_compat  # noqa: F401 — MUST precede iron imports (new-mlir-aie
 import pyxrt
 from aie.utils.hostruntime.xrtruntime.parameter_scratchpad import ParameterScratchpad
 from iron.common import AIEContext
-from iron.common.fusion import FusedMLIROperator, load_elf
+from elf_dispatch_compat import OperatorSequence, load_elf
 from iron.operators.gemv.op import GEMV
 from iron.operators.layer_norm.op import LayerNorm
 from iron.operators.elementwise_add.op import ElementwiseAdd
@@ -143,7 +143,7 @@ def main():
                (o_a8, p+"ff", p+"bf2", p+"ff"), (o_a8, p+"x2", p+"ff", nxt)]
         cur = nxt
     out_name = cur
-    fused = FusedMLIROperator("decode", rl, input_args=["x"], output_args=[out_name], buffer_sizes=bufsz, context=ctx)
+    fused = OperatorSequence("decode", rl, input_args=["x"], output_args=[out_name], buffer_sizes=bufsz, context=ctx)
     print("compiling fused decode op (scratchpad)...")
     fused.compile()
     callable_ = fused.get_callable()

@@ -35,7 +35,7 @@ import ml_dtypes
 
 import newstack_compat  # noqa: F401 — MUST precede iron imports (new-mlir-aie port shim)
 from iron.common import AIEContext
-from iron.common.fusion import FusedMLIROperator, load_elf
+from elf_dispatch_compat import OperatorSequence, load_elf
 from iron.operators.gemm.op import GEMM
 
 BF16 = ml_dtypes.bfloat16
@@ -101,7 +101,7 @@ def main():
     else:
         runlist = [(gemm, "W", "X", "out")]  # A=W[M,K], B=X[K,N], C=out[M,N]
         in_args = ["X"]
-    fused = FusedMLIROperator("gemmprobe", runlist, input_args=in_args, output_args=["out"], context=ctx)
+    fused = OperatorSequence("gemmprobe", runlist, input_args=in_args, output_args=["out"], context=ctx)
     fused.compile()
 
     elf_bytes = load_elf(fused).view(np.uint8).tobytes()

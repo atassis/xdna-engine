@@ -22,7 +22,7 @@ import ml_dtypes
 
 import newstack_compat  # noqa: F401 -- MUST precede iron imports
 from iron.common import AIEContext
-from iron.common.fusion import FusedMLIROperator
+from elf_dispatch_compat import OperatorSequence
 from iron.operators.elementwise_mul.op import ElementwiseMul
 from iron.operators.strided_copy.op import StridedCopy
 from identity_op import Identity
@@ -98,13 +98,13 @@ def main():
 
     N, TILE = 4096, 1024
     ident = Identity(N=N, tile=TILE, context=ctx)
-    unfixable += report("probe_fusion_roundtrip (identity)", FusedMLIROperator(
+    unfixable += report("probe_fusion_roundtrip (identity)", OperatorSequence(
         "fusion_roundtrip_probe", [(ident, "src", "dst")],
         input_args=["src"], output_args=["dst"],
         buffer_sizes={"src": N * 2, "dst": N * 2}, context=ctx))
 
     emul = ElementwiseMul(size=N, tile_size=N // 8, num_aie_columns=8, context=ctx)
-    unfixable += report("probe_fusion_roundtrip (emul, 2 inputs)", FusedMLIROperator(
+    unfixable += report("probe_fusion_roundtrip (emul, 2 inputs)", OperatorSequence(
         "fusion_roundtrip_emul", [(emul, "src", "ones", "dst")],
         input_args=["src", "ones"], output_args=["dst"],
         buffer_sizes={"src": N * 2, "ones": N * 2, "dst": N * 2}, context=ctx))
@@ -118,7 +118,7 @@ def main():
         input_buffer_size=NV * 2, output_buffer_size=H * HD * S,
         num_aie_channels=1, output_offset_parameter="vc_off", context=ctx,
     )
-    unfixable += report("probe_vpair_stage (measured green on device)", FusedMLIROperator(
+    unfixable += report("probe_vpair_stage (measured green on device)", OperatorSequence(
         "vpairprobe", [(stage, "v", "pair", "pair"), (pair_write, "pair", "vcache")],
         input_args=["v"], output_args=["vcache"], context=ctx))
 

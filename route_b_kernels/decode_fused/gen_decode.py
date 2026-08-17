@@ -22,7 +22,7 @@ import torch
 
 import newstack_compat  # noqa: F401 — MUST precede iron imports (new-mlir-aie port shim)
 from iron.common import AIEContext
-from iron.common.fusion import FusedMLIROperator, load_elf
+from elf_dispatch_compat import OperatorSequence, load_elf
 from iron.operators.gemv.op import GEMV
 from iron.operators.layer_norm.op import LayerNorm
 from iron.operators.elementwise_add.op import ElementwiseAdd
@@ -520,7 +520,7 @@ def main():
             ins = ", ".join(str(b) for b in bufs[:-1]); out = str(bufs[-1]) if bufs else "?"
             print(f"  {type(op).__name__:16} {out:14} <- {ins}")
         import sys; sys.exit(0)
-    fused = FusedMLIROperator("decode", rl, input_args=["x"], output_args=[out_name],
+    fused = OperatorSequence("decode", rl, input_args=["x"], output_args=[out_name],
                               buffer_sizes=bufsz, context=ctx)
     fused.compile()
     elf = load_elf(fused).view(np.uint8).tobytes()

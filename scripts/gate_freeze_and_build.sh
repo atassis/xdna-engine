@@ -34,7 +34,7 @@ export PYTHONPATH="$IRON:$GENDIR${PYTHONPATH:+:$PYTHONPATH}"
 # IRON delta lives as COMMITS on the fork, not as a .patch. Gate on the symbols gen_decode_batched.py
 # imports rather than a branch name -- see iron_require_api in amd_paths.sh.
 iron_at="$(iron_require_api "gen_decode_batched.py (freeze gate)" \
-  "iron/common/fusion.py:class FusedMLIROperator" \
+  "iron/common/sequence.py:class OperatorSequence" \
   "iron/operators/transpose/op.py:coalesce_batch_dma" \
   "iron/operators/gemv/op.py:dtype_a")" || exit 1
 echo "[freeze] IRON on $iron_at (API surface verified)"

@@ -23,7 +23,7 @@ import ml_dtypes
 import torch
 
 from iron.common import AIEContext
-from iron.common.fusion import FusedMLIROperator, load_elf
+from elf_dispatch_compat import OperatorSequence, load_elf
 from iron.operators.gemv.op import GEMV
 from iron.operators.layer_norm.op import LayerNorm
 from iron.operators.elementwise_add.op import ElementwiseAdd
@@ -179,7 +179,7 @@ def main():
         (op_f2, "Wf2", "h", "ff"), (op_add768, "ff", "bf2", "ff"),
         (op_add768, "x2", "ff", "x3"),
     ]
-    fused = FusedMLIROperator(
+    fused = OperatorSequence(
         "layer", rl, input_args=["x"], output_args=["x3"],
         buffer_sizes={
             "qkv": QKV * 2, "kcache": H * S * HD * 2, "vcache": H * S * HD * 2, "vcT": H * S * HD * 2,

@@ -31,7 +31,7 @@ import ml_dtypes
 
 import newstack_compat  # noqa: F401 -- MUST precede iron imports (new-mlir-aie port shim)
 from iron.common import AIEContext
-from iron.common.fusion import FusedMLIROperator
+from elf_dispatch_compat import OperatorSequence
 from identity_op import Identity
 
 BF16 = ml_dtypes.bfloat16
@@ -71,7 +71,7 @@ def run_arm(arm, c, src, dst, x):
 def main():
     ctx = AIEContext()
     op = Identity(N=N, tile=TILE, context=ctx)
-    fused = FusedMLIROperator(
+    fused = OperatorSequence(
         "fusion_roundtrip_probe",
         [(op, "src", "dst")],
         input_args=["src"],

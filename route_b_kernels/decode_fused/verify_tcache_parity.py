@@ -48,7 +48,7 @@ import numpy as np
 import newstack_compat  # noqa: F401 -- MUST precede iron imports (new-mlir-aie port shim)
 import pyxrt
 from aie.utils.hostruntime.xrtruntime.tensor import XRTTensor
-from iron.common.fusion import FullELFCallable
+from elf_dispatch_compat import FullELFCallable
 from param_scratchpad_compat import get_parameter_scratchpad
 
 BF16 = ml_dtypes.bfloat16

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Does the FusedMLIROperator path round-trip AT ALL?
+"""Does the OperatorSequence path round-trip AT ALL?
 
 Write a known pattern -> identity kernel copies in to out -> read it back. No arithmetic, no
 reduction, no packed output, no tiling cleverness. If this fails, the fusion path is broken
@@ -60,7 +60,7 @@ import ml_dtypes
 
 import newstack_compat  # noqa: F401 -- MUST precede iron imports (new-mlir-aie port shim)
 from iron.common import AIEContext
-from iron.common.fusion import FusedMLIROperator
+from elf_dispatch_compat import OperatorSequence
 from iron.common.sequence import OperatorSequence
 from iron.operators.elementwise_mul.op import ElementwiseMul
 from identity_op import Identity
@@ -68,7 +68,7 @@ from identity_op import Identity
 BF16 = ml_dtypes.bfloat16
 N = int(os.environ.get("PROBE_N", 4096))
 TILE = int(os.environ.get("PROBE_TILE", 1024))
-# PROBE_PATH=fused    -> FusedMLIROperator (emits ELFs for the Rust engine; its Python
+# PROBE_PATH=fused    -> OperatorSequence (emits ELFs for the Rust engine; its Python
 #                        callable path appears to be exercised by nobody)
 # PROBE_PATH=sequence -> OperatorSequence, the path gen_gemma_decode drives to token parity
 #                        and the one that received the residency fix in 2970f8a
@@ -96,7 +96,7 @@ def main():
     if PATH == "sequence":
         fused = OperatorSequence("roundtrip_seq", runlist, dispatch="fused", **kwargs)
     else:
-        fused = FusedMLIROperator("fusion_roundtrip_probe", runlist, **kwargs)
+        fused = OperatorSequence("fusion_roundtrip_probe", runlist, **kwargs)
     fused.compile()
     print(f"[roundtrip] op={OP} path={PATH} N={N} tile={TILE} ntiles={N // TILE}", flush=True)
 
