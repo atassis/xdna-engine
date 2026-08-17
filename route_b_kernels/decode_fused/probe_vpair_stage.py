@@ -15,10 +15,8 @@ for every head and dim, and both parities must survive the next token's write.
 
 Usage: python probe_vpair_stage.py [--compile-only]     (device run is single-tenant)
 
-The device run needs `aie._mlir_libs._parameter_scratchpad`, which the pinned instance is built
-without (toolchain_up.sh passes AIE_ENABLE_XRT_PYTHON_BINDINGS=OFF), so --compile-only is what runs
-here today: it gates the kernel, the design, the in-place pair aliasing and the emitted parameter
-table, and leaves the device claim unmade.
+The per-dispatch parity and column base arrive as scratchpad parameters, via
+param_scratchpad_compat -- the pinned instance omits the pybind module they normally go through.
 """
 
 import argparse
@@ -37,7 +35,7 @@ from vpair_stage_op import VPairStage
 BF16 = ml_dtypes.bfloat16
 H, HD, S = 2, 4, 8          # small enough to print, same shape family as the decode cache
 N = H * HD
-STEPS = 6                   # tokens 0..5, so both parities are exercised repeatedly
+STEPS = S                   # fill the cache, so both parities are exercised to the last column
 
 
 def main():
@@ -75,8 +73,9 @@ def main():
         return
 
     import pyxrt
-    from aie.utils.hostruntime.xrtruntime.parameter_scratchpad import ParameterScratchpad
+    from param_scratchpad_compat import get_parameter_scratchpad
 
+    ParameterScratchpad = get_parameter_scratchpad()
     callable_ = fused.get_callable()
     run = pyxrt.run(callable_.xrt_kernel)
     run.set_arg(0, callable_.input_buffer.buffer_object())
@@ -91,8 +90,11 @@ def main():
     callable_.scratch_buffer.to("npu")
 
     # V(n)[h,d] carries its own token, head and dim, so a landed value names where it came from.
+    # Kept inside 1..255, which bf16 holds exactly: the decimal-decade encoding this replaced ran
+    # past the point where the bf16 step exceeds 1 (step 4 at 600), which both read correct columns
+    # as wrong and collided two dims onto one value, so a misplaced column could hide.
     def vtok(n):
-        return np.array([100 * (n + 1) + 10 * h + d for h in range(H) for d in range(HD)],
+        return np.array([1 + n * (H * HD) + h * HD + d for h in range(H) for d in range(HD)],
                         dtype=np.float32)
 
     print(f"  n  parity  base  columns_correct  cache_ok")
@@ -106,6 +108,10 @@ def main():
         sp.sync()
         run.start()
         run.wait2()
+        # This probe dispatches through pyxrt directly, so nothing tells the runtime the device
+        # wrote the output. Without the mark, `to("cpu")` sees the range already host-resident
+        # from the first readback and no-ops, and every later token reads a stale host copy.
+        callable_.output_buffer.device = "npu"
         callable_.output_buffer.to("cpu")
         cache = np.asarray(vc_buf.data).astype(np.float32).reshape(H, HD, S)
 
