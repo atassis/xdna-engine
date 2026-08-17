@@ -805,6 +805,10 @@ pub struct FusedDecoder {
     /// one column per token through a staged pair, so the per-layer `L*_vpair` buffers are live
     /// carry state that has to be cleared alongside the caches. Default false.
     coalesce_self_tr: bool,
+    /// M0.6 (meta `vstage_direct`): the pair stage writes the transposed cache itself (its own
+    /// fill/drain carry the cache tap + `vcache_off`), so `op_scv` and the `L*_vpair` buffers are
+    /// gone and the carry state IS the cache — clearing the cache is the whole reset. Default false.
+    vstage_direct: bool,
     /// int8 cross-K (meta `int8_cross_k`): quantize each per-utterance Kenc to int8 with the fixed
     /// per-layer `cross_k_scales` (s_k folded into mat_cq at build, so it cancels) + write int8 bytes into
     /// the bf16-typed Kenc buffer (halves its LPDDR re-read). Default false.
@@ -959,6 +963,9 @@ impl FusedDecoder {
         let t_enc = meta["dims"]["T_enc"].as_u64().expect("dims.T_enc") as usize;
         let coalesce_cross = meta.get("coalesce_cross").and_then(|v| v.as_bool()).unwrap_or(false);
         let coalesce_self_tr = meta.get("coalesce_self_tr").and_then(|v| v.as_bool()).unwrap_or(false);
+        let vstage_direct = meta.get("vstage_direct").and_then(|v| v.as_bool()).unwrap_or(false);
+        assert!(!vstage_direct || coalesce_self_tr,
+                "vstage_direct without coalesce_self_tr — the artifact declares a cache write with no cache");
         let int8_cross_k = meta.get("int8_cross_k").and_then(|v| v.as_bool()).unwrap_or(false);
         if int8_cross_k {
             eprintln!("[whisper_decoder] int8_cross_k: per-utterance per-channel Kenc int8 (s_cq -> op_mul_cq on qc)");
@@ -1111,6 +1118,7 @@ impl FusedDecoder {
             t_enc,
             coalesce_cross,
             coalesce_self_tr,
+            vstage_direct,
             int8_cross_k,
             int8_cross_v,
             npu_logits,
@@ -1255,8 +1263,9 @@ impl FusedDecoder {
             self.zero_buf(&format!("L{li}_vcache"));
             // M0.5: the staged pair is carry state — the slot a token does NOT write is copied back
             // into the cache verbatim, so a pair left over from the previous utterance would land as
-            // a real column. Rewinding n_self without clearing it is not a fresh cache.
-            if self.coalesce_self_tr {
+            // a real column. Rewinding n_self without clearing it is not a fresh cache. Under M0.6
+            // the pair IS the cache window, so the zero_buf above already cleared it.
+            if self.coalesce_self_tr && !self.vstage_direct {
                 self.zero_buf(&format!("L{li}_vpair"));
             }
         }
@@ -1272,7 +1281,7 @@ impl FusedDecoder {
         for li in 0..N_LAYERS {
             self.zero_buf(&format!("L{li}_kcache"));
             self.zero_buf(&format!("L{li}_vcache"));
-            if self.coalesce_self_tr {
+            if self.coalesce_self_tr && !self.vstage_direct {
                 self.zero_buf(&format!("L{li}_vpair")); // carry state, see precompute_cross
             }
         }

@@ -92,6 +92,12 @@ def main():
     # 2nd addr scratchpad `vcache_off`=n_self), so op_ct_s reads it directly and op_tr_s is ELIMINATED
     # (kills the per-token self-V transpose round-trip, the #2 inter-op sink). Default OFF.
     ap.add_argument("--coalesce-self-tr", action="store_true", help="M0.5: transposed self vcache, drop op_tr_s")
+    # M0.6: give the pair stage's own fill/drain the cache's strided tap + `vcache_off`, so it reads and
+    # writes vcache[h,d,base:base+2] itself and op_scv DISAPPEARS -- the -1 op the arm was scoped for.
+    # Also retires the `vpair` arena buffer and the host's odd-column priming obligation: the pair IS the
+    # cache, so what the stage carries across dispatches is the cache's own preceding column. Needs
+    # --coalesce-self-tr. Default OFF so both arms stay buildable for the A/B.
+    ap.add_argument("--vstage-direct", action="store_true", help="M0.6: pair stage writes vcache directly, drop op_scv")
     # int8 cross-K (#1 M=1 byte lever, step 1): store the resident cross-K (Kenc) int8 (halves its LPDDR
     # re-read) + run op_sc_c as int8(matrix)xbf16(vector). A FIXED per-layer scale s_k is calibrated from
     # Kenc and FOLDED into mat_cq/bias_cq so it cancels (scores = (s_k*qc).Kenc_int8 = qc.Kenc_real). The
@@ -129,6 +135,7 @@ def main():
     a = ap.parse_args()
     co_cross, co_self = a.coalesce_cross, a.coalesce_self
     co_self_tr = a.coalesce_self_tr
+    vs_direct = a.vstage_direct
     int8_ck = a.int8_cross_k
     int8_cv = a.int8_cross_v
     int8_ffn = a.int8_ffn
@@ -139,6 +146,8 @@ def main():
     npu_logits = a.npu_logits
     if fuse_gelu and not fuse_ffn:
         ap.error("--fuse-gelu requires --fuse-bias-ffn (the epilogue needs op_f1 to output W·x+bias)")
+    if vs_direct and not co_self_tr:
+        ap.error("--vstage-direct requires --coalesce-self-tr (it fuses that arm's op_scv into the stage)")
     VS = 64  # kernel_vector_size — K must stay a multiple of it; K-aug pads by exactly one VS block
     if fuse_ffn and int8_ffn:
         ap.error("--fuse-bias-ffn + --int8-ffn not supported together yet (int8 quant of the aug weight)")
@@ -203,11 +212,16 @@ def main():
         #   op_scv:    pair[H,HD,2] -> vcache[h, d, base:base+2],  base = vcache_off = n & ~1
         # The pair is one arena buffer read and rewritten in place, which is what carries the previous
         # token's column across dispatches. Confirmed on device over the full cache width, both parities.
-        op_vstage = VPairStage(N=H * HD, parity_parameter="v_par", context=ctx)
+        #   M0.6 (--vstage-direct): the stage's OWN fill/drain carry that same [H,HD,2] cache tap and
+        #   `vcache_off`, so the pair it reads and rewrites IS the cache window and op_scv is gone.
+        op_vstage = VPairStage(N=H * HD, parity_parameter="v_par", context=ctx,
+                               **(dict(pair_sizes=(H, HD, 2), pair_strides=(HD * S, S, 1),
+                                       pair_buffer_size=H * S * HD, pair_offset_parameter="vcache_off")
+                                  if vs_direct else {}))
         sc_v = dict(input_sizes=(H, HD, 2), input_strides=(HD * 2, 2, 1), input_offset=0,
                     output_sizes=(H, HD, 2), output_strides=(HD * S, S, 1), output_offset=0,
                     input_buffer_size=H * HD * 2, output_buffer_size=H * S * HD, num_aie_channels=1)
-        op_scv = StridedCopy(**sc_v, output_offset_parameter="vcache_off", context=ctx)
+        op_scv = None if vs_direct else StridedCopy(**sc_v, output_offset_parameter="vcache_off", context=ctx)
     else:
         op_vstage = None
         op_scv = StridedCopy(**sc, output_offset_parameter="kv_off", context=ctx)
@@ -334,7 +348,7 @@ def main():
             weights_to_write[pre + "s_cq"] = bf16(s_cq)  # per-channel qc scale; host overwrites per utterance
         if int8_cv:
             weights_to_write[pre + "s_cv"] = bf16(s_cv)  # per-channel ctc scale; host overwrites per utterance
-        if co_self_tr:
+        if co_self_tr and not vs_direct:
             # M0.5: the staged pair must ENTER the run already holding the cache's (base, base+1)
             # columns, base = first_token & ~1. The carried slot is written back to the cache
             # verbatim, so with an ODD first column it lands on column base -- a VALID preceding
@@ -378,10 +392,11 @@ def main():
             bufsz[pre + "vcTc"] = H * TP * HD * 2
         if not co_self_tr:  # self-V transpose output buffer only when NOT storing vcache transposed (M0.5)
             bufsz[pre + "vcT"] = H * S * HD * 2
-        else:
+        elif not vs_direct:
             # staged column pair [H,HD,2], read and rewritten in place each token so the slot this token
             # does not write still holds the previous token's V. 3072 B, a whole number of 64 B granules,
             # so it does not consume the arena's one ragged-buffer-must-be-last slot (IRON 4dff5d0).
+            # --vstage-direct has no such buffer: the stage reads and rewrites the cache window itself.
             bufsz[pre + "vpair"] = H * HD * 2 * 2
 
         nxt = f"x{l+1}"  # layer output residual buffer
@@ -397,10 +412,13 @@ def main():
             self_tr = [(op_tr_s, f"{pre}vcache[{h*phs}:{(h+1)*phs}]", f"{pre}vcT[{h*phs}:{(h+1)*phs}]") for h in range(H)]
             v_ct = "vcT"
         # (1b) new-token V into the cache. Op ledger for the V write + transpose: deep-C 1+12=13,
-        # --coalesce-self 1+1=2, this arm 2+0=2. So it is op-count NEUTRAL against --coalesce-self, not the
-        # -1 the flag was first scoped for (see the epilogue note above the runlist). It pays in bytes
-        # instead: op_tr_s restages the whole [H,S,HD] cache every token (O(S)), the pair stage one pair.
-        if co_self_tr:
+        # --coalesce-self 1+1=2, this arm 2+0=2, +--vstage-direct 1+0=1. So the arm is op-count NEUTRAL
+        # against --coalesce-self until the stage absorbs the cache write, which is the -1. It also pays
+        # in bytes: op_tr_s restages the whole [H,S,HD] cache every token (O(S)), the pair stage one pair,
+        # and direct mode drops the pair's L3 round-trip through the arena on top of that.
+        if co_self_tr and vs_direct:
+            v_write = [(op_vstage, pre + "qkv[3072:4608]", pre + "vcache", pre + "vcache")]
+        elif co_self_tr:
             v_write = [(op_vstage, pre + "qkv[3072:4608]", pre + "vpair", pre + "vpair"),
                        (op_scv, pre + "vpair", pre + "vcache")]
         else:
@@ -599,7 +617,9 @@ def main():
         # RESUMES at an odd column, prime L*_vpair with that column's existing pair -- vcache[:, :,
         # (n_self & ~1) : (n_self & ~1) + 2] -- or the pair's unwritten slot is written back over the
         # preceding token's column. gen_decode emits a correctly-seeded L*_vpair for its own P.
-        "coalesce_self_tr": bool(co_self_tr),
+        # M0.6 (vstage_direct): obligation (c) is GONE -- there is no L*_vpair, the stage reads its
+        # carried column out of the cache the host already seeded. (a) and (b) are unchanged.
+        "coalesce_self_tr": bool(co_self_tr), "vstage_direct": bool(vs_direct),
         **({"vcache_param": "vcache_off", "vparity_param": "v_par"} if co_self_tr else {}),
         # int8 cross-K (per-utterance per-channel): L*_Kenc are int8 [H,TP,HD]; the host quantizes Kenc per
         # utterance + writes the L*_s_cq [D] per-channel scale buffer that op_mul_cq applies to qc.

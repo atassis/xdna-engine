@@ -36,17 +36,24 @@ done
 python3 - "$BASE" "$TR" <<'PY' || exit 1
 import json, sys
 b, t = (json.load(open(f"{d}/meta.json")) for d in sys.argv[1:3])
-if not t.get("coalesce_self_tr"):
-    sys.exit(f"[ERR] {sys.argv[2]} was not built with --coalesce-self-tr")
-if b.get("coalesce_self_tr"):
-    sys.exit(f"[ERR] {sys.argv[1]} IS a tr arm; it is the baseline")
+# Two stackable arms live on this axis, so the pairing rule is "differ in exactly ONE of them":
+# coalesce_self_tr (M0.5, transposed cache) and vstage_direct (M0.6, the stage writes that cache
+# itself and op_scv is gone). Pairing M0.6 against M0.5 isolates the fused write; pairing either
+# against the plain arm isolates the transposed cache. Pairing M0.6 against plain moves both.
+AXES = ("coalesce_self_tr", "vstage_direct")
+moved = [k for k in AXES if bool(b.get(k)) != bool(t.get(k))]
+if len(moved) != 1:
+    sys.exit(f"[ERR] arms must differ in exactly one of {AXES}; they differ in {moved or 'none'}")
+axis = moved[0]
+if not bool(t.get(axis)):
+    sys.exit(f"[ERR] {sys.argv[1]} is the {axis} arm; pass it as TR and the other as BASE")
 for k in ("coalesce_cross", "coalesce_self", "int8_cross_k", "int8_cross_v", "int8_ffn",
-          "int8_attn_w", "npu_logits"):
-    if b.get(k) != t.get(k):
-        sys.exit(f"[ERR] arms differ in {k} ({b.get(k)} vs {t.get(k)}) as well as the self-V cache")
+          "int8_attn_w", "npu_logits") + tuple(k for k in AXES if k != axis):
+    if bool(b.get(k)) != bool(t.get(k)):
+        sys.exit(f"[ERR] arms differ in {k} ({b.get(k)} vs {t.get(k)}) as well as {axis}")
 if b["dims"] != t["dims"]:
     sys.exit(f"[ERR] arms differ in dims: {b['dims']} vs {t['dims']}")
-print(f"[pair] arms differ in coalesce_self_tr alone; tr params = {sorted(t['scratchpad']['params'])}")
+print(f"[pair] arms differ in {axis} alone; tr params = {sorted(t['scratchpad']['params'])}")
 PY
 
 echo "[gate] $STEPS steps/arm, base=$BASE tr=$TR"
@@ -85,6 +92,15 @@ if fuser /dev/accel/accel0 >/dev/null 2>&1 || pgrep -f 'npu serve' >/dev/null 2>
   exit 1
 fi
 echo "[svc] device clear"
+
+# Stopping the NPU units is NOT the same as a quiesced box, and the timing half is what notices.
+# MEASURED 2026-08-17: with a Wine/Proton app at ~392% CPU (load 8.4) the drift control widened
+# 0.539 -> 5.690 ms, which is wide enough to hide any per-step effect smaller than the ops we are
+# removing. Record the host load around the timed section so a delta can never be read as a result
+# on a box that was busy; the verdict below downgrades itself rather than blocking the run.
+LOAD_MAX="${LOAD_MAX:-2.0}"
+cut -d' ' -f1 /proc/loadavg > "$OUT/loadavg.pre"
+echo "[load] 1-min load average before timed runs: $(cat "$OUT/loadavg.pre") (quiet bar $LOAD_MAX)"
 
 run(){ # $1 label  $2 dir
   LD_LIBRARY_PATH="$LDLIB" "$BIN" "$2" "$STEPS" 2>"$OUT/$1.err" > "$OUT/$1.ids"
@@ -131,14 +147,23 @@ sys.exit(1)
 PY
 rc=$?
 
+cut -d' ' -f1 /proc/loadavg > "$OUT/loadavg.post"
+
 echo "=============== PER-STEP SPEED ==============="
 grep -h '^\[time\]' "$OUT"/base.err "$OUT"/tr.err "$OUT"/tr2.err "$OUT"/base2.err 2>/dev/null \
   | sed 's/^/  /' || true
 # The verdict is deliberately conservative: a delta the drift control cannot separate from run-to-run
 # noise is reported as NO MEASURABLE DIFFERENCE, not as a win.
-python3 - "$OUT" <<'PY'
+python3 - "$OUT" "$LOAD_MAX" <<'PY'
 import re, sys, pathlib
 out = pathlib.Path(sys.argv[1])
+load_max = float(sys.argv[2])
+def load(which):
+    p = out / f"loadavg.{which}"
+    return float(p.read_text().strip()) if p.exists() else None
+lo_pre, lo_post = load("pre"), load("post")
+busy = max(x for x in (lo_pre, lo_post) if x is not None) > load_max \
+    if any(x is not None for x in (lo_pre, lo_post)) else False
 def median(label):
     p = out / f"{label}.err"
     if not p.exists(): return None
@@ -153,7 +178,12 @@ print(f"[speed] baseline median {base:.3f} ms/step (runs {b1:.3f}, {b2:.3f})")
 print(f"[speed] tr arm   median {tr:.3f} ms/step (runs {t1:.3f}, {t2:.3f})")
 print(f"[speed] delta {delta:+.3f} ms/step ({100 * delta / base:+.2f}%); "
       f"drift control (worst same-arm spread) {spread:.3f} ms")
-if abs(delta) <= spread:
+print(f"[speed] host load average {lo_pre} -> {lo_post} (quiet bar {load_max})")
+if busy:
+    print(f"[speed] VERDICT: INCONCLUSIVE -- the box was NOT quiesced (load > {load_max}), which is "
+          f"what the {spread:.3f} ms drift control is measuring. Stopping the NPU units does not "
+          f"stop host CPU load. Re-run on an idle box before reading the delta as anything.")
+elif abs(delta) <= spread:
     print("[speed] VERDICT: NO MEASURABLE DIFFERENCE -- |delta| is within run-to-run drift, so this "
           "run does not support a speed claim in either direction.")
 else:
