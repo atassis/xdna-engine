@@ -106,13 +106,16 @@ mode_tag=$(if $(filter 1,${glu}),modalglu,$(if $(filter 1,${gelu}),modalgelu,$(i
 # needs its own artifact name or it would overwrite the row-major stream. A bf16-out build
 # is a different xclbin outright (the C buffers resize), so it is tagged too.
 dep_tag=$(if $(filter 2,$(WA_C_DEPTH)),d2,)
+# A single-buffered A/B pair is a DIFFERENT xclbin (the L1 buffers halve), so it needs its own name
+# or it silently overwrites the shipped depth-2 stream.
+abdep_tag=$(if $(filter 1,$(WA_AB_DEPTH)),ab1,)
 nat_tag=$(if $(filter 1,${emulate_bfloat16_mmul_with_bfp16}),,nat)
 re_tag=$(if $(filter 1,${round_even}),re,)$(if $(filter 1,${silu_f32_tail}),ft,)$(if $(filter 1,${silu_f32_tanh}),fh,)
 panel_tag=$(if $(filter 0,${c_panel_width}),,panel${c_panel_width})
 out_tag=$(if $(filter bf16,${dtype_out}),bf16out,)
 krtp_tag=$(if $(filter 1,${k_loop_rtp}),krtp,)
 apanel_tag=$(if $(filter 0,${a_panel_width}),,apanel${a_panel_width})
-target_suffix=${M}x${K}x${N}_${m}x${k}x${n}_${n_aie_cols}c_${mode_tag}${out_tag}${panel_tag}${dep_tag}${re_tag}${nat_tag}${krtp_tag}${apanel_tag}
+target_suffix=${M}x${K}x${N}_${m}x${k}x${n}_${n_aie_cols}c_${mode_tag}${out_tag}${panel_tag}${dep_tag}${abdep_tag}${re_tag}${nat_tag}${krtp_tag}${apanel_tag}
 
 use_iron=1
 aie_py_src=whole_array_modal_iron.py

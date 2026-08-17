@@ -84,6 +84,11 @@ endif
 WA_C_DEPTH ?= 1
 export WA_C_DEPTH
 
+# Depth of the L1 A and B tiles. 2 (double-buffered) is what ships and what the L1 budget is built
+# around; 1 is the K-sweep mode, which spends the overlap to buy a longer K tile. Same export reason.
+WA_AB_DEPTH ?= 2
+export WA_AB_DEPTH
+
 ifeq ($(PROFILE),trace)
 wa_trace_size ?= 65536
 else

@@ -323,6 +323,12 @@ def my_matmul(
     import os as _os
 
     c_fifo_depth = int(_os.environ.get("WA_C_DEPTH", str(fifo_depth)))
+    # Same knob for the L1 side of A and B (WA_AB_DEPTH=1). At m=64/n=128 the depth-2 A+B pair is
+    # 48 KB of a 64 KB L1 against C's 32 KB, so k cannot rise past 32 without spending it: k=64
+    # fails allocation outright. Single-buffering trades DMA/compute overlap for K amortization,
+    # and the k=32 trace says that overlap is currently idle -- objectfifo_wait 0%, DISABLED never
+    # fires, INSTR_LOCK_ACQUIRE_REQ 0.06%. Only the L1 side; the L2 fifos are not the constraint.
+    ab_fifo_depth = int(_os.environ.get("WA_AB_DEPTH", str(fifo_depth)))
 
     n_tiles_per_core = (M // m) * (N // n) // n_aie_cores
 
@@ -413,6 +419,7 @@ def my_matmul(
                 obj_types=[A_l1_ty] * (stop_row - start_row),
                 names=[f"A_L2L1_{row}" for row in range(start_row, stop_row)],
                 dims_to_stream=dims_to_stream,
+                depths=[ab_fifo_depth] * (stop_row - start_row),
             )
         )
 
@@ -433,6 +440,7 @@ def my_matmul(
                 obj_type=B_l1_ty,
                 name=f"B_L2L1_{col}",
                 dims_to_stream=dims_to_stream,
+                depth=ab_fifo_depth,
             )
         )
 
