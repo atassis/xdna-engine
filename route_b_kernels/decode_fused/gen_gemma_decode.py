@@ -267,7 +267,7 @@ def main():
     # deep-C params.txt (kv_off addr + sm_mask core), same parse as gen_decode.py.
     import glob
     import shutil
-    _pp = sorted(glob.glob("**/gemma_decode*.mlir.prj/params.txt", recursive=True), key=os.path.getmtime)
+    _pp = sorted(glob.glob("**/params.txt", recursive=True), key=os.path.getmtime)
     scratchpad_params = {}
     if _pp:
         shutil.copy(_pp[-1], os.path.join(a.out, "params.txt"))

@@ -477,14 +477,16 @@ def main():
     # scratchpad is a u32 array; addr-kind values are written raw, core-kind values are written <<2
     # (firmware UPDATE_REG requirement — the core right-shifts by 2 after reading).
     import glob, shutil
-    _pp = sorted(glob.glob("**/decode*.mlir.prj/params.txt", recursive=True), key=os.path.getmtime)
+    _pp = sorted(glob.glob("**/params.txt", recursive=True), key=os.path.getmtime)
+    # kv_off and sm_mask are declared unconditionally above, so a missing table means the ELF cannot
+    # be driven per-token -- ship nothing rather than a meta.json with an empty params dict.
+    assert _pp, "no params.txt emitted: the ctrl-scratchpad StateTable is missing"
     scratchpad_params = {}
-    if _pp:
-        shutil.copy(_pp[-1], os.path.join(a.out, "params.txt"))
-        for line in open(_pp[-1]).read().splitlines()[1:]:
-            if line.strip():
-                nm, idx, ty, kind = line.split()
-                scratchpad_params[nm] = {"byte_offset": int(idx) * 4, "kind": kind, "dtype": ty}
+    shutil.copy(_pp[-1], os.path.join(a.out, "params.txt"))
+    for line in open(_pp[-1]).read().splitlines()[1:]:
+        if line.strip():
+            nm, idx, ty, kind = line.split()
+            scratchpad_params[nm] = {"byte_offset": int(idx) * 4, "kind": kind, "dtype": ty}
 
     # ---- device-faithful golden (N-layer forward) ----
     x = bf16(rng.standard_normal(D).astype(np.float32))

@@ -313,7 +313,7 @@ def main():
     scratchpad_params = {}
     if sp:
         import glob as _glob, shutil as _shutil
-        _pp = sorted(_glob.glob("**/decode_b*.mlir.prj/params.txt", recursive=True), key=os.path.getmtime)
+        _pp = sorted(_glob.glob("**/params.txt", recursive=True), key=os.path.getmtime)
         assert _pp, "scratchpad mode but no params.txt found (StateTable not emitted)"
         _shutil.copy(_pp[-1], os.path.join(a.out, "params.txt"))
         for line in open(_pp[-1]).read().splitlines()[1:]:

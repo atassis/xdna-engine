@@ -148,7 +148,7 @@ def main():
     fused.compile()
     callable_ = fused.get_callable()
 
-    params_path = sorted(glob.glob("**/decode*.mlir.prj/params.txt", recursive=True), key=os.path.getmtime)[-1]
+    params_path = sorted(glob.glob("**/params.txt", recursive=True), key=os.path.getmtime)[-1]
     print("params.txt:", params_path, "->", open(params_path).read().strip().replace("\n", " | "))
 
     def put2(name, arr):
