@@ -156,6 +156,17 @@ def main(o):
     print(f"[gemm-trace] {o.suffix} M={M} K={K} N={N} trace_size={o.trace_size}", flush=True)
     kern(A, B, C)
 
+    # An occupancy number off a kernel that computes the wrong thing is worse than no number, and
+    # this probe is used to COMPARE builds -- a K-tile or fifo-depth arm changes the compiled kernel
+    # object, not just the timing, so a timing variant here can be fast and wrong.
+    # 0.08 is the same rel-L2 bar the other whole_array probes use for bf16-in / f32-accumulate.
+    ref = (np.asarray(A).reshape(M, K).astype(np.float32)
+           @ np.asarray(B).reshape(K, N).astype(np.float32))
+    got = np.asarray(C).reshape(M, N).astype(np.float32)
+    rel_l2 = float(np.linalg.norm(got - ref) / np.linalg.norm(ref))
+    gate = "PASS" if rel_l2 <= 0.08 else "FAIL"
+    print(f"[gemm-trace] rel-L2 = {rel_l2:.4e}  {gate} (bar 0.08)", flush=True)
+
     size = os.path.getsize(trace_txt) if os.path.exists(trace_txt) else 0
     print(f"[gemm-trace] trace.txt {size} B", flush=True)
     if not size:
@@ -164,7 +175,8 @@ def main(o):
 
     tc.trace_to_json(prj_mlir, trace_json)
     res = summarize(trace_json)
-    res.update(suffix=o.suffix, M=M, K=K, N=N, trace_size=o.trace_size)
+    res.update(suffix=o.suffix, M=M, K=K, N=N, trace_size=o.trace_size,
+               rel_l2=rel_l2, correctness=gate)
     out = os.path.join(o.artifacts, f"gemm_trace_summary_{o.suffix}.json")
     json.dump(res, open(out, "w"), indent=2)
 
