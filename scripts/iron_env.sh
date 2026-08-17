@@ -22,6 +22,12 @@ export XRT_LIB_DIR=/usr/lib
 # reads like a toolchain bug rather than a missing dependency. Point AIEBU_ASM_DIR at the directory
 # holding it (an XRT build tree's .../aiebu/build/Release/src/cpp/utils/asm works); otherwise try the
 # standard XRT install. Silent when it is already on PATH.
+#
+# AIEBU_ASM_DIR's default comes from amd_paths.sh, so source it here rather than relying on
+# the caller having done so: this file's own header says `source scripts/iron_env.sh` is
+# enough, and without it the search below sees an empty AIEBU_ASM_DIR and every aiecc run
+# dies on its LAST edge with exactly the message above.
+. "$REPO/scripts/amd_paths.sh"
 if ! command -v aiebu-asm >/dev/null 2>&1; then
   for _d in "${AIEBU_ASM_DIR:-}" "${XILINX_XRT:-/opt/xilinx/xrt}/bin"; do
     [ -n "$_d" ] && [ -x "$_d/aiebu-asm" ] && { export PATH="$_d:$PATH"; break; }

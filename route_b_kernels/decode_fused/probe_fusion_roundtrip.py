@@ -12,20 +12,26 @@ output sync, mirroring OperatorSequence) and (b) a bisect down to the STOCK un-c
 ASR-size shape, which fails identically. Meanwhile the same argmax kernel is index-exact on
 the brick verify rail. So the fault is the path, not the kernel and not the tiling.
 
-ROOT CAUSE (found 2026-07-26): the unfenced-shim CLFLUSH read race on the
-XRTTensor/XRTSubBuffer device->host sync. Identified from the GEOMETRY of the corruption,
-not from another bisect -- the correct-element counts were 32, 64 and 128 bf16 = 64, 128
-and 256 bytes = exactly 1, 2 and 4 x 64-byte cache lines, varying run to run, with the rest
-reading as stale zeros. Cache-line-quantised staleness is an invalidation problem; a tap or
-offset error would be quantised by tile geometry instead, and a logic error would not move
-between runs. Eliminated on device first: argmax, chunking, vocab size, the residency
-flags, the placer, and hand-written-vs-built-in ops (IRON's own ElementwiseMul as x*1.0
-fails identically to the identity op here).
+ROOT CAUSE (2026-08-17, and it is NOT what this file recorded for three weeks). The
+cache-line-quantised staleness was real -- correct-element counts of 32/64/128 bf16 = 1/2/4
+x 64-byte lines, varying run to run -- but it was not an XRT invalidation bug, and no fenced
+shim was needed. The dirty lines were OURS. `dst.data[:] = 0` below writes the output arena
+through the raw `.data` array, which `NpuTensor.data` documents as the one write that is not
+reconciled: nothing is recorded, so nothing is flushed, and the host keeps dirty zero lines
+over the region the DMA is about to write. The device-to-host sync afterwards does not
+discard them, so they shadow the device's output and this probe read back its own pre-fill.
+Which lines survived was eviction luck, which is the run-to-run variation that read as a race.
 
-So this probe is EXPECTED to stay red until the fenced XRT shim lands. It is kept as the
-reproducer and as the regression guard for the day it goes green. Until then, gate device
-work on the iron.tensor rail (bricklib), which ran 22 bricks at run2run=0.00e+00 and is
-unaffected -- NOT on this path.
+MEASURED with a sentinel pre-fill (probe_fusion_output_prefill.py, three arms over one ELF):
+pre-fill 0 -> 1024/1024 read 0; pre-fill 7168 -> 1024/1024 read 7168 and none read 0, so the
+device had written the whole output; pre-fill 7168 then flushed before dispatch -> 1024/1024
+exact. Fixed in `FusedFullELFCallable._sync_inputs` (and `_FusedArenaCallable`'s copy in
+sequence.py) by flushing the output arena to the device alongside the input, which retires
+the dirty lines. This probe now passes 3/3 at N=1024 and 4096, tile 1024 and 4096, for the
+hand-written Identity and for IRON's built-in ElementwiseMul.
+
+Kept as the regression guard for that class: a caller that pre-fills an output arena through
+`.data` and reads plausible-looking stale bytes is silent, and this is where it shows.
 
 Doubles as the permanent regression guard for that whole class: four separate
 harness/runtime bugs in one day presented as kernel bugs, and a round-trip assert catches

@@ -110,25 +110,21 @@ def main():
     for nm in cases:
         x, _ = make_case(nm, rng)
         ref = int(np.argmax(x.astype(np.float32)))       # numpy: first-max wins ties
-        # Run TWICE and require the two reads to agree. The XRT shim in use is unfenced and
-        # has a known CLFLUSH read race that returns stale / cold-zero output; a fenced shim
-        # build is the real fix. The brick verify rail guards it the same way (run twice,
-        # report run-to-run delta).
-        # Running once here produced exactly that signature: 0/64 partials on most cases and
-        # 24/64 on one, varying run to run -- which reads like a tiling bug but is the race.
+        # Run TWICE and require the two reads to agree. This was written against a supposed
+        # unfenced-shim CLFLUSH race (0/64 partials on most cases, 24/64 on one, varying run
+        # to run). That cause was wrong: the stale bytes were this harness's own `am.data[:] =
+        # 0` pre-fill, an unreconciled write leaving dirty host lines over the region the DMA
+        # writes -- see probe_fusion_roundtrip.py's ROOT CAUSE. Since the arena flush landed in
+        # FusedFullELFCallable._sync_inputs, every case agrees on the first pair (tries=2).
+        # The agreement check stays as the guard, not as a workaround.
         def run_once():
             np.copyto(lg.data, x.reshape(-1))
             am.data[:] = 0
-            # NOTE: no manual residency forcing here any more. That workaround
-            # (input_buffer.device="cpu"; output_buffer.device="npu") is now done properly
-            # inside FusedFullELFCallable._sync_inputs/_sync_outputs, matching what
-            # OperatorSequence already did. If zeros come back, the fix did not take.
             c()
             return np.array(am.data, copy=True)
 
-        # Retry until two consecutive reads agree AND are not the all-zero cold read. A single
-        # pair is not enough here: the race yields all-zeros often enough that two zero reads
-        # can agree with each other and look "stable" while being pure artifact.
+        # Two consecutive reads must agree AND be non-zero: an all-zero pair agrees with
+        # itself, so requiring non-zero is what stops an artifact from reading as stable.
         prev, r2, stable, tries = run_once(), None, False, 1
         for tries in range(2, 13):
             r2 = run_once()
