@@ -11,6 +11,7 @@
 # pkg_J_per_transcription + e2e_ms + decode_ms. The byte cut is certain (meta layout); this measures whether
 # it converts to real J + wall-time at M=1 (decode is launch-overhead-bound, so the conversion is the unknown).
 set -u
+. "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/_npu_services.sh" || exit 1   # unit names + asserted quiesce
 cd "$(dirname "$0")/.."
 REPO="$(pwd)"
 CLIP="${1:-$REPO/artifacts/wer_clips/en_01.wav}"
@@ -30,10 +31,10 @@ if awk "BEGIN{exit !($LOAD > 3.0)}"; then
 fi
 for p in 'npu serve'; do pgrep -af "$p" | grep -qv 'grep' && echo "[measure] NOTE: $p running — will be stopped below"; done
 
-restart() { echo "[measure] restarting npu services"; systemctl --user start npu-serve voxd 2>/dev/null; }
+restart(){ npu_svc_start; }
 trap restart EXIT
-echo "[measure] stopping services + clearing device (single-tenant)"
-systemctl --user stop npu-serve voxd 2>/dev/null
+echo "[measure] quiescing + clearing device (single-tenant)"
+npu_svc_stop || exit 1
 pkill -f 'npu[ ]serve' 2>/dev/null   # bracket avoids self-match of this script's own cmdline
 sleep 3
 if fuser /dev/accel/accel0 2>/dev/null; then echo "[measure] ERROR: device still busy"; exit 1; fi

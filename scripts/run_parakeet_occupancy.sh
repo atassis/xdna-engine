@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Phase-0 per-op occupancy run for the Parakeet encoder (brick #8, measure-first gate).
-# RUN phase (needs the NPU). Single-tenant: stops npu-asr/voxd, ALWAYS restarts on
+# RUN phase (needs the NPU). Single-tenant: quiesces the NPU services, ALWAYS restarts on
 # exit, fuser-checks the device first (serialize -- single-tenant NPU).
 #
 # Pipeline:
@@ -14,13 +14,14 @@
 #   scripts/run_parakeet_occupancy.sh                 # fast tile 64x32x128 (default)
 #   TILE=32x32x32 scripts/run_parakeet_occupancy.sh   # native bf16 (golden-gated)
 set -euo pipefail
+. "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/_npu_services.sh" || exit 1   # unit names + asserted quiesce
 REPO="$(cd "$(dirname "$0")/.." && pwd)"; cd "$REPO"
 TILE="${TILE:-64x32x128}"
 ITERS="${ITERS:-50}"
 LOG="$REPO/artifacts/parakeet/occupancy/run.log"; mkdir -p "$(dirname "$LOG")"
 log(){ echo "$@" | tee -a "$LOG"; }
 
-restart(){ systemctl --user start xdna-engine.service voxd.service >/dev/null 2>&1 || true; log "[svc] npu services restarted"; }
+restart(){ npu_svc_start; }
 
 # --- CPU-side prep (no NPU) ---
 log "[1/4] CPU goldens + roofline"
@@ -36,9 +37,9 @@ log "[3/4] DATA_MOVEMENT_ONLY stub xclbin ($TILE)"
 TILE="$TILE" scripts/build_parakeet_occupancy_stub.sh 2>&1 | tee -a "$LOG"
 
 # --- NPU run (serialize) ---
-log "[svc] stopping npu-asr / voxd"
-systemctl --user stop xdna-engine.service voxd.service >/dev/null 2>&1 || true; sleep 1
+log "[svc] quiescing (single-tenant)"
 trap restart EXIT
+npu_svc_stop || exit 1
 if fuser /dev/accel/accel0 >/dev/null 2>&1; then
   log "FATAL: /dev/accel/accel0 busy -- another session holds the NPU. Aborting (serialize)."
   fuser -v /dev/accel/accel0 2>&1 | tee -a "$LOG"; exit 1

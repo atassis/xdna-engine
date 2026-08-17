@@ -12,12 +12,13 @@
 #
 # Builds the probe ELFs (device-free) if missing, then dispatches each on the NPU via fused_elf_probe
 # FUSED_TIME (reports "dispatch alone" ms) and the rel-L2 <= 0.08 correctness gate. Fully unattended:
-# stops npu-asr/voxd, ALWAYS restarts them on exit, fuser-checks the device, beeps when done.
+# quiesces the NPU services, ALWAYS restarts them on exit, fuser-checks the device, beeps when done.
 # RAPL note: energy not measured here (dispatch-only microbench); ms/tok is the signal.
 # =============================================================================================
 # Env: NUM_COLS (default 1) selects the array config / artifact dir tag. Full-array sweep:
 #   NUM_COLS=8 bash scripts/gemm_probe_sweep.sh "128 256 512"
 set -u
+. "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/_npu_services.sh" || exit 1   # unit names + asserted quiesce
 WT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$WT"
 NS="${1:-16 32 64 128}"
 NUM_COLS="${NUM_COLS:-1}"
@@ -28,7 +29,7 @@ TS="$(date +%Y%m%d_%H%M%S)"
 LOG="$WT/artifacts/gemm_probe_sweep_${TS}.log"
 mkdir -p "$WT/artifacts"; : > "$LOG"
 log(){ echo -e "$*" | tee -a "$LOG"; }
-restart(){ systemctl --user start xdna-engine.service voxd.service >/dev/null 2>&1; log "[svc] npu services restarted"; }
+restart(){ npu_svc_start; }
 beep(){ ( speaker-test -t sine -f 1000 -l 1 >/dev/null 2>&1 & local p=$!; sleep 1; kill -9 "$p" >/dev/null 2>&1 ); }
 trap 'restart; beep; log "[done] log: $LOG"' EXIT
 
@@ -45,8 +46,8 @@ log "[build] fused_elf_probe (release)"
 ( cd "$WT/rust" && cargo build --release -p npu-probes --bin fused_elf_probe ) >>"$LOG" 2>&1 || { log "FATAL: probe build failed"; exit 1; }
 
 # 3) claim the single-tenant NPU
-log "[svc] stopping npu-asr / voxd"
-systemctl --user stop xdna-engine.service voxd.service >/dev/null 2>&1
+log "[svc] quiescing (single-tenant)"
+npu_svc_stop || exit 1
 sleep 1
 if fuser /dev/accel/accel0 >/dev/null 2>&1; then
   log "FATAL: /dev/accel/accel0 still busy — another session holds the NPU. Aborting (single-tenant NPU, serialize with other sessions)."

@@ -5,9 +5,10 @@
 #   self     = artifacts/fd12_self             (--coalesce-self)
 # Reuses the deep-C resident engine path (only the transposes differ). Measures e2e ms, ms/token,
 # per-phase decode breakdown (FUSED_PHASE), and RAPL pkg energy J/transcription (if readable).
-# Single-tenant: stops npu-asr+voxd, restarts on exit. Correctness already gated in
+# Single-tenant: quiesces the NPU services, restarts on exit. Correctness already gated in
 # coalesce-cross-self-validated.md (all = WER 0.1172). This run is TIMING/ENERGY only.
 set -u
+. "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/_npu_services.sh" || exit 1   # unit names + asserted quiesce
 WT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$WT"
 W3="$WT/rust/target/release/whisper_e2e_timing"
 LDLIB=~/.local/lib/npu-asr
@@ -15,7 +16,7 @@ CLIP="$WT/artifacts/wer_clips/en_01.wav"
 TS="$(date +%Y%m%d_%H%M%S)"; LOG="$WT/artifacts/coalesce_e2e_ab_${TS}.log"
 mkdir -p "$WT/artifacts"; : > "$LOG"
 log(){ echo -e "$*" | tee -a "$LOG"; }
-restart(){ systemctl --user start xdna-engine.service voxd.service >/dev/null 2>&1; echo "[svc] npu services restarted" | tee -a "$LOG"; }
+restart(){ npu_svc_start; }
 trap 'restart; echo "[done] log: $LOG"' EXIT
 
 [ -x "$W3" ] || { log "[ERR] whisper_e2e_timing missing — build: (cd rust && cargo build -p npu-probes --release --bin whisper_e2e_timing)"; exit 1; }
@@ -34,8 +35,8 @@ else sudo -n chmod -R a+r /sys/class/powercap/intel-rapl*/ 2>/dev/null || true
 fi
 
 log "================ COALESCE E2E A/B  $TS ================"
-log "[svc] stopping npu-asr + voxd (single-tenant) ..."
-systemctl --user stop xdna-engine.service voxd.service; sleep 2
+log "[svc] quiescing for single-tenant NPU ..."
+npu_svc_stop || exit 1
 fuser /dev/accel/accel0 2>/dev/null && { log "[ERR] device busy — aborting"; exit 1; }
 log "[svc] device clear"
 

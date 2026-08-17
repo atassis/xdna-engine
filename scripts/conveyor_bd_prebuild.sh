@@ -2,7 +2,7 @@
 # Build the H=4 BD-ON-CHIP conveyor xclbin (4-stage column BD->scores->softmax->ctx per head, BD computed
 # on-chip -> NO host BD precompute) into artifacts/conveyor_bd/single/{final.xclbin,insts.bin}. Shipped as
 # H=4x2 (dispatch twice for 8 heads). Real Parakeet dims TQ=8 T=176 DK=128 N_QT=22 P=351 BD_KB=39 H=4.
-# Device hygiene first: systemctl --user stop npu-asr npu-vox ; fuser /dev/accel/accel0 (clear).
+# Device hygiene first: systemctl --user stop xdna-engine npu-vox ; fuser /dev/accel/accel0 (clear).
 set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$REPO"
 TQ=8; T=176; DK=128; NQT=22; BD_KB=39; H=4; INV=0.08838835

@@ -2,7 +2,7 @@
 # RUN the LPDDR bandwidth microbench sweep on the NPU (needs a window). Single-tenant device
 # discipline copied from run_parakeet_dma_occupancy.sh: stop the NPU services, fuser-check the
 # device is free, timeout-guard, and ALWAYS restart services on exit (trap). Canonical units =
-# xdna-engine.service + voxd.service (NOT the stale xdna-engine.service). CUDA disabled. Quiesce
+# the units named in _npu_services.sh, asserted to exist. CUDA disabled. Quiesce
 # the box first (close anything using LPDDR -- the measurement is bandwidth-sensitive).
 #
 # Usage:
@@ -10,6 +10,7 @@
 #   MODE=read COLS=1 scripts/run_lpddr_bw_microbench.sh
 #   MODE=rdwr COLS=8 scripts/run_lpddr_bw_microbench.sh     # aggregate (after building cols=8)
 set -uo pipefail
+. "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/_npu_services.sh" || exit 1   # unit names + asserted quiesce
 SRC="$(cd "$(dirname "$0")/.." && pwd)"
 REPO="$(cd "$(git -C "$SRC" rev-parse --git-common-dir)/.." && pwd)"
 export PARAKEET_TOOLROOT="$REPO"
@@ -22,11 +23,11 @@ SWEEP_DEPTH="${SWEEP_DEPTH:-2 4}"
 LOG="$REPO/artifacts/parakeet/lpddr_bw/run.log"; mkdir -p "$(dirname "$LOG")"
 log(){ echo "$@" | tee -a "$LOG"; }
 
-restart(){ systemctl --user start xdna-engine.service voxd.service >/dev/null 2>&1 || true; log "[svc] npu-serve + voxd restarted"; }
+restart(){ npu_svc_start; }
 
-log "[svc] stopping npu-serve / voxd (quiesce for clean timing)"
-systemctl --user stop xdna-engine.service voxd.service >/dev/null 2>&1 || true
+log "[svc] quiescing for clean timing"
 trap restart EXIT
+npu_svc_stop || exit 1
 sleep 1
 for i in 1 2 3 4 5; do
   if ! fuser /dev/accel/accel0 >/dev/null 2>&1; then break; fi

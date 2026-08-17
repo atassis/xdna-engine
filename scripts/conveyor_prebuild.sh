@@ -12,7 +12,7 @@
 #
 # Usage:  scripts/conveyor_prebuild.sh          (builds the 8-head T=176 xclbin)
 # Needs the FORK toolchain env (sourced internally). Serializes on the shared toolchain + NPU.
-# DEVICE HYGIENE FIRST: systemctl --user stop npu-asr npu-vox ; fuser /dev/accel/accel0 (must be clear).
+# DEVICE HYGIENE FIRST: systemctl --user stop xdna-engine npu-vox ; fuser /dev/accel/accel0 (must be clear).
 set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO"

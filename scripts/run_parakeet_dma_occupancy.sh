@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # RUN the DMA-occupancy sweep on the NPU (needs a window). Single-tenant device discipline:
 # stop the NPU services, fuser-check the device is free, timeout-guard the run, and ALWAYS
-# restart the services on exit (trap). Canonical units = xdna-engine.service + voxd.service
-# (NOT the stale xdna-engine.service the older occupancy runner names). CUDA disabled.
+# restart the services on exit (trap). Canonical units live in _npu_services.sh
+# and are asserted to exist before the timed section. CUDA disabled.
 #
 # Usage:
 #   scripts/run_parakeet_dma_occupancy.sh                       # 3 existing N points (no builds)
 #   SWEEP_N="1024 2048 3072 4096" scripts/run_parakeet_dma_occupancy.sh   # after building N=3072
 set -uo pipefail
+. "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/_npu_services.sh" || exit 1   # unit names + asserted quiesce
 SRC="$(cd "$(dirname "$0")/.." && pwd)"           # where this script + harness live (may be a worktree)
 # Toolchain root = the MAIN checkout (holds .venv-iron, mlir-aie/build, artifacts/). In a worktree this
 # is the git common dir's parent; in MAIN it is SRC itself.
@@ -21,11 +22,11 @@ TO="${TIMEOUT:-300}"
 LOG="$REPO/artifacts/parakeet/occupancy/dma_run.log"; mkdir -p "$(dirname "$LOG")"
 log(){ echo "$@" | tee -a "$LOG"; }
 
-restart(){ systemctl --user start xdna-engine.service voxd.service >/dev/null 2>&1 || true; log "[svc] npu-serve + voxd restarted"; }
+restart(){ npu_svc_start; }
 
-log "[svc] stopping npu-serve / voxd (quiesce for clean timing)"
-systemctl --user stop xdna-engine.service voxd.service >/dev/null 2>&1 || true
+log "[svc] quiescing for clean timing"
 trap restart EXIT
+npu_svc_stop || exit 1
 sleep 1
 # fuser-check the device is actually free before dispatching (serialize -- npu-timing-check-fuser-first)
 for i in 1 2 3 4 5; do
