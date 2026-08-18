@@ -110,6 +110,38 @@ def _stack_size():
     return int(_os.environ.get("WA_STACK_SIZE", "0xD00"), 0)
 
 
+def _trace_event(spec):
+    """One --trace_events item: a bare CoreEvent name, or a PORT_* event bound to a port.
+
+    A PORT_* name selects a monitor SLOT, not a port -- the slot counts nothing until it is
+    pointed at one. The default core set binds slot 0 to DMA ch0 in and slot 1 to DMA ch0 OUT
+    (aie.utils.trace.setup), so `PORT_RUNNING_1` alone does not mean channel 1 and the second
+    input channel is unreachable by name. Bind it explicitly as NAME:BUNDLE:CHANNEL:DIR, e.g.
+    PORT_RUNNING_1:DMA:1:in.
+
+    This design puts A on S2MM ch0 and B on S2MM ch1 (one dma_start each, in the generated
+    aie.mem), so a run without an explicit ch1 binding measures the A feed alone.
+
+    Events sharing a slot must agree on the binding -- PORT_RUNNING_0 and PORT_STALLED_0 both
+    watch slot 0, which is how running-vs-backpressured is read off one port.
+    """
+    from aie.dialects.aie import WireBundle
+    from aie.utils.trace.events import CoreEvent, PortEvent
+
+    parts = [p.strip() for p in spec.split(":")]
+    code = getattr(CoreEvent, parts[0])
+    if len(parts) == 1:
+        return code
+    if len(parts) != 4:
+        raise ValueError(f"port event wants NAME:BUNDLE:CHANNEL:DIR, got {spec!r}")
+    bundle, channel, direction = parts[1], int(parts[2]), parts[3].lower()
+    if direction not in ("in", "out"):
+        raise ValueError(f"direction is in|out, got {parts[3]!r} in {spec!r}")
+    return PortEvent(
+        code, port=getattr(WireBundle, bundle), channel=channel, master=(direction == "in")
+    )
+
+
 def ceildiv(a, b):
     return (a + b - 1) // b
 
@@ -329,6 +361,12 @@ def my_matmul(
     # and the k=32 trace says that overlap is currently idle -- objectfifo_wait 0%, DISABLED never
     # fires, INSTR_LOCK_ACQUIRE_REQ 0.06%. Only the L1 side; the L2 fifos are not the constraint.
     ab_fifo_depth = int(_os.environ.get("WA_AB_DEPTH", str(fifo_depth)))
+    # The L3->L2 hop (WA_L3L2_DEPTH). WA_AB_DEPTH above sizes only L2->L1; the shim-to-memtile
+    # fifos stayed at 2 in every arm of the K/depth sweeps, so "the L2 fifos are not the
+    # constraint" was assumed, never measured. Deepening L2->L1 2->3->4 moved LOCK_STALL by 1.8%
+    # with no trend, so if the acquire wait is a feed-rate problem it has to be upstream of that.
+    # L2 is 512 KB/col against an A+B L2 pair of k*(m*n_aie_rows + n)*2 B, so depth 4 fits easily.
+    l3l2_fifo_depth = int(_os.environ.get("WA_L3L2_DEPTH", str(fifo_depth)))
 
     n_tiles_per_core = (M // m) * (N // n) // n_aie_cores
 
@@ -399,7 +437,7 @@ def my_matmul(
 
     # Input A
     for i in range(n_shim_mem_A):
-        A_l3l2_fifos[i] = ObjectFifo(A_l2_ty, name=f"A_L3L2_{i}", depth=fifo_depth)
+        A_l3l2_fifos[i] = ObjectFifo(A_l2_ty, name=f"A_L3L2_{i}", depth=l3l2_fifo_depth)
         start_row = i * n_A_tiles_per_shim
         stop_row = start_row + n_A_tiles_per_shim
         of_offsets = [m * k * j for j in range(stop_row - start_row)]
@@ -428,7 +466,7 @@ def my_matmul(
 
     # Input B
     for col in range(n_aie_cols):
-        B_l3l2_fifos[col] = ObjectFifo(B_l2_ty, name=f"B_L3L2_{col}", depth=fifo_depth)
+        B_l3l2_fifos[col] = ObjectFifo(B_l2_ty, name=f"B_L3L2_{col}", depth=l3l2_fifo_depth)
         if b_col_maj:
             dims_to_stream = [(n // t, t * k), (k // s, s), (t, k), (s, 1)]
         else:
@@ -727,9 +765,7 @@ def my_matmul(
     if trace_size:
         events = None
         if trace_events:
-            from aie.utils.trace.events import CoreEvent
-
-            events = [getattr(CoreEvent, e.strip()) for e in trace_events.split(",") if e.strip()]
+            events = [_trace_event(e) for e in trace_events.split(",") if e.strip()]
             if len(events) > 8:
                 raise ValueError(f"AIE2 traces 8 core events; got {len(events)}")
         my_program.enable_trace(
@@ -792,7 +828,8 @@ def main():
     # Index into `workers`, not a tile coordinate. Row 2 (index 0) is the C-stream aggregation
     # point and has no free South port -- see the enable_trace comment for the per-width table.
     argparser.add_argument("--trace_worker", type=int, default=0)
-    # Comma-separated aie.utils.trace.events.CoreEvent names; empty = the default eight.
+    # Comma-separated CoreEvent names, PORT_* ones optionally bound as NAME:BUNDLE:CHANNEL:DIR
+    # (see _trace_event); empty = the default eight.
     # AIE2 gives 8 trace events per core, so this is a CHOICE, not a filter: the default set
     # (vector issue + the three stalls + two DMA ports) accounts for 33.05% of the traced span
     # at cols=4, leaving 66.95% dark purely because no scalar/load-store event is in it.
