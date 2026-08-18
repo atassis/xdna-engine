@@ -63,7 +63,10 @@ log "  ----+----+-----+-------------+-------+--------------+-------"
 for arm in $ARMS; do
   IFS=: read -r k d n <<< "$arm"; n="${n:-128}"
   kb="$(awk -v k="$k" -v d="$d" -v n="$n" 'BEGIN{ printf "%.0f", (d*64*k*2 + d*k*n*2 + 64*n*4)/1024 }')"
-  abtag=""; [ "$d" = "1" ] && abtag="ab1"
+  # Depth 2 is the generator default and stays untagged, so existing artifact names survive;
+  # EVERY other depth must tag. Tagging only d=1 meant d=3 and d=4 built into the d=2 name and
+  # silently overwrote it -- caught mid-build on 2026-08-18.
+  abtag=""; [ "$d" = "2" ] || abtag="ab$d"
   sfx="512x1024x1024_64x${k}x${n}_4c_modalid${abtag}"
   out="$EX/build/final_${sfx}.xclbin"
   # Drop the generated MLIR too, not just the xclbin. make's dependency is the .mlir FILE, so it
