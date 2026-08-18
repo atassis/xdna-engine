@@ -20,8 +20,23 @@
 # UUID/timestamp and the instruction streams in one byte per core -- which is what makes an id/silu
 # pair the one-xclbin-two-programs arm of the transition probe's --mode same-context.
 #
+# C_PANEL and A_PANEL build the OTHER kinds of same-context pair. EPILOGUE swaps a core execution
+# path while both streams drive the same DMA; these two leave the core path alone and re-stride a
+# shim TAP, so the streams differ in DATA MOVEMENT instead. Both are CONTROL-CODE-ONLY (byte-
+# identical xclbin) -- the probe verifies that rather than trusting the Makefile comment.
+# They are NOT the same strength, and the difference is the point:
+#   C_PANEL=W  re-strides the C drain to [N/W, M, W]. Same rank, same SIZES, permuted strides -- a
+#              BD FIELD change, the class already covered by [[bd-restream-inside-one-context-is-free]].
+#              Must equal n_aie_cols*n.
+#   A_PANEL=W  re-strides the A fill to [K/W, M, W]. The k-tile index SPLITS into (panel, within-
+#              panel), spending the outer repeat dim, so the sizes vector itself changes and a
+#              stride-0 degenerate dimension becomes a live one -- a BD STRUCTURE change. Needs
+#              N//n//n_aie_cols == 1 (so N=512 at n=128, 4c), K % W == 0 and W % k == 0.
+#
 # Device-free. Run:  bash scripts/gemm_notrace_build.sh [k:n:cols ...]
 #                    EPILOGUE=silu bash scripts/gemm_notrace_build.sh 32:128:4
+#                    C_PANEL=512 bash scripts/gemm_notrace_build.sh 32:128:4
+#                    N=512 A_PANEL=512 bash scripts/gemm_notrace_build.sh 32:128:4
 set -u
 WT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$WT"
 EX="$WT/mlir-aie/programming_examples/basic/matrix_multiplication/whole_array"
@@ -33,6 +48,16 @@ case "$EPILOGUE" in
   silu) mode_tag=modalsilu; no_silu=0 ;;
   *)    echo "EPILOGUE must be id or silu, got '$EPILOGUE'" >&2; exit 2 ;;
 esac
+# panel_tag (Makefile.modal:128) is `panel${c_panel_width}` for any non-zero width, so it is
+# reproduced here rather than derived -- an artifact whose name does not match target_suffix builds
+# under one name and is looked up under another.
+C_PANEL="${C_PANEL:-0}"
+panel_tag=""; [ "$C_PANEL" = 0 ] || panel_tag="panel${C_PANEL}"
+A_PANEL="${A_PANEL:-0}"
+apanel_tag=""; [ "$A_PANEL" = 0 ] || apanel_tag="apanel${A_PANEL}"
+# N is a variable because a_panel_width is only legal where the A TAP's outer repeat is degenerate
+# (N//n//n_aie_cols == 1), which at n=128 on 4 columns means N=512, not the 1024 every other arm uses.
+N="${N:-1024}"
 LOG="$WT/artifacts/gemm_notrace_build.log"
 mkdir -p "$WT/artifacts"; : > "$LOG"
 log(){ echo -e "$*" | tee -a "$LOG"; }
@@ -43,7 +68,7 @@ source "$WT/scripts/iron_env.sh" >/dev/null 2>&1
 log "======== whole_array NO-TRACE control build  $(date -Is) ========"
 log "instance: $MLIR_AIE_INSTANCE"
 log ""
-log "epilogue: $EPILOGUE (rtp[0]=$( [ "$no_silu" = 1 ] && echo 0 || echo 1 ))"
+log "epilogue: $EPILOGUE (rtp[0]=$( [ "$no_silu" = 1 ] && echo 0 || echo 1 ))  N: $N  c_panel_width: $C_PANEL  a_panel_width: $A_PANEL"
 log ""
 log "  cols |   k |   n | build | operands | xclbin bytes | suffix"
 log "  -----+-----+-----+-------+----------+--------------+-------"
@@ -56,7 +81,7 @@ unstash(){ for f in "final_$1.xclbin" "insts_$1.txt" "aie_$1.mlir" "aie_$1.mlir.
 
 for arm in $ARMS; do
   IFS=: read -r k n c <<< "$arm"
-  sfx="512x1024x1024_64x${k}x${n}_${c}c_${mode_tag}"
+  sfx="512x1024x${N}_64x${k}x${n}_${c}c_${mode_tag}${panel_tag}${apanel_tag}"
   nt="${sfx}nt"
   stash "$sfx"
   # No PROFILE=trace and no wa_trace_* -- that is the whole difference from gemm_k_sweep_build.sh.
@@ -65,8 +90,9 @@ for arm in $ARMS; do
   # building `...modalidl3` and failing the explicit target. This is the same empty-value-yields-a-
   # bare-tag defect that wrk_tag two lines below was fixed for with filter-out, still live here.
   ( cd "$EX" && WA_C_DEPTH=1 WA_AB_DEPTH=2 WA_L3L2_DEPTH=2 \
-      make -f Makefile.modal NPU2=1 M=512 K=1024 N=1024 m=64 k="$k" n="$n" n_aie_cols="$c" \
-      emulate_bfloat16_mmul_with_bfp16=1 bfp16_iree=1 no_silu="$no_silu" \
+      make -f Makefile.modal NPU2=1 M=512 K=1024 N="$N" m=64 k="$k" n="$n" n_aie_cols="$c" \
+      emulate_bfloat16_mmul_with_bfp16=1 bfp16_iree=1 no_silu="$no_silu" c_panel_width="$C_PANEL" \
+      a_panel_width="$A_PANEL" \
       "build/final_${sfx}.xclbin" ) >>"$LOG" 2>&1
   rc=$?
   if [ $rc -eq 0 ] && [ -f "$B/final_$sfx.xclbin" ]; then

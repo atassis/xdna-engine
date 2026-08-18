@@ -269,6 +269,37 @@ def main(o):
                 sys.exit(f"reference capture did not complete: stream {stream} slot {i}")
             refs[(stream, i)] = np.asarray(Cs[i]).reshape(M, N).astype(np.float32).copy()
 
+    def analytic_c(suffix, i):
+        """Closed-form C for an identity-epilogue stream, in THAT stream's own buffer layout.
+
+        Three things a suffix can change, and each one moves the answer:
+          * --a-panel-width W reads the SAME host bytes as [K/W, M, W], so the stream contracts over
+            A'[i, j] == A_flat[(j//W)*M*W + i*W + j%W] rather than over A. Both arms are handed the
+            row-major buffer deliberately -- the point is to alternate two DMA structures, not to
+            feed each its preferred layout, and a permuted A is still exactly known.
+          * B maps k -> (k+1) % N, so at K > N every output column sums the K//N values of k that
+            land on it. np.roll(A, 1) is just the K == N case of that block sum.
+          * --c-panel-width W drains [N/W, M, W] with out[c, i, j] == C[i, c*W + j] -- same values in
+            a different order (whole_array_modal_iron.py:panel_major_c_taps), so a row-major
+            reference would mismatch every element of a panel arm.
+        `(?<!a)panel` because apanel512 contains panel512: the C tag must not match the A tag.
+        """
+        if K % N:
+            sys.exit(f"analytic reference needs K % N == 0, got K={K} N={N}")
+        flat = np.asarray(As[i]).reshape(M * K).astype(np.float32)
+        wa = re.search(r"apanel(\d+)", suffix)
+        if wa:
+            w = int(wa.group(1))
+            j = np.arange(K)
+            a = flat[(j // w)[None, :] * M * w + np.arange(M)[:, None] * w + (j % w)[None, :]]
+        else:
+            a = flat.reshape(M, K)
+        c = sum(np.roll(a[:, p * N:(p + 1) * N], 1, axis=1) for p in range(K // N))
+        wc = re.search(r"(?<!a)panel(\d+)", suffix)
+        if wc:
+            c = c.reshape(M, N // int(wc.group(1)), int(wc.group(1))).transpose(1, 0, 2)
+        return c.reshape(M, N)
+
     # Gate the reference MECHANISM on the arm whose value is known in closed form. An identity
     # epilogue must reproduce np.roll(A, 1) exactly (the +-1 / permutation construction is lossless
     # through bfp16, the f32 accumulate and the drain), so if a captured reference is a captured
@@ -279,8 +310,7 @@ def main(o):
                   flush=True)
             continue
         for i in range(depth_max):
-            ref = np.roll(np.asarray(As[i]).reshape(M, K), 1, axis=1).astype(np.float32)
-            bad = int(np.count_nonzero(refs[(stream, i)] != ref))
+            bad = int(np.count_nonzero(refs[(stream, i)] != analytic_c(suffix, i)))
             if bad:
                 sys.exit(f"reference capture is not the analytic value for {suffix} "
                          f"slot {i}: {bad} mismatched elements")
