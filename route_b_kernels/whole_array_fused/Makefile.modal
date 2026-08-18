@@ -120,13 +120,16 @@ l3dep_tag=$(if $(filter 2,$(WA_L3L2_DEPTH)),,l3$(WA_L3L2_DEPTH))
 # banked artifact names survive. filter-out, not filter, so an empty value yields no tag rather
 # than a bare "w".
 wrk_tag=$(if $(filter-out 0,$(wa_trace_worker)),w$(wa_trace_worker),)
+# A traced MEMTILE adds a second trace unit and a second packet route, so it is a different xclbin
+# again. -1 is off and stays untagged.
+mt_tag=$(if $(filter-out -1,$(wa_trace_memtile)),mt$(wa_trace_memtile),)
 nat_tag=$(if $(filter 1,${emulate_bfloat16_mmul_with_bfp16}),,nat)
 re_tag=$(if $(filter 1,${round_even}),re,)$(if $(filter 1,${silu_f32_tail}),ft,)$(if $(filter 1,${silu_f32_tanh}),fh,)
 panel_tag=$(if $(filter 0,${c_panel_width}),,panel${c_panel_width})
 out_tag=$(if $(filter bf16,${dtype_out}),bf16out,)
 krtp_tag=$(if $(filter 1,${k_loop_rtp}),krtp,)
 apanel_tag=$(if $(filter 0,${a_panel_width}),,apanel${a_panel_width})
-target_suffix=${M}x${K}x${N}_${m}x${k}x${n}_${n_aie_cols}c_${mode_tag}${out_tag}${panel_tag}${dep_tag}${abdep_tag}${l3dep_tag}${wrk_tag}${re_tag}${nat_tag}${krtp_tag}${apanel_tag}
+target_suffix=${M}x${K}x${N}_${m}x${k}x${n}_${n_aie_cols}c_${mode_tag}${out_tag}${panel_tag}${dep_tag}${abdep_tag}${l3dep_tag}${wrk_tag}${mt_tag}${re_tag}${nat_tag}${krtp_tag}${apanel_tag}
 
 use_iron=1
 aie_py_src=whole_array_modal_iron.py

@@ -142,6 +142,39 @@ def _trace_event(spec):
     )
 
 
+def _memtile_trace_event(spec):
+    """One --trace_memtile_events item, in MemTileEvent space rather than CoreEvent space.
+
+    Same NAME[:BUNDLE:CHANNEL:DIR] grammar as _trace_event, and the same trap: a PORT_* name is a
+    monitor SLOT. The memtile default set binds slots 0-3 to DMA ch0-3 IN and 4-7 to ch0-3 OUT, so
+    an unbound PORT_RUNNING_1 watches an INPUT channel here.
+
+    DIR follows aie.utils.trace.setup's own convention -- master=True is "in" (S2MM), False is
+    "out" (MM2S). This design pushes A on memtile MM2S ch0 and B on MM2S ch1, so the two feeds at
+    their SOURCE are PORT_RUNNING_x:DMA:0:out and :DMA:1:out.
+
+    The DMA_MM2S_SEL{0,1}_* counters are a SEPARATE mechanism: which channel each SEL watches comes
+    from the memtile's DMA_EVENT_CHANNEL_SELECTION register, which mlir-aie never writes, so they
+    sit at the reset default. Treat that as unverified and gate it -- pair each SEL event with the
+    explicitly-bound PORT_RUNNING for the channel it is supposed to be, and check the windows agree.
+    """
+    from aie.dialects.aie import WireBundle
+    from aie.utils.trace.events import MemTileEvent, MemTilePortEvent
+
+    parts = [p.strip() for p in spec.split(":")]
+    code = getattr(MemTileEvent, parts[0])
+    if len(parts) == 1:
+        return code
+    if len(parts) != 4:
+        raise ValueError(f"port event wants NAME:BUNDLE:CHANNEL:DIR, got {spec!r}")
+    bundle, channel, direction = parts[1], int(parts[2]), parts[3].lower()
+    if direction not in ("in", "out"):
+        raise ValueError(f"direction is in|out, got {parts[3]!r} in {spec!r}")
+    return MemTilePortEvent(
+        code, port=getattr(WireBundle, bundle), channel=channel, master=(direction == "in")
+    )
+
+
 def ceildiv(a, b):
     return (a + b - 1) // b
 
@@ -305,6 +338,8 @@ def my_matmul(
     a_panel_width=0,
     trace_worker=0,
     trace_events=None,
+    trace_memtile=-1,
+    trace_memtile_events=None,
 ):
     n_aie_rows = 4
     n_aie_cores = n_aie_rows * n_aie_cols
@@ -762,6 +797,33 @@ def my_matmul(
     # and the other 66.95% is dark because no scalar/load-store event is in the set -- not
     # because the core is idle. Pass --trace_events to re-spend the eight slots, keeping
     # INSTR_VECTOR as the anchor that lets two runs be composed.
+    # A MEMTILE can be traced too, and it is the only place the two feeds are visible at their
+    # SOURCE: A leaves on memtile MM2S ch0, B on ch1. A core trace can only say which feed the core
+    # waited on -- it cannot say whether that feed was late because the memtile could not push it
+    # (array backpressure), had nothing to push (L3 starvation), or had no free buffer (lock).
+    # trace_memtile names the memtile by the B_L2L1 fifo it produces, i.e. by ROW, because that is
+    # the axis the binding feed splits on; which A column it also carries is a PLACEMENT fact and
+    # must be read back from the IR, not assumed.
+    trace_tiles = None
+    memtile_events = None
+    if trace_size and trace_memtile >= 0:
+        b_fifo = B_l2l1_fifos[trace_memtile]
+        prod = getattr(b_fifo, "_prod", None)
+        if prod is None or prod.endpoint is None or prod.endpoint.tile is None:
+            raise ValueError(
+                f"B_L2L1_{trace_memtile} has no resolved producer tile to trace"
+            )
+        trace_tiles = [prod.endpoint.tile]
+        if trace_memtile_events:
+            memtile_events = [
+                _memtile_trace_event(e)
+                for e in trace_memtile_events.split(",")
+                if e.strip()
+            ]
+            if len(memtile_events) > 8:
+                raise ValueError(
+                    f"AIE2 traces 8 memtile events; got {len(memtile_events)}"
+                )
     if trace_size:
         events = None
         if trace_events:
@@ -773,6 +835,8 @@ def my_matmul(
             workers=[workers[trace_worker]],
             egress_shim_col=0,
             coretile_events=events,
+            trace_tiles=trace_tiles,
+            memtile_events=memtile_events,
         )
     # seq_fn now runs at resolve time, so the tap lists are only populated after
     # this call -- generate_taps must return AFTER it, not before.
@@ -834,6 +898,11 @@ def main():
     # (vector issue + the three stalls + two DMA ports) accounts for 33.05% of the traced span
     # at cols=4, leaving 66.95% dark purely because no scalar/load-store event is in it.
     argparser.add_argument("--trace_events", type=str, default="")
+    # Trace the memtile that PRODUCES B_L2L1_<j> -- i.e. the B feed for AIE row j+2. -1 = off.
+    # Additive: the core trace stays on, so one run carries both ends of the same feed.
+    argparser.add_argument("--trace_memtile", type=int, default=-1)
+    # Comma-separated MemTileEvent names, PORT_* ones bound as NAME:BUNDLE:CHANNEL:DIR.
+    argparser.add_argument("--trace_memtile_events", type=str, default="")
     argparser.add_argument("--generate-taps", action="store_true")
     argparser.add_argument(
         "--c-panel-width",
@@ -892,6 +961,8 @@ def main():
         args.a_panel_width,
         args.trace_worker,
         args.trace_events,
+        args.trace_memtile,
+        args.trace_memtile_events,
     )
     if args.generate_taps:
         return maybe_module

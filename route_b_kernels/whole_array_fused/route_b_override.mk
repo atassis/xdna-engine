@@ -105,6 +105,17 @@ wa_trace_worker ?= 0
 # scalar issue or load/store -- keep INSTR_VECTOR in any replacement set so runs stay comparable.
 wa_trace_events ?=
 
+# Also trace the MEMTILE that produces B_L2L1_<j> -- the B feed for AIE row j+2. -1 = off. This is
+# additive to the core trace: one run then carries the same feed at BOTH ends, which is the only way
+# to tell a feed that arrived late because the memtile could not push it (array backpressure) from
+# one that arrived late because the memtile had nothing to push (L3 starvation).
+wa_trace_memtile ?= -1
+
+# Comma-separated MemTileEvent names; empty = the library default eight (PORT_RUNNING on ch0-3 in,
+# then ch0-3 out). The DMA_MM2S_SEL{0,1}_* counters depend on a channel-selection register mlir-aie
+# never writes, so pair them with an explicitly-bound PORT_RUNNING and check the two agree.
+wa_trace_memtile_events ?=
+
 $(info [whole_array] PROFILE=$(PROFILE) WA_C_DEPTH=$(WA_C_DEPTH) wa_trace_size=$(wa_trace_size))
 
 aiecc_peano_flags=$(if $(filter-out 0,$(wa_trace_size)),--dump-intermediates,) --peano ${PEANO_INSTALL_DIR}
@@ -124,7 +135,8 @@ insts_target := build/insts_${target_suffix}.txt
 ${mlir_target}: ${srcdir}/${aie_py_src}
 	mkdir -p ${@D}
 	python3 $< ${gen_args} --trace_size ${wa_trace_size} --trace_worker ${wa_trace_worker} \
-	    --trace_events "${wa_trace_events}" > $@
+	    --trace_events "${wa_trace_events}" --trace_memtile ${wa_trace_memtile} \
+	    --trace_memtile_events "${wa_trace_memtile_events}" > $@
 
 # Grouped co-target (&:): ONE aiecc invocation produces BOTH the xclbin AND the .txt insts,
 # so make treats insts_${target_suffix}.txt as a real target (a direct `make .../insts_*.txt`
