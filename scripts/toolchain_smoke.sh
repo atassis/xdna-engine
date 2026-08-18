@@ -31,7 +31,9 @@ XCLBIN="$MMW/build/final_512x800x3072_64x32x96_8c_modalsilu.xclbin"
 # and restore it on exit, pass or fail. The .prj/ placement artifacts the assertions read persist regardless.
 GATEBAK=""
 if [ -f "$XCLBIN" ]; then GATEBAK="$XCLBIN.gatebak"; cp -f "$XCLBIN" "$GATEBAK"; fi
-trap '[ -n "$GATEBAK" ] && [ -f "$GATEBAK" ] && mv -f "$GATEBAK" "$XCLBIN"' EXIT
+# With no prior copy there is nothing to restore, so the gate's own CPU build would be what stays --
+# the artifact this whole dance exists to keep out of build/. Delete it in that case instead.
+trap 'if [ -n "$GATEBAK" ] && [ -f "$GATEBAK" ]; then mv -f "$GATEBAK" "$XCLBIN"; else rm -f "$XCLBIN"; fi' EXIT
 # The goal must not already be satisfied, or make answers "Nothing to be done", never re-emits the
 # generator .mlir, and the gate decides the toolchain on an artifact the toolchain did not build.
 # GATEBAK holds the device-validated copy the trap restores.
