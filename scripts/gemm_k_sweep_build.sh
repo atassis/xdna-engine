@@ -45,12 +45,22 @@ log(){ echo -e "$*" | tee -a "$LOG"; }
 # INSTR_VECTOR is held in every set as the cross-run anchor: under 8 high-rate sources the trace
 # drops events roughly uniformly, and a stable MEAN duration against a falling COUNT is what tells a
 # lost event apart from a changed execution.
-# WA_EVENTS overrides the set. Set it EMPTY to fall back to the generator default, which spends
-# the 8 slots on the stall question instead (MEMORY/STREAM/LOCK_STALL + PORT_RUNNING). The two
-# sets are complementary and neither is complete: the issue set below leaves stall dark, the
-# default leaves scalar/load-store dark (66.95% of span at the deployed tile). INSTR_VECTOR is
-# in both, and is the anchor that lets two runs of the same arm be composed.
+# WA_EVENTS overrides the set; WA_EVENTS=stall selects the stall set below. The two sets are
+# complementary and neither is complete: the issue set leaves stall dark, the stall set leaves
+# scalar/load-store dark (66.95% of span at the deployed tile). INSTR_VECTOR is in both, and is
+# the anchor that lets two runs of the same arm be composed.
+#
+# SPELL THE PORT BINDING OUT -- do NOT fall back to the library default. aie/utils/trace/setup.py
+# defaults a core tile to PORT_RUNNING_0 = DMA ch0 IN and PORT_RUNNING_1 = DMA ch0 **OUT**, i.e.
+# the C output, not the B feed. This design takes A on S2MM 0 and B on S2MM 1, so the stall-by-feed
+# split needs 0:in and 1:in. Built with the default on 2026-08-18, PORT_RUNNING_1 decoded to 8
+# intervals of exactly 2048 cyc (total 16384) on every rep of four workers -- and the summary
+# reads that as an ordinary ch0-dominant tile, which is the SAME verdict a real control gives.
+# A wrong binding here is invisible in the per-arm table; gate on the 16384 signature.
+STALL_EVENTS="INSTR_EVENT_0,INSTR_EVENT_1,INSTR_VECTOR,MEMORY_STALL,STREAM_STALL,LOCK_STALL,PORT_RUNNING_0:DMA:0:in,PORT_RUNNING_1:DMA:1:in"
 EVENTS="${WA_EVENTS-INSTR_EVENT_0,INSTR_EVENT_1,INSTR_VECTOR,ACTIVE,DISABLED,INSTR_LOAD,INSTR_STORE,INSTR_LOCK_ACQUIRE_REQ}"
+[ "$EVENTS" = "stall" ] && EVENTS="$STALL_EVENTS"
+[ -n "$EVENTS" ] || { log "FATAL: WA_EVENTS is empty -- the library default binds PORT_RUNNING_1 to DMA ch0 OUT, not the B feed. Use WA_EVENTS=stall."; exit 2; }
 
 source "$WT/scripts/iron_env.sh" >/dev/null 2>&1
 [ -n "${MLIR_AIE_INSTANCE:-}" ] || { log "FATAL: iron_env did not set MLIR_AIE_INSTANCE"; exit 1; }
