@@ -106,16 +106,27 @@ mode_tag=$(if $(filter 1,${glu}),modalglu,$(if $(filter 1,${gelu}),modalgelu,$(i
 # needs its own artifact name or it would overwrite the row-major stream. A bf16-out build
 # is a different xclbin outright (the C buffers resize), so it is tagged too.
 dep_tag=$(if $(filter 2,$(WA_C_DEPTH)),d2,)
-# A single-buffered A/B pair is a DIFFERENT xclbin (the L1 buffers halve), so it needs its own name
-# or it silently overwrites the shipped depth-2 stream.
-abdep_tag=$(if $(filter 1,$(WA_AB_DEPTH)),ab1,)
+# Any A/B depth other than the shipped 2 is a DIFFERENT xclbin (the L1 buffers resize), so it needs
+# its own name or it silently overwrites the shipped depth-2 stream. This tagged only depth 1 until
+# 2026-08-18, so a depth-3/4 feed-rate arm built straight over the depth-2 artifact under one name.
+abdep_tag=$(if $(filter 2,$(WA_AB_DEPTH)),,ab$(WA_AB_DEPTH))
+# Same rule one hop up: WA_L3L2_DEPTH resizes the shim->memtile buffers, so it is a different
+# xclbin and must not share a name with the depth-2 build.
+l3dep_tag=$(if $(filter 2,$(WA_L3L2_DEPTH)),,l3$(WA_L3L2_DEPTH))
+# Same rule for the traced WORKER. It changes only which core carries the trace packets, but that is
+# both a different xclbin and a different MEASUREMENT: A multicasts down a column and B across a row,
+# so each worker sits at the intersection of two DIFFERENT 4-core rendezvous and the feed-overlap
+# quantity is non-uniform by construction. Worker 0 is the generator default and stays untagged so
+# banked artifact names survive. filter-out, not filter, so an empty value yields no tag rather
+# than a bare "w".
+wrk_tag=$(if $(filter-out 0,$(wa_trace_worker)),w$(wa_trace_worker),)
 nat_tag=$(if $(filter 1,${emulate_bfloat16_mmul_with_bfp16}),,nat)
 re_tag=$(if $(filter 1,${round_even}),re,)$(if $(filter 1,${silu_f32_tail}),ft,)$(if $(filter 1,${silu_f32_tanh}),fh,)
 panel_tag=$(if $(filter 0,${c_panel_width}),,panel${c_panel_width})
 out_tag=$(if $(filter bf16,${dtype_out}),bf16out,)
 krtp_tag=$(if $(filter 1,${k_loop_rtp}),krtp,)
 apanel_tag=$(if $(filter 0,${a_panel_width}),,apanel${a_panel_width})
-target_suffix=${M}x${K}x${N}_${m}x${k}x${n}_${n_aie_cols}c_${mode_tag}${out_tag}${panel_tag}${dep_tag}${abdep_tag}${re_tag}${nat_tag}${krtp_tag}${apanel_tag}
+target_suffix=${M}x${K}x${N}_${m}x${k}x${n}_${n_aie_cols}c_${mode_tag}${out_tag}${panel_tag}${dep_tag}${abdep_tag}${l3dep_tag}${wrk_tag}${re_tag}${nat_tag}${krtp_tag}${apanel_tag}
 
 use_iron=1
 aie_py_src=whole_array_modal_iron.py

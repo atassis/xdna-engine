@@ -34,7 +34,8 @@
 # Device-free. Run:  bash scripts/gemm_k_sweep_build.sh
 set -u
 WT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$WT"
-# Arms are k:ab_depth:n[:l3l2_depth]; l3l2_depth defaults to the shipped 2.
+# Arms are k:ab_depth:n[:l3l2_depth[:trace_worker]]; l3l2_depth defaults to the shipped 2 and
+# trace_worker to the generator default 0.
 ARMS="${1:-32:2:128 32:2:64 64:2:64 128:1:64}"
 EX="$WT/mlir-aie/programming_examples/basic/matrix_multiplication/whole_array"
 LOG="$WT/artifacts/gemm_k_sweep_build.log"
@@ -58,11 +59,11 @@ log "=========== whole_array K-tile sweep build  cols=4  $(date -Is) ===========
 log "instance: $MLIR_AIE_INSTANCE"
 log "arms (k:ab_depth:n:l3l2_depth): $ARMS"
 log ""
-log "    k | ab | l3 |   n | L1 A+B+C KB | build | xclbin bytes | suffix"
-log "  ----+----+----+-----+-------------+-------+--------------+-------"
+log "    k | ab | l3 |   n |  w | L1 A+B+C KB | build | xclbin bytes | suffix"
+log "  ----+----+----+-----+----+-------------+-------+--------------+-------"
 
 for arm in $ARMS; do
-  IFS=: read -r k d n l3 <<< "$arm"; n="${n:-128}"; l3="${l3:-2}"
+  IFS=: read -r k d n l3 w <<< "$arm"; n="${n:-128}"; l3="${l3:-2}"; w="${w:-0}"
   kb="$(awk -v k="$k" -v d="$d" -v n="$n" 'BEGIN{ printf "%.0f", (d*64*k*2 + d*k*n*2 + 64*n*4)/1024 }')"
   # Depth 2 is the generator default and stays untagged, so existing artifact names survive;
   # EVERY other depth must tag. Tagging only d=1 meant d=3 and d=4 built into the d=2 name and
@@ -70,7 +71,15 @@ for arm in $ARMS; do
   abtag=""; [ "$d" = "2" ] || abtag="ab$d"
   # Same rule for the L3->L2 hop -- a resized shim->memtile buffer is a different xclbin.
   l3tag=""; [ "$l3" = "2" ] || l3tag="l3$l3"
-  sfx="512x1024x1024_64x${k}x${n}_4c_modalid${abtag}${l3tag}"
+  # And for the traced WORKER. It changes only which core carries the trace packets, but that is a
+  # different xclbin AND a different measurement. A multicasts down a column and B across a row, so
+  # each core sits at the intersection of two different 4-core rendezvous, and MEASURED 2026-08-18
+  # over 27 runs / 3 sessions the binding feed differs by core: tile (3,5) stalls against the B
+  # channel (7/7 reps) where (0,2) and (1,3) stall against A (20/20). One core is not representative
+  # of the array's feed behaviour. Worker 0 is the generator default and stays untagged so banked
+  # artifact names survive.
+  wtag=""; [ "$w" = "0" ] || wtag="w$w"
+  sfx="512x1024x1024_64x${k}x${n}_4c_modalid${abtag}${l3tag}${wtag}"
   out="$EX/build/final_${sfx}.xclbin"
   # Drop the generated MLIR too, not just the xclbin. make's dependency is the .mlir FILE, so it
   # cannot see that wa_trace_events (or any other generator env) changed: a rerun with a different
@@ -81,14 +90,14 @@ for arm in $ARMS; do
   # Name the xclbin target. The DEFAULT goal also builds whole_array_modal.exe, the C++ host test,
   # which fails here for reasons unrelated to the design -- gating on make's exit code instead of the
   # artifact reads every arm as FAIL while all three xclbins are sitting in build/.
-  ( cd "$EX" && PROFILE=trace WA_C_DEPTH=1 WA_AB_DEPTH="$d" WA_L3L2_DEPTH="$l3" wa_trace_size=1048576 wa_trace_events="$EVENTS" \
+  ( cd "$EX" && PROFILE=trace WA_C_DEPTH=1 WA_AB_DEPTH="$d" WA_L3L2_DEPTH="$l3" wa_trace_size=1048576 wa_trace_events="$EVENTS" wa_trace_worker="$w" \
       make -f Makefile.modal NPU2=1 M=512 K=1024 N=1024 m=64 k="$k" n="$n" n_aie_cols=4 \
       emulate_bfloat16_mmul_with_bfp16=1 bfp16_iree=1 no_silu=1 "build/final_${sfx}.xclbin" ) >>"$LOG" 2>&1
   rc=$?
   if [ $rc -eq 0 ] && [ -f "$out" ]; then
-    log "$(printf '  %4s | %2s | %2s | %3s | %11s | %5s | %12s | %s' "$k" "$d" "$l3" "$n" "$kb" "OK" "$(stat -c%s "$out")" "$sfx")"
+    log "$(printf '  %4s | %2s | %2s | %3s | %2s | %11s | %5s | %12s | %s' "$k" "$d" "$l3" "$n" "$w" "$kb" "OK" "$(stat -c%s "$out")" "$sfx")"
   else
-    log "$(printf '  %4s | %2s | %2s | %3s | %11s | %5s | %12s | rc=%s' "$k" "$d" "$l3" "$n" "$kb" "FAIL" "-" "$rc")"
+    log "$(printf '  %4s | %2s | %2s | %3s | %2s | %11s | %5s | %12s | rc=%s' "$k" "$d" "$l3" "$n" "$w" "$kb" "FAIL" "-" "$rc")"
   fi
 done
 
