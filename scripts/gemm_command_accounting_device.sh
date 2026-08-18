@@ -21,6 +21,9 @@ trap restore EXIT
 ARMS="${ARMS:-512x1024x1024_64x32x128_1c_modalid 512x1024x1024_64x32x128_4c_modalid 512x1024x1024_64x32x128_8c_modalid}"
 SPAN="${SPAN:-512x1024x1024_64x32x128_4c_modalid=419340}"
 REPS="${REPS:-10}"
+# Named output: the default json name is the width series' banked artifact, so an arm set that is
+# not that series must write elsewhere or it replaces a result other passes cite.
+OUT="${OUT:-gemm_command_accounting.json}"
 
 log "===== whole_array GEMM command-time accounting  $(date -Is) ====="
 log "[svc] stopping xdna-engine + npu-vox"
@@ -43,7 +46,7 @@ log "[svc] device clear"
 source "$WT/scripts/iron_env.sh" >/dev/null 2>&1
 # shellcheck disable=SC2086
 .venv-iron/bin/python scripts/gemm_command_accounting.py \
-    --suffixes $ARMS --reps "$REPS" --span $SPAN 2>&1 | tee -a "$LOG"
+    --suffixes $ARMS --reps "$REPS" --out "$OUT" --span $SPAN 2>&1 | tee -a "$LOG"
 
 log ""
 log "log: $LOG"

@@ -36,6 +36,9 @@ import sys
 import numpy as np
 from ml_dtypes import bfloat16
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from gemm_ddr_bytes import account as ddr_account
+
 from aie.utils.npukernel import NPUKernel
 from aie.utils.tensor_factory import tensor, zeros
 import aie.utils as aie_utils
@@ -46,6 +49,24 @@ import aie.utils as aie_utils
 MAC_PER_CYCLE_PER_CORE = 512
 CORE_CLOCK_HZ = 1.53e9
 COMPUTE_ROWS = 4  # rows 2..5
+
+
+SHAPE_RE = re.compile(r"(?:^|_)(\d+)x(\d+)x(\d+)_")
+
+
+def shape_of(suffix, o):
+    """M, K, N from the suffix's own leading MxKxN token, so a run may mix shapes in one window.
+
+    The width series is all 512x1024x1024 and passed the shape on the command line; the shape series
+    that separates the byte term from the compute term is not, and one global --M/--K/--N would have
+    silently computed the reference and the peak time for the wrong arm. Explicit flags still win.
+    """
+    if o.M and o.K and o.N:
+        return o.M, o.K, o.N
+    m = SHAPE_RE.search(suffix)
+    if not m:
+        sys.exit(f"{suffix}: no MxKxN token in the suffix; pass --M/--K/--N explicitly")
+    return int(m.group(1)), int(m.group(2)), int(m.group(3))
 
 
 def design_operands(build_dir, suffix):
@@ -88,7 +109,7 @@ def measure(suffix, o):
         sys.exit(f"{suffix}: could not read runtime_sequence operands in {o.build_dir}")
     traced = len(operands) > 3
 
-    M, K, N = o.M, o.K, o.N
+    M, K, N = shape_of(suffix, o)
     rng = np.random.default_rng(seed=42)
     A = tensor(rng.standard_normal((M * K,)).astype(bfloat16), dtype=bfloat16)
     B = tensor(rng.standard_normal((K * N,)).astype(bfloat16), dtype=bfloat16)
@@ -124,9 +145,20 @@ def measure(suffix, o):
     macs = M * K * N
     t_peak_us = 1e6 * macs / (cores * MAC_PER_CYCLE_PER_CORE * CORE_CLOCK_HZ)
     med = statistics.median(samples)
+    ddr = ddr_account(o.build_dir, suffix)
+    ddr_mib = ddr["ddr_mib"]
+    if ddr["len_convention_violations"]:
+        # The byte count is the whole point of this arm; a violated len convention would double-count
+        # by the outer factor, so refuse the number rather than report a wrong one.
+        sys.exit(f"{suffix}: {len(ddr['len_convention_violations'])} shim BD(s) violate the "
+                 f"len == product-of-inner-3 convention; byte accounting is not valid here")
+
     row = {
         "suffix": suffix, "cols": cols, "cores": cores, "traced_design": traced,
         "operands": len(operands), "reps": o.reps,
+        "M": M, "K": K, "N": N, "macs": macs,
+        "ddr_mib": ddr_mib, "unique_mib": ddr["unique_mib"],
+        "ddr_per_operand": {k: v["ddr_mib"] for k, v in ddr["per_operand"].items()},
         "warmup_us": round(warm, 1),
         "samples_us": [round(s, 1) for s in samples],
         "median_us": round(med, 1), "min_us": round(min(samples), 1),
@@ -136,6 +168,10 @@ def measure(suffix, o):
         "pct_of_peak_best": round(100 * t_peak_us / min(samples), 2),
         "rel_l2": rel_l2, "correctness": gate,
     }
+    # Effective DDR rate the command sustains end to end. Not a bandwidth measurement -- it is
+    # bytes/command-time, so it folds in every stall -- but it is the number that says whether an
+    # arm is anywhere near the 47..57 GB/s this box actually achieves.
+    row["eff_ddr_gbps"] = round(ddr_mib * 2**20 / (med * 1e-6) / 1e9, 2)
 
     # Accounting: convert this arm's traced core span to microseconds and ask how much of the
     # command the core was even spanning. This is the number item (3) is about. Per-suffix, because
@@ -166,12 +202,17 @@ def main(o):
         print(f"  median {r['median_us']} us   min {r['min_us']}   max {r['max_us']}", flush=True)
         print(f"  peak-time {r['t_peak_us']} us -> {r['pct_of_peak_median']}% of peak "
               f"(best rep {r['pct_of_peak_best']}%)", flush=True)
+        print(f"  shape {r['M']}x{r['K']}x{r['N']}  DDR {r['ddr_mib']} MiB "
+              f"(unique {r['unique_mib']}) -> {r['eff_ddr_gbps']} GB/s effective", flush=True)
         if "span_us" in r:
             print(f"  traced span {r['span_cycles']} cyc = {r['span_us']} us = "
                   f"{r['span_pct_of_command']}% of command; "
                   f"{r['outside_window_us']} us outside the window", flush=True)
 
-    out = os.path.join(o.artifacts, "gemm_command_accounting.json")
+    # Named, not fixed: the width series banked this file under the default name and a second run
+    # with different arms would silently replace it -- the same overwrite the no-trace build script
+    # had to stash artifacts to avoid.
+    out = os.path.join(o.artifacts, o.out)
     json.dump(rows, open(out, "w"), indent=2)
     print(f"\nwrote {out}")
     aie_utils.DefaultNPURuntime.cleanup()
@@ -182,12 +223,13 @@ if __name__ == "__main__":
     p.add_argument("--build-dir", default="mlir-aie/programming_examples/basic/"
                                           "matrix_multiplication/whole_array/build")
     p.add_argument("--suffixes", nargs="+", required=True)
-    p.add_argument("--M", type=int, default=512)
-    p.add_argument("--K", type=int, default=1024)
-    p.add_argument("--N", type=int, default=1024)
+    p.add_argument("--M", type=int, default=None)
+    p.add_argument("--K", type=int, default=None)
+    p.add_argument("--N", type=int, default=None)
     p.add_argument("--reps", type=int, default=10)
     p.add_argument("--span", nargs="*", default=[], metavar="SUFFIX=CYCLES",
                    help="per-arm traced core span to account the command against")
     p.add_argument("--kernel", default="MLIR_AIE")
     p.add_argument("--artifacts", default="artifacts")
+    p.add_argument("--out", default="gemm_command_accounting.json")
     main(p.parse_args())
