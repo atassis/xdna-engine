@@ -32,15 +32,24 @@ fi
 log "[svc] device clear"
 
 source "$WT/scripts/iron_env.sh" >/dev/null 2>&1
-for sfx in $ARMS; do
-  log ""
-  log "---------- $sfx ----------"
-  outdir="$WT/artifacts/ksweep_${KSWEEP_TAG:+${KSWEEP_TAG}_}$sfx"
-  mkdir -p "$outdir"
-  .venv-iron/bin/python scripts/gemm_trace_probe.py \
-      --build-dir "$EX/build" --suffix "$sfx" \
-      --M 512 --K 1024 --N 1024 --trace-size 1048576 \
-      --artifacts "$outdir" 2>&1 | tee -a "$LOG"
+# REPS loops the WHOLE arm list, so reps stay interleaved inside this one service-stop window --
+# the box's per-session shift lands on acquire wait and would otherwise be read as an arm effect.
+# Each rep gets its own artifact dir: the trace JSON is named from the suffix alone, so a second rep
+# used to overwrite the first and only the summary line in this log survived. The raw trace is what
+# gemm_trace_overlap.py needs, so a per-rep dir is what makes the overlap split repeatable.
+REPS="${REPS:-1}"
+for rep in $(seq 1 "$REPS"); do
+  for sfx in $ARMS; do
+    log ""
+    log "---------- $sfx ----------"
+    outdir="$WT/artifacts/ksweep_${KSWEEP_TAG:+${KSWEEP_TAG}_}$sfx"
+    [ "$REPS" = "1" ] || outdir="${outdir}_r${rep}"
+    mkdir -p "$outdir"
+    .venv-iron/bin/python scripts/gemm_trace_probe.py \
+        --build-dir "$EX/build" --suffix "$sfx" \
+        --M 512 --K 1024 --N 1024 --trace-size 1048576 \
+        --artifacts "$outdir" 2>&1 | tee -a "$LOG"
+  done
 done
 
 log ""
