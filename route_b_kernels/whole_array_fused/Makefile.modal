@@ -106,13 +106,12 @@ mode_tag=$(if $(filter 1,${glu}),modalglu,$(if $(filter 1,${gelu}),modalgelu,$(i
 # needs its own artifact name or it would overwrite the row-major stream. A bf16-out build
 # is a different xclbin outright (the C buffers resize), so it is tagged too.
 dep_tag=$(if $(filter 2,$(WA_C_DEPTH)),d2,)
-# Any A/B depth other than the shipped 2 is a DIFFERENT xclbin (the L1 buffers resize), so it needs
-# its own name or it silently overwrites the shipped depth-2 stream. This tagged only depth 1 until
-# 2026-08-18, so a depth-3/4 feed-rate arm built straight over the depth-2 artifact under one name.
-abdep_tag=$(if $(filter 2,$(WA_AB_DEPTH)),,ab$(WA_AB_DEPTH))
-# Same rule one hop up: WA_L3L2_DEPTH resizes the shim->memtile buffers, so it is a different
-# xclbin and must not share a name with the depth-2 build.
-l3dep_tag=$(if $(filter 2,$(WA_L3L2_DEPTH)),,l3$(WA_L3L2_DEPTH))
+# Any A/B depth other than 2 is a DIFFERENT xclbin (the L1 buffers resize), so it needs its own name
+# or a feed-rate sweep arm silently overwrites the depth-2 stream. Unset is depth 2 -- the generator
+# defaults both knobs to fifo_depth=2 -- so only an explicit non-2 override earns a tag.
+abdep_tag=$(if $(filter-out 2,$(WA_AB_DEPTH)),ab$(WA_AB_DEPTH),)
+# Same rule one hop up: WA_L3L2_DEPTH resizes the shim->memtile buffers.
+l3dep_tag=$(if $(filter-out 2,$(WA_L3L2_DEPTH)),l3$(WA_L3L2_DEPTH),)
 # Same rule for the traced WORKER. It changes only which core carries the trace packets, but that is
 # both a different xclbin and a different MEASUREMENT: A multicasts down a column and B across a row,
 # so each worker sits at the intersection of two DIFFERENT 4-core rendezvous and the feed-overlap

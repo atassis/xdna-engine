@@ -132,11 +132,16 @@ gen_args = $(subst --use-chess $(use_chess),,$(aieargs))
 mlir_target := build/aie_${target_suffix}.mlir
 insts_target := build/insts_${target_suffix}.txt
 
+# Only whole_array_modal_iron.py declares these four; the plain/silu/int8 generators take
+# --trace_size alone and argparse hard-errors on the rest. Each default here equals the
+# generator-side argparse default, so they carry information only while tracing is on.
+wa_trace_args = $(if $(filter-out 0,$(wa_trace_size)),--trace_worker ${wa_trace_worker} \
+    --trace_events "${wa_trace_events}" --trace_memtile ${wa_trace_memtile} \
+    --trace_memtile_events "${wa_trace_memtile_events}")
+
 ${mlir_target}: ${srcdir}/${aie_py_src}
 	mkdir -p ${@D}
-	python3 $< ${gen_args} --trace_size ${wa_trace_size} --trace_worker ${wa_trace_worker} \
-	    --trace_events "${wa_trace_events}" --trace_memtile ${wa_trace_memtile} \
-	    --trace_memtile_events "${wa_trace_memtile_events}" > $@
+	python3 $< ${gen_args} --trace_size ${wa_trace_size} ${wa_trace_args} > $@
 
 # Grouped co-target (&:): ONE aiecc invocation produces BOTH the xclbin AND the .txt insts,
 # so make treats insts_${target_suffix}.txt as a real target (a direct `make .../insts_*.txt`

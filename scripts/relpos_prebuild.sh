@@ -18,11 +18,15 @@ TQ=8
 # HEADS=8 = Parakeet n_heads run on 8 PARALLEL cores (one head/core), one dispatch/block
 # (Phase-2 spatial-parallel relpos). HEADS=1 rebuilds the original single-Worker block.
 HEADS="${HEADS:-8}"
-# BUILT_T:KB:subdir -- keep in sync with RELPOS_BUCKETS in npu.rs.
-# Every BUILT_T must be a multiple of TQ (else the generator peels a ragged query tile and
-# re-emits every block call -- 20% of the core's 16 KB program memory) and must not be 104
-# (the insts header word[2] constant; the per-clip patch is by value). See RELPOS_BUCKETS.
-BUCKETS="${BUCKETS:-112:28:bucket_112 152:38:bucket_152 176:44:single}"
+# BUILT_T:KB:subdir -- MUST match whichever RELPOS_BUCKETS table npu.rs selects, or the engine
+# panics on a bucket this never built. The default here has to be RELPOS_BUCKETS_SHIPPED, since
+# that is what npu.rs picks with no env override.
+#   NOPEEL (PARAKEET_RELPOS_NOPEEL=1):  112:28:bucket_112 152:38:bucket_152 176:44:single
+#   ROWTILE (PARAKEET_RELPOS_ROWTILE=1, ROWS=4): 160:40:bucket_152 192:48:single
+# A BUILT_T that is not a multiple of TQ peels a ragged query tile and re-emits every block call
+# (20% of the core's 16 KB program memory) -- which is what the NOPEEL set exists to avoid -- and
+# must never be 104 (the insts header word[2] constant; the per-clip patch is by value).
+BUCKETS="${BUCKETS:-100:25:bucket_100 152:38:bucket_152 172:43:single}"
 # TSKIP=1 builds the runtime t_active block-skip arm (drop the blocks the softmax never reads).
 # OUT_ROOT redirects the artifacts so both arms can sit side by side for a swap A/B.
 TSKIP="${TSKIP:-0}"

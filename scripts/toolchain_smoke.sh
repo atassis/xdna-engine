@@ -32,6 +32,10 @@ XCLBIN="$MMW/build/final_512x800x3072_64x32x96_8c_modalsilu.xclbin"
 GATEBAK=""
 if [ -f "$XCLBIN" ]; then GATEBAK="$XCLBIN.gatebak"; cp -f "$XCLBIN" "$GATEBAK"; fi
 trap '[ -n "$GATEBAK" ] && [ -f "$GATEBAK" ] && mv -f "$GATEBAK" "$XCLBIN"' EXIT
+# The goal must not already be satisfied, or make answers "Nothing to be done", never re-emits the
+# generator .mlir, and the gate decides the toolchain on an artifact the toolchain did not build.
+# GATEBAK holds the device-validated copy the trap restores.
+rm -f "$XCLBIN"
 ( cd "$REPO" && WA_C_DEPTH=1 make -C "$MMW" -f Makefile.modal NPU2=1 M=512 K=800 N=3072 m=64 k=32 n=96 \
     n_aie_cols=8 emulate_bfloat16_mmul_with_bfp16=1 bfp16_iree=1 \
     build/final_512x800x3072_64x32x96_8c_modalsilu.xclbin )
