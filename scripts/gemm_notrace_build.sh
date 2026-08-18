@@ -15,12 +15,24 @@
 # with the traced artifacts moved aside, its products renamed to a `nt` suffix, and the traced
 # artifacts put back.
 #
+# EPILOGUE selects which mode the stream bakes into rtp[0]: `id` (identity, the default and what the
+# accounting arms use) or `silu`. Both produce the SAME array program -- the xclbins differ only in
+# UUID/timestamp and the instruction streams in one byte per core -- which is what makes an id/silu
+# pair the one-xclbin-two-programs arm of the transition probe's --mode same-context.
+#
 # Device-free. Run:  bash scripts/gemm_notrace_build.sh [k:n:cols ...]
+#                    EPILOGUE=silu bash scripts/gemm_notrace_build.sh 32:128:4
 set -u
 WT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$WT"
 EX="$WT/mlir-aie/programming_examples/basic/matrix_multiplication/whole_array"
 B="$EX/build"
 ARMS="${1:-32:128:1 32:128:4}"
+EPILOGUE="${EPILOGUE:-id}"
+case "$EPILOGUE" in
+  id)   mode_tag=modalid;   no_silu=1 ;;
+  silu) mode_tag=modalsilu; no_silu=0 ;;
+  *)    echo "EPILOGUE must be id or silu, got '$EPILOGUE'" >&2; exit 2 ;;
+esac
 LOG="$WT/artifacts/gemm_notrace_build.log"
 mkdir -p "$WT/artifacts"; : > "$LOG"
 log(){ echo -e "$*" | tee -a "$LOG"; }
@@ -30,6 +42,8 @@ source "$WT/scripts/iron_env.sh" >/dev/null 2>&1
 
 log "======== whole_array NO-TRACE control build  $(date -Is) ========"
 log "instance: $MLIR_AIE_INSTANCE"
+log ""
+log "epilogue: $EPILOGUE (rtp[0]=$( [ "$no_silu" = 1 ] && echo 0 || echo 1 ))"
 log ""
 log "  cols |   k |   n | build | operands | xclbin bytes | suffix"
 log "  -----+-----+-----+-------+----------+--------------+-------"
@@ -42,7 +56,7 @@ unstash(){ for f in "final_$1.xclbin" "insts_$1.txt" "aie_$1.mlir" "aie_$1.mlir.
 
 for arm in $ARMS; do
   IFS=: read -r k n c <<< "$arm"
-  sfx="512x1024x1024_64x${k}x${n}_${c}c_modalid"
+  sfx="512x1024x1024_64x${k}x${n}_${c}c_${mode_tag}"
   nt="${sfx}nt"
   stash "$sfx"
   # No PROFILE=trace and no wa_trace_* -- that is the whole difference from gemm_k_sweep_build.sh.
@@ -52,7 +66,8 @@ for arm in $ARMS; do
   # bare-tag defect that wrk_tag two lines below was fixed for with filter-out, still live here.
   ( cd "$EX" && WA_C_DEPTH=1 WA_AB_DEPTH=2 WA_L3L2_DEPTH=2 \
       make -f Makefile.modal NPU2=1 M=512 K=1024 N=1024 m=64 k="$k" n="$n" n_aie_cols="$c" \
-      emulate_bfloat16_mmul_with_bfp16=1 bfp16_iree=1 no_silu=1 "build/final_${sfx}.xclbin" ) >>"$LOG" 2>&1
+      emulate_bfloat16_mmul_with_bfp16=1 bfp16_iree=1 no_silu="$no_silu" \
+      "build/final_${sfx}.xclbin" ) >>"$LOG" 2>&1
   rc=$?
   if [ $rc -eq 0 ] && [ -f "$B/final_$sfx.xclbin" ]; then
     # Read the TOP-LEVEL generated MLIR: PROFILE=production does not retain the .prj's

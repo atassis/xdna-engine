@@ -40,12 +40,37 @@
 # --negative-control checks the OTHER direction the gate can be blind: it runs `alt` with B's
 # commands skipped, so the arm is not the arm it claims to be, and the run must fail.
 #
+# WHAT --mode SELECTS, and why there are three of them. The pairing above (`two-context`) alternates
+# two distinct xclbins in two live hw_contexts, so it measures PROGRAM-plus-CONTEXT together and
+# cannot say which term the ~1.5 ms belongs to. That is the question `mode-switched-multi-program-
+# xclbin` turns on: a mode-selected design puts several programs in ONE context, so it collects the
+# encoder's 743 x 1.543 ms = 1.146 s only if the cost is the CONTEXT. Two further pairings split it:
+#   two-context  -- distinct xclbins, distinct contexts.        program CHANGES, context CHANGES.
+#   same-context -- ONE xclbin, ONE context, two INSTRUCTION    program CHANGES, context is FIXED.
+#                   STREAMS. The `modalid`/`modalsilu` pair is exactly this: the two xclbins differ
+#                   in 82 bytes (UUID/timestamp) and the two streams in 16 (one `0 -> 1` per core,
+#                   the rtp[0] epilogue selector), so the array program is identical and the stream
+#                   picks identity or silu. Only arm A's xclbin is loaded; arm B contributes its
+#                   instruction stream, bound to arm A's kernel. THIS IS THE MODE-SWITCH MECHANISM.
+#   dup-context  -- arm A's xclbin copied to a second path so the runtime's path+mtime cache misses
+#                   and a second hw_context is created over IDENTICAL program bytes.
+#                                                               program is FIXED, context CHANGES.
+# Read `same-context` and `dup-context` together: they attribute the two-context floor to one term.
+#
+# THE REFERENCE IS DEVICE-DERIVED, per (stream, slot), because the two streams no longer compute the
+# same function -- silu(C) is not bit-reproducible in numpy against the device's bf16 sigmoid, so an
+# analytic reference cannot gate the silu arm. Each stream's own single-command output is captured
+# once, and the alternating arm must reproduce it EXACTLY. The mechanism is itself gated: any arm
+# whose suffix carries `modalid` must match the analytic np.roll(A, 1) exactly, which is what proves
+# a captured reference is the real value and not a captured mistake.
+#
 # Run (NPU free -- use the device wrapper, which stops xdna-engine and npu-vox):
 #   bash scripts/gemm_dispatch_transition_device.sh
 import argparse
 import json
 import os
 import re
+import shutil
 import statistics
 import sys
 import time
@@ -65,13 +90,13 @@ import aie.utils as aie_utils
 DTYPE = {"bf16": bfloat16, "f32": np.float32}
 
 
-def load_arm(suffix, o):
+def load_arm(suffix, o, xclbin=None):
     """Load one xclbin into its own hw_context and return the raw kernel handle plus its out dtype.
 
     Reaches past the runtime wrapper to the objects run()'s own timed region uses, so submit and wait
     below are the identical calls rather than a re-implementation of them.
     """
-    xclbin = os.path.join(o.build_dir, f"final_{suffix}.xclbin")
+    xclbin = xclbin or os.path.join(o.build_dir, f"final_{suffix}.xclbin")
     insts = os.path.join(o.build_dir, f"insts_{suffix}.txt")
     for p in (xclbin, insts):
         if not os.path.exists(p):
@@ -103,13 +128,27 @@ def main(o):
     depth_max = max(o.depths)
 
     kh_a, h_a, out_a = load_arm(o.arm_a, o)
-    kh_b, h_b, out_b = load_arm(o.arm_b, o)
+    if o.mode == "same-context":
+        # One xclbin, one context. Arm B is a second INSTRUCTION STREAM on arm A's kernel, built
+        # below -- nothing of arm B's own xclbin is loaded.
+        kh_b, h_b, out_b = kh_a, h_a, out_a
+    elif o.mode == "dup-context":
+        dup = os.path.join(o.artifacts, f"final_{o.arm_a}__dupctx.xclbin")
+        shutil.copyfile(os.path.join(o.build_dir, f"final_{o.arm_a}.xclbin"), dup)
+        kh_b, h_b, out_b = load_arm(o.arm_a, o, xclbin=dup)
+    else:
+        kh_b, h_b, out_b = load_arm(o.arm_b, o)
     if out_a != out_b:
         sys.exit(f"arms differ in output dtype: {out_a} vs {out_b}")
-    # Two live contexts is the premise of the whole probe. If XRT handed back the same one -- which
-    # it does for the same xclbin path -- there is no boundary to cross and the result is vacuous.
-    if kh_a.context is kh_b.context:
-        sys.exit("both arms share one hw_context -- no program boundary, nothing to measure")
+    # Whether the two arms share a context is the independent variable now, so it is ASSERTED per
+    # mode rather than merely rejected. Getting this backwards silently turns the probe into a
+    # measurement of nothing: same context in `two-context` has no boundary to cross, and a shared
+    # context in `dup-context` means the runtime's cache handed back arm A and the arm is a no-op.
+    same_ctx = kh_a.context is kh_b.context
+    if o.mode in ("two-context", "dup-context") and same_ctx:
+        sys.exit(f"{o.mode}: both arms share one hw_context -- no boundary, nothing to measure")
+    if o.mode == "same-context" and not same_ctx:
+        sys.exit("same-context: arms landed in different contexts -- the pairing is not what it says")
 
     # +-1 A and a single-cycle permutation B: see the header. Exact through bfp16, the f32
     # accumulate and the drain, so the reference below is an equality rather than a tolerance.
@@ -141,8 +180,25 @@ def main(o):
                                   xrt_device=rt._device).buffer_object()
         return bo, kh.insts.nbytes
 
+    def insts_of_file(kh, path):
+        """Build an instruction BO for a stream this kernel was NOT loaded with.
+
+        The mode-switch mechanism in one function: the hw_context and the array program come from
+        the xclbin, and which program runs rides in the instruction stream. Same kernel, same
+        context, second stream.
+        """
+        arr = np.frombuffer(open(path, "rb").read(), dtype=np.uint32)
+        bo = rt._tensor_class(arr, flags=pyxrt.bo.cacheable, group_id=kh.kernel.group_id(1),
+                              xrt_device=rt._device).buffer_object()
+        return bo, arr.nbytes
+
     ibo_a, ib_a = insts_of(kh_a)
-    ibo_b, ib_b = insts_of(kh_b)
+    if o.mode == "same-context":
+        ibo_b, ib_b = insts_of_file(kh_a, os.path.join(o.build_dir, f"insts_{o.arm_b}.txt"))
+        if ib_b != ib_a:
+            print(f"  note: streams differ in length ({ib_a} vs {ib_b} B)", flush=True)
+    else:
+        ibo_b, ib_b = insts_of(kh_b)
 
     def submit(kh, ibo, ib, i):
         return kh.kernel(3, ibo, ib, a_bos[i], b_bo, c_bos[i])
@@ -181,17 +237,59 @@ def main(o):
                 buf[:] = 0
             t.to("npu")
 
-    def check(d):
-        """Worst mismatch count over the d slots, each against ITS OWN A rotated one column."""
-        bad = 0
-        for i in range(d):
-            ref = np.roll(np.asarray(As[i]).reshape(M, K), 1, axis=1).astype(np.float32)
-            got = np.asarray(Cs[i]).reshape(M, N).astype(np.float32)
-            bad = max(bad, int(np.count_nonzero(got != ref)))
-        return bad
-
     arms = ("a", "b", "alt")
     kern_of = ((kh_a, ibo_a, ib_a), (kh_b, ibo_b, ib_b))
+
+    def check(d, p):
+        """Worst mismatch count over d slots, each against the reference of the STREAM that wrote it.
+
+        Keyed by plan, not by arm: once the two streams compute different functions, `alt` slot i is
+        only correct against stream p[i]'s reference. Called with the UNTRUNCATED plan so the
+        negative control's skipped slots are compared against a value nothing wrote.
+        """
+        bad = 0
+        for i in range(d):
+            got = np.asarray(Cs[i]).reshape(M, N).astype(np.float32)
+            bad = max(bad, int(np.count_nonzero(got != refs[(p[i], i)])))
+        return bad
+
+    # Per-(stream, slot) reference, captured from the device one command at a time. See the header:
+    # the silu stream has no bit-reproducible analytic value, so the gate compares each arm against
+    # what that stream alone produces. Poisoned first, so a stream that writes nothing is caught here
+    # rather than silently becoming its own reference.
+    refs = {}
+    for stream in (0, 1):
+        for i in range(depth_max):
+            with Cs[i].overwrite() as buf:
+                buf[:] = 0
+            Cs[i].to("npu")
+            kh, ibo, ib = kern_of[stream]
+            if kh.kernel(3, ibo, ib, a_bos[i], b_bo, c_bos[i]).wait() \
+                    != pyxrt.ert_cmd_state.ERT_CMD_STATE_COMPLETED:
+                sys.exit(f"reference capture did not complete: stream {stream} slot {i}")
+            refs[(stream, i)] = np.asarray(Cs[i]).reshape(M, N).astype(np.float32).copy()
+
+    # Gate the reference MECHANISM on the arm whose value is known in closed form. An identity
+    # epilogue must reproduce np.roll(A, 1) exactly (the +-1 / permutation construction is lossless
+    # through bfp16, the f32 accumulate and the drain), so if a captured reference is a captured
+    # mistake, it fails here instead of becoming the thing everything else is measured against.
+    for stream, suffix in ((0, o.arm_a), (1, o.arm_b)):
+        if "modalid" not in suffix:
+            print(f"  note: {suffix} has no closed form -- reference is device-derived only",
+                  flush=True)
+            continue
+        for i in range(depth_max):
+            ref = np.roll(np.asarray(As[i]).reshape(M, K), 1, axis=1).astype(np.float32)
+            bad = int(np.count_nonzero(refs[(stream, i)] != ref))
+            if bad:
+                sys.exit(f"reference capture is not the analytic value for {suffix} "
+                         f"slot {i}: {bad} mismatched elements")
+    # The two streams must actually differ somewhere, or `alt` is alternating with itself and a
+    # zero excess means nothing. Distinct instruction streams that compute the same function are
+    # legitimate (dup-context is exactly that), so this only reports.
+    differ = sum(1 for i in range(depth_max)
+                 if int(np.count_nonzero(refs[(0, i)] != refs[(1, i)])))
+    print(f"  streams produce differing output on {differ}/{depth_max} slots", flush=True)
     depths = {}
     for d in o.depths:
         per = {arm: [] for arm in arms}
@@ -212,7 +310,7 @@ def main(o):
                         sys.exit(f"depth {d} arm {arm}: kernel did not complete")
                 t2 = time.perf_counter_ns()
                 per[arm].append(((t2 - t0) / 1000.0 / d, (t1 - t0) / 1000.0 / d))
-        bad = check(d)
+        bad = check(d, plan("alt", d))
 
         med = {arm: statistics.median(p[0] for p in per[arm]) for arm in arms}
         # Paired WITHIN each rep: the counterfactual for that rep's alt is that rep's own a and b.
@@ -252,6 +350,8 @@ def main(o):
 
     macs = M * K * N
     row = {
+        "mode": o.mode, "shared_hw_context": bool(same_ctx),
+        "streams_differ_on_slots": differ,
         "arm_a": o.arm_a, "arm_b": o.arm_b, "cols_a": cols_a, "cols_b": cols_b,
         "M": M, "K": K, "N": N, "macs": macs, "out_dtype": out_a,
         "t_peak_a_us": round(1e6 * macs / (cols_a * COMPUTE_ROWS * MAC_PER_CYCLE_PER_CORE
@@ -263,7 +363,7 @@ def main(o):
         "depths": depths,
     }
 
-    print(f"\n---------- {o.arm_a}  vs  {o.arm_b} ----------", flush=True)
+    print(f"\n---------- [{o.mode}] {o.arm_a}  vs  {o.arm_b} ----------", flush=True)
     print(f"  shape {M}x{K}x{N}  cols {cols_a}/{cols_b}  out {out_a}  "
           f"t_peak {row['t_peak_a_us']}/{row['t_peak_b_us']} us", flush=True)
     failed = []
@@ -304,6 +404,13 @@ if __name__ == "__main__":
     p.add_argument("--M", type=int, default=None)
     p.add_argument("--K", type=int, default=None)
     p.add_argument("--N", type=int, default=None)
+    p.add_argument("--mode", choices=("two-context", "same-context", "dup-context"),
+                   default="two-context",
+                   help="two-context: distinct xclbins, distinct contexts (program AND context "
+                        "change). same-context: one xclbin, one context, two instruction streams "
+                        "(program changes, context fixed) -- the mode-switch mechanism. "
+                        "dup-context: one xclbin copied to a second path, two contexts over "
+                        "identical program bytes (context changes, program fixed).")
     p.add_argument("--depths", type=int, nargs="+", default=[1, 2, 4, 8, 16, 32, 64])
     p.add_argument("--depth-reps", type=int, default=15)
     p.add_argument("--poison", action="store_true")
