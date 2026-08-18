@@ -14,6 +14,12 @@
 #
 # Exit 0 = clean; exit 1 = found a private reference (prints file:line, or the
 # matching line(s) of the text in --message mode).
+#
+# `git grep --untracked` is load-bearing, not a nicety: plain `git grep` searches only
+# TRACKED files, so a brand-new public file could carry a private KB wikilink and this
+# script would exit 0 on it -- a false all-clear at exactly the moment you would run it
+# (before staging). Caught 2026-08-18 on an untracked scripts/*.py. Standard exclusions
+# still apply, so .gitignore'd paths stay out.
 # Wire it into the pre-push guard (hooks/pre-push) so a leak cannot be pushed.
 set -euo pipefail
 
@@ -56,14 +62,14 @@ if [ "$#" -gt 0 ]; then
   files=()
   for f in "$@"; do [[ "$f" =~ $allow ]] || files+=("$f"); done
   [ "${#files[@]}" -eq 0 ] && exit 0
-  hits="$(git grep -nIEi "$regex" -- "${files[@]}" 2>/dev/null || true)"
-  wiki_hits="$(git grep -nIE "$wikilink_re" -- "${files[@]}" 2>/dev/null | grep -viE "$benign_wikilink_re" || true)"
+  hits="$(git grep --untracked -nIEi "$regex" -- "${files[@]}" 2>/dev/null || true)"
+  wiki_hits="$(git grep --untracked -nIE "$wikilink_re" -- "${files[@]}" 2>/dev/null | grep -viE "$benign_wikilink_re" || true)"
 else
   # whole tree, minus the allowed guard files and lockfiles
-  hits="$(git grep -nIEi "$regex" -- . ':!*.lock' \
+  hits="$(git grep --untracked -nIEi "$regex" -- . ':!*.lock' \
             ':!scripts/check_no_private_refs.sh' ':!scripts/private_ref_patterns.sh' \
             ':!hooks/pre-push' ':!hooks/pre-push-fork' ':!.githooks-install.md' ':!.gitignore' 2>/dev/null || true)"
-  wiki_hits="$(git grep -nIE "$wikilink_re" -- . ':!*.lock' \
+  wiki_hits="$(git grep --untracked -nIE "$wikilink_re" -- . ':!*.lock' \
             ':!scripts/check_no_private_refs.sh' ':!scripts/private_ref_patterns.sh' \
             ':!hooks/pre-push' ':!hooks/pre-push-fork' ':!.githooks-install.md' ':!.gitignore' 2>/dev/null | grep -viE "$benign_wikilink_re" || true)"
 fi
