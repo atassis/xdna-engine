@@ -43,7 +43,12 @@ log(){ echo -e "$*" | tee -a "$LOG"; }
 # INSTR_VECTOR is held in every set as the cross-run anchor: under 8 high-rate sources the trace
 # drops events roughly uniformly, and a stable MEAN duration against a falling COUNT is what tells a
 # lost event apart from a changed execution.
-EVENTS="INSTR_EVENT_0,INSTR_EVENT_1,INSTR_VECTOR,ACTIVE,DISABLED,INSTR_LOAD,INSTR_STORE,INSTR_LOCK_ACQUIRE_REQ"
+# WA_EVENTS overrides the set. Set it EMPTY to fall back to the generator default, which spends
+# the 8 slots on the stall question instead (MEMORY/STREAM/LOCK_STALL + PORT_RUNNING). The two
+# sets are complementary and neither is complete: the issue set below leaves stall dark, the
+# default leaves scalar/load-store dark (66.95% of span at the deployed tile). INSTR_VECTOR is
+# in both, and is the anchor that lets two runs of the same arm be composed.
+EVENTS="${WA_EVENTS-INSTR_EVENT_0,INSTR_EVENT_1,INSTR_VECTOR,ACTIVE,DISABLED,INSTR_LOAD,INSTR_STORE,INSTR_LOCK_ACQUIRE_REQ}"
 
 source "$WT/scripts/iron_env.sh" >/dev/null 2>&1
 [ -n "${MLIR_AIE_INSTANCE:-}" ] || { log "FATAL: iron_env did not set MLIR_AIE_INSTANCE"; exit 1; }
@@ -61,7 +66,12 @@ for arm in $ARMS; do
   abtag=""; [ "$d" = "1" ] && abtag="ab1"
   sfx="512x1024x1024_64x${k}x${n}_4c_modalid${abtag}"
   out="$EX/build/final_${sfx}.xclbin"
-  rm -f "$out"
+  # Drop the generated MLIR too, not just the xclbin. make's dependency is the .mlir FILE, so it
+  # cannot see that wa_trace_events (or any other generator env) changed: a rerun with a different
+  # event set silently relinks the SAME traced design and you measure the old set. Caught on
+  # 2026-08-18 -- a stall-set rebuild produced a byte-identical xclbin against a .mlir from the
+  # previous day. Regenerating costs seconds; the failure is silent and produces wrong numbers.
+  rm -f "$out" "$EX/build/aie_${sfx}.mlir"
   # Name the xclbin target. The DEFAULT goal also builds whole_array_modal.exe, the C++ host test,
   # which fails here for reasons unrelated to the design -- gating on make's exit code instead of the
   # artifact reads every arm as FAIL while all three xclbins are sitting in build/.

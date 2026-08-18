@@ -11,7 +11,7 @@ set -u
 WT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$WT"
 EX="$WT/mlir-aie/programming_examples/basic/matrix_multiplication/whole_array"
 ARMS="${1:-512x1024x1024_64x32x128_4c_modalid 512x1024x1024_64x32x128_4c_modalidab1 512x1024x1024_64x64x128_4c_modalidab1}"
-LOG="$WT/artifacts/gemm_k_sweep_device.log"
+LOG="$WT/artifacts/gemm_k_sweep_device${KSWEEP_TAG:+_$KSWEEP_TAG}.log"
 mkdir -p "$WT/artifacts"; : > "$LOG"
 log(){ echo -e "$*" | tee -a "$LOG"; }
 
@@ -35,7 +35,7 @@ source "$WT/scripts/iron_env.sh" >/dev/null 2>&1
 for sfx in $ARMS; do
   log ""
   log "---------- $sfx ----------"
-  outdir="$WT/artifacts/ksweep_$sfx"
+  outdir="$WT/artifacts/ksweep_${KSWEEP_TAG:+${KSWEEP_TAG}_}$sfx"
   mkdir -p "$outdir"
   .venv-iron/bin/python scripts/gemm_trace_probe.py \
       --build-dir "$EX/build" --suffix "$sfx" \
