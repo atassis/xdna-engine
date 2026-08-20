@@ -71,6 +71,16 @@ c_panel_width?=0
 # different from the baked one -- and every stream dispatched on it must carry the rtp[1] write.
 k_loop_rtp?=0
 
+# Carry resadd as MODE 4 of this xclbin instead of as a sibling one (0 = off). It reuses the GEMM's
+# own A/B input channels and C drain and declares nothing: a second TOPOLOGY cannot route, because
+# the GEMM already holds core DMA 2/2, East/South/West 4/4 and memtile DMA 6/6. Different xclbin
+# (the core carries a second body), so it is tagged.
+mode_resadd?=0
+# Bake rtp[0]=4 into THIS instruction stream (0 = off). Insts-only: same xclbin as the
+# mode_resadd=1 GEMM stream, so the pair is one program serving two ops.
+rtp_mode_resadd?=0
+mode4_bisect?=0
+
 # Read A from a [K/W, M, W] panel-major buffer instead of row-major [M, K] (0 = off). Mirror of
 # c_panel_width, for a GEMM whose producer already drained panel-major -- fc1 does, by default, so a
 # wide-K fc2 needs no repack. Insts-only. Needs N/n/n_aie_cols == 1: the panel index spends the A
@@ -95,6 +105,12 @@ aieargs+=--c-panel-width ${c_panel_width}
 endif
 ifeq (${k_loop_rtp}, 1)
 aieargs+=--k-loop-rtp
+endif
+ifeq (${mode_resadd}, 1)
+aieargs+=--mode-resadd
+endif
+ifeq (${rtp_mode_resadd}, 1)
+aieargs+=--rtp-mode-resadd
 endif
 ifneq (${a_panel_width}, 0)
 aieargs+=--a-panel-width ${a_panel_width}
@@ -127,8 +143,12 @@ re_tag=$(if $(filter 1,${round_even}),re,)$(if $(filter 1,${silu_f32_tail}),ft,)
 panel_tag=$(if $(filter 0,${c_panel_width}),,panel${c_panel_width})
 out_tag=$(if $(filter bf16,${dtype_out}),bf16out,)
 krtp_tag=$(if $(filter 1,${k_loop_rtp}),krtp,)
+resadd_tag=$(if $(filter 1,${mode_resadd}),resadd,)
+# The rtp arm is a DIFFERENT INSTRUCTION STREAM on the SAME xclbin, so it needs its own artifact
+# name or it overwrites the GEMM stream -- the same rule panel_tag carries.
+rtpresadd_tag=$(if $(filter 1,${rtp_mode_resadd}),rtp4,)
 apanel_tag=$(if $(filter 0,${a_panel_width}),,apanel${a_panel_width})
-target_suffix=${M}x${K}x${N}_${m}x${k}x${n}_${n_aie_cols}c_${mode_tag}${out_tag}${panel_tag}${dep_tag}${abdep_tag}${l3dep_tag}${wrk_tag}${mt_tag}${re_tag}${nat_tag}${krtp_tag}${apanel_tag}
+target_suffix=${M}x${K}x${N}_${m}x${k}x${n}_${n_aie_cols}c_${mode_tag}${out_tag}${panel_tag}${dep_tag}${abdep_tag}${l3dep_tag}${wrk_tag}${mt_tag}${re_tag}${nat_tag}${krtp_tag}${apanel_tag}${resadd_tag}${rtpresadd_tag}
 
 use_iron=1
 aie_py_src=whole_array_modal_iron.py
@@ -138,7 +158,7 @@ buffer_aloc_flag=basic-sequential
 
 # matmul object needs the bf16_f32 combo defines (mm.cc names symbols by combo).
 MM_DEFINES=-Dbf16_f32_ONLY -DDIM_M=${m} -DDIM_K=${k} -DDIM_N=${n} -DVECTORIZED_ONLY
-EPI_DEFINES=-DEPI_M=${m} -DEPI_N=${n} -DEPI_R=${epi_r} -DEPI_T=${epi_t}$(if $(filter 1,${round_even}), -DMODAL_ROUND_EVEN,)$(if $(filter 1,${drain_round_floor}), -DMODAL_DRAIN_ROUND_FLOOR,)$(if $(filter 1,${silu_f32_tail}), -DSILU_F32_TAIL,)$(if $(filter 1,${silu_f32_tanh}), -DSILU_F32_TANH,)
+EPI_DEFINES=$(if $(filter 1,${mode4_bisect}), -DMODE4_BISECT_STORE_ONLY,)$(if $(filter 2,${mode4_bisect}), -DMODE4_BISECT_LOAD_A,)$(if $(filter 3,${mode4_bisect}), -DMODE4_BISECT_LOAD_AB,)$(if $(filter 4,${mode4_bisect}), -DMODE4_BISECT_LOAD_AB -DMODE4_BISECT_ADD,) -DEPI_M=${m} -DEPI_K=${k} -DEPI_N=${n} -DEPI_R=${epi_r} -DEPI_T=${epi_t}$(if $(filter 1,${round_even}), -DMODAL_ROUND_EVEN,)$(if $(filter 1,${drain_round_floor}), -DMODAL_DRAIN_ROUND_FLOOR,)$(if $(filter 1,${silu_f32_tail}), -DSILU_F32_TAIL,)$(if $(filter 1,${silu_f32_tanh}), -DSILU_F32_TANH,)
 ifeq (${b_col_maj}, 1)
 	MM_DEFINES+=-DB_COL_MAJ
 endif

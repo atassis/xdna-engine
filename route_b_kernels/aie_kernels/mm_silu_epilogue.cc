@@ -492,6 +492,12 @@ extern "C" {
 #ifndef EPI_N
 #define EPI_N 32
 #endif
+// The A tile's inner dim, needed only by the resadd MODE below (the epilogues are all
+// C-tile-shaped). Passed by the generator; a default that drifts from the matmul's k
+// would size the mode's loop against the wrong buffer.
+#ifndef EPI_K
+#define EPI_K 32
+#endif
 // mmul sub-tile dims, needed ONLY by the GLU mode -- the other epilogues are per-element and
 // so are layout-blind. These are the shape mm.cc was compiled with (microkernel_mac_dim_map:
 // 8,8,8 for the bfp16 path we run, 4,8,8 native), and a mismatch would silently pair the wrong
@@ -543,6 +549,65 @@ void mm_modal_epilogue_f32_f32(const float *__restrict c_in,
   } else {
     mm_identity_epilogue_f32o<EPI_M * EPI_N>(c_in, c_out);
   }
+}
+
+// MODE 4 -- resadd as a MODE of the GEMM rather than a sibling xclbin. It borrows the
+// GEMM's own A and B input channels and its C drain, so it adds no fifo, no DMA channel
+// and no switchbox route: the movement layer is 100% spoken for by the GEMM
+// (routed-modal-gemm-dest-port-use), and a second topology has nowhere to go. Only what
+// flows through the existing topology may vary.
+//
+// Length is EPI_M*EPI_K, the A tile, because A ([m,k]) is the smaller of the two input
+// buffers ([k,n] for B) and a mode may not read past the buffer it borrows. The host taps
+// decide what actually lands in those 2048 elements.
+static constexpr unsigned EPI_RESADD_ELEMS = EPI_M * EPI_K;
+
+void mm_mode_resadd_bf16_f32(const bfloat16 *__restrict a,
+                             const bfloat16 *__restrict b,
+                             float *__restrict out) {
+  event0();
+  static_assert(EPI_RESADD_ELEMS % 32 == 0, "resadd tile must be a multiple of 32");
+  const bfloat16 *__restrict pa = a;
+  const bfloat16 *__restrict pb = b;
+  float *__restrict pout = out;
+  AIE_PREPARE_FOR_PIPELINING
+  AIE_LOOP_MIN_ITERATION_COUNT(2)
+  for (unsigned off = 0; off < EPI_RESADD_ELEMS; off += 32) {
+    // Widen both operands to f32 and add there. bf16 -> f32 is exact (bf16 is a truncated
+    // f32), so the widening costs nothing numerically -- the same discipline residual_add.cc
+    // uses on its bf16 arm, and it is why this matches a host f32 add bit-for-bit.
+#ifdef MODE4_BISECT_STORE_ONLY
+    aie::store_v(pout, aie::broadcast<float, 32>(3.0f));
+#elif defined(MODE4_BISECT_LOAD_AB)
+    // both operands loaded and widened, but only A is stored -- isolates the second LOAD from
+    // the ADD. A dead widened B would be folded away, so it is kept live by a select the
+    // compiler cannot resolve (off is a runtime value here only in the trivial sense, but the
+    // store of the min keeps both accums observable).
+    aie::accum<accfloat, 32> aa;
+    aa.from_vector(aie::load_v<32>(pa), 0);
+    aie::accum<accfloat, 32> bb;
+    bb.from_vector(aie::load_v<32>(pb), 0);
+#ifdef MODE4_BISECT_ADD
+    aie::store_v(pout, aie::add(aa.to_vector<float>(), bb.to_vector<float>()));
+#else
+    aie::store_v(pout, aie::min(aa.to_vector<float>(), bb.to_vector<float>()));
+#endif
+#elif defined(MODE4_BISECT_LOAD_A)
+    aie::accum<accfloat, 32> aa;
+    aa.from_vector(aie::load_v<32>(pa), 0);
+    aie::store_v(pout, aa.to_vector<float>());
+#else
+    aie::accum<accfloat, 32> aa;
+    aa.from_vector(aie::load_v<32>(pa), 0);
+    aie::accum<accfloat, 32> ba;
+    ba.from_vector(aie::load_v<32>(pb), 0);
+    aie::store_v(pout, aie::add(aa.to_vector<float>(), ba.to_vector<float>()));
+#endif
+    pa += 32;
+    pb += 32;
+    pout += 32;
+  }
+  event1();
 }
 
 // MODAL bf16-out epilogue: same rtp[0] mode selection as the f32-out sibling, but

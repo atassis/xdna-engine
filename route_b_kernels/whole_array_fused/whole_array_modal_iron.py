@@ -53,6 +53,9 @@ from aie.iron import (
 )
 from aie.iron.device import NPU1Col1, NPU1Col2, NPU1, NPU2
 from aie.iron.controlflow import range_
+from aie.helpers.dialects.scf import if_ as scf_if_, else_ as scf_else_
+from aie.dialects import arith as _arith
+from aie.extras import types as _T
 from aie.helpers.taplib import (
     TensorAccessPattern,
     TensorAccessSequence,
@@ -340,6 +343,8 @@ def my_matmul(
     trace_events=None,
     trace_memtile=-1,
     trace_memtile_events=None,
+    mode_resadd=False,
+    rtp_mode_resadd=False,
 ):
     n_aie_rows = 4
     n_aie_cores = n_aie_rows * n_aie_cols
@@ -456,6 +461,27 @@ def my_matmul(
         [cacc_ty, C_l1_ty, rtp_ty],
     )
 
+    # MODE 4: resadd, carried as a MODE of this xclbin rather than a sibling one. It reuses the
+    # GEMM's own A and B input channels and its C drain -- it declares no fifo of its own, because
+    # a second topology cannot route: the GEMM already holds core DMA 2/2, East/South/West 4/4 and
+    # memtile DMA 6/6, and two fifos in one excl_group still cost two channels and two routes
+    # (see routed-modal-gemm-dest-port-use, excl-group-fifos-dma-channel-cost). The topology is
+    # what cannot be duplicated; what flows through it may vary freely.
+    if rtp_mode_resadd and not mode_resadd:
+        raise ValueError(
+            "--rtp-mode-resadd selects rtp[0]=4, but without --mode-resadd this xclbin has no "
+            "mode-4 body: the cores would take the GEMM branch on a stream that never feeds it."
+        )
+    resadd_kernel = (
+        Kernel(
+            "mm_mode_resadd_bf16_f32",
+            f"mm_silu_epilogue_{m}x{k}x{n}.o",
+            [A_l1_ty, B_l1_ty, C_l1_ty],
+        )
+        if mode_resadd
+        else None
+    )
+
     # Tile declarations as tile[row][col]
     tiles = [[(col, row) for col in range(0, n_aie_cols)] for row in range(0, 6)]
     core_tiles = tiles[2:]
@@ -545,7 +571,7 @@ def my_matmul(
     # accumulator), the matmul reduces DIRECTLY into the C output tile and the epilogue runs IN-PLACE
     # on it (silu/identity, f32->f32) — no separate acc_buf. That saves an m*n*4 L1 buffer per core,
     # which is what lets the wide-N fast tile (64x32x96) fit in L1.
-    def core_fn(in_a, in_b, out_c, rtp_buff, barrier, zero, matmul, epilogue):
+    def core_fn(in_a, in_b, out_c, rtp_buff, barrier, zero, matmul, epilogue, resadd=None):
         barrier.wait_for_value(1)  # wait for the host to write the epilogue mode into rtp
         # k-loop-bound-as-rtp PoC: rtp[1] carries the K-tile trip count, written by sequence()
         # alongside rtp[0]'s epilogue mode, so ONE compiled core body serves any K value --
@@ -566,15 +592,45 @@ def my_matmul(
             # carry different K -- which is the whole point of driving K from rtp.
             k_trip = rtp_buff[1] if k_loop_rtp else K // k
             elem_out = out_c.acquire(1)
-            zero(elem_out)
 
-            for _ in range_(k_trip):
-                elem_in_a = in_a.acquire(1)
-                elem_in_b = in_b.acquire(1)
-                matmul(elem_in_a, elem_in_b, elem_out)
-                in_a.release(1)
-                in_b.release(1)
-            epilogue(elem_out, elem_out, rtp_buff)  # in-place; rtp[0]: 1=silu, 0=identity
+            def _gemm_path():
+                zero(elem_out)
+                for _ in range_(k_trip):
+                    elem_in_a = in_a.acquire(1)
+                    elem_in_b = in_b.acquire(1)
+                    matmul(elem_in_a, elem_in_b, elem_out)
+                    in_a.release(1)
+                    in_b.release(1)
+                epilogue(elem_out, elem_out, rtp_buff)  # in-place; rtp[0]: 1=silu, 0=identity
+
+            if resadd is None:
+                _gemm_path()
+            else:
+                # rtp[0] < 4 keeps the GEMM (its own four epilogue modes); 4 is resadd. The two
+                # bodies must sit in DIFFERENT regions of one scf.if, not merely different blocks:
+                # that is what makes them mutually exclusive to the excl_group core-reference
+                # check, and it is what the check was sharpened to admit.
+                is_gemm = _arith.cmpi(
+                    _arith.CmpIPredicate.slt,
+                    rtp_buff[0],
+                    _arith.constant(_T.i32(), 4),
+                )
+                with scf_if_(is_gemm) as if_op:
+                    _gemm_path()
+                with scf_else_(if_op):
+                    # Borrows A and B and drains through C -- no fifo of its own. A mode that
+                    # borrows a topology also inherits its STREAM CONTRACT: the GEMM's stream
+                    # delivers k_trip A/B tile pairs per output tile, so this must consume all
+                    # k_trip or the fifos stall and nothing drains (measured: a body consuming
+                    # one pair returned an all-zero C). resadd uses the FIRST pair and drains
+                    # the rest, which is why the add is peeled out of the loop instead of
+                    # sitting under a conditional inside it.
+                    for _ in range_(k_trip):
+                        elem_in_a = in_a.acquire(1)
+                        elem_in_b = in_b.acquire(1)
+                        resadd(elem_in_a, elem_in_b, elem_out)
+                        in_a.release(1)
+                        in_b.release(1)
             out_c.release(1)
 
     # bf16-out sibling: the matmul reduces f32, so it CANNOT reduce into a bf16 C tile. This
@@ -635,6 +691,16 @@ def my_matmul(
                 matmul_kernel,
                 epilogue_kernel,
             ]
+            if resadd_kernel is not None:
+                # Only the f32-out body carries the mode; the bf16-out sibling reduces into a
+                # core-local acc and has no C tile to hand a mode kernel.
+                if split_acc:
+                    raise ValueError(
+                        "--mode-resadd needs the f32-out path (dtype_out=f32): the bf16-out "
+                        "body accumulates into a core-local buffer, so a mode borrowing the C "
+                        "tile has nothing to write into."
+                    )
+                args.append(resadd_kernel)
             workers.append(
                 Worker(
                     core_fn_split_acc if split_acc else core_fn,
@@ -708,7 +774,15 @@ def my_matmul(
         # drain stays FULL width -- a narrower tap would change the TAP SIZES, and the insts-only
         # property holds only for a re-stride at constant sizes. The consumer reads the strided
         # subset instead. So no tap change here, deliberately.
-        mode_val = 3 if do_glu else (2 if do_gelu else (1 if do_silu else 0))
+        # rtp_mode_resadd bakes 4 instead, which is the whole point of the mode: the ARRAY
+        # PROGRAM is the same either way, so the resadd arm and the GEMM arm are two insts
+        # streams on ONE xclbin -- the host picks the op by choosing the stream, at no
+        # program transition. Same mechanism the id/silu pair already ships on.
+        mode_val = (
+            4
+            if rtp_mode_resadd
+            else (3 if do_glu else (2 if do_gelu else (1 if do_silu else 0)))
+        )
         for r in range(n_aie_rows):
             for c in range(n_aie_cols):
                 rtp_bufs[r][c][0] = mode_val
@@ -938,6 +1012,21 @@ def main():
         "Claim under test: the xclbin/core-ELF becomes independent of K, so only the "
         "insts stream (A/B tap counts + the rtp[1] write) needs to vary per K value.",
     )
+    argparser.add_argument(
+        "--mode-resadd",
+        action="store_true",
+        help="add resadd as MODE 4 of this xclbin, reusing the GEMM's own A/B input channels "
+        "and C drain instead of declaring a second topology. A second topology cannot route: "
+        "the GEMM already holds core DMA 2/2, East/South/West 4/4 and memtile DMA 6/6, and two "
+        "fifos in one excl_group still cost two channels. rtp[0]=4 runs resadd, 0-3 keep the "
+        "GEMM epilogues.",
+    )
+    argparser.add_argument(
+        "--rtp-mode-resadd",
+        action="store_true",
+        help="bake rtp[0]=4 into THIS instruction stream, selecting the resadd mode. Needs "
+        "--mode-resadd (which puts the body in the xclbin). The two streams share one xclbin.",
+    )
     args = argparser.parse_args()
     maybe_module = my_matmul(
         args.dev,
@@ -963,6 +1052,8 @@ def main():
         args.trace_events,
         args.trace_memtile,
         args.trace_memtile_events,
+        args.mode_resadd,
+        args.rtp_mode_resadd,
     )
     if args.generate_taps:
         return maybe_module
