@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <vector>
 
 #include "xrt/xrt_device.h"
 #include "xrt/xrt_bo.h"
@@ -32,7 +33,9 @@ static xrt::hw_context::cfg_param_type qos_cfg(int qos_priority) {
 struct ShimDevice { xrt::device dev; };
 struct ShimKernel { xrt::hw_context ctx; xrt::kernel kern; };
 struct ShimBo     { xrt::bo bo; };
-struct ShimRun    { xrt::run run; };
+// `args` participates in ownership of the argument BOs: set_arg records only a device address
+// and a bo_id set, so neither XRT nor the driver keeps them alive for the run's lifetime.
+struct ShimRun    { xrt::run run; std::vector<xrt::bo> args; };
 // Full-ELF kernel: own the elf + hw_context so they outlive the ext::kernel that references them.
 struct ShimElfKernel { xrt::elf elf; xrt::hw_context ctx; xrt::ext::kernel kern; };
 // Persistent-context path: ctx owns the partition (built once); ShimElfKernel2 borrows it.
@@ -179,7 +182,8 @@ ShimRun* shim_run_matmul8_start(ShimKernel* k, unsigned int opcode, ShimBo* inst
   GUARD_PTR(
     auto run = k->kern(opcode, instr->bo, instr_count,
                        a->bo, b->bo, c->bo, tmp->bo, trace->bo);
-    return new ShimRun{ std::move(run) };
+    return new ShimRun{ std::move(run),
+                        { instr->bo, a->bo, b->bo, c->bo, tmp->bo, trace->bo } };
   )
 }
 
@@ -244,11 +248,14 @@ int shim_run_elf(ShimElfKernel* k, ShimBo* const* bos, size_t n_bos) {
 ShimRun* shim_run_elf_start(ShimElfKernel* k, ShimBo* const* bos, size_t n_bos) {
   GUARD_PTR(
     xrt::run run(k->kern);
+    std::vector<xrt::bo> args;
+    args.reserve(n_bos);
     for (size_t i = 0; i < n_bos; ++i) {
       run.set_arg(static_cast<int>(i), bos[i]->bo);
+      args.push_back(bos[i]->bo);
     }
     run.start();
-    return new ShimRun{ std::move(run) };
+    return new ShimRun{ std::move(run), std::move(args) };
   )
 }
 

@@ -546,8 +546,9 @@ pub struct ElfCtx {
     ptr: *mut CElfCtx,
 }
 
-/// A per-token kernel bound onto a persistent [`ElfCtx`] (borrows its hw_context; owns its own
-/// patched ELF + module + kernel). Dispatched like [`ElfKernel`] but via `shim_run_elf2`.
+/// A per-token kernel bound onto a persistent [`ElfCtx`] (owns its own patched ELF + module +
+/// kernel). Dispatched like [`ElfKernel`] but via `shim_run_elf2`. The hw_context is refcounted by
+/// XRT through `kernel_impl::hwctx`, so it outlives the [`ElfCtx`] this was built from.
 pub struct ElfKernel2 {
     ptr: *mut CElfKernel2,
 }
@@ -569,6 +570,7 @@ pub struct Bo {
 /// An in-flight (async) NPU dispatch. Created by [`Kernel::run_matmul8_start`], which submits the
 /// command and returns immediately (the NPU runs while the host does other work). Call [`Run::wait`]
 /// to block for completion. Dropping without waiting still frees the handle (XRT joins on destroy).
+/// The shim holds the argument BOs for the run's lifetime, so they need not outlive it here.
 pub struct Run {
     ptr: *mut CRun,
 }
@@ -1199,7 +1201,8 @@ impl Bo {
 
     /// A device-side sub-buffer view `[offset, offset+size)` of this BO, sharing its memory (no host
     /// round-trip, XRT-native). Lets a kernel read/write a slice of a larger BO -- e.g. one chunk of
-    /// a chunk-major fc2 A buffer, or a KV-cache window. The parent BO must outlive the view.
+    /// a chunk-major fc2 A buffer, or a KV-cache window. XRT refcounts the parent through
+    /// `buffer_sub::m_parent`, so the view keeps it alive.
     pub fn sub(&self, offset: usize, size: usize) -> Result<Bo> {
         let ptr = unsafe { shim_bo_subbuffer(self.ptr, size, offset) };
         if ptr.is_null() {
