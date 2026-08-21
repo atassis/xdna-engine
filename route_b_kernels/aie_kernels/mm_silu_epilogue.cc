@@ -570,7 +570,13 @@ void mm_mode_resadd_bf16_f32(const bfloat16 *__restrict a,
   const bfloat16 *__restrict pa = a;
   const bfloat16 *__restrict pb = b;
   float *__restrict pout = out;
+#ifndef MODE4_BISECT_NOPIPE
+  // The NOPIPE arm suppresses this to try to break the store/VALU bundle the mode-4 hang tracks.
+  // It does not: Peano pipelines anyway and emits a BYTE-IDENTICAL core ELF, so the arm measures
+  // nothing. Kept because that is the finding -- it also voids an earlier note recording "the loop
+  // and pragmas" as ruled out for this hang.
   AIE_PREPARE_FOR_PIPELINING
+#endif
   AIE_LOOP_MIN_ITERATION_COUNT(2)
   for (unsigned off = 0; off < EPI_RESADD_ELEMS; off += 32) {
     // Widen both operands to f32 and add there. bf16 -> f32 is exact (bf16 is a truncated
@@ -589,6 +595,18 @@ void mm_mode_resadd_bf16_f32(const bfloat16 *__restrict a,
     bb.from_vector(aie::load_v<32>(pb), 0);
 #ifdef MODE4_BISECT_ADD
     aie::store_v(pout, aie::add(aa.to_vector<float>(), bb.to_vector<float>()));
+#elif defined(MODE4_BISECT_SUB)
+    // Same shape as the ADD arm with one token changed: vsub.f into an accumulator, stored
+    // straight out of it. ADD hangs and MIN completes, but MIN also routes its result through
+    // the vector file (sub-compare-select), so opcode and store path are confounded. This arm
+    // holds the store path at ADD's and varies only the opcode.
+    aie::store_v(pout, aie::sub(aa.to_vector<float>(), bb.to_vector<float>()));
+#elif defined(MODE4_BISECT_ADD_VIAVEC)
+    // The other cell: ADD's opcode with MIN's store path. The relu is a compare-select the
+    // compiler cannot fold on unknown data, so the sum lands in the vector file before the
+    // store. With the SUB arm this closes the 2x2 over (opcode, store register file).
+    aie::store_v(pout, aie::max(aie::add(aa.to_vector<float>(), bb.to_vector<float>()),
+                                aie::broadcast<float, 32>(0.0f)));
 #else
     aie::store_v(pout, aie::min(aa.to_vector<float>(), bb.to_vector<float>()));
 #endif

@@ -80,6 +80,11 @@ mode_resadd?=0
 # mode_resadd=1 GEMM stream, so the pair is one program serving two ops.
 rtp_mode_resadd?=0
 mode4_bisect?=0
+# Extra compile flags for the EPILOGUE object only (empty = the family's -O2). The mode-4 hang
+# tracks a scheduling decision, not a source construct, so testing it needs a codegen knob: a
+# suppressed source pragma left the ELF byte-identical. Tagged, and stamped, or an arm would
+# reuse the previous object.
+epi_opt?=
 
 # Build the resadd body ALONE -- no matmul in the core ELF. Discriminator for the mode-4 hang:
 # same shapes, same borrowed topology, same stream contract as mode_resadd=1, one variable
@@ -159,8 +164,9 @@ rtpresadd_tag=$(if $(filter 1,${rtp_mode_resadd}),rtp4,)
 # untagged, arms silently overwrite each other's xclbin and a rerun measures the previous build.
 raonly_tag=$(if $(filter 1,${resadd_only}),raonly,)
 bisect_tag=$(if $(filter 0,${mode4_bisect}),,bis${mode4_bisect})
+opt_tag=$(if ${epi_opt},$(subst -,,$(subst =,,$(subst $(space),,${epi_opt}))),)
 apanel_tag=$(if $(filter 0,${a_panel_width}),,apanel${a_panel_width})
-target_suffix=${M}x${K}x${N}_${m}x${k}x${n}_${n_aie_cols}c_${mode_tag}${out_tag}${panel_tag}${dep_tag}${abdep_tag}${l3dep_tag}${wrk_tag}${mt_tag}${re_tag}${nat_tag}${krtp_tag}${apanel_tag}${resadd_tag}${rtpresadd_tag}${raonly_tag}${bisect_tag}
+target_suffix=${M}x${K}x${N}_${m}x${k}x${n}_${n_aie_cols}c_${mode_tag}${out_tag}${panel_tag}${dep_tag}${abdep_tag}${l3dep_tag}${wrk_tag}${mt_tag}${re_tag}${nat_tag}${krtp_tag}${apanel_tag}${resadd_tag}${rtpresadd_tag}${raonly_tag}${bisect_tag}${opt_tag}
 
 use_iron=1
 aie_py_src=whole_array_modal_iron.py
@@ -170,7 +176,7 @@ buffer_aloc_flag=basic-sequential
 
 # matmul object needs the bf16_f32 combo defines (mm.cc names symbols by combo).
 MM_DEFINES=-Dbf16_f32_ONLY -DDIM_M=${m} -DDIM_K=${k} -DDIM_N=${n} -DVECTORIZED_ONLY
-EPI_DEFINES=$(if $(filter 1,${mode4_bisect}), -DMODE4_BISECT_STORE_ONLY,)$(if $(filter 2,${mode4_bisect}), -DMODE4_BISECT_LOAD_A,)$(if $(filter 3,${mode4_bisect}), -DMODE4_BISECT_LOAD_AB,)$(if $(filter 4,${mode4_bisect}), -DMODE4_BISECT_LOAD_AB -DMODE4_BISECT_ADD,) -DEPI_M=${m} -DEPI_K=${k} -DEPI_N=${n} -DEPI_R=${epi_r} -DEPI_T=${epi_t}$(if $(filter 1,${round_even}), -DMODAL_ROUND_EVEN,)$(if $(filter 1,${drain_round_floor}), -DMODAL_DRAIN_ROUND_FLOOR,)$(if $(filter 1,${silu_f32_tail}), -DSILU_F32_TAIL,)$(if $(filter 1,${silu_f32_tanh}), -DSILU_F32_TANH,)
+EPI_DEFINES=$(if $(filter 1,${mode4_bisect}), -DMODE4_BISECT_STORE_ONLY,)$(if $(filter 2,${mode4_bisect}), -DMODE4_BISECT_LOAD_A,)$(if $(filter 3,${mode4_bisect}), -DMODE4_BISECT_LOAD_AB,)$(if $(filter 4,${mode4_bisect}), -DMODE4_BISECT_LOAD_AB -DMODE4_BISECT_ADD,)$(if $(filter 5,${mode4_bisect}), -DMODE4_BISECT_LOAD_AB -DMODE4_BISECT_SUB,)$(if $(filter 6,${mode4_bisect}), -DMODE4_BISECT_LOAD_AB -DMODE4_BISECT_ADD_VIAVEC,)$(if $(filter 7,${mode4_bisect}), -DMODE4_BISECT_LOAD_AB -DMODE4_BISECT_ADD -DMODE4_BISECT_NOPIPE,) -DEPI_M=${m} -DEPI_K=${k} -DEPI_N=${n} -DEPI_R=${epi_r} -DEPI_T=${epi_t}$(if $(filter 1,${round_even}), -DMODAL_ROUND_EVEN,)$(if $(filter 1,${drain_round_floor}), -DMODAL_DRAIN_ROUND_FLOOR,)$(if $(filter 1,${silu_f32_tail}), -DSILU_F32_TAIL,)$(if $(filter 1,${silu_f32_tanh}), -DSILU_F32_TANH,)
 ifeq (${b_col_maj}, 1)
 	MM_DEFINES+=-DB_COL_MAJ
 endif
@@ -206,10 +212,10 @@ build/mm_${m}x${k}x${n}.o: ${kernels_dir}/mm.cc build/.mm_defines.stamp
 # change dirty the object.
 build/.epi_defines.stamp: FORCE
 	@mkdir -p ${@D}
-	@echo '${EPI_DEFINES}' | cmp -s - $@ || echo '${EPI_DEFINES}' > $@
+	@echo '${EPI_DEFINES} ${epi_opt}' | cmp -s - $@ || echo '${EPI_DEFINES} ${epi_opt}' > $@
 FORCE:
 .PHONY: FORCE
 
 build/mm_silu_epilogue_${m}x${k}x${n}.o: ${kernels_dir}/mm_silu_epilogue.cc build/.epi_defines.stamp
 	mkdir -p ${@D}
-	cd ${@D} && ${KERNEL_CC} ${KERNEL_CFLAGS} ${EPI_DEFINES} -c $< -o ${@F}
+	cd ${@D} && ${KERNEL_CC} ${KERNEL_CFLAGS} ${EPI_DEFINES} ${epi_opt} -c $< -o ${@F}
