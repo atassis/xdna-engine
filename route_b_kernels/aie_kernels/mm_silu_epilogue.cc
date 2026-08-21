@@ -607,6 +607,14 @@ void mm_mode_resadd_bf16_f32(const bfloat16 *__restrict a,
     // store. With the SUB arm this closes the 2x2 over (opcode, store register file).
     aie::store_v(pout, aie::max(aie::add(aa.to_vector<float>(), bb.to_vector<float>()),
                                 aie::broadcast<float, 32>(0.0f)));
+#elif defined(MODE4_BISECT_ADD_IDENTDETOUR)
+    // Shippable form of the VIAVEC arm. The relu detours through the vector file but clamps at
+    // zero, so it is not a resadd; max(s, s-1) == s for every finite s and detours the same way.
+    // Verify on the disassembly, not on the source: the fold that would delete it also deletes
+    // the reason this arm exists.
+    const aie::vector<float, 32> s =
+        aie::add(aa.to_vector<float>(), bb.to_vector<float>());
+    aie::store_v(pout, aie::max(s, aie::sub(s, aie::broadcast<float, 32>(1.0f))));
 #else
     aie::store_v(pout, aie::min(aa.to_vector<float>(), bb.to_vector<float>()));
 #endif
