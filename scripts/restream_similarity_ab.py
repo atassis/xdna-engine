@@ -22,6 +22,16 @@ TIMING ONLY: nothing reads C, and the streams' embedded rtp_write picks the epil
 a foreign stream on a given xclbin computes the foreign stream's mode. That is intended -- all three
 designs link the same core objects and differ only in constants.
 
+ACTIVITY AXES (--interleave-contexts / --interleave-bos). Dissimilarity is flat at zero and PASSIVE
+context residency is flat at zero, so the two surviving suspects for the encoder's +2.3 ms are BO
+churn and instruction-BO eviction. Both predict the price turns on with ACTIVITY, which is the axis
+passive ballast held fixed. A ballast dispatch is therefore issued after every measured dispatch,
+round-robin, identically in both arms -- so the ballast's own cost cancels in ALT-GRP and what
+survives is whether ALT's working set, one stream larger than GRP's, crosses a capacity threshold
+GRP's does not. The two axes separate the resource: --interleave-contexts spreads the ballast over
+its own hw_contexts, --interleave-bos keeps it on the measured pair's context as extra live
+instruction BOs with content pinned identical.
+
 Usage (single-tenant, under scripts/npu_lock.sh, services quiesced):
   restream_similarity_ab.py --root <repo> --xclbin <stem> --pair <name>=<specA>,<specB> [...]
   where spec = <instsStem>:<K>:<N>
@@ -51,29 +61,57 @@ ap.add_argument("--extra-contexts", type=int, default=0,
                 help="hold N additional live hw_contexts open, dispatching into none of them. The "
                      "encoder runs 9; the isolated probe runs 1, and that is the only surviving "
                      "difference between their restream prices.")
+ap.add_argument("--interleave-contexts", type=int, default=0,
+                help="dispatch a ballast stream on each of N OWN hw_contexts, round-robin between "
+                     "the measured dispatches. Activity across contexts, not mere residency.")
+ap.add_argument("--interleave-bos", type=int, default=0,
+                help="same round-robin ballast, but all N share the measured pair's context as "
+                     "distinct live instruction BOs of identical content -- many streams in flight "
+                     "with dissimilarity pinned at zero.")
+ap.add_argument("--ballast", default=None,
+                help="spec dispatched as ballast (default: the first pair's first spec)")
 ap.add_argument("--out", default=None, help="write JSON here")
 a = ap.parse_args()
 
+if a.interleave_contexts and a.interleave_bos:
+    ap.error("--interleave-contexts and --interleave-bos confound the resource; sweep one at a time")
+
 d = pyxrt.device(0)
+_xb = {}
 _ctx = {}
+_hw = []
 _ballast = []
 
 
-def context(stem):
-    """One registered xclbin and its hw_context, memoised so a stem is only ever loaded once."""
-    if stem not in _ctx:
+def xclbin_of(stem):
+    """Registered once per stem: re-registering the same xclbin is not idempotent on XRT."""
+    if stem not in _xb:
         xb = pyxrt.xclbin(f"{a.root}/{WA}/final_{stem}.xclbin")
         d.register_xclbin(xb)
-        hw = pyxrt.hw_context(d, xb.get_uuid())
-        _ctx[stem] = pyxrt.kernel(hw, xb.get_kernels()[0].get_name())
+        _xb[stem] = xb
+    return _xb[stem]
+
+
+def kernel_on_new_context(stem):
+    """A kernel on its own fresh hw_context. The context is held live for the process."""
+    xb = xclbin_of(stem)
+    hw = pyxrt.hw_context(d, xb.get_uuid())
+    _hw.append(hw)
+    return pyxrt.kernel(hw, xb.get_kernels()[0].get_name())
+
+
+def context(stem):
+    """The one memoised hw_context per stem, so a stem is only ever loaded once."""
+    if stem not in _ctx:
+        _ctx[stem] = kernel_on_new_context(stem)
     return _ctx[stem]
 
 
-def load(spec):
+def load(spec, kernel=None):
     """One dispatchable stream: its instruction BO plus operand BOs sized from its own K and N."""
     spec, _, xstem = spec.partition("@")
     xstem = xstem or a.xclbin
-    k = context(xstem)
+    k = kernel if kernel is not None else context(xstem)
     stem, kres, n = spec.split(":")
     kres, n = int(kres), int(n)
     instr = np.fromfile(f"{a.root}/{WA}/{stem}.txt", dtype=np.uint32)
@@ -98,11 +136,16 @@ def word_diff(s0, s1):
     return int((x[:n] != y[:n]).sum()) + abs(x.size - y.size)
 
 
-def timed(streams, order):
+def timed(streams, order, ballast):
+    """Time one arm. The ballast index tracks POSITION, so both arms see an identical ballast
+    sequence and its cost cancels in the ALT-GRP difference."""
     t0 = time.perf_counter()
-    for i in order:
+    for j, i in enumerate(order):
         s = streams[i]
         s["k"](*s["args"]).wait()
+        if ballast:
+            b = ballast[j % len(ballast)]
+            b["k"](*b["args"]).wait()
     return (time.perf_counter() - t0) * 1e6
 
 
@@ -118,11 +161,21 @@ print(f"dispatches/arm {len(ALT)}   changes ALT {CH_ALT} vs GRP {CH_GRP}   (delt
 print(f"reps {a.reps}\n")
 
 if a.extra_contexts:
-    bx = pyxrt.xclbin(f"{a.root}/{WA}/final_{a.xclbin}.xclbin")
-    d.register_xclbin(bx)
+    bx = xclbin_of(a.xclbin)
     for _ in range(a.extra_contexts):
         _ballast.append(pyxrt.hw_context(d, bx.get_uuid()))
     print(f"holding {len(_ballast)} extra live hw_context(s), never dispatched into\n")
+
+BALLAST_SPEC = a.ballast or a.pair[0].split("=", 1)[1].split(",")[0]
+n_ilv = a.interleave_contexts or a.interleave_bos
+interleaved = []
+for _ in range(n_ilv):
+    k = kernel_on_new_context(a.xclbin) if a.interleave_contexts else context(a.xclbin)
+    interleaved.append(load(BALLAST_SPEC, kernel=k))
+if interleaved:
+    axis = "own hw_context" if a.interleave_contexts else "the measured context"
+    print(f"interleaving {len(interleaved)} ballast dispatch(es) of {BALLAST_SPEC.split(':')[0]}"
+          f" on {axis}, round-robin between measured dispatches\n")
 
 results = []
 for spec in a.pair:
@@ -135,7 +188,7 @@ for spec in a.pair:
         print(f"    {s['stem']}  K={s['kres']} N={s['n']}  {s['words']} words  ctx={s['xclbin'][:28]}")
     print(f"    differing words: {wd} ({100 * wd / S[0]['words']:.1f}%)")
 
-    for s in S:
+    for s in S + interleaved:
         for _ in range(a.warmup):
             s["k"](*s["args"]).wait()
 
@@ -143,11 +196,11 @@ for spec in a.pair:
     for r in range(a.reps):
         # Alternate which arm leads so any within-rep warming loads on both arms equally.
         if r % 2 == 0:
-            ta = timed(S, ALT)
-            tg = timed(S, GRP)
+            ta = timed(S, ALT, interleaved)
+            tg = timed(S, GRP, interleaved)
         else:
-            tg = timed(S, GRP)
-            ta = timed(S, ALT)
+            tg = timed(S, GRP, interleaved)
+            ta = timed(S, ALT, interleaved)
         alts.append(ta)
         grps.append(tg)
         deltas.append((ta - tg) / DCH)
@@ -174,5 +227,9 @@ for r in results:
 
 if a.out:
     with open(a.out, "w") as f:
-        json.dump(dict(xclbin=a.xclbin, total=a.total, reps=a.reps, dch=DCH, results=results), f, indent=1)
+        json.dump(dict(xclbin=a.xclbin, total=a.total, reps=a.reps, dch=DCH,
+                       extra_contexts=a.extra_contexts,
+                       interleave_contexts=a.interleave_contexts, interleave_bos=a.interleave_bos,
+                       ballast=BALLAST_SPEC if interleaved else None,
+                       results=results), f, indent=1)
     print(f"\nwrote {a.out}")
