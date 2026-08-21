@@ -81,6 +81,11 @@ mode_resadd?=0
 rtp_mode_resadd?=0
 mode4_bisect?=0
 
+# Build the resadd body ALONE -- no matmul in the core ELF. Discriminator for the mode-4 hang:
+# same shapes, same borrowed topology, same stream contract as mode_resadd=1, one variable
+# changed. Mutually exclusive with mode_resadd.
+resadd_only?=0
+
 # Read A from a [K/W, M, W] panel-major buffer instead of row-major [M, K] (0 = off). Mirror of
 # c_panel_width, for a GEMM whose producer already drained panel-major -- fc1 does, by default, so a
 # wide-K fc2 needs no repack. Insts-only. Needs N/n/n_aie_cols == 1: the panel index spends the A
@@ -111,6 +116,9 @@ aieargs+=--mode-resadd
 endif
 ifeq (${rtp_mode_resadd}, 1)
 aieargs+=--rtp-mode-resadd
+endif
+ifeq (${resadd_only}, 1)
+aieargs+=--resadd-only
 endif
 ifneq (${a_panel_width}, 0)
 aieargs+=--a-panel-width ${a_panel_width}
@@ -147,8 +155,12 @@ resadd_tag=$(if $(filter 1,${mode_resadd}),resadd,)
 # The rtp arm is a DIFFERENT INSTRUCTION STREAM on the SAME xclbin, so it needs its own artifact
 # name or it overwrites the GEMM stream -- the same rule panel_tag carries.
 rtpresadd_tag=$(if $(filter 1,${rtp_mode_resadd}),rtp4,)
+# The resadd body alone is a different core ELF, and each bisect arm compiles a different one --
+# untagged, arms silently overwrite each other's xclbin and a rerun measures the previous build.
+raonly_tag=$(if $(filter 1,${resadd_only}),raonly,)
+bisect_tag=$(if $(filter 0,${mode4_bisect}),,bis${mode4_bisect})
 apanel_tag=$(if $(filter 0,${a_panel_width}),,apanel${a_panel_width})
-target_suffix=${M}x${K}x${N}_${m}x${k}x${n}_${n_aie_cols}c_${mode_tag}${out_tag}${panel_tag}${dep_tag}${abdep_tag}${l3dep_tag}${wrk_tag}${mt_tag}${re_tag}${nat_tag}${krtp_tag}${apanel_tag}${resadd_tag}${rtpresadd_tag}
+target_suffix=${M}x${K}x${N}_${m}x${k}x${n}_${n_aie_cols}c_${mode_tag}${out_tag}${panel_tag}${dep_tag}${abdep_tag}${l3dep_tag}${wrk_tag}${mt_tag}${re_tag}${nat_tag}${krtp_tag}${apanel_tag}${resadd_tag}${rtpresadd_tag}${raonly_tag}${bisect_tag}
 
 use_iron=1
 aie_py_src=whole_array_modal_iron.py

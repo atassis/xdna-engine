@@ -345,6 +345,7 @@ def my_matmul(
     trace_memtile_events=None,
     mode_resadd=False,
     rtp_mode_resadd=False,
+    resadd_only=False,
 ):
     n_aie_rows = 4
     n_aie_cores = n_aie_rows * n_aie_cols
@@ -467,10 +468,16 @@ def my_matmul(
     # memtile DMA 6/6, and two fifos in one excl_group still cost two channels and two routes
     # (see routed-modal-gemm-dest-port-use, excl-group-fifos-dma-channel-cost). The topology is
     # what cannot be duplicated; what flows through it may vary freely.
-    if rtp_mode_resadd and not mode_resadd:
+    if rtp_mode_resadd and not (mode_resadd or resadd_only):
         raise ValueError(
             "--rtp-mode-resadd selects rtp[0]=4, but without --mode-resadd this xclbin has no "
             "mode-4 body: the cores would take the GEMM branch on a stream that never feeds it."
+        )
+    if resadd_only and mode_resadd:
+        raise ValueError(
+            "--resadd-only and --mode-resadd are the two arms of the co-residency "
+            "discriminator, not a combination: --mode-resadd puts resadd in a core ELF that "
+            "also carries the matmul, --resadd-only builds the same body ALONE."
         )
     resadd_kernel = (
         Kernel(
@@ -478,7 +485,7 @@ def my_matmul(
             f"mm_silu_epilogue_{m}x{k}x{n}.o",
             [A_l1_ty, B_l1_ty, C_l1_ty],
         )
-        if mode_resadd
+        if (mode_resadd or resadd_only)
         else None
     )
 
@@ -633,6 +640,27 @@ def my_matmul(
                         in_b.release(1)
             out_c.release(1)
 
+    def core_fn_resadd_only(in_a, in_b, out_c, rtp_buff, barrier, resadd):
+        # Discriminator arm for the mode-4 hang: the SAME resadd body, the same stream contract
+        # and the same shapes, in a core ELF that does NOT carry the matmul. Completing here
+        # implicates two-body co-residency; hanging here implicates the operator itself.
+        barrier.wait_for_value(1)
+        loop = range(1)  # Workaround for issue #1547
+        if n_tiles_per_core > 1:
+            loop = range_(n_tiles_per_core)
+        for _ in loop:
+            k_trip = rtp_buff[1] if k_loop_rtp else K // k
+            elem_out = out_c.acquire(1)
+            # Drains all k_trip pairs, same as the mode arm: the borrowed topology's stream
+            # contract is a property of the STREAM, not of which body reads it.
+            for _ in range_(k_trip):
+                elem_in_a = in_a.acquire(1)
+                elem_in_b = in_b.acquire(1)
+                resadd(elem_in_a, elem_in_b, elem_out)
+                in_a.release(1)
+                in_b.release(1)
+            out_c.release(1)
+
     # bf16-out sibling: the matmul reduces f32, so it CANNOT reduce into a bf16 C tile. This
     # variant keeps a core-local f32 accumulator and the epilogue narrows acc -> C on the way
     # out. That costs an extra m*n*4 L1 buffer per core, which is exactly the buffer the f32-out
@@ -684,6 +712,22 @@ def my_matmul(
             ]
             if split_acc:
                 args.append(Buffer(cacc_ty, name=f"cacc_{row}_{col}"))
+            if resadd_only:
+                # zero/matmul/epilogue are deliberately NOT referenced: an unreferenced Kernel
+                # is never declared, so the matmul stays out of the core ELF entirely. That
+                # absence IS the experiment.
+                if split_acc:
+                    raise ValueError(
+                        "--resadd-only needs the f32-out path (dtype_out=f32), same as "
+                        "--mode-resadd: the bf16-out body has no C tile to write into."
+                    )
+                args += [rtp_bufs[row][col], rtp_barrier, resadd_kernel]
+                workers.append(
+                    Worker(
+                        core_fn_resadd_only, args, stack_size=_stack_size()
+                    )
+                )
+                continue
             args += [
                 rtp_bufs[row][col],
                 rtp_barrier,
@@ -1027,6 +1071,13 @@ def main():
         help="bake rtp[0]=4 into THIS instruction stream, selecting the resadd mode. Needs "
         "--mode-resadd (which puts the body in the xclbin). The two streams share one xclbin.",
     )
+    argparser.add_argument(
+        "--resadd-only",
+        action="store_true",
+        help="build the resadd body ALONE -- same shapes, same borrowed topology, same stream "
+        "contract, but no matmul in the core ELF. Discriminator for the mode-4 hang: completes "
+        "=> the fault is two-body co-residency, hangs => the operator is implicated.",
+    )
     args = argparser.parse_args()
     maybe_module = my_matmul(
         args.dev,
@@ -1054,6 +1105,7 @@ def main():
         args.trace_memtile_events,
         args.mode_resadd,
         args.rtp_mode_resadd,
+        args.resadd_only,
     )
     if args.generate_taps:
         return maybe_module
