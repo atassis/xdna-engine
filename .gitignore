@@ -52,3 +52,6 @@ route_b_kernels/bricks/_verify/gen/
 # toolchain instance cache (~500MB) and root-level cargo target (~5GB)
 /.cache/
 /target/
+
+# whole_array probe build output (per-pin dirs are disposable, like probes/build)
+route_b_kernels/probes/build*/

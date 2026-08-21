@@ -26,7 +26,7 @@
 # identical xclbin) -- the probe verifies that rather than trusting the Makefile comment.
 # They are NOT the same strength, and the difference is the point:
 #   C_PANEL=W  re-strides the C drain to [N/W, M, W]. Same rank, same SIZES, permuted strides -- a
-#              BD FIELD change, the class already covered by [[bd-restream-inside-one-context-is-free]].
+#              BD FIELD change, which is measured free inside a single hardware context.
 #              Must equal n_aie_cols*n.
 #   A_PANEL=W  re-strides the A fill to [K/W, M, W]. The k-tile index SPLITS into (panel, within-
 #              panel), spending the outer repeat dim, so the sizes vector itself changes and a

@@ -3,10 +3,10 @@
 # (task gemm-offcore-residue-occupancy, item 1b / lever3-dispatch-coalesce)
 #
 # WHY: queueing d commands before waiting is worth 1.59-1.77x, and a read-after-write between
-# consecutive queued commands costs nothing [[dependent-command-chain-keeps-the-dispatch-queueing-win]].
+# consecutive queued commands costs nothing, measured.
 # Both results are bounded by the same scope sentence: every command ran ONE instruction stream inside
 # ONE hardware context. The encoder does not. It crosses 743 program boundaries per clip at
-# ~1.543 ms each [[switch-cost-per-transition-2026-08-04]], and its block boundaries are exactly
+# ~1.543 ms each, measured, and its block boundaries are exactly
 # where the lever has never been tested. If queueing cannot hide a transition, the lever stops at the
 # block boundary and the encoder sees it only inside a block; if it can, the largest single line in
 # the encoder's overhead is queueable and that is a much bigger result than the 1.77x itself.
