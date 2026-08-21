@@ -80,6 +80,11 @@ mode_resadd?=0
 # mode_resadd=1 GEMM stream, so the pair is one program serving two ops.
 rtp_mode_resadd?=0
 mode4_bisect?=0
+# Move the mode-4 branch behind the first A/B objectFIFO acquire instead of reading rtp[0] at the
+# top of the tile (0 = off). rtp[0] carries a MEASURED one-tile visibility lag -- the barrier that
+# orders it sits outside the tile loop, so each core's FIRST tile after a mode change runs the
+# previous dispatch's body. Different core ELF, so it is tagged.
+mode_read_late?=0
 # Extra compile flags for the EPILOGUE object only (empty = the family's -O2). The mode-4 hang
 # tracks a scheduling decision, not a source construct, so testing it needs a codegen knob: a
 # suppressed source pragma left the ELF byte-identical. Tagged, and stamped, or an arm would
@@ -125,6 +130,9 @@ endif
 ifeq (${resadd_only}, 1)
 aieargs+=--resadd-only
 endif
+ifeq (${mode_read_late}, 1)
+aieargs+=--mode-read-late
+endif
 ifneq (${a_panel_width}, 0)
 aieargs+=--a-panel-width ${a_panel_width}
 endif
@@ -164,9 +172,10 @@ rtpresadd_tag=$(if $(filter 1,${rtp_mode_resadd}),rtp4,)
 # untagged, arms silently overwrite each other's xclbin and a rerun measures the previous build.
 raonly_tag=$(if $(filter 1,${resadd_only}),raonly,)
 bisect_tag=$(if $(filter 0,${mode4_bisect}),,bis${mode4_bisect})
+mrl_tag=$(if $(filter 1,${mode_read_late}),mrl,)
 opt_tag=$(if ${epi_opt},$(subst -,,$(subst =,,$(subst $(space),,${epi_opt}))),)
 apanel_tag=$(if $(filter 0,${a_panel_width}),,apanel${a_panel_width})
-target_suffix=${M}x${K}x${N}_${m}x${k}x${n}_${n_aie_cols}c_${mode_tag}${out_tag}${panel_tag}${dep_tag}${abdep_tag}${l3dep_tag}${wrk_tag}${mt_tag}${re_tag}${nat_tag}${krtp_tag}${apanel_tag}${resadd_tag}${rtpresadd_tag}${raonly_tag}${bisect_tag}${opt_tag}
+target_suffix=${M}x${K}x${N}_${m}x${k}x${n}_${n_aie_cols}c_${mode_tag}${out_tag}${panel_tag}${dep_tag}${abdep_tag}${l3dep_tag}${wrk_tag}${mt_tag}${re_tag}${nat_tag}${krtp_tag}${apanel_tag}${resadd_tag}${rtpresadd_tag}${raonly_tag}${bisect_tag}${mrl_tag}${opt_tag}
 
 use_iron=1
 aie_py_src=whole_array_modal_iron.py

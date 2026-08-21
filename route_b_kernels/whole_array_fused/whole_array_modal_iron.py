@@ -346,6 +346,7 @@ def my_matmul(
     mode_resadd=False,
     rtp_mode_resadd=False,
     resadd_only=False,
+    mode_read_late=False,
 ):
     n_aie_rows = 4
     n_aie_cores = n_aie_rows * n_aie_cols
@@ -479,6 +480,17 @@ def my_matmul(
             "discriminator, not a combination: --mode-resadd puts resadd in a core ELF that "
             "also carries the matmul, --resadd-only builds the same body ALONE."
         )
+    if mode_read_late and not mode_resadd:
+        raise ValueError(
+            "--mode-read-late moves the mode-4 branch behind the first A/B acquire, so it "
+            "needs --mode-resadd: without a mode-4 body there is no branch to move."
+        )
+    if mode_read_late and k_loop_rtp:
+        raise ValueError(
+            "--mode-read-late peels one k-iteration, which needs k_trip - 1 as a constant; "
+            "under --k-loop-rtp k_trip is a runtime memref.load. Combine them only after "
+            "the peel is written against an arith.subi."
+        )
     resadd_kernel = (
         Kernel(
             "mm_mode_resadd_bf16_f32",
@@ -610,18 +622,52 @@ def my_matmul(
                     in_b.release(1)
                 epilogue(elem_out, elem_out, rtp_buff)  # in-place; rtp[0]: 1=silu, 0=identity
 
-            if resadd is None:
-                _gemm_path()
-            else:
-                # rtp[0] < 4 keeps the GEMM (its own four epilogue modes); 4 is resadd. The two
-                # bodies must sit in DIFFERENT regions of one scf.if, not merely different blocks:
-                # that is what makes them mutually exclusive to the excl_group core-reference
-                # check, and it is what the check was sharpened to admit.
-                is_gemm = _arith.cmpi(
+            def _is_gemm():
+                # rtp[0] < 4 keeps the GEMM (its own four epilogue modes); 4 is resadd.
+                return _arith.cmpi(
                     _arith.CmpIPredicate.slt,
                     rtp_buff[0],
                     _arith.constant(_T.i32(), 4),
                 )
+
+            def _drain_ab(trip, fn):
+                for _ in range_(trip):
+                    ea = in_a.acquire(1)
+                    eb = in_b.acquire(1)
+                    fn(ea, eb, elem_out)
+                    in_a.release(1)
+                    in_b.release(1)
+
+            if resadd is None:
+                _gemm_path()
+            elif mode_read_late:
+                # ORDERING ARM. rtp is a side-channel with a MEASURED one-tile visibility lag:
+                # barrier.wait_for_value sits outside the tile loop, so it orders only a
+                # context's first dispatch and a read at the TOP of a tile samples the PREVIOUS
+                # dispatch's mode -- each core's first tile runs the wrong body, every later tile
+                # the right one. The epilogue escapes it only by reading after the k-loop. So
+                # peel the first A/B pair and branch behind that acquire, which this dispatch's
+                # own data has to cross. Under test: whether ONE acquire is late enough.
+                # See 2026-08-22-the-mode-swap-costs-one-tile-and-then-recovers.
+                elem_in_a = in_a.acquire(1)
+                elem_in_b = in_b.acquire(1)
+                with scf_if_(_is_gemm()) as if_op:
+                    zero(elem_out)
+                    matmul(elem_in_a, elem_in_b, elem_out)
+                    in_a.release(1)
+                    in_b.release(1)
+                    _drain_ab(k_trip - 1, matmul)
+                    epilogue(elem_out, elem_out, rtp_buff)
+                with scf_else_(if_op):
+                    resadd(elem_in_a, elem_in_b, elem_out)
+                    in_a.release(1)
+                    in_b.release(1)
+                    _drain_ab(k_trip - 1, resadd)
+            else:
+                # The two bodies must sit in DIFFERENT regions of one scf.if, not merely
+                # different blocks: that is what makes them mutually exclusive to the excl_group
+                # core-reference check, and it is what the check was sharpened to admit.
+                is_gemm = _is_gemm()
                 with scf_if_(is_gemm) as if_op:
                     _gemm_path()
                 with scf_else_(if_op):
@@ -1078,6 +1124,14 @@ def main():
         "contract, but no matmul in the core ELF. Discriminator for the mode-4 hang: completes "
         "=> the fault is two-body co-residency, hangs => the operator is implicated.",
     )
+    argparser.add_argument(
+        "--mode-read-late",
+        action="store_true",
+        help="peel the first A/B pair so the mode-4 branch reads rtp[0] AFTER an objectFIFO "
+        "acquire instead of at the top of the tile. Needs --mode-resadd. Tests the measured "
+        "one-tile rtp visibility lag: the top-of-tile read samples the previous dispatch's "
+        "mode, so each core's first tile after a mode change runs the wrong body.",
+    )
     args = argparser.parse_args()
     maybe_module = my_matmul(
         args.dev,
@@ -1106,6 +1160,7 @@ def main():
         args.mode_resadd,
         args.rtp_mode_resadd,
         args.resadd_only,
+        args.mode_read_late,
     )
     if args.generate_taps:
         return maybe_module
