@@ -157,20 +157,30 @@ def main(o):
     b = np.zeros((K, N), dtype=bfloat16)
     b[np.arange(K), (np.arange(K) + 1) % N] = 1.0        # A @ B == np.roll(A, 1, axis=1)
 
-    Bt = tensor(b.reshape(K * N), dtype=bfloat16)
+    # `--vary operand` gives each of the two plan slots its OWN weight tensor with IDENTICAL content;
+    # every other mode keeps the single shared one the probe has always used. Identical content is the
+    # point: it pins stream dissimilarity AND bytes-per-dispatch at zero, so the only thing alternating
+    # is WHICH DDR region the dispatch reads. See the --vary help for why that is the open variable.
+    Bts = [tensor(b.reshape(K * N), dtype=bfloat16) for _ in range(2 if o.vary == "operand" else 1)]
+    Bt = Bts[0]
     As = [tensor(np.roll(a0, i, axis=0).reshape(M * K), dtype=bfloat16) for i in range(depth_max)]
     Cs = [zeros((M * N,), dtype=DTYPE[out_a]) for _ in range(depth_max)]
 
     # Warm both contexts: hw-context creation and BO first-touch are one-time and must not land in a
     # timed region. Running each arm once also proves the shared buffers are legal for both kernels.
-    rt.run(h_a, [As[0], Bt, Cs[0]])
-    rt.run(h_b, [As[0], Bt, Cs[0]])
+    for t in Bts:
+        rt.run(h_a, [As[0], t, Cs[0]])
+        rt.run(h_b, [As[0], t, Cs[0]])
 
-    for t in (*As, Bt, *Cs):
+    for t in (*As, *Bts, *Cs):
         t.to("npu")
     a_bos = [t.buffer_object() for t in As]
-    b_bo = Bt.buffer_object()
+    b_bos = [t.buffer_object() for t in Bts]
     c_bos = [t.buffer_object() for t in Cs]
+
+    def b_of(k):
+        """The weight BO plan slot `k` reads -- a different one per slot only under `--vary operand`."""
+        return b_bos[k % len(b_bos)]
 
     def insts_of(kh):
         bo = kh.insts_bo
@@ -200,8 +210,8 @@ def main(o):
     else:
         ibo_b, ib_b = insts_of(kh_b)
 
-    def submit(kh, ibo, ib, i):
-        return kh.kernel(3, ibo, ib, a_bos[i], b_bo, c_bos[i])
+    def submit(kh, ibo, ib, i, k):
+        return kh.kernel(3, ibo, ib, a_bos[i], b_of(k), c_bos[i])
 
     # Arm -> the kernel each of the d commands runs on. `alt` is the only one that crosses.
     def plan(arm, d):
@@ -222,7 +232,7 @@ def main(o):
         the timed region are exactly len(set-adjacent-differences) = d-1 for alt and 0 for a and b.
         """
         kh, ibo, ib = kern_of[p[0]]
-        kh.kernel(3, ibo, ib, a_bos[0], b_bo, c_bos[0]).wait()
+        kh.kernel(3, ibo, ib, a_bos[0], b_of(p[0]), c_bos[0]).wait()
 
     def poison(d):
         """Zero every output slot this rep is about to write, BEFORE the timed region.
@@ -239,6 +249,10 @@ def main(o):
 
     arms = ("a", "b", "alt")
     kern_of = ((kh_a, ibo_a, ib_a), (kh_b, ibo_b, ib_b))
+    if o.vary == "operand":
+        # Same kernel, same instruction BO, same bytes -- `alt` then alternates nothing but the
+        # weight BO, which is the one axis every previous sweep held fixed.
+        kern_of = ((kh_a, ibo_a, ib_a), (kh_a, ibo_a, ib_a))
 
     def check(d, p):
         """Worst mismatch count over d slots, each against the reference of the STREAM that wrote it.
@@ -264,7 +278,7 @@ def main(o):
                 buf[:] = 0
             Cs[i].to("npu")
             kh, ibo, ib = kern_of[stream]
-            if kh.kernel(3, ibo, ib, a_bos[i], b_bo, c_bos[i]).wait() \
+            if kh.kernel(3, ibo, ib, a_bos[i], b_of(stream), c_bos[i]).wait() \
                     != pyxrt.ert_cmd_state.ERT_CMD_STATE_COMPLETED:
                 sys.exit(f"reference capture did not complete: stream {stream} slot {i}")
             refs[(stream, i)] = np.asarray(Cs[i]).reshape(M, N).astype(np.float32).copy()
@@ -333,7 +347,7 @@ def main(o):
                 if o.poison:
                     poison(d)
                 t0 = time.perf_counter_ns()
-                hs = [submit(*kern_of[k], i) for i, k in enumerate(p)]
+                hs = [submit(*kern_of[k], i, k) for i, k in enumerate(p)]
                 t1 = time.perf_counter_ns()
                 for h in hs:
                     if h.wait() != pyxrt.ert_cmd_state.ERT_CMD_STATE_COMPLETED:
@@ -447,6 +461,13 @@ if __name__ == "__main__":
     p.add_argument("--no-settle", dest="settle", action="store_false",
                    help="do not pre-run the arm's first kernel; leaves one boundary "
                         "transition inside every arm's timed region")
+    p.add_argument("--vary", choices=("stream", "operand"), default="stream",
+                   help="what `alt` alternates. stream (default) = the instruction stream, the "
+                        "probe's original variable. operand = NOTHING but the weight BO: both plan "
+                        "slots run one stream from one instruction BO, and each reads its own "
+                        "identical-content weight BO. Separates 'the stream changed' from 'a "
+                        "different DDR region was read', which the encoder confounds at every "
+                        "restream and this probe has always pinned to one shared b_bo.")
     p.add_argument("--negative-control", action="store_true")
     p.add_argument("--kernel", default="MLIR_AIE")
     p.add_argument("--artifacts", default="artifacts")
