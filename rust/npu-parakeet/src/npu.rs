@@ -597,6 +597,27 @@ const DFF: usize = 4096; // Parakeet FFN inner dim (fc1 N / fc2 K)
 // does not fit alongside the m=64 C tile (L1 overflows by ~11.6 KB), so this variant only exists at m=32.
 const FC1_PANEL_BF16_TILE: &str = "32x32x128";
 
+/// Stem of the bf16-out fc1 panel build, which the fold also makes the resident -- both loads
+/// derive it here so they name ONE file. The panel carries its own copy of the modal epilogue, so
+/// `PARAKEET_MODAL_EPI_SUFFIX` has to select the variant for fc1 too; picking it at one site and
+/// not the other silently unfolds the fold.
+fn fc1_panel_bf16_stem() -> String {
+    let sfx = std::env::var("PARAKEET_MODAL_EPI_SUFFIX").unwrap_or_default();
+    format!("{PAD_M}x{KRES}x{DFF}_{FC1_PANEL_BF16_TILE}_8c_modalsilubf16outpanel{KRES}{sfx}")
+}
+
+/// Which of the two directories the panel is served from. `build_parakeet_modal_kernels.sh` copies
+/// it into `artifacts/parakeet/ln` and leaves it in the whole_array build dir; `load_kernel` keys
+/// its context cache on the PATH, so byte-identical copies at two paths are two hw_contexts and a
+/// ~1.5 ms program transition per crossing. Resolving through one picker is what lets the fold
+/// actually merge fc1 into the resident.
+fn fc1_panel_bf16_dir<'a>(base: &'a Path, ln_dir: &'a Path, stem: &str) -> &'a Path {
+    let has = |d: &Path| {
+        kernel_registry::xclbin_path(d, stem).exists() && kernel_registry::insts_path(d, stem).exists()
+    };
+    if has(ln_dir) || !has(base) { ln_dir } else { base }
+}
+
 /// `PARAKEET_FOLD_FC1=1`: make fc1's bf16-out xclbin the RESIDENT one, so fc1 and every other modal
 /// GEMM share a single hardware context.
 ///
@@ -700,6 +721,7 @@ impl NpuMatmul {
     pub fn open(root: &Path) -> Self {
         let dev = Device::open(0).expect("open NPU (single-tenant: stop npu-asr/voxd)");
         let base = root.join(WA_SUBDIR);
+        let ln_dir = root.join("artifacts/parakeet/ln");
         // resident kernel tile: fast BFP16 64x32x128 (default) or native bf16 32x32x32 (NPU_NATIVE=1),
         // or the FOLD's 32x32x128 (see `fold_fc1`).
         let tile = if fold_fc1() {
@@ -720,19 +742,11 @@ impl NpuMatmul {
         // fall back to a smaller surviving build (the N=4096/2048 twins were deleted by the
         // an earlier occupancy run; N=1024 survives). Env NPU_RESIDENT_XCLBIN overrides.
         let (xclbin, modal) = if fold_fc1() {
-            // The resident IS fc1's bf16-out xclbin, so the fc1<->fc2 transition disappears with
-            // no dispatch site touched -- PROVIDED both loads land on one hw_context.
-            // They do not, by default. This resolves the stem under `base` (the whole_array build
-            // dir) while `Fc1PanelBf16` resolves the byte-identical copy under `ln_dir`
-            // (artifacts/parakeet/ln), and `load_kernel` keys its cache on the PATH -- so the fold
-            // has been SPLITTING the two into separate contexts, not merging them. The comment here
-            // used to assert they were the same path; that unchecked claim is what let the fold
-            // report 48 deleted transitions per clip while creating exactly as many contexts as the
-            // arm it folded, and cost seven refuted axes pricing a program transition that
-            // `dispatch_log` had labelled a same-xclbin restream. Set NPU_XCLBIN_CACHE_BY_CONTENT=1
-            // to actually merge them (measured -114.8 ms/clip here); npu-xrt warns when it happens.
-            let stem = format!("{PAD_M}x{KRES}x{DFF}_{FC1_PANEL_BF16_TILE}_8c_modalsilubf16outpanel{KRES}");
-            (resolve_verified(&base, &stem).xclbin, true)
+            // The resident IS fc1's bf16-out xclbin, so the fc1<->fc2 transition disappears with no
+            // dispatch site touched -- but only while this load and `Fc1PanelBf16`'s name one path.
+            // `fc1_panel_bf16_dir` is what makes them agree.
+            let stem = fc1_panel_bf16_stem();
+            (resolve_verified(fc1_panel_bf16_dir(&base, &ln_dir, &stem), &stem).xclbin, true)
         } else if let Ok(p) = std::env::var("NPU_RESIDENT_XCLBIN") {
             let path = PathBuf::from(p);
             // Arbitrary override path (a manual/debug knob): no guaranteed `final_{stem}.xclbin`
@@ -828,7 +842,7 @@ impl NpuMatmul {
             relpos: RefCell::new(HashMap::new()),
             conveyor_dir: root.join("artifacts/conveyor"),
             conveyor: RefCell::new(None),
-            ln_dir: root.join("artifacts/parakeet/ln"),
+            ln_dir,
             resident_ln: RefCell::new(None),
             stats: RefCell::new(NpuStats::default()),
         }
@@ -1528,16 +1542,12 @@ impl NpuMatmul {
         // Fc1PanelBf16). Absent artifact still falls back cleanly, which is what makes default-on safe
         // for a tree that has not rebuilt the modal kernels.
         let fc1_panel_bf16 = {
-            // Same PARAKEET_MODAL_EPI_SUFFIX hook as the modal streams. The panel fc1 carries its
-            // OWN copy of the epilogue, so an epilogue variant has to be built and selected here
-            // too -- otherwise the variant reaches only the identity-mode GEMMs and misses fc1,
-            // which is the one dispatch whose SiLU branch the variant actually changes.
-            let sfx = std::env::var("PARAKEET_MODAL_EPI_SUFFIX").unwrap_or_default();
-            let tag = format!("{PAD_M}x{KRES}x{DFF}_{FC1_PANEL_BF16_TILE}_8c_modalsilubf16outpanel{KRES}{sfx}");
-            let present = kernel_registry::xclbin_path(&self.ln_dir, &tag).exists()
-                && kernel_registry::insts_path(&self.ln_dir, &tag).exists();
+            let tag = fc1_panel_bf16_stem();
+            let dir = fc1_panel_bf16_dir(&self.base, &self.ln_dir, &tag);
+            let present = kernel_registry::xclbin_path(dir, &tag).exists()
+                && kernel_registry::insts_path(dir, &tag).exists();
             if present {
-                let (kern, instr, n) = load_path(&self.ln_dir, &tag);
+                let (kern, instr, n) = load_path(dir, &tag);
                 let gg = |i| kern.group_id(i).unwrap();
                 Some(Fc1PanelBf16 {
                     bo_out: self.dev.alloc_bo(&kern, (DFF / KRES) * PAD_M * KRES * 2, FLAG_HOST_ONLY, gg(5)).unwrap(),
@@ -1554,7 +1564,7 @@ impl NpuMatmul {
                 if self.fc1_pack_in_drain_on() {
                     eprintln!("[npu] final_{tag}.xclbin absent in {} -- falling back to fc1+deint (slower by ~3.4%/clip). \
                                Build it with scripts/build_parakeet_modal_kernels.sh, or set PARAKEET_FC1_PACK_IN_DRAIN=0 to silence this.",
-                              self.ln_dir.display());
+                              dir.display());
                 }
                 None
             }

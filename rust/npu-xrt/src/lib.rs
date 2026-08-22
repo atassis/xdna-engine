@@ -522,13 +522,10 @@ pub type Result<T> = std::result::Result<T, String>;
 /// handed -- but two byte-identical copies of one xclbin at two paths then get two contexts, and a
 /// transition between them costs a full program switch while every report calls them one xclbin.
 /// `NPU_XCLBIN_CACHE_BY_CONTENT=1` keys on the file's CONTENT instead, so the copies share a
-/// context. Opt-in, because merging contexts changes the dispatch schedule of every configuration.
-///
-/// MEASURED, and the reason this exists: `PARAKEET_FOLD_FC1` folds fc1 onto the resident purely by
-/// pointing both at "the same xclbin", but the resident resolves it under the whole_array build dir
-/// and fc1 under `artifacts/parakeet/ln` -- same 148447 bytes, two files. The fold therefore deleted
-/// 48 transitions per clip from the dispatch log and none from the device (hw_contexts 12/16 in both
-/// arms, 15 reps each), which is why its end-to-end A/B measured neutral.
+/// context. Opt-in, because merging contexts changes the dispatch schedule of every configuration
+/// -- so it is a diagnostic for finding a duplicate, not the cure. The cure is to resolve the two
+/// call sites to ONE path, which is what `load_kernel`'s warning asks for; a caller that has done
+/// so reads the same `hw_contexts` count with this flag on and off.
 fn cache_id(xclbin_path: &str) -> String {
     if std::env::var("NPU_XCLBIN_CACHE_BY_CONTENT").map(|v| v != "0").unwrap_or(false) {
         if let Ok(bytes) = std::fs::read(xclbin_path) {
