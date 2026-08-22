@@ -29,6 +29,8 @@ CTX = re.compile(r"hw_contexts:\s*(\d+)/")
 ENC = re.compile(r"^mean encode ([0-9.]+)s/clip", re.M)
 CLIP = re.compile(r"^\[enc\] (\S+)\s+T'=\d+\s+([0-9.]+)s", re.M)
 DISP = re.compile(r"modal dispatch sites?[^0-9]*([0-9]+)", re.I)
+BLOCK = re.compile(r"total BLOCKING dispatch time ([0-9.]+) s")
+DTR = re.compile(r"^dispatches (\d+) \| transitions (\d+)", re.M)
 
 # t(0.975, df) for the df we actually reach; falls back to the normal quantile past the table.
 TCRIT = {1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571, 6: 2.447, 7: 2.365, 8: 2.306,
@@ -57,10 +59,14 @@ def ci(xs):
 
 def parse(p):
     txt = p.read_text()
+    dtr = DTR.search(txt)
     return {
         "ctx": int(CTX.search(txt).group(1)) if CTX.search(txt) else None,
         "enc": float(ENC.search(txt).group(1)) if ENC.search(txt) else None,
         "clips": {name: float(t) for name, t in CLIP.findall(txt)},
+        "block": float(BLOCK.search(txt).group(1)) if BLOCK.search(txt) else None,
+        "disp": int(dtr.group(1)) if dtr else None,
+        "trans": int(dtr.group(2)) if dtr else None,
     }
 
 
@@ -160,3 +166,63 @@ if len(clip_order) > 1:
         ("b1", "b0", "cache, on default"),
     ):
         decompose(arm, base, label, clip_order)
+
+
+# Device-blocking ledger (`NPU_DISPATCH_LOG=1`), the instrument that is NOT whole-clip wall clock.
+#
+# Why it is here: whole-clip wall clock could never resolve the GLU half. Three runs put it at -99.3,
+# -17.3 and -8.5 ms/clip, the last at 43/64 sign consistency -- drift-grade, because a ~23 ms effect
+# is 1.3% of a 1.72 s/clip statistic. The ledger sums blocking time over ~800 dispatches and drops
+# host work entirely, so the same effect lands at 8/8 sign consistency with a +-5 ms CI.
+#
+# It is a DIFFERENT quantity from wall clock (device blocking only), so it earns trust by reproducing
+# the two contrasts wall clock DID resolve, on the same runs -- see the additivity line below.
+#
+# One value per (arm, rep): the probe reports the ledger for the LAST clip only, which is a warm clip.
+def ledger_pairs(arm, base):
+    return [(reps[r][arm]["block"] - reps[r][base]["block"]) * 1e3
+            for r in complete
+            if reps[r][arm]["block"] is not None and reps[r][base]["block"] is not None]
+
+
+def ledger_row(label, pairs):
+    if len(pairs) < 2:
+        return None
+    lo, hi = ci(pairs)
+    neg = sum(1 for x in pairs if x < 0)
+    print(f"{label:<28} {statistics.mean(pairs):>9.1f}   [{lo:>8.1f}, {hi:>8.1f}]  "
+          f"{neg:>3}/{len(pairs):<3}")
+    return statistics.mean(pairs)
+
+
+if all(reps[complete[0]][a]["block"] is not None for a in ARMS):
+    print("\ndevice-blocking ledger -- ms/clip, negative = faster  (last clip, NPU_DISPATCH_LOG)")
+    print(f"{'contrast':<28} {'mean':>9}   {'95% CI':>20}  {'neg':>7}")
+    for arm, base, label in (
+        ("f0", "b0", "FOLD_FC1, uncached"),
+        ("f1", "b1", "FOLD_FC1, cached"),
+        ("p0", "f0", "GLU fold, uncached"),
+        ("p1", "f1", "GLU fold, cached"),
+        ("p0", "b0", "the pair, uncached"),
+        ("p1", "b1", "the pair, cached"),
+    ):
+        ledger_row(label, ledger_pairs(arm, base))
+
+    # Pooled across the cache setting, which the ledger itself shows is inert (the two cache rows
+    # above differ by a few ms with CIs containing zero), so the 4+4 reps are 8 replicates of one
+    # contrast rather than two contrasts.
+    print("\npooled across the cache setting")
+    print(f"{'contrast':<28} {'mean':>9}   {'95% CI':>20}  {'neg':>7}")
+    fc1 = ledger_row("FOLD_FC1", ledger_pairs("f0", "b0") + ledger_pairs("f1", "b1"))
+    glu = ledger_row("GLU fold", ledger_pairs("p0", "f0") + ledger_pairs("p1", "f1"))
+    pair = ledger_row("the pair", ledger_pairs("p0", "b0") + ledger_pairs("p1", "b1"))
+    if None not in (fc1, glu, pair):
+        # The halves add on this instrument. They never did on wall clock, where the GLU half was
+        # unresolvable and the residual absorbed it.
+        print(f"\n  additivity: {fc1:.1f} + {glu:.1f} = {fc1 + glu:.1f} vs measured pair "
+              f"{pair:.1f}  (residual {pair - fc1 - glu:+.2f} ms)")
+
+    print("\ndispatch / transition counts per arm (identical across reps -- they are structural)")
+    for arm in ARMS:
+        a = reps[complete[0]][arm]
+        print(f"  {LABEL[arm]:<28} dispatches {a['disp']}  transitions {a['trans']}")
