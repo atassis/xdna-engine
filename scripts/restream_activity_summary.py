@@ -38,13 +38,21 @@ if ctl:
               f"{r['pos']}/{r['reps']} pos")
     print()
 
-AXIS = {"ctx": "ballast on its OWN hw_context", "bos": "ballast on the measured context"}
+AXIS = {"ctx": "ballast on its OWN hw_context", "bos": "ballast on the measured context",
+        "fp": "resident NON-ZERO ballast on the measured context (footprint)"}
 for (axis, pair), rows in sorted(by_axis.items()):
     print(f"### {axis} -- {AXIS.get(axis, axis)} -- {pair}")
-    print(f"  {'N':>3s} {'us/change':>11s} {'95% CI':>24s} {'pos':>7s} {'arm ms':>9s}   verdict")
+    # pinned MiB and the measured-only absolute are printed only where the run recorded them: the
+    # footprint axis is the first to carry either, and a missing column must read as absent rather
+    # than as zero.
+    print(f"  {'N':>3s} {'pinMiB':>7s} {'us/change':>11s} {'95% CI':>24s} {'pos':>7s}"
+          f" {'ALT us/disp':>12s} {'GRP us/disp':>12s}   verdict")
     for n, r in sorted(rows):
         lo, hi = r["mean_us"] - r["ci95_us"], r["mean_us"] + r["ci95_us"]
         on = "ON" if lo > 0 else ("negative" if hi < 0 else "off")
-        print(f"  {n:3d} {r['mean_us']:11.2f}   [{lo:9.2f}, {hi:9.2f}] {r['pos']:3d}/{r['reps']:<3d}"
-              f" {r['alt_ms']:9.1f}   {on}")
+        mib = f"{r['pinned_bytes'] / 2**20:7.0f}" if "pinned_bytes" in r else " " * 7
+        ad = f"{r['alt_us_per_disp']:12.1f}" if "alt_us_per_disp" in r else " " * 12
+        gd = f"{r['grp_us_per_disp']:12.1f}" if "grp_us_per_disp" in r else " " * 12
+        print(f"  {n:3d} {mib} {r['mean_us']:11.2f}   [{lo:9.2f}, {hi:9.2f}]"
+              f" {r['pos']:3d}/{r['reps']:<3d}{ad}{gd}   {on}")
     print()

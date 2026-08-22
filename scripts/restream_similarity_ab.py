@@ -22,6 +22,17 @@ TIMING ONLY: nothing reads C, and the streams' embedded rtp_write picks the epil
 a foreign stream on a given xclbin computes the foreign stream's mode. That is intended -- all three
 designs link the same core objects and differ only in constants.
 
+FOOTPRINT AXIS (--footprint-bos). Dissimilarity, passive context residency, cross-context ACTIVITY
+and live instruction-BO count are all refuted flat at zero, and operand IDENTITY is refuted by the
+self pair (load() allocates fresh operands per stream, so `self` already alternated two distinct
+operand sets). What no isolated instrument has ever scaled is HOW MUCH IS LIVE: this probe holds a
+dozen small zero-filled BOs, while the encoder pins 1.25 GB across one resident multi-MB weight BO
+per op and reads a different one every dispatch. Both surviving mechanisms -- eviction of the next
+dispatch's working set, and address-translation state where each BO is a distinct DMA mapping --
+scale with footprint and mapping count, not with identity. So --footprint-bos N adds N resident,
+NON-ZERO, multi-MB ballast streams on the measured context, each actually dispatched against,
+round-robin; sweeping N carries the isolated working set up to the encoder's.
+
 ACTIVITY AXES (--interleave-contexts / --interleave-bos). Dissimilarity is flat at zero and PASSIVE
 context residency is flat at zero, so the two surviving suspects for the encoder's +2.3 ms are BO
 churn and instruction-BO eviction. Both predict the price turns on with ACTIVITY, which is the axis
@@ -68,13 +79,23 @@ ap.add_argument("--interleave-bos", type=int, default=0,
                 help="same round-robin ballast, but all N share the measured pair's context as "
                      "distinct live instruction BOs of identical content -- many streams in flight "
                      "with dissimilarity pinned at zero.")
+ap.add_argument("--footprint-bos", type=int, default=0,
+                help="N resident NON-ZERO ballast streams on the measured context, dispatched "
+                     "round-robin -- carries live footprint and DMA-mapping count toward the "
+                     "encoder's 1.25 GB / ~200 resident weight BOs")
+ap.add_argument("--footprint-spec", default=None,
+                help="spec for --footprint-bos ballast (default: the second stream of the first "
+                     "pair, i.e. the larger operand set)")
 ap.add_argument("--ballast", default=None,
                 help="spec dispatched as ballast (default: the first pair's first spec)")
 ap.add_argument("--out", default=None, help="write JSON here")
 a = ap.parse_args()
 
-if a.interleave_contexts and a.interleave_bos:
-    ap.error("--interleave-contexts and --interleave-bos confound the resource; sweep one at a time")
+_axes = [n for n, v in (("--interleave-contexts", a.interleave_contexts),
+                        ("--interleave-bos", a.interleave_bos),
+                        ("--footprint-bos", a.footprint_bos)) if v]
+if len(_axes) > 1:
+    ap.error(f"{' and '.join(_axes)} confound the resource; sweep one axis at a time")
 
 d = pyxrt.device(0)
 _xb = {}
@@ -107,8 +128,12 @@ def context(stem):
     return _ctx[stem]
 
 
-def load(spec, kernel=None):
-    """One dispatchable stream: its instruction BO plus operand BOs sized from its own K and N."""
+def load(spec, kernel=None, nonzero=False):
+    """One dispatchable stream: its instruction BO plus operand BOs sized from its own K and N.
+
+    `nonzero` fills the operands with finite bf16 instead of zeros. Nothing reads C, so the content
+    is numerically irrelevant -- it exists so a footprint ballast cannot be served by any zero-page
+    or all-zero-DMA shortcut, which would make the pinned bytes nominal rather than real."""
     spec, _, xstem = spec.partition("@")
     xstem = xstem or a.xclbin
     k = kernel if kernel is not None else context(xstem)
@@ -124,9 +149,16 @@ def load(spec, kernel=None):
     bo_t = pyxrt.bo(d, 1, pyxrt.bo.host_only, k.group_id(6))
     bo_r = pyxrt.bo(d, 4, pyxrt.bo.host_only, k.group_id(7))
     for bo in (bo_a, bo_b, bo_r):
-        bo.write(bytearray(bo.size()), 0)
+        if nonzero and bo is not bo_r:
+            # 0x3000..0x3fff is positive normal bf16 in ~[1.2e-4, 2.0): non-zero, finite, no
+            # denormal/NaN slow path in the core. Deterministic, so a point is reproducible.
+            rng = np.random.default_rng(bo.size())
+            bo.write(rng.integers(0x3000, 0x4000, bo.size() // 2, dtype=np.uint16).tobytes(), 0)
+        else:
+            bo.write(bytearray(bo.size()), 0)
         bo.sync(TO)
     return dict(stem=stem, kres=kres, n=n, words=int(instr.size), instr=instr, xclbin=xstem, k=k,
+                bytes=sum(b.size() for b in (bo_i, bo_a, bo_b, bo_c, bo_t, bo_r)), bos=6,
                 args=(3, bo_i, instr.size, bo_a, bo_b, bo_c, bo_t, bo_r))
 
 
@@ -137,16 +169,24 @@ def word_diff(s0, s1):
 
 
 def timed(streams, order, ballast):
-    """Time one arm. The ballast index tracks POSITION, so both arms see an identical ballast
-    sequence and its cost cancels in the ALT-GRP difference."""
+    """Time one arm, splitting MEASURED dispatches from ballast ones.
+
+    The ballast index tracks POSITION, so both arms see an identical ballast sequence and its cost
+    cancels in the ALT-GRP difference. The split exists because the differential is blind to a
+    UNIFORM per-dispatch effect that hits both arms equally -- exactly what an eviction driven by
+    total footprint would be. The measured-only absolute is what makes a point commensurable with
+    the encoder's per-predecessor-class ms/dispatch."""
+    tm = 0.0
     t0 = time.perf_counter()
     for j, i in enumerate(order):
         s = streams[i]
+        tc = time.perf_counter()
         s["k"](*s["args"]).wait()
+        tm += time.perf_counter() - tc
         if ballast:
             b = ballast[j % len(ballast)]
             b["k"](*b["args"]).wait()
-    return (time.perf_counter() - t0) * 1e6
+    return (time.perf_counter() - t0) * 1e6, tm * 1e6
 
 
 half = a.total // 2
@@ -166,16 +206,26 @@ if a.extra_contexts:
         _ballast.append(pyxrt.hw_context(d, bx.get_uuid()))
     print(f"holding {len(_ballast)} extra live hw_context(s), never dispatched into\n")
 
-BALLAST_SPEC = a.ballast or a.pair[0].split("=", 1)[1].split(",")[0]
-n_ilv = a.interleave_contexts or a.interleave_bos
+# The footprint axis defaults to the LARGER of the first pair's two streams, so each ballast pins
+# the most bytes available without inventing a spec the encoder has no analogue for.
+if a.footprint_bos:
+    BALLAST_SPEC = a.footprint_spec or a.pair[0].split("=", 1)[1].split(",")[1]
+else:
+    BALLAST_SPEC = a.ballast or a.pair[0].split("=", 1)[1].split(",")[0]
+n_ilv = a.interleave_contexts or a.interleave_bos or a.footprint_bos
 interleaved = []
 for _ in range(n_ilv):
     k = kernel_on_new_context(a.xclbin) if a.interleave_contexts else context(a.xclbin)
-    interleaved.append(load(BALLAST_SPEC, kernel=k))
+    interleaved.append(load(BALLAST_SPEC, kernel=k, nonzero=bool(a.footprint_bos)))
 if interleaved:
-    axis = "own hw_context" if a.interleave_contexts else "the measured context"
+    axis = ("own hw_context" if a.interleave_contexts else
+            "the measured context, NON-ZERO" if a.footprint_bos else "the measured context")
     print(f"interleaving {len(interleaved)} ballast dispatch(es) of {BALLAST_SPEC.split(':')[0]}"
-          f" on {axis}, round-robin between measured dispatches\n")
+          f" on {axis}, round-robin between measured dispatches")
+BALLAST_BYTES = sum(s["bytes"] for s in interleaved)
+BALLAST_BOS = sum(s["bos"] for s in interleaved)
+print(f"ballast pins {BALLAST_BYTES / 2**20:.0f} MiB over {BALLAST_BOS} BOs"
+      f"   (encoder reference: 1.25 GB resident, one weight BO per op)\n")
 
 results = []
 for spec in a.pair:
@@ -193,43 +243,62 @@ for spec in a.pair:
             s["k"](*s["args"]).wait()
 
     deltas, alts, grps = [], [], []
+    mdeltas, malts, mgrps = [], [], []
     for r in range(a.reps):
         # Alternate which arm leads so any within-rep warming loads on both arms equally.
         if r % 2 == 0:
-            ta = timed(S, ALT, interleaved)
-            tg = timed(S, GRP, interleaved)
+            ta, ma = timed(S, ALT, interleaved)
+            tg, mg = timed(S, GRP, interleaved)
         else:
-            tg = timed(S, GRP, interleaved)
-            ta = timed(S, ALT, interleaved)
+            tg, mg = timed(S, GRP, interleaved)
+            ta, ma = timed(S, ALT, interleaved)
         alts.append(ta)
         grps.append(tg)
         deltas.append((ta - tg) / DCH)
+        malts.append(ma)
+        mgrps.append(mg)
+        mdeltas.append((ma - mg) / DCH)
 
-    mean = statistics.mean(deltas)
-    sd = statistics.stdev(deltas) if len(deltas) > 1 else 0.0
-    se = sd / len(deltas) ** 0.5
-    ci = 1.96 * se
-    pos = sum(1 for x in deltas if x > 0)
+    def stats(xs):
+        m = statistics.mean(xs)
+        sd = statistics.stdev(xs) if len(xs) > 1 else 0.0
+        return m, sd, 1.96 * sd / len(xs) ** 0.5, sum(1 for x in xs if x > 0)
+
+    mean, sd, ci, pos = stats(deltas)
+    mmean, msd, mci, mpos = stats(mdeltas)
+    # Absolute per MEASURED dispatch, ballast excluded: the number the encoder's per-class
+    # ms/dispatch can be read against directly (same-context restream cell = 2.57-2.62 ms).
+    alt_pd = statistics.mean(malts) / len(ALT)
+    grp_pd = statistics.mean(mgrps) / len(GRP)
     print(f"    ALT  {statistics.mean(alts) / 1e3:9.2f} ms/arm     GRP {statistics.mean(grps) / 1e3:9.2f} ms/arm")
     print(f"    => restream cost {mean:8.2f} us/change   95% CI [{mean - ci:.2f}, {mean + ci:.2f}]"
-          f"   {pos}/{len(deltas)} reps positive\n")
+          f"   {pos}/{len(deltas)} reps positive")
+    print(f"    measured-only    {mmean:8.2f} us/change   95% CI [{mmean - mci:.2f}, {mmean + mci:.2f}]"
+          f"   {mpos}/{len(mdeltas)} reps positive")
+    print(f"    abs/dispatch (measured only)  ALT {alt_pd:8.1f} us   GRP {grp_pd:8.1f} us\n")
     results.append(dict(pair=name, streams=[s["stem"] for s in S], xclbins=[s["xclbin"] for s in S],
                         kres=[s["kres"] for s in S],
                         n=[s["n"] for s in S], word_diff=wd, words=S[0]["words"],
                         mean_us=mean, ci95_us=ci, sd_us=sd, reps=a.reps, pos=pos,
                         alt_ms=statistics.mean(alts) / 1e3, grp_ms=statistics.mean(grps) / 1e3,
-                        deltas_us=deltas))
+                        meas_mean_us=mmean, meas_ci95_us=mci, meas_pos=mpos,
+                        alt_us_per_disp=alt_pd, grp_us_per_disp=grp_pd,
+                        ballast_bytes=BALLAST_BYTES, ballast_bos=BALLAST_BOS,
+                        pinned_bytes=BALLAST_BYTES + sum(s["bytes"] for s in S),
+                        deltas_us=deltas, meas_deltas_us=mdeltas))
 
-print(f"{'pair':28s} {'diff words':>10s} {'us/change':>12s} {'95% CI':>22s}")
+print(f"{'pair':28s} {'pinned MiB':>10s} {'us/change':>12s} {'95% CI':>22s} {'abs us/disp ALT':>16s}")
 for r in results:
     lo, hi = r["mean_us"] - r["ci95_us"], r["mean_us"] + r["ci95_us"]
-    print(f"{r['pair']:28s} {r['word_diff']:10d} {r['mean_us']:12.2f}   [{lo:8.2f}, {hi:8.2f}]")
+    print(f"{r['pair']:28s} {r['pinned_bytes'] / 2**20:10.0f} {r['mean_us']:12.2f}"
+          f"   [{lo:8.2f}, {hi:8.2f}] {r['alt_us_per_disp']:16.1f}")
 
 if a.out:
     with open(a.out, "w") as f:
         json.dump(dict(xclbin=a.xclbin, total=a.total, reps=a.reps, dch=DCH,
                        extra_contexts=a.extra_contexts,
                        interleave_contexts=a.interleave_contexts, interleave_bos=a.interleave_bos,
+                       footprint_bos=a.footprint_bos,
                        ballast=BALLAST_SPEC if interleaved else None,
                        results=results), f, indent=1)
     print(f"\nwrote {a.out}")
