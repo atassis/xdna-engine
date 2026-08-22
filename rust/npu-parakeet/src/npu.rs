@@ -1412,17 +1412,29 @@ impl NpuMatmul {
                 None
             }
         };
+        // The ADDEND slot (g4) of acc_add and of the s100 residual is a modal C drain -- the fc2
+        // partial and the MHSA linear_out -- so its wire width follows the resident, while the
+        // accumulator/residual stream on g3/g5 stays f32 for every other brick that reads it. That
+        // asymmetry is the `bf16b` arm; picking it by drain width is what keeps a bf16-out resident
+        // from handing f32-in bricks half-width rows. s050's addend is acc_add's own f32 output, so
+        // it is not part of this.
+        let b_elem = self.c_elem_bytes();
+        let bsuf = if b_elem == 2 { "_bf16b" } else { "" };
         // resident-FFN fc2 on-device accumulate (out=a+b f32), OPTIONAL: load only if built. acc0/acc1
         // ping-pong the running sum; `zero` (zeroed once) seeds the first partial (acc = partial0 + 0).
         let acc_add = {
-            let stem = format!("accadd_{PAD_M}x{KRES}");
+            let stem = format!("accadd_{PAD_M}x{KRES}{bsuf}");
             let present = kernel_registry::xclbin_path(&self.ln_dir, &stem).exists()
                 && kernel_registry::insts_path(&self.ln_dir, &stem).exists();
             if present {
                 let (kern, instr, n) = load_path(&self.ln_dir, &stem);
                 let gaa = |i| kern.group_id(i).unwrap();
-                let zero = self.dev.alloc_bo(&kern, PAD_M * KRES * 4, FLAG_HOST_ONLY, gaa(4)).unwrap();
-                zero.write_bytes(&vec![0u8; PAD_M * KRES * 4]).unwrap();
+                // g4 is the addend slot, so the seed is sized at the addend's width, not the
+                // accumulator's -- an f32-sized seed against a bf16 tap feeds the DMA twice the
+                // rows it will read.
+                let zbytes = PAD_M * KRES * b_elem;
+                let zero = self.dev.alloc_bo(&kern, zbytes, FLAG_HOST_ONLY, gaa(4)).unwrap();
+                zero.write_bytes(&vec![0u8; zbytes]).unwrap();
                 zero.sync_to_device().unwrap();
                 Some(AccAdd {
                     acc0: Rc::new(self.dev.alloc_bo(&kern, PAD_M * KRES * 4, FLAG_HOST_ONLY, gaa(5)).unwrap()),
@@ -1433,7 +1445,7 @@ impl NpuMatmul {
                     kern, instr, n,
                 })
             } else {
-                eprintln!("[npu] acc_add xclbin absent in {} -- resident_ffn_dev unavailable (build final_accadd_{PAD_M}x{KRES})", self.ln_dir.display());
+                eprintln!("[npu] acc_add xclbin absent in {} -- resident_ffn_dev unavailable (build final_{stem})", self.ln_dir.display());
                 None
             }
         };
@@ -1459,7 +1471,7 @@ impl NpuMatmul {
         };
         // scaled residual-add s100 (out=a+1.0*b f32), OPTIONAL: the full MHSA/conv residual x+sublayer.
         let resadd_s100 = {
-            let stem = format!("resadd_{PAD_M}x{KRES}_s100");
+            let stem = format!("resadd_{PAD_M}x{KRES}_s100{bsuf}");
             let present = kernel_registry::xclbin_path(&self.ln_dir, &stem).exists()
                 && kernel_registry::insts_path(&self.ln_dir, &stem).exists();
             if present {
@@ -1473,7 +1485,7 @@ impl NpuMatmul {
                     kern, instr, n,
                 })
             } else {
-                eprintln!("[npu] resadd_s100 xclbin absent in {} -- residual_add_dev(1.0) unavailable (build final_resadd_{PAD_M}x{KRES}_s100)", self.ln_dir.display());
+                eprintln!("[npu] resadd_s100 xclbin absent in {} -- residual_add_dev(1.0) unavailable (build final_{stem})", self.ln_dir.display());
                 None
             }
         };
@@ -1946,9 +1958,9 @@ impl NpuMatmul {
     /// Read a device f32 [PAD_M,KRES] BO back to a host [m, KRES] array (the block/encoder boundary).
     ///
     /// f32 and NOT [`Self::c_elem_bytes`]-aware, deliberately: a resident STREAM is what the resadd
-    /// and acc_add bricks drain, and both are f32-only builds whatever the modal resident does. The
-    /// buffer that follows the resident's drain width is a modal `bo_c`, which is a different thing
-    /// this must not be pointed at.
+    /// and acc_add bricks drain, and their OUT slot is f32 in every arm -- only their addend follows
+    /// the resident. The buffer that follows the drain width is a modal `bo_c`, which is a different
+    /// thing this must not be pointed at.
     pub fn readback_stream(&self, bo: &Bo, m: usize) -> Array2<f32> {
         assert!(m <= PAD_M, "readback_stream: m={m} exceeds PAD_M={PAD_M}");
         bo.sync_from_device().unwrap();
@@ -3231,9 +3243,11 @@ impl NpuMatmul {
 
     /// On-chip scaled residual add: out = a + scale*b, f32 [PAD_M,KRES], device-resident. Selects
     /// the baked-scale xclbin: s050 = 0.5 (Macaron residual) and s100 = 1.0 (MHSA residual) are both
-    /// built; the FUSED_BLOCK path requires BOTH (gated by `resident_fused_available`). `a_bo`/`b_bo`
-    /// are device f32 [PAD_M,KRES] BOs; returns the device result (ResidualAdd scratch, overwritten by
-    /// the next call). `None` when the selected-scale xclbin is absent; PANICS on an unbuilt scale.
+    /// built; the FUSED_BLOCK path requires BOTH (gated by `resident_fused_available`). `a_bo` and the
+    /// f32 [PAD_M,KRES] result are f32 for every scale; `b_bo` follows the loaded brick's addend width
+    /// -- f32 for s050, and for s100 whatever `c_elem_bytes` measured, since that addend is a modal C.
+    /// Returns the device result (ResidualAdd scratch, overwritten by the next call). `None` when the
+    /// selected-scale xclbin is absent; PANICS on an unbuilt scale.
     pub fn residual_add_dev(&self, a_bo: &Bo, b_bo: &Bo, scale: f32, _m: usize) -> Option<Rc<Bo>> {
         let rl = self.resident_ln()?;
         let ra = if (scale - 0.5).abs() < 1e-6 {

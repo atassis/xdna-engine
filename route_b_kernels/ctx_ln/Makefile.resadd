@@ -17,13 +17,17 @@ cols ?= 1024
 scale ?= 0.5
 stag ?= 050
 # dtype=bf16 halves every streaming buffer (6 x D x 4B = 24588 B -> 12300 B of the core's
-# 64 KB) and the DDR traffic with it. The generator's --dtype and the kernel's -DRESADD_BF16
-# MUST move together -- they are two halves of one ABI -- so this one knob drives both, and
-# the object name carries it so an f32 build never links a bf16 .o. Tag carries it too.
+# 64 KB) and the DDR traffic with it; dtype=bf16b narrows only b, for an f32 residual stream fed
+# by a bf16-out GEMM drain. The generator's --dtype and the kernel's -D flag MUST move together --
+# they are two halves of one ABI -- so this one knob drives both, and the object name carries it
+# so an f32 build never links a bf16 .o. Tag carries it too.
 dtype ?= f32
 ifeq ($(dtype),bf16)
 RESADD_DEFINES = -DRESADD_BF16
 dtsuf = _bf16
+else ifeq ($(dtype),bf16b)
+RESADD_DEFINES = -DRESADD_B_BF16
+dtsuf = _bf16b
 else
 RESADD_DEFINES =
 dtsuf =

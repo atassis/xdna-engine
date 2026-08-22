@@ -9,8 +9,9 @@
 //! The f32 decode IS the control: on an f32 drain the two agree element-for-element, on a bf16 drain
 //! it reads adjacent output pairs as one f32.
 //!
-//! It also prices what NO host reader can fix: the modal C is handed straight to `residual_add_dev`
-//! on the encoder's own MHSA seam, and that brick is an f32-in build.
+//! It also prices what no host reader reaches: the modal C is handed straight to `residual_add_dev`
+//! on the encoder's own MHSA seam, whose addend slot must follow the drain while the residual
+//! stream it adds to stays f32.
 //!
 //! Read the two arms together, one process each:
 //!   drain_dtype_probe                      -> drain 4 B/elem, both decodes identical
@@ -89,19 +90,18 @@ fn main() {
     println!("dispatch         = {:.3e}", rel_l2(&dispatched, &want));
     println!("f32-assumed      = {:.3e}  (control: the decode every readback used to do)", rel_l2(&assumed, &want));
 
-    // The device-side consumer: the encoder hands linear_out's modal C straight to residual_add,
-    // whose shipped xclbin is the f32-in arm (`resadd_512x1024_s*`, out sized PAD_M*KRES*4). No host
-    // reader is on that path. a + 1.0*b against the same two operands decoded on host is the gate.
-    let a2 = fill(m, k, 3);
-    let b3 = b.clone();
-    let bo2 = npu.matmul_id_to_bo(&a2, move || b3, "drain.probe.bo2", n);
-    let resadd = npu.residual_add_dev(&bo, &bo2, 1.0, m).map(|sum_bo| {
-        let want2 = a2.mapv(bf16).dot(&b.mapv(bf16));
-        let host_sum = &want.mapv(bf16) + &want2.mapv(bf16);
+    // The device-side consumer, in the SEAM'S OWN SHAPE: the encoder's s100 residual adds the
+    // modal C (linear_out) to the f32 residual stream the previous residual left resident, and
+    // reads the sum back as f32. Both slots fed from a modal C would price an arrangement no
+    // encoder path builds, and would hide which slot the drain width actually reaches.
+    let x = fill(m, n, 3);
+    let x_bo = npu.upload_stream(&x);
+    let resadd = npu.residual_add_dev(&x_bo, &bo, 1.0, m).map(|sum_bo| {
+        let host_sum = &x + &want;
         rel_l2(&npu.readback_stream(&sum_bo, m), &host_sum)
     });
     match resadd {
-        Some(e) => println!("resadd(dev)      = {e:.3e}  (device consumer of the same C, f32-in brick)"),
+        Some(e) => println!("resadd(dev)      = {e:.3e}  (device consumer of the same C)"),
         None => println!("resadd(dev)      = SKIPPED (resadd xclbin absent)"),
     }
 

@@ -101,20 +101,23 @@ def residual_add(dev, sequence_length, embedding_dim, scale, trace_size, n_cores
     assert sequence_length % n_cores == 0, "rows must split evenly across 8 cores"
     assert embedding_dim % 16 == 0, "residual_add_row<16> vectorizes cols by 16"
 
-    # dtype selects the WIRE format of a/b/out; the arithmetic is f32 in both arms (the bf16
-    # kernel widens on load and narrows on store). All six streaming buffers follow it, which
-    # is the whole L1 lever: 6 x D x 4 B = 24588 B at f32, 12300 B at bf16 on a 64 KB core.
-    # Must move together with the kernel's -DRESADD_BF16 -- the Kernel() arg types below are
-    # what the compiled entry expects, so a half-set build is a silent type mismatch.
-    assert dtype in ("f32", "bf16"), "dtype must be f32 or bf16"
+    # dtype selects the WIRE format per slot; the arithmetic is f32 in every arm (a bf16 slot is
+    # widened on load, and narrowed on store only where out is bf16). It must move together with
+    # the kernel's -D flag -- the Kernel() arg types below are what the compiled entry expects, so
+    # a half-set build is a silent type mismatch.
+    #   f32    a/b/out f32   -- 6 x D x 4 B = 24588 B of the 64 KB core
+    #   bf16   a/b/out bf16  -- 12300 B, the L1 lever
+    #   bf16b  b bf16 only   -- 20492 B; pairs an f32 residual stream with a bf16-out GEMM drain
+    assert dtype in ("f32", "bf16", "bf16b"), "dtype must be f32, bf16 or bf16b"
     f32 = np.float32
-    elem = np.float32 if dtype == "f32" else bfloat16
+    ab_elem = np.float32 if dtype != "bf16" else bfloat16
+    b_elem = np.float32 if dtype == "f32" else bfloat16
     total = sequence_length * embedding_dim
     rows_per_core = sequence_length // n_cores
 
-    a_chunk = np.ndarray[(embedding_dim,), np.dtype[elem]]
-    b_chunk = np.ndarray[(embedding_dim,), np.dtype[elem]]
-    out_chunk = np.ndarray[(embedding_dim,), np.dtype[elem]]
+    a_chunk = np.ndarray[(embedding_dim,), np.dtype[ab_elem]]
+    b_chunk = np.ndarray[(embedding_dim,), np.dtype[b_elem]]
+    out_chunk = np.ndarray[(embedding_dim,), np.dtype[ab_elem]]
 
     of_a = [ObjectFifo(a_chunk, name=f"a_{i}") for i in range(n_cores)]
     of_b = [ObjectFifo(b_chunk, name=f"b_{i}") for i in range(n_cores)]
@@ -149,9 +152,9 @@ def residual_add(dev, sequence_length, embedding_dim, scale, trace_size, n_cores
         for i in range(n_cores)
     ]
 
-    a_ty = np.ndarray[(total,), np.dtype[elem]]
-    b_ty = np.ndarray[(total,), np.dtype[elem]]
-    out_ty = np.ndarray[(total,), np.dtype[elem]]
+    a_ty = np.ndarray[(total,), np.dtype[ab_elem]]
+    b_ty = np.ndarray[(total,), np.dtype[b_elem]]
+    out_ty = np.ndarray[(total,), np.dtype[ab_elem]]
 
     def sequence(a, b, out, a_prods, b_prods, out_conses):
         for i in range(n_cores):
@@ -200,8 +203,8 @@ p.add_argument("-s", "--scale", required=True, dest="scale")
 p.add_argument("-t", "--trace_size", required=False, dest="trace_size", default=0)
 p.add_argument("-n", "--cores", required=False, dest="cores", default=8)
 p.add_argument("--dtype", required=False, dest="dtype", default="f32",
-               choices=("f32", "bf16"),
-               help="wire format of a/b/out; must match the kernel's -DRESADD_BF16")
+               choices=("f32", "bf16", "bf16b"),
+               help="per-slot wire format; must match the kernel's -DRESADD_BF16/-DRESADD_B_BF16")
 p.add_argument("-e", "--event-set", required=False, dest="event_set", default="band-naming",
                 choices=["band-naming", "perfcnt-probe", "denom-check"])
 opts = p.parse_args(sys.argv[1:])

@@ -13,21 +13,32 @@ VPATH := ${srcdir}/../../../aie_kernels/aie2p
 devicename ?= $(if $(filter 1,$(NPU2)),npu2,npu)
 rows ?= 512
 cols ?= 1024
-tag = accadd_${rows}x${cols}
+# dtype=bf16b narrows the PARTIAL (b) to bf16 for a bf16-out fc2 drain; a/out stay f32. The
+# generator's --dtype and the kernel's -DACCADD_B_BF16 are two halves of one ABI, so one knob
+# drives both and the object name carries it -- an f32 build never links a bf16b .o.
+dtype ?= f32
+ifeq ($(dtype),bf16b)
+ACCADD_DEFINES = -DACCADD_B_BF16
+dtsuf = _bf16b
+else
+ACCADD_DEFINES =
+dtsuf =
+endif
+tag = accadd_${rows}x${cols}${dtsuf}
 
 aie_py_src = acc_add_iron.py
 
 all: build/final_${tag}.xclbin
 
-build/acc_add.o: acc_add.cc
+build/acc_add${dtsuf}.o: acc_add.cc
 	mkdir -p ${@D}
-	cd ${@D} && ${PEANO_INSTALL_DIR}/bin/clang++ ${PEANOWRAP2P_FLAGS} -c $< -o ${@F}
+	cd ${@D} && ${PEANO_INSTALL_DIR}/bin/clang++ ${PEANOWRAP2P_FLAGS} ${ACCADD_DEFINES} -c $< -o ${@F}
 
 build/aie_${tag}.mlir: ${srcdir}/${aie_py_src}
 	mkdir -p ${@D}
-	python3 $< -d ${devicename} -r ${rows} -c ${cols} -t 0 > $@
+	python3 $< -d ${devicename} -r ${rows} -c ${cols} -t 0 --dtype ${dtype} > $@
 
-build/final_${tag}.xclbin: build/aie_${tag}.mlir build/acc_add.o
+build/final_${tag}.xclbin: build/aie_${tag}.mlir build/acc_add${dtsuf}.o
 	mkdir -p ${@D}
 	cd ${@D} && aiecc --get-xclbin --get-npu-insts \
 		--peano ${PEANO_INSTALL_DIR} \

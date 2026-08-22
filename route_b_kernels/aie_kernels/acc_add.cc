@@ -21,6 +21,30 @@
 #include <aie_api/aie.hpp>
 #include <stdint.h>
 
+// ACCADD_B_BF16: the partial (b) arrives on a bf16-out GEMM drain while the running accumulator
+// (a/out) stays f32. Widening b is exact, but the bit-identity above does NOT carry over -- the
+// partials are already rounded when they reach the core, so this arm differs from the host K-split
+// by the drain's rounding, not by accumulation order. Exactly one arm compiles per build.
+#ifdef ACCADD_B_BF16
+template <int N>
+void acc_add_row(const float *restrict a, const bfloat16 *restrict b,
+                 float *restrict out, int32_t cols) {
+  event0();
+  for (int i = 0; i < cols; i += N) {
+    ::aie::accum<accfloat, N> ba;
+    ba.from_vector(::aie::load_v<N>(b + i), 0);
+    ::aie::store_v(out + i, ::aie::add(::aie::load_v<N>(a + i),
+                                       ba.template to_vector<float>()));
+  }
+  event1();
+}
+
+extern "C" {
+void acc_add_row(float *a, bfloat16 *b, float *out, int32_t cols) {
+  acc_add_row<16>(a, b, out, cols);
+}
+}
+#else
 template <int N>
 void acc_add_row(const float *restrict a, const float *restrict b,
                  float *restrict out, int32_t cols) {
@@ -38,3 +62,4 @@ void acc_add_row(float *a, float *b, float *out, int32_t cols) {
   acc_add_row<16>(a, b, out, cols);
 }
 }
+#endif  // ACCADD_B_BF16

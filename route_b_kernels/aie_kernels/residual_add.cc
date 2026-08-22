@@ -15,10 +15,41 @@
 #include <aie_api/aie.hpp>
 #include <stdint.h>
 
-// RESADD_BF16 selects the bf16-stream arm: same arithmetic in f32, but a/b/out are bf16 on the
-// wire. Six streaming buffers halve, 24588 B -> 12300 B of the core's 64 KB. Exactly ONE arm
-// compiles per build (not two entry points) so the L1 figure a build reports is its own.
-#ifdef RESADD_BF16
+// Three wire formats, exactly ONE compiled per build (not three entry points) so the L1 figure a
+// build reports is its own.
+//   default        a/b/out f32
+//   RESADD_BF16    a/b/out bf16 -- six streaming buffers halve, 24588 B -> 12300 B of the 64 KB core
+//   RESADD_B_BF16  a/out f32, b bf16
+//
+// B_BF16 is the arm a bf16-out modal GEMM needs: only the sub-layer addend comes off that drain, and
+// the residual stream a/out is read as f32 by every other brick on the seam, so narrowing it too
+// would move the defect rather than fix it. Widening b is exact (bf16 is a truncated f32), so the
+// arithmetic is the f32 arm's with a coarser addend.
+#if defined(RESADD_B_BF16)
+template <int N>
+void residual_add_row(const float *restrict a, const bfloat16 *restrict b,
+                      float *restrict out, float scale, int32_t cols) {
+  event0();
+  const auto saved_rounding =
+      ::aie::swap_rounding(::aie::rounding_mode::conv_even);
+  const ::aie::vector<float, N> sv = ::aie::broadcast<float, N>(scale);
+  for (int i = 0; i < cols; i += N) {
+    ::aie::accum<accfloat, N> ba;
+    ba.from_vector(::aie::load_v<N>(b + i), 0);
+    ::aie::vector<float, N> sb = ::aie::mul(ba.template to_vector<float>(), sv);
+    ::aie::store_v(out + i, ::aie::add(::aie::load_v<N>(a + i), sb));
+  }
+  ::aie::set_rounding(saved_rounding);
+  event1();
+}
+
+extern "C" {
+void residual_add_row(float *a, bfloat16 *b, float *out, float scale,
+                      int32_t cols) {
+  residual_add_row<16>(a, b, out, scale, cols);
+}
+}
+#elif defined(RESADD_BF16)
 template <int N>
 void residual_add_row(const bfloat16 *restrict a, const bfloat16 *restrict b,
                       bfloat16 *restrict out, float scale, int32_t cols) {
@@ -80,4 +111,4 @@ void residual_add_row(float *a, float *b, float *out, float scale, int32_t cols)
   residual_add_row<16>(a, b, out, scale, cols);
 }
 }
-#endif  // RESADD_BF16
+#endif  // wire-format arm
