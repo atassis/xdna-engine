@@ -79,6 +79,10 @@ mode_resadd?=0
 # Bake rtp[0]=4 into THIS instruction stream (0 = off). Insts-only: same xclbin as the
 # mode_resadd=1 GEMM stream, so the pair is one program serving two ops.
 rtp_mode_resadd?=0
+# Bisect arms for the mode-4 hang (1-8), plus arm 9 = ACCADD, which is not a bisect: it carries the
+# encoder's fc2 K-split accumulator, whose `a` operand is f32, through the GEMM's bf16 A fifo by
+# reinterpreting the tile's bytes. Halves the mode's element count (2048 bf16 = 1024 f32) and keeps
+# arm 8's identity detour, which is what makes the add complete.
 mode4_bisect?=0
 # Move the mode-4 branch behind the first A/B objectFIFO acquire instead of reading rtp[0] at the
 # top of the tile (0 = off). rtp[0] carries a MEASURED one-tile visibility lag -- the barrier that
@@ -185,7 +189,7 @@ buffer_aloc_flag=basic-sequential
 
 # matmul object needs the bf16_f32 combo defines (mm.cc names symbols by combo).
 MM_DEFINES=-Dbf16_f32_ONLY -DDIM_M=${m} -DDIM_K=${k} -DDIM_N=${n} -DVECTORIZED_ONLY
-EPI_DEFINES=$(if $(filter 1,${mode4_bisect}), -DMODE4_BISECT_STORE_ONLY,)$(if $(filter 2,${mode4_bisect}), -DMODE4_BISECT_LOAD_A,)$(if $(filter 3,${mode4_bisect}), -DMODE4_BISECT_LOAD_AB,)$(if $(filter 4,${mode4_bisect}), -DMODE4_BISECT_LOAD_AB -DMODE4_BISECT_ADD,)$(if $(filter 5,${mode4_bisect}), -DMODE4_BISECT_LOAD_AB -DMODE4_BISECT_SUB,)$(if $(filter 6,${mode4_bisect}), -DMODE4_BISECT_LOAD_AB -DMODE4_BISECT_ADD_VIAVEC,)$(if $(filter 7,${mode4_bisect}), -DMODE4_BISECT_LOAD_AB -DMODE4_BISECT_ADD -DMODE4_BISECT_NOPIPE,)$(if $(filter 8,${mode4_bisect}), -DMODE4_BISECT_LOAD_AB -DMODE4_BISECT_ADD_IDENTDETOUR,) -DEPI_M=${m} -DEPI_K=${k} -DEPI_N=${n} -DEPI_R=${epi_r} -DEPI_T=${epi_t}$(if $(filter 1,${round_even}), -DMODAL_ROUND_EVEN,)$(if $(filter 1,${drain_round_floor}), -DMODAL_DRAIN_ROUND_FLOOR,)$(if $(filter 1,${silu_f32_tail}), -DSILU_F32_TAIL,)$(if $(filter 1,${silu_f32_tanh}), -DSILU_F32_TANH,)
+EPI_DEFINES=$(if $(filter 1,${mode4_bisect}), -DMODE4_BISECT_STORE_ONLY,)$(if $(filter 2,${mode4_bisect}), -DMODE4_BISECT_LOAD_A,)$(if $(filter 3,${mode4_bisect}), -DMODE4_BISECT_LOAD_AB,)$(if $(filter 4,${mode4_bisect}), -DMODE4_BISECT_LOAD_AB -DMODE4_BISECT_ADD,)$(if $(filter 5,${mode4_bisect}), -DMODE4_BISECT_LOAD_AB -DMODE4_BISECT_SUB,)$(if $(filter 6,${mode4_bisect}), -DMODE4_BISECT_LOAD_AB -DMODE4_BISECT_ADD_VIAVEC,)$(if $(filter 7,${mode4_bisect}), -DMODE4_BISECT_LOAD_AB -DMODE4_BISECT_ADD -DMODE4_BISECT_NOPIPE,)$(if $(filter 8,${mode4_bisect}), -DMODE4_BISECT_LOAD_AB -DMODE4_BISECT_ADD_IDENTDETOUR,)$(if $(filter 9,${mode4_bisect}), -DMODE4_ACCADD,) -DEPI_M=${m} -DEPI_K=${k} -DEPI_N=${n} -DEPI_R=${epi_r} -DEPI_T=${epi_t}$(if $(filter 1,${round_even}), -DMODAL_ROUND_EVEN,)$(if $(filter 1,${drain_round_floor}), -DMODAL_DRAIN_ROUND_FLOOR,)$(if $(filter 1,${silu_f32_tail}), -DSILU_F32_TAIL,)$(if $(filter 1,${silu_f32_tanh}), -DSILU_F32_TANH,)
 ifeq (${b_col_maj}, 1)
 	MM_DEFINES+=-DB_COL_MAJ
 endif

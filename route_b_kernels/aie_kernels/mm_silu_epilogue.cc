@@ -612,14 +612,27 @@ void mm_modal_epilogue_f32_f32(const float *__restrict c_in,
 // decide what actually lands in those 2048 elements.
 static constexpr unsigned EPI_RESADD_ELEMS = EPI_M * EPI_K;
 
+// ACCADD arm. The encoder's `accadd` brick -- the fc2 K-split accumulation, and the highest-ranked
+// context-merge candidate at 320 ms/clip -- is out[t,c] = a[t,c] + b[t,c] where the RUNNING
+// ACCUMULATOR a is f32 and only the partial b is bf16. f32 there is not a taste: order-preserving
+// f32 accumulation is what makes the device K-split bit-identical to the host one (acc_add.cc).
+// So the mode has to carry an operand whose dtype is not the fifo's. It rides the GEMM's bf16 A
+// fifo as raw BYTES -- the same 4096 B, read as 1024 f32 instead of 2048 bf16 -- which halves the
+// element count. b keeps the fifo's own dtype, so exactly one operand is reinterpreted.
+static constexpr unsigned EPI_ACCADD_ELEMS = EPI_RESADD_ELEMS / 2;
+
 void mm_mode_resadd_bf16_f32(const bfloat16 *__restrict a,
                              const bfloat16 *__restrict b,
                              float *__restrict out) {
   event0();
   static_assert(EPI_RESADD_ELEMS % 32 == 0, "resadd tile must be a multiple of 32");
+  static_assert(EPI_ACCADD_ELEMS % 32 == 0, "accadd tile must be a multiple of 32");
   const bfloat16 *__restrict pa = a;
   const bfloat16 *__restrict pb = b;
   float *__restrict pout = out;
+#ifdef MODE4_ACCADD
+  const float *__restrict pa32 = reinterpret_cast<const float *>(pa);
+#endif
 #ifndef MODE4_BISECT_NOPIPE
   // The NOPIPE arm suppresses this to try to break the store/VALU bundle the mode-4 hang tracks.
   // It does not: Peano pipelines anyway and emits a BYTE-IDENTICAL core ELF, so the arm measures
@@ -628,13 +641,27 @@ void mm_mode_resadd_bf16_f32(const bfloat16 *__restrict a,
   AIE_PREPARE_FOR_PIPELINING
 #endif
   AIE_LOOP_MIN_ITERATION_COUNT(2)
+#ifdef MODE4_ACCADD
+  for (unsigned off = 0; off < EPI_ACCADD_ELEMS; off += 32) {
+#else
   for (unsigned off = 0; off < EPI_RESADD_ELEMS; off += 32) {
+#endif
+#ifdef MODE4_ACCADD
+    // Same identity detour as bisect 8, for the same reason: an accumulator-sourced f32 add whose
+    // result reaches memory without passing through the vector file hangs this core
+    // (2026-08-21-the-opcode-is-innocent-the-store-path-is-the-discriminator). max(s, s-1) == s for
+    // every finite s. Verify it survives on the disassembly, not on the source.
+    aie::accum<accfloat, 32> ba;
+    ba.from_vector(aie::load_v<32>(pb), 0);
+    const aie::vector<float, 32> s =
+        aie::add(aie::load_v<32>(pa32), ba.to_vector<float>());
+    aie::store_v(pout, aie::max(s, aie::sub(s, aie::broadcast<float, 32>(1.0f))));
+#elif defined(MODE4_BISECT_STORE_ONLY)
+    aie::store_v(pout, aie::broadcast<float, 32>(3.0f));
+#elif defined(MODE4_BISECT_LOAD_AB)
     // Widen both operands to f32 and add there. bf16 -> f32 is exact (bf16 is a truncated
     // f32), so the widening costs nothing numerically -- the same discipline residual_add.cc
     // uses on its bf16 arm, and it is why this matches a host f32 add bit-for-bit.
-#ifdef MODE4_BISECT_STORE_ONLY
-    aie::store_v(pout, aie::broadcast<float, 32>(3.0f));
-#elif defined(MODE4_BISECT_LOAD_AB)
     // both operands loaded and widened, but only A is stored -- isolates the second LOAD from
     // the ADD. A dead widened B would be folded away, so it is kept live by a select the
     // compiler cannot resolve (off is a runtime value here only in the trivial sense, but the
@@ -679,7 +706,11 @@ void mm_mode_resadd_bf16_f32(const bfloat16 *__restrict a,
     ba.from_vector(aie::load_v<32>(pb), 0);
     aie::store_v(pout, aie::add(aa.to_vector<float>(), ba.to_vector<float>()));
 #endif
+#ifdef MODE4_ACCADD
+    pa32 += 32;
+#else
     pa += 32;
+#endif
     pb += 32;
     pout += 32;
   }
