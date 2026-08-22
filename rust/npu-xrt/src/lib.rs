@@ -546,7 +546,7 @@ fn cache_id(xclbin_path: &str) -> String {
 pub struct Device {
     ptr: *mut CDevice,
     kernels: RefCell<HashMap<String, Rc<Kernel>>>,
-    /// How many hw_contexts each xclbin STEM has been loaded into. The cache key is the path, but
+    /// Which PATHS each xclbin STEM has been loaded from. The cache key is the path, but
     /// [`dispatch_log`] identifies a context by the stem -- so two copies of one xclbin at two
     /// paths (a build dir and an artifacts dir, byte-identical) are two contexts wearing one name,
     /// and every transition between them is logged as a same-xclbin instruction restream. That is
@@ -554,7 +554,9 @@ pub struct Device {
     /// while creating exactly as many contexts as the arm it was folding (12/16 in both), and it
     /// cost seven refuted axes hunting a restream price that was a program transition all along.
     /// Second and later contexts for a stem get a `~ctx{n}` suffix so the report cannot conflate.
-    stems: RefCell<HashMap<String, usize>>,
+    /// The paths are kept (not just a count) so the second load can say WHICH other path it split
+    /// from and whether the bytes there are the same -- a warning nobody had when it first happened.
+    stems: RefCell<HashMap<String, Vec<String>>>,
 }
 
 /// An xclbin loaded into a hw_context with its kernel resolved.
@@ -687,9 +689,30 @@ impl Device {
             .to_string();
         let nth = {
             let mut st = self.stems.borrow_mut();
-            let c = st.entry(stem.clone()).or_insert(0);
-            *c += 1;
-            *c
+            let seen = st.entry(stem.clone()).or_default();
+            seen.push(xclbin_path.to_string());
+            if seen.len() > 1 {
+                // A second context for one stem is either a real second program that happens to
+                // share a filename, or the same bytes loaded twice from two directories -- and the
+                // second costs a full ~1.5 ms program transition per crossing while LOOKING like a
+                // same-xclbin restream in the log. Distinguish them here, once, at the only place
+                // that can: identical bytes mean the split was avoidable at the call site.
+                let first = &seen[0];
+                let identical = match (std::fs::read(first), std::fs::read(xclbin_path)) {
+                    (Ok(a), Ok(b)) => a == b,
+                    _ => false,
+                };
+                eprintln!(
+                    "[npu-xrt] WARNING: xclbin stem `{stem}` is now in {} hw_contexts ({}): {} and {}{}",
+                    seen.len(),
+                    if identical { "BYTE-IDENTICAL -- avoidable, resolve one path or set NPU_XCLBIN_CACHE_BY_CONTENT=1" }
+                    else { "different content sharing a stem" },
+                    first,
+                    xclbin_path,
+                    if identical { " -- every transition between them logs as a same-xclbin restream" } else { "" },
+                );
+            }
+            seen.len()
         };
         let label = if nth == 1 { stem } else { format!("{stem}~ctx{nth}") };
         let k = Rc::new(Kernel { ptr, label });

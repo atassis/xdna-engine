@@ -708,9 +708,17 @@ impl NpuMatmul {
         // fall back to a smaller surviving build (the N=4096/2048 twins were deleted by the
         // an earlier occupancy run; N=1024 survives). Env NPU_RESIDENT_XCLBIN overrides.
         let (xclbin, modal) = if fold_fc1() {
-            // The resident IS fc1's bf16-out xclbin. Same path as `Fc1PanelBf16` resolves, so
-            // load_kernel's path cache hands both the same Kernel and the fc1<->fc2 transition
-            // disappears without touching a dispatch site.
+            // The resident IS fc1's bf16-out xclbin, so the fc1<->fc2 transition disappears with
+            // no dispatch site touched -- PROVIDED both loads land on one hw_context.
+            // They do not, by default. This resolves the stem under `base` (the whole_array build
+            // dir) while `Fc1PanelBf16` resolves the byte-identical copy under `ln_dir`
+            // (artifacts/parakeet/ln), and `load_kernel` keys its cache on the PATH -- so the fold
+            // has been SPLITTING the two into separate contexts, not merging them. The comment here
+            // used to assert they were the same path; that unchecked claim is what let the fold
+            // report 48 deleted transitions per clip while creating exactly as many contexts as the
+            // arm it folded, and cost seven refuted axes pricing a program transition that
+            // `dispatch_log` had labelled a same-xclbin restream. Set NPU_XCLBIN_CACHE_BY_CONTENT=1
+            // to actually merge them (measured -114.8 ms/clip here); npu-xrt warns when it happens.
             let stem = format!("{PAD_M}x{KRES}x{DFF}_{FC1_PANEL_BF16_TILE}_8c_modalsilubf16outpanel{KRES}");
             (resolve_verified(&base, &stem).xclbin, true)
         } else if let Ok(p) = std::env::var("NPU_RESIDENT_XCLBIN") {
