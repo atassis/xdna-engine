@@ -274,6 +274,11 @@ pub struct NpuMatmul {
     // mode-3 stream and returns pw1's raw [a|g] -- a wrong answer, not a failure -- so this is
     // measured on device rather than claimed (see `glu_epi()`). `None` until that check runs.
     glu_epi: RefCell<Option<bool>>,
+    // Bytes per element of whatever this resident drains into a C buffer -- 4 (f32) or 2 (bf16).
+    // `split_acc` bakes the C objectFIFO's element type into the array program, so it is a property
+    // of the loaded resident, not of a stream: `fold_fc1` swaps the resident for fc1's bf16-out
+    // build and EVERY modal GEMM's C halves with it. `None` until `c_elem_bytes()` settles it.
+    c_elem: RefCell<Option<usize>>,
     // (K, N, activation, a_panel) -> stream. `a_panel` is part of the KEY, not just the filename:
     // at k!=KRES the same (k,n,act) has both a panel-major and a row-major stream, and letting them
     // collide would hand one consumer the other's A tap and be silently wrong.
@@ -807,6 +812,7 @@ impl NpuMatmul {
             modal,
             krtp,
             glu_epi: RefCell::new(None),
+            c_elem: RefCell::new(None),
             streams: RefCell::new(HashMap::new()),
             fc2_out: RefCell::new(None),
             bo_a4: RefCell::new(None),
@@ -1854,7 +1860,93 @@ impl NpuMatmul {
         Rc::new(bo)
     }
 
+    /// Bytes per element of whatever the resident drains into a C buffer: 4 (f32) or 2 (bf16).
+    ///
+    /// Every host readback and every device consumer of a modal C is written against f32, so a
+    /// resident that drains bf16 is silently wrong output rather than a failure. `PARAKEET_FOLD_FC1`
+    /// makes fc1's bf16-out build the resident, which halves the drain of every modal GEMM on it --
+    /// not just fc1's.
+    ///
+    /// The shipped default picks an f32-out resident in `open()`, so the branch that chose the
+    /// xclbin is the authority and no probe is spent. The two branches that can land a bf16-out
+    /// program here -- the fold and an arbitrary `NPU_RESIDENT_XCLBIN` -- are both opt-in, and there
+    /// the answer is MEASURED. Not read off a `bf16out` substring, for the reason `glu_epi` is not:
+    /// the last time a filename stood in for a property of the compiled program it was a stream's
+    /// mode tag, and it disagreed.
+    pub fn c_elem_bytes(&self) -> usize {
+        if let Some(v) = *self.c_elem.borrow() {
+            return v;
+        }
+        let v = if fold_fc1() || std::env::var_os("NPU_RESIDENT_XCLBIN").is_some() {
+            self.probe_c_elem_bytes()
+        } else {
+            4
+        };
+        *self.c_elem.borrow_mut() = Some(v);
+        v
+    }
+
+    /// Ask the device how wide its C drain is, with a probe that needs no knowledge of the C tile
+    /// layout: A and W are all-ones bf16 at k=KRES, so EVERY element of C is exactly 1024.0 whatever
+    /// permutation the drain tap applies, and element 0 is at offset 0 either way. 1024.0 reads back
+    /// at offset 0 as f32 iff the drain is f32 (a bf16 pair there reads 1026.14) and as bf16 iff it
+    /// is bf16 (an f32 1024.0's low half reads 0.0), so the two answers are checked against each
+    /// other and a third aborts rather than being silently rounded to one of them.
+    ///
+    /// Own A/W/C buffers: this can run lazily between real dispatches, and the stream's `bo_c` and
+    /// `self.bo_a` are live at that point. One dispatch, once per process, opt-in paths only.
+    fn probe_c_elem_bytes(&self) -> usize {
+        let n = KRES;
+        let st = self.stream(n, Act::Identity);
+        let g = |i| self.kern.group_id(i).unwrap();
+        let ones = vec![npu_xrt::f32_to_bf16_bits(1.0); PAD_M * KRES];
+        let a = self.dev.alloc_bo(&self.kern, PAD_M * KRES * 2, FLAG_HOST_ONLY, g(3)).unwrap();
+        a.write_bytes(u16_bytes(&ones)).unwrap();
+        a.sync_to_device().unwrap();
+        let w = self.dev.alloc_bo(&self.kern, KRES * n * 2, FLAG_HOST_ONLY, g(4)).unwrap();
+        w.write_bytes(u16_bytes(&vec![npu_xrt::f32_to_bf16_bits(1.0); KRES * n])).unwrap();
+        w.sync_to_device().unwrap();
+        let c = self.dev.alloc_bo(&self.kern, PAD_M * n * 4, FLAG_HOST_ONLY, g(5)).unwrap();
+        self.kern
+            .run_matmul8(3, &st.instr, st.n_instr, &a, &w, &c, &self.bo_tmp, &self.bo_tr)
+            .unwrap();
+        self.stats.borrow_mut().dispatches += 1; // the probe's own device work, not encoder work
+        c.sync_from_device().unwrap();
+        let mut b = [0u8; 4];
+        c.read_bytes(&mut b).unwrap();
+        let as_f32 = f32::from_le_bytes(b);
+        let as_bf16 = npu_xrt::bf16_bits_to_f32(u16::from_le_bytes([b[0], b[1]]));
+        let k = KRES as f32;
+        let elem = match (as_f32 == k, as_bf16 == k) {
+            (true, false) => 4,
+            (false, true) => 2,
+            _ => panic!(
+                "C drain probe: A=W=1 at k={KRES} must give C=={k}, but offset 0 reads {as_f32} as \
+                 f32 and {as_bf16} as bf16 -- the resident is neither an f32-out nor a bf16-out \
+                 build of this GEMM, so no readback width is safe"
+            ),
+        };
+        if !npu_xrt::quiet() {
+            eprintln!("[npu] resident C drain = {elem} bytes/element (measured)");
+        }
+        elem
+    }
+
+    /// Read the first `count` elements of a modal C drain, at the drain's OWN element width.
+    /// Pair with [`c_at`] to decode; sizing the host buffer `count * 4` against a bf16 drain reads
+    /// twice the elements asked for and indexes the wrong ones.
+    fn read_c_bytes(&self, bo: &Bo, count: usize) -> Vec<u8> {
+        let mut cb = vec![0u8; count * self.c_elem_bytes()];
+        bo.read_bytes(&mut cb).unwrap();
+        cb
+    }
+
     /// Read a device f32 [PAD_M,KRES] BO back to a host [m, KRES] array (the block/encoder boundary).
+    ///
+    /// f32 and NOT [`Self::c_elem_bytes`]-aware, deliberately: a resident STREAM is what the resadd
+    /// and acc_add bricks drain, and both are f32-only builds whatever the modal resident does. The
+    /// buffer that follows the resident's drain width is a modal `bo_c`, which is a different thing
+    /// this must not be pointed at.
     pub fn readback_stream(&self, bo: &Bo, m: usize) -> Array2<f32> {
         assert!(m <= PAD_M, "readback_stream: m={m} exceeds PAD_M={PAD_M}");
         bo.sync_from_device().unwrap();
@@ -1908,16 +2000,15 @@ impl NpuMatmul {
         let t_sync = Instant::now();
         st.bo_c.sync_from_device().unwrap();
         let sync_s = t_sync.elapsed().as_secs_f64();
-        let mut cb = vec![0u8; m * n * 4];
+        let w = self.c_elem_bytes();
         let t_read = Instant::now();
-        st.bo_c.read_bytes(&mut cb).unwrap();
+        let cb = self.read_c_bytes(&st.bo_c, m * n);
         let read_s = t_read.elapsed().as_secs_f64();
         let t_dec = Instant::now();
         let mut out = Array2::<f32>::zeros((m, n));
         for r in 0..m {
             for c in 0..n {
-                let off = (r * n + c) * 4;
-                out[[r, c]] = f32::from_le_bytes([cb[off], cb[off + 1], cb[off + 2], cb[off + 3]]);
+                out[[r, c]] = c_at(&cb, w, r * n + c);
             }
         }
         {
@@ -2000,13 +2091,12 @@ impl NpuMatmul {
         let half = tile_n / 2;
         let n2 = 2 * d;
         bo.sync_from_device().unwrap();
-        let mut cb = vec![0u8; m * n2 * 4]; // first m rows are contiguous, as in the two-dispatch read
-        bo.read_bytes(&mut cb).unwrap();
+        let w = self.c_elem_bytes();
+        let cb = self.read_c_bytes(bo, m * n2); // first m rows are contiguous, as in the two-dispatch read
         let mut out = Array2::<f32>::zeros((m, d));
         for r in 0..m {
             for c in 0..d {
-                let off = (r * n2 + (c / half) * tile_n + (c % half)) * 4;
-                out[[r, c]] = f32::from_le_bytes([cb[off], cb[off + 1], cb[off + 2], cb[off + 3]]);
+                out[[r, c]] = c_at(&cb, w, r * n2 + (c / half) * tile_n + (c % half));
             }
         }
         out
@@ -2266,13 +2356,12 @@ impl NpuMatmul {
         }
         self.stats.borrow_mut().dispatches += 1;
         st.bo_c.sync_from_device().unwrap();
-        let mut cb = vec![0u8; m * KRES * 4];
-        st.bo_c.read_bytes(&mut cb).unwrap();
+        let w = self.c_elem_bytes();
+        let cb = self.read_c_bytes(&st.bo_c, m * KRES);
         let mut out = Array2::<f32>::zeros((m, KRES));
         for r in 0..m {
             for c in 0..KRES {
-                let off = (r * KRES + c) * 4;
-                out[[r, c]] = f32::from_le_bytes([cb[off], cb[off + 1], cb[off + 2], cb[off + 3]]);
+                out[[r, c]] = c_at(&cb, w, r * KRES + c);
             }
         }
         Some(out)
@@ -3383,15 +3472,12 @@ impl NpuMatmul {
             let _m2 = crate::prof::phase::PhaseScope::new(stage, crate::prof::phase::Bucket::Marshal);
             st.bo_c.sync_from_device().unwrap();
             // read only the first m rows (row-major); rows m..PAD_M are padding-row garbage
-            let mut c_bytes = vec![0u8; m * n * 4];
-            st.bo_c.read_bytes(&mut c_bytes).unwrap();
+            let w = self.c_elem_bytes();
+            let c_bytes = self.read_c_bytes(&st.bo_c, m * n);
             let mut out = Array2::<f32>::zeros((m, n));
             for r in 0..m {
                 for c in 0..n {
-                    let off = (r * n + c) * 4;
-                    out[[r, c]] = f32::from_le_bytes([
-                        c_bytes[off], c_bytes[off + 1], c_bytes[off + 2], c_bytes[off + 3],
-                    ]);
+                    out[[r, c]] = c_at(&c_bytes, w, r * n + c);
                 }
             }
             out
@@ -3534,13 +3620,12 @@ impl NpuMatmul {
         let read_part = |slot: &PipeSlot| -> Array2<f32> {
             let _m = crate::prof::phase::PhaseScope::new(stage, crate::prof::phase::Bucket::Marshal);
             slot.bo_c.sync_from_device().unwrap();
-            let mut cb = vec![0u8; m * n * 4];
-            slot.bo_c.read_bytes(&mut cb).unwrap();
+            let w = self.c_elem_bytes();
+            let cb = self.read_c_bytes(&slot.bo_c, m * n);
             let mut out = Array2::<f32>::zeros((m, n));
             for r in 0..m {
                 for c in 0..n {
-                    let off = (r * n + c) * 4;
-                    out[[r, c]] = f32::from_le_bytes([cb[off], cb[off + 1], cb[off + 2], cb[off + 3]]);
+                    out[[r, c]] = c_at(&cb, w, r * n + c);
                 }
             }
             out
@@ -3580,6 +3665,17 @@ impl NpuMatmul {
         acc += &read_part(&self.slots[prev_slot]);
         self.stats.borrow_mut().dispatch_s += t0.elapsed().as_secs_f64();
         acc
+    }
+}
+
+/// Decode element `i` of a C drain read by `read_c_bytes`, at element width `w` (4 = f32, 2 = bf16).
+/// `w` is passed rather than re-read per element: the width lives behind a `RefCell` and these loops
+/// run over up to PAD_M*DFF elements.
+fn c_at(cb: &[u8], w: usize, i: usize) -> f32 {
+    if w == 4 {
+        f32::from_le_bytes([cb[i * 4], cb[i * 4 + 1], cb[i * 4 + 2], cb[i * 4 + 3]])
+    } else {
+        npu_xrt::bf16_bits_to_f32(u16::from_le_bytes([cb[i * 2], cb[i * 2 + 1]]))
     }
 }
 
