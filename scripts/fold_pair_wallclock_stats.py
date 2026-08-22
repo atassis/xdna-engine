@@ -85,21 +85,39 @@ for arm in ARMS:
     lo, hi = ci(encs)
     print(f"{LABEL[arm]:<28} {str(ctxs):>7}  {statistics.mean(encs):>10.4f}   [{lo:.4f}, {hi:.4f}]")
 
+def paired(arm, base, label):
+    pc = []
+    for r in complete:
+        a, b = reps[r][arm]["clips"], reps[r][base]["clips"]
+        for name in sorted(set(a) & set(b)):
+            pc.append((a[name] - b[name]) * 1e3)
+    if len(pc) < 2:
+        return
+    rm = [(reps[r][arm]["enc"] - reps[r][base]["enc"]) * 1e3 for r in complete]
+    lo, hi = ci(pc)
+    neg = sum(1 for x in pc if x < 0)
+    print(f"{label:<28} {len(pc):>10}   {statistics.mean(pc):>9.1f}   "
+          f"[{lo:>8.1f}, {hi:>8.1f}]  {neg:>3}/{len(pc):<3}  {statistics.mean(rm):>8.1f}")
+
+
+HDR = "arm                            per-clip pairs   mean      95% CI                neg    rep-mean"
 for base in ("b0", "b1"):
     print(f"\npaired vs {LABEL[base]} -- ms/clip, negative = faster")
-    print("arm                            per-clip pairs   mean      95% CI                neg    rep-mean")
+    print(HDR)
     for arm in ARMS:
-        if arm == base:
-            continue
-        pc = []
-        for r in complete:
-            a, b = reps[r][arm]["clips"], reps[r][base]["clips"]
-            for name in sorted(set(a) & set(b)):
-                pc.append((a[name] - b[name]) * 1e3)
-        rm = [(reps[r][arm]["enc"] - reps[r][base]["enc"]) * 1e3 for r in complete]
-        if len(pc) < 2:
-            continue
-        lo, hi = ci(pc)
-        neg = sum(1 for x in pc if x < 0)
-        print(f"{LABEL[arm]:<28} {len(pc):>10}   {statistics.mean(pc):>9.1f}   "
-              f"[{lo:>8.1f}, {hi:>8.1f}]  {neg:>3}/{len(pc):<3}  {statistics.mean(rm):>8.1f}")
+        if arm != base:
+            paired(arm, base, LABEL[arm])
+
+# One factor at a time. Against a default base both factors move together, which is what confounded
+# the fold with the context cache in the first place; each row here holds the other factor fixed.
+print("\nsingle-factor contrasts -- ms/clip, negative = faster")
+print(HDR)
+for arm, base, label in (
+    ("b1", "b0", "cache, on default"),
+    ("f1", "f0", "cache, on FOLD_FC1"),
+    ("p1", "p0", "cache, on the pair"),
+    ("p0", "f0", "GLU fold, uncached"),
+    ("p1", "f1", "GLU fold, cached"),
+    ("f0", "b0", "FOLD_FC1, uncached"),
+):
+    paired(arm, base, label)
