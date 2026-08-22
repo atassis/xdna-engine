@@ -2024,10 +2024,14 @@ impl NpuMatmul {
     /// So ask the device, with a differential that needs neither the expected values nor the C tile
     /// layout: dispatch one (A, W) at `rtp[0]=3` and at `rtp[0]=0`. Absent the branch, mode 3 IS the
     /// identity arm and the two outputs are bit-identical by construction; present, the value half
-    /// holds `a*sigmoid(g)` against raw `a`. The identity dispatch is repeated as a control, because
-    /// mode 3 leaves the gate half undefined and only a control can show the drain is reproducible
-    /// enough for a difference to mean the mode. Three dispatches, once per process, and only under
-    /// `PARAKEET_FOLD_GLU=1`.
+    /// holds `a*sigmoid(g)` against raw `a`.
+    ///
+    /// Both dispatches drain into ONE buffer, and the identity dispatch repeats as a control. Each
+    /// guards a distinct way the difference could come from something other than the mode: a stream's
+    /// own `bo_c` is sized `PAD_M*n*4` while a bf16 drain writes half of it, so comparing two streams'
+    /// buffers compares their uninitialised tails and reports a difference for every resident; and
+    /// mode 3 leaves the gate half undefined, so only re-running identity shows the drain is
+    /// reproducible at all. Three dispatches, once per process, under `PARAKEET_FOLD_GLU=1` only.
     fn glu_epi(&self, a_bf16: &Bo, wbo: &Bo) -> bool {
         if let Some(v) = *self.glu_epi.borrow() {
             return v;
@@ -2035,13 +2039,14 @@ impl NpuMatmul {
         let n2 = 2 * KRES;
         let glu = self.stream(n2, Act::Glu);
         let idt = self.stream(n2, Act::Identity);
+        let out = &glu.bo_c;
         let dispatch_read = |st: &NStream| {
             self.kern
-                .run_matmul8(3, &st.instr, st.n_instr, a_bf16, wbo, &st.bo_c, &self.bo_tmp, &self.bo_tr)
+                .run_matmul8(3, &st.instr, st.n_instr, a_bf16, wbo, out, &self.bo_tmp, &self.bo_tr)
                 .unwrap();
-            st.bo_c.sync_from_device().unwrap();
-            let mut b = vec![0u8; st.bo_c.nbytes()];
-            st.bo_c.read_bytes(&mut b).unwrap();
+            out.sync_from_device().unwrap();
+            let mut b = vec![0u8; out.nbytes()];
+            out.read_bytes(&mut b).unwrap();
             b
         };
         let control = dispatch_read(&idt);
