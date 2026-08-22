@@ -74,21 +74,25 @@ def find(rep, frag):
 
 
 def model_merge(rep, a, b, tax, floor):
-    """Contexts of `a` and `b` become one: every a<->b boundary stops being a transition."""
+    """Contexts of `a` and `b` become one: every a<->b boundary stops being a transition.
+
+    Returns rows tagged `measured` or `bounded`, and the two must be read differently. The saving
+    lands on the dispatch that FOLLOWS the deleted boundary, so where that dispatch's stream has an
+    observed tax the row is MEASURED. Where it does not, the row falls back to
+    (mean after-switch - in-context floor), which is only an upper BOUND -- it charges the whole
+    dispatch minus the floor to reconfiguration, which is near enough for a small brick whose cost is
+    mostly reconfiguration and badly wrong for a kernel that does real work. `final~ctx3` is the
+    worked example: the bound hands it 7.593 of its 7.912 ms, which no one should believe.
+    """
     killed = [(x, y, n) for x, y, n in rep["trans"] if {x, y} == {a, b}]
-    saved, rows = 0.0, []
+    rows = []
     for x, y, n in killed:
-        # The saving lands on the dispatch that FOLLOWS the deleted boundary -- it is the one that
-        # no longer pays reconfiguration. Use that kernel's own tax where it is observable, else the
-        # (mean after-switch - floor) bound, which cannot exceed the dispatch's whole cost.
-        mean_y = rep["per_kernel"][y][2]
-        t = tax if y in tax else max(0.0, mean_y - floor)
         if y in tax:
-            t = tax[y]
-        s = n * t
-        rows.append((f"{x[-34:]} -> {y[-34:]}", n, t, s))
-        saved += s
-    return killed, saved, rows
+            t, kind = tax[y], "measured"
+        else:
+            t, kind = max(0.0, rep["per_kernel"][y][2] - floor), "bounded"
+        rows.append((f"{x[-34:]} -> {y[-34:]}", n, t, n * t, kind))
+    return killed, sum(r[3] for r in rows), rows
 
 
 def main():
@@ -158,10 +162,16 @@ def main():
         print(f"\nMERGE {a[-40:]}\n   +  {b[-40:]}")
         print(f"  boundaries deleted: {n_killed}  ({rep['transitions']} -> "
               f"{rep['transitions'] - n_killed} transitions)")
-        for name, n, t, s in rows:
-            print(f"    x{n:<4} @ {t:.3f} ms = {s:7.1f} ms   {name}")
+        for name, n, t, s, kind in rows:
+            print(f"    x{n:<4} @ {t:.3f} ms = {s:7.1f} ms  [{kind:<8}] {name}")
+        meas = sum(r[3] for r in rows if r[4] == "measured")
+        bound = saved - meas
         print(f"  PROJECTED saving {saved:.1f} ms/clip  "
               f"({saved / max(n_killed,1):.3f} ms per boundary)")
+        print(f"    of which MEASURED tax {meas:.1f} ms  |  upper-BOUND only {bound:.1f} ms")
+        print(f"    rank folds on the MEASURED column; the bounded one is an upper limit, and it is "
+              f"vacuous\n    for any kernel whose dispatch does real work rather than mostly "
+              f"reconfiguring.")
         print(f"  fleet-average comparison: {n_killed} x 1.543 = {n_killed * 1.543:.1f} ms "
               f"-- the rate this model exists to replace")
         print("\n  NOTE: this is a PROJECTION. It is calibrated to ~1% on FOLD_FC1 and FOLD_GLU "
