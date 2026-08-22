@@ -607,10 +607,15 @@ const FC1_PANEL_BF16_TILE: &str = "32x32x128";
 /// exactly 11596 B, verified by build). Measured tile penalty: 1.13x at N=1024, 1.27x at N=4096.
 /// Projected net ~-67 ms/clip.
 ///
-/// **TIMING-ONLY as it stands.** The host readback still decodes C as f32 while the folded xclbin
-/// writes bf16, so encoder OUTPUT IS WRONG under this flag -- it exists to measure the dispatch
-/// sequence, the transition count and the wall clock end-to-end. Shipping it additionally needs the
-/// readback converted in both crates that dispatch modal GEMMs (here and `npu_asr::ctx2`). The
+/// **TIMING-ONLY as it stands** -- encoder OUTPUT IS WRONG under this flag, which exists to measure
+/// the dispatch sequence, the transition count and the wall clock end-to-end. Two defects, and only
+/// the first is host-side. (1) Every host readback decodes C as f32 while the folded xclbin writes
+/// bf16, in both crates that dispatch modal GEMMs (here and `npu_asr::ctx2`). (2) The conv module's
+/// GLU breaks ON DEVICE, where no host change reaches it: pw1 dispatches through this resident, so
+/// `glu.cc` is handed a bf16 buffer through its `const float *` input. `PARAKEET_FOLD_GLU=1` is not
+/// the escape -- `glu_epi` keys on `modalglu` in the resident filename, which this branch overrides,
+/// and `mm_modal_epilogue_f32_bf16` implements rtp[0] 0/1/2 only, so mode 3 would fall through to
+/// identity and return pw1's raw `[a|g]`. Shipping needs GLU as a bf16-out epilogue mode first. The
 /// accuracy side is already priced separately: zero WER cost on 200 clips.
 fn fold_fc1() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
