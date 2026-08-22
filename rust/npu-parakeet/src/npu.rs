@@ -269,11 +269,11 @@ pub struct NpuMatmul {
     // and a separate knob could be set to disagree with it. (PARAKEET_MODAL_EPI_SUFFIX cannot serve
     // here -- it is also appended to fc1's panel stem, which knocks fc1 onto its fallback path.)
     krtp: bool,
-    // Resident's epilogue was compiled with the GLU branch (`rtp[0]==3`). Derived from the xclbin
-    // name for the same reason as `krtp`. This one has teeth: a modalglu STREAM dispatched on a
-    // resident built before that branch existed takes the `else` arm and returns pw1's raw [a|g]
-    // -- a wrong answer, not a failure. The shipped `modalsilu` resident is such a build.
-    glu_epi: bool,
+    // Whether the resident's epilogue carries the GLU branch (`rtp[0]==3`), established by
+    // `glu_epi()` on first use and cached here. A resident without it takes the `else` arm for a
+    // mode-3 stream and returns pw1's raw [a|g] -- a wrong answer, not a failure -- so this is
+    // measured on device rather than claimed (see `glu_epi()`). `None` until that check runs.
+    glu_epi: RefCell<Option<bool>>,
     // (K, N, activation, a_panel) -> stream. `a_panel` is part of the KEY, not just the filename:
     // at k!=KRES the same (k,n,act) has both a panel-major and a row-major stream, and letting them
     // collide would hand one consumer the other's A tap and be silently wrong.
@@ -612,11 +612,11 @@ const FC1_PANEL_BF16_TILE: &str = "32x32x128";
 /// the first is host-side. (1) Every host readback decodes C as f32 while the folded xclbin writes
 /// bf16, in both crates that dispatch modal GEMMs (here and `npu_asr::ctx2`). (2) The conv module's
 /// GLU breaks ON DEVICE, where no host change reaches it: pw1 dispatches through this resident, so
-/// `glu.cc` is handed a bf16 buffer through its `const float *` input. `PARAKEET_FOLD_GLU=1` is not
-/// the escape -- `glu_epi` keys on `modalglu` in the resident filename, which this branch overrides,
-/// and `mm_modal_epilogue_f32_bf16` implements rtp[0] 0/1/2 only, so mode 3 would fall through to
-/// identity and return pw1's raw `[a|g]`. Shipping needs GLU as a bf16-out epilogue mode first. The
-/// accuracy side is already priced separately: zero WER cost on 200 clips.
+/// `glu.cc` is handed a bf16 buffer through its `const float *` input. The escape is
+/// `PARAKEET_FOLD_GLU=1`, which deletes that consumer by gating inside pw1's own epilogue
+/// (`rtp[0]==3`, implemented by the bf16-out modal epilogue) -- so shipping needs a resident built
+/// with BOTH that epilogue and this branch's bf16-out panel drain. The accuracy side is already
+/// priced separately: zero WER cost on 200 clips.
 fn fold_fc1() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("PARAKEET_FOLD_FC1").map(|v| v != "0").unwrap_or(false))
@@ -627,11 +627,11 @@ fn fold_fc1() -> bool {
 /// on the 24-block encoder. It also deletes a narrowing: the epilogue still holds pw1's f32
 /// accumulator, so it never rounds to bf16 to hand GLU its input the way `glu.cc` had to.
 ///
-/// Opt-in, and it carries a pairing requirement rather than just a flag. The mode is selected by the
-/// instruction stream, but the BRANCH lives in the resident's compiled epilogue, so it must be paired
-/// with `NPU_RESIDENT_XCLBIN=<...modalglu...>`. On a resident built before that branch existed --
-/// which the shipped `modalsilu` one is -- `rtp[0]=3` falls through to identity and returns pw1's raw
-/// `[a|g]`: a wrong answer, not a failed run. `conv_pw1_glu_folded` asserts the pairing.
+/// Opt-in, and it constrains the ARTIFACT, not just the flag. The mode is selected by the instruction
+/// stream while the BRANCH lives in the resident's compiled epilogue, so a resident whose epilogue
+/// omits it takes the identity arm for `rtp[0]=3` and returns pw1's raw `[a|g]` -- a wrong answer,
+/// not a failed run. `conv_pw1_glu_folded` measures the loaded resident (`glu_epi`) before its first
+/// gated dispatch and aborts when the branch is absent.
 fn fold_glu() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("PARAKEET_FOLD_GLU").map(|v| v != "0").unwrap_or(false))
@@ -776,9 +776,8 @@ impl NpuMatmul {
             (path, modal)
         };
         let krtp = xclbin.file_name().and_then(|s| s.to_str()).is_some_and(|s| s.contains("krtp"));
-        let glu_epi = xclbin.file_name().and_then(|s| s.to_str()).is_some_and(|s| s.contains("modalglu"));
         if !npu_xrt::quiet() {
-            eprintln!("[npu] resident xclbin = {} (modal={modal} krtp={krtp} glu_epi={glu_epi})", xclbin.display());
+            eprintln!("[npu] resident xclbin = {} (modal={modal} krtp={krtp})", xclbin.display());
         }
         let kern = dev
             .load_kernel(xclbin.to_str().unwrap(), None)
@@ -807,7 +806,7 @@ impl NpuMatmul {
             slots,
             modal,
             krtp,
-            glu_epi,
+            glu_epi: RefCell::new(None),
             streams: RefCell::new(HashMap::new()),
             fc2_out: RefCell::new(None),
             bo_a4: RefCell::new(None),
@@ -2013,17 +2012,59 @@ impl NpuMatmul {
         out
     }
 
+    /// Whether this resident's epilogue implements GLU as `rtp[0]==3`, measured on device.
+    ///
+    /// The mode is selected by the instruction stream but IMPLEMENTED in the resident's compiled
+    /// epilogue, and an xclbin container carries no signal for which branches went into it (see the
+    /// `kernel_registry` module docs). Its name cannot answer it either: `modalglu` is the mode tag
+    /// of an instruction STREAM, so it states which mode a stream selects, never which modes the
+    /// array program implements -- `modalsilubf16outpanel1024` carries the branch without carrying
+    /// the substring.
+    ///
+    /// So ask the device, with a differential that needs neither the expected values nor the C tile
+    /// layout: dispatch one (A, W) at `rtp[0]=3` and at `rtp[0]=0`. Absent the branch, mode 3 IS the
+    /// identity arm and the two outputs are bit-identical by construction; present, the value half
+    /// holds `a*sigmoid(g)` against raw `a`. The identity dispatch is repeated as a control, because
+    /// mode 3 leaves the gate half undefined and only a control can show the drain is reproducible
+    /// enough for a difference to mean the mode. Three dispatches, once per process, and only under
+    /// `PARAKEET_FOLD_GLU=1`.
+    fn glu_epi(&self, a_bf16: &Bo, wbo: &Bo) -> bool {
+        if let Some(v) = *self.glu_epi.borrow() {
+            return v;
+        }
+        let n2 = 2 * KRES;
+        let glu = self.stream(n2, Act::Glu);
+        let idt = self.stream(n2, Act::Identity);
+        let dispatch_read = |st: &NStream| {
+            self.kern
+                .run_matmul8(3, &st.instr, st.n_instr, a_bf16, wbo, &st.bo_c, &self.bo_tmp, &self.bo_tr)
+                .unwrap();
+            st.bo_c.sync_from_device().unwrap();
+            let mut b = vec![0u8; st.bo_c.nbytes()];
+            st.bo_c.read_bytes(&mut b).unwrap();
+            b
+        };
+        let control = dispatch_read(&idt);
+        let gated = dispatch_read(&glu);
+        assert!(
+            control == dispatch_read(&idt),
+            "the identity epilogue did not reproduce across two dispatches of one (A, W), so a \
+             mode-3 difference cannot be attributed to the mode"
+        );
+        let present = gated != control;
+        if !npu_xrt::quiet() {
+            eprintln!("[npu] resident GLU epilogue rtp[0]==3 present = {present} (measured)");
+        }
+        self.stats.borrow_mut().dispatches += 3; // the probe's own device work, not encoder work
+        *self.glu_epi.borrow_mut() = Some(present);
+        present
+    }
+
     /// `PARAKEET_FOLD_GLU=1` body, shared by the host-in and device-in conv fronts (they differ only
     /// in how the LN'd bf16 A was produced). One modal GEMM whose epilogue applies `a * sigmoid(g)`.
     fn conv_pw1_glu_folded<F: FnOnce() -> Array2<f32>>(
         &self, a_bf16: &Bo, m: usize, make_w1: F, id: &str,
     ) -> Option<Array2<f32>> {
-        assert!(
-            self.glu_epi,
-            "PARAKEET_FOLD_GLU=1 needs a resident whose epilogue carries the GLU branch, and this \
-             one does not. Pair it with NPU_RESIDENT_XCLBIN=<...modalglu...xclbin>: on a pre-GLU \
-             resident rtp[0]=3 falls through to identity and silently returns pw1's raw [a|g]."
-        );
         let n2 = 2 * KRES;
         // The permuted weight gets its OWN cache id: `{blk}.pw1` is shared with resident_ff1_fc1's
         // unpermuted path, and handing that path a permuted W1 would corrupt the fallback arm.
@@ -2038,6 +2079,12 @@ impl NpuMatmul {
             let wp = self.permute_w1_glu(w.view());
             self.weight_bo(&pid, wp.view())
         };
+        assert!(
+            self.glu_epi(a_bf16, &wbo),
+            "PARAKEET_FOLD_GLU=1 needs a resident whose epilogue implements rtp[0]==3, and a mode-3 \
+             dispatch on this one reproduced the identity output exactly -- it would silently return \
+             pw1's raw [a|g]. Build the resident from a modal epilogue that carries the GLU branch."
+        );
         let st = self.stream(n2, Act::Glu);
         modal_site("glu.fold");
         {
