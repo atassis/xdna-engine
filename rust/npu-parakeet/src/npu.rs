@@ -613,15 +613,17 @@ const FC1_PANEL_BF16_TILE: &str = "32x32x128";
 /// Projected net ~-67 ms/clip.
 ///
 /// **TIMING-ONLY as it stands** -- encoder OUTPUT IS WRONG under this flag, which exists to measure
-/// the dispatch sequence, the transition count and the wall clock end-to-end. Two defects, and only
-/// the first is host-side. (1) Every host readback decodes C as f32 while the folded xclbin writes
-/// bf16, in both crates that dispatch modal GEMMs (here and `npu_asr::ctx2`). (2) The conv module's
-/// GLU breaks ON DEVICE, where no host change reaches it: pw1 dispatches through this resident, so
-/// `glu.cc` is handed a bf16 buffer through its `const float *` input. The escape is
-/// `PARAKEET_FOLD_GLU=1`, which deletes that consumer by gating inside pw1's own epilogue
-/// (`rtp[0]==3`, implemented by the bf16-out modal epilogue) -- so shipping needs a resident built
-/// with BOTH that epilogue and this branch's bf16-out panel drain. The accuracy side is already
-/// priced separately: zero WER cost on 200 clips.
+/// the dispatch sequence, the transition count and the wall clock end-to-end. What remains is a
+/// DEVICE-side dtype gap, not a host one: the bf16 C is handed straight to bricks compiled against
+/// f32, and no host reader is on those paths. `matmul_id_to_bo`'s linear_out feeds
+/// `residual_add_dev` on the MHSA seam (measured at rel-L2 1.223 under the fold against 6.652e-3
+/// without), the fc2 K-split partials feed `acc_add`, which has no bf16 arm at all, and pw1 feeds
+/// the GLU brick through `glu.cc`'s `const float *`. The last one already has its escape --
+/// `PARAKEET_FOLD_GLU=1` gates inside pw1's own epilogue (`rtp[0]==3`) and deletes the consumer --
+/// so shipping needs a resident carrying BOTH that epilogue and this branch's bf16-out panel drain,
+/// plus bf16-input builds of resadd and acc_add. The host half is done: `c_elem_bytes` settles the
+/// drain width and the modal readbacks decode at it. The accuracy side is priced separately: zero
+/// WER cost on 200 clips.
 fn fold_fc1() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("PARAKEET_FOLD_FC1").map(|v| v != "0").unwrap_or(false))
