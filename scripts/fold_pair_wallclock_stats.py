@@ -121,3 +121,42 @@ for arm, base, label in (
     ("f0", "b0", "FOLD_FC1, uncached"),
 ):
     paired(arm, base, label)
+
+
+# Clips-per-process decomposition. The pairing above holds the cold clip in BOTH arms, which removes
+# it as a bias but not as a TERM: a delta that lives in one-time setup (a context the arm does not
+# create, an xclbin it does not load) still lands entirely on clip 1, so the per-clip mean carries it
+# divided by CLIPS. That makes the headline a function of how many clips the probe ran, not a
+# property of the encoder -- and the shipped banks run 17 clips, not 3. Split it: `warm` is the
+# steady-state per-clip effect that transfers, `one-time` is (cold - warm), and the projection is
+# one-time/n + warm. Report the warm column as the number; it is also the tighter one, because all of
+# the cold clip's variance stays out of it.
+def decompose(arm, base, label, clip_order):
+    warm, cold = [], []
+    for r in complete:
+        a, b = reps[r][arm]["clips"], reps[r][base]["clips"]
+        for name in clip_order:
+            if name in a and name in b:
+                (cold if name == clip_order[0] else warm).append((a[name] - b[name]) * 1e3)
+    if len(warm) < 2 or len(cold) < 2:
+        return
+    w, c = statistics.mean(warm), statistics.mean(cold)
+    one = c - w
+    lo, hi = ci(warm)
+    neg = sum(1 for x in warm if x < 0)
+    print(f"{label:<28} {w:>8.1f} [{lo:>7.1f},{hi:>7.1f}] {neg:>3}/{len(warm):<3} "
+          f"{one:>9.1f} {one / 3 + w:>8.1f} {one / 17 + w:>8.1f}")
+
+
+clip_order = sorted(reps[complete[0]]["b0"]["clips"])
+if len(clip_order) > 1:
+    print(f"\nclips-per-process decomposition -- ms/clip, cold clip = {clip_order[0]}")
+    print(f"{'contrast':<28} {'warm':>8} {'95% CI':>17} {'neg':>7} {'one-time':>9} "
+          f"{'n=3':>8} {'n=17':>8}")
+    for arm, base, label in (
+        ("f0", "b0", "FOLD_FC1"),
+        ("p0", "b0", "FOLD_FC1+FOLD_GLU"),
+        ("p0", "f0", "GLU fold, uncached"),
+        ("b1", "b0", "cache, on default"),
+    ):
+        decompose(arm, base, label, clip_order)
