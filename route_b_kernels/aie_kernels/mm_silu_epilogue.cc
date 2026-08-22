@@ -445,6 +445,56 @@ static inline void mm_identity_epilogue_bf16o(const float *__restrict pC_in,
   event1();
 }
 
+// glu, bf16 out. Same value/gate pairing and hiprec sigmoid ladder as
+// mm_glu_epilogue_f32o; the two differences are the narrowing store and that the
+// result lands in a SEPARATE bf16 tile rather than in place, so nothing here
+// depends on the +kHalf partner still being readable after a write.
+//
+// The result keeps the value half's ELEMENT positions, leaving the gate half
+// undefined, so the drain tap that takes 64 of every 128 columns carries over
+// unchanged from the f32-out mode.
+template <int rows, int cols, int r, int t>
+static inline void mm_glu_epilogue_bf16o(const float *__restrict pC_in,
+                                         bfloat16 *__restrict pC_out) {
+  event0();
+  static_assert(r == t, "the +half-row-block pairing assumes square mmul sub-tiles");
+  static_assert(cols % (2 * t) == 0, "value/gate split must fall on a sub-tile boundary");
+  static_assert(rows % r == 0, "tile rows must be a whole number of sub-tile rows");
+  constexpr int kRowBlock = r * cols;
+  constexpr int kHalf = kRowBlock / 2;
+  static_assert(kHalf % 16 == 0, "epilogue walks 16-wide chunks");
+
+  const auto saved_rounding = aie::swap_rounding(aie::rounding_mode::conv_even);
+  const aie::vector<float, 16> halff = aie::broadcast<float, 16>(0.5f);
+  const aie::vector<bfloat16, 16> one = aie::broadcast<bfloat16, 16>(1.0f);
+  const aie::vector<bfloat16, 16> halfb = aie::broadcast<bfloat16, 16>(0.5f);
+
+  for (int blk = 0; blk < rows / r; blk++) {
+    const float *__restrict a_ptr = pC_in + blk * kRowBlock;
+    const float *__restrict g_ptr = a_ptr + kHalf;
+    bfloat16 *__restrict out_ptr = pC_out + blk * kRowBlock;
+    AIE_PREPARE_FOR_PIPELINING
+    AIE_LOOP_MIN_ITERATION_COUNT(2)
+    for (int off = 0; off < kHalf; off += 16) {
+      aie::vector<float, 16> av = aie::load_v<16>(a_ptr + off);
+      aie::vector<float, 16> gv = aie::load_v<16>(g_ptr + off);
+      aie::vector<float, 16> half_g = aie::mul(gv, halff);
+      aie::vector<bfloat16, 16> tanh_half_g = aie::tanh<bfloat16>(half_g);
+      aie::vector<bfloat16, 16> tanh_p1 = aie::add(tanh_half_g, one);
+      aie::vector<bfloat16, 16> sig = aie::mul(tanh_p1, halfb);
+      aie::accum<accfloat, 16> sacc;
+      sacc.from_vector(sig);
+      aie::vector<float, 16> sigf = sacc.to_vector<float>();
+      aie::vector<float, 16> outv = aie::mul(av, sigf);
+      aie::accum<accfloat, 16> oacc;
+      oacc.from_vector(outv);
+      aie::store_v(out_ptr + off, oacc.to_vector<bfloat16>());
+    }
+  }
+  aie::set_rounding(saved_rounding);
+  event1();
+}
+
 // --- int8 DEQUANT epilogue (L3: on-chip i32 -> f32 dequant) -------------------
 // The int8 matmul (matmul_i8_i32) reduces i8*i8 into an i32 accumulator tile,
 // IN-PLACE in the C tile (4 bytes/elem, exactly like the f32-out modal). This
@@ -653,8 +703,11 @@ void mm_modal_epilogue_f32_bf16(const float *__restrict c_in,
   // ambient-state bug it is testing for.
   const auto saved_rounding = aie::swap_rounding(aie::rounding_mode::floor);
 #endif
-  // rtp[0]: 0=identity, 1=silu, 2=gelu (same encoding as mm_modal_epilogue_f32_f32).
-  if (rtp[0] == 1) {
+  // rtp[0]: 0=identity, 1=silu, 2=gelu, 3=glu (same encoding as mm_modal_epilogue_f32_f32).
+  if (rtp[0] == 3) {
+    // Halves the live output width -- the drain tap takes 64 of every 128 columns.
+    mm_glu_epilogue_bf16o<EPI_M, EPI_N, EPI_R, EPI_T>(c_in, c_out);
+  } else if (rtp[0] == 1) {
     mm_silu_epilogue_bf16o_hiprec<EPI_M * EPI_N>(c_in, c_out);
   } else if (rtp[0] == 2) {
     mm_gelu_epilogue_bf16o<EPI_M * EPI_N>(c_in, c_out);
