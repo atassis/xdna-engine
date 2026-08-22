@@ -32,8 +32,15 @@ trap 'npu_svc_start' EXIT
 npu_svc_stop || exit 1
 npu_svc_require_device_free || exit 1
 
+# The NPU is single-tenant, so this must serialise against any other device session. The wrapper
+# itself is not part of this tree: point NPU_LOCK_SH at one exposing `<wrapper> run -- <cmd>`.
+NPU_LOCK_SH="${NPU_LOCK_SH:-}"
+if [ -z "$NPU_LOCK_SH" ] || [ ! -x "$NPU_LOCK_SH" ]; then
+  log "[ERR] set NPU_LOCK_SH to the device serialisation wrapper (mode: run -- <cmd>)"; exit 1
+fi
+
 log "xclbin=$XCLBIN reps=$REPS total=$TOTAL"
-timeout -k 10 1800 ../xdna-engine-private/journal/scripts/npu_lock.sh run -- \
+timeout -k 10 1800 "$NPU_LOCK_SH" run -- \
   python3 scripts/restream_similarity_ab.py \
     --root "$PWD" --xclbin "$XCLBIN" \
     --pair "self_id1024=$ID1024,$ID1024" \

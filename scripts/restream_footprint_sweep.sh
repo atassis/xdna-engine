@@ -5,7 +5,7 @@
 # stream dissimilarity, passive hw_context residency, cross-context activity, live instruction-BO
 # count -- and operand IDENTITY is refuted by the self pair. All of them held one thing fixed: HOW
 # MUCH IS LIVE. The isolated probe pins ~15 MiB over a dozen zero-filled BOs; the encoder pins
-# 1.25 GB ([[parakeet-pinned-bo-bytes-resident]]) across one resident multi-MB weight BO per op and
+# 1.25 GB (measured pinned BO bytes for the resident encoder) across one multi-MB weight BO per op and
 # reads a different one every dispatch. The two surviving mechanisms -- eviction of the next
 # dispatch's working set, and address-translation state where each BO is a distinct DMA mapping --
 # both scale with footprint and mapping count, and with nothing else that has been swept.

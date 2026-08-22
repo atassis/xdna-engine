@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
 """Does the restream price track how DISSIMILAR the two streams are, or is it flat per change?
 
-Two sound measurements of "the cost of changing the instruction stream inside one hw_context"
-disagree by ~750x: [[bd-restream-inside-one-context-is-free]] measured < 3 us for a pair differing
-only in BD size/stride, and [[2026-08-22-a-stream-change-costs-what-a-transition-costs]] measured
-+2.258 ms in the encoder for fc1's panel-drain stream against an identity stream. Two variables moved
-at once -- the streams' SIMILARITY, and isolated-vs-in-encoder. This holds the second fixed (everything
-here is isolated) and sweeps the first.
+Written when two measurements of "the cost of changing the instruction stream inside one
+hw_context" appeared to disagree by ~750x: an isolated probe measured < 3 us for a pair differing only
+in BD size/stride, while the encoder appeared to charge +2.258 ms for fc1's panel-drain stream against
+an identity stream. Two variables moved at once -- the streams' SIMILARITY, and isolated-vs-in-encoder
+-- so this holds the second fixed (everything here is isolated) and sweeps the first.
+
+THE DISAGREEMENT WAS AN ARTIFACT (resolved 2026-08-22). The encoder was not measuring a restream: two
+byte-identical copies of one xclbin loaded from two directories became two hw_contexts, and the
+dispatch log names a context by the xclbin file stem, so a full program transition was booked as a
+same-xclbin restream. A same-context restream is free in the encoder too. This sweep's own answer
+stands and is the one that generalises: the price does not track dissimilarity, it tracks the
+hw_context boundary. `npu-xrt` now warns when one stem lands in two contexts.
 
 Construction, unchanged from `switch-cost-per-transition-controlled`: ONE multiset of dispatches, half
 from each stream, timed in two orders. ALTERNATING pays total-1 stream changes, GROUPED pays 1. Both
