@@ -518,15 +518,50 @@ pub type Result<T> = std::result::Result<T, String>;
 /// Kernels (each owning a hw_context) are cached by xclbin path: the NPU's 8 columns are a
 /// limited hw_context budget, so loading the same xclbin twice returns the SAME shared kernel
 /// (many engines with different weight BOs share one context). Mirrors `npu_asr/device.py`.
+/// The identity a hw_context is cached under. By default the xclbin PATH, which is what XRT was
+/// handed -- but two byte-identical copies of one xclbin at two paths then get two contexts, and a
+/// transition between them costs a full program switch while every report calls them one xclbin.
+/// `NPU_XCLBIN_CACHE_BY_CONTENT=1` keys on the file's CONTENT instead, so the copies share a
+/// context. Opt-in, because merging contexts changes the dispatch schedule of every configuration.
+///
+/// MEASURED, and the reason this exists: `PARAKEET_FOLD_FC1` folds fc1 onto the resident purely by
+/// pointing both at "the same xclbin", but the resident resolves it under the whole_array build dir
+/// and fc1 under `artifacts/parakeet/ln` -- same 148447 bytes, two files. The fold therefore deleted
+/// 48 transitions per clip from the dispatch log and none from the device (hw_contexts 12/16 in both
+/// arms, 15 reps each), which is why its end-to-end A/B measured neutral.
+fn cache_id(xclbin_path: &str) -> String {
+    if std::env::var("NPU_XCLBIN_CACHE_BY_CONTENT").map(|v| v != "0").unwrap_or(false) {
+        if let Ok(bytes) = std::fs::read(xclbin_path) {
+            let mut h: u64 = 0xcbf29ce484222325; // FNV-1a
+            for b in &bytes {
+                h ^= *b as u64;
+                h = h.wrapping_mul(0x100000001b3);
+            }
+            return format!("content:{h:016x}:{}", bytes.len());
+        }
+    }
+    xclbin_path.to_string()
+}
+
 pub struct Device {
     ptr: *mut CDevice,
     kernels: RefCell<HashMap<String, Rc<Kernel>>>,
+    /// How many hw_contexts each xclbin STEM has been loaded into. The cache key is the path, but
+    /// [`dispatch_log`] identifies a context by the stem -- so two copies of one xclbin at two
+    /// paths (a build dir and an artifacts dir, byte-identical) are two contexts wearing one name,
+    /// and every transition between them is logged as a same-xclbin instruction restream. That is
+    /// not hypothetical: it is what made `PARAKEET_FOLD_FC1` report 48 deleted transitions per clip
+    /// while creating exactly as many contexts as the arm it was folding (12/16 in both), and it
+    /// cost seven refuted axes hunting a restream price that was a program transition all along.
+    /// Second and later contexts for a stem get a `~ctx{n}` suffix so the report cannot conflate.
+    stems: RefCell<HashMap<String, usize>>,
 }
 
 /// An xclbin loaded into a hw_context with its kernel resolved.
 pub struct Kernel {
     ptr: *mut CKernel,
-    /// xclbin basename, used only by [`dispatch_log`] to identify hw_context transitions.
+    /// xclbin basename, used only by [`dispatch_log`] to identify hw_context transitions. Suffixed
+    /// `~ctx{n}` for the second and later contexts of one stem -- see [`Device::stems`].
     label: String,
 }
 
@@ -603,6 +638,7 @@ impl Device {
             Ok(Device {
                 ptr,
                 kernels: RefCell::new(HashMap::new()),
+                stems: RefCell::new(HashMap::new()),
             })
         }
     }
@@ -625,7 +661,7 @@ impl Device {
         name: Option<&str>,
         qos: Option<QosPriority>,
     ) -> Result<Rc<Kernel>> {
-        let key = format!("{xclbin_path}\u{0}{}\u{0}{:?}", name.unwrap_or(""), qos);
+        let key = format!("{}\u{0}{}\u{0}{:?}", cache_id(xclbin_path), name.unwrap_or(""), qos);
         if let Some(k) = self.kernels.borrow().get(&key) {
             return Ok(k.clone());
         }
@@ -644,11 +680,18 @@ impl Device {
         if ptr.is_null() {
             return Err(format!("load_kernel({xclbin_path}): {}", last_error()));
         }
-        let label = std::path::Path::new(xclbin_path)
+        let stem = std::path::Path::new(xclbin_path)
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or(xclbin_path)
             .to_string();
+        let nth = {
+            let mut st = self.stems.borrow_mut();
+            let c = st.entry(stem.clone()).or_insert(0);
+            *c += 1;
+            *c
+        };
+        let label = if nth == 1 { stem } else { format!("{stem}~ctx{nth}") };
         let k = Rc::new(Kernel { ptr, label });
         self.kernels.borrow_mut().insert(key, k.clone());
         Ok(k)
