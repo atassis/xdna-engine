@@ -352,6 +352,7 @@ def my_matmul(
     rtp_mode_lnaffcast=False,
     lnaffcast_rows=0,
     lnaffcast_c_fanout=False,
+    lnaffcast_group_rounds=1,
 ):
     n_aie_rows = 4
     n_aie_cores = n_aie_rows * n_aie_cols
@@ -1080,8 +1081,16 @@ def my_matmul(
         cols = mode_lnaffcast
         c_region = lnaffcast_rows * cols if lnaffcast_c_fanout else 0
 
-        for base in range(0, lnaffcast_rows, lnaff_rows_per_round):
-            tg = TaskGroup()
+        # How many rounds share a TaskGroup. `tg.finish()` is a HOST-side await, so one per round
+        # serialises the whole sequence at the round boundary -- the GEMM finishes twice for a
+        # 512x1024x1024, not once per tile-block, for exactly this reason. Groups larger than one
+        # round let the queue run ahead; the ceiling is BD/queue resource, not correctness.
+        rounds = lnaffcast_rows // lnaff_rows_per_round
+        tg = None
+        for rnd in range(rounds):
+            base = rnd * lnaff_rows_per_round
+            if rnd % lnaffcast_group_rounds == 0:
+                tg = TaskGroup()
             for col in range(n_aie_cols):
                 tap_c = TensorAccessPattern(
                     (M * N,), col * c_region + base * cols, c_sizes, c_strides
@@ -1099,7 +1108,8 @@ def my_matmul(
                 )
                 A_taps.append(tap_a)
                 A_prods[row].fill(A, tap=tap_a, group=tg)
-            tg.finish()
+            if rnd % lnaffcast_group_rounds == lnaffcast_group_rounds - 1 or rnd == rounds - 1:
+                tg.finish()
 
     def sequence(A, B, C, A_prods, B_prods, C_conses):
         nonlocal c_index
@@ -1425,6 +1435,14 @@ def main():
         "tensors hold, rounded down to a whole round.",
     )
     argparser.add_argument(
+        "--lnaffcast-group-rounds",
+        type=int,
+        default=1,
+        metavar="R",
+        help="rounds per TaskGroup. tg.finish() is a host-side await, so 1 serialises the whole "
+        "sequence at every round boundary; larger lets the DMA queue run ahead.",
+    )
+    argparser.add_argument(
         "--lnaffcast-c-fanout",
         action="store_true",
         help="give each of the n_aie_cols columns its own output region instead of writing them "
@@ -1466,6 +1484,7 @@ def main():
         args.rtp_mode_lnaffcast,
         args.lnaffcast_rows,
         args.lnaffcast_c_fanout,
+        args.lnaffcast_group_rounds,
     )
     if args.generate_taps:
         return maybe_module
