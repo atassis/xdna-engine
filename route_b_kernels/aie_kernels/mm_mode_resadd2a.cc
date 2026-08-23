@@ -73,6 +73,25 @@
 #ifndef RESADD2A_MAC
 #define RESADD2A_MAC 0
 #endif
+
+// Force the apply half to STORE rather than read-modify-write, independently of RESADD2A_NOOP.
+// The arm this exists for: BOTH bodies real, apply not reading C. Each entry point alone is 9/9
+// and both real is 0/9, so the fault is co-residency; this asks whether it needs the RMW. The
+// output is meaningless by construction (apply overwrites what stage staged), so the arm is gated
+// on completion alone.
+#ifndef RESADD2A_NO_C_READ
+#define RESADD2A_NO_C_READ 0
+#endif
+
+// Runs the STAGE body actually walks, out of kRuns. Both bodies stay real and both are still
+// called the same number of times, so this varies WORK while holding BODY COUNT fixed -- the one
+// discriminator left for the co-residency fault, which survives with the RMW removed, the multiply
+// fused, the stack identical and the caller byte-identical. Passing at 1 would mean the fault is
+// the amount of work per C tile and not the presence of two bodies. Output is meaningless, so the
+// arm is gated on completion.
+#ifndef RESADD2A_STAGE_RUNS
+#define RESADD2A_STAGE_RUNS kRuns
+#endif
 #define RESADD2A_HAS_STAGE (RESADD2A_NOOP == 0 || RESADD2A_NOOP == 2 || RESADD2A_NOOP == 4)
 #define RESADD2A_HAS_APPLY \
   (RESADD2A_NOOP == 0 || RESADD2A_NOOP == 3 || RESADD2A_NOOP == 5 || RESADD2A_NOOP == 6)
@@ -89,7 +108,7 @@
 // at most 16 mantissa bits and is EXACT in f32 -- the accumulate is accfloat, so nothing rounds.
 // The one requirement is that `scale` itself be bf16-representable; the encoder's two resadds use
 // 1.0 and 0.5, which are. A scale that is not is silently rounded, so it is checked on the host.
-#define RESADD2A_APPLY_READS_C (RESADD2A_NOOP != 5)
+#define RESADD2A_APPLY_READS_C (!RESADD2A_NO_C_READ && RESADD2A_NOOP != 5)
 
 static constexpr int kRun = EPI_R * EPI_K;      // contiguous f32 one C-drain run carries
 static constexpr int kRuns = EPI_M / EPI_R;     // runs per A tile
@@ -117,7 +136,7 @@ void mm_resadd2a_stage_f32(const bfloat16 *__restrict a, float *__restrict c,
   event0();
 #if RESADD2A_HAS_STAGE
   float *__restrict dst = c + j * kRun;
-  for (int i = 0; i < kRuns; ++i)
+  for (int i = 0; i < RESADD2A_STAGE_RUNS; ++i)
     for (int q = 0; q < kRun; q += kLanes) {
 #if RESADD2A_NOOP == 4
       ::aie::store_v(dst + i * kStride + q, ::aie::broadcast<float, kLanes>(42.0f));
