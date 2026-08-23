@@ -356,6 +356,9 @@ struct ResidentLn {
     fc2_k4096: Option<Fc2K4096>,
     // fc1 that drains chunk-major bf16 itself, deleting the deint dispatch. OPTIONAL + opt-in.
     fc1_panel_bf16: Option<Fc1PanelBf16>,
+    // lnaffcast as a MODE of the panel above rather than its own xclbin. Takes priority over
+    // `lnaffcast` when present; both absent -> the two-dispatch chain.
+    ln_mode: Option<LnMode>,
     // conv-module depthwise conv1d (step 3), OPTIONAL like glu.
     dwconv: Option<ConvDw>,
     // conv-module post-dwconv SiLU (step 4), OPTIONAL like glu/dwconv. SEPARATE single-op-loop
@@ -394,6 +397,31 @@ struct ConvGlu {
 /// in one dispatch. Same 8-arg host ABI as the bricks it replaces (x g3, gb g4, out g5), so it drops
 /// straight into either call site. Reuses the chain's `bo_gb`/`bo_bf16`, owning only its dummies.
 struct LnFused {
+    kern: Rc<Kernel>,
+    instr: Bo,
+    n: usize,
+    dummy_tmp: Bo,
+    dummy_tr: Bo,
+}
+
+/// [`LnFused`] as a MODE of the fc1 panel xclbin rather than an xclbin of its own -- one array
+/// program, a second instruction stream, so the lnaffcast<->fc1 boundary stops being a program
+/// transition. Gated by [`ln_mode`]; see it for what the merge is worth.
+///
+/// `kern` is the panel's own `Rc<Kernel>`, cloned rather than re-loaded, so this cannot drift onto a
+/// second hardware context. Absent artifact -> `None` -> the standalone `LnFused` path, unchanged.
+///
+/// OPERANDS ARE SWAPPED relative to the standalone op, which takes (x, gb, y): the mode takes
+/// **gb on A, x on B, y on C**. That swap IS the 1x route. The three BOs `ResidentLn` already owns
+/// are exactly the right sizes for it, which is why this brick declares no buffers of its own --
+/// read off the mode stream's emitted BDs, the touched extents are A 8192 B, B 2097152 B,
+/// C 1048576 B against `bo_gb` 2*KRES f32 = 8192, `bo_x` PAD_M*KRES f32 = 2097152, and `bo_bf16`
+/// PAD_M*KRES bf16 = 1048576. Exact, not merely sufficient.
+///
+/// The C tap walks [PAD_M,KRES] row-major into a C the GEMM stream declares [PAD_M,DFF] panel-major.
+/// That is correct by construction -- each stream carries its own taps -- and it is why `bo_bf16`
+/// (row-major, the layout every downstream consumer already reads) is the right buffer to bind.
+struct LnMode {
     kern: Rc<Kernel>,
     instr: Bo,
     n: usize,
@@ -597,13 +625,58 @@ const DFF: usize = 4096; // Parakeet FFN inner dim (fc1 N / fc2 K)
 // does not fit alongside the m=64 C tile (L1 overflows by ~11.6 KB), so this variant only exists at m=32.
 const FC1_PANEL_BF16_TILE: &str = "32x32x128";
 
+// The lnaffcast MODE's build knobs, named so the two stems below read as intent rather than as a
+// string nobody can re-derive. Each is a `lnaffcast_merge_build.sh` make var, and each tags the
+// artifact name -- so a stem assembled from anything but these asks for a file that was not built.
+const LN_MODE_SCATTER: usize = 2; // lnaffcast_scatter_c=2 (SCAT)
+const LN_MODE_RTP: u32 = 18; // rtp[0] value that selects the mode; it rides the STREAM, not the host call
+const LN_MODE_GROUP_ROUNDS: usize = 4; // lnaffcast_group_rounds=4
+
+/// `PARAKEET_LN_MODE=1`: dispatch lnaffcast as a MODE of the fc1 panel xclbin instead of as its own
+/// standalone `lnaffcast_{PAD_M}x{KRES}` one.
+///
+/// The lever is the transition, not the op. Measured on the encoder's own resident: the mode costs
+/// 579.3/549.1 us against the shipped standalone's 855.1 -- **-290.9 us/dispatch, -34.0%** -- and it
+/// charges fc1 nothing (fc1's instruction stream is byte-identical on both xclbins, the L1 allocation
+/// unmoved to the address). On top of that the f2 ledger's `lnaffcast -> panel-fc1` x96 and
+/// `panel-fc1 -> lnaffcast` x47 become intra-program: **143 transitions/clip deleted, -240.0 ms/clip**.
+/// Total **-267.9 ms/clip**.
+///
+/// OPT-IN, and the default flip is a separate decision -- it moves the encoder onto a different
+/// xclbin, which is exactly the class of change the shipped path gets gated on rather than inherits.
+fn ln_mode() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PARAKEET_LN_MODE").map(|v| v != "0").unwrap_or(false))
+}
+
 /// Stem of the bf16-out fc1 panel build, which the fold also makes the resident -- both loads
 /// derive it here so they name ONE file. The panel carries its own copy of the modal epilogue, so
 /// `PARAKEET_MODAL_EPI_SUFFIX` has to select the variant for fc1 too; picking it at one site and
 /// not the other silently unfolds the fold.
+///
+/// Under [`ln_mode`] this returns the MODE-CARRYING panel instead. Routing the mode through this one
+/// function is what keeps fc1 and lnaffcast on ONE hardware context in BOTH configurations: the fold
+/// makes this stem the resident, the hybrid path loads it as `Fc1PanelBf16`, and `Device::load_kernel`
+/// caches by PATH -- so naming one file here is the whole of "keep fc1 on the same context".
 fn fc1_panel_bf16_stem() -> String {
     let sfx = std::env::var("PARAKEET_MODAL_EPI_SUFFIX").unwrap_or_default();
-    format!("{PAD_M}x{KRES}x{DFF}_{FC1_PANEL_BF16_TILE}_8c_modalsilubf16outpanel{KRES}{sfx}")
+    let panel = format!("{PAD_M}x{KRES}x{DFF}_{FC1_PANEL_BF16_TILE}_8c_modalsilubf16outpanel{KRES}{sfx}");
+    if ln_mode() {
+        // `1x` is the route, not a variant tag: x rides B, which is per-column, so the 8 columns of
+        // an array row stop computing the same rows and gb on A gets the broadcast a weight wants.
+        format!("{panel}lnaff{KRES}scat{LN_MODE_SCATTER}1x")
+    } else {
+        panel
+    }
+}
+
+/// Stem of the lnaffcast mode's own instruction stream on [`fc1_panel_bf16_stem`]'s xclbin.
+/// INSTS-ONLY -- there is no paired `final_*.xclbin` at this stem and there must not be: sharing the
+/// array program with fc1 is the entire mechanism. `r{PAD_M}` because the stream's taps are cut for a
+/// fixed row count and the host always pads to PAD_M; `ctgc` is the contiguous-C-tap arm, the one that
+/// passed parity (the derived-tap arm fails at 1.4042 and is the build's both-directions control).
+fn ln_mode_insts_stem() -> String {
+    format!("{}rtp{LN_MODE_RTP}r{PAD_M}g{LN_MODE_GROUP_ROUNDS}ctgc", fc1_panel_bf16_stem())
 }
 
 /// Which of the two directories the panel is served from. `build_parakeet_modal_kernels.sh` copies
@@ -1573,6 +1646,43 @@ impl NpuMatmul {
                 None
             }
         };
+        // lnaffcast as a mode of that panel (PARAKEET_LN_MODE=1). Insts-only: the stream is bound to
+        // the panel's ALREADY-LOADED kernel, never to a second `load_kernel`, because a second handle
+        // on a second path is a second hw_context and would reinstate the transition this deletes.
+        let ln_mode = {
+            let panel = fc1_panel_bf16.as_ref().map(|p| p.kern.clone());
+            match (ln_mode(), panel) {
+                (true, Some(kern)) => {
+                    let stem = ln_mode_insts_stem();
+                    let dir = fc1_panel_bf16_dir(&self.base, &self.ln_dir, &fc1_panel_bf16_stem());
+                    let insts = kernel_registry::insts_path(dir, &stem);
+                    let ib = std::fs::read(&insts).unwrap_or_else(|e| panic!("read {}: {e}", insts.display()));
+                    let gg = |i| kern.group_id(i).unwrap();
+                    let instr = self.dev.alloc_bo(&kern, ib.len(), FLAG_CACHEABLE, gg(1)).unwrap();
+                    instr.write_bytes(&ib).unwrap();
+                    instr.sync_to_device().unwrap();
+                    if !npu_xrt::quiet() {
+                        eprintln!("[npu] lnaffcast runs as a MODE of {} ({} words)", fc1_panel_bf16_stem(), ib.len() / 4);
+                    }
+                    Some(LnMode {
+                        n: ib.len() / 4,
+                        dummy_tmp: self.dev.alloc_bo(&kern, 1, FLAG_HOST_ONLY, gg(6)).unwrap(),
+                        dummy_tr: self.dev.alloc_bo(&kern, 4, FLAG_HOST_ONLY, gg(7)).unwrap(),
+                        kern, instr,
+                    })
+                }
+                // Asked for and not available. A DEGRADATION (the standalone op costs +290.9 us and
+                // its two transitions), so it is not quiet-gated -- same reason as the lnaffcast
+                // warning above.
+                (true, None) => {
+                    eprintln!("[npu] PARAKEET_LN_MODE=1 but the mode-carrying panel is absent -- \
+                               lnaffcast stays a standalone xclbin (+~290.9 us/dispatch + 143 transitions/clip). \
+                               Build it with scripts/lnaffcast_merge_build.sh.");
+                    None
+                }
+                (false, _) => None,
+            }
+        };
         // conv-module depthwise conv1d (step 3), OPTIONAL. 3-buffer ABI in[C,T]/w[C,16]/out[C,T] bf16.
         // The dwconv/SiLU bricks are FOUR builds of ONE op, and the conv path has a strict
         // preference order (time-major fused > channel-major fused > separate dwconv+silu). Loading
@@ -1687,7 +1797,7 @@ impl NpuMatmul {
             deint_c: self.dev.alloc_bo(&deint_kern, 1, FLAG_HOST_ONLY, gd(5)).unwrap(),
             deint_tmp: self.dev.alloc_bo(&deint_kern, 8, FLAG_HOST_ONLY, gd(6)).unwrap(),
             deint_tr: self.dev.alloc_bo(&deint_kern, 1, FLAG_HOST_ONLY, gd(7)).unwrap(),
-            ln_kern, ln_instr, ln_n, ac_kern, ac_instr, ac_n, lnaffcast,
+            ln_kern, ln_instr, ln_n, ac_kern, ac_instr, ac_n, lnaffcast, ln_mode,
             deint_kern, deint_instr, deint_n, glu, acc_add, resadd_s050, resadd_s100, fc2_k4096, fc1_panel_bf16, dwconv, silu, dwconv_silu, dwconv_silu_t,
         });
         rl
@@ -1735,14 +1845,21 @@ impl NpuMatmul {
         gb[KRES..].copy_from_slice(beta);
         rl.bo_gb.write_bytes(f32_bytes(&gb)).unwrap();
         rl.bo_gb.sync_to_device().unwrap();
-        match rl.lnaffcast.as_ref() {
+        match (rl.ln_mode.as_ref(), rl.lnaffcast.as_ref()) {
+            // ONE dispatch on the fc1 PANEL's own program: (gamma|beta, bo_x) -> bo_bf16. Operands
+            // swapped against the standalone below -- see `LnMode`.
+            (Some(m), _) => {
+                modal_site("ln_mode#1");
+                { let _dt = self.dtimer(); m.kern.run_matmul8(3, &m.instr, m.n, &rl.bo_gb, &rl.bo_x, &rl.bo_bf16, &m.dummy_tmp, &m.dummy_tr).unwrap(); }
+                self.stats.borrow_mut().dispatches += 1;
+            }
             // ONE dispatch: (bo_x, gamma|beta) -> bo_bf16. bo_ln is never materialized.
-            Some(f) => {
+            (None, Some(f)) => {
                 modal_site("f.kern#1");
                 { let _dt = self.dtimer(); f.kern.run_matmul8(3, &f.instr, f.n, &rl.bo_x, &rl.bo_gb, &rl.bo_bf16, &f.dummy_tmp, &f.dummy_tr).unwrap(); }
                 self.stats.borrow_mut().dispatches += 1;
             }
-            None => {
+            (None, None) => {
                 // (1) ctxLN: bo_x -> bo_ln  (NO sync back -- stays device-resident)
                 modal_site("rl.ln_kern#1");
                 { let _dt = self.dtimer(); rl.ln_kern.run_matmul8(3, &rl.ln_instr, rl.ln_n, &rl.bo_x, &rl.bo_ln, &rl.ln_c, &rl.ln_tmp, &rl.ln_tr).unwrap(); }
@@ -1793,14 +1910,22 @@ impl NpuMatmul {
         gb[KRES..].copy_from_slice(beta);
         rl.bo_gb.write_bytes(f32_bytes(&gb)).unwrap();
         rl.bo_gb.sync_to_device().unwrap();
-        match rl.lnaffcast.as_ref() {
+        match (rl.ln_mode.as_ref(), rl.lnaffcast.as_ref()) {
+            // ONE dispatch on the fc1 panel's program, DEVICE-IN: (gamma|beta, a_bo) -> bo_bf16.
+            // `a_bo` lands in the B slot, where the mode's tap reads exactly the [PAD_M,KRES] f32 the
+            // previous brick left there -- the same 2 MB extent `bo_x` occupies on the host-in path.
+            (Some(m), _) => {
+                modal_site("ln_mode#2");
+                { let _dt = self.dtimer(); m.kern.run_matmul8(3, &m.instr, m.n, &rl.bo_gb, a_bo, &rl.bo_bf16, &m.dummy_tmp, &m.dummy_tr).unwrap(); }
+                self.stats.borrow_mut().dispatches += 1;
+            }
             // ONE dispatch, DEVICE-IN: (a_bo, gamma|beta) -> bo_bf16.
-            Some(f) => {
+            (None, Some(f)) => {
                 modal_site("f.kern#2");
                 { let _dt = self.dtimer(); f.kern.run_matmul8(3, &f.instr, f.n, a_bo, &rl.bo_gb, &rl.bo_bf16, &f.dummy_tmp, &f.dummy_tr).unwrap(); }
                 self.stats.borrow_mut().dispatches += 1;
             }
-            None => {
+            (None, None) => {
                 // (1) ctxLN: a_bo -> bo_ln  (DEVICE-IN: no host write of x; stays device-resident)
                 modal_site("rl.ln_kern#3");
                 { let _dt = self.dtimer(); rl.ln_kern.run_matmul8(3, &rl.ln_instr, rl.ln_n, a_bo, &rl.bo_ln, &rl.ln_c, &rl.ln_tmp, &rl.ln_tr).unwrap(); }
