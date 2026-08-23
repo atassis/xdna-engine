@@ -9,7 +9,11 @@ Reports the warm column separately because `mean encode` is `(one-time + n x per
 living in process setup lands entirely on clip 1 and is then divided by n. At 17 clips pooled and
 warm should agree closely; a gap between them means the effect is in setup, not per-clip.
 
-Usage: krtp_onedispatch_stats.py <dir>
+Usage: krtp_onedispatch_stats.py <dir> [base:label,cand:label]
+
+The arm pair is an argument because the same ledger prices any two-arm encoder A/B, not just this
+one -- the fold+krtp composition reuses it verbatim. BASE is the reference arm; every delta is
+reported as CAND - BASE.
 """
 import re
 import statistics
@@ -18,6 +22,15 @@ from pathlib import Path
 
 ARMS = ["k0", "k1"]
 LABEL = {"k0": "K-split fc2 (default)", "k1": "one-dispatch fc2 (krtp)"}
+if len(sys.argv) > 2:
+    ARMS, LABEL = [], {}
+    for spec in sys.argv[2].split(","):
+        arm, _, lab = spec.partition(":")
+        ARMS.append(arm)
+        LABEL[arm] = lab or arm
+    if len(ARMS) != 2:
+        sys.exit("arm spec wants exactly two comma-separated arms, e.g. f0:default,f1:fold+krtp")
+BASE, CAND = ARMS
 
 CLIP = re.compile(r"^\[enc\]\s+(\S+)\s+T'=\d+\s+([\d.]+)s", re.M)
 MEAN = re.compile(r"^mean encode ([\d.]+)s/clip over (\d+) clips", re.M)
@@ -80,7 +93,7 @@ for arm in ARMS:
 complete = sorted(r for r, a in reps.items() if all(x in a for x in ARMS))
 if not complete:
     sys.exit("no complete reps")
-print(f"complete reps: {complete}  ({len(complete)} x {reps[complete[0]]['k0']['n_clips']} clips)\n")
+print(f"complete reps: {complete}  ({len(complete)} x {reps[complete[0]][BASE]['n_clips']} clips)\n")
 
 print("per-arm mean encode (s/clip), by rep")
 for rep in complete:
@@ -96,27 +109,27 @@ for arm in ARMS:
     print(f"  {arm} {LABEL[arm]:<26} dispatches/transitions {sorted(s)}  "
           f"hw_contexts {sorted(ctxs)}  blocking {blk:.3f} s")
 
-k0d = reps[complete[0]]["k0"]["dispatches"]
-k1d = reps[complete[0]]["k1"]["dispatches"]
+k0d = reps[complete[0]][BASE]["dispatches"]
+k1d = reps[complete[0]][CAND]["dispatches"]
 if k0d and k1d:
-    n = reps[complete[0]]["k0"]["n_clips"]
+    n = reps[complete[0]][BASE]["n_clips"]
     print(f"  => dispatches/clip {k0d / n:.1f} -> {k1d / n:.1f}  "
           f"({(k1d - k0d) / n:+.1f}/clip, {k1d - k0d:+d} over {n} clips)")
 
-print("\nkernels present in k0 but NOT in k1 (the collapse should delete accadd outright)")
-only0 = set(reps[complete[0]]["k0"]["per_kernel"]) - set(reps[complete[0]]["k1"]["per_kernel"])
+print(f"\nkernels present in {BASE} but NOT in {CAND} (a collapse should delete a program outright)")
+only0 = set(reps[complete[0]][BASE]["per_kernel"]) - set(reps[complete[0]][CAND]["per_kernel"])
 for k in sorted(only0):
-    n, s, ms = reps[complete[0]]["k0"]["per_kernel"][k]
+    n, s, ms = reps[complete[0]][BASE]["per_kernel"][k]
     print(f"  {k:<52} x{n:<5} {s:.3f}s  {ms:.3f} ms")
 if not only0:
     print("  (none)")
 
-print("\npaired per-(rep, clip) delta, k1 - k0   [negative = one-dispatch is faster]")
+print(f"\npaired per-(rep, clip) delta, {CAND} - {BASE}   [negative = {CAND} is faster]")
 pooled, warm = [], []
-clip_order = sorted(reps[complete[0]]["k0"]["clips"])
+clip_order = sorted(reps[complete[0]][BASE]["clips"])
 for rep in complete:
     for ci, c in enumerate(clip_order):
-        a, b = reps[rep]["k1"]["clips"].get(c), reps[rep]["k0"]["clips"].get(c)
+        a, b = reps[rep][CAND]["clips"].get(c), reps[rep][BASE]["clips"].get(c)
         if a is None or b is None:
             continue
         pooled.append(a - b)
@@ -126,9 +139,9 @@ report_delta("pooled (all clips)", pooled)
 report_delta("warm (clip 1 dropped)", warm)
 
 print("\ndevice BLOCKING dispatch time, paired per rep [the non-wall-clock instrument]")
-blk = [reps[r]["k1"]["blocking_s"] - reps[r]["k0"]["blocking_s"] for r in complete
-       if reps[r]["k1"]["blocking_s"] is not None and reps[r]["k0"]["blocking_s"] is not None]
+blk = [reps[r][CAND]["blocking_s"] - reps[r][BASE]["blocking_s"] for r in complete
+       if reps[r][CAND]["blocking_s"] is not None and reps[r][BASE]["blocking_s"] is not None]
 if blk:
-    n = reps[complete[0]]["k0"]["n_clips"]
+    n = reps[complete[0]][BASE]["n_clips"]
     report_delta("blocking (last clip only)", blk)
     print(f"  NOTE: the ledger covers the LAST clip only, so n is {len(blk)} single-clip observations.")
