@@ -59,6 +59,20 @@
 #ifndef RESADD2A_BF16_MUL
 #define RESADD2A_BF16_MUL 0
 #endif
+
+// Accumulate with ONE fused `aie::mac` instead of a separate `aie::mul` and `aie::add`. Two
+// reasons, and the brick one holds even if the hang one does not: (a) mul-then-add is the generic
+// pair where the hardware has the fused op, which is the recurring mistake the brick catalog
+// exists to stop; (b) MEASURED, the apply hang on the bf16 datapath tracks a store bundled in one
+// instruction word with a VALU write -- `vst x9, [p4]; mov p4, p3; vmul.f dm1, x5, x4, r4` -- and
+// the three bf16 arms split 3/3 on whether that bundle is present. Removing the separate vmul
+// removes the operation that gets packed there. Note the store is from the VECTOR file (x9), so
+// the RESADD2A_VFILE_DETOUR above did its job and the core hung anyway: the hazard is a VALU write
+// bundled WITH the store, not only a store sourced from the accumulator file.
+// Requires RESADD2A_BF16_MUL (mac takes the bf16 operands directly).
+#ifndef RESADD2A_MAC
+#define RESADD2A_MAC 0
+#endif
 #define RESADD2A_HAS_STAGE (RESADD2A_NOOP == 0 || RESADD2A_NOOP == 2 || RESADD2A_NOOP == 4)
 #define RESADD2A_HAS_APPLY \
   (RESADD2A_NOOP == 0 || RESADD2A_NOOP == 3 || RESADD2A_NOOP == 5 || RESADD2A_NOOP == 6)
@@ -136,6 +150,14 @@ void mm_resadd2a_apply_f32(const bfloat16 *__restrict b, float *__restrict c,
       ::aie::accum<accfloat, kLanes> bv;
       bv.from_vector(::aie::load_v<kLanes>(b + i * kRun + q), 0);
       float *__restrict p = dst + i * kStride + q;
+#if RESADD2A_MAC && RESADD2A_APPLY_MULS && RESADD2A_APPLY_READS_C
+      // C + scale*b as ONE accumulate: load C into the accumulator, mac the bf16 operands onto
+      // it, narrow once. No separate product to schedule next to the store.
+      ::aie::accum<accfloat, kLanes> acc;
+      acc.from_vector(::aie::load_v<kLanes>(p), 0);
+      acc = ::aie::mac(acc, ::aie::load_v<kLanes>(b + i * kRun + q), svb);
+      ::aie::store_v(p, vfile(acc.to_vector<float>()));
+#else
 #if RESADD2A_APPLY_MULS && RESADD2A_BF16_MUL
       ::aie::vector<float, kLanes> sb =
           ::aie::mul(::aie::load_v<kLanes>(b + i * kRun + q), svb).to_vector<float>();
@@ -149,6 +171,7 @@ void mm_resadd2a_apply_f32(const bfloat16 *__restrict b, float *__restrict c,
       ::aie::store_v(p, vfile(::aie::add(::aie::load_v<kLanes>(p), sb)));
 #else
       ::aie::store_v(p, vfile(sb));
+#endif
 #endif
     }
 #endif
