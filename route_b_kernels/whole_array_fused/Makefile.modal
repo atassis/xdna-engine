@@ -135,6 +135,10 @@ lnaffcast_1x?=0
 # insts-only, so every (rows, scale) shares one xclbin.
 mode_resadd2a?=0
 rtp_mode_resadd2a?=0
+# Put scale*b on the bf16 datapath. The f32 aie::mul is MEASURED to hang the core; b is already
+# bf16 and scale is a constant, so the product is one vmul into an accfloat and is bit-exact for
+# any bf16-representable scale.
+resadd2a_bf16mul?=0
 resadd2a_rows?=0
 resadd2a_scale?=1.0
 # 1 = compile the mode's two entry points EMPTY (the stream-contract discriminator).
@@ -265,7 +269,7 @@ apanel_tag=$(if $(filter 0,${a_panel_width}),,apanel${a_panel_width})
 # The lnaffcast BODY is a different core ELF; the rtp arm is a different instruction stream on
 # that same xclbin. rows/fanout change only the stream, so they tag the stream and not the body.
 lnaff_tag=$(if $(filter 0,${mode_lnaffcast}),,lnaff${mode_lnaffcast})$(if $(filter 0,${lnaffcast_scatter_c}),,scat$(patsubst 1,,${lnaffcast_scatter_c}))$(if $(filter 1,${lnaffcast_1x}),1x,)
-r2a_tag=$(if $(filter 0,${mode_resadd2a}),,r2a)$(if $(filter 0,${resadd2a_noop}),,noop$(patsubst 1,,${resadd2a_noop}))
+r2a_tag=$(if $(filter 0,${mode_resadd2a}),,r2a)$(if $(filter 0,${resadd2a_noop}),,noop$(patsubst 1,,${resadd2a_noop}))$(if $(filter 0,${resadd2a_bf16mul}),,bf16m)
 rtpr2a_tag=$(if $(filter 1,${rtp_mode_resadd2a}),rtp5,)$(if $(filter 0,${resadd2a_rows}),,r${resadd2a_rows})$(if $(filter 1.0,${resadd2a_scale}),,s$(subst .,,${resadd2a_scale}))
 rtplnaff_tag=$(if $(filter 1,${rtp_mode_lnaffcast}),rtp18,)$(if $(filter 0,${lnaffcast_rows}),,r${lnaffcast_rows})$(if $(filter 1,${lnaffcast_c_fanout}),fan,)$(if $(filter 1,${lnaffcast_group_rounds}),,g${lnaffcast_group_rounds})$(if ${lnaffcast_contig_taps},ctg${lnaffcast_contig_taps},)
 target_suffix=${M}x${K}x${N}_${m}x${k}x${n}_${n_aie_cols}c_${mode_tag}${out_tag}${panel_tag}${dep_tag}${abdep_tag}${l3dep_tag}${wrk_tag}${mt_tag}${re_tag}${nat_tag}${krtp_tag}${apanel_tag}${resadd_tag}${rtpresadd_tag}${raonly_tag}${bisect_tag}${mrl_tag}${krl_tag}${lnaff_tag}${rtplnaff_tag}${r2a_tag}${rtpr2a_tag}${opt_tag}
@@ -326,12 +330,30 @@ build/mm_silu_epilogue_${m}x${k}x${n}.o: ${kernels_dir}/mm_silu_epilogue.cc buil
 # traces only direct func.call edges from the core -- an object this one CALLED would never reach
 # the link line. LNA_COLS is a build parameter and shares the epilogue's EPI_M/K/N, which are what
 # fix the slab and row counts, so the same stamp dirties it.
-build/mm_mode_lnaffcast_${m}x${k}x${n}.o: ${kernels_dir}/mm_mode_lnaffcast.cc build/.epi_defines.stamp
+# A MODE OBJECT NEEDS ITS OWN STAMP. .epi_defines.stamp carries EPI_DEFINES only, so a mode whose
+# arm lives in a define of its own (LNA_COLS, RESADD2A_NOOP) is invisible to it: the object name is
+# the same for every arm, the source is unchanged, and make relinks the PREVIOUS arm's object into
+# the new xclbin. That is the same fault the stamp above was added for, and it recurred twice --
+# 2026-07-28 on epi_opt, and 2026-08-24 on RESADD2A_NOOP, where arms 5 and 6 came out with
+# byte-identical core ELFs. It only surfaced because the arms were diffed before being run.
+# See a-conditional-define-that-drops-its-value-measures-one-arm-as-three.
+LNAFF_DEFINES=-DLNA_COLS=${mode_lnaffcast}
+R2A_DEFINES=$(if $(filter 0,${resadd2a_noop}),, -DRESADD2A_NOOP=${resadd2a_noop})$(if $(filter 0,${resadd2a_bf16mul}),, -DRESADD2A_BF16_MUL=1)
+
+build/.lnaffcast_defines.stamp: FORCE
+	@mkdir -p ${@D}
+	@echo '${EPI_DEFINES} ${LNAFF_DEFINES}' | cmp -s - $@ || echo '${EPI_DEFINES} ${LNAFF_DEFINES}' > $@
+
+build/.resadd2a_defines.stamp: FORCE
+	@mkdir -p ${@D}
+	@echo '${EPI_DEFINES} ${R2A_DEFINES}' | cmp -s - $@ || echo '${EPI_DEFINES} ${R2A_DEFINES}' > $@
+
+build/mm_mode_lnaffcast_${m}x${k}x${n}.o: ${kernels_dir}/mm_mode_lnaffcast.cc build/.lnaffcast_defines.stamp
 	mkdir -p ${@D}
-	cd ${@D} && ${KERNEL_CC} ${KERNEL_CFLAGS} ${EPI_DEFINES} -DLNA_COLS=${mode_lnaffcast} -c $< -o ${@F}
+	cd ${@D} && ${KERNEL_CC} ${KERNEL_CFLAGS} ${EPI_DEFINES} ${LNAFF_DEFINES} -c $< -o ${@F}
 
 # both-on-A resadd mode object. Its own .cc for the same reason lnaffcast's is: an object the
 # core CALLS is not traced by AIEAssignCoreLinkFiles and never reaches the link line.
-build/mm_mode_resadd2a_${m}x${k}x${n}.o: ${kernels_dir}/mm_mode_resadd2a.cc build/.epi_defines.stamp
+build/mm_mode_resadd2a_${m}x${k}x${n}.o: ${kernels_dir}/mm_mode_resadd2a.cc build/.resadd2a_defines.stamp
 	mkdir -p ${@D}
-	cd ${@D} && ${KERNEL_CC} ${KERNEL_CFLAGS} ${EPI_DEFINES}$(if $(filter 0,${resadd2a_noop}),, -DRESADD2A_NOOP=${resadd2a_noop}) -c $< -o ${@F}
+	cd ${@D} && ${KERNEL_CC} ${KERNEL_CFLAGS} ${EPI_DEFINES}${R2A_DEFINES} -c $< -o ${@F}

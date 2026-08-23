@@ -48,11 +48,34 @@
 //   0 = both real   1 = both empty   2 = stage only   3 = apply only
 //   4 = stage writes a CONSTANT through the same address expression, apply empty. Separates
 //       "the stores do not land" from "the stores land carrying the wrong value".
+// Apply differs from stage in TWO ways -- it multiplies, and it reads the C tile back -- so 3
+// implicates both at once. 5 and 6 are that 2x2's remaining cells, stage empty in both:
+//   5 = apply MULTIPLIES but does not read C (store scale*b)
+//   6 = apply READS C but does not multiply (store C + b)
+// Arm 2 is the cell with neither and it passes, so whichever of 5/6 hangs carries the fault.
 #ifndef RESADD2A_NOOP
 #define RESADD2A_NOOP 0
 #endif
+#ifndef RESADD2A_BF16_MUL
+#define RESADD2A_BF16_MUL 0
+#endif
 #define RESADD2A_HAS_STAGE (RESADD2A_NOOP == 0 || RESADD2A_NOOP == 2 || RESADD2A_NOOP == 4)
-#define RESADD2A_HAS_APPLY (RESADD2A_NOOP == 0 || RESADD2A_NOOP == 3)
+#define RESADD2A_HAS_APPLY \
+  (RESADD2A_NOOP == 0 || RESADD2A_NOOP == 3 || RESADD2A_NOOP == 5 || RESADD2A_NOOP == 6)
+#define RESADD2A_APPLY_MULS (RESADD2A_NOOP != 6)
+
+// Put `scale*b` on the bf16 datapath instead of the f32 one. MEASURED: the f32 `aie::mul` is what
+// hangs the core -- multiply-without-reading-C is 9/9 TIMEOUT, read-C-without-multiplying is 7/9
+// COMPLETED (resadd2a-apply-hang-is-the-f32-multiply-not-the-rmw). Peano has no f32 vector
+// multiply, so it emulates one as a bf16 product chain, 8 vmul.f + 7 vadd.f per 16 lanes; b is
+// already bf16 and scale is a build constant, so that chain is reconstructing a product neither
+// operand needs widened.
+//
+// NOT an approximation for the scales that ship. Both factors are bf16, so their product carries
+// at most 16 mantissa bits and is EXACT in f32 -- the accumulate is accfloat, so nothing rounds.
+// The one requirement is that `scale` itself be bf16-representable; the encoder's two resadds use
+// 1.0 and 0.5, which are. A scale that is not is silently rounded, so it is checked on the host.
+#define RESADD2A_APPLY_READS_C (RESADD2A_NOOP != 5)
 
 static constexpr int kRun = EPI_R * EPI_K;      // contiguous f32 one C-drain run carries
 static constexpr int kRuns = EPI_M / EPI_R;     // runs per A tile
@@ -103,16 +126,30 @@ void mm_resadd2a_apply_f32(const bfloat16 *__restrict b, float *__restrict c,
 #if RESADD2A_HAS_APPLY
   float scale;
   __builtin_memcpy(&scale, &scale_bits, sizeof(scale));
-  const ::aie::vector<float, kLanes> sv = ::aie::broadcast<float, kLanes>(scale);
+  [[maybe_unused]] const ::aie::vector<float, kLanes> sv =
+      ::aie::broadcast<float, kLanes>(scale);
+  [[maybe_unused]] const ::aie::vector<bfloat16, kLanes> svb =
+      ::aie::broadcast<bfloat16, kLanes>((bfloat16)scale);
   float *__restrict dst = c + j * kRun;
   for (int i = 0; i < kRuns; ++i)
     for (int q = 0; q < kRun; q += kLanes) {
       ::aie::accum<accfloat, kLanes> bv;
       bv.from_vector(::aie::load_v<kLanes>(b + i * kRun + q), 0);
       float *__restrict p = dst + i * kStride + q;
+#if RESADD2A_APPLY_MULS && RESADD2A_BF16_MUL
+      ::aie::vector<float, kLanes> sb =
+          ::aie::mul(::aie::load_v<kLanes>(b + i * kRun + q), svb).to_vector<float>();
+#elif RESADD2A_APPLY_MULS
       ::aie::vector<float, kLanes> sb =
           ::aie::mul(bv.to_vector<float>(), sv).to_vector<float>();
+#else
+      ::aie::vector<float, kLanes> sb = bv.to_vector<float>();
+#endif
+#if RESADD2A_APPLY_READS_C
       ::aie::store_v(p, vfile(::aie::add(::aie::load_v<kLanes>(p), sb)));
+#else
+      ::aie::store_v(p, vfile(sb));
+#endif
     }
 #endif
   event1();
