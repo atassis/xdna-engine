@@ -1430,10 +1430,14 @@ impl NpuMatmul {
         // partial and the MHSA linear_out -- so its wire width follows the resident, while the
         // accumulator/residual stream on g3/g5 stays f32 for every other brick that reads it. That
         // asymmetry is the `bf16b` arm; picking it by drain width is what keeps a bf16-out resident
-        // from handing f32-in bricks half-width rows. s050's addend is acc_add's own f32 output, so
-        // it is not part of this.
+        // from handing f32-in bricks half-width rows.
         let b_elem = self.c_elem_bytes();
         let bsuf = if b_elem == 2 { "_bf16b" } else { "" };
+        // s050 joins that class only on the one-dispatch fc2, which returns the modal C ITSELF where
+        // the K-split returns acc_add's f32 -- so its addend width follows the ROUTE, not the
+        // resident. `_bf16b` here is unreachable until a bf16-out resident and a krtp one are the
+        // same artifact; the arm exists so that pairing is a build, not another source change.
+        let s050suf = if self.ffn_out_elem_bytes() == 2 { "_bf16b" } else { "" };
         // resident-FFN fc2 on-device accumulate (out=a+b f32), OPTIONAL: load only if built. acc0/acc1
         // ping-pong the running sum; `zero` (zeroed once) seeds the first partial (acc = partial0 + 0).
         let acc_add = {
@@ -1465,7 +1469,7 @@ impl NpuMatmul {
         };
         // scaled residual-add s050 (out = a + 0.5*b, f32), OPTIONAL: the Macaron FFN residual on-chip.
         let resadd_s050 = {
-            let stem = format!("resadd_{PAD_M}x{KRES}_s050");
+            let stem = format!("resadd_{PAD_M}x{KRES}_s050{s050suf}");
             let present = kernel_registry::xclbin_path(&self.ln_dir, &stem).exists()
                 && kernel_registry::insts_path(&self.ln_dir, &stem).exists();
             if present {
@@ -1479,7 +1483,7 @@ impl NpuMatmul {
                     kern, instr, n,
                 })
             } else {
-                eprintln!("[npu] resadd_s050 xclbin absent in {} -- residual_add_dev(0.5) unavailable (build final_resadd_{PAD_M}x{KRES}_s050)", self.ln_dir.display());
+                eprintln!("[npu] resadd_s050 xclbin absent in {} -- residual_add_dev(0.5) unavailable (build final_{stem})", self.ln_dir.display());
                 None
             }
         };
@@ -2664,16 +2668,35 @@ impl NpuMatmul {
         true
     }
 
+    /// Element width of the BO `ffn_dev_accum` returns -- the FFN boundary every downstream brick
+    /// and readback taps. NOT [`Self::c_elem_bytes`] on its own: the K-split route ends in acc_add,
+    /// whose OUT slot is f32 in every arm, while the one-dispatch route hands back the modal C
+    /// drain itself. So the boundary follows the ROUTE and the resident TOGETHER, and only their
+    /// conjunction (a bf16-out resident that is also a krtp one) narrows it.
+    fn ffn_out_elem_bytes(&self) -> usize {
+        if self.fc2_onedispatch_on() { self.c_elem_bytes() } else { 4 }
+    }
+
     /// Output BO for the one-dispatch fc2, lazily allocated against the RESIDENT kernel's C group.
     /// Deliberately not the stream's `bo_c` (shared by every dispatch on that key) and not the
     /// accadd scratch (allocated against another kernel's group, whose bank is what makes a
     /// mis-homed BO corrupt silently).
+    ///
+    /// Sized at the resident's OWN drain width, same rule as the accadd seed: this BO IS a modal C,
+    /// so a constant `*4` against a bf16-out resident describes a buffer twice the rows the drain
+    /// writes, and every consumer that sizes off it inherits that.
+    ///
+    /// Hygiene, NOT a correctness lever, and that is measured rather than assumed: the fold+krtp
+    /// arm returns byte-identical output at `*4` and at `*c_elem_bytes()` (rel-L2 0.9942 both, same
+    /// worst frame). Over-allocating a C drain is inert -- the BD chain writes what the instruction
+    /// stream says. Do not re-open this as a suspect for that arm's defect.
     fn fc2_out_bo(&self) -> Rc<Bo> {
         if let Some(bo) = self.fc2_out.borrow().as_ref() {
             return bo.clone();
         }
         let g5 = self.kern.group_id(5).unwrap();
-        let bo = Rc::new(self.dev.alloc_bo(&self.kern, PAD_M * KRES * 4, FLAG_HOST_ONLY, g5).unwrap());
+        let bytes = PAD_M * KRES * self.c_elem_bytes();
+        let bo = Rc::new(self.dev.alloc_bo(&self.kern, bytes, FLAG_HOST_ONLY, g5).unwrap());
         *self.fc2_out.borrow_mut() = Some(bo.clone());
         bo
     }
@@ -3146,13 +3169,15 @@ impl NpuMatmul {
         let m = x.nrows();
         let acc_bo = self.resident_ffn_dev(x, gamma, beta, make_w1, id1, make_w2, id2)?;
         acc_bo.sync_from_device().unwrap();
-        let mut cb = vec![0u8; m * KRES * 4];
+        // At the FFN boundary's own width, not f32: on the one-dispatch route this BO is a modal C,
+        // and reading a bf16 drain as f32 halves the rows covered instead of failing.
+        let w = self.ffn_out_elem_bytes();
+        let mut cb = vec![0u8; m * KRES * w];
         acc_bo.read_bytes(&mut cb).unwrap();
         let mut out = Array2::<f32>::zeros((m, KRES));
         for r in 0..m {
             for c in 0..KRES {
-                let off = (r * KRES + c) * 4;
-                out[[r, c]] = f32::from_le_bytes([cb[off], cb[off + 1], cb[off + 2], cb[off + 3]]);
+                out[[r, c]] = c_at(&cb, w, r * KRES + c);
             }
         }
         Some(out)
@@ -3255,7 +3280,8 @@ impl NpuMatmul {
     /// the baked-scale xclbin: s050 = 0.5 (Macaron residual) and s100 = 1.0 (MHSA residual) are both
     /// built; the FUSED_BLOCK path requires BOTH (gated by `resident_fused_available`). `a_bo` and the
     /// f32 [PAD_M,KRES] result are f32 for every scale; `b_bo` follows the loaded brick's addend width
-    /// -- f32 for s050, and for s100 whatever `c_elem_bytes` measured, since that addend is a modal C.
+    /// -- [`Self::ffn_out_elem_bytes`] for s050, whose addend is the FFN output, and for s100
+    /// whatever `c_elem_bytes` measured, since that addend is a modal C.
     /// Returns the device result (ResidualAdd scratch, overwritten by the next call). `None` when the
     /// selected-scale xclbin is absent; PANICS on an unbuilt scale.
     pub fn residual_add_dev(&self, a_bo: &Bo, b_bo: &Bo, scale: f32, _m: usize) -> Option<Rc<Bo>> {
