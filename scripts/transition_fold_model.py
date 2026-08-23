@@ -24,11 +24,13 @@ rate instead of the small one's. On the lnaffcast merge that is 48 arrivals x +1
 against 299.1 ms of saving; the saving-only projection reads 310.3 where the ledger pair moves
 217.0. See `survivor_charge`.
 
-SCOPE, and it is the open end of this model: the decomposition reproduces the PASS it is fitted on
-to 0.4% (-216.2 modelled vs -217.0 measured), which validates its structure -- but arrival costs
-are themselves per-pass, and that pass's -217.0 sits outside the 11-rep bracket for the same merge
-(-183.1 [-205.8, -160.4]). So the model's SHAPE is calibrated and its LEVEL is not: re-fit the
-arrival table over the same reps as the bracket before pricing an unbuilt merge with it.
+SCOPE, now measured over the bracket rather than guessed (scripts/arrival_refit_bracket.py, 11
+reps, no new device time): the model is SYSTEMATICALLY OPTIMISTIC by 21.8 ms [10.6, 33.1] on this
+merge -- -204.9 [-214.0, -195.8] modelled against -183.1 [-203.1, -163.1] measured, inside 10% in
+only 3/11 reps. It gets the sign, the transition count (-143 exact) and the magnitude right, so use
+it to RANK candidate merges, and discount ~12% before quoting one as a saving. The single pass it
+was first fitted on closed to 0.4%, which was luck: that pass moved -217.0 and sits outside the
+bracket entirely.
 
 Usage: transition_fold_model.py <report.txt> [--merge A,B] [--delete K]
   --merge   two kernel labels (substring match) whose contexts become one
@@ -158,9 +160,11 @@ def survivor_charge(rep, a, b, reconfig, bound):
     310.3 ms against a measured 217.0: 48 surviving arrivals were charged nothing when the ledger
     charges them +1.693 ms each.
 
-    reconfig(b) is taken as the merged program's rate, which this pair measures rather than assumes
-    -- the panel's fit moves 2.677 -> 2.691 after absorbing lnaffcast (+0.5%), so a merge does not
-    make the absorbing program dearer to enter.
+    reconfig(b) is taken as the merged program's rate BEFORE the merge, which understates it: over
+    11 reps the panel's fit moves 2.651 [2.610, 2.693] -> 2.765 [2.724, 2.807] after absorbing
+    lnaffcast, +0.114 ms [0.060, 0.168], dearer in 10/11 reps. A single pass reads that delta as
+    +0.014 and hides it. So the absorbing program does get dearer to enter, and this term is a
+    second, smaller charge the model does not yet carry -- see scripts/arrival_refit_bracket.py.
     """
     r_b = reconfig.get(b)
     r_a = reconfig.get(a, bound.get(a))
