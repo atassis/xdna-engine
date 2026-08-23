@@ -353,6 +353,7 @@ def my_matmul(
     lnaffcast_rows=0,
     lnaffcast_c_fanout=False,
     lnaffcast_group_rounds=1,
+    lnaffcast_contig_taps="",
 ):
     n_aie_rows = 4
     n_aie_cores = n_aie_rows * n_aie_cols
@@ -1078,6 +1079,39 @@ def my_matmul(
         # whole n_aie_rows * lnaff_rows_per_c block of consecutive output rows.
         c_sizes, c_strides = [16, 8, 16, 8], [1024, 8, 64, 1]
 
+        # --lnaffcast-contig-taps: the TIMING-ONLY control for
+        # lnaffcast-mode-taps-burst-at-16-bytes. Each named tap keeps its sizes, its offset and
+        # its footprint and gets the contiguous strides for those sizes, which raises the
+        # innermost run from 8 bf16 to the whole 4096-16384 elements. The walk is then WRONG --
+        # the un-permute is what the real strides encode -- so any arm built with this flag
+        # reads out garbage by construction and can only be compared on wall clock. Sizes are
+        # unchanged deliberately: the burst-length claim is that the same byte count at the same
+        # rank costs less when it is not scattered, so anything else moving would confound it.
+        if lnaffcast_contig_taps:
+            unknown = set(lnaffcast_contig_taps) - set("abc")
+            if unknown:
+                raise ValueError(
+                    f"--lnaffcast-contig-taps: unknown tap(s) {sorted(unknown)}, expected a "
+                    "subset of 'abc'"
+                )
+
+            def contiguous(sizes, strides):
+                got = [sizes[1] * sizes[2] * sizes[3], sizes[2] * sizes[3], sizes[3], 1]
+                span = lambda st: sum((s - 1) * d for s, d in zip(sizes, st))
+                if span(got) != span(strides):
+                    raise ValueError(
+                        f"contiguous restride of {sizes} spans {span(got)} against the real "
+                        f"walk's {span(strides)} -- not the same footprint, so it is not a control"
+                    )
+                return got
+
+            if "a" in lnaffcast_contig_taps:
+                a_strides = contiguous(a_sizes, a_strides)
+            if "b" in lnaffcast_contig_taps:
+                b_strides = contiguous(b_sizes, b_strides)
+            if "c" in lnaffcast_contig_taps:
+                c_strides = contiguous(c_sizes, c_strides)
+
         cols = mode_lnaffcast
         c_region = lnaffcast_rows * cols if lnaffcast_c_fanout else 0
 
@@ -1450,6 +1484,16 @@ def main():
         "separating them lets a probe check the copies agree. Costs n_aie_cols x the C tensor, "
         "so it divides the rows one dispatch covers by the same factor.",
     )
+    argparser.add_argument(
+        "--lnaffcast-contig-taps",
+        type=str,
+        default="",
+        metavar="ABC",
+        help="TIMING-ONLY control: give the named taps (subset of 'abc') contiguous strides at "
+        "unchanged sizes, offset and footprint, so only the innermost run changes. The output "
+        "is wrong by construction -- the real strides ARE the un-permute -- so an arm built "
+        "with this can be compared on wall clock and nothing else.",
+    )
     args = argparser.parse_args()
     maybe_module = my_matmul(
         args.dev,
@@ -1485,6 +1529,7 @@ def main():
         args.lnaffcast_rows,
         args.lnaffcast_c_fanout,
         args.lnaffcast_group_rounds,
+        args.lnaffcast_contig_taps,
     )
     if args.generate_taps:
         return maybe_module

@@ -120,6 +120,10 @@ lnaffcast_c_fanout?=0
 # Rounds per TaskGroup in the mode's sequence. tg.finish() is a host-side await, so 1 serialises
 # every round boundary; the GEMM finishes twice for a whole 512x1024x1024 for the same reason.
 lnaffcast_group_rounds?=1
+# TIMING-ONLY control for the 16 B burst claim: give the named taps (subset of abc) contiguous
+# strides at unchanged sizes/offset/footprint. The output is wrong by construction, so an arm
+# built with this is comparable on wall clock and on nothing else.
+lnaffcast_contig_taps?=
 
 # Read A from a [K/W, M, W] panel-major buffer instead of row-major [M, K] (0 = off). Mirror of
 # c_panel_width, for a GEMM whose producer already drained panel-major -- fc1 does, by default, so a
@@ -179,6 +183,9 @@ endif
 ifneq (${lnaffcast_group_rounds}, 1)
 aieargs+=--lnaffcast-group-rounds ${lnaffcast_group_rounds}
 endif
+ifneq (${lnaffcast_contig_taps},)
+aieargs+=--lnaffcast-contig-taps ${lnaffcast_contig_taps}
+endif
 
 # Distinct suffix so silu/bias/gelu artifacts never collide with the plain matmul's.
 mode_tag=$(if $(filter 1,${glu}),modalglu,$(if $(filter 1,${gelu}),modalgelu,$(if $(filter 1,${no_silu}),modalid,modalsilu)))
@@ -222,7 +229,7 @@ apanel_tag=$(if $(filter 0,${a_panel_width}),,apanel${a_panel_width})
 # The lnaffcast BODY is a different core ELF; the rtp arm is a different instruction stream on
 # that same xclbin. rows/fanout change only the stream, so they tag the stream and not the body.
 lnaff_tag=$(if $(filter 0,${mode_lnaffcast}),,lnaff${mode_lnaffcast})
-rtplnaff_tag=$(if $(filter 1,${rtp_mode_lnaffcast}),rtp18,)$(if $(filter 0,${lnaffcast_rows}),,r${lnaffcast_rows})$(if $(filter 1,${lnaffcast_c_fanout}),fan,)$(if $(filter 1,${lnaffcast_group_rounds}),,g${lnaffcast_group_rounds})
+rtplnaff_tag=$(if $(filter 1,${rtp_mode_lnaffcast}),rtp18,)$(if $(filter 0,${lnaffcast_rows}),,r${lnaffcast_rows})$(if $(filter 1,${lnaffcast_c_fanout}),fan,)$(if $(filter 1,${lnaffcast_group_rounds}),,g${lnaffcast_group_rounds})$(if ${lnaffcast_contig_taps},ctg${lnaffcast_contig_taps},)
 target_suffix=${M}x${K}x${N}_${m}x${k}x${n}_${n_aie_cols}c_${mode_tag}${out_tag}${panel_tag}${dep_tag}${abdep_tag}${l3dep_tag}${wrk_tag}${mt_tag}${re_tag}${nat_tag}${krtp_tag}${apanel_tag}${resadd_tag}${rtpresadd_tag}${raonly_tag}${bisect_tag}${mrl_tag}${krl_tag}${lnaff_tag}${rtplnaff_tag}${opt_tag}
 
 use_iron=1
