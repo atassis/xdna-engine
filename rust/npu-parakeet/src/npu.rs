@@ -638,9 +638,22 @@ const LN_MODE_GROUP_ROUNDS: usize = 4; // lnaffcast_group_rounds=4
 /// The lever is the transition, not the op. Measured on the encoder's own resident: the mode costs
 /// 579.3/549.1 us against the shipped standalone's 855.1 -- **-290.9 us/dispatch, -34.0%** -- and it
 /// charges fc1 nothing (fc1's instruction stream is byte-identical on both xclbins, the L1 allocation
-/// unmoved to the address). On top of that the f2 ledger's `lnaffcast -> panel-fc1` x96 and
-/// `panel-fc1 -> lnaffcast` x47 become intra-program: **143 transitions/clip deleted, -240.0 ms/clip**.
-/// Total **-267.9 ms/clip**.
+/// unmoved to the address).
+///
+/// WHAT IT IS WORTH DEPENDS ON WHAT fc1'S NEIGHBOURS ARE, and each row is bracketed rather than
+/// projected (blocking dispatch ledger, paired, one quiesced window each):
+///
+/// | composition                                     | transitions/clip | ms/clip                  |
+/// |-------------------------------------------------|------------------|--------------------------|
+/// | shipped default (hybrid)                        | 743 -> 695 (-48) | RISES (single pass)      |
+/// | `PARAKEET_FOLD_FC1`                             | 695 -> 575 (-120)| -128.9 [-133.6, -124.3]  |
+/// | + `FOLD_GLU` + `MODAL_EPI_SUFFIX=krtpkrl`       | 335 -> 192 (-143)| -183.1 [-205.8, -160.4]  |
+///
+/// The last row is the one the 96-in/47-out ledger always described; its COUNT reproduces exactly
+/// and its earlier -240.0 ms/clip projection does not -- that priced each boundary at 1.678 ms and
+/// the composition charges 1.085. On the shipped default the flag is still a small LOSS, because
+/// there is no `panel-fc1 -> lnaffcast` edge to delete and the surviving arrivals move into a
+/// costlier program to enter.
 ///
 /// OPT-IN, and the default flip is a separate decision -- it moves the encoder onto a different
 /// xclbin, which is exactly the class of change the shipped path gets gated on rather than inherits.
