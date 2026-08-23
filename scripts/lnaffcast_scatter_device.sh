@@ -11,9 +11,11 @@
 #   group A, baseline xclbin: <base>          derived C tap, contiguous write   -> must PASS
 #                             <base>ctgc      contiguous tap, contiguous write  -> must FAIL
 #                             <base:gemm>     GEMM stream                       -> control
-#   group B, scatter xclbin:  <scat>          derived C tap, SCATTERED write    -> must FAIL
-#                             <scat>ctgc      contiguous tap, SCATTERED write   -> must PASS
-#                             <scat:gemm>     GEMM stream                       -> control
+#   group B/C, scatter xclbins: <scat>        derived C tap, SCATTERED write    -> must FAIL
+#                              <scat>ctgc    contiguous tap, SCATTERED write   -> must PASS
+#                              <scat:gemm>   GEMM stream                       -> control
+# scat narrows the whole write pass to t lanes; scat2 keeps the arithmetic at 16 and splits only
+# the store, so the pair separates the datapath half of the scatter's cost from the store half.
 #
 # Single-tenant NPU: stops xdna-engine + npu-vox, verifies the device is actually free, and ALWAYS
 # restores them on exit including on abort. The free-device check is fuser + pgrep, never
@@ -60,8 +62,10 @@ run_group(){   # $1 = group name, $2 = host suffix, $3 = must-pass arm, $4.. = a
 
 run_group base "${BASE}rtp18g4" "${BASE}rtp18g4" \
     "${BASE}rtp18g4" "${BASE}rtp18g4ctgc" "${BASE}"
-run_group scat "${BASE}scatrtp18g4" "${BASE}scatrtp18g4ctgc" \
-    "${BASE}scatrtp18g4" "${BASE}scatrtp18g4ctgc" "${BASE}scat"
+for tag in ${SCAT_TAGS:-scat scat2}; do
+  run_group "$tag" "${BASE}${tag}rtp18g4" "${BASE}${tag}rtp18g4ctgc" \
+      "${BASE}${tag}rtp18g4" "${BASE}${tag}rtp18g4ctgc" "${BASE}${tag}"
+done
 
 log ""
 log "log: $LOG   rc=$rc"

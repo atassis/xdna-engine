@@ -42,9 +42,12 @@
 #define LNA_COLS 1024
 #endif
 
-// Which side undoes C_L2L3: 0 = the shim tap (the derived C strides), 1 = this
-// core, writing scattered so a contiguous tap is correct. A build parameter, not
-// a property of the tile.
+// Which side undoes C_L2L3, and at what width. 0 = the shim tap (the derived C
+// strides). 1 = this core, whole write pass narrowed to t lanes. 2 = this core,
+// arithmetic kept at N lanes and only the STORE split into N/t pieces -- 1 pays
+// half the f32 datapath for the scatter and 2 does not, which is the difference
+// lnaffcast-scatter-core-cost-is-not-a-constant left unattributed. A build
+// parameter, not a property of the tile.
 #ifndef LNA_SCATTER_C
 #define LNA_SCATTER_C 0
 #endif
@@ -121,7 +124,7 @@ static void lnaff_apply(const bfloat16 *restrict gb, float *restrict acc,
 
   for (int row = 0; row < kRowsPerC; row++) {
     const float *x = acc + row * LNA_COLS;
-#if !LNA_SCATTER_C
+#if LNA_SCATTER_C == 0
     bfloat16 *y = out + row * LNA_COLS;
 #endif
 
@@ -143,8 +146,8 @@ static void lnaff_apply(const bfloat16 *restrict gb, float *restrict acc,
       var_v = ::aie::add(var_v, sq);
     }
     float var = ::aie::reduce_add(var_v) / float(LNA_COLS);
-#if LNA_SCATTER_C
-    // The two scalars presented at the store width the scatter walks in.
+#if LNA_SCATTER_C == 1
+    // The two scalars presented at the store width this form walks in.
     ::aie::vector<float, kT> mean_v_t = ::aie::broadcast<float, kT>(mean);
     ::aie::vector<float, kT> inv_v_t =
         ::aie::broadcast<float, kT>(::aie::invsqrt(var + epsilon));
@@ -160,7 +163,7 @@ static void lnaff_apply(const bfloat16 *restrict gb, float *restrict acc,
     // runs on this same core from a different dispatch.
     const auto saved_rounding =
         ::aie::swap_rounding(::aie::rounding_mode::conv_even);
-#if LNA_SCATTER_C
+#if LNA_SCATTER_C == 1
     // Same arithmetic, narrower store. Each element is computed independently of
     // its neighbours (mean and inv are broadcasts), so kT lanes and N lanes are
     // bit-identical -- which is what lets the two forms be gated on one number.
@@ -174,6 +177,27 @@ static void lnaff_apply(const bfloat16 *restrict gb, float *restrict acc,
       acc_y.from_vector(::aie::add(ng, ::aie::load_v<kT>(beta + col)));
       ::aie::store_v(out + scatter_base(row, g),
                      acc_y.template to_vector<bfloat16>());
+    }
+#elif LNA_SCATTER_C == 2
+    // The scatter costs one address and N/kT stores; it does not have to cost the
+    // datapath. The arithmetic below is the LNA_SCATTER_C=0 loop unchanged, and
+    // only the store is split -- the N lanes of chunk i are the kT-groups
+    // i*kPerChunk .. +kPerChunk-1, which share the (n/t) digit, so their L1 bases
+    // are one arithmetic sequence at stride r*t.
+    constexpr int kPerChunk = N / kT;
+    static_assert(kNPerT % kPerChunk == 0,
+                  "a chunk must not straddle the (n/t) digit");
+    for (int i = 0; i < chunks; i++) {
+      ::aie::vector<float, N> d = ::aie::sub(::aie::load_v<N>(x + i * N), mean_v);
+      ::aie::vector<float, N> norm = ::aie::mul(d, inv_v);
+      ::aie::vector<float, N> ng =
+          ::aie::mul(norm, ::aie::load_v<N>(gamma + i * N));
+      ::aie::accum<accfloat, N> acc_y;
+      acc_y.from_vector(::aie::add(ng, ::aie::load_v<N>(beta + i * N)));
+      ::aie::vector<bfloat16, N> v = acc_y.template to_vector<bfloat16>();
+      const int base = scatter_base(row, i * kPerChunk);
+      for (int j = 0; j < kPerChunk; j++)
+        ::aie::store_v(out + base + j * (EPI_R * kT), v.template extract<kT>(j));
     }
 #else
     for (int i = 0; i < chunks; i++) {
