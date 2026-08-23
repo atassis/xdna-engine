@@ -348,6 +348,8 @@ def my_matmul(
     resadd_only=False,
     mode_read_late=False,
     k_read_late=False,
+    mode_lnaffcast=0,
+    rtp_mode_lnaffcast=False,
 ):
     n_aie_rows = 4
     n_aie_cores = n_aie_rows * n_aie_cols
@@ -512,6 +514,52 @@ def my_matmul(
         if (mode_resadd or resadd_only)
         else None
     )
+
+    # --mode-lnaffcast: LN + affine + cast as a mode of the BF16-OUT resident. It is the mirror
+    # of --mode-resadd's constraint rather than an exception to it -- resadd needs the f32-out
+    # path because it borrows the C tile as an accumulator, and this needs the bf16-out path
+    # because it needs `cacc` as staging and writes C exactly once, the way the epilogue does.
+    #
+    # Sizing, all forced by the shipped resident and none of it newly declared: one x row is
+    # LNA_COLS f32, an A tile carries m*k/2 f32, and a C tile holds m*n/LNA_COLS output rows.
+    # cacc is m*n f32, which is exactly those rows -- the staging buffer already exists.
+    lnaff_slabs = 0
+    lnaff_stage_kernel = lnaff_apply_kernel = None
+    if rtp_mode_lnaffcast and not mode_lnaffcast:
+        raise ValueError(
+            "--rtp-mode-lnaffcast selects the lnaffcast stream, but --mode-lnaffcast=<cols> is "
+            "what puts the body in the xclbin. Emitting the stream without the body would bake "
+            "a mode value no core can service."
+        )
+    if mode_lnaffcast:
+        if dtype_out_str != "bf16":
+            raise ValueError(
+                "--mode-lnaffcast needs the bf16-out path (dtype_out=bf16): it stages into the "
+                "per-core cacc and writes the C tile once, both of which exist only there. The "
+                "f32-out body has no cacc, and its C tile is the live accumulator."
+            )
+        a_tile_f32 = m * k // 2
+        if mode_lnaffcast % a_tile_f32:
+            raise ValueError(
+                f"--mode-lnaffcast={mode_lnaffcast} (cols) must be a whole number of A tiles: "
+                f"an A tile carries m*k/2 = {a_tile_f32} f32 at m={m} k={k}."
+            )
+        if (m * n) % mode_lnaffcast:
+            raise ValueError(
+                f"--mode-lnaffcast={mode_lnaffcast} (cols) must divide the C tile's m*n = "
+                f"{m * n}, or a C tile would hold a fractional output row."
+            )
+        # Slabs the mode consumes per C tile. This is ALSO the A fill count its own stream must
+        # program -- a mode with its own instruction stream sets its own fill contract and does
+        # not inherit the GEMM's k_trip A/B pairing.
+        lnaff_slabs = (m * n) // a_tile_f32
+        lnaff_obj = f"mm_mode_lnaffcast_{m}x{k}x{n}.o"
+        lnaff_stage_kernel = Kernel(
+            "mm_lnaff_stage_f32", lnaff_obj, [A_l1_ty, cacc_ty, np.int32]
+        )
+        lnaff_apply_kernel = Kernel(
+            "mm_lnaff_apply_f32", lnaff_obj, [B_l1_ty, cacc_ty, C_l1_ty]
+        )
 
     # Tile declarations as tile[row][col]
     tiles = [[(col, row) for col in range(0, n_aie_cols)] for row in range(0, 6)]
@@ -753,7 +801,17 @@ def my_matmul(
     # modal deleted to make the wide-N fast tile fit -- so a bf16-out build has a tighter L1
     # budget and may need a smaller m. The allocator, not this comment, is the authority.
     def core_fn_split_acc(
-        in_a, in_b, out_c, acc, rtp_buff, barrier, zero, matmul, epilogue
+        in_a,
+        in_b,
+        out_c,
+        acc,
+        rtp_buff,
+        barrier,
+        zero,
+        matmul,
+        epilogue,
+        lnaff_stage=None,
+        lnaff_apply=None,
     ):
         barrier.wait_for_value(1)
         loop = range(1)  # Workaround for issue #1547
@@ -764,26 +822,76 @@ def my_matmul(
             # span several dispatches, so a hoisted rtp read pairs with the wrong one.
             k_trip = None if k_read_late else (rtp_buff[1] if k_loop_rtp else K // k)
             elem_out = out_c.acquire(1)
-            zero(acc)
 
-            rest = k_trip
-            if k_read_late:
-                # Same peel as core_fn's GEMM path, and this is the body the mixed-K failure
-                # was measured on (bf16 out). See the comment there for why a stale k_trip
-                # desynchronises the fifos rather than merely mis-computing one tile.
+            def _gemm_path(peeled_a=None):
+                zero(acc)
+                rest = k_trip
+                if peeled_a is not None:
+                    # The A pair was already taken to get behind rtp (see below); finish it
+                    # here so the trip count and the fifo balance both still describe the
+                    # whole tile.
+                    eb = in_b.acquire(1)
+                    rest = _minus_one(rtp_buff[1] if k_read_late else k_trip)
+                    matmul(peeled_a, eb, acc)
+                    in_a.release(1)
+                    in_b.release(1)
+                elif k_read_late:
+                    # Same peel as core_fn's GEMM path, and this is the body the mixed-K
+                    # failure was measured on (bf16 out). See the comment there for why a
+                    # stale k_trip desynchronises the fifos rather than merely mis-computing
+                    # one tile.
+                    ea = in_a.acquire(1)
+                    eb = in_b.acquire(1)
+                    rest = _minus_one(rtp_buff[1])
+                    matmul(ea, eb, acc)
+                    in_a.release(1)
+                    in_b.release(1)
+                for _ in range_(rest):
+                    elem_in_a = in_a.acquire(1)
+                    elem_in_b = in_b.acquire(1)
+                    matmul(elem_in_a, elem_in_b, acc)
+                    in_a.release(1)
+                    in_b.release(1)
+                epilogue(acc, elem_out, rtp_buff)  # f32 acc -> bf16 C; rtp[0] selects the mode
+
+            if lnaff_apply is None:
+                _gemm_path()
+            else:
+                # PEEL ONE A ACQUIRE AND BRANCH BEHIND IT, for the reason --mode-read-late
+                # peels on the f32-out side: rtp is a side-channel with a MEASURED one-tile
+                # visibility lag, so a branch on a top-of-tile read runs the PREVIOUS
+                # dispatch's body on each core's first tile. One acquire of this dispatch's
+                # own data is enough -- measured on the K read, which is the stricter case
+                # (see k-read-after-first-acquire-fixes-mixed-k).
+                #
+                # Only A is peeled. The GEMM takes its B inside the branch, and lnaffcast
+                # takes exactly one B at the END: gb is a per-row weight, not a per-slab
+                # operand, so pairing it with A the way the GEMM does would make its own
+                # stream fill B lnaff_slabs times for one tile's worth of use.
                 ea = in_a.acquire(1)
-                eb = in_b.acquire(1)
-                rest = _minus_one(rtp_buff[1])
-                matmul(ea, eb, acc)
-                in_a.release(1)
-                in_b.release(1)
-            for _ in range_(rest):
-                elem_in_a = in_a.acquire(1)
-                elem_in_b = in_b.acquire(1)
-                matmul(elem_in_a, elem_in_b, acc)
-                in_a.release(1)
-                in_b.release(1)
-            epilogue(acc, elem_out, rtp_buff)  # f32 acc -> bf16 C; rtp[0] selects the mode
+                with scf_if_(
+                    # rtp[0] < 4 is the GEMM and its four epilogue modes, the same split the
+                    # f32-out body uses. A bf16-out build carries at most this one mode, so
+                    # every value at or above 4 lands here.
+                    _arith.cmpi(
+                        _arith.CmpIPredicate.slt,
+                        rtp_buff[0],
+                        _arith.constant(_T.i32(), 4),
+                    )
+                ) as if_op:
+                    _gemm_path(peeled_a=ea)
+                with scf_else_(if_op):
+                    # Python-unrolled, so each slot is a compile-time constant: the mode needs
+                    # no core-side counter and no loop-index cast to address its slab.
+                    lnaff_stage(ea, acc, 0)
+                    in_a.release(1)
+                    for slot in range(1, lnaff_slabs):
+                        elem_in_a = in_a.acquire(1)
+                        lnaff_stage(elem_in_a, acc, slot)
+                        in_a.release(1)
+                    elem_in_b = in_b.acquire(1)
+                    lnaff_apply(elem_in_b, acc, elem_out)
+                    in_b.release(1)
             out_c.release(1)
 
     # Per-core RTP (epilogue mode) + a shared runtime barrier. Each worker reads rtp[0].
@@ -842,6 +950,9 @@ def my_matmul(
                         "tile has nothing to write into."
                     )
                 args.append(resadd_kernel)
+            if lnaff_apply_kernel is not None:
+                # bf16-out only, checked at declaration; split_acc is that condition.
+                args += [lnaff_stage_kernel, lnaff_apply_kernel]
             workers.append(
                 Worker(
                     core_fn_split_acc if split_acc else core_fn,
@@ -919,10 +1030,17 @@ def my_matmul(
         # PROGRAM is the same either way, so the resadd arm and the GEMM arm are two insts
         # streams on ONE xclbin -- the host picks the op by choosing the stream, at no
         # program transition. Same mechanism the id/silu pair already ships on.
+        # 18 is the lnaffcast mode. It sits above resadd's 4 rather than reusing it so a stream
+        # cannot select the wrong family on a build that carries both bodies -- the core only
+        # tests `< 4`, but the VALUE is what a dispatch log and a bisect arm read.
         mode_val = (
-            4
-            if rtp_mode_resadd
-            else (3 if do_glu else (2 if do_gelu else (1 if do_silu else 0)))
+            18
+            if rtp_mode_lnaffcast
+            else (
+                4
+                if rtp_mode_resadd
+                else (3 if do_glu else (2 if do_gelu else (1 if do_silu else 0)))
+            )
         )
         for r in range(n_aie_rows):
             for c in range(n_aie_cols):
@@ -1192,6 +1310,23 @@ def main():
         "corrupt each other because the top-of-tile read samples whichever dispatch happened "
         "to enter the body.",
     )
+    argparser.add_argument(
+        "--mode-lnaffcast",
+        type=int,
+        default=0,
+        metavar="COLS",
+        help="put the lnaffcast body (LN + affine + f32->bf16 cast) in the xclbin, over rows of "
+        "COLS columns. BF16-OUT ONLY, the mirror of --mode-resadd's f32-out constraint: it "
+        "stages into the per-core cacc and writes the C tile once, and neither exists on the "
+        "f32-out path. Declares nothing -- one x row is two A tiles, gb is one B tile, and a C "
+        "tile holds m*n/COLS output rows, which is exactly cacc.",
+    )
+    argparser.add_argument(
+        "--rtp-mode-lnaffcast",
+        action="store_true",
+        help="bake rtp[0]=18 into THIS instruction stream, selecting the lnaffcast mode. Needs "
+        "--mode-lnaffcast (which puts the body in the xclbin). The two streams share one xclbin.",
+    )
     args = argparser.parse_args()
     maybe_module = my_matmul(
         args.dev,
@@ -1222,6 +1357,8 @@ def main():
         args.resadd_only,
         args.mode_read_late,
         args.k_read_late,
+        args.mode_lnaffcast,
+        args.rtp_mode_lnaffcast,
     )
     if args.generate_taps:
         return maybe_module
