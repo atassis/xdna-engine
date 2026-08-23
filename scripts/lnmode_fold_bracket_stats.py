@@ -48,6 +48,17 @@ COMPOSITIONS = {
         (("k0m", "k0", "MODE on krtpkrl"),),
         (),
     ),
+    # The stack, against the arm a caller actually gets today. The composition and the mode were
+    # each measured against their OWN baseline in their own window, so their sum is an addition
+    # across windows and not a measurement -- this set puts all three arms in one.
+    "stack": (
+        ["s0", "k0", "k0m"],
+        {"s0": "shipped default", "k0": "fold+glu+krtpkrl", "k0m": "  + LN_MODE"},
+        (("k0", "s0", "composition vs shipped"),
+         ("k0m", "s0", "comp+MODE vs shipped"),
+         ("k0m", "k0", "MODE, within this window")),
+        (),
+    ),
 }
 CTX = re.compile(r"hw_contexts:\s*(\d+)/")
 ENC = re.compile(r"^mean encode ([0-9.]+)s/clip", re.M)
