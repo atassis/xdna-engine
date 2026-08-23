@@ -354,6 +354,7 @@ def my_matmul(
     lnaffcast_c_fanout=False,
     lnaffcast_group_rounds=1,
     lnaffcast_contig_taps="",
+    lnaffcast_1x=False,
 ):
     n_aie_rows = 4
     n_aie_cores = n_aie_rows * n_aie_cols
@@ -528,7 +529,7 @@ def my_matmul(
     # LNA_COLS f32, an A tile carries m*k/2 f32, and a C tile holds m*n/LNA_COLS output rows.
     # cacc is m*n f32, which is exactly those rows -- the staging buffer already exists.
     lnaff_slabs = 0
-    lnaff_stage_kernel = lnaff_apply_kernel = None
+    lnaff_stage_kernel = lnaff_apply_kernel = lnaff_apply_x_kernel = None
     if rtp_mode_lnaffcast and not mode_lnaffcast:
         raise ValueError(
             "--rtp-mode-lnaffcast selects the lnaffcast stream, but --mode-lnaffcast=<cols> is "
@@ -572,6 +573,54 @@ def my_matmul(
             M * K // 2 // mode_lnaffcast,
             M * N // mode_lnaffcast // (n_aie_cols if lnaffcast_c_fanout else 1),
         )
+        # --lnaffcast-1x: SWAP which operand carries which thing. The duplication above is a
+        # property of WHICH fifo x arrives on, not of the mode: A_L2L1 is per-array-row and
+        # broadcast across the 8 columns, so x on A makes the columns compute the same rows.
+        # gb is a weight and wants exactly that broadcast; x wants the per-column fifo. So x
+        # goes on B and gb on A, and the row axis is broken by a SKIP -- a column's B stream
+        # carries n_aie_rows C tiles' worth and each core applies only its own share.
+        #
+        # The skip belongs on B for a size reason, not a taste one: a B tile is k*n/2 f32
+        # against an A tile's m*k/2, so one C tile of x is lnaff_b_per_c B tiles against
+        # lnaff_slabs A ones, and the skip costs n_aie_rows x that -- 8 acquire pairs per C
+        # tile here against the 64 the same skip on A would cost.
+        lnaff_b_f32 = k * n // 2
+        lnaff_rows_per_b = lnaff_b_f32 // mode_lnaffcast
+        lnaff_b_per_c = lnaff_gb_slabs = lnaff_rows_per_col = 0
+        if lnaffcast_1x:
+            if lnaffcast_c_fanout:
+                raise ValueError(
+                    "--lnaffcast-1x and --lnaffcast-c-fanout are contradictory: fanout exists "
+                    "to READ the n_aie_cols duplicate outputs, and 1x is the route that stops "
+                    "producing them. Every core writes distinct rows here."
+                )
+            if lnaff_b_f32 % mode_lnaffcast or lnaff_rows_per_c % lnaff_rows_per_b:
+                raise ValueError(
+                    f"--lnaffcast-1x needs a B tile to be a whole number of x rows and a C tile "
+                    f"a whole number of B tiles: b={lnaff_b_f32} f32, cols={mode_lnaffcast}, "
+                    f"rows/C={lnaff_rows_per_c}, rows/B={lnaff_rows_per_b}"
+                )
+            # gb is 2*cols f32 (gamma then beta) and now arrives as A tiles, so it must be a
+            # whole number of them -- the same divisibility --mode-lnaffcast already demands of
+            # an x row, applied to the operand that swapped places with it.
+            if (2 * mode_lnaffcast) % a_tile_f32:
+                raise ValueError(
+                    f"--lnaffcast-1x: gb is 2*{mode_lnaffcast} f32 and must be a whole number "
+                    f"of A tiles (m*k/2 = {a_tile_f32} f32)"
+                )
+            lnaff_b_per_c = lnaff_rows_per_c // lnaff_rows_per_b
+            lnaff_gb_slabs = (2 * mode_lnaffcast) // a_tile_f32
+            # A round is still ONE C tile per core; what changes is that all n_aie_cores of them
+            # are now useful, so the round covers n_aie_cols times the rows it used to.
+            lnaff_rows_per_col = lnaff_rows_per_c * n_aie_rows
+            lnaff_rows_per_round = lnaff_rows_per_col * n_aie_cols
+            # x rides B now and gb rides A, so the cap moves to the B tensor. A holds only gb.
+            lnaff_rows_cap = min(K * N // 2 // mode_lnaffcast, M * N // mode_lnaffcast)
+            if 2 * mode_lnaffcast > M * K:
+                raise ValueError(
+                    f"--lnaffcast-1x: gb needs {2 * mode_lnaffcast} f32 in the A tensor, which "
+                    f"holds {M * K // 2}"
+                )
         if not lnaffcast_rows:
             lnaffcast_rows = (lnaff_rows_cap // lnaff_rows_per_round) * lnaff_rows_per_round
         if lnaffcast_rows % lnaff_rows_per_round:
@@ -582,7 +631,12 @@ def my_matmul(
         if lnaffcast_rows > lnaff_rows_cap:
             raise ValueError(
                 f"--lnaffcast-rows={lnaffcast_rows} exceeds {lnaff_rows_cap}, what the declared "
-                f"A ({M * K} bf16) and C ({M * N} bf16) tensors hold at cols={mode_lnaffcast}"
+                + (
+                    f"B ({K * N} bf16) and C ({M * N} bf16)"
+                    if lnaffcast_1x
+                    else f"A ({M * K} bf16) and C ({M * N} bf16)"
+                )
+                + f" tensors hold at cols={mode_lnaffcast}"
                 + (f" x {n_aie_cols} fanout regions" if lnaffcast_c_fanout else "")
             )
         lnaff_obj = f"mm_mode_lnaffcast_{m}x{k}x{n}.o"
@@ -592,6 +646,14 @@ def my_matmul(
         lnaff_apply_kernel = Kernel(
             "mm_lnaff_apply_f32", lnaff_obj, [B_l1_ty, cacc_ty, C_l1_ty]
         )
+        if lnaffcast_1x:
+            # Same staging kernel -- it copies one A tile into cacc either way, and in the 1x
+            # route what it copies is a quarter of gb rather than an eighth of x. Only the apply
+            # changes side: it reads x out of the B tile in place, so the 1x route never stages
+            # an activation at all.
+            lnaff_apply_x_kernel = Kernel(
+                "mm_lnaff_apply_x_f32", lnaff_obj, [cacc_ty, B_l1_ty, C_l1_ty, np.int32]
+            )
 
     # Tile declarations as tile[row][col]
     tiles = [[(col, row) for col in range(0, n_aie_cols)] for row in range(0, 6)]
@@ -844,6 +906,8 @@ def my_matmul(
         epilogue,
         lnaff_stage=None,
         lnaff_apply=None,
+        lnaff_apply_x=None,
+        lnaff_row=0,
     ):
         barrier.wait_for_value(1)
         loop = range(1)  # Workaround for issue #1547
@@ -915,15 +979,41 @@ def my_matmul(
                 with scf_else_(if_op):
                     # Python-unrolled, so each slot is a compile-time constant: the mode needs
                     # no core-side counter and no loop-index cast to address its slab.
-                    lnaff_stage(ea, acc, 0)
-                    in_a.release(1)
-                    for slot in range(1, lnaff_slabs):
-                        elem_in_a = in_a.acquire(1)
-                        lnaff_stage(elem_in_a, acc, slot)
+                    if lnaff_apply_x is None:
+                        lnaff_stage(ea, acc, 0)
                         in_a.release(1)
-                    elem_in_b = in_b.acquire(1)
-                    lnaff_apply(elem_in_b, acc, elem_out)
-                    in_b.release(1)
+                        for slot in range(1, lnaff_slabs):
+                            elem_in_a = in_a.acquire(1)
+                            lnaff_stage(elem_in_a, acc, slot)
+                            in_a.release(1)
+                        elem_in_b = in_b.acquire(1)
+                        lnaff_apply(elem_in_b, acc, elem_out)
+                        in_b.release(1)
+                    else:
+                        # THE 1x ROUTE. A now carries gb, so the peeled acquire that gets this
+                        # branch behind rtp is gb's first slab rather than x's -- the peel is
+                        # about ORDER, not about which operand, so it survives the swap.
+                        lnaff_stage(ea, acc, 0)
+                        in_a.release(1)
+                        for slot in range(1, lnaff_gb_slabs):
+                            elem_in_a = in_a.acquire(1)
+                            lnaff_stage(elem_in_a, acc, slot)
+                            in_a.release(1)
+                        # x arrives on the column's B fifo, which is broadcast down the
+                        # n_aie_rows cores of the column, so EVERY core must consume every tile
+                        # for the fifo to advance. Each applies only the lnaff_b_per_c tiles
+                        # that are its own; the rest are an acquire/release pair and touch no
+                        # data. The share is a Python constant, so the skip costs no branch.
+                        for j in range(lnaff_b_per_c * n_aie_rows):
+                            elem_in_b = in_b.acquire(1)
+                            if j // lnaff_b_per_c == lnaff_row:
+                                lnaff_apply_x(
+                                    acc,
+                                    elem_in_b,
+                                    elem_out,
+                                    (j % lnaff_b_per_c) * lnaff_rows_per_b,
+                                )
+                            in_b.release(1)
             out_c.release(1)
 
     # Per-core RTP (epilogue mode) + a shared runtime barrier. Each worker reads rtp[0].
@@ -985,13 +1075,18 @@ def my_matmul(
             if lnaff_apply_kernel is not None:
                 # bf16-out only, checked at declaration; split_acc is that condition.
                 args += [lnaff_stage_kernel, lnaff_apply_kernel]
-            workers.append(
-                Worker(
-                    core_fn_split_acc if split_acc else core_fn,
-                    args,
-                    stack_size=_stack_size(),
-                )
-            )
+            body = core_fn_split_acc if split_acc else core_fn
+            if lnaff_apply_x_kernel is not None:
+                args.append(lnaff_apply_x_kernel)
+                # The array row picks which share of the column's B stream this core applies.
+                # It is bound in a closure rather than appended to args because fn_args are
+                # registered as CORE arguments and a Python int is not one -- and the body is
+                # traced inline per tile (Worker calls core_fn inside @core), so a per-row
+                # closure costs nothing and needs no distinct name.
+                def body(*fn_args, _row=row):
+                    return core_fn_split_acc(*fn_args, lnaff_row=_row)
+
+            workers.append(Worker(body, args, stack_size=_stack_size()))
 
     tb_max_n_rows = 4
     # DERIVED, not `tb_max_n_rows // 2`: the C tiler below asks for exactly this many row-blocks, so a
@@ -1079,6 +1174,20 @@ def my_matmul(
         # whole n_aie_rows * lnaff_rows_per_c block of consecutive output rows.
         c_sizes, c_strides = [16, 8, 16, 8], [1024, 8, 64, 1]
 
+        if lnaffcast_1x:
+            # The operands swapped sides, and the WALKS follow them unchanged -- what a tap
+            # undoes is its fifo's L2->L1 shuffle, which is a property of the fifo, not of what
+            # rides it. So the 1x taps are the same two walks above at new counts and offsets:
+            #
+            #   one A tile  = [4, 8, 4, 8] / [256, 8, 64, 1]   over 1024 contiguous bf16
+            #   one B tile  = [4, 8, 16, 8] / [1024, 8, 64, 1] over 4096 contiguous bf16
+            #
+            # and consecutive tiles merge into the LEADING digit rather than adding a dimension
+            # (1024 == 4 x 256, 4096 == 4 x 1024), which is the same merge the 8x A tap already
+            # relies on and is why all three still fit the shim's 4 dims.
+            a_sizes = [4 * lnaff_gb_slabs, 8, 4, 8]             # gb, now on A
+            b_sizes = [4 * lnaff_b_per_c * n_aie_rows, 8, 16, 8]  # x, one column's share
+
         # --lnaffcast-contig-taps: originally the TIMING-ONLY control for
         # lnaffcast-mode-taps-burst-at-16-bytes. Each named tap keeps its sizes, its offset and
         # its footprint and gets the contiguous strides for those sizes, which raises the
@@ -1131,19 +1240,33 @@ def my_matmul(
             if rnd % lnaffcast_group_rounds == 0:
                 tg = TaskGroup()
             for col in range(n_aie_cols):
+                # 8x: every column drains the SAME rows (they computed the same thing), so the
+                # offset does not move with col and --lnaffcast-c-fanout is what separates them
+                # to be read. 1x: a column owns lnaff_rows_per_col consecutive rows, and its
+                # n_aie_rows cores split them, so the SAME drain walk lands at a col offset.
+                col_base = base + (col * lnaff_rows_per_col if lnaffcast_1x else 0)
                 tap_c = TensorAccessPattern(
-                    (M * N,), col * c_region + base * cols, c_sizes, c_strides
+                    (M * N,), col * c_region + col_base * cols, c_sizes, c_strides
                 )
                 C_taps.append(tap_c)
                 C_conses[col].drain(C, tap=tap_c, wait=True, group=tg)
 
-                tap_b = TensorAccessPattern((K * N,), 0, b_sizes, b_strides)
+                # 8x: B is gb, one tile, identical for every column. 1x: B is x, and this is
+                # the fifo the whole route turns on -- per column, so the columns diverge.
+                tap_b = TensorAccessPattern(
+                    (K * N,), col_base * cols * 2 if lnaffcast_1x else 0, b_sizes, b_strides
+                )
                 B_taps.append(tap_b)
                 B_prods[col].fill(B, tap=tap_b, group=tg)
 
             for row in range(n_aie_rows):
+                # 8x: A is x, one C tile's worth per array row. 1x: A is gb -- the same bytes
+                # to every row, which is what the broadcast is for and why the offset is 0.
                 tap_a = TensorAccessPattern(
-                    (M * K,), (base + row * lnaff_rows_per_c) * cols * 2, a_sizes, a_strides
+                    (M * K,),
+                    0 if lnaffcast_1x else (base + row * lnaff_rows_per_c) * cols * 2,
+                    a_sizes,
+                    a_strides,
                 )
                 A_taps.append(tap_a)
                 A_prods[row].fill(A, tap=tap_a, group=tg)
@@ -1499,6 +1622,14 @@ def main():
         "is wrong by construction -- the real strides ARE the un-permute -- so an arm built "
         "with this can be compared on wall clock and nothing else.",
     )
+    argparser.add_argument(
+        "--lnaffcast-1x",
+        action="store_true",
+        help="swap the operands: x rides B (per column) and gb rides A (per row, broadcast). "
+        "The columns of an array row share an A fifo, so x on A makes all n_aie_cols of them "
+        "compute the same output rows -- 4 useful C tiles per round of 32. This route makes "
+        "every core's output distinct, at the cost of a n_aie_rows-way skip on the B stream.",
+    )
     args = argparser.parse_args()
     maybe_module = my_matmul(
         args.dev,
@@ -1535,6 +1666,7 @@ def main():
         args.lnaffcast_c_fanout,
         args.lnaffcast_group_rounds,
         args.lnaffcast_contig_taps,
+        args.lnaffcast_1x,
     )
     if args.generate_taps:
         return maybe_module

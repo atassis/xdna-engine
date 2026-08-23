@@ -18,6 +18,16 @@
 // is 4 dims only because its outer slab dimension merges with the leading digit
 // (512 == 4 x 128). See lnaffcast-mode-taps-fit-the-shim-in-four-dims.
 //
+// THE 1x ROUTE (LNA_ONE_X on the generator side; this file needs no #if for it,
+// only the extra entry point below). A_L2L1 lists EIGHT consumer cores, so with x
+// on A the 8 columns of an array row compute the SAME output: 1x on the read, 8x
+// on the write, 4 useful C tiles per round of 32. Swapping the operands fixes it
+// -- x on B is per-column and gb on A is a weight, which is what a broadcast is
+// FOR. The row axis is then broken by a skip: a column's B stream carries
+// n_aie_rows C tiles' worth and each core acquires all of them and applies only
+// its own, which is 8 acquire pairs per C tile against the 64 the same skip on A
+// would cost, because a B tile is 4 A tiles.
+//
 // LNA_SCATTER_C moves the C un-permute off the tap and onto this core, which is
 // the OTHER side of that choice and the one the tap derivation never priced.
 // Those C strides burst at 16 B and cost 56.8% of the mode's dispatch time
@@ -57,11 +67,25 @@
 static constexpr int kSlabF32 = EPI_M * EPI_K / 2;
 static constexpr int kRowsPerC = EPI_M * EPI_N / LNA_COLS;
 
+// The 1x route swaps which operand carries which thing: x rides B (per-column,
+// so the 8 columns stop computing the same rows) and gb rides A (per-row and
+// broadcast across columns, which is CORRECT for a weight). So the "operand is
+// a whole number of output rows" property kSlabF32 gives A is what the B tile
+// needs here, and gb is staged into cacc instead of x.
+static constexpr int kBTileF32 = EPI_K * EPI_N / 2;
+static constexpr int kRowsPerB = kBTileF32 / LNA_COLS;
+
 static_assert(EPI_M * EPI_N == kRowsPerC * LNA_COLS,
               "C tile must hold a whole number of output rows");
 static_assert(LNA_COLS % kSlabF32 == 0,
               "an x row must be a whole number of A tiles");
 static_assert(LNA_COLS % 16 == 0, "the write pass walks 16 lanes at a time");
+static_assert(kBTileF32 == kRowsPerB * LNA_COLS,
+              "a B tile must be a whole number of x rows for the 1x route");
+static_assert(kRowsPerC % kRowsPerB == 0,
+              "a C tile must be a whole number of B tiles for the 1x route");
+static_assert(2 * LNA_COLS <= EPI_M * EPI_N,
+              "cacc must hold gb ([gamma|beta]) for the 1x route");
 
 #if LNA_SCATTER_C
 // C_L2L3's own walk, read off the generator: sizes (m/r, r, n/t, t) against
@@ -111,21 +135,27 @@ static void lnaff_stage(const bfloat16 *restrict a, float *restrict acc) {
 // DEFAULT mode (ctxLN never sets one) and conv_even is swapped in ONLY around
 // the affine+cast write. Setting conv_even up front changes the reduction
 // rounding and regressed WER 8.2 -> 8.8, compounded over 24 layers.
-template <int N>
-static void lnaff_apply(const bfloat16 *restrict gb, float *restrict acc,
-                        bfloat16 *restrict out) {
+template <int N, int ROWS>
+static void lnaff_apply_rows(const float *restrict gbf, const float *restrict xsrc,
+                             bfloat16 *restrict out, int row_base) {
   event0();
   constexpr float epsilon = 1e-5f;
   constexpr int chunks = LNA_COLS / N;
-  // gb is [gamma | beta], one B tile, f32 like the activations above.
-  const float *gbf = reinterpret_cast<const float *>(gb);
+  // gb is [gamma | beta], f32 like the activations. WHERE it is read from is the
+  // route's choice -- a B tile in the 8x route, cacc in the 1x one -- and the
+  // arithmetic below must not be able to tell, or the two routes cannot be gated
+  // on one parity number.
   const float *gamma = gbf;
   const float *beta = gbf + LNA_COLS;
 
-  for (int row = 0; row < kRowsPerC; row++) {
-    const float *x = acc + row * LNA_COLS;
+  for (int row = 0; row < ROWS; row++) {
+    const float *x = xsrc + row * LNA_COLS;
+    // The output row inside the C tile. In the 8x route xsrc IS the whole C
+    // tile's worth so the two indices coincide; in the 1x route one B tile is
+    // kRowsPerB of the tile's kRowsPerC rows and row_base says which.
+    const int orow = row_base + row;
 #if LNA_SCATTER_C == 0
-    bfloat16 *y = out + row * LNA_COLS;
+    bfloat16 *y = out + orow * LNA_COLS;
 #endif
 
     // pass 1: mean = Sx / cols
@@ -175,7 +205,7 @@ static void lnaff_apply(const bfloat16 *restrict gb, float *restrict acc,
           ::aie::mul(norm, ::aie::load_v<kT>(gamma + col));
       ::aie::accum<accfloat, kT> acc_y;
       acc_y.from_vector(::aie::add(ng, ::aie::load_v<kT>(beta + col)));
-      ::aie::store_v(out + scatter_base(row, g),
+      ::aie::store_v(out + scatter_base(orow, g),
                      acc_y.template to_vector<bfloat16>());
     }
 #elif LNA_SCATTER_C == 2
@@ -195,7 +225,7 @@ static void lnaff_apply(const bfloat16 *restrict gb, float *restrict acc,
       ::aie::accum<accfloat, N> acc_y;
       acc_y.from_vector(::aie::add(ng, ::aie::load_v<N>(beta + i * N)));
       ::aie::vector<bfloat16, N> v = acc_y.template to_vector<bfloat16>();
-      const int base = scatter_base(row, i * kPerChunk);
+      const int base = scatter_base(orow, i * kPerChunk);
       for (int j = 0; j < kPerChunk; j++)
         ::aie::store_v(out + base + j * (EPI_R * kT), v.template extract<kT>(j));
     }
@@ -224,9 +254,20 @@ void mm_lnaff_stage_f32(const bfloat16 *__restrict a, float *__restrict acc,
   lnaff_stage<16>(a, acc + slot * kSlabF32);
 }
 
-// gb + the staged accumulator -> the bf16 C tile.
+// gb + the staged accumulator -> the bf16 C tile. The 8x route: x came in on A
+// and was staged, gb is one B tile.
 void mm_lnaff_apply_f32(const bfloat16 *__restrict gb, float *__restrict acc,
                         bfloat16 *__restrict out) {
-  lnaff_apply<16>(gb, acc, out);
+  lnaff_apply_rows<16, kRowsPerC>(reinterpret_cast<const float *>(gb), acc, out, 0);
+}
+
+// The 1x route's apply: gb is already staged in cacc (kSlabF32 at a time, by the
+// call above), and x is read STRAIGHT out of the B tile -- one B tile is
+// kRowsPerB whole output rows, so nothing needs staging on the activation side
+// and the 8x route's whole L1->L1 copy pass disappears with it.
+void mm_lnaff_apply_x_f32(float *__restrict gbbuf, const bfloat16 *__restrict xb,
+                          bfloat16 *__restrict out, int32_t row_base) {
+  lnaff_apply_rows<16, kRowsPerB>(gbbuf, reinterpret_cast<const float *>(xb), out,
+                                  row_base);
 }
 }

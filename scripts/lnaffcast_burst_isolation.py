@@ -102,22 +102,29 @@ def tap_bursts(build_dir, suffix):
     return out
 
 
-def operands(x):
+def operands(x, one_x=False):
     """A, B, C as the mode reads them, plus the host reference for y.
 
     x rides the A tensor as f32-in-bf16 and gb = [gamma | beta] rides B the same way -- both are
     the GEMM's own bf16 operand buffers, reinterpreted by the mode body. C is poisoned with NaN so
     a dispatch that wrote nothing reads as nan rather than as the previous arm's output.
+
+    --one-x swaps them, because that swap IS the 1x route: x on B is per-column so the 8 columns
+    of an array row stop computing the same rows, and gb on A gets the broadcast a weight wants.
+    Nothing else about the operands changes -- same values, same dtype-in-dtype borrow, same
+    reference -- so a 1x arm and an 8x arm are gated on one parity number.
     """
     rng = np.random.default_rng(seed=7)
     gamma = rng.normal(1.0, 0.1, COLS).astype(np.float32)
     beta = rng.normal(0.0, 0.1, COLS).astype(np.float32)
+    rows = x.shape[0]
 
     a = np.zeros(M * K, dtype=bfloat16)
-    a.view(np.float32)[: ROWS * COLS] = x.reshape(-1)
     b = np.zeros(K * N, dtype=bfloat16)
-    b.view(np.float32)[:COLS] = gamma
-    b.view(np.float32)[COLS: 2 * COLS] = beta
+    xt, gt = (b, a) if one_x else (a, b)
+    xt.view(np.float32)[: rows * COLS] = x.reshape(-1)
+    gt.view(np.float32)[:COLS] = gamma
+    gt.view(np.float32)[COLS: 2 * COLS] = beta
     c = np.full(M * N, np.nan, dtype=bfloat16)
 
     mean = x.mean(axis=1, keepdims=True)
@@ -171,8 +178,8 @@ def main(o):
         runs = " ".join(f"{a}:{r}el({r * 2}B)" for a, (_s, _st, r) in sorted(bursts[suffix].items()))
         print(f"  {suffix.replace(o.host, '<host>'):<22s} {runs}")
 
-    x = np.random.default_rng(seed=11).standard_normal((ROWS, COLS)).astype(np.float32)
-    a, b, c, ref = operands(x)
+    x = np.random.default_rng(seed=11).standard_normal((o.rows, COLS)).astype(np.float32)
+    a, b, c, ref = operands(x, one_x=o.one_x)
 
     results = {s: {"blocks": {}, "taps": {k: {"sizes": v[0], "strides": v[1], "innermost_run": v[2]}
                                           for k, v in bursts[s].items()}} for s in o.arms}
@@ -192,7 +199,7 @@ def main(o):
                           Ct.buffer_object()).wait()
                 us.append((time.perf_counter_ns() - t0) / 1000.0)
             Ct.to("cpu")
-            got = np.asarray(Ct)[: ROWS * COLS].reshape(ROWS, COLS).astype(np.float64)
+            got = np.asarray(Ct)[: o.rows * COLS].reshape(o.rows, COLS).astype(np.float64)
             steady = us[1:] or us
             rec = {"us": us, "median_us": statistics.median(steady), "parity": parity(got, ref)}
             results[suffix]["blocks"][bname] = rec
@@ -236,8 +243,8 @@ def main(o):
               f"(rel-L2 {p_['rel_l2']:.4e} vs gate {o.rel_l2_gate:.1e}){note}")
 
     with open(o.out, "w") as f:
-        json.dump({"host": o.host, "shape": [M, K, N], "cols": COLS, "rows": ROWS,
-                   "reps": o.reps, "parity_must_pass": sorted(must_pass),
+        json.dump({"host": o.host, "shape": [M, K, N], "cols": COLS, "rows": o.rows,
+                   "one_x": o.one_x, "reps": o.reps, "parity_must_pass": sorted(must_pass),
                    "results": results}, f, indent=2)
     print(f"\nwrote {o.out}")
     return 0 if ok else 1
@@ -257,5 +264,12 @@ if __name__ == "__main__":
     p.add_argument("--parity-must-pass", nargs="*", default=None,
                    help="arms expected to pass parity (default: the first arm). Every other arm "
                         "is gated on FAILING -- against LNA_SCATTER_C=1 that is the derived tap.")
+    p.add_argument("--rows", type=int, default=ROWS,
+                   help="x rows the arms cover. Must match what the streams were BUILT for "
+                        "(lnaffcast_rows) -- the tap count is baked, this only sizes the operands "
+                        "and the reference.")
+    p.add_argument("--one-x", action="store_true",
+                   help="operands for the 1x route: x on B and gb on A, the swap that stops the "
+                        "8 columns of an array row computing the same output rows.")
     p.add_argument("--out", default="artifacts/lnaffcast_burst_isolation.json")
     sys.exit(main(p.parse_args()))
