@@ -58,9 +58,12 @@ from aie.utils.npukernel import NPUKernel
 from aie.utils.tensor_factory import tensor
 import aie.utils as aie_utils
 
-# The shipped resident's own shape, which is what the taps are derived for -- the generator
-# refuses any other, so these are read-only here.
-M, K, N = 512, 1024, 1024
+# The GEMM shape only sizes the A/B/C host buffers, and it is READ OFF THE DESIGN NAME rather than
+# fixed here. It used to be `M, K, N = 512, 1024, 1024` under "the generator refuses any other" --
+# which was never true and is now load-bearing: the merge runs this mode on the encoder's own
+# resident, 512x1024x4096, where a B tensor sized for N=1024 is a quarter of what the 1x route's
+# x tap walks.
+SHAPE_RE = re.compile(r"^(\d+)x(\d+)x(\d+)_")
 COLS = 1024      # --mode-lnaffcast: the lnaffcast embedding dim
 ROWS = 256       # x rows one dispatch covers, the default cap for these tensors
 EPS = 1e-5       # mm_mode_lnaffcast.cc's epsilon, and ln_affine_cast.cc's before it
@@ -102,7 +105,7 @@ def tap_bursts(build_dir, suffix):
     return out
 
 
-def operands(x, one_x=False):
+def operands(x, shape, one_x=False):
     """A, B, C as the mode reads them, plus the host reference for y.
 
     x rides the A tensor as f32-in-bf16 and gb = [gamma | beta] rides B the same way -- both are
@@ -114,6 +117,7 @@ def operands(x, one_x=False):
     Nothing else about the operands changes -- same values, same dtype-in-dtype borrow, same
     reference -- so a 1x arm and an 8x arm are gated on one parity number.
     """
+    M, K, N = shape
     rng = np.random.default_rng(seed=7)
     gamma = rng.normal(1.0, 0.1, COLS).astype(np.float32)
     beta = rng.normal(0.0, 0.1, COLS).astype(np.float32)
@@ -178,8 +182,16 @@ def main(o):
         runs = " ".join(f"{a}:{r}el({r * 2}B)" for a, (_s, _st, r) in sorted(bursts[suffix].items()))
         print(f"  {suffix.replace(o.host, '<host>'):<22s} {runs}")
 
+    # The design name carries the shape it was built for, so the buffers are sized from the HOST
+    # design rather than from a constant that only ever matched one vehicle.
+    mshape = SHAPE_RE.match(o.host)
+    if not mshape:
+        sys.exit(f"cannot read MxKxN off the host design name: {o.host}")
+    shape = tuple(int(g) for g in mshape.groups())
+    print(f"--- shape {shape[0]}x{shape[1]}x{shape[2]}, read off the host design name ---")
+
     x = np.random.default_rng(seed=11).standard_normal((o.rows, COLS)).astype(np.float32)
-    a, b, c, ref = operands(x, one_x=o.one_x)
+    a, b, c, ref = operands(x, shape, one_x=o.one_x)
 
     results = {s: {"blocks": {}, "taps": {k: {"sizes": v[0], "strides": v[1], "innermost_run": v[2]}
                                           for k, v in bursts[s].items()}} for s in o.arms}
@@ -224,7 +236,11 @@ def main(o):
         print(f"  {suffix.replace(o.host, '<host>'):<22s} max innermost run {run:>6d} el  "
               f"{'  '.join(line)}   block spread {agree:.1%}")
 
-    must_pass = set(o.parity_must_pass or [o.arms[0]])
+    # `is None` and not `or`: nargs="*" makes an EXPLICIT empty list mean "no arm should pass this
+    # reference", which is what a wall-clock-only control group is (a GEMM stream gated against an
+    # LN reference fails by construction). Under `or` the two collapse and the group reports a
+    # spurious failure on the arm it was measuring.
+    must_pass = set(o.arms[:1] if o.parity_must_pass is None else o.parity_must_pass)
     unknown = must_pass - set(o.arms)
     if unknown:
         sys.exit(f"--parity-must-pass names arms that are not in --arms: {sorted(unknown)}")
@@ -243,7 +259,7 @@ def main(o):
               f"(rel-L2 {p_['rel_l2']:.4e} vs gate {o.rel_l2_gate:.1e}){note}")
 
     with open(o.out, "w") as f:
-        json.dump({"host": o.host, "shape": [M, K, N], "cols": COLS, "rows": o.rows,
+        json.dump({"host": o.host, "shape": list(shape), "cols": COLS, "rows": o.rows,
                    "one_x": o.one_x, "reps": o.reps, "parity_must_pass": sorted(must_pass),
                    "results": results}, f, indent=2)
     print(f"\nwrote {o.out}")
