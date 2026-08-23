@@ -64,6 +64,8 @@ M, K, N = 512, 1024, 1024
 COLS = 1024      # the lnaffcast embedding dim
 EPS = 1e-5       # mm_mode_lnaffcast.cc's epsilon
 
+# The 4-column set is the same route on a second axis, so the arms are named off --base rather
+# than off one design.
 BASE = "512x1024x1024_32x32x128_8c_modalidbf16outkrtpkrllnaff1024scat21x"
 
 
@@ -132,7 +134,7 @@ def main(o):
     for spec in o.arms:
         name, kind, rows = spec.split(":")
         rows = int(rows)
-        suffix = o.gemm_suffix if kind == "gemm" else f"{BASE}rtp18r{rows}g4ctgc"
+        suffix = o.gemm_suffix if kind == "gemm" else f"{o.base}rtp18r{rows}g4ctgc"
         insts = os.path.join(o.build_dir, f"insts_{suffix}.txt")
         if not os.path.exists(insts):
             sys.exit(f"missing insts: {insts}")
@@ -361,10 +363,12 @@ if __name__ == "__main__":
                                           "matrix_multiplication/whole_array/build")
     p.add_argument("--artifacts", default="artifacts")
     p.add_argument("--kernel", default="MLIR_AIE")
-    p.add_argument("--host", default=f"{BASE}rtp18r256g4ctgc",
-                   help="the ONE xclbin every arm's stream runs on")
-    p.add_argument("--gemm-suffix", default=BASE,
-                   help="the GEMM stream's insts suffix (the mode's host program)")
+    p.add_argument("--base", default=BASE,
+                   help="design prefix the lnaff arms name their streams off")
+    p.add_argument("--host", default=None,
+                   help="the ONE xclbin every arm's stream runs on (default <base>rtp18r256g4ctgc)")
+    p.add_argument("--gemm-suffix", default=None,
+                   help="the GEMM stream's insts suffix (default <base>)")
     p.add_argument("--arms", nargs="+",
                    default=["lnaff128:lnaff:128", "lnaff256:lnaff:256",
                             "lnaff384:lnaff:384", "lnaff512:lnaff:512", "gemm:gemm:0"],
@@ -381,4 +385,7 @@ if __name__ == "__main__":
                         "bytes and parity passes whether or not the commands stayed separate, "
                         "which is what makes the per-slot gate above meaningful")
     p.add_argument("--out", default="artifacts/lnaffcast_dispatch_floor.json")
-    sys.exit(main(p.parse_args()))
+    o = p.parse_args()
+    o.host = o.host or f"{o.base}rtp18r256g4ctgc"
+    o.gemm_suffix = o.base if o.gemm_suffix is None else o.gemm_suffix
+    sys.exit(main(o))
