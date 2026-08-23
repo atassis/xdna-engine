@@ -359,6 +359,7 @@ def my_matmul(
     rtp_mode_resadd2a=False,
     resadd2a_rows=0,
     resadd2a_scale=1.0,
+    resadd2a_rev_rows=False,
 ):
     n_aie_rows = 4
     n_aie_cores = n_aie_rows * n_aie_cols
@@ -1419,6 +1420,15 @@ def my_matmul(
         onto it, and the fifo is the only thing that orders them.
         """
         op_stride = resadd2a_rows * N
+        # Which end of the column the sequence fills FIRST. A hung dispatch drains a PREFIX of the
+        # array rows -- rows 0-1 complete and bit-exact, rows 2-3 untouched, uniform across all 8
+        # columns -- and row 0 is the core tile nearest the memtile. Reversing this loop separates
+        # the two explanations that shape admits: if the surviving prefix follows the FILL ORDER it
+        # is a programming/BD-order effect, and if it stays at rows 0-1 it is routing or service
+        # order down the column. Nothing else changes -- same taps, same count, same array program.
+        row_order = list(range(n_aie_rows))
+        if resadd2a_rev_rows:
+            row_order = row_order[::-1]
         for rnd in range(r2a_rounds):
             row_base = rnd * n_aie_rows * m
             # One TaskGroup per COLUMN's share, because a shim tile holds 16 active BDs and a
@@ -1427,7 +1437,7 @@ def my_matmul(
             # so awaiting a drain before the sequence has issued the rest would deadlock.
             for col in range(n_aie_cols):
                 tg = TaskGroup()
-                for row in range(n_aie_rows):
+                for row in row_order:
                     for operand in range(2):
                         for j in range(r2a_j):
                             tap_a = TensorAccessPattern(
@@ -1843,6 +1853,13 @@ def main():
         "N-wide operands). Insts-only, so several row counts share one xclbin.",
     )
     argparser.add_argument(
+        "--resadd2a-rev-rows",
+        action="store_true",
+        help="fill the array rows far-end-first. Insts-only, so it shares an xclbin with the "
+        "forward arm: it separates a fill-order effect from a routing/service-order one when a "
+        "hung dispatch drains a prefix of the rows.",
+    )
+    argparser.add_argument(
         "--resadd2a-scale",
         type=float,
         default=1.0,
@@ -1891,6 +1908,7 @@ def main():
         args.rtp_mode_resadd2a,
         args.resadd2a_rows,
         args.resadd2a_scale,
+        args.resadd2a_rev_rows,
     )
     if args.generate_taps:
         return maybe_module
