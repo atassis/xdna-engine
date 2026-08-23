@@ -47,7 +47,12 @@ log(){ echo -e "$*" | tee -a "$LOG"; }
 restore(){ systemctl --user start xdna-engine.service npu-vox.service >/dev/null 2>&1; log "[svc] restored"; }
 trap restore EXIT
 
-BASE=512x1024x1024_32x32x128_8c_modalidbf16outkrtpkrllnaff1024
+# Which vehicle carries the mode. Default is the research one this was first written against; the
+# merge needs the price on the ENCODER'S OWN resident, where the mode is a mode of the xclbin the
+# FFN already loads:
+#   BASE=512x1024x4096_32x32x128_8c_modalsilubf16outpanel1024lnaff1024 bash scripts/...
+# The standalone arm is the same shipped op either way -- it is the mode side that moves.
+BASE="${BASE:-512x1024x1024_32x32x128_8c_modalidbf16outkrtpkrllnaff1024}"
 X1=${BASE}scat21x
 REPS="${REPS:-5}"
 ROWS="${ROWS:-512}"
