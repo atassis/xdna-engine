@@ -18,6 +18,18 @@ that WERE measured on this ledger predicts them to ~1%.
   FOLD_FC1   48 boundaries x 2.263 ms tax  = 108.6 predicted   vs -109.6 measured
   FOLD_GLU   24 deleted dispatches x 0.945 =  22.7 predicted   vs  -23.0 measured
 
+A merge also CHARGES, and leaving that term out is a 43% error. Every arrival into the absorbed
+brick that still crosses afterwards now enters the bigger program and pays its reconfiguration
+rate instead of the small one's. On the lnaffcast merge that is 48 arrivals x +1.693 ms = +81.3 ms
+against 299.1 ms of saving; the saving-only projection reads 310.3 where the ledger pair moves
+217.0. See `survivor_charge`.
+
+SCOPE, and it is the open end of this model: the decomposition reproduces the PASS it is fitted on
+to 0.4% (-216.2 modelled vs -217.0 measured), which validates its structure -- but arrival costs
+are themselves per-pass, and that pass's -217.0 sits outside the 11-rep bracket for the same merge
+(-183.1 [-205.8, -160.4]). So the model's SHAPE is calibrated and its LEVEL is not: re-fit the
+arrival table over the same reps as the bracket before pricing an unbuilt merge with it.
+
 Usage: transition_fold_model.py <report.txt> [--merge A,B] [--delete K]
   --merge   two kernel labels (substring match) whose contexts become one
   --delete  a kernel label whose dispatches disappear entirely
@@ -73,6 +85,48 @@ def find(rep, frag):
     return hits[0]
 
 
+def reconfig_by_program(rep):
+    """Fit ONE reconfiguration cost per destination xclbin, and each stream's own work.
+
+    This replaces the `bounded` fallback below, which charged a stream's whole dispatch minus a
+    global floor to reconfiguration and was vacuous for anything doing real work. The reason a
+    single per-program number is enough: within one xclbin, arrival cost decomposes as
+
+        arrival(stream) = reconfig(xclbin) + work(stream)
+
+    and on the fold+glu+krtpkrl pair that holds to a max residual of 0.037 ms over five streams
+    whose arrivals span 3.02-4.08 ms. So a stream seen ONLY after a switch still yields its work
+    exactly, as arrival - reconfig, instead of a bound nobody should believe.
+
+    reconfig is NOT one constant across programs, which is the whole reason the flat per-transition
+    figure misprices a specific boundary: the krtpkrl panel charges 2.677 ms to enter, the fold
+    arm's panel 2.222-2.295, and the 812-word single-brick xclbins arrive in 0.80-1.72 ms TOTAL, so
+    theirs is at most that. Fit it per report; do not carry a rate across compositions.
+    """
+    per_stream, by_prog = {}, {}
+    for label, ordn, insts, n_same, t_same, n_re, t_re, n_xcl, t_xcl in rep["by_pred"]:
+        # Same-stream is the cleanest in-context column; another stream on the same xclbin is the
+        # same reconfiguration state, so it serves when the stream never follows itself.
+        incontext = float(t_same) if n_same else (float(t_re) if n_re else None)
+        xcl = float(t_xcl) if n_xcl else None
+        per_stream[(label, int(ordn))] = {
+            "insts": int(insts), "incontext": incontext, "xcl": xcl,
+            "n_incontext": int(n_same or 0) + int(n_re or 0), "n_xcl": int(n_xcl or 0),
+        }
+        if incontext is not None and xcl is not None:
+            by_prog.setdefault(label, []).append(xcl - incontext)
+    reconfig = {k: sum(v) / len(v) for k, v in by_prog.items()}
+    for (label, ordn), s in per_stream.items():
+        r = reconfig.get(label)
+        if s["incontext"] is not None:
+            s["work"], s["work_kind"] = s["incontext"], "measured"
+        elif r is not None and s["xcl"] is not None:
+            s["work"], s["work_kind"] = s["xcl"] - r, "fitted"
+        else:
+            s["work"], s["work_kind"] = None, "unknown"
+    return reconfig, per_stream
+
+
 def model_merge(rep, a, b, tax, floor):
     """Contexts of `a` and `b` become one: every a<->b boundary stops being a transition.
 
@@ -93,6 +147,30 @@ def model_merge(rep, a, b, tax, floor):
             t, kind = max(0.0, rep["per_kernel"][y][2] - floor), "bounded"
         rows.append((f"{x[-34:]} -> {y[-34:]}", n, t, n * t, kind))
     return killed, sum(r[3] for r in rows), rows
+
+
+def survivor_charge(rep, a, b, reconfig, bound):
+    """What the merge COSTS: arrivals into `a` from elsewhere now enter the bigger program.
+
+    Deleting boundaries is only half a merge. Every arrival into `a` whose source is neither `a` nor
+    `b` still crosses afterwards, but its destination is now inside `b`, so it pays reconfig(b)
+    rather than reconfig(a). Omitting this is what made the projection for the lnaffcast merge read
+    310.3 ms against a measured 217.0: 48 surviving arrivals were charged nothing when the ledger
+    charges them +1.693 ms each.
+
+    reconfig(b) is taken as the merged program's rate, which this pair measures rather than assumes
+    -- the panel's fit moves 2.677 -> 2.691 after absorbing lnaffcast (+0.5%), so a merge does not
+    make the absorbing program dearer to enter.
+    """
+    r_b = reconfig.get(b)
+    r_a = reconfig.get(a, bound.get(a))
+    if r_b is None or r_a is None:
+        return None, []
+    rows = []
+    for x, y, n in rep["trans"]:
+        if y == a and x not in (a, b):
+            rows.append((f"{x[-34:]} -> {y[-34:]}", n, r_b - r_a, n * (r_b - r_a)))
+    return sum(r[3] for r in rows), rows
 
 
 def main():
@@ -124,6 +202,25 @@ def main():
     floor = min(t for _, _, t, _, _, _ in taxes)
     tax_mean = sum(d for *_, d in taxes) / len(taxes)
     print(f"  in-context floor {floor:.3f} ms; tax used for unobserved streams = mean - floor bound")
+
+    reconfig, per_stream = reconfig_by_program(rep)
+    print("\nreconfiguration cost per destination PROGRAM (arrival = reconfig + the stream's work)")
+    for prog, r in sorted(reconfig.items(), key=lambda kv: -kv[1]):
+        n = sum(1 for (lab, _), s in per_stream.items()
+                if lab == prog and s["incontext"] is not None and s["xcl"] is not None)
+        print(f"  {prog[-56:]:<56} reconfig {r:.3f} ms  (fit on {n} stream(s))")
+    unfit = sorted({lab for (lab, _), s in per_stream.items()
+                    if lab not in reconfig and s["xcl"] is not None})
+    for prog in unfit:
+        arr = min(s["xcl"] for (lab, _), s in per_stream.items()
+                  if lab == prog and s["xcl"] is not None)
+        print(f"  {prog[-56:]:<56} reconfig <= {arr:.3f} ms  (never in-context; work >= 0 bounds it)")
+    print("  residuals of arrival - (reconfig + work), streams with BOTH columns:")
+    for (lab, ordn), s in sorted(per_stream.items()):
+        if s["incontext"] is None or s["xcl"] is None:
+            continue
+        resid = s["xcl"] - (reconfig[lab] + s["incontext"])
+        print(f"    {lab[-46:]:<46}#{ordn} insts {s['insts']:<5} resid {resid:+.3f} ms")
 
     if delete:
         k = find(rep, delete)
@@ -172,6 +269,23 @@ def main():
         print(f"    rank folds on the MEASURED column; the bounded one is an upper limit, and it is "
               f"vacuous\n    for any kernel whose dispatch does real work rather than mostly "
               f"reconfiguring.")
+        bound = {}
+        for (lab, _), s in per_stream.items():
+            if lab not in reconfig and s["xcl"] is not None:
+                bound[lab] = min(bound.get(lab, s["xcl"]), s["xcl"])
+        charge, crows = survivor_charge(rep, a, b, reconfig, bound)
+        if charge is None:
+            print("  survivor charge: NOT MODELLED -- no reconfig rate for one side")
+        else:
+            print(f"  survivor charge (arrivals into {a[-30:]} that still cross,")
+            print(f"    now entering the merged program):")
+            for name, n, t, s in crows:
+                print(f"    x{n:<4} @ {t:+.3f} ms = {s:+7.1f} ms  {name}")
+            using = "fitted" if a in reconfig else f"BOUND reconfig({a[-24:]}) <= {bound.get(a):.3f}"
+            print(f"    [{using}] -- with a bound this charge is a LOWER limit, so the net is an "
+                  f"UPPER limit")
+            print(f"  NET {saved - charge:+.1f} ms/clip  "
+                  f"({saved:.1f} saved - {charge:.1f} charged)")
         print(f"  fleet-average comparison: {n_killed} x 1.543 = {n_killed * 1.543:.1f} ms "
               f"-- the rate this model exists to replace")
         print("\n  NOTE: this is a PROJECTION. It is calibrated to ~1% on FOLD_FC1 and FOLD_GLU "
