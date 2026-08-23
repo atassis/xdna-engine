@@ -60,6 +60,10 @@ import aie.utils as aie_utils
 
 DTYPE = {"bf16": bfloat16, "f32": np.float32}
 
+# The fold's resident: fc1's own bf16-out panel build, and the program every modal stream
+# borrows under PARAKEET_FOLD_FC1=1.
+RESIDENT = "512x1024x4096_32x32x128_8c_modalsilubf16outpanel1024krtp"
+
 ARMS = [
     "512x4096x1024_64x32x128_8c_modalid",
     "512x4096x1024_64x32x128_8c_modalidkrtpapanel1024",
@@ -114,27 +118,40 @@ def cross_arms(o):
     THIS IS WHAT THE ENCODER ACTUALLY DOES and what the per-arm run above deliberately does not.
     `stream_k_ex` resolves an insts path only and binds the instruction BO to the ONE resident
     kernel, so under the fold the K=4096 collapse stream executes on fc1's N=4096 array program
-    rather than on its own N=1024 build. The two differ in the device region: the modal instruction
-    streams are shape-independent (N rides in the BD size/stride fields) but each core's tile-loop
-    bound is BAKED, at 2/4/8 for N=1024/2048/4096.
+    rather than on its own N=1024 build.
 
-    The K-split stream on the same resident is the positive control: it crosses the same N boundary
-    and is the configuration that passes parity in the encoder, so if it fails here the probe is
-    wrong rather than the collapse.
+    ORDER IS AN INDEPENDENT VARIABLE, which is why the pairs are a command-line list rather than a
+    constant. Measured 2026-08-23: the K=4096 stream FAILS on the resident when it follows a
+    K=1024 dispatch and PASSES when it follows another K=4096 one, so a fixed list reproduces a
+    sequence rather than a property. Pass `--cross-pairs host:stream ...` to run one explicitly;
+    a bare stream name is paired with the fold resident.
     """
-    resident = "512x1024x4096_32x32x128_8c_modalsilubf16outpanel1024krtp"
-    return [(resident, "512x1024x1024_32x32x128_8c_modalidbf16outkrtp"),          # control
-            (resident, "512x4096x1024_32x32x128_8c_modalidbf16outkrtpapanel1024")]  # the suspect
+    if not o.cross_pairs:
+        return [(RESIDENT, "512x1024x1024_32x32x128_8c_modalidbf16outkrtp"),
+                (RESIDENT, "512x4096x1024_32x32x128_8c_modalidbf16outkrtp"),
+                (RESIDENT, "512x4096x1024_32x32x128_8c_modalidbf16outkrtpapanel1024")]
+    out = []
+    for spec in o.cross_pairs:
+        host, _, stream = spec.rpartition(":")
+        out.append((host or RESIDENT, stream))
+    return out
 
 
 def run_cross(o, patterns, results):
     """Drive each (host, stream) pair and gate the stream's OWN closed form."""
     rt = aie_utils.DefaultNPURuntime
-    for host, stream in cross_arms(o):
-        handle, _ = load_arm(host, o)
-        kh = handle
-        while not hasattr(kh, "kernel"):
-            kh = kh._handle
+    # Load each distinct host ONCE and reuse it across the whole sequence. Re-loading per step
+    # would put a context creation between consecutive dispatches, which is itself a state reset --
+    # and order is the independent variable, so that confound has to go.
+    loaded = {}
+    for pos, (host, stream) in enumerate(cross_arms(o)):
+        if host not in loaded:
+            handle, _ = load_arm(host, o)
+            kh = handle
+            while not hasattr(kh, "kernel"):
+                kh = kh._handle
+            loaded[host] = kh
+        kh = loaded[host]
         M, K, N = shape_of(stream, o)
         hM, hK, hN = shape_of(host, o)
         out_dt = design_operands(o.build_dir, stream)[-1][1]
@@ -146,9 +163,14 @@ def run_cross(o, patterns, results):
         # drive more traffic than the stream's own shape implies, and an under-sized BO would fault
         # or corrupt neighbouring memory instead of returning the wrong answer this probe is here
         # to see.
-        key = f"{stream} ON {host}"
+        # Position is part of the key: order is load-bearing, so the same pair at two
+        # points in a sequence is two different observations, not one overwritten.
+        key = f"[{pos}] {stream} ON {host}"
         results[key] = {"out_dtype": out_dt, "host": host, "stream": stream}
-        for pname in ("exact", "dense"):
+        # ONE dispatch per step when a single pattern is selected. Order is the independent
+        # variable here, so an arm that silently issues two dispatches makes the sequence
+        # ambiguous -- which is exactly how the first reading of this effect was misread.
+        for pname in (("exact", "dense") if o.cross_pattern == "both" else (o.cross_pattern,)):
             a, b = patterns[pname](M, K, N)
             a_pad = np.zeros(max(M * K, hM * hK), dtype=bfloat16); a_pad[:M * K] = a.reshape(M * K)
             b_pad = np.zeros(max(K * N, hK * hN), dtype=bfloat16); b_pad[:K * N] = b.reshape(K * N)
@@ -239,10 +261,10 @@ def main(o):
     print()
     # The exact pattern is the verdict: equality or a defect, nothing in between.
     for s, r in results.items():
-        e = r["exact"]
+        e = r.get("exact") or r["dense"]
+        dense = f", dense rel-L2 {r['dense']['rel_l2']:.4f}" if "dense" in r else ""
         print(f"  {'FAIL' if e['mismatches'] else 'PASS'}  {s}  "
-              f"(exact {e['mismatches']}/{e['elements']} bad, dense rel-L2 "
-              f"{r['dense']['rel_l2']:.4f})")
+              f"({e['mismatches']}/{e['elements']} bad{dense})")
     with open(o.out, "w") as f:
         json.dump({"shape": [M, K, N], "results": results}, f, indent=2)
     print(f"\nwrote {o.out}")
@@ -260,6 +282,10 @@ if __name__ == "__main__":
     p.add_argument("--M", type=int)
     p.add_argument("--K", type=int)
     p.add_argument("--N", type=int)
+    p.add_argument("--cross-pattern", choices=("exact", "dense", "both"), default="both",
+                   help="one dispatch per step unless 'both'")
+    p.add_argument("--cross-pairs", nargs="+", default=None,
+                   help="[host:]stream pairs to run in THIS ORDER; order is load-bearing")
     p.add_argument("--cross", action="store_true",
                    help="also run each stream on the fold resident's array program")
     p.add_argument("--out", default="artifacts/gemm_drain_width_isolated.json")

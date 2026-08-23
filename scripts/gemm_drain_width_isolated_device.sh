@@ -33,7 +33,7 @@ log "[svc] device clear"
 
 source "$WT/scripts/iron_env.sh" >/dev/null 2>&1
 .venv-iron/bin/python scripts/gemm_drain_width_isolated.py --out "$OUT" ${CROSS:+--cross} \
-    ${DRAIN_ARMS:+--arms $DRAIN_ARMS} 2>&1 | tee -a "$LOG"
+    ${DRAIN_ARMS:+--arms $DRAIN_ARMS} ${CROSS_PAIRS:+--cross-pairs $CROSS_PAIRS} ${CROSS_PATTERN:+--cross-pattern $CROSS_PATTERN} 2>&1 | tee -a "$LOG"
 rc=${PIPESTATUS[0]}
 
 log ""
