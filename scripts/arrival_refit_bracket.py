@@ -143,6 +143,69 @@ def main():
           f"model within 10% of measured in "
           f"{sum(1 for m, dd in zip(modelled, delta) if abs(m - dd) <= 0.10 * abs(dd))}/{len(modelled)} reps")
 
+    # The model above carries the surviving-arrival charge for the ABSORBED brick only. Two terms
+    # are missing, and together they are the whole of its optimism: every OTHER stream's surviving
+    # arrivals also move (A), and work already dispatched in-context drifts (B). With
+    # n_conv = n_xcl0 - n_xcl1 the per-stream ledger is exact:
+    #     delta = -n_conv*(xcl0 - ic1) + n_xcl1*(xcl1 - xcl0) + n_ic0*(ic1 - ic0)
+    print("\nthe two terms the model omits, and what they close")
+    a_other, b_term = [], []
+    for r in reps:
+        a, b = k0[r]["streams"], k1[r]["streams"]
+        ln0 = next((s for kk, s in a.items() if kk.startswith("lnaffcast")), None)
+        pairs = [(n, a.get(n), s1) for n, s1 in b.items() if n != "lnaff-mode"]
+        if ln0 and "lnaff-mode" in b:
+            pairs.append(("lnaff", ln0, b["lnaff-mode"]))
+        ao = bt = 0.0
+        for name, s0, s1 in pairs:
+            if not s0:
+                continue
+            if name != "lnaff" and s0["xcl"] and s1["xcl"]:
+                ao += s1["n_xcl"] * (s1["xcl"] - s0["xcl"])
+            if s0["incontext"] is not None and s1["incontext"] is not None:
+                bt += s0["n_incontext"] * (s1["incontext"] - s0["incontext"])
+        a_other.append(ao)
+        b_term.append(bt)
+    row("A: surviving arrivals, streams other than lnaff", a_other)
+    row("B: drift in work already in-context", b_term)
+    exact = [modelled[i] + a_other[i] + b_term[i] for i in range(len(modelled))]
+    row("exact decomposition (model + A + B)", exact)
+    row("residual: exact - measured", [exact[i] - delta[i] for i in range(len(exact))])
+
+    # ...but A is NOT a merge charge. Streams on xclbins the merge never touched move by the same
+    # FRACTION as the merged one, so this arm pair carries a level shift the treated/control
+    # contrast divides out. lnmode_fold_bracket, which has null-control arms that read zero, shows
+    # no such shift and isolates the real charge at +0.025 ms (scripts/arrival_control_bracket.py).
+    print("\ncontrol: streams whose xclbin the merge never touched (% of the k0 arrival)")
+    CONTROL = ["final", "dwconv_silu_t_1024x400",
+               "resadd_512x1024_s050_bf16b", "resadd_512x1024_s100_bf16b"]
+    TREATED = "k1024n1024-modalid"
+
+    def rel(r, n):
+        s0, s1 = k0[r]["streams"].get(n), k1[r]["streams"].get(n)
+        if not s0 or not s1 or not s0["xcl"] or not s1["xcl"]:
+            return None
+        return (s1["xcl"] - s0["xcl"]) / s0["xcl"] * 100.0
+
+    cols = []
+    for n in CONTROL:
+        xs = [rel(r, n) for r in reps]
+        xs = [x for x in xs if x is not None]
+        if len(xs) == len(reps):
+            row(f"CONTROL {n}", xs, "%")
+            cols.append(xs)
+    trt = [rel(r, TREATED) for r in reps]
+    if all(x is not None for x in trt) and cols:
+        row(f"TREATED {TREATED} (the merged program)", trt, "%")
+        pooled = [statistics.mean([c[i] for c in cols]) for i in range(len(reps))]
+        row("POOLED CONTROL", pooled, "%")
+        dd = [trt[i] - pooled[i] for i in range(len(reps))]
+        row("DIFFERENCE-IN-DIFFERENCES", dd, "%")
+        _, lo, hi = ci(dd)
+        print("    -> spans zero: on THIS bracket the merged program's rise is not "
+              "separable from the arm-wide shift" if lo < 0 < hi else
+              "    -> excludes zero: a merge-specific excess survives the control")
+
     print("\narrival cost of the absorbed brick, per rep (the cap on what its boundaries return)")
     row("lnaffcast arrival, k0", [k0[r]["lnaff_arrival"] for r in reps if k0[r]["lnaff_arrival"]])
     row("lnaff-mode arrival, k0m (entering the panel)",
