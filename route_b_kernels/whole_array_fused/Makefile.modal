@@ -89,6 +89,12 @@ mode4_bisect?=0
 # orders it sits outside the tile loop, so each core's FIRST tile after a mode change runs the
 # previous dispatch's body. Different core ELF, so it is tagged.
 mode_read_late?=0
+# Same peel, applied to rtp[1] (the K-tile trip count) instead of rtp[0] (0 = off). Needs
+# k_loop_rtp=1. A stale k_trip is worse than a stale mode: the trip count decides how many A/B
+# pairs a tile consumes, so one wrong read desynchronises the fifos for every later dispatch --
+# which is why two streams with DIFFERENT K on one hardware context corrupt each other while
+# uniform-K sequences are bit-exact. Different core ELF, so it is tagged.
+k_read_late?=0
 # Extra compile flags for the EPILOGUE object only (empty = the family's -O2). The mode-4 hang
 # tracks a scheduling decision, not a source construct, so testing it needs a codegen knob: a
 # suppressed source pragma left the ELF byte-identical. Tagged, and stamped, or an arm would
@@ -137,6 +143,9 @@ endif
 ifeq (${mode_read_late}, 1)
 aieargs+=--mode-read-late
 endif
+ifeq (${k_read_late}, 1)
+aieargs+=--k-read-late
+endif
 ifneq (${a_panel_width}, 0)
 aieargs+=--a-panel-width ${a_panel_width}
 endif
@@ -177,9 +186,10 @@ rtpresadd_tag=$(if $(filter 1,${rtp_mode_resadd}),rtp4,)
 raonly_tag=$(if $(filter 1,${resadd_only}),raonly,)
 bisect_tag=$(if $(filter 0,${mode4_bisect}),,bis${mode4_bisect})
 mrl_tag=$(if $(filter 1,${mode_read_late}),mrl,)
+krl_tag=$(if $(filter 1,${k_read_late}),krl,)
 opt_tag=$(if ${epi_opt},$(subst -,,$(subst =,,$(subst $(space),,${epi_opt}))),)
 apanel_tag=$(if $(filter 0,${a_panel_width}),,apanel${a_panel_width})
-target_suffix=${M}x${K}x${N}_${m}x${k}x${n}_${n_aie_cols}c_${mode_tag}${out_tag}${panel_tag}${dep_tag}${abdep_tag}${l3dep_tag}${wrk_tag}${mt_tag}${re_tag}${nat_tag}${krtp_tag}${apanel_tag}${resadd_tag}${rtpresadd_tag}${raonly_tag}${bisect_tag}${mrl_tag}${opt_tag}
+target_suffix=${M}x${K}x${N}_${m}x${k}x${n}_${n_aie_cols}c_${mode_tag}${out_tag}${panel_tag}${dep_tag}${abdep_tag}${l3dep_tag}${wrk_tag}${mt_tag}${re_tag}${nat_tag}${krtp_tag}${apanel_tag}${resadd_tag}${rtpresadd_tag}${raonly_tag}${bisect_tag}${mrl_tag}${krl_tag}${opt_tag}
 
 use_iron=1
 aie_py_src=whole_array_modal_iron.py

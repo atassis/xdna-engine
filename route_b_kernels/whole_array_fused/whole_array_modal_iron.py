@@ -347,6 +347,7 @@ def my_matmul(
     rtp_mode_resadd=False,
     resadd_only=False,
     mode_read_late=False,
+    k_read_late=False,
 ):
     n_aie_rows = 4
     n_aie_cores = n_aie_rows * n_aie_cols
@@ -485,11 +486,22 @@ def my_matmul(
             "--mode-read-late moves the mode-4 branch behind the first A/B acquire, so it "
             "needs --mode-resadd: without a mode-4 body there is no branch to move."
         )
-    if mode_read_late and k_loop_rtp:
+    if k_read_late and not k_loop_rtp:
         raise ValueError(
-            "--mode-read-late peels one k-iteration, which needs k_trip - 1 as a constant; "
-            "under --k-loop-rtp k_trip is a runtime memref.load. Combine them only after "
-            "the peel is written against an arith.subi."
+            "--k-read-late moves the k_trip read behind the first A/B acquire, so it needs "
+            "--k-loop-rtp: with a baked K//k there is no runtime read to move."
+        )
+    if k_read_late and mode_resadd and not mode_read_late:
+        raise ValueError(
+            "--k-read-late with --mode-resadd needs --mode-read-late too. Otherwise the GEMM "
+            "path peels while the is_gemm branch that selects it still reads rtp[0] at the top "
+            "of the tile: half the body behind this dispatch's data and half behind the "
+            "previous one's. The two peels share one acquire pair -- take both or neither."
+        )
+    if k_read_late and resadd_only:
+        raise ValueError(
+            "--k-read-late has nothing to move in --resadd-only: that body carries no matmul, "
+            "so its k_trip read is a drain count with no peel to hang it behind."
         )
     resadd_kernel = (
         Kernel(
@@ -590,6 +602,13 @@ def my_matmul(
     # accumulator), the matmul reduces DIRECTLY into the C output tile and the epilogue runs IN-PLACE
     # on it (silu/identity, f32->f32) — no separate acc_buf. That saves an m*n*4 L1 buffer per core,
     # which is what lets the wide-N fast tile (64x32x96) fit in L1.
+    def _minus_one(trip):
+        # k_trip is a Python int when K//k is baked and an i32 memref.load under --k-loop-rtp.
+        # The peel needs trip-1 either way, so subtract in whichever domain it lives in.
+        if isinstance(trip, int):
+            return trip - 1
+        return _arith.subi(trip, _arith.constant(_T.i32(), 1))
+
     def core_fn(in_a, in_b, out_c, rtp_buff, barrier, zero, matmul, epilogue, resadd=None):
         barrier.wait_for_value(1)  # wait for the host to write the epilogue mode into rtp
         # k-loop-bound-as-rtp PoC: rtp[1] carries the K-tile trip count, written by sequence()
@@ -609,12 +628,31 @@ def my_matmul(
             # per body iteration and pairs with whichever dispatch happened to enter it. That is
             # invisible while every stream shares K=1024, and silently wrong the moment two streams
             # carry different K -- which is the whole point of driving K from rtp.
-            k_trip = rtp_buff[1] if k_loop_rtp else K // k
+            # Under --k-read-late every path that reads k_trip does so behind its own acquire,
+            # so emitting this load as well would leave a dead top-of-tile read in the IR --
+            # exactly the shape a later reader would take for the defect still being present.
+            # The plain resadd borrow is the one path that still reads at the top.
+            needs_top_read = not k_read_late or (resadd is not None and not mode_read_late)
+            k_trip = (rtp_buff[1] if k_loop_rtp else K // k) if needs_top_read else None
             elem_out = out_c.acquire(1)
 
             def _gemm_path():
                 zero(elem_out)
-                for _ in range_(k_trip):
+                rest = k_trip
+                if k_read_late:
+                    # PEEL, for the same reason --mode-read-late peels: a top-of-tile rtp read
+                    # samples the PREVIOUS dispatch's value. A stale K is worse than a stale
+                    # epilogue mode -- the trip count decides how many A/B pairs this tile
+                    # consumes, so one wrong read desynchronises the fifos for everything after,
+                    # which is why mixed-K failures have no clean recurrence. Reading behind the
+                    # first acquire puts it downstream of this dispatch's own data.
+                    ea = in_a.acquire(1)
+                    eb = in_b.acquire(1)
+                    rest = _minus_one(rtp_buff[1])
+                    matmul(ea, eb, elem_out)
+                    in_a.release(1)
+                    in_b.release(1)
+                for _ in range_(rest):
                     elem_in_a = in_a.acquire(1)
                     elem_in_b = in_b.acquire(1)
                     matmul(elem_in_a, elem_in_b, elem_out)
@@ -651,18 +689,20 @@ def my_matmul(
                 # See 2026-08-22-the-mode-swap-costs-one-tile-and-then-recovers.
                 elem_in_a = in_a.acquire(1)
                 elem_in_b = in_b.acquire(1)
+                if k_read_late:
+                    k_trip = rtp_buff[1]  # behind the same acquire the mode branch is
                 with scf_if_(_is_gemm()) as if_op:
                     zero(elem_out)
                     matmul(elem_in_a, elem_in_b, elem_out)
                     in_a.release(1)
                     in_b.release(1)
-                    _drain_ab(k_trip - 1, matmul)
+                    _drain_ab(_minus_one(k_trip), matmul)
                     epilogue(elem_out, elem_out, rtp_buff)
                 with scf_else_(if_op):
                     resadd(elem_in_a, elem_in_b, elem_out)
                     in_a.release(1)
                     in_b.release(1)
-                    _drain_ab(k_trip - 1, resadd)
+                    _drain_ab(_minus_one(k_trip), resadd)
             else:
                 # The two bodies must sit in DIFFERENT regions of one scf.if, not merely
                 # different blocks: that is what makes them mutually exclusive to the excl_group
@@ -722,11 +762,22 @@ def my_matmul(
         for _ in loop:
             # Inside the tile loop, for the same reason as core_fn above: a body iteration can
             # span several dispatches, so a hoisted rtp read pairs with the wrong one.
-            k_trip = rtp_buff[1] if k_loop_rtp else K // k
+            k_trip = None if k_read_late else (rtp_buff[1] if k_loop_rtp else K // k)
             elem_out = out_c.acquire(1)
             zero(acc)
 
-            for _ in range_(k_trip):
+            rest = k_trip
+            if k_read_late:
+                # Same peel as core_fn's GEMM path, and this is the body the mixed-K failure
+                # was measured on (bf16 out). See the comment there for why a stale k_trip
+                # desynchronises the fifos rather than merely mis-computing one tile.
+                ea = in_a.acquire(1)
+                eb = in_b.acquire(1)
+                rest = _minus_one(rtp_buff[1])
+                matmul(ea, eb, acc)
+                in_a.release(1)
+                in_b.release(1)
+            for _ in range_(rest):
                 elem_in_a = in_a.acquire(1)
                 elem_in_b = in_b.acquire(1)
                 matmul(elem_in_a, elem_in_b, acc)
@@ -1132,6 +1183,15 @@ def main():
         "one-tile rtp visibility lag: the top-of-tile read samples the previous dispatch's "
         "mode, so each core's first tile after a mode change runs the wrong body.",
     )
+    argparser.add_argument(
+        "--k-read-late",
+        action="store_true",
+        help="peel the first A/B pair so the k-loop trip count is read from rtp[1] AFTER an "
+        "objectFIFO acquire instead of at the top of the tile. Needs --k-loop-rtp. Fixes the "
+        "measured mixed-K unsoundness: two streams with different K on ONE hardware context "
+        "corrupt each other because the top-of-tile read samples whichever dispatch happened "
+        "to enter the body.",
+    )
     args = argparser.parse_args()
     maybe_module = my_matmul(
         args.dev,
@@ -1161,6 +1221,7 @@ def main():
         args.rtp_mode_resadd,
         args.resadd_only,
         args.mode_read_late,
+        args.k_read_late,
     )
     if args.generate_taps:
         return maybe_module
