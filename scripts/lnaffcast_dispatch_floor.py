@@ -6,7 +6,7 @@
 # decode-GEMV dispatch floor -- a lead, not a finding". But a third floor is already measured and
 # already DECOMPOSED: the whole_array GEMM's per-command floor is 139.7 us direct-read, of which
 # 87.9 us (63%) amortizes by queueing commands instead of submit-then-wait and 51.8 us (37%) is
-# device-serial ([[gemm-per-command-floor-is-mostly-host-round-trip]]). Three floors in one band on
+# device-serial -- i.e. that floor is mostly host round-trip. Three floors in one band on
 # one box is not a coincidence to chase pairwise -- it is a hypothesis with a sharp test.
 #
 # THE SHARP PREDICTION. If the floor is a generic per-command host round-trip, the AMORTIZABLE part
@@ -302,8 +302,8 @@ def main(o):
     # ---- the row sweep: is the 151.0 us floor a floor, or a two-point extrapolation? ----
     # The recorded 151.0 us came from fitting a LINE to exactly two points (256 and 512 rows).
     # Two points cannot tell a line from a curve, and this vehicle's sibling task already found an
-    # intercept that turned out to be an artifact of exactly that
-    # ([[decode-gemv-depth2-intercept-is-not-resolvable]]), so the fit is repeated here over every
+    # intercept that turned out to be an artifact of exactly that -- a line fitted to a curve --
+    # so the fit is repeated here over every
     # legal row count -- the generator refuses anything that is not a multiple of the 128-row round,
     # so 128/256/384/512 is the complete set at or below the shipped count.
     rows_pts = sorted((a["rows"], statistics.mean(

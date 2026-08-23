@@ -3,8 +3,8 @@
 # with the 8c arm run twice to bracket the 4c one (task mode-switched-multi-program-xclbin).
 #
 # WHY BRACKETED RATHER THAN TWO RUNS. The point of the column axis is the DIFFERENCE between the
-# two intercepts, and this box drifts 8.0% across sessions against 2.2% within one
-# ([[the-timing-shift-is-persistent-and-not-thermal]]). A 4c number from one session minus an 8c
+# two intercepts, and this box drifts 8.0% across sessions against 2.2% within one (measured, and
+# persistent rather than thermal). A 4c number from one session minus an 8c
 # number from another is differencing two quantities whose separation is smaller than the boundary
 # between them. Running 8c -> 4c -> 8c in one window makes the drift measurable instead of assumed:
 # the two 8c passes bound it, and any 4c-vs-8c effect has to clear that bound to be read.

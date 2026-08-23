@@ -10,7 +10,7 @@
 #   * the DEPTH SWEEP splits each arm's floor into host round-trip and device-serial work, and the
 #     GEMM stream rides along as the arm whose command size differs most.
 # Same-session matters: this box drifts 8.0% on one artifact ACROSS sessions against 2.2% within
-# one ([[the-timing-shift-is-persistent-and-not-thermal]]), so absolute numbers from different
+# one, and that drift is persistent rather than thermal, so absolute numbers from different
 # sessions cannot be subtracted.
 #
 # Single-tenant NPU: stops xdna-engine + npu-vox, verifies the device is actually free with
