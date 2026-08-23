@@ -106,6 +106,18 @@ epi_opt?=
 # changed. Mutually exclusive with mode_resadd.
 resadd_only?=0
 
+# --mode-lnaffcast COLS: put the LN + affine + f32->bf16 cast body in the xclbin, over rows of
+# COLS columns; rtp_mode_lnaffcast=1 bakes rtp[0]=18 into THIS stream to select it. BF16-OUT only.
+# The mode has its OWN fill contract (COLS-derived A slabs + 1 B + 1 C drain per tile), not the
+# GEMM's k_trip pairing, so the rtp arm is a different INSTRUCTION STREAM on the same xclbin.
+mode_lnaffcast?=0
+rtp_mode_lnaffcast?=0
+# Rows one lnaffcast dispatch covers (0 = the most the declared A/C tensors hold). c_fanout gives
+# each column its own output region: the columns of an array row share an A fifo and so compute
+# the SAME rows, and separating them lets a probe check the copies agree.
+lnaffcast_rows?=0
+lnaffcast_c_fanout?=0
+
 # Read A from a [K/W, M, W] panel-major buffer instead of row-major [M, K] (0 = off). Mirror of
 # c_panel_width, for a GEMM whose producer already drained panel-major -- fc1 does, by default, so a
 # wide-K fc2 needs no repack. Insts-only. Needs N/n/n_aie_cols == 1: the panel index spends the A
@@ -113,7 +125,7 @@ resadd_only?=0
 a_panel_width?=0
 
 # Two kernel objects: the matmul (mm.cc) and the fused epilogue.
-kernels=mm_${m}x${k}x${n} mm_silu_epilogue_${m}x${k}x${n}
+kernels=mm_${m}x${k}x${n} mm_silu_epilogue_${m}x${k}x${n}$(if $(filter 0,${mode_lnaffcast}),, mm_mode_lnaffcast_${m}x${k}x${n})
 
 aieargs+=-m $m -k $k -n $n --n-aie-cols ${n_aie_cols} --b-col-maj ${b_col_maj}
 ifeq (${no_silu}, 1)
@@ -148,6 +160,18 @@ aieargs+=--k-read-late
 endif
 ifneq (${a_panel_width}, 0)
 aieargs+=--a-panel-width ${a_panel_width}
+endif
+ifneq (${mode_lnaffcast}, 0)
+aieargs+=--mode-lnaffcast ${mode_lnaffcast}
+endif
+ifeq (${rtp_mode_lnaffcast}, 1)
+aieargs+=--rtp-mode-lnaffcast
+endif
+ifneq (${lnaffcast_rows}, 0)
+aieargs+=--lnaffcast-rows ${lnaffcast_rows}
+endif
+ifeq (${lnaffcast_c_fanout}, 1)
+aieargs+=--lnaffcast-c-fanout
 endif
 
 # Distinct suffix so silu/bias/gelu artifacts never collide with the plain matmul's.
@@ -189,7 +213,11 @@ mrl_tag=$(if $(filter 1,${mode_read_late}),mrl,)
 krl_tag=$(if $(filter 1,${k_read_late}),krl,)
 opt_tag=$(if ${epi_opt},$(subst -,,$(subst =,,$(subst $(space),,${epi_opt}))),)
 apanel_tag=$(if $(filter 0,${a_panel_width}),,apanel${a_panel_width})
-target_suffix=${M}x${K}x${N}_${m}x${k}x${n}_${n_aie_cols}c_${mode_tag}${out_tag}${panel_tag}${dep_tag}${abdep_tag}${l3dep_tag}${wrk_tag}${mt_tag}${re_tag}${nat_tag}${krtp_tag}${apanel_tag}${resadd_tag}${rtpresadd_tag}${raonly_tag}${bisect_tag}${mrl_tag}${krl_tag}${opt_tag}
+# The lnaffcast BODY is a different core ELF; the rtp arm is a different instruction stream on
+# that same xclbin. rows/fanout change only the stream, so they tag the stream and not the body.
+lnaff_tag=$(if $(filter 0,${mode_lnaffcast}),,lnaff${mode_lnaffcast})
+rtplnaff_tag=$(if $(filter 1,${rtp_mode_lnaffcast}),rtp18,)$(if $(filter 0,${lnaffcast_rows}),,r${lnaffcast_rows})$(if $(filter 1,${lnaffcast_c_fanout}),fan,)
+target_suffix=${M}x${K}x${N}_${m}x${k}x${n}_${n_aie_cols}c_${mode_tag}${out_tag}${panel_tag}${dep_tag}${abdep_tag}${l3dep_tag}${wrk_tag}${mt_tag}${re_tag}${nat_tag}${krtp_tag}${apanel_tag}${resadd_tag}${rtpresadd_tag}${raonly_tag}${bisect_tag}${mrl_tag}${krl_tag}${lnaff_tag}${rtplnaff_tag}${opt_tag}
 
 use_iron=1
 aie_py_src=whole_array_modal_iron.py
@@ -242,3 +270,11 @@ FORCE:
 build/mm_silu_epilogue_${m}x${k}x${n}.o: ${kernels_dir}/mm_silu_epilogue.cc build/.epi_defines.stamp
 	mkdir -p ${@D}
 	cd ${@D} && ${KERNEL_CC} ${KERNEL_CFLAGS} ${EPI_DEFINES} ${epi_opt} -c $< -o ${@F}
+
+# lnaffcast mode object. Its own .cc rather than the epilogue's, because AIEAssignCoreLinkFiles
+# traces only direct func.call edges from the core -- an object this one CALLED would never reach
+# the link line. LNA_COLS is a build parameter and shares the epilogue's EPI_M/K/N, which are what
+# fix the slab and row counts, so the same stamp dirties it.
+build/mm_mode_lnaffcast_${m}x${k}x${n}.o: ${kernels_dir}/mm_mode_lnaffcast.cc build/.epi_defines.stamp
+	mkdir -p ${@D}
+	cd ${@D} && ${KERNEL_CC} ${KERNEL_CFLAGS} ${EPI_DEFINES} -DLNA_COLS=${mode_lnaffcast} -c $< -o ${@F}

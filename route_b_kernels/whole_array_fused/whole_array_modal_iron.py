@@ -350,6 +350,8 @@ def my_matmul(
     k_read_late=False,
     mode_lnaffcast=0,
     rtp_mode_lnaffcast=False,
+    lnaffcast_rows=0,
+    lnaffcast_c_fanout=False,
 ):
     n_aie_rows = 4
     n_aie_cores = n_aie_rows * n_aie_cols
@@ -553,6 +555,34 @@ def my_matmul(
         # program -- a mode with its own instruction stream sets its own fill contract and does
         # not inherit the GEMM's k_trip A/B pairing.
         lnaff_slabs = (m * n) // a_tile_f32
+        # A ROUND is one C tile per core. The 8 columns of an array row share one A_L2L1 fifo
+        # (measured: A_L2L1_0 lists 8 consumer cores in the shipped resident), so they receive
+        # the SAME slabs and compute the SAME output rows. A round therefore advances by
+        # n_aie_rows blocks, not by the core count, and every output row is written n_aie_cols
+        # times. That redundancy is the mode's price on this vehicle, not a bug in the sequence
+        # -- see lnaffcast-mode-duplicates-output-across-the-a-broadcast.
+        lnaff_rows_per_c = (m * n) // mode_lnaffcast
+        lnaff_rows_per_round = lnaff_rows_per_c * n_aie_rows
+        # x rides the A tensor as f32-in-bf16, y the C tensor. --lnaffcast-c-fanout gives each
+        # column its OWN output region so a probe can read all n_aie_cols copies and check they
+        # agree; without it they land on one region and the duplicate writes overwrite.
+        lnaff_rows_cap = min(
+            M * K // 2 // mode_lnaffcast,
+            M * N // mode_lnaffcast // (n_aie_cols if lnaffcast_c_fanout else 1),
+        )
+        if not lnaffcast_rows:
+            lnaffcast_rows = (lnaff_rows_cap // lnaff_rows_per_round) * lnaff_rows_per_round
+        if lnaffcast_rows % lnaff_rows_per_round:
+            raise ValueError(
+                f"--lnaffcast-rows={lnaffcast_rows} must be a multiple of the round "
+                f"{lnaff_rows_per_round} = {lnaff_rows_per_c} rows/C-tile x {n_aie_rows} rows"
+            )
+        if lnaffcast_rows > lnaff_rows_cap:
+            raise ValueError(
+                f"--lnaffcast-rows={lnaffcast_rows} exceeds {lnaff_rows_cap}, what the declared "
+                f"A ({M * K} bf16) and C ({M * N} bf16) tensors hold at cols={mode_lnaffcast}"
+                + (f" x {n_aie_cols} fanout regions" if lnaffcast_c_fanout else "")
+            )
         lnaff_obj = f"mm_mode_lnaffcast_{m}x{k}x{n}.o"
         lnaff_stage_kernel = Kernel(
             "mm_lnaff_stage_f32", lnaff_obj, [A_l1_ty, cacc_ty, np.int32]
@@ -1016,6 +1046,61 @@ def my_matmul(
         )
     c_index = 0
 
+    def lnaffcast_fills(A, B, C, A_prods, B_prods, C_conses):
+        """The lnaffcast mode's own fill contract: 8 A + 1 B + 1 C drain per C tile.
+
+        The GEMM's contract is K//k A/B PAIRS per C tile; this body consumes lnaff_slabs A and
+        exactly one B, so inheriting the GEMM stream programs 32 A and 32 B fills against 8 and 1
+        and stalls the producer on backpressure. Same failure the 2026-08-16 pass predicted.
+
+        Every shuffle is undone on the DDR side, so the core stages, reduces and writes
+        CONTIGUOUSLY -- see lnaffcast-mode-taps-fit-the-shim-in-four-dims for the search. Each of
+        the three taps is at exactly the shim's 4 dimensions, and A is at 4 only because its
+        per-slab dimension merges with the leading permutation digit (512 == 4 x 128), which is a
+        property of THIS slab size and does not survive a change to it. That is why the guard
+        below is exact rather than a range: these are derived numbers, and a config they were not
+        derived for must fail loud instead of emitting a wrong walk.
+        """
+        if (m, k, n, r, s, t, mode_lnaffcast) != (32, 32, 128, 8, 8, 8, 1024):
+            raise ValueError(
+                "the lnaffcast taps are derived for the shipped resident "
+                f"(m,k,n=32,32,128 r=s=t=8 cols=1024), not (m,k,n={m},{k},{n} "
+                f"r,s,t={r},{s},{t} cols={mode_lnaffcast})"
+            )
+        # f32-derived walks, doubled into the bf16 element units the tensors are declared in.
+        # The doubling costs no dimension: the innermost f32 run of 4 at stride 1 becomes 4 at
+        # stride 2 with a pair of stride 1 inside it, i.e. 8 contiguous bf16.
+        a_sizes, a_strides = [32, 8, 4, 8], [256, 8, 64, 1]     # 8 slabs = one C tile of x
+        b_sizes, b_strides = [4, 8, 16, 8], [1024, 8, 64, 1]    # gb = [gamma|beta], 2048 f32
+        # C is bf16 already. The outer walk over the n_aie_rows tiles the memtile joins merges
+        # into the leading digit (4 x 1024 == the 4-row stride), so one drain covers the round's
+        # whole n_aie_rows * lnaff_rows_per_c block of consecutive output rows.
+        c_sizes, c_strides = [16, 8, 16, 8], [1024, 8, 64, 1]
+
+        cols = mode_lnaffcast
+        c_region = lnaffcast_rows * cols if lnaffcast_c_fanout else 0
+
+        for base in range(0, lnaffcast_rows, lnaff_rows_per_round):
+            tg = TaskGroup()
+            for col in range(n_aie_cols):
+                tap_c = TensorAccessPattern(
+                    (M * N,), col * c_region + base * cols, c_sizes, c_strides
+                )
+                C_taps.append(tap_c)
+                C_conses[col].drain(C, tap=tap_c, wait=True, group=tg)
+
+                tap_b = TensorAccessPattern((K * N,), 0, b_sizes, b_strides)
+                B_taps.append(tap_b)
+                B_prods[col].fill(B, tap=tap_b, group=tg)
+
+            for row in range(n_aie_rows):
+                tap_a = TensorAccessPattern(
+                    (M * K,), (base + row * lnaff_rows_per_c) * cols * 2, a_sizes, a_strides
+                )
+                A_taps.append(tap_a)
+                A_prods[row].fill(A, tap=tap_a, group=tg)
+            tg.finish()
+
     def sequence(A, B, C, A_prods, B_prods, C_conses):
         nonlocal c_index
         # bake the epilogue mode into this instruction stream's RTP (1=silu, 0=identity), then
@@ -1048,6 +1133,10 @@ def my_matmul(
                 if k_loop_rtp:
                     rtp_bufs[r][c][1] = K // k  # k-loop-bound-as-rtp PoC: K-tile trip count
         rtp_barrier.set(1)
+
+        if rtp_mode_lnaffcast:
+            lnaffcast_fills(A, B, C, A_prods, B_prods, C_conses)
+            return
 
         tg = TaskGroup()
         for tb in range(ceildiv(M // m // n_aie_rows, tb_max_n_rows)):
@@ -1327,6 +1416,22 @@ def main():
         help="bake rtp[0]=18 into THIS instruction stream, selecting the lnaffcast mode. Needs "
         "--mode-lnaffcast (which puts the body in the xclbin). The two streams share one xclbin.",
     )
+    argparser.add_argument(
+        "--lnaffcast-rows",
+        type=int,
+        default=0,
+        metavar="ROWS",
+        help="x rows one lnaffcast dispatch covers. Default: the most the declared A and C "
+        "tensors hold, rounded down to a whole round.",
+    )
+    argparser.add_argument(
+        "--lnaffcast-c-fanout",
+        action="store_true",
+        help="give each of the n_aie_cols columns its own output region instead of writing them "
+        "all to one. The columns of an array row share an A fifo and so compute the SAME rows; "
+        "separating them lets a probe check the copies agree. Costs n_aie_cols x the C tensor, "
+        "so it divides the rows one dispatch covers by the same factor.",
+    )
     args = argparser.parse_args()
     maybe_module = my_matmul(
         args.dev,
@@ -1359,6 +1464,8 @@ def main():
         args.k_read_late,
         args.mode_lnaffcast,
         args.rtp_mode_lnaffcast,
+        args.lnaffcast_rows,
+        args.lnaffcast_c_fanout,
     )
     if args.generate_taps:
         return maybe_module
