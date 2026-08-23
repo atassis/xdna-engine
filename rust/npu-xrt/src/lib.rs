@@ -142,8 +142,14 @@ pub mod dispatch_log {
         dispatches: usize,
         transitions: usize,
         per_kernel: BTreeMap<String, usize>,
-        /// (from -> to) transition pairs, so we can separate GEMM<->brick from brick<->brick.
-        pairs: BTreeMap<(String, String), usize>,
+        /// (from -> to) transition pairs with their blocking time, so we can separate
+        /// GEMM<->brick from brick<->brick -- and, because the time rides along, separate a cost
+        /// that belongs to the DESTINATION program from one that belongs to the PAIR. Entering a
+        /// program measures 0.79-3.55 ms depending on which program, a 4.3x spread that the flat
+        /// ~1.543 ms constant every merge on this project is priced against cannot express; the
+        /// count alone could not say whether that is the destination's own reprogramming extent or
+        /// a property of the difference between the two programs.
+        pairs: BTreeMap<(String, String), (usize, f64)>,
         /// Full dispatch order, so a probe can REPLAY the real sequence rather than approximate it.
         seq: Vec<String>,
         /// Blocking wall time per kernel, and the same split by whether this dispatch FOLLOWED a
@@ -182,7 +188,9 @@ pub mod dispatch_log {
             if switched {
                 l.transitions += 1;
                 let from = l.prev.clone().unwrap().0;
-                *l.pairs.entry((from, label.to_string())).or_insert(0) += 1;
+                let pe = l.pairs.entry((from, label.to_string())).or_insert((0, 0.0));
+                pe.0 += 1;
+                pe.1 += secs.unwrap_or(0.0);
                 l.secs_switched += secs.unwrap_or(0.0);
                 l.n_switched += 1;
             } else if l.prev.is_some() {
@@ -302,9 +310,49 @@ pub mod dispatch_log {
             }
             out.push("  transitions (from -> to):".into());
             let mut ps: Vec<_> = l.pairs.iter().collect();
-            ps.sort_by(|a, b| b.1.cmp(a.1));
-            for ((f, t), n) in ps.iter().take(20) {
+            ps.sort_by(|a, b| (b.1).0.cmp(&(a.1).0));
+            for ((f, t), (n, _)) in ps.iter().take(20) {
                 out.push(format!("    {f:<28} -> {t:<28} x{n}"));
+            }
+            // The same pairs GROUPED BY DESTINATION, which is the arrangement that answers "is the
+            // cost of entering a program a property of the program, or of the pair?". Read WITHIN a
+            // group: every row there enters the same destination doing the same work, so the only
+            // thing varying is where control came from. A tight group means the cost belongs to the
+            // destination (its own reprogramming extent) and a merge can be priced from the
+            // destination alone; a wide one means the predecessor is paying for the DIFFERENCE
+            // between two programs, and no per-destination constant can price a merge at all.
+            // `spread` is max-min over the group's means, reported so the two cases are separable
+            // at a glance rather than by eye over the rows.
+            out.push(
+                "  ARRIVAL COST BY DESTINATION (mean ms per from -> to; spread within a group \
+                 separates a destination cost from a pair cost):"
+                    .into(),
+            );
+            let mut by_dst: BTreeMap<&String, Vec<(&String, usize, f64)>> = BTreeMap::new();
+            for ((f, t), (n, s)) in l.pairs.iter() {
+                if *n > 0 {
+                    by_dst.entry(t).or_default().push((f, *n, s * 1e3 / *n as f64));
+                }
+            }
+            let mut ds: Vec<_> = by_dst.into_iter().collect();
+            ds.sort_by(|a, b| {
+                let tot = |v: &Vec<(&String, usize, f64)>| v.iter().map(|x| x.1).sum::<usize>();
+                tot(&b.1).cmp(&tot(&a.1))
+            });
+            for (dst, mut froms) in ds {
+                froms.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+                let (lo, hi) = froms.iter().fold((f64::MAX, f64::MIN), |(a, b), x| {
+                    (a.min(x.2), b.max(x.2))
+                });
+                let n: usize = froms.iter().map(|x| x.1).sum();
+                out.push(format!(
+                    "    -> {dst:<40} x{n:<5} spread {:>6.3} ms over {} predecessor(s)",
+                    if froms.len() > 1 { hi - lo } else { 0.0 },
+                    froms.len()
+                ));
+                for (f, n, ms) in froms {
+                    out.push(format!("         from {f:<44} x{n:<5} {ms:>7.3} ms"));
+                }
             }
             out.join("\n")
         })
