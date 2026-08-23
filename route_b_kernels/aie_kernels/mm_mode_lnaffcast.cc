@@ -18,6 +18,16 @@
 // is 4 dims only because its outer slab dimension merges with the leading digit
 // (512 == 4 x 128). See lnaffcast-mode-taps-fit-the-shim-in-four-dims.
 //
+// LNA_SCATTER_C moves the C un-permute off the tap and onto this core, which is
+// the OTHER side of that choice and the one the tap derivation never priced.
+// Those C strides burst at 16 B and cost 56.8% of the mode's dispatch time
+// (lnaffcast-mode-contiguous-taps-recover-61-percent), and the core-side form is
+// a SCATTER rather than the 993-run gather the A-side map was measured at:
+// C_L2L3's innermost digit is (t, 1), so writing output element q to L1 slot
+// C_L2L3[q] lands in 509 runs of 8, every base t-aligned. It must be paired with
+// a CONTIGUOUS C tap (--lnaffcast-contig-taps c) -- the two are one decision, and
+// either alone returns the permuted output.
+//
 // Self-contained because AIEAssignCoreLinkFiles traces only direct func.call
 // edges from the core, so an object this one CALLED would never reach the link
 // line. Same shape mm_mode_body.cc uses.
@@ -32,6 +42,13 @@
 #define LNA_COLS 1024
 #endif
 
+// Which side undoes C_L2L3: 0 = the shim tap (the derived C strides), 1 = this
+// core, writing scattered so a contiguous tap is correct. A build parameter, not
+// a property of the tile.
+#ifndef LNA_SCATTER_C
+#define LNA_SCATTER_C 0
+#endif
+
 // f32 elements in one A tile, and output rows in one C tile. Derived from the
 // GEMM's own declared shapes so they cannot drift from the buffers they index.
 static constexpr int kSlabF32 = EPI_M * EPI_K / 2;
@@ -42,6 +59,32 @@ static_assert(EPI_M * EPI_N == kRowsPerC * LNA_COLS,
 static_assert(LNA_COLS % kSlabF32 == 0,
               "an x row must be a whole number of A tiles");
 static_assert(LNA_COLS % 16 == 0, "the write pass walks 16 lanes at a time");
+
+#if LNA_SCATTER_C
+// C_L2L3's own walk, read off the generator: sizes (m/r, r, n/t, t) against
+// strides (r*n, t, r*t, 1). Stream position q -> L1 slot kScatter(q), so the core
+// writing output element q there is what a CONTIGUOUS C tap needs to land DDR in
+// row-major order. Derived from EPI_*, not spelled, so a blocking change fails a
+// static_assert instead of emitting a wrong walk.
+static constexpr int kT = EPI_T;             // innermost digit: t elements at stride 1
+static constexpr int kNPerT = EPI_N / EPI_T; // (n/t) digit, stride r*t
+static constexpr int kRowStride = EPI_R * EPI_N;   // (m/r) digit, stride r*n
+static constexpr int kGroups = LNA_COLS / kT;      // scattered stores per output row
+
+static_assert(EPI_N % EPI_T == 0, "n must be a whole number of t-columns");
+static_assert(LNA_COLS % kT == 0, "an output row must be a whole number of stores");
+// The (m/r) digit is the OUTPUT ROW only when one row is exactly the r*n elements
+// the other three digits span; without it the row index straddles digits and the
+// closed form below is wrong rather than merely narrower.
+static_assert(LNA_COLS == kRowStride,
+              "LNA_SCATTER_C needs one output row == r*n; re-derive otherwise");
+static_assert(kRowsPerC == EPI_M / EPI_R, "rows per C tile must be the (m/r) digit");
+
+// L1 slot the group of kT output columns starting at g*kT must be written to.
+static constexpr int scatter_base(int row, int g) {
+  return row * kRowStride + (g / kNPerT) * kT + (g % kNPerT) * (EPI_R * kT);
+}
+#endif
 
 // Stage one A tile into the accumulator. The A tile is DECLARED bf16 (it is the
 // GEMM's operand buffer) but a mode stream fills it with f32 activations, so it
@@ -78,7 +121,9 @@ static void lnaff_apply(const bfloat16 *restrict gb, float *restrict acc,
 
   for (int row = 0; row < kRowsPerC; row++) {
     const float *x = acc + row * LNA_COLS;
+#if !LNA_SCATTER_C
     bfloat16 *y = out + row * LNA_COLS;
+#endif
 
     // pass 1: mean = Sx / cols
     ::aie::vector<float, N> sum_v = ::aie::zeros<float, N>();
@@ -98,8 +143,15 @@ static void lnaff_apply(const bfloat16 *restrict gb, float *restrict acc,
       var_v = ::aie::add(var_v, sq);
     }
     float var = ::aie::reduce_add(var_v) / float(LNA_COLS);
+#if LNA_SCATTER_C
+    // The two scalars presented at the store width the scatter walks in.
+    ::aie::vector<float, kT> mean_v_t = ::aie::broadcast<float, kT>(mean);
+    ::aie::vector<float, kT> inv_v_t =
+        ::aie::broadcast<float, kT>(::aie::invsqrt(var + epsilon));
+#else
     ::aie::vector<float, N> inv_v =
         ::aie::broadcast<float, N>(::aie::invsqrt(var + epsilon));
+#endif
 
     // write: out = ((x - mean) * inv) * gamma + beta -> bf16.
     // The core's rounding mode is one sticky register shared by every kernel on
@@ -108,6 +160,22 @@ static void lnaff_apply(const bfloat16 *restrict gb, float *restrict acc,
     // runs on this same core from a different dispatch.
     const auto saved_rounding =
         ::aie::swap_rounding(::aie::rounding_mode::conv_even);
+#if LNA_SCATTER_C
+    // Same arithmetic, narrower store. Each element is computed independently of
+    // its neighbours (mean and inv are broadcasts), so kT lanes and N lanes are
+    // bit-identical -- which is what lets the two forms be gated on one number.
+    for (int g = 0; g < kGroups; g++) {
+      const int col = g * kT;
+      ::aie::vector<float, kT> d = ::aie::sub(::aie::load_v<kT>(x + col), mean_v_t);
+      ::aie::vector<float, kT> norm = ::aie::mul(d, inv_v_t);
+      ::aie::vector<float, kT> ng =
+          ::aie::mul(norm, ::aie::load_v<kT>(gamma + col));
+      ::aie::accum<accfloat, kT> acc_y;
+      acc_y.from_vector(::aie::add(ng, ::aie::load_v<kT>(beta + col)));
+      ::aie::store_v(out + scatter_base(row, g),
+                     acc_y.template to_vector<bfloat16>());
+    }
+#else
     for (int i = 0; i < chunks; i++) {
       ::aie::vector<float, N> d = ::aie::sub(::aie::load_v<N>(x + i * N), mean_v);
       ::aie::vector<float, N> norm = ::aie::mul(d, inv_v);
@@ -117,6 +185,7 @@ static void lnaff_apply(const bfloat16 *restrict gb, float *restrict acc,
       acc_y.from_vector(::aie::add(ng, ::aie::load_v<N>(beta + i * N)));
       ::aie::store_v(y + i * N, acc_y.template to_vector<bfloat16>());
     }
+#endif
     ::aie::set_rounding(saved_rounding);
   }
   event1();

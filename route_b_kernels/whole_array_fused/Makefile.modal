@@ -124,6 +124,12 @@ lnaffcast_group_rounds?=1
 # strides at unchanged sizes/offset/footprint. The output is wrong by construction, so an arm
 # built with this is comparable on wall clock and on nothing else.
 lnaffcast_contig_taps?=
+# Which side undoes C_L2L3. 0 = the derived C tap (16 B bursts, 56.8% of the mode's
+# dispatch time); 1 = the CORE, writing scattered so the contiguous tap is the correct
+# one -- so a correct scatter arm is `lnaffcast_scatter_c=1 lnaffcast_contig_taps=c`,
+# and either half alone returns the permuted output. Changes the core ELF, not the
+# stream, so it tags the body.
+lnaffcast_scatter_c?=0
 
 # Read A from a [K/W, M, W] panel-major buffer instead of row-major [M, K] (0 = off). Mirror of
 # c_panel_width, for a GEMM whose producer already drained panel-major -- fc1 does, by default, so a
@@ -228,7 +234,7 @@ opt_tag=$(if ${epi_opt},$(subst -,,$(subst =,,$(subst $(space),,${epi_opt}))),)
 apanel_tag=$(if $(filter 0,${a_panel_width}),,apanel${a_panel_width})
 # The lnaffcast BODY is a different core ELF; the rtp arm is a different instruction stream on
 # that same xclbin. rows/fanout change only the stream, so they tag the stream and not the body.
-lnaff_tag=$(if $(filter 0,${mode_lnaffcast}),,lnaff${mode_lnaffcast})
+lnaff_tag=$(if $(filter 0,${mode_lnaffcast}),,lnaff${mode_lnaffcast})$(if $(filter 1,${lnaffcast_scatter_c}),scat,)
 rtplnaff_tag=$(if $(filter 1,${rtp_mode_lnaffcast}),rtp18,)$(if $(filter 0,${lnaffcast_rows}),,r${lnaffcast_rows})$(if $(filter 1,${lnaffcast_c_fanout}),fan,)$(if $(filter 1,${lnaffcast_group_rounds}),,g${lnaffcast_group_rounds})$(if ${lnaffcast_contig_taps},ctg${lnaffcast_contig_taps},)
 target_suffix=${M}x${K}x${N}_${m}x${k}x${n}_${n_aie_cols}c_${mode_tag}${out_tag}${panel_tag}${dep_tag}${abdep_tag}${l3dep_tag}${wrk_tag}${mt_tag}${re_tag}${nat_tag}${krtp_tag}${apanel_tag}${resadd_tag}${rtpresadd_tag}${raonly_tag}${bisect_tag}${mrl_tag}${krl_tag}${lnaff_tag}${rtplnaff_tag}${opt_tag}
 
@@ -240,7 +246,7 @@ buffer_aloc_flag=basic-sequential
 
 # matmul object needs the bf16_f32 combo defines (mm.cc names symbols by combo).
 MM_DEFINES=-Dbf16_f32_ONLY -DDIM_M=${m} -DDIM_K=${k} -DDIM_N=${n} -DVECTORIZED_ONLY
-EPI_DEFINES=$(if $(filter 1,${mode4_bisect}), -DMODE4_BISECT_STORE_ONLY,)$(if $(filter 2,${mode4_bisect}), -DMODE4_BISECT_LOAD_A,)$(if $(filter 3,${mode4_bisect}), -DMODE4_BISECT_LOAD_AB,)$(if $(filter 4,${mode4_bisect}), -DMODE4_BISECT_LOAD_AB -DMODE4_BISECT_ADD,)$(if $(filter 5,${mode4_bisect}), -DMODE4_BISECT_LOAD_AB -DMODE4_BISECT_SUB,)$(if $(filter 6,${mode4_bisect}), -DMODE4_BISECT_LOAD_AB -DMODE4_BISECT_ADD_VIAVEC,)$(if $(filter 7,${mode4_bisect}), -DMODE4_BISECT_LOAD_AB -DMODE4_BISECT_ADD -DMODE4_BISECT_NOPIPE,)$(if $(filter 8,${mode4_bisect}), -DMODE4_BISECT_LOAD_AB -DMODE4_BISECT_ADD_IDENTDETOUR,)$(if $(filter 9,${mode4_bisect}), -DMODE4_ACCADD,) -DEPI_M=${m} -DEPI_K=${k} -DEPI_N=${n} -DEPI_R=${epi_r} -DEPI_T=${epi_t}$(if $(filter 1,${round_even}), -DMODAL_ROUND_EVEN,)$(if $(filter 1,${drain_round_floor}), -DMODAL_DRAIN_ROUND_FLOOR,)$(if $(filter 1,${silu_f32_tail}), -DSILU_F32_TAIL,)$(if $(filter 1,${silu_f32_tanh}), -DSILU_F32_TANH,)
+EPI_DEFINES=$(if $(filter 1,${mode4_bisect}), -DMODE4_BISECT_STORE_ONLY,)$(if $(filter 2,${mode4_bisect}), -DMODE4_BISECT_LOAD_A,)$(if $(filter 3,${mode4_bisect}), -DMODE4_BISECT_LOAD_AB,)$(if $(filter 4,${mode4_bisect}), -DMODE4_BISECT_LOAD_AB -DMODE4_BISECT_ADD,)$(if $(filter 5,${mode4_bisect}), -DMODE4_BISECT_LOAD_AB -DMODE4_BISECT_SUB,)$(if $(filter 6,${mode4_bisect}), -DMODE4_BISECT_LOAD_AB -DMODE4_BISECT_ADD_VIAVEC,)$(if $(filter 7,${mode4_bisect}), -DMODE4_BISECT_LOAD_AB -DMODE4_BISECT_ADD -DMODE4_BISECT_NOPIPE,)$(if $(filter 8,${mode4_bisect}), -DMODE4_BISECT_LOAD_AB -DMODE4_BISECT_ADD_IDENTDETOUR,)$(if $(filter 9,${mode4_bisect}), -DMODE4_ACCADD,) -DEPI_M=${m} -DEPI_K=${k} -DEPI_N=${n} -DEPI_R=${epi_r} -DEPI_T=${epi_t}$(if $(filter 1,${lnaffcast_scatter_c}), -DLNA_SCATTER_C=1,)$(if $(filter 1,${round_even}), -DMODAL_ROUND_EVEN,)$(if $(filter 1,${drain_round_floor}), -DMODAL_DRAIN_ROUND_FLOOR,)$(if $(filter 1,${silu_f32_tail}), -DSILU_F32_TAIL,)$(if $(filter 1,${silu_f32_tanh}), -DSILU_F32_TANH,)
 ifeq (${b_col_maj}, 1)
 	MM_DEFINES+=-DB_COL_MAJ
 endif

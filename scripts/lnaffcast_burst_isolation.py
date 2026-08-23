@@ -21,6 +21,13 @@
 # them scrambles the output. That is why parity is reported here but gated only on the BASELINE:
 # a control that passed parity would mean the re-stride did not take.
 #
+# WHICH ARMS MUST PASS IS AN INPUT, not a property of the flag. Against a core body built with
+# LNA_SCATTER_C=1 the un-permute lives on the CORE, so the contiguous C tap is the CORRECT one and
+# the DERIVED tap is the arm that must fail. --parity-must-pass names the arms expected to pass;
+# every other arm is checked for the opposite. Both directions are gated: an arm that passes when
+# it should fail means the re-stride did not take, and one that fails when it should pass is a
+# broken candidate -- reporting only the first would let the second read as a clean control run.
+#
 # ONE HARDWARE CONTEXT, THREE STREAMS. The array program is byte-identical across the arms (the
 # taps live in the runtime sequence), so all three insts run on the baseline's loaded xclbin. That
 # deletes the program-transition tax (~1.543 ms) from the comparison outright rather than
@@ -210,20 +217,28 @@ def main(o):
         print(f"  {suffix.replace(o.host, '<host>'):<22s} max innermost run {run:>6d} el  "
               f"{'  '.join(line)}   block spread {agree:.1%}")
 
-    bp = base["blocks"]["forward"]["parity"]
-    ok = bp["rel_l2"] < o.rel_l2_gate and not bp["nan_out"]
-    print(f"\n  baseline parity {'PASS' if ok else 'FAIL'} "
-          f"(rel-L2 {bp['rel_l2']:.4e} vs gate {o.rel_l2_gate:.1e})")
-    for suffix in o.arms[1:]:
-        cp = results[suffix]["blocks"]["forward"]["parity"]
-        if cp["rel_l2"] < o.rel_l2_gate:
-            print(f"  WARNING {suffix}: control PASSES parity -- the re-stride did not take, "
-                  f"so its timing is not a control")
+    must_pass = set(o.parity_must_pass or [o.arms[0]])
+    unknown = must_pass - set(o.arms)
+    if unknown:
+        sys.exit(f"--parity-must-pass names arms that are not in --arms: {sorted(unknown)}")
+    ok = True
+    for suffix in o.arms:
+        p_ = results[suffix]["blocks"]["forward"]["parity"]
+        passed = p_["rel_l2"] < o.rel_l2_gate and not p_["nan_out"]
+        want = suffix in must_pass
+        tag = "PASS" if passed else "FAIL"
+        note = ""
+        if passed != want:
             ok = False
+            note = ("  <- expected PASS" if want else
+                    "  <- expected FAIL; a control that passes means the re-stride did not take")
+        print(f"  {suffix.replace(o.host, '<host>'):<26s} parity {tag} "
+              f"(rel-L2 {p_['rel_l2']:.4e} vs gate {o.rel_l2_gate:.1e}){note}")
 
     with open(o.out, "w") as f:
         json.dump({"host": o.host, "shape": [M, K, N], "cols": COLS, "rows": ROWS,
-                   "reps": o.reps, "results": results}, f, indent=2)
+                   "reps": o.reps, "parity_must_pass": sorted(must_pass),
+                   "results": results}, f, indent=2)
     print(f"\nwrote {o.out}")
     return 0 if ok else 1
 
@@ -239,5 +254,8 @@ if __name__ == "__main__":
     p.add_argument("--reps", type=int, default=5)
     p.add_argument("--rel-l2-gate", type=float, default=1e-4,
                    help="baseline gate; the mode measured 5.7361e-06 on first dispatch")
+    p.add_argument("--parity-must-pass", nargs="*", default=None,
+                   help="arms expected to pass parity (default: the first arm). Every other arm "
+                        "is gated on FAILING -- against LNA_SCATTER_C=1 that is the derived tap.")
     p.add_argument("--out", default="artifacts/lnaffcast_burst_isolation.json")
     sys.exit(main(p.parse_args()))

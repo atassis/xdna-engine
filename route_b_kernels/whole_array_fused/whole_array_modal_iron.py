@@ -1079,14 +1079,19 @@ def my_matmul(
         # whole n_aie_rows * lnaff_rows_per_c block of consecutive output rows.
         c_sizes, c_strides = [16, 8, 16, 8], [1024, 8, 64, 1]
 
-        # --lnaffcast-contig-taps: the TIMING-ONLY control for
+        # --lnaffcast-contig-taps: originally the TIMING-ONLY control for
         # lnaffcast-mode-taps-burst-at-16-bytes. Each named tap keeps its sizes, its offset and
         # its footprint and gets the contiguous strides for those sizes, which raises the
-        # innermost run from 8 bf16 to the whole 4096-16384 elements. The walk is then WRONG --
-        # the un-permute is what the real strides encode -- so any arm built with this flag
-        # reads out garbage by construction and can only be compared on wall clock. Sizes are
-        # unchanged deliberately: the burst-length claim is that the same byte count at the same
-        # rank costs less when it is not scattered, so anything else moving would confound it.
+        # innermost run from 8 bf16 to the whole 4096-16384 elements. Sizes are unchanged
+        # deliberately: the burst-length claim is that the same byte count at the same rank
+        # costs less when it is not scattered, so anything else moving would confound it.
+        #
+        # WHETHER THE ARM IS CORRECT DEPENDS ON THE CORE BODY, which this generator cannot see.
+        # Against the default body the walk is WRONG -- the un-permute is what the real strides
+        # encode -- so the arm reads out garbage and is comparable on wall clock alone. Against
+        # a body built with LNA_SCATTER_C=1 the core writes C scattered and `c` here is the
+        # CORRECT tap for it; the two are one decision and either half alone permutes the
+        # output.
         if lnaffcast_contig_taps:
             unknown = set(lnaffcast_contig_taps) - set("abc")
             if unknown:
