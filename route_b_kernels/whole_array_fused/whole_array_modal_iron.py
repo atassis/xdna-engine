@@ -360,6 +360,7 @@ def my_matmul(
     resadd2a_rows=0,
     resadd2a_scale=1.0,
     resadd2a_rev_rows=False,
+    resadd2a_fused=False,
 ):
     n_aie_rows = 4
     n_aie_cores = n_aie_rows * n_aie_cols
@@ -665,7 +666,7 @@ def my_matmul(
     # broadcast factor in acquires instead -- 2 * n/k tiles per C tile per column, and the pairing
     # is free because ONE index map applies to both (two-activation-mode-broadcast-acquire-cost).
     r2a_j = r2a_per_core = r2a_rounds = 0
-    r2a_stage_kernel = r2a_apply_kernel = None
+    r2a_stage_kernel = r2a_apply_kernel = r2a_fused_kernel = None
     if rtp_mode_resadd2a and not mode_resadd2a:
         raise ValueError(
             "--rtp-mode-resadd2a bakes rtp[0]=5, but --mode-resadd2a is what puts the body in "
@@ -719,6 +720,17 @@ def my_matmul(
         )
         r2a_apply_kernel = Kernel(
             "mm_resadd2a_apply_f32", r2a_obj, [A_l1_ty, C_l1_ty, np.int32, np.int32]
+        )
+        # ONE PASS over each (a, b) pair. Writes the C tile once per hold instead of twice, which
+        # is what the measured budget requires; costs two A-fifo buffers held at once.
+        r2a_fused_kernel = (
+            Kernel(
+                "mm_resadd2a_fused_f32",
+                r2a_obj,
+                [A_l1_ty, A_l1_ty, C_l1_ty, np.int32, np.int32],
+            )
+            if resadd2a_fused
+            else None
         )
         # An AIE2 tile has no input channel left for a scale operand, so it travels as its f32
         # bit pattern in an i32 the kernel memcpys back. One build serves every scale.
@@ -834,6 +846,7 @@ def my_matmul(
         resadd=None,
         r2a_stage=None,
         r2a_apply=None,
+        r2a_fused=None,
         r2a_col=0,
     ):
         barrier.wait_for_value(1)  # wait for the host to write the epilogue mode into rtp
@@ -927,17 +940,33 @@ def my_matmul(
                     # broadcast across the columns of an array row; a core acquires all of them
                     # and applies the r2a_per_core that are its own. Python-unrolled, so the
                     # skip and the slab index are compile-time constants and cost no branch.
-                    for slot in range(n_aie_cols * r2a_per_core):
-                        elem_in_a = ea if slot == 0 else in_a.acquire(1)
-                        if slot // r2a_per_core == r2a_col:
-                            local = slot % r2a_per_core
-                            if local < r2a_j:
-                                r2a_stage(elem_in_a, elem_out, local)
-                            else:
-                                r2a_apply(
-                                    elem_in_a, elem_out, local - r2a_j, r2a_scale_bits
+                    if r2a_fused is not None:
+                        # Paired stream order: this core's share arrives as (a[j], b[j]) pairs, so
+                        # both are live at once and one call writes the slot. Two A buffers held
+                        # across the call -- WA_AB_DEPTH must be >= 2 for that to be possible at
+                        # all, and >= 3 to keep any producer overlap.
+                        for slot in range(0, n_aie_cols * r2a_per_core, 2):
+                            e_a = ea if slot == 0 else in_a.acquire(1)
+                            e_b = in_a.acquire(1)
+                            if slot // r2a_per_core == r2a_col:
+                                r2a_fused(
+                                    e_a, e_b, elem_out,
+                                    (slot % r2a_per_core) // 2, r2a_scale_bits,
                                 )
-                        in_a.release(1)
+                            in_a.release(1)
+                            in_a.release(1)
+                    else:
+                        for slot in range(n_aie_cols * r2a_per_core):
+                            elem_in_a = ea if slot == 0 else in_a.acquire(1)
+                            if slot // r2a_per_core == r2a_col:
+                                local = slot % r2a_per_core
+                                if local < r2a_j:
+                                    r2a_stage(elem_in_a, elem_out, local)
+                                else:
+                                    r2a_apply(
+                                        elem_in_a, elem_out, local - r2a_j, r2a_scale_bits
+                                    )
+                            in_a.release(1)
             elif mode_read_late:
                 # ORDERING ARM. rtp is a side-channel with a MEASURED one-tile visibility lag:
                 # barrier.wait_for_value sits outside the tile loop, so it orders only a
@@ -1196,6 +1225,8 @@ def my_matmul(
             body = core_fn_split_acc if split_acc else core_fn
             if r2a_stage_kernel is not None:
                 args += [r2a_stage_kernel, r2a_apply_kernel]
+                if r2a_fused_kernel is not None:
+                    args.append(r2a_fused_kernel)
                 # The COLUMN picks which share of the row's A stream this core applies. Bound in
                 # a closure because fn_args are core arguments and a Python int is not one. The
                 # two mode kernels are passed by NAME: `resadd` sits between them and the
@@ -1205,6 +1236,7 @@ def my_matmul(
                         *fn_args[:8],
                         r2a_stage=fn_args[8],
                         r2a_apply=fn_args[9],
+                        r2a_fused=fn_args[10] if len(fn_args) > 10 else None,
                         r2a_col=_col,
                     )
 
@@ -1437,9 +1469,12 @@ def my_matmul(
             # so awaiting a drain before the sequence has issued the rest would deadlock.
             for col in range(n_aie_cols):
                 tg = TaskGroup()
+                pairs = ([(j, o) for j in range(r2a_j) for o in range(2)]
+                         if resadd2a_fused
+                         else [(j, o) for o in range(2) for j in range(r2a_j)])
                 for row in row_order:
-                    for operand in range(2):
-                        for j in range(r2a_j):
+                    for j, operand in pairs:
+                        if True:
                             tap_a = TensorAccessPattern(
                                 (M * K,),
                                 operand * op_stride
@@ -1853,6 +1888,13 @@ def main():
         "N-wide operands). Insts-only, so several row counts share one xclbin.",
     )
     argparser.add_argument(
+        "--resadd2a-fused",
+        action="store_true",
+        help="one pass per (a, b) pair instead of a stage pass and an apply pass. Writes the C "
+        "tile once per hold rather than twice, which is what the measured work budget requires. "
+        "Pairs the fill order and holds two A-fifo buffers across the call.",
+    )
+    argparser.add_argument(
         "--resadd2a-rev-rows",
         action="store_true",
         help="fill the array rows far-end-first. Insts-only, so it shares an xclbin with the "
@@ -1909,6 +1951,7 @@ def main():
         args.resadd2a_rows,
         args.resadd2a_scale,
         args.resadd2a_rev_rows,
+        args.resadd2a_fused,
     )
     if args.generate_taps:
         return maybe_module

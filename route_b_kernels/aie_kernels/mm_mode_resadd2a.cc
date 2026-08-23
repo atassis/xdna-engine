@@ -92,6 +92,13 @@
 #ifndef RESADD2A_STAGE_RUNS
 #define RESADD2A_STAGE_RUNS kRuns
 #endif
+// Same knob for the apply body. Together they separate TOTAL work per C-tile hold from HOW IT IS
+// SPLIT: stage 4 + apply 4 writes the C tile exactly once, the same 1.000x that stage-only and
+// apply-only sustain, but across two real bodies. If that passes, the budget is total work and
+// merging the two passes into one is the fix; if it fails, the split matters too.
+#ifndef RESADD2A_APPLY_RUNS
+#define RESADD2A_APPLY_RUNS kRuns
+#endif
 #define RESADD2A_HAS_STAGE (RESADD2A_NOOP == 0 || RESADD2A_NOOP == 2 || RESADD2A_NOOP == 4)
 #define RESADD2A_HAS_APPLY \
   (RESADD2A_NOOP == 0 || RESADD2A_NOOP == 3 || RESADD2A_NOOP == 5 || RESADD2A_NOOP == 6)
@@ -130,6 +137,32 @@ static inline ::aie::vector<float, N> vfile(const ::aie::vector<float, N> &s) {
 
 extern "C" {
 
+// ONE PASS: `c = a + scale*b` written through the closed-form address in a single traversal, so
+// the C tile is written ONCE per hold instead of twice. That is the whole point -- the measured
+// budget is about 1.000x the C tile per hold and the two-pass stage+apply shape spends 2.000x
+// (resadd2a-mode-has-a-core-work-budget-per-c-tile, the-c-tile-work-budget-is-the-total-not-the-split).
+// Needs a[j] and b[j] LIVE TOGETHER, which the paired fill order supplies and which costs the core
+// two A-fifo buffers held at once.
+void mm_resadd2a_fused_f32(const bfloat16 *__restrict a, const bfloat16 *__restrict b,
+                           float *__restrict c, int32_t j, int32_t scale_bits) {
+  event0();
+  float scale;
+  __builtin_memcpy(&scale, &scale_bits, sizeof(scale));
+  const ::aie::vector<bfloat16, kLanes> svb =
+      ::aie::broadcast<bfloat16, kLanes>((bfloat16)scale);
+  float *__restrict dst = c + j * kRun;
+  for (int i = 0; i < kRuns; ++i)
+    for (int q = 0; q < kRun; q += kLanes) {
+      // a widened into the accumulator, then scale*b mac'd on top -- one fused product, and the
+      // store is the only write this slot ever takes.
+      ::aie::accum<accfloat, kLanes> acc;
+      acc.from_vector(::aie::load_v<kLanes>(a + i * kRun + q), 0);
+      acc = ::aie::mac(acc, ::aie::load_v<kLanes>(b + i * kRun + q), svb);
+      ::aie::store_v(dst + i * kStride + q, vfile(acc.to_vector<float>()));
+    }
+  event1();
+}
+
 // Widen A tile `j` into the C tile at the slots the drain will read it from.
 void mm_resadd2a_stage_f32(const bfloat16 *__restrict a, float *__restrict c,
                            int32_t j) {
@@ -164,7 +197,7 @@ void mm_resadd2a_apply_f32(const bfloat16 *__restrict b, float *__restrict c,
   [[maybe_unused]] const ::aie::vector<bfloat16, kLanes> svb =
       ::aie::broadcast<bfloat16, kLanes>((bfloat16)scale);
   float *__restrict dst = c + j * kRun;
-  for (int i = 0; i < kRuns; ++i)
+  for (int i = 0; i < RESADD2A_APPLY_RUNS; ++i)
     for (int q = 0; q < kRun; q += kLanes) {
       ::aie::accum<accfloat, kLanes> bv;
       bv.from_vector(::aie::load_v<kLanes>(b + i * kRun + q), 0);
