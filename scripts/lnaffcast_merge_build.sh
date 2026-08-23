@@ -57,6 +57,21 @@ ENC=(NPU2=1 M=512 K=1024 N=4096 m=32 k=32 n=128 n_aie_cols=8
      dtype_in=bf16 dtype_out=bf16 emulate_bfloat16_mmul_with_bfp16=1 bfp16_iree=1
      c_panel_width=1024)
 SHIPPED=512x1024x4096_32x32x128_8c_modalsilubf16outpanel1024
+
+# KRTPKRL=1 builds the mode on the FOLD composition's resident instead of the shipped one. Both
+# vehicles are real and they are not interchangeable: `build_parakeet_modal_kernels.sh` ships
+# `...panel1024`, but the f2 ledger every merge VALUE is derived from (96 lnaffcast dispatches, 47
+# arrivals from the resident, -240.0 ms/clip of boundary tax) ran `...panel1024krtpkrl`. Gating one
+# and quoting the other is how a merge lands on an xclbin nobody loads -- the mistake this whole
+# script exists to stop, one level up.
+#
+# krtp puts the k trip count in rtp[1], which is what makes mixed-K unsound; krl is the peel that
+# fixes it, and the pair is why that variant carries BOTH tags. The mode itself needs neither -- its
+# slab counts are compile-time constants -- so it rides along either way.
+if [ "${KRTPKRL:-0}" = 1 ]; then
+  ENC+=(k_loop_rtp=1 k_read_late=1)
+  SHIPPED=${SHIPPED}krtpkrl
+fi
 SCAT="${SCAT:-2}"
 
 build() {   # $1 = artifact suffix, rest = extra make vars

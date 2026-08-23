@@ -30,7 +30,10 @@ log(){ echo -e "$*" | tee -a "$LOG"; }
 restore(){ systemctl --user start xdna-engine.service npu-vox.service >/dev/null 2>&1; log "[svc] restored"; }
 trap restore EXIT
 
+# KRTPKRL=1 gates the FOLD composition's resident instead of the shipped one -- see the same knob
+# in lnaffcast_merge_build.sh for why the two are not interchangeable.
 SHIPPED=512x1024x4096_32x32x128_8c_modalsilubf16outpanel1024
+[ "${KRTPKRL:-0}" = 1 ] && SHIPPED=${SHIPPED}krtpkrl
 X1=${SHIPPED}lnaff1024scat21x
 REPS="${REPS:-5}"
 ROWS="${ROWS:-512}"
