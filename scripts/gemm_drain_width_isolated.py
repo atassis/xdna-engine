@@ -53,6 +53,7 @@ from ml_dtypes import bfloat16
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from gemm_command_accounting import design_operands, insts_bin, shape_of
 
+import pyxrt
 from aie.utils.npukernel import NPUKernel
 from aie.utils.tensor_factory import tensor
 import aie.utils as aie_utils
@@ -107,6 +108,72 @@ def reference(a, b, K, N):
                for p in range(K // N))
 
 
+def cross_arms(o):
+    """(host xclbin, stream) pairs -- run a stream on an array program it was not built for.
+
+    THIS IS WHAT THE ENCODER ACTUALLY DOES and what the per-arm run above deliberately does not.
+    `stream_k_ex` resolves an insts path only and binds the instruction BO to the ONE resident
+    kernel, so under the fold the K=4096 collapse stream executes on fc1's N=4096 array program
+    rather than on its own N=1024 build. The two differ in the device region: the modal instruction
+    streams are shape-independent (N rides in the BD size/stride fields) but each core's tile-loop
+    bound is BAKED, at 2/4/8 for N=1024/2048/4096.
+
+    The K-split stream on the same resident is the positive control: it crosses the same N boundary
+    and is the configuration that passes parity in the encoder, so if it fails here the probe is
+    wrong rather than the collapse.
+    """
+    resident = "512x1024x4096_32x32x128_8c_modalsilubf16outpanel1024krtp"
+    return [(resident, "512x1024x1024_32x32x128_8c_modalidbf16outkrtp"),          # control
+            (resident, "512x4096x1024_32x32x128_8c_modalidbf16outkrtpapanel1024")]  # the suspect
+
+
+def run_cross(o, patterns, results):
+    """Drive each (host, stream) pair and gate the stream's OWN closed form."""
+    rt = aie_utils.DefaultNPURuntime
+    for host, stream in cross_arms(o):
+        handle, _ = load_arm(host, o)
+        kh = handle
+        while not hasattr(kh, "kernel"):
+            kh = kh._handle
+        M, K, N = shape_of(stream, o)
+        hM, hK, hN = shape_of(host, o)
+        out_dt = design_operands(o.build_dir, stream)[-1][1]
+        arr = np.frombuffer(open(os.path.join(o.build_dir, f"insts_{stream}.txt"), "rb").read(),
+                            dtype=np.uint32)
+        ibo = rt._tensor_class(arr, flags=pyxrt.bo.cacheable, group_id=kh.kernel.group_id(1),
+                               xrt_device=rt._device).buffer_object()
+        # Size every BO to the MAX of the two designs. The HOST program's baked tile-loop bound may
+        # drive more traffic than the stream's own shape implies, and an under-sized BO would fault
+        # or corrupt neighbouring memory instead of returning the wrong answer this probe is here
+        # to see.
+        key = f"{stream} ON {host}"
+        results[key] = {"out_dtype": out_dt, "host": host, "stream": stream}
+        for pname in ("exact", "dense"):
+            a, b = patterns[pname](M, K, N)
+            a_pad = np.zeros(max(M * K, hM * hK), dtype=bfloat16); a_pad[:M * K] = a.reshape(M * K)
+            b_pad = np.zeros(max(K * N, hK * hN), dtype=bfloat16); b_pad[:K * N] = b.reshape(K * N)
+            c_pad = np.full(max(M * N, hM * hN), np.nan, dtype=DTYPE[out_dt])
+            At, Bt = tensor(a_pad, dtype=bfloat16), tensor(b_pad, dtype=bfloat16)
+            Ct = tensor(c_pad, dtype=DTYPE[out_dt])
+            for t in (At, Bt, Ct):
+                t.to("npu")
+            kh.kernel(3, ibo, arr.nbytes, At.buffer_object(), Bt.buffer_object(),
+                      Ct.buffer_object()).wait()
+            Ct.to("cpu")
+            got = np.asarray(Ct)[:M * N].reshape(M, N).astype(np.float64)
+            ref = reference(a_as_the_stream_reads_it(
+                a.reshape(M * K).astype(np.float64), stream, M, K), b, K, N)
+            bad = int(np.count_nonzero(got != ref))
+            rel = float(np.linalg.norm(got - ref) / np.linalg.norm(ref))
+            results[key][pname] = {
+                "mismatches": bad, "elements": int(got.size), "rel_l2": rel,
+                "max_abs_err": float(np.max(np.abs(got - ref))),
+                "nan_out": int(np.count_nonzero(~np.isfinite(got))),
+            }
+            print(f"  {key:<58s} {pname:<6s} rel-L2 {rel:>9.4f}  bad {bad:>7d}/{got.size}  "
+                  f"nan {int(np.count_nonzero(~np.isfinite(got))):>7d}", flush=True)
+
+
 def main(o):
     os.makedirs(o.artifacts, exist_ok=True)
     rt = aie_utils.DefaultNPURuntime
@@ -117,23 +184,31 @@ def main(o):
     if K % N:
         sys.exit(f"this probe's B construction needs K % N == 0, got K={K} N={N}")
 
-    rng = np.random.default_rng(seed=42)
-    patterns = {}
-    # exact: +-1 A, single-cycle permutation B. Lossless end to end -- see the header.
-    a_ex = np.where(rng.random((M, K)) < 0.5, -1.0, 1.0).astype(bfloat16)
-    b_ex = np.zeros((K, N), dtype=bfloat16)
-    b_ex[np.arange(K), (np.arange(K) + 1) % N] = 1.0
-    patterns["exact"] = (a_ex, b_ex)
-    # dense: the precision-class control. Small magnitudes keep the f32 accumulate well away from
-    # saturation so a large rel-L2 is a defect and not a range artifact.
-    patterns["dense"] = (rng.normal(0, 0.5, (M, K)).astype(bfloat16),
-                         rng.normal(0, 0.5, (K, N)).astype(bfloat16))
+    # Shape-parameterized, because the cross arms below run streams of a DIFFERENT shape than the
+    # per-arm set. Seeded per call so a given (pattern, shape) is the same data everywhere.
+    def exact(m, k, n):
+        """+-1 A, single-cycle permutation B. Lossless end to end -- see the header."""
+        r = np.random.default_rng(seed=42)
+        a = np.where(r.random((m, k)) < 0.5, -1.0, 1.0).astype(bfloat16)
+        b = np.zeros((k, n), dtype=bfloat16)
+        b[np.arange(k), (np.arange(k) + 1) % n] = 1.0
+        return a, b
+
+    def dense(m, k, n):
+        """The precision-class control. Small magnitudes keep the f32 accumulate well away from
+        saturation, so a large rel-L2 is a defect and not a range artifact."""
+        r = np.random.default_rng(seed=43)
+        return (r.normal(0, 0.5, (m, k)).astype(bfloat16),
+                r.normal(0, 0.5, (k, n)).astype(bfloat16))
+
+    patterns = {"exact": exact, "dense": dense}
 
     results = {}
     for suffix in o.arms:
         handle, out_dt = load_arm(suffix, o)
         results[suffix] = {"out_dtype": out_dt}
-        for pname, (a, b) in patterns.items():
+        for pname, mk in patterns.items():
+            a, b = mk(M, K, N)
             At = tensor(a.reshape(M * K), dtype=bfloat16)
             Bt = tensor(b.reshape(K * N), dtype=bfloat16)
             # Poison the drain through the same host->device path A and B take: a dispatch that
@@ -157,18 +232,21 @@ def main(o):
                   f"bad {bad:>7d}/{got.size}  maxabs {np.max(np.abs(got - ref)):>9.4f}"
                   f"{'  NAN' if not np.all(np.isfinite(got)) else ''}", flush=True)
 
+    if o.cross:
+        print("\n--- cross-program: the stream on an array program it was not built for ---")
+        run_cross(o, patterns, results)
+
     print()
     # The exact pattern is the verdict: equality or a defect, nothing in between.
-    failed = [s for s in o.arms if results[s]["exact"]["mismatches"]]
-    for s in o.arms:
-        e = results[s]["exact"]
+    for s, r in results.items():
+        e = r["exact"]
         print(f"  {'FAIL' if e['mismatches'] else 'PASS'}  {s}  "
               f"(exact {e['mismatches']}/{e['elements']} bad, dense rel-L2 "
-              f"{results[s]['dense']['rel_l2']:.4f})")
+              f"{r['dense']['rel_l2']:.4f})")
     with open(o.out, "w") as f:
         json.dump({"shape": [M, K, N], "results": results}, f, indent=2)
     print(f"\nwrote {o.out}")
-    return 1 if len(failed) == len(o.arms) else 0
+    return 0
 
 
 if __name__ == "__main__":
@@ -182,5 +260,7 @@ if __name__ == "__main__":
     p.add_argument("--M", type=int)
     p.add_argument("--K", type=int)
     p.add_argument("--N", type=int)
+    p.add_argument("--cross", action="store_true",
+                   help="also run each stream on the fold resident's array program")
     p.add_argument("--out", default="artifacts/gemm_drain_width_isolated.json")
     sys.exit(main(p.parse_args()))
