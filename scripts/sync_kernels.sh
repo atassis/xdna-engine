@@ -46,6 +46,7 @@ cp "$RB/aie_kernels/mm_silu_epilogue.cc" "$K/mm_silu_epilogue.cc"
 # lnaffcast as a MODE of the modal GEMM: its own object, because AIEAssignCoreLinkFiles
 # traces only direct func.call edges from the core.
 cp "$RB/aie_kernels/mm_mode_lnaffcast.cc" "$K/mm_mode_lnaffcast.cc"
+cp "$RB/aie_kernels/mm_mode_resadd2a.cc" "$K/mm_mode_resadd2a.cc"
 # softmax-400 (pad->416) example
 cp "$RB/softmax400/softmax400.py" "$PE/ml/softmax400/softmax400.py"
 cp "$RB/softmax400/Makefile"      "$PE/ml/softmax400/Makefile"

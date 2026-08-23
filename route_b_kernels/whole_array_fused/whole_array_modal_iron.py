@@ -355,6 +355,10 @@ def my_matmul(
     lnaffcast_group_rounds=1,
     lnaffcast_contig_taps="",
     lnaffcast_1x=False,
+    mode_resadd2a=False,
+    rtp_mode_resadd2a=False,
+    resadd2a_rows=0,
+    resadd2a_scale=1.0,
 ):
     n_aie_rows = 4
     n_aie_cores = n_aie_rows * n_aie_cols
@@ -655,6 +659,72 @@ def my_matmul(
                 "mm_lnaff_apply_x_f32", lnaff_obj, [cacc_ty, B_l1_ty, C_l1_ty, np.int32]
             )
 
+    # --mode-resadd2a: `out = a + scale*b` with BOTH operands on the A fifo. resadd has no weight
+    # to absorb a broadcast the way lnaffcast's gb does, so the operands are charged their fifo's
+    # broadcast factor in acquires instead -- 2 * n/k tiles per C tile per column, and the pairing
+    # is free because ONE index map applies to both (two-activation-mode-broadcast-acquire-cost).
+    r2a_j = r2a_per_core = r2a_rounds = 0
+    r2a_stage_kernel = r2a_apply_kernel = None
+    if rtp_mode_resadd2a and not mode_resadd2a:
+        raise ValueError(
+            "--rtp-mode-resadd2a bakes rtp[0]=5, but --mode-resadd2a is what puts the body in "
+            "the xclbin. The stream would select a mode no core can service."
+        )
+    if mode_resadd2a and (mode_resadd or resadd_only or mode_lnaffcast):
+        raise ValueError(
+            "--mode-resadd2a is a second body in the same rtp[0] >= 4 branch as --mode-resadd, "
+            "--resadd-only and --mode-lnaffcast. Build one mode per xclbin."
+        )
+    if mode_resadd2a:
+        if dtype_out_str != "f32":
+            raise ValueError(
+                "--mode-resadd2a needs the f32-out path (dtype_out=f32): it stages `a` into the "
+                "C tile and accumulates scale*b on top, and only the f32-out body's C tile is an "
+                "accumulator."
+            )
+        if n % k:
+            raise ValueError(
+                f"--mode-resadd2a needs n % k == 0: the n/k A tiles spanning a C tile are what "
+                f"the drain's base offset indexes (n={n}, k={k})."
+            )
+        if N != n * n_aie_cols:
+            raise ValueError(
+                f"--mode-resadd2a covers one column-block sweep per round, so the operand row "
+                f"must be exactly n * n_aie_cols wide: N={N}, n * n_aie_cols={n * n_aie_cols}."
+            )
+        r2a_j = n // k
+        r2a_per_core = 2 * r2a_j
+        # One round is one C tile per core: n_aie_rows * m output rows, the full N wide.
+        r2a_rows_per_round = n_aie_rows * m
+        # Both operands live in the A tensor -- a at 0, b at rows*N -- so it is A, not C, that
+        # caps the sweep.
+        r2a_rows_cap = min(M * K // (2 * N), M)
+        if not resadd2a_rows:
+            resadd2a_rows = (r2a_rows_cap // r2a_rows_per_round) * r2a_rows_per_round
+        if resadd2a_rows % r2a_rows_per_round:
+            raise ValueError(
+                f"--resadd2a-rows={resadd2a_rows} must be a multiple of the round "
+                f"{r2a_rows_per_round} = n_aie_rows * m"
+            )
+        if resadd2a_rows > r2a_rows_cap:
+            raise ValueError(
+                f"--resadd2a-rows={resadd2a_rows} exceeds {r2a_rows_cap}, what the A tensor "
+                f"({M * K} bf16) holds as two {N}-wide operands"
+            )
+        r2a_rounds = resadd2a_rows // r2a_rows_per_round
+        r2a_obj = f"mm_mode_resadd2a_{m}x{k}x{n}.o"
+        r2a_stage_kernel = Kernel(
+            "mm_resadd2a_stage_f32", r2a_obj, [A_l1_ty, C_l1_ty, np.int32]
+        )
+        r2a_apply_kernel = Kernel(
+            "mm_resadd2a_apply_f32", r2a_obj, [A_l1_ty, C_l1_ty, np.int32, np.int32]
+        )
+        # An AIE2 tile has no input channel left for a scale operand, so it travels as its f32
+        # bit pattern in an i32 the kernel memcpys back. One build serves every scale.
+        r2a_scale_bits = int(
+            np.frombuffer(np.float32(resadd2a_scale).tobytes(), dtype=np.int32)[0]
+        )
+
     # Tile declarations as tile[row][col]
     tiles = [[(col, row) for col in range(0, n_aie_cols)] for row in range(0, 6)]
     core_tiles = tiles[2:]
@@ -751,7 +821,20 @@ def my_matmul(
             return trip - 1
         return _arith.subi(trip, _arith.constant(_T.i32(), 1))
 
-    def core_fn(in_a, in_b, out_c, rtp_buff, barrier, zero, matmul, epilogue, resadd=None):
+    def core_fn(
+        in_a,
+        in_b,
+        out_c,
+        rtp_buff,
+        barrier,
+        zero,
+        matmul,
+        epilogue,
+        resadd=None,
+        r2a_stage=None,
+        r2a_apply=None,
+        r2a_col=0,
+    ):
         barrier.wait_for_value(1)  # wait for the host to write the epilogue mode into rtp
         # k-loop-bound-as-rtp PoC: rtp[1] carries the K-tile trip count, written by sequence()
         # alongside rtp[0]'s epilogue mode, so ONE compiled core body serves any K value --
@@ -778,10 +861,18 @@ def my_matmul(
             k_trip = (rtp_buff[1] if k_loop_rtp else K // k) if needs_top_read else None
             elem_out = out_c.acquire(1)
 
-            def _gemm_path():
+            def _gemm_path(peeled_a=None):
                 zero(elem_out)
                 rest = k_trip
-                if k_read_late:
+                if peeled_a is not None:
+                    # The A acquire that got this branch behind rtp is this tile's first, so
+                    # finish it here and the trip count still describes the whole tile.
+                    eb = in_b.acquire(1)
+                    rest = _minus_one(rtp_buff[1] if k_read_late else k_trip)
+                    matmul(peeled_a, eb, elem_out)
+                    in_a.release(1)
+                    in_b.release(1)
+                elif k_read_late:
                     # PEEL, for the same reason --mode-read-late peels: a top-of-tile rtp read
                     # samples the PREVIOUS dispatch's value. A stale K is worse than a stale
                     # epilogue mode -- the trip count decides how many A/B pairs this tile
@@ -818,8 +909,34 @@ def my_matmul(
                     in_a.release(1)
                     in_b.release(1)
 
-            if resadd is None:
+            if resadd is None and r2a_stage is None:
                 _gemm_path()
+            elif r2a_stage is not None:
+                # Peel ONE A acquire and branch behind it: rtp has a measured one-tile
+                # visibility lag, so a top-of-tile read runs the previous dispatch's body on
+                # each core's first tile. Only A is peeled -- this mode consumes no B, and its
+                # own stream programs no B fill to acquire.
+                ea = in_a.acquire(1)
+                if k_read_late:
+                    k_trip = rtp_buff[1]
+                with scf_if_(_is_gemm()) as if_op:
+                    _gemm_path(peeled_a=ea)
+                with scf_else_(if_op):
+                    # The row's A stream carries every column's share, because A_L2L1 is
+                    # broadcast across the columns of an array row; a core acquires all of them
+                    # and applies the r2a_per_core that are its own. Python-unrolled, so the
+                    # skip and the slab index are compile-time constants and cost no branch.
+                    for slot in range(n_aie_cols * r2a_per_core):
+                        elem_in_a = ea if slot == 0 else in_a.acquire(1)
+                        if slot // r2a_per_core == r2a_col:
+                            local = slot % r2a_per_core
+                            if local < r2a_j:
+                                r2a_stage(elem_in_a, elem_out, local)
+                            else:
+                                r2a_apply(
+                                    elem_in_a, elem_out, local - r2a_j, r2a_scale_bits
+                                )
+                        in_a.release(1)
             elif mode_read_late:
                 # ORDERING ARM. rtp is a side-channel with a MEASURED one-tile visibility lag:
                 # barrier.wait_for_value sits outside the tile loop, so it orders only a
@@ -1076,6 +1193,20 @@ def my_matmul(
                 # bf16-out only, checked at declaration; split_acc is that condition.
                 args += [lnaff_stage_kernel, lnaff_apply_kernel]
             body = core_fn_split_acc if split_acc else core_fn
+            if r2a_stage_kernel is not None:
+                args += [r2a_stage_kernel, r2a_apply_kernel]
+                # The COLUMN picks which share of the row's A stream this core applies. Bound in
+                # a closure because fn_args are core arguments and a Python int is not one. The
+                # two mode kernels are passed by NAME: `resadd` sits between them and the
+                # epilogue in the signature, and this mode never carries it.
+                def body(*fn_args, _col=col):
+                    return core_fn(
+                        *fn_args[:8],
+                        r2a_stage=fn_args[8],
+                        r2a_apply=fn_args[9],
+                        r2a_col=_col,
+                    )
+
             if lnaff_apply_x_kernel is not None:
                 args.append(lnaff_apply_x_kernel)
                 # The array row picks which share of the column's B stream this core applies.
@@ -1273,6 +1404,57 @@ def my_matmul(
             if rnd % lnaffcast_group_rounds == lnaffcast_group_rounds - 1 or rnd == rounds - 1:
                 tg.finish()
 
+    def resadd2a_fills(A, B, C, A_prods, B_prods, C_conses):
+        """The mode's own fill contract: n_aie_cols * 2 * n/k A tiles per array row, 1 C drain
+        per column, no B.
+
+        Both operands live in the A tensor as [rows, N] bf16 -- a at 0, b at rows*N -- so the
+        taps are plain row-major [m, k] block reads and the C drain is the row-major block the
+        GEMM already uses. Nothing here undoes a fifo shuffle: the core writes L1 C at the
+        address the drain reads it from, which the closed form in mm_mode_resadd2a.cc computes
+        from the tile dims.
+
+        Stream order is a core's whole share back to back -- its n/k `a` tiles, then its n/k
+        `b` tiles -- because the body stages all of `a` into the C tile before accumulating
+        onto it, and the fifo is the only thing that orders them.
+        """
+        op_stride = resadd2a_rows * N
+        for rnd in range(r2a_rounds):
+            row_base = rnd * n_aie_rows * m
+            # One TaskGroup per COLUMN's share, because a shim tile holds 16 active BDs and a
+            # round programs n_aie_cols * 2 * n/k = 64 A fills onto each. The C drains cannot
+            # ride these groups: a core releases its C tile only after the LAST column's share,
+            # so awaiting a drain before the sequence has issued the rest would deadlock.
+            for col in range(n_aie_cols):
+                tg = TaskGroup()
+                for row in range(n_aie_rows):
+                    for operand in range(2):
+                        for j in range(r2a_j):
+                            tap_a = TensorAccessPattern(
+                                (M * K,),
+                                operand * op_stride
+                                + (row_base + row * m) * N
+                                + col * n
+                                + j * k,
+                                [m, k],
+                                [N, 1],
+                            )
+                            A_taps.append(tap_a)
+                            A_prods[row].fill(A, tap=tap_a, group=tg)
+                tg.finish()
+
+            tg = TaskGroup()
+            for col in range(n_aie_cols):
+                tap_c = TensorAccessPattern(
+                    (M * N,),
+                    row_base * N + col * n,
+                    [n_aie_rows * m, n],
+                    [N, 1],
+                )
+                C_taps.append(tap_c)
+                C_conses[col].drain(C, tap=tap_c, wait=True, group=tg)
+            tg.finish()
+
     def sequence(A, B, C, A_prods, B_prods, C_conses):
         nonlocal c_index
         # bake the epilogue mode into this instruction stream's RTP (1=silu, 0=identity), then
@@ -1294,9 +1476,13 @@ def my_matmul(
             18
             if rtp_mode_lnaffcast
             else (
-                4
-                if rtp_mode_resadd
-                else (3 if do_glu else (2 if do_gelu else (1 if do_silu else 0)))
+                5
+                if rtp_mode_resadd2a
+                else (
+                    4
+                    if rtp_mode_resadd
+                    else (3 if do_glu else (2 if do_gelu else (1 if do_silu else 0)))
+                )
             )
         )
         for r in range(n_aie_rows):
@@ -1308,6 +1494,10 @@ def my_matmul(
 
         if rtp_mode_lnaffcast:
             lnaffcast_fills(A, B, C, A_prods, B_prods, C_conses)
+            return
+
+        if rtp_mode_resadd2a:
+            resadd2a_fills(A, B, C, A_prods, B_prods, C_conses)
             return
 
         tg = TaskGroup()
@@ -1630,6 +1820,36 @@ def main():
         "compute the same output rows -- 4 useful C tiles per round of 32. This route makes "
         "every core's output distinct, at the cost of a n_aie_rows-way skip on the B stream.",
     )
+    argparser.add_argument(
+        "--mode-resadd2a",
+        action="store_true",
+        help="put `out = a + scale*b` in the xclbin with BOTH operands on the A fifo. F32-OUT "
+        "ONLY: the C tile is the staging buffer, `a` widened into it and scale*b accumulated on "
+        "top. resadd has no weight to absorb the A broadcast the way lnaffcast's gb does, so "
+        "each core acquires every column's share and applies its own -- 2 * n/k tiles per C "
+        "tile per column.",
+    )
+    argparser.add_argument(
+        "--rtp-mode-resadd2a",
+        action="store_true",
+        help="bake rtp[0]=5 into THIS instruction stream, selecting the both-on-A resadd mode. "
+        "Needs --mode-resadd2a (which puts the body in the xclbin).",
+    )
+    argparser.add_argument(
+        "--resadd2a-rows",
+        type=int,
+        default=0,
+        help="output rows the mode's stream covers (0 = what the A tensor holds as two "
+        "N-wide operands). Insts-only, so several row counts share one xclbin.",
+    )
+    argparser.add_argument(
+        "--resadd2a-scale",
+        type=float,
+        default=1.0,
+        help="the scale in `a + scale*b` (1.0 = full residual, 0.5 = Macaron). Travels as its "
+        "f32 bit pattern in rtp[2], so it costs no input channel and one build serves both "
+        "encoder resadd bricks.",
+    )
     args = argparser.parse_args()
     maybe_module = my_matmul(
         args.dev,
@@ -1667,6 +1887,10 @@ def main():
         args.lnaffcast_group_rounds,
         args.lnaffcast_contig_taps,
         args.lnaffcast_1x,
+        args.mode_resadd2a,
+        args.rtp_mode_resadd2a,
+        args.resadd2a_rows,
+        args.resadd2a_scale,
     )
     if args.generate_taps:
         return maybe_module
