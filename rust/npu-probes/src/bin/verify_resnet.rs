@@ -193,4 +193,11 @@ fn main() {
     println!("ResNet-18 {label} logits rel vs ORT = {r:.3e}  (need <= {tol:.0e})");
     assert!(pass, "ResNet-18 gate FAILED: rel {r} > {tol}");
     println!("{} GATE PASS", if npu_mode { "NPU" } else { "LOWERING" });
+
+    // NPU_DISPATCH_LOG=1: dispatch/transition census. The conv path loads ONE xclbin and selects the
+    // Cout band by instruction stream, so `transitions` should stay at 0 here -- a nonzero count means
+    // a band fell back to its own xclbin.
+    if npu_mode && npu_xrt::dispatch_log::enabled() {
+        println!("\n{}", npu_xrt::dispatch_log::report(1.543));
+    }
 }

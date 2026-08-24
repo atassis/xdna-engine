@@ -1,5 +1,6 @@
-//! ResNet conv on the NPU: per-channel-band M-stationary GEMM dispatch. One xclbin per Cout band
-//! (512x768xN). `gemm_tile` runs ONE [512,768]x[768,N] dispatch; `conv` lowers a full conv layer via
+//! ResNet conv on the NPU: per-channel-band M-stationary GEMM dispatch. ONE xclbin serves every Cout
+//! band; the band is selected by swapping the instruction stream, which carries the BD size/stride
+//! fields. `gemm_tile` runs ONE [512,768]x[768,N] dispatch; `conv` lowers a full conv layer via
 //! im2col2d + M-tile (512 rows) + host K-split (768 chunks) + accumulate + bias.
 //! See internal notes (spike GO). Dispatch mirrors bin/mstat_probe.rs.
 use std::cell::RefCell;
@@ -20,78 +21,115 @@ fn f32_to_bf16_bits(x: f32) -> u16 {
     ((b.wrapping_add(r)) >> 16) as u16
 }
 
-struct Band {
+/// Bands this path can dispatch. The largest is the ANCHOR: its xclbin is the one actually loaded and
+/// its shapes size the data BOs, so every smaller band reuses both. Measured safe -- one hw_context
+/// runs both bands' streams clean in either order, and an N mismatch leaves A=[M,K] fixed while
+/// B=[K,N] and C=[M,N] scale, which is the output-scales case that reuse permits.
+const ANCHOR: usize = 512;
+
+struct Ctx {
     kern: Rc<Kernel>,
-    instr: Bo,
-    n_instr: usize,
+    streams: RefCell<HashMap<usize, (Rc<Bo>, usize)>>, // band -> (instruction BO, word count)
+    // Sized for ANCHOR and reused by every band. Reallocating these per dispatch cost two sessions to
+    // a fake intermittency, so they are allocated exactly once.
+    bo_a: Bo,
+    bo_b: Bo,
+    bo_c: Bo,
+    bo_tmp: Bo,
+    bo_tr: Bo,
 }
 
 pub struct ConvNpu {
     dev: Rc<Device>,
     wa: PathBuf, // dir holding final_mstat_*.xclbin + insts_*.txt
-    bands: RefCell<HashMap<usize, Rc<Band>>>,
+    ctx: RefCell<Option<Rc<Ctx>>>,
+}
+
+/// `dir/final_{stem}.xclbin` + `dir/insts_{stem}.txt`, with the opt-in manifest check
+/// (engine-op-manifest-and-dynamic-xclbin): NPU_KERNEL_MANIFEST_VERIFY=1 re-hashes both against
+/// dir/kernel_manifest.json first, so a stale artifact fails loud instead of loading silently.
+fn artifacts(wa: &std::path::Path, n: usize) -> crate::kernel_registry::KernelArtifacts {
+    let stem = format!("mstat_512x768x{n}_16x32x32_8c");
+    if std::env::var("NPU_KERNEL_MANIFEST_VERIFY").is_ok() {
+        crate::kernel_registry::resolve_checked(wa, &stem)
+            .unwrap_or_else(|e| panic!("kernel manifest check failed for stem={stem}: {e}"))
+    } else {
+        crate::kernel_registry::resolve(wa, &stem)
+    }
 }
 
 impl ConvNpu {
     pub fn new(dev: Rc<Device>, wa: PathBuf) -> Self {
-        ConvNpu { dev, wa, bands: RefCell::new(HashMap::new()) }
+        ConvNpu { dev, wa, ctx: RefCell::new(None) }
     }
 
-    fn band(&self, n: usize) -> Rc<Band> {
-        if let Some(b) = self.bands.borrow().get(&n) {
-            return b.clone();
+    /// The single loaded context, built on first use from the ANCHOR band.
+    fn ctx(&self) -> Rc<Ctx> {
+        if let Some(c) = self.ctx.borrow().as_ref() {
+            return c.clone();
         }
-        let stem = format!("mstat_512x768x{n}_16x32x32_8c");
-        // Opt-in manifest verification (engine-op-manifest-and-dynamic-xclbin): NPU_KERNEL_MANIFEST_VERIFY=1
-        // re-hashes {xclbin,insts} against dir/kernel_manifest.json (see kernel_registry::resolve_checked)
-        // before loading, so a wrong/stale artifact at this path fails loud here instead of loading
-        // silently. Default OFF -- existing behavior (`resolve`, no check) is unchanged.
-        let crate::kernel_registry::KernelArtifacts { xclbin, insts } =
-            if std::env::var("NPU_KERNEL_MANIFEST_VERIFY").is_ok() {
-                crate::kernel_registry::resolve_checked(&self.wa, &stem)
-                    .unwrap_or_else(|e| panic!("kernel manifest check failed for stem={stem}: {e}"))
-            } else {
-                crate::kernel_registry::resolve(&self.wa, &stem)
-            };
+        let xclbin = artifacts(&self.wa, ANCHOR).xclbin;
         let kern = self
             .dev
             .load_kernel(xclbin.to_str().unwrap(), None)
-            .unwrap_or_else(|e| panic!("load band xclbin {xclbin:?}: {e}"));
+            .unwrap_or_else(|e| panic!("load anchor xclbin {xclbin:?}: {e}"));
+        let alloc = |nbytes: usize, arg: i32| {
+            self.dev
+                .alloc_bo(&kern, nbytes, FLAG_HOST_ONLY, kern.group_id(arg).unwrap())
+                .unwrap()
+        };
+        let c = Rc::new(Ctx {
+            streams: RefCell::new(HashMap::new()),
+            bo_a: alloc(MT * KT * 2, 3),
+            bo_b: alloc(KT * ANCHOR * 2, 4),
+            bo_c: alloc(MT * ANCHOR * 4, 5),
+            bo_tmp: alloc(1, 6),
+            bo_tr: alloc(4, 7),
+            kern,
+        });
+        *self.ctx.borrow_mut() = Some(c.clone());
+        c
+    }
+
+    /// This band's instruction stream, uploaded once. Only the stream differs per band -- the loaded
+    /// xclbin does not change.
+    fn stream(&self, ctx: &Ctx, n: usize) -> (Rc<Bo>, usize) {
+        if let Some((bo, count)) = ctx.streams.borrow().get(&n) {
+            return (bo.clone(), *count);
+        }
+        let insts = artifacts(&self.wa, n).insts;
         let bytes = std::fs::read(&insts).unwrap_or_else(|e| panic!("read insts {insts:?}: {e}"));
-        let n_instr = bytes.len() / 4;
-        let instr = self
-            .dev
-            .alloc_bo(&kern, bytes.len(), FLAG_CACHEABLE, kern.group_id(1).unwrap())
-            .unwrap();
-        instr.write_bytes(&bytes).unwrap();
-        instr.sync_to_device().unwrap();
-        let b = Rc::new(Band { kern, instr, n_instr });
-        self.bands.borrow_mut().insert(n, b.clone());
-        b
+        let count = bytes.len() / 4;
+        let bo = Rc::new(
+            self.dev
+                .alloc_bo(&ctx.kern, bytes.len(), FLAG_CACHEABLE, ctx.kern.group_id(1).unwrap())
+                .unwrap(),
+        );
+        bo.write_bytes(&bytes).unwrap();
+        bo.sync_to_device().unwrap();
+        ctx.streams.borrow_mut().insert(n, (bo.clone(), count));
+        (bo, count)
     }
 
     /// One M-stationary dispatch: a[MT,KT] @ b[KT,N] -> [MT,N] f32. a,b row-major f32 (cast to bf16).
     fn gemm_tile(&self, a: &Array2<f32>, bmat: &Array2<f32>, n: usize) -> Array2<f32> {
         assert_eq!(a.dim(), (MT, KT));
         assert_eq!(bmat.dim(), (KT, n));
-        let band = self.band(n);
-        let k = &band.kern;
+        assert!(n <= ANCHOR, "band N={n} exceeds anchor {ANCHOR}: rebuild with a larger anchor");
+        let ctx = self.ctx();
+        let (instr, n_instr) = self.stream(&ctx, n);
         let a_bits: Vec<u8> = a.iter().flat_map(|&v| f32_to_bf16_bits(v).to_le_bytes()).collect();
         let b_bits: Vec<u8> = bmat.iter().flat_map(|&v| f32_to_bf16_bits(v).to_le_bytes()).collect();
-        let bo_a = self.dev.alloc_bo(k, MT * KT * 2, FLAG_HOST_ONLY, k.group_id(3).unwrap()).unwrap();
-        let bo_b = self.dev.alloc_bo(k, KT * n * 2, FLAG_HOST_ONLY, k.group_id(4).unwrap()).unwrap();
-        let bo_c = self.dev.alloc_bo(k, MT * n * 4, FLAG_HOST_ONLY, k.group_id(5).unwrap()).unwrap();
-        let bo_tmp = self.dev.alloc_bo(k, 1, FLAG_HOST_ONLY, k.group_id(6).unwrap()).unwrap();
-        let bo_tr = self.dev.alloc_bo(k, 4, FLAG_HOST_ONLY, k.group_id(7).unwrap()).unwrap();
-        bo_a.write_bytes(&a_bits).unwrap();
-        bo_a.sync_to_device().unwrap();
-        bo_b.write_bytes(&b_bits).unwrap();
-        bo_b.sync_to_device().unwrap();
-        k.run_matmul8(3, &band.instr, band.n_instr, &bo_a, &bo_b, &bo_c, &bo_tmp, &bo_tr)
+        ctx.bo_a.write_bytes(&a_bits).unwrap();
+        ctx.bo_a.sync_to_device().unwrap();
+        ctx.bo_b.write_bytes(&b_bits).unwrap();
+        ctx.bo_b.sync_to_device().unwrap();
+        ctx.kern
+            .run_matmul8(3, &instr, n_instr, &ctx.bo_a, &ctx.bo_b, &ctx.bo_c, &ctx.bo_tmp, &ctx.bo_tr)
             .expect("dispatch");
-        bo_c.sync_from_device().unwrap();
+        ctx.bo_c.sync_from_device().unwrap();
         let mut cb = vec![0u8; MT * n * 4];
-        bo_c.read_bytes(&mut cb).unwrap();
+        ctx.bo_c.read_bytes(&mut cb).unwrap();
         let c: Vec<f32> = cb
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
