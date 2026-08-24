@@ -29,7 +29,17 @@ WHEEL_BIN="$REPO/.venv-iron/lib/python3.14/site-packages/mlir_aie/bin"
 
 # Fill the instance bin with the vendored prebuilt tools it does NOT build itself (bootgen PDI packager,
 # aie-translate, etc.). aiecc + aie-opt are built from the fork source (version-sensitive, place-tiles);
-# these others are version-agnostic vendored binaries, taken from the wheel. Idempotent.
+# the others come from the wheel. Idempotent.
+#
+# "version-agnostic" is what this comment used to claim about the vendored set, and it is FALSE for
+# aie-translate: it CONSUMES aie-opt's output, so it cannot be version-independent by construction.
+# Measured 2026-08-24 -- the wheel is mlir_aie 0.0.1.2026033104 (31 Mar) against a fork pin of
+# 17 Aug, and the two disagree about aiex.npu.address_patch (aie-opt prints it with an operand, the
+# vendored aie-translate answers "requires zero operands"), which fails 51 Targets/ lit tests.
+# Scope: aiecc translates IN-PROCESS against the fork-built library and does NOT exec this binary, so
+# no xclbin is affected -- the skew reaches `check-aie` only. bootgen / aie-lsp-server / aie-reset /
+# aie-visualize consume no aie-opt output and are genuinely version-independent.
+# Fix when convenient: build aie-translate from the fork and drop it from the loop below.
 _link_vendored_tools() {
   local t
   for t in "$WHEEL_BIN"/*; do
