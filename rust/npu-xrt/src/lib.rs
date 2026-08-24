@@ -576,9 +576,12 @@ pub type Result<T> = std::result::Result<T, String>;
 
 /// A single shared XDNA2 device. NPU is single-tenant; create exactly one.
 ///
-/// Kernels (each owning a hw_context) are cached by xclbin path: the NPU's 8 columns are a
-/// limited hw_context budget, so loading the same xclbin twice returns the SAME shared kernel
-/// (many engines with different weight BOs share one context). Mirrors `npu_asr/device.py`.
+/// Kernels (each owning a hw_context) are cached by xclbin path: loading the same xclbin twice
+/// returns the SAME shared kernel (many engines with different weight BOs share one context).
+/// What that saves is a hw_context SLOT, not columns. npu4 sets `AIE2_TEMPORAL_ONLY`
+/// (`npu4_regs.c`), so contexts do NOT partition the array -- `aie2_ctx.c` ignores
+/// `hwctx->col_list` and requests all `total_col` columns for every context, which then
+/// time-slice. The budget is `.hwctx_limit` = 16 on npu4 (npu1: 6). Mirrors `npu_asr/device.py`.
 /// The identity a hw_context is cached under. By default the xclbin PATH, which is what XRT was
 /// handed -- but two byte-identical copies of one xclbin at two paths then get two contexts, and a
 /// transition between them costs a full program switch while every report calls them one xclbin.
@@ -705,7 +708,9 @@ impl Device {
 
     /// Load an xclbin and resolve its kernel. `name=None` uses the first kernel in the xclbin.
     /// Cached by (path, name): repeated loads of the same xclbin return the SAME shared kernel
-    /// (one hw_context), so many engines coexist within the 8-column budget. No QoS declared (the
+    /// (one hw_context), so engines share a context instead of each spending one of the 16 slots
+    /// and paying a context switch between them -- they do not divide the array up.
+    /// No QoS declared (the
     /// unconfigured context, `max_dpm_level`); use [`load_kernel_qos`](Self::load_kernel_qos) for a
     /// background/best-effort context.
     pub fn load_kernel(&self, xclbin_path: &str, name: Option<&str>) -> Result<Rc<Kernel>> {
