@@ -131,8 +131,12 @@ lnaffcast_contig_taps?=
 lnaffcast_1x?=0
 
 # --mode-resadd2a: `out = a + scale*b` with BOTH operands on the A fifo, f32-out only.
-# rtp_mode_resadd2a=1 bakes rtp[0]=5 into THIS stream to select it. rows and scale are
-# insts-only, so every (rows, scale) shares one xclbin.
+# rtp_mode_resadd2a=1 bakes rtp[0]=5 into THIS stream to select it. ROWS is insts-only, so every
+# rows arm shares one xclbin. SCALE IS NOT, despite what this comment used to say and what
+# mm_mode_resadd2a.cc's `scale_bits` header implies: the generator passes it as a Python constant,
+# so it lands in the CORE ELF as an immediate (`movxm r1, #0x3f800000` at 1.0, `#0x3f000000` at
+# 0.5) and each scale costs its own program. Program count is this task's cost unit, so moving
+# scale onto the rtp side-channel it was designed for is real work, not a tidy-up.
 mode_resadd2a?=0
 rtp_mode_resadd2a?=0
 # Put scale*b on the bf16 datapath. The f32 aie::mul is MEASURED to hang the core; b is already
@@ -159,6 +163,9 @@ resadd2a_stage_runs?=0
 resadd2a_apply_runs?=0
 # One pass per (a, b) pair instead of stage-then-apply. Writes the C tile once per hold.
 resadd2a_fused?=0
+# Runs the FUSED body walks (default = all of them). The stage/apply run knobs above do not reach
+# the one-pass body, so this is how its work per C-tile hold is varied.
+resadd2a_fused_runs?=0
 resadd2a_scale?=1.0
 # 1 = compile the mode's two entry points EMPTY (the stream-contract discriminator).
 resadd2a_noop?=0
@@ -294,7 +301,7 @@ apanel_tag=$(if $(filter 0,${a_panel_width}),,apanel${a_panel_width})
 # The lnaffcast BODY is a different core ELF; the rtp arm is a different instruction stream on
 # that same xclbin. rows/fanout change only the stream, so they tag the stream and not the body.
 lnaff_tag=$(if $(filter 0,${mode_lnaffcast}),,lnaff${mode_lnaffcast})$(if $(filter 0,${lnaffcast_scatter_c}),,scat$(patsubst 1,,${lnaffcast_scatter_c}))$(if $(filter 1,${lnaffcast_1x}),1x,)
-r2a_tag=$(if $(filter 0,${mode_resadd2a}),,r2a)$(if $(filter 0,${resadd2a_noop}),,noop$(patsubst 1,,${resadd2a_noop}))$(if $(filter 0,${resadd2a_bf16mul}),,bf16m)$(if $(filter 1,${resadd2a_vfile}),,novf)$(if $(filter 0,${resadd2a_mac}),,mac)$(if $(filter 0,${resadd2a_no_c_read}),,nord)$(if $(filter 0,${resadd2a_stage_runs}),,sr${resadd2a_stage_runs})$(if $(filter 0,${resadd2a_apply_runs}),,ar${resadd2a_apply_runs})$(if $(filter 0,${resadd2a_fused}),,fus)
+r2a_tag=$(if $(filter 0,${mode_resadd2a}),,r2a)$(if $(filter 0,${resadd2a_noop}),,noop$(patsubst 1,,${resadd2a_noop}))$(if $(filter 0,${resadd2a_bf16mul}),,bf16m)$(if $(filter 1,${resadd2a_vfile}),,novf)$(if $(filter 0,${resadd2a_mac}),,mac)$(if $(filter 0,${resadd2a_no_c_read}),,nord)$(if $(filter 0,${resadd2a_stage_runs}),,sr${resadd2a_stage_runs})$(if $(filter 0,${resadd2a_apply_runs}),,ar${resadd2a_apply_runs})$(if $(filter 0,${resadd2a_fused}),,fus)$(if $(filter 0,${resadd2a_fused_runs}),,fr${resadd2a_fused_runs})
 rtpr2a_tag=$(if $(filter 1,${rtp_mode_resadd2a}),rtp5,)$(if $(filter 1,${resadd2a_rev_rows}),revr,)$(if $(filter 0,${resadd2a_rows}),,r${resadd2a_rows})$(if $(filter 1.0,${resadd2a_scale}),,s$(subst .,,${resadd2a_scale}))
 rtplnaff_tag=$(if $(filter 1,${rtp_mode_lnaffcast}),rtp18,)$(if $(filter 0,${lnaffcast_rows}),,r${lnaffcast_rows})$(if $(filter 1,${lnaffcast_c_fanout}),fan,)$(if $(filter 1,${lnaffcast_group_rounds}),,g${lnaffcast_group_rounds})$(if ${lnaffcast_contig_taps},ctg${lnaffcast_contig_taps},)
 target_suffix=${M}x${K}x${N}_${m}x${k}x${n}_${n_aie_cols}c_${mode_tag}${out_tag}${panel_tag}${dep_tag}${abdep_tag}${l3dep_tag}${wrk_tag}${mt_tag}${re_tag}${nat_tag}${krtp_tag}${apanel_tag}${resadd_tag}${rtpresadd_tag}${raonly_tag}${bisect_tag}${mrl_tag}${krl_tag}${lnaff_tag}${rtplnaff_tag}${r2a_tag}${rtpr2a_tag}${opt_tag}
@@ -363,7 +370,7 @@ build/mm_silu_epilogue_${m}x${k}x${n}.o: ${kernels_dir}/mm_silu_epilogue.cc buil
 # byte-identical core ELFs. It only surfaced because the arms were diffed before being run.
 # See a-conditional-define-that-drops-its-value-measures-one-arm-as-three.
 LNAFF_DEFINES=-DLNA_COLS=${mode_lnaffcast}
-R2A_DEFINES=$(if $(filter 0,${resadd2a_noop}),, -DRESADD2A_NOOP=${resadd2a_noop})$(if $(filter 0,${resadd2a_bf16mul}),, -DRESADD2A_BF16_MUL=1)$(if $(filter 1,${resadd2a_vfile}),, -DRESADD2A_VFILE_DETOUR=0)$(if $(filter 0,${resadd2a_mac}),, -DRESADD2A_MAC=1)$(if $(filter 0,${resadd2a_no_c_read}),, -DRESADD2A_NO_C_READ=1)$(if $(filter 0,${resadd2a_stage_runs}),, -DRESADD2A_STAGE_RUNS=${resadd2a_stage_runs})$(if $(filter 0,${resadd2a_apply_runs}),, -DRESADD2A_APPLY_RUNS=${resadd2a_apply_runs})
+R2A_DEFINES=$(if $(filter 0,${resadd2a_noop}),, -DRESADD2A_NOOP=${resadd2a_noop})$(if $(filter 0,${resadd2a_bf16mul}),, -DRESADD2A_BF16_MUL=1)$(if $(filter 1,${resadd2a_vfile}),, -DRESADD2A_VFILE_DETOUR=0)$(if $(filter 0,${resadd2a_mac}),, -DRESADD2A_MAC=1)$(if $(filter 0,${resadd2a_no_c_read}),, -DRESADD2A_NO_C_READ=1)$(if $(filter 0,${resadd2a_stage_runs}),, -DRESADD2A_STAGE_RUNS=${resadd2a_stage_runs})$(if $(filter 0,${resadd2a_apply_runs}),, -DRESADD2A_APPLY_RUNS=${resadd2a_apply_runs})$(if $(filter 0,${resadd2a_fused_runs}),, -DRESADD2A_FUSED_RUNS=${resadd2a_fused_runs})
 
 build/.lnaffcast_defines.stamp: FORCE
 	@mkdir -p ${@D}

@@ -46,6 +46,8 @@
 // whichever value this takes, so an arm that completes where another times out separates the
 // stream contract from the body, and the two halves of the body from each other.
 //   0 = both real   1 = both empty   2 = stage only   3 = apply only
+// 1 empties the FUSED entry point too, which is that same discriminator for the one-pass shape --
+// the acquire(2)/release(2) stream contract runs unchanged with nothing in the body.
 //   4 = stage writes a CONSTANT through the same address expression, apply empty. Separates
 //       "the stores do not land" from "the stores land carrying the wrong value".
 // Apply differs from stage in TWO ways -- it multiplies, and it reads the C tile back -- so 3
@@ -99,6 +101,13 @@
 #ifndef RESADD2A_APPLY_RUNS
 #define RESADD2A_APPLY_RUNS kRuns
 #endif
+// Runs the FUSED body walks, out of kRuns. The one-pass body has no stage/apply split, so
+// neither knob above reaches it; this is how work per C-tile hold is varied now the write is
+// 1.000x. Output is meaningless below kRuns, so a short arm is gated on completion.
+#ifndef RESADD2A_FUSED_RUNS
+#define RESADD2A_FUSED_RUNS kRuns
+#endif
+#define RESADD2A_HAS_FUSED (RESADD2A_NOOP != 1)
 #define RESADD2A_HAS_STAGE (RESADD2A_NOOP == 0 || RESADD2A_NOOP == 2 || RESADD2A_NOOP == 4)
 #define RESADD2A_HAS_APPLY \
   (RESADD2A_NOOP == 0 || RESADD2A_NOOP == 3 || RESADD2A_NOOP == 5 || RESADD2A_NOOP == 6)
@@ -111,8 +120,12 @@
 // already bf16 and scale is a build constant, so that chain is reconstructing a product neither
 // operand needs widened.
 //
-// NOT an approximation for the scales that ship. Both factors are bf16, so their product carries
-// at most 16 mantissa bits and is EXACT in f32 -- the accumulate is accfloat, so nothing rounds.
+// The PRODUCT is exact: both factors are bf16, so it carries at most 16 mantissa bits and fits f32.
+// The ACCUMULATE is not always -- this line used to claim "nothing rounds" and that is MEASURED
+// false. At scale 0.5, 1 slot of 262144 lands 1 ULP low (a = 0.0017929, b = -1056: the exact sum is
+// 29.375 ULP below 528 and the core returns 30, i.e. the small addend loses bits on alignment).
+// Scale 1.0 is exact over 18 dispatches x 3 magnitude bands. So this is a ULP-level note, not an
+// approximation, but do not lean on it being bit-exact.
 // The one requirement is that `scale` itself be bf16-representable; the encoder's two resadds use
 // 1.0 and 0.5, which are. A scale that is not is silently rounded, so it is checked on the host.
 #define RESADD2A_APPLY_READS_C (!RESADD2A_NO_C_READ && RESADD2A_NOOP != 5)
@@ -146,12 +159,13 @@ extern "C" {
 void mm_resadd2a_fused_f32(const bfloat16 *__restrict a, const bfloat16 *__restrict b,
                            float *__restrict c, int32_t j, int32_t scale_bits) {
   event0();
+#if RESADD2A_HAS_FUSED
   float scale;
   __builtin_memcpy(&scale, &scale_bits, sizeof(scale));
   const ::aie::vector<bfloat16, kLanes> svb =
       ::aie::broadcast<bfloat16, kLanes>((bfloat16)scale);
   float *__restrict dst = c + j * kRun;
-  for (int i = 0; i < kRuns; ++i)
+  for (int i = 0; i < RESADD2A_FUSED_RUNS; ++i)
     for (int q = 0; q < kRun; q += kLanes) {
       // a widened into the accumulator, then scale*b mac'd on top -- one fused product, and the
       // store is the only write this slot ever takes.
@@ -160,6 +174,7 @@ void mm_resadd2a_fused_f32(const bfloat16 *__restrict a, const bfloat16 *__restr
       acc = ::aie::mac(acc, ::aie::load_v<kLanes>(b + i * kRun + q), svb);
       ::aie::store_v(dst + i * kStride + q, vfile(acc.to_vector<float>()));
     }
+#endif
   event1();
 }
 
