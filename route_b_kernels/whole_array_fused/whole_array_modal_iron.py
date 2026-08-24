@@ -361,6 +361,7 @@ def my_matmul(
     resadd2a_scale=1.0,
     resadd2a_rev_rows=False,
     resadd2a_fused=False,
+    resadd2a_scale_rtp=False,
 ):
     n_aie_rows = 4
     n_aie_cores = n_aie_rows * n_aie_cols
@@ -667,6 +668,11 @@ def my_matmul(
     # is free because ONE index map applies to both (two-activation-mode-broadcast-acquire-cost).
     r2a_j = r2a_per_core = r2a_rounds = 0
     r2a_stage_kernel = r2a_apply_kernel = r2a_fused_kernel = None
+    if resadd2a_scale_rtp and not mode_resadd2a:
+        raise ValueError(
+            "--resadd2a-scale-rtp moves the scale onto rtp[2], but --mode-resadd2a is what puts "
+            "a body there to read it."
+        )
     if rtp_mode_resadd2a and not mode_resadd2a:
         raise ValueError(
             "--rtp-mode-resadd2a bakes rtp[0]=5, but --mode-resadd2a is what puts the body in "
@@ -733,10 +739,21 @@ def my_matmul(
             else None
         )
         # An AIE2 tile has no input channel left for a scale operand, so it travels as its f32
-        # bit pattern in an i32 the kernel memcpys back. One build serves every scale.
+        # bit pattern in an i32 the kernel memcpys back. Under --resadd2a-scale-rtp that i32 is
+        # rtp[2], written by sequence(), which makes scale insts-only -- one xclbin for every
+        # scale. Otherwise it is a Python constant and lands in the core ELF as an immediate,
+        # so each scale costs its own program.
+        # The kernel multiplies on the bf16 datapath, so a scale outside bf16 is silently
+        # rounded and the host reference would then disagree with the device for a reason no
+        # output shows. Reject it here instead.
         r2a_scale_bits = int(
             np.frombuffer(np.float32(resadd2a_scale).tobytes(), dtype=np.int32)[0]
         )
+        if r2a_scale_bits & 0xFFFF:
+            raise ValueError(
+                f"--resadd2a-scale={resadd2a_scale} is not bf16-representable "
+                f"(f32 bits 0x{r2a_scale_bits & 0xFFFFFFFF:08x} carry a mantissa tail)."
+            )
 
     # Tile declarations as tile[row][col]
     tiles = [[(col, row) for col in range(0, n_aie_cols)] for row in range(0, 6)]
@@ -940,6 +957,11 @@ def my_matmul(
                     # broadcast across the columns of an array row; a core acquires all of them
                     # and applies the r2a_per_core that are its own. Python-unrolled, so the
                     # skip and the slab index are compile-time constants and cost no branch.
+                    #
+                    # rtp has the same one-tile visibility lag here as rtp[0] does, so the scale
+                    # is read inside this branch -- downstream of the peeled acquire this
+                    # dispatch's own data had to cross.
+                    scale_arg = rtp_buff[2] if resadd2a_scale_rtp else r2a_scale_bits
                     if r2a_fused is not None:
                         # Paired stream order: this core's share arrives as (a[j], b[j]) pairs, so
                         # both are live at once and one call writes the slot.
@@ -957,7 +979,7 @@ def my_matmul(
                             if slot // r2a_per_core == r2a_col:
                                 r2a_fused(
                                     pair[0], pair[1], elem_out,
-                                    (slot % r2a_per_core) // 2, r2a_scale_bits,
+                                    (slot % r2a_per_core) // 2, scale_arg,
                                 )
                             in_a.release(2)
                     else:
@@ -969,7 +991,7 @@ def my_matmul(
                                     r2a_stage(elem_in_a, elem_out, local)
                                 else:
                                     r2a_apply(
-                                        elem_in_a, elem_out, local - r2a_j, r2a_scale_bits
+                                        elem_in_a, elem_out, local - r2a_j, scale_arg
                                     )
                             in_a.release(1)
             elif mode_read_late:
@@ -1540,6 +1562,10 @@ def my_matmul(
                 rtp_bufs[r][c][0] = mode_val
                 if k_loop_rtp:
                     rtp_bufs[r][c][1] = K // k  # k-loop-bound-as-rtp PoC: K-tile trip count
+                if resadd2a_scale_rtp:
+                    # rtp[2]: the f32 bit pattern of `scale` in `a + scale*b`. Written here, so
+                    # it varies per instruction stream and not per program.
+                    rtp_bufs[r][c][2] = r2a_scale_bits
         rtp_barrier.set(1)
 
         if rtp_mode_lnaffcast:
@@ -1910,9 +1936,15 @@ def main():
         "--resadd2a-scale",
         type=float,
         default=1.0,
-        help="the scale in `a + scale*b` (1.0 = full residual, 0.5 = Macaron). Travels as its "
-        "f32 bit pattern in rtp[2], so it costs no input channel and one build serves both "
-        "encoder resadd bricks.",
+        help="the scale in `a + scale*b` (1.0 = full residual, 0.5 = Macaron). Baked into the "
+        "core ELF as an immediate unless --resadd2a-scale-rtp moves it onto rtp[2].",
+    )
+    argparser.add_argument(
+        "--resadd2a-scale-rtp",
+        action="store_true",
+        help="carry the scale as its f32 bit pattern in rtp[2] instead of baking it into the "
+        "core ELF. rtp is written by sequence(), so scale becomes insts-only and the encoder's "
+        "1.0 and 0.5 resadds share ONE xclbin -- program count is what a mode costs.",
     )
     args = argparser.parse_args()
     maybe_module = my_matmul(
@@ -1957,6 +1989,7 @@ def main():
         args.resadd2a_scale,
         args.resadd2a_rev_rows,
         args.resadd2a_fused,
+        args.resadd2a_scale_rtp,
     )
     if args.generate_taps:
         return maybe_module

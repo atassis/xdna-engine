@@ -198,9 +198,10 @@ void mm_resadd2a_stage_f32(const bfloat16 *__restrict a, float *__restrict c,
   event1();
 }
 
-// Accumulate scale*b onto the staged tile. `scale_bits` is the f32 bit pattern:
-// an AIE2 tile has no input channel left for a scale operand, but rtp is a
-// side-channel and costs none, so one build serves every scale.
+// Accumulate scale*b onto the staged tile. `scale_bits` is the f32 bit pattern,
+// because an AIE2 tile has no input channel left for a scale operand. Whether it
+// arrives as an ELF immediate or an rtp[2] read is the generator's choice
+// (--resadd2a-scale-rtp); this side only sees an i32.
 void mm_resadd2a_apply_f32(const bfloat16 *__restrict b, float *__restrict c,
                            int32_t j, int32_t scale_bits) {
   event0();
