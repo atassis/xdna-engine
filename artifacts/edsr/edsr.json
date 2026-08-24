@@ -1,7 +1,7 @@
 {
   "name": "edsr",
   "scale": 3,
-  "arena": "target/test-arenas/edsr.safetensors",
+  "checkpoint": "target/test-checkpoints/edsr.safetensors",
   "input": "rgb",
   "ops": [
     {

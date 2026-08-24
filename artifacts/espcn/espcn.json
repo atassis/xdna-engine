@@ -1,7 +1,7 @@
 {
   "name": "espcn",
   "scale": 3,
-  "arena": "target/test-arenas/espcn.safetensors",
+  "checkpoint": "target/test-checkpoints/espcn.safetensors",
   "ops": [
     { "op": "conv2d", "weights": "conv1", "k": 5, "pad": 2, "relu": true,  "cin": 1,  "cout": 64 },
     { "op": "conv2d", "weights": "conv2", "k": 3, "pad": 1, "relu": true,  "cin": 64, "cout": 64 },

@@ -2,9 +2,9 @@
 //! `SrEngine` driven ONLY through `npu_engine::capability::Servable` (never `upscale_rgb8` directly)
 //! must produce byte-identical output to the direct call, on the real CPU frontier -- no NPU touched
 //! (`use_npu=false`), so this runs on any lane, device or not. Checkpoint prereq: bake the schedule's
-//! checkpoint first (`target/test-arenas/espcn.safetensors`, matching `espcn.json`'s `arena` field --
-//! see the checkpoint-location note in the task's return; NOT `target/test-checkpoints/`, which is a
-//! different, unrelated baked copy the OTHER npu-sr tests use for their own SKIP heuristic).
+//! checkpoint first (`target/test-checkpoints/espcn.safetensors`, matching `espcn.json`'s `checkpoint`
+//! field). It is the SAME baked copy the other npu-sr tests guard on -- `target/test-arenas/` was the
+//! pre-rename path and nothing produces it, which is what made this probe and edsr_gate disagree.
 use npu_engine::capability::{Request, Response, Servable};
 use npu_sr::SrEngine;
 
@@ -16,10 +16,10 @@ fn sr_engine_through_servable_matches_the_direct_call() {
         .parent()
         .unwrap()
         .to_path_buf();
-    if !root.join("target/test-arenas/espcn.safetensors").exists() {
-        eprintln!("SKIP: checkpoint missing at target/test-arenas/espcn.safetensors -- bake via \
+    if !root.join("target/test-checkpoints/espcn.safetensors").exists() {
+        eprintln!("SKIP: checkpoint missing at target/test-checkpoints/espcn.safetensors -- bake via \
                    `npu-weights bake --source path:artifacts/espcn/espcn_x3_dyn.onnx --arch espcn \
-                   --checkpoint target/test-arenas/espcn.safetensors` from the repo root");
+                   --checkpoint target/test-checkpoints/espcn.safetensors` from the repo root");
         return;
     }
     std::env::set_current_dir(&root).unwrap();
