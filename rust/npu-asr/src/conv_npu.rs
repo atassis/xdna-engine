@@ -26,6 +26,23 @@ fn f32_to_bf16_bits(x: f32) -> u16 {
 /// runs both bands' streams clean in either order, and an N mismatch leaves A=[M,K] fixed while
 /// B=[K,N] and C=[M,N] scale, which is the output-scales case that reuse permits.
 const ANCHOR: usize = 512;
+const BANDS: [usize; 4] = [64, 128, 256, 512];
+
+/// Smallest built band that holds `n`, or None if it exceeds the widest.
+fn band_of(n: usize) -> Option<usize> {
+    BANDS.into_iter().find(|&b| n <= b)
+}
+
+/// `NPU_CONV_TRANSPOSE=1`: dispatch spatially-small layers with the operands swapped.
+///
+/// MT is kernel-fixed at 512 (m * n_aie_rows * n_aie_cols) with no sub-512 granularity, while N is a
+/// build parameter with bands down to 64. A layer whose spatial count is much smaller than 512 pays
+/// the whole M-pad: ResNet-18's 7x7 stage computes 49 rows inside a 512-row tile. Swapping puts that
+/// small count on N, where a band fits it. The dispatch COUNT is unchanged -- ceil(M/512) *
+/// ceil(K/768) either way -- so the win is entirely in per-dispatch work.
+fn transpose_enabled() -> bool {
+    std::env::var("NPU_CONV_TRANSPOSE").map(|v| v != "0").unwrap_or(false)
+}
 
 struct Ctx {
     kern: Rc<Kernel>,
@@ -180,6 +197,39 @@ impl ConvNpu {
         let mut out = Array2::<f32>::zeros((m_real, cout));
         let mut a = Array2::<f32>::zeros((MT, KT));
         let mut bmat = Array2::<f32>::zeros((KT, cout));
+        // Transposed orientation, opt-in and only when it applies: the weights become A (cout rows,
+        // which fill the 512-row tile) and the im2col becomes B (m_real columns, which fit a band).
+        // Requires cout <= MT to be one tile and m_real to fit the widest band.
+        if transpose_enabled() && cout <= MT {
+            if let Some(nb) = band_of(m_real) {
+                let mut at = Array2::<f32>::zeros((MT, KT));
+                let mut bt = Array2::<f32>::zeros((KT, nb));
+                for kc in 0..k_chunks {
+                    let c0 = kc * KT;
+                    let kk = (k_real - c0).min(KT);
+                    at.fill(0.0);
+                    for co in 0..cout {
+                        for c in 0..kk {
+                            at[[co, c]] = wmat[[co, c0 + c]];
+                        }
+                    }
+                    bt.fill(0.0);
+                    for c in 0..kk {
+                        for r in 0..m_real {
+                            bt[[c, r]] = cols[[r, c0 + c]];
+                        }
+                    }
+                    let part = self.gemm_tile(&at, &bt, nb); // [MT, nb] read as [cout, m_real]
+                    for r in 0..m_real {
+                        for co in 0..cout {
+                            out[[r, co]] += part[[co, r]];
+                        }
+                    }
+                }
+                return self.finish(out, cout, out_h, out_w, b);
+            }
+        }
+
         let mt_n = m_real.div_ceil(MT);
         for mi in 0..mt_n {
             let r0 = mi * MT;
@@ -207,8 +257,20 @@ impl ConvNpu {
                 }
             }
         }
+        self.finish(out, cout, out_h, out_w, b)
+    }
+
+    /// Bias + [m, cout] -> [cout, oh, ow], shared by both dispatch orientations.
+    fn finish(
+        &self,
+        out: Array2<f32>,
+        cout: usize,
+        out_h: usize,
+        out_w: usize,
+        b: &Array1<f32>,
+    ) -> Array3<f32> {
         let mut y = Array3::<f32>::zeros((cout, out_h, out_w));
-        for p in 0..m_real {
+        for p in 0..out.dim().0 {
             let (oh, ow) = (p / out_w, p % out_w);
             for co in 0..cout {
                 y[[co, oh, ow]] = out[[p, co]] + b[co];
