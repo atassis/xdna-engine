@@ -70,10 +70,41 @@ _wire_peano_lit() {
   sed -i "s|^config\.peano_install_dir = r\"\"\".*\"\"\"$|config.peano_install_dir = r\"\"\"$peano\"\"\"|" "$cfg"
 }
 
+# Teach the instance that this box's NPU is an npu2. The 2026-08-20 driver update renamed it by
+# silicon revision (npu4_regs.c:159, AIE2_DEV_REVISION_GPT1 -> "NPU Gorgon Point 1"); mlir-aie
+# substring-matches that against a hardcoded NPU_MODELS allowlist, so every python device runner
+# raises `Unknown device type` in the constructor, before any dispatch. Same silicon (1022:17f0
+# rev 0x10, 8 columns) -- Gorgon Point IS npu2, confirmed by execution.
+#
+# No pinned commit carries the entry: 677319c935c sits on the unmerged branch
+# fix/npu-device-name-gorgon-point. Until it lands and we re-pin, this is a tethered patch, applied
+# to $INST/src (build/python symlinks it) on both the cold and warm paths. Self-retiring: once a pin
+# carries "Gorgon Point" the grep guard makes it a no-op.
+_recognise_gorgon_point() {
+  local f
+  for f in "$INST/src/python/utils/hostruntime/xrtruntime/hostruntime.py" \
+           "$INST/src/python/aie_lit_utils/lit_config_helpers.py"; do
+    [ -f "$f" ] || continue
+    grep -q '"Gorgon Point"' "$f" && continue
+    grep -q '^\( *\)"npu2": \[' "$f" || {
+      echo "[toolchain_up] WARN: no NPU_MODELS npu2 entry in $f -- device runners may not open this NPU" >&2
+      continue
+    }
+    sed -i 's|^\( *\)"npu2": \[\(.*\)\],$|\1"npu2": [\2, "Gorgon Point"],|' "$f"
+  done
+  # A hand-patch on 2026-08-21 replaced build/python/.../hostruntime.py with a REAL file, silently
+  # diverging it from the src/ it used to symlink. Re-point it so there is one copy to reason about.
+  local b="$INST/build/python/aie/utils/hostruntime/xrtruntime/hostruntime.py"
+  local t="$INST/src/python/utils/hostruntime/xrtruntime/hostruntime.py"
+  [ -f "$b" ] && [ ! -L "$b" ] && [ -f "$t" ] && ln -sfn "$t" "$b"
+  return 0
+}
+
 if [ -f "$PYPKG" ] && grep -q "def resolve_program(self, device_name" "$PYPKG"; then
   _link_vendored_tools   # backfill vendored tools into already-built instances
   _link_include_dirs     # backfill include/ symlinks (aie_api + aie_kernels)
   _wire_peano_lit        # backfill the lit peano path (else `REQUIRES: peano` tests silently skip)
+  _recognise_gorgon_point  # backfill the npu2 device-name entry (else every device runner raises)
   touch "$INST"          # record last-used (for gc_instances keep-newest-N); warm path never GCs
   echo "$INST"; exit 0   # cached, self-consistent
 fi
@@ -126,6 +157,7 @@ ninja -C "$INST/build" AIEPythonModules aiecc aie-opt >&2
 ln -sfn "$INST/build/python" "$INST/python"
 _link_include_dirs
 _wire_peano_lit
+_recognise_gorgon_point
 ln -sfn "$INST/build/bin" "$INST/bin"
 _link_vendored_tools
 touch "$INST"                                          # record last-used before GC (protects it as newest)
