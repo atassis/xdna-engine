@@ -242,8 +242,6 @@ impl FastConformerEncoder {
         )
     }
 
-    /// NPU timing breakdown (feature `npu`, NPU path only).
-    #[cfg(feature = "npu")]
     /// `PARAKEET_HYBRID=1` restores the pre-2026-08-03 CPU+NPU MIXED path wholesale: attention
     /// interior, conv middle, residual adds and the fc2 accumulate all go back to the host.
     ///
@@ -265,10 +263,14 @@ impl FastConformerEncoder {
     }
 
     /// A residency flag: ON unless explicitly `=0`, and forced OFF by [`Self::hybrid`].
+    /// Every call site is on the NPU path, so it is dead weight without the feature.
+    #[cfg(feature = "npu")]
     fn resident_on(name: &str) -> bool {
         !Self::hybrid() && std::env::var(name).map(|v| v != "0").unwrap_or(true)
     }
 
+    /// NPU timing breakdown (feature `npu`, NPU path only).
+    #[cfg(feature = "npu")]
     pub fn npu_stats_string(&self) -> Option<String> {
         self.npu.as_ref().map(|n| {
             let s = n.stats.borrow();
@@ -374,8 +376,9 @@ impl FastConformerEncoder {
         // the seam is off or the resident xclbins are absent (WER-identical to the old block()-level LN).
         #[cfg(feature = "npu")]
         let resident_mha = Self::resident_on("PARAKEET_RESIDENT_MHA");
+        // Consumed only on the NPU path, so the fallback binding is unread without the feature.
         #[cfg(not(feature = "npu"))]
-        let resident_mha = false;
+        let _resident_mha = false;
         // DIAGNOSTIC (PARAKEET_MHA_HOSTQKV=1): keep the resident attention block but feed it
         // HOST f32-LN + mm_lazy q/k/v (the DEFAULT path's qkv), decoupling the LN->QKV seam from
         // the resident attention to isolate which owns any WER gap. No effect unless RESIDENT_MHA.
