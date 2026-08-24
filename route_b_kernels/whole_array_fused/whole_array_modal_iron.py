@@ -942,19 +942,24 @@ def my_matmul(
                     # skip and the slab index are compile-time constants and cost no branch.
                     if r2a_fused is not None:
                         # Paired stream order: this core's share arrives as (a[j], b[j]) pairs, so
-                        # both are live at once and one call writes the slot. Two A buffers held
-                        # across the call -- WA_AB_DEPTH must be >= 2 for that to be possible at
-                        # all, and >= 3 to keep any producer overlap.
+                        # both are live at once and one call writes the slot.
+                        #
+                        # ONE acquire(2), not two acquire(1). The lowering advances the buffer
+                        # selector only on RELEASE, so two consecutive acquire(1) on one handle
+                        # both index the same buffer and the call gets (x, x) -- MEASURED as
+                        # `2a`/`2b` in the drained array row, and 124/128 call sites aliased in
+                        # the lowered MLIR -- byte-identically at WA_AB_DEPTH 2 AND 3, so this is
+                        # the acquire's semantics and not a depth shortfall. acquire(2) is the
+                        # idiom that yields two DISTINCT elements; it tops the peeled acquire up
+                        # to two rather than taking a third, and grows the fifo to three buffers.
                         for slot in range(0, n_aie_cols * r2a_per_core, 2):
-                            e_a = ea if slot == 0 else in_a.acquire(1)
-                            e_b = in_a.acquire(1)
+                            pair = in_a.acquire(2)
                             if slot // r2a_per_core == r2a_col:
                                 r2a_fused(
-                                    e_a, e_b, elem_out,
+                                    pair[0], pair[1], elem_out,
                                     (slot % r2a_per_core) // 2, r2a_scale_bits,
                                 )
-                            in_a.release(1)
-                            in_a.release(1)
+                            in_a.release(2)
                     else:
                         for slot in range(n_aie_cols * r2a_per_core):
                             elem_in_a = ea if slot == 0 else in_a.acquire(1)
