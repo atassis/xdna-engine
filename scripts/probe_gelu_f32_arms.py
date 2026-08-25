@@ -38,11 +38,16 @@ C0_EXACT = np.float64(0.7978845608028654)
 # (label, artifact stem suffix after the mode tag). The baseline is the shipped bf16 body.
 ARMS = [
     ("baseline  bf16 x, hw tanh", "modalgelu"),
-    ("f32x      f32 x, hw tanh", "modalgelugx"),
-    ("f32tanh   f32 x, f32 tanh", "modalgelugh"),
-    ("f32x      f32 x, hw tanh   STACK=8192", "modalgelugxs8192"),
-    ("f32tanh   f32 x, f32 tanh  STACK=8192", "modalgelughs8192"),
+    ("f32x      f32 x,  hw tanh", "modalgelugx"),
+    ("swtanh    bf16 x, sw tanh", "modalgelugs"),
+    ("both      f32 x,  sw tanh", "modalgelugxgs"),
+    ("f32tanh   f32 x,  f32 tanh", "modalgelugh"),
+    ("f32x      f32 x,  hw tanh  STACK=8192", "modalgelugxs8192"),
+    ("f32tanh   f32 x,  f32 tanh STACK=8192", "modalgelughs8192"),
 ]
+# Timed dispatches per arm, AFTER the scored one and inside the same hw_context: the transition
+# tax is ~7.3 ms and flat, so a per-dispatch context would bury a sub-ms epilogue delta entirely.
+REPS = int(os.environ.get("ARM_REPS", 30))
 
 f32 = lambda x: np.asarray(x, np.float32)
 bf = lambda x: f32(x).astype(bfloat16)
@@ -66,6 +71,7 @@ from ml_dtypes import bfloat16
 import pyxrt
 
 xclbin, insts, mode, npz, out = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4], sys.argv[5]
+reps = int(sys.argv[6]) if len(sys.argv) > 6 else 0
 z = np.load(npz)
 A_bf, B_bf = z["A"].view(bfloat16), z["B"].view(bfloat16)
 PAD_M, DFF = int(z["pad_m"]), int(z["dff"])
@@ -104,26 +110,39 @@ sys.stderr.write("dispatching\n"); sys.stderr.flush()
 kk(3, bi, instr.size, *bufs, bc).wait()
 bc.sync(FROM)
 np.save(out, np.frombuffer(bc.read(nout, 0), np.float32).reshape(PAD_M, DFF))
+if reps:
+    import json, time
+    ts = []
+    for _ in range(reps):
+        t0 = time.perf_counter()
+        kk(3, bi, instr.size, *bufs, bc).wait()
+        ts.append((time.perf_counter() - t0) * 1e3)
+    print(json.dumps({"times_ms": ts}))
 sys.stderr.write("completed\n")
 '''
 
 
-def run_arm(xclbin, insts, mode, npz):
-    """Returns (array, status). status is 'ok', 'hang', or an error string."""
+def run_arm(xclbin, insts, mode, npz, reps=0):
+    """Returns (array, status, times_ms). status is 'ok', 'hang', or an error string."""
     fd, out = tempfile.mkstemp(suffix=".npy")
     os.close(fd)
     child = os.path.join(tempfile.gettempdir(), "_gelu_arm_child.py")
     with open(child, "w") as fh:
         fh.write(CHILD)
     try:
-        p = subprocess.run([sys.executable, child, xclbin, insts, str(mode), npz, out],
-                           capture_output=True, text=True, timeout=TIMEOUT_S)
+        p = subprocess.run([sys.executable, child, xclbin, insts, str(mode), npz, out, str(reps)],
+                           capture_output=True, text=True,
+                           timeout=TIMEOUT_S + (reps * TIMEOUT_S // 10))
     except subprocess.TimeoutExpired:
-        return None, f"HANG (no completion in {TIMEOUT_S}s)"
+        return None, f"HANG (no completion in {TIMEOUT_S}s)", []
     if p.returncode != 0:
         tail = (p.stderr or p.stdout).strip().splitlines()
-        return None, "ERROR: " + (tail[-1] if tail else f"rc={p.returncode}")
-    return np.load(out), "ok"
+        return None, "ERROR: " + (tail[-1] if tail else f"rc={p.returncode}"), []
+    times = []
+    for line in (p.stdout or "").splitlines():
+        if line.startswith("{"):
+            times = json.loads(line).get("times_ms", [])
+    return np.load(out), "ok", times
 
 
 def main():
@@ -136,7 +155,7 @@ def main():
     os.close(fd)
     np.savez(npz, A=bf(A).view(np.uint16), B=bf(B).view(np.uint16), pad_m=PAD_M, dff=DFF)
 
-    print(f"PAD_M={PAD_M} K_AUG={K_AUG} DFF={DFF} timeout={TIMEOUT_S}s seed={SEED}\n")
+    print(f"PAD_M={PAD_M} K_AUG={K_AUG} DFF={DFF} timeout={TIMEOUT_S}s reps={REPS} seed={SEED}\n")
     results = {}
     for label, tag in ARMS:
         stem = f"{PAD_M}x{K_AUG}x{DFF}_64x32x128_8c_{tag}"
@@ -144,13 +163,13 @@ def main():
         if not (os.path.exists(xclbin) and os.path.exists(insts)):
             print(f"{label:44s}  SKIP (not built)")
             continue
-        gel, st = run_arm(xclbin, insts, 2, npz)
+        gel, st, times = run_arm(xclbin, insts, 2, npz, reps=REPS)
         if st != "ok":
             print(f"{label:44s}  {st}")
             results[tag] = {"status": st}
             continue
         # identity: the exact f32 accumulator the epilogue reads, so the GEMM error cancels
-        ident, st_i = run_arm(xclbin, insts, 0, npz)
+        ident, st_i, _ = run_arm(xclbin, insts, 0, npz)
         if st_i != "ok":
             print(f"{label:44s}  gelu ok, identity {st_i}")
             results[tag] = {"status": "ok", "identity": st_i}
@@ -158,8 +177,11 @@ def main():
         x = f32(ident)
         r = rel_l2(gel, gelu_ref(np.float64(x)))
         finite = np.isfinite(gel).all()
-        print(f"{label:44s}  COMPLETES  rel-L2={r:.4e}  finite={finite}")
-        results[tag] = {"status": "ok", "rel_l2": r, "finite": bool(finite)}
+        med = float(np.median(times)) if times else float("nan")
+        print(f"{label:44s}  COMPLETES  rel-L2={r:.4e}  {med:.3f} ms  finite={finite}")
+        results[tag] = {"status": "ok", "rel_l2": r, "finite": bool(finite),
+                        "median_ms": med, "n_reps": len(times),
+                        "identity_sha": hash(ident.tobytes())}
 
     print("\n" + json.dumps(results, indent=2))
 

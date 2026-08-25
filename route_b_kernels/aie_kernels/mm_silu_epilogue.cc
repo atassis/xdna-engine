@@ -202,6 +202,54 @@ static inline void mm_silu_epilogue_f32o_hiprec(const float *__restrict pC_in,
   event1();
 }
 
+#if defined(GELU_SW_TANH)
+// Software tanh for the GELU epilogue, the only route to a tanh better than the SFU LUT:
+// aie::tanh<float> emits no code on aie2p (see the note in mm_gelu_epilogue_f32o), so the
+// accurate form has to be built, as tanh_ab.cc builds it, on the exp2 poly. Both functions are
+// VERBATIM from route_b_kernels/tanh_ab/tanh_ab.cc, itself a verbatim copy of relpos_mha.cc's
+// exp2f_vec -- do not hand-edit without re-diffing. noinline is load-bearing: forcing it inline
+// miscompiles (probes/ra_spill_repro.cc).
+static constexpr float MMSE_LOG2E = 1.4426950408889634f;
+
+static __attribute__((noinline)) aie::vector<float, 16> mmse_exp2f_vec(aie::vector<float, 16> x) {
+  x = aie::max(x, aie::broadcast<float, 16>(-100.0f));
+  aie::vector<int32_t, 16> ki = aie::to_fixed<int32_t>(x);          // round-to-nearest on aie2p
+  aie::vector<float, 16> kf = aie::to_float<float>(ki);
+  aie::vector<int32_t, 16> one = aie::broadcast<int32_t, 16>(1);
+  aie::vector<int32_t, 16> zero = aie::broadcast<int32_t, 16>(0);
+  ki = aie::sub(ki, aie::select(zero, one, aie::lt(x, kf)));
+  aie::vector<float, 16> f = aie::sub(x, aie::to_float<float>(ki)); // f in [0,1)
+  aie::vector<float, 16> p = aie::broadcast<float, 16>(0.0013333558f);
+  p = aie::add(aie::mul(p, f).to_vector<float>(), aie::broadcast<float, 16>(0.0096181291f));
+  p = aie::add(aie::mul(p, f).to_vector<float>(), aie::broadcast<float, 16>(0.0555041087f));
+  p = aie::add(aie::mul(p, f).to_vector<float>(), aie::broadcast<float, 16>(0.2402265069f));
+  p = aie::add(aie::mul(p, f).to_vector<float>(), aie::broadcast<float, 16>(0.6931471805f));
+  p = aie::add(aie::mul(p, f).to_vector<float>(), aie::broadcast<float, 16>(1.0f));
+  aie::vector<int32_t, 16> ebits =
+      aie::upshift(aie::add(ki, aie::broadcast<int32_t, 16>(127)), 23);
+  aie::vector<float, 16> p2k = ebits.cast_to<float>();
+  return aie::mul(p, p2k).to_vector<float>();
+}
+
+//   tanh(z) = sign(z) * (1 - 2/(2^(2|z|*log2e) + 1))
+// The |z| fold keeps the argument in range: 2^(2z*log2e) overflows f32 for z > ~44 and the poly
+// only guards its LOWER clamp, so the unfolded form returns garbage on the positive tail instead
+// of saturating.
+static inline aie::vector<float, 16> mmse_swtanh_vec(aie::vector<float, 16> z) {
+  const aie::vector<float, 16> zero = aie::zeros<float, 16>();
+  const aie::vector<float, 16> one = aie::broadcast<float, 16>(1.0f);
+  const aie::vector<float, 16> two = aie::broadcast<float, 16>(2.0f);
+  aie::vector<float, 16> az = aie::abs(z);
+  aie::vector<float, 16> arg =
+      aie::min(aie::mul(az, aie::broadcast<float, 16>(2.0f * MMSE_LOG2E)).to_vector<float>(),
+               aie::broadcast<float, 16>(100.0f));
+  aie::vector<float, 16> e = mmse_exp2f_vec(arg);
+  aie::vector<float, 16> r = aie::inv(aie::add(e, one));
+  aie::vector<float, 16> t = aie::sub(one, aie::mul(two, r).to_vector<float>());
+  return aie::select(t, aie::sub(zero, t), aie::lt(z, zero));   // tanh is odd
+}
+#endif
+
 // GELU (tanh approx, matches torch gelu(approximate="tanh") + the decode gelu_tile_bf16):
 //   gelu(x) = 0.5*x*(1 + tanh( sqrt(2/pi) * (x + 0.044715*x^3) ))
 // f32 acc in -> bf16 gelu -> f32 out (mirrors the silu f32o path). Used by the modal GELU mode (rtp[0]==2)
@@ -216,12 +264,23 @@ static inline void mm_gelu_epilogue_f32o(const float *__restrict pC_in,
   // budget; both f32 arms were rebuilt as GELU_F32_X (f32 cube + tail, hw tanh) and GELU_F32_TANH
   // (also tanh in f32) and MEASURED 2026-08-26 at 512x800x3072, and neither hangs:
   //
-  //   arm            rel-L2 vs host f32 GELU    dispatch (median of 30)
-  //   bf16 (shipped) 6.5527e-03                 0.568 ms
-  //   GELU_F32_X     5.8921e-03  (1.11x)        0.979 ms  (1.72x)
+  // The 2x2 ladder, {bf16 x, f32 x} x {hw tanh, GELU_SW_TANH}, all five arms in one run at
+  // 512x800x3072 (rtp[0]=0 identity output bit-identical across all five xclbins, so the GEMM
+  // cancels and this scores the epilogue alone):
   //
-  // So the f32 narrows are a real 1.11x for a real +72% -- a cost/benefit call, not a wall. The
-  // 793x-1611x arm needs the narrows AND a software tanh, and its cost is still unmeasured.
+  //   arm                        rel-L2 vs host f32 GELU   median of 30   epilogue alone
+  //   bf16 x, hw tanh (shipped)  6.5527e-03                0.824 ms       0.199 ms
+  //   GELU_F32_X                 5.8921e-03   (1.11x)      1.469 ms       0.844 ms  (4.2x)
+  //   GELU_SW_TANH               3.0016e-03   (2.18x)      2.626 ms       2.001 ms  (10.0x)
+  //   both                       3.7289e-06   (1757x)      3.257 ms       2.632 ms  (13.2x)
+  //
+  // "epilogue alone" subtracts the GELU_F32_TANH row (0.625 ms), which is this same command with
+  // the body folded away, so it is a GEMM+store floor rather than an exact zero-work control.
+  // Neither lever alone is worth much -- each is pinned by the other's floor -- and together they
+  // are 1757x for 4.0x the command, the epilogue going from 24% of it to 81%. Costs are additive
+  // in ms (sub-additive by 7.5%: the two share the tanh argument), accuracy is not. Absolute ms
+  // here run ~1.45x the 2026-08-26 first-pass numbers at unchanged RATIOS -- power mode is per-boot
+  // and unpinned, so compare arms within a run, never across.
   //
   // GELU_F32_TANH is NOT that arm and must not be read as one: aie::tanh<float> compiles to an
   // EMPTY function on aie2p (.text size 0 -- the only Tanh specialisation returns bfloat16, and
@@ -262,6 +321,8 @@ static inline void mm_gelu_epilogue_f32o(const float *__restrict pC_in,
         aie::mul(aie::add(accf, aie::vector<float, 16>(aie::mul(c1f, x3))), c0f);
 #if defined(GELU_F32_TANH)
     aie::vector<float, 16> tf = aie::tanh<float>(inner_f);
+#elif defined(GELU_SW_TANH)
+    aie::vector<float, 16> tf = mmse_swtanh_vec(inner_f);
 #else
     aie::accum<accfloat, 16> tacc;
     tacc.from_vector(aie::tanh<bfloat16>(inner_f));
@@ -289,7 +350,15 @@ static inline void mm_gelu_epilogue_f32o(const float *__restrict pC_in,
     aie::vector<bfloat16, 16> c1x3 = aie::mul(c1, x3);               // c1*x^3
     aie::vector<bfloat16, 16> inner_b = aie::add(xv, c1x3);          // x + c1*x^3  (add -> vector)
     auto inner = aie::mul(c0, inner_b);                             // c0*(x + c1*x^3)  (accum)
+#if defined(GELU_SW_TANH)
+    // The tanh swapped, and NOTHING else: the result is narrowed straight back to bf16, so this
+    // arm prices the primitive alone against the arm above it.
+    aie::accum<accfloat, 16> swacc;
+    swacc.from_vector(mmse_swtanh_vec(inner.to_vector<float>()));
+    aie::vector<bfloat16, 16> t = swacc.to_vector<bfloat16>();
+#else
     aie::vector<bfloat16, 16> t = aie::tanh<bfloat16>(inner.to_vector<float>()); // tanh(inner)
+#endif
     aie::vector<bfloat16, 16> t_p1 = aie::add(t, one);              // 1 + tanh
     aie::vector<bfloat16, 16> xt = aie::mul(xv, t_p1);              // x*(1+tanh)
     aie::vector<bfloat16, 16> gx = aie::mul(half, xt);             // 0.5*x*(1+tanh)

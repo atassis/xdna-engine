@@ -65,6 +65,12 @@ silu_f32_tanh?=0
 gelu_f32_x?=0
 gelu_f32_tanh?=0
 
+# Swap the hw tanh SFU LUT for the exp2f_vec software tanh (the tanh_ab primitive). Orthogonal to
+# gelu_f32_x, so the two knobs give the 2x2 {bf16 x, f32 x} x {hw tanh, sw tanh} ladder; the
+# combined arm is the only one the modelled 793x-1611x can come from. Ignored when
+# gelu_f32_tanh=1, which takes aie::tanh's (empty) f32 overload instead.
+gelu_sw_tanh?=0
+
 # Per-core stack reservation, bytes, forwarded to the generator as WA_STACK_SIZE (empty = its
 # 0xD00 default). TAGGED because the generator reads it from the ENV: two stack sizes otherwise
 # produce the same artifact name and the second build silently reuses the first.
@@ -303,7 +309,7 @@ wrk_tag=$(if $(filter-out 0,$(wa_trace_worker)),w$(wa_trace_worker),)
 mt_tag=$(if $(filter-out -1,$(wa_trace_memtile)),mt$(wa_trace_memtile),)
 nat_tag=$(if $(filter 1,${emulate_bfloat16_mmul_with_bfp16}),,nat)
 stack_tag=$(if ${wa_stack},s${wa_stack},)
-re_tag=$(if $(filter 1,${round_even}),re,)$(if $(filter 1,${silu_f32_tail}),ft,)$(if $(filter 1,${silu_f32_tanh}),fh,)$(if $(filter 1,${gelu_f32_x}),gx,)$(if $(filter 1,${gelu_f32_tanh}),gh,)
+re_tag=$(if $(filter 1,${round_even}),re,)$(if $(filter 1,${silu_f32_tail}),ft,)$(if $(filter 1,${silu_f32_tanh}),fh,)$(if $(filter 1,${gelu_f32_x}),gx,)$(if $(filter 1,${gelu_f32_tanh}),gh,)$(if $(filter 1,${gelu_sw_tanh}),gs,)
 panel_tag=$(if $(filter 0,${c_panel_width}),,panel${c_panel_width})
 out_tag=$(if $(filter bf16,${dtype_out}),bf16out,)
 krtp_tag=$(if $(filter 1,${k_loop_rtp}),krtp,)
@@ -337,7 +343,7 @@ buffer_aloc_flag=basic-sequential
 
 # matmul object needs the bf16_f32 combo defines (mm.cc names symbols by combo).
 MM_DEFINES=-Dbf16_f32_ONLY -DDIM_M=${m} -DDIM_K=${k} -DDIM_N=${n} -DVECTORIZED_ONLY
-EPI_DEFINES=$(if $(filter 1,${mode4_bisect}), -DMODE4_BISECT_STORE_ONLY,)$(if $(filter 2,${mode4_bisect}), -DMODE4_BISECT_LOAD_A,)$(if $(filter 3,${mode4_bisect}), -DMODE4_BISECT_LOAD_AB,)$(if $(filter 4,${mode4_bisect}), -DMODE4_BISECT_LOAD_AB -DMODE4_BISECT_ADD,)$(if $(filter 5,${mode4_bisect}), -DMODE4_BISECT_LOAD_AB -DMODE4_BISECT_SUB,)$(if $(filter 6,${mode4_bisect}), -DMODE4_BISECT_LOAD_AB -DMODE4_BISECT_ADD_VIAVEC,)$(if $(filter 7,${mode4_bisect}), -DMODE4_BISECT_LOAD_AB -DMODE4_BISECT_ADD -DMODE4_BISECT_NOPIPE,)$(if $(filter 8,${mode4_bisect}), -DMODE4_BISECT_LOAD_AB -DMODE4_BISECT_ADD_IDENTDETOUR,)$(if $(filter 9,${mode4_bisect}), -DMODE4_ACCADD,) -DEPI_M=${m} -DEPI_K=${k} -DEPI_N=${n} -DEPI_R=${epi_r} -DEPI_T=${epi_t}$(if $(filter 0,${lnaffcast_scatter_c}),, -DLNA_SCATTER_C=${lnaffcast_scatter_c})$(if $(filter 1,${round_even}), -DMODAL_ROUND_EVEN,)$(if $(filter 1,${drain_round_floor}), -DMODAL_DRAIN_ROUND_FLOOR,)$(if $(filter 1,${silu_f32_tail}), -DSILU_F32_TAIL,)$(if $(filter 1,${silu_f32_tanh}), -DSILU_F32_TANH,)$(if $(filter 1,${gelu_f32_x}), -DGELU_F32_X,)$(if $(filter 1,${gelu_f32_tanh}), -DGELU_F32_TANH,)
+EPI_DEFINES=$(if $(filter 1,${mode4_bisect}), -DMODE4_BISECT_STORE_ONLY,)$(if $(filter 2,${mode4_bisect}), -DMODE4_BISECT_LOAD_A,)$(if $(filter 3,${mode4_bisect}), -DMODE4_BISECT_LOAD_AB,)$(if $(filter 4,${mode4_bisect}), -DMODE4_BISECT_LOAD_AB -DMODE4_BISECT_ADD,)$(if $(filter 5,${mode4_bisect}), -DMODE4_BISECT_LOAD_AB -DMODE4_BISECT_SUB,)$(if $(filter 6,${mode4_bisect}), -DMODE4_BISECT_LOAD_AB -DMODE4_BISECT_ADD_VIAVEC,)$(if $(filter 7,${mode4_bisect}), -DMODE4_BISECT_LOAD_AB -DMODE4_BISECT_ADD -DMODE4_BISECT_NOPIPE,)$(if $(filter 8,${mode4_bisect}), -DMODE4_BISECT_LOAD_AB -DMODE4_BISECT_ADD_IDENTDETOUR,)$(if $(filter 9,${mode4_bisect}), -DMODE4_ACCADD,) -DEPI_M=${m} -DEPI_K=${k} -DEPI_N=${n} -DEPI_R=${epi_r} -DEPI_T=${epi_t}$(if $(filter 0,${lnaffcast_scatter_c}),, -DLNA_SCATTER_C=${lnaffcast_scatter_c})$(if $(filter 1,${round_even}), -DMODAL_ROUND_EVEN,)$(if $(filter 1,${drain_round_floor}), -DMODAL_DRAIN_ROUND_FLOOR,)$(if $(filter 1,${silu_f32_tail}), -DSILU_F32_TAIL,)$(if $(filter 1,${silu_f32_tanh}), -DSILU_F32_TANH,)$(if $(filter 1,${gelu_f32_x}), -DGELU_F32_X,)$(if $(filter 1,${gelu_f32_tanh}), -DGELU_F32_TANH,)$(if $(filter 1,${gelu_sw_tanh}), -DGELU_SW_TANH,)
 ifeq (${b_col_maj}, 1)
 	MM_DEFINES+=-DB_COL_MAJ
 endif
