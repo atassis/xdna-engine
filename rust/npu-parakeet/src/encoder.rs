@@ -336,7 +336,7 @@ impl FastConformerEncoder {
         // None on the npy path, so the `unwrap_or_else` fallback is the pre-existing f32 mm_lazy
         // call, byte-identical to before.
         prof::phase::set_stage("mhsa_qkv");
-        // x is pre-LN. RESIDENT LN->QKV seam (opt-in PARAKEET_RESIDENT_MHA): norm_self_att LN runs
+        // x is pre-LN. RESIDENT LN->QKV seam (default-on; PARAKEET_RESIDENT_MHA=0 opts out): norm_self_att LN runs
         // on-NPU (ctxLN -> affine_cast) and feeds the q/k/v modal GEMMs device-side off one resident
         // bf16 A -- the host LN is off the MHSA frontier. Falls back to host layernorm + mm_lazy when
         // the seam is off or the resident xclbins are absent (WER-identical to the old block()-level LN).
@@ -481,7 +481,7 @@ impl FastConformerEncoder {
         };
         let scale = (dk as f32).sqrt();
 
-        // RESIDENT MHA (opt-in PARAKEET_RESIDENT_MHA=1): replace the host per-head
+        // RESIDENT MHA (default-on; PARAKEET_RESIDENT_MHA=0 opts out): replace the host per-head
         // scores/rel_shift/softmax/context with the on-chip STEP=8 block, one dispatch per head.
         // The kernel bakes inv_scale=1/sqrt(128), so pass qu=qh+u / qv=qh+v / k / p / v directly.
         // The resident relpos block is baked at RELPOS_BUILT_T (=172); it cannot serve longer clips.
@@ -720,13 +720,9 @@ impl FastConformerEncoder {
         // dwconv -> silu (time-major [T,D], transposes dissolved) -> pw2 (modal GEMM), the activation
         // stream never touching host across the frontier. On-NPU SiLU is part of it.
         //
-        // OPT-IN (PARAKEET_RESIDENT_CONV=1 / PARAKEET_RESIDENT_SILU=1). The originating branch had
-        // these DEFAULT-ON, flipped on a 17-clip WER read (RU 8.5 / EN 8.6 / ALL 8.5). That flip is
-        // held back deliberately and is NOT part of this merge, for two reasons: a shipped-default
-        // flip is an owner decision, and the 17-clip greedy WER gate is chaotic at ~1e-5 -- it cannot
-        // validate a device change of this kind, so it is the wrong instrument to flip on. The
-        // capability lands here in full; flipping the default is a two-line change once a rel-L2
-        // -vs-shipped number or a larger eval backs it.
+        // DEFAULT-ON; opt out with PARAKEET_RESIDENT_CONV=0 / PARAKEET_RESIDENT_SILU=0. Gate any
+        // change to these on rel-L2 vs the shipped path: the 17-clip greedy WER is chaotic at ~1e-5
+        // and cannot validate a device change of this kind.
         #[cfg(feature = "npu")]
         let resident_conv = Self::resident_on("PARAKEET_RESIDENT_CONV");
         #[cfg(feature = "npu")]
@@ -884,7 +880,7 @@ impl FastConformerEncoder {
             let _h = PhaseScope::new("block_io", Bucket::Marshal);
             x.clone()
         };
-        // FUSED-BLOCK seam (opt-in PARAKEET_FUSED_BLOCK): keep the [T,D] activation RESIDENT across
+        // FUSED-BLOCK seam (default-on; PARAKEET_FUSED_BLOCK=0 opts out): keep the [T,D] activation RESIDENT across
         // FFN1 -> Macaron residual -> satt-LN -> MHSA q/k/v projections (no host round-trip inside that
         // frontier). For THIS seam, after MHSA read back to host and rejoin the default conv/FFN2 path.
         // Falls through to the default path when the fused bricks (acc_add/resadd/resident-ln) are absent.
