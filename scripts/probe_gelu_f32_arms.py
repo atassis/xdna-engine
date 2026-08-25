@@ -146,16 +146,28 @@ def run_arm(xclbin, insts, mode, npz, reps=0):
 
 
 def main():
-    rng = np.random.default_rng(SEED)
-    A = np.zeros((PAD_M, K_AUG), np.float32)
-    A[:, :K_REAL] = rng.standard_normal((PAD_M, K_REAL))
-    B = np.zeros((K_AUG, DFF), np.float32)
-    B[:K_REAL, :] = rng.standard_normal((K_REAL, DFF)) / np.sqrt(K_REAL)
-    fd, npz = tempfile.mkstemp(suffix=".npz")
-    os.close(fd)
-    np.savez(npz, A=bf(A).view(np.uint16), B=bf(B).view(np.uint16), pad_m=PAD_M, dff=DFF)
+    # ENC_NPZ swaps the synthetic operands for a real encoder's fc1 pair, already K-augmented by
+    # bge_ffn1_bands.py. The accumulator is what the epilogue's accuracy is a function of, and a
+    # random-normal one is NOT the distribution a default flip would be argued against.
+    enc = os.environ.get("ENC_NPZ")
+    if enc:
+        z = np.load(enc)
+        if int(z["pad_m"]) != PAD_M or int(z["dff"]) != DFF:
+            sys.exit(f"{enc}: pad_m/dff {int(z['pad_m'])}/{int(z['dff'])} != {PAD_M}/{DFF}")
+        npz, src = enc, f"{enc} (bge-base L{int(z['layer'])}, {int(z['n_tokens'])} tokens)"
+    else:
+        rng = np.random.default_rng(SEED)
+        A = np.zeros((PAD_M, K_AUG), np.float32)
+        A[:, :K_REAL] = rng.standard_normal((PAD_M, K_REAL))
+        B = np.zeros((K_AUG, DFF), np.float32)
+        B[:K_REAL, :] = rng.standard_normal((K_REAL, DFF)) / np.sqrt(K_REAL)
+        fd, npz = tempfile.mkstemp(suffix=".npz")
+        os.close(fd)
+        np.savez(npz, A=bf(A).view(np.uint16), B=bf(B).view(np.uint16), pad_m=PAD_M, dff=DFF)
+        src = f"random-normal accumulator (seed {SEED})"
 
-    print(f"PAD_M={PAD_M} K_AUG={K_AUG} DFF={DFF} timeout={TIMEOUT_S}s reps={REPS} seed={SEED}\n")
+    print(f"PAD_M={PAD_M} K_AUG={K_AUG} DFF={DFF} timeout={TIMEOUT_S}s reps={REPS}")
+    print(f"operands: {src}\n")
     results = {}
     for label, tag in ARMS:
         stem = f"{PAD_M}x{K_AUG}x{DFF}_64x32x128_8c_{tag}"
@@ -175,6 +187,13 @@ def main():
             results[tag] = {"status": "ok", "identity": st_i}
             continue
         x = f32(ident)
+        if "band" not in results:
+            a = np.abs(x.ravel())
+            results["band"] = {"std": float(x.std()), "absmax": float(a.max()),
+                               "frac_lt_0.5": float((a < 0.5).mean()),
+                               "q50": float(np.quantile(a, 0.5))}
+            print(f"  accumulator band: std={x.std():.4f} absmax={a.max():.3f} "
+                  f"|x|<0.5={(a < 0.5).mean():.3f} q50={np.quantile(a, 0.5):.4f}")
         r = rel_l2(gel, gelu_ref(np.float64(x)))
         finite = np.isfinite(gel).all()
         med = float(np.median(times)) if times else float("nan")
