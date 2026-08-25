@@ -25,6 +25,13 @@ NOSW ?= 0
 # passthrough corruption proportional to the overflow. Empty = leave the default.
 STACK ?=
 
+# Extra clang flags, appended verbatim. Exists for the aie2p subregister-liveness
+# wrong-code defect that silently drops the second aie::tanh's result -- see
+# route_b_kernels/probes/tanh_subreg_clobber.ll. Either of these makes it correct:
+#   EXTRA_CFLAGS="-mllvm -enable-subreg-liveness=false"
+#   EXTRA_CFLAGS="-mllvm -join-liveintervals=false"
+EXTRA_CFLAGS ?=
+
 targetname = tanh_ab
 aie_py_src = tanh_ab_iron.py
 
@@ -39,7 +46,7 @@ endif
 build/%.cc.o: %.cc
 	mkdir -p ${@D}
 ifeq ($(devicename),npu2)
-	cd ${@D} && ${PEANO_INSTALL_DIR}/bin/clang++ ${PEANOWRAP2P_FLAGS} -DTANHAB_N=${N} -DTANHAB_NOSW=${NOSW} -c $< -o ${@F}
+	cd ${@D} && ${PEANO_INSTALL_DIR}/bin/clang++ ${PEANOWRAP2P_FLAGS} ${EXTRA_CFLAGS} -DTANHAB_N=${N} -DTANHAB_NOSW=${NOSW} -c $< -o ${@F}
 else
 	echo "Only npu2 supported for this example"
 endif
