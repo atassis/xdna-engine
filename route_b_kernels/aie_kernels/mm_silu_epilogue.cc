@@ -172,8 +172,10 @@ static inline void mm_silu_epilogue_f32o_hiprec(const float *__restrict pC_in,
     // precision-critical fix vs the all-bf16 f32o path, which rounded x before tanh.
     aie::vector<float, 16> half_x = aie::mul(accf, halff);
 #if defined(SILU_F32_TANH)
-    // No bf16 narrow anywhere in the sigmoid: tanh returns f32, so the (t+1)*0.5 tail is f32 too.
-    // Removes BOTH lossy roundings rather than merely de-biasing them.
+    // BROKEN, measured 2026-08-26 -- do not enable without fixing aie::tanh first. aie::tanh<float>
+    // compiles to an EMPTY function on aie2p (.text size 0), so tf is undef and the optimiser folds
+    // the sigmoid away, leaving out = accf. It does not fail to compile and does not fault; it
+    // silently turns SiLU into a passthrough. See the GELU note below for the measurement.
     aie::vector<float, 16> tf = aie::tanh<float>(half_x);
     aie::vector<float, 16> sigf = aie::mul(aie::add(tf, onef), halff);
 #elif defined(SILU_F32_TAIL)
@@ -209,9 +211,28 @@ static inline void mm_gelu_epilogue_f32o(const float *__restrict pC_in,
                                          float *__restrict pC_out) {
   event0();
   static_assert(size % 16 == 0, "tile size must be a multiple of 16");
-  // The body is bf16 because a full-f32 polynomial GELU HANGS on-device ("run_matmul8: kernel run
-  // did not complete") -- the cube + tanh + finish in f32 blow the cycle budget on this bf16-native
-  // unit, as does the f32-cube + bf16-tanh hybrid.
+  // The body is bf16 for CYCLES, not because f32 fails. A previous note here recorded that a
+  // full-f32 GELU "HANGS on-device (run_matmul8: kernel run did not complete)" and blamed the cycle
+  // budget; both f32 arms were rebuilt as GELU_F32_X (f32 cube + tail, hw tanh) and GELU_F32_TANH
+  // (also tanh in f32) and MEASURED 2026-08-26 at 512x800x3072, and neither hangs:
+  //
+  //   arm            rel-L2 vs host f32 GELU    dispatch (median of 30)
+  //   bf16 (shipped) 6.5527e-03                 0.568 ms
+  //   GELU_F32_X     5.8921e-03  (1.11x)        0.979 ms  (1.72x)
+  //
+  // So the f32 narrows are a real 1.11x for a real +72% -- a cost/benefit call, not a wall. The
+  // 793x-1611x arm needs the narrows AND a software tanh, and its cost is still unmeasured.
+  //
+  // GELU_F32_TANH is NOT that arm and must not be read as one: aie::tanh<float> compiles to an
+  // EMPTY function on aie2p (.text size 0 -- the only Tanh specialisation returns bfloat16, and
+  // unlike its sibling exp2, aie::tanh does not constrain TR), so the undef result lets the
+  // optimiser fold this whole loop into a copy. It measures 0.445 ms -- FASTER than the bf16 body,
+  // which is the tell -- and returns pC_in bit-exactly. Same trap sits under SILU_F32_TANH above.
+  //
+  // Not testable as prescribed: raising the reservation to 8192 does not BUILD at this design
+  // (basic-sequential L1 allocation fails; the objectFIFO buffers already reach 0x10000), so a
+  // stack-overflow explanation cannot be tested that way -- and needs no test, since both arms
+  // complete at the default 0xD00.
   //
   // Isolated against its own f32 input (rtp[0]=0 is a pure copy, so it yields the exact pC_in), this
   // loop scores 6.5e-03 against a host f32 GELU; aie::tanh is ~7.9x off bf16 representability and
@@ -221,12 +242,40 @@ static inline void mm_gelu_epilogue_f32o(const float *__restrict pC_in,
   //
   // crRnd is one sticky per-core register shared with the matmul, hence the restore on exit.
   const auto saved_rounding = aie::swap_rounding(aie::rounding_mode::conv_even);
+  const float *__restrict in_ptr = pC_in;
+  float *__restrict out_ptr = pC_out;
+#if defined(GELU_F32_X) || defined(GELU_F32_TANH)
+  // x is never narrowed: cube and tail both in f32. GELU_F32_TANH additionally takes tanh's f32
+  // overload, so no bf16 survives anywhere; GELU_F32_X keeps the bf16 tanh output (the hybrid).
+  const aie::vector<float, 16> halff = aie::broadcast<float, 16>(0.5f);
+  const aie::vector<float, 16> onef = aie::broadcast<float, 16>(1.0f);
+  const aie::vector<float, 16> c0f = aie::broadcast<float, 16>(0.7978845608f); // sqrt(2/pi)
+  const aie::vector<float, 16> c1f = aie::broadcast<float, 16>(0.044715f);
+  AIE_PREPARE_FOR_PIPELINING
+  AIE_LOOP_MIN_ITERATION_COUNT(2)
+  for (int off = 0; off < size; off += 16) {
+    aie::vector<float, 16> accf = aie::load_v<16>(in_ptr);
+    in_ptr += 16;
+    aie::vector<float, 16> x2 = aie::mul(accf, accf);                 // x^2
+    aie::vector<float, 16> x3 = aie::mul(x2, accf);                   // x^3
+    aie::vector<float, 16> inner_f =
+        aie::mul(aie::add(accf, aie::vector<float, 16>(aie::mul(c1f, x3))), c0f);
+#if defined(GELU_F32_TANH)
+    aie::vector<float, 16> tf = aie::tanh<float>(inner_f);
+#else
+    aie::accum<accfloat, 16> tacc;
+    tacc.from_vector(aie::tanh<bfloat16>(inner_f));
+    aie::vector<float, 16> tf = tacc.to_vector<float>();
+#endif
+    aie::vector<float, 16> xt = aie::mul(accf, aie::vector<float, 16>(aie::add(tf, onef)));
+    aie::store_v(out_ptr, aie::vector<float, 16>(aie::mul(xt, halff)));
+    out_ptr += 16;
+  }
+#else
   const aie::vector<bfloat16, 16> half = aie::broadcast<bfloat16, 16>(0.5f);
   const aie::vector<bfloat16, 16> one = aie::broadcast<bfloat16, 16>(1.0f);
   const aie::vector<bfloat16, 16> c0 = aie::broadcast<bfloat16, 16>(0.7978845608f); // sqrt(2/pi)
   const aie::vector<bfloat16, 16> c1 = aie::broadcast<bfloat16, 16>(0.044715f);
-  const float *__restrict in_ptr = pC_in;
-  float *__restrict out_ptr = pC_out;
   AIE_PREPARE_FOR_PIPELINING
   AIE_LOOP_MIN_ITERATION_COUNT(2)
   for (int off = 0; off < size; off += 16) {
@@ -249,6 +298,7 @@ static inline void mm_gelu_epilogue_f32o(const float *__restrict pC_in,
     aie::store_v(out_ptr, oacc.to_vector<float>());
     out_ptr += 16;
   }
+#endif
   aie::set_rounding(saved_rounding);
   event1();
 }
