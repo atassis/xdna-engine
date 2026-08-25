@@ -2690,9 +2690,41 @@ impl NpuMatmul {
     /// Returns the device f32 `[PAD_M,KRES]` block output `x + fc2(act(fc1(x)))`, whose first `m`
     /// rows are the block result; `None` when the rail is not built or `act` has no built stream.
     /// The returned Rc is rail scratch, overwritten by the next call.
+    ///
+    /// POST-NORM ONLY, by the shape of its argument list: fc1's input and the residual operand are
+    /// the same `x`. A PRE-norm block (Whisper's encoder) normalizes into fc1 and adds the residual
+    /// from BEFORE that norm, which is two different arrays -- it wants
+    /// [`Self::resident_ffn_resid_hostx`], of which this is the collapsed case.
     #[allow(clippy::too_many_arguments)]
     pub fn resident_ffn_nonorm_hostx<F1, F2>(
         &self, x: &Array2<f32>,
+        make_w1: F1, b1: &[f32], id1: &str,
+        make_w2: F2, b2: &[f32], id2: &str,
+        act: Act,
+    ) -> Option<Rc<Bo>>
+    where
+        F1: FnOnce() -> Array2<f32>,
+        F2: FnOnce() -> Array2<f32>,
+    {
+        self.resident_ffn_resid_hostx(x, x, make_w1, b1, id1, make_w2, b2, id2, act)
+    }
+
+    /// The rail's general host-in form: `resid + fc2(act(fc1(a_in)))`, with fc1's input and the
+    /// residual operand taken SEPARATELY. Both are `[m, KRES]` host arrays and both are packed and
+    /// uploaded here; nothing is read back.
+    ///
+    /// The two operands are one array in a post-norm block and two in a pre-norm one, and that is
+    /// the whole difference between the encoder families this rail serves. Post-norm (BERT, ESM-2)
+    /// hands the same LN output to both and goes through `resident_ffn_nonorm_hostx`. Pre-norm
+    /// (Whisper's encoder: `ln2 = LN(x); x + fc2(gelu(fc1(ln2)))`) normalizes into fc1 while the
+    /// residual comes from before the norm, so it passes `(ln2, x)` here. Collapsing these two roles
+    /// into one parameter is what made the rail post-norm-only.
+    ///
+    /// `b2` is added onto the residual operand rather than fc2's output -- exact outside an identity
+    /// epilogue, and it keeps fc2's result on the device (see `resident_ffn_nonorm`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn resident_ffn_resid_hostx<F1, F2>(
+        &self, a_in: &Array2<f32>, resid: &Array2<f32>,
         make_w1: F1, b1: &[f32], id1: &str,
         make_w2: F2, b2: &[f32], id2: &str,
         act: Act,
@@ -2709,16 +2741,17 @@ impl NpuMatmul {
         }
         let rail = self.resident_k768()?;
         let (pad_m, kres, dff) = (self.pad_m, self.kres, self.dff);
-        let m = x.nrows();
+        let m = a_in.nrows();
         assert!(m <= pad_m, "resident_ffn_nonorm: T={m} exceeds PAD_M={pad_m}");
-        assert_eq!(x.ncols(), kres, "resident_ffn_nonorm needs D=kres={kres}");
+        assert_eq!(a_in.ncols(), kres, "resident_ffn_nonorm needs D=kres={kres}");
+        assert_eq!(resid.dim(), a_in.dim(), "residual operand must match fc1's input shape");
         assert_eq!(b1.len(), dff, "fc1 bias len {} != DFF={dff}", b1.len());
         assert_eq!(b2.len(), kres, "fc2 bias len {} != KRES={kres}", b2.len());
         self.stats.borrow_mut().calls += 1;
 
-        // A = [ bf16(x) | 1.0 | 0.. ] over KAUG columns. Pad rows stay all-zero -- no ones column --
-        // so they carry gelu(0)=0 through the rail instead of gelu(b1).
-        let xs = x.as_standard_layout();
+        // A = [ bf16(a_in) | 1.0 | 0.. ] over KAUG columns. Pad rows stay all-zero -- no ones column
+        // -- so they carry gelu(0)=0 through the rail instead of gelu(b1).
+        let xs = a_in.as_standard_layout();
         let xr = xs.as_slice().unwrap();
         let mut a1 = vec![0u16; pad_m * rail.kaug];
         for r in 0..m {
@@ -2759,13 +2792,15 @@ impl NpuMatmul {
         modal_site("k768.fc2");
         { let _dt = self.dtimer(); rail.fc2.kern.run_matmul8(3, &rail.fc2.instr, rail.fc2.n, &rail.cast_h_out, &w2, &rail.fc2_c, &rail.fc2.tmp, &rail.fc2.tr).unwrap(); }
 
-        // b2 rides on the residual operand: (x + b2) + fc2 == x + (fc2 + b2). The right-hand form
+        // b2 rides on the residual operand: (r + b2) + fc2 == r + (fc2 + b2). The right-hand form
         // is what the gate script runs, and it needs fc2's output on the host to add a bias to it;
         // this one adds b2 to data already on the host and leaves fc2's output resident.
+        let rs = resid.as_standard_layout();
+        let rr = rs.as_slice().unwrap();
         let mut ra = vec![0f32; pad_m * kres];
         for r in 0..m {
             for c in 0..kres {
-                ra[r * kres + c] = xr[r * kres + c] + b2[c];
+                ra[r * kres + c] = rr[r * kres + c] + b2[c];
             }
         }
         rail.resadd_a.write_bytes(f32_bytes(&ra)).unwrap();
@@ -2933,6 +2968,70 @@ impl NpuMatmul {
             &x,
             move || w1d, &b1, "selftest.k768.fc1",
             move || w2d, &b2, "selftest.k768.fc2",
+            Act::Gelu,
+        )?;
+        Some((host, self.readback_stream(&out, t), controls))
+    }
+
+    /// Device-parity self-test for the PRE-norm form: `resident_ffn_resid_hostx` with fc1's input
+    /// and the residual operand as two DIFFERENT arrays (Whisper's `ln2` and `x`).
+    ///
+    /// The control is the whole point. A rail that ignores `resid` and residuals `a_in` instead --
+    /// which is what the post-norm-only entry point did, and what any future collapse of the two
+    /// parameters would silently restore -- reproduces the "swapped" oracle exactly. So the two
+    /// oracles must be far apart for the pass to mean anything, and they are only far apart because
+    /// the two operands are drawn from different seeds.
+    /// Returns `(host, device, controls)` like [`Self::k768_ffn_selftest`].
+    pub fn k768_ffn_resid_selftest(
+        &self, t: usize, seed: u64,
+    ) -> Option<(Array2<f32>, Array2<f32>, Vec<(&'static str, Array2<f32>)>)> {
+        let (kres, dff) = (self.kres, self.dff);
+        self.resident_k768()?;
+        let fill = |rows: usize, cols: usize, sd: u64, sc: f32| -> Array2<f32> {
+            let mut s = sd.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            Array2::from_shape_fn((rows, cols), |_| {
+                s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                let mut z = s; z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB); z ^= z >> 31;
+                ((z >> 40) as f32 / (1u32 << 24) as f32 * 2.0 - 1.0) * sc
+            })
+        };
+        // a_in stands for LN(x) and resid for x: both unit-scale, independently drawn.
+        let a_in = fill(t, kres, seed, 1.0);
+        let resid = fill(t, kres, seed ^ 0x5A5A, 1.0);
+        let w1 = fill(kres, dff, seed ^ 0xC3, 1.0 / (kres as f32).sqrt());
+        let b1: Vec<f32> = fill(1, dff, seed ^ 0xE5, 0.1).iter().copied().collect();
+        let w2 = fill(dff, kres, seed ^ 0xD4, 1.0 / (dff as f32).sqrt());
+        let b2: Vec<f32> = fill(1, kres, seed ^ 0xF6, 0.1).iter().copied().collect();
+
+        let bf = |a: &Array2<f32>| -> Array2<f32> {
+            a.mapv(|v| npu_xrt::bf16_bits_to_f32(npu_xrt::f32_to_bf16_bits(v)))
+        };
+        let gelu = |v: f32| {
+            0.5 * v * (1.0 + (0.797_884_56_f32 * (v + 0.044_715 * v * v * v)).tanh())
+        };
+        let b1b: Vec<f32> = b1.iter().map(|&v| npu_xrt::bf16_bits_to_f32(npu_xrt::f32_to_bf16_bits(v))).collect();
+        let mut pre1 = bf(&a_in).dot(&bf(&w1));
+        for mut row in pre1.rows_mut() {
+            for (c, v) in row.iter_mut().enumerate() { *v += b1b[c]; }
+        }
+        let l2 = bf(&bf(&pre1.mapv(gelu)).dot(&bf(&w2)));
+        // Same fc2 result, residualled against each candidate operand.
+        let against = |r: &Array2<f32>| -> Array2<f32> {
+            let mut o = r + &l2;
+            for mut row in o.rows_mut() {
+                for (c, v) in row.iter_mut().enumerate() { *v += b2[c]; }
+            }
+            o
+        };
+        let host = against(&resid);
+        let controls = vec![("swapped-residual", against(&a_in))];
+
+        let (w1d, w2d) = (w1, w2);
+        let out = self.resident_ffn_resid_hostx(
+            &a_in, &resid,
+            move || w1d, &b1, "selftest.k768r.fc1",
+            move || w2d, &b2, "selftest.k768r.fc2",
             Act::Gelu,
         )?;
         Some((host, self.readback_stream(&out, t), controls))
