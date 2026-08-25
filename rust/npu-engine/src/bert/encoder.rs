@@ -86,11 +86,13 @@ impl BertBlock {
     /// FFN (the shipped default). None whenever the env flag is unset, no rail is injected, or the
     /// rail's capability dim isn't 768.
     ///
-    /// DEVICE-GATED: `self.resident` is None on the CPU-only base, so this returns None today. A
-    /// device session (a) builds the K=768 xclbins + a K=768-configured `NpuMatmul`, (b) sets
-    /// `resident = Some(ResidentFfn{..})` per block, then this dispatches the rail. The `upload_stream`
-    /// / `readback_stream` below are KRES-shaped on the current NpuMatmul (D=1024); a K=768 rail needs
-    /// their [T,768] variants (same const->field parameterization as `resident_ffn_nonorm`).
+    /// Goes through the HOST-IN entry, not `resident_ffn_nonorm(x_bo, ..)`: `x` is already a host
+    /// array here (the post-attention LN runs on host), and the rail packs fc1's K-augmented A and
+    /// the residual operand on the host anyway, so uploading `x` first would only buy a readback.
+    /// The weight closures clone lazily -- they fire once per id, on the rail's cache miss.
+    ///
+    /// `self.resident` is None on the CPU-only base, so this returns None there. Wiring a rail means
+    /// building a K=768-configured `NpuMatmul` and setting `resident = Some(ResidentFfn{..})`.
     fn try_resident_ffn(&self, x: &Array2<f32>) -> Option<Array2<f32>> {
         if std::env::var("BERT_RESIDENT_FFN").as_deref() != Ok("1") {
             return None; // flag unset -> host FFN (default)
@@ -99,13 +101,10 @@ impl BertBlock {
         if r.npu.resident_kres() != 768 {
             return None; // capability gate: wrong hidden dim -> host fallback
         }
-        // DEVICE-GATED: KRES-shaped upload/readback (D=1024); K=768 rail needs [T,768] variants.
-        let x_bo = r.npu.upload_stream(x);
-        let (w1, w2) = (r.w1.clone(), r.w2.clone()); // DEVICE-GATED: prefer lazy/packed BOs over a per-call clone
-        let y_bo = r.npu.resident_ffn_nonorm(
-            &x_bo, x.nrows(),
-            move || w1, &r.b1, "bert.ffn1.w1",
-            move || w2, &r.b2, "bert.ffn2.w2",
+        let y_bo = r.npu.resident_ffn_nonorm_hostx(
+            x,
+            || r.w1.clone(), &r.b1, "bert.ffn1.w1",
+            || r.w2.clone(), &r.b2, "bert.ffn2.w2",
             Act::Gelu,
         )?;
         Some(r.npu.readback_stream(&y_bo, x.nrows()))

@@ -10,6 +10,10 @@
 //!               f32 mul+add near-exact -> rel-L2 must be ~0 (<= 1e-4).
 //!   ln       -- Task 3: device-in LN. host ops::layernorm(x,g,b) vs ln_affine_cast_dev (device-in
 //!               ctxLN+affine). bf16 output -> rel-L2 <= 5e-3.
+//!   k768ffn  -- the LN-less K=768 GELU rail as a CHAIN: fc1 modalgelu -> cast@3072 -> fc2 modalid
+//!               -> resadd s100 vs a host oracle fed the same bf16 operands. bfp16 GEMMs over
+//!               K=800 and K=3072 -> rel-L2 <= 5e-2, the bar the per-brick gate script uses.
+//!               `--pad-m` picks the built width (512 = BERT short seq, 1536 = Whisper-small).
 //!
 //! Run (NPU quiesced, from the repo root):
 //!   NPU_XCLBIN_ROOT=$PWD cargo run --features npu --release --bin fused_seam_parity -- ffn
@@ -49,7 +53,13 @@ fn main() {
     let seed: u64 = arg_val("--seed", "1").parse().unwrap();
 
     let root = std::env::var("NPU_XCLBIN_ROOT").unwrap_or_else(|_| ".".into());
-    let npu = NpuMatmul::open(Path::new(&root));
+    // The K=768 rail is a different NpuMatmul CONFIGURATION, not another call on Parakeet's.
+    let npu = if seam == "k768ffn" {
+        let pad_m: usize = arg_val("--pad-m", "512").parse().unwrap();
+        NpuMatmul::open_with_rail(Path::new(&root), 768, pad_m, 3072)
+    } else {
+        NpuMatmul::open(Path::new(&root))
+    };
 
     match seam.as_str() {
         "ffn" => {
@@ -97,8 +107,27 @@ fn main() {
             assert!(l2_rel <= 1e-4, "convfront parity FAILED: rel-L2 {l2_rel:.3e} > 1e-4");
             println!("[fused_seam_parity] PASS (rel-L2 <= 1e-4)");
         }
+        "k768ffn" => {
+            let (host, dev, controls) = npu.k768_ffn_selftest(t, seed).unwrap_or_else(|| {
+                panic!("[fused_seam_parity] k768ffn: K=768 rail xclbins absent -- build \
+                        PAD_M=<width> scripts/build_k768_gelu_rail.sh into artifacts/k768_gelu_rail");
+            });
+            let (max_rel, l2_rel) = rel_err(&host, &dev);
+            println!("[fused_seam_parity] seam=k768ffn t={t} seed={seed}  max_rel={max_rel:.3e} rel-L2={l2_rel:.3e}");
+            // The epilogue rides in the instruction stream, so gelu must be shown to BEAT the modes
+            // the rail could have dispatched instead -- one residual alone does not say which ran.
+            let mut worst = f32::INFINITY;
+            for (name, ctl) in &controls {
+                let (_, r) = rel_err(ctl, &dev);
+                println!("[fused_seam_parity]   control {name}: rel-L2={r:.3e} ({:.1}x gelu)", r / l2_rel.max(1e-30));
+                worst = worst.min(r);
+            }
+            assert!(l2_rel <= 5e-2, "K=768 GELU rail chain parity FAILED: rel-L2 {l2_rel:.3e} > 5e-2");
+            assert!(worst > 4.0 * l2_rel, "K=768 rail control did NOT fire: nearest wrong epilogue is only {:.1}x off (rel-L2 {worst:.3e} vs {l2_rel:.3e}) -- the run does not show gelu was the mode dispatched", worst / l2_rel.max(1e-30));
+            println!("[fused_seam_parity] PASS (rel-L2 <= 5e-2, gelu {:.1}x clear of the nearest control)", worst / l2_rel.max(1e-30));
+        }
         other => {
-            eprintln!("[fused_seam_parity] unknown seam '{other}' (known: ffn, residual, ln, linout, convfront)");
+            eprintln!("[fused_seam_parity] unknown seam '{other}' (known: ffn, residual, ln, linout, convfront, k768ffn)");
             std::process::exit(2);
         }
     }

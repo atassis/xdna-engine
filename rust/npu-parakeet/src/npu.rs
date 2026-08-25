@@ -232,6 +232,9 @@ pub struct NpuMatmul {
     // Tri-state cache: None = untried; Some(None) = xclbins absent, FF stays host (no retry);
     // Some(Some) = co-resident on-chip LN + affine-cast chain loaded.
     resident_ln: RefCell<Option<Option<Rc<ResidentLn>>>>,
+    k768_dir: PathBuf,                             // {root}/artifacts/k768_gelu_rail
+    // Tri-state like `resident_ln`: None = untried; Some(None) = not built (no retry, host FFN).
+    k768: RefCell<Option<Option<Rc<K768Rail>>>>,
     pub stats: RefCell<NpuStats>,
 }
 
@@ -422,6 +425,53 @@ struct ResidualAdd {
     bo_out: Rc<Bo>, // [PAD_M, KRES] f32 result (scratch; overwritten by the next call)
     dummy_tmp: Bo,
     dummy_tr: Bo,
+}
+
+// fc1 K-augmentation for the GELU rail: one k=32 block appended to W1 carries `b1`, so the bias
+// lands INSIDE the on-chip GELU. fc2 needs no counterpart -- a bias outside an identity epilogue is
+// exact, so `b2` folds into the residual operand instead.
+const K768_KAUG_BLOCK: usize = 32;
+const K768_FC1_TILE: &str = "64x32x128";
+const K768_FC2_TILE: &str = "64x32x96"; // N=kres=768 = 96*8, so the epilogue's (m*n)%16==0 holds
+
+/// One separately-built brick of a resident rail: its own xclbin, its own instruction stream, and
+/// the group-6/7 scratch BOs every whole_array-family runtime sequence takes. Bricks are distinct
+/// hardware contexts, so a dispatch that crosses two of them pays a context transition -- 1.37-1.45
+/// ms on this rail, flat over 3x M, and device-serial (queued submission recovers 3% of it while
+/// the same code recovers 19-42% on same-context submits). Fusing bricks into one xclbin is the
+/// only lever on that tax, and it is a kernel build, not a host change.
+struct Brick {
+    kern: Rc<Kernel>,
+    instr: Bo,
+    n: usize,
+    tmp: Bo, // group 6
+    tr: Bo,  // group 7
+}
+
+/// LN-less GELU FFN rail for POST-norm encoders (BERT / Whisper-small / ESM-2 share the shape
+/// family), built per PAD_M by `scripts/build_k768_gelu_rail.sh` into
+/// `{root}/artifacts/k768_gelu_rail`. Schedule: `fc1 modalgelu (K_aug) -> cast@DFF -> fc2 modalid
+/// -> resadd s100`, with fc1's f32 output, its bf16 cast and fc2's output all staying on device.
+///
+/// FOUR bricks, where the rel-L2 gate script runs five. The fifth is a `cast_{pad_m}x{kres}` that
+/// makes fc1's A input, and this cannot use it: fc1 takes A as `[PAD_M, kres+32]` with a ones
+/// column folding `b1` into the matmul, and a contiguous `[PAD_M,kres]` result is not a strided
+/// view of that. The host rounds instead -- `pack_f32_to_bf16` is bit-exact against the cast brick,
+/// which is what the gate's cast control asserts -- and that deletes a context transition too.
+/// Feeding fc1 from a device-resident stream needs a cast that drains at the augmented stride.
+struct K768Rail {
+    fc1: Brick,
+    fc1_a: Bo, // bf16 [PAD_M, KAUG] -- A with the folded-bias ones column
+    fc1_c: Bo, // f32  [PAD_M, DFF]  -- gelu(x@W1 + b1), device-resident
+    cast_h: Brick,
+    cast_h_out: Bo, // bf16 [PAD_M, DFF] -- fc2's A input
+    cast_h_d5: Bo,  // the cast drains to group 4, so group 5 is a dummy
+    fc2: Brick,
+    fc2_c: Bo, // f32 [PAD_M, KRES] -- h@W2; b2 rides on the residual operand, not here
+    resadd: Brick,
+    resadd_a: Bo,       // f32 [PAD_M, KRES] -- residual operand, x + b2
+    resadd_out: Rc<Bo>, // f32 [PAD_M, KRES] -- block output (scratch; the next call overwrites)
+    kaug: usize,
 }
 
 // Conv-module depthwise conv1d (step 3): sliding_mul FIR along time, [C,T] channel-major bf16.
@@ -642,6 +692,13 @@ impl NpuMatmul {
             // disappears without touching a dispatch site.
             let stem = format!("{pad_m}x{kres}x{dff}_{FC1_PANEL_BF16_TILE}_8c_modalsilubf16outpanel{kres}");
             (resolve_verified(&base, &stem).xclbin, true)
+        } else if kres != KRES {
+            // A non-Parakeet rail has no `{pad_m}x{kres}x{dff}` whole_array resident -- its bricks
+            // are separate xclbins. Make the resident BE the rail's fc1, the way `fold_fc1` does
+            // for Parakeet: `load_kernel` keys its cache on the path, so `load_brick` later shares
+            // this hardware context instead of taking a second one out of the driver's 16.
+            let stem = format!("{pad_m}x{}x{dff}_{K768_FC1_TILE}_8c_modalgelu", kres + K768_KAUG_BLOCK);
+            (resolve_verified(&root.join("artifacts/k768_gelu_rail"), &stem).xclbin, true)
         } else if let Ok(p) = std::env::var("NPU_RESIDENT_XCLBIN") {
             let path = PathBuf::from(p);
             // Arbitrary override path (a manual/debug knob): no guaranteed `final_{stem}.xclbin`
@@ -724,6 +781,8 @@ impl NpuMatmul {
             conveyor: RefCell::new(None),
             ln_dir: root.join("artifacts/parakeet/ln"),
             resident_ln: RefCell::new(None),
+            k768_dir: root.join("artifacts/k768_gelu_rail"),
+            k768: RefCell::new(None),
             stats: RefCell::new(NpuStats::default()),
         }
     }
@@ -2565,20 +2624,11 @@ impl NpuMatmul {
     /// are the fc1/fc2 biases; `act` = `Act::Gelu` for the shipping rail. Returns None on any
     /// non-K=768 rail, so the caller falls back to the host FFN (the shipped default).
     ///
-    /// DEVICE-GATED (returns None today on the Parakeet KRES=1024 instance). Lighting this up is a
-    /// DEVICE session, not more CPU work:
-    ///   1. KRES/PAD_M/DFF become RailCfg FIELDS set from the loaded xclbin name so `resident_kres()`
-    ///      can report 768 (kept as consts here to preserve Parakeet byte-for-byte -- runbook Step 2).
-    ///   2. `open()` loads the K=768 rail (built by scripts/build_k768_gelu_rail.sh): fc1
-    ///      512x800x3072 `modalgelu`, fc2 512x3072x768 `modalid`, cast_512x768 + cast_512x3072,
-    ///      resadd_512x768_s100.
-    ///   3. `stream()`'s `insts_512x1024x{n}` literals parameterize by pad_m/kres.
-    ///   4. the K_aug=800 bias-fold packing of `b1` (one k=32 block appended to W1) + the N=768 fc2
-    ///      tile n=96 (768 = 96*8, satisfies the epilogue `(m*n)%16==0`) -- shapes the device session
-    ///      validates on rel-L2 vs host truth.
-    /// With those in place the schedule above dispatches here; until then the capability gate short-
-    /// circuits to None (host FFN) and the `resident_kres()==768` arm is `unimplemented!` so a future
-    /// K=768 build cannot SILENTLY fall through to host (which would look like the rail ran but didn't).
+    /// The bricks live in `{root}/artifacts/k768_gelu_rail` and are loaded on demand by
+    /// [`Self::resident_k768`]; absent artifacts return None, so the caller stays on the host FFN.
+    /// UNGATED ON DEVICE so far -- it compiles and dispatches, but no rel-L2 run has scored the
+    /// chain end to end. The per-brick gate (`scripts/verify_k768_gelu_rail.py`) passes at all four
+    /// built widths; what is unmeasured is this composition of them.
     pub fn resident_ffn_nonorm<F1, F2>(
         &self, x_bo: &Bo, m: usize,
         make_w1: F1, b1: &[f32], id1: &str,
@@ -2589,16 +2639,185 @@ impl NpuMatmul {
         F1: FnOnce() -> Array2<f32>,
         F2: FnOnce() -> Array2<f32>,
     {
-        // Bind the args so the signature the device session wires against is fixed, WITHOUT invoking
-        // the lazy weight closures (no host weight materialization on the fall-through-to-host path).
-        let _ = (x_bo, m, b1, id1, b2, id2, act);
-        drop((make_w1, make_w2));
-        if self.resident_kres() == 768 {
-            // DEVICE-GATED: the K=768 dispatch chain (cast -> fc1 modalgelu -> cast -> fc2 modalid ->
-            // resadd_s100) lands here once (1)-(4) above are in place; not reachable on Parakeet.
-            unimplemented!("resident_ffn_nonorm K=768 dispatch is device-gated (see the doc notes)")
+        if self.resident_kres() != 768 {
+            // Not the GELU rail (shipped Parakeet is KRES=1024): fall through to the host FFN
+            // without materializing weights.
+            drop((make_w1, make_w2));
+            let _ = (x_bo, m, b1, id1, b2, id2, act);
+            return None;
         }
-        None
+        // fc1 needs A K-augmented on the host (see `K768Rail`), so the device-in form reads `x_bo`
+        // back once and delegates. A caller that already holds `x` on the host should call
+        // `resident_ffn_nonorm_hostx` and never upload it in the first place; that is the shape the
+        // post-norm encoder seam uses, since its LN output is a host array.
+        let x = self.readback_stream(x_bo, m);
+        self.resident_ffn_nonorm_hostx(&x, make_w1, b1, id1, make_w2, b2, id2, act)
+    }
+
+    /// Host-in form of [`Self::resident_ffn_nonorm`]: `x` is the block's post-attention-LN output,
+    /// which post-norm encoders compute on the host, so the K-augmented fc1 A input and the residual
+    /// operand are both packed here and uploaded once -- no device readback anywhere in the chain.
+    /// Returns the device f32 `[PAD_M,KRES]` block output `x + fc2(act(fc1(x)))`, whose first `m`
+    /// rows are the block result; `None` when the rail is not built or `act` has no built stream.
+    /// The returned Rc is rail scratch, overwritten by the next call.
+    #[allow(clippy::too_many_arguments)]
+    pub fn resident_ffn_nonorm_hostx<F1, F2>(
+        &self, x: &Array2<f32>,
+        make_w1: F1, b1: &[f32], id1: &str,
+        make_w2: F2, b2: &[f32], id2: &str,
+        act: Act,
+    ) -> Option<Rc<Bo>>
+    where
+        F1: FnOnce() -> Array2<f32>,
+        F2: FnOnce() -> Array2<f32>,
+    {
+        // Only the GELU epilogue is built for this rail. The mode lives in the instruction stream,
+        // so Silu/Identity are an insts-only addition -- but serving them off the gelu stream would
+        // be an activation swap no residual gate could distinguish from a bad kernel.
+        if act != Act::Gelu {
+            return None;
+        }
+        let rail = self.resident_k768()?;
+        let (pad_m, kres, dff) = (self.pad_m, self.kres, self.dff);
+        let m = x.nrows();
+        assert!(m <= pad_m, "resident_ffn_nonorm: T={m} exceeds PAD_M={pad_m}");
+        assert_eq!(x.ncols(), kres, "resident_ffn_nonorm needs D=kres={kres}");
+        assert_eq!(b1.len(), dff, "fc1 bias len {} != DFF={dff}", b1.len());
+        assert_eq!(b2.len(), kres, "fc2 bias len {} != KRES={kres}", b2.len());
+        self.stats.borrow_mut().calls += 1;
+
+        // A = [ bf16(x) | 1.0 | 0.. ] over KAUG columns. Pad rows stay all-zero -- no ones column --
+        // so they carry gelu(0)=0 through the rail instead of gelu(b1).
+        let xs = x.as_standard_layout();
+        let xr = xs.as_slice().unwrap();
+        let mut a1 = vec![0u16; pad_m * rail.kaug];
+        for r in 0..m {
+            let row = r * rail.kaug;
+            npu_xrt::pack_f32_to_bf16(&xr[r * kres..(r + 1) * kres], &mut a1[row..row + kres]);
+            a1[row + kres] = npu_xrt::f32_to_bf16_bits(1.0);
+        }
+        rail.fc1_a.write_bytes(u16_bytes(&a1)).unwrap();
+        rail.fc1_a.sync_to_device().unwrap();
+
+        // W1 augmented once per id: rows 0..KRES are W1, row KRES is b1, the remaining k=32 block
+        // rows stay zero. Keyed apart from `id1` so a plain [KRES,DFF] W1 can still cache under it.
+        let w1id = format!("{id1}.kaug{}", rail.kaug);
+        let w1 = {
+            let c = self.wcache.borrow().get(&w1id).cloned();
+            c.unwrap_or_else(|| {
+                let w = make_w1();
+                assert_eq!(w.dim(), (kres, dff), "fc1 W1 dim");
+                let mut aug = Array2::<f32>::zeros((rail.kaug, dff));
+                aug.slice_mut(s![..kres, ..]).assign(&w);
+                aug.slice_mut(s![kres, ..]).assign(&ArrayView1::from(b1));
+                self.weight_bo_on(&rail.fc1.kern, &w1id, aug.view())
+            })
+        };
+        modal_site("k768.fc1");
+        { let _dt = self.dtimer(); rail.fc1.kern.run_matmul8(3, &rail.fc1.instr, rail.fc1.n, &rail.fc1_a, &w1, &rail.fc1_c, &rail.fc1.tmp, &rail.fc1.tr).unwrap(); }
+        modal_site("k768.cast");
+        { let _dt = self.dtimer(); rail.cast_h.kern.run_matmul8(3, &rail.cast_h.instr, rail.cast_h.n, &rail.fc1_c, &rail.cast_h_out, &rail.cast_h_d5, &rail.cast_h.tmp, &rail.cast_h.tr).unwrap(); }
+
+        let w2 = {
+            let c = self.wcache.borrow().get(id2).cloned();
+            c.unwrap_or_else(|| {
+                let w = make_w2();
+                assert_eq!(w.dim(), (dff, kres), "fc2 W2 dim");
+                self.weight_bo_on(&rail.fc2.kern, id2, w.view())
+            })
+        };
+        modal_site("k768.fc2");
+        { let _dt = self.dtimer(); rail.fc2.kern.run_matmul8(3, &rail.fc2.instr, rail.fc2.n, &rail.cast_h_out, &w2, &rail.fc2_c, &rail.fc2.tmp, &rail.fc2.tr).unwrap(); }
+
+        // b2 rides on the residual operand: (x + b2) + fc2 == x + (fc2 + b2). The right-hand form
+        // is what the gate script runs, and it needs fc2's output on the host to add a bias to it;
+        // this one adds b2 to data already on the host and leaves fc2's output resident.
+        let mut ra = vec![0f32; pad_m * kres];
+        for r in 0..m {
+            for c in 0..kres {
+                ra[r * kres + c] = xr[r * kres + c] + b2[c];
+            }
+        }
+        rail.resadd_a.write_bytes(f32_bytes(&ra)).unwrap();
+        rail.resadd_a.sync_to_device().unwrap();
+        modal_site("k768.resadd");
+        { let _dt = self.dtimer(); rail.resadd.kern.run_matmul8(3, &rail.resadd.instr, rail.resadd.n, &rail.resadd_a, &rail.fc2_c, &*rail.resadd_out, &rail.resadd.tmp, &rail.resadd.tr).unwrap(); }
+        self.stats.borrow_mut().dispatches += 4;
+        Some(rail.resadd_out.clone())
+    }
+
+    /// Load one rail brick: xclbin, instruction stream, and the group-6/7 scratch BOs, whose sizes
+    /// differ by brick family (GEMMs take 1/4, casts 8/1, resadd 8/1 -- the sizes each runtime
+    /// sequence was generated against).
+    fn load_brick(&self, dir: &Path, stem: &str, tmp_len: usize, tr_len: usize) -> Brick {
+        let art = resolve_verified(dir, stem);
+        let kern = self
+            .dev
+            .load_kernel(art.xclbin.to_str().unwrap(), None)
+            .unwrap_or_else(|e| panic!("load {}: {e:?}", art.xclbin.display()));
+        let ib = std::fs::read(&art.insts).unwrap_or_else(|e| panic!("read {}: {e}", art.insts.display()));
+        let n = ib.len() / 4;
+        let instr = self.dev.alloc_bo(&kern, ib.len(), FLAG_CACHEABLE, kern.group_id(1).unwrap()).unwrap();
+        instr.write_bytes(&ib).unwrap();
+        instr.sync_to_device().unwrap();
+        let tmp = self.dev.alloc_bo(&kern, tmp_len, FLAG_HOST_ONLY, kern.group_id(6).unwrap()).unwrap();
+        let tr = self.dev.alloc_bo(&kern, tr_len, FLAG_HOST_ONLY, kern.group_id(7).unwrap()).unwrap();
+        Brick { kern, instr, n, tmp, tr }
+    }
+
+    /// The LN-less GELU FFN rail, loaded on first use and cached tri-state like `resident_ln`.
+    /// `None` (and no retry) when the artifacts are absent, so a tree that has not built them keeps
+    /// the host FFN. Four bricks hold four of the driver's hardware-context slots for as long as
+    /// this `NpuMatmul` lives, which is why the load is demand-driven rather than done in `open`.
+    fn resident_k768(&self) -> Option<Rc<K768Rail>> {
+        if let Some(cached) = self.k768.borrow().as_ref() {
+            return cached.clone();
+        }
+        let (pad_m, kres, dff) = (self.pad_m, self.kres, self.dff);
+        let kaug = kres + K768_KAUG_BLOCK;
+        let stems = [
+            format!("{pad_m}x{kaug}x{dff}_{K768_FC1_TILE}_8c_modalgelu"),
+            format!("cast_{pad_m}x{dff}"),
+            format!("{pad_m}x{dff}x{kres}_{K768_FC2_TILE}_8c_modalid"),
+            format!("resadd_{pad_m}x{kres}_s100"),
+        ];
+        let present = stems.iter().all(|st| {
+            kernel_registry::xclbin_path(&self.k768_dir, st).exists()
+                && kernel_registry::insts_path(&self.k768_dir, st).exists()
+        });
+        let result = if present {
+            let fc1 = self.load_brick(&self.k768_dir, &stems[0], 1, 4);
+            let cast_h = self.load_brick(&self.k768_dir, &stems[1], 8, 1);
+            let fc2 = self.load_brick(&self.k768_dir, &stems[2], 1, 4);
+            let resadd = self.load_brick(&self.k768_dir, &stems[3], 8, 1);
+            let bo = |k: &Rc<Kernel>, len: usize, g: i32| {
+                self.dev.alloc_bo(k, len, FLAG_HOST_ONLY, k.group_id(g).unwrap()).unwrap()
+            };
+            Some(Rc::new(K768Rail {
+                fc1_a: bo(&fc1.kern, pad_m * kaug * 2, 3),
+                fc1_c: bo(&fc1.kern, pad_m * dff * 4, 5),
+                cast_h_out: bo(&cast_h.kern, pad_m * dff * 2, 4),
+                cast_h_d5: bo(&cast_h.kern, 1, 5),
+                fc2_c: bo(&fc2.kern, pad_m * kres * 4, 5),
+                resadd_a: bo(&resadd.kern, pad_m * kres * 4, 3),
+                resadd_out: Rc::new(bo(&resadd.kern, pad_m * kres * 4, 5)),
+                fc1,
+                cast_h,
+                fc2,
+                resadd,
+                kaug,
+            }))
+        } else {
+            if !npu_xrt::quiet() {
+                eprintln!(
+                    "[npu] K={kres} GELU rail absent in {} -- resident_ffn_nonorm stays on host (build it with PAD_M={pad_m} scripts/build_k768_gelu_rail.sh)",
+                    self.k768_dir.display()
+                );
+            }
+            None
+        };
+        *self.k768.borrow_mut() = Some(result.clone());
+        result
     }
 
     /// Host-readback wrapper over [`Self::resident_ffn_dev`] for the FFN-boundary gate
@@ -2622,6 +2841,79 @@ impl NpuMatmul {
             }
         }
         Some(out)
+    }
+
+    /// Device-parity self-test for the K=768 GELU rail: runs the whole four-brick chain on
+    /// synthetic weights and returns `(host truth, device out)` as `[t, KRES]`, so the COMPOSITION
+    /// is gateable without model weights -- `scripts/verify_k768_gelu_rail.py` scores the bricks
+    /// one at a time and cannot see a mis-chained one. The host side is fed what the device is fed
+    /// (bf16 A and W, f32 accumulate, the same tanh-approximation GELU, bf16 h), so what is left in
+    /// the residual is the bfp16 GEMM's error and not a formula mismatch. `None` when the rail is
+    /// not built.
+    ///
+    /// Returns the CONTROLS too -- the same chain scored under the epilogues it is not supposed to
+    /// have run. The epilogue lives in the instruction stream, not the xclbin, so "the rail is
+    /// correct" and "the rail dispatched the wrong mode" differ only in which oracle wins; a
+    /// residual against one oracle cannot tell them apart.
+    #[allow(clippy::type_complexity)]
+    pub fn k768_ffn_selftest(
+        &self, t: usize, seed: u64,
+    ) -> Option<(Array2<f32>, Array2<f32>, Vec<(&'static str, Array2<f32>)>)> {
+        let (kres, dff) = (self.kres, self.dff);
+        self.resident_k768()?;
+        let fill = |rows: usize, cols: usize, sd: u64, sc: f32| -> Array2<f32> {
+            let mut s = sd.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            Array2::from_shape_fn((rows, cols), |_| {
+                s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                let mut z = s; z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB); z ^= z >> 31;
+                ((z >> 40) as f32 / (1u32 << 24) as f32 * 2.0 - 1.0) * sc
+            })
+        };
+        // unit-scale x: a transformer FFN sees LN'd activations, so this is the real input regime.
+        let x = fill(t, kres, seed, 1.0);
+        let w1 = fill(kres, dff, seed ^ 0xC3, 1.0 / (kres as f32).sqrt());
+        let b1: Vec<f32> = fill(1, dff, seed ^ 0xE5, 0.1).iter().copied().collect();
+        let w2 = fill(dff, kres, seed ^ 0xD4, 1.0 / (dff as f32).sqrt());
+        let b2: Vec<f32> = fill(1, kres, seed ^ 0xF6, 0.1).iter().copied().collect();
+
+        let bf = |a: &Array2<f32>| -> Array2<f32> {
+            a.mapv(|v| npu_xrt::bf16_bits_to_f32(npu_xrt::f32_to_bf16_bits(v)))
+        };
+        // tanh approximation, matching the modal epilogue kernel (and the gate script's oracle).
+        let gelu = |v: f32| {
+            0.5 * v * (1.0 + (0.797_884_56_f32 * (v + 0.044_715 * v * v * v)).tanh())
+        };
+        let xb = bf(&x);
+        let b1b: Vec<f32> = b1.iter().map(|&v| npu_xrt::bf16_bits_to_f32(npu_xrt::f32_to_bf16_bits(v))).collect();
+        // fc1's pre-activation is shared by every oracle -- only the epilogue and what follows differ.
+        let mut pre1 = xb.dot(&bf(&w1));
+        for mut row in pre1.rows_mut() {
+            for (c, v) in row.iter_mut().enumerate() { *v += b1b[c]; }
+        }
+        let w2b = bf(&w2);
+        let oracle = |f: fn(f32) -> f32| -> Array2<f32> {
+            let l2 = bf(&bf(&pre1.mapv(f)).dot(&w2b));
+            let mut o = &x + &l2;
+            for mut row in o.rows_mut() {
+                for (c, v) in row.iter_mut().enumerate() { *v += b2[c]; }
+            }
+            o
+        };
+        let host = oracle(gelu);
+        let controls = vec![
+            ("silu", oracle(|v| v / (1.0 + (-v.clamp(-80.0, 80.0)).exp()))),
+            ("identity", oracle(|v| v)),
+        ];
+
+        let (w1d, w2d) = (w1, w2);
+        let out = self.resident_ffn_nonorm_hostx(
+            &x,
+            move || w1d, &b1, "selftest.k768.fc1",
+            move || w2d, &b2, "selftest.k768.fc2",
+            Act::Gelu,
+        )?;
+        Some((host, self.readback_stream(&out, t), controls))
     }
 
     /// Device-parity self-test for Task 1 (on-device fc2 accumulation). Runs [`Self::resident_ffn`]
@@ -2863,16 +3155,22 @@ impl NpuMatmul {
     }
 
     fn weight_bo(&self, id: &str, b_km: ArrayView2<f32>) -> Rc<Bo> {
+        self.weight_bo_on(&self.kern, id, b_km)
+    }
+
+    /// [`Self::weight_bo`] against a chosen kernel's group 4, for rail bricks that are their own
+    /// xclbin rather than the resident one. Same wcache/ncache keying, so a `id` is packed once.
+    fn weight_bo_on(&self, kern: &Kernel, id: &str, b_km: ArrayView2<f32>) -> Rc<Bo> {
         if let Some(bo) = self.wcache.borrow().get(id) {
             return bo.clone();
         }
         let t0 = Instant::now();
         let (k, n) = b_km.dim();
-        let g4 = self.kern.group_id(4).unwrap();
+        let g4 = kern.group_id(4).unwrap();
         let b_std = b_km.as_standard_layout();
         let mut bits = vec![0u16; k * n];
         npu_xrt::pack_f32_to_bf16(b_std.as_slice().unwrap(), &mut bits);
-        let bo = self.dev.alloc_bo(&self.kern, k * n * 2, FLAG_HOST_ONLY, g4).unwrap();
+        let bo = self.dev.alloc_bo(kern, k * n * 2, FLAG_HOST_ONLY, g4).unwrap();
         bo.write_bytes(u16_bytes(&bits)).unwrap();
         bo.sync_to_device().unwrap();
         self.stats.borrow_mut().weight_load_s += t0.elapsed().as_secs_f64();
