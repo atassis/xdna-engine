@@ -17,6 +17,12 @@ Discovered port deltas (keep this list as the canonical record):
      whose design.py the deep-C patch already ported, so this delta surfaced only when GEMM was first
      built on the new stack for the lever-3 batching probe). We rename the kwarg at call time so the
      unported GEMM design.py runs unchanged. No-op on the old stack (this branch never runs there).
+  4. Xilinx/mlir-aie#3387 reworked Runtime into a callback body and moved fill/drain off it onto the
+     ObjectFifo handle, so `Runtime.fill`/`Runtime.drain` no longer exist and patching them raised
+     AttributeError at IMPORT -- which took down every scratchpad probe that imports this shim.
+     Per-transfer placement moved to `.prod()/.cons()`, and the handle's fill/drain take no `tile=`
+     at all, so there is nothing for delta 2 to rename there. The patch list is applied by
+     attribute-presence rather than pruned, because this shim spans both sides of #3387.
 """
 import functools
 import sys
@@ -60,6 +66,8 @@ except ImportError:
     from aie.iron.worker import Worker
     from aie.iron import Runtime
 
+    # Present-only: post-#3387 Runtime has neither fill nor drain (delta 4). An absent name here
+    # means the API moved, which is this shim's subject -- not a silent failure to paper over.
     for _cls, _meth in (
         (ObjectFifoHandle, "split"),
         (ObjectFifoHandle, "join"),
@@ -68,7 +76,9 @@ except ImportError:
         (Runtime, "fill"),
         (Runtime, "drain"),
     ):
-        setattr(_cls, _meth, _rename_placement(getattr(_cls, _meth)))
+        _fn = getattr(_cls, _meth, None)
+        if _fn is not None:
+            setattr(_cls, _meth, _rename_placement(_fn))
 
     # Delta 3: the device method `get_num_connections(tile, output)` was removed from the aie.iron
     # device object between the e4f35d6 wheel (Mar-2026, HAS it) and current upstream (Jun, removed it);
