@@ -209,12 +209,18 @@ static inline void mm_gelu_epilogue_f32o(const float *__restrict pC_in,
                                          float *__restrict pC_out) {
   event0();
   static_assert(size % 16 == 0, "tile size must be a multiple of 16");
-  // NOTE (2026-06-28): a full-f32 polynomial GELU here recovers the RU precision in theory but HANGS
-  // on-device ("run_matmul8: kernel run did not complete") -- f32 elementwise/transcendental ops are NOT
-  // free on this bf16-native unit (the cube + tanh + finish in f32 blow the cycle budget; both the pure-f32
-  // and the f32-cube+bf16-tanh hybrid timed out). So this stays the bf16 tanh-approx (fast, ships). The
-  // bf16 GELU costs RU +0.4 (whisper-resident-ffn-wer-gate); recovering it needs a bf16-NATIVE precision
-  // trick (e.g. keep the cube in the f32 accumulator without full-f32 vectors), parked as kernel R&D.
+  // The body is bf16 because a full-f32 polynomial GELU HANGS on-device ("run_matmul8: kernel run
+  // did not complete") -- the cube + tanh + finish in f32 blow the cycle budget on this bf16-native
+  // unit, as does the f32-cube + bf16-tanh hybrid.
+  //
+  // Isolated against its own f32 input (rtp[0]=0 is a pure copy, so it yields the exact pC_in), this
+  // loop scores 6.5e-03 against a host f32 GELU; aie::tanh is ~7.9x off bf16 representability and
+  // owns most of that. Do NOT rank a change here by Whisper's `encoded` rel: that gate sits behind
+  // ln_post, which divides out a scale error, so it prefers the truncating form this swap replaces
+  // even though every per-block rel says otherwise.
+  //
+  // crRnd is one sticky per-core register shared with the matmul, hence the restore on exit.
+  const auto saved_rounding = aie::swap_rounding(aie::rounding_mode::conv_even);
   const aie::vector<bfloat16, 16> half = aie::broadcast<bfloat16, 16>(0.5f);
   const aie::vector<bfloat16, 16> one = aie::broadcast<bfloat16, 16>(1.0f);
   const aie::vector<bfloat16, 16> c0 = aie::broadcast<bfloat16, 16>(0.7978845608f); // sqrt(2/pi)
@@ -243,6 +249,7 @@ static inline void mm_gelu_epilogue_f32o(const float *__restrict pC_in,
     aie::store_v(out_ptr, oacc.to_vector<float>());
     out_ptr += 16;
   }
+  aie::set_rounding(saved_rounding);
   event1();
 }
 
