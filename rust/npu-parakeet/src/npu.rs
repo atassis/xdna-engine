@@ -433,6 +433,25 @@ struct ResidualAdd {
 const K768_KAUG_BLOCK: usize = 32;
 const K768_FC1_TILE: &str = "64x32x128";
 const K768_FC2_TILE: &str = "64x32x96"; // N=kres=768 = 96*8, so the epilogue's (m*n)%16==0 holds
+const K768_SUBDIR: &str = "artifacts/k768_gelu_rail";
+
+/// The rail's four brick stems in schedule order: fc1 `modalgelu`, cast@dff, fc2 `modalid`, resadd.
+/// `resident_k768` loads exactly these and [`NpuMatmul::k768_rail_built`] probes them, so the stem
+/// format has one definition rather than one per caller.
+fn k768_stems(pad_m: usize, kres: usize, dff: usize) -> [String; 4] {
+    let kaug = kres + K768_KAUG_BLOCK;
+    [
+        format!("{pad_m}x{kaug}x{dff}_{K768_FC1_TILE}_8c_modalgelu"),
+        format!("cast_{pad_m}x{dff}"),
+        format!("{pad_m}x{dff}x{kres}_{K768_FC2_TILE}_8c_modalid"),
+        format!("resadd_{pad_m}x{kres}_s100"),
+    ]
+}
+
+/// Both files a stem needs to be dispatchable: the xclbin and its runtime instruction stream.
+fn stem_present(dir: &Path, stem: &str) -> bool {
+    kernel_registry::xclbin_path(dir, stem).exists() && kernel_registry::insts_path(dir, stem).exists()
+}
 
 /// One separately-built brick of a resident rail: its own xclbin, its own instruction stream, and
 /// the group-6/7 scratch BOs every whole_array-family runtime sequence takes. Bricks are distinct
@@ -781,7 +800,7 @@ impl NpuMatmul {
             conveyor: RefCell::new(None),
             ln_dir: root.join("artifacts/parakeet/ln"),
             resident_ln: RefCell::new(None),
-            k768_dir: root.join("artifacts/k768_gelu_rail"),
+            k768_dir: root.join(K768_SUBDIR),
             k768: RefCell::new(None),
             stats: RefCell::new(NpuStats::default()),
         }
@@ -1602,6 +1621,17 @@ impl NpuMatmul {
     /// present). Lets `feed_forward` default to the resident path and fall back to host otherwise.
     pub fn resident_ff_available(&self) -> bool {
         self.modal && self.resident_ln().is_some()
+    }
+
+    /// Whether the K=`kres` GELU rail is built under `root` at this width, checked BEFORE opening a
+    /// rail-configured `NpuMatmul`. `open_with_rail` resolves fc1 as its resident and PANICS if that
+    /// xclbin is missing, so a caller that wants a host fallback (the encoder seam) cannot discover
+    /// absence by constructing one. `resident_k768` returns None for the same shortfall once open,
+    /// hence both directories: the four bricks it loads, plus fc1 where the resident is resolved.
+    pub fn k768_rail_built(root: &Path, kres: usize, pad_m: usize, dff: usize) -> bool {
+        let stems = k768_stems(pad_m, kres, dff);
+        stems.iter().all(|st| stem_present(&root.join(K768_SUBDIR), st))
+            && stem_present(&root.join(WA_SUBDIR), &stems[0])
     }
 
     /// Capability accessors: the resident rail's baked contraction/padding/inner dims. A K=768
@@ -2775,16 +2805,8 @@ impl NpuMatmul {
         }
         let (pad_m, kres, dff) = (self.pad_m, self.kres, self.dff);
         let kaug = kres + K768_KAUG_BLOCK;
-        let stems = [
-            format!("{pad_m}x{kaug}x{dff}_{K768_FC1_TILE}_8c_modalgelu"),
-            format!("cast_{pad_m}x{dff}"),
-            format!("{pad_m}x{dff}x{kres}_{K768_FC2_TILE}_8c_modalid"),
-            format!("resadd_{pad_m}x{kres}_s100"),
-        ];
-        let present = stems.iter().all(|st| {
-            kernel_registry::xclbin_path(&self.k768_dir, st).exists()
-                && kernel_registry::insts_path(&self.k768_dir, st).exists()
-        });
+        let stems = k768_stems(pad_m, kres, dff);
+        let present = stems.iter().all(|st| stem_present(&self.k768_dir, st));
         let result = if present {
             let fc1 = self.load_brick(&self.k768_dir, &stems[0], 1, 4);
             let cast_h = self.load_brick(&self.k768_dir, &stems[1], 8, 1);

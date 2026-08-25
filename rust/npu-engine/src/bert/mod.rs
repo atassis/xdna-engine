@@ -31,12 +31,18 @@ impl EmbedPipeline {
         );
         let frontend = EmbedFrontend::new(
             &root.join(&cfg.artifacts.tokenizer), weights.clone(), cfg.model.max_seq);
-        let encoder = BertEncoder::new(dev, root, &weights, cfg.model.n_heads, cfg.model.head_dim);
+        let encoder = BertEncoder::new(
+            dev, root, &weights, cfg.model.n_heads, cfg.model.head_dim, cfg.model.max_seq);
         let head = EmbedHead {
             pooling: Pooling::parse(&cfg.embeddings.pooling),
             normalize: cfg.embeddings.normalize,
         };
         Ok(EmbedPipeline { frontend, encoder, head })
+    }
+
+    /// The encoder, for gates that need to read its resident-rail dispatch counters.
+    pub fn encoder(&self) -> &BertEncoder {
+        &self.encoder
     }
 
     /// Full pipeline: text -> embedding vector.
