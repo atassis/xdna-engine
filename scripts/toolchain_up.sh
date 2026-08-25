@@ -100,16 +100,38 @@ _recognise_gorgon_point() {
   return 0
 }
 
+# Build the scratchpad host binding into an instance that predates the flag flip. Same self-healing
+# contract as _link_include_dirs: the warm path never re-runs cmake, so an instance configured with
+# AIE_ENABLE_XRT_PYTHON_BINDINGS=OFF would keep skipping every scratchpad test forever. Self-retiring
+# once the .so exists. Checks pybind11 FIRST -- reconfiguring without it is a CMake FATAL_ERROR, which
+# on the warm path would leave a half-updated cache on an instance that was working.
+_build_parameter_scratchpad() {
+  compgen -G "$INST/build/python/aie/_mlir_libs/_parameter_scratchpad*.so" >/dev/null 2>&1 && return 0
+  [ -f "$INST/build/CMakeCache.txt" ] || return 0
+  "$REPO/.venv-iron/bin/python" -c "import pybind11" 2>/dev/null || {
+    echo "[toolchain_up] WARN: pybind11 missing in .venv-iron -- scratchpad host binding not built;" >&2
+    echo "[toolchain_up]       aiecc still emits params.txt, but every scratchpad test will SKIP." >&2
+    return 0
+  }
+  echo "[toolchain_up] backfilling _parameter_scratchpad into $LOCKHASH ..." >&2
+  cmake -B "$INST/build" -S "$INST/src" -DAIE_ENABLE_XRT_PYTHON_BINDINGS=ON >&2 \
+    && ninja -C "$INST/build" _parameter_scratchpad >&2 \
+    || echo "[toolchain_up] WARN: scratchpad binding backfill failed; scratchpad tests will skip" >&2
+}
+
 if [ -f "$PYPKG" ] && grep -q "def resolve_program(self, device_name" "$PYPKG"; then
   _link_vendored_tools   # backfill vendored tools into already-built instances
   _link_include_dirs     # backfill include/ symlinks (aie_api + aie_kernels)
   _wire_peano_lit        # backfill the lit peano path (else `REQUIRES: peano` tests silently skip)
   _recognise_gorgon_point  # backfill the npu2 device-name entry (else every device runner raises)
+  _build_parameter_scratchpad  # backfill the scratchpad host binding (else scratchpad tests silently skip)
   touch "$INST"          # record last-used (for gc_instances keep-newest-N); warm path never GCs
   echo "$INST"; exit 0   # cached, self-consistent
 fi
 echo "[toolchain_up] building instance $LOCKHASH ..." >&2
-"$REPO/.venv-iron/bin/python" -m pip install -q "nanobind==$NANOBIND"
+# nanobind builds the MLIR bindings; pybind11 builds _parameter_scratchpad (below). Both are
+# configure-time hard requirements -- cmake FATAL_ERRORs without them.
+"$REPO/.venv-iron/bin/python" -m pip install -q "nanobind==$NANOBIND" pybind11
 mkdir -p "$INST"
 # Source = a CLEAN checkout of the fork integration-branch commit (NO dirty working tree); the route_b kernels
 # are overlaid by sync_kernels (policy B). The prebuilt MLIR distro + cmake helpers come from the submodule.
@@ -140,6 +162,11 @@ if [ ! -e "$SRC/tools/aiecc/aiecc.cpp" ]; then
   done
   bash "$REPO/scripts/sync_kernels.sh" "$SRC" >&2
 fi
+# AIE_ENABLE_XRT_PYTHON_BINDINGS=ON builds _parameter_scratchpad, the host side of runtime
+# scratchpad params. Despite the option name the module is XRT-free (TEST_UTILS_USE_XRT=0, raw
+# buffer), and DISABLE_FIND_PACKAGE_XRT below does not suppress it -- XRT_COREUTIL/UUID come from
+# find_library, so the cmake_dependent_option guarding it holds. OFF emitted params.txt with
+# nothing able to read it, so every scratchpad test skipped rather than failed.
 cmake -G Ninja -B "$INST/build" -S "$SRC" \
   -DCMAKE_BUILD_TYPE=Release \
   -DPython3_EXECUTABLE="$REPO/.venv-iron/bin/python" \
@@ -150,7 +177,7 @@ cmake -G Ninja -B "$INST/build" -S "$SRC" \
   -DLLVM_INCLUDE_TESTS=OFF -DLLVM_USE_LINKER=lld \
   -DCMAKE_DISABLE_FIND_PACKAGE_XRT=ON -DCMAKE_DISABLE_FIND_PACKAGE_hsa-runtime64=ON \
   -DCMAKE_DISABLE_FIND_PACKAGE_aiebu=ON \
-  -DAIE_ENABLE_XRT_PYTHON_BINDINGS=OFF \
+  -DAIE_ENABLE_XRT_PYTHON_BINDINGS=ON \
   -DPEANO_INSTALL_DIR="$REPO/.venv-iron/lib/python3.14/site-packages/llvm-aie" \
   -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache >&2
 ninja -C "$INST/build" AIEPythonModules aiecc aie-opt >&2
