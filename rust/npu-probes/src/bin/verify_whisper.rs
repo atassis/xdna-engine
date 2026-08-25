@@ -80,7 +80,21 @@ fn main() {
     // Pre-norm LayerNorm renormalizes this away — the make-or-break quantity is the post-LN
     // `encoded` (gate 3). On the host f32 path the per-block gate stays strict (it's a real test).
     let block_gates = backend != "npu";
+    #[cfg(feature = "npu")]
+    let rail_before = enc.resident_ffn_stats();
     let outs = enc.forward_collect(&after_conv);
+    // WHISPER_RESIDENT_FFN: the rail falls back to the ctx2 FFN silently, so matching activations
+    // are also what a rail that never dispatched would produce. Count the bricks instead.
+    #[cfg(feature = "npu")]
+    if let (Some((c0, d0)), Some((c1, d1))) = (rail_before, enc.resident_ffn_stats()) {
+        let (dc, dd) = (c1 - c0, d1 - d0);
+        let want = enc.cfg.n_layers;
+        println!("[k768_rail] {dc}/{want} blocks dispatched, {dd} bricks ({} per block)",
+                 if dc > 0 { dd / dc } else { 0 });
+        if dc != want || dd != 4 * want {
+            fails.push(format!("k768_rail dispatched {dc}/{want} blocks, {dd} bricks (want {})", 4 * want));
+        }
+    }
     let mut worst = 0f32;
     for (i, out) in outs.iter().enumerate() {
         let rb = rel(out, &as2(w.ref_tensor(&format!("block_{i}"))));

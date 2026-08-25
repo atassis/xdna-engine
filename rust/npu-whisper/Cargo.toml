@@ -12,7 +12,7 @@ path = "src/lib.rs"
 # `npu`: route the encoder's per-token linear projections through the XDNA2 NPU via the shared
 # ctx2 K=768 kernel (attention/LN/GELU stay on host). Off by default so the host f32 reference
 # builds without XRT (CI / other branches).
-npu = ["dep:npu-xrt", "dep:npu-asr"]
+npu = ["dep:npu-xrt", "dep:npu-asr", "dep:npu-parakeet"]
 
 [dependencies]
 ndarray = "0.16"
@@ -20,4 +20,7 @@ ndarray-npy = { version = "0.9", default-features = false }
 npu-asr-host = { path = "../npu-asr-host" }
 npu-xrt = { path = "../npu-xrt", optional = true }
 npu-asr = { path = "../npu-asr", features = ["two_ctx"], optional = true }
+# WHISPER_RESIDENT_FFN: the K=768 GELU rail lives on npu-parakeet's NpuMatmul. No cycle --
+# npu-parakeet depends on npu-asr/npu-weights/npu-xrt, never on this crate.
+npu-parakeet = { path = "../npu-parakeet", features = ["npu"], optional = true }
 

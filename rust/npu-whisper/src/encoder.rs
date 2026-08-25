@@ -43,6 +43,11 @@ macro_rules! timed {
     }};
 }
 
+/// Rail widths the K=768 GELU bricks are built at (`scripts/build_k768_gelu_rail.sh` PAD_M). The
+/// rail pads every dispatch to one fixed width, so the encoder takes the narrowest that covers T.
+#[cfg(feature = "npu")]
+const K768_BUILT_WIDTHS: [usize; 4] = [256, 512, 1024, 1536];
+
 pub struct WhisperEncoder {
     pub cfg: WhisperCfg,
     w: WhisperWeights,
@@ -58,6 +63,15 @@ pub struct WhisperEncoder {
     // 512x768x768 band) instead of host im2col_conv1d. GELU/transpose stay host. Gated; default None.
     #[cfg(feature = "npu")]
     conv_npu: Option<npu_asr::conv_npu::ConvNpu>,
+    // WHISPER_RESIDENT_FFN=1: the whole FFN sublayer as the K=768 GELU rail -- fc1 modalgelu ->
+    // cast@3072 -> fc2 modalid -> resadd, with the intermediate AND the residual add on device, so
+    // the block output comes back once. PAD_M=1536 covers T=1500. Gated; default None (host/ctx2).
+    //
+    // Distinct from NPU_ENC_FFN_RESIDENT, which keeps the fc1->fc2 intermediate resident across the
+    // ctx2 ops but still returns f_out for a host residual add. Both target the same seam by
+    // different mechanisms; the rail additionally owns the residual. Do not enable both.
+    #[cfg(feature = "npu")]
+    k768_rail: Option<std::rc::Rc<npu_parakeet::npu::NpuMatmul>>,
 }
 
 impl WhisperEncoder {
@@ -75,6 +89,8 @@ impl WhisperEncoder {
             mha_npu: None,
             #[cfg(feature = "npu")]
             conv_npu: None,
+            #[cfg(feature = "npu")]
+            k768_rail: None,
         }
     }
 
@@ -142,6 +158,31 @@ impl WhisperEncoder {
             None
         };
 
+        // WHISPER_RESIDENT_FFN=1: the K=768 GELU rail, one shared NpuMatmul for all blocks. Built at
+        // the narrowest width covering the conv stem's T (1500 -> PAD_M=1536). Absence of the
+        // artifacts is a fallback, not an error -- but open_with_rail PANICS on a missing resident
+        // xclbin, so the built-check has to come first.
+        let k768_rail = if std::env::var("WHISPER_RESIDENT_FFN").as_deref() == Ok("1") {
+            use npu_parakeet::npu::NpuMatmul;
+            // T is the conv stem's output length, which is not in WhisperCfg -- the positional
+            // table is sized to exactly max source positions, so it is the authority for the width.
+            let t_max = w.conv().get("embed_positions").shape()[0];
+            match K768_BUILT_WIDTHS.iter().copied().find(|&width| width >= t_max) {
+                Some(pm) if NpuMatmul::k768_rail_built(root, 768, pm, 3072) => {
+                    Some(std::rc::Rc::new(NpuMatmul::open_with_rail(root, 768, pm, 3072)))
+                }
+                _ => {
+                    eprintln!(
+                        "[whisper] WHISPER_RESIDENT_FFN=1 but the K=768 rail is not built for \
+                         T={t_max} -- staying on the ctx2 FFN (scripts/build_k768_gelu_rail.sh)"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         WhisperEncoder {
             cfg,
             w,
@@ -149,11 +190,21 @@ impl WhisperEncoder {
             block_ops,
             mha_npu,
             conv_npu,
+            k768_rail,
         }
     }
 
     pub fn weights(&self) -> &WhisperWeights {
         &self.w
+    }
+
+    /// `(calls, dispatches)` the K=768 rail has recorded, or None when no rail is wired. The rail
+    /// falls back to the ctx2 FFN silently, so a gate that only scores activations cannot tell a
+    /// correct rail from one that never ran -- it has to read this.
+    #[cfg(feature = "npu")]
+    pub fn resident_ffn_stats(&self) -> Option<(usize, usize)> {
+        let s = self.k768_rail.as_ref()?.stats.borrow();
+        Some((s.calls, s.dispatches))
     }
 
     /// The NPU device this encoder opened (when built via `new_npu`), so a co-resident decoder can
@@ -297,6 +348,26 @@ impl WhisperEncoder {
 
         // --- feed-forward sublayer ---
         let ln2 = timed!("ln", layer_norm(&x, b.v("ln2.weight").as_slice().unwrap(), b.v("ln2.bias").as_slice().unwrap(), LN_EPS));
+
+        // K=768 GELU rail (WHISPER_RESIDENT_FFN=1): the whole sublayer, residual included, on device.
+        // PRE-norm, so fc1's input and the residual operand are DIFFERENT arrays -- (ln2, x). This
+        // returns the block output directly rather than an f_out, since the resadd already ran.
+        // Weights are cloned lazily by id, once per block on the rail's cache miss.
+        #[cfg(feature = "npu")]
+        if let Some(rail) = &self.k768_rail {
+            if m <= rail.resident_pad_m() {
+                let out = timed!("ffn_rail", rail.resident_ffn_resid_hostx(
+                    &ln2, &x,
+                    || b.m("fc1.weight"), b.v("fc1.bias").as_slice().unwrap(), &format!("whisper.l{i}.fc1"),
+                    || b.m("fc2.weight"), b.v("fc2.bias").as_slice().unwrap(), &format!("whisper.l{i}.fc2"),
+                    npu_parakeet::npu::Act::Gelu,
+                ));
+                if let Some(y) = out {
+                    return rail.readback_stream(&y, m);
+                }
+            }
+        }
+
         let f_out;
         if use_npu {
             #[cfg(feature = "npu")]

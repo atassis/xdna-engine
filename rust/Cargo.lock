@@ -1113,6 +1113,7 @@ dependencies = [
  "ndarray-npy",
  "npu-asr",
  "npu-asr-host",
+ "npu-parakeet",
  "npu-xrt",
 ]
 
