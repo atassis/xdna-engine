@@ -15,7 +15,7 @@ while read -r local_ref local_sha remote_ref remote_sha; do
   fi
   for c in $revs; do
     changed=$(git diff-tree --no-commit-id --name-only -r "$c" \
-              | grep -vE '^hooks/pre-push$|^\.githooks-install\.md$' || true)
+              | grep -vE '^hooks/pre-push(-fork)?$|^\.githooks-install\.md$' || true)
     if printf '%s\n' "$changed" | grep -Eq "$forbidden_paths"; then
       echo "BLOCKED: $c touches a forbidden private path"; fail=1
     fi
