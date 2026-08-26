@@ -134,8 +134,7 @@ int shim_run_matmul8(ShimKernel* k, unsigned int opcode, ShimBo* instr, size_t i
   GUARD_INT(
     auto run = k->kern(opcode, instr->bo, instr_count,
                        a->bo, b->bo, c->bo, tmp->bo, trace->bo);
-    ert_cmd_state st = run.wait();
-    if (st != ERT_CMD_STATE_COMPLETED) { set_err("kernel run did not complete"); return -1; }
+    run.wait2();
     return 0;
   )
 }
@@ -144,8 +143,7 @@ int shim_run_dwconv6(ShimKernel* k, unsigned int opcode, ShimBo* instr, size_t i
                      ShimBo* x, ShimBo* w, ShimBo* y) {
   GUARD_INT(
     auto run = k->kern(opcode, instr->bo, instr_count, x->bo, w->bo, y->bo);
-    ert_cmd_state st = run.wait();
-    if (st != ERT_CMD_STATE_COMPLETED) { set_err("kernel run did not complete"); return -1; }
+    run.wait2();
     return 0;
   )
 }
@@ -156,8 +154,7 @@ int shim_run_mha7(ShimKernel* k, unsigned int opcode, ShimBo* instr, size_t inst
                   ShimBo* q, ShimBo* kk, ShimBo* v, ShimBo* o) {
   GUARD_INT(
     auto run = k->kern(opcode, instr->bo, instr_count, q->bo, kk->bo, v->bo, o->bo);
-    ert_cmd_state st = run.wait();
-    if (st != ERT_CMD_STATE_COMPLETED) { set_err("kernel run did not complete"); return -1; }
+    run.wait2();
     return 0;
   )
 }
@@ -168,8 +165,7 @@ int shim_run_bd8(ShimKernel* k, unsigned int opcode, ShimBo* instr, size_t instr
                  ShimBo* qpv, ShimBo* p, ShimBo* kk, ShimBo* v, ShimBo* ctx) {
   GUARD_INT(
     auto run = k->kern(opcode, instr->bo, instr_count, qpv->bo, p->bo, kk->bo, v->bo, ctx->bo);
-    ert_cmd_state st = run.wait();
-    if (st != ERT_CMD_STATE_COMPLETED) { set_err("kernel run did not complete"); return -1; }
+    run.wait2();
     return 0;
   )
 }
@@ -189,8 +185,7 @@ ShimRun* shim_run_matmul8_start(ShimKernel* k, unsigned int opcode, ShimBo* inst
 
 int shim_run_wait(ShimRun* r) {
   GUARD_INT(
-    ert_cmd_state st = r->run.wait();
-    if (st != ERT_CMD_STATE_COMPLETED) { set_err("kernel run did not complete"); return -1; }
+    r->run.wait2();
     return 0;
   )
 }
@@ -236,8 +231,7 @@ int shim_run_elf(ShimElfKernel* k, ShimBo* const* bos, size_t n_bos) {
       run.set_arg(static_cast<int>(i), bos[i]->bo);
     }
     run.start();
-    ert_cmd_state st = run.wait();
-    if (st != ERT_CMD_STATE_COMPLETED) { set_err("elf run did not complete"); return -1; }
+    run.wait2();
     return 0;
   )
 }
@@ -307,8 +301,7 @@ int shim_run_elf2(ShimElfKernel2* k, ShimBo* const* bos, size_t n_bos) {
       run.set_arg(static_cast<int>(i), bos[i]->bo);
     }
     run.start();
-    ert_cmd_state st = run.wait();
-    if (st != ERT_CMD_STATE_COMPLETED) { set_err("elf2 run did not complete"); return -1; }
+    run.wait2();
     return 0;
   )
 }
@@ -375,8 +368,7 @@ int shim_elf_resident_dispatch(ShimElfResident* r) {
   GUARD_INT(
     r->scratchpad.sync(XCL_BO_SYNC_BO_TO_DEVICE);
     r->run.start();
-    ert_cmd_state st = r->run.wait();
-    if (st != ERT_CMD_STATE_COMPLETED) { set_err("resident run did not complete"); return -1; }
+    r->run.wait2();
     return 0;
   )
 }
