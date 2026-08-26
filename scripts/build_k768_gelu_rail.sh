@@ -93,4 +93,3 @@ echo "Staged K=768 GELU resident-rail xclbins -> $OUTDIR"
 ls -la "$OUTDIR/" || true
 echo
 echo "NEXT (device session): validate rel-L2 vs host truth, then wire under BertEncoder."
-echo "Turnkey: xdna-engine-private/journal/docs/handoffs/active/2026-07-17-k768-gelu-rail-device.md"

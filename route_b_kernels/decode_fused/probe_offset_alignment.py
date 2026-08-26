@@ -15,7 +15,7 @@ elements (128 bytes), so every arm it runs is aligned. Odd element offsets are t
 
 bf16 only. The f32 control this probe was written with cannot run here: the fused sequence path is
 bf16-only in four hardcodings, so no f32 operator can be fused at all (measured 2026-08-25, all four
-byte/element spellings rejected at two gates -- [[fused-mlir-operator-path-is-bf16-only]]). Run it
+byte/element spellings rejected at two gates). Run it
 off fusion if the control is ever wanted.
 
 Usage: python probe_offset_alignment.py
