@@ -1,0 +1,7 @@
+[
+  {"name": "process_name", "ph": "M", "pid": 0, "args": {"name": "core_trace for tile2,0"}},
+  {"name": "thread_name", "ph": "M", "pid": 0, "tid": 0, "args": {"name": "INSTR_VECTOR"}},
+  {"name": "INSTR_VECTOR", "ts": 0, "ph": "B", "pid": 0, "tid": 0, "args": {}},
+  {"name": "INSTR_VECTOR", "ts": 8, "ph": "E", "pid": 0, "tid": 0, "args": {}},
+  {"name": "INSTR_VECTOR", "ts": 8, "ph": "B", "pid": 0, "tid": 0, "args": {}}
+]

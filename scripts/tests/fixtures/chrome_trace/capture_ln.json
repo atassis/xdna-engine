@@ -1,0 +1,11 @@
+[
+  {"name": "process_name", "ph": "M", "pid": 0, "args": {"name": "core_trace for tile2,0"}},
+  {"name": "thread_name", "ph": "M", "pid": 0, "tid": 0, "args": {"name": "INSTR_VECTOR"}},
+  {"name": "thread_name", "ph": "M", "pid": 0, "tid": 1, "args": {"name": "LOCK_STALL"}},
+  {"name": "INSTR_VECTOR", "ts": 0, "ph": "B", "pid": 0, "tid": 0, "args": {}},
+  {"name": "INSTR_VECTOR", "ts": 10, "ph": "E", "pid": 0, "tid": 0, "args": {}},
+  {"name": "LOCK_STALL", "ts": 10, "ph": "B", "pid": 0, "tid": 1, "args": {}},
+  {"name": "LOCK_STALL", "ts": 15, "ph": "E", "pid": 0, "tid": 1, "args": {}},
+  {"name": "INSTR_VECTOR", "ts": 15, "ph": "B", "pid": 0, "tid": 0, "args": {}},
+  {"name": "INSTR_VECTOR", "ts": 25, "ph": "E", "pid": 0, "tid": 0, "args": {}}
+]
