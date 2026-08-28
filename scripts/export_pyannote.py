@@ -48,7 +48,7 @@ def fetch_yaml(url):
         return yaml.safe_load(r.read())
 
 pipe_cfg = fetch_yaml(PIPELINE_CFG)
-emb_cfg = fetch_yaml(EMBED_CFG)
+emb_cfg = fetch_yaml(EMBED_CFG)   # fetched for provenance/diffing only; hparams win
 clus = pipe_cfg["params"]["clustering"]
 seg_params = pipe_cfg["params"]["segmentation"]
 pipe_params = pipe_cfg["pipeline"]["params"]
@@ -66,12 +66,29 @@ torch.onnx.export(seg, x, f"{OUT}/segmentation.onnx", input_names=["waveform"],
                   dynamic_axes={"waveform": {0: "batch"}, "logits": {0: "batch"}})
 print(f"segmentation.onnx: {dur}s -> [{n_frames}, {n_classes}]")
 # 589 frames is the derived expectation (SincNet strides); a mismatch means the checkpoint moved.
-assert n_classes == 7, f"expected 7 powerset classes, got {n_classes}"
+n_speakers = len(seg.specifications.classes)
+max_per_frame = int(seg.specifications.powerset_max_classes)
+# The Rust POWERSET_3 table hardcodes the 3-speaker / max-2-per-frame layout. Assert the checkpoint
+# still matches it here, where the model is in hand -- otherwise the decode silently maps classes to
+# the wrong speaker sets and every downstream number is quietly wrong.
+from math import comb
+expect = sum(comb(n_speakers, k) for k in range(max_per_frame + 1))
+assert (n_speakers, max_per_frame) == (3, 2), (
+    f"checkpoint is {n_speakers} speakers / max {max_per_frame} per frame; "
+    f"npu-engine's POWERSET_3 table assumes 3/2 and must be regenerated")
+assert n_classes == expect == 7, f"expected {expect} powerset classes, got {n_classes}"
+print(f"powerset: {n_speakers} speakers, max {max_per_frame}/frame -> {n_classes} classes")
 
 # ---- embedder: traceable fbank + resnet, weights in --------------------------------------------
 emb = Model.from_pretrained("pyannote/wespeaker-voxceleb-resnet34-LM", use_auth_token=token).eval()
-NUM_MEL = int(emb_cfg["num_mel_bins"]); FLEN = float(emb_cfg["frame_length"])
-FSHIFT = float(emb_cfg["frame_shift"]); WIN = emb_cfg.get("window_type", "hamming")
+# Read the feature params off the LOADED model, not by parsing config.yaml: the published YAML
+# nests them under a `model:` key, and more importantly the checkpoint's own hparams are the real
+# provenance -- a config the loader ignored would be the wrong number attached to the right name.
+_h = dict(emb.hparams)
+NUM_MEL = int(_h["num_mel_bins"]); FLEN = float(_h["frame_length"])
+FSHIFT = float(_h["frame_shift"]); WIN = str(_h["window_type"])
+USE_ENERGY = bool(_h.get("use_energy", False)); DITHER = float(_h.get("dither", 0.0))
+assert int(_h["sample_rate"]) == SR, f"embedder wants {_h['sample_rate']} Hz, pipeline is {SR}"
 
 class TraceableFbank(nn.Module):
     """kaldi-compatible fbank in plain torch ops, so the graph traces.
@@ -141,8 +158,7 @@ with torch.no_grad():
     ours = fbank_mod(probe)[0]
     theirs = kaldi.fbank(probe * 32768.0, num_mel_bins=NUM_MEL, frame_length=FLEN,
                          frame_shift=FSHIFT, sample_frequency=SR, window_type=WIN,
-                         dither=0.0, use_energy=bool(emb_cfg.get("use_energy", False)),
-                         snip_edges=True)
+                         dither=DITHER, use_energy=USE_ENERGY, snip_edges=True)
 n = min(ours.shape[0], theirs.shape[0])
 rel = ((ours[:n] - theirs[:n]).abs().max() / theirs[:n].abs().max().clamp(min=1e-6)).item()
 print(f"fbank max rel diff vs kaldi: {rel:.3e}  (ours {tuple(ours.shape)} kaldi {tuple(theirs.shape)})")
@@ -180,7 +196,8 @@ manifest = {
         "onnx": "segmentation.onnx", "duration_s": dur,
         # 0.1 x duration is a SpeakerDiarization.__init__ default; it is in no config.yaml.
         "step_s": round(0.1 * dur, 6),
-        "max_speakers_per_chunk": int(seg.specifications.max_speakers_per_chunk),
+        "max_speakers_per_chunk": n_speakers,
+        "max_speakers_per_frame": max_per_frame,
         "powerset_classes": n_classes,
         "n_frames": n_frames,
         "source": "pyannote/segmentation-3.0 (HF, gated); step_s from pyannote-audio "
@@ -189,7 +206,7 @@ manifest = {
     "embedding": {
         "onnx": "embedding.onnx", "dim": dim, "num_mel_bins": NUM_MEL,
         "frame_length_ms": FLEN, "frame_shift_ms": FSHIFT, "n_frames": n_emb_frames,
-        "source": "pyannote/wespeaker-voxceleb-resnet34-LM config.yaml (fbank params); "
+        "source": "pyannote/wespeaker-voxceleb-resnet34-LM checkpoint hparams (fbank params); "
                   f"dim + TSTP pooling hardcoded in pyannote-audio {PYANNOTE_REV} source",
     },
     "clustering": {
