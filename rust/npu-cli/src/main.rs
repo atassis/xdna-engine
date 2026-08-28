@@ -4,6 +4,8 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 
+mod media;
+
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 use npu_runtime::actor::{start, start_lazy};
@@ -32,6 +34,32 @@ enum Cmd {
     },
     /// One-shot transcription of a 16 kHz mono 16-bit WAV.
     Transcribe { wav: PathBuf, #[arg(long)] model: Option<String> },
+    /// Transcribe a media file (video or audio) to a speaker-attributed transcript FILE.
+    ///
+    /// Every audio track is handled independently -- diarized, transcribed and labelled from its
+    /// own metadata -- then merged onto one timeline. That covers a mixed track, one track per
+    /// participant, and mic-plus-system-audio without having to know which it is.
+    TranscribeMedia {
+        input: PathBuf,
+        /// Output file. Defaults to <input> with the format's extension.
+        #[arg(long, short)] out: Option<PathBuf>,
+        #[arg(long, default_value = "md")] format: String,
+        /// ASR model name; omit to use the configured asr default.
+        #[arg(long)] asr: Option<String>,
+        /// Diarization model name; omit to use the configured diarize default.
+        #[arg(long)] diarize: Option<String>,
+        /// Only this audio track (0-based among audio streams). Default: all of them.
+        #[arg(long)] track: Option<usize>,
+        /// Skip diarization; label every utterance by its track. Faster, no speaker split.
+        #[arg(long)] no_diarize: bool,
+    },
+    /// Speaker diarization of a 16 kHz mono 16-bit WAV: who spoke when.
+    Diarize {
+        wav: PathBuf,
+        #[arg(long)] model: Option<String>,
+        /// Emit the same JSON body the HTTP route returns, instead of readable lines.
+        #[arg(long)] json: bool,
+    },
     /// One-shot embedding of a text string.
     /// `allow_hyphen_values`: the text to embed is prose, and prose begins with `-` all the time
     /// (every Markdown bullet). Without it clap read a bullet as an unknown flag and failed with a
@@ -69,6 +97,10 @@ fn main() -> Result<()> {
         Cmd::Serve { port, allow_degraded } => serve(&path, *port, *allow_degraded),
         Cmd::Transcribe { wav, model } => transcribe(&path, wav, model.as_deref()),
         Cmd::Embed { text, model } => embed(&path, text, model.as_deref()),
+        Cmd::Diarize { wav, model, json } => diarize(&path, wav, model.as_deref(), *json),
+        Cmd::TranscribeMedia { input, out, format, asr, diarize: diar, track, no_diarize } =>
+            transcribe_media(&path, input, out.as_deref(), format, asr.as_deref(),
+                             diar.as_deref(), *track, *no_diarize),
         Cmd::Models { port } => models(&path, *port),
         Cmd::Reload { port } => reload(&path, *port),
         Cmd::Bake { name } => bake(&path, name),
@@ -187,6 +219,124 @@ fn transcribe(path: &Path, wav: &Path, model: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// Shortest span worth sending to ASR. Below this a "segment" is a diarization edge artefact and
+/// the transcript gains a line of noise, not a word.
+const MIN_UTTERANCE_S: f32 = 0.30;
+
+#[allow(clippy::too_many_arguments)]
+fn transcribe_media(path: &Path, input: &Path, out: Option<&Path>, format: &str,
+                    asr: Option<&str>, diar: Option<&str>, only_track: Option<usize>,
+                    no_diarize: bool) -> Result<()> {
+    quiet_one_shot();
+    let cfg = load_cfg(path)?;
+    let root = root(&cfg)?;
+    let tracks = media::probe_audio_tracks(input)?;
+    if tracks.is_empty() { bail!("{} has no audio tracks", input.display()); }
+    let wanted: Vec<&media::AudioTrack> = match only_track {
+        Some(n) => tracks.iter().filter(|t| t.ord == n).collect(),
+        None => tracks.iter().collect(),
+    };
+    if wanted.is_empty() {
+        bail!("no audio track {} in {} (it has {})", only_track.unwrap(), input.display(), tracks.len());
+    }
+    eprintln!("[npu] {} audio track(s): {}", wanted.len(),
+        wanted.iter().map(|t| t.label()).collect::<Vec<_>>().join(", "));
+
+    // One actor for the whole run: the models stay resident across tracks and segments instead of
+    // reloading per call. `max_resident` must be >= 2 for asr + diarize to coexist.
+    let (handle, join) = start_lazy(cfg, Box::new(EngineLoader { root }))?;
+    let tmp = std::env::temp_dir().join(format!("npu-media-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).context("temp dir")?;
+
+    let result = (|| -> Result<Vec<media::Utterance>> {
+        let mut utts: Vec<media::Utterance> = Vec::new();
+        for t in &wanted {
+            let wav = tmp.join(format!("track{}.wav", t.ord));
+            media::extract_track(input, t.ord, &wav)?;
+            let bytes = std::fs::read(&wav).with_context(|| format!("read {}", wav.display()))?;
+            let pcm = http::parse::parse_wav_i16(&bytes)
+                .ok_or_else(|| anyhow!("track {} did not decode to 16k mono 16-bit", t.ord))?;
+            let label = t.label();
+
+            // Spans to transcribe: diarized turns, or the whole track when diarization is off.
+            let spans: Vec<(f32, f32, u32)> = if no_diarize {
+                vec![(0.0, pcm.len() as f32 / 16_000.0, 0)]
+            } else {
+                handle.diarize(diar, pcm.clone(), 16_000)
+                    .map_err(|e| anyhow!("diarize track {}: {e}", t.ord))?
+                    .value.iter().map(|s| (s.start_s, s.end_s, s.speaker)).collect()
+            };
+            let n_spk = spans.iter().map(|s| s.2).collect::<std::collections::BTreeSet<_>>().len();
+            eprintln!("[npu] {label}: {} span(s), {n_spk} speaker(s)", spans.len());
+
+            for (start_s, end_s, spk) in spans {
+                if end_s - start_s < MIN_UTTERANCE_S { continue }
+                // Slice the PCM directly rather than re-invoking ffmpeg per span: the samples are
+                // already in memory and a subprocess per utterance would dominate the runtime.
+                let (a, b) = ((start_s * 16_000.0) as usize, (end_s * 16_000.0) as usize);
+                let slice = pcm[a.min(pcm.len())..b.min(pcm.len())].to_vec();
+                if slice.is_empty() { continue }
+                let text = handle.transcribe(asr, slice, 16_000)
+                    .map_err(|e| anyhow!("transcribe {label} [{start_s:.2}-{end_s:.2}]: {e}"))?
+                    .value.trim().to_string();
+                if text.is_empty() { continue }
+                utts.push(media::Utterance {
+                    start_s, end_s,
+                    speaker: media::speaker_label(&label, spk, n_spk),
+                    text,
+                });
+            }
+        }
+        // All tracks share the recording's clock, so the merge is chronological, not per-track.
+        utts.sort_by(|x, y| x.start_s.partial_cmp(&y.start_s).unwrap_or(std::cmp::Ordering::Equal));
+        Ok(utts)
+    })();
+
+    handle.shutdown(); let _ = join.join();
+    let _ = std::fs::remove_dir_all(&tmp);
+    let utts = result?;
+
+    let ext = match format { "srt" => "srt", "json" => "json", "txt" => "txt", _ => "md" };
+    let out_path = match out {
+        Some(p) => p.to_path_buf(),
+        None => input.with_extension(ext),
+    };
+    let body = media::render(&utts, format, &input.display().to_string())?;
+    std::fs::write(&out_path, body).with_context(|| format!("write {}", out_path.display()))?;
+    println!("{} ({} utterances)", out_path.display(), utts.len());
+    Ok(())
+}
+
+fn diarize(path: &Path, wav: &Path, model: Option<&str>, json: bool) -> Result<()> {
+    quiet_one_shot();
+    let cfg = load_cfg(path)?;
+    let root = root(&cfg)?;
+    // Lazy, same reason as `transcribe`: a one-shot run loads the model it serves and nothing else.
+    let (handle, join) = start_lazy(cfg, Box::new(EngineLoader { root }))?;
+    let bytes = std::fs::read(wav).with_context(|| format!("read {}", wav.display()))?;
+    let samples = http::parse::parse_wav_i16(&bytes)
+        .ok_or_else(|| anyhow!("bad wav (need 16k mono 16-bit)"))?;
+    let out = handle.diarize(model, samples, 16_000).map_err(|e| anyhow!(e.to_string()));
+    handle.shutdown(); let _ = join.join();
+    println!("{}", render_segments(&out?.value, json));
+    Ok(())
+}
+
+/// Human lines by default, the HTTP JSON body under `--json`. Pure, so it is testable without a
+/// device, a model or a server.
+fn render_segments(segs: &[npu_engine::capability::Segment], json: bool) -> String {
+    if json {
+        let items: Vec<String> = segs.iter().map(|s| format!(
+            "{{\"start\":{:.3},\"end\":{:.3},\"speaker\":\"SPEAKER_{:02}\"}}",
+            s.start_s, s.end_s, s.speaker)).collect();
+        return format!("{{\"segments\":[{}]}}", items.join(","));
+    }
+    segs.iter()
+        .map(|s| format!("[{:.2} - {:.2}] SPEAKER_{:02}", s.start_s, s.end_s, s.speaker))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn embed(path: &Path, text: &str, model: Option<&str>) -> Result<()> {
     quiet_one_shot();
     let cfg = load_cfg(path)?;
@@ -301,5 +451,26 @@ mod tests {
         assert!(r.contains("asr=parakeet") && r.contains("tts=kokoro"), "{r}");
         assert!(r.contains("idle_unload_s 900") && r.contains("idle_release_s 1800")
             && r.contains("evict_policy lru"), "{r}");
+    }
+
+    #[test]
+    fn diarize_lines_are_human_readable_and_json_is_machine_readable() {
+        let segs = vec![
+            npu_engine::capability::Segment { start_s: 0.5, end_s: 3.25, speaker: 0 },
+            npu_engine::capability::Segment { start_s: 3.25, end_s: 9.0, speaker: 1 },
+        ];
+        let lines = render_segments(&segs, false);
+        assert_eq!(lines.lines().count(), 2, "{lines}");
+        assert!(lines.starts_with("[0.50 - 3.25] SPEAKER_00"), "{lines}");
+        assert!(lines.contains("[3.25 - 9.00] SPEAKER_01"), "{lines}");
+        let json = render_segments(&segs, true);
+        assert!(json.starts_with('{') && json.contains("\"segments\""), "{json}");
+        assert!(json.contains("\"speaker\":\"SPEAKER_01\""), "{json}");
+    }
+
+    #[test]
+    fn an_empty_diarization_renders_without_panicking() {
+        assert_eq!(render_segments(&[], false), "");
+        assert!(render_segments(&[], true).contains("\"segments\":[]"));
     }
 }

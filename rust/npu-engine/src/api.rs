@@ -7,11 +7,15 @@ use crate::pipeline::Scenario;
 
 /// What a loaded model does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ModelKind { Asr, Embed }
+pub enum ModelKind { Asr, Embed, Diarize }
 
 impl std::fmt::Display for ModelKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self { ModelKind::Asr => "asr", ModelKind::Embed => "embed" })
+        f.write_str(match self {
+            ModelKind::Asr => "asr",
+            ModelKind::Embed => "embed",
+            ModelKind::Diarize => "diarize",
+        })
     }
 }
 
@@ -24,6 +28,7 @@ impl ModelKind {
         match s {
             "asr" => Some(ModelKind::Asr),
             "embeddings" => Some(ModelKind::Embed),
+            "diarize" => Some(ModelKind::Diarize),
             _ => None,
         }
     }
@@ -35,6 +40,7 @@ impl ModelKind {
         match self {
             ModelKind::Asr => crate::capability::Capability::ASR,
             ModelKind::Embed => crate::capability::Capability::EMBED,
+            ModelKind::Diarize => crate::capability::Capability::DIARIZE,
         }
     }
 }
@@ -73,7 +79,9 @@ impl Engine {
 /// single instance must not be driven concurrently (the service serializes; the NPU is single-tenant).
 pub struct Model {
     scen: Scenario,
-    hidden: usize,
+    /// Configured hidden size, when the scenario has a `[model]` block at all. `None` for a
+    /// non-transformer model, which is exactly when `embed_dim` has nothing to report.
+    hidden: Option<usize>,
 }
 
 impl Model {
@@ -89,18 +97,18 @@ impl Model {
     pub fn load_in(scenario: impl AsRef<Path>, root: impl AsRef<Path>) -> Result<Model, EngineError> {
         let cfg = crate::config::ScenarioConfig::load(scenario.as_ref())
             .map_err(|e| EngineError::Load(format!("scenario {}: {e}", scenario.as_ref().display())))?;
-        let hidden = cfg.model.hidden;
+        let hidden = cfg.model.as_ref().map(|m| m.hidden);
         let scen = crate::registry::try_build(scenario.as_ref(), root.as_ref())?;
         Ok(Model { scen, hidden })
     }
 
     pub fn kind(&self) -> ModelKind {
-        match self.scen { Scenario::Asr(_) => ModelKind::Asr, Scenario::Embed(_) => ModelKind::Embed }
+        kind_of(&self.scen)
     }
 
     /// Embedding output dimension for an embed model (= configured hidden size); None for ASR.
     pub fn embed_dim(&self) -> Option<usize> {
-        match self.scen { Scenario::Embed(_) => Some(self.hidden), Scenario::Asr(_) => None }
+        match self.scen { Scenario::Embed(_) => self.hidden, _ => None }
     }
 
     /// ASR: 16 kHz mono i16 PCM -> text.
@@ -110,8 +118,8 @@ impl Model {
         }
         match &self.scen {
             Scenario::Asr(m) => m.transcribe(pcm),
-            Scenario::Embed(_) => Err(EngineError::WrongKind {
-                wanted: ModelKind::Asr.capability(), got: ModelKind::Embed.capability() }),
+            other => Err(EngineError::WrongKind {
+                wanted: ModelKind::Asr.capability(), got: kind_of(other).capability() }),
         }
     }
 
@@ -119,13 +127,36 @@ impl Model {
     pub fn embed(&self, text: &str) -> Result<Vec<f32>, EngineError> {
         match &self.scen {
             Scenario::Embed(m) => m.embed_one(text.to_string()),
-            Scenario::Asr(_) => Err(EngineError::WrongKind {
-                wanted: ModelKind::Embed.capability(), got: ModelKind::Asr.capability() }),
+            other => Err(EngineError::WrongKind {
+                wanted: ModelKind::Embed.capability(), got: kind_of(other).capability() }),
         }
     }
 
     pub fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EngineError> {
         texts.iter().map(|t| self.embed(t)).collect()
+    }
+
+    /// Diarization: 16 kHz mono i16 PCM -> speaker-attributed spans.
+    pub fn diarize(&self, pcm: &[i16], sample_rate: u32)
+        -> Result<Vec<crate::capability::Segment>, EngineError> {
+        if sample_rate != 16_000 {
+            return Err(EngineError::Unsupported(format!("sample_rate {sample_rate} (need 16000)")));
+        }
+        match &self.scen {
+            Scenario::Diarize(m) => m.diarize(pcm),
+            other => Err(EngineError::WrongKind {
+                wanted: ModelKind::Diarize.capability(), got: kind_of(other).capability() }),
+        }
+    }
+}
+
+/// The kind of a scenario without needing a `Model`. Keeps every mismatch arm above from having to
+/// re-match all three variants.
+fn kind_of(s: &Scenario) -> ModelKind {
+    match s {
+        Scenario::Asr(_) => ModelKind::Asr,
+        Scenario::Embed(_) => ModelKind::Embed,
+        Scenario::Diarize(_) => ModelKind::Diarize,
     }
 }
 
@@ -150,5 +181,16 @@ mod tests {
             Err(other) => panic!("expected Load error, got {other:?}"),
             Ok(_) => panic!("expected an error loading a missing scenario"),
         }
+    }
+
+    #[test]
+    fn diarize_is_a_model_kind_that_routes_and_refuses_the_other_two() {
+        assert_eq!(ModelKind::Diarize.to_string(), "diarize");
+        assert_eq!(ModelKind::from_scenario_kind("diarize"), Some(ModelKind::Diarize));
+        assert_eq!(ModelKind::Diarize.capability(), crate::capability::Capability::DIARIZE);
+        // The existing two are untouched -- this is the regression that matters.
+        assert_eq!(ModelKind::from_scenario_kind("asr"), Some(ModelKind::Asr));
+        assert_eq!(ModelKind::from_scenario_kind("embeddings"), Some(ModelKind::Embed));
+        assert_eq!(ModelKind::from_scenario_kind("nope"), None);
     }
 }

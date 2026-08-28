@@ -1,0 +1,14 @@
+# Speaker diarization. No [model] block: PyanNet and ResNet34 have none of the six transformer
+# fields, and every hyperparameter lives in the manifest with the upstream source it came from.
+#
+# NOTE: set `max_resident = 2` in engine.toml if you also serve ASR -- the default of 1 evicts
+# whichever model you did not just call, forcing a full reload on every alternating request.
+[scenario]
+kind = "diarize"
+name = "pyannote-speaker-diarization-3.1"
+
+[artifacts]
+weights = "artifacts/pyannote"
+
+[diarization]
+manifest = "artifacts/pyannote/diarize.json"

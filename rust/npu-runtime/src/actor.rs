@@ -9,7 +9,7 @@ use crate::loader::ModelLoader;
 use crate::reconcile::{reconcile, ReconcileReport};
 use crate::registry::{deep_release_due, release_free_memory, Capability, ModelStatus, Registry};
 use crate::select::resolve;
-use npu_engine::capability::{Request, Response};
+use npu_engine::capability::{Request, Response, Segment};
 use npu_engine::EngineError;
 
 /// Result carrying which model served (the echo).
@@ -266,6 +266,14 @@ impl Handle {
         match s.value {
             Response::Vector(v) => Ok(Served { model: s.model, value: v }),
             other => Err(wrong_shape(Capability::EMBED, &s.model, &other)),
+        }
+    }
+    pub fn diarize(&self, model: Option<&str>, pcm: Vec<i16>, sr: u32)
+        -> Result<Served<Vec<Segment>>, EngineError> {
+        let s = self.serve(Capability::DIARIZE, model, Request::Audio { pcm, sample_rate: sr })?;
+        match s.value {
+            Response::Segments(v) => Ok(Served { model: s.model, value: v }),
+            other => Err(wrong_shape(Capability::DIARIZE, &s.model, &other)),
         }
     }
     pub fn reconcile(&self, cfg: Config) -> Result<ReconcileReport, EngineError> {

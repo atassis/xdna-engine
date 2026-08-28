@@ -40,6 +40,7 @@ impl Capability {
     pub const GENERATE: Capability = Capability("generate");
     pub const TTS: Capability = Capability("tts");
     pub const IMAGE_SR: Capability = Capability("image-sr");
+    pub const DIARIZE: Capability = Capability("diarize");
 
     /// Every capability this binary can serve. `&'static str` is kept rather than widened to an
     /// owned string precisely because of this list: a capability name that no compiled-in model
@@ -47,7 +48,7 @@ impl Capability {
     /// that fails. Adding a capability is one const plus one entry HERE -- one file, versus the five
     /// (`api`, `pipeline`, `loader`, `actor`, `select`) that a `ModelKind` variant used to cost.
     pub const ALL: &'static [Capability] =
-        &[Self::ASR, Self::EMBED, Self::GENERATE, Self::TTS, Self::IMAGE_SR];
+        &[Self::ASR, Self::EMBED, Self::GENERATE, Self::TTS, Self::IMAGE_SR, Self::DIARIZE];
 
     /// Resolve a capability written in config -- an `/admin/defaults` body, a `?capability=` -- against
     /// `ALL`. `None` for a name nothing implements.
@@ -101,6 +102,16 @@ impl Request {
     }
 }
 
+/// One speaker-attributed span of a clip. `speaker` is a cluster INDEX, not a label -- the
+/// `SPEAKER_00` rendering belongs to the HTTP/CLI edge, so anything downstream (a future
+/// ASR-composition route) can still do arithmetic on it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Segment {
+    pub start_s: f32,
+    pub end_s: f32,
+    pub speaker: u32,
+}
+
 /// The response payload. Same rule as `Request`: shapes, earned per instance.
 #[derive(Debug)]
 pub enum Response {
@@ -115,6 +126,9 @@ pub enum Response {
     /// `SrEngine::upscale_rgb8`'s shape: interleaved RGB8 + the OUTPUT dims (upscaled, so these
     /// differ from the request's `w`/`h` by the schedule's integer scale factor).
     Image { rgb: Vec<u8>, w: usize, h: usize },
+    /// `Diarizer::diarize`'s shape: who spoke when. A distinct shape from `Text` because a
+    /// transcript and a speaker timeline are not interchangeable payloads.
+    Segments(Vec<Segment>),
 }
 
 impl Response {
@@ -125,6 +139,7 @@ impl Response {
             Response::Text(_) => "text",
             Response::Audio { .. } => "audio",
             Response::Image { .. } => "image",
+            Response::Segments(_) => "segments",
         }
     }
 }
@@ -177,5 +192,15 @@ mod tests {
         v.sort();
         assert_eq!(v, vec![Capability("embed"), Capability("image-sr")]);
         assert_ne!(Capability("embed"), Capability("image-sr"));
+    }
+
+    #[test]
+    fn diarize_is_a_resolvable_capability_with_its_own_response_shape() {
+        assert_eq!(Capability::from_name("diarize"), Some(Capability::DIARIZE));
+        assert!(Capability::ALL.contains(&Capability::DIARIZE),
+            "from_name searches ALL, so the const alone is not enough");
+        assert_eq!(Capability::from_scenario_kind("diarize"), Some(Capability::DIARIZE));
+        let r = Response::Segments(vec![Segment { start_s: 0.5, end_s: 3.25, speaker: 1 }]);
+        assert_eq!(r.shape(), "segments");
     }
 }

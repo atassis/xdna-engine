@@ -49,8 +49,9 @@ fn main() {
     // oracle: onnx session + a frontend reused only to get matching token ids
     let env = Env::new().expect("onnx env");
     let sess = Session::load(&env, root.join(&cfg.artifacts.onnx_ref).to_str().unwrap()).expect("onnx");
-    let weights = Rc::new(BertWeights::load(&root.join(&cfg.artifacts.weights), cfg.model.n_layers).unwrap());
-    let fe = EmbedFrontend::new(&root.join(&cfg.artifacts.tokenizer), weights, cfg.model.max_seq);
+    let m = cfg.model.as_ref().expect("verify_embeddings needs a [model] block");
+    let weights = Rc::new(BertWeights::load(&root.join(&cfg.artifacts.weights), m.n_layers).unwrap());
+    let fe = EmbedFrontend::new(&root.join(&cfg.artifacts.tokenizer), weights, m.max_seq);
 
     let mut worst = 1.0f32;
     for s in SENTENCES {
@@ -68,7 +69,7 @@ fn main() {
             ],
             &["last_hidden_state"],
         ).expect("onnx run");
-        let d = cfg.model.hidden;
+        let d = m.hidden;
         let oracle = pool_l2(out.f32(0), seq, d);
 
         let cos = cosine(&ours, &oracle);

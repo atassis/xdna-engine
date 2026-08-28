@@ -83,3 +83,27 @@ fn actor_serves_a_capability_with_no_typed_helper() {
     h.shutdown();
     join.join().unwrap();
 }
+
+/// The owner's constraint, pinned: adding a diarize capability cannot move the configured ASR
+/// default, and an unconfigured diarize request must fail loudly rather than fall back to the ASR
+/// model that happens to be resident.
+#[test]
+fn diarize_routes_by_capability_and_leaves_the_asr_default_alone() {
+    let mut table = BTreeMap::new();
+    table.insert("parakeet".to_string(), Ok((Capability::ASR, 1u64)));
+    let l = MockLoader { table };
+    let cfg = Config {
+        server: ServerCfg { max_resident: 2, ..Default::default() },
+        defaults: Defaults::from_pairs([(Capability::ASR, "parakeet".to_string())]),
+        models: vec![ModelCfg { name: "parakeet".into(), scenario: "x".into() }],
+    };
+    let (h, join) = start(cfg, Box::new(l)).unwrap();
+    let Err(e) = h.diarize(None, vec![0i16; 16], 16_000) else {
+        panic!("an unconfigured diarize capability must not resolve to the resident asr model");
+    };
+    assert!(e.to_string().contains("diarize"), "must name the missing capability, got: {e}");
+    assert!(h.transcribe(None, vec![0i16; 16], 16_000).is_ok(),
+        "the asr default must still resolve after a diarize capability exists");
+    h.shutdown();
+    let _ = join.join();
+}

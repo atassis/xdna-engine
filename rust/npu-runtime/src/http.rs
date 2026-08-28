@@ -82,6 +82,7 @@ pub fn route(req: &Request, handle: &Handle, cfg_path: &Path) -> Response {
         ("POST", "/v1/embeddings") => embeddings(req, handle),
         ("POST", "/v1/audio/speech") => audio_speech(req, handle),
         ("POST", "/v1/audio/transcriptions") => transcriptions(req, handle),
+        ("POST", "/v1/audio/diarizations") => diarizations(req, handle),
         ("POST", "/admin/reload") => admin_reload(handle, cfg_path),
         ("POST", "/admin/models") => admin_add_model(req, handle, cfg_path),
         ("POST", "/admin/defaults") => admin_set_default(req, handle, cfg_path),
@@ -212,6 +213,32 @@ fn transcriptions(req: &Request, handle: &Handle) -> Response {
             parse::json_escape(&s.value), parse::json_escape(&s.model)).into()),
         Err(e) => engine_err(&e),
     }
+}
+
+/// Speaker diarization. OpenAI has no diarization endpoint, so this mirrors the shape of our own
+/// `/v1/audio/transcriptions`: multipart `file` part + a `model` form field.
+fn diarizations(req: &Request, handle: &Handle) -> Response {
+    let wav = match parse::extract_file_part(&req.body, &req.boundary) {
+        Some(w) => w, None => return (400, "{\"error\":\"no file part\"}".into()),
+    };
+    let samples = match parse::parse_wav_i16(wav) {
+        Some(s) if !s.is_empty() => s,
+        _ => return (400, "{\"error\":\"bad wav (need 16k mono 16-bit)\"}".into()),
+    };
+    let model = parse::extract_form_field(&req.body, &req.boundary, "model");
+    match handle.diarize(model.as_deref(), samples, 16_000) {
+        Ok(s) => (200, segments_json(&s.model, &s.value).into()),
+        Err(e) => engine_err(&e),
+    }
+}
+
+/// Render segments. `speaker` is a cluster INDEX internally; the `SPEAKER_NN` label is produced
+/// here, at the edge, so nothing downstream has to parse a string back into a number.
+fn segments_json(model: &str, segs: &[npu_engine::capability::Segment]) -> String {
+    let items: Vec<String> = segs.iter().map(|s| format!(
+        "{{\"start\":{:.3},\"end\":{:.3},\"speaker\":\"SPEAKER_{:02}\"}}",
+        s.start_s, s.end_s, s.speaker)).collect();
+    format!("{{\"model\":\"{}\",\"segments\":[{}]}}", parse::json_escape(model), items.join(","))
 }
 
 fn admin_reload(handle: &Handle, cfg_path: &Path) -> Response {
@@ -896,5 +923,26 @@ mod route_tests {
         assert!(models.text().contains("\"id\":\"e5\",\"object\":\"model\",\"kind\":\"embed\",\"state\":\"loaded\""), "{models}");
         assert!(models.text().contains("\"idle_s\":null"), "the evicted model reports no idle time: {models}");
         h.shutdown(); j.join().unwrap();
+    }
+
+    #[test]
+    fn diarizations_renders_segments_as_labelled_spans() {
+        let segs = vec![
+            npu_engine::capability::Segment { start_s: 0.5, end_s: 3.25, speaker: 0 },
+            npu_engine::capability::Segment { start_s: 3.0, end_s: 4.0, speaker: 11 },
+        ];
+        let body = segments_json("pyannote-3.1", &segs);
+        assert!(body.contains("\"model\":\"pyannote-3.1\""), "{body}");
+        assert!(body.contains("\"start\":0.500"), "{body}");
+        assert!(body.contains("\"end\":3.250"), "{body}");
+        assert!(body.contains("\"speaker\":\"SPEAKER_00\""), "index 0 renders zero-padded: {body}");
+        assert!(body.contains("\"speaker\":\"SPEAKER_11\""), "{body}");
+        // Overlapping spans are legal and must both survive.
+        assert_eq!(body.matches("\"start\"").count(), 2, "{body}");
+    }
+
+    #[test]
+    fn an_empty_diarization_is_a_valid_empty_list_not_an_error() {
+        assert_eq!(segments_json("m", &[]), "{\"model\":\"m\",\"segments\":[]}");
     }
 }

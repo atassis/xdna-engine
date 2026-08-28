@@ -26,14 +26,14 @@ pub struct EsmEmbedPipeline {
 }
 impl EsmEmbedPipeline {
     pub fn build(cfg: &ScenarioConfig, root: &Path, dev: Rc<Device>) -> Result<Self, EngineError> {
+        let m = cfg.model_or_err().map_err(EngineError::Load)?;
         // Uniform declarative entry point: checkpoint (bake-on-missing) when artifacts.source is set,
         // else NPU_WEIGHTS_CHECKPOINT env, else the legacy npy dir -- all behind one call.
         let w = Rc::new(
-            EsmWeights::load_for(&cfg.artifacts, root, cfg.model.n_layers)
+            EsmWeights::load_for(&cfg.artifacts, root, m.n_layers)
                 .map_err(|e| EngineError::Load(format!("esm weights: {e}")))?,
         );
-        let frontend = Frontend_::new(w.clone(), cfg.model.max_seq);
-        let m = &cfg.model;
+        let frontend = Frontend_::new(w.clone(), m.max_seq);
         let encoder: Box<dyn Encoder> = if m.kernel == "native" {
             Box::new(EsmEncoderNative::new(dev, root, &w, m.hidden, m.ff, m.n_heads, m.head_dim))
         } else {

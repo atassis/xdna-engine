@@ -35,8 +35,15 @@ impl Servable for EngineModel {
     fn footprint(&self) -> u64 { 0 }
     fn run(&mut self, req: Request) -> Result<Response, EngineError> {
         match req {
-            Request::Audio { pcm, sample_rate } =>
-                self.model.transcribe(&pcm, sample_rate).map(Response::Text),
+            // Audio serves TWO capabilities, so this dispatches on the model's KIND. The compiler
+            // cannot catch a missing arm here -- the match is over `Request`, not `ModelKind` --
+            // so a diarize model would silently answer every request with a WrongKind error.
+            // loader::tests pins the diarize path for exactly that reason.
+            Request::Audio { pcm, sample_rate } => match self.model.kind() {
+                npu_engine::ModelKind::Diarize =>
+                    self.model.diarize(&pcm, sample_rate).map(Response::Segments),
+                _ => self.model.transcribe(&pcm, sample_rate).map(Response::Text),
+            },
             Request::Text(text) => self.model.embed(&text).map(Response::Vector),
             // Neither engine scenario takes an image, so this is a routing bug rather than a user
             // error -- but still a Result, because the actor must not be panicked by one.
@@ -95,5 +102,36 @@ pub mod mock {
         fn declared_capability(&self, cfg: &ModelCfg) -> Option<Capability> {
             match self.table.get(&cfg.name) { Some(Ok((c, _))) => Some(*c), _ => None }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use npu_engine::capability::{Request, Response, Segment};
+
+    /// A `Servable` standing in for a loaded diarize model, exercising the SHAPE contract the
+    /// EngineModel adapter must honour: audio in, segments out.
+    struct FakeDiarize;
+    impl Servable for FakeDiarize {
+        fn capabilities(&self) -> Capability { Capability::DIARIZE }
+        fn run(&mut self, req: Request) -> Result<Response, EngineError> {
+            match req {
+                Request::Audio { .. } =>
+                    Ok(Response::Segments(vec![Segment { start_s: 0.0, end_s: 1.0, speaker: 0 }])),
+                other => Err(EngineError::Unsupported(other.shape().into())),
+            }
+        }
+    }
+
+    #[test]
+    fn a_diarize_model_answers_audio_with_segments_not_wrong_kind() {
+        let mut m: Box<dyn Servable> = Box::new(FakeDiarize);
+        let out = m.run(Request::Audio { pcm: vec![0i16; 16], sample_rate: 16_000 })
+            .expect("audio to a diarize model must not be a WrongKind error");
+        assert_eq!(out.shape(), "segments",
+            "EngineModel::run dispatches Request::Audio on the model KIND; nothing in the type \
+             system enforces this, so this test is the guard");
+        assert_eq!(m.capabilities(), Capability::DIARIZE);
     }
 }

@@ -23,15 +23,16 @@ pub struct EmbedPipeline {
 
 impl EmbedPipeline {
     pub fn build(cfg: &ScenarioConfig, root: &Path, dev: Rc<Device>) -> Result<Self, EngineError> {
+        let m = cfg.model_or_err().map_err(EngineError::Load)?;
         // Uniform declarative entry point: checkpoint (bake-on-missing) when artifacts.source is set,
         // else the legacy npy dir -- all behind one call.
         let weights = Rc::new(
-            BertWeights::load_for(&cfg.artifacts, root, cfg.model.n_layers)
+            BertWeights::load_for(&cfg.artifacts, root, m.n_layers)
                 .map_err(|e| EngineError::Load(format!("bert weights: {e}")))?,
         );
         let frontend = EmbedFrontend::new(
-            &root.join(&cfg.artifacts.tokenizer), weights.clone(), cfg.model.max_seq);
-        let encoder = BertEncoder::new(dev, root, &weights, cfg.model.n_heads, cfg.model.head_dim);
+            &root.join(&cfg.artifacts.tokenizer), weights.clone(), m.max_seq);
+        let encoder = BertEncoder::new(dev, root, &weights, m.n_heads, m.head_dim);
         let head = EmbedHead {
             pooling: Pooling::parse(&cfg.embeddings.pooling),
             normalize: cfg.embeddings.normalize,

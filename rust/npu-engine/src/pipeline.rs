@@ -41,8 +41,15 @@ pub trait Embedder {
     fn embed_one(&self, text: String) -> Result<Vec<f32>, EngineError>;
 }
 
+/// Speaker diarization: PCM in, speaker-attributed spans out. Same `&self` shape as `AsrModel`;
+/// no interior mutability is needed because the ONNX sessions behind it are stateless per call.
+pub trait Diarizer {
+    fn diarize(&self, pcm: &[i16]) -> Result<Vec<crate::capability::Segment>, EngineError>;
+}
+
 /// One assembled, ready-to-serve pipeline. The registry returns this; `engine_serve` matches on it.
 pub enum Scenario {
     Asr(Box<dyn AsrModel>),
     Embed(Box<dyn Embedder>),
+    Diarize(Box<dyn Diarizer>),
 }
