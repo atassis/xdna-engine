@@ -285,6 +285,24 @@ fi  # end MODEL=gigaam artifact block
 # clean and then dies (or worse, serves nothing) at runtime. A re-pin silently broke the shipped
 # ASR service for five days exactly this way. So: resolve the whole chain here and refuse.
 # ---------------------------------------------------------------------------
+# 4a2. Replace any previously installed npu-weights with the deprecation shim
+# ---------------------------------------------------------------------------
+# The weight tooling moved into `npu weights`. A shim only helps if it is actually INSTALLED:
+# without this step an old npu-weights binary sits in ~/.local/bin doing the pre-fold thing
+# indefinitely, which is exactly the silent-stale-binary failure the shim exists to prevent.
+# (Observed: a July build still answering `--arena` months after that flag was renamed.)
+SHIM_BIN="$REPO/rust/target/release/npu-weights"
+if [ -f "$SHIM_BIN" ]; then
+  if [ -e "$ENGINE_BIN_DIR/npu-weights" ]; then
+    info "Replacing npu-weights with the deprecation shim (tooling moved to \`npu weights\`)"
+  fi
+  install -m 0755 "$SHIM_BIN" "$ENGINE_BIN_DIR/npu-weights"
+  ok "npu-weights -> shim that forwards to \`npu weights\`"
+else
+  warn "no npu-weights build at $SHIM_BIN; any stale copy in $ENGINE_BIN_DIR is left as-is"
+fi
+
+# ---------------------------------------------------------------------------
 # 4b. Stage the stable production root
 # ---------------------------------------------------------------------------
 # scenarios/ are COPIED (small, and a copy cannot be changed under the service by a checkout
@@ -394,6 +412,12 @@ mkdir -p "$UNIT_DIR"
 #   XDNA_ENGINE_ROOT           -> where the engine resolves artifacts/, scenarios/ and the NPU
 #                                 xclbins under mlir-aie/. Named EXPLICITLY so the service does
 #                                 not depend on a working directory or on any git checkout.
+#   NO WorkingDirectory        -> deliberately absent. Setting it as well as the env var made the
+#                                 service work while the CLI did not, because cwd happened to equal
+#                                 the root there; a real cwd dependency (relative scenario paths
+#                                 joined against cwd) survived unnoticed until someone ran the CLI
+#                                 from another directory. Leaving it unset means any such
+#                                 dependency fails HERE too, where it gets seen.
 cat > "$UNIT_PATH" <<EOF
 [Unit]
 Description=$DESC
@@ -404,9 +428,6 @@ After=graphical-session.target
 
 [Service]
 Type=simple
-# Set for belt-and-braces only: XDNA_ENGINE_ROOT below is what actually resolves paths, and this
-# points at the same stable prefix rather than at a checkout.
-WorkingDirectory=$ENGINE_ROOT
 # The engine's root for artifacts/, scenarios/ and the mlir-aie xclbins. npu-cli's root() reads
 # this before falling back to a scenario path or to cwd.
 Environment=XDNA_ENGINE_ROOT=$ENGINE_ROOT
