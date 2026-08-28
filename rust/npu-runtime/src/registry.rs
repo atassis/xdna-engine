@@ -50,6 +50,11 @@ pub fn deep_release_due(
     }
 }
 
+/// Status detail for a model the memory accountant could not weigh. Named rather than inlined
+/// because the test and the reader must agree on it, and because it should disappear the day
+/// `footprint()` returns real bytes.
+pub const UNWEIGHED: &str = "memory_ceiling not applied: footprint unmeasured";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoadState { Loaded, Failed, Unloaded }
 
@@ -137,7 +142,13 @@ impl Registry {
                     return;
                 }
                 let status = ModelStatus {
-                    name: cfg.name.clone(), state: LoadState::Loaded, detail: String::new(),
+                    name: cfg.name.clone(), state: LoadState::Loaded,
+                    // Say when the accountant could not weigh this model. `footprint()` returns 0
+                    // for every shipped model, so the check above is a no-op and the ceiling reads
+                    // as enforced while enforcing nothing -- which is how a memory failure reached
+                    // a service that advertised a bound against it. Reporting it is not a fix; it
+                    // is the difference between an unmeasured bound and a silent one.
+                    detail: if bo == 0 { UNWEIGHED.into() } else { String::new() },
                     capability: Some(m.capabilities()), bo_bytes: bo, idle_s: Some(0),
                 };
                 self.upsert(Entry { cfg: cfg.clone(), model: Some(m), status, last_used: now });
@@ -283,6 +294,70 @@ mod tests {
     use crate::loader::mock::MockLoader;
     use std::collections::BTreeMap;
     fn cfg(name: &str) -> ModelCfg { ModelCfg { name: name.into(), scenario: "x".into() } }
+    /// The accountant is INERT, and the engine has to say so.
+    ///
+    /// Every shipped model returns `footprint() == 0`, so `resident_bytes() + 0 > ceiling` can
+    /// never fire however small the ceiling. The bug is not the arithmetic, it is that a config
+    /// advertising `memory_ceiling_mb = 4096` read as a bound while bounding nothing -- which is
+    /// how a memory failure reached a service that claimed to prevent it.
+    #[test]
+    fn a_model_with_no_measured_footprint_loads_and_says_the_ceiling_did_not_apply() {
+        let mut t = BTreeMap::new();
+        t.insert("weightless".to_string(), Ok((Capability::EMBED, 0u64)));
+        let l = MockLoader { table: t };
+        let mut srv = ServerCfg::default();
+        srv.memory_ceiling_mb = 0;          // the tightest ceiling expressible
+        let mut r = Registry::default();
+        r.try_load(&cfg("weightless"), &l, &srv, Instant::now());
+        let s = r.status();
+        let m = s.iter().find(|x| x.name == "weightless").expect("status entry");
+        assert_eq!(m.state, LoadState::Loaded,
+            "a 0-byte footprint cannot exceed even a 0 MB ceiling, so it must load: {}", m.detail);
+        assert_eq!(m.detail, UNWEIGHED,
+            "loading unweighed must be VISIBLE, not silent: {:?}", m.detail);
+        assert_eq!(m.bo_bytes, 0);
+    }
+
+    /// ...and the arithmetic itself is correct, so the day footprints are measured the ceiling
+    /// starts working with no other change. Without this the test above would equally pass over a
+    /// check that had been deleted.
+    #[test]
+    fn a_model_that_reports_bytes_over_the_ceiling_is_refused() {
+        let mut t = BTreeMap::new();
+        t.insert("heavy".to_string(), Ok((Capability::EMBED, 3 * 1024 * 1024)));
+        let l = MockLoader { table: t };
+        let mut srv = ServerCfg::default();
+        srv.memory_ceiling_mb = 2;
+        let mut r = Registry::default();
+        r.try_load(&cfg("heavy"), &l, &srv, Instant::now());
+        let s = r.status();
+        let m = s.iter().find(|x| x.name == "heavy").expect("status entry");
+        assert_eq!(m.state, LoadState::Failed, "3 MB must not fit under a 2 MB ceiling");
+        assert!(m.detail.contains("memory_ceiling"), "the refusal must name the bound: {}", m.detail);
+        assert_ne!(m.detail, UNWEIGHED, "a weighed model must not be reported as unweighed");
+    }
+
+    /// The ceiling is a SUM over resident models, not a per-model test: two models that each fit
+    /// can still exceed it together. This is the case a per-model check would pass wrongly.
+    #[test]
+    fn the_ceiling_sums_across_resident_models() {
+        let mut t = BTreeMap::new();
+        t.insert("a".to_string(), Ok((Capability::EMBED, 3 * 1024 * 1024)));
+        t.insert("b".to_string(), Ok((Capability::EMBED, 3 * 1024 * 1024)));
+        let l = MockLoader { table: t };
+        let mut srv = ServerCfg::default();
+        srv.memory_ceiling_mb = 4;          // each fits alone; together they do not
+        srv.max_resident = 2;
+        let mut r = Registry::default();
+        let now = Instant::now();
+        r.try_load(&cfg("a"), &l, &srv, now);
+        r.try_load(&cfg("b"), &l, &srv, now);
+        let s = r.status();
+        assert_eq!(s.iter().find(|x| x.name == "a").unwrap().state, LoadState::Loaded);
+        let b = s.iter().find(|x| x.name == "b").unwrap();
+        assert_eq!(b.state, LoadState::Failed, "3 + 3 MB must not fit under 4 MB: {}", b.detail);
+    }
+
     fn loader(names: &[&str]) -> MockLoader {
         let mut t = BTreeMap::new();
         for n in names { t.insert((*n).to_string(), Ok((Capability::EMBED, 1))); }

@@ -394,7 +394,13 @@ fn config_cmd(path: &Path, action: &ConfigCmd) -> Result<()> {
 
 /// Human-readable config summary (pure, testable).
 fn render(cfg: &Config) -> String {
-    let mut s = format!("port {}  max_resident {}  memory_ceiling_mb {}\n",
+    // The ceiling's scope is printed with it. It bounds summed DEVICE-BO bytes, and a model that
+    // reports no footprint is exempt -- which today is every shipped model, so the number alone
+    // reads as a guarantee it does not give. The wording stays true once footprints are measured,
+    // rather than being an "inert" note that would go stale silently. `npu status` has the live
+    // per-model answer.
+    let mut s = format!("port {}  max_resident {}  memory_ceiling_mb {} (device BOs; \
+                         models reporting no footprint are exempt)\n",
         cfg.server.port, cfg.server.max_resident, cfg.server.memory_ceiling_mb);
     s.push_str(&format!("residency: idle_unload_s {}  idle_release_s {}  sweep_interval_s {}  evict_policy {}\n",
         cfg.server.idle_unload_s, cfg.server.idle_release_s, cfg.server.sweep_interval_s,
@@ -446,6 +452,12 @@ mod tests {
         assert!(r.contains("asr=parakeet") && r.contains("tts=kokoro"), "{r}");
         assert!(r.contains("idle_unload_s 900") && r.contains("idle_release_s 1800")
             && r.contains("evict_policy lru"), "{r}");
+        // The ceiling must not be printed as a bare number: it bounds device BOs, exempts models
+        // with no measured footprint, and today that is all of them. A reader who takes 4096 as a
+        // guarantee is the person a memory failure surprised.
+        assert!(r.contains("memory_ceiling_mb 4096"), "{r}");
+        assert!(r.contains("device BOs") && r.contains("no footprint are exempt"),
+            "the ceiling's scope must be printed with it: {r}");
     }
 
     #[test]
