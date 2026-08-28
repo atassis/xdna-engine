@@ -1,6 +1,7 @@
 //! Speaker diarization: who spoke when. Host-only in v1; the NPU embedder swaps in behind
 //! `SpeakerEmbedder` without touching the pipeline.
 
+pub mod cluster;
 pub mod powerset;
 pub mod stitch;
 pub mod types;
