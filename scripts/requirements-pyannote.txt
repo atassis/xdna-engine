@@ -1,0 +1,11 @@
+# Pinned deps for scripts/export_pyannote.py (py3.12, installed by setup_pyannote_venv.sh).
+# Versions verified 2026-08-28 to actually load pyannote/wespeaker-voxceleb-resnet34-LM on this
+# box; see setup_pyannote_venv.sh for what each upper bound is avoiding. torch is CPU-only by
+# policy (NPU-first: exports never touch CUDA).
+torch==2.5.1+cpu
+torchaudio==2.5.1+cpu
+pyannote.audio==3.3.2
+huggingface_hub<0.28
+onnx
+pyyaml
+matplotlib
