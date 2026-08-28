@@ -23,7 +23,39 @@ use std::path::Path;
 use ndarray::Array2;
 use npu_engine::diarize::onnx::{OnnxEmbedder, OnnxSegmenter};
 use npu_engine::diarize::types::{Clusterer, Manifest, Segmenter, SpeakerEmbedder};
+use npu_engine::diarize::{cluster, vbx};
 use npu_engine::diarize::{build_crops, powerset};
+
+/// The manifest's clusterer, built directly so the probe can run it on embeddings it chose --
+/// notably a REORDERED copy. Mirrors `clusterer_for`, which is private to the engine.
+fn clusterer_of(m: &Manifest, dir: &Path) -> Box<dyn Clusterer> {
+    match m.clustering.method.as_str() {
+        "vbx" => Box::new(vbx::VbxClusterer {
+            plda: vbx::Plda::load(m.clustering.plda.as_ref().expect("plda"), dir).expect("plda load"),
+            threshold: m.clustering.threshold as f32,
+            fa: m.clustering.fa as f32,
+            fb: m.clustering.fb as f32,
+            max_iters: m.clustering.max_iters.max(1),
+            init_smoothing: m.clustering.init_smoothing as f32,
+            lda_dim: m.clustering.lda_dim.max(1),
+        }),
+        _ => Box::new(cluster::AgglomerativeClusterer {
+            threshold: m.clustering.threshold as f32,
+            min_cluster_size: m.clustering.min_cluster_size,
+        }),
+    }
+}
+
+/// Rows of `e` in the given order.
+fn reorder(e: &Array2<f32>, order: &[usize]) -> Array2<f32> {
+    let mut out = Array2::<f32>::zeros((order.len(), e.ncols()));
+    for (r, &i) in order.iter().enumerate() {
+        for d in 0..e.ncols() { out[[r, d]] = e[[i, d]]; }
+    }
+    out
+}
+
+fn n_groups(v: &[u32]) -> usize { v.iter().collect::<std::collections::BTreeSet<_>>().len() }
 
 fn read_wav_i16(p: &Path) -> Vec<i16> {
     let b = std::fs::read(p).unwrap_or_else(|e| panic!("read {}: {e}", p.display()));
@@ -81,7 +113,7 @@ fn main() {
 
     println!("model {model}  clustering {}", m.clustering.method);
     println!("{:>12} {:>6} {:>6} {:>8} {:>8} {:>6} {:>4}  {}",
-             "clip", "wins", "crops", "minority", "min_frac", "sep", "spk", "minority crop start_s");
+             "clip", "wins", "crops", "minority", "min_frac", "sep", "spk", "k: fwd/rev/sorted");
     for path in &args {
         let p = Path::new(path);
         let pcm = read_wav_i16(p);
@@ -95,6 +127,19 @@ fn main() {
         let (minority, sep) = minority_of_two(&e);
         let spk = clu.run(&pcm).expect("diarize").iter()
             .map(|s| s.speaker).collect::<std::collections::BTreeSet<_>>().len();
+        // Does the ORDER of the crops change the answer? VBx is a Bayesian HMM over the crop
+        // SEQUENCE, so a minority block sitting at the end of that sequence is not obviously the
+        // same problem as one at the start -- and crops come out of build_crops in window order,
+        // so where a speaker talks IS where their crops sit in the sequence. If reversing flips a
+        // collapse, the mechanism is the sequence, not the amount of evidence.
+        let cl = clusterer_of(&m, &dir);
+        let fwd: Vec<usize> = (0..e.nrows()).collect();
+        let rev: Vec<usize> = (0..e.nrows()).rev().collect();
+        // A third order with no temporal meaning at all: minority rows first, then the rest.
+        let mut sorted: Vec<usize> = minority.clone();
+        sorted.extend((0..e.nrows()).filter(|i| !minority.contains(i)));
+        let k = |o: &[usize]| cl.cluster(&reorder(&e, o)).map(|v| n_groups(&v)).unwrap_or(0);
+        let (kf, kr, ks) = (k(&fwd), k(&rev), k(&sorted));
         let name = p.file_name().unwrap().to_string_lossy();
         // WHERE the minority crops sit is the second half of the question: a crop is a whole
         // window, so speech truncated by the clip edge yields crops that also carry the other
@@ -105,9 +150,9 @@ fn main() {
             (Some(a), Some(b)) => format!("{a:.0}-{b:.0}s"),
             _ => "-".into(),
         };
-        println!("{name:>12} {n_win:>6} {:>6} {:>8} {:>7.1}% {sep:>6.2} {spk:>4}  {span:>10}  {}",
+        println!("{name:>12} {n_win:>6} {:>6} {:>8} {:>7.1}% {sep:>6.2} {spk:>4}  {kf}/{kr}/{ks}  {span:>10}",
                  crops.len(), minority.len(),
-                 100.0 * minority.len() as f32 / crops.len() as f32,
-                 pos.iter().map(|x| format!("{x:.0}")).collect::<Vec<_>>().join(","));
+                 100.0 * minority.len() as f32 / crops.len() as f32);
+        let _ = pos;
     }
 }
