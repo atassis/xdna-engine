@@ -2,6 +2,7 @@
 //! `SpeakerEmbedder` without touching the pipeline.
 
 pub mod powerset;
+pub mod stitch;
 pub mod types;
 
 pub use types::{Crop, Manifest, Segmenter, SpeakerEmbedder};
