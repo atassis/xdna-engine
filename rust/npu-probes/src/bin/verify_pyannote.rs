@@ -22,7 +22,21 @@ use npu_engine::diarize::{onnx::OnnxSegmenter, types::Segmenter, DiarizePipeline
 #[derive(serde::Deserialize)]
 struct RefSeg { start: f32, end: f32, speaker: String }
 #[derive(serde::Deserialize)]
-struct RefSummary { n_speakers: usize, overlap_s: f32, segments: Vec<RefSeg> }
+struct RefSummary {
+    n_speakers: usize,
+    overlap_s: f32,
+    segments: Vec<RefSeg>,
+    /// Which pyannote pipeline produced this dump. Older dumps predate the field; the dumper only
+    /// ever ran 3.1, so that is the default rather than a guess.
+    #[serde(default = "default_ref_pipeline")]
+    pipeline: String,
+}
+fn default_ref_pipeline() -> String { "pyannote/speaker-diarization-3.1".to_string() }
+
+/// A constructed fixture's own truth, from `<clip>.json`. Model-independent, unlike the reference
+/// dump: the clip was BUILT from a known number of source voices, so it gates every model.
+#[derive(serde::Deserialize)]
+struct FixtureTruth { expect_speakers: usize }
 
 fn read_wav_i16(p: &Path) -> Vec<i16> {
     let b = std::fs::read(p).unwrap_or_else(|e| panic!("read {}: {e}", p.display()));
@@ -159,6 +173,35 @@ fn main() {
 
     assert!(acc > 0.99, "segmentation argmax agreement {acc:.4} below 0.99 -- the exported graph \
                          disagrees with the reference model");
-    assert_eq!(our_n, summary.n_speakers, "speaker count must match the reference");
-    println!("PASS");
+
+    // The SEGMENTATION gate above is model-independent: both shipped models use the same graph.
+    // The speaker COUNT is not. The dump comes from one pipeline, and a model with a different
+    // CLUSTERING stage will legitimately disagree with it -- so asserting the count for every model
+    // measures the gap between two models and reports it as our bug. It did: community-1 was read
+    // as "provably wrong against pyannote" when the dump is 3.1's answer and community-1 is a
+    // different clusterer.
+    // A constructed fixture knows its own speaker count regardless of which model is running, so
+    // that is the gate whenever the clip has one. It is what actually caught community-1 here; the
+    // reference dump only ever showed it disagreeing with a DIFFERENT model.
+    let truth: Option<usize> = std::fs::read_to_string(wav.with_extension("json")).ok()
+        .and_then(|t| serde_json::from_str::<FixtureTruth>(&t).ok())
+        .map(|f| f.expect_speakers);
+    if let Some(want) = truth {
+        println!("  fixture truth = {want} speakers (GATE, model-independent)");
+        assert_eq!(our_n, want,
+            "{model} found {our_n} speakers on a fixture constructed from {want} voices");
+    }
+
+    let ref_is_this_model = summary.pipeline.rsplit('/').next().unwrap_or("") == model;
+    if ref_is_this_model {
+        assert_eq!(our_n, summary.n_speakers, "speaker count must match the reference");
+        println!("PASS");
+    } else {
+        println!("  NOTE: the reference dump is {} and this run is {model}, which differ in the \
+                  CLUSTERING stage. Speaker count is reported, NOT gated -- a disagreement here is \
+                  two models differing, not necessarily an error. Re-run \
+                  scripts/verify_pyannote_reference.py against {model} to gate it.",
+                 summary.pipeline);
+        println!("PASS (segmentation gated; speaker count reported only)");
+    }
 }
