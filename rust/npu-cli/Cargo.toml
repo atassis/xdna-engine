@@ -13,6 +13,7 @@ npu-runtime = { path = "../npu-runtime" }
 npu-engine = { path = "../npu-engine" }
 npu-weights = { path = "../npu-weights" }
 clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -47,14 +47,41 @@ pub struct EmbCfg {
     /// 25 ms/10 ms. The export records what the graph actually emits, and the weights mask must be
     /// exactly this long or onnxruntime rejects the input.
     pub n_frames: usize,
+    /// Crops per ONNX call. Upstream ships `embedding_batch_size: 32`, and batch-1 calls measured
+    /// ~10x more expensive: each re-pays the session's fixed per-run cost on a single window.
+    #[serde(default = "default_batch")]
+    pub batch_size: usize,
     pub source: String,
 }
+
+/// Where VBx's learned matrices live, relative to the manifest. Produced by the export script,
+/// which also solves the generalized eigenproblem so nothing here needs an eigensolver.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PldaCfg {
+    pub xvec_mean1: String,
+    pub xvec_lda: String,
+    pub xvec_mean2: String,
+    pub plda_mu: String,
+    pub plda_tr: String,
+    pub plda_psi: String,
+}
+
+fn default_batch() -> usize { 32 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ClusterCfg {
     pub method: String,
     pub threshold: f64,
+    /// Agglomerative only. Absent for vbx, whose speaker count falls out of the VB objective.
+    #[serde(default)]
     pub min_cluster_size: usize,
+    /// VBx only, below.
+    #[serde(default)] pub fa: f64,
+    #[serde(default)] pub fb: f64,
+    #[serde(default)] pub max_iters: usize,
+    #[serde(default)] pub init_smoothing: f64,
+    #[serde(default)] pub lda_dim: usize,
+    #[serde(default)] pub plda: Option<PldaCfg>,
     /// `embedding_exclude_overlap` upstream. True in the shipped pipeline; the embedder pools
     /// WEIGHTED over a speaker's active non-overlapping frames, so this is a correctness switch.
     pub exclude_overlap: bool,
@@ -85,6 +112,18 @@ pub trait Segmenter {
     /// model's fixed input length, and a stitcher that consumes those padding frames drifts the
     /// timeline only at clip boundaries -- a defect that passes every mid-clip test.
     fn segment(&self, pcm: &[i16]) -> Result<(Array3<f32>, usize), EngineError>;
+}
+
+/// Group embeddings into speakers.
+///
+/// A trait, not a function, because the clustering STAGE is where diarization models actually
+/// differ once segmentation and embedding are behind their own traits. pyannote 3.1 uses
+/// centroid-linkage agglomerative clustering; community-1 uses Bayesian HMM (VBx) with a learned
+/// PLDA. Same pipeline, same `[tile, D]` embeddings in, same labels out -- so the model is DATA
+/// (a manifest naming its method) and not a second pipeline.
+pub trait Clusterer {
+    /// `[n_crops, dim]` L2-normalised embeddings -> one label per row, compacted to 0..k.
+    fn cluster(&self, embeddings: &Array2<f32>) -> Result<Vec<u32>, EngineError>;
 }
 
 /// Fixed-dimension speaker embeddings, weighted-pooled per crop.

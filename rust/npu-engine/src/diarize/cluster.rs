@@ -15,6 +15,26 @@
 
 use ndarray::Array2;
 
+/// Which distance the linkage uses.
+///
+/// NOT cosmetic, and not interchangeable via the threshold: 3.1 cuts a COSINE dendrogram at
+/// 0.7045, community-1 cuts a EUCLIDEAN one (on L2-normalised embeddings) at 0.6. The two configs
+/// spell the field `threshold` either way, so reading one with the other's metric merges everything
+/// into a single cluster -- which is exactly what it did before this existed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Metric {
+    Cosine,
+    /// Euclidean between centroids, on embeddings the caller has already L2-normalised.
+    Euclidean,
+}
+
+fn distance(metric: Metric, a: &[f32], b: &[f32]) -> f32 {
+    match metric {
+        Metric::Cosine => cosine_distance(a, b),
+        Metric::Euclidean => a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum::<f32>().sqrt(),
+    }
+}
+
 /// Cosine distance, `1 - cos`. Embeddings arrive L2-normalised, but a CENTROID of normalised
 /// vectors is not itself normalised, so the norms are recomputed rather than assumed.
 fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
@@ -35,6 +55,12 @@ fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
 /// `threshold` is the cosine distance above which two clusters are different speakers
 /// (`0.7045654963945799` upstream). `min_cluster_size` is the reassignment floor (12 upstream).
 pub fn cluster(embeddings: &Array2<f32>, threshold: f32, min_cluster_size: usize) -> Vec<u32> {
+    cluster_with(embeddings, threshold, min_cluster_size, Metric::Cosine)
+}
+
+/// `cluster` with an explicit metric. See [`Metric`] for why this is not a threshold rescale.
+pub fn cluster_with(embeddings: &Array2<f32>, threshold: f32, min_cluster_size: usize,
+                    metric: Metric) -> Vec<u32> {
     let n = embeddings.nrows();
     if n == 0 { return Vec::new() }
     if n == 1 { return vec![0] }
@@ -51,7 +77,7 @@ pub fn cluster(embeddings: &Array2<f32>, threshold: f32, min_cluster_size: usize
             if !alive[i] { continue }
             for j in (i + 1)..members.len() {
                 if !alive[j] { continue }
-                let d = cosine_distance(&centroids[i], &centroids[j]);
+                let d = distance(metric, &centroids[i], &centroids[j]);
                 if best.map_or(true, |(_, _, bd)| d < bd) { best = Some((i, j, d)); }
             }
         }
@@ -71,7 +97,7 @@ pub fn cluster(embeddings: &Array2<f32>, threshold: f32, min_cluster_size: usize
     for (label, &ci) in live.iter().enumerate() {
         for &row in &members[ci] { labels[row] = label as u32; }
     }
-    reassign_small(embeddings, &mut labels, &live, &members, &centroids, min_cluster_size, dim);
+    reassign_small(embeddings, &mut labels, &live, &members, &centroids, min_cluster_size, dim, metric);
     compact(&mut labels);
     labels
 }
@@ -90,7 +116,7 @@ fn centroid_of(e: &Array2<f32>, rows: &[usize], dim: usize) -> Vec<f32> {
 /// nothing is large enough -- returning small clusters beats collapsing a clip into one speaker.
 fn reassign_small(
     e: &Array2<f32>, labels: &mut [u32], live: &[usize], members: &[Vec<usize>],
-    centroids: &[Vec<f32>], min_cluster_size: usize, dim: usize,
+    centroids: &[Vec<f32>], min_cluster_size: usize, dim: usize, metric: Metric,
 ) {
     let big: Vec<usize> = live.iter().copied()
         .filter(|&ci| members[ci].len() >= min_cluster_size).collect();
@@ -104,7 +130,7 @@ fn reassign_small(
             let mut best = big[0];
             let mut best_d = f32::INFINITY;
             for &bi in &big {
-                let d = cosine_distance(&v, &centroids[bi]);
+                let d = distance(metric, &v, &centroids[bi]);
                 if d < best_d { best_d = d; best = bi; }
             }
             labels[row] = big_label[&best];
@@ -120,6 +146,18 @@ fn compact(labels: &mut [u32]) {
         map.entry(*l).or_insert(next);
     }
     for l in labels.iter_mut() { *l = map[l]; }
+}
+
+/// pyannote 3.1's clusterer, behind the trait.
+pub struct AgglomerativeClusterer {
+    pub threshold: f32,
+    pub min_cluster_size: usize,
+}
+
+impl crate::diarize::types::Clusterer for AgglomerativeClusterer {
+    fn cluster(&self, embeddings: &ndarray::Array2<f32>) -> Result<Vec<u32>, crate::api::EngineError> {
+        Ok(cluster(embeddings, self.threshold, self.min_cluster_size))
+    }
 }
 
 /// Number of distinct clusters in a label vector.
@@ -167,6 +205,15 @@ mod tests {
     fn reassignment_is_a_noop_when_every_cluster_is_big_enough() {
         let e = arr2(&[[1.0f32, 0.0], [0.99, 0.14], [0.0, 1.0], [0.14, 0.99]]);
         assert_eq!(cluster(&e, 0.5, 2), cluster(&e, 0.5, 1));
+    }
+
+    #[test]
+    fn the_trait_impl_agrees_with_the_free_function() {
+        use crate::diarize::types::Clusterer;
+        let e = arr2(&[[1.0f32, 0.0], [0.99, 0.14], [0.0, 1.0], [0.14, 0.99]]);
+        let c = AgglomerativeClusterer { threshold: 0.5, min_cluster_size: 1 };
+        assert_eq!(c.cluster(&e).unwrap(), cluster(&e, 0.5, 1),
+            "the seam must not change behaviour -- it only moves the call site");
     }
 
     #[test]

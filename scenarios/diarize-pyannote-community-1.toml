@@ -1,0 +1,11 @@
+# Speaker diarization, pyannote community-1. Same graphs as 3.1 (PyanNet + WeSpeakerResNet34);
+# the clustering stage differs (VBx + PLDA), and the manifest says so.
+[scenario]
+kind = "diarize"
+name = "pyannote-speaker-diarization-community-1"
+
+[artifacts]
+weights = "artifacts/pyannote/speaker-diarization-community-1"
+
+[diarization]
+manifest = "artifacts/pyannote/speaker-diarization-community-1/diarize.json"

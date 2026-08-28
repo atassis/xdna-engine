@@ -72,6 +72,20 @@ ENGINE_BIN="$ENGINE_BIN_DIR/npu"
 BUILT_BIN="$REPO/rust/target/release/npu"
 ENGINE_CONFIG="${ENGINE_CONFIG:-$HOME/.config/npu/engine.toml}"
 
+# Stable PRODUCTION root. The service must not depend on a working directory or on a git
+# worktree: a checkout can be moved, rebased onto a branch, or pruned, and the running service
+# would then silently resolve artifacts and xclbins somewhere else (or nowhere). So installation
+# stages a fixed prefix and the unit names it explicitly via XDNA_ENGINE_ROOT, which npu-cli's
+# root() already honours ahead of any cwd fallback.
+ENGINE_ROOT="${ENGINE_ROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/xdna-engine}"
+
+# Where the staged root's artifacts/ and mlir-aie/ point. Default to this checkout, but they are
+# overridable BECAUSE this script may legitimately be run from a git worktree: a worktree supplies
+# the sources, and linking a service's weights into one would tie production to a directory that
+# gets pruned. Point these at the permanent checkout (or a shared model store) in that case.
+ENGINE_ARTIFACTS="${ENGINE_ARTIFACTS:-$REPO/artifacts}"
+ENGINE_MLIR_AIE="${ENGINE_MLIR_AIE:-$REPO/mlir-aie}"
+
 # Stable runtime dir for libonnxruntime, decoupled from the volatile cargo target/ build tree
 # (which `cargo clean` wipes). The unit puts this on LD_LIBRARY_PATH so the service resolves
 # its .so here regardless of build-tree churn. Override with STABLE_LIB_DIR=...
@@ -88,6 +102,7 @@ esac
 # Pretty logging helpers.
 info() { printf '\033[1;34m[install]\033[0m %s\n' "$*"; }
 ok()   { printf '\033[1;32m[ ok ]\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33m[warn]\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31m[fail]\033[0m %s\n' "$*" >&2; exit 1; }
 
 # ---------------------------------------------------------------------------
@@ -269,6 +284,28 @@ fi  # end MODEL=gigaam artifact block
 # missing scenario, or a scenario pointing at missing weights, produces a unit that installs
 # clean and then dies (or worse, serves nothing) at runtime. A re-pin silently broke the shipped
 # ASR service for five days exactly this way. So: resolve the whole chain here and refuse.
+# ---------------------------------------------------------------------------
+# 4b. Stage the stable production root
+# ---------------------------------------------------------------------------
+# scenarios/ are COPIED (small, and a copy cannot be changed under the service by a checkout
+# switching branches). artifacts/ and mlir-aie/ are SYMLINKED, because they are large and are
+# already shared between checkouts; linking keeps one copy of the weights and xclbins.
+info "Staging production root -> $ENGINE_ROOT"
+mkdir -p "$ENGINE_ROOT"
+rm -rf "$ENGINE_ROOT/scenarios"
+cp -r "$REPO/scenarios" "$ENGINE_ROOT/scenarios"
+stage_link() {  # name, source
+  if [ -e "$2" ]; then
+    ln -sfn "$(readlink -f "$2")" "$ENGINE_ROOT/$1"
+    ok "  $1 -> $(readlink -f "$2")"
+  else
+    warn "  $1 missing ($2) -- the service may not resolve all models"
+  fi
+}
+stage_link artifacts "$ENGINE_ARTIFACTS"
+stage_link mlir-aie  "$ENGINE_MLIR_AIE"
+ok "Production root staged."
+
 info "Preflighting engine config: $ENGINE_CONFIG"
 [ -f "$ENGINE_CONFIG" ] || die "engine config missing: $ENGINE_CONFIG
   Create it (see the [server]/[defaults]/[[model]] example in the README), or point
@@ -279,8 +316,8 @@ scen_count=0
 while IFS= read -r scen; do
   [ -n "$scen" ] || continue
   scen_count=$((scen_count + 1))
-  # Relative scenario paths resolve against the repo (WorkingDirectory at runtime).
-  case "$scen" in /*) scen_abs="$scen" ;; *) scen_abs="$REPO/$scen" ;; esac
+  # Relative scenario paths resolve against the STAGED ROOT, which is what the service uses.
+  case "$scen" in /*) scen_abs="$scen" ;; *) scen_abs="$ENGINE_ROOT/$scen" ;; esac
   [ -f "$scen_abs" ] || die "engine config references a missing scenario: $scen_abs
   (from $ENGINE_CONFIG)"
 
@@ -288,7 +325,7 @@ while IFS= read -r scen; do
   wdir=$(grep -oP '^\s*weights\s*=\s*"\K[^"]+' "$scen_abs" | head -1)
   [ -n "$kind" ] || die "scenario has no [scenario].kind: $scen_abs"
   if [ -n "$wdir" ]; then
-    case "$wdir" in /*) wabs="$wdir" ;; *) wabs="$REPO/$wdir" ;; esac
+    case "$wdir" in /*) wabs="$wdir" ;; *) wabs="$ENGINE_ROOT/$wdir" ;; esac
     [ -d "$wabs" ] && [ -n "$(ls -A "$wabs" 2>/dev/null)" ] \
       || die "scenario '$scen_abs' points at missing/empty weights: $wabs"
   fi
@@ -300,6 +337,53 @@ done < <(grep -oP '^\s*scenario\s*=\s*"\K[^"]+' "$ENGINE_CONFIG")
 ok "Engine config preflight passed ($scen_count model(s) resolvable)."
 
 # ---------------------------------------------------------------------------
+# 4c. Shell completions
+# ---------------------------------------------------------------------------
+# Generated FROM the clap command tree by the binary we just installed, so completions cannot
+# drift from the actual subcommands and flags. Written to a stable per-user dir; the system
+# site-functions dirs would need root, and this script never asks for it.
+# Prefer a dir zsh ALREADY searches and the user can write, so a working install needs no
+# ~/.zshrc edit. Only if none exists do we fall back to the XDG location and tell them the one
+# line to add -- zsh silently ignores completion files off $fpath, so "installed" and "works" are
+# different states and the difference has to be reported.
+if [ -z "${COMPLETION_DIR:-}" ]; then
+  COMPLETION_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/zsh/site-functions"
+  # Rank by NAME, not by fpath order. The first writable entry is frequently some unrelated
+  # tool's config dir (it happened: ~/.config/sing-box), and dropping a completion file into
+  # another project's directory is not ours to do.
+  fpath_dirs="$(zsh -ic 'print -l $fpath' 2>/dev/null || true)"
+  for want in '.zfunc' 'zsh/site-functions' 'zfunctions' 'completions'; do
+    while IFS= read -r d; do
+      case "$d" in
+        "$HOME"/*"$want") [ -d "$d" ] && [ -w "$d" ] && COMPLETION_DIR="$d" && break 2 ;;
+      esac
+    done <<< "$fpath_dirs"
+  done
+fi
+info "Installing zsh completions -> $COMPLETION_DIR/_npu"
+mkdir -p "$COMPLETION_DIR"
+if "$ENGINE_BIN" completions zsh > "$COMPLETION_DIR/_npu" 2>/dev/null; then
+  ok "Wrote _npu ($(wc -l < "$COMPLETION_DIR/_npu") lines)."
+  # bash and fish too, cheap and harmless; a user of either gets them without a second install.
+  bash_dir="${XDG_DATA_HOME:-$HOME/.local/share}/bash-completion/completions"
+  mkdir -p "$bash_dir" && "$ENGINE_BIN" completions bash > "$bash_dir/npu" 2>/dev/null || true
+  fish_dir="${XDG_CONFIG_HOME:-$HOME/.config}/fish/completions"
+  mkdir -p "$fish_dir" && "$ENGINE_BIN" completions fish > "$fish_dir/npu.fish" 2>/dev/null || true
+
+  # Only nag if the dir is not already searched: zsh silently ignores files off fpath, so an
+  # install that "succeeded" while tab-completion stayed dead is the failure worth catching.
+  if ! zsh -ic 'print -l $fpath' 2>/dev/null | grep -qx "$COMPLETION_DIR"; then
+    warn "$COMPLETION_DIR is not on your zsh \$fpath, so completions will NOT load."
+    warn "Add this to ~/.zshrc ABOVE the compinit line, then start a new shell:"
+    printf '\n    fpath=(%s $fpath)\n\n' "$COMPLETION_DIR"
+  else
+    ok "  $COMPLETION_DIR is on \$fpath; run 'exec zsh' to pick them up."
+  fi
+else
+  warn "Could not generate completions (old binary?); skipping."
+fi
+
+# ---------------------------------------------------------------------------
 # 5. Install the systemd --user unit
 # ---------------------------------------------------------------------------
 info "Installing systemd --user unit -> $UNIT_PATH"
@@ -307,8 +391,9 @@ mkdir -p "$UNIT_DIR"
 
 # Absolute paths are baked in at install time (no $-expansion at runtime).
 #   Conflicts=flm-asr.service  -> starting ours auto-stops FLM, freeing NPU + :11434.
-#   WorkingDirectory=$REPO     -> the engine resolves artifacts/ and scenario paths relative
-#                                 to cwd (npu_engine::Model::load uses the working dir as root).
+#   XDNA_ENGINE_ROOT           -> where the engine resolves artifacts/, scenarios/ and the NPU
+#                                 xclbins under mlir-aie/. Named EXPLICITLY so the service does
+#                                 not depend on a working directory or on any git checkout.
 cat > "$UNIT_PATH" <<EOF
 [Unit]
 Description=$DESC
@@ -319,7 +404,12 @@ After=graphical-session.target
 
 [Service]
 Type=simple
-WorkingDirectory=$REPO
+# Set for belt-and-braces only: XDNA_ENGINE_ROOT below is what actually resolves paths, and this
+# points at the same stable prefix rather than at a checkout.
+WorkingDirectory=$ENGINE_ROOT
+# The engine's root for artifacts/, scenarios/ and the mlir-aie xclbins. npu-cli's root() reads
+# this before falling back to a scenario path or to cwd.
+Environment=XDNA_ENGINE_ROOT=$ENGINE_ROOT
 # Resolve libonnxruntime.so.1 from the STABLE dir (not the volatile cargo build tree). The
 # binary's DT_RUNPATH is searched AFTER LD_LIBRARY_PATH, so this wins and survives cargo clean.
 Environment=LD_LIBRARY_PATH=$STABLE_LIB_DIR

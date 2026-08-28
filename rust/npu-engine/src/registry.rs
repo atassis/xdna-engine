@@ -54,7 +54,7 @@ pub fn try_build(cfg_path: &Path, root: &Path) -> Result<Scenario, EngineError> 
             let seg = crate::diarize::onnx::OnnxSegmenter::build(&manifest, &dir)?;
             let emb = crate::diarize::onnx::OnnxEmbedder::build(&manifest, &dir)?;
             Scenario::Diarize(Box::new(crate::diarize::DiarizePipeline::new(
-                manifest, Box::new(seg), Box::new(emb))))
+                manifest, Box::new(seg), Box::new(emb), &dir)?))
         }
         None => return Err(EngineError::Load(format!("unknown scenario kind {:?}", cfg.scenario.kind))),
     };

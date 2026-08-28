@@ -33,7 +33,7 @@ int npu_available(void);
 struct NpuModel *npu_model_load(const char *scenario_path);
 
 /**
- * 0 = asr, 1 = embed, -1 = error.
+ * 0 = asr, 1 = embed, 2 = diarize, -1 = error. Append-only: existing values never move.
  */
 int npu_model_kind(const struct NpuModel *m);
 
@@ -41,6 +41,15 @@ int npu_model_kind(const struct NpuModel *m);
  * ASR: PCM i16 mono -> malloc'd UTF-8 C string (free with `npu_string_free`). NULL on error.
  */
 char *npu_transcribe(struct NpuModel *m, const int16_t *pcm, uintptr_t n, uint32_t sample_rate);
+
+/**
+ * Diarization: PCM i16 mono -> malloc'd UTF-8 JSON C string (free with `npu_string_free`).
+ * NULL on error. JSON rather than a struct array because the result is variable-length and an
+ * out-param protocol would need a sizing call first -- the shape `npu_embed` already pays for.
+ *
+ * Body: `{"segments":[{"start":0.500,"end":3.200,"speaker":0}]}`
+ */
+char *npu_diarize(struct NpuModel *m, const int16_t *pcm, uintptr_t n, uint32_t sample_rate);
 
 /**
  * Embedding. Call with out_cap==0 (or out==NULL) to get the dimension; call again with a buffer of
