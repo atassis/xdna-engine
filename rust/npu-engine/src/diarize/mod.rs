@@ -41,9 +41,12 @@ impl DiarizePipeline {
         // Seconds per segmentation frame, from the window duration and the model's own frame count.
         let frame_s = m.segmentation.duration_s / n_frames as f32;
         let hop_frames = ((m.segmentation.step_s / frame_s).round() as usize).max(1);
-        // Embedder frames per window, at its own fbank rate -- not the segmentation rate.
-        let n_emb_frames =
-            ((m.segmentation.duration_s * 1000.0 / m.embedding.frame_shift_ms).round() as usize).max(1);
+        // Embedder frames per window, taken from the manifest rather than computed. The obvious
+        // `duration / frame_shift` is WRONG: kaldi frames with snip_edges, giving
+        // floor((samples - frame_length)/frame_shift) + 1 = 998, not 1000, for 10 s at 25/10 ms.
+        // onnxruntime rejects a weights mask of the wrong length outright, so this must match the
+        // graph exactly.
+        let n_emb_frames = m.embedding.n_frames.max(1);
         let win_samples = (m.segmentation.duration_s * m.sample_rate as f32).round() as usize;
         let hop_samples = (m.segmentation.step_s * m.sample_rate as f32).round() as usize;
 
@@ -116,7 +119,7 @@ mod tests {
           "pyannote_audio_rev":"3.1.1","sample_rate":16000,
           "segmentation":{"onnx":"s","duration_s":1.0,"step_s":1.0,
                           "max_speakers_per_chunk":3,"powerset_classes":7,"source":"t"},
-          "embedding":{"onnx":"e","dim":2,"num_mel_bins":80,
+          "embedding":{"onnx":"e","dim":2,"num_mel_bins":80,"n_frames":98,
                        "frame_length_ms":25.0,"frame_shift_ms":10.0,"source":"t"},
           "clustering":{"method":"centroid","threshold":0.5,"min_cluster_size":1,
                         "exclude_overlap":true,"source":"t"},

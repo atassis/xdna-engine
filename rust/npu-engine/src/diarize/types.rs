@@ -41,6 +41,12 @@ pub struct EmbCfg {
     pub num_mel_bins: usize,
     pub frame_length_ms: f32,
     pub frame_shift_ms: f32,
+    /// Fbank frames the exported graph produces for ONE window. NOT computable as
+    /// `duration / frame_shift`: kaldi frames with `snip_edges`, so the count is
+    /// `floor((samples - frame_length) / frame_shift) + 1` -- 998, not 1000, for a 10 s window at
+    /// 25 ms/10 ms. The export records what the graph actually emits, and the weights mask must be
+    /// exactly this long or onnxruntime rejects the input.
+    pub n_frames: usize,
     pub source: String,
 }
 
@@ -100,7 +106,7 @@ mod tests {
                            "max_speakers_per_chunk": 3, "powerset_classes": 7,
                            "source": "pyannote/segmentation-3.0@main"},
           "embedding": {"onnx": "emb.onnx", "dim": 256, "num_mel_bins": 80,
-                        "frame_length_ms": 25.0, "frame_shift_ms": 10.0,
+                        "frame_length_ms": 25.0, "frame_shift_ms": 10.0, "n_frames": 998,
                         "source": "pyannote/wespeaker-voxceleb-resnet34-LM@main"},
           "clustering": {"method": "centroid", "threshold": 0.7045654963945799,
                          "min_cluster_size": 12, "exclude_overlap": true,
@@ -112,6 +118,7 @@ mod tests {
         assert_eq!(m.clustering.min_cluster_size, 12);
         assert!(m.clustering.exclude_overlap, "the mask is the contract, not an option");
         assert_eq!(m.embedding.dim, 256);
+        assert_eq!(m.embedding.n_frames, 998, "snip_edges framing, not duration/shift");
         assert_eq!(m.segmentation.powerset_classes, 7);
         // The library-sourced values must be present -- they are in NO upstream config.yaml.
         assert_eq!(m.pyannote_audio_rev, "3.1.1");

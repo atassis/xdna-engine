@@ -111,7 +111,7 @@ mod tests {
           "pyannote_audio_rev":"3.1.1","sample_rate":16000,
           "segmentation":{"onnx":"nope.onnx","duration_s":10.0,"step_s":1.0,
                           "max_speakers_per_chunk":3,"powerset_classes":7,"source":"t"},
-          "embedding":{"onnx":"nope.onnx","dim":256,"num_mel_bins":80,
+          "embedding":{"onnx":"nope.onnx","dim":256,"num_mel_bins":80,"n_frames":998,
                        "frame_length_ms":25.0,"frame_shift_ms":10.0,"source":"t"},
           "clustering":{"method":"centroid","threshold":0.7,"min_cluster_size":12,
                         "exclude_overlap":true,"source":"t"},
