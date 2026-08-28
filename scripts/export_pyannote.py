@@ -295,6 +295,7 @@ manifest = {
     "embedding": {
         "onnx": "embedding.onnx", "dim": dim, "num_mel_bins": NUM_MEL,
         "frame_length_ms": FLEN, "frame_shift_ms": FSHIFT, "n_frames": n_emb_frames,
+        "batch_size": int(pipe_params.get("embedding_batch_size", 32)),
         "source": (f"{PIPELINE} subfolder 'embedding'" if BUNDLED
                    else "pyannote/wespeaker-voxceleb-resnet34-LM")
                   + f" checkpoint hparams (fbank params); dim + TSTP pooling hardcoded in "

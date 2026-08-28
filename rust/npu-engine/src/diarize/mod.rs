@@ -42,7 +42,15 @@ impl DiarizePipeline {
 
     pub fn run(&self, pcm: &[i16]) -> Result<Vec<Segment>, EngineError> {
         let m = &self.manifest;
+        // Per-stage wall clock behind NPU_DIARIZE_TIME. Which stage dominates decides whether
+        // moving the embedder to the NPU is worth anything at all, and that is not guessable:
+        // segmentation is a sequential BiLSTM, the embedder is dense conv, and they are within an
+        // order of magnitude of each other in FLOPs.
+        let timing = std::env::var_os("NPU_DIARIZE_TIME").is_some();
+        let t_all = std::time::Instant::now();
+        let t = std::time::Instant::now();
         let (logits, _valid_last) = self.segmenter.segment(pcm)?;
+        let t_seg = t.elapsed();
         let n_spk = m.segmentation.max_speakers_per_chunk;
         let activity = powerset::decode_powerset(&logits, n_spk);
         let (n_windows, n_frames, _) = activity.dim();
@@ -79,8 +87,12 @@ impl DiarizePipeline {
         }
         if crops.is_empty() { return Ok(Vec::new()) }
 
+        let t = std::time::Instant::now();
         let embeddings = self.embedder.embed(&crops)?;
+        let t_emb = t.elapsed();
+        let t = std::time::Instant::now();
         let labels_vec = self.clusterer.cluster(&embeddings)?;
+        let t_clu = t.elapsed();
         let n_clusters = cluster::n_clusters(&labels_vec).max(1);
         let labels: HashMap<(usize, usize), u32> =
             keys.iter().copied().zip(labels_vec.iter().copied()).collect();
@@ -88,7 +100,20 @@ impl DiarizePipeline {
         let n_global = (n_windows - 1) * hop_frames + n_frames;
         let global = stitch::aggregate_windows(&activity, &labels, hop_frames, n_global, n_clusters);
         let cov = stitch::coverage(n_windows, n_frames, hop_frames, n_global);
-        Ok(timeline::to_segments(&global, &cov, 0.5, frame_s, m.min_duration_off_s))
+        let out = timeline::to_segments(&global, &cov, 0.5, frame_s, m.min_duration_off_s);
+        if timing {
+            let total = t_all.elapsed();
+            let audio_s = pcm.len() as f64 / m.sample_rate as f64;
+            let pct = |d: std::time::Duration| 100.0 * d.as_secs_f64() / total.as_secs_f64();
+            eprintln!("[diarize-time] audio {audio_s:.2}s | total {:.3}s ({:.1}x realtime)",
+                      total.as_secs_f64(), audio_s / total.as_secs_f64());
+            eprintln!("[diarize-time]   segment  {:.3}s  {:5.1}%  ({} windows)",
+                      t_seg.as_secs_f64(), pct(t_seg), n_windows);
+            eprintln!("[diarize-time]   embed    {:.3}s  {:5.1}%  ({} crops)",
+                      t_emb.as_secs_f64(), pct(t_emb), crops.len());
+            eprintln!("[diarize-time]   cluster  {:.3}s  {:5.1}%", t_clu.as_secs_f64(), pct(t_clu));
+        }
+        Ok(out)
     }
 }
 

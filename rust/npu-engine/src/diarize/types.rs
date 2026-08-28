@@ -47,6 +47,10 @@ pub struct EmbCfg {
     /// 25 ms/10 ms. The export records what the graph actually emits, and the weights mask must be
     /// exactly this long or onnxruntime rejects the input.
     pub n_frames: usize,
+    /// Crops per ONNX call. Upstream ships `embedding_batch_size: 32`, and batch-1 calls measured
+    /// ~10x more expensive: each re-pays the session's fixed per-run cost on a single window.
+    #[serde(default = "default_batch")]
+    pub batch_size: usize,
     pub source: String,
 }
 
@@ -61,6 +65,8 @@ pub struct PldaCfg {
     pub plda_tr: String,
     pub plda_psi: String,
 }
+
+fn default_batch() -> usize { 32 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ClusterCfg {
