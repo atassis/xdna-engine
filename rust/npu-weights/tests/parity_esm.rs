@@ -1,6 +1,7 @@
+mod common;
+
 // rust/npu-weights/tests/parity_esm.rs
 use std::path::Path;
-use std::process::Command;
 
 fn check_one(sub: &str, hf: &str) {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
@@ -9,22 +10,7 @@ fn check_one(sub: &str, hf: &str) {
         eprintln!("SKIP {sub}: oracle missing - run .venv/bin/python scripts/export_esm.py {hf} {sub}");
         return;
     }
-    let checkpoint = root.join(format!("target/test-checkpoints/{sub}.safetensors"));
-    let bin = env!("CARGO_BIN_EXE_npu-weights");
-    let st = Command::new(bin)
-        .current_dir(root)
-        .args(["bake", "--source", &format!("hf:{hf}"), "--arch", "esm",
-               "--checkpoint", checkpoint.to_str().unwrap(), "--force"])
-        .status().unwrap();
-    assert!(st.success(), "bake failed for {sub}");
-    let out = Command::new(bin)
-        .current_dir(root)
-        .args(["verify", "--checkpoint", checkpoint.to_str().unwrap(), "--arch", "esm",
-               "--refs", refs.to_str().unwrap()])
-        .output().unwrap();
-    let s = String::from_utf8_lossy(&out.stdout);
-    assert!(out.status.success(), "verify failed for {sub}:\n{s}\n{}", String::from_utf8_lossy(&out.stderr));
-    assert!(s.contains("PARITY PASS"), "no parity pass for {sub}:\n{s}");
+    common::bake_and_verify(sub, &format!("hf:{hf}"), "esm", &refs);
 }
 
 #[test]

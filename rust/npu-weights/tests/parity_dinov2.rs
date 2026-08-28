@@ -1,3 +1,5 @@
+mod common;
+
 // rust/npu-weights/tests/parity_dinov2.rs
 // Bakes facebook/dinov2-base via the `dinov2` arch and checks every baked tensor against the Python
 // oracle npy (scripts/convert_dinov2.py). Refs dir is the model root `artifacts/dinov2-base`; checkpoint
@@ -5,7 +7,6 @@
 // oracle's npy paths. The patch-embed conv2d is im2col-flattened + transposed exactly as the oracle
 // does; LayerScale (ls1/ls2) is baked verbatim. Gated on oracle presence.
 use std::path::Path;
-use std::process::Command;
 
 #[test]
 fn dinov2_base_checkpoint_matches_python_oracle() {
@@ -15,20 +16,5 @@ fn dinov2_base_checkpoint_matches_python_oracle() {
         eprintln!("SKIP dinov2: oracle missing - run .venv/bin/python scripts/convert_dinov2.py");
         return;
     }
-    let checkpoint = root.join("target/test-checkpoints/dinov2-base.safetensors");
-    let bin = env!("CARGO_BIN_EXE_npu-weights");
-    let st = Command::new(bin)
-        .current_dir(root)
-        .args(["bake", "--source", "hf:facebook/dinov2-base", "--arch", "dinov2",
-               "--checkpoint", checkpoint.to_str().unwrap(), "--force"])
-        .status().unwrap();
-    assert!(st.success(), "bake failed for dinov2-base");
-    let out = Command::new(bin)
-        .current_dir(root)
-        .args(["verify", "--checkpoint", checkpoint.to_str().unwrap(), "--arch", "dinov2",
-               "--refs", refs.to_str().unwrap()])
-        .output().unwrap();
-    let s = String::from_utf8_lossy(&out.stdout);
-    assert!(out.status.success(), "verify failed for dinov2:\n{s}\n{}", String::from_utf8_lossy(&out.stderr));
-    assert!(s.contains("PARITY PASS"), "no parity pass for dinov2:\n{s}");
+    common::bake_and_verify("dinov2", "hf:facebook/dinov2-base", "dinov2", &refs);
 }
