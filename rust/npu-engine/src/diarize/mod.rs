@@ -7,6 +7,7 @@ pub mod powerset;
 pub mod stitch;
 pub mod timeline;
 pub mod types;
+pub mod vbx;
 
 pub use types::{Clusterer, Crop, Manifest, Segmenter, SpeakerEmbedder};
 
@@ -26,9 +27,9 @@ pub struct DiarizePipeline {
 }
 
 impl DiarizePipeline {
-    pub fn new(manifest: Manifest, segmenter: Box<dyn Segmenter>, embedder: Box<dyn SpeakerEmbedder>)
-        -> Result<DiarizePipeline, EngineError> {
-        let clusterer = clusterer_for(&manifest)?;
+    pub fn new(manifest: Manifest, segmenter: Box<dyn Segmenter>, embedder: Box<dyn SpeakerEmbedder>,
+               dir: &std::path::Path) -> Result<DiarizePipeline, EngineError> {
+        let clusterer = clusterer_for(&manifest, dir)?;
         Ok(DiarizePipeline { manifest, segmenter, embedder, clusterer })
     }
 
@@ -94,14 +95,27 @@ impl DiarizePipeline {
 /// Pick the clustering stage the manifest names. Unknown methods fail LOUDLY at load rather than
 /// silently falling back to centroid: a manifest asking for vbx and getting agglomerative would
 /// produce plausible-looking labels that are simply a different model's answer.
-fn clusterer_for(m: &Manifest) -> Result<Box<dyn Clusterer>, EngineError> {
+fn clusterer_for(m: &Manifest, dir: &std::path::Path) -> Result<Box<dyn Clusterer>, EngineError> {
     match m.clustering.method.as_str() {
         "centroid" => Ok(Box::new(cluster::AgglomerativeClusterer {
             threshold: m.clustering.threshold as f32,
             min_cluster_size: m.clustering.min_cluster_size,
         })),
+        "vbx" => {
+            let p = m.clustering.plda.as_ref().ok_or_else(|| EngineError::Load(
+                "clustering.method = vbx but the manifest carries no [plda] artifacts".into()))?;
+            Ok(Box::new(vbx::VbxClusterer {
+                plda: vbx::Plda::load(p, dir)?,
+                threshold: m.clustering.threshold as f32,
+                fa: m.clustering.fa as f32,
+                fb: m.clustering.fb as f32,
+                max_iters: m.clustering.max_iters.max(1),
+                init_smoothing: m.clustering.init_smoothing as f32,
+                lda_dim: m.clustering.lda_dim.max(1),
+            }))
+        }
         other => Err(EngineError::Load(format!(
-            "unsupported clustering method {other:?} (this build has: centroid)"))),
+            "unsupported clustering method {other:?} (this build has: centroid, vbx)"))),
     }
 }
 
@@ -150,7 +164,7 @@ mod tests {
 
     #[test]
     fn two_windows_of_different_voices_become_two_speakers() {
-        let p = DiarizePipeline::new(manifest(), Box::new(MockSeg), Box::new(MockEmb)).unwrap();
+        let p = DiarizePipeline::new(manifest(), Box::new(MockSeg), Box::new(MockEmb), std::path::Path::new(".")).unwrap();
         let segs = p.run(&vec![0i16; 32_000]).expect("diarize");
         assert!(!segs.is_empty(), "a fully-voiced clip must yield segments");
         let speakers: std::collections::BTreeSet<u32> = segs.iter().map(|s| s.speaker).collect();
@@ -161,12 +175,13 @@ mod tests {
     #[test]
     fn an_unknown_clustering_method_fails_at_load_not_silently() {
         let mut m = manifest();
-        m.clustering.method = "vbx".into();
-        let Err(e) = DiarizePipeline::new(m, Box::new(MockSeg), Box::new(MockEmb)) else {
+        m.clustering.method = "spectral".into();
+        let Err(e) = DiarizePipeline::new(m, Box::new(MockSeg), Box::new(MockEmb), std::path::Path::new(".")) else {
             panic!("a manifest naming an unimplemented clusterer must not build a pipeline");
         };
-        assert!(e.to_string().contains("vbx"), "must name the method it cannot serve: {e}");
+        assert!(e.to_string().contains("spectral"), "must name the method it cannot serve: {e}");
         assert!(e.to_string().contains("centroid"), "and say what it can: {e}");
+        assert!(e.to_string().contains("vbx"), "vbx is implemented, so it must be listed: {e}");
     }
 
     #[test]
@@ -179,7 +194,7 @@ mod tests {
                 Ok((a, 4))
             }
         }
-        let p = DiarizePipeline::new(manifest(), Box::new(Silent), Box::new(MockEmb)).unwrap();
+        let p = DiarizePipeline::new(manifest(), Box::new(Silent), Box::new(MockEmb), std::path::Path::new(".")).unwrap();
         assert!(p.run(&vec![0i16; 32_000]).unwrap().is_empty());
     }
 
@@ -194,7 +209,7 @@ mod tests {
             }
         }
         let seen = Arc::new(Mutex::new(Vec::new()));
-        let p = DiarizePipeline::new(manifest(), Box::new(MockSeg), Box::new(Spy(seen.clone()))).unwrap();
+        let p = DiarizePipeline::new(manifest(), Box::new(MockSeg), Box::new(Spy(seen.clone())), std::path::Path::new(".")).unwrap();
         let _ = p.run(&vec![0i16; 32_000]);
         let lens = seen.lock().unwrap().clone();
         assert!(!lens.is_empty(), "the embedder must be called");

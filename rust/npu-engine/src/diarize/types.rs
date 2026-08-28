@@ -50,11 +50,32 @@ pub struct EmbCfg {
     pub source: String,
 }
 
+/// Where VBx's learned matrices live, relative to the manifest. Produced by the export script,
+/// which also solves the generalized eigenproblem so nothing here needs an eigensolver.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PldaCfg {
+    pub xvec_mean1: String,
+    pub xvec_lda: String,
+    pub xvec_mean2: String,
+    pub plda_mu: String,
+    pub plda_tr: String,
+    pub plda_psi: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ClusterCfg {
     pub method: String,
     pub threshold: f64,
+    /// Agglomerative only. Absent for vbx, whose speaker count falls out of the VB objective.
+    #[serde(default)]
     pub min_cluster_size: usize,
+    /// VBx only, below.
+    #[serde(default)] pub fa: f64,
+    #[serde(default)] pub fb: f64,
+    #[serde(default)] pub max_iters: usize,
+    #[serde(default)] pub init_smoothing: f64,
+    #[serde(default)] pub lda_dim: usize,
+    #[serde(default)] pub plda: Option<PldaCfg>,
     /// `embedding_exclude_overlap` upstream. True in the shipped pipeline; the embedder pools
     /// WEIGHTED over a speaker's active non-overlapping frames, so this is a correctness switch.
     pub exclude_overlap: bool,

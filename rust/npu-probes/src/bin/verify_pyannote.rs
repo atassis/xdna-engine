@@ -73,15 +73,22 @@ fn main() {
     let wav = std::env::args().nth(1).expect("usage: verify_pyannote <clip.wav>");
     let wav = PathBuf::from(wav);
     let stem = wav.file_stem().unwrap().to_string_lossy().to_string();
-    let dir = Path::new("artifacts/pyannote");
-    let refdir = dir.join("ref").join(&stem);
+    // Which model's artifacts to verify. Defaults to 3.1 for compatibility with existing dumps;
+    // pass a second argument to check community-1 (or any other exported model).
+    let model = std::env::args().nth(2)
+        .unwrap_or_else(|| "speaker-diarization-3.1".to_string());
+    let dir_owned = Path::new("artifacts/pyannote").join(&model);
+    let dir = dir_owned.as_path();
+    let refdir = Path::new("artifacts/pyannote/ref").join(&stem);
     assert!(refdir.is_dir(), "no reference dump at {} -- run scripts/verify_pyannote_reference.py first",
             refdir.display());
 
     let manifest: Manifest = serde_json::from_str(
         &std::fs::read_to_string(dir.join("diarize.json")).expect("diarize.json")).expect("manifest");
     let pcm = read_wav_i16(&wav);
-    println!("clip {} ({:.2}s)", wav.display(), pcm.len() as f32 / manifest.sample_rate as f32);
+    println!("clip {} ({:.2}s), model {model}, clustering {}",
+             wav.display(), pcm.len() as f32 / manifest.sample_rate as f32,
+             manifest.clustering.method);
 
     // ---- stage 1: segmentation logits -----------------------------------------------------
     let seg = OnnxSegmenter::build(&manifest, dir).expect("segmenter");
@@ -126,7 +133,8 @@ fn main() {
         manifest.clone(),
         Box::new(OnnxSegmenter::build(&manifest, dir).expect("segmenter")),
         Box::new(npu_engine::diarize::onnx::OnnxEmbedder::build(&manifest, dir).expect("embedder")),
-    );
+        dir,
+    ).expect("build diarize pipeline");
     let segs = dp.run(&pcm).expect("diarize");
     let summary: RefSummary = serde_json::from_str(
         &std::fs::read_to_string(refdir.join("summary.json")).expect("summary.json")).expect("summary");
