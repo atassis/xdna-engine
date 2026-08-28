@@ -2,9 +2,12 @@
 """CPU gate for scripts/chrome_trace_emit.py -- no NPU, no real capture needed.
 
 Two tiny synthetic mlir-aie trace_to_json-shaped fixtures (fixtures/chrome_trace/) stand in for
-two sequential hw-context dispatches. Checks the three things a wrong merge would get silently
-wrong: cycle->us scaling, the unclosed-B-at-buffer-end drop, and that a hw-context switch shows
-up as a real time gap (not two captures overlapping because both started at cycle 0).
+two sequential hw-context dispatches. Checks the things a wrong merge would get silently wrong:
+cycle->us scaling, the unclosed-B-at-buffer-end drop, that a hw-context switch shows up as a real
+time gap (not two captures overlapping because both started at cycle 0), that clock-hz/power-mode
+are recorded rather than assumed, that --cycles-only passes raw cycles through untouched, and that
+find_overlaps()/build() actually catch same-tid overlapping events (capture_overlap_garbage.json)
+instead of passing everything, garbage included.
 
     python3 scripts/tests/chrome_trace_emit_test.py
 """
@@ -82,6 +85,45 @@ check(doc2["otherData"]["switch_us_source"] == "unmeasured-placeholder (0)",
       "omitted --switch-us is tagged unmeasured-placeholder, not silently real")
 gelu2 = next(e for e in doc2["traceEvents"] if e["ph"] == "X" and e["pid"] == 1)
 check(gelu2["ts"] == 25.0, f"with no gap, gelu starts right where ln ends (ts={gelu2['ts']})")
+
+# --power-mode metadata: recorded when given, tagged unspecified (never silently blank) when not.
+check(C.build([os.path.join(FIX, "capture_ln.json")], clock_hz=1e6, labels=["ln"],
+              switch_us=None, clip_seconds=[], power_mode="turbo")["otherData"]["power_mode"]
+      == "turbo", "explicit --power-mode lands verbatim in otherData")
+doc_nopm = C.build([os.path.join(FIX, "capture_ln.json")], clock_hz=1e6, labels=["ln"],
+                    switch_us=None, clip_seconds=[])
+check(doc_nopm["otherData"]["power_mode"] is None
+      and doc_nopm["otherData"]["power_mode_source"] == "unspecified",
+      "omitted --power-mode is None but explicitly tagged unspecified")
+
+# --cycles-only: no --clock-hz needed, ts/dur stay raw cycles, otherData says so.
+doc_cyc = C.build([os.path.join(FIX, "capture_ln.json")], clock_hz=None, labels=["ln"],
+                   switch_us=None, clip_seconds=[], cycles_only=True)
+check(doc_cyc["otherData"]["ts_unit"] == "cycles" and doc_cyc["otherData"]["clock_hz"] is None,
+      "cycles-only mode tags ts_unit=cycles and records no clock_hz")
+ln_cyc = sorted((e for e in doc_cyc["traceEvents"] if e["ph"] == "X"), key=lambda e: e["ts"])
+check(ln_cyc[0]["ts"] == 0 and ln_cyc[0]["dur"] == 10,
+      f"cycles-only passes raw cycle deltas through unscaled, got ts={ln_cyc[0]['ts']} dur={ln_cyc[0]['dur']}")
+
+# find_overlaps: must be silent on a real, correctly-offset merge...
+check(C.find_overlaps(events) == [], "the ln+gelu merge has no overlapping X events on any tid")
+# ...and must NOT pass on garbage: two intervals sharing a tid that genuinely overlap in time
+# (an out-of-order/duplicated B/E pair, the kind a buffer wraparound produces) has to be caught,
+# not silently accepted -- prove the checker isn't vacuous before trusting it to gate build().
+garbage_events = [
+    {"name": "w", "ph": "X", "pid": 0, "tid": 0, "ts": 0.0, "dur": 50.0, "args": {}},
+    {"name": "w", "ph": "X", "pid": 0, "tid": 0, "ts": 30.0, "dur": 50.0, "args": {}},
+]
+garbage_hits = C.find_overlaps(garbage_events)
+check(len(garbage_hits) == 1, f"find_overlaps catches a deliberately overlapping pair, got {len(garbage_hits)}")
+
+# build() itself must refuse to write a trace with that defect, not just expose the checker.
+garbage_path = os.path.join(FIX, "capture_overlap_garbage.json")
+try:
+    C.build([garbage_path], clock_hz=1e6, labels=["garbage"], switch_us=None, clip_seconds=[])
+    check(False, "build() must raise ValueError on a capture with overlapping same-tid events")
+except ValueError as exc:
+    check("overlapping" in str(exc), f"build() raises ValueError naming the defect, got: {exc}")
 
 print()
 if failures:
