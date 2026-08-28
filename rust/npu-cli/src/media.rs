@@ -162,6 +162,34 @@ pub fn render(utts: &[Utterance], format: &str, source: &str) -> Result<String> 
     Ok(s)
 }
 
+/// Split a diarized turn into ASR-sized pieces.
+///
+/// The Parakeet path silently truncates its input at `WIN_MEL` = 2040 mel frames = 20.4 s
+/// (`npu-engine/src/asr/parakeet.rs:160`, `t.min(WIN_MEL)`): a longer request returns 200 OK with
+/// the tail simply missing, no error and no log. Conversational turns routinely exceed that -- a
+/// 240 s recording measured here contained a single 124 s span -- so transcribing a turn whole
+/// loses most of it.
+///
+/// This is a WORKAROUND at the call site, not a fix: the truncation belongs to the ASR backend and
+/// is tracked separately. It is done here because silently inheriting a silent truncation is how
+/// the original defect survived unnoticed in the first place.
+///
+/// Splits on an even division so pieces are similar length rather than leaving a runt at the end,
+/// and never emits a piece longer than `max_s`.
+pub fn split_turn(start_s: f32, end_s: f32, max_s: f32) -> Vec<(f32, f32)> {
+    let dur = end_s - start_s;
+    if dur <= max_s || max_s <= 0.0 {
+        return vec![(start_s, end_s)];
+    }
+    let n = (dur / max_s).ceil() as usize;
+    let step = dur / n as f32;
+    (0..n).map(|i| {
+        let a = start_s + step * i as f32;
+        let b = if i + 1 == n { end_s } else { start_s + step * (i + 1) as f32 };
+        (a, b)
+    }).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,6 +269,36 @@ mod tests {
     fn an_unknown_format_is_a_named_error() {
         let e = render(&utts(), "docx", "x").unwrap_err().to_string();
         assert!(e.contains("docx") && e.contains("md|srt|txt|json"), "{e}");
+    }
+
+    #[test]
+    fn a_turn_within_the_asr_window_is_left_alone() {
+        assert_eq!(split_turn(1.0, 15.0, 18.0), vec![(1.0, 15.0)]);
+        assert_eq!(split_turn(0.0, 18.0, 18.0), vec![(0.0, 18.0)], "exactly at the limit");
+    }
+
+    #[test]
+    fn a_long_turn_splits_into_pieces_the_asr_can_actually_hold() {
+        // The measured case: one 124s span in a 240s recording. Whole, Parakeet would keep 20.4s
+        // of it and silently drop the rest.
+        let parts = split_turn(116.11, 240.39, 18.0);
+        assert!(parts.len() >= 7, "124s must not stay one piece: {parts:?}");
+        for (a, b) in &parts {
+            assert!(b - a <= 18.0 + 1e-3, "piece {a}-{b} exceeds the ASR window");
+            assert!(b > a, "no empty piece");
+        }
+        assert!((parts[0].0 - 116.11).abs() < 1e-3, "must start where the turn starts");
+        assert!((parts.last().unwrap().1 - 240.39).abs() < 1e-3, "and end where it ends");
+    }
+
+    #[test]
+    fn splitting_loses_no_audio_and_leaves_no_gaps() {
+        let parts = split_turn(5.0, 100.0, 18.0);
+        let covered: f32 = parts.iter().map(|(a, b)| b - a).sum();
+        assert!((covered - 95.0).abs() < 1e-2, "pieces must tile the turn: {covered}");
+        for w in parts.windows(2) {
+            assert!((w[1].0 - w[0].1).abs() < 1e-3, "gap between {:?} and {:?}", w[0], w[1]);
+        }
     }
 
     #[test]

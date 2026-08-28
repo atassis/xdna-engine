@@ -164,6 +164,16 @@ fn transcribe(path: &Path, wav: &Path, model: Option<&str>) -> Result<()> {
 /// the transcript gains a line of noise, not a word.
 const MIN_UTTERANCE_S: f32 = 0.30;
 
+/// Longest span sent to ASR in one call.
+///
+/// Parakeet truncates at WIN_MEL = 2040 mel frames = 20.4 s and returns 200 OK with the tail
+/// missing (`npu-engine/src/asr/parakeet.rs:160`). 18 s leaves margin for the frame arithmetic
+/// rather than sitting on the cliff edge. Overridable so a backend without the limit is not
+/// penalised by it.
+fn asr_window_s() -> f32 {
+    std::env::var("NPU_ASR_MAX_SPAN_S").ok().and_then(|v| v.parse().ok()).unwrap_or(18.0)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn transcribe_media(path: &Path, input: &Path, out: Option<&Path>, format: OutFormat,
                     asr: Option<&str>, diar: Option<&str>, only_track: Option<usize>,
@@ -210,6 +220,13 @@ fn transcribe_media(path: &Path, input: &Path, out: Option<&Path>, format: OutFo
             let n_spk = spans.iter().map(|s| s.2).collect::<std::collections::BTreeSet<_>>().len();
             eprintln!("[npu] {label}: {} span(s), {n_spk} speaker(s)", spans.len());
 
+            // Split turns the ASR cannot hold whole, then transcribe each piece. Without this a
+            // long turn returns only its first ~20 s, with no error to notice.
+            let max_span = asr_window_s();
+            let spans: Vec<(f32, f32, u32)> = spans.iter()
+                .flat_map(|&(a, b, spk)| media::split_turn(a, b, max_span).into_iter()
+                    .map(move |(x, y)| (x, y, spk)))
+                .collect();
             for (start_s, end_s, spk) in spans {
                 if end_s - start_s < MIN_UTTERANCE_S { continue }
                 // Slice the PCM directly rather than re-invoking ffmpeg per span: the samples are
