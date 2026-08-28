@@ -53,15 +53,28 @@ impl Servable for EngineModel {
     }
 }
 
+impl EngineLoader {
+    /// A scenario path resolved against the engine ROOT when it is relative.
+    ///
+    /// `root` used to reach only the artifacts, so a relative `scenario = "scenarios/x.toml"` was
+    /// joined against the process's working directory instead. That works wherever cwd happens to
+    /// equal the root -- which the systemd unit sets, masking it -- and fails everywhere else, so
+    /// the CLI could not run from any other directory.
+    fn scenario_path(&self, cfg: &ModelCfg) -> std::path::PathBuf {
+        let p = std::path::Path::new(&cfg.scenario);
+        if p.is_absolute() { p.to_path_buf() } else { self.root.join(p) }
+    }
+}
+
 impl ModelLoader for EngineLoader {
     fn load(&self, cfg: &ModelCfg) -> Result<Box<dyn Servable>, EngineError> {
-        let model = npu_engine::Model::load_in(&cfg.scenario, &self.root)?;
+        let model = npu_engine::Model::load_in(self.scenario_path(cfg), &self.root)?;
         Ok(Box::new(EngineModel { model }))
     }
     /// Read the scenario's `[scenario] kind`. Parsing one small TOML costs nothing next to a load,
     /// and it is the same field `registry::try_build` dispatches on.
     fn declared_capability(&self, cfg: &ModelCfg) -> Option<Capability> {
-        let sc = npu_engine::config::ScenarioConfig::load(std::path::Path::new(&cfg.scenario)).ok()?;
+        let sc = npu_engine::config::ScenarioConfig::load(&self.scenario_path(cfg)).ok()?;
         Capability::from_scenario_kind(&sc.scenario.kind)
     }
 }
@@ -109,6 +122,19 @@ pub mod mock {
 mod tests {
     use super::*;
     use npu_engine::capability::{Request, Response, Segment};
+
+    #[test]
+    fn a_relative_scenario_resolves_against_the_root_not_the_cwd() {
+        // The regression the CLI hit: engine.toml carries `scenarios/x.toml`, and joining that
+        // against the process cwd works only where cwd happens to equal the root -- which the
+        // systemd unit sets, so the service masked it and only the CLI failed.
+        let l = EngineLoader { root: std::path::PathBuf::from("/opt/engine") };
+        let rel = ModelCfg { name: "m".into(), scenario: "scenarios/x.toml".into() };
+        assert_eq!(l.scenario_path(&rel), std::path::PathBuf::from("/opt/engine/scenarios/x.toml"));
+        // An absolute path is already an answer and must be left alone.
+        let abs = ModelCfg { name: "m".into(), scenario: "/etc/npu/y.toml".into() };
+        assert_eq!(l.scenario_path(&abs), std::path::PathBuf::from("/etc/npu/y.toml"));
+    }
 
     /// A `Servable` standing in for a loaded diarize model, exercising the SHAPE contract the
     /// EngineModel adapter must honour: audio in, segments out.
