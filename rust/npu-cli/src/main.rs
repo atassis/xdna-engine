@@ -71,19 +71,59 @@ fn quiet_one_shot() {
 ///
 /// Order: explicit env override, then derive from an absolute scenario path
 /// (`<repo>/scenarios/x.toml` -> `<repo>`), then cwd as the last resort.
-fn root(cfg: &Config) -> Result<PathBuf> {
+/// Where `artifacts/` and `scenarios/` live.
+///
+/// Ordered by how explicit each source is, and every candidate is CHECKED before it is returned:
+/// a root is only a root if it actually holds `scenarios/`. That check is the point. The absolute-
+/// scenario branch below shipped unverified and was dead the whole time -- `engine.toml` writes
+/// scenario paths relative (`scenarios/asr.toml`), so `is_absolute()` skipped every model and the
+/// function fell through to the working directory. Any invocation from outside a checkout then died
+/// on `scenario <cwd>/scenarios/....toml: No such file`, which is not a diagnosis of anything.
+fn root(cfg: &Config, config_path: &Path) -> Result<PathBuf> {
     if let Ok(p) = std::env::var("XDNA_ENGINE_ROOT") {
         return Ok(PathBuf::from(p));
     }
-    for m in &cfg.models {
-        let s = Path::new(&m.scenario);
-        if !s.is_absolute() { continue; }
-        let dir = match s.parent() { Some(d) => d, None => continue };
-        if dir.file_name().map(|n| n == "scenarios").unwrap_or(false) {
-            if let Some(r) = dir.parent() { return Ok(r.to_path_buf()); }
-        }
+    let home = std::env::var("HOME").ok().map(PathBuf::from);
+    let install = std::env::var("XDG_DATA_HOME").ok().map(PathBuf::from)
+        .or_else(|| home.map(|h| h.join(".local/share")))
+        // The prefix install.sh stages and bakes into the unit (`ENGINE_ROOT`, install.sh). If that
+        // name changes there, it must change here: these are one constant in two files, and the
+        // only reason it is not shared is that one of them is bash.
+        .map(|d| d.join("xdna-engine"));
+    let cwd = std::env::current_dir().ok();
+    for cand in root_candidates(cfg, config_path, cwd, install) {
+        if cand.join("scenarios").is_dir() { return Ok(cand) }
     }
     std::env::current_dir().context("cwd")
+}
+
+/// The candidate roots, most explicit first. Separate from `root` so the ordering is testable
+/// without setting process-wide environment variables.
+fn root_candidates(cfg: &Config, config_path: &Path, cwd: Option<PathBuf>,
+                   install: Option<PathBuf>) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    // 1. An absolute `.../scenarios/x.toml` names its own root.
+    for m in &cfg.models {
+        let s = Path::new(&m.scenario);
+        if !s.is_absolute() { continue }
+        let Some(dir) = s.parent() else { continue };
+        if dir.file_name().map(|n| n == "scenarios").unwrap_or(false) {
+            if let Some(r) = dir.parent() { out.push(r.to_path_buf()) }
+        }
+    }
+    // 2. The config's own directory, for a self-contained layout that keeps the two together.
+    //    NOT the common case -- ~/.config/npu holds only engine.toml -- so it is checked for
+    //    `scenarios/` by the caller like every other candidate rather than assumed.
+    if let Some(d) = config_path.parent() { out.push(d.to_path_buf()) }
+    // 3. A checkout the operator is standing in. Ranked ABOVE the install root, not below: the
+    //    installed prefix symlinks `artifacts/` back to whichever checkout was installed from, so
+    //    preferring it would hand a second worktree the first one's weights without saying so.
+    //    Only taken when it really holds `scenarios/`, which is what makes it safe to try early.
+    out.extend(cwd);
+    // 4. Where install.sh put it. This is the one that makes `npu diarize foo.wav` work in a plain
+    //    shell, which is the case that was broken.
+    out.extend(install);
+    out
 }
 
 /// Fail SOFTLY when the port is already taken, instead of loading models first and dying on an
@@ -125,7 +165,7 @@ fn serve(path: &Path, port: Option<u16>, allow_degraded: bool) -> Result<()> {
     let cfg = load_cfg(path)?;
     let port = port.unwrap_or(cfg.server.port);
     preflight_serve(port)?;
-    let root = root(&cfg)?;
+    let root = root(&cfg, path)?;
     let (handle, _join) = start(cfg, Box::new(EngineLoader { root }))?;
     // Do not bind a port the service cannot serve from. The initial reconcile records a load
     // failure as `Failed` rather than panicking, so before this the socket came up and every
@@ -150,7 +190,7 @@ fn serve(path: &Path, port: Option<u16>, allow_degraded: bool) -> Result<()> {
 fn transcribe(path: &Path, wav: &Path, model: Option<&str>) -> Result<()> {
     quiet_one_shot();
     let cfg = load_cfg(path)?;
-    let root = root(&cfg)?;
+    let root = root(&cfg, path)?;
     // Lazy: a one-shot run should load the model it serves, and nothing else.
     let (handle, join) = start_lazy(cfg, Box::new(EngineLoader { root }))?;
     let bytes = std::fs::read(wav).with_context(|| format!("read {}", wav.display()))?;
@@ -181,7 +221,7 @@ fn transcribe_media(path: &Path, input: &Path, out: Option<&Path>, format: OutFo
                     no_diarize: bool) -> Result<()> {
     quiet_one_shot();
     let cfg = load_cfg(path)?;
-    let root = root(&cfg)?;
+    let root = root(&cfg, path)?;
     let tracks = media::probe_audio_tracks(input)?;
     if tracks.is_empty() { bail!("{} has no audio tracks", input.display()); }
     let wanted: Vec<&media::AudioTrack> = match only_track {
@@ -268,7 +308,7 @@ fn transcribe_media(path: &Path, input: &Path, out: Option<&Path>, format: OutFo
 fn diarize(path: &Path, wav: &Path, model: Option<&str>, json: bool) -> Result<()> {
     quiet_one_shot();
     let cfg = load_cfg(path)?;
-    let root = root(&cfg)?;
+    let root = root(&cfg, path)?;
     // Lazy, same reason as `transcribe`: a one-shot run loads the model it serves and nothing else.
     let (handle, join) = start_lazy(cfg, Box::new(EngineLoader { root }))?;
     let bytes = std::fs::read(wav).with_context(|| format!("read {}", wav.display()))?;
@@ -298,7 +338,7 @@ fn render_segments(segs: &[npu_engine::capability::Segment], json: bool) -> Stri
 fn embed(path: &Path, text: &str, model: Option<&str>) -> Result<()> {
     quiet_one_shot();
     let cfg = load_cfg(path)?;
-    let root = root(&cfg)?;
+    let root = root(&cfg, path)?;
     // Lazy: `npu embed` against an ASR-only config used to pay a full parakeet load before it could
     // say there was no embed model at all.
     let (handle, join) = start_lazy(cfg, Box::new(EngineLoader { root }))?;
@@ -329,7 +369,7 @@ fn bake(path: &Path, name: &str) -> Result<()> {
     let sc = npu_engine::config::ScenarioConfig::load(Path::new(&m.scenario))
         .with_context(|| format!("scenario {}", m.scenario))?;
     match sc.artifacts.model_spec()? {
-        Some(spec) => { let p = spec.ensure_checkpoint(&root(&cfg)?, false)?; println!("baked: {}", p.display()); }
+        Some(spec) => { let p = spec.ensure_checkpoint(&root(&cfg, path)?, false)?; println!("baked: {}", p.display()); }
         None => println!("nothing to bake ({} uses legacy npy weights)", name),
     }
     Ok(())
@@ -342,7 +382,7 @@ fn bake(path: &Path, name: &str) -> Result<()> {
 /// which is the cwd dependency the service install just removed -- folding it in drops that too.
 fn weights_cmd(path: &Path, action: &WeightsCmd) -> Result<()> {
     use npu_weights::{checkpoint, spec::ModelSpec, spec::Source};
-    let root = load_cfg(path).ok().and_then(|c| root(&c).ok())
+    let root = load_cfg(path).ok().and_then(|c| root(&c, path).ok())
         .map(Ok)
         .unwrap_or_else(std::env::current_dir)
         .context("repo root")?;
@@ -433,6 +473,90 @@ fn http_req(port: u16, method: &str, path: &str, body: &str) -> Result<String> {
 mod tests {
     use super::*;
     use npu_runtime::config::{Defaults, ModelCfg, ServerCfg};
+    fn cfg_with(scenarios: &[&str]) -> Config {
+        Config {
+            server: ServerCfg::default(),
+            defaults: Defaults::default(),
+            models: scenarios.iter().enumerate()
+                .map(|(i, s)| ModelCfg { name: format!("m{i}"), scenario: (*s).into() })
+                .collect(),
+        }
+    }
+
+    /// The regression: a config with RELATIVE scenario paths -- which is what `npu config` writes
+    /// and what every installed engine.toml holds -- must still produce a usable root.
+    ///
+    /// The old chain had exactly one branch between the env var and the working directory, and it
+    /// required an ABSOLUTE scenario path. So it never fired for a real config, and `npu diarize`
+    /// outside a checkout died on `<cwd>/scenarios/...: No such file`. Nothing tested it, which is
+    /// how a dead branch stayed in a shipped fix.
+    #[test]
+    fn a_relative_config_still_finds_the_install_root() {
+        let install = tempfile::tempdir().unwrap();
+        std::fs::create_dir(install.path().join("scenarios")).unwrap();
+        let cfgdir = tempfile::tempdir().unwrap();          // holds engine.toml and nothing else
+        let cfg_path = cfgdir.path().join("engine.toml");
+
+        let cands = root_candidates(&cfg_with(&["scenarios/asr.toml"]), &cfg_path, None,
+                                    Some(install.path().to_path_buf()));
+        assert!(!cands.is_empty(), "a relative config must still offer candidates");
+        // The config's own directory is offered but has no scenarios/, so it must not be chosen;
+        // the install root has one and must be.
+        let chosen = cands.iter().find(|c| c.join("scenarios").is_dir());
+        assert_eq!(chosen, Some(&install.path().to_path_buf()),
+            "the checked candidate must be the install root, not the config dir: {cands:?}");
+    }
+
+    /// An absolute `.../scenarios/x.toml` still names its own root, and wins over the install
+    /// location -- otherwise pointing the CLI at a second checkout would silently serve the
+    /// installed one.
+    #[test]
+    fn an_absolute_scenario_path_outranks_the_install_root() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repo.path().join("scenarios")).unwrap();
+        let install = tempfile::tempdir().unwrap();
+        std::fs::create_dir(install.path().join("scenarios")).unwrap();
+        let abs = repo.path().join("scenarios/asr.toml");
+        let cands = root_candidates(&cfg_with(&[abs.to_str().unwrap()]),
+                                    Path::new("/nowhere/engine.toml"), None,
+                                    Some(install.path().to_path_buf()));
+        assert_eq!(cands.first(), Some(&repo.path().to_path_buf()),
+            "an absolute scenario names its root and must rank first: {cands:?}");
+    }
+
+    /// A candidate without `scenarios/` is not a root. This is the check whose absence let the old
+    /// chain fall through to a working directory that was never going to work.
+    #[test]
+    fn a_candidate_without_scenarios_is_not_a_root() {
+        let empty = tempfile::tempdir().unwrap();
+        let cands = root_candidates(&cfg_with(&["scenarios/asr.toml"]),
+                                    &empty.path().join("engine.toml"), None,
+                                    Some(empty.path().to_path_buf()));
+        assert!(cands.iter().all(|c| !c.join("scenarios").is_dir()),
+            "nothing here holds scenarios/, so no candidate may pass the check: {cands:?}");
+    }
+
+    /// A checkout you are standing in outranks the installed prefix.
+    ///
+    /// Not a preference: install.sh symlinks the installed `artifacts/` back to whichever checkout
+    /// it was run from, so ranking the install root first would give a SECOND worktree the FIRST
+    /// one's weights and report nothing. The bug being fixed here is a silent wrong root; trading
+    /// it for a different silent wrong root is not a fix.
+    #[test]
+    fn a_checkout_you_are_standing_in_outranks_the_install_root() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repo.path().join("scenarios")).unwrap();
+        let install = tempfile::tempdir().unwrap();
+        std::fs::create_dir(install.path().join("scenarios")).unwrap();
+        let cands = root_candidates(&cfg_with(&["scenarios/asr.toml"]),
+                                    Path::new("/nowhere/engine.toml"),
+                                    Some(repo.path().to_path_buf()),
+                                    Some(install.path().to_path_buf()));
+        let chosen = cands.iter().find(|c| c.join("scenarios").is_dir());
+        assert_eq!(chosen, Some(&repo.path().to_path_buf()),
+            "the checkout must win over the install prefix: {cands:?}");
+    }
+
     #[test]
     fn render_empty_and_populated() {
         let empty = Config::default();
