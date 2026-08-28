@@ -17,12 +17,10 @@ use std::time::Instant;
 
 use ndarray::prelude::*;
 use npu_asr::kernel_registry;
+use npu_bricks::{u16_bytes, PAD_M, WA_SUBDIR};
 use npu_xrt::{Bo, Device, Kernel, FLAG_CACHEABLE, FLAG_HOST_ONLY};
 
-const PAD_M: usize = 512;
 const KRES: usize = 1024; // resident kernel contraction dim
-const WA_SUBDIR: &str =
-    "mlir-aie/programming_examples/basic/matrix_multiplication/whole_array/build";
 
 /// Activation epilogue baked into the modal resident's per-N instruction stream (RTP-selected at
 /// generate time -- `whole_array_modal_iron.py` sets `mode_val` and `set_modes` bakes it into that
@@ -3867,10 +3865,6 @@ fn c_at(cb: &[u8], w: usize, i: usize) -> f32 {
     } else {
         npu_xrt::bf16_bits_to_f32(u16::from_le_bytes([cb[i * 2], cb[i * 2 + 1]]))
     }
-}
-
-fn u16_bytes(v: &[u16]) -> &[u8] {
-    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 2) }
 }
 
 fn f32_bytes(v: &[f32]) -> &[u8] {

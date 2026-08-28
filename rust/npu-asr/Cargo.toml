@@ -28,6 +28,7 @@ chained_ffn = []
 npu-xrt = { path = "../npu-xrt" }
 npu-asr-host = { path = "../npu-asr-host" }
 npu-onnx = { path = "../npu-onnx" }
+npu-bricks = { path = "../npu-bricks" }
 ndarray = "0.16"
 ndarray-npy = { version = "0.9", default-features = false }
 rayon = "1"
