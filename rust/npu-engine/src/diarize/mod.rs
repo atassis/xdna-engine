@@ -4,6 +4,7 @@
 pub mod cluster;
 pub mod powerset;
 pub mod stitch;
+pub mod timeline;
 pub mod types;
 
 pub use types::{Crop, Manifest, Segmenter, SpeakerEmbedder};
