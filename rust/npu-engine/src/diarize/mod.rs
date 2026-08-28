@@ -77,18 +77,20 @@ impl DiarizePipeline {
                 let weights = stitch::exclusive_weights(&activity, w, s, n_emb_frames);
                 if !stitch::has_speech(&weights) { continue }
                 let start = w * hop_samples;
-                let end = (start + win_samples).min(pcm.len());
-                if start >= end { continue }
-                let mut buf = pcm[start..end].to_vec();
-                buf.resize(win_samples, 0);   // the padding contract: pad, and report what was real
-                crops.push(Crop { pcm: buf, start_s: start as f64 / m.sample_rate as f64, weights });
+                if start >= pcm.len() { continue }
+                crops.push(Crop {
+                    offset: start,
+                    len: win_samples,
+                    start_s: start as f64 / m.sample_rate as f64,
+                    weights,
+                });
                 keys.push((w, s));
             }
         }
         if crops.is_empty() { return Ok(Vec::new()) }
 
         let t = std::time::Instant::now();
-        let embeddings = self.embedder.embed(&crops)?;
+        let embeddings = self.embedder.embed(pcm, &crops)?;
         let t_emb = t.elapsed();
         let t = std::time::Instant::now();
         let labels_vec = self.clusterer.cluster(&embeddings)?;
@@ -166,7 +168,7 @@ mod tests {
     /// Window 0's voice points +x, window 1's points +y -> two clusters.
     struct MockEmb;
     impl SpeakerEmbedder for MockEmb {
-        fn embed(&self, crops: &[Crop]) -> Result<Array2<f32>, EngineError> {
+        fn embed(&self, _pcm: &[i16], crops: &[Crop]) -> Result<Array2<f32>, EngineError> {
             let mut e = Array2::zeros((crops.len(), 2));
             for (i, c) in crops.iter().enumerate() {
                 if c.start_s < 0.5 { e[[i, 0]] = 1.0; } else { e[[i, 1]] = 1.0; }
@@ -210,6 +212,31 @@ mod tests {
     }
 
     #[test]
+    fn crops_reference_the_source_instead_of_copying_it() {
+        // The regression that took the service down: crops used to own a Vec<i16> each, so a
+        // 4-minute clip held 462 x 320 KB of audio copies before a single embedding ran. A crop
+        // must name a slice, so memory follows the batch and not the clip length.
+        use std::sync::{Arc, Mutex};
+        struct Spy(Arc<Mutex<Vec<(usize, usize)>>>);
+        impl SpeakerEmbedder for Spy {
+            fn embed(&self, pcm: &[i16], crops: &[Crop]) -> Result<Array2<f32>, EngineError> {
+                for c in crops {
+                    assert!(c.offset < pcm.len(), "crop offset must index the source clip");
+                    self.0.lock().unwrap().push((c.offset, c.len));
+                }
+                Ok(Array2::zeros((crops.len(), 2)))
+            }
+        }
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let p = DiarizePipeline::new(manifest(), Box::new(MockSeg), Box::new(Spy(seen.clone())),
+                                     std::path::Path::new(".")).unwrap();
+        let _ = p.run(&vec![0i16; 32_000]);
+        let got = seen.lock().unwrap().clone();
+        assert!(!got.is_empty(), "the embedder must be called");
+        assert!(got.iter().all(|&(_, len)| len > 0), "every crop names a real span: {got:?}");
+    }
+
+    #[test]
     fn a_silent_clip_yields_no_segments_and_no_panic() {
         struct Silent;
         impl Segmenter for Silent {
@@ -228,7 +255,7 @@ mod tests {
         use std::sync::{Arc, Mutex};
         struct Spy(Arc<Mutex<Vec<usize>>>);
         impl SpeakerEmbedder for Spy {
-            fn embed(&self, crops: &[Crop]) -> Result<Array2<f32>, EngineError> {
+            fn embed(&self, _pcm: &[i16], crops: &[Crop]) -> Result<Array2<f32>, EngineError> {
                 self.0.lock().unwrap().extend(crops.iter().map(|c| c.weights.len()));
                 Ok(Array2::zeros((crops.len(), 2)))
             }

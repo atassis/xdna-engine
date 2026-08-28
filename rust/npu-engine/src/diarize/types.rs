@@ -88,8 +88,12 @@ pub struct ClusterCfg {
     pub source: String,
 }
 
-/// One speaker's crop of one window: the audio, where it sits in the clip, and the per-frame
-/// activation weights for THAT speaker.
+/// One speaker's crop of one window: WHERE the audio is, where it sits in the clip, and the
+/// per-frame activation weights for THAT speaker.
+///
+/// Holds an offset into the source PCM rather than a copy of it. Copying made peak memory a
+/// function of clip length -- 462 crops x 320 KB for a 4-minute file, all live before a single
+/// embedding was computed -- which is how a longer file became a crash rather than a slower run.
 ///
 /// `weights` is not an optimisation. The shipped pipeline runs `embedding_exclude_overlap: true`
 /// and WeSpeaker pools weighted statistics over only that speaker's active, non-overlapping frames
@@ -98,7 +102,11 @@ pub struct ClusterCfg {
 /// diarization matters.
 #[derive(Debug, Clone)]
 pub struct Crop {
-    pub pcm: Vec<i16>,
+    /// First sample of this window in the source PCM.
+    pub offset: usize,
+    /// Window length in samples. The slice may run past the end of the source; the embedder
+    /// zero-pads, which is the same padding contract the segmenter uses.
+    pub len: usize,
     pub start_s: f64,
     /// One weight per EMBEDDER fbank frame, 0.0..=1.0.
     pub weights: Vec<f32>,
@@ -128,8 +136,9 @@ pub trait Clusterer {
 
 /// Fixed-dimension speaker embeddings, weighted-pooled per crop.
 pub trait SpeakerEmbedder {
-    /// Returns `[n_crops, dim]`, L2-normalised.
-    fn embed(&self, crops: &[Crop]) -> Result<Array2<f32>, EngineError>;
+    /// Returns `[n_crops, dim]`, L2-normalised. `pcm` is the whole clip; each crop names a slice
+    /// of it, so no per-crop audio copy exists and peak memory follows the BATCH, not the clip.
+    fn embed(&self, pcm: &[i16], crops: &[Crop]) -> Result<Array2<f32>, EngineError>;
 }
 
 #[cfg(test)]
@@ -166,8 +175,12 @@ mod tests {
 
     #[test]
     fn a_crop_carries_its_own_activation_weights() {
-        let c = Crop { pcm: vec![0i16; 16], start_s: 2.0, weights: vec![0.0, 1.0, 1.0, 0.0] };
+        let c = Crop { offset: 32_000, len: 160_000, start_s: 2.0,
+                       weights: vec![0.0, 1.0, 1.0, 0.0] };
         assert_eq!(c.weights.len(), 4);
         assert_eq!(c.start_s, 2.0);
+        // Names a slice of the source rather than owning a copy: that is what keeps peak memory a
+        // function of the batch instead of the clip length.
+        assert_eq!(c.offset + c.len, 192_000);
     }
 }

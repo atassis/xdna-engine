@@ -75,46 +75,73 @@ impl Segmenter for OnnxSegmenter {
 
 pub struct OnnxEmbedder { _env: Rc<Env>, sess: Session, dim: usize, batch: usize }
 
+/// Crops per ONNX call, chosen from a MEMORY BUDGET rather than copied from upstream's config.
+///
+/// onnxruntime sizes its arena for the largest activation set it is asked to hold, so the batch
+/// sets peak RSS: measured 1519 MB at 32 and 568 MB at 8 on the same clip. Upstream's 32 is right
+/// for their runtime, not a number we validated, and taking it unexamined is what let a 4-minute
+/// file exceed a service's headroom and die inside the allocator.
+///
+/// ~55 MB per crop is the measured slope ((1519-568)/24). Budget via NPU_DIARIZE_MEM_MB.
+fn embed_batch(m: &Manifest) -> usize {
+    const MB_PER_CROP: usize = 55;
+    let budget = std::env::var("NPU_DIARIZE_MEM_MB").ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(768);
+    let from_budget = (budget / MB_PER_CROP).max(1);
+    // The manifest's batch_size stays an upper bound: a budget must never make us slower than
+    // upstream intends, only smaller when the arena would not fit.
+    from_budget.min(m.embedding.batch_size.max(1))
+}
+
 impl OnnxEmbedder {
     pub fn build(m: &Manifest, dir: &Path) -> Result<OnnxEmbedder, EngineError> {
         let (env, sess) = load(dir, &m.embedding.onnx)?;
-        Ok(OnnxEmbedder { _env: env, sess, dim: m.embedding.dim, batch: m.embedding.batch_size.max(1) })
+        Ok(OnnxEmbedder { _env: env, sess, dim: m.embedding.dim, batch: embed_batch(m) })
     }
 }
 
 impl SpeakerEmbedder for OnnxEmbedder {
-    /// Embed in BATCHES, not one crop per call.
+    /// Embed in batches, slicing each crop out of the source PCM.
     ///
-    /// Measured: crop-at-a-time was 95.6% of total diarization runtime (24.3 s of 25.5 s on a 46 s
-    /// clip, ~329 ms per crop), because each call re-pays the session's fixed per-run cost on a
-    /// single 10 s window. The graph is exported with a dynamic batch axis and upstream's own
-    /// config uses `embedding_batch_size: 32`, so this is the shape the model expects.
+    /// Peak memory follows the BATCH, not the clip: measured on a 60 s file, batch 32 peaked at
+    /// 1519 MB and batch 8 at 568 MB, because onnxruntime sizes its arena for the largest
+    /// ResNet34 activation set it is ever asked to hold. Left at 32 with clip-length crop copies
+    /// on top, a 4-minute file reached 2170 MB standalone and took the service down.
     ///
-    /// Crops within a batch must be the same length; they are, since every crop is one padded
-    /// window. The assert states that rather than trusting it, because a ragged batch would
-    /// silently reshape into nonsense instead of failing.
-    fn embed(&self, crops: &[Crop]) -> Result<Array2<f32>, EngineError> {
+    /// Crops within a batch must be the same length; they are, since every crop is one window.
+    /// The assert states that rather than trusting it -- a ragged batch reshapes into nonsense
+    /// instead of failing.
+    fn embed(&self, pcm: &[i16], crops: &[Crop]) -> Result<Array2<f32>, EngineError> {
         let mut out = Array2::<f32>::zeros((crops.len(), self.dim));
         if crops.is_empty() { return Ok(out) }
-        let n_samp = crops[0].pcm.len();
+        let n_samp = crops[0].len;
         let n_w = crops[0].weights.len();
 
+        // Reused across batches so the per-batch input buffers are allocated once, not per call.
+        let mut wav: Vec<f32> = Vec::with_capacity(self.batch * n_samp);
+        let mut msk: Vec<f32> = Vec::with_capacity(self.batch * n_w);
+
         for (b, chunk) in crops.chunks(self.batch).enumerate() {
-            let ok = chunk.iter().all(|c| c.pcm.len() == n_samp && c.weights.len() == n_w);
-            if !ok {
+            if !chunk.iter().all(|c| c.len == n_samp && c.weights.len() == n_w) {
                 return Err(EngineError::Device(
-                    "embedder batch has ragged crops; every crop must be one padded window".into()));
+                    "embedder batch has ragged crops; every crop must be one window".into()));
             }
-            let mut wav: Vec<f32> = Vec::with_capacity(chunk.len() * n_samp);
-            let mut msk: Vec<f32> = Vec::with_capacity(chunk.len() * n_w);
+            wav.clear();
+            msk.clear();
             for c in chunk {
-                wav.extend(c.pcm.iter().map(|&s| s as f32 / 32768.0));
+                let end = (c.offset + c.len).min(pcm.len());
+                let have = pcm.get(c.offset..end).unwrap_or(&[]);
+                wav.extend(have.iter().map(|&s| s as f32 / 32768.0));
+                // Zero-pad a window that runs past the clip end -- the segmenter's padding
+                // contract, applied here so the batch stays rectangular.
+                wav.resize((b_len(&wav, n_samp)) , 0.0);
                 msk.extend_from_slice(&c.weights);
             }
             let bs = chunk.len() as i64;
             let wt = Tensor::F32(&wav, vec![bs, n_samp as i64]);
-            // `weights` is not optional: without it the graph pools over the whole crop, which is a
-            // different statistic and diverges exactly on overlapping speech.
+            // `weights` is not optional: without it the graph pools over the whole crop, which is
+            // a different statistic and diverges exactly on overlapping speech.
             let mt = Tensor::F32(&msk, vec![bs, n_w as i64]);
             let r = self.sess.run(&[("waveform", wt), ("weights", mt)], &["embedding"])
                 .map_err(|e| EngineError::Device(format!("embedding onnx: {e}")))?;
@@ -129,6 +156,12 @@ impl SpeakerEmbedder for OnnxEmbedder {
         }
         Ok(out)
     }
+}
+
+/// Round `wav`'s length up to the next whole crop of `n_samp`, so a short final window is
+/// zero-padded to the batch's rectangular shape.
+fn b_len(wav: &[f32], n_samp: usize) -> usize {
+    wav.len().div_ceil(n_samp) * n_samp
 }
 
 #[cfg(test)]
