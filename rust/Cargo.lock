@@ -984,6 +984,8 @@ dependencies = [
  "anyhow",
  "clap",
  "clap_complete",
+ "ndarray",
+ "ndarray-npy",
  "npu-engine",
  "npu-runtime",
  "npu-weights",

@@ -10,7 +10,7 @@ mod media;
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser};
 
-use cli_def::{Cli, Cmd, ConfigCmd, OutFormat};
+use cli_def::{Cli, Cmd, ConfigCmd, OutFormat, WeightsCmd};
 use clap_complete::Shell;
 use npu_runtime::actor::{start, start_lazy};
 use npu_engine::capability::Capability;
@@ -40,6 +40,7 @@ fn main() -> Result<()> {
         Cmd::Reload { port } => reload(&path, *port),
         Cmd::Bake { name } => bake(&path, name),
         Cmd::Config { action } => config_cmd(&path, action),
+        Cmd::Weights { action } => weights_cmd(&path, action),
         Cmd::Completions { shell } => {
             let mut cmd = Cli::command();
             let name = cmd.get_name().to_string();
@@ -330,6 +331,43 @@ fn bake(path: &Path, name: &str) -> Result<()> {
     match sc.artifacts.model_spec()? {
         Some(spec) => { let p = spec.ensure_checkpoint(&root(&cfg)?, false)?; println!("baked: {}", p.display()); }
         None => println!("nothing to bake ({} uses legacy npy weights)", name),
+    }
+    Ok(())
+}
+
+/// Weight-checkpoint tooling.
+///
+/// Resolves the repo root the SAME way every other subcommand does (`root()`: XDNA_ENGINE_ROOT,
+/// then an absolute scenario path, then cwd). The standalone binary used a bare `current_dir()`,
+/// which is the cwd dependency the service install just removed -- folding it in drops that too.
+fn weights_cmd(path: &Path, action: &WeightsCmd) -> Result<()> {
+    use npu_weights::{checkpoint, spec::ModelSpec, spec::Source};
+    let root = load_cfg(path).ok().and_then(|c| root(&c).ok())
+        .map(Ok)
+        .unwrap_or_else(std::env::current_dir)
+        .context("repo root")?;
+    match action {
+        WeightsCmd::Bake { source, arch, checkpoint, force } => {
+            let spec = ModelSpec {
+                source: Source::parse(source)?, arch: arch.clone(), checkpoint: checkpoint.clone() };
+            let p = spec.ensure_checkpoint(&root, *force)?;
+            println!("checkpoint ready: {}", p.display());
+        }
+        WeightsCmd::Load { checkpoint, arch } => {
+            let l = checkpoint::load(checkpoint, arch)?;
+            println!("arch={} version={} tensors={}", l.arch, l.meta_version, l.names.len());
+            for n in l.names.iter().take(5) {
+                let (sh, _) = l.tensor_f32(n)?;
+                println!("  {n} {sh:?}");
+            }
+        }
+        WeightsCmd::Verify { checkpoint, arch, refs } => {
+            let l = checkpoint::load(checkpoint, arch)?;
+            let (n, max) = checkpoint::verify_against_npy(&l, refs)?;
+            println!("verified {n} tensors; max abs rel-err {max:.4e}");
+            anyhow::ensure!(max < 5e-2, "parity FAILED: max rel-err {max:.4e} >= 5e-2");
+            println!("PARITY PASS");
+        }
     }
     Ok(())
 }

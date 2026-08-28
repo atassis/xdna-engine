@@ -1,3 +1,5 @@
+mod common;
+
 // rust/npu-weights/tests/parity_gigaam.rs
 // Bakes the GigaAM-v3 Conformer ENCODER weights from the local ONNX
 // (models/gigaam_v3_encoder_static.onnx, weights inline) via the `gigaam` arch and checks every
@@ -5,7 +7,6 @@
 // artifacts/encoder, so checkpoint names (L{i}/..., pre_encode/pre_encode.conv.*) map directly to the
 // oracle npy paths. Gated on both the ONNX model AND the oracle npy being present (skips otherwise).
 use std::path::Path;
-use std::process::Command;
 
 #[test]
 fn gigaam_conformer_encoder_checkpoint_matches_python_oracle() {
@@ -20,20 +21,5 @@ fn gigaam_conformer_encoder_checkpoint_matches_python_oracle() {
         eprintln!("SKIP gigaam: oracle missing - run .venv/bin/python scripts/extract_encoder.py");
         return;
     }
-    let checkpoint = root.join("target/test-checkpoints/gigaam-encoder.safetensors");
-    let bin = env!("CARGO_BIN_EXE_npu-weights");
-    let st = Command::new(bin)
-        .current_dir(root)
-        .args(["bake", "--source", "path:models/gigaam_v3_encoder_static.onnx", "--arch", "gigaam",
-               "--checkpoint", checkpoint.to_str().unwrap(), "--force"])
-        .status().unwrap();
-    assert!(st.success(), "bake failed for gigaam");
-    let out = Command::new(bin)
-        .current_dir(root)
-        .args(["verify", "--checkpoint", checkpoint.to_str().unwrap(), "--arch", "gigaam",
-               "--refs", refs.to_str().unwrap()])
-        .output().unwrap();
-    let s = String::from_utf8_lossy(&out.stdout);
-    assert!(out.status.success(), "verify failed for gigaam:\n{s}\n{}", String::from_utf8_lossy(&out.stderr));
-    assert!(s.contains("PARITY PASS"), "no parity pass for gigaam:\n{s}");
+    common::bake_and_verify("gigaam", "path:models/gigaam_v3_encoder_static.onnx", "gigaam", &refs);
 }

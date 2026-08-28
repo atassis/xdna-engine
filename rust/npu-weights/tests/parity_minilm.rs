@@ -1,10 +1,11 @@
+mod common;
+
 // rust/npu-weights/tests/parity_minilm.rs
 //
 // Parity for sentence-transformers BERT-family text-embedding models against the Python oracle
 // (export_minilm.py). all-MiniLM-L6-v2 = 6-layer BERT (exercises the layer-count inference in the
 // generalized `bert` arch); bge-small/e5-small = 12-layer BERT-family (same arch, minor naming).
 use std::path::Path;
-use std::process::Command;
 
 fn check_one(sub: &str, hf: &str) {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
@@ -13,22 +14,7 @@ fn check_one(sub: &str, hf: &str) {
         eprintln!("SKIP {sub}: oracle missing - run .venv/bin/python scripts/export_minilm.py {hf} {sub}");
         return;
     }
-    let checkpoint = root.join(format!("target/test-checkpoints/{sub}.safetensors"));
-    let bin = env!("CARGO_BIN_EXE_npu-weights");
-    let st = Command::new(bin)
-        .current_dir(root)
-        .args(["bake", "--source", &format!("hf:{hf}"), "--arch", "bert",
-               "--checkpoint", checkpoint.to_str().unwrap(), "--force"])
-        .status().unwrap();
-    assert!(st.success(), "bake failed for {sub}");
-    let out = Command::new(bin)
-        .current_dir(root)
-        .args(["verify", "--checkpoint", checkpoint.to_str().unwrap(), "--arch", "bert",
-               "--refs", refs.to_str().unwrap()])
-        .output().unwrap();
-    let s = String::from_utf8_lossy(&out.stdout);
-    assert!(out.status.success(), "verify failed for {sub}:\n{s}\n{}", String::from_utf8_lossy(&out.stderr));
-    assert!(s.contains("PARITY PASS"), "no parity pass for {sub}:\n{s}");
+    common::bake_and_verify(sub, &format!("hf:{hf}"), "bert", &refs);
 }
 
 #[test]

@@ -12,6 +12,8 @@ path = "src/main.rs"
 npu-runtime = { path = "../npu-runtime" }
 npu-engine = { path = "../npu-engine" }
 npu-weights = { path = "../npu-weights" }
+ndarray = "0.16"
+ndarray-npy = { version = "0.9", default-features = false }
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 anyhow = "1"
