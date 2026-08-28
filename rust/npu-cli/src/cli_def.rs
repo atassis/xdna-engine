@@ -74,6 +74,14 @@ pub enum Cmd {
     Reload { #[arg(long)] port: Option<u16> },
     /// Pre-bake a model's weight checkpoint (host-only, no device).
     Bake { name: String },
+    /// Weight-checkpoint tooling: bake, inspect, and parity-check.
+    // Folded in from the separate `npu-weights` binary: `npu` is documented as the single
+    // entrypoint, `npu bake` already overlapped `npu-weights bake`, and a second binary was a
+    // second completion surface with none of this one's coverage guarantees.
+    Weights {
+        #[command(subcommand)]
+        action: WeightsCmd,
+    },
     /// Print a shell completion script (zsh, bash, fish, elvish, powershell).
     ///
     /// Generated from the clap command tree, so it covers every subcommand and flag and cannot
@@ -94,6 +102,30 @@ impl OutFormat {
     }
     /// File extension for the default output path.
     pub fn ext(self) -> &'static str { self.as_str() }
+}
+
+#[derive(Subcommand)]
+pub enum WeightsCmd {
+    /// Bake source weights into a bf16 checkpoint (skips if fresh, unless --force).
+    Bake {
+        /// `hf:<repo>[@rev]` or `path:/abs`.
+        #[arg(long)] source: String,
+        /// npu-weights arch transform: bert|esm|vit|opt|whisper|fastconformer|gigaam|...
+        #[arg(long)] arch: String,
+        #[arg(long, value_hint = ValueHint::FilePath)] checkpoint: Option<PathBuf>,
+        #[arg(long)] force: bool,
+    },
+    /// mmap-load a checkpoint and print tensor stats.
+    Load {
+        #[arg(long, value_hint = ValueHint::FilePath)] checkpoint: PathBuf,
+        #[arg(long)] arch: String,
+    },
+    /// Verify checkpoint tensors match a directory of reference .npy within tolerance.
+    Verify {
+        #[arg(long, value_hint = ValueHint::FilePath)] checkpoint: PathBuf,
+        #[arg(long)] arch: String,
+        #[arg(long, value_hint = ValueHint::DirPath)] refs: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
