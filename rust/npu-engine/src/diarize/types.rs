@@ -87,6 +87,18 @@ pub trait Segmenter {
     fn segment(&self, pcm: &[i16]) -> Result<(Array3<f32>, usize), EngineError>;
 }
 
+/// Group embeddings into speakers.
+///
+/// A trait, not a function, because the clustering STAGE is where diarization models actually
+/// differ once segmentation and embedding are behind their own traits. pyannote 3.1 uses
+/// centroid-linkage agglomerative clustering; community-1 uses Bayesian HMM (VBx) with a learned
+/// PLDA. Same pipeline, same `[tile, D]` embeddings in, same labels out -- so the model is DATA
+/// (a manifest naming its method) and not a second pipeline.
+pub trait Clusterer {
+    /// `[n_crops, dim]` L2-normalised embeddings -> one label per row, compacted to 0..k.
+    fn cluster(&self, embeddings: &Array2<f32>) -> Result<Vec<u32>, EngineError>;
+}
+
 /// Fixed-dimension speaker embeddings, weighted-pooled per crop.
 pub trait SpeakerEmbedder {
     /// Returns `[n_crops, dim]`, L2-normalised.

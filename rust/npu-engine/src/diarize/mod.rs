@@ -8,7 +8,7 @@ pub mod stitch;
 pub mod timeline;
 pub mod types;
 
-pub use types::{Crop, Manifest, Segmenter, SpeakerEmbedder};
+pub use types::{Clusterer, Crop, Manifest, Segmenter, SpeakerEmbedder};
 
 use std::collections::HashMap;
 
@@ -22,12 +22,21 @@ pub struct DiarizePipeline {
     manifest: Manifest,
     segmenter: Box<dyn Segmenter>,
     embedder: Box<dyn SpeakerEmbedder>,
+    clusterer: Box<dyn Clusterer>,
 }
 
 impl DiarizePipeline {
     pub fn new(manifest: Manifest, segmenter: Box<dyn Segmenter>, embedder: Box<dyn SpeakerEmbedder>)
+        -> Result<DiarizePipeline, EngineError> {
+        let clusterer = clusterer_for(&manifest)?;
+        Ok(DiarizePipeline { manifest, segmenter, embedder, clusterer })
+    }
+
+    /// Explicit clusterer, for tests and for a caller assembling a model the manifest cannot name.
+    pub fn with_clusterer(manifest: Manifest, segmenter: Box<dyn Segmenter>,
+                          embedder: Box<dyn SpeakerEmbedder>, clusterer: Box<dyn Clusterer>)
         -> DiarizePipeline {
-        DiarizePipeline { manifest, segmenter, embedder }
+        DiarizePipeline { manifest, segmenter, embedder, clusterer }
     }
 
     pub fn run(&self, pcm: &[i16]) -> Result<Vec<Segment>, EngineError> {
@@ -70,8 +79,7 @@ impl DiarizePipeline {
         if crops.is_empty() { return Ok(Vec::new()) }
 
         let embeddings = self.embedder.embed(&crops)?;
-        let labels_vec = cluster::cluster(
-            &embeddings, m.clustering.threshold as f32, m.clustering.min_cluster_size);
+        let labels_vec = self.clusterer.cluster(&embeddings)?;
         let n_clusters = cluster::n_clusters(&labels_vec).max(1);
         let labels: HashMap<(usize, usize), u32> =
             keys.iter().copied().zip(labels_vec.iter().copied()).collect();
@@ -80,6 +88,20 @@ impl DiarizePipeline {
         let global = stitch::aggregate_windows(&activity, &labels, hop_frames, n_global, n_clusters);
         let cov = stitch::coverage(n_windows, n_frames, hop_frames, n_global);
         Ok(timeline::to_segments(&global, &cov, 0.5, frame_s, m.min_duration_off_s))
+    }
+}
+
+/// Pick the clustering stage the manifest names. Unknown methods fail LOUDLY at load rather than
+/// silently falling back to centroid: a manifest asking for vbx and getting agglomerative would
+/// produce plausible-looking labels that are simply a different model's answer.
+fn clusterer_for(m: &Manifest) -> Result<Box<dyn Clusterer>, EngineError> {
+    match m.clustering.method.as_str() {
+        "centroid" => Ok(Box::new(cluster::AgglomerativeClusterer {
+            threshold: m.clustering.threshold as f32,
+            min_cluster_size: m.clustering.min_cluster_size,
+        })),
+        other => Err(EngineError::Load(format!(
+            "unsupported clustering method {other:?} (this build has: centroid)"))),
     }
 }
 
@@ -128,12 +150,23 @@ mod tests {
 
     #[test]
     fn two_windows_of_different_voices_become_two_speakers() {
-        let p = DiarizePipeline::new(manifest(), Box::new(MockSeg), Box::new(MockEmb));
+        let p = DiarizePipeline::new(manifest(), Box::new(MockSeg), Box::new(MockEmb)).unwrap();
         let segs = p.run(&vec![0i16; 32_000]).expect("diarize");
         assert!(!segs.is_empty(), "a fully-voiced clip must yield segments");
         let speakers: std::collections::BTreeSet<u32> = segs.iter().map(|s| s.speaker).collect();
         assert_eq!(speakers.len(), 2, "different voices must not collapse: {segs:?}");
         assert!(segs.iter().all(|s| s.end_s > s.start_s), "no empty spans: {segs:?}");
+    }
+
+    #[test]
+    fn an_unknown_clustering_method_fails_at_load_not_silently() {
+        let mut m = manifest();
+        m.clustering.method = "vbx".into();
+        let Err(e) = DiarizePipeline::new(m, Box::new(MockSeg), Box::new(MockEmb)) else {
+            panic!("a manifest naming an unimplemented clusterer must not build a pipeline");
+        };
+        assert!(e.to_string().contains("vbx"), "must name the method it cannot serve: {e}");
+        assert!(e.to_string().contains("centroid"), "and say what it can: {e}");
     }
 
     #[test]
@@ -146,7 +179,7 @@ mod tests {
                 Ok((a, 4))
             }
         }
-        let p = DiarizePipeline::new(manifest(), Box::new(Silent), Box::new(MockEmb));
+        let p = DiarizePipeline::new(manifest(), Box::new(Silent), Box::new(MockEmb)).unwrap();
         assert!(p.run(&vec![0i16; 32_000]).unwrap().is_empty());
     }
 
@@ -161,7 +194,7 @@ mod tests {
             }
         }
         let seen = Arc::new(Mutex::new(Vec::new()));
-        let p = DiarizePipeline::new(manifest(), Box::new(MockSeg), Box::new(Spy(seen.clone())));
+        let p = DiarizePipeline::new(manifest(), Box::new(MockSeg), Box::new(Spy(seen.clone()))).unwrap();
         let _ = p.run(&vec![0i16; 32_000]);
         let lens = seen.lock().unwrap().clone();
         assert!(!lens.is_empty(), "the embedder must be called");

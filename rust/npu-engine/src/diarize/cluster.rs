@@ -122,6 +122,18 @@ fn compact(labels: &mut [u32]) {
     for l in labels.iter_mut() { *l = map[l]; }
 }
 
+/// pyannote 3.1's clusterer, behind the trait.
+pub struct AgglomerativeClusterer {
+    pub threshold: f32,
+    pub min_cluster_size: usize,
+}
+
+impl crate::diarize::types::Clusterer for AgglomerativeClusterer {
+    fn cluster(&self, embeddings: &ndarray::Array2<f32>) -> Result<Vec<u32>, crate::api::EngineError> {
+        Ok(cluster(embeddings, self.threshold, self.min_cluster_size))
+    }
+}
+
 /// Number of distinct clusters in a label vector.
 pub fn n_clusters(labels: &[u32]) -> usize {
     labels.iter().collect::<std::collections::BTreeSet<_>>().len()
@@ -167,6 +179,15 @@ mod tests {
     fn reassignment_is_a_noop_when_every_cluster_is_big_enough() {
         let e = arr2(&[[1.0f32, 0.0], [0.99, 0.14], [0.0, 1.0], [0.14, 0.99]]);
         assert_eq!(cluster(&e, 0.5, 2), cluster(&e, 0.5, 1));
+    }
+
+    #[test]
+    fn the_trait_impl_agrees_with_the_free_function() {
+        use crate::diarize::types::Clusterer;
+        let e = arr2(&[[1.0f32, 0.0], [0.99, 0.14], [0.0, 1.0], [0.14, 0.99]]);
+        let c = AgglomerativeClusterer { threshold: 0.5, min_cluster_size: 1 };
+        assert_eq!(c.cluster(&e).unwrap(), cluster(&e, 0.5, 1),
+            "the seam must not change behaviour -- it only moves the call site");
     }
 
     #[test]
