@@ -41,12 +41,12 @@ pub unsafe extern "C" fn npu_model_load(scenario_path: *const c_char) -> *mut Np
     r.unwrap_or_else(|_| { set_error("panic in npu_model_load"); ptr::null_mut() })
 }
 
-/// 0 = asr, 1 = embed, -1 = error.
+/// 0 = asr, 1 = embed, 2 = diarize, -1 = error. Append-only: existing values never move.
 #[no_mangle]
 pub unsafe extern "C" fn npu_model_kind(m: *const NpuModel) -> c_int {
     catch_unwind(AssertUnwindSafe(|| {
         let Some(m) = (unsafe { m.as_ref() }) else { set_error("model is null"); return -1; };
-        match m.0.kind() { ModelKind::Asr => 0, ModelKind::Embed => 1 }
+        match m.0.kind() { ModelKind::Asr => 0, ModelKind::Embed => 1, ModelKind::Diarize => 2 }
     })).unwrap_or(-1)
 }
 
@@ -65,6 +65,33 @@ pub unsafe extern "C" fn npu_transcribe(m: *mut NpuModel, pcm: *const i16, n: us
         }
     }));
     r.unwrap_or_else(|_| { set_error("panic in npu_transcribe"); ptr::null_mut() })
+}
+
+/// Diarization: PCM i16 mono -> malloc'd UTF-8 JSON C string (free with `npu_string_free`).
+/// NULL on error. JSON rather than a struct array because the result is variable-length and an
+/// out-param protocol would need a sizing call first -- the shape `npu_embed` already pays for.
+///
+/// Body: `{"segments":[{"start":0.500,"end":3.200,"speaker":0}]}`
+#[no_mangle]
+pub unsafe extern "C" fn npu_diarize(m: *mut NpuModel, pcm: *const i16, n: usize, sample_rate: u32)
+    -> *mut c_char {
+    let r = catch_unwind(AssertUnwindSafe(|| {
+        let Some(m) = (unsafe { m.as_ref() }) else { set_error("model is null"); return ptr::null_mut(); };
+        if pcm.is_null() && n != 0 { set_error("pcm is null"); return ptr::null_mut(); }
+        let samples = if n == 0 { &[][..] } else { unsafe { std::slice::from_raw_parts(pcm, n) } };
+        match m.0.diarize(samples, sample_rate) {
+            Ok(segs) => {
+                let items: Vec<String> = segs.iter().map(|s| format!(
+                    "{{\"start\":{:.3},\"end\":{:.3},\"speaker\":{}}}",
+                    s.start_s, s.end_s, s.speaker)).collect();
+                let json = format!("{{\"segments\":[{}]}}", items.join(","));
+                CString::new(json).map(|c| c.into_raw()).unwrap_or_else(|_| {
+                    set_error("segment json contained a NUL byte"); ptr::null_mut() })
+            }
+            Err(e) => { set_error(e.to_string()); ptr::null_mut() }
+        }
+    }));
+    r.unwrap_or_else(|_| { set_error("panic in npu_diarize"); ptr::null_mut() })
 }
 
 /// Embedding. Call with out_cap==0 (or out==NULL) to get the dimension; call again with a buffer of

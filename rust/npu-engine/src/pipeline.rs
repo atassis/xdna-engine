@@ -51,4 +51,5 @@ pub trait Diarizer {
 pub enum Scenario {
     Asr(Box<dyn AsrModel>),
     Embed(Box<dyn Embedder>),
+    Diarize(Box<dyn Diarizer>),
 }

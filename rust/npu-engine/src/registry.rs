@@ -41,6 +41,21 @@ pub fn try_build(cfg_path: &Path, root: &Path) -> Result<Scenario, EngineError> 
                 Scenario::Asr(Box::new(crate::asr::AsrPipeline::build(&cfg, root, dev)?))
             }
         }
+        // NO open_dev(): v1 diarization is host-only, so a resident diarize model must not take a
+        // hardware context away from the ASR model it coexists with.
+        Some(crate::ModelKind::Diarize) => {
+            let mpath = std::path::Path::new(&cfg.diarization.manifest);
+            let mpath = if mpath.is_absolute() { mpath.to_path_buf() } else { root.join(mpath) };
+            let txt = std::fs::read_to_string(&mpath).map_err(|e| EngineError::Load(
+                format!("diarize manifest {}: {e}", mpath.display())))?;
+            let manifest: crate::diarize::Manifest = serde_json::from_str(&txt).map_err(|e|
+                EngineError::Load(format!("diarize manifest {}: {e}", mpath.display())))?;
+            let dir = mpath.parent().unwrap_or(root).to_path_buf();
+            let seg = crate::diarize::onnx::OnnxSegmenter::build(&manifest, &dir)?;
+            let emb = crate::diarize::onnx::OnnxEmbedder::build(&manifest, &dir)?;
+            Scenario::Diarize(Box::new(crate::diarize::DiarizePipeline::new(
+                manifest, Box::new(seg), Box::new(emb))))
+        }
         None => return Err(EngineError::Load(format!("unknown scenario kind {:?}", cfg.scenario.kind))),
     };
     Ok(scen)
