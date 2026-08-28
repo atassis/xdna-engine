@@ -27,7 +27,9 @@ import torchaudio.compliance.kaldi as kaldi
 import yaml
 from pyannote.audio import Model
 
-OUT = "artifacts/pyannote"
+PIPELINE = os.environ.get("PYANNOTE_PIPELINE", "pyannote/speaker-diarization-3.1")
+SLUG = PIPELINE.split("/")[-1]
+OUT = f"artifacts/pyannote/{SLUG}"
 os.makedirs(OUT, exist_ok=True)
 SR = 16000
 # Read from the installed package, never hardcoded: the manifest claims this as the
@@ -43,18 +45,43 @@ if not token:
     sys.exit("HF_TOKEN is required: pyannote/segmentation-3.0 is a gated repo. Accept its "
              "conditions on huggingface.co, then export HF_TOKEN=hf_...")
 
+# `use_auth_token` was removed from huggingface_hub; pyannote 4.x takes `token`.
+import inspect as _inspect
+TOKEN_KW = ({"token": token} if "token" in _inspect.signature(Model.from_pretrained).parameters
+            else {"use_auth_token": token})
+
 def fetch_yaml(url):
     with urllib.request.urlopen(url, timeout=30) as r:
         return yaml.safe_load(r.read())
 
-pipe_cfg = fetch_yaml(PIPELINE_CFG)
+def pipeline_config():
+    """The pipeline's own config.yaml. For 3.1 an ungated GitHub mirror serves it without a token;
+    for anything else read the repo directly."""
+    if SLUG == "speaker-diarization-3.1":
+        return fetch_yaml(PIPELINE_CFG)
+    import urllib.request
+    url = f"https://huggingface.co/{PIPELINE}/resolve/main/config.yaml"
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return yaml.safe_load(r.read())
+
+pipe_cfg = pipeline_config()
 emb_cfg = fetch_yaml(EMBED_CFG)   # fetched for provenance/diffing only; hparams win
 clus = pipe_cfg["params"]["clustering"]
 seg_params = pipe_cfg["params"]["segmentation"]
 pipe_params = pipe_cfg["pipeline"]["params"]
 
 # ---- segmentation: waveform in, exports cleanly ------------------------------------------------
-seg = Model.from_pretrained("pyannote/segmentation-3.0", use_auth_token=token).eval()
+# community-1 bundles its segmentation/embedding under subfolders of the pipeline repo; 3.1 names
+# two separate repos. Same ARCHITECTURES either way (PyanNet + WeSpeakerResNet34), so everything
+# below -- the traceable fbank, the weights input, the powerset assertion -- is shared.
+BUNDLED = "community" in SLUG or "precision" in SLUG
+def _load(sub, repo):
+    if BUNDLED:
+        return Model.from_pretrained(PIPELINE, subfolder=sub, **TOKEN_KW).eval()
+    return Model.from_pretrained(repo, **TOKEN_KW).eval()
+
+seg = _load("segmentation", "pyannote/segmentation-3.0")
 dur = float(seg.specifications.duration)
 n_samples = int(dur * SR)
 x = torch.randn(1, 1, n_samples)
@@ -62,7 +89,7 @@ with torch.no_grad():
     seg_out = seg(x)
 n_frames, n_classes = int(seg_out.shape[1]), int(seg_out.shape[2])
 torch.onnx.export(seg, x, f"{OUT}/segmentation.onnx", input_names=["waveform"],
-                  output_names=["logits"], opset_version=17,
+                  output_names=["logits"], opset_version=17, dynamo=False,
                   dynamic_axes={"waveform": {0: "batch"}, "logits": {0: "batch"}})
 print(f"segmentation.onnx: {dur}s -> [{n_frames}, {n_classes}]")
 # 589 frames is the derived expectation (SincNet strides); a mismatch means the checkpoint moved.
@@ -80,7 +107,7 @@ assert n_classes == expect == 7, f"expected {expect} powerset classes, got {n_cl
 print(f"powerset: {n_speakers} speakers, max {max_per_frame}/frame -> {n_classes} classes")
 
 # ---- embedder: traceable fbank + resnet, weights in --------------------------------------------
-emb = Model.from_pretrained("pyannote/wespeaker-voxceleb-resnet34-LM", use_auth_token=token).eval()
+emb = _load("embedding", "pyannote/wespeaker-voxceleb-resnet34-LM")
 # Read the feature params off the LOADED model, not by parsing config.yaml: the published YAML
 # nests them under a `model:` key, and more importantly the checkpoint's own hparams are the real
 # provenance -- a config the loader ignored would be the wrong number attached to the right name.
@@ -182,11 +209,70 @@ with torch.no_grad():
     dim = int(graph(probe, w0).shape[-1])
 torch.onnx.export(graph, (probe, w0), f"{OUT}/embedding.onnx",
                   input_names=["waveform", "weights"], output_names=["embedding"],
-                  opset_version=17,
+                  opset_version=17, dynamo=False,
                   dynamic_axes={"waveform": {0: "batch"}, "weights": {0: "batch"},
                                 "embedding": {0: "batch"}})
 print(f"embedding.onnx: -> [{dim}], {n_emb_frames} fbank frames")
 assert dim == 256, f"expected 256-d embeddings, got {dim}"
+
+
+# ---- clustering: agglomerative (3.1) or VBx+PLDA (community-1) ---------------------------------
+def clustering_block():
+    """The clustering stage's parameters, and for VBx its LEARNED matrices.
+
+    VBx needs a PLDA whose setup solves a generalized symmetric eigenproblem, `eigh(B, W)`. That is
+    a ONE-TIME transform of two fixed files, so it is solved HERE and the results are shipped as
+    plain .npy. The Rust side then needs only dense matmul -- no eigensolver, no new dependency --
+    and the derived constants carry their provenance like every other number in this manifest.
+    """
+    method = str(pipe_cfg["pipeline"]["params"].get("clustering", "AgglomerativeClustering"))
+    src = f"{PIPELINE} config.yaml"
+    if "VBx" not in method:
+        return {
+            "method": "centroid", "threshold": float(clus["threshold"]),
+            "min_cluster_size": int(clus["min_cluster_size"]),
+            "exclude_overlap": bool(pipe_params["embedding_exclude_overlap"]),
+            "source": src if SLUG != "speaker-diarization-3.1"
+                      else "pyannote/hf-speaker-diarization-3.1 config.yaml (ungated GitHub mirror)",
+        }
+
+    import numpy as np
+    from scipy.linalg import eigh
+    from huggingface_hub import hf_hub_download
+    tf_p = hf_hub_download(PIPELINE, "xvec_transform.npz", subfolder="plda", token=token)
+    pl_p = hf_hub_download(PIPELINE, "plda.npz", subfolder="plda", token=token)
+    x, pl = np.load(tf_p), np.load(pl_p)
+    mean1, mean2, lda = x["mean1"], x["mean2"], x["lda"]
+    mu, tr, psi = pl["mu"], pl["tr"], pl["psi"]
+
+    # vbx_setup: whiten via the generalized eigenproblem, then reorder descending.
+    W = np.linalg.inv(tr.T.dot(tr))
+    B = np.linalg.inv((tr.T / psi).dot(tr))
+    acvar, wccn = eigh(B, W)
+    plda_psi = acvar[::-1].copy()
+    plda_tr = wccn.T[::-1].copy()
+
+    d = int(lda.shape[1])
+    np.save(f"{OUT}/xvec_mean1.npy", mean1.astype(np.float32))
+    np.save(f"{OUT}/xvec_lda.npy", lda.astype(np.float32))
+    np.save(f"{OUT}/xvec_mean2.npy", mean2.astype(np.float32))
+    np.save(f"{OUT}/plda_mu.npy", mu.astype(np.float32))
+    np.save(f"{OUT}/plda_tr.npy", plda_tr.astype(np.float32))
+    np.save(f"{OUT}/plda_psi.npy", plda_psi[:d].astype(np.float32))
+    print(f"plda: lda {lda.shape} tr {plda_tr.shape} psi[:{d}] -- eigenproblem solved at export")
+
+    return {
+        "method": "vbx",
+        "threshold": float(clus["threshold"]),
+        "fa": float(clus["Fa"]), "fb": float(clus["Fb"]),
+        "max_iters": 20, "init_smoothing": 7.0, "lda_dim": d,
+        "exclude_overlap": bool(pipe_params["embedding_exclude_overlap"]),
+        "plda": {"xvec_mean1": "xvec_mean1.npy", "xvec_lda": "xvec_lda.npy",
+                 "xvec_mean2": "xvec_mean2.npy", "plda_mu": "plda_mu.npy",
+                 "plda_tr": "plda_tr.npy", "plda_psi": "plda_psi.npy"},
+        # max_iters and init_smoothing are cluster_vbx() defaults in the library, not config keys.
+        "source": f"{src}; max_iters/init_smoothing from pyannote-audio {PYANNOTE_REV} cluster_vbx()",
+    }
 
 # ---- manifest: every value WITH its source ------------------------------------------------------
 manifest = {
@@ -200,21 +286,21 @@ manifest = {
         "max_speakers_per_frame": max_per_frame,
         "powerset_classes": n_classes,
         "n_frames": n_frames,
-        "source": "pyannote/segmentation-3.0 (HF, gated); step_s from pyannote-audio "
-                  f"{PYANNOTE_REV} SpeakerDiarization.__init__",
+        # Name where the checkpoint ACTUALLY came from: community-1 bundles its own segmentation
+        # under a subfolder and does not use segmentation-3.0 at all.
+        "source": (f"{PIPELINE} subfolder 'segmentation'" if BUNDLED
+                   else "pyannote/segmentation-3.0 (HF, gated)")
+                  + f"; step_s from pyannote-audio {PYANNOTE_REV} SpeakerDiarization.__init__",
     },
     "embedding": {
         "onnx": "embedding.onnx", "dim": dim, "num_mel_bins": NUM_MEL,
         "frame_length_ms": FLEN, "frame_shift_ms": FSHIFT, "n_frames": n_emb_frames,
-        "source": "pyannote/wespeaker-voxceleb-resnet34-LM checkpoint hparams (fbank params); "
-                  f"dim + TSTP pooling hardcoded in pyannote-audio {PYANNOTE_REV} source",
+        "source": (f"{PIPELINE} subfolder 'embedding'" if BUNDLED
+                   else "pyannote/wespeaker-voxceleb-resnet34-LM")
+                  + f" checkpoint hparams (fbank params); dim + TSTP pooling hardcoded in "
+                    f"pyannote-audio {PYANNOTE_REV} source",
     },
-    "clustering": {
-        "method": clus["method"], "threshold": float(clus["threshold"]),
-        "min_cluster_size": int(clus["min_cluster_size"]),
-        "exclude_overlap": bool(pipe_params["embedding_exclude_overlap"]),
-        "source": "pyannote/hf-speaker-diarization-3.1 config.yaml (ungated GitHub mirror)",
-    },
+    "clustering": clustering_block(),
     "min_duration_off_s": float(seg_params["min_duration_off"]),
 }
 with open(f"{OUT}/diarize.json", "w") as f:
