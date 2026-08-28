@@ -3,3 +3,11 @@ Copyright 2026 Taimuraz Kaitmazov
 
 This product includes software developed as a general inference engine
 for the AMD XDNA2 (Strix) NPU.
+
+pyannote/wespeaker-voxceleb-resnet34-LM
+  Licensed CC-BY-4.0 (https://creativecommons.org/licenses/by/4.0/).
+  Changes were made: the model is exported to ONNX with a reimplemented feature front-end.
+  Weights are not redistributed here; scripts/export_pyannote.py fetches them.
+
+pyannote/segmentation-3.0 is MIT and is consumed via the pyannote.audio package rather than
+vendored, and its weights are not redistributed, so it carries no obligation here.

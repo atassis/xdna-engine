@@ -107,6 +107,16 @@ class TraceableFbank(nn.Module):
         banks, _ = kaldi.get_mel_banks(n_mels, s.nfft, float(sr), 20.0, 0.0, 100.0, -500.0, 1.0)
         s.register_buffer("fb", banks.T.contiguous())     # (nfft//2, n_mels)
         s.eps = 1.1920928955078125e-07                    # kaldi's float32 epsilon
+        # The real DFT as a baked matmul, NOT torch.fft.rfft: aten::fft_rfft has no ONNX lowering
+        # (opset 17), so an rfft here exports as nothing at all. nfft is fixed, so the transform is
+        # a constant matrix and the result is exact rather than approximate. Only the bins below
+        # Nyquist are built, because kaldi drops the last one anyway.
+        n_bin = s.nfft // 2
+        t = torch.arange(s.nfft, dtype=torch.float64).unsqueeze(1)      # (nfft, 1)
+        f = torch.arange(n_bin, dtype=torch.float64).unsqueeze(0)       # (1, n_bin)
+        ang = 2.0 * torch.pi * t * f / s.nfft
+        s.register_buffer("dft_cos", torch.cos(ang).float().contiguous())
+        s.register_buffer("dft_sin", torch.sin(ang).float().contiguous())
 
     def forward(s, wav):                                  # wav [B, T] in [-1, 1]
         x = wav * 32768.0                                 # kaldi works in int16 units
@@ -115,8 +125,10 @@ class TraceableFbank(nn.Module):
         pre = torch.cat([frames[..., :1], frames[..., :-1]], dim=-1)
         frames = frames - 0.97 * pre                      # preemphasis, replicate-padded
         frames = frames * s.win
-        spec = torch.fft.rfft(frames, n=s.nfft, dim=-1).abs().pow(2.0)   # use_power=True
-        spec = spec[..., : s.nfft // 2]                    # kaldi drops the Nyquist bin
+        frames = torch.nn.functional.pad(frames, (0, s.nfft - s.wlen))   # zero-pad to nfft
+        re = frames @ s.dft_cos
+        im = -(frames @ s.dft_sin)
+        spec = re * re + im * im                           # use_power=True; Nyquist already absent
         mel = spec @ s.fb
         return torch.log(torch.clamp(mel, min=s.eps))
 
