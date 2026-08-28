@@ -363,39 +363,13 @@ fn weights_cmd(path: &Path, action: &WeightsCmd) -> Result<()> {
         }
         WeightsCmd::Verify { checkpoint, arch, refs } => {
             let l = checkpoint::load(checkpoint, arch)?;
-            let (n, max) = verify_against_npy(&l, refs)?;
+            let (n, max) = checkpoint::verify_against_npy(&l, refs)?;
             println!("verified {n} tensors; max abs rel-err {max:.4e}");
             anyhow::ensure!(max < 5e-2, "parity FAILED: max rel-err {max:.4e} >= 5e-2");
             println!("PARITY PASS");
         }
     }
     Ok(())
-}
-
-/// Compare each checkpoint tensor to refs/<name>.npy (name '/'->path). Returns (count, max rel-err).
-fn verify_against_npy(l: &npu_weights::checkpoint::Loaded, refs: &Path) -> Result<(usize, f32)> {
-    use ndarray::ArrayD;
-    use ndarray_npy::read_npy;
-    let mut max = 0f32;
-    let mut n = 0usize;
-    let mut worst = String::new();
-    for name in &l.names {
-        let p = refs.join(format!("{name}.npy"));
-        if !p.exists() { continue }               // refs may be a subset
-        let r: ArrayD<f32> = read_npy(&p)?;
-        let (_sh, got) = l.tensor_f32(name)?;
-        let exp: Vec<f32> = r.iter().cloned().collect();
-        anyhow::ensure!(exp.len() == got.len(),
-            "len mismatch for {name}: {} vs {}", exp.len(), got.len());
-        for (a, b) in got.iter().zip(exp.iter()) {
-            let denom = b.abs().max(1e-3);
-            let e = (a - b).abs() / denom;
-            if e > max { max = e; worst = name.clone(); }
-        }
-        n += 1;
-    }
-    if !worst.is_empty() { eprintln!("worst tensor: {worst} (rel-err {max:.4e})"); }
-    Ok((n, max))
 }
 
 fn config_cmd(path: &Path, action: &ConfigCmd) -> Result<()> {

@@ -153,3 +153,34 @@ mod tests {
         assert!(load(&p, "whisper").is_err());
     }
 }
+
+/// Compare each checkpoint tensor against `refs/<name>.npy` (tensor name '/' -> path separator).
+/// Returns `(tensors_compared, max_abs_rel_err)`; refs may be a SUBSET, missing ones are skipped.
+///
+/// Lives in the library because two callers need it -- the `npu weights verify` subcommand and the
+/// parity test -- and it is checkpoint logic, not CLI plumbing. It previously lived inside the
+/// standalone binary, which is why the test had to shell out to that binary to reach it.
+pub fn verify_against_npy(l: &Loaded, refs: &std::path::Path) -> anyhow::Result<(usize, f32)> {
+    use ndarray::ArrayD;
+    use ndarray_npy::read_npy;
+    let mut max = 0f32;
+    let mut n = 0usize;
+    let mut worst = String::new();
+    for name in &l.names {
+        let p = refs.join(format!("{name}.npy"));
+        if !p.exists() { continue }
+        let r: ArrayD<f32> = read_npy(&p)?;
+        let (_sh, got) = l.tensor_f32(name)?;
+        let exp: Vec<f32> = r.iter().cloned().collect();
+        anyhow::ensure!(exp.len() == got.len(),
+            "len mismatch for {name}: {} vs {}", exp.len(), got.len());
+        for (a, b) in got.iter().zip(exp.iter()) {
+            let denom = b.abs().max(1e-3);
+            let e = (a - b).abs() / denom;
+            if e > max { max = e; worst = name.clone(); }
+        }
+        n += 1;
+    }
+    if !worst.is_empty() { eprintln!("worst tensor: {worst} (rel-err {max:.4e})"); }
+    Ok((n, max))
+}
