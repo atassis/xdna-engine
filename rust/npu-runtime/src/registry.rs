@@ -127,8 +127,14 @@ impl Registry {
     /// `Failed`). The request path is `ensure_resident`, which evicts instead.
     pub fn try_load(&mut self, cfg: &ModelCfg, loader: &dyn ModelLoader, srv: &ServerCfg, now: Instant) {
         if self.resident_count() >= srv.max_resident {
+            // Record what the model IS even though it is not loaded. Without this a deferred model
+            // reports capability None, which `/v1/models` renders as kind "unknown" -- and at the
+            // default max_resident of 1 that is every model but the first, until something happens
+            // to load it. The lazy path already asks the loader here (`actor::run`); the eager
+            // reconcile did not, so the two disagreed about the same model.
+            let cap = self.declared(cfg, loader);
             self.set_deferred(cfg, format!(
-                "not resident: at max_resident ({}); loads on demand", srv.max_resident));
+                "not resident: at max_resident ({}); loads on demand", srv.max_resident), cap);
             return;
         }
         // The loader can PANIC, not just Err: model constructors still `.expect()` on missing
@@ -138,7 +144,7 @@ impl Registry {
             Ok(m) => {
                 let bo = m.footprint();
                 if self.resident_bytes() + bo > srv.memory_ceiling_mb * 1024 * 1024 {
-                    self.set_failed(cfg, "over memory_ceiling".into());
+                    self.set_failed(cfg, "over memory_ceiling".into(), None);
                     return;
                 }
                 let status = ModelStatus {
@@ -153,7 +159,7 @@ impl Registry {
                 };
                 self.upsert(Entry { cfg: cfg.clone(), model: Some(m), status, last_used: now });
             }
-            Err(e) => self.set_failed(cfg, e.to_string()),
+            Err(e) => { let cap = self.declared(cfg, loader); self.set_failed(cfg, e.to_string(), cap) }
         }
     }
 
@@ -267,16 +273,27 @@ impl Registry {
             .map(|e| e.cfg.name.clone()).collect()
     }
 
-    fn set_failed(&mut self, cfg: &ModelCfg, detail: String) {
-        self.set_state(cfg, LoadState::Failed, detail);
+    /// What the loader says this model is, without loading it. `None` when it cannot tell cheaply.
+    ///
+    /// Behind `guard` because `declared_capability` reads and parses a scenario file, and the real
+    /// loader's callees still `.expect()` in places -- a malformed manifest must leave the model
+    /// unlabelled, not unwind through a reconcile.
+    fn declared(&self, cfg: &ModelCfg, loader: &dyn ModelLoader) -> Option<Capability> {
+        crate::actor::guard(|| loader.declared_capability(cfg)).unwrap_or(None)
+    }
+    fn set_failed(&mut self, cfg: &ModelCfg, detail: String, declared: Option<Capability>) {
+        self.set_state(cfg, LoadState::Failed, detail, declared);
     }
     /// Configured, wanted, and deliberately not resident -- distinct from a failure.
-    fn set_deferred(&mut self, cfg: &ModelCfg, detail: String) {
-        self.set_state(cfg, LoadState::Unloaded, detail);
+    fn set_deferred(&mut self, cfg: &ModelCfg, detail: String, declared: Option<Capability>) {
+        self.set_state(cfg, LoadState::Unloaded, detail, declared);
     }
-    fn set_state(&mut self, cfg: &ModelCfg, state: LoadState, detail: String) {
-        // Keep a capability learned from an earlier successful load: still true, and routing uses it.
-        let capability = self.known_capability(&cfg.name);
+    fn set_state(&mut self, cfg: &ModelCfg, state: LoadState, detail: String,
+                 declared: Option<Capability>) {
+        // Keep a capability learned from an earlier successful load: still true, and routing uses
+        // it. Fall back to what the loader declares, so a model that has never loaded is still
+        // labelled instead of reading as "unknown".
+        let capability = self.known_capability(&cfg.name).or(declared);
         let status = ModelStatus {
             name: cfg.name.clone(), state, detail, capability, bo_bytes: 0, idle_s: None,
         };
@@ -356,6 +373,56 @@ mod tests {
         assert_eq!(s.iter().find(|x| x.name == "a").unwrap().state, LoadState::Loaded);
         let b = s.iter().find(|x| x.name == "b").unwrap();
         assert_eq!(b.state, LoadState::Failed, "3 + 3 MB must not fit under 4 MB: {}", b.detail);
+    }
+
+    /// A model that has never loaded must still report WHAT IT IS.
+    ///
+    /// At the default `max_resident = 1` every model past the first is deferred by the eager
+    /// reconcile, and a deferred entry used to carry `capability: None` -- which `/v1/models`
+    /// renders as kind "unknown". The lazy path already asked the loader; only the eager path did
+    /// not, so the same model was labelled or not depending on how the server started.
+    #[test]
+    fn a_deferred_model_reports_its_declared_kind_not_unknown() {
+        let mut t = BTreeMap::new();
+        t.insert("first".to_string(), Ok((Capability::ASR, 0u64)));
+        t.insert("second".to_string(), Ok((Capability::DIARIZE, 0u64)));
+        let l = MockLoader { table: t };
+        let mut srv = ServerCfg::default();
+        srv.max_resident = 1;
+        let mut r = Registry::default();
+        let now = Instant::now();
+        r.try_load(&cfg("first"), &l, &srv, now);
+        r.try_load(&cfg("second"), &l, &srv, now);
+        let s = r.status();
+        let d = s.iter().find(|x| x.name == "second").expect("status entry");
+        assert_eq!(d.state, LoadState::Unloaded, "second must be deferred at max_resident 1");
+        assert_eq!(d.capability, Some(Capability::DIARIZE),
+            "a deferred model must carry its declared capability, not None: {:?}", d.capability);
+    }
+
+    /// A model whose LOAD failed is still a known kind: the scenario file said so, and failing to
+    /// load does not unsay it. Routing and the model listing both read this field.
+    #[test]
+    fn a_failed_model_keeps_its_declared_kind() {
+        let mut r = Registry::default();
+        // A loader that cannot load this model but can still say what it is -- the real case, since
+        // declared_capability reads the scenario TOML and the failure is in the artifacts.
+        struct Declaring;
+        impl ModelLoader for Declaring {
+            fn load(&self, _c: &ModelCfg) -> Result<Box<dyn Servable>, EngineError> {
+                Err(EngineError::Load("boom".into()))
+            }
+            fn declared_capability(&self, _c: &ModelCfg) -> Option<Capability> {
+                Some(Capability::DIARIZE)
+            }
+        }
+        r.try_load(&cfg("broken"), &Declaring, &ServerCfg::default(), Instant::now());
+        let s = r.status();
+        let f = s.iter().find(|x| x.name == "broken").expect("status entry");
+        assert_eq!(f.state, LoadState::Failed);
+        assert!(f.detail.contains("boom"), "{}", f.detail);
+        assert_eq!(f.capability, Some(Capability::DIARIZE),
+            "a failed load must not erase the declared kind: {:?}", f.capability);
     }
 
     fn loader(names: &[&str]) -> MockLoader {
