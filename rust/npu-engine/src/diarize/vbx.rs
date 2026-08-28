@@ -21,6 +21,7 @@ use crate::api::EngineError;
 use crate::diarize::types::Clusterer;
 
 /// The learned matrices, loaded from the artifacts the export script wrote.
+#[derive(Clone)]
 pub struct Plda {
     pub xvec_mean1: Array1<f32>,   // [256]
     pub xvec_lda: Array2<f32>,     // [256, 128]
