@@ -109,7 +109,7 @@ def context_switch_marker(ts_us, from_label, to_label, gap_us):
     across every row in chrome://tracing, on top of the gap already left in the time axis."""
     return {
         "name": "hw_context_switch", "ph": "i", "s": "g", "ts": round(ts_us, 3),
-        "cat": "context_switch",
+        "cat": "context_switch", "pid": 0, "tid": 0,
         "args": {"from": from_label, "to": to_label, "gap_us": round(gap_us, 3)},
     }
 
@@ -145,6 +145,11 @@ def find_overlaps(trace_events):
 
 
 def build(capture_paths, clock_hz, labels, switch_us, clip_seconds, cycles_only=False, power_mode=None):
+    # Validate here, not only in main(): a non-positive clock scales every ts and dur into
+    # garbage that chrome://tracing still renders, so a caller importing build() directly would
+    # get a plausible-looking timeline with no error.
+    if not cycles_only and not (isinstance(clock_hz, (int, float)) and clock_hz > 0):
+        raise ValueError(f"clock_hz must be a positive number, got {clock_hz!r}")
     scale = 1.0 if cycles_only else 1e6 / clock_hz
     trace_events = []
     offset = 0.0
@@ -226,6 +231,12 @@ def main(argv=None):
     if not o.cycles_only and o.clock_hz is None:
         p.error("pass --clock-hz <hz> (measure it -- decode-perop-aie-clock says ~1.8 GHz "
                  "single-tenant, not a constant) or --cycles-only to opt out of a time unit")
+    if o.clock_hz is not None and o.clock_hz <= 0:
+        p.error(f"--clock-hz must be positive, got {o.clock_hz}; a non-positive clock scales "
+                 "every ts and dur to garbage the viewer still renders")
+    if o.clock_hz is not None and not (7.5e8 <= o.clock_hz <= 2.0e9):
+        print(f"warning: --clock-hz {o.clock_hz:g} is outside the AIE DPM ladder "
+              "(792 MHz..1800 MHz); check the unit is Hz, not MHz", file=sys.stderr)
     if len(o.captures) > 1 and o.switch_us is None:
         print("warning: >1 capture merged with no --switch-us; gap set to 0 and tagged "
               "unmeasured-placeholder in otherData", file=sys.stderr)

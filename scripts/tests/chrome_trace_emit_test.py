@@ -125,6 +125,26 @@ try:
 except ValueError as exc:
     check("overlapping" in str(exc), f"build() raises ValueError naming the defect, got: {exc}")
 
+# Every instant event needs pid and tid. Without them chrome://tracing files the marker under a
+# phantom process or drops it -- the marker is invisible exactly when a merged trace needs it most.
+# Assert on a MERGE, because a single capture emits no markers and the check would pass vacuously.
+merged = C.build([os.path.join(FIX, "capture_ln.json"), os.path.join(FIX, "capture_gelu.json")],
+                 clock_hz=1e6, labels=["ln", "gelu"], switch_us=100.0, clip_seconds=[])
+instants = [e for e in merged["traceEvents"] if e.get("ph") == "i"]
+check(len(instants) >= 1, f"the merge emits at least one instant marker to assert on, got {len(instants)}")
+check(all("pid" in e and "tid" in e for e in instants),
+      "every instant marker carries pid and tid")
+
+# A non-positive --clock-hz scaled every ts and dur into garbage the viewer still renders, and the
+# tool exited 0. Reject it at the scale factor rather than trusting argparse to have caught it.
+for bad_hz in (0.0, -1.8e9):
+    try:
+        C.build([os.path.join(FIX, "capture_ln.json")], clock_hz=bad_hz, labels=["ln"],
+                switch_us=None, clip_seconds=[])
+        check(False, f"build() must reject clock_hz={bad_hz}")
+    except (ValueError, ZeroDivisionError) as exc:
+        check(True, f"build() rejects clock_hz={bad_hz} ({type(exc).__name__})")
+
 print()
 if failures:
     print(f"GATE RED ({len(failures)} failed)")
