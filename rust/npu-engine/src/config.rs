@@ -5,10 +5,37 @@ use serde::Deserialize;
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct ScenarioConfig {
     pub scenario: Scenario,
-    pub model: ModelCfg,
+    /// OPTIONAL because it is transformer-shaped and not every model is a transformer. Parakeet,
+    /// Whisper and GigaAM already read none of it; PyanNet and ResNet34 have none of these fields.
+    /// Builders that need it `ok_or` on it, so a missing block is a loud error rather than six
+    /// fabricated numbers reaching a model that cannot use them.
+    #[serde(default)]
+    pub model: Option<ModelCfg>,
     pub artifacts: Artifacts,
     #[serde(default)]
     pub embeddings: EmbeddingsCfg,
+    #[serde(default)]
+    pub diarization: DiarizationCfg,
+}
+
+/// Per-kind block for `kind = "diarize"`, same shape as `embeddings`. One field on purpose: every
+/// hyperparameter lives in the manifest the export script writes, WITH its upstream source, so no
+/// pyannote constant is retyped here.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+pub struct DiarizationCfg {
+    #[serde(default)]
+    pub manifest: String,
+}
+
+impl ScenarioConfig {
+    pub fn from_str(s: &str) -> Result<ScenarioConfig, toml::de::Error> { toml::from_str(s) }
+
+    /// The `[model]` block, or a loud error naming the scenario that lacks it.
+    pub fn model_or_err(&self) -> Result<&ModelCfg, String> {
+        self.model.as_ref().ok_or_else(|| format!(
+            "scenario {:?} (kind {:?}) needs a [model] block",
+            self.scenario.name, self.scenario.kind))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -130,8 +157,29 @@ normalize = true
 "#;
         let c = ScenarioConfig::from_toml_str(toml).expect("parse");
         assert_eq!(c.scenario.kind, "embeddings");
-        assert_eq!(c.model.hidden, 768);
-        assert_eq!(c.model.precision, "bf16"); // default applied
+        assert_eq!(c.model.as_ref().unwrap().hidden, 768);
+        assert_eq!(c.model.as_ref().unwrap().precision, "bf16"); // default applied
         assert!(c.embeddings.normalize);
+    }
+
+    #[test]
+    fn a_scenario_without_a_model_block_parses_and_carries_its_diarization_manifest() {
+        let toml = r#"
+[scenario]
+kind = "diarize"
+name = "pyannote-speaker-diarization-3.1"
+[artifacts]
+weights = "artifacts/pyannote"
+[diarization]
+manifest = "artifacts/pyannote/diarize.json"
+"#;
+        let c = ScenarioConfig::from_str(toml).expect("a non-transformer scenario must parse");
+        assert!(c.model.is_none(), "PyanNet has none of the six transformer fields");
+        assert_eq!(c.diarization.manifest, "artifacts/pyannote/diarize.json");
+        // ...and every shipped scenario still parses WITH its block. cwd is the crate root.
+        let bge = std::fs::read_to_string("../../scenarios/bge-base.toml").unwrap();
+        let b = ScenarioConfig::from_str(&bge).unwrap();
+        assert_eq!(b.model.as_ref().unwrap().hidden, 768);
+        assert!(b.diarization.manifest.is_empty(), "an absent block defaults, never errors");
     }
 }

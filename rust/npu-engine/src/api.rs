@@ -73,7 +73,9 @@ impl Engine {
 /// single instance must not be driven concurrently (the service serializes; the NPU is single-tenant).
 pub struct Model {
     scen: Scenario,
-    hidden: usize,
+    /// Configured hidden size, when the scenario has a `[model]` block at all. `None` for a
+    /// non-transformer model, which is exactly when `embed_dim` has nothing to report.
+    hidden: Option<usize>,
 }
 
 impl Model {
@@ -89,7 +91,7 @@ impl Model {
     pub fn load_in(scenario: impl AsRef<Path>, root: impl AsRef<Path>) -> Result<Model, EngineError> {
         let cfg = crate::config::ScenarioConfig::load(scenario.as_ref())
             .map_err(|e| EngineError::Load(format!("scenario {}: {e}", scenario.as_ref().display())))?;
-        let hidden = cfg.model.hidden;
+        let hidden = cfg.model.as_ref().map(|m| m.hidden);
         let scen = crate::registry::try_build(scenario.as_ref(), root.as_ref())?;
         Ok(Model { scen, hidden })
     }
@@ -100,7 +102,7 @@ impl Model {
 
     /// Embedding output dimension for an embed model (= configured hidden size); None for ASR.
     pub fn embed_dim(&self) -> Option<usize> {
-        match self.scen { Scenario::Embed(_) => Some(self.hidden), Scenario::Asr(_) => None }
+        match self.scen { Scenario::Embed(_) => self.hidden, Scenario::Asr(_) => None }
     }
 
     /// ASR: 16 kHz mono i16 PCM -> text.

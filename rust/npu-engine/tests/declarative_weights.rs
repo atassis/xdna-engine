@@ -88,7 +88,7 @@ checkpoint = "{checkpoint}"
     assert_eq!(spec.arch, "bert");
 
     // Uniform entry point: ensure (bake-on-missing) + load -- no NPU.
-    let w = BertWeights::load_for(&cfg.artifacts, root, cfg.model.n_layers)
+    let w = BertWeights::load_for(&cfg.artifacts, root, cfg.model.as_ref().unwrap().n_layers)
         .expect("declarative load_for must bake + load");
     assert!(checkpoint.exists(), "checkpoint was baked to the configured path");
     assert_eq!(w.n_layers(), 12);
@@ -98,7 +98,7 @@ checkpoint = "{checkpoint}"
     assert_eq!(we.iter().copied().collect::<Vec<f32>>(), vec![1., 2., 3., 4.]);
 
     // Second load finds the checkpoint FRESH (no re-bake) and returns the same shapes.
-    let w2 = BertWeights::load_for(&cfg.artifacts, root, cfg.model.n_layers).expect("fresh reload");
+    let w2 = BertWeights::load_for(&cfg.artifacts, root, cfg.model.as_ref().unwrap().n_layers).expect("fresh reload");
     assert_eq!(w2.n_layers(), 12);
 }
 
