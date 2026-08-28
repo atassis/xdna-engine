@@ -16,6 +16,9 @@ ShimOrtEnv* sort_env_create(void);
 void        sort_env_free(ShimOrtEnv*);
 
 ShimOrtSession* sort_session_create(ShimOrtEnv*, const char* model_path);
+/* Same, with an explicit intra-op thread count. 1 is NOT a safe default for every graph -- see the
+ * comment on sort_session_create_threads in the .cpp. */
+ShimOrtSession* sort_session_create_threads(ShimOrtEnv*, const char* model_path, int intra_threads);
 void            sort_session_free(ShimOrtSession*);
 
 /* Run the session. Inputs given as parallel arrays of length n_in (dtype 0=f32,1=i64).

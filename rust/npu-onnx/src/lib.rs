@@ -23,6 +23,8 @@ extern "C" {
     fn sort_env_create() -> *mut CEnv;
     fn sort_env_free(e: *mut CEnv);
     fn sort_session_create(e: *mut CEnv, path: *const c_char) -> *mut CSession;
+    fn sort_session_create_threads(e: *mut CEnv, path: *const c_char, intra: c_int)
+        -> *mut CSession;
     fn sort_session_free(s: *mut CSession);
     fn sort_run(
         s: *mut CSession,
@@ -103,9 +105,25 @@ impl Tensor<'_> {
 }
 
 impl Session {
+    /// Load with the 1-thread intra-op pool the ASR graphs want. See `load_with_threads` before
+    /// reaching for this with a large graph.
     pub fn load(env: &Rc<Env>, model_path: &str) -> Result<Session> {
+        Session::load_with_threads(env, model_path, 1)
+    }
+
+    /// Load with an explicit intra-op thread count.
+    ///
+    /// The default of 1 is tuned for the tiny ASR preprocessor/decoder/joint, where a wider pool
+    /// only contends with the encoder's rayon glue. It costs a large graph most of the machine:
+    /// MEASURED on the diarization embedder (WeSpeaker ResNet34), 290.6 ms at 1 thread vs 50.9 ms
+    /// at 10. Best at one thread per PHYSICAL core -- 12/14/20 on this 10-core/20-thread box all
+    /// measured worse than 10, so the ceiling is SMT contention, not the pool size.
+    pub fn load_with_threads(env: &Rc<Env>, model_path: &str, intra_threads: usize)
+        -> Result<Session> {
         let c = CString::new(model_path).map_err(|e| e.to_string())?;
-        let ptr = unsafe { sort_session_create(env.ptr, c.as_ptr()) };
+        let ptr = unsafe {
+            sort_session_create_threads(env.ptr, c.as_ptr(), intra_threads.max(1) as c_int)
+        };
         if ptr.is_null() {
             Err(format!("load {model_path}: {}", last_error()))
         } else {
