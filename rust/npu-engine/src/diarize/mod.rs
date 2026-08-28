@@ -2,6 +2,7 @@
 //! `SpeakerEmbedder` without touching this file.
 
 pub mod cluster;
+pub mod onnx;
 pub mod powerset;
 pub mod stitch;
 pub mod timeline;
