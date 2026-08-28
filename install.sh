@@ -102,6 +102,7 @@ esac
 # Pretty logging helpers.
 info() { printf '\033[1;34m[install]\033[0m %s\n' "$*"; }
 ok()   { printf '\033[1;32m[ ok ]\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33m[warn]\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31m[fail]\033[0m %s\n' "$*" >&2; exit 1; }
 
 # ---------------------------------------------------------------------------
@@ -334,6 +335,53 @@ done < <(grep -oP '^\s*scenario\s*=\s*"\K[^"]+' "$ENGINE_CONFIG")
 [ "$scen_count" -gt 0 ] || die "engine config declares no [[model]] scenario: $ENGINE_CONFIG
   The service would start and serve nothing."
 ok "Engine config preflight passed ($scen_count model(s) resolvable)."
+
+# ---------------------------------------------------------------------------
+# 4c. Shell completions
+# ---------------------------------------------------------------------------
+# Generated FROM the clap command tree by the binary we just installed, so completions cannot
+# drift from the actual subcommands and flags. Written to a stable per-user dir; the system
+# site-functions dirs would need root, and this script never asks for it.
+# Prefer a dir zsh ALREADY searches and the user can write, so a working install needs no
+# ~/.zshrc edit. Only if none exists do we fall back to the XDG location and tell them the one
+# line to add -- zsh silently ignores completion files off $fpath, so "installed" and "works" are
+# different states and the difference has to be reported.
+if [ -z "${COMPLETION_DIR:-}" ]; then
+  COMPLETION_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/zsh/site-functions"
+  # Rank by NAME, not by fpath order. The first writable entry is frequently some unrelated
+  # tool's config dir (it happened: ~/.config/sing-box), and dropping a completion file into
+  # another project's directory is not ours to do.
+  fpath_dirs="$(zsh -ic 'print -l $fpath' 2>/dev/null || true)"
+  for want in '.zfunc' 'zsh/site-functions' 'zfunctions' 'completions'; do
+    while IFS= read -r d; do
+      case "$d" in
+        "$HOME"/*"$want") [ -d "$d" ] && [ -w "$d" ] && COMPLETION_DIR="$d" && break 2 ;;
+      esac
+    done <<< "$fpath_dirs"
+  done
+fi
+info "Installing zsh completions -> $COMPLETION_DIR/_npu"
+mkdir -p "$COMPLETION_DIR"
+if "$ENGINE_BIN" completions zsh > "$COMPLETION_DIR/_npu" 2>/dev/null; then
+  ok "Wrote _npu ($(wc -l < "$COMPLETION_DIR/_npu") lines)."
+  # bash and fish too, cheap and harmless; a user of either gets them without a second install.
+  bash_dir="${XDG_DATA_HOME:-$HOME/.local/share}/bash-completion/completions"
+  mkdir -p "$bash_dir" && "$ENGINE_BIN" completions bash > "$bash_dir/npu" 2>/dev/null || true
+  fish_dir="${XDG_CONFIG_HOME:-$HOME/.config}/fish/completions"
+  mkdir -p "$fish_dir" && "$ENGINE_BIN" completions fish > "$fish_dir/npu.fish" 2>/dev/null || true
+
+  # Only nag if the dir is not already searched: zsh silently ignores files off fpath, so an
+  # install that "succeeded" while tab-completion stayed dead is the failure worth catching.
+  if ! zsh -ic 'print -l $fpath' 2>/dev/null | grep -qx "$COMPLETION_DIR"; then
+    warn "$COMPLETION_DIR is not on your zsh \$fpath, so completions will NOT load."
+    warn "Add this to ~/.zshrc ABOVE the compinit line, then start a new shell:"
+    printf '\n    fpath=(%s $fpath)\n\n' "$COMPLETION_DIR"
+  else
+    ok "  $COMPLETION_DIR is on \$fpath; run 'exec zsh' to pick them up."
+  fi
+else
+  warn "Could not generate completions (old binary?); skipping."
+fi
 
 # ---------------------------------------------------------------------------
 # 5. Install the systemd --user unit

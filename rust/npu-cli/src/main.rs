@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 mod media;
 
 use anyhow::{anyhow, bail, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::Shell;
 use npu_runtime::actor::{start, start_lazy};
 use npu_engine::capability::Capability;
 use npu_runtime::config::{Config, EvictPolicy};
@@ -71,6 +72,11 @@ enum Cmd {
     Reload { #[arg(long)] port: Option<u16> },
     /// Pre-bake a model's weight checkpoint (host-only, no device).
     Bake { name: String },
+    /// Print a shell completion script (zsh, bash, fish, elvish, powershell).
+    ///
+    /// Generated from the clap command tree, so it covers every subcommand and flag and cannot
+    /// drift from them the way a hand-written script would.
+    Completions { shell: Shell },
     /// Inspect / edit the desired-state config.
     Config { #[command(subcommand)] action: ConfigCmd },
 }
@@ -105,6 +111,12 @@ fn main() -> Result<()> {
         Cmd::Reload { port } => reload(&path, *port),
         Cmd::Bake { name } => bake(&path, name),
         Cmd::Config { action } => config_cmd(&path, action),
+        Cmd::Completions { shell } => {
+            let mut cmd = Cli::command();
+            let name = cmd.get_name().to_string();
+            clap_complete::generate(*shell, &mut cmd, name, &mut std::io::stdout());
+            Ok(())
+        }
     }
 }
 
