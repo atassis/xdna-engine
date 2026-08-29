@@ -35,13 +35,13 @@ fn main() {
     let cfg = ModelCfg::PARAKEET_V3;
     let enc = if cpu {
         println!("[cpu] host f32 encoder");
-        FastConformerEncoder::new(artifacts, cfg)
+        FastConformerEncoder::new(artifacts, cfg).expect("build FastConformerEncoder")
     } else {
         let root = std::env::var("NPU_XCLBIN_ROOT")
             .unwrap_or_else(|_| "$REPO".into());
         println!("[npu] xclbin root = {root}");
         #[cfg(feature = "npu")]
-        { FastConformerEncoder::new_npu(artifacts, cfg, Path::new(&root)) }
+        { FastConformerEncoder::new_npu(artifacts, cfg, Path::new(&root)).expect("build FastConformerEncoder (npu)") }
         #[cfg(not(feature = "npu"))]
         { panic!("built without --features npu") }
     };

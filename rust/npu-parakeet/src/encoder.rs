@@ -41,24 +41,25 @@ fn dump_convin(tag: &str, blk: usize, x: &Array2<f32>) {
 }
 
 impl FastConformerEncoder {
-    pub fn new(artifacts: &Path, cfg: ModelCfg) -> Self {
-        let w = ParakeetWeights::load(artifacts).expect("load parakeet weights");
+    pub fn new(artifacts: &Path, cfg: ModelCfg) -> Result<Self, String> {
+        let w = ParakeetWeights::load(artifacts)
+            .map_err(|e| format!("load parakeet weights from {}: {e}", artifacts.display()))?;
         assert_eq!(w.nblocks(), cfg.n_layers, "block count mismatch");
-        FastConformerEncoder {
+        Ok(FastConformerEncoder {
             cfg,
             w,
             #[cfg(feature = "npu")]
             npu: None,
-        }
+        })
     }
 
     /// Construct with the NPU matmul path enabled. `root` = repo root holding the mlir-aie build
     /// dir with the Parakeet xclbins. Single-tenant NPU only.
     #[cfg(feature = "npu")]
-    pub fn new_npu(artifacts: &Path, cfg: ModelCfg, root: &Path) -> Self {
-        let mut e = Self::new(artifacts, cfg);
-        e.npu = Some(crate::npu::NpuMatmul::open(root));
-        e
+    pub fn new_npu(artifacts: &Path, cfg: ModelCfg, root: &Path) -> Result<Self, String> {
+        let mut e = Self::new(artifacts, cfg)?;
+        e.npu = Some(crate::npu::NpuMatmul::open(root)?);
+        Ok(e)
     }
 
     /// Weight matmul C[m,n] = A[m,k] @ B[k,n] — NPU if enabled, else host ndarray. `id` keys the
