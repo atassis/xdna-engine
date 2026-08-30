@@ -81,7 +81,7 @@ static inline void gemm_int8xint4_dequant_tile(const int8_t *__restrict pA,
   constexpr unsigned nTiles = N / 16;
 
   // Round-to-nearest-even for the bf16 narrow (banked WER lesson).
-  ::aie::set_rounding(::aie::rounding_mode::conv_even);
+  const auto saved_rounding = ::aie::swap_rounding(::aie::rounding_mode::conv_even);
 
   for (unsigned mi = 0; mi < mTiles; ++mi) {
     for (unsigned ni = 0; ni < nTiles; ++ni) {
@@ -146,6 +146,7 @@ static inline void gemm_int8xint4_dequant_tile(const int8_t *__restrict pA,
       ::aie::store_v(pC_tile, a.template to_vector<bfloat16>());
     }
   }
+  ::aie::set_rounding(saved_rounding);
 }
 
 extern "C" {

@@ -49,7 +49,7 @@ void geglu_row(const float *restrict input, float *restrict output,
   event0();
   // Round-to-nearest-even on the bf16 narrowings (banked WER rule: bf16 casts
   // on the numerics-critical path must round-nearest, not truncate).
-  ::aie::set_rounding(::aie::rounding_mode::conv_even);
+  const auto saved_rounding = ::aie::swap_rounding(::aie::rounding_mode::conv_even);
 
   const float *up = input;          // value half:  in[0..cols)
   const float *gate = input + cols; // gate  half:  in[cols..2*cols)
@@ -97,6 +97,7 @@ void geglu_row(const float *restrict input, float *restrict output,
     ::aie::vector<float, N> outv = ::aie::mul(upv, gelu_g);     // up * gelu(gate)
     ::aie::store_v(output + i, outv);
   }
+  ::aie::set_rounding(saved_rounding);
   event1();
 }
 

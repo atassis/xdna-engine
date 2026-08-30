@@ -67,7 +67,7 @@ void dequant_int4_group_row(const uint8_t *restrict packed, // ceil(cols/2) byte
   event0();
   // Round-to-nearest-even, matching the host AVX512 pack_f32_to_bf16 path
   // (banked WER lesson: default truncation biases toward zero).
-  ::aie::set_rounding(::aie::rounding_mode::conv_even);
+  const auto saved_rounding = ::aie::swap_rounding(::aie::rounding_mode::conv_even);
 
   float unpacked[N];
   for (int i = 0; i < cols; i += N) {
@@ -92,6 +92,7 @@ void dequant_int4_group_row(const uint8_t *restrict packed, // ceil(cols/2) byte
     a.from_vector(y);
     ::aie::store_v(output + i, a.template to_vector<bfloat16>());
   }
+  ::aie::set_rounding(saved_rounding);
   event1();
 }
 

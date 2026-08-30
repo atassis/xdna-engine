@@ -106,7 +106,7 @@ void gemm_bf16xbfp16_core(const bfloat16 *__restrict pA,
   // Here A stays bf16 and B arrives already bfp16ebs8 through the mixed
   // intrinsic, so no A/B conversion happens. This result neither supports nor
   // refutes that one.
-  aie::set_rounding(aie::rounding_mode::conv_even);
+  const auto saved_rounding = aie::swap_rounding(aie::rounding_mode::conv_even);
 
   for (unsigned m = 0; m < RowA; ++m) {
     const bfloat16 *__restrict pA_row0 = pA + m * ColA * sizeA;
@@ -142,6 +142,7 @@ void gemm_bf16xbfp16_core(const bfloat16 *__restrict pA,
                     acc.template to_vector<bfloat16>());
     }
   }
+  aie::set_rounding(saved_rounding);
 }
 
 // ---- extern "C" entry point -------------------------------------------------
