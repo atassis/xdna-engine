@@ -41,6 +41,20 @@ fn as2(a: ArrayD<f32>) -> Array2<f32> {
     a.into_dimensionality::<Ix2>().unwrap()
 }
 
+/// FNV-1a 64 over an array's raw f32 bytes (LE). Dependency-free bit fingerprint for artifact-
+/// identity checks: two runs producing the SAME hash ran bit-identical data, full stop, no
+/// precision loss from printing rel/alpha to 3 significant figures.
+fn fingerprint(a: &Array2<f32>) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for x in a.iter() {
+        for b in x.to_le_bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+    }
+    h
+}
+
 /// Split `got - refr` into the part proportional to `refr` and the part orthogonal to it:
 /// `got = (1 + alpha) * refr + r`, `<r, refr> = 0`. Returns `(alpha, ||r|| / ||refr||)`.
 ///
@@ -178,6 +192,15 @@ fn main() {
     if last_alpha.abs() > TOL_SCALE {
         fails.push("scale".into());
     }
+
+    // Artifact-identity fingerprint for round-trip rounding/kernel experiments: prints ALWAYS
+    // (not gated), so a rebuild-and-redispatch control can diff two runs' printed lines directly
+    // rather than needing a separate file dump. FNV-1a over block_{n-1}'s raw f32 bytes.
+    println!(
+        "[fingerprint] block_{} = {:016x}",
+        enc.cfg.n_layers - 1,
+        fingerprint(&outs[enc.cfg.n_layers - 1])
+    );
 
     // ---- control: does gate 4 actually see a scale error? ----
     // TOL_SCALE was calibrated (2026-08-31) from two real but unverified-as-representative alpha
