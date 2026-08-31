@@ -18,7 +18,17 @@ MM=$PE/basic/matrix_multiplication
 K=$AIEROOT/aie_kernels/aie2p
 
 [ -d "$AIEROOT" ] || { echo "$AIEROOT not present — run scripts/setup_route_b.sh first" >&2; exit 1; }
-mkdir -p "$PE/ml/dwconv1d" "$PE/ml/softmax400" "$PE/ml/layernorm" "$PE/ml/relpos_mha"
+mkdir -p "$PE/ml/dwconv1d" "$PE/ml/softmax400" "$PE/ml/layernorm" "$PE/ml/relpos_mha" "$PE/ml/silu"
+
+# silu (elementwise bf16). Upstream DELETED programming_examples/ml/silu in #3025 while KEEPING
+# aie_kernels/aie2p/silu.cc, so the kernel still builds but the design and Makefile that drive it are
+# gone -- and with them the artifacts run_npu_silu.py and run_npu_block0.py load. We now own that pair.
+# The design is the deleted one MIGRATED to the current Runtime(seq_fn, fn_args) API; the pre-#3025
+# form raises TypeError on any current pin. Verified against the pinned instance: npu2 4x1 emits 4
+# aie.core, 4x2 emits 8.
+cp "$RB/silu/silu.py"  "$PE/ml/silu/silu.py"
+cp "$RB/silu/Makefile" "$PE/ml/silu/Makefile"
+cp "$RB/silu/test.cpp" "$PE/ml/silu/test.cpp"
 
 # dwconv1d k=5 (docs/08) — last missing Conformer primitive
 cp "$RB/dwconv1d/dwconv1d.cc" "$K/dwconv1d.cc"
