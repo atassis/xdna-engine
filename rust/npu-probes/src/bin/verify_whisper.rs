@@ -12,8 +12,19 @@ const TOL_HOST: f32 = 5e-3;
 /// P2 make-or-break gate: NPU (bf16/int8 over 12 layers) vs ONNX golden.
 #[cfg(feature = "npu")]
 const TOL_NPU: f32 = 0.08;
-/// CALIBRATE-ME
-const TOL_SCALE: f32 = 0.0;
+/// Calibrated 2026-08-31 (device, k768-gelu-rail item (iv)): the two currently-shipped
+/// computation paths for `block_{n-1}` measure |alpha| = 2.069e-3 (NPU_ENC_GELU_FUSED on-chip
+/// GELU epilogue) and 3.426e-3 (host GELU, unfused) against the ONNX golden -- both believed
+/// correct, both pass `encoded`. Set at ~2x the larger of those two, so neither shipped path
+/// false-positives while still catching a regression an order of magnitude worse (the KB
+/// precedent -- [[a-gate-behind-a-layernorm-cannot-see-a-scale-error]] -- found a real scale bug
+/// at 8.564e-3 measured on the ISOLATED epilogue kernel alone, a narrower, dirtier-signal scope
+/// than this whole-block measurement, so that number is a proxy, not a direct bound). NOT
+/// verified against a whole-block bad-arm control: an attempted truncate-vs-nearest-even device
+/// control this same day did not reproduce the expected divergence (see
+/// [[k768-gelu-rail-scale-gate-exists-uncalibrated-control-inconclusive]]), so treat this
+/// threshold as provisional until a working control exists.
+const TOL_SCALE: f32 = 5e-3;
 
 fn rel(got: &Array2<f32>, refr: &Array2<f32>) -> f32 {
     let mut num = 0f64;
@@ -166,6 +177,40 @@ fn main() {
     );
     if last_alpha.abs() > TOL_SCALE {
         fails.push("scale".into());
+    }
+
+    // ---- control: does gate 4 actually see a scale error? ----
+    // TOL_SCALE was calibrated (2026-08-31) from two real but unverified-as-representative alpha
+    // readings, because a rounding-mode device control came back bit-identical to the arm it was
+    // meant to differ from (open observation, not resolved: see this task's worklog). This is the
+    // control that replaces it: perturb REAL data by a KNOWN multiplicative factor -- not the
+    // kernel's ambient state, so device-free, no recompile, nothing to restore -- and check that
+    // `scale_split` recovers the injected factor on top of whatever real alpha was already there.
+    // `SCALE_INJECT=<f32>` (e.g. 0.01) multiplies the already-computed `block_{n-1}` by (1+f)
+    // before re-running scale_split against the SAME golden; to first order (f small, base alpha
+    // near zero) the predicted new alpha is base_alpha + f, since scaling `got` by (1+f) adds
+    // f*refr to the numerator `got-refr` and only a second-order f*(got-refr) cross term is
+    // dropped. This is a stronger check than recovering an injected shrink on synthetic i.i.d.
+    // data (already covered by `scale_split_recovers_an_injected_shrink`): it tests the SAME
+    // real, correlated, non-Gaussian data class the gate actually runs against.
+    if let Ok(s) = std::env::var("SCALE_INJECT") {
+        let f: f32 = s.parse().expect("SCALE_INJECT must parse as f32, e.g. 0.01");
+        let last = &outs[enc.cfg.n_layers - 1];
+        let golden_last = as2(w.ref_tensor(&format!("block_{}", enc.cfg.n_layers - 1)));
+        let perturbed = last.mapv(|x| x * (1.0 + f));
+        let (alpha_inj, _) = scale_split(&perturbed, &golden_last);
+        let predicted = last_alpha + f;
+        let err = (alpha_inj - predicted).abs();
+        // 5% relative to the injected factor itself (not to the tiny base alpha), since that is
+        // the quantity a real scale bug of this size would move the gate by.
+        let ok = err <= 0.05 * f.abs();
+        println!(
+            "[scale-control] SCALE_INJECT={f:+.3e}  alpha(injected)={alpha_inj:+.3e}  predicted={predicted:+.3e}  |err|={err:.3e}  {}",
+            if ok { "OK -- alpha tracks the injected factor" } else { "FAIL -- gate did not see the injected scale error" }
+        );
+        if !ok {
+            fails.push("scale-control".into());
+        }
     }
 
     if fails.is_empty() {
