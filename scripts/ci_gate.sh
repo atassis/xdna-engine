@@ -38,9 +38,24 @@ step() {
 step "clippy --workspace --all-targets" \
   cargo clippy --workspace --all-targets -j "$J"
 
-# 2. Tests.
-step "test --workspace" \
-  cargo test --workspace --no-fail-fast -j "$J"
+# 2. Tests. `--nocapture`, because the fixture-guard pattern (`eprintln!("SKIP: ...")` + early
+#    `return`) prints nothing without it -- a test whose fixture is missing still reports `ok`, so
+#    a passing-by-skipping test read as green here too. Tee to a scratch file so the tally below
+#    survives the scrollback; `pipefail` so `tee` succeeding doesn't hide a `cargo test` failure.
+echo
+echo "[ci_gate] === test --workspace ==="
+test_log="$(mktemp)"
+if (set -o pipefail; cargo test --workspace --no-fail-fast -j "$J" -- --nocapture 2>&1 | tee "$test_log"); then
+  echo "[ci_gate] OK"
+else
+  echo "[ci_gate] FAILED"; fail=1
+fi
+skip_count=$(grep -c '^SKIP' "$test_log" || true)
+if [ "$skip_count" -gt 0 ]; then
+  echo "[ci_gate] $skip_count SKIP line(s) above -- a guarded test's fixture was missing and it returned early, counted as a pass:"
+  grep '^SKIP' "$test_log" | sort -u | sed 's/^/[ci_gate]   /'
+fi
+rm -f "$test_log"
 
 # 3. The decoupling contract: npu-parakeet must build standalone, no features, no XRT. This is the
 #    check that would have caught the missing `required-features` on a cfg-gated device probe.
