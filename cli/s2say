@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+# s2say -- synthesize speech from text, write a timestamped wav, play it.
+#
+#   s2say "some text to speak"
+#   s2say --no-play "text"           write the file, do not play
+#   s2say --voice alice "text"       use a saved .s2voice profile
+#   s2say --out-dir ~/clips "text"
+#   s2say --where                    show which binary, model and config are in use
+#
+# Installed by cli/install.sh. Paths resolve env -> ~/.config/s2say/config -> repo-relative, so an
+# installed copy does not depend on the checkout staying where it was when it was installed.
+#
+# WHICH HARDWARE THIS USES, stated plainly because it is the whole question right now:
+# this runs the s2.cpp CPU reference end to end. It is NOT the NPU path.
+#
+# The NPU work so far covers the codec DECODER's operators and its window-stitching driver -- a
+# complete decoder stage is device-green at rel-L2 8.869e-07 against the true stream. It is not yet
+# a runnable pipeline, for two independent reasons:
+#
+#   1. Only stage 4 of 4 is wired end to end; stages 1-3 need their -D shapes and channel chunking
+#      (the mechanism is in place and validated, the wiring is not).
+#   2. Even wired, a full-length decode is impractical today: stage 4's dilation-9 convolution
+#      advances 10 samples per dispatch over a 112640-sample stream, so a 2.5 s clip is ~11k
+#      dispatches for that one op. Window length is the fix, and the lever is a bf16 resident.
+#
+# And the AR half (text -> codes) has no NPU kernels at all. So "TTS on the NPU" is not something
+# this script can honestly claim yet; when it can, this script gets a --npu flag and this comment
+# gets shorter.
+set -euo pipefail
+
+CONFIG="${S2SAY_CONFIG:-$HOME/.config/s2say/config}"
+# Config first, then env wins: sourcing before the defaults lets an env var override an installed
+# config without editing it.
+[[ -r "$CONFIG" ]] && . "$CONFIG"
+
+# Repo-relative fallback, so the script also works when run straight out of a checkout.
+_here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+_ws="$(cd "$_here/../.." 2>/dev/null && pwd || echo /nonexistent)"
+
+S2="${S2_BIN:-${S2_BIN_CFG:-$_ws/s2.cpp/build-cpu/s2}}"
+MODEL="${S2_MODEL:-${S2_MODEL_CFG:-$_ws/s2.cpp/models/s2-pro-q6_k.gguf}}"
+TOKENIZER="${S2_TOKENIZER:-${S2_TOKENIZER_CFG:-$_ws/s2.cpp/models/tokenizer.json}}"
+OUT_DIR="${S2SAY_OUT_DIR:-${S2SAY_OUT_DIR_CFG:-$HOME/Music/s2}}"
+PLAY=1
+VOICE=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --no-play) PLAY=0; shift ;;
+    --out-dir) OUT_DIR="$2"; shift 2 ;;
+    --voice)   VOICE="$2"; shift 2 ;;
+    --where)
+      printf 'binary    %s%s\nmodel     %s%s\ntokenizer %s%s\nconfig    %s%s\nout-dir   %s\n' \
+        "$S2" "$([[ -x $S2 ]] || echo '   [MISSING]')" \
+        "$MODEL" "$([[ -e $MODEL ]] || echo '   [MISSING]')" \
+        "$TOKENIZER" "$([[ -e $TOKENIZER ]] || echo '   [MISSING]')" \
+        "$CONFIG" "$([[ -r $CONFIG ]] || echo '   [none, using defaults]')" "$OUT_DIR"
+      exit 0 ;;
+    -h|--help) sed -n '2,12p' "$0" | sed 's/^# \?//'; exit 0 ;;
+    *) break ;;
+  esac
+done
+
+TEXT="${*:-}"
+if [[ -z "$TEXT" ]]; then
+  echo "usage: $(basename "$0") [--no-play] [--voice ID] [--out-dir DIR] \"text to speak\"" >&2
+  exit 2
+fi
+
+for f in "$S2" "$MODEL" "$TOKENIZER"; do
+  [[ -e "$f" ]] || {
+    echo "missing: $f" >&2
+    echo "run 's2say --where' to see resolved paths, or re-run cli/install.sh" >&2
+    exit 1
+  }
+done
+
+mkdir -p "$OUT_DIR"
+STAMP="$(date +%Y%m%d-%H%M%S)"
+# Slug from the text so a directory of clips is browsable rather than a wall of timestamps.
+SLUG="$(printf '%s' "$TEXT" | tr '[:upper:]' '[:lower:]' \
+        | tr -cs 'a-z0-9' '-' | sed 's/^-*//; s/-*$//' | cut -c1-40)"
+OUT="$OUT_DIR/${STAMP}${SLUG:+-$SLUG}.wav"
+
+ARGS=(-m "$MODEL" -t "$TOKENIZER" -text "$TEXT" -o "$OUT" -v -1
+      -threads "$(( $(nproc) / 2 ))")
+[[ -n "$VOICE" ]] && ARGS+=(--voice "$VOICE")
+
+echo "synthesizing (CPU reference path) -> $OUT"
+START=$(date +%s.%N)
+"$S2" "${ARGS[@]}" >/dev/null 2>&1 || { echo "s2 failed; re-run without >/dev/null to see why" >&2; exit 1; }
+END=$(date +%s.%N)
+
+[[ -s "$OUT" ]] || { echo "no audio produced" >&2; exit 1; }
+
+# Report duration and realtime factor: for a TTS clip those are the two numbers worth seeing, and
+# they make the CPU-vs-NPU comparison concrete once there is an NPU path to compare against.
+# Parse RIFF by hand: s2.cpp writes IEEE-float wavs (format tag 3) and python's `wave` module
+# rejects anything that is not PCM.
+read -r DUR SIZE < <(python3 -c "
+import os, struct, sys
+p = sys.argv[1]
+b = open(p, 'rb').read()
+assert b[:4] == b'RIFF' and b[8:12] == b'WAVE', 'not a RIFF/WAVE file'
+i, rate, ch, bits, ndata = 12, None, None, None, 0
+while i + 8 <= len(b):
+    cid, sz = b[i:i+4], struct.unpack('<I', b[i+4:i+8])[0]
+    if cid == b'fmt ':
+        _, ch, rate, _, _, bits = struct.unpack('<HHIIHH', b[i+8:i+24])
+    elif cid == b'data':
+        ndata = sz
+    i += 8 + sz + (sz & 1)
+print((ndata / (ch * bits // 8)) / rate, os.path.getsize(p))
+" "$OUT")
+# All formatting in python: the shell's printf honours LC_NUMERIC, so on a comma-decimal locale
+# it rejects the floats python just produced.
+python3 -c "
+import sys
+dur, size, start, end = float(sys.argv[1]), int(sys.argv[2]), float(sys.argv[3]), float(sys.argv[4])
+wall = end - start
+print(f'  {dur:.2f} s audio, {size/1000:.0f} kB, {wall:.1f} s wall, '
+      f'RTF {wall/max(dur,1e-9):.2f} (1.0 = realtime, lower is faster)')
+" "$DUR" "$SIZE" "$START" "$END"
+
+if [[ "$PLAY" == 1 ]]; then
+  for p in paplay pw-play aplay; do
+    if command -v "$p" >/dev/null; then
+      echo "playing via $p"
+      "$p" "$OUT" && break
+    fi
+  done
+fi

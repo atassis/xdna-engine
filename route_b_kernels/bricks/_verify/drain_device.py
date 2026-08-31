@@ -62,6 +62,19 @@ SCRIPT_TARGETS = [
     "verify_upscaler_conv2d_ktile",
     "verify_upscaler_espcn_image",
     "verify_upscaler_espcn_wholenet",
+    # Codec bricks, merged from feat/s2-codec-bricks. On that branch the upscaler/ESPCN gates
+    # above were deliberately omitted because its artifacts/ carried only espcn.json; here the
+    # assets exist, so the two sets coexist.
+    "verify_conv_1d",
+    "verify_conv_transpose_1d",
+    "verify_dwconv_causal",
+    "verify_gather_rows",
+    "verify_gelu_erf",
+    "verify_mha_decode_hd128",
+    "verify_prefill_attn",  # device-green 2026-08-31: 32/32 heads, worst rel-L2 8.540e-08
+    "verify_sin",
+    "verify_snake",
+    "verify_softmax",
 ]
 
 
