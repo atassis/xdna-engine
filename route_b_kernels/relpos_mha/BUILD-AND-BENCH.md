@@ -174,6 +174,23 @@ KB must match `-DRELPOS_KB`; T=172=4*43 blocks k/V with no pad, p is 7 full + a
 
 ### 3d. device gate (serial, orchestrator-driven; announce + fuser + quiesce)
 
+**CAVEAT (2026-08-31, relpos-uses-8-of-32-cores round 19):** the `--stream` commands below predate
+the HEADS=8 row-tiling extension and are STALE for any xclbin built with `HEADS=8` (the shipped
+row-tiled arm): they send one head's worth of QUV/KPV/CTX against a runtime sequence that expects
+all H heads concatenated head-major (confirmed against the compiled `.mlir`'s
+`aie.runtime_sequence` arg sizes -- each is exactly 8x a single head's), which reads/writes past
+the allocated host buffer and returns non-finite garbage, non-deterministically. `run_npu_relpos_rowtiled.py`
+now builds all H heads for `--stream` and de-concatenates the readback per head, which removes that
+failure class -- but a SEPARATE, unresolved issue remains even after the fix (also present on the
+untouched, single-head STEP=6 path, so it is not multi-head-specific): the gate still does not pass
+(rel-L2/corr both far outside tolerance), with a per-row error pattern that cleanly splits between
+~0.002 (bf16 noise) and ~1.3-1.6 (essentially uncorrelated), the first query tile always clean and
+later tiles scattered bad -- shape-matching the KPV block-replay mechanism in 3f below, not yet
+isolated further. The real production pipeline (`rust/npu-parakeet`'s `RelposK`, same xclbin family)
+gives correct transcripts on real clips, so this is not believed to be a kernel defect, but that is
+not proven for this second issue the way the buffer-size fix is. Do not treat a passing `--stream`
+run as fully trustworthy until this is resolved; see the script's own updated docstring.
+
     # STEP=7 (existing packing, unchanged runner):
     scripts/run_npu_relpos_rowtiled.py --xclbin .../build/final.xclbin \
         --insts .../build/insts.bin --synth-T 32
