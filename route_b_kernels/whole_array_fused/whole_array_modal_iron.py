@@ -995,11 +995,10 @@ def my_matmul(
                         # acquires only 1 NEW lock (`held` -> 2), and slot 0's `release(2)` drops
                         # it back to 0 -- so `ea`'s hold is absorbed into slot 0's request rather
                         # than leaked, at the lock level, by this trace. That casts real doubt on
-                        # candidate 1 (2026-08-28-mode-switch-stall-candidates) as the hang's root
-                        # cause -- consistent with that note's own weakening evidence
+                        # the orphaned-peel explanation as the hang's root cause -- consistent
+                        # with that explanation's own weakening evidence
                         # (RESADD2A_NOOP=1 has the identical skeleton and completes 18/18) -- but
-                        # is a source trace, not a device measurement either way. Detail:
-                        # [[2026-08-31-resadd2a-fused-peel-fix-was-unsound]].
+                        # is a source trace, not a device measurement either way.
                         for slot in range(0, n_aie_cols * r2a_per_core, 2):
                             pair = in_a.acquire(2)
                             if slot // r2a_per_core == r2a_col:

@@ -15,7 +15,7 @@ kernel = "zeropad"
 [artifacts]
 weights = "artifacts/whisper-turbo"
 
-# NOT registered in engine.toml -- see docs/tasks/whisper-v3-turbo-on-npu.md. The encoder weights
+# NOT registered in engine.toml. The encoder weights
 # + golden activations here are baked and host-path-gated (rel-L2 vs the real HF checkpoint), but
 # there is no NPU-resident encoder kernel at this shape yet (K=1280/K=5120 whole-array GEMM,
 # needs a new aiecc build, not a config change). Registering this scenario in engine.toml before

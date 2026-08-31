@@ -16,14 +16,16 @@ const TOL_NPU: f32 = 0.08;
 /// computation paths for `block_{n-1}` measure |alpha| = 2.069e-3 (NPU_ENC_GELU_FUSED on-chip
 /// GELU epilogue) and 3.426e-3 (host GELU, unfused) against the ONNX golden -- both believed
 /// correct, both pass `encoded`. Set at ~2x the larger of those two, so neither shipped path
-/// false-positives while still catching a regression an order of magnitude worse (the KB
-/// precedent -- [[a-gate-behind-a-layernorm-cannot-see-a-scale-error]] -- found a real scale bug
-/// at 8.564e-3 measured on the ISOLATED epilogue kernel alone, a narrower, dirtier-signal scope
-/// than this whole-block measurement, so that number is a proxy, not a direct bound). NOT
-/// verified against a whole-block bad-arm control: an attempted truncate-vs-nearest-even device
-/// control this same day did not reproduce the expected divergence (see
-/// [[k768-gelu-rail-scale-gate-exists-uncalibrated-control-inconclusive]]), so treat this
-/// threshold as provisional until a working control exists.
+/// false-positives while still catching a regression an order of magnitude worse. A prior scale
+/// bug measured 8.564e-3 on the ISOLATED epilogue kernel alone -- a narrower, dirtier-signal
+/// scope than this whole-block measurement, so that figure informed the bound rather than
+/// setting it. CONTROLLED 2026-08-31 with `SCALE_INJECT`, which multiplies the measured block by
+/// (1+f) post-hoc so the response has a PREDICTED value: +0.01 -> predicted +1.207e-2, measured
+/// +1.209e-2; +0.003 (straddling this threshold) -> predicted +5.069e-3, measured +5.076e-3;
+/// -0.01 tracks in sign. So this is a demonstrated detector at its own threshold's magnitude,
+/// not an inferred bound. (An earlier truncate-vs-nearest-even rebuild appeared not to diverge;
+/// that was traced to a build-path artifact -- the dispatched xclbin was a different tile than
+/// the one rebuilt -- and is not evidence about rounding.)
 const TOL_SCALE: f32 = 5e-3;
 
 fn rel(got: &Array2<f32>, refr: &Array2<f32>) -> f32 {
