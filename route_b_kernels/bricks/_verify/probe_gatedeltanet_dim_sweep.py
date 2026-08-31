@@ -4,7 +4,7 @@
 WHY. gatedeltanet went NaN -> 0.000e+00 bit-exact when `float bk = beta * k[i]` became a vector op.
 An isolated probe then showed the bare scalar multiply is FINE (32/32 lanes bit-exact, both forms),
 so that was never the mechanism. The surviving explanation is one this project already measured:
-[[kernel-internal-loops-miscompile-put-volume-in-the-worker]] -- a loop INSIDE an AIE kernel body
+a loop INSIDE an AIE kernel body
 miscompiles, with error growing in BOTH live-vector count and iteration count (gelu-erf: clean at 1
 chunk, 7.077e-01 at 2). gatedeltanet's NaN entered at t=2 of 64 with steps 0-1 clean, which is that
 exact signature, and hoisting the multiply out of the inner DK loop reduces per-iteration live

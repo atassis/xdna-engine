@@ -2,8 +2,8 @@
 """Is prefill-attn's NaN the verify_streamed RAIL, or the kernel body?
 
 WHY. prefill-attn is NaN on all 32 heads and at every M>=2 (M=1 hangs), while its CPU self-checks
-all pass with teeth, so the fault is device-side and not row-count-dependent
-([[prefill-attn-is-broken-at-every-m-not-a-row-count-defect]]). Before bisecting a large attention
+all pass with teeth, so the fault is device-side and not row-count-dependent.
+Before bisecting a large attention
 kernel, clear or implicate the DATA PATH it rides on -- the same move that exonerated the rail
 during the rope-lut hunt and saved chasing the kernel for nothing.
 

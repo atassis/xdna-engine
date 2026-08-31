@@ -89,8 +89,8 @@ static inline ::aie::vector<float, N> sin_v(::aie::vector<float, N> r) {
 // 7.035e-01, same as |x|<=64), and the fold constant is not the cause (2^23 vs 1.5*2^23 are
 // BIT-IDENTICAL at one chunk, 7.114e-01 both). What fixed it is removing the runtime bound, the
 // same fix that took `gelu-erf` from 9.538e+00 to 1.138e-03.
-// See [[kernel-internal-loops-miscompile-put-volume-in-the-worker]] -- volume belongs in the
-// objectFIFO worker loop, which costs nothing since the iteration merely moves to the driver.
+// Volume belongs in the objectFIFO worker loop, not in a kernel-internal bound: it costs
+// nothing there, since the iteration merely moves to the driver.
 template <int N>
 void sin_core(const float *restrict input, float *restrict output) {
   event0();

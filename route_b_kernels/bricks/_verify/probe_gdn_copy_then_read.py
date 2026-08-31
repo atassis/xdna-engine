@@ -3,7 +3,7 @@
 
 WHY. rope-lut's pinned-aie_api damage turned out to be ORDERING, not arithmetic: a scalar copy loop
 that writes a buffer, immediately followed by a vector loop that reads it, had the reads scheduled
-ahead of the writes ([[rope-lut-pin-damage-is-copy-then-rotate-not-the-rotate]]).
+ahead of the writes.
 `gatedeltanet_core` opens with exactly that shape:
 
     for (i) { row = load_v(&s_in[i]); store_v(&s_out[i], row); }   // seed s_out from s_in
