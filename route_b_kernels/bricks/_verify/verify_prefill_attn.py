@@ -89,6 +89,13 @@ def _verify_head(oh: int, q_full, k_full, v_full, m_tokens: int, mask: np.ndarra
         # which measured depth=2 fail to build / depth=1 build+gate-green at a comparable shape).
         resident_depth=1,
         compile_flags=[f"-DPREFILL_HD={golden.HD}", f"-DPREFILL_M={m_tokens}"],
+        # This kernel's frame exceeds the 0x400 dialect default, so at the default it overruns the
+        # adjacent objectFIFO buffers and every head returns NaN -- the long-standing red on this
+        # brick, and NOT a numerics defect (see the ~10 arithmetic hypotheses refuted against it).
+        # Measured head 0: 0x400 nan/1408 non-finite, 0x800 rel-L2 8.290e-08 and 0/1408. 0xD00 is
+        # 0x800 plus margin, matches amd/IRON's own constant for its gemm/mha operators, and costs
+        # nothing here -- the design still builds at 0x4000, so L1 is not tight at this shape.
+        stack_size=0xD00,
     )
 
 

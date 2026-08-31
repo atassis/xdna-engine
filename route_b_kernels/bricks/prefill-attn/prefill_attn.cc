@@ -197,6 +197,63 @@ static constexpr int M = PREFILL_M;
 
 static constexpr int SPAD = 16; // one softmax_core<VL> chunk; see header PADDING note.
 
+// Stage bisect (0 = full kernel, the shipped path). Non-zero short-circuits after stage N and
+// writes that stage's intermediate into ctx_row, to find the first stage that is already
+// non-finite on device. Diagnostic only -- the default leaves the kernel byte-identical.
+//   1 = after the bf16 dot products   2 = after the additive mask
+//   3 = after softmax_core            4 = after the V-weighted accumulate (== full)
+#ifndef PREFILL_STOP_AFTER
+#define PREFILL_STOP_AFTER 0
+#endif
+
+// Diagnostic: make the bisect's emit read `src` with ONE aie::load_v<VL>, the way softmax_core
+// reads it, instead of a scalar loop. Default 0 = shipped emit, byte-identical.
+#ifndef PREFILL_VEC_EMIT
+#define PREFILL_VEC_EMIT 0
+#endif
+
+// Diagnostic: at stop=3, have softmax_core write STRAIGHT INTO the streamed output (ctx_row)
+// instead of the alignas(64) stack local row_probs. In isolation softmax_core writes a streamed
+// buffer and PASSES; in the kernel it writes a stack local and the result is unstable (stage 3
+// reads differently scalar vs vector). Clean here => the defect is the stack-local STORE TARGET,
+// not the callee and not the input data. Default 0 = shipped path, byte-identical.
+#ifndef PREFILL_SM_OUT_DIRECT
+#define PREFILL_SM_OUT_DIRECT 0
+#endif
+
+// Diagnostic: at stop=3, feed softmax_core from a NON-STACK-LOCAL. Copies the masked scores into
+// spare space in the streamed output tile (ctx_row+SPAD, DMA-backed L1, still 64B-aligned since
+// SPAD*4 == 64) and calls softmax from there. Every FAILING arm so far feeds softmax a stack local;
+// the one PASSING arm (isolation) feeds it a streamed operand -- this holds everything else fixed
+// and varies only that. Default 0 = shipped path, byte-identical.
+#ifndef PREFILL_SM_IN_STREAMED
+#define PREFILL_SM_IN_STREAMED 0
+#endif
+
+// Diagnostic (STATE, not memory): every failing arm runs the dot-product and mask passes before
+// softmax; the one passing arm (isolation) runs neither. So the suspect is machine state carried
+// into the call, not any buffer.
+//   PREFILL_SET_ROUNDING=1 -- set the rounding mode at FUNCTION ENTRY. softmax_core sets it at its
+//     own top, but its header notes the VECTOR to_fixed honours that register while the scalar
+//     overload does not; the preceding passes never set it.
+//   PREFILL_SM_WARM=1 -- call softmax_core once on throwaway data BEFORE the dot products. If the
+//     real call is then right, this is a first-call-after-prior-work effect.
+#ifndef PREFILL_SET_ROUNDING
+#define PREFILL_SET_ROUNDING 0
+#endif
+#ifndef PREFILL_SM_WARM
+#define PREFILL_SM_WARM 0
+#endif
+
+// Diagnostic (CODE VOLUME, holding the emitted data fixed): at stop=3, run the whole V-accumulate
+// tail as well but STILL emit row_probs. The emitted bytes and their golden are unchanged, so the
+// only difference from plain stop=3 is that the tail's vector code is present and executed. If
+// stage 3's rel-L2 moves, severity tracks code volume rather than anything about the data -- and
+// unlike an Hd sweep this does not change the golden. Default 0.
+#ifndef PREFILL_TAIL_PRESENT
+#define PREFILL_TAIL_PRESENT 0
+#endif
+
 // Compile-time sqrt (Newton-Raphson, folded entirely at compile time) -- same helper mha_decode.cc
 // carries (not shared via include, to keep this brick's only cross-file dependency the sanctioned
 // softmax reuse; five lines, not worth a third file).
@@ -229,9 +286,41 @@ static void prefill_attn_row_impl(const bfloat16 *restrict qm_row, const bfloat1
   const bfloat16 *K = kv;           // [Mq, Hd]
   const bfloat16 *V = kv + Mq * Hd; // [Mq, Hd]
 
+#if PREFILL_STOP_AFTER
+  // Bisect emit: copy an SPAD-wide intermediate into ctx_row (zero-filled tail) and return.
+  auto emit_stage = [&](const float *src) {
+    for (int vi = 0; vi < HdVecs; vi++)
+      aie::store_v(ctx_row + vi * VL, aie::zeros<float, VL>());
+#if PREFILL_VEC_EMIT
+    // Read `src` the way softmax_core does -- ONE aie::load_v<VL> -- instead of the scalar loop.
+    // The stage bisect's green stages 1/2 only prove row_scores is correct when read SCALAR-wise;
+    // softmax_core vector-loads it. If stage 2 fails under this arm and passes under the scalar
+    // one, the buffer is bad for vector loads and the callee is not the variable at all.
+    aie::store_v(ctx_row, aie::load_v<VL>(src)); // SPAD == VL, so exactly one vector
+#else
+    for (int j = 0; j < SPAD; j++)
+      ctx_row[j] = src[j];
+#endif
+    event1();
+  };
+#endif
+
   alignas(64) float row_scores[SPAD];
+#if PREFILL_SET_ROUNDING
+  aie::set_rounding(aie::rounding_mode::conv_even);
+#endif
   alignas(64) float row_probs[SPAD];
   alignas(64) float acc_row[Hd];
+#if PREFILL_SM_WARM
+  // Throwaway softmax on constant data before any dot-product work, output discarded into
+  // row_probs (overwritten by the real call below).
+  {
+    alignas(64) float warm[SPAD];
+    for (int j = 0; j < SPAD; j++)
+      warm[j] = (float)j * 0.125f;
+    route_b_bricks::softmax_core<VL>(warm, row_probs, SPAD);
+  }
+#endif
 
   // Pass 1a: dot products for the Mq real keys; j>=Mq (no K data) scores 0 -- see header PADDING
   // (the mask, added next, unconditionally carries -1e9 there regardless of row).
@@ -246,19 +335,76 @@ static void prefill_attn_row_impl(const bfloat16 *restrict qm_row, const bfloat1
       acc = aie::mac(acc, aie::load_v<VL>(q_row + vi * VL), aie::load_v<VL>(kj + vi * VL));
     row_scores[j] = aie::reduce_add(acc.to_vector<float>()) * SCALE;
   }
+#if PREFILL_STOP_AFTER == 1
+  emit_stage(row_scores);
+  return;
+#endif
 
   // Pass 1b: additive mask -- DATA, not a branch (see header MASK IS DATA). SPAD==VL==16 -> one
   // vector op, no loop. mask_row widened bf16->f32 the same way V is widened in pass 3 below.
+#if PREFILL_SCALAR_MASK
+  // Diagnostic arm: identical arithmetic, but the result reaches row_scores through SCALAR stores
+  // instead of one aie::store_v. The isolated softmax probe fed softmax_core from a scalar store
+  // loop and was clean, so this isolates "vector store feeding a call" from the arithmetic.
+  for (int j = 0; j < SPAD; j++)
+    row_scores[j] = row_scores[j] + (float)mask_row[j];
+#else
   {
     aie::accum<accfloat, VL> mask_acc;
     mask_acc.from_vector(aie::load_v<VL>(mask_row));
     aie::vector<float, VL> scores_v = aie::load_v<VL>(row_scores);
     aie::store_v(row_scores, aie::add(scores_v, mask_acc.to_vector<float>()));
   }
+#endif
+#if PREFILL_STOP_AFTER == 2
+  emit_stage(row_scores);
+  return;
+#endif
 
   // Pass 2: full-row softmax, reused verbatim from the softmax brick (route_b_bricks namespace,
   // internal template -- see header SOFTMAX section). Distinct buffers, no aliasing.
+#if PREFILL_FENCE
+  // Diagnostic: force the pass-1b store to be visible before the dependent read inside
+  // softmax_core. If this alone turns the kernel green, the defect is store/load ORDERING
+  // across the call, not arithmetic in either side.
+  asm volatile("" ::: "memory");
+#endif
+#if PREFILL_SM_COPY
+  // Diagnostic: hand softmax_core a COPY in a distinct buffer, leaving row_scores untouched.
+  // softmax_core is clean in isolation on this same data, and emit_stage reads row_scores
+  // correctly at the same program point, so the remaining suspect is this buffer's live range
+  // across the call rather than the callee. Clean here => it is the buffer, not softmax.
+  alignas(64) float sm_in[SPAD];
+  for (int j = 0; j < SPAD; j++)
+    sm_in[j] = row_scores[j];
+  route_b_bricks::softmax_core<VL>(sm_in, row_probs, SPAD);
+#else
   route_b_bricks::softmax_core<VL>(row_scores, row_probs, SPAD);
+#endif
+#if PREFILL_STOP_AFTER == 3 && PREFILL_SM_IN_STREAMED
+  // Softmax reads from streamed scratch instead of the stack local; output also streamed.
+  for (int vi = 0; vi < HdVecs; vi++)
+    aie::store_v(ctx_row + vi * VL, aie::zeros<float, VL>());
+  for (int j = 0; j < SPAD; j++)
+    ctx_row[SPAD + j] = row_scores[j];
+  route_b_bricks::softmax_core<VL>(ctx_row + SPAD, ctx_row, SPAD);
+  for (int j = 0; j < SPAD; j++)
+    ctx_row[SPAD + j] = 0.0f; // clear the scratch so the tail control still reads zero
+  event1();
+  return;
+#endif
+#if PREFILL_STOP_AFTER == 3 && PREFILL_SM_OUT_DIRECT
+  // Softmax writes the streamed output directly; zero the tail first, then re-run it onto ctx_row.
+  for (int vi = 0; vi < HdVecs; vi++)
+    aie::store_v(ctx_row + vi * VL, aie::zeros<float, VL>());
+  route_b_bricks::softmax_core<VL>(row_scores, ctx_row, SPAD);
+  event1();
+  return;
+#endif
+#if PREFILL_STOP_AFTER == 3 && !PREFILL_TAIL_PRESENT
+  emit_stage(row_probs);
+  return;
+#endif
 
   // Pass 3: ctx_row = sum_{j=0}^{Mq-1} probs[j] * V[j]. Fresh accumulator (see header NO STATIC
   // L1 STATE) -- zeroed here, never carried from a previous call.
@@ -284,6 +430,9 @@ static void prefill_attn_row_impl(const bfloat16 *restrict qm_row, const bfloat1
 
   for (int vi = 0; vi < HdVecs; vi++)
     aie::store_v(ctx_row + vi * VL, aie::load_v<VL>(acc_row + vi * VL));
+#if PREFILL_STOP_AFTER == 3 && PREFILL_TAIL_PRESENT
+  emit_stage(row_probs); // tail ran; emit the stage-3 intermediate anyway so the golden is unchanged
+#endif
   event1();
 }
 

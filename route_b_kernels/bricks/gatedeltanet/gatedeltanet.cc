@@ -100,15 +100,39 @@ static inline aie::vector<float, DV> gdn_state_read(const float *__restrict S,
 // bk is beta*k, precomputed by the caller in the VECTOR domain: the aie2p
 // scalar-f32 path miscompiles (see rope_lut.cc's header), and the `beta*k[i]`
 // this loop used to do was a scalar float mul.
+// GDN_VARIANT selects which PART of the 3-part vector-domain fix is applied, to name the
+// edit that actually mattered. 3 = the shipped kernel (all parts); 0 = the pre-fix kernel.
+//   bit 0 (=1) : alpha broadcast hoisted to the caller (vector in, not scalar)
+//   bit 1 (=2) : beta*k hoisted to the caller as ONE vector mul (kills the scalar f32 mul)
+// Diagnostic only -- the default leaves the kernel byte-identical to what ships.
+#ifndef GDN_VARIANT
+#define GDN_VARIANT 3
+#endif
+
 template <unsigned DK, unsigned DV>
 static inline void gdn_state_write(float *__restrict S,
+#if GDN_VARIANT & 2
                                     const aie::vector<float, DK> &bk,
+#else
+                                    const aie::vector<float, DK> &k,
+                                    float beta,
+#endif
                                     const aie::vector<float, DV> &err,
+#if GDN_VARIANT & 1
                                     const aie::vector<float, DV> &alpha_v) {
+#else
+                                    float alpha) {
+  const aie::vector<float, DV> alpha_v = aie::broadcast<float, DV>(alpha);
+#endif
   for (unsigned i = 0; i < DK; ++i) {
     aie::vector<float, DV> row = aie::load_v<DV>(&S[i * DV]);
     aie::accum<accfloat, DV> acc = aie::mul(row, alpha_v);  // alpha * S[i,:]
+#if GDN_VARIANT & 2
     acc = aie::mac(acc, err, aie::broadcast<float, DV>(bk[i]));
+#else
+    float bk_i = beta * k[i];   // the scalar f32 mul under suspicion
+    acc = aie::mac(acc, err, aie::broadcast<float, DV>(bk_i));
+#endif
     aie::store_v(&S[i * DV], acc.template to_vector<float>());
   }
 }
@@ -156,19 +180,36 @@ static inline void gatedeltanet_core(const bfloat16 *__restrict k,
     aie::vector<float, DV> vf = vacc.template to_vector<float>();
 
     // Both gates go straight from their scalar load into the vector domain;
-    // no scalar float arithmetic happens on this path.
+    // no scalar float arithmetic happens on this path. (See GDN_VARIANT above:
+    // each half of that move can be disabled independently for the bisect.)
+#if GDN_VARIANT & 1
     const aie::vector<float, DV> alpha_v =
         aie::broadcast<float, DV>(gates[t * 2 + 0]);
+#else
+    const float alpha = gates[t * 2 + 0];
+#endif
+#if GDN_VARIANT & 2
     const aie::vector<float, DK> bk =
         aie::mul(kf, aie::broadcast<float, DK>(gates[t * 2 + 1]))
             .template to_vector<float>();
+#else
+    const float beta = gates[t * 2 + 1];
+#endif
 
     // 1) predict what the (pre-update) state already stores for this key.
     aie::vector<float, DV> pred = gdn_state_read<DK, DV>(s_out, kf);
     // 2) delta / correction term.
     aie::vector<float, DV> err = aie::sub(vf, pred);
     // 3) decay + delta-rule write (in place on s_out).
+#if GDN_VARIANT == 3
     gdn_state_write<DK, DV>(s_out, bk, err, alpha_v);
+#elif GDN_VARIANT == 2
+    gdn_state_write<DK, DV>(s_out, bk, err, alpha);
+#elif GDN_VARIANT == 1
+    gdn_state_write<DK, DV>(s_out, kf, gates[t * 2 + 1], err, alpha_v);
+#else
+    gdn_state_write<DK, DV>(s_out, kf, beta, err, alpha);
+#endif
     // 4) read the just-updated state back out with the query.
     aie::vector<float, DV> ov = gdn_state_read<DK, DV>(s_out, qf);
 

@@ -166,7 +166,7 @@ def _design_key(symbol, *parts):
 
 
 def _build_streamed(symbol, shim, n_tiles, in_tile, out_tile, resident_len, compile_flags,
-                    in_dt, out_dt, resident_dt, resident_depth=2):
+                    in_dt, out_dt, resident_dt, resident_depth=2, stack_size=None):
     """Stream `n_tiles` fixed-size operand tiles past ONE resident operand.
 
     This is the general resident-stream `[tile, D]` delivery: the core acquires the
@@ -190,6 +190,12 @@ def _build_streamed(symbol, shim, n_tiles, in_tile, out_tile, resident_len, comp
 
     Row-wise verification (`_build_rowwise`) is the special case where one tile is one row
     of a matrix; `verify_streamed` is the tiled-operand case. Both are the same design.
+
+    `stack_size` is the core's stack reservation in bytes; None takes the AIE dialect default of
+    0x400. The generated linker script places the stack immediately below the objectFIFO buffers
+    with zero clearance, so a kernel whose frame exceeds the reservation overwrites them -- which
+    presents as missing output tiles, not as a crash. Measured frames on straight-line vector code
+    reach 0x700. amd/IRON's own gemm and mha operators pass 0xD00 for the same reason.
     """
     compile_flags = _AIE_API_INC + list(compile_flags or [])
     # Make edits to #included files visible to the JIT cache key (see _include_closure_digest).
@@ -222,7 +228,8 @@ def _build_streamed(symbol, shim, n_tiles, in_tile, out_tile, resident_len, comp
                     inf.release(1)
                 cf.release(1)
 
-            worker = Worker(core, fn_args=[inf.cons(), cf.cons(), of.prod(), kern])
+            worker = Worker(core, fn_args=[inf.cons(), cf.cons(), of.prod(), kern],
+                            stack_size=stack_size)
             in_tap = TensorTiler2D.group_tiler((n_tiles, in_tile), (1, in_tile), (n_tiles, 1))[0]
             out_tap = TensorTiler2D.group_tiler((n_tiles, out_tile), (1, out_tile), (n_tiles, 1))[0]
             cst_tap = TensorTiler2D.group_tiler((1, resident_len), (1, resident_len), (1, 1))[0]
@@ -240,7 +247,7 @@ def _build_streamed(symbol, shim, n_tiles, in_tile, out_tile, resident_len, comp
             ).resolve_program()
         design.__name__ = design.__qualname__ = _design_key(
             symbol, n_tiles, in_tile, out_tile, resident_len, in_dt, out_dt, resident_dt,
-            compile_flags, resident_depth, _shim_digest(shim))
+            compile_flags, resident_depth, stack_size, _shim_digest(shim))
         return iron.jit(design, use_cache=_JIT_CACHE)
 
     def design(inp: In, out: Out):
@@ -262,7 +269,7 @@ def _build_streamed(symbol, shim, n_tiles, in_tile, out_tile, resident_len, comp
                 of.release(1)
                 inf.release(1)
 
-        worker = Worker(core, fn_args=[inf.cons(), of.prod(), kern])
+        worker = Worker(core, fn_args=[inf.cons(), of.prod(), kern], stack_size=stack_size)
         in_tap = TensorTiler2D.group_tiler((n_tiles, in_tile), (1, in_tile), (n_tiles, 1))[0]
         out_tap = TensorTiler2D.group_tiler((n_tiles, out_tile), (1, out_tile), (n_tiles, 1))[0]
         def sequence(a, o, in_h, out_h):
@@ -275,19 +282,19 @@ def _build_streamed(symbol, shim, n_tiles, in_tile, out_tile, resident_len, comp
         ).resolve_program()
     design.__name__ = design.__qualname__ = _design_key(
         symbol, n_tiles, in_tile, out_tile, resident_len, in_dt, out_dt, resident_dt,
-        compile_flags, _shim_digest(shim))
+        compile_flags, stack_size, _shim_digest(shim))
     return iron.jit(design, use_cache=_JIT_CACHE)
 
 
 def _build_rowwise(symbol, shim, m, in_cols, out_cols, const_len, compile_flags,
-                   in_dt, out_dt, const_dt):
+                   in_dt, out_dt, const_dt, stack_size=None):
     """Rows-of-a-matrix view of `_build_streamed`: one tile is one row.
 
     Kept as its own name because that IS what the row-wise bricks mean, and their call
     sites read better for it. The generated design is identical.
     """
     return _build_streamed(symbol, shim, m, in_cols, out_cols, const_len, compile_flags,
-                           in_dt, out_dt, const_dt)
+                           in_dt, out_dt, const_dt, stack_size=stack_size)
 
 
 def _find_kernel_params(symbol, shim_path):
@@ -353,7 +360,8 @@ def _check_symbol_arity(symbol, shim, n_buffers):
         )
 
 
-def _build_oneshot(symbol, shim, in_numels, out_numel, in_dts, out_dt, compile_flags):
+def _build_oneshot(symbol, shim, in_numels, out_numel, in_dts, out_dt, compile_flags,
+                   stack_size=None):
     """Whole-buffer inputs, ONE kernel call, one output. For GEMM/GEMV-style bricks.
     In/Out params are signature markers for iron.jit's tensor-arg count; data flows
     through rt.sequence."""
@@ -382,7 +390,8 @@ def _build_oneshot(symbol, shim, in_numels, out_numel, in_dts, out_dt, compile_f
             for c in cons:
                 c.release(1)
 
-        worker = Worker(core, fn_args=[f.cons() for f in in_fifos] + [of.prod(), kern])
+        worker = Worker(core, fn_args=[f.cons() for f in in_fifos] + [of.prod(), kern],
+                        stack_size=stack_size)
         seq_tys = list(in_tys) + [out_ty]
 
         def sequence(*params):
@@ -414,13 +423,18 @@ def _build_oneshot(symbol, shim, in_numels, out_numel, in_dts, out_dt, compile_f
     else:
         raise ValueError(f"_build_oneshot supports 1-4 inputs, got {nin}")
 
+    # `stack_size` belongs in the key for the same reason shapes do: it changes the program but
+    # appears in neither the source nor the flags, so a sweep over it would otherwise compare one
+    # artifact against itself and report that the stack does not matter.
     design.__name__ = design.__qualname__ = _design_key(
-        symbol, in_numels, out_numel, in_dts, out_dt, compile_flags, _shim_digest(shim))
+        symbol, in_numels, out_numel, in_dts, out_dt, compile_flags, stack_size,
+        _shim_digest(shim))
     return iron.jit(design, use_cache=_JIT_CACHE)
 
 
 def verify_oneshot(name, brick_cc, shim_body, symbol, inputs, out_numel, out_shape,
-                   unpack, golden, gate, compile_flags=None, out_dt=np.int32):
+                   unpack, golden, gate, compile_flags=None, out_dt=np.int32,
+                   stack_size=None):
     """inputs: list of (packed_1d_np, dtype). unpack(dev_flat)->got array (native shape).
     golden: reference array (native shape). Returns result dict."""
     compile_flags = list(compile_flags or [])
@@ -431,7 +445,8 @@ def verify_oneshot(name, brick_cc, shim_body, symbol, inputs, out_numel, out_sha
     )
     in_numels = [int(np.asarray(a).size) for a, _ in inputs]
     in_dts = [dt for _, dt in inputs]
-    design = _build_oneshot(symbol, shim, in_numels, out_numel, in_dts, out_dt, compile_flags)
+    design = _build_oneshot(symbol, shim, in_numels, out_numel, in_dts, out_dt, compile_flags,
+                            stack_size=stack_size)
 
     def run_once():
         in_ts = [iron.tensor(np.ascontiguousarray(np.asarray(a).reshape(-1)), dtype=dt,
@@ -460,7 +475,7 @@ def verify_oneshot(name, brick_cc, shim_body, symbol, inputs, out_numel, out_sha
 
 def verify_streamed(name, shim, symbol, in_tiles, out_tile_numel, resident,
                     unpack, golden, gate, in_dt, out_dt, resident_dt=None,
-                    compile_flags=None, resident_depth=2):
+                    compile_flags=None, resident_depth=2, stack_size=None):
     """Gate a brick whose operands are too big to stage whole into L1.
 
     `verify_oneshot` moves every operand into L1 in one piece, so it can only gate shapes
@@ -481,7 +496,8 @@ def verify_streamed(name, shim, symbol, in_tiles, out_tile_numel, resident,
     n_tiles, in_tile = in_tiles.shape
     resident_len = 0 if resident is None else int(np.asarray(resident).size)
     design = _build_streamed(symbol, shim, n_tiles, in_tile, out_tile_numel, resident_len,
-                             compile_flags, in_dt, out_dt, resident_dt, resident_depth)
+                             compile_flags, in_dt, out_dt, resident_dt, resident_depth,
+                             stack_size=stack_size)
 
     def run_once():
         in_t = iron.tensor(np.ascontiguousarray(in_tiles.reshape(-1)), dtype=in_dt,
@@ -514,7 +530,8 @@ def verify_streamed(name, shim, symbol, in_tiles, out_tile_numel, resident,
 
 def verify_rowwise(name, brick_cc, shim_body, symbol, m, in_cols, out_cols,
                    x, expected, gate, const=None, compile_flags=None,
-                   in_dt=np.float32, out_dt=np.float32, const_dt=np.float32):
+                   in_dt=np.float32, out_dt=np.float32, const_dt=np.float32,
+                   stack_size=None):
     """Generate shim, build+run the design twice on device, gate rel-L2.
 
     x: (m, in_cols) input.  const: 1-D packed const or None.  expected: (m, out_cols).
@@ -528,7 +545,8 @@ def verify_rowwise(name, brick_cc, shim_body, symbol, m, in_cols, out_cols,
     )
     const_len = 0 if const is None else int(np.asarray(const).size)
     design = _build_rowwise(symbol, shim, m, in_cols, out_cols, const_len,
-                            compile_flags, in_dt, out_dt, const_dt)
+                            compile_flags, in_dt, out_dt, const_dt,
+                            stack_size=stack_size)
 
     def run_once():
         x_t = iron.tensor(np.ascontiguousarray(x.reshape(-1)), dtype=in_dt, device="npu")
