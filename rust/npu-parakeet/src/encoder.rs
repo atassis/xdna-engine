@@ -6,6 +6,7 @@ use std::path::Path;
 use ndarray::prelude::*;
 
 use crate::config::ModelCfg;
+use crate::errors::LoadError;
 use crate::ops::{conv2d, dwconv1d, layernorm, rel_shift, sigmoid, silu_inplace};
 use crate::prof;
 use crate::prof::phase::{Bucket, PhaseScope};
@@ -41,10 +42,16 @@ fn dump_convin(tag: &str, blk: usize, x: &Array2<f32>) {
 }
 
 impl FastConformerEncoder {
-    pub fn new(artifacts: &Path, cfg: ModelCfg) -> Result<Self, String> {
+    pub fn new(artifacts: &Path, cfg: ModelCfg) -> Result<Self, LoadError> {
         let w = ParakeetWeights::load(artifacts)
-            .map_err(|e| format!("load parakeet weights from {}: {e}", artifacts.display()))?;
-        assert_eq!(w.nblocks(), cfg.n_layers, "block count mismatch");
+            .map_err(|source| LoadError::Weights { path: artifacts.to_path_buf(), source })?;
+        if w.nblocks() != cfg.n_layers {
+            return Err(LoadError::BlockCountMismatch {
+                path: artifacts.to_path_buf(),
+                found: w.nblocks(),
+                expected: cfg.n_layers,
+            });
+        }
         Ok(FastConformerEncoder {
             cfg,
             w,
@@ -56,7 +63,7 @@ impl FastConformerEncoder {
     /// Construct with the NPU matmul path enabled. `root` = repo root holding the mlir-aie build
     /// dir with the Parakeet xclbins. Single-tenant NPU only.
     #[cfg(feature = "npu")]
-    pub fn new_npu(artifacts: &Path, cfg: ModelCfg, root: &Path) -> Result<Self, String> {
+    pub fn new_npu(artifacts: &Path, cfg: ModelCfg, root: &Path) -> Result<Self, LoadError> {
         let mut e = Self::new(artifacts, cfg)?;
         e.npu = Some(crate::npu::NpuMatmul::open(root)?);
         Ok(e)
@@ -1089,5 +1096,71 @@ impl FastConformerEncoder {
         let x = prof::time("subsample", || self.subsample(mel));
         let t = x.nrows();
         self.forward_last(&x, t)
+    }
+}
+
+#[cfg(test)]
+mod load_error_tests {
+    use super::*;
+
+    // Before this pass both cases below returned the SAME thing: a missing artifacts directory
+    // was Err(String) from ParakeetWeights::load's io error reformatted, and a wrong-shaped
+    // artifacts directory was a panic (`assert_eq!`, not even a Result), and neither could be
+    // told apart from the other or from any other load failure without parsing prose. These
+    // tests are the "fails before, passes after" evidence: on the pre-conversion code, the
+    // second case aborts the process (no Err to assert on) and the first case's error carries no
+    // structure to match on beyond "it's a String".
+
+    #[test]
+    fn missing_artifacts_dir_is_a_weights_error_naming_the_path() {
+        let missing = std::path::Path::new("/does/not/exist/parakeet-artifacts-xyz");
+        let err = match FastConformerEncoder::new(missing, ModelCfg::PARAKEET_V3) {
+            Err(e) => e,
+            Ok(_) => panic!("expected an error for a missing artifacts dir"),
+        };
+        match err {
+            LoadError::Weights { path, source } => {
+                assert_eq!(path, missing);
+                assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
+            }
+            other => panic!("expected LoadError::Weights, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn block_count_mismatch_is_a_typed_error_not_a_panic() {
+        // A real, readable artifacts dir with one block (L0/) and a pre_encode/ dir, requested
+        // against a cfg that wants two layers -- exactly "artifacts built for a different model
+        // variant", the case the old `assert_eq!` could only abort the process on.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("L0")).unwrap();
+        std::fs::create_dir_all(dir.path().join("pre_encode")).unwrap();
+        let cfg = ModelCfg { n_layers: 2, ..ModelCfg::PARAKEET_V3 };
+
+        let err = match FastConformerEncoder::new(dir.path(), cfg) {
+            Err(e) => e,
+            Ok(_) => panic!("expected an error for a block-count mismatch"),
+        };
+        match err {
+            LoadError::BlockCountMismatch { path, found, expected } => {
+                assert_eq!(path, dir.path());
+                assert_eq!(found, 1);
+                assert_eq!(expected, 2);
+            }
+            other => panic!("expected LoadError::BlockCountMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn matching_block_count_still_constructs() {
+        // Control: the same shape, sized correctly, must still succeed -- the conversion must not
+        // have turned a previously-passing load into a failure.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("L0")).unwrap();
+        std::fs::create_dir_all(dir.path().join("pre_encode")).unwrap();
+        let cfg = ModelCfg { n_layers: 1, ..ModelCfg::PARAKEET_V3 };
+
+        let enc = FastConformerEncoder::new(dir.path(), cfg);
+        assert!(enc.is_ok(), "expected Ok, got {:?}", enc.err());
     }
 }

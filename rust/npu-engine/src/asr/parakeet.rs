@@ -62,7 +62,7 @@ impl ParakeetAsr {
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| root.to_path_buf());
         let enc = FastConformerEncoder::new_npu(&pk.join("encoder"), ModelCfg::PARAKEET_V3, &xroot)
-            .map_err(EngineError::Load)?;
+            .map_err(|e| EngineError::Load(e.to_string()))?;
         let vocab = load_vocab(&pk.join("vocab.txt"))?;
         Ok(ParakeetAsr { prep, dj, enc, vocab, _env: env })
     }

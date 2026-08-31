@@ -19,6 +19,8 @@ use ndarray::prelude::*;
 use npu_asr::kernel_registry;
 use npu_xrt::{Bo, Device, Kernel, FLAG_CACHEABLE, FLAG_HOST_ONLY};
 
+use crate::errors::LoadError;
+
 const PAD_M: usize = 512;
 const KRES: usize = 1024; // resident kernel contraction dim
 const WA_SUBDIR: &str =
@@ -804,9 +806,8 @@ impl NpuMatmul {
         DispatchTimer { stats: &self.stats, t: Instant::now() }
     }
 
-    pub fn open(root: &Path) -> Result<Self, String> {
-        let dev = Device::open(0)
-            .map_err(|e| format!("open NPU (single-tenant: stop npu-asr/voxd): {e}"))?;
+    pub fn open(root: &Path) -> Result<Self, LoadError> {
+        let dev = Device::open(0).map_err(LoadError::Device)?;
         let base = root.join(WA_SUBDIR);
         let ln_dir = root.join("artifacts/parakeet/ln");
         // resident kernel tile: fast BFP16 64x32x128 (default) or native bf16 32x32x32 (NPU_NATIVE=1),
@@ -889,36 +890,36 @@ impl NpuMatmul {
         }
         let kern = dev
             .load_kernel(xclbin.to_str().unwrap(), None)
-            .map_err(|e| format!("load resident {}: {e}", xclbin.display()))?;
-        let g = |i| kern.group_id(i).map_err(|e| format!("group_id({i}): {e}"));
+            .map_err(|source| LoadError::Kernel { path: xclbin.clone(), source })?;
+        let g = |i| kern.group_id(i).map_err(|source| LoadError::GroupId { arg: i, source });
         let bo_a = dev
             .alloc_bo(&kern, PAD_M * KRES * 2, FLAG_HOST_ONLY, g(3)?)
-            .map_err(|e| format!("alloc bo_a: {e}"))?;
+            .map_err(|source| LoadError::Alloc { what: "bo_a", source })?;
         let bo_tmp = dev
             .alloc_bo(&kern, 1, FLAG_HOST_ONLY, g(6)?)
-            .map_err(|e| format!("alloc bo_tmp: {e}"))?;
+            .map_err(|source| LoadError::Alloc { what: "bo_tmp", source })?;
         let bo_tr = dev
             .alloc_bo(&kern, 4, FLAG_HOST_ONLY, g(7)?)
-            .map_err(|e| format!("alloc bo_tr: {e}"))?;
+            .map_err(|source| LoadError::Alloc { what: "bo_tr", source })?;
         // 2-slot ring for the K-split pipeline (ff.l2 output N=1024)
         let slots = (0..2)
             .map(|_| {
                 Ok(PipeSlot {
                     bo_a: dev
                         .alloc_bo(&kern, PAD_M * KRES * 2, FLAG_HOST_ONLY, g(3)?)
-                        .map_err(|e| format!("alloc slot bo_a: {e}"))?,
+                        .map_err(|source| LoadError::Alloc { what: "slot.bo_a", source })?,
                     bo_c: dev
                         .alloc_bo(&kern, PAD_M * 1024 * 4, FLAG_HOST_ONLY, g(5)?)
-                        .map_err(|e| format!("alloc slot bo_c: {e}"))?,
+                        .map_err(|source| LoadError::Alloc { what: "slot.bo_c", source })?,
                     bo_tmp: dev
                         .alloc_bo(&kern, 1, FLAG_HOST_ONLY, g(6)?)
-                        .map_err(|e| format!("alloc slot bo_tmp: {e}"))?,
+                        .map_err(|source| LoadError::Alloc { what: "slot.bo_tmp", source })?,
                     bo_tr: dev
                         .alloc_bo(&kern, 4, FLAG_HOST_ONLY, g(7)?)
-                        .map_err(|e| format!("alloc slot bo_tr: {e}"))?,
+                        .map_err(|source| LoadError::Alloc { what: "slot.bo_tr", source })?,
                 })
             })
-            .collect::<Result<Vec<_>, String>>()?;
+            .collect::<Result<Vec<_>, LoadError>>()?;
         Ok(NpuMatmul {
             dev,
             base,
