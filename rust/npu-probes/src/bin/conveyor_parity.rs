@@ -107,7 +107,7 @@ fn main() {
 
     // --- device via the real encoder code path ---
     let root = std::env::var("NPU_XCLBIN_ROOT").unwrap_or_else(|_| ".".into());
-    let npu = NpuMatmul::open(Path::new(&root));
+    let npu = NpuMatmul::open(Path::new(&root)).expect("open NpuMatmul");
     let ctx_dev = npu.relpos_mha_conveyor(&q, &k, &v, &pm, &ubias, &vbias, H);
     assert_eq!(ctx_dev.dim(), (t, D), "conveyor returned unexpected ctx shape");
 

@@ -31,3 +31,6 @@ npu-onnx = { path = "../npu-onnx", optional = true }
 npu-asr = { path = "../npu-asr", optional = true }
 rayon = "1"
 
+[dev-dependencies]
+tempfile = "3"
+

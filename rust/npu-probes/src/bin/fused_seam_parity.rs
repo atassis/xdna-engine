@@ -49,7 +49,7 @@ fn main() {
     let seed: u64 = arg_val("--seed", "1").parse().unwrap();
 
     let root = std::env::var("NPU_XCLBIN_ROOT").unwrap_or_else(|_| ".".into());
-    let npu = NpuMatmul::open(Path::new(&root));
+    let npu = NpuMatmul::open(Path::new(&root)).expect("open NpuMatmul");
 
     match seam.as_str() {
         "ffn" => {

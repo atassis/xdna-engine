@@ -15,6 +15,7 @@
 pub mod config;
 pub mod decoder;
 pub mod encoder;
+pub mod errors;
 pub mod ffn_rail;
 #[cfg(feature = "npu")]
 pub mod npu;
@@ -26,4 +27,5 @@ pub mod weights;
 pub use config::ModelCfg;
 pub use decoder::TdtDecoder;
 pub use encoder::FastConformerEncoder;
+pub use errors::LoadError;
 pub use weights::ParakeetWeights;

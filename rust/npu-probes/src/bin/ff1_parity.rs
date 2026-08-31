@@ -67,7 +67,7 @@ fn main() {
 
     let artifacts = Path::new("artifacts/parakeet/encoder");
     let cfg = ModelCfg::PARAKEET_V3;
-    let enc = FastConformerEncoder::new(artifacts, cfg);
+    let enc = FastConformerEncoder::new(artifacts, cfg).expect("build FastConformerEncoder");
 
     let x = random_matrix(t, cfg.hidden, seed, 1.0);
 

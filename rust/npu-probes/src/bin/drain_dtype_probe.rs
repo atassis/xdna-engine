@@ -60,7 +60,7 @@ fn main() {
     let want = a.mapv(bf16).dot(&b.mapv(bf16));
     let bf16_floor = rel_l2(&want.mapv(bf16), &want);
 
-    let npu = NpuMatmul::open(Path::new(&root));
+    let npu = NpuMatmul::open(Path::new(&root)).expect("open NpuMatmul");
     let w = npu.c_elem_bytes();
 
     // Device-out, so the SAME buffer can be decoded twice.

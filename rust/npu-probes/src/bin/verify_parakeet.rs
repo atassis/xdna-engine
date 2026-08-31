@@ -49,15 +49,16 @@ fn main() {
             .unwrap_or_else(|_| "$REPO".into());
         println!("[npu] matmuls on NPU; xclbin root = {root}");
         FastConformerEncoder::new_npu(artifacts, ModelCfg::PARAKEET_V3, Path::new(&root))
+            .expect("build FastConformerEncoder (npu)")
     } else {
-        FastConformerEncoder::new(artifacts, ModelCfg::PARAKEET_V3)
+        FastConformerEncoder::new(artifacts, ModelCfg::PARAKEET_V3).expect("build FastConformerEncoder")
     };
     #[cfg(not(feature = "npu"))]
     let enc = {
         if npu_mode {
             eprintln!("built without --features npu; running host reference");
         }
-        FastConformerEncoder::new(artifacts, ModelCfg::PARAKEET_V3)
+        FastConformerEncoder::new(artifacts, ModelCfg::PARAKEET_V3).expect("build FastConformerEncoder")
     };
 
     let w = enc.weights();

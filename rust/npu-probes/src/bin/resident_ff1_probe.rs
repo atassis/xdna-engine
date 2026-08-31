@@ -86,7 +86,7 @@ fn main() {
     let g: Vec<f32> = gamma.to_vec();
     let b: Vec<f32> = beta.to_vec();
     let root = std::env::var("NPU_XCLBIN_ROOT").unwrap_or_else(|_| ".".into());
-    let npu = NpuMatmul::open(Path::new(&root));
+    let npu = NpuMatmul::open(Path::new(&root)).expect("open NpuMatmul");
     // resident: ctxLN -> affine_cast(gamma,beta) -> modal fc1 (on-chip SiLU, W1 unmodified)
     // silu=true: fc1 (n=DFF) takes the on-chip SiLU epilogue, matching the host oracle above.
     let dev = npu.resident_ff1_fc1(&x, &g, &b, || w1.clone(), &format!("{blk}.ff1.l1"), f, true);
