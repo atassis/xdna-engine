@@ -972,8 +972,33 @@ def my_matmul(
                         # `2a`/`2b` in the drained array row, and 124/128 call sites aliased in
                         # the lowered MLIR -- byte-identically at WA_AB_DEPTH 2 AND 3, so this is
                         # the acquire's semantics and not a depth shortfall. acquire(2) is the
-                        # idiom that yields two DISTINCT elements; it tops the peeled acquire up
-                        # to two rather than taking a third, and grows the fifo to three buffers.
+                        # idiom that yields two DISTINCT elements.
+                        #
+                        # REVERTED 2026-08-31 (mode-switched-multi-program-xclbin item (c)): a
+                        # same-day fix here tried `pair = [ea, in_a.acquire(1)]` at slot 0 to fold
+                        # in the peeled `ea` instead of leaving it unreferenced. That reintroduces
+                        # exactly the bug two paragraphs up: `ea` and a lone `in_a.acquire(1)` are
+                        # two SEPARATE ObjectFifoAcquireOps, each with its own subview.access at
+                        # index 0 (`LowerObjectFifoSubviewAccess`, AIEObjectFifoStatefulTransform
+                        # .cpp:478-503, resolves `buffers[(accessOp.getIndex() + counter) %
+                        # depth]`, and the counter only advances on release), so `pair[0]` and
+                        # `pair[1]` alias to the same physical buffer -- confirmed by reading the
+                        # lowering, not device-tested. Reverted to the plain `acquire(2)` every
+                        # slot, including 0, leaving `ea` unreferenced in this branch again.
+                        #
+                        # Whether that leaves a real defect is now DOUBTED, not just open. Traced
+                        # AIE2's semaphore-lock acquire lowering (same file, ~line 423: `delta =
+                        # max(0, acqNumber - held)` against a per-(fifo,port) runtime `held`
+                        # counter, shared across every acquire on this core regardless of Python
+                        # call site): `ea`'s acquire(1) raises `held` to 1 and touches no buffer
+                        # index (only release does); slot 0's `acquire(2)` then sees held=1 and
+                        # acquires only 1 NEW lock (`held` -> 2), and slot 0's `release(2)` drops
+                        # it back to 0 -- so `ea`'s hold is absorbed into slot 0's request rather
+                        # than leaked, at the lock level, by this trace. That casts real doubt on
+                        # the orphaned-peel explanation as the hang's root cause -- consistent
+                        # with that explanation's own weakening evidence
+                        # (RESADD2A_NOOP=1 has the identical skeleton and completes 18/18) -- but
+                        # is a source trace, not a device measurement either way.
                         for slot in range(0, n_aie_cols * r2a_per_core, 2):
                             pair = in_a.acquire(2)
                             if slot // r2a_per_core == r2a_col:

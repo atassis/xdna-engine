@@ -23,6 +23,28 @@ ABI (opcode 3): kernel(op, instr[gid1,cacheable], n, QUV[gid3], KPV[gid4], CTX[g
 QUV=[2*T*DK] bf16, KPV=[(2*T+P)*DK] bf16, CTX=[T*DK] bf16.
 Build MUST use the SAME T (and a TQ that the kernel was built with): the .cc bakes
 RELPOS_T / RELPOS_TQ, so make STEP=6 T=<N> TQ=<tq> before running with matching N.
+
+STATUS (round 19, relpos-uses-8-of-32-cores): --stream (STEP=8, relpos_rowtiled_stream) drives an
+xclbin built HEADS=8 (H parallel cores, ONE dispatch drives ALL 8 heads at once -- confirmed
+against the compiled .mlir's aie.runtime_sequence arg sizes and each head's per-head DMA offset
+stride). This script's ABI above describes the ORIGINAL, single-head STEP=6 design; --stream was
+added later without updating that assumption, so every --stream dispatch sent a buffer sized for
+ONE head against an ABI that expects 8 heads concatenated head-major -- a straight buffer-size
+mismatch (FIXED: --stream now builds+sends all H heads' QUV/KPV and de-concatenates the CTX
+readback per head). That fix alone is NOT sufficient to pass the gate yet: a SEPARATE, unresolved
+issue remains, present even on the untouched, genuinely single-core STEP=6 path (--stream is not
+required to reproduce it) -- per-row error is cleanly bimodal (~0.002, bf16-noise floor, or ~1.3-1.6,
+essentially uncorrelated), with the FIRST query tile (rows 0..TQ-1) consistently clean and later
+tiles scattered bad, which shape-matches the KPV block-REPLAY mechanism (BUILD-AND-BENCH.md 3f: one
+shim BD re-reads padded kpv from DDR n_qt times) rather than the multi-head fix above. NOT
+isolated to harness vs kernel this pass; the real pipeline (rust/npu-parakeet's RelposK, same xclbin
+family) gives correct transcripts on 2 real clips (round 18), which argues against a kernel defect
+but does not prove the standalone probe's remaining wrongness is harness-only. Next decisive test:
+localize which query tile / which host-side step introduces the divergence (compare the reference's
+rel_shift_host output tile-by-tile against a device dump, or bisect --stream against STEP=7's
+kpvstream design, which BUILD-AND-BENCH.md's 3f section names as the block-arithmetic isolator).
+Do not trust this script's --stream gate as fully green yet -- the buffer-size class of failure
+(NaN, non-deterministic) is gone, but the remaining failure is real and unresolved.
 """
 import argparse, os, sys, time
 import numpy as np
@@ -124,21 +146,6 @@ def main():
     ap.add_argument("--kb", type=int, default=43, help="key-block rows (must match -DRELPOS_KB)")
     a = ap.parse_args()
 
-    T, qu, qv, kh, ph, Vh, inv_scale = build_head(a.block, a.head, a.synth_T, a.real_tiled_T)
-    P = 2 * T - 1
-
-    # non-degenerate softmax: fold 1/std(scores) into qu/qv (shrinks AC and BD by
-    # the same factor); the oracle uses the identical effective scale. --raw skips it.
-    if a.raw:
-        qu_d, qv_d, sc = qu, qv, inv_scale
-    else:
-        ac = qu @ kh.T; bd = qv @ ph.T
-        bd_sh = rel_shift_host(bd[None])[0]
-        std = float(((ac + bd_sh) * inv_scale).std()) + 1e-6
-        qu_d, qv_d, sc = qu / std, qv / std, inv_scale
-
-    _, ctx_ref = host_probs_ctx(qu_d, qv_d, kh, ph, Vh, sc)  # [T,DK] f32 golden
-
     def bf(x): return np.ascontiguousarray(x, np.float32).astype(bfloat16).reshape(-1)
 
     def ceildiv(x, y): return (x + y - 1) // y
@@ -149,33 +156,86 @@ def main():
             x = np.concatenate([x, np.zeros((n - r, DK), np.float32)], 0)
         return x
 
+    def prep_head(head):
+        """Per-head data + non-degenerate-softmax prescale (--raw skips it) + the f32 golden
+        ctx for that head. Factored out so --stream can call it once per head (see BUG NOTE
+        below), while non-stream (STEP=6) keeps calling it exactly once for --head."""
+        T_, qu_, qv_, kh_, ph_, Vh_, inv_scale_ = build_head(a.block, head, a.synth_T, a.real_tiled_T)
+        if a.raw:
+            qu_d_, qv_d_, sc_ = qu_, qv_, inv_scale_
+        else:
+            ac_ = qu_ @ kh_.T; bd_ = qv_ @ ph_.T
+            bd_sh_ = rel_shift_host(bd_[None])[0]
+            std_ = float(((ac_ + bd_sh_) * inv_scale_).std()) + 1e-6
+            qu_d_, qv_d_, sc_ = qu_ / std_, qv_ / std_, inv_scale_
+        _, ctx_ref_ = host_probs_ctx(qu_d_, qv_d_, kh_, ph_, Vh_, sc_)  # [T,DK] f32 golden
+        return T_, qu_d_, qv_d_, kh_, ph_, Vh_, sc_, ctx_ref_
+
+    T, qu_d, qv_d, kh, ph, Vh, sc, ctx_ref = prep_head(a.head)
+    P = 2 * T - 1
+
     if a.stream:
         # STEP=8 MemTile-streamed packing (relpos_rowtiled_stream_iron.py):
         #   QUV tile-interleaved [qu_t0, qv_t0, qu_t1, qv_t1, ...], each tile TQ rows
         #     (ragged final tile zero-padded to TQ); CTX read back n_qt*TQ rows -> [:T].
         #   KPV = k(pad Tp) | p(pad Pp) | V(pad Tp), Tp=n_kb*KB, Pp=n_pb*KB.
+        #
+        # BUG FOUND round 19: the xclbin this drives is built HEADS=8 (H parallel cores, ONE
+        # dispatch drives ALL 8 heads at once -- see rust/npu-parakeet/src/npu.rs's own comment
+        # "The BOs concatenate all H heads; each head's Worker reads/writes its own slice via a
+        # per-head shim OFFSET tap"). Confirmed against the compiled .mlir's own
+        # `aie.runtime_sequence(%arg0: memref<327680xbf16>, %arg1: memref<655360xbf16>,
+        # %arg2: memref<163840xbf16>)` and each head's `aiex.dma_configure_task_for @kpv{i}`
+        # offset (0, 81920, 163840, ... -- uniform stride, head-major): every one of those sizes
+        # is EXACTLY 8x a single head's QUV/KPV/CTX (327680/8=40960 QUV elems/head,
+        # 655360/8=81920 KPV elems/head, 163840/8=20480 CTX elems/head, all matching this
+        # function's own per-head math below). The ORIGINAL code here built and dispatched
+        # ONE head's worth of data against that 8-head ABI -- a straight buffer-size mismatch
+        # (the STEP=6 assumption baked into main(): one head per dispatch, --head selects which).
+        # STEP=6's own xclbin genuinely IS single-head (Makefile's GEN_EXTRA only adds --heads
+        # under STEP=8), so the non-stream path below this block is correct as originally
+        # written and is NOT touched by this fix.
         TQ, KB = a.tq, a.kb
         n_qt = ceildiv(T, TQ); n_kb = ceildiv(T, KB); n_pb = ceildiv(P, KB)
         Tp, Pp = n_kb * KB, n_pb * KB
-        quv_tiles = []
-        for q in range(n_qt):
-            q0 = q * TQ
-            quv_tiles.append(pad_rows(qu_d[q0:q0 + TQ], TQ))
-            quv_tiles.append(pad_rows(qv_d[q0:q0 + TQ], TQ))
-        QUV = bf(np.concatenate(quv_tiles, 0))                # [2*n_qt*TQ, DK]
-        KPV = np.concatenate([bf(pad_rows(kh, Tp)),
-                              bf(pad_rows(ph, Pp)),
-                              bf(pad_rows(Vh, Tp))])           # [Tp+Pp+Tp, DK]
         ctx_rows = n_qt * TQ
 
-        # SELF-CHECK: de-pack the EXACT bytes about to be sent to the QUV/KPV BOs,
-        # per the kernel's expected layout, and assert they reconstruct qu_d/qv_d/
-        # kh/ph/Vh byte-for-byte. This verifies device-input packing vs the data the
-        # reference is computed on (the reference uses the same qu_d/qv_d/kh/ph/Vh).
-        # Runs on the ACTUAL synth data (real sig/RNG); a mismatch is THE bug.
+        def pack_one_head(qu_h, qv_h, kh_h, ph_h, Vh_h):
+            quv_tiles = []
+            for q in range(n_qt):
+                q0 = q * TQ
+                quv_tiles.append(pad_rows(qu_h[q0:q0 + TQ], TQ))
+                quv_tiles.append(pad_rows(qv_h[q0:q0 + TQ], TQ))
+            quv_h = bf(np.concatenate(quv_tiles, 0))            # [2*n_qt*TQ, DK], one head
+            kpv_h = np.concatenate([bf(pad_rows(kh_h, Tp)),
+                                    bf(pad_rows(ph_h, Pp)),
+                                    bf(pad_rows(Vh_h, Tp))])    # [Tp+Pp+Tp, DK], one head
+            return quv_h, kpv_h
+
+        quv_h0, kpv_h0 = pack_one_head(qu_d, qv_d, kh, ph, Vh)
+        quv_parts, kpv_parts, ctx_ref_parts = [quv_h0], [kpv_h0], [ctx_ref]
+        for h in range(H):
+            if h == a.head:
+                continue
+            _, qu_h, qv_h, kh_h, ph_h, Vh_h, _, ctx_ref_h = prep_head(h)
+            quv_h, kpv_h = pack_one_head(qu_h, qv_h, kh_h, ph_h, Vh_h)
+            quv_parts.append(quv_h); kpv_parts.append(kpv_h); ctx_ref_parts.append(ctx_ref_h)
+        # head-major order 0..H-1, matching the .mlir's uniform per-head offset stride
+        # (a.head's chunk was computed first above, so re-sort back to head-id order).
+        head_ids = [a.head] + [h for h in range(H) if h != a.head]
+        reorder = np.argsort(head_ids)
+        QUV = np.concatenate([quv_parts[i] for i in reorder])
+        KPV = np.concatenate([kpv_parts[i] for i in reorder])
+        ctx_ref = np.concatenate([ctx_ref_parts[i] for i in reorder], axis=0)  # [H*T, DK]
+        ctx_rows_per_head = ctx_rows  # n_qt*TQ, may exceed T (padded tail, cropped below)
+        ctx_rows = H * ctx_rows_per_head
+
+        # SELF-CHECK (a.head's own slice only, matching the original check's scope): de-pack
+        # the EXACT bytes about to be sent for a.head and assert they reconstruct qu_d/qv_d/
+        # kh/ph/Vh byte-for-byte.
         def _bf_rows(x): return np.frombuffer(bf(x).tobytes(), np.uint16).view(bfloat16).reshape(-1, DK).astype(np.float32)
-        QUVr = np.frombuffer(QUV.view(np.uint16).tobytes(), np.uint16).view(bfloat16).reshape(2 * n_qt, TQ, DK).astype(np.float32)
-        KPVr = np.frombuffer(KPV.view(np.uint16).tobytes(), np.uint16).view(bfloat16).reshape(-1, DK).astype(np.float32)
+        QUVr = np.frombuffer(quv_h0.view(np.uint16).tobytes(), np.uint16).view(bfloat16).reshape(2 * n_qt, TQ, DK).astype(np.float32)
+        KPVr = np.frombuffer(kpv_h0.view(np.uint16).tobytes(), np.uint16).view(bfloat16).reshape(-1, DK).astype(np.float32)
         qu_dp = np.zeros((T, DK), np.float32); qv_dp = np.zeros((T, DK), np.float32)
         for q in range(n_qt):
             q0 = q * TQ; tq = min(TQ, T - q0)
@@ -229,7 +289,28 @@ def main():
     dt = (time.perf_counter() - t0) / iters
 
     bo_cx.sync(FROM)
-    CX = np.frombuffer(bo_cx.read(Cbytes, 0), dtype=np.uint16).view(bfloat16).reshape(-1, DK).astype(np.float32)[:T]
+    CXraw = np.frombuffer(bo_cx.read(Cbytes, 0), dtype=np.uint16).view(bfloat16).reshape(-1, DK).astype(np.float32)
+    if a.stream:
+        # [H*n_qt*TQ, DK] -> per-head [n_qt*TQ, DK], crop each head's padded tail to T, re-stack
+        # head-major to match ctx_ref's [H*T, DK] layout.
+        CX = CXraw.reshape(H, ctx_rows_per_head, DK)[:, :T, :].reshape(H * T, DK)
+    else:
+        CX = CXraw[:T]
+    print(f"[diag] CX stats: min={CX.min():.3g} max={CX.max():.3g} "
+          f"finite={np.isfinite(CX).sum()}/{CX.size}  shape={CX.shape}")
+    print(f"[diag] ref stats: min={ctx_ref.min():.3g} max={ctx_ref.max():.3g}  shape={ctx_ref.shape}")
+    d_abs = np.abs(CX - ctx_ref)
+    worst = np.unravel_index(np.argmax(d_abs), d_abs.shape)
+    print(f"[diag] worst abs err at {worst}: dev={CX[worst]:.4g} ref={ctx_ref[worst]:.4g} "
+          f"|d|={d_abs[worst]:.4g}")
+    row_rel = np.linalg.norm(d_abs, axis=1) / (np.linalg.norm(np.abs(ctx_ref), axis=1) + 1e-9)
+    print(f"[diag] per-row rel err (non-stream shape [T,DK]): {np.round(row_rel, 3).tolist()}")
+    if a.stream:
+        CXh = CX.reshape(H, T, DK); RFh = ctx_ref.reshape(H, T, DK)
+        for h in range(H):
+            d = CXh[h] - RFh[h]
+            rl2 = float(np.linalg.norm(d) / (np.linalg.norm(RFh[h]) + 1e-12))
+            print(f"[diag] head {h}: rel-L2={rl2:.4e}  dev[0,:3]={CXh[h,0,:3]}  ref[0,:3]={RFh[h,0,:3]}")
     af, rf = CX.ravel(), ctx_ref.ravel()
     rel_l2 = float(np.linalg.norm(af - rf) / (np.linalg.norm(rf) + 1e-12))
     corr = float(np.corrcoef(af, rf)[0, 1])

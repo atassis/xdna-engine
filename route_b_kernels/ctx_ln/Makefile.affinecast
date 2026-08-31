@@ -16,21 +16,39 @@ partflag = $(if ${partcols},-p ${partcols},)
 partsuf  = $(if ${partcols},_p${partcols}c,)
 rows ?= 512
 cols ?= 1024
-tag = affcast_${rows}x${cols}${partsuf}
+# dtype=bf16 narrows the `x` (in) operand -- mixed-precision-budget-sweep candidate #2, the
+# ctxLN->affcast inter-op [PAD_M,KRES] stream (2 MB f32 today). dtype=gb_bf16 narrows gamma|beta
+# instead, a PER-OP PARAMETER (same rounded value reused every row -- a different numerics risk
+# than the streamed x, gated separately). out (already bf16) is unchanged by either. The
+# generator's --dtype and the kernel's -D flag MUST move together, same ABI discipline as
+# Makefile.resadd's dtype knob; the object name carries it too so an f32 build never links a
+# narrow .o.
+dtype ?= f32
+ifeq ($(dtype),bf16)
+AFFCAST_DEFINES = -DAFFCAST_X_BF16
+dtsuf = _bf16
+else ifeq ($(dtype),gb_bf16)
+AFFCAST_DEFINES = -DAFFCAST_GB_BF16
+dtsuf = _gb_bf16
+else
+AFFCAST_DEFINES =
+dtsuf =
+endif
+tag = affcast_${rows}x${cols}${partsuf}${dtsuf}
 
 aie_py_src = affine_cast_iron.py
 
 all: build/final_${tag}.xclbin
 
-build/affine_cast.o: affine_cast.cc
+build/affine_cast${dtsuf}.o: affine_cast.cc
 	mkdir -p ${@D}
-	cd ${@D} && ${PEANO_INSTALL_DIR}/bin/clang++ ${PEANOWRAP2P_FLAGS} -c $< -o ${@F}
+	cd ${@D} && ${PEANO_INSTALL_DIR}/bin/clang++ ${PEANOWRAP2P_FLAGS} ${AFFCAST_DEFINES} -c $< -o ${@F}
 
 build/aie_${tag}.mlir: ${srcdir}/${aie_py_src}
 	mkdir -p ${@D}
-	python3 $< -d ${devicename} -r ${rows} -c ${cols} -t 0 ${partflag} > $@
+	python3 $< -d ${devicename} -r ${rows} -c ${cols} -t 0 ${partflag} --dtype ${dtype} > $@
 
-build/final_${tag}.xclbin: build/aie_${tag}.mlir build/affine_cast.o
+build/final_${tag}.xclbin: build/aie_${tag}.mlir build/affine_cast${dtsuf}.o
 	mkdir -p ${@D}
 	cd ${@D} && aiecc --get-xclbin --get-npu-insts \
 		--peano ${PEANO_INSTALL_DIR} \

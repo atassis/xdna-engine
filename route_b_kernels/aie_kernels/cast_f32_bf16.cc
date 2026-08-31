@@ -1,35 +1,32 @@
-//===- cast_f32_bf16.cc ---------------------------------------*- C++ -*-===//
+//===- cast_f32_bf16.cc -----------------------------------*- C++ -*-===//
 //
-// Device-side f32 -> bf16 elementwise cast (resident-rails seam primitive).
-//
-// The resident-stream frontier hands activations device-to-device between xclbin
-// dispatches. Producers that emit f32 (e.g. the ctxLN ln_2pass kernel, "never
-// re-expand") must be cast to bf16 before the whole_array matmul (bf16 in) can
-// consume them WITHOUT a host round-trip. This is that cast, on-chip: one row of
-// `cols` f32 in -> `cols` bf16 out, matching the host npu_xrt::pack_f32_to_bf16
-// (round-to-nearest-even, the aie to_vector<bfloat16> default).
-//
-// One call casts ONE row of `cols` elements (the ml/layernorm per-row core_body
-// contract, reused verbatim). cols must be a multiple of N (16).
-//
+// Copyright (C) 2026 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 #include <aie_api/aie.hpp>
+#include <cassert>
 #include <stdint.h>
 
+// Element-wise f32 -> bf16 narrowing cast over one row of `cols` elements.
+//
+// `aie::vector<float, N>` has no `to_vector<bfloat16>`
+// directly, so the narrow goes through an `accfloat` accumulator, which does.
+//
+// The default AIE rounding is truncation toward zero; `conv_even` instead
+// matches a host f32 -> bf16 pack (e.g. `_mm512_cvtne2ps_pbh` on AVX512-BF16),
+// so an on-chip cast and its host equivalent agree bit-for-bit. The mode is
+// one sticky register shared by every kernel on this core, so it is handed
+// back before returning.
 template <int N>
 void cast_f32_bf16_row(const float *restrict input, bfloat16 *restrict output,
                        int32_t cols) {
+  assert(cols % N == 0);
   event0();
-  // Round-to-nearest-even to match the host AVX512 pack (default accum narrow truncates).
-  // crRnd is a single sticky register shared by every kernel that runs on this core, so the mode
-  // has to be handed back: leaving it set makes the NEXT kernel's narrowing depend on whether this
-  // one happened to run first, which is invisible in every artifact we diff.
-  const auto saved_rounding =
+  ::aie::rounding_mode saved_rounding =
       ::aie::swap_rounding(::aie::rounding_mode::conv_even);
   for (int i = 0; i < cols; i += N) {
-    // f32 -> bf16 narrow via an accumulator (the aie_api idiom, see
-    // mm_silu_epilogue.cc / norm_gemv_prologue.cc): vector<float> has no
-    // to_vector<bfloat16>; accum<accfloat> does.
     ::aie::vector<float, N> v = ::aie::load_v<N>(input + i);
     ::aie::accum<accfloat, N> a;
     a.from_vector(v);

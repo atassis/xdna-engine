@@ -1,0 +1,22 @@
+[scenario]
+kind = "asr"
+name = "whisper-turbo"
+
+[model]
+hidden = 1280
+ff = 5120
+n_heads = 20
+head_dim = 64
+n_layers = 32
+max_seq = 1500
+precision = "bf16"
+kernel = "zeropad"
+
+[artifacts]
+weights = "artifacts/whisper-turbo"
+
+# NOT registered in engine.toml. The encoder weights
+# + golden activations here are baked and host-path-gated (rel-L2 vs the real HF checkpoint), but
+# there is no NPU-resident encoder kernel at this shape yet (K=1280/K=5120 whole-array GEMM,
+# needs a new aiecc build, not a config change). Registering this scenario in engine.toml before
+# that exists would let `npu serve`/`npu bake` try to run a model with no working NPU path.
