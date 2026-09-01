@@ -98,6 +98,7 @@ import window_driver as wd
 # export_codec_artifacts.py's own module docstring. NPU2() is a static device descriptor consumed
 # by MLIR generation; this line never opens /dev/accel0.
 iron.set_current_device(NPU2())
+_EVENTS = ["dense"]   # set from --events in main(); read at build time by the traced builder
 
 # See the module docstring's EVENT SET section: verbatim DENOM_CHECK_CORETILE_EVENTS from
 # residual_add_iron.py.
@@ -110,6 +111,19 @@ CORETILE_EVENTS = [
     CoreEvent.STREAM_STALL,
     CoreEvent.INSTR_LOAD,
     CoreEvent.INSTR_STORE,
+]
+# SPARSE set: the same monitors MINUS the per-instruction classes. INSTR_VECTOR alone fired
+# n=107970 over two tile iterations (~54k events/tile), which is what filled a 262144-byte buffer
+# after 2 of 384 iterations. Dropping the three INSTR_* volume events costs the "% of span issuing
+# vectors" figure (already measured at 25.6% on the dense run) and buys the whole stream: every
+# tile bracketed by event0/event1 plus its stalls, which is what shows whether the per-tile cost is
+# UNIFORM. The dense run cannot answer that -- at n=2 its lead/trail split is meaningless.
+CORETILE_EVENTS_SPARSE = [
+    CoreEvent.INSTR_EVENT_0,
+    CoreEvent.INSTR_EVENT_1,
+    CoreEvent.LOCK_STALL,
+    CoreEvent.MEMORY_STALL,
+    CoreEvent.STREAM_STALL,
 ]
 # STREAM_STALL is this script's proxy for "core stalled waiting on the fifo" -- see gotcha 4.
 STALL_EVENTS = ("LOCK_STALL", "MEMORY_STALL", "STREAM_STALL")
@@ -128,7 +142,7 @@ def _install_traced_builder(trace_config, egress_shim_col):
         return bricklib._build_streamed_traced(
             symbol, shim, n_tiles, in_tile, out_tile, resident_len, compile_flags,
             in_dt, out_dt, resident_dt, trace_config, resident_depth=resident_depth,
-            stack_size=stack_size, coretile_events=CORETILE_EVENTS,
+            stack_size=stack_size, coretile_events=(CORETILE_EVENTS_SPARSE if _EVENTS[0] == 'sparse' else CORETILE_EVENTS),
             egress_shim_col=egress_shim_col)
 
     bricklib._build_streamed = _build_traced
@@ -384,5 +398,10 @@ if __name__ == "__main__":
     p.add_argument("--expected-wall-ms", type=float, default=65.6,
                    help="reference wall time for the sanity check, informational only unless "
                         "--tile-floats/--c-out are left at their defaults")
+    p.add_argument("--events", choices=["dense", "sparse"], default="dense",
+                   help="dense: includes the per-instruction classes, which fill the buffer in "
+                        "~2 tile iterations. sparse: bracketing + stalls only, so every tile fits.")
     p.add_argument("--seed", type=int, default=21)
-    main(p.parse_args())
+    _a = p.parse_args()
+    _EVENTS[0] = _a.events
+    main(_a)
