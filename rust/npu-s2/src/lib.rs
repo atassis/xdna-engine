@@ -551,20 +551,25 @@ mod tests {
     /// present so the suite stays runnable on a clean checkout.
     #[test]
     fn meta_parses_a_real_exported_artifact() {
-        let dir = Path::new("$S2_ARTIFACT_DIR");
+        // $S2_ARTIFACT_DIR points at one exported design directory. Env-driven rather than a
+        // hardcoded path: an absolute home directory does not belong in the public tree, and this
+        // way the test runs against whatever export the caller actually has.
+        let Ok(dir) = std::env::var("S2_ARTIFACT_DIR") else {
+            eprintln!("skip: set S2_ARTIFACT_DIR to an exported design directory");
+            return;
+        };
+        let dir = Path::new(&dir);
         if !dir.join(META_FILE).is_file() {
-            eprintln!("skip: no exported artifact at {}", dir.display());
+            eprintln!("skip: no meta.json at {}", dir.display());
             return;
         }
         let meta: S2Meta = read_json(&dir.join(META_FILE)).unwrap();
-        assert_eq!(meta.symbol, "wd_conv_head_k128");
-        assert_eq!(meta.op, "head_conv");
-        assert_eq!(meta.n_tiles, 1536);
-        assert_eq!(meta.in_tile, 897);
-        assert_eq!(meta.out_numel, 64);
-        assert_eq!(meta.resident_len, 8192);
+        // Shape-agnostic: assert the INVARIANTS that must hold for any exported design, not one
+        // design's literals, so this works against whatever S2_ARTIFACT_DIR points at.
+        assert!(!meta.symbol.is_empty() && !meta.op.is_empty());
+        assert!(meta.n_tiles > 0 && meta.in_tile > 0 && meta.out_numel > 0);
         assert_eq!(meta.dtypes.in_, "float32");
-        assert_eq!(meta.dtypes.resident.as_deref(), Some("float32"));
+        assert_eq!(meta.dtypes.out, "float32");
         let bb = meta.buffer_bytes.as_ref().unwrap();
         assert_eq!(bb.in_, meta.n_tiles * meta.in_tile * F32_BYTES);
         assert_eq!(bb.out, meta.n_tiles * meta.out_numel * F32_BYTES);
