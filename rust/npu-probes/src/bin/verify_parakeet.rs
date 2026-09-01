@@ -63,6 +63,10 @@ fn main() {
     let w = enc.weights();
 
     let mut fails: Vec<String> = Vec::new();
+    // `!(x <= tol)` and not `x > tol`: NaN compares FALSE against both, so `>` let a non-finite
+    // gate skip `fails` entirely and the run printed "ALL GATES PASS" under two printed FAILs.
+    // A device path returning NaN is the loudest failure there is; it must not be the quietest.
+    let over = |x: f32, tol: f32| !(x <= tol);
 
     // ---- gate 2: subsample (audio_signal [1,128,T] -> block_in [1,T',D]) ----
     let audio = squeeze0(w.ref_tensor("audio_signal")); // [128, T]
@@ -70,7 +74,7 @@ fn main() {
     let sub = enc.subsample(&audio);
     let r2 = rel(&sub, &block_in);
     println!("[gate2] subsample vs block_in:   rel={r2:.2e}  {}", if r2 <= tol { "OK" } else { "FAIL" });
-    if r2 > tol {
+    if over(r2, tol) {
         fails.push("subsample".into());
     }
 
@@ -78,15 +82,15 @@ fn main() {
     let outs = enc.forward_collect(&block_in);
     let r3 = rel(&outs[0], &squeeze0(w.ref_tensor("out_L0")));
     println!("[gate3] block-0 vs out_L0:        rel={r3:.2e}  {}  <- rel-pos gate", if r3 <= tol { "OK" } else { "FAIL" });
-    if r3 > tol {
+    if over(r3, tol) {
         fails.push("block0".into());
     }
 
     let mut worst = 0f32;
     for (b, out) in outs.iter().enumerate() {
         let rb = rel(out, &squeeze0(w.ref_tensor(&format!("out_L{b}"))));
-        worst = worst.max(rb);
-        if rb > tol_full {
+        worst = if rb.is_nan() { f32::NAN } else { worst.max(rb) };
+        if over(rb, tol_full) {
             println!("  [block {b}] rel={rb:.2e} FAIL");
             fails.push(format!("block{b}"));
         }
@@ -97,7 +101,7 @@ fn main() {
     let g4 = worst <= tol_full && r_enc <= tol_full;
     println!("[gate4] full {}-block: worst per-block rel={worst:.2e}; final vs encoded rel={r_enc:.2e}  {}",
              enc.cfg.n_layers, if g4 { "OK" } else { "FAIL" });
-    if r_enc > tol_full {
+    if over(r_enc, tol_full) {
         fails.push("encoded".into());
     }
 
