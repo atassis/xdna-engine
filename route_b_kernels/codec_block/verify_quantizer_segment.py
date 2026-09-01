@@ -9,8 +9,8 @@ DEVICE output, the real deployment path -- not fed a fresh slice of the true str
 verify_stage123.py's "iso" gates do), against a HOST TRUTH computed by calling
 scripts/codec_quantizer_ref.py's own functions directly, in the same sequence quantizer_driver.decode()
 uses, so the golden here is exactly the oracle-matching reference, never a reimplementation of it.
-Three checks per stage, matching this codebase's own gate discipline (docs/kb/error-metrics-are-notes-
-not-gates: rel-L2 is a note, 1:1 DETERMINISM is what actually gates):
+Three checks per stage, matching this codebase's own gate discipline -- rel-L2 is a NOTE, and 1:1
+determinism against the reference is what actually gates:
   - rel-L2 <= GATE (reported, not blocking on its own)
   - run2run: the STAGE's own device function called TWICE on the same input must agree exactly --
     the CLFLUSH-race guard bricklib already runs per DISPATCH, re-run here per STAGE so a

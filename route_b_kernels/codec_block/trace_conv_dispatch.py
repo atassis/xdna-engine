@@ -69,7 +69,7 @@ figure), so --clock-ghz defaults to 1.8 and every cycle->ms conversion below nam
 
 Usage (main session, device held under the NPU lock -- see bricks/_verify/run.sh for the env this
 needs: instance PYTHONPATH, AIECC_PATH, PEANO_INSTALL_DIR):
-  python3 trace_conv_dispatch.py --tile-floats 897 --c-out 384 --out $TRACE_OUT_DIR
+  python3 trace_conv_dispatch.py --tile-floats 897 --c-out 384 --out <dir>
 """
 import argparse
 import json
@@ -385,7 +385,7 @@ if __name__ == "__main__":
     p.add_argument("--c-out", type=int, default=384, help="n_tiles (objectFIFO tile count)")
     p.add_argument("--k", type=int, default=7, help="conv kernel width (must divide tile-floats-1)")
     p.add_argument("--dilation", type=int, default=1)
-    p.add_argument("--out", default="$TRACE_OUT_DIR",
+    p.add_argument("--out", default=os.environ.get("TRACE_OUT_DIR", "trace-out"),
                    help="output dir for trace.txt/.json/summary.json")
     p.add_argument("--trace-size", type=int, default=262144, help="host trace buffer, bytes")
     p.add_argument("--egress-shim-col", type=int, default=1,

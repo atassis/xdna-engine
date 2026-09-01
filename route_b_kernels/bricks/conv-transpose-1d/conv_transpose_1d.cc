@@ -103,8 +103,8 @@ inline void conv_transpose_1d_core(const float *restrict x, const float *restric
 //
 // c_in/k/t/stride stay RUNTIME int32_t parameters, matching conv_transpose_channel_core's own
 // signature. That is syntactically the shape flagged as a miscompile hazard
-// (docs/kb/kernel-internal-loops-miscompile-put-volume-in-the-worker.md: a genuinely runtime trip
-// count driving a VECTOR loop can silently corrupt output) -- but every call site this brick is
+// -- a genuinely runtime trip count driving a VECTOR loop is a known miscompile hazard on this
+// target and can silently corrupt output -- but every call site this brick is
 // gated from (verify_conv_transpose_1d.py's generated shims, mirroring conv_1d_causal_core_vec's
 // own gate) substitutes them as C++ literal constants, and this function is `static inline` in the
 // same translation unit as its caller, so -O2 constant-folds the loop trip counts during inlining.

@@ -10,7 +10,7 @@ DMA wait, or lock stall. If it is already DMA-bound, spreading to 32 cores buys 
 bricklib hardcodes iron.jit(design, use_cache=...), so trace_config is injected by wrapping
 iron.jit for the duration of the build. Everything else is the ordinary driver path.
 """
-import sys, time
+import os, sys, time
 from pathlib import Path
 import numpy as np
 
@@ -21,7 +21,7 @@ import bricklib
 import aie.iron as iron
 from aie.utils.trace.config import TraceConfig
 
-TRACE_OUT = Path("$TRACE_OUT_DIR/trace_conv.bin")
+TRACE_OUT = Path(os.environ.get("TRACE_OUT_DIR", "trace-out")) / "trace_conv.bin"
 TRACE_OUT.parent.mkdir(parents=True, exist_ok=True)
 tc = TraceConfig(trace_size=262144, trace_file=str(TRACE_OUT))
 
