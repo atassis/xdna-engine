@@ -100,4 +100,21 @@ PEANO_LOCAL_HOME="$T3" bash "$SCRIPT" --gc --keep 0 >/dev/null 2>&1
 [ -d "$T3/unreadable" ] && ok "unidentifiable install survives GC" || no "GC deleted an install it could not verify"
 rm -rf "$T3"
 
+echo "== an explicit root protects an install without any prose =="
+T4="$(mktemp -d)"; PEANO_LOCAL_HOME="$T4"
+for n in r-old r-new; do
+  mkdir -p "$T4/$n/bin"
+  sha=$(printf '%s' "$n" | md5sum | cut -c1-8)
+  printf '#!/bin/sh\necho "clang version 21.0.0git (git@github.com:atassis/llvm-aie.git %s0000000000000000000000000000000000)"\n' "$sha" > "$T4/$n/bin/clang++"
+  chmod +x "$T4/$n/bin/clang++"
+done
+touch -d "2026-01-01" "$T4/r-old"; touch -d "2026-06-01" "$T4/r-new"
+PEANO_LOCAL_HOME="$T4" bash "$SCRIPT" --migrate >/dev/null 2>&1
+old_id=$(PEANO_LOCAL_HOME="$T4" bash "$SCRIPT" --list | awk '/^llvm21/{print $1}' | sort | head -1)
+PEANO_LOCAL_HOME="$T4" bash "$SCRIPT" --add-root rollback-llvm21 "$old_id" >/dev/null 2>&1
+PEANO_LOCAL_HOME="$T4" bash "$SCRIPT" --gc --keep 1 >/dev/null 2>&1
+[ -d "$T4/$old_id" ] && ok "an install named by a root survives GC" || no "root did not protect the install"
+[ -L "$T4/roots/rollback-llvm21" ] && ok "root is a symlink, not a sentence" || no "root symlink missing"
+rm -rf "$T4"
+
 exit $fail

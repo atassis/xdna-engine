@@ -52,6 +52,9 @@
 #                                     # active, the pinned, or anything toolchain.lock names
 #   scripts/install_peano_local.sh --migrate [--dry-run]
 #                                     # rename legacy --tag dirs to their identity, old name -> alias
+#   scripts/install_peano_local.sh --add-root <name> <install-dir>
+#                                     # symlink <name> under roots/ -> <install-dir>; --gc treats any
+#                                     # rooted install as protected, no toolchain.lock prose needed
 #
 # NAMING: an install directory is named for the build it CONTAINS (`llvm<major>-<sha12>`), read from
 # `clang++ --version`, not for the day it was made. A hand-typed name is an unverified claim; this
@@ -224,6 +227,7 @@ _real_installs() {
     [ -d "$d" ] || continue
     d="${d%/}"
     [ -L "$d" ] && continue
+    [ "$(basename "$d")" = "roots" ] && continue
     echo "$d"
   done
   return 0
@@ -235,15 +239,36 @@ _real_installs() {
 # cannot see a prose pointer. (The lock is not edited to fix that: LOCKHASH is sha256 of the WHOLE
 # file, so touching even a comment orphans the built mlir-aie instance and forces a rebuild.)
 _is_protected() {
-  local inst="$1" id pin active a
+  local inst="$1" id pin active a rooted
   id="$(_peano_identity "$inst" 2>/dev/null || true)"
   active="$(readlink -f "$VENV_LINK" 2>/dev/null || true)"
   [ -n "$active" ] && [ "$active" = "$(cd "$inst" && pwd -P)" ] && { echo "active"; return 0; }
+  if rooted="$(_is_rooted "$inst")"; then echo "$rooted"; return 0; fi
   pin="$(_lock_field PEANO_FORK_COMMIT)"
   [ -n "$pin" ] && [ -n "$id" ] && [ "${id#*-}" = "${pin:0:12}" ] && { echo "pinned"; return 0; }
   # the install itself, or any alias pointing at it, named in the lock
   for a in "$(basename "$inst")" $(_aliases_of "$inst"); do
     grep -q -- "peano-local/$a" "$REPO/toolchain.lock" 2>/dev/null && { echo "lock-ref:$a"; return 0; }
+  done
+  return 1
+}
+
+# A GC root is a REFERENCE, not a sentence. The llvm21 rollback target was reachable only through a
+# line of prose in toolchain.lock, so _is_protected had to grep the lock to avoid collecting it.
+PEANO_ROOTS="$PEANO_LOCAL_HOME/roots"
+_add_root() {
+  local name="$1" target="$2"
+  [ -d "$PEANO_LOCAL_HOME/$target" ] || die "no such install: $target"
+  mkdir -p "$PEANO_ROOTS"
+  ln -sfn "../$target" "$PEANO_ROOTS/$name"
+  log "root: $name -> $target"
+}
+_is_rooted() {
+  local inst="$1" r
+  [ -d "$PEANO_ROOTS" ] || return 1
+  for r in "$PEANO_ROOTS"/*; do
+    [ -L "$r" ] || continue
+    [ "$(readlink -f "$r")" = "$(cd "$inst" && pwd -P)" ] && { echo "root:$(basename "$r")"; return 0; }
   done
   return 1
 }
@@ -369,7 +394,7 @@ _resolve_default_install() {
 }
 
 # ---------------------------------------------------------------------------------------------
-FROM=""; BUILD=""; TAG=""; MODE="install"; CHECK_DIR=""; KEEP=2; DRY=0
+FROM=""; BUILD=""; TAG=""; MODE="install"; CHECK_DIR=""; KEEP=2; DRY=0; ROOT_NAME=""; ROOT_TGT=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --from)     FROM="${2:?--from needs a dir}"; shift 2 ;;
@@ -381,6 +406,7 @@ while [ $# -gt 0 ]; do
     --resolve)  MODE="resolve"; shift ;;
     --gc)       MODE="gc"; shift ;;
     --migrate)  MODE="migrate"; shift ;;
+    --add-root) MODE="addroot"; ROOT_NAME="${2:?--add-root needs a name}"; ROOT_TGT="${3:?--add-root needs a target}"; shift 3 ;;
     --keep)     KEEP="${2:?--keep needs a number}"; shift 2 ;;
     --dry-run)  DRY=1; shift ;;
     -h|--help)  sed -n '2,52p' "${BASH_SOURCE[0]}"; exit 0 ;;
@@ -407,6 +433,7 @@ case "$MODE" in
   resolve)  _resolve_pin ;;
   gc)       _gc "$KEEP" "$DRY" ;;
   migrate)  _migrate "$DRY" ;;
+  addroot)  _add_root "$ROOT_NAME" "$ROOT_TGT" ;;
   install)
     [ -n "$FROM" ] && [ -n "$BUILD" ] \
       || die "need --from <good-install> --build <build-fast-dir> (--tag is optional; the install is
