@@ -64,6 +64,13 @@ int shim_run_mha7(ShimKernel*, unsigned int opcode, ShimBo* instr, size_t instr_
 int shim_run_bd8(ShimKernel*, unsigned int opcode, ShimBo* instr, size_t instr_count,
                  ShimBo* qpv, ShimBo* p, ShimBo* kk, ShimBo* v, ShimBo* ctx);
 
+/* Generic xclbin/instr dispatch host ABI: kernel(opcode, instr, instr_count, data[0..n_data)).
+ * Same (opcode, instr, count) prefix as the fixed-arity variants above, but for an arbitrary
+ * data-arg count -- e.g. the S2 codec's streamed designs, which take 2 or 3 data BOs
+ * (in_tiles[, resident], out) depending on whether the design has a resident operand. */
+int shim_run_kernel(ShimKernel*, unsigned int opcode, ShimBo* instr, size_t instr_count,
+                    ShimBo* const* data, size_t n_data);
+
 /* ASYNC split of shim_run_matmul8: _start submits the run (xrt::kernel::operator() enqueues +
  * starts execution) and returns a run handle WITHOUT waiting, so the host can do other work (prep
  * the next dispatch, post-process the previous) while the NPU computes. _wait blocks for completion.

@@ -473,6 +473,14 @@ extern "C" {
         v: *mut CBo,
         ctx: *mut CBo,
     ) -> c_int;
+    fn shim_run_kernel(
+        k: *mut CKernel,
+        opcode: c_uint,
+        instr: *mut CBo,
+        count: usize,
+        data: *const *mut CBo,
+        n_data: usize,
+    ) -> c_int;
     #[allow(clippy::too_many_arguments)]
     fn shim_run_matmul8_start(
         k: *mut CKernel,
@@ -1063,6 +1071,22 @@ impl Kernel {
         dispatch_log::note(&self.label, instr.ptr as usize, count, Some(_t.elapsed().as_secs_f64()));
         if r != 0 {
             Err(format!("run_bd_conveyor: {}", last_error()))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Dispatch a generic xclbin/instr kernel: (opcode, instr, count, data[0..N)). For designs
+    /// whose data-BO arity isn't one of the fixed shapes above (matmul8/dwconv6/mha7/bd8) -- e.g.
+    /// the S2 codec's streamed designs, which take 2 or 3 data BOs (in_tiles[, resident], out).
+    /// Blocks until the run completes.
+    pub fn run_kernel(&self, opcode: u32, instr: &Bo, count: usize, data: &[&Bo]) -> Result<()> {
+        let _t = std::time::Instant::now();
+        let ptrs: Vec<*mut CBo> = data.iter().map(|b| b.ptr).collect();
+        let r = unsafe { shim_run_kernel(self.ptr, opcode, instr.ptr, count, ptrs.as_ptr(), ptrs.len()) };
+        dispatch_log::note(&self.label, instr.ptr as usize, count, Some(_t.elapsed().as_secs_f64()));
+        if r != 0 {
+            Err(format!("run_kernel: {}", last_error()))
         } else {
             Ok(())
         }

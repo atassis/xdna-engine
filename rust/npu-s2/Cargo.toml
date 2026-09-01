@@ -1,0 +1,25 @@
+[package]
+name = "npu-s2"
+version = "0.1.0"
+edition = "2021"
+description = "S2 TTS codec on the XDNA2 NPU engine -- build-once/dispatch-many loader for one exported streamed design (xclbin + insts + meta.json), plus the artifact-directory manifest over all of a codec's designs"
+
+[lib]
+name = "npu_s2"
+path = "src/lib.rs"
+
+[dependencies]
+npu-xrt = { path = "../npu-xrt" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# xclbin content-hash check against meta.json's recorded sha256 (see kernel_registry's
+# engine-op-manifest-and-dynamic-xclbin: an xclbin's own container carries no op-identity signal,
+# so a wrong artifact at the right path can only be caught by re-hashing).
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "s2_design_probe"
+path = "src/bin/s2_design_probe.rs"
