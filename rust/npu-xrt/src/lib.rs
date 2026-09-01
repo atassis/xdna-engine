@@ -589,7 +589,9 @@ pub type Result<T> = std::result::Result<T, String>;
 /// What that saves is a hw_context SLOT, not columns. npu4 sets `AIE2_TEMPORAL_ONLY`
 /// (`npu4_regs.c`), so contexts do NOT partition the array -- `aie2_ctx.c` ignores
 /// `hwctx->col_list` and requests all `total_col` columns for every context, which then
-/// time-slice. The budget is `.hwctx_limit` = 16 on npu4 (npu1: 6). Mirrors `npu_asr/device.py`.
+/// time-slice. The budget is `.hwctx_limit` = 16 on npu4 (npu1: 6). Ported from
+/// `npu_asr/device.py` (RETIRED 2026-06-11); structure deliberately diverges -- see
+/// npu_asr/RETIRED.md.
 /// The identity a hw_context is cached under. By default the xclbin PATH, which is what XRT was
 /// handed -- but two byte-identical copies of one xclbin at two paths then get two contexts, and a
 /// transition between them costs a full program switch while every report calls them one xclbin.
