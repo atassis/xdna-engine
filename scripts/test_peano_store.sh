@@ -66,4 +66,38 @@ bash "$SCRIPT" --gc --keep 1 >/dev/null 2>&1
 [ ! -d "$T/llvm22-dddddddddddd" ] && ok "removed older llvm22" || no "kept an over-quota llvm22"
 [ ! -e "$T/old-b" ] && ok "alias of a removed build cleaned up" || no "dangling alias left behind"
 [ -L "$T/dup-of-a" ] && ok "alias of a surviving build kept" || no "alias of survivor lost"
+
+echo "== ties in mtime must not make the victim arbitrary =="
+# mtime only moves on --activate, so same-session installs tie exactly. Without a secondary key
+# the GC victim is whatever order the glob produced, which differs between runs.
+T2="$(mktemp -d)"; PEANO_LOCAL_HOME="$T2"
+for n in tie-1 tie-2 tie-3; do
+  mkdir -p "$T2/$n/bin"
+  sha=$(printf '%s' "$n" | md5sum | cut -c1-8)
+  printf '#!/bin/sh
+echo "clang version 21.0.0git (git@github.com:atassis/llvm-aie.git %s0000000000000000000000000000000000)"
+' "$sha" > "$T2/$n/bin/clang++"
+  chmod +x "$T2/$n/bin/clang++"
+done
+touch -d "2026-01-01" "$T2"/tie-*          # exact tie
+PEANO_LOCAL_HOME="$T2" bash "$SCRIPT" --migrate >/dev/null 2>&1
+runs=$(for i in 1 2 3 4 5; do
+         PEANO_LOCAL_HOME="$T2" bash "$SCRIPT" --gc --keep 1 --dry-run 2>&1            | grep 'WOULD REMOVE' | sed 's/.*REMOVE //' | sort | tr '
+' ' '
+       done | sort -u | wc -l)
+[ "$runs" = 1 ] && ok "GC victim is identical across 5 runs on tied mtimes" || no "GC nondeterministic ($runs distinct outcomes)"
+rm -rf "$T2"
+
+echo "== an install whose identity cannot be read is never deleted =="
+T3="$(mktemp -d)"; PEANO_LOCAL_HOME="$T3"
+mkdir -p "$T3/unreadable/bin"; : > "$T3/unreadable/bin/clang++"   # exists, not executable/no banner
+mkdir -p "$T3/good/bin"
+printf '#!/bin/sh
+echo "clang version 21.0.0git (git@github.com:atassis/llvm-aie.git ffffffffffffffffffffffffffffffffffffffff)"
+' > "$T3/good/bin/clang++"
+chmod +x "$T3/good/bin/clang++"
+PEANO_LOCAL_HOME="$T3" bash "$SCRIPT" --gc --keep 0 >/dev/null 2>&1
+[ -d "$T3/unreadable" ] && ok "unidentifiable install survives GC" || no "GC deleted an install it could not verify"
+rm -rf "$T3"
+
 exit $fail

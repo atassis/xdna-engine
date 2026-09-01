@@ -74,6 +74,23 @@
 #   file/binary, both paths, both hashes/SHAs, and how to fix it. Never mutates kernels_dir,
 #   PEANO_INSTALL_DIR, or the pin -- read-only except for the manifest stamp.
 set -euo pipefail
+
+# The pinned build is very often ALREADY on disk, just not the one the venv points at. Saying
+# "re-provision" then sends you rebuilding something you have; on 2026-09-01 answering "do we even
+# need to re-pin?" took six clang++ invocations by hand. Ask the store instead, and print the exact
+# command -- or say plainly that the build is genuinely absent.
+_peano_remedy() {
+  local have
+  if have="$("$(dirname "${BASH_SOURCE[0]}")/install_peano_local.sh" --resolve 2>/dev/null)" && [ -n "$have" ]; then
+    printf '  The pinned build IS installed. Activate it:\n    scripts/install_peano_local.sh --activate %s\n' "$have"
+    printf '  (If the currently-active build is the one you meant to use, re-pin toolchain.lock instead --\n'
+    printf '   that is the /repin flow, not this gate.)\n'
+  else
+    printf '  No installed Peano matches the pin (scripts/install_peano_local.sh --list shows what there is),\n'
+    printf '  so this one has to be built: scripts/toolchain_up.sh, or install_peano_local.sh --from/--build.\n'
+  fi
+}
+
 REPO="$(cd "$(dirname "$0")/.." && pwd)"; cd "$REPO"
 
 MMW=mlir-aie/programming_examples/basic/matrix_multiplication/whole_array
@@ -230,8 +247,8 @@ for mk in "${family[@]}"; do
   which does NOT match toolchain.lock's PEANO_FORK_COMMIT
     $peano_fork_commit
   -- the build would compile with the WRONG compiler (right or wrong kernel source either way).
-  FIX: PEANO_INSTALL_DIR (\"$PEANO_INSTALL_DIR\") is not the toolchain.lock-pinned Peano build --
-  re-run scripts/toolchain_up.sh's Peano provisioning (install_peano_local.sh) for the current pin." >&2
+  FIX: PEANO_INSTALL_DIR (\"$PEANO_INSTALL_DIR\") is not the toolchain.lock-pinned Peano build.
+$(_peano_remedy)" >&2
       fail=1
     else
       echo "[verify_kernel_source] OK   $mk KERNEL_CC=$cc_raw self-reports $cc_sha == toolchain.lock PEANO_FORK_COMMIT"

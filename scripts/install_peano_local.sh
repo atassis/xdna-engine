@@ -298,13 +298,21 @@ _resolve_pin() {
 _gc() {
   local keep="$1" dry="$2" d id maj prot seen line
   declare -A count=()
-  # newest first, grouped by major
+  # Newest first, grouped by major. mtime alone does NOT order this set: it is only bumped on
+  # --activate, so installs copied in the same session tie exactly (all three llvm21 installs
+  # here share one mtime). Ties therefore break on the identity, so the victim is deterministic
+  # rather than whatever order the glob happened to produce.
   for line in $(for d in $(_real_installs); do
                   id="$(_peano_identity "$d" 2>/dev/null || echo 'llvm?-unknown')"
                   echo "$(stat -c %Y "$d")|${id%%-*}|$d"
-                done | sort -t'|' -k1 -rn); do
+                done | sort -t'|' -k1,1rn -k3,3r); do
     maj="$(echo "$line" | cut -d'|' -f2)"; d="$(echo "$line" | cut -d'|' -f3)"
     count[$maj]=$(( ${count[$maj]:-0} + 1 ))
+    # An install we cannot identify is one we cannot prove is redundant. Never delete it.
+    if [ "$maj" = "llvm?" ]; then
+      log "KEEP  $(basename "$d")  (identity unreadable -- refusing to delete what cannot be verified)"
+      continue
+    fi
     if prot="$(_is_protected "$d")"; then
       log "KEEP  $(basename "$d")  ($maj, $prot)"; continue
     fi
