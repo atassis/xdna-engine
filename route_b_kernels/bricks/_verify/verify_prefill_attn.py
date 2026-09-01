@@ -58,8 +58,14 @@ BRICK_CC = BRICK_DIR / "prefill_attn.cc"
 sys.path.insert(0, str(BRICK_DIR))
 import golden  # noqa: E402
 
+import aie.iron as iron  # noqa: E402
+from aie.iron import In, Out, ObjectFifo, Program, Runtime, Worker  # noqa: E402
+from aie.iron.controlflow import range_  # noqa: E402
+from aie.iron.kernel import ExternalFunction  # noqa: E402
+
 GATE = 3e-2
 _bf16 = ml_dtypes.bfloat16
+FLASH_GATE = 3.0e-2
 
 
 def _verify_head(oh: int, q_full, k_full, v_full, m_tokens: int, mask: np.ndarray = None,
@@ -97,6 +103,130 @@ def _verify_head(oh: int, q_full, k_full, v_full, m_tokens: int, mask: np.ndarra
         # nothing here -- the design still builds at 0x4000, so L1 is not tight at this shape.
         stack_size=0xD00,
     )
+
+
+#===============================================================================================#
+# FLASH/CHUNKED CONFIGURATION -- prefill_attn_chunk, the S2 quantizer post_module transformer's
+# capacity extension (RVQ_HEAD_DIM=64, up to RVQ_WINDOW_SIZE=128 visible keys; see
+# prefill_attn.cc's "prefill_attn_chunk" section header for the design and the route-choice
+# rationale). NOT bricklib's verify_streamed/verify_rowwise, for the same class of reason
+# verify_mha_decode_hd128.py hand-rolls its own design: prefill_attn_chunk's ABI (2 streamed
+# inputs, ONE RESIDENT-PER-ROW output DOUBLING as online-softmax state, plus a per-call literal
+# chunk_idx) does not fit bricklib's generic `kern(in_tile,[resident],out_tile)` no-scalar
+# contract. Bespoke @iron.jit design below, same pieces bricklib's own builders use.
+#
+# TWO LEVELS OF ITERATION, DELIBERATELY DIFFERENT MECHANISMS -- this is the one thing to get right
+# here, matching the exact "PROGRAM MEMORY" hazard prefill_attn.cc's own header records
+# (Revision 1b: 352 Python-unrolled call sites overflowed the core's program memory and failed to
+# load, a genuine device error, not a numerics bug). t_tokens ROWS is the axis that scales with
+# the real problem (up to the T=66 captured clip, or more for a longer one) -- that axis uses
+# `range_(t_tokens)`, bricklib's own proven single-call-site device dispatch loop (see
+# `_build_streamed`'s own core function above for the identical shape), NOT Python's `range`.
+# n_chunks CHUNKS is a small, HARDWARE-CAPACITY-bounded axis (<=8 for the RVQ_WINDOW_SIZE=128
+# cap) that genuinely needs a per-call COMPILE-TIME LITERAL `chunk_idx` (the reset/finalize
+# signal) -- exactly mha_decode_iron.py's own justification for Python-unrolling its `tile_idx`
+# loop, at a comparably small n_tiles=4 in its own device-green test. So: Python `for c in
+# range(n_chunks)` NESTED INSIDE the `range_(t_tokens)` body -- n_chunks call sites TOTAL in the
+# emitted program (independent of t_tokens), never t_tokens*n_chunks. Unverified: whether IRON
+# accepts a plain-Python-unrolled inner loop nested inside a `range_()` body at all (no exact
+# precedent for that nesting was found in this codebase's other verify scripts); if it does not,
+# this design needs restructuring, not a bigger n_chunks bound.
+#===============================================================================================#
+
+def _build_flash_design(t_tokens: int, n_chunks: int, hd: int):
+    """One resident-per-row state buffer (RESIDENT ACROSS one row's n_chunks calls, released and
+    re-acquired every row -- see prefill_attn_chunk's header NO STATIC L1 STATE), streamed over
+    t_tokens*n_chunks (qm_row, kv_chunk) tile pairs. `sequence` fills the FULL padded qm/kv arrays
+    (t_tokens*n_chunks tiles each, built by golden.pack_head_chunks) and drains t_tokens state
+    tiles of [hd+2] f32 each (the extra 2 are the row's final running max/sum -- unused by the
+    caller, see prefill_attn_chunk's header; only ctx[:, :hd] is read back)."""
+    compile_flags = bricklib._aie_api_include() + [f"-DPREFILL2_HD={hd}", f"-DPREFILL2_NCHUNKS={n_chunks}"]
+
+    qm_bf16 = hd + golden.VL
+    kv_bf16 = 2 * golden.VL * hd
+    state_f32 = hd + 2
+
+    qm_ty = np.ndarray[(qm_bf16,), np.dtype[_bf16]]
+    kv_ty = np.ndarray[(kv_bf16,), np.dtype[_bf16]]
+    state_ty = np.ndarray[(state_f32,), np.dtype[np.float32]]
+    qm_full_ty = np.ndarray[(t_tokens * n_chunks * qm_bf16,), np.dtype[_bf16]]
+    kv_full_ty = np.ndarray[(t_tokens * n_chunks * kv_bf16,), np.dtype[_bf16]]
+    state_full_ty = np.ndarray[(t_tokens * state_f32,), np.dtype[np.float32]]
+
+    def design(qm_in: In, kv_in: In, state_out: Out):
+        kern = ExternalFunction(
+            "prefill_attn_chunk", source_file=str(BRICK_CC),
+            arg_types=[qm_ty, kv_ty, state_ty, np.int32],
+            compile_flags=compile_flags,
+        )
+        of_qm = ObjectFifo(qm_ty, name="qm_in", depth=2)
+        of_kv = ObjectFifo(kv_ty, name="kv_in", depth=2)
+        of_state = ObjectFifo(state_ty, name="state_out", depth=2)
+
+        def core(qm_cons, kv_cons, state_prod, kern):
+            for _ in range_(t_tokens):  # genuine device loop, ONE call-site body (see header)
+                es = state_prod.acquire(1)  # resident for this row's whole chunk sweep
+                for c in range(n_chunks):   # Python-unrolled, n_chunks literal call sites TOTAL
+                    eqm = qm_cons.acquire(1)
+                    ekv = kv_cons.acquire(1)
+                    kern(eqm, ekv, es, c)
+                    kv_cons.release(1)
+                    qm_cons.release(1)
+                state_prod.release(1)
+
+        worker = Worker(core, fn_args=[of_qm.cons(), of_kv.cons(), of_state.prod(), kern],
+                        stack_size=0xD00)  # measured deepest path 1152 B (0x480); see report
+
+        def sequence(qm, kv, st, qm_h, kv_h, st_h):
+            qm_h.fill(qm)
+            kv_h.fill(kv)
+            st_h.drain(st, wait=True)
+
+        rt = Runtime(
+            sequence,
+            [qm_full_ty, kv_full_ty, state_full_ty, of_qm.prod(), of_kv.prod(), of_state.cons()],
+        )
+        return Program(iron.get_current_device(), rt, workers=[worker]).resolve_program()
+
+    base = bricklib._design_key(
+        "prefill_attn_chunk", compile_flags,
+        bricklib._include_closure_digest(BRICK_CC, compile_flags))
+    design.__name__ = design.__qualname__ = f"{base}_hd{hd}_nchunks{n_chunks}_t{t_tokens}"
+    return iron.jit(design, use_cache=False)
+
+
+def _verify_flash_head(cq, q_full, k_full, v_full, head: int, t_tokens: int, n_chunks: int,
+                        hd: int, mask: np.ndarray = None):
+    """Build+run prefill_attn_chunk for one head, all t_tokens rows, gate rel-L2 against
+    `golden.reference_rvq_head`. Returns a bricklib-shaped result dict (has 'ok', 'rel_l2',
+    'run2run', 'got', ...)."""
+    qm_tiles, kv_tiles = golden.pack_head_chunks(cq, q_full, k_full, v_full, head, t_tokens,
+                                                 n_chunks, mask=mask)
+    if mask is None:
+        mask = cq._causal_window_mask(t_tokens, cq.RVQ_WINDOW_SIZE)
+    exp = golden.reference_rvq_head(cq, q_full, k_full, v_full, head, mask)  # [t_tokens, hd] f32
+    design = _build_flash_design(t_tokens, n_chunks, hd)
+
+    def run_once():
+        qm_t = iron.tensor(np.ascontiguousarray(qm_tiles.reshape(-1)), dtype=_bf16, device="npu")
+        kv_t = iron.tensor(np.ascontiguousarray(kv_tiles.reshape(-1)), dtype=_bf16, device="npu")
+        st_t = iron.zeros((t_tokens * (hd + 2),), dtype=np.float32, device="npu")
+        design(qm_t, kv_t, st_t)
+        return st_t.numpy().reshape(t_tokens, hd + 2)[:, :hd].copy()  # drop the 2 scratch scalars
+
+    dev1 = run_once()
+    dev2 = run_once()
+    got = np.asarray(dev1, np.float64)
+    e = np.asarray(exp, np.float64)
+    den = np.linalg.norm(e)
+    rel_l2 = float(np.linalg.norm(got - e) / den) if den else float(np.linalg.norm(got))
+    determ = float(np.linalg.norm(dev1.astype(np.float64) - dev2.astype(np.float64)))
+    nz = float(np.abs(dev1).sum())
+    ok = (nz > 0.0) and (rel_l2 <= FLASH_GATE)
+    status = "PASS" if ok else ("FAIL-ZERO" if nz == 0.0 else "FAIL")
+    print(f"  [flash] head={head} T={t_tokens} n_chunks={n_chunks} HD={hd}: "
+          f"rel_l2={rel_l2:.3e} run2run={determ:.3e} -> {status}")
+    return dict(ok=ok, rel_l2=rel_l2, run2run=determ, nonzero=nz, status=status, got=got)
 
 
 def main():
@@ -224,6 +354,29 @@ def main():
               f"run2run={res1['run2run']:.3e} -> {res1['status']}")
     overall_ok &= m1_ok
     assert m1_ok, "prefill_attn M=1 gate failed for one or more heads"
+
+    # ---- FLASH/CHUNKED CONFIGURATION: prefill_attn_chunk, the S2 quantizer post_module
+    # transformer's capacity extension (RVQ_HEAD_DIM=64, no GQA, sliding-window causal mask).
+    # ADDITIONAL cases, ADDED alongside the HD=128/M<=11 gate above, which this section does not
+    # touch. Two configs: the real captured clip (T=66, 5 chunks) and the window cap (T=128, 8
+    # chunks, ceil(RVQ_WINDOW_SIZE/16)) -- see prefill_attn.cc's "prefill_attn_chunk" section and
+    # this file's own FLASH/CHUNKED CONFIGURATION header above for the design. UNVERIFIED end to
+    # end: authored device-free, never run (see the accompanying report). ----
+    golden._selftest_rvq_chunked_matches_windowed()  # device-free: proves the merge algebra alone
+
+    cq = golden._load_codec_quantizer_ref()
+    flash_ok = True
+    for t_tokens, n_chunks, seed, label in [
+        (66, 5, 3, "T=66 (real captured clip)"),
+        (128, 8, 4, "T=128 (RVQ_WINDOW_SIZE cap)"),
+    ]:
+        _, qf, kf, vf = golden.build_qkv_rvq(seed=seed, t_tokens=t_tokens, n_head=4)
+        res = _verify_flash_head(cq, qf, kf, vf, head=1, t_tokens=t_tokens, n_chunks=n_chunks,
+                                 hd=cq.RVQ_HEAD_DIM)
+        flash_ok &= res["ok"]
+        print(f"[prefill_attn_chunk {label}] -> {res['status']}")
+    overall_ok &= flash_ok
+    assert flash_ok, "prefill_attn_chunk (flash/windowed) gate failed for one or more configs"
 
     assert overall_ok, "prefill_attn: one or more device checks failed (see above)"
     print("PASS")
