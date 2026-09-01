@@ -31,14 +31,24 @@ log() { echo "[driver_status] $*"; }
 # future kernel update and pacman can uninstall it cleanly.
 emit_command() {
   local drv="$DRV" jobs; jobs=$(( $(nproc) / 2 )); [ "$jobs" -lt 1 ] && jobs=1
+  local pyb_venv="$WS/.cache/pybind11-venv"
+  local pyb_cmake="$pyb_venv/lib/python3.14/site-packages/pybind11/share/cmake/pybind11"
   cat <<EOF
 
+  --- prerequisites (once per checkout) ---
+  git -C $drv submodule update --init --recursive --reference $WS/XRT-src xrt
+  python3 -m venv $pyb_venv && $pyb_venv/bin/pip install -q pybind11==2.13.6
+  # xrt/src/python does find_package(pybind11 2.6.0 REQUIRED) and nothing on this box provides it.
+
   --- build + package (no root; I can run these for you) ---
-  cd $drv && ./build/build.sh -release -j $jobs
-  cd $drv/build/arch && XDNA_BUILD_DIR=../Release makepkg -f
+  cd $drv && LLVM=1 CMAKE_PREFIX_PATH=$pyb_cmake ./build/build.sh -release -j $jobs
+  # LLVM=1: this kernel is clang/LLD-built, and gcc rejects the flags its kbuild passes.
+  cd $drv/build/arch && XDNA_BUILD_DIR=$drv/Release makepkg -f -d -p PKGBUILD-amdxdna-driver
+  # Absolute XDNA_BUILD_DIR: package() runs in makepkg's srcdir, so a relative one misses.
+  # -d: depends=('linux-headers'), which CachyOS provides as LINUX-HEADERS; pacman is case-sensitive.
 
   --- install + load (needs root; run these yourself) ---
-  sudo pacman -U $drv/build/arch/amdxdna-driver-*.pkg.tar.zst
+  sudo pacman -U --assume-installed linux-headers $drv/build/arch/amdxdna-driver-*.pkg.tar.zst
   sudo modprobe -r amdxdna && sudo modprobe amdxdna
 
   --- verify (no root) ---
