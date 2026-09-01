@@ -1,0 +1,22 @@
+# driver.lock -- the amdxdna kernel module we RUN, pinned. Read by scripts/driver_status.sh.
+#
+# SEPARATE FROM toolchain.lock, deliberately. The two pin different things on different clocks:
+#   * toolchain.lock keys the content-addressed mlir-aie INSTANCE. The driver is not a build input
+#     to it, so folding the driver in would make every driver bump rebuild the whole instance -- the
+#     same over-invalidation that already costs a full rebuild when only PEANO_FORK_COMMIT moves.
+#   * the driver binds to the RUNNING KERNEL, not to the compiler. A CachyOS kernel update forces a
+#     driver rebuild with toolchain.lock untouched; a Peano bump must not touch the driver at all.
+#   * the gates differ: a toolchain bump gates on rel-L2, a driver swap gates on "does the NPU still
+#     enumerate and allocate a hw context", and its failure mode is NO DEVICE.
+#   * rollback differs: --activate an install vs. removing a DKMS module and reloading.
+#
+# INSTALL PATH: AMD's own Arch packaging (build/arch/PKGBUILD-amdxdna-driver), which is a DKMS
+# package. DKMS rebuilds per kernel, signs with the existing /var/lib/dkms/mok.key, and lands the
+# module in /lib/modules/<ver>/updates/dkms/, which depmod prefers over the in-tree copy
+# (/usr/lib/depmod.d/search.conf: "search updates extramodules built-in"). nvidia-egpufix on this box
+# already shadows an in-tree module the same way, so the mechanism is proven here, not theoretical.
+# dkms.conf runs configure_kernel.sh as PRE_BUILD to generate config_kernel.h -- do NOT hand-write it.
+
+XDNA_DRIVER_COMMIT=eae6a0f610fe70bc1df23ef0977c1689b87656e4   # amd/xdna-driver origin/main, 2026-09-01. Pure upstream: it already contains our 6 merged fixes (#1647 firmware-name-on-timeout, #1631 terminal ERT states, #1567 CU BO refs, #1541 flush-requested-range, #1529 power sensor units, #1506 x86 CLFLUSH fence). PIN A COMMIT, NEVER "latest": the tree took 106 commits in 90 days and much of it is aie4/ve2/npu3a work for hardware that is not ours (we are PCI 0x17f0:0x10 -> dev_npu4_info).
+XDNA_DRIVER_CARRIES=                                          # our unmerged commits applied on top; EMPTY = pure upstream. Add a branch name here only to run a fix before it merges (e.g. fix/msg-buff-order-fallback, PR #1568 open). Every carry is a local delta the running kernel has and upstream does not -- keep the list short and drop entries as their PRs merge.
+XDNA_DRIVER_KERNEL=7.2.0-1-cachyos                            # the kernel this pin was last validated against. DKMS rebuilds for new kernels automatically; a MAJOR kernel bump still warrants a re-gate, since the driver tracks internal kernel APIs that are not stable.
