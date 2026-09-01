@@ -41,6 +41,18 @@ UNITS = [("c.decoder.model.4.block.2.block.1.conv", 1),
          ("c.decoder.model.4.block.3.block.1.conv", 3),
          ("c.decoder.model.4.block.4.block.1.conv", 9)]
 
+# ADDITIVE: the same three dilated tensors plus a real 1x1 (block.3.conv, a residual unit's own
+# pointwise conv -- what the S2 quantizer's projections use), now against conv_1d_causal_core_vec
+# instead of conv_1d_causal_core. Same golden, same GATE, same activation -- only the kernel symbol
+# and k (for the 1x1 case) differ, so a failure here isolates to the vector core, never to the
+# tensors or the harness. conv_1d_causal_core_vec requires t a multiple of 16 (see its own comment);
+# CV_T's default (32) and its one other measured value (64) both satisfy that.
+assert T % 16 == 0, f"conv_1d_causal_core_vec requires t a multiple of 16, got {T}"
+VEC_UNITS = [("c.decoder.model.4.block.2.block.1.conv", 7, 1),
+             ("c.decoder.model.4.block.3.block.1.conv", 7, 3),
+             ("c.decoder.model.4.block.4.block.1.conv", 7, 9),
+             ("c.decoder.model.4.block.2.block.3.conv", 1, 1)]
+
 spec = importlib.util.spec_from_file_location("conv1d_golden", BRICK / "golden.py")
 golden = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(golden)
@@ -90,6 +102,51 @@ for tensor, dilation in UNITS:
     )
     got = np.asarray(res["got"], np.float32)
     print(f"  dilation {dilation}: rel-L2 {res['rel_l2']:.3e}  "
+          f"max abs err {float(np.max(np.abs(got - ref))):.3e}  "
+          f"range [{got.min():+.4f}, {got.max():+.4f}]  {res['status']}")
+    ok = ok and res["ok"]
+
+for tensor, k, dilation in VEC_UNITS:
+    w = gx.load(str(GGUF), f"{tensor}.weight").astype(np.float32)
+    bias = gx.load(str(GGUF), f"{tensor}.bias").astype(np.float32).reshape(-1)
+    assert w.shape == (C_OUT, C_IN, k), f"{tensor}: weight shape {w.shape}"
+
+    ref = golden.conv_1d_causal_ref(x, w, bias, dilation)
+
+    tile_w = C_IN * k + 1
+    tiles = np.zeros((C_OUT, tile_w), np.float32)
+    for co in range(C_OUT):
+        tiles[co, :C_IN * k] = w[co].reshape(-1)
+        tiles[co, C_IN * k] = bias[co]
+
+    _cb = int(time.time() * 1000) % 10**9
+    shim = bricklib.GEN / f"conv_1d_vec_d{dilation}_k{k}_shim.cc"
+    shim.write_text(
+        f"// AUTO-GENERATED verify shim for the conv-1d VECTORISED brick, dilation {dilation} "
+        f"k {k}. cb {_cb}\n"
+        "#include <stdint.h>\n"
+        f'#include "{BRICK / "conv_1d.cc"}"\n'
+        f'extern "C" void conv_1d_vec_verify_d{dilation}_k{k}(float *wtile, float *resident, '
+        f'float *out) {{\n'
+        f"  route_b_bricks::conv_1d_causal_core_vec<16>(resident, wtile, wtile[{C_IN * k}], out,\n"
+        f"                                              {C_IN}, {k}, {T}, {dilation});\n"
+        "}\n"
+    )
+
+    res = bricklib.verify_streamed(
+        name=f"conv_1d_vec_dil{dilation}_k{k}",
+        shim=shim,
+        symbol=f"conv_1d_vec_verify_d{dilation}_k{k}",
+        in_tiles=tiles,
+        out_tile_numel=T,
+        resident=resident,
+        unpack=lambda d: np.asarray(d).reshape(C_OUT, T),
+        golden=ref,
+        gate=GATE,
+        in_dt=np.float32, out_dt=np.float32, resident_dt=np.float32,
+    )
+    got = np.asarray(res["got"], np.float32)
+    print(f"  VEC dilation {dilation} k={k}: rel-L2 {res['rel_l2']:.3e}  "
           f"max abs err {float(np.max(np.abs(got - ref))):.3e}  "
           f"range [{got.min():+.4f}, {got.max():+.4f}]  {res['status']}")
     ok = ok and res["ok"]

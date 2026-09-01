@@ -38,6 +38,7 @@ SNAKE_CC = (ROOT / "route_b_kernels" / "bricks" / "snake" / "snake.cc").resolve(
 CONV_CC = (ROOT / "route_b_kernels" / "bricks" / "conv-1d" / "conv_1d.cc").resolve()
 
 T = 64          # rail max at c=96; the resident activation is what caps it
+CONV_VEC = int(__import__("os").environ.get("CONV_VEC", "1"))  # vector conv core; 0 = scalar
 _CB = int(time.time() * 1000) % 10**9
 
 _stats = {"dispatches": 0, "useful": 0, "computed": 0}
@@ -153,7 +154,16 @@ def _conv_chunk(x, w, bias, k, dilation, tag, add=None, resident_depth=2):
     out = np.zeros((c_out, M), np.float32)
 
     wide = c_in * k + 1 + (T if add is not None else 0)
-    body = (f"  route_b_bricks::conv_1d_causal_core(resident, tile, tile[{c_in * k}], out,\n"
+    # VECTOR core by default. Measured on device at identical tile geometry (probe_vec_device_ms.py):
+    # scalar 1.123 ms/KiB, vector 0.049 -- 23x, and correctness is bit-comparable to the scalar
+    # reference (verify_conv_1d.py: 4.483e-07 / 4.253e-07 / 2.860e-07 at dilation 1/3/9 against the
+    # scalar's 4.475e-07 / 4.252e-07 / 2.863e-07, and 1.867e-07 at k=1). That settled a real open
+    # question -- a scalar FMA loop should not have cost 1.1 ms/KiB, so the time might have been
+    # per-tile overhead rather than compute, in which case this swap would have bought nothing.
+    # It bought 23x, so it was compute. CONV_VEC=0 restores the scalar core for A/B.
+    core = ("conv_1d_causal_core_vec<16>" if CONV_VEC else "conv_1d_causal_core")
+    assert not CONV_VEC or T % 16 == 0, f"vector core needs T % 16 == 0, got T={T}"
+    body = (f"  route_b_bricks::{core}(resident, tile, tile[{c_in * k}], out,\n"
             f"                                      {c_in}, {k}, {T}, {dilation});\n")
     if add is not None:
         body += f"  for (int p = 0; p < {T}; p++) out[p] += tile[{c_in * k + 1} + p];\n"

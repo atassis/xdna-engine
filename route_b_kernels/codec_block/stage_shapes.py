@@ -148,7 +148,11 @@ def conv_transpose_l1(c_in, k, stride, t=UP_T, resident_depth=1):
 # conv-1d does. Applying conv-1d's slope to an upsample would over-chunk it ~3x and multiply the
 # dispatch count for nothing, so each kernel carries its own measured number (probe_device_ms.py,
 # probe_ct_device_ms.py). Both are f32 at resident_depth=1; a different dtype or depth is unmeasured.
-STREAM_MS_PER_KIB = 0.97                # conv-1d: 229632 B -> 223.9 ms .. 2066688 B -> 2009.3 ms
+# conv-1d is now VECTORISED (window_driver.CONV_VEC=1). Measured at identical tile geometry
+# (probe_vec_device_ms.py): scalar 1.123 ms/KiB, vector 0.049 -- 23x. The scalar figure
+# 0.97 was measured at a slightly different geometry and is kept below for the A/B.
+STREAM_MS_PER_KIB = 0.049               # VECTOR conv-1d; 459264 B -> 22.1 ms, 1377792 B -> 65.6 ms
+STREAM_MS_PER_KIB_SCALAR = 1.123        # scalar core, same geometry, for CONV_VEC=0
 CT_STREAM_MS_PER_KIB = 0.30             # conv_transpose: 0.304/0.301/0.299/0.298 over 128 KiB..1 MiB
 TDR_TIMEOUT_MS = 2000                   # amdxdna aie2_ctx.c:31 default; root-only to change
 TDR_MARGIN = 0.7                        # aim well under the watchdog, not at its edge
@@ -230,8 +234,12 @@ def plan(stage):
     up_total = conv_transpose_l1(up_c, k, stride, resident_depth=rd)[-1]
     assert up_total <= L1_BUDGET, f"stage {stage} upsample @ ci_chunk={up_chunk}: {up_total} > {L1_BUDGET}"
 
-    res_t_cap = min(max_ci_chunk_time(c_res, 7),
-                    max_ci_chunk_time(c_res, 1, has_add=True))
+    # Either arm returns None when the widest chunk already fits the TDR budget, so min() has to
+    # skip the Nones rather than compare against them; with the vector conv core both are usually
+    # None and nothing binds but L1.
+    _caps = [c for c in (max_ci_chunk_time(c_res, 7),
+                         max_ci_chunk_time(c_res, 1, has_add=True)) if c is not None]
+    res_t_cap = min(_caps) if _caps else None
     res_chunk = RESIDUAL_CI_CHUNK[stage]
     if res_t_cap is not None and res_t_cap < (res_chunk or c_res):
         res_chunk = _snap_pow2(res_t_cap)
