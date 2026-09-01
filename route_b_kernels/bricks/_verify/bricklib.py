@@ -286,6 +286,137 @@ def _build_streamed(symbol, shim, n_tiles, in_tile, out_tile, resident_len, comp
     return iron.jit(design, use_cache=_JIT_CACHE)
 
 
+def _build_streamed_traced(symbol, shim, n_tiles, in_tile, out_tile, resident_len, compile_flags,
+                           in_dt, out_dt, resident_dt, trace_config, resident_depth=2,
+                           stack_size=None, coretile_events=None, egress_shim_col=1):
+    """Traced twin of `_build_streamed`, for hardware-tracing ONE streamed design.
+
+    A separate generator rather than a flag on `_build_streamed`, so every existing brick gate
+    (every `verify_streamed`/`verify_rowwise` caller across bricks/) is untouched: `_build_streamed`
+    still declares ZERO `CompileTime[T]` params, so its `design.__name__` (the JIT cache key), its
+    generated MLIR and every gate that calls it are byte-for-byte what they were before this
+    function existed. Nothing here is imported or called from that path.
+
+    Adds ONE thing: the design takes `trace_size: CompileTime[int] = 0` and, when
+    `iron.jit(design, trace_config=trace_config)` injects it (callabledesign.py:86-90, "When set,
+    trace_config.trace_size is injected as a trace_size compile kwarg"), calls
+    `prog.enable_trace(...)` before `resolve_program()`. `Program.enable_trace` bakes the trace
+    HARDWARE config (which core events, egress route, the trace-buffer runtime_sequence arg) into
+    the MLIR; `trace_config` on `iron.jit` is the HOST half (buffer alloc + read-back), wired by
+    NPUKernel via DefaultNPURuntime.load_and_run. Recipe: mlir-aie's own
+    programming_examples/ml/layernorm/residual_add_iron.py (Program.enable_trace + coretile_events,
+    one core to leave the trace packet flow a free shim egress route) -- connected here to
+    iron.jit's trace_config injection, which that file does not use (it is driven by a Makefile +
+    aiecc directly, not through CallableDesign).
+
+    `trace_config` is REQUIRED (not None): this builder exists to be traced. Use `_build_streamed`
+    for the untraced path. `egress_shim_col` defaults to 1, not `enable_trace`'s own 0 default:
+    Makefile.resaddtr's own comment records column 0 colliding with a design's data DMA ("aie.
+    masterset op targets same destination") on an otherwise-similar single-core design. For THIS
+    design's specific objectFifo set (conv, c_in=128/k=7/c_out=384/T=64, resident_depth=1),
+    `.compile()`-only checks (aiecc, no device) on 2026-09-01 built a real xclbin at BOTH
+    egress_shim_col=0 and =1 with no masterset error -- so the resaddtr collision does not
+    reproduce here, and 1 is kept as the default only because it is the proven-on-device value,
+    not because 0 is known bad for this shape. A clean aiecc compile is necessary, not sufficient:
+    it proves the routing lowers, not that trace packets reach DDR correctly -- that half is
+    still unverified device-side.
+    """
+    compile_flags = _AIE_API_INC + list(compile_flags or [])
+    compile_flags = compile_flags + [
+        f"-DBRICK_INCLUDE_DIGEST={_include_closure_digest(shim, compile_flags)}"]
+    has_resident = resident_len > 0
+    _check_symbol_arity(symbol, shim, 3 if has_resident else 2)
+
+    if has_resident:
+        def design(inp: In, cst: In, out: Out, *, trace_size: CompileTime[int] = 0):
+            in_row = _npty((in_tile,), in_dt)
+            out_row = _npty((out_tile,), out_dt)
+            cst_ty = _npty((resident_len,), resident_dt)
+            in_full = _npty((n_tiles * in_tile,), in_dt)
+            out_full = _npty((n_tiles * out_tile,), out_dt)
+            kern = ExternalFunction(symbol, source_file=str(shim),
+                                    arg_types=[in_row, cst_ty, out_row],
+                                    compile_flags=compile_flags)
+            inf = ObjectFifo(in_row, name="inf")
+            cf = ObjectFifo(cst_ty, name="cf", depth=resident_depth)
+            of = ObjectFifo(out_row, name="of")
+
+            def core(inf, cf, of, kern):
+                ec = cf.acquire(1)
+                for _ in range_(n_tiles):
+                    ei = inf.acquire(1)
+                    eo = of.acquire(1)
+                    kern(ei, ec, eo)
+                    of.release(1)
+                    inf.release(1)
+                cf.release(1)
+
+            worker = Worker(core, fn_args=[inf.cons(), cf.cons(), of.prod(), kern],
+                            stack_size=stack_size)
+            in_tap = TensorTiler2D.group_tiler((n_tiles, in_tile), (1, in_tile), (n_tiles, 1))[0]
+            out_tap = TensorTiler2D.group_tiler((n_tiles, out_tile), (1, out_tile), (n_tiles, 1))[0]
+            cst_tap = TensorTiler2D.group_tiler((1, resident_len), (1, resident_len), (1, 1))[0]
+            def sequence(a, c, o, in_h, cst_h, out_h):
+                in_h.fill(a, in_tap)
+                cst_h.fill(c, cst_tap)
+                out_h.drain(o, out_tap, wait=True)
+
+            rt = Runtime(
+                sequence,
+                [in_full, cst_ty, out_full, inf.prod(), cf.prod(), of.cons()],
+            )
+            prog = Program(iron.get_current_device(), rt, workers=[worker])
+            if trace_size:
+                prog.enable_trace(trace_size=trace_size, workers=[worker],
+                                  egress_shim_col=egress_shim_col,
+                                  coretile_events=coretile_events)
+            return prog.resolve_program()
+        design.__name__ = design.__qualname__ = _design_key(
+            symbol, n_tiles, in_tile, out_tile, resident_len, in_dt, out_dt, resident_dt,
+            compile_flags, resident_depth, stack_size, _shim_digest(shim),
+            "traced", egress_shim_col, tuple(coretile_events or ()))
+        return iron.jit(design, use_cache=_JIT_CACHE, trace_config=trace_config)
+
+    def design(inp: In, out: Out, *, trace_size: CompileTime[int] = 0):
+        in_row = _npty((in_tile,), in_dt)
+        out_row = _npty((out_tile,), out_dt)
+        in_full = _npty((n_tiles * in_tile,), in_dt)
+        out_full = _npty((n_tiles * out_tile,), out_dt)
+        kern = ExternalFunction(symbol, source_file=str(shim),
+                                arg_types=[in_row, out_row],
+                                compile_flags=compile_flags)
+        inf = ObjectFifo(in_row, name="inf")
+        of = ObjectFifo(out_row, name="of")
+
+        def core(inf, of, kern):
+            for _ in range_(n_tiles):
+                ei = inf.acquire(1)
+                eo = of.acquire(1)
+                kern(ei, eo)
+                of.release(1)
+                inf.release(1)
+
+        worker = Worker(core, fn_args=[inf.cons(), of.prod(), kern], stack_size=stack_size)
+        in_tap = TensorTiler2D.group_tiler((n_tiles, in_tile), (1, in_tile), (n_tiles, 1))[0]
+        out_tap = TensorTiler2D.group_tiler((n_tiles, out_tile), (1, out_tile), (n_tiles, 1))[0]
+        def sequence(a, o, in_h, out_h):
+            in_h.fill(a, in_tap)
+            out_h.drain(o, out_tap, wait=True)
+
+        rt = Runtime(sequence, [in_full, out_full, inf.prod(), of.cons()])
+        prog = Program(iron.get_current_device(), rt, workers=[worker])
+        if trace_size:
+            prog.enable_trace(trace_size=trace_size, workers=[worker],
+                              egress_shim_col=egress_shim_col,
+                              coretile_events=coretile_events)
+        return prog.resolve_program()
+    design.__name__ = design.__qualname__ = _design_key(
+        symbol, n_tiles, in_tile, out_tile, resident_len, in_dt, out_dt, resident_dt,
+        compile_flags, stack_size, _shim_digest(shim),
+        "traced", egress_shim_col, tuple(coretile_events or ()))
+    return iron.jit(design, use_cache=_JIT_CACHE, trace_config=trace_config)
+
+
 def _build_rowwise(symbol, shim, m, in_cols, out_cols, const_len, compile_flags,
                    in_dt, out_dt, const_dt, stack_size=None):
     """Rows-of-a-matrix view of `_build_streamed`: one tile is one row.
