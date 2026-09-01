@@ -1062,6 +1062,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "npu-s2"
+version = "0.1.0"
+dependencies = [
+ "npu-xrt",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
 name = "npu-sr"
 version = "0.1.0"
 dependencies = [

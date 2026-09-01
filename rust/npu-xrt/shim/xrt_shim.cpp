@@ -170,6 +170,25 @@ int shim_run_bd8(ShimKernel* k, unsigned int opcode, ShimBo* instr, size_t instr
   )
 }
 
+// Generic xclbin/instr dispatch: (opcode, instr, instr_count, data[0..n_data)). k->kern(...) above
+// needs a compile-time-fixed arg count, so this builds the run explicitly (same set_arg loop
+// shim_run_elf uses) with the (opcode, instr, count) prefix every fixed-arity variant shares.
+int shim_run_kernel(ShimKernel* k, unsigned int opcode, ShimBo* instr, size_t instr_count,
+                    ShimBo* const* data, size_t n_data) {
+  GUARD_INT(
+    xrt::run run(k->kern);
+    run.set_arg(0, opcode);
+    run.set_arg(1, instr->bo);
+    run.set_arg(2, instr_count);
+    for (size_t i = 0; i < n_data; ++i) {
+      run.set_arg(static_cast<int>(3 + i), data[i]->bo);
+    }
+    run.start();
+    run.wait2();
+    return 0;
+  )
+}
+
 // xrt::kernel::operator() constructs a run AND starts it (enqueues the command); the wait is
 // separate. So building the run here = the async "start"; the host returns immediately while the
 // NPU executes. Same arg layout as shim_run_matmul8.
