@@ -45,6 +45,10 @@ TARGETS = [
     "verify_bfp16",
     "verify_cast_quant",
     "verify_rope_lut",
+    # rope-interleaved was in NEITHER list until 2026-09-01, so its do_*() device gate ran
+    # nowhere while its CPU-only __main__ printed PASS -- a green that never touched the NPU.
+    # It is a TARGETS module (has do_rope_interleaved), not a SCRIPT_TARGETS one.
+    "verify_rope_interleaved",
     "verify_lm_head_argmax",
     "verify_moe_topk_router",
     "verify_gatedeltanet",

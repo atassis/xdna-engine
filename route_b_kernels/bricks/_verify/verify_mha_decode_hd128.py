@@ -35,7 +35,7 @@ import numpy as np
 
 HERE = Path(__file__).parent
 sys.path.insert(0, str(HERE))
-import bricklib  # noqa: E402  (reuse _aie_api_include / _design_name; see its docstrings)
+import bricklib  # noqa: E402  (reuse _aie_api_include / _design_key; see its docstrings)
 
 MHA_DIR = (HERE.parent.parent / "mha_decode").resolve()
 MHA_CC = MHA_DIR / "mha_decode.cc"
@@ -100,10 +100,15 @@ def _build_design(n_tiles: int, hd: int, tkv: int):
         return Program(iron.get_current_device(), rt, workers=[worker]).resolve_program()
 
     # Cache-bust on every real input (kernel source + compile flags, via bricklib's own hashing)
-    # PLUS n_tiles, which _design_name cannot see (it only hashes shim text + flags, and n_tiles
-    # is a Python closure baked into the unrolled MLIR, not part of either) -- see bricklib's
-    # `_design_name` docstring for why a stale name silently reruns an old build.
-    base = bricklib._design_name("mha_tile", MHA_CC, compile_flags)
+    # PLUS n_tiles, which neither half of the key can see: n_tiles is a Python closure baked into
+    # the unrolled MLIR, so it is neither source text nor a compile flag. bricklib splits the key
+    # in two -- _include_closure_digest hashes the kernel source and everything it #includes,
+    # _design_key hashes shapes/flags -- and this design is built here rather than through
+    # _build_streamed, so it has to compose both itself. See _design_key's docstring for what a
+    # stale name silently serves.
+    base = bricklib._design_key(
+        "mha_tile", compile_flags,
+        bricklib._include_closure_digest(MHA_CC, compile_flags))
     design.__name__ = design.__qualname__ = f"{base}_hd{hd}_tkv{tkv}_ntiles{n_tiles}"
     return iron.jit(design, use_cache=False)
 

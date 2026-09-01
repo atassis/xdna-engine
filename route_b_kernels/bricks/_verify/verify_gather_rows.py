@@ -6,6 +6,16 @@ resident in f32 (32 KB, see gather_rows.cc's header). The SEMANTIC codebook (n_r
 does not fit this contract in f32 and is explicitly out of scope for contract (a) -- see the
 brick header's CONTRACT CHOSEN section.
 
+SECOND, ADDITIONAL gate below: the SEMANTIC codebook (n_rows=4096) served as 4 resident
+chunks of 1024 rows each -- exactly the shape gated above, unmodified. gather_rows.cc is not
+touched: the driver runs the SAME gather_rows_f32(N_ROWS=1024,...) kernel 4 times, once per
+chunk, with the SAME local-index tile every time (idx % 1024) and only the resident codebook
+DATA differing (rows [c*1024:(c+1)*1024)); the host then does a disjoint SELECT -- for output
+row t, chunk_of[t] = idx_clamped[t] // 1024 is a single value in [0,3], so exactly one chunk's
+row t is kept and the other 3 are discarded, never summed. This is exact by construction (the
+4 row-ranges partition [0,4096) with no overlap), so this gate must be bit-exact too, same as
+the 1024-row gate above.
+
 Streamed rail: indices arrive as GATHER_T_TILE-sized int32 tiles, the codebook is ONE
 resident f32 operand acquired once for the whole stream, gathered rows stream out as
 GATHER_T_TILE x D f32 tiles. A pure gather has zero compute, so rel-L2 vs the numpy golden
@@ -94,3 +104,81 @@ print(f"  idx[4] (neg) -> row 0       : {bool(np.array_equal(got[4], codebook[0]
 print(f"  idx[2]==idx[20] repeat match: {bool(np.array_equal(got[2], got[20]))}")
 assert res["ok"], f"gather_rows device gate failed: {res['status']} rel_l2={res['rel_l2']}"
 print("PASS")
+
+# ============================================================================================
+# SEMANTIC codebook (n_rows=4096), served as 4x already-gated 1024-row chunks. See the module
+# docstring. gather_rows.cc / the shim above are REUSED VERBATIM -- N_ROWS=1024, D=8,
+# T_TILE=16 are identical to the residual-codebook gate, so this is the same compiled kernel
+# shape, only dispatched 4 times against different resident data.
+N_CHUNKS = 4
+N_ROWS_SEM = N_CHUNKS * N_ROWS      # 4096
+assert N_ROWS_SEM == 4096 and N_ROWS_SEM % N_CHUNKS == 0
+
+rng_sem = np.random.default_rng(1)   # distinct stream from the residual codebook's rng above
+codebook_sem = rng_sem.standard_normal((N_ROWS_SEM, D)).astype(np.float32)
+
+# Same edge-case discipline as the residual gate, PLUS every chunk boundary explicitly (1023/
+# 1024, 2047/2048, 3071/3072): a disjoint-select combine is exactly where an off-by-one in
+# chunk_of/local_idx would silently read the wrong chunk's row.
+idx_sem = rng_sem.integers(0, N_ROWS_SEM, size=T).astype(np.int32)
+idx_sem[0] = 0                        # first row, chunk 0
+idx_sem[1] = N_ROWS_SEM - 1           # last row, chunk 3
+idx_sem[2] = idx_sem[20] = 777        # deliberate repeat, different tiles, chunk 0
+idx_sem[3] = N_ROWS_SEM + 50          # out-of-range -> clamp to 4095 -> chunk 3
+idx_sem[4] = -3                       # negative -> clamp to 0 -> chunk 0
+idx_sem[5] = N_ROWS - 1               # 1023, last of chunk 0
+idx_sem[6] = N_ROWS                   # 1024, first of chunk 1
+idx_sem[7] = 2 * N_ROWS - 1           # 2047, last of chunk 1
+idx_sem[8] = 2 * N_ROWS               # 2048, first of chunk 2
+idx_sem[9] = 3 * N_ROWS - 1           # 3071, last of chunk 2
+idx_sem[10] = 3 * N_ROWS              # 3072, first of chunk 3
+
+ref_sem = golden.gather_rows_ref(codebook_sem, idx_sem)   # [T, D], true 4096-row golden
+
+# idx_clamped/local_idx/chunk_of are HOST arithmetic, matching rvq_lookup's own
+# np.clip(idx, 0, size-1) exactly -- computed once, fed identically to all 4 dispatches.
+idx_clamped = np.clip(idx_sem.astype(np.int64), 0, N_ROWS_SEM - 1)
+local_idx = (idx_clamped % N_ROWS).astype(np.int32)   # always in [0, N_ROWS-1]: kernel's own
+                                                        # internal clamp never trips
+chunk_of = (idx_clamped // N_ROWS).astype(np.int64)    # always in [0, N_CHUNKS-1]
+
+chunk_got = []
+for c in range(N_CHUNKS):
+    sub_codebook = codebook_sem[c * N_ROWS:(c + 1) * N_ROWS]
+    sub_ref = golden.gather_rows_ref(sub_codebook, local_idx)   # what THIS chunk's raw
+                                                                  # gather must produce,
+                                                                  # regardless of ownership
+    res_c = bricklib.verify_streamed(
+        name=f"gather_rows_sem_chunk{c}",
+        shim=shim,                          # same generated shim, N_ROWS=1024/D=8/T_TILE=16
+        symbol="gather_rows_f32",
+        in_tiles=local_idx.reshape(N_TILES, T_TILE),   # identical on every chunk dispatch
+        out_tile_numel=T_TILE * D,
+        resident=sub_codebook.reshape(-1),
+        unpack=lambda d: np.asarray(d).reshape(N_TILES * T_TILE, D),
+        golden=sub_ref,
+        gate=GATE,
+        in_dt=np.int32, out_dt=np.float32, resident_dt=np.float32,
+        resident_depth=1,
+    )
+    assert res_c["ok"], f"chunk {c} gate failed: {res_c['status']} rel_l2={res_c['rel_l2']}"
+    chunk_got.append(np.asarray(res_c["got"], np.float32))
+
+# Host disjoint SELECT: for row t, exactly one chunk owns it (chunk_of[t]); the other 3
+# chunks' row t is computed but never read here -- a select, not a sum.
+got_sem = np.empty((T, D), np.float32)
+for t in range(T):
+    got_sem[t] = chunk_got[chunk_of[t]][t]
+
+rel_l2_sem = golden.rel_l2(got_sem, ref_sem)
+print(f"  [semantic 4x1024] device vs golden rel-L2: {rel_l2_sem:.3e}")
+print(f"  idx_sem[3] (oob) -> last row : {bool(np.array_equal(got_sem[3], codebook_sem[N_ROWS_SEM - 1]))}")
+print(f"  idx_sem[4] (neg) -> row 0    : {bool(np.array_equal(got_sem[4], codebook_sem[0]))}")
+print(f"  idx_sem[2]==idx_sem[20] match: {bool(np.array_equal(got_sem[2], got_sem[20]))}")
+for t in (5, 6, 7, 8, 9, 10):
+    ok_b = bool(np.array_equal(got_sem[t], codebook_sem[int(idx_clamped[t])]))
+    print(f"  idx_sem[{t}]={int(idx_sem[t]):5d} chunk boundary row match: {ok_b}")
+    assert ok_b, f"chunk-boundary row mismatch at t={t}, idx={int(idx_sem[t])}"
+assert np.array_equal(got_sem, ref_sem), (
+    f"semantic chunked-gather must be BIT-EXACT vs the 4096-row golden, rel_l2={rel_l2_sem:.3e}")
+print("PASS (semantic 4x1024 chunked)")

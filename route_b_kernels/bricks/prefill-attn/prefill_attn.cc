@@ -450,3 +450,227 @@ void prefill_attn_row(bfloat16 *qm_row, bfloat16 *kv, float *ctx_row) {
 }
 
 } // extern "C"
+
+//===----------------------------------------------------------------------------------------===//
+// prefill_attn_chunk -- CAPACITY EXTENSION for the S2 quantizer post_module transformer
+// (scripts/codec_quantizer_ref.py::rvq_transformer), whose sliding-window attention needs up to
+// RVQ_WINDOW_SIZE=128 visible keys per query (the real captured clip runs T=66 <= window, so
+// window degenerates to plain causal there; a longer clip would exercise the window for real).
+// That is 6-8x prefill_attn_row's SPAD=16 static_assert cap above. RVQ_HEAD_DIM=64 (vs this
+// file's HD=128 default) is a second, independent axis, and unlike SPAD it needs NO new code --
+// Hd is already a template parameter (see prefill_attn_row_impl<Hd,Mq> above); this new template
+// instantiates it at 64.
+//
+// THE MASK NEEDS NO KERNEL CHANGE (re-confirming prefill_attn_row_impl's own "MASK IS DATA"
+// section, which already established that windowed and plain-causal masking are the SAME additive
+// mechanism -- codec_quantizer_ref._causal_window_mask emits the identical 0.0/-1e9 convention as
+// this file's build_causal_mask, just with an extra `k >= q-window+1` lower bound OR'd in on the
+// host side). ONLY the per-call key CAPACITY changes, hence the name.
+//
+// ROUTE CHOSEN: DRIVER-SUPPLIED KEY CHUNKS (flash/online softmax across CALLS), NOT a wider SPAD.
+// SPAD stays 16 == VL here too -- softmax_core<VL>'s own internal `chunks = cols/N` loop has never
+// been exercised past chunks=1 by any device-green run this file's own history can point to (every
+// prior prefill_attn device pass ran at cols=SPAD=VL=16), and this codebase's toolchain has a
+// documented history of kernel-internal loops and per-iteration lane-extract-then-scalar-op
+// constructs behaving inconsistently under this Peano pin -- sometimes clean, sometimes not, with
+// no reliable predictor short of a device run this task cannot make. So: do not call softmax_core
+// with cols>16 at all. Instead, each call processes exactly ONE query row against exactly ONE
+// VL=16-key CHUNK (the only softmax-adjacent shape this brick has ever gated green), and capacity
+// widens by calling MORE TIMES -- volume supplied by the WORKER's Python-unrolled dispatch loop
+// (`for t in range(n_chunks): kern(...)`), the same mechanism route_b_kernels/mha_decode/
+// mha_decode.cc's own flash tiling uses and that verify_mha_decode_hd128.py gates device-green at
+// S=100 keys via 4 tiles of TKV=32. That precedent's ALGORITHM (running max/denom/accumulator,
+// rescaled per tile) is reused here; its literal function is not, because HD, GQA and the
+// mask-as-data convention all differ (see prefill_attn_row_impl's header for why GQA/mask already
+// diverge from mha_decode.cc's shape).
+//
+// softmax_core ITSELF IS NOT CALLED HERE, deliberately. It performs a full 3-pass NORMALIZE
+// (divide by that call's own row sum) -- correct for a chunk that IS the whole row, wrong for one
+// chunk of many, which needs the UNNORMALIZED per-key exp() weights so the running sum can still
+// be rescaled by later chunks. So this function reuses only the primitive softmax_core is itself
+// built from -- `route_b_bricks::exp2_v<N>` (softmax.cc, exposed at namespace scope for exactly
+// this kind of reuse) -- and writes its own online-softmax merge, vectorized over one VL=16-key
+// chunk at a time: local max (`aie::reduce_max`, unnormalized `exp2_v`, local sum
+// (`aie::reduce_add`), then the textbook block-flash-attention merge (Dao et al.) into the running
+// (m, l, acc) state -- the same merge algebra mha_decode.cc's header documents, applied per
+// VL-key BLOCK instead of mha_decode's per-SCALAR-key granularity (a coarser, standard tiling, not
+// a different algorithm).
+//
+// NO STATIC L1 STATE, UNLIKE mha_decode.cc. mha_decode.cc keeps its online-softmax state (g_m,
+// g_l, g_acc) in core-local `static`s because a core tile has only 2 INPUT DMA channels (see this
+// file's own DMA CHANNELS note above) and there was no channel left for an explicit state buffer.
+// This kernel reuses the SAME 2-input budget (qm_row, kv_chunk) but gives the state buffer its own
+// EXPLICIT, DMA-visible identity by overloading the OUTPUT channel instead of adding a fourth:
+// `ctx_row` is sized [Hd+2] f32 (Hd for the accumulator, +2 for the running max/sum scalars) and
+// held RESIDENT across one row's whole chunk sweep by the worker (acquired once, released once --
+// the exact same resident-operand mechanism `kv` already uses in prefill_attn_row_impl above, just
+// applied to the output side). Every non-final call reads its own prior state back out of that
+// same physical buffer and writes the updated state into it; the final call normalizes
+// ctx_row[0:Hd] in place. No kernel `static` of any kind is used. (Whether the physical
+// RESIDENT-ObjectFifo mechanism is itself immune to the "green twice, unchanged source, then NaN"
+// failure a `static` caused elsewhere in this catalog is NOT proven here -- it is untested,
+// device-free authorship, like everything else in this function; it is chosen because it is the
+// literal mechanism the rest of this file already relies on for `kv`, not a novel one.)
+//
+// PER-ITERATION LANE-EXTRACT HAZARD (documented, not re-derived here in full): this Peano pin has
+// shown lane-extract + SCALAR ARITHMETIC + broadcast, done PER-ITERATION INSIDE A LOOP, to
+// occasionally miscompile the first iteration -- and, separately and just as measured, to be
+// perfectly fine (mha_decode.cc's own per-key online-softmax loop carries exactly that shape and
+// is device-green). This function avoids adding a NEW instance of the risky form: the one
+// extract-from-a-vector site in its V-accumulate loop (`p_v.get(j)`) feeds a broadcast with NO
+// scalar arithmetic in between (the measured-safe variant of the shape); `corr`'s own
+// extract-then-scalar-arithmetic happens ONCE per call, outside any loop (safer than
+// mha_decode.cc's own already-green per-key placement, not equal risk); and the per-key dot-product
+// reduction (`aie::reduce_add(...) * SCALE`, stored to a scalar array slot) reuses
+// prefill_attn_row_impl's own Pass 1a shape verbatim, already proven at 8.540e-08. None of this
+// substitutes for a device run.
+//
+// alignas(64) / L1 FOOTPRINT: see the report accompanying this change for the arithmetic (Hd=64,
+// per-chunk buffers, and the widened ctx_row/state buffer against the 0xD00 stack reservation
+// prefill_attn_row_impl already needs at Hd=128) -- not re-derived in-file to avoid a comment that
+// goes stale the moment the numbers are re-measured; the report is the source of truth for the
+// figures, this file only fixes the shapes they describe.
+static constexpr float LOG2E = 1.4426950408889634f; // e^x = 2^(x*LOG2E); no libm on aie2p.
+
+// Scalar 2^x via the vector primitive (lane 0), mirroring mha_decode.cc's own `exp_scalar` helper
+// exactly except built on `exp2_v` (f32 throughout) instead of `aie::exp2<bfloat16>` (this file's
+// existing softmax include already pulls exp2_v in, so no precision detour through bf16 is
+// needed). Called OUTSIDE any per-iteration loop below -- see PER-ITERATION LANE-EXTRACT HAZARD.
+static inline float exp2_scalar(float x) {
+  aie::vector<float, VL> v = aie::broadcast<float, VL>(x);
+  aie::vector<float, VL> e = route_b_bricks::exp2_v<VL>(v);
+  return e.get(0);
+}
+
+#ifndef PREFILL2_HD
+#define PREFILL2_HD 64 // RVQ_HEAD_DIM (scripts/codec_quantizer_ref.py) -- the S2 quantizer's
+                        // post_module transformer has no GQA, so unlike PREFILL_HD there is no
+                        // separate kv-head count anywhere in this file for this path either.
+#endif
+
+#ifndef PREFILL2_NCHUNKS
+#define PREFILL2_NCHUNKS 8 // ceil(RVQ_WINDOW_SIZE / VL) = ceil(128/16) = 8, the window-capacity
+                            // default. A shorter real context (e.g. the T=66 captured clip, 5
+                            // chunks) is a SEPARATE build with this macro set to 5 -- NChunks is
+                            // compile-time (dispatch overhead dominates at these row counts, same
+                            // reasoning prefill_attn_row_impl's PARAMETERIZATION section gives for
+                            // HD/M), never a runtime branch. Rows/chunks beyond the real context
+                            // length are carried entirely by the host-built mask (all -1e9), the
+                            // same padding convention prefill_attn_row_impl's PADDING section uses
+                            // for M<SPAD -- no kernel-side knowledge of the real length is needed.
+#endif
+
+// ONE QUERY ROW, ONE VL=16-KEY CHUNK, PER CALL -- see the header above for why this is the whole
+// design. `chunk_idx` is a per-call literal, Python-unrolled at MLIR-generation time by the
+// worker's `for t in range(NChunks)` (never a host-runtime-computed value) -- the same mechanism
+// mha_decode_iron.py's core_body already uses for its own `tile_idx`, proven device-green there.
+template <int Hd, int NChunks>
+static void prefill_attn_chunk_impl(const bfloat16 *restrict qm_row, const bfloat16 *restrict kv_chunk,
+                                    float *restrict state, int32_t chunk_idx) {
+  event0();
+  static_assert(Hd % VL == 0, "Hd must be a multiple of VL=16");
+  static_assert(NChunks >= 1, "must process at least one key chunk");
+  constexpr int HdVecs = Hd / VL;
+  constexpr float SCALE = 1.0f / ct_sqrt(static_cast<float>(Hd));
+
+  const bfloat16 *q_row = qm_row;           // [Hd]
+  const bfloat16 *mask_chunk = qm_row + Hd; // [VL], additive: 0=visible, -1e9=masked (see header)
+
+  const bfloat16 *K = kv_chunk;           // [VL, Hd] -- this chunk's VL keys
+  const bfloat16 *V = kv_chunk + VL * Hd; // [VL, Hd] -- this chunk's VL values
+
+  // state layout: state[0:Hd) = running V-weighted accumulator; state[Hd] = running max m;
+  // state[Hd+1] = running sum l. RESIDENT across this row's whole chunk sweep (see header NO
+  // STATIC L1 STATE) -- reset unconditionally on chunk 0, mirroring mha_decode.cc's own
+  // tile_idx==0 reset, which likewise never trusts incoming buffer contents on the first tile.
+  float m_old, l_old;
+  if (chunk_idx == 0) {
+    for (int vi = 0; vi < HdVecs; vi++)
+      aie::store_v(state + vi * VL, aie::zeros<float, VL>());
+    m_old = -3.0e38f;
+    l_old = 0.0f;
+  } else {
+    m_old = state[Hd];
+    l_old = state[Hd + 1];
+  }
+
+  // Pass 1: masked scores for this chunk's VL=16 keys -- identical shape to
+  // prefill_attn_row_impl's Pass 1a/1b above (reused verbatim, already proven at 8.540e-08), just
+  // always exactly VL real keys here (no j>=Mq padding branch needed: a chunk beyond the row's
+  // real key count is masked WHOLESALE by mask_chunk, same "mask is data" mechanism).
+  alignas(64) float score[VL];
+  for (int j = 0; j < VL; j++) {
+    const bfloat16 *kj = K + j * Hd;
+    aie::accum<accfloat, VL> acc = aie::zeros<accfloat, VL>();
+    for (int vi = 0; vi < HdVecs; vi++)
+      acc = aie::mac(acc, aie::load_v<VL>(q_row + vi * VL), aie::load_v<VL>(kj + vi * VL));
+    score[j] = aie::reduce_add(acc.to_vector<float>()) * SCALE;
+  }
+  {
+    aie::accum<accfloat, VL> mask_acc;
+    mask_acc.from_vector(aie::load_v<VL>(mask_chunk));
+    aie::vector<float, VL> score_v = aie::load_v<VL>(score);
+    aie::store_v(score, aie::add(score_v, mask_acc.to_vector<float>()));
+  }
+
+  // Pass 2: chunk-local max/sum, then the running (m, l) merge -- block-flash-attention algebra,
+  // same shape mha_decode.cc documents per single key, applied here per VL-key block.
+  const float m_local = aie::reduce_max(aie::load_v<VL>(score));
+  const float m_new = m_local > m_old ? m_local : m_old;
+  const float corr = exp2_scalar((m_old - m_new) * LOG2E); // ~1.0 on the row's first real chunk
+
+  aie::vector<float, VL> p_v = route_b_bricks::exp2_v<VL>(aie::mul(
+      aie::sub(aie::load_v<VL>(score), aie::broadcast<float, VL>(m_new)),
+      aie::broadcast<float, VL>(LOG2E)));
+  const float l_local = aie::reduce_add(p_v);
+  const float l_new = l_old * corr + l_local;
+
+  // Pass 3: acc = acc*corr + sum_j p_v[j]*V[j]. `corr` rescales the INCOMING accumulator once (on
+  // this chunk's first key, j==0); the remaining VL-1 keys of this chunk accumulate at identity --
+  // same shape prefill_attn_row_impl's own Pass 3 already uses with corr pinned to 1.0, corr here
+  // is simply no longer pinned. `p_v.get(j)` extracts a lane and feeds it straight to
+  // `aie::broadcast` with NO scalar arithmetic in between -- see header PER-ITERATION
+  // LANE-EXTRACT HAZARD for why that distinction is deliberate.
+  aie::vector<float, VL> corr_v = aie::broadcast<float, VL>(corr);
+  aie::vector<float, VL> one_v = aie::broadcast<float, VL>(1.0f);
+  for (int j = 0; j < VL; j++) {
+    const bfloat16 *vj = V + j * Hd;
+    aie::vector<float, VL> pj = aie::broadcast<float, VL>(p_v.get(j));
+    for (int vi = 0; vi < HdVecs; vi++) {
+      aie::accum<accfloat, VL> va;
+      va.from_vector(aie::load_v<VL>(vj + vi * VL)); // bf16 -> f32 widen
+      aie::vector<float, VL> acc_old = aie::load_v<VL>(state + vi * VL);
+      aie::accum<accfloat, VL> t = aie::mul(acc_old, j == 0 ? corr_v : one_v);
+      t = aie::mac(t, pj, va.to_vector<float>());
+      aie::store_v(state + vi * VL, t.to_vector<float>());
+    }
+  }
+
+  state[Hd] = m_new;
+  state[Hd + 1] = l_new;
+
+  // Finalize on the row's last chunk: normalize the accumulator in place. Host reads only
+  // state[0:Hd] as the row's context; state[Hd:Hd+2] are left as (unread) scratch.
+  if (chunk_idx == NChunks - 1) {
+    const float inv = 1.0f / l_new;
+    aie::vector<float, VL> inv_v = aie::broadcast<float, VL>(inv);
+    for (int vi = 0; vi < HdVecs; vi++) {
+      aie::vector<float, VL> a = aie::load_v<VL>(state + vi * VL);
+      aie::store_v(state + vi * VL, aie::mul(a, inv_v).to_vector<float>());
+    }
+  }
+  event1();
+}
+
+extern "C" {
+
+// One call = one query ROW against one VL=16-key CHUNK -- see the header above. qm_row: [HD+VL]
+// bf16, [q_row (HD) | mask_chunk (VL)] packed. kv_chunk: [VL,HD] K | [VL,HD] V bf16 (this chunk's
+// 16 keys/values). state: [HD+2] f32, RESIDENT across one row's whole NChunks-call sweep (see
+// header NO STATIC L1 STATE) -- read/written every call, normalized into the true answer on the
+// last call. chunk_idx: 0-based, Python-unrolled per call site (never host-runtime-supplied).
+void prefill_attn_chunk(bfloat16 *qm_row, bfloat16 *kv_chunk, float *state, int32_t chunk_idx) {
+  prefill_attn_chunk_impl<PREFILL2_HD, PREFILL2_NCHUNKS>(qm_row, kv_chunk, state, chunk_idx);
+}
+
+} // extern "C"

@@ -64,6 +64,7 @@ import window_driver as wd  # noqa: E402
 import stage_shapes as ss  # noqa: E402
 import gguf_extract as gx  # noqa: E402
 import codec_decoder_ref as R  # noqa: E402
+import decoder_chain as dc  # noqa: E402
 
 GATE = 3e-2
 V_FINAL = int(os.environ.get("V_FINAL", "128"))
@@ -194,33 +195,8 @@ print(f"\nV_FINAL={V_FINAL}  backward-solved required lengths: head_in(latent)={
 print(f"latent window: [{S}, {S + L_head}) of {latent_len}")
 
 
-STAGE_PLAN = {1: ss.plan(1), 2: ss.plan(2), 3: ss.plan(3),
-              4: dict(up_ci_chunk=None, res_ci_chunk=None, resident_depth=2)}
-
-
-def run_stage(x, stage, suffix):
-    """One full decoder stage (upsample + 3 residual units) via window_driver -- the exact same
-    sequence verify_stage123.py/verify_stage4_block.py run, just parameterized over `x` so it can be
-    called on EITHER the true-fed or device-chained input."""
-    p = f"{PREFIX}.model.{stage}"
-
-    def gg(name):
-        return g(f"{p}.{name}")
-
-    _, _, k, stride = ss.stage_shape(stage)
-    plan = STAGE_PLAN[stage]
-    up = wd.upsample_unfused(x, gg("block.0.alpha").reshape(-1), gg("block.1.conv.weight"),
-                             gg("block.1.conv.bias").reshape(-1), stride, f"s{stage}up_{suffix}",
-                             ci_chunk=plan["up_ci_chunk"], resident_depth=plan["resident_depth"])
-    cur = up
-    for i, (sub, dil) in enumerate((("block.2", 1), ("block.3", 3), ("block.4", 9))):
-        wts = (gg(f"{sub}.block.0.alpha").reshape(-1), gg(f"{sub}.block.1.conv.weight"),
-               gg(f"{sub}.block.1.conv.bias").reshape(-1), gg(f"{sub}.block.2.alpha").reshape(-1),
-               gg(f"{sub}.block.3.conv.weight"), gg(f"{sub}.block.3.conv.bias").reshape(-1))
-        cur = wd.residual_unit(cur, wts, dil, f"s{stage}u{i}_{suffix}",
-                               ci_chunk=plan["res_ci_chunk"], resident_depth=plan["resident_depth"])
-    return cur
-
+# run_head/run_stage/run_tail live in decoder_chain.py now (extracted so generate_wav.py's
+# whole-stream generation reuses exactly this composition instead of a second copy of it).
 
 # =====  forward pass: head, then stages 1-4 chained + iso, then tail  ==============================
 wd.reset_stats()
@@ -236,9 +212,7 @@ def phase(name):
 results = {}     # label -> rel-L2, for the final summary table
 
 z_window = np.ascontiguousarray(z_full[:, S:S + L_head])
-head_dev = wd.conv(z_window, g(f"{PREFIX}.model.0.conv.weight"),
-                   g(f"{PREFIX}.model.0.conv.bias").reshape(-1), 7, 1, "head",
-                   ci_chunk=ss.head_plan()["ci_chunk"], resident_depth=ss.head_plan()["resident_depth"])
+head_dev = dc.run_head(z_window, g)
 phase("head")
 
 P = [None] * 6
@@ -255,9 +229,9 @@ for stage in (1, 2, 3, 4):
         f"P[{stage}]={P[stage]} runs past TRUE_STREAM[{stage - 1}] (len "
         f"{TRUE_STREAM[stage - 1].shape[1]}); widen the dump or lower V_FINAL")
 
-    chain_out = run_stage(chain, stage, f"s{stage}chain")
+    chain_out = dc.run_stage(chain, stage, g, f"s{stage}chain")
     phase(f"stage{stage} chain")
-    iso_out = run_stage(iso_in, stage, f"s{stage}iso")
+    iso_out = dc.run_stage(iso_in, stage, g, f"s{stage}iso")
     phase(f"stage{stage} iso")
 
     assert chain_out.shape == iso_out.shape, (
@@ -284,14 +258,10 @@ for stage in (1, 2, 3, 4):
 iso_tail_in = TRUE_STREAM[4][:, P[5]:P[5] + chain.shape[1]].astype(np.float32)
 assert iso_tail_in.shape == chain.shape
 
-chain_tail_snake = wd.snake(chain, alpha_tail, "tailsnake_chain")
-chain_tail_raw = wd.conv(chain_tail_snake, w_tail, b_tail, 7, 1, "tailconv_chain")
-chain_audio = np.tanh(chain_tail_raw.astype(np.float64)).astype(np.float32)
+chain_audio = dc.run_tail(chain, g, "_chain")
 phase("tail chain")
 
-iso_tail_snake = wd.snake(iso_tail_in, alpha_tail, "tailsnake_iso")
-iso_tail_raw = wd.conv(iso_tail_snake, w_tail, b_tail, 7, 1, "tailconv_iso")
-iso_audio = np.tanh(iso_tail_raw.astype(np.float64)).astype(np.float32)
+iso_audio = dc.run_tail(iso_tail_in, g, "_iso")
 phase("tail iso")
 
 P_audio = P[5] + CTX_TAIL
