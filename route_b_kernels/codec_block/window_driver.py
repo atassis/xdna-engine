@@ -58,8 +58,46 @@ def reset_stats():
 
 _DESIGNS = {}
 
+# export_codec_artifacts.py sets BUILD_ONLY=True to walk the real op graph (via decoder_chain.py)
+# and collect every design it builds, without a device or a dispatch anywhere in this module.
+# _BUILD_LOG records (name, key, design, op_meta) in build order, once per NEW entry in _DESIGNS --
+# the exact set of distinct compiled artifacts the Python path needs.
+BUILD_ONLY = False
+_BUILD_LOG = []
 
-def _run(name, shim_text, symbol, tiles, out_numel, resident, flags=None, resident_depth=2):
+
+def _get_design(name, shim_text, symbol, n_tiles, in_tile, out_numel, resident_len,
+                flags=None, resident_depth=2, op_meta=None):
+    """Build (memoised) the CallableDesign for these exact inputs -- the half of `_run` that has
+    nothing to do with dispatch, so it can be driven with no device and no real tensors.
+
+    `op_meta` is a free-form dict the caller attaches for its own bookkeeping (op kind, k,
+    dilation/stride, channel counts, ...); it rides along in `_BUILD_LOG` and is never part of the
+    cache key -- two calls that differ only in op_meta still hit the same design, as they must.
+
+    The shim file is named from `symbol`, not `name`: two designs can share a `name` (conv()'s
+    first-chunk-with-add vs later-chunks-without-add reuse the same tag/name, only the symbol
+    differs) but `symbol` is exactly what makes them distinct designs, so it is what has to stay
+    collision-free on disk. A design's generator re-reads this path lazily, at whatever moment
+    something first calls it or .compile()s it -- naming by `name` let a later design silently
+    overwrite an earlier one's still-uncompiled shim before that read happened.
+    """
+    shim = bricklib.GEN / f"{symbol}_shim.cc"
+    shim.write_text(shim_text)
+    key = (symbol, shim_text, n_tiles, in_tile, out_numel, resident_len,
+           tuple(flags or ()), resident_depth)
+    design = _DESIGNS.get(key)
+    if design is None:
+        design = bricklib._build_streamed(
+            symbol, shim, n_tiles, in_tile, out_numel, resident_len, flags,
+            np.float32, np.float32, (np.float32 if resident_len else None), resident_depth)
+        _DESIGNS[key] = design
+        _BUILD_LOG.append((name, key, design, op_meta or {}))
+    return design
+
+
+def _run(name, shim_text, symbol, tiles, out_numel, resident, flags=None, resident_depth=2,
+         op_meta=None):
     """Dispatch one window. BUILD ONCE per design, then reuse it for every later window.
 
     This used to call bricklib.verify_streamed, which is a GATE: it constructs a fresh design,
@@ -73,20 +111,19 @@ def _run(name, shim_text, symbol, tiles, out_numel, resident, flags=None, reside
     The design depends only on the shapes, dtypes, flags and kernel source -- never on the window
     offset or the data -- so it is memoised on exactly those. The golden comparison and the
     run2run check stay where they belong, in the verify_* scripts.
+
+    BUILD_ONLY (export_codec_artifacts.py) skips the device tensors and returns zeros of the
+    right shape, so the caller graph keeps walking forward through every later op.
     """
-    shim = bricklib.GEN / f"wd_{name}_shim.cc"
-    shim.write_text(shim_text)
     tiles = np.ascontiguousarray(np.asarray(tiles, np.float32))
     n_tiles, in_tile = tiles.shape
     resident_len = 0 if resident is None else int(np.asarray(resident).size)
-    key = (symbol, shim_text, n_tiles, in_tile, out_numel, resident_len,
-           tuple(flags or ()), resident_depth)
-    design = _DESIGNS.get(key)
-    if design is None:
-        design = bricklib._build_streamed(
-            symbol, shim, n_tiles, in_tile, out_numel, resident_len, flags,
-            np.float32, np.float32, (np.float32 if resident_len else None), resident_depth)
-        _DESIGNS[key] = design
+    design = _get_design(name, shim_text, symbol, n_tiles, in_tile, out_numel, resident_len,
+                         flags, resident_depth, op_meta)
+
+    if BUILD_ONLY:
+        _stats["dispatches"] += 1
+        return np.zeros((n_tiles, out_numel), np.float32)
 
     in_t = bricklib.iron.tensor(tiles.reshape(-1), dtype=np.float32, device="npu")
     out_t = bricklib.iron.zeros((n_tiles * out_numel,), dtype=np.float32, device="npu")
@@ -118,7 +155,8 @@ def snake(x, alpha, tag):
         tiles = np.zeros((C, T + 1), np.float32)
         tiles[:, :n] = x[:, o:o + n]
         tiles[:, T] = alpha
-        got = _run(f"snake_{tag}", shim_text, f"wd_snake_{tag}", tiles, T, None)
+        got = _run(f"snake_{tag}", shim_text, f"wd_snake_{tag}", tiles, T, None,
+                   op_meta=dict(kind="snake", tag=tag, C=C, T=T))
         out[:, o:o + n] = got.reshape(C, T)[:, :n]
         _stats["computed"] += C * T
         _stats["useful"] += C * n
@@ -163,14 +201,18 @@ def conv(x, w, bias, k, dilation, tag, add=None, ci_chunk=None, resident_depth=2
         first = (c0 == 0)
         out += _conv_chunk(xc, wc, bias if first else np.zeros(c_out, np.float32),
                            k, dilation, f"{tag}_k{ci_chunk}",
-                           add=(add if first else None), resident_depth=resident_depth)
+                           add=(add if first else None), resident_depth=resident_depth,
+                           c_in_total=c_in)
     return out
 
 
-def _conv_chunk(x, w, bias, k, dilation, tag, add=None, resident_depth=2):
+def _conv_chunk(x, w, bias, k, dilation, tag, add=None, resident_depth=2, c_in_total=None):
     """One input-channel chunk of `conv`. Same windowing; the tag is shared across chunks so they
-    all reuse a single compiled design."""
+    all reuse a single compiled design. `c_in_total` is the FULL (pre-chunk) input channel count,
+    carried only for op_meta -- callers outside `conv()` leave it None and it falls back to this
+    chunk's own width (i.e. "unchunked")."""
     c_in, L = x.shape
+    c_in_total = c_in if c_in_total is None else c_in_total
     c_out = w.shape[0]
     ctx = (k - 1) * dilation
     M = L - ctx
@@ -210,7 +252,11 @@ def _conv_chunk(x, w, bias, k, dilation, tag, add=None, resident_depth=2):
             if add is not None:
                 seg = add[co, o:o + n]
                 tiles[co, c_in * k + 1 + ctx:c_in * k + 1 + ctx + len(seg)] = seg
-        got = _run(f"conv_{tag}", shim_text, sym, tiles, T, win, resident_depth=resident_depth)
+        got = _run(f"conv_{tag}", shim_text, sym, tiles, T, win, resident_depth=resident_depth,
+                   op_meta=dict(kind="conv", tag=tag, k=k, dilation=dilation, ctx=ctx,
+                                c_in=c_in, c_in_total=c_in_total, c_out=c_out,
+                                has_add=(add is not None), T=T, step=step,
+                                vector=bool(CONV_VEC)))
         out[:, o:o + n] = got.reshape(c_out, T)[:, ctx:ctx + n]
         _stats["computed"] += c_out * T
         _stats["useful"] += c_out * n
@@ -272,7 +318,9 @@ def upsample(x, alpha, w, bias, stride, tag, t=UPSAMPLE_T):
         resident = np.concatenate([alpha, win.reshape(-1)]).astype(np.float32)
         got = _run(f"up_{tag}", shim_text, f"wd_up_{tag}", tiles, t * stride, resident,
                    flags=[f"-DSTAGE_C_IN={c_in}", f"-DSTAGE_T={t}",
-                          f"-DSTAGE_K={k}", f"-DSTAGE_STRIDE={stride}"])
+                          f"-DSTAGE_K={k}", f"-DSTAGE_STRIDE={stride}"],
+                   op_meta=dict(kind="upsample_fused", tag=tag, k=k, stride=stride, ctx=ctx,
+                                c_in=c_in, c_in_total=c_in, c_out=c_out, t=t, step=step))
         got = got.reshape(c_out, t * stride)
         out[:, o * stride:(o + n) * stride] = got[:, ctx * stride:(ctx + n) * stride]
         _stats["computed"] += c_out * t * stride
@@ -316,14 +364,17 @@ def conv_transpose(x, w, bias, stride, tag, t=UPSAMPLE_T, ci_chunk=None, residen
         wc[:cs] = w[c0:c0 + cs]
         first = (c0 == 0)
         out += _conv_transpose_chunk(xc, wc, bias if first else np.zeros(c_out, np.float32),
-                                     stride, f"{tag}_k{ci_chunk}", t, resident_depth)
+                                     stride, f"{tag}_k{ci_chunk}", t, resident_depth,
+                                     c_in_total=c_in)
     return out
 
 
-def _conv_transpose_chunk(x, w, bias, stride, tag, t, resident_depth):
+def _conv_transpose_chunk(x, w, bias, stride, tag, t, resident_depth, c_in_total=None):
     """One input-channel chunk of `conv_transpose`. Same windowing conv_transpose always used; the
-    tag carries ci_chunk so every chunk of the same width reuses one compiled design."""
+    tag carries ci_chunk so every chunk of the same width reuses one compiled design.
+    `c_in_total`: see `_conv_chunk`'s docstring -- same convention, carried only for op_meta."""
     c_in, L = x.shape
+    c_in_total = c_in if c_in_total is None else c_in_total
     k = 2 * stride
     ctx = -(-(k - 1) // stride)
     c_out = w.shape[1]
@@ -349,7 +400,9 @@ def _conv_transpose_chunk(x, w, bias, stride, tag, t, resident_depth):
         take = min(t, L - o)
         win[:, :take] = x[:, o:o + take]
         got = _run(f"ct_{tag}", shim_text, f"wd_ct_{tag}", tiles, t * stride, win,
-                   resident_depth=resident_depth)
+                   resident_depth=resident_depth,
+                   op_meta=dict(kind="conv_transpose", tag=tag, k=k, stride=stride, ctx=ctx,
+                                c_in=c_in, c_in_total=c_in_total, c_out=c_out, t=t, step=step))
         got = got.reshape(c_out, t * stride)
         out[:, o * stride:(o + n) * stride] = got[:, ctx * stride:(ctx + n) * stride]
         _stats["computed"] += c_out * t * stride
