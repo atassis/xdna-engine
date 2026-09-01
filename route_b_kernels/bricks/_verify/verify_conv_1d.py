@@ -151,5 +151,73 @@ for tensor, k, dilation in VEC_UNITS:
           f"range [{got.min():+.4f}, {got.max():+.4f}]  {res['status']}")
     ok = ok and res["ok"]
 
+
+# ADDITIVE: same VEC_UNITS tensors/shapes, now against conv_1d_causal_core_vec_acc<16, NACC> --
+# the multi-accumulator form that splits the c_in axis into NACC independent lanes to break the
+# single serial accumulator recurrence conv_1d_causal_core_vec pays for (see that kernel's own
+# comment in conv_1d.cc for the measured cause: an unpipelined loop plus a ~6-cycle-latency
+# emulated f32 vector MAC, per llvm-aie's AIE2PGenSchedule.td). Swept at NACC 2/4/8 -- the only
+# values the kernel accepts (it static_asserts NACC a power of two) -- so device numbers can settle
+# what compile-time evidence alone could not: NACC=2 compiles with ZERO vector-register spill
+# (frame stays at the single-accumulator kernel's own 64 bytes), while NACC=4 and NACC=8 both spill
+# 8 vector (not accfloat) registers into a 704- and 960-byte frame respectively, INSIDE the hot
+# (oc, ci0, j) loop (confirmed via -fstack-size-section + llvm-readelf and reading the compiled
+# asm for "Folded Spill/Reload" tags on vst/vlda) -- more parallelism bought with register pressure
+# whose net effect on cycles is unmeasured. All four units have c_in=96, divisible by 2/4/8, so
+# this gate does NOT exercise the remainder-channel path (c_in % NACC != 0); that path is unverified
+# by any device run and rests on code inspection + the shared conv1d_vec_acc_tap logic only.
+ACC_UNITS = [("c.decoder.model.4.block.2.block.1.conv", 7, 1),
+             ("c.decoder.model.4.block.3.block.1.conv", 7, 3),
+             ("c.decoder.model.4.block.4.block.1.conv", 7, 9),
+             ("c.decoder.model.4.block.2.block.3.conv", 1, 1)]
+NACC_VALUES = (2, 4, 8)
+
+for nacc in NACC_VALUES:
+    for tensor, k, dilation in ACC_UNITS:
+        w = gx.load(str(GGUF), f"{tensor}.weight").astype(np.float32)
+        bias = gx.load(str(GGUF), f"{tensor}.bias").astype(np.float32).reshape(-1)
+        assert w.shape == (C_OUT, C_IN, k), f"{tensor}: weight shape {w.shape}"
+
+        ref = golden.conv_1d_causal_ref(x, w, bias, dilation)
+
+        tile_w = C_IN * k + 1
+        tiles = np.zeros((C_OUT, tile_w), np.float32)
+        for co in range(C_OUT):
+            tiles[co, :C_IN * k] = w[co].reshape(-1)
+            tiles[co, C_IN * k] = bias[co]
+
+        _cb = int(time.time() * 1000) % 10**9
+        shim = bricklib.GEN / f"conv_1d_acc{nacc}_d{dilation}_k{k}_shim.cc"
+        shim.write_text(
+            f"// AUTO-GENERATED verify shim for the conv-1d MULTI-ACCUMULATOR brick, NACC {nacc} "
+            f"dilation {dilation} k {k}. cb {_cb}\n"
+            "#include <stdint.h>\n"
+            f'#include "{BRICK / "conv_1d.cc"}"\n'
+            f'extern "C" void conv_1d_acc{nacc}_verify_d{dilation}_k{k}(float *wtile, '
+            f'float *resident, float *out) {{\n'
+            f"  route_b_bricks::conv_1d_causal_core_vec_acc<16, {nacc}>(resident, wtile, "
+            f"wtile[{C_IN * k}], out,\n"
+            f"                                                          {C_IN}, {k}, {T}, {dilation});\n"
+            "}\n"
+        )
+
+        res = bricklib.verify_streamed(
+            name=f"conv_1d_acc{nacc}_dil{dilation}_k{k}",
+            shim=shim,
+            symbol=f"conv_1d_acc{nacc}_verify_d{dilation}_k{k}",
+            in_tiles=tiles,
+            out_tile_numel=T,
+            resident=resident,
+            unpack=lambda d: np.asarray(d).reshape(C_OUT, T),
+            golden=ref,
+            gate=GATE,
+            in_dt=np.float32, out_dt=np.float32, resident_dt=np.float32,
+        )
+        got = np.asarray(res["got"], np.float32)
+        print(f"  ACC NACC={nacc} dilation {dilation} k={k}: rel-L2 {res['rel_l2']:.3e}  "
+              f"max abs err {float(np.max(np.abs(got - ref))):.3e}  "
+              f"range [{got.min():+.4f}, {got.max():+.4f}]  {res['status']}")
+        ok = ok and res["ok"]
+
 assert ok, "conv_1d device gate failed"
 print("PASS")
