@@ -1,5 +1,6 @@
 //! Full GigaAM-v3 encoder: subsampling front-end + N stacked Conformer blocks.
-//! Mirrors `npu_asr/encoder.py`.
+//! Ported from `npu_asr/encoder.py` (RETIRED 2026-06-11); structure deliberately diverges -- see
+//! npu_asr/RETIRED.md. Do not restore parity: that reintroduces per-op dispatch.
 
 use std::path::Path;
 use std::rc::Rc;

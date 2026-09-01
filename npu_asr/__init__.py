@@ -1,4 +1,6 @@
-"""npu_asr — an open GigaAM-v3 Conformer encoder on the AMD XDNA2 NPU (Route B).
+"""RETIRED 2026-09-01 -- provenance only, not a spec. See npu_asr/RETIRED.md.
+
+npu_asr — an open GigaAM-v3 Conformer encoder on the AMD XDNA2 NPU (Route B).
 
 Layering (each op is host/NPU-swappable; fused ObjectFifo is a future backend):
   config   — model dims + xclbin/artifact paths
