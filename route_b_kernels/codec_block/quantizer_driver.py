@@ -294,13 +294,16 @@ def _rope_head(x_head, positions, tag):
         pos_pad[:n] = positions[o:o + n]
         cossin = _rope_cossin(pos_pad, Hd)
 
-        sym = f"qd_rope_{_safe(tag)}_{o}"
+        # NOT per-offset: the body is identical across windows and the position data
+        # arrives at runtime in `cossin`, so a per-offset symbol/name only splits the
+        # design key and forces a rebuild per window. See window_driver._run.
+        sym = f"qd_rope_{_safe(tag)}"
         shim_body = (f'extern "C" void {sym}(bfloat16 *qk_in, float *cossin, bfloat16 *qk_out) {{\n'
                     f"  for (unsigned i = 0; i < (unsigned)(ROPE_M*ROPE_D); ++i) qk_out[i]=qk_in[i];\n"
                     f"  rope_interleaved_prologue(qk_out, cossin);\n}}\n")
         with contextlib.redirect_stdout(io.StringIO()):
             r = bricklib.verify_oneshot(
-                name=f"rope_{tag}_{o}", brick_cc=ROPE_CC, shim_body=shim_body, symbol=sym,
+                name=f"rope_{tag}", brick_cc=ROPE_CC, shim_body=shim_body, symbol=sym,
                 inputs=[(qk_pad.astype(_bf16).reshape(-1), _bf16), (cossin.reshape(-1), np.float32)],
                 out_numel=M * Hd, out_shape=(M, Hd),
                 unpack=lambda d: np.asarray(d, np.float32).reshape(M, Hd),
@@ -603,7 +606,7 @@ def _conv_transpose_chunk(x, w, bias, k, stride, t, tag):
         n = min(t, L - o)
         win = np.zeros((c_in, t), np.float32)
         win[:, :n] = x[:, o:o + n]
-        got = _run(f"ct_{tag}_{o}", shim, sym, tiles, t * stride, win, resident_depth=1)
+        got = _run(f"ct_{tag}", shim, sym, tiles, t * stride, win, resident_depth=1)
         got = got.reshape(c_out, t * stride)
         out[:, o * stride:(o + n) * stride] = got[:, :n * stride]  # ctx=0: no crop, no offset
     return out

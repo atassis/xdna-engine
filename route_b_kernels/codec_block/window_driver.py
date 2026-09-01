@@ -63,6 +63,13 @@ def _run(name, shim_text, symbol, tiles, out_numel, resident, flags=None, reside
     `_build_streamed`), so resident_depth=1 is always numerically safe; it exists as a knob because
     the front stages' resident activation window is large enough that depth 2's doubling is what
     pushes the design over a 64 KiB core tile. See stage_shapes.py for the arithmetic."""
+    # `name` must NOT vary per WINDOW. It becomes the shim FILENAME, and bricklib's digest hashes
+    # the resolved PATH along with the content, so a per-offset name gives every window a distinct
+    # design key and a full aiecc rebuild -- for a design that is identical across offsets, since
+    # shim_text is built once outside each caller's loop, the bound symbol already excludes the
+    # offset, and every per-window buffer is allocated at constant shape and zero-padded. Measured:
+    # an 8-frame decode generated 3433 shims (1468 conv alone) and spent 2h at 73% CPU building
+    # them, with the device mostly idle. The offset belongs in the DATA, not the design name.
     shim = bricklib.GEN / f"wd_{name}_shim.cc"
     shim.write_text(shim_text)
     # bricklib prints a PASS/FAIL line per call, and every call here is an UNGATED intermediate
@@ -94,7 +101,7 @@ def snake(x, alpha, tag):
         tiles = np.zeros((C, T + 1), np.float32)
         tiles[:, :n] = x[:, o:o + n]
         tiles[:, T] = alpha
-        got = _run(f"snake_{tag}_{o}", shim_text, f"wd_snake_{tag}", tiles, T, None)
+        got = _run(f"snake_{tag}", shim_text, f"wd_snake_{tag}", tiles, T, None)
         out[:, o:o + n] = got.reshape(C, T)[:, :n]
         _stats["computed"] += C * T
         _stats["useful"] += C * n
@@ -186,7 +193,7 @@ def _conv_chunk(x, w, bias, k, dilation, tag, add=None, resident_depth=2):
             if add is not None:
                 seg = add[co, o:o + n]
                 tiles[co, c_in * k + 1 + ctx:c_in * k + 1 + ctx + len(seg)] = seg
-        got = _run(f"conv_{tag}_{o}", shim_text, sym, tiles, T, win, resident_depth=resident_depth)
+        got = _run(f"conv_{tag}", shim_text, sym, tiles, T, win, resident_depth=resident_depth)
         out[:, o:o + n] = got.reshape(c_out, T)[:, ctx:ctx + n]
         _stats["computed"] += c_out * T
         _stats["useful"] += c_out * n
@@ -246,7 +253,7 @@ def upsample(x, alpha, w, bias, stride, tag, t=UPSAMPLE_T):
         take = min(t, L - o)
         win[:, :take] = x[:, o:o + take]
         resident = np.concatenate([alpha, win.reshape(-1)]).astype(np.float32)
-        got = _run(f"up_{tag}_{o}", shim_text, f"wd_up_{tag}", tiles, t * stride, resident,
+        got = _run(f"up_{tag}", shim_text, f"wd_up_{tag}", tiles, t * stride, resident,
                    flags=[f"-DSTAGE_C_IN={c_in}", f"-DSTAGE_T={t}",
                           f"-DSTAGE_K={k}", f"-DSTAGE_STRIDE={stride}"])
         got = got.reshape(c_out, t * stride)
@@ -324,7 +331,7 @@ def _conv_transpose_chunk(x, w, bias, stride, tag, t, resident_depth):
         win = np.zeros((c_in, t), np.float32)
         take = min(t, L - o)
         win[:, :take] = x[:, o:o + take]
-        got = _run(f"ct_{tag}_{o}", shim_text, f"wd_ct_{tag}", tiles, t * stride, win,
+        got = _run(f"ct_{tag}", shim_text, f"wd_ct_{tag}", tiles, t * stride, win,
                    resident_depth=resident_depth)
         got = got.reshape(c_out, t * stride)
         out[:, o * stride:(o + n) * stride] = got[:, ctx * stride:(ctx + n) * stride]
