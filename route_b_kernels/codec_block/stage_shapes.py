@@ -144,7 +144,12 @@ def conv_transpose_l1(c_in, k, stride, t=UP_T, resident_depth=1):
 # It is NOT a ~2 MiB size limit, which is what the byte figures alone look like: at this op's
 # measured rate 2000 ms simply lands near 2 MiB. The two constants are numerically adjacent for
 # unrelated reasons, so size and time have to be told apart by measuring time, not inferred.
-STREAM_MS_PER_KIB = 0.97                # measured slope, see above
+# Rates are PER KERNEL and differ by 3.2x -- conv_transpose moves a streamed byte far cheaper than
+# conv-1d does. Applying conv-1d's slope to an upsample would over-chunk it ~3x and multiply the
+# dispatch count for nothing, so each kernel carries its own measured number (probe_device_ms.py,
+# probe_ct_device_ms.py). Both are f32 at resident_depth=1; a different dtype or depth is unmeasured.
+STREAM_MS_PER_KIB = 0.97                # conv-1d: 229632 B -> 223.9 ms .. 2066688 B -> 2009.3 ms
+CT_STREAM_MS_PER_KIB = 0.30             # conv_transpose: 0.304/0.301/0.299/0.298 over 128 KiB..1 MiB
 TDR_TIMEOUT_MS = 2000                   # amdxdna aie2_ctx.c:31 default; root-only to change
 TDR_MARGIN = 0.7                        # aim well under the watchdog, not at its edge
 
@@ -159,9 +164,9 @@ def _snap_pow2(c):
     return p
 
 
-def max_stream_bytes(margin=TDR_MARGIN):
+def max_stream_bytes(margin=TDR_MARGIN, ms_per_kib=STREAM_MS_PER_KIB):
     """Largest streamed operand one dispatch may carry and still finish inside the TDR window."""
-    return int(TDR_TIMEOUT_MS * margin / STREAM_MS_PER_KIB * 1024)
+    return int(TDR_TIMEOUT_MS * margin / ms_per_kib * 1024)
 
 
 def stream_bytes(c_out, ci_chunk, k, has_add=False, t=RES_T):
@@ -169,10 +174,11 @@ def stream_bytes(c_out, ci_chunk, k, has_add=False, t=RES_T):
     return c_out * (ci_chunk * k + 1 + (t if has_add else 0)) * F32
 
 
-def max_ci_chunk_time(c_out, k, has_add=False, t=RES_T, margin=TDR_MARGIN):
+def max_ci_chunk_time(c_out, k, has_add=False, t=RES_T, margin=TDR_MARGIN,
+                      ms_per_kib=STREAM_MS_PER_KIB):
     """Largest ci_chunk whose dispatch fits the TDR budget. None if the widest sensible chunk
     already fits, mirroring max_ci_chunk's convention."""
-    cap = max_stream_bytes(margin)
+    cap = max_stream_bytes(margin, ms_per_kib)
     for c in range(1, 4097):
         if stream_bytes(c_out, c, k, has_add, t) > cap:
             return c - 1 if c > 1 else 0
@@ -214,12 +220,21 @@ def plan(stage):
     c_res = residual_channels(stage)
     rd = NEW_RESIDENT_DEPTH
 
+    # Both budgets bind and they do not move together: stage 1's upsample fits L1 at ci_chunk=256
+    # and streams 12.59 MB there, ~3687 ms against a 2000 ms watchdog.
+    up_t_cap = max_ci_chunk_time(c_out, k, ms_per_kib=CT_STREAM_MS_PER_KIB)
     up_chunk = UPSAMPLE_CI_CHUNK[stage]
+    if up_t_cap is not None and up_t_cap < (up_chunk or c_in):
+        up_chunk = _snap_pow2(up_t_cap)   # snap only when TIME binds; else leave the chosen policy
     up_c = up_chunk or c_in
     up_total = conv_transpose_l1(up_c, k, stride, resident_depth=rd)[-1]
     assert up_total <= L1_BUDGET, f"stage {stage} upsample @ ci_chunk={up_chunk}: {up_total} > {L1_BUDGET}"
 
+    res_t_cap = min(max_ci_chunk_time(c_res, 7),
+                    max_ci_chunk_time(c_res, 1, has_add=True))
     res_chunk = RESIDUAL_CI_CHUNK[stage]
+    if res_t_cap is not None and res_t_cap < (res_chunk or c_res):
+        res_chunk = _snap_pow2(res_t_cap)
     res_c = res_chunk or c_res
     dil_total = conv_l1(res_c, 7, resident_depth=rd, has_add=False)[-1]
     onexone_total = conv_l1(res_c, 1, resident_depth=rd, has_add=True)[-1]
