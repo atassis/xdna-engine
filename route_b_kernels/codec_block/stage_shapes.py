@@ -128,6 +128,57 @@ def conv_transpose_l1(c_in, k, stride, t=UP_T, resident_depth=1):
     return resident, stream, out, resident + stream + out
 
 
+# ---- TIME arithmetic ------------------------------------------------------------------------
+# A dispatch has a TIME budget as well as an L1 one, and until 2026-09-01 only L1 was encoded here.
+# The head conv (c_in=1024, c_out=1536, k=7, ci_chunk=128) was device-green at 4.119e-07 on
+# 2026-07-31 and returned ERT_CMD_STATE_TIMEOUT on every run afterwards, with the device provably
+# healthy (snake re-gated at its recorded 5.143e-06 either side of the failure).
+#
+# MEASURED on device (probe_device_ms.py, hooking CachedXRTRuntime.run so the figure is the
+# dispatch and not the aiecc build): device time is linear in the STREAMED operand across three
+# decades -- 229632 B -> 223.9 ms, 1837056 B -> 1786.1 ms, 2066688 B -> 2009.3 ms -- and every
+# failing shape returns at 2010-2060 ms regardless of how far over it is (3674112 B, which
+# extrapolates to ~3570 ms, comes back at 2057.6 ms). That is amdxdna's `tdr_timeout_ms`, default
+# 2000, killing a job it judges hung (drivers/accel/amdxdna/aie2_ctx.c:31).
+#
+# It is NOT a ~2 MiB size limit, which is what the byte figures alone look like: at this op's
+# measured rate 2000 ms simply lands near 2 MiB. The two constants are numerically adjacent for
+# unrelated reasons, so size and time have to be told apart by measuring time, not inferred.
+STREAM_MS_PER_KIB = 0.97                # measured slope, see above
+TDR_TIMEOUT_MS = 2000                   # amdxdna aie2_ctx.c:31 default; root-only to change
+TDR_MARGIN = 0.7                        # aim well under the watchdog, not at its edge
+
+
+def _snap_pow2(c):
+    """Round DOWN to a power of two, keeping this file's existing "round numbers, not the tightest
+    chunk that technically fits" policy. The raw cap is an awkward 34 at the head; 32 divides 1024
+    exactly, so no call gets a ragged remainder chunk."""
+    p = 1
+    while p * 2 <= c:
+        p *= 2
+    return p
+
+
+def max_stream_bytes(margin=TDR_MARGIN):
+    """Largest streamed operand one dispatch may carry and still finish inside the TDR window."""
+    return int(TDR_TIMEOUT_MS * margin / STREAM_MS_PER_KIB * 1024)
+
+
+def stream_bytes(c_out, ci_chunk, k, has_add=False, t=RES_T):
+    """Bytes window_driver streams for ONE dispatch: one weight row per OUTPUT channel."""
+    return c_out * (ci_chunk * k + 1 + (t if has_add else 0)) * F32
+
+
+def max_ci_chunk_time(c_out, k, has_add=False, t=RES_T, margin=TDR_MARGIN):
+    """Largest ci_chunk whose dispatch fits the TDR budget. None if the widest sensible chunk
+    already fits, mirroring max_ci_chunk's convention."""
+    cap = max_stream_bytes(margin)
+    for c in range(1, 4097):
+        if stream_bytes(c_out, c, k, has_add, t) > cap:
+            return c - 1 if c > 1 else 0
+    return None
+
+
 def max_ci_chunk(total_c, l1_fn, budget=L1_BUDGET, margin=1.0):
     """Largest chunk size <= total_c whose l1_fn(chunk)[-1] fits budget*margin, found by direct
     search over l1_fn (not a closed-form solve) so this stays correct if l1_fn's shape changes.
@@ -179,11 +230,22 @@ def plan(stage):
 
 
 def head_plan():
+    """ci_chunk is the MIN of the L1-derived and TDR-derived caps.
+
+    HEAD_CI_CHUNK=128 fits L1 comfortably and does NOT fit the TDR window: at c_out=1536 it streams
+    1536*(128*7+1)*4 = 5.5 MB in one dispatch, ~5.4 s against a 2000 ms watchdog. That is why the
+    whole-decoder chain died on its first device op. Both budgets bind; only one was encoded."""
     c_in, c_out, k = head_shape()
     rd = NEW_RESIDENT_DEPTH
-    total = conv_l1(HEAD_CI_CHUNK, k, resident_depth=rd, has_add=False)[-1]
-    assert total <= L1_BUDGET, f"head @ ci_chunk={HEAD_CI_CHUNK}: {total} > {L1_BUDGET}"
-    return dict(ci_chunk=HEAD_CI_CHUNK, resident_depth=rd)
+    t_cap = max_ci_chunk_time(c_out, k)
+    ci = HEAD_CI_CHUNK if t_cap is None else _snap_pow2(min(HEAD_CI_CHUNK, t_cap))
+    assert ci >= 1, f"head: no ci_chunk fits the TDR budget at c_out={c_out}, k={k}"
+    total = conv_l1(ci, k, resident_depth=rd, has_add=False)[-1]
+    assert total <= L1_BUDGET, f"head @ ci_chunk={ci}: {total} > {L1_BUDGET}"
+    assert stream_bytes(c_out, ci, k) <= max_stream_bytes(), (
+        f"head @ ci_chunk={ci}: {stream_bytes(c_out, ci, k)} B streamed > "
+        f"{max_stream_bytes()} B TDR budget")
+    return dict(ci_chunk=ci, resident_depth=rd)
 
 
 def _report():
