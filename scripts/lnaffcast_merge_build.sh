@@ -37,19 +37,17 @@ log(){ echo -e "$*" | tee -a "$LOG"; }
 
 source "$WT/scripts/iron_env.sh" >/dev/null 2>&1
 [ -n "${MLIR_AIE_INSTANCE:-}" ] || { log "FATAL: iron_env did not set MLIR_AIE_INSTANCE"; exit 1; }
-pin="$(sha256sum "$WT/toolchain.lock" | cut -c1-12)"
-[ "$(basename "$MLIR_AIE_INSTANCE")" = "$pin" ] || {
-  log "FATAL: instance $(basename "$MLIR_AIE_INSTANCE") is not the committed pin $pin"; exit 1; }
+# Ask the resolver which instance the lock names; re-deriving the key here is a second copy of
+# toolchain_up.sh's hashing rule, and the copy went stale when the key moved to the lock's fields.
+pin="$("$WT/scripts/toolchain_up.sh")"
+[ "$MLIR_AIE_INSTANCE" = "$pin" ] || {
+  log "FATAL: instance $MLIR_AIE_INSTANCE is not the one toolchain.lock names ($pin)"; exit 1; }
 
 log "======== lnaffcast merge build (encoder resident geometry)  $(date -Is) ========"
 log "instance: $MLIR_AIE_INSTANCE (pin $pin)"
 
-bash "$WT/scripts/sync_kernels.sh" "$MLIR_AIE_INSTANCE/src" >>"$LOG" 2>&1
 bash "$WT/scripts/sync_kernels.sh" >>"$LOG" 2>&1
-cmp -s "$WT/route_b_kernels/aie_kernels/mm_mode_lnaffcast.cc" \
-       "$MLIR_AIE_INSTANCE/src/aie_kernels/aie2p/mm_mode_lnaffcast.cc" || {
-  log "FATAL: the instance's mm_mode_lnaffcast.cc is not this repo's"; exit 1; }
-log "[sync] kernel overlaid into the instance"
+log "[sync] sandbox refreshed; our kernels compile from route_b_kernels/aie_kernels"
 
 # Exactly the shipped resident's parameters (build_parakeet_modal_kernels.sh, "RESIDENT-FFN: fc1
 # bf16-out + panel-major drain"). Nothing here is a research setting.

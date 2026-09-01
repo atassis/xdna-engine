@@ -18,6 +18,19 @@ MM=$PE/basic/matrix_multiplication
 K=$AIEROOT/aie_kernels/aie2p
 
 [ -d "$AIEROOT" ] || { echo "$AIEROOT not present — run scripts/setup_route_b.sh first" >&2; exit 1; }
+
+# NEVER the toolchain instance. The store under .cache/instances/<key> is content-addressed: its key
+# says which MLIR_AIE_FORK_COMMIT it is, and verify_kernel_source.sh reads vendor ground truth out of
+# it. Overlaying our kernels there made it 43 entries dirty against its own commit, so the gate's
+# reference was the mutated tree. Our kernels compile from route_b_kernels/aie_kernels now
+# (rb_kernels_dir in route_b_override.mk); nothing needs to be written into the store.
+case "$(cd "$AIEROOT" 2>/dev/null && pwd)" in
+  */.cache/instances/*)
+    echo "sync_kernels: refusing to write into the toolchain instance store ($AIEROOT).
+  It is content-addressed and read as ground truth. Build from route_b_kernels/aie_kernels via
+  rb_kernels_dir instead." >&2
+    exit 2 ;;
+esac
 mkdir -p "$PE/ml/dwconv1d" "$PE/ml/softmax400" "$PE/ml/layernorm" "$PE/ml/relpos_mha" "$PE/ml/silu"
 
 # silu (elementwise bf16). Upstream DELETED programming_examples/ml/silu in #3025 while KEEPING
@@ -168,10 +181,8 @@ cp "$RB/mha_decode/Makefile.mha"       "$PE/ml/mha_decode/Makefile.mha"
 
 echo "synced route_b_kernels/ -> $AIEROOT (edit route_b_kernels/, never the sandbox copy)"
 
-# Re-overlay into the toolchain instance as well. route_b_override.mk resolves kernels_dir there, and
-# toolchain_up.sh only syncs on a COLD instance build -- so without this, an edit to a route_b .cc
-# (mm_silu_epilogue.cc et al) never reaches the compiler on a warm instance. Idempotent cp; skipped
-# when this run already targeted the instance, or when iron_env.sh has not been sourced.
-if [ -z "${1:-}" ] && [ -n "${MLIR_AIE_INSTANCE:-}" ] && [ -d "$MLIR_AIE_INSTANCE/src" ]; then
-  exec bash "$0" "$MLIR_AIE_INSTANCE/src"
-fi
+# There used to be a re-exec into $MLIR_AIE_INSTANCE/src here, because route_b_override.mk resolved
+# OUR kernels through kernels_dir (the instance). That made every caller write into the
+# content-addressed store, so the store stopped being the commit its key names -- and
+# verify_kernel_source.sh reads vendor ground truth from that same store. The Makefiles now name
+# their own kernels through rb_kernels_dir (the tracked tree), so nothing has to be copied there.

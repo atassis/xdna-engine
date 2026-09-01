@@ -49,6 +49,19 @@ kernels_dir=${MLIR_AIE_INSTANCE}/src/aie_kernels/aie2
 KERNEL_CFLAGS=${PEANOWRAP2_FLAGS}
 endif
 
+# SECOND NAMESPACE, for kernels that are OURS. kernels_dir above is the vendor tree inside the
+# content-addressed toolchain instance; resolving our own .cc files through it is what forced
+# sync_kernels.sh to copy 83 files into that store on every build, so the store stopped being what
+# its key says it is -- and verify_kernel_source.sh reads vendor ground truth from the same store.
+# Self-locating (this file sits in route_b_kernels/whole_array_fused/) so it is right for every
+# Makefile that includes it, whatever its own srcdir depth.
+rb_kernels_dir := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))../aie_kernels)
+
+# Our kernels include vendor headers by a path relative to the VENDOR tree
+# (mm_silu_epilogue.cc: #include "../aie_kernel_utils.h"). Compiled from rb_kernels_dir that
+# relative path no longer lands there, so hand the preprocessor the vendor dir to resolve against.
+KERNEL_CFLAGS += -I${kernels_dir}
+
 # Fast-tile defines the new common no longer sets (mm.cc names symbols by these).
 ifeq ($(emulate_bfloat16_mmul_with_bfp16),1)
 KERNEL_DEFINES += -DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16

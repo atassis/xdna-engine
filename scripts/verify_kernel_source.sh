@@ -164,7 +164,7 @@ peano_fork_commit="$(sed -n 's/^PEANO_FORK_COMMIT=\([0-9a-f]*\).*/\1/p' toolchai
 resolve_make_vars() {
   local mk="$1"
   make -s -C "$MMW" -f "$mk" "NPU2=$npu2_var" \
-    --eval='__pf_print__: ; @echo __KD__=$(kernels_dir); echo __CC__=$(KERNEL_CC)' \
+    --eval='__pf_print__: ; @echo __KD__=$(kernels_dir); echo __RB__=$(rb_kernels_dir); echo __CC__=$(KERNEL_CC)' \
     __pf_print__ 2>&1
 }
 
@@ -213,12 +213,20 @@ for mk in "${family[@]}"; do
     fail=1; continue
   fi
   kdir_raw="$(sed -n 's/^__KD__=//p' <<<"$vars_out")"
+  rbdir_raw="$(sed -n 's/^__RB__=//p' <<<"$vars_out")"
   cc_raw="$(sed -n 's/^__CC__=//p' <<<"$vars_out")"
   if [ -z "$kdir_raw" ]; then
     echo "[verify_kernel_source] FAIL: could not resolve kernels_dir for $mk (make --eval produced nothing -- Makefile shape changed?)" >&2
     fail=1; continue
   fi
   kdir="$(realpath -m "$kdir_raw")"
+  # SECOND NAMESPACE. route_b_override.mk resolves OUR kernels through rb_kernels_dir (the tracked
+  # tree) and vendor kernels through kernels_dir (the pinned instance). Empty on a Makefile that
+  # predates the split, which is a resolution failure, not an absent feature: this gate's ground
+  # truth for a route_b kernel is the tracked file, so a Makefile that can only name one namespace
+  # is one this script cannot classify.
+  rbdir=""
+  [ -n "$rbdir_raw" ] && rbdir="$(realpath -m "$rbdir_raw")"
 
   # --- axis 2: compiler identity (independent of kernel source; see point 3 in the header) ---
   checked=$((checked + 1))
@@ -256,39 +264,70 @@ $(_peano_remedy)" >&2
     fi
   fi
 
-  mapfile -t declared < <(grep -oP '\$\{kernels_dir\}/\K[A-Za-z0-9_./]+\.cc' "$mkpath" | sort -u)
-  if [ ${#declared[@]} -eq 0 ]; then
-    echo "[verify_kernel_source] FAIL: $mk declares no \${kernels_dir}/*.cc prerequisite -- Makefile shape changed, nothing to verify against" >&2
+  # TWO NAMESPACES. Vendor kernels (mm.cc, zero.cc) are prerequisites of ${kernels_dir}; ours
+  # (mm_silu_epilogue.cc et al) of ${rb_kernels_dir}. Which namespace a file is declared through
+  # is now itself checked -- a route_b kernel reached via kernels_dir only resolves because
+  # something copied it into the toolchain store, which is the mutation this split removes.
+  mapfile -t declared_v  < <(grep -oP '\$\{kernels_dir\}/\K[A-Za-z0-9_./]+\.cc' "$mkpath" | sort -u)
+  mapfile -t declared_rb < <(grep -oP '\$\{rb_kernels_dir\}/\K[A-Za-z0-9_./]+\.cc' "$mkpath" | sort -u)
+  if [ $(( ${#declared_v[@]} + ${#declared_rb[@]} )) -eq 0 ]; then
+    echo "[verify_kernel_source] FAIL: $mk declares no \${kernels_dir}/*.cc or \${rb_kernels_dir}/*.cc prerequisite -- Makefile shape changed, nothing to verify against" >&2
     fail=1; continue
   fi
+  if [ ${#declared_rb[@]} -gt 0 ]; then
+    if [ -z "$rbdir" ]; then
+      echo "[verify_kernel_source] FAIL $mk: names \${rb_kernels_dir} but make resolved it empty -- route_b_override.mk is stale (it must define rb_kernels_dir)." >&2
+      fail=1; continue
+    fi
+    if [ "$rbdir" != "$(realpath -m "$RB_KERNELS")" ]; then
+      echo "[verify_kernel_source] FAIL $mk: rb_kernels_dir resolved to
+    $rbdir
+  which is not the tracked route_b kernel tree
+    $(realpath -m "$RB_KERNELS")
+  -- our kernels must compile from the tracked tree, not from a copy." >&2
+      fail=1; continue
+    fi
+  fi
+
   # HOLE 2 (closed): the Makefile NAMES prerequisites, but the compiler READS the transitive closure.
   # `mm.cc` does `#include "zero.cc"`, which appeared in no prerequisite list, so the entire
   # modal/resident family could report green while zero.cc drifted and changed every compiled object.
-  mapfile -t srcs < <(include_closure "$kdir" "${declared[@]}")
+  srcs_v=(); srcs_rb=()
+  [ ${#declared_v[@]}  -gt 0 ] && mapfile -t srcs_v  < <(include_closure "$kdir"  "${declared_v[@]}")
+  [ ${#declared_rb[@]} -gt 0 ] && mapfile -t srcs_rb < <(include_closure "$rbdir" "${declared_rb[@]}")
 
-  for f in "${srcs[@]}"; do
+  for entry in "${srcs_v[@]/#/vendor:}" "${srcs_rb[@]/#/route_b:}"; do
+    class="${entry%%:*}"; f="${entry#*:}"
     checked=$((checked + 1))
-    resolved="$kdir/$f"
+    if [ "$class" = vendor ]; then dir="$kdir"; else dir="$rbdir"; fi
+    resolved="$dir/$f"
     if [ ! -f "$resolved" ]; then
-      echo "[verify_kernel_source] FAIL $mk: $f -- kernels_dir resolved to $kdir but $f is not there" >&2
+      echo "[verify_kernel_source] FAIL $mk: $f -- ${class} namespace resolved to $dir but $f is not there" >&2
       fail=1; continue
     fi
     got_hash="$(sha256sum "$resolved" | cut -d' ' -f1)"
 
-    rb_path="$RB_KERNELS/$f"
-    if [ -f "$rb_path" ]; then
-      class="route_b"; truth="$rb_path"
-      want_hash="$(sha256sum "$rb_path" | cut -d' ' -f1)"
+    if [ "$class" = route_b ]; then
+      truth="$RB_KERNELS/$f"
+      if [ ! -f "$truth" ]; then
+        echo "[verify_kernel_source] FAIL $mk: $f -- declared through \${rb_kernels_dir} but absent from the tracked tree $RB_KERNELS" >&2
+        fail=1; continue
+      fi
     else
-      class="vendor"
+      if [ -f "$RB_KERNELS/$f" ]; then
+        echo "[verify_kernel_source] FAIL $mk: $f is OURS ($RB_KERNELS/$f) but is declared through \${kernels_dir}
+  -- it can only resolve there if something copied it into the pinned toolchain store. Declare it
+  through \${rb_kernels_dir} instead." >&2
+        fail=1; continue
+      fi
       truth="$inst/src/aie_kernels/aie2p/$f"
       [ -f "$truth" ] || truth="$inst/src/aie_kernels/aie2/$f"
       if [ ! -f "$truth" ]; then
-        echo "[verify_kernel_source] FAIL $mk: $f -- not found in the pinned instance ($inst/src/aie_kernels/{aie2p,aie2}/$f) or in route_b_kernels/aie_kernels/; cannot establish ground truth" >&2
+        echo "[verify_kernel_source] FAIL $mk: $f -- not found in the pinned instance ($inst/src/aie_kernels/{aie2p,aie2}/$f); cannot establish ground truth" >&2
         fail=1; continue
       fi
-      want_hash="$(sha256sum "$truth" | cut -d' ' -f1)"
     fi
+    want_hash="$(sha256sum "$truth" | cut -d' ' -f1)"
 
     if [ "$got_hash" != "$want_hash" ]; then
       echo "[verify_kernel_source] FAIL $mk/$f ($class kernel): the build will compile
@@ -299,7 +338,7 @@ $(_peano_remedy)" >&2
   resident modal xclbin without upstream #3442's rounding fix on 2026-07-29/30). FIX:
   $([ "$class" = vendor ] \
       && echo "the mlir-aie submodule at $(dirname "$(dirname "$kdir")") is not checked out at toolchain.lock's MLIR_AIE_FORK_COMMIT ($inst was built from that commit) -- resync it, or point kernels_dir at \$INST/src/aie_kernels (owner call, out of scope here)." \
-      || echo "re-run scripts/sync_kernels.sh -- the sandbox copy of $f is stale vs route_b_kernels/aie_kernels/$f.")" >&2
+      || echo "the tracked tree moved under the build -- re-read $truth.")" >&2
       fail=1
     else
       echo "[verify_kernel_source] OK   $mk/$f ($class) == $truth (sha256=$got_hash)"

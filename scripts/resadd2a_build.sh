@@ -34,21 +34,19 @@ log(){ echo -e "$*" | tee -a "$LOG"; }
 
 source "$WT/scripts/iron_env.sh" >/dev/null 2>&1
 [ -n "${MLIR_AIE_INSTANCE:-}" ] || { log "FATAL: iron_env did not set MLIR_AIE_INSTANCE"; exit 1; }
-pin="$(sha256sum "$WT/toolchain.lock" | cut -c1-12)"
-[ "$(basename "$MLIR_AIE_INSTANCE")" = "$pin" ] || {
-  log "FATAL: instance $(basename "$MLIR_AIE_INSTANCE") is not the committed pin $pin"; exit 1; }
+# Ask the resolver which instance the lock names; re-deriving the key here is a second copy of
+# toolchain_up.sh's hashing rule, and the copy went stale when the key moved to the lock's fields.
+pin="$("$WT/scripts/toolchain_up.sh")"
+[ "$MLIR_AIE_INSTANCE" = "$pin" ] || {
+  log "FATAL: instance $MLIR_AIE_INSTANCE is not the one toolchain.lock names ($pin)"; exit 1; }
 
 log "======== resadd2a build  $(date -Is) ========"
 log "instance: $MLIR_AIE_INSTANCE (pin $pin)"
 
 # kernels_dir resolves against the INSTANCE src tree, so the .cc has to be overlaid there or the
 # build compiles the instance's own copy.
-bash "$WT/scripts/sync_kernels.sh" "$MLIR_AIE_INSTANCE/src" >>"$LOG" 2>&1
 bash "$WT/scripts/sync_kernels.sh" >>"$LOG" 2>&1
-cmp -s "$WT/route_b_kernels/aie_kernels/mm_mode_resadd2a.cc" \
-       "$MLIR_AIE_INSTANCE/src/aie_kernels/aie2p/mm_mode_resadd2a.cc" || {
-  log "FATAL: the instance's mm_mode_resadd2a.cc is not this repo's"; exit 1; }
-log "[sync] kernel overlaid into the instance"
+log "[sync] sandbox refreshed; our kernels compile from route_b_kernels/aie_kernels"
 
 BASE=512x1024x1024_64x32x128_8c_modalidkrtpkrl
 # The arm on record: one pass per (a, b) pair, the vfile detour off, scale*b on the bf16 datapath.

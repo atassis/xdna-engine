@@ -60,6 +60,6 @@ build/mm_${m}x${k}x${n}.o: ${kernels_dir}/mm.cc
 	mkdir -p ${@D}
 	cd ${@D} && ${KERNEL_CC} ${KERNEL_CFLAGS} ${MM_DEFINES} ${KERNEL_DEFINES} -c $< -o ${@F}
 
-build/mm_ln_epilogue_${m}x${k}x${n}.o: ${kernels_dir}/mm_ln_epilogue.cc
+build/mm_ln_epilogue_${m}x${k}x${n}.o: ${rb_kernels_dir}/mm_ln_epilogue.cc
 	mkdir -p ${@D}
 	cd ${@D} && ${KERNEL_CC} ${KERNEL_CFLAGS} ${EPI_DEFINES} ${KERNEL_DEFINES} -c $< -o ${@F}

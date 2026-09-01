@@ -383,7 +383,7 @@ build/.epi_defines.stamp: FORCE
 FORCE:
 .PHONY: FORCE
 
-build/mm_silu_epilogue_${m}x${k}x${n}.o: ${kernels_dir}/mm_silu_epilogue.cc build/.epi_defines.stamp
+build/mm_silu_epilogue_${m}x${k}x${n}.o: ${rb_kernels_dir}/mm_silu_epilogue.cc build/.epi_defines.stamp
 	mkdir -p ${@D}
 	cd ${@D} && ${KERNEL_CC} ${KERNEL_CFLAGS} ${EPI_DEFINES} ${epi_opt} -c $< -o ${@F}
 
@@ -409,12 +409,12 @@ build/.resadd2a_defines.stamp: FORCE
 	@mkdir -p ${@D}
 	@echo '${EPI_DEFINES} ${R2A_DEFINES}' | cmp -s - $@ || echo '${EPI_DEFINES} ${R2A_DEFINES}' > $@
 
-build/mm_mode_lnaffcast_${m}x${k}x${n}.o: ${kernels_dir}/mm_mode_lnaffcast.cc build/.lnaffcast_defines.stamp
+build/mm_mode_lnaffcast_${m}x${k}x${n}.o: ${rb_kernels_dir}/mm_mode_lnaffcast.cc build/.lnaffcast_defines.stamp
 	mkdir -p ${@D}
 	cd ${@D} && ${KERNEL_CC} ${KERNEL_CFLAGS} ${EPI_DEFINES} ${LNAFF_DEFINES} -c $< -o ${@F}
 
 # both-on-A resadd mode object. Its own .cc for the same reason lnaffcast's is: an object the
 # core CALLS is not traced by AIEAssignCoreLinkFiles and never reaches the link line.
-build/mm_mode_resadd2a_${m}x${k}x${n}.o: ${kernels_dir}/mm_mode_resadd2a.cc build/.resadd2a_defines.stamp
+build/mm_mode_resadd2a_${m}x${k}x${n}.o: ${rb_kernels_dir}/mm_mode_resadd2a.cc build/.resadd2a_defines.stamp
 	mkdir -p ${@D}
 	cd ${@D} && ${KERNEL_CC} ${KERNEL_CFLAGS} ${EPI_DEFINES}${R2A_DEFINES} -c $< -o ${@F}

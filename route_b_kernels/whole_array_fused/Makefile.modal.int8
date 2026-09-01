@@ -78,6 +78,6 @@ build/mm_${m}x${k}x${n}.o: ${kernels_dir}/mm.cc
 	cd ${@D} && ${KERNEL_CC} ${KERNEL_CFLAGS} ${MM_DEFINES} ${KERNEL_DEFINES} -c $< -o ${@F}
 
 # Epilogue object: i32 acc -> f32 dequant (×S from rtp[0]).
-build/mm_silu_epilogue_${m}x${k}x${n}.o: ${kernels_dir}/mm_silu_epilogue.cc
+build/mm_silu_epilogue_${m}x${k}x${n}.o: ${rb_kernels_dir}/mm_silu_epilogue.cc
 	mkdir -p ${@D}
 	cd ${@D} && ${KERNEL_CC} ${KERNEL_CFLAGS} ${EPI_DEFINES} -c $< -o ${@F}
