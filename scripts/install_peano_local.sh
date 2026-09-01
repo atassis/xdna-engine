@@ -258,6 +258,8 @@ _is_protected() {
 PEANO_ROOTS="$PEANO_LOCAL_HOME/roots"
 _add_root() {
   local name="$1" target="$2"
+  [ -L "$PEANO_LOCAL_HOME/$target" ] && die "$target is an alias, not an install -- root it at the
+       identity it resolves to: $(basename "$(readlink -f "$PEANO_LOCAL_HOME/$target")")"
   [ -d "$PEANO_LOCAL_HOME/$target" ] || die "no such install: $target"
   mkdir -p "$PEANO_ROOTS"
   ln -sfn "../$target" "$PEANO_ROOTS/$name"
@@ -409,7 +411,7 @@ while [ $# -gt 0 ]; do
     --add-root) MODE="addroot"; ROOT_NAME="${2:?--add-root needs a name}"; ROOT_TGT="${3:?--add-root needs a target}"; shift 3 ;;
     --keep)     KEEP="${2:?--keep needs a number}"; shift 2 ;;
     --dry-run)  DRY=1; shift ;;
-    -h|--help)  sed -n '2,52p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    -h|--help)  awk 'NR>1 && /^#/ {print; next} NR>1 {exit}' "${BASH_SOURCE[0]}"; exit 0 ;;
     *)          die "unknown arg: $1" ;;
   esac
 done

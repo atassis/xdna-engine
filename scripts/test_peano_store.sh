@@ -117,4 +117,18 @@ PEANO_LOCAL_HOME="$T4" bash "$SCRIPT" --gc --keep 1 >/dev/null 2>&1
 [ -L "$T4/roots/rollback-llvm21" ] && ok "root is a symlink, not a sentence" || no "root symlink missing"
 rm -rf "$T4"
 
+echo "== --add-root refuses an alias target (would silently dangle if the alias moved) =="
+T5="$(mktemp -d)"; PEANO_LOCAL_HOME="$T5"
+mkdir -p "$T5/legacy-name/bin"
+printf '#!/bin/sh\necho "clang version 21.0.0git (git@github.com:atassis/llvm-aie.git 1111111111111111111111111111111111111111)"\n' > "$T5/legacy-name/bin/clang++"
+chmod +x "$T5/legacy-name/bin/clang++"
+PEANO_LOCAL_HOME="$T5" bash "$SCRIPT" --migrate >/dev/null 2>&1
+if PEANO_LOCAL_HOME="$T5" bash "$SCRIPT" --add-root probe-alias legacy-name >/dev/null 2>&1; then
+  no "--add-root against an alias should have failed"
+else
+  ok "--add-root rejects an alias target"
+fi
+[ -e "$T5/roots/probe-alias" ] && no "alias root was created anyway" || ok "no root symlink created for the alias"
+rm -rf "$T5"
+
 exit $fail
