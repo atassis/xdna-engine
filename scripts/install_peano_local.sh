@@ -42,6 +42,21 @@
 #                                     # the repo venv currently points at.
 #   scripts/install_peano_local.sh --activate <install-dir>
 #                                     # repoint .venv-iron/.../llvm-aie at <install-dir> (+ guard)
+#   scripts/install_peano_local.sh --resolve
+#                                     # print the install matching toolchain.lock's PEANO_FORK_COMMIT
+#                                     # (exit 1 if we do not have it) -- answers "must we re-pin?"
+#   scripts/install_peano_local.sh --list
+#                                     # identity, LLVM major, last-used, why-protected, aliases
+#   scripts/install_peano_local.sh --gc [--keep N] [--dry-run]
+#                                     # keep newest N (default 2) PER LLVM MAJOR; never removes the
+#                                     # active, the pinned, or anything toolchain.lock names
+#   scripts/install_peano_local.sh --migrate [--dry-run]
+#                                     # rename legacy --tag dirs to their identity, old name -> alias
+#
+# NAMING: an install directory is named for the build it CONTAINS (`llvm<major>-<sha12>`), read from
+# `clang++ --version`, not for the day it was made. A hand-typed name is an unverified claim; this
+# one is re-derivable from the artifact and collapses duplicates automatically. `--tag` survives as
+# a human alias symlink, which is also what keeps toolchain.lock's by-path rollback prose valid.
 #
 # Env overrides:
 #   PEANO_LOCAL_HOME   install root   (default: <workspace>/.cache/peano-local)
@@ -169,6 +184,175 @@ _activate() {
   log "activated: $VENV_LINK -> $inst"
 }
 
+# ---------------------------------------------------------------------------------------------
+# IDENTITY -- an install is named by what it IS, not by when it was made.
+#
+# A hand-typed --tag is an unverified claim about a directory's contents. It cost a full manual
+# audit on 2026-09-01: six dirs whose names implied six builds actually held FIVE (cint-test and
+# integ-2026-07-31 were the same inode), and the only way to learn which was which was to run
+# clang++ in each one. The build SHA is not merely computable, it is SELF-REPORTED by the artifact:
+#
+#   clang version 22.0.0git (git@github.com:atassis/llvm-aie.git fd3c04a086a1...)
+#
+# so the canonical name is derived from the binary, and can be re-verified against it at any time.
+# A key hashed from build INPUTS cannot do that -- it still lies if the tree was dirty.
+#
+# The LLVM major is in the name (not just the SHA) because it is the axis that makes a rollback
+# expensive: crossing 21 -> 22 needs a matching PEANO_DIST seed, so retention is per-major.
+# Deliberately NOT keyed on sha256(toolchain.lock): Peano is determined by PEANO_FORK_COMMIT +
+# PEANO_DIST and moves independently of MLIR_AIE_FORK_COMMIT ("PEANO WAS STAGED SEPARATELY" in the
+# lock), so a lock-wide key would mint a fresh dir for a byte-identical Peano.
+_peano_identity() {
+  local inst="$1" v maj sha
+  v="$("$inst/bin/clang++" --version 2>/dev/null | head -1)" || return 1
+  [ -n "$v" ] || return 1
+  maj="$(printf '%s' "$v" | sed -n 's/.*clang version \([0-9][0-9]*\)\..*/\1/p')"
+  sha="$(printf '%s' "$v" | grep -oE '[0-9a-f]{40}' | head -1)"
+  [ -n "$maj" ] && [ -n "$sha" ] || return 1
+  echo "llvm${maj}-${sha:0:12}"
+}
+
+# Read a bare KEY=value from toolchain.lock (values there carry trailing '# ...' prose).
+_lock_field() {
+  sed -n "s/^$1=\([^ #]*\).*/\1/p" "$REPO/toolchain.lock" | head -1
+}
+
+# Real installs only -- aliases (symlinks) are skipped so nothing is counted or GC'd twice.
+_real_installs() {
+  local d
+  for d in "$PEANO_LOCAL_HOME"/*/; do
+    [ -d "$d" ] || continue
+    d="${d%/}"
+    [ -L "$d" ] && continue
+    echo "$d"
+  done
+  return 0
+}
+
+# Is this install referenced by anything that must keep working? Protects, in order:
+#   active venv symlink | toolchain.lock's PEANO_FORK_COMMIT | any name toolchain.lock names in prose
+# The last one matters because the lock documents rollback by PATH, and a mechanical age/count GC
+# cannot see a prose pointer. (The lock is not edited to fix that: LOCKHASH is sha256 of the WHOLE
+# file, so touching even a comment orphans the built mlir-aie instance and forces a rebuild.)
+_is_protected() {
+  local inst="$1" id pin active a
+  id="$(_peano_identity "$inst" 2>/dev/null || true)"
+  active="$(readlink -f "$VENV_LINK" 2>/dev/null || true)"
+  [ -n "$active" ] && [ "$active" = "$(cd "$inst" && pwd -P)" ] && { echo "active"; return 0; }
+  pin="$(_lock_field PEANO_FORK_COMMIT)"
+  [ -n "$pin" ] && [ -n "$id" ] && [ "${id#*-}" = "${pin:0:12}" ] && { echo "pinned"; return 0; }
+  # the install itself, or any alias pointing at it, named in the lock
+  for a in "$(basename "$inst")" $(_aliases_of "$inst"); do
+    grep -q -- "peano-local/$a" "$REPO/toolchain.lock" 2>/dev/null && { echo "lock-ref:$a"; return 0; }
+  done
+  return 1
+}
+
+_aliases_of() {
+  local inst="$1" l
+  for l in "$PEANO_LOCAL_HOME"/*; do
+    [ -L "$l" ] || continue
+    [ "$(readlink -f "$l")" = "$(cd "$inst" && pwd -P)" ] && basename "$l"
+  done
+  return 0   # a non-match on the LAST entry would otherwise be this function's status, and
+             # `set -o pipefail` would carry it into the caller's assignment (set -e abort)
+}
+
+# Shows the directory NAME beside the identity its binary actually reports. A legacy hand-tagged
+# dir makes the two disagree, which is the whole point: the name is a claim, the identity is evidence.
+_list() {
+  local d id prot mtime aliases flag
+  printf '%-22s %-22s %-9s %-12s %-26s %s\n' NAME CONTAINS NAME-VS LAST-USED PROTECTED ALIASES
+  for d in $(_real_installs); do
+    id="$(_peano_identity "$d" 2>/dev/null || echo '?UNPROBEABLE')"
+    prot="$(_is_protected "$d" || true)"
+    mtime="$(date -d "@$(stat -c %Y "$d")" +%Y-%m-%d 2>/dev/null)"
+    aliases="$(_aliases_of "$d" | tr '\n' ',' | sed 's/,$//')"
+    # NB: an `[ test ] && var=x` STATEMENT returns 1 when the test is false, which under `set -e`
+    # aborts the loop. It only showed up once --migrate made the names match.
+    if [ "$(basename "$d")" = "$id" ]; then flag=ok; else flag=MISNAMED; fi
+    printf '%-22s %-22s %-9s %-12s %-26s %s\n' \
+      "$(basename "$d")" "$id" "$flag" "$mtime" "${prot:--}" "${aliases:--}"
+  done
+}
+
+# Which install matches the CURRENT pin? This is the question that had to be answered by hand on
+# 2026-09-01 (six clang++ invocations) to find out whether a re-pin was needed at all.
+_resolve_pin() {
+  local pin d id
+  pin="$(_lock_field PEANO_FORK_COMMIT)"
+  [ -n "$pin" ] || die "no PEANO_FORK_COMMIT in $REPO/toolchain.lock"
+  for d in $(_real_installs); do
+    id="$(_peano_identity "$d" 2>/dev/null || true)"
+    [ -n "$id" ] && [ "${id#*-}" = "${pin:0:12}" ] && { echo "$d"; return 0; }
+  done
+  die "no install matches PEANO_FORK_COMMIT=$pin
+       have: $(for d in $(_real_installs); do _peano_identity "$d" 2>/dev/null; done | tr '\n' ' ')
+       build one, or re-pin toolchain.lock to an install you have."
+}
+
+# Keep the newest KEEP per LLVM MAJOR, never touching a protected install. Per-major because a
+# flat keep-N deletes the cross-major rollback: on 2026-09-01 the set was 4x llvm21 + 2x llvm22,
+# so "keep newest 3" would have dropped every llvm21 but one -- including the dir the lock names
+# as THE llvm21 rollback target, whose rebuild is a full LLVM build across a major bump.
+_gc() {
+  local keep="$1" dry="$2" d id maj prot seen line
+  declare -A count=()
+  # newest first, grouped by major
+  for line in $(for d in $(_real_installs); do
+                  id="$(_peano_identity "$d" 2>/dev/null || echo 'llvm?-unknown')"
+                  echo "$(stat -c %Y "$d")|${id%%-*}|$d"
+                done | sort -t'|' -k1 -rn); do
+    maj="$(echo "$line" | cut -d'|' -f2)"; d="$(echo "$line" | cut -d'|' -f3)"
+    count[$maj]=$(( ${count[$maj]:-0} + 1 ))
+    if prot="$(_is_protected "$d")"; then
+      log "KEEP  $(basename "$d")  ($maj, $prot)"; continue
+    fi
+    if [ "${count[$maj]}" -le "$keep" ]; then
+      log "KEEP  $(basename "$d")  ($maj, newest-$keep)"
+    elif [ "$dry" = "1" ]; then
+      log "WOULD REMOVE $(basename "$d")  ($maj, #${count[$maj]} of its major)"
+    else
+      log "REMOVE $(basename "$d")  ($maj, #${count[$maj]} of its major)"
+      for a in $(_aliases_of "$d"); do rm -f "$PEANO_LOCAL_HOME/$a"; done
+      rm -rf "$d"
+    fi
+  done
+}
+
+# Rename legacy hand-tagged dirs to their identity, leaving the OLD NAME AS AN ALIAS symlink --
+# which keeps toolchain.lock's by-path rollback prose working without editing the lock (see
+# _is_protected). Duplicates collapse: two names for one build become two aliases on one dir.
+_migrate() {
+  local dry="$1" d id dest
+  # A dry run must predict the REAL outcome, so it has to model the state it would create: the
+  # second name for one build becomes an alias, not a second rename. Without this the preview
+  # reports two RENAMEs to one destination -- a plan that cannot happen.
+  declare -A planned=()
+  for d in $(_real_installs); do
+    id="$(_peano_identity "$d" 2>/dev/null || true)"
+    [ -n "$id" ] || { log "SKIP $(basename "$d") -- cannot probe clang++"; continue; }
+    [ "$(basename "$d")" = "$id" ] && { log "OK   $(basename "$d") already identity-named"; continue; }
+    dest="$PEANO_LOCAL_HOME/$id"
+    if [ "$dry" = "1" ]; then
+      if [ -e "$dest" ] || [ -n "${planned[$id]:-}" ]; then
+        log "WOULD ALIAS  $(basename "$d") -> $id (duplicate of ${planned[$id]:-existing}, same build)"
+      else
+        log "WOULD RENAME $(basename "$d") -> $id"; planned[$id]="$(basename "$d")"
+      fi
+      continue
+    fi
+    if [ -e "$dest" ]; then
+      # same build under a second name: drop the duplicate dir, keep the name as an alias
+      rm -rf "$d"; ln -sfn "$id" "$d"
+      log "ALIAS  $(basename "$d") -> $id (was a duplicate of the same build)"
+    else
+      mv "$d" "$dest"; ln -sfn "$id" "$d"
+      log "RENAME $(basename "$d") -> $id (old name kept as alias)"
+    fi
+  done
+}
+
 _resolve_default_install() {
   local p
   p="$(readlink -f "$VENV_LINK" 2>/dev/null || true)"
@@ -177,7 +361,7 @@ _resolve_default_install() {
 }
 
 # ---------------------------------------------------------------------------------------------
-FROM=""; BUILD=""; TAG=""; MODE="install"; CHECK_DIR=""
+FROM=""; BUILD=""; TAG=""; MODE="install"; CHECK_DIR=""; KEEP=2; DRY=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --from)     FROM="${2:?--from needs a dir}"; shift 2 ;;
@@ -185,7 +369,13 @@ while [ $# -gt 0 ]; do
     --tag)      TAG="${2:?--tag needs a name}"; shift 2 ;;
     --check)    MODE="check"; shift; if [ $# -gt 0 ] && [ "${1#--}" = "$1" ]; then CHECK_DIR="$1"; shift; fi ;;
     --activate) MODE="activate"; CHECK_DIR="${2:?--activate needs a dir}"; shift 2 ;;
-    -h|--help)  sed -n '2,45p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    --list)     MODE="list"; shift ;;
+    --resolve)  MODE="resolve"; shift ;;
+    --gc)       MODE="gc"; shift ;;
+    --migrate)  MODE="migrate"; shift ;;
+    --keep)     KEEP="${2:?--keep needs a number}"; shift 2 ;;
+    --dry-run)  DRY=1; shift ;;
+    -h|--help)  sed -n '2,52p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *)          die "unknown arg: $1" ;;
   esac
 done
@@ -203,16 +393,24 @@ case "$MODE" in
     _guard_soname "$CHECK_DIR"
     _assert_archiver "$CHECK_DIR"
     _activate "$CHECK_DIR"
+    touch "$CHECK_DIR"          # last-used, for --gc's newest-per-major ranking
     ;;
+  list)     _list ;;
+  resolve)  _resolve_pin ;;
+  gc)       _gc "$KEEP" "$DRY" ;;
+  migrate)  _migrate "$DRY" ;;
   install)
-    [ -n "$FROM" ] && [ -n "$BUILD" ] && [ -n "$TAG" ] \
-      || die "need --from <good-install> --build <build-fast-dir> --tag <name> (or use --check)"
+    [ -n "$FROM" ] && [ -n "$BUILD" ] \
+      || die "need --from <good-install> --build <build-fast-dir> (--tag is optional; the install is
+       named by its own build SHA). Or use --check/--list/--resolve/--gc."
     [ -d "$FROM/lib" ] || die "--from $FROM does not look like a Peano install (no lib/)"
     [ -d "$BUILD/lib" ] || die "--build $BUILD has no lib/ -- did build_peano_fast.sh run?"
-    DEST="$PEANO_LOCAL_HOME/$TAG"
-    [ -e "$DEST" ] && die "$DEST already exists -- pick another --tag, or rm it first"
     mkdir -p "$PEANO_LOCAL_HOME"
 
+    # Stage first: the identity can only be read off the FINISHED artifact (post dylib+driver swap),
+    # never off the inputs, so the final directory name is not known until the build is assembled.
+    DEST="$(mktemp -d "$PEANO_LOCAL_HOME/.staging-XXXXXX")"
+    rmdir "$DEST"
     log "hardlink-copy $FROM -> $DEST"
     cp -al "$FROM" "$DEST"
 
@@ -246,7 +444,24 @@ case "$MODE" in
     _guard_soname "$DEST"
     _assert_archiver "$DEST"
     _assert_archive_roundtrip "$DEST"
-    log "installed: $DEST"
+
+    # Name it for what it is, now that there is an artifact to ask.
+    ID="$(_peano_identity "$DEST")" || { rm -rf "$DEST"; die "installed tree does not self-report a build SHA"; }
+    FINAL="$PEANO_LOCAL_HOME/$ID"
+    if [ -e "$FINAL" ]; then
+      rm -rf "$DEST"
+      log "identical build already installed as $ID -- reusing it, nothing new written"
+      DEST="$FINAL"
+    else
+      mv "$DEST" "$FINAL"; DEST="$FINAL"
+      log "installed: $DEST"
+    fi
+    # A --tag is provenance ("why did I build this"), never the key. Kept as an alias symlink.
+    if [ -n "$TAG" ]; then
+      [ -e "$PEANO_LOCAL_HOME/$TAG" ] && [ ! -L "$PEANO_LOCAL_HOME/$TAG" ] \
+        && die "--tag $TAG collides with a real install dir"
+      ln -sfn "$ID" "$PEANO_LOCAL_HOME/$TAG"; log "alias: $TAG -> $ID"
+    fi
     log "activate with: scripts/install_peano_local.sh --activate $DEST"
     ;;
 esac
