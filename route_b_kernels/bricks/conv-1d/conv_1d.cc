@@ -20,9 +20,11 @@
 // reason. The caller owns that decomposition; this kernel just does one channel.
 //
 // conv_1d_causal_core (below) is SCALAR and stays the correctness reference the vectorised form is
-// gated against -- unlike conv-transpose-1d, whose stride-offset SCATTER on write is genuinely
-// unaligned, this brick's gather is contiguous in t, so a vector form (conv_1d_causal_core_vec,
-// below) is available. See its own comment for how it stays alignment-safe.
+// gated against. This brick's gather is contiguous in t, so a vector form (conv_1d_causal_core_vec,
+// below) is available directly. conv-transpose-1d's naive scatter form is NOT -- its stride-offset
+// write is genuinely unaligned -- but conv_transpose_1d.cc's own conv_transpose_channel_core_vec
+// gets there anyway, by reformulating the scatter into `stride` contiguous per-phase gathers
+// instead of aligning it. See its own comment for how it stays alignment-safe.
 //
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 #include <aie_api/aie.hpp>
