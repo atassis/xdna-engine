@@ -56,35 +56,52 @@ def reset_stats():
         _stats[k] = 0
 
 
+_DESIGNS = {}
+
+
 def _run(name, shim_text, symbol, tiles, out_numel, resident, flags=None, resident_depth=2):
-    """resident_depth is the objectFIFO depth of the RESIDENT operand only (default 2, the IRON
-    default -- unchanged behaviour for every existing caller). Every op here acquires its resident
-    operand ONCE before the streamed-tile loop and releases it once after (bricklib's
-    `_build_streamed`), so resident_depth=1 is always numerically safe; it exists as a knob because
-    the front stages' resident activation window is large enough that depth 2's doubling is what
-    pushes the design over a 64 KiB core tile. See stage_shapes.py for the arithmetic."""
-    # `name` must NOT vary per WINDOW. It becomes the shim FILENAME, and bricklib's digest hashes
-    # the resolved PATH along with the content, so a per-offset name gives every window a distinct
-    # design key and a full aiecc rebuild -- for a design that is identical across offsets, since
-    # shim_text is built once outside each caller's loop, the bound symbol already excludes the
-    # offset, and every per-window buffer is allocated at constant shape and zero-padded. Measured:
-    # an 8-frame decode generated 3433 shims (1468 conv alone) and spent 2h at 73% CPU building
-    # them, with the device mostly idle. The offset belongs in the DATA, not the design name.
+    """Dispatch one window. BUILD ONCE per design, then reuse it for every later window.
+
+    This used to call bricklib.verify_streamed, which is a GATE: it constructs a fresh design,
+    compiles it, runs it TWICE (a run2run determinism check), scores it against a golden, and
+    throws the design away. Correct for gating a kernel once; catastrophic in a driver loop,
+    because the compile is an aiecc subprocess and it then runs per WINDOW. Measured on one conv,
+    identical shapes: build-per-window 1.78 s/dispatch, hoisted design 0.35 s, hoisted design with
+    the artifact cache warm 0.068 s -- against ~66 ms of actual device time. A 6284-sample clip
+    needs ~7000 dispatches, so the difference is hours versus minutes.
+
+    The design depends only on the shapes, dtypes, flags and kernel source -- never on the window
+    offset or the data -- so it is memoised on exactly those. The golden comparison and the
+    run2run check stay where they belong, in the verify_* scripts.
+    """
     shim = bricklib.GEN / f"wd_{name}_shim.cc"
     shim.write_text(shim_text)
-    # bricklib prints a PASS/FAIL line per call, and every call here is an UNGATED intermediate
-    # (golden zeros, gate inf) -- so those lines read as dozens of passing gates when nothing has
-    # been gated. Only the stitched stage output is a gate. Swallow them.
-    with contextlib.redirect_stdout(io.StringIO()):
-        r = bricklib.verify_streamed(
-            name=name, shim=shim, symbol=symbol, in_tiles=tiles, out_tile_numel=out_numel,
-            resident=(None if resident is None else resident.reshape(-1).astype(np.float32)),
-            unpack=lambda d: np.asarray(d), golden=np.zeros((tiles.shape[0], out_numel)),
-            gate=np.inf,      # intermediates are not gated; the stitched stage output is
-            in_dt=np.float32, out_dt=np.float32, compile_flags=flags,
-            resident_dt=(None if resident is None else np.float32), resident_depth=resident_depth)
+    tiles = np.ascontiguousarray(np.asarray(tiles, np.float32))
+    n_tiles, in_tile = tiles.shape
+    resident_len = 0 if resident is None else int(np.asarray(resident).size)
+    key = (symbol, shim_text, n_tiles, in_tile, out_numel, resident_len,
+           tuple(flags or ()), resident_depth)
+    design = _DESIGNS.get(key)
+    if design is None:
+        design = bricklib._build_streamed(
+            symbol, shim, n_tiles, in_tile, out_numel, resident_len, flags,
+            np.float32, np.float32, (np.float32 if resident_len else None), resident_depth)
+        _DESIGNS[key] = design
+
+    in_t = bricklib.iron.tensor(tiles.reshape(-1), dtype=np.float32, device="npu")
+    out_t = bricklib.iron.zeros((n_tiles * out_numel,), dtype=np.float32, device="npu")
+    if resident_len:
+        r_t = bricklib.iron.tensor(
+            np.ascontiguousarray(np.asarray(resident, np.float32).reshape(-1)),
+            dtype=np.float32, device="npu")
+        design(in_t, r_t, out_t)
+    else:
+        design(in_t, out_t)
     _stats["dispatches"] += 1
-    return np.asarray(r["got"], np.float32)
+    # .copy() is load-bearing: out_t.numpy() is a VIEW into the device buffer, so returning it
+    # and letting out_t fall out of scope dangles the array (segfault, not a wrong number).
+    # bricklib.verify_streamed copies for the same reason.
+    return out_t.numpy().reshape(n_tiles, out_numel).copy()
 
 
 def snake(x, alpha, tag):
