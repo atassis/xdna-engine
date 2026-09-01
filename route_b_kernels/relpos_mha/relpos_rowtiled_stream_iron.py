@@ -466,6 +466,12 @@ def my_relpos_stream(dev, T, TQ, KB, t_active=None, splitp=False, heads=1, tskip
              g_ac[h * rows + r], g_bd[h * rows + r], g_probs[h * rows + r],
              g_ctxf[h * rows + r], tactive_rtp[h * rows + r], rtp_barrier,
              dot_k, dot_p, dot_p_lo, softmax_k, ctxzero_k, ctx_k, narrow_k],
+            # MEASURED from the built ELF, not guessed. The deepest chain is
+            # main(0x40) -> relpos_stream_softmax(0x40) -> relpos_scores_softmax_rows(0x3c0)
+            # -> __mulsf3/__divsf3(0x40) = 0x480, against the 0x400 default. The generated
+            # linker script then places kpv0_cons_buff_0 at 0x70400 -- the first byte past
+            # the reservation, zero clearance -- so the overflow lands on the kpv stream.
+            stack_size=0x1000,
         )
         for h in range(heads) for r in range(rows)
     ]
