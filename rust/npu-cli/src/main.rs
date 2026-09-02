@@ -168,10 +168,11 @@ const MIN_UTTERANCE_S: f32 = 0.30;
 
 /// Longest span sent to ASR in one call.
 ///
-/// Parakeet truncates at WIN_MEL = 2040 mel frames = 20.4 s and returns 200 OK with the tail
-/// missing (`npu-engine/src/asr/parakeet.rs:160`). 18 s leaves margin for the frame arithmetic
-/// rather than sitting on the cliff edge. Overridable so a backend without the limit is not
-/// penalised by it.
+/// This was a correctness guard: parakeet used to truncate at WIN_MEL = 20.4 s and whisper at its
+/// 30 s frontend window, both returning 200 OK with the tail missing, so 18 s kept every span under
+/// the shorter cliff. Both backends now window internally and transcribe any length, so the cap is
+/// only about span granularity. The number has not been re-measured against the windowed backends;
+/// raising it gives whisper more context per call and should be swept before it is changed.
 fn asr_window_s() -> f32 {
     std::env::var("NPU_ASR_MAX_SPAN_S").ok().and_then(|v| v.parse().ok()).unwrap_or(18.0)
 }

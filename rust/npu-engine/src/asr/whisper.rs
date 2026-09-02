@@ -403,27 +403,32 @@ impl WhisperAsr {
     /// 1-step language detection (argmax over the language block), the prompt
     /// `[SOT, lang, TRANSCRIBE, NOTIMESTAMPS]`, full-vocab argmax, EOT stop, and `MAX_DECODE` cap.
     /// The ONLY difference is the source of per-step logits.
-    fn greedy_decode(&self, encoder_hidden: &[f32]) -> Vec<i64> {
+    ///
+    /// `lang` short-circuits detection. Long-form audio decodes window by window and the language is
+    /// a property of the recording, not of a 30 s slice: re-detecting per window lets one quiet or
+    /// music-only window flip mid-recording, and a flipped tag makes Whisper translate the rest.
+    /// Returns the tag actually used so the caller can pin it for the following windows.
+    fn greedy_decode(&self, encoder_hidden: &[f32], lang: Option<i64>) -> (Vec<i64>, i64) {
         if let Some(fd) = &self.npu_fused {
-            self.greedy_decode_fused(&mut fd.borrow_mut(), encoder_hidden)
+            self.greedy_decode_fused(&mut fd.borrow_mut(), encoder_hidden, lang)
         } else if let Some(dec) = &self.npu_decoder {
-            self.greedy_decode_npu(&mut dec.borrow_mut(), encoder_hidden)
+            self.greedy_decode_npu(&mut dec.borrow_mut(), encoder_hidden, lang)
         } else {
-            self.greedy_decode_onnx(encoder_hidden)
+            self.greedy_decode_onnx(encoder_hidden, lang)
         }
     }
 
     /// Whole-decode fused-ELF greedy decode. IDENTICAL control logic to `greedy_decode_npu` (lang
     /// detect, prompt, argmax, EOT, MAX_DECODE) — only the backend is `FusedDecoder` (1 dispatch/token).
-    fn greedy_decode_fused(&self, dec: &mut FusedDecoder, encoder_hidden: &[f32]) -> Vec<i64> {
+    fn greedy_decode_fused(&self, dec: &mut FusedDecoder, encoder_hidden: &[f32], lang: Option<i64>)
+        -> (Vec<i64>, i64) {
         let enc2 = Array2::from_shape_vec((T_ENC, self.cfg.d_model), encoder_hidden.to_vec())
             .expect("encoder_hidden is [T_ENC*D]");
         dec.precompute_cross(&enc2);
         // Step-0 language detection needs the FULL logits (restricted argmax over the language block) → it
         // stays on host. The steady-state loop uses the on-NPU argmax (`step_token`) when the argmax-fused
         // proj_out ELF is loaded: the ELF returns a token id and the 104 KB logits readback is dropped.
-        let lang_logits = dec.step(self.tokens.sot, 0);
-        let lang = self.tokens.pick_lang(&lang_logits);
+        let lang = lang.unwrap_or_else(|| self.tokens.pick_lang(&dec.step(self.tokens.sot, 0)));
         let prompt: Vec<i64> = self.tokens.prompt(lang);
         let mut ids = prompt.clone();
         dec.reset();
@@ -458,15 +463,17 @@ impl WhisperAsr {
         }
         // P0: per-phase breakdown for this utterance (no-op unless FUSED_PHASE_TIMING set).
         dec.dump_phase_timing();
-        ids
+        (ids, lang)
     }
 
     /// ONNX KV-cached greedy decode (the baseline; unchanged behavior).
-    fn greedy_decode_onnx(&self, encoder_hidden: &[f32]) -> Vec<i64> {
+    fn greedy_decode_onnx(&self, encoder_hidden: &[f32], lang: Option<i64>) -> (Vec<i64>, i64) {
         let enc_shape = vec![1, T_ENC as i64, self.cfg.d_model as i64];
         // language detection: 1-step `[SOT]` decode via the no-past graph (KV discarded).
-        let (lang_logits, _kv) = self.decode_step0(&[self.tokens.sot], &enc_shape, encoder_hidden);
-        let lang = self.tokens.pick_lang(&lang_logits);
+        let lang = lang.unwrap_or_else(|| {
+            let (l, _kv) = self.decode_step0(&[self.tokens.sot], &enc_shape, encoder_hidden);
+            self.tokens.pick_lang(&l)
+        });
         let prompt: Vec<i64> = self.tokens.prompt(lang);
         let mut ids = prompt.clone();
 
@@ -489,7 +496,7 @@ impl WhisperAsr {
             }
             ids.push(next);
         }
-        ids
+        (ids, lang)
     }
 
     /// On-NPU per-token greedy decode (`HostDecoder`). MIRRORS `greedy_decode_onnx` exactly — same
@@ -497,7 +504,8 @@ impl WhisperAsr {
     /// NPU decoder. The host decoder advances one token at a time with an explicit position; the
     /// 4-token prompt is fed sequentially (positions 0..3) and the next token argmaxed after the last
     /// prompt token, exactly matching the ONNX step-0-over-full-prompt semantics.
-    fn greedy_decode_npu(&self, dec: &mut HostDecoder, encoder_hidden: &[f32]) -> Vec<i64> {
+    fn greedy_decode_npu(&self, dec: &mut HostDecoder, encoder_hidden: &[f32], lang: Option<i64>)
+        -> (Vec<i64>, i64) {
         // Cross-KV from the encoder hidden states (also resets the self-KV cache for this utterance).
         let enc2 = Array2::from_shape_vec((T_ENC, self.cfg.d_model), encoder_hidden.to_vec())
             .expect("encoder_hidden is [T_ENC*D]");
@@ -506,8 +514,7 @@ impl WhisperAsr {
         // block, then reset (drop the SOT self-KV so the real prompt starts clean — mirrors the ONNX
         // path which discards the detection KV).
         dec.precompute_cross(&enc2);
-        let lang_logits = dec.step(self.tokens.sot, 0);
-        let lang = self.tokens.pick_lang(&lang_logits);
+        let lang = lang.unwrap_or_else(|| self.tokens.pick_lang(&dec.step(self.tokens.sot, 0)));
 
         let prompt: Vec<i64> = self.tokens.prompt(lang);
         let mut ids = prompt.clone();
@@ -536,7 +543,7 @@ impl WhisperAsr {
             }
             ids.push(next);
         }
-        ids
+        (ids, lang)
     }
 
     /// Preprocess + NPU-encode one clip → (flat encoder hidden `[T_ENC*D]`, preproc_ms, encoder_ms).
@@ -641,7 +648,7 @@ impl WhisperAsr {
     /// Single-stream (M=1) fused greedy decode for one pre-encoded clip → token ids (incl. prompt).
     pub fn decode_m1_ids(&self, enc_flat: &[f32]) -> Vec<i64> {
         let cell = self.npu_fused.as_ref().expect("decode_m1_ids needs NPU_DECODE_FUSED");
-        self.greedy_decode_fused(&mut cell.borrow_mut(), enc_flat)
+        self.greedy_decode_fused(&mut cell.borrow_mut(), enc_flat, None).0
     }
 
     /// Batched (B-stream) fused greedy decode over B pre-encoded clips → per-stream token ids.
@@ -751,12 +758,77 @@ impl WhisperAsr {
     }
 }
 
+/// How far back from the 30 s mark to look for a quiet cut.
+const SEEK_BACK: usize = 48_000; // 3 s @ 16 kHz
+/// Energy window for that search.
+const CUT_FRAME: usize = 320; // 20 ms @ 16 kHz
+
+/// Cut points for audio longer than one Whisper window.
+///
+/// The frontend is fixed at 30 s and the old path simply truncated to it: a 90-minute recording
+/// returned its first 30 s with a 200 OK and nothing on the wire to say the rest was dropped -- the
+/// same defect already fixed on the parakeet side (`asr::parakeet`, `WIN_MEL`/`DecodeCarry`).
+///
+/// Each boundary is placed at the QUIETEST 20 ms frame within `SEEK_BACK` of the hard limit, so a
+/// cut is far more likely to land in a pause than mid-word. The windows do not overlap: the decode
+/// prompt ends in `<|notimestamps|>`, so there are no timestamps to align two overlapping decodes
+/// with, and overlap would duplicate text rather than stitch it.
+fn window_bounds(samples: &[i16]) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    while pos < samples.len() {
+        let hard = (pos + N_SAMPLES).min(samples.len());
+        if hard == samples.len() {
+            out.push((pos, hard));
+            break;
+        }
+        // SEEK_BACK < N_SAMPLES, so `lo` is always well inside this window and the cut advances.
+        let lo = hard - SEEK_BACK;
+        let (mut cut, mut quietest) = (hard, u64::MAX);
+        let mut f = lo;
+        while f + CUT_FRAME <= hard {
+            let e: u64 = samples[f..f + CUT_FRAME].iter().map(|&v| { let v = v as i64; (v * v) as u64 }).sum();
+            if e < quietest {
+                quietest = e;
+                cut = f + CUT_FRAME / 2;
+            }
+            f += CUT_FRAME;
+        }
+        out.push((pos, cut));
+        pos = cut;
+    }
+    out
+}
+
 impl AsrModel for WhisperAsr {
+    /// Transcribe audio of ANY length, window by window. The language tag is detected once, on the
+    /// first window, and pinned for the rest: it is a property of the recording, and a re-detection
+    /// that flips on a quiet window makes Whisper translate everything after it.
     fn transcribe(&self, samples: &[i16]) -> Result<String, EngineError> {
+        let mut text = String::new();
+        let mut lang = None;
+        for (a, b) in window_bounds(samples) {
+            let (t, l) = self.transcribe_window(&samples[a..b], lang)?;
+            lang = Some(l);
+            if !t.is_empty() {
+                if !text.is_empty() {
+                    text.push(' ');
+                }
+                text.push_str(&t);
+            }
+        }
+        Ok(text)
+    }
+}
+
+impl WhisperAsr {
+    /// One <= 30 s window: preprocess, encode, decode. Returns the text and the language tag used,
+    /// so the caller can pin it across the remaining windows.
+    fn transcribe_window(&self, samples: &[i16], lang: Option<i64>) -> Result<(String, i64), EngineError> {
         let timing = std::env::var("WHISPER_TIMING").is_ok();
         let t_e2e = std::time::Instant::now();
 
-        // i16 -> f32 in [-1,1], pad/truncate to exactly N_SAMPLES (preprocessor.onnx is fixed-shape).
+        // i16 -> f32 in [-1,1], zero-pad to exactly N_SAMPLES (preprocessor.onnx is fixed-shape).
         let t_prep = std::time::Instant::now();
         let mut wav = vec![0f32; N_SAMPLES];
         let m = samples.len().min(N_SAMPLES);
@@ -796,7 +868,7 @@ impl AsrModel for WhisperAsr {
         // whisper_decoder.rs) still panics internally on a decode failure -- out of scope for this
         // pass (engine-errors-are-real): converting that whole resident-context/KV-cache chain is its
         // own follow-up, not a narrow LOAD/INFERENCE-signature conversion.
-        let ids = self.greedy_decode(&flat);
+        let (ids, lang) = self.greedy_decode(&flat, lang);
         let dec_ms = t_dec.elapsed().as_secs_f64() * 1e3;
 
         let text = self.detokenize(&ids);
@@ -819,7 +891,7 @@ impl AsrModel for WhisperAsr {
                  ms_per_tok={ms_per_tok:.3} disp_per_tok={disp_per_tok:.2}"
             );
         }
-        Ok(text)
+        Ok((text, lang))
     }
 }
 
@@ -831,4 +903,47 @@ fn argmax(v: &[f32]) -> i64 {
         }
     }
     best as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The regression this windowing exists for: audio past 30 s used to be dropped silently.
+    #[test]
+    fn long_audio_is_covered_gaplessly_instead_of_truncated() {
+        let samples = vec![1000i16; 75 * 16_000]; // 75 s
+        let w = window_bounds(&samples);
+        assert!(w.len() >= 3, "75 s needs at least 3 windows, got {}", w.len());
+        assert_eq!(w[0].0, 0);
+        assert_eq!(w.last().unwrap().1, samples.len(), "the tail must be transcribed, not dropped");
+        for pair in w.windows(2) {
+            assert_eq!(pair[0].1, pair[1].0, "windows must be contiguous, no gap and no overlap");
+        }
+        for &(a, b) in &w {
+            assert!(b > a, "no empty window");
+            assert!(b - a <= N_SAMPLES, "a window must fit the fixed 30 s frontend");
+        }
+    }
+
+    /// Short audio keeps the exact old shape: one window, no cut search.
+    #[test]
+    fn audio_under_one_window_stays_one_window() {
+        let samples = vec![1000i16; 5 * 16_000];
+        assert_eq!(window_bounds(&samples), vec![(0, samples.len())]);
+        assert!(window_bounds(&[]).is_empty(), "no audio, no work");
+    }
+
+    /// The point of searching backwards: a boundary lands in a pause, not mid-word.
+    #[test]
+    fn a_cut_prefers_a_silent_gap_to_the_hard_limit() {
+        let mut samples = vec![8000i16; 45 * 16_000];
+        // 200 ms of silence starting at 28.0 s -- inside SEEK_BACK of the 30 s hard limit.
+        let gap = 28 * 16_000;
+        for v in &mut samples[gap..gap + 3_200] {
+            *v = 0;
+        }
+        let cut = window_bounds(&samples)[0].1;
+        assert!((gap..gap + 3_200).contains(&cut), "cut {cut} should be inside the silence at {gap}");
+    }
 }
