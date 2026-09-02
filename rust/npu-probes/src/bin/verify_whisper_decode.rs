@@ -21,6 +21,9 @@ use npu_engine::asr::whisper_decoder::{HostDecoder, WhisperDecoderWeights};
 use npu_xrt::Device;
 
 const D: usize = 768;
+/// Decoder depth. This probe is whisper-small only -- `D` above pins it to that model -- so 12 is
+/// this checkpoint's decoder stack, not a Whisper-wide constant (large-v3-turbo's is 4).
+const DEC_LAYERS: usize = 12;
 const T_ENC: usize = 50; // small synthetic encoder length (cross-attn is length-invariant)
 const N_STEPS: usize = 5;
 const SOT: i64 = 50258; // <|startoftranscript|>
@@ -103,7 +106,7 @@ fn main() {
 
     // --- ONNX reference path ---
     println!("loading ONNX decoder graphs from {} ...", onnx_dir.display());
-    let onnx = WhisperOnnxDecoder::load(&onnx_dir);
+    let onnx = WhisperOnnxDecoder::load(&onnx_dir, DEC_LAYERS);
 
     // --- candidate decoder path (host f32 or NPU per-token matmuls) ---
     println!("loading host decoder weights from {} ...", weights_dir.display());
