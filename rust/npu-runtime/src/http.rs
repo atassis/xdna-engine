@@ -197,12 +197,15 @@ fn embeddings(req: &Request, handle: &Handle) -> Response {
 }
 
 fn transcriptions(req: &Request, handle: &Handle) -> Response {
-    let wav = match parse::extract_file_part(&req.body, &req.boundary) {
+    let file = match parse::extract_file_part(&req.body, &req.boundary) {
         Some(w) => w, None => return (400, "{\"error\":\"no file part\"}".into()),
     };
-    let samples = match parse::parse_wav_i16(wav) {
-        Some(s) if !s.is_empty() => s,
-        _ => return (400, "{\"error\":\"bad wav (need 16k mono 16-bit)\"}".into()),
+    // Any container ffmpeg can read, not only an exact 16 kHz mono WAV. OpenAI-shaped clients upload
+    // mp3/m4a/webm and video, and the strict parser answered every one of them with the same 400.
+    let samples = match crate::media::decode_bytes(file) {
+        Ok(s) if !s.is_empty() => s,
+        Ok(_) => return (400, "{\"error\":\"file decoded to no audio\"}".into()),
+        Err(e) => return (400, format!("{{\"error\":\"{}\"}}", parse::json_escape(&e)).into()),
     };
     // OpenAI's transcription request carries `model` as a form field. This route used to drop it and
     // always serve the default, which left ASR -- the capability this engine actually ships -- with
@@ -218,12 +221,15 @@ fn transcriptions(req: &Request, handle: &Handle) -> Response {
 /// Speaker diarization. OpenAI has no diarization endpoint, so this mirrors the shape of our own
 /// `/v1/audio/transcriptions`: multipart `file` part + a `model` form field.
 fn diarizations(req: &Request, handle: &Handle) -> Response {
-    let wav = match parse::extract_file_part(&req.body, &req.boundary) {
+    let file = match parse::extract_file_part(&req.body, &req.boundary) {
         Some(w) => w, None => return (400, "{\"error\":\"no file part\"}".into()),
     };
-    let samples = match parse::parse_wav_i16(wav) {
-        Some(s) if !s.is_empty() => s,
-        _ => return (400, "{\"error\":\"bad wav (need 16k mono 16-bit)\"}".into()),
+    // Any container ffmpeg can read, not only an exact 16 kHz mono WAV. OpenAI-shaped clients upload
+    // mp3/m4a/webm and video, and the strict parser answered every one of them with the same 400.
+    let samples = match crate::media::decode_bytes(file) {
+        Ok(s) if !s.is_empty() => s,
+        Ok(_) => return (400, "{\"error\":\"file decoded to no audio\"}".into()),
+        Err(e) => return (400, format!("{{\"error\":\"{}\"}}", parse::json_escape(&e)).into()),
     };
     let model = parse::extract_form_field(&req.body, &req.boundary, "model");
     match handle.diarize(model.as_deref(), samples, 16_000) {

@@ -30,7 +30,7 @@ fn main() -> Result<()> {
     let path = config_path(&cli);
     match &cli.cmd {
         Cmd::Serve { port, allow_degraded } => serve(&path, *port, *allow_degraded),
-        Cmd::Transcribe { wav, model } => transcribe(&path, wav, model.as_deref()),
+        Cmd::Transcribe { input, model } => transcribe(&path, input, model.as_deref()),
         Cmd::Embed { text, model } => embed(&path, text, model.as_deref()),
         Cmd::Diarize { wav, model, json } => diarize(&path, wav, model.as_deref(), *json),
         Cmd::TranscribeMedia { input, out, format, asr, diarize: diar, track, no_diarize } =>
@@ -147,14 +147,15 @@ fn serve(path: &Path, port: Option<u16>, allow_degraded: bool) -> Result<()> {
     http::serve(handle, path.to_path_buf(), port).context("serve")
 }
 
-fn transcribe(path: &Path, wav: &Path, model: Option<&str>) -> Result<()> {
+fn transcribe(path: &Path, input: &Path, model: Option<&str>) -> Result<()> {
     quiet_one_shot();
     let cfg = load_cfg(path)?;
     let root = root(&cfg)?;
+    // Decode BEFORE loading a model: a bad path or a file with no audio should fail in a second,
+    // not after a multi-second model load.
+    let samples = npu_runtime::media::decode_file(input).map_err(|e| anyhow!(e))?;
     // Lazy: a one-shot run should load the model it serves, and nothing else.
     let (handle, join) = start_lazy(cfg, Box::new(EngineLoader { root }))?;
-    let bytes = std::fs::read(wav).with_context(|| format!("read {}", wav.display()))?;
-    let samples = http::parse::parse_wav_i16(&bytes).ok_or_else(|| anyhow!("bad wav (need 16k mono 16-bit)"))?;
     let out = handle.transcribe(model, samples, 16_000).map_err(|e| anyhow!(e.to_string()));
     handle.shutdown(); let _ = join.join();
     println!("{}", out?.value);

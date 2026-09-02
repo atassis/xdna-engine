@@ -29,9 +29,13 @@ pub enum Cmd {
         /// Bind even when a configured model failed to load. `/healthz` still reports 503.
         #[arg(long)] allow_degraded: bool,
     },
-    /// One-shot transcription of a 16 kHz mono 16-bit WAV.
+    /// One-shot transcription of an audio or video file, printed to stdout.
+    ///
+    /// A 16 kHz mono 16-bit WAV is read directly; anything else (other rates, stereo, mp3, a video
+    /// container) is decoded through ffmpeg. For a speaker-attributed transcript file, see
+    /// `transcribe-media`.
     Transcribe {
-        #[arg(value_hint = ValueHint::FilePath)] wav: PathBuf,
+        #[arg(value_hint = ValueHint::FilePath)] input: PathBuf,
         #[arg(long)] model: Option<String>,
     },
     /// Transcribe a media file (video or audio) to a speaker-attributed transcript FILE.
