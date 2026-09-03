@@ -112,26 +112,23 @@ def gemv(M, K, ctx, **kw):
                 tile_size_output=tso, context=ctx, **kw)
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--spec", required=True, choices=sorted(SPECS), help="model spec name")
-    ap.add_argument("--weights", required=True, help="dir of dumped .npy weights (see dump_llm_weights.py)")
-    ap.add_argument("--out", required=True)
-    ap.add_argument("--layers", type=int, default=None, help="truncate the stack (bring-up)")
-    ap.add_argument("--max-seq", type=int, default=2048, help="KV-cache padded capacity S")
-    a = ap.parse_args()
+def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
+    """Construct the fused decode graph + its weight dict for a spec.
 
-    sp = SPECS[a.spec]
+    Shared by the generator CLI and verify_llm_decode.py so the harness drives the SAME graph the
+    artifact was built from, rather than a re-typed copy that can drift from it.
+    Returns (spec, fused, weights, meta_dims).
+    """
+    sp = SPECS[spec_name]
     sp.check(cols=COLS, tsi=TSI)
-    sp.check_seq(a.max_seq)
-    NL = a.layers if a.layers is not None else sp.n_layers
-    S = a.max_seq
+    sp.check_seq(max_seq)
+    NL = layers if layers is not None else sp.n_layers
+    S = max_seq
     D, FF, HD = sp.d_model, sp.ffn, sp.head_dim
     Hq, Hkv, QD, KVD, VOCAB = sp.n_q_heads, sp.n_kv_heads, sp.q_dim, sp.kv_dim, sp.vocab
-    os.makedirs(os.path.join(a.out, "buffers"), exist_ok=True)
 
     def npy(name):
-        return np.load(os.path.join(a.weights, f"{name}.npy")).astype(np.float32)
+        return np.load(os.path.join(weights_dir, f"{name}.npy")).astype(np.float32)
 
     def load_norm(name):
         # Gemma-3 stores RMSNorm gain as w with the kernel computing x_hat*(1+w); Qwen3 stores it
@@ -263,13 +260,29 @@ def main():
               f"({(len(rl)-2)//NL}/layer + 2 tail)")
         for k, v in c.most_common():
             print(f"  {k:16} {v:5}")
-        return
+        raise SystemExit(0)
 
     inputs = ["x", "rope_global"] + (["rope_local"] if sp.rope_theta_local is not None else [])
     fused = FusedMLIROperator(f"{sp.name.replace('-','_').replace('.','_')}_decode", rl,
                               input_args=inputs, output_args=["logits"],
                               buffer_sizes=bufsz, context=ctx)
     fused.compile()
+    return sp, fused, weights, dict(NL=NL, S=S, inputs=inputs, cache_names=cache_names)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--spec", required=True, choices=sorted(SPECS), help="model spec name")
+    ap.add_argument("--weights", required=True, help="dir of dumped .npy weights (see dump_llm_weights.py)")
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--layers", type=int, default=None, help="truncate the stack (bring-up)")
+    ap.add_argument("--max-seq", type=int, default=2048, help="KV-cache padded capacity S")
+    a = ap.parse_args()
+    os.makedirs(os.path.join(a.out, "buffers"), exist_ok=True)
+    sp, fused, weights, md = build_graph(a.spec, a.weights, a.layers, a.max_seq)
+    NL, S, inputs, cache_names = md["NL"], md["S"], md["inputs"], md["cache_names"]
+    D, HD, Hq, Hkv, VOCAB = sp.d_model, sp.head_dim, sp.n_q_heads, sp.n_kv_heads, sp.vocab
+    FF = sp.ffn
     elf = load_elf(fused).view(np.uint8).tobytes()
     in_sz, out_sz, scr = fused.buffer_sizes
     wnames = list(weights.keys())
