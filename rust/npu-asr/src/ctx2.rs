@@ -46,13 +46,39 @@ pub enum Precision {
     /// int8, tile 64×64×96 — ~3.6×, integer-EXACT kernel; needs host PTQ + per-model WER validation.
     Int8,
 }
+/// `"32x32x32"` -> `(32, 32, 32)`. None on anything else, so a typo is a loud panic at the call
+/// site rather than a silent fall back to the default tile.
+fn parse_tile(v: &str) -> Option<(usize, usize, usize)> {
+    let p: Vec<&str> = v.split('x').collect();
+    match p.as_slice() {
+        [m, k, n] => Some((m.parse().ok()?, k.parse().ok()?, n.parse().ok()?)),
+        _ => None,
+    }
+}
+
 impl Precision {
     /// (m, k, n) kernel tile -> xclbin/insts filename suffix `_{m}x{k}x{n}_8c`.
+    ///
+    /// `NPU_TILE=mxkxn` overrides it, keeping the precision's FORMAT (so bfp16 stays bfp16 and the
+    /// mode tag keeps its non-`nat` suffix). The two axes are welded together otherwise, which
+    /// makes tile-vs-format unfalsifiable: whisper-small runs bfp16 at 64x32x96 and times out while
+    /// turbo runs bfp16 at 32x32x32 and does not, and there was no way to vary one alone. The
+    /// override exists to answer that. It is diagnostic -- a shape it names must already be built,
+    /// and the default is unchanged.
     pub fn tile(self) -> (usize, usize, usize) {
-        match self {
+        let dflt = match self {
             Precision::NativeBf16 => (32, 32, 32),
             Precision::FastBf16 => (64, 32, 96),
             Precision::Int8 => (64, 64, 96),
+        };
+        match std::env::var("NPU_TILE").ok().as_deref().map(parse_tile) {
+            Some(Some(t)) => {
+                eprintln!("[ctx2] NPU_TILE override: tile {}x{}x{} (was {}x{}x{})",
+                          t.0, t.1, t.2, dflt.0, dflt.1, dflt.2);
+                t
+            }
+            Some(None) => panic!("NPU_TILE: expected `mxkxn` (e.g. 32x32x32)"),
+            None => dflt,
         }
     }
     /// device input-element bytes (bf16 = 2, int8 = 1).
