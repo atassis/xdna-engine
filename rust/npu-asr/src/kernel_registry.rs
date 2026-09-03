@@ -318,6 +318,133 @@ pub fn resolve_checked(dir: &Path, stem: &str) -> Result<KernelArtifacts, Manife
     Ok(art)
 }
 
+// ---------------------------------------------------------------------------------------------
+// Toolchain-pin freshness: catches a re-pin that wiped a kernel build dir and was never rebuilt.
+// ---------------------------------------------------------------------------------------------
+//
+// `resolve_checked` above proves an artifact is INTERNALLY consistent (the bytes on disk match
+// what the manifest recorded), but a manifest generated before a `toolchain.lock` bump is
+// internally consistent and STALE at the same time -- content-hashing the artifact against its
+// own manifest can never see that the pin underneath it moved. `scripts/kernel_sandbox.sh`'s
+// `ensure_fresh_sandbox` already writes a `.toolchain-stamp` (12 hex chars of
+// `sha256(toolchain.lock)`) into a build dir on every purge-or-keep decision, but until now
+// nothing ever read it back: the file existed only to drive the NEXT build's purge, not to
+// answer "is what's here still built against the CURRENT pin" before the engine loads from it.
+// That gap is exactly how a re-pin went silent for 5 days: `ensure_fresh_sandbox` purged the
+// dir on the pin change, the rebuild that should have followed never completed, and nothing
+// downstream compared the (now-stale-or-missing) stamp against `toolchain.lock` again.
+
+/// Filename `scripts/kernel_sandbox.sh::ensure_fresh_sandbox` writes at build time.
+pub const TOOLCHAIN_STAMP_FILE: &str = ".toolchain-stamp";
+
+pub fn toolchain_stamp_path(dir: &Path) -> PathBuf {
+    dir.join(TOOLCHAIN_STAMP_FILE)
+}
+
+/// The 12-hex-char toolchain stamp, hashing `toolchain.lock` SEMANTICALLY: `#` comments and
+/// blank lines stripped, exactly as `scripts/kernel_sandbox.sh::current_toolchain_hash` and
+/// `toolchain_up.sh`'s LOCKHASH do. It must be that derivation and not `sha256(whole file)`:
+/// the stamp this compares against is WRITTEN by the shell, so any disagreement makes every
+/// dir read StampMismatch forever. The lock is 5 KEY=value fields plus several hundred words of
+/// inline prose, so whole-file hashing also makes a typo fix look like a re-pin.
+pub fn current_toolchain_hash(repo_root: &Path) -> std::io::Result<String> {
+    let text = std::fs::read_to_string(repo_root.join("toolchain.lock"))?;
+    let mut h = Sha256::new();
+    for line in text.lines() {
+        let stripped = match line.find('#') {
+            Some(i) => line[..i].trim_end(),
+            None => line,
+        };
+        if stripped.trim().is_empty() {
+            continue;
+        }
+        h.update(stripped.as_bytes());
+        h.update(b"\n");
+    }
+    let hex: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    Ok(hex[..12].to_string())
+}
+
+/// Errors from [`check_toolchain_freshness`] -- each variant names exactly what is wrong so the
+/// message is actionable without a second lookup.
+#[derive(Debug)]
+pub enum FreshnessError {
+    /// The dir does not exist at all -- a re-pin purge (or a fresh checkout) with no build since.
+    MissingDir(PathBuf),
+    /// The dir exists but was never stamped -- built before this check existed, or by a path that
+    /// does not call `ensure_fresh_sandbox`. Freshness is unknown, and unknown must fail, not pass.
+    MissingStamp(PathBuf),
+    /// The stamp does not match the CURRENT `toolchain.lock` hash: the dir was built against a
+    /// different pin and nothing has rebuilt it since. This is the exact re-pin-wipe shape --
+    /// worse than a missing dir when the stale build happens to still load.
+    StampMismatch { dir: PathBuf, stamp: String, current: String },
+    /// The stamp matches, but the dir holds no `final_*.xclbin` -- the purge ran, the rebuild did
+    /// not (or died before producing anything), so a fresh stamp sits over an empty dir.
+    NoArtifacts(PathBuf),
+    Io(PathBuf, String),
+}
+
+impl std::fmt::Display for FreshnessError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FreshnessError::MissingDir(dir) => {
+                write!(f, "kernel build dir {} does not exist", dir.display())
+            }
+            FreshnessError::MissingStamp(dir) => write!(
+                f,
+                "{} has no {TOOLCHAIN_STAMP_FILE} -- freshness against toolchain.lock is unknown",
+                dir.display()
+            ),
+            FreshnessError::StampMismatch { dir, stamp, current } => write!(
+                f,
+                "{} was built against toolchain.lock={stamp}, but toolchain.lock is now {current} \
+                 -- it was re-pinned and this dir was never rebuilt",
+                dir.display()
+            ),
+            FreshnessError::NoArtifacts(dir) => write!(
+                f,
+                "{} is stamped current but contains no final_*.xclbin -- the rebuild after the \
+                 last purge did not finish",
+                dir.display()
+            ),
+            FreshnessError::Io(p, e) => write!(f, "io error at {}: {e}", p.display()),
+        }
+    }
+}
+
+impl std::error::Error for FreshnessError {}
+
+/// Verify `dir` was built against the toolchain pin currently in `toolchain.lock` (under
+/// `repo_root`) and actually holds at least one xclbin. Pure filesystem -- no device, no XRT --
+/// so it is safe to run before anything touches `/dev/accel/*`, and cheap enough to run on every
+/// `npu serve` startup.
+pub fn check_toolchain_freshness(dir: &Path, repo_root: &Path) -> Result<(), FreshnessError> {
+    if !dir.is_dir() {
+        return Err(FreshnessError::MissingDir(dir.to_path_buf()));
+    }
+    let stamp_path = toolchain_stamp_path(dir);
+    let stamp = match std::fs::read_to_string(&stamp_path) {
+        Ok(s) => s.trim().to_string(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(FreshnessError::MissingStamp(dir.to_path_buf()));
+        }
+        Err(e) => return Err(FreshnessError::Io(stamp_path, e.to_string())),
+    };
+    let current = current_toolchain_hash(repo_root)
+        .map_err(|e| FreshnessError::Io(repo_root.join("toolchain.lock"), e.to_string()))?;
+    if stamp != current {
+        return Err(FreshnessError::StampMismatch { dir: dir.to_path_buf(), stamp, current });
+    }
+    let has_xclbin = std::fs::read_dir(dir)
+        .map_err(|e| FreshnessError::Io(dir.to_path_buf(), e.to_string()))?
+        .filter_map(|e| e.ok())
+        .any(|e| e.file_name().to_str().is_some_and(|s| s.starts_with("final_") && s.ends_with(".xclbin")));
+    if !has_xclbin {
+        return Err(FreshnessError::NoArtifacts(dir.to_path_buf()));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -531,5 +658,122 @@ mod tests {
 
         let loaded = load_manifest(td.path()).unwrap();
         assert_eq!(loaded, manifest);
+    }
+
+    // ------------------------------------------------------------------------------------
+    // check_toolchain_freshness: constructs the exact re-pin-wipe shape (defect #3,
+    // artifact-preflight-and-fail-loud) and proves the check fails loud on it, alongside its
+    // sibling failure shapes and the one case that must pass.
+    // ------------------------------------------------------------------------------------
+
+    /// A fake repo root with a `toolchain.lock` whose hash is independently known, so tests do
+    /// not depend on `sha256sum` being on PATH or on this repo's real lock file.
+    fn fake_repo(lock_bytes: &[u8]) -> (tempfile::TempDir, String) {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("toolchain.lock"), lock_bytes).unwrap();
+        let hash = current_toolchain_hash(repo.path()).unwrap();
+        (repo, hash)
+    }
+
+    #[test]
+    fn freshness_passes_when_stamp_matches_and_xclbin_present() {
+        let (repo, hash) = fake_repo(b"pin-a");
+        let dir = repo.path().join("build");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(toolchain_stamp_path(&dir), &hash).unwrap();
+        write_fake_kernel(&dir, "512x1024x4096_64x32x128_8c", b"xclbin-bytes", None);
+
+        check_toolchain_freshness(&dir, repo.path()).expect("fresh dir must pass");
+    }
+
+    /// THE defect this check exists for: `ensure_fresh_sandbox` stamped the dir for an OLD pin
+    /// (its xclbins are real, current, self-consistent artifacts -- `resolve_checked` would pass
+    /// them), `toolchain.lock` was re-pinned since, and nothing rebuilt. Old resolve_checked-style
+    /// checks see nothing wrong; this one must fail loud and name both hashes.
+    #[test]
+    fn freshness_fails_loud_when_repin_leaves_a_stale_stamp() {
+        let (repo, _old_hash_unused) = fake_repo(b"pin-a");
+        let dir = repo.path().join("build");
+        std::fs::create_dir(&dir).unwrap();
+        let stale_stamp = current_toolchain_hash(repo.path()).unwrap();
+        std::fs::write(toolchain_stamp_path(&dir), &stale_stamp).unwrap();
+        write_fake_kernel(&dir, "512x1024x4096_64x32x128_8c", b"xclbin-bytes", None);
+
+        // The re-pin: toolchain.lock changes, nobody rebuilds `dir`.
+        std::fs::write(repo.path().join("toolchain.lock"), b"pin-b").unwrap();
+        let new_hash = current_toolchain_hash(repo.path()).unwrap();
+        assert_ne!(stale_stamp, new_hash, "test setup must actually change the hash");
+
+        let err = check_toolchain_freshness(&dir, repo.path()).expect_err("stale stamp must fail");
+        match &err {
+            FreshnessError::StampMismatch { dir: d, stamp, current } => {
+                assert_eq!(d, &dir);
+                assert_eq!(stamp, &stale_stamp);
+                assert_eq!(current, &new_hash);
+            }
+            other => panic!("expected StampMismatch, got {other}"),
+        }
+        let msg = err.to_string();
+        assert!(msg.contains(&stale_stamp) && msg.contains(&new_hash), "message: {msg}");
+        assert!(msg.contains("re-pinned"), "message should say why: {msg}");
+    }
+
+    /// The other half of the same 5-day outage: `ensure_fresh_sandbox` purges the dir on the pin
+    /// change and nothing rebuilds it AT ALL -- not stale, just gone.
+    #[test]
+    fn freshness_fails_loud_on_missing_dir() {
+        let (repo, _hash) = fake_repo(b"pin-a");
+        let dir = repo.path().join("build"); // never created
+        let err = check_toolchain_freshness(&dir, repo.path()).expect_err("missing dir must fail");
+        assert!(matches!(err, FreshnessError::MissingDir(d) if d == dir));
+    }
+
+    #[test]
+    fn freshness_fails_loud_when_never_stamped() {
+        let (repo, _hash) = fake_repo(b"pin-a");
+        let dir = repo.path().join("build");
+        std::fs::create_dir(&dir).unwrap();
+        write_fake_kernel(&dir, "512x1024x4096_64x32x128_8c", b"xclbin-bytes", None);
+        // No .toolchain-stamp written: a dir built by a path that predates this check, or that
+        // never calls ensure_fresh_sandbox. Freshness is unknown, which must not read as "ok".
+        let err = check_toolchain_freshness(&dir, repo.path()).expect_err("unstamped dir must fail");
+        assert!(matches!(err, FreshnessError::MissingStamp(d) if d == dir));
+    }
+
+    /// The purge ran (stamp is current) but the rebuild after it died before producing anything --
+    /// a fresh stamp over an empty dir, which a stamp-only check would wrongly call healthy.
+    #[test]
+    fn freshness_fails_loud_when_stamped_but_empty() {
+        let (repo, hash) = fake_repo(b"pin-a");
+        let dir = repo.path().join("build");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(toolchain_stamp_path(&dir), &hash).unwrap();
+        // No xclbin written.
+        let err = check_toolchain_freshness(&dir, repo.path()).expect_err("empty dir must fail");
+        assert!(matches!(err, FreshnessError::NoArtifacts(d) if d == dir));
+    }
+}
+
+#[cfg(test)]
+mod toolchain_hash_tests {
+    use super::current_toolchain_hash;
+
+    /// The stamp this hash is compared against is WRITTEN by `scripts/kernel_sandbox.sh`, so the
+    /// two derivations must agree byte for byte. Pinned here as behaviour rather than as a digest
+    /// literal: comments and blank lines are not part of the identity, the KEY=value fields are.
+    #[test]
+    fn comments_and_blank_lines_do_not_change_the_stamp() {
+        let td = tempfile::tempdir().unwrap();
+        let bare = "A=1\nB=two\n";
+        let commented = "# leading prose\n\nA=1   # trailing essay about A\n\n  \nB=two\n# tail\n";
+        std::fs::write(td.path().join("toolchain.lock"), bare).unwrap();
+        let a = current_toolchain_hash(td.path()).unwrap();
+        std::fs::write(td.path().join("toolchain.lock"), commented).unwrap();
+        let b = current_toolchain_hash(td.path()).unwrap();
+        assert_eq!(a, b, "prose edits must not mint a new toolchain stamp");
+        assert_eq!(a.len(), 12);
+
+        std::fs::write(td.path().join("toolchain.lock"), "A=1\nB=THREE\n").unwrap();
+        assert_ne!(a, current_toolchain_hash(td.path()).unwrap(), "a field change must move it");
     }
 }

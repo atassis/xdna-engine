@@ -121,11 +121,36 @@ fn preflight_serve(port: u16) -> Result<()> {
     );
 }
 
+/// Scenario name gating the whole_array resident-artifact freshness check below. String, not a
+/// structural field: `ScenarioConfig` has no "which NPU backend does this need" marker (the
+/// still-open half of `artifact-preflight-and-fail-loud` -- see its `next:`), so this is the
+/// same kind of pragmatic name match the engine itself already uses at a few call sites (e.g.
+/// `xclbin.file_name()...contains("krtp")` in npu.rs). Narrow on purpose: it catches exactly the
+/// artifact behind the 5-day outage this task names, not every artifact every scenario can touch.
+const PARAKEET_SCENARIO_NAME: &str = "parakeet-tdt-0.6b-v3";
+
+/// Device-free: fails BEFORE `start()` ever calls `Device::open`, so a stale/missing resident
+/// build is diagnosed without needing (or touching) the NPU at all. Scoped to configs that
+/// actually load the Parakeet scenario -- see `PARAKEET_SCENARIO_NAME`.
+fn preflight_artifacts(cfg: &Config, root: &Path) -> Result<()> {
+    for m in &cfg.models {
+        let p = Path::new(&m.scenario);
+        let scenario_path = if p.is_absolute() { p.to_path_buf() } else { root.join(p) };
+        let Ok(sc) = npu_engine::config::ScenarioConfig::load(&scenario_path) else { continue };
+        if sc.scenario.name == PARAKEET_SCENARIO_NAME {
+            npu_parakeet::npu::preflight(root)
+                .map_err(|e| anyhow!("model {:?} ({}): {e}", m.name, sc.scenario.name))?;
+        }
+    }
+    Ok(())
+}
+
 fn serve(path: &Path, port: Option<u16>, allow_degraded: bool) -> Result<()> {
     let cfg = load_cfg(path)?;
     let port = port.unwrap_or(cfg.server.port);
     preflight_serve(port)?;
     let root = root(&cfg)?;
+    preflight_artifacts(&cfg, &root)?;
     let (handle, _join) = start(cfg, Box::new(EngineLoader { root }))?;
     // Do not bind a port the service cannot serve from. The initial reconcile records a load
     // failure as `Failed` rather than panicking, so before this the socket came up and every
@@ -469,6 +494,85 @@ mod tests {
     fn an_empty_diarization_renders_without_panicking() {
         assert_eq!(render_segments(&[], false), "");
         assert!(render_segments(&[], true).contains("\"segments\":[]"));
+    }
+
+    /// Builds a fake `root` with a real `toolchain.lock`, a `scenarios/asr.toml` naming the
+    /// Parakeet scenario, and (optionally) a resident build dir stamped for a DIFFERENT pin --
+    /// the re-pin-wipe shape `artifact-preflight-and-fail-loud` exists to catch. Returns the root
+    /// and the `Config` a real `serve()` call would have loaded.
+    fn fake_parakeet_root(stamp_matches_current_pin: bool) -> (tempfile::TempDir, Config) {
+        let td = tempfile::tempdir().unwrap();
+        std::fs::write(td.path().join("toolchain.lock"), b"pin-current").unwrap();
+        std::fs::create_dir_all(td.path().join("scenarios")).unwrap();
+        std::fs::write(
+            td.path().join("scenarios/asr.toml"),
+            "[scenario]\nkind = \"asr\"\nname = \"parakeet-tdt-0.6b-v3\"\n\
+             [model]\nhidden=1024\nff=4096\nn_heads=8\nhead_dim=128\nn_layers=24\nmax_seq=2040\n\
+             [artifacts]\nweights = \"artifacts/parakeet\"\n",
+        ).unwrap();
+        let wa_dir = td.path().join(npu_parakeet::npu::WA_SUBDIR);
+        std::fs::create_dir_all(&wa_dir).unwrap();
+        std::fs::write(wa_dir.join("final_512x1024x4096_64x32x128_8c.xclbin"), b"fake").unwrap();
+        let stamp = if stamp_matches_current_pin {
+            npu_asr::kernel_registry::current_toolchain_hash(td.path()).unwrap()
+        } else {
+            "stale00000pin".to_string()
+        };
+        std::fs::write(wa_dir.join(".toolchain-stamp"), stamp).unwrap();
+        let cfg = Config {
+            server: ServerCfg::default(),
+            defaults: Defaults::default(),
+            models: vec![ModelCfg {
+                name: "parakeet".into(),
+                scenario: td.path().join("scenarios/asr.toml").to_str().unwrap().to_string(),
+            }],
+        };
+        (td, cfg)
+    }
+
+    #[test]
+    fn preflight_artifacts_passes_when_resident_build_matches_current_pin() {
+        let (td, cfg) = fake_parakeet_root(true);
+        preflight_artifacts(&cfg, td.path()).expect("fresh resident build must pass");
+    }
+
+    /// THE demonstration: construct the exact broken state (5-day-outage shape) and show the
+    /// check refuses it, naming both the stale and current pin.
+    #[test]
+    fn preflight_artifacts_fails_loud_when_resident_build_predates_a_repin() {
+        let (td, cfg) = fake_parakeet_root(false);
+        let err = preflight_artifacts(&cfg, td.path())
+            .expect_err("a resident build stamped for a DIFFERENT pin must not pass preflight");
+        let msg = err.to_string();
+        assert!(msg.contains("parakeet-tdt-0.6b-v3"), "{msg}");
+        assert!(msg.contains("re-pinned"), "{msg}");
+        assert!(msg.contains("build_parakeet_kernels.sh"), "{msg}");
+    }
+
+    /// A config with no Parakeet scenario at all must not pay (or fail) this check -- proves the
+    /// scoping in `PARAKEET_SCENARIO_NAME` actually gates, not just names, the check.
+    #[test]
+    fn preflight_artifacts_is_a_noop_for_a_non_parakeet_config() {
+        let td = tempfile::tempdir().unwrap();
+        std::fs::write(td.path().join("toolchain.lock"), b"pin-current").unwrap();
+        std::fs::create_dir_all(td.path().join("scenarios")).unwrap();
+        std::fs::write(
+            td.path().join("scenarios/bge.toml"),
+            "[scenario]\nkind = \"embeddings\"\nname = \"bge-base-en-v1.5\"\n\
+             [model]\nhidden=768\nff=3072\nn_heads=12\nhead_dim=64\nn_layers=12\nmax_seq=512\n\
+             [artifacts]\nweights = \"artifacts/bge-base/encoder\"\n",
+        ).unwrap();
+        let cfg = Config {
+            server: ServerCfg::default(),
+            defaults: Defaults::default(),
+            models: vec![ModelCfg {
+                name: "bge".into(),
+                scenario: td.path().join("scenarios/bge.toml").to_str().unwrap().to_string(),
+            }],
+        };
+        // No mlir-aie/.../whole_array/build dir exists under td at all -- if the check were not
+        // scoped, this would fail on MissingDir. It must pass because nothing here is Parakeet.
+        preflight_artifacts(&cfg, td.path()).expect("non-parakeet config must skip the check");
     }
 }
 

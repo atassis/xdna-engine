@@ -986,11 +986,14 @@ dependencies = [
  "clap_complete",
  "ndarray",
  "ndarray-npy",
+ "npu-asr",
  "npu-engine",
+ "npu-parakeet",
  "npu-runtime",
  "npu-weights",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

@@ -25,6 +25,10 @@ pub enum LoadError {
     GroupId { arg: i32, source: String },
     /// Allocating the `what` device buffer object failed (commonly: out of device memory).
     Alloc { what: &'static str, source: String },
+    /// The resident kernel build dir is missing, unstamped, or stamped for a different
+    /// `toolchain.lock` pin -- see [`crate::npu::preflight`]. Distinct from `Kernel`: the
+    /// artifacts may load fine and still be built against a toolchain the repo no longer pins.
+    StaleBuild(String),
 }
 
 impl fmt::Display for LoadError {
@@ -44,6 +48,7 @@ impl fmt::Display for LoadError {
             }
             LoadError::GroupId { arg, source } => write!(f, "group_id({arg}): {source}"),
             LoadError::Alloc { what, source } => write!(f, "alloc {what}: {source}"),
+            LoadError::StaleBuild(e) => write!(f, "{e}"),
         }
     }
 }
