@@ -130,8 +130,10 @@ impl WhisperEncoder {
             let base = root.join("artifacts/encoder_mha");
             let h = cfg.n_heads;
             // Two names, because the op's own naming changed: IRON's MHA dropped `causal` as a
-            // field, so builds before that carry `_causal0_` and builds after do not. Both are the
-            // same non-causal design.
+            // field, so builds before that carry `_causal0_` and builds after do not. The name says
+            // NOTHING about whether the kernel is non-causal -- mha.cc masks unconditionally unless
+            // it is compiled with -DMHA_NONCAUSAL (StaticMHA.get_kernel_artifacts). A `_causal0_`
+            // artifact predating that flag is CAUSAL despite its name; rebuild rather than trust it.
             let stem = [format!("StaticMHA_h{h}_s1500_d64_kv0_npu2"),
                         format!("StaticMHA_h{h}_s1500_d64_kv0_causal0_npu2")]
                 .into_iter()
