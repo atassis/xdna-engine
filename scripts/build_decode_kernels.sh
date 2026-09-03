@@ -20,6 +20,11 @@
 # Usage:  scripts/build_decode_kernels.sh [K] [N]   (defaults K=768 N=768)
 set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"; cd "$REPO"
+# Makefile.resident includes route_b_override.mk, so the per-object toolchain stamp already covers
+# this path; the sandbox backstop is the second layer, added for parity with build_kernels.sh.
+# Sourced AND called -- an imported-but-uncalled guard is what build_partition_ab_probe_kernels.sh
+# had, and it reads as protection that is not there.
+source scripts/kernel_sandbox.sh
 source scripts/iron_env.sh
 bash scripts/sync_kernels.sh >/dev/null   # copy whole_array_iron.py + Makefile.resident into the sandbox
 
@@ -36,6 +41,7 @@ M=64          # smallest legal M for the whole_array 8-col native-bf16 design (s
 m=8; k=32; n=32; COLS=8
 
 MMW=mlir-aie/programming_examples/basic/matrix_multiplication/whole_array
+ensure_fresh_sandbox "$MMW/build"
 SUFFIX="${M}x${K}x${N}_${m}x${k}x${n}_${COLS}c"
 
 echo "== decode GEMV: M=${M} K=${K} N=${N} (tile ${m}x${k}x${n}, ${COLS} cols, native bf16->f32) =="
