@@ -1,5 +1,5 @@
 //! ESM-2 pre-norm encoder on the NPU (C1 zero-pad path). The resident matmul kernel is hardwired to
-//! K=KA(768), N∈{768,1536,3072}, and FfnMm2 to [3072,768]. ESM's real widths (hidden 320/480, ff
+//! K=ctx.ka(768), N∈{768,1536,3072}, and FfnMm2 to [3072,768]. ESM's real widths (hidden 320/480, ff
 //! 1280/1920) are zero-padded onto those shapes as the matmul B-operand; LayerNorm/residual/RoPE run
 //! on the REAL hidden H (never on the zero padding, else the norm statistics are wrong). Reuses the
 //! npu_asr ctx2 matmul engines untouched.
@@ -7,7 +7,7 @@ use std::path::Path;
 use std::rc::Rc;
 
 use ndarray::{s, Array2};
-use npu_asr::ctx2::{CtxAOp, Epi, FfnMm2, SharedCtxA, KA, MM2_OUT, NA};
+use npu_asr::ctx2::{CtxAOp, CtxAShape, Epi, FfnMm2, SharedCtxA};
 use npu_asr_host::{gelu, layer_norm, mha};
 use npu_xrt::Device;
 
@@ -77,6 +77,9 @@ struct EsmBlock {
     o: CtxAOp,
     ffn1: CtxAOp,
     ffn2: FfnMm2,
+    /// The ctxA widths this block pads up to. ESM's own hidden (320/480) and ff (1280/1920) are
+    /// narrower than the shared GEMM's, so every activation is padded out and sliced back.
+    ctx: CtxAShape,
     hidden: usize,
     ff: usize,
     n_heads: usize,
@@ -84,6 +87,8 @@ struct EsmBlock {
 }
 impl EsmBlock {
     fn new(shared: Rc<SharedCtxA>, l: &EsmLayer, hidden: usize, ff: usize, n_heads: usize, head_dim: usize) -> Self {
+        let ctx = shared.shape().clone();
+        let (ka, na, mm2_out) = (ctx.ka, ctx.na, ctx.mm2_out);
         let proj_n = round_stream(hidden); // 320/480 -> 768
         let ff_n = round_stream(ff); // 1280 -> 1536, 1920 -> 3072
         // Build a bf16 GEMV op, preferring the pre-packed checkpoint bf16 bits (fast restart: no per-start
@@ -95,17 +100,17 @@ impl EsmBlock {
         let mk = |wk: &str, bk: &str, n: usize| {
             let bias = vpad(&l.v(bk), n);
             if let Some((sh, bits)) = l.bf16_bits(wk) {
-                if sh.as_slice() == [KA, n] {
+                if sh.as_slice() == [ka, n] {
                     if let Some(op) = CtxAOp::new_bf16(shared.clone(), bits, n, Epi::Bias, &bias) {
                         return op;
                     }
                 }
             }
-            CtxAOp::new(shared.clone(), &pad2(&l.m(wk), KA, n), n, Epi::Bias, &bias)
+            CtxAOp::new(shared.clone(), &pad2(&l.m(wk), ka, n), n, Epi::Bias, &bias)
         };
         let ffn1 = mk("ffn1_w", "ffn1_b", ff_n);
-        // ffn2: weight [ff, hidden] -> pad to [NA=3072, MM2_OUT=768]; bias -> 768.
-        let ffn2 = FfnMm2::new(shared.clone(), &pad2(&l.m("ffn2_w"), NA, MM2_OUT), &vpad(&l.v("ffn2_b"), MM2_OUT));
+        // ffn2: weight [ff, hidden] -> pad to the shared context's [na, mm2_out]; bias -> mm2_out.
+        let ffn2 = FfnMm2::new(shared.clone(), &pad2(&l.m("ffn2_w"), na, mm2_out), &vpad(&l.v("ffn2_b"), mm2_out));
         EsmBlock {
             ln_attn_w: l.v("ln_attn_w"),
             ln_attn_b: l.v("ln_attn_b"),
@@ -117,6 +122,7 @@ impl EsmBlock {
             o: mk("attn_out_w", "attn_out_b", proj_n),
             ffn1,
             ffn2,
+            ctx,
             hidden,
             ff,
             n_heads,
@@ -127,20 +133,20 @@ impl EsmBlock {
         let h = self.hidden;
         // --- pre-norm self-attention ---
         let xn = layer_norm(x, &self.ln_attn_w, &self.ln_attn_b, LN_EPS); // [seq, h]
-        let xn_p = pad_cols(&xn, KA);
+        let xn_p = pad_cols(&xn, self.ctx.ka);
         let mut q = slice_cols(&self.q.forward(&xn_p), h);
         let mut k = slice_cols(&self.k.forward(&xn_p), h);
         let vv = slice_cols(&self.v.forward(&xn_p), h);
         rope_heads(&mut q, self.n_heads, self.head_dim);
         rope_heads(&mut k, self.n_heads, self.head_dim);
         let ctx = mha(&q, &k, &vv, self.n_heads, self.head_dim, false, valid); // [seq, h]
-        let attn = slice_cols(&self.o.forward(&pad_cols(&ctx, KA)), h);
+        let attn = slice_cols(&self.o.forward(&pad_cols(&ctx, self.ctx.ka)), h);
         let x = add(x, &attn); // residual, NO LayerNorm (pre-norm)
         // --- pre-norm FFN ---
         let fnn = layer_norm(&x, &self.ln_ffn_w, &self.ln_ffn_b, LN_EPS); // [seq, h]
-        let ff_out = slice_cols(&self.ffn1.forward(&pad_cols(&fnn, KA)), self.ff); // [seq, ff]
+        let ff_out = slice_cols(&self.ffn1.forward(&pad_cols(&fnn, self.ctx.ka)), self.ff); // [seq, ff]
         let hmid = gelu(&ff_out); // gelu(0)=0 so padding stays 0
-        let y = slice_cols(&self.ffn2.forward(&pad_cols(&hmid, NA)), h); // [seq, h]
+        let y = slice_cols(&self.ffn2.forward(&pad_cols(&hmid, self.ctx.na)), h); // [seq, h]
         add(&x, &y)
     }
 }

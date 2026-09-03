@@ -1016,7 +1016,7 @@ impl FusedDecoder {
                 eprintln!(
                     "[whisper_decoder] NPU_DECODE_PROJOUT_CTX2: ln_post+proj_out on NPU ctx2 ({} chunks of N={})",
                     ops.len(),
-                    npu_asr::ctx2::NA
+                    sh.shape().na
                 );
                 Some(ops)
             }
@@ -1317,7 +1317,7 @@ impl FusedDecoder {
         if let Some(ref pops) = self.proj_out_ops {
             let nrm = ln_norm_only(&x12[0..D]);
             let nrm2d = Array2::from_shape_vec((1, D), nrm).expect("nrm [1,D]");
-            let na = npu_asr::ctx2::NA;
+            let na = pops[0].n();
             let mut logits = vec![0f32; VOCAB];
             for (c, op) in pops.iter().enumerate() {
                 let out = op.forward(&nrm2d); // [1, NA] f32
@@ -1858,7 +1858,7 @@ fn apply_tiled_ctxa(op: &CtxAOp, x: &Array2<f32>) -> Array2<f32> {
 ///   `W'[i, jj] = γ[i] · proj_out_w[i, j0+jj]`,  `bias'[jj] = Σ_i β[i]·proj_out_w[i, j0+jj]`
 /// (the last chunk's `jj ≥ width` cols get 0 weight + 0 bias — harmless, dropped in `step()`).
 fn build_proj_out_ctx2(sh: &Rc<SharedCtxA>, w: &WhisperDecoderWeights) -> Vec<CtxAOp> {
-    let na = npu_asr::ctx2::NA;
+    let na = sh.shape().na;
     let gamma = &w.ln_post_w; // [D]
     let beta = &w.ln_post_b;  // [D]
     let pw = &w.proj_out_w;   // [D, VOCAB]

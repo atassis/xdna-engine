@@ -85,13 +85,73 @@ impl Precision {
         if self == Precision::NativeBf16 { "nat" } else { "" }
     }
 }
-/// ctxA fixed contraction / padded output width.
-pub const KA: usize = 768;
-pub const NA: usize = 3072;
+/// The shape ctxA is built for: the contraction width, the output widths it serves, and the tile the
+/// kernel was compiled with.
+///
+/// These used to be module constants (KA=768, NA=3072, KAUG=800, MM2_OUT=768, a fixed stream list),
+/// i.e. whisper-small's shape compiled into the only resident-GEMM wrapper the engine has. BERT, ESM
+/// and the Whisper decoder all ride the same wrapper and happen to be 768-wide too, so the constants
+/// were never wrong -- until a second Whisper size. large-v3-turbo is K=1280/N=5120, which is a
+/// different resident xclbin and a different set of instruction streams, not a different parameter.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CtxAShape {
+    /// Contraction width K: every op on this context takes `[m, ka]` activations.
+    pub ka: usize,
+    /// Widest output width served. The resident xclbin is built at this N; narrower ops run on it
+    /// through their own instruction stream and write a `[m, n]` prefix of the same output BO.
+    pub na: usize,
+    /// Output width of the FFN's second matmul (`FfnMm2`), which is the model's hidden width.
+    pub mm2_out: usize,
+    /// Output widths that get their own instruction stream. Must contain every `n` any op asks for.
+    pub streams: Vec<usize>,
+    /// Kernel tile `(m, k, n)` in the xclbin name, when this shape's kernels were built at a tile
+    /// other than the precision's default. turbo's are, because N=5120 overruns the ShimNOC DMA BD's
+    /// 20-bit stride field at m=64 (256 rows x 5120 = 1,310,720 > 1,048,576), so all four turbo
+    /// shapes share a uniform m=32 program.
+    pub tile: Option<(usize, usize, usize)>,
+}
+
+impl CtxAShape {
+    /// whisper-small, and the shape BERT/ESM/the Whisper decoder ride. The historical default.
+    ///
+    /// The N=1536 stream is NOT a Whisper width -- the encoder only asks for 768 and 3072. It is
+    /// here because ESM rounds its 1280-wide FFN up to it (`esm::encoder::round_stream`), and every
+    /// model on this context shares one stream list.
+    pub fn whisper_small() -> CtxAShape {
+        CtxAShape { ka: 768, na: 3072, mm2_out: 768, streams: vec![768, 1536, 3072], tile: None }
+    }
+    /// whisper-large-v3-turbo: d_model 1280, ffn 5120.
+    pub fn whisper_turbo() -> CtxAShape {
+        CtxAShape { ka: 1280, na: 5120, mm2_out: 1280, streams: vec![1280, 5120],
+                    tile: Some((32, 32, 32)) }
+    }
+    /// The ctxA shape for a Whisper encoder of this width, or an error naming what is missing.
+    ///
+    /// A shape is only valid if its kernels were BUILT: the tile is a property of the artifacts on
+    /// disk, not something derivable from the dims, so an unbuilt size is an error here rather than
+    /// a filename that fails to open later.
+    pub fn for_whisper(d_model: usize, ffn: usize) -> Result<CtxAShape, String> {
+        match (d_model, ffn) {
+            (768, 3072) => Ok(CtxAShape::whisper_small()),
+            (1280, 5120) => Ok(CtxAShape::whisper_turbo()),
+            _ => Err(format!(
+                "no ctxA kernel set is built for a Whisper encoder of d_model={d_model} ffn={ffn} \
+                 (built: 768/3072 = whisper-small, 1280/5120 = large-v3-turbo)")),
+        }
+    }
+
+    /// Contraction width the DEVICE sees under the modal epilogue: one extra 32-wide k-block carries
+    /// the bias (`A_aug=[A|ones]`, `B_aug=[B;bias]`), so no host bias-add and no third DMA channel.
+    pub fn kaug(&self) -> usize { self.ka + 32 }
+    /// How many `[ka, mm2_out]` partials the FFN's second matmul splits into.
+    pub fn mm2_ksplit(&self) -> usize { self.na / self.ka }
+}
+
+impl Default for CtxAShape {
+    fn default() -> Self { CtxAShape::whisper_small() }
+}
 /// K-augmented contraction for the Step-A modal on-chip epilogue (`NPU_MODAL_EPI=1`): bias rides an
 /// extra 32-wide k-block (`A_aug=[A|ones]`, `B_aug=[B;bias]` → `A@B+bias`), so the on-chip epilogue
-/// needs no host bias-add and no 3rd DMA channel. KAUG = KA + 32 = 800.
-pub const KAUG: usize = KA + 32;
 
 /// On-chip-epilogue replacement, applied on the HOST to ctxA's f32 output (first N columns only).
 #[derive(Clone, Copy, PartialEq)]
@@ -118,6 +178,8 @@ pub enum Epi {
 /// padded readback, and still zero context switches. Each op (see [`CtxAOp`]) brings its own
 /// real-sized `[KA, n]` weight BO + host epilogue.
 pub struct SharedCtxA {
+    /// What this context was built for. Every op on it is checked against these widths.
+    shape: CtxAShape,
     dev: Rc<Device>,
     kern: Rc<Kernel>,
     /// per-shape instruction streams: (N, instr BO, n_instr). Same resident kernel; swap per op.
@@ -194,10 +256,11 @@ struct PipeSlot {
     a_inited: std::cell::Cell<bool>,
 }
 
-/// The per-shape output widths the resident 768x3072 kernel serves via instruction streams.
-const CTXA_STREAMS: [usize; 3] = [768, 1536, NA];
 
 impl SharedCtxA {
+    /// The shape this context serves.
+    pub fn shape(&self) -> &CtxAShape { &self.shape }
+
     pub fn new(dev: &Rc<Device>, root: &Path) -> Rc<Self> {
         let cfg = crate::tuning::TuningConfig::baked_default(Precision::from_env()).with_env_overrides();
         Self::with_tuning(dev, root, &cfg)
@@ -210,9 +273,15 @@ impl SharedCtxA {
     }
 
     pub fn with_tuning(dev: &Rc<Device>, root: &Path, cfg: &crate::tuning::TuningConfig) -> Rc<Self> {
+        Self::with_shape(dev, root, cfg, CtxAShape::default())
+    }
+
+    pub fn with_shape(dev: &Rc<Device>, root: &Path, cfg: &crate::tuning::TuningConfig,
+                      shape: CtxAShape) -> Rc<Self> {
         let prec = cfg.precision;
         let wa = root.join(WA_SUBDIR);
-        let (mt, kt, nt) = prec.tile();
+        // The tile is the precision's unless this shape's kernels were built at another one.
+        let (mt, kt, nt) = shape.tile.unwrap_or_else(|| prec.tile());
         // Step-A modal on-chip epilogue: K-aug bias + on-chip SiLU, f32 out, one resident xclbin with
         // RTP-selected mode per inst-stream. bf16/native only (the modal xclbin is the native 32³ tile).
         // modal on-chip epilogue (K-aug bias + on-chip SiLU, f32 out) — built for both bf16 tiles
@@ -223,7 +292,7 @@ impl SharedCtxA {
         // L3: on-chip int8 dequant (int8 only, opt-in). Loads the `modalint8dq` resident xclbin instead
         // of the plain int8 one; its epilogue dequants the i32 accumulator to f32 on-core (×S from rtp[0]).
         let modal_int8 = prec.is_int8() && cfg.int8_onchip_dequant;
-        let ka_dev = if modal { KAUG } else { KA };
+        let ka_dev = if modal { shape.kaug() } else { shape.ka };
         if !npu_xrt::quiet() {
             eprintln!(
                 "[ctx2] V2 encoder precision = {prec:?} (tile {mt}x{kt}x{nt}){}{}",
@@ -234,16 +303,19 @@ impl SharedCtxA {
         // ONE resident kernel = the largest (N=3072) whole-array program; every op runs on it via its
         // per-N (and, modal, per-mode) instruction stream.
         let xclbin = if modal_int8 {
-            crate::kernel_registry::xclbin_path(&wa, &format!("{PAD_M}x{KA}x{NA}_{mt}x{kt}x{nt}_8c_modalint8dq"))
+            let (ka, na) = (shape.ka, shape.na);
+            crate::kernel_registry::xclbin_path(&wa, &format!("{PAD_M}x{ka}x{na}_{mt}x{kt}x{nt}_8c_modalint8dq"))
         } else if modal {
             // Default = the proven 2-branch modalsilu xclbin (rtp[0]: 0=identity, 1=silu). NPU_ENC_GELU_FUSED
             // opts into the 3-branch modalgelu superset (adds rtp[0]=2 = on-chip GELU for the Whisper encoder
             // fc1 fusion); silu/identity behavior is unchanged (validated baseline-identical without fusion).
             let tag = if std::env::var("NPU_ENC_GELU_FUSED").is_ok() { "modalgelu" } else { "modalsilu" };
             let nat = prec.nat_tag();
-            crate::kernel_registry::xclbin_path(&wa, &format!("{PAD_M}x{KAUG}x{NA}_{mt}x{kt}x{nt}_8c_{tag}{nat}"))
+            let (kaug, na) = (shape.kaug(), shape.na);
+            crate::kernel_registry::xclbin_path(&wa, &format!("{PAD_M}x{kaug}x{na}_{mt}x{kt}x{nt}_8c_{tag}{nat}"))
         } else {
-            crate::kernel_registry::xclbin_path(&wa, &format!("{PAD_M}x{KA}x{NA}_{mt}x{kt}x{nt}_8c"))
+            let (ka, na) = (shape.ka, shape.na);
+            crate::kernel_registry::xclbin_path(&wa, &format!("{PAD_M}x{ka}x{na}_{mt}x{kt}x{nt}_8c"))
         };
         let kern = dev
             .load_kernel(xclbin.to_str().unwrap(), None)
@@ -266,14 +338,15 @@ impl SharedCtxA {
 
         // plain (non-modal) per-N streams; modal loads its 6 (N × {silu,identity}) streams below;
         // modal_int8 loads its 3 dequant streams + scans each for the 32 rtp[0] patch slots.
-        let mut streams = Vec::with_capacity(CTXA_STREAMS.len());
+        let mut streams = Vec::with_capacity(shape.streams.len());
         let mut modal_streams: Vec<(usize, u8, Bo, usize)> = Vec::new();
         let mut modal_int8_streams: Vec<ModalInt8Stream> = Vec::new();
         if modal_int8 {
             const N_AIE_CORES: usize = 32; // 4 rows × 8 cols — one rtp[0] write packet each
             let sentinel = 1.0f32.to_le_bytes(); // the iron bakes 1.0f into every rtp[0] slot
-            for &n in CTXA_STREAMS.iter() {
-                let insts = crate::kernel_registry::insts_path(&wa, &format!("{PAD_M}x{KA}x{n}_{mt}x{kt}x{nt}_8c_modalint8dq"));
+            for &n in shape.streams.iter() {
+                let ka = shape.ka;
+                let insts = crate::kernel_registry::insts_path(&wa, &format!("{PAD_M}x{ka}x{n}_{mt}x{kt}x{nt}_8c_modalint8dq"));
                 let (instr_bytes, n_instr) = read_instr_words(&insts);
                 let offsets: Vec<usize> = (0..instr_bytes.len().saturating_sub(3))
                     .step_by(4)
@@ -293,22 +366,24 @@ impl SharedCtxA {
             }
         } else if modal {
             let gelu_enabled = std::env::var("NPU_ENC_GELU_FUSED").is_ok();
-            for &n in CTXA_STREAMS.iter() {
+            for &n in shape.streams.iter() {
                 // mode: 1=silu, 0=identity (every N); 2=gelu only when NPU_ENC_GELU_FUSED + a stream exists
                 // (built for N=NA, the FFN fc1 width — the only gelu user). All modes run on the loaded xclbin.
                 for (mode, tag) in [(1u8, "modalsilu"), (0u8, "modalid"), (2u8, "modalgelu")] {
                     let nat = prec.nat_tag();
-                    let insts = crate::kernel_registry::insts_path(&wa, &format!("{PAD_M}x{KAUG}x{n}_{mt}x{kt}x{nt}_8c_{tag}{nat}"));
+                    let kaug = shape.kaug();
+                    let insts = crate::kernel_registry::insts_path(&wa, &format!("{PAD_M}x{kaug}x{n}_{mt}x{kt}x{nt}_8c_{tag}{nat}"));
                     if mode == 2 && (!gelu_enabled || !insts.exists()) {
-                        continue; // gelu stream only loaded when opted-in + present (NA only)
+                        continue; // gelu stream only loaded when opted-in + present (shape.na only)
                     }
                     let (bo, n_instr) = load_stream(&insts);
                     modal_streams.push((n, mode, bo, n_instr));
                 }
             }
         } else {
-            for &n in CTXA_STREAMS.iter() {
-                let insts = crate::kernel_registry::insts_path(&wa, &format!("{PAD_M}x{KA}x{n}_{mt}x{kt}x{nt}_8c"));
+            for &n in shape.streams.iter() {
+                let ka = shape.ka;
+                let insts = crate::kernel_registry::insts_path(&wa, &format!("{PAD_M}x{ka}x{n}_{mt}x{kt}x{nt}_8c"));
                 let (bo, n_instr) = load_stream(&insts);
                 streams.push((n, bo, n_instr));
             }
@@ -317,7 +392,7 @@ impl SharedCtxA {
         // activation BO: in_bytes/elem (bf16=2, int8=1), K = ka_dev (768 / 800 modal). Output BO is
         // 4B/elem (f32 / i32).
         let bo_a = dev.alloc_bo(&kern, PAD_M * ka_dev * prec.in_bytes(), FLAG_HOST_ONLY, g_a).unwrap();
-        let bo_c = dev.alloc_bo(&kern, PAD_M * NA * 4, FLAG_HOST_ONLY, g_c).unwrap();
+        let bo_c = dev.alloc_bo(&kern, PAD_M * shape.na * 4, FLAG_HOST_ONLY, g_c).unwrap();
         let bo_tmp = dev.alloc_bo(&kern, 1, FLAG_HOST_ONLY, g_tmp).unwrap();
         let bo_tr = dev.alloc_bo(&kern, 4, FLAG_HOST_ONLY, g_tr).unwrap();
 
@@ -340,23 +415,24 @@ impl SharedCtxA {
                 if modal {
                     let one = f32_to_bf16_bits(1.0);
                     for r in 0..PAD_M {
-                        a_buf[r * ka_dev + KA] = one;
+                        a_buf[r * ka_dev + shape.ka] = one;
                     }
                 }
                 pipe.push(PipeSlot {
                     bo_a: dev.alloc_bo(&kern, PAD_M * ka_dev * prec.in_bytes(), FLAG_HOST_ONLY, g_a).unwrap(),
-                    bo_c: dev.alloc_bo(&kern, PAD_M * NA * 4, FLAG_HOST_ONLY, g_c).unwrap(),
+                    bo_c: dev.alloc_bo(&kern, PAD_M * shape.na * 4, FLAG_HOST_ONLY, g_c).unwrap(),
                     bo_tmp: dev.alloc_bo(&kern, 1, FLAG_HOST_ONLY, g_tmp).unwrap(),
                     bo_tr: dev.alloc_bo(&kern, 4, FLAG_HOST_ONLY, g_tr).unwrap(),
-                    cbuf: RefCell::new(vec![0f32; PAD_M * NA]),
+                    cbuf: RefCell::new(vec![0f32; PAD_M * shape.na]),
                     a_buf: RefCell::new(if prec.is_int8() { Vec::new() } else { a_buf }),
-                    a_buf_i8: RefCell::new(if prec.is_int8() { vec![0i8; PAD_M * KA] } else { Vec::new() }),
+                    a_buf_i8: RefCell::new(if prec.is_int8() { vec![0i8; PAD_M * shape.ka] } else { Vec::new() }),
                     a_inited: std::cell::Cell::new(false),
                 });
             }
         }
 
         Rc::new(SharedCtxA {
+            shape: shape.clone(),
             dev: dev.clone(),
             kern,
             streams,
@@ -375,13 +451,13 @@ impl SharedCtxA {
                 if modal {
                     let one = f32_to_bf16_bits(1.0);
                     for r in 0..PAD_M {
-                        v[r * ka_dev + KA] = one;
+                        v[r * ka_dev + shape.ka] = one;
                     }
                 }
                 v
             }),
-            a_buf_i8: RefCell::new(if prec.is_int8() { vec![0i8; PAD_M * KA] } else { Vec::new() }),
-            cbuf: RefCell::new(vec![0f32; PAD_M * NA]),
+            a_buf_i8: RefCell::new(if prec.is_int8() { vec![0i8; PAD_M * shape.ka] } else { Vec::new() }),
+            cbuf: RefCell::new(vec![0f32; PAD_M * shape.na]),
             a_inited: std::cell::Cell::new(false),
             pipeline,
             pipe,
@@ -443,19 +519,20 @@ impl SharedCtxA {
     /// activation scale to dequant with in [`pipe_read`]. bf16 and int8 both supported.
     fn pipe_start(&self, s: usize, a_real: ArrayView2<f32>, bo_b: &Bo, n: usize) -> (Run, f32) {
         let (mp, kk) = a_real.dim();
-        debug_assert_eq!(kk, KA);
+        debug_assert_eq!(kk, self.shape.ka);
         let slot = &self.pipe[s];
         let tc = Instant::now();
         let scale_a = if self.prec.is_int8() {
             let scale_a = quant_scale(a_real, mp, self.fast_int8);
             let mut a = slot.a_buf_i8.borrow_mut();
-            a.par_chunks_mut(KA).take(mp).enumerate().for_each(|(r, row)| {
-                for c in 0..KA {
+            let ka = self.shape.ka;
+            a.par_chunks_mut(ka).take(mp).enumerate().for_each(|(r, row)| {
+                for c in 0..ka {
                     row[c] = quant_i8(a_real[[r, c]], scale_a);
                 }
             });
             if slot.a_inited.get() {
-                slot.bo_a.write_bytes(&i8_bytes(&a)[..mp * KA]).unwrap();
+                slot.bo_a.write_bytes(&i8_bytes(&a)[..mp * self.shape.ka]).unwrap();
             } else {
                 slot.bo_a.write_bytes(i8_bytes(&a)).unwrap();
                 slot.a_inited.set(true);
@@ -464,13 +541,14 @@ impl SharedCtxA {
         } else {
             let kd = self.ka_dev;
             let mut a = slot.a_buf.borrow_mut();
+            let ka = self.shape.ka;
             a.par_chunks_mut(kd).take(mp).enumerate().for_each(|(r, row)| {
                 let arow = a_real.row(r);
                 if let Some(src) = arow.as_slice() {
                     // contiguous fast path: AVX-512 bf16 pack (byte-identical to the scalar)
-                    pack_f32_to_bf16(&src[..KA], &mut row[..KA]);
+                    pack_f32_to_bf16(&src[..ka], &mut row[..ka]);
                 } else {
-                    for c in 0..KA {
+                    for c in 0..ka {
                         row[c] = f32_to_bf16_bits(a_real[[r, c]]);
                     }
                 }
@@ -536,7 +614,7 @@ impl SharedCtxA {
             .iter()
             .find(|(sn, _, _)| *sn == n)
             .map(|(_, bo, ni)| (bo, *ni))
-            .unwrap_or_else(|| panic!("ctxA: no instruction stream for N={n} (have {CTXA_STREAMS:?})"))
+            .unwrap_or_else(|| panic!("ctxA: no instruction stream for N={n} (have {:?})", self.shape.streams))
     }
 }
 
@@ -558,9 +636,12 @@ impl CtxAOp {
     /// `w_real` is `[KA, n]` (LN affine pre-folded for the FFN mm1; raw weight otherwise). `bias` is
     /// length `n`: applied on host after the matmul (before SiLU for `Epi::SiluBias`). `n` must be a
     /// served stream width (768/1536/3072).
+    /// This op's output width -- one of the shared context's served stream widths.
+    pub fn n(&self) -> usize { self.n }
+
     pub fn new(shared: Rc<SharedCtxA>, w_real: &Array2<f32>, n: usize, epi: Epi, bias: &[f32]) -> Self {
-        assert_eq!(w_real.dim(), (KA, n));
-        assert!(CTXA_STREAMS.contains(&n), "ctxA op N={n} not a served stream");
+        assert_eq!(w_real.dim(), (shared.shape.ka, n));
+        assert!(shared.shape.streams.contains(&n), "ctxA op N={n} not a served stream");
         // Epi::None carries no bias (an empty slice); the bias-applying epilogues need length n.
         assert_eq!(bias.len(), if epi == Epi::None { 0 } else { n });
 
@@ -574,7 +655,7 @@ impl CtxAOp {
             let mut w_scale = vec![0f32; n];
             if shared.modal_int8 {
                 let mut amax = 0f32;
-                for kk in 0..KA {
+                for kk in 0..shared.shape.ka {
                     for nn in 0..n {
                         amax = amax.max(w_real[[kk, nn]].abs());
                     }
@@ -585,14 +666,14 @@ impl CtxAOp {
                 // per-output-channel (per n column) symmetric quant. scale[nn] = max|W[:,nn]|/127.
                 for nn in 0..n {
                     let mut amax = 0f32;
-                    for kk in 0..KA {
+                    for kk in 0..shared.shape.ka {
                         amax = amax.max(w_real[[kk, nn]].abs());
                     }
                     w_scale[nn] = if amax > 0.0 { amax / 127.0 } else { 1.0 };
                 }
             }
-            let mut b_i8 = vec![0i8; KA * n];
-            for kk in 0..KA {
+            let mut b_i8 = vec![0i8; shared.shape.ka * n];
+            for kk in 0..shared.shape.ka {
                 let base = kk * n;
                 for nn in 0..n {
                     b_i8[base + nn] = quant_i8(w_real[[kk, nn]], w_scale[nn]);
@@ -608,14 +689,14 @@ impl CtxAOp {
             // the silu-mode stream. Non-modal: plain [KA, n].
             let kd = shared.ka_dev;
             let mut b_bits = vec![0u16; kd * n];
-            for kk in 0..KA {
+            for kk in 0..shared.shape.ka {
                 let base = kk * n;
                 for nn in 0..n {
                     b_bits[base + nn] = f32_to_bf16_bits(w_real[[kk, nn]]);
                 }
             }
             if shared.modal {
-                let base = KA * n; // the K-aug bias row
+                let base = shared.shape.ka * n; // the K-aug bias row
                 for nn in 0..n {
                     let bv = if epi == Epi::None { 0.0 } else { bias[nn] };
                     b_bits[base + nn] = f32_to_bf16_bits(bv);
@@ -657,14 +738,14 @@ impl CtxAOp {
         epi: Epi,
         bias: &[f32],
     ) -> Option<Self> {
-        assert!(CTXA_STREAMS.contains(&n), "ctxA op N={n} not a served stream");
+        assert!(shared.shape.streams.contains(&n), "ctxA op N={n} not a served stream");
         assert_eq!(bias.len(), if epi == Epi::None { 0 } else { n });
         // Only the plain non-modal bf16 BO layout matches a straight [KA, n] bf16 handoff. Modal
         // (KAUG rows + K-aug bias) and int8 need a different BO build -> let the caller use `new`.
         if shared.modal || shared.prec.is_int8() {
             return None;
         }
-        if w_bits.len() != KA * n {
+        if w_bits.len() != shared.shape.ka * n {
             return None;
         }
         let bo_b = shared.dev_alloc_b(w_bits.len() * 2).expect("alloc ctxA bf16 weight BO");
@@ -696,7 +777,7 @@ impl CtxAOp {
             return self.forward_view_int8(a_real);
         }
         let (mp, kk) = a_real.dim();
-        assert_eq!(kk, KA);
+        assert_eq!(kk, self.shared.shape.ka);
         assert!(mp <= PAD_M);
         let sh = &self.shared;
 
@@ -707,13 +788,14 @@ impl CtxAOp {
         let tc = Instant::now();
         {
             let mut a = sh.a_buf.borrow_mut();
+            let ka = self.shared.shape.ka;
             a.par_chunks_mut(kd).take(mp).enumerate().for_each(|(r, row)| {
                 let arow = a_real.row(r);
                 if let Some(src) = arow.as_slice() {
                     // contiguous fast path: AVX-512 bf16 pack (byte-identical to the scalar)
-                    pack_f32_to_bf16(&src[..KA], &mut row[..KA]);
+                    pack_f32_to_bf16(&src[..ka], &mut row[..ka]);
                 } else {
-                    for c in 0..KA {
+                    for c in 0..ka {
                         row[c] = f32_to_bf16_bits(a_real[[r, c]]);
                     }
                 }
@@ -790,7 +872,7 @@ impl CtxAOp {
     /// `CtxAOp` on a bf16 `SharedCtxA` instead.
     fn forward_view_int8(&self, a_real: ArrayView2<f32>) -> Array2<f32> {
         let (mp, kk) = a_real.dim();
-        assert_eq!(kk, KA);
+        assert_eq!(kk, self.shared.shape.ka);
         assert!(mp <= PAD_M);
         let sh = &self.shared;
         let n = self.n;
@@ -804,13 +886,14 @@ impl CtxAOp {
         let scale_a = quant_scale(a_real, mp, sh.fast_int8);
         {
             let mut a = sh.a_buf_i8.borrow_mut();
-            a.par_chunks_mut(KA).take(mp).enumerate().for_each(|(r, row)| {
-                for c in 0..KA {
+            let ka = self.shared.shape.ka;
+            a.par_chunks_mut(ka).take(mp).enumerate().for_each(|(r, row)| {
+                for c in 0..ka {
                     row[c] = quant_i8(a_real[[r, c]], scale_a);
                 }
             });
             if sh.a_inited.get() {
-                sh.bo_a.write_bytes(&i8_bytes(&a)[..mp * KA]).unwrap();
+                sh.bo_a.write_bytes(&i8_bytes(&a)[..mp * self.shared.shape.ka]).unwrap();
             } else {
                 sh.bo_a.write_bytes(i8_bytes(&a)).unwrap();
                 sh.a_inited.set(true);
@@ -859,13 +942,14 @@ impl CtxAOp {
         let scale_a = quant_scale(a_real, mp, sh.fast_int8);
         {
             let mut a = sh.a_buf_i8.borrow_mut();
-            a.par_chunks_mut(KA).take(mp).enumerate().for_each(|(r, row)| {
-                for c in 0..KA {
+            let ka = self.shared.shape.ka;
+            a.par_chunks_mut(ka).take(mp).enumerate().for_each(|(r, row)| {
+                for c in 0..ka {
                     row[c] = quant_i8(a_real[[r, c]], scale_a);
                 }
             });
             if sh.a_inited.get() {
-                sh.bo_a.write_bytes(&i8_bytes(&a)[..mp * KA]).unwrap();
+                sh.bo_a.write_bytes(&i8_bytes(&a)[..mp * self.shared.shape.ka]).unwrap();
             } else {
                 sh.bo_a.write_bytes(i8_bytes(&a)).unwrap();
                 sh.a_inited.set(true);
@@ -927,7 +1011,7 @@ impl CtxAOp {
     pub fn forward_activated_bf16(&self, a_real: ArrayView2<f32>, out: &mut Vec<u16>) -> usize {
         assert!(!self.shared.prec.is_int8(), "forward_activated_bf16 is bf16-only");
         let (mp, kk) = a_real.dim();
-        assert_eq!(kk, KA);
+        assert_eq!(kk, self.shared.shape.ka);
         assert!(mp <= PAD_M);
         let sh = &self.shared;
         let kd = sh.ka_dev;
@@ -937,12 +1021,13 @@ impl CtxAOp {
         let tc = Instant::now();
         {
             let mut a = sh.a_buf.borrow_mut();
+            let ka = self.shared.shape.ka;
             a.par_chunks_mut(kd).take(mp).enumerate().for_each(|(r, row)| {
                 let arow = a_real.row(r);
                 if let Some(src) = arow.as_slice() {
-                    pack_f32_to_bf16(&src[..KA], &mut row[..KA]);
+                    pack_f32_to_bf16(&src[..ka], &mut row[..ka]);
                 } else {
-                    for c in 0..KA {
+                    for c in 0..ka {
                         row[c] = f32_to_bf16_bits(a_real[[r, c]]);
                     }
                 }
@@ -1037,9 +1122,10 @@ impl CtxAOp {
             let mut a = sh.a_buf.borrow_mut();
             // copy the bf16 column-slice into the activation buffer (cols 0..KA); the modal ones-column
             // at index KA is preserved (we only overwrite 0..KA).
+            let ka = self.shared.shape.ka;
             a.par_chunks_mut(kd).take(mp).enumerate().for_each(|(r, row)| {
                 let base = r * src_stride + col_off;
-                row[..KA].copy_from_slice(&src_bf16[base..base + KA]);
+                row[..ka].copy_from_slice(&src_bf16[base..base + ka]);
             });
             if sh.a_inited.get() {
                 sh.bo_a.write_bytes(&u16_bytes(&a)[..mp * kd * 2]).unwrap();
@@ -1139,12 +1225,11 @@ impl CtxAOp {
 /// (each a plain N=768 ctxA dispatch, Epi::None), accumulated on the host in f32, then bias2 added
 /// once. Host-side f32 accumulation across the 4 partials is numerically equal-or-better than one
 /// on-chip K=3072 reduction. `MM2_OUT` (768) is a served stream; each partial reuses it.
-pub const MM2_OUT: usize = 768;
-const MM2_KSPLIT: usize = NA / KA; // 3072 / 768 = 4
 
 pub struct FfnMm2 {
-    parts: Vec<CtxAOp>, // MM2_KSPLIT ops on ctxA, each weight [KA, MM2_OUT], Epi::None
-    bias2: Vec<f32>,    // length MM2_OUT, added on host once after the partial sum
+    shape: CtxAShape,
+    parts: Vec<CtxAOp>, // self.shape.mm2_ksplit() ops on ctxA, each weight [self.shape.ka, self.shape.mm2_out], Epi::None
+    bias2: Vec<f32>,    // length self.shape.mm2_out, added on host once after the partial sum
     /// Resident-FFN draft (`forward_resident`): the reused `[mp, NA]` bf16 buffer that holds the
     /// fc1->fc2 intermediate across the seam (no f32 materialize, no per-partial re-conversion). Empty
     /// until the resident path is first used; lazily grown to `PAD_M*NA`.
@@ -1153,16 +1238,21 @@ pub struct FfnMm2 {
 
 impl FfnMm2 {
     /// `w2` is `[3072, 768]` (K-major), `b2` length 768. Split W2 along K into 4× `[768, 768]`.
+    /// Output width of this mm2 -- the model's hidden width.
+    pub fn out_width(&self) -> usize { self.shape.mm2_out }
+
     pub fn new(shared: Rc<SharedCtxA>, w2: &Array2<f32>, b2: &[f32]) -> Self {
-        assert_eq!(w2.dim(), (NA, MM2_OUT));
-        assert_eq!(b2.len(), MM2_OUT);
-        let parts = (0..MM2_KSPLIT)
+        let shape = shared.shape.clone();
+        assert_eq!(w2.dim(), (shared.shape.na, shared.shape.mm2_out));
+        assert_eq!(b2.len(), shared.shape.mm2_out);
+        let parts = (0..shared.shape.mm2_ksplit())
             .map(|i| {
-                let wk = w2.slice(s![i * KA..(i + 1) * KA, ..]).to_owned(); // [KA, MM2_OUT]
-                CtxAOp::new(shared.clone(), &wk, MM2_OUT, Epi::None, &[])
+                let wk = w2.slice(s![i * shared.shape.ka..(i + 1) * shared.shape.ka, ..]).to_owned(); // [ka, mm2_out]
+                CtxAOp::new(shared.clone(), &wk, shared.shape.mm2_out, Epi::None, &[])
             })
             .collect();
         FfnMm2 {
+            shape,
             parts,
             bias2: b2.to_vec(),
             inter: RefCell::new(Vec::new()),
@@ -1203,9 +1293,9 @@ impl FfnMm2 {
         };
         // 2) fc2: each K-split partial reads a bf16 column-slice of the resident intermediate directly.
         let inter = self.inter.borrow();
-        let mut acc = Array2::<f32>::zeros((mp, MM2_OUT));
+        let mut acc = Array2::<f32>::zeros((mp, self.shape.mm2_out));
         for (i, op) in self.parts.iter().enumerate() {
-            acc += &op.forward_bf16_rows(&inter, mp, NA, i * KA);
+            acc += &op.forward_bf16_rows(&inter, mp, self.shape.na, i * self.shape.ka);
         }
         self.add_bias2(&mut acc);
         acc
@@ -1214,15 +1304,15 @@ impl FfnMm2 {
     /// `h` is `[Mp, 3072]` (the SiLU'd FFN intermediate). Returns `[Mp, 768]` = h@W2 + b2.
     pub fn forward(&self, h: &Array2<f32>) -> Array2<f32> {
         let (mp, kk) = h.dim();
-        assert_eq!(kk, NA);
+        assert_eq!(kk, self.shape.na);
         if self.parts[0].shared.pipeline {
             return self.forward_pipelined(h, mp);
         }
-        let mut acc = Array2::<f32>::zeros((mp, MM2_OUT));
+        let mut acc = Array2::<f32>::zeros((mp, self.shape.mm2_out));
         for (i, op) in self.parts.iter().enumerate() {
             // strided column-slice view of H -> converted directly into the kernel's bf16 buffer
             // (one pass over H; no per-partial gather-to-owned f32 copy).
-            let hk = h.slice(s![.., i * KA..(i + 1) * KA]); // [mp, KA] view
+            let hk = h.slice(s![.., i * self.shape.ka..(i + 1) * self.shape.ka]); // [mp, self.shape.ka] view
             acc += &op.forward_view(hk);
         }
         self.add_bias2(&mut acc);
@@ -1238,17 +1328,17 @@ impl FfnMm2 {
     /// sequential path (same kernel, same host f32 accumulate); only the scheduling differs.
     fn forward_pipelined(&self, h: &Array2<f32>, mp: usize) -> Array2<f32> {
         let shared = &self.parts[0].shared;
-        let n = MM2_OUT;
+        let n = self.shape.mm2_out;
         let np = self.parts.len();
-        let mut acc = Array2::<f32>::zeros((mp, MM2_OUT));
+        let mut acc = Array2::<f32>::zeros((mp, self.shape.mm2_out));
 
-        let h0 = h.slice(s![.., 0..KA]);
+        let h0 = h.slice(s![.., 0..self.shape.ka]);
         let (mut prev_run, mut prev_scale) = shared.pipe_start(0, h0, &self.parts[0].bo_b, n);
         let (mut prev_slot, mut prev_i) = (0usize, 0usize);
 
         for i in 1..np {
             let slot = i % 2;
-            let hi = h.slice(s![.., i * KA..(i + 1) * KA]);
+            let hi = h.slice(s![.., i * self.shape.ka..(i + 1) * self.shape.ka]);
             let (cur_run, cur_scale) = shared.pipe_start(slot, hi, &self.parts[i].bo_b, n);
             // P(i-1) is on a different slot than the just-submitted Pi → safe to finish it now; its
             // host post-processing overlaps Pi's NPU compute. The wait() is the NPU-stall the pipeline
@@ -1293,7 +1383,7 @@ impl FfnMm2 {
     fn add_bias2(&self, acc: &mut Array2<f32>) {
         let b2 = &self.bias2;
         acc.axis_iter_mut(Axis(0)).for_each(|mut row| {
-            for c in 0..MM2_OUT {
+            for c in 0..self.shape.mm2_out {
                 row[c] += b2[c];
             }
         });
@@ -1309,7 +1399,8 @@ impl FfnMm2 {
 pub const CONV2_KSPLIT: usize = 5; // 3840 / 768
 
 pub struct Conv2Mm {
-    parts: Vec<CtxAOp>, // CONV2_KSPLIT ops on ctxA, each weight [KA, 768], Epi::None
+    shape: CtxAShape,
+    parts: Vec<CtxAOp>, // CONV2_KSPLIT ops on ctxA, each weight [self.shape.ka, 768], Epi::None
     bias: Vec<f32>,     // length 768 (cout), added on host once after the partial sum
 }
 
@@ -1318,36 +1409,38 @@ impl Conv2Mm {
     /// (Cin-major, j = ci*k + ki — matching the host `im2col` cols flatten) and split along K into 5×
     /// `[768, 768]` ctxA weights.
     pub fn new(shared: Rc<SharedCtxA>, w2: &Array3<f32>, b2: &[f32]) -> Self {
+        let shape = shared.shape.clone();
         let (cout, cin, k) = w2.dim();
-        assert_eq!(cout, MM2_OUT, "conv2 cout must be {MM2_OUT}");
+        assert_eq!(cout, shared.shape.mm2_out, "conv2 cout must be {}", shared.shape.mm2_out);
         let kk = cin * k;
-        assert_eq!(kk, CONV2_KSPLIT * KA, "conv2 K={kk} must be {CONV2_KSPLIT}×{KA}");
-        assert_eq!(b2.len(), MM2_OUT);
+        assert_eq!(kk, CONV2_KSPLIT * shared.shape.ka,
+            "conv2 K={kk} must be {CONV2_KSPLIT}x{}", shared.shape.ka);
+        assert_eq!(b2.len(), shared.shape.mm2_out);
         // [cout, cin*k] in the same Cin-major flatten the host im2col uses for cols.
         let w2r = w2.to_shape((cout, kk)).expect("reshape conv2 weight").to_owned();
         let parts = (0..CONV2_KSPLIT)
             .map(|p| {
                 // partial p: activation = cols[:, p*KA..(p+1)*KA] [Lout, KA]; weight W_p[j', co] =
                 // w2r[co, p*KA + j'] → CtxAOp wants [KA, n]=[K, cout], so W_p = w2r[:, p-block].T.
-                let wp = w2r.slice(s![.., p * KA..(p + 1) * KA]).t().to_owned(); // [KA, cout]
-                CtxAOp::new(shared.clone(), &wp, MM2_OUT, Epi::None, &[])
+                let wp = w2r.slice(s![.., p * shared.shape.ka..(p + 1) * shared.shape.ka]).t().to_owned(); // [ka, cout]
+                CtxAOp::new(shared.clone(), &wp, shared.shape.mm2_out, Epi::None, &[])
             })
             .collect();
-        Conv2Mm { parts, bias: b2.to_vec() }
+        Conv2Mm { shape, parts, bias: b2.to_vec() }
     }
 
     /// `cols` is `[Lout, 3840]` (host im2col of the conv0 output). Returns `[Lout, 768]` = the conv2
     /// pre-activation `cols @ w2ᵀ + b2` (the caller applies ReLU). Lout (=400) ≤ PAD_M.
     pub fn forward(&self, cols: &Array2<f32>) -> Array2<f32> {
         let (mp, kk) = cols.dim();
-        assert_eq!(kk, CONV2_KSPLIT * KA);
-        let mut acc = Array2::<f32>::zeros((mp, MM2_OUT));
+        assert_eq!(kk, CONV2_KSPLIT * self.shape.ka);
+        let mut acc = Array2::<f32>::zeros((mp, self.shape.mm2_out));
         for (p, op) in self.parts.iter().enumerate() {
-            let ck = cols.slice(s![.., p * KA..(p + 1) * KA]); // [Lout, KA] view
+            let ck = cols.slice(s![.., p * self.shape.ka..(p + 1) * self.shape.ka]); // [Lout, self.shape.ka] view
             acc += &op.forward_view(ck);
         }
         acc.axis_iter_mut(Axis(0)).for_each(|mut row| {
-            for c in 0..MM2_OUT {
+            for c in 0..self.shape.mm2_out {
                 row[c] += self.bias[c];
             }
         });
@@ -1384,7 +1477,7 @@ fn quant_scale(a_real: ArrayView2<f32>, mp: usize, fast: bool) -> f32 {
             .into_par_iter()
             .map(|r| {
                 let mut m = 0f32;
-                for c in 0..KA {
+                for c in 0..a_real.ncols() {
                     m = m.max(a_real[[r, c]].abs());
                 }
                 m
@@ -1467,8 +1560,8 @@ impl SharedCtxA {
 }
 
 #[cfg(test)]
-mod nat_tag_tests {
-    use super::Precision;
+mod tests {
+    use super::{CtxAShape, Precision};
 
     #[test]
     fn only_native_carries_the_nat_tag() {
@@ -1504,5 +1597,32 @@ mod nat_tag_tests {
         assert!(
             src.contains("${re_tag}${nat_tag}"),
             "nat_tag is no longer the final suffix component; the append order in ctx2 is wrong");
+    }
+
+    /// The shape is what picks the resident xclbin and its instruction streams, so its arithmetic is
+    /// worth pinning: a wrong `kaug` or `mm2_ksplit` builds a filename that does not exist, or slices
+    /// an FFN weight into the wrong number of partials.
+    #[test]
+    fn a_whisper_shape_derives_its_kaug_and_ksplit() {
+        let s = CtxAShape::whisper_small();
+        assert_eq!((s.ka, s.na, s.mm2_out), (768, 3072, 768));
+        assert_eq!(s.kaug(), 800, "one extra 32-wide k-block carries the bias");
+        assert_eq!(s.mm2_ksplit(), 4);
+
+        let t = CtxAShape::whisper_turbo();
+        assert_eq!((t.ka, t.na, t.mm2_out), (1280, 5120, 1280));
+        assert_eq!(t.kaug(), 1312, "the built turbo kernels are K_aug=1312");
+        assert_eq!(t.mm2_ksplit(), 4, "ffn/d_model is 4 for both sizes, so mm2 splits the same way");
+        assert_eq!(t.tile, Some((32, 32, 32)),
+            "turbo is uniform m=32: N=5120 at m=64 overruns the 20-bit ShimNOC BD stride field");
+    }
+
+    /// An unbuilt size must be an error here, not a filename that fails to open on the device.
+    #[test]
+    fn only_built_whisper_sizes_resolve_to_a_shape() {
+        assert_eq!(CtxAShape::for_whisper(768, 3072).unwrap(), CtxAShape::whisper_small());
+        assert_eq!(CtxAShape::for_whisper(1280, 5120).unwrap(), CtxAShape::whisper_turbo());
+        let e = CtxAShape::for_whisper(1024, 4096).unwrap_err();
+        assert!(e.contains("1024") && e.contains("4096"), "the error must name the shape asked for: {e}");
     }
 }
