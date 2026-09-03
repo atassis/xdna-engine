@@ -11,6 +11,7 @@
 srcdir := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
 
 include ${srcdir}/../../makefile-common
+include ${srcdir}/toolchain_stamp.mk
 
 aie2_runtime_dir = ${MLIR_AIE_DIR}/aie_runtime_lib/AIE2
 

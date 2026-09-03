@@ -13,6 +13,7 @@
 # Produces build/final_raspill_h${HOLD}_${rows}x${cols}.xclbin + matching insts.
 #
 srcdir  := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
+include ${srcdir}/../toolchain_stamp.mk
 repo    := $(realpath $(srcdir)/../..)
 ws      := $(realpath $(repo)/..)
 AIE_INC := $(ws)/mlir-aie/third_party/aie_api/include

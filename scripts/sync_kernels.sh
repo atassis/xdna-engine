@@ -39,9 +39,12 @@ mkdir -p "$PE/ml/dwconv1d" "$PE/ml/softmax400" "$PE/ml/layernorm" "$PE/ml/relpos
 # it a .o built by an older pin looks up to date forever, which is how a 06-29 fc1 kernel entered a
 # 09-03 A/B and got a hang blamed on the kernel tile. See route_b_kernels/toolchain_stamp.mk.
 mkdir -p "$PE/ml/mha_decode"
-for _d in layernorm dwconv1d relpos_mha mha_decode; do
+mkdir -p "$PE/ml/softmax400" "$PE/ml/silu"
+for _d in layernorm dwconv1d relpos_mha mha_decode softmax400 silu; do
   cp "$RB/toolchain_stamp.mk" "$PE/ml/$_d/toolchain_stamp.mk"
 done
+# ffn_gemm2 builds in the matmul tree, not programming_examples/ml.
+cp "$RB/toolchain_stamp.mk" "$MM/single_core/toolchain_stamp.mk"
 
 # silu (elementwise bf16). Upstream DELETED programming_examples/ml/silu in #3025 while KEEPING
 # aie_kernels/aie2p/silu.cc, so the kernel still builds but the design and Makefile that drive it are
