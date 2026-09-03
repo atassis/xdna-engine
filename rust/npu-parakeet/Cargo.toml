@@ -11,7 +11,7 @@ path = "src/lib.rs"
 [features]
 # `npu`: route the encoder's matmuls through the XDNA2 NPU (native whole_array xclbins).
 # Off by default so the host f32 reference builds without XRT (CI / other branches).
-npu = ["dep:npu-xrt", "dep:npu-onnx", "dep:npu-asr"]
+npu = ["dep:npu-xrt", "dep:npu-onnx", "dep:npu-asr", "dep:npu-bricks"]
 
 [dependencies]
 anyhow = "1"
@@ -20,6 +20,9 @@ ndarray-npy = { version = "0.9", default-features = false }
 npu-weights = { path = "../npu-weights" }
 npu-xrt = { path = "../npu-xrt", optional = true }
 npu-onnx = { path = "../npu-onnx", optional = true }
+# PAD_M/WA_SUBDIR/u16_bytes only (extract-npu-bricks-crate step 1): these used to be independent
+# byte-identical copies in this file; npu-bricks is now their one definition.
+npu-bricks = { path = "../npu-bricks", optional = true }
 # kernel_registry only (engine-op-manifest-and-dynamic-xclbin): npu.rs's artifact-selection sites
 # route through npu_asr::kernel_registry instead of reimplementing the naming convention. This is
 # a first-cut dependency shape, not a structural endorsement -- kernel_registry.rs living inside

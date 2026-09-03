@@ -17,17 +17,17 @@ use std::time::Instant;
 
 use ndarray::prelude::*;
 use npu_asr::kernel_registry;
+use npu_bricks::{u16_bytes, PAD_M};
 use npu_xrt::{Bo, Device, Kernel, FLAG_CACHEABLE, FLAG_HOST_ONLY};
 
 use crate::errors::LoadError;
 
-const PAD_M: usize = 512;
+/// Re-exported, not re-declared: `preflight()` below and the CLI's startup check (`npu-cli`) both
+/// name the directory `open()` actually loads from through this path, and the definition itself
+/// now lives in `npu-bricks` with the rest of the dispatch rails.
+pub use npu_bricks::WA_SUBDIR;
+
 const KRES: usize = 1024; // resident kernel contraction dim
-/// `pub` so `preflight()` below and the CLI's startup check (`npu-cli`) can both name the same
-/// directory `open()` actually loads from -- one definition, not a path literal duplicated at
-/// the call site that could drift out of sync with it.
-pub const WA_SUBDIR: &str =
-    "mlir-aie/programming_examples/basic/matrix_multiplication/whole_array/build";
 
 /// Verify the resident whole_array build dir is present AND built against the CURRENT
 /// `toolchain.lock` pin, before anything opens the device. Pure filesystem (see
@@ -3915,10 +3915,6 @@ fn c_at(cb: &[u8], w: usize, i: usize) -> f32 {
     } else {
         npu_xrt::bf16_bits_to_f32(u16::from_le_bytes([cb[i * 2], cb[i * 2 + 1]]))
     }
-}
-
-fn u16_bytes(v: &[u16]) -> &[u8] {
-    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 2) }
 }
 
 fn f32_bytes(v: &[f32]) -> &[u8] {

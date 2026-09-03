@@ -950,6 +950,7 @@ dependencies = [
  "ndarray",
  "ndarray-npy",
  "npu-asr-host",
+ "npu-bricks",
  "npu-onnx",
  "npu-xrt",
  "rayon",
@@ -966,6 +967,10 @@ dependencies = [
  "ndarray",
  "rayon",
 ]
+
+[[package]]
+name = "npu-bricks"
+version = "0.1.0"
 
 [[package]]
 name = "npu-capi"
@@ -1042,6 +1047,7 @@ dependencies = [
  "ndarray",
  "ndarray-npy",
  "npu-asr",
+ "npu-bricks",
  "npu-onnx",
  "npu-weights",
  "npu-xrt",
