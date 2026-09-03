@@ -373,8 +373,19 @@ impl SharedCtxA {
                     let nat = prec.nat_tag();
                     let kaug = shape.kaug();
                     let insts = crate::kernel_registry::insts_path(&wa, &format!("{PAD_M}x{kaug}x{n}_{mt}x{kt}x{nt}_8c_{tag}{nat}"));
-                    if mode == 2 && (!gelu_enabled || !insts.exists()) {
-                        continue; // gelu stream only loaded when opted-in + present (shape.na only)
+                    if mode == 2 && !gelu_enabled {
+                        continue; // gelu is opt-in
+                    }
+                    // A mode with no built stream is skipped, not fatal: a model uses a subset of
+                    // {identity, silu, gelu} and the set that exists differs per shape (whisper's
+                    // encoder never asks for silu; only its fc1 asks for gelu, at N=ffn). Asking for
+                    // a mode that was skipped panics in `modal_stream` naming the file to build,
+                    // which is a better failure than refusing to load at all.
+                    if !insts.exists() {
+                        if !npu_xrt::quiet() {
+                            eprintln!("[ctx2] no {tag} stream for N={n} ({}) -- skipped", insts.display());
+                        }
+                        continue;
                     }
                     let (bo, n_instr) = load_stream(&insts);
                     modal_streams.push((n, mode, bo, n_instr));
@@ -510,7 +521,11 @@ impl SharedCtxA {
             .iter()
             .find(|(sn, ss, _, _)| *sn == n && *ss == mode)
             .map(|(_, _, bo, ni)| (bo, *ni))
-            .unwrap_or_else(|| panic!("ctxA modal: no stream N={n} mode={mode}"))
+            .unwrap_or_else(|| panic!(
+                "ctxA modal: no stream N={n} mode={mode} (0=identity, 1=silu, 2=gelu); build \
+                 insts_{}x{}x{n}_*_8c_modal{} for this shape",
+                PAD_M, self.shape.kaug(),
+                match mode { 0 => "id", 1 => "silu", _ => "gelu" }))
     }
 
     /// Async overlap, the prep half: convert+write+sync slot `s`'s activation from the strided view
