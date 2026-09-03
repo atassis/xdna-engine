@@ -61,6 +61,8 @@ def main():
 
     ref = json.load(open(a.ref))
     prompt_ids, gen_ids = ref["prompt_ids"], ref["gen_ids"]
+    margins = ref.get("margins")
+    hf_ids = ref.get("hf_f32_gen_ids")
     steps = a.steps if a.steps is not None else len(gen_ids)
 
     sp, fused, weights, md = build_graph(a.spec, a.weights, a.layers, a.max_seq)
@@ -113,9 +115,21 @@ def main():
 
     n = min(len(produced), len(gen_ids))
     match = sum(1 for i in range(n) if produced[i] == gen_ids[i])
-    print(f"\n[verify] HF ref  : {gen_ids[:n]}")
+    print(f"\n[verify] oracle  : {gen_ids[:n]}")
     print(f"[verify] NPU     : {produced[:n]}")
-    print(f"\n[verify] greedy token parity: {match}/{n}")
+    if hf_ids:
+        print(f"[verify] HF f32  : {hf_ids[:n]}   (contrast only -- NOT the gate)")
+    if margins:
+        print(f"[verify] margins : {['%.4f' % m for m in margins[:n]]}")
+    print(f"\n[verify] greedy token parity vs the oracle: {match}/{n}")
+    # A mismatch at a margin near the device's own logit error is a tie the precision cannot
+    # resolve, not a defect. Say which kind each one is instead of leaving it to be argued.
+    for i in range(n):
+        if produced[i] != gen_ids[i]:
+            m = margins[i] if margins else float("nan")
+            kind = "KNIFE-EDGE" if margins and m < 0.25 else "REAL"
+            print(f"           step {i}: oracle {gen_ids[i]} vs NPU {produced[i]}, "
+                  f"margin {m:.4f} -> {kind}")
     print("*** PARITY PASS ***" if match == n else f"*** {n-match} MISMATCH ***")
     return 0 if match == n else 1
 
