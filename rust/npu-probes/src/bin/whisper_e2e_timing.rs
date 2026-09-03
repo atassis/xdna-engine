@@ -15,7 +15,9 @@ use std::path::Path;
 use npu_engine::pipeline::Scenario;
 use npu_engine::registry;
 
-const SCENARIO: &str = "scenarios/asr-whisper-small.toml";
+/// Default scenario. Overridable with WHISPER_SCENARIO so the same harness can drive turbo
+/// (scenarios/asr-whisper-turbo.toml) -- the two differ only in weights and shape, not in code path.
+const SCENARIO_DEFAULT: &str = "scenarios/asr-whisper-small.toml";
 const PASSES: usize = 3;
 
 // Intel/AMD RAPL package energy (µJ). Package domain includes the on-die NPU on this part; the
@@ -47,7 +49,9 @@ fn main() {
         samples.len()
     );
 
-    let scen = registry::build(Path::new(SCENARIO), Path::new("."));
+    let scenario = std::env::var("WHISPER_SCENARIO").unwrap_or_else(|_| SCENARIO_DEFAULT.into());
+    eprintln!("[e2e] scenario = {scenario}");
+    let scen = registry::build(Path::new(&scenario), Path::new("."));
     let pipe = match scen {
         Scenario::Asr(p) => p,
         _ => panic!("scenario is not ASR"),
