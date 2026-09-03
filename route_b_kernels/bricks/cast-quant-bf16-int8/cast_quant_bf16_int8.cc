@@ -44,7 +44,7 @@ void quantize_bf16_to_int8_row(const bfloat16 *restrict input,
                                int8_t *restrict output, float scale,
                                int32_t cols) {
   event0();
-  ::aie::set_rounding(::aie::rounding_mode::conv_even);
+  const auto saved_rounding = ::aie::swap_rounding(::aie::rounding_mode::conv_even);
   const float inv_scale = 1.0f / scale;
   for (int i = 0; i < cols; i += N) {
     ::aie::vector<bfloat16, N> v = ::aie::load_v<N>(input + i);
@@ -58,6 +58,7 @@ void quantize_bf16_to_int8_row(const bfloat16 *restrict input,
     // as fixed-point and produced garbage (device rel-L2 2.377 vs the golden).
     ::aie::store_v(output + i, ::aie::to_fixed<int8_t>(scaled));
   }
+  ::aie::set_rounding(saved_rounding);
   event1();
 }
 
@@ -69,7 +70,7 @@ void dequantize_int8_to_bf16_row(const int8_t *restrict input,
                                  bfloat16 *restrict output, float scale,
                                  int32_t cols) {
   event0();
-  ::aie::set_rounding(::aie::rounding_mode::conv_even);
+  const auto saved_rounding = ::aie::swap_rounding(::aie::rounding_mode::conv_even);
   for (int i = 0; i < cols; i += N) {
     ::aie::vector<int8_t, N> q = ::aie::load_v<N>(input + i);
     ::aie::vector<float, N> qf = ::aie::to_float(q);  // widen int8 -> f32
@@ -78,6 +79,7 @@ void dequantize_int8_to_bf16_row(const int8_t *restrict input,
     a.from_vector(vf);
     ::aie::store_v(output + i, a.template to_vector<bfloat16>()); // narrow -> bf16
   }
+  ::aie::set_rounding(saved_rounding);
   event1();
 }
 
@@ -104,13 +106,14 @@ template <int N>
 void cast_f32_to_bf16_row(const float *restrict input,
                           bfloat16 *restrict output, int32_t cols) {
   event0();
-  ::aie::set_rounding(::aie::rounding_mode::conv_even);
+  const auto saved_rounding = ::aie::swap_rounding(::aie::rounding_mode::conv_even);
   for (int i = 0; i < cols; i += N) {
     ::aie::vector<float, N> v = ::aie::load_v<N>(input + i);
     ::aie::accum<accfloat, N> a;
     a.from_vector(v);
     ::aie::store_v(output + i, a.template to_vector<bfloat16>());
   }
+  ::aie::set_rounding(saved_rounding);
   event1();
 }
 

@@ -48,7 +48,7 @@ template <unsigned m, unsigned k, unsigned r>
 void matvec_vectorized_impl(const bfloat16 *__restrict a,
                             const bfloat16 *__restrict b,
                             bfloat16 *__restrict c) {
-  ::aie::set_rounding(aie::rounding_mode::conv_even);
+  const auto saved_rounding = ::aie::swap_rounding(aie::rounding_mode::conv_even);
   for (unsigned row = 0; row < m; row++) {
     aie::accum<accfloat, r> acc = aie::zeros<accfloat, r>();
     const bfloat16 *a_row = a + row * k;
@@ -60,6 +60,7 @@ void matvec_vectorized_impl(const bfloat16 *__restrict a,
     float partial = aie::reduce_add(acc.template to_vector<float>());
     c[row] = static_cast<bfloat16>(static_cast<float>(c[row]) + partial);
   }
+  ::aie::set_rounding(saved_rounding);
 }
 
 // Overwriting: c[row] = dot(a_row, b). Folds the per-tile zero into the
@@ -71,7 +72,7 @@ template <unsigned m, unsigned k, unsigned r>
 void matvec_vectorized_store_impl(const bfloat16 *__restrict a,
                                   const bfloat16 *__restrict b,
                                   bfloat16 *__restrict c) {
-  ::aie::set_rounding(aie::rounding_mode::conv_even);
+  const auto saved_rounding = ::aie::swap_rounding(aie::rounding_mode::conv_even);
   for (unsigned row = 0; row < m; row++) {
     aie::accum<accfloat, r> acc = aie::zeros<accfloat, r>();
     const bfloat16 *a_row = a + row * k;
@@ -83,6 +84,7 @@ void matvec_vectorized_store_impl(const bfloat16 *__restrict a,
     float partial = aie::reduce_add(acc.template to_vector<float>());
     c[row] = static_cast<bfloat16>(partial);
   }
+  ::aie::set_rounding(saved_rounding);
 }
 
 // ---------------------------------------------------------------------------
@@ -108,7 +110,7 @@ template <unsigned NW, unsigned K, unsigned R, unsigned WROW, bool ADD_BIAS>
 void gemm_tile_impl(uint32_t m_act, uint32_t row_stride, uint32_t col_off,
                     const bfloat16 *__restrict w, const bfloat16 *__restrict act,
                     bfloat16 *__restrict out) {
-  ::aie::set_rounding(aie::rounding_mode::conv_even);
+  const auto saved_rounding = ::aie::swap_rounding(aie::rounding_mode::conv_even);
   const aie::vector<bfloat16, R> ones = aie::broadcast<bfloat16, R>(static_cast<bfloat16>(1.0f));
   for (uint32_t ar = 0; ar < m_act; ar++) {
     const bfloat16 *a_row = act + ar * K;
@@ -130,6 +132,7 @@ void gemm_tile_impl(uint32_t m_act, uint32_t row_stride, uint32_t col_off,
       o_row[wr] = static_cast<bfloat16>(aie::reduce_add(acc.template to_vector<float>()));
     }
   }
+  ::aie::set_rounding(saved_rounding);
 }
 
 // ---------------------------------------------------------------------------

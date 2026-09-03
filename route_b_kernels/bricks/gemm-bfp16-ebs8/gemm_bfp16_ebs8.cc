@@ -83,8 +83,10 @@ static inline void gemm_bfp16_ebs8_tile(const bfloat16 *__restrict pA,
   static_assert(N % 8 == 0, "gemm-bfp16-ebs8: N must be a multiple of 8 (mmul tile)");
 
   // Block-floating-point quantization must round-to-nearest-even (banked
-  // convention for every bf16/bfp16 cast on the WER-gated path).
-  aie::set_rounding(aie::rounding_mode::conv_even);
+  // convention for every bf16/bfp16 cast on the WER-gated path). crRnd is a
+  // sticky per-core register, not a per-call argument, so it has to be handed
+  // back or it biases whatever tile/kernel runs next on this core.
+  const auto saved_rounding = aie::swap_rounding(aie::rounding_mode::conv_even);
 
   // Native 8x8x8 tile sizes for the bfp16ebs8 true-systolic op (block_vector
   // lane count, not element byte count): size_A = size_B = size_C = 64.
@@ -117,6 +119,8 @@ static inline void gemm_bfp16_ebs8_tile(const bfloat16 *__restrict pA,
       aie::store_v(pC_tile, acc.template to_vector<bfloat16>());
     }
   }
+
+  aie::set_rounding(saved_rounding);
 }
 
 extern "C" {
