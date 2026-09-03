@@ -277,7 +277,9 @@ def main():
 
     import glob
     import shutil
-    _pp = sorted(glob.glob("**/*_decode*.mlir.prj/params.txt", recursive=True), key=os.path.getmtime)
+    # The project dir suffix moved from `.mlir.prj` to `.mlir.d`; match params.txt wherever aiecc
+    # put it under the build tree rather than pinning a suffix that has already changed once.
+    _pp = sorted(glob.glob("**/params.txt", recursive=True), key=os.path.getmtime)
     scratchpad_params = {}
     if _pp:
         shutil.copy(_pp[-1], os.path.join(a.out, "params.txt"))
