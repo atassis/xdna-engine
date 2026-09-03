@@ -30,7 +30,7 @@ fn main() -> Result<()> {
     let path = config_path(&cli);
     match &cli.cmd {
         Cmd::Serve { port, allow_degraded } => serve(&path, *port, *allow_degraded),
-        Cmd::Transcribe { wav, model } => transcribe(&path, wav, model.as_deref()),
+        Cmd::Transcribe { input, model } => transcribe(&path, input, model.as_deref()),
         Cmd::Embed { text, model } => embed(&path, text, model.as_deref()),
         Cmd::Diarize { wav, model, json } => diarize(&path, wav, model.as_deref(), *json),
         Cmd::TranscribeMedia { input, out, format, asr, diarize: diar, track, no_diarize } =>
@@ -147,14 +147,15 @@ fn serve(path: &Path, port: Option<u16>, allow_degraded: bool) -> Result<()> {
     http::serve(handle, path.to_path_buf(), port).context("serve")
 }
 
-fn transcribe(path: &Path, wav: &Path, model: Option<&str>) -> Result<()> {
+fn transcribe(path: &Path, input: &Path, model: Option<&str>) -> Result<()> {
     quiet_one_shot();
     let cfg = load_cfg(path)?;
     let root = root(&cfg)?;
+    // Decode BEFORE loading a model: a bad path or a file with no audio should fail in a second,
+    // not after a multi-second model load.
+    let samples = npu_runtime::media::decode_file(input).map_err(|e| anyhow!(e))?;
     // Lazy: a one-shot run should load the model it serves, and nothing else.
     let (handle, join) = start_lazy(cfg, Box::new(EngineLoader { root }))?;
-    let bytes = std::fs::read(wav).with_context(|| format!("read {}", wav.display()))?;
-    let samples = http::parse::parse_wav_i16(&bytes).ok_or_else(|| anyhow!("bad wav (need 16k mono 16-bit)"))?;
     let out = handle.transcribe(model, samples, 16_000).map_err(|e| anyhow!(e.to_string()));
     handle.shutdown(); let _ = join.join();
     println!("{}", out?.value);
@@ -167,10 +168,11 @@ const MIN_UTTERANCE_S: f32 = 0.30;
 
 /// Longest span sent to ASR in one call.
 ///
-/// Parakeet truncates at WIN_MEL = 2040 mel frames = 20.4 s and returns 200 OK with the tail
-/// missing (`npu-engine/src/asr/parakeet.rs:160`). 18 s leaves margin for the frame arithmetic
-/// rather than sitting on the cliff edge. Overridable so a backend without the limit is not
-/// penalised by it.
+/// This was a correctness guard: parakeet used to truncate at WIN_MEL = 20.4 s and whisper at its
+/// 30 s frontend window, both returning 200 OK with the tail missing, so 18 s kept every span under
+/// the shorter cliff. Both backends now window internally and transcribe any length, so the cap is
+/// only about span granularity. The number has not been re-measured against the windowed backends;
+/// raising it gives whisper more context per call and should be swept before it is changed.
 fn asr_window_s() -> f32 {
     std::env::var("NPU_ASR_MAX_SPAN_S").ok().and_then(|v| v.parse().ok()).unwrap_or(18.0)
 }

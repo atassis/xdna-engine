@@ -29,24 +29,72 @@ use crate::config::ScenarioConfig;
 use crate::pipeline::AsrModel;
 
 const N_SAMPLES: usize = 480_000; // 30 s @ 16 kHz (preprocessor.onnx is fixed-shape)
-const N_MELS: usize = 80;
 const N_FRAMES: usize = 3000;
-const D: usize = 768;
-const T_ENC: usize = 1500; // encoder output rows
-const VOCAB: usize = 51865;
+const T_ENC: usize = 1500; // encoder output rows (max_source_positions, 1500 for every Whisper)
 const MAX_DECODE: usize = 200;
-const N_LAYERS: usize = 12;
 
-// Whisper special-token ids (from WhisperProcessor.tokenizer).
-const SOT: i64 = 50258; // <|startoftranscript|>
-const EOT: i64 = 50257; // <|endoftext|>
-const TRANSCRIBE: i64 = 50359; // <|transcribe|>
-const NOTIMESTAMPS: i64 = 50363; // <|notimestamps|>
-// Language tags are a contiguous block: <|en|>=50259 .. <|su|>=50357 (99 languages). We auto-detect
-// the language with a 1-step decode (argmax restricted to this block) so RU stays RU and EN stays EN
-// — without this, forcing one language makes Whisper TRANSLATE the other.
-const LANG_LO: i64 = 50259; // <|en|>
-const LANG_HI: i64 = 50357; // last language token
+/// Whisper's special-token ids, RESOLVED FROM THE TOKENIZER rather than written down.
+///
+/// They are not constant across Whisper sizes: large-v3 inserted `<|yue|>` into the language block,
+/// which shifts every id above it by one — `<|transcribe|>` is 50359 on whisper-small and 50360 on
+/// large-v3-turbo, `<|notimestamps|>` 50363 vs 50364. Hardcoding the small-model values decodes
+/// turbo as a different task with a language tag one off, silently: no crash, just wrong text. So
+/// each id is looked up by its literal token string.
+///
+/// `lang_hi` is DERIVED, not looked up: the language tags are a contiguous block that ends where
+/// `<|translate|>` begins, which is exactly what makes the block scannable for language detection.
+/// Checking against the last tag by name would need to know whether this model has `<|yue|>`.
+struct WhisperTokens {
+    sot: i64,          // <|startoftranscript|>
+    eot: i64,          // <|endoftext|>
+    transcribe: i64,   // <|transcribe|>
+    notimestamps: i64, // <|notimestamps|>
+    lang_lo: i64,      // <|en|>, first language tag
+    lang_hi: i64,      // last language tag = <|translate|> - 1
+}
+
+impl WhisperTokens {
+    fn resolve(tok: &Tokenizer) -> Result<WhisperTokens, EngineError> {
+        let id = |s: &str| -> Result<i64, EngineError> {
+            tok.token_to_id(s)
+                .map(|v| v as i64)
+                .ok_or_else(|| EngineError::Load(format!("tokenizer has no {s:?} token")))
+        };
+        let translate = id("<|translate|>")?;
+        let lang_lo = id("<|en|>")?;
+        let t = WhisperTokens {
+            sot: id("<|startoftranscript|>")?,
+            eot: id("<|endoftext|>")?,
+            transcribe: id("<|transcribe|>")?,
+            notimestamps: id("<|notimestamps|>")?,
+            lang_lo,
+            lang_hi: translate - 1,
+        };
+        if t.lang_hi < t.lang_lo {
+            return Err(EngineError::Load(format!(
+                "whisper tokenizer: language block is empty (<|en|>={lang_lo}, <|translate|>={translate})"
+            )));
+        }
+        Ok(t)
+    }
+
+    /// The decode prompt: transcribe `lang`, no timestamps.
+    fn prompt(&self, lang: i64) -> Vec<i64> { vec![self.sot, lang, self.transcribe, self.notimestamps] }
+
+    /// Argmax over the contiguous language-tag block — the shared language-detection rule used by
+    /// every decode backend. Auto-detecting keeps RU as RU and EN as EN; forcing one language makes
+    /// Whisper TRANSLATE the other.
+    fn pick_lang(&self, logits: &[f32]) -> i64 {
+        let (lo, hi) = (self.lang_lo as usize, self.lang_hi as usize);
+        let mut best = lo;
+        for i in lo..=hi {
+            if logits[i] > logits[best] {
+                best = i;
+            }
+        }
+        best as i64
+    }
+}
 
 /// A held key/value cache tensor: the past-input name it feeds, its flat f32 data, and its shape.
 /// We own the data so it survives across `Session::run` boundaries (the ONNX `Outputs` borrow does
@@ -64,13 +112,14 @@ pub struct Kv {
 pub struct WhisperOnnxDecoder {
     decoder: Session,      // decoder_model.onnx — step 0
     decoder_past: Session, // decoder_with_past_model.onnx — steps >=1
+    n_layers: usize,       // DECODER depth: names the `present.*`/`past_key_values.*` tensors
     _env: Rc<Env>,
 }
 
 impl WhisperOnnxDecoder {
     /// `onnx_dir` points at `artifacts/whisper-small/onnx` (holding `decoder_model.onnx` and
     /// `decoder_with_past_model.onnx`). Opens NO device.
-    pub fn load(onnx_dir: &Path) -> Self {
+    pub fn load(onnx_dir: &Path, n_layers: usize) -> Self {
         let env = Env::new().expect("onnx env");
         let load = |p: std::path::PathBuf| {
             Session::load(&env, p.to_str().unwrap())
@@ -78,24 +127,26 @@ impl WhisperOnnxDecoder {
         };
         let decoder = load(onnx_dir.join("decoder_model.onnx"));
         let decoder_past = load(onnx_dir.join("decoder_with_past_model.onnx"));
-        WhisperOnnxDecoder { decoder, decoder_past, _env: env }
+        WhisperOnnxDecoder { decoder, decoder_past, n_layers, _env: env }
     }
 
-    /// Step 0 over the full prompt + encoder hidden states; returns last-position logits + 48-entry KV.
+    /// Step 0 over the full prompt + encoder hidden states; returns last-position logits + the
+    /// `4 * n_layers` KV entries.
     pub fn step0(&self, ids: &[i64], enc_shape: &[i64], encoder_hidden: &[f32]) -> (Vec<f32>, Vec<Kv>) {
-        decode_step0(&self.decoder, ids, enc_shape, encoder_hidden)
+        decode_step0(&self.decoder, self.n_layers, ids, enc_shape, encoder_hidden)
     }
 
-    /// Cached step over one new token + prior KV; returns logits + the next 48-entry KV.
+    /// Cached step over one new token + prior KV; returns logits + the next KV set.
     pub fn step_cached(&self, tok: i64, prev: &[Kv]) -> (Vec<f32>, Vec<Kv>) {
-        decode_step_cached(&self.decoder_past, tok, prev)
+        decode_step_cached(&self.decoder_past, self.n_layers, tok, prev)
     }
 }
 
-/// The 48 `present.*` output names emitted by `decoder_model.onnx` (step 0), in graph order.
-fn step0_present_names() -> Vec<String> {
-    let mut v = Vec::with_capacity(4 * N_LAYERS);
-    for l in 0..N_LAYERS {
+/// The `4 * n_layers` `present.*` output names emitted by `decoder_model.onnx` (step 0), in graph
+/// order. `n_layers` is the DECODER depth (12 for whisper-small, 4 for large-v3-turbo).
+fn step0_present_names(n_layers: usize) -> Vec<String> {
+    let mut v = Vec::with_capacity(4 * n_layers);
+    for l in 0..n_layers {
         for kind in ["decoder", "encoder"] {
             for kv in ["key", "value"] {
                 v.push(format!("present.{l}.{kind}.{kv}"));
@@ -105,10 +156,10 @@ fn step0_present_names() -> Vec<String> {
     v
 }
 
-/// The 24 *decoder* `present.*` output names emitted by `decoder_with_past_model.onnx` (steps>=1).
-fn past_present_names() -> Vec<String> {
-    let mut v = Vec::with_capacity(2 * N_LAYERS);
-    for l in 0..N_LAYERS {
+/// The `2 * n_layers` *decoder* `present.*` names emitted by `decoder_with_past_model.onnx` (steps>=1).
+fn past_present_names(n_layers: usize) -> Vec<String> {
+    let mut v = Vec::with_capacity(2 * n_layers);
+    for l in 0..n_layers {
         for kv in ["key", "value"] {
             v.push(format!("present.{l}.decoder.{kv}"));
         }
@@ -119,12 +170,13 @@ fn past_present_names() -> Vec<String> {
 /// Free-standing step-0 decode (shared by `WhisperAsr` and `WhisperOnnxDecoder`).
 fn decode_step0(
     decoder: &Session,
+    n_layers: usize,
     ids: &[i64],
     enc_shape: &[i64],
     encoder_hidden: &[f32],
 ) -> (Vec<f32>, Vec<Kv>) {
     let l = ids.len() as i64;
-    let present_names = step0_present_names();
+    let present_names = step0_present_names(n_layers);
     let out_names: Vec<&str> = std::iter::once("logits")
         .chain(present_names.iter().map(|s| s.as_str()))
         .collect();
@@ -138,8 +190,11 @@ fn decode_step0(
         )
         .expect("whisper decoder (step 0)");
     let logits_all = out.f32(0);
-    let last = (ids.len() - 1) * VOCAB;
-    let logits = logits_all[last..last + VOCAB].to_vec();
+    // Vocabulary width comes from the tensor the graph just returned, not a constant: it is 51865 on
+    // whisper-small and 51866 on large-v3-turbo, and reading it here cannot drift from the model.
+    let vocab = logits_all.len() / ids.len();
+    let last = (ids.len() - 1) * vocab;
+    let logits = logits_all[last..last + vocab].to_vec();
     let kv: Vec<Kv> = present_names
         .iter()
         .enumerate()
@@ -153,14 +208,14 @@ fn decode_step0(
 }
 
 /// Free-standing cached-step decode (shared by `WhisperAsr` and `WhisperOnnxDecoder`).
-fn decode_step_cached(decoder_past: &Session, tok: i64, prev: &[Kv]) -> (Vec<f32>, Vec<Kv>) {
+fn decode_step_cached(decoder_past: &Session, n_layers: usize, tok: i64, prev: &[Kv]) -> (Vec<f32>, Vec<Kv>) {
     let ids = [tok];
     let mut inputs: Vec<(&str, Tensor)> = Vec::with_capacity(1 + prev.len());
     inputs.push(("input_ids", Tensor::I64(&ids, vec![1, 1])));
     for kv in prev {
         inputs.push((kv.name.as_str(), Tensor::F32(&kv.data, kv.shape.clone())));
     }
-    let present_names = past_present_names();
+    let present_names = past_present_names(n_layers);
     let out_names: Vec<&str> = std::iter::once("logits")
         .chain(present_names.iter().map(|s| s.as_str()))
         .collect();
@@ -202,6 +257,15 @@ pub struct WhisperAsr {
     decoder_past: Session, // decoder_with_past_model.onnx — steps >=1, cached
     enc: WhisperEncoder,
     tok: Tokenizer,
+    /// Encoder shape (d_model / layers / heads / ffn / mels) from the scenario manifest — the same
+    /// value handed to `WhisperEncoder`, kept so the host side agrees with the encoder on `d_model`
+    /// and `n_mels` instead of re-deriving them.
+    cfg: WhisperCfg,
+    /// DECODER depth. Not `cfg.n_layers`: whisper-small is 12 encoder / 12 decoder, but
+    /// large-v3-turbo is 32 / 4, and this is the one that names the ONNX KV tensors.
+    dec_layers: usize,
+    /// Special-token ids read out of this model's own tokenizer (they shift between Whisper sizes).
+    tokens: WhisperTokens,
     /// On-NPU per-token decoder, constructed ONCE when `NPU_DECODE` is set (weights + `CtxDecode`
     /// registered up front, sharing the encoder's single-tenant device). `None` => ONNX decode path.
     /// `RefCell` because `transcribe(&self)` mutates the decoder's self-KV cache (`step`/`reset`).
@@ -231,11 +295,34 @@ impl WhisperAsr {
         let xroot = std::env::var("NPU_XCLBIN_ROOT")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| root.to_path_buf());
+        // Shape comes from the scenario's `[model]` block, so a second Whisper size is a manifest,
+        // not a code change. `n_mels` and `n_decoder_layers` default to 80 / `n_layers`, which is
+        // exactly whisper-small, so its scenario keeps parsing unchanged.
+        let m = cfg.model_or_err().map_err(EngineError::Load)?;
+        let wcfg = WhisperCfg {
+            d_model: m.hidden,
+            n_layers: m.n_layers,
+            n_heads: m.n_heads,
+            head_dim: m.head_dim,
+            ffn: m.ff,
+            n_mels: m.n_mels,
+        };
+        let dec_layers = m.decoder_layers();
+        // WHISPER_ENC_HOST=1 runs the encoder on the host instead of the NPU. Opt-in and loud, never
+        // a silent fallback: a model that quietly moved off the device is the one bug this engine
+        // must not have. It exists so a newly baked size is usable end to end before its xclbins are
+        // built, and so a box with no NPU can still run the reference path.
         // WhisperEncoder::new_npu still panics internally on failure (npu-whisper crate, out of
         // scope for this pass -- see engine-errors-are-real worklog).
-        let enc = WhisperEncoder::new_npu(&ws, WhisperCfg::SMALL, &xroot);
+        let enc = if std::env::var("WHISPER_ENC_HOST").is_ok() {
+            eprintln!("[whisper] WHISPER_ENC_HOST=1: encoder runs on the HOST, not the NPU");
+            WhisperEncoder::new(&ws, wcfg)
+        } else {
+            WhisperEncoder::new_npu(&ws, wcfg, &xroot)
+        };
         let tok = Tokenizer::from_file(ws.join("tokenizer.json"))
             .map_err(|e| EngineError::Load(format!("load tokenizer.json: {e}")))?;
+        let tokens = WhisperTokens::resolve(&tok)?;
 
         // NPU_DECODE: route the per-token decoder matmuls to the NPU (HostDecoder::new_npu) instead
         // of the ONNX decoder graphs. Built ONCE here (weights + resident CtxDecode kernels), sharing
@@ -295,7 +382,10 @@ impl WhisperAsr {
             (None, None, None)
         };
 
-        Ok(WhisperAsr { prep, decoder, decoder_past, enc, tok, npu_decoder, npu_fused, npu_fused_batch, _env: env })
+        Ok(WhisperAsr {
+            prep, decoder, decoder_past, enc, tok, cfg: wcfg, dec_layers, tokens,
+            npu_decoder, npu_fused, npu_fused_batch, _env: env,
+        })
     }
 
     /// Step 0: run the no-past graph over the full prompt + encoder hidden states. Delegates to the
@@ -306,26 +396,12 @@ impl WhisperAsr {
         enc_shape: &[i64],
         encoder_hidden: &[f32],
     ) -> (Vec<f32>, Vec<Kv>) {
-        decode_step0(&self.decoder, ids, enc_shape, encoder_hidden)
+        decode_step0(&self.decoder, self.dec_layers, ids, enc_shape, encoder_hidden)
     }
 
     /// Steps >=1: run the cached graph. Delegates to the free-standing `decode_step_cached`.
     fn decode_step_cached(&self, tok: i64, prev: &[Kv]) -> (Vec<f32>, Vec<Kv>) {
-        decode_step_cached(&self.decoder_past, tok, prev)
-    }
-
-    /// Argmax over the contiguous language-tag block `[LANG_LO, LANG_HI]` — the shared
-    /// language-detection rule used by both decode backends.
-    fn pick_lang(logits: &[f32]) -> i64 {
-        let lo = LANG_LO as usize;
-        let hi = LANG_HI as usize;
-        let mut best = lo;
-        for i in lo..=hi {
-            if logits[i] > logits[best] {
-                best = i;
-            }
-        }
-        best as i64
+        decode_step_cached(&self.decoder_past, self.dec_layers, tok, prev)
     }
 
     /// KV-cached greedy autoregressive decode against the cached encoder hidden states.
@@ -336,28 +412,31 @@ impl WhisperAsr {
     /// 1-step language detection (argmax over the language block), the prompt
     /// `[SOT, lang, TRANSCRIBE, NOTIMESTAMPS]`, full-vocab argmax, EOT stop, and `MAX_DECODE` cap.
     /// The ONLY difference is the source of per-step logits.
-    fn greedy_decode(&self, encoder_hidden: &[f32]) -> Vec<i64> {
+    ///
+    /// `lang` short-circuits detection, for the caller that wants one tag pinned across windows.
+    /// Returns the tag actually used.
+    fn greedy_decode(&self, encoder_hidden: &[f32], lang: Option<i64>) -> (Vec<i64>, i64) {
         if let Some(fd) = &self.npu_fused {
-            self.greedy_decode_fused(&mut fd.borrow_mut(), encoder_hidden)
+            self.greedy_decode_fused(&mut fd.borrow_mut(), encoder_hidden, lang)
         } else if let Some(dec) = &self.npu_decoder {
-            self.greedy_decode_npu(&mut dec.borrow_mut(), encoder_hidden)
+            self.greedy_decode_npu(&mut dec.borrow_mut(), encoder_hidden, lang)
         } else {
-            self.greedy_decode_onnx(encoder_hidden)
+            self.greedy_decode_onnx(encoder_hidden, lang)
         }
     }
 
     /// Whole-decode fused-ELF greedy decode. IDENTICAL control logic to `greedy_decode_npu` (lang
     /// detect, prompt, argmax, EOT, MAX_DECODE) — only the backend is `FusedDecoder` (1 dispatch/token).
-    fn greedy_decode_fused(&self, dec: &mut FusedDecoder, encoder_hidden: &[f32]) -> Vec<i64> {
-        let enc2 = Array2::from_shape_vec((T_ENC, D), encoder_hidden.to_vec())
+    fn greedy_decode_fused(&self, dec: &mut FusedDecoder, encoder_hidden: &[f32], lang: Option<i64>)
+        -> (Vec<i64>, i64) {
+        let enc2 = Array2::from_shape_vec((T_ENC, self.cfg.d_model), encoder_hidden.to_vec())
             .expect("encoder_hidden is [T_ENC*D]");
         dec.precompute_cross(&enc2);
         // Step-0 language detection needs the FULL logits (restricted argmax over the language block) → it
         // stays on host. The steady-state loop uses the on-NPU argmax (`step_token`) when the argmax-fused
         // proj_out ELF is loaded: the ELF returns a token id and the 104 KB logits readback is dropped.
-        let lang_logits = dec.step(SOT, 0);
-        let lang = Self::pick_lang(&lang_logits);
-        let prompt: Vec<i64> = vec![SOT, lang, TRANSCRIBE, NOTIMESTAMPS];
+        let lang = lang.unwrap_or_else(|| self.tokens.pick_lang(&dec.step(self.tokens.sot, 0)));
+        let prompt: Vec<i64> = self.tokens.prompt(lang);
         let mut ids = prompt.clone();
         dec.reset();
         let npu_argmax = dec.has_npu_argmax();
@@ -375,54 +454,56 @@ impl WhisperAsr {
         for (pos, &tok) in prompt.iter().enumerate() {
             next = next_tok(dec, tok, pos);
         }
-        if next != EOT {
+        if next != self.tokens.eot {
             ids.push(next);
         }
         for step in 0..(MAX_DECODE - 1) {
-            if next == EOT {
+            if next == self.tokens.eot {
                 break;
             }
             let pos = prompt.len() + step;
             next = next_tok(dec, next, pos);
-            if next == EOT {
+            if next == self.tokens.eot {
                 break;
             }
             ids.push(next);
         }
         // P0: per-phase breakdown for this utterance (no-op unless FUSED_PHASE_TIMING set).
         dec.dump_phase_timing();
-        ids
+        (ids, lang)
     }
 
     /// ONNX KV-cached greedy decode (the baseline; unchanged behavior).
-    fn greedy_decode_onnx(&self, encoder_hidden: &[f32]) -> Vec<i64> {
-        let enc_shape = vec![1, T_ENC as i64, D as i64];
+    fn greedy_decode_onnx(&self, encoder_hidden: &[f32], lang: Option<i64>) -> (Vec<i64>, i64) {
+        let enc_shape = vec![1, T_ENC as i64, self.cfg.d_model as i64];
         // language detection: 1-step `[SOT]` decode via the no-past graph (KV discarded).
-        let (lang_logits, _kv) = self.decode_step0(&[SOT], &enc_shape, encoder_hidden);
-        let lang = Self::pick_lang(&lang_logits);
-        let prompt: Vec<i64> = vec![SOT, lang, TRANSCRIBE, NOTIMESTAMPS];
+        let lang = lang.unwrap_or_else(|| {
+            let (l, _kv) = self.decode_step0(&[self.tokens.sot], &enc_shape, encoder_hidden);
+            self.tokens.pick_lang(&l)
+        });
+        let prompt: Vec<i64> = self.tokens.prompt(lang);
         let mut ids = prompt.clone();
 
         // Step 0: full prompt through the no-past graph; seeds the KV cache.
         let (logits, mut kv) = self.decode_step0(&prompt, &enc_shape, encoder_hidden);
         let mut next = argmax(&logits);
-        if next != EOT {
+        if next != self.tokens.eot {
             ids.push(next);
         }
         // Steps >=1: feed one token at a time through the cached graph.
         for _ in 1..MAX_DECODE {
-            if next == EOT {
+            if next == self.tokens.eot {
                 break;
             }
             let (logits, new_kv) = self.decode_step_cached(next, &kv);
             kv = new_kv;
             next = argmax(&logits);
-            if next == EOT {
+            if next == self.tokens.eot {
                 break;
             }
             ids.push(next);
         }
-        ids
+        (ids, lang)
     }
 
     /// On-NPU per-token greedy decode (`HostDecoder`). MIRRORS `greedy_decode_onnx` exactly — same
@@ -430,19 +511,19 @@ impl WhisperAsr {
     /// NPU decoder. The host decoder advances one token at a time with an explicit position; the
     /// 4-token prompt is fed sequentially (positions 0..3) and the next token argmaxed after the last
     /// prompt token, exactly matching the ONNX step-0-over-full-prompt semantics.
-    fn greedy_decode_npu(&self, dec: &mut HostDecoder, encoder_hidden: &[f32]) -> Vec<i64> {
+    fn greedy_decode_npu(&self, dec: &mut HostDecoder, encoder_hidden: &[f32], lang: Option<i64>)
+        -> (Vec<i64>, i64) {
         // Cross-KV from the encoder hidden states (also resets the self-KV cache for this utterance).
-        let enc2 = Array2::from_shape_vec((T_ENC, D), encoder_hidden.to_vec())
+        let enc2 = Array2::from_shape_vec((T_ENC, self.cfg.d_model), encoder_hidden.to_vec())
             .expect("encoder_hidden is [T_ENC*D]");
 
         // language detection: precompute cross-KV, decode `[SOT]` at pos 0, argmax over the lang
         // block, then reset (drop the SOT self-KV so the real prompt starts clean — mirrors the ONNX
         // path which discards the detection KV).
         dec.precompute_cross(&enc2);
-        let lang_logits = dec.step(SOT, 0);
-        let lang = Self::pick_lang(&lang_logits);
+        let lang = lang.unwrap_or_else(|| self.tokens.pick_lang(&dec.step(self.tokens.sot, 0)));
 
-        let prompt: Vec<i64> = vec![SOT, lang, TRANSCRIBE, NOTIMESTAMPS];
+        let prompt: Vec<i64> = self.tokens.prompt(lang);
         let mut ids = prompt.clone();
 
         // Re-seed: fresh self-KV for the actual prompt (cross-KV is unchanged for this utterance).
@@ -453,23 +534,23 @@ impl WhisperAsr {
             logits = dec.step(tok, pos);
         }
         let mut next = argmax(&logits);
-        if next != EOT {
+        if next != self.tokens.eot {
             ids.push(next);
         }
         // Steps >=1: feed the last emitted token at the next position.
         for step in 0..(MAX_DECODE - 1) {
-            if next == EOT {
+            if next == self.tokens.eot {
                 break;
             }
             let pos = prompt.len() + step; // position of the token we are about to feed
             let logits = dec.step(next, pos);
             next = argmax(&logits);
-            if next == EOT {
+            if next == self.tokens.eot {
                 break;
             }
             ids.push(next);
         }
-        ids
+        (ids, lang)
     }
 
     /// Preprocess + NPU-encode one clip → (flat encoder hidden `[T_ENC*D]`, preproc_ms, encoder_ms).
@@ -485,8 +566,8 @@ impl WhisperAsr {
             .run(&[("waveform", Tensor::F32(&wav, vec![1, N_SAMPLES as i64]))], &["input_features"])
             .expect("preprocessor");
         let feats = feat.f32(0);
-        let mut mel = Array2::<f32>::zeros((N_MELS, N_FRAMES));
-        for c in 0..N_MELS {
+        let mut mel = Array2::<f32>::zeros((self.cfg.n_mels, N_FRAMES));
+        for c in 0..self.cfg.n_mels {
             for t in 0..N_FRAMES {
                 mel[[c, t]] = feats[c * N_FRAMES + t];
             }
@@ -526,7 +607,7 @@ impl WhisperAsr {
         assert_eq!(clips.len(), b, "transcribe_batch needs exactly B={b} clips");
         let encs: Vec<Array2<f32>> = clips
             .iter()
-            .map(|s| Array2::from_shape_vec((T_ENC, D), self.encode_clip(s)).expect("enc shape"))
+            .map(|s| Array2::from_shape_vec((T_ENC, self.cfg.d_model), self.encode_clip(s)).expect("enc shape"))
             .collect();
         let ids = self.greedy_decode_fused_batch(&mut dec, &encs);
         ids.iter().map(|id| self.detokenize(id)).collect()
@@ -574,7 +655,7 @@ impl WhisperAsr {
     /// Single-stream (M=1) fused greedy decode for one pre-encoded clip → token ids (incl. prompt).
     pub fn decode_m1_ids(&self, enc_flat: &[f32]) -> Vec<i64> {
         let cell = self.npu_fused.as_ref().expect("decode_m1_ids needs NPU_DECODE_FUSED");
-        self.greedy_decode_fused(&mut cell.borrow_mut(), enc_flat)
+        self.greedy_decode_fused(&mut cell.borrow_mut(), enc_flat, None).0
     }
 
     /// Batched (B-stream) fused greedy decode over B pre-encoded clips → per-stream token ids.
@@ -583,7 +664,7 @@ impl WhisperAsr {
         let mut dec = cell.borrow_mut();
         let encs: Vec<Array2<f32>> = encs_flat
             .iter()
-            .map(|f| Array2::from_shape_vec((T_ENC, D), f.clone()).expect("enc shape"))
+            .map(|f| Array2::from_shape_vec((T_ENC, self.cfg.d_model), f.clone()).expect("enc shape"))
             .collect();
         self.greedy_decode_fused_batch(&mut dec, &encs)
     }
@@ -610,7 +691,7 @@ impl WhisperAsr {
             }
             let encs: Vec<Array2<f32>> = idxs
                 .iter()
-                .map(|&i| Array2::from_shape_vec((T_ENC, D), encs_flat[i].clone()).expect("enc shape"))
+                .map(|&i| Array2::from_shape_vec((T_ENC, self.cfg.d_model), encs_flat[i].clone()).expect("enc shape"))
                 .collect();
             let ids = self.greedy_decode_fused_batch(&mut dec, &encs);
             slots += dec.last_steps() * b;
@@ -631,12 +712,11 @@ impl WhisperAsr {
     ) -> Vec<Vec<i64>> {
         let b = encs.len();
         dec.precompute_cross_batch(encs);
-        let lang_logits = dec.step_batch(&vec![SOT; b], 0);
-        let langs: Vec<i64> = lang_logits.iter().map(|l| Self::pick_lang(l)).collect();
+        let lang_logits = dec.step_batch(&vec![self.tokens.sot; b], 0);
+        let langs: Vec<i64> = lang_logits.iter().map(|l| self.tokens.pick_lang(l)).collect();
         dec.reset();
-        let prompts: Vec<[i64; 4]> =
-            langs.iter().map(|&l| [SOT, l, TRANSCRIBE, NOTIMESTAMPS]).collect();
-        let mut ids: Vec<Vec<i64>> = prompts.iter().map(|p| p.to_vec()).collect();
+        let prompts: Vec<Vec<i64>> = langs.iter().map(|&l| self.tokens.prompt(l)).collect();
+        let mut ids: Vec<Vec<i64>> = prompts.clone();
         let plen = prompts[0].len();
         let mut logits: Vec<Vec<f32>> = Vec::new();
         for pos in 0..plen {
@@ -646,7 +726,7 @@ impl WhisperAsr {
         let mut next: Vec<i64> = logits.iter().map(|l| argmax(l)).collect();
         let mut active = vec![true; b];
         for bi in 0..b {
-            if next[bi] == EOT {
+            if next[bi] == self.tokens.eot {
                 active[bi] = false;
             } else {
                 ids[bi].push(next[bi]);
@@ -657,14 +737,14 @@ impl WhisperAsr {
                 break;
             }
             let pos = plen + step;
-            let toks: Vec<i64> = (0..b).map(|bi| if active[bi] { next[bi] } else { EOT }).collect();
+            let toks: Vec<i64> = (0..b).map(|bi| if active[bi] { next[bi] } else { self.tokens.eot }).collect();
             let logits = dec.step_batch(&toks, pos);
             for bi in 0..b {
                 if !active[bi] {
                     continue;
                 }
                 next[bi] = argmax(&logits[bi]);
-                if next[bi] == EOT {
+                if next[bi] == self.tokens.eot {
                     active[bi] = false;
                 } else {
                     ids[bi].push(next[bi]);
@@ -685,12 +765,84 @@ impl WhisperAsr {
     }
 }
 
+/// How far back from the 30 s mark to look for a quiet cut.
+const SEEK_BACK: usize = 48_000; // 3 s @ 16 kHz
+/// Energy window for that search.
+const CUT_FRAME: usize = 320; // 20 ms @ 16 kHz
+
+/// Cut points for audio longer than one Whisper window.
+///
+/// The frontend is fixed at 30 s and the old path simply truncated to it: a 90-minute recording
+/// returned its first 30 s with a 200 OK and nothing on the wire to say the rest was dropped -- the
+/// same defect already fixed on the parakeet side (`asr::parakeet`, `WIN_MEL`/`DecodeCarry`).
+///
+/// Each boundary is placed at the QUIETEST 20 ms frame within `SEEK_BACK` of the hard limit, so a
+/// cut is far more likely to land in a pause than mid-word. The windows do not overlap: the decode
+/// prompt ends in `<|notimestamps|>`, so there are no timestamps to align two overlapping decodes
+/// with, and overlap would duplicate text rather than stitch it.
+fn window_bounds(samples: &[i16]) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    while pos < samples.len() {
+        let hard = (pos + N_SAMPLES).min(samples.len());
+        if hard == samples.len() {
+            out.push((pos, hard));
+            break;
+        }
+        // SEEK_BACK < N_SAMPLES, so `lo` is always well inside this window and the cut advances.
+        let lo = hard - SEEK_BACK;
+        let (mut cut, mut quietest) = (hard, u64::MAX);
+        let mut f = lo;
+        while f + CUT_FRAME <= hard {
+            let e: u64 = samples[f..f + CUT_FRAME].iter().map(|&v| { let v = v as i64; (v * v) as u64 }).sum();
+            if e < quietest {
+                quietest = e;
+                cut = f + CUT_FRAME / 2;
+            }
+            f += CUT_FRAME;
+        }
+        out.push((pos, cut));
+        pos = cut;
+    }
+    out
+}
+
 impl AsrModel for WhisperAsr {
+    /// Transcribe audio of ANY length, window by window, each window detecting its own language.
     fn transcribe(&self, samples: &[i16]) -> Result<String, EngineError> {
+        // WHISPER_LANG_PIN=1 detects once and reuses that tag for every window. OFF by default,
+        // measured 2026-09-03 on a 90 s clip that is English for its first 38 s and Russian after:
+        // pinning translated both Russian windows into English ("In Japan, there are about 7000
+        // islands...") and dropped content, while per-window detection kept each window in its own
+        // language. Pinning is right only for a recording known to be single-language, where a quiet
+        // window could otherwise flip the tag.
+        let pin_lang = std::env::var("WHISPER_LANG_PIN").is_ok();
+        let mut text = String::new();
+        let mut lang = None;
+        for (a, b) in window_bounds(samples) {
+            let (t, l) = self.transcribe_window(&samples[a..b], lang)?;
+            if pin_lang {
+                lang = Some(l);
+            }
+            if !t.is_empty() {
+                if !text.is_empty() {
+                    text.push(' ');
+                }
+                text.push_str(&t);
+            }
+        }
+        Ok(text)
+    }
+}
+
+impl WhisperAsr {
+    /// One <= 30 s window: preprocess, encode, decode. Returns the text and the language tag used,
+    /// so the caller can pin it across the remaining windows.
+    fn transcribe_window(&self, samples: &[i16], lang: Option<i64>) -> Result<(String, i64), EngineError> {
         let timing = std::env::var("WHISPER_TIMING").is_ok();
         let t_e2e = std::time::Instant::now();
 
-        // i16 -> f32 in [-1,1], pad/truncate to exactly N_SAMPLES (preprocessor.onnx is fixed-shape).
+        // i16 -> f32 in [-1,1], zero-pad to exactly N_SAMPLES (preprocessor.onnx is fixed-shape).
         let t_prep = std::time::Instant::now();
         let mut wav = vec![0f32; N_SAMPLES];
         let m = samples.len().min(N_SAMPLES);
@@ -706,8 +858,8 @@ impl AsrModel for WhisperAsr {
             .map_err(|e| EngineError::Device(format!("preprocessor: {e}")))?;
         // input_features: [1, 80, 3000] flat channel-major -> Array2 [80, 3000] for the encoder.
         let feats = feat.f32(0);
-        let mut mel = Array2::<f32>::zeros((N_MELS, N_FRAMES));
-        for c in 0..N_MELS {
+        let mut mel = Array2::<f32>::zeros((self.cfg.n_mels, N_FRAMES));
+        for c in 0..self.cfg.n_mels {
             for t in 0..N_FRAMES {
                 mel[[c, t]] = feats[c * N_FRAMES + t];
             }
@@ -730,7 +882,7 @@ impl AsrModel for WhisperAsr {
         // whisper_decoder.rs) still panics internally on a decode failure -- out of scope for this
         // pass (engine-errors-are-real): converting that whole resident-context/KV-cache chain is its
         // own follow-up, not a narrow LOAD/INFERENCE-signature conversion.
-        let ids = self.greedy_decode(&flat);
+        let (ids, lang) = self.greedy_decode(&flat, lang);
         let dec_ms = t_dec.elapsed().as_secs_f64() * 1e3;
 
         let text = self.detokenize(&ids);
@@ -753,7 +905,7 @@ impl AsrModel for WhisperAsr {
                  ms_per_tok={ms_per_tok:.3} disp_per_tok={disp_per_tok:.2}"
             );
         }
-        Ok(text)
+        Ok((text, lang))
     }
 }
 
@@ -765,4 +917,47 @@ fn argmax(v: &[f32]) -> i64 {
         }
     }
     best as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The regression this windowing exists for: audio past 30 s used to be dropped silently.
+    #[test]
+    fn long_audio_is_covered_gaplessly_instead_of_truncated() {
+        let samples = vec![1000i16; 75 * 16_000]; // 75 s
+        let w = window_bounds(&samples);
+        assert!(w.len() >= 3, "75 s needs at least 3 windows, got {}", w.len());
+        assert_eq!(w[0].0, 0);
+        assert_eq!(w.last().unwrap().1, samples.len(), "the tail must be transcribed, not dropped");
+        for pair in w.windows(2) {
+            assert_eq!(pair[0].1, pair[1].0, "windows must be contiguous, no gap and no overlap");
+        }
+        for &(a, b) in &w {
+            assert!(b > a, "no empty window");
+            assert!(b - a <= N_SAMPLES, "a window must fit the fixed 30 s frontend");
+        }
+    }
+
+    /// Short audio keeps the exact old shape: one window, no cut search.
+    #[test]
+    fn audio_under_one_window_stays_one_window() {
+        let samples = vec![1000i16; 5 * 16_000];
+        assert_eq!(window_bounds(&samples), vec![(0, samples.len())]);
+        assert!(window_bounds(&[]).is_empty(), "no audio, no work");
+    }
+
+    /// The point of searching backwards: a boundary lands in a pause, not mid-word.
+    #[test]
+    fn a_cut_prefers_a_silent_gap_to_the_hard_limit() {
+        let mut samples = vec![8000i16; 45 * 16_000];
+        // 200 ms of silence starting at 28.0 s -- inside SEEK_BACK of the 30 s hard limit.
+        let gap = 28 * 16_000;
+        for v in &mut samples[gap..gap + 3_200] {
+            *v = 0;
+        }
+        let cut = window_bounds(&samples)[0].1;
+        assert!((gap..gap + 3_200).contains(&cut), "cut {cut} should be inside the silence at {gap}");
+    }
 }

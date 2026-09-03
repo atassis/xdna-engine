@@ -52,6 +52,15 @@ pub struct ModelCfg {
     pub head_dim: usize,
     pub n_layers: usize,
     pub max_seq: usize,
+    /// Log-mel filterbank channels the frontend produces. 80 for every Whisper before large-v3,
+    /// 128 from large-v3 on; also the encoder conv stem's input channel count.
+    #[serde(default = "default_n_mels")]
+    pub n_mels: usize,
+    /// Decoder depth, when the model has a decoder and it differs from `n_layers` (which is the
+    /// ENCODER depth). whisper-small is 12/12; large-v3-turbo is 32 encoder / 4 decoder. Defaults to
+    /// `n_layers` via `ModelCfg::decoder_layers`, so every existing scenario is unchanged.
+    #[serde(default)]
+    pub n_decoder_layers: Option<usize>,
     #[serde(default = "default_precision")]
     pub precision: String, // native | bf16 | int8
     #[serde(default = "default_kernel")]
@@ -59,6 +68,13 @@ pub struct ModelCfg {
 }
 fn default_precision() -> String { "bf16".into() }
 fn default_kernel() -> String { "zeropad".into() }
+fn default_n_mels() -> usize { 80 }
+
+impl ModelCfg {
+    /// Decoder depth: the explicit `n_decoder_layers` when set, else `n_layers` (encoder-only models
+    /// and every model whose two stacks are the same depth).
+    pub fn decoder_layers(&self) -> usize { self.n_decoder_layers.unwrap_or(self.n_layers) }
+}
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct Artifacts {
@@ -181,5 +197,23 @@ manifest = "artifacts/pyannote/diarize.json"
         let b = ScenarioConfig::from_str(&bge).unwrap();
         assert_eq!(b.model.as_ref().unwrap().hidden, 768);
         assert!(b.diarization.manifest.is_empty(), "an absent block defaults, never errors");
+    }
+
+    /// The two fields a second Whisper size needs, and the guarantee that the first one does not
+    /// have to name them: whisper-small's shipped scenario declares neither.
+    #[test]
+    fn whisper_shape_fields_default_to_small_and_parse_for_turbo() {
+        let small = ScenarioConfig::from_str(
+            &std::fs::read_to_string("../../scenarios/asr-whisper-small.toml").unwrap()).unwrap();
+        let m = small.model.as_ref().unwrap();
+        assert_eq!(m.n_mels, 80, "pre-large-v3 Whisper is 80-mel");
+        assert_eq!(m.decoder_layers(), m.n_layers, "small is 12 encoder / 12 decoder");
+
+        let turbo = ScenarioConfig::from_str(
+            &std::fs::read_to_string("../../scenarios/asr-whisper-turbo.toml").unwrap()).unwrap();
+        let m = turbo.model.as_ref().unwrap();
+        assert_eq!((m.hidden, m.ff, m.n_heads, m.n_layers), (1280, 5120, 20, 32));
+        assert_eq!(m.n_mels, 128, "large-v3 and later are 128-mel");
+        assert_eq!(m.decoder_layers(), 4, "turbo's decoder is 4 layers, not its 32 encoder layers");
     }
 }

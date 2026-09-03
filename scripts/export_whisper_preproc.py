@@ -12,8 +12,11 @@ The torch module mirrors `transformers.WhisperFeatureExtractor`:
 
 Verifies against `WhisperProcessor(...).input_features` on en_01.wav (rel target < 5e-2).
 
-Usage:  python scripts/export_whisper_preproc.py
-Writes: artifacts/whisper-small/preprocessor.onnx
+The mel-bin count is read off the checkpoint's own filterbank, so this exports whisper-small's
+80-bin front-end and large-v3/turbo's 128-bin one with no change but the model name.
+
+Usage:  python scripts/export_whisper_preproc.py [model-dir-name]   # default whisper-small
+Writes: artifacts/<model>/preprocessor.onnx
 """
 import sys
 from pathlib import Path
@@ -23,12 +26,12 @@ import torch
 import torch.nn as nn
 
 ROOT = Path(__file__).resolve().parents[1]
-PROC_DIR = ROOT / "artifacts" / "whisper-small" / "onnx"
-OUT = ROOT / "artifacts" / "whisper-small" / "preprocessor.onnx"
+MODEL = sys.argv[1] if len(sys.argv) > 1 else "whisper-small"
+PROC_DIR = ROOT / "artifacts" / MODEL / "onnx"
+OUT = ROOT / "artifacts" / MODEL / "preprocessor.onnx"
 
 N_FFT = 400
 HOP = 160
-N_MELS = 80
 N_SAMPLES = 480000      # 30 s @ 16 kHz
 N_FRAMES = 3000
 
@@ -51,8 +54,8 @@ class WhisperPreproc(nn.Module):
         sin_w = (-torch.sin(ang) * window).unsqueeze(1).float()  # [201,1,400]
         self.register_buffer("cos_w", cos_w)
         self.register_buffer("sin_w", sin_w)
-        # mel_filters from HF: shape [n_freqs=201, n_mels=80]; we want [80, 201] to matmul
-        mf = torch.from_numpy(np.ascontiguousarray(mel_filters.T)).float()  # [80, 201]
+        # mel_filters from HF: shape [n_freqs=201, n_mels]; we want [n_mels, 201] to matmul
+        mf = torch.from_numpy(np.ascontiguousarray(mel_filters.T)).float()  # [n_mels, 201]
         self.register_buffer("mel_filters", mf)
 
     def forward(self, waveform: torch.Tensor) -> torch.Tensor:
@@ -65,12 +68,12 @@ class WhisperPreproc(nn.Module):
         imag = torch.nn.functional.conv1d(wav, self.sin_w, stride=HOP)[0]  # [201, 3001]
         power = real * real + imag * imag        # |STFT|^2
         magnitudes = power[:, :-1]               # [201, 3000]  (HF drops last frame)
-        mel_spec = self.mel_filters @ magnitudes  # [80, 3000]
+        mel_spec = self.mel_filters @ magnitudes  # [n_mels, 3000]
         log_spec = torch.log10(torch.clamp(mel_spec, min=1e-10))
         # clamp to within 8 dB of the per-utterance max, then normalize
         log_spec = torch.maximum(log_spec, log_spec.max() - 8.0)
         log_spec = (log_spec + 4.0) / 4.0
-        return log_spec.unsqueeze(0)             # [1, 80, 3000]
+        return log_spec.unsqueeze(0)             # [1, n_mels, 3000]
 
 
 def main():
@@ -78,8 +81,8 @@ def main():
 
     proc = WhisperProcessor.from_pretrained(str(PROC_DIR))
     fe = proc.feature_extractor
-    mel_filters = np.asarray(fe.mel_filters)    # [201, 80]
-    print(f"mel_filters shape {mel_filters.shape}")
+    mel_filters = np.asarray(fe.mel_filters)    # [201, n_mels]
+    print(f"{MODEL}: mel_filters shape {mel_filters.shape} -> {mel_filters.shape[1]} mel bins")
 
     module = WhisperPreproc(mel_filters).eval()
 
@@ -106,7 +109,7 @@ def main():
     pcm = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
     assert sr == 16000, f"expected 16k, got {sr}"
 
-    ref = proc(pcm, sampling_rate=16000, return_tensors="np").input_features  # [1,80,3000]
+    ref = proc(pcm, sampling_rate=16000, return_tensors="np").input_features  # [1,n_mels,3000]
 
     import onnxruntime as ort
 

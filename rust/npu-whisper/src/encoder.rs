@@ -88,13 +88,15 @@ impl WhisperEncoder {
         let w = WhisperWeights::load(artifacts).expect("load whisper weights");
         assert_eq!(w.nblocks(), cfg.n_layers, "block count mismatch");
 
-        let npu = crate::npu::WhisperNpu::open(root);
+        let shape = npu_asr::ctx2::CtxAShape::for_whisper(cfg.d_model, cfg.ffn)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let npu = crate::npu::WhisperNpu::open(root, shape);
         let shared = npu.shared.clone();
 
         let block_ops = (0..cfg.n_layers)
             .map(|i| {
                 let bw: &TensorMap = w.block(i);
-                // q/k/v/out: K=768 -> n=768, bias on the NPU side (Epi::Bias). k.bias is zeros.
+                // q/k/v/out: K=d_model -> n=d_model, bias on the NPU side (Epi::Bias). k.bias is zeros.
                 let mk = |wk: &str, bk: &str, n: usize| {
                     CtxAOp::new(
                         shared.clone(),
@@ -105,19 +107,19 @@ impl WhisperEncoder {
                     )
                 };
                 crate::npu::BlockOps {
-                    q: mk("q.weight", "q.bias", 768),
-                    k: mk("k.weight", "k.bias", 768),
-                    v: mk("v.weight", "v.bias", 768),
-                    out: mk("out.weight", "out.bias", 768),
-                    // FFN mm1: K=768 -> 3072 + bias. NPU_ENC_GELU_FUSED=1 folds GELU into the GEMM epilogue
-                    // (Epi::GeluBias, modal rtp[0]=2) — drops the ~260 ms/utt host GELU; else GELU on host.
+                    q: mk("q.weight", "q.bias", cfg.d_model),
+                    k: mk("k.weight", "k.bias", cfg.d_model),
+                    v: mk("v.weight", "v.bias", cfg.d_model),
+                    out: mk("out.weight", "out.bias", cfg.d_model),
+                    // FFN mm1: K=d_model -> ffn + bias. NPU_ENC_GELU_FUSED=1 folds GELU into the GEMM
+                    // epilogue (Epi::GeluBias, modal rtp[0]=2) — drops the ~260 ms/utt host GELU.
                     fc1: if std::env::var("NPU_ENC_GELU_FUSED").is_ok() {
-                        CtxAOp::new(shared.clone(), &bw.m("fc1.weight"), 3072, Epi::GeluBias,
+                        CtxAOp::new(shared.clone(), &bw.m("fc1.weight"), cfg.ffn, Epi::GeluBias,
                                     bw.v("fc1.bias").as_slice().unwrap())
                     } else {
-                        mk("fc1.weight", "fc1.bias", 3072)
+                        mk("fc1.weight", "fc1.bias", cfg.ffn)
                     },
-                    // FFN mm2: K=3072 -> 768 + bias2 (host-accumulated K-split, bias2 added once).
+                    // FFN mm2: K=ffn -> d_model + bias2 (host-accumulated K-split, bias2 added once).
                     fc2: FfnMm2::new(shared.clone(), &bw.m("fc2.weight"), bw.v("fc2.bias").as_slice().unwrap()),
                 }
             })
@@ -126,10 +128,22 @@ impl WhisperEncoder {
         // NPU_ENC_MHA_NPU=1: load the static-shape encoder-MHA xclbin onto the SAME device (single-tenant).
         let mha_npu = if std::env::var("NPU_ENC_MHA_NPU").is_ok() {
             let base = root.join("artifacts/encoder_mha");
-            let xclbin = base.join("StaticMHA_h12_s1500_d64_kv0_causal0_npu2.xclbin");
-            let insts = base.join("StaticMHA_h12_s1500_d64_kv0_causal0_npu2.bin");
-            Some(crate::mha_npu::MhaNpu::open(&npu.device(), &xclbin, &insts)
-                .expect("NPU_ENC_MHA_NPU: load encoder-MHA xclbin (build via gen_encoder_mha.py)"))
+            let h = cfg.n_heads;
+            // Two names, because the op's own naming changed: IRON's MHA dropped `causal` as a
+            // field, so builds before that carry `_causal0_` and builds after do not. Both are the
+            // same non-causal design.
+            let stem = [format!("StaticMHA_h{h}_s1500_d64_kv0_npu2"),
+                        format!("StaticMHA_h{h}_s1500_d64_kv0_causal0_npu2")]
+                .into_iter()
+                .find(|s| base.join(format!("{s}.xclbin")).exists())
+                .unwrap_or_else(|| panic!(
+                    "NPU_ENC_MHA_NPU: no encoder-MHA xclbin for h={h} in {} -- build it with \
+                     `python route_b_kernels/decode_fused/gen_encoder_mha.py --heads {h} --out {}`",
+                    base.display(), base.display()));
+            let xclbin = base.join(format!("{stem}.xclbin"));
+            let insts = base.join(format!("{stem}.bin"));
+            Some(crate::mha_npu::MhaNpu::open(&npu.device(), h, &xclbin, &insts)
+                .expect("NPU_ENC_MHA_NPU: load encoder-MHA xclbin"))
         } else {
             None
         };
@@ -230,7 +244,7 @@ impl WhisperEncoder {
         *x += &pos.slice(s![..t, ..]);
     }
 
-    /// One pre-norm encoder block i. When the NPU backend is active (`new_npu`), the four K=768
+    /// One pre-norm encoder block i. When the NPU backend is active (`new_npu`), the four K=d_model
     /// projections + the two FFN matmuls run on the NPU (row-tiled to PAD_M=512); attention, LN,
     /// GELU and residuals stay on host. Otherwise the all-host f32 path runs.
     pub fn block(&self, i: usize, x: &Array2<f32>) -> Array2<f32> {
@@ -253,11 +267,11 @@ impl WhisperEncoder {
                 use npu_asr::engines::marsh;
                 let ops = &self.block_ops[i];
                 marsh::set_op(marsh::Q);
-                q = timed!("qkv_proj", apply_tiled(&ops.q, &ln1, 768));
+                q = timed!("qkv_proj", apply_tiled(&ops.q, &ln1, self.cfg.d_model));
                 marsh::set_op(marsh::K);
-                k = timed!("qkv_proj", apply_tiled(&ops.k, &ln1, 768)); // k.bias is zeros (applied on NPU)
+                k = timed!("qkv_proj", apply_tiled(&ops.k, &ln1, self.cfg.d_model)); // k.bias is zeros (applied on NPU)
                 marsh::set_op(marsh::V);
-                v = timed!("qkv_proj", apply_tiled(&ops.v, &ln1, 768));
+                v = timed!("qkv_proj", apply_tiled(&ops.v, &ln1, self.cfg.d_model));
             }
             #[cfg(not(feature = "npu"))]
             unreachable!();
@@ -286,7 +300,7 @@ impl WhisperEncoder {
             #[cfg(feature = "npu")]
             {
                 npu_asr::engines::marsh::set_op(npu_asr::engines::marsh::OUT);
-                attn = timed!("out_proj", crate::npu::apply_tiled(&self.block_ops[i].out, &ctx, 768));
+                attn = timed!("out_proj", crate::npu::apply_tiled(&self.block_ops[i].out, &ctx, self.cfg.d_model));
             }
             #[cfg(not(feature = "npu"))]
             unreachable!();
@@ -305,7 +319,7 @@ impl WhisperEncoder {
                 use npu_asr::engines::marsh;
                 let ops = &self.block_ops[i];
                 // RESIDENT-INTERMEDIATE FFN (NPU_ENC_FFN_RESIDENT, requires NPU_ENC_GELU_FUSED so the
-                // GELU is fused into fc1's on-chip epilogue): keep the [mp,3072] fc1->fc2 intermediate
+                // GELU is fused into fc1's on-chip epilogue): keep the [mp,ffn] fc1->fc2 intermediate
                 // in one bf16 buffer across the seam -> no host materialize / re-conversion of the
                 // largest data object. See internal notes (the FFN
                 // sub-block is ~67% of the encoder's host marshaling).
@@ -318,7 +332,7 @@ impl WhisperEncoder {
                     marsh::set_op(marsh::FC1);
                     // NPU_ENC_GELU_FUSED: fc1 is built with Epi::GeluBias → its output is already
                     // gelu(W·x+b), so the host GELU is skipped. Else GELU on host (default).
-                    let h1 = timed!("fc1", apply_tiled(&ops.fc1, &ln2, 3072));
+                    let h1 = timed!("fc1", apply_tiled(&ops.fc1, &ln2, self.cfg.ffn));
                     let f = if std::env::var("NPU_ENC_GELU_FUSED").is_ok() { h1 } else { timed!("gelu", gelu(&h1)) };
                     marsh::set_op(marsh::FC2);
                     f_out = timed!("fc2", apply_tiled_mm2(&ops.fc2, &f));

@@ -69,7 +69,7 @@ impl Bge {
         }).collect();
         #[cfg(feature = "npu")]
         let npu = if std::env::var("BGE_NPU").is_ok() {
-            let wn = WhisperNpu::open(std::path::Path::new("."));
+            let wn = WhisperNpu::open(std::path::Path::new("."), npu_asr::ctx2::CtxAShape::default());
             let sh = wn.shared.clone();
             let bs = |a: &Array1<f32>| a.as_slice().unwrap().to_vec();
             let nl: Vec<LayerNpu> = layers.iter().map(|ly| LayerNpu {
