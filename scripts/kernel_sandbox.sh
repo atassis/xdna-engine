@@ -34,7 +34,14 @@ ensure_fresh_sandbox() {
   # enough to trigger it.
   [ -f "$repo/toolchain.lock" ] || {
     echo "[kernel_sandbox] refuse: no toolchain.lock at '$repo' (REPO=${REPO:-unset})" >&2; return 1; }
-  local cur; cur="$(sha256sum "$repo/toolchain.lock" | cut -c1-12)"
+  # Hash the lock SEMANTICALLY -- comments and blank lines stripped -- so this value equals
+  # toolchain_up.sh's LOCKHASH and therefore the .cache/instances/<hash> directory name. Whole-file
+  # hashing (what this used to do) makes prose edits load-bearing: a comment-only change retires
+  # every shared sandbox, which is worst exactly at a re-pin, when several sessions are mid-build.
+  # toolchain_up.sh already moved off whole-file hashing for that reason; this had not followed, so
+  # the stamp could not be cross-referenced against the instance it names.
+  local cur; cur="$(sed -e 's/[[:space:]]*#.*$//' -e '/^[[:space:]]*$/d' "$repo/toolchain.lock" \
+                    | sha256sum | cut -c1-12)"
   [ -n "$cur" ] || { echo "[kernel_sandbox] refuse: empty lock hash" >&2; return 1; }
   local stamp="$bd/.toolchain-stamp"
   if [ -d "$bd" ] && { [ ! -f "$stamp" ] || [ "$(cat "$stamp" 2>/dev/null)" != "$cur" ]; }; then

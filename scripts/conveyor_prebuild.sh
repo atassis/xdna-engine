@@ -27,8 +27,13 @@ source scripts/iron_env.sh
 python3 -c "import aie.iron" 2>/dev/null || { echo "[conveyor-prebuild] iron env not green"; exit 2; }
 scripts/sync_kernels.sh >/dev/null 2>&1 || true
 
+# Same freshness rule as conveyor_bd_prebuild.sh: existence is not freshness.
 if [ -f "$out/final.xclbin" ] && [ -f "$out/insts.bin" ] && [ -z "${FORCE:-}" ]; then
+  if [ -n "${MLIR_AIE_INSTANCE:-}" ] && [ ! "$out/final.xclbin" -nt "$MLIR_AIE_INSTANCE" ]; then
+    echo "[conveyor-prebuild] STALE against $MLIR_AIE_INSTANCE -> rebuilding"
+  else
   echo "[conveyor-prebuild] xclbin already present -> $out (FORCE=1 to rebuild)"; exit 0
+  fi
 fi
 echo "[conveyor-prebuild] building 8-head conveyor (VARIANT=attn RELPOS=1, TQ=$TQ T=$T DK=$DK NQT=$NQT H=$HEADS) ..."
 # The IRON generator reads ATTN_* from env; the kernel .cc reads the same dims via -D (KFLAGS).

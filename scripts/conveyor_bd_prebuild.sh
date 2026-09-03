@@ -13,8 +13,17 @@ source scripts/iron_env.sh
 python3 -c "import aie.iron" 2>/dev/null || { echo "[bd-prebuild] iron env not green"; exit 2; }
 scripts/sync_kernels.sh >/dev/null 2>&1 || true
 
+# Reuse only if the artifact is NEWER than the toolchain that must have built it. File-existence is
+# not a freshness test: on 2026-09-03 a 06-29 kernel survived this exact shape of guard into a
+# same-day A/B and plausibly caused the hang it was blamed for (upstream #3559 changes the emitted
+# transaction blob, so an old artifact can speak an older host<->device wire format).
+# MLIR_AIE_INSTANCE is content-addressed by the lock hash, so its mtime is the pin's build time.
 if [ -f "$out/final.xclbin" ] && [ -f "$out/insts.bin" ] && [ -z "${FORCE:-}" ]; then
-  echo "[bd-prebuild] present -> $out (FORCE=1 to rebuild)"; exit 0
+  if [ -n "${MLIR_AIE_INSTANCE:-}" ] && [ ! "$out/final.xclbin" -nt "$MLIR_AIE_INSTANCE" ]; then
+    echo "[bd-prebuild] STALE against $MLIR_AIE_INSTANCE -> rebuilding"
+  else
+    echo "[bd-prebuild] present -> $out (FORCE=1 to rebuild)"; exit 0
+  fi
 fi
 echo "[bd-prebuild] building H=$H BD-onchip conveyor (T=$T N_QT=$NQT BD_KB=$BD_KB) ..."
 ( cd "$EX" && make clean >/dev/null 2>&1; \
