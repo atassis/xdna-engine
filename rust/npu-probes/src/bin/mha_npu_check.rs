@@ -2,8 +2,8 @@
 //! Run under device serialization (stop npu-asr/voxd, fuser check, restart).
 //!
 //!   cargo run -p npu-whisper --features npu --release --bin mha_npu_check -- \
-//!       artifacts/encoder_mha/StaticMHA_h12_s1500_d64_kv0_causal0_npu2.xclbin \
-//!       artifacts/encoder_mha/StaticMHA_h12_s1500_d64_kv0_causal0_npu2.bin
+//!       artifacts/encoder_mha/StaticMHA_h12_s1500_d64_kv0_npu2.xclbin \
+//!       artifacts/encoder_mha/StaticMHA_h12_s1500_d64_kv0_npu2.bin
 
 use std::path::Path;
 use std::rc::Rc;

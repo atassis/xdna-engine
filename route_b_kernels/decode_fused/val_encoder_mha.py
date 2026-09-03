@@ -46,7 +46,10 @@ def noncausal_golden(heads, S, d, num_pipeline, seed=42):
 def main():
     golden = noncausal_golden(HEADS, SEQ, D, PIPELINES)
     ctx = AIEContext()
-    op = StaticMHA(num_heads=HEADS, seq_len=SEQ, d=D, num_KV_heads=0, causal=False,
+    # `causal` was dropped from IRON's MHA dataclass; StaticMHA compiles mha.o with
+    # -DMHA_NONCAUSAL instead. Passing it here raised TypeError before any dispatch, which is
+    # why this validator could not run at all.
+    op = StaticMHA(num_heads=HEADS, seq_len=SEQ, d=D, num_KV_heads=0,
                    num_of_pipelines=PIPELINES, context=ctx)
 
     inputs = {"Q": golden["Q"].flatten(), "K": golden["K"].flatten(), "V": golden["V"].flatten()}

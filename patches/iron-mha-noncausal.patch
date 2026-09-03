@@ -1,0 +1,87 @@
+From 8e0bb203cfc9da940c8eee246beb4c764bfd60c6 Mon Sep 17 00:00:00 2001
+From: Taimuraz Kaitmazov <taimuraz@kaitmazov.com>
+Date: Thu, 3 Sep 2026 11:33:14 +0300
+Subject: [PATCH] mha: gate the four causal-mask sites behind MHA_NONCAUSAL
+
+mha.cc masks the causal upper triangle at four unconditional sites, so a
+bidirectional encoder gets a different function, not a lossier one. Whisper's
+encoder has carried that as a "bf16 precision wall" since 2026-06-20.
+
+Device, val_encoder_mha.py h=12 s=1500 d=64, same pin and design in both arms,
+only this flag differing: causal rel-L2 0.16125, 125881 valid elements over
+abs 0.5, 474937/1179648 tight-tol mismatches, FAIL. Non-causal rel-L2 0.01300,
+zero elements over 0.5, one mismatch, PASS -- the first pass this gate has had.
+
+Inert unless -DMHA_NONCAUSAL is defined, so existing causal/decode consumers
+preprocess byte-identically.
+
+A three-site version existed as xdna-engine patches/iron-mha-noncausal.patch at
+commit e08dd0d, which is dangling on no ref. It never gated the fourth (in-block
+diagonal) site, and that site alone is what June measured as diffuse noise.
+
+Claude-Session: https://claude.ai/code/session_01UxpFVE3ZSnifhEEJXeNox5
+---
+ aie_kernels/aie2p/mha.cc | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/aie_kernels/aie2p/mha.cc b/aie_kernels/aie2p/mha.cc
+index 3f01ec5..24ea68c 100644
+--- a/aie_kernels/aie2p/mha.cc
++++ b/aie_kernels/aie2p/mha.cc
+@@ -68,9 +68,11 @@ void matmul_bf16_bf16_wrapper(bfloat16 *a_in, bfloat16 *b_in, bfloat16 *c_out, i
+ 
+     ::aie::set_rounding(ROUNDING_MODE);
+ 
++#ifndef MHA_NONCAUSAL
+     if (idx_buffer[0] > idx_buffer[1]) {
+         return;
+     }
++#endif
+ 
+     matmul_bf16_bf16(a_in, b_in, c_out);
+ }
+@@ -93,9 +95,11 @@ void matmul_PV(bfloat16 *Q,
+ 
+     ::aie::set_rounding(ROUNDING_MODE);
+ 
++#ifndef MHA_NONCAUSAL
+     if (idx_buffer[0] > idx_buffer[1]) {
+         return;
+     }
++#endif
+ 
+     // 64 emul: O dims = [(8, 512), (8, 8), (8, 64), (8, 1)]
+     // VJUNG: Scale O_{i-1} by 1/exp(m_{i-1} - m_{i}) store in scale_buffer[3*B_q:3*B_q + B_q]
+@@ -177,11 +181,13 @@ void partial_softmax(bfloat16 *A,
+     int32_t q_block_idx = idx_buffer[1];
+     int32_t kv_block_idx = idx_buffer[0];
+ 
++#ifndef MHA_NONCAUSAL
+     // Causal full mask: skip blocks strictly above diagonal
+     if (kv_block_idx > q_block_idx) {
+         zero_bf16(P);
+         return;
+     }
++#endif
+ 
+     // Compute valid extents within this block for padded tails
+     int32_t valid_q_rows = S_q_eff - q_block_idx * B_q;
+@@ -230,6 +236,7 @@ void partial_softmax(bfloat16 *A,
+         }
+     }
+ 
++#ifndef MHA_NONCAUSAL
+     // Diagonal small causal mask only within valid region (vectorized)
+     if (kv_block_idx == q_block_idx) {
+         using Vec64bf16 = aie::vector<bfloat16, VECTOR_LENGTH>;
+@@ -248,6 +255,7 @@ void partial_softmax(bfloat16 *A,
+             }
+         }
+     }
++#endif
+ 
+     using Vec64bf16 = aie::vector<bfloat16, VECTOR_LENGTH>;
+     int32_t i = 0;
+-- 
+2.55.0
+

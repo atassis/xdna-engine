@@ -32,7 +32,24 @@ STATIC_DESIGN = Path(__file__).resolve().parent / "mha_static_design.py"
 
 
 class StaticMHA(MHA):
-    """MHA whose MLIR comes from the local static-shape design (no conditional objectfifo acquire)."""
+    """MHA whose MLIR comes from the local static-shape design (no conditional objectfifo acquire).
+
+    Also builds mha.o NON-CAUSALLY. IRON's mha.cc masks the upper triangle at four sites; the
+    encoder is bidirectional, so all four must be compiled out. Causality is a property of the
+    KERNEL, not of the design -- mha_static_design.py has no causal branch, which is why the
+    masking survived every review of the design file.
+    """
+
+    def get_kernel_artifacts(self):
+        arts = super().get_kernel_artifacts()
+        # Default ON: the encoder is bidirectional. ENC_MHA_NONCAUSAL=0 restores the stock causal
+        # kernel, which exists only as the control arm for measuring what the masking costs.
+        if os.environ.get("ENC_MHA_NONCAUSAL", "1") != "0":
+            for a in arts:
+                # the mha.o translation unit -- identified by its own defines, not by filename
+                if "-Dbf16_bf16_ONLY" in getattr(a, "extra_flags", []):
+                    a.extra_flags = list(a.extra_flags) + ["-DMHA_NONCAUSAL"]
+        return arts
 
     def get_mlir_artifact(self):
         return PythonGeneratedMLIRArtifact(
@@ -73,8 +90,9 @@ def main():
     os.makedirs(a.out, exist_ok=True)
 
     ctx = AIEContext()
-    # `causal` is not a constructor field: the current IRON MHA dropped it, and this design is
-    # non-causal by construction (mha_static_design.fused_mha has no causal branch at all).
+    # `causal` is not a constructor field -- the current IRON MHA dropped it. That is NOT the same
+    # as being non-causal: mha.cc masks unconditionally, so non-causality comes from StaticMHA's
+    # -DMHA_NONCAUSAL above, not from the absence of a `causal` argument.
     op = StaticMHA(num_heads=heads, seq_len=seq, d=d, num_KV_heads=0,
                    num_of_pipelines=a.pipelines, context=ctx)
     seq_pad = op._calculate_seq_padding(seq, a.pipelines)

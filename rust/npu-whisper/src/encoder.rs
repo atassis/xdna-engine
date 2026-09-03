@@ -125,25 +125,58 @@ impl WhisperEncoder {
             })
             .collect();
 
-        // NPU_ENC_MHA_NPU=1: load the static-shape encoder-MHA xclbin onto the SAME device (single-tenant).
-        let mha_npu = if std::env::var("NPU_ENC_MHA_NPU").is_ok() {
+        // Encoder MHA runs on the NPU by DEFAULT. `NPU_ENC_MHA_NPU=0` opts out to the host f32
+        // path -- the "!= 0" convention the rest of the engine's default-on knobs use
+        // (npu-asr/src/tuning.rs `not_zero`: any value but "0" enables).
+        //
+        // Flipped 2026-09-03 on the single-hardware rule, NOT on latency: it is a measured +72 ms
+        // /clip (+2.6%) REGRESSION, because the host MHA it replaces overlapped NPU dispatch and
+        // was never on the critical path. It is gated on EXACT token parity -- 17/17 clips
+        // byte-identical vs the host path -- and the point is to stop reasoning about a
+        // two-hardware graph. Re-rank latency once MHA folds into ctx2 as a mode rather than a
+        // second hw_context.
+        let mha_requested = std::env::var("NPU_ENC_MHA_NPU").ok();
+        let mha_explicit = mha_requested.is_some();
+        let mha_on = !matches!(mha_requested.as_deref(), Some("0"));
+        let mha_npu = if mha_on {
             let base = root.join("artifacts/encoder_mha");
             let h = cfg.n_heads;
             // Two names, because the op's own naming changed: IRON's MHA dropped `causal` as a
-            // field, so builds before that carry `_causal0_` and builds after do not. Both are the
-            // same non-causal design.
-            let stem = [format!("StaticMHA_h{h}_s1500_d64_kv0_npu2"),
-                        format!("StaticMHA_h{h}_s1500_d64_kv0_causal0_npu2")]
+            // field, so builds before that carry `_causal0_` and builds after do not. The name says
+            // NOTHING about whether the kernel is non-causal -- mha.cc masks unconditionally unless
+            // it is compiled with -DMHA_NONCAUSAL (StaticMHA.get_kernel_artifacts). A `_causal0_`
+            // artifact predating that flag is CAUSAL despite its name; rebuild rather than trust it.
+            let found = [format!("StaticMHA_h{h}_s1500_d64_kv0_npu2"),
+                         format!("StaticMHA_h{h}_s1500_d64_kv0_causal0_npu2")]
                 .into_iter()
-                .find(|s| base.join(format!("{s}.xclbin")).exists())
-                .unwrap_or_else(|| panic!(
-                    "NPU_ENC_MHA_NPU: no encoder-MHA xclbin for h={h} in {} -- build it with \
-                     `python route_b_kernels/decode_fused/gen_encoder_mha.py --heads {h} --out {}`",
-                    base.display(), base.display()));
-            let xclbin = base.join(format!("{stem}.xclbin"));
-            let insts = base.join(format!("{stem}.bin"));
-            Some(crate::mha_npu::MhaNpu::open(&npu.device(), h, &xclbin, &insts)
-                .expect("NPU_ENC_MHA_NPU: load encoder-MHA xclbin"))
+                .find(|s| base.join(format!("{s}.xclbin")).exists());
+            // A missing artifact is FATAL when the flag was asked for explicitly, and a loud
+            // fallback when this is merely the default -- a default path that panics on an absent
+            // build artifact is worse than one that runs correctly on the host and says so.
+            let build_hint = format!(
+                "no encoder-MHA xclbin for h={h} in {} -- build it with \
+                 `python route_b_kernels/decode_fused/gen_encoder_mha.py --heads {h} --out {}`",
+                base.display(), base.display());
+            match found {
+                None if mha_explicit => panic!("NPU_ENC_MHA_NPU: {build_hint}"),
+                None => {
+                    eprintln!("[encoder] WARNING: {build_hint}; falling back to HOST attention");
+                    None
+                }
+                Some(stem) => {
+                    let xclbin = base.join(format!("{stem}.xclbin"));
+                    let insts = base.join(format!("{stem}.bin"));
+                    match crate::mha_npu::MhaNpu::open(&npu.device(), h, &xclbin, &insts) {
+                        Ok(op) => Some(op),
+                        Err(e) if mha_explicit => panic!("NPU_ENC_MHA_NPU: load {}: {e}", xclbin.display()),
+                        Err(e) => {
+                            eprintln!("[encoder] WARNING: load {}: {e}; falling back to HOST attention",
+                                      xclbin.display());
+                            None
+                        }
+                    }
+                }
+            }
         } else {
             None
         };
