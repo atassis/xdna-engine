@@ -49,16 +49,22 @@ class StaticMHA(MHA):
                 # the mha.o translation unit -- identified by its own defines, not by filename
                 if "-Dbf16_bf16_ONLY" in getattr(a, "extra_flags", []):
                     a.extra_flags = list(a.extra_flags) + ["-DMHA_NONCAUSAL"]
-        # TIMING PROBE, opt-in and never a default: compiles partial_softmax to an immediate return
-        # so the mha stage's softmax COMPUTE is removed while the design's objectFIFO handshakes
-        # stay. The ENC_PEROP delta against an otherwise identical build says how much of the stage
-        # is softmax compute, which is what decides whether the softmax row is the pipeline limiter.
-        # Numerically wrong by construction -- an artifact built with this must never be installed.
-        # Requires an IRON tree whose mha.cc carries the MHA_SOFTMAX_NOOP guard.
-        if os.environ.get("ENC_MHA_SOFTMAX_NOOP", "0") == "1":
+        # TIMING PROBE, opt-in and never a default. ENC_MHA_NOOP_STAGES is a comma-separated
+        # subset of {qk, softmax, pv}: each named stage's kernel compiles to an immediate return, so
+        # its COMPUTE leaves the mha stage while the design's objectFIFO handshakes stay. The
+        # ENC_PEROP delta against an otherwise identical build is that stage's arithmetic share,
+        # which is how the three-row pipeline's limiter gets named without a trace.
+        # Requires an IRON tree whose mha.cc carries the matching MHA_<STAGE>_NOOP guards.
+        # Numerically wrong by construction -- an artifact built with any of these must never ship.
+        _stages = [x.strip().lower() for x in os.environ.get("ENC_MHA_NOOP_STAGES", "").split(",") if x.strip()]
+        _known = {"qk": "MHA_QK_NOOP", "softmax": "MHA_SOFTMAX_NOOP", "pv": "MHA_PV_NOOP"}
+        for _st in _stages:
+            if _st not in _known:
+                raise SystemExit(f"ENC_MHA_NOOP_STAGES: unknown stage {_st!r}; want a subset of {sorted(_known)}")
+        if _stages:
             for a in arts:
                 if "-Dbf16_bf16_ONLY" in getattr(a, "extra_flags", []):
-                    a.extra_flags = list(a.extra_flags) + ["-DMHA_SOFTMAX_NOOP"]
+                    a.extra_flags = list(a.extra_flags) + [f"-D{_known[x]}" for x in _stages]
         return arts
 
     def get_mlir_artifact(self):
