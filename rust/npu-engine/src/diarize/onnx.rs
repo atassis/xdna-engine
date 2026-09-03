@@ -11,12 +11,54 @@ use npu_onnx::{Env, Session, Tensor};
 use crate::api::EngineError;
 use crate::diarize::types::{Crop, Manifest, Segmenter, SpeakerEmbedder};
 
-fn load(dir: &Path, name: &str) -> Result<(Rc<Env>, Session), EngineError> {
+fn load(dir: &Path, name: &str, intra_threads: usize)
+    -> Result<(Rc<Env>, Session), EngineError> {
     let p = dir.join(name);
     let env = Env::new().map_err(|e| EngineError::Load(format!("onnx env: {e}")))?;
-    let s = Session::load(&env, p.to_str().unwrap_or(name))
+    let s = Session::load_with_threads(&env, p.to_str().unwrap_or(name), intra_threads)
         .map_err(|e| EngineError::Load(format!("load {}: {e}", p.display())))?;
     Ok((env, s))
+}
+
+/// PHYSICAL cores, counted as distinct `(package, core)` pairs in sysfs.
+///
+/// `available_parallelism` reports hardware THREADS, which is the wrong number here: see
+/// `embed_threads`. Falls back to half of it when sysfs topology is unreadable, SMT-2 being the
+/// case this exists to correct, and to 1 if even that fails.
+fn physical_cores() -> usize {
+    let mut seen = std::collections::BTreeSet::new();
+    if let Ok(entries) = std::fs::read_dir("/sys/devices/system/cpu") {
+        for e in entries.flatten() {
+            let t = e.path().join("topology");
+            let rd = |f: &str| std::fs::read_to_string(t.join(f)).ok()
+                .map(|v| v.trim().to_string());
+            if let (Some(pkg), Some(core)) = (rd("physical_package_id"), rd("core_id")) {
+                seen.insert((pkg, core));
+            }
+        }
+    }
+    if !seen.is_empty() { return seen.len() }
+    std::thread::available_parallelism().map(|n| (n.get() / 2).max(1)).unwrap_or(1)
+}
+
+/// Intra-op threads for the EMBEDDER session. Not the shim's default of 1.
+///
+/// That default is a choice for the tiny ASR preprocessor/decoder/joint graphs, where a wider pool
+/// only contends with the encoder's rayon glue. On this graph it costs most of the machine:
+/// MEASURED 2026-08-28, WeSpeaker ResNet34 over a 998x80 fbank, 290.6 ms/crop at 1 thread against
+/// 50.9 ms at 10 -- a 5.7x that nothing was buying.
+///
+/// One thread per PHYSICAL core, not per hardware thread. 12, 14 and 20 all measured WORSE than 10
+/// on this 10-core/20-thread box (81.7 / 72.0 / 79.5 ms), so the ceiling is SMT contention and
+/// `available_parallelism` would overshoot it by 2x. Override with `NPU_DIARIZE_THREADS`.
+///
+/// The SEGMENTER deliberately stays at 1: it is 4 stacked bidirectional LSTMs and does not
+/// parallelise (25.0 ms at 1 thread, 17.5 at 2, 22.7 at 10), and it is under 7% of runtime.
+fn embed_threads() -> usize {
+    std::env::var("NPU_DIARIZE_THREADS").ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or_else(physical_cores)
 }
 
 pub struct OnnxSegmenter {
@@ -29,7 +71,8 @@ pub struct OnnxSegmenter {
 
 impl OnnxSegmenter {
     pub fn build(m: &Manifest, dir: &Path) -> Result<OnnxSegmenter, EngineError> {
-        let (env, sess) = load(dir, &m.segmentation.onnx)?;
+        // 1 thread: see embed_threads' closing paragraph -- the BiLSTM does not parallelise.
+        let (env, sess) = load(dir, &m.segmentation.onnx, 1)?;
         Ok(OnnxSegmenter {
             _env: env,
             sess,
@@ -96,7 +139,7 @@ fn embed_batch(m: &Manifest) -> usize {
 
 impl OnnxEmbedder {
     pub fn build(m: &Manifest, dir: &Path) -> Result<OnnxEmbedder, EngineError> {
-        let (env, sess) = load(dir, &m.embedding.onnx)?;
+        let (env, sess) = load(dir, &m.embedding.onnx, embed_threads())?;
         Ok(OnnxEmbedder { _env: env, sess, dim: m.embedding.dim, batch: embed_batch(m) })
     }
 }
@@ -135,7 +178,7 @@ impl SpeakerEmbedder for OnnxEmbedder {
                 wav.extend(have.iter().map(|&s| s as f32 / 32768.0));
                 // Zero-pad a window that runs past the clip end -- the segmenter's padding
                 // contract, applied here so the batch stays rectangular.
-                wav.resize((b_len(&wav, n_samp)) , 0.0);
+                wav.resize(b_len(&wav, n_samp), 0.0);
                 msk.extend_from_slice(&c.weights);
             }
             let bs = chunk.len() as i64;
@@ -178,6 +221,25 @@ mod tests {
           "clustering":{"method":"centroid","threshold":0.7,"min_cluster_size":12,
                         "exclude_overlap":true,"source":"t"},
           "min_duration_off_s":0.0}"#).unwrap()
+    }
+
+    #[test]
+    fn the_embedder_thread_count_is_physical_cores_and_overridable() {
+        // The point of the setting is that it is NOT the shim's 1 and NOT available_parallelism.
+        let cores = physical_cores();
+        assert!(cores >= 1, "physical core count must be usable as a thread count");
+        let logical = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+        assert!(cores <= logical, "physical cores {cores} cannot exceed hardware threads {logical}");
+        // An override must win, including one that disagrees with the machine.
+        std::env::set_var("NPU_DIARIZE_THREADS", "3");
+        assert_eq!(embed_threads(), 3);
+        // Garbage and zero fall back rather than configuring a zero-thread pool.
+        std::env::set_var("NPU_DIARIZE_THREADS", "0");
+        assert_eq!(embed_threads(), cores, "0 threads is not a pool; fall back");
+        std::env::set_var("NPU_DIARIZE_THREADS", "lots");
+        assert_eq!(embed_threads(), cores, "unparseable is not a pool; fall back");
+        std::env::remove_var("NPU_DIARIZE_THREADS");
+        assert_eq!(embed_threads(), cores);
     }
 
     #[test]

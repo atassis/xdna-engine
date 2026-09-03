@@ -59,34 +59,7 @@ impl DiarizePipeline {
         // Seconds per segmentation frame, from the window duration and the model's own frame count.
         let frame_s = m.segmentation.duration_s / n_frames as f32;
         let hop_frames = ((m.segmentation.step_s / frame_s).round() as usize).max(1);
-        // Embedder frames per window, taken from the manifest rather than computed. The obvious
-        // `duration / frame_shift` is WRONG: kaldi frames with snip_edges, giving
-        // floor((samples - frame_length)/frame_shift) + 1 = 998, not 1000, for 10 s at 25/10 ms.
-        // onnxruntime rejects a weights mask of the wrong length outright, so this must match the
-        // graph exactly.
-        let n_emb_frames = m.embedding.n_frames.max(1);
-        let win_samples = (m.segmentation.duration_s * m.sample_rate as f32).round() as usize;
-        let hop_samples = (m.segmentation.step_s * m.sample_rate as f32).round() as usize;
-
-        // One crop per (window, speaker) that has EXCLUSIVE speech. A speaker who is only ever
-        // overlapped has no clean statistic to pool, so it is dropped rather than embedded badly.
-        let mut crops = Vec::new();
-        let mut keys = Vec::new();
-        for w in 0..n_windows {
-            for s in 0..n_spk {
-                let weights = stitch::exclusive_weights(&activity, w, s, n_emb_frames);
-                if !stitch::has_speech(&weights) { continue }
-                let start = w * hop_samples;
-                if start >= pcm.len() { continue }
-                crops.push(Crop {
-                    offset: start,
-                    len: win_samples,
-                    start_s: start as f64 / m.sample_rate as f64,
-                    weights,
-                });
-                keys.push((w, s));
-            }
-        }
+        let (crops, keys) = build_crops(m, &activity, pcm.len());
         if crops.is_empty() { return Ok(Vec::new()) }
 
         let t = std::time::Instant::now();
@@ -117,6 +90,48 @@ impl DiarizePipeline {
         }
         Ok(out)
     }
+}
+
+/// The `(window, speaker)` crops a segmentation implies, and the keys that name them.
+///
+/// One crop per (window, speaker) that has EXCLUSIVE speech. A speaker who is only ever overlapped
+/// has no clean statistic to pool, so it is dropped rather than embedded badly.
+///
+/// Public and separate from `run` because the CROP COUNT is the quantity every clustering failure
+/// so far has turned on -- crops are per (window, speaker), so a speaker's evidence is its share of
+/// them, and both the sub-10 s collapse and the step_s collapse are that share running out. A probe
+/// that wants to count them must count the ones the pipeline actually builds, not a reimplementation
+/// that can drift from this one.
+pub fn build_crops(m: &Manifest, activity: &ndarray::Array3<bool>, pcm_len: usize)
+    -> (Vec<Crop>, Vec<(usize, usize)>) {
+    let n_spk = m.segmentation.max_speakers_per_chunk;
+    let (n_windows, _, _) = activity.dim();
+    // Embedder frames per window, taken from the manifest rather than computed. The obvious
+    // `duration / frame_shift` is WRONG: kaldi frames with snip_edges, giving
+    // floor((samples - frame_length)/frame_shift) + 1 = 998, not 1000, for 10 s at 25/10 ms.
+    // onnxruntime rejects a weights mask of the wrong length outright, so this must match the
+    // graph exactly.
+    let n_emb_frames = m.embedding.n_frames.max(1);
+    let win_samples = (m.segmentation.duration_s * m.sample_rate as f32).round() as usize;
+    let hop_samples = (m.segmentation.step_s * m.sample_rate as f32).round() as usize;
+    let mut crops = Vec::new();
+    let mut keys = Vec::new();
+    for w in 0..n_windows {
+        for s in 0..n_spk {
+            let weights = stitch::exclusive_weights(activity, w, s, n_emb_frames);
+            if !stitch::has_speech(&weights) { continue }
+            let start = w * hop_samples;
+            if start >= pcm_len { continue }
+            crops.push(Crop {
+                offset: start,
+                len: win_samples,
+                start_s: start as f64 / m.sample_rate as f64,
+                weights,
+            });
+            keys.push((w, s));
+        }
+    }
+    (crops, keys)
 }
 
 /// Pick the clustering stage the manifest names. Unknown methods fail LOUDLY at load rather than

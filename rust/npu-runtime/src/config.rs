@@ -18,6 +18,18 @@ pub struct Config {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ServerCfg {
     #[serde(default = "default_port")] pub port: u16,
+    /// Ceiling on the summed DEVICE-BO bytes of resident models, from `Servable::footprint`.
+    ///
+    /// It does NOT bound host RSS, which is the memory that actually took this service down: that
+    /// failure was the onnxruntime arena sizing itself for the diarization embedder's batch
+    /// (measured 1519 MB at batch 32 against 568 MB at 8), and no device-BO accountant would ever
+    /// have seen it. `NPU_DIARIZE_MEM_MB` is the knob for that one; `idle_release_s` is what gives
+    /// host pages back.
+    ///
+    /// INERT TODAY: every shipped model reports `footprint() == 0`, so the sum is always 0 and the
+    /// check never fires. A model that loads without a measured footprint says so in its status
+    /// detail rather than passing silently -- an unenforceable bound that looks enforced is the
+    /// failure this note exists to prevent.
     #[serde(default = "default_memory_ceiling_mb")] pub memory_ceiling_mb: u64,
     /// How many models may be resident at once. Not a refusal: at the cap, a request for another
     /// model evicts per `evict_policy` (see `Registry::ensure_resident`).

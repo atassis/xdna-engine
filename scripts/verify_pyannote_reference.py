@@ -39,7 +39,12 @@ np.save(f"{out}/segmentation.npy", logits)
 print("segmentation:", logits.shape, f"({len(starts)} windows, hop {hop/sr:.2f}s)")
 
 # --- stage 2: the shipped pipeline's final answer ----------------------------------------------
-pipe = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", use_auth_token=token)
+# The end-to-end reference is 3.1's pipeline SPECIFICALLY, and the dump records which, because a
+# consumer cannot tell from the file. community-1 is a different clustering stage and will
+# legitimately disagree; gating its speaker count against this dump measures the difference between
+# two models, not an error in either.
+REF_PIPELINE = "pyannote/speaker-diarization-3.1"
+pipe = Pipeline.from_pretrained(REF_PIPELINE, use_auth_token=token)
 ann = pipe(wav_path)
 with open(f"{out}/reference.rttm", "w") as f:
     ann.write_rttm(f)
@@ -61,6 +66,7 @@ for i in range(len(tl)):
 
 summary = {
     "clip": wav_path,
+    "pipeline": REF_PIPELINE,
     "n_speakers": len(spk),
     "speech_s_per_speaker": {k: round(v, 3) for k, v in sorted(spk.items())},
     "overlap_s": round(overlap_s, 3),

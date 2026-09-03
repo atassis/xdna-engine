@@ -34,11 +34,20 @@ void sort_env_free(ShimOrtEnv* e) {
     if (e) { ort()->ReleaseEnv(e->env); delete e; }
 }
 
+// The 1-thread default is a CHOICE FOR THE ASR GRAPHS, not a property of onnxruntime: the
+// preprocessor/decoder/joint are tiny, and a wider pool there only contends with the encoder's rayon
+// glue. It is wrong for a big graph. MEASURED 2026-08-28 on the diarization embedder (WeSpeaker
+// ResNet34, 36 convs over a 998x80 fbank): 290.6 ms at 1 thread, 50.9 ms at 10 -- a 5.7x this
+// default was silently costing. Callers that own a large graph pass their own count.
 ShimOrtSession* sort_session_create(ShimOrtEnv* env, const char* model_path) {
+    return sort_session_create_threads(env, model_path, 1);
+}
+
+ShimOrtSession* sort_session_create_threads(ShimOrtEnv* env, const char* model_path,
+                                            int intra_threads) {
     OrtSessionOptions* opt = nullptr;
     if (!ok(ort()->CreateSessionOptions(&opt))) return nullptr;
-    // tiny models — a 1-thread intra-op pool avoids contending with the encoder's rayon glue
-    ort()->SetIntraOpNumThreads(opt, 1);
+    if (intra_threads > 0) ort()->SetIntraOpNumThreads(opt, intra_threads);
     OrtSession* s = nullptr;
     bool good = ok(ort()->CreateSession(env->env, model_path, opt, &s));
     ort()->ReleaseSessionOptions(opt);
