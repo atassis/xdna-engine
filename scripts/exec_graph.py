@@ -231,6 +231,25 @@ def build_model(sc, gemms, mhas):
     }
 
 
+def installed_binary():
+    """The binary actually SERVING, and how far behind HEAD it is.
+
+    The graph describes what the tree can build; this says what is running. install.sh's own header
+    records a production binary going unrefreshed for "15 days and 72 commits ... while every
+    install reported success", and nothing detects it. Same class as the stale kernel: the artifact
+    exists, so nothing asks which source produced it.
+    """
+    exe = Path.home() / ".local/bin/npu"
+    if not exe.is_file():
+        return {"present": False, "ev": "disk"}
+    mt = int(exe.stat().st_mtime)
+    behind = sh("git", "rev-list", "--count", f"--since=@{mt}", "HEAD")
+    return {"present": True, "path": str(exe), "mtime": mt,
+            "built": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(mt)),
+            "commits_on_head_since_build": int(behind) if behind.isdigit() else None,
+            "stale": bool(behind.isdigit() and int(behind) > 0), "ev": "derived"}
+
+
 def graph():
     gemms, mhas = kernel_inventory(), mha_inventory()
     models = [build_model(s, gemms, mhas) for s in scenarios()]
@@ -250,6 +269,7 @@ def graph():
             "declared": "table in scripts/exec_graph.py citing the code it mirrors -- WEAKEST, overruled by a runtime trace",
             "derived": "computed from the above",
         },
+        "installed_binary": installed_binary(),
         "models": models,
         "kernel_inventory": {"gemm": gemms, "encoder_mha": mhas, "ev": "disk"},
     }
@@ -285,8 +305,16 @@ def mermaid(g):
 
 
 def summary(g):
+    ib = g.get("installed_binary", {})
     out = [f"exec-graph  commit={g['provenance']['git_commit']}  pin={g['provenance']['mlir_aie_pin']}"
-           f"{'  [DIRTY]' if g['provenance']['git_dirty'] else ''}", ""]
+           f"{'  [DIRTY]' if g['provenance']['git_dirty'] else ''}"]
+    if ib.get("present"):
+        n = ib.get("commits_on_head_since_build")
+        out.append(f"installed npu binary built {ib['built']}"
+                   + (f"  -- STALE, {n} commit(s) on HEAD since" if ib.get("stale") else "  -- current"))
+    else:
+        out.append("installed npu binary: ABSENT")
+    out.append("")
     for m in g["models"]:
         d, h = m["derived"], m["health"]
         if m.get("schedule") == "not_declared":
