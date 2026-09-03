@@ -1,0 +1,42 @@
+{
+ "model": "Qwen/Qwen3-0.6B",
+ "prompt": "The capital of France is",
+ "prompt_ids": [
+  785,
+  6722,
+  315,
+  9625,
+  374
+ ],
+ "gen_ids": [
+  12095,
+  13,
+  576,
+  6722,
+  315,
+  15344,
+  374,
+  21718
+ ],
+ "margins": [
+  3.3080568313598633,
+  0.15411376953125,
+  1.4964370727539062,
+  3.4967727661132812,
+  2.5247879028320312,
+  0.020254135131835938,
+  5.2396392822265625,
+  3.718973159790039
+ ],
+ "hf_f32_gen_ids": [
+  12095,
+  13,
+  576,
+  6722,
+  315,
+  9625,
+  374,
+  1083
+ ],
+ "note": "Faithful bf16 host forward -- the oracle a bf16 DEVICE should match 1:1. `margins` is top1-top2 per step: a mismatch at a margin near the device's own logit error is a knife-edge, not a defect. hf_f32_gen_ids is kept for contrast; it is NOT the gate."
+}

@@ -29,8 +29,8 @@ def BF(a):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--weights", default="artifacts/qwen3-0.6b/weights")
-    ap.add_argument("--ref", default="artifacts/qwen3-0.6b/refs/greedy_ref.json")
-    ap.add_argument("--out", default="artifacts/qwen3-0.6b/refs/bf16_oracle.json")
+    ap.add_argument("--ref", default="tests/refs/qwen3-0.6b/greedy_ref.json")
+    ap.add_argument("--out", default="tests/refs/qwen3-0.6b/bf16_oracle.json")
     ap.add_argument("--steps", type=int, default=8)
     a = ap.parse_args()
 

@@ -12,7 +12,7 @@ same path (each step appends to the KV cache) and generation continues free-runn
 prompt token. Parity is judged on the FREE-RUNNING tokens.
 
   python route_b_kernels/decode_fused/verify_llm_decode.py --spec qwen3-0.6b \
-      --weights artifacts/qwen3-0.6b/weights --ref artifacts/qwen3-0.6b/refs/greedy_ref.json
+      --weights artifacts/qwen3-0.6b/weights --ref tests/refs/qwen3-0.6b/bf16_oracle.json
 
 Single-tenant: stop npu serve first.
 """

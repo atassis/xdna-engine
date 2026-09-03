@@ -1,0 +1,27 @@
+{
+ "model": "Qwen/Qwen3-0.6B",
+ "prompt": "The capital of France is",
+ "prompt_ids": [
+  785,
+  6722,
+  315,
+  9625,
+  374
+ ],
+ "gen_ids": [
+  12095,
+  13,
+  576,
+  6722,
+  315,
+  9625,
+  374,
+  1083,
+  279,
+  6722,
+  315,
+  279
+ ],
+ "gen_text": " Paris. The capital of France is also the capital of the",
+ "note": "HF bf16 CPU greedy; the device graph is decode-only, so the prompt is fed one token at a time through the same graph (KV appended per step) before free-running."
+}
