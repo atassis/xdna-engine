@@ -656,7 +656,7 @@ mod embed_cli_http_fuzz {
         let mut div = Vec::new();
         for s in [
             "hello", "", "   ", "- a markdown bullet", "-- a flag", "---",
-            "see [[dispatch-cost]] here", "a [bracket] and a ] stray one",
+            "see [[Dispatch Cost]] here", "a [bracket] and a ] stray one",
             "he said \"hi\"", "back\\slash", "a lone { brace", "line\nnext\ttab",
             "привет 🌍", "🌍", "\u{200b}zero-width", "\u{202e}rtl-override",
             &"x".repeat(10_000),

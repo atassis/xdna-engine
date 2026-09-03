@@ -1,8 +1,7 @@
 //! VOD -> STT -> LLM -> tool-call wiring skeleton.
 //!
-//! Design audit: `journal/docs/log/2026-08/2026-08-28-vod-stt-llm-tools-design.md`. That design
-//! recommends NOT building the product now (LLM device backend unlinked, no tool-calling anywhere
-//! in the tree). This binary is the smallest thing that proves the four fronts compose into one
+//! The design audit behind this recommends NOT building the product now: the LLM device backend is
+//! unlinked and there is no tool-calling anywhere in the tree. This binary is the smallest thing that proves the four fronts compose into one
 //! flow using the real trait contracts, not a product. It is device-free by construction (hard
 //! gate: no `/dev/accel/accel0`, no xclbin dispatch) -- every stage that a real run would put on
 //! the NPU is either genuinely run on host (audio extraction) or an explicit stub that says so.
@@ -104,8 +103,7 @@ impl AsrModel for HostStubAsr {
 fn stub_tool_classifier(transcript: &str) -> serde_json::Value {
     stub_marker!(
         "llm-tool-decision",
-        "vocab-pruned closed-set LM-head argmax over npu_gemma's fused decode ELF logits \
-         (design doc 2026-08-28-vod-stt-llm-tools-design.md §3 item 5)",
+        "vocab-pruned closed-set LM-head argmax over npu_gemma's fused decode ELF logits",
         "no LLM forward pass exists on this stack in any form (device or host); \
          GemmaNpuDecoder::step is a hard stub, see the real call above"
     );
@@ -187,7 +185,8 @@ fn main() {
     eprintln!("  ctx 3: LLM decode ELF (Gemma fused decode, once built)                <- 1 transition");
     eprintln!("  = 3 hardware-context loads, 2 transitions, reused across many dispatches each");
     eprintln!("  (many audio frames in ctx1, many decode steps in ctx2, many tokens in ctx3).");
-    eprintln!("  Per [[transition-cost-is-a-property-of-the-destination-program-not-a-constant]]");
-    eprintln!("  each transition costs ~1-5ms; a batch VOD clip pays this a HANDFUL of times total,");
-    eprintln!("  not per-token -- see design doc sec 2 for why that makes the tenancy tax small here.");
+    eprintln!("  A transition costs 0.79-3.55ms, and the spread is real: the cost is a property of");
+    eprintln!("  the DESTINATION program, not a constant, so pricing boundaries against a flat figure");
+    eprintln!("  overshoots. A batch VOD clip pays it a HANDFUL of times total, not per-token, which");
+    eprintln!("  is what makes the tenancy tax small here.");
 }
