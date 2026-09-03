@@ -1,11 +1,13 @@
 [workspace]
 resolver = "2"
-members = ["npu-xrt", "npu-asr-host", "npu-asr", "npu-onnx", "npu-parakeet", "npu-engine", "npu-whisper", "npu-weights", "npu-capi", "npu-runtime", "npu-cli", "npu-gemma", "npu-sr", "npu-sr-capi", "npu-probes", "npu-s2"]
+members = ["npu-xrt", "npu-asr-host", "npu-asr", "npu-onnx", "npu-parakeet", "npu-engine", "npu-whisper", "npu-weights", "npu-capi", "npu-runtime", "npu-cli", "npu-gemma", "npu-sr", "npu-sr-capi", "npu-probes", "npu-s2", "npu-vod-chain-skeleton"]
 
 # What `cargo build` at the workspace root builds: the product only. `npu-probes` holds 53
 # device probes, parity checks and benchmarks -- dev tooling that used to live in src/bin of the
 # shipped crates, where it was indistinguishable from product code and paid for on every build.
 # Build it explicitly: `cargo build -p npu-probes` (or `--workspace` for everything).
+# `npu-vod-chain-skeleton` is a wiring proof-of-concept (VOD->STT->LLM->tool-call), not a shipped
+# rail; kept out of default-members for the same reason. `cargo build -p npu-vod-chain-skeleton`.
 default-members = ["npu-xrt", "npu-asr-host", "npu-asr", "npu-onnx", "npu-parakeet", "npu-engine", "npu-whisper", "npu-weights", "npu-capi", "npu-runtime", "npu-cli", "npu-gemma", "npu-sr", "npu-sr-capi", "npu-s2"]
 
 [profile.release]

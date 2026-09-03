@@ -1113,6 +1113,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "npu-vod-chain-skeleton"
+version = "0.1.0"
+dependencies = [
+ "ndarray",
+ "npu-engine",
+ "npu-gemma",
+ "serde_json",
+]
+
+[[package]]
 name = "npu-weights"
 version = "0.1.0"
 dependencies = [
