@@ -19,6 +19,27 @@
 # The path guard below is load-bearing: it is the only thing standing between a bad argument and an
 # rm/mv on an arbitrary directory.
 
+# The ONE derivation of the freshness stamp value, so ensure_fresh_sandbox and
+# check_kernel_artifact_freshness.sh cannot compute two different hashes for the same lock.
+# Hashes the lock SEMANTICALLY -- comments and blank lines stripped -- so this value equals
+# toolchain_up.sh's LOCKHASH and therefore the .cache/instances/<hash> directory name. Whole-file
+# hashing (what this used to do) makes prose edits load-bearing: a comment-only change retires
+# every shared sandbox, which is worst exactly at a re-pin, when several sessions are mid-build.
+#   current_toolchain_hash <repo_root>
+current_toolchain_hash() {
+  local repo="$1"
+  # Fail loud on a missing lock. Without this the sha is EMPTY, never matches the stamp, and the
+  # sandbox is retired on EVERY call -- a silent rebuild-everything loop that reads as slowness, not
+  # as a bug. REPO is honored from the environment, so a stale REPO from an unrelated script is
+  # enough to trigger it.
+  [ -f "$repo/toolchain.lock" ] || {
+    echo "[kernel_sandbox] refuse: no toolchain.lock at '$repo' (REPO=${REPO:-unset})" >&2; return 1; }
+  local h; h="$(sed -e 's/[[:space:]]*#.*$//' -e '/^[[:space:]]*$/d' "$repo/toolchain.lock" \
+                | sha256sum | cut -c1-12)"
+  [ -n "$h" ] || { echo "[kernel_sandbox] refuse: empty lock hash" >&2; return 1; }
+  printf '%s' "$h"
+}
+
 ensure_fresh_sandbox() {
   local bd="$1"
   [ "${KERNEL_SANDBOX_GC:-1}" = "0" ] && return 0
@@ -28,21 +49,7 @@ ensure_fresh_sandbox() {
     *mlir-aie/programming_examples/*) : ;;
     *) echo "[kernel_sandbox] refuse: '$bd' is not under the mlir-aie build tree" >&2; return 1 ;;
   esac
-  # Fail loud on a missing lock. Without this the sha is EMPTY, never matches the stamp, and the
-  # sandbox is retired on EVERY call -- a silent rebuild-everything loop that reads as slowness, not
-  # as a bug. REPO is honored from the environment, so a stale REPO from an unrelated script is
-  # enough to trigger it.
-  [ -f "$repo/toolchain.lock" ] || {
-    echo "[kernel_sandbox] refuse: no toolchain.lock at '$repo' (REPO=${REPO:-unset})" >&2; return 1; }
-  # Hash the lock SEMANTICALLY -- comments and blank lines stripped -- so this value equals
-  # toolchain_up.sh's LOCKHASH and therefore the .cache/instances/<hash> directory name. Whole-file
-  # hashing (what this used to do) makes prose edits load-bearing: a comment-only change retires
-  # every shared sandbox, which is worst exactly at a re-pin, when several sessions are mid-build.
-  # toolchain_up.sh already moved off whole-file hashing for that reason; this had not followed, so
-  # the stamp could not be cross-referenced against the instance it names.
-  local cur; cur="$(sed -e 's/[[:space:]]*#.*$//' -e '/^[[:space:]]*$/d' "$repo/toolchain.lock" \
-                    | sha256sum | cut -c1-12)"
-  [ -n "$cur" ] || { echo "[kernel_sandbox] refuse: empty lock hash" >&2; return 1; }
+  local cur; cur="$(current_toolchain_hash "$repo")" || return 1
   local stamp="$bd/.toolchain-stamp"
   if [ -d "$bd" ] && { [ ! -f "$stamp" ] || [ "$(cat "$stamp" 2>/dev/null)" != "$cur" ]; }; then
     local was; was="$(cat "$stamp" 2>/dev/null || echo none)"
