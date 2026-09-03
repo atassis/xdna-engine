@@ -42,7 +42,7 @@ fn main() {
     let host = mha(&q, &k, &v, HEADS, HEAD_DIM, false, SEQ); // [1500,768]
 
     let dev = Rc::new(Device::open(0).expect("open NPU (stop npu-asr/voxd first)"));
-    let op = MhaNpu::open(&dev, xclbin, insts).expect("MhaNpu::open");
+    let op = MhaNpu::open(&dev, HEADS, xclbin, insts).expect("MhaNpu::open");
     let got = op.forward(&q, &k, &v); // [1500,768]
 
     let diff = &got - &host;
