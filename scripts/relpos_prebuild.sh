@@ -14,9 +14,6 @@
 set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO"
-# Semantic hash of the pin (comments and blank lines stripped), identical to conveyor_bd_prebuild.sh
-# and kernel_sandbox.sh so the three agree on what "the toolchain" is.
-_lock_id() { sed -e 's/[[:space:]]*#.*$//' -e '/^[[:space:]]*$/d' "$REPO/toolchain.lock" | sha256sum | cut -c1-12; }
 TQ=8
 # HEADS=8 = Parakeet n_heads run on 8 PARALLEL cores (one head/core), one dispatch/block
 # (Phase-2 spatial-parallel relpos). HEADS=1 rebuilds the original single-Worker block.
@@ -46,29 +43,26 @@ scripts/sync_kernels.sh >/dev/null 2>&1
 
 build_bucket() {
   local BUILT_T="$1" KB="$2" out="$OUT_ROOT/$3"
-  # Reuse only if the artifact was built by the CURRENT pin. File-existence is not a freshness
-  # test: on 2026-09-03 a 06-29 kernel survived this exact shape of guard into a same-day A/B and
-  # got a hang blamed on the kernel tile. This script is where that shape came from -- both
-  # conveyor prebuilds say "mirrors relpos_prebuild.sh" and both were fixed on 2026-09-03; this one
-  # was missed, so it kept the original defect while its copies were repaired.
-  if [ -f "$out/final.xclbin" ] && [ -f "$out/insts.bin" ] && [ -z "${FORCE:-}" ]; then
-    if [ "$(cat "$out/.toolchain-stamp" 2>/dev/null)" != "$(_lock_id)" ]; then
-      echo "[prebuild] bucket $BUILT_T STALE toolchain (stamp $(cat "$out/.toolchain-stamp" 2>/dev/null || echo none) != $(_lock_id)) -> rebuilding"
-    else
-      echo "[prebuild] bucket $BUILT_T present -> $out (FORCE=1 to rebuild)"; return 0
-    fi
-  fi
-  echo "[prebuild] building STEP=8 T=$BUILT_T TQ=$TQ KB=$KB HEADS=$HEADS -> $out ..."
-  ( cd "$EX" && make clean >/dev/null 2>&1; \
-    make NPU2=1 STEP=8 SPLITP=1 TSKIP="$TSKIP" ROWS="$ROWS" T="$BUILT_T" TQ="$TQ" KB="$KB" TACTIVE="$BUILT_T" HEADS="$HEADS" >/dev/null 2>&1 )
-  if [ ! -f "$EX/build/final.xclbin" ]; then
-    echo "[prebuild] FAILED bucket $BUILT_T (no final.xclbin)"; return 1
+  # NO existence skip and NO `make clean`. Every artifact name now carries its parameters
+  # (Makefile `tag`), so make can tell the buckets apart and an unchanged bucket is a real no-op --
+  # which is what made both of those necessary. Freshness is the dependency graph's job now: the
+  # toolchain axis rides on build/.toolchain.stamp (toolchain_stamp.mk), not on a shell stamp this
+  # script maintains. A shell cache check is a worse reimplementation of make that fails OPEN; two
+  # of the three prebuilds were measurably broken that way on 2026-09-03.
+  local MK=(NPU2=1 STEP=8 SPLITP=1 TSKIP="$TSKIP" ROWS="$ROWS" T="$BUILT_T" TQ="$TQ" KB="$KB" TACTIVE="$BUILT_T" HEADS="$HEADS")
+  local tag; tag=$(make -C "$EX" -s print-tag "${MK[@]}" 2>/dev/null)
+  [ -n "$tag" ] || { echo "[prebuild] FAILED bucket $BUILT_T (could not resolve tag)"; return 1; }
+  echo "[prebuild] make bucket $BUILT_T -> $tag"
+  ( cd "$EX" && make "${MK[@]}" "build/final_$tag.xclbin" >/dev/null 2>&1 )
+  local XB="$EX/build/final_$tag.xclbin" IB="$EX/build/insts_$tag.bin"
+  if [ ! -f "$XB" ]; then
+    echo "[prebuild] FAILED bucket $BUILT_T (no $XB)"; return 1
   fi
   # The template insts hold HEADS t_active words (one per head's RTP write), all == BUILT_T.
   # npu.rs patches EVERY word == BUILT_T to the clip's t. Verify the count == HEADS so a
   # stale/mis-built insts (wrong head count, or a BUILT_T collision) fails LOUD here.
   local nt
-  nt=$(python3 - "$EX/build/insts.bin" "$BUILT_T" <<'PY'
+  nt=$(python3 - "$IB" "$BUILT_T" <<'PY'
 import sys, struct
 b = open(sys.argv[1], "rb").read()
 v = int(sys.argv[2])
@@ -82,9 +76,8 @@ PY
     echo "[prebuild]       npu.rs patches all of them; a mismatch means a BUILT_T value collision -- inspect before use."
   fi
   mkdir -p "$out"
-  cp "$EX/build/final.xclbin" "$out/final.xclbin"
-  cp "$EX/build/insts.bin"    "$out/insts.bin"
-  _lock_id > "$out/.toolchain-stamp"
+  cmp -s "$XB" "$out/final.xclbin" || cp "$XB" "$out/final.xclbin"
+  cmp -s "$IB" "$out/insts.bin"    || cp "$IB" "$out/insts.bin"
   echo "[prebuild] installed bucket $BUILT_T ($nt t_active words) -> $out"
 }
 
