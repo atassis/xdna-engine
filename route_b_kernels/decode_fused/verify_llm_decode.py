@@ -56,6 +56,7 @@ def main():
     ap.add_argument("--layers", type=int, default=None)
     ap.add_argument("--max-seq", type=int, default=2048)
     ap.add_argument("--steps", type=int, default=None, help="free-running tokens to compare")
+    ap.add_argument("--dump-logits", default=None, help="write step-0 logits to this .npy for offline compare")
     a = ap.parse_args()
 
     ref = json.load(open(a.ref))
@@ -97,7 +98,11 @@ def main():
         params.write("sm_mask", int(pos + 1))
         params.sync()
         c()
-        nxt = int(np.argmax(np.asarray(out.data[:VOCAB], dtype=np.float32)))
+        lg = np.asarray(out.data[:VOCAB], dtype=np.float32)
+        if a.dump_logits and pos == 0:
+            np.save(a.dump_logits, lg)
+            print(f"[verify] step-0 logits dumped to {a.dump_logits}")
+        nxt = int(np.argmax(lg))
         if pos + 1 < len(fed):
             tok = fed[pos + 1]              # teacher-force through the prompt
         else:
