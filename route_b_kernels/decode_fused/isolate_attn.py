@@ -131,6 +131,24 @@ def main():
     ref_cx = np.stack([sw[h, :P + 1] @ vc[h // grp, :P + 1, :] for h in range(Hq)])
     print(f"   context                {rel(ref_cx, cx):.4e}")
 
+    # 5. THE TAIL. The lm-head is the only GEMV whose tiling differs from every other (tso forced
+    # down to fit L1), it is the last op before argmax, and nothing had ever isolated it. The
+    # cumulative bisect showed xf 7.8e-1 -> logits 2.3e0, i.e. a 3x amplification across one LINEAR
+    # op, which a correct GEMV should not produce.
+    print("\n5. FINAL NORM + TIED LM-HEAD (never isolated before)")
+    n_final = npy("model.norm.weight")
+    xlast = dev(f"x{md['NL']}")
+    xf_h = np.asarray(xlast / np.sqrt((xlast * xlast).mean() + sp.eps) * n_final, BF16).astype(np.float32)
+    xf_d = dev("xf")
+    print(f"   xf     = RMSNorm(x{md['NL']})            {rel(xf_h, xf_d):.4e}")
+    lg_h = embed @ xf_d          # tied head, on the DEVICE's own xf
+    lg_d = dev("logits")[:sp.vocab]
+    print(f"   logits = embed @ (device xf)     {rel(lg_h, lg_d):.4e}   <-- isolates the lm-head GEMV")
+    print(f"   argmax host {int(np.argmax(lg_h))}  device {int(np.argmax(lg_d))}")
+    q4 = sp.vocab // 4
+    print("   per-quarter: " + " ".join(f"q{i}={rel(lg_h[i*q4:(i+1)*q4], lg_d[i*q4:(i+1)*q4]):.3e}"
+                                        for i in range(4)))
+
 
 if __name__ == "__main__":
     main()
