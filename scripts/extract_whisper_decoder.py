@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Extract openai/whisper-small DECODER weights from the exported ONNX to npy.
+"""Extract a Whisper DECODER's weights from the exported ONNX to npy.
 
 Companion to scripts/extract_whisper_encoder.py (which pulls the encoder from
 the HF transformers checkpoint). The decoder is exported to ONNX by optimum
@@ -18,14 +18,14 @@ mirror the encoder extractor's scheme exactly:
   whisper_decoder/L{i}/{q,k,v,out}.bias.npy          (k has none -> zeros)
   whisper_decoder/L{i}/cross_{q,k,v,out}.weight.npy  cross-attention  [K_in,N_out]
   whisper_decoder/L{i}/cross_{q,k,v,out}.bias.npy    (cross k has none -> zeros)
-  whisper_decoder/L{i}/fc1.weight.npy  fc1.bias.npy  [768,3072] / [3072]
-  whisper_decoder/L{i}/fc2.weight.npy  fc2.bias.npy  [3072,768] / [768]
+  whisper_decoder/L{i}/fc1.weight.npy  fc1.bias.npy  [d_model,ffn] / [ffn]
+  whisper_decoder/L{i}/fc2.weight.npy  fc2.bias.npy  [ffn,d_model] / [d_model]
   whisper_decoder/L{i}/ln_self.{weight,bias}.npy     self_attn_layer_norm  (gamma,beta)
   whisper_decoder/L{i}/ln_cross.{weight,bias}.npy    encoder_attn_layer_norm
   whisper_decoder/L{i}/ln_final.{weight,bias}.npy    final_layer_norm (post-FFN, pre-residual)
-  whisper_decoder/embed_tokens.npy        [vocab,768]   token embedding
-  whisper_decoder/embed_positions.npy     [448,768]     learned positions
-  whisper_decoder/proj_out.weight.npy     [768,vocab]   output projection (tied to embed_tokens.T)
+  whisper_decoder/embed_tokens.npy        [vocab,d_model]  token embedding
+  whisper_decoder/embed_positions.npy     [448,d_model]    learned positions
+  whisper_decoder/proj_out.weight.npy     [d_model,vocab]  output projection (tied to embed_tokens.T)
   whisper_decoder/ln_post.{weight,bias}.npy             model.decoder.layer_norm (final pre-proj_out)
 
 Linear weights keep ONNX's [K_in, N_out] layout (the MatMul rhs), i.e. already
@@ -52,9 +52,18 @@ ONNX_PATH = Path(os.environ.get("WHISPER_DECODER_ONNX", DEFAULT_ONNX))
 ART = Path(os.environ.get("WHISPER_OUT", str(ONNX_PATH.parent.parent)))
 OUT = ART / "whisper_decoder"
 
-N_LAYERS = 12
-HIDDEN = 768
-FFN = 3072
+# Shape comes from the exported checkpoint's own config, not from constants: whisper-small is
+# 12 layers / 768 / 3072 and large-v3-turbo is 4 / 1280 / 5120, and `decoder_layers` is NOT
+# `encoder_layers` (turbo's encoder is 32 deep).
+_CFG = ONNX_PATH.parent / "config.json"
+if _CFG.exists():
+    import json
+    _c = json.loads(_CFG.read_text())
+    N_LAYERS = _c["decoder_layers"]
+    HIDDEN = _c["d_model"]
+    FFN = _c["decoder_ffn_dim"]
+else:
+    raise SystemExit(f"need {_CFG} (optimum writes it beside the exported graphs)")
 
 if not ONNX_PATH.exists():
     raise SystemExit(f"decoder ONNX not found: {ONNX_PATH}\n"
@@ -168,7 +177,7 @@ print(f"\nwrote {len(manifest)} tensors -> {OUT}\n")
 for name, shape in manifest:
     print(f"  {name:32s} {shape}")
 
-# --- shape assertions against whisper-small ---
+# --- shape assertions against the config this run was driven by ---
 emb = np.load(OUT / "embed_tokens.npy")
 vocab = emb.shape[0]
 assert emb.shape == (vocab, HIDDEN), emb.shape

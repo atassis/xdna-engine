@@ -308,9 +308,18 @@ impl WhisperAsr {
             n_mels: m.n_mels,
         };
         let dec_layers = m.decoder_layers();
+        // WHISPER_ENC_HOST=1 runs the encoder on the host instead of the NPU. Opt-in and loud, never
+        // a silent fallback: a model that quietly moved off the device is the one bug this engine
+        // must not have. It exists so a newly baked size is usable end to end before its xclbins are
+        // built, and so a box with no NPU can still run the reference path.
         // WhisperEncoder::new_npu still panics internally on failure (npu-whisper crate, out of
         // scope for this pass -- see engine-errors-are-real worklog).
-        let enc = WhisperEncoder::new_npu(&ws, wcfg, &xroot);
+        let enc = if std::env::var("WHISPER_ENC_HOST").is_ok() {
+            eprintln!("[whisper] WHISPER_ENC_HOST=1: encoder runs on the HOST, not the NPU");
+            WhisperEncoder::new(&ws, wcfg)
+        } else {
+            WhisperEncoder::new_npu(&ws, wcfg, &xroot)
+        };
         let tok = Tokenizer::from_file(ws.join("tokenizer.json"))
             .map_err(|e| EngineError::Load(format!("load tokenizer.json: {e}")))?;
         let tokens = WhisperTokens::resolve(&tok)?;
@@ -404,10 +413,8 @@ impl WhisperAsr {
     /// `[SOT, lang, TRANSCRIBE, NOTIMESTAMPS]`, full-vocab argmax, EOT stop, and `MAX_DECODE` cap.
     /// The ONLY difference is the source of per-step logits.
     ///
-    /// `lang` short-circuits detection. Long-form audio decodes window by window and the language is
-    /// a property of the recording, not of a 30 s slice: re-detecting per window lets one quiet or
-    /// music-only window flip mid-recording, and a flipped tag makes Whisper translate the rest.
-    /// Returns the tag actually used so the caller can pin it for the following windows.
+    /// `lang` short-circuits detection, for the caller that wants one tag pinned across windows.
+    /// Returns the tag actually used.
     fn greedy_decode(&self, encoder_hidden: &[f32], lang: Option<i64>) -> (Vec<i64>, i64) {
         if let Some(fd) = &self.npu_fused {
             self.greedy_decode_fused(&mut fd.borrow_mut(), encoder_hidden, lang)
@@ -801,15 +808,22 @@ fn window_bounds(samples: &[i16]) -> Vec<(usize, usize)> {
 }
 
 impl AsrModel for WhisperAsr {
-    /// Transcribe audio of ANY length, window by window. The language tag is detected once, on the
-    /// first window, and pinned for the rest: it is a property of the recording, and a re-detection
-    /// that flips on a quiet window makes Whisper translate everything after it.
+    /// Transcribe audio of ANY length, window by window, each window detecting its own language.
     fn transcribe(&self, samples: &[i16]) -> Result<String, EngineError> {
+        // WHISPER_LANG_PIN=1 detects once and reuses that tag for every window. OFF by default,
+        // measured 2026-09-03 on a 90 s clip that is English for its first 38 s and Russian after:
+        // pinning translated both Russian windows into English ("In Japan, there are about 7000
+        // islands...") and dropped content, while per-window detection kept each window in its own
+        // language. Pinning is right only for a recording known to be single-language, where a quiet
+        // window could otherwise flip the tag.
+        let pin_lang = std::env::var("WHISPER_LANG_PIN").is_ok();
         let mut text = String::new();
         let mut lang = None;
         for (a, b) in window_bounds(samples) {
             let (t, l) = self.transcribe_window(&samples[a..b], lang)?;
-            lang = Some(l);
+            if pin_lang {
+                lang = Some(l);
+            }
             if !t.is_empty() {
                 if !text.is_empty() {
                     text.push(' ');
