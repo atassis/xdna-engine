@@ -5,6 +5,13 @@
 # Device hygiene first: systemctl --user stop npu-asr npu-vox ; fuser /dev/accel/accel0 (clear).
 set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$REPO"
+
+# Freshness by IDENTITY, not by timestamp. An earlier version of this guard compared the artifact's
+# mtime against $MLIR_AIE_INSTANCE -- wrong, because that directory's mtime moves whenever anything
+# inside it changes (sync_kernels.sh copies kernels in on every build), so it would rebuild
+# spuriously and constantly, which is how guards end up deleted. Compare the semantic lock hash --
+# the same value toolchain_up.sh uses to NAME .cache/instances/<hash>.
+_lock_id() { sed -e 's/[[:space:]]*#.*$//' -e '/^[[:space:]]*$/d' "$REPO/toolchain.lock" | sha256sum | cut -c1-12; }
 TQ=8; T=176; DK=128; NQT=22; BD_KB=39; H=4; INV=0.08838835
 EX=mlir-aie/programming_examples/basic/conveyor_proto
 out="artifacts/conveyor_bd/single"
@@ -19,8 +26,8 @@ scripts/sync_kernels.sh >/dev/null 2>&1 || true
 # transaction blob, so an old artifact can speak an older host<->device wire format).
 # MLIR_AIE_INSTANCE is content-addressed by the lock hash, so its mtime is the pin's build time.
 if [ -f "$out/final.xclbin" ] && [ -f "$out/insts.bin" ] && [ -z "${FORCE:-}" ]; then
-  if [ -n "${MLIR_AIE_INSTANCE:-}" ] && [ ! "$out/final.xclbin" -nt "$MLIR_AIE_INSTANCE" ]; then
-    echo "[bd-prebuild] STALE against $MLIR_AIE_INSTANCE -> rebuilding"
+  if [ "$(cat "$out/.toolchain-stamp" 2>/dev/null)" != "$(_lock_id)" ]; then
+    echo "[bd-prebuild] STALE toolchain (stamp $(cat "$out/.toolchain-stamp" 2>/dev/null || echo none) != $(_lock_id)) -> rebuilding"
   else
     echo "[bd-prebuild] present -> $out (FORCE=1 to rebuild)"; exit 0
   fi
@@ -35,3 +42,6 @@ if [ ! -f "$EX/build/final.xclbin" ]; then
 fi
 mkdir -p "$out"; cp "$EX/build/final.xclbin" "$out/final.xclbin"; cp "$EX/build/insts.bin" "$out/insts.bin"
 echo "[bd-prebuild] installed H=$H BD-onchip xclbin -> $out"
+
+# Record which toolchain produced these artifacts, so the reuse check above is an identity test.
+_lock_id > "$out/.toolchain-stamp"

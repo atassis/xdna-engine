@@ -29,8 +29,8 @@ scripts/sync_kernels.sh >/dev/null 2>&1 || true
 
 # Same freshness rule as conveyor_bd_prebuild.sh: existence is not freshness.
 if [ -f "$out/final.xclbin" ] && [ -f "$out/insts.bin" ] && [ -z "${FORCE:-}" ]; then
-  if [ -n "${MLIR_AIE_INSTANCE:-}" ] && [ ! "$out/final.xclbin" -nt "$MLIR_AIE_INSTANCE" ]; then
-    echo "[conveyor-prebuild] STALE against $MLIR_AIE_INSTANCE -> rebuilding"
+  if [ "$(cat "$out/.toolchain-stamp" 2>/dev/null)" != "$(_lock_id)" ]; then
+    echo "[conveyor-prebuild] STALE toolchain (stamp $(cat "$out/.toolchain-stamp" 2>/dev/null || echo none) != $(_lock_id)) -> rebuilding"
   else
   echo "[conveyor-prebuild] xclbin already present -> $out (FORCE=1 to rebuild)"; exit 0
   fi
@@ -50,3 +50,6 @@ mkdir -p "$out"
 cp "$EX/build/final.xclbin" "$out/final.xclbin"
 cp "$EX/build/insts.bin"    "$out/insts.bin"
 echo "[conveyor-prebuild] installed 8-head conveyor xclbin + insts -> $out"
+
+# Record which toolchain produced these artifacts, so the reuse check above is an identity test.
+_lock_id > "$out/.toolchain-stamp"
