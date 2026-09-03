@@ -49,6 +49,16 @@ class StaticMHA(MHA):
                 # the mha.o translation unit -- identified by its own defines, not by filename
                 if "-Dbf16_bf16_ONLY" in getattr(a, "extra_flags", []):
                     a.extra_flags = list(a.extra_flags) + ["-DMHA_NONCAUSAL"]
+        # TIMING PROBE, opt-in and never a default: compiles partial_softmax to an immediate return
+        # so the mha stage's softmax COMPUTE is removed while the design's objectFIFO handshakes
+        # stay. The ENC_PEROP delta against an otherwise identical build says how much of the stage
+        # is softmax compute, which is what decides whether the softmax row is the pipeline limiter.
+        # Numerically wrong by construction -- an artifact built with this must never be installed.
+        # Requires an IRON tree whose mha.cc carries the MHA_SOFTMAX_NOOP guard.
+        if os.environ.get("ENC_MHA_SOFTMAX_NOOP", "0") == "1":
+            for a in arts:
+                if "-Dbf16_bf16_ONLY" in getattr(a, "extra_flags", []):
+                    a.extra_flags = list(a.extra_flags) + ["-DMHA_SOFTMAX_NOOP"]
         return arts
 
     def get_mlir_artifact(self):
