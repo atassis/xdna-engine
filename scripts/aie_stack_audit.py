@@ -25,10 +25,14 @@ def _find_objdump():
     if os.environ.get("PEANO_INSTALL_DIR"):
         cands.append(pathlib.Path(os.environ["PEANO_INSTALL_DIR"]) / "bin" / "llvm-objdump")
     repo = pathlib.Path(__file__).resolve().parent.parent
-    venv = ".venv-iron/lib/python3.14/site-packages/llvm-aie/bin/llvm-objdump"
-    cands.append(repo / venv)
+    # Glob the interpreter version rather than pinning it. This path had python3.14 written into
+    # its middle; a venv rebuilt on any other interpreter drops this candidate silently and the
+    # audit falls through to a stock llvm-objdump, whose frame numbers are not AIE-aware -- the
+    # warning below says so, but a wrong number that announces itself is still a wrong number.
+    venv_glob = ".venv-iron/lib/python*/site-packages/llvm-aie/bin/llvm-objdump"
     # A git worktree has no venv of its own; the primary checkout beside it does.
-    cands.append(repo.parent / "xdna-engine" / venv)
+    for root in (repo, repo.parent / "xdna-engine"):
+        cands.extend(sorted(root.glob(venv_glob)))
     for c in cands:
         if c.is_file() and os.access(c, os.X_OK):
             return str(c)

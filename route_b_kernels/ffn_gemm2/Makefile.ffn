@@ -10,6 +10,7 @@
 ##===---------------------------------------------------------------------===##
 
 srcdir := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
+include ${srcdir}/toolchain_stamp.mk
 
 # final FFN dims
 M?=64

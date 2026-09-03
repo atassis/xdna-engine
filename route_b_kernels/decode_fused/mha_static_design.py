@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import argparse
+import os
 import sys
 import math
 import copy
@@ -129,7 +130,14 @@ def fused_mha(
     verbose: bool = False,
 ):
 
-    of_depth = 2
+    # objectFIFO depth. Hardcoded 2 until 2026-09-03 and therefore never tested, which matters now:
+    # per-stage stubbing (compiling each stage's kernel to an immediate return, one arm each)
+    # showed only ~24% of the mha stage is any stage's ARITHMETIC -- softmax 19%, the two matmuls
+    # under 5% combined -- so the other ~76% is movement, lock waits or serialisation, and FIFO
+    # depth is the standard lever on exactly that. Deeper decouples
+    # producer from consumer across the three-row pipeline at the cost of L1/L2 buffer space, so a
+    # depth that does not FIT is the expected failure and is a real answer, not an error.
+    of_depth = int(os.environ.get("MHA_OF_DEPTH", "2"))
     vectorized = True
     enable_tracing = trace_size > 0
     dtype_str = "bf16"

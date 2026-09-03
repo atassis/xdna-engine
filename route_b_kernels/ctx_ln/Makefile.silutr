@@ -9,6 +9,7 @@
 #
 srcdir := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
 include ${srcdir}/../../makefile-common
+include ${srcdir}/toolchain_stamp.mk
 VPATH := ${srcdir}/../../../aie_kernels/aie2p
 
 devicename ?= $(if $(filter 1,$(NPU2)),npu2,npu)

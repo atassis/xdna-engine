@@ -16,6 +16,13 @@
 set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO"
+# Semantic hash of the pin. This script CALLED _lock_id in three places without ever defining it
+# (found 2026-09-03): the write produced a 0-byte stamp, and the comparison then compared '' with
+# '', so the guard reused the artifact for every pin, forever. It failed OPEN -- degrading silently
+# to exactly the existence-only skip it had been added to replace, and doing so only AFTER the
+# first run, which is when it looks like it is working. Same definition as conveyor_bd_prebuild.sh
+# and relpos_prebuild.sh so all three agree on what "the toolchain" is.
+_lock_id() { sed -e 's/[[:space:]]*#.*$//' -e '/^[[:space:]]*$/d' "$REPO/toolchain.lock" | sha256sum | cut -c1-12; }
 
 # 8-head conveyor build dims (MUST match npu.rs CONV_* and conveyor_attn_iron.py).
 TQ=8; T=176; DK=128; NQT=22; HEADS=8

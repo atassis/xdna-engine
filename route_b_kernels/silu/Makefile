@@ -11,6 +11,7 @@
 srcdir := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
 
 include ${srcdir}/../../makefile-common
+include ${srcdir}/toolchain_stamp.mk
 
 aie2_runtime_dir = ${MLIR_AIE_DIR}/aie_runtime_lib/AIE2
 
@@ -28,7 +29,11 @@ endif
 
 aie_py_src=silu.py
 
-.PHONY all: build/${targetname}.mlir build/final.xclbin
+# `.PHONY all: <prereqs>` declares the target `.PHONY` WITH these as PREREQUISITES, and .PHONY's
+# prerequisites are marked phony -- so build/final.xclbin was phony and rebuilt unconditionally on
+# every invocation, forever. One missing colon; found by census on 2026-09-03 in 5 Makefiles here.
+all: build/${targetname}.mlir build/final.xclbin
+.PHONY: all
 
 ifeq ($(devicename),npu)
 build/lut_based_ops.o: ${aie2_runtime_dir}/lut_based_ops.cpp

@@ -12,6 +12,7 @@
 srcdir := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
 
 include ${srcdir}/../../makefile-common
+include ${srcdir}/toolchain_stamp.mk
 
 devicename ?= $(if $(filter 1,$(NPU2)),npu2,npu)
 T ?= 32
@@ -97,9 +98,33 @@ else
 VPATH :=${srcdir}/../../../aie_kernels/aie2
 endif
 
-.PHONY all: build/${targetname}.mlir build/final.xclbin
+# ---- per-configuration build directory --------------------------------------------------------
+# Every build parameter appears in the DIRECTORY name, and the artifacts inside keep their
+# conventional names. Without this, all N T-buckets wrote build/final.xclbin and
+# build/relpos_mha.cc.o (which bakes -DRELPOS_T/TQ/KB/TACTIVE), so make could not tell one bucket
+# from another -- which is why the header above says to `make clean` when switching STEP, and why
+# relpos_prebuild.sh hand-rolled an existence skip to avoid paying for that clean.
+#
+# A per-DIRECTORY tag rather than per-FILE: the generated MLIR hardcodes `link_with = "kernels.a"`,
+# so the archive must keep that exact name in the link's working directory. Renaming the artifacts
+# instead of isolating them fails at link with undefined core symbols (measured 2026-09-03).
+tag  = ${targetname}_T${T}_TQ${TQ}_KB${KB}_TA${TACTIVE}_H${HEADS}_SP${SPLITP}_TS${TSKIP}
+bdir = build/${tag}
 
-build/%.cc.o: %.cc
+# For callers that need the directory without duplicating the formula in shell.
+print-tag:
+	@echo ${tag}
+.PHONY: print-tag
+
+# `.PHONY all: <prereq>` -- the shipped form -- declares the target `.PHONY` WITH the xclbin as a
+# PREREQUISITE, and .PHONY's prerequisites are marked phony. So build/final.xclbin was phony and
+# rebuilt unconditionally on every invocation, forever. That is the real reason this build "never
+# settled", and why relpos_prebuild.sh needed `make clean` plus an existence skip to stay affordable.
+# One missing colon. Verified with a minimal control on 2026-09-03.
+all: ${bdir}/final.xclbin
+.PHONY: all
+
+${bdir}/%.cc.o: %.cc
 	mkdir -p ${@D}
 ifeq ($(devicename),npu2)
 	cd ${@D} && ${PEANO_INSTALL_DIR}/bin/clang++ ${PEANOWRAP2P_FLAGS} -DRELPOS_T=${T} -DRELPOS_TQ=${TQ} -DRELPOS_KB=${KB} -DRELPOS_TACTIVE=${TACTIVE} ${TSKIP_DEF} -c $< -o ${@F}
@@ -107,7 +132,7 @@ else
 	echo "Only npu2 supported for this example"
 endif
 
-build/kernels.a: build/relpos_mha.cc.o
+${bdir}/kernels.a: ${bdir}/relpos_mha.cc.o
 	ar rvs $@ $+
 
 # STEP=8 (streaming) generator also needs TQ/KB to compute block counts + unroll;
@@ -139,16 +164,16 @@ else
 GEN_EXTRA =
 endif
 
-build/${targetname}.mlir: ${srcdir}/${aie_py_src}
+${bdir}/aie.mlir: ${srcdir}/${aie_py_src}
 	mkdir -p ${@D}
 	python3 $< -d ${devicename} -T ${T} ${GEN_EXTRA} > $@
 
-build/final.xclbin: build/${targetname}.mlir build/kernels.a
+${bdir}/final.xclbin ${bdir}/insts.bin &: ${bdir}/aie.mlir ${bdir}/kernels.a
 	mkdir -p ${@D}
 	cd ${@D} && aiecc --get-xclbin --get-npu-insts \
-		    --xclbin-name=${@F} \
+		    --xclbin-name=final.xclbin \
 		    \
-		    --npu-insts-name=insts.bin $(<:%=../%)
+		    --npu-insts-name=insts.bin aie.mlir
 
 clean:
 	rm -rf build _build inst aie.mlir.prj core_* test.elf ${targetname}.exe

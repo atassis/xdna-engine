@@ -28,7 +28,11 @@ else
 VPATH :=${srcdir}/../../../aie_kernels/aie2
 endif
 
-.PHONY all: build/${targetname}.mlir build/final.xclbin
+# `.PHONY all: <prereqs>` declares the target `.PHONY` WITH these as PREREQUISITES, and .PHONY's
+# prerequisites are marked phony -- so build/final.xclbin was phony and rebuilt unconditionally on
+# every invocation, forever. One missing colon; found by census on 2026-09-03 in 5 Makefiles here.
+all: build/${targetname}.mlir build/final.xclbin
+.PHONY: all
 
 build/%.cc.o: %.cc
 	mkdir -p ${@D}

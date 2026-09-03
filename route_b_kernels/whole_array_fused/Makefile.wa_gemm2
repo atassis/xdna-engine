@@ -19,6 +19,10 @@
 #   make -f Makefile.wa_gemm2 kernels     # just the .o objects
 ##===---------------------------------------------------------------------===##
 
+# Self-locating: this Makefile is invoked in place (make -f Makefile.wa_gemm2) and defines no
+# srcdir, so resolve the shared stamp relative to THIS file rather than to the cwd.
+include $(dir $(lastword $(MAKEFILE_LIST)))../toolchain_stamp.mk
+
 REPO   := $(shell git -C $(dir $(realpath $(firstword $(MAKEFILE_LIST)))) rev-parse --show-toplevel)
 WA     := $(REPO)/mlir-aie/programming_examples/basic/matrix_multiplication/whole_array
 BUILD  := $(WA)/build_gemm2
