@@ -57,6 +57,10 @@ def main():
     ap.add_argument("--max-seq", type=int, default=2048)
     ap.add_argument("--steps", type=int, default=None, help="free-running tokens to compare")
     ap.add_argument("--dump-logits", default=None, help="write step-0 logits to this .npy for offline compare")
+    ap.add_argument("--teacher-force", action="store_true",
+                    help="feed the ORACLE's tokens instead of the device's own, so each step is "
+                         "judged independently. Free-running conflates one bad token with the "
+                         "trajectory it then drags behind it.")
     a = ap.parse_args()
 
     ref = json.load(open(a.ref))
@@ -108,8 +112,12 @@ def main():
         if pos + 1 < len(fed):
             tok = fed[pos + 1]              # teacher-force through the prompt
         else:
+            i = len(produced)
             produced.append(nxt)
-            tok = nxt
+            # Free-running: one wrong token puts every later step on a different trajectory, so a
+            # single flip reads as N failures. Teacher-forcing feeds the oracle's token instead,
+            # which makes each step an independent test of the forward pass.
+            tok = gen_ids[i] if (a.teacher_force and i < len(gen_ids)) else nxt
         if len(produced) >= steps:
             break
 
