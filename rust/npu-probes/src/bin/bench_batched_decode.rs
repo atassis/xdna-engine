@@ -53,13 +53,13 @@ fn main() {
     let rmax = rapl_uj(RAPL_MAX).unwrap_or(u128::MAX);
 
     // warmup each backend once (prime kernels, page-ins) — untimed.
-    let _ = asr.decode_batch_ids(&encs);
-    let _ = asr.decode_m1_ids(&encs[0]);
+    let _ = asr.decode_batch_ids(&encs).expect("warmup batched decode");
+    let _ = asr.decode_m1_ids(&encs[0]).expect("warmup m1 decode");
 
     // (a) BATCHED decode of all B at once.
     let e0 = rapl_uj(RAPL_PKG);
     let t0 = std::time::Instant::now();
-    let bids = asr.decode_batch_ids(&encs);
+    let bids = asr.decode_batch_ids(&encs).expect("batched decode");
     let b_ms = t0.elapsed().as_secs_f64() * 1e3;
     let b_j = match (e0, rapl_uj(RAPL_PKG)) {
         (Some(a), Some(c)) => Some(uj_delta(a, c, rmax) as f64 / 1e6),
@@ -70,7 +70,7 @@ fn main() {
     // (b) M=1 decode looped over the same clips.
     let e1 = rapl_uj(RAPL_PKG);
     let t1 = std::time::Instant::now();
-    let mids: Vec<Vec<i64>> = encs.iter().map(|e| asr.decode_m1_ids(e)).collect();
+    let mids: Vec<Vec<i64>> = encs.iter().map(|e| asr.decode_m1_ids(e).expect("m1 decode")).collect();
     let m_ms = t1.elapsed().as_secs_f64() * 1e3;
     let m_j = match (e1, rapl_uj(RAPL_PKG)) {
         (Some(a), Some(c)) => Some(uj_delta(a, c, rmax) as f64 / 1e6),

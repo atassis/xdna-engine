@@ -352,7 +352,7 @@ impl WhisperAsr {
                 eprintln!("[whisper] batched fused decode dir: {}", bdir.display());
                 // O1: share the encoder's resident ctx2 kernel so the batched cross-K/V fold runs on
                 // the NPU (like M=1), not the naive host f32 loop.
-                Some(RefCell::new(BatchedFusedDecoder::new(Rc::clone(&weights), &dev, &bdir, enc.shared())))
+                Some(RefCell::new(BatchedFusedDecoder::new(Rc::clone(&weights), &dev, &bdir, enc.shared())?))
             } else {
                 None
             };
@@ -367,14 +367,11 @@ impl WhisperAsr {
                 };
                 eprintln!("[whisper] fused decode ELF dir: {}", fdir.display());
                 // Share the encoder's resident ctx2 kernel so the cross-K/V fold runs on the NPU.
-                // FusedDecoder::new still panics internally on failure (whisper_decoder.rs, out of
-                // scope for this pass).
-                let fd = FusedDecoder::new(weights, &dev, &fdir, enc.shared());
+                let fd = FusedDecoder::new(weights, &dev, &fdir, enc.shared())?;
                 eprintln!("[whisper] NPU_DECODE_FUSED=1: whole 12-layer decode in ONE fused-ELF dispatch/token");
                 (None, Some(RefCell::new(fd)), nfb)
             } else {
-                // HostDecoder::new_npu still panics internally on failure, same scope note as above.
-                let dec = HostDecoder::new_npu(weights, &dev, &xroot);
+                let dec = HostDecoder::new_npu(weights, &dev, &xroot)?;
                 eprintln!("[whisper] NPU_DECODE=1: per-token decoder matmuls on the NPU");
                 (Some(RefCell::new(dec)), None, nfb)
             }
@@ -411,48 +408,54 @@ impl WhisperAsr {
     /// `build`), else the ONNX KV-cached path. BOTH paths share the EXACT same control logic:
     /// 1-step language detection (argmax over the language block), the prompt
     /// `[SOT, lang, TRANSCRIBE, NOTIMESTAMPS]`, full-vocab argmax, EOT stop, and `MAX_DECODE` cap.
-    /// The ONLY difference is the source of per-step logits.
+    /// The ONLY difference is the source of per-step logits. The ONNX arm (`greedy_decode_onnx`)
+    /// is not converted: it holds no resident-context/KV-cache state, so it has no device error to
+    /// report; it is wrapped in `Ok` rather than given a narrower signature than its siblings.
     ///
     /// `lang` short-circuits detection, for the caller that wants one tag pinned across windows.
     /// Returns the tag actually used.
-    fn greedy_decode(&self, encoder_hidden: &[f32], lang: Option<i64>) -> (Vec<i64>, i64) {
+    fn greedy_decode(&self, encoder_hidden: &[f32], lang: Option<i64>)
+        -> Result<(Vec<i64>, i64), EngineError> {
         if let Some(fd) = &self.npu_fused {
             self.greedy_decode_fused(&mut fd.borrow_mut(), encoder_hidden, lang)
         } else if let Some(dec) = &self.npu_decoder {
             self.greedy_decode_npu(&mut dec.borrow_mut(), encoder_hidden, lang)
         } else {
-            self.greedy_decode_onnx(encoder_hidden, lang)
+            Ok(self.greedy_decode_onnx(encoder_hidden, lang))
         }
     }
 
     /// Whole-decode fused-ELF greedy decode. IDENTICAL control logic to `greedy_decode_npu` (lang
     /// detect, prompt, argmax, EOT, MAX_DECODE) — only the backend is `FusedDecoder` (1 dispatch/token).
     fn greedy_decode_fused(&self, dec: &mut FusedDecoder, encoder_hidden: &[f32], lang: Option<i64>)
-        -> (Vec<i64>, i64) {
+        -> Result<(Vec<i64>, i64), EngineError> {
         let enc2 = Array2::from_shape_vec((T_ENC, self.cfg.d_model), encoder_hidden.to_vec())
             .expect("encoder_hidden is [T_ENC*D]");
-        dec.precompute_cross(&enc2);
+        dec.precompute_cross(&enc2)?;
         // Step-0 language detection needs the FULL logits (restricted argmax over the language block) → it
         // stays on host. The steady-state loop uses the on-NPU argmax (`step_token`) when the argmax-fused
         // proj_out ELF is loaded: the ELF returns a token id and the 104 KB logits readback is dropped.
-        let lang = lang.unwrap_or_else(|| self.tokens.pick_lang(&dec.step(self.tokens.sot, 0)));
+        let lang = match lang {
+            Some(l) => l,
+            None => self.tokens.pick_lang(&dec.step(self.tokens.sot, 0)?),
+        };
         let prompt: Vec<i64> = self.tokens.prompt(lang);
         let mut ids = prompt.clone();
-        dec.reset();
+        dec.reset()?;
         let npu_argmax = dec.has_npu_argmax();
         // next token after feeding token `tok` at `pos`: on-NPU argmax (id) when available, else host argmax.
-        let next_tok = |dec: &mut FusedDecoder, tok: i64, pos: usize| -> i64 {
+        let next_tok = |dec: &mut FusedDecoder, tok: i64, pos: usize| -> Result<i64, EngineError> {
             if npu_argmax {
                 dec.step_token(tok, pos)
             } else {
-                argmax(&dec.step(tok, pos))
+                Ok(argmax(&dec.step(tok, pos)?))
             }
         };
         // Feed the prompt; the next token comes from the LAST prompt position. Earlier positions just
         // advance the KV cache (dispatch); their result is discarded (use the cheap id path when available).
         let mut next = 0i64;
         for (pos, &tok) in prompt.iter().enumerate() {
-            next = next_tok(dec, tok, pos);
+            next = next_tok(dec, tok, pos)?;
         }
         if next != self.tokens.eot {
             ids.push(next);
@@ -462,7 +465,7 @@ impl WhisperAsr {
                 break;
             }
             let pos = prompt.len() + step;
-            next = next_tok(dec, next, pos);
+            next = next_tok(dec, next, pos)?;
             if next == self.tokens.eot {
                 break;
             }
@@ -470,7 +473,7 @@ impl WhisperAsr {
         }
         // P0: per-phase breakdown for this utterance (no-op unless FUSED_PHASE_TIMING set).
         dec.dump_phase_timing();
-        (ids, lang)
+        Ok((ids, lang))
     }
 
     /// ONNX KV-cached greedy decode (the baseline; unchanged behavior).
@@ -512,16 +515,19 @@ impl WhisperAsr {
     /// 4-token prompt is fed sequentially (positions 0..3) and the next token argmaxed after the last
     /// prompt token, exactly matching the ONNX step-0-over-full-prompt semantics.
     fn greedy_decode_npu(&self, dec: &mut HostDecoder, encoder_hidden: &[f32], lang: Option<i64>)
-        -> (Vec<i64>, i64) {
+        -> Result<(Vec<i64>, i64), EngineError> {
         // Cross-KV from the encoder hidden states (also resets the self-KV cache for this utterance).
         let enc2 = Array2::from_shape_vec((T_ENC, self.cfg.d_model), encoder_hidden.to_vec())
             .expect("encoder_hidden is [T_ENC*D]");
 
-        // language detection: precompute cross-KV, decode `[SOT]` at pos 0, argmax over the lang
-        // block, then reset (drop the SOT self-KV so the real prompt starts clean — mirrors the ONNX
-        // path which discards the detection KV).
+        // language detection: precompute cross-KV (pure host, infallible), decode `[SOT]` at pos 0,
+        // argmax over the lang block, then reset (drop the SOT self-KV so the real prompt starts
+        // clean — mirrors the ONNX path which discards the detection KV).
         dec.precompute_cross(&enc2);
-        let lang = lang.unwrap_or_else(|| self.tokens.pick_lang(&dec.step(self.tokens.sot, 0)));
+        let lang = match lang {
+            Some(l) => l,
+            None => self.tokens.pick_lang(&dec.step(self.tokens.sot, 0)?),
+        };
 
         let prompt: Vec<i64> = self.tokens.prompt(lang);
         let mut ids = prompt.clone();
@@ -531,7 +537,7 @@ impl WhisperAsr {
         // Feed the whole prompt; argmax only after the final prompt token (== ONNX step-0 last pos).
         let mut logits = Vec::new();
         for (pos, &tok) in prompt.iter().enumerate() {
-            logits = dec.step(tok, pos);
+            logits = dec.step(tok, pos)?;
         }
         let mut next = argmax(&logits);
         if next != self.tokens.eot {
@@ -543,14 +549,14 @@ impl WhisperAsr {
                 break;
             }
             let pos = prompt.len() + step; // position of the token we are about to feed
-            let logits = dec.step(next, pos);
+            let logits = dec.step(next, pos)?;
             next = argmax(&logits);
             if next == self.tokens.eot {
                 break;
             }
             ids.push(next);
         }
-        (ids, lang)
+        Ok((ids, lang))
     }
 
     /// Preprocess + NPU-encode one clip → (flat encoder hidden `[T_ENC*D]`, preproc_ms, encoder_ms).
@@ -600,7 +606,7 @@ impl WhisperAsr {
 
     /// Subsystem B: transcribe exactly B clips at once (offline-bulk lockstep). Encodes each clip
     /// (sequential, single-tenant NPU), then runs ONE batched greedy decode over all B streams.
-    pub fn transcribe_batch(&self, clips: &[&[i16]]) -> Vec<String> {
+    pub fn transcribe_batch(&self, clips: &[&[i16]]) -> Result<Vec<String>, EngineError> {
         let cell = self.npu_fused_batch.as_ref().expect("NPU_DECODE_FUSED_BATCH not enabled");
         let mut dec = cell.borrow_mut();
         let b = dec.batch();
@@ -609,8 +615,8 @@ impl WhisperAsr {
             .iter()
             .map(|s| Array2::from_shape_vec((T_ENC, self.cfg.d_model), self.encode_clip(s)).expect("enc shape"))
             .collect();
-        let ids = self.greedy_decode_fused_batch(&mut dec, &encs);
-        ids.iter().map(|id| self.detokenize(id)).collect()
+        let ids = self.greedy_decode_fused_batch(&mut dec, &encs)?;
+        Ok(ids.iter().map(|id| self.detokenize(id)).collect())
     }
 
     /// Subsystem B — O3: transcribe N clips (any N) via length-bucketed offline-bulk. Sorts clips by
@@ -619,7 +625,7 @@ impl WhisperAsr {
     /// decodes each bucket lockstep, and reassembles transcripts in the ORIGINAL order. Similar-length
     /// clips per bucket cut lockstep waste vs length-mixed batches (each bucket runs to ITS longest,
     /// not the global longest).
-    pub fn transcribe_bulk(&self, clips: &[&[i16]]) -> Vec<String> {
+    pub fn transcribe_bulk(&self, clips: &[&[i16]]) -> Result<Vec<String>, EngineError> {
         let b = self.npu_fused_batch.as_ref().expect("NPU_DECODE_FUSED_BATCH not enabled").borrow().batch();
         let n = clips.len();
         let mut order: Vec<usize> = (0..n).collect();
@@ -631,12 +637,12 @@ impl WhisperAsr {
                 idxs.push(*chunk.last().unwrap()); // pad short last bucket by repeating its longest
             }
             let bucket: Vec<&[i16]> = idxs.iter().map(|&i| clips[i]).collect();
-            let texts = self.transcribe_batch(&bucket);
+            let texts = self.transcribe_batch(&bucket)?;
             for (k, &orig) in chunk.iter().enumerate() {
                 out[orig] = texts[k].clone();
             }
         }
-        out
+        Ok(out)
     }
 
     // ---- decode-only bench hooks (subsystem-B perf): encode once (untimed), then time each decode
@@ -653,13 +659,13 @@ impl WhisperAsr {
     }
 
     /// Single-stream (M=1) fused greedy decode for one pre-encoded clip → token ids (incl. prompt).
-    pub fn decode_m1_ids(&self, enc_flat: &[f32]) -> Vec<i64> {
+    pub fn decode_m1_ids(&self, enc_flat: &[f32]) -> Result<Vec<i64>, EngineError> {
         let cell = self.npu_fused.as_ref().expect("decode_m1_ids needs NPU_DECODE_FUSED");
-        self.greedy_decode_fused(&mut cell.borrow_mut(), enc_flat, None).0
+        Ok(self.greedy_decode_fused(&mut cell.borrow_mut(), enc_flat, None)?.0)
     }
 
     /// Batched (B-stream) fused greedy decode over B pre-encoded clips → per-stream token ids.
-    pub fn decode_batch_ids(&self, encs_flat: &[Vec<f32>]) -> Vec<Vec<i64>> {
+    pub fn decode_batch_ids(&self, encs_flat: &[Vec<f32>]) -> Result<Vec<Vec<i64>>, EngineError> {
         let cell = self.npu_fused_batch.as_ref().expect("decode_batch_ids needs NPU_DECODE_FUSED_BATCH");
         let mut dec = cell.borrow_mut();
         let encs: Vec<Array2<f32>> = encs_flat
@@ -673,7 +679,7 @@ impl WhisperAsr {
     /// (ids in ORIGINAL order, total_computed_slots = Σ_bucket steps×B). `sort=true` length-sorts
     /// before bucketing; `sort=false` keeps input order (length-mixed buckets) for the A/B. The pad
     /// slots that fill a short last bucket are counted in `slots` (they are real dispatch work).
-    pub fn decode_bulk_ids(&self, encs_flat: &[Vec<f32>], sort_key: &[usize], sort: bool) -> (Vec<Vec<i64>>, usize) {
+    pub fn decode_bulk_ids(&self, encs_flat: &[Vec<f32>], sort_key: &[usize], sort: bool) -> Result<(Vec<Vec<i64>>, usize), EngineError> {
         let cell = self.npu_fused_batch.as_ref().expect("decode_bulk_ids needs NPU_DECODE_FUSED_BATCH");
         let mut dec = cell.borrow_mut();
         let b = dec.batch();
@@ -693,13 +699,13 @@ impl WhisperAsr {
                 .iter()
                 .map(|&i| Array2::from_shape_vec((T_ENC, self.cfg.d_model), encs_flat[i].clone()).expect("enc shape"))
                 .collect();
-            let ids = self.greedy_decode_fused_batch(&mut dec, &encs);
+            let ids = self.greedy_decode_fused_batch(&mut dec, &encs)?;
             slots += dec.last_steps() * b;
             for (k, &orig) in chunk.iter().enumerate() {
                 out[orig] = ids[k].clone();
             }
         }
-        (out, slots)
+        Ok((out, slots))
     }
 
     /// Batched greedy decode (lockstep) → per-stream token ids. IDENTICAL control logic to
@@ -709,19 +715,19 @@ impl WhisperAsr {
         &self,
         dec: &mut BatchedFusedDecoder,
         encs: &[Array2<f32>],
-    ) -> Vec<Vec<i64>> {
+    ) -> Result<Vec<Vec<i64>>, EngineError> {
         let b = encs.len();
-        dec.precompute_cross_batch(encs);
-        let lang_logits = dec.step_batch(&vec![self.tokens.sot; b], 0);
+        dec.precompute_cross_batch(encs)?;
+        let lang_logits = dec.step_batch(&vec![self.tokens.sot; b], 0)?;
         let langs: Vec<i64> = lang_logits.iter().map(|l| self.tokens.pick_lang(l)).collect();
-        dec.reset();
+        dec.reset()?;
         let prompts: Vec<Vec<i64>> = langs.iter().map(|&l| self.tokens.prompt(l)).collect();
         let mut ids: Vec<Vec<i64>> = prompts.clone();
         let plen = prompts[0].len();
         let mut logits: Vec<Vec<f32>> = Vec::new();
         for pos in 0..plen {
             let toks: Vec<i64> = (0..b).map(|bi| prompts[bi][pos]).collect();
-            logits = dec.step_batch(&toks, pos);
+            logits = dec.step_batch(&toks, pos)?;
         }
         let mut next: Vec<i64> = logits.iter().map(|l| argmax(l)).collect();
         let mut active = vec![true; b];
@@ -738,7 +744,7 @@ impl WhisperAsr {
             }
             let pos = plen + step;
             let toks: Vec<i64> = (0..b).map(|bi| if active[bi] { next[bi] } else { self.tokens.eot }).collect();
-            let logits = dec.step_batch(&toks, pos);
+            let logits = dec.step_batch(&toks, pos)?;
             for bi in 0..b {
                 if !active[bi] {
                     continue;
@@ -752,7 +758,7 @@ impl WhisperAsr {
             }
         }
         dec.dump_phase_timing(); // FUSED_PHASE_TIMING: per-dispatch batched breakdown
-        ids
+        Ok(ids)
     }
 
     fn detokenize(&self, ids: &[i64]) -> String {
@@ -878,11 +884,12 @@ impl WhisperAsr {
             dec.borrow().reset_npu_dispatches();
         }
         let t_dec = std::time::Instant::now();
-        // greedy_decode (and the NPU_DECODE*/fused decode machinery it dispatches into,
-        // whisper_decoder.rs) still panics internally on a decode failure -- out of scope for this
-        // pass (engine-errors-are-real): converting that whole resident-context/KV-cache chain is its
-        // own follow-up, not a narrow LOAD/INFERENCE-signature conversion.
-        let (ids, lang) = self.greedy_decode(&flat, lang);
+        // greedy_decode and the NPU_DECODE*/fused decode machinery it dispatches into
+        // (whisper_decoder.rs: FusedDecoder/BatchedFusedDecoder/HostDecoder's resident-context
+        // step/precompute_cross/dispatch_* chain) propagate real device errors instead of
+        // panicking. greedy_decode_onnx (the no-NPU-decoder fallback) is unconverted -- see the
+        // note on `greedy_decode` above.
+        let (ids, lang) = self.greedy_decode(&flat, lang)?;
         let dec_ms = t_dec.elapsed().as_secs_f64() * 1e3;
 
         let text = self.detokenize(&ids);
