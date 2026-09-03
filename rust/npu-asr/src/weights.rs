@@ -1,7 +1,8 @@
 //! Load encoder weights + reference tensors from `artifacts/encoder/` (produced by
 //! `scripts/extract_encoder.py`). fp32 `.npy` on disk; engines bf16-quantize at use.
-//! Mirrors `npu_asr/weights.py`. We load every `.npy` in each block dir keyed by file stem
-//! (no manifest parse needed).
+//! Ported from `npu_asr/weights.py` (RETIRED 2026-06-11); structure deliberately diverges -- see
+//! npu_asr/RETIRED.md. Do not restore parity: that reintroduces per-op dispatch.
+//! We load every `.npy` in each block dir keyed by file stem (no manifest parse needed).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

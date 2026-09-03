@@ -49,6 +49,19 @@ kernels_dir=${MLIR_AIE_INSTANCE}/src/aie_kernels/aie2
 KERNEL_CFLAGS=${PEANOWRAP2_FLAGS}
 endif
 
+# SECOND NAMESPACE, for kernels that are OURS. kernels_dir above is the vendor tree inside the
+# content-addressed toolchain instance; resolving our own .cc files through it is what forced
+# sync_kernels.sh to copy 83 files into that store on every build, so the store stopped being what
+# its key says it is -- and verify_kernel_source.sh reads vendor ground truth from the same store.
+# Self-locating (this file sits in route_b_kernels/whole_array_fused/) so it is right for every
+# Makefile that includes it, whatever its own srcdir depth.
+rb_kernels_dir := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))../aie_kernels)
+
+# Our kernels include vendor headers by a path relative to the VENDOR tree
+# (mm_silu_epilogue.cc: #include "../aie_kernel_utils.h"). Compiled from rb_kernels_dir that
+# relative path no longer lands there, so hand the preprocessor the vendor dir to resolve against.
+KERNEL_CFLAGS += -I${kernels_dir}
+
 # Fast-tile defines the new common no longer sets (mm.cc names symbols by these).
 ifeq ($(emulate_bfloat16_mmul_with_bfp16),1)
 KERNEL_DEFINES += -DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16
@@ -143,12 +156,29 @@ ${mlir_target}: ${srcdir}/${aie_py_src}
 	mkdir -p ${@D}
 	python3 $< ${gen_args} --trace_size ${wa_trace_size} ${wa_trace_args} > $@
 
+# Toolchain identity stamp -- the SAME technique Makefile.modal already uses for MM_DEFINES and
+# EPI_DEFINES, applied to the axis it left undeclared: which toolchain produced the binary.
+#
+# An xclbin's content depends on the aiecc/Peano that built it, and nothing declared that. make
+# compares mtimes of declared prerequisites, so a kernel built by an older pin looks up to date
+# forever. MEASURED 2026-09-03: final_512x800x3072_64x32x96_8c_modalsilu was 149344 B from 06-29
+# while every sibling was 170895 B from 09-03, and it silently entered a same-day A/B as the fc1
+# kernel -- upstream #3559 changes the emitted transaction blob, so an old artifact can be speaking
+# an older host<->device wire format. Exactly the failure the EPI_DEFINES stamp comment describes,
+# one axis over.
+#
+# MLIR_AIE_INSTANCE is content-addressed by the toolchain.lock hash, so the path IS the identity.
+toolchain_id := $(MLIR_AIE_INSTANCE) $(PEANO_INSTALL_DIR)
+build/.toolchain.stamp: FORCE
+	@mkdir -p ${@D}
+	@echo '$(toolchain_id)' | cmp -s - $@ || echo '$(toolchain_id)' > $@
+
 # Grouped co-target (&:): ONE aiecc invocation produces BOTH the xclbin AND the .txt insts,
 # so make treats insts_${target_suffix}.txt as a real target (a direct `make .../insts_*.txt`
 # resolves) rather than an untracked side-effect. This rule deliberately WINS over the new
 # makefile-common's xclbin rule; make prints two EXPECTED warnings ("overriding recipe for
 # target" / "ignoring old recipe for target") -- do NOT try to "fix" them.
-${xclbin_target} ${insts_target} &: ${mlir_target} ${kernels:%=build/%.o}
+${xclbin_target} ${insts_target} &: ${mlir_target} ${kernels:%=build/%.o} build/.toolchain.stamp
 	mkdir -p ${@D}
 	cd ${@D} && ${AIECC} --alloc-scheme=${buffer_aloc_flag} --get-xclbin \
 	    --xclbin-name=$(notdir ${xclbin_target}) ${aiecc_peano_flags} \

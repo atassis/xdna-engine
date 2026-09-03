@@ -1,5 +1,7 @@
 //! NPU engines: the weight-bound whole-array fused matmul (`WAEpilogue`) and the depthwise-conv
-//! (`DwconvEngine`). Mirrors `npu_asr/fused.py` (WAEpilogue) and `npu_asr/ops.py` (DwconvEngine).
+//! (`DwconvEngine`). Ported from `npu_asr/fused.py` (WAEpilogue) and `npu_asr/ops.py` (DwconvEngine),
+//! both RETIRED 2026-06-11; structure deliberately diverges -- see npu_asr/RETIRED.md. Do not
+//! restore parity: that reintroduces per-op dispatch.
 //!
 //! WAEpilogue is WEIGHT-BOUND: the K-augmented weight `B_aug` and the instruction buffer are built
 //! and synced ONCE in `new`; the activation/output buffers are allocated once and reused, so

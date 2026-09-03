@@ -23,6 +23,10 @@ source scripts/iron_env.sh
 source scripts/kernel_sandbox.sh
 
 LNML=mlir-aie/programming_examples/ml/layernorm
+# This script already sourced kernel_sandbox.sh and never called it -- the guard was imported and
+# unused. It builds into the same ml/layernorm/build that build_k768_gelu_rail.sh protects, so
+# without this the two scripts disagree about whether that sandbox is checked.
+ensure_fresh_sandbox "$LNML/build"
 LNDIR=artifacts/parakeet/ln
 mkdir -p "$LNDIR"
 

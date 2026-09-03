@@ -10,13 +10,20 @@ gc_instances() {
   local root="$1" keep="${2:-4}" protect="${3:-}"
   [ "${TOOLCHAIN_GC:-1}" = "0" ] && return 0
   [ -d "$root" ] || return 0
-  local i=0 d b
+  local i=0 d b protect_real pinned
+  # Resolve the protected path: an instance may be reached through a compatibility SYMLINK (a lock
+  # whose semantic key differs from the legacy whole-file key adopts the existing build that way).
+  # Comparing unresolved paths would then fail to protect the very directory in use.
+  protect_real="$(readlink -f "$protect" 2>/dev/null || echo "$protect")"
+  # Any directory that a symlink in this root points at is live under another key -- never GC it.
+  pinned=" $(for l in "$root"/*; do [ -L "$l" ] && readlink -f "$l"; done | tr '\n' ' ') "
   while IFS= read -r d; do
     b="$(basename "$d")"
     [[ "$b" =~ ^[0-9a-f]{12}$ ]] || continue          # only lock-hash dirs are eligible
     i=$((i+1))
     [ "$i" -le "$keep" ] && continue                   # keep the newest KEEP_N
-    [ "$d" = "$protect" ] && continue                  # never delete the just-built instance
+    [ "$(readlink -f "$d")" = "$protect_real" ] && continue   # never delete the just-built instance
+    case "$pinned" in *" $(readlink -f "$d") "*) continue ;; esac  # referenced by a compat symlink
     case "$d" in "$root"/*) : ;; *) continue ;; esac   # path guard: must be directly under root
     echo "[toolchain_up] GC: remove stale instance $b (last-used $(date -d @"$(stat -c %Y "$d" 2>/dev/null)" '+%Y-%m-%d %H:%M' 2>/dev/null))" >&2
     rm -rf "$d"

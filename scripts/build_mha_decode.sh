@@ -17,6 +17,11 @@ source scripts/iron_env.sh
 bash scripts/sync_kernels.sh
 
 MHA=mlir-aie/programming_examples/ml/mha_decode
+# mha_decode had NEITHER protective layer: Makefile.mha has no per-object toolchain stamp (it is one
+# of the 32 route_b_kernels Makefiles that do not include route_b_override.mk) and this script never
+# sourced the sandbox backstop. A kernel built by an older pin would be reused indefinitely.
+source scripts/kernel_sandbox.sh
+ensure_fresh_sandbox "$MHA/build"
 S=448  # fixed: names the single runtime-S xclbin; tile count is ceil(448/64)=7.
 
 echo "== mha_decode: runtime-S xclbin seq=${S} (streaming/flash single-query MHA, 12 heads x 64, bf16 in / f32 ctx) =="

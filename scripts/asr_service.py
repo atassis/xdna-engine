@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Drop-in HTTP ASR service — FLM/Whisper-compatible transcription API on a GigaAM-v3 backend.
+"""RETIRED 2026-09-01 -- provenance only, not a spec. See npu_asr/RETIRED.md.
+
+Drop-in HTTP ASR service — FLM/Whisper-compatible transcription API on a GigaAM-v3 backend.
 
 Exposes  POST /v1/audio/transcriptions  (multipart/form-data, field `file` = WAV, optional
 `model` text field ignored) and returns  {"text": "<transcript>"}  — exactly what voxd's
@@ -49,7 +51,9 @@ REF_TEXT_PATH = os.path.join(REPO, "artifacts", "asr_ref", "text.txt")
 PORT = int(os.environ.get("NPUVOX_PORT", "11435"))
 ENCODER = os.environ.get("ASR_ENCODER", "onnx").strip().lower()
 
-# encode_server protocol constants (see rust/npu-asr/src/bin/encode_server.rs)
+# encode_server protocol constants -- DUPLICATED from rust/npu-asr/src/bin/encode_server.rs
+# (WIN/T_OUT/D there). Nothing checks the two agree. Both sides are retired as of 2026-09-01; if
+# either is revived, derive these from one source rather than restating them.
 ENC_WIN = 1600            # 16 s mel window the NPU encoder accepts
 ENC_T_OUT = 400          # fixed encoded time dim returned
 ENC_D = 768              # encoder hidden dim

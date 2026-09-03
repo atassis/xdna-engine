@@ -84,7 +84,13 @@ def my_dwconv_silu(dev, num_columns):
     workers = []
     for i in range(num_columns):
         workers.append(
-            Worker(dwconv_body, [of_ins[i].cons(), of_ws[i].cons(), of_mids[i].prod(), dwconv])
+            # Deepest chain measured from the ELF: _main_init(0x40, claimed in the jl delay
+            # slots so it IS live) -> core_0_2(0x80) -> the kernel(0x380) = 0x440 against the
+            # 0x400 default, and the allocator puts out_0_buff_0 at the first byte past it.
+            # Benign today only because the kernel overwrites the spilled region before the
+            # DMA reads it -- nothing enforces that ordering. scripts/aie_stack_audit.py.
+            Worker(dwconv_body, [of_ins[i].cons(), of_ws[i].cons(), of_mids[i].prod(), dwconv],
+                   stack_size=4096)
         )
     # EXACT-f32 silu (SILU_MODE=2) spills a >1024 B frame. The IRON default worker stack is
     # 1024 B and the allocator places the EVEN objectfifo output buffer immediately after it,

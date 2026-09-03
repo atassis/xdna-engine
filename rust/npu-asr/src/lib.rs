@@ -3,7 +3,8 @@
 //! Matmul-heavy ops (FFN×2, q/k/v/out projections, pointwise1/2) run on the NPU as
 //! whole-array + bias(+SiLU) epilogue dispatches with reused buffers; depthwise-conv on
 //! the NPU; the LayerNorm/RoPE/attention/GLU/softmax/residual glue runs on the host via
-//! `npu_asr_host`. Mirrors `npu_asr/fused.py` (the Python correctness oracle).
+//! `npu_asr_host`. Ported from `npu_asr/fused.py` (RETIRED 2026-06-11); structure deliberately
+//! diverges -- see npu_asr/RETIRED.md. Do not restore parity: that reintroduces per-op dispatch.
 
 pub mod weights;
 pub mod kernel_registry;

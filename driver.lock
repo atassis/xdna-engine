@@ -1,0 +1,22 @@
+# driver.lock -- the amdxdna kernel module we RUN, pinned. Read by scripts/driver_status.sh.
+#
+# SEPARATE FROM toolchain.lock, deliberately. The two pin different things on different clocks:
+#   * toolchain.lock keys the content-addressed mlir-aie INSTANCE. The driver is not a build input
+#     to it, so folding the driver in would make every driver bump rebuild the whole instance -- the
+#     same over-invalidation that already costs a full rebuild when only PEANO_FORK_COMMIT moves.
+#   * the driver binds to the RUNNING KERNEL, not to the compiler. A CachyOS kernel update forces a
+#     driver rebuild with toolchain.lock untouched; a Peano bump must not touch the driver at all.
+#   * the gates differ: a toolchain bump gates on rel-L2, a driver swap gates on "does the NPU still
+#     enumerate and allocate a hw context", and its failure mode is NO DEVICE.
+#   * rollback differs: --activate an install vs. removing a DKMS module and reloading.
+#
+# INSTALL PATH: AMD's own Arch packaging (build/arch/PKGBUILD-amdxdna-driver), which is a DKMS
+# package. DKMS rebuilds per kernel, signs with the existing /var/lib/dkms/mok.key, and lands the
+# module in /lib/modules/<ver>/updates/dkms/, which depmod prefers over the in-tree copy
+# (/usr/lib/depmod.d/search.conf: "search updates extramodules built-in"). nvidia-egpufix on this box
+# already shadows an in-tree module the same way, so the mechanism is proven here, not theoretical.
+# dkms.conf runs configure_kernel.sh as PRE_BUILD to generate config_kernel.h -- do NOT hand-write it.
+
+XDNA_DRIVER_COMMIT=2b078d0957838e0ce6964dfdab7d082f09bd7e1f   # amd/xdna-driver origin/main, 2026-09-01. Pure upstream. The +1 over the previous pin eae6a0f is OUR OWN PR #1647 (name the firmware when the alive handshake times out) landing -- it read OPEN during the tidy that morning and MERGED hours later, which is why driver_status.sh fetches rather than trusting a cached PR state. Contains our 6 merged fixes (#1647, #1631 terminal ERT states, #1567 CU BO refs, #1541 flush-requested-range, #1529 power sensor units, #1506 x86 CLFLUSH fence). PIN A COMMIT, NEVER "latest": the tree took 106 commits in 90 days, much of it aie4/ve2/npu3a work for hardware that is not ours (we are PCI 0x17f0:0x10 -> dev_npu4_info).
+XDNA_DRIVER_CARRIES=                                          # our unmerged commits applied on top; EMPTY = pure upstream. Add a branch name here only to run a fix before it merges (e.g. fix/msg-buff-order-fallback, PR #1568 open). Every carry is a local delta the running kernel has and upstream does not -- keep the list short and drop entries as their PRs merge.
+XDNA_DRIVER_KERNEL=7.2.0-1-cachyos                            # the kernel this pin was last validated against -- 2026-09-02, module loaded from updates/dkms, 17-clip encoder output bit-identical to the in-tree module (c5f4d1af51). DKMS DOES NOT REBUILD THIS AUTOMATICALLY ON THIS BOX, and the failure is silent: dkms.conf selects no compiler, so on a clang/LLD-built kernel the build dies on -mllvm / -mstack-alignment=8 while pacman still reports success. MEASURED both arms here -- the clang 7.2.0 kernel failed under Arch's 70-dkms-install.hook, the gcc 6.18.42-lts kernel succeeded, same package. So after ANY kernel update, re-run scripts/driver_status.sh and confirm it says dkms (ours); if it says in-tree, the rebuild failed silently. Fix + upstream one-liner: task amdxdna-dkms-ignores-a-clang-built-kernel. A MAJOR kernel bump still warrants a re-gate on top of that, since the driver tracks internal kernel APIs that are not stable.

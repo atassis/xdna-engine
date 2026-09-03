@@ -64,6 +64,11 @@ WA_C_DEPTH=1 make $MK -C "$MMW" AIECC_JOBS="${AIECC_JOBS:-0}" \
 #   cast@768  : LN(x)  [T,768]  f32 -> bf16   (fc1 A input)
 #   cast@3072 : gelu   [T,3072] f32 -> bf16   (fc2 A input)
 LNML=mlir-aie/programming_examples/ml/layernorm
+# This script builds into TWO sandboxes but only guarded one. ensure_fresh_sandbox at the top covers
+# $MMW/build; the cast/resadd builds below land in $LNML/build, which had no .toolchain-stamp at all
+# and was therefore never checked -- accidentally fresh, not guarded. Same shape as the stale-kernel
+# confound of 2026-09-03: a build dir whose artifacts nothing compares against their compiler.
+ensure_fresh_sandbox "$LNML/build"
 echo "== K768 casts  ${PAD_M}x768 + ${PAD_M}x3072 =="
 make -C "$LNML" -f Makefile.cast NPU2=1 rows="$PAD_M" cols=768  "build/final_cast_${PAD_M}x768.xclbin"
 make -C "$LNML" -f Makefile.cast NPU2=1 rows="$PAD_M" cols=3072 "build/final_cast_${PAD_M}x3072.xclbin"

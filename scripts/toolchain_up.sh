@@ -22,8 +22,24 @@ else
   MLIR_DISTRO_ABS="$REPO/$MLIR_DISTRO_DIR"
 fi
 
-LOCKHASH="$(sha256sum "$REPO/toolchain.lock" | cut -c1-12)"
-INST="${TOOLCHAIN_HOME:-$XDNA_CACHE/instances}/$LOCKHASH"
+# The key must identify the TOOLCHAIN, not the file that describes it. Hashing the whole lock made
+# every COMMENT load-bearing: rewording the prose on a line minted a new key and orphaned a built
+# instance, i.e. a full rebuild to fix a typo. toolchain.lock is 5 KEY=value fields plus prose, so
+# the key is the fields with comments and blank lines stripped.
+_lock_semantic() { sed -e 's/[[:space:]]*#.*$//' -e '/^[[:space:]]*$/d' "$REPO/toolchain.lock"; }
+LOCKHASH="$(_lock_semantic | sha256sum | cut -c1-12)"
+INSTROOT="${TOOLCHAIN_HOME:-$XDNA_CACHE/instances}"
+INST="$INSTROOT/$LOCKHASH"
+
+# Adopt an instance built under the legacy whole-file key instead of rebuilding an identical
+# toolchain. SYMLINK, never rename: build/CMakeCache.txt bakes this absolute path (14 references)
+# and src/ is a git worktree whose admin records it, so a moved instance is a broken one.
+# gc_instances resolves symlinks and refuses to delete a directory any symlink here points at.
+_LEGACY_LOCKHASH="$(sha256sum "$REPO/toolchain.lock" | cut -c1-12)"
+if [ ! -e "$INST" ] && [ -d "$INSTROOT/$_LEGACY_LOCKHASH" ] && [ "$_LEGACY_LOCKHASH" != "$LOCKHASH" ]; then
+  ln -sfn "$_LEGACY_LOCKHASH" "$INST"
+  echo "[toolchain_up] adopted instance $_LEGACY_LOCKHASH as $LOCKHASH (semantic lock key; no rebuild)" >&2
+fi
 PYPKG="$INST/python/aie/iron/program.py"
 WHEEL_BIN="$REPO/.venv-iron/lib/python3.14/site-packages/mlir_aie/bin"
 
