@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Emit the execution graph as DATA, for every model the tree can build.
 
-Why this exists. `docs/reference/npu-dataflow-map.md` is a METHOD with no instance and nothing
-generating it, so every session re-derives the graph by reading dispatch code and settles
-disagreements by argument. One such re-derivation (op adjacency, read off a per-op timing list)
-became load-bearing for a design invariant on 2026-09-03.
+Why this exists. The tree describes how to derive the execution graph but never emits one, so every
+session re-derives it by reading dispatch code and settles disagreements by argument. One such
+re-derivation (op adjacency, read off a per-op timing list) became load-bearing for a design
+invariant on 2026-09-03. This script makes the graph an artifact instead of an argument.
 
 The contract, and the reason this is JSON and not a diagram:
 

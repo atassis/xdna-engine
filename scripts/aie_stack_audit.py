@@ -15,8 +15,35 @@ at 1024 where hand-reading the disassembly gave 1088-1152. Treat "deepest" as a 
 inside 25% of its reservation is reported `tight` for that reason and wants a hand check, not a
 reflex bump -- on dwconv1d, raising the reservation changed the encoder's bit-exact output with NO
 accuracy change (identical rel-L2 to three figures), i.e. it perturbed rather than fixed."""
-import re, subprocess, sys, pathlib, collections
-PEANO = "llvm-objdump"
+import os, re, shutil, subprocess, sys, pathlib, collections
+
+# Derive the disassembler rather than hardcoding one machine's absolute path: PEANO_INSTALL_DIR if
+# the caller set it (scripts/iron_env.sh does), else the repo's own iron venv, else whatever is on
+# PATH. Fail with the reason rather than with a confusing empty disassembly.
+def _find_objdump():
+    cands = []
+    if os.environ.get("PEANO_INSTALL_DIR"):
+        cands.append(pathlib.Path(os.environ["PEANO_INSTALL_DIR"]) / "bin" / "llvm-objdump")
+    repo = pathlib.Path(__file__).resolve().parent.parent
+    venv = ".venv-iron/lib/python3.14/site-packages/llvm-aie/bin/llvm-objdump"
+    cands.append(repo / venv)
+    # A git worktree has no venv of its own; the primary checkout beside it does.
+    cands.append(repo.parent / "xdna-engine" / venv)
+    for c in cands:
+        if c.is_file() and os.access(c, os.X_OK):
+            return str(c)
+    found = shutil.which("llvm-objdump")
+    if found:
+        # NOT equivalent: a stock llvm-objdump is not AIE-aware, so frame sizes read off its
+        # disassembly are not trustworthy. Say so rather than reporting numbers that look fine.
+        print(f"aie_stack_audit: WARNING falling back to {found}, which is not Peano's AIE-aware "
+              f"llvm-objdump -- frame numbers below may be wrong. Set PEANO_INSTALL_DIR or source "
+              f"scripts/iron_env.sh.", file=sys.stderr)
+        return found
+    raise SystemExit("aie_stack_audit: no llvm-objdump -- set PEANO_INSTALL_DIR, or "
+                     "source scripts/iron_env.sh, or put llvm-objdump on PATH")
+
+PEANO = _find_objdump()
 
 def frames_and_edges(elf):
     dis = subprocess.run([PEANO,"-d",elf],capture_output=True,text=True).stdout
