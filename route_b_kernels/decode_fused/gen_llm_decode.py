@@ -64,6 +64,7 @@ def bf16(a):
 
 L1_BYTES = 65536      # AIE2P core local memory (getLocalMemorySize(), AIETargetModel.h)
 L1_RESERVE = 8192     # stack + the allocator's own slack; measured headroom, not a guess (see below)
+C_TILE_GRANULE = 8    # tile_size_output must be a multiple of this (16 bytes of bf16); see gemv_tile_output
 
 
 def gemv_tile_output(M, K, cols=None, tsi=None):
@@ -90,6 +91,12 @@ def gemv_tile_output(M, K, cols=None, tsi=None):
     # m_input must shrink too: the A tile is m_input x K, so at K=3072 (the FFN down projection)
     # A+B double-buffered already exceed L1 at m_input=4 and leave the C tile nothing. Search
     # m_input downward and take the first that admits any legal C tile.
+    # Search every m_input and keep the largest legal C TILE, not the largest m_input. Preferring
+    # m_input first is a trap: at the lm-head shape it accepts (4, 16) -- legal, correct, and 1187
+    # tiles per column -- while (2, 9496) exists one step down and is 593x fewer tiles. A smaller
+    # m_input frees L1 budget quadratically faster than it costs, because A is m_input x K while C
+    # is just m_output.
+    best_pair = (0, 0)
     for cand_tsi in ([tsi] if tsi is not None else (4, 2, 1)):
         if per_col % cand_tsi:
             continue
@@ -97,12 +104,22 @@ def gemv_tile_output(M, K, cols=None, tsi=None):
         if budget <= 0:
             continue
         cap = budget // 4                  # C is double-buffered, 2 bytes per element
+        # THIRD constraint, and nothing in the toolchain checks it: the C tile must be a multiple of
+        # C_TILE_GRANULE elements. MEASURED 2026-09-03 with a standalone one-GEMV repro at the
+        # lm-head shape -- M=151936 K=1024 with tso=4748 (4748 % 8 == 4) returns a PERMUTATION of the
+        # right answer: values correct (sorted rel-L2 7.9e-3) in wrong positions (rel-L2 1.40). The
+        # SAME M and K with tso=9496 is correct at 2.8e-3, and 1024/512/256 are correct at M=8192.
+        # Every passing tile is a multiple of 8; the one failing tile is not. It is silent -- the
+        # build succeeds and the argmax is simply wrong -- so it has to be refused here.
         best = max((d for d in range(cand_tsi, per_col + 1, cand_tsi)
-                    if per_col % d == 0 and d <= cap), default=0)
-        if best:
-            return cand_tsi, best
+                    if per_col % d == 0 and d <= cap and d % C_TILE_GRANULE == 0), default=0)
+        if best > best_pair[1]:
+            best_pair = (cand_tsi, best)
+    if best_pair[1]:
+        return best_pair
     raise ValueError(f"GEMV M={M} K={K}: no (tile_size_input, tile_size_output) fits L1 "
-                     f"({L1_BYTES} B) with M//cols={per_col}")
+                     f"({L1_BYTES} B) with M//cols={per_col} and tile_size_output a multiple of "
+                     f"{C_TILE_GRANULE}")
 
 
 def gemv(M, K, ctx, **kw):
