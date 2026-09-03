@@ -14,6 +14,9 @@
 set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO"
+# Semantic hash of the pin (comments and blank lines stripped), identical to conveyor_bd_prebuild.sh
+# and kernel_sandbox.sh so the three agree on what "the toolchain" is.
+_lock_id() { sed -e 's/[[:space:]]*#.*$//' -e '/^[[:space:]]*$/d' "$REPO/toolchain.lock" | sha256sum | cut -c1-12; }
 TQ=8
 # HEADS=8 = Parakeet n_heads run on 8 PARALLEL cores (one head/core), one dispatch/block
 # (Phase-2 spatial-parallel relpos). HEADS=1 rebuilds the original single-Worker block.
@@ -43,8 +46,17 @@ scripts/sync_kernels.sh >/dev/null 2>&1
 
 build_bucket() {
   local BUILT_T="$1" KB="$2" out="$OUT_ROOT/$3"
+  # Reuse only if the artifact was built by the CURRENT pin. File-existence is not a freshness
+  # test: on 2026-09-03 a 06-29 kernel survived this exact shape of guard into a same-day A/B and
+  # got a hang blamed on the kernel tile. This script is where that shape came from -- both
+  # conveyor prebuilds say "mirrors relpos_prebuild.sh" and both were fixed on 2026-09-03; this one
+  # was missed, so it kept the original defect while its copies were repaired.
   if [ -f "$out/final.xclbin" ] && [ -f "$out/insts.bin" ] && [ -z "${FORCE:-}" ]; then
-    echo "[prebuild] bucket $BUILT_T present -> $out (FORCE=1 to rebuild)"; return 0
+    if [ "$(cat "$out/.toolchain-stamp" 2>/dev/null)" != "$(_lock_id)" ]; then
+      echo "[prebuild] bucket $BUILT_T STALE toolchain (stamp $(cat "$out/.toolchain-stamp" 2>/dev/null || echo none) != $(_lock_id)) -> rebuilding"
+    else
+      echo "[prebuild] bucket $BUILT_T present -> $out (FORCE=1 to rebuild)"; return 0
+    fi
   fi
   echo "[prebuild] building STEP=8 T=$BUILT_T TQ=$TQ KB=$KB HEADS=$HEADS -> $out ..."
   ( cd "$EX" && make clean >/dev/null 2>&1; \
@@ -72,6 +84,7 @@ PY
   mkdir -p "$out"
   cp "$EX/build/final.xclbin" "$out/final.xclbin"
   cp "$EX/build/insts.bin"    "$out/insts.bin"
+  _lock_id > "$out/.toolchain-stamp"
   echo "[prebuild] installed bucket $BUILT_T ($nt t_active words) -> $out"
 }
 
