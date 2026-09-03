@@ -2,11 +2,12 @@
 # =============================================================================================
 # Batched-decode WER gate. Runs verify_batched_decode over the 16 wer_clips through the batched
 # decoder, scores per-stream + aggregate WER vs refs.json, gates at 0.1172.
-# RUN-ONLY (bin prebuilt). Single-tenant NPU: stops npu-asr/voxd, ALWAYS restarts.
+# RUN-ONLY (bin prebuilt). Single-tenant NPU: quiesces the NPU services, ALWAYS restarts.
 #
 #   bash scripts/wer_batched_decode.sh [BATCH_DIR]      # default decode_batched_B16_L12_sp
 # =============================================================================================
 set -u
+. "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/_npu_services.sh" || exit 1   # unit names + asserted quiesce
 WT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$WT"
 LDLIB=~/.local/lib/npu-asr
 BATCH_DIR="${1:-$WT/artifacts/decode_batched_B16_L12_sp}"
@@ -14,7 +15,7 @@ VERIFY="$WT/rust/target/release/verify_batched_decode"
 CLIPDIR="$WT/artifacts/wer_clips"
 TS="$(date +%Y%m%d_%H%M%S)"; OUT="$WT/artifacts/wer_batched_${TS}.tsv"; LOG="$WT/artifacts/wer_batched_${TS}.log"
 log(){ echo -e "$*" | tee -a "$LOG"; }
-restart(){ systemctl --user start xdna-engine.service voxd.service >/dev/null 2>&1; log "[svc] npu services restarted"; }
+restart(){ npu_svc_start; }
 trap 'restart; log "[done] tsv: $OUT"' EXIT
 
 [ -e "$VERIFY" ] || { log "FATAL missing (prebuild): $VERIFY"; exit 1; }
@@ -35,8 +36,8 @@ log "batch width B=$BW (clips cycled from 16 base)"
 
 log "================ BATCHED WER GATE  $TS ================"
 log "batch dir: $BATCH_DIR"
-log "[svc] stopping npu-asr / voxd"
-systemctl --user stop xdna-engine.service voxd.service >/dev/null 2>&1; sleep 1
+log "[svc] quiescing (single-tenant)"
+npu_svc_stop || exit 1
 if fuser /dev/accel/accel0 >/dev/null 2>&1; then
   log "FATAL: /dev/accel/accel0 busy — another session holds the NPU. Aborting."; fuser -v /dev/accel/accel0 2>&1 | tee -a "$LOG"; exit 1
 fi

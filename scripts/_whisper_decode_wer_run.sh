@@ -3,6 +3,7 @@
 # Stops the NPU services, runs BOTH evals (each launches engine_serve, POSTs the clips, scores
 # WER vs refs.json), then ALWAYS restarts the services (trap, even on failure/Ctrl-C).
 set -u
+. "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/_npu_services.sh" || exit 1   # unit names + asserted quiesce
 cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
 PORT=11434
@@ -12,11 +13,11 @@ SCEN="scenarios/asr-whisper-small.toml"
 LOGDIR=/tmp/whisper_decode_wer
 mkdir -p "$LOGDIR"
 
-restart_services() { echo "[run] restarting npu services"; systemctl --user start xdna-engine.service voxd.service; }
+restart_services(){ npu_svc_start; }
 trap restart_services EXIT
 
-echo "[run] stopping npu services (single-tenant device)"
-systemctl --user stop xdna-engine.service voxd.service
+echo "[run] quiescing (single-tenant device)"
+npu_svc_stop || exit 1
 sleep 2
 if fuser /dev/accel/accel0 2>/dev/null; then echo "[run] ERROR: device still busy"; exit 1; fi
 echo "[run] device clear"

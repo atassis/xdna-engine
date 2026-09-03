@@ -6,7 +6,7 @@
 #
 #   bash scripts/idle_perf_sweep.sh
 #
-# It is fully unattended: stops npu-asr/voxd (single-tenant NPU), builds the binaries, runs the
+# It is fully unattended: quiesces the NPU services (single-tenant NPU), builds the binaries, runs the
 # sweep, ALWAYS restarts the services on exit (even on error/Ctrl-C), and beeps when finished.
 # Everything is logged to  artifacts/idle_perf_sweep_<timestamp>.log  with a SUMMARY at the end.
 #
@@ -21,6 +21,7 @@
 # run ONCE before this script:   sudo chmod -R a+r /sys/class/powercap/intel-rapl*/
 # =============================================================================================
 set -u
+. "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/_npu_services.sh" || exit 1   # unit names + asserted quiesce
 
 WT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$WT"
@@ -38,7 +39,7 @@ URL="http://127.0.0.1:${PORT}/v1/audio/transcriptions"
 mkdir -p "$WT/artifacts" "$WERDIR"; : > "$LOG"
 
 log(){ echo -e "$*" | tee -a "$LOG"; }
-restart(){ systemctl --user start xdna-engine.service voxd.service >/dev/null 2>&1; echo "[svc] npu services restarted" | tee -a "$LOG"; }
+restart(){ npu_svc_start; }
 beep(){ ( speaker-test -t sine -f 1000 -l 1 >/dev/null 2>&1 & local p=$!; sleep 2; kill -9 "$p" >/dev/null 2>&1 ); }
 trap 'restart; beep; echo "[done] log: $LOG" ' EXIT
 
@@ -79,8 +80,8 @@ else
 fi
 
 # ---- single-tenant ----
-log "\n[svc] stopping npu-asr + voxd for single-tenant NPU ..."
-systemctl --user stop xdna-engine.service voxd.service; sleep 2
+log "\n[svc] quiescing for single-tenant NPU ..."
+npu_svc_stop || exit 1
 if fuser /dev/accel/accel0 2>/dev/null; then
   log "[ERR] /dev/accel/accel0 still busy after stopping services — aborting (services will be restarted)."; exit 1
 fi

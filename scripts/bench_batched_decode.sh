@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================================
 # Subsystem-B perf: batched (B=16) vs M=1 DECODE J/token + tok/s, with full per-step breakout.
-# RUN-ONLY (binaries are prebuilt). Single-tenant NPU: stops npu-asr/voxd, ALWAYS restarts, beeps.
+# RUN-ONLY (binaries are prebuilt). Single-tenant NPU: quiesces the NPU services, ALWAYS restarts, beeps.
 #
 #   bash scripts/bench_batched_decode.sh
 #
@@ -15,6 +15,7 @@
 # RAPL energy: if J shows n/a, run ONCE first:  sudo chmod -R a+r /sys/class/powercap/intel-rapl*/
 # =============================================================================================
 set -u
+. "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/_npu_services.sh" || exit 1   # unit names + asserted quiesce
 WT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$WT"
 LDLIB=~/.local/lib/npu-asr
 M1_DIR="$WT/artifacts/fused_decode12"                       # shipped M=1 deep-C ELF
@@ -25,7 +26,7 @@ CLIPDIR="$WT/artifacts/wer_clips"
 TS="$(date +%Y%m%d_%H%M%S)"; LOG="$WT/artifacts/bench_batched_${TS}.log"
 mkdir -p "$WT/artifacts"; : > "$LOG"
 log(){ echo -e "$*" | tee -a "$LOG"; }
-restart(){ systemctl --user start xdna-engine.service voxd.service >/dev/null 2>&1; log "[svc] npu services restarted"; }
+restart(){ npu_svc_start; }
 beep(){ ( speaker-test -t sine -f 1000 -l 1 >/dev/null 2>&1 & local p=$!; sleep 1; kill -9 "$p" >/dev/null 2>&1 ); }
 trap 'restart; beep; log "[done] log: $LOG"' EXIT
 
@@ -41,8 +42,8 @@ log "host: $(uname -srm)   B=16   clips=${#CLIPS[@]}"
 log "M=1 dir:   $M1_DIR"
 log "batch dir: $BATCH_DIR  ($(python3 -c "import json;print('scratch %.0f MB'%(json.load(open('$BATCH_DIR/meta.json'))['scratch_size']/1e6))" 2>/dev/null))"
 
-log "[svc] stopping npu-asr / voxd"
-systemctl --user stop xdna-engine.service voxd.service >/dev/null 2>&1; sleep 1
+log "[svc] quiescing (single-tenant)"
+npu_svc_stop || exit 1
 if fuser /dev/accel/accel0 >/dev/null 2>&1; then
   log "FATAL: /dev/accel/accel0 busy — another session holds the NPU. Aborting."; fuser -v /dev/accel/accel0 2>&1 | tee -a "$LOG"; exit 1
 fi

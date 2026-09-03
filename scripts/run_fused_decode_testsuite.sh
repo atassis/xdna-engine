@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # Comprehensive fused-decode + full-ASR-e2e test suite.
-# RUN ON AN IDLE MACHINE (single-tenant NPU; the script stops/starts npu-asr/voxd itself).
+# RUN ON AN IDLE MACHINE (single-tenant NPU; the script quiesces/restarts the NPU services itself).
 #
 #   bash scripts/run_fused_decode_testsuite.sh
 #
@@ -21,6 +21,7 @@
 # A beep sounds when the whole suite finishes.
 # =============================================================================
 set -u
+. "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/_npu_services.sh" || exit 1   # unit names + asserted quiesce
 . "$(dirname "${BASH_SOURCE[0]}")/amd_paths.sh"   # -> IRON_DIR (relocatable; env-overridable)
 IRON="$IRON_DIR"
 # WT = repo root (derived from this script's location), so the suite runs from any worktree —
@@ -41,7 +42,7 @@ section(){ echo -e "\n\n========================================================
 run(){ echo -e "\n\$ $*" | tee -a "$LOG"; { eval "$@"; } >>"$LOG" 2>&1; local rc=$?; tail -n 40 "$LOG" | sed 's/^/    /'; echo "  [exit $rc]" | tee -a "$LOG"; }
 note(){ echo -e "# $*" | tee -a "$LOG"; }
 
-restart_svc(){ systemctl --user start xdna-engine.service voxd.service >/dev/null 2>&1; }
+restart_svc(){ npu_svc_start; }
 beep(){ ( speaker-test -t sine -f 1000 -l 1 >/dev/null 2>&1 & local p=$!; sleep 3; kill -9 $p >/dev/null 2>&1 ) ; }
 trap 'restart_svc; echo "[services restarted on exit]" | tee -a "$LOG"; beep' EXIT
 
@@ -83,8 +84,8 @@ gen decode      "gen_decode.py --weights $WDIR --layers 2 --out $WT/artifacts/fu
 gen decode      "gen_decode.py --weights $WDIR --layers 12 --out $WT/artifacts/fused_decode12"
 
 # ===========================================================================
-section "DEVICE TESTS — stopping npu-asr/voxd (single-tenant)"
-run "systemctl --user stop xdna-engine.service voxd.service; sleep 2"
+section "DEVICE TESTS — quiescing (single-tenant)"
+npu_svc_stop || exit 1
 run "fuser -v /dev/accel/accel0 2>&1 || echo device-free"
 
 section "1a. Fused block CORRECTNESS (rel-L2, gate <=0.08)"
@@ -116,7 +117,7 @@ run "cd $WT/rust && WHISPER_ROOT=$WT LD_LIBRARY_PATH=$LDLIB cargo run -q -p npu-
 run "cd $WT/rust && WHISPER_ROOT=$WT LD_LIBRARY_PATH=$LDLIB cargo run -q -p npu-probes --release --bin verify_whisper_decode -- --npu-attn"
 
 # restart services for the harnesses that manage their own engine_serve
-run "systemctl --user start xdna-engine.service voxd.service; sleep 2"
+npu_svc_start
 
 # ===========================================================================
 section "5. Whisper WER (FULL transcription accuracy, 17 clips) — ONNX vs NPU pooled WER vs known 0.1136"

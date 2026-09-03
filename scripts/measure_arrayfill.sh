@@ -3,19 +3,20 @@
 # Array-fill measurement: per-token NPU dispatch at B=16 (g_cols=1, 4/32 cores) vs B=128
 # (g_cols=8, 32/32 cores) for the SAME layer count, via the NL-aware BatchedFusedDecoder.
 # Output is garbage (short ELF) but the DISPATCH timing is valid — that's the array-fill number.
-# RUN-ONLY (ELFs+bins prebuilt). Single-tenant NPU: stops npu-asr/voxd, ALWAYS restarts.
+# RUN-ONLY (ELFs+bins prebuilt). Single-tenant NPU: quiesces the NPU services, ALWAYS restarts.
 #
 #   bash scripts/measure_arrayfill.sh <B16_dir> <B128_dir>
 #   e.g. bash scripts/measure_arrayfill.sh artifacts/decode_batched_B16_L1_sp_nopdi artifacts/decode_batched_B128_L1_sp_nopdi
 # =============================================================================================
 set -u
+. "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/_npu_services.sh" || exit 1   # unit names + asserted quiesce
 WT="$REPO"; cd "$WT"
 LDLIB=~/.local/lib/npu-asr
 VERIFY="$WT/rust/target/release/verify_batched_decode"
 CLIP="$WT/artifacts/wer_clips/en_04.wav"
 TS="$(date +%Y%m%d_%H%M%S)"; LOG="$WT/artifacts/arrayfill_${TS}.log"
 log(){ echo -e "$*" | tee -a "$LOG"; }
-restart(){ systemctl --user start xdna-engine.service voxd.service >/dev/null 2>&1; }
+restart(){ npu_svc_start; }
 trap 'restart; log "[done] $LOG"' EXIT
 
 measure_one(){  # $1=dir -> echoes "B<nl> dispatch_ms per_tok"
@@ -33,7 +34,7 @@ measure_one(){  # $1=dir -> echoes "B<nl> dispatch_ms per_tok"
 
 [ $# -eq 2 ] || { echo "usage: measure_arrayfill.sh <B16_dir> <B128_dir>"; exit 1; }
 log "================ ARRAY-FILL  $TS ================"
-log "[svc] stopping npu services"; systemctl --user stop xdna-engine.service voxd.service >/dev/null 2>&1; sleep 1
+log "[svc] quiescing (single-tenant)"; npu_svc_stop || exit 1
 if fuser /dev/accel/accel0 >/dev/null 2>&1; then log "FATAL device busy"; fuser -v /dev/accel/accel0 2>&1|tee -a "$LOG"; exit 1; fi
 log "[svc] device clear"
 
