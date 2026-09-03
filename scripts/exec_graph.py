@@ -36,7 +36,10 @@ GEMM = REPO / "mlir-aie/programming_examples/basic/matrix_multiplication/whole_a
 MHA_DIR = REPO / "artifacts/encoder_mha"
 ENGINE_TOML = Path.home() / ".config/npu/engine.toml"
 
-# K is augmented by 32 for the on-chip bias row, so K_aug identifies the model width uniquely.
+# Whisper's modal GEMM augments K by 32 for the on-chip bias row (768->800, 1280->1312). That is
+# NOT universal: parakeet's kernels are built at K = d_model exactly (1024). Matching on the
+# augmented value alone reported parakeet as having no kernels while its whole set was on disk, so
+# try both conventions and record which one matched rather than assuming either.
 K_AUG_BIAS = 32
 
 # The declared schedule below describes the WHISPER encoder block only. Parakeet and GigaAM are
@@ -135,7 +138,7 @@ def scenarios():
                     "d_model": mo.get("hidden"), "ffn": mo.get("ff"),
                     "n_heads": mo.get("n_heads"), "head_dim": mo.get("head_dim"),
                     "n_layers": mo.get("n_layers"), "max_seq": mo.get("max_seq"),
-                    "K_aug": (mo.get("hidden") or 0) + K_AUG_BIAS,
+                    "K_candidates": [(mo.get("hidden") or 0) + K_AUG_BIAS, mo.get("hidden") or 0],
                     # Key on the scenario PATH, not the display name: engine.toml registers
                     # `scenario = "scenarios/foo.toml"` and its model `name` need not match the
                     # scenario's own. Matching the name reported parakeet unregistered while it
@@ -145,8 +148,14 @@ def scenarios():
 
 
 def build_model(sc, gemms, mhas):
-    kaug = sc["K_aug"]
-    mine = [k for k in gemms if k["K_aug"] == kaug]
+    # Pick whichever K convention actually has kernels on disk; prefer the bias-augmented one.
+    kaug, mine = sc["K_candidates"][0], []
+    for cand in sc["K_candidates"]:
+        hit = [k for k in gemms if k["K_aug"] == cand]
+        if hit:
+            kaug, mine = cand, hit
+            break
+    sc = {**sc, "K_aug": kaug, "k_convention": "d_model+32" if kaug != sc["K_candidates"][1] else "d_model"}
     if sc["name"] not in WHISPER_FAMILY:
         # No declared schedule for this architecture. Report what IS evidence -- config and the
         # kernels on disk -- and say plainly that the op graph is unknown. A fabricated schedule
@@ -154,6 +163,7 @@ def build_model(sc, gemms, mhas):
         return {
             "name": sc["name"], "scenario": sc["scenario"],
             "config": {k: sc[k] for k in ("d_model", "ffn", "n_heads", "head_dim", "n_layers", "max_seq", "K_aug")},
+            "k_convention": sc["k_convention"],
             "registered_in_engine_toml": sc["registered_in_engine_toml"],
             "schedule": "not_declared",
             "health": {"status": "unknown", "missing": [],
@@ -205,6 +215,7 @@ def build_model(sc, gemms, mhas):
     return {
         "name": sc["name"], "scenario": sc["scenario"],
         "config": {k: sc[k] for k in ("d_model", "ffn", "n_heads", "head_dim", "n_layers", "max_seq", "K_aug")},
+        "k_convention": sc["k_convention"],
         "registered_in_engine_toml": sc["registered_in_engine_toml"],
         "health": {"status": status, "missing": missing, "hazards": haz},
         "ops": ops,
