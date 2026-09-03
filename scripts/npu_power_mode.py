@@ -62,7 +62,7 @@ FALLBACK = "performance"
 
 SET_CMD = "sudo xrt-smi configure --pmode {mode} --force"
 # Prepended to the fix hint: turbo's precondition is the overwhelmingly common reason it fails.
-QUIESCE_CMD = "systemctl --user stop xdna-engine.service voxd.service"
+QUIESCE_CMD = "systemctl --user stop xdna-engine.service npu-vox.service"
 
 
 class PowerModeUnavailable(RuntimeError):

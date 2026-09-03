@@ -20,7 +20,7 @@ Run (from the repo root) — use the venv that has onnx_asr:
     ASR_ENCODER=onnx ~/npuvox-asr-bench/.venv/bin/python scripts/asr_service.py
 
     # NPU backend (needs NPU free + `rust/target/release/encode_server` built):
-    #   first stop flm-asr.service / voxd.service (NPU is single-tenant), then:
+    #   first stop flm-asr.service / npu-vox.service (NPU is single-tenant), then:
     ASR_ENCODER=npu  ~/npuvox-asr-bench/.venv/bin/python scripts/asr_service.py
 
     # CLI WER scoring (no server) against the oracle text:
