@@ -128,10 +128,22 @@ impl WhisperEncoder {
         // NPU_ENC_MHA_NPU=1: load the static-shape encoder-MHA xclbin onto the SAME device (single-tenant).
         let mha_npu = if std::env::var("NPU_ENC_MHA_NPU").is_ok() {
             let base = root.join("artifacts/encoder_mha");
-            let xclbin = base.join("StaticMHA_h12_s1500_d64_kv0_causal0_npu2.xclbin");
-            let insts = base.join("StaticMHA_h12_s1500_d64_kv0_causal0_npu2.bin");
-            Some(crate::mha_npu::MhaNpu::open(&npu.device(), &xclbin, &insts)
-                .expect("NPU_ENC_MHA_NPU: load encoder-MHA xclbin (build via gen_encoder_mha.py)"))
+            let h = cfg.n_heads;
+            // Two names, because the op's own naming changed: IRON's MHA dropped `causal` as a
+            // field, so builds before that carry `_causal0_` and builds after do not. Both are the
+            // same non-causal design.
+            let stem = [format!("StaticMHA_h{h}_s1500_d64_kv0_npu2"),
+                        format!("StaticMHA_h{h}_s1500_d64_kv0_causal0_npu2")]
+                .into_iter()
+                .find(|s| base.join(format!("{s}.xclbin")).exists())
+                .unwrap_or_else(|| panic!(
+                    "NPU_ENC_MHA_NPU: no encoder-MHA xclbin for h={h} in {} -- build it with \
+                     `python route_b_kernels/decode_fused/gen_encoder_mha.py --heads {h} --out {}`",
+                    base.display(), base.display()));
+            let xclbin = base.join(format!("{stem}.xclbin"));
+            let insts = base.join(format!("{stem}.bin"));
+            Some(crate::mha_npu::MhaNpu::open(&npu.device(), h, &xclbin, &insts)
+                .expect("NPU_ENC_MHA_NPU: load encoder-MHA xclbin"))
         } else {
             None
         };

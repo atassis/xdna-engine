@@ -12,7 +12,7 @@ For the encoder the loop bounds are compile-time constants (seq_len=1500 fixed -
 `mha_static_design.py` replaces the runtime RTP reads with those constants and turns the `with if_(...)`
 guards into plain Python `if`s -> only the live branch is emitted, no scf.if, no conditional acquire.
 
-causal=False (non-causal / bidirectional = the encoder's full attention), d=64, heads=12, seq_len=1500
+causal=False (non-causal / bidirectional = the encoder's full attention), d=64, heads per --heads, seq_len=1500
 (pads to 1536 = 24x64). Q/K/V/O are each [heads*d*seq_pad] bf16 flat. Replaces the ~300 ms/utt host MHA.
 
 Usage (iron env, like build_projout_elf.sh): python gen_encoder_mha.py --out <dir> [--pipelines 8]
@@ -25,6 +25,8 @@ from iron.common import PythonGeneratedMLIRArtifact, DesignGenerator
 from iron.operators.mha.op import MHA
 import aie.utils as aie_utils
 
+# whisper-small's shape; every Whisper size shares d=64 and s=1500 (max_source_positions) and
+# differs only in head count -- large-v3-turbo is 20 heads, not 12. Overridable per build.
 HEADS, D, SEQ = 12, 64, 1500
 STATIC_DESIGN = Path(__file__).resolve().parent / "mha_static_design.py"
 
@@ -62,15 +64,22 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--pipelines", type=int, default=8,
                     help="AIE columns used (tested upstream at 4/8; static design needs no specific value)")
+    ap.add_argument("--heads", type=int, default=HEADS,
+                    help="attention heads (whisper-small 12, large-v3-turbo 20)")
+    ap.add_argument("--d", type=int, default=D, help="head dim (64 for every Whisper)")
+    ap.add_argument("--seq", type=int, default=SEQ, help="encoder sequence length")
     a = ap.parse_args()
+    heads, d, seq = a.heads, a.d, a.seq
     os.makedirs(a.out, exist_ok=True)
 
     ctx = AIEContext()
-    op = StaticMHA(num_heads=HEADS, seq_len=SEQ, d=D, num_KV_heads=0, causal=False,
+    # `causal` is not a constructor field: the current IRON MHA dropped it, and this design is
+    # non-causal by construction (mha_static_design.fused_mha has no causal branch at all).
+    op = StaticMHA(num_heads=heads, seq_len=seq, d=d, num_KV_heads=0,
                    num_of_pipelines=a.pipelines, context=ctx)
-    seq_pad = op._calculate_seq_padding(SEQ, a.pipelines)
-    bufelems = HEADS * D * seq_pad
-    print(f"StaticMHA(h={HEADS}, s={SEQ}->pad{seq_pad}, d={D}, causal=False, pipelines={a.pipelines}); "
+    seq_pad = op._calculate_seq_padding(seq, a.pipelines)
+    bufelems = heads * d * seq_pad
+    print(f"StaticMHA(h={heads}, s={seq}->pad{seq_pad}, d={d}, causal=False, pipelines={a.pipelines}); "
           f"Q/K/V/O = {bufelems} bf16 each, name={op.name}")
     op.compile()
     bd = str(ctx.build_dir)
@@ -80,7 +89,7 @@ def main():
         shutil.copy(f, a.out)
     meta = {
         "kernel_name": "main:sequence", "op_name": op.name,
-        "heads": HEADS, "d": D, "seq": SEQ, "seq_pad": seq_pad, "causal": False,
+        "heads": heads, "d": d, "seq": seq, "seq_pad": seq_pad, "causal": False,
         "pipelines": a.pipelines, "buf_elems": bufelems,
         "io": "Q,K,V in + O out, each [heads*d*seq_pad] bf16", "design": "mha_static_design.py",
         "xclbin": [os.path.basename(f) for f in xclbins], "insts": [os.path.basename(f) for f in instss],
