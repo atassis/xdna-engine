@@ -23,7 +23,7 @@ import ml_dtypes
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import newstack_compat  # noqa: F401,E402
 from iron.common import AIEContext  # noqa: E402
-from iron.common.fusion import FusedMLIROperator  # noqa: E402
+from elf_dispatch_compat import OperatorSequence  # noqa: E402
 from iron.operators.gemv.op import GEMV  # noqa: E402
 from gen_llm_decode import gemv_tile_output, COLS  # noqa: E402
 
@@ -35,7 +35,7 @@ def run_one(M, K, cols, tsi, tso, seed):
     ctx = AIEContext()
     op = GEMV(M=M, K=K, num_aie_columns=cols, tile_size_input=tsi,
               tile_size_output=tso, context=ctx)
-    fused = FusedMLIROperator(f"gemv_{M}_{K}_{tsi}_{tso}", [(op, "W", "x", "y")],
+    fused = OperatorSequence(f"gemv_{M}_{K}_{tsi}_{tso}", [(op, "W", "x", "y")],
                               input_args=["x"], output_args=["y"],
                               buffer_sizes={"y": M * 2}, context=ctx)
     fused.compile()
@@ -91,7 +91,7 @@ def main():
     ctx = AIEContext()
     op = GEMV(M=a.m, K=a.k, num_aie_columns=a.cols, tile_size_input=tsi,
               tile_size_output=tso, context=ctx)
-    fused = FusedMLIROperator("lmhead_repro", [(op, "W", "x", "y")],
+    fused = OperatorSequence("lmhead_repro", [(op, "W", "x", "y")],
                               input_args=["x"], output_args=["y"],
                               buffer_sizes={"y": a.m * 2}, context=ctx)
     fused.compile()

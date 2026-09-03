@@ -25,7 +25,7 @@ GENDIR="$REPO/route_b_kernels/decode_fused"
 # than a branch name -- see iron_require_api in amd_paths.sh. (gemv levers stay default-off => baseline
 # byte-identical.)
 iron_at="$(iron_require_api "gen_*_batched.py" \
-  "iron/common/fusion.py:class FusedMLIROperator" \
+  "iron/common/sequence.py:class OperatorSequence" \
   "iron/operators/transpose/op.py:coalesce_batch_dma" \
   "iron/operators/gemv/op.py:dtype_a" \
   "iron/operators/gemm/op.py:m_stationary")" || exit 1

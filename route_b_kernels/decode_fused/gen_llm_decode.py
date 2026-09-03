@@ -40,7 +40,7 @@ from llm_decode_spec import SPECS  # noqa: E402
 
 import newstack_compat  # noqa: F401,E402 -- MUST precede iron imports (new-mlir-aie port shim)
 from iron.common import AIEContext  # noqa: E402
-from iron.common.fusion import FusedMLIROperator, load_elf  # noqa: E402
+from elf_dispatch_compat import OperatorSequence, load_elf  # noqa: E402
 from iron.operators.gemv.op import GEMV  # noqa: E402
 from iron.operators.rms_norm.op import RMSNorm  # noqa: E402
 from iron.operators.rope.op import RoPE  # noqa: E402
@@ -280,7 +280,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
         raise SystemExit(0)
 
     inputs = ["x", "rope_global"] + (["rope_local"] if sp.rope_theta_local is not None else [])
-    fused = FusedMLIROperator(f"{sp.name.replace('-','_').replace('.','_')}_decode", rl,
+    fused = OperatorSequence(f"{sp.name.replace('-','_').replace('.','_')}_decode", rl,
                               input_args=inputs, output_args=["logits"],
                               buffer_sizes=bufsz, context=ctx)
     fused.compile()

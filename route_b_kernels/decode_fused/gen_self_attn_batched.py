@@ -28,7 +28,7 @@ import torch
 
 import newstack_compat  # noqa: F401 — MUST precede iron imports
 from iron.common import AIEContext
-from iron.common.fusion import FusedMLIROperator, load_elf
+from elf_dispatch_compat import OperatorSequence, load_elf
 from iron.operators.gemm.op import GEMM
 from iron.operators.gemv.op import GEMV
 from iron.operators.layer_norm.op import LayerNorm
@@ -148,7 +148,7 @@ def main():
         "kcache": B * H * S * HD * 2, "vcache": B * H * S * HD * 2, "vcacheT": B * H * S * HD * 2,
         "scores": BH * S * 2, "weights": BH * S * 2, "ctxb": B * H * HD * 2,
     }
-    fused = FusedMLIROperator("self_attn_b", runlist, input_args=["x"], output_args=["attn_out"],
+    fused = OperatorSequence("self_attn_b", runlist, input_args=["x"], output_args=["attn_out"],
                               buffer_sizes=bufsz, context=ctx)
     fused.compile()
 

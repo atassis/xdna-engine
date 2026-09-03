@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Does the FusedMLIROperator path round-trip AT ALL?
+"""Does the OperatorSequence path round-trip AT ALL?
 
 Write a known pattern -> identity kernel copies in to out -> read it back. No arithmetic, no
 reduction, no packed output, no tiling cleverness. If this fails, the fusion path is broken
@@ -12,28 +12,45 @@ output sync, mirroring OperatorSequence) and (b) a bisect down to the STOCK un-c
 ASR-size shape, which fails identically. Meanwhile the same argmax kernel is index-exact on
 the brick verify rail. So the fault is the path, not the kernel and not the tiling.
 
-ROOT CAUSE (found 2026-07-26): the unfenced-shim CLFLUSH read race on the
-XRTTensor/XRTSubBuffer device->host sync. Identified from the GEOMETRY of the corruption,
-not from another bisect -- the correct-element counts were 32, 64 and 128 bf16 = 64, 128
-and 256 bytes = exactly 1, 2 and 4 x 64-byte cache lines, varying run to run, with the rest
-reading as stale zeros. Cache-line-quantised staleness is an invalidation problem; a tap or
-offset error would be quantised by tile geometry instead, and a logic error would not move
-between runs. Eliminated on device first: argmax, chunking, vocab size, the residency
-flags, the placer, and hand-written-vs-built-in ops (IRON's own ElementwiseMul as x*1.0
-fails identically to the identity op here).
+ROOT CAUSE (2026-08-17, and it is NOT what this file recorded for three weeks). The
+cache-line-quantised staleness was real -- correct-element counts of 32/64/128 bf16 = 1/2/4
+x 64-byte lines, varying run to run -- but it was not an XRT invalidation bug, and no fenced
+shim was needed. The dirty lines were OURS. `dst.data[:] = 0` below writes the output arena
+through the raw `.data` array, which `NpuTensor.data` documents as the one write that is not
+reconciled: nothing is recorded, so nothing is flushed, and the host keeps dirty zero lines
+over the region the DMA is about to write. The device-to-host sync afterwards does not
+discard them, so they shadow the device's output and this probe read back its own pre-fill.
+Which lines survived was eviction luck, which is the run-to-run variation that read as a race.
 
-So this probe is EXPECTED to stay red until the fenced XRT shim lands. It is kept as the
-reproducer and as the regression guard for the day it goes green. Until then, gate device
-work on the iron.tensor rail (bricklib), which ran 22 bricks at run2run=0.00e+00 and is
-unaffected -- NOT on this path.
+MEASURED with a sentinel pre-fill (probe_fusion_output_prefill.py, three arms over one ELF):
+pre-fill 0 -> 1024/1024 read 0; pre-fill 7168 -> 1024/1024 read 7168 and none read 0, so the
+device had written the whole output; pre-fill 7168 then flushed before dispatch -> 1024/1024
+exact. Fixed in `FusedFullELFCallable._sync_inputs` (and `_FusedArenaCallable`'s copy in
+sequence.py) by flushing the output arena to the device alongside the input, which retires
+the dirty lines. This probe now passes 3/3 at N=1024 and 4096, tile 1024 and 4096, for the
+hand-written Identity and for IRON's built-in ElementwiseMul.
+
+Kept as the regression guard for that class: a caller that pre-fills an output arena through
+`.data` and reads plausible-looking stale bytes is silent, and this is where it shows.
 
 Doubles as the permanent regression guard for that whole class: four separate
 harness/runtime bugs in one day presented as kernel bugs, and a round-trip assert catches
 them at the point of failure instead of five bisect stages later.
 
+Both paths pass as of 2026-08-17. PROBE_PATH=sequence had been recorded as "fails to BUILD,
+dying in the per-core ld.script link"; it does not, and never did. The build succeeds and the
+failure was host-side, in two layers: get_buffer() still constructed XRTSubBuffer directly
+(the subview() migration in IRON e48befe fixed fusion.py and missed this call site), and once
+that was fixed, _sync_inputs did not FORCE the input flush -- it relied on XRTSubBuffer.data
+marking the parent host-dirty, which is exactly what the migration removed, so the device read
+init-zeros. See the log entry for the measurements.
+
 Run:
     python probe_fusion_roundtrip.py            # default N=4096, tile=1024
-    PROBE_N=8192 PROBE_TILE=8192 python ...     # single-tile variant
+    PROBE_N=8192 PROBE_TILE=4096 python ...     # two tiles, the largest that fits L1
+Do NOT use TILE=8192: at 16 KB/buffer the double-buffered in+out fills the 64 KB L1 and aiecc
+fails with "'aie.tile' op allocated buffers exceeded available memory". MEASURED boundary at
+N=8192: tile 1024/2048/4096 all build and pass 3/3; 8192 does not build.
 """
 import os
 import sys
@@ -43,7 +60,7 @@ import ml_dtypes
 
 import newstack_compat  # noqa: F401 -- MUST precede iron imports (new-mlir-aie port shim)
 from iron.common import AIEContext
-from iron.common.fusion import FusedMLIROperator
+from elf_dispatch_compat import OperatorSequence
 from iron.common.sequence import OperatorSequence
 from iron.operators.elementwise_mul.op import ElementwiseMul
 from identity_op import Identity
@@ -51,7 +68,7 @@ from identity_op import Identity
 BF16 = ml_dtypes.bfloat16
 N = int(os.environ.get("PROBE_N", 4096))
 TILE = int(os.environ.get("PROBE_TILE", 1024))
-# PROBE_PATH=fused    -> FusedMLIROperator (emits ELFs for the Rust engine; its Python
+# PROBE_PATH=fused    -> OperatorSequence (emits ELFs for the Rust engine; its Python
 #                        callable path appears to be exercised by nobody)
 # PROBE_PATH=sequence -> OperatorSequence, the path gen_gemma_decode drives to token parity
 #                        and the one that received the residency fix in 2970f8a
@@ -79,7 +96,7 @@ def main():
     if PATH == "sequence":
         fused = OperatorSequence("roundtrip_seq", runlist, dispatch="fused", **kwargs)
     else:
-        fused = FusedMLIROperator("fusion_roundtrip_probe", runlist, **kwargs)
+        fused = OperatorSequence("fusion_roundtrip_probe", runlist, **kwargs)
     fused.compile()
     print(f"[roundtrip] op={OP} path={PATH} N={N} tile={TILE} ntiles={N // TILE}", flush=True)
 

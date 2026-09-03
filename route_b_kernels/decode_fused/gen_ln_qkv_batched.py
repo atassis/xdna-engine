@@ -23,7 +23,7 @@ import torch
 
 import newstack_compat  # noqa: F401 — MUST precede iron imports
 from iron.common import AIEContext
-from iron.common.fusion import FusedMLIROperator, load_elf
+from elf_dispatch_compat import OperatorSequence, load_elf
 from iron.operators.gemm.op import GEMM
 from iron.operators.layer_norm.op import LayerNorm
 from iron.operators.elementwise_add.op import ElementwiseAdd
@@ -88,7 +88,7 @@ def main():
         (add, "qkv", "bias_qkv", "qkv"),      # +bias' (broadcast tiled)
     ]
     bufsz = {"x": B * D * 2, "x_norm": B * D * 2}
-    fused = FusedMLIROperator("ln_qkv_b", runlist, input_args=["x"], output_args=["qkv"],
+    fused = OperatorSequence("ln_qkv_b", runlist, input_args=["x"], output_args=["qkv"],
                               buffer_sizes=bufsz, context=ctx)
     fused.compile()
 

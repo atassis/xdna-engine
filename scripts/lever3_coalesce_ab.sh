@@ -9,7 +9,7 @@
 # POST-DEEP-C (new mlir-aie 1.3.2 stack, constant resident ELF):
 # baseline moved to ~75 ms/tok (~CPU floor), so the single-stream win is now SMALL — this run re-baselines
 # and quantifies it (and any J/token benefit). Fully unattended: builds, runs, ALWAYS restarts
-# the NPU services on exit, beeps when done. Everything -> artifacts/lever3_ab_<ts>.log.
+# npu-asr/voxd on exit, beeps when done. Everything -> artifacts/lever3_ab_<ts>.log.
 #
 # WHAT IT MEASURES (3 backends; all use the NPU encoder, decode differs):
 #   onnx        — CPU decode (reference, ~74 ms/tok)
@@ -30,7 +30,6 @@
 # RAPL: if energy shows N/A, run ONCE first:  sudo chmod -R a+r /sys/class/powercap/intel-rapl*/
 # =============================================================================================
 set -u
-. "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/_npu_services.sh" || exit 1   # unit names + asserted quiesce
 
 WT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$WT"
@@ -54,7 +53,7 @@ URL="http://127.0.0.1:${PORT}/v1/audio/transcriptions"
 mkdir -p "$WT/artifacts" "$WERDIR"; : > "$LOG"
 
 log(){ echo -e "$*" | tee -a "$LOG"; }
-restart(){ npu_svc_start; }
+restart(){ systemctl --user start xdna-engine.service voxd.service >/dev/null 2>&1; echo "[svc] npu services restarted" | tee -a "$LOG"; }
 beep(){ ( speaker-test -t sine -f 1000 -l 1 >/dev/null 2>&1 & local p=$!; sleep 2; kill -9 "$p" >/dev/null 2>&1 ); }
 trap 'restart; beep; echo "[done] log: $LOG"' EXIT
 
@@ -89,7 +88,7 @@ fi
 # re-checks its own surface below; this is the fast pre-check so the A/B fails before the rust build.
 if ! iron_at="$(iron_require_api "lever3 coalesce A/B" \
   "iron/operators/transpose/op.py:coalesce_batch_dma" \
-  "iron/common/fusion.py:class FusedMLIROperator")"; then
+  "iron/common/sequence.py:class OperatorSequence")"; then
   log "[ERR] IRON API surface check failed -- see stderr above"; exit 1
 fi
 log "[iron] IRON on $iron_at (API surface verified)"
@@ -124,8 +123,8 @@ log "[cooldown] 15s so the build heat doesn't bias the idle energy numbers ...";
 # =========================================================================================
 # single-tenant
 # =========================================================================================
-log "\n[svc] quiescing for single-tenant NPU ..."
-npu_svc_stop || exit 1
+log "\n[svc] stopping npu-asr + voxd for single-tenant NPU ..."
+systemctl --user stop xdna-engine.service voxd.service; sleep 2
 if fuser /dev/accel/accel0 2>/dev/null; then
   log "[ERR] /dev/accel/accel0 still busy after stopping services — aborting (other session still running?)."; exit 1
 fi

@@ -25,7 +25,7 @@ import ml_dtypes
 import torch
 
 from iron.common import AIEContext
-from iron.common.fusion import FusedMLIROperator, load_elf
+from elf_dispatch_compat import OperatorSequence, load_elf
 from iron.operators.gemv.op import GEMV
 from iron.operators.layer_norm.op import LayerNorm
 from iron.operators.elementwise_add.op import ElementwiseAdd
@@ -144,7 +144,7 @@ def main():
         (g_o, "Wo", "ctx", "attn_out"),
         (add_o, "attn_out", "bias_o", "attn_out"),
     ]
-    fused = FusedMLIROperator(
+    fused = OperatorSequence(
         "self_attn", runlist, input_args=["x"], output_args=["attn_out"],
         buffer_sizes={
             "qkv": QKV * 2,

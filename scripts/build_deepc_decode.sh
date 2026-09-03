@@ -34,8 +34,7 @@ command -v "$AIEBU_DIR/aiebu-asm" >/dev/null || [ -x "$AIEBU_DIR/aiebu-asm" ] ||
 # IRON delta (deep-C scratchpad + the rest) lives as COMMITS on the fork, not as a .patch. Gate on the
 # symbols gen_decode.py imports rather than a branch name -- see iron_require_api in amd_paths.sh.
 iron_at="$(iron_require_api "gen_decode.py (deep-C)" \
-  "iron/common/fusion.py:class FusedMLIROperator" \
-  "iron/common/fusion.py:def load_elf" \
+  "iron/common/sequence.py:class OperatorSequence" \
   "iron/operators/strided_copy/op.py:output_offset_parameter")" || exit 1
 echo "[build] IRON on $iron_at (API surface verified)"
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""FE1 Task-0 spike generator: a minimal 2-GEMV *fused full ELF* via IRON's FusedMLIROperator.
+"""FE1 Task-0 spike generator: a minimal 2-GEMV *fused full ELF* via IRON's OperatorSequence.
 
 This is the artifact side of the dispatch-shim crux -- proving a fused ELF can dispatch through
 the new xrt::elf path end to end. It produces a fused ELF that chains
@@ -25,7 +25,7 @@ import numpy as np
 import ml_dtypes
 
 from iron.common import AIEContext
-from iron.common.fusion import FusedMLIROperator, load_elf
+from elf_dispatch_compat import OperatorSequence, load_elf
 from iron.operators.gemv.op import GEMV
 
 BF16 = ml_dtypes.bfloat16
@@ -53,7 +53,7 @@ def main():
         (g0, "W0", "x", "y0"),   # arg spec order: (matrix[M,K], vector[K], out[M])
         (g1, "W1", "y0", "y1"),
     ]
-    fused = FusedMLIROperator(
+    fused = OperatorSequence(
         "spike2gemv",
         runlist,
         input_args=["x"],

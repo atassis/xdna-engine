@@ -22,7 +22,7 @@ import torch
 
 import newstack_compat  # noqa: F401 — MUST precede iron imports (new-mlir-aie port shim)
 from iron.common import AIEContext
-from iron.common.fusion import FusedMLIROperator, load_elf
+from elf_dispatch_compat import OperatorSequence, load_elf
 from iron.operators.gemv.op import GEMV
 from iron.operators.layer_norm.op import LayerNorm
 from iron.operators.elementwise_add.op import ElementwiseAdd
@@ -31,6 +31,7 @@ from iron.operators.softmax.op import Softmax
 from iron.operators.strided_copy.op import StridedCopy
 from iron.operators.transpose.op import Transpose
 from iron.operators.gelu.op import GELU
+from vpair_stage_op import VPairStage
 
 BF16 = ml_dtypes.bfloat16
 D, H, HD, QKV, FF = 768, 12, 64, 2304, 3072
@@ -91,6 +92,12 @@ def main():
     # 2nd addr scratchpad `vcache_off`=n_self), so op_ct_s reads it directly and op_tr_s is ELIMINATED
     # (kills the per-token self-V transpose round-trip, the #2 inter-op sink). Default OFF.
     ap.add_argument("--coalesce-self-tr", action="store_true", help="M0.5: transposed self vcache, drop op_tr_s")
+    # M0.6: give the pair stage's own fill/drain the cache's strided tap + `vcache_off`, so it reads and
+    # writes vcache[h,d,base:base+2] itself and op_scv DISAPPEARS -- the -1 op the arm was scoped for.
+    # Also retires the `vpair` arena buffer and the host's odd-column priming obligation: the pair IS the
+    # cache, so what the stage carries across dispatches is the cache's own preceding column. Needs
+    # --coalesce-self-tr. Default OFF so both arms stay buildable for the A/B.
+    ap.add_argument("--vstage-direct", action="store_true", help="M0.6: pair stage writes vcache directly, drop op_scv")
     # int8 cross-K (#1 M=1 byte lever, step 1): store the resident cross-K (Kenc) int8 (halves its LPDDR
     # re-read) + run op_sc_c as int8(matrix)xbf16(vector). A FIXED per-layer scale s_k is calibrated from
     # Kenc and FOLDED into mat_cq/bias_cq so it cancels (scores = (s_k*qc).Kenc_int8 = qc.Kenc_real). The
@@ -128,6 +135,7 @@ def main():
     a = ap.parse_args()
     co_cross, co_self = a.coalesce_cross, a.coalesce_self
     co_self_tr = a.coalesce_self_tr
+    vs_direct = a.vstage_direct
     int8_ck = a.int8_cross_k
     int8_cv = a.int8_cross_v
     int8_ffn = a.int8_ffn
@@ -138,6 +146,8 @@ def main():
     npu_logits = a.npu_logits
     if fuse_gelu and not fuse_ffn:
         ap.error("--fuse-gelu requires --fuse-bias-ffn (the epilogue needs op_f1 to output W·x+bias)")
+    if vs_direct and not co_self_tr:
+        ap.error("--vstage-direct requires --coalesce-self-tr (it fuses that arm's op_scv into the stage)")
     VS = 64  # kernel_vector_size — K must stay a multiple of it; K-aug pads by exactly one VS block
     if fuse_ffn and int8_ffn:
         ap.error("--fuse-bias-ffn + --int8-ffn not supported together yet (int8 quant of the aug weight)")
@@ -194,13 +204,26 @@ def main():
     # the decode ELF is CONSTANT across tokens (registered once; host writes the offset per dispatch).
     op_sck = StridedCopy(**sc, output_offset_parameter="kv_off", context=ctx)
     if co_self_tr:
-        # transposed vcache [H,HD,S]: new V[h,d] -> vcache[h*HD*S + d*S + n_self]; head stride HD*S, dim
-        # stride S, runtime column offset = vcache_off (= n_self, NOT n_self*HD like the kcache kv_off).
-        sc_v = dict(input_sizes=(H, HD), input_strides=(HD, 1), input_offset=0, output_sizes=(1, H, HD),
-                    output_strides=(0, HD * S, S), output_offset=0, input_buffer_size=H * HD,
-                    output_buffer_size=H * S * HD, num_aie_channels=1)
-        op_scv = StridedCopy(**sc_v, output_offset_parameter="vcache_off", context=ctx)
+        # transposed vcache [H,HD,S]: new V[h,d] -> vcache[h*HD*S + d*S + n_self]. A DMA cannot write that
+        # single column -- the innermost bf16 unit is a 4-byte granule spanning columns (n & ~1, n | 1), and
+        # an odd element offset truncates down into it (MEASURED; DMA-only staging is refuted). So the core
+        # stages the column PAIR and the DMA writes it whole at an EVEN base:
+        #   op_vstage: V[h,d] -> slot (n & 1) of pair[h,d,2], carrying the other slot through
+        #   op_scv:    pair[H,HD,2] -> vcache[h, d, base:base+2],  base = vcache_off = n & ~1
+        # The pair is one arena buffer read and rewritten in place, which is what carries the previous
+        # token's column across dispatches. Confirmed on device over the full cache width, both parities.
+        #   M0.6 (--vstage-direct): the stage's OWN fill/drain carry that same [H,HD,2] cache tap and
+        #   `vcache_off`, so the pair it reads and rewrites IS the cache window and op_scv is gone.
+        op_vstage = VPairStage(N=H * HD, parity_parameter="v_par", context=ctx,
+                               **(dict(pair_sizes=(H, HD, 2), pair_strides=(HD * S, S, 1),
+                                       pair_buffer_size=H * S * HD, pair_offset_parameter="vcache_off")
+                                  if vs_direct else {}))
+        sc_v = dict(input_sizes=(H, HD, 2), input_strides=(HD * 2, 2, 1), input_offset=0,
+                    output_sizes=(H, HD, 2), output_strides=(HD * S, S, 1), output_offset=0,
+                    input_buffer_size=H * HD * 2, output_buffer_size=H * S * HD, num_aie_channels=1)
+        op_scv = None if vs_direct else StridedCopy(**sc_v, output_offset_parameter="vcache_off", context=ctx)
     else:
+        op_vstage = None
         op_scv = StridedCopy(**sc, output_offset_parameter="kv_off", context=ctx)
     op_sc_s = GEMV(M=S, K=HD, num_aie_columns=8, tile_size_input=4, tile_size_output=S // 8, num_batches=H, context=ctx)
     # Deep-C: the per-token self-softmax mask width is now a runtime `core`-kind scratchpad param
@@ -325,6 +348,19 @@ def main():
             weights_to_write[pre + "s_cq"] = bf16(s_cq)  # per-channel qc scale; host overwrites per utterance
         if int8_cv:
             weights_to_write[pre + "s_cv"] = bf16(s_cv)  # per-channel ctc scale; host overwrites per utterance
+        if co_self_tr and not vs_direct:
+            # M0.5: the staged pair must ENTER the run already holding the cache's (base, base+1)
+            # columns, base = first_token & ~1. The carried slot is written back to the cache
+            # verbatim, so with an ODD first column it lands on column base -- a VALID preceding
+            # token -- and a zeroed pair silently destroys it, permanently. Seeding from the cache
+            # is right for both parities: an even first column reads two unwritten (zero) columns.
+            # The HOST owes the same priming whenever it seeds the cache and resumes at an odd
+            # column, which is why this buffer is exported rather than left internal.
+            # MEASURED at P=5 (verify_tcache_parity.py): unseeded, column 4 diverges from the
+            # non-tr arm on the first dispatch and never recovers; from an even column the same
+            # ELF is bit-identical over all 448 columns.
+            b = P & ~1
+            weights_to_write[pre + "vpair"] = vc.transpose(0, 2, 1)[:, :, b:b + 2].copy().reshape(-1)
         patch_offsets_names += [pre + "kcache", pre + "vcache"]
         # explicit sizes for sliced/cache/score buffers
         bufsz.update({
@@ -356,6 +392,12 @@ def main():
             bufsz[pre + "vcTc"] = H * TP * HD * 2
         if not co_self_tr:  # self-V transpose output buffer only when NOT storing vcache transposed (M0.5)
             bufsz[pre + "vcT"] = H * S * HD * 2
+        elif not vs_direct:
+            # staged column pair [H,HD,2], read and rewritten in place each token so the slot this token
+            # does not write still holds the previous token's V. 3072 B, a whole number of 64 B granules,
+            # so it does not consume the arena's one ragged-buffer-must-be-last slot (IRON 4dff5d0).
+            # --vstage-direct has no such buffer: the stage reads and rewrites the cache window itself.
+            bufsz[pre + "vpair"] = H * HD * 2 * 2
 
         nxt = f"x{l+1}"  # layer output residual buffer
         # (1) self-V transpose: ELIMINATED (--coalesce-self-tr, vcache stored [H,HD,S], op_ct_s reads it
@@ -369,6 +411,18 @@ def main():
         else:
             self_tr = [(op_tr_s, f"{pre}vcache[{h*phs}:{(h+1)*phs}]", f"{pre}vcT[{h*phs}:{(h+1)*phs}]") for h in range(H)]
             v_ct = "vcT"
+        # (1b) new-token V into the cache. Op ledger for the V write + transpose: deep-C 1+12=13,
+        # --coalesce-self 1+1=2, this arm 2+0=2, +--vstage-direct 1+0=1. So the arm is op-count NEUTRAL
+        # against --coalesce-self until the stage absorbs the cache write, which is the -1. It also pays
+        # in bytes: op_tr_s restages the whole [H,S,HD] cache every token (O(S)), the pair stage one pair,
+        # and direct mode drops the pair's L3 round-trip through the arena on top of that.
+        if co_self_tr and vs_direct:
+            v_write = [(op_vstage, pre + "qkv[3072:4608]", pre + "vcache", pre + "vcache")]
+        elif co_self_tr:
+            v_write = [(op_vstage, pre + "qkv[3072:4608]", pre + "vpair", pre + "vpair"),
+                       (op_scv, pre + "vpair", pre + "vcache")]
+        else:
+            v_write = [(op_scv, pre + "qkv[3072:4608]", pre + "vcache")]
         # fuse_attn: K-augmented attention inputs — the PRODUCING op writes [0:D] (byte-sliced), the GEMV
         # reads the full [D+VS]; the engine sets the [1,0..] tail. (D2 = D in bytes.)
         D2 = D * 2
@@ -388,10 +442,16 @@ def main():
         # fuse_attn: drop the bias-add (folded into the aug weight); else keep it (with optional int8 mulw).
         def ba(addop, *args, mulw=None, sname=None, is_i8=False):
             return [] if fuse_attn else ((wm(mulw, args[0], sname, is_i8) if mulw else []) + [(addop, *args)])
+        # Why the pair stage is a separate op and not op_qkv's epilogue. That epilogue (see epilogue="gelu")
+        # is elementwise and in-place on a whole C-tile, and the stage is neither: op_qkv spreads M=QKV=2304
+        # rows over 8 columns at m_output=288, so V (rows 1536..2304) starts 96 rows inside core 5 and never
+        # lands on a C-tile boundary; and the stage needs a second resident input (last token's pair) and
+        # emits 2x its input, which the fixed C fifo type cannot carry. Recovering the -1 op means splitting
+        # V out of the fused QKV GEMV, which costs an op of its own -- UNMEASURED whether that nets out.
         rl += [
             (op_ln, cur, pre + a_xns),
             (op_qkv, pre + "Wqkv", pre + "xn_s", pre + "qkv"), *ba(op_add_qkv, pre + "qkv", pre + "bias_qkv", pre + "qkv", mulw=op_mulw_qkv, sname="sw_qkv", is_i8=int8_attn_w),
-            (op_sck, pre + "qkv[1536:3072]", pre + "kcache"), (op_scv, pre + "qkv[3072:4608]", pre + "vcache"),
+            (op_sck, pre + "qkv[1536:3072]", pre + "kcache"), *v_write,
             (op_sc_s, pre + "kcache", pre + "qkv[0:1536]", f"{pre}scs[0:{HSs}]"), (op_sm_s, pre + "scs", pre + "sws"),
         ] + self_tr + [
             (op_ct_s, pre + v_ct, f"{pre}sws[0:{HSs}]", pre + a_cts),
@@ -460,7 +520,7 @@ def main():
             ins = ", ".join(str(b) for b in bufs[:-1]); out = str(bufs[-1]) if bufs else "?"
             print(f"  {type(op).__name__:16} {out:14} <- {ins}")
         import sys; sys.exit(0)
-    fused = FusedMLIROperator("decode", rl, input_args=["x"], output_args=[out_name],
+    fused = OperatorSequence("decode", rl, input_args=["x"], output_args=[out_name],
                               buffer_sizes=bufsz, context=ctx)
     fused.compile()
     elf = load_elf(fused).view(np.uint8).tobytes()
@@ -477,14 +537,16 @@ def main():
     # scratchpad is a u32 array; addr-kind values are written raw, core-kind values are written <<2
     # (firmware UPDATE_REG requirement — the core right-shifts by 2 after reading).
     import glob, shutil
-    _pp = sorted(glob.glob("**/decode*.mlir.prj/params.txt", recursive=True), key=os.path.getmtime)
+    _pp = sorted(glob.glob("**/params.txt", recursive=True), key=os.path.getmtime)
+    # kv_off and sm_mask are declared unconditionally above, so a missing table means the ELF cannot
+    # be driven per-token -- ship nothing rather than a meta.json with an empty params dict.
+    assert _pp, "no params.txt emitted: the ctrl-scratchpad StateTable is missing"
     scratchpad_params = {}
-    if _pp:
-        shutil.copy(_pp[-1], os.path.join(a.out, "params.txt"))
-        for line in open(_pp[-1]).read().splitlines()[1:]:
-            if line.strip():
-                nm, idx, ty, kind = line.split()
-                scratchpad_params[nm] = {"byte_offset": int(idx) * 4, "kind": kind, "dtype": ty}
+    shutil.copy(_pp[-1], os.path.join(a.out, "params.txt"))
+    for line in open(_pp[-1]).read().splitlines()[1:]:
+        if line.strip():
+            nm, idx, ty, kind = line.split()
+            scratchpad_params[nm] = {"byte_offset": int(idx) * 4, "kind": kind, "dtype": ty}
 
     # ---- device-faithful golden (N-layer forward) ----
     x = bf16(rng.standard_normal(D).astype(np.float32))
@@ -547,9 +609,18 @@ def main():
         # batches op_tr_s (host vcache layout unchanged). Default false = deep-C [H,TP,HD].
         "coalesce_cross": bool(co_cross), "coalesce_self": bool(co_self),
         # M0.5: when coalesce_self_tr, the host must (a) write each L*_vcache transposed [H,HD,S], and
-        # (b) drive a 2nd addr scratchpad `vcache_off` = n_self (column) per token (kv_off stays n_self*HD).
-        "coalesce_self_tr": bool(co_self_tr),
-        **({"vcache_param": "vcache_off"} if co_self_tr else {}),
+        # (b) drive TWO extra params per token, because the new column is written as a staged PAIR at an
+        # even base: `vcache_off` (addr) = n_self & ~1, NOT n_self -- an odd element offset truncates down
+        # into the 4-byte granule -- and `v_par` (core) = n_self & 1, the slot the token writes. kv_off
+        # stays n_self*HD. Writing n_self into vcache_off is the failure mode to look for: even tokens
+        # still land and odd ones overwrite their predecessor. And (c) whenever it seeds the vcache and
+        # RESUMES at an odd column, prime L*_vpair with that column's existing pair -- vcache[:, :,
+        # (n_self & ~1) : (n_self & ~1) + 2] -- or the pair's unwritten slot is written back over the
+        # preceding token's column. gen_decode emits a correctly-seeded L*_vpair for its own P.
+        # M0.6 (vstage_direct): obligation (c) is GONE -- there is no L*_vpair, the stage reads its
+        # carried column out of the cache the host already seeded. (a) and (b) are unchanged.
+        "coalesce_self_tr": bool(co_self_tr), "vstage_direct": bool(vs_direct),
+        **({"vcache_param": "vcache_off", "vparity_param": "v_par"} if co_self_tr else {}),
         # int8 cross-K (per-utterance per-channel): L*_Kenc are int8 [H,TP,HD]; the host quantizes Kenc per
         # utterance + writes the L*_s_cq [D] per-channel scale buffer that op_mul_cq applies to qc.
         "int8_cross_k": bool(int8_ck),

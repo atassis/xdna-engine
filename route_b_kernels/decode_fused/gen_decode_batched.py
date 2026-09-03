@@ -27,7 +27,7 @@ import torch
 
 import newstack_compat  # noqa: F401
 from iron.common import AIEContext
-from iron.common.fusion import FusedMLIROperator, load_elf
+from elf_dispatch_compat import OperatorSequence, load_elf
 from iron.operators.gemm.op import GEMM
 from iron.operators.gemv.op import GEMV
 from iron.operators.layer_norm.op import LayerNorm
@@ -300,7 +300,7 @@ def main():
 
     out_name = cur
     bufsz["x"] = B * D * 2
-    fused = FusedMLIROperator("decode_b", rl, input_args=["x"], output_args=[out_name], buffer_sizes=bufsz, context=ctx)
+    fused = OperatorSequence("decode_b", rl, input_args=["x"], output_args=[out_name], buffer_sizes=bufsz, context=ctx)
     fused.compile()
     elf = load_elf(fused).view(np.uint8).tobytes()
     in_sz, out_sz, scr = fused.buffer_sizes
@@ -313,7 +313,7 @@ def main():
     scratchpad_params = {}
     if sp:
         import glob as _glob, shutil as _shutil
-        _pp = sorted(_glob.glob("**/decode_b*.mlir.prj/params.txt", recursive=True), key=os.path.getmtime)
+        _pp = sorted(_glob.glob("**/params.txt", recursive=True), key=os.path.getmtime)
         assert _pp, "scratchpad mode but no params.txt found (StateTable not emitted)"
         _shutil.copy(_pp[-1], os.path.join(a.out, "params.txt"))
         for line in open(_pp[-1]).read().splitlines()[1:]:

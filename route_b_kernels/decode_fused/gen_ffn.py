@@ -24,7 +24,7 @@ import ml_dtypes
 import torch
 
 from iron.common import AIEContext
-from iron.common.fusion import FusedMLIROperator, load_elf
+from elf_dispatch_compat import OperatorSequence, load_elf
 from iron.operators.gemv.op import GEMV
 from iron.operators.layer_norm.op import LayerNorm
 from iron.operators.gelu.op import GELU
@@ -93,7 +93,7 @@ def main():
         (g2, "Wfc2", "h", "out"),
         (add2, "out", "bfc2", "out"),
     ]
-    fused = FusedMLIROperator("ffn", runlist, input_args=["x"], output_args=["out"], context=ctx)
+    fused = OperatorSequence("ffn", runlist, input_args=["x"], output_args=["out"], context=ctx)
     fused.compile()
 
     elf_bytes = load_elf(fused).view(np.uint8).tobytes()
