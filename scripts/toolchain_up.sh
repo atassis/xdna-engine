@@ -43,23 +43,24 @@ fi
 PYPKG="$INST/python/aie/iron/program.py"
 WHEEL_BIN="$REPO/.venv-iron/lib/python3.14/site-packages/mlir_aie/bin"
 
-# Fill the instance bin with the vendored prebuilt tools it does NOT build itself (bootgen PDI packager,
-# aie-translate, etc.). aiecc + aie-opt are built from the fork source (version-sensitive, place-tiles);
-# the others come from the wheel. Idempotent.
+# Fill the instance bin with the vendored prebuilt tools it does NOT build itself. aiecc, aie-opt and
+# aie-translate are built from the fork source (version-sensitive, place-tiles); bootgen / aie-lsp-server /
+# aie-reset / aie-visualize come from the wheel, since they consume no aie-opt output and are genuinely
+# version-independent. Idempotent.
 #
-# "version-agnostic" is what this comment used to claim about the vendored set, and it is FALSE for
-# aie-translate: it CONSUMES aie-opt's output, so it cannot be version-independent by construction.
-# Measured 2026-08-24 -- the wheel is mlir_aie 0.0.1.2026033104 (31 Mar) against a fork pin of
-# 17 Aug, and the two disagree about aiex.npu.address_patch (aie-opt prints it with an operand, the
-# vendored aie-translate answers "requires zero operands"), which fails 51 Targets/ lit tests.
-# Scope: aiecc translates IN-PROCESS against the fork-built library and does NOT exec this binary, so
-# no xclbin is affected -- the skew reaches `check-aie` only. bootgen / aie-lsp-server / aie-reset /
-# aie-visualize consume no aie-opt output and are genuinely version-independent.
-# Fix when convenient: build aie-translate from the fork and drop it from the loop below.
+# History: until 2026-08-24 this comment called the whole vendored set "version-agnostic", which was
+# false for aie-translate -- it CONSUMES aie-opt's output, so it cannot be version-independent by
+# construction. Measured that day: the wheel was mlir_aie 0.0.1.2026033104 (31 Mar) against a fork pin
+# of 17 Aug, and the two disagreed about aiex.npu.address_patch (aie-opt prints it with an operand, the
+# vendored aie-translate answered "requires zero operands"), failing 51 Targets/ lit tests. aiecc
+# translates IN-PROCESS against the fork-built library and never execs this binary, so no xclbin was
+# ever affected -- the skew only ever reached `check-aie`. Fixed by building aie-translate from the
+# fork (see _build_aie_translate below) instead of vendoring it.
 _link_vendored_tools() {
   local t
   for t in "$WHEEL_BIN"/*; do
     local b; b="$(basename "$t")"
+    [ "$b" = "aie-translate" ] && continue   # fork-built by _build_aie_translate, never the wheel copy
     [ -e "$INST/build/bin/$b" ] || ln -sfn "$t" "$INST/build/bin/$b"
   done
 }
@@ -135,7 +136,20 @@ _build_parameter_scratchpad() {
     || echo "[toolchain_up] WARN: scratchpad binding backfill failed; scratchpad tests will skip" >&2
 }
 
+# Build aie-translate from the fork instead of vendoring the wheel's five-months-older copy (see the
+# _link_vendored_tools comment above for why the skew matters). A regular file here means an instance
+# already has the fork build -- skip. `rm -f` before the link is defensive: aie-opt/aiecc were already
+# proven fork-built by this point, so the only remaining vendored entry at this path is the symlink
+# _link_vendored_tools used to create; deleting it first means the link step creates a fresh file rather
+# than writing through whatever is already there, regardless of the linker's own symlink handling.
+_build_aie_translate() {
+  [ -e "$INST/build/bin/aie-translate" ] && [ ! -L "$INST/build/bin/aie-translate" ] && return 0
+  rm -f "$INST/build/bin/aie-translate"
+  ninja -C "$INST/build" aie-translate >&2
+}
+
 if [ -f "$PYPKG" ] && grep -q "def resolve_program(self, device_name" "$PYPKG"; then
+  _build_aie_translate  # backfill the fork-built aie-translate (else it stays the stale wheel symlink)
   _link_vendored_tools   # backfill vendored tools into already-built instances
   _link_include_dirs     # backfill include/ symlinks (aie_api + aie_kernels)
   _wire_peano_lit        # backfill the lit peano path (else `REQUIRES: peano` tests silently skip)
@@ -202,6 +216,7 @@ _link_include_dirs
 _wire_peano_lit
 _recognise_gorgon_point
 ln -sfn "$INST/build/bin" "$INST/bin"
+_build_aie_translate
 _link_vendored_tools
 touch "$INST"                                          # record last-used before GC (protects it as newest)
 gc_instances "${TOOLCHAIN_HOME:-$XDNA_CACHE/instances}" "${TOOLCHAIN_KEEP:-4}" "$INST"
