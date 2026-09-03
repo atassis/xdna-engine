@@ -12,6 +12,7 @@
 srcdir := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
 
 include ${srcdir}/../../makefile-common
+include ${srcdir}/toolchain_stamp.mk
 
 devicename ?= $(if $(filter 1,$(NPU2)),npu2,npu)
 T ?= 32

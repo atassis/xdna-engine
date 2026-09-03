@@ -33,6 +33,16 @@ case "$(cd "$AIEROOT" 2>/dev/null && pwd)" in
 esac
 mkdir -p "$PE/ml/dwconv1d" "$PE/ml/softmax400" "$PE/ml/layernorm" "$PE/ml/relpos_mha" "$PE/ml/silu"
 
+# toolchain_stamp.mk -- makes every target in these example dirs depend on the toolchain IDENTITY,
+# not just on its .cc. Copied NEXT TO the Makefiles rather than referenced back into the source tree,
+# so the include path does not depend on how deep the instance nests programming_examples. Without
+# it a .o built by an older pin looks up to date forever, which is how a 06-29 fc1 kernel entered a
+# 09-03 A/B and got a hang blamed on the kernel tile. See route_b_kernels/toolchain_stamp.mk.
+mkdir -p "$PE/ml/mha_decode"
+for _d in layernorm dwconv1d relpos_mha mha_decode; do
+  cp "$RB/toolchain_stamp.mk" "$PE/ml/$_d/toolchain_stamp.mk"
+done
+
 # silu (elementwise bf16). Upstream DELETED programming_examples/ml/silu in #3025 while KEEPING
 # aie_kernels/aie2p/silu.cc, so the kernel still builds but the design and Makefile that drive it are
 # gone -- and with them the artifacts run_npu_silu.py and run_npu_block0.py load. We now own that pair.
