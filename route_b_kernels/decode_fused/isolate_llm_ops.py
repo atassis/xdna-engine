@@ -38,6 +38,8 @@ def main():
     ap.add_argument("--layers", type=int, default=None)
     ap.add_argument("--token", type=int, default=785)
     ap.add_argument("--probe-layers", type=int, default=3)
+    ap.add_argument("--probe-from", type=int, default=None,
+                    help="probe layers [probe-from, NL) instead of the first few")
     a = ap.parse_args()
 
     sp, fused, weights, md = build_graph(a.spec, a.weights, a.layers)
@@ -78,7 +80,8 @@ def main():
 
     print(f"{'op (isolated)':22} {'rel-L2':>11}   what it isolates")
     print("-" * 74)
-    for l in range(min(a.probe_layers, NL)):
+    probe = range(a.probe_from, NL) if a.probe_from is not None else range(min(a.probe_layers, NL))
+    for l in probe:
         p = f"model.layers.{l}."
         pf = f"L{l}_"
         xin = dev("x") if l == 0 else dev(f"x{l}")
@@ -107,7 +110,12 @@ def main():
         d_h = bf(npy(p + "mlp.down_proj.weight") @ dev(pf + "gh"))
         print(f"{pf+'d':22} {rel(d_h, dev(pf+'d')):11.4e}   GEMV on the device's own gh")
         x1_h = bf(xin + dev(pf + "a"))
-        print(f"{pf+'x1':22} {rel(x1_h, dev(pf+'x1')):11.4e}   residual add on the device's own x,a")
+        print(f"{pf+'x1':22} {rel(x1_h, dev(pf+'x1')):11.4e}   attn residual add on the device's own x,a")
+        # The SECOND residual add -- x_{l+1} = x1 + d -- is the op that produces the stream handed to
+        # the next layer, and at l=NL-1 it produces the vector the final norm and lm-head consume.
+        # Isolating only the attention residual left exactly that op unmeasured.
+        nxt_h = bf(dev(pf + "x1") + dev(pf + "d"))
+        print(f"{'x'+str(l+1):22} {rel(nxt_h, dev('x'+str(l+1))):11.4e}   FFN residual add on the device's own x1,d")
         print()
 
 
