@@ -111,6 +111,11 @@ endif
 tag  = ${targetname}_T${T}_TQ${TQ}_KB${KB}_TA${TACTIVE}_H${HEADS}_SP${SPLITP}_TS${TSKIP}
 bdir = build/${tag}
 
+# The default goal is the FIRST target in the file, so adding print-tag above `all` silently
+# made `make` print the tag and build nothing -- the dual of the phony bug this file fixed.
+# State the policy instead of depending on target order.
+.DEFAULT_GOAL := all
+
 # For callers that need the directory without duplicating the formula in shell.
 print-tag:
 	@echo ${tag}

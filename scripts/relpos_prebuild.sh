@@ -53,10 +53,11 @@ build_bucket() {
   local tag; tag=$(make -C "$EX" -s print-tag "${MK[@]}" 2>/dev/null)
   [ -n "$tag" ] || { echo "[prebuild] FAILED bucket $BUILT_T (could not resolve tag)"; return 1; }
   echo "[prebuild] make bucket $BUILT_T -> $tag"
-  ( cd "$EX" && make "${MK[@]}" "build/final_$tag.xclbin" >/dev/null 2>&1 )
-  local XB="$EX/build/final_$tag.xclbin" IB="$EX/build/insts_$tag.bin"
+  mkdir -p "$EX/build"
+  ( cd "$EX" && make "${MK[@]}" "build/$tag/final.xclbin" > "build/$tag.log" 2>&1 )
+  local XB="$EX/build/$tag/final.xclbin" IB="$EX/build/$tag/insts.bin"
   if [ ! -f "$XB" ]; then
-    echo "[prebuild] FAILED bucket $BUILT_T (no $XB)"; return 1
+    echo "[prebuild] FAILED bucket $BUILT_T (no $XB). make said:"; tail -20 "$EX/build/$tag.log" 2>/dev/null; return 1
   fi
   # The template insts hold HEADS t_active words (one per head's RTP write), all == BUILT_T.
   # npu.rs patches EVERY word == BUILT_T to the clip's t. Verify the count == HEADS so a
