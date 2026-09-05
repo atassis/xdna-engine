@@ -891,6 +891,12 @@ impl WhisperAsr {
         // note on `greedy_decode` above.
         let (ids, lang) = self.greedy_decode(&flat, lang)?;
         let dec_ms = t_dec.elapsed().as_secs_f64() * 1e3;
+        // M4 (npu-hostonly-bo-coherency-race exposure): bit-for-bit token-id comparator needs the
+        // raw ids, not the detokenized text (a stale-read repeat can in principle collapse to the
+        // same text). Off by default.
+        if std::env::var("NPU_DEBUG_TOKEN_IDS").is_ok() {
+            eprintln!("[token_ids] {}", ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(","));
+        }
 
         let text = self.detokenize(&ids);
         let e2e_ms = t_e2e.elapsed().as_secs_f64() * 1e3;
