@@ -283,6 +283,39 @@ struct PipeSlot {
 }
 
 
+/// The xclbin stem a `(shape, tuning)` pair resolves to. **Pure** -- no device, no filesystem, no
+/// load -- so the required kernel set can be ENUMERATED instead of discovered by trying to load it.
+///
+/// That split is the point. A kernel resolved lazily on first use is invisible to any check that
+/// only sees what ran, which is how `bge-base`'s `512x800x3072_64x32x96_8c_modalsilu` survived an
+/// install preflight and killed the service at first request instead.
+///
+/// `NPU_ENC_GELU_FUSED` is an input here, not a detail: it changes which artifact must exist, so an
+/// enumeration that ignores it answers for a different configuration than the one that will run.
+pub fn xclbin_stem(shape: &CtxAShape, cfg: &crate::tuning::TuningConfig) -> String {
+    xclbin_stem_with(shape, cfg, std::env::var("NPU_ENC_GELU_FUSED").is_ok())
+}
+
+/// [`xclbin_stem`] with the environment made an argument. The env read is a real input -- it decides
+/// which artifact must exist -- so it belongs in the signature, not read from ambient state inside a
+/// function whose whole value is being pure and enumerable.
+pub fn xclbin_stem_with(
+    shape: &CtxAShape,
+    cfg: &crate::tuning::TuningConfig,
+    gelu_fused: bool,
+) -> String {
+    let prec = cfg.precision;
+    let (mt, kt, nt) = shape.tile.unwrap_or_else(|| prec.tile());
+    if prec.is_int8() && cfg.int8_onchip_dequant {
+        format!("{PAD_M}x{}x{}_{mt}x{kt}x{nt}_8c_modalint8dq", shape.ka, shape.na)
+    } else if !prec.is_int8() && cfg.modal_epilogue {
+        let tag = if gelu_fused { "modalgelu" } else { "modalsilu" };
+        format!("{PAD_M}x{}x{}_{mt}x{kt}x{nt}_8c_{tag}{}", shape.kaug(), shape.na, prec.nat_tag())
+    } else {
+        format!("{PAD_M}x{}x{}_{mt}x{kt}x{nt}_8c", shape.ka, shape.na)
+    }
+}
+
 impl SharedCtxA {
     /// The shape this context serves.
     pub fn shape(&self) -> &CtxAShape { &self.shape }
@@ -328,21 +361,7 @@ impl SharedCtxA {
         }
         // ONE resident kernel = the largest (N=3072) whole-array program; every op runs on it via its
         // per-N (and, modal, per-mode) instruction stream.
-        let xclbin = if modal_int8 {
-            let (ka, na) = (shape.ka, shape.na);
-            crate::kernel_registry::xclbin_path(&wa, &format!("{PAD_M}x{ka}x{na}_{mt}x{kt}x{nt}_8c_modalint8dq"))
-        } else if modal {
-            // Default = the proven 2-branch modalsilu xclbin (rtp[0]: 0=identity, 1=silu). NPU_ENC_GELU_FUSED
-            // opts into the 3-branch modalgelu superset (adds rtp[0]=2 = on-chip GELU for the Whisper encoder
-            // fc1 fusion); silu/identity behavior is unchanged (validated baseline-identical without fusion).
-            let tag = if std::env::var("NPU_ENC_GELU_FUSED").is_ok() { "modalgelu" } else { "modalsilu" };
-            let nat = prec.nat_tag();
-            let (kaug, na) = (shape.kaug(), shape.na);
-            crate::kernel_registry::xclbin_path(&wa, &format!("{PAD_M}x{kaug}x{na}_{mt}x{kt}x{nt}_8c_{tag}{nat}"))
-        } else {
-            let (ka, na) = (shape.ka, shape.na);
-            crate::kernel_registry::xclbin_path(&wa, &format!("{PAD_M}x{ka}x{na}_{mt}x{kt}x{nt}_8c"))
-        };
+        let xclbin = crate::kernel_registry::xclbin_path(&wa, &xclbin_stem(&shape, cfg));
         let kern = dev
             .load_kernel(xclbin.to_str().unwrap(), None)
             .unwrap_or_else(|e| panic!("load {}: {e}", xclbin.display()));
@@ -1602,7 +1621,48 @@ impl SharedCtxA {
 
 #[cfg(test)]
 mod tests {
-    use super::{CtxAShape, Precision};
+    use super::{xclbin_stem_with, CtxAShape, Precision, PAD_M};
+    use crate::tuning::TuningConfig;
+
+    /// The stem is what decides which artifact must exist, so pin every branch of it. This is a
+    /// regression pin on a real outage: on 2026-09-05 `bge-base` asked for
+    /// `512x800x3072_64x32x96_8c_modalsilu` at FIRST REQUEST -- past the install preflight, past
+    /// service start -- because nothing enumerated the set before something tried to load it.
+    #[test]
+    fn stem_pins_every_branch_including_the_one_that_broke_the_service() {
+        let shape = CtxAShape { ka: 768, na: 3072, mm2_out: 768, streams: vec![768, 1536, 3072],
+                                tile: Some((64, 32, 96)), ..CtxAShape::default() };
+        let mut cfg = TuningConfig::baked_default(Precision::FastBf16);
+        cfg.modal_epilogue = true;
+
+        // the artifact bge-base actually loads
+        assert_eq!(xclbin_stem_with(&shape, &cfg, false), "512x800x3072_64x32x96_8c_modalsilu");
+        // NPU_ENC_GELU_FUSED is an INPUT: it selects a different artifact, so an enumeration that
+        // ignores it answers for a configuration that will not run.
+        assert_eq!(xclbin_stem_with(&shape, &cfg, true), "512x800x3072_64x32x96_8c_modalgelu");
+
+        // non-modal: no K-aug, so ka not kaug
+        cfg.modal_epilogue = false;
+        assert_eq!(xclbin_stem_with(&shape, &cfg, false), "512x768x3072_64x32x96_8c");
+
+        // native carries the nat tag; int8 + on-chip dequant is its own artifact
+        cfg.modal_epilogue = true;
+        cfg.precision = Precision::NativeBf16;
+        assert_eq!(xclbin_stem_with(&shape, &cfg, false), "512x800x3072_64x32x96_8c_modalsilunat");
+        cfg.precision = Precision::Int8;
+        cfg.int8_onchip_dequant = true;
+        assert_eq!(xclbin_stem_with(&shape, &cfg, false), "512x768x3072_64x32x96_8c_modalint8dq");
+    }
+
+    /// `xclbin_stem` must be the ONLY place a stem is spelled: the drift it exists to kill is a
+    /// second `format!` that agrees today.
+    #[test]
+    fn stem_is_pure_and_needs_no_device() {
+        let a = xclbin_stem_with(&CtxAShape::default(), &TuningConfig::baked_default(Precision::FastBf16), false);
+        let b = xclbin_stem_with(&CtxAShape::default(), &TuningConfig::baked_default(Precision::FastBf16), false);
+        assert_eq!(a, b);
+        assert!(a.starts_with(&format!("{PAD_M}x")), "{a}");
+    }
 
     #[test]
     fn only_native_carries_the_nat_tag() {
