@@ -255,6 +255,11 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
     # num_batches=Hq, not Hq separate invocations. transpose/design.py's L3 tensors already hold
     # "num_batches contiguous (M,N) matrices stacked along the row dimension", which is EXACTLY what
     # vr/vt are; calling it per head issued 448 configure+run pairs per token to do 28 ops' work.
+    #
+    # It is NOT a speed fix and must not be quoted as one. Isolated on device against the same
+    # placer: -0.01 ms/token, 0.0%. Dropping 420 dispatches per token is worth nothing measurable,
+    # because these are mode selections inside ONE hardware context. Kept because it is correct,
+    # free, and 2.2 MB smaller in the ELF -- not because it is faster.
     op_trv = Transpose(M=S, N=HD, num_aie_columns=2, num_channels=1, m=256, n=32, s=8,
                        num_batches=Hq, context=ctx)
     op_ctx = gemv(HD, S, ctx, num_batches=Hq)
@@ -359,6 +364,9 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
     # deep in two columns, which is what the default column-major SequentialPlacer does. Every op
     # here has <= 8 workers, so one per column fits the 8-column array. Overridable because this is
     # a placement experiment, not a settled default.
+    #
+    # THIS is the whole measured win: -11.14 ms/token, -7.1%, isolated on device with the transpose
+    # batching held constant and DDR bytes identical at 3105.99 MB in every arm.
     placer_flags = os.environ.get("DECODE_PLACER_FLAGS", "--cores-per-col 1").split()
     fused = OperatorSequence(f"{sp.name.replace('-','_').replace('.','_')}_decode", rl,
                               input_args=inputs, output_args=["logits"],
