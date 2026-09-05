@@ -73,12 +73,18 @@ pub enum Cmd {
     /// usage error, so the CLI rejected inputs the HTTP route accepted.
     Embed { #[arg(allow_hyphen_values = true)] text: String, #[arg(long)] model: Option<String> },
     /// One-shot text generation, streamed to stdout by default.
+    /// The prompt goes through the model's chat template, so an instruction-tuned model answers it
+    /// and stops. `--raw` sends the bytes verbatim instead, which is `/v1/completions` semantics:
+    /// pure continuation, and on a chat-tuned model that means it rambles until max_tokens because
+    /// nothing in the prompt ever gives it a turn to end.
     Generate {
         #[arg(allow_hyphen_values = true)] prompt: String,
         #[arg(long)] model: Option<String>,
         #[command(flatten)] sampling: SamplingArgs,
         /// Print the whole completion at once instead of streaming it token by token.
         #[arg(long)] no_stream: bool,
+        /// Send the prompt verbatim, with no chat template -- raw continuation.
+        #[arg(long)] raw: bool,
     },
     /// Interactive chat REPL: reads a line from stdin, streams the reply, keeps history across
     /// turns. Ctrl-D exits.

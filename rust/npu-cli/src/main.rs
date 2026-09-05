@@ -32,8 +32,8 @@ fn main() -> Result<()> {
     match &cli.cmd {
         Cmd::Serve { port, allow_degraded } => serve(&path, *port, *allow_degraded),
         Cmd::Transcribe { input, model } => transcribe(&path, input, model.as_deref()),
-        Cmd::Generate { prompt, model, sampling, no_stream } =>
-            generate(&path, prompt, model.as_deref(), sampling, *no_stream),
+        Cmd::Generate { prompt, model, sampling, no_stream, raw } =>
+            generate(&path, prompt, model.as_deref(), sampling, *no_stream, *raw),
         Cmd::Chat { model, sampling, no_stream } => chat(&path, model.as_deref(), sampling, *no_stream),
         Cmd::Embed { text, model } => embed(&path, text, model.as_deref()),
         Cmd::Diarize { wav, model, json } => diarize(&path, wav, model.as_deref(), *json),
@@ -285,15 +285,38 @@ fn drain_generation(rx: std::sync::mpsc::Receiver<StreamItem>, stream: bool) -> 
     }
 }
 
-fn generate(path: &Path, prompt: &str, model: Option<&str>, sampling: &SamplingArgs, no_stream: bool)
-    -> Result<()> {
+/// Chat-templated by default, raw only on request.
+///
+/// `Prompt::Raw` sends the bytes verbatim, which is the right semantics for `/v1/completions` and
+/// the wrong DEFAULT for a CLI: an instruction-tuned model never sees a turn open, so it never
+/// emits the token that closes one and runs to max_tokens producing drift. Observed on
+/// `npu generate 'Привет!'` -- 256 tokens of invented statistics homework, in three languages,
+/// with a YouTube link. The stop machinery was working; the prompt simply never gave it a stop to
+/// find.
+fn generate(path: &Path, prompt: &str, model: Option<&str>, sampling: &SamplingArgs,
+            no_stream: bool, raw: bool) -> Result<()> {
     quiet_one_shot();
     let cfg = load_cfg(path)?;
     let root = root(&cfg, path)?;
     let (handle, join) = start_lazy(cfg, Box::new(EngineLoader { root }))?;
     let params = build_params(sampling);
-    let result = handle.generate(model, npu_engine::Prompt::Raw(prompt.to_string()), params)
-        .map_err(|e| anyhow!(e.to_string()))
+    let prompt = if raw {
+        npu_engine::Prompt::Raw(prompt.to_string())
+    } else {
+        npu_engine::Prompt::Chat(vec![npu_engine::ChatMessage {
+            role: "user".to_string(),
+            content: prompt.to_string(),
+        }])
+    };
+    let result = handle.generate(model, prompt, params)
+        .map_err(|e| {
+            // A base LM with no chat template is a legitimate case; name the flag rather than
+            // silently answering a different request than the one that was sent.
+            let e = e.to_string();
+            if e.contains("chat_template") {
+                anyhow!("{e}\n  this model has no chat template -- use `npu generate --raw`")
+            } else { anyhow!(e) }
+        })
         .and_then(|served| drain_generation(served.value, !no_stream));
     handle.shutdown(); let _ = join.join();
     let text = result?;
@@ -757,13 +780,17 @@ mod tests {
             "--stop", "STOP", "--seed", "3", "--no-stream",
         ]).expect("must parse");
         match cli.cmd {
-            Cmd::Generate { prompt, sampling, no_stream, model } => {
+            Cmd::Generate { prompt, sampling, no_stream, model, raw } => {
                 assert_eq!(prompt, "- a bullet point");
                 assert_eq!(sampling.temperature, Some(0.5));
                 assert_eq!(sampling.stop, vec!["END".to_string(), "STOP".to_string()]);
                 assert_eq!(sampling.seed, Some(3));
                 assert!(no_stream);
                 assert_eq!(model, None);
+                // Chat-templated unless asked otherwise. Raw is `/v1/completions` semantics and
+                // the wrong CLI default: a chat-tuned model never sees a turn open, so it never
+                // emits the token that closes one and runs to max_tokens.
+                assert!(!raw, "generate must default to the chat template, not raw continuation");
             }
             _ => panic!("expected Cmd::Generate"),
         }
