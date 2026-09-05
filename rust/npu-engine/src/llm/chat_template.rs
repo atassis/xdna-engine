@@ -29,6 +29,19 @@ impl ChatTemplate {
     /// `tools` is always an empty list -- tool-calling is out of scope for this milestone, so the
     /// template's `{% if tools %}` branch is never taken.
     pub fn render(&self, messages: &[ChatMessage], add_generation_prompt: bool) -> Result<String, EngineError> {
+        self.render_with(messages, add_generation_prompt, None)
+    }
+
+    /// `render` plus `enable_thinking`, the template kwarg the reasoning-model families read.
+    /// `None` leaves the variable UNDEFINED rather than passing a default: Qwen3's template tests
+    /// `enable_thinking is defined and enable_thinking is false`, so a defaulted `true` and an
+    /// absent variable are the same prompt, and only `false` is a real instruction.
+    pub fn render_with(
+        &self,
+        messages: &[ChatMessage],
+        add_generation_prompt: bool,
+        enable_thinking: Option<bool>,
+    ) -> Result<String, EngineError> {
         let mut env = Environment::new();
         env.set_unknown_method_callback(pycompat_method);
         env.add_template("chat", &self.source)
@@ -41,10 +54,18 @@ impl ChatTemplate {
             .iter()
             .map(|m| Value::from_iter([("role", Value::from(m.role.clone())), ("content", Value::from(m.content.clone()))]))
             .collect();
-        let ctx = context! {
-            messages => msgs,
-            add_generation_prompt => add_generation_prompt,
-            tools => Value::from(Vec::<Value>::new()),
+        let ctx = match enable_thinking {
+            Some(t) => context! {
+                messages => msgs,
+                add_generation_prompt => add_generation_prompt,
+                tools => Value::from(Vec::<Value>::new()),
+                enable_thinking => t,
+            },
+            None => context! {
+                messages => msgs,
+                add_generation_prompt => add_generation_prompt,
+                tools => Value::from(Vec::<Value>::new()),
+            },
         };
         tmpl.render(ctx).map_err(|e| EngineError::Load(format!("chat template render: {e}")))
     }
@@ -199,13 +220,45 @@ mod tests {
         assert_eq!(out3, "<|im_start|>user\nBare raw<|im_end|>\n");
     }
 
+    /// The same tokenizer dir `scenarios/generate-qwen3-0.6b.toml` names, so the test and the
+    /// shipped scenario cannot point at different snapshots of the template they both depend on.
     fn qwen3_tokenizer_config_path() -> PathBuf {
         if let Ok(dir) = std::env::var("QWEN3_TOKENIZER_DIR") {
             return PathBuf::from(dir).join("tokenizer_config.json");
         }
-        PathBuf::from(
-            "/mnt/data/cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/\
-             c1899de289a04d12100db370d81485cdf75e47ca/tokenizer_config.json",
-        )
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap().parent().unwrap()
+            .join("artifacts/qwen3-0.6b/tokenizer/tokenizer_config.json")
+    }
+
+    /// `enable_thinking` is the one template kwarg that changes what the model DOES, and leaving it
+    /// unset is not neutral: Qwen3 then reasons, and at the 256-token default it spends the whole
+    /// budget in `<think>` and never emits an answer. Measured over HTTP 2026-09-05 on
+    /// "What is 2+2?": 256 completion tokens, `finish_reason: length`, no `</think>` at all.
+    ///
+    /// The template's own test is `enable_thinking is defined and enable_thinking is false`, so
+    /// this also pins the asymmetry: `None` and `Some(true)` MUST render identically, and only
+    /// `Some(false)` may differ. A defaulted `true` would have looked like it worked.
+    #[test]
+    fn enable_thinking_false_is_the_only_value_that_changes_the_qwen3_prompt() {
+        let path = qwen3_tokenizer_config_path();
+        if !path.exists() {
+            eprintln!("SKIP: {} missing -- `huggingface-cli download Qwen/Qwen3-0.6B` recreates it", path.display());
+            return;
+        }
+        let cfg: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let tmpl = ChatTemplate::new(cfg["chat_template"].as_str().unwrap().to_string());
+        let msgs = [msg("user", "What is 2+2?")];
+
+        let unset = tmpl.render_with(&msgs, true, None).unwrap();
+        let on = tmpl.render_with(&msgs, true, Some(true)).unwrap();
+        let off = tmpl.render_with(&msgs, true, Some(false)).unwrap();
+
+        assert_eq!(unset, on, "an undefined kwarg and an explicit true are the same prompt");
+        assert_ne!(unset, off, "enable_thinking=false must change the prompt");
+        assert!(off.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"),
+                "thinking-off pre-fills an empty think block, got {off:?}");
+        assert!(!on.contains("<think>"), "thinking-on leaves the block to the model, got {on:?}");
     }
 }

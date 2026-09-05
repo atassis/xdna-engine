@@ -743,6 +743,21 @@ pub mod parse {
         if let Some(x) = v.get("presence_penalty") { p.presence_penalty = as_f32(x, "presence_penalty")?; }
         if let Some(x) = v.get("frequency_penalty") { p.frequency_penalty = as_f32(x, "frequency_penalty")?; }
         if let Some(x) = v.get("repetition_penalty") { p.repetition_penalty = as_f32(x, "repetition_penalty")?; }
+        // `chat_template_kwargs` is the spelling vLLM and SGLang use, and the one reasoning models
+        // are driven by in practice. Honour `enable_thinking`; 400 on any other key rather than
+        // accept it silently -- an ignored template kwarg changes the PROMPT, which is the "answer
+        // a request other than the one that was sent" case `reject_unsupported` exists for.
+        if let Some(k) = v.get("chat_template_kwargs") {
+            let obj = k.as_object().ok_or("\"chat_template_kwargs\" must be an object")?;
+            for (key, val) in obj {
+                match key.as_str() {
+                    "enable_thinking" => p.enable_thinking = Some(val.as_bool()
+                        .ok_or("\"chat_template_kwargs.enable_thinking\" must be a boolean")?),
+                    other => return Err(format!(
+                        "\"chat_template_kwargs.{other}\" is not supported")),
+                }
+            }
+        }
         p.stop = match v.get("stop") {
             None | Some(serde_json::Value::Null) => Vec::new(),
             Some(serde_json::Value::String(s)) => vec![s.clone()],
@@ -1393,6 +1408,45 @@ mod generate_tests {
         h.shutdown(); j.join().unwrap();
     }
 
+    /// `chat_template_kwargs.enable_thinking` is the spelling vLLM and SGLang accept, and the one
+    /// thing standing between a Qwen3 chat request and an answer: unset, the model reasons, and at
+    /// the 256-token default it never leaves `<think>`. Absent leaves `None` -- the template's own
+    /// default -- rather than a substituted `true`, which for Qwen3 is the same prompt but would
+    /// hide the distinction from anything reading these params.
+    #[test]
+    fn chat_template_kwargs_enable_thinking_round_trips_and_defaults_to_unset() {
+        for (body, want) in [
+            (r#"{"messages":[{"role":"user","content":"hi"}],"chat_template_kwargs":{"enable_thinking":false}}"#, Some(false)),
+            (r#"{"messages":[{"role":"user","content":"hi"}],"chat_template_kwargs":{"enable_thinking":true}}"#, Some(true)),
+            (r#"{"messages":[{"role":"user","content":"hi"}]}"#, None),
+        ] {
+            let (h, j, _d, p, _sent, seen) = gen_handle(ss(&["ok"]), Duration::ZERO);
+            let (code, resp) = route(&post("/v1/chat/completions", body), &h, &p);
+            assert_eq!(code, 200, "{resp}");
+            let (_, params) = seen.lock().unwrap().clone().unwrap();
+            assert_eq!(params.enable_thinking, want, "body: {body}");
+            h.shutdown(); j.join().unwrap();
+        }
+    }
+
+    /// An unhonoured template kwarg changes the PROMPT, so it must 400 rather than be dropped --
+    /// the same rule `reject_unsupported` enforces for `n`/`logprobs`/`tools`. Before this, the
+    /// whole `chat_template_kwargs` object was silently ignored, so a client asking for
+    /// thinking-off got thinking-on and a 200.
+    #[test]
+    fn an_unknown_or_ill_typed_template_kwarg_is_a_400_not_a_silent_drop() {
+        for body in [
+            r#"{"messages":[{"role":"user","content":"hi"}],"chat_template_kwargs":{"nonesuch":1}}"#,
+            r#"{"messages":[{"role":"user","content":"hi"}],"chat_template_kwargs":{"enable_thinking":"no"}}"#,
+            r#"{"messages":[{"role":"user","content":"hi"}],"chat_template_kwargs":7}"#,
+        ] {
+            let (h, j, _d, p, _sent, _seen) = gen_handle(ss(&["ok"]), Duration::ZERO);
+            let (code, resp) = route(&post("/v1/chat/completions", body), &h, &p);
+            assert_eq!(code, 400, "body {body} should be rejected, got {resp}");
+            h.shutdown(); j.join().unwrap();
+        }
+    }
+
     #[test]
     fn openai_defaults_apply_when_fields_are_absent() {
         let (h, j, _d, p, _sent, seen) = gen_handle(ss(&["ok"]), Duration::ZERO);
@@ -1407,6 +1461,7 @@ mod generate_tests {
         assert_eq!(params.max_tokens, 256);
         assert!(params.stop.is_empty());
         assert_eq!(params.seed, None);
+        assert_eq!(params.enable_thinking, None, "absent kwarg must not become a substituted true");
         h.shutdown(); j.join().unwrap();
     }
 

@@ -241,6 +241,13 @@ fn build_params(s: &SamplingArgs) -> npu_engine::GenerateParams {
     if let Some(t) = s.max_tokens { p.max_tokens = t; }
     if !s.stop.is_empty() { p.stop = s.stop.clone(); }
     p.seed = s.seed;
+    // Neither flag leaves the template's own default -- `None`, not a defaulted `true`, because for
+    // Qwen3 those are the same prompt and only an explicit `false` is an instruction.
+    p.enable_thinking = match (s.think, s.no_think) {
+        (true, false) => Some(true),
+        (false, true) => Some(false),
+        _ => None,
+    };
     p
 }
 
@@ -594,7 +601,7 @@ mod tests {
     fn build_params_with_no_flags_is_the_engine_default() {
         let s = cli_def::SamplingArgs {
             temperature: None, top_p: None, top_k: None, max_tokens: None,
-            stop: vec![], seed: None,
+            stop: vec![], seed: None, think: false, no_think: false,
         };
         let p = build_params(&s);
         let d = npu_engine::GenerateParams::default();
@@ -610,7 +617,7 @@ mod tests {
     fn build_params_applies_every_flag() {
         let s = cli_def::SamplingArgs {
             temperature: Some(0.4), top_p: Some(0.9), top_k: Some(50), max_tokens: Some(64),
-            stop: vec!["END".into(), "STOP".into()], seed: Some(7),
+            stop: vec!["END".into(), "STOP".into()], seed: Some(7), think: false, no_think: true,
         };
         let p = build_params(&s);
         assert_eq!(p.temperature, 0.4);
@@ -619,6 +626,44 @@ mod tests {
         assert_eq!(p.max_tokens, 64);
         assert_eq!(p.stop, vec!["END".to_string(), "STOP".to_string()]);
         assert_eq!(p.seed, Some(7));
+        assert_eq!(p.enable_thinking, Some(false));
+    }
+
+    /// Neither flag must leave `None`, not a substituted `true`. Qwen3's template branches on
+    /// `enable_thinking is defined and ... is false`, so `None` and `Some(true)` render the same
+    /// prompt -- which is exactly why a defaulted `true` would pass every prompt-level check and
+    /// still be the wrong value to hand a model whose template default is not thinking-on.
+    #[test]
+    fn think_flags_map_to_a_tri_state_and_neither_flag_leaves_the_template_default() {
+        let base = |think, no_think| cli_def::SamplingArgs {
+            temperature: None, top_p: None, top_k: None, max_tokens: None,
+            stop: vec![], seed: None, think, no_think,
+        };
+        assert_eq!(build_params(&base(false, false)).enable_thinking, None);
+        assert_eq!(build_params(&base(true, false)).enable_thinking, Some(true));
+        assert_eq!(build_params(&base(false, true)).enable_thinking, Some(false));
+    }
+
+    /// `--think` and `--no-think` override each other rather than erroring, so the last one on the
+    /// command line wins -- the shape a shell alias or a wrapper script needs.
+    #[test]
+    fn think_and_no_think_are_last_one_wins() {
+        let cli = Cli::try_parse_from(["npu", "generate", "hi", "--think", "--no-think"]).unwrap();
+        match &cli.cmd {
+            Cmd::Generate { sampling, .. } => {
+                assert!(sampling.no_think && !sampling.think);
+                assert_eq!(build_params(sampling).enable_thinking, Some(false));
+            }
+            _ => panic!("expected Cmd::Generate"),
+        }
+        let cli = Cli::try_parse_from(["npu", "chat", "--no-think", "--think"]).unwrap();
+        match &cli.cmd {
+            Cmd::Chat { sampling, .. } => {
+                assert!(sampling.think && !sampling.no_think);
+                assert_eq!(build_params(sampling).enable_thinking, Some(true));
+            }
+            _ => panic!("expected Cmd::Chat"),
+        }
     }
 
     /// `generate`'s clap definition: a free-text positional with hyphen values allowed (prose starts

@@ -31,7 +31,11 @@ pub trait DecodeStep {
 /// `Prompt::Raw` tokenizes directly. The returned length is the TRUE tokenized prompt length --
 /// never recover it later by filtering EOS out of a padded buffer: EOS doubles as the chat
 /// template's own turn separator, so that recovery undercounts and desyncs every position after it.
-pub fn tokenize_prompt(cfg: &ModelConfig, prompt: &Prompt) -> Result<Vec<u32>, EngineError> {
+pub fn tokenize_prompt(
+    cfg: &ModelConfig,
+    prompt: &Prompt,
+    enable_thinking: Option<bool>,
+) -> Result<Vec<u32>, EngineError> {
     let (text, add_special_tokens) = match prompt {
         Prompt::Chat(messages) => {
             let tmpl = cfg
@@ -40,7 +44,7 @@ pub fn tokenize_prompt(cfg: &ModelConfig, prompt: &Prompt) -> Result<Vec<u32>, E
                 .ok_or_else(|| EngineError::Unsupported("model has no chat_template for Prompt::Chat".to_string()))?;
             // The template already writes out the literal special-token text (`<|im_start|>`, ...);
             // asking the tokenizer to ALSO add its own would duplicate them.
-            (tmpl.render(messages, true)?, false)
+            (tmpl.render_with(messages, true, enable_thinking)?, false)
         }
         Prompt::Raw(s) => (s.clone(), true),
     };
@@ -100,7 +104,7 @@ impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
         // Every generation starts from an empty context. The device backend's KV cache only
         // grows with `pos`, so without this each request continues the previous one's.
         self.decode.reset()?;
-        let prompt_ids = tokenize_prompt(&self.cfg, prompt)?;
+        let prompt_ids = tokenize_prompt(&self.cfg, prompt, params.enable_thinking)?;
         if prompt_ids.is_empty() {
             return Err(EngineError::Unsupported("prompt tokenized to zero tokens".to_string()));
         }

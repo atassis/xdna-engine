@@ -89,6 +89,11 @@ pub struct GenerateParams {
     pub max_tokens: u32,
     pub stop: Vec<String>,
     pub seed: Option<u64>,
+    /// `chat_template_kwargs.enable_thinking`, the one template kwarg the reasoning-model families
+    /// (Qwen3, and the same spelling in vLLM/SGLang) read. `None` leaves the template's own
+    /// default, which for Qwen3 is thinking ON -- and at the 256-token default that spends the
+    /// whole budget reasoning and never emits an answer. Only meaningful for `Prompt::Chat`.
+    pub enable_thinking: Option<bool>,
     pub presence_penalty: f32,
     pub frequency_penalty: f32,
     pub repetition_penalty: f32,
@@ -103,6 +108,7 @@ impl Default for GenerateParams {
             max_tokens: 256,
             stop: Vec::new(),
             seed: None,
+            enable_thinking: None,
             presence_penalty: 0.0,
             frequency_penalty: 0.0,
             repetition_penalty: 1.0,

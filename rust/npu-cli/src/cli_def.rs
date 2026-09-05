@@ -122,6 +122,12 @@ pub struct SamplingArgs {
     /// May be repeated: `--stop A --stop B`.
     #[arg(long)] pub stop: Vec<String>,
     #[arg(long)] pub seed: Option<u64>,
+    /// Reasoning models (Qwen3) default to emitting a `<think>` block. `--no-think` suppresses it;
+    /// without this flag the model's own template default applies, and at --max-tokens 256 that
+    /// default spends the entire budget reasoning and never reaches an answer.
+    #[arg(long, overrides_with = "think")] pub no_think: bool,
+    /// Force the `<think>` block on even if the model's template would omit it.
+    #[arg(long, overrides_with = "no_think")] pub think: bool,
 }
 
 /// Transcript output formats.
