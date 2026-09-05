@@ -90,6 +90,15 @@ for key in "${!owner[@]}"; do
   cp -f "${owner[$key]}/$(basename "$key")" "$DEST/$key" || err "copy failed: $key"
   n=$((n+1))
 done
+# The stamp goes in EVERY published family dir, not just the root. `check_toolchain_freshness`
+# takes the directory the runtime resolved -- `kernels/whole_array` -- and looks for the stamp
+# THERE, so a single root stamp reads as "no stamp" and the service refuses to start. Observed.
+# The root copy stays as the set-wide provenance; the per-family ones are what the gate reads, and
+# the publisher has already refused unless every source agreed on the pin, so they cannot disagree.
 printf '%s' "$stamp" > "$DEST/.toolchain-stamp"
+for fam in "$DEST"/*/; do
+  [ -d "$fam" ] || continue
+  printf '%s' "$stamp" > "$fam/.toolchain-stamp"
+done
 [ "$fail" -eq 0 ] || exit 1
 note "published $n file(s) -> $DEST  (pin $stamp)"
