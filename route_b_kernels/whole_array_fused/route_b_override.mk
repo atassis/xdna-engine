@@ -169,6 +169,13 @@ ${mlir_target}: ${srcdir}/${aie_py_src}
 #
 # MLIR_AIE_INSTANCE is content-addressed by the toolchain.lock hash, so the path IS the identity.
 toolchain_id := $(MLIR_AIE_INSTANCE) $(PEANO_INSTALL_DIR)
+# FORCE has no recipe and no prerequisites, so make always considers it out of date and every rule
+# depending on it re-runs. It was referenced below without ever being declared, which made the whole
+# build die at `No rule to make target 'FORCE'` -- so the rebuild has been impossible since 6abf92f
+# (2026-09-03 14:21), the day BEFORE the re-pin. That is why nothing was rebuilt after it.
+FORCE:
+.PHONY: FORCE
+
 build/.toolchain.stamp: FORCE
 	@mkdir -p ${@D}
 	@echo '$(toolchain_id)' | cmp -s - $@ || echo '$(toolchain_id)' > $@
