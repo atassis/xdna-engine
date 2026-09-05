@@ -584,7 +584,7 @@ enum FusedKern {
 const T_PAD: usize = 1536; // encoder positions padded to a %64,%16 multiple (matches gen_decode.py)
 
 /// (arena, byte-offset, byte-len) of a named buffer in the fused arenas (from meta.json layout).
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct BufLoc {
     arena: Arena,
     off: usize,
@@ -613,6 +613,55 @@ struct ProjOutElf {
     amax_checked: std::cell::Cell<usize>,
 }
 
+/// Parse meta.json's `layout`, and check the arena contract the per-token path depends on.
+///
+/// The fast path syncs only the input arena (`sync_input`) and reads back only the output arena, so a
+/// buffer it touches has to live in the arena that sync covers. Arena membership is data from
+/// meta.json and nothing checked it: move `x` into scratch and `sync_input` silently stops covering
+/// it, leaving the device to compute on the previous token's input. That is the defect measured on
+/// the Python rail (kb: first-dispatch-after-a-host-input-write-computes-on-the-previous-input); the
+/// Rust rail is spared by what the generator happens to emit, not by a check. This is the check.
+fn parse_layout(
+    meta: &serde_json::Value,
+    what: &str,
+    per_token_writes: &[&str],
+    per_token_reads: &[&str],
+) -> Result<HashMap<String, BufLoc>, EngineError> {
+    let mut layout = HashMap::new();
+    for (name, e) in meta["layout"].as_object().expect("layout") {
+        let arena = match e["type"].as_str().unwrap() {
+            "input" => Arena::Input,
+            "output" => Arena::Output,
+            "scratch" => Arena::Scratch,
+            o => panic!("bad arena type {o}"),
+        };
+        layout.insert(
+            name.clone(),
+            BufLoc { arena, off: e["offset"].as_u64().unwrap() as usize, len: e["len"].as_u64().unwrap() as usize },
+        );
+    }
+    let check = |name: &str, want: Arena| -> Result<(), EngineError> {
+        match layout.get(name) {
+            None => Err(EngineError::Load(format!(
+                "{what}: layout has no buffer {name:?}, which the per-token path touches"
+            ))),
+            Some(loc) if loc.arena != want => Err(EngineError::Load(format!(
+                "{what}: buffer {name:?} is in {:?} but the per-token path needs {want:?} -- \
+                 sync_input/sync_from_device would not cover it",
+                loc.arena
+            ))),
+            Some(_) => Ok(()),
+        }
+    };
+    for n in per_token_writes {
+        check(n, Arena::Input)?;
+    }
+    for n in per_token_reads {
+        check(n, Arena::Output)?;
+    }
+    Ok(layout)
+}
+
 impl ProjOutElf {
     fn load(dev: &Rc<Device>, dir: &Path, _w: &WhisperDecoderWeights) -> Result<Self, EngineError> {
         let elf = std::fs::read(dir.join("projout.elf"))
@@ -625,19 +674,12 @@ impl ProjOutElf {
         let usz = |k: &str| meta[k].as_u64().expect(k) as usize;
         let (in_sz, out_sz, scr_sz) = (usz("input_size"), usz("output_size"), usz("scratch_size"));
         let vocab = usz("vocab");
-        let mut layout = HashMap::new();
-        for (name, e) in meta["layout"].as_object().expect("projout layout") {
-            let arena = match e["type"].as_str().unwrap() {
-                "input" => Arena::Input,
-                "output" => Arena::Output,
-                "scratch" => Arena::Scratch,
-                o => panic!("bad arena type {o}"),
-            };
-            layout.insert(
-                name.clone(),
-                BufLoc { arena, off: e["offset"].as_u64().unwrap() as usize, len: e["len"].as_u64().unwrap() as usize },
-            );
+        let has_argmax = meta.get("argmax").and_then(|v| v.as_bool()).unwrap_or(false);
+        let mut per_token_reads: Vec<&str> = vec!["logits"];
+        if has_argmax {
+            per_token_reads.push("amax");
         }
+        let layout = parse_layout(&meta, "projout", &["x"], &per_token_reads)?;
         let arena = FusedArena::new(dev, in_sz, out_sz, scr_sz)
             .map_err(|e| EngineError::Load(format!("alloc projout arena: {e}")))?;
         for name in meta["weights"].as_array().expect("projout weights") {
@@ -662,7 +704,6 @@ impl ProjOutElf {
         arena.sync_input().map_err(|e| EngineError::Load(format!("sync projout input arena: {e}")))?;
         let kern = dev.load_elf_kernel(&elf, Some("main:sequence"))
             .map_err(|e| EngineError::Load(format!("register projout ELF: {e}")))?;
-        let has_argmax = meta.get("argmax").and_then(|v| v.as_bool()).unwrap_or(false);
         let cols = meta.get("cols").and_then(|v| v.as_u64()).unwrap_or(8) as usize;
         let vocab_pad = usz("vocab_pad");
         let amax_loc = if has_argmax { Some(layout["amax"]) } else { None };
@@ -911,19 +952,7 @@ impl FusedDecoder {
         let (in_sz, out_sz, scr_sz) = (usz("input_size"), usz("output_size"), usz("scratch_size"));
         let output = meta["output"].as_str().expect("output").to_string();
 
-        let mut layout = HashMap::new();
-        for (name, e) in meta["layout"].as_object().expect("layout") {
-            let arena = match e["type"].as_str().unwrap() {
-                "input" => Arena::Input,
-                "output" => Arena::Output,
-                "scratch" => Arena::Scratch,
-                o => panic!("bad arena type {o}"),
-            };
-            layout.insert(
-                name.clone(),
-                BufLoc { arena, off: e["offset"].as_u64().unwrap() as usize, len: e["len"].as_u64().unwrap() as usize },
-            );
-        }
+        let layout = parse_layout(&meta, "fused decode", &["x"], &[&output])?;
 
         let arena = FusedArena::new(dev, in_sz, out_sz, scr_sz)
             .map_err(|e| EngineError::Load(format!("alloc fused arenas: {e}")))?;
@@ -1679,19 +1708,7 @@ impl BatchedFusedDecoder {
         let t_enc = meta["dims"]["T"].as_u64().expect("dims.T") as usize;
         let t_pad = ((t_enc + 63) / 64) * 64;
 
-        let mut layout = HashMap::new();
-        for (name, e) in meta["layout"].as_object().expect("layout") {
-            let arena = match e["type"].as_str().unwrap() {
-                "input" => Arena::Input,
-                "output" => Arena::Output,
-                "scratch" => Arena::Scratch,
-                o => panic!("bad arena type {o}"),
-            };
-            layout.insert(
-                name.clone(),
-                BufLoc { arena, off: e["offset"].as_u64().unwrap() as usize, len: e["len"].as_u64().unwrap() as usize },
-            );
-        }
+        let layout = parse_layout(&meta, "batched fused decode", &["x"], &[&output])?;
         let arena = FusedArena::new(dev, in_sz, out_sz, scr_sz)
             .map_err(|e| EngineError::Load(format!("alloc batched fused arenas: {e}")))?;
         // static weights (skip per-utterance encoder-K/V + self-KV caches).
@@ -2017,4 +2034,43 @@ fn ln_row(x: &[f32], gamma: &Array1<f32>, beta: &Array1<f32>) -> Vec<f32> {
 fn gelu_row(x: &[f32]) -> Vec<f32> {
     let a = Array2::from_shape_vec((1, x.len()), x.to_vec()).unwrap();
     gelu(&a).into_raw_vec_and_offset().0
+}
+
+#[cfg(test)]
+mod layout_contract_tests {
+    use super::*;
+
+    fn meta(x_type: &str, out_type: &str) -> serde_json::Value {
+        serde_json::json!({"layout": {
+            "x":      {"type": x_type,   "offset": 0, "len": 1536},
+            "logits": {"type": out_type, "offset": 0, "len": 4096},
+            "L0_W":   {"type": "scratch","offset": 1536, "len": 64},
+        }})
+    }
+
+    #[test]
+    fn accepts_the_layout_the_fast_path_needs() {
+        let l = parse_layout(&meta("input", "output"), "t", &["x"], &["logits"]).unwrap();
+        assert_eq!(l["x"].arena, Arena::Input);
+        assert_eq!(l["L0_W"].arena, Arena::Scratch);
+    }
+
+    // The regression this exists for: sync_input covers only the input arena, so an `x` that moved
+    // into scratch leaves the device computing on the previous token's bytes -- silently.
+    #[test]
+    fn rejects_a_per_token_input_that_moved_to_scratch() {
+        let e = parse_layout(&meta("scratch", "output"), "t", &["x"], &["logits"]).unwrap_err();
+        let m = format!("{e:?}");
+        assert!(m.contains("is in Scratch") && m.contains("needs Input"), "{m}");
+    }
+
+    #[test]
+    fn rejects_a_per_token_output_outside_the_output_arena() {
+        parse_layout(&meta("input", "scratch"), "t", &["x"], &["logits"]).unwrap_err();
+    }
+
+    #[test]
+    fn rejects_a_buffer_the_layout_does_not_have() {
+        parse_layout(&meta("input", "output"), "t", &["x"], &["amax"]).unwrap_err();
+    }
 }
