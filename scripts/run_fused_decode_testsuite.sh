@@ -45,7 +45,7 @@ mkdir -p "$WT/artifacts"; : > "$LOG"
 # just falls through to the existing "absent — skipped" path below, same as before.
 ONNX_ASR_VENV="${ONNX_ASR_VENV:-}"
 if [ -z "$ONNX_ASR_VENV" ]; then
-  for v in "$WT/.venv" "${XDG_DATA_HOME:-$HOME/.local/share}/xdna-engine/onnx-asr-venv"; do
+  for v in "$WT/.venv" "${XDG_DATA_HOME:-$HOME/.local/share}/xdna-engine/onnx-asr-venv" "$HOME/npuvox-asr-bench/.venv"; do
     [ -x "$v/bin/python" ] && "$v/bin/python" -c "import onnx_asr" >/dev/null 2>&1 && { ONNX_ASR_VENV="$v"; break; }
   done
 fi

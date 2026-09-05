@@ -41,6 +41,10 @@ fn main() {
             std::env::var("ONNX_ASR_VENV").ok().map(PathBuf::from),
             Some(repo_root.join(".venv")),
             Some(Path::new(&home).join(".local/share/xdna-engine/onnx-asr-venv")),
+            // Legacy last resort: the venv this project was developed against. Kept as the
+            // LAST candidate, never the default -- dropping it entirely broke `cargo check`
+            // on the one machine where it does exist.
+            Some(Path::new(&home).join("npuvox-asr-bench/.venv")),
         ]
         .into_iter()
         .flatten()

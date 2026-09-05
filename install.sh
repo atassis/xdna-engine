@@ -48,8 +48,13 @@ REPO="$(dirname "$SCRIPT_PATH")"
 #   1. ./.venv                                          (repo-local; shared with EXPORT_VENV
 #                                                         below if one venv has everything)
 #   2. ${XDG_DATA_HOME:-~/.local/share}/xdna-engine/onnx-asr-venv   (documented convention)
+#   3. ~/npuvox-asr-bench/.venv                         (legacy; the venv this was developed
+#                                                         against -- last resort, never the
+#                                                         default, and the only reason it stays
+#                                                         is that removing it broke the build on
+#                                                         the machine where it does exist)
 ONNX_ASR_VENV="${ONNX_ASR_VENV:-}"
-ONNX_ASR_VENV_CANDIDATES="$REPO/.venv ${XDG_DATA_HOME:-$HOME/.local/share}/xdna-engine/onnx-asr-venv"
+ONNX_ASR_VENV_CANDIDATES="$REPO/.venv ${XDG_DATA_HOME:-$HOME/.local/share}/xdna-engine/onnx-asr-venv $HOME/npuvox-asr-bench/.venv"
 
 # Repo export venv (has onnx + onnxruntime). Used to (re)generate the
 # artifacts/encoder/ encoder weights via extract_encoder.py.

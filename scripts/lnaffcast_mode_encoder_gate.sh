@@ -50,7 +50,7 @@ MELS="${MELS:-$WT/artifacts/wer_mels}"
 # throwaway ~/npuvox-asr-bench/.venv).
 onnx_asr_venv="${ONNX_ASR_VENV:-}"
 if [ -z "$onnx_asr_venv" ]; then
-  for v in "$WT/.venv" "${XDG_DATA_HOME:-$HOME/.local/share}/xdna-engine/onnx-asr-venv"; do
+  for v in "$WT/.venv" "${XDG_DATA_HOME:-$HOME/.local/share}/xdna-engine/onnx-asr-venv" "$HOME/npuvox-asr-bench/.venv"; do
     [ -x "$v/bin/python" ] && "$v/bin/python" -c "import onnx_asr" >/dev/null 2>&1 && { onnx_asr_venv="$v"; break; }
   done
 fi
