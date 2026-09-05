@@ -1709,12 +1709,13 @@ mod tests {
     /// truncated the rest of the build. If upstream changes the rule, fail HERE rather than at the
     /// next missing-artifact panic.
     ///
-    /// Skips when the submodule is absent, so a checkout without `mlir-aie` does not fail; a test
-    /// that cannot see its subject must not claim to have checked it.
+    /// Reads the TRACKED Makefile, not the sandbox copy. It used to read the copy inside the
+    /// `mlir-aie` submodule and skip when that was absent -- which is every worktree, so the guard
+    /// had effectively never run. A test that silently skips is deleted for free.
     #[test]
     fn nat_tag_still_matches_the_makefile_rule() {
         let mk = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../mlir-aie/programming_examples/basic/matrix_multiplication/whole_array/Makefile.modal");
+            .join("../../designs/whole_array_fused/Makefile.modal");
         let src = match std::fs::read_to_string(&mk) {
             Ok(s) => s,
             Err(_) => { eprintln!("skip: {} absent", mk.display()); return; }
