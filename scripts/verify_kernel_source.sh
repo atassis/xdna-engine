@@ -94,7 +94,7 @@ _peano_remedy() {
 REPO="$(cd "$(dirname "$0")/.." && pwd)"; cd "$REPO"
 
 MMW=mlir-aie/programming_examples/basic/matrix_multiplication/whole_array
-RB_KERNELS=route_b_kernels/aie_kernels
+RB_KERNELS=aie_kernels
 # The TRACKED originals of the Makefiles sync_kernels.sh copies into $MMW. Ground truth for the
 # sandbox copies, which are untracked inside the submodule working tree.
 RB_MAKEFILES=route_b_kernels/whole_array_fused

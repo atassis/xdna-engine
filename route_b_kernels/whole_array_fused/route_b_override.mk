@@ -53,9 +53,11 @@ endif
 # content-addressed toolchain instance; resolving our own .cc files through it is what forced
 # sync_kernels.sh to copy 83 files into that store on every build, so the store stopped being what
 # its key says it is -- and verify_kernel_source.sh reads vendor ground truth from the same store.
-# Self-locating (this file sits in route_b_kernels/whole_array_fused/) so it is right for every
+# Self-locating so it is right for every Makefile that includes it, whatever its own srcdir
+# depth. NOTE the ../../ -- the kernels moved to the repo-root aie_kernels/ library, one
+# level further up than the old route_b_kernels/aie_kernels/.
 # Makefile that includes it, whatever its own srcdir depth.
-rb_kernels_dir := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))../aie_kernels)
+rb_kernels_dir := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))../../aie_kernels)
 
 # Our kernels include vendor headers by a path relative to the VENDOR tree
 # (mm_silu_epilogue.cc: #include "../aie_kernel_utils.h"). Compiled from rb_kernels_dir that
