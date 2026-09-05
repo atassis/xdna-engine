@@ -24,11 +24,14 @@ pub fn repo_root() -> PathBuf {
 pub fn bake_and_verify(label: &str, source: &str, arch: &str, refs: &Path) {
     let root = repo_root();
     let checkpoint = root.join(format!("target/test-checkpoints/{label}.safetensors"));
-    let spec = ModelSpec {
-        source: Source::parse(source).unwrap_or_else(|e| panic!("{label}: bad source: {e}")),
-        arch: arch.to_string(),
-        checkpoint: Some(checkpoint.clone()),
+    // A relative `path:` source resolves against the CWD, which under cargo is the crate dir, not
+    // the repo root -- so `path:models/...` baked ENOENT while the caller's own `root.join(...)`
+    // existence gate passed. Anchor it here, where `root` is already known.
+    let source = match Source::parse(source).unwrap_or_else(|e| panic!("{label}: bad source: {e}")) {
+        Source::Path(p) if p.is_relative() => Source::Path(root.join(p)),
+        other => other,
     };
+    let spec = ModelSpec { source, arch: arch.to_string(), checkpoint: Some(checkpoint.clone()) };
     spec.ensure_checkpoint(&root, true)
         .unwrap_or_else(|e| panic!("{label}: bake failed: {e}"));
     let loaded = checkpoint::load(&checkpoint, arch)
