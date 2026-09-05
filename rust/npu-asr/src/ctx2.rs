@@ -356,7 +356,7 @@ impl SharedCtxA {
     pub fn with_shape(dev: &Rc<Device>, root: &Path, cfg: &crate::tuning::TuningConfig,
                       shape: CtxAShape) -> Rc<Self> {
         let prec = cfg.precision;
-        let wa = root.join(WA_SUBDIR);
+        let wa = crate::kernel_registry::resolve_kernel_dir(root, WA_SUBDIR);
         // The tile is the precision's unless this shape's kernels were built at another one.
         let (mt, kt, nt) = shape.tile.unwrap_or_else(|| prec.tile());
         // Step-A modal on-chip epilogue: K-aug bias + on-chip SiLU, f32 out, one resident xclbin with

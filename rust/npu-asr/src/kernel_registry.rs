@@ -46,6 +46,37 @@ pub struct KernelArtifacts {
     pub insts: PathBuf,
 }
 
+/// The directory name an install publishes kernels into, flat and install-owned.
+pub const PUBLISHED_KERNELS_DIR: &str = "kernels";
+
+/// Where to look for a kernel: the install's published directory when it exists, else the legacy
+/// path inside the mlir-aie checkout.
+///
+/// The published directory is the destination. A production install should contain the artifacts an
+/// engine needs -- config, kernels, weights, binaries -- and not a compiler tree; today it holds a
+/// symlink to the mlir-aie checkout and resolves xclbins out of `programming_examples/`, which is
+/// also why a shipped service reads a dev-tree `toolchain.lock` for its freshness gate at all.
+///
+/// The legacy arm is kept so a developer checkout and the probe binaries keep working, and it is a
+/// FALLBACK rather than an alternative: it applies only when the published directory is absent, so
+/// an install cannot silently serve from a build tree it also has. Callers print the resolved path
+/// at load, which is what keeps the choice visible rather than a third arm nobody compares.
+pub fn resolve_kernel_dir(root: &Path, legacy_subdir: &str) -> PathBuf {
+    let published = root.join(PUBLISHED_KERNELS_DIR).join(kernel_family(legacy_subdir));
+    if published.is_dir() { published } else { root.join(legacy_subdir) }
+}
+
+/// The family name a legacy build path publishes under: the directory ABOVE `build`.
+///
+/// `.../ml/layernorm/build` -> `layernorm`. One subdirectory per family rather than one flat
+/// directory, because the runtime loads bare `final.xclbin` / `insts.bin` from dwconv1d
+/// (`engines.rs:453`) and parakeet (`npu.rs:997`), telling them apart by DIRECTORY -- and layernorm
+/// publishes files of those exact names. Flattening would silently pick one.
+fn kernel_family(legacy_subdir: &str) -> &str {
+    legacy_subdir.trim_end_matches('/').trim_end_matches("/build")
+        .rsplit('/').next().unwrap_or(legacy_subdir)
+}
+
 /// The xclbin path for a kernel identified by `stem` under `dir`: `dir/final_{stem}.xclbin`.
 pub fn xclbin_path(dir: &Path, stem: &str) -> PathBuf {
     dir.join(format!("final_{stem}.xclbin"))
@@ -447,6 +478,34 @@ pub fn check_toolchain_freshness(dir: &Path, repo_root: &Path) -> Result<(), Fre
 
 #[cfg(test)]
 mod tests {
+
+    /// The published directory wins when it exists; the legacy path applies only in its absence, so
+    /// an install carrying both cannot serve from the build tree by accident.
+    #[test]
+    fn published_kernels_win_over_the_legacy_checkout_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let legacy = "mlir-aie/programming_examples/ml/layernorm/build";
+        assert_eq!(resolve_kernel_dir(root, legacy), root.join(legacy),
+                   "with no published dir, fall back");
+        std::fs::create_dir_all(root.join(PUBLISHED_KERNELS_DIR).join("layernorm")).unwrap();
+        assert_eq!(resolve_kernel_dir(root, legacy), root.join("kernels/layernorm"),
+                   "published dir present -- it wins");
+    }
+
+    /// The family must match what `scripts/publish_kernels.sh` writes -- it derives the same name
+    /// from the same paths, in another language, and nothing else couples them.
+    #[test]
+    fn kernel_family_matches_what_the_publisher_writes() {
+        for (legacy, want) in [
+            ("mlir-aie/programming_examples/basic/matrix_multiplication/whole_array/build", "whole_array"),
+            ("mlir-aie/programming_examples/ml/layernorm/build", "layernorm"),
+            ("mlir-aie/programming_examples/ml/dwconv1d/build", "dwconv1d"),
+            ("mlir-aie/programming_examples/ml/mha_decode/build", "mha_decode"),
+        ] {
+            assert_eq!(super::kernel_family(legacy), want, "{legacy}");
+        }
+    }
     use super::*;
 
     // String-level parity: the registry must reproduce the exact paths the pre-refactor

@@ -372,7 +372,7 @@ impl CtxDecode {
         if let Some(ak) = self.attn_kernel.borrow().as_ref() {
             return Ok(Rc::clone(ak));
         }
-        let dir = self.root.join(MHA_DIR);
+        let dir = crate::kernel_registry::resolve_kernel_dir(&self.root, MHA_DIR);
         let stem = format!("mha_decode_{ATTN_S_MAX}");
         let crate::kernel_registry::KernelArtifacts { xclbin, insts } =
             crate::kernel_registry::resolve(&dir, &stem);

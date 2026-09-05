@@ -63,7 +63,7 @@ impl WAEpilogue {
         assert!(mode == "silu" || mode == "bias");
         let kaug = k + TILE;
         let suffix = format!("{PAD_M}x{kaug}x{n}_{TILE}x{TILE}x{TILE}_8c_{mode}");
-        let wa = root.join(WA_SUBDIR);
+        let wa = crate::kernel_registry::resolve_kernel_dir(root, WA_SUBDIR);
         let crate::kernel_registry::KernelArtifacts { xclbin, insts } =
             crate::kernel_registry::resolve(&wa, &suffix);
         let kern = dev
@@ -242,7 +242,7 @@ impl ChainedFFN {
         assert_eq!(w1.dim(), (k1, n1));
         assert_eq!(w2.dim(), (n1, n2));
         let kaug1 = k1 + TILE;
-        let wa = root.join(WA_SUBDIR);
+        let wa = crate::kernel_registry::resolve_kernel_dir(root, WA_SUBDIR);
 
         // --- mm1: silu epilogue xclbin (K-augmented) ---
         let suffix1 = format!("{PAD_M}x{kaug1}x{n1}_{TILE}x{TILE}x{TILE}_8c_silu");
@@ -449,7 +449,7 @@ pub struct DwconvEngine {
 
 impl DwconvEngine {
     pub fn new(dev: Rc<Device>, root: &Path, ch: usize, t: usize) -> Self {
-        let dw = root.join(DW_SUBDIR);
+        let dw = crate::kernel_registry::resolve_kernel_dir(root, DW_SUBDIR);
         let xclbin = dw.join("final.xclbin");
         let insts = dw.join("insts.bin");
         let kern = dev

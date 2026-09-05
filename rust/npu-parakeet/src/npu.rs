@@ -40,7 +40,7 @@ const KRES: usize = 1024; // resident kernel contraction dim
 /// `load_kernel` panic only fires once something already has the device open (and, before
 /// `feat/serve-fail-loud`, that panic did not even stop the service from reporting healthy).
 pub fn preflight(root: &Path) -> Result<(), String> {
-    let base = root.join(WA_SUBDIR);
+    let base = kernel_registry::resolve_kernel_dir(root, WA_SUBDIR);
     kernel_registry::check_toolchain_freshness(&base, root).map_err(|e| {
         format!(
             "resident encoder artifacts stale or missing: {e}\n  rebuild: \
@@ -838,7 +838,7 @@ impl NpuMatmul {
         // `load_kernel` ENOENT below.
         preflight(root).map_err(LoadError::StaleBuild)?;
         let dev = Device::open(0).map_err(LoadError::Device)?;
-        let base = root.join(WA_SUBDIR);
+        let base = kernel_registry::resolve_kernel_dir(root, WA_SUBDIR);
         let ln_dir = root.join("artifacts/parakeet/ln");
         // resident kernel tile: fast BFP16 64x32x128 (default) or native bf16 32x32x32 (NPU_NATIVE=1),
         // or the FOLD's 32x32x128 (see `fold_fc1`).
