@@ -231,6 +231,58 @@ mod tests {
         assert_eq!(rope_row(5, 128, 1_000_000.0).len(), 128);
     }
 
+    /// Diagnostic, NOT a device test: dump the exact `x`/`rope_global` BYTES this rail would write
+    /// for the failing teacher-forced step (device position 9, fed token 315 -- see
+    /// `device_teacher_forced_matches_oracle`'s doc comment) for an out-of-band byte-for-byte
+    /// compare against `verify_llm_decode.py`'s host computation. No device access -- `x`/
+    /// `rope_global` are pure functions of (token, pos, embed table, scale, theta), so this needs
+    /// only the embed `.npy` on disk. SKIPs if it is absent.
+    #[test]
+    fn dump_x_and_rope_bytes_for_the_failing_step() {
+        let weights_dir = std::path::Path::new(
+            "<workspace>/artifacts-qwen3-0.6b/weights",
+        );
+        let embed_path = weights_dir.join("model.embed_tokens.weight.npy");
+        if !embed_path.exists() {
+            eprintln!("SKIP: {} not found", embed_path.display());
+            return;
+        }
+        let out_dir = std::path::Path::new(
+            "/tmp/claude-1000/-home-atassis-repositories-ns-atassis-xdna-engine-workspace/57b4e007-4f99-4357-a109-fc028eef879e/scratchpad/byte_compare",
+        );
+        std::fs::create_dir_all(out_dir).unwrap();
+
+        let embed: Array2<f32> = ndarray_npy::read_npy(&embed_path).expect("read embed npy");
+        const TOKEN: usize = 315;
+        const POS: usize = 9;
+        const HEAD_DIM: usize = 128;
+        const THETA: f64 = 1_000_000.0;
+        let embed_scale = 1.0f32; // host_protocol.embed_scale == "none" for qwen3-0.6b
+
+        let raw_row: Vec<f32> = embed.row(TOKEN).iter().copied().collect();
+        let x: Vec<f32> = raw_row.iter().map(|&v| v * embed_scale).collect();
+        let x_bytes = pack_bf16_bytes(&x);
+        let rope = rope_row(POS, HEAD_DIM, THETA);
+        let rope_bytes = pack_bf16_bytes(&rope);
+
+        std::fs::write(out_dir.join("rust_embed_row_raw.bin"), bytemuck_f32_to_le_bytes(&raw_row)).unwrap();
+        std::fs::write(out_dir.join("rust_x_f32.bin"), bytemuck_f32_to_le_bytes(&x)).unwrap();
+        std::fs::write(out_dir.join("rust_x_bf16.bin"), &x_bytes).unwrap();
+        std::fs::write(out_dir.join("rust_rope_bf16.bin"), &rope_bytes).unwrap();
+
+        eprintln!("rust x_bytes len={}, rope_bytes len={}", x_bytes.len(), rope_bytes.len());
+        eprintln!("rust raw_row[:8]={:?}", &raw_row[..8]);
+        eprintln!("wrote rust_{{embed_row_raw,x_f32,x_bf16,rope_bf16}}.bin to {}", out_dir.display());
+    }
+
+    fn bytemuck_f32_to_le_bytes(v: &[f32]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(v.len() * 4);
+        for &f in v {
+            out.extend_from_slice(&f.to_le_bytes());
+        }
+        out
+    }
+
     // ---------------------------------------------------------------------------------------
     // Device gates. Plain `cargo test` (workspace or `-p npu-engine`) must NEVER touch
     // `/dev/accel/accel0` -- both tests below SKIP unless `NPU_LLM_DEVICE_GATE=1` is set, and the
@@ -337,14 +389,26 @@ mod tests {
     /// a second dispatch to get there (a stale coherence map on ITS rail, see the module doc); the
     /// Rust rail syncs unconditionally every token and should not need that workaround.
     ///
-    /// MEASURED 2026-09-05 on this rail: **7/8**, deterministic across 3 repeats -- the single miss
-    /// is at produced-index 5 (device position 9): oracle 15344 vs NPU 279, oracle margin 0.0203 (the
-    /// SAME step and margin the pre-fix merge recorded before the second-dispatch discovery raised
-    /// Python to 8/8). [`device_free_running_is_deterministic_across_five_runs`] rules out a race on
-    /// THIS rail (5/5 bit-identical), so this is not the coherence-map defect reappearing -- it is a
-    /// genuine bf16 knife-edge tie (`margin < 0.25` in `verify_llm_decode.py`'s own classification)
-    /// that this rail's numerics resolve the other way from the CPU f64 oracle. Left as a strict
-    /// assertion: a future run naming a DIFFERENT step/margin is the actual regression signal.
+    /// CORRECTED 2026-09-05 -- an initial reading of this gate was WRONG and is left here so the
+    /// mistake stays legible. Against the DEFAULT `NPU_LLM_DECODE_DIR`
+    /// (`artifacts-qwen3-0.6b/decode/`, built 2026-09-03 18:55) this gate scores **7/8**,
+    /// deterministic across 3 repeats, missing at produced-index 5 (device position 9): oracle
+    /// 15344 vs NPU 279, margin 0.0203. That was first read as "a genuine bf16 knife-edge tie this
+    /// rail's numerics resolve the other way from the CPU oracle" -- plausible (margin < 0.25 in
+    /// `verify_llm_decode.py`'s own classification) and WRONG. The control that decided it:
+    /// `route_b_kernels/decode_fused/gen_llm_decode.py` regenerated FRESH against the CURRENTLY
+    /// PINNED toolchain reaches **8/8** on this exact rail (no code changed here at all) --
+    /// `decode.elf` shrinks 22279888 -> 20952656 bytes, a real recompile, not container-metadata
+    /// noise. Root cause: `toolchain.lock`'s `MLIR_AIE_FORK_COMMIT` advanced 035528f71cf1
+    /// (upstream tip 2026-08-27) -> acecda2fc53e (2026-09-02) on 2026-09-04 10:38 -- AFTER the
+    /// artifact was frozen -- and that pin's own history notes this class of bump changes emitted
+    /// DMA/scheduling bytes even when it isn't a correctness fix. A ~6-day upstream advance
+    /// changing instruction scheduling is fully sufficient to flip a genuine 0.02-margin bf16 tie.
+    /// Host-side bytes were independently verified byte-identical against `verify_llm_decode.py`
+    /// (embed row, `x`, `rope_global`) before this was found, so the artifact vintage -- not this
+    /// rail's host code -- was the whole gap. Regenerate the default artifact to close it; until
+    /// then this gate is EXPECTED to read 7/8 against the stale default, and a run pointed at a
+    /// freshly generated decode dir is the one that must read 8/8.
     #[test]
     fn device_teacher_forced_matches_oracle() {
         let (decode_dir, weights_dir, oracle_path) = gate_paths();
