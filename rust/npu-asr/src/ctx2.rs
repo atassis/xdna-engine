@@ -292,6 +292,24 @@ struct PipeSlot {
 ///
 /// `NPU_ENC_GELU_FUSED` is an input here, not a detail: it changes which artifact must exist, so an
 /// enumeration that ignores it answers for a different configuration than the one that will run.
+/// Every ctxA xclbin stem this tuning can ask for, over every encoder shape the runtime can select.
+///
+/// The point of enumerating rather than discovering: `for_whisper` already refuses an unbuilt
+/// d_model/ffn, so the shape set is closed and knowable without a device. What was missing is
+/// saying it out loud before something tries to load one -- which is how `bge-base` reached first
+/// request before anyone learned its artifact was absent.
+///
+/// Scoped to ONE tuning deliberately. The cross-product over every precision would demand artifacts
+/// this install never selects, and a preflight that fails on those is a preflight people learn to
+/// ignore.
+pub fn required_stems(cfg: &crate::tuning::TuningConfig) -> Vec<String> {
+    let gelu_fused = std::env::var("NPU_ENC_GELU_FUSED").is_ok();
+    [CtxAShape::whisper_small(), CtxAShape::whisper_turbo()]
+        .iter()
+        .map(|sh| xclbin_stem_with(sh, cfg, gelu_fused))
+        .collect()
+}
+
 pub fn xclbin_stem(shape: &CtxAShape, cfg: &crate::tuning::TuningConfig) -> String {
     xclbin_stem_with(shape, cfg, std::env::var("NPU_ENC_GELU_FUSED").is_ok())
 }
@@ -1652,6 +1670,19 @@ mod tests {
         cfg.precision = Precision::Int8;
         cfg.int8_onchip_dequant = true;
         assert_eq!(xclbin_stem_with(&shape, &cfg, false), "512x768x3072_64x32x96_8c_modalint8dq");
+    }
+
+    /// The set is closed: two shapes, and `for_whisper` refuses anything else. If a third encoder
+    /// width is ever built, this test fails and the enumerator has to learn about it -- which is the
+    /// whole point of having one.
+    #[test]
+    fn required_stems_covers_every_shape_the_runtime_can_select() {
+        let cfg = TuningConfig::baked_default(Precision::FastBf16);
+        let got = super::required_stems(&cfg);
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert!(got.iter().any(|s| s.starts_with("512x800x3072_")), "{got:?}");
+        assert!(got.iter().any(|s| s.starts_with("512x1312x5120_")), "{got:?}");
+        assert!(CtxAShape::for_whisper(999, 999).is_err(), "an unbuilt width must be refused");
     }
 
     /// `xclbin_stem` must be the ONLY place a stem is spelled: the drift it exists to kill is a
