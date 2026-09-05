@@ -253,7 +253,11 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
     op_scale = ElementwiseMul(size=Hq * S, tile_size=S // COLS, num_aie_columns=COLS, context=ctx)
     op_softmax = Softmax(rows=Hq, cols=S, num_aie_columns=1, num_channels=1, rtp_vector_size=S,
                          vector_size_parameter="sm_mask", context=ctx)
-    op_trv = Transpose(M=S, N=HD, num_aie_columns=2, num_channels=1, m=256, n=32, s=8, context=ctx)
+    # num_batches=Hq, not Hq separate invocations. transpose/design.py's L3 tensors already hold
+    # "num_batches contiguous (M,N) matrices stacked along the row dimension", which is EXACTLY what
+    # vr/vt are; calling it per head issued 448 configure+run pairs per token to do 28 ops' work.
+    op_trv = Transpose(M=S, N=HD, num_aie_columns=2, num_channels=1, m=256, n=32, s=8,
+                       num_batches=Hq, context=ctx)
     op_ctx = gemv(HD, S, ctx, num_batches=Hq)
     op_gate = gemv(FF, D, ctx)
     op_up = gemv(FF, D, ctx)
@@ -314,8 +318,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
             (op_scores, p + "kr", p + "q", p + "sc"),
             (op_scale, p + "sc", "attn_scale", p + "sc"),
             (op_softmax, p + "sc", p + "sw"),
-            *[(op_trv, f"{p}vr[{h*S*HD*2}:{(h+1)*S*HD*2}]", f"{p}vt[{h*S*HD*2}:{(h+1)*S*HD*2}]")
-              for h in range(Hq)],
+            (op_trv, p + "vr", p + "vt"),
             (op_ctx, p + "vt", p + "sw", p + "cx"),
             (op_o, p + "Wo", p + "cx", p + "a"),
         ]
@@ -353,9 +356,14 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
         raise SystemExit(0)
 
     inputs = ["x", "rope_global"] + (["rope_local"] if sp.rope_theta_local is not None else [])
+    # cores-per-col=1 spreads each operator's workers one per column instead of stacking them four
+    # deep in two columns, which is what the default column-major SequentialPlacer does. Every op
+    # here has <= 8 workers, so one per column fits the 8-column array. Overridable because this is
+    # a placement experiment, not a settled default.
+    placer_flags = os.environ.get("DECODE_PLACER_FLAGS", "--cores-per-col 1").split()
     fused = OperatorSequence(f"{sp.name.replace('-','_').replace('.','_')}_decode", rl,
                               input_args=inputs, output_args=["logits"],
-                              buffer_sizes=bufsz, context=ctx)
+                              buffer_sizes=bufsz, context=ctx, extra_flags=placer_flags)
     fused.compile()
     return sp, fused, weights, dict(NL=NL, S=S, inputs=inputs, cache_names=cache_names)
 

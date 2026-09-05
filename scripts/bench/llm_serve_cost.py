@@ -133,7 +133,10 @@ def main():
     ap.add_argument("--json", default=None)
     a = ap.parse_args()
 
-    cfg = os.path.join(REPO, "scripts", "smoke", "llm_serve_smoke.engine.toml")
+    # Overridable so the harness can A/B two artifacts: point ENGINE_TOML at a config whose
+    # scenario names the other decode dir. Same harness, same request sequence, one variable.
+    cfg = os.environ.get("ENGINE_TOML") or os.path.join(
+        REPO, "scripts", "smoke", "llm_serve_smoke.engine.toml")
     bin_ = os.environ.get("BIN") or os.path.join(REPO, "rust/target/release/npu")
     if not os.access(bin_, os.X_OK):
         raise SystemExit(f"FATAL: no npu binary at {bin_}")
