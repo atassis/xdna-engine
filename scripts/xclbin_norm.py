@@ -35,8 +35,14 @@ written by `bootgen` (third_party/bootgen, vendored; aiecc.cpp statically links
 `bootgen_generate_pdi`). `bootgen -read <extracted pdi_image> -arch versal` names the two fields
 directly: `mHdr_revoke_id (0x08)` inside the Image Header, and its `checksum (0x3c)` (which covers
 bytes [0x00,0x3c) of that header, i.e. it is DERIVED FROM mHdr_revoke_id). Grepping
-`third_party/bootgen` for `metaHdrRevokeId` (the field's real name, `imageheadertable-versal.h:167`)
-finds exactly two hits: the struct declaration and the `-read` display code -- bootgen never WRITES
+`third_party/bootgen` for `metaHdrRevokeId` (the field's real name) finds FOUR hits, and the
+reachability is what matters rather than the count: the declaration
+(`versal/include/imageheadertable-versal.h:144`), the `-read` display code
+(`versal/src/readimage-versal.cpp:699`), and two Versal setters
+(`versal/src/imageheadertable-versal.cpp:1899,4699`). Those setters exist only to satisfy a pure
+virtual on the common base (`common/include/imageheadertable.h:523`); their only call sites are in
+the SPARTAN-UP backend (`spartanup/src/imageheadertable-spartanup.cpp:1141,2971`), a different device
+family. So on the Versal path they are never invoked -- bootgen never WRITES
 it when building an image, so it is uninitialized memory, not a value with meaning for an
 unauthenticated single-partition CDO image (revocation IDs are a secure/authenticated-boot
 concept; our BIF requests neither). Confirmed independently of any real build: two `aiecc`
