@@ -218,7 +218,11 @@ manifest = "artifacts/pyannote/diarize.json"
         let c = ScenarioConfig::from_str(&toml).expect("generate scenario must parse");
         assert_eq!(c.scenario.kind, "generate");
         assert!(c.model.is_none());
-        assert!(c.artifacts.decode.ends_with("regen-qwen3-decode"));
+        // The path the scenario names must be one `scripts/build_llm_decode.sh` can recreate, not
+        // a session scratchpad: the first version of this scenario pointed into /tmp and would have
+        // shipped a config that broke the moment that directory was swept.
+        assert!(c.artifacts.decode.ends_with("artifacts/qwen3-0.6b/decode"));
+        assert!(!c.artifacts.decode.starts_with("/tmp"));
         assert!(c.artifacts.weights.ends_with("artifacts-qwen3-0.6b/weights"));
         assert!(c.artifacts.tokenizer_dir.contains("Qwen3-0.6B"));
     }
