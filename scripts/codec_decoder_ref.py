@@ -25,7 +25,7 @@ Graph (s2.cpp/src/s2_codec.cpp:499-524):
 THE TWO CONVOLUTIONS TAKE OPPOSITE WEIGHT LAYOUTS, which is the single most dangerous detail here:
 ggml_conv_1d wants numpy [c_out, c_in, k] and ggml_conv_transpose_1d wants numpy [c_in, c_out, k].
 Every residual-unit weight is square, so swapping them is invisible to a shape check and shows up
-only as a wrong waveform. See route_b_kernels/bricks/conv-1d/golden.py.
+only as a wrong waveform. See aie_kernels/conv-1d/golden.py.
 
 Everything is vectorised: the per-element reference forms in the brick goldens are the definition,
 but at 112640 output samples they are unusably slow, so the loops here are over k only.

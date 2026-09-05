@@ -29,7 +29,7 @@ AR_NAME_PREFIXES = ("layers.", "fast_layers.", "embeddings.weight", "fast_embedd
                     "codebook_embeddings.weight", "norm.weight", "fast_norm.weight",
                     "fast_output.weight")
 
-# GROUP=64 symmetric, matching route_b_kernels/bricks/dequant-int4-group.cc's
+# GROUP=64 symmetric, matching aie_kernels/dequant-int4-group.cc's
 # default instantiation (dequant_int4_group_row<16,64>, HAS_ZP=0).
 GROUP = 64
 

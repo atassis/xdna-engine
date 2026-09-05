@@ -5,7 +5,7 @@ is (`get_rows`, an indexed row-gather from a huge table) and flagged it as "a ge
 MOVEMENT pattern, not a reparameterization of an existing one" without answering whether the
 hardware/toolchain can actually express it. This doc answers that one question, from the
 toolchain sources, with file:line citations, and ships a device probe
-(`route_b_kernels/bricks/_verify/probe_bd_gather_offsets.py`) that confirms it on real
+(`aie_kernels/_test/probe_bd_gather_offsets.py`) that confirms it on real
 hardware.
 
 Every claim below is tagged **READ** (found in a source file, cited) or **INFERRED**
@@ -38,7 +38,7 @@ gathers 1 embedding row plus up to 10 codebook rows (11 total, masked to whether
 semantic); a fast-AR frame calls `get_rows` 9 times against a growing 0-to-8-row prefix from
 the 4096-row `fast_embeddings` table. **No call needs more than 11 independent row offsets.**
 
-**Is this expressible at all?** `route_b_kernels/bricks/gather-rows/gather_rows.cc:57-60`
+**Is this expressible at all?** `aie_kernels/gather-rows/gather_rows.cc:57-60`
 already flags it as open: "it is UNVERIFIED whether AIE2P's BD engine even supports
 data-dependent offsets at all."
 
@@ -142,7 +142,7 @@ params, constant ELF | OK | kv_off + sm_mask, 2 words/token (replaced a 27MB ELF
 **Correction to `gather_rows.cc:52-56`'s claim that "bricklib AS IT EXISTS TODAY CANNOT
 EXPRESS THIS."** That is true of `bricklib.py` specifically (confirmed: it never passes
 `offset_parameter` anywhere in `_build_streamed`/`_build_rowwise`/`_build_oneshot`,
-`route_b_kernels/bricks/_verify/bricklib.py`). It is not true of the underlying IRON API one
+`aie_kernels/_test/bricklib.py`). It is not true of the underlying IRON API one
 layer down: `ObjectFifoHandle.fill()`/`.drain()` already accept `offset_parameter=` directly
 (instance `python/aie/iron/dataflow/objectfifo.py:726-798`, kwarg at lines 732/769) — this
 probe uses that layer directly rather than extending bricklib, precisely because bricklib's
@@ -222,7 +222,7 @@ AR gather's 11-row worst case in a single dispatch.
 - Advantage over A: never leaves the NPU's own LPDDR — no host-RAM duplicate of an 800+200+21
   MB weight set, consistent with the single-resident-copy weight-arena loader this project
   already ships.
-- `route_b_kernels/bricks/_verify/probe_bd_gather_offsets.py` Part 2 tests exactly this: T=2
+- `aie_kernels/_test/probe_bd_gather_offsets.py` Part 2 tests exactly this: T=2
   independent offsets patched and fired in ONE dispatch, to check whether the AR step's whole
   11-row gather can ride in a single xclbin call rather than needing 11 separate dispatches.
 
@@ -247,8 +247,8 @@ duplicate). C only exists combined with B. D is ruled out.
 
 ## What the probe proves, and what it cannot
 
-`route_b_kernels/bricks/_verify/probe_bd_gather_offsets.py`, run via
-`cd route_b_kernels/bricks/_verify && ./run.sh probe_bd_gather_offsets.py`:
+`aie_kernels/_test/probe_bd_gather_offsets.py`, run via
+`cd aie_kernels/_test && ./run.sh probe_bd_gather_offsets.py`:
 
 - **Part 1** (primary, low-risk): one `offset_parameter`-patched `dma_bd` reads a single row
   from a 256 KiB ramp table (4096 rows x 16 x i32, far past the 64 KiB L1), re-dispatched 3x

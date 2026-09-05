@@ -61,7 +61,7 @@ so neither is read here; do not add them "for completeness" without a reason tie
     python3 scripts/codec_quantizer_ref.py <dump-dir> [--gguf <path>]
 
 ============================================================================================
-KERNEL MAP -- one row per op in this segment: existing route_b_kernels/bricks/ brick, or a gap.
+KERNEL MAP -- one row per op in this segment: existing aie_kernels/ brick, or a gap.
 ============================================================================================
 
 Two measured constraints from the ALREADY-PORTED decoder segment (route_b_kernels/codec_block/
@@ -101,7 +101,7 @@ Design for this FIRST; it is not a detail to discover mid-port.
                                                                             near L1-resident.
   RoPE on Q,K (x8)                      rope-lut -- BLOCKED + WRONG LAYOUT see AWKWARD #2 below.
   causal(+window) softmax attention(x8) NONE -- no softmax brick exists    see AWKWARD #3. [T,T] score
-                                         (grepped route_b_kernels/bricks;                    matrix is
+                                         (grepped aie_kernels;                    matrix is
                                          only inline use is inside                          SMALL here
                                          moe_topk_router.cc's top-k, not                    (T<=65 in the
                                          a generic row-softmax)                              test clips,
@@ -164,7 +164,7 @@ AWKWARD ON-NPU (deliverable 4):
      per-codebook result to the NPU for the out_proj GEMM. (b) is the pragmatic near-term path.
 
   #2 RoPE needs rope-lut, and rope-lut is BLOCKED on an unresolved `aie::lut<4>` ab/cd duplication
-     layout question (route_b_kernels/bricks/sin/sin.cc's header cites
+     layout question (aie_kernels/sin/sin.cc's header cites
      log/2026-07/2026-07-25-rope-lut-root-cause-bank-granularity.md, "the layout question is OPEN",
      plus bricks/_verify/probe_linear_approx_abcd.py still returning permuted entries). This
      transformer's attention NEEDS RoPE (confirmed: build_transformer calls ggml_rope_ext on both Q

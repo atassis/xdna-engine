@@ -3,7 +3,7 @@
 //! establishes -- [`S2Design::open`] loads the xclbin, uploads insts and allocates every BO ONCE;
 //! [`S2Design::dispatch`] only uploads/runs/downloads.
 //!
-//! The design ABI (Python side: `bricklib._build_streamed`, `route_b_kernels/bricks/_verify/
+//! The design ABI (Python side: `bricklib._build_streamed`, `aie_kernels/_test/
 //! bricklib.py`) is `kern(in_tile, resident, out_tile)` per streamed tile when the design has a
 //! resident operand, else `kern(in_tile, out_tile)`; `resident_len == 0` in `meta.json` IS the
 //! "no resident" signal, matching that Python convention exactly. On the XRT side this is IRON's

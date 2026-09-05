@@ -136,7 +136,7 @@ Sampling (outside both graphs, `s2_generate.cpp`/`s2_sampler.cpp`): mask non-sem
 `temperature<=0`, deterministic argmax of the filtered (== unfiltered top-1) logits. See #3 below
 for why this matters for gating.
 
-## 4. Brick-vocabulary mapping (`route_b_kernels/bricks/` + `route_b_kernels/` generally)
+## 4. Brick-vocabulary mapping (`aie_kernels/` + `route_b_kernels/` generally)
 
 | AR op | existing brick | verdict |
 |---|---|---|
@@ -206,7 +206,7 @@ Given those three dump points, the gate is: run s2.cpp once with `S2_DUMP_DIR` s
 temperature, since only the PRE-sampling prefill call is being compared) on a fixed prompt, feed
 `ar_prompt_tokens` into `s2_ar_ref.slow_transformer_forward(hp, w, ar_prompt_tokens,
 logits_row_ids=None)`, and rel-L2 the result against `ar_slow_logits`/`ar_slow_hidden` -- same
-rel-L2 convention the codec side and every `route_b_kernels/bricks/*/golden.py` already use.
+rel-L2 convention the codec side and every `aie_kernels/*/golden.py` already use.
 `scripts/s2_ar_ref.py` doesn't wire this comparison up yet (the dump point doesn't exist to
 compare against), but every piece it needs -- the forward pass, a `rel_l2`-style helper -- is
 already in the script and proven correct on real weights; wiring a `--verify-dump DIR` flag is a
