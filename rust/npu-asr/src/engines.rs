@@ -9,7 +9,7 @@
 //!
 //! The dispatch-profiling/byte-marshaling primitives that used to live in this file (`PAD_M`,
 //! `WA_SUBDIR`, `DW_SUBDIR`, `marsh`, `u16_bytes`, `read_instr_words`, `prof`/`reset_prof`/
-//! `prof_record`, `dump_dispatch_prof`) moved to `npu_bricks` (`extract-npu-bricks-crate` step 1) --
+//! `prof_record`, `dump_dispatch_prof`) moved to `npu_dispatch` (`extract-npu-bricks-crate` step 1) --
 //! they carried no GigaAM semantics and had independent byte-identical copies in `npu-parakeet` and
 //! `npu-whisper`. Re-exported here so `npu_asr::engines::*` call sites are unchanged.
 
@@ -22,7 +22,7 @@ use ndarray::prelude::*;
 use npu_xrt::{bf16_bits_to_f32, f32_to_bf16_bits, Bo, Device, Kernel, FLAG_CACHEABLE, FLAG_HOST_ONLY};
 use rayon::prelude::*;
 
-pub use npu_bricks::{
+pub use npu_dispatch::{
     dump_dispatch_prof, marsh, prof, prof_record, read_instr_words, record, reset_prof, u16_bytes,
     DW_SUBDIR, PAD_M, WA_SUBDIR,
 };

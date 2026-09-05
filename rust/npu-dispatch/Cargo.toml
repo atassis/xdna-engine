@@ -1,9 +1,9 @@
 [package]
-name = "npu-bricks"
+name = "npu-dispatch"
 version = "0.1.0"
 edition = "2021"
 description = "Shared NPU dispatch rails (no model-specific semantics) -- consumed by every encoder crate"
 
 [lib]
-name = "npu_bricks"
+name = "npu_dispatch"
 path = "src/lib.rs"

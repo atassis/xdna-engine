@@ -17,15 +17,15 @@ use std::time::Instant;
 
 use ndarray::prelude::*;
 use npu_asr::kernel_registry;
-use npu_bricks::{u16_bytes, PAD_M};
+use npu_dispatch::{u16_bytes, PAD_M};
 use npu_xrt::{Bo, Device, Kernel, FLAG_CACHEABLE, FLAG_HOST_ONLY};
 
 use crate::errors::LoadError;
 
 /// Re-exported, not re-declared: `preflight()` below and the CLI's startup check (`npu-cli`) both
 /// name the directory `open()` actually loads from through this path, and the definition itself
-/// now lives in `npu-bricks` with the rest of the dispatch rails.
-pub use npu_bricks::WA_SUBDIR;
+/// now lives in `npu-dispatch` with the rest of the dispatch rails.
+pub use npu_dispatch::WA_SUBDIR;
 
 const KRES: usize = 1024; // resident kernel contraction dim
 

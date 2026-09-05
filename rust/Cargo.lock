@@ -966,7 +966,7 @@ dependencies = [
  "ndarray",
  "ndarray-npy",
  "npu-asr-host",
- "npu-bricks",
+ "npu-dispatch",
  "npu-onnx",
  "npu-xrt",
  "rayon",
@@ -983,10 +983,6 @@ dependencies = [
  "ndarray",
  "rayon",
 ]
-
-[[package]]
-name = "npu-bricks"
-version = "0.1.0"
 
 [[package]]
 name = "npu-capi"
@@ -1016,6 +1012,10 @@ dependencies = [
  "serde_json",
  "tempfile",
 ]
+
+[[package]]
+name = "npu-dispatch"
+version = "0.1.0"
 
 [[package]]
 name = "npu-engine"
@@ -1064,7 +1064,7 @@ dependencies = [
  "ndarray",
  "ndarray-npy",
  "npu-asr",
- "npu-bricks",
+ "npu-dispatch",
  "npu-onnx",
  "npu-weights",
  "npu-xrt",
