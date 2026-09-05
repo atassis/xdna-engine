@@ -18,28 +18,34 @@ measurements that all point the same way.
 |---|---|
 | Encoder context-switch cost | ~340 of ~427 ms of the encoder NPU pool is pure ~2.67 ms shape-reload, not compute (~0.1-0.3 ms) or DMA |
 | On-NPU decode attention | one fused decode-attention dispatch is ~759 us, with compute approximately equal to the DMA floor (delta ~4 us) -> roughly 100% data-movement; the attention math is free, the cost is re-streaming 16.8 MB/token |
-| Per-op occupancy trace | the #1 latency sink does 0% vector compute; attention GEMVs are 56-81% stall-bound; the NPU compute array is ~84% idle |
-| Bandwidth ratio | on-chip SRAM ~800 GB/s vs LPDDR ~120 GB/s datasheet -> residency is a large bandwidth multiplier |
+| Per-op occupancy trace | the #1 latency sink does 0% vector compute; attention GEMVs are 56-81% stall-bound; at array scale the NPU compute array is 97.6-99.2% idle (measured 2026-08; supersedes an earlier ~84% figure from a 1-of-32-core config) |
+| Bandwidth ratio | on-chip SRAM ~800 GB/s vs the Infinity Fabric's ~62.7 GB/s ceiling (measured 2026-08; achievable read lands at ~47-57 GB/s, not the old ~120 GB/s LPDDR datasheet number) -> residency is a large bandwidth multiplier |
 
-So the NPU's 32 compute tiles (against a 20-core CPU) sit ~84% idle - not
-because the hardware is weak, but because I feed it from DRAM and reload shapes
-between ops. "CPU parity" at batch=1 is a data-movement tie, not a compute
-verdict. Raise data-movement efficiency and the 32-core compute headroom becomes
-real.
+So the NPU's 32 compute tiles (against a 20-core CPU) sit 97.6-99.2% idle at
+array scale (measured 2026-08) - not because the hardware is weak, but because
+I feed it from DRAM and reload shapes between ops. "CPU parity" at batch=1 is
+a data-movement tie, not a compute verdict. Raise data-movement efficiency and
+the 32-core compute headroom becomes real.
 
 ## We are overhead-bound, not bandwidth-bound
 
 There are two floors, and the interesting one is far from where we sit.
 
-- Physics floor (LPDDR bandwidth): decode must read the model's weights per
-  token. At the 120 GB/s datasheet number that is a ~1.65 ms/token floor. But
-  the datasheet number is not achievable on the shim-DMA path: measured
-  achievable LPDDR read bandwidth is ~47-57 GB/s (pure DMA saturates around
-  47 GB/s past a few columns; the encoder GEMM path reaches ~57 GB/s). So the
-  real floor is ~2x higher, roughly 3.5-4.2 ms/token. The bytes are the bytes;
-  no loop trick changes them.
+- Physics floor (Infinity Fabric bandwidth): decode must read the model's
+  weights per token, and every one of those reads is capped by the Infinity
+  Fabric, not by the LPDDR channel behind it. The fabric ceiling is ~62.7 GB/s
+  (measured 2026-08) - well under the ~120 GB/s LPDDR datasheet number I used
+  to cite here, and under the 136.5 GB/s DRAM theoretical peak too. Measured
+  (2026-08) achievable read bandwidth is ~47-57 GB/s (pure DMA saturates around
+  47 GB/s past a few columns; the encoder GEMM path reaches ~57 GB/s) - that is
+  already 85-95% of the fabric ceiling, so there is no bandwidth headroom
+  hiding behind a bigger datasheet number: the achieved rate already sits at
+  the wall. The real floor is roughly 3.5-4.2 ms/token, set by the fabric. The
+  bytes are the bytes; no loop trick changes them.
 - Where we actually are: measured decode is ~75 ms/token, about 18-21x above
-  that measured-achievable floor.
+  that floor - and because the achieved rate is already at the fabric's
+  ceiling, that entire 18-21x is engineering overhead, not bandwidth left on
+  the table.
 
 That gap is the point. Decode today is overhead-bound - dispatch boundaries,
 inter-op transitions, on-chip choreography - not bandwidth-bound. The win is not
@@ -56,8 +62,9 @@ The attack order follows directly:
   bandwidth before overhead is premature when you are ~20x away from it
   mattering.
 
-The only true physics wall is LPDDR bandwidth, and we are far from it. Every
-other "wall" is an engineering wall. Treat a "can't" on an engineering wall as a
+The only true physics wall is the Infinity Fabric (~62.7 GB/s, measured
+2026-08), not LPDDR bandwidth, and we are far from it. Every other "wall" is
+an engineering wall. Treat a "can't" on an engineering wall as a
 signal to find the next angle, not as a verdict.
 
 ### Where the on-chip dispatch time actually goes
@@ -77,8 +84,8 @@ overhead to delete is on-chip, between operations, not across the host boundary.
 
 So the ranked levers are:
 
-1. Reduce the on-chip dispatch (47.95 ms, 91%, ~29x above the datasheet
-   bandwidth floor). It is on-chip inter-op overhead plus per-op stalls
+1. Reduce the on-chip dispatch (47.95 ms, 91%, well above the fabric-bandwidth
+   floor established above). It is on-chip inter-op overhead plus per-op stalls
    (51 ops/layer x 12 layers; the V-transpose does 0% compute, the GEMVs are
    56-81% stall). Levers: micro-op fusion, an on-chip dataflow loop that kills
    inter-op boundaries, and residency.
@@ -155,13 +162,23 @@ Lever: apply decode's pattern to the encoder - a resident, small-shape-set
 number of distinct shapes, not the dispatch count. Decode is the existence proof
 that this is possible; it is a multi-month effort.
 
-### Cost B: byte streaming from LPDDR
+### Cost B: byte streaming across the Infinity Fabric
 
 Weights, activations, and KV get re-streamed from DRAM on every dispatch or
-token. The on-NPU attention result shows this is the cost - the compute is free.
-On-chip memory is far faster than LPDDR, so the prize is keeping bytes on-chip
-and moving fewer of them. The master lever is to eliminate bytes, not accept
-them:
+token, and every one of those reads crosses the Infinity Fabric (~62.7 GB/s
+ceiling, measured 2026-08) before it ever reaches LPDDR's own theoretical peak
+(136.5 GB/s) - the fabric is the binding constraint, not the DRAM behind it.
+The on-NPU attention result shows this is the cost - the compute is free.
+On-chip memory is far faster than the fabric, so the prize is keeping bytes
+on-chip and moving fewer of them.
+
+Two consequences follow from the fabric, not LPDDR, being the shared resource:
+read and write do not compose (adding writes to a read-bound stream costs the
+read side ~35%, measured 2026-08), so a lever that trades reads for writes
+(quantize-then-dequant, KV writes) is not free; and co-scheduled tenants
+contend on the same fabric even when each sits inside its own byte budget, so
+the multi-tenant/batched levers below do not simply add their savings. The
+master lever is still to eliminate bytes, not accept them:
 
 1. Resident weights/KV - keep them on-chip across tokens rather than
    re-streaming. Blocked by capacity (weights per token exceed on-chip SRAM), so
@@ -213,10 +230,13 @@ itself the generalization - "minimize bytes plus reloads" is model-agnostic.
 | MemTile 512 KB / L1 64 KB | hardware capacity | big intermediates (FFN hidden ~3 MB) cannot stay resident un-tiled -> tile along M |
 | N-stationary cannot fuse reductions | engineering (kernel design) | an M-stationary GEMM fixes it, or cascade-reduce across columns |
 | no NPU FFT / depthwise-conv kernel | engineering (missing kernel) | log-mel and conv stay on host (small) or need custom kernels |
-| LPDDR bandwidth | physics (the DRAM) | the only true wall - beat it by moving fewer bytes, not faster ones |
+| Infinity Fabric bandwidth | physics (the fabric, not LPDDR/DRAM) | the only true wall - engines measured 2026-08 land at 85-95% of the ~62.7 GB/s fabric ceiling but only 39-50% of the 136.5 GB/s DRAM theoretical, so LPDDR/DRAM bandwidth is a ceiling we never reach; beat the fabric wall by moving fewer bytes, not faster ones, and remember read+write do not compose (writes cost read ~35%) and co-scheduled tenants share this one fabric even within budget |
 
-Only LPDDR bandwidth is physics, and even that is beaten by moving fewer bytes.
-Everything else is engineering: multi-week to multi-month, but not impossible.
+Only the Infinity Fabric is physics (~62.7 GB/s, measured 2026-08), and even
+that is beaten by moving fewer bytes. LPDDR/DRAM's own theoretical bandwidth
+(136.5 GB/s) is not a wall we ever reach - every engine measured tops out at
+39-50% of it, capped earlier by the fabric. Everything else is engineering:
+multi-week to multi-month, but not impossible.
 
 ## What I still cannot see
 
@@ -226,9 +246,11 @@ I try not to conclude from partial data. The honest gaps, and how each closes:
    that is not op compute. Is it DMA wait, stream stall, or dependency? Needs an
    in-fused trace that spans the fused multi-device structure; today's per-device
    trace pass cannot, so I lean on subtraction-attribution.
-2. On-chip vs LPDDR achievable bandwidth on this exact silicon - the 800/120
-   ratio is datasheet; the achievable read side is already measured at ~47-57
-   GB/s, and the on-chip side still wants its own micro-benchmark.
+2. On-chip vs Infinity Fabric achievable bandwidth on this exact silicon - the
+   ~800/62.7 GB/s ratio (measured 2026-08) is the fabric ceiling, not an LPDDR
+   datasheet number; the achievable read side is already measured at ~47-57
+   GB/s (85-95% of that ceiling), and the on-chip side still wants its own
+   micro-benchmark.
 3. True on-chip resident-weight decode for a small model - weights that stay
    on-chip across tokens. Demonstrated nowhere; int4 is needed to fit. Measures
    the residency ceiling.
@@ -246,9 +268,9 @@ I try not to conclude from partial data. The honest gaps, and how each closes:
 
 ## Bottom line
 
-- "CPU parity, can't improve" is wrong. About 84% of the NPU is idle and the
-  bottleneck is data movement, not compute. There is large headroom, gated by
-  data-movement engineering, not physics.
+- "CPU parity, can't improve" is wrong. At array scale, 97.6-99.2% of the NPU
+  is idle (measured 2026-08) and the bottleneck is data movement, not compute.
+  There is large headroom, gated by data-movement engineering, not physics.
 - The master frame: count bytes and shape-reloads, not FLOPs. Every lever earns
   its place by how many bytes it removes from LPDDR or how many shape-reloads it
   kills.

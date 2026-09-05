@@ -21,7 +21,8 @@ Legend: **OK** = used optimally - **~** = used suboptimally - **X** = unused (le
 - Array: **32 compute tiles (8 cols x 4 rows) + 8 MemTiles (1 row) + 8 shim tiles**.
 - **L1 = 64 KB/core**, 4 banks, 16 locks, 16 BDs, **2 MM2S + 2 S2MM DMA channels** (the
   2-input-DMA wall). MemTile **L2 = 512 KB** x8 = **4 MB** pool, 8 banks, 64 locks, 48 BDs,
-  6+6 channels. **L3 LPDDR ~120 GB/s vs on-chip ~800 GB/s (6.7x)**.
+  6+6 channels. **Infinity Fabric ceiling ~62.7 GB/s vs on-chip ~800 GB/s (~13x)** -
+  measured 2026-08; the binding wall is the fabric, not LPDDR (DRAM theoretical 136.5 GB/s).
 - **Vector reg = 512-bit** (32 bf16 / 64 int8 / 128 int4 lanes). **Accumulator reg =
   2048-bit** (64 accfloat / 64 acc32 / 32 acc64). **Cascade bus = 512-bit/beat**, adjacent
   cores only.
@@ -85,7 +86,7 @@ Source: the target model + `aie_api/{accum,vector,ld_st}.hpp`.
 |---|---|---|---|
 | L1 64KB/core (4 banks) | core working set | **OK** (N-stationary tiling fits it) | overflow = build fail; M-stationary correctly rejected (~4.15x slower) |
 | L2 MemTile 512KB x8 = 4MB | staging / resident-intermediate home | **~ (forced)** | FFN 3MB intermediate > 512KB -> must tile / DDR round-trip |
-| L3 LPDDR ~120 GB/s | the only physics wall | **OK as the lens** | decode sits far above the bandwidth floor = engineering overhead |
+| L3 LPDDR / Infinity Fabric | the physics wall is the FABRIC, not LPDDR - measured 2026-08: pure NPU read 52.7 GB/s (scaling to 8 cols), mixed traffic ~67.6 GB/s, fabric ceiling ~62.7 GB/s vs DRAM theoretical 136.5 GB/s; every engine lands at 85-95% of the fabric but only 39-50% of DRAM | **OK as the lens** | decode sits far above the bandwidth floor = engineering overhead; read+write do NOT compose (writes cost read ~35%); co-scheduled tenants contend on a SHARED fabric even within budget |
 | Accumulator reg 2048-bit (64 accfloat) | MAC/mmul partial target, f32 | **OK** | the cascade carries this; bias-as-acc-init unused |
 | Vector reg 512-bit | SIMD operands | **OK**; **bfp16ebs8 type X** | block-FP vector type unused |
 | load_v/store_v (alignment 16/32/64B) | vec mem<->reg | **OK** | **footgun**: misaligned aligned-load silently truncates address (no fault, asserts off) - watch in new strided kernels |
