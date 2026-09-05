@@ -88,7 +88,12 @@ pub enum Cmd {
         #[arg(long)] no_stream: bool,
     },
     /// List models on a running server.
-    Models { #[arg(long)] port: Option<u16> },
+    /// What this install has, and what the server is actually serving.
+    ///
+    /// Default output is aligned columns: readable, and splittable by `awk`/`cut` because the
+    /// one free-text field is last. `--json` gives the raw server document for anything that
+    /// wants the full record.
+    Models { #[arg(long)] port: Option<u16>, #[arg(long)] json: bool },
     /// Ask a running server to re-read the config and reconcile.
     Reload { #[arg(long)] port: Option<u16> },
     /// Pre-bake a model's weight checkpoint (host-only, no device).
