@@ -1,14 +1,23 @@
 #!/usr/bin/env python3
-"""CPU gate for xclbin_norm.py: positive control (identity-only mutation hashes equal) and
-negative control (a real program byte hashes different), both device-free.
+"""CPU gate for xclbin_norm.py: positive controls (identity-only mutation, and a REAL same-
+toolchain two-build pair, both hash equal) and a negative control (a real program byte hashes
+different), all device-free.
 
-The positive control here is SYNTHETIC. Two on-disk candidates that looked like a real same-
-design pair (`armA_oldpin` under `.cache/peano-gate-2026-09-01` vs `.cache/repin-gate-2026-09-04`)
-turned out, per their `.toolchain-stamp`, to be built from two DIFFERENT toolchain instances
-(f37308d2b719 vs 9da6356ac521) -- not a valid pair, and their normalized hashes correctly still
-differ. So this gate proves the mask is complete against the KNOWN identity fields
-([[an-xclbin-hash-answers-same-build-not-same-program]]); it does not prove those are the only
-fields two real builds can vary in. The task record carries the honest gap.
+CORRECTED 2026-09-05. This file previously reasoned from `armA_oldpin` (peano-gate-2026-09-01)
+vs `armA_oldpin` (repin-gate-2026-09-04): different toolchain instances confirmed by
+`.toolchain-stamp` (f37308d2b719 vs 9da6356ac521), 5 residual bytes inside `pdi_image` blamed on
+"real compiler-output drift". Wrong attribution, caught by finding an actual same-toolchain pair
+(`armB_newpin` vs `armB2_newpin`, BOTH `.toolchain-stamp` 4b8464eac495, `.kernel_source_manifest`
+byte-identical apart from its timestamp comment, `aie_*.mlir` byte-identical, built 20 minutes
+apart): the SAME 5 residual bytes, same offsets, survived there too, on a pair with no toolchain
+difference to blame. Root cause: bootgen's `ImageHeader.metaHdrRevokeId` is uninitialized memory
+(third_party/bootgen never writes it) plus the checksum riding on it -- see xclbin_norm.py's
+"The bootgen field". Confirmed by running `aiecc` twice, 4 seconds apart, on byte-identical
+MLIR/kernel-object/toolchain inputs: reproduced the exact same 75-byte raw diff, same two
+offsets, purely locally. `real_pair_control()` below wires the genuine pair in as a second
+positive control, gated on the same provenance checks that caught the original misattribution --
+if the configured pair is ever pointed at two different toolchains, this control must fail loud,
+not silently pass.
 
 Run: python3 scripts/tests/xclbin_norm_test.py
 """
@@ -76,6 +85,22 @@ def pdi_entries(raw):
     return out
 
 
+def bootgen_header_ranges(raw, img_off, img_size):
+    """[(off, off+4), ...] for mHdr_revoke_id and the Image Header checksum, independently of
+    xclbin_norm's own masking function -- same reasoning as locate_sections()/pdi_entries()."""
+    if (img_size < N.IHT_IH_OFFSET_FIELD + 4
+            or bytes(raw[img_off:img_off + len(N.PDI_PREAMBLE)]) != N.PDI_PREAMBLE):
+        return []
+    ih_off_words = struct.unpack_from("<I", raw, img_off + N.IHT_IH_OFFSET_FIELD)[0]
+    ih_base = img_off + ih_off_words * 4
+    if ih_base + N.IH_CHECKSUM_OFF + 4 > img_off + img_size:
+        return []
+    return [
+        (ih_base + N.IH_REVOKE_ID_OFF, ih_base + N.IH_REVOKE_ID_OFF + 4),
+        (ih_base + N.IH_CHECKSUM_OFF, ih_base + N.IH_CHECKSUM_OFF + 4),
+    ]
+
+
 def swap_mirror_text(buf, start, end, key, old_val_hex, new_val_hex):
     old_pat = f'"{key}":"{old_val_hex}"'.encode()
     new_pat = f'"{key}":"{new_val_hex}"'.encode()
@@ -102,8 +127,10 @@ mutated[uid_off:uid_off + 8] = bytes(rng.randrange(256) for _ in range(8))
 # (bytearray slice assignment resizing the buffer), not anything xclbin_norm.py needs to handle.
 mutated[ts_off:ts_off + 8] = struct.pack("<Q", rng.randrange(1_000_000_000, 2_000_000_000))
 mutated[huuid_off:huuid_off + 16] = bytes(rng.randrange(256) for _ in range(16))
-for entry_off, _img_off, _img_size in pdi_entries(mutated):
+for entry_off, img_off, img_size in pdi_entries(mutated):
     mutated[entry_off:entry_off + 16] = bytes(rng.randrange(256) for _ in range(16))
+    for lo, hi in bootgen_header_ranges(mutated, img_off, img_size):
+        mutated[lo:hi] = bytes(rng.randrange(256) for _ in range(hi - lo))
 
 # A real rebuild's mirror trailer always agrees with its own binary fields -- xclbinutil writes
 # both from the same values -- so the synthetic mutation must keep them in sync too, or this
@@ -141,6 +168,8 @@ check(neg[target] != orig[target], "the flipped byte actually changed")
 # own bookkeeping about what it touched.
 masked_ranges = [(uid_off, uid_off + 8), (ts_off, ts_off + 8), (huuid_off, huuid_off + 16)]
 masked_ranges += [(e[0], e[0] + 16) for e in entries]
+for _e_off, e_img_off, e_img_size in entries:
+    masked_ranges += bootgen_header_ranges(orig, e_img_off, e_img_size)
 check(img_off <= target < img_off + img_size, "flip target lands inside pdi_image")
 check(not any(a <= target < b for a, b in masked_ranges), "flip target is OUTSIDE every masked range")
 
@@ -148,6 +177,64 @@ h_orig2 = hashlib.sha256(N.normalize(bytes(orig), fixture)).hexdigest()
 h_neg = hashlib.sha256(N.normalize(bytes(neg), fixture)).hexdigest()
 check(h_orig2 == h_orig, "sanity: hashing the same bytes twice is stable")
 check(h_orig2 != h_neg, "a real content byte hashes DIFFERENT")
+
+
+def real_pair_control():
+    """Second, REAL positive control: two independent builds of one design, one toolchain,
+    20 minutes apart. Provenance is CHECKED here, not assumed -- these are the exact checks that
+    caught this file's original armA_oldpin misattribution (see module docstring), so if the
+    configured pair is ever pointed at two different toolchains this must fail loud, not pass.
+
+    The pair lives in an ephemeral gate-session scratch dir outside the repo, not a checked-in
+    fixture, so its ABSENCE is a skip; a PROVENANCE MISMATCH once the dirs exist is a failure.
+    """
+    workspace = REPO.parent
+    default_a = workspace / ".cache/peano-gate-2026-09-01/armB_newpin/whole_array_build"
+    default_b = workspace / ".cache/peano-gate-2026-09-01/armB2_newpin/whole_array_build"
+    dir_a = Path(os.environ.get("XCLBIN_NORM_TEST_REAL_PAIR_A", default_a))
+    dir_b = Path(os.environ.get("XCLBIN_NORM_TEST_REAL_PAIR_B", default_b))
+    if not (dir_a.is_dir() and dir_b.is_dir()):
+        print(f"\n--- real-pair control: SKIPPED ({dir_a} / {dir_b} not on this box) ---")
+        return
+
+    print(f"\n--- real-pair control: {dir_a} vs {dir_b} ---")
+    try:
+        stamp_a = (dir_a / ".toolchain-stamp").read_text().strip()
+        stamp_b = (dir_b / ".toolchain-stamp").read_text().strip()
+        manifest_a = (dir_a / ".kernel_source_manifest").read_text().splitlines()
+        manifest_b = (dir_b / ".kernel_source_manifest").read_text().splitlines()
+    except OSError as e:
+        check(False, f"real-pair provenance files unreadable: {e}")
+        return
+
+    same_toolchain = bool(stamp_a) and stamp_a == stamp_b
+    check(same_toolchain, f"same .toolchain-stamp ({stamp_a!r} == {stamp_b!r})")
+    # Line 0 is "# kernel-source provenance, verified <timestamp>" -- expected to differ.
+    same_kernels = manifest_a[1:] == manifest_b[1:] and len(manifest_a) > 1
+    check(same_kernels, "kernel_source_manifest identical apart from its timestamp line")
+
+    common_mlirs = sorted(
+        {p.name for p in dir_a.glob("aie_*.mlir")} & {p.name for p in dir_b.glob("aie_*.mlir")}
+    )
+    check(len(common_mlirs) > 0, "at least one generated aie_*.mlir in common")
+    same_mlir = all((dir_a / n).read_bytes() == (dir_b / n).read_bytes() for n in common_mlirs)
+    check(same_mlir, "every common aie_*.mlir is byte-identical across the pair")
+
+    if not (same_toolchain and same_kernels and same_mlir):
+        check(False, "provenance mismatch -- refusing to trust this pair's hash comparison")
+        return
+
+    common_xclbins = sorted(
+        {p.name for p in dir_a.glob("*.xclbin")} & {p.name for p in dir_b.glob("*.xclbin")}
+    )
+    check(len(common_xclbins) > 0, "at least one xclbin in common")
+    for name in common_xclbins:
+        ha = N.normalized_sha256(dir_a / name)
+        hb = N.normalized_sha256(dir_b / name)
+        check(ha == hb, f"{name}: real same-toolchain pair hashes EQUAL ({ha[:12]}...)")
+
+
+real_pair_control()
 
 print("\n--- malformed input is rejected, not silently mis-hashed ---")
 try:
