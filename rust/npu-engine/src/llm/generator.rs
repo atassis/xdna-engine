@@ -16,6 +16,15 @@ use crate::pipeline::{Chunk, FinishReason, GenerateParams, GenerateUsage, Prompt
 /// module) drives it, so an implementation is stateless about position.
 pub trait DecodeStep {
     fn step(&mut self, token: u32, pos: usize) -> Result<Vec<f32>, EngineError>;
+
+    /// Drop any per-generation state before a new one starts. A device backend holds a KV cache
+    /// that only grows with `pos`, so without this the second request continues the first one's
+    /// context and answers differently -- which is what an end-to-end run caught after every layer
+    /// passed its own tests: the scripted mock has no KV state, so no unit test could see it.
+    /// Default no-op, so a stateless implementation needs no change.
+    fn reset(&mut self) -> Result<(), EngineError> {
+        Ok(())
+    }
 }
 
 /// Tokenize a prompt. `Prompt::Chat` renders through the model's chat template first;
@@ -89,6 +98,9 @@ impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
         params: &GenerateParams,
         sink: &mut dyn FnMut(Chunk<'_>) -> bool,
     ) -> Result<(), EngineError> {
+        // Every generation starts from an empty context. The device backend's KV cache only
+        // grows with `pos`, so without this each request continues the previous one's.
+        self.decode.reset()?;
         let prompt_ids = tokenize_prompt(&self.cfg, prompt)?;
         if prompt_ids.is_empty() {
             return Err(EngineError::Unsupported("prompt tokenized to zero tokens".to_string()));

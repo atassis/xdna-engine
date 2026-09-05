@@ -17,6 +17,9 @@ SMOKE_DIR="${SMOKE_DIR:-$(mktemp -d -t llm-serve-smoke-XXXXXX)}"
 # at load by LlmArtifact's freshness gate rather than silently answering with a wrong token.
 ENGINE_TOML="${ENGINE_TOML:-$SCRIPT_DIR/llm_serve_smoke.engine.toml}"
 CFG="$SMOKE_DIR/engine.toml"
+mkdir -p "$SMOKE_DIR"
+[ -f "$ENGINE_TOML" ] || { echo "FATAL: no engine config template at $ENGINE_TOML" >&2; exit 1; }
+cp "$ENGINE_TOML" "$CFG"
 PORT=18434
 BIN="$WORKTREE/rust/target/debug/npu"
 export LD_LIBRARY_PATH=$HOME/.local/lib/xdna-engine
@@ -69,7 +72,17 @@ R1=$(curl -s "http://127.0.0.1:$PORT/v1/chat/completions" -H 'content-type: appl
 R2=$(curl -s "http://127.0.0.1:$PORT/v1/chat/completions" -H 'content-type: application/json' \
   -d '{"model":"qwen3-0.6b","messages":[{"role":"user","content":"What is 2+2?"}],"max_tokens":16,"temperature":0,"seed":1}')
 echo "$R1" >> "$TRANSCRIPT"; echo "$R2" >> "$TRANSCRIPT"
-if [ "$R1" = "$R2" ]; then log "PASS: byte-identical"; else log "FAIL: outputs differ"; fi
+# Compare only AFTER establishing both are real completions. Two identical error bodies are
+# byte-identical too, and reporting that as PASS is a check that never reached its subject.
+# Compare the COMPLETION, not the envelope. `id` and `created` are per-request identity fields, so
+# whole-body equality can never hold -- the same mistake as hashing an xclbin whose UUID is stamped
+# per build. And check a completion exists first: two identical error bodies are byte-identical too.
+C1=$(printf '%s' "$R1" | python3 -c 'import json,sys; print(json.load(sys.stdin)["choices"][0]["message"]["content"])' 2>/dev/null || true)
+C2=$(printf '%s' "$R2" | python3 -c 'import json,sys; print(json.load(sys.stdin)["choices"][0]["message"]["content"])' 2>/dev/null || true)
+if [ -z "$C1" ]; then
+  log "FAIL: determinism arm got no completion at all -- response was: $R1"
+elif [ "$C1" = "$C2" ]; then log "PASS: temperature-0 completions identical"
+else log "FAIL: two temperature-0 completions differ"; log "  R1: $C1"; log "  R2: $C2"; fi
 
 record "unsupported n:2 -> expect 400" curl -s -o /dev/null -w "%{http_code}\n" \
   "http://127.0.0.1:$PORT/v1/chat/completions" -H 'content-type: application/json' \

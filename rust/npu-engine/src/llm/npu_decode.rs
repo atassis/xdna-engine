@@ -154,6 +154,12 @@ impl NpuDecodeStep {
 }
 
 impl DecodeStep for NpuDecodeStep {
+    /// Zero every KV cache buffer. The inherent `reset` already did this; wiring it through the
+    /// trait is what makes it actually run, since the generator only ever sees `dyn DecodeStep`.
+    fn reset(&mut self) -> Result<(), EngineError> {
+        NpuDecodeStep::reset(self)
+    }
+
     fn step(&mut self, token: u32, pos: usize) -> Result<Vec<f32>, EngineError> {
         let tok = token as usize;
         if tok >= self.artifact.vocab {
