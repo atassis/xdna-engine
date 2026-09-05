@@ -256,13 +256,22 @@ def main():
         import sys
         sys.exit(0)
 
-    fused = OperatorSequence("gemma_decode", rl, input_args=["x", "rope_local", "rope_global"],
+    # ONE list, three consumers: the graph's input_args, the layout below, and meta.json's
+    # "inputs". It was three literals; the layout's omitted rope_global and rope_local, so the
+    # emitted meta.json described buffers the ELF did not have.
+    inputs = ["x", "rope_local", "rope_global"]
+    fused = OperatorSequence("gemma_decode", rl, input_args=inputs,
                               output_args=["logits"], buffer_sizes=bufsz, context=ctx)
     fused.compile()
     elf = load_elf(fused).view(np.uint8).tobytes()
     in_sz, out_sz, scr = fused.buffer_sizes
     wnames = list(weights.keys())
-    lay = {n: fused.get_layout_for_buffer(n) for n in ["x", "logits"] + wnames}
+    # Build the layout over what the graph DECLARES, never a hand-written list. The literal this
+    # replaces omitted `rope_global` -- a declared input -- so every emitted meta.json described a
+    # buffer set the ELF did not have, and a consumer placing buffers by layout could not find it.
+    # IRON already computed the answer: `subbuffer_layout` covers every input, output and scratch
+    # arg, and `calculate_buffer_layout` raises if a declared arg is missing from the runlist.
+    lay = {n: fused.get_layout_for_buffer(n) for n in [*inputs, "logits", *wnames]}
 
     # deep-C params.txt (kv_off addr + sm_mask core), same parse as gen_decode.py.
     import glob
@@ -288,7 +297,7 @@ def main():
         "elf": "decode.elf", "kernel_name": "main:sequence",
         "input_size": int(in_sz), "output_size": int(out_sz), "scratch_size": int(scr),
         "layout": {n: {"type": v[0], "offset": int(v[1]), "len": int(v[2])} for n, v in lay.items()},
-        "inputs": ["x", "rope_local", "rope_global"], "weights": wnames, "output": "logits",
+        "inputs": inputs, "weights": wnames, "output": "logits",
         "scratchpad": {"params": scratchpad_params, "kv_param": "kv_off", "mask_param": "sm_mask",
                        "head_dim": HD, "kv_heads": Hkv},
         "dims": {"layers": NL, "d_model": D, "q_heads": Hq, "kv_heads": Hkv, "head_dim": HD,

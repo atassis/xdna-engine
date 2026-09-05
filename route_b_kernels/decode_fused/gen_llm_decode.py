@@ -303,7 +303,12 @@ def main():
     elf = load_elf(fused).view(np.uint8).tobytes()
     in_sz, out_sz, scr = fused.buffer_sizes
     wnames = list(weights.keys())
-    lay = {n: fused.get_layout_for_buffer(n) for n in ["x", "logits"] + wnames}
+    # Build the layout over what the graph DECLARES, never a hand-written list. The literal this
+    # replaces omitted `rope_global` -- a declared input -- so every emitted meta.json described a
+    # buffer set the ELF did not have, and a consumer placing buffers by layout could not find it.
+    # IRON already computed the answer: `subbuffer_layout` covers every input, output and scratch
+    # arg, and `calculate_buffer_layout` raises if a declared arg is missing from the runlist.
+    lay = {n: fused.get_layout_for_buffer(n) for n in [*inputs, "logits", *wnames]}
 
     import glob
     import shutil
