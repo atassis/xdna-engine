@@ -26,7 +26,7 @@ import ml_dtypes
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import newstack_compat  # noqa: F401,E402
-from gen_llm_decode import build_graph  # noqa: E402
+from gen_llm_decode import build_graph, report_artifact_freshness  # noqa: E402
 
 BF16 = ml_dtypes.bfloat16
 
@@ -62,6 +62,8 @@ def main():
                          "judged independently. Free-running conflates one bad token with the "
                          "trajectory it then drags behind it.")
     a = ap.parse_args()
+
+    report_artifact_freshness(a.weights)
 
     ref = json.load(open(a.ref))
     prompt_ids, gen_ids = ref["prompt_ids"], ref["gen_ids"]

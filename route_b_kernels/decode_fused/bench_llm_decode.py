@@ -50,7 +50,7 @@ import ml_dtypes
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import newstack_compat  # noqa: F401,E402 -- MUST precede iron imports (new-mlir-aie port shim)
-from gen_llm_decode import build_graph  # noqa: E402
+from gen_llm_decode import build_graph, report_artifact_freshness  # noqa: E402
 
 BF16 = ml_dtypes.bfloat16
 
@@ -110,6 +110,8 @@ def main():
                      "from stale-scratch carry-over across passes in THIS process.")
     ap.add_argument("--out-json", default=None)
     a = ap.parse_args()
+
+    report_artifact_freshness(a.weights)
 
     t0 = now()
     sp, fused, weights, md = build_graph(a.spec, a.weights, a.layers, a.max_seq)

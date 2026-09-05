@@ -30,6 +30,7 @@ Run INSIDE the fork IRON env (scripts/toolchain_up.sh), never the wheel python. 
 import argparse
 import json
 import os
+import subprocess
 import sys
 
 import numpy as np
@@ -60,6 +61,78 @@ TSI = 4       # tile_size_input
 
 def bf16(a):
     return np.asarray(a).astype(BF16)
+
+
+def repo_root():
+    # gen_llm_decode.py -> decode_fused -> route_b_kernels -> repo root (toolchain.lock lives there).
+    return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def toolchain_provenance():
+    """Best-effort build provenance for meta.json: the toolchain.lock semantic hash this ELF was
+    just compiled against, plus the instance dir the build used, if resolvable.
+
+    Sources scripts/kernel_sandbox.sh's `current_toolchain_hash` (the canonical derivation --
+    comment/blank-stripped toolchain.lock, sha256, first 12 hex; matches
+    kernel_registry.rs::current_toolchain_hash and toolchain_up.sh's LOCKHASH) rather than
+    reimplementing it a fifth time. Returns {} rather than raising: provenance is a record, not a
+    gate, and a build must not fail because this is unresolvable.
+    """
+    repo = repo_root()
+    sandbox = os.path.join(repo, "scripts", "kernel_sandbox.sh")
+    if not os.path.isfile(sandbox):
+        return {}
+    try:
+        out = subprocess.run(
+            ["bash", "-c", f'source "{sandbox}" && current_toolchain_hash "$1"', "_", repo],
+            capture_output=True, text=True, timeout=10,
+        )
+    except OSError:
+        return {}
+    h = out.stdout.strip()
+    if out.returncode != 0 or not h:
+        return {}
+    prov = {"hash": h}
+    inst = os.environ.get("MLIR_AIE_INSTANCE")
+    if inst:
+        prov["instance"] = os.path.basename(inst.rstrip("/"))
+    return prov
+
+
+def report_artifact_freshness(weights_dir):
+    """Print-only freshness check for the sibling `decode/` artifact a `--weights` dir implies
+    (`artifacts/<spec>/weights` -> `artifacts/<spec>/decode`).
+
+    verify_llm_decode.py and bench_llm_decode.py always recompile the graph fresh via build_graph,
+    so THIS run never dispatches stale bytes -- but the shipped Rust engine loads decode.elf/
+    meta.json directly (npu-engine::LlmArtifact) and does not rebuild. A stale artifact sitting next
+    to fresh weights is exactly the silent-wrong-token hole this closes (see
+    docs/kb/the-2026-09-04-repin-left-two-artifact-families-stale.md): the decode ELF that shipped
+    2026-09-03 returned a wrong token at one margin step after the 2026-09-04 re-pin, with nothing
+    to say so. Never raises and never affects the caller's exit code -- this is a report about a
+    DIFFERENT consumer, not a gate on the graph this process just verified.
+    """
+    art_dir = os.path.join(os.path.dirname(os.path.normpath(weights_dir)), "decode")
+    meta_path = os.path.join(art_dir, "meta.json")
+    if not os.path.isfile(meta_path):
+        return
+    meta = json.load(open(meta_path))
+    built = meta.get("toolchain", {}).get("hash")
+    tag = "[freshness]"
+    if not built:
+        print(f"{tag} {meta_path}: no toolchain provenance recorded (built before this check "
+              f"existed) -- the Rust-loaded artifact's freshness is UNVERIFIED", file=sys.stderr)
+        return
+    cur = toolchain_provenance().get("hash")
+    if not cur:
+        print(f"{tag} {meta_path}: built against {built}, but the current toolchain.lock could not "
+              f"be resolved here -- the Rust-loaded artifact's freshness is UNVERIFIED", file=sys.stderr)
+    elif cur != built:
+        print(f"{tag} STALE: {meta_path} was built against toolchain {built}, current toolchain.lock "
+              f"is {cur} -- rebuild with scripts/build_llm_decode.sh before trusting what the Rust "
+              f"engine would load from {art_dir}", file=sys.stderr)
+    else:
+        print(f"{tag} {meta_path}: OK (toolchain {cur})", file=sys.stderr)
 
 
 L1_BYTES = 65536      # AIE2P core local memory (getLocalMemorySize(), AIETargetModel.h)
@@ -350,6 +423,13 @@ def main():
         "layer_types": ["global" if sp.is_global(l) else "sliding" for l in range(NL)],
         "cache_buffers": cache_names,
     }
+    prov = toolchain_provenance()
+    if prov:
+        meta["toolchain"] = prov
+    else:
+        print("[build] WARNING: could not record toolchain provenance in meta.json "
+              "(no toolchain.lock / kernel_sandbox.sh resolvable) -- this artifact will read as "
+              "unstamped to any freshness check", file=sys.stderr)
     json.dump(meta, open(os.path.join(a.out, "meta.json"), "w"), indent=2)
     print(f"\nwrote {NL}-layer {sp.name} decode ELF ({len(elf)}B, scratch {scr/1e6:.1f}MB) to {a.out}")
 
