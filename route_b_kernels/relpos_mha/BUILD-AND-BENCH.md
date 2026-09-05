@@ -295,3 +295,141 @@ VERIFY (no device):
 L1 memref allocs are `[KB,DK]` + the `[TQ,*]` scratch, never `[T,DK]`/`[P,DK]`;
 `scf.for` count small (loops, not unrolled). Device gate: 3d STEP=8 command,
 `rel-L2 <= 0.08 AND corr >= 0.99`.
+
+
+---
+
+## Appendix -- STEP 1 / STEP 2 (single-tile de-risk kernels, T<=32)
+
+STEP 1 and STEP 2 are the two single-tile kernels that de-risked the rel-pos
+bricks before the row-tiled STEP 6+ block above. Both cap at small T (AC/BD/probs
+co-resident in L1; `RELPOS_TMAX=512` caps the per-row f32 scratch) -- STEP 6+ is
+the one that reaches the target T=172 and is device-validated (STATUS above).
+The kernels/generators/runners below still exist and are the narrowest way to
+gate the softmax and AC-matmul bricks in isolation.
+
+### STEP 1 -- relpos_scores_softmax (host-fed AC + BD, no matmul)
+
+Given host-precomputed `AC[T,T]` f32 and `BD[T,P]` f32 (`P = 2T-1`), returns
+`probs[T,T]` bf16 = `softmax_over_keys( rel_shift(BD) + AC , * 1/sqrt(DK) )`. No
+matmul on device -- isolates the two hard rel-pos bricks (the zero-arithmetic
+strided-relayout `rel_shift` + the vectorized-exp2 softmax).
+
+- Kernel: `relpos_mha.cc` -> `relpos_scores_softmax_bake` (thin zero-scalar
+  wrapper baking `T`, `P`, `inv_scale=1/sqrt(128)` over `relpos_scores_softmax`).
+- Generator: `relpos_scores_softmax_iron.py` (single core, 3-buffer ABI: AC in /
+  BD in / probs out; bare `resolve_program()`, PLACE-TILES model, no
+  SequentialPlacer).
+- Golden (CPU, no device): `scripts/parakeet_relpos_mha_golden.py` (G1-G4b).
+- Device runner: `scripts/run_npu_relpos_scores.py`.
+
+`T = 32` (Parakeet block 0) is baked by default. `T` must be identical in
+`make T=<n>` (threads both the generator `-T` and the kernel `-DRELPOS_T`).
+
+Build:
+
+    bash scripts/setup_route_b.sh
+    source scripts/iron_env.sh
+    bash scripts/sync_kernels.sh
+    make -C mlir-aie/programming_examples/ml/relpos_mha NPU2=1 T=32
+    # -> build/final.xclbin, build/insts.bin
+
+Drive block-0 head-0: the runner computes `AC[32,32]` f32 + `BD[32,63]` f32 from
+the encoder weight artifacts, sends them (host_only BOs, group_ids 3/4), reads
+back `probs[32,32]` bf16 (group_id 5). ABI: `opcode=3`,
+`kernel(3, instr[gid1,cacheable], n_instr, AC[gid3], BD[gid4], PROBS[gid5])`.
+Block-0 raw scores saturate (~one-hot softmax), which only tests rel_shift +
+argmax, so by default the runner pre-scales AC/BD by `1/std` host-side to land a
+non-degenerate softmax that exercises the on-chip exp2 / bf16-reciprocal path
+(the oracle uses the identical effective scale); `--raw` drives the true
+saturating regime.
+
+    .venv-iron/bin/python scripts/run_npu_relpos_scores.py \
+        --xclbin mlir-aie/programming_examples/ml/relpos_mha/build/final.xclbin \
+        --insts  mlir-aie/programming_examples/ml/relpos_mha/build/insts.bin \
+        --block 0 --head 0
+    # add --raw for the saturating (one-hot) regime
+
+CPU golden (`scripts/parakeet_relpos_mha_golden.py`):
+
+    G1  strided rel_shift == NeMo rel_shift : rel=0.000e+00  PASS
+    G2  f32 mirror (strided) == host mhsa   : rel=0.000e+00  PASS
+    G3  kernel bf16 model vs f32 host mhsa  : rel=4.235e-02  GATE<= 0.08  PASS
+    G4a standalone brick, real regime       : rel=0.000e+00  GATE<= 0.08  PASS  (worst of 8 heads; scores saturate -> ~one-hot)
+    G4b standalone brick, non-degenerate sm : rel=2.928e-03  GATE<= 0.08  PASS  (worst of 8 heads; exercises exp2 softmax)
+
+Device PASS criteria: `rel-L2 <= 0.08 AND corr >= 0.99` vs the fp32 host softmax,
+with `probs` rowsums ~1.0. The host-side numeric model of the device path checks
+out at rel-L2 ~2.5e-3 across all 8 heads (rescaled regime) and exactly 0 in the
+raw one-hot regime; the device gate itself (aiecc build + pyxrt drive) is
+CPU-authored + numpy-validated only, gated serially by the orchestrator like
+every other device step in this file.
+
+### STEP 2 -- relpos_ac_scores_softmax (on-chip AC matmul, resident-L1 score tile)
+
+Composes the `AC = qu @ k^T` score matmul ON DEVICE, keeping the f32 score tile
+resident in L1 between the matmul and the softmax (no host round-trip) -- the
+first resident-block test. Takes PACKED `qk[2T,DK]` bf16 (`qu = qk[0:T]`,
+`k = qk[T:2T]`) + host-fed `BD[T,P]` f32, returns the same `probs[T,T]` bf16 as
+STEP 1: `softmax_over_keys( rel_shift(BD) + (qu @ k^T) , * 1/sqrt(DK) )`.
+
+- Kernel: `relpos_mha.cc` -> `relpos_ac_scores_softmax_bake` (`relpos_ac_matmul`
+  writes a resident L1 f32 `g_ac[T*T]`; `relpos_scores_softmax` reads it in
+  place). Row-major bf16-in / f32-accumulate dot-product tile (mirrors the `q.K`
+  dot in `mha_decode.cc`), producing row-major AC directly so the per-row
+  rel_shift + softmax-over-keys can consume it with no de-block pass. The
+  `aie::mmul`-blocked microkernel is the perf follow-up (needs an L1 de-block
+  before the row-wise softmax).
+- Generator: `relpos_ac_scores_softmax_iron.py` (single core, 3-buffer ABI: qk
+  in / BD in / probs out; qu+k packed into one input to stay within the NPU2
+  compute tile's 2 input-DMA-channel budget; bare `resolve_program()`,
+  PLACE-TILES model, no SequentialPlacer).
+- Makefile: same `Makefile`, selected by `STEP=2`.
+- Golden: `scripts/parakeet_relpos_mha_golden.py` (G5a/G5b/G5c).
+- Device runner: `scripts/run_npu_relpos_ac_scores.py`.
+
+Build (T=32):
+
+    bash scripts/setup_route_b.sh
+    source scripts/iron_env.sh
+    bash scripts/sync_kernels.sh
+    make -C mlir-aie/programming_examples/ml/relpos_mha clean
+    make -C mlir-aie/programming_examples/ml/relpos_mha NPU2=1 STEP=2 T=32
+    # -> build/final.xclbin (kernel 'relpos_ac_scores_softmax_bake'), build/insts.bin
+
+Drive block-0 head-0: packs `qk = concat(bf16(qu), bf16(k))` and host-fed
+`BD[32,63]` f32, reads back `probs[32,32]` bf16. ABI: `opcode=3`,
+`kernel(3, instr[gid1,cacheable], n_instr, QK[gid3], BD[gid4], PROBS[gid5])`.
+Same regime discipline as STEP 1: block-0 raw scores saturate to a one-hot where
+the bf16 matmul can flip a near-tie argmax (harmless; washes out end-to-end), so
+the runner defaults to the rescaled non-degenerate softmax (divides qu/BD by
+std); `--raw` drives the saturating regime.
+
+    .venv-iron/bin/python scripts/run_npu_relpos_ac_scores.py \
+        --xclbin mlir-aie/programming_examples/ml/relpos_mha/build/final.xclbin \
+        --insts  mlir-aie/programming_examples/ml/relpos_mha/build/insts.bin \
+        --block 0 --head 0
+    # add --raw for the saturating (one-hot) regime
+
+Gate: `rel-L2 <= 0.08 AND corr >= 0.99` vs the fp32 host softmax, rowsums ~1.0.
+
+Step-2 golden numbers (`scripts/parakeet_relpos_mha_golden.py`):
+
+    G3  kernel bf16 model vs f32 host mhsa  : rel=4.235e-02  GATE<= 0.08  PASS
+    G5c step-2 AC bf16 mmul vs f32 qu@k^T   : rel=8.264e-03  (matmul only, diagnostic)
+    G5a step-2 composed brick, real regime  : rel=2.500e-01  DIAGNOSTIC (one-hot; 2 near-tie argmax flip(s) across 8 heads; washes out in G3)
+    G5b step-2 composed brick, non-degen sm : rel=7.048e-03  GATE<= 0.08  PASS
+    RESULT: ALL PASS
+
+G5a is diagnostic, not a gate: the real block-0 softmax is an exact one-hot, so
+the only signal is whether the bf16 AC matmul flips a near-tie argmax -- exactly
+2 rows across all 8 heads flip, each costing `sqrt(2/T) ~ 0.25` rel by
+construction. The end-to-end G3 (bf16 AC folded through ctx + out proj) shows
+these flips wash out to 4.2e-2, and G5b (rescaled, exercises the actual on-chip
+matmul + exp2 numerics) passes at 7.0e-3. So the composed brick is gated on G5b
++ G3, matching STEP 1's "the real regime only tests rel_shift + argmax" framing.
+
+Device gate for STEP 2: CPU-authored + numpy-validated only, same
+orchestrator-serial device discipline as every step in this file. The unknown
+vs STEP 1 is the matmul -> resident-L1 -> softmax objectFIFO chain and the
+packed-qk 2-input DMA; the softmax brick itself is validated from STEP 1.
