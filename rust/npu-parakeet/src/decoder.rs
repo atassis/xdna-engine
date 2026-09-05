@@ -7,7 +7,7 @@
 //!   * joint network: enc_t + pred_u -> [vocab(8193) + durations(5)] logits
 //!   * greedy token/duration emit loop with frame-skipping (mirrors onnx_asr NeMo TDT)
 //!
-//! NPU port map (per aie2p-brick-catalog): embedding -> parallel_lookup; the LSTM/joint
+//! NPU port map (per aie2p-architecture-and-roofline): embedding -> parallel_lookup; the LSTM/joint
 //! matmuls -> M=1 GEMV (mac/accumulate, NOT mmul -- overhead-bound); argmax -> max_cmp.
 //!
 //! Weights are loaded from the .npy files produced by

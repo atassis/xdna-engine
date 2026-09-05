@@ -12,7 +12,7 @@ and refuted on device:
   * a false `__restrict` on pB/pScale, which alias the same packed allocation -- restrict
     dropped from both; C still exactly zero.
 
-So stop guessing and read the pointer back. This probe reuses verify_f2b's EXACT packing
+So stop guessing and read the pointer back. This probe reuses verify_gemm_int8xint4's EXACT packing
 (`pack_int4_blocks` -> contiguous 128B blocks, then scale appended) and the same 2-input
 shim shape, but instead of computing anything it copies the scale words straight out.
 
@@ -32,7 +32,7 @@ import numpy as np
 
 import aie.iron as iron
 import bricklib
-from verify_f2b import pack_int4_blocks, pack_int4
+from verify_gemm_int8xint4 import pack_int4_blocks, pack_int4
 
 GEN = Path(__file__).parent / "gen"
 GEN.mkdir(exist_ok=True)

@@ -45,7 +45,7 @@ Every tensor starts at an offset that is a multiple of **64 bytes**, the `alignm
 in the manifest. Padding between tensors is zero-filled.
 
 64B is not an arbitrary round number -- it is a real AIE2P hardware alignment tier already
-documented in `docs/aie2p-brick-catalog.md`'s `load_v`/`store_v` row (**alignment 16/32/64B**;
+documented in `docs/aie2p-architecture-and-roofline.md`'s `load_v`/`store_v` row (**alignment 16/32/64B**;
 that same doc also flags "misaligned aligned-load silently truncates the address" as a live
 footgun, no fault, no assert). A 64B boundary is exactly the size of one 16-lane f32 (or 32-lane
 bf16) vector register store. Aligning every tensor to 64B means a future device-side loader can
@@ -185,7 +185,7 @@ analytic scan, `analytic_size_report()`).
 time. It is a one-time load cost, not a per-token cost, but it is real: this project counts bytes
 moved, and a ~4.5B-element bf16 weight set is the thing that has to move. Whether some or all of
 that 8.5 GiB should instead be a re-quantized int8/int4 blob is exactly the kind of FORMAT-lever
-tradeoff `docs/aie2p-brick-catalog.md` catalogs generically -- this tool deliberately leaves that
+tradeoff `docs/aie2p-architecture-and-roofline.md` catalogs generically -- this tool deliberately leaves that
 slot empty (see "What this tool does not do" below) rather than deciding it here.
 
 ## Self-test: how a blob is verified

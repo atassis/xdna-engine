@@ -12,7 +12,7 @@ Run under the NPU lock:  ./run.sh verify_upscaler_conv2d_ktile.py
 import numpy as np
 import bricklib
 from bricklib import _build_oneshot, iron, GEN
-from verify_f2 import tile_pack, tile_unpack, golden_mod
+from verify_gemm_int8 import tile_pack, tile_unpack, golden_mod
 
 Cin, Cout, k, stride, pad, H, W = 64, 32, 3, 1, 1, 8, 8
 Ho = (H + 2*pad - k)//stride + 1

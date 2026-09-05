@@ -11,7 +11,7 @@ WHY THIS IS DEVICE-GATED (author best-effort; do NOT run on CPU/import):
     (f32) OUT. The core tile has 2-in/2-out DMA channels, and this rail
     (bricklib._build_oneshot) is device-proven at <=2 inputs / 1 output. So we
     PACK: input#0 = [k | v | q | gates] byte-concatenated (split by byte offset in
-    the shim, exactly like verify_f2b packs [B | scale] into one weight buffer);
+    the shim, exactly like verify_gemm_int8xint4 packs [B | scale] into one weight buffer);
     input#1 = s_in (recurrent state seed, f32). The SINGLE output buffer is the
     bf16 readout `o`. The updated state `s_out` is written to a shim-local scratch
     buffer and is NOT read back here -- verifying it needs a second probe (see

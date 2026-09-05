@@ -90,10 +90,10 @@ except Exception:
     print("rope-lut: could not import verify_rope_lut")
     traceback.print_exc(limit=3)
 
-# ---- layernorm (verify_rowwise, lives in verify_f1) ----
+# ---- layernorm (verify_rowwise, lives in verify_norm_elementwise_f32) ----
 try:
-    vf1 = importlib.import_module("verify_f1")
+    vf1 = importlib.import_module("verify_norm_elementwise_f32")
     run("layernorm (frame 0x480, sum over 4 functions)", vf1.do_layernorm)
 except Exception:
-    print("layernorm: could not import verify_f1.do_layernorm")
+    print("layernorm: could not import verify_norm_elementwise_f32.do_layernorm")
     traceback.print_exc(limit=3)

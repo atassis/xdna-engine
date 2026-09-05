@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""F2 family device-verify: GEMM/GEMV (single-shot, block-tiled layout).
+"""int8 GEMM/GEMV device-verify (single-shot, block-tiled layout).
    Start with exact int8 (gemm-int8, gemv-int8): int8xint8->int32, expect ~bit-exact.
 """
 import importlib.util
@@ -84,10 +84,10 @@ do_gemv_int8.brick_name = "gemv-int8"
 if __name__ == "__main__":
     for fn in (do_gemm_int8, do_gemv_int8):
         guard(fn)
-    print("\n==== F2 (int8) SUMMARY ====")
+    print("\n==== GEMM/GEMV INT8 SUMMARY ====")
     for r in results:
         print(f"  {r['name']:22s} {r['status']:10s} rel_l2={r.get('rel_l2', float('nan')):.3e}")
     passed = sum(1 for r in results if r.get("ok"))
-    print(f"F2-int8: {passed}/{len(results)} PASS")
+    print(f"gemm-int8: {passed}/{len(results)} PASS")
     print("JSON " + json.dumps(results))
     sys.exit(0 if passed == len(results) else 1)

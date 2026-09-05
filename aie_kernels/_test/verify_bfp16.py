@@ -31,7 +31,7 @@ import numpy as np
 
 import ml_dtypes
 import bricklib
-from verify_f2 import tile_pack, tile_unpack
+from verify_gemm_int8 import tile_pack, tile_unpack
 
 BRICKS = Path(__file__).parent.parent
 GEN = Path(__file__).parent / "gen"

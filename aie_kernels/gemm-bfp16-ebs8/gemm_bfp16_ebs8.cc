@@ -7,7 +7,7 @@
 // bfloat16-emulated-via-bfp16 path) -- a PARAMETERIZED primitive (M/K/N are
 // template args resolved per dispatch by the schedule, not per-model
 // hand-fusion) -- brick catalog entry, matmul group, compute-bound M>=8
-// regime (see docs/aie2p-brick-catalog.md).
+// regime (see docs/aie2p-architecture-and-roofline.md).
 //
 // API pattern studied from:
 //   - route_b_kernels/ffn_bfp16/repro_847_mmul888_bfp16.cc (mmul<M,K,N,TA,TB,

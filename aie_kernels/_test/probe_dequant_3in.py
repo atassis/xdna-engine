@@ -23,7 +23,7 @@ import ml_dtypes
 
 import bricklib
 from bricklib import GEN
-from verify_f2b import golden_mod, pack_int4_blocks, pack_int4, tile_pack, tile_unpack
+from verify_gemm_int8xint4 import golden_mod, pack_int4_blocks, pack_int4, tile_pack, tile_unpack
 
 M, K, N, G = 8, 64, 64, 64
 

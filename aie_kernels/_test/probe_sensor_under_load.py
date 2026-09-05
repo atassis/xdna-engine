@@ -24,8 +24,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "bench"))
 import aie.iron as iron  # noqa: E402
 import bricklib  # noqa: E402
 from npu_sensors import read_sensors  # noqa: E402
-from verify_f2 import tile_pack  # noqa: E402
-from verify_f2b import GEN, golden_mod, pack_int4, pack_int4_blocks  # noqa: E402
+from verify_gemm_int8 import tile_pack  # noqa: E402
+from verify_gemm_int8xint4 import GEN, golden_mod, pack_int4, pack_int4_blocks  # noqa: E402
 
 SECONDS = float(sys.argv[1]) if len(sys.argv) > 1 else 30.0
 M, K, N, G, Nt = 4, 1024, 4096, 128, 16

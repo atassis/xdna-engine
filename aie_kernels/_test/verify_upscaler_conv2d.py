@@ -15,7 +15,7 @@ Run under the NPU lock:  ./run.sh verify_upscaler_conv2d.py
 """
 import numpy as np
 import bricklib
-from verify_f2 import tile_pack, tile_unpack, golden_mod
+from verify_gemm_int8 import tile_pack, tile_unpack, golden_mod
 
 # --- conv config chosen to fit ONE 64x64x64 gemm-int8 tile -------------------
 Cin, Cout, k, stride, pad, H, W = 16, 64, 2, 1, 0, 9, 9

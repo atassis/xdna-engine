@@ -5,7 +5,7 @@
 // tiled over the AIE2P aie::mmul<M,K,N,int8,int4,accauto> "mmul_8_4" unit.
 // PARAMETERIZED primitive (M/K/N are template args resolved per dispatch by
 // the schedule, not per-model hand-fusion) -- brick catalog entry, matmul
-// group, compute-bound M>=8 regime (see docs/aie2p-brick-catalog.md).
+// group, compute-bound M>=8 regime (see docs/aie2p-architecture-and-roofline.md).
 //
 // KEY brick per the task: this is the first int8xint4 mixed-precision GEMM in
 // the catalog. If it ICEs or mislowers, that is a candidate llvm-aie PR, not a

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""F3 specials device-verify (tractable ones). transpose-dma: pure strided permutation,
+"""Specials device-verify (tractable ones). transpose-dma: pure strided permutation,
    bit-exact. (rope-lut/lm-head-argmax/moe/gdn/dequant-int4 are heavier -- parked.)
 """
 import json
@@ -44,10 +44,10 @@ do_transpose_dma.brick_name = "transpose-dma"
 if __name__ == "__main__":
     for fn in (do_transpose_dma,):
         guard(fn)
-    print("\n==== F3 SUMMARY ====")
+    print("\n==== SPECIALS SUMMARY ====")
     for r in results:
         print(f"  {r['name']:22s} {r['status']:10s} rel_l2={r.get('rel_l2', float('nan')):.3e}")
     passed = sum(1 for r in results if r.get("ok"))
-    print(f"F3: {passed}/{len(results)} PASS")
+    print(f"specials: {passed}/{len(results)} PASS")
     print("JSON " + json.dumps(results))
     sys.exit(0 if passed == len(results) else 1)

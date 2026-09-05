@@ -48,7 +48,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).parent))
 import bricklib  # noqa: E402
 from verify_bfp16 import BF16, pack_B_nk_blocks  # noqa: E402
-from verify_f2 import golden_mod, tile_pack, tile_unpack  # noqa: E402
+from verify_gemm_int8 import golden_mod, tile_pack, tile_unpack  # noqa: E402
 
 GEN = Path(__file__).parent / "gen"
 GEN.mkdir(exist_ok=True)

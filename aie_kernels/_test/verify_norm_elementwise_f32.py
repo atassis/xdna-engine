@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""F1 family device-verify: norm + elementwise f32 bricks, one device session.
+"""Norm + elementwise f32 device-verify, one device session:
    rmsnorm, layernorm, qk-norm, relu2, geglu, swiglu.  Gate rel-L2 <= brick threshold.
 """
 import importlib.util
@@ -129,11 +129,11 @@ do_swiglu.brick_name = "swiglu"
 if __name__ == "__main__":
     for fn in (do_rmsnorm, do_layernorm, do_qknorm, do_relu2, do_geglu, do_swiglu):
         guard(fn)
-    print("\n==== F1 SUMMARY ====")
+    print("\n==== NORM+ELEMENTWISE F32 SUMMARY ====")
     for r in results:
         print(f"  {r['name']:22s} {r['status']:10s} "
               f"rel_l2={r.get('rel_l2', float('nan')):.3e}")
     passed = sum(1 for r in results if r.get("ok"))
-    print(f"F1: {passed}/{len(results)} PASS")
+    print(f"norm-elementwise-f32: {passed}/{len(results)} PASS")
     print("JSON " + json.dumps(results))
     sys.exit(0 if passed == len(results) else 1)

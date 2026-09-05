@@ -38,10 +38,10 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 
 TARGETS = [
-    "verify_f1",  # norm + elementwise (6 gates)
-    "verify_f2",  # int8 (2)
-    "verify_f2b",  # int8 gemv (6)
-    "verify_f3",  # transpose (1)
+    "verify_norm_elementwise_f32",  # norm + elementwise (6 gates)
+    "verify_gemm_int8",  # int8 (2)
+    "verify_gemm_int8xint4",  # int8 gemv (6)
+    "verify_specials",  # transpose (1)
     "verify_bfp16",
     "verify_cast_quant",
     "verify_rope_lut",

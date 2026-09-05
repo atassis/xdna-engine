@@ -33,8 +33,8 @@ import numpy as np
 
 import aie.iron as iron
 import bricklib
-from verify_f2 import tile_pack
-from verify_f2b import pack_int4_blocks, pack_int4
+from verify_gemm_int8 import tile_pack
+from verify_gemm_int8xint4 import pack_int4_blocks, pack_int4
 
 GEN = Path(__file__).parent / "gen"
 GEN.mkdir(exist_ok=True)

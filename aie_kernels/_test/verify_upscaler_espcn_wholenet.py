@@ -14,7 +14,7 @@ Run under the NPU lock:  ./run.sh verify_upscaler_espcn_wholenet.py
 import numpy as np, ml_dtypes
 from pathlib import Path
 from bricklib import _build_oneshot, iron, GEN
-from verify_f2 import tile_pack, tile_unpack, golden_mod
+from verify_gemm_int8 import tile_pack, tile_unpack, golden_mod
 
 # Fixture resolution. This gate was promoted out of a session scratchpad whose temp dir is long
 # gone, and the promotion rewrote WD to a path that nothing in the tree ever creates -- so the gate

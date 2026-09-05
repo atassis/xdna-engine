@@ -58,7 +58,7 @@ import s2_ar_ref as ar  # noqa: E402  (reuse GGUF parsing + validated q6_k dequa
 FORMAT_VERSION = 1
 
 # 64 bytes is the floor this project already treats as a real hardware alignment tier, not a
-# round number picked for this tool: docs/aie2p-brick-catalog.md's load_v/store_v row documents
+# round number picked for this tool: docs/aie2p-architecture-and-roofline.md's load_v/store_v row documents
 # 16/32/64B as the AIE2P vector load/store alignment classes, and a 16-lane f32 (or 32-lane bf16)
 # vector register store is exactly 64B. Aligning every tensor to 64B means a future device-side
 # loader can DMA any tensor's bytes straight off the mmap with no bounce-copy to fix up alignment,

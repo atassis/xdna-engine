@@ -6,7 +6,7 @@ nibble = even col, high = odd col, signed two's-complement [-8,7]) -> bf16 dequa
 `(q - zp) * scale` at GROUP granularity. Symmetric (HAS_ZP=0, zp folded away) is the
 primary case; asymmetric (HAS_ZP=1) is a compile-flag variant.
 
-RAIL SHAPE (mirrors verify_f2b's dequant): a core tile has only 2-in/2-out DMA
+RAIL SHAPE (mirrors verify_gemm_int8xint4's dequant): a core tile has only 2-in/2-out DMA
 channels but this op has THREE logical inputs (packed uint8 / scale f32 / zp int8).
 We pack all three into ONE resident input buffer and split it by byte offset inside
 the shim -- so exactly 1 input fifo + 1 output fifo cross the tile boundary.

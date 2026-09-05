@@ -43,8 +43,9 @@ from aie.utils.npukernel import NPUKernel
 from aie.utils.tensor_factory import tensor, zeros
 import aie.utils as aie_utils
 
-# bfp16 path: mmul<8,8,8> lowers to one mac_8x8_8x8T_conf = 512 MACs/cycle/core. The brick catalog's
-# 128 is plain bf16 and gating against it understates the gap 4x. Core clock from AMD's published
+# bfp16 path: mmul<8,8,8> lowers to one mac_8x8_8x8T_conf = 512 MACs/cycle/core. The
+# aie2p-architecture-and-roofline.md doc's 128 is plain bf16 and gating against it understates
+# the gap 4x. Core clock from AMD's published
 # 50 TOPS / 32 cores / 512 MAC (an on-device trace independently implied ~1.6 GHz).
 MAC_PER_CYCLE_PER_CORE = 512
 CORE_CLOCK_HZ = 1.53e9

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Device gate for the STREAMED (tiled-operand) int4 dequant rail.
 
-Split out of verify_f2b so a run rebuilds only these two xclbins: the point of this rail is
+Split out of verify_gemm_int8xint4 so a run rebuilds only these two xclbins: the point of this rail is
 the shapes the one-shot builder cannot stage into L1, and iterating on it while rebuilding
 every F2b brick wastes device time.
 
@@ -11,7 +11,7 @@ every F2b brick wastes device time.
 import json
 import traceback
 
-from verify_f2b import (
+from verify_gemm_int8xint4 import (
     do_gemm_int8xint4_dequant_64x128x128_streamed,
     do_gemm_int8xint4_dequant_tallk_streamed,
 )

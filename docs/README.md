@@ -7,8 +7,9 @@ thesis - it is the frame everything else follows from.
   data-movement-bound, not compute-bound, and what that implies for optimization.
 - [where-time-goes.md](where-time-goes.md) - a precise accounting of NPU encoder
   time and energy: most of it is avoidable overhead, not compute.
-- [aie2p-brick-catalog.md](aie2p-brick-catalog.md) - the XDNA2 hardware "periodic
-  table": the compute/movement/memory/orchestration/format bricks and how to pick one.
+- [aie2p-architecture-and-roofline.md](aie2p-architecture-and-roofline.md) - the XDNA2
+  hardware's fixed set of capabilities across five layers (compute/movement/memory/
+  orchestration/format) and a roofline model for picking the right one per regime.
 - [execution-graph.md](execution-graph.md) - which hardware primitive to use at each
   node of the encoder/decoder/lm-head/vision graph, keyed on the compute regime.
 - [case-study-on-npu-logits.md](case-study-on-npu-logits.md) - moving the Whisper

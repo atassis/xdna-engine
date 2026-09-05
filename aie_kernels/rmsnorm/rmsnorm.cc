@@ -1,6 +1,6 @@
 //===- rmsnorm.cc ---------------------------------------------*- C++ -*-===//
 //
-// GENERIC AIE2P brick: RMSNorm (op-TYPE `norm{RMS}`, see docs/aie2p-brick-catalog.md
+// GENERIC AIE2P brick: RMSNorm (op-TYPE `norm{RMS}`, see docs/aie2p-architecture-and-roofline.md
 // and the norm{LN|RMS} rail in build-methodology). Affine, single-pass, no re-centering
 // (that's the LN-vs-RMS distinction: RMSNorm skips the mean-subtraction entirely and
 // normalizes by the root-mean-square of x directly).

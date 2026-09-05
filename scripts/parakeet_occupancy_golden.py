@@ -58,9 +58,9 @@ OP_MAP = {
     4096: [("ff1.linear1", 1), ("ff2.linear1", 1)],
 }
 
-# --- machine constants (aie2p-brick-catalog.md; ASSUMPTIONS labelled) ---
+# --- machine constants (aie2p-architecture-and-roofline.md; ASSUMPTIONS labelled) ---
 N_CORES = 32  # whole_array compute grid = 8 cols x 4 rows (core_tiles rows 2-5)
-PEAK_MAC = {  # MAC/cyc/core by format (catalog LAYER 1)
+PEAK_MAC = {  # MAC/cyc/core by format (architecture doc LAYER 1)
     "bf16_emul": 128,   # emulated bf16 FMA+shuffle (native 32x32x32 tile)
     "bfp16_true": 512,  # TRUE systolic bfp16 (fast 64x32x128 tile, BFP16_IREE)
 }

@@ -13,7 +13,7 @@ import numpy as np
 
 import aie.iron as iron
 import bricklib
-from verify_f2 import tile_pack, tile_unpack
+from verify_gemm_int8 import tile_pack, tile_unpack
 
 BRICKS = Path(__file__).parent.parent
 CC = str(BRICKS / "gemm-int8xint4" / "gemm_int8xint4.cc")

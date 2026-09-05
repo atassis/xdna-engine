@@ -110,4 +110,4 @@ movement**, not speeding up arithmetic:
 GEMV, cascade FFN, single-query flash MHA, depthwise/2D conv, LayerNorm, softmax, and a
 transpose path. They are built through the pinned `mlir-aie` toolchain (place-tiles model)
 and validated against NumPy/ONNX goldens before use. The kernel-selection map - which
-brick for which node and regime - is documented in `docs/`.
+hardware capability for which node and regime - is documented in `docs/`.

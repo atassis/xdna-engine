@@ -15,7 +15,7 @@ without the NPU. Validating it node-by-node here (rel-L2 <= 0.08 vs the ONNX
 oracle) de-risks the later NPU port: the prediction GEMVs map to the M=1 GEMV
 brick + embedding parallel_lookup, the joint argmax to max_cmp.
 
-Bricks this reference stands in for (per aie2p-brick-catalog, NPU port):
+Hardware capabilities this reference stands in for (per aie2p-architecture-and-roofline.md, NPU port):
   - embedding lookup        -> parallel_lookup (gather LUT)
   - LSTM / joint matmuls     -> GEMV (M=1 small) -- mac/accumulate, not mmul
   - token + duration argmax  -> max_cmp (value + index co-produced, free argmax)

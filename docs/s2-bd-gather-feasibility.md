@@ -84,11 +84,11 @@ runtime sequences" as an **unchecked** (`- [ ]`) item: "The core milestone (stan
 encoding, AIEX->EmitC codegen, SSA-operand control ops, dynamic BD allocation, ...) is
 merged; what remains is reworking the IRON `Runtime` Python API into an eager callback body."
 
-Consistent with this, `docs/aie2p-brick-catalog.md:180-182` (this repo, written before this
-investigation) already recorded: "BD-chain on-chip loop: the hardware brick exists, but
-in-tree authoring is limited (npu-insts is flat / loop-incapable) -> exposing it is a
-toolchain opportunity. The dynamic-runtime-sequences work upstream is already moving in this
-direction." That prediction is now confirmed from the harness source directly.
+Consistent with this, `docs/aie2p-architecture-and-roofline.md:182-184` (this repo, written
+before this investigation) already recorded: "BD-chain on-chip loop: the hardware capability
+exists, but in-tree authoring is limited (npu-insts is flat / loop-incapable) -> exposing it
+is a toolchain opportunity. The dynamic-runtime-sequences work upstream is already moving in
+this direction." That prediction is now confirmed from the harness source directly.
 
 **No example anywhere in the fork** (`programming_examples/`, `test/`) shows a compute core
 reading a data value (e.g. a token id it just streamed in) and using it to reprogram a BD
@@ -136,7 +136,7 @@ per-token KV-cache-append offset `kv_off` used by `route_b_kernels/decode_fused/
 193-198`, `gen_gemma_decode.py:123-128`, and gated by
 `decode_fused/verify_fused_decode_sp.py:110-111,218` (`sp.write("kv_off", step * HD)`) is the
 exact same `offset_parameter` mechanism, already proven on-device for a different per-token
-runtime offset. `docs/aie2p-brick-catalog.md:102` records it: "RTP scratchpad | per-token
+runtime offset. `docs/aie2p-architecture-and-roofline.md:103` records it: "RTP scratchpad | per-token
 params, constant ELF | OK | kv_off + sm_mask, 2 words/token (replaced a 27MB ELF patch)".
 
 **Correction to `gather_rows.cc:52-56`'s claim that "bricklib AS IT EXISTS TODAY CANNOT
@@ -199,7 +199,7 @@ NPU-resident copy once at load time) and DMAs one dense `[T, 2560]` bf16 buffer 
 
 - Cost: `T * 5120` bytes over the host link — for a single decode step (T<=11) that's under 56
   KB, negligible next to this project's own measured per-dispatch overhead (`docs/
-  aie2p-brick-catalog.md`'s "~91% inter-op dispatch overhead" figure for decode).
+  aie2p-architecture-and-roofline.md`'s "~91% inter-op dispatch overhead" figure for decode).
 - Fits this project's own front-to-back doctrine's allowance for a host-uploaded **resident
   head** at the start of a pipeline segment.
 - Downside: needs the table ALSO readable from the host per step. `s2-ar-graph-map.md:39-45`'s
@@ -216,7 +216,7 @@ AR gather's 11-row worst case in a single dispatch.
 
 - Cost: T separate small BD executions (each ~5 KB), no batching across rows into one
   descriptor since the offsets are non-uniform — likely below this project's measured
-  small-transfer efficiency floor (`resadd` at 6.0 GB/s, `docs/aie2p-brick-catalog.md`'s
+  small-transfer efficiency floor (`resadd` at 6.0 GB/s, `docs/aie2p-architecture-and-roofline.md`'s
   movement-floor numbers) per individual row, but the absolute bytes are tiny (11 rows x 5 KB
   = 55 KB) so the dominant cost is dispatch/BD-reprogram overhead, not bandwidth.
 - Advantage over A: never leaves the NPU's own LPDDR — no host-RAM duplicate of an 800+200+21

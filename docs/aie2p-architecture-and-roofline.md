@@ -1,18 +1,18 @@
-# AIE2P hardware brick catalog - the periodic table for building from scratch
+# AIE2P hardware architecture and roofline model
 
 The AMD XDNA2 (Strix) NPU is an AIE2P array. Its performance is not a mystery once you
-stop thinking in FLOPs and start thinking in *bricks*: the fixed set of hardware
-primitives the silicon actually provides, spread across five layers - COMPUTE, MOVEMENT,
-MEMORY, ORCHESTRATION, and FORMAT. Each layer has a small number of specialized bricks,
-and the recurring, costly mistake is reaching for a *generic* brick where a *specialized*
-one exists. Swapping a hand-rolled `mac`+`reduce_add` matmul for the systolic `mmul`
-brick, for example, is a single-brick change worth roughly 5x.
+stop thinking in FLOPs and start thinking in hardware capabilities: the array provides a
+fixed set of them, spread across five layers - COMPUTE, MOVEMENT, MEMORY, ORCHESTRATION,
+and FORMAT. Each layer offers a small number of specialized capabilities, and the
+recurring, costly mistake is reaching for a *generic* one where a *specialized* one
+exists. Swapping a hand-rolled `mac`+`reduce_add` matmul for the systolic `aie::mmul`
+unit, for example, is a single swap worth roughly 5x.
 
-This is the complete inventory - every brick, what it does, whether it is being used
+This is the complete inventory - every capability, what it does, whether it is being used
 optimally, and where it applies - so that designing an algorithm for this hardware is a
-*lookup*, not a post-hoc discovery. The other half of the doc is the pick-by-regime rule:
-a brick only helps in the regime it was built for, and applying a compute brick to an
-overhead-bound decode step buys nothing.
+*lookup*, not a post-hoc discovery. The other half of the doc is a roofline model: a
+capability only helps in the regime it was built for (compute-bound vs. memory/overhead-
+bound), and applying a compute capability to an overhead-bound decode step buys nothing.
 
 Legend: **OK** = used optimally - **~** = used suboptimally - **X** = unused (left on the table).
 
@@ -36,7 +36,7 @@ Legend: **OK** = used optimally - **~** = used suboptimally - **X** = unused (le
 Source: `aie_api/{aie.hpp,detail/mmul.hpp,sliding_mul.hpp,accum.hpp}`, the aie2p vector
 multiply intrinsics.
 
-| Brick | What | Status | Where / note |
+| Capability | What | Status | Where / note |
 |---|---|---|---|
 | **mmul** (systolic matrix) | M*K*N tile/issue, K-sum stays in acc, no reduce | **OK** in the patch-embed and repro paths; GEMV path still **~** | encoder/FFN/prefix GEMM (M>=8). The ~5x win. Batched cascade-FFN GEMM tile is still mac+reduce and remains a candidate. Shapes per format below |
 | **mac / mul** (vector FMA) | elementwise into acc | **OK** (norm/bias/act); **~** for matmul (paired w/ reduce_add) | M=1 GEMV is correctly mac; batched should be mmul |
@@ -64,7 +64,7 @@ MAC/issue, densest)**; int16 small-K.
 
 Source: the AIE / AIEX / AIR dialect op definitions.
 
-| Brick | What | Status | Where / note |
+| Capability | What | Status | Where / note |
 |---|---|---|---|
 | `dma_bd` (n-D strided + pad) | 3-D core / 4-D memtile strided slice, zero-pad gather | **OK** | transpose/relayout/im2col FOR FREE in the DMA |
 | **BD-chain loop** (`next_bd`+`repeat_count`) | the ONLY on-chip hardware loop (BD next-ptr goto) | **X** | **#1 MOVEMENT LEVER: whole decode layer as ONE dispatch -> kills the ~91% inter-op dispatch overhead** |
@@ -82,7 +82,7 @@ Source: the AIE / AIEX / AIR dialect op definitions.
 
 Source: the target model + `aie_api/{accum,vector,ld_st}.hpp`.
 
-| Brick | What | Status | Where / note |
+| Capability | What | Status | Where / note |
 |---|---|---|---|
 | L1 64KB/core (4 banks) | core working set | **OK** (N-stationary tiling fits it) | overflow = build fail; M-stationary correctly rejected (~4.15x slower) |
 | L2 MemTile 512KB x8 = 4MB | staging / resident-intermediate home | **~ (forced)** | FFN 3MB intermediate > 512KB -> must tile / DDR round-trip |
@@ -95,7 +95,7 @@ Source: the target model + `aie_api/{accum,vector,ld_st}.hpp`.
 
 Source: the lock/objectfifo + runtime-sequence op definitions, plus the decode generator.
 
-| Brick | What | Status | Where / note |
+| Capability | What | Status | Where / note |
 |---|---|---|---|
 | locks (counting semaphores, AcquireGreaterEqual/Release = P/V) | buffer credits | **OK** (via objectFIFO) | 16/core, 64/memtile, max 63 |
 | **objectFIFO depth** | N buffers = compute/DMA overlap | **~ the known miss** | depth-1 (no overlap) hit in cascade-FFN; recovering depth-2 without the w1+w2 over-credit needs a per-sub-stream knob the AIR Python API lacks -> C++ pass / upstream |
@@ -130,7 +130,8 @@ fold quant scales POST-mmul at GROUP granularity (AWQ); set `conv_even` rounding
 ## What is left on the table - ranked across all layers
 
 1. **BD-chain on-chip loop** (MOVEMENT) - whole decode layer as ONE dispatch; attacks the
-   ~91% / ~48ms-per-token inter-op dispatch overhead. The single biggest brick-miss.
+   ~91% / ~48ms-per-token inter-op dispatch overhead. The single biggest capability left
+   unused.
 2. **mmul for batched GEMM** (COMPUTE) - ~5x proven; encoder/FFN/prefill/vision (M>=8
    compute-bound only).
 3. **Fused cascade-accumulator** (MOVEMENT) - ~5-10x on multi-core K-reduction; the bus is
@@ -149,19 +150,19 @@ fold quant scales POST-mmul at GROUP granularity (AWQ); set `conv_even` rounding
 9. **int8 / int8xint4** (FORMAT) - energy levers for the M=1 weight stream
    (latency-negative; energy-gated).
 
-## Where the bricks come from - three tiers
+## Where these capabilities come from - three tiers
 
 A useful way to reason about what can and cannot be improved is to split the stack into
 three tiers, because the tier determines whether the fix is in my kernels, in reusing
 reference kernels, or in the toolchain.
 
-**Tier 1 - HARDWARE bricks (the silicon: mmul array, cascade ports, DMA engines, SFU,
-memory). FIXED - they can only be USED, not improved.** The Peano backend
-(`__builtin_aie2p_*` intrinsics) and `aie_api` expose every one of them; nothing in the
-catalog above is missing from the tooling. The gap here was pure non-use - mmul,
-sliding_mul, cascade-accumulator, bfp16, and the BD-chain loop all exist, and generic
-substitutes shipped in their place. You do not "make a better mmul"; it is the array. The
-fix is in the kernels.
+**Tier 1 - HARDWARE (the silicon: mmul array, cascade ports, DMA engines, SFU, memory).
+FIXED - it can only be USED, not improved.** The Peano backend (`__builtin_aie2p_*`
+intrinsics) and `aie_api` expose every one of these capabilities; nothing in the inventory
+above is missing from the tooling. The gap here was pure non-use - mmul, sliding_mul,
+cascade-accumulator, bfp16, and the BD-chain loop all exist, and generic substitutes
+shipped in their place. You do not "make a better mmul"; it is the array. The fix is in
+the kernels.
 
 **Tier 2 - REFERENCE KERNELS (the `aie_kernels/aie2p/{mm,mha,conv2dk1}.cc` set and the
 programming examples). GOOD - mmul-based and vendor-tuned.** Hand-written kernels that
@@ -170,20 +171,20 @@ reinvented these tended to reinvent them *worse*. The fix is to REUSE them, not 
 idiom, not the exact kernel.
 
 **Tier 3 - TOOLCHAIN EXPOSURE (the dialects, lowerings, passes, and abstractions that let
-you AUTHOR the bricks). This is where the real gaps and bugs live - and where improvements
-are durable.** Confirmed:
+you AUTHOR against Tier 1). This is where the real gaps and bugs live - and where
+improvements are durable.** Confirmed:
 
 - **`npu_cascade` lowers to buffer-transport + software-add, NOT the fused
   mmul-accumulator form** -> adding a fused-cascade-accumulator lowering makes the cascade
-  brick actually usable.
+  accumulator actually usable.
 - **objectFIFO has no per-sub-stream DEPTH knob** in the Python API -> a C++ pass to
   recover depth-2 overlap without the over-credit merge.
-- **BD-chain on-chip loop:** the hardware brick exists, but in-tree authoring is limited
-  (npu-insts is flat / loop-incapable) -> exposing it is a toolchain opportunity. The
-  dynamic-runtime-sequences work upstream is already moving in this direction.
+- **BD-chain on-chip loop:** the hardware capability exists, but in-tree authoring is
+  limited (npu-insts is flat / loop-incapable) -> exposing it is a toolchain opportunity.
+  The dynamic-runtime-sequences work upstream is already moving in this direction.
 - **Compiler bugs found + fixed/staged:** a cascade re-entrancy bug, an AIRDmaToChannel
   SIGSEGV, quadratic aiecc passes, and an int->float->int Peano miscompile. Each is a
-  brick the toolchain exposed incorrectly until it was fixed.
+  capability the toolchain exposed incorrectly until it was fixed.
 
 **Method:** Tier-3 gaps are found by *reading the source to deduce suboptimality*, not by
 surveying issue trackers - the device is not needed to *discover* a structural or
@@ -193,21 +194,23 @@ buffer-copy+software-add lowering, the AIRDmaToChannel SIGSEGV, the int->float->
 miscompile, the scalar `dwconv1d` vs `sliding_mul`. Issue trackers are a reactive
 secondary cross-check to avoid duplication; the edge is proactive code-reading.
 
-**Net:** the hardware bricks and good reference kernels are provided - the job there is to
-USE and REUSE them. The durable edge is Tier 3: the toolchain does not always *expose* the
-bricks well (fused cascade, depth knob, on-chip loop) or *correctly* (the bugs), and
-improving that exposure both unblocks the kernels and is the high-value upstream
-contribution. So: do not "replace the hardware bricks" - USE them, REUSE the good kernels,
-and IMPROVE the toolchain exposure where it fails the bricks.
+**Net:** the hardware capabilities and good reference kernels are provided - the job
+there is to USE and REUSE them. The durable edge is Tier 3: the toolchain does not always
+*expose* them well (fused cascade, depth knob, on-chip loop) or *correctly* (the bugs),
+and improving that exposure both unblocks the kernels and is the high-value upstream
+contribution. So: do not "replace the hardware" - USE it, REUSE the good kernels, and
+IMPROVE the toolchain exposure where it fails to expose a capability correctly.
 
-## Regime rule (so a brick is not mis-applied - the mmul lesson)
+## Roofline model: matching a capability to its regime (the mmul lesson)
 
-COMPUTE bricks (mmul, bfp16, sliding_mul, int8-tile) win ONLY when the op is
-**compute-bound** = M>=8 batched (encoder GEMM, prefill, speculative-verify, vision conv).
-At **M=1 decode** the levers are MOVEMENT (BD-chain loop, cascade, broadcast,
-kill-transpose) + op-count, and FORMAT only for ENERGY - NOT faster MACs. Gate every
-COMPUTE/FORMAT win on a per-op compute-vs-DMA occupancy measurement (the trace-event
-harness). A hand-written *compute* kernel can be ~18x off peak while looking fine to the
-data-movement lens, so the two lenses are complementary: count bytes moved and
-shape-reloads for the movement picture, and % of the 128 bf16 MAC/cyc/core peak for the
-compute picture.
+This is roofline reasoning: a capability's payoff is capped by whichever bound - compute
+or memory/overhead - a given operation actually sits under, not by the capability's peak
+throughput in isolation. COMPUTE capabilities (mmul, bfp16, sliding_mul, int8-tile) win
+ONLY when the op is **compute-bound** = M>=8 batched (encoder GEMM, prefill,
+speculative-verify, vision conv). At **M=1 decode** the levers are MOVEMENT (BD-chain
+loop, cascade, broadcast, kill-transpose) + op-count, and FORMAT only for ENERGY - NOT
+faster MACs. Gate every COMPUTE/FORMAT win on a per-op compute-vs-DMA occupancy
+measurement (the trace-event harness). A hand-written *compute* kernel can be ~18x off
+peak while looking fine to the data-movement lens, so the two lenses are complementary:
+count bytes moved and shape-reloads for the movement picture, and % of the 128 bf16
+MAC/cyc/core peak for the compute picture.

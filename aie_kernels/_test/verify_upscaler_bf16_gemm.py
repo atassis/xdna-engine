@@ -17,7 +17,7 @@ import numpy as np
 import ml_dtypes
 import bricklib
 from bricklib import _build_oneshot, iron, GEN
-from verify_f2 import tile_pack, tile_unpack, golden_mod
+from verify_gemm_int8 import tile_pack, tile_unpack, golden_mod
 
 M = K = N = 64
 g, cc = golden_mod("gemm-bfp16-ebs8", "gemm_bfp16_ebs8.cc")

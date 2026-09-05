@@ -34,8 +34,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "bench"))
 import aie.iron as iron  # noqa: E402
 import bricklib  # noqa: E402
 from npu_sensors import read_sensors  # noqa: E402
-from verify_f2 import tile_pack  # noqa: E402
-from verify_f2b import GEN, golden_mod, pack_int4, pack_int4_blocks  # noqa: E402
+from verify_gemm_int8 import tile_pack  # noqa: E402
+from verify_gemm_int8xint4 import GEN, golden_mod, pack_int4, pack_int4_blocks  # noqa: E402
 
 # A decode-shaped FFN projection: M=4 is the native-tile rounding of M=1 decode.
 # SHAPE=small selects a cheap dispatch on purpose: the round-trip delta is a few ms against

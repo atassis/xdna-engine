@@ -5,7 +5,7 @@
 // aie::mmul<8,8,8,int8,int8,accauto> systolic tile. This is a PARAMETERIZED
 // primitive (M/K/N are template args resolved per dispatch by the schedule,
 // not per-model hand-fusion) -- brick catalog entry, matmul group, compute-
-// bound M>=8 regime (see docs/aie2p-brick-catalog.md).
+// bound M>=8 regime (see docs/aie2p-architecture-and-roofline.md).
 //
 // API pattern studied from route_b_kernels/ffn_bfp16/repro_847_mmul888_bfp16.cc
 // and mlir-aie/aie_kernels/aie2p/mm.cc (matmul_vectorized_8x8x8_i8_i32):

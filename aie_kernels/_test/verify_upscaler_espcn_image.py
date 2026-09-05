@@ -8,7 +8,7 @@ Run under the NPU lock:  ./run.sh verify_upscaler_espcn_image.py
 import numpy as np, ml_dtypes
 from pathlib import Path
 from bricklib import _build_oneshot, iron, GEN
-from verify_f2 import tile_pack, tile_unpack, golden_mod
+from verify_gemm_int8 import tile_pack, tile_unpack, golden_mod
 
 # Anchored at the repo root: run.sh cds into _verify/, so a relative "artifacts/..." never resolved.
 # Regenerate the fixtures with scripts/make_espcn_gate_fixtures.py.

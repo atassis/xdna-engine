@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""F2b device-verify: int4 GEMM/GEMV (mmul_8_4 = mmul<4,16,16>).
+"""int8xint4 GEMM/GEMV device-verify (mmul_8_4 = mmul<4,16,16>).
 
 HISTORY: root cause cracked 2026-07-20 (identity + stride probes) -- the kernel strided B
 blocks by MMUL::size_B(256) on an int4* whose arithmetic advances 1 byte/int4, so each 16x16
@@ -22,7 +22,7 @@ import numpy as np
 
 import ml_dtypes
 import bricklib
-from verify_f2 import tile_pack, tile_unpack
+from verify_gemm_int8 import tile_pack, tile_unpack
 
 BRICKS = Path(__file__).parent.parent
 GEN = Path(__file__).parent / "gen"
@@ -327,11 +327,11 @@ do_gemm_int8xint4_dequant_64x128x128.brick_name = "gemm-int8xint4-dequant-64x128
 if __name__ == "__main__":
     for fn in (do_gemm_int8xint4, do_gemv_int8xint4, do_gemm_int8xint4_dequant):
         guard(fn)
-    print("\n==== F2b (int4, padded stride) SUMMARY ====", flush=True)
+    print("\n==== GEMM/GEMV INT8xINT4 (padded stride) SUMMARY ====", flush=True)
     for r in results:
         print(f"  {r['name']:22s} {r['status']:10s} rel_l2={r.get('rel_l2', float('nan')):.3e}")
     passed = sum(1 for r in results if r.get("ok"))
-    print(f"F2b: {passed}/{len(results)} PASS")
+    print(f"gemm-int8xint4: {passed}/{len(results)} PASS")
     print("JSON " + json.dumps(results))
     import os
     os._exit(0)
