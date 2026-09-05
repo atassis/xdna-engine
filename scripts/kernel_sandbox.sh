@@ -37,6 +37,14 @@ current_toolchain_hash() {
   local h; h="$(sed -e 's/[[:space:]]*#.*$//' -e '/^[[:space:]]*$/d' "$repo/toolchain.lock" \
                 | sha256sum | cut -c1-12)"
   [ -n "$h" ] || { echo "[kernel_sandbox] refuse: empty lock hash" >&2; return 1; }
+  # The -n test above does NOT catch an EMPTY INPUT: sha256sum of nothing is
+  # e3b0c44298fc1c149afb..., a perfectly ordinary-looking digest that -n accepts and that never
+  # matches a real stamp -- so every dir reads stale and rebuilds forever, the exact silent loop
+  # the file check guards against, reached by a different path (an unreadable lock, a pipe that
+  # produced nothing). Compare against the sentinel, not against emptiness.
+  [ "$h" != "e3b0c44298fc" ] || {
+    echo "[kernel_sandbox] refuse: lock hashed to the EMPTY-input digest (read '$repo/toolchain.lock' produced nothing)" >&2
+    return 1; }
   printf '%s' "$h"
 }
 
