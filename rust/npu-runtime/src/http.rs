@@ -10,7 +10,9 @@ use std::time::Duration;
 use crate::actor::Handle;
 use crate::config::{Config, ModelCfg};
 use crate::registry::{LoadState, ModelStatus};
+use crate::stream::StreamItem;
 use npu_engine::capability::{Capability, Request as EngineReq, Response as EngineResp};
+use npu_engine::FinishReason;
 
 const MAX_BODY: usize = 16 * 1024 * 1024;
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(60);
@@ -25,22 +27,29 @@ pub struct Request {
 
 /// A response body. Not always JSON: `/v1/audio/speech` returns audio bytes, the same way OpenAI's
 /// does, so the body cannot be a `String`.
-#[derive(Debug, PartialEq)]
 pub enum Body {
     Json(String),
     Wav(Vec<u8>),
+    /// Server-Sent Events. The generator runs on the actor thread; this is the receiving end of the
+    /// channel it feeds, plus what the socket loop needs to render each item into a `data:` frame.
+    /// No `Debug`/`PartialEq`: a `Receiver` has neither, and nothing needs to compare a stream body.
+    Stream(SseStream),
 }
 
 impl Body {
-    /// The body as text -- the JSON for a JSON body, empty for audio. For tests and logging.
+    /// The body as text -- the JSON for a JSON body, empty otherwise. For tests and logging.
     pub fn text(&self) -> &str {
-        match self { Body::Json(s) => s, Body::Wav(_) => "" }
+        match self { Body::Json(s) => s, Body::Wav(_) | Body::Stream(_) => "" }
     }
     pub fn content_type(&self) -> &'static str {
-        match self { Body::Json(_) => "application/json", Body::Wav(_) => "audio/wav" }
+        match self {
+            Body::Json(_) => "application/json",
+            Body::Wav(_) => "audio/wav",
+            Body::Stream(_) => "text/event-stream",
+        }
     }
     pub fn bytes(&self) -> &[u8] {
-        match self { Body::Json(s) => s.as_bytes(), Body::Wav(v) => v }
+        match self { Body::Json(s) => s.as_bytes(), Body::Wav(v) => v, Body::Stream(_) => &[] }
     }
 }
 impl std::fmt::Display for Body {
@@ -48,11 +57,83 @@ impl std::fmt::Display for Body {
         match self {
             Body::Json(s) => f.write_str(s),
             Body::Wav(v) => write!(f, "<{} bytes of audio/wav>", v.len()),
+            Body::Stream(_) => f.write_str("<event-stream>"),
         }
     }
 }
 impl From<String> for Body { fn from(s: String) -> Body { Body::Json(s) } }
 impl From<&str> for Body { fn from(s: &str) -> Body { Body::Json(s.to_string()) } }
+
+/// Which OpenAI route an `SseStream` is rendering for -- the two shapes differ (`delta` vs `text`,
+/// and chat alone has a role-announcement chunk).
+pub enum SseKind { Chat, Completion }
+
+/// A streaming generation in progress, plus what `respond()` needs to render OpenAI-shaped frames
+/// from it without knowing anything about JSON itself living on the actor side.
+pub struct SseStream {
+    rx: std::sync::mpsc::Receiver<StreamItem>,
+    id: String,
+    created: i64,
+    model: String,
+    kind: SseKind,
+}
+
+impl SseStream {
+    fn new(rx: std::sync::mpsc::Receiver<StreamItem>, model: String, kind: SseKind) -> SseStream {
+        let prefix = match kind { SseKind::Chat => "chatcmpl", SseKind::Completion => "cmpl" };
+        SseStream { rx, id: gen_id(prefix), created: unix_now(), model, kind }
+    }
+    /// The chat-only preamble: OpenAI announces the role before any content, in its own chunk.
+    fn render_role(&self) -> String {
+        format!(
+            "{{\"id\":\"{}\",\"object\":\"chat.completion.chunk\",\"created\":{},\"model\":\"{}\",\
+             \"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\"}},\"finish_reason\":null}}]}}",
+            self.id, self.created, parse::json_escape(&self.model))
+    }
+    fn render_text(&self, text: &str) -> String {
+        match self.kind {
+            SseKind::Chat => format!(
+                "{{\"id\":\"{}\",\"object\":\"chat.completion.chunk\",\"created\":{},\"model\":\"{}\",\
+                 \"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{}\"}},\"finish_reason\":null}}]}}",
+                self.id, self.created, parse::json_escape(&self.model), parse::json_escape(text)),
+            SseKind::Completion => format!(
+                "{{\"id\":\"{}\",\"object\":\"text_completion\",\"created\":{},\"model\":\"{}\",\
+                 \"choices\":[{{\"index\":0,\"text\":\"{}\",\"finish_reason\":null}}]}}",
+                self.id, self.created, parse::json_escape(&self.model), parse::json_escape(text)),
+        }
+    }
+    fn render_done(&self, reason: FinishReason) -> String {
+        match self.kind {
+            SseKind::Chat => format!(
+                "{{\"id\":\"{}\",\"object\":\"chat.completion.chunk\",\"created\":{},\"model\":\"{}\",\
+                 \"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"{}\"}}]}}",
+                self.id, self.created, parse::json_escape(&self.model), reason.as_str()),
+            SseKind::Completion => format!(
+                "{{\"id\":\"{}\",\"object\":\"text_completion\",\"created\":{},\"model\":\"{}\",\
+                 \"choices\":[{{\"index\":0,\"text\":\"\",\"finish_reason\":\"{}\"}}]}}",
+                self.id, self.created, parse::json_escape(&self.model), reason.as_str()),
+        }
+    }
+    fn render_error(&self, msg: &str) -> String {
+        format!("{{\"error\":{{\"message\":\"{}\"}}}}", parse::json_escape(msg))
+    }
+}
+
+/// A process-unique id for a completion object (`chatcmpl-...` / `cmpl-...`). Not cryptographic,
+/// just distinct: a nanosecond timestamp plus a monotonic counter, so two completions started in
+/// the same nanosecond (the actor is single-flight, but the counter costs nothing) still differ.
+fn gen_id(prefix: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos()).unwrap_or(0);
+    format!("{prefix}-{nanos:x}{n:x}")
+}
+fn unix_now() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64).unwrap_or(0)
+}
 
 /// (status code, body).
 pub type Response = (u16, Body);
@@ -79,6 +160,7 @@ pub fn route(req: &Request, handle: &Handle, cfg_path: &Path) -> Response {
         }
         ("GET", "/v1/models") => (200, models_json(&handle.status()).into()),
         ("POST", "/v1/chat/completions") => chat_completions(req, handle),
+        ("POST", "/v1/completions") => completions(req, handle),
         ("POST", "/v1/embeddings") => embeddings(req, handle),
         ("POST", "/v1/audio/speech") => audio_speech(req, handle),
         ("POST", "/v1/audio/transcriptions") => transcriptions(req, handle),
@@ -124,27 +206,76 @@ fn engine_err(e: &npu_engine::EngineError) -> Response {
     (code, format!("{{\"error\":\"{}\"}}", parse::json_escape(&e.to_string())).into())
 }
 
-/// OpenAI chat completions. Serves `Capability::GENERATE`; the prompt is the last message's content,
-/// which is what a single-turn client sends and all any current model could use.
+/// OpenAI chat completions. Serves `Capability::GENERATE` with the FULL message array (system
+/// prompt + history, not just the last turn) and the full sampling surface -- see `parse::
+/// parse_chat_request`. Streams via SSE when the body asks for it, buffers otherwise.
 fn chat_completions(req: &Request, handle: &Handle) -> Response {
     let body = String::from_utf8_lossy(&req.body).to_string();
-    let model = extract_str_field(&body, "model");
-    let prompt = match parse::parse_last_message(&body) {
+    let parsed = match parse::parse_chat_request(&body) {
         Ok(p) => p,
         Err(e) => return (400, format!("{{\"error\":\"{}\"}}", parse::json_escape(&e)).into()),
     };
-    let served = match handle.serve(Capability::GENERATE, model.as_deref(), EngineReq::Text(prompt)) {
+    let served = match handle.generate(parsed.model.as_deref(), parsed.prompt, parsed.params) {
         Ok(s) => s,
         Err(e) => return engine_err(&e),
     };
-    match served.value {
-        EngineResp::Text(text) => (200, format!(
-            "{{\"object\":\"chat.completion\",\"model\":\"{}\",\"choices\":[{{\"index\":0,\
-             \"message\":{{\"role\":\"assistant\",\"content\":\"{}\"}},\"finish_reason\":\"stop\"}}]}}",
-            parse::json_escape(&served.model), parse::json_escape(&text)).into()),
-        other => (500, format!("{{\"error\":\"{} returned a {} response\"}}",
-            parse::json_escape(&served.model), other.shape()).into()),
+    if parsed.stream {
+        (200, Body::Stream(SseStream::new(served.value, served.model, SseKind::Chat)))
+    } else {
+        render_buffered(served.model, served.value, SseKind::Chat)
     }
+}
+
+/// OpenAI text completions: same generation path as chat, over a raw (non-templated) prompt string.
+fn completions(req: &Request, handle: &Handle) -> Response {
+    let body = String::from_utf8_lossy(&req.body).to_string();
+    let parsed = match parse::parse_completion_request(&body) {
+        Ok(p) => p,
+        Err(e) => return (400, format!("{{\"error\":\"{}\"}}", parse::json_escape(&e)).into()),
+    };
+    let served = match handle.generate(parsed.model.as_deref(), parsed.prompt, parsed.params) {
+        Ok(s) => s,
+        Err(e) => return engine_err(&e),
+    };
+    if parsed.stream {
+        (200, Body::Stream(SseStream::new(served.value, served.model, SseKind::Completion)))
+    } else {
+        render_buffered(served.model, served.value, SseKind::Completion)
+    }
+}
+
+/// Drain a generation to completion and render the OpenAI non-streaming shape. Draining fully
+/// (rather than stopping at the first error) is deliberate: the actor side always sends exactly one
+/// terminal item (`Done` or `Error`), so this loop always terminates.
+fn render_buffered(model: String, rx: std::sync::mpsc::Receiver<StreamItem>, kind: SseKind) -> Response {
+    let mut text = String::new();
+    let (reason, usage) = loop {
+        match rx.recv() {
+            Ok(StreamItem::Text(t)) => text.push_str(&t),
+            Ok(StreamItem::Done { reason, usage }) => break (reason, usage),
+            Ok(StreamItem::Error(e)) =>
+                return (500, format!("{{\"error\":\"{}\"}}", parse::json_escape(&e)).into()),
+            Err(_) =>
+                return (500, "{\"error\":\"generation ended without a result\"}".into()),
+        }
+    };
+    let id = gen_id(match kind { SseKind::Chat => "chatcmpl", SseKind::Completion => "cmpl" });
+    let created = unix_now();
+    let total = usage.prompt_tokens + usage.completion_tokens;
+    let usage_json = format!("\"usage\":{{\"prompt_tokens\":{},\"completion_tokens\":{},\"total_tokens\":{total}}}",
+        usage.prompt_tokens, usage.completion_tokens);
+    let body = match kind {
+        SseKind::Chat => format!(
+            "{{\"id\":\"{id}\",\"object\":\"chat.completion\",\"created\":{created},\"model\":\"{}\",\
+             \"choices\":[{{\"index\":0,\"message\":{{\"role\":\"assistant\",\"content\":\"{}\"}},\
+             \"finish_reason\":\"{}\"}}],{usage_json}}}",
+            parse::json_escape(&model), parse::json_escape(&text), reason.as_str()),
+        SseKind::Completion => format!(
+            "{{\"id\":\"{id}\",\"object\":\"text_completion\",\"created\":{created},\"model\":\"{}\",\
+             \"choices\":[{{\"index\":0,\"text\":\"{}\",\"finish_reason\":\"{}\"}}],{usage_json}}}",
+            parse::json_escape(&model), parse::json_escape(&text), reason.as_str()),
+    };
+    (200, body.into())
 }
 
 /// OpenAI speech synthesis. Serves `Capability::TTS` and returns audio bytes, not JSON.
@@ -314,9 +445,15 @@ fn extract_str_field(body: &str, key: &str) -> Option<String> {
 
 /// Blocking single-flight server. Reads each request, routes it, writes the response.
 pub fn serve(handle: Handle, cfg_path: PathBuf, port: u16) -> std::io::Result<()> {
-    let addr = format!("127.0.0.1:{port}");
-    let listener = TcpListener::bind(&addr)?;
-    eprintln!("[npu-serve] ready on http://{addr}");
+    let listener = TcpListener::bind(format!("127.0.0.1:{port}"))?;
+    serve_on(listener, handle, cfg_path)
+}
+
+/// Like `serve`, but on an already-bound listener. Lets a caller (a test, chiefly) claim an
+/// OS-assigned ephemeral port via `TcpListener::bind("127.0.0.1:0")` and read it back with
+/// `local_addr()` before handing the listener over here -- no bind-then-guess race.
+pub fn serve_on(listener: TcpListener, handle: Handle, cfg_path: PathBuf) -> std::io::Result<()> {
+    eprintln!("[npu-serve] ready on http://{}", listener.local_addr()?);
     for stream in listener.incoming() {
         match stream {
             Ok(s) => { if let Err(e) = handle_conn(s, &handle, &cfg_path) { eprintln!("[npu-serve] {e}"); } }
@@ -357,18 +494,51 @@ fn handle_conn(mut stream: TcpStream, handle: &Handle, cfg_path: &Path) -> std::
 }
 
 fn respond(stream: &mut TcpStream, code: u16, body: &Body) -> std::io::Result<()> {
-    let reason = match code {
-        200 => "OK", 400 => "Bad Request", 404 => "Not Found", 413 => "Payload Too Large",
-        500 => "Internal Server Error", 501 => "Not Implemented", 503 => "Service Unavailable",
-        _ => "Error",
-    };
+    if let Body::Stream(s) = body {
+        return respond_stream(stream, code, s);
+    }
     let data = body.bytes();
     // Header and body are written separately because the body is not always UTF-8 (audio/wav).
     let head = format!(
-        "HTTP/1.1 {code} {reason}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.content_type(), data.len());
+        "HTTP/1.1 {code} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        reason_phrase(code), body.content_type(), data.len());
     stream.write_all(head.as_bytes())?;
     stream.write_all(data)?;
+    stream.flush()
+}
+
+fn reason_phrase(code: u16) -> &'static str {
+    match code {
+        200 => "OK", 400 => "Bad Request", 404 => "Not Found", 413 => "Payload Too Large",
+        500 => "Internal Server Error", 501 => "Not Implemented", 503 => "Service Unavailable",
+        _ => "Error",
+    }
+}
+
+/// Stream Server-Sent Events as the actor produces them: one `data:` frame per item, `[DONE]`
+/// terminates. No `Content-Length` -- the length is not known up front, which is the whole point.
+///
+/// A failed write (the client hung up) returns `Err` immediately instead of trying the rest of the
+/// stream, which drops `s.rx` on the way out. The actor's next `tx.send` then fails and the
+/// generator's sink returns `false` -- this is the entire disconnect-abort mechanism; nothing here
+/// signals the actor directly.
+fn respond_stream(stream: &mut TcpStream, code: u16, s: &SseStream) -> std::io::Result<()> {
+    let head = format!(
+        "HTTP/1.1 {code} {}\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\
+         Connection: close\r\n\r\n", reason_phrase(code));
+    stream.write_all(head.as_bytes())?;
+    if matches!(s.kind, SseKind::Chat) {
+        stream.write_all(format!("data: {}\n\n", s.render_role()).as_bytes())?;
+    }
+    for item in s.rx.iter() {
+        let frame = match item {
+            StreamItem::Text(t) => s.render_text(&t),
+            StreamItem::Done { reason, .. } => s.render_done(reason),
+            StreamItem::Error(e) => s.render_error(&e),
+        };
+        stream.write_all(format!("data: {frame}\n\n").as_bytes())?;
+    }
+    stream.write_all(b"data: [DONE]\n\n")?;
     stream.flush()
 }
 
@@ -485,38 +655,147 @@ pub mod parse {
         Ok((char::from_u32(cp).ok_or("invalid surrogate pair")?, i + 10))
     }
 
-    /// The `content` of the LAST message in a chat-completions body.
-    ///
-    /// Scans string literals the same way `parse_inputs` does, so a `"content"` appearing inside
-    /// message text is not mistaken for the key. Takes the last occurrence because that is the new
-    /// turn; earlier ones are history no current model consumes.
-    pub fn parse_last_message(body: &str) -> Result<String, String> {
-        let b = body.as_bytes();
-        let (mut i, mut last) = (0usize, None);
-        while i < b.len() {
-            if b[i] != b'"' { i += 1; continue; }
-            let (key, after) = scan_json_string(body, i)?;
-            let mut j = after;
-            while j < b.len() && b[j].is_ascii_whitespace() { j += 1; }
-            if j < b.len() && b[j] == b':' {
-                if key == "content" {
-                    let mut k = j + 1;
-                    while k < b.len() && b[k].is_ascii_whitespace() { k += 1; }
-                    // A non-string content (OpenAI's multi-part array form) is not something any
-                    // model here can consume; skip it rather than guess at a flattening.
-                    if b.get(k) == Some(&b'"') {
-                        let (v, n) = scan_json_string(body, k)?;
-                        last = Some(v);
-                        i = n;
-                        continue;
+    /// The generation request extracted from a chat/completions body: routing (`model`), the prompt,
+    /// the full sampling surface, and whether to stream.
+    pub struct ParsedGenerate {
+        pub model: Option<String>,
+        pub prompt: npu_engine::Prompt,
+        pub params: npu_engine::GenerateParams,
+        pub stream: bool,
+    }
+
+    /// `/v1/chat/completions`: the full `messages` array (system prompt + history, not just the last
+    /// turn -- that was the bug) plus the sampling surface. `serde_json`, not the hand-rolled scanner
+    /// above: `messages` is genuinely nested (array of objects, content sometimes itself an array),
+    /// and that shape is exactly where a hand-rolled parser accumulates bugs.
+    pub fn parse_chat_request(body: &str) -> Result<ParsedGenerate, String> {
+        let v: serde_json::Value = serde_json::from_str(body).map_err(|e| format!("invalid JSON: {e}"))?;
+        let model = v.get("model").and_then(|m| m.as_str()).map(str::to_string);
+        let messages = v.get("messages").and_then(|m| m.as_array())
+            .ok_or_else(|| "missing \"messages\" array".to_string())?;
+        if messages.is_empty() { return Err("\"messages\" must not be empty".into()); }
+        let mut chat = Vec::with_capacity(messages.len());
+        for (i, m) in messages.iter().enumerate() {
+            let role = m.get("role").and_then(|r| r.as_str())
+                .ok_or_else(|| format!("messages[{i}]: missing \"role\""))?.to_string();
+            let content = parse_content(m.get("content")).map_err(|e| format!("messages[{i}]: {e}"))?;
+            chat.push(npu_engine::ChatMessage { role, content });
+        }
+        let params = parse_generate_params(&v)?;
+        let stream = v.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
+        reject_unsupported(&v, false)?;
+        Ok(ParsedGenerate { model, prompt: npu_engine::Prompt::Chat(chat), params, stream })
+    }
+
+    /// A message's `content`: a plain string, or OpenAI's multi-part array form when every part is
+    /// `{"type":"text","text":...}`. Any other part type is REJECTED rather than silently dropped (the
+    /// old behaviour) -- this surface has no vision/audio input, and dropping content changes the
+    /// prompt's meaning with no trace, which is exactly what spec S6 bans.
+    fn parse_content(v: Option<&serde_json::Value>) -> Result<String, String> {
+        match v {
+            Some(serde_json::Value::String(s)) => Ok(s.clone()),
+            Some(serde_json::Value::Array(parts)) => {
+                let mut out = String::new();
+                for p in parts {
+                    match p.get("type").and_then(|t| t.as_str()) {
+                        Some("text") => out.push_str(p.get("text").and_then(|t| t.as_str()).unwrap_or("")),
+                        Some(other) => return Err(format!("unsupported content part type {other:?}")),
+                        None => return Err("content part missing \"type\"".into()),
                     }
                 }
-                i = j + 1;
-            } else {
-                i = after;
+                Ok(out)
+            }
+            Some(_) => Err("\"content\" must be a string or an array of parts".into()),
+            None => Err("missing \"content\"".into()),
+        }
+    }
+
+    /// `/v1/completions`. The array form of `prompt` (OpenAI allows batching several prompts in one
+    /// request) is rejected with a clear 400 -- this surface serves one completion per request, and
+    /// silently taking just the first would answer a different request than the one sent.
+    pub fn parse_completion_request(body: &str) -> Result<ParsedGenerate, String> {
+        let v: serde_json::Value = serde_json::from_str(body).map_err(|e| format!("invalid JSON: {e}"))?;
+        let model = v.get("model").and_then(|m| m.as_str()).map(str::to_string);
+        let prompt = match v.get("prompt") {
+            Some(serde_json::Value::String(s)) => s.clone(),
+            Some(serde_json::Value::Array(_)) =>
+                return Err("array \"prompt\" (batched prompts) is not supported; send one string".into()),
+            Some(_) => return Err("\"prompt\" must be a string".into()),
+            None => return Err("missing \"prompt\"".into()),
+        };
+        let params = parse_generate_params(&v)?;
+        let stream = v.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
+        reject_unsupported(&v, true)?;
+        Ok(ParsedGenerate { model, prompt: npu_engine::Prompt::Raw(prompt), params, stream })
+    }
+
+    /// The shared sampling surface: OpenAI's fields plus `top_k`/`repetition_penalty`, neither in
+    /// OpenAI's schema but both universal among local servers (`GenerateParams`'s own doc comment).
+    /// A field absent from the body keeps `GenerateParams::default()` -- OpenAI's defaults (e.g.
+    /// `temperature: 1.0`), never a silent substitution of greedy.
+    fn parse_generate_params(v: &serde_json::Value) -> Result<npu_engine::GenerateParams, String> {
+        let mut p = npu_engine::GenerateParams::default();
+        if let Some(x) = v.get("temperature") { p.temperature = as_f32(x, "temperature")?; }
+        if let Some(x) = v.get("top_p") { p.top_p = as_f32(x, "top_p")?; }
+        if let Some(x) = v.get("top_k") { p.top_k = as_u32(x, "top_k")?; }
+        if let Some(x) = v.get("max_tokens") { p.max_tokens = as_u32(x, "max_tokens")?; }
+        if let Some(x) = v.get("seed") { p.seed = Some(as_u64(x, "seed")?); }
+        if let Some(x) = v.get("presence_penalty") { p.presence_penalty = as_f32(x, "presence_penalty")?; }
+        if let Some(x) = v.get("frequency_penalty") { p.frequency_penalty = as_f32(x, "frequency_penalty")?; }
+        if let Some(x) = v.get("repetition_penalty") { p.repetition_penalty = as_f32(x, "repetition_penalty")?; }
+        p.stop = match v.get("stop") {
+            None | Some(serde_json::Value::Null) => Vec::new(),
+            Some(serde_json::Value::String(s)) => vec![s.clone()],
+            Some(serde_json::Value::Array(items)) => items.iter()
+                .map(|i| i.as_str().map(str::to_string)
+                    .ok_or_else(|| "\"stop\" array must contain only strings".to_string()))
+                .collect::<Result<Vec<_>, _>>()?,
+            Some(_) => return Err("\"stop\" must be a string or an array of strings".into()),
+        };
+        Ok(p)
+    }
+    fn as_f32(v: &serde_json::Value, field: &str) -> Result<f32, String> {
+        v.as_f64().map(|f| f as f32).ok_or_else(|| format!("\"{field}\" must be a number"))
+    }
+    fn as_u32(v: &serde_json::Value, field: &str) -> Result<u32, String> {
+        v.as_u64().and_then(|n| u32::try_from(n).ok())
+            .ok_or_else(|| format!("\"{field}\" must be a non-negative integer"))
+    }
+    fn as_u64(v: &serde_json::Value, field: &str) -> Result<u64, String> {
+        v.as_u64().ok_or_else(|| format!("\"{field}\" must be a non-negative integer"))
+    }
+
+    /// Spec S6 ("branch freely on *how*, never silently on *what*"): a client-visible parameter this
+    /// surface cannot honour must be a 400, not a quiet no-op. `n != 1`, `logprobs`, `logit_bias`,
+    /// `tools` and friends all change what the RESPONSE IS; accepting them and ignoring their effect
+    /// would answer a request other than the one that was sent, with no trace of the substitution.
+    fn reject_unsupported(v: &serde_json::Value, completions: bool) -> Result<(), String> {
+        if let Some(n) = v.get("n").and_then(|x| x.as_u64()) {
+            if n != 1 { return Err("\"n\" != 1 is not supported".into()); }
+        }
+        let logprobs_wanted = if completions {
+            v.get("logprobs").map(|x| !x.is_null()).unwrap_or(false)
+        } else {
+            v.get("logprobs").and_then(|x| x.as_bool()).unwrap_or(false)
+        };
+        if logprobs_wanted { return Err("\"logprobs\" is not supported".into()); }
+        for field in ["logit_bias", "tools", "tool_choice", "response_format", "stream_options"] {
+            if v.get(field).map(|x| !x.is_null()).unwrap_or(false) {
+                return Err(format!("\"{field}\" is not supported"));
             }
         }
-        last.ok_or_else(|| "no message with string content".to_string())
+        if completions {
+            if v.get("echo").and_then(|x| x.as_bool()).unwrap_or(false) {
+                return Err("\"echo\" is not supported".into());
+            }
+            if let Some(b) = v.get("best_of").and_then(|x| x.as_u64()) {
+                if b != 1 { return Err("\"best_of\" != 1 is not supported".into()); }
+            }
+            if v.get("suffix").map(|x| !x.is_null()).unwrap_or(false) {
+                return Err("\"suffix\" is not supported".into());
+            }
+        }
+        Ok(())
     }
 
     /// Wrap mono i16 PCM in a 44-byte canonical WAV header. The rate comes from the model, not a
@@ -734,6 +1013,36 @@ pub mod parse {
             assert_eq!(extract_form_field(body, b, "file"), None);
             assert_eq!(extract_file_part(body, b), Some(&b"RIFF"[..]));
         }
+
+        #[test]
+        fn parse_chat_request_rejects_malformed_bodies() {
+            for bad in [
+                "not json",
+                "{}",                                        // no messages
+                r#"{"messages":[]}"#,                         // empty
+                r#"{"messages":[{"content":"hi"}]}"#,         // no role
+                r#"{"messages":[{"role":"user"}]}"#,          // no content
+                r#"{"messages":[{"role":"user","content":123}]}"#, // wrong content type
+                r#"{"messages":[{"role":"user","content":"hi"}],"stop":5}"#,
+                r#"{"messages":[{"role":"user","content":"hi"}],"temperature":"hot"}"#,
+            ] {
+                assert!(parse_chat_request(bad).is_err(), "must reject {bad:?}");
+            }
+        }
+
+        #[test]
+        fn parse_completion_request_rejects_malformed_bodies() {
+            for bad in ["not json", "{}", r#"{"prompt":123}"#, r#"{"prompt":["a","b"]}"#] {
+                assert!(parse_completion_request(bad).is_err(), "must reject {bad:?}");
+            }
+        }
+
+        #[test]
+        fn parse_completion_request_accepts_a_bare_string_prompt() {
+            let p = parse_completion_request(r#"{"prompt":"hello"}"#).unwrap();
+            assert!(matches!(p.prompt, npu_engine::Prompt::Raw(s) if s == "hello"));
+            assert!(!p.stream);
+        }
     }
 }
 
@@ -796,31 +1105,23 @@ mod route_tests {
         h.shutdown(); j.join().unwrap();
     }
 
-    /// The same two routes against models that DO declare the capabilities: the rail carries them
-    /// end to end, and speech comes back as audio bytes rather than JSON.
+    /// `/v1/audio/speech` against a model that DOES declare the capability: the rail carries it end
+    /// to end, and speech comes back as audio bytes rather than JSON. (The equivalent for
+    /// `/v1/chat/completions` needs a `TextGenerator`, which `MockModel` does not implement -- see
+    /// `mod generate_tests` below.)
     #[test]
-    fn chat_and_speech_serve_when_a_model_declares_the_capability() {
+    fn speech_serves_when_a_model_declares_the_capability() {
         let mut t = BTreeMap::new();
-        t.insert("llm".to_string(), Ok((Capability::GENERATE, 1)));
         t.insert("tts".to_string(), Ok((Capability::TTS, 1)));
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("engine.toml");
         let cfg = Config {
             server: ServerCfg { max_resident: 2, idle_unload_s: 0, ..Default::default() },
-            models: vec![
-                ModelCfg { name: "llm".into(), scenario: "x".into() },
-                ModelCfg { name: "tts".into(), scenario: "y".into() },
-            ],
+            models: vec![ModelCfg { name: "tts".into(), scenario: "y".into() }],
             ..Default::default()
         };
         cfg.save(&p).unwrap();
         let (h, j) = start(cfg, Box::new(MockLoader { table: t })).unwrap();
-
-        let (code, body) = route(&post("/v1/chat/completions",
-            r#"{"messages":[{"role":"system","content":"be brief"},{"role":"user","content":"hi"}]}"#), &h, &p);
-        assert_eq!(code, 200, "{body}");
-        assert!(body.text().contains("\"content\":\"mock-completion\""), "{body}");
-        assert!(body.text().contains("\"model\":\"llm\""), "{body}");
 
         let (code, body) = route(&post("/v1/audio/speech", r#"{"input":"hello"}"#), &h, &p);
         assert_eq!(code, 200, "{body}");
@@ -950,5 +1251,359 @@ mod route_tests {
     #[test]
     fn an_empty_diarization_is_a_valid_empty_list_not_an_error() {
         assert_eq!(segments_json("m", &[]), "{\"model\":\"m\",\"segments\":[]}");
+    }
+}
+
+/// Generation-surface tests: `/v1/chat/completions` and `/v1/completions`, buffered and streaming.
+/// `MockModel` (used everywhere else in this file) has no `TextGenerator`, so this module builds its
+/// own fixture -- a scripted generator that emits a fixed token list with a settable per-token delay,
+/// per the task's own prescription for testing this surface without a real decoder.
+#[cfg(test)]
+mod generate_tests {
+    use super::*;
+    use crate::actor::start;
+    use crate::config::{Config, ModelCfg, ServerCfg};
+    use crate::loader::{ModelLoader, Servable, StreamServable};
+    use npu_engine::capability::{Capability, Request as EngineReq, Response as EngineResp};
+    use npu_engine::{Chunk, FinishReason, GenerateParams, GenerateUsage, Prompt, TextGenerator};
+    use npu_engine::EngineError;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    fn post(path: &str, body: &str) -> Request {
+        Request { method: "POST".into(), path: path.into(), boundary: String::new(), body: body.as_bytes().to_vec() }
+    }
+    fn ss(v: &[&str]) -> Vec<String> { v.iter().map(|s| s.to_string()).collect() }
+    fn close(a: f32, b: f32) -> bool { (a - b).abs() < 1e-6 }
+
+    type Seen = Arc<Mutex<Option<(Prompt, GenerateParams)>>>;
+
+    /// Emits `tokens` in order, one `Chunk::Text` per call to `sink` (with `delay` between them),
+    /// then `Chunk::Done`. Records every `(prompt, params)` it was invoked with, and how many tokens
+    /// it managed to SEND before the sink said stop -- what the disconnect test observes.
+    struct ScriptedGenerator { tokens: Vec<String>, delay: Duration, sent: Arc<AtomicUsize>, seen: Seen }
+    impl TextGenerator for ScriptedGenerator {
+        fn generate(&mut self, prompt: &Prompt, params: &GenerateParams,
+            sink: &mut dyn FnMut(Chunk<'_>) -> bool) -> Result<(), EngineError> {
+            *self.seen.lock().unwrap() = Some((prompt.clone(), params.clone()));
+            let mut usage = GenerateUsage::default();
+            let cap = (params.max_tokens as usize).min(self.tokens.len());
+            for tok in self.tokens.iter().take(cap) {
+                if !self.delay.is_zero() { std::thread::sleep(self.delay); }
+                self.sent.fetch_add(1, Ordering::SeqCst);
+                usage.completion_tokens += 1;
+                if !sink(Chunk::Text(tok)) {
+                    let _ = sink(Chunk::Done { reason: FinishReason::Aborted, usage });
+                    return Ok(());
+                }
+            }
+            let reason = if cap < self.tokens.len() { FinishReason::Length } else { FinishReason::Stop };
+            sink(Chunk::Done { reason, usage });
+            Ok(())
+        }
+    }
+
+    struct GenModel { gen: ScriptedGenerator }
+    impl Servable for GenModel {
+        fn capabilities(&self) -> Capability { Capability::GENERATE }
+        fn run(&mut self, _req: EngineReq) -> Result<EngineResp, EngineError> {
+            Err(EngineError::Unsupported("use generate_stream".into()))
+        }
+    }
+    impl StreamServable for GenModel {
+        fn generate_stream(&mut self, prompt: &Prompt, params: &GenerateParams,
+            sink: &mut dyn FnMut(Chunk<'_>) -> bool) -> Result<(), EngineError> {
+            self.gen.generate(prompt, params, sink)
+        }
+    }
+
+    struct GenLoader { tokens: Vec<String>, delay: Duration, sent: Arc<AtomicUsize>, seen: Seen }
+    impl ModelLoader for GenLoader {
+        fn load(&self, _cfg: &ModelCfg) -> Result<Box<dyn StreamServable>, EngineError> {
+            Ok(Box::new(GenModel { gen: ScriptedGenerator {
+                tokens: self.tokens.clone(), delay: self.delay, sent: self.sent.clone(), seen: self.seen.clone(),
+            }}))
+        }
+        fn declared_capability(&self, _cfg: &ModelCfg) -> Option<Capability> { Some(Capability::GENERATE) }
+    }
+
+    fn gen_handle(tokens: Vec<String>, delay: Duration)
+        -> (Handle, std::thread::JoinHandle<()>, tempfile::TempDir, PathBuf, Arc<AtomicUsize>, Seen) {
+        let sent = Arc::new(AtomicUsize::new(0));
+        let seen: Seen = Arc::new(Mutex::new(None));
+        let loader = GenLoader { tokens, delay, sent: sent.clone(), seen: seen.clone() };
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("engine.toml");
+        let cfg = Config {
+            server: ServerCfg { max_resident: 1, idle_unload_s: 0, ..Default::default() },
+            models: vec![ModelCfg { name: "llm".into(), scenario: "x".into() }],
+            ..Default::default()
+        };
+        cfg.save(&p).unwrap();
+        let (h, j) = start(cfg, Box::new(loader)).unwrap();
+        (h, j, dir, p, sent, seen)
+    }
+
+    #[test]
+    fn non_streaming_chat_completion_returns_full_text_and_the_whole_message_array() {
+        let (h, j, _d, p, _sent, seen) = gen_handle(ss(&["Hello", ", ", "world"]), Duration::ZERO);
+        let (code, body) = route(&post("/v1/chat/completions",
+            r#"{"messages":[{"role":"system","content":"be terse"},{"role":"user","content":"hi"}]}"#), &h, &p);
+        assert_eq!(code, 200, "{body}");
+        let v: serde_json::Value = serde_json::from_str(body.text()).unwrap();
+        assert_eq!(v["object"], "chat.completion");
+        assert_eq!(v["choices"][0]["message"]["role"], "assistant");
+        assert_eq!(v["choices"][0]["message"]["content"], "Hello, world");
+        assert_eq!(v["choices"][0]["finish_reason"], "stop");
+        assert_eq!(v["usage"]["completion_tokens"], 3);
+        assert!(v["id"].is_string() && v["created"].is_number());
+        // THE bug: the full array (system + user), not just the last turn, must reach the generator.
+        let (prompt, _) = seen.lock().unwrap().clone().unwrap();
+        match prompt {
+            Prompt::Chat(msgs) => {
+                assert_eq!(msgs.len(), 2, "{msgs:?}");
+                assert_eq!((msgs[0].role.as_str(), msgs[0].content.as_str()), ("system", "be terse"));
+                assert_eq!((msgs[1].role.as_str(), msgs[1].content.as_str()), ("user", "hi"));
+            }
+            Prompt::Raw(_) => panic!("chat completions must produce Prompt::Chat"),
+        }
+        h.shutdown(); j.join().unwrap();
+    }
+
+    #[test]
+    fn every_sampling_param_round_trips() {
+        let (h, j, _d, p, _sent, seen) = gen_handle(ss(&["ok"]), Duration::ZERO);
+        let body = r#"{"messages":[{"role":"user","content":"hi"}],
+            "temperature":0.3,"top_p":0.5,"top_k":40,"max_tokens":7,
+            "seed":42,"presence_penalty":0.1,"frequency_penalty":0.2,"repetition_penalty":1.3,
+            "stop":"STOP"}"#;
+        let (code, resp) = route(&post("/v1/chat/completions", body), &h, &p);
+        assert_eq!(code, 200, "{resp}");
+        let (_, params) = seen.lock().unwrap().clone().unwrap();
+        assert!(close(params.temperature, 0.3), "{}", params.temperature);
+        assert!(close(params.top_p, 0.5), "{}", params.top_p);
+        assert_eq!(params.top_k, 40);
+        assert_eq!(params.max_tokens, 7);
+        assert_eq!(params.seed, Some(42));
+        assert!(close(params.presence_penalty, 0.1), "{}", params.presence_penalty);
+        assert!(close(params.frequency_penalty, 0.2), "{}", params.frequency_penalty);
+        assert!(close(params.repetition_penalty, 1.3), "{}", params.repetition_penalty);
+        assert_eq!(params.stop, vec!["STOP".to_string()]);
+        h.shutdown(); j.join().unwrap();
+    }
+
+    #[test]
+    fn openai_defaults_apply_when_fields_are_absent() {
+        let (h, j, _d, p, _sent, seen) = gen_handle(ss(&["ok"]), Duration::ZERO);
+        let (code, resp) = route(&post("/v1/chat/completions",
+            r#"{"messages":[{"role":"user","content":"hi"}]}"#), &h, &p);
+        assert_eq!(code, 200, "{resp}");
+        let (_, params) = seen.lock().unwrap().clone().unwrap();
+        let d = GenerateParams::default();
+        assert!(close(params.temperature, d.temperature), "default temperature must be 1.0, not greedy");
+        assert!(close(params.top_p, d.top_p));
+        assert_eq!(params.top_k, 0);
+        assert_eq!(params.max_tokens, 256);
+        assert!(params.stop.is_empty());
+        assert_eq!(params.seed, None);
+        h.shutdown(); j.join().unwrap();
+    }
+
+    #[test]
+    fn stop_accepts_a_string_or_an_array() {
+        let (h, j, _d, p, _sent, seen) = gen_handle(ss(&["ok"]), Duration::ZERO);
+        route(&post("/v1/chat/completions",
+            r#"{"messages":[{"role":"user","content":"hi"}],"stop":"END"}"#), &h, &p);
+        assert_eq!(seen.lock().unwrap().clone().unwrap().1.stop, vec!["END".to_string()]);
+        route(&post("/v1/chat/completions",
+            r#"{"messages":[{"role":"user","content":"hi"}],"stop":["A","B"]}"#), &h, &p);
+        assert_eq!(seen.lock().unwrap().clone().unwrap().1.stop, vec!["A".to_string(), "B".to_string()]);
+        let (code, body) = route(&post("/v1/chat/completions",
+            r#"{"messages":[{"role":"user","content":"hi"}],"stop":5}"#), &h, &p);
+        assert_eq!(code, 400, "{body}");
+        h.shutdown(); j.join().unwrap();
+    }
+
+    #[test]
+    fn max_tokens_truncates_and_reports_length() {
+        let (h, j, _d, p, _sent, _seen) = gen_handle(ss(&["a", "b", "c", "d", "e"]), Duration::ZERO);
+        let (code, body) = route(&post("/v1/chat/completions",
+            r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":2}"#), &h, &p);
+        assert_eq!(code, 200, "{body}");
+        let v: serde_json::Value = serde_json::from_str(body.text()).unwrap();
+        assert_eq!(v["choices"][0]["finish_reason"], "length");
+        assert_eq!(v["choices"][0]["message"]["content"], "ab");
+        h.shutdown(); j.join().unwrap();
+    }
+
+    /// A multi-byte codepoint split across tokens produces an empty `Chunk::Text` until it completes
+    /// -- that must be forwarded, not filtered, and must not corrupt the reassembled text.
+    #[test]
+    fn an_empty_text_chunk_is_forwarded_without_corrupting_the_result() {
+        let (h, j, _d, p, _sent, _seen) = gen_handle(ss(&["", "hi", ""]), Duration::ZERO);
+        let (code, body) = route(&post("/v1/chat/completions",
+            r#"{"messages":[{"role":"user","content":"x"}]}"#), &h, &p);
+        assert_eq!(code, 200, "{body}");
+        let v: serde_json::Value = serde_json::from_str(body.text()).unwrap();
+        assert_eq!(v["choices"][0]["message"]["content"], "hi");
+        h.shutdown(); j.join().unwrap();
+    }
+
+    #[test]
+    fn unsupported_sampling_params_are_rejected_not_silently_dropped() {
+        let (h, j, _d, p, _sent, _seen) = gen_handle(ss(&["x"]), Duration::ZERO);
+        for body in [
+            r#"{"messages":[{"role":"user","content":"hi"}],"n":2}"#,
+            r#"{"messages":[{"role":"user","content":"hi"}],"logprobs":true}"#,
+            r#"{"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function"}]}"#,
+            r#"{"messages":[{"role":"user","content":"hi"}],"logit_bias":{"123":10}}"#,
+        ] {
+            let (code, resp) = route(&post("/v1/chat/completions", body), &h, &p);
+            assert_eq!(code, 400, "{body}: got {resp}");
+        }
+        // ...but explicit no-op values (OpenAI clients send these routinely) must still pass.
+        let (code, resp) = route(&post("/v1/chat/completions",
+            r#"{"messages":[{"role":"user","content":"hi"}],"n":1,"logprobs":false}"#), &h, &p);
+        assert_eq!(code, 200, "{resp}");
+        h.shutdown(); j.join().unwrap();
+    }
+
+    #[test]
+    fn a_multipart_content_array_of_text_parts_is_flattened_and_other_types_are_rejected() {
+        let (h, j, _d, p, _sent, seen) = gen_handle(ss(&["ok"]), Duration::ZERO);
+        let (code, resp) = route(&post("/v1/chat/completions",
+            r#"{"messages":[{"role":"user","content":[{"type":"text","text":"a"},{"type":"text","text":"b"}]}]}"#),
+            &h, &p);
+        assert_eq!(code, 200, "{resp}");
+        match seen.lock().unwrap().clone().unwrap().0 {
+            Prompt::Chat(msgs) => assert_eq!(msgs[0].content, "ab"),
+            _ => panic!("expected Prompt::Chat"),
+        }
+        let (code, resp) = route(&post("/v1/chat/completions",
+            r#"{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"x"}}]}]}"#),
+            &h, &p);
+        assert_eq!(code, 400, "an unsupported content part must fail loud, not drop silently: {resp}");
+        h.shutdown(); j.join().unwrap();
+    }
+
+    #[test]
+    fn completions_endpoint_uses_a_raw_untemplated_prompt() {
+        let (h, j, _d, p, _sent, seen) = gen_handle(ss(&["once", " upon", " a time"]), Duration::ZERO);
+        let (code, body) = route(&post("/v1/completions", r#"{"prompt":"Tell me a story"}"#), &h, &p);
+        assert_eq!(code, 200, "{body}");
+        let v: serde_json::Value = serde_json::from_str(body.text()).unwrap();
+        assert_eq!(v["object"], "text_completion");
+        assert_eq!(v["choices"][0]["text"], "once upon a time");
+        match seen.lock().unwrap().clone().unwrap().0 {
+            Prompt::Raw(s) => assert_eq!(s, "Tell me a story"),
+            Prompt::Chat(_) => panic!("/v1/completions must not go through the chat template"),
+        }
+        h.shutdown(); j.join().unwrap();
+    }
+
+    #[test]
+    fn completions_rejects_an_array_prompt_with_a_clear_400() {
+        let (h, j, _d, p, _sent, _seen) = gen_handle(ss(&["x"]), Duration::ZERO);
+        let (code, body) = route(&post("/v1/completions", r#"{"prompt":["a","b"]}"#), &h, &p);
+        assert_eq!(code, 400, "{body}");
+        assert!(body.text().contains("not supported"), "{body}");
+        h.shutdown(); j.join().unwrap();
+    }
+
+    /// SSE shape: a role-only preamble, then one content delta per token (verified structurally, not
+    /// by exact string match, since `id`/`created` are per-request), then a terminal empty-delta
+    /// chunk carrying `finish_reason`. `[DONE]` itself is written by `respond_stream`, which needs a
+    /// real socket -- covered by `tests/streaming.rs`.
+    #[test]
+    fn chat_completion_sse_frames_are_role_then_content_then_finish() {
+        let (h, j, _d, p, _sent, _seen) = gen_handle(ss(&["Hello", ", ", "world"]), Duration::ZERO);
+        let (code, body) = route(&post("/v1/chat/completions",
+            r#"{"messages":[{"role":"user","content":"hi"}],"stream":true}"#), &h, &p);
+        assert_eq!(code, 200);
+        let Body::Stream(s) = body else { panic!("expected a streaming body") };
+
+        let role: serde_json::Value = serde_json::from_str(&s.render_role()).unwrap();
+        assert_eq!(role["object"], "chat.completion.chunk");
+        assert_eq!(role["choices"][0]["delta"]["role"], "assistant");
+        assert!(role["choices"][0]["delta"].get("content").is_none());
+        assert!(role["choices"][0]["finish_reason"].is_null());
+
+        let mut texts = Vec::new();
+        let mut got_done = false;
+        for item in s.rx.iter() {
+            match item {
+                StreamItem::Text(t) => {
+                    let frame: serde_json::Value = serde_json::from_str(&s.render_text(&t)).unwrap();
+                    assert_eq!(frame["object"], "chat.completion.chunk");
+                    assert_eq!(frame["choices"][0]["delta"]["content"], t);
+                    assert!(frame["choices"][0]["finish_reason"].is_null());
+                    texts.push(t);
+                }
+                StreamItem::Done { reason, .. } => {
+                    let frame: serde_json::Value = serde_json::from_str(&s.render_done(reason)).unwrap();
+                    assert_eq!(frame["choices"][0]["finish_reason"], reason.as_str());
+                    assert_eq!(frame["choices"][0]["delta"], serde_json::json!({}));
+                    got_done = true;
+                }
+                StreamItem::Error(e) => panic!("unexpected error: {e}"),
+            }
+        }
+        assert_eq!(texts.join(""), "Hello, world");
+        assert!(got_done);
+        h.shutdown(); j.join().unwrap();
+    }
+
+    #[test]
+    fn completions_endpoint_streams_text_deltas_with_no_role_preamble() {
+        let (h, j, _d, p, _sent, _seen) = gen_handle(ss(&["a", "b"]), Duration::ZERO);
+        let (code, body) = route(&post("/v1/completions", r#"{"prompt":"x","stream":true}"#), &h, &p);
+        assert_eq!(code, 200);
+        let Body::Stream(s) = body else { panic!("expected a streaming body") };
+        let mut saw_text = false;
+        for item in s.rx.iter() {
+            if let StreamItem::Text(t) = item {
+                let frame: serde_json::Value = serde_json::from_str(&s.render_text(&t)).unwrap();
+                assert_eq!(frame["object"], "text_completion");
+                assert_eq!(frame["choices"][0]["text"], t);
+                saw_text = true;
+            }
+        }
+        assert!(saw_text);
+        h.shutdown(); j.join().unwrap();
+    }
+
+    /// The core of the disconnect requirement: dropping the receiving end (what `respond_stream` does
+    /// on a failed write) must make the actor's next `send` fail, which is the sink's abort signal.
+    /// `tests/streaming.rs` covers the real-socket half of this (an actual TCP close).
+    #[test]
+    fn dropping_the_receiver_aborts_generation() {
+        let n = 500;
+        let tokens: Vec<String> = (0..n).map(|i| format!("t{i}")).collect();
+        let (h, j, _d, p, sent, _seen) = gen_handle(tokens, Duration::from_millis(2));
+        let (code, body) = route(&post("/v1/chat/completions",
+            r#"{"messages":[{"role":"user","content":"hi"}],"stream":true}"#), &h, &p);
+        assert_eq!(code, 200, "{body}");
+        let Body::Stream(s) = body else { panic!("expected a streaming body") };
+        let _ = s.rx.recv();
+        let _ = s.rx.recv();
+        drop(s);
+        std::thread::sleep(Duration::from_millis(200));
+        let got = sent.load(Ordering::SeqCst);
+        assert!(got < n, "generation must abort on disconnect; sent {got} of {n} tokens");
+        h.shutdown(); j.join().unwrap();
+    }
+
+    #[test]
+    fn admin_defaults_and_selection_route_generate_correctly() {
+        let (h, j, _d, p, _sent, _seen) = gen_handle(ss(&["ok"]), Duration::ZERO);
+        let (code, body) = route(&post("/admin/defaults", r#"{"capability":"generate","model":"llm"}"#), &h, &p);
+        assert_eq!(code, 200, "{body}");
+        let cfg = Config::load(&p).unwrap();
+        assert_eq!(cfg.defaults.get(Capability::GENERATE).map(String::as_str), Some("llm"));
+        let (code, body) = route(&post("/v1/chat/completions",
+            r#"{"messages":[{"role":"user","content":"hi"}]}"#), &h, &p);
+        assert_eq!(code, 200, "{body}");
+        h.shutdown(); j.join().unwrap();
     }
 }

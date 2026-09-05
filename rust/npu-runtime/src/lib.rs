@@ -8,6 +8,7 @@ pub mod reconcile;
 pub mod actor;
 pub mod http;
 pub mod media;
+pub mod stream;
 
 pub use config::Config;
 pub use actor::{start, start_lazy, Handle, Served};

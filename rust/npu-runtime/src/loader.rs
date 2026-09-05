@@ -13,8 +13,24 @@ use npu_engine::EngineError;
 
 pub use npu_engine::capability::Servable;
 
+/// Extends `Servable` with the streaming text-generation surface. Local to npu-runtime, not
+/// `npu_engine::capability`: `Servable::run` is single-shot over `Request`/`Response`, which have no
+/// shape for a token stream, while `TextGenerator::generate` takes a sink and a `&mut self` decoder.
+/// Every `Servable` this crate constructs implements this too (the registry stores
+/// `Box<dyn StreamServable>`); the default answers `Unsupported` for a model that cannot generate.
+pub trait StreamServable: Servable {
+    fn generate_stream(
+        &mut self,
+        _prompt: &npu_engine::Prompt,
+        _params: &npu_engine::GenerateParams,
+        _sink: &mut dyn FnMut(npu_engine::Chunk<'_>) -> bool,
+    ) -> Result<(), EngineError> {
+        Err(EngineError::Unsupported(format!("{} cannot stream text generation", self.capabilities())))
+    }
+}
+
 pub trait ModelLoader {
-    fn load(&self, cfg: &ModelCfg) -> Result<Box<dyn Servable>, EngineError>;
+    fn load(&self, cfg: &ModelCfg) -> Result<Box<dyn StreamServable>, EngineError>;
 
     /// What capability this model DECLARES, without loading it: cheap, host-only, no device.
     ///
@@ -53,6 +69,15 @@ impl Servable for EngineModel {
     }
 }
 
+impl StreamServable for EngineModel {
+    /// `Model::generate` already returns `WrongKind` for a non-Generate scenario, so this is a plain
+    /// delegation -- no capability check duplicated here.
+    fn generate_stream(&mut self, prompt: &npu_engine::Prompt, params: &npu_engine::GenerateParams,
+        sink: &mut dyn FnMut(npu_engine::Chunk<'_>) -> bool) -> Result<(), EngineError> {
+        self.model.generate(prompt, params, sink)
+    }
+}
+
 impl EngineLoader {
     /// A scenario path resolved against the engine ROOT when it is relative.
     ///
@@ -67,7 +92,7 @@ impl EngineLoader {
 }
 
 impl ModelLoader for EngineLoader {
-    fn load(&self, cfg: &ModelCfg) -> Result<Box<dyn Servable>, EngineError> {
+    fn load(&self, cfg: &ModelCfg) -> Result<Box<dyn StreamServable>, EngineError> {
         let model = npu_engine::Model::load_in(self.scenario_path(cfg), &self.root)?;
         Ok(Box::new(EngineModel { model }))
     }
@@ -103,8 +128,12 @@ pub mod mock {
             }
         }
     }
+    /// No generation support: models that need to stream text build a purpose-made loader (see
+    /// `http.rs`'s test module) rather than growing this shared fixture's shape for every caller.
+    impl StreamServable for MockModel {}
+
     impl ModelLoader for MockLoader {
-        fn load(&self, cfg: &ModelCfg) -> Result<Box<dyn Servable>, EngineError> {
+        fn load(&self, cfg: &ModelCfg) -> Result<Box<dyn StreamServable>, EngineError> {
             match self.table.get(&cfg.name) {
                 Some(Ok((c, bo))) => Ok(Box::new(MockModel { cap: *c, bo: *bo })),
                 Some(Err(e)) => Err(EngineError::Load(e.clone())),
@@ -139,6 +168,7 @@ mod tests {
     /// A `Servable` standing in for a loaded diarize model, exercising the SHAPE contract the
     /// EngineModel adapter must honour: audio in, segments out.
     struct FakeDiarize;
+    impl StreamServable for FakeDiarize {}
     impl Servable for FakeDiarize {
         fn capabilities(&self) -> Capability { Capability::DIARIZE }
         fn run(&mut self, req: Request) -> Result<Response, EngineError> {

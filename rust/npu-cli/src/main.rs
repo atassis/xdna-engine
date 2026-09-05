@@ -1,6 +1,6 @@
 //! `npu` - the single engine entrypoint. Thin clap shell over npu-runtime (control plane) and
 //! npu-engine. Subcommands: serve, transcribe, embed, models, config, reload, bake.
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 
@@ -10,13 +10,14 @@ mod media;
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser};
 
-use cli_def::{Cli, Cmd, ConfigCmd, OutFormat, WeightsCmd};
+use cli_def::{Cli, Cmd, ConfigCmd, OutFormat, SamplingArgs, WeightsCmd};
 use clap_complete::Shell;
 use npu_runtime::actor::{start, start_lazy};
 use npu_engine::capability::Capability;
 use npu_runtime::config::{Config, EvictPolicy};
 use npu_runtime::http;
 use npu_runtime::loader::EngineLoader;
+use npu_runtime::stream::StreamItem;
 
 fn config_path(cli: &Cli) -> PathBuf {
     if let Some(p) = &cli.config { return p.clone(); }
@@ -31,6 +32,9 @@ fn main() -> Result<()> {
     match &cli.cmd {
         Cmd::Serve { port, allow_degraded } => serve(&path, *port, *allow_degraded),
         Cmd::Transcribe { input, model } => transcribe(&path, input, model.as_deref()),
+        Cmd::Generate { prompt, model, sampling, no_stream } =>
+            generate(&path, prompt, model.as_deref(), sampling, *no_stream),
+        Cmd::Chat { model, sampling, no_stream } => chat(&path, model.as_deref(), sampling, *no_stream),
         Cmd::Embed { text, model } => embed(&path, text, model.as_deref()),
         Cmd::Diarize { wav, model, json } => diarize(&path, wav, model.as_deref(), *json),
         Cmd::TranscribeMedia { input, out, format, asr, diarize: diar, track, no_diarize } =>
@@ -225,6 +229,90 @@ fn transcribe(path: &Path, input: &Path, model: Option<&str>) -> Result<()> {
     handle.shutdown(); let _ = join.join();
     println!("{}", out?.value);
     Ok(())
+}
+
+/// `--flag <value>` overrides one `GenerateParams` field; an absent flag keeps the engine default
+/// (`GenerateParams::default()`, OpenAI's own defaults) -- never a CLI-chosen substitute.
+fn build_params(s: &SamplingArgs) -> npu_engine::GenerateParams {
+    let mut p = npu_engine::GenerateParams::default();
+    if let Some(t) = s.temperature { p.temperature = t; }
+    if let Some(t) = s.top_p { p.top_p = t; }
+    if let Some(t) = s.top_k { p.top_k = t; }
+    if let Some(t) = s.max_tokens { p.max_tokens = t; }
+    if !s.stop.is_empty() { p.stop = s.stop.clone(); }
+    p.seed = s.seed;
+    p
+}
+
+/// `npu generate`/`npu chat` run IN-PROCESS (`start_lazy` + `EngineLoader`), the same pattern as
+/// `transcribe`/`embed`/`diarize`, rather than talking to a running server over HTTP the way `npu
+/// models`/`npu reload` do. Reasons: (1) those two already load their own model one-shot with no
+/// server required, which is the point of a CLI generate command existing at all; (2) streaming
+/// tokens to stdout is a direct callback from `Handle::generate`'s receiver, whereas an HTTP client
+/// here would mean writing an incremental SSE parser in the CLI for no benefit, since the process
+/// already IS the engine; (3) `Handle::generate`'s `Prompt::Chat` with real history is exactly what
+/// a REPL wants and is not staged through JSON at all this way.
+///
+/// Drains `rx` to completion either way, so `Cmd::Generate` on the actor side always finishes even
+/// under `--no-stream`.
+fn drain_generation(rx: std::sync::mpsc::Receiver<StreamItem>, stream: bool) -> Result<String> {
+    let mut text = String::new();
+    loop {
+        match rx.recv() {
+            Ok(StreamItem::Text(t)) => {
+                if stream { print!("{t}"); std::io::stdout().flush().ok(); }
+                else { text.push_str(&t); }
+            }
+            Ok(StreamItem::Done { .. }) => return Ok(text),
+            Ok(StreamItem::Error(e)) => bail!("{e}"),
+            Err(_) => bail!("generation ended without a result"),
+        }
+    }
+}
+
+fn generate(path: &Path, prompt: &str, model: Option<&str>, sampling: &SamplingArgs, no_stream: bool)
+    -> Result<()> {
+    quiet_one_shot();
+    let cfg = load_cfg(path)?;
+    let root = root(&cfg, path)?;
+    let (handle, join) = start_lazy(cfg, Box::new(EngineLoader { root }))?;
+    let params = build_params(sampling);
+    let result = handle.generate(model, npu_engine::Prompt::Raw(prompt.to_string()), params)
+        .map_err(|e| anyhow!(e.to_string()))
+        .and_then(|served| drain_generation(served.value, !no_stream));
+    handle.shutdown(); let _ = join.join();
+    let text = result?;
+    if no_stream { print!("{text}"); }
+    println!();
+    Ok(())
+}
+
+fn chat(path: &Path, model: Option<&str>, sampling: &SamplingArgs, no_stream: bool) -> Result<()> {
+    quiet_one_shot();
+    let cfg = load_cfg(path)?;
+    let root = root(&cfg, path)?;
+    let (handle, join) = start_lazy(cfg, Box::new(EngineLoader { root }))?;
+    let params = build_params(sampling);
+    let mut history: Vec<npu_engine::ChatMessage> = Vec::new();
+    let stdin = std::io::stdin();
+    let result = (|| -> Result<()> {
+        loop {
+            print!("> "); std::io::stdout().flush().ok();
+            let mut line = String::new();
+            if stdin.lock().read_line(&mut line)? == 0 { println!(); return Ok(()); } // Ctrl-D
+            let line = line.trim_end();
+            if line.is_empty() { continue; }
+            history.push(npu_engine::ChatMessage { role: "user".into(), content: line.to_string() });
+            let served = handle.generate(model, npu_engine::Prompt::Chat(history.clone()), params.clone())
+                .map_err(|e| anyhow!(e.to_string()))?;
+            let reply = drain_generation(served.value, !no_stream)?;
+            if no_stream { print!("{reply}"); }
+            println!();
+            history.push(npu_engine::ChatMessage { role: "assistant".into(), content: reply });
+        }
+    })();
+    handle.shutdown(); let _ = join.join();
+    result
 }
 
 /// Shortest span worth sending to ASR. Below this a "segment" is a diarization edge artefact and
@@ -500,6 +588,60 @@ fn http_req(port: u16, method: &str, path: &str, body: &str) -> Result<String> {
 mod tests {
     use super::*;
     use npu_runtime::config::{Defaults, ModelCfg, ServerCfg};
+
+    /// No flag set -> the engine default, not a CLI-chosen greedy substitute.
+    #[test]
+    fn build_params_with_no_flags_is_the_engine_default() {
+        let s = cli_def::SamplingArgs {
+            temperature: None, top_p: None, top_k: None, max_tokens: None,
+            stop: vec![], seed: None,
+        };
+        let p = build_params(&s);
+        let d = npu_engine::GenerateParams::default();
+        assert_eq!(p.temperature, d.temperature);
+        assert_eq!(p.top_p, d.top_p);
+        assert_eq!(p.top_k, d.top_k);
+        assert_eq!(p.max_tokens, d.max_tokens);
+        assert!(p.stop.is_empty());
+        assert_eq!(p.seed, None);
+    }
+
+    #[test]
+    fn build_params_applies_every_flag() {
+        let s = cli_def::SamplingArgs {
+            temperature: Some(0.4), top_p: Some(0.9), top_k: Some(50), max_tokens: Some(64),
+            stop: vec!["END".into(), "STOP".into()], seed: Some(7),
+        };
+        let p = build_params(&s);
+        assert_eq!(p.temperature, 0.4);
+        assert_eq!(p.top_p, 0.9);
+        assert_eq!(p.top_k, 50);
+        assert_eq!(p.max_tokens, 64);
+        assert_eq!(p.stop, vec!["END".to_string(), "STOP".to_string()]);
+        assert_eq!(p.seed, Some(7));
+    }
+
+    /// `generate`'s clap definition: a free-text positional with hyphen values allowed (prose starts
+    /// with `-` routinely), plus the shared sampling flags.
+    #[test]
+    fn generate_cli_parses_a_hyphen_leading_prompt_and_sampling_flags() {
+        let cli = Cli::try_parse_from([
+            "npu", "generate", "- a bullet point", "--temperature", "0.5", "--stop", "END",
+            "--stop", "STOP", "--seed", "3", "--no-stream",
+        ]).expect("must parse");
+        match cli.cmd {
+            Cmd::Generate { prompt, sampling, no_stream, model } => {
+                assert_eq!(prompt, "- a bullet point");
+                assert_eq!(sampling.temperature, Some(0.5));
+                assert_eq!(sampling.stop, vec!["END".to_string(), "STOP".to_string()]);
+                assert_eq!(sampling.seed, Some(3));
+                assert!(no_stream);
+                assert_eq!(model, None);
+            }
+            _ => panic!("expected Cmd::Generate"),
+        }
+    }
+
     fn cfg_with(scenarios: &[&str]) -> Config {
         Config {
             server: ServerCfg::default(),

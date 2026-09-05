@@ -1,7 +1,7 @@
 //! Actual state: which models are loaded, their status, the memory accountant, and residency --
 //! `last_used` per entry, which is what LRU eviction and idle unload both order themselves by.
 use crate::config::{EvictPolicy, ModelCfg, ServerCfg};
-use crate::loader::{ModelLoader, Servable};
+use crate::loader::{ModelLoader, StreamServable};
 use npu_engine::EngineError;
 use std::time::{Duration, Instant};
 
@@ -72,7 +72,7 @@ pub struct ModelStatus {
 
 pub struct Entry {
     pub cfg: ModelCfg,
-    pub model: Option<Box<dyn Servable>>,
+    pub model: Option<Box<dyn StreamServable>>,
     pub status: ModelStatus,
     /// Last time this entry served a request; set to the load time when it becomes resident. Stale
     /// but harmless while the entry is not resident -- both readers filter on residency first.
@@ -85,12 +85,12 @@ pub struct Registry {
 }
 
 impl Registry {
-    pub fn get_loaded(&self, name: &str) -> Option<&(dyn Servable + 'static)> {
+    pub fn get_loaded(&self, name: &str) -> Option<&(dyn StreamServable + 'static)> {
         self.entries.iter().find(|e| e.cfg.name == name).and_then(|e| e.model.as_deref())
     }
     /// `Servable::run` takes `&mut self` (every shipped model is mutable in truth -- some launder it
     /// through a `RefCell`), so serving needs this and not `get_loaded`.
-    pub fn get_loaded_mut(&mut self, name: &str) -> Option<&mut (dyn Servable + 'static)> {
+    pub fn get_loaded_mut(&mut self, name: &str) -> Option<&mut (dyn StreamServable + 'static)> {
         self.entries.iter_mut().find(|e| e.cfg.name == name).and_then(|e| e.model.as_deref_mut())
     }
     pub fn resident_bytes(&self) -> u64 {
@@ -409,7 +409,7 @@ mod tests {
         // declared_capability reads the scenario TOML and the failure is in the artifacts.
         struct Declaring;
         impl ModelLoader for Declaring {
-            fn load(&self, _c: &ModelCfg) -> Result<Box<dyn Servable>, EngineError> {
+            fn load(&self, _c: &ModelCfg) -> Result<Box<dyn StreamServable>, EngineError> {
                 Err(EngineError::Load("boom".into()))
             }
             fn declared_capability(&self, _c: &ModelCfg) -> Option<Capability> {
