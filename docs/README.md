@@ -15,3 +15,12 @@ thesis - it is the frame everything else follows from.
   decoder's lm-head and argmax onto the NPU: the dead-ends and the fix.
 - [benchmark-methodology.md](benchmark-methodology.md) - how the NPU-vs-CPU numbers are
   measured (RAPL energy, quiesce + idle-subtract) so they are reproducible.
+- [s2-ar-graph-map.md](s2-ar-graph-map.md) - inventory of the S2 autoregressive
+  forward pass: every operation with tensor names, shapes, brick assignments, and L1
+  sizing notes.
+- [s2-bd-gather-feasibility.md](s2-bd-gather-feasibility.md) - whether AIE2P's DMA/BD
+  engine supports runtime-offset embedding gathers, verified against toolchain sources
+  and hardware.
+- [s2-weight-blob-format.md](s2-weight-blob-format.md) - the on-disk format for
+  S2-Pro's dequantized weight blob and JSON manifest: layout specification and
+  verification procedures.
