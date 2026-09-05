@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use npu_asr::kernel_registry;
 use npu_xrt::Arena;
 
 use crate::api::EngineError;
@@ -73,6 +74,23 @@ pub struct LlmArtifact {
     pub n_layers: usize,
     pub embed_scale: EmbedScale,
     pub rope_theta_global: f64,
+    /// `meta.json`'s `toolchain.hash` -- the toolchain.lock semantic hash this ELF was compiled
+    /// against (`gen_llm_decode.py`, added 2026-09-05). `None` on any artifact built before this
+    /// field existed. See [`LlmArtifact::load`]'s freshness check below.
+    pub toolchain_hash: Option<String>,
+}
+
+/// Verdict from comparing an artifact's [`LlmArtifact::toolchain_hash`] against the currently
+/// pinned toolchain. Three ways to NOT be a hash match, because they mean different things: a
+/// pre-this-change artifact was never stamped, a stamped one couldn't be checked (no
+/// `toolchain.lock` above the artifact dir -- expected in a production install, which must not
+/// depend on that dev-infra file), and a stamped one that actively disagrees with the current pin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolchainFreshness {
+    Fresh { hash: String },
+    Stale { built_hash: String, current_hash: String },
+    Unstamped,
+    Unverifiable { built_hash: String, reason: String },
 }
 
 impl LlmArtifact {
@@ -116,6 +134,11 @@ impl LlmArtifact {
         let inputs = str_list("inputs")?;
         let weights = str_list("weights")?;
         let cache_buffers = meta.get("cache_buffers").map(|_| str_list("cache_buffers")).transpose()?.unwrap_or_default();
+        let toolchain_hash = meta
+            .get("toolchain")
+            .and_then(|t| t.get("hash"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
 
         let mut layout = HashMap::new();
         let layout_obj = meta
@@ -257,6 +280,31 @@ impl LlmArtifact {
             }
         }
 
+        // Toolchain freshness: fail loud on an ACTIVE mismatch (the pin moved, nobody rebuilt this
+        // artifact -- the exact silent-wrong-token shape recorded in
+        // docs/kb/the-2026-09-04-repin-left-two-artifact-families-stale.md). Anything short of a
+        // confirmed mismatch is reported, never fatal -- a shipped consumer must not require
+        // toolchain.lock to exist (that is dev-infra; see kernel_registry::check_toolchain_freshness's
+        // doc comment for the encoder-side sibling of this same rule).
+        match Self::check_toolchain_freshness(&toolchain_hash, decode_dir) {
+            ToolchainFreshness::Stale { built_hash, current_hash } => {
+                return Err(ctx(format!(
+                    "toolchain-stale: built against {built_hash}, current toolchain.lock is {current_hash} \
+                     -- rebuild with scripts/build_llm_decode.sh"
+                )));
+            }
+            ToolchainFreshness::Unstamped => eprintln!(
+                "[llm artifact] {}: no toolchain provenance recorded (built before this check existed) \
+                 -- freshness UNVERIFIED",
+                meta_path.display()
+            ),
+            ToolchainFreshness::Unverifiable { built_hash, reason } => eprintln!(
+                "[llm artifact] {}: built against {built_hash}, but {reason} -- freshness UNVERIFIED",
+                meta_path.display()
+            ),
+            ToolchainFreshness::Fresh { .. } => {}
+        }
+
         Ok(LlmArtifact {
             decode_dir: decode_dir.to_path_buf(),
             elf_name,
@@ -276,7 +324,43 @@ impl LlmArtifact {
             n_layers,
             embed_scale,
             rope_theta_global,
+            toolchain_hash,
         })
+    }
+
+    /// Compare `toolchain_hash` (from `meta.json`) against the toolchain.lock found by walking up
+    /// from `decode_dir`. Never touches an env var or a fixed repo path -- a production install has
+    /// no toolchain.lock at all, and that is a valid, expected state, not an error.
+    fn check_toolchain_freshness(toolchain_hash: &Option<String>, decode_dir: &Path) -> ToolchainFreshness {
+        let Some(built) = toolchain_hash else {
+            return ToolchainFreshness::Unstamped;
+        };
+        match Self::resolve_current_pin_hash(decode_dir) {
+            Ok(Some(current)) if &current == built => ToolchainFreshness::Fresh { hash: current },
+            Ok(Some(current)) => ToolchainFreshness::Stale { built_hash: built.clone(), current_hash: current },
+            Ok(None) => ToolchainFreshness::Unverifiable {
+                built_hash: built.clone(),
+                reason: "no toolchain.lock found above the artifact dir (not a dev checkout)".to_string(),
+            },
+            Err(e) => ToolchainFreshness::Unverifiable { built_hash: built.clone(), reason: format!("resolving toolchain.lock failed: {e}") },
+        }
+    }
+
+    /// Walk up from `start` for a `toolchain.lock` and hash it with
+    /// `kernel_registry::current_toolchain_hash` -- the ONE derivation
+    /// (`scripts/kernel_sandbox.sh::current_toolchain_hash`, `toolchain_up.sh`'s LOCKHASH, and this
+    /// function all agree byte-for-byte). `Ok(None)` means no lock was found, which is the normal
+    /// shape for a production install and must not be treated as an error.
+    fn resolve_current_pin_hash(start: &Path) -> std::io::Result<Option<String>> {
+        let mut dir = start.canonicalize()?;
+        loop {
+            if dir.join("toolchain.lock").is_file() {
+                return kernel_registry::current_toolchain_hash(&dir).map(Some);
+            }
+            if !dir.pop() {
+                return Ok(None);
+            }
+        }
     }
 
     pub fn elf_path(&self) -> PathBuf {
@@ -411,5 +495,69 @@ mod tests {
         write_meta(dir.path(), &meta);
         let err = LlmArtifact::load(dir.path()).unwrap_err().to_string();
         assert!(err.contains("embed_scale"), "{err}");
+    }
+
+    // ------------------------------------------------------------------------------------
+    // Toolchain freshness (2026-09-05): closes the hole a stale fused decode ELF exploited
+    // silently -- see docs/kb/the-2026-09-04-repin-left-two-artifact-families-stale.md. The
+    // ELF that shipped 2026-09-03 was built against toolchain 9da6356ac521 (the pin one commit
+    // before the 2026-09-04 re-pin, per `git log --follow -- toolchain.lock`); the values below
+    // are that real pair, not invented ones.
+    // ------------------------------------------------------------------------------------
+
+    #[test]
+    fn toolchain_fresh_when_stamp_matches_current_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("toolchain.lock"), b"PIN=abc\n").unwrap();
+        let current = kernel_registry::current_toolchain_hash(dir.path()).unwrap();
+        let mut meta = base_meta(8, 4, serde_json::json!({"rope_global": {"type": "input", "offset": 8, "len": 8}}));
+        meta["toolchain"] = serde_json::json!({"hash": current});
+        write_meta(dir.path(), &meta);
+        let art = LlmArtifact::load(dir.path()).expect("a matching stamp must load");
+        assert_eq!(art.toolchain_hash.as_deref(), Some(current.as_str()));
+    }
+
+    /// THE regression this task closes: a decode.elf built against the pin active before the
+    /// 2026-09-04 re-pin (9da6356ac521), loaded against the CURRENT pin (a6c6331c41b6, this repo's
+    /// real toolchain.lock as of 2026-09-05) -- must fail loud, naming both hashes, exactly the
+    /// shape the real `artifacts-qwen3-0.6b/decode/` artifact is in right now (that one predates
+    /// the stamp field entirely and hits `toolchain_unstamped_artifact_loads_with_a_warning_not_an_error`
+    /// below instead; this test is what re-running its build under this change would produce).
+    #[test]
+    fn toolchain_stale_stamp_fails_loud_naming_both_hashes() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("toolchain.lock"), b"PIN=abc\n").unwrap();
+        let current = kernel_registry::current_toolchain_hash(dir.path()).unwrap();
+        assert_ne!(current, "9da6356ac521", "test setup must actually disagree with the real old pin");
+        let mut meta = base_meta(8, 4, serde_json::json!({"rope_global": {"type": "input", "offset": 8, "len": 8}}));
+        meta["toolchain"] = serde_json::json!({"hash": "9da6356ac521"});
+        write_meta(dir.path(), &meta);
+        let err = LlmArtifact::load(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("toolchain-stale"), "{err}");
+        assert!(err.contains("9da6356ac521"), "{err}");
+        assert!(err.contains(&current), "{err}");
+    }
+
+    #[test]
+    fn toolchain_unstamped_artifact_loads_with_a_warning_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        // No toolchain.lock, no `toolchain` key -- the real shape of every artifact built before
+        // this change, e.g. the shipped artifacts-qwen3-0.6b/decode/meta.json.
+        let meta = base_meta(8, 4, serde_json::json!({"rope_global": {"type": "input", "offset": 8, "len": 8}}));
+        write_meta(dir.path(), &meta);
+        let art = LlmArtifact::load(dir.path()).expect("unstamped must be a warning, not fatal");
+        assert_eq!(art.toolchain_hash, None);
+    }
+
+    #[test]
+    fn toolchain_stamped_but_unresolvable_pin_loads_with_a_warning_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        // Stamped, but no toolchain.lock anywhere above this dir -- the production-install shape
+        // the design constraint requires: a shipped consumer must not need toolchain.lock to exist.
+        let mut meta = base_meta(8, 4, serde_json::json!({"rope_global": {"type": "input", "offset": 8, "len": 8}}));
+        meta["toolchain"] = serde_json::json!({"hash": "9da6356ac521"});
+        write_meta(dir.path(), &meta);
+        let art = LlmArtifact::load(dir.path()).expect("an unresolvable pin must be a warning, not fatal");
+        assert_eq!(art.toolchain_hash.as_deref(), Some("9da6356ac521"));
     }
 }
