@@ -56,6 +56,20 @@ pub fn try_build(cfg_path: &Path, root: &Path) -> Result<Scenario, EngineError> 
             Scenario::Diarize(Box::new(crate::diarize::DiarizePipeline::new(
                 manifest, Box::new(seg), Box::new(emb), &dir)?))
         }
+        // Wires `llm::NpuDecodeStep` (the fused-ELF device backend) + `llm::ModelConfig` (tokenizer/
+        // chat-template/stop-tokens) into a `TextGenerator`. `cfg.artifacts.decode`/`tokenizer_dir`
+        // are absolute-or-root-relative like every other artifact path here (`Path::join` no-ops on
+        // an absolute right-hand side, so an absolute artifact path ignores `root` exactly like the
+        // ASR/embed arms above).
+        Some(crate::ModelKind::Generate) => {
+            let dev = open_dev()?;
+            let decode_dir = root.join(&cfg.artifacts.decode);
+            let weights_dir = root.join(&cfg.artifacts.weights);
+            let tokenizer_dir = root.join(&cfg.artifacts.tokenizer_dir);
+            let model_cfg = crate::llm::ModelConfig::load(&tokenizer_dir)?;
+            let decode = crate::llm::NpuDecodeStep::new(&dev, &decode_dir, &weights_dir)?;
+            Scenario::Generate(Box::new(crate::llm::LlmGenerator::new(model_cfg, decode)))
+        }
         None => return Err(EngineError::Load(format!("unknown scenario kind {:?}", cfg.scenario.kind))),
     };
     Ok(scen)

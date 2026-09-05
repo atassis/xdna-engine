@@ -6,6 +6,8 @@
 
 pub mod api;
 pub use api::{Engine, EngineError, Model, ModelKind};
+pub use pipeline::{ChatMessage, Chunk, FinishReason, GenerateParams, GenerateUsage, Prompt,
+                   TextGenerator};
 
 #[doc(hidden)] pub mod config;
 #[doc(hidden)] pub mod pipeline;
@@ -19,3 +21,4 @@ pub use api::{Engine, EngineError, Model, ModelKind};
 // like the other internals above -- it is a candidate contract validated against two instances, not
 // yet the wired-in replacement for `pipeline::Scenario` / `npu-runtime`'s closed routing.
 #[doc(hidden)] pub mod capability;
+#[doc(hidden)] pub mod llm;

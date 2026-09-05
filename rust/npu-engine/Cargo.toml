@@ -23,6 +23,7 @@ serde_json = "1"
 thiserror = "1"
 toml = "0.8"
 tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
+minijinja = { version = "2", default-features = false, features = ["builtins", "serde"] }
 npu-xrt = { path = "../npu-xrt" }
 npu-asr = { path = "../npu-asr", features = ["two_ctx"] }
 npu-asr-host = { path = "../npu-asr-host" }

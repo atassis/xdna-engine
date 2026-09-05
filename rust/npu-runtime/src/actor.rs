@@ -1,6 +1,6 @@
 //! The single device owner. One thread holds the Registry (and the !Send models) and serves a
 //! cloneable Send Handle over an mpsc channel - total serialization of the single-tenant NPU.
-use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
+use std::sync::mpsc::{channel, sync_channel, RecvTimeoutError, Sender, SyncSender};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
@@ -9,8 +9,14 @@ use crate::loader::ModelLoader;
 use crate::reconcile::{reconcile, ReconcileReport};
 use crate::registry::{deep_release_due, release_free_memory, Capability, ModelStatus, Registry};
 use crate::select::resolve;
+use crate::stream::StreamItem;
 use npu_engine::capability::{Request, Response, Segment};
-use npu_engine::EngineError;
+use npu_engine::{Chunk, EngineError, GenerateParams, Prompt};
+
+/// Bound on the actor -> socket channel for a streaming generation. Bounded so a slow client cannot
+/// make the generator race ahead and allocate without limit; small because a token is one item, not
+/// a batch of work.
+const GENERATE_CHANNEL_CAP: usize = 8;
 
 /// Result carrying which model served (the echo).
 pub struct Served<T> { pub model: String, pub value: T }
@@ -46,6 +52,17 @@ enum Cmd {
         model: Option<String>,
         req: Request,
         reply: Sender<Result<Served<Response>, EngineError>>,
+    },
+    /// Text generation, split from `Serve` because it does not answer with one `Response`: the
+    /// result is a STREAM of chunks, produced on this thread and drained on the caller's. `ack`
+    /// carries the routing/load outcome synchronously (so a caller can answer 503/400 before ever
+    /// opening an SSE body); `tx` then carries the chunks as they are produced.
+    Generate {
+        model: Option<String>,
+        prompt: Prompt,
+        params: GenerateParams,
+        tx: SyncSender<StreamItem>,
+        ack: Sender<Result<String, EngineError>>,
     },
     Reconcile { cfg: Box<Config>, reply: Sender<ReconcileReport> },
     Status { reply: Sender<Vec<ModelStatus>> },
@@ -154,6 +171,40 @@ fn spawn(cfg: Config, loader: Box<dyn ModelLoader + Send>, eager: bool) -> Resul
                     };
                     let _ = reply.send(r);
                 }
+                Ok(Cmd::Generate { model, prompt, params, tx, ack }) => {
+                    last_request = Instant::now(); released = false;
+                    let ready = guard(|| serve_ready(&cfg, &mut reg, loader.as_ref(),
+                            Capability::GENERATE, model.as_deref()))
+                        .unwrap_or_else(|msg| Err(EngineError::Device(msg)));
+                    match ready {
+                        Err(e) => { let _ = ack.send(Err(e)); }
+                        Ok(name) => {
+                            // The ack reaches the caller before any chunk does, which is what lets
+                            // `Handle::generate` answer routing errors before an SSE body ever opens.
+                            if ack.send(Ok(name.clone())).is_ok() {
+                                let mut sink = |c: Chunk<'_>| -> bool {
+                                    let item = match c {
+                                        Chunk::Text(t) => StreamItem::Text(t.to_string()),
+                                        Chunk::Done { reason, usage } => StreamItem::Done { reason, usage },
+                                    };
+                                    // `Err` here means the receiver (the socket thread) is gone --
+                                    // the client hung up. Returning `false` is the sink's documented
+                                    // abort signal.
+                                    tx.send(item).is_ok()
+                                };
+                                let out = guard(|| run_generate(&mut reg, &name, &prompt, &params, &mut sink))
+                                    .unwrap_or_else(|msg| Err(EngineError::Device(msg)));
+                                if let Err(e) = out {
+                                    if condemns_model(&e) {
+                                        reg.mark_failed(&name, &e.to_string());
+                                        eprintln!("[npu-runtime] {name} FAILED generating: {e}");
+                                    }
+                                    let _ = tx.send(StreamItem::Error(e.to_string()));
+                                }
+                            }
+                        }
+                    }
+                }
                 Ok(Cmd::Reconcile { cfg: newcfg, reply }) => {
                     last_request = Instant::now(); released = false;
                     cfg = *newcfg;
@@ -235,6 +286,12 @@ fn run_named(reg: &mut Registry, name: &str, req: Request) -> Result<Response, E
     m.run(req)
 }
 
+fn run_generate(reg: &mut Registry, name: &str, prompt: &Prompt, params: &GenerateParams,
+                sink: &mut dyn FnMut(Chunk<'_>) -> bool) -> Result<(), EngineError> {
+    let m = reg.get_loaded_mut(name).ok_or_else(|| EngineError::Load(format!("{name} not loaded")))?;
+    m.generate_stream(prompt, params, sink)
+}
+
 /// Whether a failure condemns the MODEL or just this request.
 ///
 /// A device or load error is a property of the model -- a missing instruction stream fails
@@ -253,6 +310,19 @@ impl Handle {
         self.tx.send(Cmd::Serve { cap, model: model.map(String::from), req, reply: r })
             .map_err(|_| EngineError::Device("actor stopped".into()))?;
         rx.recv().map_err(|_| EngineError::Device("actor dropped reply".into()))?
+    }
+    /// Text generation. Unlike `serve`, this does not wait for a `Response`: it returns as soon as
+    /// routing/loading is decided, handing back a receiver the caller drains at its own pace (an SSE
+    /// socket loop, or a buffered accumulator). The bounded channel is what keeps a slow drain from
+    /// letting the generator run unbounded ahead of it.
+    pub fn generate(&self, model: Option<&str>, prompt: Prompt, params: GenerateParams)
+        -> Result<Served<std::sync::mpsc::Receiver<StreamItem>>, EngineError> {
+        let (tx, rx) = sync_channel(GENERATE_CHANNEL_CAP);
+        let (ack_tx, ack_rx) = channel();
+        self.tx.send(Cmd::Generate { model: model.map(String::from), prompt, params, tx, ack: ack_tx })
+            .map_err(|_| EngineError::Device("actor stopped".into()))?;
+        let name = ack_rx.recv().map_err(|_| EngineError::Device("actor dropped reply".into()))??;
+        Ok(Served { model: name, value: rx })
     }
     pub fn transcribe(&self, model: Option<&str>, pcm: Vec<i16>, sr: u32) -> Result<Served<String>, EngineError> {
         let s = self.serve(Capability::ASR, model, Request::Audio { pcm, sample_rate: sr })?;
@@ -436,7 +506,7 @@ mod tests {
     /// back a `Handle` to an actor whose initial reconcile silently never completed.
     struct PanicLoader;
     impl ModelLoader for PanicLoader {
-        fn load(&self, _cfg: &ModelCfg) -> Result<Box<dyn crate::loader::Servable>, EngineError> {
+        fn load(&self, _cfg: &ModelCfg) -> Result<Box<dyn crate::loader::StreamServable>, EngineError> {
             panic!("boom: simulated load-time bug");
         }
     }
@@ -451,9 +521,10 @@ mod tests {
             panic!("read instr insts_512x800x768.txt: No such file or directory");
         }
     }
+    impl crate::loader::StreamServable for PanicOnRun {}
     struct PanicOnRunLoader;
     impl ModelLoader for PanicOnRunLoader {
-        fn load(&self, _cfg: &ModelCfg) -> Result<Box<dyn crate::loader::Servable>, EngineError> {
+        fn load(&self, _cfg: &ModelCfg) -> Result<Box<dyn crate::loader::StreamServable>, EngineError> {
             Ok(Box::new(PanicOnRun))
         }
         fn declared_capability(&self, _cfg: &ModelCfg) -> Option<Capability> { Some(Capability::EMBED) }

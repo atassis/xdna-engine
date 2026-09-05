@@ -72,6 +72,21 @@ pub enum Cmd {
     /// (every Markdown bullet). Without it clap read a bullet as an unknown flag and failed with a
     /// usage error, so the CLI rejected inputs the HTTP route accepted.
     Embed { #[arg(allow_hyphen_values = true)] text: String, #[arg(long)] model: Option<String> },
+    /// One-shot text generation, streamed to stdout by default.
+    Generate {
+        #[arg(allow_hyphen_values = true)] prompt: String,
+        #[arg(long)] model: Option<String>,
+        #[command(flatten)] sampling: SamplingArgs,
+        /// Print the whole completion at once instead of streaming it token by token.
+        #[arg(long)] no_stream: bool,
+    },
+    /// Interactive chat REPL: reads a line from stdin, streams the reply, keeps history across
+    /// turns. Ctrl-D exits.
+    Chat {
+        #[arg(long)] model: Option<String>,
+        #[command(flatten)] sampling: SamplingArgs,
+        #[arg(long)] no_stream: bool,
+    },
     /// List models on a running server.
     Models { #[arg(long)] port: Option<u16> },
     /// Ask a running server to re-read the config and reconcile.
@@ -93,6 +108,20 @@ pub enum Cmd {
     Completions { shell: Shell },
     /// Inspect / edit the desired-state config.
     Config { #[command(subcommand)] action: ConfigCmd },
+}
+
+/// Sampling flags shared by `generate` and `chat`. `None` means "use the engine default"
+/// (`GenerateParams::default()`, OpenAI's defaults) rather than a CLI-chosen one -- so a bare
+/// `npu generate "..."` behaves identically to an HTTP request with no sampling fields at all.
+#[derive(clap::Args)]
+pub struct SamplingArgs {
+    #[arg(long)] pub temperature: Option<f32>,
+    #[arg(long)] pub top_p: Option<f32>,
+    #[arg(long)] pub top_k: Option<u32>,
+    #[arg(long)] pub max_tokens: Option<u32>,
+    /// May be repeated: `--stop A --stop B`.
+    #[arg(long)] pub stop: Vec<String>,
+    #[arg(long)] pub seed: Option<u64>,
 }
 
 /// Transcript output formats.

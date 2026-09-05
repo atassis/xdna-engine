@@ -7,7 +7,7 @@ use crate::pipeline::Scenario;
 
 /// What a loaded model does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ModelKind { Asr, Embed, Diarize }
+pub enum ModelKind { Asr, Embed, Diarize, Generate }
 
 impl std::fmt::Display for ModelKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -15,6 +15,7 @@ impl std::fmt::Display for ModelKind {
             ModelKind::Asr => "asr",
             ModelKind::Embed => "embed",
             ModelKind::Diarize => "diarize",
+            ModelKind::Generate => "generate",
         })
     }
 }
@@ -29,6 +30,7 @@ impl ModelKind {
             "asr" => Some(ModelKind::Asr),
             "embeddings" => Some(ModelKind::Embed),
             "diarize" => Some(ModelKind::Diarize),
+            "generate" => Some(ModelKind::Generate),
             _ => None,
         }
     }
@@ -41,6 +43,7 @@ impl ModelKind {
             ModelKind::Asr => crate::capability::Capability::ASR,
             ModelKind::Embed => crate::capability::Capability::EMBED,
             ModelKind::Diarize => crate::capability::Capability::DIARIZE,
+            ModelKind::Generate => crate::capability::Capability::GENERATE,
         }
     }
 }
@@ -136,6 +139,24 @@ impl Model {
         texts.iter().map(|t| self.embed(t)).collect()
     }
 
+    /// Text generation: prompt -> tokens, streamed to `sink` as they are produced.
+    ///
+    /// `&mut self` where every sibling method is `&self`, because it genuinely is: a decoder
+    /// advances a KV cache and a device context per token. The buffered form is
+    /// `TextGenerator::generate_to_string`, reached the same way.
+    pub fn generate(
+        &mut self,
+        prompt: &crate::pipeline::Prompt,
+        params: &crate::pipeline::GenerateParams,
+        sink: &mut dyn FnMut(crate::pipeline::Chunk<'_>) -> bool,
+    ) -> Result<(), EngineError> {
+        let got = kind_of(&self.scen).capability();
+        match &mut self.scen {
+            Scenario::Generate(m) => m.generate(prompt, params, sink),
+            _ => Err(EngineError::WrongKind { wanted: ModelKind::Generate.capability(), got }),
+        }
+    }
+
     /// Diarization: 16 kHz mono i16 PCM -> speaker-attributed spans.
     pub fn diarize(&self, pcm: &[i16], sample_rate: u32)
         -> Result<Vec<crate::capability::Segment>, EngineError> {
@@ -157,6 +178,7 @@ fn kind_of(s: &Scenario) -> ModelKind {
         Scenario::Asr(_) => ModelKind::Asr,
         Scenario::Embed(_) => ModelKind::Embed,
         Scenario::Diarize(_) => ModelKind::Diarize,
+        Scenario::Generate(_) => ModelKind::Generate,
     }
 }
 
