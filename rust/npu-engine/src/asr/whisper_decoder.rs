@@ -677,6 +677,44 @@ fn parse_layout(
     Ok(layout)
 }
 
+/// Proof that a full host->device sync will run before this scope ends. Every write that needs one
+/// takes a `&LoadScope`, and the only way to obtain one is [`LoadScope::begin`], so a scratch write
+/// outside a load phase does not compile.
+///
+/// Why it needs guarding: the per-token fast path syncs only the input arena, so a scratch write
+/// that is not followed by a full `sync_to_device()` -- the cross-K/V fold, a KV reset -- leaves the
+/// device running on the previous utterance's bytes. That was a remembered rule paired with a
+/// remembered call at the end of each of four functions.
+///
+/// The token carries no borrow deliberately: a scope holding `&FusedArena` across the fold loop
+/// would collide with the phase timers' `&mut self.ph`. It is consumed by `end_load_phase`, and
+/// dropping one unconsumed panics rather than letting the writes sit unsynced.
+struct LoadScope {
+    ended: bool,
+}
+
+impl LoadScope {
+    fn begin() -> LoadScope {
+        LoadScope { ended: false }
+    }
+}
+
+impl Drop for LoadScope {
+    fn drop(&mut self) {
+        if !self.ended && !std::thread::panicking() {
+            panic!("load phase dropped without end_load_phase: its scratch writes never reached the device");
+        }
+    }
+}
+
+/// Close a load phase: consume the token and run the full host->device sync. Taking the arena here
+/// rather than in the token keeps the scope borrow-free across the fold loop.
+fn end_load_phase(arena: &FusedArena, what: &str, mut sc: LoadScope) -> Result<(), EngineError> {
+    sc.ended = true;
+    arena.sync_to_device()
+        .map_err(|e| EngineError::Device(format!("{what}: sync to device: {e}")))
+}
+
 impl ProjOutElf {
     fn load(dev: &Rc<Device>, dir: &Path, _w: &WhisperDecoderWeights) -> Result<Self, EngineError> {
         let elf = std::fs::read(dir.join("projout.elf"))
@@ -1196,7 +1234,25 @@ impl FusedDecoder {
         })
     }
 
-    fn write_buf(&self, name: &str, f: &[f32]) -> Result<(), EngineError> {
+    /// Per-token write. Only `sync_input` follows, so this refuses anything outside the input arena
+    /// rather than writing bytes the device will not see. `parse_layout` already proved it at load;
+    /// this is the same claim at the point of use, where it costs one enum compare.
+    fn write_input_buf(&self, name: &str, f: &[f32]) -> Result<(), EngineError> {
+        let loc = &self.layout[name];
+        if loc.arena != Arena::Input {
+            return Err(EngineError::Device(format!(
+                "per-token write to {name:?} in {:?}: only sync_input follows, so the device would \
+                 not see it",
+                loc.arena
+            )));
+        }
+        let bytes = pack_bf16_bytes(f);
+        assert_eq!(bytes.len(), loc.len, "{name}: {} != {}", bytes.len(), loc.len);
+        self.arena.write_at(loc.arena, loc.off, &bytes)
+            .map_err(|e| EngineError::Device(format!("write_input_buf {name}: {e}")))
+    }
+
+    fn write_buf(&self, _: &LoadScope, name: &str, f: &[f32]) -> Result<(), EngineError> {
         let loc = &self.layout[name];
         let bytes = pack_bf16_bytes(f);
         assert_eq!(bytes.len(), loc.len, "{name}: {} != {}", bytes.len(), loc.len);
@@ -1208,7 +1264,7 @@ impl FusedDecoder {
     /// bf16-typed buffer (the GEMV kernel reinterprets them as int8). 1 byte/elem -> buffer is half-size.
     /// `scales` is [H*HD] in (h,d) order; the padded `f` is [N_HEADS, T_PAD, HEAD_DIM] head-major, so
     /// element idx -> channel (h = idx/(T_PAD*HEAD_DIM), d = idx%HEAD_DIM).
-    fn write_buf_i8(&self, name: &str, f: &[f32], scales: &[f32]) -> Result<(), EngineError> {
+    fn write_buf_i8(&self, _: &LoadScope, name: &str, f: &[f32], scales: &[f32]) -> Result<(), EngineError> {
         let loc = &self.layout[name];
         let tphd = T_PAD * HEAD_DIM;
         let bytes: Vec<u8> = f.iter().enumerate().map(|(idx, &v)| {
@@ -1224,7 +1280,7 @@ impl FusedDecoder {
     /// int8 cross-V: like `write_buf_i8` but for the PRE-TRANSPOSED Venc layout [H,HD,TP]. The contiguous
     /// inner dim is T_PAD, so element idx -> channel (h,d) = idx / T_PAD (and `scales` is [H*HD] in (h,d)
     /// order, matching the L*_s_cv buffer op_mul_cv reads).
-    fn write_buf_i8_venc(&self, name: &str, f: &[f32], scales: &[f32]) -> Result<(), EngineError> {
+    fn write_buf_i8_venc(&self, _: &LoadScope, name: &str, f: &[f32], scales: &[f32]) -> Result<(), EngineError> {
         let loc = &self.layout[name];
         let bytes: Vec<u8> = f.iter().enumerate().map(|(idx, &v)| {
             let s = scales[idx / T_PAD];
@@ -1236,7 +1292,7 @@ impl FusedDecoder {
             .map_err(|e| EngineError::Device(format!("write_buf_i8_venc {name}: {e}")))
     }
 
-    fn zero_buf(&self, name: &str) -> Result<(), EngineError> {
+    fn zero_buf(&self, _: &LoadScope, name: &str) -> Result<(), EngineError> {
         let loc = &self.layout[name];
         self.arena.write_at(loc.arena, loc.off, &vec![0u8; loc.len])
             .map_err(|e| EngineError::Device(format!("zero_buf {name}: {e}")))
@@ -1245,6 +1301,7 @@ impl FusedDecoder {
     /// Encoder cross-K/V → per-layer resident scratch (head-major, padded T_enc→T_PAD); also clears
     /// the self-KV caches and the position counter. Mirrors gen_decode.py's heads_pad layout exactly.
     pub fn precompute_cross(&mut self, enc_hidden: &Array2<f32>) -> Result<(), EngineError> {
+        let sc = LoadScope::begin();
         // New utterance: start a fresh per-phase breakdown (so each dumped line is one utterance).
         if self.timing {
             self.ph = PhaseAcc::default();
@@ -1304,8 +1361,8 @@ impl FusedDecoder {
                         if a > s_hd[ch] { s_hd[ch] = a; }
                     }
                     for s in s_hd.iter_mut() { *s = if *s > 0.0 { *s * headroom / 127.0 } else { 1.0 }; }
-                    self.write_buf_i8(&name, &padded, &s_hd)?;
-                    self.write_buf(&format!("L{li}_s_cq"), &s_hd)?;
+                    self.write_buf_i8(&sc, &name, &padded, &s_hd)?;
+                    self.write_buf(&sc, &format!("L{li}_s_cq"), &s_hd)?;
                 } else if self.int8_cross_v && name.ends_with("Venc") {
                     // `padded` here is pre-transposed [H,HD,TP] (coalesce_cross is enforced for int8_cross_v),
                     // so the contiguous inner dim is T_PAD and channel (h,d) = idx / T_PAD. Per-channel scale
@@ -1319,23 +1376,23 @@ impl FusedDecoder {
                         if a > s_cv[ch] { s_cv[ch] = a; }
                     }
                     for s in s_cv.iter_mut() { *s = if *s > 0.0 { *s * headroom / 127.0 } else { 1.0 }; }
-                    self.write_buf_i8_venc(&name, &padded, &s_cv)?;
-                    self.write_buf(&format!("L{li}_s_cv"), &s_cv)?;
+                    self.write_buf_i8_venc(&sc, &name, &padded, &s_cv)?;
+                    self.write_buf(&sc, &format!("L{li}_s_cv"), &s_cv)?;
                 } else {
-                    self.write_buf(&name, &padded)?;
+                    self.write_buf(&sc, &name, &padded)?;
                 }
             }
-            self.zero_buf(&format!("L{li}_kcache"))?;
-            self.zero_buf(&format!("L{li}_vcache"))?;
+            self.zero_buf(&sc, &format!("L{li}_kcache"))?;
+            self.zero_buf(&sc, &format!("L{li}_vcache"))?;
             // M0.5: the staged pair is carry state — the slot a token does NOT write is copied back
             // into the cache verbatim, so a pair left over from the previous utterance would land as
             // a real column. Rewinding n_self without clearing it is not a fresh cache. Under M0.6
             // the pair IS the cache window, so the zero_buf above already cleared it.
             if self.coalesce_self_tr && !self.vstage_direct {
-                self.zero_buf(&format!("L{li}_vpair"))?;
+                self.zero_buf(&sc, &format!("L{li}_vpair"))?;
             }
         }
-        self.arena.sync_to_device().map_err(|e| EngineError::Device(format!("sync cross-K/V to device: {e}")))?;
+        end_load_phase(&self.arena, "cross-K/V fold", sc)?;
         self.n_self = 0;
         self.next_kern = None; // PIPE: n_self rewound — any prefetched kernel is now mispatched.
         tmr.lap(&mut self.ph.cross_fold);
@@ -1345,14 +1402,15 @@ impl FusedDecoder {
 
     /// Fresh self-KV for a new prompt (cross-K/V unchanged for this utterance).
     pub fn reset(&mut self) -> Result<(), EngineError> {
+        let sc = LoadScope::begin();
         for li in 0..N_LAYERS {
-            self.zero_buf(&format!("L{li}_kcache"))?;
-            self.zero_buf(&format!("L{li}_vcache"))?;
+            self.zero_buf(&sc, &format!("L{li}_kcache"))?;
+            self.zero_buf(&sc, &format!("L{li}_vcache"))?;
             if self.coalesce_self_tr && !self.vstage_direct {
-                self.zero_buf(&format!("L{li}_vpair"))?; // carry state, see precompute_cross
+                self.zero_buf(&sc, &format!("L{li}_vpair"))?; // carry state, see precompute_cross
             }
         }
-        self.arena.sync_to_device().map_err(|e| EngineError::Device(format!("sync reset KV to device: {e}")))?;
+        end_load_phase(&self.arena, "reset KV", sc)?;
         self.n_self = 0;
         self.next_kern = None; // PIPE: n_self rewound — any prefetched kernel is now mispatched.
         Ok(())
@@ -1367,7 +1425,7 @@ impl FusedDecoder {
             .map(|d| self.w.embed_tokens[[tok, d]] + self.w.embed_positions[[pos, d]])
             .collect();
         tmr.lap(&mut self.ph.embed);
-        self.write_buf("x", &x)?;
+        self.write_input_buf("x", &x)?;
         tmr.lap(&mut self.ph.write_x);
 
         // Deep-C (default when the ELF carries scratchpad params): register-once + per-token scratchpad
@@ -1802,7 +1860,7 @@ impl BatchedFusedDecoder {
         self.ph.steps as usize
     }
 
-    fn zero_buf(&self, name: &str) -> Result<(), EngineError> {
+    fn zero_buf(&self, _: &LoadScope, name: &str) -> Result<(), EngineError> {
         let loc = &self.layout[name];
         self.arena.write_at(loc.arena, loc.off, &vec![0u8; loc.len])
             .map_err(|e| EngineError::Device(format!("zero_buf {name}: {e}")))
@@ -1821,6 +1879,7 @@ impl BatchedFusedDecoder {
     /// Fold B encoders' cross-K/V into the B-wide per-layer resident scratch (head-major, padded
     /// T_enc->T_PAD per stream); clear self-KV; reset position. Host f32 fold (per-stream, parallel).
     pub fn precompute_cross_batch(&mut self, encs: &[Array2<f32>]) -> Result<(), EngineError> {
+        let sc = LoadScope::begin();
         assert_eq!(encs.len(), self.b, "need exactly B={} encoder outputs", self.b);
         // Fresh per-phase counters for this batch/bucket (so last_steps() == this bucket's dispatches,
         // O3; and each FUSED_PHASE_TIMING dump is one batch).
@@ -1868,10 +1927,10 @@ impl BatchedFusedDecoder {
                 self.arena.write_at(loc.arena, loc.off, &bytes)
                     .map_err(|e| EngineError::Device(format!("write batched {name}: {e}")))?;
             }
-            self.zero_buf(&format!("L{li}_kcache"))?;
-            self.zero_buf(&format!("L{li}_vcache"))?;
+            self.zero_buf(&sc, &format!("L{li}_kcache"))?;
+            self.zero_buf(&sc, &format!("L{li}_vcache"))?;
         }
-        self.arena.sync_to_device().map_err(|e| EngineError::Device(format!("sync batched cross-K/V: {e}")))?;
+        end_load_phase(&self.arena, "batched cross-K/V", sc)?;
         self.n_self = 0;
         tmr.lap(&mut self.ph.cross_fold);
         self.ph.utterances += 1;
@@ -1880,11 +1939,12 @@ impl BatchedFusedDecoder {
 
     /// Fresh self-KV for a new prompt (cross-K/V unchanged for this utterance batch).
     pub fn reset(&mut self) -> Result<(), EngineError> {
+        let sc = LoadScope::begin();
         for li in 0..self.nl {
-            self.zero_buf(&format!("L{li}_kcache"))?;
-            self.zero_buf(&format!("L{li}_vcache"))?;
+            self.zero_buf(&sc, &format!("L{li}_kcache"))?;
+            self.zero_buf(&sc, &format!("L{li}_vcache"))?;
         }
-        self.arena.sync_to_device().map_err(|e| EngineError::Device(format!("sync batched reset: {e}")))?;
+        end_load_phase(&self.arena, "batched reset KV", sc)?;
         self.n_self = 0;
         Ok(())
     }
@@ -2100,5 +2160,39 @@ mod layout_contract_tests {
             serde_json::json!({"type": "input", "offset": 1536, "len": 256});
         let e = parse_layout(&m, "t", &["x"], &["logits"]).unwrap_err();
         assert!(format!("{e:?}").contains("rope_global"), "{e:?}");
+    }
+}
+
+#[cfg(test)]
+mod load_scope_tests {
+    use super::*;
+
+    // The guarantee, stated as a failing case: a phase whose writes never got their full sync must
+    // be loud. Before this, the sync was a remembered call at the end of four functions and its
+    // absence was silent -- the device would run on the previous utterance's cross-K/V.
+    #[test]
+    #[should_panic(expected = "never reached the device")]
+    fn dropping_a_scope_unconsumed_panics() {
+        let _sc = LoadScope::begin();
+    }
+
+    #[test]
+    fn a_consumed_scope_is_quiet() {
+        let mut sc = LoadScope::begin();
+        sc.ended = true; // what end_load_phase does before syncing
+        drop(sc);
+    }
+
+    // A panic already in flight must not be masked by the drop bomb: the original failure is the
+    // one worth seeing.
+    #[test]
+    fn does_not_fire_while_already_panicking() {
+        let r = std::panic::catch_unwind(|| {
+            let _sc = LoadScope::begin();
+            panic!("original failure");
+        });
+        let e = r.unwrap_err();
+        let msg = e.downcast_ref::<&str>().copied().unwrap_or("");
+        assert_eq!(msg, "original failure");
     }
 }
