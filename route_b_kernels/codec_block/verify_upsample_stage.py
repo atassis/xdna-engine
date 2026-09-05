@@ -25,7 +25,7 @@ import numpy as np
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent.parent
-sys.path.insert(0, str(ROOT / "route_b_kernels" / "bricks" / "_verify"))
+sys.path.insert(0, str(ROOT / "aie_kernels" / "_test"))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import bricklib  # noqa: E402
@@ -40,7 +40,7 @@ GATE = 3e-2
 
 
 def _golden(sub, name):
-    p = ROOT / "route_b_kernels" / "bricks" / sub / "golden.py"
+    p = ROOT / "aie_kernels" / sub / "golden.py"
     spec = importlib.util.spec_from_file_location(name, p)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)

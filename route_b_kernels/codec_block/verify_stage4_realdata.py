@@ -33,7 +33,7 @@ import numpy as np
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent.parent
-sys.path.insert(0, str(ROOT / "route_b_kernels" / "bricks" / "_verify"))
+sys.path.insert(0, str(ROOT / "aie_kernels" / "_test"))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import bricklib  # noqa: E402

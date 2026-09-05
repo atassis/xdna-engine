@@ -11,7 +11,7 @@
 //   logits[1, EXPERTS] = hidden[1, HIDDEN] @ Wg[HIDDEN, EXPERTS]  (bf16 in, f32 acc)
 //   (top_values[K], top_indices[K]) = topk(logits, K)             (max_cmp, iterated)
 //
-// This is the SAME gemm+argmax skeleton as bricks/lm-head-argmax
+// This is the SAME gemm+argmax skeleton as aie_kernels/lm-head-argmax
 // (lm_head_argmax.cc), which co-produces a SINGLE (value, index) via
 // aie::max_cmp + aie::select. The extension asked for by this spike is:
 // "extend max_cmp beyond k=1". The generic, parameterized way to do that

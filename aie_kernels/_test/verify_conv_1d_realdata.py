@@ -51,7 +51,7 @@ UNITS = [("c.decoder.model.4.block.2", 1, "stage4_upsample"),
 
 def _golden(sub, name):
     spec = importlib.util.spec_from_file_location(
-        name, ROOT / "route_b_kernels" / "bricks" / sub / "golden.py")
+        name, ROOT / "aie_kernels" / sub / "golden.py")
     m = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(m)
     return m

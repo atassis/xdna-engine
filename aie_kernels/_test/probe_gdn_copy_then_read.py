@@ -57,8 +57,8 @@ def _load_golden():
 
 # --- materialise the PRE-FIX kernel, and a no-seeding-copy variant of it ---
 # The path below is deliberately the OLD one: it is read at PRE_FIX_REV, where the kernel still
-# lived at route_b_kernels/bricks/. Rewriting it to the current aie_kernels/ path breaks it.
-src = subprocess.run(["git", "show", f"{PRE_FIX_REV}:route_b_kernels/bricks/gatedeltanet/gatedeltanet.cc"],
+# lived at route_b_kernels/aie_kernels/. Rewriting it to the current aie_kernels/ path breaks it.
+src = subprocess.run(["git", "show", f"{PRE_FIX_REV}:route_b_kernels/aie_kernels/gatedeltanet/gatedeltanet.cc"],
                      cwd=HERE.parent.parent, capture_output=True, text=True, check=True).stdout
 assert "float bk = beta * k[i];" in src, "this is not the pre-fix kernel"
 pre = GEN / "gdn_prefix.cc"

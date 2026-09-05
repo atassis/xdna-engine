@@ -40,7 +40,7 @@
 // composing sin_v inline. Inlining sin_v here returned real snake values in the wrong slots even
 // with the scratch aligned, which is the instability in kb/sin-brick-codegen-instability; the
 // brick entry is the arrangement whose green number actually reproduces, so use it and add nothing.
-#include "../bricks/snake/snake.cc"
+#include "../aie_kernels/snake/snake.cc"
 
 // Stage 4 by default; -D these for the other three stages.
 #ifndef STAGE_C_IN

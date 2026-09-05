@@ -5,7 +5,7 @@
 
 The SAME graph verify_stage4_block.py already gates at rel-L2 8.869e-07 (`build_decoder_block` from
 s2.cpp/src/s2_codec.cpp:501-516), run here at stage 1/2/3's real GGUF weights instead of stage 4's.
-The kernels are unchanged and already device-green (bricks/snake, bricks/conv-transpose-1d, plus the
+The kernels are unchanged and already device-green (aie_kernels/snake, aie_kernels/conv-transpose-1d, plus the
 residual-unit kernels in codec_block/); what stages 1-3 need on top of stage 4 is window_driver's
 ci_chunk/resident_depth chunking, because `c_in * k` -- the width of ONE streamed weight row -- grows
 32x from stage 4 to stage 1 and blows a 64 KiB core tile well before the resident activation window

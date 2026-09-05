@@ -35,8 +35,8 @@
 // snake.cc, not sin.cc: call the snake BRICK entry per channel rather than composing sin_v inline.
 // Inlining it returns real values in the wrong slots even with the scratch aligned
 // (kb/sin-brick-codegen-instability); the brick entry is the arrangement whose green reproduces.
-#include "../bricks/snake/snake.cc"
-#include "../bricks/conv-1d/conv_1d.cc"
+#include "../aie_kernels/snake/snake.cc"
+#include "../aie_kernels/conv-1d/conv_1d.cc"
 
 #ifndef RU_C
 #define RU_C 96

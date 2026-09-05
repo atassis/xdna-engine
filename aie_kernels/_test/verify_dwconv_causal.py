@@ -170,7 +170,7 @@ def run_case(stage_idx, T):
         f'#include "{DWCONV_CC}"\n'
         # Positional wrapper: bricklib's resident-3-arg convention calls kern(tile_in, resident,
         # tile_out); the real kernel's own order is (in, w, out). Reorder here, same trick
-        # bricks/_verify/verify_conv_1d.py's shim uses for conv_1d_causal_core.
+        # aie_kernels/_test/verify_conv_1d.py's shim uses for conv_1d_causal_core.
         f'extern "C" void dwconv_causal_verify(bfloat16 *w_tile, bfloat16 *x0, bfloat16 *out) {{\n'
         f"  dwconv1d_same_scalar<{T}, {K}, {P_CAUSAL}, true>(x0, w_tile, out);\n"
         "}\n"

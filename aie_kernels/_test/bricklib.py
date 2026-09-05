@@ -292,7 +292,7 @@ def _build_streamed_traced(symbol, shim, n_tiles, in_tile, out_tile, resident_le
     """Traced twin of `_build_streamed`, for hardware-tracing ONE streamed design.
 
     A separate generator rather than a flag on `_build_streamed`, so every existing brick gate
-    (every `verify_streamed`/`verify_rowwise` caller across bricks/) is untouched: `_build_streamed`
+    (every `verify_streamed`/`verify_rowwise` caller across aie_kernels/) is untouched: `_build_streamed`
     still declares ZERO `CompileTime[T]` params, so its `design.__name__` (the JIT cache key), its
     generated MLIR and every gate that calls it are byte-for-byte what they were before this
     function existed. Nothing here is imported or called from that path.

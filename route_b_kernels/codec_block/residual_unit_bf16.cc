@@ -59,7 +59,7 @@
 #include <aie_api/aie.hpp>
 #include <stdint.h>
 
-#include "../bricks/snake/snake.cc"
+#include "../aie_kernels/snake/snake.cc"
 
 #ifndef RU_C
 #define RU_C 96

@@ -44,7 +44,7 @@
 // No exp2/expf vector helper existed anywhere in this tree before this file (grepped
 // route_b_kernels/ for exp2/expf/exp2f_vec/expf_vec: no hits) -- `exp2_v<N>` here is the first
 // instance of the upstream-brick-exp2f-vec primitive, defined inline (this brick owns no other
-// file to host it in). A natural follow-up is factoring it into its own bricks/exp2/ file, exactly
+// file to host it in). A natural follow-up is factoring it into its own aie_kernels/exp2/ file, exactly
 // as sin.cc's sin_v was later composed by snake.cc via `#include "../sin/sin.cc"`.
 //
 // exp2_v<N> implements 2^y = 2^n * 2^f, n=round(y) (integer), f=y-n in [-0.5, 0.5):
@@ -123,7 +123,7 @@
 //     out not to be exactly round-half-to-even in practice; still far inside the 3e-2 device gate
 //     either way.
 //
-// ROW WIDTH PER CALL: this brick's own verify (bricks/_verify/verify_softmax.py) uses cols=64,
+// ROW WIDTH PER CALL: this brick's own verify (aie_kernels/_test/verify_softmax.py) uses cols=64,
 // matching sin.cc's OWN measured ceiling ("exact at 64 floats per call and wrong above that").
 // exp2_v<N> is heavier than sin_v (round-trick + int32 detour + 7-term Horner vs sin_v's 6-term
 // odd-only Horner), so if 64 was sin_v's proven ceiling, 64 is not a number to exceed here without

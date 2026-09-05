@@ -3,7 +3,7 @@
 
 Generic MoE gate GEMM + top-K expert select, M=1 padded to MOE_M_PAD rows for
 the mmul r-dim (row 0 = live query, rows 1..M-1 are zero padding, same
-convention as bricks/lm-head-argmax/golden reasoning and
+convention as aie_kernels/lm-head-argmax/golden reasoning and
 decode_norm_gemv/norm_gemv_iron.py).
 
 This is the HOST reference the later DEVICE pass checks rel-L2 against -- it

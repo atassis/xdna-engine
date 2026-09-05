@@ -43,7 +43,7 @@ def _timed_jit(*a, **k):
         acc["njit"] += 1
 iron.jit = _timed_jit
 
-# window_driver puts bricks/_verify on sys.path, so it must be imported before bricklib.
+# window_driver puts aie_kernels/_test on sys.path, so it must be imported before bricklib.
 # Both call `iron.jit(...)` by attribute at call time, so patching the module object reaches them.
 import window_driver as wd
 import bricklib

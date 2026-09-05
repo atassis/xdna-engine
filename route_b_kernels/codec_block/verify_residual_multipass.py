@@ -33,7 +33,7 @@ import numpy as np
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent.parent
-sys.path.insert(0, str(ROOT / "route_b_kernels" / "bricks" / "_verify"))
+sys.path.insert(0, str(ROOT / "aie_kernels" / "_test"))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import bricklib  # noqa: E402
@@ -41,8 +41,8 @@ import codec_paths  # noqa: E402
 import gguf_extract as gx  # noqa: E402
 
 GGUF = codec_paths.gguf()
-SNAKE = (ROOT / "route_b_kernels" / "bricks" / "snake" / "snake.cc").resolve()
-CONV = (ROOT / "route_b_kernels" / "bricks" / "conv-1d" / "conv_1d.cc").resolve()
+SNAKE = (ROOT / "aie_kernels" / "snake" / "snake.cc").resolve()
+CONV = (ROOT / "aie_kernels" / "conv-1d" / "conv_1d.cc").resolve()
 C, K = 96, 7
 T = int(os.environ.get("MP_T", 64))
 T0 = 40000

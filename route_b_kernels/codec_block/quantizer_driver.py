@@ -39,7 +39,7 @@ FIVE OP-FAMILIES, FIVE DISPATCH SHAPES -- know which one an op is before reading
   4. ROPE (rope_interleaved_prologue) is a ONE-SHOT kernel: the whole [M,D] tile is resident for one
      call, no on-device streaming loop to hide behind (unlike every op above). M is therefore chunked
      host-side at ROPE_M=32 (quantizer_shapes.ROPE_M, the exact shape
-     bricks/_verify/verify_rope_interleaved.py already gates), dispatched via `bricklib.verify_oneshot`
+     aie_kernels/_test/verify_rope_interleaved.py already gates), dispatched via `bricklib.verify_oneshot`
      directly rather than `_run`.
   5. PREFILL_ATTN_CHUNK's ABI (2 streamed inputs -- qm_row, kv_chunk -- plus ONE RESIDENT-PER-ROW
      buffer that DOUBLES as online-softmax state, plus a per-call compile-time-literal chunk_idx) fits
@@ -102,7 +102,7 @@ import numpy as np
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent.parent
 sys.path.insert(0, str(HERE))
-sys.path.insert(0, str(ROOT / "route_b_kernels" / "bricks" / "_verify"))
+sys.path.insert(0, str(ROOT / "aie_kernels" / "_test"))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import bricklib  # noqa: E402
@@ -117,7 +117,7 @@ from aie.iron.kernel import ExternalFunction  # noqa: E402
 _bf16 = ml_dtypes.bfloat16
 
 QPREFIX = qs.QPREFIX
-BRICKS = ROOT / "route_b_kernels" / "bricks"
+BRICKS = ROOT / "aie_kernels"
 GATHER_CC = (BRICKS / "gather-rows" / "gather_rows.cc").resolve()
 ROPE_CC = (BRICKS / "rope-interleaved" / "rope_interleaved.cc").resolve()
 PREFILL_CC = (BRICKS / "prefill-attn" / "prefill_attn.cc").resolve()
@@ -140,7 +140,7 @@ CONVNEXT_HIDDEN = qs.convnext_shapes(0)["pwconv1"][0]
 # quantizer_shapes.elementwise_row_batch -- the SAME TIME-budget cap every other op in this file
 # self-checks against (STREAM_MS_PER_KIB, a conv-1d proxy: see quantizer_shapes.py's TIME-BUDGET
 # CAVEAT, UNVERIFIED for these two kernels specifically), rather than a hand-picked constant. SWIGLU
-# rows are 1024 elements (matches bricks/_verify/verify_f1.py's own do_swiglu test width); GELU tiles
+# rows are 1024 elements (matches aie_kernels/_test/verify_norm_elementwise_f32.py's own do_swiglu test width); GELU tiles
 # are the kernel's fixed 16 elements.
 SWIGLU_ROW = 1024
 SWIGLU_TILES_PER_DISPATCH = qs.elementwise_row_batch(2 * SWIGLU_ROW * qs.F32)
@@ -494,7 +494,7 @@ def _dwconv_causal(x, w, bias, K, tag):
 # CUSTOM EPS. rmsnorm_f32/layernorm_ln_affine_f32's own extern "C" wrappers hardcode eps (1e-6f /
 # 1e-5f respectively); this model needs 1e-5 (RVQ_NORM_EPS) and 1e-6 (CONVNEXT_LN_EPS) respectively --
 # the OPPOSITE of each wrapper's own default -- so both shims below call the templated core directly
-# with a literal eps, the same pattern bricks/_verify/verify_f1.py's do_rmsnorm/do_layernorm already
+# with a literal eps, the same pattern aie_kernels/_test/verify_norm_elementwise_f32.py's do_rmsnorm/do_layernorm already
 # use for the identical reason.
 # =====================================================================================================
 

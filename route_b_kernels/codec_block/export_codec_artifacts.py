@@ -62,7 +62,7 @@ WS = REPO.parent
 
 
 def _toolchain_env():
-    """Reproduce bricks/_verify/run.sh's env (instance from THIS worktree's toolchain.lock, venv
+    """Reproduce aie_kernels/_test/run.sh's env (instance from THIS worktree's toolchain.lock, venv
     from wherever a `.venv-iron` exists) without its NPU lock or `exec` -- this process never
     dispatches, so it never needs the device queue. See run.sh's own comment for why instance and
     venv have to come from two different places."""

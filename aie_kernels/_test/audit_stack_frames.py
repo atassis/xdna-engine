@@ -51,7 +51,7 @@ DEFAULT_STACK = 0x400
 
 PEANO = Path(os.environ.get(
     "PEANO_INSTALL_DIR",
-    WS / "wt-s2-codec-bricks/.venv-iron/lib/python3.14/site-packages/llvm-aie"))
+    WS / "wt-s2-codec-aie_kernels/.venv-iron/lib/python3.14/site-packages/llvm-aie"))
 CLANG = PEANO / "bin/clang++"
 READELF = PEANO / "bin/llvm-readelf"
 

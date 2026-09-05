@@ -32,7 +32,7 @@ import numpy as np
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent.parent
-sys.path.insert(0, str(ROOT / "route_b_kernels" / "bricks" / "_verify"))
+sys.path.insert(0, str(ROOT / "aie_kernels" / "_test"))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import bricklib  # noqa: E402
@@ -49,7 +49,7 @@ UNITS = [("c.decoder.model.4.block.2", 1),
 
 def _golden(sub, name):
     spec = importlib.util.spec_from_file_location(
-        name, ROOT / "route_b_kernels" / "bricks" / sub / "golden.py")
+        name, ROOT / "aie_kernels" / sub / "golden.py")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod

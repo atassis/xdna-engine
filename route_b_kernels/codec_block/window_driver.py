@@ -29,13 +29,13 @@ import numpy as np
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent.parent
 import sys  # noqa: E402
-sys.path.insert(0, str(ROOT / "route_b_kernels" / "bricks" / "_verify"))
+sys.path.insert(0, str(ROOT / "aie_kernels" / "_test"))
 import bricklib  # noqa: E402
 
 UPSAMPLE_CC = (HERE / "upsample_stage.cc").resolve()
 CT_CHAN_CC = (HERE / "conv_transpose_channel.cc").resolve()
-SNAKE_CC = (ROOT / "route_b_kernels" / "bricks" / "snake" / "snake.cc").resolve()
-CONV_CC = (ROOT / "route_b_kernels" / "bricks" / "conv-1d" / "conv_1d.cc").resolve()
+SNAKE_CC = (ROOT / "aie_kernels" / "snake" / "snake.cc").resolve()
+CONV_CC = (ROOT / "aie_kernels" / "conv-1d" / "conv_1d.cc").resolve()
 
 T = 64          # rail max at c=96; the resident activation is what caps it
 CONV_VEC = int(__import__("os").environ.get("CONV_VEC", "1"))  # vector conv core; 0 = scalar

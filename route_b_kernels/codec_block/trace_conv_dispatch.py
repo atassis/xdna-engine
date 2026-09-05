@@ -67,7 +67,7 @@ stale MLIR, a routing accident). The AIE core clock is an 8-level DPM ladder; ~1
 canonical MEASURED operating point on this project (not the ~1.53 GHz back-computed marketing
 figure), so --clock-ghz defaults to 1.8 and every cycle->ms conversion below names it explicitly.
 
-Usage (main session, device held under the NPU lock -- see bricks/_verify/run.sh for the env this
+Usage (main session, device held under the NPU lock -- see aie_kernels/_test/run.sh for the env this
 needs: instance PYTHONPATH, AIECC_PATH, PEANO_INSTALL_DIR):
   python3 trace_conv_dispatch.py --tile-floats 897 --c-out 384 --out <dir>
 """
@@ -82,7 +82,7 @@ import numpy as np
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-sys.path.insert(0, str(HERE.parent / "bricks" / "_verify"))
+sys.path.insert(0, str(HERE.parent.parent / "aie_kernels" / "_test"))
 
 import aie.iron as iron
 from aie.iron.device import NPU2

@@ -12,7 +12,7 @@ from pathlib import Path
 import numpy as np
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-import window_driver as wd            # puts bricks/_verify on sys.path
+import window_driver as wd            # puts aie_kernels/_test on sys.path
 import bricklib
 from aie import iron
 

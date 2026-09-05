@@ -155,7 +155,7 @@ AWKWARD ON-NPU (deliverable 4):
   #1 RVQ codebook gather is a genuine indexed row-gather (T runtime indices -> T rows of width 8 out
      of a resident table with up to 4096 rows), and NOTHING in the current catalog does this. Do not
      confuse it with rope-lut's/sin's `aie::lut<4>::parallel_lookup` gather (probed extensively in
-     bricks/_verify/probe_gather_{known,width,ramp}.py) -- that is a 256-entry SCALAR hardware LUT
+     aie_kernels/_test/probe_gather_{known,width,ramp}.py) -- that is a 256-entry SCALAR hardware LUT
      (one bf16 value per int8 key), an entirely different mechanism from an N-row VECTOR-embedding
      gather. Two honest options: (a) a new indexed-DMA gather brick (unverified whether AIE2P's BD
      engine supports data-dependent offsets at all -- would need its own probe, analogous to but
@@ -166,7 +166,7 @@ AWKWARD ON-NPU (deliverable 4):
   #2 RoPE needs rope-lut, and rope-lut is BLOCKED on an unresolved `aie::lut<4>` ab/cd duplication
      layout question (aie_kernels/sin/sin.cc's header cites
      log/2026-07/2026-07-25-rope-lut-root-cause-bank-granularity.md, "the layout question is OPEN",
-     plus bricks/_verify/probe_linear_approx_abcd.py still returning permuted entries). This
+     plus aie_kernels/_test/probe_linear_approx_abcd.py still returning permuted entries). This
      transformer's attention NEEDS RoPE (confirmed: build_transformer calls ggml_rope_ext on both Q
      and K unconditionally), so this segment inherits that already-known-bad dependency directly --
      it is not a new blocker, but it is now a REAL one, not a hypothetical one, the moment this
@@ -178,8 +178,8 @@ AWKWARD ON-NPU (deliverable 4):
      still unwritten: exp (SFU) + causal-masked reduce-sum over the key axis + reciprocal-multiply.
 
   #4 CORRECTED 2026-07-31, DEVICE-GREEN -- this was never a gap. The original claim ("no depthwise
-     brick exists in this catalog") was true only as scoped to bricks/: route_b_kernels/dwconv1d/
-     dwconv1d.cc, Parakeet's shipped depthwise-1d kernel, lives OUTSIDE bricks/ and is directly
+     brick exists in this catalog") was true only as scoped to aie_kernels/: route_b_kernels/dwconv1d/
+     dwconv1d.cc, Parakeet's shipped depthwise-1d kernel, lives OUTSIDE aie_kernels/ and is directly
      reusable here by reparameterization -- the same reuse class as mha_decode HD=64->128.
 
      dwconv1d_same_scalar<T,K,P,BIAS> (dwconv1d.cc:114-129) computes
@@ -200,7 +200,7 @@ AWKWARD ON-NPU (deliverable 4):
      an arbitrary T compile unmodified. It also has no fused SiLU (that lives behind -DDWCONV_SILU on
      the shift variant, default off), which is what this block wants -- bias-add only.
 
-     Device-gated by bricks/_verify/verify_dwconv_causal.py: upsample.0 (T=110) rel-L2 4.185e-03 and
+     Device-gated by aie_kernels/_test/verify_dwconv_causal.py: upsample.0 (T=110) rel-L2 4.185e-03 and
      upsample.1 (T=220) 4.031e-03, run2run 0, three fresh builds. L1 is a non-issue: the kernel is
      per-channel-row, so ~1.8 KB/core at depth 2, independent of C.
 
