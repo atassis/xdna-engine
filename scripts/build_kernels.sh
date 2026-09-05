@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build ALL NPU xclbins the npu_asr encoder needs (CPU-only; no NPU required).
+# Build ALL NPU xclbins the Rust ASR encoder needs (CPU-only; no NPU required).
 # Idempotent. Run after scripts/setup_route_b.sh. The kernel-object stale-trap
 # (objects named by tile size, not dtype) is handled with explicit `rm` before
 # bf16 builds. See docs/08.
@@ -138,5 +138,5 @@ WA_C_DEPTH=1 make -C $MMW -f Makefile.modal NPU2=1 M=512 K=800 N=3072 m=64 k=32 
 make -C $PE/ml/softmax400 NPU2=1 build/final.xclbin   # softmax-400 (pad->416)
 
 echo "All encoder + fusion xclbins built."
-echo "Verify host-orchestrated: .venv-iron/bin/python scripts/verify_encoder.py --backend npu --accurate"
-echo "Verify FUSED encoder:     .venv-iron/bin/python scripts/verify_fused_encoder.py --blocks 16"
+echo "Verify Rust fused encoder: rust/target/release/verify_encoder"
+echo "Device-change gate:        .venv/bin/python scripts/encoder_parity.py"

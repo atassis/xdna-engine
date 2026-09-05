@@ -54,7 +54,7 @@ CPU-only unless noted - these run aiecc, they do not touch the device.
 
 | Script | What it does |
 | --- | --- |
-| `build_kernels.sh` | Build ALL NPU xclbins the `npu_asr` encoder needs. |
+| `build_kernels.sh` | Build ALL NPU xclbins the Rust ASR encoder needs. |
 | `build_parakeet_kernels.sh` | Build the Parakeet NPU matmul xclbins. Production engine. |
 | `build_parakeet_modal_kernels.sh` | Build the Parakeet MODAL resident xclbin + per-N instruction streams. |
 | `build_decode_kernels.sh` | Build the thin-M GEMV xclbin the on-NPU decoder needs. |
@@ -157,8 +157,7 @@ Numerical correctness. CPU-only unless the name says `verify_*` against a device
 | Script | Gate |
 | --- | --- |
 | `encoder_parity.py` | **The device-change gate.** rel-L2 parity; replaces the chaotic 17-clip greedy WER. |
-| `verify_encoder.py` | `npu_asr` Encoder end-to-end vs static-ONNX reference tensors. |
-| `verify_fused_encoder.py`, `verify_fused_attn.py`, `verify_fused_conv.py`, `verify_fused_ffn.py` | Fused GigaAM sub-blocks vs ONNX. |
+| `verify_fused_attn.py`, `verify_fused_conv.py`, `verify_fused_ffn.py` | Fused GigaAM sub-blocks vs ONNX. |
 | `verify_bge_parity.py` | NPU embeddings vs HF f32 reference (mean-pooled, L2-normalized). |
 | `block0_numpy.py`, `stack_blocks.py` | Pure-numpy Conformer block 0, verified op-by-op; then stacked. |
 | `parakeet_ref_encoder.py`, `parakeet_relpos_mha_golden.py`, `parakeet_tdt_decoder_ref.py` | Parakeet references. |
@@ -229,4 +228,3 @@ Still on disk, referenced by nothing that runs:
 | Entry | Status |
 | --- | --- |
 | `install.sh` | Deprecated shim to `../install.sh`. Use the repo-root one. |
-| `asr_service.py` | The Python HTTP ASR service the Rust `npu serve` replaced. Nothing in the engine references it. |
