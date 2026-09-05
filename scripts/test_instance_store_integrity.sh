@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # The toolchain instance store is content-addressed: .cache/instances/<key>/src IS the commit its
-# key names. It stopped being that because route_b_override.mk resolved OUR kernels through
+# key names. It stopped being that because design_override.mk resolved OUR kernels through
 # kernels_dir (the store), so sync_kernels.sh re-exec'd into it on every build -- 43 dirty entries,
 # and verify_kernel_source.sh reads VENDOR ground truth from the same tree, so the gate's reference
-# was the mutated store. Our kernels now build from rb_kernels_dir (the tracked tree).
+# was the mutated store. Our kernels now build from lib_kernels_dir (the tracked tree).
 #
 # Run standalone. Exit 0 = the store is what its key says and nothing can write to it.
 set -uo pipefail
@@ -32,12 +32,12 @@ out="$(bash scripts/sync_kernels.sh "$INST/src" 2>&1)"; rc=$?
                 || no "sync_kernels.sh wrote into the store (rc=0): $out"
 
 echo "== our kernels must not resolve through kernels_dir =="
-bad="$(grep -rn '${kernels_dir}/[A-Za-z0-9_]*\.cc' route_b_kernels/*/Makefile* route_b_kernels/*/*.mk 2>/dev/null \
+bad="$(grep -rn '${kernels_dir}/[A-Za-z0-9_]*\.cc' designs/*/Makefile* designs/*/*.mk 2>/dev/null \
        | while IFS= read -r l; do
            f="$(sed 's/.*${kernels_dir}\///; s/ .*//' <<<"$l")"
-           [ -f "route_b_kernels/aie_kernels/$f" ] && echo "$l"
+           [ -f "aie_kernels/$f" ] && echo "$l"
          done)"
-[ -z "$bad" ] && ok "no route_b kernel is declared through \${kernels_dir}" \
-              || { no "route_b kernels declared through \${kernels_dir} (they only resolve if copied into the store):"; echo "$bad"; }
+[ -z "$bad" ] && ok "no our kernel is declared through \${kernels_dir}" \
+              || { no "our kernels declared through \${kernels_dir} (they only resolve if copied into the store):"; echo "$bad"; }
 
 exit $fail

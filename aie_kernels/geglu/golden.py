@@ -14,7 +14,7 @@ GELU here is the tanh approximation (torch gelu(approximate="tanh")):
 This is the reference the later DEVICE pass checks the on-chip kernel
 against via relative L2 error (see verify_spec in the task return / this
 brick's README-less pointer: threshold 3e-2, consistent with the other
-route_b_kernels bricks' bf16-tanh-SFU tolerance).
+our kernels' bf16-tanh-SFU tolerance).
 """
 import numpy as np
 

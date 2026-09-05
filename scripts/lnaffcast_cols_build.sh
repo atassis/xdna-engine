@@ -52,7 +52,7 @@ log "instance: $MLIR_AIE_INSTANCE (pin $pin)"
 
 # kernels_dir resolves against the INSTANCE src tree, so the .cc has to be overlaid there.
 bash "$WT/scripts/sync_kernels.sh" >>"$LOG" 2>&1
-log "[sync] sandbox refreshed; our kernels compile from route_b_kernels/aie_kernels"
+log "[sync] sandbox refreshed; our kernels compile from aie_kernels"
 
 # $1 = lnaffcast_rows (0 = the GEMM stream's default), $2 = contig taps.
 build_arm() {

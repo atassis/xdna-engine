@@ -56,7 +56,7 @@ BANDS="$WT/artifacts/bge_fc1_bands"
 # Operands first (device-free): a real forward pass, validated at cos 0.9998 against the served engine.
 if [ ! -f "$BANDS/bands.json" ]; then
   log "[host] capturing bge-base fc1 operands"
-  "$PY" route_b_kernels/probes/bge_ffn1_bands.py 2>&1 | tee -a "$LOG"
+  "$PY" experiments/probes/bge_ffn1_bands.py 2>&1 | tee -a "$LOG"
 fi
 
 for L in 0 6 11; do

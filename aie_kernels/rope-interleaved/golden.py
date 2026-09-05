@@ -133,7 +133,7 @@ if __name__ == "__main__":
     from pathlib import Path
 
     HERE = Path(__file__).resolve()
-    REPO = HERE.parents[3]  # .../rope-interleaved -> bricks -> route_b_kernels -> repo root
+    REPO = HERE.parents[2]  # .../rope-interleaved -> aie_kernels -> repo root
     scripts = REPO / "scripts"
     ar_ref = _load_module(scripts / "s2_ar_ref.py", "s2_ar_ref")
     cq_ref = _load_module(scripts / "codec_quantizer_ref.py", "codec_quantizer_ref")

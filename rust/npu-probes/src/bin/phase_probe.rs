@@ -7,7 +7,7 @@
 //! different core programs (a GEMM ELF + an LN ELF) and RUN them on the open stack without the
 //! "compiles-clean-but-hangs" hazard (internal notes Risk; docs/10 s2 GEMM->GEMM deadlock).
 //!
-//! It loads three single-tile (m=32,k=32,n=64) xclbins built by route_b_kernels/phase_probe:
+//! It loads three single-tile (m=32,k=32,n=64) xclbins built by experiments/phase_probe:
 //!   * both : GEMM core || LN core, concurrent, in ONE xclbin (one hwctx)  <-- THE artifact
 //!   * gemm : GEMM core only (latency baseline)
 //!   * ln   : LN core only   (latency baseline)

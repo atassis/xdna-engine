@@ -4,7 +4,7 @@
 //
 // Generic op-TYPE against the resident [tile, D] stream contract (mirrors the
 // per-row core_body shape of affine_cast.cc / glu.cc / ln_2pass.cc in
-// route_b_kernels/aie_kernels/): ONE call processes ONE row of `cols` f32
+// aie_kernels/): ONE call processes ONE row of `cols` f32
 // elements, cols % N == 0. Not tied to any one model -- any block that wants
 // a squared-ReLU nonlinearity (e.g. a Gemma-style MLP variant, or a conv/FFN
 // activation swap) calls this brick the same way glu_row is called for GLU.

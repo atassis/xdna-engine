@@ -206,7 +206,7 @@ static inline void mm_silu_epilogue_f32o_hiprec(const float *__restrict pC_in,
 // Software tanh for the GELU epilogue, the only route to a tanh better than the SFU LUT:
 // aie::tanh<float> emits no code on aie2p (see the note in mm_gelu_epilogue_f32o), so the
 // accurate form has to be built, as tanh_ab.cc builds it, on the exp2 poly. Both functions are
-// VERBATIM from route_b_kernels/tanh_ab/tanh_ab.cc, itself a verbatim copy of relpos_mha.cc's
+// VERBATIM from experiments/tanh_ab/tanh_ab.cc, itself a verbatim copy of relpos_mha.cc's
 // exp2f_vec -- do not hand-edit without re-diffing. noinline is load-bearing: forcing it inline
 // miscompiles (probes/ra_spill_repro.cc).
 static constexpr float MMSE_LOG2E = 1.4426950408889634f;

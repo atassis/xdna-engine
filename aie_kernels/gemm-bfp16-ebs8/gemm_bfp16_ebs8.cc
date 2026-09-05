@@ -10,7 +10,7 @@
 // regime (see docs/aie2p-architecture-and-roofline.md).
 //
 // API pattern studied from:
-//   - route_b_kernels/ffn_bfp16/repro_847_mmul888_bfp16.cc (mmul<M,K,N,TA,TB,
+//   - experiments/ffn_bfp16/repro_847_mmul888_bfp16.cc (mmul<M,K,N,TA,TB,
 //     accauto> -> load_v -> acc.mul/mac -> acc.to_vector<Out>() skeleton)
 //   - aie_kernels/gemm-int8/gemm_int8.cc (this brick's tiling
 //     shape/style, generalized from int8 to the bfp16 block-float format)

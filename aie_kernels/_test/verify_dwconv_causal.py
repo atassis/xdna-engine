@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Device rel-L2 verify: is route_b_kernels/dwconv1d/dwconv1d.cc REUSABLE for the S2 codec
+"""Device rel-L2 verify: is designs/dwconv1d/dwconv1d.cc REUSABLE for the S2 codec
 quantizer's ConvNeXt depthwise conv, or does it need a new brick? Gate 3e-2. Run under the device
 lock.
 
 ANSWER (settled device-free, see the reasoning below): REUSABLE WITH PARAMETERIZATION. No new
-kernel file. This gates the EXISTING, untouched route_b_kernels/dwconv1d/dwconv1d.cc (read-only --
+kernel file. This gates the EXISTING, untouched designs/dwconv1d/dwconv1d.cc (read-only --
 Parakeet's shipped kernel; nothing here edits it) against scripts/codec_quantizer_ref.py's own
 dwconv_1d_causal, which is the real oracle-matching reference (not a reimplementation of it).
 
@@ -59,8 +59,8 @@ not something to decide inside a reuse-verify script.
 COMPILE FLAG dwconv1d.cc NEEDS (found by actually compiling the generated shim with
 aie_kernels/_test/compile_check.sh before wiring this into bricklib -- it failed
 first): dwconv1d.cc:34 `#include "../aie_kernel_utils.h"` is a relative include resolved against
-dwconv1d.cc's OWN directory (route_b_kernels/dwconv1d/), not the shim's. That header is not tracked
-in route_b_kernels at all -- it is upstream mlir-aie's aie_kernels/aie_kernel_utils.h (a handful of
+dwconv1d.cc's OWN directory (designs/dwconv1d/), not the shim's. That header is not tracked
+in our kernel library at all -- it is upstream mlir-aie's aie_kernels/aie_kernel_utils.h (a handful of
 AIE_LOOP_UNROLL_FULL-style macros), and normally resolves only because scripts/sync_kernels.sh
 copies dwconv1d.cc to <mlir-aie>/aie_kernels/aie2p/dwconv1d.cc first, sibling to the header. A
 #include'ing shim outside that sandbox therefore needs one extra flag:
@@ -98,7 +98,7 @@ import numpy as np
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent.parent
-DWCONV_CC = (ROOT / "route_b_kernels" / "dwconv1d" / "dwconv1d.cc").resolve()
+DWCONV_CC = (ROOT / "designs" / "dwconv1d" / "dwconv1d.cc").resolve()
 assert DWCONV_CC.exists(), f"expected the shipped Parakeet dwconv1d.cc at {DWCONV_CC}"
 
 sys.path.insert(0, str(HERE))

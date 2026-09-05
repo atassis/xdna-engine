@@ -1,7 +1,7 @@
 //! On-NPU decode routing (staged behind the `npu` feature).
 //!
 //! Phase-0 status: this module wires the ROUTING STRUCTURE + per-token host protocol against the fused
-//! decode ELF produced by `route_b_kernels/decode_fused/gen_gemma_decode.py`. The device backend (XRT BO
+//! decode ELF produced by `designs/decode_fused/gen_gemma_decode.py`. The device backend (XRT BO
 //! upload, per-token dispatch of the constant ELF, scratchpad writes) is NOT linked in this crate yet --
 //! [`GemmaNpuDecoder::step`] returns [`NpuError::DeviceBackendUnlinked`] so the crate `cargo check`s (and
 //! this feature compiles) WITHOUT XRT. The execution agent swaps the backend in once the ELF builds.
@@ -14,7 +14,7 @@ use crate::config::GemmaConfig;
 use crate::schedule::{decode_schedule, Brick};
 
 /// The generator script the execution agent builds the ELF from (name pinned so both sides agree).
-pub const GENERATOR: &str = "route_b_kernels/decode_fused/gen_gemma_decode.py";
+pub const GENERATOR: &str = "designs/decode_fused/gen_gemma_decode.py";
 
 /// Errors from the (not-yet-linked) device path.
 #[derive(Debug, Clone, PartialEq)]

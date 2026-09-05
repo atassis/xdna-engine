@@ -64,7 +64,7 @@ so neither is read here; do not add them "for completeness" without a reason tie
 KERNEL MAP -- one row per op in this segment: existing aie_kernels/ brick, or a gap.
 ============================================================================================
 
-Two measured constraints from the ALREADY-PORTED decoder segment (route_b_kernels/codec_block/
+Two measured constraints from the ALREADY-PORTED decoder segment (designs/codec_block/
 residual_unit_bf16.cc's frontier table) that this map is judged against:
   (a) a streamed brick design takes ONE streamed operand + ONE resident operand;
   (b) the resident operand is the dominant L1 term -- at c=96 channels, f32 [c,64] fits, [c,128]
@@ -122,7 +122,7 @@ Design for this FIRST; it is not a detail to discover mid-port.
                                                                             k==stride==2 so no
                                                                             fractional-crop case.
   ConvNeXt depthwise conv (x2)          dwconv1d_same_scalar<T,K,P,BIAS>  NOT a gap -- AWKWARD #4 is
-                                         (route_b_kernels/dwconv1d/,      CORRECTED below. Reuse via
+                                         (designs/dwconv1d/,      CORRECTED below. Reuse via
                                          Parakeet's shipped kernel)       P=K-1, device-green
                                                                             2026-07-31.
   ConvNeXt LayerNorm affine (x2)        layernorm (layernorm_ln_affine)   exact 2-pass mean-centered
@@ -178,7 +178,7 @@ AWKWARD ON-NPU (deliverable 4):
      still unwritten: exp (SFU) + causal-masked reduce-sum over the key axis + reciprocal-multiply.
 
   #4 CORRECTED 2026-07-31, DEVICE-GREEN -- this was never a gap. The original claim ("no depthwise
-     brick exists in this catalog") was true only as scoped to aie_kernels/: route_b_kernels/dwconv1d/
+     brick exists in this catalog") was true only as scoped to aie_kernels/: designs/dwconv1d/
      dwconv1d.cc, Parakeet's shipped depthwise-1d kernel, lives OUTSIDE aie_kernels/ and is directly
      reusable here by reparameterization -- the same reuse class as mha_decode HD=64->128.
 

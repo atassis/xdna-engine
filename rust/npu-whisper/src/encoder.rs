@@ -155,7 +155,7 @@ impl WhisperEncoder {
             // build artifact is worse than one that runs correctly on the host and says so.
             let build_hint = format!(
                 "no encoder-MHA xclbin for h={h} in {} -- build it with \
-                 `python route_b_kernels/decode_fused/gen_encoder_mha.py --heads {h} --out {}`",
+                 `python designs/decode_fused/gen_encoder_mha.py --heads {h} --out {}`",
                 base.display(), base.display());
             match found {
                 None if mha_explicit => panic!("NPU_ENC_MHA_NPU: {build_hint}"),

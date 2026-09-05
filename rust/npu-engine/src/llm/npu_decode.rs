@@ -3,7 +3,7 @@
 //! `asr::whisper_decoder`'s resident path uses) through `npu-xrt`'s `ElfResident`/`FusedArena`.
 //!
 //! Per-token protocol, from the authoritative Python driver
-//! (`route_b_kernels/decode_fused/verify_llm_decode.py:99-112`):
+//! (`designs/decode_fused/verify_llm_decode.py:99-112`):
 //!   1. host gathers `embed[token] * scale` -> write to `x`
 //!   2. host computes the RoPE angle row for `pos` -> write to `rope_global`
 //!   3. host writes ctrl-scratchpad `kv_off = pos*head_dim` and `sm_mask = pos+1`
@@ -228,7 +228,7 @@ impl DecodeStep for NpuDecodeStep {
 mod tests {
     use super::*;
 
-    // `scripts/... rope_row` cross-check (route_b_kernels/decode_fused/verify_llm_decode.py:34-48),
+    // `scripts/... rope_row` cross-check (designs/decode_fused/verify_llm_decode.py:34-48),
     // theta=1e6, head_dim=8 (half=4): computed independently in Python and pasted as a literal, the
     // same cross-language-oracle convention `llm::sampling`'s tests use.
     //   >>> import numpy as np
@@ -431,7 +431,7 @@ mod tests {
     /// 15344 vs NPU 279, margin 0.0203. That was first read as "a genuine bf16 knife-edge tie this
     /// rail's numerics resolve the other way from the CPU oracle" -- plausible (margin < 0.25 in
     /// `verify_llm_decode.py`'s own classification) and WRONG. The control that decided it:
-    /// `route_b_kernels/decode_fused/gen_llm_decode.py` regenerated FRESH against the CURRENTLY
+    /// `designs/decode_fused/gen_llm_decode.py` regenerated FRESH against the CURRENTLY
     /// PINNED toolchain reaches **8/8** on this exact rail (no code changed here at all) --
     /// `decode.elf` shrinks 22279888 -> 20952656 bytes, a real recompile, not container-metadata
     /// noise. Root cause: `toolchain.lock`'s `MLIR_AIE_FORK_COMMIT` advanced 035528f71cf1

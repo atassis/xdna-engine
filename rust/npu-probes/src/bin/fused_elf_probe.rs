@@ -6,7 +6,7 @@
 //! (`xrt::elf`→`hw_context(device,elf)`→`ext::kernel("main:sequence")`→N-BO run); (2) the Rust
 //! `FusedArena` + named-offset placement reproduces IRON's `FusedFullELFCallable.get_buffer()`.
 //!
-//! Artifacts (from the route_b_kernels/decode_fused/*.py generators, host-only IRON compile):
+//! Artifacts (from the designs/decode_fused/*.py generators, host-only IRON compile):
 //!   meta.json  — { elf, input_size, output_size, scratch_size, layout{name:{type,offset,len}},
 //!                  inputs[], weights[], output }
 //!   <elf>, buffers/<name>.bin (raw bf16 for every input/weight + the device golden `output`)

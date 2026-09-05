@@ -13,14 +13,14 @@
 # or exactly what broke. Non-zero exit if any configured repo failed.
 #
 # Reuses the generic scripts/apply_patches.sh; per-repo order lives in a `series`
-# file under route_b_kernels/patches/ (e.g. mlir-aie.series, iron.series).
+# file under patches/ (e.g. mlir-aie.series, iron.series).
 # =============================================================================
 set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 [ -f "$REPO/scripts/amd_toolchains.env" ] && . "$REPO/scripts/amd_toolchains.env"
 
-P="$REPO/route_b_kernels/patches"
+P="$REPO/patches"
 APPLY="$REPO/scripts/apply_patches.sh"
 RESET="${RESET:-}"
 
@@ -51,7 +51,7 @@ apply_one() {  # name  series-file  target-dir
 }
 
 # mlir-aie + mlir-air + IRON are NO LONGER patched here -- their delta is carried as FORK BRANCHES (commits,
-# not .patch): mlir-aie = atassis/mlir-aie:xdna2-asr (setup_route_b.sh checks it out, toolchain_up.sh builds
+# not .patch): mlir-aie = atassis/mlir-aie:xdna2-asr (setup_kernel_env.sh checks it out, toolchain_up.sh builds
 # it); IRON = atassis/IRON:integration-stack (xdna2-asr is its stale predecessor; the decode build scripts do
 # NOT require a branch -- they gate on the API symbols they import, see iron_require_api in amd_paths.sh); mlir-air =
 # atassis/mlir-air per-PR branches (#1694, #1695). Only llvm-aie/Peano remains (consumed as a pinned wheel;

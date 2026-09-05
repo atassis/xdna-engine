@@ -43,7 +43,7 @@ ISSUE_EVENTS = ["INSTR_VECTOR", "INSTR_LOAD", "INSTR_STORE"]
 
 
 def insts_bin(insts_txt, artifacts):
-    """Rename-only shim. route_b_override.mk pins --npu-insts-name to insts_*.txt because the
+    """Rename-only shim. design_override.mk pins --npu-insts-name to insts_*.txt because the
     engine and the kernel registry read that name, but aiecc writes RAW BINARY into it either
     way, and the host runtime dispatches on the extension alone (read_insts raises on anything
     but .bin, despite a docstring still promising a text branch). So the bytes are already

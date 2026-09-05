@@ -7,7 +7,7 @@
 // not per-model hand-fusion) -- brick catalog entry, matmul group, compute-
 // bound M>=8 regime (see docs/aie2p-architecture-and-roofline.md).
 //
-// API pattern studied from route_b_kernels/ffn_bfp16/repro_847_mmul888_bfp16.cc
+// API pattern studied from experiments/ffn_bfp16/repro_847_mmul888_bfp16.cc
 // and mlir-aie/aie_kernels/aie2p/mm.cc (matmul_vectorized_8x8x8_i8_i32):
 //   aie::mmul<M,K,N,int8,int8,accauto> MMUL;
 //   load_v -> acc.mul(A,B) [first K-step] / acc.mac(A,B) [subsequent K-steps]

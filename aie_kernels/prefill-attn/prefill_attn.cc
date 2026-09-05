@@ -7,7 +7,7 @@
 //
 // NOTHING ELSE IN THE CATALOG MATCHES THIS SHAPE (all three axes differ from the two closest
 // relatives, each checked by reading its source before writing this file):
-//   * route_b_kernels/mha_decode/mha_decode.cc is M=1 STREAMED/FLASH decode: K/V arrive as
+//   * designs/mha_decode/mha_decode.cc is M=1 STREAMED/FLASH decode: K/V arrive as
 //     TKV-key tiles and softmax is ONLINE (running max/denom/accumulator) because a full head's
 //     K/V does not fit L1 at decode-time cache lengths (up to S_MAX=448). Wrong shape here: at
 //     M<=11 the ENTIRE per-head K/V (2*11*128*2 = 5632 B) fits L1 trivially, so paying flash's
@@ -17,7 +17,7 @@
 //     CALL-PER-QUERY-STEP shape is reused too (see "ONE ROW PER CALL" below), but unlike
 //     mha_decode this kernel's per-call ABI carries NO scalar argument at all (see "MASK IS DATA,
 //     NOT A SCALAR" below) -- a stricter, not looser, version of mha_decode's shape.
-//   * route_b_kernels/relpos_mha/relpos_mha.cc is the Parakeet encoder's attention: M=T
+//   * designs/relpos_mha/relpos_mha.cc is the Parakeet encoder's attention: M=T
 //     (compute-bound, large), BIDIRECTIONAL (no causal mask), relative-position bias (AC+BD_shifted
 //     terms), and NO GQA (H=8 query heads, no separate kv-head count). Wrong on exactly the three
 //     axes this brick needs: causal, GQA, short-M.
@@ -477,7 +477,7 @@ void prefill_attn_row(bfloat16 *qm_row, bfloat16 *kv, float *ctx_row) {
 // with cols>16 at all. Instead, each call processes exactly ONE query row against exactly ONE
 // VL=16-key CHUNK (the only softmax-adjacent shape this brick has ever gated green), and capacity
 // widens by calling MORE TIMES -- volume supplied by the WORKER's Python-unrolled dispatch loop
-// (`for t in range(n_chunks): kern(...)`), the same mechanism route_b_kernels/mha_decode/
+// (`for t in range(n_chunks): kern(...)`), the same mechanism designs/mha_decode/
 // mha_decode.cc's own flash tiling uses and that verify_mha_decode_hd128.py gates device-green at
 // S=100 keys via 4 tiles of TKV=32. That precedent's ALGORITHM (running max/denom/accumulator,
 // rescaled per tile) is reused here; its literal function is not, because HD, GQA and the

@@ -42,7 +42,7 @@
 // `aie::exp2`/`aie::sin`/`aie::lut`.
 //
 // No exp2/expf vector helper existed anywhere in this tree before this file (grepped
-// route_b_kernels/ for exp2/expf/exp2f_vec/expf_vec: no hits) -- `exp2_v<N>` here is the first
+// designs/ for exp2/expf/exp2f_vec/expf_vec: no hits) -- `exp2_v<N>` here is the first
 // instance of the upstream-brick-exp2f-vec primitive, defined inline (this brick owns no other
 // file to host it in). A natural follow-up is factoring it into its own aie_kernels/exp2/ file, exactly
 // as sin.cc's sin_v was later composed by snake.cc via `#include "../sin/sin.cc"`.

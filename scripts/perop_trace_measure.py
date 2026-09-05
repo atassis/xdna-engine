@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Per-op on-NPU hardware-trace measurement (route b, standalone per-op).
 # Builds each fused-Whisper-decode op at its REAL decode shape (from
-# route_b_kernels/decode_fused/gen_decode.py), traces it on the NPU via the
+# designs/decode_fused/gen_decode.py), traces it on the NPU via the
 # IRON_TRACE_SIZE env hook (gated in each op's design.py -> no-op for production),
 # and extracts per-op on-chip cycles:
 #   - span   = full active window (max ts - min ts over all traced tiles' events),
@@ -12,7 +12,7 @@
 #
 # Run (production stack, NPU free -> stop npu-asr first):
 #   IRON_TRACE_SIZE=65536 \
-#   PYTHONPATH=route_b_kernels/decode_fused:$WS/amd/IRON \
+#   PYTHONPATH=designs/decode_fused:$WS/amd/IRON \
 #   .venv-iron/bin/python scripts/perop_trace_measure.py [op1 op2 ...]
 #
 # Results appended to artifacts/perop_trace_results.json (keyed by label).

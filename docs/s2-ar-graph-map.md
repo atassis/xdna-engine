@@ -1,11 +1,11 @@
 # S2 Dual-AR graph map: text tokens -> [10, T] codec codes
 
 The codec DECODER half of Fish-Audio S2 (codes -> audio) is already ported and partly running on
-the NPU (`route_b_kernels/codec_block/`, `feat/s2-codec-bricks`). The autoregressive half that
+the NPU (`designs/codec_block/`, `feat/s2-codec-bricks`). The autoregressive half that
 PRODUCES those codes had no reference, no shape inventory, and no kernel plan before this doc and
 its companion `scripts/s2_ar_ref.py`. This is that inventory: every op in the real forward pass,
 with real tensor names and shapes pulled from `s2.cpp/models/s2-pro-q6_k.gguf`, which of it already
-has a brick in `route_b_kernels/`, a parity/gating plan, and an L1 sizing note for what's new.
+has a brick in `designs/`, a parity/gating plan, and an L1 sizing note for what's new.
 
 Everything here was cross-checked against `s2.cpp/src/s2_model.cpp` (`SlowARModel::eval_cached` /
 `::fast_decode`, the ggml graph builders) and `s2.cpp/src/s2_generate.cpp` (the sampling loop) --
@@ -136,7 +136,7 @@ Sampling (outside both graphs, `s2_generate.cpp`/`s2_sampler.cpp`): mask non-sem
 `temperature<=0`, deterministic argmax of the filtered (== unfiltered top-1) logits. See #3 below
 for why this matters for gating.
 
-## 4. Brick-vocabulary mapping (`aie_kernels/` + `route_b_kernels/` generally)
+## 4. Brick-vocabulary mapping (`aie_kernels/` + `designs/` generally)
 
 | AR op | existing brick | verdict |
 |---|---|---|
@@ -146,10 +146,10 @@ for why this matters for gating.
 | wqkv / wo / w1 / w2 / w3 GEMMs | `aie_kernels/gemm-bfp16-ebs8` (or `gemm-bf16xbfp16`) | **REUSE the kernel**, but needs q6_k->bf16 weight conversion first (see #0) -- not a kernel gap, a preprocessing gap |
 | masked argmax over restricted vocab (greedy sampling) | `aie_kernels/lm-head-argmax` | **REUSE with reparameterization**: brick's `HIDDEN=256,VOCAB=512` are compile-time defaults, not fixed; needs `VOCAB=4096` (fast, exactly `codebook_size`) or `~4097` (slow, `semantic_end-semantic_begin+1` plus `im_end_id`) |
 | RoPE (Q, K, both stacks) | `aie_kernels/rope-lut` | **LOOKS-SOLVED-BUT-ISN'T -- concrete gap.** `rope-lut`'s golden (`golden.py:88-92`) rotates `x1=qk[0:half]` against `x2=qk[half:rot]` -- **NEOX split-half** convention. S2 calls `ggml_rope_ext(..., mode=0, ...)` = `GGML_ROPE_TYPE_NORMAL` = **adjacent-pair** rotation (`ggml.h:1809`, diagrammed `[cscs0000]`). These are different math; reusing `rope-lut` as-is on S2 would silently rotate the wrong element pairs. Needs a NEW adjacent-pair variant (same LUT/sizing, different pairing in the kernel loop) -- see brick-first doctrine: "using a generic brick where the hardware needs a specialized one" is the recurring costly mistake; this is its RoPE-convention cousin. |
-| GQA-aware causal self-attention, decode (slow model, incremental M=1 step) | `route_b_kernels/mha_decode/mha_decode.cc` | **PARTIAL -- new kernel instance needed.** `mha_decode.cc` hardcodes `HD=64` (`static constexpr int HD = 64;`, Whisper D=768/12 heads) and has no GQA repeat (Whisper MHA: `n_head==n_head_kv`). S2 needs `HD=128` and an 8->32 GQA expand before/inside the flash loop. The flash-attention STRUCTURE (online softmax, streamed K/V tiles, f32 accumulator) is directly reusable; the compile-time constants and the missing repeat are not. |
+| GQA-aware causal self-attention, decode (slow model, incremental M=1 step) | `designs/mha_decode/mha_decode.cc` | **PARTIAL -- new kernel instance needed.** `mha_decode.cc` hardcodes `HD=64` (`static constexpr int HD = 64;`, Whisper D=768/12 heads) and has no GQA repeat (Whisper MHA: `n_head==n_head_kv`). S2 needs `HD=128` and an 8->32 GQA expand before/inside the flash loop. The flash-attention STRUCTURE (online softmax, streamed K/V tiles, f32 accumulator) is directly reusable; the compile-time constants and the missing repeat are not. |
 | GQA-aware causal self-attention, prefill (fast model, M<=10 short sequence; slow model's initial multi-token prompt) | none exactly | **NEW.** Neither `mha_decode` (M=1 decode) nor `relpos_mha` (Parakeet encoder, M=T, bidirectional + relative-position bias, no causal mask, no GQA) matches a short **causal, GQA, no-relative-position** prefill. Given fast_context_length<=11, this is small enough that a naive resident (not flash) SxS score matrix is fine -- see sizing #6. |
 | embedding / codebook-table gather (`get_rows`) | none | **NEW.** No brick in the catalog does an indexed row-gather from a huge (155776x2560 / 40960x2560) DDR/L3-resident table. Every existing brick's `[tile,D]` contract assumes the WHOLE tile streams in order; this needs index-driven DMA. Small and cheap per-op (a handful of ~2-5KB row reads per token), but a genuinely new MOVEMENT pattern, not a reparameterization of an existing one. |
-| masked multi-table-gather-sum + optional scale (embedding+codebook fusion, steps 2-5 above) | none | **NEW**, small. S2-specific fusion (sum 10 gathered rows, mask by per-row semantic flag, add to token embedding, conditionally scale the sum). Structurally similar to the elementwise fuse patterns already in `route_b_kernels/ctx_ln/` (resadd/affine-cast), just with a gather feeding it instead of a stream. |
+| masked multi-table-gather-sum + optional scale (embedding+codebook fusion, steps 2-5 above) | none | **NEW**, small. S2-specific fusion (sum 10 gathered rows, mask by per-row semantic flag, add to token embedding, conditionally scale the sum). Structurally similar to the elementwise fuse patterns already in `designs/ctx_ln/` (resadd/affine-cast), just with a gather feeding it instead of a stream. |
 | q6_k weight dequant | `aie_kernels/dequant-int4-group` (wrong format) | **NOT NEEDED on-device** -- see #0's recommendation (host, load-time, once). |
 | MoE router | `aie_kernels/moe-topk-router` | **N/A** -- S2 has no MoE layer (dense FFN only); not part of this graph. |
 

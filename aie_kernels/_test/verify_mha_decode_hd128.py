@@ -7,7 +7,7 @@ task brief, `scripts/s2_ar_ref.py::causal_attention` recomputes the whole sequen
 its docstring), so "this decode step" is the LAST row of that recompute, which is exactly what
 `golden_hd128.reference_full`/`reference_direct` return. The GQA "index, don't materialize" claim
 is checked device-free by `golden_hd128._selftest_index_equals_expand` (run automatically below,
-also runnable standalone: `python3 route_b_kernels/mha_decode/golden_hd128.py`) -- this script
+also runnable standalone: `python3 designs/mha_decode/golden_hd128.py`) -- this script
 only needs to feed the kernel ONE Q head against its (unexpanded) KV head's data, because the
 device kernel is head-agnostic (see mha_decode.cc's GQA header comment) and that equivalence is
 what makes doing so correct.

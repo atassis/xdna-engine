@@ -22,7 +22,7 @@ MMW=mlir-aie/programming_examples/basic/matrix_multiplication/whole_array
 ensure_fresh_sandbox "$MMW/build"           # wipe old-pin xclbins/objects on a toolchain change
 bash scripts/sync_kernels.sh >/dev/null     # copies Makefile.modal + whole_array_modal_iron.py + mm_silu_epilogue.cc
 
-# kernels_dir (route_b_override.mk) resolves into the mlir-aie SUBMODULE, not the pinned
+# kernels_dir (design_override.mk) resolves into the mlir-aie SUBMODULE, not the pinned
 # toolchain instance -- a correctly-bumped toolchain.lock can still compile stale kernel source
 # with no error (see scripts/verify_kernel_source.sh's header). FAIL LOUD before spending a build.
 scripts/verify_kernel_source.sh Makefile.modal

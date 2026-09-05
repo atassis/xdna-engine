@@ -13,7 +13,7 @@ whole_array_iron.py accepts --trace_size but never wires enable_trace, and the
 notes -- so a clean trace path would need editing the shared checkout). The A/B
 diffs two byte-identical-dataflow xclbins:
   FULL = the production resident kernel (real bfp16/bf16 MAC datapath)
-  STUB = the same xclbin relinked with route_b_kernels/occupancy/mm_movement_stub.cc
+  STUB = the same xclbin relinked with experiments/occupancy/mm_movement_stub.cc
          (matmul body elided; objectFIFO DMA + locks + BD chains unchanged)
 For each (M=512, K=1024, N) dispatch:
   t_full = movement + dispatch + stall + COMPUTE ;  t_stub = movement+dispatch+stall

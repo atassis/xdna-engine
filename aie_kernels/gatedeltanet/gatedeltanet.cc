@@ -5,7 +5,7 @@
 // SPIKE brick: gated delta-rule linear-attention recurrence (op-TYPE
 // `recurrence{delta,gated}`), studied against dwconv1d.cc's brick shape
 // (resident [tile,D] stream, generic op over compile-time dims, extern "C"
-// entry points) -- see route_b_kernels/dwconv1d/dwconv1d.cc for the sibling
+// entry points) -- see designs/dwconv1d/dwconv1d.cc for the sibling
 // COMPUTE-FIR brick this one borrows its layout conventions from.
 //
 // WHY THIS IS A SPIKE, NOT A LANDED BRICK: causal conv1d (dwconv1d) is a

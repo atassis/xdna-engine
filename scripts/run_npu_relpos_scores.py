@@ -2,7 +2,7 @@
 """On-device validation of the STANDALONE rel-pos scores->softmax step-1 kernel.
 
 Drives one head/block of AC[T,T] f32 + BD[T,P] f32 through the
-relpos_scores_softmax_bake IRON design (route_b_kernels/relpos_mha) on the XDNA2
+relpos_scores_softmax_bake IRON design (designs/relpos_mha) on the XDNA2
 NPU via pyxrt and compares the bf16 probs readback against the fp32 host softmax
 (scripts/parakeet_relpos_mha_golden.relpos_scores_softmax_model oracle).
 

@@ -3,7 +3,7 @@
 
 WHY this exists: `xdna-engine`'s S2 port has so far only touched the codec DECODER (codes ->
 audio; see `scripts/codec_decoder_ref.py` on the `feat/s2-codec-bricks` branch and
-`route_b_kernels/codec_block/`). The autoregressive half that PRODUCES those codes -- a "Slow"
+`designs/codec_block/`). The autoregressive half that PRODUCES those codes -- a "Slow"
 transformer emitting one semantic token per audio frame plus a "Fast" transformer emitting the
 9 residual RVQ codebook tokens for that frame -- has no reference, no shape inventory, and no NPU
 kernel plan. This script is that reference, built by reading `s2.cpp/src/s2_model.cpp` (the ggml

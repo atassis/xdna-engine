@@ -7,7 +7,7 @@ The on-device argmax for an LLM lm-head has to answer two independent things:
   (1) is the KERNEL correct when a column's slice is tiled to fit L1?
   (2) does the FusedMLIROperator buffer plumbing deliver/return it?
 
-Trying to answer both at once in `xdna-engine/route_b_kernels/decode_fused/probe_argmax_vocab.py`
+Trying to answer both at once in `xdna-engine/designs/decode_fused/probe_argmax_vocab.py`
 went badly: that path returns all-zero reads most of the time. It DID once produce an exactly
 correct global index over the full 262144 vocab (dev 100929 == ref 100929, value bit-equal),
 which is not something a broken tiling produces by luck -- but a later run gave all-zeros
@@ -33,9 +33,9 @@ import ml_dtypes
 import bricklib
 
 BF16 = ml_dtypes.bfloat16
-# repo-relative: _verify -> bricks -> route_b_kernels -> repo root
+# repo-relative: _test -> aie_kernels -> repo root
 ARGMAX_CC = str(Path(__file__).resolve().parents[2]
-                / "route_b_kernels" / "decode_fused" / "argmax_slice.cc")
+                / "designs" / "decode_fused" / "argmax_slice.cc")
 
 COLS, CHUNK = 8, 4096
 NCHUNKS = 8                      # 32768-element slice / 4096 = what Gemma's vocab needs

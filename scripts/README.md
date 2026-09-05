@@ -31,7 +31,7 @@ the entry point. See also the FORK-ONLY rule in `AGENTS.md` - never build agains
 | `cache_env.sh` | Single relocatable anchor for the build CACHE (toolchain instances, ...). |
 | `fast_build_env.sh` | Cross-cutting fast-build levers for the AIE toolchain. |
 | `kernel_sandbox.sh` | Kernel build-sandbox freshness stamp. Sourced by the kernel-build scripts. |
-| `setup_route_b.sh` | Reproduce the Route B (open mlir-aie/Peano) build environment. |
+| `setup_kernel_env.sh` | Reproduce the open mlir-aie/Peano kernel build environment. |
 | `setup_amd_toolchains.sh` | Single entry point: apply ALL AMD-toolchain patch series onto their targets. |
 | `setup_export_venv.sh` | Create the py3.12 model-EXPORT venv used by the ONNX export/convert scripts. |
 | `setup_decode_env.sh` | Recreate the whisper deep-C DECODE build environment from a clean workspace. |

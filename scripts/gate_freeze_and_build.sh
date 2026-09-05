@@ -21,7 +21,7 @@ VENV_IRON="$REPO/.venv-iron"
 IRON="$IRON_DIR"
 AIEBU_DIR="$AIEBU_ASM_DIR"
 WEIGHTS="$REPO/artifacts/whisper-small/whisper_decoder"
-GENDIR="$REPO/route_b_kernels/decode_fused"
+GENDIR="$REPO/designs/decode_fused"
 
 export AIECC_PATH="${AIECC_PATH:-$("$REPO/scripts/toolchain_up.sh")/bin/aiecc}"
 export AIECC_PHASE_TIMERS="${AIECC_PHASE_TIMERS:-1}"

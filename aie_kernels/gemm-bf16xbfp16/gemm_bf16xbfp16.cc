@@ -23,7 +23,7 @@
 // picking DIM_M/DIM_K/DIM_N and DMA'ing its own bf16 activations + its own
 // offline-quantized bfp16ebs8 weight blob.
 //
-// Studied model: route_b_kernels/ffn_bfp16/repro_847_mmul888_bfp16.cc
+// Studied model: experiments/ffn_bfp16/repro_847_mmul888_bfp16.cc
 //   (API shape: aie::mmul<M,K,N,TA,TB,accauto> -> load_v -> acc.mul/mac ->
 //    acc.to_vector<Out>()) and the upstream reference mixed-type kernel
 //   mlir-aie/aie_kernels/aie2p/mm_bfp_mixed.cc (matmul_vectorized_2x2_bfp16_bf16),

@@ -16,7 +16,8 @@ transformer or conv model plugs into, rather than a per-model stack.
         |                                            |
    npu-xrt ............ safe Rust bindings over a C++ XRT shim -> the NPU
         |
-   route_b_kernels .... hand-written AIE kernels (GEMM/GEMV/cascade/MHA/conv/LN/...)
+   aie_kernels ........ the kernel library (GEMM/GEMV/cascade/MHA/conv/LN/...)
+   designs ............ multi-core IRON dataflow designs built from those kernels
    mlir-aie (submodule) the open AIE toolchain (kernel build + place-tiles)
 ```
 
@@ -106,7 +107,7 @@ movement**, not speeding up arithmetic:
 
 ## Kernels
 
-`route_b_kernels/` holds the AIE kernels the engine dispatches: whole-array GEMM, resident
+`aie_kernels/` holds the kernel library and `designs/` the IRON designs the engine dispatches: whole-array GEMM, resident
 GEMV, cascade FFN, single-query flash MHA, depthwise/2D conv, LayerNorm, softmax, and a
 transpose path. They are built through the pinned `mlir-aie` toolchain (place-tiles model)
 and validated against NumPy/ONNX goldens before use. The kernel-selection map - which

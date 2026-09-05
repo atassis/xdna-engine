@@ -21,7 +21,7 @@ VENV_IRON="${VENV_IRON:-$REPO/.venv-iron}"
 IRON="${IRON:-$IRON_DIR}"
 AIEBU_DIR="${AIEBU_DIR:-$AIEBU_ASM_DIR}"
 WEIGHTS="${WEIGHTS:-$REPO/artifacts/whisper-small/whisper_decoder}"
-GEN="$REPO/route_b_kernels/decode_fused/gen_gemm_probe.py"
+GEN="$REPO/designs/decode_fused/gen_gemm_probe.py"
 
 [ -x "$VENV_IRON/bin/python" ] || { echo "ERROR: $VENV_IRON/bin/python missing"; exit 1; }
 [ -d "$IRON/iron" ] || { echo "ERROR: amd/IRON not at $IRON"; exit 1; }

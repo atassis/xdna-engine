@@ -2,7 +2,7 @@
 """Standalone device validation for the minimal RA/spill-around-call repro.
 
 Mirrors run_npu_silu.py's ABI (opcode 3, in=gid3, out=gid4). Runs the tiny
-[rows,cols] f32 kernel built from route_b_kernels/probes and compares vs an fp32
+[rows,cols] f32 kernel built from experiments/probes and compares vs an fp32
 host golden, splitting the per-row error EVEN vs ODD (even row == ping-pong buffer
 0 of the depth-2 output objectfifo). Detects the two faces of the bug:
 
@@ -19,7 +19,7 @@ Usage (NPU must be QUIESCED):
 import argparse, os, sys, time
 import numpy as np
 
-EX = "route_b_kernels/probes/build"
+EX = "experiments/probes/build"
 
 
 def heavy16(x):
@@ -67,7 +67,7 @@ def main():
     for p in (xclbin, insts):
         if not os.path.exists(p):
             sys.exit(f"missing {p} -- build: source ../xdna-engine/scripts/iron_env.sh && "
-                     f"make -C route_b_kernels/probes -f Makefile.raspill NPU2=1 HOLD={a.hold} all")
+                     f"make -C experiments/probes -f Makefile.raspill NPU2=1 HOLD={a.hold} all")
     instr = np.fromfile(insts, dtype=np.uint32)
 
     import pyxrt

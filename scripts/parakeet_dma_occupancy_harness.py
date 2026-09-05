@@ -41,7 +41,7 @@ import numpy as np
 REPO = os.environ.get("PARAKEET_TOOLROOT", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 WA = os.path.join(REPO, "mlir-aie/programming_examples/basic/matrix_multiplication/whole_array/build")
 OUTDIR = os.path.join(REPO, "artifacts/parakeet/occupancy")
-GEN = os.path.join(REPO, "route_b_kernels/whole_array_fused/whole_array_modal_iron.py")
+GEN = os.path.join(REPO, "designs/whole_array_fused/whole_array_modal_iron.py")
 BIN, BOUT = 2, 4  # bf16 in, f32 out
 
 

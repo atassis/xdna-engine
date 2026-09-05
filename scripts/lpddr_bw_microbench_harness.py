@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """LPDDR bandwidth microbenchmark harness -- dispatch the pure-DMA xclbins built from
-route_b_kernels/lpddr_bw/lpddr_bw_microbench.py over a transfer-size sweep, time the
+experiments/lpddr_bw/lpddr_bw_microbench.py over a transfer-size sweep, time the
 median, and regress  t = c0_fixed + bytes / BW_achievable  to extract the silicon's
 achievable LPDDR bandwidth (the number the KB has only as a ~120 GB/s datasheet figure;
 optimization-map open gap #2, hw-envelope). See the design header in the generator and

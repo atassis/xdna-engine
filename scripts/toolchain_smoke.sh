@@ -10,7 +10,7 @@ export PEANO_INSTALL_DIR="$REPO/.venv-iron/lib/python3.14/site-packages/llvm-aie
 export PATH="$REPO/.venv-iron/bin:$PATH"   # make's `python3` = venv python (deps: ml_dtypes etc.)...
 export PYTHONPATH="$INST/python:${PYTHONPATH:-}"   # ...while `aie` resolves to the fork instance (place-tiles)
 export AIECC_PATH="$INST/bin/aiecc"
-export MLIR_AIE_INSTANCE="$INST"   # route_b_override.mk hard-requires this; without it the gate
+export MLIR_AIE_INSTANCE="$INST"   # design_override.mk hard-requires this; without it the gate
                                    # dies in make before compiling anything, which reads as a
                                    # toolchain failure rather than the missing export it is.
 MMW="$REPO/mlir-aie/programming_examples/basic/matrix_multiplication/whole_array"
@@ -19,8 +19,8 @@ MMW="$REPO/mlir-aie/programming_examples/basic/matrix_multiplication/whole_array
 # still compile stale kernel source with no error. Check before spending the build, same as the four
 # build_*.sh scripts. (Left unwired until now only because another session held this file modified.)
 "$REPO/scripts/verify_kernel_source.sh" Makefile.modal
-cp "$REPO/route_b_kernels/whole_array_fused/whole_array_modal_iron.py" "$MMW/"   # bare-resolve_program generator
-cp "$REPO/route_b_kernels/whole_array_fused/Makefile.modal" "$MMW/"
+cp "$REPO/designs/whole_array_fused/whole_array_modal_iron.py" "$MMW/"   # bare-resolve_program generator
+cp "$REPO/designs/whole_array_fused/Makefile.modal" "$MMW/"
 rm -f "$MMW"/build/mm_silu_epilogue_64x32x96.o "$MMW"/build/mm_64x32x96.o "$MMW"/build/aie_512x800x3072_64x32x96_8c_modalsilu.mlir
 WA_C_DEPTH=1 "${REPO}/.venv-iron/bin/python" -c 'pass'   # ensure venv active path
 GEN="$MMW/build/aie_512x800x3072_64x32x96_8c_modalsilu.mlir"          # generator output (pre-placement)

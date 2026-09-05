@@ -12,7 +12,7 @@ step worked before moving on.
 READ THIS FIRST: the chain is now hands-off on a machine with warm caches (validated by a
 clean-clone from-scratch run: all CPU steps green + a 4-clip device A/B character-identical
 to the shipped baseline). The bare-clone `mlir-aie` bootstrap (was GAP-A / the old manual
-"0.b") is now automated inside `setup_route_b.sh`. Two dependency-fetch steps (2, 3) still
+"0.b") is now automated inside `setup_kernel_env.sh`. Two dependency-fetch steps (2, 3) still
 lean on upstream assets that can rotate out of their indexes on a truly bare machine (GAP
 #2/#4, OPEN -- see the debts table). GAP #1 (models/parakeet/), GAP #3 (silent Peano miss)
 and GAP #5 (WER clips, shipped in VCS) are CLOSED. Read the GAP LIST + the Recreatability
@@ -69,7 +69,7 @@ Budget ~15-20 GB: ~1.8 GB toolchain wheels, ~2.5 GB Parakeet fp32 encoder + `.da
 `mlir-aie` is a git submodule (`.gitmodules` url = Xilinx/mlir-aie, `ignore=all`) but the
 build needs it on the **fork integration branch** `atassis/mlir-aie:xdna2-asr`, pinned by
 `toolchain.lock:MLIR_AIE_FORK_COMMIT`. On a bare clone `mlir-aie` is absent (untracked, no
-committed gitlink). `setup_route_b.sh` (Step 1) now bootstraps it automatically: when
+committed gitlink). `setup_kernel_env.sh` (Step 1) now bootstraps it automatically: when
 `mlir-aie/.git` is missing it `git init`s an empty repo, adds the `fork` remote, and
 fetches the pinned commit BY SHA, then checks out the fork branch. So Step 0 is just a
 clone -- no manual submodule dance.
@@ -82,7 +82,7 @@ git checkout chore/adopt-upstream-softmax-kwargs   # the validated branch
 ```
 
 That is all Step 0 requires. The `mlir-aie` fork checkout at the pinned commit happens
-automatically in Step 1 (`setup_route_b.sh`). (Success signal, later: after Step 1,
+automatically in Step 1 (`setup_kernel_env.sh`). (Success signal, later: after Step 1,
 `git -C mlir-aie rev-parse HEAD` equals `toolchain.lock:MLIR_AIE_FORK_COMMIT`.)
 
 ---
@@ -90,11 +90,11 @@ automatically in Step 1 (`setup_route_b.sh`). (Success signal, later: after Step
 ## Step 1 -- Route B toolchain env: `.venv-iron` + AIE wheels + fork checkout  [CPU]
 
 ```bash
-scripts/setup_route_b.sh
+scripts/setup_kernel_env.sh
 ```
 - **Produces:** `.venv-iron` (py3.14, `--system-site-packages`), the `mlir_aie` +
   `nanobind` wheels installed, Peano (`llvm-aie`) binaries copied into site-packages,
-  gcc-13/g++-13 shims, the `mlir-aie` fork-branch checkout re-ensured, and the route_b
+  gcc-13/g++-13 shims, the `mlir-aie` fork-branch checkout re-ensured, and the kernel
   kernels synced into the mlir-aie sandbox.
 - **Success signal:** prints `mlir-aie on xdna2-asr @ <sha>` and
   `Route B env ready.`; `.venv-iron/bin/python -c "import aie"` works and
@@ -324,8 +324,8 @@ automated from a clean clone.
 
 | Gitignored dep | Produced by | Automated? |
 |---|---|---|
-| `.venv-iron` (py3.14 AIE venv) | Step 1 `setup_route_b.sh` | AUTO -- the `mlir_aie` wheel + Peano tree still lean on a warm uv cache / wheelhouse / rotating network index (GAP #2 OPEN), but a miss now HARD-FAILS loudly with the pre-warm command (GAP #3 CLOSED) instead of silently absenting Peano. |
-| `mlir-aie/` on fork branch | Step 1 `setup_route_b.sh` | AUTO -- on a bare clone (no `mlir-aie/.git`) Step 1 `git init`s an empty repo, adds the `fork` remote, fetches the pinned commit BY SHA, and checks out the fork branch (GAP-A CLOSED). |
+| `.venv-iron` (py3.14 AIE venv) | Step 1 `setup_kernel_env.sh` | AUTO -- the `mlir_aie` wheel + Peano tree still lean on a warm uv cache / wheelhouse / rotating network index (GAP #2 OPEN), but a miss now HARD-FAILS loudly with the pre-warm command (GAP #3 CLOSED) instead of silently absenting Peano. |
+| `mlir-aie/` on fork branch | Step 1 `setup_kernel_env.sh` | AUTO -- on a bare clone (no `mlir-aie/.git`) Step 1 `git init`s an empty repo, adds the `fork` remote, fetches the pinned commit BY SHA, and checks out the fork branch (GAP-A CLOSED). |
 | `vendor/wheelhouse/mlir_aie-*.whl` | Step 1 -> `build_wheelhouse.sh` | PARTIAL -- rebuildable ONLY from a warm uv archive cache; empty cache => hard error, falls back to a rotating network index (GAP #2). |
 | MLIR core distro (`~/.cache/xdna2-build/mlir-distro/...`) | Step 2 `fetch_mlir_distro.sh` | AUTO -- needs authenticated `gh`; pin is a dated release asset (GAP #4). |
 | Toolchain instance (`~/.cache/xdna2-build/instances/<hash>`) | Step 3 `toolchain_up.sh` | AUTO (cold = tens of min). |
@@ -358,7 +358,7 @@ automated from a clean clone.
   93939) and the filenames are exactly what `extract_parakeet_encoder.py` reads.
 - **Related GAP-A (also CLOSED):** the bare-clone `mlir-aie` bootstrap used to fail --
   `git submodule update --init` errors on the untracked path (no committed gitlink) and
-  would target the Xilinx URL, which does not carry the pinned fork commit. `setup_route_b.sh`
+  would target the Xilinx URL, which does not carry the pinned fork commit. `setup_kernel_env.sh`
   now `git init`s an empty repo + fetches the pinned commit BY SHA from the `fork` remote when
   `mlir-aie/.git` is absent, so no manual step is needed. Validated on a fresh throwaway clone.
 
@@ -386,7 +386,7 @@ automated from a clean clone.
   `llvm-aie` tree out of `~/.cache/uv/archive-v0`. If that cache entry was absent the script
   only printed `WARNING: ... Peano binaries unavailable` and continued (set -e safe) -- Peano
   was then silently missing and Step 3/Step 4 failed confusingly two steps later.
-- **Fix (DONE):** added a TERMINAL GUARD to `setup_route_b.sh` after all Peano-provisioning
+- **Fix (DONE):** added a TERMINAL GUARD to `setup_kernel_env.sh` after all Peano-provisioning
   tiers. If `have_peano` (`.venv-iron/lib/python3.14/site-packages/llvm-aie/bin/clang`) is
   still false, it prints exactly what is missing + the pre-warm command
   (`uv pip install --python 3.14 "$PEANO_PIN" --find-links .../nightly`) and `exit 1`s. A
@@ -438,7 +438,7 @@ automated from a clean clone.
 The chain is hands-off on a warm-cache machine -- proven by a clean-clone from-scratch run
 (all CPU steps green + a 4-clip device A/B character-identical to the shipped baseline).
 GAP #1 (`models/parakeet/`, the hard blocker) is CLOSED -- `fetch_models.sh` materializes it.
-GAP-A (bare-clone `mlir-aie` bootstrap) is CLOSED -- `setup_route_b.sh` auto-inits + fetches
+GAP-A (bare-clone `mlir-aie` bootstrap) is CLOSED -- `setup_kernel_env.sh` auto-inits + fetches
 by SHA. GAP #3 is CLOSED -- a missing Peano/wheel fails loud and early with the pre-warm
 command. GAP #5 was a false alarm -- the WER clips are committed to VCS. What remains: the
 two supply-chain durability debts GAP #2 (~290 MB `mlir_aie` wheel) and GAP #4 (MLIR-distro

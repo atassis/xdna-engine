@@ -59,7 +59,7 @@
 //   * `ObjectFifoHandle.fill(..., offset_parameter=...)` takes a `ScratchpadParameter` directly
 //     (instance `python/aie/iron/dataflow/objectfifo.py:629,696-700`), so no new op is needed.
 //   * It is ALREADY SHIPPING in this repo: the Whisper decode path drives a per-token KV-write
-//     offset this way -- `route_b_kernels/decode_fused/gen_decode.py` builds a StridedCopy with
+//     offset this way -- `designs/decode_fused/gen_decode.py` builds a StridedCopy with
 //     `output_offset_parameter="kv_off"`, and `rust/npu-engine/src/asr/whisper_decoder.rs` writes
 //     that scratchpad word per token from the host. The decode ELF is CONSTANT across tokens
 //     precisely because the offset moved into a scratchpad parameter.

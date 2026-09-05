@@ -27,7 +27,7 @@
 // consumes -- exactly like mm_ln_epilogue.cc does over N. Element (row i, col c) of the [m,k] block
 // sits at:  off(i,c) = (i/r)*(r*k) + (i%r)*s + (c/s)*(r*s) + (c%s).  So row i = k/s chunks of s
 // contiguous elements at base (i/r)*(r*k)+(i%r)*s, stride r*s between chunks (validated bit-exact
-// in route_b_kernels/ctx_ln/ln_prologue_validate.py, V3).
+// in designs/ctx_ln/ln_prologue_validate.py, V3).
 //
 // AFFINE IS FREE (folded host-side, validated V2): gamma folds into the weight (W' = diag(g).W,
 // cached like the plain weight) and beta becomes an additive output bias b' = b @ W. So this

@@ -18,7 +18,7 @@ fails to place with:
 So only the single-column chain is buildable; this runner validates THAT.
 
 Design : mlir-aie/.../whole_array/wa_gemm2_iron.py  (--n-cols 1)
-Build  : see route_b_kernels/whole_array_fused/Makefile.wa_gemm2 (or the header
+Build  : see designs/whole_array_fused/Makefile.wa_gemm2 (or the header
          of that file); artifacts land in
          mlir-aie/.../whole_array/build_gemm2/final_wa_gemm2_1col.xclbin
          and insts_wa_gemm2_1col.txt

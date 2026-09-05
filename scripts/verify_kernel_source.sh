@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Verify the kernel C++ source the whole_array Makefile family (Makefile.modal,
-# Makefile.modal.int8, Makefile.resident -- the family route_b_override.mk's own header names)
+# Makefile.modal.int8, Makefile.resident -- the family design_override.mk's own header names)
 # will ACTUALLY compile matches its ground truth. Run this BEFORE the first `make -f
 # Makefile.modal[.int8]` / `-f Makefile.resident` invocation in a kernel-build script; a
 # mismatch exits non-zero and must abort the build (this script sets -e; do not swallow its
 # exit code with `|| true`).
 #
-# WHY THIS EXISTS (2026-07-30): hashing toolchain.lock is NOT sufficient. route_b_override.mk's
+# WHY THIS EXISTS (2026-07-30): hashing toolchain.lock is NOT sufficient. design_override.mk's
 #   kernels_dir=${srcdir}/../../../../aie_kernels/aie2p
 # resolves relative to wherever the mlir-aie SUBMODULE happens to be checked out -- never the
 # pinned toolchain INSTANCE that toolchain_up.sh resolves the compiler from. So a correctly
@@ -19,13 +19,13 @@
 #  1. kernels_dir: asks GNU Make itself, via `--eval` injecting a throwaway print-only target into
 #     the REAL Makefile with the REAL vars (NPU2=1, same as every call site). Hand-deriving the
 #     same ${srcdir}/../../../../aie_kernels/... arithmetic here would just be a SECOND copy of
-#     route_b_override.mk's own logic -- exactly the kind of duplicated source of truth that
+#     design_override.mk's own logic -- exactly the kind of duplicated source of truth that
 #     drifts. Asking Make means a future edit to that arithmetic is still caught correctly.
 #  2. Which files: reads the ${kernels_dir}/*.cc prerequisites straight out of the Makefile's own
 #     `.o:` rules (grep on the tracked text Make itself parses) -- not an assumed list, not a
 #     directory walk (so untracked/generated files sitting in kernels_dir, e.g. .o/.stamp/.mlir
 #     build output, are never touched or flagged).
-#  3. KERNEL_CC (the compiler that actually turns those .cc files into .o -- route_b_override.mk:
+#  3. KERNEL_CC (the compiler that actually turns those .cc files into .o -- design_override.mk:
 #     `KERNEL_CC=${PEANO_INSTALL_DIR}/bin/clang++`): resolved the SAME way, via the SAME --eval
 #     call, never re-derived. This is a SECOND, independent provenance axis found by the
 #     FindPeano lane 2026-07-30: a Peano `clang`/`clang++` embeds its own build SHA in
@@ -50,15 +50,15 @@
 # paths would flag "kernels_dir points at the submodule" even when that submodule happens to be
 # correctly pinned -- content hashing is what actually answers "did the build get the right
 # bytes"):
-#  - VENDOR kernels (no route_b_kernels/ override -- e.g. mm.cc, the plain upstream matmul):
+#  - VENDOR kernels (no designs/ override -- e.g. mm.cc, the plain upstream matmul):
 #    ground truth = the PINNED TOOLCHAIN INSTANCE's own worktree source,
 #    $(scripts/toolchain_up.sh)/src/aie_kernels/{aie2p,aie2}/<file> -- what toolchain.lock
 #    actually bought. A mismatch here is exactly tonight's bug class.
-#  - ROUTE_B kernels (route_b_kernels/aie_kernels/<file> exists -- intentionally vendored-and-
+#  - ROUTE_B kernels (aie_kernels/<file> exists -- intentionally vendored-and-
 #    patched or net-new, e.g. mm_silu_epilogue.cc): ground truth = that TRACKED file. Comparing
 #    these against the toolchain instance would be a false positive (upstream may not even have
 #    the file, or has the unpatched original) -- sync_kernels.sh's own contract is the copy at
-#    kernels_dir must equal route_b_kernels/, so that is what we check.
+#    kernels_dir must equal designs/, so that is what we check.
 #  - KERNEL_CC (compiler identity): ground truth = toolchain.lock's PEANO_FORK_COMMIT, checked
 #    against the resolved clang/clang++'s own --version VCS banner (see point 3 above). If
 #    toolchain.lock has no PEANO_FORK_COMMIT (a future lock shape using PEANO_DIST only), this
@@ -97,7 +97,7 @@ MMW=mlir-aie/programming_examples/basic/matrix_multiplication/whole_array
 RB_KERNELS=aie_kernels
 # The TRACKED originals of the Makefiles sync_kernels.sh copies into $MMW. Ground truth for the
 # sandbox copies, which are untracked inside the submodule working tree.
-RB_MAKEFILES=route_b_kernels/whole_array_fused
+RB_MAKEFILES=designs/whole_array_fused
 
 # Transitive closure of quoted `#include "..."` starting from the Makefile's declared prerequisites,
 # printed one relative path per line (input order first, then discovered).
@@ -137,7 +137,7 @@ include_closure() {
 family=("$@")
 [ ${#family[@]} -gt 0 ] || family=(Makefile.modal Makefile.modal.int8 Makefile.resident)
 
-# The only var route_b_override.mk's kernels_dir branches on is devicename (from NPU2); every
+# The only var design_override.mk's kernels_dir branches on is devicename (from NPU2); every
 # real call site (build_kernels.sh, build_parakeet_kernels.sh, build_parakeet_modal_kernels.sh)
 # passes NPU2=1. Passed through --eval alongside the real Makefile, so if a future edit makes
 # kernels_dir depend on something else, asking Make (not this list) is still what answers it.
@@ -164,7 +164,7 @@ peano_fork_commit="$(sed -n 's/^PEANO_FORK_COMMIT=\([0-9a-f]*\).*/\1/p' toolchai
 resolve_make_vars() {
   local mk="$1"
   make -s -C "$MMW" -f "$mk" "NPU2=$npu2_var" \
-    --eval='__pf_print__: ; @echo __KD__=$(kernels_dir); echo __RB__=$(rb_kernels_dir); echo __CC__=$(KERNEL_CC)' \
+    --eval='__pf_print__: ; @echo __KD__=$(kernels_dir); echo __RB__=$(lib_kernels_dir); echo __CC__=$(KERNEL_CC)' \
     __pf_print__ 2>&1
 }
 
@@ -220,10 +220,10 @@ for mk in "${family[@]}"; do
     fail=1; continue
   fi
   kdir="$(realpath -m "$kdir_raw")"
-  # SECOND NAMESPACE. route_b_override.mk resolves OUR kernels through rb_kernels_dir (the tracked
+  # SECOND NAMESPACE. design_override.mk resolves OUR kernels through lib_kernels_dir (the tracked
   # tree) and vendor kernels through kernels_dir (the pinned instance). Empty on a Makefile that
   # predates the split, which is a resolution failure, not an absent feature: this gate's ground
-  # truth for a route_b kernel is the tracked file, so a Makefile that can only name one namespace
+  # truth for a our kernel is the tracked file, so a Makefile that can only name one namespace
   # is one this script cannot classify.
   rbdir=""
   [ -n "$rbdir_raw" ] && rbdir="$(realpath -m "$rbdir_raw")"
@@ -265,24 +265,24 @@ $(_peano_remedy)" >&2
   fi
 
   # TWO NAMESPACES. Vendor kernels (mm.cc, zero.cc) are prerequisites of ${kernels_dir}; ours
-  # (mm_silu_epilogue.cc et al) of ${rb_kernels_dir}. Which namespace a file is declared through
-  # is now itself checked -- a route_b kernel reached via kernels_dir only resolves because
+  # (mm_silu_epilogue.cc et al) of ${lib_kernels_dir}. Which namespace a file is declared through
+  # is now itself checked -- a our kernel reached via kernels_dir only resolves because
   # something copied it into the toolchain store, which is the mutation this split removes.
   mapfile -t declared_v  < <(grep -oP '\$\{kernels_dir\}/\K[A-Za-z0-9_./]+\.cc' "$mkpath" | sort -u)
-  mapfile -t declared_rb < <(grep -oP '\$\{rb_kernels_dir\}/\K[A-Za-z0-9_./]+\.cc' "$mkpath" | sort -u)
+  mapfile -t declared_rb < <(grep -oP '\$\{lib_kernels_dir\}/\K[A-Za-z0-9_./]+\.cc' "$mkpath" | sort -u)
   if [ $(( ${#declared_v[@]} + ${#declared_rb[@]} )) -eq 0 ]; then
-    echo "[verify_kernel_source] FAIL: $mk declares no \${kernels_dir}/*.cc or \${rb_kernels_dir}/*.cc prerequisite -- Makefile shape changed, nothing to verify against" >&2
+    echo "[verify_kernel_source] FAIL: $mk declares no \${kernels_dir}/*.cc or \${lib_kernels_dir}/*.cc prerequisite -- Makefile shape changed, nothing to verify against" >&2
     fail=1; continue
   fi
   if [ ${#declared_rb[@]} -gt 0 ]; then
     if [ -z "$rbdir" ]; then
-      echo "[verify_kernel_source] FAIL $mk: names \${rb_kernels_dir} but make resolved it empty -- route_b_override.mk is stale (it must define rb_kernels_dir)." >&2
+      echo "[verify_kernel_source] FAIL $mk: names \${lib_kernels_dir} but make resolved it empty -- design_override.mk is stale (it must define lib_kernels_dir)." >&2
       fail=1; continue
     fi
     if [ "$rbdir" != "$(realpath -m "$RB_KERNELS")" ]; then
-      echo "[verify_kernel_source] FAIL $mk: rb_kernels_dir resolved to
+      echo "[verify_kernel_source] FAIL $mk: lib_kernels_dir resolved to
     $rbdir
-  which is not the tracked route_b kernel tree
+  which is not the tracked our kernel tree
     $(realpath -m "$RB_KERNELS")
   -- our kernels must compile from the tracked tree, not from a copy." >&2
       fail=1; continue
@@ -296,7 +296,7 @@ $(_peano_remedy)" >&2
   [ ${#declared_v[@]}  -gt 0 ] && mapfile -t srcs_v  < <(include_closure "$kdir"  "${declared_v[@]}")
   [ ${#declared_rb[@]} -gt 0 ] && mapfile -t srcs_rb < <(include_closure "$rbdir" "${declared_rb[@]}")
 
-  for entry in "${srcs_v[@]/#/vendor:}" "${srcs_rb[@]/#/route_b:}"; do
+  for entry in "${srcs_v[@]/#/vendor:}" "${srcs_rb[@]/#/lib:}"; do
     class="${entry%%:*}"; f="${entry#*:}"
     checked=$((checked + 1))
     if [ "$class" = vendor ]; then dir="$kdir"; else dir="$rbdir"; fi
@@ -307,17 +307,17 @@ $(_peano_remedy)" >&2
     fi
     got_hash="$(sha256sum "$resolved" | cut -d' ' -f1)"
 
-    if [ "$class" = route_b ]; then
+    if [ "$class" = lib ]; then
       truth="$RB_KERNELS/$f"
       if [ ! -f "$truth" ]; then
-        echo "[verify_kernel_source] FAIL $mk: $f -- declared through \${rb_kernels_dir} but absent from the tracked tree $RB_KERNELS" >&2
+        echo "[verify_kernel_source] FAIL $mk: $f -- declared through \${lib_kernels_dir} but absent from the tracked tree $RB_KERNELS" >&2
         fail=1; continue
       fi
     else
       if [ -f "$RB_KERNELS/$f" ]; then
         echo "[verify_kernel_source] FAIL $mk: $f is OURS ($RB_KERNELS/$f) but is declared through \${kernels_dir}
   -- it can only resolve there if something copied it into the pinned toolchain store. Declare it
-  through \${rb_kernels_dir} instead." >&2
+  through \${lib_kernels_dir} instead." >&2
         fail=1; continue
       fi
       truth="$inst/src/aie_kernels/aie2p/$f"

@@ -56,7 +56,7 @@ pub use schedule::{decode_schedule, Brick};
 
 /// On-NPU decode routing (host driver + per-token protocol) for the fused decode ELF. Gated behind the
 /// `npu` feature: the routing STRUCTURE + schedule compile CPU-only (no XRT); the device backend is
-/// wired in by the execution agent. See `route_b_kernels/decode_fused/gen_gemma_decode.py`.
+/// wired in by the execution agent. See `designs/decode_fused/gen_gemma_decode.py`.
 #[cfg(feature = "npu")]
 pub mod npu;
 

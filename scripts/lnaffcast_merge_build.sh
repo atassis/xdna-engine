@@ -47,7 +47,7 @@ log "======== lnaffcast merge build (encoder resident geometry)  $(date -Is) ===
 log "instance: $MLIR_AIE_INSTANCE (pin $pin)"
 
 bash "$WT/scripts/sync_kernels.sh" >>"$LOG" 2>&1
-log "[sync] sandbox refreshed; our kernels compile from route_b_kernels/aie_kernels"
+log "[sync] sandbox refreshed; our kernels compile from aie_kernels"
 
 # Exactly the shipped resident's parameters (build_parakeet_modal_kernels.sh, "RESIDENT-FFN: fc1
 # bf16-out + panel-major drain"). Nothing here is a research setting.

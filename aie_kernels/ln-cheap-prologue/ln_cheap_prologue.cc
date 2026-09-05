@@ -17,7 +17,7 @@
 // can NOT arrive on a 3rd channel. They ride IN-BAND on the A stream: the generator prepends ONE
 // stats "k-block" that the core peels into core-local mu[PRO_M]/inv[PRO_M] buffers (ln_cheap_load),
 // then normalizes k-blocks 1..K/k with ln_cheap_apply. mu MUST be f32-precise (delivering mu in bf16
-// re-introduces the |mean|-scaled cancellation -- see route_b_kernels/ctx_ln/ln_cheap_study.py, table
+// re-introduces the |mean|-scaled cancellation -- see designs/ctx_ln/ln_cheap_study.py, table
 // A2: bf16-mean K-aug hits rel 16.6). Deliver mu as double-bf16 (mu_hi+mu_lo two-sum) or reinterpret
 // f32 bytes; inv tolerates bf16 (it scales the already-centered O(std) residual).
 //

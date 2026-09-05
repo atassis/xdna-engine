@@ -1,36 +1,36 @@
 #!/usr/bin/env bash
 # Copy our canonical custom kernels/designs FORWARD into the mlir-aie build sandbox.
 #
-# DIRECTION MATTERS: route_b_kernels/ (tracked, real source files) is the SINGLE
+# DIRECTION MATTERS: designs/ (tracked, real source files) is the SINGLE
 # SOURCE OF TRUTH. mlir-aie/ is a gitignored, disposable build sandbox. This copies
 # repo -> sandbox (one-directional), so there is no drift: you ALWAYS edit
-# route_b_kernels/, NEVER the mlir-aie copy (it's just a build input, recreated here).
+# designs/, NEVER the mlir-aie copy (it's just a build input, recreated here).
 # Real files (not symlinks) so mlir-aie's relative-path Makefiles/includes work.
-# Idempotent; called by setup_route_b.sh and build_kernels.sh.
+# Idempotent; called by setup_kernel_env.sh and build_kernels.sh.
 set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"; cd "$REPO"
-RB=route_b_kernels
-# Kernels moved out of route_b_kernels/ into the top-level library; designs still live under $RB.
+RB=designs
+# Kernels moved out of designs/ into the top-level library; designs still live under $RB.
 AK=aie_kernels
 # Target mlir-aie root: default = the submodule (back-compat); pass an arg to overlay a clean fork-branch
-# checkout instead (Phase-2 policy B -- kernels stay route_b-authored, synced into the build source).
+# checkout instead (Phase-2 policy B -- kernels stay authored in this tree, synced into the build source).
 AIEROOT="${1:-mlir-aie}"
 PE=$AIEROOT/programming_examples
 MM=$PE/basic/matrix_multiplication
 K=$AIEROOT/aie_kernels/aie2p
 
-[ -d "$AIEROOT" ] || { echo "$AIEROOT not present — run scripts/setup_route_b.sh first" >&2; exit 1; }
+[ -d "$AIEROOT" ] || { echo "$AIEROOT not present — run scripts/setup_kernel_env.sh first" >&2; exit 1; }
 
 # NEVER the toolchain instance. The store under .cache/instances/<key> is content-addressed: its key
 # says which MLIR_AIE_FORK_COMMIT it is, and verify_kernel_source.sh reads vendor ground truth out of
 # it. Overlaying our kernels there made it 43 entries dirty against its own commit, so the gate's
-# reference was the mutated tree. Our kernels compile from route_b_kernels/aie_kernels now
-# (rb_kernels_dir in route_b_override.mk); nothing needs to be written into the store.
+# reference was the mutated tree. Our kernels compile from aie_kernels now
+# (lib_kernels_dir in design_override.mk); nothing needs to be written into the store.
 case "$(cd "$AIEROOT" 2>/dev/null && pwd)" in
   */.cache/instances/*)
     echo "sync_kernels: refusing to write into the toolchain instance store ($AIEROOT).
-  It is content-addressed and read as ground truth. Build from route_b_kernels/aie_kernels via
-  rb_kernels_dir instead." >&2
+  It is content-addressed and read as ground truth. Build from aie_kernels via
+  lib_kernels_dir instead." >&2
     exit 2 ;;
 esac
 # Copy only when the CONTENT differs.
@@ -39,7 +39,7 @@ esac
 # make rule that depends on a synced source -- `build/mm_*.o: ${kernels_dir}/mm.cc`, the generator
 # .py behind each .mlir -- is then stale on every run, so a build that changed NOTHING recompiles
 # every object and relinks every xclbin. sync_kernels.sh runs before make in build_conv_kernels.sh,
-# build_parakeet_kernels.sh, lnaffcast_merge_build.sh and setup_route_b.sh, so that was every build.
+# build_parakeet_kernels.sh, lnaffcast_merge_build.sh and setup_kernel_env.sh, so that was every build.
 #
 # That unconditional cost is what drove callers to hand-roll `if [ -f "$target" ]; then skip; fi`,
 # and file-existence is not a freshness test -- which is how a 2026-06-29 kernel was still in place
@@ -58,7 +58,7 @@ mkdir -p "$PE/ml/dwconv1d" "$PE/ml/softmax400" "$PE/ml/layernorm" "$PE/ml/relpos
 # not just on its .cc. Copied NEXT TO the Makefiles rather than referenced back into the source tree,
 # so the include path does not depend on how deep the instance nests programming_examples. Without
 # it a .o built by an older pin looks up to date forever, which is how a 06-29 fc1 kernel entered a
-# 09-03 A/B and got a hang blamed on the kernel tile. See route_b_kernels/toolchain_stamp.mk.
+# 09-03 A/B and got a hang blamed on the kernel tile. See designs/toolchain_stamp.mk.
 mkdir -p "$PE/ml/mha_decode"
 mkdir -p "$PE/ml/softmax400" "$PE/ml/silu"
 for _d in layernorm dwconv1d relpos_mha mha_decode softmax400 silu; do
@@ -126,7 +126,7 @@ sync_cp "$RB/relpos_mha/relpos_rowtiled_stream_iron.py" "$PE/ml/relpos_mha/relpo
 sync_cp "$RB/relpos_mha/probe_floor_iron.py"              "$PE/ml/relpos_mha/probe_floor_iron.py"
 sync_cp "$RB/relpos_mha/Makefile"                         "$PE/ml/relpos_mha/Makefile"
 # plain resident whole_array matmul (no epilogue) -- MLIR-emitting generator +
-# Makefile.resident (route_b_override .txt-insts + WA_C_DEPTH flow) for the Parakeet
+# Makefile.resident (design_override .txt-insts + WA_C_DEPTH flow) for the Parakeet
 # resident encoder tiles and the thin-M decode GEMV (build_parakeet/decode_kernels.sh).
 sync_cp "$RB/whole_array_fused/whole_array_iron.py"      "$MM/whole_array/whole_array_iron.py"
 sync_cp "$RB/whole_array_fused/Makefile.resident"        "$MM/whole_array/Makefile.resident"
@@ -213,10 +213,10 @@ sync_cp "$RB/mha_decode/mha_decode.cc"      "$K/mha_decode.cc"
 sync_cp "$RB/mha_decode/mha_decode_iron.py" "$PE/ml/mha_decode/mha_decode_iron.py"
 sync_cp "$RB/mha_decode/Makefile.mha"       "$PE/ml/mha_decode/Makefile.mha"
 
-echo "synced route_b_kernels/ -> $AIEROOT (edit route_b_kernels/, never the sandbox copy)"
+echo "synced designs/ -> $AIEROOT (edit designs/, never the sandbox copy)"
 
-# There used to be a re-exec into $MLIR_AIE_INSTANCE/src here, because route_b_override.mk resolved
+# There used to be a re-exec into $MLIR_AIE_INSTANCE/src here, because design_override.mk resolved
 # OUR kernels through kernels_dir (the instance). That made every caller write into the
 # content-addressed store, so the store stopped being the commit its key names -- and
 # verify_kernel_source.sh reads vendor ground truth from that same store. The Makefiles now name
-# their own kernels through rb_kernels_dir (the tracked tree), so nothing has to be copied there.
+# their own kernels through lib_kernels_dir (the tracked tree), so nothing has to be copied there.

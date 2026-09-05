@@ -596,7 +596,7 @@ struct BufLoc {
 /// per-token patch / scratchpad), so it registers once and dispatches with the bound arena each token.
 /// The GEMV computes `logits[VOCAB_PAD] = (γ⊙proj_out_w).Tᵀ · norm` (vocab-as-M → contiguous vector output,
 /// no whole_array DMA-stride wall); the LN affine-normalize and the `β·W` bias stay on host (cheap). Built
-/// by `route_b_kernels/decode_fused/gen_projout.py` / `scripts/build_projout_elf.sh`.
+/// by `designs/decode_fused/gen_projout.py` / `scripts/build_projout_elf.sh`.
 struct ProjOutElf {
     arena: FusedArena,
     kern: ElfKernel,

@@ -4,7 +4,7 @@ feeding the resident-in-L1 scores->softmax brick.
 
 Drives one head/block of PACKED qk[2T,DK] bf16 (qu = qk[0:T], k = qk[T:2T]) plus
 host-precomputed BD[T,P] f32 through the relpos_ac_scores_softmax_bake IRON design
-(route_b_kernels/relpos_mha, built with STEP=2) on the XDNA2 NPU via pyxrt. The
+(designs/relpos_mha, built with STEP=2) on the XDNA2 NPU via pyxrt. The
 device computes AC = qu @ k^T (bf16 mmul, f32 accumulate) into a RESIDENT L1 f32
 tile, then rel_shift(BD) + scale + vectorized-exp2 softmax -> probs[T,T] bf16. The
 readback is compared to the fp32 host softmax over the f32 qu@k^T + BD.

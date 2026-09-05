@@ -11,7 +11,7 @@
 //! after the V-tile). >0 normal, <0 last non-empty (finalize), 0 empty (skip). No zero-pad
 //! softmax poison.
 //!
-//! Kernel I/O (head-major, streaming/flash — see route_b_kernels/mha_decode/):
+//! Kernel I/O (head-major, streaming/flash — see designs/mha_decode/):
 //!   q   : [12, 64]                       bf16   -> ABI slot 3 (A)
 //!   kv  : [12, n_tiles, 2*TKV*64 + 2]    bf16   -> ABI slot 4 (B)
 //!          (per tile: K-tile (TKV*64) | V-tile (TKV*64) | int32 s_in_tile (2 bf16), TKV=64)

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build ALL NPU xclbins the Rust ASR encoder needs (CPU-only; no NPU required).
-# Idempotent. Run after scripts/setup_route_b.sh. The kernel-object stale-trap
+# Idempotent. Run after scripts/setup_kernel_env.sh. The kernel-object stale-trap
 # (objects named by tile size, not dtype) is handled with explicit `rm` before
 # bf16 builds. See docs/08.
 set -euo pipefail
@@ -17,7 +17,7 @@ done
 
 bash scripts/sync_kernels.sh   # copy canonical custom kernels/designs into the build sandbox
 
-# kernels_dir (route_b_override.mk) resolves into the mlir-aie SUBMODULE, not the pinned
+# kernels_dir (design_override.mk) resolves into the mlir-aie SUBMODULE, not the pinned
 # toolchain instance -- a correctly-bumped toolchain.lock can still compile stale kernel source
 # with no error (see scripts/verify_kernel_source.sh's header). FAIL LOUD before spending a build.
 scripts/verify_kernel_source.sh Makefile.modal Makefile.modal.int8
@@ -70,7 +70,7 @@ done
 # The shipped V2 encoder (two_ctx) runs the WHOLE encoder on ONE resident 768x3072 xclbin via per-N
 # instruction streams (768/1536/3072). The fast kernel/dataflow-2x BFP16_IREE microkernel gives ~2x
 # (n=96 chosen so the resident-stream reuse holds across all served widths). Needs the mlir-aie patch
-# applied (setup_route_b.sh does this: BFP16_IREE microkernel + bfp16_iree flag + WA_C_DEPTH).
+# applied (setup_kernel_env.sh does this: BFP16_IREE microkernel + bfp16_iree flag + WA_C_DEPTH).
 rm -f $MMW/build/mm_64x32x96.o
 for N in 3072 1536 768; do
   rm -f $MMW/build/aie_512x768x${N}_64x32x96_8c.mlir

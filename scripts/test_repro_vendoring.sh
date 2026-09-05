@@ -4,7 +4,7 @@
 #
 # Proves the contract: fresh clone -> `git submodule update --init` resolves the pinned SHA ->
 # the tethered patch applies cleanly -> our kernels sync forward -> build_kernels.sh produces the
-# encoder xclbins. It runs the REAL setup_route_b.sh + build_kernels.sh against a throwaway clone.
+# encoder xclbins. It runs the REAL setup_kernel_env.sh + build_kernels.sh against a throwaway clone.
 #
 # Toolchain is REUSED (the existing .venv-iron is symlinked in), so we do NOT re-download the
 # ~1.8 GB wheels (per the agreed test scope). By default the mlir-aie submodule is mirrored from
@@ -15,7 +15,7 @@ ORIG="$(cd "$(dirname "$0")/.." && pwd)"
 SHA=8373e49165649644f1ec414c2e406c0abbbf51cf
 USE_GITHUB=0; [ "${1:-}" = "--github" ] && USE_GITHUB=1
 
-[ -d "$ORIG/.venv-iron" ] || { echo "FAIL: this test reuses the existing .venv-iron toolchain, which is absent. Run scripts/setup_route_b.sh first." >&2; exit 1; }
+[ -d "$ORIG/.venv-iron" ] || { echo "FAIL: this test reuses the existing .venv-iron toolchain, which is absent. Run scripts/setup_kernel_env.sh first." >&2; exit 1; }
 
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/repro-vendor.XXXXXX")"
 cleanup(){ chmod -R u+w "$TMP" 2>/dev/null || true; rm -rf "$TMP"; }
@@ -45,8 +45,8 @@ fi
 GOT="$(git -C mlir-aie rev-parse HEAD)"
 [ "$GOT" = "$SHA" ] && echo "   OK: submodule at pinned SHA $GOT" || fail "submodule SHA $GOT != pinned $SHA"
 
-echo "== [4/6] run the real setup_route_b.sh (skips venv/wheels/init via guards; applies patch + syncs) =="
-bash scripts/setup_route_b.sh
+echo "== [4/6] run the real setup_kernel_env.sh (skips venv/wheels/init via guards; applies patch + syncs) =="
+bash scripts/setup_kernel_env.sh
 # assert the patch landed on all 3 upstream files
 for f in programming_examples/common.cmake \
          programming_examples/basic/matrix_multiplication/common.h \

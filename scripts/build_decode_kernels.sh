@@ -20,7 +20,7 @@
 # Usage:  scripts/build_decode_kernels.sh [K] [N]   (defaults K=768 N=768)
 set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"; cd "$REPO"
-# Makefile.resident includes route_b_override.mk, so the per-object toolchain stamp already covers
+# Makefile.resident includes design_override.mk, so the per-object toolchain stamp already covers
 # this path; the sandbox backstop is the second layer, added for parity with build_kernels.sh.
 # Sourced AND called -- an imported-but-uncalled guard is what build_partition_ab_probe_kernels.sh
 # had, and it reads as protection that is not there.
@@ -28,7 +28,7 @@ source scripts/kernel_sandbox.sh
 source scripts/iron_env.sh
 bash scripts/sync_kernels.sh >/dev/null   # copy whole_array_iron.py + Makefile.resident into the sandbox
 
-# kernels_dir (route_b_override.mk) resolves into the mlir-aie SUBMODULE, not the pinned toolchain
+# kernels_dir (design_override.mk) resolves into the mlir-aie SUBMODULE, not the pinned toolchain
 # instance -- a correctly-bumped toolchain.lock can still compile stale kernel source with no error
 # (see scripts/verify_kernel_source.sh's header). FAIL LOUD before spending a build. This script
 # builds through Makefile.resident, so that is the family member to gate on; the other three build

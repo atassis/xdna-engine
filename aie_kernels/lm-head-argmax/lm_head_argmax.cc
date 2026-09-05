@@ -19,7 +19,7 @@
 // ---------------------------------------------------------------------------
 // Dataflow (decode, M=1 padded to M_PAD rows; row 0 = the live query, rows
 // 1..M_PAD-1 are zero-padded so the mmul<M,K,N> tile shape is met — same
-// padding convention as route_b_kernels/decode_norm_gemv/norm_gemv_iron.py):
+// padding convention as designs/decode_norm_gemv/norm_gemv_iron.py):
 //
 //   for each VOCAB tile of width N_TILE:
 //     acc = 0                                              (accauto, f32)
@@ -34,7 +34,7 @@
 //
 // The API pattern (aie::mmul<M,K,N,TA,TB,accauto> -> load_v -> acc.mac ->
 // acc.to_vector<Out>()) is copied verbatim from
-// route_b_kernels/ffn_bfp16/repro_847_mmul888_bfp16.cc. The co-produced
+// experiments/ffn_bfp16/repro_847_mmul888_bfp16.cc. The co-produced
 // (value, mask) argmax primitive is aie::max_cmp, whose mask semantics
 // (m[i]==0 -> keep v1[i], m[i]==1 -> take v2[i]) are documented in
 // aie_api/include/aie_api/aie.hpp and mirrored exactly by aie::select, so a

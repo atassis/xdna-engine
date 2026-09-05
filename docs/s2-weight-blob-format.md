@@ -221,7 +221,7 @@ the same source GGUF -- the manifest's `source_gguf.header_sha256` confirms it i
 
 - **No device-side loader or upload path.** This tool produces a blob + manifest on the host
   filesystem. Nothing here mmaps it into device-visible memory, DMAs it onto the NPU, or wires it
-  into `route_b_kernels/` or the engine's dataflow. That is separate, not-yet-built work.
+  into `designs/` or the engine's dataflow. That is separate, not-yet-built work.
 - **No int8/int4 re-quantization.** bf16 is a deliberate, conservative first target -- it is a
   format every matmul kernel in this project already consumes, so a blob in this format is usable
   the moment a loader exists. Re-quantizing to int8/int4 is a real FORMAT-lever option this
@@ -229,4 +229,4 @@ the same source GGUF -- the manifest's `source_gguf.header_sha256` confirms it i
   tensor), but choosing precision per weight matrix is a separate, gated decision with its own
   accuracy-gate work, out of scope here.
 - **No engine integration.** This is a standalone host tool; it does not touch
-  `route_b_kernels/`, `rust/npu-engine/`, or any runtime dataflow.
+  `designs/`, `rust/npu-engine/`, or any runtime dataflow.

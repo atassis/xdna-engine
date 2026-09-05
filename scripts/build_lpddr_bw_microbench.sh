@@ -39,7 +39,7 @@ AIECC="$INST/bin/aiecc"
   exit 1
 }
 
-GEN="$SRC/route_b_kernels/lpddr_bw/lpddr_bw_microbench.py"
+GEN="$SRC/experiments/lpddr_bw/lpddr_bw_microbench.py"
 OUTDIR="${OUTDIR:-$REPO/artifacts/parakeet/lpddr_bw}"; mkdir -p "$OUTDIR"
 WORK="$OUTDIR/build"; mkdir -p "$WORK"
 

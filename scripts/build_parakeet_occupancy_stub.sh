@@ -4,7 +4,7 @@
 #
 # The stub xclbin is byte-identical to the production resident kernel in EVERYTHING
 # (objectFIFO dataflow, BD chains, locks, DMA access patterns) EXCEPT the in-core
-# matmul body, which is elided (route_b_kernels/occupancy/mm_movement_stub.cc). The
+# matmul body, which is elided (experiments/occupancy/mm_movement_stub.cc). The
 # A/B latency diff (full - stub) isolates per-dispatch COMPUTE from movement+stall.
 #
 # Recipe (swap-and-restore so the production tree is never left modified):
@@ -71,7 +71,7 @@ echo "[stub] compiling mm_movement_stub.cc -> $MMO ($TILE) ..."
 # include path). $MAD/include supplies aie_api; the repo's mlir-aie/ supplies aie_kernels.
 "$PEANO_INSTALL_DIR/bin/clang++" -O2 -std=c++20 --target=aie2p-none-unknown-elf -DNDEBUG \
   -I "$MAD/include" -I "$REPO/mlir-aie" -Dbf16_f32_ONLY -DDIM_M=$m -DDIM_K=$k -DDIM_N=$n -DVECTORIZED_ONLY $MMDEF \
-  -c route_b_kernels/occupancy/mm_movement_stub.cc -o "$MMO"
+  -c experiments/occupancy/mm_movement_stub.cc -o "$MMO"
 touch "$MMO"  # newer than mm.cc so make won't rebuild from the real source
 
 # 3. relink the N=4096 resident xclbin with the stub object, save as _STUB.

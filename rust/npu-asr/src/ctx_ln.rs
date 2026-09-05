@@ -1,7 +1,7 @@
 //! ctxLN — encoder LayerNorm on the NPU array (Step D, internal notes §4).
 //!
 //! A standalone resident xclbin (the `ml/layernorm` design rebuilt f32 + the `ln_2pass` f32
-//! two-pass kernel — route_b_kernels/ctx_ln/), loaded ONCE, dispatched per LN call. It computes
+//! two-pass kernel — designs/ctx_ln/), loaded ONCE, dispatched per LN call. It computes
 //! the NORMALIZE-ONLY part `(x - mean) / sqrt(var + eps)` per row over the 768 channels, f32 in /
 //! f32 out (docs/05 "never re-expand"); the affine γ,β is applied on the host by the caller for the
 //! 4 affine LN sites (cheap, exact). This is design D-i: a SEPARATE small xclbin co-resident with

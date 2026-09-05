@@ -35,7 +35,7 @@ VENV_IRON="${VENV_IRON:-$REPO/.venv-iron}"
 [ -x "$VENV_IRON/bin/python" ] || { echo "ERROR: $VENV_IRON/bin/python missing" >&2; exit 1; }
 [ -d "$IRON_DIR/iron" ]        || { echo "ERROR: amd/IRON not at $IRON_DIR" >&2; exit 1; }
 
-GEN="$REPO/route_b_kernels/decode_fused/gen_encoder_mha.py"
+GEN="$REPO/designs/decode_fused/gen_encoder_mha.py"
 [ -f "$GEN" ] || { echo "ERROR: generator missing: $GEN" >&2; exit 1; }
 
 # The two identities that decide what the object IS, captured BEFORE the build so a failed build
@@ -49,10 +49,10 @@ export PATH="$VENV_IRON/bin:$VENV_IRON/cc-shim:${AIEBU_ASM_DIR:-}:$PATH"
 export PEANO_INSTALL_DIR="$VENV_IRON/lib/python3.14/site-packages/llvm-aie"
 # The generator's own directory must be importable (newstack_compat) even though we do NOT run from
 # there -- see WORK below. STATIC_DESIGN resolves via __file__, so it needs no cwd.
-export PYTHONPATH="$IRON_DIR:$REPO/route_b_kernels/decode_fused${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH="$IRON_DIR:$REPO/designs/decode_fused${PYTHONPATH:+:$PYTHONPATH}"
 
 # PER-BUILD build_dir, and this is load-bearing. iron's AIEContext() takes build_dir from $(cwd)/build.
-# Running every arm from route_b_kernels/decode_fused makes them all share ONE long-lived cache, and
+# Running every arm from designs/decode_fused makes them all share ONE long-lived cache, and
 # the cache returns the PREVIOUS artifact byte-identically -- measured 2026-09-03 while writing this
 # script: four --pipelines values (4/6/8/10) produced the same md5 and emitted no MLIR. That is
 # a cache hit masquerading as a build, and it would make this script certify provenance it had not

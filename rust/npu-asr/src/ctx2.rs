@@ -1357,7 +1357,7 @@ impl FfnMm2 {
     /// happens (the resident kernel outputs f32, and an fc2 K-split column-slice of a `[mp, NA]`
     /// row-major buffer is strided, not a contiguous device sub-tensor). Eliminating that readback
     /// entirely -- a TRUE on-device fc1->fc2 hand-off -- needs the fused fc1->GELU->fc2 kernel
-    /// (route_b `cascade_ffn`, an on-chip K=3072 reduction), which is NPU/kernel work, not host
+    /// (`designs/cascade_ffn`, an on-chip K=3072 reduction), which is NPU/kernel work, not host
     /// plumbing. This draft is the maximal host-resident form on the current f32-out kernel ABI.
     pub fn forward_resident(&self, mm1: &CtxAOp, x: &Array2<f32>) -> Array2<f32> {
         // int8 (or any int8 ctx) is out of scope for the draft -> host-mediated fallback (exact).

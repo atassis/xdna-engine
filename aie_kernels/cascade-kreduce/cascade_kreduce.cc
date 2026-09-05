@@ -15,7 +15,7 @@
 //   (gemm-int8 / gemm-bfp16-ebs8 bricks in this same dir; the systolic-tile
 //   skeleton) + "aie::mmul + cascade put/get" per the task's brick spec.
 //
-// MODEL STUDIED FIRST: route_b_kernels/cascade_ffn/ (STRUCTURE.md +
+// MODEL STUDIED FIRST: designs/cascade_ffn/ (STRUCTURE.md +
 // mv_bf16_gelu.cc). Two things carry over from that model and one does NOT:
 //   - carries over: the HEAD/MIDDLE/TAIL cascade role split, residual
 //     injected at HEAD, truncate-to-bf16 only at TAIL (matvec_cascade_add.py

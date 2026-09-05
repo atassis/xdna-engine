@@ -168,7 +168,7 @@ echo "[toolchain_up] building instance $LOCKHASH ..." >&2
 # configure-time hard requirements -- cmake FATAL_ERRORs without them.
 "$REPO/.venv-iron/bin/python" -m pip install -q "nanobind==$NANOBIND" pybind11
 mkdir -p "$INST"
-# Source = a CLEAN checkout of the fork integration-branch commit (NO dirty working tree); the route_b kernels
+# Source = a CLEAN checkout of the fork integration-branch commit (NO dirty working tree); the our kernels
 # are overlaid by sync_kernels (policy B). The prebuilt MLIR distro + cmake helpers come from the submodule.
 SRC="$INST/src"
 if [ ! -e "$SRC/tools/aiecc/aiecc.cpp" ]; then

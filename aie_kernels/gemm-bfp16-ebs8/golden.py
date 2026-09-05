@@ -22,7 +22,7 @@ Datapath being modeled (per-8x8-tile, matches the on-chip kernel):
   4. Result is cast back to bf16 for the resident stream contract's C output.
 
 This is the SAME bfp16ebs8 block-float quantization model already validated
-in route_b_kernels/ffn_bfp16/golden_ffn_gemm.py (that script predicted the
+in experiments/ffn_bfp16/golden_ffn_gemm.py (that script predicted the
 rel-L2 a bfp16 mmul WOULD achieve once #847 is fixed); this brick's kernel
 uses bfp16ebs8 directly (not the bf16-emulated-via-#847-macro path), so this
 golden is the DIRECT host reference for the on-device rel-L2 gate, not just

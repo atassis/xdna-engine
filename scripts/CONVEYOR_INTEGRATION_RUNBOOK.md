@@ -7,7 +7,7 @@ packing, and the opt-in `PARAKEET_CONVEYOR_MHA` wiring. What remains is device-g
 the dispatch wiring inside the TODO stub, and the WER/timing gate) and was deliberately NOT run here
 because another human was using the box.
 
-Paths are relative to the repo root (the checkout holding `scripts/`, `route_b_kernels/`, `artifacts/`).
+Paths are relative to the repo root (the checkout holding `scripts/`, `designs/`, `artifacts/`).
 `PY` below = the numpy/onnx venv, e.g. `~/npuvox-asr-bench/.venv/bin/python`.
 
 ## 0. Device hygiene preamble (EVERY on-device run)

@@ -3,7 +3,7 @@
 
 Runs the dwconv1d_k9_bf16 IRON design (C=1024, T=400, KW=16) on the XDNA2 NPU
 via pyxrt and compares the readback against the fp32 host reference from
-route_b_kernels/dwconv1d/golden_dwconv1d_k9.py (the Parakeet ConvModule depthwise
+designs/dwconv1d/golden_dwconv1d_k9.py (the Parakeet ConvModule depthwise
 conv: out[c,t] = sum_{j=0..8} dw[c,j]*pad(x)[c,t+j] + bias[c]).
 
 Gate: rel-L2 <= 0.08 AND corr >= 0.99 vs the fp32 golden.

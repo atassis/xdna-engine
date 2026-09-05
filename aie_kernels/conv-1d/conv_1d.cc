@@ -68,7 +68,7 @@ static inline void conv_1d_causal_core(const float *restrict x, const float *res
 // never a multiple of N, so a naive aligned-output/misaligned-input load would issue an unaligned
 // load_v. On this toolchain that SNAPS to the aligned base and silently returns the wrong data
 // instead of erroring (the same failure dwconv1d_shift's header records for its own FIR window,
-// route_b_kernels/dwconv1d/dwconv1d.cc) -- so every load_v here is on an N-aligned address, and the
+// designs/dwconv1d/dwconv1d.cc) -- so every load_v here is on an N-aligned address, and the
 // misaligned window is built in-register with shuffle_down_fill, exactly that kernel's technique.
 //
 // dwconv1d_shift affords a padded scratch buffer because T/K/P are compile-time there; this core

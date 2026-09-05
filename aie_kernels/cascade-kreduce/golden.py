@@ -16,7 +16,7 @@ matching the HEAD/MIDDLE/TAIL role split in cascade_kreduce.cc:
 
 r is an optional residual/bias injected at the HEAD (all-zero if the op-type
 instance being scheduled has none to fuse in -- matches matvec_cascade_add.py's
-"R injected at HEAD" convention studied from route_b_kernels/cascade_ffn/
+"R injected at HEAD" convention studied from designs/cascade_ffn/
 STRUCTURE.md section A.2).
 
 Precision note: this is a bf16 brick (bf16 in, fp32-accumulate per-core via

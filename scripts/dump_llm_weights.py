@@ -16,7 +16,7 @@ import sys
 import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                "..", "route_b_kernels", "decode_fused"))
+                                "..", "designs", "decode_fused"))
 from llm_decode_spec import SPECS  # noqa: E402
 
 HF_REPO = {"qwen3-0.6b": "Qwen/Qwen3-0.6B", "gemma3-270m": "unsloth/gemma-3-270m-it"}

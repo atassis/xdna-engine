@@ -12,7 +12,7 @@
 // workaround-in-place (toolchain-bug-test-latest-before-workaround KB stance).
 //
 // API pattern studied from:
-//   - route_b_kernels/ffn_bfp16/repro_847_mmul888_bfp16.cc (mmul<M,K,N,TA,TB,
+//   - experiments/ffn_bfp16/repro_847_mmul888_bfp16.cc (mmul<M,K,N,TA,TB,
 //     accauto> -> load_v -> acc.mul/mac -> acc.to_vector<Out>() shape).
 //   - aie_kernels/gemm-int8/gemm_int8.cc (sibling brick, same group/style; int8x
 //     int8 uses a 2-arg mac(A,B) because that specialization (mmul_8_8) infers

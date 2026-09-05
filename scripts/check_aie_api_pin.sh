@@ -2,7 +2,7 @@
 # Are the aie_api headers kernels COMPILE against the ones toolchain.lock PINS?
 #
 # They are not, and that is the point of this check. `toolchain_up.sh:_link_include_dirs` symlinks
-# `$INST/build/include/aie_api` at the mlir_aie WHEEL (`setup_route_b.sh` hardcodes its version),
+# `$INST/build/include/aie_api` at the mlir_aie WHEEL (`setup_kernel_env.sh` hardcodes its version),
 # while `toolchain.lock` pins `mlir-aie/third_party/aie_api` through MLIR_AIE_FORK_COMMIT. Those two
 # are structurally decoupled: bumping the fork commit moves the pinned headers and leaves the linked
 # ones exactly where they were, with no error and a green lock.

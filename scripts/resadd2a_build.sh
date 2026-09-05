@@ -46,7 +46,7 @@ log "instance: $MLIR_AIE_INSTANCE (pin $pin)"
 # kernels_dir resolves against the INSTANCE src tree, so the .cc has to be overlaid there or the
 # build compiles the instance's own copy.
 bash "$WT/scripts/sync_kernels.sh" >>"$LOG" 2>&1
-log "[sync] sandbox refreshed; our kernels compile from route_b_kernels/aie_kernels"
+log "[sync] sandbox refreshed; our kernels compile from aie_kernels"
 
 BASE=512x1024x1024_64x32x128_8c_modalidkrtpkrl
 # The arm on record: one pass per (a, b) pair, the vfile detour off, scale*b on the bf16 datapath.

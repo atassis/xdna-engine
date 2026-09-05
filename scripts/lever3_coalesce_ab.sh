@@ -35,7 +35,7 @@ WT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$WT"
 . "$WT/scripts/amd_paths.sh"   # -> IRON_DIR (relocatable; env-overridable)
 IRON="${IRON:-$IRON_DIR}"
-TPATCH="$WT/route_b_kernels/patches/iron-transpose-num-batches.patch"  # lever-3 transpose num_batches
+TPATCH="$WT/patches/iron-transpose-num-batches.patch"  # lever-3 transpose num_batches
 LDLIB=~/.local/lib/npu-asr
 W3="$WT/rust/target/release/whisper_e2e_timing"
 SERVE="$WT/rust/target/release/engine_serve"

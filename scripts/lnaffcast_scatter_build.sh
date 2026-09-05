@@ -44,7 +44,7 @@ log "instance: $MLIR_AIE_INSTANCE (pin $pin)"
 # kernels_dir resolves against the INSTANCE src tree, not this repo, so the .cc has to be
 # overlaid there or the build compiles the instance's own older copy.
 bash "$WT/scripts/sync_kernels.sh" >>"$LOG" 2>&1
-log "[sync] sandbox refreshed; our kernels compile from route_b_kernels/aie_kernels"
+log "[sync] sandbox refreshed; our kernels compile from aie_kernels"
 
 BASE=512x1024x1024_32x32x128_8c_modalidbf16outkrtpkrl
 # 1 = the whole write pass narrowed to t lanes; 2 = arithmetic left at 16 lanes, only the store

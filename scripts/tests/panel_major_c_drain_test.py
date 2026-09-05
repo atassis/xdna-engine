@@ -21,7 +21,7 @@ import sys
 import numpy as np
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.insert(0, os.path.join(REPO, "route_b_kernels", "whole_array_fused"))
+sys.path.insert(0, os.path.join(REPO, "designs", "whole_array_fused"))
 
 import whole_array_modal_iron as G  # noqa: E402
 

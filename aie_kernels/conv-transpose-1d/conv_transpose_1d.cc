@@ -49,7 +49,7 @@ inline void conv_transpose_1d_core(const float *restrict x, const float *restric
 }
 
 // VECTORISED form of ONE OUTPUT CHANNEL of a transposed conv -- the granularity
-// route_b_kernels/codec_block/conv_transpose_channel.cc's scalar `conv_transpose_channel_core`
+// designs/codec_block/conv_transpose_channel.cc's scalar `conv_transpose_channel_core`
 // already runs at (that is what window_driver.py and quantizer_driver.py actually dispatch; this
 // brick's own `conv_transpose_1d_core` above is multi-channel and used only by this file's own
 // oneshot gate). Kept in THIS file rather than added to conv_transpose_channel.cc: that file's own

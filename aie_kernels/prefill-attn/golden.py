@@ -3,7 +3,7 @@
 the S2 AR fast decoder's short prefill sequence (M = fast_context_length <= 11).
 
 ORACLE (scripts/s2_ar_ref.py, loaded by path below so its @dataclass machinery resolves via
-sys.modules -- same pattern route_b_kernels/mha_decode/golden_hd128.py uses, for the same reason):
+sys.modules -- same pattern designs/mha_decode/golden_hd128.py uses, for the same reason):
   * `causal_attention(q, k, v, scale)` (~line 582): q (n_tokens,n_head,head_dim); k,v
     (n_tokens,n_head,head_dim) ALREADY GQA-expanded to n_head. n_past=0 causal mask (query i
     attends keys 0..i, `np.triu(-inf, k=1)` additive mask). Returns (n_tokens,n_head,head_dim).
@@ -67,13 +67,13 @@ _bf16 = ml_dtypes.bfloat16
 def _load_s2_ar_ref():
     """importlib-load scripts/s2_ar_ref.py by path, registering it in sys.modules first --
     required because it uses @dataclass, whose machinery looks the defining class up via
-    sys.modules[cls.__module__] (same pattern as route_b_kernels/mha_decode/golden_hd128.py and
+    sys.modules[cls.__module__] (same pattern as designs/mha_decode/golden_hd128.py and
     aie_kernels/rope-interleaved/golden.py)."""
     import importlib.util
     import sys
 
-    # this file -> prefill-attn -> bricks -> route_b_kernels -> repo root: 3 parents up.
-    repo = Path(__file__).resolve().parents[3]
+    # this file -> prefill-attn -> aie_kernels -> repo root: 2 parents up.
+    repo = Path(__file__).resolve().parents[2]
     path = repo / "scripts" / "s2_ar_ref.py"
     spec = importlib.util.spec_from_file_location("s2_ar_ref", path)
     mod = importlib.util.module_from_spec(spec)
@@ -400,7 +400,7 @@ def _load_codec_quantizer_ref():
     import importlib.util
     import sys
 
-    repo = Path(__file__).resolve().parents[3]
+    repo = Path(__file__).resolve().parents[2]
     path = repo / "scripts" / "codec_quantizer_ref.py"
     spec = importlib.util.spec_from_file_location("codec_quantizer_ref", path)
     mod = importlib.util.module_from_spec(spec)

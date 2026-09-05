@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build a decoder-LLM fused decode ELF from an LlmSpec (route_b_kernels/decode_fused/gen_llm_decode.py).
+# Build a decoder-LLM fused decode ELF from an LlmSpec (designs/decode_fused/gen_llm_decode.py).
 # Compile-only, no NPU needed.
 #
 #   bash scripts/build_llm_decode.sh <spec> [LAYERS] [OUT_DIR]
@@ -21,7 +21,7 @@ VENV_IRON="${VENV_IRON:-$REPO/.venv-iron}"
 . "$REPO/scripts/amd_paths.sh"        # -> IRON_DIR, AIEBU_ASM_DIR (relocatable; env-overridable)
 IRON="${IRON:-$IRON_DIR}"
 WEIGHTS="${WEIGHTS:-$REPO/artifacts/$SPEC/weights}"
-GEN="$REPO/route_b_kernels/decode_fused/gen_llm_decode.py"
+GEN="$REPO/designs/decode_fused/gen_llm_decode.py"
 
 [ -x "$VENV_IRON/bin/python" ] || { echo "ERROR: no iron venv at $VENV_IRON"; exit 1; }
 # Gate on the API SURFACE gen_llm_decode.py imports, not a branch name or a worktree path. This

@@ -4,11 +4,11 @@
 # vendor/ is gitignored, so a from-scratch checkout has NO wheelhouse. This script reconstructs the
 # one wheel that is not reliably fetchable from the network find-links indexes -- mlir_aie -- by
 # repacking its already-unpacked tree from ~/.cache/uv/archive-v0 into a proper cp314 wheel.
-# scripts/setup_route_b.sh auto-invokes this when the wheel is missing. Idempotent: a fresh repack
+# scripts/setup_kernel_env.sh auto-invokes this when the wheel is missing. Idempotent: a fresh repack
 # each run (cheap, deterministic; overwrites any prior wheel of the same version).
 #
 # NOTE: the llvm-aie/Peano wheel is deliberately NOT handled here -- its cp310 tag cannot install into
-# the py3.14 venv, so setup_route_b.sh provides it by copying the unpacked archive tree straight into
+# the py3.14 venv, so setup_kernel_env.sh provides it by copying the unpacked archive tree straight into
 # site-packages, never via a wheel.
 set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"

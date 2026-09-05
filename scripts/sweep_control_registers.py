@@ -88,7 +88,7 @@ def main():
     args = ap.parse_args()
 
     roots = args.roots or [
-        os.path.join(REPO, "route_b_kernels"),
+        os.path.join(REPO, "designs"),
         os.path.join(REPO, "mlir-aie", "aie_kernels"),
     ]
     roots = [r for r in roots if os.path.isdir(r)]
