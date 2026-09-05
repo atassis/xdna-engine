@@ -11,7 +11,7 @@
 //   via rust/npu-probes/src/bin/mha_decode_probe.rs, gate rel-L2 <= 0.08.
 // S2 fast decoder (new, -DMHA_HD=128 -DMHA_TKV=32): head_dim HD=128, n_head=32, n_head_kv=8
 //   (n_rep=4). Validated against `scripts/s2_ar_ref.py::causal_attention` + `repeat_kv` via
-//   route_b_kernels/bricks/_verify/verify_mha_decode_hd128.py, gate rel-L2 <= 3e-2.
+//   aie_kernels/_test/verify_mha_decode_hd128.py, gate rel-L2 <= 3e-2.
 //
 // STREAMING / FLASH design (forced by L1 capacity): a single compute tile has only ~64 KB data
 // memory and 2 input DMA channels. The full per-head K+V does not fit, let alone all heads. So K/V
@@ -87,7 +87,7 @@
 // (MHA_TKV, default 64); both are compile-time constants, never a runtime branch -- this is an
 // M=1 kernel where dispatch overhead dominates, so a shape check in the per-key inner loop would
 // be a straight regression. mha_tile_impl is templated on <Hd, Tkv> (the `template<int N>` shape
-// this codebase uses, e.g. route_b_kernels/bricks/sin/sin.cc) rather than `static inline`d: an
+// this codebase uses, e.g. aie_kernels/sin/sin.cc) rather than `static inline`d: an
 // identical body behind a plain `static inline` helper returned NaN on this target in an earlier
 // kernel, and the fix that is proven safe here is exactly this shape -- the real work stays
 // directly in the function bound (via one concrete instantiation) to the extern "C" symbol.

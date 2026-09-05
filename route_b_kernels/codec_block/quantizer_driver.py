@@ -45,7 +45,7 @@ FIVE OP-FAMILIES, FIVE DISPATCH SHAPES -- know which one an op is before reading
      buffer that DOUBLES as online-softmax state, plus a per-call compile-time-literal chunk_idx) fits
      none of bricklib's generic builders (`_check_symbol_arity` wants exactly `n_buffers` pointer
      params, no scalar, no read-write resident). `_flash_design` below is `_build_flash_design` from
-     route_b_kernels/bricks/_verify/verify_prefill_attn.py, adapted only to be MEMOIZED (that script
+     aie_kernels/_test/verify_prefill_attn.py, adapted only to be MEMOIZED (that script
      builds once per test case; this driver reuses one compiled design across all 16 heads x 8 layers
      for a given T, since the compiled program depends on (t_tokens, n_chunks, hd) only, never on
      which head/layer is being run).

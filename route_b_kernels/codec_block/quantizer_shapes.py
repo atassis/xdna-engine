@@ -246,7 +246,7 @@ def gather_n_tiles(t_seq, t_tile=GATHER_T_TILE):
 
 # ---- rope-interleaved: ONE-SHOT kernel (whole [M,D] resident in one call), so M itself must be
 # chunked to fit L1 -- unlike the streamed rail above, there is no on-device loop to hide behind.
-# ROPE_M=32 reuses the EXACT shape route_b_kernels/bricks/_verify/verify_rope_interleaved.py
+# ROPE_M=32 reuses the EXACT shape aie_kernels/_test/verify_rope_interleaved.py
 # already gates green (D=ROT=64, M=32) rather than deriving a new (untested) chunk size.
 
 ROPE_M = 32

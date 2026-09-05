@@ -10,6 +10,8 @@
 set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"; cd "$REPO"
 RB=route_b_kernels
+# Kernels moved out of route_b_kernels/ into the top-level library; designs still live under $RB.
+AK=aie_kernels
 # Target mlir-aie root: default = the submodule (back-compat); pass an arg to overlay a clean fork-branch
 # checkout instead (Phase-2 policy B -- kernels stay route_b-authored, synced into the build source).
 AIEROOT="${1:-mlir-aie}"
@@ -93,15 +95,15 @@ sync_cp "$RB/dwconv1d/Makefile.dwsilu_t"          "$PE/ml/dwconv1d/Makefile.dwsi
 # on-chip COMPUTE-tile transpose brick (conv step 3b enabler): element transpose in-core
 # (transpose_tile.cc), shim DMA does only contiguous read + unit-inner-stride scatter --
 # AVOIDS the transposing n-D DMA that hangs when co-resident (blocker npu.rs:740).
-sync_cp "$RB/aie_kernels/transpose_tile.cc"  "$K/transpose_tile.cc"
+sync_cp "$AK/transpose-tile/transpose_tile.cc"  "$K/transpose_tile.cc"
 sync_cp "$RB/dwconv1d/transpose_iron.py"     "$PE/ml/dwconv1d/transpose_iron.py"
 sync_cp "$RB/dwconv1d/Makefile.transpose"    "$PE/ml/dwconv1d/Makefile.transpose"
 # fused bias+SiLU / narrow epilogue kernel (docs/10)
-sync_cp "$RB/aie_kernels/mm_silu_epilogue.cc" "$K/mm_silu_epilogue.cc"
+sync_cp "$AK/mm-silu-epilogue/mm_silu_epilogue.cc" "$K/mm_silu_epilogue.cc"
 # lnaffcast as a MODE of the modal GEMM: its own object, because AIEAssignCoreLinkFiles
 # traces only direct func.call edges from the core.
-sync_cp "$RB/aie_kernels/mm_mode_lnaffcast.cc" "$K/mm_mode_lnaffcast.cc"
-sync_cp "$RB/aie_kernels/mm_mode_resadd2a.cc" "$K/mm_mode_resadd2a.cc"
+sync_cp "$AK/mm-mode-lnaffcast/mm_mode_lnaffcast.cc" "$K/mm_mode_lnaffcast.cc"
+sync_cp "$AK/mm-mode-resadd2a/mm_mode_resadd2a.cc" "$K/mm_mode_resadd2a.cc"
 # softmax-400 (pad->416) example
 sync_cp "$RB/softmax400/softmax400.py" "$PE/ml/softmax400/softmax400.py"
 sync_cp "$RB/softmax400/Makefile"      "$PE/ml/softmax400/Makefile"
@@ -143,34 +145,34 @@ sync_cp "$RB/ffn_gemm2/Makefile.ffn"      "$MM/single_core/Makefile.ffn"
 sync_cp "$RB/m_stationary/m_stationary_iron.py" "$MM/whole_array/m_stationary_iron.py"
 sync_cp "$RB/m_stationary/Makefile.mstat"       "$MM/whole_array/Makefile.mstat"
 # M-stationary GEMM + fused LayerNorm epilogue (Phase 1.2 spike) — bin/mstat_ln_probe.rs
-sync_cp "$RB/aie_kernels/mm_ln_epilogue.cc"         "$K/mm_ln_epilogue.cc"
+sync_cp "$AK/mm-ln-epilogue/mm_ln_epilogue.cc"         "$K/mm_ln_epilogue.cc"
 sync_cp "$RB/m_stationary/m_stationary_ln_iron.py"  "$MM/whole_array/m_stationary_ln_iron.py"
 sync_cp "$RB/m_stationary/Makefile.mstatln"         "$MM/whole_array/Makefile.mstatln"
 # ctxLN — encoder LayerNorm on the NPU (Step D, internal notes): f32 two-pass kernel + design
-sync_cp "$RB/aie_kernels/ln_2pass.cc"     "$K/ln_2pass.cc"
+sync_cp "$AK/ln-2pass/ln_2pass.cc"     "$K/ln_2pass.cc"
 sync_cp "$RB/ctx_ln/ctx_ln_iron.py"       "$PE/ml/layernorm/ctx_ln_iron.py"
 sync_cp "$RB/ctx_ln/Makefile.ctxln"       "$PE/ml/layernorm/Makefile.ctxln"
 # device-side f32->bf16 cast (resident-rails seam primitive)
-sync_cp "$RB/aie_kernels/cast_f32_bf16.cc" "$K/cast_f32_bf16.cc"
+sync_cp "$AK/cast-f32-bf16/cast_f32_bf16.cc" "$K/cast_f32_bf16.cc"
 sync_cp "$RB/ctx_ln/cast_f32_bf16_iron.py" "$PE/ml/layernorm/cast_f32_bf16_iron.py"
 sync_cp "$RB/ctx_ln/Makefile.cast"         "$PE/ml/layernorm/Makefile.cast"
 # device-side affine + f32->bf16 cast (resident-rails LN affine seam)
-sync_cp "$RB/aie_kernels/affine_cast.cc"   "$K/affine_cast.cc"
+sync_cp "$AK/affine-cast/affine_cast.cc"   "$K/affine_cast.cc"
 sync_cp "$RB/ctx_ln/affine_cast_iron.py"   "$PE/ml/layernorm/affine_cast_iron.py"
 sync_cp "$RB/ctx_ln/Makefile.affinecast"   "$PE/ml/layernorm/Makefile.affinecast"
 sync_cp "$RB/ctx_ln/deint_cast_iron.py"   "$PE/ml/layernorm/deint_cast_iron.py"
 sync_cp "$RB/ctx_ln/Makefile.deint"        "$PE/ml/layernorm/Makefile.deint"
 # device-side GLU (conv-module gate step): a*sigmoid(g) over pw1's [T,2D] -> [T,D]
-sync_cp "$RB/aie_kernels/glu.cc"           "$K/glu.cc"
+sync_cp "$AK/glu/glu.cc"           "$K/glu.cc"
 sync_cp "$RB/ctx_ln/glu_iron.py"           "$PE/ml/layernorm/glu_iron.py"
 sync_cp "$RB/ctx_ln/Makefile.glu"          "$PE/ml/layernorm/Makefile.glu"
 sync_cp "$RB/ctx_ln/Makefile.glutr"        "$PE/ml/layernorm/Makefile.glutr"
 # device-side f32 accumulate-add (resident-FFN fc2 on-device K-split accum): out = a + b, f32
-sync_cp "$RB/aie_kernels/acc_add.cc"       "$K/acc_add.cc"
+sync_cp "$AK/acc-add/acc_add.cc"       "$K/acc_add.cc"
 sync_cp "$RB/ctx_ln/acc_add_iron.py"       "$PE/ml/layernorm/acc_add_iron.py"
 sync_cp "$RB/ctx_ln/Makefile.accadd"       "$PE/ml/layernorm/Makefile.accadd"
 # device-side f32 scaled residual-add (whole-block fusion residual): out = a + scale*b, f32 (scale baked)
-sync_cp "$RB/aie_kernels/residual_add.cc"  "$K/residual_add.cc"
+sync_cp "$AK/residual-add/residual_add.cc"  "$K/residual_add.cc"
 sync_cp "$RB/ctx_ln/residual_add_iron.py"  "$PE/ml/layernorm/residual_add_iron.py"
 sync_cp "$RB/ctx_ln/Makefile.resadd"       "$PE/ml/layernorm/Makefile.resadd"
 # TRACED variants (aie-trace-wire-existing-enable-trace, 2026-07-30): per-op device occupancy
@@ -192,14 +194,14 @@ sync_cp "$RB/ctx_ln/trace_brick_silu.py"   "$PE/ml/layernorm/trace_brick_silu.py
 # (npu.rs), so this one is shipped-critical, not a probe. Its generator/kernel/Makefile used to
 # live ONLY in the gitignored sandbox: nothing tracked could rebuild it, and the 2026-07-27 aiecc
 # flag migration skipped it for the same reason. Tracked here now; see the fixed-encoder-xclbins log.
-sync_cp "$RB/aie_kernels/ln_affine_cast.cc"   "$K/ln_affine_cast.cc"
+sync_cp "$AK/ln-affine-cast/ln_affine_cast.cc"   "$K/ln_affine_cast.cc"
 sync_cp "$RB/ctx_ln/ln_affine_cast_iron.py"   "$PE/ml/layernorm/ln_affine_cast_iron.py"
 sync_cp "$RB/ctx_ln/Makefile.lnaffcast"       "$PE/ml/layernorm/Makefile.lnaffcast"
 # RETIRED variants -- kept in tree so the work is not lost, NOT built by build_parakeet_modal_kernels.sh:
 #   lnaffcastb/-tr/-btr : bias / transposed spins of the same generator, no consumer
 #   lnaffinef32         : f32-affine spin, no consumer
 #   resaddln            : fused resadd->LN, measured a WASH (xdna-engine dec9c2c), engine wiring removed
-sync_cp "$RB/aie_kernels/ln_affine_f32.cc"    "$K/ln_affine_f32.cc"
+sync_cp "$AK/ln-affine-f32/ln_affine_f32.cc"    "$K/ln_affine_f32.cc"
 sync_cp "$RB/ctx_ln/ln_affine_f32_iron.py"    "$PE/ml/layernorm/ln_affine_f32_iron.py"
 sync_cp "$RB/ctx_ln/resadd_ln_iron.py"        "$PE/ml/layernorm/resadd_ln_iron.py"
 for _m in lnaffcastb lnaffcastbtr lnaffcasttr lnaffinef32 resaddln; do

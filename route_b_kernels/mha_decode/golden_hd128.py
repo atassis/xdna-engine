@@ -56,7 +56,7 @@ _bf16 = ml_dtypes.bfloat16
 def _load_s2_ar_ref():
     """importlib-load scripts/s2_ar_ref.py by path, registering it in sys.modules first --
     required because it uses @dataclass, whose machinery looks the defining class up via
-    sys.modules[cls.__module__] (see route_b_kernels/bricks/rope-interleaved/golden.py, which
+    sys.modules[cls.__module__] (see aie_kernels/rope-interleaved/golden.py, which
     uses the identical pattern for the same reason)."""
     import importlib.util
     import sys

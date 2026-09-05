@@ -47,7 +47,7 @@ STARTER_PROMPT*.md
 /target/test-arenas/
 
 # Generated brick-verification artifacts (rebuilt by the verify scripts)
-route_b_kernels/bricks/_verify/gen/
+aie_kernels/_test/gen/
 
 # toolchain instance cache (~500MB) and root-level cargo target (~5GB)
 /.cache/

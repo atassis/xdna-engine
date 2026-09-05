@@ -26,7 +26,7 @@ and shim body -- so `symbol` (unique per design, confirmed 68/68 on the real cha
 the exported directory, not `name`.
 
 WHY `iron.set_current_device(NPU2())` runs before anything else: `bricklib._build_streamed`
-(route_b_kernels/bricks/_verify/bricklib.py) targets whatever `iron.get_current_device()` returns,
+(aie_kernels/_test/bricklib.py) targets whatever `iron.get_current_device()` returns,
 and that function's default path PROBES the live NPU runtime the first time nothing has bound a
 device explicitly -- exactly the /dev/accel0 touch this export must never make (device-free, NPU is
 single-tenant and busy with the main session's job). Binding NPU2() up front short-circuits that
