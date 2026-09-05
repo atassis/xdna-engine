@@ -5,7 +5,7 @@
 #   * dtype bf16 -> f32 (docs/05 "never re-expand": the encoder LN is f32 in/out; the host
 #     downstream — residual add / next matmul / SiLU — consumes f32 with no re-expand tax).
 #   * kernel layer_norm (bf16, unstable E[x²]-mean²) -> layer_norm_2pass_f32 (designs/
-#     aie_kernels/ln_2pass.cc): per-row f32 two-pass centered variance, matching the host
+#     aie_kernels/ln-2pass/ln_2pass.cc): per-row f32 two-pass centered variance, matching the host
 #     reference npu-asr-host/src/lib.rs `layer_norm_normalize` exactly. NORMALIZE-ONLY; the
 #     affine γ,β is applied on the host for the 4 affine LN sites (exact, cheap).
 #

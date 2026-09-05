@@ -2,7 +2,7 @@
 """Device parity for the f32 two-pass ctxLN xclbin (resident-rails Task 2, D-parameterized).
 
 Unlike run_npu_layernorm.py (bf16 `layer_norm`, E[x^2]-mean^2), this drives the f32
-`layer_norm_2pass_f32` kernel (aie_kernels/ln_2pass.cc): NORMALIZE-ONLY,
+`layer_norm_2pass_f32` kernel (aie_kernels/ln-2pass/ln_2pass.cc): NORMALIZE-ONLY,
 per-row TWO-PASS centered variance, f32 in / f32 out. Matches the host reference exactly
 (npu-asr-host layer_norm_normalize); ctx_ln.rs measured rel ~7.8e-7 at D=768.
 

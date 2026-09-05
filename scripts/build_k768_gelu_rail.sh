@@ -11,7 +11,7 @@
 # WHY these shapes (see the scout report generalization.md and the GELU-kernel read):
 #   * Whisper-small d_model=768 ffn=3072, BERT-base hidden=768 intermediate=3072, ESM-2 padded
 #     to K=768 by ctx2::round_stream -- ONE (K=768, N=3072, GELU) FFN rail serves all three.
-#   * GELU epilogue = mm_gelu_epilogue_f32o (aie_kernels/mm_silu_epilogue.cc):
+#   * GELU epilogue = mm_gelu_epilogue_f32o (aie_kernels/mm-silu-epilogue/mm_silu_epilogue.cc):
 #     TANH-APPROX gelu, tanh(sqrt(2/pi)*(x+0.044715 x^3)), computed in bf16. Selected by the
 #     modal RTP mode baked per instruction stream: rtp[0]=2 (gelu), set by the generator's
 #     --gelu flag (whole_array_modal_iron.py, mode_val=2). One xclbin can also host the id

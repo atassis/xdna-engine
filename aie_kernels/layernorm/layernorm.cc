@@ -2,7 +2,7 @@
 //
 // GENERIC "norm{LN|RMS}" brick (aie_kernels, group: norm).
 //
-// Model studied: aie_kernels/ln_2pass.cc (the encoder ctxLN 2-pass f32 kernel).
+// Model studied: aie_kernels/ln-2pass/ln_2pass.cc (the encoder ctxLN 2-pass f32 kernel).
 // This brick generalizes that kernel into a parameterized op-TYPE against the resident [tile,D]
 // stream contract, per the CLAUDE.md rail: "Fixes must be GENERIC primitives ... never per-model
 // hand-fused kernels". It is NOT a clone of ln_2pass.cc for one model's shape/affine convention --
