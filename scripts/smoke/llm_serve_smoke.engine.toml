@@ -1,6 +1,7 @@
-# Template for scripts/smoke/llm_serve_smoke.sh. Port 18434 is deliberate: it must NOT
-# collide with the systemd unit on 11434. The scenario path is absolute because the
-# engine resolves it against XDNA_ENGINE_ROOT, not the config's own location.
+# Template for scripts/smoke/llm_serve_smoke.sh. Port 18434 is deliberate: it must NOT collide
+# with the systemd unit on 11434. The scenario path is root-relative, like the installed
+# engine.toml's -- the engine resolves it against XDNA_ENGINE_ROOT, which the smoke sets to the
+# repo, not against this file's own location.
 [server]
 port = 18434
 max_resident = 1
@@ -10,4 +11,4 @@ generate = "qwen3-0.6b"
 
 [[model]]
 name = "qwen3-0.6b"
-scenario = "<workspace>/wt-llm-serve/scenarios/generate-qwen3-0.6b.toml"
+scenario = "scenarios/generate-qwen3-0.6b.toml"

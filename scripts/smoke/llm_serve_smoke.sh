@@ -1,17 +1,21 @@
 #!/usr/bin/env bash
-# End-to-end smoke for llm-serve-openai-surface. NOT run yet -- device is held for a separate
-# owner-gated experiment (patched amdxdna map_wc module) as of 2026-09-05 18:31. Run this only
-# after the owner confirms the device is free AND the module is back to stock
-# (srcversion 76D3502C9538984CD074984), so the result is reported against the shipped driver.
+# End-to-end smoke for the LLM serving surface: /healthz, /v1/models, chat completions buffered and
+# streamed, /v1/completions, temperature-0 determinism, the 400 on an unsupported param, and the
+# `npu generate` CLI. Opens the NPU, so it is single-tenant: set NPU_LOCK to a serializing wrapper
+# (`NPU_LOCK=/path/to/lock.sh queue --`) or make sure nothing else holds /dev/accel/accel0.
+#
+# Report a result together with the driver it ran against: `cat /sys/module/amdxdna/srcversion`.
 set -uo pipefail
 
-WORKTREE="<workspace>/wt-llm-serve"
-NPU_LOCK="<workspace>/xdna-engine-private/journal/scripts/npu_lock.sh"
-# Rescued from a session scratchpad 2026-09-05. Everything that was an absolute path into that
-# ephemeral dir is now derived or overridable, so this survives the session that wrote it.
+# Every path is derived from this script's own location or overridable. It was written in a session
+# scratchpad and then in a worktree, and both spellings named a directory that no longer exists.
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 REPO="$(cd -- "$SCRIPT_DIR/../.." >/dev/null 2>&1 && pwd)"
 SMOKE_DIR="${SMOKE_DIR:-$(mktemp -d -t llm-serve-smoke-XXXXXX)}"
+# Serializing wrapper for device access, as an argv PREFIX. Empty runs unserialized, which is fine
+# on an idle box and wrong on a shared one -- hence the warning rather than a silent default.
+read -r -a NPU_LOCK_ARGV <<< "${NPU_LOCK:-}"
+[ "${#NPU_LOCK_ARGV[@]}" -gt 0 ] || echo "WARN: NPU_LOCK unset -- running unserialized on a single-tenant device" >&2
 # The engine config template ships beside this script; the scenario it names must point at a
 # decode artifact built against the CURRENT toolchain pin. A stale artifact will now be REFUSED
 # at load by LlmArtifact's freshness gate rather than silently answering with a wrong token.
@@ -20,10 +24,19 @@ CFG="$SMOKE_DIR/engine.toml"
 mkdir -p "$SMOKE_DIR"
 [ -f "$ENGINE_TOML" ] || { echo "FATAL: no engine config template at $ENGINE_TOML" >&2; exit 1; }
 cp "$ENGINE_TOML" "$CFG"
-PORT=18434
-BIN="$WORKTREE/rust/target/debug/npu"
-export LD_LIBRARY_PATH=$HOME/.local/lib/xdna-engine
-export XDNA_ENGINE_ROOT="${XDNA_ENGINE_ROOT:-$(cd -- "$REPO/.." >/dev/null 2>&1 && pwd)}"
+PORT="${PORT:-18434}"
+# Release first: it is what install.sh ships, so a debug-only smoke tests a binary nobody runs.
+BIN="${BIN:-}"
+if [ -z "$BIN" ]; then
+  for cand in "$REPO/rust/target/release/npu" "$REPO/rust/target/debug/npu"; do
+    [ -x "$cand" ] && BIN="$cand" && break
+  done
+fi
+[ -x "$BIN" ] || { echo "FATAL: no npu binary -- build it, or set BIN=" >&2; exit 1; }
+export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-$HOME/.local/lib/xdna-engine}"
+# The repo IS the engine root here: the smoke config names its scenario root-relative, exactly as
+# the installed engine.toml does, so scenarios/ and artifacts/ resolve out of this checkout.
+export XDNA_ENGINE_ROOT="${XDNA_ENGINE_ROOT:-$REPO}"
 
 TRANSCRIPT="$SMOKE_DIR/transcript.txt"
 : > "$TRANSCRIPT"
@@ -32,8 +45,8 @@ record() { echo "--- $1 ---" >> "$TRANSCRIPT"; shift; "$@" | tee -a "$TRANSCRIPT
 
 echo "amdxdna srcversion: $(cat /sys/module/amdxdna/srcversion 2>/dev/null)" | tee -a "$TRANSCRIPT"
 
-log "== starting npu serve under npu_lock.sh queue =="
-"$NPU_LOCK" queue -- "$BIN" --config "$CFG" serve --port "$PORT" > "$SMOKE_DIR/serve.log" 2>&1 &
+log "== starting npu serve =="
+"${NPU_LOCK_ARGV[@]}" "$BIN" --config "$CFG" serve --port "$PORT" > "$SMOKE_DIR/serve.log" 2>&1 &
 SERVE_PID=$!
 
 for i in $(seq 1 90); do
@@ -93,7 +106,7 @@ kill "$SERVE_PID" 2>/dev/null
 wait "$SERVE_PID" 2>/dev/null
 
 log "== npu generate CLI (one-shot, streams to stdout) =="
-"$NPU_LOCK" queue -- "$BIN" --config "$CFG" generate "Say hello in one short sentence." --max-tokens 32 --temperature 0 \
+"${NPU_LOCK_ARGV[@]}" "$BIN" --config "$CFG" generate "Say hello in one short sentence." --max-tokens 32 --temperature 0 \
   2>&1 | tee -a "$TRANSCRIPT"
 
 log "== done, transcript at $TRANSCRIPT =="

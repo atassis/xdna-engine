@@ -29,9 +29,8 @@ pub trait DecodeStep {
 
 /// Tokenize a prompt. `Prompt::Chat` renders through the model's chat template first;
 /// `Prompt::Raw` tokenizes directly. The returned length is the TRUE tokenized prompt length --
-/// never recover it later by filtering EOS out of a padded buffer
-/// (`docs/kb/chat-template-eos-breaks-prompt-len-recovery.md`): EOS doubles as the chat template's
-/// own turn separator, so that recovery undercounts and desyncs every position after it.
+/// never recover it later by filtering EOS out of a padded buffer: EOS doubles as the chat
+/// template's own turn separator, so that recovery undercounts and desyncs every position after it.
 pub fn tokenize_prompt(cfg: &ModelConfig, prompt: &Prompt) -> Result<Vec<u32>, EngineError> {
     let (text, add_special_tokens) = match prompt {
         Prompt::Chat(messages) => {

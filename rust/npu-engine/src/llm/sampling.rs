@@ -1,8 +1,7 @@
 //! Token-level sampling over a logits VIEW: temperature, top-k, top-p (nucleus), and
 //! repetition/frequency/presence penalties.
 //!
-//! Copied from `npu-gemma::sampling` and fixed for the defect recorded in
-//! `docs/kb/an-id-indexed-array-api-degrades-silently-on-a-subset.md`: the original took a bare
+//! Copied from `npu-gemma::sampling` and fixed for one defect: the original took a bare
 //! `&[f32]` indexed by TOKEN ID, so `sample()`/`argmax()` returned a raw array index (a token id
 //! only for a full-vocabulary array) and `apply_penalties`'s `logits.get_mut(tok as usize)` silently
 //! dropped the penalty for any history token outside the array. [`LogitView`] makes the index space

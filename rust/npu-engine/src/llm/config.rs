@@ -13,11 +13,9 @@ use crate::llm::chat_template::ChatTemplate;
 /// carry two EOS-role tokens that are genuinely different: `<|im_end|>` ends a chat turn (the
 /// tokenizer's own `eos_token`) while `<|endoftext|>`, the base-LM's original EOS, shows up as an
 /// EXTRA member of `generation_config.json`'s `eos_token_id` list. They are tracked separately
-/// rather than merged into one guess -- see
-/// `docs/kb/an-id-indexed-array-api-degrades-silently-on-a-subset.md` and
-/// `docs/kb/the-two-s2-authorities-disagree-on-the-generation-stop-token.md` for the failure this
-/// avoids: two authorities computing different answers for "the" stop token, with the difference
-/// noticed only after a mismatched decode length.
+/// rather than merged into one guess, because of the failure that merging causes: two authorities
+/// computing different answers for "the" stop token, with the difference noticed only after a
+/// mismatched decode length.
 #[derive(Debug, Clone)]
 pub struct StopTokens {
     /// `tokenizer_config.json`'s `eos_token`, resolved to an id via the tokenizer's own vocab.
@@ -191,8 +189,7 @@ mod tests {
     }
 
     /// The load-bearing case: the two authorities give genuinely different answers for the primary
-    /// EOS (the S2 shape -- `docs/kb/the-two-s2-authorities-disagree-on-the-generation-stop-token.md`).
-    /// Must fail loud, naming both values, never pick one.
+    /// EOS. Must fail loud, naming both values, never pick one.
     #[test]
     fn disagreeing_authorities_fail_loud_naming_both_values() {
         let tok = tiny_tokenizer(&[("<unk>", 0), ("<|im_end|>", 151645), ("<|weird|>", 999)]);

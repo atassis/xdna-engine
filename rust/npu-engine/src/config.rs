@@ -218,13 +218,13 @@ manifest = "artifacts/pyannote/diarize.json"
         let c = ScenarioConfig::from_str(&toml).expect("generate scenario must parse");
         assert_eq!(c.scenario.kind, "generate");
         assert!(c.model.is_none());
-        // The path the scenario names must be one `scripts/build_llm_decode.sh` can recreate, not
-        // a session scratchpad: the first version of this scenario pointed into /tmp and would have
-        // shipped a config that broke the moment that directory was swept.
-        assert!(c.artifacts.decode.ends_with("artifacts/qwen3-0.6b/decode"));
-        assert!(!c.artifacts.decode.starts_with("/tmp"));
-        assert!(c.artifacts.weights.ends_with("artifacts-qwen3-0.6b/weights"));
-        assert!(c.artifacts.tokenizer_dir.contains("Qwen3-0.6B"));
+        // Root-relative, like every other shipped scenario. Absolute artifact paths parse fine and
+        // then pin the config to one machine: this scenario shipped first with a /tmp scratchpad
+        // and then with a developer's home dir, and neither survives being installed elsewhere.
+        for p in [&c.artifacts.decode, &c.artifacts.weights, &c.artifacts.tokenizer_dir] {
+            assert!(!p.starts_with('/'), "artifact path must be root-relative, got {p:?}");
+            assert!(p.starts_with("artifacts/qwen3-0.6b/"), "unexpected artifact path {p:?}");
+        }
     }
 
     /// The two fields a second Whisper size needs, and the guarantee that the first one does not

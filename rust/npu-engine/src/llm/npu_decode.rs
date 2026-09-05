@@ -13,8 +13,7 @@
 //! **Load-bearing property, checked by construction, not by convention**: every call to
 //! [`NpuDecodeStep::step`] does write -> `sync_input()` -> `dispatch()` -> `sync_from_device()`
 //! unconditionally. On the IRON Python rail the first dispatch after a host input write computes on
-//! the PREVIOUS input, because `tensor_class.to()` early-returns on a stale coherence map
-//! (`docs/kb/first-dispatch-after-a-host-input-write-computes-on-the-previous-input.md`). `npu-xrt`
+//! the PREVIOUS input, because `tensor_class.to()` early-returns on a stale coherence map. `npu-xrt`
 //! has no such map -- `Bo::sync_to_device()` is an unconditional FFI call -- so this rail does not
 //! inherit the defect PROVIDED every write is followed by a real sync. Never special-case that away
 //! (e.g. "skip the sync when nothing changed"): that is exactly the shortcut that reintroduces it.
@@ -248,18 +247,16 @@ mod tests {
     /// only the embed `.npy` on disk. SKIPs if it is absent.
     #[test]
     fn dump_x_and_rope_bytes_for_the_failing_step() {
-        let weights_dir = std::path::Path::new(
-            "<workspace>/artifacts-qwen3-0.6b/weights",
-        );
+        let (_, weights_dir, _) = gate_paths();
         let embed_path = weights_dir.join("model.embed_tokens.weight.npy");
         if !embed_path.exists() {
             eprintln!("SKIP: {} not found", embed_path.display());
             return;
         }
-        let out_dir = std::path::Path::new(
-            "/tmp/claude-1000/-home-atassis-repositories-ns-atassis-xdna-engine-workspace/57b4e007-4f99-4357-a109-fc028eef879e/scratchpad/byte_compare",
-        );
-        std::fs::create_dir_all(out_dir).unwrap();
+        // Under the repo's own target/, not a session scratchpad: the first version of this wrote
+        // into one agent session's /tmp dir, which is gone the moment that session ends.
+        let out_dir = repo_root().join("rust/target/llm-byte-compare");
+        std::fs::create_dir_all(&out_dir).unwrap();
 
         let embed: Array2<f32> = ndarray_npy::read_npy(&embed_path).expect("read embed npy");
         const TOKEN: usize = 315;
@@ -314,14 +311,26 @@ mod tests {
         std::env::var(key).unwrap_or_else(|_| default.to_string())
     }
 
-    /// `(decode_dir, weights_dir, oracle_path)`, defaulting to the fixed locations named by the
-    /// `llm-serve-openai-surface` task (outside this worktree), overridable for other checkouts.
+    /// Repo root, from this crate's manifest dir -- so the gate resolves in a worktree, a clone or
+    /// a CI checkout, none of which is the machine this test was written on.
+    fn repo_root() -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap().to_path_buf()
+    }
+
+    /// `(decode_dir, weights_dir, oracle_path)`, defaulting to the same `artifacts/qwen3-0.6b/`
+    /// tree `scenarios/generate-qwen3-0.6b.toml` names, overridable per checkout.
+    ///
+    /// The default USED to name a sibling `artifacts-qwen3-0.6b/decode` outside the repo. That copy
+    /// predates the 2026-09-04 re-pin and reads 7/8 teacher-forced, so the gate's own default
+    /// disagreed with the scenario the service loads, and the 8/8 result only appeared when the env
+    /// override happened to be set.
     fn gate_paths() -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
-        let root = "<workspace>";
+        let root = repo_root();
+        let d = |s: &str| root.join(s).to_string_lossy().into_owned();
         (
-            env_or("NPU_LLM_DECODE_DIR", &format!("{root}/artifacts-qwen3-0.6b/decode")).into(),
-            env_or("NPU_LLM_WEIGHTS_DIR", &format!("{root}/artifacts-qwen3-0.6b/weights")).into(),
-            env_or("NPU_LLM_ORACLE", &format!("{root}/xdna-engine/tests/refs/qwen3-0.6b/bf16_oracle.json")).into(),
+            env_or("NPU_LLM_DECODE_DIR", &d("artifacts/qwen3-0.6b/decode")).into(),
+            env_or("NPU_LLM_WEIGHTS_DIR", &d("artifacts/qwen3-0.6b/weights")).into(),
+            env_or("NPU_LLM_ORACLE", &d("tests/refs/qwen3-0.6b/bf16_oracle.json")).into(),
         )
     }
 

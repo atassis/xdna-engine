@@ -5,9 +5,8 @@
 //!
 //! `gen_llm_decode.py:306` hand-writes `["x", "logits"] + wnames` instead of asking IRON for every
 //! declared input, so `rope_global` -- a real `inputs` entry -- has no `layout` row (the generator's
-//! own bug, not a device fact; see
-//! `docs/superpowers/specs/2026-09-05-llm-serving-and-residency-design.md` §4 and its placement
-//! ledger). [`LlmArtifact::load`] refuses to guess that gap open-endedly: it fails loud on ANY missing
+//! own bug, not a device fact). [`LlmArtifact::load`] refuses to guess that gap open-endedly: it
+//! fails loud on ANY missing
 //! name, and separately -- ONLY for the exact `rope_global`-after-`x` shape this generator produces --
 //! applies a narrow, logged compatibility placement. Rebuilding the artifact with a fixed generator
 //! removes the shim's reason to exist, not its correctness.
@@ -281,8 +280,7 @@ impl LlmArtifact {
         }
 
         // Toolchain freshness: fail loud on an ACTIVE mismatch (the pin moved, nobody rebuilt this
-        // artifact -- the exact silent-wrong-token shape recorded in
-        // docs/kb/the-2026-09-04-repin-left-two-artifact-families-stale.md). Anything short of a
+        // artifact -- a stale ELF answers with a plausible WRONG token, silently). Anything short of a
         // confirmed mismatch is reported, never fatal -- a shipped consumer must not require
         // toolchain.lock to exist (that is dev-infra; see kernel_registry::check_toolchain_freshness's
         // doc comment for the encoder-side sibling of this same rule).
@@ -529,7 +527,7 @@ mod tests {
 
     // ------------------------------------------------------------------------------------
     // Toolchain freshness (2026-09-05): closes the hole a stale fused decode ELF exploited
-    // silently -- see docs/kb/the-2026-09-04-repin-left-two-artifact-families-stale.md. The
+    // silently -- it read 7/8 teacher-forced and looked like a precision tie. The
     // ELF that shipped 2026-09-03 was built against toolchain 9da6356ac521 (the pin one commit
     // before the 2026-09-04 re-pin, per `git log --follow -- toolchain.lock`); the values below
     // are that real pair, not invented ones.
