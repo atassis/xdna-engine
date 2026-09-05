@@ -3,6 +3,7 @@
 pub mod config;
 pub mod loader;
 pub mod registry;
+pub mod status_file;
 pub mod select;
 pub mod reconcile;
 pub mod actor;

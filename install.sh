@@ -428,6 +428,9 @@ After=graphical-session.target
 
 [Service]
 Type=simple
+# systemd creates this on start and REMOVES it on stop, so the status file's presence is the
+# liveness signal: npu models needs no port, probe or timeout to read live state.
+RuntimeDirectory=xdna-engine
 # The engine's root for artifacts/, scenarios/ and the mlir-aie xclbins. npu-cli's root() reads
 # this before falling back to a scenario path or to cwd.
 Environment=XDNA_ENGINE_ROOT=$ENGINE_ROOT

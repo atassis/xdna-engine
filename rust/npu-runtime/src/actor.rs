@@ -237,6 +237,11 @@ fn spawn(cfg: Config, loader: Box<dyn ModelLoader + Send>, eager: bool) -> Resul
                 }
                 next_sweep = now + cfg.server.sweep_interval();
             }
+            // Publish after every command and every sweep -- the two things that can change what is
+            // resident. This thread is the only owner of the registry, so the file is written from
+            // the same place the state lives and cannot disagree with it. Best-effort: see
+            // `status_file`, a service that cannot write its status must keep serving.
+            crate::status_file::publish(&reg.status_at(Instant::now()));
         }
     });
     match ready_rx.recv() {

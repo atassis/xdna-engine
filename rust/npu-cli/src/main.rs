@@ -480,34 +480,69 @@ fn embed(path: &Path, text: &str, model: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-/// What this INSTALL has: the configured models, read from the config file.
+/// The configured models, and -- when the service is running -- what it currently has resident.
 ///
-/// Deliberately does not ask the server. The CLI and the service must not depend on each other --
-/// every other one-shot command (`transcribe`, `embed`, `generate`, `chat`) drives the engine
-/// directly, and this was the one that could not answer without a running HTTP server. With the
-/// service down it returned "no server" to a question the config answers perfectly well, which is
-/// exactly when the question gets asked.
+/// Never contacts the service. The CLI and the service must not depend on each other: every other
+/// one-shot command drives the engine directly, and this one used to need a running HTTP server to
+/// say anything at all.
 ///
-/// For what a RUNNING server is actually serving, query the server: `curl :11434/v1/models`, or
-/// `systemctl --user status xdna-engine`. That is a different question with a different answer --
-/// today the config lists `whisper-turbo` whose xclbin does not exist -- and conflating them behind
-/// one command is what made this one need a network.
+/// Live state comes from a FILE the service publishes, not a socket or the port. `RuntimeDirectory=`
+/// has systemd create that directory on start and remove it on stop, so its presence is the liveness
+/// signal -- no probe, no handshake, no timeout, and no way to mistake ollama on the shared 11434
+/// for us. A wedged service cannot hang this command, because reading bytes is not connecting; it
+/// shows the last published state and how old it is, and lets the reader judge.
 fn models(path: &Path, as_json: bool) -> Result<()> {
     let cfg = load_cfg(path)?;
+    let live = read_live_status();
+
     if as_json {
-        println!("{}", serde_json::json!({
-            "object": "list",
-            "source": path.display().to_string(),
-            "data": cfg.models.iter().map(|m| serde_json::json!({"id": m.name, "scenario": m.scenario}))
-                       .collect::<Vec<_>>(),
-        }));
+        let rows: Vec<_> = cfg.models.iter().map(|m| {
+            let l = live.as_ref().and_then(|(_, v)| find_live(v, &m.name));
+            serde_json::json!({
+                "id": m.name, "scenario": m.scenario,
+                "state": l.and_then(|x| x.get("state").and_then(|s| s.as_str())).unwrap_or("unknown"),
+            })
+        }).collect();
+        let age = live.as_ref().map(|(a, _)| serde_json::json!(a));
+        println!("{}", serde_json::json!({"source": path.display().to_string(),
+                                          "live_age_s": age, "data": rows}));
         return Ok(());
     }
-    println!("{:<22}  {}", "NAME", "SCENARIO");
+
+    println!("{:<22} {:<9} {:<8}  {}", "NAME", "STATE", "KIND", "SCENARIO");
     for m in &cfg.models {
-        println!("{:<22}  {}", m.name, m.scenario);
+        let l = live.as_ref().and_then(|(_, v)| find_live(v, &m.name));
+        let f = |k: &str| l.and_then(|x| x.get(k).and_then(|s| s.as_str())).unwrap_or("-").to_string();
+        println!("{:<22} {:<9} {:<8}  {}", m.name, f("state"), f("kind"), m.scenario);
+    }
+    match (&live, npu_runtime::status_file::dir().map(|d| d.exists())) {
+        (Some((age, _)), _) => println!("\n(live state as of {age}s ago)"),
+        // systemd removes the runtime directory on stop, so its absence is "not running". Its
+        // PRESENCE with no file inside is a different fact -- the service is up but has not
+        // published -- and saying "not running" there would be a lie during a rollout.
+        (None, Some(true)) => println!("\n(service is up but has published no status yet)"),
+        (None, _) => println!("\n(service not running -- configured models only)"),
     }
     Ok(())
+}
+
+/// The published status and its age in seconds, or `None` when the service is not running.
+///
+/// Absence is not an error to report: systemd removes the runtime directory on stop, so "no file"
+/// IS "not running", which is a fact worth printing rather than a failure worth raising.
+fn read_live_status() -> Option<(u64, serde_json::Value)> {
+    let p = npu_runtime::status_file::path()?;
+    let body = std::fs::read_to_string(p).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&body).ok()?;
+    let written = v.get("written_unix")?.as_u64()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+    Some((now.saturating_sub(written), v))
+}
+
+fn find_live<'a>(doc: &'a serde_json::Value, name: &str) -> Option<&'a serde_json::Value> {
+    doc.get("models")?.get("data")?.as_array()?
+        .iter().find(|m| m.get("id").and_then(|i| i.as_str()) == Some(name))
 }
 
 fn reload(path: &Path, port: Option<u16>) -> Result<()> {
