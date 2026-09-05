@@ -232,10 +232,27 @@ ok "Stable .so: $STABLE_LIB_DIR/$ORT_SO_BASE (+ SONAME symlink)"
 # A directory "exists with content" check (non-empty).
 dir_has_content() { [ -d "$1" ] && [ -n "$(ls -A "$1" 2>/dev/null)" ]; }
 
+# ---- Kernels: COPIED into the production root, never linked to the compiler tree ----
+# This used to be `stage_link mlir-aie`, a symlink to the whole 3.1 GB mlir-aie checkout, of which a
+# running engine needs 2.8 MB. That made a production install contain a compiler tree, depend on a
+# developer working tree existing at a fixed path, and it is why the shipped service read a dev-tree
+# toolchain.lock for its freshness gate at all.
+#
+# Published BEFORE the preflight below, because the preflight now checks the artifacts that will
+# actually ship rather than the ones in the build tree they came from. Checking the source and
+# shipping the copy is how the two drift.
+ENGINE_KERNELS="$ENGINE_ROOT/kernels"
+info "Publishing kernels -> $ENGINE_KERNELS"
+mkdir -p "$ENGINE_ROOT"
+bash "$REPO/scripts/publish_kernels.sh" "$ENGINE_KERNELS" "$ENGINE_MLIR_AIE" \
+  || die "kernel publish refused -- see the message above. The usual cause is a build dir that was
+  never rebuilt after a re-pin; scripts/check_kernel_artifact_freshness.sh names every stale one."
+ok "Kernels published (pin $(cat "$ENGINE_KERNELS/.toolchain-stamp" 2>/dev/null || echo unknown))"
+
 # ---- Parakeet artifacts (MODEL=parakeet) ----
 if [ "$MODEL" = parakeet ]; then
   PK="$ENGINE_ARTIFACTS/parakeet"
-  WA="$ENGINE_MLIR_AIE/programming_examples/basic/matrix_multiplication/whole_array/build"
+  WA="$ENGINE_KERNELS/whole_array"          # the published copy, not the build tree
   dir_has_content "$PK/encoder" \
     || die "Parakeet encoder weights missing: $PK/encoder — run: $EXPORT_VENV/bin/python scripts/extract_parakeet_encoder.py (needs models/parakeet/encoder-model.onnx)."
   for f in preprocessor.onnx decoder_joint.onnx vocab.txt; do
@@ -250,7 +267,7 @@ if [ "$MODEL" = parakeet ]; then
       [ -f "$WA/final_512x1024x${n}_64x32x128_8c${v}.xclbin" ] && { have="$v"; break; }
     done
     [ -n "${have+x}" ] && [ -f "$WA/final_512x1024x${n}_64x32x128_8c${have}.xclbin" ] \
-      || die "Parakeet NPU xclbin missing: final_512x1024x${n}_64x32x128_8c{_modalsilu,_modalid,}.xclbin — run scripts/build_parakeet_kernels.sh (needs the mlir-aie toolchain)."
+      || die "Parakeet NPU xclbin missing from the PUBLISHED set: final_512x1024x${n}_64x32x128_8c{_modalsilu,_modalid,}.xclbin in $WA — run scripts/build_parakeet_kernels.sh (needs the mlir-aie toolchain), then re-run this installer to republish."
   done
   ok "Parakeet artifacts present: $PK (encoder weights + preproc/decoder_joint/vocab) + NPU xclbins"
   # skip the GigaAM artifact generation below
@@ -330,8 +347,12 @@ fi
 # 4b. Stage the stable production root
 # ---------------------------------------------------------------------------
 # scenarios/ are COPIED (small, and a copy cannot be changed under the service by a checkout
-# switching branches). artifacts/ and mlir-aie/ are SYMLINKED, because they are large and are
-# already shared between checkouts; linking keeps one copy of the weights and xclbins.
+# switching branches). Kernels are COPIED too, in section 4 above.
+#
+# artifacts/ stays a SYMLINK, deliberately and as the only one: it is the model weights, 3.8 GB, and
+# duplicating that is the cost worth avoiding. Point ENGINE_ARTIFACTS at wherever they live -- the
+# default resolves to this checkout, which makes the install depend on it, and an operator with the
+# weights on another partition should say so rather than have the project assume.
 info "Staging production root -> $ENGINE_ROOT"
 mkdir -p "$ENGINE_ROOT"
 rm -rf "$ENGINE_ROOT/scenarios"
@@ -345,7 +366,14 @@ stage_link() {  # name, source
   fi
 }
 stage_link artifacts "$ENGINE_ARTIFACTS"
-stage_link mlir-aie  "$ENGINE_MLIR_AIE"
+# NO `stage_link mlir-aie`. A compiler tree does not belong in a production install; section 4
+# published the artifacts a running engine actually resolves.
+if [ -L "$ENGINE_ROOT/mlir-aie" ] || [ -d "$ENGINE_ROOT/mlir-aie" ]; then
+  # Left by an older install. Retire rather than delete -- the same convention the kernel sandbox
+  # uses -- so a rollback has something to roll back to.
+  mv "$ENGINE_ROOT/mlir-aie" "$ENGINE_ROOT/mlir-aie.retired-$(date +%Y%m%dT%H%M%S)"
+  ok "  retired the mlir-aie link from a previous install (a compiler tree is not an artifact)"
+fi
 ok "Production root staged."
 
 info "Preflighting engine config: $ENGINE_CONFIG"

@@ -22,11 +22,16 @@
 # for the next family added, and a silent overwrite in a published set is indistinguishable from a
 # complete one.
 #
-#   publish_kernels.sh <dest-dir>
+#   publish_kernels.sh <dest-dir> [<mlir-aie-root>]
+#
+# The source root is an argument because `install.sh` exposes ENGINE_MLIR_AIE as a knob; a publisher
+# that hardcoded $REPO/mlir-aie would silently ignore an operator who set it.
 set -uo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-DEST="${1:?usage: publish_kernels.sh <dest-dir>}"
-PE="$REPO/mlir-aie/programming_examples"
+DEST="${1:?usage: publish_kernels.sh <dest-dir> [<mlir-aie-root>]}"
+MLIR_AIE_ROOT="${2:-$REPO/mlir-aie}"
+[ -d "$MLIR_AIE_ROOT" ] || { echo "[publish-kernels] ERROR: no mlir-aie root at '$MLIR_AIE_ROOT'" >&2; exit 1; }
+PE="$MLIR_AIE_ROOT/programming_examples"
 
 # The dirs a SERVING engine resolves from. Every one must carry a .toolchain-stamp: publishing an
 # artifact whose pin is unknown is how a re-pin goes unnoticed, which cost five days once.

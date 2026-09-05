@@ -566,8 +566,14 @@ fn read_live_status(want_port: u16) -> Option<(u64, serde_json::Value)> {
     // The path is per-USER, so another engine on another port publishes here too -- a test instance,
     // a parallel session. Without this the command reports someone else's models as ours, which it
     // did today. Same check `preflight_serve` makes about who holds a socket.
-    if v.get("port").and_then(|p| p.as_u64()) != Some(want_port as u64) {
-        return None;
+    //
+    // ABSENT is not WRONG. A service running an older binary publishes no `port` at all, and the
+    // first version of this check read that as a mismatch and called a live service down -- during
+    // exactly the rolling upgrade where the two binaries differ. An unknown port falls back to the
+    // pid, which is weaker identification but an honest one.
+    match v.get("port").and_then(|p| p.as_u64()) {
+        Some(p) if p != want_port as u64 => return None,
+        _ => {}
     }
     let written = v.get("written_unix")?.as_u64()?;
     let now = std::time::SystemTime::now()
