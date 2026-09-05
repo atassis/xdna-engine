@@ -374,6 +374,36 @@ impl LlmArtifact {
     pub fn loc(&self, name: &str) -> &BufLoc {
         &self.layout[name]
     }
+
+    /// Bidirectional companion to the missing-`layout`-entry check above (ported from
+    /// `asr::whisper_decoder`'s `parse_layout`, `xdna-engine f446a50`): an `Arena::Input` buffer that
+    /// `per_token_writes` does not name is what a missing host write looks like from the layout side.
+    /// The caller passes the literal list of buffer names its own per-token step function writes
+    /// (`NpuDecodeStep::step` -> `["x", "rope_global"]` today), so this catches an artifact whose
+    /// declared inputs the decoder does not handle, not a generic property of `meta.json` alone.
+    ///
+    /// Scoped deliberately narrow: this guards the MISSING-WRITE class only. It does NOT guard
+    /// artifact staleness -- a buffer can be written every token and still hold stale-toolchain
+    /// bytes, which is a separate cause with the same symptom (one wrong token at a small-margin
+    /// step) and is `check_toolchain_freshness`'s job, not this one's.
+    pub fn check_per_token_writes(&self, per_token_writes: &[&str]) -> Result<(), EngineError> {
+        let mut missing: Vec<&str> = self
+            .layout
+            .iter()
+            .filter(|(_, loc)| loc.arena == Arena::Input)
+            .map(|(name, _)| name.as_str())
+            .filter(|name| !per_token_writes.contains(name))
+            .collect();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        missing.sort_unstable();
+        Err(EngineError::Load(format!(
+            "input-arena buffer(s) with no per-token host write: {} -- either the host write is \
+             missing or the buffer does not belong in the input arena",
+            missing.join(", ")
+        )))
+    }
 }
 
 #[cfg(test)]
@@ -547,6 +577,51 @@ mod tests {
         write_meta(dir.path(), &meta);
         let art = LlmArtifact::load(dir.path()).expect("unstamped must be a warning, not fatal");
         assert_eq!(art.toolchain_hash, None);
+    }
+
+    // ------------------------------------------------------------------------------------
+    // check_per_token_writes -- the inverse arena check ported from whisper_decoder.rs
+    // (xdna-engine f446a50): an Arena::Input buffer nothing writes per token is an error.
+    // ------------------------------------------------------------------------------------
+
+    #[test]
+    fn per_token_writes_passes_when_every_input_buffer_is_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = base_meta(8, 4, serde_json::json!({"rope_global": {"type": "input", "offset": 8, "len": 8}}));
+        write_meta(dir.path(), &meta);
+        let art = LlmArtifact::load(dir.path()).unwrap();
+        art.check_per_token_writes(&["x", "rope_global"]).expect("x and rope_global are both named");
+    }
+
+    #[test]
+    fn per_token_writes_passes_via_the_rope_global_compat_shim_too() {
+        // rope_global absent from `layout` (shimmed in by `load`) must still be seen as an
+        // Arena::Input entry by this check -- it runs against the resolved layout, not raw meta.json.
+        let dir = tempfile::tempdir().unwrap();
+        write_meta(dir.path(), &base_meta(8, 4, serde_json::json!({})));
+        let art = LlmArtifact::load(dir.path()).unwrap();
+        art.check_per_token_writes(&["x", "rope_global"]).expect("shimmed rope_global still counts");
+    }
+
+    #[test]
+    fn per_token_writes_fails_loud_naming_an_unwritten_input_buffer() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut meta = base_meta(
+            8,
+            4,
+            serde_json::json!({
+                "rope_global": {"type": "input", "offset": 8, "len": 8},
+                "positions": {"type": "input", "offset": 16, "len": 4},
+            }),
+        );
+        // base_meta's input_size only covers [x, rope_global); widen it to also fit `positions`.
+        meta["input_size"] = serde_json::json!(20);
+        write_meta(dir.path(), &meta);
+        let art = LlmArtifact::load(dir.path()).unwrap();
+        // The decoder only knows to write x and rope_global -- `positions` is a declared input
+        // buffer the decoder does not handle, exactly the missing-write shape this guards.
+        let err = art.check_per_token_writes(&["x", "rope_global"]).unwrap_err().to_string();
+        assert!(err.contains("positions"), "{err}");
     }
 
     #[test]

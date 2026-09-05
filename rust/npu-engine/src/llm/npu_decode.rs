@@ -86,6 +86,9 @@ impl NpuDecodeStep {
     /// `decode_dir/buffers`).
     pub fn new(dev: &Rc<Device>, decode_dir: &Path, weights_dir: &Path) -> Result<Self, EngineError> {
         let artifact = LlmArtifact::load(decode_dir)?;
+        // Mirrors this exact loop's writes below (`x_loc`, `rope_loc`) -- an artifact declaring a
+        // third per-token input buffer would otherwise leave it unwritten every token, silently.
+        artifact.check_per_token_writes(&["x", "rope_global"])?;
 
         let arena = FusedArena::new(dev, artifact.input_size, artifact.output_size, artifact.scratch_size)
             .map_err(|e| EngineError::Load(format!("alloc fused arenas: {e}")))?;
