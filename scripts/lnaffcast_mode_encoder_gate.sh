@@ -44,7 +44,18 @@ log(){ echo -e "$*" | tee -a "$LOG"; }
 
 BIN="$WT/rust/target/release/parakeet_encode_npu"
 MELS="${MELS:-$WT/artifacts/wer_mels}"
-PY="${PY:-$HOME/npuvox-asr-bench/.venv/bin/python}"
+# Decoder python: PY overrides directly. Otherwise derive from ONNX_ASR_VENV (same var
+# install.sh's preflight uses), searching ./.venv then the documented conventional path if
+# ONNX_ASR_VENV is unset. No universal default exists (this used to hardcode the author's own
+# throwaway ~/npuvox-asr-bench/.venv).
+onnx_asr_venv="${ONNX_ASR_VENV:-}"
+if [ -z "$onnx_asr_venv" ]; then
+  for v in "$WT/.venv" "${XDG_DATA_HOME:-$HOME/.local/share}/xdna-engine/onnx-asr-venv"; do
+    [ -x "$v/bin/python" ] && "$v/bin/python" -c "import onnx_asr" >/dev/null 2>&1 && { onnx_asr_venv="$v"; break; }
+  done
+fi
+PY="${PY:-${onnx_asr_venv:+$onnx_asr_venv/bin/python}}"
+PY="${PY:-/nonexistent/onnx-asr-python}"
 
 restore(){ systemctl --user start xdna-engine.service npu-vox.service >/dev/null 2>&1; log "[svc] restored"; }
 trap restore EXIT

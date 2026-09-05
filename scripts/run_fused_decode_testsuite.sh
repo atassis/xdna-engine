@@ -38,6 +38,20 @@ CLIP_RU=$WT/artifacts/wer_clips/ru_01.wav
 LOG=$WT/artifacts/fused_testsuite.log
 mkdir -p "$WT/artifacts"; : > "$LOG"
 
+# Parakeet WER (section 6) needs the onnx-asr venv (has onnx_asr). Same search order as
+# install.sh's ONNX_ASR_VENV preflight: explicit ONNX_ASR_VENV, else ./.venv, else the
+# documented conventional path. No universal default exists (this used to hardcode the
+# author's own throwaway ~/npuvox-asr-bench/.venv); best-effort section, so an unresolved venv
+# just falls through to the existing "absent — skipped" path below, same as before.
+ONNX_ASR_VENV="${ONNX_ASR_VENV:-}"
+if [ -z "$ONNX_ASR_VENV" ]; then
+  for v in "$WT/.venv" "${XDG_DATA_HOME:-$HOME/.local/share}/xdna-engine/onnx-asr-venv"; do
+    [ -x "$v/bin/python" ] && "$v/bin/python" -c "import onnx_asr" >/dev/null 2>&1 && { ONNX_ASR_VENV="$v"; break; }
+  done
+fi
+PARAKEET_PY="${ONNX_ASR_VENV:+$ONNX_ASR_VENV/bin/python}"
+PARAKEET_PY="${PARAKEET_PY:-/nonexistent/onnx-asr-python}"
+
 section(){ echo -e "\n\n========================================================================\n## $*\n========================================================================" | tee -a "$LOG"; }
 run(){ echo -e "\n\$ $*" | tee -a "$LOG"; { eval "$@"; } >>"$LOG" 2>&1; local rc=$?; tail -n 40 "$LOG" | sed 's/^/    /'; echo "  [exit $rc]" | tee -a "$LOG"; }
 note(){ echo -e "# $*" | tee -a "$LOG"; }
@@ -127,7 +141,7 @@ run "test -f $WT/scripts/_whisper_decode_attn_wer_run.sh && bash $WT/scripts/_wh
 
 section "6. OTHER MODELS (best-effort; skipped cleanly if env/deps absent)"
 note "Parakeet full-transcription WER (needs onnx_asr venv):"
-run "test -x ~/npuvox-asr-bench/.venv/bin/python && (cd $WT && ~/npuvox-asr-bench/.venv/bin/python scripts/parakeet_npu_wer.py npu artifacts/wer_clips) || echo 'parakeet venv/onnx_asr absent — skipped'"
+run "test -x $PARAKEET_PY && (cd $WT && $PARAKEET_PY scripts/parakeet_npu_wer.py npu artifacts/wer_clips) || echo 'parakeet venv/onnx_asr absent — skipped'"
 note "Embeddings (bge-base) e2e latency:"
 run "test -f $WT/scripts/_esm_latency.sh && bash $WT/scripts/_esm_latency.sh scenarios/bge-base.toml 11436 bge || echo 'embeddings harness skipped'"
 note "ESM-2 native e2e latency:"

@@ -41,7 +41,15 @@ REPO="$(dirname "$SCRIPT_PATH")"
 
 # onnx-asr runtime venv (has onnx_asr, onnxruntime, numpy, py3.12).
 # Used to RUN the service and to generate the artifacts/asr/ ONNX models.
-ONNX_ASR_VENV="${ONNX_ASR_VENV:-$HOME/npuvox-asr-bench/.venv}"
+# No universal default exists (this used to hardcode the author's own throwaway
+# ~/npuvox-asr-bench/.venv, which cannot exist on any other machine). If the caller does not
+# set ONNX_ASR_VENV explicitly, the preflight below (2b) searches these conventional
+# locations, in order, taking the first one that actually validates:
+#   1. ./.venv                                          (repo-local; shared with EXPORT_VENV
+#                                                         below if one venv has everything)
+#   2. ${XDG_DATA_HOME:-~/.local/share}/xdna-engine/onnx-asr-venv   (documented convention)
+ONNX_ASR_VENV="${ONNX_ASR_VENV:-}"
+ONNX_ASR_VENV_CANDIDATES="$REPO/.venv ${XDG_DATA_HOME:-$HOME/.local/share}/xdna-engine/onnx-asr-venv"
 
 # Repo export venv (has onnx + onnxruntime). Used to (re)generate the
 # artifacts/encoder/ encoder weights via extract_encoder.py.
@@ -126,6 +134,17 @@ command -v cargo >/dev/null 2>&1 || die "cargo not found on PATH. Install Rust (
 ok "cargo: $(command -v cargo)"
 
 # 2b. onnx-asr venv + onnx_asr importable
+# ONNX_ASR_VENV set explicitly -> used as-is (validated below, never silently swapped for a
+# different candidate). Unset -> search ONNX_ASR_VENV_CANDIDATES and take the first one that
+# actually validates; never silently pick one that fails validation.
+if [ -z "$ONNX_ASR_VENV" ]; then
+  for v in $ONNX_ASR_VENV_CANDIDATES; do
+    [ -x "$v/bin/python" ] && "$v/bin/python" -c "import onnx_asr" >/dev/null 2>&1 && { ONNX_ASR_VENV="$v"; break; }
+  done
+  [ -n "$ONNX_ASR_VENV" ] || die "no onnx-asr venv found. Tried: $ONNX_ASR_VENV_CANDIDATES
+  Set ONNX_ASR_VENV=/path/to/venv, where <venv>/bin/python has \`import onnx_asr\` working and
+  <venv>/lib/python*/site-packages/onnxruntime/capi/libonnxruntime.so.* present."
+fi
 ONNX_ASR_PY="$ONNX_ASR_VENV/bin/python"
 [ -x "$ONNX_ASR_PY" ] || die "onnx-asr venv python not found at $ONNX_ASR_PY (override with ONNX_ASR_VENV=...)."
 "$ONNX_ASR_PY" -c "import onnx_asr" 2>/dev/null \
