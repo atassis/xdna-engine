@@ -56,6 +56,13 @@ pub fn try_build(cfg_path: &Path, root: &Path) -> Result<Scenario, EngineError> 
             Scenario::Diarize(Box::new(crate::diarize::DiarizePipeline::new(
                 manifest, Box::new(seg), Box::new(emb), &dir)?))
         }
+        // Placeholder arm, landed with the `TextGenerator` contract so the tree compiles while the
+        // decoder is built (`llm-serve-openai-surface`). It FAILS LOUD rather than falling back to a
+        // host implementation: a `kind = "generate"` scenario that silently served something else
+        // would be indistinguishable from a working one until someone measured it.
+        Some(crate::ModelKind::Generate) => return Err(EngineError::Load(format!(
+            "scenario {:?} declares kind=generate, but no LLM decoder is wired yet \
+             (llm-serve-openai-surface)", cfg.scenario.name))),
         None => return Err(EngineError::Load(format!("unknown scenario kind {:?}", cfg.scenario.kind))),
     };
     Ok(scen)
