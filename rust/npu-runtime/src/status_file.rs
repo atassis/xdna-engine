@@ -7,6 +7,12 @@
 //! another server for this one, because the path is ours by construction where port 11434 is a
 //! shared default with ollama and FLM; and it needs no protocol, port or timeout.
 //!
+//! The document carries the PORT because the path does not: `$XDG_RUNTIME_DIR/xdna-engine` is
+//! per-USER, so a second engine started on another port -- a test instance, a peer session -- writes
+//! here too. That happened within the hour of this file existing, and made `npu models` report a
+//! foreign instance's models as the service's. A reader must check the port it expects, the same way
+//! `preflight_serve` checks who holds a socket rather than assuming.
+//!
 //! The cost is staleness, which is why `written_unix` is in the document. A reader states the age
 //! and lets the human judge -- a stale answer carrying its age beats a connection that never
 //! returns, which is the failure mode a socket would have on a device call that never comes back.
@@ -44,12 +50,14 @@ pub fn path() -> Option<PathBuf> { dir().map(|d| d.join(FILE_NAME)) }
 ///
 /// Written to a temporary and renamed, because a reader that catches a half-written file would get
 /// a parse error that reads like a corrupt service rather than a race.
-pub fn publish(status: &[ModelStatus]) {
+pub fn publish(port: u16, status: &[ModelStatus]) {
     let Some(p) = path() else { return };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     let body = crate::http::models_json(status);
-    let doc = format!("{{\"written_unix\":{now},\"pid\":{},\"models\":{body}}}", std::process::id());
+    let doc = format!(
+        "{{\"written_unix\":{now},\"pid\":{},\"port\":{port},\"models\":{body}}}",
+        std::process::id());
     let tmp = p.with_extension("json.tmp");
     if let Some(parent) = p.parent() {
         let _ = std::fs::create_dir_all(parent);

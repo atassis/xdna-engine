@@ -241,7 +241,7 @@ fn spawn(cfg: Config, loader: Box<dyn ModelLoader + Send>, eager: bool) -> Resul
             // resident. This thread is the only owner of the registry, so the file is written from
             // the same place the state lives and cannot disagree with it. Best-effort: see
             // `status_file`, a service that cannot write its status must keep serving.
-            crate::status_file::publish(&reg.status_at(Instant::now()));
+            crate::status_file::publish(cfg.server.port, &reg.status_at(Instant::now()));
         }
     });
     match ready_rx.recv() {

@@ -516,7 +516,7 @@ fn embed(path: &Path, text: &str, model: Option<&str>) -> Result<()> {
 /// shows the last published state and how old it is, and lets the reader judge.
 fn models(path: &Path, as_json: bool) -> Result<()> {
     let cfg = load_cfg(path)?;
-    let live = read_live_status();
+    let live = read_live_status(cfg.server.port);
 
     if as_json {
         let rows: Vec<_> = cfg.models.iter().map(|m| {
@@ -538,25 +538,37 @@ fn models(path: &Path, as_json: bool) -> Result<()> {
         let f = |k: &str| l.and_then(|x| x.get(k).and_then(|s| s.as_str())).unwrap_or("-").to_string();
         println!("{:<22} {:<9} {:<8}  {}", m.name, f("state"), f("kind"), m.scenario);
     }
-    match (&live, npu_runtime::status_file::dir().map(|d| d.exists())) {
-        (Some((age, _)), _) => println!("\n(live state as of {age}s ago)"),
-        // systemd removes the runtime directory on stop, so its absence is "not running". Its
-        // PRESENCE with no file inside is a different fact -- the service is up but has not
-        // published -- and saying "not running" there would be a lie during a rollout.
-        (None, Some(true)) => println!("\n(service is up but has published no status yet)"),
-        (None, _) => println!("\n(service not running -- configured models only)"),
+    match &live {
+        Some((age, _)) => println!("\n(live state as of {age}s ago)"),
+        None => println!("\n(service not running -- configured models only)"),
     }
     Ok(())
 }
 
-/// The published status and its age in seconds, or `None` when the service is not running.
+/// The published status and its age in seconds, or `None` when nothing is serving.
 ///
-/// Absence is not an error to report: systemd removes the runtime directory on stop, so "no file"
-/// IS "not running", which is a fact worth printing rather than a failure worth raising.
-fn read_live_status() -> Option<(u64, serde_json::Value)> {
+/// Liveness comes from the PID recorded in the file, not from the directory existing. The first
+/// version trusted the directory -- `RuntimeDirectory=` with `RuntimeDirectoryPreserve=no` is
+/// documented to be removed on stop -- and that is FALSE as observed here: after a clean
+/// `systemctl --user stop`, `/run/user/1000/xdna-engine` survived with its `status.json` intact, so
+/// the command reported a dead service as live. Reproduced deliberately before changing this.
+///
+/// The pid check costs one `stat` of `/proc/<pid>`, cannot hang, and cannot be fooled by a leftover
+/// directory -- which the directory test could not say the same of.
+fn read_live_status(want_port: u16) -> Option<(u64, serde_json::Value)> {
     let p = npu_runtime::status_file::path()?;
     let body = std::fs::read_to_string(p).ok()?;
     let v: serde_json::Value = serde_json::from_str(&body).ok()?;
+    let pid = v.get("pid")?.as_u64()?;
+    if !std::path::Path::new(&format!("/proc/{pid}")).exists() {
+        return None; // stale file from a process that is gone
+    }
+    // The path is per-USER, so another engine on another port publishes here too -- a test instance,
+    // a parallel session. Without this the command reports someone else's models as ours, which it
+    // did today. Same check `preflight_serve` makes about who holds a socket.
+    if v.get("port").and_then(|p| p.as_u64()) != Some(want_port as u64) {
+        return None;
+    }
     let written = v.get("written_unix")?.as_u64()?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
