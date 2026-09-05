@@ -86,6 +86,16 @@ pub struct Artifacts {
     pub tokenizer: String,
     #[serde(default)]
     pub onnx_ref: String,
+    /// `kind = "generate"` only: directory holding a fused-decode ELF (`meta.json` + `decode.elf` +
+    /// `buffers/`), read through `llm::LlmArtifact`. Every other scenario kind leaves this empty.
+    #[serde(default)]
+    pub decode: String,
+    /// `kind = "generate"` only: the checkpoint's directory (`tokenizer.json`,
+    /// `tokenizer_config.json`, `generation_config.json`), read through `llm::ModelConfig::load`.
+    /// Separate from `tokenizer` above, which every other scenario points at a single
+    /// `tokenizer.json` file rather than its containing directory.
+    #[serde(default)]
+    pub tokenizer_dir: String,
     /// Declarative weight source: `"hf:<repo>[@rev]"` or `"path:/abs"`. When set, the engine
     /// resolves + bakes (on missing) a `npu-weights` checkpoint via this spec instead of reading the
     /// legacy npy `weights` dir. Optional and additive: omit it and the npy path is unchanged.
@@ -197,6 +207,20 @@ manifest = "artifacts/pyannote/diarize.json"
         let b = ScenarioConfig::from_str(&bge).unwrap();
         assert_eq!(b.model.as_ref().unwrap().hidden, 768);
         assert!(b.diarization.manifest.is_empty(), "an absent block defaults, never errors");
+    }
+
+    /// `kind = "generate"` needs no `[model]` block at all (the fused decode ELF's own `meta.json`
+    /// carries every dimension) -- only the two new `[artifacts]` fields the registry's Generate
+    /// arm reads.
+    #[test]
+    fn generate_scenario_parses_with_no_model_block_and_carries_decode_paths() {
+        let toml = std::fs::read_to_string("../../scenarios/generate-qwen3-0.6b.toml").unwrap();
+        let c = ScenarioConfig::from_str(&toml).expect("generate scenario must parse");
+        assert_eq!(c.scenario.kind, "generate");
+        assert!(c.model.is_none());
+        assert!(c.artifacts.decode.ends_with("regen-qwen3-decode"));
+        assert!(c.artifacts.weights.ends_with("artifacts-qwen3-0.6b/weights"));
+        assert!(c.artifacts.tokenizer_dir.contains("Qwen3-0.6B"));
     }
 
     /// The two fields a second Whisper size needs, and the guarantee that the first one does not

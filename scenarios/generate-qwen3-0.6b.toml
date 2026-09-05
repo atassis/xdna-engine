@@ -1,0 +1,13 @@
+[scenario]
+kind = "generate"
+name = "qwen3-0.6b"
+
+[artifacts]
+# The FRESH decode artifact (rebuilt against the current toolchain pin, 8/8 teacher-forced parity,
+# 5/5 bit-identical) -- NOT the shared artifacts-qwen3-0.6b/decode/, which predates the 2026-09-04
+# re-pin and reads 7/8 (see llm-serve-openai-surface's worklog). Absolute paths on purpose: a
+# generate scenario's artifacts do not live under any scenarios/-adjacent artifacts/ tree the way
+# ASR/embed scenarios' do, and `root.join(<absolute>)` leaves an absolute path unchanged.
+decode = "/tmp/claude-1000/-home-atassis-repositories-ns-atassis-xdna-engine-workspace/57b4e007-4f99-4357-a109-fc028eef879e/scratchpad/regen-qwen3-decode"
+weights = "<workspace>/artifacts-qwen3-0.6b/weights"
+tokenizer_dir = "/mnt/data/cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca"
