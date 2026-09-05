@@ -5,7 +5,7 @@
 Sibling to verify_llm_decode.py (the correctness gate). This file asserts NOTHING about token
 identity and must never be imported by or merged into the gate; it drives the SAME graph via
 build_graph so the numbers describe the artifact the parity gate already exercises, not a re-typed
-copy that can drift from it. See docs/tasks/llm-decode-first-timing.md.
+copy that can drift from it.
 
   python route_b_kernels/decode_fused/bench_llm_decode.py --spec qwen3-0.6b \
       --weights /path/to/artifacts-qwen3-0.6b/weights --out-json /tmp/bench.json

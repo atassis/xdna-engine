@@ -4,7 +4,7 @@
 `sha256(xclbin)` answers "same build run", never "same program" -- an xclbin embeds per-build
 identity in five fields plus a text duplicate of three of them, all regenerated fresh by a
 rebuild of the IDENTICAL design (measured 2026-09-01, two builds of one design on one toolchain:
-68 bytes differ, all of them identity -- [[an-xclbin-hash-answers-same-build-not-same-program]]):
+68 bytes differ, all of them identity):
 
   1. `axlf.m_uniqueId`            (8 B,  container header) -- "use it to skip redownload etc",
                                     regenerated per build so the driver can tell builds apart.

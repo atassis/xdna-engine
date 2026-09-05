@@ -106,11 +106,10 @@ def report_artifact_freshness(weights_dir):
     verify_llm_decode.py and bench_llm_decode.py always recompile the graph fresh via build_graph,
     so THIS run never dispatches stale bytes -- but the shipped Rust engine loads decode.elf/
     meta.json directly (npu-engine::LlmArtifact) and does not rebuild. A stale artifact sitting next
-    to fresh weights is exactly the silent-wrong-token hole this closes (see
-    docs/kb/the-2026-09-04-repin-left-two-artifact-families-stale.md): the decode ELF that shipped
-    2026-09-03 returned a wrong token at one margin step after the 2026-09-04 re-pin, with nothing
-    to say so. Never raises and never affects the caller's exit code -- this is a report about a
-    DIFFERENT consumer, not a gate on the graph this process just verified.
+    to fresh weights is exactly the silent-wrong-token hole this closes: the decode ELF that
+    shipped 2026-09-03 returned a wrong token at one margin step after the 2026-09-04 re-pin, with
+    nothing to say so. Never raises and never affects the caller's exit code -- this is a report
+    about a DIFFERENT consumer, not a gate on the graph this process just verified.
     """
     art_dir = os.path.join(os.path.dirname(os.path.normpath(weights_dir)), "decode")
     meta_path = os.path.join(art_dir, "meta.json")
