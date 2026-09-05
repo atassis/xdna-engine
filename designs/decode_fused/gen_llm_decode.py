@@ -228,6 +228,16 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
     ctx = AIEContext()
 
     # ---- op vocabulary: created ONCE, reused across every layer (same dims per layer) ----
+    # 1 column, and this is FORCED by the operator's semantics, not a placement budget.
+    # RMSNorm's `tile_size` is the NORMALISED WIDTH, not a work split: its own test reads
+    # `rows = input_length // tile_size, cols = tile_size`, and design_weighted.py carries one
+    # weight ObjectFifo of `tile_size` elements shared across every column. num_aie_columns splits
+    # ROWS. A decode step normalises ONE vector of d_model, so rows == 1 and there is nothing to
+    # spread. Setting tile_size = D // 4 to buy width would compute four independent 256-wide
+    # normalisations instead of one 1024-wide one -- a different function, not a faster one. The
+    # buffer-size gate caught it first ("L0_n_in.bin is 2048 bytes, layout declares 512"), which is
+    # luck: the sizes happened to disagree. Had D//4 divided evenly into the dumped weight it would
+    # have run and been quietly wrong.
     op_norm = RMSNorm(size=D, num_aie_columns=1, num_channels=1, tile_size=D,
                       weighted=True, epsilon=sp.eps, context=ctx)
     op_qk_norm = RMSNorm(size=HD, num_aie_columns=1, num_channels=1, tile_size=HD,
@@ -250,7 +260,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
     op_rep_v = Repeat(rows=Hkv, cols=S * HD, repeat=sp.gqa_group, transfer_size=HD, context=ctx)
     op_scores = gemv(S, HD, ctx, num_batches=Hq)
     op_scale = ElementwiseMul(size=Hq * S, tile_size=S // COLS, num_aie_columns=COLS, context=ctx)
-    op_softmax = Softmax(rows=Hq, cols=S, num_aie_columns=1, num_channels=1, rtp_vector_size=S,
+    op_softmax = Softmax(rows=Hq, cols=S, num_aie_columns=COLS, num_channels=1, rtp_vector_size=S,
                          vector_size_parameter="sm_mask", context=ctx)
     # num_batches=Hq, not Hq separate invocations. transpose/design.py's L3 tensors already hold
     # "num_batches contiguous (M,N) matrices stacked along the row dimension", which is EXACTLY what
@@ -260,7 +270,12 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
     # placer: -0.01 ms/token, 0.0%. Dropping 420 dispatches per token is worth nothing measurable,
     # because these are mode selections inside ONE hardware context. Kept because it is correct,
     # free, and 2.2 MB smaller in the ELF -- not because it is faster.
-    op_trv = Transpose(M=S, N=HD, num_aie_columns=2, num_channels=1, m=256, n=32, s=8,
+    # 4, not COLS: Transpose splits N across columns as `N // num_columns // n`, and at N=HD=128
+    # with n=32 that is 4 tiles, so 8 columns divides to ZERO. Its __post_init__ does not catch it
+    # -- it checks M*N % (m*n*cols*channels), which 8 satisfies -- and the failure surfaces deep in
+    # taplib as "All sizes must be >= 1, but got [8, 0, 256, 32]", naming no operator and no
+    # parameter. 4 is the real ceiling at this n; raising it needs n=16.
+    op_trv = Transpose(M=S, N=HD, num_aie_columns=4, num_channels=1, m=256, n=32, s=8,
                        num_batches=Hq, context=ctx)
     op_ctx = gemv(HD, S, ctx, num_batches=Hq)
     op_gate = gemv(FF, D, ctx)
