@@ -88,12 +88,11 @@ pub enum Cmd {
         #[arg(long)] no_stream: bool,
     },
     /// List models on a running server.
-    /// What this install has, and what the server is actually serving.
+    /// The models this install is configured to serve, from the config file.
     ///
-    /// Default output is aligned columns: readable, and splittable by `awk`/`cut` because the
-    /// one free-text field is last. `--json` gives the raw server document for anything that
-    /// wants the full record.
-    Models { #[arg(long)] port: Option<u16>, #[arg(long)] json: bool },
+    /// Local only -- it never contacts the server, so it answers with the service down. For what a
+    /// RUNNING server is serving, ask the server: `curl :11434/v1/models`.
+    Models { #[arg(long)] json: bool },
     /// Ask a running server to re-read the config and reconcile.
     Reload { #[arg(long)] port: Option<u16> },
     /// Pre-bake a model's weight checkpoint (host-only, no device).

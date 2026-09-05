@@ -40,7 +40,7 @@ fn main() -> Result<()> {
         Cmd::TranscribeMedia { input, out, format, asr, diarize: diar, track, no_diarize } =>
             transcribe_media(&path, input, out.as_deref(), *format, asr.as_deref(),
                              diar.as_deref(), *track, *no_diarize),
-        Cmd::Models { port, json } => models(&path, *port, *json),
+        Cmd::Models { json } => models(&path, *json),
         Cmd::Reload { port } => reload(&path, *port),
         Cmd::Bake { name } => bake(&path, name),
         Cmd::Config { action } => config_cmd(&path, action),
@@ -480,72 +480,32 @@ fn embed(path: &Path, text: &str, model: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-/// What this install has, and -- separately -- what is actually being served.
+/// What this INSTALL has: the configured models, read from the config file.
 ///
-/// The two differ, which is the whole reason to print both. A config lists what was asked for; the
-/// server lists what loaded. Today `/v1/models` reports `whisper-turbo` while its xclbin does not
-/// exist, so even the live answer is a claim rather than a guarantee.
+/// Deliberately does not ask the server. The CLI and the service must not depend on each other --
+/// every other one-shot command (`transcribe`, `embed`, `generate`, `chat`) drives the engine
+/// directly, and this was the one that could not answer without a running HTTP server. With the
+/// service down it returned "no server" to a question the config answers perfectly well, which is
+/// exactly when the question gets asked.
 ///
-/// Reading the config FIRST means the command still answers with the service down, which is when
-/// the question is usually asked. The old version returned "no server" and nothing else.
-fn models(path: &Path, port: Option<u16>, as_json: bool) -> Result<()> {
-    let port = resolve_port(path, port)?;
+/// For what a RUNNING server is actually serving, query the server: `curl :11434/v1/models`, or
+/// `systemctl --user status xdna-engine`. That is a different question with a different answer --
+/// today the config lists `whisper-turbo` whose xclbin does not exist -- and conflating them behind
+/// one command is what made this one need a network.
+fn models(path: &Path, as_json: bool) -> Result<()> {
     let cfg = load_cfg(path)?;
-    let names: Vec<&str> = cfg.models.iter().map(|m| m.name.as_str()).collect();
-
-    if listener_is_ours(port) {
-        match http_get(port, "/v1/models") {
-            Ok(body) => {
-                if as_json {
-                    println!("{body}");
-                } else {
-                    print_model_table(&body)?;
-                }
-                return Ok(());
-            }
-            // Answered /healthz as ours, then failed the listing: report it rather than falling
-            // through to the local list as if nothing happened.
-            Err(e) => eprintln!("[npu] server on {port} is ours but /v1/models failed: {e}"),
-        }
-    } else if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-        eprintln!(
-            "[npu] something is listening on 127.0.0.1:{port} but it is not an xdna-engine \
-             (it did not answer /healthz as one -- {port} is a shared default, so it is likely \
-             ollama or FLM). Listing the local config instead."
-        );
-    } else {
-        eprintln!("[npu] no server on 127.0.0.1:{port}; listing the local config.");
-    }
-
     if as_json {
-        let doc: Vec<_> = names.iter().map(|n| serde_json::json!({"id": n, "state": "unknown"})).collect();
-        println!("{}", serde_json::json!({"object": "list", "source": "config", "data": doc}));
+        println!("{}", serde_json::json!({
+            "object": "list",
+            "source": path.display().to_string(),
+            "data": cfg.models.iter().map(|m| serde_json::json!({"id": m.name, "scenario": m.scenario}))
+                       .collect::<Vec<_>>(),
+        }));
         return Ok(());
     }
-    println!("{:<22} {:<8} {:<9} {:>5}  {}", "NAME", "KIND", "STATE", "IDLE", "DETAIL");
-    for n in &names {
-        println!("{n:<22} {:<8} {:<9} {:>5}  {}", "-", "-", "-", "from config; server not answering");
-    }
-    Ok(())
-}
-
-/// Render `/v1/models` as aligned columns.
-///
-/// Two rules make it both readable and machine-splittable, and they are the reason this is not just
-/// a `println!` of the JSON: the columns are fixed-width so a human can scan them, and the ONE
-/// free-text field (`detail`) is LAST so `awk '{print $3}'` cannot be derailed by the spaces in it.
-fn print_model_table(body: &str) -> Result<()> {
-    let v: serde_json::Value = serde_json::from_str(body)
-        .with_context(|| format!("server did not return JSON: {}", body.chars().take(120).collect::<String>()))?;
-    let rows = v.get("data").and_then(|d| d.as_array()).ok_or_else(|| anyhow!("no \"data\" array in the server's reply"))?;
-    println!("{:<22} {:<8} {:<9} {:>5}  {}", "NAME", "KIND", "STATE", "IDLE", "DETAIL");
-    for m in rows {
-        let s = |k: &str| m.get(k).and_then(|x| x.as_str()).unwrap_or("-").to_string();
-        let idle = match m.get("idle_s").and_then(|x| x.as_u64()) {
-            Some(n) => format!("{n}s"),
-            None => "-".to_string(),
-        };
-        println!("{:<22} {:<8} {:<9} {:>5}  {}", s("id"), s("kind"), s("state"), idle, s("detail"));
+    println!("{:<22}  {}", "NAME", "SCENARIO");
+    for m in &cfg.models {
+        println!("{:<22}  {}", m.name, m.scenario);
     }
     Ok(())
 }
@@ -665,42 +625,25 @@ fn http_req(port: u16, method: &str, path: &str, body: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    /// The table's contract is that it stays splittable. `detail` is free text with spaces in it, so
-    /// it must be the LAST column -- otherwise `awk '{print $3}'` reads a word of prose instead of
-    /// the state, and every script built on this command breaks the first time a detail gets longer.
-    #[test]
-    fn model_table_keeps_the_free_text_field_last() {
-        let body = r#"{"object":"list","data":[
-            {"id":"parakeet","kind":"asr","state":"loaded","detail":"memory_ceiling not applied","idle_s":118},
-            {"id":"whisper-turbo","kind":"asr","state":"unloaded","detail":"loads on demand","idle_s":null}]}"#;
-        let v: serde_json::Value = serde_json::from_str(body).unwrap();
-        let rows = v["data"].as_array().unwrap();
-        for m in rows {
-            let line = format!(
-                "{:<22} {:<8} {:<9} {:>5}  {}",
-                m["id"].as_str().unwrap(), m["kind"].as_str().unwrap(), m["state"].as_str().unwrap(),
-                m["idle_s"].as_u64().map(|n| format!("{n}s")).unwrap_or_else(|| "-".into()),
-                m["detail"].as_str().unwrap());
-            let f: Vec<&str> = line.split_whitespace().collect();
-            assert_eq!(f[0], m["id"].as_str().unwrap());
-            assert_eq!(f[1], m["kind"].as_str().unwrap());
-            assert_eq!(f[2], m["state"].as_str().unwrap(), "state must survive a detail with spaces");
-        }
-    }
-
-    /// A non-JSON reply must name what arrived rather than panicking on a parse. A shared port means
-    /// the body can be anyone's -- an HTML error page, ollama's own shape, a proxy's 502.
-    #[test]
-    fn model_table_refuses_a_reply_that_is_not_ours() {
-        assert!(super::print_model_table("<html>502 Bad Gateway</html>").is_err());
-        assert!(super::print_model_table(r#"{"models":["llama3"]}"#).is_err(),
-                "another server's JSON has no data array and must not be printed as ours");
-    }
-
     use super::*;
     use npu_runtime::config::{Defaults, ModelCfg, ServerCfg};
 
-    /// No flag set -> the engine default, not a CLI-chosen greedy substitute.
+    /// The listing has to stay splittable: `npu models | awk '{print $1}'` is the obvious use, and a
+    /// scenario path can contain no spaces while a model name never does -- so name first, path last.
+    #[test]
+    fn model_listing_is_splittable_by_column() {
+        let cfg = npu_runtime::config::Config::from_str(
+            "[[model]]\nname = \"whisper-turbo\"\nscenario = \"scenarios/asr-whisper-turbo.toml\"\n",
+        )
+        .unwrap();
+        let m = &cfg.models[0];
+        let line = format!("{:<22}  {}", m.name, m.scenario);
+        let f: Vec<&str> = line.split_whitespace().collect();
+        assert_eq!(f[0], "whisper-turbo");
+        assert_eq!(f[1], "scenarios/asr-whisper-turbo.toml");
+        assert_eq!(f.len(), 2, "a row must be exactly two fields: {line:?}");
+    }
+
     #[test]
     fn build_params_with_no_flags_is_the_engine_default() {
         let s = cli_def::SamplingArgs {
