@@ -156,7 +156,24 @@ impl DecodeStep for NpuDecodeStep {
     /// Zero every KV cache buffer. The inherent `reset` already did this; wiring it through the
     /// trait is what makes it actually run, since the generator only ever sees `dyn DecodeStep`.
     fn reset(&mut self) -> Result<(), EngineError> {
+        // Zero the dispatch accounting alongside the KV cache, so a report covers exactly the
+        // generation that follows and not everything the process has ever dispatched. Both are
+        // no-ops unless NPU_DISPATCH_LOG is set; the log is thread-local and the engine actor is
+        // one thread, which is what makes per-generation scoping meaningful at all.
+        if npu_xrt::dispatch_log::enabled() {
+            npu_xrt::dispatch_log::reset();
+        }
         NpuDecodeStep::reset(self)
+    }
+
+    /// One decode step is one dispatch of the fused ELF, so the count here is the claim
+    /// "one dispatch per token for all 28 layers" measured rather than asserted. `switch_ms` is
+    /// 0.0 deliberately: this rail holds ONE xclbin, so a predicted switch tax priced off a
+    /// cross-program constant would be an invented number, and transitions should read 0.
+    fn dispatch_report(&self) -> Option<String> {
+        npu_xrt::dispatch_log::enabled().then(|| {
+            format!("{}\n{}", npu_xrt::dispatch_log::report(0.0), npu_xrt::context_report())
+        })
     }
 
     fn step(&mut self, token: u32, pos: usize) -> Result<Vec<f32>, EngineError> {

@@ -667,6 +667,11 @@ pub struct ElfKernel2 {
 /// re-registration. Construct via [`Device::open_elf_resident`].
 pub struct ElfResident {
     ptr: *mut CElfResident,
+    /// Kernel name, so [`dispatch_log`] can attribute these dispatches. Without it the resident
+    /// rail was invisible to `NPU_DISPATCH_LOG=1`: the log covers `Kernel`'s methods, and this
+    /// type calls the FFI directly, so an LLM decode reported `dispatches 0` -- a well-formed
+    /// zero from an instrument that never reached its subject.
+    label: String,
 }
 
 /// A device buffer object.
@@ -903,7 +908,11 @@ impl Device {
         if ptr.is_null() {
             Err(format!("open_elf_resident({} bytes): {}", elf_bytes.len(), last_error()))
         } else {
-            Ok(ElfResident { ptr })
+            // One hw_context, same as `load_kernel`'s, and it counts against the same driver limit
+            // of 16. Counting only there made `context_report()` read 0/16 for a rail that holds
+            // one.
+            CONTEXTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(ElfResident { ptr, label: name.unwrap_or("main:sequence").to_string() })
         }
     }
 }
@@ -1218,12 +1227,18 @@ impl ElfResident {
 
     /// Sync the scratchpad to device, start the bound run, wait for completion.
     pub fn dispatch(&self) -> Result<()> {
+        let t = std::time::Instant::now();
         let r = unsafe { shim_elf_resident_dispatch(self.ptr) };
         if r != 0 {
-            Err(format!("resident dispatch: {}", last_error()))
-        } else {
-            Ok(())
+            return Err(format!("resident dispatch: {}", last_error()));
         }
+        // The stream id is this resident's own pointer: one ElfResident is one program held open
+        // across every dispatch, so it is stable for the stream's lifetime exactly as the
+        // instruction BO address is on the `Kernel` path. `insts` is 0 -- a resident ELF has no
+        // separately-sized instruction stream to report, and inventing a width would be worse
+        // than reporting none.
+        dispatch_log::note(&self.label, self.ptr as usize, 0, Some(t.elapsed().as_secs_f64()));
+        Ok(())
     }
 }
 

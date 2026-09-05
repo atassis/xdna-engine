@@ -25,6 +25,14 @@ pub trait DecodeStep {
     fn reset(&mut self) -> Result<(), EngineError> {
         Ok(())
     }
+
+    /// Per-generation device accounting, or `None` when the backend has none or it is not enabled.
+    /// Emitted by [`LlmGenerator::generate`] after the loop, paired with [`DecodeStep::reset`]
+    /// before it, so the numbers cover exactly one generation. A host-side backend returns `None`;
+    /// nothing in the loop branches on the answer.
+    fn dispatch_report(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Tokenize a prompt. `Prompt::Chat` renders through the model's chat template first;
@@ -187,6 +195,12 @@ impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
             sink(Chunk::Text(&tail));
         }
         sink(Chunk::Done { reason: finish, usage: GenerateUsage { prompt_tokens, completion_tokens } });
+        // After Done, never before: the report is diagnostics, and a caller streaming to a socket
+        // must get its terminator whatever the backend has to say. stderr, so it cannot land in
+        // an SSE body.
+        if let Some(r) = self.decode.dispatch_report() {
+            eprintln!("[dispatch] {prompt_tokens} prompt + {completion_tokens} completion tokens\n{r}");
+        }
         Ok(())
     }
 }
