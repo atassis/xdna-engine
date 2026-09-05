@@ -621,6 +621,13 @@ struct ProjOutElf {
 /// it, leaving the device to compute on the previous token's input. That is the defect measured on
 /// the Python rail (kb: first-dispatch-after-a-host-input-write-computes-on-the-previous-input); the
 /// Rust rail is spared by what the generator happens to emit, not by a check. This is the check.
+///
+/// It runs in both directions, and the second direction exists because meta.json has been incomplete:
+/// before mlir-aie 0bcbede the generator emitted no layout entry at all for `rope_global`, a
+/// host-written-per-token input on the LLM rail, so a one-way check would have reported "fine" for a
+/// buffer it could not see. Naming a buffer that has no entry is therefore an error, not a skip, and
+/// an `input`-arena buffer nobody writes is an error too -- that is the shape of a host write that
+/// went missing.
 fn parse_layout(
     meta: &serde_json::Value,
     what: &str,
@@ -658,6 +665,14 @@ fn parse_layout(
     }
     for n in per_token_reads {
         check(n, Arena::Output)?;
+    }
+    for (name, loc) in &layout {
+        if loc.arena == Arena::Input && !per_token_writes.contains(&name.as_str()) {
+            return Err(EngineError::Load(format!(
+                "{what}: buffer {name:?} is declared in the input arena but nothing writes it per \
+                 token -- either the host write is missing or it does not belong in input"
+            )));
+        }
     }
     Ok(layout)
 }
@@ -2071,6 +2086,19 @@ mod layout_contract_tests {
 
     #[test]
     fn rejects_a_buffer_the_layout_does_not_have() {
+        // Naming a missing buffer must fail rather than skip: meta.json was incomplete before
+        // mlir-aie 0bcbede, so "no entry" is the failure mode this has to catch, not tolerate.
         parse_layout(&meta("input", "output"), "t", &["x"], &["amax"]).unwrap_err();
+    }
+
+    // The inverse drift: the generator declares an input the host never writes, which is what a
+    // missing host write looks like from the layout side.
+    #[test]
+    fn rejects_a_declared_input_that_nothing_writes() {
+        let mut m = meta("input", "output");
+        m["layout"]["rope_global"] =
+            serde_json::json!({"type": "input", "offset": 1536, "len": 256});
+        let e = parse_layout(&m, "t", &["x"], &["logits"]).unwrap_err();
+        assert!(format!("{e:?}").contains("rope_global"), "{e:?}");
     }
 }
