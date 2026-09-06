@@ -216,9 +216,11 @@ impl Registry {
         });
     }
 
-    /// Least-recently-used RESIDENT model, if any.
+    /// Least-recently-used RESIDENT model, if any. Pinned models are not candidates: a pin that LRU
+    /// could evict is not a pin, and the default model would be the first victim precisely because
+    /// serving one long generation leaves it looking idle next to a chattier one.
     pub fn lru_victim(&self) -> Option<String> {
-        self.entries.iter().filter(|e| e.model.is_some())
+        self.entries.iter().filter(|e| e.model.is_some() && !e.cfg.resident)
             .min_by_key(|e| e.last_used).map(|e| e.cfg.name.clone())
     }
 
@@ -227,7 +229,8 @@ impl Registry {
     /// The actor calls this from its `recv_timeout` idle branch, i.e. only between commands.
     pub fn sweep_idle(&mut self, now: Instant, idle: Duration) -> Vec<String> {
         let expired: Vec<String> = self.entries.iter()
-            .filter(|e| e.model.is_some() && now.saturating_duration_since(e.last_used) >= idle)
+            .filter(|e| e.model.is_some() && !e.cfg.resident
+                && now.saturating_duration_since(e.last_used) >= idle)
             .map(|e| e.cfg.name.clone()).collect();
         for n in &expired { self.release(n, &format!("unloaded: idle >= {}s", idle.as_secs())); }
         expired
@@ -310,7 +313,8 @@ mod tests {
     use super::*;
     use crate::loader::mock::MockLoader;
     use std::collections::BTreeMap;
-    fn cfg(name: &str) -> ModelCfg { ModelCfg { name: name.into(), scenario: "x".into() } }
+    fn cfg(name: &str) -> ModelCfg { ModelCfg { name: name.into(), scenario: "x".into(), resident: false } }
+    fn pinned(name: &str) -> ModelCfg { ModelCfg { name: name.into(), scenario: "x".into(), resident: true } }
     /// The accountant is INERT, and the engine has to say so.
     ///
     /// Every shipped model returns `footprint() == 0`, so `resident_bytes() + 0 > ceiling` can
@@ -459,6 +463,41 @@ mod tests {
         let b = r.status().into_iter().find(|x| x.name == "b").unwrap();
         assert_eq!(b.state, LoadState::Unloaded, "over capacity is a capacity decision, not a failure");
         assert!(b.detail.contains("max_resident"), "{}", b.detail);
+    }
+    #[test]
+    fn a_pinned_model_is_never_the_eviction_victim() {
+        let l = loader(&["a", "b", "c"]);
+        let srv = ServerCfg { max_resident: 2, ..Default::default() };
+        let mut r = Registry::default();
+        let t0 = Instant::now();
+        r.try_load(&pinned("a"), &l, &srv, t0);   // pinned AND the least recently used
+        r.try_load(&cfg("b"), &l, &srv, t0);
+        r.touch("b", t0 + Duration::from_secs(10));
+        r.ensure_resident(&cfg("c"), &l, &srv, t0 + Duration::from_secs(20)).unwrap();
+        assert!(r.get_loaded("a").is_some(), "the pin must outrank LRU order");
+        assert!(r.get_loaded("c").is_some());
+        assert_eq!(r.status().into_iter().find(|x| x.name == "b").unwrap().state, LoadState::Unloaded);
+    }
+    #[test]
+    fn a_pinned_model_survives_the_idle_sweep_that_drops_its_neighbour() {
+        let l = loader(&["a", "b"]);
+        let srv = ServerCfg { max_resident: 2, ..Default::default() };
+        let mut r = Registry::default();
+        let t0 = Instant::now();
+        r.try_load(&pinned("a"), &l, &srv, t0);
+        r.try_load(&cfg("b"), &l, &srv, t0);
+        // Both are equally idle: only the pin distinguishes them, which is the point.
+        let released = r.sweep_idle(t0 + Duration::from_secs(3600), Duration::from_secs(900));
+        assert_eq!(released, vec!["b".to_string()]);
+        assert!(r.get_loaded("a").is_some(), "a pinned model must not be swept for idleness");
+    }
+    #[test]
+    fn lru_victim_is_none_when_every_resident_model_is_pinned() {
+        let l = loader(&["a"]);
+        let srv = ServerCfg { max_resident: 1, ..Default::default() };
+        let mut r = Registry::default();
+        r.try_load(&pinned("a"), &l, &srv, Instant::now());
+        assert_eq!(r.lru_victim(), None, "a pin-only registry offers no victim");
     }
     #[test]
     fn ensure_resident_evicts_the_lru_not_just_anyone() {

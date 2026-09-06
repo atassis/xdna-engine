@@ -28,6 +28,7 @@ GEN="$REPO/designs/decode_fused/gen_llm_decode.py"
 # used to default IRON to a wt-iron-qwen3 worktree and require the DELETED iron/common/fusion.py,
 # which tethered the whole LLM decode build to one side branch; the generator is now on
 # OperatorSequence like the other 15.
+iron_require_pin || exit 1
 iron_at="$(iron_require_api "gen_llm_decode.py" \
   "iron/common/sequence.py:class OperatorSequence" \
   "iron/operators/strided_copy/op.py:output_offset_parameter")" || exit 1

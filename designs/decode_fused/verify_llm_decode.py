@@ -26,7 +26,7 @@ import ml_dtypes
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import newstack_compat  # noqa: F401,E402
-from gen_llm_decode import build_graph, report_artifact_freshness  # noqa: E402
+from gen_llm_decode import build_graph, report_artifact_freshness, load_weight_buffer  # noqa: E402
 
 BF16 = ml_dtypes.bfloat16
 
@@ -85,7 +85,7 @@ def main():
 
     for name, arr in weights.items():
         buf = c.get_buffer(name)
-        np.copyto(buf.data, np.asarray(arr, BF16).reshape(-1))
+        load_weight_buffer(buf, arr)
     print(f"[verify] {len(weights)} weight buffers loaded")
 
     # embed_tokens doubles as the tied lm-head; the host gathers the row for the current token.
@@ -105,6 +105,10 @@ def main():
         params.write("kv_off", int(pos * HD))
         params.write("sm_mask", int(pos + 1))
         params.sync()
+        # ONE dispatch per position. The duplicate that used to sit here worked around
+        # _sync_inputs() trusting a coherence map this harness never updates; that is fixed at the
+        # source now (iron/common/sequence.py forces host residency, mirroring _sync_outputs), so
+        # a second dispatch would only double the cost and mask a regression in the real fix.
         c()
         lg = np.asarray(out.data[:VOCAB], dtype=np.float32)
         if a.dump_logits and pos == 0:

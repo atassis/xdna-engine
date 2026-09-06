@@ -77,10 +77,15 @@ def _assert_pinned_aie():
     # here: toolchain_up.sh is the authority for the name, this only has to agree with it.
     with open(lock, "r", encoding="utf-8") as f:
         text = f.read()
+    # IRON_FORK_COMMIT is excluded, mirroring toolchain_up.sh's _lock_semantic: IRON is resolved
+    # through PYTHONPATH at runtime and is never compiled into the instance, so pinning it must not
+    # rename the instance. This exclusion has to be kept in step with the shell by hand -- that is
+    # the standing cost of the second derivation this file's own comment warns against.
     _semantic = "".join(
         line.split("#", 1)[0].rstrip() + "\n"
         for line in text.splitlines()
         if line.split("#", 1)[0].strip()
+        and not line.split("#", 1)[0].lstrip().startswith("IRON_FORK_COMMIT=")
     )
     want = hashlib.sha256(_semantic.encode()).hexdigest()[:12]
     # toolchain_up.sh ADOPTS an instance built under the old whole-file key by symlinking it to the

@@ -110,7 +110,16 @@ impl Defaults {
     }
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ModelCfg { pub name: String, pub scenario: String }
+pub struct ModelCfg {
+    pub name: String,
+    pub scenario: String,
+    /// Pin this model in residency: exempt from idle unload and never chosen as an eviction victim.
+    ///
+    /// The cost is a permanently occupied slot, so pinning every model would leave `ensure_resident`
+    /// no victim and turn LRU eviction into a refusal. `Config::pin_overcommit` reports that case
+    /// rather than letting it surface later as a load that cannot find room.
+    #[serde(default)] pub resident: bool,
+}
 
 impl Config {
     pub fn from_str(s: &str) -> Result<Config, toml::de::Error> { toml::from_str(s) }
@@ -131,6 +140,16 @@ impl Config {
         std::fs::rename(&tmp, path).map_err(|e| e.to_string())
     }
     pub fn find(&self, name: &str) -> Option<&ModelCfg> { self.models.iter().find(|m| m.name == name) }
+    /// Pinned models, in config order.
+    pub fn pinned(&self) -> impl Iterator<Item = &ModelCfg> { self.models.iter().filter(|m| m.resident) }
+    /// `Some(message)` when pins leave no slot to evict, i.e. pinned >= `max_resident`. Advisory:
+    /// the registry still runs, but a load for an unpinned model can no longer make room.
+    pub fn pin_overcommit(&self) -> Option<String> {
+        let n = self.pinned().count();
+        (n >= self.server.max_resident).then(|| format!(
+            "{n} model(s) pinned resident but max_resident = {}: no slot is left to evict, so \
+             loading any other model will be refused", self.server.max_resident))
+    }
 }
 impl Default for Config {
     fn default() -> Self {
@@ -141,6 +160,30 @@ impl Default for Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn resident_defaults_false_and_parses_from_toml() {
+        let c = Config::from_str(
+            "[[model]]\nname = \"a\"\nscenario = \"x\"\n\n[[model]]\nname = \"b\"\nscenario = \"y\"\nresident = true\n"
+        ).unwrap();
+        assert!(!c.find("a").unwrap().resident, "absent key must stay false, so old configs are unchanged");
+        assert!(c.find("b").unwrap().resident);
+        assert_eq!(c.pinned().map(|m| m.name.as_str()).collect::<Vec<_>>(), vec!["b"]);
+    }
+    #[test]
+    fn pin_overcommit_fires_only_when_no_slot_is_left() {
+        let mk = |n: usize, max: usize| {
+            let mut c = Config::default();
+            c.server.max_resident = max;
+            c.models = (0..n).map(|i| ModelCfg {
+                name: format!("m{i}"), scenario: "x".into(), resident: true }).collect();
+            c
+        };
+        assert!(mk(1, 5).pin_overcommit().is_none(), "one pin of five slots leaves room");
+        assert!(mk(4, 5).pin_overcommit().is_none(), "four pins of five still leave one evictable slot");
+        assert!(mk(5, 5).pin_overcommit().is_some_and(|w| w.contains("max_resident = 5")),
+            "pins equal to the cap leave no victim at all");
+        assert!(mk(6, 5).pin_overcommit().is_some(), "over the cap is the same failure, worse");
+    }
     #[test]
     fn roundtrip_and_defaults() {
         let toml = r#"
@@ -193,7 +236,7 @@ scenario = "scenarios/asr.toml"
         let p = dir.path().join("engine.toml");
         let c = Config {
             defaults: Defaults::from_pairs([(Capability::ASR, "a".to_string())]),
-            models: vec![ModelCfg { name: "a".into(), scenario: "s.toml".into() }],
+            models: vec![ModelCfg { name: "a".into(), scenario: "s.toml".into(), resident: false }],
             ..Default::default()
         };
         c.save(&p).unwrap();

@@ -43,6 +43,7 @@ import newstack_compat  # noqa: F401,E402 -- MUST precede iron imports (new-mlir
 from iron.common import AIEContext  # noqa: E402
 from elf_dispatch_compat import OperatorSequence, load_elf  # noqa: E402
 from iron.operators.gemv.op import GEMV  # noqa: E402
+from iron.operators.gemv.quant import quantize_weight  # noqa: E402
 from iron.operators.rms_norm.op import RMSNorm  # noqa: E402
 from iron.operators.rope.op import RoPE  # noqa: E402
 from iron.operators.elementwise_add.op import ElementwiseAdd  # noqa: E402
@@ -61,6 +62,46 @@ TSI = 4       # tile_size_input
 
 def bf16(a):
     return np.asarray(a).astype(BF16)
+
+
+# Engineering-check MLP weight quantization axis (Wg/Wu/Wd -- the "MLP weights" byte class), gated
+# by env vars so build/verify/bench need no CLI plumbing to A/B it, matching DECODE_PLACER_FLAGS'
+# convention. QUANT_MLP_DTYPE="bf16" (default) is a no-op: every GEMV byte-for-byte unchanged.
+# NOT a quality claim: this axis is validated as a byte-stream + determinism engineering check on
+# Qwen3-0.6B, not a token-quality gate (tests/refs/qwen3-0.6b/bf16_oracle.json is 1 prompt / 8
+# free-running tokens with knife-edge logit margins -- too small to see quantization damage).
+QUANT_MLP_DTYPE = os.environ.get("QUANT_MLP_DTYPE", "bf16")
+QUANT_MLP_GROUP = int(os.environ.get("QUANT_MLP_GROUP", "128"))
+
+
+def weight_bytes(arr):
+    """Bytes for one weight buffer exactly as written into the .bin / device arena.
+
+    A quantize_weight() packed array (np.int8, opaque on-wire bytes) must NOT be value-cast to
+    bf16 like every other weight here -- that would renumber the packed bytes instead of copying
+    them.
+    """
+    a = np.asarray(arr)
+    if a.dtype == np.int8:
+        return a.tobytes()
+    return np.asarray(a, BF16).tobytes()
+
+
+def load_weight_buffer(buf, arr):
+    """Load one weight into its device buffer, mirroring weight_bytes()'s dtype split.
+
+    `buf.data` is always a bfloat16-dtype view (iron.common.sequence's shared bf16-granule arena,
+    FusedFullELFCallable.get_buffer) regardless of the argument's declared dtype, so a packed
+    int8 array must be written via a raw byte view, never `np.asarray(arr, BF16)` (which would
+    numerically reinterpret the packed byte VALUES as floats).
+    """
+    a = np.asarray(arr)
+    if a.dtype == np.int8:
+        dst = buf.data.view(np.uint8)
+        assert dst.nbytes == a.nbytes, f"weight byte-size mismatch: buf {dst.nbytes} vs arr {a.nbytes}"
+        dst[:] = a.view(np.uint8)
+    else:
+        np.copyto(buf.data, np.asarray(a, BF16).reshape(-1))
 
 
 def repo_root():
@@ -256,6 +297,19 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
     # GQA broadcast. Correctness-first; the byte-free form is a batch-stride-0 GEMV read of the kv
     # head (0 ops, 0 bytes) -- at Hq=16 x 28 layers this Repeat plus the V transpose are 41% of the
     # per-token DDR budget, so it is the first optimisation after parity, not an afterthought.
+    #
+    # S below is deliberately ONE value shared by kc/vc/kr/vr/vt/sc/sw, op_scores, op_rep_k/v, op_trv
+    # AND op_ctx -- not the op_ctx-excluded 4-of-5 split llm-decode-attention-pads-to-full-window.md
+    # scoped out device-free. That split needs op_trv to write a bucket-wide `vt` while op_ctx reads
+    # it at full max_seq width, and symmetrically op_rep_k/v to read a bucket-wide prefix of a kc/vc
+    # row whose true stride is max_seq*HD (Hkv=8 here, not a degenerate single-row case where prefix
+    # == whole buffer). Neither holds with today's operators: Repeat's input TensorAccessPattern
+    # ties its row stride directly to `cols` (repeat/design.py: strides=[0, cols, cols_split, 1]),
+    # and Transpose's output stride is tied to its own `M` (transpose/design.py: taps_out_L1L3
+    # strides derive from M) -- neither exposes a stride independent of its own declared size, so
+    # "read/write a narrower window of a wider-strided buffer" is new IRON capability, not a
+    # generator change. Bucketing S UNIFORMLY (this build already takes it as `max_seq`) is the
+    # route that needs none.
     op_rep_k = Repeat(rows=Hkv, cols=S * HD, repeat=sp.gqa_group, transfer_size=HD, context=ctx)
     op_rep_v = Repeat(rows=Hkv, cols=S * HD, repeat=sp.gqa_group, transfer_size=HD, context=ctx)
     op_scores = gemv(S, HD, ctx, num_batches=Hq)
@@ -278,14 +332,19 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
     op_trv = Transpose(M=S, N=HD, num_aie_columns=4, num_channels=1, m=256, n=32, s=8,
                        num_batches=Hq, context=ctx)
     op_ctx = gemv(HD, S, ctx, num_batches=Hq)
-    op_gate = gemv(FF, D, ctx)
-    op_up = gemv(FF, D, ctx)
+    # MLP weight-stream dtype axis (Wg/Wu/Wd -- "MLP weights" in the byte breakdown, the largest
+    # single weight class). bf16 (default) is byte-for-byte the pre-existing path; QUANT_MLP_DTYPE
+    # is an engineering-check toggle (see its definition above), not a quality-validated default.
+    mlp_quant_kw = (dict(weight_dtype=QUANT_MLP_DTYPE, group_size=QUANT_MLP_GROUP)
+                    if QUANT_MLP_DTYPE != "bf16" else {})
+    op_gate = gemv(FF, D, ctx, **mlp_quant_kw)
+    op_up = gemv(FF, D, ctx, **mlp_quant_kw)
     if sp.act == "silu":
         op_act = SiLU(size=FF, num_aie_columns=COLS, tile_size=FF // COLS, context=ctx)
     else:
         op_act = GELU(size=FF, num_aie_columns=COLS, num_channels=1, tile_size=FF // COLS, context=ctx)
     op_mul_ffn = ElementwiseMul(size=FF, tile_size=FF // COLS, num_aie_columns=COLS, context=ctx)
-    op_down = gemv(D, FF, ctx)
+    op_down = gemv(D, FF, ctx, **mlp_quant_kw)
     op_add = ElementwiseAdd(size=D, tile_size=D // COLS, num_aie_columns=COLS, context=ctx)
     op_head = gemv(VOCAB, D, ctx)
 
@@ -297,10 +356,15 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
         nm = sp.norm_weight_names(l)
         for key, tensor in nm.items():
             weights[p + key] = load_norm(tensor)
+        mlp_keys = {"Wg", "Wu", "Wd"}
         for key, tensor in (("Wq", "self_attn.q_proj"), ("Wk", "self_attn.k_proj"),
                             ("Wv", "self_attn.v_proj"), ("Wo", "self_attn.o_proj"),
                             ("Wg", "mlp.gate_proj"), ("Wu", "mlp.up_proj"), ("Wd", "mlp.down_proj")):
-            weights[p + key] = bf16(npy(f"model.layers.{l}.{tensor}.weight")).reshape(-1)
+            w = npy(f"model.layers.{l}.{tensor}.weight")  # [M, K], f32
+            if key in mlp_keys and QUANT_MLP_DTYPE != "bf16":
+                weights[p + key] = quantize_weight(w, QUANT_MLP_GROUP, QUANT_MLP_DTYPE)
+            else:
+                weights[p + key] = bf16(w).reshape(-1)
         weights[p + "kc"] = np.zeros(Hkv * S * HD, BF16)
         weights[p + "vc"] = np.zeros(Hkv * S * HD, BF16)
         cache_names += [p + "kc", p + "vc"]
@@ -428,7 +492,7 @@ def main():
 
     bdir = os.path.join(a.out, "buffers")
     for n_, arr in weights.items():
-        open(os.path.join(bdir, f"{n_}.bin"), "wb").write(np.asarray(arr, BF16).tobytes())
+        open(os.path.join(bdir, f"{n_}.bin"), "wb").write(weight_bytes(arr))
     open(os.path.join(a.out, "decode.elf"), "wb").write(elf)
 
     meta = {
@@ -452,6 +516,8 @@ def main():
                           "rope_theta_local": sp.rope_theta_local},
         "layer_types": ["global" if sp.is_global(l) else "sliding" for l in range(NL)],
         "cache_buffers": cache_names,
+        # Engineering-check axis (see QUANT_MLP_DTYPE above), not a validated model default.
+        "weight_quant": {"mlp_dtype": QUANT_MLP_DTYPE, "mlp_group_size": QUANT_MLP_GROUP},
     }
     prov = toolchain_provenance()
     if prov:

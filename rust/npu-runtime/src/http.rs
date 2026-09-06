@@ -397,7 +397,7 @@ fn admin_add_model(req: &Request, handle: &Handle, cfg_path: &Path) -> Response 
     };
     mutate_and_reconcile(handle, cfg_path, |cfg| {
         cfg.models.retain(|m| m.name != name);
-        cfg.models.push(ModelCfg { name: name.clone(), scenario: scenario.clone() });
+        cfg.models.push(ModelCfg { name: name.clone(), scenario: scenario.clone(), resident: false });
     })
 }
 
@@ -1080,7 +1080,7 @@ mod route_tests {
         let cfg_path = dir.path().join("engine.toml");
         let cfg = Config {
             server: ServerCfg { max_resident: 8, ..Default::default() },
-            models: vec![ModelCfg { name: "bge".into(), scenario: "x".into() }],
+            models: vec![ModelCfg { name: "bge".into(), scenario: "x".into(), resident: false }],
             ..Default::default()
         };
         cfg.save(&cfg_path).unwrap();
@@ -1132,7 +1132,7 @@ mod route_tests {
         let p = dir.path().join("engine.toml");
         let cfg = Config {
             server: ServerCfg { max_resident: 2, idle_unload_s: 0, ..Default::default() },
-            models: vec![ModelCfg { name: "tts".into(), scenario: "y".into() }],
+            models: vec![ModelCfg { name: "tts".into(), scenario: "y".into(), resident: false }],
             ..Default::default()
         };
         cfg.save(&p).unwrap();
@@ -1166,7 +1166,7 @@ mod route_tests {
         let cfg = Config {
             server: ServerCfg { max_resident, idle_unload_s: 0, ..Default::default() },
             models: models.iter()
-                .map(|(n, _)| ModelCfg { name: (*n).into(), scenario: "x".into() }).collect(),
+                .map(|(n, _)| ModelCfg { name: (*n).into(), scenario: "x".into(), resident: false }).collect(),
             ..Default::default()
         };
         cfg.save(&p).unwrap();
@@ -1231,8 +1231,8 @@ mod route_tests {
         let cfg = Config {
             server: ServerCfg { max_resident: 1, idle_unload_s: 0, ..Default::default() },
             models: vec![
-                ModelCfg { name: "bge".into(), scenario: "x".into() },
-                ModelCfg { name: "e5".into(), scenario: "y".into() },
+                ModelCfg { name: "bge".into(), scenario: "x".into(), resident: false },
+                ModelCfg { name: "e5".into(), scenario: "y".into(), resident: false },
             ],
             ..Default::default()
         };
@@ -1352,7 +1352,7 @@ mod generate_tests {
         let p = dir.path().join("engine.toml");
         let cfg = Config {
             server: ServerCfg { max_resident: 1, idle_unload_s: 0, ..Default::default() },
-            models: vec![ModelCfg { name: "llm".into(), scenario: "x".into() }],
+            models: vec![ModelCfg { name: "llm".into(), scenario: "x".into(), resident: false }],
             ..Default::default()
         };
         cfg.save(&p).unwrap();

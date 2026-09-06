@@ -26,7 +26,15 @@ fi
 # every COMMENT load-bearing: rewording the prose on a line minted a new key and orphaned a built
 # instance, i.e. a full rebuild to fix a typo. toolchain.lock is 5 KEY=value fields plus prose, so
 # the key is the fields with comments and blank lines stripped.
-_lock_semantic() { sed -e 's/[[:space:]]*#.*$//' -e '/^[[:space:]]*$/d' "$REPO/toolchain.lock"; }
+# The instance key covers what is BUILT INTO the instance -- mlir-aie, the LLVM distro, Peano --
+# and nothing else. IRON is a separate python tree resolved through PYTHONPATH at runtime and is
+# never compiled in, so pinning it must not invalidate an already-built toolchain. Dropping it here
+# is a semantic statement, not a convenience: a key belongs in this hash only if changing it changes
+# the artifacts under $INST. Adding IRON_FORK_COMMIT without this moved the key to c4fb9caa28b9 and
+# would have forced a full rebuild for a value the build never reads.
+_lock_semantic() {
+  sed -e 's/[[:space:]]*#.*$//' -e '/^[[:space:]]*$/d' -e '/^IRON_FORK_COMMIT=/d' "$REPO/toolchain.lock"
+}
 LOCKHASH="$(_lock_semantic | sha256sum | cut -c1-12)"
 INSTROOT="${TOOLCHAIN_HOME:-$XDNA_CACHE/instances}"
 INST="$INSTROOT/$LOCKHASH"

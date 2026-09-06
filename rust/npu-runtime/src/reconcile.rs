@@ -63,7 +63,7 @@ mod tests {
     fn cfg(names: &[&str]) -> Config {
         Config {
             server: ServerCfg { max_resident: 8, ..Default::default() },
-            models: names.iter().map(|n| ModelCfg { name: (*n).into(), scenario: "x".into() }).collect(),
+            models: names.iter().map(|n| ModelCfg { name: (*n).into(), scenario: "x".into(), resident: false }).collect(),
             ..Default::default()
         }
     }
