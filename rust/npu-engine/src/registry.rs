@@ -64,10 +64,9 @@ pub fn try_build(cfg_path: &Path, root: &Path) -> Result<Scenario, EngineError> 
         Some(crate::ModelKind::Generate) => {
             let dev = open_dev()?;
             let decode_dir = root.join(&cfg.artifacts.decode);
-            let weights_dir = root.join(&cfg.artifacts.weights);
             let tokenizer_dir = root.join(&cfg.artifacts.tokenizer_dir);
             let model_cfg = crate::llm::ModelConfig::load(&tokenizer_dir)?;
-            let decode = crate::llm::NpuDecodeStep::new(&dev, &decode_dir, &weights_dir)?;
+            let decode = crate::llm::NpuDecodeStep::new(&dev, &decode_dir)?;
             Scenario::Generate(Box::new(crate::llm::LlmGenerator::new(model_cfg, decode)))
         }
         None => return Err(EngineError::Load(format!("unknown scenario kind {:?}", cfg.scenario.kind))),

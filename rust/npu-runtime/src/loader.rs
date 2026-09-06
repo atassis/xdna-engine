@@ -158,10 +158,10 @@ mod tests {
         // against the process cwd works only where cwd happens to equal the root -- which the
         // systemd unit sets, so the service masked it and only the CLI failed.
         let l = EngineLoader { root: std::path::PathBuf::from("/opt/engine") };
-        let rel = ModelCfg { name: "m".into(), scenario: "scenarios/x.toml".into() };
+        let rel = ModelCfg { name: "m".into(), scenario: "scenarios/x.toml".into(), resident: false };
         assert_eq!(l.scenario_path(&rel), std::path::PathBuf::from("/opt/engine/scenarios/x.toml"));
         // An absolute path is already an answer and must be left alone.
-        let abs = ModelCfg { name: "m".into(), scenario: "/etc/npu/y.toml".into() };
+        let abs = ModelCfg { name: "m".into(), scenario: "/etc/npu/y.toml".into(), resident: false };
         assert_eq!(l.scenario_path(&abs), std::path::PathBuf::from("/etc/npu/y.toml"));
     }
 

@@ -21,7 +21,6 @@
 use std::path::Path;
 use std::rc::Rc;
 
-use ndarray::Array2;
 use npu_xrt::{Device, ElfResident, FusedArena};
 
 use crate::api::EngineError;
@@ -70,20 +69,22 @@ pub struct NpuDecodeStep {
     artifact: LlmArtifact,
     arena: FusedArena,
     res: ElfResident,
-    /// `[vocab, d_model]` f32, for the host embedding gather (`step`'s `embed[token] * scale`). Kept
-    /// as f32 (not the on-device bf16 `W_head` blob) because the host does this lookup in the
-    /// artifact's own declared precision path -- HF weights are f32, exactly like
-    /// `verify_llm_decode.py`'s `embed_tokens.weight.npy` load.
-    embed: Array2<f32>,
+    /// The tied `W_head` blob, mmapped: `[vocab, d_model]` bf16 row-major, which IS the embedding
+    /// table -- `gen_llm_decode.py` builds `W_head` from `model.embed_tokens.weight`. Gathered one
+    /// row per step, so a generation never materialises the table.
+    ///
+    /// bf16 here is the artifact's real precision rather than a narrowing: the checkpoint ships
+    /// bf16 and `dump_llm_weights.py` widens it with `.float()`, so the f32 `.npy` this reads
+    /// instead of carries no information a bf16 does not.
+    embed: memmap2::Mmap,
     embed_scale: f32,
 }
 
 impl NpuDecodeStep {
-    /// `decode_dir` holds `meta.json` + the ELF + `buffers/<name>.bin` (see [`LlmArtifact`]);
-    /// `weights_dir` holds the checkpoint's dumped `.npy` weights, for `model.embed_tokens.weight.npy`
-    /// (the host-side embedding gather -- everything else the device needs is already in
-    /// `decode_dir/buffers`).
-    pub fn new(dev: &Rc<Device>, decode_dir: &Path, weights_dir: &Path) -> Result<Self, EngineError> {
+    /// `decode_dir` holds `meta.json` + the ELF + `buffers/<name>.bin` (see [`LlmArtifact`]) and is
+    /// the ONLY input: the host embedding gather reads the tied `W_head` blob that is already there,
+    /// so the checkpoint's dumped `.npy` weights are a build input and no longer a runtime one.
+    pub fn new(dev: &Rc<Device>, decode_dir: &Path) -> Result<Self, EngineError> {
         let artifact = LlmArtifact::load(decode_dir)?;
         // Mirrors this exact loop's writes below (`x_loc`, `rope_loc`) -- an artifact declaring a
         // third per-token input buffer would otherwise leave it unwritten every token, silently.
@@ -118,16 +119,20 @@ impl NpuDecodeStep {
             .map_err(|e| EngineError::Load(format!("open_elf_resident: decode ELF lacks a ctrl scratchpad: {e}")))?;
         arena.bind_resident(&res).map_err(|e| EngineError::Load(format!("bind resident arena BOs: {e}")))?;
 
-        let embed_path = weights_dir.join("model.embed_tokens.weight.npy");
-        let embed: Array2<f32> = ndarray_npy::read_npy(&embed_path)
-            .map_err(|e| EngineError::Load(format!("read {}: {e}", embed_path.display())))?;
-        if embed.shape() != [artifact.vocab, artifact.d_model] {
+        // Gate on the BYTE LENGTH the layout declares, not on the file merely existing: a W_head
+        // built for another vocab is the failure that would otherwise gather a wrong row quietly.
+        let embed_path = artifact.weight_blob_path("W_head");
+        let want = artifact.vocab * artifact.d_model * 2;
+        let f = std::fs::File::open(&embed_path)
+            .map_err(|e| EngineError::Load(format!("open {}: {e}", embed_path.display())))?;
+        // SAFETY: the artifact directory is owned by the engine and read-only for its lifetime; a
+        // concurrent truncation would be a corrupted install, which every other blob read shares.
+        let embed = unsafe { memmap2::Mmap::map(&f) }
+            .map_err(|e| EngineError::Load(format!("mmap {}: {e}", embed_path.display())))?;
+        if embed.len() != want {
             return Err(EngineError::Load(format!(
-                "{} is {:?}, artifact declares vocab={} d_model={}",
-                embed_path.display(),
-                embed.shape(),
-                artifact.vocab,
-                artifact.d_model
+                "{} is {} bytes, artifact declares vocab={} d_model={} (bf16 -> {} bytes)",
+                embed_path.display(), embed.len(), artifact.vocab, artifact.d_model, want
             )));
         }
         let embed_scale = match artifact.embed_scale {
@@ -182,10 +187,23 @@ impl DecodeStep for NpuDecodeStep {
             return Err(EngineError::Unsupported(format!("token {tok} >= vocab {}", self.artifact.vocab)));
         }
 
-        let x: Vec<f32> = self.embed.row(tok).iter().map(|&v| v * self.embed_scale).collect();
+        // The row is already bf16 in exactly the layout `x` wants, so an unscaled model writes the
+        // mmapped bytes straight through: no unpack, no repack. A scaled model pays a conversion on
+        // one row, and the f32 it converts through is the same value the old whole-table path held,
+        // so both arms stay bit-identical to it.
+        let d = self.artifact.d_model;
+        let row = &self.embed[tok * d * 2..(tok + 1) * d * 2];
+        let scaled;
+        let x_bytes: &[u8] = if self.embed_scale == 1.0 {
+            row
+        } else {
+            let v: Vec<f32> = unpack_bf16_bytes(row).iter().map(|&e| e * self.embed_scale).collect();
+            scaled = pack_bf16_bytes(&v);
+            &scaled
+        };
         let x_loc = self.artifact.loc("x");
         self.arena
-            .write_at(x_loc.arena, x_loc.off, &pack_bf16_bytes(&x))
+            .write_at(x_loc.arena, x_loc.off, x_bytes)
             .map_err(|e| EngineError::Device(format!("write x: {e}")))?;
 
         let rope = rope_row(pos, self.artifact.head_dim, self.artifact.rope_theta_global);
@@ -227,6 +245,7 @@ impl DecodeStep for NpuDecodeStep {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ndarray::Array2;
 
     // `scripts/... rope_row` cross-check (designs/decode_fused/verify_llm_decode.py:34-48),
     // theta=1e6, head_dim=8 (half=4): computed independently in Python and pasted as a literal, the
@@ -264,7 +283,7 @@ mod tests {
     /// only the embed `.npy` on disk. SKIPs if it is absent.
     #[test]
     fn dump_x_and_rope_bytes_for_the_failing_step() {
-        let (_, weights_dir, _) = gate_paths();
+        let (decode_dir, weights_dir, _) = gate_paths();
         let embed_path = weights_dir.join("model.embed_tokens.weight.npy");
         if !embed_path.exists() {
             eprintln!("SKIP: {} not found", embed_path.display());
@@ -287,6 +306,20 @@ mod tests {
         let x_bytes = pack_bf16_bytes(&x);
         let rope = rope_row(POS, HEAD_DIM, THETA);
         let rope_bytes = pack_bf16_bytes(&rope);
+
+        // The f32 `.npy` above is the ORIGINAL source; `W_head.bin` is what `step` now gathers from.
+        // Asserting they agree byte-for-byte is what licenses reading the blob instead of the table:
+        // the checkpoint is bf16 and the dump widens it, so the narrowing here recovers exactly the
+        // bits that were there. A mismatch means the tied-W_head assumption broke for this artifact.
+        let wh = decode_dir.join("buffers/W_head.bin");
+        if wh.exists() {
+            let blob = std::fs::read(&wh).expect("read W_head.bin");
+            let d = raw_row.len();
+            let row = &blob[TOKEN * d * 2..(TOKEN + 1) * d * 2];
+            assert_eq!(row, &x_bytes[..], "W_head row != bf16(embed row) for token {TOKEN}");
+        } else {
+            eprintln!("NOTE: {} absent, skipped the W_head equivalence assert", wh.display());
+        }
 
         std::fs::write(out_dir.join("rust_embed_row_raw.bin"), bytemuck_f32_to_le_bytes(&raw_row)).unwrap();
         std::fs::write(out_dir.join("rust_x_f32.bin"), bytemuck_f32_to_le_bytes(&x)).unwrap();
@@ -452,7 +485,7 @@ mod tests {
         }
         let (prompt_ids, gen_ids) = load_oracle(&oracle_path);
         let dev = Rc::new(Device::open(0).expect("open NPU device (stop other services first)"));
-        let mut step = NpuDecodeStep::new(&dev, &decode_dir, &weights_dir).expect("build NpuDecodeStep");
+        let mut step = NpuDecodeStep::new(&dev, &decode_dir).expect("build NpuDecodeStep");
 
         let produced = teacher_forced_run(&mut step, &prompt_ids, &gen_ids);
         let matches = produced.iter().zip(&gen_ids).filter(|(a, b)| a == b).count();
@@ -473,7 +506,7 @@ mod tests {
         }
         let (prompt_ids, gen_ids) = load_oracle(&oracle_path);
         let dev = Rc::new(Device::open(0).expect("open NPU device (stop other services first)"));
-        let mut step = NpuDecodeStep::new(&dev, &decode_dir, &weights_dir).expect("build NpuDecodeStep");
+        let mut step = NpuDecodeStep::new(&dev, &decode_dir).expect("build NpuDecodeStep");
 
         const N_RUNS: usize = 5;
         let mut seqs = Vec::with_capacity(N_RUNS);

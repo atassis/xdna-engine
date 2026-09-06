@@ -17,6 +17,7 @@ npu = []
 anyhow = "1"
 ndarray = "0.16"
 ndarray-npy = { version = "0.9", default-features = false }
+memmap2 = "0.9"
 rayon = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

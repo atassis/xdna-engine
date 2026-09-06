@@ -66,7 +66,7 @@ mod tests {
         let now = std::time::Instant::now();
         let mut c = Config::default();
         for (n, _) in models {
-            let m = ModelCfg { name: (*n).into(), scenario: "x".into() };
+            let m = ModelCfg { name: (*n).into(), scenario: "x".into(), resident: false };
             r.try_load(&m, &l, &srv, now);
             c.models.push(m);
         }
@@ -94,7 +94,7 @@ mod tests {
     #[test]
     fn configured_but_never_loaded_is_routable_by_name() {
         let (mut c, r) = reg_with(&[("bge", Capability::EMBED)]);
-        c.models.push(ModelCfg { name: "fresh".into(), scenario: "y".into() });
+        c.models.push(ModelCfg { name: "fresh".into(), scenario: "y".into(), resident: false });
         assert_eq!(resolve(&c, &r, Capability::ASR, Some("fresh")).unwrap(), "fresh",
             "kind is unknown until it loads; the post-load check decides");
     }

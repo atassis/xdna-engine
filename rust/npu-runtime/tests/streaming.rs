@@ -65,7 +65,7 @@ fn spawn_server(loader: GenLoader) -> (npu_runtime::actor::Handle, std::thread::
     let cfg_path = dir.path().join("engine.toml");
     let cfg = Config {
         server: ServerCfg { max_resident: 1, idle_unload_s: 0, ..Default::default() },
-        models: vec![ModelCfg { name: "llm".into(), scenario: "x".into() }],
+        models: vec![ModelCfg { name: "llm".into(), scenario: "x".into(), resident: false }],
         ..Default::default()
     };
     cfg.save(&cfg_path).unwrap();
