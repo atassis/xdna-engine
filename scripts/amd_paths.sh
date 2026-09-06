@@ -45,7 +45,10 @@ export AIECC_JOBS="${AIECC_JOBS:-0}"
 # __TIMESTAMP__, and nothing under aie_kernels/ or in aie_api uses them (checked).
 # Appended rather than assigned, so an existing sloppiness is kept.
 if command -v ccache >/dev/null 2>&1; then
-  export AIE_KERNEL_COMPILER_LAUNCHER="${AIE_KERNEL_COMPILER_LAUNCHER:-ccache}"
+  # ${VAR-default}, NOT ${VAR:-default}: the colon form substitutes an explicitly
+  # EMPTY value too, so `AIE_KERNEL_COMPILER_LAUNCHER= ` would silently be turned
+  # back into ccache and the documented off switch would not exist.
+  export AIE_KERNEL_COMPILER_LAUNCHER="${AIE_KERNEL_COMPILER_LAUNCHER-ccache}"
   case ",${CCACHE_SLOPPINESS:-}," in
     *,time_macros,*) : ;;
     ,,) export CCACHE_SLOPPINESS="time_macros" ;;
