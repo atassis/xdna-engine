@@ -33,19 +33,46 @@ export AIEBU_ASM_DIR="${AIEBU_ASM_DIR:-$XRT_SRC_DIR/src/runtime_src/core/common/
 #   iron_require_api <label> <path-under-IRON>:<literal-symbol> ...
 #
 # Names every missing symbol (not just the first) and prints the branch for the report line.
+# Checks ${IRON:-$IRON_DIR}, i.e. the tree the CALLER will actually build with. Every caller uses
+# the same `IRON="${IRON:-$IRON_DIR}"` idiom and then puts $IRON on PYTHONPATH, so gating $IRON_DIR
+# verified one tree and built with another whenever IRON was overridden -- silently, since the
+# report line said "API surface verified" either way. Found 2026-09-06 by an override that pointed
+# at a worktree while the shared checkout satisfied the gate.
 iron_require_api() {
   local label="$1"; shift
+  local dir="${IRON:-$IRON_DIR}"
   local on spec f sym missing=0
-  on="$(git -C "$IRON_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
+  on="$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
   for spec in "$@"; do
     f="${spec%%:*}"; sym="${spec#*:}"
-    grep -qF -- "$sym" "$IRON_DIR/$f" 2>/dev/null && continue
-    echo "ERROR: $IRON_DIR ('$on') lacks '$sym' in $f -- required by $label" >&2
+    grep -qF -- "$sym" "$dir/$f" 2>/dev/null && continue
+    echo "ERROR: $dir ('$on') lacks '$sym' in $f -- required by $label" >&2
     missing=1
   done
   [ "$missing" = 0 ] || {
     echo "  the fork line carrying it is 'integration-stack'; 'xdna2-asr' is its stale predecessor." >&2
     return 1
   }
-  echo "$on @ $(git -C "$IRON_DIR" rev-parse --short HEAD 2>/dev/null)"
+  echo "$on @ $(git -C "$dir" rev-parse --short HEAD 2>/dev/null)"
+}
+
+# iron_require_pin -- the IRON tree must CONTAIN toolchain.lock's IRON_FORK_COMMIT.
+#
+# Ancestry, not equality: every IRON worktree here carries local commits on top of the pinned
+# floor, so an exact-sha gate would fail all of them. The floor is the merge-base of every IRON
+# line in the workspace, so "contains it" means "descends from the state we all agreed on".
+#
+# An ABSENT pin is not a pass -- a lock that forgot the key must not read as unlocked.
+iron_require_pin() {
+  local dir="${IRON:-$IRON_DIR}"
+  local lock="${IRON_LOCK:-$(dirname "${BASH_SOURCE[0]:-$0}")/../toolchain.lock}"
+  local want
+  want="$(sed -n 's/^IRON_FORK_COMMIT=\([0-9a-f]\{7,\}\).*/\1/p' "$lock" 2>/dev/null | head -1)"
+  [ -n "$want" ] || { echo "ERROR: no IRON_FORK_COMMIT in $lock -- refusing to build unpinned" >&2; return 1; }
+  git -C "$dir" cat-file -e "$want^{commit}" 2>/dev/null || {
+    echo "ERROR: $dir does not have pinned IRON_FORK_COMMIT $want (fetch the fork?)" >&2; return 1; }
+  git -C "$dir" merge-base --is-ancestor "$want" HEAD 2>/dev/null || {
+    echo "ERROR: $dir HEAD ($(git -C "$dir" rev-parse --short HEAD)) does not contain pinned $want." >&2
+    echo "  Rebase onto the pin, or re-pin toolchain.lock to a new merge-base if the floor moved." >&2
+    return 1; }
 }
