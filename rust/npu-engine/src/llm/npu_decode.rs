@@ -219,6 +219,13 @@ impl DecodeStep for NpuDecodeStep {
         self.res
             .write_scratchpad(self.artifact.kv_off.byte_offset, &kv_val.to_le_bytes())
             .map_err(|e| EngineError::Device(format!("write kv_off scratchpad: {e}")))?;
+        // A transposed V cache addresses by POSITION, not position*head_dim: its element address is
+        // h*head_dim*S + d*S + pos, so the base is `pos` alone. Present only on that layout.
+        if let Some(p) = self.artifact.kv_off_v.as_ref() {
+            self.res
+                .write_scratchpad(p.byte_offset, &(pos as u32).to_le_bytes())
+                .map_err(|e| EngineError::Device(format!("write kv_off_v scratchpad: {e}")))?;
+        }
         let sm_raw = (pos + 1) as u32;
         let sm_val = if self.artifact.sm_mask.core { sm_raw << 2 } else { sm_raw };
         self.res

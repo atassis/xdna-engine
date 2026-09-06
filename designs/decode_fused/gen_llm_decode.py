@@ -39,6 +39,14 @@ import ml_dtypes
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from llm_decode_spec import SPECS  # noqa: E402
 
+# Dataflow switches, read ONCE at module scope. They are consumed in three different functions
+# (graph construction, the runlist, and the meta writer), and defining them next to their first
+# use put them out of scope in the others -- four times in one session, because Python does not
+# complain until the single run that matters.
+GROUPED_K = os.environ.get("GQA_GROUPED_K") == "1"
+GROUPED_V = os.environ.get("GQA_GROUPED_V") == "1"
+VT_CACHE = os.environ.get("VT_TRANSPOSED_CACHE") == "1"
+
 import newstack_compat  # noqa: F401,E402 -- MUST precede iron imports (new-mlir-aie port shim)
 from iron.common import AIEContext  # noqa: E402
 from elf_dispatch_compat import OperatorSequence, load_elf  # noqa: E402
@@ -293,7 +301,20 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
               output_sizes=(1, Hkv, HD), output_strides=(0, S * HD, 1), output_offset=0,
               input_buffer_size=Hkv * HD, output_buffer_size=Hkv * S * HD, num_aie_channels=1)
     op_sck = StridedCopy(**sc, output_offset_parameter="kv_off", context=ctx)
-    op_scv = StridedCopy(**sc, output_offset_parameter="kv_off", context=ctx)
+    # V CACHE ORIENTATION. op_ctx is gemv(M=HD, K=S), so it wants its matrix as [HD][S]; the cache
+    # is written [S][HD], and op_trv exists ONLY to reconcile the two -- 528.5 MB/token of pure
+    # rearrangement at 0% compute. Storing V transposed at APPEND time deletes that op outright:
+    # the write becomes HD elements at stride S instead of HD contiguous, i.e. ~1024 elements per
+    # head per token against a whole-cache transpose.
+    #
+    # It needs its OWN offset param: the address is h*HD*S + d*S + p, so the base is `p`, while K
+    # (which keeps [S][HD], because op_scores is gemv(M=S, K=HD) and wants it) needs `p*HD`. One
+    # scratchpad value cannot serve both, and a BD cannot divide.
+    if VT_CACHE:
+        sc_v = dict(sc, output_sizes=(1, Hkv, HD), output_strides=(0, HD * S, S))
+        op_scv = StridedCopy(**sc_v, output_offset_parameter="kv_off_v", context=ctx)
+    else:
+        op_scv = StridedCopy(**sc, output_offset_parameter="kv_off", context=ctx)
     # GQA broadcast. Correctness-first; the byte-free form is a batch-stride-0 GEMV read of the kv
     # head (0 ops, 0 bytes) -- at Hq=16 x 28 layers this Repeat plus the V transpose are 41% of the
     # per-token DDR budget, so it is the first optimisation after parity, not an afterthought.
@@ -313,7 +334,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
     op_rep_k = Repeat(rows=Hkv, cols=S * HD, repeat=sp.gqa_group, transfer_size=HD, context=ctx)
     op_rep_v = Repeat(rows=Hkv, cols=S * HD, repeat=sp.gqa_group, transfer_size=HD, context=ctx)
     op_scores = gemv(S, HD, ctx, num_batches=Hq,
-                     batch_group=sp.gqa_group if grouped_k else 1)
+                     batch_group=sp.gqa_group if GROUPED_K else 1)
     op_scale = ElementwiseMul(size=Hq * S, tile_size=S // COLS, num_aie_columns=COLS, context=ctx)
     op_softmax = Softmax(rows=Hq, cols=S, num_aie_columns=COLS, num_channels=1, rtp_vector_size=S,
                          vector_size_parameter="sm_mask", context=ctx)
@@ -335,11 +356,10 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
     # that duplicated it into DDR disappears. Opt-in per side because k and v are not the same edit
     # (k: Repeat feeds the GEMV; v: Repeat feeds a Transpose that feeds the GEMV), so they must be
     # gated separately to stay attributable in an A/B ladder.
-    grouped_k = os.environ.get("GQA_GROUPED_K") == "1"
-    grouped_v = os.environ.get("GQA_GROUPED_V") == "1"
     op_trv = Transpose(M=S, N=HD, num_aie_columns=4, num_channels=1, m=256, n=32, s=8,
-                       num_batches=Hq, batch_group=sp.gqa_group if grouped_v else 1, context=ctx)
-    op_ctx = gemv(HD, S, ctx, num_batches=Hq)
+                       num_batches=Hq, batch_group=sp.gqa_group if GROUPED_V else 1, context=ctx)
+    op_ctx = gemv(HD, S, ctx, num_batches=Hq,
+                  batch_group=sp.gqa_group if VT_CACHE else 1)
     # MLP weight-stream dtype axis (Wg/Wu/Wd -- "MLP weights" in the byte breakdown, the largest
     # single weight class). bf16 (default) is byte-for-byte the pre-existing path; QUANT_MLP_DTYPE
     # is an engineering-check toggle (see its definition above), not a quality-validated default.
@@ -404,13 +424,15 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
             (op_rope_k, p + "k", ang, p + "k"),
             (op_sck, p + "k", p + "kc"),
             (op_scv, p + "v", p + "vc"),
-            *([] if grouped_k else [(op_rep_k, p + "kc", p + "kr")]),
-            *([] if grouped_v else [(op_rep_v, p + "vc", p + "vr")]),
-            (op_scores, p + ("kc" if grouped_k else "kr"), p + "q", p + "sc"),
+            *([] if GROUPED_K else [(op_rep_k, p + "kc", p + "kr")]),
+            *([] if GROUPED_V else [(op_rep_v, p + "vc", p + "vr")]),
+            (op_scores, p + ("kc" if GROUPED_K else "kr"), p + "q", p + "sc"),
             (op_scale, p + "sc", "attn_scale", p + "sc"),
             (op_softmax, p + "sc", p + "sw"),
-            (op_trv, p + ("vc" if grouped_v else "vr"), p + "vt"),
-            (op_ctx, p + "vt", p + "sw", p + "cx"),
+            # With a transposed cache op_ctx reads vc directly and op_trv disappears entirely --
+            # its 528.5 MB/token were rearrangement, not information.
+            *([] if VT_CACHE else [(op_trv, p + ("vc" if GROUPED_V else "vr"), p + "vt")]),
+            (op_ctx, p + ("vc" if VT_CACHE else "vt"), p + "sw", p + "cx"),
             (op_o, p + "Wo", p + "cx", p + "a"),
         ]
         if sp.sandwich_norms:
@@ -508,8 +530,13 @@ def main():
         "input_size": int(in_sz), "output_size": int(out_sz), "scratch_size": int(scr),
         "layout": {n: {"type": v[0], "offset": int(v[1]), "len": int(v[2])} for n, v in lay.items()},
         "inputs": inputs, "weights": wnames, "output": "logits",
+        # kv_v_param is present only for a transposed V cache, and it is a DIFFERENT quantity
+        # from kv_param: `n_past` in elements, not `n_past * head_dim`. A host that does not know
+        # the key simply will not find it, which is why it is absent rather than null on the
+        # untransposed path -- an unwritten param must fail loudly, not default to zero.
         "scratchpad": {"params": scratchpad_params, "kv_param": "kv_off", "mask_param": "sm_mask",
-                       "head_dim": HD, "kv_heads": Hkv},
+                       "head_dim": HD, "kv_heads": Hkv,
+                       **({"kv_v_param": "kv_off_v"} if VT_CACHE else {})},
         "dims": {"layers": NL, "d_model": D, "q_heads": Hq, "kv_heads": Hkv, "head_dim": HD,
                  "ffn": FF, "vocab": VOCAB, "S": S,
                  "sliding_window": sp.sliding_window, "sw_pattern": sp.sw_pattern},

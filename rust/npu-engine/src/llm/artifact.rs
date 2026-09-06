@@ -66,6 +66,10 @@ pub struct LlmArtifact {
     /// buffer still validates.
     pub cache_buffers: Vec<String>,
     pub kv_off: ScratchpadParam,
+    /// Present only for a TRANSPOSED V cache, and it carries a different quantity from `kv_off`:
+    /// `n_past` in elements, not `n_past * head_dim`. Absent means the untransposed layout, where
+    /// `op_scv` shares `kv_off` with `op_sck` -- so `None` is a layout statement, not a default.
+    pub kv_off_v: Option<ScratchpadParam>,
     pub sm_mask: ScratchpadParam,
     pub head_dim: usize,
     pub d_model: usize,
@@ -207,6 +211,12 @@ impl LlmArtifact {
         };
         let kv_off = read_param(kv_param_name)?;
         let sm_mask = read_param(mask_param_name)?;
+        // Absent key -> untransposed cache. A PRESENT key naming a missing param is still an error:
+        // an artifact that declares a param the host cannot find must fail, not fall back.
+        let kv_off_v = match sp.get("kv_v_param").and_then(|v| v.as_str()) {
+            Some(name) => Some(read_param(name)?),
+            None => None,
+        };
 
         // Compat shim, narrow and logged: ONLY for `rope_global` immediately following `x`, the exact
         // shape `gen_llm_decode.py` currently emits. Any other gap still fails loud below.
@@ -315,6 +325,7 @@ impl LlmArtifact {
             output,
             cache_buffers,
             kv_off,
+            kv_off_v,
             sm_mask,
             head_dim,
             d_model,
