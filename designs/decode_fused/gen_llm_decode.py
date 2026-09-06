@@ -312,7 +312,8 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
     # route that needs none.
     op_rep_k = Repeat(rows=Hkv, cols=S * HD, repeat=sp.gqa_group, transfer_size=HD, context=ctx)
     op_rep_v = Repeat(rows=Hkv, cols=S * HD, repeat=sp.gqa_group, transfer_size=HD, context=ctx)
-    op_scores = gemv(S, HD, ctx, num_batches=Hq)
+    op_scores = gemv(S, HD, ctx, num_batches=Hq,
+                     batch_group=sp.gqa_group if grouped_k else 1)
     op_scale = ElementwiseMul(size=Hq * S, tile_size=S // COLS, num_aie_columns=COLS, context=ctx)
     op_softmax = Softmax(rows=Hq, cols=S, num_aie_columns=COLS, num_channels=1, rtp_vector_size=S,
                          vector_size_parameter="sm_mask", context=ctx)
@@ -329,8 +330,15 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
     # -- it checks M*N % (m*n*cols*channels), which 8 satisfies -- and the failure surfaces deep in
     # taplib as "All sizes must be >= 1, but got [8, 0, 256, 32]", naming no operator and no
     # parameter. 4 is the real ceiling at this n; raising it needs n=16.
+    # GQA broadcast as an ACCESS PATTERN instead of a materialised copy. gqa_group query heads
+    # attend to one kv head; with batch_group the consumer reads that head directly and the Repeat
+    # that duplicated it into DDR disappears. Opt-in per side because k and v are not the same edit
+    # (k: Repeat feeds the GEMV; v: Repeat feeds a Transpose that feeds the GEMV), so they must be
+    # gated separately to stay attributable in an A/B ladder.
+    grouped_k = os.environ.get("GQA_GROUPED_K") == "1"
+    grouped_v = os.environ.get("GQA_GROUPED_V") == "1"
     op_trv = Transpose(M=S, N=HD, num_aie_columns=4, num_channels=1, m=256, n=32, s=8,
-                       num_batches=Hq, context=ctx)
+                       num_batches=Hq, batch_group=sp.gqa_group if grouped_v else 1, context=ctx)
     op_ctx = gemv(HD, S, ctx, num_batches=Hq)
     # MLP weight-stream dtype axis (Wg/Wu/Wd -- "MLP weights" in the byte breakdown, the largest
     # single weight class). bf16 (default) is byte-for-byte the pre-existing path; QUANT_MLP_DTYPE
@@ -396,12 +404,12 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
             (op_rope_k, p + "k", ang, p + "k"),
             (op_sck, p + "k", p + "kc"),
             (op_scv, p + "v", p + "vc"),
-            (op_rep_k, p + "kc", p + "kr"),
-            (op_rep_v, p + "vc", p + "vr"),
-            (op_scores, p + "kr", p + "q", p + "sc"),
+            *([] if grouped_k else [(op_rep_k, p + "kc", p + "kr")]),
+            *([] if grouped_v else [(op_rep_v, p + "vc", p + "vr")]),
+            (op_scores, p + ("kc" if grouped_k else "kr"), p + "q", p + "sc"),
             (op_scale, p + "sc", "attn_scale", p + "sc"),
             (op_softmax, p + "sc", p + "sw"),
-            (op_trv, p + "vr", p + "vt"),
+            (op_trv, p + ("vc" if grouped_v else "vr"), p + "vt"),
             (op_ctx, p + "vt", p + "sw", p + "cx"),
             (op_o, p + "Wo", p + "cx", p + "a"),
         ]
