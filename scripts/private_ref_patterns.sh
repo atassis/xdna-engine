@@ -42,6 +42,8 @@ private_ref_regex="$(IFS='|'; echo "${private_ref_patterns[*]}")"
 # heuristic (e.g. "require a hyphen") -- the private KB also has legitimate single-word
 # slugs (`design`, `approaches`), so a hyphen-required pattern would silently stop
 # catching a real single-word slug leak. Grow this allowlist only when a NEW verified
-# non-KB `[[word]]` use shows up; do not add words defensively.
+# non-KB `[[word]]` use shows up; do not add words defensively. Third such case, verified
+# 2026-09-06: `np.asarray([[nxt]], ...)` in scripts/whisper_wer_from_hidden.py -- the same
+# nested-array literal as `[[last]]`, a different loop variable. It had the gate red on main.
 private_ref_wikilink_re='\[\[[a-z0-9][a-z0-9-]*\]\]'
-private_ref_benign_wikilink_re='\[\[(bin|model|last)\]\]'
+private_ref_benign_wikilink_re='\[\[(bin|model|last|nxt)\]\]'
