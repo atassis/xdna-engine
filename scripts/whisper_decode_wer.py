@@ -15,7 +15,6 @@ import argparse, json, os, re, sys, time, unicodedata
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-CLIPS = REPO / "artifacts" / "wer_clips"
 
 _PUNCT = re.compile(r"[^\w\s]", re.UNICODE)
 _WS = re.compile(r"\s+")
@@ -39,12 +38,12 @@ def wer(ref, hyp):
     return prev[-1] / len(r), len(r)
 
 
-def transcribe(url, wav_path, timeout):
+def transcribe(url, wav_path, model, timeout):
     import requests
     with open(wav_path, "rb") as f:
         files = {"file": (os.path.basename(wav_path), f, "audio/wav")}
         t0 = time.time()
-        resp = requests.post(url, files=files, data={"model": "whisper-small"}, timeout=timeout)
+        resp = requests.post(url, files=files, data={"model": model}, timeout=timeout)
         dt = time.time() - t0
     resp.raise_for_status()
     return resp.json().get("text", ""), dt
@@ -53,20 +52,27 @@ def transcribe(url, wav_path, timeout):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--url", default="http://127.0.0.1:11434/v1/audio/transcriptions")
+    ap.add_argument("--model", default="whisper-small")
+    ap.add_argument("--clips", default="artifacts/wer_clips")
     ap.add_argument("--label", default="run")
     ap.add_argument("--out", default=None)
+    ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--timeout", type=float, default=300.0)
     a = ap.parse_args()
 
-    refs = json.load(open(CLIPS / "refs.json", encoding="utf-8"))
+    clips = Path(a.clips)
+    refs = json.load(open(clips / "refs.json", encoding="utf-8"))
+    names = sorted(refs)
+    if a.limit:
+        names = names[: a.limit]
     rows = {}
     wall = []
-    for name in sorted(refs):
-        wav = CLIPS / name
+    for name in names:
+        wav = clips / name
         if not wav.is_file():
             continue
         try:
-            hyp, dt = transcribe(a.url, wav, a.timeout)
+            hyp, dt = transcribe(a.url, wav, a.model, a.timeout)
         except Exception as e:  # noqa: BLE001
             print(f"[{a.label}] {name} FAILED: {e!r}", file=sys.stderr)
             continue
