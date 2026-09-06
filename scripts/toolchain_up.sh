@@ -81,9 +81,28 @@ _link_vendored_tools() {
 # leaves this symlink untouched -- so the headers kernels compile against are not the ones the lock
 # describes. Repointing it is a measured behaviour change, not a cleanup; scripts/check_aie_api_pin.sh
 # ratchets the current state so a bump cannot move it silently.
+# These point SHARED state (the instance is keyed by the lock, not by the caller) at a path, so the
+# path must outlive any one caller. $REPO is whatever tree toolchain_up.sh was run from, and a linked
+# worktree is ephemeral: running this from one repointed the instance at it, and DELETING that
+# worktree later left both symlinks dangling, breaking every other tree's kernel compiles with
+# `aie_api/aie.hpp file not found`. Observed three times on 2026-09-06, twice from a worktree that
+# lacked a .venv-iron (so it dangled immediately) and once from a worktree that was later removed.
+# Resolve to the PRIMARY worktree instead, which is the one that cannot be pruned.
+_shared_link_root() {
+  local main
+  main="$(git -C "$REPO" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print $2; exit}')"
+  [ -n "$main" ] && [ -d "$main" ] && { echo "$main"; return; }
+  echo "$REPO"
+}
 _link_include_dirs() {
-  ln -sfn "$REPO/.venv-iron/lib/python3.14/site-packages/mlir_aie/include/aie_api" "$INST/build/include/aie_api"
-  ln -sfn "$REPO/mlir-aie/aie_kernels" "$INST/build/include/aie_kernels"   # aie.iron _default_source_path resolves kernel .cc here (aie2p/mm.cc etc.)
+  local root; root="$(_shared_link_root)"
+  ln -sfn "$root/.venv-iron/lib/python3.14/site-packages/mlir_aie/include/aie_api" "$INST/build/include/aie_api"
+  ln -sfn "$root/mlir-aie/aie_kernels" "$INST/build/include/aie_kernels"   # aie.iron _default_source_path resolves kernel .cc here (aie2p/mm.cc etc.)
+  # A dangling shared symlink is worse than a missing one: it fails deep inside Peano naming a header,
+  # not the wiring. Say it here, where the cause is still visible.
+  for want in "aie_api/aie.hpp" "aie_kernels/aie2p/mm.cc"; do
+    [ -e "$INST/build/include/$want" ] || echo "[toolchain_up] WARNING: $INST/build/include/$want does not resolve (root=$root)" >&2
+  done
 }
 
 # Point the generated lit config at the Peano we actually run. Without PEANO_INSTALL_DIR at configure
