@@ -45,6 +45,8 @@ from llm_decode_spec import SPECS  # noqa: E402
 # complain until the single run that matters.
 GROUPED_K = os.environ.get("GQA_GROUPED_K") == "1"
 GROUPED_V = os.environ.get("GQA_GROUPED_V") == "1"
+# Context step as a transposed-A reduction over the V cache rows, deleting op_trv outright.
+TMV_CTX = os.environ.get("TMV_CTX") == "1"
 
 import newstack_compat  # noqa: F401,E402 -- MUST precede iron imports (new-mlir-aie port shim)
 from iron.common import AIEContext  # noqa: E402
@@ -58,6 +60,7 @@ from iron.operators.elementwise_mul.op import ElementwiseMul  # noqa: E402
 from iron.operators.softmax.op import Softmax  # noqa: E402
 from iron.operators.strided_copy.op import StridedCopy  # noqa: E402
 from iron.operators.transpose.op import Transpose  # noqa: E402
+from iron.operators.tmatvec.op import TMatVec  # noqa: E402
 from iron.operators.gelu.op import GELU  # noqa: E402
 from iron.operators.silu.op import SiLU  # noqa: E402
 from iron.operators.repeat.op import Repeat  # noqa: E402
@@ -350,7 +353,17 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
     # gated separately to stay attributable in an A/B ladder.
     op_trv = Transpose(M=S, N=HD, num_aie_columns=4, num_channels=1, m=256, n=32, s=8,
                        num_batches=Hq, batch_group=sp.gqa_group if GROUPED_V else 1, context=ctx)
-    op_ctx = gemv(HD, S, ctx, num_batches=Hq)
+    # CONTEXT STEP. op_trv exists only because gemv reduces ALONG a row: it wants [HD][S] and the
+    # cache is [S][HD], so the whole cache is rearranged every token -- 16.777 MB/layer measured, at
+    # 0% compute. TMatVec reduces DOWN the rows instead and reads `vc` as it is stored, so the
+    # transpose has nothing left to do. One kv head per column (n_matrices == cols == Hkv), so each
+    # column streams its own head ONCE and applies both query heads' softmax rows out of L1 -- the
+    # stride-0 group re-read goes too. rows_per_chunk=64 puts the L1 A tile at 16 KB double-buffered.
+    if TMV_CTX:
+        op_ctx = TMatVec(M=HD, K=S, num_aie_columns=Hkv, num_batches=Hq,
+                         batch_group=sp.gqa_group, rows_per_chunk=64, context=ctx)
+    else:
+        op_ctx = gemv(HD, S, ctx, num_batches=Hq)
     # MLP weight-stream dtype axis (Wg/Wu/Wd -- "MLP weights" in the byte breakdown, the largest
     # single weight class). bf16 (default) is byte-for-byte the pre-existing path; QUANT_MLP_DTYPE
     # is an engineering-check toggle (see its definition above), not a quality-validated default.
@@ -416,12 +429,14 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
             (op_sck, p + "k", p + "kc"),
             (op_scv, p + "v", p + "vc"),
             *([] if GROUPED_K else [(op_rep_k, p + "kc", p + "kr")]),
-            *([] if GROUPED_V else [(op_rep_v, p + "vc", p + "vr")]),
+            # TMV_CTX subsumes the v-side grouping: TMatVec reads vc per kv head itself, so a
+            # Repeat would materialise a `vr` nothing consumes.
+            *([] if (GROUPED_V or TMV_CTX) else [(op_rep_v, p + "vc", p + "vr")]),
             (op_scores, p + ("kc" if GROUPED_K else "kr"), p + "q", p + "sc"),
             (op_scale, p + "sc", "attn_scale", p + "sc"),
             (op_softmax, p + "sc", p + "sw"),
-            (op_trv, p + ("vc" if GROUPED_V else "vr"), p + "vt"),
-            (op_ctx, p + "vt", p + "sw", p + "cx"),
+            *([] if TMV_CTX else [(op_trv, p + ("vc" if GROUPED_V else "vr"), p + "vt")]),
+            (op_ctx, p + ("vc" if TMV_CTX else "vt"), p + "sw", p + "cx"),
             (op_o, p + "Wo", p + "cx", p + "a"),
         ]
         if sp.sandwich_norms:
