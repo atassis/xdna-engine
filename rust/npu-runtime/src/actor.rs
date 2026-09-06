@@ -109,6 +109,7 @@ fn spawn(cfg: Config, loader: Box<dyn ModelLoader + Send>, eager: bool) -> Resul
         // the floor (`let _ = ready_rx.recv()` used to discard it, handing the caller a `Handle` to
         // an actor whose initial reconcile silently never ran).
         let init: Result<(), String> = if eager {
+            if let Some(w) = cfg.pin_overcommit() { eprintln!("[npu] WARNING: {w}"); }
             guard(|| reconcile(&cfg, &mut reg, loader.as_ref())).map(|_report| ())
         } else {
             for m in &cfg.models {
@@ -387,8 +388,8 @@ mod tests {
             defaults: Defaults::from_pairs([
                 (Capability::ASR, "asr".to_string()), (Capability::EMBED, "bge".to_string())]),
             models: vec![
-                ModelCfg { name: "asr".into(), scenario: "x".into() },
-                ModelCfg { name: "bge".into(), scenario: "y".into() },
+                ModelCfg { name: "asr".into(), scenario: "x".into(), resident: false },
+                ModelCfg { name: "bge".into(), scenario: "y".into(), resident: false },
             ],
         };
         start(cfg, Box::new(MockLoader { table: t })).unwrap()
@@ -457,8 +458,8 @@ mod tests {
             defaults: Defaults::from_pairs([
                 (Capability::ASR, "asr".to_string()), (Capability::EMBED, "bge".to_string())]),
             models: vec![
-                ModelCfg { name: "asr".into(), scenario: "x".into() },
-                ModelCfg { name: "bge".into(), scenario: "y".into() },
+                ModelCfg { name: "asr".into(), scenario: "x".into(), resident: false },
+                ModelCfg { name: "bge".into(), scenario: "y".into(), resident: false },
             ],
         };
         let (h, j) = start_lazy(cfg, Box::new(MockLoader { table: t })).unwrap();
@@ -483,7 +484,7 @@ mod tests {
         let cfg = Config {
             server: ServerCfg { max_resident: 1, idle_unload_s: 0, ..Default::default() },
             defaults: Defaults::from_pairs([(Capability::ASR, "asr".to_string())]),
-            models: vec![ModelCfg { name: "asr".into(), scenario: "x".into() }],
+            models: vec![ModelCfg { name: "asr".into(), scenario: "x".into(), resident: false }],
         };
         let (h, j) = start_lazy(cfg, Box::new(MockLoader { table: t })).unwrap();
         let e = match h.embed(None, "hi") { Err(e) => e.to_string(), Ok(s) => panic!("served {}", s.model) };
@@ -540,7 +541,7 @@ mod tests {
         let cfg = Config {
             server: ServerCfg { max_resident: 1, idle_unload_s: 0, ..Default::default() },
             defaults: Defaults::from_pairs([(Capability::EMBED, "bge".to_string())]),
-            models: vec![ModelCfg { name: "bge".into(), scenario: "x".into() }],
+            models: vec![ModelCfg { name: "bge".into(), scenario: "x".into(), resident: false }],
         };
         let (h, j) = start(cfg, Box::new(PanicOnRunLoader)).unwrap();
         assert_eq!(state_of(&h, "bge"), LoadState::Loaded, "it loads fine; the panic is at dispatch");
@@ -570,7 +571,7 @@ mod tests {
         let cfg = Config {
             server: ServerCfg { max_resident: 1, idle_unload_s: 0, ..Default::default() },
             defaults: Defaults::from_pairs([(Capability::EMBED, "bge".to_string())]),
-            models: vec![ModelCfg { name: "bge".into(), scenario: "x".into() }],
+            models: vec![ModelCfg { name: "bge".into(), scenario: "x".into(), resident: false }],
         };
         // start_lazy: nothing loads until the request, so the panic happens on the REQUEST path.
         let (h, j) = start_lazy(cfg, Box::new(PanicLoader)).unwrap();
@@ -593,7 +594,7 @@ mod tests {
         let cfg = Config {
             server: ServerCfg { max_resident: 1, idle_unload_s: 0, ..Default::default() },
             defaults: Defaults::from_pairs([(Capability::ASR, "asr".to_string())]),
-            models: vec![ModelCfg { name: "asr".into(), scenario: "x".into() }],
+            models: vec![ModelCfg { name: "asr".into(), scenario: "x".into(), resident: false }],
         };
         let (h, j) = match start(cfg, Box::new(PanicLoader)) {
             Ok(v) => v,

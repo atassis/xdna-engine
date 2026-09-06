@@ -17,8 +17,8 @@ fn actor_serves_and_echoes_model() {
         defaults: Defaults::from_pairs([
             (Capability::ASR, "asr".to_string()), (Capability::EMBED, "bge".to_string())]),
         models: vec![
-            ModelCfg { name: "bge".into(), scenario: "x".into() },
-            ModelCfg { name: "asr".into(), scenario: "y".into() },
+            ModelCfg { name: "bge".into(), scenario: "x".into(), resident: false },
+            ModelCfg { name: "asr".into(), scenario: "y".into(), resident: false },
         ],
     };
     let (h, join) = start(cfg, Box::new(MockLoader { table: t })).unwrap();
@@ -44,8 +44,8 @@ fn actor_hot_swaps_at_one_slot() {
         defaults: Defaults::from_pairs([
             (Capability::ASR, "asr".to_string()), (Capability::EMBED, "bge".to_string())]),
         models: vec![
-            ModelCfg { name: "asr".into(), scenario: "x".into() },
-            ModelCfg { name: "bge".into(), scenario: "y".into() },
+            ModelCfg { name: "asr".into(), scenario: "x".into(), resident: false },
+            ModelCfg { name: "bge".into(), scenario: "y".into(), resident: false },
         ],
     };
     let (h, join) = start(cfg, Box::new(MockLoader { table: t })).unwrap();
@@ -69,7 +69,7 @@ fn actor_serves_a_capability_with_no_typed_helper() {
     let cfg = Config {
         server: ServerCfg { max_resident: 1, idle_unload_s: 0, ..Default::default() },
         defaults: Defaults::from_pairs([(Capability::TTS, "kokoro".to_string())]),
-        models: vec![ModelCfg { name: "kokoro".into(), scenario: "x".into() }],
+        models: vec![ModelCfg { name: "kokoro".into(), scenario: "x".into(), resident: false }],
     };
     let (h, join) = start(cfg, Box::new(MockLoader { table: t })).unwrap();
     let s = h.serve(Capability::TTS, None, Request::Text("hello".into())).unwrap();
@@ -95,7 +95,7 @@ fn diarize_routes_by_capability_and_leaves_the_asr_default_alone() {
     let cfg = Config {
         server: ServerCfg { max_resident: 2, ..Default::default() },
         defaults: Defaults::from_pairs([(Capability::ASR, "parakeet".to_string())]),
-        models: vec![ModelCfg { name: "parakeet".into(), scenario: "x".into() }],
+        models: vec![ModelCfg { name: "parakeet".into(), scenario: "x".into(), resident: false }],
     };
     let (h, join) = start(cfg, Box::new(l)).unwrap();
     let Err(e) = h.diarize(None, vec![0i16; 16], 16_000) else {

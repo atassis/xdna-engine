@@ -648,7 +648,7 @@ fn config_cmd(path: &Path, action: &ConfigCmd) -> Result<()> {
         ConfigCmd::Show => { print!("{}", render(&cfg)); return Ok(()); }
         ConfigCmd::AddModel { name, scenario } => {
             cfg.models.retain(|m| &m.name != name);
-            cfg.models.push(npu_runtime::config::ModelCfg { name: name.clone(), scenario: scenario.clone() });
+            cfg.models.push(npu_runtime::config::ModelCfg { name: name.clone(), scenario: scenario.clone(), resident: false });
         }
         ConfigCmd::RemoveModel { name } => cfg.models.retain(|m| &m.name != name),
         ConfigCmd::SetDefault { capability, model } => match Capability::from_name(capability) {
@@ -675,6 +675,12 @@ fn render(cfg: &Config) -> String {
     s.push_str(&format!("residency: idle_unload_s {}  idle_release_s {}  sweep_interval_s {}  evict_policy {}\n",
         cfg.server.idle_unload_s, cfg.server.idle_release_s, cfg.server.sweep_interval_s,
         match cfg.server.evict_policy { EvictPolicy::Lru => "lru", EvictPolicy::None => "none" }));
+    let pins = cfg.pinned().map(|m| m.name.as_str()).collect::<Vec<_>>();
+    s.push_str(&format!("pinned resident: {}\n",
+        if pins.is_empty() { "(none)".to_string() } else { pins.join(" ") }));
+    // Surface the overcommit here rather than only at load time: the config summary is where an
+    // operator looks BEFORE a refusal, not after one.
+    if let Some(w) = cfg.pin_overcommit() { s.push_str(&format!("WARNING: {w}\n")); }
     let defaults = cfg.defaults.0.iter().map(|(c, m)| format!("{c}={m}")).collect::<Vec<_>>();
     s.push_str(&format!("defaults: {}\n",
         if defaults.is_empty() { "(none)".to_string() } else { defaults.join(" ") }));
@@ -819,7 +825,7 @@ mod tests {
             server: ServerCfg::default(),
             defaults: Defaults::default(),
             models: scenarios.iter().enumerate()
-                .map(|(i, s)| ModelCfg { name: format!("m{i}"), scenario: (*s).into() })
+                .map(|(i, s)| ModelCfg { name: format!("m{i}"), scenario: (*s).into(), resident: false })
                 .collect(),
         }
     }
@@ -909,7 +915,7 @@ mod tests {
             server: ServerCfg::default(),
             defaults: Defaults::from_pairs([
                 (Capability::ASR, "parakeet".to_string()), (Capability::TTS, "kokoro".to_string())]),
-            models: vec![ModelCfg { name: "parakeet".into(), scenario: "scenarios/asr.toml".into() }],
+            models: vec![ModelCfg { name: "parakeet".into(), scenario: "scenarios/asr.toml".into(), resident: false }],
         };
         let r = render(&c);
         assert!(r.contains("model parakeet -> scenarios/asr.toml"));
@@ -975,6 +981,7 @@ mod tests {
             models: vec![ModelCfg {
                 name: "parakeet".into(),
                 scenario: td.path().join("scenarios/asr.toml").to_str().unwrap().to_string(),
+                resident: false,
             }],
         };
         (td, cfg)
@@ -1018,6 +1025,7 @@ mod tests {
             models: vec![ModelCfg {
                 name: "bge".into(),
                 scenario: td.path().join("scenarios/bge.toml").to_str().unwrap().to_string(),
+                resident: false,
             }],
         };
         // No mlir-aie/.../whole_array/build dir exists under td at all -- if the check were not
