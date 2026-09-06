@@ -54,7 +54,7 @@ index 1721a41b90b..19175baa352 100644
                  compile_mlir_module(
                      mlir_module=mlir_module,
 diff --git a/python/utils/compile/utils.py b/python/utils/compile/utils.py
-index 103ea76613f..315fc75202e 100644
+index 103ea76613f..763cc8ce004 100644
 --- a/python/utils/compile/utils.py
 +++ b/python/utils/compile/utils.py
 @@ -5,12 +5,15 @@
@@ -73,7 +73,7 @@ index 103ea76613f..315fc75202e 100644
  from pathlib import Path
  from typing import TYPE_CHECKING
  
-@@ -23,6 +26,154 @@ if TYPE_CHECKING:
+@@ -23,6 +26,167 @@ if TYPE_CHECKING:
  
  logger = logging.getLogger(__name__)
  
@@ -189,12 +189,25 @@ index 103ea76613f..315fc75202e 100644
 +    if pch.exists():
 +        return str(pch)
 +
++    # Two locks, because they guard different duplications. The thread lock is
++    # for the parallel kernel compiles inside ONE build; the file lock is for
++    # concurrent builds, which are the common case on a shared box and would
++    # otherwise each spend ~2.7 s and ~180 MB producing the same 19 MB file.
++    # Both re-check after acquiring: everyone missed the fast path above.
 +    with _PCH_BUILD_LOCK:
-+        # Re-check: concurrent kernel compiles all miss above, and building one
-+        # PCH per thread costs the wall this exists to save.
 +        if pch.exists():
 +            return str(pch)
-+        return _build_kernel_pch(cxx, pch_flags, cache, key, pch)
++        from aie.utils.compile.cache.utils import file_lock
++
++        try:
++            with file_lock(str(cache / f"{key}.lock"), timeout_seconds=300):
++                if pch.exists():
++                    return str(pch)
++                return _build_kernel_pch(cxx, pch_flags, cache, key, pch)
++        except (TimeoutError, OSError):
++            # Never let the lock be the reason a build stalls or fails: a PCH is
++            # an optimisation. Build our own copy and move on.
++            return _build_kernel_pch(cxx, pch_flags, cache, key, pch)
 +
 +
 +_PCH_BUILD_LOCK = threading.Lock()
@@ -228,7 +241,7 @@ index 103ea76613f..315fc75202e 100644
  
  def resolve_target_arch(device=None) -> str:
      """Return ``'aie2'`` or ``'aie2p'`` for the given device, or ``'aie2'`` if device is None."""
-@@ -302,13 +453,10 @@ def compile_cxx_core_function(
+@@ -302,13 +466,10 @@ def compile_cxx_core_function(
              f"-I{config.cxx_header_path()}",
          ]
      else:
@@ -246,7 +259,7 @@ index 103ea76613f..315fc75202e 100644
              "-std=c++20",
              "-Wno-parentheses",
              "-Wno-attributes",
-@@ -316,11 +464,6 @@ def compile_cxx_core_function(
+@@ -316,11 +477,6 @@ def compile_cxx_core_function(
              "-Wno-empty-body",
              "-O2",
              "-DNDEBUG",
@@ -258,7 +271,7 @@ index 103ea76613f..315fc75202e 100644
              # Pre-trip aie_api's aie_adf.hpp include guard so stock upstream
              # aie_api never pulls in <adf.h> (Vitis-only, absent from Peano).
              # No mlir-aie kernel uses adf:: symbols, so this only elides dead
-@@ -335,9 +478,41 @@ def compile_cxx_core_function(
+@@ -335,9 +491,41 @@ def compile_cxx_core_function(
              # the same stack accounting. -ffunction-sections and
              # -fdata-sections give each symbol its own section, which the
              # attribution in StackSizeAnalysis.h needs.
@@ -303,7 +316,7 @@ index 103ea76613f..315fc75202e 100644
  
      # Add include directories
      if include_dirs:
-@@ -355,6 +530,15 @@ def compile_cxx_core_function(
+@@ -355,6 +543,15 @@ def compile_cxx_core_function(
          check=False,
          capture_output=True,
      )
@@ -319,7 +332,7 @@ index 103ea76613f..315fc75202e 100644
      if ret.stdout:
          logger.debug("%s", ret.stdout.decode())
      if ret.returncode != 0:
-@@ -404,6 +588,234 @@ def compile_cxx_core_function(
+@@ -404,6 +601,253 @@ def compile_cxx_core_function(
                  raise RuntimeError(f"[Peano] LLVM bitcode assembly failed{detail}")
  
  
@@ -512,6 +525,11 @@ index 103ea76613f..315fc75202e 100644
 +                shutil.copy2(child, tmp / "workdir" / child.name)
 +        for flag, dest in named:
 +            shutil.copy2(dest, tmp / "named" / flag.lstrip("-"))
++        # os.replace refuses a non-empty directory, and `entry` can exist here:
++        # the caller holds this key's lock and only reaches the store after a
++        # restore DECLINED the entry (a missing named output). Clear it first --
++        # still inside that lock, so no reader can be inside it.
++        shutil.rmtree(entry, ignore_errors=True)
 +        os.replace(tmp, entry)
 +    except OSError as e:
 +        logger.debug("aiecc cache: not storing %s (%s)", entry.name, e)
@@ -527,7 +545,16 @@ index 103ea76613f..315fc75202e 100644
 +    evicts by age rather than by use.  That is deliberate -- stat'ing every
 +    entry on every hit costs more than the occasional wrong eviction, and a
 +    wrongly evicted entry is a recompile, not a fault.
++
++    Every deletion takes the SAME per-key lock the compile path holds while it
++    restores. Without it a concurrent build copying out of an entry gets a
++    half-deleted tree -- a corrupt work dir, not a miss, and the one failure
++    mode of this cache that is worse than not having it. An entry that is busy
++    is skipped rather than waited for: eviction is housekeeping and must never
++    block a build.
 +    """
++    from aie.utils.compile.cache.utils import file_lock
++
 +    if _AIECC_CACHE_MAX_GB <= 0:
 +        return
 +    try:
@@ -542,7 +569,12 @@ index 103ea76613f..315fc75202e 100644
 +        if total <= cap:
 +            return
 +        for _, n, d in sorted(sized):
-+            shutil.rmtree(d, ignore_errors=True)
++            try:
++                with file_lock(str(root / f"{d.name}.lock"), timeout_seconds=0):
++                    shutil.rmtree(d, ignore_errors=True)
++            except (TimeoutError, OSError):
++                logger.debug("aiecc cache: %s is busy, not evicting", d.name)
++                continue
 +            total -= n
 +            logger.debug("aiecc cache: evicted %s", d.name)
 +            if total <= cap:
@@ -554,7 +586,7 @@ index 103ea76613f..315fc75202e 100644
  def _run_aiecc(mlir_file: str, args: list[str]):
      aiecc_bin = config.aiecc_path()
      cmd = [aiecc_bin, mlir_file] + args
-@@ -526,9 +938,15 @@ def compile_mlir_module(
+@@ -526,9 +970,15 @@ def compile_mlir_module(
          from aie.iron.kernel import ExternalFunction
  
          target_arch = resolve_target_arch(device)
@@ -573,7 +605,7 @@ index 103ea76613f..315fc75202e 100644
  
      # When work_dir is provided, invoke the aiecc binary as a subprocess so
      # that it resolves relative link_with paths (e.g. "add_one.o") against the
-@@ -538,9 +956,31 @@ def compile_mlir_module(
+@@ -538,9 +988,31 @@ def compile_mlir_module(
      # If no work_dir is provided, fall back to a temporary file instead.
      if work_dir:
          mlir_file = os.path.join(work_dir, "aie.mlir")
@@ -607,7 +639,7 @@ index 103ea76613f..315fc75202e 100644
      else:
          with tempfile.NamedTemporaryFile(mode="w", suffix=".mlir", delete=False) as f:
              f.write(str(mlir_module))
-@@ -563,6 +1003,55 @@ def _rename_symbol_in_object(object_path: str, old_name: str, new_name: str) ->
+@@ -563,6 +1035,55 @@ def _rename_symbol_in_object(object_path: str, old_name: str, new_name: str) ->
          raise RuntimeError(f"Symbol rename failed: {result.stderr.decode()}")
  
  
