@@ -50,10 +50,6 @@ import ml_dtypes
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import newstack_compat  # noqa: F401,E402 -- MUST precede iron imports (new-mlir-aie port shim)
-
-# Same switch the generator reads, so the host protocol cannot disagree with the design it is
-# driving: a transposed V cache declares kv_off_v and needs it written every token.
-_HAS_KV_V = os.environ.get("VT_TRANSPOSED_CACHE") == "1"
 from gen_llm_decode import build_graph, report_artifact_freshness, load_weight_buffer  # noqa: E402
 
 BF16 = ml_dtypes.bfloat16
@@ -184,11 +180,6 @@ def main():
         np.copyto(rope_buf.data, rope_row(pos, HD, sp.rope_theta_global).reshape(-1))
         t2 = now()
         params.write("kv_off", int(pos * HD))
-        # A transposed V cache addresses by position alone (h*HD*S + d*S + pos), so it carries its
-        # own param. Written only when the design declares it; writing an undeclared name would be
-        # a silent no-op, which is why this is keyed off the artifact rather than off an env flag.
-        if _HAS_KV_V:
-            params.write("kv_off_v", int(pos))
         params.write("sm_mask", int(pos + 1))
         params.sync()
         t3 = now()
