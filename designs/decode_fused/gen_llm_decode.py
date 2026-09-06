@@ -256,6 +256,19 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
     # GQA broadcast. Correctness-first; the byte-free form is a batch-stride-0 GEMV read of the kv
     # head (0 ops, 0 bytes) -- at Hq=16 x 28 layers this Repeat plus the V transpose are 41% of the
     # per-token DDR budget, so it is the first optimisation after parity, not an afterthought.
+    #
+    # S below is deliberately ONE value shared by kc/vc/kr/vr/vt/sc/sw, op_scores, op_rep_k/v, op_trv
+    # AND op_ctx -- not the op_ctx-excluded 4-of-5 split llm-decode-attention-pads-to-full-window.md
+    # scoped out device-free. That split needs op_trv to write a bucket-wide `vt` while op_ctx reads
+    # it at full max_seq width, and symmetrically op_rep_k/v to read a bucket-wide prefix of a kc/vc
+    # row whose true stride is max_seq*HD (Hkv=8 here, not a degenerate single-row case where prefix
+    # == whole buffer). Neither holds with today's operators: Repeat's input TensorAccessPattern
+    # ties its row stride directly to `cols` (repeat/design.py: strides=[0, cols, cols_split, 1]),
+    # and Transpose's output stride is tied to its own `M` (transpose/design.py: taps_out_L1L3
+    # strides derive from M) -- neither exposes a stride independent of its own declared size, so
+    # "read/write a narrower window of a wider-strided buffer" is new IRON capability, not a
+    # generator change. Bucketing S UNIFORMLY (this build already takes it as `max_seq`) is the
+    # route that needs none.
     op_rep_k = Repeat(rows=Hkv, cols=S * HD, repeat=sp.gqa_group, transfer_size=HD, context=ctx)
     op_rep_v = Repeat(rows=Hkv, cols=S * HD, repeat=sp.gqa_group, transfer_size=HD, context=ctx)
     op_scores = gemv(S, HD, ctx, num_batches=Hq)

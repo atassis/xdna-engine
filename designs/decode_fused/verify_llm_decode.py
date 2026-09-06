@@ -105,6 +105,14 @@ def main():
         params.write("kv_off", int(pos * HD))
         params.write("sm_mask", int(pos + 1))
         params.sync()
+        # get_callable() is upstream's OperatorSequence.SequenceCallable, whose _sync_inputs()
+        # trusts a coherence map this harness never updates (np.copyto writes through .data,
+        # documented as unmediated) -- so after the FIRST dispatch, every write above is a no-op
+        # sync and the device computes on the PREVIOUS position's buffers. Re-dispatching with the
+        # same (now correctly-resident) inputs is the measured fix: second and third dispatches
+        # agree and reproduce the oracle 8/8, where the first disagrees at every position.
+        # (first-dispatch-after-a-host-input-write-computes-on-the-previous-input, 2026-09-05.)
+        c()
         c()
         lg = np.asarray(out.data[:VOCAB], dtype=np.float32)
         if a.dump_logits and pos == 0:
