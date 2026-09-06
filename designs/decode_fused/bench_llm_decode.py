@@ -50,7 +50,7 @@ import ml_dtypes
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import newstack_compat  # noqa: F401,E402 -- MUST precede iron imports (new-mlir-aie port shim)
-from gen_llm_decode import build_graph, report_artifact_freshness  # noqa: E402
+from gen_llm_decode import build_graph, report_artifact_freshness, load_weight_buffer  # noqa: E402
 
 BF16 = ml_dtypes.bfloat16
 
@@ -135,7 +135,7 @@ def main():
     t0 = now()
     for name, arr in weights.items():
         buf = c.get_buffer(name)
-        np.copyto(buf.data, np.asarray(arr, BF16).reshape(-1))
+        load_weight_buffer(buf, arr)
     print(f"[bench] weight load: {now() - t0:.1f}s ({len(weights)} buffers)", flush=True)
 
     embed = np.load(os.path.join(a.weights, "model.embed_tokens.weight.npy")).astype(np.float32)
