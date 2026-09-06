@@ -129,6 +129,45 @@ _wire_peano_lit() {
 # fix/npu-device-name-gorgon-point. Until it lands and we re-pin, this is a tethered patch, applied
 # to $INST/src (build/python symlinks it) on both the cold and warm paths. Self-retiring: once a pin
 # carries "Gorgon Point" the grep guard makes it a no-op.
+# Kernel-compile speedups, carried as a tethered patch until the pin moves.
+#
+# WHAT IT DOES. Three changes in mlir-aie's python/utils/compile, all measured on the real
+# encoder-MHA build (17.1 s baseline) and all producing BYTE-IDENTICAL objects, insts.bin and
+# generated MLIR:
+#   * a precompiled header for the intrinsics the AIE driver injects into every TU. An empty aie2p
+#     TU costs 2.14 s against 0.45 s for aie2 and 0.019 s for the host, and -ftime-trace puts 2.02 s
+#     of that in ParseDeclarationOrFunctionDefinition. mha.cc: 5.28 s -> 2.80 s, 251.6 -> 205.6 MB RSS.
+#   * an opt-in compiler launcher (AIE_KERNEL_COMPILER_LAUNCHER=ccache), off by default.
+#   * a design's kernels compiled concurrently instead of one after another.
+#   * an opt-in content-addressed cache for a whole aiecc run (AIE_AIECC_CACHE=1), off by default.
+#
+# WHY TETHERED AND NOT PINNED. The change is upstreamable and lives on the fork branch
+# perf/kernel-compile-pch, but landing it properly means a toolchain.lock bump, which is device-gated
+# and retires every shared kernel sandbox on this box. Same shape and same reasoning as
+# _recognise_gorgon_point below: patch $INST/src (build/python symlinks it), grep-guarded so it is a
+# no-op once a pin carries it, and NON-FATAL -- a build that cannot take the patch is slow, not broken.
+#
+# Kill switches, in order of bluntness: AIE_KERNEL_PCH=0 disables just the PCH;
+# XDNA_NO_KERNEL_COMPILE_PATCH=1 skips this function entirely.
+_apply_kernel_compile_speedups() {
+  [ "${XDNA_NO_KERNEL_COMPILE_PATCH:-0}" = "1" ] && return 0
+  local f="$INST/src/python/utils/compile/utils.py"
+  local patch="$REPO/patches/mlir-aie-kernel-compile-speedups.patch"
+  [ -f "$f" ] || return 0
+  # Already carried, by the patch or by a pin that absorbed it.
+  grep -q "_PCH_ENABLED" "$f" && return 0
+  [ -f "$patch" ] || { echo "[toolchain_up] WARN: $patch missing; kernel compiles stay slow" >&2; return 0; }
+  if git -C "$INST/src" apply --check "$patch" >/dev/null 2>&1; then
+    git -C "$INST/src" apply "$patch" &&       echo "[toolchain_up] applied kernel-compile speedups (PCH + parallel kernel compiles)" >&2
+  else
+    # A pin moved under the patch. Say so loudly with the fix, rather than silently building slow.
+    echo "[toolchain_up] WARN: patches/mlir-aie-kernel-compile-speedups.patch no longer applies at" >&2
+    echo "[toolchain_up]       this pin -- rebase fork branch perf/kernel-compile-pch and regenerate," >&2
+    echo "[toolchain_up]       or drop the patch if the pin now carries it. Builds continue, slower." >&2
+  fi
+  return 0
+}
+
 _recognise_gorgon_point() {
   local f
   for f in "$INST/src/python/utils/hostruntime/xrtruntime/hostruntime.py" \
@@ -185,6 +224,7 @@ if [ -f "$PYPKG" ] && grep -q "def resolve_program(self, device_name" "$PYPKG"; 
   _link_vendored_tools   # backfill vendored tools into already-built instances
   _link_include_dirs     # backfill include/ symlinks (aie_api + aie_kernels)
   _wire_peano_lit        # backfill the lit peano path (else `REQUIRES: peano` tests silently skip)
+  _apply_kernel_compile_speedups  # tethered: PCH + parallel kernel compiles (byte-identical output)
   _recognise_gorgon_point  # backfill the npu2 device-name entry (else every device runner raises)
   _build_parameter_scratchpad  # backfill the scratchpad host binding (else scratchpad tests silently skip)
   touch "$INST"          # record last-used (for gc_instances keep-newest-N); warm path never GCs
@@ -246,6 +286,7 @@ ninja -C "$INST/build" AIEPythonModules aiecc aie-opt >&2
 ln -sfn "$INST/build/python" "$INST/python"
 _link_include_dirs
 _wire_peano_lit
+_apply_kernel_compile_speedups
 _recognise_gorgon_point
 ln -sfn "$INST/build/bin" "$INST/bin"
 _build_aie_translate

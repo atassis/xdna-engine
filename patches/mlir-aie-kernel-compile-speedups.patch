@@ -1,0 +1,623 @@
+diff --git a/python/utils/compile/__init__.py b/python/utils/compile/__init__.py
+index a48748c4a76..a3c6d1c714e 100644
+--- a/python/utils/compile/__init__.py
++++ b/python/utils/compile/__init__.py
+@@ -11,6 +11,7 @@ from pathlib import Path
+ from .utils import (
+     compile_cxx_core_function,
+     compile_external_kernel,
++    compile_external_kernels,
+     compile_mlir_module,
+     resolve_target_arch,
+ )
+@@ -24,6 +25,7 @@ __all__ = [
+     "compile_cxx_core_function",
+     "compile_mlir_module",
+     "compile_external_kernel",
++    "compile_external_kernels",
+     "resolve_target_arch",
+     "NPU_CACHE_HOME",
+ ]
+diff --git a/python/utils/compile/jit/compilabledesign.py b/python/utils/compile/jit/compilabledesign.py
+index 1721a41b90b..19175baa352 100644
+--- a/python/utils/compile/jit/compilabledesign.py
++++ b/python/utils/compile/jit/compilabledesign.py
+@@ -46,7 +46,7 @@ from aie.ir import (  # pyright: ignore[reportMissingImports]
+ )
+ from aie.utils.compile import (
+     NPU_CACHE_HOME,
+-    compile_external_kernel,
++    compile_external_kernels,
+     compile_mlir_module,
+ )
+ from aie.utils.compile.cache.utils import file_lock
+@@ -389,9 +389,7 @@ class CompilableDesign:
+ 
+                 use_chess = self._resolve_use_chess(external_kernels)
+ 
+-                for func in external_kernels:
+-                    if not func._compiled:
+-                        compile_external_kernel(func, kernel_dir, target_arch)
++                compile_external_kernels(external_kernels, kernel_dir, target_arch)
+ 
+                 compile_mlir_module(
+                     mlir_module=mlir_module,
+@@ -508,9 +506,7 @@ class CompilableDesign:
+                 ExternalFunction._instances.clear()
+ 
+                 use_chess = self._resolve_use_chess(external_kernels)
+-                for func in external_kernels:
+-                    if not func._compiled:
+-                        compile_external_kernel(func, kernel_dir, target_arch)
++                compile_external_kernels(external_kernels, kernel_dir, target_arch)
+ 
+                 compile_mlir_module(
+                     mlir_module=mlir_module,
+diff --git a/python/utils/compile/utils.py b/python/utils/compile/utils.py
+index 103ea76613f..b3886cabc92 100644
+--- a/python/utils/compile/utils.py
++++ b/python/utils/compile/utils.py
+@@ -5,12 +5,15 @@
+ #
+ """Low-level helpers for compiling MLIR modules and external C++ kernels to NPU artifacts."""
+ 
++import concurrent.futures
++import hashlib
+ import logging
+ import os
+ import re
+ import shutil
+ import subprocess
+ import tempfile
++import threading
+ from pathlib import Path
+ from typing import TYPE_CHECKING
+ 
+@@ -23,6 +26,154 @@ if TYPE_CHECKING:
+ 
+ logger = logging.getLogger(__name__)
+ 
++# --- Precompiled header for the driver-injected intrinsics -------------------
++#
++# The AIE driver `-include`s its intrinsics header into every TU it compiles
++# (clang/lib/Driver/ToolChains/AIE.cpp, AddClangSystemIncludeArgs).  For aie2p
++# that header set is 67k lines of inline intrinsic definitions and Sema re-runs
++# over all of it per kernel.  Measured on an EMPTY translation unit: aie2p costs
++# 2.14 s against 0.45 s for aie2 and 0.019 s for the host, and -ftime-trace puts
++# 2.02 s of the 2.11 s in ParseDeclarationOrFunctionDefinition.  Preprocessing is
++# not the cost (-E is 0.19 s); parsing the inline bodies is.
++#
++# So parse it once into a PCH and pass that back with -mno-vitis-headers, which
++# suppresses the automatic inclusion.  Measured on aie_kernels/aie2p/mha.cc:
++# 5.28 s -> 2.80 s wall and 251.6 MB -> 205.6 MB peak RSS, object byte-identical.
++#
++# Two properties make this safe rather than merely fast:
++#
++#   * The PCH source is an EMPTY header.  The driver injects the intrinsics into
++#     the PCH's own TU exactly as it would into a kernel's, so the PCH holds
++#     precisely what it replaces and no header path has to be located or guessed.
++#
++#   * The key covers only the compiler and the flags THIS function fixes, never a
++#     caller's -I / -D / compile_args.  That is what keeps it to one PCH per
++#     target rather than one per kernel, and it is sound in both directions:
++#     extra caller defines are accepted and produce a byte-identical object
++#     (verified), while a CONFLICTING one is a hard clang error naming the PCH,
++#     not a silently different parse.  The retry below turns that error back into
++#     an ordinary compile so a caller can never be blocked by this optimisation.
++#
++# Set AIE_KERNEL_PCH=0 to disable.
++_PCH_ENABLED = os.environ.get("AIE_KERNEL_PCH", "1") != "0"
++
++
++# --- Compiler launcher -------------------------------------------------------
++#
++# A kernel .cc is recompiled whenever anything around it moves -- a sibling
++# design rebuilt, a branch switched back, a CI job rerun -- even though nothing
++# it reads changed.  This function already emits -MD/-MF for exactly this
++# reason ("the way ninja and ccache learn a translation unit's real inputs");
++# routing the compile through a launcher is what makes that pay.  Measured on
++# aie_kernels/aie2p/mha.cc: 5.44 s miss -> 0.010 s hit, object identical, and it
++# composes with the PCH (miss 1.92 s, hit 0.026 s).
++#
++# Off unless asked for: a compiler cache is a policy about the developer's
++# machine, not a property of the compile, and a wrong hit is expensive enough
++# that opting in should be deliberate.  Set AIE_KERNEL_COMPILER_LAUNCHER=ccache
++# (or sccache, or any launcher that takes the compiler as its first argument).
++_COMPILER_LAUNCHER = os.environ.get("AIE_KERNEL_COMPILER_LAUNCHER", "")
++
++
++def _warn_launcher_pch_interaction(launcher: str) -> None:
++    """Say that ccache will not cache a compile that uses -include-pch.
++
++    It is not an error and not a miss -- the call is counted "uncacheable" and
++    the launcher does nothing at all, so a developer who sets both gets the cost
++    of neither lever and no output saying why.  ccache's own message is
++    "You have to specify time_macros sloppiness when using precompiled headers
++    to get direct hits", and it only appears under CCACHE_DEBUG.  Say it here.
++    """
++    if _warn_launcher_pch_interaction.__dict__.setdefault("done", False):
++        return
++    if "ccache" not in os.path.basename(launcher):
++        return
++    if "time_macros" in os.environ.get("CCACHE_SLOPPINESS", ""):
++        return
++    _warn_launcher_pch_interaction.__dict__["done"] = True
++    logger.warning(
++        "ccache will not cache these compiles while the intrinsics PCH is in "
++        "use. Add time_macros to CCACHE_SLOPPINESS, or set AIE_KERNEL_PCH=0 to "
++        "trade the PCH for the cache."
++    )
++
++
++def _compiler_identity(cxx: str) -> str:
++    """Identify the compiler by what it IS, not by where it sits.
++
++    ``clang --version`` prints the llvm-aie git SHA, identical across installs of
++    one build; a path or an mtime is not.  mlir-aie#3427 keyed aiecc by mtime and
++    made two installs of the same commit disagree -- here the same mistake would
++    serve a PCH built by a different compiler.  Costs ~16 ms, once per process.
++    """
++    try:
++        out = subprocess.run([cxx, "--version"], capture_output=True, check=True).stdout
++    except (OSError, subprocess.CalledProcessError):
++        return ""
++    return out.decode(errors="replace").strip()
++
++
++def _kernel_pch(cxx: str, pch_flags: list[str]) -> str | None:
++    """Path to a PCH built with ``pch_flags``, building it on first use.
++
++    Fails OPEN: every error returns None and the caller compiles normally.
++    Written under a temporary name and renamed into place, so a concurrent kernel
++    compile can never read a half-written PCH.
++    """
++    ident = _compiler_identity(cxx)
++    if not ident:
++        return None
++    key = hashlib.sha256("\0".join([ident, *pch_flags]).encode()).hexdigest()[:32]
++    try:
++        # Deferred: aie.utils.compile.__init__ imports this module, so
++        # NPU_CACHE_HOME cannot be imported at module scope.
++        from aie.utils.compile import NPU_CACHE_HOME
++
++        cache = NPU_CACHE_HOME / "pch"
++        cache.mkdir(parents=True, exist_ok=True)
++    except (ImportError, OSError):
++        return None
++
++    pch = cache / f"{key}.pch"
++    if pch.exists():
++        return str(pch)
++
++    with _PCH_BUILD_LOCK:
++        # Re-check: concurrent kernel compiles all miss above, and building one
++        # PCH per thread costs the wall this exists to save.
++        if pch.exists():
++            return str(pch)
++        return _build_kernel_pch(cxx, pch_flags, cache, key, pch)
++
++
++_PCH_BUILD_LOCK = threading.Lock()
++
++
++def _build_kernel_pch(cxx, pch_flags, cache, key, pch):
++    try:
++        empty = cache / f"{key}.h"
++        empty.touch()
++        with tempfile.NamedTemporaryFile(
++            dir=cache, prefix=f"{key}.", suffix=".tmp", delete=False
++        ) as tmp:
++            tmp_path = tmp.name
++        ret = subprocess.run(
++            [cxx, "-x", "c++-header", str(empty), "-o", tmp_path, *pch_flags],
++            capture_output=True,
++            check=False,
++        )
++        if ret.returncode != 0 or not os.path.getsize(tmp_path):
++            logger.debug(
++                "PCH build failed; compiling without it:\n%s",
++                ret.stderr.decode(errors="replace"),
++            )
++            os.unlink(tmp_path)
++            return None
++        os.replace(tmp_path, pch)
++    except OSError:
++        return None
++    return str(pch)
++
+ 
+ def resolve_target_arch(device=None) -> str:
+     """Return ``'aie2'`` or ``'aie2p'`` for the given device, or ``'aie2'`` if device is None."""
+@@ -302,13 +453,10 @@ def compile_cxx_core_function(
+             f"-I{config.cxx_header_path()}",
+         ]
+     else:
+-        cmd = [
+-            config.peano_cxx_path(),
+-            source_path,
+-            *emit_flags,
+-            "-o",
+-            f"{output_path}",
+-            f"-I{config.cxx_header_path()}",
++        # The flags this function fixes for every kernel, in one place: they go
++        # into the compile AND into the PCH key, and a second copy would let the
++        # two disagree about what a header was parsed with.
++        peano_flags = [
+             "-std=c++20",
+             "-Wno-parentheses",
+             "-Wno-attributes",
+@@ -316,11 +464,6 @@ def compile_cxx_core_function(
+             "-Wno-empty-body",
+             "-O2",
+             "-DNDEBUG",
+-            # Have the compiler report what it actually read, the way ninja and
+-            # ccache learn a translation unit's real inputs.
+-            "-MD",
+-            "-MF",
+-            f"{output_path}.d",
+             # Pre-trip aie_api's aie_adf.hpp include guard so stock upstream
+             # aie_api never pulls in <adf.h> (Vitis-only, absent from Peano).
+             # No mlir-aie kernel uses adf:: symbols, so this only elides dead
+@@ -335,9 +478,41 @@ def compile_cxx_core_function(
+             # the same stack accounting. -ffunction-sections and
+             # -fdata-sections give each symbol its own section, which the
+             # attribution in StackSizeAnalysis.h needs.
+-            cmd.extend(
+-                ["-ffunction-sections", "-fdata-sections", "-fstack-size-section"]
+-            )
++            peano_flags += [
++                "-ffunction-sections",
++                "-fdata-sections",
++                "-fstack-size-section",
++            ]
++
++        cmd = [
++            config.peano_cxx_path(),
++            source_path,
++            *emit_flags,
++            "-o",
++            f"{output_path}",
++            f"-I{config.cxx_header_path()}",
++            # Have the compiler report what it actually read, the way ninja and
++            # ccache learn a translation unit's real inputs.
++            "-MD",
++            "-MF",
++            f"{output_path}.d",
++            *peano_flags,
++        ]
++        if _PCH_ENABLED:
++            pch = _kernel_pch(cmd[0], peano_flags)
++            if pch is not None:
++                cmd[1:1] = ["-mno-vitis-headers", "-include-pch", pch]
++        if _COMPILER_LAUNCHER:
++            launcher = shutil.which(_COMPILER_LAUNCHER)
++            if launcher:
++                if "-include-pch" in cmd:
++                    _warn_launcher_pch_interaction(launcher)
++                cmd.insert(0, launcher)
++            else:
++                logger.warning(
++                    "AIE_KERNEL_COMPILER_LAUNCHER=%s is not on PATH; ignoring it",
++                    _COMPILER_LAUNCHER,
++                )
+ 
+     # Add include directories
+     if include_dirs:
+@@ -355,6 +530,15 @@ def compile_cxx_core_function(
+         check=False,
+         capture_output=True,
+     )
++    if ret.returncode != 0 and "-include-pch" in cmd:
++        # The PCH is an optimisation and must never be the reason a build fails
++        # or the reason an error message is confusing.  Redo the compile without
++        # it and report THAT, so what surfaces is the kernel's own diagnostic.
++        i = cmd.index("-include-pch")
++        plain = [a for j, a in enumerate(cmd) if j not in (i, i + 1)]
++        plain.remove("-mno-vitis-headers")  # index-independent: appears once
++        logger.debug("Retrying without the PCH: %s", " ".join(plain))
++        ret = subprocess.run(plain, cwd=cwd, check=False, capture_output=True)
+     if ret.stdout:
+         logger.debug("%s", ret.stdout.decode())
+     if ret.returncode != 0:
+@@ -404,6 +588,192 @@ def compile_cxx_core_function(
+                 raise RuntimeError(f"[Peano] LLVM bitcode assembly failed{detail}")
+ 
+ 
++# --- Content-addressed cache for a whole aiecc invocation ---------------------
++#
++# `CompilableDesign.compile()` bypasses the JIT cache whenever the caller names
++# its output paths ("the caller is presumed to manage their own dependency
++# tracking"), and every design that goes through a build graph rather than
++# @iron.jit does exactly that.  What those callers manage instead is filename +
++# mtime inside one build directory, which is not a build cache: it cannot tell
++# two designs apart that write the same filename, so the graphs that use it end
++# up disabling it -- amd/IRON's encoder-MHA driver gives every build a fresh work
++# dir precisely because four different `--pipelines` values produced one artifact.
++#
++# So key the aiecc run on its INPUTS instead, and let the caller keep naming the
++# destinations.  Measured on that design: an unchanged rebuild costs 7.7 s of
++# aiecc, and 0.3 s when this hits.
++#
++# The whole work directory is stored, not just the requested outputs: aiecc's
++# per-core ELF directories are read by real consumers (trace probes, A/B scripts
++# comparing `elfs_main_core_*`), so a hit that restored only the named artifacts
++# would break them in a way no test covers.
++#
++# Off unless asked for.  A wrong hit here ships a wrong xclbin, and this project
++# has already paid for a compile cache keyed on too little; `AIE_AIECC_CACHE=1`
++# turns it on, and `python/utils/compile/cache/aiecc_cache_selftest.py` is the
++# invalidation self-test that has to pass before that becomes a default.
++_AIECC_CACHE_ENABLED = os.environ.get("AIE_AIECC_CACHE", "0") == "1"
++
++# Flags whose VALUE names a destination rather than an input.  The flag itself
++# stays in the key (asking for an xclbin is not the same run as not asking); its
++# path does not, so one cached build can serve any destination.
++#
++# This list is a policy and it is checked the safe way round: an argument that is
++# not on it is kept VERBATIM, so a flag added to aiecc later over-invalidates the
++# cache instead of being silently ignored.  Note `--xclbin-kernel-name` is NOT
++# here and must not be -- it names the kernel inside the artifact, which is
++# input, not destination, and a suffix rule on "-name=" would wrongly strip it.
++_AIECC_DESTINATION_FLAGS = (
++    "--npu-insts-name",
++    "--xclbin-name",
++    "--pdi-name",
++    "--elf-name",
++    "--full-elf-name",
++    "--txn-name",
++    "--ctrlpkt-name",
++    "--ctrlpkt-elf-name",
++    "--ctrlpkt-dma-seq-name",
++    "--tmpdir",
++    "--output-dir",
++    "--checkpoint",
++    "--repeater-output-dir",
++)
++
++# Flags whose value identifies a TOOLCHAIN by path.  The path is per-install, so
++# it is replaced by a fingerprint of what it points at (see _tool_identity).
++_AIECC_TOOLCHAIN_FLAGS = ("--peano", "--aietools")
++
++
++def _tool_identity(binary: str) -> str:
++    """Fingerprint a toolchain binary by what it is, not where it sits.
++
++    Both aiecc and clang print a git SHA. Only the first line is used: aiecc also
++    prints a `compiled:` timestamp, which differs between two installs of the
++    same commit and would make this key per-machine -- the failure mlir-aie#3427
++    introduced for aiecc by keying on mtime.
++    """
++    try:
++        out = subprocess.run(
++            [binary, "--version"], capture_output=True, check=False
++        ).stdout.decode(errors="replace")
++    except OSError:
++        return ""
++    lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
++    return " | ".join(lines[:2]) if "git SHA" in out else (lines[0] if lines else "")
++
++
++def _aiecc_cache_key(mlir_text, args, work_dir, use_chess, fold_ddr_addr_offset):
++    """Hash everything that decides what this aiecc run produces.
++
++    Returns None when an input cannot be read, which disables the cache for that
++    call: a key that silently omits an input is worse than no key at all.
++    """
++    h = hashlib.sha256()
++    h.update(b"aiecc-cache-v1\0")
++    h.update(_tool_identity(config.aiecc_path()).encode() + b"\0")
++    h.update(str(use_chess).encode() + b"\0")
++    h.update(str(fold_ddr_addr_offset).encode() + b"\0")
++    h.update(mlir_text.encode() + b"\0")
++
++    for arg in args:
++        flag, _, value = arg.partition("=")
++        if flag in _AIECC_DESTINATION_FLAGS:
++            h.update(flag.encode() + b"=<dest>\0")
++        elif flag in _AIECC_TOOLCHAIN_FLAGS:
++            ident = (
++                _tool_identity(os.path.join(value, "bin", "clang++")) if value else ""
++            )
++            h.update(flag.encode() + b"=" + ident.encode() + b"\0")
++        elif flag.startswith("-j"):
++            # Measured on a 24-core design: insts.bin and every per-core ELF are
++            # byte-identical between -j1 and -j16, and input_with_addresses.mlir
++            # differs only in the work-dir path it embeds -- which two runs at
++            # the SAME -j differ in too. Parallelism is not an input.
++            h.update(b"-j=<any>\0")
++        else:
++            h.update(arg.encode() + b"\0")
++
++    # Every file the module links, by content. This is the one input that is not
++    # in the text: `link_with = "x.o"` resolves against work_dir at aiecc time,
++    # so two runs of identical MLIR against different objects are different runs.
++    for name in sorted(set(re.findall(r'link_with\s*=\s*"([^"]+)"', mlir_text))):
++        path = Path(work_dir) / name
++        try:
++            h.update(name.encode() + b"\0" + hashlib.sha256(path.read_bytes()).digest())
++        except OSError:
++            logger.debug("aiecc cache: cannot read linked object %s; not caching", path)
++            return None
++
++    for arg in args:
++        if arg.startswith("--xclbin-input="):
++            try:
++                h.update(
++                    hashlib.sha256(Path(arg.split("=", 1)[1]).read_bytes()).digest()
++                )
++            except OSError:
++                return None
++
++    return h.hexdigest()[:32]
++
++
++def _aiecc_named_outputs(args):
++    """Return the (flag, path) destinations this invocation was asked to write."""
++    out = []
++    for arg in args:
++        flag, sep, value = arg.partition("=")
++        if sep and flag in _AIECC_DESTINATION_FLAGS and flag.endswith("-name"):
++            out.append((flag, value))
++    return out
++
++
++def _aiecc_cache_dir(key):
++    from aie.utils.compile import NPU_CACHE_HOME
++
++    return NPU_CACHE_HOME / "aiecc" / key
++
++
++def _aiecc_cache_restore(entry, work_dir, named):
++    """Copy a cached run's work directory and named outputs into place."""
++    src = entry / "workdir"
++    if not src.is_dir():
++        return False
++    for flag, dest in named:
++        if not (entry / "named" / flag.lstrip("-")).is_file():
++            return False
++    shutil.copytree(src, work_dir, dirs_exist_ok=True, symlinks=True)
++    for flag, dest in named:
++        os.makedirs(os.path.dirname(os.path.abspath(dest)) or ".", exist_ok=True)
++        shutil.copy2(entry / "named" / flag.lstrip("-"), dest)
++    return True
++
++
++def _aiecc_cache_store(entry, work_dir, named, preexisting):
++    """Record what the run produced, atomically enough to be shared.
++
++    Only entries aiecc created are stored: the caller may have staged inputs into
++    work_dir (amd/IRON symlinks its whole build directory in), and those are the
++    caller's to recreate, not the cache's to own.
++    """
++    tmp = entry.parent / (entry.name + f".tmp{os.getpid()}")
++    try:
++        shutil.rmtree(tmp, ignore_errors=True)
++        (tmp / "workdir").mkdir(parents=True)
++        (tmp / "named").mkdir()
++        for child in Path(work_dir).iterdir():
++            if child.name in preexisting or child.is_symlink():
++                continue
++            if child.is_dir():
++                shutil.copytree(child, tmp / "workdir" / child.name, symlinks=True)
++            else:
++                shutil.copy2(child, tmp / "workdir" / child.name)
++        for flag, dest in named:
++            shutil.copy2(dest, tmp / "named" / flag.lstrip("-"))
++        os.replace(tmp, entry)
++    except OSError as e:
++        logger.debug("aiecc cache: not storing %s (%s)", entry.name, e)
++        shutil.rmtree(tmp, ignore_errors=True)
++
++
+ def _run_aiecc(mlir_file: str, args: list[str]):
+     aiecc_bin = config.aiecc_path()
+     cmd = [aiecc_bin, mlir_file] + args
+@@ -526,9 +896,15 @@ def compile_mlir_module(
+         from aie.iron.kernel import ExternalFunction
+ 
+         target_arch = resolve_target_arch(device)
+-        for func in list(ExternalFunction._instances):
+-            if not func._compiled and getattr(func, "_source_file", None):
+-                compile_external_kernel(func, str(work_dir), target_arch)
++        compile_external_kernels(
++            [
++                f
++                for f in ExternalFunction._instances
++                if getattr(f, "_source_file", None)
++            ],
++            str(work_dir),
++            target_arch,
++        )
+ 
+     # When work_dir is provided, invoke the aiecc binary as a subprocess so
+     # that it resolves relative link_with paths (e.g. "add_one.o") against the
+@@ -538,9 +914,31 @@ def compile_mlir_module(
+     # If no work_dir is provided, fall back to a temporary file instead.
+     if work_dir:
+         mlir_file = os.path.join(work_dir, "aie.mlir")
++        mlir_text = str(mlir_module)
+         with open(mlir_file, "w") as f:
+-            f.write(str(mlir_module))
+-        _run_aiecc(mlir_file, args)
++            f.write(mlir_text)
++
++        key = (
++            _aiecc_cache_key(mlir_text, args, work_dir, use_chess, fold_ddr_addr_offset)
++            if _AIECC_CACHE_ENABLED
++            else None
++        )
++        if key is None:
++            _run_aiecc(mlir_file, args)
++        else:
++            from aie.utils.compile.cache.utils import file_lock
++
++            entry = _aiecc_cache_dir(key)
++            named = _aiecc_named_outputs(args)
++            # aie.mlir was just written, so it is an input here and must not be
++            # counted as something aiecc produced.
++            preexisting = {c.name for c in Path(work_dir).iterdir()}
++            with file_lock(str(entry.parent / f"{key}.lock")):
++                if entry.is_dir() and _aiecc_cache_restore(entry, work_dir, named):
++                    logger.debug("aiecc cache hit (%s)", key)
++                else:
++                    _run_aiecc(mlir_file, args)
++                    _aiecc_cache_store(entry, work_dir, named, preexisting)
+     else:
+         with tempfile.NamedTemporaryFile(mode="w", suffix=".mlir", delete=False) as f:
+             f.write(str(mlir_module))
+@@ -563,6 +961,55 @@ def _rename_symbol_in_object(object_path: str, old_name: str, new_name: str) ->
+         raise RuntimeError(f"Symbol rename failed: {result.stderr.decode()}")
+ 
+ 
++def compile_external_kernels(funcs, kernel_dir, target_arch):
++    """Compile every ExternalFunction in ``funcs`` into ``kernel_dir``.
++
++    Kernels are separate translation units with separate outputs, so they have
++    always been independent -- they were merely compiled one after another, and
++    the wall was the SUM.  On the encoder-MHA design here that is 7.9 s of the
++    17.1 s build for two kernels.
++
++    Two of them can still collide: ``compile_external_kernel`` writes the source
++    as ``<_original_name>.cc``, so two ExternalFunctions sharing an original name
++    write the same file.  Those keep their relative order; everything else runs
++    concurrently.
++
++    Each compile is single-threaded and peaks near 205 MB of RSS on aie2p (250 MB
++    without the intrinsics PCH), so the bound is cores rather than memory on an
++    ordinary box.  Set AIE_KERNEL_COMPILE_JOBS to override.
++    """
++    pending = [f for f in funcs if not f._compiled]
++    if not pending:
++        return
++
++    groups: dict[str, list] = {}
++    for f in pending:
++        groups.setdefault(getattr(f, "_original_name", f._name), []).append(f)
++
++    try:
++        jobs = int(os.environ.get("AIE_KERNEL_COMPILE_JOBS", "0"))
++    except ValueError:
++        jobs = 0
++    if jobs <= 0:
++        jobs = os.cpu_count() or 1
++    jobs = min(jobs, len(groups))
++
++    if jobs == 1:
++        for group in groups.values():
++            for f in group:
++                compile_external_kernel(f, kernel_dir, target_arch)
++        return
++
++    def _run(group):
++        for f in group:
++            compile_external_kernel(f, kernel_dir, target_arch)
++
++    with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
++        # list() re-raises the first failure, after the others have finished --
++        # a compile error must not be swallowed by a sibling that succeeded.
++        list(pool.map(_run, groups.values()))
++
++
+ def compile_external_kernel(func, kernel_dir, target_arch):
+     """Compile an ExternalFunction to an object file in the kernel directory.
+ 
