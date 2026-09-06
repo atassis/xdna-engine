@@ -361,7 +361,8 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
     # stride-0 group re-read goes too. rows_per_chunk=64 puts the L1 A tile at 16 KB double-buffered.
     if TMV_CTX:
         op_ctx = TMatVec(M=HD, K=S, num_aie_columns=Hkv, num_batches=Hq,
-                         batch_group=sp.gqa_group, rows_per_chunk=64, context=ctx)
+                         batch_group=sp.gqa_group,
+                         rows_per_chunk=int(os.environ.get("TMV_RPC", "64")), context=ctx)
     else:
         op_ctx = gemv(HD, S, ctx, num_batches=Hq)
     # MLP weight-stream dtype axis (Wg/Wu/Wd -- "MLP weights" in the byte breakdown, the largest
