@@ -30,6 +30,28 @@ export IRON_DIR="${IRON_DIR:-$XDNA_WS/IRON}"
 # input_with_addresses.mlir differs only in the work-dir path it embeds, which two runs
 # at the SAME -j differ in too.
 export AIECC_JOBS="${AIECC_JOBS:-0}"
+
+# Route kernel .cc compiles through ccache. Measured on 8 kernels: 6.72 s of misses
+# against 0.09 s of hits, objects identical. It composes with the intrinsics PCH,
+# and it is the only thing that removes DUPLICATED compilation -- batching every
+# kernel into one clang invocation was measured 32% SLOWER than separate calls,
+# and the per-invocation floor with the PCH is only ~0.025 s, so there is nothing
+# for a shared process to recover.
+#
+# time_macros is not optional and not cosmetic: ccache silently refuses to cache
+# ANY compile that uses -include-pch without it -- the call is counted
+# "uncacheable", not a miss, and the only explanation appears under CCACHE_DEBUG.
+# Set both levers and get neither. What it makes sloppy is __DATE__/__TIME__/
+# __TIMESTAMP__, and nothing under aie_kernels/ or in aie_api uses them (checked).
+# Appended rather than assigned, so an existing sloppiness is kept.
+if command -v ccache >/dev/null 2>&1; then
+  export AIE_KERNEL_COMPILER_LAUNCHER="${AIE_KERNEL_COMPILER_LAUNCHER:-ccache}"
+  case ",${CCACHE_SLOPPINESS:-}," in
+    *,time_macros,*) : ;;
+    ,,) export CCACHE_SLOPPINESS="time_macros" ;;
+    *) export CCACHE_SLOPPINESS="${CCACHE_SLOPPINESS},time_macros" ;;
+  esac
+fi
 export XRT_SRC_DIR="${XRT_SRC_DIR:-$XDNA_WS/XRT-src}"
 export AIEBU_ASM_DIR="${AIEBU_ASM_DIR:-$XRT_SRC_DIR/src/runtime_src/core/common/aiebu/build/Release/src/cpp/utils/asm}"
 
