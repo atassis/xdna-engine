@@ -54,7 +54,7 @@ index 1721a41b90b..19175baa352 100644
                  compile_mlir_module(
                      mlir_module=mlir_module,
 diff --git a/python/utils/compile/utils.py b/python/utils/compile/utils.py
-index 103ea76613f..b3886cabc92 100644
+index 103ea76613f..315fc75202e 100644
 --- a/python/utils/compile/utils.py
 +++ b/python/utils/compile/utils.py
 @@ -5,12 +5,15 @@
@@ -319,7 +319,7 @@ index 103ea76613f..b3886cabc92 100644
      if ret.stdout:
          logger.debug("%s", ret.stdout.decode())
      if ret.returncode != 0:
-@@ -404,6 +588,192 @@ def compile_cxx_core_function(
+@@ -404,6 +588,234 @@ def compile_cxx_core_function(
                  raise RuntimeError(f"[Peano] LLVM bitcode assembly failed{detail}")
  
  
@@ -343,11 +343,20 @@ index 103ea76613f..b3886cabc92 100644
 +# comparing `elfs_main_core_*`), so a hit that restored only the named artifacts
 +# would break them in a way no test covers.
 +#
-+# Off unless asked for.  A wrong hit here ships a wrong xclbin, and this project
-+# has already paid for a compile cache keyed on too little; `AIE_AIECC_CACHE=1`
-+# turns it on, and `python/utils/compile/cache/aiecc_cache_selftest.py` is the
-+# invalidation self-test that has to pass before that becomes a default.
-+_AIECC_CACHE_ENABLED = os.environ.get("AIE_AIECC_CACHE", "0") == "1"
++# ON by default.  The key covers every input this invocation has -- the MLIR text,
++# the content of every object it links, the tool identities, and every argument
++# that is not a destination -- and `test/python/test_aiecc_cache_key.py` holds it
++# to that: seven input classes that must move the key, two that must not, fail-
++# closed on an unreadable input, and four degenerate key functions each of which
++# must be rejected.  That suite was itself proven non-vacuous by sabotaging the
++# real key three ways and confirming it goes red.  `AIE_AIECC_CACHE=0` disables.
++_AIECC_CACHE_ENABLED = os.environ.get("AIE_AIECC_CACHE", "1") != "0"
++
++# A cache that is on by default and never evicts is a disk-filler, and this
++# project already has one: NPU_CACHE_HOME sits at 2.3 GB / 5082 entries, kept
++# survivable only because CI wipes it per run.  Prune oldest-first past a cap
++# rather than repeat that.  ~3.5 MB per entry for a 24-core design.
++_AIECC_CACHE_MAX_GB = float(os.environ.get("AIE_AIECC_CACHE_MAX_GB", "8"))
 +
 +# Flags whose VALUE names a destination rather than an input.  The flag itself
 +# stays in the key (asking for an xclbin is not the same run as not asking); its
@@ -507,12 +516,45 @@ index 103ea76613f..b3886cabc92 100644
 +    except OSError as e:
 +        logger.debug("aiecc cache: not storing %s (%s)", entry.name, e)
 +        shutil.rmtree(tmp, ignore_errors=True)
++        return
++    _aiecc_cache_prune(entry.parent)
++
++
++def _aiecc_cache_prune(root: Path) -> None:
++    """Drop oldest entries until the store is back under the cap.
++
++    Mtime order, not access order: a hit does not touch the entry, so this
++    evicts by age rather than by use.  That is deliberate -- stat'ing every
++    entry on every hit costs more than the occasional wrong eviction, and a
++    wrongly evicted entry is a recompile, not a fault.
++    """
++    if _AIECC_CACHE_MAX_GB <= 0:
++        return
++    try:
++        entries = [d for d in root.iterdir() if d.is_dir()]
++        sized = []
++        total = 0
++        for d in entries:
++            n = sum(f.stat().st_size for f in d.rglob("*") if f.is_file())
++            total += n
++            sized.append((d.stat().st_mtime, n, d))
++        cap = _AIECC_CACHE_MAX_GB * (1 << 30)
++        if total <= cap:
++            return
++        for _, n, d in sorted(sized):
++            shutil.rmtree(d, ignore_errors=True)
++            total -= n
++            logger.debug("aiecc cache: evicted %s", d.name)
++            if total <= cap:
++                return
++    except OSError:
++        return
 +
 +
  def _run_aiecc(mlir_file: str, args: list[str]):
      aiecc_bin = config.aiecc_path()
      cmd = [aiecc_bin, mlir_file] + args
-@@ -526,9 +896,15 @@ def compile_mlir_module(
+@@ -526,9 +938,15 @@ def compile_mlir_module(
          from aie.iron.kernel import ExternalFunction
  
          target_arch = resolve_target_arch(device)
@@ -531,7 +573,7 @@ index 103ea76613f..b3886cabc92 100644
  
      # When work_dir is provided, invoke the aiecc binary as a subprocess so
      # that it resolves relative link_with paths (e.g. "add_one.o") against the
-@@ -538,9 +914,31 @@ def compile_mlir_module(
+@@ -538,9 +956,31 @@ def compile_mlir_module(
      # If no work_dir is provided, fall back to a temporary file instead.
      if work_dir:
          mlir_file = os.path.join(work_dir, "aie.mlir")
@@ -565,7 +607,7 @@ index 103ea76613f..b3886cabc92 100644
      else:
          with tempfile.NamedTemporaryFile(mode="w", suffix=".mlir", delete=False) as f:
              f.write(str(mlir_module))
-@@ -563,6 +961,55 @@ def _rename_symbol_in_object(object_path: str, old_name: str, new_name: str) ->
+@@ -563,6 +1003,55 @@ def _rename_symbol_in_object(object_path: str, old_name: str, new_name: str) ->
          raise RuntimeError(f"Symbol rename failed: {result.stderr.decode()}")
  
  

@@ -18,6 +18,18 @@ XDNA_WS="${XDNA_WS:-$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/../.." && pwd)}"
 export XDNA_WS
 
 export IRON_DIR="${IRON_DIR:-$XDNA_WS/IRON}"
+
+# amd/IRON's two aiecc rules default AIECC_JOBS to '1', so every design's per-core
+# compiles run one at a time. On the 24-core encoder-MHA design that is 7.7 s against
+# 6.0 s at aiecc's own auto-detect (0); nothing above 8 helps. Set here rather than in
+# the IRON checkout: IRON is shared by every worktree on this box and is not ours to
+# edit in place, and it already reads this from the environment.
+#
+# Safe because -j does not change what aiecc produces -- MEASURED on that design,
+# insts.bin and all 24 per-core ELFs are byte-identical between -j1 and -j16, and
+# input_with_addresses.mlir differs only in the work-dir path it embeds, which two runs
+# at the SAME -j differ in too.
+export AIECC_JOBS="${AIECC_JOBS:-0}"
 export XRT_SRC_DIR="${XRT_SRC_DIR:-$XDNA_WS/XRT-src}"
 export AIEBU_ASM_DIR="${AIEBU_ASM_DIR:-$XRT_SRC_DIR/src/runtime_src/core/common/aiebu/build/Release/src/cpp/utils/asm}"
 
