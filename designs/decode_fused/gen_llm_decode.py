@@ -132,7 +132,7 @@ FUSE_ACT = os.environ.get("FUSE_ACT", "0") == "1"
 # same six designs with a contemporaneous alternated control -- 1770.5 -> 1251.9 us/layer. N=16 and
 # N=32 are SLOWER, because fitting them inside the 16-channel ShimDMA budget needs a MemTile
 # split/join whose small strided-gather fills cost more than the finer parallelism buys.
-FUSE_MLP_DP = os.environ.get("FUSE_MLP_DP", "0") == "1"
+FUSE_MLP_DP = os.environ.get("FUSE_MLP_DP", "1") == "1"
 MLP_DP_COLS = int(os.environ.get("MLP_DP_COLS", "8"))
 
 
@@ -194,6 +194,9 @@ def sequence_name(sp, NL, S, placer_flags):
         parts.append(f"{QUANT_MLP_DTYPE}g{QUANT_MLP_GROUP}")
     if SPLIT_QKNORM:
         parts.append("splitqk")
+    # Suffix stays ON the default here, unlike the other switches: the shipped artifact was BUILT
+    # and gated under this name, and aiecc is not byte-reproducible, so a rename would mean the
+    # next rebuild produces a different ELF under a name nothing was ever gated against.
     if FUSE_MLP_DP:
         parts.append(f"mlpdp{MLP_DP_COLS}")
     if FUSE_ACT:
