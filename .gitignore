@@ -55,3 +55,6 @@ aie_kernels/_test/gen/
 
 # whole_array probe build output (per-pin dirs are disposable, like probes/build)
 experiments/probes/build*/
+
+# per-worktree cargo target-dir, written by scripts/setup_worktree.sh
+/.cargo/
