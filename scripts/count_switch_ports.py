@@ -23,6 +23,7 @@ import sys
 
 TILE_RE = re.compile(r"(%[\w]+)\s*=\s*aie\.tile\((\d+),\s*(\d+)\)")
 SWITCH_RE = re.compile(r"aie\.switchbox\((%[\w]+)\)")
+SHIMMUX_RE = re.compile(r"aie\.shim_mux\((%[\w]+)\)")
 CONNECT_RE = re.compile(r"aie\.connect<([A-Za-z]+)\s*:\s*(\d+)\s*,\s*([A-Za-z]+)\s*:\s*(\d+)>")
 
 # AIE2/AIE2P destination-port budgets. Edge tiles get 0 for the outward direction;
@@ -35,6 +36,17 @@ BUDGET = {
     "shim": {"FIFO": 1, "North": 6, "West": 4, "South": 6, "East": 4, "TileControl": 1},
 }
 
+# The PL-interface mux is a SEPARATE block from the stream switch, so its aie.connect ops
+# score against their own budget rather than the switchbox's above. aie-rt models the two
+# apart (XAie_PlIfMod vs XAie_StrmMod) and the mux registers sit in the NOC window at
+# 0x1F000, not the switch's 0x3F000. Only aie.switchbox resets the current tile, so charging
+# mux connects to the preceding switchbox added a spurious North per shim tile: designs read
+# shim North over budget while routing cleanly, which cannot be a real violation, because a
+# design that exceeds a router budget does not route at all.
+# The toolchain emits North as a mux DESTINATION but its own budget function has no North
+# case (it defaults to 0), so that bundle is reported with an unknown budget, not gated.
+SHIMMUX_BUDGET = {"DMA": 2, "NOC": 4, "PLIO": 6, "South": 8}
+
 
 def tile_class(row):
     return "shim" if row == 0 else ("mem" if row == 1 else "core")
@@ -44,17 +56,22 @@ def parse(path):
     text = open(path).read()
     tiles = {m.group(1): (int(m.group(2)), int(m.group(3))) for m in TILE_RE.finditer(text)}
     used = collections.defaultdict(collections.Counter)   # (col,row) -> bundle -> n
-    cur = None
+    mux = collections.defaultdict(collections.Counter)    # same, for aie.shim_mux blocks
+    cur, sink = None, None
     for line in text.splitlines():
         m = SWITCH_RE.search(line)
         if m:
-            cur = tiles.get(m.group(1))
+            cur, sink = tiles.get(m.group(1)), used
+            continue
+        m = SHIMMUX_RE.search(line)
+        if m:
+            cur, sink = tiles.get(m.group(1)), mux
             continue
         if cur is None:
             continue
         for c in CONNECT_RE.finditer(line):
-            used[cur][c.group(3)] += 1          # destination bundle
-    return used
+            sink[cur][c.group(3)] += 1          # destination bundle
+    return used, mux
 
 
 def main():
@@ -63,10 +80,12 @@ def main():
     ap.add_argument("--label", action="append", default=None)
     args = ap.parse_args()
 
-    per_design = [parse(p) for p in args.mlir]
+    parsed = [parse(p) for p in args.mlir]
+    per_design = [u for u, _ in parsed]
+    per_mux = [m for _, m in parsed]
     labels = args.label or [p.split("/")[-1] for p in args.mlir]
 
-    for lab, used in zip(labels, per_design):
+    for lab, used, mux in zip(labels, per_design, per_mux):
         worst = collections.defaultdict(collections.Counter)
         for (col, row), b in used.items():
             for bundle, n in b.items():
@@ -78,6 +97,13 @@ def main():
                 continue
             cells = ", ".join(f"{b} {n}/{BUDGET[k].get(b,'?')}" for b, n in sorted(worst[k].items()))
             print(f"  {k:5s} {cells}")
+        mworst = collections.Counter()
+        for b in mux.values():
+            for bundle, n in b.items():
+                mworst[bundle] = max(mworst[bundle], n)
+        if mworst:
+            cells = ", ".join(f"{b} {n}/{SHIMMUX_BUDGET.get(b,'?')}" for b, n in sorted(mworst.items()))
+            print(f"  {'mux':5s} {cells}")
 
     if len(per_design) > 1:
         total = collections.defaultdict(collections.Counter)
