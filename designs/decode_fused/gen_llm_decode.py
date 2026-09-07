@@ -101,6 +101,22 @@ def bf16(a):
 # NOT a quality claim: this axis is validated as a byte-stream + determinism engineering check on
 # Qwen3-0.6B, not a token-quality gate (tests/refs/qwen3-0.6b/bf16_oracle.json is 1 prompt / 8
 # free-running tokens with knife-edge logit margins -- too small to see quantization damage).
+# STILL DEFAULT OFF for exactly that reason, even though it now composes with FUSE_MLP_DP and wins:
+# the missing thing is a quality gate, not a performance one.
+#
+# int4/g128 ON TOP of FUSE_MLP_DP, measured 2026-09-07, in-process bench, 4 ABBA rounds, separate
+# process per arm, Power Mode Default:
+#
+#   arm                   ms/token (median)   DDR MB/token   MLP block MB/dispatch
+#   bf16, FUSE_MLP_DP=1        64.308            1562.92            529.06
+#   int4, FUSE_MLP_DP=1        59.519            1174.82            140.95
+#
+# -4.789 ms, -7.45%, arms' clean-cell ranges disjoint. dispatch_count_total 165 in BOTH arms, so it
+# is a byte effect and not a dispatch-count one. The two levers are NOT redundant: fusion was
+# -17.4% and int4 alone -6.0%, and this is a further -7.45% on top of fusion.
+#
+# Only 65% of the census's -7.36 ms transport-floor delta materialised -- the removed bytes were
+# partly overlapped, so price a byte lever here at ~2/3 of its floor arithmetic, not at face value.
 QUANT_MLP_DTYPE = os.environ.get("QUANT_MLP_DTYPE", "bf16")
 QUANT_MLP_GROUP = int(os.environ.get("QUANT_MLP_GROUP", "128"))
 
@@ -155,6 +171,11 @@ FUSE_ACT = os.environ.get("FUSE_ACT", "0") == "1"
 # same six designs with a contemporaneous alternated control -- 1770.5 -> 1251.9 us/layer. N=16 and
 # N=32 are SLOWER, because fitting them inside the 16-channel ShimDMA budget needs a MemTile
 # split/join whose small strided-gather fills cost more than the finer parallelism buys.
+#
+# This block OWNS the MLP weight buffers while it is on, which is why it -- not the gate/up/down
+# GEMVs -- takes QUANT_MLP_DTYPE. Until it did, the two switches could not both be on: it declared
+# bf16-sized buffers while the weight loop below packed the same tensors int4, and the graph died
+# at load_weight_buffer's byte-size assert.
 FUSE_MLP_DP = os.environ.get("FUSE_MLP_DP", "1") == "1"
 MLP_DP_COLS = int(os.environ.get("MLP_DP_COLS", "8"))
 
