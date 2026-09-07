@@ -65,11 +65,13 @@ if [ "$#" -gt 0 ]; then
   hits="$(git grep --untracked -nIEi "$regex" -- "${files[@]}" 2>/dev/null || true)"
   wiki_hits="$(git grep --untracked -nIE "$wikilink_re" -- "${files[@]}" 2>/dev/null | grep -viE "$benign_wikilink_re" || true)"
 else
-  # whole tree, minus the allowed guard files and lockfiles
-  hits="$(git grep --untracked -nIEi "$regex" -- . ':!*.lock' \
+  # whole tree, minus the allowed guard files and rust/Cargo.lock, whose generated
+  # `[[package]]` headers have the wikilink shape. Exclude that ONE path, never *.lock:
+  # toolchain.lock is prose and cites the KB.
+  hits="$(git grep --untracked -nIEi "$regex" -- . ':!rust/Cargo.lock' \
             ':!scripts/check_no_private_refs.sh' ':!scripts/private_ref_patterns.sh' \
             ':!hooks/pre-push' ':!hooks/pre-push-fork' ':!.githooks-install.md' ':!.gitignore' 2>/dev/null || true)"
-  wiki_hits="$(git grep --untracked -nIE "$wikilink_re" -- . ':!*.lock' \
+  wiki_hits="$(git grep --untracked -nIE "$wikilink_re" -- . ':!rust/Cargo.lock' \
             ':!scripts/check_no_private_refs.sh' ':!scripts/private_ref_patterns.sh' \
             ':!hooks/pre-push' ':!hooks/pre-push-fork' ':!.githooks-install.md' ':!.gitignore' 2>/dev/null | grep -viE "$benign_wikilink_re" || true)"
 fi
