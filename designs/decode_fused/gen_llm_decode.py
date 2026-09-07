@@ -135,6 +135,27 @@ FUSE_ACT = os.environ.get("FUSE_ACT", "0") == "1"
 FUSE_MLP_DP = os.environ.get("FUSE_MLP_DP", "1") == "1"
 MLP_DP_COLS = int(os.environ.get("MLP_DP_COLS", "8"))
 
+# Wq/Wk/Wv concatenated into ONE [QD+2*KVD, D] weight and projected by ONE GEMV writing a single
+# `qkv` buffer; q/k/v become byte slices of it. Three runs and two configures per layer become one
+# of each, and the weight stream becomes one contiguous 8.39 MB read instead of three. Arithmetic
+# on the rows is untouched -- each output row is its own dot product -- so this arm is expected to
+# be bit-identical, which is the gate it is checked against.
+FUSE_QKV_GEMV = os.environ.get("FUSE_QKV_GEMV", "1") == "1"
+
+# One RoPE run over the 24 q+k head rows instead of two runs of 16 and 8. Needs FUSE_QKV_GEMV,
+# because it is only expressible when q and k are adjacent in one buffer. Same angle row, same
+# per-row kernel, so also expected bit-identical.
+FUSE_ROPE_QK = os.environ.get("FUSE_ROPE_QK", "1") == "1"
+
+# Fold `attn_scale` into the q-norm gain instead of running an ElementwiseMul over the whole
+# [Hq, S] score matrix. RMSNorm's gain multiply and RoPE's rotation are both linear in q, and the
+# scores GEMV is linear in q, so scaling n_qn by attn_scale scales `sc` by exactly the same factor
+# -- one design, one configure and 28 runs of the token deleted outright.
+#
+# NOT bit-identical: it removes a bf16 rounding of the intermediate `sc` and adds one of the gain.
+# Same class of change as FUSE_MLP_DP's summation order, and gated the same way (token parity).
+SCALE_IN_QNORM = os.environ.get("SCALE_IN_QNORM", "1") == "1"
+
 
 def weight_bytes(arr):
     """Bytes for one weight buffer exactly as written into the .bin / device arena.
@@ -430,9 +451,16 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
     op_qk_norm_b = (RMSNorm(size=HD, num_aie_columns=1, num_channels=1, tile_size=HD,
                             weighted=True, epsilon=sp.eps, context=ctx)
                     if (sp.qk_norm and SPLIT_QKNORM) else op_qk_norm)
+    # QKV projection: one GEMV over the concatenated weight, or the three separate ones. op_kv is
+    # built in both arms because share_designs pairs Wk with Wv only in the unfused one.
+    op_qkv = gemv(QD + 2 * KVD, D, ctx) if FUSE_QKV_GEMV else None
     op_q = gemv(QD, D, ctx)
     op_kv = gemv(KVD, D, ctx)
     op_o = gemv(D, QD, ctx)
+    # RoPE over q and k together (24 head rows) needs them adjacent, which only the fused qkv
+    # buffer gives; angle_rows=1 is unchanged, so every row still reads the same single angle row.
+    fuse_rope = FUSE_QKV_GEMV and FUSE_ROPE_QK
+    op_rope_qk = RoPE(rows=Hq + Hkv, cols=HD, angle_rows=1, context=ctx) if fuse_rope else None
     op_rope_q = RoPE(rows=Hq, cols=HD, angle_rows=1, context=ctx)
     op_rope_k = RoPE(rows=Hkv, cols=HD, angle_rows=1, context=ctx)
     # KV append: deep-C scratchpad offset "kv_off" (element units = n_past*HD), constant ELF.
@@ -467,7 +495,11 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
     op_rep_v = Repeat(rows=Hkv, cols=S * HD, repeat=sp.gqa_group, transfer_size=HD, context=ctx)
     op_scores = gemv(S, HD, ctx, num_batches=Hq,
                      batch_group=sp.gqa_group if GROUPED_K else 1)
-    op_scale = ElementwiseMul(size=Hq * S, tile_size=S // COLS, num_aie_columns=COLS, context=ctx)
+    # Folded into n_qn when SCALE_IN_QNORM; built anyway so the A/B arm stays reachable.
+    scale_in_qnorm = SCALE_IN_QNORM and sp.qk_norm
+    op_scale = (None if scale_in_qnorm else
+                ElementwiseMul(size=Hq * S, tile_size=S // COLS, num_aie_columns=COLS,
+                               context=ctx))
     op_softmax = Softmax(rows=Hq, cols=S, num_aie_columns=COLS, num_channels=1, rtp_vector_size=S,
                          vector_size_parameter="sm_mask", context=ctx)
     # num_batches=Hq, not Hq separate invocations. transpose/design.py's L3 tensors already hold
@@ -550,23 +582,49 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
         p = f"L{l}_"
         nm = sp.norm_weight_names(l)
         for key, tensor in nm.items():
-            weights[p + key] = load_norm(tensor)
+            w = load_norm(tensor)
+            if key == "n_qn" and scale_in_qnorm:
+                # scores = (K @ RoPE(rms(q_raw) * n_qn)) * attn_scale, and both RoPE and the
+                # scores GEMV are linear in q -- so the constant rides on the gain instead of on
+                # a whole [Hq, S] elementwise pass. Scaled in f32 before the bf16 round.
+                w = bf16(np.asarray(w, np.float32) * sp.attn_scale)
+            weights[p + key] = w
         mlp_keys = {"Wg", "Wu", "Wd"}
+        qkv_keys = ("Wq", "Wk", "Wv")
+        qkv_parts = []   # filled in Wq, Wk, Wv order below -- the row order op_qkv assumes
         for key, tensor in (("Wq", "self_attn.q_proj"), ("Wk", "self_attn.k_proj"),
                             ("Wv", "self_attn.v_proj"), ("Wo", "self_attn.o_proj"),
                             ("Wg", "mlp.gate_proj"), ("Wu", "mlp.up_proj"), ("Wd", "mlp.down_proj")):
             w = npy(f"model.layers.{l}.{tensor}.weight")  # [M, K], f32
             if key in mlp_keys and QUANT_MLP_DTYPE != "bf16":
                 weights[p + key] = quantize_weight(w, QUANT_MLP_GROUP, QUANT_MLP_DTYPE)
+            elif key in qkv_keys and FUSE_QKV_GEMV:
+                qkv_parts.append(bf16(w).reshape(-1))     # row-major, so concatenation IS stacking
             else:
                 weights[p + key] = bf16(w).reshape(-1)
+        if FUSE_QKV_GEMV:
+            assert len(qkv_parts) == 3, f"expected Wq, Wk, Wv; got {len(qkv_parts)}"
+            weights[p + "Wqkv"] = np.concatenate(qkv_parts)
         weights[p + "kc"] = np.zeros(Hkv * S * HD, BF16)
         weights[p + "vc"] = np.zeros(Hkv * S * HD, BF16)
         cache_names += [p + "kc", p + "vc"]
         ang = "rope_global" if sp.is_global(l) else "rope_local"
 
+        # q/k/v are byte slices of ONE `qkv` buffer in the fused arm -- op_qkv writes all three in
+        # one pass, and q|k adjacency is what lets a single RoPE cover both. Declared with an
+        # explicit size because a parent that is only ever referenced sliced has no arg spec to
+        # take its length from (iron/common/sequence.py: calculate_buffer_layout).
+        if FUSE_QKV_GEMV:
+            qkvb, kb, vb = p + "qkv", QD * 2, (QD + KVD) * 2
+            ref_q, ref_k = f"{qkvb}[0:{kb}]", f"{qkvb}[{kb}:{vb}]"
+            ref_v, ref_qk = f"{qkvb}[{vb}:{vb + KVD * 2}]", f"{qkvb}[0:{vb}]"
+            qhb, qho, khb, kho = qkvb, 0, qkvb, kb    # per-head qk-norm slice base + byte offset
+            bufsz[qkvb] = (QD + 2 * KVD) * 2
+        else:
+            ref_q, ref_k, ref_v = p + "q", p + "k", p + "v"
+            qhb, qho, khb, kho = p + "q", 0, p + "k", 0
+            bufsz.update({p + "q": QD * 2, p + "k": KVD * 2, p + "v": KVD * 2})
         bufsz.update({
-            p + "q": QD * 2, p + "k": KVD * 2, p + "v": KVD * 2,
             p + "kc": Hkv * S * HD * 2, p + "vc": Hkv * S * HD * 2,
             p + "kr": Hq * S * HD * 2, p + "vr": Hq * S * HD * 2, p + "vt": Hq * S * HD * 2,
             p + "sc": Hq * S * 2, p + "sw": Hq * S * 2,
@@ -577,28 +635,32 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
         nxt = f"x{l+1}"
         qk = []
         if sp.qk_norm:
+            hq = [f"{qhb}[{qho + h*HD*2}:{qho + (h+1)*HD*2}]" for h in range(Hq)]
+            hk = [f"{khb}[{kho + h*HD*2}:{kho + (h+1)*HD*2}]" for h in range(Hkv)]
             qk = [*[((op_qk_norm if h % 2 == 0 else op_qk_norm_b),
-                     f"{p}q[{h*HD*2}:{(h+1)*HD*2}]", p + "n_qn",
-                     f"{p}q[{h*HD*2}:{(h+1)*HD*2}]") for h in range(Hq)],
+                     hq[h], p + "n_qn", hq[h]) for h in range(Hq)],
                   *[((op_qk_norm if h % 2 == 0 else op_qk_norm_b),
-                     f"{p}k[{h*HD*2}:{(h+1)*HD*2}]", p + "n_kn",
-                     f"{p}k[{h*HD*2}:{(h+1)*HD*2}]") for h in range(Hkv)]]
+                     hk[h], p + "n_kn", hk[h]) for h in range(Hkv)]]
+        proj = ([(op_qkv, p + "Wqkv", p + "hn", p + "qkv")] if FUSE_QKV_GEMV else
+                [(op_q, p + "Wq", p + "hn", ref_q),
+                 (op_kv, p + "Wk", p + "hn", ref_k),
+                 (op_kv, p + "Wv", p + "hn", ref_v)])
+        rope = ([(op_rope_qk, ref_qk, ang, ref_qk)] if fuse_rope else
+                [(op_rope_q, ref_q, ang, ref_q),
+                 (op_rope_k, ref_k, ang, ref_k)])
         rl += [
             (op_norm, cur, p + "n_in", p + "hn"),
-            (op_q, p + "Wq", p + "hn", p + "q"),
-            (op_kv, p + "Wk", p + "hn", p + "k"),
-            (op_kv, p + "Wv", p + "hn", p + "v"),
+            *proj,
             *qk,
-            (op_rope_q, p + "q", ang, p + "q"),
-            (op_rope_k, p + "k", ang, p + "k"),
-            (op_sck, p + "k", p + "kc"),
-            (op_scv, p + "v", p + "vc"),
+            *rope,
+            (op_sck, ref_k, p + "kc"),
+            (op_scv, ref_v, p + "vc"),
             *([] if GROUPED_K else [(op_rep_k, p + "kc", p + "kr")]),
             # TMV_CTX subsumes the v-side grouping: TMatVec reads vc per kv head itself, so a
             # Repeat would materialise a `vr` nothing consumes.
             *([] if (GROUPED_V or TMV_CTX) else [(op_rep_v, p + "vc", p + "vr")]),
-            (op_scores, p + ("kc" if GROUPED_K else "kr"), p + "q", p + "sc"),
-            (op_scale, p + "sc", "attn_scale", p + "sc"),
+            (op_scores, p + ("kc" if GROUPED_K else "kr"), ref_q, p + "sc"),
+            *([] if scale_in_qnorm else [(op_scale, p + "sc", "attn_scale", p + "sc")]),
             (op_softmax, p + "sc", p + "sw"),
             *([] if TMV_CTX else [(op_trv, p + ("vc" if GROUPED_V else "vr"), p + "vt")]),
             (op_ctx, p + ("vc" if TMV_CTX else "vt"), p + "sw", p + "cx"),
@@ -634,7 +696,8 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
 
     weights["n_final"] = load_norm("model.norm.weight")
     weights["W_head"] = bf16(npy("model.embed_tokens.weight")).reshape(-1)   # tied
-    weights["attn_scale"] = np.full(Hq * S, sp.attn_scale, BF16)
+    if not scale_in_qnorm:
+        weights["attn_scale"] = np.full(Hq * S, sp.attn_scale, BF16)
     rl += [(op_norm, cur, "n_final", "xf"), (op_head, "W_head", "xf", "logits")]
     bufsz["xf"] = D * 2
     bufsz["logits"] = VOCAB * 2
