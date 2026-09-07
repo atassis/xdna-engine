@@ -86,7 +86,21 @@ def main():
     for name, arr in weights.items():
         buf = c.get_buffer(name)
         load_weight_buffer(buf, arr)
-    print(f"[verify] {len(weights)} weight buffers loaded")
+    # FLUSH SCRATCH. Every weight and both KV caches live in the scratch arena, and the callable
+    # syncs only input (host->device) and output (device->host) -- scratch in NEITHER direction,
+    # deliberately, because it is large and "whoever loads it" is supposed to sync it. Nobody did.
+    # So these writes sat in dirty host cache lines over DRAM the device then read, and what the
+    # device saw depended on which lines the CPU had happened to write back.
+    #
+    # MEASURED 2026-09-07 with probe_decode_first_divergence.py, two identical passes of the
+    # 2-layer decode: without this flush BOTH arms are nondeterministic -- the TMV arm first
+    # diverges at L0_q (the Q projection, runlist index 1, 95/114 snapshots differing and a
+    # different token by step 2) and the kv arm at L0_kr by 64 elements = exactly 2 x 64-byte
+    # cache lines. With it, both arms are bit-identical across passes and agree token for token.
+    # The "kv arm is 0/336" that this defect was localised against was luck, not a property.
+    c.scratch_buffer.device = "cpu"
+    c.scratch_buffer.to("npu")
+    print(f"[verify] {len(weights)} weight buffers loaded and scratch flushed to the device")
 
     # embed_tokens doubles as the tied lm-head; the host gathers the row for the current token.
     embed = np.load(os.path.join(a.weights, "model.embed_tokens.weight.npy")).astype(np.float32)
