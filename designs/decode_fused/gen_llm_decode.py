@@ -132,6 +132,45 @@ def load_weight_buffer(buf, arr):
         np.copyto(buf.data, np.asarray(a, BF16).reshape(-1))
 
 
+
+def isolate_build_dir(tag):
+    """chdir into a private build dir, because IRON writes build/ intermediates under CWD.
+
+    IRON keys cached operator artifacts by NAME, and the name encodes SHAPES but not the dataflow
+    flags -- so two arms of this graph produce the same filenames. Any entry point that runs in a
+    shared directory can therefore assemble an ELF partly from another arm's operator binaries. The
+    result is not a crash and not noise: it is a deterministic, reproducible wrong answer that looks
+    exactly like a numerical bug.
+
+    MEASURED COST 2026-09-07, twice in one day. Once here (an A/B in a shared dir produced a
+    different step-0 token for a FIXED graph, which is impossible), and once in a parallel session
+    that spent ~3 hours on a full-depth decode returning the constant token 3972 at every step,
+    deterministic across runs, because its runner never left the shared xdna-engine/build.
+
+    build_llm_decode.sh already does `WORK=$(mktemp -d); cd "$WORK"` for exactly this reason. This
+    gives the Python entry points the same protection instead of trusting the caller's cwd.
+
+    Set DECODE_WORK=<dir> to use a specific directory (kept, not deleted) when you need the
+    intermediates -- a byte census needs the fused MLIR, which is otherwise discarded.
+    """
+    import atexit
+    import shutil
+    import tempfile
+
+    explicit = os.environ.get("DECODE_WORK")
+    if explicit:
+        os.makedirs(explicit, exist_ok=True)
+        os.chdir(explicit)
+        print(f"[{tag}] build dir {explicit} (DECODE_WORK, kept)", flush=True)
+        return explicit
+    work = tempfile.mkdtemp(prefix=f"{tag}-")
+    atexit.register(shutil.rmtree, work, ignore_errors=True)
+    os.chdir(work)
+    print(f"[{tag}] build dir {work} (private, removed on exit; "
+          f"set DECODE_WORK=<dir> to keep)", flush=True)
+    return work
+
+
 def repo_root():
     # gen_llm_decode.py -> decode_fused -> designs -> repo root (toolchain.lock lives there).
     return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))

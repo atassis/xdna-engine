@@ -43,7 +43,7 @@ import ml_dtypes
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import newstack_compat  # noqa: F401,E402
-from gen_llm_decode import build_graph, load_weight_buffer  # noqa: E402
+from gen_llm_decode import build_graph, load_weight_buffer, isolate_build_dir  # noqa: E402
 from verify_llm_decode import rope_row  # noqa: E402
 
 BF16 = ml_dtypes.bfloat16
@@ -72,6 +72,7 @@ def main():
     ap.add_argument("--weights", required=True)
     ap.add_argument("--prompt-token", type=int, default=785)
     a = ap.parse_args()
+    isolate_build_dir("probe")
 
     layers = int(os.environ.get("PROBE_LAYERS", "2"))
     steps = int(os.environ.get("PROBE_STEPS", "3"))
