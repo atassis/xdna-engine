@@ -271,14 +271,26 @@ def main():
             if buf_type == "scratch" and name not in weights:
                 extra_scratch[name] = np.zeros(length // 2, BF16)  # bf16 element count
 
+    def push_scratch():
+        # reset_kv()/extra_scratch write through get_buffer(...).data -- the UNMEDIATED handle,
+        # which does not update the coherence map -- so without this the device keeps the KV the
+        # timing sweep left and each determinism pass runs on different residue.
+        c.scratch_buffer.device = "cpu"
+        c.scratch_buffer.to("npu")
+
     def reset_all():
         reset_kv()
         for name, zeros in extra_scratch.items():
             np.copyto(c.get_buffer(name).data, zeros)
+        push_scratch()
 
     det_sequences = []
     for run_idx in range(a.det_runs):
-        reset_all() if a.det_full_reset else reset_kv()
+        if a.det_full_reset:
+            reset_all()
+        else:
+            reset_kv()
+            push_scratch()
         fed = list(prompt_ids)
         produced = []
         tok = fed[0]
