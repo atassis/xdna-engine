@@ -28,6 +28,7 @@ Run INSIDE the fork IRON env (scripts/toolchain_up.sh), never the wheel python. 
       --weights artifacts/qwen3-0.6b/weights --out artifacts/qwen3-0.6b/decode --layers 28
 """
 import argparse
+import hashlib
 import json
 import os
 import subprocess
@@ -65,6 +66,8 @@ GROUPED_K = os.environ.get("GQA_GROUPED_K", "1") == "1"
 GROUPED_V = os.environ.get("GQA_GROUPED_V", "0") == "1"
 # Context step as a transposed-A reduction over the V cache rows, deleting op_trv outright.
 TMV_CTX = os.environ.get("TMV_CTX", "1") == "1"
+TMV_RPC_DEFAULT = 64
+TMV_RPC = int(os.environ.get("TMV_RPC", str(TMV_RPC_DEFAULT)))
 
 import newstack_compat  # noqa: F401,E402 -- MUST precede iron imports (new-mlir-aie port shim)
 from iron.common import AIEContext  # noqa: E402
@@ -101,6 +104,8 @@ def bf16(a):
 QUANT_MLP_DTYPE = os.environ.get("QUANT_MLP_DTYPE", "bf16")
 QUANT_MLP_GROUP = int(os.environ.get("QUANT_MLP_GROUP", "128"))
 
+DECODE_PLACER_FLAGS_DEFAULT = "--cores-per-col 1"
+
 
 def weight_bytes(arr):
     """Bytes for one weight buffer exactly as written into the .bin / device arena.
@@ -131,6 +136,40 @@ def load_weight_buffer(buf, arr):
     else:
         np.copyto(buf.data, np.asarray(a, BF16).reshape(-1))
 
+
+
+def sequence_name(sp, NL, S, placer_flags):
+    """Name the fused sequence after everything that changes its graph, not just the model.
+
+    IRON keys the cached artifact by this name. Every knob below produces a DIFFERENT ELF, so
+    without them two arms share one filename and a later run executes the earlier arm's binary --
+    see isolate_build_dir() for what that cost twice on 2026-09-07. Isolating the build dir hides
+    the collision; naming the arm removes it, and only naming it makes an arm's artifact
+    identifiable after the fact.
+
+    Suffixes are emitted only for NON-DEFAULT values, so the shipped default keeps the bare
+    `<spec>_decode` name and its existing artifact stays valid. Same convention as TMatVec's
+    `_ak{alloc_K}`.
+    """
+    base = f"{sp.name.replace('-','_').replace('.','_')}_decode"
+    parts = []
+    if not TMV_CTX:
+        parts.append("noctx")
+    if not GROUPED_K:
+        parts.append("nogk")
+    if GROUPED_V:
+        parts.append("gv")
+    if TMV_CTX and TMV_RPC != TMV_RPC_DEFAULT:
+        parts.append(f"rpc{TMV_RPC}")
+    if QUANT_MLP_DTYPE != "bf16":
+        parts.append(f"{QUANT_MLP_DTYPE}g{QUANT_MLP_GROUP}")
+    if NL != sp.n_layers:
+        parts.append(f"l{NL}")
+    if S != 2048:
+        parts.append(f"s{S}")
+    if placer_flags != DECODE_PLACER_FLAGS_DEFAULT.split():
+        parts.append("p" + hashlib.sha1(" ".join(placer_flags).encode()).hexdigest()[:6])
+    return "_".join([base, *parts])
 
 
 def isolate_build_dir(tag):
@@ -419,7 +458,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
     if TMV_CTX:
         op_ctx = TMatVec(M=HD, K=S, num_aie_columns=Hkv, num_batches=Hq,
                          batch_group=sp.gqa_group,
-                         rows_per_chunk=int(os.environ.get("TMV_RPC", "64")), context=ctx)
+                         rows_per_chunk=TMV_RPC, context=ctx)
     else:
         op_ctx = gemv(HD, S, ctx, num_batches=Hq)
     # MLP weight-stream dtype axis (Wg/Wu/Wd -- "MLP weights" in the byte breakdown, the largest
@@ -538,8 +577,8 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
     #
     # THIS is the whole measured win: -11.14 ms/token, -7.1%, isolated on device with the transpose
     # batching held constant and DDR bytes identical at 3105.99 MB in every arm.
-    placer_flags = os.environ.get("DECODE_PLACER_FLAGS", "--cores-per-col 1").split()
-    fused = OperatorSequence(f"{sp.name.replace('-','_').replace('.','_')}_decode", rl,
+    placer_flags = os.environ.get("DECODE_PLACER_FLAGS", DECODE_PLACER_FLAGS_DEFAULT).split()
+    fused = OperatorSequence(sequence_name(sp, NL, S, placer_flags), rl,
                               input_args=inputs, output_args=["logits"],
                               buffer_sizes=bufsz, context=ctx, extra_flags=placer_flags)
     fused.compile()
