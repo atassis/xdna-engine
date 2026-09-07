@@ -127,6 +127,14 @@ SPLIT_QKNORM = os.environ.get("SPLIT_QKNORM", "0") == "1"
 # pair. Turn it on with FUSE_ACT=1.
 FUSE_ACT = os.environ.get("FUSE_ACT", "0") == "1"
 
+# Replace the MLP block's SIX designs with ONE data-parallel fused design: every core runs every
+# stage on its own 1/N slice, N=8 (one core per column). Measured standalone at -29.3% against the
+# same six designs with a contemporaneous alternated control -- 1770.5 -> 1251.9 us/layer. N=16 and
+# N=32 are SLOWER, because fitting them inside the 16-channel ShimDMA budget needs a MemTile
+# split/join whose small strided-gather fills cost more than the finer parallelism buys.
+FUSE_MLP_DP = os.environ.get("FUSE_MLP_DP", "0") == "1"
+MLP_DP_COLS = int(os.environ.get("MLP_DP_COLS", "8"))
+
 
 def weight_bytes(arr):
     """Bytes for one weight buffer exactly as written into the .bin / device arena.
@@ -186,6 +194,8 @@ def sequence_name(sp, NL, S, placer_flags):
         parts.append(f"{QUANT_MLP_DTYPE}g{QUANT_MLP_GROUP}")
     if SPLIT_QKNORM:
         parts.append("splitqk")
+    if FUSE_MLP_DP:
+        parts.append(f"mlpdp{MLP_DP_COLS}")
     if FUSE_ACT:
         parts.append("fuseact")
     if NL != sp.n_layers:
@@ -510,6 +520,16 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
                    **(dict(epilogue=sp.act) if fuse_act else {}))
     op_up = gemv(FF, D, ctx, **mlp_quant_kw)
     op_act = None
+    op_mlp_dp = None
+    if FUSE_MLP_DP:
+        if sp.sandwich_norms or sp.act != "silu":
+            raise NotImplementedError(
+                "FUSE_MLP_DP covers the plain SiLU MLP block only; this spec has "
+                f"sandwich_norms={sp.sandwich_norms!r} act={sp.act!r}"
+            )
+        from iron.operators.swiglu_mlp_dp.op import SwiGLUMLPDataParallel
+        op_mlp_dp = SwiGLUMLPDataParallel(D=D, FF=FF, num_aie_columns=MLP_DP_COLS,
+                                          epsilon=sp.eps, context=ctx)
     if not fuse_act:
         if sp.act == "silu":
             op_act = SiLU(size=FF, num_aie_columns=COLS, tile_size=FF // COLS, context=ctx)
@@ -583,20 +603,31 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
         ]
         if sp.sandwich_norms:
             rl.append((op_norm, p + "a", p + "n_pa", p + "a"))
-        rl += [
-            (op_add, cur, p + "a", p + "x1"),
-            (op_norm, p + "x1", p + "n_pf", p + "hf"),
-            (op_gate, p + "Wg", p + "hf", p + "g"),
-            (op_up, p + "Wu", p + "hf", p + "u"),
-            *([] if op_act is None else [(op_act, p + "g", p + "g")]),
-            (op_mul_ffn, p + "g", p + "u", p + "gh"),
-            (op_down, p + "Wd", p + "gh", p + "d"),
-        ]
+        if op_mlp_dp is not None:
+            # cur + a -> x1 -> norm -> gate/up -> silu -> mul -> down -> +x1, all inside one design.
+            # x1/hf/g/u/gh/d never reach DDR; `mlp_gh` is the all-gather round-trip buffer and is
+            # shared across layers because the sequence runs them one at a time.
+            rl.append((op_mlp_dp, cur, p + "a", p + "n_pf", p + "Wg", p + "Wu", p + "Wd",
+                       "mlp_gh", nxt))
+        else:
+            rl += [
+                (op_add, cur, p + "a", p + "x1"),
+                (op_norm, p + "x1", p + "n_pf", p + "hf"),
+                (op_gate, p + "Wg", p + "hf", p + "g"),
+                (op_up, p + "Wu", p + "hf", p + "u"),
+                *([] if op_act is None else [(op_act, p + "g", p + "g")]),
+                (op_mul_ffn, p + "g", p + "u", p + "gh"),
+                (op_down, p + "Wd", p + "gh", p + "d"),
+            ]
         if sp.sandwich_norms:
             rl.append((op_norm, p + "d", p + "n_pff", p + "d"))
-        rl.append((op_add, p + "x1", p + "d", nxt))
+        if op_mlp_dp is None:
+            rl.append((op_add, p + "x1", p + "d", nxt))
         bufsz[p + "x1"] = D * 2
         cur = nxt
+
+    if op_mlp_dp is not None:
+        bufsz["mlp_gh"] = FF * 2   # one buffer, reused by every layer -- they run one at a time
 
     weights["n_final"] = load_norm("model.norm.weight")
     weights["W_head"] = bf16(npy("model.embed_tokens.weight")).reshape(-1)   # tied
