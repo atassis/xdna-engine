@@ -167,12 +167,21 @@ SCALE_IN_QNORM = os.environ.get("SCALE_IN_QNORM", "1") == "1"
 # the q+k RoPE -- as ONE data-parallel design: every core owns a contiguous row slice of Wqkv and
 # runs every stage on it. Four configures per layer become one, and `hn` stops reaching DDR.
 #
-# DEFAULT OFF until it is A/B'd on device. The previous attempt at this group (fuse/qkv-head, a
-# spatial per-column pipeline sharing ONE input channel between the activations and the weight
-# rows) measured +28.2% SLOWER, so a placement result is not a win here -- see the operator's own
-# design.py for which of its two defects this one fixes. Needs FUSE_QKV_GEMV for the concatenated
-# weight it consumes.
-FUSE_QKV_DP = os.environ.get("FUSE_QKV_DP", "0") == "1"
+# DEFAULT ON 2026-09-07 (owner call). Measured on device, ABBA, separate single-context process
+# per arm, 18 cells per arm: 57.078 -> 54.071 ms/token, -3.007 ms, -5.27%, 17.52 -> 18.49 tok/s.
+# The two arms' clean modes are DISJOINT (=0's minimum 56.862 exceeds =1's maximum 56.681), so no
+# statistic choice carries the result and no outlier filter is applied. Teacher-forced parity is
+# identical to the =0 arm.
+#
+# -84 configures bought 35.8 us each against the independently measured 51-62 us flat per-configure
+# cost, so this design hands back ~1.6 ms of its own saving as per-invocation work. The three flags
+# above went the OTHER way, 73.7 us/configure, because the concatenated GEMV also improved
+# transport. Fusion is the configure model PLUS a per-design work delta whose sign the configure
+# count does not predict -- do not price the next group off the count alone.
+#
+# The previous attempt at this group (fuse/qkv-head) measured +28.2% SLOWER, and neither of its two
+# defects was fusing: see the operator's design.py. Needs FUSE_QKV_GEMV for the concatenated weight.
+FUSE_QKV_DP = os.environ.get("FUSE_QKV_DP", "1") == "1"
 
 
 def weight_bytes(arr):

@@ -38,7 +38,8 @@ iron_at="$(iron_require_api "gen_llm_decode.py" \
   "iron/common/sequence.py:class OperatorSequence" \
   "iron/operators/strided_copy/op.py:output_offset_parameter" \
   "iron/operators/tmatvec/op.py:class TMatVec" \
-  "iron/operators/gemv/quant.py:def quantize_weight")" || exit 1
+  "iron/operators/gemv/quant.py:def quantize_weight" \
+  "iron/operators/qkv_head_dp/op.py:class QKVHeadDataParallel")" || exit 1
 echo "[build] IRON on $iron_at (API surface verified)"
 [ -d "$WEIGHTS" ] || { echo "ERROR: no weights at $WEIGHTS (run scripts/dump_llm_weights.py)"; exit 1; }
 
