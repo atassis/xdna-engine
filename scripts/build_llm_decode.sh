@@ -29,9 +29,16 @@ GEN="$REPO/designs/decode_fused/gen_llm_decode.py"
 # which tethered the whole LLM decode build to one side branch; the generator is now on
 # OperatorSequence like the other 15.
 iron_require_pin || exit 1
+# Gate on the modules gen_llm_decode.py ACTUALLY IMPORTS at module scope. The first two are the
+# API surface the generator was ported to; the last two are operators that exist only on the
+# integration stack, and WITHOUT THEM LISTED this gate passed against a checkout that then died at
+# `ModuleNotFoundError: No module named 'iron.operators.gemv.quant'`. A gate whose purpose is to
+# fail early, failing late, on a message naming a Python module rather than a mis-pointed IRON_DIR.
 iron_at="$(iron_require_api "gen_llm_decode.py" \
   "iron/common/sequence.py:class OperatorSequence" \
-  "iron/operators/strided_copy/op.py:output_offset_parameter")" || exit 1
+  "iron/operators/strided_copy/op.py:output_offset_parameter" \
+  "iron/operators/tmatvec/op.py:class TMatVec" \
+  "iron/operators/gemv/quant.py:def quantize_weight")" || exit 1
 echo "[build] IRON on $iron_at (API surface verified)"
 [ -d "$WEIGHTS" ] || { echo "ERROR: no weights at $WEIGHTS (run scripts/dump_llm_weights.py)"; exit 1; }
 

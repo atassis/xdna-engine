@@ -17,7 +17,21 @@
 XDNA_WS="${XDNA_WS:-$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/../.." && pwd)}"
 export XDNA_WS
 
-export IRON_DIR="${IRON_DIR:-$XDNA_WS/IRON}"
+# IRON_DIR points at the INTEGRATION STACK, not the bare fork checkout.
+#
+# The shared $XDNA_WS/IRON checkout sits on whatever branch it was last left on and carries neither
+# iron/operators/tmatvec/ nor iron/operators/gemv/quant.py -- both imported at module scope by
+# designs/decode_fused/gen_llm_decode.py. So the documented build command for the LLM decode failed
+# at import with the default resolution, and every caller had to know to pass IRON=<worktree>.
+#
+# wt-iron-integ is the integration-stack model every other fork here already uses: latest upstream
+# as the base, our carries cherry-picked on top, dropped as they land upstream. Rebased 2026-09-07
+# onto upstream/devel deb6e1e with all carries applied and gated -- device-free tests, bf16-oracle
+# parity, DDR bytes, interleaved timing, and a byte-identical decode ELF against the pre-rebase
+# build. See the journal task iron-back-onto-the-integration-stack-model.
+#
+# Still overridable: `IRON=<dir>` on any caller, or IRON_DIR in the environment.
+export IRON_DIR="${IRON_DIR:-$XDNA_WS/wt-iron-integ}"
 
 # amd/IRON's two aiecc rules default AIECC_JOBS to '1', so every design's per-core
 # compiles run one at a time. On the 24-core encoder-MHA design that is 7.7 s against
