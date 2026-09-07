@@ -128,6 +128,13 @@ def main():
         top1_hits += int(np.argmax(lg) == ids[pos + 1])
         if (pos + 1) % 256 == 0:
             print(f"[ppl]   {pos+1}/{n}  running ppl {math.exp(np.mean(nll)):.4f}", flush=True)
+            if a.dump_nll:
+                # Checkpoint. This harness cannot RESUME -- every position depends on the KV cache
+                # the previous ones built, so there is no cheap way to skip ahead -- but a killed
+                # run can still leave a usable paired sample. Cost is one small write per 256
+                # dispatches. Measured need: a run stopped at 1024/2000 to hand the device over
+                # was worth keeping and nearly wasn't.
+                np.save(a.dump_nll, np.asarray(nll, dtype=np.float64))
     wall = time.perf_counter() - t0
 
     mean_nll = float(np.mean(nll))
