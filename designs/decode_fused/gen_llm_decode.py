@@ -501,6 +501,17 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
         w = npy(name)
         return bf16(1.0 + w) if sp.norm_gain == "one_plus_w" else bf16(w)
 
+    # AIE_DEVICE=npu2 pins the target instead of probing the runtime for it. The probe OPENS
+    # /dev/accel, which makes an otherwise device-free build queue behind whatever is running on
+    # the single-tenant NPU -- tonight that was ~16 min of another session's eval for a 3.5 min
+    # build. Pinning is opt-in, so the default still verifies you are building for the device you
+    # actually have; set it only when you know the target and want the build off the device lock.
+    if os.environ.get("AIE_DEVICE"):
+        import aie.utils as _aie_utils
+        from aie.iron.device import from_name as _from_name
+        # n_cols=None means the device's full width; COLS above already assumes all 8.
+        _aie_utils.set_current_device(_from_name(os.environ["AIE_DEVICE"], n_cols=None))
+
     ctx = AIEContext()
 
     # ---- op vocabulary: created ONCE, reused across every layer (same dims per layer) ----
