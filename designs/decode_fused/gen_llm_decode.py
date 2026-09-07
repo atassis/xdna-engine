@@ -119,8 +119,11 @@ QUANT_ATTN_GROUP = int(os.environ.get("QUANT_ATTN_GROUP", "128"))
 # NEXT step's `embed[token]` straight out of it as a raw bf16 [vocab, d_model] row -- see that
 # struct's doc comment ("the host embedding gather reads the tied W_head blob that is already
 # there"). quantize_weight()'s on-wire row layout ([n_groups x f32 scale][packed payload]) is a
-# DIFFERENT byte layout from a bf16 row, so QUANT_HEAD_DTYPE != "bf16" silently breaks that host
-# gather -- it would read scale/payload bytes as if they were bf16 floats. This flag only rewires
+# DIFFERENT byte layout from a bf16 row AND a different SIZE, so QUANT_HEAD_DTYPE != "bf16" makes
+# the artifact refuse to load: npu_decode.rs:125-137 gates on `vocab * d_model * 2` and returns a
+# Load error naming the mismatch. That is a loud failure, not a silent misread -- the gate exists
+# for exactly this class ("a W_head built for another vocab ... would otherwise gather a wrong row
+# quietly"). Verified by reading the gate, not inferred. This flag only rewires
 # the ON-DEVICE lm-head GEMV; making the artifact runnable end to end additionally needs
 # NpuDecodeStep to dequantize the row it gathers (or a second, always-bf16 embedding blob), which
 # is rust/npu-engine's code and out of this axis's scope -- see the loud build-time warning below.
