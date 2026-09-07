@@ -578,9 +578,14 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
     # THIS is the whole measured win: -11.14 ms/token, -7.1%, isolated on device with the transpose
     # batching held constant and DDR bytes identical at 3105.99 MB in every arm.
     placer_flags = os.environ.get("DECODE_PLACER_FLAGS", DECODE_PLACER_FLAGS_DEFAULT).split()
+    # Two designs where one would do: gate/up are the same GEMV shape and adjacent, as are the two
+    # KV StridedCopys. Each duplicate pair costs an extra aiex.configure PER LAYER -- 56 per token
+    # against a measured ~40 us each. SHARE_DESIGNS=0 restores the unshared build for an A/B.
+    share = os.environ.get("SHARE_DESIGNS", "1") == "1"
     fused = OperatorSequence(sequence_name(sp, NL, S, placer_flags), rl,
                               input_args=inputs, output_args=["logits"],
-                              buffer_sizes=bufsz, context=ctx, extra_flags=placer_flags)
+                              buffer_sizes=bufsz, context=ctx, extra_flags=placer_flags,
+                              share_designs=share)
     fused.compile()
     return sp, fused, weights, dict(NL=NL, S=S, inputs=inputs, cache_names=cache_names)
 
