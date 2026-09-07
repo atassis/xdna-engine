@@ -156,6 +156,17 @@ FUSE_ROPE_QK = os.environ.get("FUSE_ROPE_QK", "1") == "1"
 # Same class of change as FUSE_MLP_DP's summation order, and gated the same way (token parity).
 SCALE_IN_QNORM = os.environ.get("SCALE_IN_QNORM", "1") == "1"
 
+# The whole QKV head -- pre-attn RMSNorm, the concatenated QKV GEMV, the 24 per-head qk-norms and
+# the q+k RoPE -- as ONE data-parallel design: every core owns a contiguous row slice of Wqkv and
+# runs every stage on it. Four configures per layer become one, and `hn` stops reaching DDR.
+#
+# DEFAULT OFF until it is A/B'd on device. The previous attempt at this group (fuse/qkv-head, a
+# spatial per-column pipeline sharing ONE input channel between the activations and the weight
+# rows) measured +28.2% SLOWER, so a placement result is not a win here -- see the operator's own
+# design.py for which of its two defects this one fixes. Needs FUSE_QKV_GEMV for the concatenated
+# weight it consumes.
+FUSE_QKV_DP = os.environ.get("FUSE_QKV_DP", "0") == "1"
+
 
 def weight_bytes(arr):
     """Bytes for one weight buffer exactly as written into the .bin / device arena.
@@ -461,6 +472,17 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
     # buffer gives; angle_rows=1 is unchanged, so every row still reads the same single angle row.
     fuse_rope = FUSE_QKV_GEMV and FUSE_ROPE_QK
     op_rope_qk = RoPE(rows=Hq + Hkv, cols=HD, angle_rows=1, context=ctx) if fuse_rope else None
+    op_qkv_dp = None
+    if FUSE_QKV_DP:
+        if not (FUSE_QKV_GEMV and sp.qk_norm):
+            raise NotImplementedError(
+                "FUSE_QKV_DP consumes the concatenated Wqkv and applies a per-head qk-norm; it "
+                f"needs FUSE_QKV_GEMV=1 (got {FUSE_QKV_GEMV}) and a spec with qk_norm "
+                f"(got {sp.qk_norm})"
+            )
+        from iron.operators.qkv_head_dp.op import QKVHeadDataParallel
+        op_qkv_dp = QKVHeadDataParallel(D=D, HD=HD, Hq=Hq, Hkv=Hkv, num_aie_columns=COLS,
+                                        epsilon=sp.eps, tile_size_input=TSI, context=ctx)
     op_rope_q = RoPE(rows=Hq, cols=HD, angle_rows=1, context=ctx)
     op_rope_k = RoPE(rows=Hkv, cols=HD, angle_rows=1, context=ctx)
     # KV append: deep-C scratchpad offset "kv_off" (element units = n_past*HD), constant ELF.
@@ -648,11 +670,13 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
         rope = ([(op_rope_qk, ref_qk, ang, ref_qk)] if fuse_rope else
                 [(op_rope_q, ref_q, ang, ref_q),
                  (op_rope_k, ref_k, ang, ref_k)])
+        # The fused head replaces the norm, the projection, every qk-norm and the RoPE with one
+        # design; `hn` lives and dies in L1 instead of round-tripping DDR between four of them.
+        head = ([(op_qkv_dp, cur, p + "n_in", p + "Wqkv", p + "n_qn", p + "n_kn", ang, p + "qkv")]
+                if op_qkv_dp is not None else
+                [(op_norm, cur, p + "n_in", p + "hn"), *proj, *qk, *rope])
         rl += [
-            (op_norm, cur, p + "n_in", p + "hn"),
-            *proj,
-            *qk,
-            *rope,
+            *head,
             (op_sck, ref_k, p + "kc"),
             (op_scv, ref_v, p + "vc"),
             *([] if GROUPED_K else [(op_rep_k, p + "kc", p + "kr")]),
