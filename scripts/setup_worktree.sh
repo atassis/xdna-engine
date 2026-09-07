@@ -40,6 +40,16 @@ link_into() {  # link_into <target> <link-path>
 mkdir -p artifacts
 for entry in "$store"/*; do
   [ -e "$entry" ] || continue
+  # An artifact whose validity is established by its POSITION cannot be relocated: moving it
+  # moves its gate. artifact.rs walks UP from the decode dir for toolchain.lock, so with no dev
+  # checkout above it the freshness check drops from Stale (hard error, "rebuild") to
+  # Unverifiable (warn) and a stale artifact loads silently. The property is the stamp, not the
+  # directory name -- meta.json's `toolchain.hash`, which is what check_toolchain_freshness reads.
+  # NB: test the grep OUTPUT, not find's exit status -- find succeeds whether or not grep matched.
+  if find "$entry" -maxdepth 3 -name meta.json -exec grep -l '"toolchain"' {} + 2>/dev/null | grep -q .; then
+    echo "  skip $(basename "$entry") -- toolchain-stamped build output; it stays in the checkout" >&2
+    continue
+  fi
   link_into "$entry" "artifacts/$(basename "$entry")"
 done
 link_into "$models" models
