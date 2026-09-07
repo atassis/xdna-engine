@@ -27,8 +27,8 @@ request path. Unifying them is open work, not a shipped property; see "Known sea
 
 ## Crates
 
-15 workspace members (`rust/Cargo.toml`). `cargo build` at the workspace root builds the 14
-product crates; `npu-probes` is excluded from `default-members` and built on request.
+18 workspace members (`rust/Cargo.toml`). `cargo build` at the workspace root builds the 16
+`default-members`; `npu-probes` and `npu-vod-chain-skeleton` are excluded and built on request.
 
 | Crate | Responsibility |
 | --- | --- |
@@ -46,6 +46,9 @@ product crates; `npu-probes` is excluded from `default-members` and built on req
 | `npu-capi` | C ABI over `npu-engine` (cdylib + staticlib, cbindgen header) for in-process embedding from any language. |
 | `npu-cli` | `npu` multitool: serve, transcribe, embed, models, config, reload, bake. |
 | `npu-probes` | 53 device probes, parity checks and benchmarks. Dev tooling, not shipped: NOT in `default-members`, so it costs nothing on a product build. `cargo build -p npu-probes`. |
+| `npu-dispatch` | Byte-marshaling helpers and dispatch profiling with zero model-specific semantics; the one definition of `PAD_M`/`WA_SUBDIR`/`u16_bytes` that `npu-asr`, `npu-parakeet` and `npu-whisper` each used to copy. |
+| `npu-s2` | S2 TTS codec: opens one exported streamed design (`final.xclbin` + `insts.bin` + `meta.json`) once and dispatches it many times. |
+| `npu-vod-chain-skeleton` | VOD -> STT -> LLM -> tool-call wiring skeleton. Device-free by construction; proves the stages compose against the real trait contracts. NOT in `default-members`. |
 
 ## Dataflow
 

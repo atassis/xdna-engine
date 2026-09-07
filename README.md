@@ -19,14 +19,20 @@ freeing the CPU - see [docs/data-movement-thesis.md](docs/data-movement-thesis.m
 
 ## What works today
 
+- **LLM decode** - Qwen3-0.6B generates on the NPU: the whole MLP block and the whole QKV
+  head each compile to one design, and a token costs 170 dispatches against 8 designs.
 - **ASR** - GigaAM-v3 and Parakeet FastConformer encoders on the NPU; Whisper-small
   encoder + a full 12-layer decoder fused into a single ELF dispatch.
-- **Embeddings** - BGE / MiniLM / E5 / ModernBERT BERT encoders on the NPU, served over
-  an OpenAI-compatible `/v1/embeddings` endpoint.
-- **Small LLMs** - opt-125m and a Gemma 3 bring-up reusing the resident-FFN + fused-decode
-  + KV primitives (weight-bandwidth-bound; int8 is the sweet spot).
-- **Vision** - ViT, DINOv2, and ResNet-18 through a general conv2d path.
+- **Embeddings** - BGE-base on the NPU, served over an OpenAI-compatible `/v1/embeddings`
+  endpoint. ESM-2 (8M/35M) runs the same encoder rails.
+- **Super-resolution** - ESPCN and EDSR on the NPU, gated against a CPU oracle, reached
+  through the `xdna-sr` CLI and an ffmpeg filter rather than `npu serve`.
 - **Precision** - selectable bf16 / bfp16 / int8, per-op, gated on WER/accuracy.
+
+Weights convert and match a reference for MiniLM, E5, ModernBERT, ViT, DINOv2, ResNet-18,
+opt-125m and Gemma 3, but their forward pass still runs on the host. The rails those models
+need are the ones the LLM decode work is building now, so finishing them is wiring, not
+research.
 
 Representative measured results (host: AMD Ryzen AI 9 465, XDNA2, Linux):
 
@@ -35,7 +41,8 @@ Representative measured results (host: AMD Ryzen AI 9 465, XDNA2, Linux):
 | GigaAM encoder, NPU vs CPU | 651 ms vs 890 ms |
 | Parakeet resident engine | 4.0 s -> 0.70-0.92 s / clip, WER-lossless |
 | BGE embeddings, NPU vs host | 2.5-4x |
-| opt-125m decode, int8 | 92 -> 47 ms/token, golden-exact |
+| Qwen3-0.6B decode, on NPU | 74.6 -> 54.8 ms/token in one day (13.4 -> 18.3 tok/s) |
+| Qwen3-0.6B dispatch count | 366 -> 170 configures/token, 14 -> 8 designs |
 | aiecc kernel build | 536 s -> ~7 min cold, < 10 s warm |
 
 ## Build and run
