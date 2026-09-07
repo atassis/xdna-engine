@@ -104,19 +104,21 @@ def bf16(a):
 # STILL DEFAULT OFF for exactly that reason, even though it now composes with FUSE_MLP_DP and wins:
 # the missing thing is a quality gate, not a performance one.
 #
-# int4/g128 ON TOP of FUSE_MLP_DP, measured 2026-09-07, in-process bench, 4 ABBA rounds, separate
-# process per arm, Power Mode Default:
+# Measured 2026-09-07 on THREE successive graphs as the decode was cut underneath it, in-process
+# bench, separate process per arm, Power Mode Default. Quote the MILLISECONDS, not the percentage:
 #
-#   arm                   ms/token (median)   DDR MB/token   MLP block MB/dispatch
-#   bf16, FUSE_MLP_DP=1        64.308            1562.92            529.06
-#   int4, FUSE_MLP_DP=1        59.519            1174.82            140.95
+#   base graph                          bf16     int4    saving   pct
+#   pre-fold                           64.308   59.519   -4.789  -7.45%
+#   + configure cut (FUSE_QKV_DP=0)    57.323   52.309   -5.014  -8.75%
+#   + fused QKV head (shipped default) 54.181   49.278   -4.902  -9.05%
 #
-# -4.789 ms, -7.45%, arms' clean-cell ranges disjoint. dispatch_count_total 165 in BOTH arms, so it
-# is a byte effect and not a dispatch-count one. The two levers are NOT redundant: fusion was
-# -17.4% and int4 alone -6.0%, and this is a further -7.45% on top of fusion.
+# The saving spans 0.225 ms (+/-2.3%) while the base falls 15.7% and the percentage climbs from
+# 7.45 to 9.05. The millisecond is the property of THIS lever; the percentage is a property of
+# whatever else is in the graph. On the shipped default: 1167.03 MB/token, floor 22.15 ms, and
+# dispatch_count is identical in both arms -- a byte effect, not a dispatch-count one.
 #
-# Only 65% of the census's -7.36 ms transport-floor delta materialised -- the removed bytes were
-# partly overlapped, so price a byte lever here at ~2/3 of its floor arithmetic, not at face value.
+# Only 65% of the census's transport-floor delta materialises -- the removed bytes are partly
+# overlapped, so price a byte lever here at ~2/3 of its floor arithmetic, not at face value.
 QUANT_MLP_DTYPE = os.environ.get("QUANT_MLP_DTYPE", "bf16")
 QUANT_MLP_GROUP = int(os.environ.get("QUANT_MLP_GROUP", "128"))
 
