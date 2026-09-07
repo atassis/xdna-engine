@@ -5,7 +5,11 @@
 Drives the SAME graph gen_llm_decode.py built (via build_graph, not a re-typed runlist) one token at
 a time through the deep-C constant-ELF protocol -- host writes `x`, the RoPE angle row and the two
 scratchpad params, then ONE dispatch -- and compares the greedy token sequence against a HuggingFace
-bf16 reference captured off-device (scripts/... -> refs/greedy_ref.json).
+bf16 reference captured off-device (scripts/llm_decode_bf16_oracle.py -> refs/bf16_oracle.json).
+NOTE tests/refs/<model>/ holds TWO refs and only one of them is a legitimate gate for a bf16
+device: greedy_ref.json is HF **f32** and has no `margins`; bf16_oracle.json is the bf16
+oracle and carries them. Gating bf16 silicon against the f32 ref charges it for ties it
+cannot win -- Qwen3-0.6B step 5 is exactly that, and every dataflow arm 'fails' it.
 
 The graph is decode-only: there is no prefill, so the prompt is fed one token at a time through the
 same path (each step appends to the KV cache) and generation continues free-running from the last
@@ -48,11 +52,30 @@ def rope_row(pos, head_dim, theta):
     return row.astype(BF16)
 
 
+def bf16_ulp(x):
+    """One bf16 quantum at magnitude x.
+
+    bf16 keeps 7 explicit mantissa bits, so the spacing at magnitude x is 2**(exp - 7). Two logits
+    closer than this are the SAME number in the dtype the device emits: which one wins the argmax
+    is decided by index order, not by the model. That makes it a derived threshold rather than the
+    hardcoded 0.25 this classifier used to carry, which had no derivation and no owner.
+    """
+    import math
+
+    if not math.isfinite(x) or x == 0.0:
+        return 0.0
+    return 2.0 ** (math.floor(math.log2(abs(x))) - 7)
+
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--spec", required=True)
     ap.add_argument("--weights", required=True)
-    ap.add_argument("--ref", required=True, help="greedy_ref.json from the HF reference")
+    ap.add_argument("--ref", required=True,
+                    help="bf16_oracle.json -- the MATCHING-PRECISION oracle. greedy_ref.json "
+                         "is HF f32 and is a contrast, not a gate: a bf16 device cannot win a "
+                         "step where f32 and bf16 legitimately disagree.")
     ap.add_argument("--layers", type=int, default=None)
     ap.add_argument("--max-seq", type=int, default=2048)
     ap.add_argument("--steps", type=int, default=None, help="free-running tokens to compare")
@@ -115,6 +138,10 @@ def main():
 
     fed = list(prompt_ids)
     produced = []
+    # Per produced step: (device top-1 logit, logit the device gave the ORACLE's token).
+    # This is what classifies a mismatch. The oracle's stored `margins` describe a DIFFERENT
+    # implementation's forward pass; the device's own gap describes this one.
+    step_logits = []
     tok = fed[0]
     for pos in range(len(fed) + steps - 1):
         np.copyto(xin.data, np.asarray(embed[tok] * scale, BF16).reshape(-1))
@@ -137,6 +164,8 @@ def main():
         else:
             i = len(produced)
             produced.append(nxt)
+            want = gen_ids[i] if i < len(gen_ids) else nxt
+            step_logits.append((float(lg[nxt]), float(lg[want])))
             # Free-running: one wrong token puts every later step on a different trajectory, so a
             # single flip reads as N failures. Teacher-forcing feeds the oracle's token instead,
             # which makes each step an independent test of the forward pass.
@@ -156,11 +185,29 @@ def main():
     # A mismatch at a margin near the device's own logit error is a tie the precision cannot
     # resolve, not a defect. Say which kind each one is instead of leaving it to be argued.
     for i in range(n):
-        if produced[i] != gen_ids[i]:
-            m = margins[i] if margins else float("nan")
-            kind = "KNIFE-EDGE" if margins and m < 0.25 else "REAL"
-            print(f"           step {i}: oracle {gen_ids[i]} vs NPU {produced[i]}, "
-                  f"margin {m:.4f} -> {kind}")
+        if produced[i] == gen_ids[i]:
+            continue
+        # Classify from THIS device's own logits. The oracle's `margins` come from a different
+        # forward pass and cannot say whether this device saw a tie; its own gap can. A gap at or
+        # below one bf16 quantum means the two tokens are the SAME number in the emitted dtype and
+        # the argmax was decided by index order -- not a defect the model can be held to.
+        if i < len(step_logits):
+            got_lg, want_lg = step_logits[i]
+            gap = got_lg - want_lg
+            ulp = bf16_ulp(got_lg)
+            if gap <= ulp:
+                kind = f"TIE (gap {gap:.4f} <= one bf16 ulp {ulp:.4f} at {got_lg:.4f})"
+            elif gap <= 2 * ulp:
+                kind = f"NEAR-TIE (gap {gap:.4f}, {gap / ulp:.1f} ulp)"
+            else:
+                kind = f"REAL (gap {gap:.4f} = {gap / ulp:.1f} ulp, well above the dtype quantum)"
+        else:
+            # No logits captured for this step -- say so rather than defaulting to the most
+            # confident verdict, which is what the old `else "REAL"` branch did whenever the ref
+            # simply had no margins.
+            kind = "UNCLASSIFIED (no device logits captured for this step)"
+        extra = f", host margin {margins[i]:.4f}" if margins and i < len(margins) else ""
+        print(f"           step {i}: oracle {gen_ids[i]} vs NPU {produced[i]}{extra} -> {kind}")
     print("*** PARITY PASS ***" if match == n else f"*** {n-match} MISMATCH ***")
     return 0 if match == n else 1
 

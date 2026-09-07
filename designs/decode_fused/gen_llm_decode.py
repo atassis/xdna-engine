@@ -43,10 +43,28 @@ from llm_decode_spec import SPECS  # noqa: E402
 # (graph construction, the runlist, and the meta writer), and defining them next to their first
 # use put them out of scope in the others -- four times in one session, because Python does not
 # complain until the single run that matters.
-GROUPED_K = os.environ.get("GQA_GROUPED_K") == "1"
-GROUPED_V = os.environ.get("GQA_GROUPED_V") == "1"
+# DEFAULTS FLIPPED ON 2026-09-07 (owner call) after a four-arm A/B, interleaved, 28 layers:
+#
+#   arm                        MB/token   ms/token   tok/s
+#   base, no flags              3105.99     137.90    7.25
+#   GQA_GROUPED_K+V             2166.47     100.03   10.00
+#   TMV_CTX alone               2036.18      98.50   10.15
+#   TMV_CTX + GQA_GROUPED_K     1566.42      79.13   12.64   <- the default now
+#
+# ~1.25x over the previous best arm, and 1.20x AHEAD of AMD's own mlir-air Qwen3 example (95.2
+# ms/token on this box), which we were 1.44x behind on 2026-09-05. Correctness: 8/8 vs the bf16
+# oracle at every step but one, and that one is a THREE-WAY EXACT bf16 tie (279/9625/15344 all at
+# 16.7500, argmax broken by index) which the un-grouped arm happens to win by exactly one ulp.
+# Determinism is bit-identical across passes. Full record: the 2026-09-07 log note in the journal.
+#
+# Each flag still takes "0" to turn it OFF, so every arm above is still reachable for A/B.
+GROUPED_K = os.environ.get("GQA_GROUPED_K", "1") == "1"
+# NOT flipped: TMV_CTX subsumes the v-side grouping (TMatVec reads vc per kv head itself, so the
+# Repeat would materialise a `vr` nothing consumes). Setting this with TMV_CTX on is a no-op, and
+# reading a null result from toggling it as evidence about grouping would be a mistake.
+GROUPED_V = os.environ.get("GQA_GROUPED_V", "0") == "1"
 # Context step as a transposed-A reduction over the V cache rows, deleting op_trv outright.
-TMV_CTX = os.environ.get("TMV_CTX") == "1"
+TMV_CTX = os.environ.get("TMV_CTX", "1") == "1"
 
 import newstack_compat  # noqa: F401,E402 -- MUST precede iron imports (new-mlir-aie port shim)
 from iron.common import AIEContext  # noqa: E402
