@@ -135,12 +135,19 @@ def main():
         "spec": sp.name, "layers": md["NL"], "text": os.path.basename(a.text),
         "n_scored": n, "mean_nll": mean_nll, "perplexity": math.exp(mean_nll),
         "top1_acc": top1_hits / n, "median_nll": float(np.median(nll)),
-        "wall_s": wall, "ms_per_token": 1000.0 * wall / n,
+        # NOT a benchmark, and named so it cannot be quoted as one. No warmup, no alternation,
+        # no repetition, and every position pays a host-side f64 log-softmax over the whole vocab
+        # that a real decode never does. MEASURED: the SAME arm read 56.8 and 48.2 ms/token on two
+        # runs of an identical job -- a 15% swing on an unchanged binary. Use bench_llm_decode.py
+        # for timing; this is a progress indicator.
+        "wall_s": wall, "harness_ms_per_position_NOT_A_BENCHMARK": 1000.0 * wall / n,
         "env": {k: os.environ.get(k) for k in
                 ("QUANT_MLP_DTYPE", "QUANT_MLP_GROUP", "FUSE_MLP_DP", "FUSE_QKV_DP")},
     }
     print(f"\n[ppl] mean NLL {mean_nll:.6f}   PERPLEXITY {res['perplexity']:.4f}   "
-          f"top-1 {100*res['top1_acc']:.2f}%   ({n} positions, {res['ms_per_token']:.1f} ms/token)")
+          f"top-1 {100*res['top1_acc']:.2f}%   ({n} positions, "
+          f"{res['harness_ms_per_position_NOT_A_BENCHMARK']:.1f} ms/pos -- harness rate, NOT a "
+          f"decode benchmark: no warmup, and a host f64 log-softmax per position)")
     if a.dump_nll:
         np.save(a.dump_nll, np.asarray(nll, dtype=np.float64))
         print(f"[ppl] per-position NLL -> {a.dump_nll}")
