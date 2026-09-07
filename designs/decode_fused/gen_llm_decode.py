@@ -114,6 +114,19 @@ DECODE_PLACER_FLAGS_DEFAULT = "--cores-per-col 1"
 # is +39.9 ms if the cost is flat, and ~0 if it tracks the view count.
 SPLIT_QKNORM = os.environ.get("SPLIT_QKNORM", "0") == "1"
 
+# Fold the FFN activation into the gate GEMV as a fused tile epilogue.
+#
+# DEFAULT OFF, because on THIS graph it is a wash and the counting is the lesson. Deleting op_act
+# removes one design, but giving op_gate an epilogue makes it differ from op_up, which breaks the
+# share_designs pair those two were in. Measured device-free: designs 18 -> 18, configures 534 ->
+# 534, runs 1262 -> 1234. share_designs and epilogue-folding target the SAME single configure here
+# and are not additive; whichever runs second buys nothing.
+#
+# Kept because the mechanism is correct and is the one the folds that DO pay need -- RoPE into the
+# q/k GEMVs, the residual adds into the o/down GEMVs -- where the consumer is not half of a shared
+# pair. Turn it on with FUSE_ACT=1.
+FUSE_ACT = os.environ.get("FUSE_ACT", "0") == "1"
+
 
 def weight_bytes(arr):
     """Bytes for one weight buffer exactly as written into the .bin / device arena.
@@ -173,6 +186,8 @@ def sequence_name(sp, NL, S, placer_flags):
         parts.append(f"{QUANT_MLP_DTYPE}g{QUANT_MLP_GROUP}")
     if SPLIT_QKNORM:
         parts.append("splitqk")
+    if FUSE_ACT:
+        parts.append("fuseact")
     if NL != sp.n_layers:
         parts.append(f"l{NL}")
     if S != 2048:
@@ -479,12 +494,27 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
     # is an engineering-check toggle (see its definition above), not a quality-validated default.
     mlp_quant_kw = (dict(weight_dtype=QUANT_MLP_DTYPE, group_size=QUANT_MLP_GROUP)
                     if QUANT_MLP_DTYPE != "bf16" else {})
-    op_gate = gemv(FF, D, ctx, **mlp_quant_kw)
+    # The activation runs on the gate projection's output, immediately after it and before anything
+    # else reads `g`, so folding it into that GEMV's epilogue preserves the order exactly.
+    # Two things can veto the fold, and both are the operator's own rules rather than choices here:
+    # the epilogue walks the C tile 32 lanes at a time, and GEMV refuses an epilogue on a quantized
+    # weight stream (untested combination, not a hardware conflict). gemv() picks tile_size_output
+    # itself, so ask it rather than assuming FF // COLS.
+    _gate_tso = gemv_tile_output(FF, D)[1]
+    fuse_act = (
+        FUSE_ACT
+        and QUANT_MLP_DTYPE == "bf16"
+        and _gate_tso % 32 == 0
+    )
+    op_gate = gemv(FF, D, ctx, **mlp_quant_kw,
+                   **(dict(epilogue=sp.act) if fuse_act else {}))
     op_up = gemv(FF, D, ctx, **mlp_quant_kw)
-    if sp.act == "silu":
-        op_act = SiLU(size=FF, num_aie_columns=COLS, tile_size=FF // COLS, context=ctx)
-    else:
-        op_act = GELU(size=FF, num_aie_columns=COLS, num_channels=1, tile_size=FF // COLS, context=ctx)
+    op_act = None
+    if not fuse_act:
+        if sp.act == "silu":
+            op_act = SiLU(size=FF, num_aie_columns=COLS, tile_size=FF // COLS, context=ctx)
+        else:
+            op_act = GELU(size=FF, num_aie_columns=COLS, num_channels=1, tile_size=FF // COLS, context=ctx)
     op_mul_ffn = ElementwiseMul(size=FF, tile_size=FF // COLS, num_aie_columns=COLS, context=ctx)
     op_down = gemv(D, FF, ctx, **mlp_quant_kw)
     op_add = ElementwiseAdd(size=D, tile_size=D // COLS, num_aie_columns=COLS, context=ctx)
@@ -558,7 +588,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
             (op_norm, p + "x1", p + "n_pf", p + "hf"),
             (op_gate, p + "Wg", p + "hf", p + "g"),
             (op_up, p + "Wu", p + "hf", p + "u"),
-            (op_act, p + "g", p + "g"),
+            *([] if op_act is None else [(op_act, p + "g", p + "g")]),
             (op_mul_ffn, p + "g", p + "u", p + "gh"),
             (op_down, p + "Wd", p + "gh", p + "d"),
         ]
