@@ -34,11 +34,12 @@ iron_require_pin || exit 1
 # integration stack, and WITHOUT THEM LISTED this gate passed against a checkout that then died at
 # `ModuleNotFoundError: No module named 'iron.operators.gemv.quant'`. A gate whose purpose is to
 # fail early, failing late, on a message naming a Python module rather than a mis-pointed IRON_DIR.
+# The quant packer moved to iron/common/ when SwiGLUMLPDataParallel became its second consumer.
 iron_at="$(iron_require_api "gen_llm_decode.py" \
   "iron/common/sequence.py:class OperatorSequence" \
   "iron/operators/strided_copy/op.py:output_offset_parameter" \
   "iron/operators/tmatvec/op.py:class TMatVec" \
-  "iron/operators/gemv/quant.py:def quantize_weight" \
+  "iron/common/quant.py:def quantize_weight" \
   "iron/operators/qkv_head_dp/op.py:class QKVHeadDataParallel")" || exit 1
 echo "[build] IRON on $iron_at (API surface verified)"
 [ -d "$WEIGHTS" ] || { echo "ERROR: no weights at $WEIGHTS (run scripts/dump_llm_weights.py)"; exit 1; }

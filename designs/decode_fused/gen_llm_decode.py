@@ -73,7 +73,7 @@ import newstack_compat  # noqa: F401,E402 -- MUST precede iron imports (new-mlir
 from iron.common import AIEContext  # noqa: E402
 from elf_dispatch_compat import OperatorSequence, load_elf  # noqa: E402
 from iron.operators.gemv.op import GEMV  # noqa: E402
-from iron.operators.gemv.quant import quantize_weight  # noqa: E402
+from iron.common.quant import quantize_weight  # noqa: E402
 from iron.operators.rms_norm.op import RMSNorm  # noqa: E402
 from iron.operators.rope.op import RoPE  # noqa: E402
 from iron.operators.elementwise_add.op import ElementwiseAdd  # noqa: E402
@@ -633,8 +633,12 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
                 f"sandwich_norms={sp.sandwich_norms!r} act={sp.act!r}"
             )
         from iron.operators.swiglu_mlp_dp.op import SwiGLUMLPDataParallel
+        # Same mlp_quant_kw the unfused gate/up/down GEMVs take. The fused block OWNS the MLP
+        # weight buffers when it is on, so it -- not gemv -- is what must declare their packed
+        # size; while it did not carry the axis, QUANT_MLP_DTYPE=int4 packed the weights and then
+        # tripped load_weight_buffer's `weight byte-size mismatch` against bf16-sized buffers.
         op_mlp_dp = SwiGLUMLPDataParallel(D=D, FF=FF, num_aie_columns=MLP_DP_COLS,
-                                          epsilon=sp.eps, context=ctx)
+                                          epsilon=sp.eps, context=ctx, **mlp_quant_kw)
     if not fuse_act:
         if sp.act == "silu":
             op_act = SiLU(size=FF, num_aie_columns=COLS, tile_size=FF // COLS, context=ctx)
