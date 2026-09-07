@@ -104,6 +104,29 @@ def bf16(a):
 QUANT_MLP_DTYPE = os.environ.get("QUANT_MLP_DTYPE", "bf16")
 QUANT_MLP_GROUP = int(os.environ.get("QUANT_MLP_GROUP", "128"))
 
+# Same axis, same GEMV(weight_dtype=...) mechanism, applied to Wo (attention output projection,
+# "Wo" -- the "attention weights" byte class) instead of the MLP. Independent env vars so an A/B
+# can quantize Wo without touching Wg/Wu/Wd, and vice versa. Same caveat as QUANT_MLP_DTYPE: an
+# engineering-check byte-stream axis, not a validated model default.
+QUANT_ATTN_DTYPE = os.environ.get("QUANT_ATTN_DTYPE", "bf16")
+QUANT_ATTN_GROUP = int(os.environ.get("QUANT_ATTN_GROUP", "128"))
+
+# Same axis again, applied to W_head, the FINAL lm-head GEMV's weight.
+#
+# W_head IS THE TIED EMBEDDING TABLE, not an independent lm-head weight -- built below from
+# `model.embed_tokens.weight` (Qwen3 ties them). It is NOT decode-graph-local: rust/npu-engine's
+# NpuDecodeStep::step (npu_decode.rs) mmaps this exact buffer, buffers/W_head.bin, and gathers the
+# NEXT step's `embed[token]` straight out of it as a raw bf16 [vocab, d_model] row -- see that
+# struct's doc comment ("the host embedding gather reads the tied W_head blob that is already
+# there"). quantize_weight()'s on-wire row layout ([n_groups x f32 scale][packed payload]) is a
+# DIFFERENT byte layout from a bf16 row, so QUANT_HEAD_DTYPE != "bf16" silently breaks that host
+# gather -- it would read scale/payload bytes as if they were bf16 floats. This flag only rewires
+# the ON-DEVICE lm-head GEMV; making the artifact runnable end to end additionally needs
+# NpuDecodeStep to dequantize the row it gathers (or a second, always-bf16 embedding blob), which
+# is rust/npu-engine's code and out of this axis's scope -- see the loud build-time warning below.
+QUANT_HEAD_DTYPE = os.environ.get("QUANT_HEAD_DTYPE", "bf16")
+QUANT_HEAD_GROUP = int(os.environ.get("QUANT_HEAD_GROUP", "128"))
+
 DECODE_PLACER_FLAGS_DEFAULT = "--cores-per-col 1"
 
 # INSTRUMENT, not a feature. Alternates the per-head qk-norm between two IDENTICAL RMSNorm
@@ -240,6 +263,10 @@ def sequence_name(sp, NL, S, placer_flags):
         parts.append(f"rpc{TMV_RPC}")
     if QUANT_MLP_DTYPE != "bf16":
         parts.append(f"{QUANT_MLP_DTYPE}g{QUANT_MLP_GROUP}")
+    if QUANT_ATTN_DTYPE != "bf16":
+        parts.append(f"attn{QUANT_ATTN_DTYPE}g{QUANT_ATTN_GROUP}")
+    if QUANT_HEAD_DTYPE != "bf16":
+        parts.append(f"head{QUANT_HEAD_DTYPE}g{QUANT_HEAD_GROUP}")
     if SPLIT_QKNORM:
         parts.append("splitqk")
     # Suffix stays ON the default here, unlike the other switches: the shipped artifact was BUILT
@@ -480,10 +507,14 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
                     if (sp.qk_norm and SPLIT_QKNORM) else op_qk_norm)
     # QKV projection: one GEMV over the concatenated weight, or the three separate ones. op_kv is
     # built in both arms because share_designs pairs Wk with Wv only in the unfused one.
+    # Wo weight-stream dtype axis (see QUANT_ATTN_DTYPE above). bf16 (default) is byte-for-byte the
+    # pre-existing path.
+    attn_quant_kw = (dict(weight_dtype=QUANT_ATTN_DTYPE, group_size=QUANT_ATTN_GROUP)
+                     if QUANT_ATTN_DTYPE != "bf16" else {})
     op_qkv = gemv(QD + 2 * KVD, D, ctx) if FUSE_QKV_GEMV else None
     op_q = gemv(QD, D, ctx)
     op_kv = gemv(KVD, D, ctx)
-    op_o = gemv(D, QD, ctx)
+    op_o = gemv(D, QD, ctx, **attn_quant_kw)
     # RoPE over q and k together (24 head rows) needs them adjacent, which only the fused qkv
     # buffer gives; angle_rows=1 is unchanged, so every row still reads the same single angle row.
     fuse_rope = FUSE_QKV_GEMV and FUSE_ROPE_QK
@@ -497,8 +528,9 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
                 f"(got {sp.qk_norm})"
             )
         from iron.operators.qkv_head_dp.op import QKVHeadDataParallel
-        op_qkv_dp = QKVHeadDataParallel(D=D, HD=HD, Hq=Hq, Hkv=Hkv, num_aie_columns=COLS,
-                                        epsilon=sp.eps, tile_size_input=TSI, context=ctx)
+        op_qkv_dp = QKVHeadDataParallel(D=D, HD=HD, Hq=Hq, Hkv=Hkv, max_seq=S,
+                                        num_aie_columns=COLS, epsilon=sp.eps,
+                                        tile_size_input=TSI, context=ctx)
     op_rope_q = RoPE(rows=Hq, cols=HD, angle_rows=1, context=ctx)
     op_rope_k = RoPE(rows=Hkv, cols=HD, angle_rows=1, context=ctx)
     # KV append: deep-C scratchpad offset "kv_off" (element units = n_past*HD), constant ELF.
@@ -611,7 +643,11 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
     op_mul_ffn = ElementwiseMul(size=FF, tile_size=FF // COLS, num_aie_columns=COLS, context=ctx)
     op_down = gemv(D, FF, ctx, **mlp_quant_kw)
     op_add = ElementwiseAdd(size=D, tile_size=D // COLS, num_aie_columns=COLS, context=ctx)
-    op_head = gemv(VOCAB, D, ctx)
+    # W_head weight-stream dtype axis (see QUANT_HEAD_DTYPE above -- READ THE TIED-EMBEDDING NOTE
+    # before turning this on).
+    head_quant_kw = (dict(weight_dtype=QUANT_HEAD_DTYPE, group_size=QUANT_HEAD_GROUP)
+                     if QUANT_HEAD_DTYPE != "bf16" else {})
+    op_head = gemv(VOCAB, D, ctx, **head_quant_kw)
 
     weights, bufsz, cache_names, rl = {}, {}, [], []
     cur = "x"
@@ -636,6 +672,8 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
             w = npy(f"model.layers.{l}.{tensor}.weight")  # [M, K], f32
             if key in mlp_keys and QUANT_MLP_DTYPE != "bf16":
                 weights[p + key] = quantize_weight(w, QUANT_MLP_GROUP, QUANT_MLP_DTYPE)
+            elif key == "Wo" and QUANT_ATTN_DTYPE != "bf16":
+                weights[p + key] = quantize_weight(w, QUANT_ATTN_GROUP, QUANT_ATTN_DTYPE)
             elif key in qkv_keys and FUSE_QKV_GEMV:
                 qkv_parts.append(bf16(w).reshape(-1))     # row-major, so concatenation IS stacking
             else:
@@ -652,7 +690,12 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
         # one pass, and q|k adjacency is what lets a single RoPE cover both. Declared with an
         # explicit size because a parent that is only ever referenced sliced has no arg spec to
         # take its length from (iron/common/sequence.py: calculate_buffer_layout).
-        if FUSE_QKV_GEMV:
+        if op_qkv_dp is not None:
+            # The fused head appends k and v to the caches itself, so neither ever becomes an L3
+            # buffer and only `q` survives as an intermediate.
+            ref_q = p + "q"
+            bufsz[ref_q] = QD * 2
+        elif FUSE_QKV_GEMV:
             qkvb, kb, vb = p + "qkv", QD * 2, (QD + KVD) * 2
             ref_q, ref_k = f"{qkvb}[0:{kb}]", f"{qkvb}[{kb}:{vb}]"
             ref_v, ref_qk = f"{qkvb}[{vb}:{vb + KVD * 2}]", f"{qkvb}[0:{vb}]"
@@ -671,30 +714,37 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
             p + "hn": D * 2, p + "hf": D * 2,
         })
         nxt = f"x{l+1}"
-        qk = []
-        if sp.qk_norm:
+        # The unfused arms only. With the fused head, the per-head norms, the projection and the
+        # RoPE are all inside one design and none of these runlist entries exists.
+        qk = proj = rope = []
+        if sp.qk_norm and op_qkv_dp is None:
             hq = [f"{qhb}[{qho + h*HD*2}:{qho + (h+1)*HD*2}]" for h in range(Hq)]
             hk = [f"{khb}[{kho + h*HD*2}:{kho + (h+1)*HD*2}]" for h in range(Hkv)]
             qk = [*[((op_qk_norm if h % 2 == 0 else op_qk_norm_b),
                      hq[h], p + "n_qn", hq[h]) for h in range(Hq)],
                   *[((op_qk_norm if h % 2 == 0 else op_qk_norm_b),
                      hk[h], p + "n_kn", hk[h]) for h in range(Hkv)]]
-        proj = ([(op_qkv, p + "Wqkv", p + "hn", p + "qkv")] if FUSE_QKV_GEMV else
-                [(op_q, p + "Wq", p + "hn", ref_q),
-                 (op_kv, p + "Wk", p + "hn", ref_k),
-                 (op_kv, p + "Wv", p + "hn", ref_v)])
-        rope = ([(op_rope_qk, ref_qk, ang, ref_qk)] if fuse_rope else
-                [(op_rope_q, ref_q, ang, ref_q),
-                 (op_rope_k, ref_k, ang, ref_k)])
+        if op_qkv_dp is None:
+            proj = ([(op_qkv, p + "Wqkv", p + "hn", p + "qkv")] if FUSE_QKV_GEMV else
+                    [(op_q, p + "Wq", p + "hn", ref_q),
+                     (op_kv, p + "Wk", p + "hn", ref_k),
+                     (op_kv, p + "Wv", p + "hn", ref_v)])
+            rope = ([(op_rope_qk, ref_qk, ang, ref_qk)] if fuse_rope else
+                    [(op_rope_q, ref_q, ang, ref_q),
+                     (op_rope_k, ref_k, ang, ref_k)])
         # The fused head replaces the norm, the projection, every qk-norm and the RoPE with one
         # design; `hn` lives and dies in L1 instead of round-tripping DDR between four of them.
-        head = ([(op_qkv_dp, cur, p + "n_in", p + "Wqkv", p + "n_qn", p + "n_kn", ang, p + "qkv")]
+        # The fused head absorbs the KV append too: k and v are drained straight into the caches
+        # at `kv_off` instead of into buffers a StridedCopy then re-reads and re-writes. The caches
+        # were their only consumer, so the intermediate had no reader -- it existed because the
+        # append was a separate operator. Two runs and one more configure per layer.
+        head = ([(op_qkv_dp, cur, p + "n_in", p + "Wqkv", p + "n_qn", p + "n_kn", ang,
+                  ref_q, p + "kc", p + "vc")]
                 if op_qkv_dp is not None else
-                [(op_norm, cur, p + "n_in", p + "hn"), *proj, *qk, *rope])
+                [(op_norm, cur, p + "n_in", p + "hn"), *proj, *qk, *rope,
+                 (op_sck, ref_k, p + "kc"), (op_scv, ref_v, p + "vc")])
         rl += [
             *head,
-            (op_sck, ref_k, p + "kc"),
-            (op_scv, ref_v, p + "vc"),
             *([] if GROUPED_K else [(op_rep_k, p + "kc", p + "kr")]),
             # TMV_CTX subsumes the v-side grouping: TMatVec reads vc per kv head itself, so a
             # Repeat would materialise a `vr` nothing consumes.
@@ -735,7 +785,18 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
         bufsz["mlp_gh"] = FF * 2   # one buffer, reused by every layer -- they run one at a time
 
     weights["n_final"] = load_norm("model.norm.weight")
-    weights["W_head"] = bf16(npy("model.embed_tokens.weight")).reshape(-1)   # tied
+    embed_f32 = npy("model.embed_tokens.weight")   # tied: also the host's embedding-gather table
+    if QUANT_HEAD_DTYPE != "bf16":
+        weights["W_head"] = quantize_weight(embed_f32, QUANT_HEAD_GROUP, QUANT_HEAD_DTYPE)
+        print(f"[build] WARNING: QUANT_HEAD_DTYPE={QUANT_HEAD_DTYPE!r} packs buffers/W_head.bin as "
+              f"quantize_weight()'s [scale|payload] rows. W_head IS the tied embedding table, and "
+              f"rust/npu-engine's NpuDecodeStep::step (npu_decode.rs) mmaps that exact blob and "
+              f"gathers embed[token] from it as raw bf16 rows -- this build's W_head.bin is no "
+              f"longer that layout, so the host embedding gather will read garbage until "
+              f"NpuDecodeStep is taught to dequantize the row (or a separate bf16 embedding blob "
+              f"is restored). This artifact is NOT runnable end to end as is.", file=sys.stderr)
+    else:
+        weights["W_head"] = bf16(embed_f32).reshape(-1)
     if not scale_in_qnorm:
         weights["attn_scale"] = np.full(Hq * S, sp.attn_scale, BF16)
     rl += [(op_norm, cur, "n_final", "xf"), (op_head, "W_head", "xf", "logits")]
@@ -835,7 +896,9 @@ def main():
         "layer_types": ["global" if sp.is_global(l) else "sliding" for l in range(NL)],
         "cache_buffers": cache_names,
         # Engineering-check axis (see QUANT_MLP_DTYPE above), not a validated model default.
-        "weight_quant": {"mlp_dtype": QUANT_MLP_DTYPE, "mlp_group_size": QUANT_MLP_GROUP},
+        "weight_quant": {"mlp_dtype": QUANT_MLP_DTYPE, "mlp_group_size": QUANT_MLP_GROUP,
+                         "attn_dtype": QUANT_ATTN_DTYPE, "attn_group_size": QUANT_ATTN_GROUP,
+                         "head_dtype": QUANT_HEAD_DTYPE, "head_group_size": QUANT_HEAD_GROUP},
     }
     prov = toolchain_provenance()
     if prov:
