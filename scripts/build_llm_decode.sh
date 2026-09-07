@@ -43,7 +43,15 @@ export MLIR_AIE_INSTANCE="$INST"
 export PATH="$VENV_IRON/bin:$VENV_IRON/cc-shim:$AIEBU_ASM_DIR:$PATH"
 [ -x "$AIECC_PATH" ] || { echo "ERROR: instance aiecc missing at $AIECC_PATH"; exit 1; }
 
-WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT   # IRON writes build/ intermediates under CWD
+# IRON writes build/ intermediates under CWD. KEEP_WORK=<dir> keeps them: the fused .mlir is the
+# only input scripts/decode_ddr_bytes.py takes, and the shipped artifact does not carry the shim
+# BDs -- so with the unconditional trap a byte census is reproducible only by accident, from a
+# build that happened to choose its own directory.
+if [ -n "${KEEP_WORK:-}" ]; then
+    WORK="$KEEP_WORK"; mkdir -p "$WORK"; echo "[build] keeping intermediates in $WORK"
+else
+    WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
+fi
 mkdir -p "$OUT"
 echo "[build] spec=$SPEC layers=${LAYERS:-full} inst=$(basename "$INST") iron=$(basename "$IRON")"
 ( cd "$WORK" && "$VENV_IRON/bin/python" "$GEN" --spec "$SPEC" --weights "$WEIGHTS" \
