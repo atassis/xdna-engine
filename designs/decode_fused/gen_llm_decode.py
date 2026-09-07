@@ -209,6 +209,17 @@ SCALE_IN_QNORM = os.environ.get("SCALE_IN_QNORM", "1") == "1"
 # defects was fusing: see the operator's design.py. Needs FUSE_QKV_GEMV for the concatenated weight.
 FUSE_QKV_DP = os.environ.get("FUSE_QKV_DP", "1") == "1"
 
+# Fold the attention output projection (`a = Wo @ cx`) into the SwiGLU MLP data-parallel design:
+# every core computes its own D/N row-slice of `a` from its own row-slice of Wo before doing
+# anything else, all-gathers it through the same DRAM-scratch mechanism gh already uses, then
+# proceeds exactly as FUSE_MLP_DP already does. Deletes op_o's own standalone design/configure/run
+# from the per-layer runlist outright (6 designs/layer -> 5). Needs FUSE_MLP_DP (there is nothing
+# to fold INTO otherwise). DEFAULT OFF: device-free only so far (places at 61.7% .text against
+# FUSE_MLP_DP's own 49.8%; see iron/operators/swiglu_mlp_dp/design.py's FUSE_O module docstring for
+# the TSI_O-vs-D_PER_CORE divisibility issue this works around with a 1-row Wo pad, not measured on
+# device).
+FUSE_MLP_O = os.environ.get("FUSE_MLP_O", "0") == "1"
+
 
 def weight_bytes(arr):
     """Bytes for one weight buffer exactly as written into the .bin / device arena.
@@ -277,6 +288,8 @@ def sequence_name(sp, NL, S, placer_flags):
     # next rebuild produces a different ELF under a name nothing was ever gated against.
     if FUSE_MLP_DP:
         parts.append(f"mlpdp{MLP_DP_COLS}")
+    if FUSE_MLP_O:
+        parts.append("mlpo")
     if FUSE_ACT:
         parts.append("fuseact")
     if NL != sp.n_layers:
@@ -514,10 +527,20 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
     # pre-existing path.
     attn_quant_kw = (dict(weight_dtype=QUANT_ATTN_DTYPE, group_size=QUANT_ATTN_GROUP)
                      if QUANT_ATTN_DTYPE != "bf16" else {})
+    if FUSE_MLP_O:
+        if not FUSE_MLP_DP:
+            raise NotImplementedError(
+                "FUSE_MLP_O folds op_o INTO the swiglu_mlp_dp design; it needs FUSE_MLP_DP=1"
+            )
+        if QUANT_ATTN_DTYPE != "bf16":
+            raise NotImplementedError(
+                "FUSE_MLP_O's Wo path (swiglu_mlp_dp's fuse_o) is bf16-only, no quant kwarg "
+                f"support yet; got QUANT_ATTN_DTYPE={QUANT_ATTN_DTYPE!r}"
+            )
     op_qkv = gemv(QD + 2 * KVD, D, ctx) if FUSE_QKV_GEMV else None
     op_q = gemv(QD, D, ctx)
     op_kv = gemv(KVD, D, ctx)
-    op_o = gemv(D, QD, ctx, **attn_quant_kw)
+    op_o = None if FUSE_MLP_O else gemv(D, QD, ctx, **attn_quant_kw)
     # RoPE over q and k together (24 head rows) needs them adjacent, which only the fused qkv
     # buffer gives; angle_rows=1 is unchanged, so every row still reads the same single angle row.
     fuse_rope = FUSE_QKV_GEMV and FUSE_ROPE_QK
@@ -637,7 +660,9 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
             )
         from iron.operators.swiglu_mlp_dp.op import SwiGLUMLPDataParallel
         op_mlp_dp = SwiGLUMLPDataParallel(D=D, FF=FF, num_aie_columns=MLP_DP_COLS,
-                                          epsilon=sp.eps, context=ctx)
+                                          epsilon=sp.eps,
+                                          QD=QD if FUSE_MLP_O else None, fuse_o=FUSE_MLP_O,
+                                          context=ctx)
     if not fuse_act:
         if sp.act == "silu":
             op_act = SiLU(size=FF, num_aie_columns=COLS, tile_size=FF // COLS, context=ctx)
@@ -677,6 +702,17 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
                 weights[p + key] = quantize_weight(w, QUANT_MLP_GROUP, QUANT_MLP_DTYPE)
             elif key == "Wo" and QUANT_ATTN_DTYPE != "bf16":
                 weights[p + key] = quantize_weight(w, QUANT_ATTN_GROUP, QUANT_ATTN_DTYPE)
+            elif key == "Wo" and FUSE_MLP_O:
+                # swiglu_mlp_dp's fuse_o tiles Wo's D output rows in TSI_O=3-row groups shared
+                # byte-identically with Wg/Wu/Wd's weight channel; D/MLP_DP_COLS is never a
+                # multiple of 3 (D is a power of two), so every core reads one row PAST its own
+                # slice and the last core's read would run off the end of Wo -- padded here with
+                # `_wo_rows_padded - D` zero rows so that read stays in bounds. Their computed
+                # contribution is exactly zero and is never drained (see design.py's FUSE_O
+                # module docstring for the full derivation).
+                pad_rows = op_mlp_dp._wo_rows_padded - D
+                w_padded = np.pad(w, ((0, pad_rows), (0, 0)))
+                weights[p + key] = bf16(w_padded).reshape(-1)
             elif key in qkv_keys and FUSE_QKV_GEMV:
                 qkv_parts.append(bf16(w).reshape(-1))     # row-major, so concatenation IS stacking
             else:
@@ -712,10 +748,15 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
             p + "kc": Hkv * S * HD * 2, p + "vc": Hkv * S * HD * 2,
             p + "kr": Hq * S * HD * 2, p + "vr": Hq * S * HD * 2, p + "vt": Hq * S * HD * 2,
             p + "sc": Hq * S * 2, p + "sw": Hq * S * 2,
-            p + "cx": QD * 2, p + "a": D * 2,
+            p + "cx": QD * 2,
             p + "g": FF * 2, p + "u": FF * 2, p + "gh": FF * 2, p + "d": D * 2,
             p + "hn": D * 2, p + "hf": D * 2,
         })
+        # `a` is purely internal to op_mlp_dp's own fuse_o path (never an L3 buffer -- see
+        # design.py) once folded; only declare it when something outside that design still reads
+        # or writes it.
+        if not FUSE_MLP_O:
+            bufsz[p + "a"] = D * 2
         nxt = f"x{l+1}"
         # The unfused arms only. With the fused head, the per-head norms, the projection and the
         # RoPE are all inside one design and none of these runlist entries exists.
@@ -757,16 +798,22 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
             (op_softmax, p + "sc", p + "sw"),
             *([] if TMV_CTX else [(op_trv, p + ("vc" if GROUPED_V else "vr"), p + "vt")]),
             (op_ctx, p + ("vc" if TMV_CTX else "vt"), p + "sw", p + "cx"),
-            (op_o, p + "Wo", p + "cx", p + "a"),
+            *([] if FUSE_MLP_O else [(op_o, p + "Wo", p + "cx", p + "a")]),
         ]
         if sp.sandwich_norms:
             rl.append((op_norm, p + "a", p + "n_pa", p + "a"))
         if op_mlp_dp is not None:
             # cur + a -> x1 -> norm -> gate/up -> silu -> mul -> down -> +x1, all inside one design.
             # x1/hf/g/u/gh/d never reach DDR; `mlp_gh` is the all-gather round-trip buffer and is
-            # shared across layers because the sequence runs them one at a time.
-            rl.append((op_mlp_dp, cur, p + "a", p + "n_pf", p + "Wg", p + "Wu", p + "Wd",
-                       "mlp_gh", nxt))
+            # shared across layers because the sequence runs them one at a time. FUSE_MLP_O folds
+            # `a = Wo @ cx` in too: `cx`/`Wo` replace `a` as the design's own inputs, and
+            # `mlp_a_scratch` is a's own all-gather round-trip buffer, the same idiom as mlp_gh's.
+            if FUSE_MLP_O:
+                rl.append((op_mlp_dp, cur, p + "cx", p + "n_pf", p + "Wo", p + "Wg", p + "Wu",
+                           p + "Wd", "mlp_gh", "mlp_a_scratch", nxt))
+            else:
+                rl.append((op_mlp_dp, cur, p + "a", p + "n_pf", p + "Wg", p + "Wu", p + "Wd",
+                           "mlp_gh", nxt))
         else:
             rl += [
                 (op_add, cur, p + "a", p + "x1"),
@@ -786,6 +833,8 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
 
     if op_mlp_dp is not None:
         bufsz["mlp_gh"] = FF * 2   # one buffer, reused by every layer -- they run one at a time
+        if FUSE_MLP_O:
+            bufsz["mlp_a_scratch"] = D * 2   # a's own all-gather round-trip buffer, same idiom
 
     weights["n_final"] = load_norm("model.norm.weight")
     embed_f32 = npy("model.embed_tokens.weight")   # tied: also the host's embedding-gather table
