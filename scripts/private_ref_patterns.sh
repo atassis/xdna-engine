@@ -45,5 +45,11 @@ private_ref_regex="$(IFS='|'; echo "${private_ref_patterns[*]}")"
 # non-KB `[[word]]` use shows up; do not add words defensively. Third such case, verified
 # 2026-09-06: `np.asarray([[nxt]], ...)` in scripts/whisper_wer_from_hidden.py -- the same
 # nested-array literal as `[[last]]`, a different loop variable. It had the gate red on main.
+# Fourth, verified 2026-09-08: `[[package]]`, Cargo.lock's array-of-tables header -- same kind as
+# `[[bin]]`. The FILE scan already skips rust/Cargo.lock wholesale, but the pre-push COMMIT-MESSAGE
+# scan shares this pattern set, so a message that merely NAMES the token was blocked -- which is
+# how the commit teaching the gate about lockfiles blocked itself. Checked against the private KB
+# before allowlisting: its only `package`-prefixed slug is
+# `package-rapl-is-root-only-...`, which the exact-token form below cannot match.
 private_ref_wikilink_re='\[\[[a-z0-9][a-z0-9-]*\]\]'
-private_ref_benign_wikilink_re='\[\[(bin|model|last|nxt)\]\]'
+private_ref_benign_wikilink_re='\[\[(bin|model|last|nxt|package)\]\]'
