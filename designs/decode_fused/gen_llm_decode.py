@@ -789,15 +789,18 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
 
     weights["n_final"] = load_norm("model.norm.weight")
     embed_f32 = npy("model.embed_tokens.weight")   # tied: also the host's embedding-gather table
+    # Quantizing W_head narrows the DEVICE lm-head stream, but W_head is TIED, so the host also
+    # gathers embed[token] out of it. Rather than teach the host to dequantise -- which would
+    # quantise the embedding INPUT too, a second quality change for no extra speed -- the exact
+    # bf16 table is emitted alongside as a HOST-ONLY blob. It is written outside the `weights`
+    # dict on purpose: the device loader takes its buffer set from `weights`/`wnames`, so a side
+    # file costs 311 MB of disk and ZERO device arena, and the host only ever faults in the one
+    # 2 KB row it gathers.
+    embed_blob, host_embed = "W_head", None
     if QUANT_HEAD_DTYPE != "bf16":
         weights["W_head"] = quantize_weight(embed_f32, QUANT_HEAD_GROUP, QUANT_HEAD_DTYPE)
-        print(f"[build] WARNING: QUANT_HEAD_DTYPE={QUANT_HEAD_DTYPE!r} packs buffers/W_head.bin as "
-              f"quantize_weight()'s [scale|payload] rows. W_head IS the tied embedding table, and "
-              f"rust/npu-engine's NpuDecodeStep::step (npu_decode.rs) mmaps that exact blob and "
-              f"gathers embed[token] from it as raw bf16 rows -- this build's W_head.bin is no "
-              f"longer that layout, so the host embedding gather will read garbage until "
-              f"NpuDecodeStep is taught to dequantize the row (or a separate bf16 embedding blob "
-              f"is restored). This artifact is NOT runnable end to end as is.", file=sys.stderr)
+        embed_blob = "W_embed"
+        host_embed = bf16(embed_f32).reshape(-1)
     else:
         weights["W_head"] = bf16(embed_f32).reshape(-1)
     if not scale_in_qnorm:
@@ -833,7 +836,8 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
                               buffer_sizes=bufsz, context=ctx, extra_flags=placer_flags,
                               share_designs=share)
     fused.compile()
-    return sp, fused, weights, dict(NL=NL, S=S, inputs=inputs, cache_names=cache_names)
+    return sp, fused, weights, dict(NL=NL, S=S, inputs=inputs, cache_names=cache_names,
+                                    embed_blob=embed_blob, host_embed=host_embed)
 
 
 def main():
@@ -847,6 +851,7 @@ def main():
     os.makedirs(os.path.join(a.out, "buffers"), exist_ok=True)
     sp, fused, weights, md = build_graph(a.spec, a.weights, a.layers, a.max_seq)
     NL, S, inputs, cache_names = md["NL"], md["S"], md["inputs"], md["cache_names"]
+    embed_blob, host_embed = md["embed_blob"], md["host_embed"]
     D, HD, Hq, Hkv, VOCAB = sp.d_model, sp.head_dim, sp.n_q_heads, sp.n_kv_heads, sp.vocab
     FF = sp.ffn
     elf = load_elf(fused).view(np.uint8).tobytes()
@@ -875,6 +880,9 @@ def main():
     bdir = os.path.join(a.out, "buffers")
     for n_, arr in weights.items():
         open(os.path.join(bdir, f"{n_}.bin"), "wb").write(weight_bytes(arr))
+    if embed_blob != "W_head":
+        # Host-only, deliberately not in `wnames`: see the tied-embedding note at its build site.
+        open(os.path.join(bdir, f"{embed_blob}.bin"), "wb").write(weight_bytes(host_embed))
     open(os.path.join(a.out, "decode.elf"), "wb").write(elf)
 
     meta = {
@@ -882,6 +890,10 @@ def main():
         "input_size": int(in_sz), "output_size": int(out_sz), "scratch_size": int(scr),
         "layout": {n: {"type": v[0], "offset": int(v[1]), "len": int(v[2])} for n, v in lay.items()},
         "inputs": inputs, "weights": wnames, "output": "logits",
+        # Which blob the HOST gathers embed[token] from. Always bf16 [vocab, d_model]; it is
+        # W_head itself unless the lm-head was quantised, in which case W_head is packed and this
+        # names the bf16 sidecar. Absent in older artifacts -- consumers default to "W_head".
+        "embed_blob": embed_blob,
         "scratchpad": {"params": scratchpad_params, "kv_param": "kv_off", "mask_param": "sm_mask",
                        "head_dim": HD, "kv_heads": Hkv},
         "dims": {"layers": NL, "d_model": D, "q_heads": Hq, "kv_heads": Hkv, "head_dim": HD,

@@ -121,7 +121,11 @@ impl NpuDecodeStep {
 
         // Gate on the BYTE LENGTH the layout declares, not on the file merely existing: a W_head
         // built for another vocab is the failure that would otherwise gather a wrong row quietly.
-        let embed_path = artifact.weight_blob_path("W_head");
+        // `meta.json`'s `embed_blob` names the bf16 table the gather reads. It is "W_head" unless
+        // the lm-head was quantised, in which case W_head.bin is packed [scale|payload] rows and
+        // the generator emits a bf16 sidecar for this read. Defaults to "W_head" so every artifact
+        // built before that field keeps working.
+        let embed_path = artifact.weight_blob_path(artifact.embed_blob());
         let want = artifact.vocab * artifact.d_model * 2;
         let f = std::fs::File::open(&embed_path)
             .map_err(|e| EngineError::Load(format!("open {}: {e}", embed_path.display())))?;

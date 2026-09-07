@@ -65,6 +65,8 @@ pub struct LlmArtifact {
     /// re-zero (`NpuDecodeStep::reset`). Absent (empty) is legal: a model with no on-device cache
     /// buffer still validates.
     pub cache_buffers: Vec<String>,
+    /// `meta.json`'s `embed_blob`; see [`Self::embed_blob`]. `None` in pre-2026-09-08 artifacts.
+    pub embed_blob: Option<String>,
     pub kv_off: ScratchpadParam,
     pub sm_mask: ScratchpadParam,
     pub head_dim: usize,
@@ -133,6 +135,7 @@ impl LlmArtifact {
         let inputs = str_list("inputs")?;
         let weights = str_list("weights")?;
         let cache_buffers = meta.get("cache_buffers").map(|_| str_list("cache_buffers")).transpose()?.unwrap_or_default();
+        let embed_blob = meta.get("embed_blob").and_then(|v| v.as_str()).map(str::to_owned);
         let toolchain_hash = meta
             .get("toolchain")
             .and_then(|t| t.get("hash"))
@@ -314,6 +317,7 @@ impl LlmArtifact {
             weights,
             output,
             cache_buffers,
+            embed_blob,
             kv_off,
             sm_mask,
             head_dim,
@@ -363,6 +367,13 @@ impl LlmArtifact {
 
     pub fn elf_path(&self) -> PathBuf {
         self.decode_dir.join(&self.elf_name)
+    }
+
+    /// The bf16 `[vocab, d_model]` blob the host embedding gather reads. `W_head` itself unless
+    /// the lm-head was quantised; then the generator emits a bf16 sidecar and names it here.
+    /// Older artifacts have no such field, so they resolve to `W_head` exactly as before.
+    pub fn embed_blob(&self) -> &str {
+        self.embed_blob.as_deref().unwrap_or("W_head")
     }
 
     pub fn weight_blob_path(&self, name: &str) -> PathBuf {
