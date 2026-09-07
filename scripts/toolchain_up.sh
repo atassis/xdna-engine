@@ -255,6 +255,20 @@ if [ ! -e "$SRC/tools/aiecc/aiecc.cpp" ]; then
     [ -e "$REPO/mlir-aie/$nested/.git" ] || git -C "$REPO/mlir-aie" submodule update --init -- "$nested" >/dev/null 2>&1 || true
     cur=$(git -C "$REPO/mlir-aie/$nested" rev-parse HEAD 2>/dev/null || echo none)
     if [ "$want" != "$cur" ]; then
+      # The checkout below is --force, so it DISCARDS local modifications without saying so, in a
+      # checkout other sessions share. Say so, and leave the work recoverable. Measured 2026-09-08 on
+      # the tree this script actually uses ($REPO/mlir-aie -- NOT the workspace-level mlir-aie/):
+      # aie-rt carried 11 modified files and bootgen 4, provenance unestablished, all of which the
+      # next pin bump would have deleted with no message.
+      dirty=$(git -C "$REPO/mlir-aie/$nested" status --porcelain --untracked-files=no 2>/dev/null)
+      if [ -n "$dirty" ]; then
+        stash="$XDNA_CACHE/submodule-rescue/${nested//\//_}-$(date +%Y%m%dT%H%M%S).patch"
+        mkdir -p "$(dirname "$stash")"
+        git -C "$REPO/mlir-aie/$nested" diff > "$stash" 2>/dev/null || true
+        echo "[toolchain_up] WARN: $nested has local modifications and is being re-pinned" >&2
+        echo "$dirty" | sed 's/^/[toolchain_up]   /' >&2
+        echo "[toolchain_up]   saved to $stash -- re-apply with: git -C $REPO/mlir-aie/$nested apply $stash" >&2
+      fi
       git -C "$REPO/mlir-aie/$nested" cat-file -e "${want}^{commit}" 2>/dev/null \
         || git -C "$REPO/mlir-aie/$nested" fetch -q origin "$want" 2>/dev/null || true
       git -C "$REPO/mlir-aie/$nested" checkout -q --force --detach "$want" 2>/dev/null \
