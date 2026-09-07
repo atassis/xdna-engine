@@ -98,6 +98,9 @@ def main():
     # different token by step 2) and the kv arm at L0_kr by 64 elements = exactly 2 x 64-byte
     # cache lines. With it, both arms are bit-identical across passes and agree token for token.
     # The "kv arm is 0/336" that this defect was localised against was luck, not a property.
+    # The Rust rail has always done this -- rust/npu-engine/src/llm/npu_decode.rs:113, one bulk
+    # arena.sync_to_device() after the weight load, with the write -> sync_input -> dispatch ->
+    # sync_from_device contract in that module's doc. Only the Python path was missing it.
     c.scratch_buffer.device = "cpu"
     c.scratch_buffer.to("npu")
     print(f"[verify] {len(weights)} weight buffers loaded and scratch flushed to the device")
