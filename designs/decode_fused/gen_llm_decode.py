@@ -106,6 +106,14 @@ QUANT_MLP_GROUP = int(os.environ.get("QUANT_MLP_GROUP", "128"))
 
 DECODE_PLACER_FLAGS_DEFAULT = "--cores-per-col 1"
 
+# INSTRUMENT, not a feature. Alternates the per-head qk-norm between two IDENTICAL RMSNorm
+# instances. RMSNorm has no design_key, so two instances are two DESIGNS: the 24 consecutive runs
+# stop sharing one aiex.configure and become 24. Runs, bytes and output are unchanged, so it
+# isolates the cost of a CHEAP configure (18 KB of views) the way share_designs isolated an
+# expensive one. Predicted +644 configures/token; at the measured 61.9 us for a big configure that
+# is +39.9 ms if the cost is flat, and ~0 if it tracks the view count.
+SPLIT_QKNORM = os.environ.get("SPLIT_QKNORM", "0") == "1"
+
 
 def weight_bytes(arr):
     """Bytes for one weight buffer exactly as written into the .bin / device arena.
@@ -163,6 +171,8 @@ def sequence_name(sp, NL, S, placer_flags):
         parts.append(f"rpc{TMV_RPC}")
     if QUANT_MLP_DTYPE != "bf16":
         parts.append(f"{QUANT_MLP_DTYPE}g{QUANT_MLP_GROUP}")
+    if SPLIT_QKNORM:
+        parts.append("splitqk")
     if NL != sp.n_layers:
         parts.append(f"l{NL}")
     if S != 2048:
@@ -389,6 +399,9 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
                       weighted=True, epsilon=sp.eps, context=ctx)
     op_qk_norm = RMSNorm(size=HD, num_aie_columns=1, num_channels=1, tile_size=HD,
                          weighted=True, epsilon=sp.eps, context=ctx) if sp.qk_norm else None
+    op_qk_norm_b = (RMSNorm(size=HD, num_aie_columns=1, num_channels=1, tile_size=HD,
+                            weighted=True, epsilon=sp.eps, context=ctx)
+                    if (sp.qk_norm and SPLIT_QKNORM) else op_qk_norm)
     op_q = gemv(QD, D, ctx)
     op_kv = gemv(KVD, D, ctx)
     op_o = gemv(D, QD, ctx)
@@ -511,9 +524,11 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
         nxt = f"x{l+1}"
         qk = []
         if sp.qk_norm:
-            qk = [*[(op_qk_norm, f"{p}q[{h*HD*2}:{(h+1)*HD*2}]", p + "n_qn",
+            qk = [*[((op_qk_norm if h % 2 == 0 else op_qk_norm_b),
+                     f"{p}q[{h*HD*2}:{(h+1)*HD*2}]", p + "n_qn",
                      f"{p}q[{h*HD*2}:{(h+1)*HD*2}]") for h in range(Hq)],
-                  *[(op_qk_norm, f"{p}k[{h*HD*2}:{(h+1)*HD*2}]", p + "n_kn",
+                  *[((op_qk_norm if h % 2 == 0 else op_qk_norm_b),
+                     f"{p}k[{h*HD*2}:{(h+1)*HD*2}]", p + "n_kn",
                      f"{p}k[{h*HD*2}:{(h+1)*HD*2}]") for h in range(Hkv)]]
         rl += [
             (op_norm, cur, p + "n_in", p + "hn"),
