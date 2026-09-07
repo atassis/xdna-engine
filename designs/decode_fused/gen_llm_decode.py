@@ -154,6 +154,13 @@ FUSE_ROPE_QK = os.environ.get("FUSE_ROPE_QK", "1") == "1"
 #
 # NOT bit-identical: it removes a bf16 rounding of the intermediate `sc` and adds one of the gain.
 # Same class of change as FUSE_MLP_DP's summation order, and gated the same way (token parity).
+#
+# The three flags together are worth 0.230 MB/layer = 6.44 MB/token, measured off the shim BDs of
+# one controlled pair (400.88 -> 400.42 MB/dispatch at depth 2). It attributes exactly: op_scale's
+# read and write of `sc` plus its `attn_scale` operand is 3 x 64 KB, and the two GEMV invocations
+# FUSE_QKV_GEMV deletes each stopped broadcasting `hn` to 8 columns, 2 x 8 x 2 KB. At the fabric
+# wall that is 0.12 ms of the measured -6.19, so these are dispatch levers that happen to move a
+# few bytes, not the other way round.
 SCALE_IN_QNORM = os.environ.get("SCALE_IN_QNORM", "1") == "1"
 
 # The whole QKV head -- pre-attn RMSNorm, the concatenated QKV GEMV, the 24 per-head qk-norms and
