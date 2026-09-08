@@ -642,6 +642,14 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
     # elements). The runtime offset has the same granule floor, so an odd `p` truncates down.
     # The working shape is a PAIR write on an even offset, whose staging cannot itself be a DMA.
     op_scv = StridedCopy(**sc, output_offset_parameter="kv_off", context=ctx)
+
+    # One (scratchpad slot, head_dim) pair per DISTINCT attention geometry. Uniform today, so one
+    # entry -- but the host reads this as a list (Artifact::kv_offs) and writes `pos * head_dim` to
+    # each slot, so the per-layer case is an append here rather than a change of contract. It has
+    # to be derived beside the StridedCopy ops that consume the slot, not restated at the meta
+    # site, because the pairing IS the contract: which slot a layer's KV-append reads and which
+    # head_dim scales it are the same decision.
+    kv_slots = [("kv_off", HD)]
     # GQA broadcast. Correctness-first; the byte-free form is a batch-stride-0 GEMV read of the kv
     # head (0 ops, 0 bytes) -- at Hq=16 x 28 layers this Repeat plus the V transpose are 41% of the
     # per-token DDR budget, so it is the first optimisation after parity, not an afterthought.
@@ -1071,7 +1079,8 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
                               share_designs=share)
     fused.compile()
     return sp, fused, weights, dict(NL=NL, S=S, inputs=inputs, cache_names=cache_names,
-                                    embed_blob=embed_blob, host_embed=host_embed)
+                                    embed_blob=embed_blob, host_embed=host_embed,
+                                    kv_slots=kv_slots)
 
 
 def main():
@@ -1141,7 +1150,10 @@ def main():
         # W_head itself unless the lm-head was quantised, in which case W_head is packed and this
         # names the bf16 sidecar. Absent in older artifacts -- consumers default to "W_head".
         "embed_blob": embed_blob,
+        # `kv_param` is the single-slot form every artifact before this carried, kept so an older
+        # consumer still loads; `kv_params` is the list the host prefers.
         "scratchpad": {"params": scratchpad_params, "kv_param": "kv_off", "mask_param": "sm_mask",
+                       "kv_params": [{"param": n, "head_dim": hd} for n, hd in md["kv_slots"]],
                        "head_dim": HD, "kv_heads": Hkv},
         "dims": {"layers": NL, "d_model": D, "q_heads": Hq, "kv_heads": Hkv, "head_dim": HD,
                  "ffn": FF, "vocab": VOCAB, "S": S,
