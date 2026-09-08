@@ -57,6 +57,10 @@ export PYTHONPATH="$IRON_DIR:$REPO/designs/decode_fused${PYTHONPATH:+:$PYTHONPAT
 # script: four --pipelines values (4/6/8/10) produced the same md5 and emitted no MLIR. That is
 # a cache hit masquerading as a build, and it would make this script certify provenance it had not
 # actually rebuilt. Own cwd per build; the tells are an instant build and a missing .mlir.
+#
+# Only two of those four values can produce an artifact at all, so that run was never a 4-arm A/B:
+# 6 exhausts the MemTile's DMA channels and 10 asks for more columns than the device has. The
+# generator now rejects both up front (gen_encoder_mha.py:_validate_pipelines).
 WORK="${WORK:-$OUT/.build}"
 mkdir -p "$WORK"
 
