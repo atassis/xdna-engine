@@ -12,7 +12,8 @@ use clap_complete::Shell;
 use npu_engine::capability::Capability;
 
 #[derive(Parser)]
-#[command(name = "npu", about = "XDNA2 NPU engine multitool")]
+#[command(name = "npu", about = "XDNA2 NPU engine multitool",
+          subcommand_required = true, arg_required_else_help = true)]
 pub struct Cli {
     /// Config path (default: $NPU_CONFIG or ~/.config/npu/engine.toml)
     #[arg(long, global = true, value_hint = ValueHint::FilePath)]
@@ -137,6 +138,7 @@ pub enum Cmd {
     // Folded in from the separate `npu-weights` binary: `npu` is documented as the single
     // entrypoint, `npu bake` already overlapped `npu-weights bake`, and a second binary was a
     // second completion surface with none of this one's coverage guarantees.
+    #[command(subcommand_required = true, arg_required_else_help = true)]
     Weights {
         #[command(subcommand)]
         action: WeightsCmd,
@@ -147,6 +149,7 @@ pub enum Cmd {
     /// drift from them the way a hand-written script would.
     Completions { shell: Shell },
     /// Inspect / edit the desired-state config.
+    #[command(subcommand_required = true, arg_required_else_help = true)]
     Config { #[command(subcommand)] action: ConfigCmd },
     /// Read-only self-test: device/driver versions, power mode, who holds the device, which
     /// config is in effect and why, whether configured models' artifacts resolve, service status.
