@@ -22,7 +22,7 @@
 //! the right way round for a gate: it holds if the policy is later loosened, which the measured
 //! break-even argues it should be.
 //!
-//! NPU is single-tenant -- run under `xdna-engine-private/journal/scripts/npu_lock.sh`.
+//! NPU is single-tenant -- stop `npu serve` and serialise against any other device user.
 //!
 //! Takes ONE OR MORE references per invocation and loops them inside a single process: binding the
 //! pair costs a 1.99 GB arena upload, and paying that once per prompt length would dominate the run.

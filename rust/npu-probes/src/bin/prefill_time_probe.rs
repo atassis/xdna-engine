@@ -6,10 +6,11 @@
 //!
 //! The flag is resolved once per process, so an arm is a process. Run the two ALTERNATED and take
 //! paired medians: this box drifts ~33% over hours, so an unpaired A-then-B is not a measurement
-//! ([[device-measurement-discipline]]). `--reps` is per invocation; alternation is the caller's job
+//! (this box drifts ~33% over hours; quote a delta against a contemporaneous alternated
+//! control, and name the power mode). `--reps` is per invocation; alternation is the caller's job
 //! (scripts/time_prefill.sh does it).
 //!
-//! NPU is single-tenant -- run under `xdna-engine-private/journal/scripts/npu_lock.sh`.
+//! NPU is single-tenant -- stop `npu serve` and serialise against any other device user.
 //!
 //! Usage: prefill_time_probe <decode_dir> <prefill_dir> [--reps N] [--lens 256,512,1024]
 

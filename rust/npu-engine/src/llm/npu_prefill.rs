@@ -69,9 +69,10 @@ use crate::llm::npu_decode::{pack_bf16_bytes, rope_row, EmbedTable};
 ///
 /// The step-0 logit deltas that justified the old default are still there and are still not
 /// identity -- they are the cross-implementation cascade
-/// ([[token-identity-across-two-kernels-is-not-achievable]]), which is the standard this rail
-/// retired and which nobody in this domain gates on. What changed is that the distribution is now
-/// measured not to have moved.
+/// -- two independent implementations of one op cannot agree bit for bit, and greedy decode turns
+/// any difference into a token flip wherever the top two logits are close. That is the standard this
+/// rail retired and which nobody in this domain gates on. What changed is that the distribution is
+/// now measured not to have moved.
 ///
 /// Worth it: 35.8-37.1x faster priming, 707-742 tok/s against 49.9-51.5 ms/token, measured with an
 /// alternated control. And decode is not perturbed by the pair being resident -- the control arm,
