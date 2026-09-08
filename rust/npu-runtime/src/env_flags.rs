@@ -87,12 +87,12 @@ use Semantics::*;
 pub const FLAGS: &[Flag] = &[
     // -- npu-engine: llm decode ------------------------------------------------------------------
     Flag { name: "NPU_LLM_REUSE_KV", owner: "npu-engine", site: "npu-engine/src/llm/npu_decode.rs:161",
-        semantics: IsOne, default: "false",
-        doc: "skip the per-request KV-cache zeroing and reuse the buffers across requests. The \
-              cache is already zeroed at load, and sm_mask excludes every position at or beyond \
-              n_past, so the per-request pass should be redundant -- it costs 224 MiB of host \
-              memset plus an arena write per request at S=2048. Opt-in until the correctness A/B \
-              is run on more shapes." },
+        semantics: NotZero, default: "true",
+        doc: "reuse the KV-cache buffers across requests instead of re-zeroing them each time. \
+              Default ON: the buffers are zeroed explicitly at load and sm_mask excludes every \
+              position at or beyond n_past, so the per-request pass cost 224 MiB of host memset \
+              plus an arena write (~60 ms/request at S=2048) and changed no output. Set =0 to \
+              restore it when bisecting a suspected KV bug." },
 
     // -- npu-asr-host --------------------------------------------------------------------------
     Flag { name: "NPU_PAR_SUBSAMPLE", owner: "npu-asr-host", site: "npu-asr-host/src/lib.rs:507",
