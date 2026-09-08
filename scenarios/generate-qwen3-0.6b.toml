@@ -12,6 +12,12 @@ name = "qwen3-0.6b"
 #   tokenizer  the HF snapshot dir: tokenizer.json, config.json, generation_config.json
 [artifacts]
 decode = "artifacts/qwen3-0.6b/decode"
+# Batched prefill: primes the KV cache dims.M positions per dispatch instead of one per token.
+# Optional -- drop this line and the rail falls back to per-token priming with no other change.
+# The pair is checked at load (dims, RoPE base, embed scale, S % M, and every shared scratch
+# offset), so a prefill built against a different decode build is refused rather than mis-bound.
+#   prefill  scripts/build_prefill.sh 28 256 2048
+prefill = "artifacts/qwen3-0.6b/prefill"
 weights = "artifacts/qwen3-0.6b/weights"
 tokenizer_dir = "artifacts/qwen3-0.6b/tokenizer"
 
