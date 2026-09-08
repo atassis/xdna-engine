@@ -30,7 +30,7 @@ from gen_llm_decode import gemv_tile_output, COLS  # noqa: E402
 BF16 = ml_dtypes.bfloat16
 
 
-def run_one(M, K, cols, tsi, tso, seed):
+def run_one(M, K, cols, tsi, tso, seed, dispatches=2):
     """Build + run ONE GEMV; return (rel-L2, rel-L2 of sorted values, tiles per column)."""
     ctx = AIEContext()
     op = GEMV(M=M, K=K, num_aie_columns=cols, tile_size_input=tsi,
@@ -45,13 +45,57 @@ def run_one(M, K, cols, tsi, tso, seed):
     x = np.asarray(rng.standard_normal(K) * 0.5, BF16).astype(np.float32)
     np.copyto(c.get_buffer("W").data, np.asarray(W, BF16).reshape(-1))
     np.copyto(c.get_buffer("x").data, np.asarray(x, BF16).reshape(-1))
-    c()
+    # TWO dispatches, first result discarded ON PURPOSE. On this rail the FIRST dispatch after a
+    # host input write computes on the PREVIOUS input -- measured 2026-09-05, see
+    # docs/kb/first-dispatch-after-a-host-input-write-computes-on-the-previous-input.md in the
+    # journal. For a freshly built design the "previous input" is an unwritten arena, so a
+    # single-dispatch run here was reporting a GEMV of whatever happened to be in memory. That is
+    # what produced the large exact-zero counts, verdicts that disagreed between runs of the SAME
+    # config, and a pattern no tiling parameter could explain.
+    for _ in range(dispatches):
+        c()
     got = np.asarray(c.get_buffer("y").data, np.float32)[:M]
     ref = np.asarray(W @ x, BF16).astype(np.float32)
     n = np.linalg.norm(np.float64(ref))
     d = np.linalg.norm(np.float64(ref - got)) / n
     ds = np.linalg.norm(np.float64(np.sort(ref) - np.sort(got))) / n
-    return d, ds, (M // cols) // tso
+    # The ZERO COUNT is reported alongside the error because at M=2048 K=128 it was 1826/2048 --
+    # an output buffer that was largely never written. An error metric cannot tell "computed the
+    # wrong number" from "never wrote this element", and those have completely different fixes.
+    return d, ds, (M // cols) // tso, int((got == 0).sum())
+
+
+def converge(M, K, cols, tsi, tso, seed, n):
+    """Build ONCE, then dispatch n times and report after EACH.
+
+    Separates "the first dispatch computes on the previous input" (a fixed lag: the reading is
+    correct from dispatch 2 onward and never moves again) from "the buffers settle gradually" (the
+    reading keeps improving). Rebuilding per dispatch count cannot tell those apart and costs a
+    compile per point.
+    """
+    ctx = AIEContext()
+    op = GEMV(M=M, K=K, num_aie_columns=cols, tile_size_input=tsi,
+              tile_size_output=tso, context=ctx)
+    fused = OperatorSequence(f"gemv_{M}_{K}_{tsi}_{tso}", [(op, "W", "x", "y")],
+                             input_args=["x"], output_args=["y"],
+                             buffer_sizes={"y": M * 2}, context=ctx)
+    fused.compile()
+    c = fused.get_callable()
+    rng = np.random.default_rng(seed)
+    W = np.asarray(rng.standard_normal((M, K)) * 0.05, BF16).astype(np.float32)
+    x = np.asarray(rng.standard_normal(K) * 0.5, BF16).astype(np.float32)
+    np.copyto(c.get_buffer("W").data, np.asarray(W, BF16).reshape(-1))
+    np.copyto(c.get_buffer("x").data, np.asarray(x, BF16).reshape(-1))
+    ref = np.asarray(W @ x, BF16).astype(np.float32)
+    nrm = np.linalg.norm(np.float64(ref))
+    print(f"[converge] M={M} K={K} tsi={tsi} tso={tso}")
+    print(f"{'dispatch':>8} {'rel-L2':>12} {'zeros':>14}")
+    for i in range(1, n + 1):
+        c()
+        got = np.asarray(c.get_buffer("y").data, np.float32)[:M]
+        d = np.linalg.norm(np.float64(ref - got)) / nrm
+        print(f"{i:8} {d:12.4e} {int((got == 0).sum()):7}/{M:<6}")
+    return 0
 
 
 def main():
@@ -62,22 +106,35 @@ def main():
     ap.add_argument("--tsi", type=int, default=None)
     ap.add_argument("--tso", type=int, default=None)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--dispatches", type=int, default=2,
+                    help="dispatches per run; the FIRST computes on the previous input")
+    ap.add_argument("--converge", type=int, default=0,
+                    help="build once, dispatch N times, report after each")
     ap.add_argument("--sweep", default=None,
                     help="comma-separated M:K:tsi:tso configs, run in one device session")
     a = ap.parse_args()
 
+    if a.converge:
+        tsi, tso = (a.tsi, a.tso) if a.tsi and a.tso else gemv_tile_output(a.m, a.k)
+        return converge(a.m, a.k, a.cols, tsi, tso, a.seed, a.converge)
+
     if a.sweep:
         print(f"{'M':>8} {'K':>6} {'tsi':>4} {'tso':>7} {'tiles/col':>9} "
-              f"{'rel-L2':>11} {'sorted':>11}  verdict")
+              f"{'rel-L2':>11} {'sorted':>11} {'zeros':>13}  verdict")
         for spec in a.sweep.split(","):
             m, k, tsi, tso = (int(v) for v in spec.split(":"))
             try:
-                d, ds, nt = run_one(m, k, a.cols, tsi, tso, a.seed)
+                d, ds, nt, nz = run_one(m, k, a.cols, tsi, tso, a.seed, a.dispatches)
             except Exception as e:
-                print(f"{m:8} {k:6} {tsi:4} {tso:7} {'-':>9} {'BUILD FAIL':>11}  {type(e).__name__}: {str(e)[:40]}")
+                print(f"{m:8} {k:6} {tsi:4} {tso:7} {'-':>9} {'BUILD FAIL':>11} {'-':>11} {'-':>13}  {type(e).__name__}: {str(e)[:34]}")
                 continue
-            verdict = "ok" if d < 0.05 else ("PERMUTED" if ds < d / 10 else "WRONG VALUES")
-            print(f"{m:8} {k:6} {tsi:4} {tso:7} {nt:9} {d:11.4e} {ds:11.4e}  {verdict}")
+            # PERMUTED is tested BEFORE the absolute-error threshold: a clean permutation
+            # signature is a real finding even when the absolute error happens to be small, and
+            # testing `d < 0.05` first hid exactly that.
+            verdict = ("UNWRITTEN" if nz > m // 100 else
+                       "PERMUTED" if ds < d / 10 and d > 1e-3 else
+                       "ok" if d < 0.05 else "WRONG VALUES")
+            print(f"{m:8} {k:6} {tsi:4} {tso:7} {nt:9} {d:11.4e} {ds:11.4e} {nz:6}/{m:<6}  {verdict}")
         return 0
 
     if a.tso is None or a.tsi is None:
@@ -102,7 +159,15 @@ def main():
     x = np.asarray(rng.standard_normal(a.k) * 0.5, BF16).astype(np.float32)
     np.copyto(c.get_buffer("W").data, np.asarray(W, BF16).reshape(-1))
     np.copyto(c.get_buffer("x").data, np.asarray(x, BF16).reshape(-1))
-    c()
+    # TWO dispatches, first result discarded ON PURPOSE. On this rail the FIRST dispatch after a
+    # host input write computes on the PREVIOUS input -- measured 2026-09-05, see
+    # docs/kb/first-dispatch-after-a-host-input-write-computes-on-the-previous-input.md in the
+    # journal. For a freshly built design the "previous input" is an unwritten arena, so a
+    # single-dispatch run here was reporting a GEMV of whatever happened to be in memory. That is
+    # what produced the large exact-zero counts, verdicts that disagreed between runs of the SAME
+    # config, and a pattern no tiling parameter could explain.
+    for _ in range(a.dispatches):
+        c()
     got = np.asarray(c.get_buffer("y").data, np.float32)[:a.m]
     ref = np.asarray(W @ x, BF16).astype(np.float32)
 
