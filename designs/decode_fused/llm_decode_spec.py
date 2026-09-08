@@ -152,6 +152,47 @@ class LlmSpec:
     global_head_dim: int | None = None
     global_n_kv_heads: int | None = None
 
+    # ---- Gemma-4 axes, DATA ONLY: every one of these is refused by name in check() ----
+    # Each was read off the checkpoint or `transformers/models/gemma4_unified/`, never inferred from
+    # Gemma-3 by family resemblance -- which is the trap that put `norm_gain="one_plus_w"` in the
+    # stranded literal, wrong on all 193 norm tensors. Facts and citations:
+    # [[gemma4-norm-gain-is-w-not-one-plus-w]].
+    #
+    # They are fields BEFORE they are capabilities on purpose. A spec that cannot say what a model
+    # needs cannot refuse it by name either, and "gemma4-12b is not supported" is a far worse
+    # failure than a list of five things that are missing.
+
+    # attention scaling is a FIXED 1.0, not head_dim**-0.5 and not a query_pre_attn_scalar.
+    # Gemma4UnifiedTextAttention sets `self.scaling = 1.0` and passes it explicitly, so the
+    # eager-attention default is never taken. Encoding it as query_pre_attn_scalar=1.0 would
+    # compute the right number by coincidence and read as a config value the checkpoint does not
+    # have.
+    attn_scale_fixed: float | None = None
+    # attention_k_eq_v: global layers have NO v_proj and V is the RAW k_proj output -- captured
+    # before k_norm and before RoPE, because the Python binds value_states to key_states and then
+    # rebinds key_states.
+    v_from_k_on_global: bool = False
+    # A GAINLESS RMSNorm (with_scale=False) on the value path of EVERY layer. with_scale=False
+    # removes the learned gain, NOT the normalisation -- and because it removes the gain there is
+    # no weight tensor anywhere in the checkpoint, so nothing can fail on its absence. This flag
+    # exists so the absence is a declaration instead of an oversight.
+    v_norm: bool = False
+    # Fraction of head_dim rotated on the global layers (0.25 = 64 of 256 frequency pairs at
+    # global_head_dim=512), with the rope_type the config names for them.
+    rope_partial_rotary: float | None = None
+    rope_type_global: str | None = None
+    # A trained per-layer scalar applied to the block output AFTER both residual adds. A
+    # register_buffer, so it is in the checkpoint but not in config.json; 0.053 at layer 0 and
+    # 0.048 at 47, so treating it as 1.0 is worst at the ends of the stack.
+    layer_scalar: bool = False
+    # tanh softcap at the LM head (logits/c -> tanh -> *c). An LM-head axis, not an attention one:
+    # eager_attention_forward takes a softcap argument and the decoder layer passes none.
+    logit_softcap: float | None = None
+    # Tensor-name prefix in the dump. Gemma-4-12B is a MULTIMODAL checkpoint -- vision and audio
+    # embedders sit alongside the text stack -- so its text tensors are under
+    # `model.language_model.`, not `model.`.
+    weight_prefix: str = "model."
+
     # ---- derived ----
     @property
     def q_dim(self) -> int:
@@ -167,6 +208,8 @@ class LlmSpec:
 
     @property
     def attn_scale(self) -> float:
+        if self.attn_scale_fixed is not None:
+            return self.attn_scale_fixed
         qpas = self.query_pre_attn_scalar
         return (qpas ** -0.5) if qpas is not None else (self.head_dim ** -0.5)
 
@@ -195,6 +238,48 @@ class LlmSpec:
 
     def kv_dim_for(self, layer_idx: int) -> int:
         return self.n_kv_heads_for(layer_idx) * self.head_dim_for(layer_idx)
+
+    def unimplemented(self) -> list[str]:
+        """The model features this spec declares that the build cannot express yet, each named.
+
+        One list rather than a refusal per feature, because the useful question at porting time is
+        "what is still missing", and answering it one exception at a time is how the Gemma-3
+        bring-up met four capability gaps as four separate crashes on four separate builds.
+
+        Each entry says what breaks, not just what is absent -- a reader deciding whether to
+        implement it needs the failure, and the failure is the argument for the refusal.
+        """
+        gaps = []
+        if not self.geometry_is_uniform():
+            gaps.append(
+                f"per-layer attention geometry (head_dim {self.head_dim}/{self.global_head_dim}, "
+                f"n_kv_heads {self.n_kv_heads}/{self.global_n_kv_heads}): the GENERATOR handles it "
+                f"(the op vocabulary is keyed on the pair), but meta.json still carries "
+                f"dims.head_dim as one scalar and the host's rope cross-check is gated on "
+                f"kv_offs.len()==1, so it does nothing in exactly this case")
+        if self.v_norm:
+            gaps.append(
+                "v_norm: a GAINLESS RMSNorm on the value path of every layer. There is no weight "
+                "tensor for it anywhere in the checkpoint (with_scale=False), so its absence "
+                "cannot raise a missing-key error -- skipping it is a silent numerical change")
+        if self.v_from_k_on_global:
+            gaps.append(
+                "attention_k_eq_v: global layers have no v_proj and V is the RAW k_proj output, "
+                "taken before k_norm and before RoPE. The graph currently derives V from its own "
+                "projection on every layer")
+        if self.layer_scalar:
+            gaps.append(
+                "layer_scalar: a trained per-layer scalar on the block output after BOTH residual "
+                "adds. It is a register_buffer, so config.json is silent about it and a port that "
+                "reads only the config treats it as 1.0 -- worst at the ends of the stack")
+        if self.rope_partial_rotary is not None:
+            gaps.append(
+                f"partial rotary {self.rope_partial_rotary} (rope_type "
+                f"{self.rope_type_global!r}): only that fraction of head_dim is rotated on the "
+                f"global layers")
+        if self.logit_softcap is not None:
+            gaps.append(f"logit softcap {self.logit_softcap}: tanh(logits/c)*c at the LM head")
+        return gaps
 
     def softmax_cols(self, cap: int) -> int:
         """num_aie_columns for the attention Softmax: the widest split of the q heads that fits.
@@ -272,25 +357,14 @@ class LlmSpec:
         tile_size_output=head_dim//2=128 while M//cols is 32, violating `m_output <= M//cols`. The
         device run that gated Gemma used a scratchpad diag copy, not that file.
         """
-        # LOUD REFUSAL, landed before the capability it guards. Per-layer geometry is expressible
-        # above but NOT buildable: two host contracts assume one head_dim per artifact.
-        #   1. npu_decode.rs writes kv_off = pos * head_dim ONCE per token into a single scratchpad
-        #      slot that every one of the 2*n_layers KV-append StridedCopy ops reads. Two head_dims
-        #      mean two byte offsets for the same position and only one reaches the device.
-        #   2. Both RoPE rows are built from the same artifact.head_dim, so the existing
-        #      rope_global/rope_local split differs in THETA but not in WIDTH.
-        # meta.json carries dims.head_dim as a single scalar, so the artifact FORMAT encodes it too.
-        # The failure this refusal prevents is not a crash: it is a clean build that is wrong on the
-        # global layers only, which teacher-forced parity over a handful of tokens can easily miss.
-        if not self.geometry_is_uniform():
+        gaps = self.unimplemented()
+        if gaps:
             raise ValueError(
-                f"{self.name}: per-layer attention geometry (head_dim "
-                f"{self.head_dim}/{self.global_head_dim}, n_kv_heads "
-                f"{self.n_kv_heads}/{self.global_n_kv_heads}) is not buildable yet -- the host "
-                f"protocol assumes ONE head_dim per artifact (kv_off is a single scratchpad slot "
-                f"written as pos*head_dim, and both RoPE rows are built at one width). See the "
-                f"task per-layer-head-dim-breaks-the-host-protocol; this refusal exists so a "
-                f"partial implementation cannot build cleanly and be wrong on the global layers.")
+                f"{self.name}: {len(gaps)} model feature(s) this build cannot express yet:\n" +
+                "".join(f"  - {g}\n" for g in gaps) +
+                "This refusal is deliberately landed BEFORE the capabilities. Every one of these "
+                "fails SILENTLY if implemented halfway -- a clean build that is wrong on a subset "
+                "of layers, which teacher-forced parity over a handful of tokens can miss.")
 
         for label, m in (("q_dim", self.q_dim), ("kv_dim", self.kv_dim), ("d_model", self.d_model),
                          ("head_dim", self.head_dim), ("ffn", self.ffn), ("vocab", self.vocab)):
@@ -357,4 +431,30 @@ QWEN3_0_6B = LlmSpec(
     sliding_window=None, sw_pattern=None, query_pre_attn_scalar=None,
 )
 
-SPECS = {s.name: s for s in (GEMMA3_270M, QWEN3_0_6B)}
+# Gemma-4-12B-IT (unsloth/gemma-4-12b-it, "unsloth_fixed": true). Every axis below is VERIFIED
+# against the packed dump and the checkpoint header by scripts/check_llm_spec_against_dump.py --
+# nothing here is typed from config.json alone, and the axis facts live on
+# [[gemma4-norm-gain-is-w-not-one-plus-w]].
+#
+# Two corrections to the earlier stranded literal are baked in here. norm_gain is "w", NOT
+# "one_plus_w": Gemma4UnifiedRMSNorm inits the weight to ones and multiplies directly, and the
+# trained weights (means 6-20, max 604) are only sane under a direct-multiply gain. That one would
+# have been wrong on all 193 norm tensors and invisible to every build gate, because load_norm
+# folds the gain into the weight buffer. And attn_scale is a fixed 1.0 rather than the
+# head_dim**-0.5 the spec would otherwise compute -- 1/16 on sliding layers and 1/22.6 on global,
+# which would have built and run quietly wrong.
+#
+# NOT BUILDABLE: check() refuses it, naming six features. That is the point of landing it.
+GEMMA4_12B = LlmSpec(
+    name="gemma4-12b", d_model=3840, n_layers=48, n_q_heads=16, n_kv_heads=8, head_dim=256,
+    ffn=15360, vocab=262144, eps=1e-6, act="gelu_tanh", norm_gain="w",
+    sandwich_norms=True, qk_norm=True, embed_scale="sqrt_d_model",
+    rope_theta_global=1_000_000.0, rope_theta_local=10_000.0,
+    sliding_window=1024, sw_pattern=6, query_pre_attn_scalar=None,
+    global_head_dim=512, global_n_kv_heads=1,
+    attn_scale_fixed=1.0, v_from_k_on_global=True, v_norm=True,
+    rope_partial_rotary=0.25, rope_type_global="proportional",
+    layer_scalar=True, logit_softcap=30.0, weight_prefix="model.language_model.",
+)
+
+SPECS = {s.name: s for s in (GEMMA3_270M, QWEN3_0_6B, GEMMA4_12B)}
