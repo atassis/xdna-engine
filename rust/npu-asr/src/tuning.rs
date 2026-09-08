@@ -33,7 +33,6 @@ pub struct TuningConfig {
     pub qkv_overlap: bool,         // NPU_QKV_OVERLAP
     pub mm2_pipeline: bool,        // NPU_MM2_PIPELINE
     pub int8_fast_epi: bool,       // NPU_INT8_FASTEPI
-    pub int8_onchip_dequant: bool, // NPU_INT8_ONCHIP
     pub ffn_resident: bool,        // NPU_ENC_FFN_RESIDENT (resident fc1->fc2 intermediate; draft, default OFF)
 }
 
@@ -51,7 +50,6 @@ impl TuningConfig {
             qkv_overlap: false,
             mm2_pipeline: true,
             int8_fast_epi: true,
-            int8_onchip_dequant: false,
             ffn_resident: false,
         }
     }
@@ -73,7 +71,6 @@ impl TuningConfig {
         // "== 1" knobs: only the exact value "1" enables; any other set value disables.
         self.layernorm_on_npu = is_one("NPU_LN_NPU", self.layernorm_on_npu);
         self.qkv_overlap = is_one("NPU_QKV_OVERLAP", self.qkv_overlap);
-        self.int8_onchip_dequant = is_one("NPU_INT8_ONCHIP", self.int8_onchip_dequant);
         self.ffn_resident = ffn_resident_requested();
         self
     }
@@ -93,10 +90,8 @@ mod tests {
         assert!(bf16.glu_fused);
         assert!(!bf16.qkv_overlap);     // legacy default false for ALL precisions
         assert!(bf16.mm2_pipeline);
-        assert!(!bf16.int8_onchip_dequant);
         let i8 = TuningConfig::baked_default(Precision::Int8);
         assert!(i8.int8_fast_epi);
-        assert!(!i8.int8_onchip_dequant);
     }
 
     #[test]

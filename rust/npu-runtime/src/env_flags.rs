@@ -134,9 +134,6 @@ pub const FLAGS: &[Flag] = &[
         doc: "overlaps QKV projection dispatch with the previous stage. Also read independently, \
               same is_one-equivalent check (`== Ok(\"1\")`), at block.rs:330 (feature two_ctx, \
               default-on) -- the two agree." },
-    Flag { name: "NPU_INT8_ONCHIP", owner: "npu-asr", site: "npu-asr/src/tuning.rs:76",
-        semantics: IsOne, default: "false",
-        doc: "on-chip int8 dequantization instead of host." },
     Flag { name: "NPU_ENC_FFN_RESIDENT", owner: "npu-asr", site: "npu-asr/src/tuning.rs:23",
         semantics: IsOne, default: "false",
         doc: "resident fc1->fc2 FFN intermediate stays on-device (draft, default OFF), read via \
@@ -162,7 +159,7 @@ pub const FLAGS: &[Flag] = &[
     Flag { name: "NPU_PRECISION", owner: "npu-asr", site: "npu-asr/src/ctx2.rs:93",
         semantics: Value, default: "bf16 (Precision::FastBf16)",
         doc: "runtime precision selector for the encoder GEMMs: native|bf16|int8." },
-    Flag { name: "NPU_ENC_GELU_FUSED", owner: "npu-asr", site: "npu-asr/src/ctx2.rs:316",
+    Flag { name: "NPU_ENC_GELU_FUSED", owner: "npu-asr", site: "npu-asr/src/ctx2.rs:294",
         semantics: IsOk, default: "false",
         doc: "picks the GELU-fused xclbin stem/required artifact set for the encoder. COUPLING: \
               npu-whisper reads the SAME name (encoder.rs) with the same is_ok() rule to decide \

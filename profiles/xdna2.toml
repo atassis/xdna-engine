@@ -10,6 +10,5 @@ int8_fast_epi    = true
 # TBD-by-harness (left at baked default until probe_tuning confirms):
 # layernorm_on_npu = false
 # qkv_overlap      = false   # harness may set true on native
-# int8_onchip_dequant = false
 # Class-3 crossover (recorded; per-request dispatch wired in serving spec B):
 # cpu_npu_crossover_s = 20.0
