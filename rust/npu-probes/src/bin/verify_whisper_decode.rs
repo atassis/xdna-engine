@@ -76,10 +76,19 @@ fn main() {
     // --npu-attn = the NPU path with on-chip SELF-attention (fused LN+QKV + mha kernel) enabled.
     let npu_attn = std::env::args().any(|a| a == "--npu-attn");
     let npu = npu_attn || std::env::args().any(|a| a == "--npu");
+    // Redispatch check: dispatch the SAME
+    // (token, pos) twice with no state change between and require byte-identical logits. No
+    // oracle, no tolerance -- it isolates input/output staleness from a wrong computation, the
+    // class of bug where the first dispatch after a host input write used the PREVIOUS input,
+    // found on the Python/IRON rail. `npu-xrt::Bo::sync_to_device` is unconditional (no
+    // coherence map to go stale), so this is expected to pass; run it after any change to the
+    // per-token write/sync sequence in whisper_decoder.rs.
+    let redispatch = std::env::args().any(|a| a == "--redispatch");
     if !host && !npu {
         eprintln!(
             "note: pass --host (host-vs-onnx), --npu (npu-vs-onnx), or --npu-attn (npu + on-chip \
-             self-attention) to select the parity check."
+             self-attention) to select the parity check. Add --redispatch to run the \
+             byte-identical re-dispatch check instead of the ONNX parity loop."
         );
         return;
     }
@@ -126,6 +135,25 @@ fn main() {
         HostDecoder::new(Rc::clone(&weights))
     };
     hostdec.precompute_cross(&enc);
+
+    if redispatch {
+        println!("re-dispatch check: step(SOT, 0) x2, identical inputs, comparing raw logits ...");
+        let disp1 = hostdec.step(SOT, 0).expect("host decoder step (dispatch 1)");
+        let disp2 = hostdec.step(SOT, 0).expect("host decoder step (dispatch 2)");
+        if disp1 == disp2 {
+            println!("REDISPATCH PASS: {} logits byte-identical across 2 dispatches", disp1.len());
+        } else {
+            let mismatches = disp1.iter().zip(disp2.iter()).filter(|(a, b)| a != b).count();
+            eprintln!(
+                "REDISPATCH FAIL: {mismatches}/{} logits differ between dispatch 1 and 2 -- \
+                 input or output staleness (see first-dispatch-after-a-host-input-write-computes-\
+                 on-the-previous-input)",
+                disp1.len()
+            );
+            std::process::exit(1);
+        }
+        return;
+    }
 
     let label = if npu_attn {
         "npu-attn"

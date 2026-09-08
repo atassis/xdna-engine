@@ -132,10 +132,14 @@ def main():
     rng = np.random.default_rng(20260907)
     A = np.asarray(rng.standard_normal((n_mat, K, M), dtype=np.float32), BF16)
     W = np.asarray(rng.standard_normal((HQ, K), dtype=np.float32), BF16)
-    np.copyto(c.get_buffer("A").data, A.reshape(-1))
-    np.copyto(c.get_buffer("W").data, W.reshape(-1))
-    np.copyto(c.get_buffer("fin").data, np.asarray(np.ones(FILL, np.float32), BF16))
-    np.copyto(c.get_buffer("fones").data, np.asarray(np.ones(FILL, np.float32), BF16))
+    with c.get_buffer("A").overwrite() as _buf:
+        _buf[:] = A.reshape(-1)
+    with c.get_buffer("W").overwrite() as _buf:
+        _buf[:] = W.reshape(-1)
+    with c.get_buffer("fin").overwrite() as _buf:
+        _buf[:] = np.asarray(np.ones(FILL, np.float32), BF16)
+    with c.get_buffer("fones").overwrite() as _buf:
+        _buf[:] = np.asarray(np.ones(FILL, np.float32), BF16)
 
     # Nothing syncs scratch, so make the one host->device transfer of A and W explicit
     # rather than relying on allocation-time residency.

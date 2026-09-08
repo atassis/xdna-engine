@@ -261,7 +261,8 @@ def load_weight_buffer(buf, arr):
         assert dst.nbytes == a.nbytes, f"weight byte-size mismatch: buf {dst.nbytes} vs arr {a.nbytes}"
         dst[:] = a.view(np.uint8)
     else:
-        np.copyto(buf.data, np.asarray(a, BF16).reshape(-1))
+        with buf.overwrite() as _buf:
+            _buf[:] = np.asarray(a, BF16).reshape(-1)
 
 
 

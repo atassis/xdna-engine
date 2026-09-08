@@ -19,7 +19,8 @@ if [ "${SKIP_RUST_GATE:-0}" = "1" ]; then
   echo "[ci_gate] SKIP_RUST_GATE=1 -- skipping"; exit 0
 fi
 
-cd "$(dirname "$0")/../rust"
+script_dir="$(cd "$(dirname "$0")" && pwd)"
+cd "$script_dir/../rust"
 
 # Half the cores: heavy local builds should leave the box usable.
 J=$(( $(nproc) / 2 )); [ "$J" -lt 1 ] && J=1
@@ -61,6 +62,22 @@ rm -f "$test_log"
 #    check that would have caught the missing `required-features` on a cfg-gated device probe.
 step "check -p npu-parakeet (no default features)" \
   cargo check -p npu-parakeet --no-default-features -j "$J"
+
+# 4. Execution graph: exec_graph.py declares each model's op schedule against the kernels actually
+#    on disk (scripts/exec_graph.py). Nothing regenerated or checked it before this -- the graph
+#    could drift from the dispatch code silently. ADVISORY by default: whisper-turbo is unbuildable
+#    on this box right now (no GEMM at K_aug=1312), which is known, in-progress debt, not a
+#    regression, and hard-blocking on it would train people to bypass this gate on unrelated rust/
+#    changes. Set STRICT_EXEC_GRAPH=1 once every declared model builds clean to make this blocking.
+echo
+echo "[ci_gate] === exec_graph.py --check ==="
+if python3 "$script_dir/exec_graph.py" --summary --check; then
+  echo "[ci_gate] OK"
+elif [ "${STRICT_EXEC_GRAPH:-0}" = "1" ]; then
+  echo "[ci_gate] FAILED (STRICT_EXEC_GRAPH=1)"; fail=1
+else
+  echo "[ci_gate] ADVISORY -- exec-graph reports a hazard/unbuildable model (set STRICT_EXEC_GRAPH=1 to block)"
+fi
 
 echo
 if [ "$fail" -ne 0 ]; then

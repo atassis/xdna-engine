@@ -31,6 +31,7 @@ import ml_dtypes
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import newstack_compat  # noqa: F401,E402
 from gen_llm_decode import build_graph, report_artifact_freshness, load_weight_buffer, isolate_build_dir  # noqa: E402
+from redispatch_check import assert_redispatch_identical  # noqa: E402
 
 BF16 = ml_dtypes.bfloat16
 
@@ -92,6 +93,10 @@ def main():
                     help="feed the ORACLE's tokens instead of the device's own, so each step is "
                          "judged independently. Free-running conflates one bad token with the "
                          "trajectory it then drags behind it.")
+    ap.add_argument("--redispatch-check", action="store_true",
+                    help="redispatch check: write step-0's "
+                         "inputs once, dispatch twice with nothing rewritten in between, and "
+                         "require byte-identical logits. Runs instead of the parity loop.")
     a = ap.parse_args()
     isolate_build_dir("verify")
 
@@ -145,6 +150,18 @@ def main():
     rope_buf = c.get_buffer("rope_global")
     out = c.get_buffer("logits")
 
+    if a.redispatch_check:
+        tok0 = prompt_ids[0]
+        with xin.overwrite() as _buf:
+            _buf[:] = np.asarray(embed[tok0] * scale, BF16).reshape(-1)
+        with rope_buf.overwrite() as _buf:
+            _buf[:] = rope_row(0, HD, sp.rope_theta_global).reshape(-1)
+        params.write("kv_off", 0)
+        params.write("sm_mask", 1)
+        params.sync()
+        assert_redispatch_identical(c, out, label=sp.name, vocab=VOCAB)
+        return
+
     fed = list(prompt_ids)
     produced = []
     topk_ids, topk_logits = [], []
@@ -154,8 +171,10 @@ def main():
     step_logits = []
     tok = fed[0]
     for pos in range(len(fed) + steps - 1):
-        np.copyto(xin.data, np.asarray(embed[tok] * scale, BF16).reshape(-1))
-        np.copyto(rope_buf.data, rope_row(pos, HD, sp.rope_theta_global).reshape(-1))
+        with xin.overwrite() as _buf:
+            _buf[:] = np.asarray(embed[tok] * scale, BF16).reshape(-1)
+        with rope_buf.overwrite() as _buf:
+            _buf[:] = rope_row(pos, HD, sp.rope_theta_global).reshape(-1)
         params.write("kv_off", int(pos * HD))
         params.write("sm_mask", int(pos + 1))
         params.sync()

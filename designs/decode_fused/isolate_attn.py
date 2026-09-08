@@ -51,7 +51,8 @@ def main():
     c = fused.get_callable()
     params = c.params
     for n, arr in weights.items():
-        np.copyto(c.get_buffer(n).data, np.asarray(arr, BF16).reshape(-1))
+        with c.get_buffer(n).overwrite() as _buf:
+            _buf[:] = np.asarray(arr, BF16).reshape(-1)
 
     def npy(n):
         return np.load(os.path.join(a.weights, f"{n}.npy")).astype(np.float32)
@@ -65,11 +66,13 @@ def main():
 
     kv_hist = []
     for pos, tok in enumerate(toks):
-        np.copyto(c.get_buffer("x").data, np.asarray(embed[tok], BF16).reshape(-1))
+        with c.get_buffer("x").overwrite() as _buf:
+            _buf[:] = np.asarray(embed[tok], BF16).reshape(-1)
         row = np.empty(HD, np.float32)
         row[0::2] = np.cos(pos * inv)
         row[1::2] = np.sin(pos * inv)
-        np.copyto(c.get_buffer("rope_global").data, np.asarray(row, BF16))
+        with c.get_buffer("rope_global").overwrite() as _buf:
+            _buf[:] = np.asarray(row, BF16)
         params.write("kv_off", int(pos * HD))
         params.write("sm_mask", int(pos + 1))
         params.sync()

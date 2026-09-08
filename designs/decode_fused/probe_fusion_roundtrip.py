@@ -111,9 +111,11 @@ def main():
 
     npass = 0
     for trial in range(3):
-        np.copyto(src.data, x.reshape(-1))
+        with src.overwrite() as _buf:
+            _buf[:] = x.reshape(-1)
         if ones is not None:
-            np.copyto(ones.data, np.ones(N, BF16))
+            with ones.overwrite() as _buf:
+                _buf[:] = np.ones(N, BF16)
         dst.data[:] = 0
         c()
         got = np.array(dst.data, copy=True)

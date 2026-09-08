@@ -46,7 +46,7 @@ Every key is optional; an absent one takes its default.
 | `idle_unload_s` | `900` | Unload a model that has served no request for this long, freeing the device. `0` disables idle unload. |
 | `sweep_interval_s` | `30` | How often the device actor checks for idle models. Only checked between commands, so this is also the worst-case delay before an idle model is released. Clamped to at least 1s. |
 | `idle_release_s` | `1800` | A second, deeper idleness level: after this long since the last *request* (not just since unload), the memory an unload freed but the allocator kept is given back. `0` disables it. |
-| `memory_ceiling_mb` | `4096` | Ceiling on summed device buffer-object bytes across resident models. **Currently inert**: every shipped model reports a `0` footprint, so this never actually refuses a load today; a model without a measured footprint says so in its status detail rather than passing silently. |
+| `memory_ceiling_mb` | `4096` | Ceiling on summed device buffer-object bytes across resident models. **Partial**: Parakeet reports its real footprint; every other shipped model still reports `0` and is not bounded by this. A model without a measured footprint says so in its status detail rather than passing silently. |
 | `evict_policy` | `"lru"` | What to evict when `max_resident` is full and a new model needs the slot: `"lru"` (drop the least-recently-used resident model) or `"none"` (refuse the new load instead). |
 
 ### `[defaults]`
@@ -141,11 +141,14 @@ cap with `npu config set max_resident <n>`.
 Both are idempotent, and neither touches `engine.toml` -- so neither survives a restart. For
 residency that does, pin the model.
 
-> **`memory_ceiling_mb` does not currently bound anything.** It sums `Servable::footprint()` across
-> resident models, and every shipped model returns a hardcoded `0` (`npu-runtime/src/loader.rs`), so
-> the sum is always 0 and the check never fires. `max_resident` -- a model COUNT -- is the only
-> residency limit actually enforced today. `npu load` says so when it reports a model the accountant
-> could not weigh, rather than letting a ceiling you just set look like it is holding.
+> **`memory_ceiling_mb` bounds real bytes only for Parakeet today.** It sums `Servable::footprint()`
+> across resident models; Parakeet reports its actual pinned device BO total, and every other shipped
+> model still returns a hardcoded `0` (`npu-engine/src/pipeline.rs`'s trait defaults, unwired for
+> Whisper, the generic GigaAM ASR path, BERT/ESM embed, and text generation). A ceiling with a
+> non-Parakeet model resident is not enforcing anything for that model's share. `npu load` says which
+> resident models the accountant could not weigh, rather than letting a ceiling you just set look
+> like it covers everything that is loaded. `max_resident` (a model COUNT) is the only limit
+> enforced uniformly across every model kind.
 
 A running service does not pick up a config edit until reloaded:
 

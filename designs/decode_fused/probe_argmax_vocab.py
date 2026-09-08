@@ -118,7 +118,8 @@ def main():
         # FusedFullELFCallable._sync_inputs, every case agrees on the first pair (tries=2).
         # The agreement check stays as the guard, not as a workaround.
         def run_once():
-            np.copyto(lg.data, x.reshape(-1))
+            with lg.overwrite() as _buf:
+                _buf[:] = x.reshape(-1)
             am.data[:] = 0
             c()
             return np.array(am.data, copy=True)

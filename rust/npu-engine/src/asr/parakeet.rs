@@ -281,6 +281,10 @@ text={:?}",
         let _t = PhaseScope::new("detok", Bucket::Host);
         Ok(self.detokenize(&all_ids))
     }
+
+    fn bo_bytes(&self) -> u64 {
+        self.enc.bo_bytes()
+    }
 }
 
 fn load_vocab(path: &Path) -> Result<HashMap<i64, String>, EngineError> {

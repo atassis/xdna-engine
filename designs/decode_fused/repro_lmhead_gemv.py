@@ -43,8 +43,10 @@ def run_one(M, K, cols, tsi, tso, seed):
     rng = np.random.default_rng(seed)
     W = np.asarray(rng.standard_normal((M, K)) * 0.05, BF16).astype(np.float32)
     x = np.asarray(rng.standard_normal(K) * 0.5, BF16).astype(np.float32)
-    np.copyto(c.get_buffer("W").data, np.asarray(W, BF16).reshape(-1))
-    np.copyto(c.get_buffer("x").data, np.asarray(x, BF16).reshape(-1))
+    with c.get_buffer("W").overwrite() as _buf:
+        _buf[:] = np.asarray(W, BF16).reshape(-1)
+    with c.get_buffer("x").overwrite() as _buf:
+        _buf[:] = np.asarray(x, BF16).reshape(-1)
     c()
     got = np.asarray(c.get_buffer("y").data, np.float32)[:M]
     ref = np.asarray(W @ x, BF16).astype(np.float32)
@@ -100,8 +102,10 @@ def main():
     rng = np.random.default_rng(a.seed)
     W = np.asarray(rng.standard_normal((a.m, a.k)) * 0.05, BF16).astype(np.float32)
     x = np.asarray(rng.standard_normal(a.k) * 0.5, BF16).astype(np.float32)
-    np.copyto(c.get_buffer("W").data, np.asarray(W, BF16).reshape(-1))
-    np.copyto(c.get_buffer("x").data, np.asarray(x, BF16).reshape(-1))
+    with c.get_buffer("W").overwrite() as _buf:
+        _buf[:] = np.asarray(W, BF16).reshape(-1)
+    with c.get_buffer("x").overwrite() as _buf:
+        _buf[:] = np.asarray(x, BF16).reshape(-1)
     c()
     got = np.asarray(c.get_buffer("y").data, np.float32)[:a.m]
     ref = np.asarray(W @ x, BF16).astype(np.float32)

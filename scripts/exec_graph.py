@@ -353,9 +353,15 @@ def main():
         print(json.dumps(g, indent=2))
     if a.check:
         # Only models with a declared schedule can be judged unbuildable; "unknown" is not a failure.
-        bad = [m["name"] for m in g["models"] if m["health"]["status"] == "unbuildable"]
+        # "hazard" also fails here even though build_model() only escalates status to "unbuildable"
+        # on a MISSING artifact: a severity=="broken" hazard (e.g. the ctx2 64x32x96 device hang)
+        # means the declared path builds but the device times out, which is the failure this gate
+        # exists to catch, not a lesser one. Before this, --check passed on whisper-small although
+        # its own hazards table records a confirmed ERT_CMD_STATE_TIMEOUT at the built tile.
+        bad = [m["name"] for m in g["models"] if m["health"]["status"] == "unbuildable"
+               or any(h["severity"] == "broken" for h in m["health"]["hazards"])]
         if bad:
-            print(f"exec-graph: unbuildable: {', '.join(bad)}", file=sys.stderr)
+            print(f"exec-graph: unbuildable or device-broken: {', '.join(bad)}", file=sys.stderr)
             return 1
     return 0
 
