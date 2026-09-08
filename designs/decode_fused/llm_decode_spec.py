@@ -267,11 +267,6 @@ class LlmSpec:
                 "attention_k_eq_v: global layers have no v_proj and V is the RAW k_proj output, "
                 "taken before k_norm and before RoPE. The graph currently derives V from its own "
                 "projection on every layer")
-        if self.layer_scalar:
-            gaps.append(
-                "layer_scalar: a trained per-layer scalar on the block output after BOTH residual "
-                "adds. It is a register_buffer, so config.json is silent about it and a port that "
-                "reads only the config treats it as 1.0 -- worst at the ends of the stack")
         if self.rope_partial_rotary is not None:
             gaps.append(
                 f"partial rotary {self.rope_partial_rotary} (rope_type "
@@ -327,9 +322,13 @@ class LlmSpec:
             return f"the fused block is SwiGLU; this spec's activation is {self.act!r}"
         return None
 
+    def layer_scalar_name(self, layer: int) -> str:
+        """The per-layer scalar tensor. A register_buffer, so config.json never mentions it."""
+        return f"{self.weight_prefix}layers.{layer}.layer_scalar"
+
     def norm_weight_names(self, layer: int) -> dict:
         """Per-layer RMSNorm tensor names. The pre-FFN norm's NAME differs between the two families."""
-        p = f"model.layers.{layer}."
+        p = f"{self.weight_prefix}layers.{layer}."
         names = {
             "n_in": p + "input_layernorm.weight",
             "n_pf": p + ("pre_feedforward_layernorm" if self.sandwich_norms

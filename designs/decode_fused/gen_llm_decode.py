@@ -844,6 +844,11 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
     else:
         op_down = gemv(D, FF, ctx, **mlp_quant_kw)
     op_add = ElementwiseAdd(size=D, tile_size=D // COLS, num_aie_columns=COLS, context=ctx)
+    # Gemma-4's trained per-layer scalar, applied to the block output after BOTH residual adds.
+    # It cannot fold anywhere: it scales the residual stream itself, so the next layer's norm sees
+    # it and every later layer compounds it. One D-wide multiply per layer is the honest form.
+    op_lscale = (ElementwiseMul(size=D, tile_size=D // COLS, num_aie_columns=COLS, context=ctx)
+                 if sp.layer_scalar else None)
 
     def split_over_k(op, w, xin, out, n, k_elems, tag):
         """A reduction over K as one GEMV, or as `n` partial GEMVs plus a summation tree.
@@ -910,7 +915,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
         for key, tensor in (("Wq", "self_attn.q_proj"), ("Wk", "self_attn.k_proj"),
                             ("Wv", "self_attn.v_proj"), ("Wo", "self_attn.o_proj"),
                             ("Wg", "mlp.gate_proj"), ("Wu", "mlp.up_proj"), ("Wd", "mlp.down_proj")):
-            hf = f"model.layers.{l}.{tensor}.weight"
+            hf = f"{sp.weight_prefix}layers.{l}.{tensor}.weight"
             if {"Wd": down_chunks, "Wo": g.o_chunks}.get(key, 1) > 1:
                 # Each chunk is its own contiguous tensor. A pre-chunked dump names them
                 # `<tensor>.kchunkN` and we take those bytes as-is; otherwise the split happens
@@ -1102,6 +1107,17 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
         if op_mlp_dp is None:
             rl.append((op_add, p + "x1", p + "d", nxt))
         bufsz[p + "x1"] = D * 2
+        if op_lscale is not None:
+            # `hidden_states *= self.layer_scalar` is the LAST statement of the reference decoder
+            # layer, after both residual adds, so it goes here and not inside either arm above.
+            # In place on `nxt`: it is written by whichever arm ran and nothing has read it yet.
+            #
+            # Broadcast to D rather than passed as an RTP because the operator multiplies two
+            # buffers elementwise, and a D-wide constant is 7680 B per layer against a decode step
+            # that already streams hundreds of MB. Its VALUE is per layer (0.053 at layer 0, 0.048
+            # at 47), so this cannot be one shared buffer.
+            weights[p + "ls"] = np.full(D, float(npy(sp.layer_scalar_name(l))[0]), BF16)
+            rl.append((op_lscale, nxt, p + "ls", nxt))
         cur = nxt
 
     if op_mlp_dp is not None:
@@ -1109,8 +1125,9 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
         if fuse_o:
             bufsz["mlp_a_scratch"] = D * 2   # a's own all-gather round-trip buffer, same idiom
 
-    weights["n_final"] = load_norm("model.norm.weight")
-    embed_f32 = npy("model.embed_tokens.weight")   # tied: also the host's embedding-gather table
+    weights["n_final"] = load_norm(f"{sp.weight_prefix}norm.weight")
+    # tied: also the host's embedding-gather table
+    embed_f32 = npy(f"{sp.weight_prefix}embed_tokens.weight")
     # Quantizing W_head narrows the DEVICE lm-head stream, but W_head is TIED, so the host also
     # gathers embed[token] out of it. Rather than teach the host to dequantise -- which would
     # quantise the embedding INPUT too, a second quality change for no extra speed -- the exact
