@@ -6,7 +6,7 @@
 # What this does (idempotent):
 #   1. Resolve & sanity-check the repo.
 #   2. Preflight: cargo, onnx-asr venv (import onnx_asr), XRT headers/libs.
-#   3. Build the Rust workspace (--release) -> rust/target/release/npu.
+#   3. Build the Rust workspace (--release) -> <cargo target-dir>/release/npu.
 #  3a. INSTALL that binary to ~/.local/bin/npu  <- the step whose absence used to make
 #      every "successful" install a silent no-op against a stale binary.
 #   4. Ensure model artifacts exist (generate only if missing), then PREFLIGHT the engine
@@ -82,7 +82,22 @@ LEGACY_UNITS="npu-asr.service npu-serve.service"
 # desired-state config. The binary keeps its own name; the SERVICE is the product name.
 ENGINE_BIN_DIR="${ENGINE_BIN_DIR:-$HOME/.local/bin}"
 ENGINE_BIN="$ENGINE_BIN_DIR/npu"
-BUILT_BIN="$REPO/rust/target/release/npu"
+
+# ASK cargo where it puts artifacts; do not assume $REPO/rust/target.
+#
+# A checkout that has been through scripts/setup_worktree.sh carries an untracked
+# .cargo/config.toml setting build.target-dir off the root volume, and cargo merges that with
+# rust/.cargo/config.toml. With the path hardcoded the build SUCCEEDED and the install then died
+# with "Build finished but .../rust/target/release/npu is missing/not executable" -- which reads
+# like a build failure and is not one. Worse below: SHIM_BIN only warns when it is missing, so the
+# same wrong path silently skipped the npu-weights shim, defeating the stale-binary guard that
+# step exists to be.
+#
+# grep rather than jq: jq is not a dependency of this script and need not become one.
+CARGO_TARGET_DIR_RESOLVED="$(cd "$REPO/rust" && cargo metadata --format-version 1 --no-deps 2>/dev/null \
+  | grep -o '"target_directory":"[^"]*"' | head -1 | cut -d'"' -f4)"
+[ -n "$CARGO_TARGET_DIR_RESOLVED" ] || CARGO_TARGET_DIR_RESOLVED="$REPO/rust/target"
+BUILT_BIN="$CARGO_TARGET_DIR_RESOLVED/release/npu"
 ENGINE_CONFIG="${ENGINE_CONFIG:-$HOME/.config/npu/engine.toml}"
 
 # Stable PRODUCTION root. The service must not depend on a working directory or on a git
@@ -332,7 +347,7 @@ fi  # end MODEL=gigaam artifact block
 # without this step an old npu-weights binary sits in ~/.local/bin doing the pre-fold thing
 # indefinitely, which is exactly the silent-stale-binary failure the shim exists to prevent.
 # (Observed: a July build still answering `--arena` months after that flag was renamed.)
-SHIM_BIN="$REPO/rust/target/release/npu-weights"
+SHIM_BIN="$CARGO_TARGET_DIR_RESOLVED/release/npu-weights"
 if [ -f "$SHIM_BIN" ]; then
   if [ -e "$ENGINE_BIN_DIR/npu-weights" ]; then
     info "Replacing npu-weights with the deprecation shim (tooling moved to \`npu weights\`)"
