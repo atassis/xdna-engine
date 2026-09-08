@@ -287,7 +287,7 @@ def run_time_manifest(args, registry_path):
     arm runs, and the arms are interleaved across shapes rather than grouped, so a box that drifts
     drifts across the whole set instead of across one shape.
     """
-    sys.path.insert(0, str(HERE.parent / "scripts"))
+    sys.path.insert(0, str(HERE.parent.parent / "scripts"))
     from npu_power_mode import require_pinned  # noqa: E402  -- scripts/, not this package
     mode = require_pinned()
 
