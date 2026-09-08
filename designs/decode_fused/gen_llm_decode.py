@@ -50,7 +50,12 @@ from llm_decode_spec import SPECS  # noqa: E402
 #   base, no flags              3105.99     137.90    7.25
 #   GQA_GROUPED_K+V             2166.47     100.03   10.00
 #   TMV_CTX alone               2036.18      98.50   10.15
-#   TMV_CTX + GQA_GROUPED_K     1566.42      79.13   12.64   <- the default now
+#   TMV_CTX + GQA_GROUPED_K     1566.42      79.13   12.64   <- the default then
+#
+# The 79.13 is the 2026-09-07 state and is STALE as a current rate: the configure cut and the two
+# data-parallel fusions below took it to 49.35-49.55 ms/token (bench_llm_decode.py, 25 reps, sd
+# 0.21-0.53), which is what the installed artifact measures. Kept as the row of the four-arm A/B
+# it belongs to, not as the rail's rate.
 #
 # ~1.25x over the previous best arm, and 1.20x AHEAD of AMD's own mlir-air Qwen3 example (95.2
 # ms/token on this box), which we were 1.44x behind on 2026-09-05. Correctness: 8/8 vs the bf16
@@ -792,14 +797,27 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
             ref_q, ref_k, ref_v = p + "q", p + "k", p + "v"
             qhb, qho, khb, kho = p + "q", 0, p + "k", 0
             bufsz.update({p + "q": QD * 2, p + "k": KVD * 2, p + "v": KVD * 2})
+        # kr/vr/vt are the GQA-broadcast and V-transpose intermediates, and each exists ONLY in the
+        # arm whose op writes it. Declaring them unconditionally allocated them anyway: an entry in
+        # `buffer_sizes` that no runlist op references still lands in the scratch arena, because
+        # calculate_buffer_layout appends every explicit buffer not already placed
+        # (iron/common/sequence.py, the `explicit_buf not in scratch_args` branch). At the shipped
+        # defaults (GROUPED_K=1, TMV_CTX=1) all three are dead, and at Hq*S*HD*2 = 8 MiB each over
+        # 28 layers that is 672 MiB of arena that nothing reads -- 33.8% of the 1.99 GiB scratch,
+        # and it reconciles exactly: 1.9898 GiB total minus 1.32904 GiB of named buffers = 0.661.
         bufsz.update({
             p + "kc": Hkv * S * HD * 2, p + "vc": Hkv * S * HD * 2,
-            p + "kr": Hq * S * HD * 2, p + "vr": Hq * S * HD * 2, p + "vt": Hq * S * HD * 2,
             p + "sc": Hq * S * 2, p + "sw": Hq * S * 2,
             p + "cx": QD * 2,
             p + "g": FF * 2, p + "u": FF * 2, p + "gh": FF * 2, p + "d": D * 2,
             p + "hn": D * 2, p + "hf": D * 2,
         })
+        if not GROUPED_K:
+            bufsz[p + "kr"] = Hq * S * HD * 2
+        if not (GROUPED_V or TMV_CTX):
+            bufsz[p + "vr"] = Hq * S * HD * 2
+        if not TMV_CTX:
+            bufsz[p + "vt"] = Hq * S * HD * 2
         # `a` is purely internal to op_mlp_dp's own fuse_o path (never an L3 buffer -- see
         # design.py) once folded; only declare it when something outside that design still reads
         # or writes it.

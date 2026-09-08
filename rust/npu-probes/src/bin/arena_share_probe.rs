@@ -247,6 +247,14 @@ fn main() {
     let _ = step(&meta, &arena, &res2, &embed, t0, 0, d_model, head_dim, theta);
     let bb = step(&meta, &arena, &res2, &embed, t1, 1, d_model, head_dim, theta);
 
+    // Optional: dump the AA logits so two artifacts built from different generator states can be
+    // compared bitwise. This is the token-identity gate for any change that alters the ELF without
+    // intending to alter the arithmetic.
+    if let Ok(path) = std::env::var("DUMP_LOGITS") {
+        std::fs::write(&path, &aa).unwrap_or_else(|e| panic!("write {path}: {e}"));
+        println!("  dumped AA logits ({} bytes) to {path}", aa.len());
+    }
+
     let (ia, va) = argmax_bf16(&aa);
     let (ib, vb) = argmax_bf16(&ab);
     let (ic, vc) = argmax_bf16(&bb);
