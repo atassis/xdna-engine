@@ -240,6 +240,11 @@ MLP_TILE_ROWS = int(os.environ.get("MLP_TILE_ROWS", "0"))
 # times instead of once. FORCE_K_SPLIT exists to price exactly that on a shape that does not need
 # the split, by building it both ways.
 FORCE_K_SPLIT = int(os.environ.get("FORCE_K_SPLIT", "0"))
+# Same axis for the attention output projection. Gemma-4's GLOBAL layers have head_dim 512, so
+# o_proj is K=8192 there and needs 2 chunks while its sliding layers at K=4096 need none -- a
+# PER-LAYER split, which this per-spec version does not yet express (it needs q_dim_for(layer),
+# a Gemma-4 spec axis). What is here covers every spec whose q_dim is uniform.
+FORCE_O_SPLIT = int(os.environ.get("FORCE_O_SPLIT", "0"))
 
 
 def packed_zero_rows(n_rows, K, group_size, weight_dtype):
@@ -590,7 +595,10 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
     op_qkv = gemv(QD + 2 * KVD, D, ctx) if FUSE_QKV_GEMV else None
     op_q = gemv(QD, D, ctx)
     op_kv = gemv(KVD, D, ctx)
-    op_o = None if fuse_o else gemv(D, QD, ctx, **attn_quant_kw)
+    # o_proj, split over K on the same terms as the down projection. Under fuse_o there is no
+    # standalone op_o at all -- Wo rides the MLP design's weight channel -- so the split is moot.
+    o_chunks = 1 if fuse_o else (FORCE_O_SPLIT or k_chunks_for(D, QD, COLS))
+    op_o = None if fuse_o else gemv(D, QD // o_chunks, ctx, **attn_quant_kw)
     # RoPE over q and k together (24 head rows) needs them adjacent, which only the fused qkv
     # buffer gives; angle_rows=1 is unchanged, so every row still reads the same single angle row.
     fuse_rope = FUSE_QKV_GEMV and FUSE_ROPE_QK
@@ -735,31 +743,41 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
         op_down = gemv(D, FF, ctx, **mlp_quant_kw)
     op_add = ElementwiseAdd(size=D, tile_size=D // COLS, num_aie_columns=COLS, context=ctx)
 
-    def down_runlist(p):
-        """The down projection: one GEMV, or `down_chunks` partial GEMVs plus a summation tree.
+    def split_over_k(op, w, xin, out, n, k_elems, tag):
+        """A reduction over K as one GEMV, or as `n` partial GEMVs plus a summation tree.
 
-        Chunk i reads `gh[i*CW:(i+1)*CW]` -- a BYTE slice of the buffer that already holds the FFN
-        activation, so the split moves no data and adds no buffer on the input side. Partials are
-        folded PAIRWISE, not linearly: mv.cc rounds its f32 accumulator to bf16 once per partial,
-        and a pairwise fold makes the rounding depth log2(n) instead of n-1.
+        Chunk i reads `xin[i*CW:(i+1)*CW]` -- a BYTE slice of the buffer that already holds the
+        input, so the split moves no data and adds no buffer on the input side. Partials fold
+        PAIRWISE, not linearly: mv.cc rounds its f32 accumulator to bf16 once per partial, so a
+        pairwise fold makes the rounding depth log2(n) instead of n-1.
+
+        Used by BOTH the down projection and o_proj. One helper rather than two, because the
+        weight-naming it implies (`<w>k<i>`) has to match what the weight loop writes, and two
+        copies of a naming scheme is the seam this file has already paid for.
         """
-        if down_chunks == 1:
-            return [(op_down, p + "Wd", p + "gh", p + "d")]
-        cw = (FF // down_chunks) * 2                     # chunk width in BYTES, the slice unit
-        steps = [(op_down, f"{p}Wdk{i}", f"{p}gh[{i * cw}:{(i + 1) * cw}]", f"{p}dp{i}")
-                 for i in range(down_chunks)]
-        level, r = [f"{p}dp{i}" for i in range(down_chunks)], 0
+        if n == 1:
+            return [(op, w, xin, out)]
+        cw = (k_elems // n) * 2                          # chunk width in BYTES, the slice unit
+        steps = [(op, f"{w}k{i}", f"{xin}[{i * cw}:{(i + 1) * cw}]", f"{tag}p{i}")
+                 for i in range(n)]
+        level, r = [f"{tag}p{i}" for i in range(n)], 0
         while len(level) > 1:
             nxt = []
             for i in range(0, len(level) - 1, 2):
-                # the final add writes `d`, so everything downstream is untouched by the split
-                out = (p + "d") if len(level) == 2 else f"{p}ds{r}_{i // 2}"
-                steps.append((op_add, level[i], level[i + 1], out))
-                nxt.append(out)
+                # the final add writes `out`, so everything downstream is untouched by the split
+                o = out if len(level) == 2 else f"{tag}s{r}_{i // 2}"
+                steps.append((op_add, level[i], level[i + 1], o))
+                nxt.append(o)
             if len(level) % 2:
                 nxt.append(level[-1])
             level, r = nxt, r + 1
         return steps
+
+    def down_runlist(p):
+        return split_over_k(op_down, p + "Wd", p + "gh", p + "d", down_chunks, FF, p + "d")
+
+    def o_runlist(p):
+        return split_over_k(op_o, p + "Wo", p + "cx", p + "a", o_chunks, QD, p + "a")
     # W_head weight-stream dtype axis (see QUANT_HEAD_DTYPE above -- READ THE TIED-EMBEDDING NOTE
     # before turning this on).
     head_quant_kw = (dict(weight_dtype=QUANT_HEAD_DTYPE, group_size=QUANT_HEAD_GROUP)
@@ -787,21 +805,22 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
                             ("Wv", "self_attn.v_proj"), ("Wo", "self_attn.o_proj"),
                             ("Wg", "mlp.gate_proj"), ("Wu", "mlp.up_proj"), ("Wd", "mlp.down_proj")):
             hf = f"model.layers.{l}.{tensor}.weight"
-            if key == "Wd" and down_chunks > 1:
+            if {"Wd": down_chunks, "Wo": o_chunks}.get(key, 1) > 1:
                 # Each chunk is its own contiguous tensor. A pre-chunked dump names them
                 # `<tensor>.kchunkN` and we take those bytes as-is; otherwise the split happens
                 # here, along K, BEFORE quantizing -- so each chunk carries its own per-group
                 # scales, exactly as the kernel reads it. Splitting AFTER packing would cut
                 # through a group.
-                chunk_hf = [f"{hf}.kchunk{i}" for i in range(down_chunks)]
+                nch = {"Wd": down_chunks, "Wo": o_chunks}[key]
+                chunk_hf = [f"{hf}.kchunk{i}" for i in range(nch)]
                 if all(n in PACKED for n in chunk_hf):
                     for i, n in enumerate(chunk_hf):
-                        weights[f"{p}Wdk{i}"] = np.asarray(npy_raw(n))
+                        weights[f"{p}{key}k{i}"] = np.asarray(npy_raw(n))
                 else:
                     wd = npy(hf)
-                    for i, part in enumerate(np.split(wd, down_chunks, axis=1)):
+                    for i, part in enumerate(np.split(wd, nch, axis=1)):
                         part = np.ascontiguousarray(part)
-                        weights[f"{p}Wdk{i}"] = (
+                        weights[f"{p}{key}k{i}"] = (
                             quantize_weight(part, QUANT_MLP_GROUP, QUANT_MLP_DTYPE)
                             if QUANT_MLP_DTYPE != "bf16" else bf16(part).reshape(-1))
                 continue
@@ -888,6 +907,8 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
             # down_runlist so the two cannot drift apart
             **({} if down_chunks == 1 else
                {step[-1]: D * 2 for step in down_runlist(p)}),
+            **({} if (fuse_o or o_chunks == 1) else
+               {step[-1]: D * 2 for step in o_runlist(p)}),
             p + "hn": D * 2, p + "hf": D * 2,
         })
         # `a` is purely internal to op_mlp_dp's own fuse_o path (never an L3 buffer -- see
@@ -936,7 +957,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
             (op_softmax, p + "sc", p + "sw"),
             *([] if TMV_CTX else [(op_trv, p + ("vc" if GROUPED_V else "vr"), p + "vt")]),
             (op_ctx, p + ("vc" if TMV_CTX else "vt"), p + "sw", p + "cx"),
-            *([] if fuse_o else [(op_o, p + "Wo", p + "cx", p + "a")]),
+            *([] if fuse_o else o_runlist(p)),
         ]
         if sp.sandwich_norms:
             rl.append((op_norm, p + "a", p + "n_pa", p + "a"))
