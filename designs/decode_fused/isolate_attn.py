@@ -20,6 +20,7 @@ import ml_dtypes
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import newstack_compat  # noqa: F401,E402
+import gen_llm_decode as G  # noqa: E402
 from gen_llm_decode import build_graph  # noqa: E402
 
 BF16 = ml_dtypes.bfloat16
@@ -52,6 +53,13 @@ def main():
     params = c.params
     for n, arr in weights.items():
         np.copyto(c.get_buffer(n).data, np.asarray(arr, BF16).reshape(-1))
+    # Flush the scratch arena to the device after the weight load, exactly as verify_llm_decode.py
+    # does. Its comment records why: WITHOUT this both arms are nondeterministic, the TMV arm first
+    # diverging at L0_q and the kv arm at L0_kr. This harness never had it, and that is what made it
+    # report different scores rel-L2 on identical inputs (8.93e-02 and 1.55e-01 across two runs) --
+    # numbers that read as a kernel defect and are the harness reading unflushed memory.
+    c.scratch_buffer.device = "cpu"
+    c.scratch_buffer.to("npu")
 
     def npy(n):
         return np.load(os.path.join(a.weights, f"{n}.npy")).astype(np.float32)
@@ -63,6 +71,35 @@ def main():
     def dev(n):
         return np.asarray(c.get_buffer(n).data, np.float32)
 
+    QD, KVD = Hq * HD, Hkv * HD
+
+    def qkv_now():
+        """This position's (k, v, q), whichever arm built the graph.
+
+        Three arms exist and this harness only ever handled the third:
+          * FUSE_QKV_DP -- the fused head appends k and v to the caches itself, so neither is ever
+            an L3 buffer and only `q` survives. Per-position k/v are NOT OBSERVABLE there.
+          * FUSE_QKV_GEMV -- one `qkv` buffer with q|k|v as byte slices, which is the arm the
+            engine ships by default.
+          * neither -- three separate buffers.
+        Reading `<L>_k` unconditionally made the harness die with KeyError on the first two, i.e.
+        it could not isolate the configuration we actually run.
+        """
+        try:
+            b = dev(pf + "qkv")
+        except KeyError:
+            pass
+        else:
+            return b[QD:QD + KVD].copy(), b[QD + KVD:QD + 2 * KVD].copy(), b[:QD].copy()
+        try:
+            return dev(pf + "k").copy(), dev(pf + "v").copy(), dev(pf + "q").copy()
+        except KeyError:
+            raise SystemExit(
+                f"{pf}k / {pf}qkv are both absent: the fused QKV head (FUSE_QKV_DP) appends k and "
+                f"v to the caches inside the design, so per-position k/v are not observable as "
+                f"buffers. Re-run with FUSE_QKV_DP=0 to isolate them, or read them out of "
+                f"{pf}kc / {pf}vc, which this harness already does below.")
+
     kv_hist = []
     for pos, tok in enumerate(toks):
         np.copyto(c.get_buffer("x").data, np.asarray(embed[tok], BF16).reshape(-1))
@@ -73,8 +110,17 @@ def main():
         params.write("kv_off", int(pos * HD))
         params.write("sm_mask", int(pos + 1))
         params.sync()
+        # TWO dispatches, first discarded. On this rail the FIRST dispatch after a host input write
+        # computes on the PREVIOUS input (journal
+        # docs/kb/first-dispatch-after-a-host-input-write-computes-on-the-previous-input.md), so a
+        # one-dispatch capture records position p-1's k/v under position p. The KV append is
+        # idempotent here -- kv_off is unchanged between the two -- so the second write lands on the
+        # same row with the same value. Everything this harness reads AFTER the loop (the caches,
+        # the softmax row sum, the context) was already settled and unaffected; it is the
+        # per-position captures that moved between identical runs.
         c()
-        kv_hist.append((dev(pf + "k").copy(), dev(pf + "v").copy(), dev(pf + "q").copy()))
+        c()
+        kv_hist.append(qkv_now())
 
     P = len(toks) - 1                       # the last position dispatched
     kc = dev(pf + "kc").reshape(Hkv, S, HD)
@@ -114,7 +160,13 @@ def main():
             print(f"     head {h:2}: vs kc[h//{grp}] {ei:.4e}   vs kc[h%{Hkv}] {em:.4e}  {better}")
 
     print("\n3. SCORES + SOFTMAX (sm_mask width) -- valid width is P+1 = %d" % (P + 1))
-    scale = sp.attn_scale
+    # SCALE_IN_QNORM (the default) folds attn_scale into the q-norm GAIN, so the `q` this harness
+    # reads back off the device already carries it. Multiplying by sp.attn_scale here as well
+    # applied it TWICE and made the reference `scale` times the device output -- which is exactly
+    # the rel-L2 that was being reported: (1 - 0.088388) / 0.088388 = 10.31, against an observed
+    # 1.0336e+01. The scores were never wrong; the reference was. Mirrors the generator's own
+    # `scale_in_qnorm = SCALE_IN_QNORM and sp.qk_norm`.
+    scale = 1.0 if (G.SCALE_IN_QNORM and sp.qk_norm) else sp.attn_scale
     ref_sc = np.stack([kc[h // grp, :P + 1, :] @ q[h] * scale for h in range(Hq)])
     print(f"   scores[:, :{P+1}]      {rel(ref_sc, sc[:, :P + 1]):.4e}")
     e = np.exp(ref_sc - ref_sc.max(-1, keepdims=True))
