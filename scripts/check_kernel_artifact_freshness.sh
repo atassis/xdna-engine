@@ -54,6 +54,19 @@ DIRS=(
 # NOT covered here: the artifacts/relpos.<variant> and artifacts/conveyor_bd_io siblings -- A/B
 # experiment dirs with no producer script found in scripts/*.sh (orphaned or built ad hoc); adding
 # them needs an owner decision on which are still live, not a mechanical extension of this list.
+# LLM DECODE artifacts. A DIFFERENT stamp convention, which is why they were missed: the fused
+# decode build writes {"toolchain":{"hash":...}} INTO meta.json and emits decode.elf, so neither
+# the .toolchain-stamp file nor the final*.xclbin that check_one looks for is ever present.
+# Added 2026-09-09 after a re-pin left `npu generate` refusing to load ("toolchain-stale: built
+# against c4fb9caa28b9") while this script reported every dir it knew about as fresh -- the gate
+# said green because the artifact was outside its list, not because it was current. Discovered by
+# the owner running the command, which is the cheapest possible detector and the wrong one to
+# depend on. artifacts/gemma4-12b/decode is deliberately absent: it has no meta.json, so it
+# predates the convention and adding it would report UNSTAMPED forever with no producer to fix it.
+ELF_DIRS=(
+  "$REPO/artifacts/qwen3-0.6b/decode|scripts/build_llm_decode.sh qwen3-0.6b"
+)
+
 FAMILY_DIRS=(
   "$REPO/artifacts/relpos|scripts/relpos_prebuild.sh"
   "$REPO/artifacts/conveyor|scripts/conveyor_prebuild.sh"
@@ -69,6 +82,37 @@ fail=0
 # by both DIRS (dir IS the artifact) and FAMILY_DIRS (dir is one subdir of a family). Sets `fail=1`
 # on anything but OK; never exits itself, so a family root's later subdirs still get checked and
 # reported even after an earlier subdir's warning.
+# check_elf_one <dir> <regen> -- same five verdicts as check_one, against the meta.json convention.
+check_elf_one() {
+  local dir="$1" regen="$2"
+  local rel="${dir#"$REPO"/}"
+
+  if [ ! -d "$dir" ]; then
+    echo "[check_kernel_artifact_freshness] MISSING   $rel does not exist -- rebuild with $regen" >&2
+    fail=1; return
+  fi
+  local meta="$dir/meta.json"
+  if [ ! -f "$meta" ]; then
+    echo "[check_kernel_artifact_freshness] UNSTAMPED $rel has no meta.json -- freshness against toolchain.lock is unknown; rebuild with $regen" >&2
+    fail=1; return
+  fi
+  local stamp
+  stamp="$(python3 -c 'import json,sys;print((json.load(open(sys.argv[1])).get("toolchain") or {}).get("hash",""))' "$meta" 2>/dev/null)"
+  if [ -z "$stamp" ]; then
+    echo "[check_kernel_artifact_freshness] UNSTAMPED $rel meta.json carries no toolchain.hash -- rebuild with $regen" >&2
+    fail=1; return
+  fi
+  if [ "$stamp" != "$current" ]; then
+    echo "[check_kernel_artifact_freshness] STALE     $rel was built for toolchain.lock=$stamp, but toolchain.lock is now $current -- it was re-pinned and this dir was never rebuilt; rebuild with $regen" >&2
+    fail=1; return
+  fi
+  if [ ! -s "$dir/decode.elf" ]; then
+    echo "[check_kernel_artifact_freshness] EMPTY     $rel is stamped current ($current) but holds no decode.elf; rebuild with $regen" >&2
+    fail=1; return
+  fi
+  echo "[check_kernel_artifact_freshness] OK        $rel (toolchain.lock=$current)"
+}
+
 check_one() {
   local dir="$1" regen="$2"
   local rel="${dir#"$REPO"/}"
@@ -121,6 +165,10 @@ for entry in "${FAMILY_DIRS[@]}"; do
     echo "[check_kernel_artifact_freshness] MISSING   $rel_root exists but holds no final*.xclbin anywhere under it -- rebuild with $regen" >&2
     fail=1
   fi
+done
+
+for row in "${ELF_DIRS[@]}"; do
+  check_elf_one "${row%%|*}" "${row#*|}"
 done
 
 if [ "$fail" -ne 0 ]; then

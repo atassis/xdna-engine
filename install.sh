@@ -312,6 +312,16 @@ bash "$REPO/scripts/publish_kernels.sh" "$ENGINE_KERNELS" "$ENGINE_MLIR_AIE" \
   never rebuilt after a re-pin; scripts/check_kernel_artifact_freshness.sh names every stale one."
 ok "Kernels published (pin $(cat "$ENGINE_KERNELS/.toolchain-stamp" 2>/dev/null || echo unknown))"
 
+# ---- Stage toolchain.lock BESIDE the kernels it describes ----
+# The engine resolves its root from XDNA_ENGINE_ROOT / XDG data home and reads toolchain.lock THERE
+# (npu-asr/src/kernel_registry.rs::current_toolchain_hash), then compares it against each published
+# dir's .toolchain-stamp. Publishing kernels without the lock leaves the two halves from different
+# pins: measured 2026-09-09, a fresh install shipped kernels stamped b5e36d432d81 next to a lock left
+# over from the previous pin (c4fb9caa28b9), so the service refused to start with "resident encoder
+# artifacts stale" -- naming the artifacts, which were the correct half. Copy them together.
+install -m 0644 "$REPO/toolchain.lock" "$ENGINE_ROOT/toolchain.lock"
+ok "Staged toolchain.lock (pin $(sed -e 's/[[:space:]]*#.*$//' -e '/^[[:space:]]*$/d' "$ENGINE_ROOT/toolchain.lock" | sha256sum | cut -c1-12))"
+
 # ---- Parakeet artifacts (MODEL=parakeet) ----
 if [ "$MODEL" = parakeet ]; then
   PK="$ENGINE_ARTIFACTS/parakeet"

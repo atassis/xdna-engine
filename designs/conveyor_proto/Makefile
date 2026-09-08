@@ -25,7 +25,16 @@ endif
 .PHONY: all
 all: build/final.xclbin
 
-build/%.cc.o: %.cc
+# The two kernels are tracked in aie_kernels/<kebab>/<snake>.cc and sync_kernels.sh lays them
+# into the sandbox's shared aie2p kernel dir, like every other design's kernels. They used to sit
+# beside this Makefile, which is why the rule read `%.cc` from the current directory.
+# (NOT ${lib_kernels_dir}: that is defined by whole_array_fused/design_override.mk for its own
+# tree, not by makefile-common, so it expands empty here.)
+kernels_aie2p := ${srcdir}/../../../aie_kernels/aie2p
+build/conveyor_attn.cc.o:  ${kernels_aie2p}/conveyor_attn.cc
+build/conveyor_stage.cc.o: ${kernels_aie2p}/conveyor_stage.cc
+
+build/%.cc.o:
 	mkdir -p ${@D}
 ifeq ($(devicename),npu2)
 	${PEANO_INSTALL_DIR}/bin/clang++ ${PEANOWRAP2P_FLAGS} ${KFLAGS} -c $< -o $@
