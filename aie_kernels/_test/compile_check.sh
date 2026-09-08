@@ -16,7 +16,7 @@
 # is what actually broke sin and rope_lut. Device gate still decides.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO="$(cd "$HERE/../../.." && pwd)"
+REPO="$(cd "$HERE/../.." && pwd)"
 
 INST="$("$REPO/scripts/toolchain_up.sh")"
 [ -n "$INST" ] || { echo "compile_check: empty instance dir from toolchain_up.sh" >&2; exit 1; }
