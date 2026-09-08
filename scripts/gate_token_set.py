@@ -81,6 +81,22 @@ def main():
         print(f"[tier2] NOTE device produced {len(npu['gen_ids'])} tokens against the reference's "
               f"{len(ref['gen_ids'])}; judging the {n} they share")
 
+    # The teacher-forced pass, when the device file carries one. STRICTLY MORE INFORMATIVE than the
+    # rule below and reported first: the free-running rule judges exactly ONE step (the first
+    # divergence), because after it the two runs are on different trajectories. Teacher-forcing puts
+    # the device on the reference's trajectory at every step, so all N are independently comparable.
+    # Reported, not gated on -- the adopted rule is the free-running one, and changing which rule
+    # BLOCKS is a decision, not a refactor.
+    tf = npu.get("teacher_forced_topk_ids") or []
+    if tf:
+        n_tf = min(len(tf), len(ref["gen_ids"]))
+        hits = [i for i in range(n_tf) if ref["gen_ids"][i] in list(tf[i])[:k]]
+        top1 = sum(1 for i in range(n_tf) if tf[i] and tf[i][0] == ref["gen_ids"][i])
+        misses = [i for i in range(n_tf) if i not in hits]
+        print(f"[tier2] teacher-forced: reference token in device top-{k} at "
+              f"{len(hits)}/{n_tf} steps (top-1 at {top1}/{n_tf})"
+              + (f"; MISSES at steps {misses}" if misses else ""))
+
     ok, verdict, first = judge(ref, npu, k)
     print(f"[tier2] reference : {ref.get('backend', '?')}")
     print(f"[tier2] device    : {npu.get('backend', 'npu')}")
