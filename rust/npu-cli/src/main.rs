@@ -3,8 +3,10 @@
 use std::io::{BufRead, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 
 mod cli_def;
+mod exit;
 mod media;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -12,6 +14,7 @@ use clap::{CommandFactory, Parser};
 
 use cli_def::{Cli, Cmd, ConfigCmd, OutFormat, SamplingArgs, WeightsCmd};
 use clap_complete::Shell;
+use exit::{engine_error, Code, Tagged};
 use npu_runtime::actor::{start, start_lazy};
 use npu_engine::capability::Capability;
 use npu_runtime::config::{Config, EvictPolicy};
@@ -26,27 +29,40 @@ fn config_path(cli: &Cli) -> PathBuf {
     PathBuf::from(home).join(".config/npu/engine.toml")
 }
 
-fn main() -> Result<()> {
+/// The one place an error becomes a process exit code (`exit::of`) -- see `exit.rs`. Printing
+/// stays exactly what `Result<(), E: Debug>`'s stdlib `Termination` impl already did (`Error:
+/// {e:?}`, the anyhow chain with "Caused by:"); only the exit status is new.
+fn main() -> ExitCode {
     let cli = Cli::parse();
     let path = config_path(&cli);
+    match run(&cli, &path) {
+        Ok(()) => ExitCode::from(Code::Success as u8),
+        Err(e) => {
+            eprintln!("Error: {e:?}");
+            ExitCode::from(exit::of(&e) as u8)
+        }
+    }
+}
+
+fn run(cli: &Cli, path: &Path) -> Result<()> {
     match &cli.cmd {
-        Cmd::Serve { port, allow_degraded } => serve(&path, *port, *allow_degraded),
-        Cmd::Transcribe { input, model } => transcribe(&path, input, model.as_deref()),
+        Cmd::Serve { port, allow_degraded } => serve(path, *port, *allow_degraded),
+        Cmd::Transcribe { input, model } => transcribe(path, input, model.as_deref()),
         Cmd::Generate { prompt, model, sampling, no_stream, raw } =>
-            generate(&path, prompt, model.as_deref(), sampling, *no_stream, *raw),
-        Cmd::Chat { model, sampling, no_stream } => chat(&path, model.as_deref(), sampling, *no_stream),
-        Cmd::Embed { text, model } => embed(&path, text, model.as_deref()),
-        Cmd::Diarize { wav, model, json } => diarize(&path, wav, model.as_deref(), *json),
+            generate(path, prompt, model.as_deref(), sampling, *no_stream, *raw),
+        Cmd::Chat { model, sampling, no_stream } => chat(path, model.as_deref(), sampling, *no_stream),
+        Cmd::Embed { text, model } => embed(path, text, model.as_deref()),
+        Cmd::Diarize { wav, model, json } => diarize(path, wav, model.as_deref(), *json),
         Cmd::TranscribeMedia { input, out, format, asr, diarize: diar, track, no_diarize } =>
-            transcribe_media(&path, input, out.as_deref(), *format, asr.as_deref(),
+            transcribe_media(path, input, out.as_deref(), *format, asr.as_deref(),
                              diar.as_deref(), *track, *no_diarize),
-        Cmd::Models { json, port } => models(&path, *json, *port),
-        Cmd::Reload { port } => reload(&path, *port),
-        Cmd::Load { model, port } => load_model(&path, model, *port),
-        Cmd::Unload { model, port } => unload_model(&path, model, *port),
-        Cmd::Bake { name } => bake(&path, name),
-        Cmd::Config { action } => config_cmd(&path, action),
-        Cmd::Weights { action } => weights_cmd(&path, action),
+        Cmd::Models { json, port } => models(path, *json, *port),
+        Cmd::Reload { port } => reload(path, *port),
+        Cmd::Load { model, port } => load_model(path, model, *port),
+        Cmd::Unload { model, port } => unload_model(path, model, *port),
+        Cmd::Bake { name } => bake(path, name),
+        Cmd::Config { action } => config_cmd(path, action),
+        Cmd::Weights { action } => weights_cmd(path, action),
         Cmd::Completions { shell } => {
             let mut cmd = Cli::command();
             let name = cmd.get_name().to_string();
@@ -155,7 +171,9 @@ fn preflight_serve(port: u16) -> Result<()> {
         return if npu_engine::Engine::available() {
             Ok(())
         } else {
-            bail!("no XDNA2 NPU device at /dev/accel/accel0 (is the amdxdna driver loaded?)")
+            Err(Tagged(Code::Device,
+                "no XDNA2 NPU device at /dev/accel/accel0 (is the amdxdna driver loaded?)".into())
+                .into())
         };
     }
     // Something is listening. Ask it who it is rather than assuming.
@@ -205,7 +223,8 @@ fn serve(path: &Path, port: Option<u16>, allow_degraded: bool) -> Result<()> {
     preflight_serve(port)?;
     let root = root(&cfg, path)?;
     preflight_artifacts(&cfg, &root)?;
-    let (handle, _join) = start(cfg, Box::new(EngineLoader { root }))?;
+    let (handle, _join) = start(cfg, Box::new(EngineLoader { root }))
+        .map_err(|e| Tagged(engine_error(&e), e.to_string()))?;
     // Do not bind a port the service cannot serve from. The initial reconcile records a load
     // failure as `Failed` rather than panicking, so before this the socket came up and every
     // request answered "actor dropped reply" while systemd showed active -- how a 5-day outage
@@ -234,8 +253,10 @@ fn transcribe(path: &Path, input: &Path, model: Option<&str>) -> Result<()> {
     // not after a multi-second model load.
     let samples = npu_runtime::media::decode_file(input).map_err(|e| anyhow!(e))?;
     // Lazy: a one-shot run should load the model it serves, and nothing else.
-    let (handle, join) = start_lazy(cfg, Box::new(EngineLoader { root }))?;
-    let out = handle.transcribe(model, samples, 16_000).map_err(|e| anyhow!(e.to_string()));
+    let (handle, join) = start_lazy(cfg, Box::new(EngineLoader { root }))
+        .map_err(|e| Tagged(engine_error(&e), e.to_string()))?;
+    let out = handle.transcribe(model, samples, 16_000)
+        .map_err(|e| Tagged(engine_error(&e), e.to_string()));
     handle.shutdown(); let _ = join.join();
     println!("{}", out?.value);
     Ok(())
@@ -300,7 +321,8 @@ fn generate(path: &Path, prompt: &str, model: Option<&str>, sampling: &SamplingA
     quiet_one_shot();
     let cfg = load_cfg(path)?;
     let root = root(&cfg, path)?;
-    let (handle, join) = start_lazy(cfg, Box::new(EngineLoader { root }))?;
+    let (handle, join) = start_lazy(cfg, Box::new(EngineLoader { root }))
+        .map_err(|e| Tagged(engine_error(&e), e.to_string()))?;
     let params = build_params(sampling);
     let prompt = if raw {
         npu_engine::Prompt::Raw(prompt.to_string())
@@ -314,10 +336,12 @@ fn generate(path: &Path, prompt: &str, model: Option<&str>, sampling: &SamplingA
         .map_err(|e| {
             // A base LM with no chat template is a legitimate case; name the flag rather than
             // silently answering a different request than the one that was sent.
-            let e = e.to_string();
-            if e.contains("chat_template") {
-                anyhow!("{e}\n  this model has no chat template -- use `npu generate --raw`")
-            } else { anyhow!(e) }
+            let code = engine_error(&e);
+            let msg = e.to_string();
+            let tagged = if msg.contains("chat_template") {
+                Tagged(code, format!("{msg}\n  this model has no chat template -- use `npu generate --raw`"))
+            } else { Tagged(code, msg) };
+            anyhow::Error::from(tagged)
         })
         .and_then(|served| drain_generation(served.value, !no_stream));
     handle.shutdown(); let _ = join.join();
@@ -331,7 +355,8 @@ fn chat(path: &Path, model: Option<&str>, sampling: &SamplingArgs, no_stream: bo
     quiet_one_shot();
     let cfg = load_cfg(path)?;
     let root = root(&cfg, path)?;
-    let (handle, join) = start_lazy(cfg, Box::new(EngineLoader { root }))?;
+    let (handle, join) = start_lazy(cfg, Box::new(EngineLoader { root }))
+        .map_err(|e| Tagged(engine_error(&e), e.to_string()))?;
     let params = build_params(sampling);
     let mut history: Vec<npu_engine::ChatMessage> = Vec::new();
     let stdin = std::io::stdin();
@@ -344,7 +369,7 @@ fn chat(path: &Path, model: Option<&str>, sampling: &SamplingArgs, no_stream: bo
             if line.is_empty() { continue; }
             history.push(npu_engine::ChatMessage { role: "user".into(), content: line.to_string() });
             let served = handle.generate(model, npu_engine::Prompt::Chat(history.clone()), params.clone())
-                .map_err(|e| anyhow!(e.to_string()))?;
+                .map_err(|e| Tagged(engine_error(&e), e.to_string()))?;
             let reply = drain_generation(served.value, !no_stream)?;
             if no_stream { print!("{reply}"); }
             println!();
@@ -391,7 +416,8 @@ fn transcribe_media(path: &Path, input: &Path, out: Option<&Path>, format: OutFo
 
     // One actor for the whole run: the models stay resident across tracks and segments instead of
     // reloading per call. `max_resident` must be >= 2 for asr + diarize to coexist.
-    let (handle, join) = start_lazy(cfg, Box::new(EngineLoader { root }))?;
+    let (handle, join) = start_lazy(cfg, Box::new(EngineLoader { root }))
+        .map_err(|e| Tagged(engine_error(&e), e.to_string()))?;
     let tmp = std::env::temp_dir().join(format!("npu-media-{}", std::process::id()));
     std::fs::create_dir_all(&tmp).context("temp dir")?;
 
@@ -410,7 +436,7 @@ fn transcribe_media(path: &Path, input: &Path, out: Option<&Path>, format: OutFo
                 vec![(0.0, pcm.len() as f32 / 16_000.0, 0)]
             } else {
                 handle.diarize(diar, pcm.clone(), 16_000)
-                    .map_err(|e| anyhow!("diarize track {}: {e}", t.ord))?
+                    .map_err(|e| Tagged(engine_error(&e), format!("diarize track {}: {e}", t.ord)))?
                     .value.iter().map(|s| (s.start_s, s.end_s, s.speaker)).collect()
             };
             let n_spk = spans.iter().map(|s| s.2).collect::<std::collections::BTreeSet<_>>().len();
@@ -431,7 +457,8 @@ fn transcribe_media(path: &Path, input: &Path, out: Option<&Path>, format: OutFo
                 let slice = pcm[a.min(pcm.len())..b.min(pcm.len())].to_vec();
                 if slice.is_empty() { continue }
                 let text = handle.transcribe(asr, slice, 16_000)
-                    .map_err(|e| anyhow!("transcribe {label} [{start_s:.2}-{end_s:.2}]: {e}"))?
+                    .map_err(|e| Tagged(engine_error(&e),
+                        format!("transcribe {label} [{start_s:.2}-{end_s:.2}]: {e}")))?
                     .value.trim().to_string();
                 if text.is_empty() { continue }
                 utts.push(media::Utterance {
@@ -465,11 +492,13 @@ fn diarize(path: &Path, wav: &Path, model: Option<&str>, json: bool) -> Result<(
     let cfg = load_cfg(path)?;
     let root = root(&cfg, path)?;
     // Lazy, same reason as `transcribe`: a one-shot run loads the model it serves and nothing else.
-    let (handle, join) = start_lazy(cfg, Box::new(EngineLoader { root }))?;
+    let (handle, join) = start_lazy(cfg, Box::new(EngineLoader { root }))
+        .map_err(|e| Tagged(engine_error(&e), e.to_string()))?;
     let bytes = std::fs::read(wav).with_context(|| format!("read {}", wav.display()))?;
     let samples = http::parse::parse_wav_i16(&bytes)
         .ok_or_else(|| anyhow!("bad wav (need 16k mono 16-bit)"))?;
-    let out = handle.diarize(model, samples, 16_000).map_err(|e| anyhow!(e.to_string()));
+    let out = handle.diarize(model, samples, 16_000)
+        .map_err(|e| Tagged(engine_error(&e), e.to_string()));
     handle.shutdown(); let _ = join.join();
     println!("{}", render_segments(&out?.value, json));
     Ok(())
@@ -496,8 +525,9 @@ fn embed(path: &Path, text: &str, model: Option<&str>) -> Result<()> {
     let root = root(&cfg, path)?;
     // Lazy: `npu embed` against an ASR-only config used to pay a full parakeet load before it could
     // say there was no embed model at all.
-    let (handle, join) = start_lazy(cfg, Box::new(EngineLoader { root }))?;
-    let out = handle.embed(model, text).map_err(|e| anyhow!(e.to_string()));
+    let (handle, join) = start_lazy(cfg, Box::new(EngineLoader { root }))
+        .map_err(|e| Tagged(engine_error(&e), e.to_string()))?;
+    let out = handle.embed(model, text).map_err(|e| Tagged(engine_error(&e), e.to_string()));
     handle.shutdown(); let _ = join.join();
     let v = out?.value;
     let arr = v.iter().map(|x| format!("{x}")).collect::<Vec<_>>().join(",");
@@ -612,7 +642,8 @@ fn find_live<'a>(doc: &'a serde_json::Value, name: &str) -> Option<&'a serde_jso
 
 fn reload(path: &Path, port: Option<u16>) -> Result<()> {
     let port = resolve_port(path, port)?;
-    let body = http_post(port, "/admin/reload", "").context("reload (is the server running?)")?;
+    let body = http_post(port, "/admin/reload", "")
+        .context(Tagged(Code::NoService, "reload (is the server running?)".into()))?;
     println!("{body}");
     Ok(())
 }
@@ -626,7 +657,7 @@ fn reload(path: &Path, port: Option<u16>) -> Result<()> {
 fn load_model(path: &Path, model: &str, port: Option<u16>) -> Result<()> {
     let port = resolve_port(path, port)?;
     let body = http_post(port, &format!("/admin/models/{model}/load"), "")
-        .context("load (is the server running?)")?;
+        .context(Tagged(Code::NoService, "load (is the server running?)".into()))?;
     let v: serde_json::Value = serde_json::from_str(&body)
         .with_context(|| format!("unexpected reply: {body}"))?;
     if let Some(e) = v.get("error").and_then(|e| e.as_str()) { return Err(admin_err(e, port)) }
@@ -648,7 +679,7 @@ fn load_model(path: &Path, model: &str, port: Option<u16>) -> Result<()> {
 fn unload_model(path: &Path, model: &str, port: Option<u16>) -> Result<()> {
     let port = resolve_port(path, port)?;
     let body = http_post(port, &format!("/admin/models/{model}/unload"), "")
-        .context("unload (is the server running?)")?;
+        .context(Tagged(Code::NoService, "unload (is the server running?)".into()))?;
     let v: serde_json::Value = serde_json::from_str(&body)
         .with_context(|| format!("unexpected reply: {body}"))?;
     if let Some(e) = v.get("error").and_then(|e| e.as_str()) { return Err(admin_err(e, port)) }
@@ -720,7 +751,8 @@ fn unit_of(pid: u64) -> Option<String> {
 
 fn bake(path: &Path, name: &str) -> Result<()> {
     let cfg = load_cfg(path)?;
-    let m = cfg.find(name).ok_or_else(|| anyhow!("unknown model {name:?} in config"))?;
+    let m = cfg.find(name)
+        .ok_or_else(|| Tagged(Code::NoModel, format!("unknown model {name:?} in config")))?;
     let sc = npu_engine::config::ScenarioConfig::load(Path::new(&m.scenario))
         .with_context(|| format!("scenario {}", m.scenario))?;
     match sc.artifacts.model_spec()? {
@@ -787,7 +819,7 @@ fn config_cmd(path: &Path, action: &ConfigCmd) -> Result<()> {
         }
         ConfigCmd::RemoveModel { name } => {
             if !doc.remove_model(name).map_err(|e| anyhow!(e))? {
-                return Err(anyhow!("unknown model {name:?} (not in the config)"));
+                return Err(Tagged(Code::NoModel, format!("unknown model {name:?} (not in the config)")).into());
             }
             format!("removed model {name}")
         }
@@ -796,7 +828,7 @@ fn config_cmd(path: &Path, action: &ConfigCmd) -> Result<()> {
             // Refuse rather than write: a pin on a name the config does not have is a typo, and
             // there is nothing in the file for the key to attach to.
             if !doc.set_resident(model, on).map_err(|e| anyhow!(e))? {
-                return Err(anyhow!("unknown model {model:?} (not in the config)"));
+                return Err(Tagged(Code::NoModel, format!("unknown model {model:?} (not in the config)")).into());
             }
             if on { format!("pinned {model} resident") } else { format!("unpinned {model}") }
         }
