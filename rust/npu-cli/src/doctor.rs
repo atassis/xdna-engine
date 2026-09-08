@@ -197,6 +197,22 @@ pub struct ModelArtifactCheck {
     pub scenario_path: String,
     pub ok: bool,
     pub detail: String,
+    /// Resolved decode tier + which source produced it (`config::resolve_decode_backend`), for the
+    /// scenarios that read it today -- name contains "whisper", the same test `registry::try_build`
+    /// dispatches on. `None` for every other scenario, which has no decode-backend concept to report.
+    pub decode_backend: Option<String>,
+}
+
+/// `sc`'s resolved decode backend as `"tier (source)"`, or `None` for a scenario that doesn't route
+/// through `WhisperAsr::build` (the only consumer of `[decode] backend` today) -- gated the same way
+/// `registry::try_build` dispatches, on the scenario NAME, not `kind` (parakeet is `kind = "asr"` too
+/// and does not read this field).
+fn whisper_decode_backend_detail(sc: &npu_engine::config::ScenarioConfig) -> Option<String> {
+    if !sc.scenario.name.to_lowercase().contains("whisper") {
+        return None;
+    }
+    let (tier, source) = npu_engine::config::resolve_decode_backend(sc);
+    Some(format!("{tier} ({source})"))
 }
 
 /// Whether `m`'s scenario file parses and, if it declares a legacy `artifacts.weights` dir, whether
@@ -211,18 +227,20 @@ fn scenario_artifact_check(m: &ModelCfg, root: &Path) -> ModelArtifactCheck {
     match npu_engine::config::ScenarioConfig::load(&scenario_path) {
         Err(e) => ModelArtifactCheck {
             name: m.name.clone(), scenario_path: display, ok: false,
-            detail: format!("scenario error: {e}"),
+            detail: format!("scenario error: {e}"), decode_backend: None,
         },
         Ok(sc) if sc.artifacts.weights.is_empty() => ModelArtifactCheck {
+            decode_backend: whisper_decode_backend_detail(&sc),
             name: m.name.clone(), scenario_path: display, ok: true,
             detail: "scenario OK (no legacy weights dir declared)".into(),
         },
         Ok(sc) => {
+            let decode_backend = whisper_decode_backend_detail(&sc);
             let w = Path::new(&sc.artifacts.weights);
             let wp = if w.is_absolute() { w.to_path_buf() } else { root.join(w) };
             let has_content = std::fs::read_dir(&wp).map(|mut d| d.next().is_some()).unwrap_or(false);
             ModelArtifactCheck {
-                name: m.name.clone(), scenario_path: display, ok: has_content,
+                name: m.name.clone(), scenario_path: display, ok: has_content, decode_backend,
                 detail: if has_content { format!("weights OK: {}", wp.display()) }
                         else { format!("weights missing/empty: {}", wp.display()) },
             }
@@ -353,6 +371,9 @@ impl DoctorReport {
             for c in &self.model_checks {
                 println!("{:<22} {:<8} {}  [{}]",
                     c.name, if c.ok { "OK" } else { "FAIL" }, c.detail, c.scenario_path);
+                if let Some(db) = &c.decode_backend {
+                    println!("{:<22} {:<8} decode backend: {db}", "", "");
+                }
             }
         }
         match &self.parakeet_preflight {
@@ -396,6 +417,7 @@ impl DoctorReport {
         };
         let models_j: Vec<Value> = self.model_checks.iter().map(|c| serde_json::json!({
             "name": c.name, "scenario": c.scenario_path, "ok": c.ok, "detail": c.detail,
+            "decode_backend": c.decode_backend,
         })).collect();
         let parakeet_j = self.parakeet_preflight.as_ref().map(|r| match r {
             Ok(()) => serde_json::json!({"ok": true}),

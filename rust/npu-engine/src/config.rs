@@ -20,6 +20,11 @@ pub struct ScenarioConfig {
     /// field out. A request that names the field always wins -- this sets the default, never a cap.
     #[serde(default)]
     pub generation: GenerationCfg,
+    /// Decode-backend tier default for autoregressive decode models (Whisper today). Optional and
+    /// additive: absent means "not set", which resolves the same way an absent field always has --
+    /// see `resolve_decode_backend`.
+    #[serde(default)]
+    pub decode: DecodeCfg,
 }
 
 /// Per-model generation defaults. Empty block = the engine's own defaults, which is what every
@@ -70,6 +75,85 @@ impl GenerationCfg {
 pub struct DiarizationCfg {
     #[serde(default)]
     pub manifest: String,
+}
+
+/// Decode-backend tier, per `env-flag-contract.md` E008b: a rung on the device ladder, not an
+/// implementation name, so a kernel rename or a new artifact dir under an existing tier never
+/// touches a scenario file. Named after the three backends `WhisperAsr::build` already has:
+/// `FusedDecoder` (whole-decoder ELF, one dispatch/token), the per-op `NPU_DECODE` NPU path
+/// (~72 dispatches/token), and the host ONNX decoder graphs -- the one arm BELOW the ladder.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DecodeTier {
+    Fused,
+    Dispatched,
+    Host,
+}
+
+impl DecodeTier {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DecodeTier::Fused => "fused",
+            DecodeTier::Dispatched => "dispatched",
+            DecodeTier::Host => "host",
+        }
+    }
+}
+
+impl std::fmt::Display for DecodeTier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(self.as_str()) }
+}
+
+/// `[decode]` scenario block. One field today, mirroring `DiarizationCfg`'s shape: a scenario that
+/// doesn't declare it parses exactly as before this block existed.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+pub struct DecodeCfg {
+    #[serde(default)]
+    pub backend: Option<DecodeTier>,
+}
+
+/// Which of the three sources produced a resolved `DecodeTier` -- reportable so a measurement can
+/// name what selected the backend (env-flag-contract E007), mirroring `npu-cli`'s
+/// `config_path_and_source`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecodeSource {
+    /// `NPU_DECODE_FUSED` or `NPU_DECODE`, read directly. Overrides the scenario unconditionally --
+    /// unchanged from the pre-existing env-only behavior, so the 13+ scripts that export them keep
+    /// working.
+    Env(&'static str),
+    /// The scenario's own `[decode] backend` field, no env override present.
+    Scenario,
+    /// Neither an env var nor a scenario field is set: the byte-identical behavior every existing
+    /// scenario had before this field existed.
+    Default,
+}
+
+impl std::fmt::Display for DecodeSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DecodeSource::Env(name) => write!(f, "env ${name}"),
+            DecodeSource::Scenario => write!(f, "scenario [decode] backend"),
+            DecodeSource::Default => write!(f, "default (no field, no env)"),
+        }
+    }
+}
+
+/// Resolve the decode tier for `cfg`: `NPU_DECODE_FUSED` beats `NPU_DECODE` beats the scenario's
+/// `[decode] backend` beats `Host` -- the exact fallback chain `WhisperAsr::build` already had
+/// before this field existed, so a scenario with no `[decode]` block and no env vars set resolves
+/// to `(Host, Default)`, unchanged. Pure and device-free: reads only `cfg` and process env, no
+/// device or artifact I/O, so it is testable without a device (`WhisperAsr::build` is not).
+pub fn resolve_decode_backend(cfg: &ScenarioConfig) -> (DecodeTier, DecodeSource) {
+    if std::env::var("NPU_DECODE_FUSED").is_ok() {
+        return (DecodeTier::Fused, DecodeSource::Env("NPU_DECODE_FUSED"));
+    }
+    if std::env::var("NPU_DECODE").is_ok() {
+        return (DecodeTier::Dispatched, DecodeSource::Env("NPU_DECODE"));
+    }
+    match cfg.decode.backend {
+        Some(tier) => (tier, DecodeSource::Scenario),
+        None => (DecodeTier::Host, DecodeSource::Default),
+    }
 }
 
 impl ScenarioConfig {
@@ -317,5 +401,82 @@ manifest = "artifacts/pyannote/diarize.json"
         assert_eq!((m.hidden, m.ff, m.n_heads, m.n_layers), (1280, 5120, 20, 32));
         assert_eq!(m.n_mels, 128, "large-v3 and later are 128-mel");
         assert_eq!(m.decoder_layers(), 4, "turbo's decoder is 4 layers, not its 32 encoder layers");
+    }
+
+    #[test]
+    fn decode_backend_field_parses_each_tier_and_rejects_unknown_values() {
+        for (word, want) in
+            [("fused", DecodeTier::Fused), ("dispatched", DecodeTier::Dispatched), ("host", DecodeTier::Host)]
+        {
+            let toml = format!(
+                "[scenario]\nkind = \"asr\"\nname = \"m\"\n[artifacts]\nweights = \"w\"\n[decode]\nbackend = \"{word}\"\n"
+            );
+            let c = ScenarioConfig::from_str(&toml).expect("a valid tier must parse");
+            assert_eq!(c.decode.backend, Some(want));
+        }
+        // E004: a bad value fails loud at config load, naming the value AND the valid set -- not a
+        // silent fallback discovered later at resolution time.
+        let bad = "[scenario]\nkind = \"asr\"\nname = \"m\"\n[artifacts]\nweights = \"w\"\n[decode]\nbackend = \"fuzed\"\n";
+        let err = ScenarioConfig::from_str(bad).expect_err("an unrecognised tier must fail to parse");
+        let msg = err.to_string();
+        assert!(msg.contains("fuzed"), "error must name the bad value: {msg}");
+        assert!(msg.contains("fused") && msg.contains("dispatched") && msg.contains("host"),
+            "error must name the valid set: {msg}");
+    }
+
+    #[test]
+    fn a_scenario_with_no_decode_field_parses_as_none_and_the_shipped_whisper_scenarios_declare_none() {
+        let c = ScenarioConfig::from_str(
+            "[scenario]\nkind = \"asr\"\nname = \"m\"\n[artifacts]\nweights = \"w\"\n",
+        )
+        .expect("a scenario with no [decode] block must parse");
+        assert_eq!(c.decode.backend, None);
+
+        // Backwards compatibility is a hard requirement: neither shipped Whisper scenario needs
+        // touching for this field to exist.
+        for f in ["../../scenarios/asr-whisper-small.toml", "../../scenarios/asr-whisper-turbo.toml"] {
+            let s = ScenarioConfig::from_str(&std::fs::read_to_string(f).unwrap()).unwrap();
+            assert_eq!(s.decode.backend, None, "{f} must not need updating for this field to exist");
+        }
+    }
+
+    /// Env-var mutation is process-global; every case touching `NPU_DECODE_FUSED`/`NPU_DECODE` lives
+    /// in this ONE test (matching `diarize::onnx`'s `NPU_DIARIZE_THREADS` precedent) so `cargo
+    /// test`'s parallel test threads cannot interleave two cases and read each other's value.
+    #[test]
+    fn resolve_decode_backend_order_is_env_over_scenario_over_default() {
+        std::env::remove_var("NPU_DECODE_FUSED");
+        std::env::remove_var("NPU_DECODE");
+
+        // No field, no env: today's behavior, byte-for-byte -- both flags read `.is_ok()` false, so
+        // `WhisperAsr::build` took the ONNX (host) arm before this field existed.
+        let no_field = ScenarioConfig::from_str(
+            "[scenario]\nkind = \"asr\"\nname = \"m\"\n[artifacts]\nweights = \"w\"\n").unwrap();
+        assert_eq!(resolve_decode_backend(&no_field), (DecodeTier::Host, DecodeSource::Default));
+
+        // Scenario field alone -- the new default path -- picks the tier.
+        let fused_field = ScenarioConfig::from_str(
+            "[scenario]\nkind = \"asr\"\nname = \"m\"\n[artifacts]\nweights = \"w\"\n[decode]\nbackend = \"fused\"\n").unwrap();
+        assert_eq!(resolve_decode_backend(&fused_field), (DecodeTier::Fused, DecodeSource::Scenario));
+        let dispatched_field = ScenarioConfig::from_str(
+            "[scenario]\nkind = \"asr\"\nname = \"m\"\n[artifacts]\nweights = \"w\"\n[decode]\nbackend = \"dispatched\"\n").unwrap();
+        assert_eq!(resolve_decode_backend(&dispatched_field), (DecodeTier::Dispatched, DecodeSource::Scenario));
+        let host_field = ScenarioConfig::from_str(
+            "[scenario]\nkind = \"asr\"\nname = \"m\"\n[artifacts]\nweights = \"w\"\n[decode]\nbackend = \"host\"\n").unwrap();
+        assert_eq!(resolve_decode_backend(&host_field), (DecodeTier::Host, DecodeSource::Scenario));
+
+        // The 13+ benchmark scripts that export NPU_DECODE/NPU_DECODE_FUSED must keep working
+        // unchanged: env overrides a scenario field that disagrees with it.
+        std::env::set_var("NPU_DECODE", "1");
+        assert_eq!(resolve_decode_backend(&host_field), (DecodeTier::Dispatched, DecodeSource::Env("NPU_DECODE")));
+
+        // NPU_DECODE_FUSED beats NPU_DECODE when both are set -- existing precedence, unchanged --
+        // and beats even a scenario with no [decode] block at all.
+        std::env::set_var("NPU_DECODE_FUSED", "1");
+        assert_eq!(resolve_decode_backend(&host_field), (DecodeTier::Fused, DecodeSource::Env("NPU_DECODE_FUSED")));
+        assert_eq!(resolve_decode_backend(&no_field), (DecodeTier::Fused, DecodeSource::Env("NPU_DECODE_FUSED")));
+
+        std::env::remove_var("NPU_DECODE_FUSED");
+        std::env::remove_var("NPU_DECODE");
     }
 }
