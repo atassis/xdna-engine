@@ -80,6 +80,14 @@ def main():
     ap.add_argument("--max-seq", type=int, default=2048)
     ap.add_argument("--steps", type=int, default=None, help="free-running tokens to compare")
     ap.add_argument("--dump-logits", default=None, help="write step-0 logits to this .npy for offline compare")
+    ap.add_argument("--emit-topk", default=None,
+                    help="TIER 2 capture: write this run's per-step top-K token ids and logits to "
+                         "a JSON for scripts/gate_token_set.py. With this set the script CAPTURES "
+                         "rather than judges -- its own 1:1 parity line stays as a note and the "
+                         "exit status reports whether the DEVICE RUN worked, not whether the "
+                         "tokens matched, because the verdict is the token-set gate's to give.")
+    ap.add_argument("--topk", type=int, default=5,
+                    help="how many candidates per step to record (GATE_K in gate_llm_reference.py)")
     ap.add_argument("--teacher-force", action="store_true",
                     help="feed the ORACLE's tokens instead of the device's own, so each step is "
                          "judged independently. Free-running conflates one bad token with the "
@@ -139,6 +147,7 @@ def main():
 
     fed = list(prompt_ids)
     produced = []
+    topk_ids, topk_logits = [], []
     # Per produced step: (device top-1 logit, logit the device gave the ORACLE's token).
     # This is what classifies a mismatch. The oracle's stored `margins` describe a DIFFERENT
     # implementation's forward pass; the device's own gap describes this one.
@@ -167,6 +176,12 @@ def main():
             produced.append(nxt)
             want = gen_ids[i] if i < len(gen_ids) else nxt
             step_logits.append((float(lg[nxt]), float(lg[want])))
+            # The device's own top-K, captured whether or not this step matched: the token-set gate
+            # needs the candidates AT the first divergence, which is not knowable in advance.
+            top = np.argpartition(-lg, a.topk)[:a.topk]
+            top = top[np.argsort(-lg[top])]
+            topk_ids.append([int(t) for t in top])
+            topk_logits.append([float(lg[t]) for t in top])
             # Free-running: one wrong token puts every later step on a different trajectory, so a
             # single flip reads as N failures. Teacher-forcing feeds the oracle's token instead,
             # which makes each step an independent test of the forward pass.
@@ -210,6 +225,21 @@ def main():
         extra = f", host margin {margins[i]:.4f}" if margins and i < len(margins) else ""
         print(f"           step {i}: oracle {gen_ids[i]} vs NPU {produced[i]}{extra} -> {kind}")
     print("*** PARITY PASS ***" if match == n else f"*** {n-match} MISMATCH ***")
+    if a.emit_topk:
+        json.dump({
+            "spec": sp.name, "backend": f"npu fused decode, {NL} layers, S={S}",
+            "prompt": ref.get("prompt"), "prompt_ids": prompt_ids,
+            "n_tokens": len(produced), "k": a.topk, "gen_ids": produced,
+            "topk_ids": topk_ids, "topk_logits": topk_logits,
+            "teacher_forced": bool(a.teacher_force),
+            "note": "Device capture for scripts/gate_token_set.py. The 1:1 parity line this run "
+                    "also printed is the OLD gate and is kept as a note: it demands byte-identical "
+                    "tokens against one particular host implementation, which stops being "
+                    "achievable as soon as a rail has two implementations of an op.",
+        }, open(a.emit_topk, "w"), indent=1)
+        print(f"[verify] top-{a.topk} capture -> {a.emit_topk}; the VERDICT is "
+              f"scripts/gate_token_set.py's, not this line's")
+        return 0
     return 0 if match == n else 1
 
 
