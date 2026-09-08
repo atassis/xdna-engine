@@ -9,16 +9,17 @@
 //! `NPU_LLM_DEVICE_GATE`, `S2_ARTIFACT_DIR`). Build-time vars (`CARGO_*`, `OUT_DIR`) and pure
 //! environment (`HOME`, `PATH`, `LD_LIBRARY_PATH`, `XRT_*`) are out of scope too.
 //!
-//! `npu_asr::tuning::TuningConfig::with_env_overrides` already names two truth idioms (its
-//! `not_zero` and `is_one` closures); [`Semantics`] reuses that vocabulary rather than inventing a
-//! competing one, and adds the idioms tuning.rs does not cover: `is_ok()` (ANY set value,
-//! including the string `"0"`, reads as true), bare presence (`var_os(..).is_some()`), an explicit
-//! falsy-string list, and a plain value that is consumed rather than reduced to a bool.
+//! `npu_asr::tuning` already names two truth idioms (its `not_zero` closure and `is_one` function);
+//! [`Semantics`] reuses that vocabulary rather than inventing a competing one, and adds the idioms
+//! tuning.rs does not cover: `is_ok()` (ANY set value, including the string `"0"`, reads as true),
+//! bare presence (`var_os(..).is_some()`), an explicit falsy-string list, and a plain value that is
+//! consumed rather than reduced to a bool.
 //!
 //! This list is report-only by construction: it does not change what any site reads, parses, or
-//! defaults to. Where two sites disagree about what the SAME name means (`NPU_ENC_FFN_RESIDENT`),
-//! that disagreement is recorded here, not resolved -- resolving it is a shipped-behaviour change
-//! and belongs to its own change, not to an inventory.
+//! defaults to. A disagreement between two sites about what the SAME name means is recorded here,
+//! not silently resolved -- resolving one is a shipped-behaviour change and belongs to its own
+//! change, not to an inventory (`NPU_ENC_FFN_RESIDENT` was the one live instance; fixed 2026-09-08
+//! by routing npu-whisper through npu-asr's accessor, see that flag's entry below).
 
 /// A var's truth/parse idiom. The four not named after `TuningConfig`'s own two are the ones nine
 /// flags already standardize on; everything else in the engine uses one of the other four.
@@ -107,41 +108,44 @@ pub const FLAGS: &[Flag] = &[
     // via `not_zero`/`is_one` closures parameterized by these literal keys, not by a direct
     // `env::var("LITERAL")` call -- which is why a plain grep for the literal undercounts this
     // crate.
-    Flag { name: "NPU_MODAL_EPI", owner: "npu-asr", site: "npu-asr/src/tuning.rs:49",
+    Flag { name: "NPU_MODAL_EPI", owner: "npu-asr", site: "npu-asr/src/tuning.rs:68",
         semantics: NotZero, default: "true",
         doc: "modal (fused) epilogue on the encoder GEMMs; gated to non-int8 at construction." },
-    Flag { name: "NPU_SS_NPU", owner: "npu-asr", site: "npu-asr/src/tuning.rs:50",
+    Flag { name: "NPU_SS_NPU", owner: "npu-asr", site: "npu-asr/src/tuning.rs:69",
         semantics: NotZero, default: "true",
         doc: "subsampling stage dispatches on the NPU instead of host." },
-    Flag { name: "NPU_GLU_FUSED", owner: "npu-asr", site: "npu-asr/src/tuning.rs:51",
+    Flag { name: "NPU_GLU_FUSED", owner: "npu-asr", site: "npu-asr/src/tuning.rs:70",
         semantics: NotZero, default: "true",
         doc: "collapses three HOST passes (bias add, transpose, GLU) into one rayon pass in \
               npu_asr_host::glu_fused. Despite the name nothing is fused into a GEMM epilogue and \
               no device call is involved; both arms are host-only and numerically exact. Also read independently, \
               same not_zero-equivalent check (`!= Ok(\"0\")`), at block.rs:328 -- the two agree." },
-    Flag { name: "NPU_MM2_PIPELINE", owner: "npu-asr", site: "npu-asr/src/tuning.rs:52",
+    Flag { name: "NPU_MM2_PIPELINE", owner: "npu-asr", site: "npu-asr/src/tuning.rs:71",
         semantics: NotZero, default: "true",
         doc: "pipelines the FFN's second matmul (mm2)." },
-    Flag { name: "NPU_INT8_FASTEPI", owner: "npu-asr", site: "npu-asr/src/tuning.rs:53",
+    Flag { name: "NPU_INT8_FASTEPI", owner: "npu-asr", site: "npu-asr/src/tuning.rs:72",
         semantics: NotZero, default: "true",
         doc: "fast int8 epilogue path; only meaningful under int8 precision." },
-    Flag { name: "NPU_LN_NPU", owner: "npu-asr", site: "npu-asr/src/tuning.rs:60",
+    Flag { name: "NPU_LN_NPU", owner: "npu-asr", site: "npu-asr/src/tuning.rs:74",
         semantics: IsOne, default: "false",
         doc: "LayerNorm dispatches on the NPU instead of host." },
-    Flag { name: "NPU_QKV_OVERLAP", owner: "npu-asr", site: "npu-asr/src/tuning.rs:61",
+    Flag { name: "NPU_QKV_OVERLAP", owner: "npu-asr", site: "npu-asr/src/tuning.rs:75",
         semantics: IsOne, default: "false",
         doc: "overlaps QKV projection dispatch with the previous stage. Also read independently, \
               same is_one-equivalent check (`== Ok(\"1\")`), at block.rs:330 (feature two_ctx, \
               default-on) -- the two agree." },
-    Flag { name: "NPU_INT8_ONCHIP", owner: "npu-asr", site: "npu-asr/src/tuning.rs:62",
+    Flag { name: "NPU_INT8_ONCHIP", owner: "npu-asr", site: "npu-asr/src/tuning.rs:76",
         semantics: IsOne, default: "false",
         doc: "on-chip int8 dequantization instead of host." },
-    Flag { name: "NPU_ENC_FFN_RESIDENT", owner: "npu-asr", site: "npu-asr/src/tuning.rs:63",
+    Flag { name: "NPU_ENC_FFN_RESIDENT", owner: "npu-asr", site: "npu-asr/src/tuning.rs:23",
         semantics: IsOne, default: "false",
-        doc: "resident fc1->fc2 FFN intermediate stays on-device (draft, default OFF). Also read \
-              independently, same is_one-equivalent check (`== Ok(\"1\")`), at block.rs:130 -- \
-              agrees with tuning.rs. DRIFT: npu-whisper reads the SAME name at a separate site \
-              with is_ok() semantics instead -- see the npu-whisper entry of this name." },
+        doc: "resident fc1->fc2 FFN intermediate stays on-device (draft, default OFF), read via \
+              `tuning::ffn_resident_requested()` (E003 single accessor). Also read independently, \
+              same is_one-equivalent check (`== Ok(\"1\")`), at block.rs:130 -- agrees. FIXED \
+              2026-09-08: npu-whisper used to read the SAME name at its own site with is_ok() \
+              semantics -- ANY set value, including \"0\", true -- so NPU_ENC_FFN_RESIDENT=0 \
+              disabled this crate's residency and enabled whisper's from one export. \
+              npu-whisper/src/encoder.rs now calls this accessor instead of reading env directly." },
 
     // -- npu-asr: everything else -----------------------------------------------------------------
     Flag { name: "NPU_CONV_TRANSPOSE", owner: "npu-asr", site: "npu-asr/src/conv_npu.rs:44",
@@ -447,13 +451,7 @@ pub const FLAGS: &[Flag] = &[
         semantics: Value, default: "usize::MAX (all layers)",
         doc: "caps NPU MHA to the first N encoder blocks; the bf16 attention error compounds over \
               layers, so a partial offload can stay WER-acceptable." },
-    Flag { name: "NPU_ENC_FFN_RESIDENT", owner: "npu-whisper", site: "npu-whisper/src/encoder.rs:359",
-        semantics: IsOk, default: "false",
-        doc: "resident FFN intermediate stays on-device; ALSO requires NPU_ENC_GELU_FUSED.is_ok(). \
-              DRIFT: npu-asr reads the SAME name at a separate site (block.rs/tuning.rs) with \
-              is_one-equivalent semantics -- NPU_ENC_FFN_RESIDENT=x for any non-empty x enables \
-              this (whisper) copy, but only the exact value \"1\" enables npu-asr's." },
-    Flag { name: "ENC_PEROP_TIMING", owner: "npu-whisper", site: "npu-whisper/src/encoder.rs:398",
+    Flag { name: "ENC_PEROP_TIMING", owner: "npu-whisper", site: "npu-whisper/src/encoder.rs:417",
         semantics: IsOk, default: "false",
         doc: "per-op timing breakdown for the Whisper encoder forward pass." },
 

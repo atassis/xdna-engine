@@ -356,8 +356,27 @@ impl WhisperEncoder {
                 // in one bf16 buffer across the seam -> no host materialize / re-conversion of the
                 // largest data object. See internal notes (the FFN
                 // sub-block is ~67% of the encoder's host marshaling).
-                let resident = std::env::var("NPU_ENC_FFN_RESIDENT").is_ok()
-                    && std::env::var("NPU_ENC_GELU_FUSED").is_ok();
+                //
+                // NPU_ENC_FFN_RESIDENT goes through npu_asr::tuning's single accessor (E003,
+                // env-flag-contract.md) instead of an independent env::var read here: this crate used
+                // to read it with is_ok() (ANY set value, including "0", true), while npu-asr read the
+                // same name with is_one() (only "1" true) -- one export could enable residency for one
+                // encoder and disable it for the other. Both now resolve identically.
+                let ffn_resident_requested = npu_asr::tuning::ffn_resident_requested();
+                let gelu_fused = std::env::var("NPU_ENC_GELU_FUSED").is_ok();
+                if ffn_resident_requested && !gelu_fused {
+                    // Requesting residency without its prerequisite used to silently no-op (byte-
+                    // identical to the default path, no diagnostic). Say so once instead.
+                    static MISSING_PREREQ_WARNED: std::sync::Once = std::sync::Once::new();
+                    MISSING_PREREQ_WARNED.call_once(|| {
+                        eprintln!(
+                            "[encoder] WARNING: NPU_ENC_FFN_RESIDENT requested but NPU_ENC_GELU_FUSED \
+                             is unset -- residency requires GELU fused into fc1's on-chip epilogue; \
+                             falling back to the non-resident FFN path"
+                        );
+                    });
+                }
+                let resident = ffn_resident_requested && gelu_fused;
                 if resident {
                     marsh::set_op(marsh::FC1);
                     f_out = timed!("ffn_resident", apply_tiled_ffn_resident(&ops.fc1, &ops.fc2, &ln2));

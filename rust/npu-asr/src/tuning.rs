@@ -4,6 +4,25 @@
 
 use crate::ctx2::Precision;
 
+/// "== 1" knobs: only the exact value `"1"` enables; any other set value disables.
+fn is_one(k: &str, dflt: bool) -> bool {
+    match std::env::var(k).ok().as_deref() {
+        Some("1") => true,
+        Some(_) => false,
+        None => dflt,
+    }
+}
+
+/// The single accessor for `NPU_ENC_FFN_RESIDENT` (E003, `docs/reference/env-flag-contract.md`).
+/// Also called by `npu-whisper/src/encoder.rs`, which used to read the env var independently with
+/// `is_ok()` semantics -- ANY set value, including `"0"`, read as true there, so
+/// `NPU_ENC_FFN_RESIDENT=0` turned Parakeet residency off and Whisper residency on from one export.
+/// Same `is_one` rule and same baked-off default as `TuningConfig::ffn_resident` below, so unset/
+/// `=0`/`=1` now resolve identically for both encoders.
+pub fn ffn_resident_requested() -> bool {
+    is_one("NPU_ENC_FFN_RESIDENT", false)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TuningConfig {
     pub precision: Precision,
@@ -52,15 +71,10 @@ impl TuningConfig {
         self.mm2_pipeline = not_zero("NPU_MM2_PIPELINE", self.mm2_pipeline);
         self.int8_fast_epi = not_zero("NPU_INT8_FASTEPI", self.int8_fast_epi);
         // "== 1" knobs: only the exact value "1" enables; any other set value disables.
-        let is_one = |k: &str, dflt: bool| match std::env::var(k).ok().as_deref() {
-            Some("1") => true,
-            Some(_) => false,
-            None => dflt,
-        };
         self.layernorm_on_npu = is_one("NPU_LN_NPU", self.layernorm_on_npu);
         self.qkv_overlap = is_one("NPU_QKV_OVERLAP", self.qkv_overlap);
         self.int8_onchip_dequant = is_one("NPU_INT8_ONCHIP", self.int8_onchip_dequant);
-        self.ffn_resident = is_one("NPU_ENC_FFN_RESIDENT", self.ffn_resident);
+        self.ffn_resident = ffn_resident_requested();
         self
     }
 }
@@ -92,5 +106,35 @@ mod tests {
         let c = TuningConfig::baked_default(Precision::FastBf16).with_env_overrides();
         assert!(!c.glu_fused, "NPU_GLU_FUSED=0 must override the baked true");
         std::env::remove_var("NPU_GLU_FUSED");
+    }
+
+    #[test]
+    fn ffn_resident_requested_is_one_semantics() {
+        // mutates process env -> run single-threaded (cargo test -- --test-threads=1)
+        std::env::remove_var("NPU_ENC_FFN_RESIDENT");
+        assert!(!ffn_resident_requested(), "unset must resolve to the baked-off default");
+        std::env::set_var("NPU_ENC_FFN_RESIDENT", "0");
+        assert!(!ffn_resident_requested(), "=0 must stay off (is_one, not whisper's old is_ok)");
+        std::env::set_var("NPU_ENC_FFN_RESIDENT", "1");
+        assert!(ffn_resident_requested(), "=1 must turn residency on");
+        std::env::remove_var("NPU_ENC_FFN_RESIDENT");
+    }
+
+    /// npu-whisper's encoder calls `ffn_resident_requested()` (no more independent `env::var`
+    /// read); this proves it agrees with npu-asr's own `TuningConfig` resolution for unset/=0/=1
+    /// -- the defect env-flag-contract.md E003 closes.
+    #[test]
+    fn ffn_resident_agrees_across_both_encoders_env_states() {
+        for (val, want) in [(None, false), (Some("0"), false), (Some("1"), true)] {
+            match val {
+                Some(v) => std::env::set_var("NPU_ENC_FFN_RESIDENT", v),
+                None => std::env::remove_var("NPU_ENC_FFN_RESIDENT"),
+            }
+            let parakeet = TuningConfig::baked_default(Precision::FastBf16).with_env_overrides().ffn_resident;
+            let whisper = ffn_resident_requested();
+            assert_eq!(parakeet, want, "npu-asr resolution for {val:?}");
+            assert_eq!(whisper, want, "npu-whisper resolution for {val:?}");
+        }
+        std::env::remove_var("NPU_ENC_FFN_RESIDENT");
     }
 }
