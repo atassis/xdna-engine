@@ -40,6 +40,8 @@ setup_env() { source scripts/iron_env.sh; }
 setup_env
 python3 -c "import aie.iron" 2>/dev/null || { echo "[prebuild] iron env not green"; exit 2; }
 scripts/sync_kernels.sh >/dev/null 2>&1
+# shellcheck disable=SC1091
+source scripts/kernel_sandbox.sh   # current_toolchain_hash -- for the INSTALLED-copy stamp below
 
 build_bucket() {
   local BUILT_T="$1" KB="$2" out="$OUT_ROOT/$3"
@@ -79,6 +81,12 @@ PY
   mkdir -p "$out"
   cmp -s "$XB" "$out/final.xclbin" || cp "$XB" "$out/final.xclbin"
   cmp -s "$IB" "$out/insts.bin"    || cp "$IB" "$out/insts.bin"
+  # The submodule build dir's freshness rides on make's own dependency graph (build/.toolchain.stamp,
+  # see the comment above) -- but nothing carried that identity to the INSTALLED copy the engine and
+  # check_kernel_artifact_freshness.sh actually read, so a re-pin left it silently unstamped forever
+  # (task artifact-families-with-no-freshness-stamp). Stamp it here, same convention as
+  # ensure_fresh_sandbox (kernel_sandbox.sh).
+  current_toolchain_hash "$REPO" > "$out/.toolchain-stamp"
   echo "[prebuild] installed bucket $BUILT_T ($nt t_active words) -> $out"
 }
 

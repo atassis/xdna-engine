@@ -41,8 +41,11 @@ SRC_DIRS=(
   "$PE/ml/layernorm/build"
 )
 # NOT published, and named here rather than silently absent:
-#   ml/mha_decode/build -- carries no .toolchain-stamp and is not covered by
-#     check_kernel_artifact_freshness.sh either. It is reached only from ctx_decode.rs, the opt-in
+#   ml/mha_decode/build -- check_kernel_artifact_freshness.sh added it to DIRS 2026-09-08 (task
+#     artifact-families-with-no-freshness-stamp), and build_mha_decode.sh already writes the
+#     stamp via ensure_fresh_sandbox; but the artifact ON DISK right now predates both fixes and
+#     still carries no .toolchain-stamp -- it needs an actual rebuild (bash scripts/build_mha_decode.sh)
+#     before this exclusion can come out. It is reached only from ctx_decode.rs, the opt-in
 #     NPU_DECODE per-op backend that NPU_DECODE_FUSED takes precedence over, so nothing the service
 #     selects by default needs it. Add it here once it is stamped; do not add it unstamped.
 

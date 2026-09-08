@@ -8,10 +8,28 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"; cd "$REPO"
 source scripts/iron_env.sh
 source scripts/kernel_sandbox.sh
 
+# Preflight: the mlir-aie SUBMODULE checkout must actually contain toolchain.lock's pinned
+# commit. The PLAIN matrix_multiplication Makefiles (single_core, whole_array -- not the
+# Makefile.modal/.silu family, which drive OUR OWN designs/ generators instead) run their .py
+# driver straight out of THIS checkout via `python3 <aie_py_src>`; only the imported `aie.iron`
+# package comes from the pinned toolchain INSTANCE (PYTHONPATH, set by iron_env.sh's
+# toolchain_up.sh call). A submodule frozen on an older commit still imports the NEW aie.iron
+# API but runs OLD driver code against it, e.g. `Runtime()` vs `Runtime(seq_fn, ...)` -- which
+# reads as an upstream API break and is not one: at the pin, upstream's own driver already
+# matches (verified 2026-09-08, task build-kernels-sh-aborts-at-single-core -- the submodule was
+# stuck on a147b347d2a, 2026-08-18, three re-pins behind toolchain.lock's acecda2fc5). Ancestry,
+# not equality (mirrors amd_paths.sh's iron_require_pin): a worktree may legitimately carry local
+# commits on top of the pin.
+set -a; . "$REPO/toolchain.lock"; set +a
+if ! git -C mlir-aie merge-base --is-ancestor "$MLIR_AIE_FORK_COMMIT" HEAD 2>/dev/null; then
+  echo "[build_kernels] FAIL: mlir-aie submodule HEAD ($(git -C mlir-aie rev-parse --short HEAD 2>/dev/null || echo '?')) does not contain toolchain.lock's MLIR_AIE_FORK_COMMIT (${MLIR_AIE_FORK_COMMIT:0:12}) -- resync with scripts/setup_kernel_env.sh before building." >&2
+  exit 1
+fi
+
 PE=mlir-aie/programming_examples
 MM=$PE/basic/matrix_multiplication/single_core
 MMW=$PE/basic/matrix_multiplication/whole_array
-for _bd in "$MMW/build" "$MM/build" "$PE/ml/dwconv1d/build" "$PE/ml/layernorm/build" "$PE/ml/silu/build"; do
+for _bd in "$MMW/build" "$MM/build" "$PE/ml/dwconv1d/build" "$PE/ml/layernorm/build" "$PE/ml/silu/build" "$PE/ml/softmax400/build"; do
   ensure_fresh_sandbox "$_bd"
 done
 
