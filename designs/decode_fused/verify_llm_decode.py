@@ -134,7 +134,19 @@ def main():
     scale = np.sqrt(D) if sp.embed_scale == "sqrt_d_model" else 1.0
 
     xin = c.get_buffer("x")
-    rope_buf = c.get_buffer("rope_global")
+    # Drive whichever angle buffers the BUILD declares, not a fixed pair. Two reasons, and the
+    # second is a silent accuracy fault rather than a crash: a truncated dual-theta stack can hold
+    # only sliding layers (Gemma-3 goes global every 6th), so at --layers 2 there is no
+    # rope_global to fetch; and a dual-theta spec declares a SECOND angle input, where the
+    # sliding-attention layers rotate at rope_theta_local and the global ones at
+    # rope_theta_global, with which layer reads which baked into the ELF. Driving only
+    # rope_global leaves every sliding layer rotating against a buffer the host never writes.
+    # The production path already does this (rust/npu-engine/src/llm/npu_decode.rs); this
+    # harness was the half still missing it, so a gate run here would have mis-rotated most
+    # layers and presented as a device divergence.
+    declared = set(md["inputs"])
+    rope_buf = c.get_buffer("rope_global") if "rope_global" in declared else None
+    rope_loc_buf = c.get_buffer("rope_local") if "rope_local" in declared else None
     out = c.get_buffer("logits")
 
     fed = list(prompt_ids)
@@ -146,7 +158,10 @@ def main():
     tok = fed[0]
     for pos in range(len(fed) + steps - 1):
         np.copyto(xin.data, np.asarray(embed[tok] * scale, BF16).reshape(-1))
-        np.copyto(rope_buf.data, rope_row(pos, HD, sp.rope_theta_global).reshape(-1))
+        if rope_buf is not None:
+            np.copyto(rope_buf.data, rope_row(pos, HD, sp.rope_theta_global).reshape(-1))
+        if rope_loc_buf is not None:
+            np.copyto(rope_loc_buf.data, rope_row(pos, HD, sp.rope_theta_local).reshape(-1))
         params.write("kv_off", int(pos * HD))
         params.write("sm_mask", int(pos + 1))
         params.sync()
