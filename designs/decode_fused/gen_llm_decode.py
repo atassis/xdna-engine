@@ -220,6 +220,14 @@ FUSE_QKV_DP = os.environ.get("FUSE_QKV_DP", "1") == "1"
 # device).
 FUSE_MLP_O = os.environ.get("FUSE_MLP_O", "1") == "1"
 
+# Weight ObjectFifo depth for the two fused designs. 2 is plain double-buffering; the
+# layer body moves bytes at 29.3 GB/s against the 53.5 GB/s the same dispatch's lm_head
+# GEMV achieves, and a core stalling on every weight tile is the shape that would explain
+# it. An A/B axis, not a settled default.
+WEIGHT_DEPTH = int(os.environ.get("WEIGHT_DEPTH", "2"))
+# Weight tile ROWS for the fused MLP. Trades against WEIGHT_DEPTH at constant L1.
+MLP_TILE_ROWS = int(os.environ.get("MLP_TILE_ROWS", "0"))
+
 
 def weight_bytes(arr):
     """Bytes for one weight buffer exactly as written into the .bin / device arena.
@@ -290,6 +298,10 @@ def sequence_name(sp, NL, S, placer_flags):
         parts.append(f"mlpdp{MLP_DP_COLS}")
     if FUSE_MLP_O:
         parts.append("mlpo")
+    if WEIGHT_DEPTH != 2:
+        parts.append(f"wd{WEIGHT_DEPTH}")
+    if MLP_TILE_ROWS:
+        parts.append(f"tr{MLP_TILE_ROWS}")
     if FUSE_ACT:
         parts.append("fuseact")
     if NL != sp.n_layers:
@@ -571,7 +583,8 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
         from iron.operators.qkv_head_dp.op import QKVHeadDataParallel
         op_qkv_dp = QKVHeadDataParallel(D=D, HD=HD, Hq=Hq, Hkv=Hkv, max_seq=S,
                                         num_aie_columns=COLS, epsilon=sp.eps,
-                                        tile_size_input=TSI, context=ctx)
+                                        tile_size_input=TSI, context=ctx,
+                                        weight_depth=WEIGHT_DEPTH)
     op_rope_q = RoPE(rows=Hq, cols=HD, angle_rows=1, context=ctx)
     op_rope_k = RoPE(rows=Hkv, cols=HD, angle_rows=1, context=ctx)
     # KV append: deep-C scratchpad offset "kv_off" (element units = n_past*HD), constant ELF.
@@ -677,7 +690,9 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
         op_mlp_dp = SwiGLUMLPDataParallel(D=D, FF=FF, num_aie_columns=MLP_DP_COLS,
                                           epsilon=sp.eps,
                                           QD=QD if FUSE_MLP_O else None, fuse_o=FUSE_MLP_O,
-                                          context=ctx, **mlp_quant_kw)
+                                          context=ctx, weight_depth=WEIGHT_DEPTH,
+                                          tile_rows_gu=MLP_TILE_ROWS,
+                                          **mlp_quant_kw)
     if not fuse_act:
         if sp.act == "silu":
             op_act = SiLU(size=FF, num_aie_columns=COLS, tile_size=FF // COLS, context=ctx)

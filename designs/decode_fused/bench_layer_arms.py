@@ -120,24 +120,27 @@ def main():
     arms = []
     census = {}
     for spec in a.arms:
-        m = re.fullmatch(r"(\d+)(f?)(?:c(\d+))?(?:q(\w+))?", spec)
+        m = re.fullmatch(r"(\d+)(f?)(?:c(\d+))?(?:q(\w+?))?(?:d(\d+))?", spec)
         if not m:
             raise SystemExit(f"bad arm spec {spec!r}")
         L = int(m.group(1))
         fmo = m.group(2) == "f"
         cols = int(m.group(3)) if m.group(3) else 8
         qdt = m.group(4) or "bf16"
+        wdepth = int(m.group(5)) if m.group(5) else 2
         # These are captured at gen_llm_decode IMPORT time, so flipping os.environ here would be
         # silently ignored -- set the module globals the generator actually reads.
         G.FUSE_MLP_O = fmo
         G.MLP_DP_COLS = cols
         G.QUANT_MLP_DTYPE = qdt
+        G.WEIGHT_DEPTH = wdepth
         t0 = time.perf_counter()
         sp, fused, weights, md = build_graph(a.spec, a.weights, L, a.max_seq)
         # A fit's CONTROL variables need the same evidence as its result: print every quantity
         # that differs between arms BEFORE fitting, not just the one being varied.
         census[spec] = census_from_mlir(fused, md)
-        census[spec].update(fuse_mlp_o=fmo, mlp_dp_cols=cols, quant_mlp=qdt)
+        census[spec].update(fuse_mlp_o=fmo, mlp_dp_cols=cols, quant_mlp=qdt,
+                            weight_depth=wdepth)
         print(f"[layer-arms] built {spec} in {time.perf_counter()-t0:.1f}s  census={census[spec]}",
               flush=True)
         c = fused.get_callable()
@@ -151,7 +154,8 @@ def main():
             load_weight_buffer(c.get_buffer(name), arr)
         del weights
         scale = np.sqrt(sp.d_model) if sp.embed_scale == "sqrt_d_model" else 1.0
-        arms.append(dict(spec=spec, L=L, fmo=fmo, cols=cols, qdt=qdt, sp=sp, c=c,
+        arms.append(dict(spec=spec, L=L, fmo=fmo, cols=cols, qdt=qdt, wdepth=wdepth,
+                         sp=sp, c=c,
                          params=params,
                          xin=c.get_buffer("x"), rope_buf=c.get_buffer("rope_global"),
                          scale=scale))
@@ -184,7 +188,7 @@ def main():
         xs = [t * 1e3 for t in samples[sp_]]
         med, spread = median_spread(xs)
         report[sp_] = {"reps": xs, "median_ms": med, "spread_pct": spread, "L": arm["L"],
-                       "fuse_mlp_o": arm["fmo"], "cols": arm["cols"], "qdt": arm["qdt"],
+                       "fuse_mlp_o": arm["fmo"], "cols": arm["cols"], "qdt": arm["qdt"], "wdepth": arm["wdepth"],
                        "mb": census[sp_].get("mb"), "min_ms": min(xs), "census": census[sp_]}
         print(f"{sp_:>8} {arm['L']:4} {census[sp_].get('configures', 0):5} "
               f"{census[sp_].get('mb', float('nan')):9.2f} {len(xs):4} "
@@ -193,18 +197,18 @@ def main():
     # Fit on MEDIANS and again on MINIMA. A sustained downclock inflates a whole cell with LOW
     # variance (four-configures-a-layer-came-off-without-a-new-kernel: one cell read 110.261 ms at
     # sd 0.147), so a spread filter cannot catch it -- agreement between the two fits is the check.
-    keys = sorted({(report[s_]["fuse_mlp_o"], report[s_]["cols"], report[s_]["qdt"])
-                   for s_ in report})
+    keys = sorted({(report[s_]["fuse_mlp_o"], report[s_]["cols"], report[s_]["qdt"],
+                    report[s_]["wdepth"]) for s_ in report})
     for key in keys:
         group = sorted((s_ for s_ in report
                         if (report[s_]["fuse_mlp_o"], report[s_]["cols"],
-                            report[s_]["qdt"]) == key),
+                            report[s_]["qdt"], report[s_]["wdepth"]) == key),
                        key=lambda s_: report[s_]["L"])
         if len(group) < 2:
             continue
-        fmo, cols, qdt = key
+        fmo, cols, qdt, wdepth = key
         tag = (f"FUSE_MLP_O={int(fmo)} ({6-int(fmo)} runs/layer), MLP_DP_COLS={cols}, "
-               f"QUANT_MLP={qdt}")
+               f"QUANT_MLP={qdt}, WEIGHT_DEPTH={wdepth}")
         for label, key in (("median", "median_ms"), ("min", "min_ms")):
             pairs = [(report[s_]["L"], report[s_][key]) for s_ in group]
             alpha, beta, resid = fit_affine(pairs)
