@@ -209,20 +209,27 @@ pub enum WeightsCmd {
     Bake {
         /// `hf:<repo>[@rev]` or `path:/abs`.
         #[arg(long)] source: String,
-        /// npu-weights arch transform: bert|esm|vit|opt|whisper|fastconformer|gigaam|...
-        #[arg(long)] arch: String,
+        /// npu-weights arch transform.
+        // Values from ARCH_NAMES, so completion cannot offer an arch npu-weights does not
+        // implement, nor fall behind when `arch/` grows a module.
+        #[arg(long, value_parser = PossibleValuesParser::new(npu_weights::arch::ARCH_NAMES.to_vec()))]
+        arch: String,
         #[arg(long, value_hint = ValueHint::FilePath)] checkpoint: Option<PathBuf>,
         #[arg(long)] force: bool,
     },
     /// mmap-load a checkpoint and print tensor stats.
     Load {
         #[arg(long, value_hint = ValueHint::FilePath)] checkpoint: PathBuf,
-        #[arg(long)] arch: String,
+        /// npu-weights arch transform.
+        #[arg(long, value_parser = PossibleValuesParser::new(npu_weights::arch::ARCH_NAMES.to_vec()))]
+        arch: String,
     },
     /// Verify checkpoint tensors match a directory of reference .npy within tolerance.
     Verify {
         #[arg(long, value_hint = ValueHint::FilePath)] checkpoint: PathBuf,
-        #[arg(long)] arch: String,
+        /// npu-weights arch transform.
+        #[arg(long, value_parser = PossibleValuesParser::new(npu_weights::arch::ARCH_NAMES.to_vec()))]
+        arch: String,
         #[arg(long, value_hint = ValueHint::DirPath)] refs: PathBuf,
     },
 }
