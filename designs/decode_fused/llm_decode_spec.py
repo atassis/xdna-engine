@@ -138,6 +138,20 @@ class LlmSpec:
     sw_pattern: int | None            # every Nth layer (1-based) is GLOBAL; None = all global
     query_pre_attn_scalar: float | None   # None => scale = head_dim ** -0.5
 
+    # ---- per-layer attention geometry (Gemma-4) ----
+    # Gemma-4-12B is not uniform: its SLIDING layers are head_dim 256 / 8 kv heads and its GLOBAL
+    # layers are head_dim 512 / 1 kv head, selected by the same is_global() rule the theta split
+    # already uses. Both are stated correctly in that checkpoint's config.json (global_head_dim,
+    # num_global_key_value_heads) -- an older note in this file claimed otherwise and was stale.
+    # None on both means "uniform", which is every spec here today.
+    #
+    # THESE FIELDS ARE DATA ONLY AND A NON-UNIFORM SPEC CANNOT BUILD YET. See check(): the host
+    # protocol assumes one head_dim per artifact in two places, so a build would be silently wrong
+    # on the global layers rather than failing. The refusal is deliberately landed BEFORE the
+    # capability.
+    global_head_dim: int | None = None
+    global_n_kv_heads: int | None = None
+
     # ---- derived ----
     @property
     def q_dim(self) -> int:
@@ -161,6 +175,26 @@ class LlmSpec:
         if self.sw_pattern is None:
             return True
         return (layer_idx + 1) % self.sw_pattern == 0
+
+    def geometry_is_uniform(self) -> bool:
+        """True when every layer shares one head_dim and one n_kv_heads."""
+        return self.global_head_dim is None and self.global_n_kv_heads is None
+
+    def head_dim_for(self, layer_idx: int) -> int:
+        if self.global_head_dim is not None and self.is_global(layer_idx):
+            return self.global_head_dim
+        return self.head_dim
+
+    def n_kv_heads_for(self, layer_idx: int) -> int:
+        if self.global_n_kv_heads is not None and self.is_global(layer_idx):
+            return self.global_n_kv_heads
+        return self.n_kv_heads
+
+    def q_dim_for(self, layer_idx: int) -> int:
+        return self.n_q_heads * self.head_dim_for(layer_idx)
+
+    def kv_dim_for(self, layer_idx: int) -> int:
+        return self.n_kv_heads_for(layer_idx) * self.head_dim_for(layer_idx)
 
     def softmax_cols(self, cap: int) -> int:
         """num_aie_columns for the attention Softmax: the widest split of the q heads that fits.
@@ -232,6 +266,26 @@ class LlmSpec:
         tile_size_output=head_dim//2=128 while M//cols is 32, violating `m_output <= M//cols`. The
         device run that gated Gemma used a scratchpad diag copy, not that file.
         """
+        # LOUD REFUSAL, landed before the capability it guards. Per-layer geometry is expressible
+        # above but NOT buildable: two host contracts assume one head_dim per artifact.
+        #   1. npu_decode.rs writes kv_off = pos * head_dim ONCE per token into a single scratchpad
+        #      slot that every one of the 2*n_layers KV-append StridedCopy ops reads. Two head_dims
+        #      mean two byte offsets for the same position and only one reaches the device.
+        #   2. Both RoPE rows are built from the same artifact.head_dim, so the existing
+        #      rope_global/rope_local split differs in THETA but not in WIDTH.
+        # meta.json carries dims.head_dim as a single scalar, so the artifact FORMAT encodes it too.
+        # The failure this refusal prevents is not a crash: it is a clean build that is wrong on the
+        # global layers only, which teacher-forced parity over a handful of tokens can easily miss.
+        if not self.geometry_is_uniform():
+            raise ValueError(
+                f"{self.name}: per-layer attention geometry (head_dim "
+                f"{self.head_dim}/{self.global_head_dim}, n_kv_heads "
+                f"{self.n_kv_heads}/{self.global_n_kv_heads}) is not buildable yet -- the host "
+                f"protocol assumes ONE head_dim per artifact (kv_off is a single scratchpad slot "
+                f"written as pos*head_dim, and both RoPE rows are built at one width). See the "
+                f"task per-layer-head-dim-breaks-the-host-protocol; this refusal exists so a "
+                f"partial implementation cannot build cleanly and be wrong on the global layers.")
+
         for label, m in (("q_dim", self.q_dim), ("kv_dim", self.kv_dim), ("d_model", self.d_model),
                          ("head_dim", self.head_dim), ("ffn", self.ffn), ("vocab", self.vocab)):
             if m % cols:
