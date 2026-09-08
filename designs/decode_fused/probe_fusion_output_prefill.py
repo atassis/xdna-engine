@@ -47,7 +47,8 @@ def run_arm(arm, c, src, dst, x):
     """One arm, TRIALS times. Returns (n_exact_trials, per-trial breakdown)."""
     rows = []
     for _ in range(TRIALS):
-        np.copyto(src.data, x.reshape(-1))
+        with src.overwrite() as _buf:
+            _buf[:] = x.reshape(-1)
         if arm == "data-zero":
             dst.data[:] = 0
         else:

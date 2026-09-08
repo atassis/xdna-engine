@@ -183,9 +183,11 @@ def main():
 
     def one_token(pos, tok):
         t0_ = now()
-        np.copyto(xin.data, np.asarray(embed[tok] * scale, BF16).reshape(-1))
+        with xin.overwrite() as _buf:
+            _buf[:] = np.asarray(embed[tok] * scale, BF16).reshape(-1)
         t1 = now()
-        np.copyto(rope_buf.data, rope_row(pos, HD, sp.rope_theta_global).reshape(-1))
+        with rope_buf.overwrite() as _buf:
+            _buf[:] = rope_row(pos, HD, sp.rope_theta_global).reshape(-1)
         t2 = now()
         params.write("kv_off", int(pos * HD))
         params.write("sm_mask", int(pos + 1))
@@ -259,7 +261,8 @@ def main():
     def reset_kv():
         for name in cache_names:
             buf = c.get_buffer(name)
-            np.copyto(buf.data, weights[name])
+            with buf.overwrite() as _buf:
+                _buf[:] = weights[name]
 
     # Every scratch buffer the runlist ever writes that is NOT a loaded weight -- q/k/v/sc/sw/vt/
     # cx/a/g/u/gh/d/hn/hf/x1 per layer. These are declared by SIZE only (bufsz in
@@ -281,7 +284,8 @@ def main():
     def reset_all():
         reset_kv()
         for name, zeros in extra_scratch.items():
-            np.copyto(c.get_buffer(name).data, zeros)
+            with c.get_buffer(name).overwrite() as _buf:
+                _buf[:] = zeros
         push_scratch()
 
     det_sequences = []

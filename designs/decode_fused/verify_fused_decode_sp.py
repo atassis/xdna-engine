@@ -216,7 +216,8 @@ def main():
     fus_toks, tok = [], SOT
     for step in range(a.steps):
         x = bf16(emb_t[tok] + emb_p[step])
-        np.copyto(xin.data, x.reshape(-1))
+        with xin.overwrite() as _buf:
+            _buf[:] = x.reshape(-1)
         callable_.input_buffer.to("npu")
         sp.write("kv_off", step * HD)   # element-units position offset (additive BD offset)
         sp.write("sm_mask", step + 1)   # context length = #valid self-attn positions

@@ -162,9 +162,10 @@ def main():
     print(f"[layer-arms] {len(arms)} arms resident, dispatching at pos={a.pos}", flush=True)
 
     def one(arm):
-        np.copyto(arm["xin"].data, np.asarray(embed[TOK] * arm["scale"], BF16).reshape(-1))
-        np.copyto(arm["rope_buf"].data,
-                  rope_row(a.pos, arm["sp"].head_dim, arm["sp"].rope_theta_global).reshape(-1))
+        with arm["xin"].overwrite() as _buf:
+            _buf[:] = np.asarray(embed[TOK] * arm["scale"], BF16).reshape(-1)
+        with arm["rope_buf"].overwrite() as _buf:
+            _buf[:] = rope_row(a.pos, arm["sp"].head_dim, arm["sp"].rope_theta_global).reshape(-1)
         arm["params"].write("kv_off", int(a.pos * arm["sp"].head_dim))
         arm["params"].write("sm_mask", int(a.pos + 1))
         arm["params"].sync()
