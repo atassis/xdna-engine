@@ -282,11 +282,23 @@ fn spawn(cfg: Config, loader: Box<dyn ModelLoader + Send>, eager: bool) -> Resul
                             "unknown model {name:?} (not in the config)"))),
                         Some(_) => {
                             let was = reg.get_loaded(&name).is_some();
-                            if was { reg.release(&name, "unloaded: asked for"); }
-                            // An unload frees a working set, so the deep release has something new
-                            // to trim -- the same bookkeeping the idle sweep does.
-                            if was { released = false; }
-                            Ok(was)
+                            // Behind `guard`, like the idle sweep's release -- dropping a model runs
+                            // native teardown (XRT, onnxruntime) and a panic there must not take the
+                            // actor with it. NOTE this does NOT make teardown safe: the observed
+                            // failure is a SIGSEGV, which catch_unwind cannot see. See task
+                            // `model-teardown-segfaults-the-service`.
+                            match was {
+                                false => Ok(false),
+                                true => match guard(|| reg.release(&name, "unloaded: asked for")) {
+                                    Ok(()) => {
+                                        // An unload frees a working set, so the deep release has
+                                        // something new to trim -- as after the idle sweep.
+                                        released = false;
+                                        Ok(true)
+                                    }
+                                    Err(m) => Err(EngineError::Device(format!("unload {name}: {m}"))),
+                                },
+                            }
                         }
                     };
                     let _ = reply.send(r);
