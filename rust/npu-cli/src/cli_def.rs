@@ -93,12 +93,20 @@ pub enum Cmd {
         #[command(flatten)] sampling: SamplingArgs,
         #[arg(long)] no_stream: bool,
     },
-    /// List models on a running server.
-    /// The models this install is configured to serve, from the config file.
+    /// The configured models, plus what the service currently has resident.
     ///
-    /// Local only -- it never contacts the server, so it answers with the service down. For what a
-    /// RUNNING server is serving, ask the server: `curl :11434/v1/models`.
-    Models { #[arg(long)] json: bool },
+    /// Answers from the config, so it works with the service down. When the service IS up it merges
+    /// the state it publishes to a file -- no socket, no probe, nothing to hang on -- and prints how
+    /// old that snapshot is. A `*` in PIN means the running server's pin disagrees with the config,
+    /// which is what `npu reload` fixes.
+    Models {
+        /// Machine-readable output. Carries both `pinned` (config) and `live_pinned` (server), which
+        /// the table collapses into one PIN cell, so a script can act on the drift the `*` only flags.
+        #[arg(long)] json: bool,
+        /// Read the status published for this port instead of the config's, to inspect a second
+        /// instance. The port is the key the service files its status under, not something dialled.
+        #[arg(long)] port: Option<u16>,
+    },
     /// Ask a running server to re-read the config and reconcile.
     Reload { #[arg(long)] port: Option<u16> },
     /// Pre-bake a model's weight checkpoint (host-only, no device).
@@ -182,6 +190,28 @@ pub enum ConfigCmd {
     Show,
     AddModel { name: String, #[arg(value_hint = ValueHint::FilePath)] scenario: String },
     RemoveModel { name: String },
+    /// Pin a model resident: exempt from idle unload, never chosen as an eviction victim.
+    ///
+    /// What a pin does NOT do is win a slot it would not otherwise have had. Admission is still
+    /// first-N-in-config-order against `max_resident`, so pinning a model listed after enough
+    /// others leaves it loading on demand as before -- the server says so on startup rather than
+    /// declining the intent silently. Takes effect on `npu reload`; no restart, no device churn.
+    Pin { model: String },
+    /// Drop a model's residency pin: it becomes swept when idle and evictable again.
+    Unpin { model: String },
+    /// Set one `[server]` key. `npu config set --help` lists them.
+    ///
+    /// The key list is closed on purpose: an unrecognised key would produce a file that still
+    /// parses and silently does nothing, which is the one failure a config typo must never have.
+    // Values from SERVER_KEYS, so completion cannot offer a knob the binary does not read, nor
+    // fall behind when one is added.
+    #[command(after_long_help = npu_runtime::config_doc::server_key_help_text())]
+    Set {
+        #[arg(value_parser = PossibleValuesParser::new(
+            npu_runtime::config_doc::SERVER_KEYS.iter().map(|(k, _)| *k).collect::<Vec<_>>()))]
+        key: String,
+        value: String,
+    },
     /// Set the default model for a capability.
     // Values come from Capability::ALL, so completion cannot offer a capability this binary does
     // not implement, nor fall behind when one is added.

@@ -40,7 +40,7 @@ fn main() -> Result<()> {
         Cmd::TranscribeMedia { input, out, format, asr, diarize: diar, track, no_diarize } =>
             transcribe_media(&path, input, out.as_deref(), *format, asr.as_deref(),
                              diar.as_deref(), *track, *no_diarize),
-        Cmd::Models { json } => models(&path, *json),
+        Cmd::Models { json, port } => models(&path, *json, *port),
         Cmd::Reload { port } => reload(&path, *port),
         Cmd::Bake { name } => bake(&path, name),
         Cmd::Config { action } => config_cmd(&path, action),
@@ -514,9 +514,9 @@ fn embed(path: &Path, text: &str, model: Option<&str>) -> Result<()> {
 /// signal -- no probe, no handshake, no timeout, and no way to mistake ollama on the shared 11434
 /// for us. A wedged service cannot hang this command, because reading bytes is not connecting; it
 /// shows the last published state and how old it is, and lets the reader judge.
-fn models(path: &Path, as_json: bool) -> Result<()> {
+fn models(path: &Path, as_json: bool, port: Option<u16>) -> Result<()> {
     let cfg = load_cfg(path)?;
-    let live = read_live_status(cfg.server.port);
+    let live = read_live_status(port.unwrap_or(cfg.server.port));
 
     if as_json {
         let rows: Vec<_> = cfg.models.iter().map(|m| {
@@ -524,6 +524,10 @@ fn models(path: &Path, as_json: bool) -> Result<()> {
             serde_json::json!({
                 "id": m.name, "scenario": m.scenario,
                 "state": l.and_then(|x| x.get("state").and_then(|s| s.as_str())).unwrap_or("unknown"),
+                // Both, because they are allowed to differ: the config is desired state and the
+                // service only adopts it on reload. That gap is the thing worth reporting.
+                "pinned": m.resident,
+                "live_pinned": l.and_then(|x| x.get("pinned").and_then(|s| s.as_bool())),
             })
         }).collect();
         let age = live.as_ref().map(|(a, _)| serde_json::json!(a));
@@ -532,15 +536,21 @@ fn models(path: &Path, as_json: bool) -> Result<()> {
         return Ok(());
     }
 
-    println!("{:<22} {:<9} {:<8}  {}", "NAME", "STATE", "KIND", "SCENARIO");
+    println!("{:<22} {:<9} {:<8} {:<5}  {}", "NAME", "STATE", "KIND", "PIN", "SCENARIO");
+    let mut drifted = false;
     for m in &cfg.models {
         let l = live.as_ref().and_then(|(_, v)| find_live(v, &m.name));
         let f = |k: &str| l.and_then(|x| x.get(k).and_then(|s| s.as_str())).unwrap_or("-").to_string();
-        println!("{:<22} {:<9} {:<8}  {}", m.name, f("state"), f("kind"), m.scenario);
+        let pin = pin_cell(m.resident, l.and_then(|x| x.get("pinned")).and_then(|p| p.as_bool()));
+        if pin.ends_with('*') { drifted = true; }
+        println!("{:<22} {:<9} {:<8} {:<5}  {}", m.name, f("state"), f("kind"), pin, m.scenario);
     }
     match &live {
         Some((age, _)) => println!("\n(live state as of {age}s ago)"),
         None => println!("\n(service not running -- configured models only)"),
+    }
+    if drifted {
+        println!("* the running server has a different pin than the config -- run `npu reload`");
     }
     Ok(())
 }
@@ -579,6 +589,18 @@ fn read_live_status(want_port: u16) -> Option<(u64, serde_json::Value)> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
     Some((now.saturating_sub(written), v))
+}
+
+/// The PIN column. `*` marks a config pin the running server has not adopted yet -- which is the
+/// normal state between `npu config pin` and `npu reload`, and the one thing a pin column has to be
+/// able to say. A server too old to publish `pinned` reports `None`, and gets the config's answer
+/// without a drift marker rather than a fabricated disagreement.
+fn pin_cell(want: bool, live: Option<bool>) -> String {
+    let w = if want { "yes" } else { "no" };
+    match live {
+        Some(l) if l != want => format!("{w}*"),
+        _ => w.to_string(),
+    }
 }
 
 fn find_live<'a>(doc: &'a serde_json::Value, name: &str) -> Option<&'a serde_json::Value> {
@@ -642,24 +664,78 @@ fn weights_cmd(path: &Path, action: &WeightsCmd) -> Result<()> {
     Ok(())
 }
 
+/// Every mutation goes through `ConfigDoc`, which edits the FILE rather than round-tripping a
+/// deserialized `Config` back through the serializer. The struct does not carry comments, so the
+/// old path silently deleted every one of them -- including the ones the engine's own generated
+/// config ships with.
 fn config_cmd(path: &Path, action: &ConfigCmd) -> Result<()> {
-    let mut cfg = load_cfg(path)?;
-    match action {
-        ConfigCmd::Show => { print!("{}", render(&cfg)); return Ok(()); }
+    if let ConfigCmd::Show = action {
+        print!("{}", render(&load_cfg(path)?));
+        return Ok(());
+    }
+    let mut doc = npu_runtime::ConfigDoc::load(path).map_err(|e| anyhow!(e))?;
+    // What to print once the write lands. Held rather than printed inline so a command that then
+    // fails validation says nothing, instead of reporting a change it did not make.
+    let note = match action {
+        ConfigCmd::Show => unreachable!("handled above"),
         ConfigCmd::AddModel { name, scenario } => {
-            cfg.models.retain(|m| &m.name != name);
-            cfg.models.push(npu_runtime::config::ModelCfg { name: name.clone(), scenario: scenario.clone(), resident: false });
+            doc.add_model(name, scenario).map_err(|e| anyhow!(e))?;
+            format!("model {name} -> {scenario}")
         }
-        ConfigCmd::RemoveModel { name } => cfg.models.retain(|m| &m.name != name),
+        ConfigCmd::RemoveModel { name } => {
+            if !doc.remove_model(name).map_err(|e| anyhow!(e))? {
+                return Err(anyhow!("unknown model {name:?} (not in the config)"));
+            }
+            format!("removed model {name}")
+        }
+        ConfigCmd::Pin { model } | ConfigCmd::Unpin { model } => {
+            let on = matches!(action, ConfigCmd::Pin { .. });
+            // Refuse rather than write: a pin on a name the config does not have is a typo, and
+            // there is nothing in the file for the key to attach to.
+            if !doc.set_resident(model, on).map_err(|e| anyhow!(e))? {
+                return Err(anyhow!("unknown model {model:?} (not in the config)"));
+            }
+            if on { format!("pinned {model} resident") } else { format!("unpinned {model}") }
+        }
+        ConfigCmd::Set { key, value } => {
+            doc.set_server(key, value).map_err(|e| anyhow!(e))?;
+            format!("server.{key} = {value}")
+        }
         ConfigCmd::SetDefault { capability, model } => match Capability::from_name(capability) {
-            Some(cap) => cfg.defaults.set(cap, model.clone()),
+            Some(cap) => { doc.set_default(cap, model); format!("default {capability} = {model}") }
             None => return Err(anyhow!("unknown capability {capability:?} (one of: {})",
                 Capability::ALL.iter().map(|c| c.0).collect::<Vec<_>>().join("|"))),
         },
+    };
+    let cfg = doc.save(path).map_err(|e| anyhow!(e))?;
+    println!("{note}  [{}]", path.display());
+    // Warn on the same conditions `npu config show` does, so an edit that creates one is caught
+    // where it is made rather than at the next boot.
+    if let Some(w) = cfg.pin_overcommit() { eprintln!("WARNING: {w}"); }
+    if let Some(w) = pins_behind_admission(&cfg) { eprintln!("WARNING: {w}"); }
+    // The file is desired state; the running service only picks it up when asked.
+    if matches!(action, ConfigCmd::Pin { .. } | ConfigCmd::Unpin { .. } | ConfigCmd::Set { .. }) {
+        println!("run `npu reload` to apply this to a running server");
     }
-    cfg.save(path).map_err(|e| anyhow!(e))?;
-    println!("updated {}", path.display());
     Ok(())
+}
+
+/// `Some(message)` when a pinned model sits behind enough unpinned ones that boot admission will
+/// not reach it.
+///
+/// A pin means exempt-from-eviction, NOT entitled to a slot: `reconcile` walks the models in CONFIG
+/// ORDER and stops admitting at `max_resident`, and `Config::pinned()` has no caller there. So the
+/// pin is real but arrives late -- the model loads on demand and then stays. Worth saying, because
+/// the config states an intent the runtime partly declines and used to do so in silence.
+fn pins_behind_admission(cfg: &Config) -> Option<String> {
+    let late: Vec<&str> = cfg.models.iter().enumerate()
+        .filter(|(i, m)| m.resident && *i >= cfg.server.max_resident)
+        .map(|(_, m)| m.name.as_str()).collect();
+    (!late.is_empty()).then(|| format!(
+        "pinned but not admitted at boot: {}. A pin exempts a model from eviction and the idle \
+         sweep; it does not win a slot. Admission is the first {} models in config order, so these \
+         load on demand (and then stay). Move them earlier, or raise max_resident.",
+        late.join(" "), cfg.server.max_resident))
 }
 
 /// Human-readable config summary (pure, testable).
@@ -681,11 +757,18 @@ fn render(cfg: &Config) -> String {
     // Surface the overcommit here rather than only at load time: the config summary is where an
     // operator looks BEFORE a refusal, not after one.
     if let Some(w) = cfg.pin_overcommit() { s.push_str(&format!("WARNING: {w}\n")); }
+    if let Some(w) = pins_behind_admission(cfg) { s.push_str(&format!("WARNING: {w}\n")); }
     let defaults = cfg.defaults.0.iter().map(|(c, m)| format!("{c}={m}")).collect::<Vec<_>>();
     s.push_str(&format!("defaults: {}\n",
         if defaults.is_empty() { "(none)".to_string() } else { defaults.join(" ") }));
     if cfg.models.is_empty() { s.push_str("models: (none)\n"); }
-    for m in &cfg.models { s.push_str(&format!("model {} -> {}\n", m.name, m.scenario)); }
+    // The pin is marked on the model's own line as well as summarised above: the summary answers
+    // "what is pinned", the marker answers "is THIS one pinned", and the second question is the one
+    // asked while reading down a list of eight.
+    for m in &cfg.models {
+        s.push_str(&format!("model {} -> {}{}\n", m.name, m.scenario,
+            if m.resident { "  [pinned]" } else { "" }));
+    }
     s
 }
 
@@ -724,6 +807,91 @@ mod tests {
         assert_eq!(f[0], "whisper-turbo");
         assert_eq!(f[1], "scenarios/asr-whisper-turbo.toml");
         assert_eq!(f.len(), 2, "a row must be exactly two fields: {line:?}");
+    }
+
+    /// The one thing a PIN column must be able to say: the config and the running server disagree,
+    /// which is the normal state between `npu config pin` and `npu reload`.
+    #[test]
+    fn pin_cell_marks_config_and_server_disagreeing() {
+        assert_eq!(pin_cell(true, Some(true)), "yes");
+        assert_eq!(pin_cell(false, Some(false)), "no");
+        assert_eq!(pin_cell(true, Some(false)), "yes*", "pinned in the config, not yet reloaded");
+        assert_eq!(pin_cell(false, Some(true)), "no*", "unpinned in the config, not yet reloaded");
+        // A server too old to publish `pinned`, or none running: report the config, invent nothing.
+        assert_eq!(pin_cell(true, None), "yes");
+        assert_eq!(pin_cell(false, None), "no");
+    }
+
+    fn pin_cfg(max_resident: usize, models: &[(&str, bool)]) -> npu_runtime::config::Config {
+        npu_runtime::config::Config {
+            server: ServerCfg { max_resident, ..Default::default() },
+            models: models.iter().map(|(n, r)| ModelCfg {
+                name: (*n).into(), scenario: "x".into(), resident: *r }).collect(),
+            ..Default::default()
+        }
+    }
+
+    /// A pin is exempt-from-eviction, not entitled to a slot. Saying so where the pin is SET beats
+    /// leaving it to be discovered in `/v1/models` after something has already gone wrong.
+    #[test]
+    fn a_pin_boot_admission_cannot_reach_is_reported() {
+        assert!(pins_behind_admission(&pin_cfg(1, &[("a", false), ("b", true)]))
+            .is_some_and(|w| w.contains('b')), "b is pinned but second with one slot");
+        assert!(pins_behind_admission(&pin_cfg(2, &[("a", false), ("b", true)])).is_none(),
+            "two slots reach b, so there is nothing to warn about");
+        assert!(pins_behind_admission(&pin_cfg(1, &[("b", true), ("a", false)])).is_none(),
+            "a pin first in config order is admitted; order is what decides, not the pin");
+        assert!(pins_behind_admission(&pin_cfg(1, &[("a", false), ("b", false)])).is_none(),
+            "an unpinned deferral is ordinary capacity, not a declined intent");
+    }
+
+    #[test]
+    fn render_marks_which_models_are_pinned() {
+        let out = render(&pin_cfg(4, &[("a", false), ("b", true)]));
+        assert!(out.contains("model b -> x  [pinned]"), "{out}");
+        assert!(out.contains("model a -> x\n"), "an unpinned model gets no marker: {out}");
+        assert!(out.contains("pinned resident: b"), "{out}");
+    }
+
+    /// `npu config` edits the file a human wrote. Every verb has to leave the rest of it alone.
+    #[test]
+    fn config_verbs_edit_in_place_without_destroying_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("engine.toml");
+        std::fs::write(&p, "# keep me\n[server]\nmax_resident = 2\n\n[[model]]\nname = \"a\"\nscenario = \"s.toml\"\n").unwrap();
+
+        config_cmd(&p, &ConfigCmd::Pin { model: "a".into() }).unwrap();
+        assert!(npu_runtime::config::Config::load(&p).unwrap().find("a").unwrap().resident);
+
+        config_cmd(&p, &ConfigCmd::Set { key: "idle_unload_s".into(), value: "0".into() }).unwrap();
+        let cfg = npu_runtime::config::Config::load(&p).unwrap();
+        assert_eq!(cfg.server.idle_unload(), None, "0 is how idle unload is switched off");
+        assert_eq!(cfg.server.max_resident, 2, "an unnamed key must not move");
+
+        // Re-pointing a scenario must not silently unpin.
+        config_cmd(&p, &ConfigCmd::AddModel { name: "a".into(), scenario: "t.toml".into() }).unwrap();
+        let cfg = npu_runtime::config::Config::load(&p).unwrap();
+        assert_eq!(cfg.find("a").unwrap().scenario, "t.toml");
+        assert!(cfg.find("a").unwrap().resident);
+
+        config_cmd(&p, &ConfigCmd::Unpin { model: "a".into() }).unwrap();
+        assert!(!npu_runtime::config::Config::load(&p).unwrap().find("a").unwrap().resident);
+
+        assert!(std::fs::read_to_string(&p).unwrap().contains("# keep me"),
+            "every verb has to preserve the comments");
+    }
+
+    #[test]
+    fn config_verbs_refuse_a_name_or_key_they_cannot_honour() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("engine.toml");
+        std::fs::write(&p, "[[model]]\nname = \"a\"\nscenario = \"s\"\n").unwrap();
+        let before = std::fs::read_to_string(&p).unwrap();
+        assert!(config_cmd(&p, &ConfigCmd::Pin { model: "nope".into() }).is_err());
+        assert!(config_cmd(&p, &ConfigCmd::Unpin { model: "nope".into() }).is_err());
+        assert!(config_cmd(&p, &ConfigCmd::RemoveModel { name: "nope".into() }).is_err());
+        assert!(config_cmd(&p, &ConfigCmd::Set { key: "max_resident".into(), value: "-1".into() }).is_err());
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), before, "a refused command writes nothing");
     }
 
     #[test]
