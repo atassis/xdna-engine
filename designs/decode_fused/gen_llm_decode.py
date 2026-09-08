@@ -544,9 +544,13 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
                 "FUSE_MLP_O folds op_o INTO the swiglu_mlp_dp design; it needs FUSE_MLP_DP=1"
             )
         if QUANT_ATTN_DTYPE != "bf16":
+            # Under fuse_o, Wo rides the MLP design's single weight ObjectFifo, and one fifo
+            # carries one wire format. So Wo's dtype is QUANT_MLP_DTYPE's, not its own axis --
+            # QUANT_ATTN_DTYPE would silently mean nothing here rather than a little.
             raise NotImplementedError(
-                "FUSE_MLP_O's Wo path (swiglu_mlp_dp's fuse_o) is bf16-only, no quant kwarg "
-                f"support yet; got QUANT_ATTN_DTYPE={QUANT_ATTN_DTYPE!r}"
+                "FUSE_MLP_O folds Wo into swiglu_mlp_dp's shared weight channel, so Wo takes "
+                f"QUANT_MLP_DTYPE ({QUANT_MLP_DTYPE!r}), not QUANT_ATTN_DTYPE "
+                f"({QUANT_ATTN_DTYPE!r}); set FUSE_MLP_O=0 to quantize Wo independently"
             )
     op_qkv = gemv(QD + 2 * KVD, D, ctx) if FUSE_QKV_GEMV else None
     op_q = gemv(QD, D, ctx)
@@ -673,7 +677,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
         op_mlp_dp = SwiGLUMLPDataParallel(D=D, FF=FF, num_aie_columns=MLP_DP_COLS,
                                           epsilon=sp.eps,
                                           QD=QD if FUSE_MLP_O else None, fuse_o=FUSE_MLP_O,
-                                          context=ctx)
+                                          context=ctx, **mlp_quant_kw)
     if not fuse_act:
         if sp.act == "silu":
             op_act = SiLU(size=FF, num_aie_columns=COLS, tile_size=FF // COLS, context=ctx)
@@ -714,6 +718,9 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
             elif key == "Wo" and QUANT_ATTN_DTYPE != "bf16":
                 weights[p + key] = quantize_weight(w, QUANT_ATTN_GROUP, QUANT_ATTN_DTYPE)
             elif key == "Wo" and FUSE_MLP_O:
+                # Pad FIRST, then quantize: the pad rows must be a whole number of groups in the
+                # same wire format as the rest of the channel. Zero rows quantize to amax=0 ->
+                # scale 1.0, q=0, so their contribution stays exactly zero.
                 # swiglu_mlp_dp's fuse_o tiles Wo's D output rows in TSI_O=3-row groups shared
                 # byte-identically with Wg/Wu/Wd's weight channel; D/MLP_DP_COLS is never a
                 # multiple of 3 (D is a power of two), so every core reads one row PAST its own
@@ -723,7 +730,10 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
                 # module docstring for the full derivation).
                 pad_rows = op_mlp_dp._wo_rows_padded - D
                 w_padded = np.pad(w, ((0, pad_rows), (0, 0)))
-                weights[p + key] = bf16(w_padded).reshape(-1)
+                weights[p + key] = (
+                    quantize_weight(w_padded, QUANT_MLP_GROUP, QUANT_MLP_DTYPE)
+                    if QUANT_MLP_DTYPE != "bf16" else bf16(w_padded).reshape(-1)
+                )
             elif key in qkv_keys and FUSE_QKV_GEMV:
                 qkv_parts.append(bf16(w).reshape(-1))     # row-major, so concatenation IS stacking
             else:
