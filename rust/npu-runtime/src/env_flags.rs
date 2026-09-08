@@ -164,22 +164,22 @@ pub const FLAGS: &[Flag] = &[
               setting it for one crate's artifacts without the other is a silent mismatch." },
 
     // -- npu-cli --------------------------------------------------------------------------------
-    Flag { name: "NPU_CONFIG", owner: "npu-cli", site: "npu-cli/src/main.rs:24",
+    Flag { name: "NPU_CONFIG", owner: "npu-cli", site: "npu-cli/src/main.rs:32",
         semantics: Value, default: "$HOME/.config/npu/engine.toml",
         doc: "overrides the engine.toml config path (also settable via --config)." },
-    Flag { name: "NPU_QUIET", owner: "npu-cli", site: "npu-cli/src/main.rs:66",
+    Flag { name: "NPU_QUIET", owner: "npu-cli", site: "npu-cli/src/main.rs:89",
         semantics: Presence, default: "n/a (checks ABSENCE, not presence)",
         doc: "DOCUMENTED FALSE LEAD, correct as written: quiet_one_shot() checks \
               var_os(..).is_none() -- \"did the caller express a preference at all\" -- and only \
               then sets NPU_QUIET=1 for one-shot commands. It does not itself gate the banners; \
               npu-xrt's NPU_QUIET (this table, owner npu-xrt) is the actual consumer." },
-    Flag { name: "XDNA_ENGINE_ROOT", owner: "npu-cli", site: "npu-cli/src/main.rs:89",
+    Flag { name: "XDNA_ENGINE_ROOT", owner: "npu-cli", site: "npu-cli/src/main.rs:112",
         semantics: Value, default: "derived (XDG_DATA_HOME, or cwd, checked for scenarios/)",
         doc: "explicit override for the repo root that scenario/artifact paths resolve against." },
-    Flag { name: "XDG_DATA_HOME", owner: "npu-cli", site: "npu-cli/src/main.rs:93",
+    Flag { name: "XDG_DATA_HOME", owner: "npu-cli", site: "npu-cli/src/main.rs:116",
         semantics: Value, default: "$HOME/.local/share",
         doc: "XDG data-home candidate for the install root when XDNA_ENGINE_ROOT is unset." },
-    Flag { name: "NPU_ASR_MAX_SPAN_S", owner: "npu-cli", site: "npu-cli/src/main.rs:370",
+    Flag { name: "NPU_ASR_MAX_SPAN_S", owner: "npu-cli", site: "npu-cli/src/main.rs:417",
         semantics: Value, default: "18.0",
         doc: "max transcription window span in seconds; span-granularity only now that both ASR \
               backends window internally (not re-measured against them)." },
