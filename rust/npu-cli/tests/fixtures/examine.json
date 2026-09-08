@@ -1,0 +1,60 @@
+{
+    "schema_version": {
+        "schema": "JSON",
+        "creation_date": "Tue Sep  8 11:23:32 2026 GMT"
+    },
+    "system": {
+        "host": {
+            "os": {
+                "sysname": "Linux",
+                "release": "7.2.0-1-cachyos",
+                "version": "#1 SMP PREEMPT_DYNAMIC Thu, 20 Aug 2026 06:06:30 +0000",
+                "machine": "x86_64",
+                "distribution": "CachyOS",
+                "bios_vendor": "American Megatrends International, LLC.",
+                "bios_version": "UM5606GA.305",
+                "model": "Zenbook S16 UM5606GA",
+                "cores": "20",
+                "memory_bytes": "0x79f44d000",
+                "libraries": [
+                    {
+                        "name": "glibc",
+                        "version": "2.44"
+                    }
+                ],
+                "hostname": "cachyos-26",
+                "processor": "AMD Ryzen AI 9 465 w\/ Radeon 880M"
+            },
+            "xrt": {
+                "version": "2.21.75",
+                "branch": "makepkg",
+                "hash": "4eb1f4392a012b4e6eca759762389c612537f7c7",
+                "build_date": "2026-08-20 00:55:31",
+                "drivers": [
+                    {
+                        "name": "virtio-pci",
+                        "version": "unknown",
+                        "hash": "unknown"
+                    },
+                    {
+                        "name": "amdxdna",
+                        "version": "2.26.0_20260901",
+                        "hash": "2b078d0957838e0ce6964dfdab7d082f09bd7e1f"
+                    }
+                ]
+            },
+            "devices": [
+                {
+                    "bdf": "0000:c5:00.1",
+                    "device_class": "Ryzen",
+                    "name": "NPU Gorgon Point 1",
+                    "id": "00000000-0000-0000-0000-000000000000",
+                    "firmware_version": "1.1.2.64",
+                    "instance": "user(inst=0)",
+                    "is_ready": "true"
+                }
+            ]
+        }
+    }
+}
+

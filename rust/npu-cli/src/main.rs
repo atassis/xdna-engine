@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 mod cli_def;
+mod doctor;
 mod exit;
 mod media;
 
@@ -22,11 +23,15 @@ use npu_runtime::http;
 use npu_runtime::loader::EngineLoader;
 use npu_runtime::stream::StreamItem;
 
-fn config_path(cli: &Cli) -> PathBuf {
-    if let Some(p) = &cli.config { return p.clone(); }
-    if let Ok(p) = std::env::var("NPU_CONFIG") { return PathBuf::from(p); }
+fn config_path(cli: &Cli) -> PathBuf { config_path_and_source(cli).0 }
+
+/// [`config_path`] plus WHICH of the three sources won -- `--config` beats `$NPU_CONFIG` beats the
+/// default path. `npu doctor` reports this directly; every other caller just wants the path.
+fn config_path_and_source(cli: &Cli) -> (PathBuf, &'static str) {
+    if let Some(p) = &cli.config { return (p.clone(), "--config flag"); }
+    if let Ok(p) = std::env::var("NPU_CONFIG") { return (PathBuf::from(p), "$NPU_CONFIG"); }
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    PathBuf::from(home).join(".config/npu/engine.toml")
+    (PathBuf::from(home).join(".config/npu/engine.toml"), "default path (~/.config/npu/engine.toml)")
 }
 
 /// The one place an error becomes a process exit code (`exit::of`) -- see `exit.rs`. Printing
@@ -56,13 +61,14 @@ fn run(cli: &Cli, path: &Path) -> Result<()> {
         Cmd::TranscribeMedia { input, out, format, asr, diarize: diar, track, no_diarize } =>
             transcribe_media(path, input, out.as_deref(), *format, asr.as_deref(),
                              diar.as_deref(), *track, *no_diarize),
-        Cmd::Models { json, port } => models(path, *json, *port),
-        Cmd::Reload { port } => reload(path, *port),
-        Cmd::Load { model, port } => load_model(path, model, *port),
-        Cmd::Unload { model, port } => unload_model(path, model, *port),
-        Cmd::Bake { name } => bake(path, name),
-        Cmd::Config { action } => config_cmd(path, action),
-        Cmd::Weights { action } => weights_cmd(path, action),
+        Cmd::Models { json, port } => models(&path, *json, *port),
+        Cmd::Reload { port } => reload(&path, *port),
+        Cmd::Load { model, port } => load_model(&path, model, *port),
+        Cmd::Unload { model, port } => unload_model(&path, model, *port),
+        Cmd::Bake { name } => bake(&path, name),
+        Cmd::Config { action } => config_cmd(&path, action),
+        Cmd::Weights { action } => weights_cmd(&path, action),
+        Cmd::Doctor { json } => doctor::doctor(&cli, *json),
         Cmd::Completions { shell } => {
             let mut cmd = Cli::command();
             let name = cmd.get_name().to_string();

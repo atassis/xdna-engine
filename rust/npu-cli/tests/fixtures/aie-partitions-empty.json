@@ -1,0 +1,18 @@
+{
+    "schema_version": {
+        "schema": "JSON",
+        "creation_date": "Tue Sep  8 11:24:30 2026 GMT"
+    },
+    "devices": [
+        {
+            "interface_type": "pcie",
+            "device_id": "0000:c5:00.1",
+            "aie_partitions": {
+                "description": "AIE Partition Information",
+                "total_memory_usage": "N\/A",
+                "partitions": ""
+            }
+        }
+    ]
+}
+

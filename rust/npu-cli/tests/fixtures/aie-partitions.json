@@ -1,0 +1,98 @@
+{
+    "schema_version": {
+        "schema": "JSON",
+        "creation_date": "Tue Sep  8 11:23:32 2026 GMT"
+    },
+    "devices": [
+        {
+            "interface_type": "pcie",
+            "device_id": "0000:c5:00.1",
+            "aie_partitions": {
+                "description": "AIE Partition Information",
+                "total_memory_usage": "N\/A",
+                "partitions": [
+                    {
+                        "start_col": "0",
+                        "num_cols": "8",
+                        "partition_index": "0",
+                        "hw_contexts": [
+                            {
+                                "pid": "144071",
+                                "process_name": "N\/A",
+                                "context_id": "95",
+                                "status": "Idle",
+                                "instr_bo_mem": "6696 KB",
+                                "command_submissions": "0",
+                                "command_completions": "0",
+                                "migrations": "0",
+                                "errors": "0",
+                                "suspensions": "0",
+                                "memory_usage": "N\/A",
+                                "gops": "N\/A",
+                                "egops": "N\/A",
+                                "fps": "N\/A",
+                                "latency": "N\/A",
+                                "priority": "N\/A"
+                            },
+                            {
+                                "pid": "144071",
+                                "process_name": "N\/A",
+                                "context_id": "99",
+                                "status": "Idle",
+                                "instr_bo_mem": "6696 KB",
+                                "command_submissions": "0",
+                                "command_completions": "0",
+                                "migrations": "0",
+                                "errors": "0",
+                                "suspensions": "0",
+                                "memory_usage": "N\/A",
+                                "gops": "N\/A",
+                                "egops": "N\/A",
+                                "fps": "N\/A",
+                                "latency": "N\/A",
+                                "priority": "N\/A"
+                            },
+                            {
+                                "pid": "144071",
+                                "process_name": "N\/A",
+                                "context_id": "100",
+                                "status": "Idle",
+                                "instr_bo_mem": "6696 KB",
+                                "command_submissions": "0",
+                                "command_completions": "0",
+                                "migrations": "0",
+                                "errors": "0",
+                                "suspensions": "0",
+                                "memory_usage": "N\/A",
+                                "gops": "N\/A",
+                                "egops": "N\/A",
+                                "fps": "N\/A",
+                                "latency": "N\/A",
+                                "priority": "N\/A"
+                            },
+                            {
+                                "pid": "144071",
+                                "process_name": "N\/A",
+                                "context_id": "103",
+                                "status": "Idle",
+                                "instr_bo_mem": "6696 KB",
+                                "command_submissions": "0",
+                                "command_completions": "0",
+                                "migrations": "0",
+                                "errors": "0",
+                                "suspensions": "0",
+                                "memory_usage": "N\/A",
+                                "gops": "N\/A",
+                                "egops": "N\/A",
+                                "fps": "N\/A",
+                                "latency": "N\/A",
+                                "priority": "N\/A"
+                            }
+                        ]
+                    }
+                ]
+            }
+        }
+    ]
+}
+

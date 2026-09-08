@@ -148,6 +148,16 @@ pub enum Cmd {
     Completions { shell: Shell },
     /// Inspect / edit the desired-state config.
     Config { #[command(subcommand)] action: ConfigCmd },
+    /// Read-only self-test: device/driver versions, power mode, who holds the device, which
+    /// config is in effect and why, whether configured models' artifacts resolve, service status.
+    ///
+    /// Answers "is my install actually working, and what state is the device in" without touching
+    /// the device -- no `Device::open`, no dispatch, no hardware context taken. Shells out to
+    /// `xrt-smi examine` (unprivileged, read-only) and reads files only.
+    Doctor {
+        /// Machine-readable output.
+        #[arg(long)] json: bool,
+    },
 }
 
 /// Sampling flags shared by `generate` and `chat`. `None` means "use the engine default"
