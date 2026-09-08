@@ -541,10 +541,14 @@ mod tests {
     /// DMA/scheduling bytes even when it isn't a correctness fix. A ~6-day upstream advance
     /// changing instruction scheduling is fully sufficient to flip a genuine 0.02-margin bf16 tie.
     /// Host-side bytes were independently verified byte-identical against `verify_llm_decode.py`
-    /// (embed row, `x`, `rope_global`) before this was found, so the artifact vintage -- not this
-    /// rail's host code -- was the whole gap. Regenerate the default artifact to close it; until
-    /// then this gate is EXPECTED to read 7/8 against the stale default, and a run pointed at a
-    /// freshly generated decode dir is the one that must read 8/8.
+    /// (embed row, `x`, `rope_global`), so this rail's host code is not the gap.
+    ///
+    /// CORRECTED 2026-09-08: "a freshly generated decode dir must read 8/8" does NOT hold. A fresh
+    /// 28-layer bf16 build on the current pin reads 7/8, missing the same step with a THIRD token,
+    /// 9625. Frozen 279, that fresh build 15344, this one 9625 -- which is exactly the three-way
+    /// tie `probe_step5_topk.py` measured at 16.7500. So step 5 does not report artifact vintage:
+    /// which tied token wins moves with any change to the numerics, in either direction. Judge this
+    /// gate on the other seven steps, and judge a FORMAT change on perplexity, never here.
     #[test]
     fn device_teacher_forced_matches_oracle() {
         let (decode_dir, weights_dir, oracle_path) = gate_paths();
