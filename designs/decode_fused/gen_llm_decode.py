@@ -112,6 +112,16 @@ QUANT_MLP_GROUP = int(os.environ.get("QUANT_MLP_GROUP", "128"))
 QUANT_ATTN_DTYPE = os.environ.get("QUANT_ATTN_DTYPE", "bf16")
 QUANT_ATTN_GROUP = int(os.environ.get("QUANT_ATTN_GROUP", "128"))
 
+# Same axis again for the Q/K/V projections, which had none. It is needed to READ a pre-quantized
+# dump at all: a 12B cannot be dumped at f32 (43 GB), and such a dump packs q/k/v along with
+# everything else, so without this the packed bytes have no consumer and the build refuses them by
+# name. The fused-QKV arm concatenates Wq|Wk|Wv into one weight -- that still works packed, because
+# all three share K=d_model and therefore one row stride, so concatenating the byte runs IS stacking
+# the rows. QKVHeadDataParallel has NO weight_dtype, so that arm is refused rather than silently
+# fed packed bytes.
+QUANT_QKV_DTYPE = os.environ.get("QUANT_QKV_DTYPE", "bf16")
+QUANT_QKV_GROUP = int(os.environ.get("QUANT_QKV_GROUP", "128"))
+
 # Same axis again, applied to W_head, the FINAL lm-head GEMV's weight.
 #
 # W_head IS THE TIED EMBEDDING TABLE, not an independent lm-head weight -- built below from
@@ -514,15 +524,16 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
         # the default", which is the same contract env-flag-presence-means-on names.
         _mdt, _mgs = _qmf["dtype"], int(_qmf["group_size"])
         for _v, _want in (("QUANT_MLP_DTYPE", _mdt), ("QUANT_ATTN_DTYPE", _mdt),
-                          ("QUANT_MLP_GROUP", str(_mgs)), ("QUANT_ATTN_GROUP", str(_mgs))):
+                          ("QUANT_QKV_DTYPE", _mdt), ("QUANT_MLP_GROUP", str(_mgs)),
+                          ("QUANT_ATTN_GROUP", str(_mgs)), ("QUANT_QKV_GROUP", str(_mgs))):
             _got = os.environ.get(_v)
             if _got is not None and _got != _want:
                 raise SystemExit(
                     f"{_v}={_got!r} contradicts {_qmf_path} ({_want!r}). The dump is already "
                     f"packed at {_mdt} g{_mgs}; the build cannot re-choose the format. Unset "
                     f"{_v} to take the dump's, or re-dump at the format you want.")
-        globals().update(QUANT_MLP_DTYPE=_mdt, QUANT_ATTN_DTYPE=_mdt,
-                         QUANT_MLP_GROUP=_mgs, QUANT_ATTN_GROUP=_mgs)
+        globals().update(QUANT_MLP_DTYPE=_mdt, QUANT_ATTN_DTYPE=_mdt, QUANT_QKV_DTYPE=_mdt,
+                         QUANT_MLP_GROUP=_mgs, QUANT_ATTN_GROUP=_mgs, QUANT_QKV_GROUP=_mgs)
 
     def load_norm(name):
         # Gemma-3 stores RMSNorm gain as w with the kernel computing x_hat*(1+w); Qwen3 stores it
@@ -592,9 +603,16 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
                 f"QUANT_ATTN_DTYPE is {QUANT_ATTN_DTYPE!r}. Set them equal, or FUSE_MLP_O=0 to "
                 "quantize Wo independently"
             )
-    op_qkv = gemv(QD + 2 * KVD, D, ctx) if FUSE_QKV_GEMV else None
-    op_q = gemv(QD, D, ctx)
-    op_kv = gemv(KVD, D, ctx)
+    qkv_quant_kw = (dict(weight_dtype=QUANT_QKV_DTYPE, group_size=QUANT_QKV_GROUP)
+                    if QUANT_QKV_DTYPE != "bf16" else {})
+    if QUANT_QKV_DTYPE != "bf16" and qkv_dp_why is None:
+        raise NotImplementedError(
+            f"QUANT_QKV_DTYPE={QUANT_QKV_DTYPE!r} but the fused QKV head is on, and "
+            "QKVHeadDataParallel has no weight_dtype axis -- it would consume packed bytes as "
+            "bf16 values. Set FUSE_QKV_DP=0, or add the axis to the operator.")
+    op_qkv = gemv(QD + 2 * KVD, D, ctx, **qkv_quant_kw) if FUSE_QKV_GEMV else None
+    op_q = gemv(QD, D, ctx, **qkv_quant_kw)
+    op_kv = gemv(KVD, D, ctx, **qkv_quant_kw)
     # o_proj, split over K on the same terms as the down projection. Under fuse_o there is no
     # standalone op_o at all -- Wo rides the MLP design's weight channel -- so the split is moot.
     o_chunks = 1 if fuse_o else (FORCE_O_SPLIT or k_chunks_for(D, QD, COLS))
@@ -827,13 +845,16 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
             if hf in PACKED:
                 # Already on the wire; npy_raw, never npy -- widening these bytes to f32 renumbers
                 # the payload instead of copying it, and does so silently.
-                if key in qkv_keys:
+                if key in qkv_keys and QUANT_QKV_DTYPE == "bf16":
                     raise SystemExit(
-                        f"{hf} is packed, but nothing here can read a packed {tensor}: op_qkv, "
-                        f"op_q and op_kv are all built without quant kwargs, so the packed bytes "
-                        f"would be consumed as bf16 values. Re-dump with --quant-leaves excluding "
-                        f"q_proj,k_proj,v_proj, or wire the QKV GEMVs to the quant axis first.")
+                        f"{hf} is packed but QUANT_QKV_DTYPE is bf16, so op_qkv/op_q/op_kv would "
+                        f"consume the packed bytes as bf16 values. This should be unreachable when "
+                        f"the dump's quant.json set the axis; re-dump with --quant-leaves excluding "
+                        f"q_proj,k_proj,v_proj if that is what you meant.")
                 wp = np.asarray(npy_raw(hf))
+                if key in qkv_keys and FUSE_QKV_GEMV:
+                    qkv_parts.append(wp)
+                    continue
                 if key == "Wo" and fuse_o:
                     # The pad cannot be done in the float domain here -- there is no float domain
                     # left. Zero rows are built directly in the wire format instead; see
@@ -867,7 +888,12 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
                 # dtype first would send a quantized+fused Wo down the unpadded path.
                 weights[p + key] = quantize_weight(w, QUANT_ATTN_GROUP, QUANT_ATTN_DTYPE)
             elif key in qkv_keys and FUSE_QKV_GEMV:
-                qkv_parts.append(bf16(w).reshape(-1))     # row-major, so concatenation IS stacking
+                # row-major, so concatenation IS stacking -- and that holds for the packed form too,
+                # since q/k/v share K=d_model and therefore one row stride.
+                qkv_parts.append(quantize_weight(w, QUANT_QKV_GROUP, QUANT_QKV_DTYPE)
+                                 if QUANT_QKV_DTYPE != "bf16" else bf16(w).reshape(-1))
+            elif key in qkv_keys and QUANT_QKV_DTYPE != "bf16":
+                weights[p + key] = quantize_weight(w, QUANT_QKV_GROUP, QUANT_QKV_DTYPE)
             else:
                 weights[p + key] = bf16(w).reshape(-1)
         if FUSE_QKV_GEMV:
@@ -1087,7 +1113,20 @@ def main():
 
     bdir = os.path.join(a.out, "buffers")
     for n_, arr in weights.items():
-        open(os.path.join(bdir, f"{n_}.bin"), "wb").write(weight_bytes(arr))
+        blob = weight_bytes(arr)
+        # The BUILD is the last place that knows both numbers, so it is the place to compare them.
+        # Without this the artifact is written self-inconsistent and the only thing that notices is
+        # the Rust loader, at run time, in another language and process ("weight buffer {}.bin is {}
+        # bytes, layout declares {}"). MEASURED 2026-09-08: a half-wired quant axis put 8388608
+        # bf16 bytes into a buffer the layout declared as 2228224 int4 bytes -- 3.76x -- and the
+        # build reported success.
+        want = int(lay[n_][2]) if n_ in lay else None
+        if want is not None and len(blob) != want:
+            raise SystemExit(
+                f"weight buffer {n_}: built {len(blob)} bytes but the design's layout declares "
+                f"{want}. The weight and the design disagree about format -- usually a quant axis "
+                f"applied to one and not the other.")
+        open(os.path.join(bdir, f"{n_}.bin"), "wb").write(blob)
     if embed_blob != "W_head":
         # Host-only, deliberately not in `wnames`: see the tied-embedding note at its build site.
         open(os.path.join(bdir, f"{embed_blob}.bin"), "wb").write(weight_bytes(host_embed))
@@ -1121,6 +1160,7 @@ def main():
         # Engineering-check axis (see QUANT_MLP_DTYPE above), not a validated model default.
         "weight_quant": {"mlp_dtype": QUANT_MLP_DTYPE, "mlp_group_size": QUANT_MLP_GROUP,
                          "attn_dtype": QUANT_ATTN_DTYPE, "attn_group_size": QUANT_ATTN_GROUP,
+                         "qkv_dtype": QUANT_QKV_DTYPE, "qkv_group_size": QUANT_QKV_GROUP,
                          "head_dtype": QUANT_HEAD_DTYPE, "head_group_size": QUANT_HEAD_GROUP},
     }
     prov = toolchain_provenance()
