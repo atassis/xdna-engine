@@ -87,15 +87,26 @@ use Semantics::*;
 /// The full census, in crate order. See the module doc for what is deliberately excluded.
 pub const FLAGS: &[Flag] = &[
     // -- npu-engine: llm decode ------------------------------------------------------------------
-    Flag { name: "NPU_LLM_REUSE_KV", owner: "npu-engine", site: "npu-engine/src/llm/npu_decode.rs:198",
+    Flag { name: "NPU_LLM_REUSE_KV", owner: "npu-engine", site: "npu-engine/src/llm/npu_decode.rs:301",
         semantics: NotZero, default: "true",
         doc: "reuse the KV-cache buffers across requests instead of re-zeroing them each time. \
               Default ON: the buffers are zeroed explicitly at load and sm_mask excludes every \
               position at or beyond n_past, so the per-request pass cost 224 MiB of host memset \
               plus an arena write (~60 ms/request at S=2048) and changed no output. Set =0 to \
               restore it when bisecting a suspected KV bug." },
-
-    // -- npu-asr-host --------------------------------------------------------------------------
+    Flag { name: "NPU_LLM_PREFILL_BATCHED", owner: "npu-engine", site: "npu-engine/src/llm/npu_prefill.rs:66",
+        semantics: NotZero, default: "true",
+        doc: "prime the KV cache over a prompt in batches of the prefill artifact's dims.M instead \
+              of one dispatch per token. DEFAULT ON since 2026-09-09; =0 restores per-token \
+              priming. It was opt-in until its gate existed, and what was missing was a SUBJECT \
+              rather than a measurement -- --tier2 drives verify_llm_decode.py, which is \
+              decode-only by its own header, so the end-to-end gate had never run this path. \
+              scripts/gate_llm.sh --tier2-prefill does, at seven prompt geometries against a \
+              float32 reference: 14/14 PASS, and teacher-forced (all 32 steps independently \
+              comparable rather than only the first divergence) the reference token is in the \
+              device's top-5 at 32/32 steps at every length in both arms. Worth 35.8-37.1x on \
+              priming, 707-742 tok/s against 49.9-51.5 ms/token. Set =0 to bisect a suspected \
+              prefill bug or to reproduce the pre-2026-09-09 output." },
     Flag { name: "NPU_PAR_SUBSAMPLE", owner: "npu-asr-host", site: "npu-asr-host/src/lib.rs:507",
         semantics: NotZero, default: "true",
         doc: "host-side subsample matmul runs multithreaded via rayon; opt out with =0." },

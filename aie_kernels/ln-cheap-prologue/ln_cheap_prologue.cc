@@ -76,6 +76,11 @@ void ln_cheap_load(const bfloat16 *restrict stats, float *restrict mu, float *re
 // Called K/k times per output tile (once per streamed k-block), between DMA-acquire and matmul.
 void ln_cheap_apply(bfloat16 *restrict a, const float *restrict mu, const float *restrict inv) {
   event0();
+  // conv_even over the whole pass, matching the host's round-nearest f32->bf16 pack. Safe to hold
+  // across the body because the stats arrive precomputed -- there is no on-chip reduction here for
+  // the mode to perturb, which is what cost WER 8.2 -> 8.8 in mm_mode_lnaffcast.cc. Handed back
+  // because crRnd is one sticky register shared with the mmul that consumes this block.
+  const auto saved_rounding = ::aie::swap_rounding(::aie::rounding_mode::conv_even);
   constexpr int V = PRO_S;          // one mmul sub-tile row-chunk (s contiguous) per vector
   constexpr int nch = PRO_K / PRO_S; // k/s chunks per row in this block
   for (int i = 0; i < PRO_M; i++) {
@@ -93,6 +98,7 @@ void ln_cheap_apply(bfloat16 *restrict a, const float *restrict mu, const float 
       ::aie::store_v(a + base + cj * PRO_R * PRO_S, ya.template to_vector<bfloat16>()); // bf16 store
     }
   }
+  ::aie::set_rounding(saved_rounding);
   event1();
 }
 

@@ -107,6 +107,11 @@ static inline void ln_prologue_apply_t(bfloat16 *restrict a, const float *restri
                                        const float *restrict inv) {
   constexpr int V = S;
   constexpr int nch = K / S;
+  // conv_even over the whole pass: this one only normalizes, so there is no reduction here for
+  // the mode to perturb (the pass-1 stats are a separate dispatch, deliberately left ambient --
+  // see mm_mode_lnaffcast.cc, where conv_even across a norm's reduction cost WER 8.2 -> 8.8).
+  // Handed back because crRnd is one sticky register shared with the GEMM on this core.
+  const auto saved_rounding = ::aie::swap_rounding(::aie::rounding_mode::conv_even);
   for (int i = 0; i < M; i++) {
     const int base = (i / R) * (R * K) + (i % R) * S;
     ::aie::vector<float, V> muv = ::aie::broadcast<float, V>(mu[i]);
@@ -120,6 +125,7 @@ static inline void ln_prologue_apply_t(bfloat16 *restrict a, const float *restri
       ::aie::store_v(a + base + cj * R * S, ya.template to_vector<bfloat16>());  // bf16 store
     }
   }
+  ::aie::set_rounding(saved_rounding);
 }
 
 extern "C" {

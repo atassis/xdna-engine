@@ -1332,6 +1332,18 @@ impl FusedArena {
         self.output.sync_from_device()
     }
 
+    /// Sync the SCRATCH arena back from the device, so the host can read state a dispatch wrote
+    /// there rather than only what it emitted as an output.
+    ///
+    /// Not on the per-token path: scratch holds the resident weights and the KV cache, so this is
+    /// a multi-gigabyte transfer and calling it in a decode loop would dominate the step. It exists
+    /// for GATES -- comparing a prefill's per-layer KV against a CPU golden, or against what `P`
+    /// sequential M=1 steps wrote -- which is the one check that localises a divergence to a layer
+    /// instead of inferring it from logits at the end of 28 of them.
+    pub fn sync_scratch_from_device(&self) -> Result<()> {
+        self.scratch.sync_from_device()
+    }
+
     /// Dispatch the fused ELF over `[input, output, scratch]`.
     pub fn dispatch(&self, kern: &ElfKernel) -> Result<()> {
         kern.run_elf(&[&self.input, &self.output, &self.scratch])

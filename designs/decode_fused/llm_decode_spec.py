@@ -20,6 +20,221 @@ Qwen3 by `head_dim**0.5`. And Gemma scales the embedding by `sqrt(d_model)` on t
 does not (`embed_scale`), which is a HOST-side per-token step, recorded here so the two sides agree.
 """
 from dataclasses import dataclass
+from itertools import product
+
+# ---------------------------------------------------------------------------------------------
+# GEMM tiling constraints -- ONE implementation, two consumers.
+#
+# `check_prefill*` below raises on the first violation, at the point the shape is picked (K007).
+# The tile sweep (sweep_gemm_tiles.py) needs the SAME verdict as data instead: it enumerates a
+# candidate grid and has to count how many candidates each rule kills, and why. Two copies of these
+# rules would drift -- and the rules themselves are the expensive kind, because half of them are
+# NOT checked anywhere in the toolchain (K008) and the other half are checked more weakly by
+# `iron/operators/gemm/op.py` than by the kernel that actually runs.
+# ---------------------------------------------------------------------------------------------
+
+GEMM_AIE_ROWS = 4            # hardcoded n_aie_rows in iron/operators/gemm/design.py::my_matmul
+GEMM_FIFO_DEPTH = 2          # design.py: fifo_depth = 2 for A, B, and (unless prio_accuracy) C
+GEMM_WORKER_STACK = 0xD00    # design.py passes stack_size=0xD00 to every GEMM Worker
+GEMM_COLS = (1, 2, 4, 8)     # design.py's own --n-aie-cols domain; npu2 is a 4x8 array
+L1_BYTES = 65536             # getLocalMemorySize(), AIE2/AIE2P core tile
+MEMTILE_BYTES = 0x80000      # getMemTileSize(), AIETargetModel.h -- 512 KB per column
+
+
+@dataclass(frozen=True)
+class TilingRejection:
+    """Why one (shape, tiling) candidate is illegal. `code` is stable so a census can count it."""
+    code: str
+    detail: str
+
+
+def gemm_mac_dims(bfp16: bool) -> tuple[int, int, int]:
+    """mm.cc's (r, s, t) for the bf16 path, which decides the tile GRANULARITY rules.
+
+    `aie_kernels/aie2p/mm.cc` selects the microkernel by `#ifdef
+    AIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16`: (8,8,8) with the emulation on (IRON GEMM's default),
+    (4,8,8) without -- for bf16->bf16 and bf16->f32 alike. Each instantiation static_asserts
+    `m % (2*r) == 0`, `k % s == 0`, `n % (2*t) == 0`. `op.py` only checks `tile_* >= r-ish`, which
+    is weaker in every case and silently admits tiles the C++ rejects.
+    """
+    return (8, 8, 8) if bfp16 else (4, 8, 8)
+
+
+def gemm_l1_bytes(tile_m: int, tile_k: int, tile_n: int, *, prio_accuracy: bool = False,
+                  elem_in: int = 2, elem_out: int = 2) -> int:
+    """Per-core L1 the GEMM worker holds. Nothing in the toolchain checks this for GEMM.
+
+    A[tile_m,tile_k] and B[tile_k,tile_n] ride ObjectFifos at the default depth 2 (design.py passes
+    `depths=None` on the A split()/B forward()). C is the one that moves with `prio_accuracy`:
+
+      prio_accuracy=False   C_L1L2 carries C_l1_ty (dtype_out) at `depths=[fifo_depth]*rows` = 2.
+      prio_accuracy=True    design.py sets `fifo_depth_out = 1` AND allocates a SEPARATE
+                            `acc_buffer` of C_l1_ty_internal = f32, so the core holds one bf16
+                            transfer tile plus one f32 accumulator -- 6 bytes/element, not 4.
+
+    The old formula here was `4 * (A + B + C)`, which is the prio_accuracy=False case only; under
+    prio_accuracy it understates the footprint by `2 * tile_m * tile_n` bytes.
+    """
+    c_bytes = (elem_out + 4) if prio_accuracy else (elem_out * GEMM_FIFO_DEPTH)
+    return (GEMM_FIFO_DEPTH * elem_in * tile_m * tile_k
+            + GEMM_FIFO_DEPTH * elem_in * tile_k * tile_n
+            + c_bytes * tile_m * tile_n
+            + GEMM_WORKER_STACK)
+
+
+def gemm_memtile_bytes(tile_m: int, tile_k: int, tile_n: int, cols: int, *,
+                       elem_in: int = 2, elem_out: int = 2) -> int:
+    """L2 the busiest MemTile column holds, from design.py's three L3<->L2 ObjectFifos.
+
+    A_L3L2 is `mem_tile_m_A * tile_k` at depth 2, B_L3L2 is `tile_k * tile_n` at depth 2, and
+    C_L2L3 is `tile_m * n_aie_rows * tile_n` at depth 2 -- C dominates, and it is the term that
+    grows fastest as the tile widens. A_L3L2 only lands on `min(cols, 4)` columns (Tile(2*i, 1)
+    when cols == 8), but B and C are per column, so the worst column carries all three.
+
+    A ceiling, not a placement: objectFIFO puts a buffer on ONE MemTile, so this is the capacity
+    the widest tile has to fit in, and aiecc reports a miss as "'aie.tile' op Basic sequential
+    allocation also failed" -- naming a tile and not a size.
+    """
+    a_tiles_per_shim = GEMM_AIE_ROWS // cols if cols < GEMM_AIE_ROWS else 1
+    a_l2 = GEMM_FIFO_DEPTH * elem_in * (tile_m * a_tiles_per_shim) * tile_k
+    b_l2 = GEMM_FIFO_DEPTH * elem_in * tile_k * tile_n
+    c_l2 = GEMM_FIFO_DEPTH * elem_out * (tile_m * GEMM_AIE_ROWS) * tile_n
+    return a_l2 + b_l2 + c_l2
+
+
+def largest_valid_tile_n(Nout: int, cols: int, bfp16: bool = True) -> int | None:
+    """Largest tile_n satisfying `Nout % (tile_n*cols) == 0` and mm.cc's `tile_n % (2*t) == 0`.
+
+    Used only to print a working suggestion in a raised error, never to silently pick one.
+    """
+    if Nout % cols:
+        return None
+    step = 2 * gemm_mac_dims(bfp16)[2]
+    per_col = Nout // cols
+    return max((d for d in range(step, per_col + 1, step) if per_col % d == 0), default=None)
+
+
+def gemm_tile_rejection(tile_m: int, tile_k: int, tile_n: int, cols: int, *,
+                        bfp16: bool = True) -> TilingRejection | None:
+    """The tile-granularity rules, which depend on neither the batch nor the projection shape."""
+    if cols not in GEMM_COLS:
+        return TilingRejection("cols", f"num_aie_columns={cols} is not one of {GEMM_COLS} "
+                                       f"(gemm/design.py's own --n-aie-cols domain; npu2 has 8)")
+    r, s, t = gemm_mac_dims(bfp16)
+    path = "bfp16-emulation" if bfp16 else "plain-bf16"
+    if tile_m % (2 * r):
+        return TilingRejection("tile_m", f"tile_m={tile_m} not a multiple of {2 * r} -- mm.cc "
+                                         f"static_assert(m % (2*r) == 0), r={r} on the {path} "
+                                         f"path; op.py's own check only requires tile_m >= {r}, "
+                                         f"which is weaker and would silently pass e.g. "
+                                         f"tile_m={r}")
+    if tile_k % s:
+        return TilingRejection("tile_k", f"tile_k={tile_k} not a multiple of {s} -- mm.cc "
+                                         f"static_assert(k % s == 0), s={s} on both the "
+                                         f"bfp16-emulation and plain-bf16 paths; op.py's own "
+                                         f"check only requires tile_k >= 8, which is weaker and "
+                                         f"would silently pass e.g. tile_k=12")
+    if tile_n % (2 * t):
+        return TilingRejection("tile_n", f"tile_n={tile_n} not a multiple of {2 * t} -- mm.cc "
+                                         f"static_assert(n % (2*t) == 0), t={t} on both compute "
+                                         f"paths; op.py's own check only requires tile_n >= 8, "
+                                         f"which is weaker")
+    return None
+
+
+def gemm_batch_rejection(batch: int, tile_m: int) -> TilingRejection | None:
+    """`M % (tile_m * n_aie_rows) == 0` -- the only rule the token batch enters."""
+    min_M = tile_m * GEMM_AIE_ROWS
+    if batch % min_M:
+        return TilingRejection("batch", f"batch={batch} not a multiple of "
+                                        f"tile_m({tile_m})*n_aie_rows({GEMM_AIE_ROWS})={min_M} "
+                                        f"(gemm/design.py hardcodes n_aie_rows={GEMM_AIE_ROWS}; "
+                                        f"op.py's own min_M)")
+    return None
+
+
+def gemm_batch_tile_rejection(batch: int, tile_m: int, tile_k: int, tile_n: int, cols: int, *,
+                              bfp16: bool = True) -> TilingRejection | None:
+    """Tile granularity, then the batch modulus."""
+    return (gemm_tile_rejection(tile_m, tile_k, tile_n, cols, bfp16=bfp16)
+            or gemm_batch_rejection(batch, tile_m))
+
+
+def gemm_shape_rejection(K: int, Nout: int, tile_m: int, tile_k: int, tile_n: int, cols: int, *,
+                         bfp16: bool = True, prio_accuracy: bool = False,
+                         check_memtile: bool = True) -> TilingRejection | None:
+    """The per-projection rules: K/N divisibility, then the two capacity budgets."""
+    if K % tile_k:
+        return TilingRejection("K", f"K={K} not divisible by tile_k={tile_k} "
+                                    f"(op.py: K % tile_k == 0)")
+    min_N = tile_n * cols
+    if Nout % min_N:
+        fix = largest_valid_tile_n(Nout, cols, bfp16)
+        hint = (f"; tile_n={fix} would satisfy it" if fix
+                else f"; no tile_n multiple of {2 * gemm_mac_dims(bfp16)[2]} divides "
+                     f"Nout={Nout} at cols={cols}")
+        return TilingRejection("N", f"Nout={Nout} not divisible by tile_n({tile_n})*cols({cols})"
+                                    f"={min_N} (op.py: N % (tile_n*num_aie_columns) == 0){hint}")
+    l1 = gemm_l1_bytes(tile_m, tile_k, tile_n, prio_accuracy=prio_accuracy)
+    if l1 > L1_BYTES:
+        return TilingRejection("l1", f"L1 footprint {l1}B exceeds {L1_BYTES} (64KB, "
+                                     f"getLocalMemorySize()) at tile_m={tile_m}, tile_k={tile_k}, "
+                                     f"tile_n={tile_n}, prio_accuracy={prio_accuracy} -- "
+                                     f"double-buffered A+B+C tiles plus stack_size=0xD00 "
+                                     f"(design.py); unchecked anywhere else in the toolchain")
+    if check_memtile:
+        l2 = gemm_memtile_bytes(tile_m, tile_k, tile_n, cols)
+        if l2 > MEMTILE_BYTES:
+            return TilingRejection("memtile", f"MemTile footprint {l2}B exceeds {MEMTILE_BYTES} "
+                                              f"(512KB, getMemTileSize()) at tile_m={tile_m}, "
+                                              f"tile_k={tile_k}, tile_n={tile_n}, cols={cols} -- "
+                                              f"A/B/C L3<->L2 ObjectFifos at depth "
+                                              f"{GEMM_FIFO_DEPTH}, C the dominant term")
+    return None
+
+
+def gemm_tiling_rejection(M: int, K: int, N: int, tile_m: int, tile_k: int, tile_n: int,
+                          cols: int, *, bfp16: bool = True, prio_accuracy: bool = False,
+                          check_memtile: bool = True) -> TilingRejection | None:
+    """One verdict for one (shape, tiling) candidate. `None` means legal."""
+    rej = gemm_batch_tile_rejection(M, tile_m, tile_k, tile_n, cols, bfp16=bfp16)
+    return rej or gemm_shape_rejection(K, N, tile_m, tile_k, tile_n, cols, bfp16=bfp16,
+                                       prio_accuracy=prio_accuracy, check_memtile=check_memtile)
+
+
+def gemm_tile_grid(*, bfp16: bool = True, tile_ms=None, tile_ks=None, tile_ns=None,
+                   colss=None) -> list[tuple[int, int, int, int]]:
+    """The candidate grid to enumerate, DERIVED from the kernel's granularity rather than listed.
+
+    Defaults walk every tile the microkernel admits up to 256 (`2*r`, `s`, `2*t` steps); the caller
+    narrows it. The point of enumerating the whole thing is the census: "how many candidates are
+    legal" is only a useful number against a grid whose bounds come from the hardware.
+    """
+    r, s, t = gemm_mac_dims(bfp16)
+    tile_ms = tile_ms or list(range(2 * r, 257, 2 * r))
+    tile_ks = tile_ks or list(range(s, 257, s))
+    tile_ns = tile_ns or list(range(2 * t, 257, 2 * t))
+    colss = colss or list(GEMM_COLS)
+    return [(tm, tk, tn, c) for tm, tk, tn, c in product(tile_ms, tile_ks, tile_ns, colss)]
+
+
+def gemm_tile_census(M: int, K: int, N: int, *, bfp16: bool = True, prio_accuracy: bool = False,
+                     check_memtile: bool = True, grid=None, **grid_kw):
+    """`(legal, rejected)` for one shape over a candidate grid.
+
+    `legal` is a list of `(tile_m, tile_k, tile_n, cols)`; `rejected` maps a rejection CODE to the
+    list of `(candidate, detail)` it killed, so a caller can print how much freedom the shape
+    actually has and which rule took the rest.
+    """
+    legal, rejected = [], {}
+    for cand in (grid if grid is not None else gemm_tile_grid(bfp16=bfp16, **grid_kw)):
+        rej = gemm_tiling_rejection(M, K, N, *cand, bfp16=bfp16, prio_accuracy=prio_accuracy,
+                                    check_memtile=check_memtile)
+        if rej is None:
+            legal.append(cand)
+        else:
+            rejected.setdefault(rej.code, []).append((cand, rej.detail))
+    return legal, rejected
 
 
 @dataclass(frozen=True)
@@ -178,6 +393,134 @@ class LlmSpec:
             raise ValueError(f"{self.name}: scores GEMV M=S={S} must satisfy S%8==0 and (S//8)%4==0")
         if S % 64:
             raise ValueError(f"{self.name}: context GEMV K=S={S} must be a multiple of 64")
+
+    # ---- batched prefill (GEMM, not GEMV) ----
+    #
+    # The lm-head stays a GEMV at batch=1 even during prefill (only the LAST prefill position needs
+    # logits) -- it is deliberately not one of the ops below, not an oversight.
+    #
+    # API shape: `tile_n` is ONE global default, but a caller passes `tile_n_overrides={op: tile_n}`
+    # for the ops it does not cover. This is necessary because the ops below do not share an N: `ctx`
+    # has Nout=head_dim, which for Qwen3 (128) and Gemma-3 (256) is far narrower than d_model/ffn, so
+    # a single tile_n that fits the wide ops (qkv/gate/up/down) generally does not divide the narrow
+    # one. The alternative -- one tile_n per whole spec -- would make `check_prefill` reject shapes a
+    # real per-op build can still legally tile, which is exactly the K007 failure mode this file's
+    # `check()` docstring already warns about (gen_gemma_decode.py's op_kv). So every failure below
+    # names the offending number AND, for the Nout%... case, computes and prints a tile_n that WOULD
+    # work for that op, rather than making the caller guess.
+    def _check_prefill_tiles_and_batch(self, batch: int, tile_m: int, tile_k: int, tile_n: int,
+                                        cols: int, bfp16: bool) -> None:
+        """The batch- and tile-level constraints that do not depend on any one projection's shape.
+
+        `n_aie_rows=4` is hardcoded in `iron/operators/gemm/design.py::my_matmul`; `op.py`'s
+        `GEMM.__post_init__` states it back as `min_M = tile_m * num_aie_rows` and asserts
+        `M % min_M == 0` -- M here is the token batch (A is token-major: `C[batch,Nout] = A[batch,K]
+        @ B[K,Nout]`, B stored `[Nout,K]` and read `b_col_maj`).
+
+        The kernel's own tile rules are NARROWER than what `op.py` checks; `gemm_mac_dims` and
+        `gemm_batch_tile_rejection` at the top of this file own the derivation, so the sweep and
+        this raise cannot disagree about which candidate is legal.
+        """
+        rej = gemm_batch_tile_rejection(batch, tile_m, tile_k, tile_n, cols, bfp16=bfp16)
+        if rej is not None:
+            raise ValueError(f"{self.name}: prefill {rej.detail}")
+
+    def _check_prefill_ops(self, ops, tile_m: int, tile_k: int, tile_n: int, cols: int,
+                            bfp16: bool, overrides: dict, prio_accuracy: bool = False) -> None:
+        for label, K, Nout in ops:
+            eff_tile_n = overrides.get(label, tile_n)
+            rej = (gemm_tile_rejection(tile_m, tile_k, eff_tile_n, cols, bfp16=bfp16)
+                   or gemm_shape_rejection(K, Nout, tile_m, tile_k, eff_tile_n, cols,
+                                           bfp16=bfp16, prio_accuracy=prio_accuracy))
+            if rej is None:
+                continue
+            detail = rej.detail
+            if rej.code == "N" and "would satisfy it" in detail:
+                fix = largest_valid_tile_n(Nout, cols, bfp16)
+                detail = detail.replace(f"; tile_n={fix} would satisfy it",
+                                        f"; tile_n_overrides={{{label!r}: {fix}}} would satisfy it")
+            raise ValueError(f"{self.name}: prefill {label} {detail}")
+
+    def check_prefill_projections(self, batch: int, ops, tile_m: int = 64, tile_k: int = 64,
+                                   tile_n: int = 64, cols: int = 8, bfp16: bool = True,
+                                   tile_n_overrides: dict | None = None,
+                                   prio_accuracy: bool = False) -> None:
+        """The same checks for an EXPLICIT list of `(label, K, Nout)` GEMMs.
+
+        `check_prefill`/`check_prefill_seq` below are the two spec-shaped callers. A generator that
+        splits or fuses projections differently -- gen_llm_prefill.py projects q, k and v as three
+        GEMMs rather than one, because at M>1 a token's v rows sit between its k rows and the next
+        token's q rows, so no contiguous slice reaches the q or k head rows alone -- checks the
+        shapes it ACTUALLY builds through here (K007), instead of a nearby list that happens to
+        pass.
+        """
+        self._check_prefill_tiles_and_batch(batch, tile_m, tile_k, tile_n, cols, bfp16)
+        self._check_prefill_ops(ops, tile_m, tile_k, tile_n, cols, bfp16, tile_n_overrides or {},
+                                prio_accuracy=prio_accuracy)
+
+    def check_prefill(self, batch: int, tile_m: int = 64, tile_k: int = 64, tile_n: int = 64,
+                       cols: int = 8, bfp16: bool = True, tile_n_overrides: dict | None = None,
+                       prio_accuracy: bool = False) -> None:
+        """Every batched-prefill (GEMM) tiling constraint for the projections whose shape depends
+        only on the spec, not on the runtime KV window: qkv, o, gate, up, down. `scores`/`ctx` need
+        the KV window S and are checked by `check_prefill_seq` instead (mirrors `check`/`check_seq`
+        above). The lm-head is NOT here -- see the module note at the top of this section.
+
+        Pass `tile_n_overrides={"o": 16, ...}` for any op whose Nout does not divide
+        `tile_n*cols`; the raised error names a tile_n that would work.
+        """
+        ops = (
+            ("qkv", self.d_model, self.q_dim + 2 * self.kv_dim),
+            ("o", self.q_dim, self.d_model),
+            ("gate", self.d_model, self.ffn),
+            ("up", self.d_model, self.ffn),
+            ("down", self.ffn, self.d_model),
+        )
+        self.check_prefill_projections(batch, ops, tile_m=tile_m, tile_k=tile_k, tile_n=tile_n,
+                                        cols=cols, bfp16=bfp16,
+                                        tile_n_overrides=tile_n_overrides,
+                                        prio_accuracy=prio_accuracy)
+
+    def check_prefill_seq(self, batch: int, S: int, tile_m: int = 64, tile_k: int = 64,
+                           tile_n: int = 64, cols: int = 8, bfp16: bool = True,
+                           tile_n_overrides: dict | None = None,
+                           prio_accuracy: bool = False) -> None:
+        """The two per-q-head prefill GEMMs that depend on the KV window S: `scores`
+        (K=head_dim, Nout=S) and `ctx` (K=S, Nout=head_dim). Separate from `check_prefill` for the
+        same reason `check_seq` is separate from `check`: S is a runtime choice, not a spec field.
+
+        `ctx`'s Nout=head_dim is usually far narrower than the other ops' Nout (128 for Qwen3,
+        256 for Gemma-3) and almost always needs a `tile_n_overrides={"ctx": ...}` entry -- this
+        does NOT also run `check_prefill`'s batch-independent ops; call both when both apply.
+        """
+        ops = (
+            ("scores", self.head_dim, S),
+            ("ctx", S, self.head_dim),
+        )
+        self.check_prefill_projections(batch, ops, tile_m=tile_m, tile_k=tile_k, tile_n=tile_n,
+                                        cols=cols, bfp16=bfp16,
+                                        tile_n_overrides=tile_n_overrides,
+                                        prio_accuracy=prio_accuracy)
+
+    def legal_prefill_batches(self, cap: int, tile_m: int = 64, tile_k: int = 64,
+                               tile_n: int = 64, cols: int = 8, bfp16: bool = True,
+                               tile_n_overrides: dict | None = None) -> list[int]:
+        """Every prefill batch size <= cap this spec can legally build `check_prefill` at, for a
+        given tile/column config -- so a caller asks "what M can I use?" once instead of guessing
+        a batch and catching a `ValueError`.
+
+        batch enters `check_prefill` only through `batch % (tile_m*4) == 0`; every other
+        constraint there is batch-independent. So this is either every multiple of `tile_m*4` up
+        to `cap`, or none (if the tile/column config itself is illegal for this spec) -- never
+        checks `check_prefill_seq`'s S-dependent ops, since S is not a spec property.
+        """
+        step = tile_m * 4
+        try:
+            self.check_prefill(step, tile_m=tile_m, tile_k=tile_k, tile_n=tile_n, cols=cols,
+                                bfp16=bfp16, tile_n_overrides=tile_n_overrides)
+        except ValueError:
+            return []
+        return list(range(step, cap + 1, step))
 
 
 # Gemma-3 270M -- the checkpoint the rail was brought up on (8/8 greedy token parity on device,
