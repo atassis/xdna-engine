@@ -207,12 +207,17 @@ class LlmSpec:
         """
         return max(d for d in range(1, cap + 1) if self.n_q_heads % d == 0)
 
-    def qkv_dp_cols(self, cap: int) -> int:
-        """num_aie_columns for QKVHeadDataParallel: every core owns a whole number of head rows."""
-        heads = self.n_q_heads + 2 * self.n_kv_heads
+    def qkv_dp_cols(self, cap: int, n_kv_heads: int | None = None) -> int:
+        """num_aie_columns for QKVHeadDataParallel: every core owns a whole number of head rows.
+
+        `n_kv_heads` overrides the spec's own value for a per-layer geometry; omitted, it is the
+        uniform one, so a caller that has no geometry to name gets the pre-existing answer.
+        """
+        kvh = self.n_kv_heads if n_kv_heads is None else n_kv_heads
+        heads = self.n_q_heads + 2 * kvh
         return max(d for d in range(1, cap + 1) if heads % d == 0)
 
-    def qkv_dp_reason(self, cap: int) -> str | None:
+    def qkv_dp_reason(self, cap: int, head_dim: int | None = None) -> str | None:
         """Why QKVHeadDataParallel does not cover this spec, or None when it does.
 
         Every rule here is the OPERATOR's (iron/operators/qkv_head_dp/op.py), read off its
@@ -223,8 +228,9 @@ class LlmSpec:
         """
         if not self.qk_norm:
             return "the op applies a per-head qk-norm and this spec has none"
-        if self.d_model % self.head_dim:
-            return (f"d_model={self.d_model} is not a whole number of head_dim={self.head_dim} "
+        hd = self.head_dim if head_dim is None else head_dim
+        if self.d_model % hd:
+            return (f"d_model={self.d_model} is not a whole number of head_dim={hd} "
                     f"chunks -- cur/n_in ride the HD-wide misc channel")
         return None
 

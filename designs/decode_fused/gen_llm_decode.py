@@ -33,6 +33,7 @@ import json
 import os
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import numpy as np
 import ml_dtypes
@@ -567,17 +568,31 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
     # have run and been quietly wrong.
     op_norm = RMSNorm(size=D, num_aie_columns=1, num_channels=1, tile_size=D,
                       weighted=True, epsilon=sp.eps, context=ctx)
-    op_qk_norm = RMSNorm(size=HD, num_aie_columns=1, num_channels=1, tile_size=HD,
-                         weighted=True, epsilon=sp.eps, context=ctx) if sp.qk_norm else None
-    op_qk_norm_b = (RMSNorm(size=HD, num_aie_columns=1, num_channels=1, tile_size=HD,
-                            weighted=True, epsilon=sp.eps, context=ctx)
-                    if (sp.qk_norm and SPLIT_QKNORM) else op_qk_norm)
-    # QKV projection: one GEMV over the concatenated weight, or the three separate ones. op_kv is
-    # built in both arms because share_designs pairs Wk with Wv only in the unfused one.
     # Wo weight-stream dtype axis (see QUANT_ATTN_DTYPE above). bf16 (default) is byte-for-byte the
     # pre-existing path.
     attn_quant_kw = (dict(weight_dtype=QUANT_ATTN_DTYPE, group_size=QUANT_ATTN_GROUP)
                      if QUANT_ATTN_DTYPE != "bf16" else {})
+
+    # ---- attention op vocabulary, keyed on the layer's ATTENTION GEOMETRY ----
+    # Everything below depends on (head_dim, n_kv_heads), and Gemma-4-12B does not have one pair:
+    # its sliding layers are 256/8 and its global layers 512/1. So these cannot be built once for
+    # the stack the way the d_model- and ffn-shaped ops above and below can.
+    #
+    # A memoized factory rather than per-layer construction, because the uniform case has to stay
+    # exactly what it was: every shipped spec has ONE geometry, so the cache holds one entry, the
+    # ops are the same objects every layer references, and the artifact is byte-identical to the
+    # pre-refactor build. The non-uniform case then costs one more entry rather than a rewrite.
+    #
+    # What is NOT in here is as load-bearing as what is. op_norm, op_scale, op_softmax and the whole
+    # MLP vocabulary are shaped by d_model, ffn and n_q_heads, none of which varies per layer, so
+    # hoisting them in would key them on something they do not depend on and multiply designs for
+    # nothing.
+    geoms = []
+    for l in range(NL):
+        gk = (sp.head_dim_for(l), sp.n_kv_heads_for(l))
+        if gk not in geoms:
+            geoms.append(gk)
+
     # ---- which fused arms this MODEL can use ----
     # Whether a fused arm applies is the OPERATOR's rule, not a choice here -- the same shape as
     # fuse_act further down, which already asks the GEMV instead of assuming. The env flag can only
@@ -585,13 +600,22 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
     # cover. It used to, and a Qwen-shaped default then met Gemma-3 as a NotImplementedError three
     # frames down -- a capability gap reported as a crash, and only after the previous gap was
     # cleared, so the four of them surfaced one build at a time.
-    qkv_dp_why = ("FUSE_QKV_DP=0" if not FUSE_QKV_DP else
-                  "needs FUSE_QKV_GEMV=1 for the concatenated Wqkv" if not FUSE_QKV_GEMV else
-                  sp.qkv_dp_reason(COLS))
+    #
+    # The qkv arm is decided PER GEOMETRY: its rule is `d_model % head_dim`, so two head_dims can
+    # genuinely disagree about it. The mlp arm's rules (sandwich norms, activation) touch no
+    # attention geometry, so it stays one verdict for the build.
+    if not FUSE_QKV_DP:
+        qkv_dp_why = {g: "FUSE_QKV_DP=0" for g in geoms}
+    elif not FUSE_QKV_GEMV:
+        qkv_dp_why = {g: "needs FUSE_QKV_GEMV=1 for the concatenated Wqkv" for g in geoms}
+    else:
+        qkv_dp_why = {g: sp.qkv_dp_reason(COLS, head_dim=g[0]) for g in geoms}
     mlp_dp_why = "FUSE_MLP_DP=0" if not FUSE_MLP_DP else sp.mlp_dp_reason()
     fuse_o = FUSE_MLP_O and mlp_dp_why is None
-    for arm, why in (("qkv_head_dp", qkv_dp_why), ("swiglu_mlp_dp", mlp_dp_why)):
-        print(f"[gen] fused arm {arm}: {'OFF -- ' + why if why else 'on'}")
+    for g in geoms:
+        why, tag = qkv_dp_why[g], "" if len(geoms) == 1 else f" [head_dim={g[0]}, kv_heads={g[1]}]"
+        print(f"[gen] fused arm qkv_head_dp{tag}: {'OFF -- ' + why if why else 'on'}")
+    print(f"[gen] fused arm swiglu_mlp_dp: {'OFF -- ' + mlp_dp_why if mlp_dp_why else 'on'}")
     if fuse_o:
         if QUANT_ATTN_DTYPE != QUANT_MLP_DTYPE:
             # Under fuse_o, Wo rides the MLP design's single weight ObjectFifo, and one fifo
@@ -603,73 +627,167 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
                 f"QUANT_ATTN_DTYPE is {QUANT_ATTN_DTYPE!r}. Set them equal, or FUSE_MLP_O=0 to "
                 "quantize Wo independently"
             )
+        if len(geoms) > 1:
+            # op_mlp_dp is built ONCE with QD baked in, because Wo rides its weight channel. Two
+            # q_dims cannot share it, and the failure would be a silent stride error rather than a
+            # crash -- so refuse here rather than build the wrong thing.
+            qds = sorted({Hq * hd for hd, _ in geoms})
+            raise NotImplementedError(
+                f"FUSE_MLP_O folds Wo into one swiglu_mlp_dp design carrying a single QD, but "
+                f"{sp.name} has {len(geoms)} attention geometries {geoms} and therefore the "
+                f"q_dims {qds}. Set FUSE_MLP_O=0, or give the operator a per-layer QD.")
     qkv_quant_kw = (dict(weight_dtype=QUANT_QKV_DTYPE, group_size=QUANT_QKV_GROUP)
                     if QUANT_QKV_DTYPE != "bf16" else {})
-    if QUANT_QKV_DTYPE != "bf16" and qkv_dp_why is None:
-        raise NotImplementedError(
-            f"QUANT_QKV_DTYPE={QUANT_QKV_DTYPE!r} but the fused QKV head is on, and "
-            "QKVHeadDataParallel has no weight_dtype axis -- it would consume packed bytes as "
-            "bf16 values. Set FUSE_QKV_DP=0, or add the axis to the operator.")
-    op_qkv = gemv(QD + 2 * KVD, D, ctx, **qkv_quant_kw) if FUSE_QKV_GEMV else None
-    op_q = gemv(QD, D, ctx, **qkv_quant_kw)
-    op_kv = gemv(KVD, D, ctx, **qkv_quant_kw)
-    # o_proj, split over K on the same terms as the down projection. Under fuse_o there is no
-    # standalone op_o at all -- Wo rides the MLP design's weight channel -- so the split is moot.
-    o_chunks = 1 if fuse_o else (FORCE_O_SPLIT or k_chunks_for(D, QD, COLS))
-    op_o = None if fuse_o else gemv(D, QD // o_chunks, ctx, **attn_quant_kw)
     # RoPE over q and k together (24 head rows) needs them adjacent, which only the fused qkv
     # buffer gives; angle_rows=1 is unchanged, so every row still reads the same single angle row.
     fuse_rope = FUSE_QKV_GEMV and FUSE_ROPE_QK
-    op_rope_qk = RoPE(rows=Hq + Hkv, cols=HD, angle_rows=1, context=ctx) if fuse_rope else None
-    op_qkv_dp = None
-    if qkv_dp_why is None:
-        from iron.operators.qkv_head_dp.op import QKVHeadDataParallel
-        op_qkv_dp = QKVHeadDataParallel(D=D, HD=HD, Hq=Hq, Hkv=Hkv, max_seq=S,
-                                        num_aie_columns=sp.qkv_dp_cols(COLS), epsilon=sp.eps,
-                                        tile_size_input=TSI, context=ctx,
-                                        weight_depth=WEIGHT_DEPTH)
-    op_rope_q = RoPE(rows=Hq, cols=HD, angle_rows=1, context=ctx)
-    op_rope_k = RoPE(rows=Hkv, cols=HD, angle_rows=1, context=ctx)
-    # KV append: deep-C scratchpad offset "kv_off" (element units = n_past*HD), constant ELF.
-    sc = dict(input_sizes=(Hkv, HD), input_strides=(HD, 1), input_offset=0,
-              output_sizes=(1, Hkv, HD), output_strides=(0, S * HD, 1), output_offset=0,
-              input_buffer_size=Hkv * HD, output_buffer_size=Hkv * S * HD, num_aie_channels=1)
-    op_sck = StridedCopy(**sc, output_offset_parameter="kv_off", context=ctx)
-    # V stays [S][HD]. A transposed append would delete op_trv, but a SINGLE-token transposed write
-    # is 1024 isolated bf16 elements (h*HD*S + d*S + p) and the shim address generator steps in
-    # 4-byte granules: the BD silently halves the innermost dimension (measured on the emitted
-    # descriptor -- d0_size 64 for 128 elements, d0_stride 1023, i.e. 64 granules of two ADJACENT
-    # elements). The runtime offset has the same granule floor, so an odd `p` truncates down.
-    # The working shape is a PAIR write on an even offset, whose staging cannot itself be a DMA.
-    op_scv = StridedCopy(**sc, output_offset_parameter="kv_off", context=ctx)
 
-    # One (scratchpad slot, head_dim) pair per DISTINCT attention geometry. Uniform today, so one
-    # entry -- but the host reads this as a list (Artifact::kv_offs) and writes `pos * head_dim` to
-    # each slot, so the per-layer case is an append here rather than a change of contract. It has
-    # to be derived beside the StridedCopy ops that consume the slot, not restated at the meta
-    # site, because the pairing IS the contract: which slot a layer's KV-append reads and which
-    # head_dim scales it are the same decision.
-    kv_slots = [("kv_off", HD)]
-    # GQA broadcast. Correctness-first; the byte-free form is a batch-stride-0 GEMV read of the kv
-    # head (0 ops, 0 bytes) -- at Hq=16 x 28 layers this Repeat plus the V transpose are 41% of the
-    # per-token DDR budget, so it is the first optimisation after parity, not an afterthought.
-    #
-    # S below is deliberately ONE value shared by kc/vc/kr/vr/vt/sc/sw, op_scores, op_rep_k/v, op_trv
-    # AND op_ctx -- not the op_ctx-excluded 4-of-5 split llm-decode-attention-pads-to-full-window.md
-    # scoped out device-free. That split needs op_trv to write a bucket-wide `vt` while op_ctx reads
-    # it at full max_seq width, and symmetrically op_rep_k/v to read a bucket-wide prefix of a kc/vc
-    # row whose true stride is max_seq*HD (Hkv=8 here, not a degenerate single-row case where prefix
-    # == whole buffer). Neither holds with today's operators: Repeat's input TensorAccessPattern
-    # ties its row stride directly to `cols` (repeat/design.py: strides=[0, cols, cols_split, 1]),
-    # and Transpose's output stride is tied to its own `M` (transpose/design.py: taps_out_L1L3
-    # strides derive from M) -- neither exposes a stride independent of its own declared size, so
-    # "read/write a narrower window of a wider-strided buffer" is new IRON capability, not a
-    # generator change. Bucketing S UNIFORMLY (this build already takes it as `max_seq`) is the
-    # route that needs none.
-    op_rep_k = Repeat(rows=Hkv, cols=S * HD, repeat=sp.gqa_group, transfer_size=HD, context=ctx)
-    op_rep_v = Repeat(rows=Hkv, cols=S * HD, repeat=sp.gqa_group, transfer_size=HD, context=ctx)
-    op_scores = gemv(S, HD, ctx, num_batches=Hq,
-                     batch_group=sp.gqa_group if GROUPED_K else 1)
+    # One (scratchpad slot, head_dim) pair per DISTINCT attention geometry, appended by the factory
+    # as it builds each one. The host reads this as a list (Artifact::kv_offs) and writes
+    # `pos * head_dim` to each slot. It has to be derived beside the StridedCopy ops that consume
+    # the slot, not restated at the meta site, because the pairing IS the contract: which slot a
+    # layer's KV-append reads and which head_dim scales it are the same decision.
+    kv_slots = []
+    _attn_cache = {}
+
+    def attn_ops(hd, hkv):
+        """The ops shaped by one (head_dim, n_kv_heads) pair, built once per distinct pair."""
+        if (hd, hkv) in _attn_cache:
+            return _attn_cache[(hd, hkv)]
+        qd, kvd, gqa = Hq * hd, hkv * hd, Hq // hkv
+        dp_why = qkv_dp_why[(hd, hkv)]
+        op_qk_norm = RMSNorm(size=hd, num_aie_columns=1, num_channels=1, tile_size=hd,
+                             weighted=True, epsilon=sp.eps, context=ctx) if sp.qk_norm else None
+        op_qk_norm_b = (RMSNorm(size=hd, num_aie_columns=1, num_channels=1, tile_size=hd,
+                                weighted=True, epsilon=sp.eps, context=ctx)
+                        if (sp.qk_norm and SPLIT_QKNORM) else op_qk_norm)
+        # QKV projection: one GEMV over the concatenated weight, or the three separate ones. op_kv
+        # is built in both arms because share_designs pairs Wk with Wv only in the unfused one.
+        if QUANT_QKV_DTYPE != "bf16" and dp_why is None:
+            raise NotImplementedError(
+                f"QUANT_QKV_DTYPE={QUANT_QKV_DTYPE!r} but the fused QKV head is on, and "
+                "QKVHeadDataParallel has no weight_dtype axis -- it would consume packed bytes as "
+                "bf16 values. Set FUSE_QKV_DP=0, or add the axis to the operator.")
+        op_qkv = gemv(qd + 2 * kvd, D, ctx, **qkv_quant_kw) if FUSE_QKV_GEMV else None
+        op_q = gemv(qd, D, ctx, **qkv_quant_kw)
+        op_kv = gemv(kvd, D, ctx, **qkv_quant_kw)
+        # o_proj, split over K on the same terms as the down projection. Under fuse_o there is no
+        # standalone op_o at all -- Wo rides the MLP design's weight channel -- so the split is
+        # moot. k_chunks_for reads q_dim, so the chunk COUNT is per-geometry too, and it reaches
+        # the weight loop through this namespace rather than as a build-wide constant.
+        o_chunks = 1 if fuse_o else (FORCE_O_SPLIT or k_chunks_for(D, qd, COLS))
+        op_o = None if fuse_o else gemv(D, qd // o_chunks, ctx, **attn_quant_kw)
+        op_rope_qk = RoPE(rows=Hq + hkv, cols=hd, angle_rows=1, context=ctx) if fuse_rope else None
+        op_qkv_dp = None
+        if dp_why is None:
+            from iron.operators.qkv_head_dp.op import QKVHeadDataParallel
+            op_qkv_dp = QKVHeadDataParallel(D=D, HD=hd, Hq=Hq, Hkv=hkv, max_seq=S,
+                                            num_aie_columns=sp.qkv_dp_cols(COLS, n_kv_heads=hkv),
+                                            epsilon=sp.eps,
+                                            tile_size_input=TSI, context=ctx,
+                                            weight_depth=WEIGHT_DEPTH)
+        op_rope_q = RoPE(rows=Hq, cols=hd, angle_rows=1, context=ctx)
+        op_rope_k = RoPE(rows=hkv, cols=hd, angle_rows=1, context=ctx)
+        # KV append: deep-C scratchpad offset "kv_off" (element units = n_past*hd), constant ELF.
+        # head_dim rides the output STRIDE as well as the sizes, so a second geometry is a second
+        # StridedCopy design and not a re-parameterisation of this one.
+        #
+        # The FIRST geometry keeps the bare name "kv_off": it is baked into the design, and the
+        # host's pre-list fallback reads that spelling.
+        slot = "kv_off" if not kv_slots else f"kv_off{len(kv_slots)}"
+        kv_slots.append((slot, hd))
+        sc = dict(input_sizes=(hkv, hd), input_strides=(hd, 1), input_offset=0,
+                  output_sizes=(1, hkv, hd), output_strides=(0, S * hd, 1), output_offset=0,
+                  input_buffer_size=hkv * hd, output_buffer_size=hkv * S * hd, num_aie_channels=1)
+        op_sck = StridedCopy(**sc, output_offset_parameter=slot, context=ctx)
+        # V stays [S][hd]. A transposed append would delete op_trv, but a SINGLE-token transposed
+        # write is 1024 isolated bf16 elements (h*hd*S + d*S + p) and the shim address generator
+        # steps in 4-byte granules: the BD silently halves the innermost dimension (measured on the
+        # emitted descriptor -- d0_size 64 for 128 elements, d0_stride 1023, i.e. 64 granules of two
+        # ADJACENT elements). The runtime offset has the same granule floor, so an odd `p` truncates
+        # down. The working shape is a PAIR write on an even offset, whose staging cannot itself be
+        # a DMA.
+        op_scv = StridedCopy(**sc, output_offset_parameter=slot, context=ctx)
+        # GQA broadcast. Correctness-first; the byte-free form is a batch-stride-0 GEMV read of the
+        # kv head (0 ops, 0 bytes) -- at Hq=16 x 28 layers this Repeat plus the V transpose are 41%
+        # of the per-token DDR budget, so it is the first optimisation after parity, not an
+        # afterthought.
+        #
+        # S below is deliberately ONE value shared by kc/vc/kr/vr/vt/sc/sw, op_scores, op_rep_k/v,
+        # op_trv AND op_ctx -- not the op_ctx-excluded 4-of-5 split
+        # llm-decode-attention-pads-to-full-window.md scoped out device-free. That split needs
+        # op_trv to write a bucket-wide `vt` while op_ctx reads it at full max_seq width, and
+        # symmetrically op_rep_k/v to read a bucket-wide prefix of a kc/vc row whose true stride is
+        # max_seq*hd (hkv=8 here, not a degenerate single-row case where prefix == whole buffer).
+        # Neither holds with today's operators: Repeat's input TensorAccessPattern ties its row
+        # stride directly to `cols` (repeat/design.py: strides=[0, cols, cols_split, 1]), and
+        # Transpose's output stride is tied to its own `M` (transpose/design.py: taps_out_L1L3
+        # strides derive from M) -- neither exposes a stride independent of its own declared size,
+        # so "read/write a narrower window of a wider-strided buffer" is new IRON capability, not a
+        # generator change. Bucketing S UNIFORMLY (this build already takes it as `max_seq`) is the
+        # route that needs none.
+        op_rep_k = Repeat(rows=hkv, cols=S * hd, repeat=gqa, transfer_size=hd, context=ctx)
+        op_rep_v = Repeat(rows=hkv, cols=S * hd, repeat=gqa, transfer_size=hd, context=ctx)
+        op_scores = gemv(S, hd, ctx, num_batches=Hq, batch_group=gqa if GROUPED_K else 1)
+        # num_batches=Hq, not Hq separate invocations. transpose/design.py's L3 tensors already hold
+        # "num_batches contiguous (M,N) matrices stacked along the row dimension", which is EXACTLY
+        # what vr/vt are; calling it per head issued 448 configure+run pairs per token to do 28 ops'
+        # work.
+        #
+        # It is NOT a speed fix and must not be quoted as one. Isolated on device against the same
+        # placer: -0.01 ms/token, 0.0%. Dropping 420 dispatches per token is worth nothing
+        # measurable, because these are mode selections inside ONE hardware context. Kept because it
+        # is correct, free, and 2.2 MB smaller in the ELF -- not because it is faster.
+        # 4, not COLS: Transpose splits N across columns as `N // num_columns // n`, and at N=hd=128
+        # with n=32 that is 4 tiles, so 8 columns divides to ZERO. Its __post_init__ does not catch
+        # it -- it checks M*N % (m*n*cols*channels), which 8 satisfies -- and the failure surfaces
+        # deep in taplib as "All sizes must be >= 1, but got [8, 0, 256, 32]", naming no operator
+        # and no parameter. 4 is the real ceiling at this n; raising it needs n=16.
+        # GQA broadcast as an ACCESS PATTERN instead of a materialised copy. gqa query heads attend
+        # to one kv head; with batch_group the consumer reads that head directly and the Repeat that
+        # duplicated it into DDR disappears. Opt-in per side because k and v are not the same edit
+        # (k: Repeat feeds the GEMV; v: Repeat feeds a Transpose that feeds the GEMV), so they must
+        # be gated separately to stay attributable in an A/B ladder.
+        op_trv = Transpose(M=S, N=hd, num_aie_columns=4, num_channels=1, m=256, n=32, s=8,
+                           num_batches=Hq, batch_group=gqa if GROUPED_V else 1, context=ctx)
+        # CONTEXT STEP. op_trv exists only because gemv reduces ALONG a row: it wants [hd][S] and
+        # the cache is [S][hd], so the whole cache is rearranged every token -- 16.777 MB/layer
+        # measured, at 0% compute. TMatVec reduces DOWN the rows instead and reads `vc` as it is
+        # stored, so the transpose has nothing left to do. One kv head per column
+        # (n_matrices == cols == hkv), so each column streams its own head ONCE and applies both
+        # query heads' softmax rows out of L1 -- the stride-0 group re-read goes too.
+        # rows_per_chunk=64 puts the L1 A tile at 16 KB double-buffered.
+        if TMV_CTX:
+            # TMV_RPC is a CAP, not the value: the largest chunk that fits L1 depends on head_dim,
+            # and 64 is right for Qwen3's hd=128 and too big for Gemma-3's 256. check_l1_fits is the
+            # operator's own arithmetic, so ask it rather than carrying a second copy of the L1
+            # model here -- or an env constant that was correct for one model and silently wrong for
+            # the next. It runs PER GEOMETRY for the same reason: the answer is a function of hd.
+            from iron.operators.tmatvec.design import check_l1_fits
+            rpc = TMV_RPC
+            while rpc > 1 and (S % rpc or check_l1_fits(hd, S, gqa, rpc) is not None):
+                rpc //= 2
+            if rpc != TMV_RPC:
+                print(f"[gen] TMatVec rows_per_chunk {TMV_RPC} -> {rpc} (L1 fit at head_dim={hd})")
+            op_ctx = TMatVec(M=hd, K=S, num_aie_columns=hkv, num_batches=Hq, batch_group=gqa,
+                             rows_per_chunk=rpc, context=ctx)
+        else:
+            op_ctx = gemv(hd, S, ctx, num_batches=Hq)
+        g = SimpleNamespace(
+            hd=hd, hkv=hkv, qd=qd, kvd=kvd, gqa=gqa, kv_slot=slot, o_chunks=o_chunks,
+            op_qk_norm=op_qk_norm, op_qk_norm_b=op_qk_norm_b, op_qkv=op_qkv, op_q=op_q,
+            op_kv=op_kv, op_o=op_o, op_rope_qk=op_rope_qk, op_qkv_dp=op_qkv_dp,
+            op_rope_q=op_rope_q, op_rope_k=op_rope_k, op_sck=op_sck, op_scv=op_scv,
+            op_rep_k=op_rep_k, op_rep_v=op_rep_v, op_scores=op_scores, op_trv=op_trv,
+            op_ctx=op_ctx)
+        _attn_cache[(hd, hkv)] = g
+        return g
+
+    # Built up front, in layer order, rather than lazily from the loop: construction order is then
+    # what it was before this was a factory, and a geometry that cannot be built fails here instead
+    # of 20 layers into the runlist.
+    for gk in geoms:
+        attn_ops(*gk)
     # Folded into n_qn when SCALE_IN_QNORM; built anyway so the A/B arm stays reachable.
     scale_in_qnorm = SCALE_IN_QNORM and sp.qk_norm
     op_scale = (None if scale_in_qnorm else
@@ -680,48 +798,6 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
     op_softmax = Softmax(rows=Hq, cols=S, num_aie_columns=sp.softmax_cols(COLS),
                          num_channels=1, rtp_vector_size=S,
                          vector_size_parameter="sm_mask", context=ctx)
-    # num_batches=Hq, not Hq separate invocations. transpose/design.py's L3 tensors already hold
-    # "num_batches contiguous (M,N) matrices stacked along the row dimension", which is EXACTLY what
-    # vr/vt are; calling it per head issued 448 configure+run pairs per token to do 28 ops' work.
-    #
-    # It is NOT a speed fix and must not be quoted as one. Isolated on device against the same
-    # placer: -0.01 ms/token, 0.0%. Dropping 420 dispatches per token is worth nothing measurable,
-    # because these are mode selections inside ONE hardware context. Kept because it is correct,
-    # free, and 2.2 MB smaller in the ELF -- not because it is faster.
-    # 4, not COLS: Transpose splits N across columns as `N // num_columns // n`, and at N=HD=128
-    # with n=32 that is 4 tiles, so 8 columns divides to ZERO. Its __post_init__ does not catch it
-    # -- it checks M*N % (m*n*cols*channels), which 8 satisfies -- and the failure surfaces deep in
-    # taplib as "All sizes must be >= 1, but got [8, 0, 256, 32]", naming no operator and no
-    # parameter. 4 is the real ceiling at this n; raising it needs n=16.
-    # GQA broadcast as an ACCESS PATTERN instead of a materialised copy. gqa_group query heads
-    # attend to one kv head; with batch_group the consumer reads that head directly and the Repeat
-    # that duplicated it into DDR disappears. Opt-in per side because k and v are not the same edit
-    # (k: Repeat feeds the GEMV; v: Repeat feeds a Transpose that feeds the GEMV), so they must be
-    # gated separately to stay attributable in an A/B ladder.
-    op_trv = Transpose(M=S, N=HD, num_aie_columns=4, num_channels=1, m=256, n=32, s=8,
-                       num_batches=Hq, batch_group=sp.gqa_group if GROUPED_V else 1, context=ctx)
-    # CONTEXT STEP. op_trv exists only because gemv reduces ALONG a row: it wants [HD][S] and the
-    # cache is [S][HD], so the whole cache is rearranged every token -- 16.777 MB/layer measured, at
-    # 0% compute. TMatVec reduces DOWN the rows instead and reads `vc` as it is stored, so the
-    # transpose has nothing left to do. One kv head per column (n_matrices == cols == Hkv), so each
-    # column streams its own head ONCE and applies both query heads' softmax rows out of L1 -- the
-    # stride-0 group re-read goes too. rows_per_chunk=64 puts the L1 A tile at 16 KB double-buffered.
-    if TMV_CTX:
-        # TMV_RPC is a CAP, not the value: the largest chunk that fits L1 depends on head_dim, and
-        # 64 is right for Qwen3's HD=128 and too big for Gemma-3's 256. check_l1_fits is the
-        # operator's own arithmetic, so ask it rather than carrying a second copy of the L1 model
-        # here -- or an env constant that was correct for one model and silently wrong for the next.
-        from iron.operators.tmatvec.design import check_l1_fits
-        rpc = TMV_RPC
-        while rpc > 1 and (S % rpc or check_l1_fits(HD, S, sp.gqa_group, rpc) is not None):
-            rpc //= 2
-        if rpc != TMV_RPC:
-            print(f"[gen] TMatVec rows_per_chunk {TMV_RPC} -> {rpc} (L1 fit at head_dim={HD})")
-        op_ctx = TMatVec(M=HD, K=S, num_aie_columns=Hkv, num_batches=Hq,
-                         batch_group=sp.gqa_group,
-                         rows_per_chunk=rpc, context=ctx)
-    else:
-        op_ctx = gemv(HD, S, ctx, num_batches=Hq)
     # MLP weight-stream dtype axis (Wg/Wu/Wd -- "MLP weights" in the byte breakdown, the largest
     # single weight class). bf16 (default) is byte-for-byte the pre-existing path; QUANT_MLP_DTYPE
     # is an engineering-check toggle (see its definition above), not a quality-validated default.
@@ -802,8 +878,8 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
     def down_runlist(p):
         return split_over_k(op_down, p + "Wd", p + "gh", p + "d", down_chunks, FF, p + "d")
 
-    def o_runlist(p):
-        return split_over_k(op_o, p + "Wo", p + "cx", p + "a", o_chunks, QD, p + "a")
+    def o_runlist(p, g):
+        return split_over_k(g.op_o, p + "Wo", p + "cx", p + "a", g.o_chunks, g.qd, p + "a")
     # W_head weight-stream dtype axis (see QUANT_HEAD_DTYPE above -- READ THE TIED-EMBEDDING NOTE
     # before turning this on).
     head_quant_kw = (dict(weight_dtype=QUANT_HEAD_DTYPE, group_size=QUANT_HEAD_GROUP)
@@ -814,6 +890,10 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
     cur = "x"
 
     for l in range(NL):
+        # The layer's attention geometry. Uniform for every shipped spec, so this is the same
+        # namespace object every iteration and the ops are shared exactly as they were when they
+        # were module-level; Gemma-4-12B is where it starts returning two.
+        g = attn_ops(sp.head_dim_for(l), sp.n_kv_heads_for(l))
         p = f"L{l}_"
         nm = sp.norm_weight_names(l)
         for key, tensor in nm.items():
@@ -831,13 +911,13 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
                             ("Wv", "self_attn.v_proj"), ("Wo", "self_attn.o_proj"),
                             ("Wg", "mlp.gate_proj"), ("Wu", "mlp.up_proj"), ("Wd", "mlp.down_proj")):
             hf = f"model.layers.{l}.{tensor}.weight"
-            if {"Wd": down_chunks, "Wo": o_chunks}.get(key, 1) > 1:
+            if {"Wd": down_chunks, "Wo": g.o_chunks}.get(key, 1) > 1:
                 # Each chunk is its own contiguous tensor. A pre-chunked dump names them
                 # `<tensor>.kchunkN` and we take those bytes as-is; otherwise the split happens
                 # here, along K, BEFORE quantizing -- so each chunk carries its own per-group
                 # scales, exactly as the kernel reads it. Splitting AFTER packing would cut
                 # through a group.
-                nch = {"Wd": down_chunks, "Wo": o_chunks}[key]
+                nch = {"Wd": down_chunks, "Wo": g.o_chunks}[key]
                 chunk_hf = [f"{hf}.kchunk{i}" for i in range(nch)]
                 if all(n in PACKED for n in chunk_hf):
                     for i, n in enumerate(chunk_hf):
@@ -868,7 +948,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
                     # left. Zero rows are built directly in the wire format instead; see
                     # packed_zero_rows for why a zero row is exactly [f32(1.0) x n_groups][zeros].
                     wp = np.concatenate([wp, packed_zero_rows(
-                        op_mlp_dp._wo_rows_padded - D, QD, QUANT_MLP_GROUP, QUANT_MLP_DTYPE)])
+                        op_mlp_dp._wo_rows_padded - D, g.qd, QUANT_MLP_GROUP, QUANT_MLP_DTYPE)])
                 weights[p + key] = wp
                 continue
             w = npy(hf)  # [M, K], f32
@@ -907,8 +987,8 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
         if FUSE_QKV_GEMV:
             assert len(qkv_parts) == 3, f"expected Wq, Wk, Wv; got {len(qkv_parts)}"
             weights[p + "Wqkv"] = np.concatenate(qkv_parts)
-        weights[p + "kc"] = np.zeros(Hkv * S * HD, BF16)
-        weights[p + "vc"] = np.zeros(Hkv * S * HD, BF16)
+        weights[p + "kc"] = np.zeros(g.hkv * S * g.hd, BF16)
+        weights[p + "vc"] = np.zeros(g.hkv * S * g.hd, BF16)
         cache_names += [p + "kc", p + "vc"]
         ang = "rope_global" if sp.is_global(l) else "rope_local"
 
@@ -916,33 +996,33 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
         # one pass, and q|k adjacency is what lets a single RoPE cover both. Declared with an
         # explicit size because a parent that is only ever referenced sliced has no arg spec to
         # take its length from (iron/common/sequence.py: calculate_buffer_layout).
-        if op_qkv_dp is not None:
+        if g.op_qkv_dp is not None:
             # The fused head appends k and v to the caches itself, so neither ever becomes an L3
             # buffer and only `q` survives as an intermediate.
             ref_q = p + "q"
-            bufsz[ref_q] = QD * 2
+            bufsz[ref_q] = g.qd * 2
         elif FUSE_QKV_GEMV:
-            qkvb, kb, vb = p + "qkv", QD * 2, (QD + KVD) * 2
+            qkvb, kb, vb = p + "qkv", g.qd * 2, (g.qd + g.kvd) * 2
             ref_q, ref_k = f"{qkvb}[0:{kb}]", f"{qkvb}[{kb}:{vb}]"
-            ref_v, ref_qk = f"{qkvb}[{vb}:{vb + KVD * 2}]", f"{qkvb}[0:{vb}]"
+            ref_v, ref_qk = f"{qkvb}[{vb}:{vb + g.kvd * 2}]", f"{qkvb}[0:{vb}]"
             qhb, qho, khb, kho = qkvb, 0, qkvb, kb    # per-head qk-norm slice base + byte offset
-            bufsz[qkvb] = (QD + 2 * KVD) * 2
+            bufsz[qkvb] = (g.qd + 2 * g.kvd) * 2
         else:
             ref_q, ref_k, ref_v = p + "q", p + "k", p + "v"
             qhb, qho, khb, kho = p + "q", 0, p + "k", 0
-            bufsz.update({p + "q": QD * 2, p + "k": KVD * 2, p + "v": KVD * 2})
+            bufsz.update({p + "q": g.qd * 2, p + "k": g.kvd * 2, p + "v": g.kvd * 2})
         bufsz.update({
-            p + "kc": Hkv * S * HD * 2, p + "vc": Hkv * S * HD * 2,
-            p + "kr": Hq * S * HD * 2, p + "vr": Hq * S * HD * 2, p + "vt": Hq * S * HD * 2,
+            p + "kc": g.hkv * S * g.hd * 2, p + "vc": g.hkv * S * g.hd * 2,
+            p + "kr": Hq * S * g.hd * 2, p + "vr": Hq * S * g.hd * 2, p + "vt": Hq * S * g.hd * 2,
             p + "sc": Hq * S * 2, p + "sw": Hq * S * 2,
-            p + "cx": QD * 2,
+            p + "cx": g.qd * 2,
             p + "g": FF * 2, p + "u": FF * 2, p + "gh": FF * 2, p + "d": D * 2,
             # every partial and fold-level buffer the K-split introduces; the names come FROM
             # down_runlist so the two cannot drift apart
             **({} if down_chunks == 1 else
                {step[-1]: D * 2 for step in down_runlist(p)}),
-            **({} if (fuse_o or o_chunks == 1) else
-               {step[-1]: D * 2 for step in o_runlist(p)}),
+            **({} if (fuse_o or g.o_chunks == 1) else
+               {step[-1]: D * 2 for step in o_runlist(p, g)}),
             p + "hn": D * 2, p + "hf": D * 2,
         })
         # `a` is purely internal to op_mlp_dp's own fuse_o path (never an L3 buffer -- see
@@ -954,44 +1034,44 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
         # The unfused arms only. With the fused head, the per-head norms, the projection and the
         # RoPE are all inside one design and none of these runlist entries exists.
         qk = proj = rope = []
-        if sp.qk_norm and op_qkv_dp is None:
-            hq = [f"{qhb}[{qho + h*HD*2}:{qho + (h+1)*HD*2}]" for h in range(Hq)]
-            hk = [f"{khb}[{kho + h*HD*2}:{kho + (h+1)*HD*2}]" for h in range(Hkv)]
-            qk = [*[((op_qk_norm if h % 2 == 0 else op_qk_norm_b),
+        if sp.qk_norm and g.op_qkv_dp is None:
+            hq = [f"{qhb}[{qho + h*g.hd*2}:{qho + (h+1)*g.hd*2}]" for h in range(Hq)]
+            hk = [f"{khb}[{kho + h*g.hd*2}:{kho + (h+1)*g.hd*2}]" for h in range(g.hkv)]
+            qk = [*[((g.op_qk_norm if h % 2 == 0 else g.op_qk_norm_b),
                      hq[h], p + "n_qn", hq[h]) for h in range(Hq)],
-                  *[((op_qk_norm if h % 2 == 0 else op_qk_norm_b),
-                     hk[h], p + "n_kn", hk[h]) for h in range(Hkv)]]
-        if op_qkv_dp is None:
-            proj = ([(op_qkv, p + "Wqkv", p + "hn", p + "qkv")] if FUSE_QKV_GEMV else
-                    [(op_q, p + "Wq", p + "hn", ref_q),
-                     (op_kv, p + "Wk", p + "hn", ref_k),
-                     (op_kv, p + "Wv", p + "hn", ref_v)])
-            rope = ([(op_rope_qk, ref_qk, ang, ref_qk)] if fuse_rope else
-                    [(op_rope_q, ref_q, ang, ref_q),
-                     (op_rope_k, ref_k, ang, ref_k)])
+                  *[((g.op_qk_norm if h % 2 == 0 else g.op_qk_norm_b),
+                     hk[h], p + "n_kn", hk[h]) for h in range(g.hkv)]]
+        if g.op_qkv_dp is None:
+            proj = ([(g.op_qkv, p + "Wqkv", p + "hn", p + "qkv")] if FUSE_QKV_GEMV else
+                    [(g.op_q, p + "Wq", p + "hn", ref_q),
+                     (g.op_kv, p + "Wk", p + "hn", ref_k),
+                     (g.op_kv, p + "Wv", p + "hn", ref_v)])
+            rope = ([(g.op_rope_qk, ref_qk, ang, ref_qk)] if fuse_rope else
+                    [(g.op_rope_q, ref_q, ang, ref_q),
+                     (g.op_rope_k, ref_k, ang, ref_k)])
         # The fused head replaces the norm, the projection, every qk-norm and the RoPE with one
         # design; `hn` lives and dies in L1 instead of round-tripping DDR between four of them.
         # The fused head absorbs the KV append too: k and v are drained straight into the caches
         # at `kv_off` instead of into buffers a StridedCopy then re-reads and re-writes. The caches
         # were their only consumer, so the intermediate had no reader -- it existed because the
         # append was a separate operator. Two runs and one more configure per layer.
-        head = ([(op_qkv_dp, cur, p + "n_in", p + "Wqkv", p + "n_qn", p + "n_kn", ang,
+        head = ([(g.op_qkv_dp, cur, p + "n_in", p + "Wqkv", p + "n_qn", p + "n_kn", ang,
                   ref_q, p + "kc", p + "vc")]
-                if op_qkv_dp is not None else
+                if g.op_qkv_dp is not None else
                 [(op_norm, cur, p + "n_in", p + "hn"), *proj, *qk, *rope,
-                 (op_sck, ref_k, p + "kc"), (op_scv, ref_v, p + "vc")])
+                 (g.op_sck, ref_k, p + "kc"), (g.op_scv, ref_v, p + "vc")])
         rl += [
             *head,
-            *([] if GROUPED_K else [(op_rep_k, p + "kc", p + "kr")]),
+            *([] if GROUPED_K else [(g.op_rep_k, p + "kc", p + "kr")]),
             # TMV_CTX subsumes the v-side grouping: TMatVec reads vc per kv head itself, so a
             # Repeat would materialise a `vr` nothing consumes.
-            *([] if (GROUPED_V or TMV_CTX) else [(op_rep_v, p + "vc", p + "vr")]),
-            (op_scores, p + ("kc" if GROUPED_K else "kr"), ref_q, p + "sc"),
+            *([] if (GROUPED_V or TMV_CTX) else [(g.op_rep_v, p + "vc", p + "vr")]),
+            (g.op_scores, p + ("kc" if GROUPED_K else "kr"), ref_q, p + "sc"),
             *([] if scale_in_qnorm else [(op_scale, p + "sc", "attn_scale", p + "sc")]),
             (op_softmax, p + "sc", p + "sw"),
-            *([] if TMV_CTX else [(op_trv, p + ("vc" if GROUPED_V else "vr"), p + "vt")]),
-            (op_ctx, p + ("vc" if TMV_CTX else "vt"), p + "sw", p + "cx"),
-            *([] if fuse_o else o_runlist(p)),
+            *([] if TMV_CTX else [(g.op_trv, p + ("vc" if GROUPED_V else "vr"), p + "vt")]),
+            (g.op_ctx, p + ("vc" if TMV_CTX else "vt"), p + "sw", p + "cx"),
+            *([] if fuse_o else o_runlist(p, g)),
         ]
         if sp.sandwich_norms:
             rl.append((op_norm, p + "a", p + "n_pa", p + "a"))
