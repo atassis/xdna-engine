@@ -127,6 +127,27 @@ fn main() {
     let res = dev.open_elf_resident(&elf, Some("main:sequence")).expect("open prefill resident");
     arena.bind_resident(&res).expect("bind");
     res.dispatch().expect("prefill dispatch");
+
+    // PROBE_TIME=<iters>: warm dispatch timing, wrapping ONLY the dispatch -- no host writes, no
+    // syncs, no ELF load. Built for the layer-scaling decomposition: this artifact family ships at
+    // 1, 2 and 28 layers off the SAME generator, so t(L) across them separates the per-dispatch
+    // fixed cost from the per-layer marginal without a single rebuild or an ablation.
+    if let Ok(n) = std::env::var("PROBE_TIME") {
+        let iters: usize = n.parse().unwrap_or(20);
+        for _ in 0..(iters / 4).max(3) {
+            res.dispatch().unwrap();
+        }
+        let mut us: Vec<f64> = Vec::with_capacity(iters);
+        for _ in 0..iters {
+            let t = std::time::Instant::now();
+            res.dispatch().unwrap();
+            us.push(t.elapsed().as_secs_f64() * 1e6);
+        }
+        us.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let rl = meta.dims.get("runlist").and_then(|v| v.as_u64()).unwrap_or(0);
+        println!("[time] layers={nl} runlist={rl} iters={iters} median={:.1} min={:.1} max={:.1} us",
+                 us[us.len() / 2], us[0], us[us.len() - 1]);
+    }
     arena.sync_from_device().unwrap();
     arena.sync_scratch_from_device().unwrap();
     println!("dispatched, output + scratch synced back\n");
