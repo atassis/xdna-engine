@@ -3,15 +3,19 @@
 use std::io::{BufRead, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 
 mod cli_def;
+mod doctor;
+mod exit;
 mod media;
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser};
 
-use cli_def::{Cli, Cmd, ConfigCmd, OutFormat, SamplingArgs, WeightsCmd};
+use cli_def::{Cli, Cmd, ConfigCmd, OutFormat, OutputFormat, SamplingArgs, WeightsCmd};
 use clap_complete::Shell;
+use exit::{engine_error, Code, Tagged};
 use npu_runtime::actor::{start, start_lazy};
 use npu_engine::capability::Capability;
 use npu_runtime::config::{Config, EvictPolicy};
@@ -19,34 +23,58 @@ use npu_runtime::http;
 use npu_runtime::loader::EngineLoader;
 use npu_runtime::stream::StreamItem;
 
-fn config_path(cli: &Cli) -> PathBuf {
-    if let Some(p) = &cli.config { return p.clone(); }
-    if let Ok(p) = std::env::var("NPU_CONFIG") { return PathBuf::from(p); }
+fn config_path(cli: &Cli) -> PathBuf { config_path_and_source(cli).0 }
+
+/// [`config_path`] plus WHICH of the three sources won -- `--config` beats `$NPU_CONFIG` beats the
+/// default path. `npu doctor` reports this directly; every other caller just wants the path.
+fn config_path_and_source(cli: &Cli) -> (PathBuf, &'static str) {
+    if let Some(p) = &cli.config { return (p.clone(), "--config flag"); }
+    if let Ok(p) = std::env::var("NPU_CONFIG") { return (PathBuf::from(p), "$NPU_CONFIG"); }
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    PathBuf::from(home).join(".config/npu/engine.toml")
+    (PathBuf::from(home).join(".config/npu/engine.toml"), "default path (~/.config/npu/engine.toml)")
 }
 
-fn main() -> Result<()> {
+/// The one place an error becomes a process exit code (`exit::of`) -- see `exit.rs`. Printing
+/// stays exactly what `Result<(), E: Debug>`'s stdlib `Termination` impl already did (`Error:
+/// {e:?}`, the anyhow chain with "Caused by:"); only the exit status is new.
+fn main() -> ExitCode {
     let cli = Cli::parse();
     let path = config_path(&cli);
+    match run(&cli, &path) {
+        Ok(()) => ExitCode::from(Code::Success as u8),
+        Err(e) => {
+            eprintln!("Error: {e:?}");
+            ExitCode::from(exit::of(&e) as u8)
+        }
+    }
+}
+
+fn run(cli: &Cli, path: &Path) -> Result<()> {
+    // `--output json` is the one global spelling; the per-command `--json` flags stay accepted
+    // until the socket rewrite makes every response structured and the table becomes a renderer.
+    // Either asks for JSON, so they are OR-ed rather than one overriding the other.
+    let as_json = cli.output == OutputFormat::Json;
     match &cli.cmd {
-        Cmd::Serve { port, allow_degraded } => serve(&path, *port, *allow_degraded),
-        Cmd::Transcribe { input, model } => transcribe(&path, input, model.as_deref()),
+        Cmd::Serve { port, allow_degraded } => serve(path, *port, *allow_degraded),
+        Cmd::Transcribe { input, model } => transcribe(path, input, model.as_deref()),
         Cmd::Generate { prompt, model, sampling, no_stream, raw } =>
-            generate(&path, prompt, model.as_deref(), sampling, *no_stream, *raw),
-        Cmd::Chat { model, sampling, no_stream } => chat(&path, model.as_deref(), sampling, *no_stream),
-        Cmd::Embed { text, model } => embed(&path, text, model.as_deref()),
-        Cmd::Diarize { wav, model, json } => diarize(&path, wav, model.as_deref(), *json),
+            generate(path, prompt, model.as_deref(), sampling, *no_stream, *raw),
+        Cmd::Chat { prompt, model, sampling, no_stream } =>
+            chat(path, prompt.as_deref(), model.as_deref(), sampling, *no_stream),
+        Cmd::Embed { text, model } => embed(path, text, model.as_deref()),
+        Cmd::Diarize { wav, model, json } => diarize(path, wav, model.as_deref(), *json || as_json),
         Cmd::TranscribeMedia { input, out, format, asr, diarize: diar, track, no_diarize } =>
-            transcribe_media(&path, input, out.as_deref(), *format, asr.as_deref(),
+            transcribe_media(path, input, out.as_deref(), *format, asr.as_deref(),
                              diar.as_deref(), *track, *no_diarize),
-        Cmd::Models { json, port } => models(&path, *json, *port),
+        Cmd::Models { json, port } => models(&path, *json || as_json, *port),
         Cmd::Reload { port } => reload(&path, *port),
         Cmd::Load { model, port } => load_model(&path, model, *port),
         Cmd::Unload { model, port } => unload_model(&path, model, *port),
         Cmd::Bake { name } => bake(&path, name),
         Cmd::Config { action } => config_cmd(&path, action),
+        Cmd::Flags { json } => flags_cmd(*json || as_json),
         Cmd::Weights { action } => weights_cmd(&path, action),
+        Cmd::Doctor { json } => doctor::doctor(&cli, *json || as_json),
         Cmd::Completions { shell } => {
             let mut cmd = Cli::command();
             let name = cmd.get_name().to_string();
@@ -155,7 +183,9 @@ fn preflight_serve(port: u16) -> Result<()> {
         return if npu_engine::Engine::available() {
             Ok(())
         } else {
-            bail!("no XDNA2 NPU device at /dev/accel/accel0 (is the amdxdna driver loaded?)")
+            Err(Tagged(Code::Device,
+                "no XDNA2 NPU device at /dev/accel/accel0 (is the amdxdna driver loaded?)".into())
+                .into())
         };
     }
     // Something is listening. Ask it who it is rather than assuming.
@@ -205,7 +235,8 @@ fn serve(path: &Path, port: Option<u16>, allow_degraded: bool) -> Result<()> {
     preflight_serve(port)?;
     let root = root(&cfg, path)?;
     preflight_artifacts(&cfg, &root)?;
-    let (handle, _join) = start(cfg, Box::new(EngineLoader { root }))?;
+    let (handle, _join) = start(cfg, Box::new(EngineLoader { root }))
+        .map_err(|e| Tagged(engine_error(&e), e.to_string()))?;
     // Do not bind a port the service cannot serve from. The initial reconcile records a load
     // failure as `Failed` rather than panicking, so before this the socket came up and every
     // request answered "actor dropped reply" while systemd showed active -- how a 5-day outage
@@ -234,8 +265,10 @@ fn transcribe(path: &Path, input: &Path, model: Option<&str>) -> Result<()> {
     // not after a multi-second model load.
     let samples = npu_runtime::media::decode_file(input).map_err(|e| anyhow!(e))?;
     // Lazy: a one-shot run should load the model it serves, and nothing else.
-    let (handle, join) = start_lazy(cfg, Box::new(EngineLoader { root }))?;
-    let out = handle.transcribe(model, samples, 16_000).map_err(|e| anyhow!(e.to_string()));
+    let (handle, join) = start_lazy(cfg, Box::new(EngineLoader { root }))
+        .map_err(|e| Tagged(engine_error(&e), e.to_string()))?;
+    let out = handle.transcribe(model, samples, 16_000)
+        .map_err(|e| Tagged(engine_error(&e), e.to_string()));
     handle.shutdown(); let _ = join.join();
     println!("{}", out?.value);
     Ok(())
@@ -243,12 +276,20 @@ fn transcribe(path: &Path, input: &Path, model: Option<&str>) -> Result<()> {
 
 /// `--flag <value>` overrides one `GenerateParams` field; an absent flag keeps the engine default
 /// (`GenerateParams::default()`, OpenAI's own defaults) -- never a CLI-chosen substitute.
-fn build_params(s: &SamplingArgs) -> npu_engine::GenerateParams {
+fn build_params(s: &SamplingArgs) -> Result<npu_engine::GenerateParams, String> {
     let mut p = npu_engine::GenerateParams::default();
-    if let Some(t) = s.temperature { p.temperature = t; }
-    if let Some(t) = s.top_p { p.top_p = t; }
-    if let Some(t) = s.top_k { p.top_k = t; }
-    if let Some(t) = s.max_tokens { p.max_tokens = t; }
+    p.temperature = s.temperature;
+    p.top_p = s.top_p;
+    p.top_k = s.top_k;
+    p.presence_penalty = s.presence_penalty;
+    p.frequency_penalty = s.frequency_penalty;
+    p.repetition_penalty = s.repetition_penalty;
+    p.max_tokens = match (s.max_tokens, s.max_completion_tokens) {
+        (Some(a), Some(b)) if a != b => return Err(format!(
+            "--max-tokens ({a}) and --max-completion-tokens ({b}) disagree; pass one")),
+        (Some(a), _) | (None, Some(a)) => Some(a),
+        (None, None) => None,
+    };
     if !s.stop.is_empty() { p.stop = s.stop.clone(); }
     p.seed = s.seed;
     // Neither flag leaves the template's own default -- `None`, not a defaulted `true`, because for
@@ -258,7 +299,10 @@ fn build_params(s: &SamplingArgs) -> npu_engine::GenerateParams {
         (false, true) => Some(false),
         _ => None,
     };
-    p
+    // The SAME check the HTTP surface runs, from the same function -- two surfaces validating
+    // separately is how they drift on what they accept.
+    p.validate()?;
+    Ok(p)
 }
 
 /// `npu generate`/`npu chat` run IN-PROCESS (`start_lazy` + `EngineLoader`), the same pattern as
@@ -300,8 +344,11 @@ fn generate(path: &Path, prompt: &str, model: Option<&str>, sampling: &SamplingA
     quiet_one_shot();
     let cfg = load_cfg(path)?;
     let root = root(&cfg, path)?;
-    let (handle, join) = start_lazy(cfg, Box::new(EngineLoader { root }))?;
-    let params = build_params(sampling);
+    let (handle, join) = start_lazy(cfg, Box::new(EngineLoader { root }))
+        .map_err(|e| Tagged(engine_error(&e), e.to_string()))?;
+    // Code::Failure, the documented generic bucket: this closed set has no invalid-argument code,
+    // and NoService (2) would tell a caller to start a server for what is a bad flag value.
+    let params = build_params(sampling).map_err(|m| Tagged(Code::Failure, m))?;
     let prompt = if raw {
         npu_engine::Prompt::Raw(prompt.to_string())
     } else {
@@ -314,10 +361,12 @@ fn generate(path: &Path, prompt: &str, model: Option<&str>, sampling: &SamplingA
         .map_err(|e| {
             // A base LM with no chat template is a legitimate case; name the flag rather than
             // silently answering a different request than the one that was sent.
-            let e = e.to_string();
-            if e.contains("chat_template") {
-                anyhow!("{e}\n  this model has no chat template -- use `npu generate --raw`")
-            } else { anyhow!(e) }
+            let code = engine_error(&e);
+            let msg = e.to_string();
+            let tagged = if msg.contains("chat_template") {
+                Tagged(code, format!("{msg}\n  this model has no chat template -- use `npu generate --raw`"))
+            } else { Tagged(code, msg) };
+            anyhow::Error::from(tagged)
         })
         .and_then(|served| drain_generation(served.value, !no_stream));
     handle.shutdown(); let _ = join.join();
@@ -327,24 +376,42 @@ fn generate(path: &Path, prompt: &str, model: Option<&str>, sampling: &SamplingA
     Ok(())
 }
 
-fn chat(path: &Path, model: Option<&str>, sampling: &SamplingArgs, no_stream: bool) -> Result<()> {
+/// `opening` is the turn given on the command line. It is answered before stdin is read once, and
+/// then the REPL continues from it -- a seeded session, not a one-shot. The one-shot spelling is
+/// `npu generate`, which builds the identical single-message `Prompt::Chat`; duplicating it here
+/// would add a second name for a command we have and drop the history that makes this one a REPL.
+fn chat(path: &Path, opening: Option<&str>, model: Option<&str>, sampling: &SamplingArgs,
+        no_stream: bool) -> Result<()> {
     quiet_one_shot();
     let cfg = load_cfg(path)?;
     let root = root(&cfg, path)?;
-    let (handle, join) = start_lazy(cfg, Box::new(EngineLoader { root }))?;
-    let params = build_params(sampling);
+    let (handle, join) = start_lazy(cfg, Box::new(EngineLoader { root }))
+        .map_err(|e| Tagged(engine_error(&e), e.to_string()))?;
+    // Code::Failure, the documented generic bucket: this closed set has no invalid-argument code,
+    // and NoService (2) would tell a caller to start a server for what is a bad flag value.
+    let params = build_params(sampling).map_err(|m| Tagged(Code::Failure, m))?;
     let mut history: Vec<npu_engine::ChatMessage> = Vec::new();
     let stdin = std::io::stdin();
+    // Whitespace-only counts as absent: `npu chat ""` must open the REPL, not send an empty turn.
+    let mut opening = opening.map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
     let result = (|| -> Result<()> {
         loop {
-            print!("> "); std::io::stdout().flush().ok();
-            let mut line = String::new();
-            if stdin.lock().read_line(&mut line)? == 0 { println!(); return Ok(()); } // Ctrl-D
-            let line = line.trim_end();
-            if line.is_empty() { continue; }
-            history.push(npu_engine::ChatMessage { role: "user".into(), content: line.to_string() });
+            let line = match opening.take() {
+                // Echoed at the prompt so the transcript reads the same whether the turn came from
+                // argv or the keyboard.
+                Some(turn) => { println!("> {turn}"); turn }
+                None => {
+                    print!("> "); std::io::stdout().flush().ok();
+                    let mut line = String::new();
+                    if stdin.lock().read_line(&mut line)? == 0 { println!(); return Ok(()); } // Ctrl-D
+                    let line = line.trim_end().to_string();
+                    if line.is_empty() { continue; }
+                    line
+                }
+            };
+            history.push(npu_engine::ChatMessage { role: "user".into(), content: line });
             let served = handle.generate(model, npu_engine::Prompt::Chat(history.clone()), params.clone())
-                .map_err(|e| anyhow!(e.to_string()))?;
+                .map_err(|e| Tagged(engine_error(&e), e.to_string()))?;
             let reply = drain_generation(served.value, !no_stream)?;
             if no_stream { print!("{reply}"); }
             println!();
@@ -366,8 +433,26 @@ const MIN_UTTERANCE_S: f32 = 0.30;
 /// the shorter cliff. Both backends now window internally and transcribe any length, so the cap is
 /// only about span granularity. The number has not been re-measured against the windowed backends;
 /// raising it gives whisper more context per call and should be swept before it is changed.
-fn asr_window_s() -> f32 {
-    std::env::var("NPU_ASR_MAX_SPAN_S").ok().and_then(|v| v.parse().ok()).unwrap_or(18.0)
+///
+/// A malformed value is an ERROR, not a silent 18.0 -- contract rule E004, whose worked example is
+/// this flag: `NPU_ASR_MAX_SPAN_S=2O` (letter O) parsed as nothing and returned the default, so an
+/// operator who asked for a different window got the old one with no diagnostic. Non-positive and
+/// non-finite are rejected at the same place; neither names a span.
+fn asr_window_s() -> Result<f32> {
+    parse_asr_window(std::env::var_os("NPU_ASR_MAX_SPAN_S").as_deref())
+}
+
+/// Split from the read so it is testable without mutating the process environment, which is global
+/// and races every other test in this binary.
+fn parse_asr_window(raw: Option<&std::ffi::OsStr>) -> Result<f32> {
+    let Some(raw) = raw else { return Ok(18.0) };
+    match raw.to_str().and_then(|v| v.parse::<f32>().ok()).filter(|s| *s > 0.0 && s.is_finite()) {
+        Some(s) => Ok(s),
+        // Code::Failure: the closed set has no invalid-argument code, and this is a bad value, not
+        // a missing service or model.
+        None => Err(Tagged(Code::Failure, format!(
+            "NPU_ASR_MAX_SPAN_S: expected a positive number of seconds, got {raw:?}")).into()),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -375,6 +460,9 @@ fn transcribe_media(path: &Path, input: &Path, out: Option<&Path>, format: OutFo
                     asr: Option<&str>, diar: Option<&str>, only_track: Option<usize>,
                     no_diarize: bool) -> Result<()> {
     quiet_one_shot();
+    // Before the device, ffmpeg or diarization: a bad NPU_ASR_MAX_SPAN_S is an operator typo, and
+    // reporting it after a model load and a diarize pass is loud but far too late.
+    let max_span = asr_window_s()?;
     let cfg = load_cfg(path)?;
     let root = root(&cfg, path)?;
     let tracks = media::probe_audio_tracks(input)?;
@@ -391,7 +479,8 @@ fn transcribe_media(path: &Path, input: &Path, out: Option<&Path>, format: OutFo
 
     // One actor for the whole run: the models stay resident across tracks and segments instead of
     // reloading per call. `max_resident` must be >= 2 for asr + diarize to coexist.
-    let (handle, join) = start_lazy(cfg, Box::new(EngineLoader { root }))?;
+    let (handle, join) = start_lazy(cfg, Box::new(EngineLoader { root }))
+        .map_err(|e| Tagged(engine_error(&e), e.to_string()))?;
     let tmp = std::env::temp_dir().join(format!("npu-media-{}", std::process::id()));
     std::fs::create_dir_all(&tmp).context("temp dir")?;
 
@@ -410,7 +499,7 @@ fn transcribe_media(path: &Path, input: &Path, out: Option<&Path>, format: OutFo
                 vec![(0.0, pcm.len() as f32 / 16_000.0, 0)]
             } else {
                 handle.diarize(diar, pcm.clone(), 16_000)
-                    .map_err(|e| anyhow!("diarize track {}: {e}", t.ord))?
+                    .map_err(|e| Tagged(engine_error(&e), format!("diarize track {}: {e}", t.ord)))?
                     .value.iter().map(|s| (s.start_s, s.end_s, s.speaker)).collect()
             };
             let n_spk = spans.iter().map(|s| s.2).collect::<std::collections::BTreeSet<_>>().len();
@@ -418,7 +507,6 @@ fn transcribe_media(path: &Path, input: &Path, out: Option<&Path>, format: OutFo
 
             // Split turns the ASR cannot hold whole, then transcribe each piece. Without this a
             // long turn returns only its first ~20 s, with no error to notice.
-            let max_span = asr_window_s();
             let spans: Vec<(f32, f32, u32)> = spans.iter()
                 .flat_map(|&(a, b, spk)| media::split_turn(a, b, max_span).into_iter()
                     .map(move |(x, y)| (x, y, spk)))
@@ -431,7 +519,8 @@ fn transcribe_media(path: &Path, input: &Path, out: Option<&Path>, format: OutFo
                 let slice = pcm[a.min(pcm.len())..b.min(pcm.len())].to_vec();
                 if slice.is_empty() { continue }
                 let text = handle.transcribe(asr, slice, 16_000)
-                    .map_err(|e| anyhow!("transcribe {label} [{start_s:.2}-{end_s:.2}]: {e}"))?
+                    .map_err(|e| Tagged(engine_error(&e),
+                        format!("transcribe {label} [{start_s:.2}-{end_s:.2}]: {e}")))?
                     .value.trim().to_string();
                 if text.is_empty() { continue }
                 utts.push(media::Utterance {
@@ -465,11 +554,13 @@ fn diarize(path: &Path, wav: &Path, model: Option<&str>, json: bool) -> Result<(
     let cfg = load_cfg(path)?;
     let root = root(&cfg, path)?;
     // Lazy, same reason as `transcribe`: a one-shot run loads the model it serves and nothing else.
-    let (handle, join) = start_lazy(cfg, Box::new(EngineLoader { root }))?;
+    let (handle, join) = start_lazy(cfg, Box::new(EngineLoader { root }))
+        .map_err(|e| Tagged(engine_error(&e), e.to_string()))?;
     let bytes = std::fs::read(wav).with_context(|| format!("read {}", wav.display()))?;
     let samples = http::parse::parse_wav_i16(&bytes)
         .ok_or_else(|| anyhow!("bad wav (need 16k mono 16-bit)"))?;
-    let out = handle.diarize(model, samples, 16_000).map_err(|e| anyhow!(e.to_string()));
+    let out = handle.diarize(model, samples, 16_000)
+        .map_err(|e| Tagged(engine_error(&e), e.to_string()));
     handle.shutdown(); let _ = join.join();
     println!("{}", render_segments(&out?.value, json));
     Ok(())
@@ -496,8 +587,9 @@ fn embed(path: &Path, text: &str, model: Option<&str>) -> Result<()> {
     let root = root(&cfg, path)?;
     // Lazy: `npu embed` against an ASR-only config used to pay a full parakeet load before it could
     // say there was no embed model at all.
-    let (handle, join) = start_lazy(cfg, Box::new(EngineLoader { root }))?;
-    let out = handle.embed(model, text).map_err(|e| anyhow!(e.to_string()));
+    let (handle, join) = start_lazy(cfg, Box::new(EngineLoader { root }))
+        .map_err(|e| Tagged(engine_error(&e), e.to_string()))?;
+    let out = handle.embed(model, text).map_err(|e| Tagged(engine_error(&e), e.to_string()));
     handle.shutdown(); let _ = join.join();
     let v = out?.value;
     let arr = v.iter().map(|x| format!("{x}")).collect::<Vec<_>>().join(",");
@@ -612,7 +704,8 @@ fn find_live<'a>(doc: &'a serde_json::Value, name: &str) -> Option<&'a serde_jso
 
 fn reload(path: &Path, port: Option<u16>) -> Result<()> {
     let port = resolve_port(path, port)?;
-    let body = http_post(port, "/admin/reload", "").context("reload (is the server running?)")?;
+    let body = http_post(port, "/admin/reload", "")
+        .context(Tagged(Code::NoService, "reload (is the server running?)".into()))?;
     println!("{body}");
     Ok(())
 }
@@ -626,7 +719,7 @@ fn reload(path: &Path, port: Option<u16>) -> Result<()> {
 fn load_model(path: &Path, model: &str, port: Option<u16>) -> Result<()> {
     let port = resolve_port(path, port)?;
     let body = http_post(port, &format!("/admin/models/{model}/load"), "")
-        .context("load (is the server running?)")?;
+        .context(Tagged(Code::NoService, "load (is the server running?)".into()))?;
     let v: serde_json::Value = serde_json::from_str(&body)
         .with_context(|| format!("unexpected reply: {body}"))?;
     if let Some(e) = v.get("error").and_then(|e| e.as_str()) { return Err(admin_err(e, port)) }
@@ -648,7 +741,7 @@ fn load_model(path: &Path, model: &str, port: Option<u16>) -> Result<()> {
 fn unload_model(path: &Path, model: &str, port: Option<u16>) -> Result<()> {
     let port = resolve_port(path, port)?;
     let body = http_post(port, &format!("/admin/models/{model}/unload"), "")
-        .context("unload (is the server running?)")?;
+        .context(Tagged(Code::NoService, "unload (is the server running?)".into()))?;
     let v: serde_json::Value = serde_json::from_str(&body)
         .with_context(|| format!("unexpected reply: {body}"))?;
     if let Some(e) = v.get("error").and_then(|e| e.as_str()) { return Err(admin_err(e, port)) }
@@ -720,7 +813,8 @@ fn unit_of(pid: u64) -> Option<String> {
 
 fn bake(path: &Path, name: &str) -> Result<()> {
     let cfg = load_cfg(path)?;
-    let m = cfg.find(name).ok_or_else(|| anyhow!("unknown model {name:?} in config"))?;
+    let m = cfg.find(name)
+        .ok_or_else(|| Tagged(Code::NoModel, format!("unknown model {name:?} in config")))?;
     let sc = npu_engine::config::ScenarioConfig::load(Path::new(&m.scenario))
         .with_context(|| format!("scenario {}", m.scenario))?;
     match sc.artifacts.model_spec()? {
@@ -787,7 +881,7 @@ fn config_cmd(path: &Path, action: &ConfigCmd) -> Result<()> {
         }
         ConfigCmd::RemoveModel { name } => {
             if !doc.remove_model(name).map_err(|e| anyhow!(e))? {
-                return Err(anyhow!("unknown model {name:?} (not in the config)"));
+                return Err(Tagged(Code::NoModel, format!("unknown model {name:?} (not in the config)")).into());
             }
             format!("removed model {name}")
         }
@@ -796,7 +890,7 @@ fn config_cmd(path: &Path, action: &ConfigCmd) -> Result<()> {
             // Refuse rather than write: a pin on a name the config does not have is a typo, and
             // there is nothing in the file for the key to attach to.
             if !doc.set_resident(model, on).map_err(|e| anyhow!(e))? {
-                return Err(anyhow!("unknown model {model:?} (not in the config)"));
+                return Err(Tagged(Code::NoModel, format!("unknown model {model:?} (not in the config)")).into());
             }
             if on { format!("pinned {model} resident") } else { format!("unpinned {model}") }
         }
@@ -819,6 +913,43 @@ fn config_cmd(path: &Path, action: &ConfigCmd) -> Result<()> {
     // The file is desired state; the running service only picks it up when asked.
     if matches!(action, ConfigCmd::Pin { .. } | ConfigCmd::Unpin { .. } | ConfigCmd::Set { .. }) {
         println!("run `npu reload` to apply this to a running server");
+    }
+    Ok(())
+}
+
+/// Every registered `NPU_*`/related env var against the LIVE process environment: whether it is
+/// currently set, its raw value if so, its truth semantics, and what it does.
+///
+/// `npu_runtime::env_flags::FLAGS` is the single source; this only renders it. Reads with
+/// `var_os` (not `var`) so presence is detected independent of UTF-8 validity, matching the
+/// `Presence`/`IsOk`/`NotZero` sites themselves.
+fn flags_cmd(as_json: bool) -> Result<()> {
+    if as_json {
+        let rows: Vec<_> = npu_runtime::env_flags::FLAGS.iter().map(|f| {
+            let raw = std::env::var_os(f.name);
+            serde_json::json!({
+                "name": f.name,
+                "owner": f.owner,
+                "site": f.site,
+                "semantics": f.semantics.code(),
+                "semantics_rule": f.semantics.describe(),
+                "default": f.default,
+                "set": raw.is_some(),
+                "value": raw.map(|v| v.to_string_lossy().into_owned()),
+                "doc": f.doc,
+            })
+        }).collect();
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+        return Ok(());
+    }
+    for f in npu_runtime::env_flags::FLAGS {
+        let raw = std::env::var_os(f.name);
+        let (source, value) = match &raw {
+            Some(v) => ("env", v.to_string_lossy().into_owned()),
+            None => ("default", format!("(default: {})", f.default)),
+        };
+        println!("{:<32} {:<8} {:<28} {:<10} {}", f.name, source, value, f.semantics.code(), f.owner);
+        println!("    {}", f.doc);
     }
     Ok(())
 }
@@ -1017,29 +1148,82 @@ mod tests {
     fn build_params_with_no_flags_is_the_engine_default() {
         let s = cli_def::SamplingArgs {
             temperature: None, top_p: None, top_k: None, max_tokens: None,
-            stop: vec![], seed: None, think: false, no_think: false,
+            max_completion_tokens: None, presence_penalty: None, frequency_penalty: None,
+            repetition_penalty: None, stop: vec![], seed: None, think: false, no_think: false,
         };
-        let p = build_params(&s);
-        let d = npu_engine::GenerateParams::default();
-        assert_eq!(p.temperature, d.temperature);
-        assert_eq!(p.top_p, d.top_p);
-        assert_eq!(p.top_k, d.top_k);
-        assert_eq!(p.max_tokens, d.max_tokens);
+        let p = build_params(&s).unwrap();
+        // Everything UNSET, exactly like an HTTP body with no sampling fields -- the CLI must not
+        // pre-fill a value, or it would silently outrank the scenario and checkpoint tiers.
+        assert_eq!(p.temperature, None);
+        assert_eq!(p.top_p, None);
+        assert_eq!(p.top_k, None);
+        assert_eq!(p.max_tokens, None);
+        assert_eq!(p.presence_penalty, None);
+        assert_eq!(p.frequency_penalty, None);
+        assert_eq!(p.repetition_penalty, None);
         assert!(p.stop.is_empty());
         assert_eq!(p.seed, None);
+    }
+
+    /// The CLI and the HTTP surface must accept the SAME sampling set. This is the parity guard:
+    /// every field on `GenerateParams` that a caller can set has a flag here.
+    #[test]
+    fn every_sampling_flag_reaches_generate_params() {
+        let s = cli_def::SamplingArgs {
+            temperature: Some(0.4), top_p: Some(0.9), top_k: Some(50), max_tokens: None,
+            max_completion_tokens: Some(64), presence_penalty: Some(0.5),
+            frequency_penalty: Some(-0.5), repetition_penalty: Some(1.2),
+            stop: vec!["END".into()], seed: Some(7), think: false, no_think: true,
+        };
+        let p = build_params(&s).unwrap();
+        assert_eq!(p.presence_penalty, Some(0.5));
+        assert_eq!(p.frequency_penalty, Some(-0.5));
+        assert_eq!(p.repetition_penalty, Some(1.2));
+        assert_eq!(p.max_tokens, Some(64), "--max-completion-tokens is an alias for --max-tokens");
+    }
+
+    #[test]
+    fn the_two_max_token_spellings_must_agree_when_both_are_given() {
+        let mk = |a, b| cli_def::SamplingArgs {
+            temperature: None, top_p: None, top_k: None, max_tokens: a,
+            max_completion_tokens: b, presence_penalty: None, frequency_penalty: None,
+            repetition_penalty: None, stop: vec![], seed: None, think: false, no_think: false,
+        };
+        assert_eq!(build_params(&mk(Some(8), Some(8))).unwrap().max_tokens, Some(8));
+        let err = build_params(&mk(Some(8), Some(9))).unwrap_err();
+        assert!(err.contains("disagree"), "{err}");
+    }
+
+    /// Out-of-range values are rejected by the SAME `validate()` the HTTP surface calls, so the two
+    /// cannot drift on what they accept. Silently degenerate is the behaviour being removed here:
+    /// a negative temperature read as greedy and a top_p above 1 disabled the filter.
+    #[test]
+    fn out_of_range_sampling_values_are_rejected() {
+        let mk = |t, tp| cli_def::SamplingArgs {
+            temperature: t, top_p: tp, top_k: None, max_tokens: None,
+            max_completion_tokens: None, presence_penalty: None, frequency_penalty: None,
+            repetition_penalty: None, stop: vec![], seed: None, think: false, no_think: false,
+        };
+        assert!(build_params(&mk(Some(-1.0), None)).unwrap_err().contains("temperature"));
+        assert!(build_params(&mk(Some(3.0), None)).unwrap_err().contains("temperature"));
+        assert!(build_params(&mk(None, Some(1.5))).unwrap_err().contains("top_p"));
+        assert!(build_params(&mk(Some(0.0), Some(1.0))).is_ok(), "the endpoints are legal");
+        assert!(build_params(&mk(Some(2.0), Some(0.0))).is_ok());
     }
 
     #[test]
     fn build_params_applies_every_flag() {
         let s = cli_def::SamplingArgs {
             temperature: Some(0.4), top_p: Some(0.9), top_k: Some(50), max_tokens: Some(64),
+            max_completion_tokens: None, presence_penalty: None, frequency_penalty: None,
+            repetition_penalty: None,
             stop: vec!["END".into(), "STOP".into()], seed: Some(7), think: false, no_think: true,
         };
-        let p = build_params(&s);
-        assert_eq!(p.temperature, 0.4);
-        assert_eq!(p.top_p, 0.9);
-        assert_eq!(p.top_k, 50);
-        assert_eq!(p.max_tokens, 64);
+        let p = build_params(&s).unwrap();
+        assert_eq!(p.temperature, Some(0.4));
+        assert_eq!(p.top_p, Some(0.9));
+        assert_eq!(p.top_k, Some(50));
+        assert_eq!(p.max_tokens, Some(64));
         assert_eq!(p.stop, vec!["END".to_string(), "STOP".to_string()]);
         assert_eq!(p.seed, Some(7));
         assert_eq!(p.enable_thinking, Some(false));
@@ -1052,12 +1236,14 @@ mod tests {
     #[test]
     fn think_flags_map_to_a_tri_state_and_neither_flag_leaves_the_template_default() {
         let base = |think, no_think| cli_def::SamplingArgs {
+            max_completion_tokens: None, presence_penalty: None, frequency_penalty: None,
+            repetition_penalty: None,
             temperature: None, top_p: None, top_k: None, max_tokens: None,
             stop: vec![], seed: None, think, no_think,
         };
-        assert_eq!(build_params(&base(false, false)).enable_thinking, None);
-        assert_eq!(build_params(&base(true, false)).enable_thinking, Some(true));
-        assert_eq!(build_params(&base(false, true)).enable_thinking, Some(false));
+        assert_eq!(build_params(&base(false, false)).unwrap().enable_thinking, None);
+        assert_eq!(build_params(&base(true, false)).unwrap().enable_thinking, Some(true));
+        assert_eq!(build_params(&base(false, true)).unwrap().enable_thinking, Some(false));
     }
 
     /// `--think` and `--no-think` override each other rather than erroring, so the last one on the
@@ -1068,7 +1254,7 @@ mod tests {
         match &cli.cmd {
             Cmd::Generate { sampling, .. } => {
                 assert!(sampling.no_think && !sampling.think);
-                assert_eq!(build_params(sampling).enable_thinking, Some(false));
+                assert_eq!(build_params(sampling).unwrap().enable_thinking, Some(false));
             }
             _ => panic!("expected Cmd::Generate"),
         }
@@ -1076,7 +1262,7 @@ mod tests {
         match &cli.cmd {
             Cmd::Chat { sampling, .. } => {
                 assert!(sampling.think && !sampling.no_think);
-                assert_eq!(build_params(sampling).enable_thinking, Some(true));
+                assert_eq!(build_params(sampling).unwrap().enable_thinking, Some(true));
             }
             _ => panic!("expected Cmd::Chat"),
         }
@@ -1104,6 +1290,41 @@ mod tests {
                 assert!(!raw, "generate must default to the chat template, not raw continuation");
             }
             _ => panic!("expected Cmd::Generate"),
+        }
+    }
+
+    /// The opening turn is optional and positional: `npu chat "hi"` answers immediately, `npu chat`
+    /// alone still opens an empty REPL. `allow_hyphen_values` for the same reason `generate` has it.
+    #[test]
+    fn chat_takes_an_optional_opening_turn() {
+        let cli = Cli::try_parse_from(["npu", "chat"]).expect("a bare chat must still parse");
+        match cli.cmd {
+            Cmd::Chat { prompt, .. } => assert_eq!(prompt, None),
+            _ => panic!("expected Cmd::Chat"),
+        }
+        let cli = Cli::try_parse_from(["npu", "chat", "- an opening turn", "--seed", "3"])
+            .expect("an opening turn must parse");
+        match cli.cmd {
+            Cmd::Chat { prompt, sampling, .. } => {
+                assert_eq!(prompt.as_deref(), Some("- an opening turn"));
+                assert_eq!(sampling.seed, Some(3));
+            }
+            _ => panic!("expected Cmd::Chat"),
+        }
+    }
+
+    /// E004: a `Value` flag must fail loudly. The worked example in the contract is this flag --
+    /// `NPU_ASR_MAX_SPAN_S=2O` (letter O, not zero) parsed as nothing and silently became 18.0.
+    #[test]
+    fn a_malformed_asr_window_is_an_error_not_the_default() {
+        use std::ffi::OsStr;
+        assert_eq!(parse_asr_window(None).unwrap(), 18.0, "unset means the default");
+        assert_eq!(parse_asr_window(Some(OsStr::new("24.5"))).unwrap(), 24.5);
+        for bad in ["2O", "", "0", "-3", "inf", "nan", "18s"] {
+            let e = parse_asr_window(Some(OsStr::new(bad)))
+                .expect_err(&format!("{bad:?} must not silently become 18.0"));
+            assert_eq!(exit::of(&e), Code::Failure);
+            assert!(e.to_string().contains("NPU_ASR_MAX_SPAN_S"), "the message must name the flag");
         }
     }
 

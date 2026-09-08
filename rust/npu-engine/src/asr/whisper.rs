@@ -25,7 +25,7 @@ use tokenizers::Tokenizer;
 
 use crate::api::EngineError;
 use crate::asr::whisper_decoder::{BatchedFusedDecoder, FusedDecoder, HostDecoder, WhisperDecoderWeights};
-use crate::config::ScenarioConfig;
+use crate::config::{self, DecodeSource, DecodeTier, ScenarioConfig};
 use crate::pipeline::AsrModel;
 
 const N_SAMPLES: usize = 480_000; // 30 s @ 16 kHz (preprocessor.onnx is fixed-shape)
@@ -276,6 +276,10 @@ pub struct WhisperAsr {
     /// Subsystem B (env `NPU_DECODE_FUSED_BATCH` + `NPU_DECODE_FUSED_BATCH_DIR`): batched decode over B
     /// streams in one dispatch/step. Driven by `transcribe_batch` (offline bulk), not the serve path.
     npu_fused_batch: Option<RefCell<BatchedFusedDecoder>>,
+    /// The tier `build` resolved for the single-stream decode path (`npu_fused`/`npu_decoder`/ONNX)
+    /// and which source produced it -- reportable via `decode_backend()`, e.g. for `npu doctor`.
+    /// Independent of `npu_fused_batch`, which stays purely `NPU_DECODE_FUSED_BATCH`-gated.
+    decode_backend: (DecodeTier, DecodeSource),
     _env: Rc<Env>,
 }
 
@@ -328,11 +332,14 @@ impl WhisperAsr {
         // of the ONNX decoder graphs. Built ONCE here (weights + resident CtxDecode kernels), sharing
         // the encoder's already-open single-tenant device. When unset, the decoder is None and the
         // transcribe path is byte-identical to the ONNX baseline.
-        // Decode backend: NPU_DECODE_FUSED (whole 12-layer fused ELF, 1 dispatch/token) takes
-        // precedence over NPU_DECODE (per-op, ~72 dispatches/token); else ONNX. All share the
-        // encoder's single-tenant device + the same host weights.
-        let fused_on = std::env::var("NPU_DECODE_FUSED").is_ok();
-        let npu_on = std::env::var("NPU_DECODE").is_ok();
+        // Decode backend: the scenario's `[decode] backend` tier is the DEFAULT; NPU_DECODE_FUSED /
+        // NPU_DECODE remain an OVERRIDE on top of it (env beats scenario beats Host), so a scenario
+        // with no [decode] block and no env vars set resolves exactly as before this field existed.
+        // See `config::resolve_decode_backend`.
+        let (tier, tier_source) = config::resolve_decode_backend(cfg);
+        eprintln!("[whisper] decode backend: {tier} (source: {tier_source})");
+        let fused_on = tier == DecodeTier::Fused;
+        let npu_on = tier == DecodeTier::Dispatched;
         let batch_on = std::env::var("NPU_DECODE_FUSED_BATCH").is_ok();
         let (npu_decoder, npu_fused, npu_fused_batch) = if fused_on || npu_on || batch_on {
             let dev = enc.device().ok_or_else(|| EngineError::Load(
@@ -381,9 +388,13 @@ impl WhisperAsr {
 
         Ok(WhisperAsr {
             prep, decoder, decoder_past, enc, tok, cfg: wcfg, dec_layers, tokens,
-            npu_decoder, npu_fused, npu_fused_batch, _env: env,
+            npu_decoder, npu_fused, npu_fused_batch, decode_backend: (tier, tier_source), _env: env,
         })
     }
+
+    /// The decode tier `build` resolved for this instance, and which source produced it -- for
+    /// callers (e.g. `npu doctor`) that want to report the running backend, not just re-derive it.
+    pub fn decode_backend(&self) -> (DecodeTier, DecodeSource) { self.decode_backend }
 
     /// Step 0: run the no-past graph over the full prompt + encoder hidden states. Delegates to the
     /// free-standing `decode_step0` (shared with `WhisperOnnxDecoder`).

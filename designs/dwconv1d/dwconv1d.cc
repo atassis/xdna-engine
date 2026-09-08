@@ -23,8 +23,8 @@
 // Weight tile (KW=16 bf16): taps in slots [0..K-1]. For the k=9 Parakeet path the
 // per-channel bias (BatchNorm folded into the depthwise bias) is carried in slot
 // [K] = w[9] -- this keeps the (in, w, out) 3-buffer signature (no 4th DMA input)
-// and folds the bias add into the on-chip epilogue. The k=5 GigaAM path is
-// bias-free (no slot read past the taps).
+// and folds the bias add into the on-chip epilogue. The k=5 path reads no slot past
+// the taps, so GigaAM's depthwise bias is the caller's to apply.
 //
 // TRACKED COPY -- installed into mlir-aie/aie_kernels/aie2p/ by setup_kernel_env.sh
 // (the mlir-aie tree is gitignored / re-cloned).
@@ -309,8 +309,10 @@ void dwconv1d_k9_bf16(bfloat16 *in, bfloat16 *w, bfloat16 *out) {
 #endif
 }
 
-// GigaAM-v3 Conformer depthwise conv: k=5, 'same' (pad=2), bias-free. Scalar (correct); a vectorized
-// k5 shift path is YAGNI until a GigaAM model is on the bench (dwconv1d_shift is unrolled for k9).
+// GigaAM-v3 Conformer depthwise conv: k=5, 'same' (pad=2), taps only. GigaAM HAS a depthwise bias
+// (conv.depthwise_conv.bias); the host applies it (npu-asr block.rs). Moving that on-chip means
+// passing it in w[K] and flipping the template flag, exactly as k9 does. Scalar; a vectorized k5
+// shift path is YAGNI until a GigaAM model is on the bench (dwconv1d_shift is unrolled for k9).
 void dwconv1d_k5_bf16(bfloat16 *in, bfloat16 *w, bfloat16 *out) {
   dwconv1d_same_scalar<400, 5, 2, false>(in, w, out);
 }

@@ -21,7 +21,6 @@ pub struct TuningProfile {
     pub qkv_overlap: Option<bool>,
     pub mm2_pipeline: Option<bool>,
     pub int8_fast_epi: Option<bool>,
-    pub int8_onchip_dequant: Option<bool>,
     /// Class-3: measured CPU↔NPU crossover (seconds of audio). Recorded; dispatch wired in spec B.
     pub cpu_npu_crossover_s: Option<f32>,
 }
@@ -40,7 +39,6 @@ impl TuningProfile {
         if let Some(v) = self.qkv_overlap { c.qkv_overlap = v; }
         if let Some(v) = self.mm2_pipeline { c.mm2_pipeline = v; }
         if let Some(v) = self.int8_fast_epi { c.int8_fast_epi = v; }
-        if let Some(v) = self.int8_onchip_dequant { c.int8_onchip_dequant = v; }
         c.with_env_overrides()
     }
 }

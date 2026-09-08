@@ -99,6 +99,18 @@ resident at once.
 
 ## CLI
 
+**Exit codes** -- a closed set, additive over plain 1/0 so scripts can branch without parsing
+stderr. Anything not confidently matched to 2-5 stays 1.
+
+| Code | Meaning |
+| --- | --- |
+| `0` | Success. |
+| `1` | Generic / unclassified failure -- the default. |
+| `2` | No service running, or the CLI could not reach it (`npu reload`/`load`/`unload`). Start one: `npu serve`. |
+| `3` | No such model, or no model configured for the requested capability. |
+| `4` | Device or engine error. |
+| `5` | Cancelled by the user. No command produces this yet. |
+
 **`npu: error while loading shared libraries: libonnxruntime.so.1`** -- you have a
 `npu` binary that was built without the RPATH bake `install.sh` performs (a bare `cargo
 build` or a binary copied out from a different build). Reinstall via `install.sh`,

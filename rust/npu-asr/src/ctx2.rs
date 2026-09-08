@@ -89,11 +89,21 @@ impl Precision {
         self == Precision::Int8
     }
     /// Runtime selector: `NPU_PRECISION` = native|bf16|int8 (default FastBf16).
+    ///
+    /// An unrecognised value PANICS rather than falling back. The wildcard arm this replaces
+    /// swallowed three different mistakes into the same silent default: a typo (`natve`), the wrong
+    /// case (`Int8`), and -- the one that proves the point -- `bf16` itself, which this doc string
+    /// has always advertised and the match never handled. `NPU_TILE`, forty lines up, already
+    /// panics on a malformed value; this is that discipline applied to the sibling knob.
     pub fn from_env() -> Self {
         match std::env::var("NPU_PRECISION").ok().as_deref() {
             Some("native") => Precision::NativeBf16,
+            Some("bf16") => Precision::FastBf16,
             Some("int8") => Precision::Int8,
-            _ => Precision::FastBf16,
+            Some(other) => panic!(
+                "NPU_PRECISION: expected native|bf16|int8, got {other:?}"
+            ),
+            None => Precision::FastBf16,
         }
     }
 
@@ -244,28 +254,6 @@ pub struct SharedCtxA {
     /// (replaces the per-element `i % n` hardware divide, keeping the exact `(acc·scale_a)·ws[c]`
     /// multiply order). int8-only; no effect on the bf16 default.
     fast_int8: bool,
-    /// L3 — on-chip int8 dequant (`NPU_INT8_ONCHIP=1`, int8 only, default-OFF). The resident xclbin is
-    /// the `modalint8dq` build: its epilogue dequants the i32 accumulator to f32 ON-CORE by a single
-    /// per-dispatch scalar S = scale_a·w_global delivered in rtp[0] (the host patches S's f32 bits into
-    /// the stream's 32 RTP slots before each dispatch). This moves the ~50ms host dequant MULTIPLY onto
-    /// the array so int8's host epilogue becomes the same near-no-op as the bf16 modal (internal notes).
-    /// First cut: per-tensor weight scale (one scalar) + sequential dispatch (pipeline forced off — the
-    /// shared per-N stream can't be patched by two concurrent dispatches; per-slot streams are stage 2).
-    modal_int8: bool,
-    modal_int8_streams: Vec<ModalInt8Stream>,
-}
-
-/// One per-N instruction stream for the on-chip int8 dequant path. The instr stream bakes a placeholder
-/// `1.0f` in each of the 32 per-core rtp[0] slots; `offsets` are those 32 byte-positions (found by
-/// scanning, asserted == n_aie_cores). Per dispatch the host patches S's bytes into `bytes` at each
-/// offset, re-writes+syncs the (small, ~5.7KB) `bo`, then dispatches — so the on-core epilogue dequants
-/// by the right S. `bytes` is the host master copy (cheap to patch); `bo` is the device instr buffer.
-struct ModalInt8Stream {
-    n: usize,
-    bo: Bo,
-    bytes: RefCell<Vec<u8>>,
-    offsets: Vec<usize>,
-    n_instr: usize,
 }
 
 /// One double-buffer slot for the async mm2 pipeline: its own activation/output BOs (so a dispatch
@@ -324,9 +312,7 @@ pub fn xclbin_stem_with(
 ) -> String {
     let prec = cfg.precision;
     let (mt, kt, nt) = shape.tile.unwrap_or_else(|| prec.tile());
-    if prec.is_int8() && cfg.int8_onchip_dequant {
-        format!("{PAD_M}x{}x{}_{mt}x{kt}x{nt}_8c_modalint8dq", shape.ka, shape.na)
-    } else if !prec.is_int8() && cfg.modal_epilogue {
+    if !prec.is_int8() && cfg.modal_epilogue {
         let tag = if gelu_fused { "modalgelu" } else { "modalsilu" };
         format!("{PAD_M}x{}x{}_{mt}x{kt}x{nt}_8c_{tag}{}", shape.kaug(), shape.na, prec.nat_tag())
     } else {
@@ -366,15 +352,11 @@ impl SharedCtxA {
         // WER 9.6% unchanged). int8 would need an i32-dequant epilogue (not built). Opt out:
         // `NPU_MODAL_EPI=0`.
         let modal = !prec.is_int8() && cfg.modal_epilogue;
-        // L3: on-chip int8 dequant (int8 only, opt-in). Loads the `modalint8dq` resident xclbin instead
-        // of the plain int8 one; its epilogue dequants the i32 accumulator to f32 on-core (×S from rtp[0]).
-        let modal_int8 = prec.is_int8() && cfg.int8_onchip_dequant;
         let ka_dev = if modal { shape.kaug() } else { shape.ka };
         if !npu_xrt::quiet() {
             eprintln!(
-                "[ctx2] V2 encoder precision = {prec:?} (tile {mt}x{kt}x{nt}){}{}",
-                if modal { "  [modal on-chip epilogue: K-aug bias + on-chip SiLU, f32 out]" } else { "" },
-                if modal_int8 { "  [L3 on-chip int8 dequant: i32->f32 ×S on-core, host bias/silu, seq]" } else { "" }
+                "[ctx2] V2 encoder precision = {prec:?} (tile {mt}x{kt}x{nt}){}",
+                if modal { "  [modal on-chip epilogue: K-aug bias + on-chip SiLU, f32 out]" } else { "" }
             );
         }
         // ONE resident kernel = the largest (N=3072) whole-array program; every op runs on it via its
@@ -399,35 +381,10 @@ impl SharedCtxA {
             (bo, n_instr)
         };
 
-        // plain (non-modal) per-N streams; modal loads its 6 (N × {silu,identity}) streams below;
-        // modal_int8 loads its 3 dequant streams + scans each for the 32 rtp[0] patch slots.
+        // plain (non-modal) per-N streams; modal loads its 6 (N × {silu,identity}) streams below.
         let mut streams = Vec::with_capacity(shape.streams.len());
         let mut modal_streams: Vec<(usize, u8, Bo, usize)> = Vec::new();
-        let mut modal_int8_streams: Vec<ModalInt8Stream> = Vec::new();
-        if modal_int8 {
-            const N_AIE_CORES: usize = 32; // 4 rows × 8 cols — one rtp[0] write packet each
-            let sentinel = 1.0f32.to_le_bytes(); // the iron bakes 1.0f into every rtp[0] slot
-            for &n in shape.streams.iter() {
-                let ka = shape.ka;
-                let insts = crate::kernel_registry::insts_path(&wa, &format!("{PAD_M}x{ka}x{n}_{mt}x{kt}x{nt}_8c_modalint8dq"));
-                let (instr_bytes, n_instr) = read_instr_words(&insts);
-                let offsets: Vec<usize> = (0..instr_bytes.len().saturating_sub(3))
-                    .step_by(4)
-                    .filter(|&i| instr_bytes[i..i + 4] == sentinel)
-                    .collect();
-                assert_eq!(
-                    offsets.len(), N_AIE_CORES,
-                    "modalint8dq N={n}: expected {N_AIE_CORES} rtp[0] slots, found {} — sentinel collision?",
-                    offsets.len()
-                );
-                let bo = dev.alloc_bo(&kern, instr_bytes.len(), FLAG_CACHEABLE, g_instr).unwrap();
-                bo.write_bytes(&instr_bytes).unwrap();
-                bo.sync_to_device().unwrap();
-                modal_int8_streams.push(ModalInt8Stream {
-                    n, bo, bytes: RefCell::new(instr_bytes), offsets, n_instr,
-                });
-            }
-        } else if modal {
+        if modal {
             let gelu_enabled = std::env::var("NPU_ENC_GELU_FUSED").is_ok();
             for &n in shape.streams.iter() {
                 // mode: 1=silu, 0=identity (every N); 2=gelu only when NPU_ENC_GELU_FUSED + a stream exists
@@ -473,10 +430,7 @@ impl SharedCtxA {
         // Goal-1 async overlap: 2-slot double-buffer for the mm2 pipeline. DEFAULT-ON (measured s10:
         // ~29ms/8% off the bf16 default, ~15-17ms native/int8, numerically byte-identical — same
         // kernel + same host f32 accumulation order). Opt out with `NPU_MM2_PIPELINE=0`.
-        // FORCED OFF for modal_int8 (stage-1): the per-N dequant stream's rtp[0] is patched per dispatch,
-        // so two concurrent dispatches sharing one instr BO would clobber each other's S. Per-slot instr
-        // BOs (stage 2) re-enable it.
-        let pipeline = !modal_int8 && cfg.mm2_pipeline;
+        let pipeline = cfg.mm2_pipeline;
         let mut pipe = Vec::new();
         if pipeline {
             if !npu_xrt::quiet() {
@@ -548,34 +502,7 @@ impl SharedCtxA {
                 }
                 on
             },
-            modal_int8,
-            modal_int8_streams,
         })
-    }
-
-    /// Dispatch the on-chip int8 dequant path for N=`n` on the shared `bo_a`/`bo_c` (sequential): patch
-    /// the per-dispatch scalar `s` into the stream's 32 rtp[0] slots, re-write+sync the (small) instr BO,
-    /// then run the matmul. The on-core epilogue then dequants the i32 accumulator by `s` -> f32 in `bo_c`.
-    fn dispatch_int8_onchip(&self, n: usize, s: f32, bo_b: &Bo) {
-        let st = self
-            .modal_int8_streams
-            .iter()
-            .find(|st| st.n == n)
-            .unwrap_or_else(|| panic!("modalint8dq: no stream for N={n}"));
-        let sb = s.to_le_bytes();
-        {
-            let mut b = st.bytes.borrow_mut();
-            for &off in &st.offsets {
-                b[off..off + 4].copy_from_slice(&sb);
-            }
-            st.bo.write_bytes(&b).unwrap();
-        }
-        st.bo.sync_to_device().unwrap();
-        let t0 = Instant::now();
-        self.kern
-            .run_matmul8(3, &st.bo, st.n_instr, &self.bo_a, bo_b, &self.bo_c, &self.bo_tmp, &self.bo_tr)
-            .unwrap();
-        prof_record(t0.elapsed());
     }
 
     /// (instr BO, n_instr) for the modal stream producing N=`n` in `mode` (0=id,1=silu,2=gelu) on the xclbin.
@@ -705,8 +632,6 @@ pub struct CtxAOp {
     bias: Vec<f32>, // length n
     bo_b: Bo,       // weight [KA, n] row-major (modal: [KAUG, n] with bias K-aug'd into row KA)
     w_scale: Vec<f32>, // int8: per-output-channel symmetric scale (len n); empty for bf16
-    w_global: f32,  // modal_int8 (L3): per-TENSOR weight scale (one scalar) so dequant ×(scale_a·w_global)
-                    // is a single on-core multiply via rtp[0]; 1.0 for the per-column host-dequant path.
     mode: u8,  // modal epilogue mode: 0=identity, 1=silu (Epi::SiluBias), 2=gelu (Epi::GeluBias)
 }
 
@@ -724,31 +649,15 @@ impl CtxAOp {
         assert_eq!(bias.len(), if epi == Epi::None { 0 } else { n });
 
         // Weight [KA, n] row-major (no NA padding — the N=n stream reads exactly [KA, n]).
-        let mut w_global = 1.0f32;
         let (bo_b, w_scale) = if shared.prec.is_int8() {
-            // int8 weight quant. Per-column (default host-dequant path) gives best accuracy; modal_int8
-            // (L3 on-chip dequant) uses ONE per-TENSOR scale w_global so the on-core dequant is a single
-            // ×(scale_a·w_global) — the per-dispatch scalar S — with no per-column delivery. The host
-            // then needs no dequant multiply (the win); per-column delivery is a later upgrade.
+            // per-output-channel (per n column) symmetric quant. scale[nn] = max|W[:,nn]|/127.
             let mut w_scale = vec![0f32; n];
-            if shared.modal_int8 {
+            for nn in 0..n {
                 let mut amax = 0f32;
                 for kk in 0..shared.shape.ka {
-                    for nn in 0..n {
-                        amax = amax.max(w_real[[kk, nn]].abs());
-                    }
+                    amax = amax.max(w_real[[kk, nn]].abs());
                 }
-                w_global = if amax > 0.0 { amax / 127.0 } else { 1.0 };
-                w_scale.iter_mut().for_each(|s| *s = w_global); // uniform (kept for ABI symmetry)
-            } else {
-                // per-output-channel (per n column) symmetric quant. scale[nn] = max|W[:,nn]|/127.
-                for nn in 0..n {
-                    let mut amax = 0f32;
-                    for kk in 0..shared.shape.ka {
-                        amax = amax.max(w_real[[kk, nn]].abs());
-                    }
-                    w_scale[nn] = if amax > 0.0 { amax / 127.0 } else { 1.0 };
-                }
+                w_scale[nn] = if amax > 0.0 { amax / 127.0 } else { 1.0 };
             }
             let mut b_i8 = vec![0i8; shared.shape.ka * n];
             for kk in 0..shared.shape.ka {
@@ -794,7 +703,6 @@ impl CtxAOp {
             bias: bias.to_vec(),
             bo_b,
             w_scale,
-            w_global,
         }
     }
 
@@ -837,7 +745,6 @@ impl CtxAOp {
             bias: bias.to_vec(),
             bo_b,
             w_scale: Vec::new(), // bf16 path: no int8 per-column scales
-            w_global: 1.0,
         })
     }
 
@@ -955,10 +862,6 @@ impl CtxAOp {
         let sh = &self.shared;
         let n = self.n;
 
-        if sh.modal_int8 {
-            return self.forward_view_int8_onchip(a_real, mp, n);
-        }
-
         let tc = Instant::now();
         // dynamic per-tensor activation scale = max|A| / 127 over the real mp×KA elements
         let scale_a = quant_scale(a_real, mp, sh.fast_int8);
@@ -1004,73 +907,6 @@ impl CtxAOp {
         // the device wrote i32; reinterpret the 4B/elem readback buffer as i32 (same layout, no copy).
         let acc: &[i32] = unsafe { std::slice::from_raw_parts(cf.as_ptr() as *const i32, mp * n) };
         let data = dequant_epi(acc, mp, n, scale_a, &self.w_scale, self.epi, &self.bias, sh.fast_int8);
-        let out = Array2::from_shape_vec((mp, n), data).unwrap();
-        marsh::add(marsh::EPI, te.elapsed());
-        out
-    }
-
-    /// L3 on-chip int8 dequant (`NPU_INT8_ONCHIP=1`): quant the activation (dynamic per-tensor scale_a),
-    /// dispatch the `modalint8dq` stream with S = scale_a·w_global patched into rtp[0] (the on-core
-    /// epilogue dequants i32→f32, so `bo_c` already holds dequanted f32), then apply ONLY bias/SiLU on
-    /// host — the fat per-element dequant MULTIPLY (the reason int8 lost to bf16) is gone. The host
-    /// epilogue is now the same shape as the bf16 modal's (a copy, or a cheap bias/silu pass).
-    fn forward_view_int8_onchip(&self, a_real: ArrayView2<f32>, mp: usize, n: usize) -> Array2<f32> {
-        let sh = &self.shared;
-        let tc = Instant::now();
-        let scale_a = quant_scale(a_real, mp, sh.fast_int8);
-        {
-            let mut a = sh.a_buf_i8.borrow_mut();
-            let ka = self.shared.shape.ka;
-            a.par_chunks_mut(ka).take(mp).enumerate().for_each(|(r, row)| {
-                for c in 0..ka {
-                    row[c] = quant_i8(a_real[[r, c]], scale_a);
-                }
-            });
-            if sh.a_inited.get() {
-                sh.bo_a.write_bytes(&i8_bytes(&a)[..mp * self.shared.shape.ka]).unwrap();
-            } else {
-                sh.bo_a.write_bytes(i8_bytes(&a)).unwrap();
-                sh.a_inited.set(true);
-            }
-        }
-        marsh::add(marsh::CONV, tc.elapsed());
-        let ts = Instant::now();
-        sh.bo_a.sync_to_device().unwrap();
-        marsh::add(marsh::SYNC_TO, ts.elapsed());
-
-        // S = scale_a (dynamic) * w_global (per-tensor weight) -> the on-core dequant scalar.
-        sh.dispatch_int8_onchip(n, scale_a * self.w_global, &self.bo_b);
-
-        let tf = Instant::now();
-        sh.bo_c.sync_from_device().unwrap();
-        marsh::add(marsh::SYNC_FROM, tf.elapsed());
-        let tr = Instant::now();
-        {
-            let mut cf = sh.cbuf.borrow_mut();
-            let dst = unsafe { std::slice::from_raw_parts_mut(cf.as_mut_ptr() as *mut u8, mp * n * 4) };
-            sh.bo_c.read_bytes(dst).unwrap();
-        }
-        marsh::add(marsh::READ, tr.elapsed());
-        let te = Instant::now();
-        let cf = sh.cbuf.borrow();
-        let vals: &[f32] = &cf[..mp * n]; // already dequanted on-core (= acc * scale_a * w_global)
-        let epi = self.epi;
-        let bias = &self.bias;
-        // host epilogue: bias/SiLU ONLY — the dequant multiply ran on-core. Mirrors the non-modal bf16
-        // host epilogue exactly, applied to the dequanted f32 values.
-        let data: Vec<f32> = match epi {
-            Epi::None => vals.to_vec(),
-            Epi::Bias => vals.par_iter().enumerate().map(|(i, &v)| v + bias[i % n]).collect(),
-            Epi::GeluBias => unreachable!("GeluBias is modal-only (gelu runs on-chip)"),
-            Epi::SiluBias => vals
-                .par_iter()
-                .enumerate()
-                .map(|(i, &raw)| {
-                    let v = raw + bias[i % n];
-                    v * fast_sigmoid(v)
-                })
-                .collect(),
-        };
         let out = Array2::from_shape_vec((mp, n), data).unwrap();
         marsh::add(marsh::EPI, te.elapsed());
         out
@@ -1663,13 +1499,13 @@ mod tests {
         cfg.modal_epilogue = false;
         assert_eq!(xclbin_stem_with(&shape, &cfg, false), "512x768x3072_64x32x96_8c");
 
-        // native carries the nat tag; int8 + on-chip dequant is its own artifact
+        // native carries the nat tag
         cfg.modal_epilogue = true;
         cfg.precision = Precision::NativeBf16;
         assert_eq!(xclbin_stem_with(&shape, &cfg, false), "512x800x3072_64x32x96_8c_modalsilunat");
+        // int8 never takes the modal branch, regardless of modal_epilogue
         cfg.precision = Precision::Int8;
-        cfg.int8_onchip_dequant = true;
-        assert_eq!(xclbin_stem_with(&shape, &cfg, false), "512x768x3072_64x32x96_8c_modalint8dq");
+        assert_eq!(xclbin_stem_with(&shape, &cfg, false), "512x768x3072_64x32x96_8c");
     }
 
     /// The set is closed: two shapes, and `for_whisper` refuses anything else. If a third encoder

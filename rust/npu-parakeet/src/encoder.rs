@@ -674,15 +674,16 @@ impl FastConformerEncoder {
         // dispatches) with ONE 8-head conveyor dispatch. The host packs the query belt (qu = q+u[h];
         // BD_shifted = rel_shift((q+v[h]) @ p^T), carriage per PARAKEET_CONVEYOR_BD -- default plain,
         // see scripts/conveyor_bd_precision_check.py). npu.relpos_mha_conveyor returns merged ctx
-        // [T, D]; the 8-head xclbin dispatch inside it is a TODO stub until the artifact is built
-        // (see CONVEYOR_INTEGRATION_RUNBOOK.md). Falls back to the host score path when unset.
+        // [T, D], or None when artifacts/conveyor/single/ isn't built (scripts/conveyor_prebuild.sh)
+        // -- falls through to the host score path below, same as when the env var is unset.
         #[cfg(feature = "npu")]
         if std::env::var("PARAKEET_CONVEYOR_MHA").is_ok() {
             if let Some(npu) = &self.npu {
                 let _h = PhaseScope::new("mhsa_conveyor", Bucket::Npu);
-                let ctx = npu.relpos_mha_conveyor(q, k, v, pm, &ubias, &vbias, h);
-                prof::phase::set_stage("mhsa_qkv");
-                return ctx; // merged [T,D]; linear_out applied by the caller (mhsa / mhsa_dev)
+                if let Some(ctx) = npu.relpos_mha_conveyor(q, k, v, pm, &ubias, &vbias, h) {
+                    prof::phase::set_stage("mhsa_qkv");
+                    return ctx; // merged [T,D]; linear_out applied by the caller (mhsa / mhsa_dev)
+                }
             }
         }
 

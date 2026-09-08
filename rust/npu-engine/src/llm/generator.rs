@@ -26,6 +26,17 @@ pub trait DecodeStep {
         Ok(())
     }
 
+    /// The largest number of token positions this backend's KV cache can hold, or `None` when the
+    /// backend has no window (a host implementation whose cache is a growable `Vec`). The device
+    /// backend reads it from the artifact's `dims.S`, which sizes `kc`/`vc` as `[Hkv, S, HD]`.
+    ///
+    /// This is a REQUIRED bound, not a hint. `step`'s `pos` becomes `kv_off = pos * head_dim` into
+    /// that layout, so `pos == S` lands exactly on head 1's row 0: inside the arena, past no check,
+    /// and silently answering from an overwritten cache. Enforced in [`LlmGenerator::generate`].
+    fn max_context(&self) -> Option<usize> {
+        None
+    }
+
     /// Per-generation device accounting, or `None` when the backend has none or it is not enabled.
     /// Emitted by [`LlmGenerator::generate`] after the loop, paired with [`DecodeStep::reset`]
     /// before it, so the numbers cover exactly one generation. A host-side backend returns `None`;
@@ -67,17 +78,29 @@ pub fn tokenize_prompt(
 /// ignoring `token`/`pos`. Not a model -- a way to drive [`LlmGenerator`]'s loop deterministically.
 pub struct ScriptedDecodeStep {
     steps: VecDeque<Vec<f32>>,
+    max_context: Option<usize>,
 }
 
 impl ScriptedDecodeStep {
     pub fn new(steps: Vec<Vec<f32>>) -> Self {
-        ScriptedDecodeStep { steps: steps.into() }
+        ScriptedDecodeStep { steps: steps.into(), max_context: None }
+    }
+
+    /// Give the mock a finite KV window, so the bound in [`LlmGenerator::generate`] is testable
+    /// without a device.
+    pub fn with_max_context(mut self, max_context: usize) -> Self {
+        self.max_context = Some(max_context);
+        self
     }
 }
 
 impl DecodeStep for ScriptedDecodeStep {
     fn step(&mut self, _token: u32, _pos: usize) -> Result<Vec<f32>, EngineError> {
         self.steps.pop_front().ok_or_else(|| EngineError::Device("scripted decode exhausted".to_string()))
+    }
+
+    fn max_context(&self) -> Option<usize> {
+        self.max_context
     }
 }
 
@@ -86,11 +109,20 @@ impl DecodeStep for ScriptedDecodeStep {
 pub struct LlmGenerator<D: DecodeStep> {
     cfg: ModelConfig,
     decode: D,
+    /// The scenario's `[generation]` block -- the tier between the request and the checkpoint.
+    scenario_defaults: crate::pipeline::GenerationDefaults,
 }
 
 impl<D: DecodeStep> LlmGenerator<D> {
     pub fn new(cfg: ModelConfig, decode: D) -> Self {
-        LlmGenerator { cfg, decode }
+        LlmGenerator { cfg, decode, scenario_defaults: Default::default() }
+    }
+
+    /// Set the scenario's generation defaults. A request that names a field still wins; these
+    /// apply only under the fields it leaves out, and above the checkpoint's own settings.
+    pub fn with_scenario_defaults(mut self, d: crate::pipeline::GenerationDefaults) -> Self {
+        self.scenario_defaults = d;
+        self
     }
 }
 
@@ -117,14 +149,31 @@ impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
             return Err(EngineError::Unsupported("prompt tokenized to zero tokens".to_string()));
         }
         let prompt_tokens = prompt_ids.len() as u32;
+        // The KV window is a HARD bound, and crossing it is silent rather than loud: `pos` becomes
+        // `kv_off = pos * head_dim` into a `[Hkv, S, HD]` cache, so position S lands on head 1's
+        // row 0 -- in-arena, past the artifact's own bounds check, answering from a cache it just
+        // overwrote. Priming walks positions `0..prompt_len`, so the prompt alone must fit.
+        let max_context = self.decode.max_context();
+        if let Some(max_ctx) = max_context {
+            if prompt_ids.len() > max_ctx {
+                return Err(EngineError::Unsupported(format!(
+                    "prompt is {} tokens but this model's context window is {max_ctx} \
+                     (the decode artifact was built at max_seq={max_ctx}); \
+                     shorten the prompt or load an artifact built with a larger window",
+                    prompt_ids.len()
+                )));
+            }
+        }
 
+        // The one place the tiers collapse: request -> scenario -> checkpoint -> engine.
+        let gen = params.resolve(&self.scenario_defaults, &self.cfg.checkpoint_defaults);
         let sampling_cfg = SamplingConfig {
-            temperature: params.temperature,
-            top_k: params.top_k as usize,
-            top_p: params.top_p,
-            repetition_penalty: params.repetition_penalty,
-            frequency_penalty: params.frequency_penalty,
-            presence_penalty: params.presence_penalty,
+            temperature: gen.temperature,
+            top_k: gen.top_k as usize,
+            top_p: gen.top_p,
+            repetition_penalty: gen.repetition_penalty,
+            frequency_penalty: gen.frequency_penalty,
+            presence_penalty: gen.presence_penalty,
         };
         let mut rng = SplitMix64::new(params.seed.unwrap_or_else(default_seed));
         // Penalties see the whole context, prompt included -- OpenAI's own wording ("existing
@@ -140,6 +189,8 @@ impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
             logits = self.decode.step(tok, i)?;
         }
 
+        let max_tokens = gen.max_tokens;
+
         let mut completion_tokens = 0u32;
         let finish: FinishReason;
         let mut pos = prompt_ids.len();
@@ -147,7 +198,7 @@ impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
         // Checked BOTH before sampling (so `max_tokens: 0` never samples at all) and again right
         // after a token is accepted (so the loop never pays for a device dispatch it will not use).
         'decode: loop {
-            if completion_tokens >= params.max_tokens {
+            if completion_tokens >= max_tokens {
                 finish = FinishReason::Length;
                 break;
             }
@@ -182,7 +233,13 @@ impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
                 }
             }
 
-            if completion_tokens >= params.max_tokens {
+            if completion_tokens >= max_tokens {
+                finish = FinishReason::Length;
+                break;
+            }
+            // Same bound, at the other end: the next dispatch would write position `pos`, so stop
+            // while `pos` is still inside the window rather than after it has been overwritten.
+            if max_context.is_some_and(|m| pos >= m) {
                 finish = FinishReason::Length;
                 break;
             }
@@ -209,6 +266,7 @@ impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
 mod tests {
     use super::*;
     use crate::llm::chat_template::ChatTemplate;
+    use crate::pipeline::GenerationDefaults;
     use crate::llm::config::StopTokens;
     use crate::pipeline::ChatMessage;
     use std::collections::HashMap;
@@ -253,12 +311,137 @@ mod tests {
             vec![0.0, 0.0, 0.0, 0.0, 9.0], // sample -> id 4 (EOS)
         ]);
         let mut gen = LlmGenerator::new(cfg, decode);
-        let params = GenerateParams { max_tokens: 50, temperature: 0.0, ..GenerateParams::default() };
+        let params = GenerateParams { max_tokens: Some(50), temperature: Some(0.0), ..GenerateParams::default() };
         let (text, reason, usage) = gen.generate_to_string(&Prompt::Raw("hello".to_string()), &params).unwrap();
         assert_eq!(text, "world");
         assert_eq!(reason, FinishReason::Stop);
         assert_eq!(usage.prompt_tokens, 1);
         assert_eq!(usage.completion_tokens, 1, "the EOS token itself must not be counted");
+    }
+
+    #[test]
+    fn a_configured_default_applies_when_the_request_omits_max_tokens() {
+        let cfg = build_cfg(None);
+        let peak = |id: usize| { let mut v = vec![0.0; 7]; v[id] = 9.0; v };
+        let decode = ScriptedDecodeStep::new(vec![peak(2), peak(5), peak(6), peak(1)]);
+        let mut gen = LlmGenerator::new(cfg, decode).with_scenario_defaults(GenerationDefaults { max_tokens: Some(2), ..Default::default() });
+        // max_tokens unset -- the model's own budget of 2 decides, not the engine's 256.
+        let params = GenerateParams { temperature: Some(0.0), ..GenerateParams::default() };
+        let (text, reason, usage) =
+            gen.generate_to_string(&Prompt::Raw("hello".to_string()), &params).unwrap();
+        assert_eq!(reason, FinishReason::Length);
+        assert_eq!(usage.completion_tokens, 2);
+        assert_eq!(text, "world foo");
+    }
+
+    #[test]
+    fn an_explicit_request_value_beats_the_configured_default_in_both_directions() {
+        let peak = |id: usize| { let mut v = vec![0.0; 7]; v[id] = 9.0; v };
+        // Asking for MORE than the model default gets more: the default is a default, not a cap.
+        let decode = ScriptedDecodeStep::new(vec![peak(2), peak(5), peak(6), peak(1)]);
+        let mut gen = LlmGenerator::new(build_cfg(None), decode).with_scenario_defaults(GenerationDefaults { max_tokens: Some(1), ..Default::default() });
+        let params = GenerateParams { max_tokens: Some(3), temperature: Some(0.0), ..GenerateParams::default() };
+        let (_, _, usage) =
+            gen.generate_to_string(&Prompt::Raw("hello".to_string()), &params).unwrap();
+        assert_eq!(usage.completion_tokens, 3, "an explicit request must be able to exceed the default");
+
+        // And asking for less gets less.
+        let decode = ScriptedDecodeStep::new(vec![peak(2), peak(5), peak(6), peak(1)]);
+        let mut gen = LlmGenerator::new(build_cfg(None), decode).with_scenario_defaults(GenerationDefaults { max_tokens: Some(3), ..Default::default() });
+        let params = GenerateParams { max_tokens: Some(1), temperature: Some(0.0), ..GenerateParams::default() };
+        let (_, _, usage) =
+            gen.generate_to_string(&Prompt::Raw("hello".to_string()), &params).unwrap();
+        assert_eq!(usage.completion_tokens, 1);
+    }
+
+    #[test]
+    fn with_no_configured_default_the_engine_default_still_applies() {
+        let cfg = build_cfg(None);
+        // 256 is a lot of script, so assert the resolution rather than the count: an unset request
+        // against an unset model default must not collapse to zero tokens.
+        let decode = ScriptedDecodeStep::new(vec![vec![0.0, 0.0, 9.0, 0.0, 0.0], vec![0.0, 0.0, 0.0, 0.0, 9.0]]);
+        let mut gen = LlmGenerator::new(cfg, decode);
+        let params = GenerateParams { temperature: Some(0.0), ..GenerateParams::default() };
+        assert_eq!(params.max_tokens, None);
+        let (text, reason, _) =
+            gen.generate_to_string(&Prompt::Raw("hello".to_string()), &params).unwrap();
+        assert_eq!(reason, FinishReason::Stop);
+        assert_eq!(text, "world");
+    }
+
+    #[test]
+    fn a_prompt_longer_than_the_kv_window_is_refused_naming_both_numbers() {
+        let cfg = build_cfg(None);
+        // Window of 2, prompt of 3 -- priming alone would walk positions 0,1,2 and write past the
+        // last row of head 0. Nothing downstream can detect that, so it must be refused here.
+        let decode = ScriptedDecodeStep::new(vec![vec![0.0, 0.0, 9.0, 0.0, 0.0]]).with_max_context(2);
+        let mut gen = LlmGenerator::new(cfg, decode);
+        let params = GenerateParams { max_tokens: Some(50), temperature: Some(0.0), ..GenerateParams::default() };
+        let err = gen
+            .generate_to_string(&Prompt::Raw("hello world foo".to_string()), &params)
+            .expect_err("a prompt that does not fit the window must not run");
+        let msg = err.to_string();
+        assert!(msg.contains('3'), "must name the prompt length: {msg}");
+        assert!(msg.contains('2'), "must name the window: {msg}");
+    }
+
+    #[test]
+    fn generation_stops_at_the_kv_window_before_overwriting_it() {
+        let cfg = build_cfg(None);
+        // Window of 3, prompt "hello" (1 token). Priming consumes entry 0 at position 0, so `pos`
+        // enters the loop at 1. Positions 1 and 2 are legal; the step that would write position 3
+        // must not happen. That allows exactly 3 accepted tokens, and the script is deliberately
+        // LONGER than that -- if the bound did not fire the loop would happily keep going.
+        let peak = |id: usize| {
+            let mut v = vec![0.0; 7];
+            v[id] = 9.0;
+            v
+        };
+        let decode = ScriptedDecodeStep::new(vec![peak(2), peak(5), peak(6), peak(1), peak(2)])
+            .with_max_context(3);
+        let mut gen = LlmGenerator::new(cfg, decode);
+        let params = GenerateParams { max_tokens: Some(50), temperature: Some(0.0), ..GenerateParams::default() };
+        let (text, reason, usage) =
+            gen.generate_to_string(&Prompt::Raw("hello".to_string()), &params).unwrap();
+        assert_eq!(reason, FinishReason::Length, "hitting the window is a length stop");
+        assert_eq!(usage.completion_tokens, 3, "one token per legal position, and not one more");
+        assert_eq!(text, "world foo bar");
+    }
+
+    #[test]
+    fn a_prompt_exactly_filling_the_window_still_emits_from_its_last_logits() {
+        let cfg = build_cfg(None);
+        // prompt_len == max_context is legal: priming walks 0..=1 and stops inside the window. The
+        // last primed logits are real, so one token is sampled from them before the loop stops.
+        let decode = ScriptedDecodeStep::new(vec![vec![0.0; 7], {
+            let mut v = vec![0.0; 7];
+            v[2] = 9.0;
+            v
+        }])
+        .with_max_context(2);
+        let mut gen = LlmGenerator::new(cfg, decode);
+        let params = GenerateParams { max_tokens: Some(50), temperature: Some(0.0), ..GenerateParams::default() };
+        let (text, reason, usage) =
+            gen.generate_to_string(&Prompt::Raw("hello world".to_string()), &params).unwrap();
+        assert_eq!(reason, FinishReason::Length);
+        assert_eq!(usage.completion_tokens, 1);
+        assert_eq!(text, "world");
+    }
+
+    #[test]
+    fn a_backend_with_no_window_is_unbounded_as_before() {
+        let cfg = build_cfg(None);
+        // max_context() defaults to None, so nothing about the existing host path changes.
+        let decode = ScriptedDecodeStep::new(vec![
+            vec![0.0, 0.0, 9.0, 0.0, 0.0],
+            vec![0.0, 0.0, 0.0, 0.0, 9.0],
+        ]);
+        assert!(decode.max_context().is_none());
+        let mut gen = LlmGenerator::new(cfg, decode);
+        let params = GenerateParams { max_tokens: Some(50), temperature: Some(0.0), ..GenerateParams::default() };
+        let (_, reason, _) =
+            gen.generate_to_string(&Prompt::Raw("hello".to_string()), &params).unwrap();
+        assert_eq!(reason, FinishReason::Stop);
     }
 
     #[test]
@@ -269,7 +452,7 @@ mod tests {
             vec![0.0, 0.0, 9.0, 0.0, 0.0], // -> "world" again
         ]);
         let mut gen = LlmGenerator::new(cfg, decode);
-        let params = GenerateParams { max_tokens: 2, temperature: 0.0, ..GenerateParams::default() };
+        let params = GenerateParams { max_tokens: Some(2), temperature: Some(0.0), ..GenerateParams::default() };
         let (text, reason, usage) = gen.generate_to_string(&Prompt::Raw("hello".to_string()), &params).unwrap();
         assert_eq!(text, "world world");
         assert_eq!(reason, FinishReason::Length, "must stop WITHOUT an extra wasted device dispatch");
@@ -281,7 +464,7 @@ mod tests {
         let cfg = build_cfg(None);
         let decode = ScriptedDecodeStep::new(vec![vec![0.0, 0.0, 9.0, 0.0, 0.0]]);
         let mut gen = LlmGenerator::new(cfg, decode);
-        let params = GenerateParams { max_tokens: 50, temperature: 0.0, ..GenerateParams::default() };
+        let params = GenerateParams { max_tokens: Some(50), temperature: Some(0.0), ..GenerateParams::default() };
         let mut finish = None;
         gen.generate(&Prompt::Raw("hello".to_string()), &params, &mut |c| match c {
             Chunk::Text(_) => false, // abort on the very first text chunk
@@ -303,8 +486,8 @@ mod tests {
         ]);
         let mut gen = LlmGenerator::new(cfg, decode);
         let params = GenerateParams {
-            max_tokens: 50,
-            temperature: 0.0,
+            max_tokens: Some(50),
+            temperature: Some(0.0),
             stop: vec!["stop_word".to_string()],
             ..GenerateParams::default()
         };
@@ -325,7 +508,7 @@ mod tests {
             ]);
             LlmGenerator::new(cfg, decode)
         };
-        let params = GenerateParams { max_tokens: 50, temperature: 0.0, ..GenerateParams::default() };
+        let params = GenerateParams { max_tokens: Some(50), temperature: Some(0.0), ..GenerateParams::default() };
         let (t1, ..) = make().generate_to_string(&Prompt::Raw("hello".to_string()), &params).unwrap();
         let (t2, ..) = make().generate_to_string(&Prompt::Raw("hello".to_string()), &params).unwrap();
         assert_eq!(t1, t2);
@@ -337,7 +520,7 @@ mod tests {
         // one thing: does the SAME seed draw the SAME two tokens from non-degenerate softmax logits.
         let script = || vec![vec![1.0, 1.0, 1.0, 1.0, 0.0], vec![1.0, 2.0, 3.0, 1.0, 0.0]];
         let params =
-            GenerateParams { max_tokens: 2, temperature: 0.9, seed: Some(1234), ..GenerateParams::default() };
+            GenerateParams { max_tokens: Some(2), temperature: Some(0.9), seed: Some(1234), ..GenerateParams::default() };
         let run = || {
             let cfg = build_cfg(None);
             let decode = ScriptedDecodeStep::new(script());
@@ -360,7 +543,7 @@ mod tests {
             vec![0.0, 0.0, 0.0, 0.0, 9.0], // priming pos 1 ("world") -> first sample() -> EOS
         ]);
         let mut gen = LlmGenerator::new(cfg, decode);
-        let params = GenerateParams { max_tokens: 5, temperature: 0.0, ..GenerateParams::default() };
+        let params = GenerateParams { max_tokens: Some(5), temperature: Some(0.0), ..GenerateParams::default() };
         let prompt = Prompt::Chat(vec![ChatMessage { role: "user".to_string(), content: "hello world".to_string() }]);
         let (text, reason, usage) = gen.generate_to_string(&prompt, &params).unwrap();
         assert_eq!(text, "");
@@ -373,7 +556,7 @@ mod tests {
         let cfg = build_cfg(Some("SHOULD NOT BE USED"));
         let decode = ScriptedDecodeStep::new(vec![vec![0.0, 0.0, 0.0, 0.0, 9.0]]); // -> EOS immediately
         let mut gen = LlmGenerator::new(cfg, decode);
-        let params = GenerateParams { max_tokens: 5, temperature: 0.0, ..GenerateParams::default() };
+        let params = GenerateParams { max_tokens: Some(5), temperature: Some(0.0), ..GenerateParams::default() };
         let (_, _, usage) = gen.generate_to_string(&Prompt::Raw("hello".to_string()), &params).unwrap();
         assert_eq!(usage.prompt_tokens, 1);
     }

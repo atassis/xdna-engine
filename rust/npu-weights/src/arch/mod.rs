@@ -31,22 +31,72 @@ pub trait Arch {
     fn transform(&self, src: &BTreeMap<String, RawTensor>) -> anyhow::Result<BTreeMap<String, OutTensor>>;
 }
 
+/// Constructor for one arch. A plain fn pointer, not `Box<dyn Fn>`, so [`REGISTRY`] is a `const`
+/// table rather than something built fresh on every `get()` call.
+type Ctor = fn() -> Box<dyn Arch>;
+
+/// (name, constructor), alphabetical, one entry per `arch/*.rs` module. The single source for both
+/// [`get`]'s dispatch and [`ARCH_NAMES`] -- a new module is wired in by adding one line here, and
+/// `npu weights --arch`'s clap possible-values + help text (`npu-cli/src/cli_def.rs`) read
+/// `ARCH_NAMES`, so a module that forgets this line cannot be dispatched to either, and one that
+/// remembers it cannot be missing from the CLI's help.
+const REGISTRY: &[(&str, Ctor)] = &[
+    ("bert", || Box::new(bert::Bert)),
+    ("clip", || Box::new(clip::Clip)),
+    ("dinov2", || Box::new(dinov2::Dinov2)),
+    ("edsr", || Box::new(edsr::Edsr)),
+    ("espcn", || Box::new(espcn::Espcn)),
+    ("esm", || Box::new(esm::Esm)),
+    ("fastconformer", || Box::new(fastconformer::FastConformer)),
+    ("gigaam", || Box::new(gigaam::Gigaam)),
+    ("modernbert", || Box::new(modernbert::ModernBert)),
+    ("opt", || Box::new(opt::Opt)),
+    ("resnet", || Box::new(resnet::Resnet)),
+    ("vit", || Box::new(vit::Vit)),
+    ("whisper", || Box::new(whisper::Whisper)),
+];
+
+const ARCH_NAMES_ARR: [&str; REGISTRY.len()] = {
+    let mut out = [""; REGISTRY.len()];
+    let mut i = 0;
+    while i < REGISTRY.len() {
+        out[i] = REGISTRY[i].0;
+        i += 1;
+    }
+    out
+};
+
+/// Every `--arch` value `get` accepts, derived from [`REGISTRY`] at compile time -- same shape as
+/// `npu_runtime::config_doc::SERVER_KEYS`, a `pub const` slice single-sourced with the code that
+/// consumes the names.
+pub const ARCH_NAMES: &[&str] = &ARCH_NAMES_ARR;
+
 pub fn get(name: &str) -> anyhow::Result<Box<dyn Arch>> {
-    match name {
-        "bert" => Ok(Box::new(bert::Bert)),
-        "clip" => Ok(Box::new(clip::Clip)),
-        "dinov2" => Ok(Box::new(dinov2::Dinov2)),
-        "edsr" => Ok(Box::new(edsr::Edsr)),
-        "espcn" => Ok(Box::new(espcn::Espcn)),
-        "esm" => Ok(Box::new(esm::Esm)),
-        "fastconformer" => Ok(Box::new(fastconformer::FastConformer)),
-        "gigaam" => Ok(Box::new(gigaam::Gigaam)),
-        "modernbert" => Ok(Box::new(modernbert::ModernBert)),
-        "opt" => Ok(Box::new(opt::Opt)),
-        "resnet" => Ok(Box::new(resnet::Resnet)),
-        "vit" => Ok(Box::new(vit::Vit)),
-        "whisper" => Ok(Box::new(whisper::Whisper)),
-        other => anyhow::bail!("unknown arch {other:?}"),
+    match REGISTRY.iter().find(|(n, _)| *n == name) {
+        Some((_, ctor)) => Ok(ctor()),
+        None => anyhow::bail!("unknown arch {name:?} (one of: {})", ARCH_NAMES.join(", ")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `ARCH_NAMES` and `get`'s dispatch are the same table by construction, but this is the
+    /// assertion that grades any future change to that construction: every name the CLI can offer
+    /// must actually build, and must build the arch it names.
+    #[test]
+    fn every_arch_name_dispatches_to_the_arch_it_names() {
+        assert_eq!(ARCH_NAMES.len(), REGISTRY.len());
+        for name in ARCH_NAMES {
+            let a = get(name).unwrap_or_else(|e| panic!("ARCH_NAMES has {name:?} but get() does not: {e}"));
+            assert_eq!(a.name(), *name);
+        }
+    }
+
+    #[test]
+    fn an_unknown_arch_is_rejected() {
+        assert!(get("no-such-arch").is_err());
     }
 }
 

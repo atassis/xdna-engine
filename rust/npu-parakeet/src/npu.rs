@@ -109,6 +109,13 @@ const CONV_GJ: usize = 4;        // heads per MemTile group (must match the gene
 // fix (no kernel change): reproduces the shipped relpos t_active masking for variable-length clips.
 const CONV_KEY_MASK: f32 = -1.0e4;
 
+/// Whether `dir` (expected `{conveyor_dir}/single`) carries both files `conveyor_block` loads.
+/// Factored out of `conveyor_block` so the presence gate is unit-testable without an open device
+/// (`conveyor_block` itself needs `&self.dev`).
+fn conveyor_artifact_present(dir: &Path) -> bool {
+    dir.join("final.xclbin").exists() && dir.join("insts.bin").exists()
+}
+
 /// BD-carriage precision for the conveyor query belt (open-item C / SPLITP). Default PLAIN per the
 /// Deliverable-1 gate (scripts/conveyor_bd_precision_check.py). Env PARAKEET_CONVEYOR_BD=split flips
 /// to two-bf16 (hi+lo, ~14 mantissa bits) if the device 17-clip WER ever regresses vs 8.5.
@@ -189,6 +196,26 @@ fn relpos_buckets() -> &'static [(usize, usize, &'static str)] {
 // tap. The insts template holds H t_active words (one per head's RTP write), all == the bucket's BUILT_T
 // at build; per clip we patch EVERY word == BUILT_T to t.
 const RELPOS_HEADS: usize = 8; // = Parakeet n_heads; must match the xclbin's --heads build
+
+/// Verify a relpos insts template was actually BUILT for `bt`, instead of trusting the directory
+/// name (relpos-loader-bypasses-the-manifest-and-can-load-a-mislabelled-bucket). Every head's RTP
+/// write bakes a t_active word == BUILT_T -- `relpos_prebuild.sh` counts them at build time and
+/// warns when the count != HEADS*ROWS (scripts/relpos_prebuild.sh:65-78); this re-runs that count
+/// at LOAD time, because the build-time warning is thrown away once the artifact is copied out.
+/// A bucket actually built for a different T has ZERO words == bt, so `relpos_mha_batched`'s
+/// per-clip patch loop (`if *w == rk.built_t { *w = t_patch }`) would silently touch nothing and
+/// every dispatch would run with a stale baked-in t_active -- no panic, no gate. Pure (no I/O), so
+/// it is unit-testable without a device or a live artifact directory.
+fn verify_relpos_built_t(words: &[u32], bt: usize) -> Result<usize, String> {
+    let found = words.iter().filter(|&&w| w == bt as u32).count();
+    if found == 0 || found % RELPOS_HEADS != 0 {
+        return Err(format!(
+            "insts.bin has {found} words == BUILT_T={bt} (want a positive multiple of \
+             RELPOS_HEADS={RELPOS_HEADS}) -- built for a different T than the bucket name claims"
+        ));
+    }
+    Ok(found)
+}
 
 /// The single resident relpos block (built at its bucket's BUILT_T -- see relpos_buckets()). BOs are sized for BUILT_T; per
 /// dispatch we patch the instr template's t_active word and pad data to BUILT_T. Dispatched per
@@ -322,7 +349,10 @@ pub struct NpuMatmul {
     relpos_dir: PathBuf,                           // {root}/artifacts/relpos (per-T xclbin cache)
     relpos: RefCell<HashMap<usize, Rc<RelposK>>>,  // T -> loaded resident block
     conveyor_dir: PathBuf,                         // {root}/artifacts/conveyor (8-head xclbin)
-    conveyor: RefCell<Option<Rc<ConveyorK>>>,      // loaded 8-head conveyor (H baked, single instance)
+    // Tri-state cache, same shape as `resident_ln` below: None = untried; Some(None) = artifact
+    // absent, PARAKEET_CONVEYOR_MHA declines (no retry); Some(Some) = loaded conveyor (H baked,
+    // single instance).
+    conveyor: RefCell<Option<Option<Rc<ConveyorK>>>>,
     ln_dir: PathBuf,                               // {root}/artifacts/parakeet/ln (ctxln + affcast xclbins)
     // Tri-state cache: None = untried; Some(None) = xclbins absent, FF stays host (no retry);
     // Some(Some) = co-resident on-chip LN + affine-cast chain loaded.
@@ -745,9 +775,13 @@ fn fc1_panel_bf16_dir<'a>(base: &'a Path, ln_dir: &'a Path, stem: &str) -> &'a P
 /// exactly 11596 B, verified by build). Measured tile penalty: 1.13x at N=1024, 1.27x at N=4096.
 /// Projected net ~-67 ms/clip.
 ///
-/// **TIMING-ONLY as it stands** -- encoder OUTPUT IS WRONG under this flag, which exists to measure
-/// the dispatch sequence, the transition count and the wall clock end-to-end. What remains is a
-/// DEVICE-side dtype gap, not a host one: the bf16 C is handed straight to bricks compiled against
+/// **CORRECTED 2026-09-08: this comment said "encoder OUTPUT IS WRONG under this flag" and listed
+/// the bf16 resadd/acc_add arms as missing. Commit 73b5ed1 added them TWELVE MINUTES after 8c46d00
+/// wrote this text (2026-08-22 23:13 -> 23:25), and all three `*_bf16b` artifacts are on disk; the
+/// log `2026-08-22-the-full-fold-is-correct.md` records the pair encoding correctly end to end.**
+/// Still opt-in, and the standalone case is the open question: correctness was demonstrated for
+/// `PARAKEET_FOLD_FC1=1` TOGETHER WITH `PARAKEET_FOLD_GLU=1`, never for this flag alone.
+/// The device-side dtype reasoning below is why the pair is needed: the bf16 C is handed straight to bricks compiled against
 /// f32, and no host reader is on those paths. `matmul_id_to_bo`'s linear_out feeds
 /// `residual_add_dev` on the MHSA seam (measured at rel-L2 1.223 under the fold against 6.652e-3
 /// without), the fc2 K-split partials feed `acc_add`, which has no bf16 arm at all, and pw1 feeds
@@ -985,34 +1019,46 @@ impl NpuMatmul {
 
     /// Load (once) the 8-head relpos CONVEYOR built at CONV_BUILT_T by scripts/conveyor_prebuild.sh
     /// into {root}/artifacts/conveyor/single/. Static insts (no per-clip t_active patch), 4-BO ABI.
-    fn conveyor_block(&self, n_heads: usize, qelem: usize) -> Rc<ConveyorK> {
-        if let Some(k) = self.conveyor.borrow().as_ref() {
-            assert_eq!(k.n_heads, n_heads, "conveyor xclbin baked for H={}, got {n_heads}", k.n_heads);
-            assert_eq!(k.qelem, qelem, "conveyor belt qelem mismatch (carriage changed since load?)");
-            return k.clone();
+    ///
+    /// Graceful like `resident_ln`: PARAKEET_CONVEYOR_MHA=1 with the artifact unbuilt must decline
+    /// (`None`, host score path stays active), not panic -- unlike `relpos_block`'s raw
+    /// `load_kernel`/`fs::read`, this is the loader-B half of
+    /// relpos-loader-bypasses-the-manifest-and-can-load-a-mislabelled-bucket.
+    fn conveyor_block(&self, n_heads: usize, qelem: usize) -> Option<Rc<ConveyorK>> {
+        if let Some(cached) = self.conveyor.borrow().as_ref() {
+            if let Some(k) = cached {
+                assert_eq!(k.n_heads, n_heads, "conveyor xclbin baked for H={}, got {n_heads}", k.n_heads);
+                assert_eq!(k.qelem, qelem, "conveyor belt qelem mismatch (carriage changed since load?)");
+            }
+            return cached.clone();
         }
         let dk = CONV_DK;
         let n_qt = CONV_BUILT_T / CONV_TQ;
         let dir = self.conveyor_dir.join("single");
-        let xclbin = dir.join("final.xclbin");
-        let insts = dir.join("insts.bin");
-        let kern = self
-            .dev
-            .load_kernel(xclbin.to_str().unwrap(), None)
-            .unwrap_or_else(|e| panic!("load conveyor single ({}): {e:?}\n  pre-build: scripts/conveyor_prebuild.sh", xclbin.display()));
-        let ib = std::fs::read(&insts).unwrap_or_else(|e| panic!("read {}: {e}", insts.display()));
-        let n_instr = ib.len() / 4;
-        let g = |i| kern.group_id(i).unwrap();
-        let bo_instr = self.dev.alloc_bo(&kern, ib.len(), FLAG_CACHEABLE, g(1)).unwrap();
-        let bo_q = self.dev.alloc_bo(&kern, n_heads * n_qt * qelem * 2, FLAG_HOST_ONLY, g(3)).unwrap();
-        let bo_k = self.dev.alloc_bo(&kern, n_heads * CONV_BUILT_T * dk * 2, FLAG_HOST_ONLY, g(4)).unwrap();
-        let bo_v = self.dev.alloc_bo(&kern, n_heads * CONV_BUILT_T * dk * 2, FLAG_HOST_ONLY, g(5)).unwrap();
-        let bo_ctx = self.dev.alloc_bo(&kern, n_heads * n_qt * CONV_TQ * dk * 2, FLAG_HOST_ONLY, g(6)).unwrap();
-        bo_instr.write_bytes(&ib).unwrap(); // static instr stream -> upload once
-        bo_instr.sync_to_device().unwrap();
-        let ck = Rc::new(ConveyorK { kern, n_instr, bo_instr, bo_q, bo_k, bo_v, bo_ctx, n_qt, qelem, n_heads });
-        *self.conveyor.borrow_mut() = Some(ck.clone());
-        ck
+        let result = if conveyor_artifact_present(&dir) {
+            let xclbin = dir.join("final.xclbin");
+            let insts = dir.join("insts.bin");
+            let kern = self
+                .dev
+                .load_kernel(xclbin.to_str().unwrap(), None)
+                .unwrap_or_else(|e| panic!("load conveyor single ({}): {e:?}\n  pre-build: scripts/conveyor_prebuild.sh", xclbin.display()));
+            let ib = std::fs::read(&insts).unwrap_or_else(|e| panic!("read {}: {e}", insts.display()));
+            let n_instr = ib.len() / 4;
+            let g = |i| kern.group_id(i).unwrap();
+            let bo_instr = self.dev.alloc_bo(&kern, ib.len(), FLAG_CACHEABLE, g(1)).unwrap();
+            let bo_q = self.dev.alloc_bo(&kern, n_heads * n_qt * qelem * 2, FLAG_HOST_ONLY, g(3)).unwrap();
+            let bo_k = self.dev.alloc_bo(&kern, n_heads * CONV_BUILT_T * dk * 2, FLAG_HOST_ONLY, g(4)).unwrap();
+            let bo_v = self.dev.alloc_bo(&kern, n_heads * CONV_BUILT_T * dk * 2, FLAG_HOST_ONLY, g(5)).unwrap();
+            let bo_ctx = self.dev.alloc_bo(&kern, n_heads * n_qt * CONV_TQ * dk * 2, FLAG_HOST_ONLY, g(6)).unwrap();
+            bo_instr.write_bytes(&ib).unwrap(); // static instr stream -> upload once
+            bo_instr.sync_to_device().unwrap();
+            Some(Rc::new(ConveyorK { kern, n_instr, bo_instr, bo_q, bo_k, bo_v, bo_ctx, n_qt, qelem, n_heads }))
+        } else {
+            eprintln!("[npu] conveyor xclbin absent in {} -- PARAKEET_CONVEYOR_MHA declines, host score path stays active (pre-build: scripts/conveyor_prebuild.sh)", dir.display());
+            None
+        };
+        *self.conveyor.borrow_mut() = Some(result.clone());
+        result
     }
 
     /// Max clip length T the resident relpos block can serve (the largest bucket's baked BUILT_T).
@@ -1068,6 +1114,12 @@ impl NpuMatmul {
             .chunks_exact(4)
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
+        // Trust but verify (relpos-loader-bypasses-the-manifest-and-can-load-a-mislabelled-bucket):
+        // this dir has no manifest to route through `resolve_verified`, so re-run
+        // relpos_prebuild.sh's own build-time count here instead -- a bucket actually built for a
+        // different T patches ZERO t_active words per clip and dispatches silently wrong.
+        verify_relpos_built_t(&instr_template, bt)
+            .unwrap_or_else(|e| panic!("relpos bucket {bt} at {}: {e}\n  pre-build: scripts/relpos_prebuild.sh", dir.display()));
         let n_instr = instr_template.len();
         let g = |i| kern.group_id(i).unwrap();
         let bo_instr = self.dev.alloc_bo(&kern, ib.len(), FLAG_CACHEABLE, g(1)).unwrap();
@@ -1296,16 +1348,16 @@ impl NpuMatmul {
     /// gain -> default PLAIN; flip to split only if the device 17-clip WER regresses vs 8.5.
     ///
     /// Inputs (host f32, as encoder.rs already has them): q/k/v [T, H*DK], pm [P, H*DK],
-    /// ubias/vbias [H, DK]. Returns merged ctx [T, H*DK] (pre-linear_out; caller applies linear_out).
-    ///
-    /// NOTE: the actual 8-head xclbin LOAD + DISPATCH + output de-interleave is a TODO STUB below
-    /// (needs artifacts/conveyor/single/{final.xclbin,insts.bin} from scripts/conveyor_prebuild.sh
-    /// and the group-major join ABI from conveyor_attn_iron.py -- see CONVEYOR_INTEGRATION_RUNBOOK.md).
+    /// ubias/vbias [H, DK]. Returns merged ctx [T, H*DK] (pre-linear_out; caller applies linear_out),
+    /// or `None` when {conveyor_dir}/single/{final.xclbin,insts.bin} isn't built
+    /// (scripts/conveyor_prebuild.sh) -- the caller falls back to the host score path, mirroring
+    /// `conveyor_block`'s own decline (relpos-loader-bypasses-the-manifest-and-can-load-a-mislabelled-bucket,
+    /// loader B).
     pub fn relpos_mha_conveyor(
         &self,
         q: &Array2<f32>, k: &Array2<f32>, v: &Array2<f32>, pm: &Array2<f32>,
         ubias: &Array2<f32>, vbias: &Array2<f32>, n_heads: usize,
-    ) -> Array2<f32> {
+    ) -> Option<Array2<f32>> {
         let carry = BdCarry::from_env();
         let t = q.nrows();
         let p = pm.nrows(); // 2T-1
@@ -1315,6 +1367,9 @@ impl NpuMatmul {
         let n_qt = CONV_BUILT_T / CONV_TQ;                       // query tiles streamed (176/8 = 22)
         // per-tile query-belt element count: qu [TQ*DK] then BD_shifted [carry_factor * TQ*BUILT_T].
         let qelem = CONV_TQ * dk + carry.factor() * CONV_TQ * CONV_BUILT_T;
+        // Resolve (and possibly decline) the resident block FIRST, before the belt-packing work
+        // below -- a decline is then a cheap filesystem check, not a wasted host pass.
+        let ck = self.conveyor_block(n_heads, qelem)?;
 
         // ---- host-side belt inputs: qu_all [H,T,DK] and BD (pre-shift) [H,T,P] ----
         let mut qu_all = Array3::<f32>::zeros((n_heads, t, dk));
@@ -1406,7 +1461,6 @@ impl NpuMatmul {
         npu_xrt::pack_f32_to_bf16(&v_pack, &mut vb);
 
         // ---- device dispatch: 4-BO conveyor ABI (instr | q | k | v | ctx), ONE run ----
-        let ck = self.conveyor_block(n_heads, qelem);
         debug_assert_eq!(qb.len(), n_heads * n_qt * qelem);
         let t0 = Instant::now();
         ck.bo_q.write_bytes(u16_bytes(&qb)).unwrap();
@@ -1450,7 +1504,7 @@ impl NpuMatmul {
             }
             base += n_qt * gsz * CONV_TQ * dk;
         }
-        ctx
+        Some(ctx)
     }
 
     /// Lazy-load the co-resident ctxLN + cast xclbins from {root}/artifacts/parakeet/ln (built at
@@ -1758,6 +1812,21 @@ impl NpuMatmul {
         let want_dws = !want_dws_t && have(&format!("dwconv_silu_{DW_C}x{DW_T}"));
         // separate dwconv + silu only when neither fused variant exists
         let want_split = !want_dws_t && !want_dws;
+        // Which variant won, said once. The three branches below then warn only when the variant
+        // was actually wanted and is genuinely missing -- they used to print "absent" for a file
+        // that was present but lost the order, and send the reader to rebuild it. In each of those
+        // branches `want_split` is exactly that genuine-absence case: a fused variant winning is
+        // the only other way to reach them.
+        let selected = if want_dws_t {
+            "dwconv_silu_t (time-major fused)"
+        } else if want_dws {
+            "dwconv_silu (channel-major fused)"
+        } else {
+            "separate dwconv + silu"
+        };
+        if !npu_xrt::quiet() {
+            eprintln!("[npu] conv dwconv/SiLU: {selected} selected in {}", self.ln_dir.display());
+        }
 
         let dwconv = {
             let stem = format!("dwconv_{DW_C}x{DW_T}");
@@ -1774,7 +1843,9 @@ impl NpuMatmul {
                     kern, instr, n,
                 })
             } else {
-                eprintln!("[npu] dwconv xclbin absent in {} -- conv dwconv stays host (build final_dwconv_{DW_C}x{DW_T})", self.ln_dir.display());
+                if want_split {
+                    eprintln!("[npu] dwconv xclbin absent in {} -- conv dwconv stays host (build final_dwconv_{DW_C}x{DW_T})", self.ln_dir.display());
+                }
                 None
             }
         };
@@ -1794,7 +1865,9 @@ impl NpuMatmul {
                     kern, instr, n,
                 })
             } else {
-                eprintln!("[npu] silu xclbin absent in {} -- conv SiLU stays host (build final_silu_{DW_C}x{DW_T})", self.ln_dir.display());
+                if want_split {
+                    eprintln!("[npu] silu xclbin absent in {} -- conv SiLU stays host (build final_silu_{DW_C}x{DW_T})", self.ln_dir.display());
+                }
                 None
             }
         };
@@ -1815,7 +1888,9 @@ impl NpuMatmul {
                     kern, instr, n,
                 })
             } else {
-                eprintln!("[npu] fused dwconv+silu xclbin absent in {} -- separate dwconv+silu path (build final_dwconv_silu_{DW_C}x{DW_T})", self.ln_dir.display());
+                if want_split {
+                    eprintln!("[npu] fused dwconv+silu xclbin absent in {} -- separate dwconv+silu path (build final_dwconv_silu_{DW_C}x{DW_T})", self.ln_dir.display());
+                }
                 None
             }
         };
@@ -3984,5 +4059,71 @@ mod resolve_verified_tests {
             assert_eq!(got.xclbin, want.xclbin, "stem={stem}");
             assert_eq!(got.insts, want.insts, "stem={stem}");
         }
+    }
+}
+
+#[cfg(test)]
+mod relpos_verify_tests {
+    use super::*;
+
+    // Real on-disk insts.bin, frozen as committed fixtures (artifacts/ itself is gitignored and
+    // regenerable, so a live artifacts/relpos/... path would make this test environment-dependent).
+    // MEASURED 2026-09-08 (task next: field): `artifacts/relpos/bucket_152` is built for T=152;
+    // `artifacts/relpos.rows1ctl/bucket_152` is a dir NAMED bucket_152 but built for T=160 -- the
+    // trap this check exists to catch.
+    const CORRECT: &str =
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/relpos_insts/bucket_152_t152.insts");
+    const MISLABELLED: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/relpos_insts/bucket_152_mislabelled_t160.insts"
+    );
+
+    fn words_from_file(path: &str) -> Vec<u32> {
+        std::fs::read(path)
+            .unwrap_or_else(|e| panic!("read fixture {path}: {e}"))
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    }
+
+    #[test]
+    fn bucket_built_for_the_requested_t_verifies() {
+        let words = words_from_file(CORRECT);
+        let found = verify_relpos_built_t(&words, 152).expect("bucket_152/T=152 must verify");
+        assert_eq!(found, RELPOS_HEADS, "one t_active word per head at ROWS=1");
+    }
+
+    #[test]
+    fn bucket_built_for_a_different_t_is_rejected() {
+        let words = words_from_file(MISLABELLED);
+        let err = verify_relpos_built_t(&words, 152)
+            .expect_err("dir named bucket_152 but built for T=160 must fail loud");
+        assert!(err.contains("0 words"), "expected a zero-count report, got: {err}");
+    }
+}
+
+#[cfg(test)]
+mod conveyor_presence_tests {
+    use super::*;
+
+    #[test]
+    fn declines_when_artifact_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!conveyor_artifact_present(dir.path()));
+    }
+
+    #[test]
+    fn declines_when_only_one_file_present() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("final.xclbin"), b"stub").unwrap();
+        assert!(!conveyor_artifact_present(dir.path()));
+    }
+
+    #[test]
+    fn present_when_both_files_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("final.xclbin"), b"stub").unwrap();
+        std::fs::write(dir.path().join("insts.bin"), b"stub").unwrap();
+        assert!(conveyor_artifact_present(dir.path()));
     }
 }

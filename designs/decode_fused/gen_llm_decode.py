@@ -328,6 +328,17 @@ def sequence_name(sp, NL, S, placer_flags):
         parts.append("gv")
     if TMV_CTX and TMV_RPC != TMV_RPC_DEFAULT:
         parts.append(f"rpc{TMV_RPC}")
+    # Three more graph-changing switches that predate this function's audit and were missed by it:
+    # each has its own doc comment above proving it changes the per-layer runlist (configure count
+    # and/or dispatch structure), the same class of change TMV_CTX/GROUPED_K above are named for.
+    # Nested on their own gate, same shape as fuse_rope/scale_in_qnorm at their build site, so an
+    # already-off parent doesn't also emit its child's suffix.
+    if not FUSE_QKV_GEMV:
+        parts.append("noqkvgemv")
+    if FUSE_QKV_GEMV and not FUSE_ROPE_QK:
+        parts.append("noropeqk")
+    if sp.qk_norm and not SCALE_IN_QNORM:
+        parts.append("noscaleqn")
     if QUANT_MLP_DTYPE != "bf16":
         parts.append(f"{QUANT_MLP_DTYPE}g{QUANT_MLP_GROUP}")
     if QUANT_ATTN_DTYPE != "bf16":
@@ -343,6 +354,13 @@ def sequence_name(sp, NL, S, placer_flags):
         parts.append(f"mlpdp{MLP_DP_COLS}")
     if FUSE_MLP_O and sp.mlp_dp_reason() is None:
         parts.append("mlpo")
+    # Same convention, its sibling arm: FUSE_QKV_DP defaulted ON 2026-09-07 (27a9411) and was
+    # missing here entirely -- not just off-the-default-name, ABSENT, so a build before that
+    # commit and a build after it shared this function's name unchanged. sp.qkv_dp_reason(COLS)
+    # mirrors qkv_dp_why's own gate exactly (build_graph computes the same three-way check further
+    # down); COLS is the module constant, not a build_graph local, so it is reachable here.
+    if FUSE_QKV_DP and FUSE_QKV_GEMV and sp.qkv_dp_reason(COLS) is None:
+        parts.append("qkvdp")
     if WEIGHT_DEPTH != 2:
         parts.append(f"wd{WEIGHT_DEPTH}")
     if MLP_TILE_ROWS:
@@ -444,6 +462,34 @@ def repo_root():
     return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
+def generator_provenance():
+    """Best-effort build provenance for meta.json: the git commit of THIS FILE's tree at build
+    time, and whether designs/decode_fused was dirty against it.
+
+    toolchain_provenance() answers "which toolchain built this"; this answers "which generator
+    graph built this" -- a different axis. Two designs/decode_fused commits landed the same day
+    this artifact shipped (2026-09-07 23:40) that changed the GRAPH (b7b0498, 198 -> 170
+    configures), and nothing recorded which side of that change a given decode.elf was on --
+    telling them apart took a manual byte-size diff against a rebuild. Returns {} rather than
+    raising: provenance is a record, not a gate.
+    """
+    repo = repo_root()
+    try:
+        sha = subprocess.run(
+            ["git", "-C", repo, "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=10,
+        )
+        dirty = subprocess.run(
+            ["git", "-C", repo, "status", "--porcelain", "--", "designs/decode_fused"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except OSError:
+        return {}
+    if sha.returncode != 0 or not sha.stdout.strip():
+        return {}
+    return {"commit": sha.stdout.strip(), "dirty": bool(dirty.stdout.strip())}
+
+
 def toolchain_provenance():
     """Best-effort build provenance for meta.json: the toolchain.lock semantic hash this ELF was
     just compiled against, plus the instance dir the build used, if resolvable.
@@ -508,6 +554,28 @@ def report_artifact_freshness(weights_dir):
               f"engine would load from {art_dir}", file=sys.stderr)
     else:
         print(f"{tag} {meta_path}: OK (toolchain {cur})", file=sys.stderr)
+
+    # Same shape, the other provenance axis: which designs/decode_fused commit built this graph.
+    # Older artifacts (built before generator_provenance() existed) have no "generator" key --
+    # report that as unverified rather than silently skipping, since that is the exact hole this
+    # closes (see installed-decode-artifact-predates-head, filed after a manual byte-size diff
+    # was the only way to notice a graph-changing commit had landed after the shipped ELF).
+    gen = meta.get("generator", {}).get("commit")
+    if not gen:
+        print(f"{tag} {meta_path}: no generator provenance recorded (built before this check "
+              f"existed) -- staleness against designs/decode_fused HEAD is UNVERIFIED", file=sys.stderr)
+        return
+    curgen = generator_provenance().get("commit")
+    if not curgen:
+        print(f"{tag} {meta_path}: built from generator {gen[:12]}, but the current commit could "
+              f"not be resolved here -- staleness is UNVERIFIED", file=sys.stderr)
+    elif curgen != gen:
+        print(f"{tag} {meta_path} (arm {meta.get('sequence_name', '?')}): built from "
+              f"designs/decode_fused @ {gen[:12]}, current HEAD is {curgen[:12]} -- a commit in "
+              f"between may change the graph rather than a default; diff before trusting what the "
+              f"Rust engine would load from {art_dir}", file=sys.stderr)
+    else:
+        print(f"{tag} {meta_path}: OK (generator {curgen[:12]})", file=sys.stderr)
 
 
 def gemv(M, K, ctx, **kw):
@@ -1338,6 +1406,12 @@ def main():
 
     meta = {
         "spec": sp.name, "elf": "decode.elf", "kernel_name": "main:sequence",
+        # The resolved OperatorSequence name (sequence_name()'s return, plus IRON's own
+        # `_shared` suffix) -- the same string IRON keys the build cache by. Two arms can build
+        # identical dims/weight_quant and still be different graphs (TMV_CTX, FUSE_MLP_DP,
+        # WEIGHT_DEPTH, ... are not otherwise recorded here); this is the one field that
+        # disambiguates them without re-deriving the flag values from ELF size.
+        "sequence_name": fused.name,
         "input_size": int(in_sz), "output_size": int(out_sz), "scratch_size": int(scr),
         "layout": {n: {"type": v[0], "offset": int(v[1]), "len": int(v[2])} for n, v in lay.items()},
         "inputs": inputs, "weights": wnames, "output": "logits",
@@ -1377,6 +1451,16 @@ def main():
         print("[build] WARNING: could not record toolchain provenance in meta.json "
               "(no toolchain.lock / kernel_sandbox.sh resolvable) -- this artifact will read as "
               "unstamped to any freshness check", file=sys.stderr)
+    gprov = generator_provenance()
+    if gprov:
+        meta["generator"] = gprov
+        if gprov["dirty"]:
+            print(f"[build] WARNING: designs/decode_fused was DIRTY at {gprov['commit'][:12]} -- "
+                  "meta.json's generator commit will not reproduce this build", file=sys.stderr)
+    else:
+        print("[build] WARNING: could not record generator provenance in meta.json "
+              "(no git checkout resolvable) -- staleness against designs/decode_fused HEAD will "
+              "be invisible to any future check", file=sys.stderr)
     json.dump(meta, open(os.path.join(a.out, "meta.json"), "w"), indent=2)
     print(f"\nwrote {NL}-layer {sp.name} decode ELF ({len(elf)}B, scratch {scr/1e6:.1f}MB) to {a.out}")
 

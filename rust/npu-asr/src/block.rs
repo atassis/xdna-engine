@@ -127,7 +127,10 @@ impl FusedFFN {
             mm1,
             mm2,
             ctx_ln,
-            resident_on: std::env::var("NPU_ENC_FFN_RESIDENT").as_deref() == Ok("1"),
+            // Via the accessor, not a fourth spelling of the same read (contract E003: one name,
+            // one semantic, ONE accessor). This site agreed with `tuning.rs` by coincidence of both
+            // spelling `== Ok("1")`; agreement that nothing enforces is how the whisper site drifted.
+            resident_on: crate::tuning::ffn_resident_requested(),
         }
     }
 

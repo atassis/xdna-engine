@@ -933,7 +933,10 @@ pub struct FusedDecoder {
     /// env `NPU_DECODE_FUSED_REUSECTX`: P1.1 spike — persistent hw_context built once from the base
     /// ELF, per-token patched ELFs rebound onto it. **BLOCKED on this XRT**: `ext::kernel(ctx, module,
     /// name)` rejects an ELF-built hw_context ("not created using XCLBIN") — an ELF context binds only
-    /// its own module. The plumbing is kept (works for an xclbin-backed ctx); the flag panics if set.
+    /// its own module. The plumbing is kept (works for an xclbin-backed ctx). It does NOT panic: the
+    /// shim wraps the XRT call in GUARD_PTR, so the failure surfaces as an ordinary
+    /// EngineError::Device. The flag is inert anyway -- the shipped artifact has `scratchpad`, so
+    /// `resident` wins and this is never consulted unless NPU_DECODE_FUSED_PATCH is also set.
     /// See `log/2026-06/fused-decode-reusectx-wall.md`. The viable levers are runtime-offset kernel
     /// regen or async-prefetch of the position-only registration.
     reuse_ctx: Option<ElfCtx>,

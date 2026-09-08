@@ -24,6 +24,7 @@ from iron.common import AIEContext
 from iron.common import PythonGeneratedMLIRArtifact, DesignGenerator
 from iron.operators.mha.op import MHA
 import aie.utils as aie_utils
+from mha_static_design import MEMTILE_DMA_CHANNELS, join_distribute_width
 
 # whisper-small's shape; every Whisper size shares d=64 and s=1500 (max_source_positions) and
 # differs only in head count -- large-v3-turbo is 20 heads, not 12. Overridable per build.
@@ -92,6 +93,46 @@ class StaticMHA(MHA):
         )
 
 
+def _validate_pipelines(n):
+    """Reject a --pipelines the array cannot realise, naming the knob and the budget.
+
+    Both limits below are enforced by aiecc anyway, but only after generation and against a TILE:
+    `--pipelines 6` reports "tile (6, 1) requires 6 input/1 output DMA channels" and `--pipelines 10`
+    reports "column index (8) must be less than the number of columns in the device (8)". Neither
+    names --pipelines, and a caller reading either has to reconstruct which knob produced the tile.
+
+    The rule: a tiling must FIT, not merely divide, and the place to check that is where the value
+    is chosen.
+    """
+    dev = aie_utils.DefaultNPURuntime.device()
+    ok = [k for k in range(1, dev.cols + 1) if _pipelines_problem(k, dev) is None]
+    problem = _pipelines_problem(n, dev)
+    if problem is None:
+        return
+    raise SystemExit(f"--pipelines {n}: {problem}. Valid here: {', '.join(map(str, ok))}.")
+
+
+def _pipelines_problem(n, dev):
+    """Why n pipelines cannot be realised, or None. Three independent limits, measured 2026-09-08.
+
+    The valid set is not a range -- 6 fails between working 5 and 8 -- because the two-MemTile path
+    above 6 pipelines changes which limit binds.
+    """
+    if n < 1 or n > dev.cols:
+        return (f"the design places one AIE column per pipeline and this device has {dev.cols} "
+                f"({type(dev).__name__})")
+    if n > 6 and n % 2:
+        # Above 6 the split feeds two MemTiles of n//2 outputs each, so memQ holds 2*(n//2) entries
+        # while the worker loop runs to n. Odd n indexes past the end (IndexError in fused_mha).
+        return f"above 6 the design splits over two MemTiles and needs an even count, not {n}"
+    join = join_distribute_width(n)
+    if join + 1 > MEMTILE_DMA_CHANNELS:
+        return (f"the inQ split and memO join share one MemTile, needing {join + 1} DMA channels in "
+                f"each direction ({join}-way fan-out plus the shim side) against "
+                f"{MEMTILE_DMA_CHANNELS} per MemTile")
+    return None
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
@@ -103,6 +144,7 @@ def main():
     ap.add_argument("--seq", type=int, default=SEQ, help="encoder sequence length")
     a = ap.parse_args()
     heads, d, seq = a.heads, a.d, a.seq
+    _validate_pipelines(a.pipelines)
     os.makedirs(a.out, exist_ok=True)
 
     ctx = AIEContext()

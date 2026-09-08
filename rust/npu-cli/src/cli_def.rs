@@ -12,11 +12,19 @@ use clap_complete::Shell;
 use npu_engine::capability::Capability;
 
 #[derive(Parser)]
-#[command(name = "npu", about = "XDNA2 NPU engine multitool")]
+#[command(name = "npu", about = "XDNA2 NPU engine multitool",
+          subcommand_required = true, arg_required_else_help = true)]
 pub struct Cli {
     /// Config path (default: $NPU_CONFIG or ~/.config/npu/engine.toml)
     #[arg(long, global = true, value_hint = ValueHint::FilePath)]
     pub config: Option<PathBuf>,
+    /// Output format for commands that have a machine-readable form.
+    // No `short = 'o'`, though the design asked for `-o`: `transcribe-media` already spells its
+    // output FILE `-o`, and a global short collides with it -- clap panics there with "Short option
+    // names must be unique". Freeing `-o` means renaming that one, which is a user-visible break and
+    // a separate decision.
+    #[arg(long = "output", global = true, value_enum, default_value_t = OutputFormat::Table)]
+    pub output: OutputFormat,
     #[command(subcommand)]
     pub cmd: Cmd,
 }
@@ -68,11 +76,13 @@ pub enum Cmd {
         #[arg(long)] json: bool,
     },
     /// One-shot embedding of a text string.
+    ///
     /// `allow_hyphen_values`: the text to embed is prose, and prose begins with `-` all the time
     /// (every Markdown bullet). Without it clap read a bullet as an unknown flag and failed with a
     /// usage error, so the CLI rejected inputs the HTTP route accepted.
     Embed { #[arg(allow_hyphen_values = true)] text: String, #[arg(long)] model: Option<String> },
     /// One-shot text generation, streamed to stdout by default.
+    ///
     /// The prompt goes through the model's chat template, so an instruction-tuned model answers it
     /// and stops. `--raw` sends the bytes verbatim instead, which is `/v1/completions` semantics:
     /// pure continuation, and on a chat-tuned model that means it rambles until max_tokens because
@@ -88,7 +98,13 @@ pub enum Cmd {
     },
     /// Interactive chat REPL: reads a line from stdin, streams the reply, keeps history across
     /// turns. Ctrl-D exits.
+    ///
+    /// An opening turn on the command line is answered before the first prompt, so `npu chat "hi"`
+    /// starts talking instead of waiting, and the session continues from there -- which is the part
+    /// `npu generate "hi"` does not do. A turn may begin with `-`; it is not read as a flag.
     Chat {
+        /// Opening turn, answered immediately. Omit it to start at an empty prompt.
+        #[arg(allow_hyphen_values = true)] prompt: Option<String>,
         #[arg(long)] model: Option<String>,
         #[command(flatten)] sampling: SamplingArgs,
         #[arg(long)] no_stream: bool,
@@ -137,6 +153,7 @@ pub enum Cmd {
     // Folded in from the separate `npu-weights` binary: `npu` is documented as the single
     // entrypoint, `npu bake` already overlapped `npu-weights bake`, and a second binary was a
     // second completion surface with none of this one's coverage guarantees.
+    #[command(subcommand_required = true, arg_required_else_help = true)]
     Weights {
         #[command(subcommand)]
         action: WeightsCmd,
@@ -147,18 +164,50 @@ pub enum Cmd {
     /// drift from them the way a hand-written script would.
     Completions { shell: Shell },
     /// Inspect / edit the desired-state config.
+    #[command(subcommand_required = true, arg_required_else_help = true)]
     Config { #[command(subcommand)] action: ConfigCmd },
+    /// Read-only self-test: device/driver versions, power mode, who holds the device, which
+    /// config is in effect and why, whether configured models' artifacts resolve, service status.
+    ///
+    /// Answers "is my install actually working, and what state is the device in" without touching
+    /// the device -- no `Device::open`, no dispatch, no hardware context taken. Shells out to
+    /// `xrt-smi examine` (unprivileged, read-only) and reads files only.
+    Doctor {
+        /// Machine-readable output.
+        #[arg(long)] json: bool,
+    },
+    /// List every `NPU_*`/related env var the engine reads, with its LIVE value and source.
+    ///
+    /// A third configuration plane alongside `engine.toml` and these CLI flags: vars read directly
+    /// by `env::var`/`var_os` across the shipped crates, none of them visible in `engine.toml` or
+    /// `--help`. This is that registry (`npu_runtime::env_flags::FLAGS`) rendered against the
+    /// current process environment -- report-only, changes nothing.
+    Flags {
+        /// Machine-readable output.
+        #[arg(long)] json: bool,
+    },
 }
 
-/// Sampling flags shared by `generate` and `chat`. `None` means "use the engine default"
-/// (`GenerateParams::default()`, OpenAI's defaults) rather than a CLI-chosen one -- so a bare
-/// `npu generate "..."` behaves identically to an HTTP request with no sampling fields at all.
+/// Sampling flags shared by `generate` and `chat`. `None` means "the caller did not ask", which is
+/// what lets the lower tiers (the scenario's `[generation]` block, then the checkpoint's own
+/// `generation_config.json`) supply a value -- so a bare `npu generate "..."` behaves identically to
+/// an HTTP request with no sampling fields at all. The two surfaces accept the same set on purpose;
+/// a flag here without a JSON field there (or the reverse) is a parity bug.
 #[derive(clap::Args)]
 pub struct SamplingArgs {
     #[arg(long)] pub temperature: Option<f32>,
     #[arg(long)] pub top_p: Option<f32>,
     #[arg(long)] pub top_k: Option<u32>,
     #[arg(long)] pub max_tokens: Option<u32>,
+    /// OpenAI's current spelling for `--max-tokens`. Setting both to different values is an error
+    /// rather than a silent pick, matching the HTTP surface.
+    #[arg(long)] pub max_completion_tokens: Option<u32>,
+    /// OpenAI range -2.0..2.0. Accepted over HTTP since the beginning; the CLI could not send it.
+    #[arg(long)] pub presence_penalty: Option<f32>,
+    /// OpenAI range -2.0..2.0.
+    #[arg(long)] pub frequency_penalty: Option<f32>,
+    /// Not an OpenAI field, but universal in local servers. 1.0 = no penalty.
+    #[arg(long)] pub repetition_penalty: Option<f32>,
     /// May be repeated: `--stop A --stop B`.
     #[arg(long)] pub stop: Vec<String>,
     #[arg(long)] pub seed: Option<u64>,
@@ -173,6 +222,11 @@ pub struct SamplingArgs {
 /// Transcript output formats.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 pub enum OutFormat { Md, Srt, Txt, Json }
+
+/// How a command RENDERS its response. Distinct from `OutFormat`, which is the document format
+/// `transcribe-media` writes to a file.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default, ValueEnum)]
+pub enum OutputFormat { #[default] Table, Json }
 
 impl OutFormat {
     pub fn as_str(self) -> &'static str {
@@ -189,28 +243,53 @@ pub enum WeightsCmd {
     Bake {
         /// `hf:<repo>[@rev]` or `path:/abs`.
         #[arg(long)] source: String,
-        /// npu-weights arch transform: bert|esm|vit|opt|whisper|fastconformer|gigaam|...
-        #[arg(long)] arch: String,
+        /// npu-weights arch transform.
+        // Values from ARCH_NAMES, so completion cannot offer an arch npu-weights does not
+        // implement, nor fall behind when `arch/` grows a module.
+        #[arg(long, value_parser = PossibleValuesParser::new(npu_weights::arch::ARCH_NAMES.to_vec()))]
+        arch: String,
         #[arg(long, value_hint = ValueHint::FilePath)] checkpoint: Option<PathBuf>,
         #[arg(long)] force: bool,
     },
     /// mmap-load a checkpoint and print tensor stats.
     Load {
         #[arg(long, value_hint = ValueHint::FilePath)] checkpoint: PathBuf,
-        #[arg(long)] arch: String,
+        /// npu-weights arch transform.
+        #[arg(long, value_parser = PossibleValuesParser::new(npu_weights::arch::ARCH_NAMES.to_vec()))]
+        arch: String,
     },
     /// Verify checkpoint tensors match a directory of reference .npy within tolerance.
     Verify {
         #[arg(long, value_hint = ValueHint::FilePath)] checkpoint: PathBuf,
-        #[arg(long)] arch: String,
+        /// npu-weights arch transform.
+        #[arg(long, value_parser = PossibleValuesParser::new(npu_weights::arch::ARCH_NAMES.to_vec()))]
+        arch: String,
         #[arg(long, value_hint = ValueHint::DirPath)] refs: PathBuf,
     },
 }
 
 #[derive(Subcommand)]
 pub enum ConfigCmd {
+    /// Print the config's own view: `[server]`, defaults, and every `[[model]]` with its pin state.
+    ///
+    /// Reads the FILE, not the running server -- unlike `npu models`, nothing here is merged with
+    /// live state, so it works with the service down. This is also where a pin overcommit or a
+    /// pin the admission order will not honour gets surfaced, on purpose: before the write that
+    /// would trip it, not after.
     Show,
+    /// Add a model, or repoint an existing one's scenario.
+    ///
+    /// Updates the entry IN PLACE when `name` is already in the config: only `scenario` changes,
+    /// residency and every other key on that model stay as they were. The old writer instead
+    /// dropped the entry and pushed a fresh one, which silently unpinned a model the moment its
+    /// scenario path was corrected.
     AddModel { name: String, #[arg(value_hint = ValueHint::FilePath)] scenario: String },
+    /// Delete a model's `[[model]]` entry entirely.
+    ///
+    /// Unlike `unpin`, nothing of the model is left behind -- no scenario, no pin state, nothing
+    /// for `npu load`/`npu models` to resolve. Fails on a name the config does not have, the same
+    /// refusal `pin`/`unpin` make: there is nothing to act on, so silently doing nothing would only
+    /// hide the typo.
     RemoveModel { name: String },
     /// Pin a model resident: exempt from idle unload, never chosen as an eviction victim.
     ///

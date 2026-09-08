@@ -14,3 +14,10 @@ name = "qwen3-0.6b"
 decode = "artifacts/qwen3-0.6b/decode"
 weights = "artifacts/qwen3-0.6b/weights"
 tokenizer_dir = "artifacts/qwen3-0.6b/tokenizer"
+
+# Per-model completion budget, applied when a request omits `max_tokens`; an explicit request value
+# still wins, in both directions. 256 (the engine default, OpenAI's number) is the wrong default for
+# a reasoning model: Qwen3 opens a `<think>` block and at 256 the whole budget goes to reasoning with
+# no answer ever emitted -- see 8398acb, which fixed the template half of that same problem.
+[generation]
+max_tokens = 1024

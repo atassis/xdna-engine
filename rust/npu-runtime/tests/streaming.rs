@@ -19,7 +19,7 @@ impl TextGenerator for ScriptedGenerator {
     fn generate(&mut self, _prompt: &Prompt, params: &GenerateParams,
         sink: &mut dyn FnMut(Chunk<'_>) -> bool) -> Result<(), EngineError> {
         let mut usage = GenerateUsage::default();
-        let cap = (params.max_tokens as usize).min(self.tokens.len());
+        let cap = (params.max_tokens.unwrap_or(npu_engine::DEFAULT_MAX_TOKENS) as usize).min(self.tokens.len());
         for tok in self.tokens.iter().take(cap) {
             if !self.delay.is_zero() { std::thread::sleep(self.delay); }
             self.sent.fetch_add(1, Ordering::SeqCst);

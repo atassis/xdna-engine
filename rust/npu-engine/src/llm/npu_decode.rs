@@ -116,6 +116,19 @@ impl NpuDecodeStep {
                 .write_at(loc.arena, loc.off, &bytes)
                 .map_err(|e| EngineError::Load(format!("write weight buffer {name}: {e}")))?;
         }
+        // Zero every KV-cache buffer EXPLICITLY, rather than relying on its `buffers/<name>.bin`
+        // happening to be an all-zero blob (today all 56 are, but nothing enforces that). This is
+        // what makes cross-request reuse safe: stale entries past `n_past` are masked to -inf and
+        // contribute nothing ONLY while they are finite, and a cache that starts at zero can never
+        // hold anything else -- every value in it afterwards was written by the model. Load-time,
+        // so it costs one memset per load rather than one per request.
+        for name in &artifact.cache_buffers {
+            let loc = artifact.loc(name);
+            arena
+                .write_at(loc.arena, loc.off, &vec![0u8; loc.len])
+                .map_err(|e| EngineError::Load(format!("zero cache buffer {name}: {e}")))?;
+        }
+
         // One bulk sync covers every buffer written above (scratch is never re-synced per token --
         // only `sync_input()` is, mirroring `asr::whisper_decoder::FusedDecoder`'s resident path).
         arena.sync_to_device().map_err(|e| EngineError::Load(format!("sync weights to device: {e}")))?;
@@ -159,6 +172,32 @@ impl NpuDecodeStep {
     /// each new generation on a REUSED instance; a freshly-constructed instance is already zero (the
     /// artifact's own cache-buffer blobs are all-zero) and does not need this.
     pub fn reset(&mut self) -> Result<(), EngineError> {
+        // The cache buffers are ALREADY zero when the model loads: every one of them is listed in
+        // `meta.json`'s `weights` too, and its `buffers/<name>.bin` is an all-zero blob, so
+        // `new()`'s weight loop zeroes them and syncs once. This per-request pass exists only to
+        // stop request N+1 from seeing request N's history.
+        //
+        // Whether it is NEEDED is a question about the mask, not about the cache: `sm_mask` is
+        // written as `n_past + 1` and the attention masks every position at or beyond it to -inf,
+        // so stale entries past the current position should contribute nothing. If that holds, this
+        // is 224 MiB of host memset plus an arena write per request at S=2048 (56 at S=512) that
+        // buys nothing -- and it is a per-REQUEST cost, so it hurts short generations most.
+        //
+        // DEFAULT ON since 2026-09-08. The safety condition -- that a masked-out entry is finite,
+        // because a stale inf or NaN would survive `0 * v` -- is now guaranteed by CONSTRUCTION
+        // rather than by argument: `new()` zeroes these buffers explicitly at load, so everything
+        // they ever hold afterwards was written by the model itself.
+        //
+        // Deliberately NOT time-based. Nothing about a KV cache decays with age; what makes a
+        // retained entry wrong is a different token at that position, and the mask already handles
+        // every position past `n_past`. An idle timer would add a knob that expires correct state
+        // on a clock. The resource side is already covered one level up, at the right granularity:
+        // `idle_unload_s` drops the whole model and frees its 2 GB arena, cache included.
+        //
+        // NPU_LLM_REUSE_KV=0 restores the per-request pass, for bisecting a suspected KV bug.
+        if std::env::var("NPU_LLM_REUSE_KV").ok().as_deref() != Some("0") {
+            return Ok(());
+        }
         for name in &self.artifact.cache_buffers {
             let loc = self.artifact.loc(name);
             self.arena
@@ -170,6 +209,12 @@ impl NpuDecodeStep {
 }
 
 impl DecodeStep for NpuDecodeStep {
+    /// The artifact's own `dims.S`. This is what makes the generator's bound real: without it the
+    /// trait default is `None` and the decode loop walks `pos` past the end of the KV cache.
+    fn max_context(&self) -> Option<usize> {
+        Some(self.artifact.max_seq)
+    }
+
     /// Zero every KV cache buffer. The inherent `reset` already did this; wiring it through the
     /// trait is what makes it actually run, since the generator only ever sees `dyn DecodeStep`.
     fn reset(&mut self) -> Result<(), EngineError> {

@@ -265,8 +265,9 @@ fn render_buffered(model: String, rx: std::sync::mpsc::Receiver<StreamItem>, kin
         match rx.recv() {
             Ok(StreamItem::Text(t)) => text.push_str(&t),
             Ok(StreamItem::Done { reason, usage }) => break (reason, usage),
-            Ok(StreamItem::Error(e)) =>
-                return (500, format!("{{\"error\":\"{}\"}}", parse::json_escape(&e)).into()),
+            // Classified, not blanket-500: a prompt that does not fit the context window is the
+            // caller's to fix, and `engine_err` already knows that `Unsupported` is a 400.
+            Ok(StreamItem::Error(e)) => return engine_err(&e),
             Err(_) =>
                 return (500, "{\"error\":\"generation ended without a result\"}".into()),
         }
@@ -608,7 +609,7 @@ fn respond_stream(stream: &mut TcpStream, code: u16, s: &SseStream) -> std::io::
         let frame = match item {
             StreamItem::Text(t) => s.render_text(&t),
             StreamItem::Done { reason, .. } => s.render_done(reason),
-            StreamItem::Error(e) => s.render_error(&e),
+            StreamItem::Error(e) => s.render_error(&e.to_string()),
         };
         stream.write_all(format!("data: {frame}\n\n").as_bytes())?;
     }
@@ -809,14 +810,30 @@ pub mod parse {
     /// `temperature: 1.0`), never a silent substitution of greedy.
     fn parse_generate_params(v: &serde_json::Value) -> Result<npu_engine::GenerateParams, String> {
         let mut p = npu_engine::GenerateParams::default();
-        if let Some(x) = v.get("temperature") { p.temperature = as_f32(x, "temperature")?; }
-        if let Some(x) = v.get("top_p") { p.top_p = as_f32(x, "top_p")?; }
-        if let Some(x) = v.get("top_k") { p.top_k = as_u32(x, "top_k")?; }
-        if let Some(x) = v.get("max_tokens") { p.max_tokens = as_u32(x, "max_tokens")?; }
+        if let Some(x) = v.get("temperature") { p.temperature = Some(as_f32(x, "temperature")?); }
+        if let Some(x) = v.get("top_p") { p.top_p = Some(as_f32(x, "top_p")?); }
+        if let Some(x) = v.get("top_k") { p.top_k = Some(as_u32(x, "top_k")?); }
+        // `max_completion_tokens` is OpenAI's current spelling; `max_tokens` is the deprecated one
+        // every existing client still sends. Accept both, reject a body that sets them to different
+        // values rather than silently picking a winner.
+        let max_tokens = match (v.get("max_tokens"), v.get("max_completion_tokens")) {
+            (Some(a), Some(b)) => {
+                let (a, b) = (as_u32(a, "max_tokens")?, as_u32(b, "max_completion_tokens")?);
+                if a != b {
+                    return Err(format!(
+                        "\"max_tokens\" ({a}) and \"max_completion_tokens\" ({b}) disagree; send one"));
+                }
+                Some(a)
+            }
+            (Some(a), None) => Some(as_u32(a, "max_tokens")?),
+            (None, Some(b)) => Some(as_u32(b, "max_completion_tokens")?),
+            (None, None) => None,
+        };
+        p.max_tokens = max_tokens;
         if let Some(x) = v.get("seed") { p.seed = Some(as_u64(x, "seed")?); }
-        if let Some(x) = v.get("presence_penalty") { p.presence_penalty = as_f32(x, "presence_penalty")?; }
-        if let Some(x) = v.get("frequency_penalty") { p.frequency_penalty = as_f32(x, "frequency_penalty")?; }
-        if let Some(x) = v.get("repetition_penalty") { p.repetition_penalty = as_f32(x, "repetition_penalty")?; }
+        if let Some(x) = v.get("presence_penalty") { p.presence_penalty = Some(as_f32(x, "presence_penalty")?); }
+        if let Some(x) = v.get("frequency_penalty") { p.frequency_penalty = Some(as_f32(x, "frequency_penalty")?); }
+        if let Some(x) = v.get("repetition_penalty") { p.repetition_penalty = Some(as_f32(x, "repetition_penalty")?); }
         // `chat_template_kwargs` is the spelling vLLM and SGLang use, and the one reasoning models
         // are driven by in practice. Honour `enable_thinking`; 400 on any other key rather than
         // accept it silently -- an ignored template kwarg changes the PROMPT, which is the "answer
@@ -841,6 +858,8 @@ pub mod parse {
                 .collect::<Result<Vec<_>, _>>()?,
             Some(_) => return Err("\"stop\" must be a string or an array of strings".into()),
         };
+        // Shared with the CLI so the two surfaces cannot drift on what they accept.
+        p.validate()?;
         Ok(p)
     }
     fn as_f32(v: &serde_json::Value, field: &str) -> Result<f32, String> {
@@ -1493,7 +1512,7 @@ mod generate_tests {
             sink: &mut dyn FnMut(Chunk<'_>) -> bool) -> Result<(), EngineError> {
             *self.seen.lock().unwrap() = Some((prompt.clone(), params.clone()));
             let mut usage = GenerateUsage::default();
-            let cap = (params.max_tokens as usize).min(self.tokens.len());
+            let cap = (params.max_tokens.unwrap_or(npu_engine::DEFAULT_MAX_TOKENS) as usize).min(self.tokens.len());
             for tok in self.tokens.iter().take(cap) {
                 if !self.delay.is_zero() { std::thread::sleep(self.delay); }
                 self.sent.fetch_add(1, Ordering::SeqCst);
@@ -1586,14 +1605,14 @@ mod generate_tests {
         let (code, resp) = route(&post("/v1/chat/completions", body), &h, &p);
         assert_eq!(code, 200, "{resp}");
         let (_, params) = seen.lock().unwrap().clone().unwrap();
-        assert!(close(params.temperature, 0.3), "{}", params.temperature);
-        assert!(close(params.top_p, 0.5), "{}", params.top_p);
-        assert_eq!(params.top_k, 40);
-        assert_eq!(params.max_tokens, 7);
+        assert!(close(params.temperature.unwrap(), 0.3), "{:?}", params.temperature);
+        assert!(close(params.top_p.unwrap(), 0.5), "{:?}", params.top_p);
+        assert_eq!(params.top_k, Some(40));
+        assert_eq!(params.max_tokens, Some(7));
         assert_eq!(params.seed, Some(42));
-        assert!(close(params.presence_penalty, 0.1), "{}", params.presence_penalty);
-        assert!(close(params.frequency_penalty, 0.2), "{}", params.frequency_penalty);
-        assert!(close(params.repetition_penalty, 1.3), "{}", params.repetition_penalty);
+        assert!(close(params.presence_penalty.unwrap(), 0.1), "{:?}", params.presence_penalty);
+        assert!(close(params.frequency_penalty.unwrap(), 0.2), "{:?}", params.frequency_penalty);
+        assert!(close(params.repetition_penalty.unwrap(), 1.3), "{:?}", params.repetition_penalty);
         assert_eq!(params.stop, vec!["STOP".to_string()]);
         h.shutdown(); j.join().unwrap();
     }
@@ -1637,18 +1656,24 @@ mod generate_tests {
         }
     }
 
+    /// Absent fields must arrive UNSET, not pre-filled with the engine's numbers. Parsing is not
+    /// where defaults are chosen any more: the scenario's `[generation]` block and then the
+    /// checkpoint's `generation_config.json` sit below the request, and a parser that substituted
+    /// 1.0 here would silently outrank both.
     #[test]
-    fn openai_defaults_apply_when_fields_are_absent() {
+    fn absent_fields_stay_unset_so_the_lower_tiers_can_apply() {
         let (h, j, _d, p, _sent, seen) = gen_handle(ss(&["ok"]), Duration::ZERO);
         let (code, resp) = route(&post("/v1/chat/completions",
             r#"{"messages":[{"role":"user","content":"hi"}]}"#), &h, &p);
         assert_eq!(code, 200, "{resp}");
         let (_, params) = seen.lock().unwrap().clone().unwrap();
-        let d = GenerateParams::default();
-        assert!(close(params.temperature, d.temperature), "default temperature must be 1.0, not greedy");
-        assert!(close(params.top_p, d.top_p));
-        assert_eq!(params.top_k, 0);
-        assert_eq!(params.max_tokens, 256);
+        assert_eq!(params.temperature, None, "parsing must not choose a temperature");
+        assert_eq!(params.top_p, None);
+        assert_eq!(params.top_k, None);
+        assert_eq!(params.presence_penalty, None);
+        assert_eq!(params.frequency_penalty, None);
+        assert_eq!(params.repetition_penalty, None);
+        assert_eq!(params.max_tokens, None, "an absent max_tokens must stay unset, so the model default can apply");
         assert!(params.stop.is_empty());
         assert_eq!(params.seed, None);
         assert_eq!(params.enable_thinking, None, "absent kwarg must not become a substituted true");
@@ -1667,6 +1692,68 @@ mod generate_tests {
         let (code, body) = route(&post("/v1/chat/completions",
             r#"{"messages":[{"role":"user","content":"hi"}],"stop":5}"#), &h, &p);
         assert_eq!(code, 400, "{body}");
+        h.shutdown(); j.join().unwrap();
+    }
+
+    /// Fails immediately with a chosen `EngineError`, so the status classification of an error
+    /// raised INSIDE generation (after the response has been promised) is testable.
+    struct FailingModel(Option<EngineError>);
+    impl Servable for FailingModel {
+        fn capabilities(&self) -> Capability { Capability::GENERATE }
+        fn run(&mut self, _req: EngineReq) -> Result<EngineResp, EngineError> {
+            Err(EngineError::Unsupported("use generate_stream".into()))
+        }
+    }
+    impl StreamServable for FailingModel {
+        fn generate_stream(&mut self, _prompt: &Prompt, _params: &GenerateParams,
+            _sink: &mut dyn FnMut(Chunk<'_>) -> bool) -> Result<(), EngineError> {
+            Err(self.0.take().expect("FailingModel used twice"))
+        }
+    }
+
+    fn failing_handle(err: EngineError)
+        -> (Handle, std::thread::JoinHandle<()>, tempfile::TempDir, PathBuf) {
+        struct L(Mutex<Option<EngineError>>);
+        impl ModelLoader for L {
+            fn load(&self, _cfg: &ModelCfg) -> Result<Box<dyn StreamServable>, EngineError> {
+                Ok(Box::new(FailingModel(self.0.lock().unwrap().take())))
+            }
+            fn declared_capability(&self, _cfg: &ModelCfg) -> Option<Capability> {
+                Some(Capability::GENERATE)
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("engine.toml");
+        let cfg = Config {
+            server: ServerCfg { max_resident: 1, idle_unload_s: 0, ..Default::default() },
+            models: vec![ModelCfg { name: "llm".into(), scenario: "x".into(), resident: false }],
+            ..Default::default()
+        };
+        cfg.save(&p).unwrap();
+        let (h, j) = start(cfg, Box::new(L(Mutex::new(Some(err))))).unwrap();
+        (h, j, dir, p)
+    }
+
+    /// A prompt that does not fit the model's context window is the CALLER's mistake, and it is
+    /// raised inside `generate` -- past the point where the route has already returned Ok. Before
+    /// `StreamItem::Error` carried the `EngineError`, every such failure rendered as a blanket 500.
+    #[test]
+    fn a_client_fault_raised_inside_generation_is_a_400_not_a_500() {
+        let (h, j, _d, p) = failing_handle(EngineError::Unsupported(
+            "prompt is 2601 tokens but this model's context window is 2048".into()));
+        let (code, body) = route(&post("/v1/completions", r#"{"prompt":"hi"}"#), &h, &p);
+        assert_eq!(code, 400, "{body}");
+        assert!(body.text().contains("context window"), "{}", body.text());
+        h.shutdown(); j.join().unwrap();
+    }
+
+    /// The other half: an engine fault raised in the same place must still be a 500, so the
+    /// classification is doing work rather than blanket-downgrading everything to 400.
+    #[test]
+    fn an_engine_fault_raised_inside_generation_is_still_a_500() {
+        let (h, j, _d, p) = failing_handle(EngineError::Device("dispatch timed out".into()));
+        let (code, body) = route(&post("/v1/completions", r#"{"prompt":"hi"}"#), &h, &p);
+        assert_eq!(code, 500, "{body}");
         h.shutdown(); j.join().unwrap();
     }
 

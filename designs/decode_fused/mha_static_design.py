@@ -115,6 +115,25 @@ def main():
         print(f"MLIR module written to {output_file_path}")
 
 
+# MemTile (6,1) carries BOTH the inQ split and the memO join, so its DMA demand is
+# join_width + 1 channels in each direction: the split takes 1 in / join_width out, the join takes
+# join_width in / 1 out. An AIE2P MemTile has 6 of each, which is why join_width > 5 does not place.
+# The placer is still the authority -- it reports this as
+#   tile (6, 1) requires 6 input/1 output DMA channels, but only 5 input/0 output available
+# naming a tile rather than the knob. MEMTILE_DMA_CHANNELS lets gen_encoder_mha.py say it earlier
+# and name --pipelines instead.
+MEMTILE_DMA_CHANNELS = 6
+
+
+def join_distribute_width(number_of_pipelines: int) -> int:
+    """Fan-out of the inQ split and the memO join, both pinned onto one MemTile.
+
+    Above 6 pipelines the design uses two MemTiles (inQ/inQ2, memO/memO2), halving the fan-out each
+    one carries.
+    """
+    return number_of_pipelines // 2 if number_of_pipelines > 6 else number_of_pipelines
+
+
 def fused_mha(
     dev,
     heads: int,
@@ -142,10 +161,7 @@ def fused_mha(
     enable_tracing = trace_size > 0
     dtype_str = "bf16"
 
-    if number_of_pipelines > 6:
-        number_of_pipelines_join_distribute = number_of_pipelines // 2
-    else:
-        number_of_pipelines_join_distribute = number_of_pipelines
+    number_of_pipelines_join_distribute = join_distribute_width(number_of_pipelines)
 
     S_q_eff = S_q
     S_kv_eff = S_kv

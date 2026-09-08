@@ -1,0 +1,27 @@
+{
+    "schema_version": {
+        "schema": "JSON",
+        "creation_date": "Tue Sep  8 11:23:32 2026 GMT"
+    },
+    "devices": [
+        {
+            "interface_type": "pcie",
+            "device_id": "0000:c5:00.1",
+            "platforms": [
+                {
+                    "static_region": {
+                        "name": "NPU Gorgon Point 1",
+                        "total_columns": "8"
+                    },
+                    "status": {
+                        "power_mode": "Default"
+                    },
+                    "electrical": {
+                        "power_consumption_watts": "N\/A"
+                    }
+                }
+            ]
+        }
+    ]
+}
+

@@ -39,3 +39,13 @@ jobs:
         env:
           RUSTFLAGS: ""
         run: cargo test -p npu-asr-host -p npu-gemma -p npu-weights
+
+  # ARCHITECTURE.md and scripts/README.md both state counts of the things they index. Nothing ran
+  # scripts/check_selfdescribing_indexes.py, so `delete npu-vod-chain-skeleton` (313ea34) left a
+  # crate row and a member count describing a crate that no longer existed. Pure Python, no XRT.
+  self-describing-indexes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: counts match what they describe
+        run: python3 scripts/check_selfdescribing_indexes.py

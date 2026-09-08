@@ -84,6 +84,15 @@ pub struct LlmArtifact {
     pub d_model: usize,
     pub vocab: usize,
     pub n_layers: usize,
+    /// `meta.json`'s `dims.S` -- how many token positions the on-device KV cache holds. `kc`/`vc`
+    /// are `[Hkv, S, HD]`, so this is an exact capacity, not a hint, and it is a BUILD parameter:
+    /// the head stride depends on it, so changing the window means a different artifact.
+    ///
+    /// Required, like its sibling dims, deliberately. It was recorded here and read by nobody,
+    /// which left `pos` unbounded all the way to the dispatch -- and the overrun is silent, since
+    /// position S lands on head 1's row 0 rather than outside the arena. An artifact that cannot
+    /// say how big its window is cannot have that window enforced, so it fails to load instead.
+    pub max_seq: usize,
     pub embed_scale: EmbedScale,
     pub rope_theta_global: f64,
     /// The LOCAL RoPE base, for models with interleaved local/global attention (Gemma-3). `None` on
@@ -189,6 +198,7 @@ impl LlmArtifact {
         let d_model = dim("d_model")?;
         let vocab = dim("vocab")?;
         let n_layers = dim("layers")?;
+        let max_seq = dim("S")?;
 
         let hp = meta.get("host_protocol").ok_or_else(|| ctx("missing top-level `host_protocol`".to_string()))?;
         let embed_scale = match hp.get("embed_scale").and_then(|v| v.as_str()) {
@@ -373,6 +383,7 @@ impl LlmArtifact {
             d_model,
             vocab,
             n_layers,
+            max_seq,
             embed_scale,
             rope_theta_global,
             rope_theta_local,
@@ -493,7 +504,7 @@ mod tests {
                 "params": {"kv_off": {"byte_offset": 0, "kind": "addr"}, "sm_mask": {"byte_offset": 4, "kind": "core"}},
                 "kv_param": "kv_off", "mask_param": "sm_mask",
             },
-            "dims": {"layers": 1, "d_model": x_len / 2, "vocab": 4, "head_dim": head_dim},
+            "dims": {"layers": 1, "d_model": x_len / 2, "vocab": 4, "head_dim": head_dim, "S": 8},
             "host_protocol": {"embed_scale": "none", "rope_theta_global": 1_000_000.0},
         })
     }
@@ -584,6 +595,28 @@ mod tests {
         write_meta(dir.path(), &meta);
         let err = LlmArtifact::load(dir.path()).unwrap_err().to_string();
         assert!(err.contains("embed_scale"), "{err}");
+    }
+
+    #[test]
+    fn an_artifact_that_does_not_declare_its_window_fails_to_load() {
+        // The migration cost of making `dims.S` required, asserted rather than left implicit. An
+        // artifact built before the window was recorded loads into an engine that cannot bound
+        // `pos`, and the overrun is silent -- so refusing it is the safer failure of the two.
+        let dir = tempfile::tempdir().unwrap();
+        let mut meta = base_meta(8, 4, serde_json::json!({"rope_global": {"type": "input", "offset": 8, "len": 8}}));
+        meta["dims"].as_object_mut().unwrap().remove("S");
+        write_meta(dir.path(), &meta);
+        let err = LlmArtifact::load(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("dims.S"), "must name the missing field: {err}");
+    }
+
+    #[test]
+    fn the_declared_window_is_what_the_artifact_reports() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut meta = base_meta(8, 4, serde_json::json!({"rope_global": {"type": "input", "offset": 8, "len": 8}}));
+        meta["dims"]["S"] = serde_json::json!(512);
+        write_meta(dir.path(), &meta);
+        assert_eq!(LlmArtifact::load(dir.path()).unwrap().max_seq, 512);
     }
 
     // ------------------------------------------------------------------------------------
