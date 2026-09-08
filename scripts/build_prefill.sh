@@ -4,19 +4,20 @@
 #
 #   bash scripts/build_prefill.sh [LAYERS] [BATCH] [SEQ] [OUT_DIR]
 #
-# IRON defaults to wt-iron-prefill, NOT amd_paths.sh's wt-iron-integ: the shared scratch arena
-# needs OperatorSequence(scratch_order=...), which lives only on branch prefill/scratch-order.
-# Override with IRON=<dir>; the build fails loud if the parameter is absent.
+# IRON defaults to wt-iron-causal, NOT amd_paths.sh's wt-iron-integ: this build needs BOTH
+# OperatorSequence(scratch_order=...) for the shared arena and Softmax(vector_size_source="rows")
+# for the causal mask, and branch prefill/causal-softmax is where the two meet.
+# Override with IRON=<dir>; the build fails loud if either parameter is absent.
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WS="$(cd "$REPO/.." && pwd)"
 LAYERS="${1:-1}"; BATCH="${2:-256}"; SEQ="${3:-2048}"
 OUT="${4:-/mnt/data/xdna-scratch/prefill/full_l${LAYERS}_m${BATCH}_s${SEQ}}"
-CAUSAL="${CAUSAL:-none}"
+CAUSAL="${CAUSAL:-rows}"
 VENV_IRON="${VENV_IRON:-$REPO/.venv-iron}"
 [ -x "$VENV_IRON/bin/python" ] || VENV_IRON="$WS/xdna-engine/.venv-iron"
 . "$REPO/scripts/amd_paths.sh"
-IRON="${IRON:-$WS/wt-iron-prefill}"
+IRON="${IRON:-$WS/wt-iron-causal}"
 WEIGHTS="${WEIGHTS:-$WS/artifacts-qwen3-0.6b/weights}"
 DECODE_META="${DECODE_META:-$WS/xdna-engine/artifacts/qwen3-0.6b/decode/meta.json}"
 
@@ -27,7 +28,7 @@ iron_at="$(iron_require_api "gen_llm_prefill.py" \
   "iron/common/sequence.py:scratch_order" \
   "iron/operators/gemm/op.py:b_col_maj" \
   "iron/operators/rope/op.py:angle_rows" \
-  "iron/operators/softmax/op.py:vector_size_parameter" \
+  "iron/operators/softmax/op.py:vector_size_source" \
   "iron/operators/strided_copy/op.py:output_offset_parameter")" || exit 1
 echo "[build] IRON on $iron_at (API surface verified)"
 

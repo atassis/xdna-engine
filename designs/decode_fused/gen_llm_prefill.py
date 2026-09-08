@@ -17,28 +17,27 @@ M=256. This composes them into the real thing: for a chunk of M tokens at absolu
 Output is `x` after N layers. There is NO lm-head: prefill's product is the KV side effect, and
 the shipped M=1 decode step produces the logits for the last position.
 
-=== NOT CAUSAL. Read this before using the output for anything. ===
+=== Causality: the per-row width vector IS the mask ===
 
-The per-row-width softmax the design needs (`prefill/rowwise-softmax`, worktree wt-iron-mask) is
-EMPTY as of 2026-09-08 -- that branch is a bare fork of the integration stack with no commits. So
-this ships the non-causal path, exactly the way gen_self_attn_batched.py and
-gen_llm_prefill_attn.py scoped their own v1, and `causal` is a build parameter with the seam left
-open. Two modes exist:
+The scores buffer is `[Hq*M, S]` and softmax's `rows` axis is just "independent rows to
+normalise", so row `r = h*M + i` is token `i` of the chunk under head `h`. Row `i` may attend
+absolute positions `<= base + i`, which is a width of `base + i + 1` -- the same width under every
+head, since a head changes WHICH scores a row is over, never how many positions precede it. A
+scalar cannot say that; a per-row width vector says it exactly.
 
-  --causal none   (default) every row attends the whole compiled window S, mask included. The KV
-                  written by layer 0 is still correct -- K/V are appended before any softmax runs
-                  -- but layer 1's input is not, so the KV of layers >= 1 is NOT the KV the M=1
-                  path would leave. Use this to gate the DATAFLOW, never to seed a decode.
-  --causal block  keeps the scalar `sm_mask` width the M=1 softmax already takes, set to
-                  `base + M`. That kills the whole zeroed-cache tail (the dominant error: exp(0)=1
-                  over S-base-M empty positions) and leaves row i of the chunk over-including at
-                  most M-1-i positions inside the diagonal block. Strictly closer to correct,
-                  still not correct, and NOT device-validated here.
+So there is no separate mask buffer and no additive triangle. `Softmax(vector_size_source="rows")`
+(IRON branch prefill/causal-softmax) streams one int32 per row alongside the scores, `mask_bf16`
+writes -inf past it, and the diagonal block and the zeroed tail of the cache are killed by the
+same mechanism. `sm_widths` is a THIRD declared input buffer, `[Hq*M]` int32, written per chunk by
+the host; the ELF is still constant across chunks.
 
-The missing piece in both is the [M, M] additive triangle on the diagonal block. When the rowwise
-softmax lands, the seam is: build `op_mask = ElementwiseAdd(size=Hq*M*M, ...)`, a constant
-`causal_tri` buffer, and one runlist entry between op_sc and op_sm operating on the diagonal
-sub-block of `sc`. Nothing else in this file moves.
+  --causal rows   (default) true causality, as above.
+  --causal none   every row attends the whole compiled window S, zeroed cache tail included. Kept
+                  as the A/B control -- it costs nothing (`sm_kw` is empty and `sm_widths` is not
+                  declared), and it is the arm that isolates a dataflow bug from a mask bug. The
+                  KV written by layer 0 is correct in this arm too (K/V are appended before any
+                  softmax runs), but layer 1's input is not, so the KV of layers >= 1 is NOT the
+                  KV the M=1 path would leave. Gate the DATAFLOW with it, never seed a decode.
 
 === The head-axis seam, and what it costs ===
 
@@ -98,9 +97,10 @@ silent otherwise: decode folds `attn_scale` into `L{l}_n_qn` (SCALE_IN_QNORM, on
 prefill inherits the scale by reading the same buffer and must NOT apply it again. Verified
 against the artifact's own bytes, not assumed.
 
-Run inside the fork IRON env with IRON pointed at a checkout carrying `scratch_order`
-(wt-iron-prefill, branch prefill/scratch-order). AIE_DEVICE=npu2 keeps the build off the device
-lock -- see the comment in gen_llm_decode.py.
+Run inside the fork IRON env with IRON pointed at a checkout carrying BOTH `scratch_order` and
+`vector_size_source` (wt-iron-causal, branch prefill/causal-softmax -- prefill/scratch-order
+merged with prefill/rowwise-softmax). AIE_DEVICE=npu2 keeps the build off the device lock -- see
+the comment in gen_llm_decode.py.
 """
 import argparse
 import glob
@@ -136,6 +136,8 @@ TILE_M = TILE_K = TILE_N = 64
 # comfortably inside one MemTile with room for the forwarded pair, and every tensor this file
 # copies is a multiple of it.
 XFER_ELEMS = int(os.environ.get("PREFILL_XFER_ELEMS", "16384"))
+# The causal mask, as a buffer name. One int32 per softmax row, host-written per chunk.
+SM_WIDTHS = "sm_widths"
 
 
 def bf16(a):
@@ -156,6 +158,20 @@ def rope_table(base, rows, head_dim, theta):
     t[:, 0::2] = np.cos(ang)
     t[:, 1::2] = np.sin(ang)
     return bf16(t)
+
+
+def causal_widths(base, M, S, heads):
+    """The per-row unmasked widths for one chunk: `[heads*M]` int32, row `r = h*M + i`.
+
+    Row `i` of a chunk starting at absolute position `base` attends positions `<= base + i`, so
+    its width is `base + i + 1` -- the same under every head. Clamped to `[1, S]` because
+    `mask_bf16` loops `for (j = width; j < cols; j++)` over the raw i32 it is handed: a width past
+    `S` masks nothing, and a width of 0 leaves the row all -inf, whose softmax is NaN rather than
+    a small number. The clamp at S is reachable -- the last chunk of a full window has
+    `base + M - 1 == S - 1`, so its final width is exactly S.
+    """
+    w = np.clip(np.arange(M, dtype=np.int64) + base + 1, 1, S).astype(np.int32)
+    return np.tile(w, heads)
 
 
 def pick_transfer(total_elems, target=None):
@@ -297,9 +313,10 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
     op_sc = GEMM(M=M, K=HD, N=S, tile_n=tn_sc, b_col_maj=True, **gemm_kw)
     op_cx = GEMM(M=M, K=S, N=HD, tile_n=tn_cx, b_col_maj=False, **gemm_kw)
     # ONE softmax over every head's rows at once: its `rows` axis is just "independent rows to
-    # normalise", and every head's [M, S] block is a contiguous slice of the same buffer.
-    sm_kw = (dict(rtp_vector_size=S, vector_size_parameter="sm_mask")
-             if causal == "block" else {})
+    # normalise", and every head's [M, S] block is a contiguous slice of the same buffer. That is
+    # also what makes the causal mask a plain vector: row Hq*M is (head, token) flattened, and the
+    # width depends only on the token half.
+    sm_kw = dict(vector_size_source="rows") if causal == "rows" else {}
     op_sm = Softmax(rows=Hq * M, cols=S, num_aie_columns=cols, num_channels=1,
                     context=ctx, **sm_kw)
     if sp.act == "silu":
@@ -387,7 +404,10 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
             rl.append((op_sc, f"qh[{h * M * HD * 2}:{(h + 1) * M * HD * 2}]",
                        f"{p}kc[{kv * S * HD * 2}:{(kv + 1) * S * HD * 2}]",
                        f"sc[{h * M * S * 2}:{(h + 1) * M * S * 2}]"))
-        rl.append((op_sm, "sc", "sw"))
+        # The widths buffer is an INPUT of the softmax step, not a side channel: op.get_arg_spec()
+        # puts it between in and out, so it is the middle name here.
+        rl.append((op_sm, "sc", SM_WIDTHS, "sw") if causal == "rows"
+                  else (op_sm, "sc", "sw"))
         for h in range(Hq):
             kv = h // grp
             rl.append((op_cx, f"sw[{h * M * S * 2}:{(h + 1) * M * S * 2}]",
@@ -407,7 +427,10 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
         ]
         cache_names += [p + "kc", p + "vc"]
 
-    inputs = ["x", "rope"]
+    # `sm_widths` goes LAST so x and rope keep the input-arena offsets the non-causal arm gives
+    # them: add_buffers walks input_args in order, and the host's x/rope writes are the same in
+    # both arms.
+    inputs = ["x", "rope"] + ([SM_WIDTHS] if causal == "rows" else [])
     name = f"prefill_{sp.name.replace('-', '_').replace('.', '_')}_m{M}_s{S}_l{NL}_c{cols}"
     if causal != "none":
         name += f"_{causal}"
@@ -437,6 +460,7 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
 
     dims = dict(NL=NL, M=M, S=S, inputs=inputs, cache_names=cache_names,
                 tn_sc=tn_sc, tn_cx=tn_cx, cols=cols, causal=causal,
+                sm_widths=(SM_WIDTHS if causal == "rows" else None), sm_rows=Hq * M,
                 shared=[n for n in dec_order if not n.startswith("__decode_gap")],
                 reserved=dec_reserved, prefill_local=prefill_local,
                 rl=rl, runlist_len=len(rl), per_layer=len(rl) // NL)
@@ -511,11 +535,18 @@ def _rope_block(x, table, heads):
     return bf16(np.concatenate([x1 * cos - x2 * sin, x2 * cos + x1 * sin], axis=-1))
 
 
-def _softmax_rows(s, width):
+def _softmax_rows(s, widths):
+    """Row-wise softmax of `[rows, cols]`, with one unmasked width per row.
+
+    `widths` is None (attend everything) or a `[rows]` int vector: row `i` is softmaxed over
+    `s[i, :widths[i]]` and the tail is zero. That models `mask_bf16` writing -inf past the width
+    and `softmax_bf16` then exponentiating the whole row -- the MASK, not the device's bf16
+    rounding, and it assumes aie::exp2 returns exactly 0 at -inf.
+    """
     f = np.asarray(s, np.float32)
-    if width is not None and width < f.shape[-1]:
-        f = f.copy()
-        f[..., width:] = -np.inf
+    if widths is not None:
+        keep = np.arange(f.shape[-1])[None, :] < np.asarray(widths, np.int64)[:, None]
+        f = np.where(keep, f, -np.inf)
     e = np.exp(f - f.max(-1, keepdims=True))
     e = np.nan_to_num(e, nan=0.0)
     return bf16(e / e.sum(-1, keepdims=True))
@@ -529,7 +560,10 @@ def golden(sp, weights_dir, NL, M, S, base, causal, X, table):
     """
     D, FF, HD = sp.d_model, sp.ffn, sp.head_dim
     Hq, Hkv, grp = sp.n_q_heads, sp.n_kv_heads, sp.gqa_group
-    width = (base + M) if causal == "block" else None
+    # The device is handed `[Hq*M]`; a head's block is `[M, S]` and every head shares the same M
+    # widths, so slicing the first M off the flat vector is the same thing and keeps the two
+    # derivations from drifting.
+    widths = causal_widths(base, M, S, Hq)[:M] if causal == "rows" else None
 
     def npy(n):
         return np.load(os.path.join(weights_dir, f"{n}.npy")).astype(np.float32)
@@ -569,7 +603,7 @@ def golden(sp, weights_dir, NL, M, S, base, causal, X, table):
         for hh in range(Hq):
             kv = hh // grp
             s = _mm(np.asarray(q, np.float32)[:, hh], bf16(kc[kv]))
-            p = _softmax_rows(s, width)
+            p = _softmax_rows(s, widths)
             cx[hh] = np.asarray(bf16(np.asarray(p, np.float32) @ vc[kv]), np.float32)
         cxt = cx.transpose(1, 0, 2).reshape(M, Hq * HD)
         a = _mm(cxt, Wo)
@@ -603,8 +637,9 @@ def main():
     ap.add_argument("--base", type=int, default=0,
                     help="absolute position of the chunk's first token; the ELF is constant "
                          "across chunks, so this only shapes the emitted inputs and golden")
-    ap.add_argument("--causal", default="none", choices=("none", "block"),
-                    help="see the module docstring: NEITHER is true causality")
+    ap.add_argument("--causal", default="rows", choices=("rows", "none"),
+                    help="`rows` (default) is true causality via per-row softmax widths; `none` "
+                         "is the non-causal A/B control -- see the module docstring")
     ap.add_argument("--decode-meta", default=None,
                     help="decode artifact meta.json to pin the shared scratch arena against; "
                          "omit (or --no-arena-share) to build a standalone arena")
@@ -655,6 +690,14 @@ def main():
     bdir = os.path.join(a.out, "buffers")
     open(os.path.join(bdir, "x.bin"), "wb").write(X.tobytes())
     open(os.path.join(bdir, "rope.bin"), "wb").write(table.tobytes())
+    if dims["sm_widths"]:
+        widths = causal_widths(a.base, M, S, Hq)
+        want = fused.get_layout_for_buffer(SM_WIDTHS)[2]
+        if widths.nbytes != want:
+            raise SystemExit(f"ERROR: {SM_WIDTHS} is {widths.nbytes}B here and {want}B in the "
+                             f"layout -- AIERuntimeArgSpec.dtype defaults to bfloat16, so this is "
+                             f"what an unset dtype looks like")
+        open(os.path.join(bdir, f"{SM_WIDTHS}.bin"), "wb").write(widths.tobytes())
 
     golden_files = {}
     if not a.no_golden:
@@ -710,12 +753,28 @@ def main():
         "cache_buffers": dims["cache_names"],
         "arena_shared": bool(dec_meta_path),
         "decode_artifact": dec_ref,
-        "causal": False,
+        "causal": dims["causal"] == "rows",
         "causal_mode": dims["causal"],
+        # Everything the host needs to fill the mask. dtype is stated because it is the one field
+        # that is silently wrong when omitted: AIERuntimeArgSpec defaults to bfloat16 and the
+        # buffer layout is sized off it, so an unset dtype under-allocates this by 2x.
+        "mask_widths": None if dims["causal"] != "rows" else {
+            "buffer": SM_WIDTHS,
+            "dtype": "int32",
+            "rows": dims["sm_rows"],
+            "len": dims["sm_rows"] * 4,
+            "row_index": "r = h * M + i, h in [0, q_heads), i in [0, M)",
+            "rule": "widths[h*M + i] = clamp(base + i + 1, 1, S)",
+            "note": "one width per softmax row; row r attends scores[r, :widths[r]] and "
+                    "mask_bf16 writes -inf over the rest. This IS the causal mask -- there is no "
+                    "triangle buffer and no scalar width.",
+        },
         "scratchpad": {
             "params": scratchpad_params,
             "kv_param": "kv_off",
-            "mask_param": "sm_mask" if dims["causal"] == "block" else None,
+            # No scalar causal width in either arm: `rows` streams a per-row vector instead, and
+            # `none` masks nothing at all.
+            "mask_param": None,
             "head_dim": HD, "kv_heads": Hkv,
         },
         "dims": {"layers": NL, "M": M, "S": S, "d_model": D, "ffn": FF,
@@ -731,8 +790,9 @@ def main():
                     f"INTERLEAVED [cos, sin, cos, sin, ...], theta="
                     f"{sp.rope_theta_global}",
             "kv_off": "base * head_dim, element units, addr kind, written raw",
-            "sm_mask": ("base + M (core kind; the host writes it <<2, as the decode step does)"
-                        if dims["causal"] == "block" else None),
+            SM_WIDTHS: (f"[{dims['sm_rows']}] int32 = q_heads({Hq}) * M({M}), row r = h*M + i "
+                        f"holding clamp(base + i + 1, 1, {S}); a plain input-arena write, not a "
+                        f"scratchpad parameter" if dims["causal"] == "rows" else None),
             "xout": f"[{M}, {D}] bf16 hidden states after {NL} layers; prefill emits NO logits",
             "attn_scale_folded_into": "L*_n_qn (decode's SCALE_IN_QNORM); do NOT apply it again",
             "chunking": f"pad the final chunk to M={M}; pad tokens sit at the END so their KV "
@@ -748,14 +808,19 @@ def main():
         "bytes": byte_classes,
         "macs": int(NL * (M * D * (QD + 2 * sp.kv_dim) + M * QD * D + 3 * M * D * FF
                           + 2 * Hq * M * S * HD)),
-        "limitations": [
+        "limitations": ([] if dims["causal"] == "rows" else [
             "NOT causal: --causal none attends the whole compiled window including the zeroed "
-            "tail of the cache; --causal block truncates at base+M but still lets a row see the "
-            "rest of its own chunk. The KV of layer 0 is correct in both; the KV of layers >= 1 "
-            "is not, because it is computed from a non-causal layer-0 output.",
-            "The per-row-width softmax (IRON branch prefill/rowwise-softmax) is unwritten as of "
-            "2026-09-08; that worktree carries no commits over the integration stack.",
+            "tail of the cache. The KV of layer 0 is still correct (K/V are appended before any "
+            "softmax runs); the KV of layers >= 1 is not, because it is computed from a "
+            "non-causal layer-0 output. This arm is the A/B control, not a seed for a decode.",
+        ]) + [
             "The two head-axis rearranges cost 4.0 MB/layer at M=256 of zero-compute DMA.",
+            f"The widths cost a THIRD shim DMA channel per softmax core ({dims['cols']} here; "
+            "read off the generated MLIR: one BD per core, sm_rows/cores int32 each, not one "
+            "transfer per row). Measured in op.py at 8 cores OK / 16 failing for DMA capacity, so "
+            "this shape has no headroom left in that dimension -- a wider softmax needs the "
+            "broadcast-one-buffer form that file names. On-core it is one objectFIFO "
+            "acquire/release per row; unmeasured.",
         ],
     }
     from gen_llm_decode import toolchain_provenance

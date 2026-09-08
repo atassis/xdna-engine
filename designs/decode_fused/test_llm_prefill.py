@@ -90,6 +90,58 @@ def test_transfer_size_divides_and_fits():
         assert total % t == 0 and t <= iron_gen.XFER_ELEMS
 
 
+# ---------------------------------------------------------------------------------------------
+# The causal mask. It is a per-row width vector, so the whole contract is (a) which width each row
+# gets and (b) that the softmax honours it -- there is no triangle buffer to check.
+# ---------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("base", [0, 256, 512])
+def test_widths_are_the_causal_rule_repeated_per_head(base):
+    M, S, heads = 8, 2048, 3
+    w = iron_gen.causal_widths(base, M, S, heads)
+    assert w.dtype == np.int32 and w.shape == (heads * M,)
+    for h in range(heads):
+        assert list(w[h * M:(h + 1) * M]) == [base + i + 1 for i in range(M)], \
+            "row h*M+i must attend base+i+1 positions, the same count under every head"
+
+
+def test_widths_clamp_at_the_window_and_never_reach_zero():
+    """`mask_bf16` loops `for (j = width; j < cols; j++)` over the raw i32: a width past S masks
+    nothing and a width of 0 leaves the row all -inf, whose softmax is NaN."""
+    M, S = 8, 16
+    w = iron_gen.causal_widths(S - 4, M, S, 1)          # runs off the end of the window
+    assert list(w) == [13, 14, 15, 16, 16, 16, 16, 16]
+    assert w.min() >= 1 and w.max() <= S
+
+
+def test_the_first_row_of_the_first_chunk_attends_exactly_one_position():
+    """The sharpest consequence of causality, and the one a scalar width cannot produce."""
+    M, S = 4, 8
+    s = np.arange(M * S, dtype=np.float32).reshape(M, S)
+    p = np.asarray(iron_gen._softmax_rows(s, iron_gen.causal_widths(0, M, S, 1)), np.float32)
+    assert p[0, 0] == 1.0 and np.all(p[0, 1:] == 0.0)
+    for i in range(M):
+        assert np.count_nonzero(p[i]) == i + 1, f"row {i} must see exactly {i + 1} positions"
+        assert abs(p[i].sum() - 1.0) < 1e-2
+
+
+def test_no_widths_is_the_unmasked_softmax():
+    """The `--causal none` arm must stay the exact control it was."""
+    s = np.random.default_rng(7).standard_normal((4, 8)).astype(np.float32)
+    p = np.asarray(iron_gen._softmax_rows(s, None), np.float32)
+    assert np.all(p > 0) and np.allclose(p.sum(-1), 1.0, atol=1e-2)
+
+
+def test_a_full_width_vector_is_the_unmasked_softmax():
+    """A width of S on every row must reduce to the no-mask arm exactly, not approximately --
+    both round the same f32 expression to bf16, so any difference is a different computation."""
+    M, S = 4, 16
+    s = np.random.default_rng(9).standard_normal((M, S)).astype(np.float32)
+    full = iron_gen._softmax_rows(s, np.full(M, S, np.int32))
+    assert np.array_equal(np.asarray(full), np.asarray(iron_gen._softmax_rows(s, None)))
+
+
 def test_decode_arena_plan_fills_gaps(tmp_path):
     """A layout that names only the weights must come back as a packed order whose fillers cover
     the unnamed intermediates -- otherwise the shared weights slide."""

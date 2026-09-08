@@ -27,8 +27,10 @@
 //!   2. each declared RoPE table <- `M` angle rows for absolute positions `[start, start+M)`,
 //!      token-major (`rope` on a prefill artifact, `rope_global`/`rope_local` on a decode one --
 //!      resolved from `inputs`, never hardcoded)
-//!   3. scratchpad `kv_param`   = `start * head_dim`  (element-unit BD offset; `pos * head_dim` at M=1)
-//!   4. scratchpad `mask_param` = `start + M`         (causal width; `pos + 1` at M=1)
+//!   3. the causal widths buffer <- `[q_heads*M]` int32, row `h*M + i` = `start + i + 1` clamped
+//!      to the window. At M=1 that vector is one value per head, all equal to `pos + 1`, which is
+//!      what the decode ELF writes as its scalar `sm_mask` -- the same mask, one dimension down.
+//!   4. scratchpad `kv_param`   = `start * head_dim`  (element-unit BD offset; `pos * head_dim` at M=1)
 //!   5. one dispatch. Nothing is read back -- prefill's whole product is the KV it left in scratch.
 //!
 //! Step 5 does no `sync_from_device`, and that is not an omission. The KV writes are device-side and
@@ -42,7 +44,7 @@ use std::rc::Rc;
 use npu_xrt::{Device, ElfResident, FusedArena};
 
 use crate::api::EngineError;
-use crate::llm::artifact::{BufLoc, LlmArtifact};
+use crate::llm::artifact::{BufLoc, LlmArtifact, MaskWidths};
 use crate::llm::npu_decode::{pack_bf16_bytes, rope_row, EmbedTable};
 
 /// `NPU_LLM_PREFILL_BATCHED` -- the one accessor (E003 of the env-flag contract).
@@ -105,6 +107,29 @@ pub fn rope_block(start: usize, batch: usize, head_dim: usize, theta: f64) -> Ve
     out
 }
 
+/// The chunk's causal mask: `[heads*M]` little-endian int32, row `h*M + i` holding the number of
+/// positions token `i` may attend.
+///
+/// Row `i` of a chunk at absolute position `start` attends positions `<= start + i`, so its width
+/// is `start + i + 1` -- independent of the head, which changes only WHICH scores the row is over.
+/// Clamped into `[1, max_seq]`: `mask_bf16` loops `for (j = width; j < cols; j++)` over the raw
+/// i32, so a width past the window masks nothing and a width of 0 leaves the row all -inf, whose
+/// softmax is NaN rather than a small number. The upper clamp is reachable -- the last chunk of a
+/// full window ends at `start + M - 1 == S - 1`.
+///
+/// Pad rows carry a real width, not a sentinel. They are the chunk's LAST rows, so their widths
+/// are the largest ones and they attend the real tokens before them; nothing reads their output,
+/// and their KV lands past `n_past` where the decode mask already kills it.
+pub fn mask_widths_block(start: usize, batch: usize, heads: usize, max_seq: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(heads * batch * 4);
+    for _ in 0..heads {
+        for i in 0..batch {
+            out.extend_from_slice(&((start + i + 1).clamp(1, max_seq) as u32).to_le_bytes());
+        }
+    }
+    out
+}
+
 /// A resident device backend for one batched-prefill ELF, bound to a `FusedArena` it does not own.
 ///
 /// Constructed only through [`NpuDecodeStep::with_prefill`](crate::llm::NpuDecodeStep::with_prefill),
@@ -117,6 +142,10 @@ pub struct NpuPrefill {
     /// against the DECODE artifact -- the authority for a model constant, which a prefill artifact
     /// may leave undeclared and which `check_prefill_pairing` refuses to let it contradict.
     rope_writes: Vec<(BufLoc, f64)>,
+    /// Where the causal widths go and how many heads they repeat over, resolved once at open for
+    /// the same reason `rope_writes` is. `None` on a non-causal bring-up build, which declares no
+    /// widths buffer and masks nothing.
+    mask_write: Option<(BufLoc, MaskWidths)>,
 }
 
 impl NpuPrefill {
@@ -129,6 +158,8 @@ impl NpuPrefill {
         arena: &FusedArena,
     ) -> Result<Self, EngineError> {
         let rope_writes = artifact.rope_writes(decode)?;
+        let mask_write =
+            artifact.mask_widths.clone().map(|mw| (*artifact.loc(&mw.buffer), mw));
         let elf = std::fs::read(artifact.elf_path())
             .map_err(|e| EngineError::Load(format!("read {}: {e}", artifact.elf_path().display())))?;
         let res = dev.open_elf_resident(&elf, Some(&artifact.kernel_name)).map_err(|e| {
@@ -138,7 +169,7 @@ impl NpuPrefill {
             .bind_resident(&res)
             .map_err(|e| EngineError::Load(format!("bind prefill resident to the shared arena: {e}")))?;
         let batch = artifact.batch;
-        Ok(NpuPrefill { artifact, res, batch, rope_writes })
+        Ok(NpuPrefill { artifact, res, batch, rope_writes, mask_write })
     }
 
     pub fn batch(&self) -> usize {
@@ -191,6 +222,14 @@ impl NpuPrefill {
                     })?;
             }
 
+            if let Some((loc, mw)) = &self.mask_write {
+                let widths =
+                    mask_widths_block(chunk.start, self.batch, mw.heads, self.artifact.max_seq);
+                arena.write_at(loc.arena, loc.off, &widths).map_err(|e| {
+                    EngineError::Device(format!("write prefill {}: {e}", mw.buffer))
+                })?;
+            }
+
             // `kv_param` is "addr"-kind (element-unit BD offset, no shift); `mask_param` is
             // "core"-kind and the firmware's UPDATE_REG convention requires the host to pre-shift
             // by 2 bits. Both values are the decode ones with `M` substituted for 1, so a prefill
@@ -199,11 +238,11 @@ impl NpuPrefill {
             self.res
                 .write_scratchpad(self.artifact.kv_off.byte_offset, &kv.to_le_bytes())
                 .map_err(|e| EngineError::Device(format!("write prefill kv_off scratchpad: {e}")))?;
-            // Everything at or beyond `start + M` is masked. Within the chunk, row i must not see
-            // row j > i, and a SCALAR width cannot say that -- the diagonal `[M, M]` triangle the
-            // design adds is a constant buffer of the ELF's, not a host write. A prefill artifact
-            // with no scalar width at all (a non-causal bring-up build) declares no `mask_param`,
-            // and then there is nothing here to write.
+            // A SCALAR width cannot express causality within a chunk (row i must not see row
+            // j > i), which is why the causal arm streams the per-row vector above instead and
+            // declares no `mask_param`. This branch survives for the degenerate build that has a
+            // scalar and no vector -- a prefill ELF at M=1, driven byte-identically to decode.
+            // `artifact.rs` refuses an artifact carrying both.
             if let Some(mask) = self.artifact.sm_mask {
                 let sm_raw = (chunk.start + self.batch) as u32;
                 let sm = if mask.core { sm_raw << 2 } else { sm_raw };
@@ -329,6 +368,90 @@ mod tests {
         let c1 = rope_block(m, m, hd, THETA);
         assert_eq!(&c1[..hd * 2], &pack_bf16_bytes(&rope_row(m, hd, THETA))[..]);
         assert_ne!(&c0[..hd * 2], &c1[..hd * 2]);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // The causal mask. It is the whole correctness gap the batched path had, and it is data --
+    // one int32 per softmax row -- so it is checkable here without a device.
+    // ---------------------------------------------------------------------------------------
+
+    fn widths(start: usize, batch: usize, heads: usize, s: usize) -> Vec<u32> {
+        mask_widths_block(start, batch, heads, s)
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect()
+    }
+
+    #[test]
+    fn the_first_chunks_row_i_attends_exactly_i_plus_one_positions() {
+        let w = widths(0, 8, 1, 2048);
+        assert_eq!(w, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn a_later_chunk_carries_its_absolute_base() {
+        // The off-by-one that would look like a working mask: widths restarting at 1 per chunk
+        // would hide every token before position 512 from the whole chunk.
+        let w = widths(512, 4, 1, 2048);
+        assert_eq!(w, vec![513, 514, 515, 516]);
+    }
+
+    #[test]
+    fn the_widths_repeat_once_per_head_in_head_major_order() {
+        // Row r = h*M + i, which is the flattening the [q_heads*M, S] scores buffer already uses.
+        let (m, heads) = (4usize, 3usize);
+        let w = widths(16, m, heads, 2048);
+        assert_eq!(w.len(), heads * m);
+        for h in 0..heads {
+            assert_eq!(&w[h * m..(h + 1) * m], &[17, 18, 19, 20], "head {h}");
+        }
+    }
+
+    #[test]
+    fn the_block_is_four_bytes_per_softmax_row() {
+        // AIERuntimeArgSpec defaults to bfloat16 and IRON sizes the device buffer off that dtype,
+        // so a widths buffer allocated at 2 bytes/row takes half of this and the rest lands in
+        // whatever follows it in the input arena.
+        assert_eq!(mask_widths_block(0, 256, 16, 2048).len(), 16 * 256 * 4);
+    }
+
+    #[test]
+    fn widths_never_run_past_the_window_or_down_to_zero() {
+        // `mask_bf16` loops `for (j = width; j < cols; j++)` over the raw i32: past S it masks
+        // nothing, and at 0 the row is all -inf and its softmax is NaN, not a small number.
+        let (s, m) = (2048usize, 256usize);
+        let last = widths(s - m, m, 1, s);
+        assert_eq!(*last.last().unwrap(), s as u32, "the final row of a full window sees all of it");
+        for start in [0usize, 256, 1024, s - m, s] {
+            for w in widths(start, m, 2, s) {
+                assert!(w >= 1 && w <= s as u32, "start={start} width={w} outside [1, {s}]");
+            }
+        }
+    }
+
+    #[test]
+    fn every_chunk_of_a_plan_masks_the_positions_that_plan_covers() {
+        // The property the individual cases sample, tied to the chunk plan that produces the
+        // starts: across a whole prompt, chunk c's row i is width c*M + i + 1 and the widths are
+        // strictly increasing from 1 -- never restarting, never skipping a position.
+        let (s, m) = (2048usize, 64usize);
+        let mut want = 1u32;
+        for c in chunk_plan(512, m) {
+            for w in widths(c.start, m, 1, s) {
+                assert_eq!(w, want, "chunk at {}", c.start);
+                want += 1;
+            }
+        }
+        assert_eq!(want, 513, "8 chunks of 64 cover positions 1..=512");
+    }
+
+    #[test]
+    fn a_batch_of_one_masks_exactly_what_the_decode_step_masks() {
+        // The architecture's claim again, now for the mask: decode writes the scalar `pos + 1`,
+        // and the M=1 instance of this vector is that value, once per head.
+        for pos in [0usize, 1, 7, 2047] {
+            assert_eq!(widths(pos, 1, 4, 2048), vec![pos as u32 + 1; 4]);
+        }
     }
 
     #[test]

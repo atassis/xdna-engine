@@ -38,6 +38,25 @@ pub struct ScratchpadParam {
     pub core: bool,
 }
 
+/// The causal mask of a batched-prefill artifact, which is a per-row WIDTH VECTOR and not a
+/// triangle: the scores buffer is `[q_heads*M, S]`, so row `r = h*M + i` is token `i` under head
+/// `h`, and it may attend `base + i + 1` positions -- the same count under every head. Softmax
+/// masks each row past its own width (`vector_size_source="rows"`), which is why there is no
+/// separate mask buffer, no additive triangle, and no scalar width in this mode.
+///
+/// An ordinary input buffer, rewritten per chunk like `x` and the angle tables, NOT a scratchpad
+/// parameter.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MaskWidths {
+    /// The declared input buffer holding the widths -- read from `meta.json`, never a literal, for
+    /// the same reason the RoPE buffers are.
+    pub buffer: String,
+    /// `dims.q_heads`. The widths repeat once per head.
+    pub heads: usize,
+    /// `heads * M` int32 values; the buffer is four times this in bytes.
+    pub rows: usize,
+}
+
 /// How the host scales `embed[token]` before writing it to the device -- `host_protocol.embed_scale`
 /// in `meta.json`, a real per-model choice (Whisper embeds unscaled; some LLM families multiply by
 /// `sqrt(d_model)`) and therefore a branch on *what*, not *how*: an unrecognised value fails loud
@@ -95,10 +114,14 @@ pub struct LlmArtifact {
     /// `meta.json`'s `embed_blob`; see [`Self::embed_blob`]. `None` in pre-2026-09-08 artifacts.
     pub embed_blob: Option<String>,
     pub kv_off: ScratchpadParam,
-    /// The causal-width parameter. Required on a decode artifact. `None` on a prefill artifact
-    /// whose graph has no scalar causal width at all -- a non-causal bring-up build declares
-    /// `scratchpad.mask_param: null`, and there is then nothing for the host to write.
+    /// The scalar causal-width parameter. Required on a decode artifact. `None` on every prefill
+    /// artifact the current generator emits, in BOTH arms and for two different reasons: the
+    /// causal one masks with [`Self::mask_widths`] instead, and the non-causal control masks
+    /// nothing. Either way `scratchpad.mask_param` is `null` and there is nothing to write.
     pub sm_mask: Option<ScratchpadParam>,
+    /// The per-row causal widths, when `meta.json` says `causal: true`. Prefill only -- decode is
+    /// M=1, where one scalar width says everything there is to say. See [`MaskWidths`].
+    pub mask_widths: Option<MaskWidths>,
     /// The declared input buffers holding RoPE angle tables, and which base each wants. Derived
     /// from `inputs` rather than a literal `["rope_global", "rope_local"]`, which is what lets a
     /// single-table prefill artifact name its buffer `rope` without a second code path.
@@ -447,6 +470,73 @@ impl LlmArtifact {
             }
         }
 
+        // The causal mask. `causal: true` says this graph masks with a per-row width VECTOR --
+        // an ordinary input buffer, not a scratchpad scalar -- so everything the host needs to
+        // fill it is checked here rather than assumed at dispatch. It is read for the prefill role
+        // only: `causal` on a decode artifact would be describing its scalar `sm_mask`, a
+        // different mechanism, and reading it as this one would demand a widths buffer decode
+        // does not have.
+        let mask_widths = match (role, meta.get("causal").and_then(|v| v.as_bool())) {
+            (ArtifactRole::Prefill, Some(true)) => {
+                let mw = meta.get("mask_widths").filter(|v| !v.is_null()).ok_or_else(|| {
+                    ctx("`causal` is true but there is no `mask_widths` block naming the widths buffer".to_string())
+                })?;
+                let buffer = mw
+                    .get("buffer")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| ctx("mask_widths.buffer missing/non-string".to_string()))?
+                    .to_string();
+                // Stated, not assumed. IRON's AIERuntimeArgSpec defaults to bfloat16 and sizes the
+                // device buffer off its dtype, so a widths spec that forgot its dtype allocates
+                // half of what the host is about to write -- silently, into the next buffer.
+                match mw.get("dtype").and_then(|v| v.as_str()) {
+                    Some("int32") => {}
+                    other => {
+                        return Err(ctx(format!(
+                            "mask_widths.dtype = {other:?}, want \"int32\" -- a widths buffer of any \
+                             other width is not the one the host writes"
+                        )))
+                    }
+                }
+                let q_heads = dims
+                    .get("q_heads")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize)
+                    .ok_or_else(|| ctx("dims.q_heads missing/non-numeric, and the widths are one int32 per (head, token) row".to_string()))?;
+                if !inputs.iter().any(|n| n == &buffer) {
+                    return Err(ctx(format!(
+                        "mask_widths.buffer `{buffer}` is not a declared input, so nothing would \
+                         place it in the input arena"
+                    )));
+                }
+                let loc = layout
+                    .get(&buffer)
+                    .ok_or_else(|| ctx(format!("mask_widths.buffer `{buffer}` has no `layout` entry")))?;
+                let want = q_heads * batch * 4;
+                if loc.len != want {
+                    return Err(ctx(format!(
+                        "layout[{buffer}].len = {} but dims.q_heads({q_heads}) * dims.M({batch}) * 4 = {want}",
+                        loc.len
+                    )));
+                }
+                if let Some(declared) = mw.get("len").and_then(|v| v.as_u64()) {
+                    if declared as usize != want {
+                        return Err(ctx(format!("mask_widths.len = {declared}, but the layout says {want}")));
+                    }
+                }
+                // Two mask sources cannot both be right: the rows softmax takes no scalar, and a
+                // graph that carried both would be masking twice at two different widths.
+                if sm_mask.is_some() {
+                    return Err(ctx(format!(
+                        "artifact declares both the widths buffer `{buffer}` and a scalar \
+                         scratchpad width -- one graph, two disagreeing masks"
+                    )));
+                }
+                Some(MaskWidths { buffer, heads: q_heads, rows: q_heads * batch })
+            }
+            _ => None,
+        };
+
         // Toolchain freshness: fail loud on an ACTIVE mismatch (the pin moved, nobody rebuilt this
         // artifact -- a stale ELF answers with a plausible WRONG token, silently). Anything short of a
         // confirmed mismatch is reported, never fatal -- a shipped consumer must not require
@@ -486,6 +576,7 @@ impl LlmArtifact {
             embed_blob,
             kv_off,
             sm_mask,
+            mask_widths,
             rope_inputs,
             head_dim,
             d_model,
@@ -663,11 +754,15 @@ impl LlmArtifact {
         Ok(())
     }
 
-    /// The input buffers the host rewrites before every dispatch: `x` plus whatever RoPE tables
-    /// this artifact declares. Derived, never a literal -- the list is model-shaped (Gemma-3 has a
-    /// third) and role-shaped (the prefill generator names its single table `rope`).
+    /// The input buffers the host rewrites before every dispatch: `x`, whatever RoPE tables this
+    /// artifact declares, and the causal widths on a causal one. Derived, never a literal -- the
+    /// list is model-shaped (Gemma-3 has a third table) and role-shaped (the prefill generator
+    /// names its single table `rope`).
     pub fn per_dispatch_writes(&self) -> Vec<&str> {
-        std::iter::once("x").chain(self.rope_inputs.iter().map(|(n, _)| n.as_str())).collect()
+        std::iter::once("x")
+            .chain(self.rope_inputs.iter().map(|(n, _)| n.as_str()))
+            .chain(self.mask_widths.iter().map(|m| m.buffer.as_str()))
+            .collect()
     }
 
     /// Each declared RoPE buffer paired with the angle base to fill it from, resolved ONCE at load
@@ -1309,8 +1404,10 @@ mod tests {
     /// so that a generator change this loader cannot read shows up here rather than at model load.
     /// It differs from a decode meta in five ways, and each one is a deliberate allowance above:
     /// the RoPE input is `rope` (not `rope_global`), `dims` carries no `vocab`, `host_protocol`
-    /// carries prose rather than the two model constants, `mask_param` may be `null`, and the
-    /// weight blobs live in the decode artifact's `buffers/` (`weights_from`) rather than its own.
+    /// carries prose rather than the two model constants, `mask_param` is `null` (the causal arm
+    /// masks with the widths VECTOR of `causal_prefill_meta` below, and the control masks not at
+    /// all), and the weight blobs live in the decode artifact's `buffers/` (`weights_from`)
+    /// rather than its own.
     fn generator_shaped_prefill_meta(m: usize, mask_param: serde_json::Value) -> serde_json::Value {
         serde_json::json!({
             "spec": "qwen3-0.6b", "elf": "prefill.elf", "kernel_name": "main:sequence",
@@ -1344,6 +1441,116 @@ mod tests {
                 "sm_mask": "base + M (core kind; the host writes it <<2)",
             },
         })
+    }
+
+    /// The generator's shape with `--causal rows`: a third input buffer carrying one int32 per
+    /// softmax row, `causal: true`, and no scalar `mask_param` anywhere.
+    fn causal_prefill_meta(m: usize) -> serde_json::Value {
+        let mut pre = generator_shaped_prefill_meta(m, serde_json::Value::Null);
+        let q_heads = pre["dims"]["q_heads"].as_u64().unwrap() as usize;
+        let (off, len) = (m * (D_MODEL + HEAD_DIM) * 2, q_heads * m * 4);
+        pre["layout"]["sm_widths"] = serde_json::json!({"type": "input", "offset": off, "len": len});
+        pre["inputs"] = serde_json::json!(["x", "rope", "sm_widths"]);
+        pre["input_size"] = serde_json::json!(off + len);
+        pre["causal"] = serde_json::json!(true);
+        pre["causal_mode"] = serde_json::json!("rows");
+        pre["mask_widths"] = serde_json::json!({
+            "buffer": "sm_widths", "dtype": "int32", "rows": q_heads * m, "len": len,
+        });
+        pre
+    }
+
+    fn load_causal_prefill(meta: &serde_json::Value) -> Result<LlmArtifact, EngineError> {
+        let dir = tempfile::tempdir().unwrap();
+        write_meta(dir.path(), meta);
+        LlmArtifact::load_prefill(dir.path())
+    }
+
+    #[test]
+    fn a_causal_prefill_artifact_resolves_its_widths_buffer() {
+        let art = load_causal_prefill(&causal_prefill_meta(2)).expect("causal prefill artifact");
+        let mw = art.mask_widths.as_ref().expect("causal: true must resolve a widths buffer");
+        assert_eq!(mw.buffer, "sm_widths");
+        assert_eq!(mw.heads, 1);
+        assert_eq!(mw.rows, 2, "q_heads(1) * M(2)");
+        assert_eq!(art.loc("sm_widths").len, mw.rows * 4, "int32, not bf16");
+        assert!(art.sm_mask.is_none(), "the rows softmax takes no scalar width");
+        // The write list is what `check_per_token_writes` gates on, so a widths buffer left off it
+        // would load fine and then be dispatched as an all-zero mask -- every row all -inf.
+        assert_eq!(art.per_dispatch_writes(), vec!["x", "rope", "sm_widths"]);
+        art.check_per_token_writes(&art.per_dispatch_writes()).expect("every input is written");
+    }
+
+    #[test]
+    fn a_non_causal_prefill_artifact_has_no_widths_buffer() {
+        let art = load_causal_prefill(&generator_shaped_prefill_meta(2, serde_json::Value::Null))
+            .expect("the --causal none control still loads");
+        assert!(art.mask_widths.is_none());
+        assert_eq!(art.per_dispatch_writes(), vec!["x", "rope"]);
+    }
+
+    #[test]
+    fn causal_without_a_mask_widths_block_fails_loud() {
+        let mut meta = causal_prefill_meta(2);
+        meta["mask_widths"] = serde_json::Value::Null;
+        let e = load_causal_prefill(&meta).expect_err("causal with nothing to write is not drivable");
+        assert!(format!("{e}").contains("no `mask_widths` block"), "{e}");
+    }
+
+    #[test]
+    fn a_widths_buffer_that_is_not_int32_fails_loud() {
+        // The exact defect the dtype field exists to catch: AIERuntimeArgSpec defaults to bfloat16
+        // and sizes the buffer off it, so a generator that forgot the dtype allocates HALF what the
+        // host writes and the tail lands in the next buffer.
+        let mut meta = causal_prefill_meta(2);
+        meta["mask_widths"]["dtype"] = serde_json::json!("bfloat16");
+        let e = load_causal_prefill(&meta).expect_err("only int32 widths are the ones we write");
+        assert!(format!("{e}").contains("want \"int32\""), "{e}");
+    }
+
+    #[test]
+    fn a_widths_buffer_sized_for_the_wrong_shape_fails_loud() {
+        let mut meta = causal_prefill_meta(2);
+        meta["layout"]["sm_widths"]["len"] = serde_json::json!(4); // one row, not q_heads*M
+        let e = load_causal_prefill(&meta).expect_err("a short widths buffer is a truncated mask");
+        assert!(format!("{e}").contains("dims.q_heads(1) * dims.M(2) * 4 = 8"), "{e}");
+    }
+
+    #[test]
+    fn a_widths_buffer_the_artifact_does_not_declare_as_an_input_fails_loud() {
+        let mut meta = causal_prefill_meta(2);
+        meta["inputs"] = serde_json::json!(["x", "rope"]);
+        let e = load_causal_prefill(&meta).expect_err("nothing would place it in the input arena");
+        assert!(format!("{e}").contains("not a declared input"), "{e}");
+    }
+
+    #[test]
+    fn declaring_both_a_scalar_width_and_a_widths_vector_fails_loud() {
+        let mut meta = causal_prefill_meta(2);
+        meta["scratchpad"]["mask_param"] = serde_json::json!("sm_mask");
+        let e = load_causal_prefill(&meta).expect_err("one graph cannot have two masks");
+        assert!(format!("{e}").contains("two disagreeing masks"), "{e}");
+    }
+
+    #[test]
+    fn a_causal_artifact_that_cannot_say_how_many_heads_it_has_fails_loud() {
+        let mut meta = causal_prefill_meta(2);
+        meta["dims"].as_object_mut().unwrap().remove("q_heads");
+        let e = load_causal_prefill(&meta).expect_err("the widths length is q_heads * M");
+        assert!(format!("{e}").contains("dims.q_heads"), "{e}");
+    }
+
+    #[test]
+    fn a_decode_artifact_is_not_read_as_carrying_widths() {
+        // `causal` on a decode artifact would be describing its scalar `sm_mask`, a different
+        // mechanism. Reading it as this one would demand a buffer decode does not have.
+        let dir = tempfile::tempdir().unwrap();
+        let mut meta = base_meta(8, 4, serde_json::json!({}));
+        meta["causal"] = serde_json::json!(true);
+        write_meta(dir.path(), &meta);
+        let art = LlmArtifact::load(dir.path()).expect("decode still loads");
+        assert!(art.mask_widths.is_none());
+        assert!(art.sm_mask.is_some(), "decode masks with the scalar, and still does");
     }
 
     #[test]

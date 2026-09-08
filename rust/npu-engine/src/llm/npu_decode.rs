@@ -231,9 +231,11 @@ impl NpuDecodeStep {
         for name in &artifact.weights {
             upload_blob(&arena, &artifact, name)?;
         }
-        // A prefill artifact may declare weights the decode graph has no use for -- the constant
-        // `[M, M]` causal triangle is the design's one example. Those come from ITS buffers dir; the
-        // shared ones were just written from decode's and must not be written twice.
+        // A prefill artifact may declare weights the decode graph has no use for. There is no such
+        // buffer today -- the causal mask turned out to be a per-row width VECTOR the host writes
+        // per chunk, not a constant the ELF carries -- but a prefill-only weight stays legal, and
+        // it comes from ITS buffers dir; the shared ones were just written from decode's and must
+        // not be written twice.
         if let Some(p) = &pre_art {
             for name in p.weights.iter().filter(|n| !artifact.layout.contains_key(n.as_str())) {
                 upload_blob(&arena, p, name)?;
