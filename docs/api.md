@@ -116,9 +116,11 @@ Bodies are capped at 16 MiB. Streaming responses use Server-Sent Events with no
   it returns 503 rather than 200 when a model failed to load, and 200 otherwise. `npu` reports
   whether an NPU device is present at all.
 - `GET /v1/models` -- `{"object":"list","data":[{"id","object":"model","kind","state",
-  "detail","bo_bytes","idle_s"}, ...]}` for every model named in the config. `state` is one of
-  `loaded | failed | unloaded`; `idle_s` is seconds since the model last served a request, or
-  `null` while not resident.
+  "detail","bo_bytes","idle_s","pinned"}, ...]}` for every model named in the config. `state`
+  is one of `loaded | failed | unloaded`; `idle_s` is seconds since the model last served a
+  request, or `null` while not resident; `pinned` is the config's `resident` as the RUNNING
+  server currently has it, which is how you check that a pin reached the service rather than
+  only the file.
 
 ### Inference (OpenAI-compatible shape)
 
@@ -174,16 +176,32 @@ These routes edit `engine.toml` on disk and then ask the device actor to reconci
 -- config is the persistence layer; a restart re-reads the same file.
 
 - `POST /admin/reload` -- re-read the config and reconcile with no edit.
-- `POST /admin/models` -- body `{"name","scenario"}`; add or replace a model entry (new models
-  default to `resident: false`).
+- `POST /admin/models` -- body `{"name","scenario"}`; add a model entry, or update the scenario
+  of one already present. New models default to `resident: false`; an existing entry keeps every
+  other key it had, so re-pointing a scenario does not silently unpin the model.
 - `DELETE /admin/models/<name>`
+- `POST /admin/models/<name>/resident` -- body `{"resident": bool}`; pin or unpin a model. Takes
+  effect immediately, with no unload and no restart. A name not in the config is a 400.
+- `POST /admin/models/<name>/load` -- make the model resident now. Returns
+  `{"loaded","resident","max_resident","unweighed"}`; `loaded` is `false` when it already was.
+  **409** when the server is at `max_resident`: this route never evicts, and the error names the
+  models holding the slots. `unweighed` lists resident models the memory accountant cannot weigh,
+  i.e. the ones `memory_ceiling_mb` is not bounding.
+- `POST /admin/models/<name>/unload` -- release the model's device memory, keeping its config entry.
+  Returns `{"released": bool}`; `false` means it was not resident.
+
+  Unlike the routes above, `load`/`unload` are device operations and do **not** edit `engine.toml`.
 - `POST /admin/defaults` -- body `{"capability","model"}`; set which model serves a capability
   when a request does not name one. `capability` must be one of `Capability::ALL` (currently
   `asr`, `embed`, `generate`, `tts`, `image-sr`, `diarize`); an unrecognized value is a 400
   rather than a silent no-op.
 
-All four return `{"loaded","unloaded","failed","deferred"}` counts from the reconcile report on
-success.
+These routes edit the file in place rather than re-serializing the parsed config, so comments
+in `engine.toml` survive an edit made over HTTP.
+
+All of them return `{"loaded","unloaded","failed","deferred","pinned_deferred"}` counts from the
+reconcile report on success. `pinned_deferred` names how many models the config pins that
+admission did not reach -- see the pin note in `docs/configuration.md`.
 
 ## Scenario and config files
 

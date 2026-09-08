@@ -109,6 +109,28 @@ pub enum Cmd {
     },
     /// Ask a running server to re-read the config and reconcile.
     Reload { #[arg(long)] port: Option<u16> },
+    /// Make a model resident on the running server, now.
+    ///
+    /// Fails rather than evicting when the server is already at `max_resident` -- an explicit load
+    /// is a statement about capacity, so honouring it by dropping someone else's model would answer
+    /// a different question. The refusal names what is holding the slots. Serving a request still
+    /// evicts as before; this is the operator path, not the request path.
+    ///
+    /// Runtime state, not config: it does not edit `engine.toml` and does not survive a restart.
+    /// For that, pin the model (`npu config pin`).
+    Load {
+        model: String,
+        #[arg(long)] port: Option<u16>,
+    },
+    /// Give a model's device memory back now, without stopping the service.
+    ///
+    /// The same release the idle sweep performs, fired by hand: the config entry stays, routing
+    /// still knows what the model is, and the next request that needs it loads it again. This is
+    /// what frees the NPU for another process without `systemctl stop`.
+    Unload {
+        model: String,
+        #[arg(long)] port: Option<u16>,
+    },
     /// Pre-bake a model's weight checkpoint (host-only, no device).
     Bake { name: String },
     /// Weight-checkpoint tooling: bake, inspect, and parity-check.

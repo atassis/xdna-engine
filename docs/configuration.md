@@ -84,8 +84,18 @@ resident = false
 - `scenario` -- path to the scenario TOML, resolved against the engine root (see below)
   if relative.
 - `resident` (default `false`) -- pin this model so it is never chosen as an eviction
-  victim and never idle-unloaded. Pinning every model leaves no eviction victim at all;
-  `npu config show` and the config summary warn when pinned models are `>= max_resident`.
+  victim and never idle-unloaded. Set it with `npu config pin <model>` / `npu config unpin
+  <model>`, or by hand.
+
+  **A pin is an exemption, not an entitlement.** It keeps a model that IS resident from being
+  swept or evicted; it does not win it a slot it would not otherwise have had. Boot admission
+  is still the first `max_resident` models in config order, so a pin listed after enough
+  others is simply not loaded at startup -- it loads on the first request that routes to it
+  and then stays. `npu config show`, `npu config pin` and the server's startup log all say so
+  when that is the case, rather than leaving the config stating an intent the runtime declined.
+
+  Pinning every model leaves no eviction victim at all; `npu config show` and the config
+  summary warn when pinned models are `>= max_resident`.
 
 ### Editing it
 
@@ -94,10 +104,50 @@ npu config show
 npu config add-model <name> <scenario-path>
 npu config remove-model <name>
 npu config set-default <capability> <model>
+npu config pin <model>                # resident = true
+npu config unpin <model>              # resident = false
+npu config set <key> <value>          # one [server] key; `npu config set --help` lists them
 ```
 
-Each of these loads, mutates, and atomically saves `engine.toml` (temp file + rename).
-A running service does not pick up an edit until reloaded:
+`npu config set` covers the residency knobs: `max_resident`, `idle_unload_s` (`0` switches
+idle unload off entirely), `idle_release_s`, `sweep_interval_s`, `evict_policy`, plus `port`
+and `memory_ceiling_mb`. The key list is closed -- an unrecognised key is refused rather than
+written, because a key nothing reads produces a file that still parses and silently does
+nothing.
+
+Each of these edits `engine.toml` **in place** and saves it atomically (temp file + rename).
+In place, not re-serialized from the parsed struct: the struct does not carry comments, so
+rewriting the file from it deleted every one of them -- including the comments the generated
+config ships with. Re-running `add-model` on a name already present updates that entry's
+scenario and leaves its other keys, including `resident`, alone.
+
+### Residency at runtime
+
+`engine.toml` is desired state. To change what is on the device **now**, without editing the config
+or restarting:
+
+```
+npu load <model>          # make it resident now
+npu unload <model>        # give its device memory back now
+```
+
+`npu load` **refuses** rather than evicting when the server is already at `max_resident`, and the
+refusal names what is holding the slots. That is deliberate and is the one place the operator path
+differs from the request path: a request names a capability, so swapping a model in to serve it is
+right; an explicit load is a statement about *capacity*, and honouring it by dropping a model
+someone else pinned would answer a different question. Free a slot with `npu unload`, or raise the
+cap with `npu config set max_resident <n>`.
+
+Both are idempotent, and neither touches `engine.toml` -- so neither survives a restart. For
+residency that does, pin the model.
+
+> **`memory_ceiling_mb` does not currently bound anything.** It sums `Servable::footprint()` across
+> resident models, and every shipped model returns a hardcoded `0` (`npu-runtime/src/loader.rs`), so
+> the sum is always 0 and the check never fires. `max_resident` -- a model COUNT -- is the only
+> residency limit actually enforced today. `npu load` says so when it reports a model the accountant
+> could not weigh, rather than letting a ceiling you just set look like it is holding.
+
+A running service does not pick up a config edit until reloaded:
 
 ```
 npu reload                       # POST /admin/reload on the running server

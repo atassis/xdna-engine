@@ -42,6 +42,8 @@ fn main() -> Result<()> {
                              diar.as_deref(), *track, *no_diarize),
         Cmd::Models { json, port } => models(&path, *json, *port),
         Cmd::Reload { port } => reload(&path, *port),
+        Cmd::Load { model, port } => load_model(&path, model, *port),
+        Cmd::Unload { model, port } => unload_model(&path, model, *port),
         Cmd::Bake { name } => bake(&path, name),
         Cmd::Config { action } => config_cmd(&path, action),
         Cmd::Weights { action } => weights_cmd(&path, action),
@@ -613,6 +615,62 @@ fn reload(path: &Path, port: Option<u16>) -> Result<()> {
     let body = http_post(port, "/admin/reload", "").context("reload (is the server running?)")?;
     println!("{body}");
     Ok(())
+}
+
+/// `npu load` / `npu unload` talk to the SERVICE, not the device.
+///
+/// Every other one-shot command drives the engine in-process, but residency is a property of the
+/// running server's registry -- the thing that owns `max_resident`, eviction and the idle sweep.
+/// Loading a model into this process would take its own hardware context and change nothing the
+/// server can see, which is the opposite of what was asked.
+fn load_model(path: &Path, model: &str, port: Option<u16>) -> Result<()> {
+    let port = resolve_port(path, port)?;
+    let body = http_post(port, &format!("/admin/models/{model}/load"), "")
+        .context("load (is the server running?)")?;
+    let v: serde_json::Value = serde_json::from_str(&body)
+        .with_context(|| format!("unexpected reply: {body}"))?;
+    if let Some(e) = v.get("error").and_then(|e| e.as_str()) { return Err(admin_err(e, port)) }
+    let n = |k: &str| v.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
+    println!("{model}: {}  ({}/{} resident)",
+        if v.get("loaded").and_then(|x| x.as_bool()) == Some(true) { "loaded" } else { "already resident" },
+        n("resident"), n("max_resident"));
+    // Say when the ceiling the operator may have just set is not bounding anything. An unenforceable
+    // limit that looks enforced is the failure `memory_ceiling_mb`'s own doc comment warns about.
+    let unweighed: Vec<&str> = v.get("unweighed").and_then(|x| x.as_array())
+        .map(|a| a.iter().filter_map(|s| s.as_str()).collect()).unwrap_or_default();
+    if !unweighed.is_empty() {
+        eprintln!("note: memory_ceiling_mb is not bounding these -- they report no measured \
+                   footprint: {}", unweighed.join(" "));
+    }
+    Ok(())
+}
+
+fn unload_model(path: &Path, model: &str, port: Option<u16>) -> Result<()> {
+    let port = resolve_port(path, port)?;
+    let body = http_post(port, &format!("/admin/models/{model}/unload"), "")
+        .context("unload (is the server running?)")?;
+    let v: serde_json::Value = serde_json::from_str(&body)
+        .with_context(|| format!("unexpected reply: {body}"))?;
+    if let Some(e) = v.get("error").and_then(|e| e.as_str()) { return Err(admin_err(e, port)) }
+    println!("{model}: {}", match v.get("released").and_then(|x| x.as_bool()) {
+        Some(true) => "released",
+        _ => "was not resident",
+    });
+    Ok(())
+}
+
+/// An admin route's error, with the one case that is not about the request spelled out.
+///
+/// `http_req` keeps only the body, so a 404 arrives as this server's generic `not found` and reads
+/// as though the MODEL was not found -- which is the wrong thing entirely, and is what a CLI newer
+/// than the service it is talking to hits every time. Observed against a server started before these
+/// routes existed.
+fn admin_err(e: &str, port: u16) -> anyhow::Error {
+    if e == "not found" {
+        return anyhow!("the server on port {port} has no load/unload route -- it is older than \
+                        this CLI. Restart it: systemctl --user restart npu-asr");
+    }
+    anyhow!("{e}")
 }
 
 fn bake(path: &Path, name: &str) -> Result<()> {
