@@ -1,0 +1,14 @@
+[scenario]
+kind = "generate"
+name = "gemma3-270m"
+
+# Gemma-3-270M fused decode. Same rail as qwen3-0.6b -- the spec is DATA
+# (designs/decode_fused/llm_decode_spec.py::GEMMA3_270M), not a second generator.
+#
+#   decode     scripts/build_llm_decode.sh gemma3-270m   (fused 18-layer ELF + meta.json)
+#   weights    scripts/dump_llm_weights.py --spec gemma3-270m --out artifacts/gemma3-270m/weights
+#   tokenizer  the unsloth/gemma-3-270m-it HF snapshot dir
+[artifacts]
+decode = "artifacts/gemma3-270m/decode"
+weights = "artifacts/gemma3-270m/weights"
+tokenizer_dir = "artifacts/gemma3-270m/tokenizer"
