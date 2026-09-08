@@ -94,14 +94,18 @@ pub const FLAGS: &[Flag] = &[
               position at or beyond n_past, so the per-request pass cost 224 MiB of host memset \
               plus an arena write (~60 ms/request at S=2048) and changed no output. Set =0 to \
               restore it when bisecting a suspected KV bug." },
-    Flag { name: "NPU_LLM_PREFILL_BATCHED", owner: "npu-engine", site: "npu-engine/src/llm/npu_prefill.rs:56",
-        semantics: NotZero, default: "true",
+    Flag { name: "NPU_LLM_PREFILL_BATCHED", owner: "npu-engine", site: "npu-engine/src/llm/npu_prefill.rs:66",
+        semantics: IsOne, default: "false",
         doc: "prime the KV cache over a prompt in batches of the prefill artifact's dims.M instead \
-              of one dispatch per token. No effect unless the scenario names artifacts.prefill -- \
-              without that artifact there is no batched ELF and the flag reads on a path that does \
-              not exist. Set =0 for the A/B control behind every prefill measurement, and to \
-              bisect a batched prompt that disagrees with P sequential steps. Both arms are \
-              device-only: this is a step within the tier ladder, never a fall to host." },
+              of one dispatch per token. OPT-IN (=1), not not_zero, because the batched path does \
+              not yet pass its own gate: measured 2026-09-08 on device, batched and per-token \
+              priming agree on the first token at every prompt length tried but their step-0 \
+              logits differ by rel-L2 0.14-0.17, and with top-1 gaps as small as 0.0625 that \
+              cascades into different text within a few tokens. So configuring a prefill artifact \
+              must not silently change what the model says. =1 turns it on for measurement and \
+              bisection against the per-token control. Both arms are device-only: this is a step \
+              within the tier ladder, never a fall to host. Flip back to not_zero when the gate \
+              passes, not before." },
 
     // -- npu-asr-host --------------------------------------------------------------------------
     Flag { name: "NPU_PAR_SUBSAMPLE", owner: "npu-asr-host", site: "npu-asr-host/src/lib.rs:507",

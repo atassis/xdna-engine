@@ -49,12 +49,21 @@ use crate::llm::npu_decode::{pack_bf16_bytes, rope_row, EmbedTable};
 
 /// `NPU_LLM_PREFILL_BATCHED` -- the one accessor (E003 of the env-flag contract).
 ///
-/// Default ON with `not_zero` semantics (E001), matching `NPU_LLM_REUSE_KV` next door: `=0` takes
-/// the per-token priming path, which is the A/B control for every prefill measurement and the
-/// bisect handle if a batched prompt ever disagrees with `P` sequential steps. Both arms are
-/// device-only -- this is a step WITHIN the tier ladder, not a silent fall to host.
+/// Default **OFF** (`=1` opts in), which is deliberately NOT the `not_zero` shape `NPU_LLM_REUSE_KV`
+/// next door uses.
+///
+/// The batched path does not yet pass its own gate. Measured on device 2026-09-08 against the
+/// shipped 28-layer decode artifact: batched priming and `P` sequential steps agree on the FIRST
+/// token at every prompt length tried, but the step-0 logits differ by rel-L2 0.14-0.17 -- two
+/// orders of magnitude above bf16 rounding -- and with top-1 gaps as small as 0.0625 that cascades
+/// into different text within a few tokens. 1 of 5 prompt lengths reproduced the per-token output
+/// exactly.
+///
+/// So a scenario that merely CONFIGURES a prefill artifact must not silently change what the model
+/// says. `=1` turns it on for measurement and bisection; flipping this default back to `not_zero`
+/// is a one-word change and belongs with the gate passing, not before it.
 fn batched_prefill_enabled() -> bool {
-    std::env::var("NPU_LLM_PREFILL_BATCHED").ok().as_deref() != Some("0")
+    std::env::var("NPU_LLM_PREFILL_BATCHED").ok().as_deref() == Some("1")
 }
 
 /// One padded dispatch of the prefill ELF: absolute positions `[start, start + M)`, of which the
