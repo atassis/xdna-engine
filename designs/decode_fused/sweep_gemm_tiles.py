@@ -135,7 +135,7 @@ def print_census(name, cen, *, verbose_examples=True):
 
 
 def subsample(candidates, cap):
-    """A STRATIFIED subsample of the legal set -- every ceil(n/cap)-th, in grid order.
+    """A STRATIFIED subsample of the legal set -- a fixed stride through it, in grid order.
 
     Not "the most promising": any ranking here would be the guess this whole file exists to
     delete. Sorting by (cols, tile_m, tile_k, tile_n) and taking a fixed stride spreads the sample
@@ -279,13 +279,14 @@ def run_build(args, shapes, registry_path):
 # device timing -- the ONLY mode here that opens /dev/accel
 # ---------------------------------------------------------------------------------------------
 def run_time_manifest(args, registry_path):
-    """Dispatch every built arm through fused_elf_probe, in ONE pass, and write timings.jsonl.
+    """Dispatch every built arm through fused_elf_probe and write timings.jsonl.
 
-    ONE pass in manifest order on purpose. A sequential sweep on an unpinned NPU aliases the swept
-    variable with the device's DVFS ramp -- `scripts/npu_power_mode.py` records the case where that
-    turned a 1.17x fan-out result into an apparent 3.05x -- so the mode is GATED here before any
-    arm runs, and the arms are interleaved across shapes rather than grouped, so a box that drifts
-    drifts across the whole set instead of across one shape.
+    Two pieces of measurement discipline, both paid for elsewhere on this rail. The power mode is
+    GATED before the first dispatch -- a sequential sweep on an unpinned NPU aliases the swept
+    variable with the DVFS ramp, which is how a 1.17x DMA fan-out once read as 3.05x
+    (`scripts/npu_power_mode.py`). And the arms are ROUND-ROBINED across shapes rather than run
+    shape by shape, so a box that drifts over the run drifts across the whole set instead of
+    landing entirely on whichever shape happened to go last.
     """
     sys.path.insert(0, str(HERE.parent.parent / "scripts"))
     from npu_power_mode import require_pinned  # noqa: E402  -- scripts/, not this package
@@ -309,12 +310,11 @@ def run_time_manifest(args, registry_path):
     by_label = OrderedDict()
     for a in arms:
         by_label.setdefault(a["label"], []).append(a)
-    order, i = [], 0
+    order = []
     while any(by_label.values()):
         for lbl in list(by_label):
             if by_label[lbl]:
                 order.append(by_label[lbl].pop(0))
-        i += 1
 
     rows = []
     with timings.open("w") as fh:
