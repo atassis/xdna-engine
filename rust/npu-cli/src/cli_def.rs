@@ -91,7 +91,13 @@ pub enum Cmd {
     },
     /// Interactive chat REPL: reads a line from stdin, streams the reply, keeps history across
     /// turns. Ctrl-D exits.
+    ///
+    /// An opening turn on the command line is answered before the first prompt, so `npu chat "hi"`
+    /// starts talking instead of waiting, and the session continues from there -- which is the part
+    /// `npu generate "hi"` does not do. A turn may begin with `-`; it is not read as a flag.
     Chat {
+        /// Opening turn, answered immediately. Omit it to start at an empty prompt.
+        #[arg(allow_hyphen_values = true)] prompt: Option<String>,
         #[arg(long)] model: Option<String>,
         #[command(flatten)] sampling: SamplingArgs,
         #[arg(long)] no_stream: bool,

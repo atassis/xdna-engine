@@ -55,7 +55,8 @@ fn run(cli: &Cli, path: &Path) -> Result<()> {
         Cmd::Transcribe { input, model } => transcribe(path, input, model.as_deref()),
         Cmd::Generate { prompt, model, sampling, no_stream, raw } =>
             generate(path, prompt, model.as_deref(), sampling, *no_stream, *raw),
-        Cmd::Chat { model, sampling, no_stream } => chat(path, model.as_deref(), sampling, *no_stream),
+        Cmd::Chat { prompt, model, sampling, no_stream } =>
+            chat(path, prompt.as_deref(), model.as_deref(), sampling, *no_stream),
         Cmd::Embed { text, model } => embed(path, text, model.as_deref()),
         Cmd::Diarize { wav, model, json } => diarize(path, wav, model.as_deref(), *json),
         Cmd::TranscribeMedia { input, out, format, asr, diarize: diar, track, no_diarize } =>
@@ -371,7 +372,12 @@ fn generate(path: &Path, prompt: &str, model: Option<&str>, sampling: &SamplingA
     Ok(())
 }
 
-fn chat(path: &Path, model: Option<&str>, sampling: &SamplingArgs, no_stream: bool) -> Result<()> {
+/// `opening` is the turn given on the command line. It is answered before stdin is read once, and
+/// then the REPL continues from it -- a seeded session, not a one-shot. The one-shot spelling is
+/// `npu generate`, which builds the identical single-message `Prompt::Chat`; duplicating it here
+/// would add a second name for a command we have and drop the history that makes this one a REPL.
+fn chat(path: &Path, opening: Option<&str>, model: Option<&str>, sampling: &SamplingArgs,
+        no_stream: bool) -> Result<()> {
     quiet_one_shot();
     let cfg = load_cfg(path)?;
     let root = root(&cfg, path)?;
@@ -382,14 +388,24 @@ fn chat(path: &Path, model: Option<&str>, sampling: &SamplingArgs, no_stream: bo
     let params = build_params(sampling).map_err(|m| Tagged(Code::Failure, m))?;
     let mut history: Vec<npu_engine::ChatMessage> = Vec::new();
     let stdin = std::io::stdin();
+    // Whitespace-only counts as absent: `npu chat ""` must open the REPL, not send an empty turn.
+    let mut opening = opening.map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
     let result = (|| -> Result<()> {
         loop {
-            print!("> "); std::io::stdout().flush().ok();
-            let mut line = String::new();
-            if stdin.lock().read_line(&mut line)? == 0 { println!(); return Ok(()); } // Ctrl-D
-            let line = line.trim_end();
-            if line.is_empty() { continue; }
-            history.push(npu_engine::ChatMessage { role: "user".into(), content: line.to_string() });
+            let line = match opening.take() {
+                // Echoed at the prompt so the transcript reads the same whether the turn came from
+                // argv or the keyboard.
+                Some(turn) => { println!("> {turn}"); turn }
+                None => {
+                    print!("> "); std::io::stdout().flush().ok();
+                    let mut line = String::new();
+                    if stdin.lock().read_line(&mut line)? == 0 { println!(); return Ok(()); } // Ctrl-D
+                    let line = line.trim_end().to_string();
+                    if line.is_empty() { continue; }
+                    line
+                }
+            };
+            history.push(npu_engine::ChatMessage { role: "user".into(), content: line });
             let served = handle.generate(model, npu_engine::Prompt::Chat(history.clone()), params.clone())
                 .map_err(|e| Tagged(engine_error(&e), e.to_string()))?;
             let reply = drain_generation(served.value, !no_stream)?;
@@ -1250,6 +1266,26 @@ mod tests {
                 assert!(!raw, "generate must default to the chat template, not raw continuation");
             }
             _ => panic!("expected Cmd::Generate"),
+        }
+    }
+
+    /// The opening turn is optional and positional: `npu chat "hi"` answers immediately, `npu chat`
+    /// alone still opens an empty REPL. `allow_hyphen_values` for the same reason `generate` has it.
+    #[test]
+    fn chat_takes_an_optional_opening_turn() {
+        let cli = Cli::try_parse_from(["npu", "chat"]).expect("a bare chat must still parse");
+        match cli.cmd {
+            Cmd::Chat { prompt, .. } => assert_eq!(prompt, None),
+            _ => panic!("expected Cmd::Chat"),
+        }
+        let cli = Cli::try_parse_from(["npu", "chat", "- an opening turn", "--seed", "3"])
+            .expect("an opening turn must parse");
+        match cli.cmd {
+            Cmd::Chat { prompt, sampling, .. } => {
+                assert_eq!(prompt.as_deref(), Some("- an opening turn"));
+                assert_eq!(sampling.seed, Some(3));
+            }
+            _ => panic!("expected Cmd::Chat"),
         }
     }
 
