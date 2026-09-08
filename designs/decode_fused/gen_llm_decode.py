@@ -505,7 +505,16 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
     Hq, Hkv, QD, KVD, VOCAB = sp.n_q_heads, sp.n_kv_heads, sp.q_dim, sp.kv_dim, sp.vocab
 
     def npy(name):
-        return np.load(os.path.join(weights_dir, f"{name}.npy")).astype(np.float32)
+        # mmap_mode + copy=False, and BOTH halves matter. The dump is f32 on disk and the tied
+        # embedding is the whole table: 3.75 GiB for Gemma-4-12B (262144x3840). Reading that into
+        # anonymous memory, then copying it again because astype() copies even when the dtype
+        # ALREADY MATCHES, is 7.5 GiB of resident memory for one tensor -- which is what
+        # OOM-killed the 12B build, and why an 8-layer build died too: the embedding is fixed cost
+        # and depth does not touch it. Every consumer below is read-only and builds a new array
+        # (quantize_weight writes into its own `out`, bf16()/np.pad() allocate), so a read-only
+        # view is sufficient. Page cache is evictable; anonymous memory is not.
+        return np.load(os.path.join(weights_dir, f"{name}.npy"),
+                       mmap_mode="r").astype(np.float32, copy=False)
 
     def load_norm(name):
         # Gemma-3 stores RMSNorm gain as w with the kernel computing x_hat*(1+w); Qwen3 stores it
