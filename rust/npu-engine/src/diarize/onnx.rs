@@ -128,8 +128,12 @@ pub struct OnnxEmbedder { _env: Rc<Env>, sess: Session, dim: usize, batch: usize
 /// ~55 MB per crop is the measured slope ((1519-568)/24). Budget via NPU_DIARIZE_MEM_MB.
 fn embed_batch(m: &Manifest) -> usize {
     const MB_PER_CROP: usize = 55;
+    // `.filter(|&n| n > 0)` matches `embed_threads` above: reject a zero budget at the INPUT
+    // rather than leaning on the `.max(1)` further down, which clamps a DERIVED quantity and so
+    // turned `NPU_DIARIZE_MEM_MB=0` into a silent batch-of-1 instead of the documented default.
     let budget = std::env::var("NPU_DIARIZE_MEM_MB").ok()
         .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
         .unwrap_or(768);
     let from_budget = (budget / MB_PER_CROP).max(1);
     // The manifest's batch_size stays an upper bound: a budget must never make us slower than

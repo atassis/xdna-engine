@@ -89,11 +89,21 @@ impl Precision {
         self == Precision::Int8
     }
     /// Runtime selector: `NPU_PRECISION` = native|bf16|int8 (default FastBf16).
+    ///
+    /// An unrecognised value PANICS rather than falling back. The wildcard arm this replaces
+    /// swallowed three different mistakes into the same silent default: a typo (`natve`), the wrong
+    /// case (`Int8`), and -- the one that proves the point -- `bf16` itself, which this doc string
+    /// has always advertised and the match never handled. `NPU_TILE`, forty lines up, already
+    /// panics on a malformed value; this is that discipline applied to the sibling knob.
     pub fn from_env() -> Self {
         match std::env::var("NPU_PRECISION").ok().as_deref() {
             Some("native") => Precision::NativeBf16,
+            Some("bf16") => Precision::FastBf16,
             Some("int8") => Precision::Int8,
-            _ => Precision::FastBf16,
+            Some(other) => panic!(
+                "NPU_PRECISION: expected native|bf16|int8, got {other:?}"
+            ),
+            None => Precision::FastBf16,
         }
     }
 
