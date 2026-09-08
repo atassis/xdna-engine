@@ -9,7 +9,7 @@
 //! Both arms drive the raw residents so nothing in the host's decision logic can differ between
 //! them, and both prime exactly the same positions with the same tokens.
 //!
-//! NPU is single-tenant -- run under `xdna-engine-private/journal/scripts/npu_lock.sh`.
+//! NPU is single-tenant -- stop `npu serve` and serialise against any other device user.
 //!
 //! Usage: prefill_kv_parity_probe <decode_dir> <prefill_dir> [--n 256]
 

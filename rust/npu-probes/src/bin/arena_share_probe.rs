@@ -6,7 +6,7 @@
 //! (`gen_llm_decode.py` declares only `x`/`rope_global` as inputs and `logits` as output, so all
 //! 1.110 GiB of weights and all 224 MiB of KV cache are scratch). If two ELFs cannot share one
 //! arena, batched prefill needs a second weight copy AND a host round-trip of the KV cache, and
-//! the design in `docs/reference/batched-prefill-architecture.md` collapses.
+//! the batched-prefill design collapses.
 //!
 //! Two phases, both against ONE arena:
 //!   A. two `ElfResident`s (= two hw_contexts) from the same ELF. Drive a two-step decode with
@@ -14,9 +14,9 @@
 //!      the logits BITWISE. Step 1 reads the KV row step 0 wrote, so equality proves cross-context
 //!      visibility of a device-side scratch write -- exactly the prefill->decode handoff.
 //!   B. one `ElfCtx` + two `rebind`s (= one hw_context, two programs). The free-transition path
-//!      that [[transition-cost-is-the-context-not-the-program]] measured.
+//!      that the transition-cost measurement attributes to the CONTEXT, not the program.
 //!
-//! NPU is single-tenant -- run under `xdna-engine-private/journal/scripts/npu_lock.sh`.
+//! NPU is single-tenant -- stop `npu serve` and serialise against any other device user.
 //!
 //! Usage: arena_share_probe <artifact_dir>
 

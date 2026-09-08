@@ -31,7 +31,7 @@
 #   bash scripts/gate_llm.sh --make-ref           # no device: (re)write the Tier 2 reference
 #
 # The DEVICE steps are announced before they run and are the only ones that open /dev/accel. The
-# NPU is single-tenant: run them under xdna-engine-private/journal/scripts/npu_lock.sh.
+# NPU is single-tenant: stop `npu serve` and serialise against any other device user.
 #
 # Env: GATE_ARTIFACTS (space-separated Tier 1 artifact dirs), GATE_DUMP_ROOT, GATE_REF, GATE_NPU,
 #      WEIGHTS, GATE_TOKENS, GATE_K, VENV_IRON, IRON.

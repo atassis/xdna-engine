@@ -9,7 +9,7 @@
 //! flag is resolved once per process and because two `with_prefill` instances would hold four
 //! hardware contexts and two 2 GB arenas for no reason.
 //!
-//! NPU is single-tenant -- run under `xdna-engine-private/journal/scripts/npu_lock.sh`.
+//! NPU is single-tenant -- stop `npu serve` and serialise against any other device user.
 //!
 //! Usage: prefill_parity_probe <decode_dir> <prefill_dir> [--gen N] [--lens 64,255,256,257,600]
 

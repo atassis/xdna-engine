@@ -10,7 +10,7 @@
 //! It also splits the space in half on its own: if xout and every slab MATCH, the prefill graph is
 //! right and the bug is in the handoff or the control; if they differ, the bug is inside the graph.
 //!
-//! NPU is single-tenant -- run under `xdna-engine-private/journal/scripts/npu_lock.sh`.
+//! NPU is single-tenant -- stop `npu serve` and serialise against any other device user.
 //!
 //! Usage: prefill_golden_probe <prefill_artifact_dir>
 

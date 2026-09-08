@@ -1,7 +1,7 @@
 //! Batched prefill: prime the KV cache for a prompt `M` positions per dispatch instead of one.
 //!
-//! The design is `xdna-engine-private/journal/docs/reference/batched-prefill-architecture.md`. Two
-//! of its decisions are what this file implements, and both are load-bearing:
+//! Two decisions from the batched-prefill design are what this file implements, and both are
+//! load-bearing:
 //!
 //! **One arena, two ELFs.** The weights live in the SCRATCH arena, so a second arena would mean a
 //! second copy of them plus a host round-trip of the KV cache between the halves. `FusedArena`
