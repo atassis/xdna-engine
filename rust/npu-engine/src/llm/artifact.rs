@@ -68,6 +68,17 @@ pub struct LlmArtifact {
     /// `meta.json`'s `embed_blob`; see [`Self::embed_blob`]. `None` in pre-2026-09-08 artifacts.
     pub embed_blob: Option<String>,
     pub kv_off: ScratchpadParam,
+    /// Every KV-append offset slot the artifact declares, paired with the head_dim its layers use.
+    ///
+    /// One entry on a uniform model, which is every model shipped today -- and then this is exactly
+    /// `[(kv_off, head_dim)]`, so nothing changes. It is a LIST because Gemma-4-12B's attention
+    /// geometry is per-layer (sliding head_dim 256, global 512), and `kv_off = pos * head_dim` is
+    /// therefore two different byte offsets for the same logical position. One slot cannot carry
+    /// both; the host must write one value per distinct head_dim.
+    ///
+    /// Populated from `meta.json`'s `scratchpad.kv_params` when present, else derived from the
+    /// single `kv_param` + `dims.head_dim` so every existing artifact keeps loading unchanged.
+    pub kv_offs: Vec<(ScratchpadParam, usize)>,
     pub sm_mask: ScratchpadParam,
     pub head_dim: usize,
     pub d_model: usize,
@@ -227,6 +238,25 @@ impl LlmArtifact {
             Ok(ScratchpadParam { byte_offset, core })
         };
         let kv_off = read_param(kv_param_name)?;
+        // `scratchpad.kv_params`: [{"param": <name>, "head_dim": <n>}, ...]. Absent on every
+        // artifact built before per-layer geometry existed, so fall back to the single slot rather
+        // than requiring a rebuild.
+        let kv_offs = match sp.get("kv_params").and_then(|v| v.as_array()) {
+            Some(list) if !list.is_empty() => {
+                let mut out = Vec::with_capacity(list.len());
+                for e in list {
+                    let nm = e.get("param").and_then(|v| v.as_str()).ok_or_else(|| {
+                        ctx("scratchpad.kv_params entry missing string `param`".to_string())
+                    })?;
+                    let hd = e.get("head_dim").and_then(|v| v.as_u64()).ok_or_else(|| {
+                        ctx(format!("scratchpad.kv_params entry `{nm}` missing numeric `head_dim`"))
+                    })? as usize;
+                    out.push((read_param(nm)?, hd));
+                }
+                out
+            }
+            _ => vec![(kv_off.clone(), head_dim)],
+        };
         let sm_mask = read_param(mask_param_name)?;
 
         // Compat shim, narrow and logged: ONLY for `rope_global` immediately following `x`, the exact
@@ -337,6 +367,7 @@ impl LlmArtifact {
             cache_buffers,
             embed_blob,
             kv_off,
+            kv_offs,
             sm_mask,
             head_dim,
             d_model,
