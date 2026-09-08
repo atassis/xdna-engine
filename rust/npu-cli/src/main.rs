@@ -663,14 +663,59 @@ fn unload_model(path: &Path, model: &str, port: Option<u16>) -> Result<()> {
 ///
 /// `http_req` keeps only the body, so a 404 arrives as this server's generic `not found` and reads
 /// as though the MODEL was not found -- which is the wrong thing entirely, and is what a CLI newer
-/// than the service it is talking to hits every time. Observed against a server started before these
-/// routes existed.
+/// than the service it is talking to hits every time.
 fn admin_err(e: &str, port: u16) -> anyhow::Error {
     if e == "not found" {
         return anyhow!("the server on port {port} has no load/unload route -- it is older than \
-                        this CLI. Restart it: systemctl --user restart npu-asr");
+                        this CLI.{}", restart_hint(port));
     }
     anyhow!("{e}")
+}
+
+/// How to restart whatever is serving `port` -- RESOLVED from the running process, not guessed.
+///
+/// The first version hardcoded `systemctl --user restart npu-asr`, and install.sh had just
+/// superseded that unit, so the advice named a service the box does not have. The unit name is
+/// readable: systemd puts it in the process's cgroup path. So is the more useful fact underneath,
+/// which is why the server is stale at all -- `install` replaces the binary's inode, and a server
+/// started before that keeps running the old one, which the kernel marks `(deleted)`.
+///
+/// Returns "" rather than a guess when the process cannot be identified. Silence beats wrong advice.
+fn restart_hint(port: u16) -> String {
+    let Some(pid) = serving_pid(port) else { return String::new() };
+    let stale = std::fs::read_link(format!("/proc/{pid}/exe"))
+        .map(|p| p.to_string_lossy().ends_with("(deleted)")).unwrap_or(false);
+    let why = if stale {
+        " It is running a binary that has already been replaced on disk (/proc/<pid>/exe is deleted),           so this is an install that has not been restarted into."
+    } else { "" };
+    match unit_of(pid) {
+        Some(unit) => format!("{why} Restart it: systemctl --user restart {}",
+                              unit.trim_end_matches(".service")),
+        // Not under a unit: started by hand, so there is no restart command to offer.
+        None => format!("{why} It was started outside systemd (pid {pid}); restart it the way it                          was started."),
+    }
+}
+
+/// The pid the running server published, or `None` when nothing is serving this port.
+fn serving_pid(port: u16) -> Option<u64> {
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(npu_runtime::status_file::path()?).ok()?).ok()?;
+    match v.get("port").and_then(|p| p.as_u64()) {
+        Some(p) if p != port as u64 => return None,
+        _ => {}
+    }
+    let pid = v.get("pid")?.as_u64()?;
+    std::path::Path::new(&format!("/proc/{pid}")).exists().then_some(pid)
+}
+
+/// The systemd unit owning `pid`, from its cgroup path -- the last `*.service` component of
+/// `/user.slice/.../app.slice/xdna-engine.service`. `None` when the process is not under one.
+fn unit_of(pid: u64) -> Option<String> {
+    std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?
+        .split(['/', '\n'])
+        .filter(|c| c.ends_with(".service"))
+        .last()
+        .map(str::to_string)
 }
 
 fn bake(path: &Path, name: &str) -> Result<()> {
@@ -950,6 +995,22 @@ mod tests {
         assert!(config_cmd(&p, &ConfigCmd::RemoveModel { name: "nope".into() }).is_err());
         assert!(config_cmd(&p, &ConfigCmd::Set { key: "max_resident".into(), value: "-1".into() }).is_err());
         assert_eq!(std::fs::read_to_string(&p).unwrap(), before, "a refused command writes nothing");
+    }
+
+    /// The unit name must be READ, not guessed. The first version hardcoded `npu-asr`, which
+    /// install.sh had superseded, so the advice named a service that does not exist.
+    #[test]
+    fn unit_of_reads_the_service_from_a_cgroup_path() {
+        let parse = |s: &str| s.split(['/', '\n']).filter(|c| c.ends_with(".service"))
+            .last().map(str::to_string);
+        assert_eq!(parse("0::/user.slice/user-1000.slice/user@1000.service/app.slice/xdna-engine.service"),
+                   Some("xdna-engine.service".to_string()),
+                   "the LAST .service component is the unit; user@1000.service is the manager");
+        assert_eq!(parse("0::/user.slice/user-1000.slice/user@1000.service/app.slice/npu-asr.service"),
+                   Some("npu-asr.service".to_string()));
+        // Started by hand: no unit, so there is no restart command to offer and none is invented.
+        assert_eq!(parse("0::/user.slice/user-1000.slice/session-3.scope"), None);
+        assert_eq!(parse(""), None);
     }
 
     #[test]
