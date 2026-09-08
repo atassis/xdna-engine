@@ -38,7 +38,8 @@ import numpy as np
 import ml_dtypes
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from llm_decode_spec import SPECS  # noqa: E402
+from llm_decode_spec import (SPECS, C_TILE_GRANULE, L1_BYTES, L1_RESERVE,  # noqa: E402,F401
+                             gemv_fits, gemv_tile_output, k_chunks_for)
 
 # Dataflow switches, read ONCE at module scope. They are consumed in three different functions
 # (graph construction, the runlist, and the meta writer), and defining them next to their first
@@ -438,69 +439,9 @@ def report_artifact_freshness(weights_dir):
         print(f"{tag} {meta_path}: OK (toolchain {cur})", file=sys.stderr)
 
 
-L1_BYTES = 65536      # AIE2P core local memory (getLocalMemorySize(), AIETargetModel.h)
-L1_RESERVE = 8192     # stack + the allocator's own slack; measured headroom, not a guess (see below)
-C_TILE_GRANULE = 8    # tile_size_output must be a multiple of this (16 bytes of bf16); see gemv_tile_output
-
-
-def gemv_tile_output(M, K, cols=None, tsi=None):
-    """Largest legal `tile_size_output` for a GEMV that also FITS L1.
-
-    Two independent constraints, and only the first is checked by the toolchain:
-
-    1. design.py asserts `m_output <= M//cols` and `(M//cols) % m_output == 0`, plus
-       `m_output % m_input == 0`.
-    2. NOTHING checks L1 capacity. The generated core holds, per the linker map of a failing build:
-       the C output tile DOUBLE-buffered (2 x m_output x 2B), the A input tile double-buffered
-       (2 x m_input x K x 2B) and the B vector double-buffered (2 x K x 2B). Exceed 64 KB and aiecc
-       dies with "'aie.tile' op Basic sequential allocation also failed" -- which names a tile, not a
-       tile SIZE, so it reads as a placement bug rather than "your output tile is too big".
-
-    Taking m_output = M//cols (the largest the asserts allow) blows constraint 2 on the lm-head:
-    vocab 151936 -> 18992 elements -> 37984 B, double-buffered 76 KB against 64 KB of L1. Both the
-    tracked gen_gemma_decode.py (vocab//8 = 32768) and a naive port hit this.
-
-    Returns (tile_size_input, tile_size_output).
-    """
-    cols = COLS if cols is None else cols
-    per_col = M // cols
-    # m_input must shrink too: the A tile is m_input x K, so at K=3072 (the FFN down projection)
-    # A+B double-buffered already exceed L1 at m_input=4 and leave the C tile nothing. Search
-    # m_input downward and take the first that admits any legal C tile.
-    # Search every m_input and keep the largest legal C TILE, not the largest m_input. Preferring
-    # m_input first is a trap: at the lm-head shape it accepts (4, 16) -- legal, correct, and 1187
-    # tiles per column -- while (2, 9496) exists one step down and is 593x fewer tiles. A smaller
-    # m_input frees L1 budget quadratically faster than it costs, because A is m_input x K while C
-    # is just m_output.
-    best_pair = (0, 0)
-    for cand_tsi in ([tsi] if tsi is not None else (4, 2, 1)):
-        if per_col % cand_tsi:
-            continue
-        budget = L1_BYTES - L1_RESERVE - 2 * (cand_tsi * K * 2) - 2 * (K * 2)
-        if budget <= 0:
-            continue
-        cap = budget // 4                  # C is double-buffered, 2 bytes per element
-        # THIRD constraint, and nothing in the toolchain checks it: the C tile must be a multiple of
-        # C_TILE_GRANULE elements. MEASURED 2026-09-03 with a standalone one-GEMV repro at the
-        # lm-head shape -- M=151936 K=1024 with tso=4748 (4748 % 8 == 4) returns a PERMUTATION of the
-        # right answer: values correct (sorted rel-L2 7.9e-3) in wrong positions (rel-L2 1.40). The
-        # SAME M and K with tso=9496 is correct at 2.8e-3, and 1024/512/256 are correct at M=8192.
-        # Every passing tile is a multiple of 8; the one failing tile is not. It is silent -- the
-        # build succeeds and the argmax is simply wrong -- so it has to be refused here.
-        best = max((d for d in range(cand_tsi, per_col + 1, cand_tsi)
-                    if per_col % d == 0 and d <= cap and d % C_TILE_GRANULE == 0), default=0)
-        if best > best_pair[1]:
-            best_pair = (cand_tsi, best)
-    if best_pair[1]:
-        return best_pair
-    raise ValueError(f"GEMV M={M} K={K}: no (tile_size_input, tile_size_output) fits L1 "
-                     f"({L1_BYTES} B) with M//cols={per_col} and tile_size_output a multiple of "
-                     f"{C_TILE_GRANULE}")
-
-
 def gemv(M, K, ctx, **kw):
     """GEMV tiled as large as both the design asserts AND L1 allow."""
-    tsi, tso = gemv_tile_output(M, K)
+    tsi, tso = gemv_tile_output(M, K, cols=COLS)
     return GEMV(M=M, K=K, num_aie_columns=COLS, tile_size_input=tsi,
                 tile_size_output=tso, context=ctx, **kw)
 
@@ -746,7 +687,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
     # the epilogue walks the C tile 32 lanes at a time, and GEMV refuses an epilogue on a quantized
     # weight stream (untested combination, not a hardware conflict). gemv() picks tile_size_output
     # itself, so ask it rather than assuming FF // COLS.
-    _gate_tso = gemv_tile_output(FF, D)[1]
+    _gate_tso = gemv_tile_output(FF, D, cols=COLS)[1]
     fuse_act = (
         FUSE_ACT
         and QUANT_MLP_DTYPE == "bf16"

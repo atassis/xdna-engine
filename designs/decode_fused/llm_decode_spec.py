@@ -21,6 +21,100 @@ does not (`embed_scale`), which is a HOST-side per-token step, recorded here so 
 """
 from dataclasses import dataclass
 
+# ---- GEMV L1 fit -- ONE model, shared by the generator and the weight dump ----
+# This lives here rather than in gen_llm_decode.py because the WEIGHT DUMP has to make the same
+# decision: whether a GEMV fits L1 decides whether its K is split, and a K-split changes how many
+# tensors the dump writes and what they are named. Two copies of an L1 model is a seam with no
+# owner, which is the class that has already cost this tree a build.
+
+L1_BYTES = 65536      # AIE2P core local memory (getLocalMemorySize(), AIETargetModel.h)
+L1_RESERVE = 8192     # stack + the allocator's own slack; measured headroom, not a guess (see below)
+C_TILE_GRANULE = 8    # tile_size_output must be a multiple of this (16 bytes of bf16); see gemv_tile_output
+
+
+def gemv_tile_output(M, K, cols=8, tsi=None):
+    """Largest legal `tile_size_output` for a GEMV that also FITS L1.
+
+    Two independent constraints, and only the first is checked by the toolchain:
+
+    1. design.py asserts `m_output <= M//cols` and `(M//cols) % m_output == 0`, plus
+       `m_output % m_input == 0`.
+    2. NOTHING checks L1 capacity. The generated core holds, per the linker map of a failing build:
+       the C output tile DOUBLE-buffered (2 x m_output x 2B), the A input tile double-buffered
+       (2 x m_input x K x 2B) and the B vector double-buffered (2 x K x 2B). Exceed 64 KB and aiecc
+       dies with "'aie.tile' op Basic sequential allocation also failed" -- which names a tile, not a
+       tile SIZE, so it reads as a placement bug rather than "your output tile is too big".
+
+    Taking m_output = M//cols (the largest the asserts allow) blows constraint 2 on the lm-head:
+    vocab 151936 -> 18992 elements -> 37984 B, double-buffered 76 KB against 64 KB of L1. Both the
+    tracked gen_gemma_decode.py (vocab//8 = 32768) and a naive port hit this.
+
+    Returns (tile_size_input, tile_size_output).
+    """
+    per_col = M // cols
+    # m_input must shrink too: the A tile is m_input x K, so at K=3072 (the FFN down projection)
+    # A+B double-buffered already exceed L1 at m_input=4 and leave the C tile nothing. Search
+    # m_input downward and take the first that admits any legal C tile.
+    # Search every m_input and keep the largest legal C TILE, not the largest m_input. Preferring
+    # m_input first is a trap: at the lm-head shape it accepts (4, 16) -- legal, correct, and 1187
+    # tiles per column -- while (2, 9496) exists one step down and is 593x fewer tiles. A smaller
+    # m_input frees L1 budget quadratically faster than it costs, because A is m_input x K while C
+    # is just m_output.
+    best_pair = (0, 0)
+    for cand_tsi in ([tsi] if tsi is not None else (4, 2, 1)):
+        if per_col % cand_tsi:
+            continue
+        budget = L1_BYTES - L1_RESERVE - 2 * (cand_tsi * K * 2) - 2 * (K * 2)
+        if budget <= 0:
+            continue
+        cap = budget // 4                  # C is double-buffered, 2 bytes per element
+        # THIRD constraint, and nothing in the toolchain checks it: the C tile must be a multiple of
+        # C_TILE_GRANULE elements. MEASURED 2026-09-03 with a standalone one-GEMV repro at the
+        # lm-head shape -- M=151936 K=1024 with tso=4748 (4748 % 8 == 4) returns a PERMUTATION of the
+        # right answer: values correct (sorted rel-L2 7.9e-3) in wrong positions (rel-L2 1.40). The
+        # SAME M and K with tso=9496 is correct at 2.8e-3, and 1024/512/256 are correct at M=8192.
+        # Every passing tile is a multiple of 8; the one failing tile is not. It is silent -- the
+        # build succeeds and the argmax is simply wrong -- so it has to be refused here.
+        best = max((d for d in range(cand_tsi, per_col + 1, cand_tsi)
+                    if per_col % d == 0 and d <= cap and d % C_TILE_GRANULE == 0), default=0)
+        if best > best_pair[1]:
+            best_pair = (cand_tsi, best)
+    if best_pair[1]:
+        return best_pair
+    raise ValueError(f"GEMV M={M} K={K}: no (tile_size_input, tile_size_output) fits L1 "
+                     f"({L1_BYTES} B) with M//cols={per_col} and tile_size_output a multiple of "
+                     f"{C_TILE_GRANULE}")
+
+
+def gemv_fits(M, K, cols=8):
+    """Does ANY legal (tile_size_input, tile_size_output) exist for this GEMV within L1?
+
+    A predicate over gemv_tile_output rather than a second budget calculation -- a duplicated fit
+    model is exactly what moving this here was meant to delete.
+    """
+    try:
+        gemv_tile_output(M, K, cols=cols)
+        return True
+    except ValueError:
+        return False
+
+
+def k_chunks_for(M, K, cols=8):
+    """Fewest power-of-two chunks of K whose GEMV fits L1. 1 when the shape already fits.
+
+    The B vector is double-buffered at 2*K*2 bytes and is INDEPENDENT of every tiling knob, so a
+    large enough K does not fit at ANY (tsi, tso): Gemma-4-12B's down projection needs 61440 B of
+    57344 usable before a single weight or output byte is counted. Splitting the reduction over K
+    and summing the partials is the fix and needs no new operator. It is NOT free in bf16 -- each
+    partial is rounded to bf16 before the sum.
+    """
+    n = 1
+    while n <= 64:
+        if K % n == 0 and gemv_fits(M, K // n, cols):
+            return n
+        n *= 2
+    raise ValueError(f"GEMV M={M} K={K}: no power-of-two K split up to 64 fits L1")
+
 
 @dataclass(frozen=True)
 class LlmSpec:
