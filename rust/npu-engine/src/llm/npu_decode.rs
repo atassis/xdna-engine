@@ -218,30 +218,56 @@ impl DecodeStep for NpuDecodeStep {
             .write_at(x_loc.arena, x_loc.off, x_bytes)
             .map_err(|e| EngineError::Device(format!("write x: {e}")))?;
 
-        let rope = rope_row(pos, self.artifact.head_dim, self.artifact.rope_theta_global);
+        // The row WIDTH comes from the buffer the artifact declares, not from a scalar head_dim.
+        // That is the number the ELF actually reads, so the two cannot drift apart -- and it makes
+        // the per-layer case free: Gemma-4-12B's global layers use head_dim 512 where its sliding
+        // layers use 256, so `rope_global` and `rope_local` must differ in WIDTH and not only in
+        // theta, which a single artifact.head_dim cannot express.
         let rope_loc = self.artifact.loc("rope_global");
+        let rope = rope_row(pos, rope_loc.len / 2, self.artifact.rope_theta_global);
+        // Cross-check against the SEPARATELY computed dims.head_dim, which is the only version of
+        // this number that can actually disagree. (Comparing the built byte count against
+        // rope_loc.len would be tautological -- the width is derived from that same len.) The
+        // check is skipped once geometry is per-layer, where no single head_dim is the right
+        // answer for both rows.
+        if self.artifact.kv_offs.len() == 1 && rope_loc.len != self.artifact.head_dim * 2 {
+            return Err(EngineError::Device(format!(
+                "rope_global buffer is {} bytes, but dims.head_dim = {} implies {} -- the \
+                 generator and the artifact disagree about the RoPE row width",
+                rope_loc.len, self.artifact.head_dim, self.artifact.head_dim * 2)));
+        }
+        let rope_bytes = pack_bf16_bytes(&rope);
         self.arena
-            .write_at(rope_loc.arena, rope_loc.off, &pack_bf16_bytes(&rope))
+            .write_at(rope_loc.arena, rope_loc.off, &rope_bytes)
             .map_err(|e| EngineError::Device(format!("write rope_global: {e}")))?;
 
         // Same row, different base. Gemma-3 interleaves local and global attention layers and the
         // ELF reads a separate angle table for each; a model without local layers has no such
         // buffer and this is skipped.
         if let Some(theta_local) = self.artifact.rope_theta_local {
-            let rope_l = rope_row(pos, self.artifact.head_dim, theta_local);
             let loc = self.artifact.loc("rope_local");
+            let rope_l = rope_row(pos, loc.len / 2, theta_local);
+            let rope_l_bytes = pack_bf16_bytes(&rope_l);
             self.arena
-                .write_at(loc.arena, loc.off, &pack_bf16_bytes(&rope_l))
+                .write_at(loc.arena, loc.off, &rope_l_bytes)
                 .map_err(|e| EngineError::Device(format!("write rope_local: {e}")))?;
         }
 
         // `kv_off` is "addr"-kind (element-unit BD offset, no shift); `sm_mask` is "core"-kind and
         // the firmware's UPDATE_REG convention requires the host to pre-shift it left by 2 bits
         // (matches `asr::whisper_decoder::FusedDecoder::dispatch_resident`).
-        let kv_val = (pos * self.artifact.head_dim) as u32;
-        self.res
-            .write_scratchpad(self.artifact.kv_off.byte_offset, &kv_val.to_le_bytes())
-            .map_err(|e| EngineError::Device(format!("write kv_off scratchpad: {e}")))?;
+        // ONE WRITE PER DISTINCT head_dim. `kv_offs` has a single entry on every model shipped
+        // today, so this is the same single write it has always been. It is a loop because
+        // Gemma-4-12B's geometry is per-layer -- sliding head_dim 256, global 512 -- and
+        // `pos * head_dim` is then two different byte offsets for the same logical position, which
+        // one slot cannot carry. A spec with non-uniform geometry is still refused at build time
+        // (LlmSpec.check); this is the host half of lifting that refusal.
+        for (slot, head_dim) in &self.artifact.kv_offs {
+            let kv_val = (pos * head_dim) as u32;
+            self.res
+                .write_scratchpad(slot.byte_offset, &kv_val.to_le_bytes())
+                .map_err(|e| EngineError::Device(format!("write kv_off scratchpad: {e}")))?;
+        }
         let sm_raw = (pos + 1) as u32;
         let sm_val = if self.artifact.sm_mask.core { sm_raw << 2 } else { sm_raw };
         self.res
@@ -251,7 +277,8 @@ impl DecodeStep for NpuDecodeStep {
         // Unconditional every token -- see the module doc. No arm here may skip a step "because
         // nothing changed"; that branch is exactly the defect this mirrors away from.
         self.arena.sync_input().map_err(|e| EngineError::Device(format!("sync input: {e}")))?;
-        self.res.dispatch().map_err(|e| EngineError::Device(format!("resident dispatch: {e}")))?;
+        // dispatch()'s own error already names "resident dispatch"; don't prefix it twice.
+        self.res.dispatch().map_err(EngineError::Device)?;
         self.arena.sync_from_device().map_err(|e| EngineError::Device(format!("sync output: {e}")))?;
 
         let out_loc = self.artifact.loc(&self.artifact.output);
@@ -496,10 +523,14 @@ mod tests {
     /// DMA/scheduling bytes even when it isn't a correctness fix. A ~6-day upstream advance
     /// changing instruction scheduling is fully sufficient to flip a genuine 0.02-margin bf16 tie.
     /// Host-side bytes were independently verified byte-identical against `verify_llm_decode.py`
-    /// (embed row, `x`, `rope_global`) before this was found, so the artifact vintage -- not this
-    /// rail's host code -- was the whole gap. Regenerate the default artifact to close it; until
-    /// then this gate is EXPECTED to read 7/8 against the stale default, and a run pointed at a
-    /// freshly generated decode dir is the one that must read 8/8.
+    /// (embed row, `x`, `rope_global`), so this rail's host code is not the gap.
+    ///
+    /// CORRECTED 2026-09-08: "a freshly generated decode dir must read 8/8" does NOT hold. A fresh
+    /// 28-layer bf16 build on the current pin reads 7/8, missing the same step with a THIRD token,
+    /// 9625. Frozen 279, that fresh build 15344, this one 9625 -- which is exactly the three-way
+    /// tie `probe_step5_topk.py` measured at 16.7500. So step 5 does not report artifact vintage:
+    /// which tied token wins moves with any change to the numerics, in either direction. Judge this
+    /// gate on the other seven steps, and judge a FORMAT change on perplexity, never here.
     #[test]
     fn device_teacher_forced_matches_oracle() {
         let (decode_dir, weights_dir, oracle_path) = gate_paths();
