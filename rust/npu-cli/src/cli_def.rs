@@ -236,8 +236,26 @@ pub enum WeightsCmd {
 
 #[derive(Subcommand)]
 pub enum ConfigCmd {
+    /// Print the config's own view: `[server]`, defaults, and every `[[model]]` with its pin state.
+    ///
+    /// Reads the FILE, not the running server -- unlike `npu models`, nothing here is merged with
+    /// live state, so it works with the service down. This is also where a pin overcommit or a
+    /// pin the admission order will not honour gets surfaced, on purpose: before the write that
+    /// would trip it, not after.
     Show,
+    /// Add a model, or repoint an existing one's scenario.
+    ///
+    /// Updates the entry IN PLACE when `name` is already in the config: only `scenario` changes,
+    /// residency and every other key on that model stay as they were. The old writer instead
+    /// dropped the entry and pushed a fresh one, which silently unpinned a model the moment its
+    /// scenario path was corrected.
     AddModel { name: String, #[arg(value_hint = ValueHint::FilePath)] scenario: String },
+    /// Delete a model's `[[model]]` entry entirely.
+    ///
+    /// Unlike `unpin`, nothing of the model is left behind -- no scenario, no pin state, nothing
+    /// for `npu load`/`npu models` to resolve. Fails on a name the config does not have, the same
+    /// refusal `pin`/`unpin` make: there is nothing to act on, so silently doing nothing would only
+    /// hide the typo.
     RemoveModel { name: String },
     /// Pin a model resident: exempt from idle unload, never chosen as an eviction victim.
     ///
