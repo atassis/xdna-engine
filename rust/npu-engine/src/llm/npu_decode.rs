@@ -170,6 +170,12 @@ impl NpuDecodeStep {
 }
 
 impl DecodeStep for NpuDecodeStep {
+    /// The artifact's own `dims.S`. This is what makes the generator's bound real: without it the
+    /// trait default is `None` and the decode loop walks `pos` past the end of the KV cache.
+    fn max_context(&self) -> Option<usize> {
+        Some(self.artifact.max_seq)
+    }
+
     /// Zero every KV cache buffer. The inherent `reset` already did this; wiring it through the
     /// trait is what makes it actually run, since the generator only ever sees `dyn DecodeStep`.
     fn reset(&mut self) -> Result<(), EngineError> {

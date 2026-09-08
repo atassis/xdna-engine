@@ -26,6 +26,17 @@ pub trait DecodeStep {
         Ok(())
     }
 
+    /// The largest number of token positions this backend's KV cache can hold, or `None` when the
+    /// backend has no window (a host implementation whose cache is a growable `Vec`). The device
+    /// backend reads it from the artifact's `dims.S`, which sizes `kc`/`vc` as `[Hkv, S, HD]`.
+    ///
+    /// This is a REQUIRED bound, not a hint. `step`'s `pos` becomes `kv_off = pos * head_dim` into
+    /// that layout, so `pos == S` lands exactly on head 1's row 0: inside the arena, past no check,
+    /// and silently answering from an overwritten cache. Enforced in [`LlmGenerator::generate`].
+    fn max_context(&self) -> Option<usize> {
+        None
+    }
+
     /// Per-generation device accounting, or `None` when the backend has none or it is not enabled.
     /// Emitted by [`LlmGenerator::generate`] after the loop, paired with [`DecodeStep::reset`]
     /// before it, so the numbers cover exactly one generation. A host-side backend returns `None`;
@@ -67,17 +78,29 @@ pub fn tokenize_prompt(
 /// ignoring `token`/`pos`. Not a model -- a way to drive [`LlmGenerator`]'s loop deterministically.
 pub struct ScriptedDecodeStep {
     steps: VecDeque<Vec<f32>>,
+    max_context: Option<usize>,
 }
 
 impl ScriptedDecodeStep {
     pub fn new(steps: Vec<Vec<f32>>) -> Self {
-        ScriptedDecodeStep { steps: steps.into() }
+        ScriptedDecodeStep { steps: steps.into(), max_context: None }
+    }
+
+    /// Give the mock a finite KV window, so the bound in [`LlmGenerator::generate`] is testable
+    /// without a device.
+    pub fn with_max_context(mut self, max_context: usize) -> Self {
+        self.max_context = Some(max_context);
+        self
     }
 }
 
 impl DecodeStep for ScriptedDecodeStep {
     fn step(&mut self, _token: u32, _pos: usize) -> Result<Vec<f32>, EngineError> {
         self.steps.pop_front().ok_or_else(|| EngineError::Device("scripted decode exhausted".to_string()))
+    }
+
+    fn max_context(&self) -> Option<usize> {
+        self.max_context
     }
 }
 
@@ -117,6 +140,21 @@ impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
             return Err(EngineError::Unsupported("prompt tokenized to zero tokens".to_string()));
         }
         let prompt_tokens = prompt_ids.len() as u32;
+        // The KV window is a HARD bound, and crossing it is silent rather than loud: `pos` becomes
+        // `kv_off = pos * head_dim` into a `[Hkv, S, HD]` cache, so position S lands on head 1's
+        // row 0 -- in-arena, past the artifact's own bounds check, answering from a cache it just
+        // overwrote. Priming walks positions `0..prompt_len`, so the prompt alone must fit.
+        let max_context = self.decode.max_context();
+        if let Some(max_ctx) = max_context {
+            if prompt_ids.len() > max_ctx {
+                return Err(EngineError::Unsupported(format!(
+                    "prompt is {} tokens but this model's context window is {max_ctx} \
+                     (the decode artifact was built at max_seq={max_ctx}); \
+                     shorten the prompt or load an artifact built with a larger window",
+                    prompt_ids.len()
+                )));
+            }
+        }
 
         let sampling_cfg = SamplingConfig {
             temperature: params.temperature,
@@ -183,6 +221,12 @@ impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
             }
 
             if completion_tokens >= params.max_tokens {
+                finish = FinishReason::Length;
+                break;
+            }
+            // Same bound, at the other end: the next dispatch would write position `pos`, so stop
+            // while `pos` is still inside the window rather than after it has been overwritten.
+            if max_context.is_some_and(|m| pos >= m) {
                 finish = FinishReason::Length;
                 break;
             }
@@ -259,6 +303,81 @@ mod tests {
         assert_eq!(reason, FinishReason::Stop);
         assert_eq!(usage.prompt_tokens, 1);
         assert_eq!(usage.completion_tokens, 1, "the EOS token itself must not be counted");
+    }
+
+    #[test]
+    fn a_prompt_longer_than_the_kv_window_is_refused_naming_both_numbers() {
+        let cfg = build_cfg(None);
+        // Window of 2, prompt of 3 -- priming alone would walk positions 0,1,2 and write past the
+        // last row of head 0. Nothing downstream can detect that, so it must be refused here.
+        let decode = ScriptedDecodeStep::new(vec![vec![0.0, 0.0, 9.0, 0.0, 0.0]]).with_max_context(2);
+        let mut gen = LlmGenerator::new(cfg, decode);
+        let params = GenerateParams { max_tokens: 50, temperature: 0.0, ..GenerateParams::default() };
+        let err = gen
+            .generate_to_string(&Prompt::Raw("hello world foo".to_string()), &params)
+            .expect_err("a prompt that does not fit the window must not run");
+        let msg = err.to_string();
+        assert!(msg.contains('3'), "must name the prompt length: {msg}");
+        assert!(msg.contains('2'), "must name the window: {msg}");
+    }
+
+    #[test]
+    fn generation_stops_at_the_kv_window_before_overwriting_it() {
+        let cfg = build_cfg(None);
+        // Window of 3, prompt "hello" (1 token). Priming consumes entry 0 at position 0, so `pos`
+        // enters the loop at 1. Positions 1 and 2 are legal; the step that would write position 3
+        // must not happen. That allows exactly 3 accepted tokens, and the script is deliberately
+        // LONGER than that -- if the bound did not fire the loop would happily keep going.
+        let peak = |id: usize| {
+            let mut v = vec![0.0; 7];
+            v[id] = 9.0;
+            v
+        };
+        let decode = ScriptedDecodeStep::new(vec![peak(2), peak(5), peak(6), peak(1), peak(2)])
+            .with_max_context(3);
+        let mut gen = LlmGenerator::new(cfg, decode);
+        let params = GenerateParams { max_tokens: 50, temperature: 0.0, ..GenerateParams::default() };
+        let (text, reason, usage) =
+            gen.generate_to_string(&Prompt::Raw("hello".to_string()), &params).unwrap();
+        assert_eq!(reason, FinishReason::Length, "hitting the window is a length stop");
+        assert_eq!(usage.completion_tokens, 3, "one token per legal position, and not one more");
+        assert_eq!(text, "world foo bar");
+    }
+
+    #[test]
+    fn a_prompt_exactly_filling_the_window_still_emits_from_its_last_logits() {
+        let cfg = build_cfg(None);
+        // prompt_len == max_context is legal: priming walks 0..=1 and stops inside the window. The
+        // last primed logits are real, so one token is sampled from them before the loop stops.
+        let decode = ScriptedDecodeStep::new(vec![vec![0.0; 7], {
+            let mut v = vec![0.0; 7];
+            v[2] = 9.0;
+            v
+        }])
+        .with_max_context(2);
+        let mut gen = LlmGenerator::new(cfg, decode);
+        let params = GenerateParams { max_tokens: 50, temperature: 0.0, ..GenerateParams::default() };
+        let (text, reason, usage) =
+            gen.generate_to_string(&Prompt::Raw("hello world".to_string()), &params).unwrap();
+        assert_eq!(reason, FinishReason::Length);
+        assert_eq!(usage.completion_tokens, 1);
+        assert_eq!(text, "world");
+    }
+
+    #[test]
+    fn a_backend_with_no_window_is_unbounded_as_before() {
+        let cfg = build_cfg(None);
+        // max_context() defaults to None, so nothing about the existing host path changes.
+        let decode = ScriptedDecodeStep::new(vec![
+            vec![0.0, 0.0, 9.0, 0.0, 0.0],
+            vec![0.0, 0.0, 0.0, 0.0, 9.0],
+        ]);
+        assert!(decode.max_context().is_none());
+        let mut gen = LlmGenerator::new(cfg, decode);
+        let params = GenerateParams { max_tokens: 50, temperature: 0.0, ..GenerateParams::default() };
+        let (_, reason, _) =
+            gen.generate_to_string(&Prompt::Raw("hello".to_string()), &params).unwrap();
+        assert_eq!(reason, FinishReason::Stop);
     }
 
     #[test]
