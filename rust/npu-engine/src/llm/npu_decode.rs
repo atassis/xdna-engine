@@ -322,7 +322,8 @@ impl DecodeStep for NpuDecodeStep {
         // Unconditional every token -- see the module doc. No arm here may skip a step "because
         // nothing changed"; that branch is exactly the defect this mirrors away from.
         self.arena.sync_input().map_err(|e| EngineError::Device(format!("sync input: {e}")))?;
-        self.res.dispatch().map_err(|e| EngineError::Device(format!("resident dispatch: {e}")))?;
+        // dispatch()'s own error already names "resident dispatch"; don't prefix it twice.
+        self.res.dispatch().map_err(EngineError::Device)?;
         self.arena.sync_from_device().map_err(|e| EngineError::Device(format!("sync output: {e}")))?;
 
         let out_loc = self.artifact.loc(&self.artifact.output);
