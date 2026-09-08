@@ -11,6 +11,7 @@
 # Other env (same defaults as build_deepc_decode.sh): VENV_IRON, IRON, AIEBU_DIR, WEIGHTS
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$REPO/scripts/require_disk_backed.sh"
 NS="${1:-16 32 64 128}"
 OUT_ROOT="${2:-$REPO/artifacts/gemm_probe}"
 NUM_COLS="${NUM_COLS:-1}"
@@ -52,7 +53,7 @@ export AIECC_PATH="${AIECC_PATH:-$INST/bin/aiecc}"
 
 for N in $NS; do
   OUT="${OUT_ROOT}${SUF}_N${N}"
-  WORK="$(mktemp -d)"   # amd/IRON writes build/ intermediates under CWD
+  WORK="$(disk_backed_mktemp)"   # amd/IRON writes build/ intermediates under CWD
   mkdir -p "$OUT"
   echo "=== building GEMM probe N=$N cols=$NUM_COLS -> $OUT (work=$WORK) ==="
   ( cd "$WORK" && "$VENV_IRON/bin/python" "$GEN" --weights "$WEIGHTS" --N "$N" --num-cols "$NUM_COLS" --tile-n "$TILE_N" --out "$OUT" ${TILE_M:+--tile-m "$TILE_M"} ${FUSE_RESIDUAL:+--fuse-residual} ${M_STATIONARY:+--m-stationary} )

@@ -55,10 +55,13 @@ export PATH="$VENV_IRON/bin:$VENV_IRON/cc-shim:$AIEBU_ASM_DIR:$PATH"
 # only input scripts/decode_ddr_bytes.py takes, and the shipped artifact does not carry the shim
 # BDs -- so with the unconditional trap a byte census is reproducible only by accident, from a
 # build that happened to choose its own directory.
+. "$REPO/scripts/require_disk_backed.sh"
+require_disk_backed "$OUT" "OUT (the built artifact)" || exit 1
 if [ -n "${KEEP_WORK:-}" ]; then
+    require_disk_backed "$KEEP_WORK" "KEEP_WORK (build intermediates)" || exit 1
     WORK="$KEEP_WORK"; mkdir -p "$WORK"; echo "[build] keeping intermediates in $WORK"
 else
-    WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
+    WORK="$(disk_backed_mktemp)"; trap 'rm -rf "$WORK"' EXIT
 fi
 mkdir -p "$OUT"
 echo "[build] spec=$SPEC layers=${LAYERS:-full} inst=$(basename "$INST") iron=$(basename "$IRON")"

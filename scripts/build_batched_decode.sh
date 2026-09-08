@@ -7,6 +7,7 @@
 # (later: ln_qkv, decode --layers N — added as those generators land)
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$REPO/scripts/require_disk_backed.sh"
 WHAT="${1:-ffn}"
 B="${B:-128}"
 VENV_IRON="${VENV_IRON:-$REPO/.venv-iron}"
@@ -70,7 +71,7 @@ case "$WHAT" in
   *) echo "ERROR: unknown block '$WHAT' (have: ffn ln_qkv self_attn cross_attn decode)"; exit 1 ;;
 esac
 
-WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT; mkdir -p "$OUT"
+WORK="$(disk_backed_mktemp)"; trap 'rm -rf "$WORK"' EXIT; mkdir -p "$OUT"
 echo "=== building batched $WHAT B=$B -> $OUT (work=$WORK) ==="
 ( cd "$WORK" && "$VENV_IRON/bin/python" "$GEN" --weights "$WEIGHTS" $ARGS --out "$OUT" )
 echo "[build] done: $OUT  (elf=$(du -h "$OUT"/*.elf | cut -f1))"
