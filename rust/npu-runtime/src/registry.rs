@@ -77,6 +77,11 @@ pub struct Entry {
     /// Last time this entry served a request; set to the load time when it becomes resident. Stale
     /// but harmless while the entry is not resident -- both readers filter on residency first.
     pub last_used: Instant,
+    /// `Some(max_resident)` when this entry was deferred because the slots were full AT THAT MOMENT.
+    /// The reason is a snapshot and the condition lapses: the idle sweep frees slots without
+    /// revisiting anyone's stored detail, so a boot-time "at max_resident" was still being reported
+    /// with every slot free. `status_at` re-reads it against the live count instead of trusting it.
+    pub deferred_capacity: Option<usize>,
 }
 
 #[derive(Default)]
@@ -102,9 +107,17 @@ impl Registry {
     pub fn status(&self) -> Vec<ModelStatus> { self.status_at(Instant::now()) }
     /// `status()` with the clock passed in, so idle reporting is testable without sleeping.
     pub fn status_at(&self, now: Instant) -> Vec<ModelStatus> {
+        let live = self.resident_count();
         self.entries.iter().map(|e| {
             let mut s = e.status.clone();
             s.idle_s = e.model.as_ref().map(|_| now.saturating_duration_since(e.last_used).as_secs());
+            // A capacity deferral is a snapshot. Report it only while it is still true, or the
+            // config reads as refused long after the sweep freed every slot.
+            if let Some(cap) = e.deferred_capacity {
+                if e.model.is_none() && live < cap {
+                    s.detail = format!("not resident: {}/{} slots in use; loads on demand", live, cap);
+                }
+            }
             s
         }).collect()
     }
@@ -134,7 +147,8 @@ impl Registry {
             // reconcile did not, so the two disagreed about the same model.
             let cap = self.declared(cfg, loader);
             self.set_deferred(cfg, format!(
-                "not resident: at max_resident ({}); loads on demand", srv.max_resident), cap);
+                "not resident: at max_resident ({}); loads on demand", srv.max_resident), cap,
+                srv.max_resident);
             return;
         }
         // The loader can PANIC, not just Err: model constructors still `.expect()` on missing
@@ -157,7 +171,8 @@ impl Registry {
                     detail: if bo == 0 { UNWEIGHED.into() } else { String::new() },
                     capability: Some(m.capabilities()), bo_bytes: bo, idle_s: Some(0),
                 };
-                self.upsert(Entry { cfg: cfg.clone(), model: Some(m), status, last_used: now });
+                self.upsert(Entry { cfg: cfg.clone(), model: Some(m), status, last_used: now,
+                                    deferred_capacity: None });
             }
             Err(e) => { let cap = self.declared(cfg, loader); self.set_failed(cfg, e.to_string(), cap) }
         }
@@ -213,6 +228,7 @@ impl Registry {
                 name: cfg.name.clone(), state: LoadState::Unloaded, detail, capability, bo_bytes: 0, idle_s: None,
             },
             last_used: Instant::now(),
+            deferred_capacity: None,
         });
     }
 
@@ -288,11 +304,16 @@ impl Registry {
         self.set_state(cfg, LoadState::Failed, detail, declared);
     }
     /// Configured, wanted, and deliberately not resident -- distinct from a failure.
-    fn set_deferred(&mut self, cfg: &ModelCfg, detail: String, declared: Option<Capability>) {
-        self.set_state(cfg, LoadState::Unloaded, detail, declared);
+    fn set_deferred(&mut self, cfg: &ModelCfg, detail: String, declared: Option<Capability>,
+                    capacity: usize) {
+        self.set_state_inner(cfg, LoadState::Unloaded, detail, declared, Some(capacity));
     }
     fn set_state(&mut self, cfg: &ModelCfg, state: LoadState, detail: String,
                  declared: Option<Capability>) {
+        self.set_state_inner(cfg, state, detail, declared, None);
+    }
+    fn set_state_inner(&mut self, cfg: &ModelCfg, state: LoadState, detail: String,
+                       declared: Option<Capability>, capacity: Option<usize>) {
         // Keep a capability learned from an earlier successful load: still true, and routing uses
         // it. Fall back to what the loader declares, so a model that has never loaded is still
         // labelled instead of reading as "unknown".
@@ -300,7 +321,8 @@ impl Registry {
         let status = ModelStatus {
             name: cfg.name.clone(), state, detail, capability, bo_bytes: 0, idle_s: None,
         };
-        self.upsert(Entry { cfg: cfg.clone(), model: None, status, last_used: Instant::now() });
+        self.upsert(Entry { cfg: cfg.clone(), model: None, status, last_used: Instant::now(),
+                            deferred_capacity: capacity });
     }
     fn upsert(&mut self, e: Entry) {
         if let Some(slot) = self.entries.iter_mut().find(|x| x.cfg.name == e.cfg.name) { *slot = e; }
@@ -464,6 +486,37 @@ mod tests {
         assert_eq!(b.state, LoadState::Unloaded, "over capacity is a capacity decision, not a failure");
         assert!(b.detail.contains("max_resident"), "{}", b.detail);
     }
+    /// The deferral reason is a snapshot, and it outlives the condition it describes.
+    ///
+    /// Observed on the running server 2026-09-08: all seven models `unloaded`, five of them by the
+    /// idle sweep, and the two pinned ones still reporting "not resident: at max_resident (5)".
+    /// `resident_count()` counts `model.is_some()`, so at that moment it was 0 and every slot was
+    /// free -- the message was a fossil from boot, not a live verdict. It reads as "the pin was
+    /// refused", which is why it was filed as pinned-loses-to-max_resident; the slots are not held
+    /// by anything.
+    #[test]
+    fn a_deferral_reason_outlives_the_capacity_that_caused_it() {
+        let l = loader(&["a", "b"]);
+        let srv = ServerCfg { max_resident: 1, ..Default::default() };
+        let mut r = Registry::default();
+        let t0 = Instant::now();
+        r.try_load(&cfg("a"), &l, &srv, t0);
+        r.try_load(&pinned("b"), &l, &srv, t0);   // deferred: "a" took the only slot
+        assert_eq!(r.resident_count(), 1);
+
+        // The idle sweep releases "a" (unpinned), so the slot it held is free again.
+        let swept = r.sweep_idle(t0 + Duration::from_secs(1000), Duration::from_secs(900));
+        assert_eq!(swept, vec!["a".to_string()]);
+        assert_eq!(r.resident_count(), 0, "every slot is free once the sweep has run");
+
+        let b = r.status().into_iter().find(|x| x.name == "b").unwrap();
+        assert!(
+            !b.detail.contains("max_resident"),
+            "with {} of {} slots in use, the stored reason still claims capacity: {:?}",
+            r.resident_count(), srv.max_resident, b.detail
+        );
+    }
+
     #[test]
     fn a_pinned_model_is_never_the_eviction_victim() {
         let l = loader(&["a", "b", "c"]);
