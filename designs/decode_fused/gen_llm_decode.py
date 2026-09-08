@@ -589,7 +589,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
     # nothing.
     geoms = []
     for l in range(NL):
-        gk = (sp.head_dim_for(l), sp.n_kv_heads_for(l))
+        gk = (sp.head_dim_for(l), sp.n_kv_heads_for(l), sp.has_v_proj(l))
         if gk not in geoms:
             geoms.append(gk)
 
@@ -613,7 +613,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
     mlp_dp_why = "FUSE_MLP_DP=0" if not FUSE_MLP_DP else sp.mlp_dp_reason()
     fuse_o = FUSE_MLP_O and mlp_dp_why is None
     for g in geoms:
-        why, tag = qkv_dp_why[g], "" if len(geoms) == 1 else f" [head_dim={g[0]}, kv_heads={g[1]}]"
+        why, tag = qkv_dp_why[g], "" if len(geoms) == 1 else f" [head_dim={g[0]}, kv_heads={g[1]}, v_proj={g[2]}]"
         print(f"[gen] fused arm qkv_head_dp{tag}: {'OFF -- ' + why if why else 'on'}")
     print(f"[gen] fused arm swiglu_mlp_dp: {'OFF -- ' + mlp_dp_why if mlp_dp_why else 'on'}")
     if fuse_o:
@@ -631,7 +631,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
             # op_mlp_dp is built ONCE with QD baked in, because Wo rides its weight channel. Two
             # q_dims cannot share it, and the failure would be a silent stride error rather than a
             # crash -- so refuse here rather than build the wrong thing.
-            qds = sorted({Hq * hd for hd, _ in geoms})
+            qds = sorted({Hq * hd for hd, _, _ in geoms})
             raise NotImplementedError(
                 f"FUSE_MLP_O folds Wo into one swiglu_mlp_dp design carrying a single QD, but "
                 f"{sp.name} has {len(geoms)} attention geometries {geoms} and therefore the "
@@ -650,12 +650,18 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
     kv_slots = []
     _attn_cache = {}
 
-    def attn_ops(hd, hkv):
-        """The ops shaped by one (head_dim, n_kv_heads) pair, built once per distinct pair."""
-        if (hd, hkv) in _attn_cache:
-            return _attn_cache[(hd, hkv)]
+    def attn_ops(hd, hkv, has_v):
+        """The ops shaped by one (head_dim, n_kv_heads, has_v_proj) triple.
+
+        `has_v` is a third key component and not derived from the other two on purpose. Under
+        Gemma-4 the layers that lack a v_proj are exactly the ones with the other geometry, so a
+        two-part key would work by coincidence here -- and silently mis-key the first model where
+        attention_k_eq_v and the geometry split do not coincide.
+        """
+        if (hd, hkv, has_v) in _attn_cache:
+            return _attn_cache[(hd, hkv, has_v)]
         qd, kvd, gqa = Hq * hd, hkv * hd, Hq // hkv
-        dp_why = qkv_dp_why[(hd, hkv)]
+        dp_why = qkv_dp_why[(hd, hkv, has_v)]
         op_qk_norm = RMSNorm(size=hd, num_aie_columns=1, num_channels=1, tile_size=hd,
                              weighted=True, epsilon=sp.eps, context=ctx) if sp.qk_norm else None
         op_qk_norm_b = (RMSNorm(size=hd, num_aie_columns=1, num_channels=1, tile_size=hd,
@@ -668,7 +674,11 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
                 f"QUANT_QKV_DTYPE={QUANT_QKV_DTYPE!r} but the fused QKV head is on, and "
                 "QKVHeadDataParallel has no weight_dtype axis -- it would consume packed bytes as "
                 "bf16 values. Set FUSE_QKV_DP=0, or add the axis to the operator.")
-        op_qkv = gemv(qd + 2 * kvd, D, ctx, **qkv_quant_kw) if FUSE_QKV_GEMV else None
+        # attention_k_eq_v: a layer with no v_proj concatenates TWO parts, not three, so both the
+        # GEMV shape and the qkv buffer layout are per-geometry. V is then derived from k rather
+        # than projected -- see the runlist, where v_norm reads the k slice.
+        kv_parts = 2 if has_v else 1
+        op_qkv = gemv(qd + kv_parts * kvd, D, ctx, **qkv_quant_kw) if FUSE_QKV_GEMV else None
         op_q = gemv(qd, D, ctx, **qkv_quant_kw)
         op_kv = gemv(kvd, D, ctx, **qkv_quant_kw)
         # o_proj, split over K on the same terms as the down projection. Under fuse_o there is no
@@ -794,8 +804,8 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
             op_kv=op_kv, op_o=op_o, op_rope_qk=op_rope_qk, op_qkv_dp=op_qkv_dp,
             op_rope_q=op_rope_q, op_rope_k=op_rope_k, op_sck=op_sck, op_scv=op_scv,
             op_rep_k=op_rep_k, op_rep_v=op_rep_v, op_scores=op_scores, op_trv=op_trv,
-            op_ctx=op_ctx, op_v_norm=op_v_norm)
-        _attn_cache[(hd, hkv)] = g
+            op_ctx=op_ctx, op_v_norm=op_v_norm, has_v=has_v, kv_parts=kv_parts)
+        _attn_cache[(hd, hkv, has_v)] = g
         return g
 
     # Built up front, in layer order, rather than lazily from the loop: construction order is then
@@ -913,7 +923,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
         # The layer's attention geometry. Uniform for every shipped spec, so this is the same
         # namespace object every iteration and the ops are shared exactly as they were when they
         # were module-level; Gemma-4-12B is where it starts returning two.
-        g = attn_ops(sp.head_dim_for(l), sp.n_kv_heads_for(l))
+        g = attn_ops(sp.head_dim_for(l), sp.n_kv_heads_for(l), sp.has_v_proj(l))
         p = f"L{l}_"
         nm = sp.norm_weight_names(l)
         for key, tensor in nm.items():
@@ -930,6 +940,8 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
         for key, tensor in (("Wq", "self_attn.q_proj"), ("Wk", "self_attn.k_proj"),
                             ("Wv", "self_attn.v_proj"), ("Wo", "self_attn.o_proj"),
                             ("Wg", "mlp.gate_proj"), ("Wu", "mlp.up_proj"), ("Wd", "mlp.down_proj")):
+            if key == "Wv" and not g.has_v:
+                continue     # attention_k_eq_v: no v_proj tensor exists for this layer
             hf = f"{sp.weight_prefix}layers.{l}.{tensor}.weight"
             if {"Wd": down_chunks, "Wo": g.o_chunks}.get(key, 1) > 1:
                 # Each chunk is its own contiguous tensor. A pre-chunked dump names them
@@ -1005,7 +1017,10 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
             else:
                 weights[p + key] = bf16(w).reshape(-1)
         if FUSE_QKV_GEMV:
-            assert len(qkv_parts) == 3, f"expected Wq, Wk, Wv; got {len(qkv_parts)}"
+            want = 1 + g.kv_parts
+            assert len(qkv_parts) == want, (
+                f"L{l}: expected {want} concat parts ({'Wq, Wk, Wv' if g.has_v else 'Wq, Wk'}); "
+                f"got {len(qkv_parts)}")
             weights[p + "Wqkv"] = np.concatenate(qkv_parts)
         weights[p + "kc"] = np.zeros(g.hkv * S * g.hd, BF16)
         weights[p + "vc"] = np.zeros(g.hkv * S * g.hd, BF16)
@@ -1024,10 +1039,19 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
         elif FUSE_QKV_GEMV:
             qkvb, kb, vb = p + "qkv", g.qd * 2, (g.qd + g.kvd) * 2
             ref_q, ref_k = f"{qkvb}[0:{kb}]", f"{qkvb}[{kb}:{vb}]"
-            ref_v, ref_qk = f"{qkvb}[{vb}:{vb + g.kvd * 2}]", f"{qkvb}[0:{vb}]"
+            ref_qk = f"{qkvb}[0:{vb}]"
+            if g.has_v:
+                ref_v = f"{qkvb}[{vb}:{vb + g.kvd * 2}]"
+                vhb, vho = qkvb, vb
+            else:
+                # No v_proj: the concatenation ends at k, and `v` is its own buffer that v_norm
+                # writes from the k slice. It cannot alias the k slice -- k is normed and rotated
+                # in place afterwards, and V must be the RAW projection.
+                ref_v, vhb, vho = p + "v", p + "v", 0
+                bufsz[p + "v"] = g.kvd * 2
             # per-head norm slice base + byte offset, for q, k and v alike
-            qhb, qho, khb, kho, vhb, vho = qkvb, 0, qkvb, kb, qkvb, vb
-            bufsz[qkvb] = (g.qd + 2 * g.kvd) * 2
+            qhb, qho, khb, kho = qkvb, 0, qkvb, kb
+            bufsz[qkvb] = (g.qd + g.kv_parts * g.kvd) * 2
         else:
             ref_q, ref_k, ref_v = p + "q", p + "k", p + "v"
             qhb, qho, khb, kho, vhb, vho = p + "q", 0, p + "k", 0, p + "v", 0
@@ -1066,17 +1090,25 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
             proj = ([(g.op_qkv, p + "Wqkv", p + "hn", p + "qkv")] if FUSE_QKV_GEMV else
                     [(g.op_q, p + "Wq", p + "hn", ref_q),
                      (g.op_kv, p + "Wk", p + "hn", ref_k),
-                     (g.op_kv, p + "Wv", p + "hn", ref_v)])
+                     *([(g.op_kv, p + "Wv", p + "hn", ref_v)] if g.has_v else [])])
             rope = ([(g.op_rope_qk, ref_qk, ang, ref_qk)] if fuse_rope else
                     [(g.op_rope_q, ref_q, ang, ref_q),
                      (g.op_rope_k, ref_k, ang, ref_k)])
             if g.op_v_norm is not None:
-                # Per kv head over head_dim, in place, and NOT rotated -- RoPE is a q/k-only step,
-                # so this sits after the rope entries the way the reference layer does, purely to
-                # read in the same order. Two args, not three: the unweighted design has no weight
-                # fifo (rms_norm/op.py runtime_args).
+                # Per kv head over head_dim, NOT rotated -- RoPE is a q/k-only step. Two args, not
+                # three: the unweighted design has no weight fifo (rms_norm/op.py runtime_args).
+                #
+                # SOURCE, and this is the whole of attention_k_eq_v: where the layer has a v_proj
+                # this is in place on v, but where it does not, V is the RAW k_proj output and the
+                # norm READS the k slice and WRITES the v buffer. That out-of-place form is also
+                # the copy, so k_eq_v needs no copy operator at all.
+                #
+                # ORDER is load-bearing in the second case and free in the first, so it is placed
+                # for the second: BEFORE the qk-norm and RoPE entries, which mutate k in place.
                 hv = [f"{vhb}[{vho + h*g.hd*2}:{vho + (h+1)*g.hd*2}]" for h in range(g.hkv)]
-                vnorm = [(g.op_v_norm, s, s) for s in hv]
+                src = ([f"{khb}[{kho + h*g.hd*2}:{kho + (h+1)*g.hd*2}]" for h in range(g.hkv)]
+                       if not g.has_v else hv)
+                vnorm = [(g.op_v_norm, a, b) for a, b in zip(src, hv)]
         # The fused head replaces the norm, the projection, every qk-norm and the RoPE with one
         # design; `hn` lives and dies in L1 instead of round-tripping DDR between four of them.
         # The fused head absorbs the KV append too: k and v are drained straight into the caches
@@ -1086,7 +1118,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
         head = ([(g.op_qkv_dp, cur, p + "n_in", p + "Wqkv", p + "n_qn", p + "n_kn", ang,
                   ref_q, p + "kc", p + "vc")]
                 if g.op_qkv_dp is not None else
-                [(op_norm, cur, p + "n_in", p + "hn"), *proj, *qk, *rope, *vnorm,
+                [(op_norm, cur, p + "n_in", p + "hn"), *proj, *vnorm, *qk, *rope,
                  (g.op_sck, ref_k, p + "kc"), (g.op_scv, ref_v, p + "vc")])
         rl += [
             *head,

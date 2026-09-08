@@ -257,11 +257,6 @@ class LlmSpec:
                 f"(the op vocabulary is keyed on the pair), but meta.json still carries "
                 f"dims.head_dim as one scalar and the host's rope cross-check is gated on "
                 f"kv_offs.len()==1, so it does nothing in exactly this case")
-        if self.v_from_k_on_global:
-            gaps.append(
-                "attention_k_eq_v: global layers have no v_proj and V is the RAW k_proj output, "
-                "taken before k_norm and before RoPE. The graph currently derives V from its own "
-                "projection on every layer")
         if self.rope_partial_rotary is not None:
             gaps.append(
                 f"partial rotary {self.rope_partial_rotary} (rope_type "
@@ -316,6 +311,15 @@ class LlmSpec:
         if self.act != "silu":
             return f"the fused block is SwiGLU; this spec's activation is {self.act!r}"
         return None
+
+    def has_v_proj(self, layer: int) -> bool:
+        """False where attention_k_eq_v applies: the layer has no v_proj and V comes from K.
+
+        A separate predicate from is_global() even though the two coincide in Gemma-4, because the
+        thing the graph needs to know is "is there a v projection", and a model can plausibly split
+        those two ways differently.
+        """
+        return not (self.v_from_k_on_global and self.is_global(layer))
 
     def layer_scalar_name(self, layer: int) -> str:
         """The per-layer scalar tensor. A register_buffer, so config.json never mentions it."""
