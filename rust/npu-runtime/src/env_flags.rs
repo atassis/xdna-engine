@@ -85,6 +85,15 @@ use Semantics::*;
 
 /// The full census, in crate order. See the module doc for what is deliberately excluded.
 pub const FLAGS: &[Flag] = &[
+    // -- npu-engine: llm decode ------------------------------------------------------------------
+    Flag { name: "NPU_LLM_REUSE_KV", owner: "npu-engine", site: "npu-engine/src/llm/npu_decode.rs:161",
+        semantics: IsOne, default: "false",
+        doc: "skip the per-request KV-cache zeroing and reuse the buffers across requests. The \
+              cache is already zeroed at load, and sm_mask excludes every position at or beyond \
+              n_past, so the per-request pass should be redundant -- it costs 224 MiB of host \
+              memset plus an arena write per request at S=2048. Opt-in until the correctness A/B \
+              is run on more shapes." },
+
     // -- npu-asr-host --------------------------------------------------------------------------
     Flag { name: "NPU_PAR_SUBSAMPLE", owner: "npu-asr-host", site: "npu-asr-host/src/lib.rs:507",
         semantics: NotZero, default: "true",

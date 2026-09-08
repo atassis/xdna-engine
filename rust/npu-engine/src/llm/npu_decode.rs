@@ -159,6 +159,24 @@ impl NpuDecodeStep {
     /// each new generation on a REUSED instance; a freshly-constructed instance is already zero (the
     /// artifact's own cache-buffer blobs are all-zero) and does not need this.
     pub fn reset(&mut self) -> Result<(), EngineError> {
+        // The cache buffers are ALREADY zero when the model loads: every one of them is listed in
+        // `meta.json`'s `weights` too, and its `buffers/<name>.bin` is an all-zero blob, so
+        // `new()`'s weight loop zeroes them and syncs once. This per-request pass exists only to
+        // stop request N+1 from seeing request N's history.
+        //
+        // Whether it is NEEDED is a question about the mask, not about the cache: `sm_mask` is
+        // written as `n_past + 1` and the attention masks every position at or beyond it to -inf,
+        // so stale entries past the current position should contribute nothing. If that holds, this
+        // is 224 MiB of host memset plus an arena write per request at S=2048 (56 at S=512) that
+        // buys nothing -- and it is a per-REQUEST cost, so it hurts short generations most.
+        //
+        // NPU_LLM_REUSE_KV=1 skips it, to measure exactly that. Left opt-in until the correctness
+        // A/B below is run on more than one shape: masked-out garbage is only harmless while it is
+        // FINITE (a stale inf or NaN would survive `0 * v`), and load-time zeroing is what
+        // guarantees that -- so this is safe to reuse but NOT safe to skip at load.
+        if std::env::var("NPU_LLM_REUSE_KV").ok().as_deref() == Some("1") {
+            return Ok(());
+        }
         for name in &self.artifact.cache_buffers {
             let loc = self.artifact.loc(name);
             self.arena
