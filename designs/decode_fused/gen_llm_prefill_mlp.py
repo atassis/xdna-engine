@@ -57,6 +57,16 @@ def bf16(a):
     return np.asarray(a).astype(BF16)
 
 
+# The GEMM's NUMERICS, which the registry keys on and which decide whether this block can pass the
+# tier-1 tolerance gate at all. Measured on device 2026-09-08 against a float64 reference on layer-0
+# V: the M=1 GEMV sits at 1.658e-3, the batched GEMM at 4.332e-3 with these OFF/ON and 1.219e-2 with
+# both ON (IRON's defaults). bfp16 costs accuracy here and buys nothing, because batched prefill is
+# movement-bound -- half the array costs 1.189x. AMD ships bfp16 ON for their shapes, which are
+# compute-bound at 3B/2048; ours are not, so the right answer differs.
+EMULATE = os.environ.get("PREFILL_BFP16", "0") == "1"
+PRIO_ACC = os.environ.get("PREFILL_ACC", "1") == "1"
+
+
 def pick_tiles(batch, shapes):
     """The registry's tiling for every GEMM this block builds, checked where the shape is picked.
 
@@ -69,7 +79,8 @@ def pick_tiles(batch, shapes):
     reg = registry()
     out = {}
     for label, K, N in shapes:
-        ch = reg.lookup(batch, K, N, b_col_maj=True, label=label)
+        ch = reg.lookup(batch, K, N, b_col_maj=True, label=label,
+                        emulate=EMULATE, prio_accuracy=PRIO_ACC)
         out[label] = ch
     return out
 
@@ -111,8 +122,12 @@ def main():
     op_norm = RMSNorm(size=M * D, num_aie_columns=COLS, num_channels=1, tile_size=D,
                       weighted=True, epsilon=sp.eps, context=ctx)
     # shared by gate and up: same shape, one design, one registry entry
-    op_gu = GEMM(M=M, K=D, N=FF, b_col_maj=True, context=ctx, **ch["gate_up"].gemm_kwargs)
-    op_down = GEMM(M=M, K=FF, N=D, b_col_maj=True, context=ctx, **ch["down"].gemm_kwargs)
+    gemm_num = dict(emulate_bf16_mmul_with_bfp16=EMULATE, prio_accuracy=PRIO_ACC,
+                    round_conv_even=True)
+    op_gu = GEMM(M=M, K=D, N=FF, b_col_maj=True, context=ctx, **ch["gate_up"].gemm_kwargs,
+                 **gemm_num)
+    op_down = GEMM(M=M, K=FF, N=D, b_col_maj=True, context=ctx, **ch["down"].gemm_kwargs,
+                   **gemm_num)
     op_silu = SiLU(size=M * FF, num_aie_columns=COLS, tile_size=FF // COLS, context=ctx)
     op_mul = ElementwiseMul(size=M * FF, num_aie_columns=COLS, tile_size=FF // COLS, context=ctx)
 
@@ -130,7 +145,8 @@ def main():
 
     tile_sig = "_".join(f"{k}{c.tile_m}x{c.tile_k}x{c.tile_n}c{c.cols}"
                         for k, c in sorted(ch.items()))
-    fused = OperatorSequence(f"prefill_mlp_{sp.name}_m{M}_c{COLS}_l{a.layer}_{tile_sig}", rl,
+    fused = OperatorSequence(f"prefill_mlp_{sp.name}_m{M}_c{COLS}_l{a.layer}_{tile_sig}"
+                             f"_bfp{int(EMULATE)}_acc{int(PRIO_ACC)}", rl,
                              input_args=["x"], output_args=["out"], context=ctx,
                              share_designs=True)
     fused.compile()
