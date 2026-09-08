@@ -67,6 +67,7 @@ fn run(cli: &Cli, path: &Path) -> Result<()> {
         Cmd::Unload { model, port } => unload_model(&path, model, *port),
         Cmd::Bake { name } => bake(&path, name),
         Cmd::Config { action } => config_cmd(&path, action),
+        Cmd::Flags { json } => flags_cmd(*json),
         Cmd::Weights { action } => weights_cmd(&path, action),
         Cmd::Doctor { json } => doctor::doctor(&cli, *json),
         Cmd::Completions { shell } => {
@@ -857,6 +858,43 @@ fn config_cmd(path: &Path, action: &ConfigCmd) -> Result<()> {
     // The file is desired state; the running service only picks it up when asked.
     if matches!(action, ConfigCmd::Pin { .. } | ConfigCmd::Unpin { .. } | ConfigCmd::Set { .. }) {
         println!("run `npu reload` to apply this to a running server");
+    }
+    Ok(())
+}
+
+/// Every registered `NPU_*`/related env var against the LIVE process environment: whether it is
+/// currently set, its raw value if so, its truth semantics, and what it does.
+///
+/// `npu_runtime::env_flags::FLAGS` is the single source; this only renders it. Reads with
+/// `var_os` (not `var`) so presence is detected independent of UTF-8 validity, matching the
+/// `Presence`/`IsOk`/`NotZero` sites themselves.
+fn flags_cmd(as_json: bool) -> Result<()> {
+    if as_json {
+        let rows: Vec<_> = npu_runtime::env_flags::FLAGS.iter().map(|f| {
+            let raw = std::env::var_os(f.name);
+            serde_json::json!({
+                "name": f.name,
+                "owner": f.owner,
+                "site": f.site,
+                "semantics": f.semantics.code(),
+                "semantics_rule": f.semantics.describe(),
+                "default": f.default,
+                "set": raw.is_some(),
+                "value": raw.map(|v| v.to_string_lossy().into_owned()),
+                "doc": f.doc,
+            })
+        }).collect();
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+        return Ok(());
+    }
+    for f in npu_runtime::env_flags::FLAGS {
+        let raw = std::env::var_os(f.name);
+        let (source, value) = match &raw {
+            Some(v) => ("env", v.to_string_lossy().into_owned()),
+            None => ("default", format!("(default: {})", f.default)),
+        };
+        println!("{:<32} {:<8} {:<28} {:<10} {}", f.name, source, value, f.semantics.code(), f.owner);
+        println!("    {}", f.doc);
     }
     Ok(())
 }

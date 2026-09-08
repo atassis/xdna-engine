@@ -2,6 +2,7 @@
 //! behind a single device actor. Public: `Config`, `Handle`, `start`, `ModelStatus`.
 pub mod config;
 pub mod config_doc;
+pub mod env_flags;
 pub mod loader;
 pub mod registry;
 pub mod status_file;

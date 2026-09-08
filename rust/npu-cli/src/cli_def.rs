@@ -158,6 +158,16 @@ pub enum Cmd {
         /// Machine-readable output.
         #[arg(long)] json: bool,
     },
+    /// List every `NPU_*`/related env var the engine reads, with its LIVE value and source.
+    ///
+    /// A third configuration plane alongside `engine.toml` and these CLI flags: vars read directly
+    /// by `env::var`/`var_os` across the shipped crates, none of them visible in `engine.toml` or
+    /// `--help`. This is that registry (`npu_runtime::env_flags::FLAGS`) rendered against the
+    /// current process environment -- report-only, changes nothing.
+    Flags {
+        /// Machine-readable output.
+        #[arg(long)] json: bool,
+    },
 }
 
 /// Sampling flags shared by `generate` and `chat`. `None` means "use the engine default"
