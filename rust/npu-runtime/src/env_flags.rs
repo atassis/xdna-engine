@@ -87,13 +87,21 @@ use Semantics::*;
 /// The full census, in crate order. See the module doc for what is deliberately excluded.
 pub const FLAGS: &[Flag] = &[
     // -- npu-engine: llm decode ------------------------------------------------------------------
-    Flag { name: "NPU_LLM_REUSE_KV", owner: "npu-engine", site: "npu-engine/src/llm/npu_decode.rs:198",
+    Flag { name: "NPU_LLM_REUSE_KV", owner: "npu-engine", site: "npu-engine/src/llm/npu_decode.rs:301",
         semantics: NotZero, default: "true",
         doc: "reuse the KV-cache buffers across requests instead of re-zeroing them each time. \
               Default ON: the buffers are zeroed explicitly at load and sm_mask excludes every \
               position at or beyond n_past, so the per-request pass cost 224 MiB of host memset \
               plus an arena write (~60 ms/request at S=2048) and changed no output. Set =0 to \
               restore it when bisecting a suspected KV bug." },
+    Flag { name: "NPU_LLM_PREFILL_BATCHED", owner: "npu-engine", site: "npu-engine/src/llm/npu_prefill.rs:56",
+        semantics: NotZero, default: "true",
+        doc: "prime the KV cache over a prompt in batches of the prefill artifact's dims.M instead \
+              of one dispatch per token. No effect unless the scenario names artifacts.prefill -- \
+              without that artifact there is no batched ELF and the flag reads on a path that does \
+              not exist. Set =0 for the A/B control behind every prefill measurement, and to \
+              bisect a batched prompt that disagrees with P sequential steps. Both arms are \
+              device-only: this is a step within the tier ladder, never a fall to host." },
 
     // -- npu-asr-host --------------------------------------------------------------------------
     Flag { name: "NPU_PAR_SUBSAMPLE", owner: "npu-asr-host", site: "npu-asr-host/src/lib.rs:507",

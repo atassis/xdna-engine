@@ -37,6 +37,27 @@ pub trait DecodeStep {
         None
     }
 
+    /// The batch one dispatch of this backend's prefill ELF covers, or `None` when it has no
+    /// batched-prefill path (every host backend, and a device backend loaded without a prefill
+    /// artifact or with `NPU_LLM_PREFILL_BATCHED=0`). The generator uses it to decide whether a
+    /// prompt is long enough to be worth the padding, so a backend that returns `None` behaves
+    /// exactly as this rail did before prefill existed.
+    fn prefill_batch(&self) -> Option<usize> {
+        None
+    }
+
+    /// Prime the KV cache for `tokens` at positions `[0, tokens.len())` in batches of
+    /// [`prefill_batch`](DecodeStep::prefill_batch), and return how many positions were primed.
+    ///
+    /// Returning fewer than `tokens.len()` (including 0) is legal and is how a backend declines:
+    /// the caller resumes the per-token loop at the returned position. It produces no logits --
+    /// prefill's product is the KV cache -- so the caller must keep at least the prompt's LAST
+    /// token for [`step`](DecodeStep::step), which is what it samples from.
+    fn prefill(&mut self, tokens: &[u32]) -> Result<usize, EngineError> {
+        let _ = tokens;
+        Ok(0)
+    }
+
     /// Per-generation device accounting, or `None` when the backend has none or it is not enabled.
     /// Emitted by [`LlmGenerator::generate`] after the loop, paired with [`DecodeStep::reset`]
     /// before it, so the numbers cover exactly one generation. A host-side backend returns `None`;
@@ -79,17 +100,34 @@ pub fn tokenize_prompt(
 pub struct ScriptedDecodeStep {
     steps: VecDeque<Vec<f32>>,
     max_context: Option<usize>,
+    prefill_batch: Option<usize>,
+    /// Every `prefill()` call's token count, in order. The batched path produces no logits, so a
+    /// test cannot see it in the output at all -- this is what makes "did the generator take it,
+    /// and with how much of the prompt" observable without a device.
+    pub prefill_calls: Vec<usize>,
 }
 
 impl ScriptedDecodeStep {
     pub fn new(steps: Vec<Vec<f32>>) -> Self {
-        ScriptedDecodeStep { steps: steps.into(), max_context: None }
+        ScriptedDecodeStep {
+            steps: steps.into(),
+            max_context: None,
+            prefill_batch: None,
+            prefill_calls: Vec::new(),
+        }
     }
 
     /// Give the mock a finite KV window, so the bound in [`LlmGenerator::generate`] is testable
     /// without a device.
     pub fn with_max_context(mut self, max_context: usize) -> Self {
         self.max_context = Some(max_context);
+        self
+    }
+
+    /// Give the mock a batched-prefill path of batch `m`, so [`LlmGenerator::generate`]'s threshold
+    /// and its handoff back to the per-token loop are testable without a device.
+    pub fn with_prefill_batch(mut self, m: usize) -> Self {
+        self.prefill_batch = Some(m);
         self
     }
 }
@@ -101,6 +139,15 @@ impl DecodeStep for ScriptedDecodeStep {
 
     fn max_context(&self) -> Option<usize> {
         self.max_context
+    }
+
+    fn prefill_batch(&self) -> Option<usize> {
+        self.prefill_batch
+    }
+
+    fn prefill(&mut self, tokens: &[u32]) -> Result<usize, EngineError> {
+        self.prefill_calls.push(tokens.len());
+        Ok(tokens.len())
     }
 }
 
@@ -124,7 +171,28 @@ impl<D: DecodeStep> LlmGenerator<D> {
         self.scenario_defaults = d;
         self
     }
+
+    /// The decode backend, for callers that need to read what it recorded (the scripted mock's
+    /// `prefill_calls`, a device backend's artifact dims).
+    pub fn backend(&self) -> &D {
+        &self.decode
+    }
 }
+
+/// How many WHOLE batches of prompt the batched-prefill path must have before it is taken.
+///
+/// A prefill dispatch always costs a padded chunk of `M` positions whatever the prompt length, so
+/// below one full chunk the batched path pays for rows it never uses while the per-token path pays
+/// only for what it primes. One chunk is the smallest threshold that cannot lose: at `n >= M` the
+/// batched path issues at most `ceil(n/M)` dispatches against the per-token path's `n`, and
+/// `ceil(n/M) <= n` for every `n >= 1`.
+///
+/// It is deliberately NOT tuned below that. The break-even in TIME is unmeasured on a whole-stack
+/// prefill ELF -- the MLP brick alone measured a 1.8-2.0 ms per-dispatch cost at M=256, and a whole
+/// layer stack is not that -- so a smaller threshold would be a guess dressed as a constant. Raise
+/// or lower it from a measured pair (batched vs per-token at the same prompt, alternated), not from
+/// this comment.
+const PREFILL_MIN_CHUNKS: usize = 1;
 
 /// A seed for when the caller does not ask for reproducibility. Not cryptographic -- just distinct
 /// across requests so "no seed" does not silently mean "the same sequence every time", which
@@ -182,10 +250,20 @@ impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
         let mut detok = IncrementalDetokenizer::new();
         let mut stopper = StopMatcher::new(params.stop.clone());
 
-        // Prime the KV cache over the prompt, one dispatch per token; only the last position's
-        // logits are sampled from.
+        // Prime the KV cache over the prompt. The last position always goes through `step`,
+        // because only `step` returns logits and those are what the first `sample()` reads; every
+        // position before it is a pure KV side effect, which is exactly what the batched path
+        // produces. `primed <= prompt_ids.len() - 1` therefore holds by construction and the loop
+        // below always runs at least once.
+        let batchable = prompt_ids.len() - 1;
+        let mut primed = 0usize;
+        if let Some(m) = self.decode.prefill_batch() {
+            if batchable >= m * PREFILL_MIN_CHUNKS {
+                primed = self.decode.prefill(&prompt_ids[..batchable])?;
+            }
+        }
         let mut logits = Vec::new();
-        for (i, &tok) in prompt_ids.iter().enumerate() {
+        for (i, &tok) in prompt_ids.iter().enumerate().skip(primed) {
             logits = self.decode.step(tok, i)?;
         }
 
@@ -442,6 +520,97 @@ mod tests {
         let (_, reason, _) =
             gen.generate_to_string(&Prompt::Raw("hello".to_string()), &params).unwrap();
         assert_eq!(reason, FinishReason::Stop);
+    }
+
+    // ------------------------------------------------------------------------------------
+    // Batched prefill wiring. The batched path returns no logits, so nothing about it is visible
+    // in the generated text -- these assert on the script the per-token loop still consumes and on
+    // the mock's recorded prefill calls.
+    // ------------------------------------------------------------------------------------
+
+    #[test]
+    fn a_prompt_of_at_least_one_batch_is_primed_by_prefill_except_its_last_token() {
+        let cfg = build_cfg(None);
+        // "hello world foo bar" -- 4 prompt tokens against a batch of 2. Prefill takes the first
+        // three; only position 3 goes through `step`, so the script needs exactly two entries (the
+        // priming step at position 3, then one more after the first accepted token).
+        let peak = |id: usize| { let mut v = vec![0.0; 7]; v[id] = 9.0; v };
+        let decode = ScriptedDecodeStep::new(vec![peak(2), peak(4)]).with_prefill_batch(2);
+        let mut gen = LlmGenerator::new(cfg, decode);
+        let params = GenerateParams { max_tokens: Some(50), temperature: Some(0.0), ..GenerateParams::default() };
+        let (text, reason, usage) =
+            gen.generate_to_string(&Prompt::Raw("hello world foo bar".to_string()), &params).unwrap();
+        assert_eq!(gen.backend().prefill_calls, vec![3], "prefill takes the prompt minus its last token");
+        assert_eq!(usage.prompt_tokens, 4);
+        assert_eq!(text, "world");
+        assert_eq!(reason, FinishReason::Stop);
+    }
+
+    #[test]
+    fn a_prompt_shorter_than_one_batch_keeps_the_per_token_path() {
+        let cfg = build_cfg(None);
+        // 3 prompt tokens, batch 4: 2 batchable positions is under one chunk, so priming a whole
+        // padded chunk would pay for rows it never uses. All three positions go through `step`.
+        let peak = |id: usize| { let mut v = vec![0.0; 7]; v[id] = 9.0; v };
+        let decode = ScriptedDecodeStep::new(vec![peak(0), peak(0), peak(2), peak(4)]).with_prefill_batch(4);
+        let mut gen = LlmGenerator::new(cfg, decode);
+        let params = GenerateParams { max_tokens: Some(50), temperature: Some(0.0), ..GenerateParams::default() };
+        let (text, _, usage) =
+            gen.generate_to_string(&Prompt::Raw("hello world foo".to_string()), &params).unwrap();
+        assert!(gen.backend().prefill_calls.is_empty(), "under one chunk, the batched path is not taken");
+        assert_eq!(usage.prompt_tokens, 3);
+        assert_eq!(text, "world");
+    }
+
+    #[test]
+    fn a_backend_with_no_batched_path_primes_exactly_as_before() {
+        let cfg = build_cfg(None);
+        // prefill_batch() defaults to None, so the priming loop is byte-for-byte the old one: four
+        // script entries consumed for a four-token prompt.
+        let peak = |id: usize| { let mut v = vec![0.0; 7]; v[id] = 9.0; v };
+        let decode = ScriptedDecodeStep::new(vec![peak(0), peak(0), peak(0), peak(2), peak(4)]);
+        assert!(decode.prefill_batch().is_none());
+        let mut gen = LlmGenerator::new(cfg, decode);
+        let params = GenerateParams { max_tokens: Some(50), temperature: Some(0.0), ..GenerateParams::default() };
+        let (text, _, usage) =
+            gen.generate_to_string(&Prompt::Raw("hello world foo bar".to_string()), &params).unwrap();
+        assert_eq!(usage.prompt_tokens, 4);
+        assert_eq!(text, "world");
+    }
+
+    #[test]
+    fn the_last_prompt_token_always_goes_through_step_even_at_an_exact_multiple() {
+        let cfg = build_cfg(None);
+        // 4 prompt tokens, batch 1: prefill could cover all four, and must not -- only `step`
+        // returns logits and the first sample() reads them. It takes three.
+        let peak = |id: usize| { let mut v = vec![0.0; 7]; v[id] = 9.0; v };
+        let decode = ScriptedDecodeStep::new(vec![peak(2), peak(4)]).with_prefill_batch(1);
+        let mut gen = LlmGenerator::new(cfg, decode);
+        let params = GenerateParams { max_tokens: Some(50), temperature: Some(0.0), ..GenerateParams::default() };
+        let (text, _, _) =
+            gen.generate_to_string(&Prompt::Raw("hello world foo bar".to_string()), &params).unwrap();
+        assert_eq!(gen.backend().prefill_calls, vec![3]);
+        assert_eq!(text, "world", "the sampled logits came from step(pos=3), not from prefill");
+    }
+
+    #[test]
+    fn a_backend_that_declines_prefill_falls_back_with_no_positions_skipped() {
+        // What `NPU_LLM_PREFILL_BATCHED=0` and a missing prefill artifact both look like from here:
+        // `prefill_batch()` is Some, `prefill()` primes 0, and the per-token loop covers everything.
+        struct Declining(ScriptedDecodeStep);
+        impl DecodeStep for Declining {
+            fn step(&mut self, t: u32, p: usize) -> Result<Vec<f32>, EngineError> { self.0.step(t, p) }
+            fn prefill_batch(&self) -> Option<usize> { Some(1) }
+            fn prefill(&mut self, _tokens: &[u32]) -> Result<usize, EngineError> { Ok(0) }
+        }
+        let peak = |id: usize| { let mut v = vec![0.0; 7]; v[id] = 9.0; v };
+        let decode = Declining(ScriptedDecodeStep::new(vec![peak(0), peak(0), peak(2), peak(4)]));
+        let mut gen = LlmGenerator::new(build_cfg(None), decode);
+        let params = GenerateParams { max_tokens: Some(50), temperature: Some(0.0), ..GenerateParams::default() };
+        let (text, _, usage) =
+            gen.generate_to_string(&Prompt::Raw("hello world foo".to_string()), &params).unwrap();
+        assert_eq!(usage.prompt_tokens, 3);
+        assert_eq!(text, "world");
     }
 
     #[test]

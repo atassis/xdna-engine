@@ -219,6 +219,13 @@ pub struct Artifacts {
     /// `buffers/`), read through `llm::LlmArtifact`. Every other scenario kind leaves this empty.
     #[serde(default)]
     pub decode: String,
+    /// `kind = "generate"`, optional: directory holding a batched-prefill ELF for the SAME model,
+    /// generated to share `decode`'s arena layout. Set it and prompt priming runs `dims.M` positions
+    /// per dispatch instead of one; leave it empty (the default) and the rail is exactly the
+    /// per-token path. The two artifacts' shared arena offsets are checked at load, so a mismatched
+    /// pair fails loud rather than corrupting the weights.
+    #[serde(default)]
+    pub prefill: String,
     /// `kind = "generate"` only: the checkpoint's directory (`tokenizer.json`,
     /// `tokenizer_config.json`, `generation_config.json`), read through `llm::ModelConfig::load`.
     /// Separate from `tokenizer` above, which every other scenario points at a single

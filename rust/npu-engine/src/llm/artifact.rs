@@ -48,10 +48,33 @@ pub enum EmbedScale {
     SqrtDModel,
 }
 
+/// Which half of the LLM rail an artifact drives.
+///
+/// A decode artifact declares one position per dispatch, an output the host samples from, and every
+/// model constant it needs. A prefill artifact declares `dims.M` positions per dispatch and is
+/// deliberately allowed to omit the model constants the DECODE half is the authority for: it runs
+/// only as one half of a checked pair, and inheriting them is what keeps the pair from carrying two
+/// copies of a number that must agree ([`LlmArtifact::check_prefill_pairing`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArtifactRole {
+    Decode,
+    Prefill,
+}
+
+/// Which RoPE angle table a declared input buffer holds. Gemma-3 interleaves local and global
+/// attention layers and the ELF reads a separate table for each; a global-only model (Qwen3) has
+/// one, and may name it either `rope_global` or `rope`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RopeBase {
+    Global,
+    Local,
+}
+
 /// A validated, ready-to-drive fused decode ELF: every buffer the artifact declares has a checked
 /// location, and the scratchpad protocol (`kv_off`/`sm_mask`) is resolved to concrete offsets.
 #[derive(Debug)]
 pub struct LlmArtifact {
+    pub role: ArtifactRole,
     pub decode_dir: PathBuf,
     pub elf_name: String,
     pub kernel_name: String,
@@ -60,7 +83,11 @@ pub struct LlmArtifact {
     pub scratch_size: usize,
     pub layout: HashMap<String, BufLoc>,
     pub weights: Vec<String>,
-    pub output: String,
+    /// The buffer the host reads after a dispatch. `None` on a prefill artifact: prefill's whole
+    /// product is the KV cache it leaves in scratch, so it declares no output and the host reads
+    /// nothing back. Required on a decode artifact -- one whose logits buffer cannot be located is
+    /// not drivable at all.
+    pub output: Option<String>,
     /// `meta.json`'s `cache_buffers` -- the KV-cache scratch buffers a fresh generation must
     /// re-zero (`NpuDecodeStep::reset`). Absent (empty) is legal: a model with no on-device cache
     /// buffer still validates.
@@ -68,10 +95,19 @@ pub struct LlmArtifact {
     /// `meta.json`'s `embed_blob`; see [`Self::embed_blob`]. `None` in pre-2026-09-08 artifacts.
     pub embed_blob: Option<String>,
     pub kv_off: ScratchpadParam,
-    pub sm_mask: ScratchpadParam,
+    /// The causal-width parameter. Required on a decode artifact. `None` on a prefill artifact
+    /// whose graph has no scalar causal width at all -- a non-causal bring-up build declares
+    /// `scratchpad.mask_param: null`, and there is then nothing for the host to write.
+    pub sm_mask: Option<ScratchpadParam>,
+    /// The declared input buffers holding RoPE angle tables, and which base each wants. Derived
+    /// from `inputs` rather than a literal `["rope_global", "rope_local"]`, which is what lets a
+    /// single-table prefill artifact name its buffer `rope` without a second code path.
+    pub rope_inputs: Vec<(String, RopeBase)>,
     pub head_dim: usize,
     pub d_model: usize,
-    pub vocab: usize,
+    /// `dims.vocab`. Required on a decode artifact -- it sizes the logits read and bounds the
+    /// embedding gather. `None` on a prefill artifact, which has no lm-head and emits no logits.
+    pub vocab: Option<usize>,
     pub n_layers: usize,
     /// `meta.json`'s `dims.S` -- how many token positions the on-device KV cache holds. `kc`/`vc`
     /// are `[Hkv, S, HD]`, so this is an exact capacity, not a hint, and it is a BUILD parameter:
@@ -82,8 +118,21 @@ pub struct LlmArtifact {
     /// position S lands on head 1's row 0 rather than outside the arena. An artifact that cannot
     /// say how big its window is cannot have that window enforced, so it fails to load instead.
     pub max_seq: usize,
-    pub embed_scale: EmbedScale,
-    pub rope_theta_global: f64,
+    /// `meta.json`'s `dims.M` -- how many token positions ONE dispatch of this ELF covers. 1 on a
+    /// decode artifact (absent from its meta, and the decode graph IS the M=1 instance of the
+    /// prefill graph); the batch on a prefill artifact, where it is required and where every
+    /// per-dispatch host buffer is sized by it.
+    pub batch: usize,
+    /// `host_protocol.embed_scale`. Required on a decode artifact. `None` on a prefill artifact that
+    /// does not declare it: the batched path gathers through the DECODE artifact's embedding table
+    /// and its scale, deliberately -- one gather function, so the two paths cannot drift on the
+    /// scale-then-narrow, which is exactly what the token-identity gate would report as a
+    /// divergence. A prefill artifact that DOES declare it must agree.
+    pub embed_scale: Option<EmbedScale>,
+    /// `host_protocol.rope_theta_global`. Required on a decode artifact. `None` on a prefill
+    /// artifact that does not declare it -- see [`Self::embed_scale`]; the angle rows are computed
+    /// from the decode half's base for the same reason.
+    pub rope_theta_global: Option<f64>,
     /// The LOCAL RoPE base, for models with interleaved local/global attention (Gemma-3). `None` on
     /// a global-only model (Qwen3), which is why it is optional rather than defaulted: the presence
     /// of this field is exactly what decides whether the artifact declares a `rope_local` input, so
@@ -112,6 +161,18 @@ impl LlmArtifact {
     /// Load and validate `decode_dir/meta.json`. `decode_dir` also holds `decode.elf` and
     /// `buffers/<name>.bin` for every name in `weights`.
     pub fn load(decode_dir: &Path) -> Result<LlmArtifact, EngineError> {
+        Self::load_role(decode_dir, ArtifactRole::Decode)
+    }
+
+    /// Load and validate a batched-prefill artifact. Same `meta.json` schema as a decode artifact,
+    /// with two role differences enforced here rather than assumed by the caller: `dims.M` is
+    /// required (it sizes every per-dispatch host write), and `output` is optional because prefill
+    /// produces no logits.
+    pub fn load_prefill(prefill_dir: &Path) -> Result<LlmArtifact, EngineError> {
+        Self::load_role(prefill_dir, ArtifactRole::Prefill)
+    }
+
+    fn load_role(decode_dir: &Path, role: ArtifactRole) -> Result<LlmArtifact, EngineError> {
         let meta_path = decode_dir.join("meta.json");
         let bytes = fs::read(&meta_path)
             .map_err(|e| EngineError::Load(format!("read {}: {e}", meta_path.display())))?;
@@ -145,7 +206,19 @@ impl LlmArtifact {
         let scratch_size = usz("scratch_size")?;
         let elf_name = str_field("elf")?;
         let kernel_name = str_field("kernel_name")?;
-        let output = str_field("output")?;
+        let output = match role {
+            ArtifactRole::Decode => Some(str_field("output")?),
+            // Present-and-null and absent are the same thing, matching how `rope_theta_local` is
+            // read below: a generator that emits every key for every role writes `null` here.
+            ArtifactRole::Prefill => match meta.get("output") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(v) => Some(
+                    v.as_str()
+                        .map(str::to_string)
+                        .ok_or_else(|| ctx("`output` present but non-string".to_string()))?,
+                ),
+            },
+        };
         let inputs = str_list("inputs")?;
         let weights = str_list("weights")?;
         let cache_buffers = meta.get("cache_buffers").map(|_| str_list("cache_buffers")).transpose()?.unwrap_or_default();
@@ -185,20 +258,44 @@ impl LlmArtifact {
         };
         let head_dim = dim("head_dim")?;
         let d_model = dim("d_model")?;
-        let vocab = dim("vocab")?;
+        // Prefill has no lm-head, so it has no vocabulary to declare. Decode reads its logits
+        // buffer against this and bounds the embedding gather with it, so there it is required.
+        let vocab = match role {
+            ArtifactRole::Decode => Some(dim("vocab")?),
+            ArtifactRole::Prefill => dims.get("vocab").and_then(|v| v.as_u64()).map(|v| v as usize),
+        };
         let n_layers = dim("layers")?;
         let max_seq = dim("S")?;
+        // `dims.M` is what makes a prefill artifact drivable: it sizes `x` and the RoPE angle
+        // block, it is the padded chunk width, and it is the batch the causal width is derived
+        // from. A decode artifact does not carry it and does not need to -- decode IS M=1.
+        let batch = match role {
+            ArtifactRole::Decode => 1,
+            ArtifactRole::Prefill => match dim("M") {
+                Ok(0) => return Err(ctx("dims.M = 0".to_string())),
+                other => other?,
+            },
+        };
 
-        let hp = meta.get("host_protocol").ok_or_else(|| ctx("missing top-level `host_protocol`".to_string()))?;
+        // Optional as a whole only for prefill, whose model constants come from the decode half.
+        static NO_HP: serde_json::Value = serde_json::Value::Null;
+        let hp = match role {
+            ArtifactRole::Decode => meta
+                .get("host_protocol")
+                .ok_or_else(|| ctx("missing top-level `host_protocol`".to_string()))?,
+            ArtifactRole::Prefill => meta.get("host_protocol").unwrap_or(&NO_HP),
+        };
         let embed_scale = match hp.get("embed_scale").and_then(|v| v.as_str()) {
-            Some("none") => EmbedScale::None,
-            Some("sqrt_d_model") => EmbedScale::SqrtDModel,
+            Some("none") => Some(EmbedScale::None),
+            Some("sqrt_d_model") => Some(EmbedScale::SqrtDModel),
+            None if role == ArtifactRole::Prefill => None,
             other => return Err(ctx(format!("host_protocol.embed_scale = {other:?}, want \"none\" or \"sqrt_d_model\""))),
         };
-        let rope_theta_global = hp
-            .get("rope_theta_global")
-            .and_then(|v| v.as_f64())
-            .ok_or_else(|| ctx("host_protocol.rope_theta_global missing/non-numeric".to_string()))?;
+        let rope_theta_global = match hp.get("rope_theta_global").and_then(|v| v.as_f64()) {
+            Some(t) => Some(t),
+            None if role == ArtifactRole::Prefill => None,
+            None => return Err(ctx("host_protocol.rope_theta_global missing/non-numeric".to_string())),
+        };
         // Absent on a global-only model; present and numeric, or the artifact is malformed. A
         // non-numeric value must not read as "global-only" -- that would silently drop the local
         // RoPE write and leave the local layers rotating at the wrong base.
@@ -219,10 +316,17 @@ impl LlmArtifact {
             .get("kv_param")
             .and_then(|v| v.as_str())
             .ok_or_else(|| ctx("scratchpad.kv_param missing".to_string()))?;
-        let mask_param_name = sp
-            .get("mask_param")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ctx("scratchpad.mask_param missing".to_string()))?;
+        // `null` is a real answer, not an omission: a non-causal prefill bring-up build has no
+        // scalar causal width to write. Decode always has one -- without it every position would
+        // attend the whole compiled window.
+        let mask_param_name = match sp.get("mask_param") {
+            Some(serde_json::Value::Null) | None if role == ArtifactRole::Prefill => None,
+            other => Some(
+                other
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| ctx("scratchpad.mask_param missing".to_string()))?,
+            ),
+        };
         let read_param = |name: &str| -> Result<ScratchpadParam, EngineError> {
             let p = sp_params.get(name).ok_or_else(|| ctx(format!("scratchpad.params has no entry `{name}`")))?;
             let byte_offset = p
@@ -237,7 +341,22 @@ impl LlmArtifact {
             Ok(ScratchpadParam { byte_offset, core })
         };
         let kv_off = read_param(kv_param_name)?;
-        let sm_mask = read_param(mask_param_name)?;
+        let sm_mask = mask_param_name.map(read_param).transpose()?;
+
+        // The RoPE angle buffers, resolved from what the artifact DECLARES. `rope` and
+        // `rope_global` are the same thing under two spellings -- the decode generator emits the
+        // second, the prefill generator the first, and a single-table model has exactly one.
+        let mut rope_inputs: Vec<(String, RopeBase)> = Vec::new();
+        for n in &inputs {
+            match n.as_str() {
+                "rope" | "rope_global" => rope_inputs.push((n.clone(), RopeBase::Global)),
+                "rope_local" => rope_inputs.push((n.clone(), RopeBase::Local)),
+                // Anything else is caught by `check_per_token_writes`, which compares the input
+                // arena against the write list this derives -- so an unrecognised input buffer is
+                // reported as an unwritten one rather than skipped here in silence.
+                _ => {}
+            }
+        }
 
         // Compat shim, narrow and logged: ONLY for `rope_global` immediately following `x`, the exact
         // shape `gen_llm_decode.py` currently emits. Any other gap still fails loud below.
@@ -245,7 +364,7 @@ impl LlmArtifact {
             let x = *layout
                 .get("x")
                 .ok_or_else(|| ctx("rope_global compat shim needs `x`'s layout entry, and it is ALSO missing -- refusing to guess".to_string()))?;
-            let len = head_dim * 2; // bf16 bytes
+            let len = batch * head_dim * 2; // bf16 bytes, one angle row per position in the batch
             let off = x.off + x.len;
             if off + len > input_size {
                 return Err(ctx(format!(
@@ -269,7 +388,7 @@ impl LlmArtifact {
         let mut missing: Vec<&str> = inputs
             .iter()
             .chain(weights.iter())
-            .chain(std::iter::once(&output))
+            .chain(output.iter())
             .map(String::as_str)
             .filter(|n| !layout.contains_key(*n))
             .collect();
@@ -310,6 +429,24 @@ impl LlmArtifact {
             }
         }
 
+        // A prefill dispatch's host writes are all `dims.M` rows wide, so a layout that disagrees
+        // with `dims.M` means the host would either short-write the tail rows (garbage KV, no
+        // error) or overrun into the next input buffer. Checked for the prefill role only: the
+        // decode artifacts already in the field are not re-validated by this change.
+        if role == ArtifactRole::Prefill {
+            let rope_names = rope_inputs.iter().map(|(n, _)| (n.as_str(), head_dim, "head_dim"));
+            for (name, unit, what) in std::iter::once(("x", d_model, "d_model")).chain(rope_names) {
+                let Some(loc) = layout.get(name) else { continue };
+                let want = batch * unit * 2;
+                if loc.len != want {
+                    return Err(ctx(format!(
+                        "layout[{name}].len = {} but dims.M({batch}) * {what}({unit}) * 2 = {want}",
+                        loc.len
+                    )));
+                }
+            }
+        }
+
         // Toolchain freshness: fail loud on an ACTIVE mismatch (the pin moved, nobody rebuilt this
         // artifact -- a stale ELF answers with a plausible WRONG token, silently). Anything short of a
         // confirmed mismatch is reported, never fatal -- a shipped consumer must not require
@@ -335,6 +472,7 @@ impl LlmArtifact {
         }
 
         Ok(LlmArtifact {
+            role,
             decode_dir: decode_dir.to_path_buf(),
             elf_name,
             kernel_name,
@@ -348,11 +486,13 @@ impl LlmArtifact {
             embed_blob,
             kv_off,
             sm_mask,
+            rope_inputs,
             head_dim,
             d_model,
             vocab,
             n_layers,
             max_seq,
+            batch,
             embed_scale,
             rope_theta_global,
             rope_theta_local,
@@ -412,6 +552,226 @@ impl LlmArtifact {
 
     pub fn loc(&self, name: &str) -> &BufLoc {
         &self.layout[name]
+    }
+
+    /// The declared output buffer, or a load-shaped error naming the artifact. Only a decode
+    /// artifact has one; a prefill artifact's product is the KV cache it leaves behind.
+    pub fn output_name(&self) -> Result<&str, EngineError> {
+        self.output.as_deref().ok_or_else(|| {
+            EngineError::Load(format!(
+                "{}: artifact declares no `output` buffer (role {:?})",
+                self.decode_dir.display(),
+                self.role
+            ))
+        })
+    }
+
+    /// The precondition for sharing ONE `FusedArena` between this artifact's ELF and `other`'s.
+    ///
+    /// Arena offsets in IRON are emergent from runlist order (`iron/common/sequence.py`'s
+    /// `add_buffers` packs input args, then output args, then every other buffer in first-appearance
+    /// order), so two independently generated graphs agreeing on where `L0_kc` lives is a property
+    /// of how they were built, never a guarantee. Both generators declaring the same
+    /// `scratch_order` is what makes it true; this is what makes it CHECKED, and it fails loud
+    /// naming the first divergent buffer rather than letting one ELF's weights land on the other's
+    /// KV cache.
+    ///
+    /// Three checks, in the order a divergence is most likely to appear:
+    ///
+    /// 1. every scratch buffer both artifacts name sits at the same `(offset, len)`;
+    /// 2. every one of this artifact's `cache_buffers` is declared by `other` at all -- prefill
+    ///    that does not name the cache decode reads is not writing it;
+    /// 3. no buffer `other` declares under a DIFFERENT name overlaps one of this artifact's
+    ///    weight/cache buffers.
+    ///
+    /// The input and output arenas are deliberately out of scope: both are rewritten by whichever
+    /// path is about to dispatch, and they legitimately differ in size (prefill's `x` is `M` rows).
+    ///
+    /// KNOWN GAP, and it is the generator's to close, not this function's: `meta.json` lists only
+    /// the buffers the graph DECLARES. IRON also packs undeclared launch-to-launch intermediates
+    /// into scratch, and those are invisible here -- check 3 can only see what is named. What keeps
+    /// them off the weights is `scratch_order` putting `[*weights, *caches]` in a common prefix.
+    pub fn check_shared_layout_agrees(&self, other: &LlmArtifact) -> Result<(), EngineError> {
+        let label = |a: &LlmArtifact| a.decode_dir.display().to_string();
+        let mine = label(self);
+        let theirs = label(other);
+
+        let mut shared: Vec<&str> = self
+            .layout
+            .keys()
+            .filter(|n| other.layout.contains_key(n.as_str()))
+            .map(String::as_str)
+            .filter(|n| self.loc(n).arena == Arena::Scratch || other.layout[*n].arena == Arena::Scratch)
+            .collect();
+        shared.sort_unstable();
+        for name in shared {
+            let a = *self.loc(name);
+            let b = other.layout[name];
+            if a != b {
+                return Err(EngineError::Load(format!(
+                    "shared-arena layout mismatch on `{name}`: {mine} places it at {:?}[{}, {}) \
+                     but {theirs} places it at {:?}[{}, {}) -- the two ELFs cannot share one arena; \
+                     regenerate both with the same declared scratch_order",
+                    a.arena, a.off, a.off + a.len, b.arena, b.off, b.off + b.len
+                )));
+            }
+        }
+
+        let mut absent: Vec<&str> =
+            self.cache_buffers.iter().map(String::as_str).filter(|n| !other.layout.contains_key(*n)).collect();
+        absent.sort_unstable();
+        if let Some(name) = absent.first() {
+            return Err(EngineError::Load(format!(
+                "{theirs} declares no buffer `{name}`, which {mine} lists in `cache_buffers` \
+                 ({} more missing) -- the two ELFs do not agree on the KV cache",
+                absent.len() - 1
+            )));
+        }
+
+        // Protected = everything this artifact needs to survive the other ELF running: its weights
+        // (which include the caches -- the generator lists a cache buffer in both) and its caches.
+        let mut protected: Vec<(usize, usize, &str)> = self
+            .weights
+            .iter()
+            .chain(self.cache_buffers.iter())
+            .map(String::as_str)
+            .filter_map(|n| {
+                let l = self.layout.get(n)?;
+                (l.arena == Arena::Scratch).then_some((l.off, l.off + l.len, n))
+            })
+            .collect();
+        protected.sort_unstable();
+        protected.dedup();
+        let mut theirs_spans: Vec<(usize, usize, &str)> = other
+            .layout
+            .iter()
+            .filter(|(_, l)| l.arena == Arena::Scratch)
+            .map(|(n, l)| (l.off, l.off + l.len, n.as_str()))
+            .collect();
+        theirs_spans.sort_unstable();
+        for &(off, end, name) in &protected {
+            for &(o2, e2, n2) in &theirs_spans {
+                if n2 != name && o2 < end && off < e2 {
+                    return Err(EngineError::Load(format!(
+                        "shared-arena collision: {theirs}'s `{n2}` at scratch[{o2}, {e2}) overlaps \
+                         {mine}'s `{name}` at scratch[{off}, {end}) -- one ELF would overwrite the \
+                         other's weights or KV cache"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The input buffers the host rewrites before every dispatch: `x` plus whatever RoPE tables
+    /// this artifact declares. Derived, never a literal -- the list is model-shaped (Gemma-3 has a
+    /// third) and role-shaped (the prefill generator names its single table `rope`).
+    pub fn per_dispatch_writes(&self) -> Vec<&str> {
+        std::iter::once("x").chain(self.rope_inputs.iter().map(|(n, _)| n.as_str())).collect()
+    }
+
+    /// Each declared RoPE buffer paired with the angle base to fill it from, resolved ONCE at load
+    /// so no dispatch path carries a lookup or an unwrap. `bases` is the authority for the two
+    /// constants: for a decode artifact that is itself, and for a prefill artifact it is the decode
+    /// half of its pair -- prefill may leave them undeclared, and computing its angle rows from
+    /// anything but decode's base is what a disagreement would look like on device.
+    pub fn rope_writes(&self, bases: &LlmArtifact) -> Result<Vec<(BufLoc, f64)>, EngineError> {
+        self.rope_inputs
+            .iter()
+            .map(|(name, which)| {
+                let theta = match which {
+                    RopeBase::Global => bases.rope_theta_global,
+                    RopeBase::Local => bases.rope_theta_local,
+                };
+                let theta = theta.ok_or_else(|| {
+                    EngineError::Load(format!(
+                        "{}: declares input `{name}` but {} has no host_protocol base for {which:?}",
+                        self.decode_dir.display(),
+                        bases.decode_dir.display()
+                    ))
+                })?;
+                let loc = *self.layout.get(name).ok_or_else(|| {
+                    EngineError::Load(format!(
+                        "{}: input `{name}` has no layout entry",
+                        self.decode_dir.display()
+                    ))
+                })?;
+                Ok((loc, theta))
+            })
+            .collect()
+    }
+
+    /// The prefill/decode agreements a shared arena does not cover: everything that changes what
+    /// the KV bytes MEAN rather than where they sit. `self` is the decode half.
+    ///
+    /// Checked at the point the pair is formed (K007), each naming its own numbers, because none of
+    /// these produces an error on the device -- a disagreeing RoPE base or `S` yields a plausible
+    /// wrong token and nothing else.
+    pub fn check_prefill_pairing(&self, prefill: &LlmArtifact) -> Result<(), EngineError> {
+        let mut checks: Vec<(&str, usize, usize)> = vec![
+            // `S` is the head stride of the `[Hkv, S, HD]` cache, so a disagreement puts prefill's
+            // KV rows under decode's head boundaries -- in-arena, past every bounds check.
+            ("dims.S", self.max_seq, prefill.max_seq),
+            ("dims.head_dim", self.head_dim, prefill.head_dim),
+            ("dims.d_model", self.d_model, prefill.d_model),
+            ("dims.layers", self.n_layers, prefill.n_layers),
+        ];
+        // Optional on the prefill half (it has no lm-head), checked when declared.
+        if let (Some(d), Some(p)) = (self.vocab, prefill.vocab) {
+            checks.push(("dims.vocab", d, p));
+        }
+        for (what, d, p) in checks {
+            if d != p {
+                return Err(EngineError::Load(format!(
+                    "prefill/decode disagree on {what}: decode {d}, prefill {p}"
+                )));
+            }
+        }
+        // The model constants prefill may inherit rather than declare. Where it DOES declare one,
+        // it must agree -- a second copy of a number that must match is only useful if it is
+        // compared, and a disagreeing RoPE base produces plausible wrong text and nothing else.
+        if prefill.rope_theta_global.is_some() && self.rope_theta_global != prefill.rope_theta_global
+            || prefill.rope_theta_local.is_some() && self.rope_theta_local != prefill.rope_theta_local
+        {
+            return Err(EngineError::Load(format!(
+                "prefill/decode disagree on the RoPE base: decode ({:?}, {:?}), prefill ({:?}, {:?})",
+                self.rope_theta_global, self.rope_theta_local,
+                prefill.rope_theta_global, prefill.rope_theta_local
+            )));
+        }
+        if prefill.embed_scale.is_some() && self.embed_scale != prefill.embed_scale {
+            return Err(EngineError::Load(format!(
+                "prefill/decode disagree on host_protocol.embed_scale: decode {:?}, prefill {:?}",
+                self.embed_scale, prefill.embed_scale
+            )));
+        }
+        // Both halves must ask for the same RoPE tables, whatever they call the buffers. A prefill
+        // artifact declaring only a global table for a model with local layers would leave the
+        // local ones rotating at whatever its buffer last held.
+        let bases = |a: &LlmArtifact| {
+            let mut b: Vec<RopeBase> = a.rope_inputs.iter().map(|(_, r)| *r).collect();
+            b.sort_unstable_by_key(|r| *r as u8);
+            b
+        };
+        if bases(self) != bases(prefill) {
+            return Err(EngineError::Load(format!(
+                "prefill/decode declare different RoPE tables: decode {:?}, prefill {:?}",
+                self.rope_inputs, prefill.rope_inputs
+            )));
+        }
+        // The final chunk of a prompt is padded to `M`, so a prefill run covers `ceil(n/M)*M`
+        // positions. With `S % M == 0` that can never exceed `S` for any prompt the window already
+        // admits (`n <= S-1` => `ceil(n/M)*M <= S`), which is what lets the chunk loop skip a bound
+        // it could not act on anyway -- declining a long prompt after priming half of it is worse
+        // than refusing the pair at load.
+        if !self.max_seq.is_multiple_of(prefill.batch) {
+            return Err(EngineError::Load(format!(
+                "prefill batch M={} does not divide the KV window S={}: the padded final chunk \
+                 would write past the end of the cache for prompts near the window",
+                prefill.batch, self.max_seq
+            )));
+        }
+        Ok(())
     }
 
     /// Bidirectional companion to the missing-`layout`-entry check above (ported from
@@ -551,9 +911,9 @@ mod tests {
         write_meta(dir.path(), &meta);
         let art = LlmArtifact::load(dir.path()).unwrap();
         assert_eq!(art.head_dim, 4);
-        assert_eq!(art.embed_scale, EmbedScale::None);
+        assert_eq!(art.embed_scale, Some(EmbedScale::None));
         assert!(!art.kv_off.core);
-        assert!(art.sm_mask.core);
+        assert!(art.sm_mask.unwrap().core);
     }
 
     #[test]
@@ -743,6 +1103,348 @@ mod tests {
         // buffer the decoder does not handle, exactly the missing-write shape this guards.
         let err = art.check_per_token_writes(&["x", "rope_global"]).unwrap_err().to_string();
         assert!(err.contains("positions"), "{err}");
+    }
+
+    // ------------------------------------------------------------------------------------
+    // The prefill role, and the arena-sharing precondition. The check these exercise is the one
+    // thing standing between "two ELFs, one arena, one weight upload" and one graph's activations
+    // landing on the other's KV cache -- an offset in IRON is emergent from runlist order, so the
+    // two agreeing is a property of how they were generated and nothing in the artifacts asserts it.
+    // ------------------------------------------------------------------------------------
+
+    const D_MODEL: usize = 4;
+    const HEAD_DIM: usize = 4;
+
+    /// A decode/prefill `meta.json` PAIR whose scratch layouts agree: `W` at [0,16) and the cache
+    /// `L0_kc` at [16,32) in BOTH. Every test below is one deliberate mutation away from it.
+    ///
+    /// `W_head` at [32,48) is declared by the DECODE half only -- the lm-head, which prefill has no
+    /// use for (it needs logits at no position). That asymmetry is real and the fixture carries it,
+    /// because it is what makes the shared-name comparison insufficient on its own.
+    ///
+    /// The input arena deliberately does NOT agree: prefill's `x` is `M` rows and its `rope_global`
+    /// therefore starts elsewhere. That is legal and must stay legal -- each path rewrites the whole
+    /// input arena before its own dispatch -- so a check that demanded agreement there would refuse
+    /// every real pair.
+    fn pair_metas(m: usize) -> (serde_json::Value, serde_json::Value) {
+        let scratch = serde_json::json!({
+            "W": {"type": "scratch", "offset": 0, "len": 16},
+            "L0_kc": {"type": "scratch", "offset": 16, "len": 16},
+        });
+        let with_io = |x_len: usize, rope_len: usize, extra: serde_json::Value| {
+            let mut lay = scratch.clone();
+            lay.as_object_mut().unwrap().insert(
+                "x".into(),
+                serde_json::json!({"type": "input", "offset": 0, "len": x_len}),
+            );
+            lay.as_object_mut().unwrap().insert(
+                "rope_global".into(),
+                serde_json::json!({"type": "input", "offset": x_len, "len": rope_len}),
+            );
+            for (k, v) in extra.as_object().unwrap() {
+                lay.as_object_mut().unwrap().insert(k.clone(), v.clone());
+            }
+            lay
+        };
+        let common = |lay: serde_json::Value, input_size: usize| {
+            serde_json::json!({
+                "kernel_name": "main:sequence",
+                "input_size": input_size, "scratch_size": 48,
+                "layout": lay,
+                "inputs": ["x", "rope_global"],
+                "weights": ["W", "L0_kc"], "cache_buffers": ["L0_kc"],
+                "scratchpad": {
+                    "params": {"kv_off": {"byte_offset": 0, "kind": "addr"},
+                               "sm_mask": {"byte_offset": 4, "kind": "core"}},
+                    "kv_param": "kv_off", "mask_param": "sm_mask",
+                },
+                "dims": {"layers": 1, "d_model": D_MODEL, "vocab": 4, "head_dim": HEAD_DIM, "S": 8},
+                "host_protocol": {"embed_scale": "none", "rope_theta_global": 1_000_000.0},
+            })
+        };
+        let mut dec = common(with_io(D_MODEL * 2, HEAD_DIM * 2, serde_json::json!({
+            "logits": {"type": "output", "offset": 0, "len": 8},
+            "W_head": {"type": "scratch", "offset": 32, "len": 16},
+        })), D_MODEL * 2 + HEAD_DIM * 2);
+        dec["elf"] = serde_json::json!("decode.elf");
+        dec["output"] = serde_json::json!("logits");
+        dec["output_size"] = serde_json::json!(8);
+        dec["weights"] = serde_json::json!(["W", "L0_kc", "W_head"]);
+
+        let mut pre = common(with_io(m * D_MODEL * 2, m * HEAD_DIM * 2, serde_json::json!({})),
+                             m * (D_MODEL + HEAD_DIM) * 2);
+        pre["elf"] = serde_json::json!("prefill.elf");
+        pre["output_size"] = serde_json::json!(0);
+        pre["dims"]["M"] = serde_json::json!(m);
+        (dec, pre)
+    }
+
+    /// `(decode, prefill)` loaded from two temp dirs. The dirs are returned so they outlive the
+    /// artifacts' `decode_dir` paths.
+    fn load_pair(
+        dec: &serde_json::Value,
+        pre: &serde_json::Value,
+    ) -> (tempfile::TempDir, tempfile::TempDir, LlmArtifact, LlmArtifact) {
+        let (d, p) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        write_meta(d.path(), dec);
+        write_meta(p.path(), pre);
+        let da = LlmArtifact::load(d.path()).expect("decode half of the pair");
+        let pa = LlmArtifact::load_prefill(p.path()).expect("prefill half of the pair");
+        (d, p, da, pa)
+    }
+
+    #[test]
+    fn a_prefill_artifact_carries_its_batch_and_needs_no_output() {
+        let (dec, pre) = pair_metas(2);
+        let (_d, _p, da, pa) = load_pair(&dec, &pre);
+        assert_eq!(pa.role, ArtifactRole::Prefill);
+        assert_eq!(pa.batch, 2);
+        assert_eq!(pa.output, None, "prefill's product is the KV cache, not a buffer");
+        assert!(pa.output_name().is_err(), "asking for it must fail loud, not return a placeholder");
+        assert_eq!(da.batch, 1, "the decode graph IS the M=1 instance of the prefill graph");
+        assert_eq!(da.output.as_deref(), Some("logits"));
+    }
+
+    #[test]
+    fn a_decode_artifact_still_requires_its_output() {
+        let (mut dec, _) = pair_metas(2);
+        dec.as_object_mut().unwrap().remove("output");
+        let dir = tempfile::tempdir().unwrap();
+        write_meta(dir.path(), &dec);
+        let err = LlmArtifact::load(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("output"), "{err}");
+    }
+
+    #[test]
+    fn a_prefill_artifact_without_dims_m_fails_to_load() {
+        let (_, mut pre) = pair_metas(2);
+        pre["dims"].as_object_mut().unwrap().remove("M");
+        let dir = tempfile::tempdir().unwrap();
+        write_meta(dir.path(), &pre);
+        let err = LlmArtifact::load_prefill(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("dims.M"), "must name the missing field: {err}");
+    }
+
+    #[test]
+    fn a_prefill_input_buffer_sized_for_the_wrong_batch_fails_loud() {
+        // The silent failure this closes: `x` sized for M=1 while dims.M says 2 means the host
+        // writes 2 rows into a 1-row buffer -- an overrun into `rope_global`, no error, garbage KV.
+        let (_, mut pre) = pair_metas(2);
+        pre["layout"]["x"] = serde_json::json!({"type": "input", "offset": 0, "len": D_MODEL * 2});
+        let dir = tempfile::tempdir().unwrap();
+        write_meta(dir.path(), &pre);
+        let err = LlmArtifact::load_prefill(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("layout[x].len"), "{err}");
+        assert!(err.contains("dims.M(2)"), "must name the batch it disagrees with: {err}");
+    }
+
+    #[test]
+    fn an_agreeing_pair_passes_the_shared_arena_check() {
+        let (dec, pre) = pair_metas(2);
+        let (_d, _p, da, pa) = load_pair(&dec, &pre);
+        da.check_shared_layout_agrees(&pa).expect("the pair was generated to agree");
+        // Symmetric: neither side is privileged, so a caller may check in either direction.
+        pa.check_shared_layout_agrees(&da).expect("and in the other direction");
+    }
+
+    #[test]
+    fn a_weight_at_a_different_offset_fails_loud_naming_it() {
+        let (dec, mut pre) = pair_metas(2);
+        pre["layout"]["W"] = serde_json::json!({"type": "scratch", "offset": 16, "len": 16});
+        pre["layout"]["L0_kc"] = serde_json::json!({"type": "scratch", "offset": 0, "len": 16});
+        let (_d, _p, da, pa) = load_pair(&dec, &pre);
+        let err = da.check_shared_layout_agrees(&pa).unwrap_err().to_string();
+        assert!(err.contains("`W`") || err.contains("`L0_kc`"), "must name a divergent buffer: {err}");
+        assert!(err.contains("scratch_order"), "must say how to fix it: {err}");
+    }
+
+    #[test]
+    fn a_weight_of_a_different_length_fails_loud_naming_it() {
+        let (dec, mut pre) = pair_metas(2);
+        pre["layout"]["W"] = serde_json::json!({"type": "scratch", "offset": 0, "len": 8});
+        let (_d, _p, da, pa) = load_pair(&dec, &pre);
+        let err = da.check_shared_layout_agrees(&pa).unwrap_err().to_string();
+        assert!(err.contains("`W`"), "{err}");
+        assert!(err.contains("[0, 16)") && err.contains("[0, 8)"), "must name both extents: {err}");
+    }
+
+    #[test]
+    fn a_prefill_that_does_not_declare_the_kv_cache_fails_loud_naming_it() {
+        let (dec, mut pre) = pair_metas(2);
+        pre["layout"].as_object_mut().unwrap().remove("L0_kc");
+        pre["weights"] = serde_json::json!(["W"]);
+        pre["cache_buffers"] = serde_json::json!([]);
+        let (_d, _p, da, pa) = load_pair(&dec, &pre);
+        let err = da.check_shared_layout_agrees(&pa).unwrap_err().to_string();
+        assert!(err.contains("L0_kc"), "{err}");
+        assert!(err.contains("cache_buffers"), "{err}");
+    }
+
+    #[test]
+    fn a_differently_named_prefill_buffer_landing_on_a_weight_fails_loud_naming_both() {
+        // The failure a name-by-name comparison alone cannot see, and the one that actually
+        // corrupts: prefill's [M, FF] intermediate is bigger than decode's [FF] one, so a
+        // generator that packs by first-appearance rather than a declared scratch_order slides
+        // everything after it -- under a NEW name, so no shared name disagrees.
+        let (dec, mut pre) = pair_metas(2);
+        pre["layout"]["P0_h"] = serde_json::json!({"type": "scratch", "offset": 32, "len": 16});
+        let (_d, _p, da, pa) = load_pair(&dec, &pre);
+        let err = da.check_shared_layout_agrees(&pa).unwrap_err().to_string();
+        assert!(err.contains("P0_h"), "must name the intruder: {err}");
+        assert!(err.contains("W_head"), "and what it lands on: {err}");
+    }
+
+    #[test]
+    fn the_input_arena_is_allowed_to_disagree() {
+        // Prefill's `x` is M rows and its `rope_global` therefore starts elsewhere. Both paths
+        // rewrite the whole input arena before dispatching, so this is not a conflict -- and a
+        // check that flagged it would refuse every real pair.
+        let (dec, pre) = pair_metas(4);
+        let (_d, _p, da, pa) = load_pair(&dec, &pre);
+        assert_ne!(da.loc("rope_global"), pa.loc("rope_global"), "the fixture must actually differ");
+        da.check_shared_layout_agrees(&pa).expect("an input-arena difference is not a collision");
+    }
+
+    /// The shape `designs/decode_fused/gen_llm_prefill.py` emits, key for key, as of 2026-09-08 --
+    /// so that a generator change this loader cannot read shows up here rather than at model load.
+    /// It differs from a decode meta in five ways, and each one is a deliberate allowance above:
+    /// the RoPE input is `rope` (not `rope_global`), `dims` carries no `vocab`, `host_protocol`
+    /// carries prose rather than the two model constants, `mask_param` may be `null`, and the
+    /// weight blobs live in the decode artifact's `buffers/` (`weights_from`) rather than its own.
+    fn generator_shaped_prefill_meta(m: usize, mask_param: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "spec": "qwen3-0.6b", "elf": "prefill.elf", "kernel_name": "main:sequence",
+            "input_size": m * (D_MODEL + HEAD_DIM) * 2, "output_size": m * D_MODEL * 2,
+            "scratch_size": 48,
+            "layout": {
+                "x": {"type": "input", "offset": 0, "len": m * D_MODEL * 2},
+                "rope": {"type": "input", "offset": m * D_MODEL * 2, "len": m * HEAD_DIM * 2},
+                "xout": {"type": "output", "offset": 0, "len": m * D_MODEL * 2},
+                "W": {"type": "scratch", "offset": 0, "len": 16},
+                "L0_kc": {"type": "scratch", "offset": 16, "len": 16},
+            },
+            "inputs": ["x", "rope"], "output": "xout",
+            "weights": ["W", "L0_kc"],
+            "weights_from": "/somewhere/decode/buffers",
+            "cache_buffers": ["L0_kc"],
+            "arena_shared": true,
+            "scratchpad": {
+                "params": {"kv_off": {"byte_offset": 0, "kind": "addr"},
+                           "sm_mask": {"byte_offset": 4, "kind": "core"}},
+                "kv_param": "kv_off", "mask_param": mask_param,
+                "head_dim": HEAD_DIM, "kv_heads": 1,
+            },
+            "dims": {"layers": 1, "M": m, "S": 8, "d_model": D_MODEL, "ffn": 8,
+                     "q_heads": 1, "kv_heads": 1, "head_dim": HEAD_DIM, "q_dim": HEAD_DIM},
+            "host_protocol": {
+                "batch": m,
+                "x": "[M, D] bf16 token-major embeddings for this chunk",
+                "rope": "[M, HD] bf16, one row per absolute position base..base+M-1",
+                "kv_off": "base * head_dim, element units, addr kind, written raw",
+                "sm_mask": "base + M (core kind; the host writes it <<2)",
+            },
+        })
+    }
+
+    #[test]
+    fn the_generators_own_prefill_meta_loads_and_pairs() {
+        let (dec, _) = pair_metas(2);
+        let pre = generator_shaped_prefill_meta(2, serde_json::json!("sm_mask"));
+        let (_d, _p, da, pa) = load_pair(&dec, &pre);
+        assert_eq!(pa.batch, 2);
+        assert_eq!(pa.vocab, None, "prefill has no lm-head and declares no vocabulary");
+        assert_eq!(pa.embed_scale, None, "and inherits the scale from the decode half");
+        assert_eq!(pa.rope_theta_global, None);
+        assert_eq!(pa.per_dispatch_writes(), vec!["x", "rope"], "its angle buffer is named `rope`");
+        da.check_shared_layout_agrees(&pa).expect("shared scratch agrees");
+        da.check_prefill_pairing(&pa).expect("same model, same window");
+        // The inherited base is decode's, resolved once at load rather than looked up per dispatch.
+        let writes = pa.rope_writes(&da).expect("resolve the angle bases against the decode half");
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].0, *pa.loc("rope"));
+        assert_eq!(writes[0].1, da.rope_theta_global.unwrap());
+    }
+
+    #[test]
+    fn a_non_causal_prefill_build_declares_no_mask_param_and_still_loads() {
+        // `--causal none` is a real bring-up configuration and its graph has no scalar causal
+        // width, so there is nothing for the host to write. Decode has no such freedom.
+        let pre = generator_shaped_prefill_meta(2, serde_json::Value::Null);
+        let dir = tempfile::tempdir().unwrap();
+        write_meta(dir.path(), &pre);
+        assert!(LlmArtifact::load_prefill(dir.path()).unwrap().sm_mask.is_none());
+    }
+
+    #[test]
+    fn a_prefill_declaring_a_contradicting_constant_still_fails_loud() {
+        // Inheriting an UNDECLARED constant and accepting a DECLARED-but-different one are not the
+        // same allowance, and only the first is one.
+        let (dec, _) = pair_metas(2);
+        let mut pre = generator_shaped_prefill_meta(2, serde_json::json!("sm_mask"));
+        pre["host_protocol"]["rope_theta_global"] = serde_json::json!(10_000.0);
+        let (_d, _p, da, pa) = load_pair(&dec, &pre);
+        let err = da.check_prefill_pairing(&pa).unwrap_err().to_string();
+        assert!(err.contains("RoPE base"), "{err}");
+    }
+
+    #[test]
+    fn a_prefill_missing_a_rope_table_the_model_needs_fails_loud() {
+        // Gemma-3 declares two angle tables; a prefill half that declares one would leave the local
+        // layers rotating at whatever its buffer last held -- no error, wrong text.
+        let (mut dec, _) = pair_metas(2);
+        dec["host_protocol"]["rope_theta_local"] = serde_json::json!(10_000.0);
+        dec["inputs"] = serde_json::json!(["x", "rope_global", "rope_local"]);
+        dec["layout"]["rope_local"] =
+            serde_json::json!({"type": "input", "offset": (D_MODEL + HEAD_DIM) * 2, "len": HEAD_DIM * 2});
+        dec["input_size"] = serde_json::json!((D_MODEL + 2 * HEAD_DIM) * 2);
+        let pre = generator_shaped_prefill_meta(2, serde_json::json!("sm_mask"));
+        let (_d, _p, da, pa) = load_pair(&dec, &pre);
+        let err = da.check_prefill_pairing(&pa).unwrap_err().to_string();
+        assert!(err.contains("RoPE tables"), "{err}");
+    }
+
+    #[test]
+    fn an_agreeing_pair_passes_the_model_level_check_too() {
+        let (dec, pre) = pair_metas(2);
+        let (_d, _p, da, pa) = load_pair(&dec, &pre);
+        da.check_prefill_pairing(&pa).expect("same model, same window, M divides S");
+    }
+
+    #[test]
+    fn a_prefill_built_for_a_different_window_fails_loud() {
+        // S is the head stride of the [Hkv, S, HD] cache, so this is not a capacity difference --
+        // it puts prefill's rows under decode's head boundaries, in-arena and past every check.
+        let (dec, mut pre) = pair_metas(2);
+        pre["dims"]["S"] = serde_json::json!(4);
+        let (_d, _p, da, pa) = load_pair(&dec, &pre);
+        let err = da.check_prefill_pairing(&pa).unwrap_err().to_string();
+        assert!(err.contains("dims.S"), "{err}");
+        assert!(err.contains('8') && err.contains('4'), "must name both windows: {err}");
+    }
+
+    #[test]
+    fn a_prefill_rotating_at_a_different_rope_base_fails_loud() {
+        let (dec, mut pre) = pair_metas(2);
+        pre["host_protocol"]["rope_theta_global"] = serde_json::json!(10_000.0);
+        let (_d, _p, da, pa) = load_pair(&dec, &pre);
+        let err = da.check_prefill_pairing(&pa).unwrap_err().to_string();
+        assert!(err.contains("RoPE base"), "{err}");
+    }
+
+    #[test]
+    fn a_batch_that_does_not_divide_the_window_is_refused_at_load() {
+        // The failure it prevents happens only for prompts NEAR the window, so it would pass every
+        // short-prompt test and then write past the last row of the cache in production.
+        let (dec, mut pre) = pair_metas(2);
+        pre["dims"]["M"] = serde_json::json!(3);
+        pre["dims"]["S"] = serde_json::json!(8);
+        pre["layout"]["x"] = serde_json::json!({"type": "input", "offset": 0, "len": 3 * D_MODEL * 2});
+        pre["layout"]["rope_global"] =
+            serde_json::json!({"type": "input", "offset": 3 * D_MODEL * 2, "len": 3 * HEAD_DIM * 2});
+        pre["input_size"] = serde_json::json!(3 * (D_MODEL + HEAD_DIM) * 2);
+        let (_d, _p, da, pa) = load_pair(&dec, &pre);
+        let err = da.check_prefill_pairing(&pa).unwrap_err().to_string();
+        assert!(err.contains("M=3") && err.contains("S=8"), "must name both numbers: {err}");
     }
 
     #[test]
