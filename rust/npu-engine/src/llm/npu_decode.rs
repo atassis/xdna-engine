@@ -263,20 +263,38 @@ impl DecodeStep for NpuDecodeStep {
             .write_at(x_loc.arena, x_loc.off, x_bytes)
             .map_err(|e| EngineError::Device(format!("write x: {e}")))?;
 
-        let rope = rope_row(pos, self.artifact.head_dim, self.artifact.rope_theta_global);
+        // The row WIDTH comes from the buffer the artifact declares, not from a scalar head_dim.
+        // That is the number the ELF actually reads, so the two cannot drift apart -- and it makes
+        // the per-layer case free: Gemma-4-12B's global layers use head_dim 512 where its sliding
+        // layers use 256, so `rope_global` and `rope_local` must differ in WIDTH and not only in
+        // theta, which a single artifact.head_dim cannot express.
         let rope_loc = self.artifact.loc("rope_global");
+        let rope = rope_row(pos, rope_loc.len / 2, self.artifact.rope_theta_global);
+        // Cross-check against the SEPARATELY computed dims.head_dim, which is the only version of
+        // this number that can actually disagree. (Comparing the built byte count against
+        // rope_loc.len would be tautological -- the width is derived from that same len.) The
+        // check is skipped once geometry is per-layer, where no single head_dim is the right
+        // answer for both rows.
+        if self.artifact.kv_offs.len() == 1 && rope_loc.len != self.artifact.head_dim * 2 {
+            return Err(EngineError::Device(format!(
+                "rope_global buffer is {} bytes, but dims.head_dim = {} implies {} -- the \
+                 generator and the artifact disagree about the RoPE row width",
+                rope_loc.len, self.artifact.head_dim, self.artifact.head_dim * 2)));
+        }
+        let rope_bytes = pack_bf16_bytes(&rope);
         self.arena
-            .write_at(rope_loc.arena, rope_loc.off, &pack_bf16_bytes(&rope))
+            .write_at(rope_loc.arena, rope_loc.off, &rope_bytes)
             .map_err(|e| EngineError::Device(format!("write rope_global: {e}")))?;
 
         // Same row, different base. Gemma-3 interleaves local and global attention layers and the
         // ELF reads a separate angle table for each; a model without local layers has no such
         // buffer and this is skipped.
         if let Some(theta_local) = self.artifact.rope_theta_local {
-            let rope_l = rope_row(pos, self.artifact.head_dim, theta_local);
             let loc = self.artifact.loc("rope_local");
+            let rope_l = rope_row(pos, loc.len / 2, theta_local);
+            let rope_l_bytes = pack_bf16_bytes(&rope_l);
             self.arena
-                .write_at(loc.arena, loc.off, &pack_bf16_bytes(&rope_l))
+                .write_at(loc.arena, loc.off, &rope_l_bytes)
                 .map_err(|e| EngineError::Device(format!("write rope_local: {e}")))?;
         }
 
