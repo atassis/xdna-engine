@@ -95,19 +95,18 @@ pub const FLAGS: &[Flag] = &[
               plus an arena write (~60 ms/request at S=2048) and changed no output. Set =0 to \
               restore it when bisecting a suspected KV bug." },
     Flag { name: "NPU_LLM_PREFILL_BATCHED", owner: "npu-engine", site: "npu-engine/src/llm/npu_prefill.rs:66",
-        semantics: IsOne, default: "false",
+        semantics: NotZero, default: "true",
         doc: "prime the KV cache over a prompt in batches of the prefill artifact's dims.M instead \
-              of one dispatch per token. OPT-IN (=1), not not_zero, because the batched path does \
-              not yet pass its own gate: measured 2026-09-08 on device, batched and per-token \
-              priming agree on the first token at every prompt length tried but their step-0 \
-              logits differ by rel-L2 0.14-0.17, and with top-1 gaps as small as 0.0625 that \
-              cascades into different text within a few tokens. So configuring a prefill artifact \
-              must not silently change what the model says. =1 turns it on for measurement and \
-              bisection against the per-token control. Both arms are device-only: this is a step \
-              within the tier ladder, never a fall to host. Flip back to not_zero when the gate \
-              passes, not before." },
-
-    // -- npu-asr-host --------------------------------------------------------------------------
+              of one dispatch per token. DEFAULT ON since 2026-09-09; =0 restores per-token \
+              priming. It was opt-in until its gate existed, and what was missing was a SUBJECT \
+              rather than a measurement -- --tier2 drives verify_llm_decode.py, which is \
+              decode-only by its own header, so the end-to-end gate had never run this path. \
+              scripts/gate_llm.sh --tier2-prefill does, at seven prompt geometries against a \
+              float32 reference: 14/14 PASS, and teacher-forced (all 32 steps independently \
+              comparable rather than only the first divergence) the reference token is in the \
+              device's top-5 at 32/32 steps at every length in both arms. Worth 35.8-37.1x on \
+              priming, 707-742 tok/s against 49.9-51.5 ms/token. Set =0 to bisect a suspected \
+              prefill bug or to reproduce the pre-2026-09-09 output." },
     Flag { name: "NPU_PAR_SUBSAMPLE", owner: "npu-asr-host", site: "npu-asr-host/src/lib.rs:507",
         semantics: NotZero, default: "true",
         doc: "host-side subsample matmul runs multithreaded via rayon; opt out with =0." },

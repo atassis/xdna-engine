@@ -49,21 +49,35 @@ use crate::llm::npu_decode::{pack_bf16_bytes, rope_row, EmbedTable};
 
 /// `NPU_LLM_PREFILL_BATCHED` -- the one accessor (E003 of the env-flag contract).
 ///
-/// Default **OFF** (`=1` opts in), which is deliberately NOT the `not_zero` shape `NPU_LLM_REUSE_KV`
-/// next door uses.
+/// Default **ON** since 2026-09-09 (`=0` opts out), the `not_zero` shape `NPU_LLM_REUSE_KV` next
+/// door uses.
 ///
-/// The batched path does not yet pass its own gate. Measured on device 2026-09-08 against the
-/// shipped 28-layer decode artifact: batched priming and `P` sequential steps agree on the FIRST
-/// token at every prompt length tried, but the step-0 logits differ by rel-L2 0.14-0.17 -- two
-/// orders of magnitude above bf16 rounding -- and with top-1 gaps as small as 0.0625 that cascades
-/// into different text within a few tokens. 1 of 5 prompt lengths reproduced the per-token output
-/// exactly.
+/// It was opt-in until its gate existed, and the condition written here for flipping it was "the
+/// gate passing, not before it". That gate now exists and passes. What was missing was not a
+/// measurement but a SUBJECT: `--tier2` drives `verify_llm_decode.py`, which is decode-only by its
+/// own header, so the end-to-end gate had never run this path at all.
 ///
-/// So a scenario that merely CONFIGURES a prefill artifact must not silently change what the model
-/// says. `=1` turns it on for measurement and bisection; flipping this default back to `not_zero`
-/// is a one-word change and belongs with the gate passing, not before it.
+/// `scripts/gate_llm.sh --tier2-prefill` does, at seven prompt geometries (64 under a chunk, 255
+/// pad-1, 256 exact, 257 the first cross-chunk handoff, 512, 600 ragged, 768) against a float32
+/// reference, both arms:
+///
+///   * 14/14 PASS on the adopted rule -- top-5 inclusion at the first divergence.
+///   * TEACHER-FORCED, which is the stronger statement: put on the reference's own trajectory so
+///     all 32 steps are independently comparable rather than only the first divergence, the
+///     reference token is in the device's top-5 at **32/32 steps at every length in both arms**,
+///     and is top-1 28-31/32 batched against 30-32/32 per-token.
+///
+/// The step-0 logit deltas that justified the old default are still there and are still not
+/// identity -- they are the cross-implementation cascade
+/// ([[token-identity-across-two-kernels-is-not-achievable]]), which is the standard this rail
+/// retired and which nobody in this domain gates on. What changed is that the distribution is now
+/// measured not to have moved.
+///
+/// Worth it: 35.8-37.1x faster priming, 707-742 tok/s against 49.9-51.5 ms/token, measured with an
+/// alternated control. And decode is not perturbed by the pair being resident -- the control arm,
+/// which loads both ELFs and primes per token, reproduces the standing per-token figure.
 fn batched_prefill_enabled() -> bool {
-    std::env::var("NPU_LLM_PREFILL_BATCHED").ok().as_deref() == Some("1")
+    std::env::var("NPU_LLM_PREFILL_BATCHED").ok().as_deref() != Some("0")
 }
 
 /// One padded dispatch of the prefill ELF: absolute positions `[start, start + M)`, of which the
