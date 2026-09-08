@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """check_selfdescribing_indexes.py -- a doc that counts what it indexes must agree with it.
 
-Three files here describe the tree by number: ARCHITECTURE.md counts workspace members and crate
-rows, scripts/README.md counts scripts. All were written by hand, so all drift the moment the thing
+Four files here describe the tree by number: ARCHITECTURE.md counts workspace members and crate
+rows, scripts/README.md counts scripts, designs/README.md counts designs and kernel directories. All were written by hand, so all drift the moment the thing
 they count changes, and nothing said so. Measured 2026-09-05: the crate count was 15 against 18 real
 members. Measured again 2026-09-08 while fixing that: the count had since been corrected, but two
 crates still had no table row, and scripts/README.md said 194 against 315 files. The task recording
@@ -33,6 +33,11 @@ def cargo_members():
 def script_entries():
     d = REPO / "scripts"
     return sorted(p.name for p in d.iterdir() if p.is_file() and p.name != "README.md")
+
+
+def dir_children(rel):
+    d = REPO / rel
+    return sorted(p.name for p in d.iterdir() if p.is_dir()) if d.is_dir() else []
 
 
 def main():
@@ -72,6 +77,40 @@ def main():
     elif int(m.group(1)) != len(entries):
         issues.append(f"scripts/README.md says {m.group(1)} entries; scripts/ holds {len(entries)}")
         edits.append((sr_path, m.group(0), f"{len(entries)} entries"))
+
+    # designs/README.md. Same rule, and it landed with hand-written counts the same day
+    # ARCHITECTURE.md's hand-written count was found stale -- so it gets derived before it can drift.
+    dr_path = REPO / "designs" / "README.md"
+    designs = dir_children("designs")
+    kernel_dirs = dir_children("aie_kernels")
+    kernels = [k for k in kernel_dirs if not k.startswith("_")]
+    if dr_path.exists():
+        dr = dr_path.read_text()
+        m = re.search(r"(\d+)(\s+shipping\s+)designs", dr)
+        if not m:
+            issues.append("designs/README.md: no 'N shipping designs' phrase to check")
+        elif int(m.group(1)) != len(designs):
+            issues.append(f"designs/README.md says {m.group(1)} shipping designs; designs/ holds {len(designs)}")
+            edits.append((dr_path, m.group(0), f"{len(designs)}{m.group(2)}designs"))
+        # The build-model breakdown is a PARTITION, so it must both use the right denominator and
+        # add up. A classification that silently drops a design is the failure this file exists for.
+        split = [(int(a), int(b)) for a, b in re.findall(r"\((\d+) of (\d+)[:,]", dr)]
+        if split:
+            bad = sorted({b for _, b in split if b != len(designs)})
+            if bad:
+                issues.append(f"designs/README.md build-model split says 'of {bad}'; designs/ holds {len(designs)}")
+            total = sum(a for a, _ in split)
+            if total != len(designs):
+                issues.append(f"designs/README.md build-model split covers {total} designs, not {len(designs)}")
+        # "49 dirs: 48 kernels + `_test/`" -- both halves, because the split is the informative part.
+        m = re.search(r"\((\d+) dirs: (\d+) kernels", dr)
+        if not m:
+            issues.append("designs/README.md: no 'N dirs: M kernels' phrase to check")
+        elif (int(m.group(1)), int(m.group(2))) != (len(kernel_dirs), len(kernels)):
+            issues.append(f"designs/README.md says {m.group(1)} dirs / {m.group(2)} kernels; "
+                          f"aie_kernels/ holds {len(kernel_dirs)} / {len(kernels)}")
+            edits.append((dr_path, m.group(0), f"({len(kernel_dirs)} dirs: {len(kernels)} kernels"))
+        print(f"designs/ {len(designs)} | aie_kernels/ {len(kernel_dirs)} dirs, {len(kernels)} kernels")
 
     # Coverage is REPORTED, never failed: the table is a curated index, and the honest state is
     # "documents M of N", not a demand that every script get a row the moment it lands.

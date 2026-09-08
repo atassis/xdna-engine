@@ -85,6 +85,9 @@ does not need it.
 - `rust/` - the engine (14 product crates + `npu-probes`; see [ARCHITECTURE.md](ARCHITECTURE.md))
 - `aie_kernels/` - the kernel library: 48 hand-written AIE kernels (GEMM, GEMV, cascade FFN,
   MHA, conv, LayerNorm, ...), each with its numpy golden where one exists ([index](aie_kernels/INDEX.md))
+- `designs/` - the IRON multi-core dataflow graphs the engine actually dispatches, built from
+  those kernels ([layout + build model per design](designs/README.md))
+- `experiments/` - one-off studies and A/B probes, not dispatched by the engine
 - `scripts/` - model export/convert, kernel builds, device probes, eval ([index](scripts/README.md))
 - `bench/` - latency/energy benchmark harness
 - `docs/` - engineering deep-dives (data-movement thesis, AIE2P architecture/roofline, benchmark methodology, ...)
