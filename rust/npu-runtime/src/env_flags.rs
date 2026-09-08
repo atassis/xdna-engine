@@ -185,7 +185,7 @@ pub const FLAGS: &[Flag] = &[
     Flag { name: "XDG_DATA_HOME", owner: "npu-cli", site: "npu-cli/src/main.rs:116",
         semantics: Value, default: "$HOME/.local/share",
         doc: "XDG data-home candidate for the install root when XDNA_ENGINE_ROOT is unset." },
-    Flag { name: "NPU_ASR_MAX_SPAN_S", owner: "npu-cli", site: "npu-cli/src/main.rs:433",
+    Flag { name: "NPU_ASR_MAX_SPAN_S", owner: "npu-cli", site: "npu-cli/src/main.rs:438",
         semantics: Value, default: "18.0",
         doc: "max transcription window span in seconds; span-granularity only now that both ASR \
               backends window internally (not re-measured against them)." },

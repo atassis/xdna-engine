@@ -429,8 +429,26 @@ const MIN_UTTERANCE_S: f32 = 0.30;
 /// the shorter cliff. Both backends now window internally and transcribe any length, so the cap is
 /// only about span granularity. The number has not been re-measured against the windowed backends;
 /// raising it gives whisper more context per call and should be swept before it is changed.
-fn asr_window_s() -> f32 {
-    std::env::var("NPU_ASR_MAX_SPAN_S").ok().and_then(|v| v.parse().ok()).unwrap_or(18.0)
+///
+/// A malformed value is an ERROR, not a silent 18.0 -- contract rule E004, whose worked example is
+/// this flag: `NPU_ASR_MAX_SPAN_S=2O` (letter O) parsed as nothing and returned the default, so an
+/// operator who asked for a different window got the old one with no diagnostic. Non-positive and
+/// non-finite are rejected at the same place; neither names a span.
+fn asr_window_s() -> Result<f32> {
+    parse_asr_window(std::env::var_os("NPU_ASR_MAX_SPAN_S").as_deref())
+}
+
+/// Split from the read so it is testable without mutating the process environment, which is global
+/// and races every other test in this binary.
+fn parse_asr_window(raw: Option<&std::ffi::OsStr>) -> Result<f32> {
+    let Some(raw) = raw else { return Ok(18.0) };
+    match raw.to_str().and_then(|v| v.parse::<f32>().ok()).filter(|s| *s > 0.0 && s.is_finite()) {
+        Some(s) => Ok(s),
+        // Code::Failure: the closed set has no invalid-argument code, and this is a bad value, not
+        // a missing service or model.
+        None => Err(Tagged(Code::Failure, format!(
+            "NPU_ASR_MAX_SPAN_S: expected a positive number of seconds, got {raw:?}")).into()),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -438,6 +456,9 @@ fn transcribe_media(path: &Path, input: &Path, out: Option<&Path>, format: OutFo
                     asr: Option<&str>, diar: Option<&str>, only_track: Option<usize>,
                     no_diarize: bool) -> Result<()> {
     quiet_one_shot();
+    // Before the device, ffmpeg or diarization: a bad NPU_ASR_MAX_SPAN_S is an operator typo, and
+    // reporting it after a model load and a diarize pass is loud but far too late.
+    let max_span = asr_window_s()?;
     let cfg = load_cfg(path)?;
     let root = root(&cfg, path)?;
     let tracks = media::probe_audio_tracks(input)?;
@@ -482,7 +503,6 @@ fn transcribe_media(path: &Path, input: &Path, out: Option<&Path>, format: OutFo
 
             // Split turns the ASR cannot hold whole, then transcribe each piece. Without this a
             // long turn returns only its first ~20 s, with no error to notice.
-            let max_span = asr_window_s();
             let spans: Vec<(f32, f32, u32)> = spans.iter()
                 .flat_map(|&(a, b, spk)| media::split_turn(a, b, max_span).into_iter()
                     .map(move |(x, y)| (x, y, spk)))
@@ -1286,6 +1306,21 @@ mod tests {
                 assert_eq!(sampling.seed, Some(3));
             }
             _ => panic!("expected Cmd::Chat"),
+        }
+    }
+
+    /// E004: a `Value` flag must fail loudly. The worked example in the contract is this flag --
+    /// `NPU_ASR_MAX_SPAN_S=2O` (letter O, not zero) parsed as nothing and silently became 18.0.
+    #[test]
+    fn a_malformed_asr_window_is_an_error_not_the_default() {
+        use std::ffi::OsStr;
+        assert_eq!(parse_asr_window(None).unwrap(), 18.0, "unset means the default");
+        assert_eq!(parse_asr_window(Some(OsStr::new("24.5"))).unwrap(), 24.5);
+        for bad in ["2O", "", "0", "-3", "inf", "nan", "18s"] {
+            let e = parse_asr_window(Some(OsStr::new(bad)))
+                .expect_err(&format!("{bad:?} must not silently become 18.0"));
+            assert_eq!(exit::of(&e), Code::Failure);
+            assert!(e.to_string().contains("NPU_ASR_MAX_SPAN_S"), "the message must name the flag");
         }
     }
 
