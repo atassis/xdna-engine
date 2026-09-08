@@ -86,7 +86,7 @@ use Semantics::*;
 /// The full census, in crate order. See the module doc for what is deliberately excluded.
 pub const FLAGS: &[Flag] = &[
     // -- npu-engine: llm decode ------------------------------------------------------------------
-    Flag { name: "NPU_LLM_REUSE_KV", owner: "npu-engine", site: "npu-engine/src/llm/npu_decode.rs:161",
+    Flag { name: "NPU_LLM_REUSE_KV", owner: "npu-engine", site: "npu-engine/src/llm/npu_decode.rs:198",
         semantics: NotZero, default: "true",
         doc: "reuse the KV-cache buffers across requests instead of re-zeroing them each time. \
               Default ON: the buffers are zeroed explicitly at load and sm_mask excludes every \
