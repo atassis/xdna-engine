@@ -532,8 +532,50 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
                 sm_widths=(SM_WIDTHS if causal == "rows" else None), sm_rows=Hq * M,
                 shared=[n for n in dec_order if not n.startswith("__decode_gap")],
                 reserved=dec_reserved, prefill_local=prefill_local,
-                rl=rl, runlist_len=len(rl), per_layer=len(rl) // NL)
+                rl=rl, runlist_len=len(rl), per_layer=len(rl) // NL,
+                # The CONFIGURE count. `share_designs` collapses operators reporting the same
+                # design_key onto one design, which is built, prefixed and configured ONCE -- so
+                # this, not the runlist length, is how many setups a dispatch pays for. Measured
+                # 2026-09-09: a block's dispatch time is `per-design setup + bytes`, and the setup
+                # term is the larger one at M=256, so the number belongs in the artifact.
+                n_designs=len(fused.unique_designs()[0]))
     return sp, fused, dims
+
+
+def op_census(runlist, resolve, n_layers):
+    """Bytes and invocation count PER OPERATOR TYPE, for one layer.
+
+    `operand_bytes` above splits by BUFFER class, which answers "what kind of traffic is this" and
+    not "which op should I attack". Device timing put 27.6% of a layer outside the two block
+    artifacts (MLP 36.0%, attention 36.4%) without saying which of the remaining ops it is; this
+    is the byte-side companion to that split. It is an ATTRIBUTION BY BYTES, not a measurement:
+    ops do not all run at the same GB/s, and the two zero-compute rearranges in particular are
+    pure DMA. Read it to rank suspects, then measure the winner.
+    """
+    per = {}
+
+    def length(name):
+        if "[" in name:
+            lo, hi = name[name.index("[") + 1:-1].split(":")
+            return int(hi) - int(lo)
+        return int(resolve(name)[2])
+
+    for op, *bufs in runlist:
+        kind = type(op).__name__
+        moved = int(np.prod(op.input_sizes)) * 2 if isinstance(op, StridedCopy) else None
+        b = sum(moved if moved is not None else length(x) for x in bufs)
+        e = per.setdefault(kind, [0, 0])
+        e[0] += 1
+        e[1] += b
+    total = sum(v[1] for v in per.values())
+    rows = sorted(per.items(), key=lambda kv: -kv[1][1])
+    print(f"[census] per LAYER ({n_layers} built), by operator type:")
+    print(f"[census] {'op':<22} {'calls':>6} {'MB':>10} {'share':>7}")
+    for k, (n, b) in rows:
+        print(f"[census] {k:<22} {n // n_layers:>6} {b / n_layers / 2**20:>10.2f} "
+              f"{100 * b / total:>6.1f}%")
+    print(f"[census] {'TOTAL':<22} {len(runlist) // n_layers:>6} "
+          f"{total / n_layers / 2**20:>10.2f} {100.0:>6.1f}%")
 
 
 def operand_bytes(runlist, resolve, shared):
@@ -653,7 +695,10 @@ def main():
               f"{len(dims['shared'])} shared buffers verified against the decode arena"
               if dec_meta_path else
               f"[layout] {NL} layers, M={M} S={S}: {dims['runlist_len']} runlist entries, "
-              f"scratch {scr/1e6:.1f}MB (standalone arena)")
+              f"{dims['n_designs']} designs, scratch {scr/1e6:.1f}MB (standalone arena)")
+        print(f"[layout] designs (= configures) {dims['n_designs']}, "
+              f"{dims['n_designs']/NL:.1f}/layer")
+        op_census(dims["rl"], fused.get_layout_for_buffer, NL)
         return
     D, FF, HD = sp.d_model, sp.ffn, sp.head_dim
     Hq, Hkv, QD = sp.n_q_heads, sp.n_kv_heads, sp.q_dim
@@ -771,7 +816,8 @@ def main():
                  "tile_sources": sorted({v["source"] for v in dims["tiles"].values()}),
                  "tile_n_scores": dims["tn_sc"],
                  "tile_n_ctx": dims["tn_cx"], "cols": dims["cols"],
-                 "runlist": dims["runlist_len"], "runlist_per_layer": dims["per_layer"]},
+                 "runlist": dims["runlist_len"], "runlist_per_layer": dims["per_layer"],
+                 "designs": dims["n_designs"]},
         "host_protocol": {
             "batch": M,
             "x": f"[{M}, {D}] bf16 token-major embeddings for this chunk "
