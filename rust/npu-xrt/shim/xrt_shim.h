@@ -78,6 +78,9 @@ int shim_run_kernel(ShimKernel*, unsigned int opcode, ShimBo* instr, size_t inst
 ShimRun* shim_run_matmul8_start(ShimKernel*, unsigned int opcode, ShimBo* instr, size_t instr_count,
                                 ShimBo* a, ShimBo* b, ShimBo* c, ShimBo* tmp, ShimBo* trace);
 int      shim_run_wait(ShimRun*); /* 0 = completed, -1 = error/not-completed */
+/* Longest single dispatch wait this process has seen, in ms. Exists so the dispatch deadline
+   (NPU_DISPATCH_TIMEOUT_MS) can be re-sized against measured dispatches rather than re-guessed. */
+double   shim_dispatch_max_wait_ms(void);
 void     shim_run_free(ShimRun*);
 
 /* --- Fused full-ELF dispatch (the IRON FusedMLIROperator path) ----------------------------------
