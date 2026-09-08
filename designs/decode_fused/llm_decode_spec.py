@@ -257,11 +257,6 @@ class LlmSpec:
                 f"(the op vocabulary is keyed on the pair), but meta.json still carries "
                 f"dims.head_dim as one scalar and the host's rope cross-check is gated on "
                 f"kv_offs.len()==1, so it does nothing in exactly this case")
-        if self.v_norm:
-            gaps.append(
-                "v_norm: a GAINLESS RMSNorm on the value path of every layer. There is no weight "
-                "tensor for it anywhere in the checkpoint (with_scale=False), so its absence "
-                "cannot raise a missing-key error -- skipping it is a silent numerical change")
         if self.v_from_k_on_global:
             gaps.append(
                 "attention_k_eq_v: global layers have no v_proj and V is the RAW k_proj output, "

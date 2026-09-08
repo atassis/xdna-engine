@@ -686,6 +686,21 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
                                             epsilon=sp.eps,
                                             tile_size_input=TSI, context=ctx,
                                             weight_depth=WEIGHT_DEPTH)
+        # Gemma-4 applies a GAINLESS RMSNorm to the value path of every layer. with_scale=False in
+        # the reference removes the learned gain, not the normalisation, so there is no weight
+        # tensor anywhere in the checkpoint -- which is why nothing could ever have failed on its
+        # absence. `weighted=False` is the operator's own axis for exactly this (its runtime arg
+        # spec drops the weight fifo), so it needs no new kernel and no ones-filled buffer.
+        op_v_norm = (RMSNorm(size=hd, num_aie_columns=1, num_channels=1, tile_size=hd,
+                             weighted=False, epsilon=sp.eps, context=ctx) if sp.v_norm else None)
+        if sp.v_norm and dp_why is None:
+            # The fused head drains k and v straight into the caches, so `v` never exists as a
+            # buffer this graph can normalise -- the norm would be silently skipped rather than
+            # rejected, on every layer.
+            raise NotImplementedError(
+                "spec sets v_norm but the fused QKV head is on, and QKVHeadDataParallel appends v "
+                "to the cache itself -- the value norm would be silently dropped. Set "
+                "FUSE_QKV_DP=0, or give the operator a value-norm stage.")
         op_rope_q = RoPE(rows=Hq, cols=hd, angle_rows=1, context=ctx)
         op_rope_k = RoPE(rows=hkv, cols=hd, angle_rows=1, context=ctx)
         # KV append: deep-C scratchpad offset "kv_off" (element units = n_past*hd), constant ELF.
@@ -779,7 +794,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
             op_kv=op_kv, op_o=op_o, op_rope_qk=op_rope_qk, op_qkv_dp=op_qkv_dp,
             op_rope_q=op_rope_q, op_rope_k=op_rope_k, op_sck=op_sck, op_scv=op_scv,
             op_rep_k=op_rep_k, op_rep_v=op_rep_v, op_scores=op_scores, op_trv=op_trv,
-            op_ctx=op_ctx)
+            op_ctx=op_ctx, op_v_norm=op_v_norm)
         _attn_cache[(hd, hkv)] = g
         return g
 
@@ -1010,11 +1025,12 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
             qkvb, kb, vb = p + "qkv", g.qd * 2, (g.qd + g.kvd) * 2
             ref_q, ref_k = f"{qkvb}[0:{kb}]", f"{qkvb}[{kb}:{vb}]"
             ref_v, ref_qk = f"{qkvb}[{vb}:{vb + g.kvd * 2}]", f"{qkvb}[0:{vb}]"
-            qhb, qho, khb, kho = qkvb, 0, qkvb, kb    # per-head qk-norm slice base + byte offset
+            # per-head norm slice base + byte offset, for q, k and v alike
+            qhb, qho, khb, kho, vhb, vho = qkvb, 0, qkvb, kb, qkvb, vb
             bufsz[qkvb] = (g.qd + 2 * g.kvd) * 2
         else:
             ref_q, ref_k, ref_v = p + "q", p + "k", p + "v"
-            qhb, qho, khb, kho = p + "q", 0, p + "k", 0
+            qhb, qho, khb, kho, vhb, vho = p + "q", 0, p + "k", 0, p + "v", 0
             bufsz.update({p + "q": g.qd * 2, p + "k": g.kvd * 2, p + "v": g.kvd * 2})
         bufsz.update({
             p + "kc": g.hkv * S * g.hd * 2, p + "vc": g.hkv * S * g.hd * 2,
@@ -1038,7 +1054,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
         nxt = f"x{l+1}"
         # The unfused arms only. With the fused head, the per-head norms, the projection and the
         # RoPE are all inside one design and none of these runlist entries exists.
-        qk = proj = rope = []
+        qk = proj = rope = vnorm = []
         if sp.qk_norm and g.op_qkv_dp is None:
             hq = [f"{qhb}[{qho + h*g.hd*2}:{qho + (h+1)*g.hd*2}]" for h in range(Hq)]
             hk = [f"{khb}[{kho + h*g.hd*2}:{kho + (h+1)*g.hd*2}]" for h in range(g.hkv)]
@@ -1054,6 +1070,13 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
             rope = ([(g.op_rope_qk, ref_qk, ang, ref_qk)] if fuse_rope else
                     [(g.op_rope_q, ref_q, ang, ref_q),
                      (g.op_rope_k, ref_k, ang, ref_k)])
+            if g.op_v_norm is not None:
+                # Per kv head over head_dim, in place, and NOT rotated -- RoPE is a q/k-only step,
+                # so this sits after the rope entries the way the reference layer does, purely to
+                # read in the same order. Two args, not three: the unweighted design has no weight
+                # fifo (rms_norm/op.py runtime_args).
+                hv = [f"{vhb}[{vho + h*g.hd*2}:{vho + (h+1)*g.hd*2}]" for h in range(g.hkv)]
+                vnorm = [(g.op_v_norm, s, s) for s in hv]
         # The fused head replaces the norm, the projection, every qk-norm and the RoPE with one
         # design; `hn` lives and dies in L1 instead of round-tripping DDR between four of them.
         # The fused head absorbs the KV append too: k and v are drained straight into the caches
@@ -1063,7 +1086,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
         head = ([(g.op_qkv_dp, cur, p + "n_in", p + "Wqkv", p + "n_qn", p + "n_kn", ang,
                   ref_q, p + "kc", p + "vc")]
                 if g.op_qkv_dp is not None else
-                [(op_norm, cur, p + "n_in", p + "hn"), *proj, *qk, *rope,
+                [(op_norm, cur, p + "n_in", p + "hn"), *proj, *qk, *rope, *vnorm,
                  (g.op_sck, ref_k, p + "kc"), (g.op_scv, ref_v, p + "vc")])
         rl += [
             *head,
