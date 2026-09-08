@@ -163,10 +163,23 @@ class Checker:
         ]
 
     def chunks(self, l, leaf, want):
-        """How many K-chunks the dump actually shipped for one weight."""
+        """How many K-chunks the dump shipped for one weight, against how many it OWES.
+
+        A dump owes pre-chunked tensors only when that weight is PACKED. The split runs along K,
+        and splitting packed bytes would cut through a quantisation group -- so a packed dump has
+        to do it before packing, and shipping one blob is a real defect the generator cannot
+        recover from. An UNPACKED weight owes nothing: gen_llm_decode.py splits it itself at build
+        time (`np.split(wd, nch, axis=1)` in the `not all(n in PACKED)` arm), which is exact and
+        free, and demanding pre-chunked bf16 would fail every correct bf16 dump.
+
+        That distinction was missing, and it went unseen because both other specs have
+        k_chunks_for == 1 -- so this check was vacuous on every dump it had ever run against, and
+        fired 56 false FAILs the first time a spec actually needed a split.
+        """
         base = self.layer(l, leaf)
         got = 1 if self.exists(base) else sum(1 for i in range(64) if self.exists(f"{base}.kchunk{i}"))
-        self.check(f"L{l} {leaf.split('.')[-2]} K-chunks", got, want)
+        packed = base in self.packed or f"{base}.kchunk0" in self.packed
+        self.check(f"L{l} {leaf.split('.')[-2]} K-chunks", got, want if packed else 1)
 
 
 def main():
