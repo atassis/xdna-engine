@@ -34,7 +34,9 @@ import numpy as np
 import ml_dtypes
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from llm_decode_spec import SPECS  # noqa: E402
+from llm_decode_spec import SPECS, gemm_l1_bytes  # noqa: E402
+from gemm_tile_registry import registry  # noqa: E402
+from prefill_ref import f32, gate_block, mlp_block  # noqa: E402
 
 import newstack_compat  # noqa: F401,E402 -- MUST precede iron imports
 from iron.common import AIEContext  # noqa: E402
@@ -46,44 +48,30 @@ from iron.operators.elementwise_mul.op import ElementwiseMul  # noqa: E402
 
 BF16 = ml_dtypes.bfloat16
 COLS = int(os.environ.get("PREFILL_COLS", "8"))
-TILE_M = TILE_K = TILE_N = 64
+# The GEMM tiling is no longer a constant here -- `gemm_tile_registry` holds a measured triple per
+# SHAPE, and a shape that has never been swept raises rather than falling back to 64/64/64. COLS
+# still splits the non-GEMM ops (RMSNorm/SiLU/mul).
 
 
 def bf16(a):
     return np.asarray(a).astype(BF16)
 
 
-def check_batch(batch, shapes):
-    """K007: assert every GEMM modulus HERE, where the shape is picked, naming the offending number.
+def pick_tiles(batch, shapes):
+    """The registry's tiling for every GEMM this block builds, checked where the shape is picked.
 
-    `iron/operators/gemm/op.py` raises for M/K/N, but only after the caller has committed; and its
-    tile checks are WEAKER than the kernel's (`op.py` tests `tile_m >= 8` while
-    `aie_kernels/aie2p/mm.cc` static_asserts `m % (2*r) == 0`, r=8 on the bfp16-emulation path that
-    is IRON's GEMM default). So the kernel's rule is the one checked here.
+    K007/K008 are still enforced here, but not by a second copy of the rules: `Registry.lookup`
+    runs `llm_decode_spec.gemm_tiling_rejection` -- the same function `check_prefill_projections`
+    raises from -- so the modulus, the mm.cc `static_assert`s, the 64 KB L1 and the 512 KB MemTile
+    are all named before an operator is constructed. A shape absent from the registry raises with
+    the sweep command that fills it; nothing falls back to a default triple.
     """
-    if batch % (TILE_M * 4):
-        raise ValueError(f"batch={batch} is not a multiple of tile_m*n_aie_rows={TILE_M * 4} "
-                         f"(n_aie_rows is hardcoded 4 in iron/operators/gemm/design.py)")
-    if TILE_M % 16 or TILE_N % 16:
-        raise ValueError(f"tile_m={TILE_M}/tile_n={TILE_N}: mm.cc static_asserts m%(2*r)==0 and "
-                         f"n%(2*t)==0 with r=t=8 on the bfp16 path; op.py's own >=8 check is weaker")
-    if TILE_K % 8:
-        raise ValueError(f"tile_k={TILE_K}: mm.cc static_asserts k%s==0 with s=8")
+    reg = registry()
+    out = {}
     for label, K, N in shapes:
-        if K % TILE_K:
-            raise ValueError(f"{label}: K={K} not a multiple of tile_k={TILE_K}")
-        if N % (TILE_N * COLS):
-            raise ValueError(f"{label}: N={N} not a multiple of tile_n*num_aie_columns="
-                             f"{TILE_N * COLS}; the widest legal column count is "
-                             f"{max((c for c in (8, 4, 2, 1) if N % (TILE_N * c) == 0), default=0)}")
-    # K008: nothing in the toolchain checks GEMM's L1 occupancy. A, B and C are all double-buffered
-    # bf16 tiles, plus gemm/design.py's stack_size=0xD00 per worker.
-    l1 = 4 * (TILE_M * TILE_K + TILE_K * TILE_N + TILE_M * TILE_N) + 0xD00
-    if l1 > 65536:
-        raise ValueError(f"tile ({TILE_M},{TILE_K},{TILE_N}) needs {l1} B of L1 against 65536; "
-                         f"aiecc would report this as \"'aie.tile' op Basic sequential allocation "
-                         f"also failed\", naming a tile and not a size")
-    return l1
+        ch = reg.lookup(batch, K, N, b_col_maj=True, label=label)
+        out[label] = ch
+    return out
 
 
 def main():
@@ -97,9 +85,10 @@ def main():
 
     sp = SPECS[a.spec]
     D, FF, M = sp.d_model, sp.ffn, a.batch
-    l1 = check_batch(M, [("gate/up", D, FF), ("down", FF, D)])
+    ch = pick_tiles(M, [("gate_up", D, FF), ("down", FF, D)])
+    l1 = gemm_l1_bytes(ch["gate_up"].tile_m, ch["gate_up"].tile_k, ch["gate_up"].tile_n)
     print(f"[shape] {sp.name} L{a.layer}  M={M}  D={D}  FF={FF}  "
-          f"tiles=({TILE_M},{TILE_K},{TILE_N}) cols={COLS}  L1={l1}B ({100*l1/65536:.0f}%)")
+          f"gate_up={ch['gate_up']}  down={ch['down']}  L1={l1}B ({100*l1/65536:.0f}%)")
 
     if os.environ.get("AIE_DEVICE"):
         import aie.utils as _aie_utils
@@ -121,10 +110,9 @@ def main():
     # does one row at M=1 does M rows here -- the batch is a size, not a new op-type.
     op_norm = RMSNorm(size=M * D, num_aie_columns=COLS, num_channels=1, tile_size=D,
                       weighted=True, epsilon=sp.eps, context=ctx)
-    gemm_kw = dict(tile_m=TILE_M, tile_k=TILE_K, tile_n=TILE_N, num_aie_columns=COLS,
-                   b_col_maj=True, context=ctx)
-    op_gu = GEMM(M=M, K=D, N=FF, **gemm_kw)      # shared by gate and up: same shape, one design
-    op_down = GEMM(M=M, K=FF, N=D, **gemm_kw)
+    # shared by gate and up: same shape, one design, one registry entry
+    op_gu = GEMM(M=M, K=D, N=FF, b_col_maj=True, context=ctx, **ch["gate_up"].gemm_kwargs)
+    op_down = GEMM(M=M, K=FF, N=D, b_col_maj=True, context=ctx, **ch["down"].gemm_kwargs)
     op_silu = SiLU(size=M * FF, num_aie_columns=COLS, tile_size=FF // COLS, context=ctx)
     op_mul = ElementwiseMul(size=M * FF, num_aie_columns=COLS, tile_size=FF // COLS, context=ctx)
 
@@ -140,23 +128,20 @@ def main():
     weights = {"n_pf": bf16(nw), "Wg": bf16(Wg).reshape(-1),
                "Wu": bf16(Wu).reshape(-1), "Wd": bf16(Wd).reshape(-1)}
 
-    fused = OperatorSequence(f"prefill_mlp_{sp.name}_m{M}_c{COLS}_l{a.layer}", rl,
+    tile_sig = "_".join(f"{k}{c.tile_m}x{c.tile_k}x{c.tile_n}c{c.cols}"
+                        for k, c in sorted(ch.items()))
+    fused = OperatorSequence(f"prefill_mlp_{sp.name}_m{M}_c{COLS}_l{a.layer}_{tile_sig}", rl,
                              input_args=["x"], output_args=["out"], context=ctx,
                              share_designs=True)
     fused.compile()
 
-    # ---- CPU golden: the same bf16 dataflow, rounded where the device rounds ----
-    def rms(v, w):
-        f = np.asarray(v, np.float32)
-        s = f / np.sqrt((f * f).mean(-1, keepdims=True) + sp.eps)
-        return bf16(s * np.asarray(w, np.float32))
-    hf = rms(X, bf16(nw))
-    g = bf16(np.asarray(hf, np.float32) @ np.asarray(bf16(Wg), np.float32).T)
-    u = bf16(np.asarray(hf, np.float32) @ np.asarray(bf16(Wu), np.float32).T)
-    gf = np.asarray(g, np.float32)
-    gs = bf16(gf / (1.0 + np.exp(-gf)))
-    gh = bf16(np.asarray(gs, np.float32) * np.asarray(u, np.float32))
-    out = bf16(np.asarray(gh, np.float32) @ np.asarray(bf16(Wd), np.float32).T)
+    # ---- Two references off ONE dataflow (prefill_ref.mlp_block) ----
+    # bf16: rounded where the device rounds, for the probe's rel-L2. f32: the SAME bf16 inputs with
+    # no intermediate narrowed, which is what Tier 1 gates against -- a bf16 reference would agree
+    # with the device on exactly the rounding the gate exists to measure.
+    ref_args = (X, bf16(nw), bf16(Wg), bf16(Wu), bf16(Wd), sp.eps, sp.act)
+    out = mlp_block(*ref_args, bf16)
+    ref32 = mlp_block(*ref_args, f32)
 
     os.makedirs(os.path.join(a.out, "buffers"), exist_ok=True)
     bdir = os.path.join(a.out, "buffers")
@@ -175,7 +160,9 @@ def main():
         "layout": {n: {"type": v[0], "offset": int(v[1]), "len": int(v[2])} for n, v in lay.items()},
         "inputs": ["x"], "weights": list(weights), "output": "out",
         "dims": {"spec": sp.name, "layer": a.layer, "M": M, "d_model": D, "ffn": FF,
-                 "tile": [TILE_M, TILE_K, TILE_N], "cols": COLS},
+                 "tiles": {k: {"tile": [c.tile_m, c.tile_k, c.tile_n], "cols": c.cols,
+                               "source": c.source} for k, c in ch.items()},
+                 "cols": COLS},
         # DDR bytes this block moves per dispatch, so a device timing converts to GB/s without the
         # caller re-deriving it. Weights are M-independent; activations are not. Splitting the two
         # is what separates "transport-bound" from "compute-bound" on an M sweep.
@@ -184,6 +171,8 @@ def main():
         # MACs the block actually issues, so a device timing converts straight to MAC/s without
         # the caller re-deriving it -- this is the number that decides how far batching pays.
         "macs": int(2 * M * D * FF + M * FF * D),
+        "gate": gate_block(a.out, {"out": np.asarray(ref32, np.float32).reshape(M, D)},
+                           {"out": np.asarray(out, np.float32).reshape(M, D)}),
     }, open(os.path.join(a.out, "meta.json"), "w"), indent=2)
     print(f"[ok] wrote {len(elf)}B ELF, scratch {scr/1e6:.1f} MB, "
           f"{2*M*D*FF + M*FF*D:,} MACs/dispatch -> {a.out}")

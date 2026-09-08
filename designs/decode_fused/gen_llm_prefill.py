@@ -104,6 +104,7 @@ the comment in gen_llm_decode.py.
 """
 import argparse
 import glob
+import hashlib
 import json
 import os
 import shutil
@@ -114,6 +115,9 @@ import ml_dtypes
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from llm_decode_spec import SPECS  # noqa: E402
+from gemm_tile_registry import registry  # noqa: E402
+from prefill_ref import (f32, gate_block, layer_stack, npy_weights,  # noqa: E402
+                         rope_block as _rope_block, softmax_rows as _softmax_rows)
 
 import newstack_compat  # noqa: F401,E402 -- MUST precede iron imports
 from iron.common import AIEContext  # noqa: E402
@@ -130,7 +134,16 @@ from iron.operators.strided_copy.op import StridedCopy  # noqa: E402
 
 BF16 = ml_dtypes.bfloat16
 COLS = int(os.environ.get("PREFILL_COLS", "8"))
-TILE_M = TILE_K = TILE_N = 64
+# There is no TILE_M/TILE_K/TILE_N constant here any more. It used to be `64` for every GEMM in
+# the model -- q (K=1024,N=2048), o (K=2048,N=1024), gate/up (K=1024,N=3072), down (K=3072,N=1024),
+# scores (K=128,N=2048), ctx (K=2048,N=128) -- one triple over six shapes, picked because it
+# divides and fits rather than because anything measured it. `ctx` already had to override it to
+# tile_n=16, which is the standing proof that one size does not fit. Each GEMM now asks
+# `gemm_tile_registry` for its own shape and RAISES if that shape has never been swept; the
+# registry's lookup checks the answer against `gemm_tiling_rejection` before returning it, so K007
+# is enforced at the point the shape is picked exactly as before.
+# COLS still sets the column split for every NON-GEMM op (RMSNorm/RoPE/Softmax/elementwise); the
+# GEMMs take theirs from the registry, which may legitimately differ per shape.
 # StridedCopy sizes its ObjectFifo at `transfer_size` elements and, unset, that is the WHOLE
 # tensor: 512 KB-1 MB here, against a 512 KB MemTile. Chunk it. 16384 bf16 elements = 32 KB is
 # comfortably inside one MemTile with room for the forwarded pair, and every tensor this file
@@ -181,18 +194,6 @@ def pick_transfer(total_elems, target=None):
     if not best:
         raise ValueError(f"no ObjectFifo transfer size <= {target} divides {total_elems}")
     return best
-
-
-def pick_tile_n(Nout, label, cols=COLS):
-    """Largest tile_n with `Nout % (tile_n*cols) == 0` and `tile_n % 16 == 0` (mm.cc's real rule).
-
-    K007: the shape is picked HERE, so the modulus is checked HERE, naming the offending number.
-    """
-    for tn in (64, 48, 32, 16):
-        if tn % 16 == 0 and Nout % (tn * cols) == 0:
-            return tn
-    raise ValueError(f"{label}: Nout={Nout} admits no tile_n in (64,48,32,16) with "
-                     f"Nout % (tile_n*{cols}) == 0 and tile_n % 16 == 0")
 
 
 def decode_arena_plan(meta_path):
@@ -257,15 +258,10 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
                          f"this graph has no separate score scale")
 
     # ---- K007: every shape constraint asserted where the shape is picked ----
-    tn_sc, tn_cx = pick_tile_n(S, "scores"), pick_tile_n(HD, "ctx")
-    sp.check_prefill_projections(
-        M, (("q", D, QD), ("k", D, KVD), ("v", D, KVD), ("o", QD, D),
-            ("gate", D, FF), ("up", D, FF), ("down", FF, D)),
-        tile_m=TILE_M, tile_k=TILE_K, tile_n=TILE_N, cols=cols)
-    sp.check_prefill_projections(
-        M, (("scores", HD, S), ("ctx", S, HD)),
-        tile_m=TILE_M, tile_k=TILE_K, tile_n=TILE_N, cols=cols,
-        tile_n_overrides={"scores": tn_sc, "ctx": tn_cx})
+    # The GEMM tilings come from the registry below, at the point each GEMM is constructed --
+    # `Registry.lookup` runs the same `gemm_tiling_rejection` these checks do, so a shape that
+    # reaches an operator has already had its modulus, L1 and MemTile budgets named. What is left
+    # here is everything that is NOT a GEMM.
     # RoPE. `rows = M*heads, angle_rows = M` makes design.py's block quotient exactly the head
     # count, which is what makes the block convention the RIGHT one for a token-major tensor --
     # so these three moduli are the whole contract, and the fourth condition (that the buffer is
@@ -294,7 +290,62 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
         _aie_utils.set_current_device(_from_name(os.environ["AIE_DEVICE"], n_cols=None))
 
     ctx = AIEContext()
-    gemm_kw = dict(tile_m=TILE_M, tile_k=TILE_K, num_aie_columns=cols, context=ctx)
+    # PREFILL_BFP16=0 turns OFF IRON GEMM's default bfp16 emulation.
+    #
+    # Not a tuning knob -- a NUMERICS one, and it is the axis that decides whether batched prefill
+    # can ever be token-identical to the M=1 decode path. GEMM defaults
+    # `emulate_bf16_mmul_with_bfp16=True`, which converts both operands to `v64bfp16ebs8`: block
+    # float with ONE exponent shared across 8 elements. The decode path's GEMV has no bfp16
+    # anywhere (grep `iron/operators/gemv/`, `aie_kernels/aie2p/mv.cc`) -- it does plain bf16 MACs.
+    # So the two paths compute the same expression in different formats, and measured on device
+    # 2026-09-08 that is worth rel-L2 1.3e-2 on layer 0's K AND V, compounding to 2.2e-1 by
+    # layer 27. Setting this to 0 costs the 4x mmul throughput and is what makes the arithmetic
+    # comparable.
+    emulate = os.environ.get("PREFILL_BFP16", "1") == "1"
+    # PREFILL_ACC=1 keeps the GEMM's K-reduction in f32.
+    #
+    # The second numerics axis, and measured to be the bigger one. By DEFAULT `C_l1_ty` is the
+    # OUTPUT dtype -- bf16 -- so the reduction loop rounds to bf16 once per k-tile, 16 times at
+    # K=1024/tile_k=64. `gemm/design.py:180` says so outright: prio_accuracy "will accumulate in
+    # place with a f32 buffer, which will be converted to bf16 after the reduction loop finishes".
+    # Decode's GEMV has no such split -- it carries all of K in f32 -- so the default GEMM cannot
+    # reproduce it however the operands are formatted.
+    prio_acc = os.environ.get("PREFILL_ACC", "0") == "1"
+    # PREFILL_ROUND_EVEN=0 makes the GEMM round bf16 outputs FLOOR instead of nearest-even.
+    #
+    # The third numerics axis, and the one that is a genuine ASYMMETRY rather than a choice.
+    # `aie_kernels/aie2p/mm.cc:222-227` takes conv_even under -DROUND_CONV_EVEN and floor
+    # otherwise; `aie_kernels/aie2p/mv.cc` -- the kernel the M=1 decode path actually runs --
+    # contains the string "rounding" ZERO times, so it never sets the register and inherits
+    # whatever is in it (documented default floor; in a fused ELF, whatever the previous kernel on
+    # that core left). One ULP of bf16 is 2^-8 = 3.9e-3 relative, which is the order of the
+    # residual disagreement between the two paths. Matching the modes is a precondition for token
+    # identity; it is NOT a claim that floor is the better mode -- see K001.
+    round_even = os.environ.get("PREFILL_ROUND_EVEN", "1") == "1"
+
+    # Every GEMM's tiling, from the measured registry. A shape with no entry RAISES here, naming
+    # the sweep that fills it -- there is deliberately no fallback triple, because a fallback is
+    # the hardcoded constant this replaced with an extra indirection. `GEMM_TILES_OVERRIDE`
+    # (JSON, keyed by registry key or by the op label below) is the experiment escape hatch.
+    reg = registry()
+    tiles = {}
+
+    def gemm_for(label, K, Nout, b_col_maj=True):
+        """One GEMM at the registry's tiling for its shape, checked twice on the way through."""
+        ch = reg.lookup(M, K, Nout, emulate=emulate, prio_accuracy=prio_acc,
+                        b_col_maj=b_col_maj, label=label)
+        # The spec-shaped check as well as the registry's own: it names the SPEC and the op, which
+        # is the message a shape error should carry, and it costs nothing.
+        sp.check_prefill_projections(M, ((label, K, Nout),), tile_m=ch.tile_m, tile_k=ch.tile_k,
+                                     tile_n=ch.tile_n, cols=ch.cols, bfp16=emulate,
+                                     prio_accuracy=prio_acc)
+        tiles[label] = {"tile": [ch.tile_m, ch.tile_k, ch.tile_n], "cols": ch.cols,
+                        "source": ch.source, "K": K, "N": Nout,
+                        "measured": ch.measured}
+        return GEMM(M=M, K=K, N=Nout, b_col_maj=b_col_maj, context=ctx,
+                    emulate_bf16_mmul_with_bfp16=emulate, prio_accuracy=prio_acc,
+                    round_conv_even=round_even, **ch.gemm_kwargs)
+
     op_norm = RMSNorm(size=M * D, num_aie_columns=cols, num_channels=1, tile_size=D,
                       weighted=True, epsilon=sp.eps, context=ctx)
     op_qn = RMSNorm(size=M * QD, num_aie_columns=cols, num_channels=1, tile_size=HD,
@@ -303,15 +354,21 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
                     weighted=True, epsilon=sp.eps, context=ctx)
     op_rq = RoPE(rows=M * Hq, cols=HD, angle_rows=M, num_aie_columns=cols, context=ctx)
     op_rk = RoPE(rows=M * Hkv, cols=HD, angle_rows=M, num_aie_columns=cols, context=ctx)
-    op_gq = GEMM(M=M, K=D, N=QD, tile_n=TILE_N, b_col_maj=True, **gemm_kw)
-    op_gkv = GEMM(M=M, K=D, N=KVD, tile_n=TILE_N, b_col_maj=True, **gemm_kw)
-    op_o = GEMM(M=M, K=QD, N=D, tile_n=TILE_N, b_col_maj=True, **gemm_kw)
-    op_gu = GEMM(M=M, K=D, N=FF, tile_n=TILE_N, b_col_maj=True, **gemm_kw)
-    op_down = GEMM(M=M, K=FF, N=D, tile_n=TILE_N, b_col_maj=True, **gemm_kw)
+    op_gq = gemm_for("q", D, QD)
+    # ONE design serves k and v (same shape), and one serves gate and up -- so the label is the
+    # pair. `GEMM_TILES_OVERRIDE` keys on these labels or on the registry key.
+    op_gkv = gemm_for("kv", D, KVD)
+    op_o = gemm_for("o", QD, D)
+    op_gu = gemm_for("gate_up", D, FF)
+    op_down = gemm_for("down", FF, D)
     # scores: B is the kv cache stored [S, HD], i.e. [N, K] -> read b_col_maj.
     # ctx:    B is the same cache read as [K=S, N=HD] -> plain.
-    op_sc = GEMM(M=M, K=HD, N=S, tile_n=tn_sc, b_col_maj=True, **gemm_kw)
-    op_cx = GEMM(M=M, K=S, N=HD, tile_n=tn_cx, b_col_maj=False, **gemm_kw)
+    op_sc = gemm_for("scores", HD, S)
+    op_cx = gemm_for("ctx", S, HD, b_col_maj=False)
+    tn_sc, tn_cx = tiles["scores"]["tile"][2], tiles["ctx"]["tile"][2]
+    print("[tiles] " + "  ".join(
+        f"{k}={v['tile'][0]}x{v['tile'][1]}x{v['tile'][2]}@{v['cols']}c({v['source']})"
+        for k, v in sorted(tiles.items())))
     # ONE softmax over every head's rows at once: its `rows` axis is just "independent rows to
     # normalise", and every head's [M, S] block is a contiguous slice of the same buffer. That is
     # also what makes the causal mask a plain vector: row Hq*M is (head, token) flattened, and the
@@ -431,9 +488,21 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
     # them: add_buffers walks input_args in order, and the host's x/rope writes are the same in
     # both arms.
     inputs = ["x", "rope"] + ([SM_WIDTHS] if causal == "rows" else [])
-    name = f"prefill_{sp.name.replace('-', '_').replace('.', '_')}_m{M}_s{S}_l{NL}_c{cols}"
+    # Every knob that changes the GRAPH must be in the name: IRON keys the cached artifact by
+    # it, so an arm whose name collides with an earlier one silently RUNS THE EARLIER
+    # BINARY. Measured here 2026-09-08: a PREFILL_BFP16=0 rebuild produced an ELF with the
+    # same md5 as the bfp16 arm, so the numerics A/B measured nothing until the flag went
+    # into the name. `gen_llm_decode.py`'s sequence_name() carries the same warning.
+    name = (f"prefill_{sp.name.replace('-', '_').replace('.', '_')}"
+            f"_m{M}_s{S}_l{NL}_c{cols}_{causal}_bfp{int(emulate)}_acc{int(prio_acc)}_re{int(round_even)}")
     if causal != "none":
         name += f"_{causal}"
+    # The tiling is now a per-shape lookup, so it is a GRAPH knob like the three above and has to
+    # be in the name for the same reason: a re-sweep that moves one GEMM's tile must not link the
+    # previous tiling's ELF out of the artifact cache. Hashed rather than spelled out -- seven
+    # ops * four numbers does not belong in a filename, and the tiles themselves are in meta.json.
+    tile_sig = ";".join(f"{k}:{v['tile']}x{v['cols']}" for k, v in sorted(tiles.items()))
+    name += "_t" + hashlib.md5(tile_sig.encode()).hexdigest()[:8]
     fused = OperatorSequence(name, rl, input_args=inputs, output_args=["xout"],
                              buffer_sizes=bufsz, context=ctx, share_designs=True,
                              scratch_order=(dec_order or None))
@@ -459,7 +528,7 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
                     f"share one FusedArena")
 
     dims = dict(NL=NL, M=M, S=S, inputs=inputs, cache_names=cache_names,
-                tn_sc=tn_sc, tn_cx=tn_cx, cols=cols, causal=causal,
+                tn_sc=tn_sc, tn_cx=tn_cx, tiles=tiles, cols=cols, causal=causal,
                 sm_widths=(SM_WIDTHS if causal == "rows" else None), sm_rows=Hq * M,
                 shared=[n for n in dec_order if not n.startswith("__decode_gap")],
                 reserved=dec_reserved, prefill_local=prefill_local,
@@ -509,121 +578,28 @@ def operand_bytes(runlist, resolve, shared):
 
 
 # --------------------------------------------------------------------------------------------
-# CPU golden -- the same bf16 dataflow, rounded where the device rounds.
+# CPU goldens. The dataflow itself lives in prefill_ref.py, once, parameterised on where it
+# narrows; this file only supplies the weights and picks the arm.
 # --------------------------------------------------------------------------------------------
-def _rms(v, w, eps):
-    f = np.asarray(v, np.float32)
-    s = f / np.sqrt((f * f).mean(-1, keepdims=True) + eps)
-    return bf16(s * np.asarray(w, np.float32))
+def golden_widths(sp, M, S, base, causal):
+    """The softmax widths the golden must use.
 
-
-def _mm(a, b_t):
-    """bf16(A @ B^T) with B stored [Nout, K] -- the b_col_maj read the device does."""
-    return bf16(np.asarray(a, np.float32) @ np.asarray(b_t, np.float32).T)
-
-
-def _rope_block(x, table, heads):
-    """RoPE in design.py's BLOCK convention: token t's angle row covers `heads` consecutive rows.
-
-    x is [M, heads, HD] token-major; `table` is [M, HD] interleaved [cos, sin, ...].
+    The device is handed `[Hq*M]`; a head's block is `[M, S]` and every head shares the same M
+    widths, so slicing the first M off the flat vector is the same thing and keeps the two
+    derivations from drifting.
     """
-    f = np.asarray(x, np.float32)
-    ang = np.asarray(table, np.float32)
-    cos, sin = ang[:, 0::2][:, None, :], ang[:, 1::2][:, None, :]
-    half = f.shape[-1] // 2
-    x1, x2 = f[..., :half], f[..., half:]
-    return bf16(np.concatenate([x1 * cos - x2 * sin, x2 * cos + x1 * sin], axis=-1))
+    return causal_widths(base, M, S, sp.n_q_heads)[:M] if causal == "rows" else None
 
 
-def _softmax_rows(s, widths):
-    """Row-wise softmax of `[rows, cols]`, with one unmasked width per row.
-
-    `widths` is None (attend everything) or a `[rows]` int vector: row `i` is softmaxed over
-    `s[i, :widths[i]]` and the tail is zero. That models `mask_bf16` writing -inf past the width
-    and `softmax_bf16` then exponentiating the whole row -- the MASK, not the device's bf16
-    rounding, and it assumes aie::exp2 returns exactly 0 at -inf.
-    """
-    f = np.asarray(s, np.float32)
-    if widths is not None:
-        keep = np.arange(f.shape[-1])[None, :] < np.asarray(widths, np.int64)[:, None]
-        f = np.where(keep, f, -np.inf)
-    e = np.exp(f - f.max(-1, keepdims=True))
-    e = np.nan_to_num(e, nan=0.0)
-    return bf16(e / e.sum(-1, keepdims=True))
-
-
-def golden(sp, weights_dir, NL, M, S, base, causal, X, table):
+def golden(sp, weights_dir, NL, M, S, base, causal, X, table, rnd=bf16):
     """Full-stack CPU golden. Returns (xout, [(kc_slab, vc_slab) per layer]).
 
-    kc/vc slabs are [Hkv, M, HD] -- the rows this chunk writes, which is what a host gate compares
-    against `cache[h, base:base+M, :]`. The rest of the cache is untouched and still zero.
+    `rnd=bf16` rounds where the device rounds -- the probe's reference. `rnd=f32` keeps every
+    intermediate wide on the same bf16 inputs -- Tier 1's reference (see prefill_ref's header for
+    why a bf16 golden cannot serve as one).
     """
-    D, FF, HD = sp.d_model, sp.ffn, sp.head_dim
-    Hq, Hkv, grp = sp.n_q_heads, sp.n_kv_heads, sp.gqa_group
-    # The device is handed `[Hq*M]`; a head's block is `[M, S]` and every head shares the same M
-    # widths, so slicing the first M off the flat vector is the same thing and keeps the two
-    # derivations from drifting.
-    widths = causal_widths(base, M, S, Hq)[:M] if causal == "rows" else None
-
-    def npy(n):
-        return np.load(os.path.join(weights_dir, f"{n}.npy")).astype(np.float32)
-
-    x = np.asarray(X, np.float32)
-    slabs = []
-    for l in range(NL):
-        pre = f"model.layers.{l}."
-        n_in = bf16(npy(pre + "input_layernorm.weight"))
-        n_pf = bf16(npy(pre + "post_attention_layernorm.weight"))
-        # attn_scale rides on the q-norm gain, because that is how the SHARED decode buffer stores
-        # it (SCALE_IN_QNORM). Applying it again here would double-scale against the device.
-        n_qn = bf16(npy(pre + "self_attn.q_norm.weight") * sp.attn_scale)
-        n_kn = bf16(npy(pre + "self_attn.k_norm.weight"))
-        Wq = bf16(npy(pre + "self_attn.q_proj.weight"))
-        Wk = bf16(npy(pre + "self_attn.k_proj.weight"))
-        Wv = bf16(npy(pre + "self_attn.v_proj.weight"))
-        Wo = bf16(npy(pre + "self_attn.o_proj.weight"))
-        Wg = bf16(npy(pre + "mlp.gate_proj.weight"))
-        Wu = bf16(npy(pre + "mlp.up_proj.weight"))
-        Wd = bf16(npy(pre + "mlp.down_proj.weight"))
-
-        h = _rms(x, n_in, sp.eps)
-        q = _mm(h, Wq).reshape(M, Hq, HD)
-        k = _mm(h, Wk).reshape(M, Hkv, HD)
-        v = _mm(h, Wv).reshape(M, Hkv, HD)
-        q = _rms(q, n_qn, sp.eps)
-        k = _rms(k, n_kn, sp.eps)
-        q = _rope_block(q, table, Hq)
-        k = _rope_block(k, table, Hkv)
-        kc = np.zeros((Hkv, S, HD), np.float32)
-        vc = np.zeros((Hkv, S, HD), np.float32)
-        kc[:, base:base + M] = np.asarray(k, np.float32).transpose(1, 0, 2)
-        vc[:, base:base + M] = np.asarray(v, np.float32).transpose(1, 0, 2)
-        slabs.append((bf16(kc[:, base:base + M]), bf16(vc[:, base:base + M])))
-        cx = np.empty((Hq, M, HD), np.float32)
-        for hh in range(Hq):
-            kv = hh // grp
-            s = _mm(np.asarray(q, np.float32)[:, hh], bf16(kc[kv]))
-            p = _softmax_rows(s, widths)
-            cx[hh] = np.asarray(bf16(np.asarray(p, np.float32) @ vc[kv]), np.float32)
-        cxt = cx.transpose(1, 0, 2).reshape(M, Hq * HD)
-        a = _mm(cxt, Wo)
-        x1 = bf16(x + np.asarray(a, np.float32))
-        hf = _rms(x1, n_pf, sp.eps)
-        g = np.asarray(_mm(hf, Wg), np.float32)
-        u = np.asarray(_mm(hf, Wu), np.float32)
-        # exp(-g) overflows f32 below g = -88, which a 28-layer stack reaches; g/inf is -0.0,
-        # the right limit, so the warning is the only thing to suppress. NOT rewritten to a
-        # two-sided sigmoid: that is the same function but a different f32 rounding, and it moved
-        # this golden away from gen_llm_prefill_mlp.py's, which is the one device-gated at M=256.
-        with np.errstate(over="ignore"):
-            gs = np.asarray(bf16(g / (1.0 + np.exp(-g))) if sp.act == "silu"
-                            else bf16(0.5 * g * (1.0 + np.tanh(0.7978845608 *
-                                                               (g + 0.044715 * g ** 3)))),
-                            np.float32)
-        gh = bf16(gs * u)
-        d = _mm(gh, Wd)
-        x = np.asarray(bf16(np.asarray(x1, np.float32) + np.asarray(d, np.float32)), np.float32)
-    return bf16(x), slabs
+    return layer_stack(sp, npy_weights(weights_dir), NL, M, S, base, X, table,
+                       golden_widths(sp, M, S, base, causal), rnd)
 
 
 def main():
@@ -699,11 +675,11 @@ def main():
                              f"what an unset dtype looks like")
         open(os.path.join(bdir, f"{SM_WIDTHS}.bin"), "wb").write(widths.tobytes())
 
-    golden_files = {}
+    golden_files, gate = {}, None
     if not a.no_golden:
         if not a.weights:
             raise SystemExit("ERROR: --weights is required unless --no-golden")
-        xout, slabs = golden(sp, a.weights, NL, M, S, a.base, a.causal, X, table)
+        xout, slabs = golden(sp, a.weights, NL, M, S, a.base, a.causal, X, table, bf16)
         gdir = os.path.join(bdir, "golden")
         os.makedirs(gdir, exist_ok=True)
         open(os.path.join(gdir, "xout.bin"), "wb").write(xout.tobytes())
@@ -713,6 +689,18 @@ def main():
                 fn = f"L{l}_{tag}_slab.bin"
                 open(os.path.join(gdir, fn), "wb").write(np.asarray(arr, BF16).tobytes())
                 golden_files[f"L{l}_{tag}"] = f"buffers/golden/{fn}"
+        # The Tier 1 reference: SECOND pass, same inputs, nothing narrowed in between. A second
+        # full CPU forward is the honest price -- reusing the bf16 pass's intermediates would make
+        # the two references share exactly the rounding the gate is meant to see.
+        x32, slab32 = golden(sp, a.weights, NL, M, S, a.base, a.causal, X, table, f32)
+        refs = {"xout": np.asarray(x32, np.float32).reshape(M, D)}
+        floors = {"xout": np.asarray(xout, np.float32).reshape(M, D)}
+        for l, ((kslab, vslab), (kf, vf)) in enumerate(zip(slab32, slabs)):
+            refs[f"L{l}_kc"] = np.asarray(kslab, np.float32).reshape(Hkv, M, HD)
+            refs[f"L{l}_vc"] = np.asarray(vslab, np.float32).reshape(Hkv, M, HD)
+            floors[f"L{l}_kc"] = np.asarray(kf, np.float32).reshape(Hkv, M, HD)
+            floors[f"L{l}_vc"] = np.asarray(vf, np.float32).reshape(Hkv, M, HD)
+        gate = gate_block(a.out, refs, floors)
 
     elf = load_elf(fused).view(np.uint8).tobytes()
     open(os.path.join(a.out, "prefill.elf"), "wb").write(elf)
@@ -779,7 +767,9 @@ def main():
         },
         "dims": {"layers": NL, "M": M, "S": S, "d_model": D, "ffn": FF,
                  "q_heads": Hq, "kv_heads": Hkv, "head_dim": HD, "q_dim": QD,
-                 "tile": [TILE_M, TILE_K, TILE_N], "tile_n_scores": dims["tn_sc"],
+                 "tiles": dims["tiles"],
+                 "tile_sources": sorted({v["source"] for v in dims["tiles"].values()}),
+                 "tile_n_scores": dims["tn_sc"],
                  "tile_n_ctx": dims["tn_cx"], "cols": dims["cols"],
                  "runlist": dims["runlist_len"], "runlist_per_layer": dims["per_layer"]},
         "host_protocol": {
@@ -801,6 +791,7 @@ def main():
                     "M=1 step reads them",
         },
         "golden": golden_files or None,
+        "gate": gate,
         "golden_layout": {"xout": [M, D],
                           "kv_slab": [Hkv, M, HD],
                           "note": "a kv slab is cache[h, base:base+M, :] for every kv head h; "

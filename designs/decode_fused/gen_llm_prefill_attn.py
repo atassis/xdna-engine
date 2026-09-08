@@ -42,6 +42,8 @@ import ml_dtypes
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from llm_decode_spec import SPECS  # noqa: E402
+from gemm_tile_registry import registry  # noqa: E402
+from prefill_ref import attn_block, f32, gate_block  # noqa: E402
 
 import newstack_compat  # noqa: F401,E402
 from iron.common import AIEContext  # noqa: E402
@@ -51,26 +53,13 @@ from iron.operators.softmax.op import Softmax  # noqa: E402
 
 BF16 = ml_dtypes.bfloat16
 COLS = int(os.environ.get("PREFILL_COLS", "8"))
-TILE_M = TILE_K = 64
+# No TILE_M/TILE_K constant and no local pick_tile_n: `gemm_tile_registry` holds a measured tiling
+# per SHAPE, and `scores` (K=head_dim, N=S) and `ctx` (K=S, N=head_dim) are two very different
+# shapes -- which is exactly why this file used to need a hand-written tile_n for each.
 
 
 def bf16(a):
     return np.asarray(a).astype(BF16)
-
-
-def pick_tile_n(Nout, label):
-    """Largest tile_n with `Nout % (tile_n*COLS) == 0` and `tile_n % 16 == 0` (mm.cc's real rule).
-
-    K007: the shape is picked HERE, so the modulus is checked HERE, naming the offending number --
-    rather than surfacing as a ValueError from the operator or, worse, a C++ static_assert.
-    """
-    for tn in (64, 48, 32, 16):
-        if tn % 16 == 0 and Nout % (tn * COLS) == 0:
-            return tn
-    raise ValueError(f"{label}: Nout={Nout} admits no tile_n in (64,48,32,16) with "
-                     f"Nout % (tile_n*{COLS}) == 0 and tile_n % 16 == 0. "
-                     f"Divisors of Nout that would work at {COLS} columns: "
-                     f"{[t for t in range(16, 65, 16) if Nout % (t*COLS) == 0] or 'none'}")
 
 
 def main():
@@ -85,13 +74,16 @@ def main():
     M, S = a.batch, a.seq
     Hq, Hkv, HD = sp.n_q_heads, sp.n_kv_heads, sp.head_dim
     grp = Hq // Hkv
-    if M % (TILE_M * 4):
-        raise ValueError(f"batch={M} is not a multiple of tile_m*n_aie_rows={TILE_M*4}")
-    if S % TILE_K:
-        raise ValueError(f"seq={S} is not a multiple of tile_k={TILE_K} (the ctx GEMM's K)")
-    tn_sc, tn_cx = pick_tile_n(S, "scores"), pick_tile_n(HD, "ctx")
+    # K007: `Registry.lookup` runs the same `gemm_tiling_rejection` the spec checks raise from, so
+    # the batch modulus, mm.cc's static_asserts, the K/N divisibility and both capacity budgets are
+    # all named here, at the point the shape is picked. An unswept shape raises with the sweep
+    # command; nothing falls back to a guessed triple.
+    reg = registry()
+    ch_sc = reg.lookup(M, HD, S, b_col_maj=True, label="scores")
+    ch_cx = reg.lookup(M, S, HD, b_col_maj=False, label="ctx")
+    tn_sc, tn_cx = ch_sc.tile_n, ch_cx.tile_n
     print(f"[shape] {sp.name} M={M} S={S} Hq={Hq} Hkv={Hkv} HD={HD} gqa={grp}  "
-          f"tile_n scores={tn_sc} ctx={tn_cx} cols={COLS}")
+          f"scores={ch_sc}  ctx={ch_cx}  cols={COLS}")
 
     if os.environ.get("AIE_DEVICE"):
         import aie.utils as _aie_utils
@@ -99,10 +91,8 @@ def main():
         _aie_utils.set_current_device(_from_name(os.environ["AIE_DEVICE"], n_cols=None))
 
     ctx = AIEContext()
-    op_sc = GEMM(M=M, K=HD, N=S, tile_m=TILE_M, tile_k=TILE_K, tile_n=tn_sc,
-                 num_aie_columns=COLS, b_col_maj=True, context=ctx)
-    op_cx = GEMM(M=M, K=S, N=HD, tile_m=TILE_M, tile_k=TILE_K, tile_n=tn_cx,
-                 num_aie_columns=COLS, b_col_maj=False, context=ctx)
+    op_sc = GEMM(M=M, K=HD, N=S, b_col_maj=True, context=ctx, **ch_sc.gemm_kwargs)
+    op_cx = GEMM(M=M, K=S, N=HD, b_col_maj=False, context=ctx, **ch_cx.gemm_kwargs)
     # ONE softmax over every head's rows at once -- see the module docstring.
     op_sm = Softmax(rows=Hq * M, cols=S, num_aie_columns=COLS, num_channels=1, context=ctx)
 
@@ -132,20 +122,17 @@ def main():
     KC = bf16(rng.standard_normal((Hkv, S, HD)).astype(np.float32))
     VC = bf16(rng.standard_normal((Hkv, S, HD)).astype(np.float32))
 
-    fused = OperatorSequence(f"prefill_attn_{sp.name}_m{M}_s{S}_c{COLS}", rl,
+    tile_sig = (f"sc{ch_sc.tile_m}x{ch_sc.tile_k}x{ch_sc.tile_n}c{ch_sc.cols}"
+                f"_cx{ch_cx.tile_m}x{ch_cx.tile_k}x{ch_cx.tile_n}c{ch_cx.cols}")
+    fused = OperatorSequence(f"prefill_attn_{sp.name}_m{M}_s{S}_c{COLS}_{tile_sig}", rl,
                              input_args=["q"], output_args=["cx"],
                              buffer_sizes=bufsz, context=ctx, share_designs=True)
     fused.compile()
 
-    # ---- CPU golden, same bf16 dataflow ----
-    out = np.zeros((Hq, M, HD), np.float32)
-    for h in range(Hq):
-        kv = h // grp
-        s = np.asarray(Q[h], np.float32) @ np.asarray(KC[kv], np.float32).T   # [M, S]
-        s = np.asarray(bf16(s), np.float32)
-        e = np.exp(s - s.max(-1, keepdims=True))
-        p = np.asarray(bf16(e / e.sum(-1, keepdims=True)), np.float32)
-        out[h] = np.asarray(bf16(p @ np.asarray(VC[kv], np.float32)), np.float32)
+    # ---- Two references off ONE dataflow (prefill_ref.attn_block) ----
+    # bf16 for the probe's rel-L2; f32 for Tier 1, same bf16 q/kc/vc with nothing narrowed between.
+    out = attn_block(Q, KC, VC, bf16)
+    ref32 = attn_block(Q, KC, VC, f32)
 
     os.makedirs(os.path.join(a.out, "buffers"), exist_ok=True)
     b = os.path.join(a.out, "buffers")
@@ -163,8 +150,14 @@ def main():
         "layout": {n: {"type": v[0], "offset": int(v[1]), "len": int(v[2])} for n, v in lay.items()},
         "inputs": ["q"], "weights": ["kc", "vc"], "output": "cx",
         "dims": {"spec": sp.name, "M": M, "S": S, "q_heads": Hq, "kv_heads": Hkv, "head_dim": HD,
-                 "tile_n_scores": tn_sc, "tile_n_ctx": tn_cx, "cols": COLS, "causal": False},
+                 "tile_n_scores": tn_sc, "tile_n_ctx": tn_cx, "cols": COLS, "causal": False,
+                 "tiles": {"scores": {"tile": [ch_sc.tile_m, ch_sc.tile_k, ch_sc.tile_n],
+                                      "cols": ch_sc.cols, "source": ch_sc.source},
+                           "ctx": {"tile": [ch_cx.tile_m, ch_cx.tile_k, ch_cx.tile_n],
+                                   "cols": ch_cx.cols, "source": ch_cx.source}}},
         "macs": int(2 * Hq * M * S * HD),
+        "gate": gate_block(a.out, {"cx": np.asarray(ref32, np.float32).reshape(Hq, M, HD)},
+                           {"cx": np.asarray(out, np.float32).reshape(Hq, M, HD)}),
     }, open(os.path.join(a.out, "meta.json"), "w"), indent=2)
     print(f"[ok] wrote {len(elf)}B ELF, scratch {scr/1e6:.1f} MB, "
           f"{2*Hq*M*S*HD:,} MACs/dispatch, {len(rl)} runlist entries -> {a.out}")
