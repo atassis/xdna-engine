@@ -32,6 +32,8 @@ request path. Unifying them is open work, not a shipped property; see "Known sea
 
 | Crate | Responsibility |
 | --- | --- |
+| `npu-asr` | GigaAM-v3 Conformer encoder on the NPU: matmul-heavy ops as whole-array dispatches with reused buffers, depthwise-conv on device, host glue via `npu-asr-host`. |
+| `npu-asr-host` | Pure host-side tensor math for that encoder, no NPU dependency: LayerNorm, RoPE, attention, GLU, and the im2col subsampling front-end. |
 | `npu-xrt` | Safe Rust bindings to drive the XDNA2 NPU via a thin C++ XRT shim. |
 | `npu-engine` | General multi-model engine over the kernel kit: a `Frontend / Encoder / Head` pipeline serving ASR and embeddings. |
 | `npu-runtime` | Control plane over `npu-engine`: desired-state config, reconcile, and a single device actor that serializes NPU work. |

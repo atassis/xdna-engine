@@ -1,8 +1,13 @@
 # scripts/
 
-194 entries, flat on disk, doing eight unrelated jobs. This index groups them by job so you
+316 entries, flat on disk, doing eight unrelated jobs. This index groups them by job so you
 can find the one you want without reading filenames. Descriptions are each script's own
 header line, not a re-description.
+
+It is a curated index, not a manifest: **155 of the 316 have a row here.** Both numbers are
+checked by `scripts/check_selfdescribing_indexes.py`, which derives them rather than trusting
+this sentence -- the count above read 194 for long enough that a task filed against it quoted
+307, and by the time that was read the truth had moved again.
 
 **Device discipline:** the NPU is single-tenant. Anything marked **[NPU]** takes the device -
 announce it, stop `npu-serve` / `npu-asr`, and check `fuser -v /dev/accel/accel0` first.
