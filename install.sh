@@ -82,6 +82,9 @@ LEGACY_UNITS="npu-asr.service npu-serve.service"
 # desired-state config. The binary keeps its own name; the SERVICE is the product name.
 ENGINE_BIN_DIR="${ENGINE_BIN_DIR:-$HOME/.local/bin}"
 ENGINE_BIN="$ENGINE_BIN_DIR/npu"
+# Where installed binaries are kept, keyed by build-id, so a core outliving its executable can
+# still be symbolised. See archive_binary_by_build_id below for what this cost when it was absent.
+ENGINE_BIN_ARCHIVE="${ENGINE_BIN_ARCHIVE:-${XDG_DATA_HOME:-$HOME/.local/share}/xdna-engine/bin-archive}"
 
 # ASK cargo where it puts artifacts; do not assume $REPO/rust/target.
 #
@@ -206,19 +209,64 @@ ok "Built engine binary: $BUILT_BIN"
 # This is the step whose absence made every previous "successful" install a no-op: the unit
 # runs $ENGINE_BIN, but nothing ever copied the freshly built binary there. A stale binary in
 # ~/.local/bin would keep serving while the build reported green.
+# Keep every installed binary reachable by BUILD-ID, so a core dump can always be symbolised.
+#
+# Why this is not optional hygiene. Measured 2026-09-08: a 3.3 GB core from an `npu` SIGSEGV that
+# day could not be symbolised at all, because the executable it names --
+# `~/.local/bin/npu (deleted)`, build-id f9f4b92af25f... -- had been replaced by the
+# next install. Its stored trace is `#0 0x35c3c0 n/a (n/a + 0x0)`, permanently. Four earlier npu
+# SIGSEGVs had already had their cores evicted. The task chasing that crash recorded the blocker as
+# "build from the SAME commit and keep it", which cannot work: the artifact is destroyed by the
+# next install, not by forgetfulness. Only an archive keyed on what the core actually references --
+# the build-id -- fixes it.
+#
+# Hardlinks, so this costs ZERO extra disk: install(1) creates a new inode, so linking the outgoing
+# binary aside merely keeps its existing inode alive, and linking the incoming one shares storage
+# until some later install replaces the path.
+archive_binary_by_build_id() {
+  local bin="$1" why="$2" id dest
+  [ -x "$bin" ] || return 0
+  command -v readelf >/dev/null 2>&1 || { warn "readelf missing -- not archiving $why binary"; return 0; }
+  # `|| true`: this file runs under `set -euo pipefail`, and readelf fails on anything that is not
+  # an ELF, so a bare assignment would abort the WHOLE install rather than skip one archive step.
+  # Same trap the comment further down already names for `[ ... ] && info ...`. Caught by testing
+  # the no-build-id case, which is the only reason it is not in the shipped script.
+  id="$(readelf -n "$bin" 2>/dev/null | sed -n 's/.*Build ID: \([0-9a-f]\{8,\}\).*/\1/p' | head -1 || true)"
+  [ -n "$id" ] || { warn "no build-id on $bin -- not archiving ($why)"; return 0; }
+  mkdir -p "$ENGINE_BIN_ARCHIVE"
+  dest="$ENGINE_BIN_ARCHIVE/npu-$id"
+  [ -e "$dest" ] && return 0
+  ln "$bin" "$dest" 2>/dev/null || cp -p "$bin" "$dest" || { warn "could not archive $why binary"; return 0; }
+  info "  archived $why binary as npu-$id"
+}
+
 info "Installing engine binary -> $ENGINE_BIN"
 mkdir -p "$ENGINE_BIN_DIR"
 if [ -x "$ENGINE_BIN" ] && cmp -s "$BUILT_BIN" "$ENGINE_BIN"; then
   ok "Engine binary already current: $ENGINE_BIN"
+  archive_binary_by_build_id "$ENGINE_BIN" "current"
 else
   # NB: `[ ... ] && info ...` would abort under `set -e` when the test is false (first install).
   if [ -x "$ENGINE_BIN" ]; then
     info "  replacing existing binary (was $(date -r "$ENGINE_BIN" '+%Y-%m-%d %H:%M'))"
   fi
+  # Archive the OUTGOING one before install(1) unlinks the path: a core produced by it may not have
+  # been read yet, and after this point nothing else on the box can identify that build.
+  archive_binary_by_build_id "$ENGINE_BIN" "outgoing"
   # install(1) replaces atomically-ish and preserves the mode; a running service keeps its
   # open inode until restarted, so this is safe to do while the old one is serving.
   install -m 0755 "$BUILT_BIN" "$ENGINE_BIN"
   ok "Installed: $ENGINE_BIN ($(date -r "$ENGINE_BIN" '+%Y-%m-%d %H:%M'))"
+  archive_binary_by_build_id "$ENGINE_BIN" "installed"
+fi
+
+# Bounded: keep the newest 10 (~170 MB worst case, and far less while hardlinks share storage with
+# the live binary). Unbounded would trade one silent failure for another.
+if [ -d "$ENGINE_BIN_ARCHIVE" ]; then
+  # shellcheck disable=SC2012  # names are npu-<hex>, so ls -t is safe here
+  ls -t "$ENGINE_BIN_ARCHIVE"/npu-* 2>/dev/null | tail -n +11 | while read -r old; do
+    rm -f "$old" && info "  pruned archived binary $(basename "$old")"
+  done
 fi
 
 # ---------------------------------------------------------------------------
