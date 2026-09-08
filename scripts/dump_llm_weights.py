@@ -29,7 +29,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 "..", "designs", "decode_fused"))
 from llm_decode_spec import SPECS  # noqa: E402
 
-HF_REPO = {"qwen3-0.6b": "Qwen/Qwen3-0.6B", "gemma3-270m": "unsloth/gemma-3-270m-it"}
+HF_REPO = {"qwen3-0.6b": "Qwen/Qwen3-0.6B", "gemma3-270m": "unsloth/gemma-3-270m-it",
+           "gemma4-12b": "unsloth/gemma-4-12b-it"}
 
 # The projection leaves, i.e. everything that is a [out, in] matrix rather than a norm gain or the
 # embedding table. Only these are packable.
@@ -59,6 +60,9 @@ def main():
     repo = a.repo or HF_REPO[a.spec]
     NL = a.layers if a.layers is not None else sp.n_layers
     os.makedirs(a.out, exist_ok=True)
+
+    # HF stores nn.Linear weights as [out, in].
+    D_, FF_, V_ = sp.d_model, sp.ffn, sp.vocab
 
     quant_leaves = {x for x in a.quant_leaves.split(",") if x}
     quantize_weight = None
@@ -92,34 +96,49 @@ def main():
         with safe_open(index[key], framework="pt") as f:
             return f.get_tensor(key).float().numpy()
 
+    # EVERY name comes off the spec, never a literal. `weight_prefix` is "model." on a text-only
+    # checkpoint and "model.language_model." on Gemma-4-12B, whose text stack sits beside a vision
+    # and an audio embedder -- a hardcoded prefix reports that as a missing tensor and names a path
+    # instead of the axis.
     want = {}
+    exp_per_key = {}   # key -> expected [out, in], since the two geometries do not share one
     for l in range(NL):
         want.update({v: None for v in sp.norm_weight_names(l).values()})
-        for t in ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj",
-                  "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"):
-            want[f"model.layers.{l}.{t}.weight"] = None
-    want["model.norm.weight"] = None
-    want["model.embed_tokens.weight"] = None
-
-    # expected shapes -- HF stores nn.Linear weights as [out, in]
-    D, FF, HD, QD, KVD, V = sp.d_model, sp.ffn, sp.head_dim, sp.q_dim, sp.kv_dim, sp.vocab
-    exp = {"q_proj": (QD, D), "k_proj": (KVD, D), "v_proj": (KVD, D), "o_proj": (D, QD),
-           "gate_proj": (FF, D), "up_proj": (FF, D), "down_proj": (D, FF)}
+        # Per-layer, not per-spec: Gemma-4-12B's global layers are head_dim 512 / 1 kv head where
+        # its sliding layers are 256 / 8, so q_proj is [8192, D] on one and [4096, D] on the other.
+        # Checking both against the uniform value would reject the correct checkpoint.
+        qd, kvd, hd = sp.q_dim_for(l), sp.kv_dim_for(l), sp.head_dim_for(l)
+        leaves = {"self_attn.q_proj": (qd, D_), "self_attn.k_proj": (kvd, D_),
+                  "self_attn.o_proj": (D_, qd), "mlp.gate_proj": (FF_, D_),
+                  "mlp.up_proj": (FF_, D_), "mlp.down_proj": (D_, FF_)}
+        # attention_k_eq_v: a layer whose V is the raw k projection HAS no v_proj tensor. Demanding
+        # one turns a correctly-dumped checkpoint into a KeyError.
+        if sp.has_v_proj(l):
+            leaves["self_attn.v_proj"] = (kvd, D_)
+        for t, shape in leaves.items():
+            key = f"{sp.weight_prefix}layers.{l}.{t}.weight"
+            want[key] = None
+            exp_per_key[key] = shape
+        for nm in sp.norm_weight_names(l).values():
+            # q_norm/k_norm are per-HEAD, so they follow the layer's head_dim; every other norm is
+            # d_model-wide.
+            exp_per_key[nm] = (hd,) if nm.endswith(("q_norm.weight", "k_norm.weight")) else (D_,)
+        if sp.layer_scalar:
+            # A register_buffer -- in the checkpoint, absent from config.json, and scalar-shaped, so
+            # it gets no shape assertion beyond "it is there".
+            want[sp.layer_scalar_name(l)] = None
+    want[f"{sp.weight_prefix}norm.weight"] = None
+    exp_per_key[f"{sp.weight_prefix}norm.weight"] = (D_,)
+    want[f"{sp.weight_prefix}embed_tokens.weight"] = None
+    exp_per_key[f"{sp.weight_prefix}embed_tokens.weight"] = (V_, D_)
 
     n, packed = 0, []
     for key in sorted(want):
         w = get(key)
         leaf = key.rsplit(".", 2)[-2]
-        if leaf in exp and w.shape != exp[leaf]:
-            raise ValueError(f"{key}: shape {w.shape} != expected {exp[leaf]} for spec {sp.name}")
-        if key.endswith("q_norm.weight") or key.endswith("k_norm.weight"):
-            if w.shape != (HD,):
-                raise ValueError(f"{key}: shape {w.shape} != expected ({HD},)")
-        elif "layernorm" in key or key == "model.norm.weight":
-            if w.shape != (D,):
-                raise ValueError(f"{key}: shape {w.shape} != expected ({D},)")
-        if key == "model.embed_tokens.weight" and w.shape != (V, D):
-            raise ValueError(f"{key}: shape {w.shape} != expected ({V}, {D})")
+        want_shape = exp_per_key.get(key)
+        if want_shape is not None and w.shape != want_shape:
+            raise ValueError(f"{key}: shape {w.shape} != expected {want_shape} for spec {sp.name}")
         # Shapes are checked ABOVE, on the f32 array, before any packing -- a packed tensor is a
         # flat byte run and has no shape left to check.
         if quantize_weight is not None and leaf in quant_leaves:
