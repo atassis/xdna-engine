@@ -57,14 +57,23 @@ def bf16(a):
     return np.asarray(a).astype(BF16)
 
 
-# The GEMM's NUMERICS, which the registry keys on and which decide whether this block can pass the
-# tier-1 tolerance gate at all. Measured on device 2026-09-08 against a float64 reference on layer-0
-# V: the M=1 GEMV sits at 1.658e-3, the batched GEMM at 4.332e-3 with these OFF/ON and 1.219e-2 with
-# both ON (IRON's defaults). bfp16 costs accuracy here and buys nothing, because batched prefill is
-# movement-bound -- half the array costs 1.189x. AMD ships bfp16 ON for their shapes, which are
-# compute-bound at 3B/2048; ours are not, so the right answer differs.
-EMULATE = os.environ.get("PREFILL_BFP16", "0") == "1"
-PRIO_ACC = os.environ.get("PREFILL_ACC", "1") == "1"
+# The GEMM's NUMERICS. Defaults are IRON's (bfp16 emulation ON, f32 C accumulator OFF) and MATCH
+# `gen_llm_prefill.py`, which is what the gated 28-layer artifact is built from -- two generators
+# for one rail must not disagree about the arithmetic.
+#
+# CORRECTED 2026-09-09, and the correction is the point. This block briefly defaulted to
+# PREFILL_BFP16=0 PREFILL_ACC=1 on the grounds that bfp16 "buys nothing, because batched prefill is
+# movement-bound". That was DERIVED, and measuring it refuted it: interleaved in one window over
+# three rounds, the accuracy arm costs **4486 us against 2805 us, 1.60x**. The mechanism is movement
+# after all -- `prio_accuracy` makes the L1 C tiles f32, doubling the C traffic, and `emulate=False`
+# drops to the plain-bf16 128 MAC/cyc path.
+#
+# What it buys, measured the same way: 1.01x a faithful bf16 floor against 1.60x
+# (mean_rel_L1 1.593e-2 vs 2.516e-2). So it is ~1.6x time for ~1.6x error, and BOTH arms pass tier 1
+# and tier 2 -- the 28-layer stack that passes the token gate 14/14 is the fast arm. Fast is the
+# default; the knobs stay so the trade can be re-taken per model rather than re-argued.
+EMULATE = os.environ.get("PREFILL_BFP16", "1") == "1"
+PRIO_ACC = os.environ.get("PREFILL_ACC", "0") == "1"
 
 
 def pick_tiles(batch, shapes):
