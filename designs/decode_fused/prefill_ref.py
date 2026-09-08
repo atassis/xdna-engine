@@ -96,6 +96,8 @@ def softmax_rows(s, widths, rnd=bf16):
     if widths is not None:
         keep = np.arange(f.shape[-1])[None, :] < np.asarray(widths, np.int64)[:, None]
         f = np.where(keep, f, -np.inf)
+    if rnd is bf16:
+        return softmax_device(s, widths)     # the DEVICE's softmax -- LUT included, see K020
     e = np.exp(f - f.max(-1, keepdims=True))
     e = np.nan_to_num(e, nan=0.0)
     return rnd(e / e.sum(-1, keepdims=True))
@@ -162,6 +164,71 @@ def silu_device(g):
     one_plus = np.asarray(bf16(aie_tanh_bf16(half) + np.float32(1.0)), np.float32)
     sig = np.asarray(bf16(one_plus * np.float32(0.5)), np.float32)               # exact: 2^-1
     return bf16(np.asarray(gb, np.float32) * sig)
+
+
+# ------------------------------------------------------------------------------------------------
+# aie::exp2, sampled. UNLIKE aie::tanh this one cannot be enumerated, and that was MEASURED rather
+# than assumed: softmax.cc feeds it `aie::sub(scaled_accum, max_vec).to_vector<float>()`, an f32
+# accumulator value, and a device sweep found bf16 keys mapping to more than one output -- so the
+# block sees more of its argument than bf16 and the domain is not finite. What IS true is that the
+# output is a coarse step table (128 steps per binade on [-1,0), and the step scales with |x|), so a
+# 1/1024 sample resolves it well. The model's own fidelity is measured on HELD-OUT real arguments
+# and recorded here, because a floor derived from an unvalidated model is worth nothing.
+# ------------------------------------------------------------------------------------------------
+_EXP2_TAB = None
+# Measured on device 2026-09-09 against 1024 held-out real softmax arguments: 992/1024 bit-exact,
+# mean rel 4.872e-4, while the LUT's OWN error against exact exp2 on the same arguments is mean
+# 4.451e-2 -- the model is 91x tighter than the effect it models.
+EXP2_MODEL_MEAN_REL = 4.872e-4
+EXP2_LUT_MEAN_REL = 4.451e-2
+
+
+def aie_exp2_bf16(x):
+    """`aie::exp2<bfloat16>` by dense device sample + nearest-below lookup.
+
+    Outside the sampled window the value is taken exactly, and the bound is why that is safe rather
+    than convenient: a softmax row sums to 1, so a term at x < -16 contributes at most 2**-16 =
+    1.5e-5 of the row -- below the bf16 floor this gate is measuring. -inf (a masked position) is 0
+    by definition and never reaches the table.
+    """
+    global _EXP2_TAB
+    if _EXP2_TAB is None:
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__)))), "tests", "refs", "aie_exp2_bf16_table.npz")
+        if not os.path.isfile(path):
+            raise SystemExit(f"ERROR: {path} is missing -- the bf16 arm cannot model aie::exp2 "
+                             f"without it. Regenerate it on device; see the note in this docstring.")
+        z = np.load(path)
+        _EXP2_TAB = (float(z["lo"]), int(z["per"]), np.asarray(z["hw"], np.float32))
+    lo, per, tab = _EXP2_TAB
+    f = np.asarray(x, np.float32)
+    out = np.exp2(np.clip(f, -400.0, 128.0)).astype(np.float32)   # the exact fallback
+    out[np.isneginf(f)] = 0.0
+    inside = (f >= lo) & (f < lo + len(tab) / per) & np.isfinite(f)
+    idx = np.clip(((f[inside] - lo) * per).astype(np.int64), 0, len(tab) - 1)
+    out[inside] = tab[idx]
+    return out
+
+
+def softmax_device(s, widths):
+    """`aie_kernels/aie2p/softmax.cc` step for step, including the SFU LUT.
+
+    Three passes, as the kernel has them: a max over `bf16(s*log2e)`, `exp2(s*log2e - max)` through
+    the LUT, then a scale by `bf16(aie::inv(sum))`. `aie::inv` is modelled as an exact reciprocal --
+    it is an SFU op too and may not be, which is the FIRST place to look if this arm's residual
+    against the device stays large.
+    """
+    f = np.asarray(s, np.float32)
+    if widths is not None:
+        keep = np.arange(f.shape[-1])[None, :] < np.asarray(widths, np.int64)[:, None]
+        f = np.where(keep, f, -np.inf)
+    log2e = np.float32(np.asarray(bf16(1.4426950408889634)))      # what the kernel broadcasts
+    scaled = np.asarray(bf16(f * log2e), np.float32)              # reduce_max runs on the bf16 form
+    mx = np.asarray(bf16(np.nanmax(np.where(np.isfinite(scaled), scaled, -np.inf),
+                                   -1, keepdims=True)), np.float32)
+    ev = aie_exp2_bf16(f * log2e - mx)
+    tot = ev.sum(-1, keepdims=True, dtype=np.float32)
+    return bf16(ev * np.asarray(bf16(np.float32(1.0) / tot), np.float32))
 
 
 def gated_ffn_act(g, act, rnd):
