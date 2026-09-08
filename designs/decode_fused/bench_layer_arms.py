@@ -29,6 +29,7 @@ import json
 import re
 import os
 import statistics
+import subprocess
 import sys
 import time
 
@@ -38,7 +39,8 @@ import ml_dtypes
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import newstack_compat  # noqa: F401,E402
 import gen_llm_decode as G  # noqa: E402
-from gen_llm_decode import build_graph, report_artifact_freshness  # noqa: E402
+from gen_llm_decode import (build_graph, load_weight_buffer,  # noqa: E402
+                            report_artifact_freshness)
 from bench_llm_decode import rope_row  # noqa: E402
 
 BF16 = ml_dtypes.bfloat16
@@ -53,10 +55,19 @@ def census_from_mlir(fused, md):
     """
     out = {"NL": md.get("NL"), "S": md.get("S")}
     try:
-        src = open(fused.artifacts[0].mlir_input.filename).read()
+        path = fused.artifacts[0].mlir_input.filename
+        src = open(path).read()
         out["configures"] = len(re.findall(r"aiex\.configure\s+@", src))
         out["runs"] = len(re.findall(r"aiex\.run\s+@", src))
         out["designs"] = len(re.findall(r"aie\.device\(", src))
+        # DDR bytes are a varying control the moment an arm changes a weight DTYPE, so census them
+        # per arm from the same shim BDs rather than carrying a figure over from another build.
+        tool = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "..", "..", "scripts", "decode_ddr_bytes.py")
+        r = subprocess.run([sys.executable, os.path.abspath(tool), path],
+                           capture_output=True, text=True, timeout=600)
+        m = re.search(r"TOTAL DDR bytes/dispatch:\s*([\d.]+)\s*MB", r.stdout)
+        out["mb"] = float(m.group(1)) if m else float("nan")
     except Exception as e:
         out["census_error"] = repr(e)
     return out
@@ -87,10 +98,11 @@ def main():
     ap.add_argument("--spec", required=True)
     ap.add_argument("--weights", required=True)
     ap.add_argument("--arms", nargs="+", required=True,
-                    help="arm spec L[f]: layer count, optional 'f' = FUSE_MLP_O=1 (folds op_o into "
-                         "the MLP design: 5 runs/layer instead of 6, bytes ~unchanged). Fitting "
-                         "both variants gives alpha at two runs-per-layer values, which is what "
-                         "prices a whole-layer fusion.")
+                    help="arm spec L[f][cN][q<dtype>]: layer count; 'f' = FUSE_MLP_O=1 (folds "
+                         "op_o into the MLP design, 5 runs/layer instead of 6, bytes ~unchanged); "
+                         "'cN' = MLP_DP_COLS=N; 'q<dtype>' = QUANT_MLP_DTYPE (Wg/Wu/Wd), which "
+                         "moves per-layer WEIGHT bytes at constant configures -- the only way to "
+                         "measure the layer body's marginal weight-byte rate.")
     ap.add_argument("--max-seq", type=int, default=512)
     ap.add_argument("--pos", type=int, required=True)
     ap.add_argument("--reps", type=int, default=25)
@@ -108,17 +120,24 @@ def main():
     arms = []
     census = {}
     for spec in a.arms:
-        fmo = spec.endswith("f")
-        L = int(spec[:-1] if fmo else spec)
-        # FUSE_MLP_O is captured at gen_llm_decode IMPORT time, so flipping os.environ here would
-        # be silently ignored -- set the module global the generator actually reads.
+        m = re.fullmatch(r"(\d+)(f?)(?:c(\d+))?(?:q(\w+))?", spec)
+        if not m:
+            raise SystemExit(f"bad arm spec {spec!r}")
+        L = int(m.group(1))
+        fmo = m.group(2) == "f"
+        cols = int(m.group(3)) if m.group(3) else 8
+        qdt = m.group(4) or "bf16"
+        # These are captured at gen_llm_decode IMPORT time, so flipping os.environ here would be
+        # silently ignored -- set the module globals the generator actually reads.
         G.FUSE_MLP_O = fmo
+        G.MLP_DP_COLS = cols
+        G.QUANT_MLP_DTYPE = qdt
         t0 = time.perf_counter()
         sp, fused, weights, md = build_graph(a.spec, a.weights, L, a.max_seq)
         # A fit's CONTROL variables need the same evidence as its result: print every quantity
         # that differs between arms BEFORE fitting, not just the one being varied.
         census[spec] = census_from_mlir(fused, md)
-        census[spec]["fuse_mlp_o"] = fmo
+        census[spec].update(fuse_mlp_o=fmo, mlp_dp_cols=cols, quant_mlp=qdt)
         print(f"[layer-arms] built {spec} in {time.perf_counter()-t0:.1f}s  census={census[spec]}",
               flush=True)
         c = fused.get_callable()
@@ -126,10 +145,14 @@ def main():
         if params is None:
             raise SystemExit(f"[layer-arms] arm {spec}: no runtime parameters bound")
         for name, arr in weights.items():
-            np.copyto(c.get_buffer(name).data, np.asarray(arr, BF16).reshape(-1))
+            # load_weight_buffer, not np.copyto: a quantized arm's weights are PACKED int8 bytes
+            # and buf.data is a bf16-dtype view of the same arena, so copying through BF16 would
+            # reinterpret the packed byte values as floats.
+            load_weight_buffer(c.get_buffer(name), arr)
         del weights
         scale = np.sqrt(sp.d_model) if sp.embed_scale == "sqrt_d_model" else 1.0
-        arms.append(dict(spec=spec, L=L, fmo=fmo, sp=sp, c=c, params=params,
+        arms.append(dict(spec=spec, L=L, fmo=fmo, cols=cols, qdt=qdt, sp=sp, c=c,
+                         params=params,
                          xin=c.get_buffer("x"), rope_buf=c.get_buffer("rope_global"),
                          scale=scale))
     print(f"[layer-arms] {len(arms)} arms resident, dispatching at pos={a.pos}", flush=True)
@@ -153,27 +176,35 @@ def main():
         for arm in arms:
             samples[arm["spec"]].append(one(arm))
 
-    print(f"\n{'arm':>6} {'L':>4} {'cfg':>5} {'n':>4} {'median_ms':>10} {'spread_%':>9} "
-          f"{'min_ms':>9} {'max_ms':>9}")
+    print(f"\n{'arm':>8} {'L':>4} {'cfg':>5} {'MB':>9} {'n':>4} {'median_ms':>10} "
+          f"{'spread_%':>9} {'min_ms':>9} {'max_ms':>9}")
     report = {}
-    for arm in sorted(arms, key=lambda x: (x["fmo"], x["L"])):
+    for arm in sorted(arms, key=lambda x: (x["qdt"], x["cols"], x["fmo"], x["L"])):
         sp_ = arm["spec"]
         xs = [t * 1e3 for t in samples[sp_]]
         med, spread = median_spread(xs)
         report[sp_] = {"reps": xs, "median_ms": med, "spread_pct": spread, "L": arm["L"],
-                       "fuse_mlp_o": arm["fmo"], "min_ms": min(xs), "census": census[sp_]}
-        print(f"{sp_:>6} {arm['L']:4} {census[sp_].get('configures', 0):5} {len(xs):4} "
+                       "fuse_mlp_o": arm["fmo"], "cols": arm["cols"], "qdt": arm["qdt"],
+                       "mb": census[sp_].get("mb"), "min_ms": min(xs), "census": census[sp_]}
+        print(f"{sp_:>8} {arm['L']:4} {census[sp_].get('configures', 0):5} "
+              f"{census[sp_].get('mb', float('nan')):9.2f} {len(xs):4} "
               f"{med:10.3f} {spread:9.2f} {min(xs):9.3f} {max(xs):9.3f}")
 
     # Fit on MEDIANS and again on MINIMA. A sustained downclock inflates a whole cell with LOW
     # variance (four-configures-a-layer-came-off-without-a-new-kernel: one cell read 110.261 ms at
     # sd 0.147), so a spread filter cannot catch it -- agreement between the two fits is the check.
-    for fmo in (False, True):
-        group = sorted((s_ for s_ in report if report[s_]["fuse_mlp_o"] == fmo),
+    keys = sorted({(report[s_]["fuse_mlp_o"], report[s_]["cols"], report[s_]["qdt"])
+                   for s_ in report})
+    for key in keys:
+        group = sorted((s_ for s_ in report
+                        if (report[s_]["fuse_mlp_o"], report[s_]["cols"],
+                            report[s_]["qdt"]) == key),
                        key=lambda s_: report[s_]["L"])
         if len(group) < 2:
             continue
-        tag = "FUSE_MLP_O=1 (5 runs/layer)" if fmo else "FUSE_MLP_O=0 (6 runs/layer)"
+        fmo, cols, qdt = key
+        tag = (f"FUSE_MLP_O={int(fmo)} ({6-int(fmo)} runs/layer), MLP_DP_COLS={cols}, "
+               f"QUANT_MLP={qdt}")
         for label, key in (("median", "median_ms"), ("min", "min_ms")):
             pairs = [(report[s_]["L"], report[s_][key]) for s_ in group]
             alpha, beta, resid = fit_affine(pairs)

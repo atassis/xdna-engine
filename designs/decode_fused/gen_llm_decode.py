@@ -159,7 +159,7 @@ FUSE_ACT = os.environ.get("FUSE_ACT", "0") == "1"
 # N=32 are SLOWER, because fitting them inside the 16-channel ShimDMA budget needs a MemTile
 # split/join whose small strided-gather fills cost more than the finer parallelism buys.
 FUSE_MLP_DP = os.environ.get("FUSE_MLP_DP", "1") == "1"
-MLP_DP_COLS = int(os.environ.get("MLP_DP_COLS", "8"))
+MLP_DP_COLS = int(os.environ.get("MLP_DP_COLS", "4"))
 
 # Wq/Wk/Wv concatenated into ONE [QD+2*KVD, D] weight and projected by ONE GEMV writing a single
 # `qkv` buffer; q/k/v become byte slices of it. Three runs and two configures per layer become one
@@ -218,7 +218,7 @@ FUSE_QKV_DP = os.environ.get("FUSE_QKV_DP", "1") == "1"
 # FUSE_MLP_DP's own 49.8%; see iron/operators/swiglu_mlp_dp/design.py's FUSE_O module docstring for
 # the TSI_O-vs-D_PER_CORE divisibility issue this works around with a 1-row Wo pad, not measured on
 # device).
-FUSE_MLP_O = os.environ.get("FUSE_MLP_O", "0") == "1"
+FUSE_MLP_O = os.environ.get("FUSE_MLP_O", "1") == "1"
 
 
 def weight_bytes(arr):
