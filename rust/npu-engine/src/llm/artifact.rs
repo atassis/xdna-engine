@@ -744,6 +744,45 @@ mod tests {
         assert!(err.contains("attention geometry disagrees"), "{err}");
     }
 
+    /// Load a REAL built artifact and assert the geometry contract on it. Device-free -- this only
+    /// parses `meta.json` -- but it is the only test that sees a generator's actual output rather
+    /// than a hand-written meta, which is where the two components can disagree.
+    ///
+    ///   NPU_LLM_DECODE_DIR=/path/to/decode cargo test -p npu-engine real_artifact_geometry
+    ///
+    /// Skips when unset, because the artifact is a 5 GB build output and does not belong in a repo.
+    #[test]
+    fn a_real_artifact_loads_and_its_geometry_is_self_consistent() {
+        let Ok(dir) = std::env::var("NPU_LLM_DECODE_DIR") else {
+            eprintln!("SKIP: set NPU_LLM_DECODE_DIR to a built decode artifact");
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+        if !dir.join("meta.json").exists() {
+            eprintln!("SKIP: no meta.json under {}", dir.display());
+            return;
+        }
+        let art = LlmArtifact::load(&dir).expect("a built artifact must load");
+        // The cross-check in `load` already ran; restate what it guarantees so a failure here says
+        // WHICH half broke rather than only that loading failed.
+        let mut declared: Vec<usize> = art.kv_offs.iter().map(|&(_, hd)| hd).collect();
+        declared.sort_unstable();
+        declared.dedup();
+        assert!(declared.contains(&art.head_dim), "dims.head_dim {} not in {declared:?}", art.head_dim);
+        for name in ["rope_global", "rope_local"] {
+            if let Some(loc) = art.layout.get(name) {
+                assert!(declared.contains(&(loc.len / 2)),
+                        "{name} is {} bf16 wide, not one of {declared:?}", loc.len / 2);
+            }
+        }
+        // A per-layer-geometry artifact must declare BOTH rows; one row cannot serve two widths.
+        if declared.len() > 1 {
+            assert!(art.layout.contains_key("rope_local"),
+                    "{} declares {declared:?} but only one angle row", dir.display());
+        }
+        eprintln!("[ok] {}: head_dims {declared:?}, kv slots {}", dir.display(), art.kv_offs.len());
+    }
+
     #[test]
     fn unknown_embed_scale_fails_loud_rather_than_defaulting() {
         let dir = tempfile::tempdir().unwrap();
