@@ -89,7 +89,8 @@ tier1() {
     if [ "$JUDGE_ONLY" = "0" ]; then
       # Which probe reads this artifact is a property of the artifact, so read it off meta.json
       # rather than keeping a list here that drifts from the generators.
-      out="$(jq -r .output "$art/meta.json")"
+      out="$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["output"])' \
+              "$art/meta.json")"
       case "$out" in
         out|cx)  probe=fused_elf_probe ;;
         xout)    probe=prefill_golden_probe ;;
@@ -122,7 +123,7 @@ tier2() {
     export PATH="$VENV_IRON/bin:$VENV_IRON/cc-shim:$AIEBU_ASM_DIR:$PATH"
     device_step "greedy decode, $TOKENS tokens, capturing top-$K per step"
     "$PY" "$REPO/designs/decode_fused/verify_llm_decode.py" --spec "$SPEC" --weights "$WEIGHTS" \
-        --ref "$REF" --steps "$TOKENS" --topk "$K" --emit-topk "$NPU_JSON" "${EXTRA[@]}" || return 2
+        --ref "$REF" --steps "$TOKENS" --topk "$K" --emit-topk "$NPU_JSON" ${EXTRA[@]+"${EXTRA[@]}"} || return 2
   fi
   echo
   "$PY" "$REPO/scripts/gate_token_set.py" --ref "$REF" --npu "$NPU_JSON" --k "$K"
@@ -130,7 +131,7 @@ tier2() {
 
 rc=0
 case "$MODE" in
-  --refresh-goldens) refresh_goldens "${EXTRA[@]}"; rc=$? ;;
+  --refresh-goldens) refresh_goldens ${EXTRA[@]+"${EXTRA[@]}"}; rc=$? ;;
   --make-ref)        make_ref; rc=$? ;;
   --tier1)           tier1; rc=$? ;;
   --tier2)           tier2; rc=$? ;;
