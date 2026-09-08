@@ -189,3 +189,42 @@ fn every_supported_shell_generates_a_non_trivial_script() {
         assert!(s.contains("diarize"), "{sh:?} missing a subcommand");
     }
 }
+
+/// `--q-len` and `--preemption` are the two knobs the multi-tenant queue work will need on `serve`:
+/// how deep the request queue runs, and whether a higher-criticality request may preempt a running
+/// one. Neither exists yet, and this test asserts they still do not parse.
+///
+/// It is here to hold the NAMES. This tree has a specific allergy to declared-but-unimplemented
+/// surface -- `Capability::TTS` and `IMAGE_SR` sat in `ALL` and were served over HTTP with no CLI
+/// verb for long enough that nobody noticed. A flag that parses and then errors is the same thing
+/// with a friendlier face: shell completion offers it, so it reads as a capability. Better that the
+/// name is unclaimed until it works, and that whoever repurposes either spelling for something else
+/// fails here rather than shipping a `--q-len` that means something unrelated.
+#[test]
+fn reserved_queue_names_do_not_parse() {
+    use clap::Parser;
+    for flag in ["--q-len", "--preemption"] {
+        let r = cli_def::Cli::try_parse_from(["npu", "serve", flag, "10"]);
+        assert!(
+            r.is_err(),
+            "{flag} parses, but nothing implements it. Either it now does something -- in which \
+             case document it and delete it from this test -- or the name has been taken for an \
+             unrelated purpose, which is what this test exists to catch."
+        );
+    }
+}
+
+/// clap validates the command tree (duplicate long names, colliding shorts, bad defaults) only in
+/// `debug_assert`s that fire when a command is BUILT, so an inconsistency reaches a debug user as a
+/// panic at the moment they run the offending subcommand and a release user as silence.
+///
+/// A global `-o` for `--output` was written and did exactly that: it collided with
+/// `transcribe-media -o/--out`, built clean, ran clean on every other subcommand, and panicked only
+/// once `transcribe-media` itself was invoked.
+///
+/// The completion tests above do catch it, because generating a script builds the tree -- but they
+/// report it as a panic inside an unrelated assertion. This one names the failure.
+#[test]
+fn the_command_tree_is_internally_consistent() {
+    cli_def::Cli::command().debug_assert();
+}

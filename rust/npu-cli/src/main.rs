@@ -13,7 +13,7 @@ mod media;
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser};
 
-use cli_def::{Cli, Cmd, ConfigCmd, OutFormat, SamplingArgs, WeightsCmd};
+use cli_def::{Cli, Cmd, ConfigCmd, OutFormat, OutputFormat, SamplingArgs, WeightsCmd};
 use clap_complete::Shell;
 use exit::{engine_error, Code, Tagged};
 use npu_runtime::actor::{start, start_lazy};
@@ -50,6 +50,10 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: &Cli, path: &Path) -> Result<()> {
+    // `--output json` is the one global spelling; the per-command `--json` flags stay accepted
+    // until the socket rewrite makes every response structured and the table becomes a renderer.
+    // Either asks for JSON, so they are OR-ed rather than one overriding the other.
+    let as_json = cli.output == OutputFormat::Json;
     match &cli.cmd {
         Cmd::Serve { port, allow_degraded } => serve(path, *port, *allow_degraded),
         Cmd::Transcribe { input, model } => transcribe(path, input, model.as_deref()),
@@ -58,19 +62,19 @@ fn run(cli: &Cli, path: &Path) -> Result<()> {
         Cmd::Chat { prompt, model, sampling, no_stream } =>
             chat(path, prompt.as_deref(), model.as_deref(), sampling, *no_stream),
         Cmd::Embed { text, model } => embed(path, text, model.as_deref()),
-        Cmd::Diarize { wav, model, json } => diarize(path, wav, model.as_deref(), *json),
+        Cmd::Diarize { wav, model, json } => diarize(path, wav, model.as_deref(), *json || as_json),
         Cmd::TranscribeMedia { input, out, format, asr, diarize: diar, track, no_diarize } =>
             transcribe_media(path, input, out.as_deref(), *format, asr.as_deref(),
                              diar.as_deref(), *track, *no_diarize),
-        Cmd::Models { json, port } => models(&path, *json, *port),
+        Cmd::Models { json, port } => models(&path, *json || as_json, *port),
         Cmd::Reload { port } => reload(&path, *port),
         Cmd::Load { model, port } => load_model(&path, model, *port),
         Cmd::Unload { model, port } => unload_model(&path, model, *port),
         Cmd::Bake { name } => bake(&path, name),
         Cmd::Config { action } => config_cmd(&path, action),
-        Cmd::Flags { json } => flags_cmd(*json),
+        Cmd::Flags { json } => flags_cmd(*json || as_json),
         Cmd::Weights { action } => weights_cmd(&path, action),
-        Cmd::Doctor { json } => doctor::doctor(&cli, *json),
+        Cmd::Doctor { json } => doctor::doctor(&cli, *json || as_json),
         Cmd::Completions { shell } => {
             let mut cmd = Cli::command();
             let name = cmd.get_name().to_string();

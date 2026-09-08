@@ -18,6 +18,13 @@ pub struct Cli {
     /// Config path (default: $NPU_CONFIG or ~/.config/npu/engine.toml)
     #[arg(long, global = true, value_hint = ValueHint::FilePath)]
     pub config: Option<PathBuf>,
+    /// Output format for commands that have a machine-readable form.
+    // No `short = 'o'`, though the design asked for `-o`: `transcribe-media` already spells its
+    // output FILE `-o`, and a global short collides with it -- clap panics there with "Short option
+    // names must be unique". Freeing `-o` means renaming that one, which is a user-visible break and
+    // a separate decision.
+    #[arg(long = "output", global = true, value_enum, default_value_t = OutputFormat::Table)]
+    pub output: OutputFormat,
     #[command(subcommand)]
     pub cmd: Cmd,
 }
@@ -215,6 +222,11 @@ pub struct SamplingArgs {
 /// Transcript output formats.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 pub enum OutFormat { Md, Srt, Txt, Json }
+
+/// How a command RENDERS its response. Distinct from `OutFormat`, which is the document format
+/// `transcribe-media` writes to a file.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default, ValueEnum)]
+pub enum OutputFormat { #[default] Table, Json }
 
 impl OutFormat {
     pub fn as_str(self) -> &'static str {
