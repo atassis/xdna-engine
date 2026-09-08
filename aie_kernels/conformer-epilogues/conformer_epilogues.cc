@@ -43,6 +43,15 @@
 // un-tiled output, or split a/g into two N-wide GEMM outputs). Documented so the
 // resident-block wiring picks the right producer layout.
 //
+// ROUNDING: every node narrows f32 to bf16, so each entry swaps in conv_even and hands the mode
+// back. crRnd is one sticky register per core that aie_api never initialises, so a node that does
+// not set it rounds however the previous kernel on that core left it -- and the epilogue role
+// above puts mm.cc there, which installs floor unless built with -DROUND_CONV_EVEN. Held across
+// the whole call because these nodes are elementwise; a node with a reduction must not
+// (mm_mode_lnaffcast.cc, WER 8.2 -> 8.8). conf_epi_silu_design.py currently places the SiLU node
+// alone, so today the inherited mode is the design's, not the GEMM's; the guard is what makes the
+// answer independent of that.
+//
 //===----------------------------------------------------------------------===//
 
 #include <aie_api/aie.hpp>
@@ -77,6 +86,7 @@ static inline void silu_epilogue(const float *__restrict pin,
                                  bfloat16 *__restrict pout) {
   event0();
   static_assert(size % 16 == 0, "tile size must be a multiple of 16");
+  const auto saved_rounding = aie::swap_rounding(aie::rounding_mode::conv_even);
   const aie::vector<bfloat16, 16> half = aie::broadcast<bfloat16, 16>(0.5f);
   const aie::vector<bfloat16, 16> one = aie::broadcast<bfloat16, 16>(1.0f);
   for (int off = 0; off < size; off += 16) {
@@ -84,6 +94,7 @@ static inline void silu_epilogue(const float *__restrict pin,
     aie::vector<bfloat16, 16> sig = sigmoid_bf16(xv, half, one);
     aie::store_v(pout + off, aie::mul(xv, sig).to_vector<bfloat16>());
   }
+  aie::set_rounding(saved_rounding);
   event1();
 }
 
@@ -95,6 +106,7 @@ static inline void glu_epilogue(uint32_t M, uint32_t N,
                                 const float *__restrict pin,
                                 bfloat16 *__restrict pout) {
   event0();
+  const auto saved_rounding = aie::swap_rounding(aie::rounding_mode::conv_even);
   const aie::vector<bfloat16, 16> half = aie::broadcast<bfloat16, 16>(0.5f);
   const aie::vector<bfloat16, 16> one = aie::broadcast<bfloat16, 16>(1.0f);
   for (uint32_t r = 0; r < M; r++) {
@@ -108,6 +120,7 @@ static inline void glu_epilogue(uint32_t M, uint32_t N,
       aie::store_v(orow + j, aie::mul(av, sig).to_vector<bfloat16>());
     }
   }
+  aie::set_rounding(saved_rounding);
   event1();
 }
 
@@ -122,6 +135,7 @@ static inline void bn_fold_epilogue(uint32_t M, uint32_t N,
                                     const bfloat16 *__restrict pshift,
                                     bfloat16 *__restrict pout) {
   event0();
+  const auto saved_rounding = aie::swap_rounding(aie::rounding_mode::conv_even);
   for (uint32_t r = 0; r < M; r++) {
     const float *xrow = pin + (uint32_t)(r * N);
     bfloat16 *orow = pout + (uint32_t)(r * N);
@@ -134,6 +148,7 @@ static inline void bn_fold_epilogue(uint32_t M, uint32_t N,
       aie::store_v(orow + c, aie::add(prod, bv));
     }
   }
+  aie::set_rounding(saved_rounding);
   event1();
 }
 
@@ -147,6 +162,9 @@ static inline void residual_add_epilogue(uint32_t size, float alpha,
                                          const bfloat16 *__restrict presidual,
                                          bfloat16 *__restrict pout) {
   event0();
+  // Swapped before the alpha broadcast, not after: alpha is a host-supplied f32 narrowed once and
+  // reused on every element, so its rounding is a systematic bias, not per-element noise.
+  const auto saved_rounding = aie::swap_rounding(aie::rounding_mode::conv_even);
   const aie::vector<bfloat16, 16> av = aie::broadcast<bfloat16, 16>((bfloat16)alpha);
   for (uint32_t off = 0; off < size; off += 16) {
     aie::vector<bfloat16, 16> xv = load_narrow_bf16(px + off);
@@ -154,6 +172,7 @@ static inline void residual_add_epilogue(uint32_t size, float alpha,
     aie::vector<bfloat16, 16> sx = aie::mul(xv, av).to_vector<bfloat16>();
     aie::store_v(pout + off, aie::add(rv, sx));
   }
+  aie::set_rounding(saved_rounding);
   event1();
 }
 
@@ -187,11 +206,13 @@ void conformer_silu_bf16(uint32_t n, const float *c_in, bfloat16 *c_out) {
   const aie::vector<bfloat16, 16> half = aie::broadcast<bfloat16, 16>(0.5f);
   const aie::vector<bfloat16, 16> one = aie::broadcast<bfloat16, 16>(1.0f);
   event0();
+  const auto saved_rounding = aie::swap_rounding(aie::rounding_mode::conv_even);
   for (uint32_t off = 0; off < n; off += 16) {
     aie::vector<bfloat16, 16> xv = load_narrow_bf16(c_in + off);
     aie::vector<bfloat16, 16> sig = sigmoid_bf16(xv, half, one);
     aie::store_v(c_out + off, aie::mul(xv, sig).to_vector<bfloat16>());
   }
+  aie::set_rounding(saved_rounding);
   event1();
 }
 

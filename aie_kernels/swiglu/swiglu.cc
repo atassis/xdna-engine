@@ -77,6 +77,12 @@ static inline void swiglu(const float *__restrict pGate_in,
     up_ptr += 16;
 
     // s = 2^(-x*log2e) via the hardware exp2 SFU (bf16-output LUT).
+    //
+    // K001: inherits -- this is the only bf16 value in the kernel and it is not a narrowing the
+    // rounding register reaches. aie::exp2<bfloat16> lowers to __builtin_aie2p_exp2 (Peano's
+    // aie2p_nlf_vector.h), which returns bf16 straight from the SFU; it is not in the SRS convert
+    // family that crRnd governs, and the LUT's own error dominates a rounding step anyway. Nothing
+    // else here leaves f32, so the mode is left as found rather than swapped for no effect.
     aie::vector<float, 16> arg = aie::mul(gv, neg_log2e).to_vector<float>();
     aie::vector<bfloat16, 16> s_bf = aie::exp2<bfloat16>(arg);
 

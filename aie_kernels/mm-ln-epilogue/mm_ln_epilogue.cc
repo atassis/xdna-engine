@@ -60,6 +60,12 @@ static inline void ln_tiled_f32_bf16(const float *restrict acc, bfloat16 *restri
     float inv = ::aie::invsqrt(var + epsilon);
     ::aie::vector<float, V> inv_v = ::aie::broadcast<float, V>(inv);
 
+    // conv_even across the narrowing store ONLY -- the two reduction passes above stay in the
+    // ambient mode, because swapping it in ahead of a norm's reduction regressed WER 8.2 -> 8.8
+    // (mm_mode_lnaffcast.cc). Swapped per row for that reason, and handed back because crRnd is
+    // one sticky register shared with the GEMM on this core.
+    const auto saved_rounding = ::aie::swap_rounding(::aie::rounding_mode::conv_even);
+
     // write (x - mean) * inv back to the SAME tiled positions, f32 -> bf16
     for (int tj = 0; tj < ntiles; tj++) {
       ::aie::vector<float, V> d = ::aie::sub(::aie::load_v<V>(acc + rowbase + tj * R * T), mean_v);
@@ -68,6 +74,7 @@ static inline void ln_tiled_f32_bf16(const float *restrict acc, bfloat16 *restri
       ya.from_vector(y);
       ::aie::store_v(out + rowbase + tj * R * T, ya.template to_vector<bfloat16>());
     }
+    ::aie::set_rounding(saved_rounding);
   }
 }
 
