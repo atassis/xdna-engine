@@ -261,6 +261,13 @@ pub mod dispatch_log {
             )];
             let total: f64 = l.secs_by_kernel.values().sum();
             out.push(format!("  total BLOCKING dispatch time {total:.3} s"));
+            // The longest SINGLE wait, which is what the dispatch deadline has to clear. It lives
+            // here rather than in a log line because the deadline is meant to be re-sized against
+            // measurement, and a number nobody prints is a number nobody re-sizes against.
+            out.push(format!(
+                "  longest single dispatch {:.3} ms (deadline must stay well above this)",
+                super::dispatch_max_wait_ms()
+            ));
             out.push("  per-kernel  (count, total s, mean ms):".into());
             let mut ks: Vec<_> = l.per_kernel.iter().collect();
             ks.sort_by(|a, b| b.1.cmp(a.1));
@@ -494,6 +501,7 @@ extern "C" {
         trace: *mut CBo,
     ) -> *mut CRun;
     fn shim_run_wait(r: *mut CRun) -> c_int;
+    fn shim_dispatch_max_wait_ms() -> f64;
     fn shim_run_free(r: *mut CRun);
     fn shim_elf_kernel_load(
         d: *mut CDevice,
@@ -705,6 +713,16 @@ impl Drop for Run {
     fn drop(&mut self) {
         unsafe { shim_run_free(self.ptr) }
     }
+}
+
+/// Longest single dispatch wait this process has seen, in ms.
+///
+/// Every dispatch now waits with a deadline (`NPU_DISPATCH_TIMEOUT_MS`, default 30 s, 0 disables).
+/// The default is deliberately far above any healthy dispatch because it bounds a HANG rather than
+/// policing latency -- so this is the number to re-size it against, and the reason the figure is
+/// measured here instead of argued.
+pub fn dispatch_max_wait_ms() -> f64 {
+    unsafe { shim_dispatch_max_wait_ms() }
 }
 
 impl Device {

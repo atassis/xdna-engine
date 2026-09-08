@@ -4,6 +4,7 @@
 #include <string>
 #include <utility>
 #include <exception>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -35,12 +36,12 @@ struct ShimKernel { xrt::hw_context ctx; xrt::kernel kern; };
 struct ShimBo     { xrt::bo bo; };
 // `args` participates in ownership of the argument BOs: set_arg records only a device address
 // and a bo_id set, so neither XRT nor the driver keeps them alive for the run's lifetime.
-struct ShimRun    { xrt::run run; std::vector<xrt::bo> args; };
+struct ShimRun    { xrt::run run; std::vector<xrt::bo> args; std::string label; };
 // Full-ELF kernel: own the elf + hw_context so they outlive the ext::kernel that references them.
-struct ShimElfKernel { xrt::elf elf; xrt::hw_context ctx; xrt::ext::kernel kern; };
+struct ShimElfKernel { xrt::elf elf; xrt::hw_context ctx; xrt::ext::kernel kern; std::string name; };
 // Persistent-context path: ctx owns the partition (built once); ShimElfKernel2 borrows it.
 struct ShimElfCtx     { xrt::elf base_elf; xrt::hw_context ctx; };
-struct ShimElfKernel2 { xrt::elf elf; xrt::module mod; xrt::ext::kernel kern; };
+struct ShimElfKernel2 { xrt::elf elf; xrt::module mod; xrt::ext::kernel kern; std::string name; };
 
 // Per-sub-step timing of the ELF load path (attribution of the per-token re-registration cost),
 // gated by env XRT_SHIM_ELF_TIMING so it is a true no-op in production.
@@ -51,6 +52,129 @@ static bool elf_timing() {
 using shim_clock = std::chrono::steady_clock;
 static double ms_since(shim_clock::time_point t0) {
   return std::chrono::duration<double, std::milli>(shim_clock::now() - t0).count();
+}
+
+// Sized, not guessed -- and deliberately far above any healthy dispatch rather than tight, because
+// this deadline exists to bound a HANG, not to police latency. Reference points on this box: the
+// shipped Qwen3-0.6B fused decode step is one dispatch at ~55 ms, the fused Whisper decode step
+// 43.91 ms, and Gemma-4-12B projects ~236 ms/token. 30 s is ~127x the largest of those, so it
+// cannot fire on healthy work, and it turns an unbounded stall into a 30 s named error.
+// shim_dispatch_max_wait_ms() reports the longest wait actually observed, so this can be re-sized
+// against measurement instead of re-argued.
+#define NPU_DISPATCH_TIMEOUT_DEFAULT_MS 30000
+
+// --- dispatch deadline ------------------------------------------------------------------------
+// EVERY wait here used to be a bare `wait2()`, which XRT defines as `wait2(milliseconds{0})` --
+// "default block until run completes" (xrt/xrt_kernel.h). With no deadline, a wedged graph stalls
+// the host forever and the ONLY thing that can end it is the kernel driver's TDR: our diagnosis of
+// a hang was entirely the driver's, and any stall class the TDR does not cover had no owner at all.
+// That is what int4+FUSE_MLP_O=1 cost to find.
+//
+// The two abnormal outcomes are kept DISTINCT on purpose:
+//   cv_status::timeout -> the device never answered inside the deadline (wedged / deadlocked)
+//   command_error      -> the device answered abnormally, ERT_CMD_STATE_* in the message
+// Collapsing them would lose the difference between a deadlock and a rejection, which is the
+// first thing anyone debugging either one needs to know.
+//
+// NPU_DISPATCH_TIMEOUT_MS overrides the default; 0 restores the old block-forever behaviour for
+// anyone deliberately waiting on something longer than the default.
+static long dispatch_timeout_ms() {
+  static const long ms = [] {
+    const char* e = std::getenv("NPU_DISPATCH_TIMEOUT_MS");
+    if (!e || !*e) return static_cast<long>(NPU_DISPATCH_TIMEOUT_DEFAULT_MS);
+    char* end = nullptr;
+    long v = std::strtol(e, &end, 10);
+    return (end && *end == '\0' && v >= 0) ? v : static_cast<long>(NPU_DISPATCH_TIMEOUT_DEFAULT_MS);
+  }();
+  return ms;
+}
+
+static const char* ert_state_name(ert_cmd_state st) {
+  switch (st) {
+    case ERT_CMD_STATE_NEW:        return "NEW";
+    case ERT_CMD_STATE_QUEUED:     return "QUEUED";
+    case ERT_CMD_STATE_RUNNING:    return "RUNNING";
+    case ERT_CMD_STATE_COMPLETED:  return "COMPLETED";
+    case ERT_CMD_STATE_ERROR:      return "ERROR";
+    case ERT_CMD_STATE_ABORT:      return "ABORT";
+    case ERT_CMD_STATE_SUBMITTED:  return "SUBMITTED";
+    case ERT_CMD_STATE_TIMEOUT:    return "TIMEOUT";
+    case ERT_CMD_STATE_NORESPONSE: return "NORESPONSE";
+    case ERT_CMD_STATE_SKERROR:    return "SKERROR";
+    case ERT_CMD_STATE_SKCRASHED:  return "SKCRASHED";
+    default:                       return "UNKNOWN";
+  }
+}
+
+// Longest single wait this process has seen, so the default above can be RE-SIZED against measured
+// dispatches rather than re-guessed. Read via shim_dispatch_max_wait_ms().
+static std::atomic<double> g_max_wait_ms{0.0};
+
+static void note_wait(double ms) {
+  double prev = g_max_wait_ms.load(std::memory_order_relaxed);
+  while (ms > prev && !g_max_wait_ms.compare_exchange_weak(prev, ms, std::memory_order_relaxed)) {}
+}
+
+double shim_dispatch_max_wait_ms(void) { return g_max_wait_ms.load(std::memory_order_relaxed); }
+
+// `what` names the dispatch (entry point, plus the kernel/design name where the caller has one).
+// A timeout that cannot say WHICH dispatch wedged is only marginally better than a hang.
+// `run.state()` is itself a device call and can throw once the command is in a bad state, so it is
+// only ever read defensively -- a diagnostic that takes the process down is not a diagnostic.
+static std::string state_or(const xrt::run& run, const char* fallback) {
+  try { return ert_state_name(run.state()); } catch (...) { return fallback; }
+}
+
+static void wait_deadline(const xrt::run& run, const std::string& what) {
+  const long ms = dispatch_timeout_ms();
+  auto t0 = shim_clock::now();
+  if (ms == 0) {                    // opt-out: original block-forever semantics
+    run.wait2();
+    note_wait(ms_since(t0));
+    return;
+  }
+  // MEASURED on this box (XRT + amdxdna): an EXPIRED deadline does NOT come back as
+  // cv_status::timeout the way xrt_kernel.h's contract reads. The qds backend throws
+  // "qds_device::wait() unexpected command state" from inside wait2, because the command is still
+  // RUNNING when the wait gives up. So both exits are handled, and both are re-thrown with the
+  // same attribution -- relying on the documented return value alone would have produced a
+  // deadline that fires and still cannot say what wedged, which is most of the original problem.
+  try {
+    if (run.wait2(std::chrono::milliseconds{ms}) == std::cv_status::timeout) {
+      throw std::runtime_error("wait2 returned cv_status::timeout");
+    }
+  } catch (const xrt::run::command_error& e) {
+    // The device ANSWERED, abnormally. This is not a deadline event and must not be reported as
+    // one: it can arrive long before `ms` (a driver TDR is the common case), and "the device
+    // rejected this" is a different finding from "the device is wedged". The ert state is the
+    // whole payload, so it leads.
+    throw std::runtime_error(
+        "dispatch '" + what + "' failed: command state "
+        + ert_state_name(e.get_command_state()) + " after "
+        + std::to_string(static_cast<long>(ms_since(t0))) + " ms: " + e.what());
+  } catch (const std::exception& e) {
+    // MEASURED on this box (XRT + amdxdna): an EXPIRED deadline does NOT come back as
+    // cv_status::timeout the way xrt_kernel.h's contract reads. The qds backend throws
+    // "qds_device::wait() unexpected command state" from inside wait2, because the command is
+    // still RUNNING when the wait gives up. Relying on the documented return value alone would
+    // have produced a deadline that fires and still cannot say what wedged -- most of the
+    // original problem. Elapsed time, not the exception type, decides which story this is.
+    //
+    // NOTE the command is still IN FLIGHT on the deadline path: XRT documents that after a
+    // timeout it is the caller's responsibility to abort it, and we do not -- there is no abort
+    // in this ABI, and this path reports a wedged device rather than recovering from one. Treat
+    // the process as unusable for further dispatches once it fires.
+    const long waited = static_cast<long>(ms_since(t0));
+    const std::string where = "dispatch '" + what + "' (command state "
+                            + state_or(run, "UNREADABLE") + ", waited "
+                            + std::to_string(waited) + " ms): " + e.what();
+    if (waited + 1 >= ms) {
+      throw std::runtime_error(
+          "deadline: " + where + " -- NPU_DISPATCH_TIMEOUT_MS changes it, 0 disables it");
+    }
+    throw std::runtime_error("wait failed before the deadline: " + where);
+  }
+  note_wait(ms_since(t0));
 }
 
 static thread_local std::string g_err;
@@ -134,7 +258,7 @@ int shim_run_matmul8(ShimKernel* k, unsigned int opcode, ShimBo* instr, size_t i
   GUARD_INT(
     auto run = k->kern(opcode, instr->bo, instr_count,
                        a->bo, b->bo, c->bo, tmp->bo, trace->bo);
-    run.wait2();
+    wait_deadline(run, "matmul8");
     return 0;
   )
 }
@@ -143,7 +267,7 @@ int shim_run_dwconv6(ShimKernel* k, unsigned int opcode, ShimBo* instr, size_t i
                      ShimBo* x, ShimBo* w, ShimBo* y) {
   GUARD_INT(
     auto run = k->kern(opcode, instr->bo, instr_count, x->bo, w->bo, y->bo);
-    run.wait2();
+    wait_deadline(run, "dwconv6");
     return 0;
   )
 }
@@ -154,7 +278,7 @@ int shim_run_mha7(ShimKernel* k, unsigned int opcode, ShimBo* instr, size_t inst
                   ShimBo* q, ShimBo* kk, ShimBo* v, ShimBo* o) {
   GUARD_INT(
     auto run = k->kern(opcode, instr->bo, instr_count, q->bo, kk->bo, v->bo, o->bo);
-    run.wait2();
+    wait_deadline(run, "mha7");
     return 0;
   )
 }
@@ -165,7 +289,7 @@ int shim_run_bd8(ShimKernel* k, unsigned int opcode, ShimBo* instr, size_t instr
                  ShimBo* qpv, ShimBo* p, ShimBo* kk, ShimBo* v, ShimBo* ctx) {
   GUARD_INT(
     auto run = k->kern(opcode, instr->bo, instr_count, qpv->bo, p->bo, kk->bo, v->bo, ctx->bo);
-    run.wait2();
+    wait_deadline(run, "bd8");
     return 0;
   )
 }
@@ -184,7 +308,7 @@ int shim_run_kernel(ShimKernel* k, unsigned int opcode, ShimBo* instr, size_t in
       run.set_arg(static_cast<int>(3 + i), data[i]->bo);
     }
     run.start();
-    run.wait2();
+    wait_deadline(run, "kernel");
     return 0;
   )
 }
@@ -198,13 +322,14 @@ ShimRun* shim_run_matmul8_start(ShimKernel* k, unsigned int opcode, ShimBo* inst
     auto run = k->kern(opcode, instr->bo, instr_count,
                        a->bo, b->bo, c->bo, tmp->bo, trace->bo);
     return new ShimRun{ std::move(run),
-                        { instr->bo, a->bo, b->bo, c->bo, tmp->bo, trace->bo } };
+                        { instr->bo, a->bo, b->bo, c->bo, tmp->bo, trace->bo },
+                        "matmul8_start" };
   )
 }
 
 int shim_run_wait(ShimRun* r) {
   GUARD_INT(
-    r->run.wait2();
+    wait_deadline(r->run, r->label);
     return 0;
   )
 }
@@ -237,7 +362,7 @@ ShimElfKernel* shim_elf_kernel_load(ShimDevice* d, const void* elf_bytes, size_t
       std::fprintf(stderr, "[XRT_SHIM_ELF] load: elf=%.3f hw_context=%.3f ext_kernel=%.3f ms\n",
                    t_elf, t_ctx, t_kern);
     }
-    return new ShimElfKernel{ std::move(elf), std::move(ctx), std::move(k) };
+    return new ShimElfKernel{ std::move(elf), std::move(ctx), std::move(k), name };
   )
 }
 
@@ -250,7 +375,7 @@ int shim_run_elf(ShimElfKernel* k, ShimBo* const* bos, size_t n_bos) {
       run.set_arg(static_cast<int>(i), bos[i]->bo);
     }
     run.start();
-    run.wait2();
+    wait_deadline(run, "elf:" + k->name);
     return 0;
   )
 }
@@ -268,7 +393,7 @@ ShimRun* shim_run_elf_start(ShimElfKernel* k, ShimBo* const* bos, size_t n_bos) 
       args.push_back(bos[i]->bo);
     }
     run.start();
-    return new ShimRun{ std::move(run), std::move(args) };
+    return new ShimRun{ std::move(run), std::move(args), "elf_start:" + k->name };
   )
 }
 
@@ -307,7 +432,7 @@ ShimElfKernel2* shim_elf_kernel_rebind(ShimElfCtx* c, const void* elf_bytes, siz
       std::fprintf(stderr, "[XRT_SHIM_ELF] rebind: elf=%.3f module=%.3f ext_kernel=%.3f ms\n",
                    t_elf, t_mod, t_kern);
     }
-    return new ShimElfKernel2{ std::move(elf), std::move(mod), std::move(k) };
+    return new ShimElfKernel2{ std::move(elf), std::move(mod), std::move(k), name };
   )
 }
 
@@ -320,7 +445,7 @@ int shim_run_elf2(ShimElfKernel2* k, ShimBo* const* bos, size_t n_bos) {
       run.set_arg(static_cast<int>(i), bos[i]->bo);
     }
     run.start();
-    run.wait2();
+    wait_deadline(run, "elf2:" + k->name);
     return 0;
   )
 }
@@ -332,6 +457,7 @@ struct ShimElfResident {
   xrt::hw_context ctx;
   xrt::ext::kernel kern;
   xrt::run run;
+  std::string name;       // kernel/design name, so a wedged dispatch names itself
   xrt::bo scratchpad;     // ctrl scratchpad BO (from the run), empty if the ELF has none
   uint8_t* scratch_map;   // host mapping of the scratchpad (nullptr if none)
   size_t scratch_size;
@@ -355,7 +481,7 @@ ShimElfResident* shim_elf_resident_open(ShimDevice* d, const void* elf_bytes, si
     uint8_t* mp = sp.map<uint8_t*>();
     size_t sz = sp.size();
     return new ShimElfResident{ std::move(elf), std::move(ctx), std::move(k), std::move(run),
-                                std::move(sp), mp, sz };
+                                name, std::move(sp), mp, sz };
   )
 }
 
@@ -387,7 +513,7 @@ int shim_elf_resident_dispatch(ShimElfResident* r) {
   GUARD_INT(
     r->scratchpad.sync(XCL_BO_SYNC_BO_TO_DEVICE);
     r->run.start();
-    r->run.wait2();
+    wait_deadline(r->run, "resident:" + r->name);
     return 0;
   )
 }
