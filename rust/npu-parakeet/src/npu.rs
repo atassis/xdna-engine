@@ -1812,6 +1812,21 @@ impl NpuMatmul {
         let want_dws = !want_dws_t && have(&format!("dwconv_silu_{DW_C}x{DW_T}"));
         // separate dwconv + silu only when neither fused variant exists
         let want_split = !want_dws_t && !want_dws;
+        // Which variant won, said once. The three branches below then warn only when the variant
+        // was actually wanted and is genuinely missing -- they used to print "absent" for a file
+        // that was present but lost the order, and send the reader to rebuild it. In each of those
+        // branches `want_split` is exactly that genuine-absence case: a fused variant winning is
+        // the only other way to reach them.
+        let selected = if want_dws_t {
+            "dwconv_silu_t (time-major fused)"
+        } else if want_dws {
+            "dwconv_silu (channel-major fused)"
+        } else {
+            "separate dwconv + silu"
+        };
+        if !npu_xrt::quiet() {
+            eprintln!("[npu] conv dwconv/SiLU: {selected} selected in {}", self.ln_dir.display());
+        }
 
         let dwconv = {
             let stem = format!("dwconv_{DW_C}x{DW_T}");
@@ -1828,7 +1843,9 @@ impl NpuMatmul {
                     kern, instr, n,
                 })
             } else {
-                eprintln!("[npu] dwconv xclbin absent in {} -- conv dwconv stays host (build final_dwconv_{DW_C}x{DW_T})", self.ln_dir.display());
+                if want_split {
+                    eprintln!("[npu] dwconv xclbin absent in {} -- conv dwconv stays host (build final_dwconv_{DW_C}x{DW_T})", self.ln_dir.display());
+                }
                 None
             }
         };
@@ -1848,7 +1865,9 @@ impl NpuMatmul {
                     kern, instr, n,
                 })
             } else {
-                eprintln!("[npu] silu xclbin absent in {} -- conv SiLU stays host (build final_silu_{DW_C}x{DW_T})", self.ln_dir.display());
+                if want_split {
+                    eprintln!("[npu] silu xclbin absent in {} -- conv SiLU stays host (build final_silu_{DW_C}x{DW_T})", self.ln_dir.display());
+                }
                 None
             }
         };
@@ -1869,7 +1888,9 @@ impl NpuMatmul {
                     kern, instr, n,
                 })
             } else {
-                eprintln!("[npu] fused dwconv+silu xclbin absent in {} -- separate dwconv+silu path (build final_dwconv_silu_{DW_C}x{DW_T})", self.ln_dir.display());
+                if want_split {
+                    eprintln!("[npu] fused dwconv+silu xclbin absent in {} -- separate dwconv+silu path (build final_dwconv_silu_{DW_C}x{DW_T})", self.ln_dir.display());
+                }
                 None
             }
         };
