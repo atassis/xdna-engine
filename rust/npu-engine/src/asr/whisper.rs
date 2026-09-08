@@ -310,6 +310,9 @@ impl WhisperAsr {
             head_dim: m.head_dim,
             ffn: m.ff,
             n_mels: m.n_mels,
+            // Unused on the production path (WhisperAsr never reads it): `tol_npu` is a
+            // verify_whisper.rs gate parameter, not a shape. See WhisperCfg::{SMALL,TURBO}.
+            tol_npu: 0.0,
         };
         let dec_layers = m.decoder_layers();
         // WHISPER_ENC_HOST=1 runs the encoder on the host instead of the NPU. Opt-in and loud, never

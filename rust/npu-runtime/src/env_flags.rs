@@ -255,7 +255,7 @@ pub const FLAGS: &[Flag] = &[
     Flag { name: "INT8_CV_HEADROOM", owner: "npu-engine", site: "npu-engine/src/asr/whisper_decoder.rs:1370",
         semantics: Value, default: "1.0",
         doc: "int8 quantization headroom multiplier for cross-attn V." },
-    Flag { name: "WHISPER_ENC_HOST", owner: "npu-engine", site: "npu-engine/src/asr/whisper.rs:317",
+    Flag { name: "WHISPER_ENC_HOST", owner: "npu-engine", site: "npu-engine/src/asr/whisper.rs:324",
         semantics: IsOk, default: "false",
         doc: "runs the Whisper encoder on host ONNX instead of the NPU; opt-in, loud (never a \
               silent fallback)." },
