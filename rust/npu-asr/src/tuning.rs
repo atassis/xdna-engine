@@ -13,7 +13,7 @@ fn is_one(k: &str, dflt: bool) -> bool {
     }
 }
 
-/// The single accessor for `NPU_ENC_FFN_RESIDENT` (E003, `docs/reference/env-flag-contract.md`).
+/// The single accessor for `NPU_ENC_FFN_RESIDENT`.
 /// Also called by `npu-whisper/src/encoder.rs`, which used to read the env var independently with
 /// `is_ok()` semantics -- ANY set value, including `"0"`, read as true there, so
 /// `NPU_ENC_FFN_RESIDENT=0` turned Parakeet residency off and Whisper residency on from one export.
@@ -122,7 +122,7 @@ mod tests {
 
     /// npu-whisper's encoder calls `ffn_resident_requested()` (no more independent `env::var`
     /// read); this proves it agrees with npu-asr's own `TuningConfig` resolution for unset/=0/=1
-    /// -- the defect env-flag-contract.md E003 closes.
+    /// -- the defect the single accessor closes.
     #[test]
     fn ffn_resident_agrees_across_both_encoders_env_states() {
         for (val, want) in [(None, false), (Some("0"), false), (Some("1"), true)] {

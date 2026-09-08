@@ -357,8 +357,8 @@ impl WhisperEncoder {
                 // largest data object. See internal notes (the FFN
                 // sub-block is ~67% of the encoder's host marshaling).
                 //
-                // NPU_ENC_FFN_RESIDENT goes through npu_asr::tuning's single accessor (E003,
-                // env-flag-contract.md) instead of an independent env::var read here: this crate used
+                // NPU_ENC_FFN_RESIDENT goes through npu_asr::tuning's single accessor instead
+                // of an independent env::var read here: this crate used
                 // to read it with is_ok() (ANY set value, including "0", true), while npu-asr read the
                 // same name with is_one() (only "1" true) -- one export could enable residency for one
                 // encoder and disable it for the other. Both now resolve identically.

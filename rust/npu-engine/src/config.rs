@@ -77,7 +77,7 @@ pub struct DiarizationCfg {
     pub manifest: String,
 }
 
-/// Decode-backend tier, per `env-flag-contract.md` E008b: a rung on the device ladder, not an
+/// Decode-backend tier: a rung on the device ladder, not an
 /// implementation name, so a kernel rename or a new artifact dir under an existing tier never
 /// touches a scenario file. Named after the three backends `WhisperAsr::build` already has:
 /// `FusedDecoder` (whole-decoder ELF, one dispatch/token), the per-op `NPU_DECODE` NPU path
@@ -113,7 +113,7 @@ pub struct DecodeCfg {
 }
 
 /// Which of the three sources produced a resolved `DecodeTier` -- reportable so a measurement can
-/// name what selected the backend (env-flag-contract E007), mirroring `npu-cli`'s
+/// name what selected the backend, mirroring `npu-cli`'s
 /// `config_path_and_source`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecodeSource {
