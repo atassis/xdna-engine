@@ -1435,7 +1435,15 @@ def main():
         "host_protocol": {"embed_scale": sp.embed_scale, "attn_scale": float(sp.attn_scale),
                           "act": sp.act, "norm_gain": sp.norm_gain, "eps": sp.eps,
                           "rope_theta_global": sp.rope_theta_global,
-                          "rope_theta_local": sp.rope_theta_local},
+                          "rope_theta_local": sp.rope_theta_local,
+                          # The checkpoint's partial_rotary_factor, on the GLOBAL row only -- the
+                          # host resolves it against that buffer's own width. Null on every model
+                          # whose rope_type is "default", which is every one but Gemma-4's global
+                          # layers.
+                          "rope_partial_rotary": sp.rope_partial_rotary,
+                          # final_logit_softcapping: tanh(logits/c)*c, applied by the host after
+                          # the logits cross back. Null unless the checkpoint sets it.
+                          "logit_softcap": sp.logit_softcap},
         "layer_types": ["global" if sp.is_global(l) else "sliding" for l in range(NL)],
         "cache_buffers": cache_names,
         # Engineering-check axis (see QUANT_MLP_DTYPE above), not a validated model default.

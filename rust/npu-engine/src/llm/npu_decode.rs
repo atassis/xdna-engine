@@ -48,16 +48,53 @@ fn unpack_bf16_bytes(bytes: &[u8]) -> Vec<f32> {
 /// `iron/operators/rope/reference.py` documents and `verify_llm_decode.py:34`'s `rope_row` implements.
 /// This is NOT mlir-air's half-split `[cos..., sin...]` packing; porting that convention here would
 /// compile, dispatch, and produce plausible-looking wrong logits.
-fn rope_row(pos: usize, head_dim: usize, theta: f64) -> Vec<f32> {
+fn rope_row(pos: usize, head_dim: usize, theta: f64, rope_angles: usize) -> Vec<f32> {
     let half = head_dim / 2;
     let mut row = vec![0f32; head_dim];
     for i in 0..half {
-        let inv = 1.0 / theta.powf((2 * i) as f64 / head_dim as f64);
+        // Past `rope_angles` the inverse frequency is ZERO, not absent. transformers'
+        // `_compute_proportional_rope_parameters` concatenates `zeros(head_dim/2 - rope_angles)`
+        // onto the rotated frequencies, and a zero frequency gives ang = 0 -> cos 1, sin 0, which
+        // is the identity rotation. So the row keeps its full head_dim width and the un-rotated
+        // dimensions pass through -- no buffer-size change, nothing downstream to teach.
+        //
+        // The exponent's denominator is head_dim even when only a fraction is rotated. That is
+        // what makes this rope_type "proportional" rather than the usual partial rotary, which
+        // divides by the rotated width instead and so spaces its frequencies differently. Read off
+        // modeling_rope_utils.py, not inferred from the `default` path.
+        let inv = if i < rope_angles { 1.0 / theta.powf((2 * i) as f64 / head_dim as f64) } else { 0.0 };
         let ang = pos as f64 * inv;
         row[2 * i] = ang.cos() as f32;
         row[2 * i + 1] = ang.sin() as f32;
     }
     row
+}
+
+/// How many of a row's `head_dim/2` frequency pairs are actually rotated.
+///
+/// `int(partial_rotary_factor * head_dim // 2)`, the arithmetic
+/// `_compute_proportional_rope_parameters` does -- 64 of 256 at Gemma-4-12B's global head_dim 512
+/// and 0.25. `None` (every model shipped today) rotates all of them, which makes the partial path
+/// bit-identical to the full one rather than a second arm to keep in step.
+fn rope_angles(head_dim: usize, partial: Option<f64>) -> usize {
+    match partial {
+        Some(f) => (f * head_dim as f64 / 2.0).floor() as usize,
+        None => head_dim / 2,
+    }
+}
+
+/// `logits = tanh(logits/c) * c`, the checkpoint's `final_logit_softcapping`
+/// (`Gemma4UnifiedForCausalLM.forward`). An LM-HEAD axis, not the attention one -- that is a
+/// separate config key, taken by `eager_attention_forward`, which this decoder layer leaves unset.
+///
+/// Host-side rather than a kernel epilogue because it is elementwise on the one vector that has
+/// already crossed back, so it costs no dispatch on the axis that dominates the step.
+fn apply_logit_softcap(logits: &mut [f32], cap: Option<f64>) {
+    let Some(c) = cap else { return };
+    let c = c as f32;
+    for l in logits.iter_mut() {
+        *l = (*l / c).tanh() * c;
+    }
 }
 
 /// A resident device backend for one decoder-LLM fused decode ELF. Construction registers the
@@ -269,7 +306,16 @@ impl DecodeStep for NpuDecodeStep {
         // layers use 256, so `rope_global` and `rope_local` must differ in WIDTH and not only in
         // theta, which a single artifact.head_dim cannot express.
         let rope_loc = self.artifact.loc("rope_global");
-        let rope = rope_row(pos, rope_loc.len / 2, self.artifact.rope_theta_global);
+        let rope_hd = rope_loc.len / 2;
+        // Partial rotary is a GLOBAL-layer axis: Gemma-4-12B's config gives full_attention
+        // rope_type "proportional" with partial_rotary_factor 0.25 and sliding_attention plain
+        // "default", so only this row narrows.
+        let rope = rope_row(
+            pos,
+            rope_hd,
+            self.artifact.rope_theta_global,
+            rope_angles(rope_hd, self.artifact.rope_partial_rotary),
+        );
         // The width/head_dim cross-check moved to `LlmArtifact::load`, which sees BOTH angle rows
         // and every declared geometry at once. Here it could only ever compare one row against one
         // scalar, which is why it was gated on `kv_offs.len() == 1` and did nothing in the
@@ -284,7 +330,7 @@ impl DecodeStep for NpuDecodeStep {
         // buffer and this is skipped.
         if let Some(theta_local) = self.artifact.rope_theta_local {
             let loc = self.artifact.loc("rope_local");
-            let rope_l = rope_row(pos, loc.len / 2, theta_local);
+            let rope_l = rope_row(pos, loc.len / 2, theta_local, rope_angles(loc.len / 2, None));
             let rope_l_bytes = pack_bf16_bytes(&rope_l);
             self.arena
                 .write_at(loc.arena, loc.off, &rope_l_bytes)
@@ -326,6 +372,7 @@ impl DecodeStep for NpuDecodeStep {
             .map_err(|e| EngineError::Device(format!("read {}: {e}", self.artifact.output)))?;
         let mut logits = unpack_bf16_bytes(&bytes);
         logits.truncate(self.artifact.vocab);
+        apply_logit_softcap(&mut logits, self.artifact.logit_softcap);
         Ok(logits)
     }
 }
@@ -345,22 +392,132 @@ mod tests {
     #[test]
     fn rope_row_matches_python_oracle_at_pos_zero() {
         // pos=0 -> ang=0 for every pair -> cos=1, sin=0 regardless of theta/head_dim.
-        let row = rope_row(0, 8, 1_000_000.0);
+        let row = rope_row(0, 8, 1_000_000.0, 4);
         assert_eq!(row, vec![1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0]);
     }
 
     #[test]
     fn rope_row_matches_python_oracle_at_pos_one() {
         // inv = [1.0, 0.03162277660168379, 0.001, 3.1622776601683795e-05] (theta=1e6, head_dim=8)
-        let row = rope_row(1, 8, 1_000_000.0);
+        let row = rope_row(1, 8, 1_000_000.0, 4);
         let inv = [1.0f64, 0.03162277660168379, 0.001, 3.1622776601683795e-05];
         let want: Vec<f32> = inv.iter().flat_map(|&a| [a.cos() as f32, a.sin() as f32]).collect();
         assert_eq!(row, want);
     }
 
+    /// Cross-language oracle for the "proportional" rope_type, produced by CALLING transformers
+    /// rather than reimplementing its arithmetic in the test:
+    ///   >>> cfg = AutoConfig.from_pretrained("unsloth/gemma-4-12b-it").get_text_config()
+    ///   >>> rot = Gemma4UnifiedTextRotaryEmbedding(cfg)
+    ///   >>> ang = 7 * rot.full_attention_inv_freq.double()
+    ///   >>> torch.stack([ang.cos(), ang.sin()], 1).flatten()
+    /// Tolerance rather than equality because that reference builds inv_freq in f32 and this builds
+    /// it in f64; the gap is ~1e-8, four orders under bf16's resolution at these magnitudes.
+    ///
+    /// This is the test that pins the DENOMINATOR. "proportional" divides the exponent by the full
+    /// head_dim while ordinary partial rotary divides by the rotated width -- at pair 1 that is
+    /// 0.9475 against 0.8058, so a row built the usual way misses these literals by 0.14.
+    #[test]
+    fn rope_row_matches_the_hf_proportional_oracle_on_a_global_row() {
+        const HD: usize = 512; // Gemma-4-12B global_head_dim
+        let row = rope_row(7, HD, 1_000_000.0, rope_angles(HD, Some(0.25)));
+        assert_eq!(row.len(), HD);
+        let want_head = [
+            0.753902254343, 0.656986598719, 0.939694868055, 0.342013968942,
+            0.999999804905, 0.000624652668, 0.946202850550, -0.323574049656,
+        ];
+        for (i, &w) in want_head.iter().enumerate() {
+            assert!((row[i] as f64 - w).abs() < 1e-6, "row[{i}] = {} want {w}", row[i]);
+        }
+        // Pairs 62..65 -- the last two rotated and the first two that are not.
+        let want_tail = [
+            0.969750772636, 0.244097191651, 0.972831560659, 0.231514048355,
+            1.0, 0.0, 1.0, 0.0,
+        ];
+        for (i, &w) in want_tail.iter().enumerate() {
+            let j = 124 + i;
+            assert!((row[j] as f64 - w).abs() < 1e-6, "row[{j}] = {} want {w}", row[j]);
+        }
+    }
+
+    /// Same oracle, the SLIDING row: rope_type "default", theta 1e4, head_dim 256, nothing narrowed.
+    /// Included because the two rows differ in width, theta AND rotated fraction at once, and a
+    /// change that fixed the global row by breaking the local one would otherwise pass.
+    #[test]
+    fn rope_row_matches_the_hf_oracle_on_a_sliding_row() {
+        const HD: usize = 256;
+        let row = rope_row(7, HD, 10_000.0, rope_angles(HD, None));
+        assert_eq!(row.len(), HD);
+        let want = [
+            0.753902254343, 0.656986598719, 0.973479372428, 0.228774805118,
+            0.975583321243, -0.219629650350, 0.800726221135, -0.599030482351,
+        ];
+        for (i, &w) in want.iter().enumerate() {
+            assert!((row[i] as f64 - w).abs() < 1e-6, "row[{i}] = {} want {w}", row[i]);
+        }
+    }
+
+    /// The un-rotated tail is the IDENTITY rotation, not zeros: transformers pads inv_freq with
+    /// zeros to the full head_dim/2, and a zero frequency lands on cos 1 / sin 0. Zeros there would
+    /// annihilate the un-rotated dimensions instead of passing them through.
+    #[test]
+    fn rope_row_past_the_rotated_angles_is_the_identity_rotation() {
+        const HD: usize = 512;
+        let row = rope_row(1234, HD, 1_000_000.0, rope_angles(HD, Some(0.25)));
+        for i in 64..HD / 2 {
+            assert_eq!((row[2 * i], row[2 * i + 1]), (1.0, 0.0), "pair {i} must be identity");
+        }
+        assert_ne!((row[126], row[127]), (1.0, 0.0), "pair 63 is the last ROTATED one");
+    }
+
+    /// `int(f * head_dim // 2)`, the arithmetic `_compute_proportional_rope_parameters` does.
+    #[test]
+    fn rope_angles_matches_the_python_floor_arithmetic() {
+        assert_eq!(rope_angles(512, Some(0.25)), 64, "0.25 * 512 // 2");
+        assert_eq!(rope_angles(256, Some(0.25)), 32);
+        assert_eq!(rope_angles(512, Some(1.0)), 256, "a full fraction rotates everything");
+        assert_eq!(rope_angles(512, None), 256);
+        assert_eq!(rope_angles(128, None), 64);
+    }
+
+    /// The partial path must be BIT-identical to the full one when nothing is narrowed -- that is
+    /// what makes this a generalisation rather than a second arm that can drift. Every model
+    /// shipped today takes the None branch.
+    #[test]
+    fn a_full_fraction_is_bit_identical_to_no_fraction() {
+        let hd = 128;
+        let full = rope_row(97, hd, 1_000_000.0, rope_angles(hd, None));
+        let frac = rope_row(97, hd, 1_000_000.0, rope_angles(hd, Some(1.0)));
+        assert_eq!(full, frac);
+    }
+
+    /// tanh(x/30)*30, from torch rather than from arithmetic done here:
+    ///   >>> ((torch.tensor([0.,1.,-1.,30.,500.,-500.])/30).tanh()*30).tolist()
+    ///
+    /// The interesting entry is 30.0 -> 22.848, not 30: the cap is the ASYMPTOTE, so a logit AT the
+    /// cap is already well inside it. Reading `logit_softcap` as a clamp gets that one wrong by 7.
+    #[test]
+    fn logit_softcap_matches_the_python_oracle_and_is_a_no_op_when_absent() {
+        let raw = [0.0f32, 1.0, -1.0, 30.0, 500.0, -500.0];
+        let mut got = raw.to_vec();
+        apply_logit_softcap(&mut got, Some(30.0));
+        let want = [0.0f64, 0.9996297955513, -0.9996297955513, 22.84782600402832, 30.0, -30.0];
+        for (i, &w) in want.iter().enumerate() {
+            assert!((got[i] as f64 - w).abs() < 1e-5, "logit[{i}] = {} want {w}", got[i]);
+        }
+        // SATURATION IS REAL, and it is why this belongs at the head rather than at sampling time:
+        // at |x/c| ~ 16 the f32 tanh returns exactly 1, so two far-apart logits both land on the
+        // cap and their ORDER is gone. Applying the cap later would change what argmax picks.
+        assert_eq!(got[4], 30.0, "500/30 saturates f32 tanh");
+
+        let mut untouched = raw.to_vec();
+        apply_logit_softcap(&mut untouched, None);
+        assert_eq!(untouched, raw.to_vec(), "no cap declared must not touch the logits");
+    }
+
     #[test]
     fn rope_row_length_matches_head_dim() {
-        assert_eq!(rope_row(5, 128, 1_000_000.0).len(), 128);
+        assert_eq!(rope_row(5, 128, 1_000_000.0, 64).len(), 128);
     }
 
     /// Diagnostic, NOT a device test: dump the exact `x`/`rope_global` BYTES this rail would write
@@ -392,7 +549,7 @@ mod tests {
         let raw_row: Vec<f32> = embed.row(TOKEN).iter().copied().collect();
         let x: Vec<f32> = raw_row.iter().map(|&v| v * embed_scale).collect();
         let x_bytes = pack_bf16_bytes(&x);
-        let rope = rope_row(POS, HEAD_DIM, THETA);
+        let rope = rope_row(POS, HEAD_DIM, THETA, rope_angles(HEAD_DIM, None));
         let rope_bytes = pack_bf16_bytes(&rope);
 
         // The f32 `.npy` above is the ORIGINAL source; `W_head.bin` is what `step` now gathers from.

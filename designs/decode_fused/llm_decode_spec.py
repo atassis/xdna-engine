@@ -250,20 +250,19 @@ class LlmSpec:
         implement it needs the failure, and the failure is the argument for the refusal.
         """
         gaps = []
-        if not self.geometry_is_uniform():
-            gaps.append(
-                f"per-layer attention geometry (head_dim {self.head_dim}/{self.global_head_dim}, "
-                f"n_kv_heads {self.n_kv_heads}/{self.global_n_kv_heads}): the GENERATOR handles it "
-                f"(the op vocabulary is keyed on the pair), but meta.json still carries "
-                f"dims.head_dim as one scalar and the host's rope cross-check is gated on "
-                f"kv_offs.len()==1, so it does nothing in exactly this case")
-        if self.rope_partial_rotary is not None:
-            gaps.append(
-                f"partial rotary {self.rope_partial_rotary} (rope_type "
-                f"{self.rope_type_global!r}): only that fraction of head_dim is rotated on the "
-                f"global layers")
-        if self.logit_softcap is not None:
-            gaps.append(f"logit softcap {self.logit_softcap}: tanh(logits/c)*c at the LM head")
+        # EMPTY as of 2026-09-08, and kept as a list rather than deleted: it is where the next
+        # model's gaps get named, and the shape of the refusal is the part worth keeping.
+        #
+        # The three that closed, and what closes them:
+        #   per-layer geometry -- the generator keys the op vocabulary on (head_dim, n_kv_heads)
+        #     and emits scratchpad.kv_params; the host writes one kv_off per distinct head_dim,
+        #     takes each RoPE row width from its own buffer, and LlmArtifact::load refuses an
+        #     artifact whose angle-row widths and declared head_dims disagree as sets.
+        #   partial rotary -- host-side: rope_type "proportional" zeroes the inverse frequency past
+        #     int(f * head_dim // 2) pairs, keeping the full head_dim width, and divides the
+        #     exponent by head_dim rather than by the rotated width (which is what distinguishes it
+        #     from ordinary partial rotary). Gated against transformers' own rotary embedding.
+        #   logit softcap -- host-side: tanh(logits/c)*c after readback, no dispatch.
         return gaps
 
     def softmax_cols(self, cap: int) -> int:
@@ -364,20 +363,33 @@ class LlmSpec:
                 "fails SILENTLY if implemented halfway -- a clean build that is wrong on a subset "
                 "of layers, which teacher-forced parity over a handful of tokens can miss.")
 
-        for label, m in (("q_dim", self.q_dim), ("kv_dim", self.kv_dim), ("d_model", self.d_model),
-                         ("head_dim", self.head_dim), ("ffn", self.ffn), ("vocab", self.vocab)):
-            if m % cols:
-                raise ValueError(f"{self.name}: GEMV M={label}={m} not divisible by cols={cols}")
-            if (m // cols) % tsi:
-                raise ValueError(f"{self.name}: GEMV {label}: (M//cols)={m//cols} not a multiple of "
-                                 f"tile_size_input={tsi}")
-        for label, k in (("d_model", self.d_model), ("q_dim", self.q_dim),
-                         ("head_dim", self.head_dim), ("ffn", self.ffn)):
-            if k % 64:
-                raise ValueError(f"{self.name}: GEMV K={label}={k} not a multiple of "
-                                 f"kernel_vector_size=64")
-        if self.head_dim % 32:
-            raise ValueError(f"{self.name}: head_dim={self.head_dim} % 32 != 0 (Transpose n=32)")
+        # EVERY geometry, not just the uniform one. Under per-layer geometry the global layers have
+        # their own head_dim/q_dim/kv_dim, and checking only `self.*` checks the sliding layers and
+        # leaves the others to whatever the placer happens to accept. Gemma-4-12B's global shapes
+        # pass -- but they passed before this loop existed too, which is the reason to assert them.
+        geoms = [("", self.head_dim, self.q_dim, self.kv_dim, self.n_kv_heads)]
+        if not self.geometry_is_uniform():
+            gl = self.global_head_dim
+            gkv = self.global_n_kv_heads
+            geoms.append((" [global]", gl, self.n_q_heads * gl, gkv * gl, gkv))
+        for tag, hd, qd, kvd, kvh in geoms:
+            for label, m in ((f"q_dim{tag}", qd), (f"kv_dim{tag}", kvd), ("d_model", self.d_model),
+                             (f"head_dim{tag}", hd), ("ffn", self.ffn), ("vocab", self.vocab)):
+                if m % cols:
+                    raise ValueError(f"{self.name}: GEMV M={label}={m} not divisible by cols={cols}")
+                if (m // cols) % tsi:
+                    raise ValueError(f"{self.name}: GEMV {label}: (M//cols)={m//cols} not a multiple of "
+                                     f"tile_size_input={tsi}")
+            for label, k in (("d_model", self.d_model), (f"q_dim{tag}", qd),
+                             (f"head_dim{tag}", hd), ("ffn", self.ffn)):
+                if k % 64:
+                    raise ValueError(f"{self.name}: GEMV K={label}={k} not a multiple of "
+                                     f"kernel_vector_size=64")
+            if hd % 32:
+                raise ValueError(f"{self.name}: head_dim{tag}={hd} % 32 != 0 (Transpose n=32)")
+            if self.n_q_heads % kvh:
+                raise ValueError(f"{self.name}: n_q_heads={self.n_q_heads} not a multiple of "
+                                 f"n_kv_heads{tag}={kvh}")
         # No n_q_heads % 16 rule here any more. It cited iron/operators/softmax/op.py, which had
         # rejected `rows % 16` with no stated derivation and has since dropped it: the real
         # requirements are rows >= num_aie_columns*num_channels and rows % num_aie_columns == 0,
@@ -386,9 +398,6 @@ class LlmSpec:
         if self.softmax_cols(cols) * 1 > self.n_q_heads:
             raise ValueError(f"{self.name}: Softmax rows=n_q_heads={self.n_q_heads} cannot be "
                              f"split across {cols} columns")
-        if self.n_q_heads % self.n_kv_heads:
-            raise ValueError(f"{self.name}: n_q_heads={self.n_q_heads} not a multiple of "
-                             f"n_kv_heads={self.n_kv_heads}")
         if self.act not in ("gelu_tanh", "silu"):
             raise ValueError(f"{self.name}: unknown act {self.act!r}")
         if self.norm_gain not in ("one_plus_w", "w"):

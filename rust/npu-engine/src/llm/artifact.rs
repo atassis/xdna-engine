@@ -100,6 +100,18 @@ pub struct LlmArtifact {
     /// of this field is exactly what decides whether the artifact declares a `rope_local` input, so
     /// a default would make a two-input and a three-input artifact indistinguishable here.
     pub rope_theta_local: Option<f64>,
+    /// `partial_rotary_factor` for the GLOBAL angle row, absent when every dimension rotates.
+    ///
+    /// Gemma-4-12B's `full_attention` rope_type is "proportional" with 0.25; its
+    /// `sliding_attention` is plain "default", so this narrows one row and not the other. Kept as
+    /// the checkpoint's FRACTION rather than a resolved angle count: the count depends on the row
+    /// width, which the host reads off the buffer, and storing both would be two copies of one
+    /// number with nothing comparing them.
+    pub rope_partial_rotary: Option<f64>,
+    /// tanh softcap applied to the LM-head logits: `tanh(logits/c) * c`, from the checkpoint's
+    /// `final_logit_softcapping`. NOT the attention softcap -- that is a separate config key this
+    /// model leaves unset.
+    pub logit_softcap: Option<f64>,
     /// `meta.json`'s `toolchain.hash` -- the toolchain.lock semantic hash this ELF was compiled
     /// against (`gen_llm_decode.py`, added 2026-09-05). `None` on any artifact built before this
     /// field existed. See [`LlmArtifact::load`]'s freshness check below.
@@ -218,6 +230,31 @@ impl LlmArtifact {
         // artifact carries an explicit null rather than omitting the field; matching only on
         // absence sent Qwen3-0.6B, the pinned default, down the malformed branch. A non-numeric
         // value that is not null is still an error, which is the case the check is for.
+        // Both optional and both refused when present-but-wrong-typed, for the reason
+        // `rope_theta_local` is: a null/garbage value that silently reads as "absent" turns a
+        // model axis off without saying so, and the build stays clean.
+        let opt_f64 = |key: &str| -> Result<Option<f64>, EngineError> {
+            match hp.get(key) {
+                None | Some(serde_json::Value::Null) => Ok(None),
+                Some(v) => Ok(Some(
+                    v.as_f64().ok_or_else(|| ctx(format!("host_protocol.{key} present but non-numeric")))?,
+                )),
+            }
+        };
+        let rope_partial_rotary = opt_f64("rope_partial_rotary")?;
+        if let Some(f) = rope_partial_rotary {
+            if !(f > 0.0 && f <= 1.0) {
+                return Err(ctx(format!(
+                    "host_protocol.rope_partial_rotary = {f}, want a fraction in (0, 1]"
+                )));
+            }
+        }
+        let logit_softcap = opt_f64("logit_softcap")?;
+        if let Some(c) = logit_softcap {
+            if !(c > 0.0) {
+                return Err(ctx(format!("host_protocol.logit_softcap = {c}, want a positive cap")));
+            }
+        }
         let rope_theta_local = match hp.get("rope_theta_local") {
             None | Some(serde_json::Value::Null) => None,
             Some(v) => Some(v.as_f64().ok_or_else(||
@@ -424,6 +461,8 @@ impl LlmArtifact {
             embed_scale,
             rope_theta_global,
             rope_theta_local,
+            rope_partial_rotary,
+            logit_softcap,
             toolchain_hash,
         })
     }
