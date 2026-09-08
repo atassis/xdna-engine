@@ -555,12 +555,12 @@ mod tests {
         // hardcoded path: an absolute home directory does not belong in the public tree, and this
         // way the test runs against whatever export the caller actually has.
         let Ok(dir) = std::env::var("S2_ARTIFACT_DIR") else {
-            eprintln!("skip: set S2_ARTIFACT_DIR to an exported design directory");
+            eprintln!("SKIP: set S2_ARTIFACT_DIR to an exported design directory");
             return;
         };
         let dir = Path::new(&dir);
         if !dir.join(META_FILE).is_file() {
-            eprintln!("skip: no meta.json at {}", dir.display());
+            eprintln!("SKIP: no meta.json at {}", dir.display());
             return;
         }
         let meta: S2Meta = read_json(&dir.join(META_FILE)).unwrap();

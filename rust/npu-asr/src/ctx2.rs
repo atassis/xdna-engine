@@ -1554,7 +1554,7 @@ mod tests {
             .join("../../designs/whole_array_fused/Makefile.modal");
         let src = match std::fs::read_to_string(&mk) {
             Ok(s) => s,
-            Err(_) => { eprintln!("skip: {} absent", mk.display()); return; }
+            Err(_) => { eprintln!("SKIP: {} absent", mk.display()); return; }
         };
         assert!(
             src.contains("nat_tag=$(if $(filter 1,${emulate_bfloat16_mmul_with_bfp16}),,nat)"),

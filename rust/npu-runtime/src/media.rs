@@ -99,7 +99,7 @@ mod tests {
     #[test]
     fn a_44k_stereo_wav_is_resampled_rather_than_refused() {
         if !have_ffmpeg() {
-            eprintln!("skipped: no ffmpeg");
+            eprintln!("SKIP: no ffmpeg");
             return;
         }
         let dir = std::env::temp_dir().join(format!("npu-media-test-{}", std::process::id()));
@@ -125,7 +125,7 @@ mod tests {
     #[test]
     fn a_video_file_yields_its_audio_track() {
         if !have_ffmpeg() {
-            eprintln!("skipped: no ffmpeg");
+            eprintln!("SKIP: no ffmpeg");
             return;
         }
         let dir = std::env::temp_dir().join(format!("npu-media-vid-{}", std::process::id()));
@@ -148,7 +148,7 @@ mod tests {
     #[test]
     fn a_file_with_no_audio_is_an_error_that_says_so() {
         if !have_ffmpeg() {
-            eprintln!("skipped: no ffmpeg");
+            eprintln!("SKIP: no ffmpeg");
             return;
         }
         let dir = std::env::temp_dir().join(format!("npu-media-silent-{}", std::process::id()));
