@@ -294,9 +294,9 @@ def sequence_name(sp, NL, S, placer_flags):
     # Suffix stays ON the default here, unlike the other switches: the shipped artifact was BUILT
     # and gated under this name, and aiecc is not byte-reproducible, so a rename would mean the
     # next rebuild produces a different ELF under a name nothing was ever gated against.
-    if FUSE_MLP_DP:
+    if FUSE_MLP_DP and sp.mlp_dp_reason() is None:
         parts.append(f"mlpdp{MLP_DP_COLS}")
-    if FUSE_MLP_O:
+    if FUSE_MLP_O and sp.mlp_dp_reason() is None:
         parts.append("mlpo")
     if WEIGHT_DEPTH != 2:
         parts.append(f"wd{WEIGHT_DEPTH}")
@@ -550,11 +550,21 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
     # pre-existing path.
     attn_quant_kw = (dict(weight_dtype=QUANT_ATTN_DTYPE, group_size=QUANT_ATTN_GROUP)
                      if QUANT_ATTN_DTYPE != "bf16" else {})
-    if FUSE_MLP_O:
-        if not FUSE_MLP_DP:
-            raise NotImplementedError(
-                "FUSE_MLP_O folds op_o INTO the swiglu_mlp_dp design; it needs FUSE_MLP_DP=1"
-            )
+    # ---- which fused arms this MODEL can use ----
+    # Whether a fused arm applies is the OPERATOR's rule, not a choice here -- the same shape as
+    # fuse_act further down, which already asks the GEMV instead of assuming. The env flag can only
+    # turn an arm OFF (for A/B); it can no longer turn one ON for a spec the operator does not
+    # cover. It used to, and a Qwen-shaped default then met Gemma-3 as a NotImplementedError three
+    # frames down -- a capability gap reported as a crash, and only after the previous gap was
+    # cleared, so the four of them surfaced one build at a time.
+    qkv_dp_why = ("FUSE_QKV_DP=0" if not FUSE_QKV_DP else
+                  "needs FUSE_QKV_GEMV=1 for the concatenated Wqkv" if not FUSE_QKV_GEMV else
+                  sp.qkv_dp_reason(COLS))
+    mlp_dp_why = "FUSE_MLP_DP=0" if not FUSE_MLP_DP else sp.mlp_dp_reason()
+    fuse_o = FUSE_MLP_O and mlp_dp_why is None
+    for arm, why in (("qkv_head_dp", qkv_dp_why), ("swiglu_mlp_dp", mlp_dp_why)):
+        print(f"[gen] fused arm {arm}: {'OFF -- ' + why if why else 'on'}")
+    if fuse_o:
         if QUANT_ATTN_DTYPE != "bf16":
             # Under fuse_o, Wo rides the MLP design's single weight ObjectFifo, and one fifo
             # carries one wire format. So Wo's dtype is QUANT_MLP_DTYPE's, not its own axis --
@@ -567,22 +577,16 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
     op_qkv = gemv(QD + 2 * KVD, D, ctx) if FUSE_QKV_GEMV else None
     op_q = gemv(QD, D, ctx)
     op_kv = gemv(KVD, D, ctx)
-    op_o = None if FUSE_MLP_O else gemv(D, QD, ctx, **attn_quant_kw)
+    op_o = None if fuse_o else gemv(D, QD, ctx, **attn_quant_kw)
     # RoPE over q and k together (24 head rows) needs them adjacent, which only the fused qkv
     # buffer gives; angle_rows=1 is unchanged, so every row still reads the same single angle row.
     fuse_rope = FUSE_QKV_GEMV and FUSE_ROPE_QK
     op_rope_qk = RoPE(rows=Hq + Hkv, cols=HD, angle_rows=1, context=ctx) if fuse_rope else None
     op_qkv_dp = None
-    if FUSE_QKV_DP:
-        if not (FUSE_QKV_GEMV and sp.qk_norm):
-            raise NotImplementedError(
-                "FUSE_QKV_DP consumes the concatenated Wqkv and applies a per-head qk-norm; it "
-                f"needs FUSE_QKV_GEMV=1 (got {FUSE_QKV_GEMV}) and a spec with qk_norm "
-                f"(got {sp.qk_norm})"
-            )
+    if qkv_dp_why is None:
         from iron.operators.qkv_head_dp.op import QKVHeadDataParallel
         op_qkv_dp = QKVHeadDataParallel(D=D, HD=HD, Hq=Hq, Hkv=Hkv, max_seq=S,
-                                        num_aie_columns=COLS, epsilon=sp.eps,
+                                        num_aie_columns=sp.qkv_dp_cols(COLS), epsilon=sp.eps,
                                         tile_size_input=TSI, context=ctx,
                                         weight_depth=WEIGHT_DEPTH)
     op_rope_q = RoPE(rows=Hq, cols=HD, angle_rows=1, context=ctx)
@@ -624,7 +628,10 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
     op_scale = (None if scale_in_qnorm else
                 ElementwiseMul(size=Hq * S, tile_size=S // COLS, num_aie_columns=COLS,
                                context=ctx))
-    op_softmax = Softmax(rows=Hq, cols=S, num_aie_columns=COLS, num_channels=1, rtp_vector_size=S,
+    # Not COLS: with fewer q heads than columns each core gets less than one tile and the
+    # op computes nothing (IRON raises). Gemma-3's 4 heads run at 4 columns.
+    op_softmax = Softmax(rows=Hq, cols=S, num_aie_columns=sp.softmax_cols(COLS),
+                         num_channels=1, rtp_vector_size=S,
                          vector_size_parameter="sm_mask", context=ctx)
     # num_batches=Hq, not Hq separate invocations. transpose/design.py's L3 tensors already hold
     # "num_batches contiguous (M,N) matrices stacked along the row dimension", which is EXACTLY what
@@ -653,9 +660,19 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
     # column streams its own head ONCE and applies both query heads' softmax rows out of L1 -- the
     # stride-0 group re-read goes too. rows_per_chunk=64 puts the L1 A tile at 16 KB double-buffered.
     if TMV_CTX:
+        # TMV_RPC is a CAP, not the value: the largest chunk that fits L1 depends on head_dim, and
+        # 64 is right for Qwen3's HD=128 and too big for Gemma-3's 256. check_l1_fits is the
+        # operator's own arithmetic, so ask it rather than carrying a second copy of the L1 model
+        # here -- or an env constant that was correct for one model and silently wrong for the next.
+        from iron.operators.tmatvec.design import check_l1_fits
+        rpc = TMV_RPC
+        while rpc > 1 and (S % rpc or check_l1_fits(HD, S, sp.gqa_group, rpc) is not None):
+            rpc //= 2
+        if rpc != TMV_RPC:
+            print(f"[gen] TMatVec rows_per_chunk {TMV_RPC} -> {rpc} (L1 fit at head_dim={HD})")
         op_ctx = TMatVec(M=HD, K=S, num_aie_columns=Hkv, num_batches=Hq,
                          batch_group=sp.gqa_group,
-                         rows_per_chunk=TMV_RPC, context=ctx)
+                         rows_per_chunk=rpc, context=ctx)
     else:
         op_ctx = gemv(HD, S, ctx, num_batches=Hq)
     # MLP weight-stream dtype axis (Wg/Wu/Wd -- "MLP weights" in the byte breakdown, the largest
@@ -680,16 +697,11 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
     op_up = gemv(FF, D, ctx, **mlp_quant_kw)
     op_act = None
     op_mlp_dp = None
-    if FUSE_MLP_DP:
-        if sp.sandwich_norms or sp.act != "silu":
-            raise NotImplementedError(
-                "FUSE_MLP_DP covers the plain SiLU MLP block only; this spec has "
-                f"sandwich_norms={sp.sandwich_norms!r} act={sp.act!r}"
-            )
+    if mlp_dp_why is None:
         from iron.operators.swiglu_mlp_dp.op import SwiGLUMLPDataParallel
         op_mlp_dp = SwiGLUMLPDataParallel(D=D, FF=FF, num_aie_columns=MLP_DP_COLS,
                                           epsilon=sp.eps,
-                                          QD=QD if FUSE_MLP_O else None, fuse_o=FUSE_MLP_O,
+                                          QD=QD if fuse_o else None, fuse_o=fuse_o,
                                           context=ctx, weight_depth=WEIGHT_DEPTH,
                                           tile_rows_gu=MLP_TILE_ROWS,
                                           **mlp_quant_kw)
@@ -732,7 +744,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
                 weights[p + key] = quantize_weight(w, QUANT_MLP_GROUP, QUANT_MLP_DTYPE)
             elif key == "Wo" and QUANT_ATTN_DTYPE != "bf16":
                 weights[p + key] = quantize_weight(w, QUANT_ATTN_GROUP, QUANT_ATTN_DTYPE)
-            elif key == "Wo" and FUSE_MLP_O:
+            elif key == "Wo" and fuse_o:
                 # Pad FIRST, then quantize: the pad rows must be a whole number of groups in the
                 # same wire format as the rest of the channel. Zero rows quantize to amax=0 ->
                 # scale 1.0, q=0, so their contribution stays exactly zero.
@@ -791,7 +803,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
         # `a` is purely internal to op_mlp_dp's own fuse_o path (never an L3 buffer -- see
         # design.py) once folded; only declare it when something outside that design still reads
         # or writes it.
-        if not FUSE_MLP_O:
+        if not fuse_o:
             bufsz[p + "a"] = D * 2
         nxt = f"x{l+1}"
         # The unfused arms only. With the fused head, the per-head norms, the projection and the
@@ -834,7 +846,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
             (op_softmax, p + "sc", p + "sw"),
             *([] if TMV_CTX else [(op_trv, p + ("vc" if GROUPED_V else "vr"), p + "vt")]),
             (op_ctx, p + ("vc" if TMV_CTX else "vt"), p + "sw", p + "cx"),
-            *([] if FUSE_MLP_O else [(op_o, p + "Wo", p + "cx", p + "a")]),
+            *([] if fuse_o else [(op_o, p + "Wo", p + "cx", p + "a")]),
         ]
         if sp.sandwich_norms:
             rl.append((op_norm, p + "a", p + "n_pa", p + "a"))
@@ -844,7 +856,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
             # shared across layers because the sequence runs them one at a time. FUSE_MLP_O folds
             # `a = Wo @ cx` in too: `cx`/`Wo` replace `a` as the design's own inputs, and
             # `mlp_a_scratch` is a's own all-gather round-trip buffer, the same idiom as mlp_gh's.
-            if FUSE_MLP_O:
+            if fuse_o:
                 rl.append((op_mlp_dp, cur, p + "cx", p + "n_pf", p + "Wo", p + "Wg", p + "Wu",
                            p + "Wd", "mlp_gh", "mlp_a_scratch", nxt))
             else:
@@ -869,7 +881,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
 
     if op_mlp_dp is not None:
         bufsz["mlp_gh"] = FF * 2   # one buffer, reused by every layer -- they run one at a time
-        if FUSE_MLP_O:
+        if fuse_o:
             bufsz["mlp_a_scratch"] = D * 2   # a's own all-gather round-trip buffer, same idiom
 
     weights["n_final"] = load_norm("model.norm.weight")

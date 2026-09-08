@@ -68,6 +68,46 @@ class LlmSpec:
             return True
         return (layer_idx + 1) % self.sw_pattern == 0
 
+    def softmax_cols(self, cap: int) -> int:
+        """num_aie_columns for the attention Softmax: the widest split of the q heads that fits.
+
+        The Softmax is built with rows = n_q_heads, and iron/operators/softmax/op.py requires
+        rows >= num_aie_columns*num_channels and rows % num_aie_columns == 0 -- a head count under
+        the split leaves a core with less than one tile, so the op silently computes nothing rather
+        than failing. Taking the largest divisor of n_q_heads at or below the cap satisfies both:
+        Qwen3's 16 heads give 8, Gemma-3's 4 give 4.
+        """
+        return max(d for d in range(1, cap + 1) if self.n_q_heads % d == 0)
+
+    def qkv_dp_cols(self, cap: int) -> int:
+        """num_aie_columns for QKVHeadDataParallel: every core owns a whole number of head rows."""
+        heads = self.n_q_heads + 2 * self.n_kv_heads
+        return max(d for d in range(1, cap + 1) if heads % d == 0)
+
+    def qkv_dp_reason(self, cap: int) -> str | None:
+        """Why QKVHeadDataParallel does not cover this spec, or None when it does.
+
+        Every rule here is the OPERATOR's (iron/operators/qkv_head_dp/op.py), read off its
+        __post_init__ rather than guessed: it applies a per-head qk-norm, and `cur`/`n_in` ride an
+        HD-wide misc channel so d_model must be a whole number of head_dim chunks. Gemma-3-270M
+        fails the second at 640/256 = 2.5, which no column count can fix -- worth stating, because
+        the column rule looks like the whole story and is not.
+        """
+        if not self.qk_norm:
+            return "the op applies a per-head qk-norm and this spec has none"
+        if self.d_model % self.head_dim:
+            return (f"d_model={self.d_model} is not a whole number of head_dim={self.head_dim} "
+                    f"chunks -- cur/n_in ride the HD-wide misc channel")
+        return None
+
+    def mlp_dp_reason(self) -> str | None:
+        """Why SwiGLUMLPDataParallel does not cover this spec, or None when it does."""
+        if self.sandwich_norms:
+            return "the fused block has no sandwich norms (this spec normalises the FFN output)"
+        if self.act != "silu":
+            return f"the fused block is SwiGLU; this spec's activation is {self.act!r}"
+        return None
+
     def norm_weight_names(self, layer: int) -> dict:
         """Per-layer RMSNorm tensor names. The pre-FFN norm's NAME differs between the two families."""
         p = f"model.layers.{layer}."
@@ -112,13 +152,14 @@ class LlmSpec:
                                  f"kernel_vector_size=64")
         if self.head_dim % 32:
             raise ValueError(f"{self.name}: head_dim={self.head_dim} % 32 != 0 (Transpose n=32)")
-        # Softmax is built with rows = n_q_heads and iron/operators/softmax/op.py requires
-        # rows % 16 == 0. Qwen3's 16 heads pass; Gemma-3-270M's 4 do NOT, which is why that spec
-        # cannot build on this IRON ref without a softmax change -- named here rather than as a
-        # ValueError from three frames down.
-        if self.n_q_heads % 16:
-            raise ValueError(f"{self.name}: Softmax rows=n_q_heads={self.n_q_heads} must be a "
-                             f"multiple of 16 (iron/operators/softmax/op.py)")
+        # No n_q_heads % 16 rule here any more. It cited iron/operators/softmax/op.py, which had
+        # rejected `rows % 16` with no stated derivation and has since dropped it: the real
+        # requirements are rows >= num_aie_columns*num_channels and rows % num_aie_columns == 0,
+        # both of which softmax_cols() satisfies by construction. The stale copy outlived its
+        # source and was the ONLY thing failing gemma3-270m, whose 4 heads run at 4 columns.
+        if self.softmax_cols(cols) * 1 > self.n_q_heads:
+            raise ValueError(f"{self.name}: Softmax rows=n_q_heads={self.n_q_heads} cannot be "
+                             f"split across {cols} columns")
         if self.n_q_heads % self.n_kv_heads:
             raise ValueError(f"{self.name}: n_q_heads={self.n_q_heads} not a multiple of "
                              f"n_kv_heads={self.n_kv_heads}")
