@@ -26,11 +26,41 @@ pub struct ScenarioConfig {
 /// scenario got before this existed.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 pub struct GenerationCfg {
-    /// Default completion budget for this model. `None` falls back to `GenerateParams`'s 256, which
-    /// is OpenAI's number and not a property of any model here -- a reasoning model whose `<think>`
-    /// block routinely costs more than that had no per-model way to say so.
+    /// Default completion budget for this model. Unset falls through to the checkpoint's
+    /// `max_new_tokens` and then to the engine's 256 -- OpenAI's number, and not a property of any
+    /// model here, which is wrong for a reasoning model whose `<think>` block outgrows it.
     #[serde(default)]
     pub max_tokens: Option<u32>,
+    /// Sampling overrides. Each is optional and each sits ABOVE the checkpoint's own
+    /// `generation_config.json` and below an explicit request -- set one only to disagree with what
+    /// the model ships, which is a deliberate act and should look like one in the config.
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    #[serde(default)]
+    pub top_p: Option<f32>,
+    #[serde(default)]
+    pub top_k: Option<u32>,
+    #[serde(default)]
+    pub presence_penalty: Option<f32>,
+    #[serde(default)]
+    pub frequency_penalty: Option<f32>,
+    #[serde(default)]
+    pub repetition_penalty: Option<f32>,
+}
+
+impl GenerationCfg {
+    /// The engine-side tier this block represents.
+    pub fn to_defaults(&self) -> crate::pipeline::GenerationDefaults {
+        crate::pipeline::GenerationDefaults {
+            temperature: self.temperature,
+            top_p: self.top_p,
+            top_k: self.top_k,
+            max_tokens: self.max_tokens,
+            presence_penalty: self.presence_penalty,
+            frequency_penalty: self.frequency_penalty,
+            repetition_penalty: self.repetition_penalty,
+        }
+    }
 }
 
 /// Per-kind block for `kind = "diarize"`, same shape as `embeddings`. One field on purpose: every

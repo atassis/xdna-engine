@@ -173,15 +173,26 @@ pub enum Cmd {
     },
 }
 
-/// Sampling flags shared by `generate` and `chat`. `None` means "use the engine default"
-/// (`GenerateParams::default()`, OpenAI's defaults) rather than a CLI-chosen one -- so a bare
-/// `npu generate "..."` behaves identically to an HTTP request with no sampling fields at all.
+/// Sampling flags shared by `generate` and `chat`. `None` means "the caller did not ask", which is
+/// what lets the lower tiers (the scenario's `[generation]` block, then the checkpoint's own
+/// `generation_config.json`) supply a value -- so a bare `npu generate "..."` behaves identically to
+/// an HTTP request with no sampling fields at all. The two surfaces accept the same set on purpose;
+/// a flag here without a JSON field there (or the reverse) is a parity bug.
 #[derive(clap::Args)]
 pub struct SamplingArgs {
     #[arg(long)] pub temperature: Option<f32>,
     #[arg(long)] pub top_p: Option<f32>,
     #[arg(long)] pub top_k: Option<u32>,
     #[arg(long)] pub max_tokens: Option<u32>,
+    /// OpenAI's current spelling for `--max-tokens`. Setting both to different values is an error
+    /// rather than a silent pick, matching the HTTP surface.
+    #[arg(long)] pub max_completion_tokens: Option<u32>,
+    /// OpenAI range -2.0..2.0. Accepted over HTTP since the beginning; the CLI could not send it.
+    #[arg(long)] pub presence_penalty: Option<f32>,
+    /// OpenAI range -2.0..2.0.
+    #[arg(long)] pub frequency_penalty: Option<f32>,
+    /// Not an OpenAI field, but universal in local servers. 1.0 = no penalty.
+    #[arg(long)] pub repetition_penalty: Option<f32>,
     /// May be repeated: `--stop A --stop B`.
     #[arg(long)] pub stop: Vec<String>,
     #[arg(long)] pub seed: Option<u64>,

@@ -271,12 +271,20 @@ fn transcribe(path: &Path, input: &Path, model: Option<&str>) -> Result<()> {
 
 /// `--flag <value>` overrides one `GenerateParams` field; an absent flag keeps the engine default
 /// (`GenerateParams::default()`, OpenAI's own defaults) -- never a CLI-chosen substitute.
-fn build_params(s: &SamplingArgs) -> npu_engine::GenerateParams {
+fn build_params(s: &SamplingArgs) -> Result<npu_engine::GenerateParams, String> {
     let mut p = npu_engine::GenerateParams::default();
-    if let Some(t) = s.temperature { p.temperature = t; }
-    if let Some(t) = s.top_p { p.top_p = t; }
-    if let Some(t) = s.top_k { p.top_k = t; }
-    if let Some(t) = s.max_tokens { p.max_tokens = Some(t); }
+    p.temperature = s.temperature;
+    p.top_p = s.top_p;
+    p.top_k = s.top_k;
+    p.presence_penalty = s.presence_penalty;
+    p.frequency_penalty = s.frequency_penalty;
+    p.repetition_penalty = s.repetition_penalty;
+    p.max_tokens = match (s.max_tokens, s.max_completion_tokens) {
+        (Some(a), Some(b)) if a != b => return Err(format!(
+            "--max-tokens ({a}) and --max-completion-tokens ({b}) disagree; pass one")),
+        (Some(a), _) | (None, Some(a)) => Some(a),
+        (None, None) => None,
+    };
     if !s.stop.is_empty() { p.stop = s.stop.clone(); }
     p.seed = s.seed;
     // Neither flag leaves the template's own default -- `None`, not a defaulted `true`, because for
@@ -286,7 +294,10 @@ fn build_params(s: &SamplingArgs) -> npu_engine::GenerateParams {
         (false, true) => Some(false),
         _ => None,
     };
-    p
+    // The SAME check the HTTP surface runs, from the same function -- two surfaces validating
+    // separately is how they drift on what they accept.
+    p.validate()?;
+    Ok(p)
 }
 
 /// `npu generate`/`npu chat` run IN-PROCESS (`start_lazy` + `EngineLoader`), the same pattern as
@@ -330,7 +341,9 @@ fn generate(path: &Path, prompt: &str, model: Option<&str>, sampling: &SamplingA
     let root = root(&cfg, path)?;
     let (handle, join) = start_lazy(cfg, Box::new(EngineLoader { root }))
         .map_err(|e| Tagged(engine_error(&e), e.to_string()))?;
-    let params = build_params(sampling);
+    // Code::Failure, the documented generic bucket: this closed set has no invalid-argument code,
+    // and NoService (2) would tell a caller to start a server for what is a bad flag value.
+    let params = build_params(sampling).map_err(|m| Tagged(Code::Failure, m))?;
     let prompt = if raw {
         npu_engine::Prompt::Raw(prompt.to_string())
     } else {
@@ -364,7 +377,9 @@ fn chat(path: &Path, model: Option<&str>, sampling: &SamplingArgs, no_stream: bo
     let root = root(&cfg, path)?;
     let (handle, join) = start_lazy(cfg, Box::new(EngineLoader { root }))
         .map_err(|e| Tagged(engine_error(&e), e.to_string()))?;
-    let params = build_params(sampling);
+    // Code::Failure, the documented generic bucket: this closed set has no invalid-argument code,
+    // and NoService (2) would tell a caller to start a server for what is a bad flag value.
+    let params = build_params(sampling).map_err(|m| Tagged(Code::Failure, m))?;
     let mut history: Vec<npu_engine::ChatMessage> = Vec::new();
     let stdin = std::io::stdin();
     let result = (|| -> Result<()> {
@@ -1093,28 +1108,81 @@ mod tests {
     fn build_params_with_no_flags_is_the_engine_default() {
         let s = cli_def::SamplingArgs {
             temperature: None, top_p: None, top_k: None, max_tokens: None,
-            stop: vec![], seed: None, think: false, no_think: false,
+            max_completion_tokens: None, presence_penalty: None, frequency_penalty: None,
+            repetition_penalty: None, stop: vec![], seed: None, think: false, no_think: false,
         };
-        let p = build_params(&s);
-        let d = npu_engine::GenerateParams::default();
-        assert_eq!(p.temperature, d.temperature);
-        assert_eq!(p.top_p, d.top_p);
-        assert_eq!(p.top_k, d.top_k);
-        assert_eq!(p.max_tokens, d.max_tokens);
+        let p = build_params(&s).unwrap();
+        // Everything UNSET, exactly like an HTTP body with no sampling fields -- the CLI must not
+        // pre-fill a value, or it would silently outrank the scenario and checkpoint tiers.
+        assert_eq!(p.temperature, None);
+        assert_eq!(p.top_p, None);
+        assert_eq!(p.top_k, None);
+        assert_eq!(p.max_tokens, None);
+        assert_eq!(p.presence_penalty, None);
+        assert_eq!(p.frequency_penalty, None);
+        assert_eq!(p.repetition_penalty, None);
         assert!(p.stop.is_empty());
         assert_eq!(p.seed, None);
+    }
+
+    /// The CLI and the HTTP surface must accept the SAME sampling set. This is the parity guard:
+    /// every field on `GenerateParams` that a caller can set has a flag here.
+    #[test]
+    fn every_sampling_flag_reaches_generate_params() {
+        let s = cli_def::SamplingArgs {
+            temperature: Some(0.4), top_p: Some(0.9), top_k: Some(50), max_tokens: None,
+            max_completion_tokens: Some(64), presence_penalty: Some(0.5),
+            frequency_penalty: Some(-0.5), repetition_penalty: Some(1.2),
+            stop: vec!["END".into()], seed: Some(7), think: false, no_think: true,
+        };
+        let p = build_params(&s).unwrap();
+        assert_eq!(p.presence_penalty, Some(0.5));
+        assert_eq!(p.frequency_penalty, Some(-0.5));
+        assert_eq!(p.repetition_penalty, Some(1.2));
+        assert_eq!(p.max_tokens, Some(64), "--max-completion-tokens is an alias for --max-tokens");
+    }
+
+    #[test]
+    fn the_two_max_token_spellings_must_agree_when_both_are_given() {
+        let mk = |a, b| cli_def::SamplingArgs {
+            temperature: None, top_p: None, top_k: None, max_tokens: a,
+            max_completion_tokens: b, presence_penalty: None, frequency_penalty: None,
+            repetition_penalty: None, stop: vec![], seed: None, think: false, no_think: false,
+        };
+        assert_eq!(build_params(&mk(Some(8), Some(8))).unwrap().max_tokens, Some(8));
+        let err = build_params(&mk(Some(8), Some(9))).unwrap_err();
+        assert!(err.contains("disagree"), "{err}");
+    }
+
+    /// Out-of-range values are rejected by the SAME `validate()` the HTTP surface calls, so the two
+    /// cannot drift on what they accept. Silently degenerate is the behaviour being removed here:
+    /// a negative temperature read as greedy and a top_p above 1 disabled the filter.
+    #[test]
+    fn out_of_range_sampling_values_are_rejected() {
+        let mk = |t, tp| cli_def::SamplingArgs {
+            temperature: t, top_p: tp, top_k: None, max_tokens: None,
+            max_completion_tokens: None, presence_penalty: None, frequency_penalty: None,
+            repetition_penalty: None, stop: vec![], seed: None, think: false, no_think: false,
+        };
+        assert!(build_params(&mk(Some(-1.0), None)).unwrap_err().contains("temperature"));
+        assert!(build_params(&mk(Some(3.0), None)).unwrap_err().contains("temperature"));
+        assert!(build_params(&mk(None, Some(1.5))).unwrap_err().contains("top_p"));
+        assert!(build_params(&mk(Some(0.0), Some(1.0))).is_ok(), "the endpoints are legal");
+        assert!(build_params(&mk(Some(2.0), Some(0.0))).is_ok());
     }
 
     #[test]
     fn build_params_applies_every_flag() {
         let s = cli_def::SamplingArgs {
             temperature: Some(0.4), top_p: Some(0.9), top_k: Some(50), max_tokens: Some(64),
+            max_completion_tokens: None, presence_penalty: None, frequency_penalty: None,
+            repetition_penalty: None,
             stop: vec!["END".into(), "STOP".into()], seed: Some(7), think: false, no_think: true,
         };
-        let p = build_params(&s);
-        assert_eq!(p.temperature, 0.4);
-        assert_eq!(p.top_p, 0.9);
-        assert_eq!(p.top_k, 50);
+        let p = build_params(&s).unwrap();
+        assert_eq!(p.temperature, Some(0.4));
+        assert_eq!(p.top_p, Some(0.9));
+        assert_eq!(p.top_k, Some(50));
         assert_eq!(p.max_tokens, Some(64));
         assert_eq!(p.stop, vec!["END".to_string(), "STOP".to_string()]);
         assert_eq!(p.seed, Some(7));
@@ -1128,12 +1196,14 @@ mod tests {
     #[test]
     fn think_flags_map_to_a_tri_state_and_neither_flag_leaves_the_template_default() {
         let base = |think, no_think| cli_def::SamplingArgs {
+            max_completion_tokens: None, presence_penalty: None, frequency_penalty: None,
+            repetition_penalty: None,
             temperature: None, top_p: None, top_k: None, max_tokens: None,
             stop: vec![], seed: None, think, no_think,
         };
-        assert_eq!(build_params(&base(false, false)).enable_thinking, None);
-        assert_eq!(build_params(&base(true, false)).enable_thinking, Some(true));
-        assert_eq!(build_params(&base(false, true)).enable_thinking, Some(false));
+        assert_eq!(build_params(&base(false, false)).unwrap().enable_thinking, None);
+        assert_eq!(build_params(&base(true, false)).unwrap().enable_thinking, Some(true));
+        assert_eq!(build_params(&base(false, true)).unwrap().enable_thinking, Some(false));
     }
 
     /// `--think` and `--no-think` override each other rather than erroring, so the last one on the
@@ -1144,7 +1214,7 @@ mod tests {
         match &cli.cmd {
             Cmd::Generate { sampling, .. } => {
                 assert!(sampling.no_think && !sampling.think);
-                assert_eq!(build_params(sampling).enable_thinking, Some(false));
+                assert_eq!(build_params(sampling).unwrap().enable_thinking, Some(false));
             }
             _ => panic!("expected Cmd::Generate"),
         }
@@ -1152,7 +1222,7 @@ mod tests {
         match &cli.cmd {
             Cmd::Chat { sampling, .. } => {
                 assert!(sampling.think && !sampling.no_think);
-                assert_eq!(build_params(sampling).enable_thinking, Some(true));
+                assert_eq!(build_params(sampling).unwrap().enable_thinking, Some(true));
             }
             _ => panic!("expected Cmd::Chat"),
         }

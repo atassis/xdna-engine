@@ -109,20 +109,19 @@ impl DecodeStep for ScriptedDecodeStep {
 pub struct LlmGenerator<D: DecodeStep> {
     cfg: ModelConfig,
     decode: D,
-    /// The scenario's `[generation] max_tokens`, applied when a request omits the field. `None`
-    /// falls through to [`DEFAULT_MAX_TOKENS`].
-    default_max_tokens: Option<u32>,
+    /// The scenario's `[generation]` block -- the tier between the request and the checkpoint.
+    scenario_defaults: crate::pipeline::GenerationDefaults,
 }
 
 impl<D: DecodeStep> LlmGenerator<D> {
     pub fn new(cfg: ModelConfig, decode: D) -> Self {
-        LlmGenerator { cfg, decode, default_max_tokens: None }
+        LlmGenerator { cfg, decode, scenario_defaults: Default::default() }
     }
 
-    /// Set the per-model completion budget. A request that names `max_tokens` still wins; this is
-    /// the default for one that does not.
-    pub fn with_default_max_tokens(mut self, max_tokens: Option<u32>) -> Self {
-        self.default_max_tokens = max_tokens;
+    /// Set the scenario's generation defaults. A request that names a field still wins; these
+    /// apply only under the fields it leaves out, and above the checkpoint's own settings.
+    pub fn with_scenario_defaults(mut self, d: crate::pipeline::GenerationDefaults) -> Self {
+        self.scenario_defaults = d;
         self
     }
 }
@@ -166,13 +165,15 @@ impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
             }
         }
 
+        // The one place the tiers collapse: request -> scenario -> checkpoint -> engine.
+        let gen = params.resolve(&self.scenario_defaults, &self.cfg.checkpoint_defaults);
         let sampling_cfg = SamplingConfig {
-            temperature: params.temperature,
-            top_k: params.top_k as usize,
-            top_p: params.top_p,
-            repetition_penalty: params.repetition_penalty,
-            frequency_penalty: params.frequency_penalty,
-            presence_penalty: params.presence_penalty,
+            temperature: gen.temperature,
+            top_k: gen.top_k as usize,
+            top_p: gen.top_p,
+            repetition_penalty: gen.repetition_penalty,
+            frequency_penalty: gen.frequency_penalty,
+            presence_penalty: gen.presence_penalty,
         };
         let mut rng = SplitMix64::new(params.seed.unwrap_or_else(default_seed));
         // Penalties see the whole context, prompt included -- OpenAI's own wording ("existing
@@ -188,12 +189,7 @@ impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
             logits = self.decode.step(tok, i)?;
         }
 
-        // Request first, then the model's configured default, then the engine's. Resolved ONCE so
-        // the two checks below cannot disagree.
-        let max_tokens = params
-            .max_tokens
-            .or(self.default_max_tokens)
-            .unwrap_or(crate::pipeline::DEFAULT_MAX_TOKENS);
+        let max_tokens = gen.max_tokens;
 
         let mut completion_tokens = 0u32;
         let finish: FinishReason;
@@ -270,6 +266,7 @@ impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
 mod tests {
     use super::*;
     use crate::llm::chat_template::ChatTemplate;
+    use crate::pipeline::GenerationDefaults;
     use crate::llm::config::StopTokens;
     use crate::pipeline::ChatMessage;
     use std::collections::HashMap;
@@ -314,7 +311,7 @@ mod tests {
             vec![0.0, 0.0, 0.0, 0.0, 9.0], // sample -> id 4 (EOS)
         ]);
         let mut gen = LlmGenerator::new(cfg, decode);
-        let params = GenerateParams { max_tokens: Some(50), temperature: 0.0, ..GenerateParams::default() };
+        let params = GenerateParams { max_tokens: Some(50), temperature: Some(0.0), ..GenerateParams::default() };
         let (text, reason, usage) = gen.generate_to_string(&Prompt::Raw("hello".to_string()), &params).unwrap();
         assert_eq!(text, "world");
         assert_eq!(reason, FinishReason::Stop);
@@ -327,9 +324,9 @@ mod tests {
         let cfg = build_cfg(None);
         let peak = |id: usize| { let mut v = vec![0.0; 7]; v[id] = 9.0; v };
         let decode = ScriptedDecodeStep::new(vec![peak(2), peak(5), peak(6), peak(1)]);
-        let mut gen = LlmGenerator::new(cfg, decode).with_default_max_tokens(Some(2));
+        let mut gen = LlmGenerator::new(cfg, decode).with_scenario_defaults(GenerationDefaults { max_tokens: Some(2), ..Default::default() });
         // max_tokens unset -- the model's own budget of 2 decides, not the engine's 256.
-        let params = GenerateParams { temperature: 0.0, ..GenerateParams::default() };
+        let params = GenerateParams { temperature: Some(0.0), ..GenerateParams::default() };
         let (text, reason, usage) =
             gen.generate_to_string(&Prompt::Raw("hello".to_string()), &params).unwrap();
         assert_eq!(reason, FinishReason::Length);
@@ -342,16 +339,16 @@ mod tests {
         let peak = |id: usize| { let mut v = vec![0.0; 7]; v[id] = 9.0; v };
         // Asking for MORE than the model default gets more: the default is a default, not a cap.
         let decode = ScriptedDecodeStep::new(vec![peak(2), peak(5), peak(6), peak(1)]);
-        let mut gen = LlmGenerator::new(build_cfg(None), decode).with_default_max_tokens(Some(1));
-        let params = GenerateParams { max_tokens: Some(3), temperature: 0.0, ..GenerateParams::default() };
+        let mut gen = LlmGenerator::new(build_cfg(None), decode).with_scenario_defaults(GenerationDefaults { max_tokens: Some(1), ..Default::default() });
+        let params = GenerateParams { max_tokens: Some(3), temperature: Some(0.0), ..GenerateParams::default() };
         let (_, _, usage) =
             gen.generate_to_string(&Prompt::Raw("hello".to_string()), &params).unwrap();
         assert_eq!(usage.completion_tokens, 3, "an explicit request must be able to exceed the default");
 
         // And asking for less gets less.
         let decode = ScriptedDecodeStep::new(vec![peak(2), peak(5), peak(6), peak(1)]);
-        let mut gen = LlmGenerator::new(build_cfg(None), decode).with_default_max_tokens(Some(3));
-        let params = GenerateParams { max_tokens: Some(1), temperature: 0.0, ..GenerateParams::default() };
+        let mut gen = LlmGenerator::new(build_cfg(None), decode).with_scenario_defaults(GenerationDefaults { max_tokens: Some(3), ..Default::default() });
+        let params = GenerateParams { max_tokens: Some(1), temperature: Some(0.0), ..GenerateParams::default() };
         let (_, _, usage) =
             gen.generate_to_string(&Prompt::Raw("hello".to_string()), &params).unwrap();
         assert_eq!(usage.completion_tokens, 1);
@@ -364,7 +361,7 @@ mod tests {
         // against an unset model default must not collapse to zero tokens.
         let decode = ScriptedDecodeStep::new(vec![vec![0.0, 0.0, 9.0, 0.0, 0.0], vec![0.0, 0.0, 0.0, 0.0, 9.0]]);
         let mut gen = LlmGenerator::new(cfg, decode);
-        let params = GenerateParams { temperature: 0.0, ..GenerateParams::default() };
+        let params = GenerateParams { temperature: Some(0.0), ..GenerateParams::default() };
         assert_eq!(params.max_tokens, None);
         let (text, reason, _) =
             gen.generate_to_string(&Prompt::Raw("hello".to_string()), &params).unwrap();
@@ -379,7 +376,7 @@ mod tests {
         // last row of head 0. Nothing downstream can detect that, so it must be refused here.
         let decode = ScriptedDecodeStep::new(vec![vec![0.0, 0.0, 9.0, 0.0, 0.0]]).with_max_context(2);
         let mut gen = LlmGenerator::new(cfg, decode);
-        let params = GenerateParams { max_tokens: Some(50), temperature: 0.0, ..GenerateParams::default() };
+        let params = GenerateParams { max_tokens: Some(50), temperature: Some(0.0), ..GenerateParams::default() };
         let err = gen
             .generate_to_string(&Prompt::Raw("hello world foo".to_string()), &params)
             .expect_err("a prompt that does not fit the window must not run");
@@ -403,7 +400,7 @@ mod tests {
         let decode = ScriptedDecodeStep::new(vec![peak(2), peak(5), peak(6), peak(1), peak(2)])
             .with_max_context(3);
         let mut gen = LlmGenerator::new(cfg, decode);
-        let params = GenerateParams { max_tokens: Some(50), temperature: 0.0, ..GenerateParams::default() };
+        let params = GenerateParams { max_tokens: Some(50), temperature: Some(0.0), ..GenerateParams::default() };
         let (text, reason, usage) =
             gen.generate_to_string(&Prompt::Raw("hello".to_string()), &params).unwrap();
         assert_eq!(reason, FinishReason::Length, "hitting the window is a length stop");
@@ -423,7 +420,7 @@ mod tests {
         }])
         .with_max_context(2);
         let mut gen = LlmGenerator::new(cfg, decode);
-        let params = GenerateParams { max_tokens: Some(50), temperature: 0.0, ..GenerateParams::default() };
+        let params = GenerateParams { max_tokens: Some(50), temperature: Some(0.0), ..GenerateParams::default() };
         let (text, reason, usage) =
             gen.generate_to_string(&Prompt::Raw("hello world".to_string()), &params).unwrap();
         assert_eq!(reason, FinishReason::Length);
@@ -441,7 +438,7 @@ mod tests {
         ]);
         assert!(decode.max_context().is_none());
         let mut gen = LlmGenerator::new(cfg, decode);
-        let params = GenerateParams { max_tokens: Some(50), temperature: 0.0, ..GenerateParams::default() };
+        let params = GenerateParams { max_tokens: Some(50), temperature: Some(0.0), ..GenerateParams::default() };
         let (_, reason, _) =
             gen.generate_to_string(&Prompt::Raw("hello".to_string()), &params).unwrap();
         assert_eq!(reason, FinishReason::Stop);
@@ -455,7 +452,7 @@ mod tests {
             vec![0.0, 0.0, 9.0, 0.0, 0.0], // -> "world" again
         ]);
         let mut gen = LlmGenerator::new(cfg, decode);
-        let params = GenerateParams { max_tokens: Some(2), temperature: 0.0, ..GenerateParams::default() };
+        let params = GenerateParams { max_tokens: Some(2), temperature: Some(0.0), ..GenerateParams::default() };
         let (text, reason, usage) = gen.generate_to_string(&Prompt::Raw("hello".to_string()), &params).unwrap();
         assert_eq!(text, "world world");
         assert_eq!(reason, FinishReason::Length, "must stop WITHOUT an extra wasted device dispatch");
@@ -467,7 +464,7 @@ mod tests {
         let cfg = build_cfg(None);
         let decode = ScriptedDecodeStep::new(vec![vec![0.0, 0.0, 9.0, 0.0, 0.0]]);
         let mut gen = LlmGenerator::new(cfg, decode);
-        let params = GenerateParams { max_tokens: Some(50), temperature: 0.0, ..GenerateParams::default() };
+        let params = GenerateParams { max_tokens: Some(50), temperature: Some(0.0), ..GenerateParams::default() };
         let mut finish = None;
         gen.generate(&Prompt::Raw("hello".to_string()), &params, &mut |c| match c {
             Chunk::Text(_) => false, // abort on the very first text chunk
@@ -490,7 +487,7 @@ mod tests {
         let mut gen = LlmGenerator::new(cfg, decode);
         let params = GenerateParams {
             max_tokens: Some(50),
-            temperature: 0.0,
+            temperature: Some(0.0),
             stop: vec!["stop_word".to_string()],
             ..GenerateParams::default()
         };
@@ -511,7 +508,7 @@ mod tests {
             ]);
             LlmGenerator::new(cfg, decode)
         };
-        let params = GenerateParams { max_tokens: Some(50), temperature: 0.0, ..GenerateParams::default() };
+        let params = GenerateParams { max_tokens: Some(50), temperature: Some(0.0), ..GenerateParams::default() };
         let (t1, ..) = make().generate_to_string(&Prompt::Raw("hello".to_string()), &params).unwrap();
         let (t2, ..) = make().generate_to_string(&Prompt::Raw("hello".to_string()), &params).unwrap();
         assert_eq!(t1, t2);
@@ -523,7 +520,7 @@ mod tests {
         // one thing: does the SAME seed draw the SAME two tokens from non-degenerate softmax logits.
         let script = || vec![vec![1.0, 1.0, 1.0, 1.0, 0.0], vec![1.0, 2.0, 3.0, 1.0, 0.0]];
         let params =
-            GenerateParams { max_tokens: Some(2), temperature: 0.9, seed: Some(1234), ..GenerateParams::default() };
+            GenerateParams { max_tokens: Some(2), temperature: Some(0.9), seed: Some(1234), ..GenerateParams::default() };
         let run = || {
             let cfg = build_cfg(None);
             let decode = ScriptedDecodeStep::new(script());
@@ -546,7 +543,7 @@ mod tests {
             vec![0.0, 0.0, 0.0, 0.0, 9.0], // priming pos 1 ("world") -> first sample() -> EOS
         ]);
         let mut gen = LlmGenerator::new(cfg, decode);
-        let params = GenerateParams { max_tokens: Some(5), temperature: 0.0, ..GenerateParams::default() };
+        let params = GenerateParams { max_tokens: Some(5), temperature: Some(0.0), ..GenerateParams::default() };
         let prompt = Prompt::Chat(vec![ChatMessage { role: "user".to_string(), content: "hello world".to_string() }]);
         let (text, reason, usage) = gen.generate_to_string(&prompt, &params).unwrap();
         assert_eq!(text, "");
@@ -559,7 +556,7 @@ mod tests {
         let cfg = build_cfg(Some("SHOULD NOT BE USED"));
         let decode = ScriptedDecodeStep::new(vec![vec![0.0, 0.0, 0.0, 0.0, 9.0]]); // -> EOS immediately
         let mut gen = LlmGenerator::new(cfg, decode);
-        let params = GenerateParams { max_tokens: Some(5), temperature: 0.0, ..GenerateParams::default() };
+        let params = GenerateParams { max_tokens: Some(5), temperature: Some(0.0), ..GenerateParams::default() };
         let (_, _, usage) = gen.generate_to_string(&Prompt::Raw("hello".to_string()), &params).unwrap();
         assert_eq!(usage.prompt_tokens, 1);
     }

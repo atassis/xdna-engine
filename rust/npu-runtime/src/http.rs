@@ -810,14 +810,30 @@ pub mod parse {
     /// `temperature: 1.0`), never a silent substitution of greedy.
     fn parse_generate_params(v: &serde_json::Value) -> Result<npu_engine::GenerateParams, String> {
         let mut p = npu_engine::GenerateParams::default();
-        if let Some(x) = v.get("temperature") { p.temperature = as_f32(x, "temperature")?; }
-        if let Some(x) = v.get("top_p") { p.top_p = as_f32(x, "top_p")?; }
-        if let Some(x) = v.get("top_k") { p.top_k = as_u32(x, "top_k")?; }
-        if let Some(x) = v.get("max_tokens") { p.max_tokens = Some(as_u32(x, "max_tokens")?); }
+        if let Some(x) = v.get("temperature") { p.temperature = Some(as_f32(x, "temperature")?); }
+        if let Some(x) = v.get("top_p") { p.top_p = Some(as_f32(x, "top_p")?); }
+        if let Some(x) = v.get("top_k") { p.top_k = Some(as_u32(x, "top_k")?); }
+        // `max_completion_tokens` is OpenAI's current spelling; `max_tokens` is the deprecated one
+        // every existing client still sends. Accept both, reject a body that sets them to different
+        // values rather than silently picking a winner.
+        let max_tokens = match (v.get("max_tokens"), v.get("max_completion_tokens")) {
+            (Some(a), Some(b)) => {
+                let (a, b) = (as_u32(a, "max_tokens")?, as_u32(b, "max_completion_tokens")?);
+                if a != b {
+                    return Err(format!(
+                        "\"max_tokens\" ({a}) and \"max_completion_tokens\" ({b}) disagree; send one"));
+                }
+                Some(a)
+            }
+            (Some(a), None) => Some(as_u32(a, "max_tokens")?),
+            (None, Some(b)) => Some(as_u32(b, "max_completion_tokens")?),
+            (None, None) => None,
+        };
+        p.max_tokens = max_tokens;
         if let Some(x) = v.get("seed") { p.seed = Some(as_u64(x, "seed")?); }
-        if let Some(x) = v.get("presence_penalty") { p.presence_penalty = as_f32(x, "presence_penalty")?; }
-        if let Some(x) = v.get("frequency_penalty") { p.frequency_penalty = as_f32(x, "frequency_penalty")?; }
-        if let Some(x) = v.get("repetition_penalty") { p.repetition_penalty = as_f32(x, "repetition_penalty")?; }
+        if let Some(x) = v.get("presence_penalty") { p.presence_penalty = Some(as_f32(x, "presence_penalty")?); }
+        if let Some(x) = v.get("frequency_penalty") { p.frequency_penalty = Some(as_f32(x, "frequency_penalty")?); }
+        if let Some(x) = v.get("repetition_penalty") { p.repetition_penalty = Some(as_f32(x, "repetition_penalty")?); }
         // `chat_template_kwargs` is the spelling vLLM and SGLang use, and the one reasoning models
         // are driven by in practice. Honour `enable_thinking`; 400 on any other key rather than
         // accept it silently -- an ignored template kwarg changes the PROMPT, which is the "answer
@@ -842,6 +858,8 @@ pub mod parse {
                 .collect::<Result<Vec<_>, _>>()?,
             Some(_) => return Err("\"stop\" must be a string or an array of strings".into()),
         };
+        // Shared with the CLI so the two surfaces cannot drift on what they accept.
+        p.validate()?;
         Ok(p)
     }
     fn as_f32(v: &serde_json::Value, field: &str) -> Result<f32, String> {
@@ -1587,14 +1605,14 @@ mod generate_tests {
         let (code, resp) = route(&post("/v1/chat/completions", body), &h, &p);
         assert_eq!(code, 200, "{resp}");
         let (_, params) = seen.lock().unwrap().clone().unwrap();
-        assert!(close(params.temperature, 0.3), "{}", params.temperature);
-        assert!(close(params.top_p, 0.5), "{}", params.top_p);
-        assert_eq!(params.top_k, 40);
+        assert!(close(params.temperature.unwrap(), 0.3), "{:?}", params.temperature);
+        assert!(close(params.top_p.unwrap(), 0.5), "{:?}", params.top_p);
+        assert_eq!(params.top_k, Some(40));
         assert_eq!(params.max_tokens, Some(7));
         assert_eq!(params.seed, Some(42));
-        assert!(close(params.presence_penalty, 0.1), "{}", params.presence_penalty);
-        assert!(close(params.frequency_penalty, 0.2), "{}", params.frequency_penalty);
-        assert!(close(params.repetition_penalty, 1.3), "{}", params.repetition_penalty);
+        assert!(close(params.presence_penalty.unwrap(), 0.1), "{:?}", params.presence_penalty);
+        assert!(close(params.frequency_penalty.unwrap(), 0.2), "{:?}", params.frequency_penalty);
+        assert!(close(params.repetition_penalty.unwrap(), 1.3), "{:?}", params.repetition_penalty);
         assert_eq!(params.stop, vec!["STOP".to_string()]);
         h.shutdown(); j.join().unwrap();
     }
@@ -1638,17 +1656,23 @@ mod generate_tests {
         }
     }
 
+    /// Absent fields must arrive UNSET, not pre-filled with the engine's numbers. Parsing is not
+    /// where defaults are chosen any more: the scenario's `[generation]` block and then the
+    /// checkpoint's `generation_config.json` sit below the request, and a parser that substituted
+    /// 1.0 here would silently outrank both.
     #[test]
-    fn openai_defaults_apply_when_fields_are_absent() {
+    fn absent_fields_stay_unset_so_the_lower_tiers_can_apply() {
         let (h, j, _d, p, _sent, seen) = gen_handle(ss(&["ok"]), Duration::ZERO);
         let (code, resp) = route(&post("/v1/chat/completions",
             r#"{"messages":[{"role":"user","content":"hi"}]}"#), &h, &p);
         assert_eq!(code, 200, "{resp}");
         let (_, params) = seen.lock().unwrap().clone().unwrap();
-        let d = GenerateParams::default();
-        assert!(close(params.temperature, d.temperature), "default temperature must be 1.0, not greedy");
-        assert!(close(params.top_p, d.top_p));
-        assert_eq!(params.top_k, 0);
+        assert_eq!(params.temperature, None, "parsing must not choose a temperature");
+        assert_eq!(params.top_p, None);
+        assert_eq!(params.top_k, None);
+        assert_eq!(params.presence_penalty, None);
+        assert_eq!(params.frequency_penalty, None);
+        assert_eq!(params.repetition_penalty, None);
         assert_eq!(params.max_tokens, None, "an absent max_tokens must stay unset, so the model default can apply");
         assert!(params.stop.is_empty());
         assert_eq!(params.seed, None);
