@@ -265,8 +265,9 @@ fn render_buffered(model: String, rx: std::sync::mpsc::Receiver<StreamItem>, kin
         match rx.recv() {
             Ok(StreamItem::Text(t)) => text.push_str(&t),
             Ok(StreamItem::Done { reason, usage }) => break (reason, usage),
-            Ok(StreamItem::Error(e)) =>
-                return (500, format!("{{\"error\":\"{}\"}}", parse::json_escape(&e)).into()),
+            // Classified, not blanket-500: a prompt that does not fit the context window is the
+            // caller's to fix, and `engine_err` already knows that `Unsupported` is a 400.
+            Ok(StreamItem::Error(e)) => return engine_err(&e),
             Err(_) =>
                 return (500, "{\"error\":\"generation ended without a result\"}".into()),
         }
@@ -608,7 +609,7 @@ fn respond_stream(stream: &mut TcpStream, code: u16, s: &SseStream) -> std::io::
         let frame = match item {
             StreamItem::Text(t) => s.render_text(&t),
             StreamItem::Done { reason, .. } => s.render_done(reason),
-            StreamItem::Error(e) => s.render_error(&e),
+            StreamItem::Error(e) => s.render_error(&e.to_string()),
         };
         stream.write_all(format!("data: {frame}\n\n").as_bytes())?;
     }
@@ -1667,6 +1668,68 @@ mod generate_tests {
         let (code, body) = route(&post("/v1/chat/completions",
             r#"{"messages":[{"role":"user","content":"hi"}],"stop":5}"#), &h, &p);
         assert_eq!(code, 400, "{body}");
+        h.shutdown(); j.join().unwrap();
+    }
+
+    /// Fails immediately with a chosen `EngineError`, so the status classification of an error
+    /// raised INSIDE generation (after the response has been promised) is testable.
+    struct FailingModel(Option<EngineError>);
+    impl Servable for FailingModel {
+        fn capabilities(&self) -> Capability { Capability::GENERATE }
+        fn run(&mut self, _req: EngineReq) -> Result<EngineResp, EngineError> {
+            Err(EngineError::Unsupported("use generate_stream".into()))
+        }
+    }
+    impl StreamServable for FailingModel {
+        fn generate_stream(&mut self, _prompt: &Prompt, _params: &GenerateParams,
+            _sink: &mut dyn FnMut(Chunk<'_>) -> bool) -> Result<(), EngineError> {
+            Err(self.0.take().expect("FailingModel used twice"))
+        }
+    }
+
+    fn failing_handle(err: EngineError)
+        -> (Handle, std::thread::JoinHandle<()>, tempfile::TempDir, PathBuf) {
+        struct L(Mutex<Option<EngineError>>);
+        impl ModelLoader for L {
+            fn load(&self, _cfg: &ModelCfg) -> Result<Box<dyn StreamServable>, EngineError> {
+                Ok(Box::new(FailingModel(self.0.lock().unwrap().take())))
+            }
+            fn declared_capability(&self, _cfg: &ModelCfg) -> Option<Capability> {
+                Some(Capability::GENERATE)
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("engine.toml");
+        let cfg = Config {
+            server: ServerCfg { max_resident: 1, idle_unload_s: 0, ..Default::default() },
+            models: vec![ModelCfg { name: "llm".into(), scenario: "x".into(), resident: false }],
+            ..Default::default()
+        };
+        cfg.save(&p).unwrap();
+        let (h, j) = start(cfg, Box::new(L(Mutex::new(Some(err))))).unwrap();
+        (h, j, dir, p)
+    }
+
+    /// A prompt that does not fit the model's context window is the CALLER's mistake, and it is
+    /// raised inside `generate` -- past the point where the route has already returned Ok. Before
+    /// `StreamItem::Error` carried the `EngineError`, every such failure rendered as a blanket 500.
+    #[test]
+    fn a_client_fault_raised_inside_generation_is_a_400_not_a_500() {
+        let (h, j, _d, p) = failing_handle(EngineError::Unsupported(
+            "prompt is 2601 tokens but this model's context window is 2048".into()));
+        let (code, body) = route(&post("/v1/completions", r#"{"prompt":"hi"}"#), &h, &p);
+        assert_eq!(code, 400, "{body}");
+        assert!(body.text().contains("context window"), "{}", body.text());
+        h.shutdown(); j.join().unwrap();
+    }
+
+    /// The other half: an engine fault raised in the same place must still be a 500, so the
+    /// classification is doing work rather than blanket-downgrading everything to 400.
+    #[test]
+    fn an_engine_fault_raised_inside_generation_is_still_a_500() {
+        let (h, j, _d, p) = failing_handle(EngineError::Device("dispatch timed out".into()));
+        let (code, body) = route(&post("/v1/completions", r#"{"prompt":"hi"}"#), &h, &p);
+        assert_eq!(code, 500, "{body}");
         h.shutdown(); j.join().unwrap();
     }
 

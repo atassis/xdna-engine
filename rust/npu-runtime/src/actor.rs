@@ -235,7 +235,7 @@ fn spawn(cfg: Config, loader: Box<dyn ModelLoader + Send>, eager: bool) -> Resul
                                         reg.mark_failed(&name, &e.to_string());
                                         eprintln!("[npu-runtime] {name} FAILED generating: {e}");
                                     }
-                                    let _ = tx.send(StreamItem::Error(e.to_string()));
+                                    let _ = tx.send(StreamItem::Error(e));
                                 }
                             }
                         }
