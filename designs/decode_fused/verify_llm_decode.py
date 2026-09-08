@@ -35,16 +35,29 @@ from gen_llm_decode import build_graph, report_artifact_freshness, load_weight_b
 BF16 = ml_dtypes.bfloat16
 
 
-def rope_row(pos, head_dim, theta):
+def rope_row(pos, head_dim, theta, partial=None):
     """One position's angle row in the layout iron's RoPE op expects.
 
     iron/operators/rope/reference.py: `angles` holds INTERLEAVED [cos, sin, cos, sin, ...] along the
     last dim (length head_dim), and method_type=0 rotates two halves
     (y1 = x1*cos - x2*sin, y2 = x2*cos + x1*sin) -- the same convention as HF's rotate_half.
     NOTE this is NOT the half-split [cos..., sin...] packing mlir-air's examples use.
+
+    `partial` is the checkpoint's partial_rotary_factor for rope_type "proportional": zero the
+    inverse frequency past `int(f * head_dim // 2)` pairs, keeping the FULL head_dim width, because
+    a zero frequency is the identity rotation. The exponent's denominator stays head_dim -- that is
+    what makes it "proportional" rather than ordinary partial rotary, which divides by the rotated
+    width. Same rule as rust/npu-engine/src/llm/npu_decode.rs::rope_row.
+
+    THIS IS THE THIRD COPY of this arithmetic (here, the Rust host, and transformers itself). The
+    two Python ones cannot merge with the Rust one, and the proportional/default distinction is
+    exactly the kind of detail that drifts between copies, so the Rust side is gated against
+    transformers directly and this one is gated against the Rust side by producing the same bytes.
     """
     half = head_dim // 2
     inv = 1.0 / (theta ** (np.arange(0, head_dim, 2, dtype=np.float64)[:half] / head_dim))
+    if partial is not None:
+        inv[int(partial * head_dim // 2):] = 0.0
     ang = pos * inv
     row = np.empty(head_dim, dtype=np.float32)
     row[0::2] = np.cos(ang)
@@ -145,6 +158,11 @@ def main():
     # harness was the half still missing it, so a gate run here would have mis-rotated most
     # layers and presented as a device divergence.
     declared = set(md["inputs"])
+    # `kv_params` is the list form; `kv_param` is the pre-per-layer single slot every older
+    # artifact carries. Falling back keeps this harness able to gate an artifact built before the
+    # list existed.
+    kv_slots = md["scratchpad"].get("kv_params") or [{"param": md["scratchpad"]["kv_param"],
+                                                      "head_dim": HD}]
     rope_buf = c.get_buffer("rope_global") if "rope_global" in declared else None
     rope_loc_buf = c.get_buffer("rope_local") if "rope_local" in declared else None
     out = c.get_buffer("logits")
@@ -158,11 +176,22 @@ def main():
     tok = fed[0]
     for pos in range(len(fed) + steps - 1):
         np.copyto(xin.data, np.asarray(embed[tok] * scale, BF16).reshape(-1))
+        # WIDTH PER BUFFER, not one spec-wide HD. Gemma-4-12B's global layers rotate at head_dim
+        # 512 and its sliding layers at 256, so the two rows differ in width as well as theta;
+        # taking both from `sp.head_dim` writes the wrong number of angles into one of them.
         if rope_buf is not None:
-            np.copyto(rope_buf.data, rope_row(pos, HD, sp.rope_theta_global).reshape(-1))
+            np.copyto(rope_buf.data,
+                      rope_row(pos, rope_buf.data.size, sp.rope_theta_global,
+                               sp.rope_partial_rotary).reshape(-1))
         if rope_loc_buf is not None:
-            np.copyto(rope_loc_buf.data, rope_row(pos, HD, sp.rope_theta_local).reshape(-1))
-        params.write("kv_off", int(pos * HD))
+            # Sliding layers are rope_type "default" -- nothing narrowed.
+            np.copyto(rope_loc_buf.data,
+                      rope_row(pos, rope_loc_buf.data.size, sp.rope_theta_local).reshape(-1))
+        # ONE WRITE PER DISTINCT head_dim, off the artifact's own kv_params. `pos * head_dim` is two
+        # different byte offsets under per-layer geometry, and a single write silently hands the
+        # global layers the sliding layers' KV offset.
+        for slot in kv_slots:
+            params.write(slot["param"], int(pos * slot["head_dim"]))
         params.write("sm_mask", int(pos + 1))
         params.sync()
         # ONE dispatch per position. The duplicate that used to sit here worked around
@@ -171,6 +200,11 @@ def main():
         # a second dispatch would only double the cost and mask a regression in the real fix.
         c()
         lg = np.asarray(out.data[:VOCAB], dtype=np.float32)
+        # final_logit_softcapping, the same transform rust/npu-engine applies after readback. It
+        # changes the ARGMAX (tanh saturates), so a harness that skips it does not gate the model
+        # the engine runs.
+        if sp.logit_softcap is not None:
+            lg = np.tanh(lg / sp.logit_softcap) * sp.logit_softcap
         if a.dump_logits and pos == 0:
             np.save(a.dump_logits, lg)
             print(f"[verify] step-0 logits dumped to {a.dump_logits}")
