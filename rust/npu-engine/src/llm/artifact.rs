@@ -192,8 +192,13 @@ impl LlmArtifact {
         // Absent on a global-only model; present and numeric, or the artifact is malformed. A
         // non-numeric value must not read as "global-only" -- that would silently drop the local
         // RoPE write and leave the local layers rotating at the wrong base.
+        // ABSENT and PRESENT-AS-NULL are the same thing -- single-theta RoPE. The generator emits
+        // the key for every spec and writes `null` where there is no local base, so a global-only
+        // artifact carries an explicit null rather than omitting the field; matching only on
+        // absence sent Qwen3-0.6B, the pinned default, down the malformed branch. A non-numeric
+        // value that is not null is still an error, which is the case the check is for.
         let rope_theta_local = match hp.get("rope_theta_local") {
-            None => None,
+            None | Some(serde_json::Value::Null) => None,
             Some(v) => Some(v.as_f64().ok_or_else(||
                 ctx("host_protocol.rope_theta_local present but non-numeric".to_string()))?),
         };
@@ -639,6 +644,20 @@ mod tests {
             "two writes must NOT satisfy a three-input artifact");
         art.check_per_token_writes(&["x", "rope_global", "rope_local"])
             .expect("naming all three inputs is what the decoder now does");
+    }
+
+    /// The shape the GENERATOR actually emits for a global-only spec: the key is present and
+    /// `null`, not absent. Qwen3-0.6B's shipped meta.json is exactly this, and matching only on
+    /// absence sent the pinned default model down the malformed branch -- `npu generate --model
+    /// qwen3-0.6b` failed to load with "rope_theta_local present but non-numeric" while every unit
+    /// test passed, because no fixture carried the real form.
+    #[test]
+    fn a_present_null_local_base_reads_as_global_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut meta = base_meta(8, 4, serde_json::json!({}));
+        meta["host_protocol"]["rope_theta_local"] = serde_json::Value::Null;
+        write_meta(dir.path(), &meta);
+        assert_eq!(LlmArtifact::load(dir.path()).unwrap().rope_theta_local, None);
     }
 
     /// A non-numeric value must not read as "global-only": that would silently skip the local write
