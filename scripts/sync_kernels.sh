@@ -213,6 +213,24 @@ sync_cp "$RB/mha_decode/mha_decode.cc"      "$K/mha_decode.cc"
 sync_cp "$RB/mha_decode/mha_decode_iron.py" "$PE/ml/mha_decode/mha_decode_iron.py"
 sync_cp "$RB/mha_decode/Makefile.mha"       "$PE/ml/mha_decode/Makefile.mha"
 
+# conveyor_proto -- the attention-conveyor prototype. MIGRATED into designs/ on 2026-09-09; until
+# then its ONLY home was commits on the sandbox branch xdna2-asr, which setup_kernel_env.sh recreates
+# at MLIR_AIE_FORK_COMMIT on every run. So scripts/conveyor_prebuild.sh and npu.rs's CONV_* constants
+# -- both tracked, both public -- depended on source that nothing tracked and one checkout could
+# delete. It survived only because that checkout had been failing silently since the pin went
+# zero-carry. Kernels go to the shared library like every other design; the rest lands in the
+# example dir. The trace_*.txt / tr_*.json dumps were measurement OUTPUT and were NOT migrated.
+mkdir -p "$PE/basic/conveyor_proto"
+sync_cp "$AK/conveyor-attn/conveyor_attn.cc"    "$K/conveyor_attn.cc"
+sync_cp "$AK/conveyor-stage/conveyor_stage.cc"  "$K/conveyor_stage.cc"
+for _f in conveyor_attn_iron.py conveyor_iron.py conveyor_qt_iron.py \
+          conveyor_attn_reuse_dmareset.mlir Makefile \
+          run_bd_AB.py run_bd_freshctx.py run_bd_mask_test.py run_bd_onchip.py \
+          run_bd_rearm_probe.py run_bd_reuse.py run_bd_reuse_stability.py \
+          run_bd_reuse_timed.py run_bd_twice.py run_conveyor_attn.py run_conveyor.py; do
+  sync_cp "$RB/conveyor_proto/$_f"              "$PE/basic/conveyor_proto/$_f"
+done
+
 echo "synced designs/ -> $AIEROOT (edit designs/, never the sandbox copy)"
 
 # There used to be a re-exec into $MLIR_AIE_INSTANCE/src here, because design_override.mk resolved
