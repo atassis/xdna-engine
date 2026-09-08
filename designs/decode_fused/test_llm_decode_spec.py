@@ -109,3 +109,33 @@ class TestCheckPrefillTileRules:
         msg = str(exc.value)
         assert "L1" in msg
         assert "65536" in msg or "64KB" in msg
+
+
+class TestCheckPrefillProjections:
+    """The explicit-op form, which gen_llm_prefill.py uses because it does NOT build the fused
+    `qkv` projection check_prefill assumes -- at M>1 a token's v rows sit between its k rows and
+    the next token's q rows, so q and k are projected separately."""
+
+    QWEN_OPS = (("q", 1024, 2048), ("k", 1024, 1024), ("v", 1024, 1024), ("o", 2048, 1024),
+                ("gate", 1024, 3072), ("up", 1024, 3072), ("down", 3072, 1024))
+
+    def test_split_qkv_is_legal_at_256(self):
+        QWEN3_0_6B.check_prefill_projections(256, self.QWEN_OPS)
+
+    def test_batch_modulus_still_applies(self):
+        with pytest.raises(ValueError) as exc:
+            QWEN3_0_6B.check_prefill_projections(128, self.QWEN_OPS)
+        assert "128" in str(exc.value) and "256" in str(exc.value)
+
+    def test_attention_ops_need_the_ctx_override(self):
+        ops = (("scores", 128, 2048), ("ctx", 2048, 128))
+        with pytest.raises(ValueError) as exc:
+            QWEN3_0_6B.check_prefill_projections(256, ops)
+        assert "ctx" in str(exc.value)
+        QWEN3_0_6B.check_prefill_projections(256, ops, tile_n_overrides={"ctx": 16})
+
+    def test_an_unsatisfiable_nout_names_no_working_tile(self):
+        """head_dim=128 at 16 columns: no multiple of 16 divides 128//16 = 8."""
+        with pytest.raises(ValueError) as exc:
+            QWEN3_0_6B.check_prefill_projections(256, (("ctx", 2048, 128),), cols=16)
+        assert "no tile_n multiple of 16 divides" in str(exc.value)

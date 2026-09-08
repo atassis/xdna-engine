@@ -274,6 +274,21 @@ class LlmSpec:
                                   f"stack_size=0xD00 (design.py); unchecked anywhere else in the "
                                   f"toolchain for GEMM")
 
+    def check_prefill_projections(self, batch: int, ops, tile_m: int = 64, tile_k: int = 64,
+                                   tile_n: int = 64, cols: int = 8, bfp16: bool = True,
+                                   tile_n_overrides: dict | None = None) -> None:
+        """The same checks for an EXPLICIT list of `(label, K, Nout)` GEMMs.
+
+        `check_prefill`/`check_prefill_seq` below are the two spec-shaped callers. A generator that
+        splits or fuses projections differently -- gen_llm_prefill.py projects q, k and v as three
+        GEMMs rather than one, because at M>1 a token's v rows sit between its k rows and the next
+        token's q rows, so no contiguous slice reaches the q or k head rows alone -- checks the
+        shapes it ACTUALLY builds through here (K007), instead of a nearby list that happens to
+        pass.
+        """
+        self._check_prefill_tiles_and_batch(batch, tile_m, tile_k, bfp16)
+        self._check_prefill_ops(ops, tile_m, tile_k, tile_n, cols, bfp16, tile_n_overrides or {})
+
     def check_prefill(self, batch: int, tile_m: int = 64, tile_k: int = 64, tile_n: int = 64,
                        cols: int = 8, bfp16: bool = True, tile_n_overrides: dict | None = None
                        ) -> None:
@@ -285,7 +300,6 @@ class LlmSpec:
         Pass `tile_n_overrides={"o": 16, ...}` for any op whose Nout does not divide
         `tile_n*cols`; the raised error names a tile_n that would work.
         """
-        self._check_prefill_tiles_and_batch(batch, tile_m, tile_k, bfp16)
         ops = (
             ("qkv", self.d_model, self.q_dim + 2 * self.kv_dim),
             ("o", self.q_dim, self.d_model),
@@ -293,7 +307,9 @@ class LlmSpec:
             ("up", self.d_model, self.ffn),
             ("down", self.ffn, self.d_model),
         )
-        self._check_prefill_ops(ops, tile_m, tile_k, tile_n, cols, bfp16, tile_n_overrides or {})
+        self.check_prefill_projections(batch, ops, tile_m=tile_m, tile_k=tile_k, tile_n=tile_n,
+                                        cols=cols, bfp16=bfp16,
+                                        tile_n_overrides=tile_n_overrides)
 
     def check_prefill_seq(self, batch: int, S: int, tile_m: int = 64, tile_k: int = 64,
                            tile_n: int = 64, cols: int = 8, bfp16: bool = True,
@@ -306,12 +322,13 @@ class LlmSpec:
         256 for Gemma-3) and almost always needs a `tile_n_overrides={"ctx": ...}` entry -- this
         does NOT also run `check_prefill`'s batch-independent ops; call both when both apply.
         """
-        self._check_prefill_tiles_and_batch(batch, tile_m, tile_k, bfp16)
         ops = (
             ("scores", self.head_dim, S),
             ("ctx", S, self.head_dim),
         )
-        self._check_prefill_ops(ops, tile_m, tile_k, tile_n, cols, bfp16, tile_n_overrides or {})
+        self.check_prefill_projections(batch, ops, tile_m=tile_m, tile_k=tile_k, tile_n=tile_n,
+                                        cols=cols, bfp16=bfp16,
+                                        tile_n_overrides=tile_n_overrides)
 
     def legal_prefill_batches(self, cap: int, tile_m: int = 64, tile_k: int = 64,
                                tile_n: int = 64, cols: int = 8, bfp16: bool = True,
