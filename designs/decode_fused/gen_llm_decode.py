@@ -377,18 +377,61 @@ def isolate_build_dir(tag):
 
     Set DECODE_WORK=<dir> to use a specific directory (kept, not deleted) when you need the
     intermediates -- a byte census needs the fused MLIR, which is otherwise discarded.
+
+    NOT ON RAM. `tempfile.mkdtemp()` honours TMPDIR and otherwise picks /tmp, which is a 16 GB
+    tmpfs of 30 GB total on this class of box -- so the default landed every one of this
+    function's six callers' intermediates in MEMORY, competing with the weight buffers the model
+    must hold resident. `scripts/require_disk_backed.sh` has guarded exactly this for the shell
+    build path since it landed; the Python entry points were the sibling that never got it, which
+    is why `verify_llm_decode.py` was still announcing `build dir /tmp/verify-...` on 2026-09-08.
+    Same rules as that file, deliberately: XDNA_SCRATCH names the disk root, ALLOW_TMPFS_BUILD=1
+    overrides, and a fallback to RAM SAYS SO rather than happening silently.
     """
     import atexit
     import shutil
+    import subprocess
     import tempfile
+
+    def _fs_type(path):
+        """Filesystem type, via the same `df -PT` the shell guard uses.
+
+        Same command on purpose: two different ways of deciding "is this RAM" is two answers that
+        can disagree, and this one has a sibling in require_disk_backed.sh that must agree with it.
+        """
+        try:
+            out = subprocess.run(["df", "-PT", str(path)], capture_output=True, text=True,
+                                 timeout=10).stdout.splitlines()
+            return out[1].split()[1] if len(out) > 1 else ""
+        except (OSError, IndexError, subprocess.SubprocessError):
+            return ""
 
     explicit = os.environ.get("DECODE_WORK")
     if explicit:
         os.makedirs(explicit, exist_ok=True)
+        fs = _fs_type(explicit)
+        if fs in ("tmpfs", "ramfs") and os.environ.get("ALLOW_TMPFS_BUILD") != "1":
+            raise SystemExit(
+                f"[{tag}] DECODE_WORK={explicit} is on {fs}, which is RAM. A decode artifact is "
+                f"~1.4 GB and competes with the weight buffers the model holds resident. Use a "
+                f"disk-backed path (e.g. ${{XDNA_SCRATCH:-/mnt/data/xdna-scratch}}/{tag}), or set "
+                f"ALLOW_TMPFS_BUILD=1 for a small probe build.")
         os.chdir(explicit)
         print(f"[{tag}] build dir {explicit} (DECODE_WORK, kept)", flush=True)
         return explicit
-    work = tempfile.mkdtemp(prefix=f"{tag}-")
+
+    root = os.environ.get("XDNA_SCRATCH", "/mnt/data/xdna-scratch")
+    base, why = None, ""
+    try:
+        os.makedirs(root, exist_ok=True)
+        if os.access(root, os.W_OK) and _fs_type(root) not in ("tmpfs", "ramfs"):
+            base = root
+        else:
+            why = f"{root} is not writable or is itself RAM"
+    except OSError as e:
+        why = f"{root} unusable ({e})"
+    if base is None:
+        print(f"[{tag}] WARN: no disk-backed scratch -- {why}; intermediates go to RAM", flush=True)
+    work = tempfile.mkdtemp(prefix=f"{tag}-", dir=base)
     atexit.register(shutil.rmtree, work, ignore_errors=True)
     os.chdir(work)
     print(f"[{tag}] build dir {work} (private, removed on exit; "
