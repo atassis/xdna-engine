@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::actor::Handle;
-use crate::config::{Config, ModelCfg};
+use crate::config::Config;
+use crate::config_doc::ConfigDoc;
 use crate::registry::{LoadState, ModelStatus};
 use crate::stream::StreamItem;
 use npu_engine::capability::{Capability, Request as EngineReq, Response as EngineResp};
@@ -168,6 +169,15 @@ pub fn route(req: &Request, handle: &Handle, cfg_path: &Path) -> Response {
         ("POST", "/admin/reload") => admin_reload(handle, cfg_path),
         ("POST", "/admin/models") => admin_add_model(req, handle, cfg_path),
         ("POST", "/admin/defaults") => admin_set_default(req, handle, cfg_path),
+        // Before the generic model routes: these are sub-resources, and a prefix match on
+        // `/admin/models/` would otherwise swallow them.
+        ("POST", p) if p.starts_with("/admin/models/") && p.ends_with("/resident") =>
+            admin_set_resident(&p["/admin/models/".len()..p.len() - "/resident".len()],
+                               req, handle, cfg_path),
+        ("POST", p) if p.starts_with("/admin/models/") && p.ends_with("/load") =>
+            admin_load(&p["/admin/models/".len()..p.len() - "/load".len()], handle),
+        ("POST", p) if p.starts_with("/admin/models/") && p.ends_with("/unload") =>
+            admin_unload(&p["/admin/models/".len()..p.len() - "/unload".len()], handle),
         ("DELETE", p) if p.starts_with("/admin/models/") =>
             admin_remove_model(&p["/admin/models/".len()..].to_string(), handle, cfg_path),
         ("GET", _) => (404, "{\"error\":\"not found\"}".into()),
@@ -178,7 +188,9 @@ pub fn route(req: &Request, handle: &Handle, cfg_path: &Path) -> Response {
 /// Render model statuses as the `/v1/models` JSON list (reused by the C ABI control surface).
 ///
 /// `state` + `idle_s` are what make a hot swap observable from outside: `idle_s` counts seconds since
-/// the model last served a request and is `null` while it is not resident.
+/// the model last served a request and is `null` while it is not resident. `pinned` is the config's
+/// `resident = true`, reported because otherwise the only way to check whether a pin had reached the
+/// running service was to read the file and assume.
 pub fn models_json(status: &[ModelStatus]) -> String {
     let mut data = String::new();
     for (i, s) in status.iter().enumerate() {
@@ -187,8 +199,8 @@ pub fn models_json(status: &[ModelStatus]) -> String {
         let state = match s.state { LoadState::Loaded => "loaded", LoadState::Failed => "failed", LoadState::Unloaded => "unloaded" };
         let idle = match s.idle_s { Some(n) => n.to_string(), None => "null".to_string() };
         data.push_str(&format!(
-            "{{\"id\":\"{}\",\"object\":\"model\",\"kind\":\"{kind}\",\"state\":\"{state}\",\"detail\":\"{}\",\"bo_bytes\":{},\"idle_s\":{idle}}}",
-            s.name, parse::json_escape(&s.detail), s.bo_bytes));
+            "{{\"id\":\"{}\",\"object\":\"model\",\"kind\":\"{kind}\",\"state\":\"{state}\",\"detail\":\"{}\",\"bo_bytes\":{},\"idle_s\":{idle},\"pinned\":{}}}",
+            s.name, parse::json_escape(&s.detail), s.bo_bytes, s.pinned));
     }
     format!("{{\"object\":\"list\",\"data\":[{data}]}}")
 }
@@ -381,8 +393,10 @@ fn segments_json(model: &str, segs: &[npu_engine::capability::Segment]) -> Strin
 fn admin_reload(handle: &Handle, cfg_path: &Path) -> Response {
     match Config::load(cfg_path) {
         Ok(cfg) => match handle.reconcile(cfg) {
-            Ok(rep) => (200, format!("{{\"loaded\":{},\"unloaded\":{},\"failed\":{},\"deferred\":{}}}",
-                rep.loaded.len(), rep.unloaded.len(), rep.failed.len(), rep.deferred.len()).into()),
+            Ok(rep) => (200, format!(
+                "{{\"loaded\":{},\"unloaded\":{},\"failed\":{},\"deferred\":{},\"pinned_deferred\":{}}}",
+                rep.loaded.len(), rep.unloaded.len(), rep.failed.len(), rep.deferred.len(),
+                rep.pinned_deferred.len()).into()),
             Err(e) => engine_err(&e),
         },
         Err(e) => (400, format!("{{\"error\":\"{}\"}}", parse::json_escape(&e)).into()),
@@ -395,15 +409,35 @@ fn admin_add_model(req: &Request, handle: &Handle, cfg_path: &Path) -> Response 
         (Some(n), Some(s)) => (n, s),
         _ => return (400, "{\"error\":\"need name + scenario\"}".into()),
     };
-    mutate_and_reconcile(handle, cfg_path, |cfg| {
-        cfg.models.retain(|m| m.name != name);
-        cfg.models.push(ModelCfg { name: name.clone(), scenario: scenario.clone(), resident: false });
-    })
+    // In place, so re-pointing a model's scenario keeps every other key the operator set on it. The
+    // remove-then-push this replaces wrote `resident: false` back every time, silently unpinning a
+    // model whose scenario path was being corrected.
+    mutate_and_reconcile(handle, cfg_path, |doc| doc.add_model(&name, &scenario))
 }
 
 fn admin_remove_model(name: &str, handle: &Handle, cfg_path: &Path) -> Response {
     let name = name.to_string();
-    mutate_and_reconcile(handle, cfg_path, |cfg| cfg.models.retain(|m| m.name != name))
+    mutate_and_reconcile(handle, cfg_path, |doc| doc.remove_model(&name).map(|_| ()))
+}
+
+/// Pin or unpin a model: `{"resident": true}`.
+///
+/// The live half of `npu config pin`. It takes effect without a restart because reconcile now
+/// adopts a changed `ModelCfg` for an already-loaded model instead of only noticing a scenario
+/// change -- see `Registry::update_cfg`.
+fn admin_set_resident(name: &str, req: &Request, handle: &Handle, cfg_path: &Path) -> Response {
+    let name = name.to_string();
+    let on = match serde_json::from_slice::<serde_json::Value>(&req.body)
+        .ok().as_ref().and_then(|v| v.get("resident")).and_then(|v| v.as_bool()) {
+        Some(b) => b,
+        None => return (400, "{\"error\":\"need a boolean `resident` field\"}".into()),
+    };
+    // A pin on a model that is not configured is a typo, not an instruction. Writing it would leave
+    // a `resident` key on nothing, which the config cannot even represent.
+    mutate_and_reconcile(handle, cfg_path, move |doc| match doc.set_resident(&name, on)? {
+        true => Ok(()),
+        false => Err(format!("unknown model {name:?} (not in the config)")),
+    })
 }
 
 fn admin_set_default(req: &Request, handle: &Handle, cfg_path: &Path) -> Response {
@@ -418,16 +452,56 @@ fn admin_set_default(req: &Request, handle: &Handle, cfg_path: &Path) -> Respons
         Some(c) => c,
         None => return (400, format!("{{\"error\":\"unknown capability {}\"}}", parse::json_escape(&cap)).into()),
     };
-    mutate_and_reconcile(handle, cfg_path, |cfg| cfg.defaults.set(cap, model.clone()))
+    mutate_and_reconcile(handle, cfg_path, |doc| { doc.set_default(cap, &model); Ok(()) })
 }
 
-fn mutate_and_reconcile(handle: &Handle, cfg_path: &Path, f: impl FnOnce(&mut Config)) -> Response {
-    let mut cfg = match Config::load(cfg_path) { Ok(c) => c, Err(e) => return (400, format!("{{\"error\":\"{}\"}}", parse::json_escape(&e)).into()) };
-    f(&mut cfg);
-    if let Err(e) = cfg.save(cfg_path) { return (500, format!("{{\"error\":\"{}\"}}", parse::json_escape(&e)).into()); }
+/// Edit the config FILE, then reconcile the running registry against it.
+///
+/// Through `ConfigDoc`, not `Config`: writing back a deserialized struct rebuilt the file from the
+/// struct's fields and destroyed everything else it carried -- every comment, including the ones
+/// the engine's own generated config ships with.
+/// Make a model resident now. Touches the DEVICE, not the config -- residency is runtime state, and
+/// an operator warming a model for the next hour is not editing what the service serves at boot.
+/// Use `/admin/models/<name>/resident` for the persistent form.
+///
+/// 409 rather than 400 at capacity: the request is well-formed and the server understood it, the
+/// state just conflicts. A client can act on that (unload something, raise the cap) where a 400
+/// would tell it to fix its request.
+fn admin_load(name: &str, handle: &Handle) -> Response {
+    match handle.load(name) {
+        Ok(r) => (200, format!(
+            "{{\"loaded\":{},\"resident\":{},\"max_resident\":{},\"unweighed\":[{}]}}",
+            r.loaded, r.resident, r.max_resident,
+            r.unweighed.iter().map(|n| format!("\"{}\"", parse::json_escape(n)))
+                .collect::<Vec<_>>().join(",")).into()),
+        Err(e @ npu_engine::EngineError::Unsupported(_)) =>
+            (409, format!("{{\"error\":\"{}\"}}", parse::json_escape(&e.to_string())).into()),
+        Err(e) => engine_err(&e),
+    }
+}
+
+/// Release a model's device memory, keeping its config entry. `released: false` means it was not
+/// resident -- not an error: the caller asked for a state and that state already holds.
+fn admin_unload(name: &str, handle: &Handle) -> Response {
+    match handle.unload(name) {
+        Ok(released) => (200, format!("{{\"released\":{released}}}").into()),
+        Err(e) => engine_err(&e),
+    }
+}
+
+fn mutate_and_reconcile(handle: &Handle, cfg_path: &Path,
+                        f: impl FnOnce(&mut ConfigDoc) -> Result<(), String>) -> Response {
+    let bad = |code: u16, e: String| -> Response {
+        (code, format!("{{\"error\":\"{}\"}}", parse::json_escape(&e)).into())
+    };
+    let mut doc = match ConfigDoc::load(cfg_path) { Ok(d) => d, Err(e) => return bad(400, e) };
+    if let Err(e) = f(&mut doc) { return bad(400, e) }
+    let cfg = match doc.save(cfg_path) { Ok(c) => c, Err(e) => return bad(500, e) };
     match handle.reconcile(cfg) {
-        Ok(rep) => (200, format!("{{\"loaded\":{},\"unloaded\":{},\"failed\":{},\"deferred\":{}}}",
-            rep.loaded.len(), rep.unloaded.len(), rep.failed.len(), rep.deferred.len()).into()),
+        Ok(rep) => (200, format!(
+            "{{\"loaded\":{},\"unloaded\":{},\"failed\":{},\"deferred\":{},\"pinned_deferred\":{}}}",
+            rep.loaded.len(), rep.unloaded.len(), rep.failed.len(), rep.deferred.len(),
+            rep.pinned_deferred.len()).into()),
         Err(e) => engine_err(&e),
     }
 }
@@ -1196,6 +1270,122 @@ mod route_tests {
         assert!(body.text().contains("\"ok\":false"), "{body}");
         assert!(body.text().contains("\"broken\""), "the failing model is named: {body}");
         assert!(body.text().contains("\"loaded\":1"), "the healthy one is still counted: {body}");
+        h.shutdown(); j.join().unwrap();
+    }
+
+    /// The live half of `npu config pin`: the file is edited and the running registry adopts it,
+    /// with no unload and no restart.
+    #[test]
+    fn admin_resident_pins_a_loaded_model_in_place() {
+        let (h, j, _d, p) = mock_handle();
+        assert!(route(&get("/v1/models"), &h, &p).1.text().contains("\"pinned\":false"));
+
+        let (code, body) = route(&post("/admin/models/bge/resident", r#"{"resident":true}"#), &h, &p);
+        assert_eq!(code, 200, "{body}");
+        assert!(route(&get("/v1/models"), &h, &p).1.text().contains("\"pinned\":true"),
+            "the pin has to reach the running registry, not just the file");
+        assert!(std::fs::read_to_string(&p).unwrap().contains("resident = true"),
+            "and it has to survive a restart, i.e. be in the file");
+
+        let (code, _) = route(&post("/admin/models/bge/resident", r#"{"resident":false}"#), &h, &p);
+        assert_eq!(code, 200);
+        assert!(route(&get("/v1/models"), &h, &p).1.text().contains("\"pinned\":false"));
+        h.shutdown(); j.join().unwrap();
+    }
+
+    /// The behaviour asked for: an explicit load REFUSES at capacity rather than evicting, and the
+    /// refusal is a 409 naming what holds the slots.
+    #[test]
+    fn admin_load_refuses_at_capacity_with_409_and_never_evicts() {
+        let (h, j, _d, p) = health_setup(&[("bge", true), ("e5", true)], 1);
+        // `bge` took the only slot at boot.
+        let (code, body) = route(&post("/admin/models/e5/load", ""), &h, &p);
+        assert_eq!(code, 409, "at capacity is a state conflict, not a bad request: {body}");
+        assert!(body.text().contains("1/1 slots in use"), "{body}");
+        assert!(body.text().contains("bge"), "the refusal names what is in the way: {body}");
+        let models = route(&get("/v1/models"), &h, &p).1;
+        assert!(models.text().contains("\"id\":\"bge\",\"object\":\"model\",\"kind\":\"embed\",\"state\":\"loaded\""),
+            "a refusal must not have evicted the incumbent: {models}");
+        h.shutdown(); j.join().unwrap();
+    }
+
+    #[test]
+    fn admin_load_then_unload_round_trips_and_frees_the_slot() {
+        let (h, j, _d, p) = health_setup(&[("bge", true), ("e5", true)], 1);
+
+        let (code, body) = route(&post("/admin/models/bge/unload", ""), &h, &p);
+        assert_eq!(code, 200, "{body}");
+        assert!(body.text().contains("\"released\":true"), "{body}");
+
+        // ...which is what makes room for the load that was refused a moment ago.
+        let (code, body) = route(&post("/admin/models/e5/load", ""), &h, &p);
+        assert_eq!(code, 200, "{body}");
+        assert!(body.text().contains("\"loaded\":true") && body.text().contains("\"resident\":1"), "{body}");
+
+        // Idempotent in both directions: asking for a state that already holds is not an error.
+        assert!(route(&post("/admin/models/e5/load", ""), &h, &p).1.text().contains("\"loaded\":false"));
+        assert!(route(&post("/admin/models/bge/unload", ""), &h, &p).1.text().contains("\"released\":false"));
+        h.shutdown(); j.join().unwrap();
+    }
+
+    /// Residency is runtime state. `npu load` must not quietly rewrite what the box serves at boot.
+    #[test]
+    fn admin_load_and_unload_leave_the_config_file_untouched() {
+        let (h, j, _d, p) = mock_handle();
+        let before = std::fs::read_to_string(&p).unwrap();
+        route(&post("/admin/models/bge/unload", ""), &h, &p);
+        route(&post("/admin/models/bge/load", ""), &h, &p);
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), before,
+            "load/unload are device operations, not config edits");
+        h.shutdown(); j.join().unwrap();
+    }
+
+    #[test]
+    fn admin_load_and_unload_reject_a_model_that_is_not_configured() {
+        let (h, j, _d, p) = mock_handle();
+        assert_ne!(route(&post("/admin/models/nope/load", ""), &h, &p).0, 200);
+        assert_ne!(route(&post("/admin/models/nope/unload", ""), &h, &p).0, 200);
+        h.shutdown(); j.join().unwrap();
+    }
+
+    #[test]
+    fn admin_resident_rejects_an_unknown_model_and_a_missing_field() {
+        let (h, j, _d, p) = mock_handle();
+        let before = std::fs::read_to_string(&p).unwrap();
+        assert_eq!(route(&post("/admin/models/nope/resident", r#"{"resident":true}"#), &h, &p).0, 400,
+            "a pin on a model the config does not have is a typo, not an instruction");
+        assert_eq!(route(&post("/admin/models/bge/resident", "{}"), &h, &p).0, 400);
+        assert_eq!(route(&post("/admin/models/bge/resident", r#"{"resident":"yes"}"#), &h, &p).0, 400);
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), before, "a rejected edit writes nothing");
+        h.shutdown(); j.join().unwrap();
+    }
+
+    /// The admin surface writes the same file a human reads. It used to round-trip it through the
+    /// serializer, which deleted every comment in it.
+    #[test]
+    fn admin_edits_preserve_the_files_comments() {
+        let (h, j, _d, p) = mock_handle();
+        let commented = format!("# hand-written note\n{}", std::fs::read_to_string(&p).unwrap());
+        std::fs::write(&p, &commented).unwrap();
+
+        route(&post("/admin/models/bge/resident", r#"{"resident":true}"#), &h, &p);
+        route(&post("/admin/models", r#"{"name":"c","scenario":"y"}"#), &h, &p);
+        route(&post("/admin/defaults", r#"{"capability":"embed","model":"bge"}"#), &h, &p);
+
+        let after = std::fs::read_to_string(&p).unwrap();
+        assert!(after.contains("# hand-written note"), "comments destroyed:\n{after}");
+        h.shutdown(); j.join().unwrap();
+    }
+
+    /// Re-pointing a model's scenario must not silently drop the pin the operator set on it.
+    #[test]
+    fn admin_add_model_on_an_existing_name_keeps_its_pin() {
+        let (h, j, _d, p) = mock_handle();
+        route(&post("/admin/models/bge/resident", r#"{"resident":true}"#), &h, &p);
+        route(&post("/admin/models", r#"{"name":"bge","scenario":"y"}"#), &h, &p);
+        let cfg = Config::load(&p).unwrap();
+        assert_eq!(cfg.find("bge").unwrap().scenario, "y");
+        assert!(cfg.find("bge").unwrap().resident, "add-model must not unpin what it is re-pointing");
         h.shutdown(); j.join().unwrap();
     }
 

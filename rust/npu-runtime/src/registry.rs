@@ -68,6 +68,12 @@ pub struct ModelStatus {
     /// Seconds since this model last served a request, for resident models only. `None` when the
     /// model is not resident (nothing is holding the device on its behalf).
     pub idle_s: Option<u64>,
+    /// `resident = true` in the config: exempt from the idle sweep and never an eviction victim.
+    ///
+    /// Reported because a pin was otherwise invisible from outside -- `/v1/models` showed a pinned
+    /// and an unpinned model identically, so the only way to know whether the intent had taken was
+    /// to read the config file and trust that the running service agreed with it.
+    pub pinned: bool,
 }
 
 pub struct Entry {
@@ -111,6 +117,9 @@ impl Registry {
         self.entries.iter().map(|e| {
             let mut s = e.status.clone();
             s.idle_s = e.model.as_ref().map(|_| now.saturating_duration_since(e.last_used).as_secs());
+            // Read off `cfg`, like the sweep and the evictor do, so the reported pin cannot drift
+            // from the one those two act on.
+            s.pinned = e.cfg.resident;
             // A capacity deferral is a snapshot. Report it only while it is still true, or the
             // config reads as refused long after the sweep freed every slot.
             if let Some(cap) = e.deferred_capacity {
@@ -127,6 +136,17 @@ impl Registry {
         let e = self.entries.iter().find(|e| e.cfg.name == name)?;
         e.model.as_ref().map(|m| m.capabilities()).or(e.status.capability)
     }
+    /// Adopt a new `ModelCfg` for an entry whose loaded model is still the right one.
+    ///
+    /// `resident` is read off `e.cfg` by `lru_victim` and `sweep_idle`, and reconcile only replaced
+    /// the entry when the SCENARIO changed -- so a pin or unpin was silently ignored for exactly as
+    /// long as the model stayed loaded, which is the whole time it matters. Everything that would
+    /// need a reload (the scenario) still goes through unload + load; this is for the fields that
+    /// do not touch the device.
+    pub fn update_cfg(&mut self, name: &str, cfg: &ModelCfg) {
+        if let Some(e) = self.entries.iter_mut().find(|e| e.cfg.name == name) { e.cfg = cfg.clone(); }
+    }
+
     /// Stamp a model as just used. Called once per served request.
     pub fn touch(&mut self, name: &str, now: Instant) {
         if let Some(e) = self.entries.iter_mut().find(|e| e.cfg.name == name) { e.last_used = now; }
@@ -170,6 +190,7 @@ impl Registry {
                     // is the difference between an unmeasured bound and a silent one.
                     detail: if bo == 0 { UNWEIGHED.into() } else { String::new() },
                     capability: Some(m.capabilities()), bo_bytes: bo, idle_s: Some(0),
+                    pinned: cfg.resident,
                 };
                 self.upsert(Entry { cfg: cfg.clone(), model: Some(m), status, last_used: now,
                                     deferred_capacity: None });
@@ -211,6 +232,47 @@ impl Registry {
         Err(EngineError::Load(format!("{}: {why}", cfg.name)))
     }
 
+    /// Make `cfg.name` resident because an OPERATOR asked, or fail saying why.
+    ///
+    /// This never evicts, and that is the whole difference from `ensure_resident`. On the request
+    /// path `max_resident` is an evict trigger: a request names a capability, not a capacity, so
+    /// swapping a model in to serve it is the right answer. An explicit `npu load` is the opposite
+    /// -- it IS a statement about capacity -- and silently dropping a model someone else pinned or
+    /// is about to use, in order to honour it, answers a question that was not asked. So it refuses,
+    /// and the refusal names what is holding the slots, because "at max_resident" alone tells the
+    /// operator nothing they can act on.
+    ///
+    /// Idempotent: loading an already-resident model succeeds without touching the device.
+    pub fn load_explicit(&mut self, cfg: &ModelCfg, loader: &dyn ModelLoader, srv: &ServerCfg,
+                         now: Instant) -> Result<(), EngineError> {
+        if self.get_loaded(&cfg.name).is_some() { return Ok(()); }
+        if self.resident_count() >= srv.max_resident {
+            let held: Vec<&str> = self.entries.iter().filter(|e| e.model.is_some())
+                .map(|e| e.cfg.name.as_str()).collect();
+            return Err(EngineError::Unsupported(format!(
+                "{} cannot be made resident: {}/{} slots in use. Resident now: {}. \
+                 Free one with `npu unload <model>`, or raise the cap with \
+                 `npu config set max_resident <n>`.",
+                cfg.name, self.resident_count(), srv.max_resident, held.join(" "))));
+        }
+        self.try_load(cfg, loader, srv, now);
+        if self.get_loaded(&cfg.name).is_some() { return Ok(()); }
+        let why = self.entries.iter().find(|e| e.cfg.name == cfg.name)
+            .map(|e| e.status.detail.clone()).unwrap_or_else(|| "load failed".into());
+        Err(EngineError::Load(format!("{}: {why}", cfg.name)))
+    }
+
+    /// Resident models whose footprint the accountant could not weigh.
+    ///
+    /// `Servable::footprint()` returns a hardcoded 0 for every shipped model, so `memory_ceiling_mb`
+    /// sums to 0 and never refuses anything. A caller that reports a successful load says so, rather
+    /// than letting an operator who just set the ceiling believe it is now bounding something.
+    pub fn unweighed_residents(&self) -> Vec<String> {
+        self.entries.iter()
+            .filter(|e| e.model.as_ref().is_some_and(|m| m.footprint() == 0))
+            .map(|e| e.cfg.name.clone()).collect()
+    }
+
     /// Record a configured model WITHOUT loading it, keeping the capability its scenario declares so
     /// routing can pick it (and `/v1/models` can show it) before anything touches the device. A no-op
     /// on a model the registry already knows: a live entry always outranks a declaration.
@@ -225,7 +287,8 @@ impl Registry {
             cfg: cfg.clone(),
             model: None,
             status: ModelStatus {
-                name: cfg.name.clone(), state: LoadState::Unloaded, detail, capability, bo_bytes: 0, idle_s: None,
+                name: cfg.name.clone(), state: LoadState::Unloaded, detail, capability, bo_bytes: 0,
+                idle_s: None, pinned: cfg.resident,
             },
             last_used: Instant::now(),
             deferred_capacity: None,
@@ -320,6 +383,7 @@ impl Registry {
         let capability = self.known_capability(&cfg.name).or(declared);
         let status = ModelStatus {
             name: cfg.name.clone(), state, detail, capability, bo_bytes: 0, idle_s: None,
+            pinned: cfg.resident,
         };
         self.upsert(Entry { cfg: cfg.clone(), model: None, status, last_used: Instant::now(),
                             deferred_capacity: capacity });
@@ -337,6 +401,82 @@ mod tests {
     use std::collections::BTreeMap;
     fn cfg(name: &str) -> ModelCfg { ModelCfg { name: name.into(), scenario: "x".into(), resident: false } }
     fn pinned(name: &str) -> ModelCfg { ModelCfg { name: name.into(), scenario: "x".into(), resident: true } }
+    /// The point of the operator path: it REFUSES at capacity where the request path evicts.
+    #[test]
+    fn load_explicit_refuses_at_capacity_instead_of_evicting() {
+        let mut t = BTreeMap::new();
+        for n in ["a", "b"] { t.insert(n.to_string(), Ok((Capability::EMBED, 1))); }
+        let l = MockLoader { table: t };
+        let srv = ServerCfg { max_resident: 1, ..Default::default() };
+        let mut r = Registry::default();
+        let now = Instant::now();
+
+        r.load_explicit(&cfg("a"), &l, &srv, now).unwrap();
+        let e = r.load_explicit(&cfg("b"), &l, &srv, now).unwrap_err().to_string();
+        assert!(e.contains("1/1 slots in use"), "the refusal has to be quantified: {e}");
+        assert!(e.contains("Resident now: a"), "and has to name what is in the way: {e}");
+        assert!(r.get_loaded("a").is_some(), "a REFUSAL must not have evicted anything");
+        assert!(r.get_loaded("b").is_none());
+
+        // ...where the request path, asked the same question, swaps.
+        r.ensure_resident(&cfg("b"), &l, &srv, now).unwrap();
+        assert!(r.get_loaded("b").is_some(), "the request path still evicts");
+        assert!(r.get_loaded("a").is_none());
+    }
+
+    #[test]
+    fn load_explicit_is_idempotent_and_reports_a_real_load_failure() {
+        let mut t = BTreeMap::new();
+        t.insert("a".to_string(), Ok((Capability::EMBED, 1)));
+        t.insert("broken".to_string(), Err("no instruction stream".to_string()));
+        let l = MockLoader { table: t };
+        let srv = ServerCfg { max_resident: 4, ..Default::default() };
+        let mut r = Registry::default();
+        let now = Instant::now();
+
+        r.load_explicit(&cfg("a"), &l, &srv, now).unwrap();
+        r.load_explicit(&cfg("a"), &l, &srv, now).expect("loading a resident model is a no-op, not an error");
+        assert_eq!(r.resident_count(), 1);
+
+        let e = r.load_explicit(&cfg("broken"), &l, &srv, now).unwrap_err().to_string();
+        assert!(e.contains("no instruction stream"), "a load failure must surface its cause: {e}");
+    }
+
+    /// A pin must not be collateral damage: refusing to evict is what makes `npu load` safe to run
+    /// against a server someone else is using.
+    #[test]
+    fn load_explicit_refuses_rather_than_touching_a_pinned_model() {
+        let mut t = BTreeMap::new();
+        for n in ["p", "b"] { t.insert(n.to_string(), Ok((Capability::EMBED, 1))); }
+        let l = MockLoader { table: t };
+        let srv = ServerCfg { max_resident: 1, ..Default::default() };
+        let mut r = Registry::default();
+        let now = Instant::now();
+        r.load_explicit(&pinned("p"), &l, &srv, now).unwrap();
+        assert!(r.load_explicit(&cfg("b"), &l, &srv, now).is_err());
+        assert!(r.get_loaded("p").is_some(), "the pinned model is untouched");
+    }
+
+    /// `memory_ceiling_mb` sums footprints that are all zero, so it bounds nothing. A caller has to
+    /// be able to say so rather than reporting a load as if the limit had been checked.
+    #[test]
+    fn unweighed_residents_names_every_model_the_ceiling_cannot_bound() {
+        let mut t = BTreeMap::new();
+        // `unweighed` is the shipped case -- every real model reports 0 -- and `weighed` is what a
+        // measured footprint would look like. Both, so this pins a filter and not a constant.
+        t.insert("unweighed".to_string(), Ok((Capability::EMBED, 0)));
+        t.insert("weighed".to_string(), Ok((Capability::EMBED, 4096)));
+        let l = MockLoader { table: t };
+        let srv = ServerCfg { max_resident: 4, ..Default::default() };
+        let mut r = Registry::default();
+        let now = Instant::now();
+        assert!(r.unweighed_residents().is_empty(), "nothing resident, nothing to report");
+        r.load_explicit(&cfg("weighed"), &l, &srv, now).unwrap();
+        assert!(r.unweighed_residents().is_empty(), "a measured model is not reported");
+        r.load_explicit(&cfg("unweighed"), &l, &srv, now).unwrap();
+        assert_eq!(r.unweighed_residents(), vec!["unweighed".to_string()]);
+    }
+
     /// The accountant is INERT, and the engine has to say so.
     ///
     /// Every shipped model returns `footprint() == 0`, so `resident_bytes() + 0 > ceiling` can

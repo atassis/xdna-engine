@@ -21,11 +21,39 @@ const GENERATE_CHANNEL_CAP: usize = 8;
 /// Result carrying which model served (the echo).
 pub struct Served<T> { pub model: String, pub value: T }
 
+/// What an explicit load did, so the caller can report it without a second round trip.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LoadReport {
+    /// False when the model was ALREADY resident. The load is idempotent, and saying which of the
+    /// two happened is the difference between "I warmed the device" and "nothing to do".
+    pub loaded: bool,
+    pub resident: usize,
+    pub max_resident: usize,
+    /// Resident models the memory accountant cannot weigh. Non-empty means `memory_ceiling_mb` is
+    /// not bounding anything, which an operator who just set it needs told.
+    pub unweighed: Vec<String>,
+}
+
 /// A model answered a capability with a payload shape that capability never returns. Reachable only
 /// from a buggy `Servable` impl, not from any request -- routing has already checked the capability
 /// by this point -- so it names the model rather than blaming the caller.
 fn wrong_shape(cap: Capability, model: &str, got: &Response) -> EngineError {
     EngineError::Device(format!("{model} served {cap} but returned a {} response", got.shape()))
+}
+
+/// Say when the config pinned a model that admission then declined.
+///
+/// `resident = true` means exempt-from-eviction, not entitled to a slot: admission is still
+/// first-N-in-config-order against `max_resident`. So a pin behind enough unpinned models simply
+/// does not become resident, and until this existed the only trace was a `/v1/models` detail line
+/// nobody reads until something is already wrong -- the config stated an intent and the runtime
+/// declined it in silence.
+fn warn_declined_pins(rep: &ReconcileReport) {
+    for n in &rep.pinned_deferred {
+        eprintln!("[npu] WARNING: {n} is pinned (resident = true) but was not made resident: \
+                   at max_resident, and a pin does not outrank a model declared before it. \
+                   Raise max_resident, or move it earlier in the config.");
+    }
 }
 
 /// Run `f`, converting a panic into `Err(message)` instead of unwinding out of the actor thread.
@@ -65,6 +93,13 @@ enum Cmd {
         ack: Sender<Result<String, EngineError>>,
     },
     Reconcile { cfg: Box<Config>, reply: Sender<ReconcileReport> },
+    /// Make a model resident because an operator asked. NEVER evicts: at `max_resident` this fails
+    /// and names what holds the slots. The request path (`Cmd::Serve`) still evicts, because a
+    /// request asks for a capability while this asks for capacity.
+    Load { name: String, reply: Sender<Result<LoadReport, EngineError>> },
+    /// Give a model's device memory back now, keeping its config entry so routing still knows what
+    /// it is and the next request reloads it. The same call the idle sweep makes, fired by hand.
+    Unload { name: String, reply: Sender<Result<bool, EngineError>> },
     Status { reply: Sender<Vec<ModelStatus>> },
     Shutdown,
 }
@@ -110,7 +145,7 @@ fn spawn(cfg: Config, loader: Box<dyn ModelLoader + Send>, eager: bool) -> Resul
         // an actor whose initial reconcile silently never ran).
         let init: Result<(), String> = if eager {
             if let Some(w) = cfg.pin_overcommit() { eprintln!("[npu] WARNING: {w}"); }
-            guard(|| reconcile(&cfg, &mut reg, loader.as_ref())).map(|_report| ())
+            guard(|| reconcile(&cfg, &mut reg, loader.as_ref())).map(|report| warn_declined_pins(&report))
         } else {
             for m in &cfg.models {
                 let cap = guard(|| loader.declared_capability(m)).unwrap_or(None);
@@ -211,7 +246,50 @@ fn spawn(cfg: Config, loader: Box<dyn ModelLoader + Send>, eager: bool) -> Resul
                     cfg = *newcfg;
                     let rep = guard(|| reconcile(&cfg, &mut reg, loader.as_ref()))
                         .unwrap_or_else(|msg| ReconcileReport { failed: vec![msg], ..Default::default() });
+                    warn_declined_pins(&rep);
                     let _ = reply.send(rep);
+                }
+                Ok(Cmd::Load { name, reply }) => {
+                    // Counts as activity: an operator warming the device must not have it swept out
+                    // from under them by an idle window that started before they asked.
+                    last_request = Instant::now(); released = false;
+                    let now = Instant::now();
+                    let r = match cfg.find(&name).cloned() {
+                        None => Err(EngineError::Load(format!(
+                            "unknown model {name:?} (not in the config)"))),
+                        Some(m) => {
+                            let already = reg.get_loaded(&name).is_some();
+                            guard(|| reg.load_explicit(&m, loader.as_ref(), &cfg.server, now))
+                                .unwrap_or_else(|msg| Err(EngineError::Load(msg)))
+                                .map(|()| {
+                                    // Stamp it, or the model an operator just loaded is the LRU
+                                    // victim of the very next request that needs a slot.
+                                    reg.touch(&name, now);
+                                    LoadReport {
+                                        loaded: !already,
+                                        resident: reg.resident_count(),
+                                        max_resident: cfg.server.max_resident,
+                                        unweighed: reg.unweighed_residents(),
+                                    }
+                                })
+                        }
+                    };
+                    let _ = reply.send(r);
+                }
+                Ok(Cmd::Unload { name, reply }) => {
+                    let r = match cfg.find(&name) {
+                        None => Err(EngineError::Load(format!(
+                            "unknown model {name:?} (not in the config)"))),
+                        Some(_) => {
+                            let was = reg.get_loaded(&name).is_some();
+                            if was { reg.release(&name, "unloaded: asked for"); }
+                            // An unload frees a working set, so the deep release has something new
+                            // to trim -- the same bookkeeping the idle sweep does.
+                            if was { released = false; }
+                            Ok(was)
+                        }
+                    };
+                    let _ = reply.send(r);
                 }
                 Ok(Cmd::Status { reply }) => { let _ = reply.send(reg.status()); }
                 Ok(Cmd::Shutdown) => break,
@@ -357,6 +435,21 @@ impl Handle {
         self.tx.send(Cmd::Reconcile { cfg: Box::new(cfg), reply: r })
             .map_err(|_| EngineError::Device("actor stopped".into()))?;
         rx.recv().map_err(|_| EngineError::Device("actor dropped reply".into()))
+    }
+    /// Make a model resident now. `Err` at `max_resident` -- this never evicts; see
+    /// `Registry::load_explicit` for why the request path and this one differ.
+    pub fn load(&self, name: &str) -> Result<LoadReport, EngineError> {
+        let (r, rx) = channel();
+        self.tx.send(Cmd::Load { name: name.to_string(), reply: r })
+            .map_err(|_| EngineError::Device("actor stopped".into()))?;
+        rx.recv().map_err(|_| EngineError::Device("actor dropped reply".into()))?
+    }
+    /// Release a model's device memory. `Ok(false)` when it was not resident to begin with.
+    pub fn unload(&self, name: &str) -> Result<bool, EngineError> {
+        let (r, rx) = channel();
+        self.tx.send(Cmd::Unload { name: name.to_string(), reply: r })
+            .map_err(|_| EngineError::Device("actor stopped".into()))?;
+        rx.recv().map_err(|_| EngineError::Device("actor dropped reply".into()))?
     }
     pub fn status(&self) -> Vec<ModelStatus> {
         let (r, rx) = channel();
