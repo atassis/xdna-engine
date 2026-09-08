@@ -283,10 +283,18 @@ impl DecodeStep for NpuDecodeStep {
         // `kv_off` is "addr"-kind (element-unit BD offset, no shift); `sm_mask` is "core"-kind and
         // the firmware's UPDATE_REG convention requires the host to pre-shift it left by 2 bits
         // (matches `asr::whisper_decoder::FusedDecoder::dispatch_resident`).
-        let kv_val = (pos * self.artifact.head_dim) as u32;
-        self.res
-            .write_scratchpad(self.artifact.kv_off.byte_offset, &kv_val.to_le_bytes())
-            .map_err(|e| EngineError::Device(format!("write kv_off scratchpad: {e}")))?;
+        // ONE WRITE PER DISTINCT head_dim. `kv_offs` has a single entry on every model shipped
+        // today, so this is the same single write it has always been. It is a loop because
+        // Gemma-4-12B's geometry is per-layer -- sliding head_dim 256, global 512 -- and
+        // `pos * head_dim` is then two different byte offsets for the same logical position, which
+        // one slot cannot carry. A spec with non-uniform geometry is still refused at build time
+        // (LlmSpec.check); this is the host half of lifting that refusal.
+        for (slot, head_dim) in &self.artifact.kv_offs {
+            let kv_val = (pos * head_dim) as u32;
+            self.res
+                .write_scratchpad(slot.byte_offset, &kv_val.to_le_bytes())
+                .map_err(|e| EngineError::Device(format!("write kv_off scratchpad: {e}")))?;
+        }
         let sm_raw = (pos + 1) as u32;
         let sm_val = if self.artifact.sm_mask.core { sm_raw << 2 } else { sm_raw };
         self.res
