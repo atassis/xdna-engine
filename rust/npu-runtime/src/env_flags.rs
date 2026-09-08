@@ -115,7 +115,9 @@ pub const FLAGS: &[Flag] = &[
         doc: "subsampling stage dispatches on the NPU instead of host." },
     Flag { name: "NPU_GLU_FUSED", owner: "npu-asr", site: "npu-asr/src/tuning.rs:51",
         semantics: NotZero, default: "true",
-        doc: "GLU activation fused into the conv-module GEMM epilogue. Also read independently, \
+        doc: "collapses three HOST passes (bias add, transpose, GLU) into one rayon pass in \
+              npu_asr_host::glu_fused. Despite the name nothing is fused into a GEMM epilogue and \
+              no device call is involved; both arms are host-only and numerically exact. Also read independently, \
               same not_zero-equivalent check (`!= Ok(\"0\")`), at block.rs:328 -- the two agree." },
     Flag { name: "NPU_MM2_PIPELINE", owner: "npu-asr", site: "npu-asr/src/tuning.rs:52",
         semantics: NotZero, default: "true",
@@ -156,7 +158,7 @@ pub const FLAGS: &[Flag] = &[
     Flag { name: "NPU_PRECISION", owner: "npu-asr", site: "npu-asr/src/ctx2.rs:93",
         semantics: Value, default: "bf16 (Precision::FastBf16)",
         doc: "runtime precision selector for the encoder GEMMs: native|bf16|int8." },
-    Flag { name: "NPU_ENC_GELU_FUSED", owner: "npu-asr", site: "npu-asr/src/ctx2.rs:306",
+    Flag { name: "NPU_ENC_GELU_FUSED", owner: "npu-asr", site: "npu-asr/src/ctx2.rs:316",
         semantics: IsOk, default: "false",
         doc: "picks the GELU-fused xclbin stem/required artifact set for the encoder. COUPLING: \
               npu-whisper reads the SAME name (encoder.rs) with the same is_ok() rule to decide \
@@ -218,7 +220,9 @@ pub const FLAGS: &[Flag] = &[
               dirs. Same read at npu-parakeet/src/weights.rs:106 -- consistent." },
     Flag { name: "NPU_DECODE_ATTN", owner: "npu-engine", site: "npu-engine/src/asr/whisper_decoder.rs:366",
         semantics: IsOk, default: "false",
-        doc: "on-NPU self-attention in the fused decoder path; meaningful only when NPU decode is active." },
+        doc: "on-NPU self-attention in the HOST decoder's per-op path (HostDecoder::step, ~72 \
+              dispatches/token) -- NOT the fused decoder, which never reads it. Pair with \
+              NPU_DECODE=1, never NPU_DECODE_FUSED=1." },
     Flag { name: "NPU_DECODE_FUSED_PATCH", owner: "npu-engine", site: "npu-engine/src/asr/whisper_decoder.rs:1091",
         semantics: IsOk, default: "false",
         doc: "opts OUT of the resident scratchpad-arena decode path back to legacy per-token ELF \
@@ -336,8 +340,11 @@ pub const FLAGS: &[Flag] = &[
         doc: "A/B diagnostic: resident MHA context vs f32 host golden, for head 0 and a mid head." },
     Flag { name: "PARAKEET_CONVEYOR_MHA", owner: "npu-parakeet", site: "npu-parakeet/src/encoder.rs:680",
         semantics: IsOk, default: "false",
-        doc: "conveyor (8-head merged dispatch) MHA path; the on-device 8-head dispatch is a TODO \
-              stub, falls back to the host score path when unset." },
+        doc: "conveyor (8-head merged dispatch) MHA path. The \"TODO stub\" this doc used to claim was \
+              wired by 9ef97ea on 2026-07-17 and the source comment corrected by 9abcaf2; this \
+              registry entry copied the dead text three weeks later. Non-functional for two OTHER \
+              reasons: artifacts/conveyor/single/ does not exist and conveyor_block() panics \
+              instead of declining, and the 16 hw_context budget is already spent." },
     Flag { name: "PARAKEET_CONVEYOR_BD", owner: "npu-parakeet", site: "npu-parakeet/src/npu.rs:119",
         semantics: Value, default: "Plain",
         doc: "BD-belt carry precision for the conveyor path: \"split\" for hi+lo bf16, else plain \

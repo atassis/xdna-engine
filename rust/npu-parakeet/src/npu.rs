@@ -745,9 +745,13 @@ fn fc1_panel_bf16_dir<'a>(base: &'a Path, ln_dir: &'a Path, stem: &str) -> &'a P
 /// exactly 11596 B, verified by build). Measured tile penalty: 1.13x at N=1024, 1.27x at N=4096.
 /// Projected net ~-67 ms/clip.
 ///
-/// **TIMING-ONLY as it stands** -- encoder OUTPUT IS WRONG under this flag, which exists to measure
-/// the dispatch sequence, the transition count and the wall clock end-to-end. What remains is a
-/// DEVICE-side dtype gap, not a host one: the bf16 C is handed straight to bricks compiled against
+/// **CORRECTED 2026-09-08: this comment said "encoder OUTPUT IS WRONG under this flag" and listed
+/// the bf16 resadd/acc_add arms as missing. Commit 73b5ed1 added them TWELVE MINUTES after 8c46d00
+/// wrote this text (2026-08-22 23:13 -> 23:25), and all three `*_bf16b` artifacts are on disk; the
+/// log `2026-08-22-the-full-fold-is-correct.md` records the pair encoding correctly end to end.**
+/// Still opt-in, and the standalone case is the open question: correctness was demonstrated for
+/// `PARAKEET_FOLD_FC1=1` TOGETHER WITH `PARAKEET_FOLD_GLU=1`, never for this flag alone.
+/// The device-side dtype reasoning below is why the pair is needed: the bf16 C is handed straight to bricks compiled against
 /// f32, and no host reader is on those paths. `matmul_id_to_bo`'s linear_out feeds
 /// `residual_add_dev` on the MHSA seam (measured at rel-L2 1.223 under the fold against 6.652e-3
 /// without), the fc2 K-split partials feed `acc_add`, which has no bf16 arm at all, and pw1 feeds

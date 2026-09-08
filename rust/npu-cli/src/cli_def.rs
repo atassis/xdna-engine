@@ -69,11 +69,13 @@ pub enum Cmd {
         #[arg(long)] json: bool,
     },
     /// One-shot embedding of a text string.
+    ///
     /// `allow_hyphen_values`: the text to embed is prose, and prose begins with `-` all the time
     /// (every Markdown bullet). Without it clap read a bullet as an unknown flag and failed with a
     /// usage error, so the CLI rejected inputs the HTTP route accepted.
     Embed { #[arg(allow_hyphen_values = true)] text: String, #[arg(long)] model: Option<String> },
     /// One-shot text generation, streamed to stdout by default.
+    ///
     /// The prompt goes through the model's chat template, so an instruction-tuned model answers it
     /// and stops. `--raw` sends the bytes verbatim instead, which is `/v1/completions` semantics:
     /// pure continuation, and on a chat-tuned model that means it rambles until max_tokens because

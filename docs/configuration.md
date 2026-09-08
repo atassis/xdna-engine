@@ -284,7 +284,7 @@ Each candidate is only accepted if it actually contains a `scenarios/` directory
 | `NPU_XCLBIN_ROOT` | Overrides where the Parakeet NPU path resolves its resident xclbins from (default: the engine root). |
 | `NPU_KERNEL_MANIFEST_VERIFY` | Set (to any value) to re-hash kernel artifacts against their manifest at load time. Default off. |
 | `NPU_HOST_PROF` | Set to enable the per-op host-side profiler (ASR host reference path). Default off, zero cost. |
-| `NPU_DISPATCH_LOG` | Set to enable per-token dispatch accounting in the LLM decode path. |
+| `NPU_DISPATCH_LOG` | Set to log per-`(xclbin, insts)` dispatch blocking time and hw_context-transition counts. Covers EVERY kernel dispatch in the engine, not only LLM decode. |
 
 This is the operator-facing surface. The kernel and dataflow crates carry additional
 environment-gated switches used for research and ablation during kernel development;
