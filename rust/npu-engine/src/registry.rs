@@ -67,7 +67,8 @@ pub fn try_build(cfg_path: &Path, root: &Path) -> Result<Scenario, EngineError> 
             let tokenizer_dir = root.join(&cfg.artifacts.tokenizer_dir);
             let model_cfg = crate::llm::ModelConfig::load(&tokenizer_dir)?;
             let decode = crate::llm::NpuDecodeStep::new(&dev, &decode_dir)?;
-            Scenario::Generate(Box::new(crate::llm::LlmGenerator::new(model_cfg, decode)))
+            Scenario::Generate(Box::new(crate::llm::LlmGenerator::new(model_cfg, decode)
+                .with_default_max_tokens(cfg.generation.max_tokens)))
         }
         None => return Err(EngineError::Load(format!("unknown scenario kind {:?}", cfg.scenario.kind))),
     };

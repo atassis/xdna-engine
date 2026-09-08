@@ -813,7 +813,7 @@ pub mod parse {
         if let Some(x) = v.get("temperature") { p.temperature = as_f32(x, "temperature")?; }
         if let Some(x) = v.get("top_p") { p.top_p = as_f32(x, "top_p")?; }
         if let Some(x) = v.get("top_k") { p.top_k = as_u32(x, "top_k")?; }
-        if let Some(x) = v.get("max_tokens") { p.max_tokens = as_u32(x, "max_tokens")?; }
+        if let Some(x) = v.get("max_tokens") { p.max_tokens = Some(as_u32(x, "max_tokens")?); }
         if let Some(x) = v.get("seed") { p.seed = Some(as_u64(x, "seed")?); }
         if let Some(x) = v.get("presence_penalty") { p.presence_penalty = as_f32(x, "presence_penalty")?; }
         if let Some(x) = v.get("frequency_penalty") { p.frequency_penalty = as_f32(x, "frequency_penalty")?; }
@@ -1494,7 +1494,7 @@ mod generate_tests {
             sink: &mut dyn FnMut(Chunk<'_>) -> bool) -> Result<(), EngineError> {
             *self.seen.lock().unwrap() = Some((prompt.clone(), params.clone()));
             let mut usage = GenerateUsage::default();
-            let cap = (params.max_tokens as usize).min(self.tokens.len());
+            let cap = (params.max_tokens.unwrap_or(npu_engine::DEFAULT_MAX_TOKENS) as usize).min(self.tokens.len());
             for tok in self.tokens.iter().take(cap) {
                 if !self.delay.is_zero() { std::thread::sleep(self.delay); }
                 self.sent.fetch_add(1, Ordering::SeqCst);
@@ -1590,7 +1590,7 @@ mod generate_tests {
         assert!(close(params.temperature, 0.3), "{}", params.temperature);
         assert!(close(params.top_p, 0.5), "{}", params.top_p);
         assert_eq!(params.top_k, 40);
-        assert_eq!(params.max_tokens, 7);
+        assert_eq!(params.max_tokens, Some(7));
         assert_eq!(params.seed, Some(42));
         assert!(close(params.presence_penalty, 0.1), "{}", params.presence_penalty);
         assert!(close(params.frequency_penalty, 0.2), "{}", params.frequency_penalty);
@@ -1649,7 +1649,7 @@ mod generate_tests {
         assert!(close(params.temperature, d.temperature), "default temperature must be 1.0, not greedy");
         assert!(close(params.top_p, d.top_p));
         assert_eq!(params.top_k, 0);
-        assert_eq!(params.max_tokens, 256);
+        assert_eq!(params.max_tokens, None, "an absent max_tokens must stay unset, so the model default can apply");
         assert!(params.stop.is_empty());
         assert_eq!(params.seed, None);
         assert_eq!(params.enable_thinking, None, "absent kwarg must not become a substituted true");

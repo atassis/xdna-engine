@@ -16,6 +16,21 @@ pub struct ScenarioConfig {
     pub embeddings: EmbeddingsCfg,
     #[serde(default)]
     pub diarization: DiarizationCfg,
+    /// `kind = "generate"` only: per-model generation defaults, applied where a request leaves the
+    /// field out. A request that names the field always wins -- this sets the default, never a cap.
+    #[serde(default)]
+    pub generation: GenerationCfg,
+}
+
+/// Per-model generation defaults. Empty block = the engine's own defaults, which is what every
+/// scenario got before this existed.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+pub struct GenerationCfg {
+    /// Default completion budget for this model. `None` falls back to `GenerateParams`'s 256, which
+    /// is OpenAI's number and not a property of any model here -- a reasoning model whose `<think>`
+    /// block routinely costs more than that had no per-model way to say so.
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
 }
 
 /// Per-kind block for `kind = "diarize"`, same shape as `embeddings`. One field on purpose: every
@@ -225,6 +240,35 @@ manifest = "artifacts/pyannote/diarize.json"
             assert!(!p.starts_with('/'), "artifact path must be root-relative, got {p:?}");
             assert!(p.starts_with("artifacts/qwen3-0.6b/"), "unexpected artifact path {p:?}");
         }
+    }
+
+    #[test]
+    fn an_absent_generation_block_invents_no_budget() {
+        // Asserted on an inline scenario, not on a shipped one: a test that reads a real file to
+        // check a field is ABSENT pins that file's current content, and fails the moment someone
+        // legitimately sets it. This one is about the parse, so it owns its input.
+        let c = ScenarioConfig::from_str(
+            "[scenario]\nkind = \"generate\"\nname = \"m\"\n             [artifacts]\ndecode = \"d\"\nweights = \"w\"\ntokenizer_dir = \"t\"\n",
+        )
+        .expect("a scenario with no [generation] block must parse");
+        assert_eq!(c.generation.max_tokens, None);
+    }
+
+    #[test]
+    fn the_shipped_qwen3_scenario_declares_its_own_budget() {
+        let toml = std::fs::read_to_string("../../scenarios/generate-qwen3-0.6b.toml").unwrap();
+        let c = ScenarioConfig::from_str(&toml).expect("generate scenario must parse");
+        assert_eq!(c.generation.max_tokens, Some(1024),
+            "the reasoning model ships a budget bigger than the engine's 256");
+    }
+
+    #[test]
+    fn a_generation_block_sets_the_models_default_completion_budget() {
+        let c = ScenarioConfig::from_str(
+            "[scenario]\nkind = \"generate\"\nname = \"m\"\n             [artifacts]\ndecode = \"d\"\nweights = \"w\"\ntokenizer_dir = \"t\"\n             [generation]\nmax_tokens = 1024\n",
+        )
+        .expect("a [generation] block must parse");
+        assert_eq!(c.generation.max_tokens, Some(1024));
     }
 
     /// The two fields a second Whisper size needs, and the guarantee that the first one does not

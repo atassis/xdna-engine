@@ -86,7 +86,11 @@ pub struct GenerateParams {
     /// 0 = disabled. Not in OpenAI's schema but universal in local servers, and the device-side
     /// top-k slice (`llm-onchip-topk-feedback`) makes it the cheapest of the three to honour.
     pub top_k: u32,
-    pub max_tokens: u32,
+    /// `None` = the caller did not ask, so the model's configured default applies (and failing
+    /// that, [`DEFAULT_MAX_TOKENS`]). It is an Option so that "unset" and "explicitly 256" stay
+    /// distinguishable all the way to the generator -- without that a per-model default cannot
+    /// exist, because by the time the request arrives every field already looks specified.
+    pub max_tokens: Option<u32>,
     pub stop: Vec<String>,
     pub seed: Option<u64>,
     /// `chat_template_kwargs.enable_thinking`, the one template kwarg the reasoning-model families
@@ -105,7 +109,7 @@ impl Default for GenerateParams {
             temperature: 1.0,
             top_p: 1.0,
             top_k: 0,
-            max_tokens: 256,
+            max_tokens: None,
             stop: Vec::new(),
             seed: None,
             enable_thinking: None,
@@ -127,6 +131,10 @@ pub enum FinishReason {
     /// The sink asked to stop -- client disconnected mid-stream.
     Aborted,
 }
+
+/// The completion budget when neither the request nor the model's config names one. OpenAI's
+/// number, kept as the final fallback rather than as the only answer.
+pub const DEFAULT_MAX_TOKENS: u32 = 256;
 
 impl FinishReason {
     /// The wire name. `Aborted` reports as `stop`: OpenAI has no vocabulary for "the client hung

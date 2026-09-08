@@ -248,7 +248,7 @@ fn build_params(s: &SamplingArgs) -> npu_engine::GenerateParams {
     if let Some(t) = s.temperature { p.temperature = t; }
     if let Some(t) = s.top_p { p.top_p = t; }
     if let Some(t) = s.top_k { p.top_k = t; }
-    if let Some(t) = s.max_tokens { p.max_tokens = t; }
+    if let Some(t) = s.max_tokens { p.max_tokens = Some(t); }
     if !s.stop.is_empty() { p.stop = s.stop.clone(); }
     p.seed = s.seed;
     // Neither flag leaves the template's own default -- `None`, not a defaulted `true`, because for
@@ -1039,7 +1039,7 @@ mod tests {
         assert_eq!(p.temperature, 0.4);
         assert_eq!(p.top_p, 0.9);
         assert_eq!(p.top_k, 50);
-        assert_eq!(p.max_tokens, 64);
+        assert_eq!(p.max_tokens, Some(64));
         assert_eq!(p.stop, vec!["END".to_string(), "STOP".to_string()]);
         assert_eq!(p.seed, Some(7));
         assert_eq!(p.enable_thinking, Some(false));
