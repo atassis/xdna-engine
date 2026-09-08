@@ -109,6 +109,19 @@ impl Model {
         kind_of(&self.scen)
     }
 
+    /// Live pinned device BO bytes this model holds right now. `0` until a scenario's pipeline
+    /// wires its device handle through (see `pipeline::AsrModel::bo_bytes` and siblings); not yet
+    /// every pipeline, so this is a floor, not a promise that every resident model is weighed --
+    /// `npu_runtime::registry::Registry::unweighed_residents` names the ones still unmeasured.
+    pub fn bo_bytes(&self) -> u64 {
+        match &self.scen {
+            Scenario::Asr(m) => m.bo_bytes(),
+            Scenario::Embed(m) => m.bo_bytes(),
+            Scenario::Diarize(m) => m.bo_bytes(),
+            Scenario::Generate(m) => m.bo_bytes(),
+        }
+    }
+
     /// Embedding output dimension for an embed model (= configured hidden size); None for ASR.
     pub fn embed_dim(&self) -> Option<usize> {
         match self.scen { Scenario::Embed(_) => self.hidden, _ => None }

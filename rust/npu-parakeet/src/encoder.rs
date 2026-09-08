@@ -69,6 +69,15 @@ impl FastConformerEncoder {
         Ok(e)
     }
 
+    /// Live pinned device BO bytes, `0` on the host-only (no `npu` feature, or `new()` without
+    /// `new_npu`) build.
+    #[cfg(feature = "npu")]
+    pub fn bo_bytes(&self) -> u64 {
+        self.npu.as_ref().map_or(0, |n| n.bo_bytes())
+    }
+    #[cfg(not(feature = "npu"))]
+    pub fn bo_bytes(&self) -> u64 { 0 }
+
     /// Weight matmul C[m,n] = A[m,k] @ B[k,n] — NPU if enabled, else host ndarray. `id` keys the
     /// NPU weight-BO cache (unique per fixed weight, e.g. "3.ff1.l1"). Eager (non-lazy) sibling of
     /// [`Self::mm_lazy`]; retained as the general entry point (all encoder call sites use the lazy

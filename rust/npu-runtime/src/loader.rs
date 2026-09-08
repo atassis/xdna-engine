@@ -46,9 +46,10 @@ struct EngineModel { model: npu_engine::Model }
 
 impl Servable for EngineModel {
     fn capabilities(&self) -> Capability { self.model.kind().capability() }
-    // Best-effort BO footprint: not yet measured per-model (backlog R11(f)); report 0 until then so
-    // the accountant is a no-op rather than wrong. A later task wires real BO byte totals.
-    fn footprint(&self) -> u64 { 0 }
+    /// Real pinned BO bytes where the underlying pipeline exposes its device handle (Parakeet
+    /// today); `0` for every other scenario kind until they are wired the same way, which
+    /// `Registry::unweighed_residents` reports rather than silently trusting.
+    fn footprint(&self) -> u64 { self.model.bo_bytes() }
     fn run(&mut self, req: Request) -> Result<Response, EngineError> {
         match req {
             // Audio serves TWO capabilities, so this dispatches on the model's KIND. The compiler

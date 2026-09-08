@@ -864,6 +864,12 @@ impl NpuMatmul {
         DispatchTimer { stats: &self.stats, t: Instant::now() }
     }
 
+    /// Live pinned BO bytes this encoder's device holds -- weight cache, resident A/tmp/tr buffers,
+    /// per-N stream BOs, everything `self.dev.alloc_bo*` has allocated and not yet dropped.
+    pub fn bo_bytes(&self) -> u64 {
+        self.dev.resident_bo_bytes()
+    }
+
     pub fn open(root: &Path) -> Result<Self, LoadError> {
         // Fail on a stale/missing resident build BEFORE spending a device open on a load that is
         // going to fail anyway -- see `preflight()`. Callers that already ran it (the `npu serve`

@@ -160,10 +160,10 @@ pub trait Servable {
     /// (nothing here rules it out) but does not build -- YAGNI, per doctrine item 4.
     fn capabilities(&self) -> Capability;
 
-    /// Best-effort device-memory footprint in bytes, 0 if unknown. Same shape and same honest "0
-    /// until measured" convention as `npu_runtime::loader::Inference::bo_bytes` (`loader.rs:34`) --
-    /// not yet measured per-model there either (backlog R11(f)); this trait does not invent a
-    /// stricter contract than the one caller that already has this method actually keeps.
+    /// Best-effort device-memory footprint in bytes, 0 if unknown. `npu_runtime::loader::EngineModel`
+    /// (the real, non-mock implementor) delegates this to `Model::bo_bytes()`, which is real for
+    /// Parakeet and `0` -- honestly unmeasured, not "zero bytes" -- for every other scenario kind
+    /// until they are wired the same way.
     fn footprint(&self) -> u64 { 0 }
 
     /// Serve one request. `Err` for a capability mismatch (wrong `Request` variant for this model,
