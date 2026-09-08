@@ -270,17 +270,10 @@ impl DecodeStep for NpuDecodeStep {
         // theta, which a single artifact.head_dim cannot express.
         let rope_loc = self.artifact.loc("rope_global");
         let rope = rope_row(pos, rope_loc.len / 2, self.artifact.rope_theta_global);
-        // Cross-check against the SEPARATELY computed dims.head_dim, which is the only version of
-        // this number that can actually disagree. (Comparing the built byte count against
-        // rope_loc.len would be tautological -- the width is derived from that same len.) The
-        // check is skipped once geometry is per-layer, where no single head_dim is the right
-        // answer for both rows.
-        if self.artifact.kv_offs.len() == 1 && rope_loc.len != self.artifact.head_dim * 2 {
-            return Err(EngineError::Device(format!(
-                "rope_global buffer is {} bytes, but dims.head_dim = {} implies {} -- the \
-                 generator and the artifact disagree about the RoPE row width",
-                rope_loc.len, self.artifact.head_dim, self.artifact.head_dim * 2)));
-        }
+        // The width/head_dim cross-check moved to `LlmArtifact::load`, which sees BOTH angle rows
+        // and every declared geometry at once. Here it could only ever compare one row against one
+        // scalar, which is why it was gated on `kv_offs.len() == 1` and did nothing in the
+        // per-layer case it was written for.
         let rope_bytes = pack_bf16_bytes(&rope);
         self.arena
             .write_at(rope_loc.arena, rope_loc.off, &rope_bytes)

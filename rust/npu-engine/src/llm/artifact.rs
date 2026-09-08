@@ -340,6 +340,43 @@ impl LlmArtifact {
             }
         }
 
+        // GEOMETRY CROSS-CHECK. `kv_offs` carries one head_dim per distinct attention geometry;
+        // the RoPE angle buffers carry one row per geometry. The two are computed in different
+        // components -- the generator's op vocabulary and its buffer layout -- and nothing else
+        // compares them. The failure it exists for builds cleanly: two KV slots declared against a
+        // single angle row means half the layers rotate at a width no layer uses, and only the
+        // global layers are wrong.
+        //
+        // SET equality, not a pairing. `kv_params` does not say which slot the global layers read
+        // and `layout` does not say which row a layer reads, so the strongest claim the artifact
+        // supports is that both components name the same head_dims. Under uniform geometry this
+        // reduces to the check that used to run per token in `npu_decode.rs` -- and which was
+        // gated on `kv_offs.len() == 1`, so it did nothing in exactly the non-uniform case it was
+        // for. It is tautological for a compat-shimmed `rope_global`, whose width this function
+        // manufactured from `head_dim` a few lines above; there is nothing there to disagree.
+        let mut declared: Vec<usize> = kv_offs.iter().map(|&(_, hd)| hd).collect();
+        declared.sort_unstable();
+        declared.dedup();
+        let mut rope_widths: Vec<usize> =
+            ["rope_global", "rope_local"].iter().filter_map(|n| layout.get(*n).map(|l| l.len / 2)).collect();
+        rope_widths.sort_unstable();
+        rope_widths.dedup();
+        if !rope_widths.is_empty() {
+            if declared != rope_widths {
+                return Err(ctx(format!(
+                    "attention geometry disagrees: scratchpad.kv_params declares head_dim(s) {declared:?}, \
+                     but the RoPE angle buffers are {rope_widths:?} bf16 elements wide -- each distinct \
+                     geometry needs exactly one angle row of its own width"
+                )));
+            }
+            if !declared.contains(&head_dim) {
+                return Err(ctx(format!(
+                    "dims.head_dim = {head_dim} is not one of the geometries scratchpad.kv_params \
+                     declares ({declared:?}) -- the scalar is a third, unreconciled copy of this number"
+                )));
+            }
+        }
+
         // Toolchain freshness: fail loud on an ACTIVE mismatch (the pin moved, nobody rebuilt this
         // artifact -- a stale ELF answers with a plausible WRONG token, silently). Anything short of a
         // confirmed mismatch is reported, never fatal -- a shipped consumer must not require
@@ -585,6 +622,87 @@ mod tests {
         assert_eq!(art.embed_scale, EmbedScale::None);
         assert!(!art.kv_off.core);
         assert!(art.sm_mask.core);
+    }
+
+    /// A two-geometry meta.json, built the way `gen_llm_decode.py` emits one: a second kv slot and
+    /// a second angle row. `x` is widened to fit both rows so the arena checks stay out of the way.
+    fn two_geometry_meta() -> serde_json::Value {
+        // x[0,8) then rope_global (head_dim 8 -> 16 B) then rope_local (head_dim 4 -> 8 B).
+        let mut meta = base_meta(
+            8,
+            4,
+            serde_json::json!({
+                "rope_global": {"type": "input", "offset": 8,  "len": 16},
+                "rope_local":  {"type": "input", "offset": 24, "len": 8},
+            }),
+        );
+        meta["input_size"] = serde_json::json!(32);
+        meta["inputs"] = serde_json::json!(["x", "rope_global", "rope_local"]);
+        meta["host_protocol"]["rope_theta_local"] = serde_json::json!(10_000.0);
+        meta["scratchpad"]["params"]["kv_off1"] = serde_json::json!({"byte_offset": 8, "kind": "addr"});
+        meta["scratchpad"]["kv_params"] = serde_json::json!([
+            {"param": "kv_off",  "head_dim": 8},
+            {"param": "kv_off1", "head_dim": 4},
+        ]);
+        meta["dims"]["head_dim"] = serde_json::json!(8);
+        meta
+    }
+
+    #[test]
+    fn two_geometries_with_one_angle_row_each_load() {
+        let dir = tempfile::tempdir().unwrap();
+        write_meta(dir.path(), &two_geometry_meta());
+        let art = LlmArtifact::load(dir.path()).expect("matched geometries must load");
+        assert_eq!(art.kv_offs.len(), 2);
+        assert_eq!(art.loc("rope_global").len / 2, 8);
+        assert_eq!(art.loc("rope_local").len / 2, 4);
+    }
+
+    /// THE failure the cross-check exists for: the generator declares two KV geometries and one
+    /// angle row width. Nothing else in the artifact compares those two numbers, so before this
+    /// check the build was clean and only the layers reading the missing width were wrong.
+    #[test]
+    fn a_second_kv_geometry_with_no_second_angle_row_fails_loud() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut meta = two_geometry_meta();
+        // Both rows at the same width -- the shape a generator emits when it splits the KV slots
+        // and forgets the angle tables.
+        meta["layout"]["rope_local"] = serde_json::json!({"type": "input", "offset": 24, "len": 16});
+        meta["input_size"] = serde_json::json!(40);
+        write_meta(dir.path(), &meta);
+        let err = LlmArtifact::load(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("attention geometry disagrees"), "{err}");
+        assert!(err.contains("[4, 8]") && err.contains("[8]"), "must print both sets: {err}");
+    }
+
+    /// `dims.head_dim` is a third copy of a number `kv_params` already carries. Under uniform
+    /// geometry it is THE copy the host used; under per-layer geometry it can name a width no
+    /// layer has, which is silent because nothing reads it in that case.
+    #[test]
+    fn a_scalar_head_dim_outside_the_declared_geometries_fails_loud() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut meta = two_geometry_meta();
+        meta["dims"]["head_dim"] = serde_json::json!(16);
+        write_meta(dir.path(), &meta);
+        let err = LlmArtifact::load(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("dims.head_dim = 16"), "{err}");
+        assert!(err.contains("[4, 8]"), "{err}");
+    }
+
+    /// The uniform case still runs the check the per-token path used to: one geometry, one row,
+    /// and a row whose width does not match `dims.head_dim` is refused at LOAD rather than on the
+    /// first dispatch.
+    #[test]
+    fn a_uniform_artifact_whose_angle_row_contradicts_head_dim_fails_loud() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut meta = base_meta(8, 4, serde_json::json!({"rope_global": {"type": "input", "offset": 8, "len": 8}}));
+        // 12 B = 6 bf16 elements against dims.head_dim 4. Widen the arena so the extent check does
+        // not fire first and mask this one.
+        meta["layout"]["rope_global"] = serde_json::json!({"type": "input", "offset": 8, "len": 12});
+        meta["input_size"] = serde_json::json!(20);
+        write_meta(dir.path(), &meta);
+        let err = LlmArtifact::load(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("attention geometry disagrees"), "{err}");
     }
 
     #[test]
