@@ -2,14 +2,24 @@
 # SPDX-License-Identifier: Apache-2.0
 """Dump a HuggingFace decoder-LLM checkpoint to the flat .npy tree gen_llm_decode.py reads.
 
-One .npy per tensor, named by its HF key, f32. Only the tensors the spec's graph actually consumes
-are written, and every one is CHECKED against the spec's dims before writing -- a silently
-transposed or mis-shaped projection is the failure mode that survives every build gate and shows up
-only as drifting token parity.
+One .npy per tensor, named by its HF key. Only the tensors the spec's graph actually consumes are
+written, and every one is CHECKED against the spec's dims before writing -- a silently transposed or
+mis-shaped projection is the failure mode that survives every build gate and shows up only as
+drifting token parity.
 
   python scripts/dump_llm_weights.py --spec qwen3-0.6b --out artifacts/qwen3-0.6b/weights
+
+`--quant` packs the PROJECTION matrices on the way out, for models whose f32 dump does not fit on
+disk: a 12B is 43 GB at f32 and 6 GB at int4 g64. Packed tensors are np.int8 ON-WIRE BYTES, not
+values, so the dump declares itself in `quant.json` (dtype, group_size, and the exact set of packed
+names) and the generator READS that declaration. Agreeing via matching env vars instead would make a
+group-size disagreement silent numerical garbage rather than a load error -- the packer and the
+kernel share a byte layout, and nothing else checks it.
+
+  python scripts/dump_llm_weights.py --spec qwen3-0.6b --out ... --quant int4 --quant-group 64
 """
 import argparse
+import json
 import os
 import sys
 
@@ -21,6 +31,10 @@ from llm_decode_spec import SPECS  # noqa: E402
 
 HF_REPO = {"qwen3-0.6b": "Qwen/Qwen3-0.6B", "gemma3-270m": "unsloth/gemma-3-270m-it"}
 
+# The projection leaves, i.e. everything that is a [out, in] matrix rather than a norm gain or the
+# embedding table. Only these are packable.
+EXP_LEAVES = ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj")
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -28,11 +42,35 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--repo", default=None, help="override the HF repo id")
     ap.add_argument("--layers", type=int, default=None)
+    ap.add_argument("--quant", default="bf16", choices=("bf16", "int4", "int8"),
+                    help="pack the PROJECTION matrices at this width (norms and the embedding stay "
+                         "f32 and readable). bf16 writes the plain f32 dump.")
+    ap.add_argument("--quant-group", type=int, default=64)
+    # Default: exactly the leaves gen_llm_decode.py can CONSUME packed today -- the MLP class
+    # (QUANT_MLP_DTYPE) and Wo (QUANT_ATTN_DTYPE). q/k/v are excluded because their GEMVs are built
+    # without quant kwargs (`gemv(QD, D, ctx)`, and the concatenated Wqkv likewise), so a packed
+    # q_proj has no reader. Packing them is allowed but the build will refuse it by name rather
+    # than quietly widening the bytes.
+    ap.add_argument("--quant-leaves", default="gate_proj,up_proj,down_proj,o_proj",
+                    help="comma-separated projection leaves to pack (default: the ones the "
+                         "generator can read back)")
     a = ap.parse_args()
     sp = SPECS[a.spec]
     repo = a.repo or HF_REPO[a.spec]
     NL = a.layers if a.layers is not None else sp.n_layers
     os.makedirs(a.out, exist_ok=True)
+
+    quant_leaves = {x for x in a.quant_leaves.split(",") if x}
+    quantize_weight = None
+    if a.quant != "bf16":
+        unknown = quant_leaves - set(EXP_LEAVES)
+        if unknown:
+            ap.error(f"--quant-leaves has non-projection leaves {sorted(unknown)}; "
+                     f"expected a subset of {sorted(EXP_LEAVES)}")
+        # Imported from IRON rather than reimplemented here, because the on-wire row layout
+        # ([n_groups x f32 scale][packed payload]) is shared with the matvec kernel. A second copy
+        # of it is a seam with no owner, which is the class this whole manifest exists to close.
+        from iron.operators.gemv.quant import quantize_weight
 
     from huggingface_hub import snapshot_download
     from safetensors import safe_open
@@ -68,7 +106,7 @@ def main():
     exp = {"q_proj": (QD, D), "k_proj": (KVD, D), "v_proj": (KVD, D), "o_proj": (D, QD),
            "gate_proj": (FF, D), "up_proj": (FF, D), "down_proj": (D, FF)}
 
-    n = 0
+    n, packed = 0, []
     for key in sorted(want):
         w = get(key)
         leaf = key.rsplit(".", 2)[-2]
@@ -82,9 +120,30 @@ def main():
                 raise ValueError(f"{key}: shape {w.shape} != expected ({D},)")
         if key == "model.embed_tokens.weight" and w.shape != (V, D):
             raise ValueError(f"{key}: shape {w.shape} != expected ({V}, {D})")
-        np.save(os.path.join(a.out, f"{key}.npy"), w)
+        # Shapes are checked ABOVE, on the f32 array, before any packing -- a packed tensor is a
+        # flat byte run and has no shape left to check.
+        if quantize_weight is not None and leaf in quant_leaves:
+            np.save(os.path.join(a.out, f"{key}.npy"),
+                    quantize_weight(w, a.quant_group, a.quant))
+            packed.append(key)
+        else:
+            np.save(os.path.join(a.out, f"{key}.npy"), w)
         n += 1
-    print(f"wrote {n} tensors to {a.out} (spec {sp.name}, {NL} layers) -- all shapes checked")
+
+    manifest = {
+        "dtype": a.quant,
+        "group_size": a.quant_group,
+        "packed": sorted(packed),
+        "note": "packed arrays are np.int8 on-wire bytes, NOT values -- never .astype()",
+    }
+    with open(os.path.join(a.out, "quant.json"), "w") as f:
+        json.dump(manifest, f, indent=2)
+
+    tail = ""
+    if packed:
+        bits = ((4 if a.quant == "int4" else 8) * a.quant_group + 32) / a.quant_group
+        tail = f", {len(packed)} packed at {a.quant} g{a.quant_group} = {bits:.2f} bits/weight"
+    print(f"wrote {n} tensors to {a.out} (spec {sp.name}, {NL} layers) -- all shapes checked{tail}")
 
 
 if __name__ == "__main__":

@@ -73,7 +73,7 @@ import newstack_compat  # noqa: F401,E402 -- MUST precede iron imports (new-mlir
 from iron.common import AIEContext  # noqa: E402
 from elf_dispatch_compat import OperatorSequence, load_elf  # noqa: E402
 from iron.operators.gemv.op import GEMV  # noqa: E402
-from iron.operators.gemv.quant import quantize_weight  # noqa: E402
+from iron.operators.gemv.quant import quantize_weight, row_stride_bytes  # noqa: E402
 from iron.operators.rms_norm.op import RMSNorm  # noqa: E402
 from iron.operators.rope.op import RoPE  # noqa: E402
 from iron.operators.elementwise_add.op import ElementwiseAdd  # noqa: E402
@@ -227,6 +227,22 @@ FUSE_MLP_O = os.environ.get("FUSE_MLP_O", "1") == "1"
 WEIGHT_DEPTH = int(os.environ.get("WEIGHT_DEPTH", "2"))
 # Weight tile ROWS for the fused MLP. Trades against WEIGHT_DEPTH at constant L1.
 MLP_TILE_ROWS = int(os.environ.get("MLP_TILE_ROWS", "0"))
+
+
+def packed_zero_rows(n_rows, K, group_size, weight_dtype):
+    """`n_rows` all-zero rows in quantize_weight's on-wire layout, built WITHOUT unpacking.
+
+    A pre-packed dump has no float domain left to pad in, but fuse_o still needs its Wo pad. A zero
+    row is constructible directly: quantize_weight takes amax=0 to scale 1.0
+    (`np.where(amax > 0, amax/qmax, 1.0)`) and q=0, so the row is [n_groups x float32(1.0)][zeros].
+    Gated by an equality against the float path -- see the round-trip check in tests.
+    """
+    stride = row_stride_bytes(K, group_size, weight_dtype)
+    n_groups = K // group_size
+    out = np.zeros((n_rows, stride), np.uint8)
+    ones = np.ones((n_rows, n_groups), np.float32)
+    out[:, : n_groups * 4] = ones.view(np.uint8).reshape(n_rows, n_groups * 4)
+    return out.reshape(-1).view(np.int8)
 
 
 def weight_bytes(arr):
@@ -516,6 +532,40 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
         return np.load(os.path.join(weights_dir, f"{name}.npy"),
                        mmap_mode="r").astype(np.float32, copy=False)
 
+    def npy_raw(name):
+        """Load without casting. A packed weight is np.int8 ON-WIRE BYTES, not values -- widening
+        it to float32 renumbers the payload instead of copying it, and does so silently."""
+        return np.load(os.path.join(weights_dir, f"{name}.npy"), mmap_mode="r")
+
+    # THE DUMP DECLARES ITSELF; this reads the declaration rather than agreeing with it via matching
+    # env vars. The packer and the matvec kernel share an on-wire row layout, and nothing else in
+    # the build checks it -- so a disagreement about dtype or group size is silent numerical
+    # garbage, not a load error. A dump too large to write at f32 (a 12B is 43 GB f32, 6 GB at int4
+    # g64) can only arrive pre-packed, which is why this path exists at all.
+    _qmf_path = os.path.join(weights_dir, "quant.json")
+    _qmf = (json.load(open(_qmf_path)) if os.path.isfile(_qmf_path)
+            else {"dtype": "bf16", "group_size": 0, "packed": []})
+    PACKED = set(_qmf.get("packed", []))
+    if PACKED and _qmf.get("dtype", "bf16") == "bf16":
+        raise SystemExit(f"{_qmf_path}: lists {len(PACKED)} packed tensors but dtype is bf16")
+    if PACKED:
+        # A packed dump is the AUTHORITY for the weight format, because the bytes are already on
+        # disk in it -- the env can no longer choose. An env var that was EXPLICITLY SET to
+        # something else is a contradiction and fails loudly here; an unset one simply adopts the
+        # manifest. Presence, not value, is what distinguishes "the operator asked" from "this is
+        # the default", which is the same contract env-flag-presence-means-on names.
+        _mdt, _mgs = _qmf["dtype"], int(_qmf["group_size"])
+        for _v, _want in (("QUANT_MLP_DTYPE", _mdt), ("QUANT_ATTN_DTYPE", _mdt),
+                          ("QUANT_MLP_GROUP", str(_mgs)), ("QUANT_ATTN_GROUP", str(_mgs))):
+            _got = os.environ.get(_v)
+            if _got is not None and _got != _want:
+                raise SystemExit(
+                    f"{_v}={_got!r} contradicts {_qmf_path} ({_want!r}). The dump is already "
+                    f"packed at {_mdt} g{_mgs}; the build cannot re-choose the format. Unset "
+                    f"{_v} to take the dump's, or re-dump at the format you want.")
+        globals().update(QUANT_MLP_DTYPE=_mdt, QUANT_ATTN_DTYPE=_mdt,
+                         QUANT_MLP_GROUP=_mgs, QUANT_ATTN_GROUP=_mgs)
+
     def load_norm(name):
         # Gemma-3 stores RMSNorm gain as w with the kernel computing x_hat*(1+w); Qwen3 stores it
         # already absolute. IRON's weighted RMSNorm always does x_hat*w', so Gemma folds the +1 here.
@@ -574,14 +624,15 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
     for arm, why in (("qkv_head_dp", qkv_dp_why), ("swiglu_mlp_dp", mlp_dp_why)):
         print(f"[gen] fused arm {arm}: {'OFF -- ' + why if why else 'on'}")
     if fuse_o:
-        if QUANT_ATTN_DTYPE != "bf16":
+        if QUANT_ATTN_DTYPE != QUANT_MLP_DTYPE:
             # Under fuse_o, Wo rides the MLP design's single weight ObjectFifo, and one fifo
             # carries one wire format. So Wo's dtype is QUANT_MLP_DTYPE's, not its own axis --
             # QUANT_ATTN_DTYPE would silently mean nothing here rather than a little.
             raise NotImplementedError(
-                "FUSE_MLP_O folds Wo into swiglu_mlp_dp's shared weight channel, so Wo takes "
-                f"QUANT_MLP_DTYPE ({QUANT_MLP_DTYPE!r}), not QUANT_ATTN_DTYPE "
-                f"({QUANT_ATTN_DTYPE!r}); set FUSE_MLP_O=0 to quantize Wo independently"
+                "FUSE_MLP_O folds Wo into swiglu_mlp_dp's shared weight channel, and one fifo "
+                f"carries one wire format, so Wo must take QUANT_MLP_DTYPE ({QUANT_MLP_DTYPE!r}); "
+                f"QUANT_ATTN_DTYPE is {QUANT_ATTN_DTYPE!r}. Set them equal, or FUSE_MLP_O=0 to "
+                "quantize Wo independently"
             )
     op_qkv = gemv(QD + 2 * KVD, D, ctx) if FUSE_QKV_GEMV else None
     op_q = gemv(QD, D, ctx)
@@ -748,11 +799,28 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
         for key, tensor in (("Wq", "self_attn.q_proj"), ("Wk", "self_attn.k_proj"),
                             ("Wv", "self_attn.v_proj"), ("Wo", "self_attn.o_proj"),
                             ("Wg", "mlp.gate_proj"), ("Wu", "mlp.up_proj"), ("Wd", "mlp.down_proj")):
-            w = npy(f"model.layers.{l}.{tensor}.weight")  # [M, K], f32
+            hf = f"model.layers.{l}.{tensor}.weight"
+            if hf in PACKED:
+                # Already on the wire; npy_raw, never npy -- widening these bytes to f32 renumbers
+                # the payload instead of copying it, and does so silently.
+                if key in qkv_keys:
+                    raise SystemExit(
+                        f"{hf} is packed, but nothing here can read a packed {tensor}: op_qkv, "
+                        f"op_q and op_kv are all built without quant kwargs, so the packed bytes "
+                        f"would be consumed as bf16 values. Re-dump with --quant-leaves excluding "
+                        f"q_proj,k_proj,v_proj, or wire the QKV GEMVs to the quant axis first.")
+                wp = np.asarray(npy_raw(hf))
+                if key == "Wo" and fuse_o:
+                    # The pad cannot be done in the float domain here -- there is no float domain
+                    # left. Zero rows are built directly in the wire format instead; see
+                    # packed_zero_rows for why a zero row is exactly [f32(1.0) x n_groups][zeros].
+                    wp = np.concatenate([wp, packed_zero_rows(
+                        op_mlp_dp._wo_rows_padded - D, QD, QUANT_MLP_GROUP, QUANT_MLP_DTYPE)])
+                weights[p + key] = wp
+                continue
+            w = npy(hf)  # [M, K], f32
             if key in mlp_keys and QUANT_MLP_DTYPE != "bf16":
                 weights[p + key] = quantize_weight(w, QUANT_MLP_GROUP, QUANT_MLP_DTYPE)
-            elif key == "Wo" and QUANT_ATTN_DTYPE != "bf16":
-                weights[p + key] = quantize_weight(w, QUANT_ATTN_GROUP, QUANT_ATTN_DTYPE)
             elif key == "Wo" and fuse_o:
                 # Pad FIRST, then quantize: the pad rows must be a whole number of groups in the
                 # same wire format as the rest of the channel. Zero rows quantize to amax=0 ->
@@ -770,6 +838,10 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
                     quantize_weight(w_padded, QUANT_MLP_GROUP, QUANT_MLP_DTYPE)
                     if QUANT_MLP_DTYPE != "bf16" else bf16(w_padded).reshape(-1)
                 )
+            elif key == "Wo" and QUANT_ATTN_DTYPE != "bf16":
+                # AFTER the fuse_o branch, not before it: fused Wo needs the pad, and testing the
+                # dtype first would send a quantized+fused Wo down the unpadded path.
+                weights[p + key] = quantize_weight(w, QUANT_ATTN_GROUP, QUANT_ATTN_DTYPE)
             elif key in qkv_keys and FUSE_QKV_GEMV:
                 qkv_parts.append(bf16(w).reshape(-1))     # row-major, so concatenation IS stacking
             else:
