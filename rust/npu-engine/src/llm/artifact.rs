@@ -75,6 +75,11 @@ pub struct LlmArtifact {
     pub n_layers: usize,
     pub embed_scale: EmbedScale,
     pub rope_theta_global: f64,
+    /// The LOCAL RoPE base, for models with interleaved local/global attention (Gemma-3). `None` on
+    /// a global-only model (Qwen3), which is why it is optional rather than defaulted: the presence
+    /// of this field is exactly what decides whether the artifact declares a `rope_local` input, so
+    /// a default would make a two-input and a three-input artifact indistinguishable here.
+    pub rope_theta_local: Option<f64>,
     /// `meta.json`'s `toolchain.hash` -- the toolchain.lock semantic hash this ELF was compiled
     /// against (`gen_llm_decode.py`, added 2026-09-05). `None` on any artifact built before this
     /// field existed. See [`LlmArtifact::load`]'s freshness check below.
@@ -184,6 +189,14 @@ impl LlmArtifact {
             .get("rope_theta_global")
             .and_then(|v| v.as_f64())
             .ok_or_else(|| ctx("host_protocol.rope_theta_global missing/non-numeric".to_string()))?;
+        // Absent on a global-only model; present and numeric, or the artifact is malformed. A
+        // non-numeric value must not read as "global-only" -- that would silently drop the local
+        // RoPE write and leave the local layers rotating at the wrong base.
+        let rope_theta_local = match hp.get("rope_theta_local") {
+            None => None,
+            Some(v) => Some(v.as_f64().ok_or_else(||
+                ctx("host_protocol.rope_theta_local present but non-numeric".to_string()))?),
+        };
 
         let sp = meta.get("scratchpad").ok_or_else(|| ctx("missing top-level `scratchpad`".to_string()))?;
         let sp_params = sp.get("params").ok_or_else(|| ctx("scratchpad.params missing".to_string()))?;
@@ -326,6 +339,7 @@ impl LlmArtifact {
             n_layers,
             embed_scale,
             rope_theta_global,
+            rope_theta_local,
             toolchain_hash,
         })
     }
@@ -592,6 +606,52 @@ mod tests {
     // check_per_token_writes -- the inverse arena check ported from whisper_decoder.rs
     // (xdna-engine f446a50): an Arena::Input buffer nothing writes per token is an error.
     // ------------------------------------------------------------------------------------
+
+    /// A global-only artifact has no `rope_theta_local`, and must keep reading as global-only --
+    /// that absence is what makes the decoder's write list derivable instead of a literal.
+    #[test]
+    fn rope_theta_local_is_absent_on_a_global_only_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        write_meta(dir.path(), &base_meta(8, 4, serde_json::json!({})));
+        assert_eq!(LlmArtifact::load(dir.path()).unwrap().rope_theta_local, None);
+    }
+
+    /// Gemma-3 interleaves local and global attention, carries both bases, and declares a THIRD
+    /// input. Parsing the local base is what lets the decoder write it: before this the artifact
+    /// declared `rope_local`, nothing wrote it, and check_per_token_writes refused the load with
+    /// "input-arena buffer(s) with no per-token host write: rope_local".
+    #[test]
+    fn a_local_attention_artifact_parses_its_local_base_and_declares_a_third_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut meta = base_meta(8, 4, serde_json::json!({
+            "rope_global": {"type": "input", "offset": 8,  "len": 8},
+            "rope_local":  {"type": "input", "offset": 16, "len": 8},
+        }));
+        meta["host_protocol"]["rope_theta_local"] = serde_json::json!(10_000.0);
+        // A third input needs room for it: the fixture's default input arena fits exactly two.
+        meta["input_size"] = serde_json::json!(24);
+        write_meta(dir.path(), &meta);
+        let art = LlmArtifact::load(dir.path()).unwrap();
+        assert_eq!(art.rope_theta_local, Some(10_000.0));
+
+        // The decoder derives its write list from exactly this, so pin both directions.
+        assert!(art.check_per_token_writes(&["x", "rope_global"]).is_err(),
+            "two writes must NOT satisfy a three-input artifact");
+        art.check_per_token_writes(&["x", "rope_global", "rope_local"])
+            .expect("naming all three inputs is what the decoder now does");
+    }
+
+    /// A non-numeric value must not read as "global-only": that would silently skip the local write
+    /// and leave the local layers rotating at the global base -- wrong output, no error.
+    #[test]
+    fn a_malformed_local_base_is_an_error_not_a_silent_global_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut meta = base_meta(8, 4, serde_json::json!({}));
+        meta["host_protocol"]["rope_theta_local"] = serde_json::json!("10000");
+        write_meta(dir.path(), &meta);
+        let e = LlmArtifact::load(dir.path()).unwrap_err().to_string();
+        assert!(e.contains("rope_theta_local"), "{e}");
+    }
 
     #[test]
     fn per_token_writes_passes_when_every_input_buffer_is_named() {

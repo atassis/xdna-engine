@@ -88,7 +88,15 @@ impl NpuDecodeStep {
         let artifact = LlmArtifact::load(decode_dir)?;
         // Mirrors this exact loop's writes below (`x_loc`, `rope_loc`) -- an artifact declaring a
         // third per-token input buffer would otherwise leave it unwritten every token, silently.
-        artifact.check_per_token_writes(&["x", "rope_global"])?;
+        // The write list is DERIVED from the artifact, not a literal, because it is model-shaped:
+        // a global-only model (Qwen3) declares two inputs, and one with interleaved local/global
+        // attention (Gemma-3) declares three. The literal `["x", "rope_global"]` was correct for
+        // every model on this rail until Gemma-3, and then reported the missing `rope_local` write
+        // as an artifact defect -- which is exactly what the check is for, but the fix belongs
+        // here.
+        let mut writes: Vec<&str> = vec!["x", "rope_global"];
+        if artifact.rope_theta_local.is_some() { writes.push("rope_local"); }
+        artifact.check_per_token_writes(&writes)?;
 
         let arena = FusedArena::new(dev, artifact.input_size, artifact.output_size, artifact.scratch_size)
             .map_err(|e| EngineError::Load(format!("alloc fused arenas: {e}")))?;
@@ -215,6 +223,17 @@ impl DecodeStep for NpuDecodeStep {
         self.arena
             .write_at(rope_loc.arena, rope_loc.off, &pack_bf16_bytes(&rope))
             .map_err(|e| EngineError::Device(format!("write rope_global: {e}")))?;
+
+        // Same row, different base. Gemma-3 interleaves local and global attention layers and the
+        // ELF reads a separate angle table for each; a model without local layers has no such
+        // buffer and this is skipped.
+        if let Some(theta_local) = self.artifact.rope_theta_local {
+            let rope_l = rope_row(pos, self.artifact.head_dim, theta_local);
+            let loc = self.artifact.loc("rope_local");
+            self.arena
+                .write_at(loc.arena, loc.off, &pack_bf16_bytes(&rope_l))
+                .map_err(|e| EngineError::Device(format!("write rope_local: {e}")))?;
+        }
 
         // `kv_off` is "addr"-kind (element-unit BD offset, no shift); `sm_mask` is "core"-kind and
         // the firmware's UPDATE_REG convention requires the host to pre-shift it left by 2 bits
