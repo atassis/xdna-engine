@@ -103,6 +103,14 @@ def main():
     report_artifact_freshness(a.weights)
 
     ref = json.load(open(a.ref))
+    # A reference captured at a DIFFERENT depth is not a reference for this build. It presents as a
+    # token mismatch at step 0, which reads as a device defect; refuse instead. `layers` is absent
+    # on refs captured before it was recorded, and absent means full depth.
+    ref_layers = ref.get("layers")
+    if ref_layers != a.layers:
+        raise SystemExit(
+            f"reference was captured at layers={ref_layers} but this build is layers={a.layers}. "
+            f"Re-capture with scripts/llm_hf_bf16_ref.py --layers {a.layers}.")
     prompt_ids, gen_ids = ref["prompt_ids"], ref["gen_ids"]
     margins = ref.get("margins")
     hf_ids = ref.get("hf_f32_gen_ids")
@@ -203,7 +211,12 @@ def main():
         # final_logit_softcapping, the same transform rust/npu-engine applies after readback. It
         # changes the ARGMAX (tanh saturates), so a harness that skips it does not gate the model
         # the engine runs.
-        if sp.logit_softcap is not None:
+        #
+        # WHETHER to apply it comes from the REFERENCE, never from a flag here. A truncated stack
+        # needs it off (its logits are ~1168 against a cap of 30, so 28.9% of the vocab ties at the
+        # cap and the argmax is index order); a full-depth one needs it on. Two independent flags
+        # would present a disagreement as a token mismatch instead of a configuration error.
+        if sp.logit_softcap is not None and not ref.get("logit_softcap_disabled"):
             lg = np.tanh(lg / sp.logit_softcap) * sp.logit_softcap
         if a.dump_logits and pos == 0:
             np.save(a.dump_logits, lg)

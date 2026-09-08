@@ -35,6 +35,18 @@ def main():
     ap.add_argument("--prompt", default="The capital of France is")
     ap.add_argument("--steps", type=int, default=8)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--no-logit-softcap", action="store_true",
+                    help="run the reference with final_logit_softcapping disabled. REQUIRED to "
+                         "gate a TRUNCATED Gemma-4: the cap is an asymptote, and a truncated stack "
+                         "produces logits ~1168 against a cap of 30, so tanh returns exactly 1 for "
+                         "28.9%% of the vocabulary and the argmax becomes index order over ~75k "
+                         "tied tokens. MEASURED at 12 layers: pre-cap top1 1168.0 margin 24.0, "
+                         "post-cap top1 30.0 margin 0.0. The setting is recorded in the ref so the "
+                         "device harness takes it from there and cannot disagree.")
+    ap.add_argument("--layers", type=int, default=None,
+                    help="truncate the model to the first N decoder layers, to gate a build made "
+                         "with the same --layers. `layer_types` is truncated with it, so the "
+                         "sliding/global pattern stays the one the generator used.")
     ap.add_argument("--f32-contrast", action="store_true",
                     help="also run an f32 pass for contrast (loads a SECOND copy of the weights; "
                          "see the module docstring for why this is off by default)")
@@ -54,7 +66,37 @@ def main():
         pass
 
     tok = AutoTokenizer.from_pretrained(a.model)
-    model = AutoModelForCausalLM.from_pretrained(a.model, dtype=torch.bfloat16).eval()
+    kw = {}
+    softcap = None
+    if a.no_logit_softcap:
+        from transformers import AutoConfig as _AC
+
+        cfg0 = _AC.from_pretrained(a.model)
+        softcap = cfg0.get_text_config().final_logit_softcapping
+        print(f"[ref] final_logit_softcapping {softcap} -> DISABLED for this reference")
+    if a.layers is not None:
+        # A reduced-depth ORACLE for a reduced-depth build. The full 12B is 23 GB of bf16 weights
+        # against this box's ~13 GB, so the full-depth gate does not execute here at all; a
+        # truncated pair still gates every CAPABILITY, provided the truncation reaches the first
+        # global layer. `layer_types` is an explicit 48-entry list in Gemma-4's config, so it has to
+        # be cut alongside num_hidden_layers or the pattern silently changes under the truncation.
+        from transformers import AutoConfig
+
+        cfg = AutoConfig.from_pretrained(a.model)
+        tc = cfg.get_text_config()
+        tc.num_hidden_layers = a.layers
+        if getattr(tc, "layer_types", None):
+            tc.layer_types = list(tc.layer_types)[: a.layers]
+        kw["config"] = cfg
+        print(f"[ref] truncated to {a.layers} layers"
+              + (f", layer_types {tc.layer_types}" if getattr(tc, "layer_types", None) else ""))
+    if a.no_logit_softcap:
+        if "config" not in kw:
+            from transformers import AutoConfig as _AC2
+
+            kw["config"] = _AC2.from_pretrained(a.model)
+        kw["config"].get_text_config().final_logit_softcapping = None
+    model = AutoModelForCausalLM.from_pretrained(a.model, dtype=torch.bfloat16, **kw).eval()
 
     ids = tok(a.prompt, return_tensors="pt").input_ids
     prompt_ids = ids[0].tolist()
@@ -89,6 +131,12 @@ def main():
 
     ref = {
         "model": a.model,
+        "layers": a.layers,   # null = the checkpoint's full depth
+        # THE gate's copy of this setting. The device harness reads it from here rather than taking
+        # its own flag, so the reference and the device cannot silently disagree about whether the
+        # cap was applied -- which they would present as a token mismatch, not as a config error.
+        "logit_softcap_disabled": bool(a.no_logit_softcap),
+        "logit_softcap_value": softcap,
         "prompt": a.prompt,
         "prompt_ids": prompt_ids,
         "gen_ids": gen_ids,
