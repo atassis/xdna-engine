@@ -135,7 +135,17 @@ class TestCheckPrefillProjections:
         QWEN3_0_6B.check_prefill_projections(256, ops, tile_n_overrides={"ctx": 16})
 
     def test_an_unsatisfiable_nout_names_no_working_tile(self):
-        """head_dim=128 at 16 columns: no multiple of 16 divides 128//16 = 8."""
+        """head_dim=64 at 8 columns: no multiple of 16 divides 64//8 = 8, so no ctx tiling exists.
+
+        Stated at a LEGAL column count. The earlier form of this test used cols=16, which the
+        column-domain rule now rejects first -- gemm/design.py takes --n-aie-cols from [1,2,4,8]
+        and npu2 has 8 columns, so 16 never reached the Nout arithmetic on hardware either.
+        """
+        with pytest.raises(ValueError) as exc:
+            QWEN3_0_6B.check_prefill_projections(256, (("ctx", 2048, 64),), cols=8)
+        assert "no tile_n multiple of 16 divides" in str(exc.value)
+
+    def test_an_illegal_column_count_is_named_as_such(self):
         with pytest.raises(ValueError) as exc:
             QWEN3_0_6B.check_prefill_projections(256, (("ctx", 2048, 128),), cols=16)
-        assert "no tile_n multiple of 16 divides" in str(exc.value)
+        assert "num_aie_columns=16" in str(exc.value)
