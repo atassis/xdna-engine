@@ -59,7 +59,8 @@ for pass in $(seq 1 "$PASSES"); do
   for arm in "${ARMS[@]}"; do
     t="$(tag_of "$arm")"
     echo "=== bench $t pass$pass ==="
-    ( set -a; IFS=','; for kv in $arm; do export "${kv?}"; done; set +a
+    ( IFS=',' read -ra KVS <<< "$arm"; set -a; for kv in "${KVS[@]}"; do export "${kv?}"; done; set +a
+      # shellcheck disable=SC2086  -- POS is a deliberate word list
       "$VENV/bin/python" "$REPO/designs/decode_fused/bench_llm_decode.py" --spec "$SPEC" \
         --weights "$REPO/artifacts/$SPEC/weights" --positions $POS --reps "$REPS" \
         --det-runs 5 --out-json "$OUT/bench-$t-p$pass.json" ) || echo "[gate] bench $t FAILED"
@@ -70,7 +71,7 @@ done
 for arm in "${ARMS[@]}"; do
   t="$(tag_of "$arm")"
   echo "=== ppl $t ==="
-  ( set -a; IFS=','; for kv in $arm; do export "${kv?}"; done; set +a
+  ( IFS=',' read -ra KVS <<< "$arm"; set -a; for kv in "${KVS[@]}"; do export "${kv?}"; done; set +a
     bash "$REPO/scripts/run_llm_perplexity.sh" "$SPEC" "$CORPUS" "$OUT/ppl-$t" "$TOK" ) \
     || echo "[gate] ppl $t FAILED"
 done
