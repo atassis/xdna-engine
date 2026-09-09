@@ -391,7 +391,13 @@ def main():
                           f"off {_off:>13,} ({_off/2**30:7.3f} GiB)"
                           f"{'  <-- UNWRITTEN' if _r == 0.0 else ''}", file=sys.stderr)
                     break
-        if head_c is not None:
+        # EXPLICIT FLAG WINS. --host-lm-head is the substitution arm that localises a fault to the
+        # lm-head, and SPLIT_LM_HEAD is a build default -- so an `elif` here silently ignored the
+        # flag whenever the head had been split out, which is exactly the configuration you want to
+        # bisect at depth. Measured 2026-09-10: a full-depth diagnostic run reported the device
+        # head's output while claiming to be the host arm, and the two were indistinguishable
+        # because they were the same path.
+        if head_c is not None and not a.host_lm_head:
             # stack -> xf (a declared OUTPUT, so it is synced), then the head graph -> logits.
             _xf = np.asarray(stack[-1]["outlet"].data, BF16)
             if pos == 0:
