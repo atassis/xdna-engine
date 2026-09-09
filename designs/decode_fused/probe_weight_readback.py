@@ -1,0 +1,98 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+"""Read every weight buffer BACK off the device and compare it to what the host wrote.
+
+The 6-layer bisect leaves `xf` clean at 2.79e-02 -- indistinguishable from the 5-layer arm that
+passes -- and then reports logits at 1.49e+01. A correct hidden state feeding a wrong lm-head means
+the fault is not in the arithmetic the bisect walks; the candidate left is the ARENA, where a
+buffer sized for one geometry can be overlapped by one sized for another.
+
+This does not run the graph. It writes the weights, flushes, reads them straight back and diffs.
+Anything that comes back different was overlapped by another buffer, and the name says by which
+region.
+"""
+import argparse, os, sys
+import numpy as np
+import ml_dtypes
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import newstack_compat  # noqa: F401,E402
+from gen_llm_decode import build_graph, load_weight_buffer  # noqa: E402
+
+BF16 = ml_dtypes.bfloat16
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--spec", required=True)
+    ap.add_argument("--weights", required=True)
+    ap.add_argument("--layers", type=int, default=None)
+    a = ap.parse_args()
+
+    sp, fused, weights, md = build_graph(a.spec, a.weights, a.layers, 2048)
+    c = fused.get_callable()
+    for n, arr in weights.items():
+        with c.get_buffer(n).overwrite() as buf:
+            buf[:] = np.asarray(arr, BF16).reshape(-1)
+    c.scratch_buffer.device = "cpu"
+    c.scratch_buffer.to("npu")
+
+    # Run the graph once at pos 0, then look at the logits ELEMENT-WISE. The bisect says xf is
+    # clean and logits is not, and the weights survive a write/flush/read, so the remaining
+    # candidate is a buffer written DURING the dispatch landing on the output region. Where the
+    # vector stops agreeing names that region's boundary.
+    D = sp.d_model
+    # One ROW is all this needs; mmap so the 3.75 GiB table is never resident (see the same
+    # idiom and its OOM history in gen_llm_decode.py::npy).
+    embed = np.load(os.path.join(a.weights, f"{sp.weight_prefix}embed_tokens.weight.npy"),
+                    mmap_mode="r")
+    scale = np.sqrt(D) if sp.embed_scale == "sqrt_d_model" else 1.0
+    with c.get_buffer("x").overwrite() as buf:
+        buf[:] = np.asarray(embed[785].astype(np.float32) * scale, BF16).reshape(-1)
+    for ang in ("rope_global", "rope_local"):
+        if ang in md["inputs"]:
+            with c.get_buffer(ang).overwrite() as buf:
+                row = np.zeros(buf.size, np.float32); row[0::2] = 1.0
+                buf[:] = np.asarray(row, BF16)
+    for slot_name, _ in md["kv_slots"]:
+        c.params.write(slot_name, 0)
+    c.params.write("sm_mask", 1)
+    c.params.sync()
+    c()
+    lg = np.asarray(c.get_buffer("logits").data, BF16).astype(np.float32)
+    print(f"\nlogits buffer: {lg.size} elements, "
+          f"finite {int(np.isfinite(lg).sum())}, zeros {int((lg == 0).sum())}, "
+          f"|max| {float(np.abs(lg[np.isfinite(lg)]).max()):.6g}")
+    V = int(sp.vocab)
+    for lo, hi in [(0, 1024), (V//4, V//4+1024), (V//2, V//2+1024), (3*V//4, 3*V//4+1024), (V-1024, V)]:
+        seg = lg[lo:hi]
+        print(f"  [{lo:7}:{hi:7}] |max| {float(np.abs(seg).max()):12.6g}  "
+              f"mean|.| {float(np.abs(seg).mean()):12.6g}  zeros {int((seg==0).sum()):5}")
+    big = np.flatnonzero(np.abs(lg) > 1e3)
+    print(f"  elements with |logit| > 1e3: {big.size}"
+          + (f", first at {int(big[0])}, last at {int(big[-1])}" if big.size else ""))
+    print(f"  device argmax {int(np.argmax(lg))}")
+    if big.size:
+        print(f"  outlier indices: {big.tolist()}")
+        d = np.diff(big)
+        print(f"  gaps between them: {d.tolist()}")
+        print(f"  idx % 8   : {(big % 8).tolist()}")
+        print(f"  idx % 64  : {sorted(set((big % 64).tolist()))}")
+        print(f"  idx // 32768 (per-column block): {sorted(set((big // 32768).tolist()))}")
+
+    bad = 0
+    for n, arr in weights.items():
+        want = np.asarray(arr, BF16).reshape(-1)
+        got = np.asarray(c.get_buffer(n).data, BF16).reshape(-1)[:want.size]
+        if not np.array_equal(np.asarray(want, np.float32), np.asarray(got, np.float32)):
+            d = np.asarray(want, np.float32) - np.asarray(got, np.float32)
+            nz = int(np.count_nonzero(d))
+            print(f"CORRUPT {n:40} {nz}/{want.size} elements differ, "
+                  f"first at {int(np.flatnonzero(d)[0])}, max|d| {float(np.abs(d).max()):.4g}")
+            bad += 1
+    print(f"\n{bad} of {len(weights)} weight buffers came back different after a write+flush+read")
+    return 1 if bad else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
