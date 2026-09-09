@@ -646,6 +646,13 @@ def check_arena_offsets_are_addressable(seq, names):
             bad.append((n, arena, off, ln))
     if not bad:
         return
+    if os.environ.get("ALLOW_UNADDRESSABLE_OFFSETS") == "1":
+        # Escape hatch for testing a TOOLCHAIN that no longer has the I32 cap. The guard encodes an
+        # mlir-aie limitation, not a hardware one, so a build against a fixed aie-translate must be
+        # able to get past it -- otherwise the guard would prevent proving its own obsolescence.
+        print(f"[gen] {len(bad)} buffer(s) past 4 GiB, allowed by ALLOW_UNADDRESSABLE_OFFSETS=1 "
+              f"(first {bad[0][0]!r} at {bad[0][2]:,})")
+        return
     bad.sort(key=lambda b: b[2])
     first = bad[0]
     raise ValueError(
