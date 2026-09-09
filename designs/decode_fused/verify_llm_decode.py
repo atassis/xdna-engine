@@ -94,6 +94,15 @@ def main():
     ap.add_argument("--max-seq", type=int, default=2048)
     ap.add_argument("--steps", type=int, default=None, help="free-running tokens to compare")
     ap.add_argument("--dump-logits", default=None, help="write step-0 logits to this .npy for offline compare")
+    ap.add_argument("--host-lm-head", action="store_true",
+                    help="compute the logits on the HOST from the device's own `xf`, instead of "
+                         "reading the on-device lm-head output. `xf` is verified correct at every "
+                         "depth (the per-node bisect puts it at 2.79e-02 at 6 layers, the same as "
+                         "the 5-layer arm that passes) while the on-device lm-head output is not: "
+                         "it comes back with whole runs unwritten and a few elements wildly wrong, "
+                         "in specific column blocks, from 6 layers up. This isolates that defect "
+                         "so the REST of the model can be gated, and is slow -- a 262144x3840 "
+                         "matvec per token -- so it is a diagnostic, not a shipping path.")
     ap.add_argument("--emit-topk", default=None,
                     help="TIER 2 capture: write this run's per-step top-K token ids and logits to "
                          "a JSON for scripts/gate_token_set.py. With this set the script CAPTURES "
@@ -207,6 +216,10 @@ def main():
 
     fed = list(prompt_ids)
     produced = []
+    # mmap, never np.load: this is the 262144x3840 f32 table, 3.75 GiB, and astype copies even when
+    # the dtype already matches (see gen_llm_decode.py::npy for what that cost).
+    head_w = (np.load(os.path.join(a.weights, f"{sp.weight_prefix}embed_tokens.weight.npy"),
+                      mmap_mode="r") if a.host_lm_head else None)
     topk_ids, topk_logits = [], []
     # Per produced step: (device top-1 logit, logit the device gave the ORACLE's token).
     # This is what classifies a mismatch. The oracle's stored `margins` describe a DIFFERENT
@@ -239,7 +252,23 @@ def main():
         # source now (iron/common/sequence.py forces host residency, mirroring _sync_outputs), so
         # a second dispatch would only double the cost and mask a regression in the real fix.
         c()
-        lg = np.asarray(out.data[:VOCAB], dtype=np.float32)
+        if a.host_lm_head:
+            # `xf` lives in the SCRATCH arena, and the device is non-coherent: the host's copy is
+            # whatever was last written from this side unless it is pulled back. The output arena is
+            # synced for us, scratch is not -- which is why this read returned all zeros at 12
+            # layers while working at 6, a depth-dependent lie rather than a model result.
+            c.scratch_buffer.device = "npu"
+            c.scratch_buffer.to("cpu")
+            xf = np.asarray(c.get_buffer("xf").data, dtype=np.float32)
+            if pos == 0:
+                print(f"[host-lm-head] xf: size={xf.size} nonzero={int((xf!=0).sum())} "
+                      f"norm={float(np.linalg.norm(xf)):.6g}", file=sys.stderr)
+            lg = np.empty(VOCAB, np.float32)
+            for lo in range(0, VOCAB, 16384):
+                hi = min(lo + 16384, VOCAB)
+                lg[lo:hi] = np.asarray(head_w[lo:hi], np.float32) @ xf
+        else:
+            lg = np.asarray(out.data[:VOCAB], dtype=np.float32)
         # final_logit_softcapping, the same transform rust/npu-engine applies after readback. It
         # changes the ARGMAX (tanh saturates), so a harness that skips it does not gate the model
         # the engine runs.
