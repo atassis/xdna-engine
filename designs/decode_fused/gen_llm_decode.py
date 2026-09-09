@@ -1086,6 +1086,31 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
                 rpc //= 2
             if rpc != TMV_RPC:
                 print(f"[gen] TMatVec rows_per_chunk {TMV_RPC} -> {rpc} (L1 fit at head_dim={hd})")
+            # RAISE HERE, NAMING THE FLAG, rather than letting the operator raise two frames down.
+            # rpc bottoms out at 1 and the shape can still not fit: Gemma-4's global layers are the
+            # case, where C = 2*gqa*hd*2 and acc = gqa*hd*4 are 32768 B each at gqa 16, hd 512 and
+            # fill L1 between them with W at zero -- neither depends on rows_per_chunk or on S, so
+            # the loop above cannot help and shrinking max_seq cannot either.
+            #
+            # NOT auto-falling-back to op_trv, though that path exists and is correct. The decline
+            # would be PER GEOMETRY while sequence_name() reads the GLOBAL TMV_CTX, so a Gemma-4
+            # build would emit a mixed graph -- global layers on op_trv, sliding layers on TMatVec
+            # -- under a name claiming TMV_CTX throughout, and collide in the build cache with a
+            # design that is genuinely all-TMatVec. An artifact whose name does not describe it is
+            # worse than a build error.
+            #
+            # Cost of not naming the flag, measured 2026-09-09: a session lost a full build to
+            # `TMatVec does not fit L1` on a model whose recorded working config sets TMV_CTX=0,
+            # with nothing connecting the two. The reproduction flags lived in the task, not here.
+            msg = check_l1_fits(hd, S, gqa, rpc)
+            if msg is not None:
+                raise SystemExit(
+                    f"[gen] TMV_CTX=1 cannot serve this geometry (head_dim={hd}, S={S}, "
+                    f"batch_group={gqa}): {msg}\n"
+                    f"[gen] Set TMV_CTX=0. That selects the op_trv context path, which is correct "
+                    f"here and is the config this model's artifacts were built with; it is slower "
+                    f"(TMV_CTX was worth ~1.25x in the 2026-09-07 four-arm A/B), which is why this "
+                    f"is your decision and not a silent fallback.")
             op_ctx = TMatVec(M=hd, K=S, num_aie_columns=hkv, num_batches=Hq, batch_group=gqa,
                              rows_per_chunk=rpc, context=ctx)
         else:
