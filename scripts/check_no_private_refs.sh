@@ -58,20 +58,32 @@ allow='^(scripts/check_no_private_refs\.sh|scripts/private_ref_patterns\.sh|hook
 
 cd "$(git rev-parse --show-toplevel)"
 
+# --rev <committish>: scan THAT TREE instead of the working tree, and drop --untracked
+# (a commit has no untracked files). This is what the pre-push tree guard wants: the
+# question there is "does the tree I am PUSHING carry a private reference", and answering
+# it from the working tree makes one session's UNSAVED edit block another session's push
+# of unrelated commits. Measured 2026-09-09: two pushes were refused because a concurrent
+# session had an uncommitted `[[slug]]` in gen_llm_decode.py, while the pushed tree was
+# clean. The working-tree default stays for every other caller -- catching a brand-new
+# unstaged file is exactly why --untracked is load-bearing above.
+REV=""
+if [ "${1:-}" = "--rev" ]; then REV="${2:?--rev needs a committish}"; shift 2; fi
+if [ -n "$REV" ]; then SCAN=("$REV"); UNTRACKED=(); else SCAN=(); UNTRACKED=(--untracked); fi
+
 if [ "$#" -gt 0 ]; then
   files=()
   for f in "$@"; do [[ "$f" =~ $allow ]] || files+=("$f"); done
   [ "${#files[@]}" -eq 0 ] && exit 0
-  hits="$(git grep --untracked -nIEi "$regex" -- "${files[@]}" 2>/dev/null || true)"
-  wiki_hits="$(git grep --untracked -nIE "$wikilink_re" -- "${files[@]}" 2>/dev/null | grep -viE "$benign_wikilink_re" || true)"
+  hits="$(git grep "${UNTRACKED[@]}" -nIEi "$regex" "${SCAN[@]}" -- "${files[@]}" 2>/dev/null || true)"
+  wiki_hits="$(git grep "${UNTRACKED[@]}" -nIE "$wikilink_re" "${SCAN[@]}" -- "${files[@]}" 2>/dev/null | grep -viE "$benign_wikilink_re" || true)"
 else
   # whole tree, minus the allowed guard files and rust/Cargo.lock, whose generated
   # `[[package]]` headers have the wikilink shape. Exclude that ONE path, never *.lock:
   # toolchain.lock is prose and cites the KB.
-  hits="$(git grep --untracked -nIEi "$regex" -- . ':!rust/Cargo.lock' \
+  hits="$(git grep "${UNTRACKED[@]}" -nIEi "$regex" "${SCAN[@]}" -- . ':!rust/Cargo.lock' \
             ':!scripts/check_no_private_refs.sh' ':!scripts/private_ref_patterns.sh' \
             ':!hooks/pre-push' ':!hooks/pre-push-fork' ':!.githooks-install.md' ':!.gitignore' 2>/dev/null || true)"
-  wiki_hits="$(git grep --untracked -nIE "$wikilink_re" -- . ':!rust/Cargo.lock' \
+  wiki_hits="$(git grep "${UNTRACKED[@]}" -nIE "$wikilink_re" "${SCAN[@]}" -- . ':!rust/Cargo.lock' \
             ':!scripts/check_no_private_refs.sh' ':!scripts/private_ref_patterns.sh' \
             ':!hooks/pre-push' ':!hooks/pre-push-fork' ':!.githooks-install.md' ':!.gitignore' 2>/dev/null | grep -viE "$benign_wikilink_re" || true)"
 fi

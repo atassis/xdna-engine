@@ -6,8 +6,10 @@ Z=0000000000000000000000000000000000000000
 forbidden_paths='^(journal/|strategy/|internal/|docs/(handoffs|tasks|log|kb|reference|superpowers|archive|research)/|\.claude/|STARTER_PROMPT)'
 forbidden_text='/home/[a-z]|autonomous session|two-Sonnet|atassis\.ru|100\.64\.|-----BEGIN [A-Z ]*PRIVATE KEY-----'
 fail=0
+pushed_tips=()
 while read -r local_ref local_sha remote_ref remote_sha; do
   [ "$local_sha" = "$Z" ] && continue
+  pushed_tips+=("$local_sha")
   if [ "$remote_sha" = "$Z" ]; then
     revs=$(git rev-list "$local_sha" --not --remotes)
   else
@@ -40,10 +42,19 @@ done
 # Content-level guard: no public file may LINK to private material (private repo name,
 # private-KB paths, private tooling, or a local dev-workspace path). Whole-tree scan of
 # the tip being pushed; pattern list lives in the scanner (single source of truth).
+#
+# `--rev "$tip"` scans THAT COMMIT, which is what this comment always claimed and what the
+# guard should mean. It used to scan the WORKING TREE, so an uncommitted edit -- including
+# one made by a different session sharing this checkout -- blocked a push of unrelated
+# commits. Measured 2026-09-09: two pushes refused over a concurrent session's unsaved
+# `[[slug]]`, with the pushed tree clean. The scanner's working-tree default is unchanged
+# for every other caller; only this guard pins itself to the commit.
 if [ -x scripts/check_no_private_refs.sh ]; then
-  if ! scripts/check_no_private_refs.sh >&2; then
-    echo "BLOCKED: the tree contains a reference to private material (see above)"; fail=1
-  fi
+  for tip in "${pushed_tips[@]}"; do
+    if ! scripts/check_no_private_refs.sh --rev "$tip" >&2; then
+      echo "BLOCKED: ${tip:0:12} contains a reference to private material (see above)"; fail=1
+    fi
+  done
 fi
 if [ "$fail" -ne 0 ]; then
   echo "pre-push guard refused the push. Do NOT use --no-verify unless you are certain." >&2
