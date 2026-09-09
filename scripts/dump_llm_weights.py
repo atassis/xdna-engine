@@ -27,7 +27,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 "..", "designs", "decode_fused"))
-from llm_decode_spec import SPECS  # noqa: E402
+from llm_decode_spec import SPECS, k_chunks_for  # noqa: E402
 
 HF_REPO = {"qwen3-0.6b": "Qwen/Qwen3-0.6B", "gemma3-270m": "unsloth/gemma-3-270m-it",
            "gemma4-12b": "unsloth/gemma-4-12b-it"}
@@ -47,6 +47,10 @@ def main():
                     help="pack the PROJECTION matrices at this width (norms and the embedding stay "
                          "f32 and readable). bf16 writes the plain f32 dump.")
     ap.add_argument("--quant-group", type=int, default=64)
+    ap.add_argument("--cols", type=int, default=8,
+                    help="num_aie_columns the CONSUMER will build with. Only used to decide which "
+                         "packed tensors must be pre-chunked over K, via the same k_chunks_for the "
+                         "generator calls -- a mismatch here silently produces chunks it cannot read.")
     # Default: exactly the leaves gen_llm_decode.py can CONSUME packed today -- the MLP class
     # (QUANT_MLP_DTYPE) and Wo (QUANT_ATTN_DTYPE). q/k/v are excluded because their GEMVs are built
     # without quant kwargs (`gemv(QD, D, ctx)`, and the concatenated Wqkv likewise), so a packed
@@ -142,6 +146,27 @@ def main():
         # Shapes are checked ABOVE, on the f32 array, before any packing -- a packed tensor is a
         # flat byte run and has no shape left to check.
         if quantize_weight is not None and leaf in quant_leaves:
+            # PRE-CHUNK before packing when the generator will split this tensor over K.
+            # A packed tensor is a flat byte run with no axis left to slice, so a K-split
+            # CANNOT happen after quantizing -- it would cut through a quantization group and
+            # renumber the payload. The generator says so and reads `<tensor>.kchunkN` when
+            # they exist (gen_llm_decode.py: "Splitting AFTER packing would cut through a
+            # group"), falling back to splitting an UNPACKED tensor itself. Without these it
+            # cannot consume a packed down_proj at all: np.split on the flat run dies with
+            # "object of type 'int' has no len()".
+            #
+            # The chunk count must match the generator's exactly or the bytes are silently
+            # wrong, so it comes from the same k_chunks_for the generator uses, on the same
+            # (D, K, cols) -- never a second copy of the arithmetic.
+            nch = k_chunks_for(D_, w.shape[1], a.cols) if w.ndim == 2 else 1
+            if nch > 1:
+                for i, part in enumerate(np.split(w, nch, axis=1)):
+                    name = f"{key}.kchunk{i}"
+                    np.save(os.path.join(a.out, f"{name}.npy"),
+                            quantize_weight(np.ascontiguousarray(part), a.quant_group, a.quant))
+                    packed.append(name)
+                n += nch - 1
+                continue
             np.save(os.path.join(a.out, f"{key}.npy"),
                     quantize_weight(w, a.quant_group, a.quant))
             packed.append(key)
