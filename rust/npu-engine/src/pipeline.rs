@@ -4,6 +4,7 @@
 use ndarray::Array2;
 
 use crate::api::EngineError;
+use crate::telemetry::{GenerationReport, StepRecord};
 
 /// The genuinely-shared, genuinely-hard NPU stage. INTERFACE CONTRACT for sibling models
 /// (GigaAM Conformer, Parakeet FastConformer, BERT): implement this and the registry can host it.
@@ -252,7 +253,7 @@ impl FinishReason {
 }
 
 /// Token accounting, OpenAI's `usage` object.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GenerateUsage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
@@ -265,8 +266,19 @@ pub enum Chunk<'a> {
     /// appends to a String never allocates per token. May be empty: a multi-byte UTF-8 codepoint
     /// split across BPE tokens produces nothing until it completes.
     Text(&'a str),
+    /// What the token just produced cost. Emitted once per DECODED TOKEN, immediately after the
+    /// `Text` it produced -- which is NOT once per `Text`: a token that completes no codepoint
+    /// emits no text at all, and a stop-sequence flush emits text with no token behind it. A
+    /// consumer that wants one record per token must read this and not count `Text` frames.
+    ///
+    /// `emit` inside the record repeats the text the preceding `Text` carried, borrowed from the
+    /// same buffer rather than cloned, so a consumer can render frames from `Step` alone.
+    Step(&'a StepRecord),
     /// Terminal. Emitted exactly once, after the last `Text`.
-    Done { reason: FinishReason, usage: GenerateUsage },
+    ///
+    /// `usage` stays a field of its own rather than being read out of `report`: it is the OpenAI
+    /// contract and every caller needs it, while the report is for callers that want the timeline.
+    Done { reason: FinishReason, usage: GenerateUsage, report: &'a GenerationReport },
 }
 
 /// An autoregressive text model. ONE method serves both the streaming and the buffered surface --
@@ -305,7 +317,8 @@ pub trait TextGenerator {
         self.generate(prompt, params, &mut |c| {
             match c {
                 Chunk::Text(t) => out.push_str(t),
-                Chunk::Done { reason, usage: u } => {
+                Chunk::Step(_) => {}
+                Chunk::Done { reason, usage: u, .. } => {
                     fin = reason;
                     usage = u;
                 }

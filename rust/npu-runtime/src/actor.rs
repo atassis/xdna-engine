@@ -91,6 +91,10 @@ enum Cmd {
         params: GenerateParams,
         tx: SyncSender<StreamItem>,
         ack: Sender<Result<String, EngineError>>,
+        /// Stamped by the caller, read by the actor: the gap is the request's queue wait. One
+        /// thread owns the device, so a second request waits out the first one's whole generation
+        /// -- a real cost, and until now an invisible one that showed up inside TTFT with no name.
+        enqueued: Instant,
     },
     Reconcile { cfg: Box<Config>, reply: Sender<ReconcileReport> },
     /// Make a model resident because an operator asked. NEVER evicts: at `max_resident` this fails
@@ -134,6 +138,9 @@ pub fn start_lazy(cfg: Config, loader: Box<dyn ModelLoader + Send>) -> Result<(H
 fn spawn(cfg: Config, loader: Box<dyn ModelLoader + Send>, eager: bool) -> Result<(Handle, JoinHandle<()>), EngineError> {
     let (tx, rx) = channel::<Cmd>();
     let (ready_tx, ready_rx) = channel::<Result<(), String>>();
+    // Off the request path on purpose: it is a subprocess, and the first request must not pay for
+    // it. See `conditions::spawn_probe`.
+    crate::conditions::spawn_probe();
     let join = std::thread::spawn(move || {
         let mut reg = Registry::default();
         let mut cfg = cfg;
@@ -207,21 +214,52 @@ fn spawn(cfg: Config, loader: Box<dyn ModelLoader + Send>, eager: bool) -> Resul
                     };
                     let _ = reply.send(r);
                 }
-                Ok(Cmd::Generate { model, prompt, params, tx, ack }) => {
+                Ok(Cmd::Generate { model, prompt, params, tx, ack, enqueued }) => {
                     last_request = Instant::now(); released = false;
+                    let queue_us = enqueued.elapsed().as_micros() as u64;
+                    // Snapshot residency BEFORE resolving, so a cold first token can be told from a
+                    // warm one afterwards. Reading it back from the elapsed time would be an
+                    // inference wearing a measurement's clothes.
+                    let resident_before: Vec<String> = reg.entries.iter()
+                        .filter(|e| e.model.is_some()).map(|e| e.cfg.name.clone()).collect();
+                    let t_load = Instant::now();
                     let ready = guard(|| serve_ready(&cfg, &mut reg, loader.as_ref(),
                             Capability::GENERATE, model.as_deref()))
                         .unwrap_or_else(|msg| Err(EngineError::Device(msg)));
+                    let load_us = t_load.elapsed().as_micros() as u64;
                     match ready {
                         Err(e) => { let _ = ack.send(Err(e)); }
                         Ok(name) => {
                             // The ack reaches the caller before any chunk does, which is what lets
                             // `Handle::generate` answer routing errors before an SSE body ever opens.
                             if ack.send(Ok(name.clone())).is_ok() {
+                                let was_resident = resident_before.contains(&name);
+                                let conditions = npu_engine::RunConditions {
+                                    engine_version: env!("CARGO_PKG_VERSION").to_string(),
+                                    model: name.clone(),
+                                    power_mode: crate::conditions::power_mode(),
+                                    resident: Some(was_resident),
+                                    kernel: crate::conditions::kernel_release(),
+                                    started_unix: std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .map(|d| d.as_secs() as i64).unwrap_or(0),
+                                };
+                                let power_start_uw = crate::conditions::npu_power_uw();
                                 let mut sink = |c: Chunk<'_>| -> bool {
                                     let item = match c {
                                         Chunk::Text(t) => StreamItem::Text(t.to_string()),
-                                        Chunk::Done { reason, usage } => StreamItem::Done { reason, usage },
+                                        Chunk::Step(r) => StreamItem::Step(r.clone()),
+                                        Chunk::Done { reason, usage, report } => {
+                                            // The generator measured the generation; only this
+                                            // thread saw the queue, the load and the machine.
+                                            let mut report = report.clone();
+                                            report.conditions = conditions.clone();
+                                            report.queue_us = queue_us;
+                                            report.load_us = load_us;
+                                            report.npu_power_start_uw = power_start_uw;
+                                            report.npu_power_end_uw = crate::conditions::npu_power_uw();
+                                            StreamItem::Done { reason, usage, report: Box::new(report) }
+                                        }
                                     };
                                     // `Err` here means the receiver (the socket thread) is gone --
                                     // the client hung up. Returning `false` is the sink's documented
@@ -415,7 +453,8 @@ impl Handle {
         -> Result<Served<std::sync::mpsc::Receiver<StreamItem>>, EngineError> {
         let (tx, rx) = sync_channel(GENERATE_CHANNEL_CAP);
         let (ack_tx, ack_rx) = channel();
-        self.tx.send(Cmd::Generate { model: model.map(String::from), prompt, params, tx, ack: ack_tx })
+        self.tx.send(Cmd::Generate { model: model.map(String::from), prompt, params, tx,
+                                     ack: ack_tx, enqueued: Instant::now() })
             .map_err(|_| EngineError::Device("actor stopped".into()))?;
         let name = ack_rx.recv().map_err(|_| EngineError::Device("actor dropped reply".into()))??;
         Ok(Served { model: name, value: rx })

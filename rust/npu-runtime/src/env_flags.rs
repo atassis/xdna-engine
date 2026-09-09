@@ -94,7 +94,7 @@ pub const FLAGS: &[Flag] = &[
               position at or beyond n_past, so the per-request pass cost 224 MiB of host memset \
               plus an arena write (~60 ms/request at S=2048) and changed no output. Set =0 to \
               restore it when bisecting a suspected KV bug." },
-    Flag { name: "NPU_LLM_PREFILL_BATCHED", owner: "npu-engine", site: "npu-engine/src/llm/npu_prefill.rs:66",
+    Flag { name: "NPU_LLM_PREFILL_BATCHED", owner: "npu-engine", site: "npu-engine/src/llm/npu_prefill.rs:81",
         semantics: NotZero, default: "true",
         doc: "prime the KV cache over a prompt in batches of the prefill artifact's dims.M instead \
               of one dispatch per token. DEFAULT ON since 2026-09-09; =0 restores per-token \
@@ -181,19 +181,19 @@ pub const FLAGS: &[Flag] = &[
     Flag { name: "NPU_CONFIG", owner: "npu-cli", site: "npu-cli/src/main.rs:32",
         semantics: Value, default: "$HOME/.config/npu/engine.toml",
         doc: "overrides the engine.toml config path (also settable via --config)." },
-    Flag { name: "NPU_QUIET", owner: "npu-cli", site: "npu-cli/src/main.rs:89",
+    Flag { name: "NPU_QUIET", owner: "npu-cli", site: "npu-cli/src/main.rs:106",
         semantics: Presence, default: "n/a (checks ABSENCE, not presence)",
         doc: "DOCUMENTED FALSE LEAD, correct as written: quiet_one_shot() checks \
               var_os(..).is_none() -- \"did the caller express a preference at all\" -- and only \
               then sets NPU_QUIET=1 for one-shot commands. It does not itself gate the banners; \
               npu-xrt's NPU_QUIET (this table, owner npu-xrt) is the actual consumer." },
-    Flag { name: "XDNA_ENGINE_ROOT", owner: "npu-cli", site: "npu-cli/src/main.rs:112",
+    Flag { name: "XDNA_ENGINE_ROOT", owner: "npu-cli", site: "npu-cli/src/main.rs:129",
         semantics: Value, default: "derived (XDG_DATA_HOME, or cwd, checked for scenarios/)",
         doc: "explicit override for the repo root that scenario/artifact paths resolve against." },
-    Flag { name: "XDG_DATA_HOME", owner: "npu-cli", site: "npu-cli/src/main.rs:116",
+    Flag { name: "XDG_DATA_HOME", owner: "npu-cli", site: "npu-cli/src/main.rs:133",
         semantics: Value, default: "$HOME/.local/share",
         doc: "XDG data-home candidate for the install root when XDNA_ENGINE_ROOT is unset." },
-    Flag { name: "NPU_ASR_MAX_SPAN_S", owner: "npu-cli", site: "npu-cli/src/main.rs:438",
+    Flag { name: "NPU_ASR_MAX_SPAN_S", owner: "npu-cli", site: "npu-cli/src/main.rs:572",
         semantics: Value, default: "18.0",
         doc: "max transcription window span in seconds; span-granularity only now that both ASR \
               backends window internally (not re-measured against them)." },
@@ -426,6 +426,16 @@ pub const FLAGS: &[Flag] = &[
         doc: "phase-timing profiler (Npu/Host/Marshal buckets) for the encode path." },
 
     // -- npu-runtime ------------------------------------------------------------------------------
+    Flag { name: "NPU_TELEMETRY_LOG", owner: "npu-runtime", site: "npu-runtime/src/run_log.rs:26",
+        semantics: Value, default: "unset (no run logs)",
+        doc: "directory to write one JSONL run log per generation into, named by completion id \
+              (`chatcmpl-<hex>.jsonl`). Each line is a JSON object tagged by `object`: a header \
+              carrying the conditions, one OpenAI stream chunk per DECODED TOKEN with an `x_npu` \
+              block holding that token's timing, then the prefill record and a summary. Serves the \
+              case the per-request `stream_options.include_stats` opt-in cannot: the run you did \
+              not know you would need to explain, which you only learn about afterwards. Writing is \
+              best-effort and can never fail a request. Unbounded -- one file per generation, not \
+              rotated, so point it somewhere you are willing to clean up." },
     Flag { name: "FFMPEG", owner: "npu-runtime", site: "npu-runtime/src/media.rs:18",
         semantics: Value, default: "\"ffmpeg\"",
         doc: "ffmpeg binary override, for a box where it is not on PATH." },
@@ -484,7 +494,7 @@ pub const FLAGS: &[Flag] = &[
     Flag { name: "NPU_DISPATCH_LOG", owner: "npu-xrt", site: "npu-xrt/src/lib.rs:121",
         semantics: NotZero, default: "false",
         doc: "logs per-(xclbin, insts) dispatch blocking time and hw_context-transition counts." },
-    Flag { name: "NPU_XCLBIN_CACHE_BY_CONTENT", owner: "npu-xrt", site: "npu-xrt/src/lib.rs:604",
+    Flag { name: "NPU_XCLBIN_CACHE_BY_CONTENT", owner: "npu-xrt", site: "npu-xrt/src/lib.rs:615",
         semantics: NotZero, default: "false",
         doc: "keys the hw_context cache on the xclbin's CONTENT hash instead of its path; a \
               diagnostic for finding a duplicate-path load, not the cure (the cure is one path)." },

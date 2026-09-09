@@ -12,6 +12,7 @@ use crate::config::Config;
 use crate::config_doc::ConfigDoc;
 use crate::registry::{LoadState, ModelStatus};
 use crate::stream::StreamItem;
+use npu_engine::telemetry::wire;
 use npu_engine::capability::{Capability, Request as EngineReq, Response as EngineResp};
 use npu_engine::FinishReason;
 
@@ -77,12 +78,26 @@ pub struct SseStream {
     created: i64,
     model: String,
     kind: SseKind,
+    /// Render frames from the per-token records instead of the plain text items, and close with a
+    /// summary frame. Off, the stream is byte-for-byte what it was before telemetry existed.
+    stats: bool,
 }
 
 impl SseStream {
-    fn new(rx: std::sync::mpsc::Receiver<StreamItem>, model: String, kind: SseKind) -> SseStream {
+    fn new(rx: std::sync::mpsc::Receiver<StreamItem>, model: String, kind: SseKind, stats: bool) -> SseStream {
         let prefix = match kind { SseKind::Chat => "chatcmpl", SseKind::Completion => "cmpl" };
-        SseStream { rx, id: gen_id(prefix), created: unix_now(), model, kind }
+        SseStream { rx, id: gen_id(prefix), created: unix_now(), model, kind, stats }
+    }
+
+    /// The identity every rendered line shares, so the SSE frames and the run log cannot disagree
+    /// about which run they describe.
+    fn meta(&self) -> wire::RunMeta {
+        wire::RunMeta {
+            id: self.id.clone(),
+            created: self.created,
+            model: self.model.clone(),
+            chat: matches!(self.kind, SseKind::Chat),
+        }
     }
     /// The chat-only preamble: OpenAI announces the role before any content, in its own chunk.
     fn render_role(&self) -> String {
@@ -232,7 +247,7 @@ fn chat_completions(req: &Request, handle: &Handle) -> Response {
         Err(e) => return engine_err(&e),
     };
     if parsed.stream {
-        (200, Body::Stream(SseStream::new(served.value, served.model, SseKind::Chat)))
+        (200, Body::Stream(SseStream::new(served.value, served.model, SseKind::Chat, parsed.stats)))
     } else {
         render_buffered(served.model, served.value, SseKind::Chat)
     }
@@ -250,7 +265,7 @@ fn completions(req: &Request, handle: &Handle) -> Response {
         Err(e) => return engine_err(&e),
     };
     if parsed.stream {
-        (200, Body::Stream(SseStream::new(served.value, served.model, SseKind::Completion)))
+        (200, Body::Stream(SseStream::new(served.value, served.model, SseKind::Completion, parsed.stats)))
     } else {
         render_buffered(served.model, served.value, SseKind::Completion)
     }
@@ -259,12 +274,26 @@ fn completions(req: &Request, handle: &Handle) -> Response {
 /// Drain a generation to completion and render the OpenAI non-streaming shape. Draining fully
 /// (rather than stopping at the first error) is deliberate: the actor side always sends exactly one
 /// terminal item (`Done` or `Error`), so this loop always terminates.
+///
+/// The measurement objects are UNCONDITIONAL here, the way llama-server's `timings` is. There is no
+/// bandwidth argument against them on a buffered response -- they are a few hundred bytes once --
+/// and a client that did not ask for them ignores two unknown keys. The streaming path is where the
+/// opt-in lives, because there the cost is per token.
 fn render_buffered(model: String, rx: std::sync::mpsc::Receiver<StreamItem>, kind: SseKind) -> Response {
+    let chat = matches!(kind, SseKind::Chat);
+    let id = gen_id(if chat { "chatcmpl" } else { "cmpl" });
+    let created = unix_now();
+    let meta = wire::RunMeta { id: id.clone(), created, model: model.clone(), chat };
+    let mut log = crate::run_log::RunLog::open(&id);
+    if let Some(l) = log.as_mut() { l.header(&meta); }
     let mut text = String::new();
-    let (reason, usage) = loop {
+    let (reason, report) = loop {
         match rx.recv() {
             Ok(StreamItem::Text(t)) => text.push_str(&t),
-            Ok(StreamItem::Done { reason, usage }) => break (reason, usage),
+            Ok(StreamItem::Step(r)) => {
+                if let Some(l) = log.as_mut() { l.line(&wire::chunk_line(&r, &meta)); }
+            }
+            Ok(StreamItem::Done { reason, report, .. }) => break (reason, report),
             // Classified, not blanket-500: a prompt that does not fit the context window is the
             // caller's to fix, and `engine_err` already knows that `Unsupported` is a 400.
             Ok(StreamItem::Error(e)) => return engine_err(&e),
@@ -272,23 +301,13 @@ fn render_buffered(model: String, rx: std::sync::mpsc::Receiver<StreamItem>, kin
                 return (500, "{\"error\":\"generation ended without a result\"}".into()),
         }
     };
-    let id = gen_id(match kind { SseKind::Chat => "chatcmpl", SseKind::Completion => "cmpl" });
-    let created = unix_now();
-    let total = usage.prompt_tokens + usage.completion_tokens;
-    let usage_json = format!("\"usage\":{{\"prompt_tokens\":{},\"completion_tokens\":{},\"total_tokens\":{total}}}",
-        usage.prompt_tokens, usage.completion_tokens);
-    let body = match kind {
-        SseKind::Chat => format!(
-            "{{\"id\":\"{id}\",\"object\":\"chat.completion\",\"created\":{created},\"model\":\"{}\",\
-             \"choices\":[{{\"index\":0,\"message\":{{\"role\":\"assistant\",\"content\":\"{}\"}},\
-             \"finish_reason\":\"{}\"}}],{usage_json}}}",
-            parse::json_escape(&model), parse::json_escape(&text), reason.as_str()),
-        SseKind::Completion => format!(
-            "{{\"id\":\"{id}\",\"object\":\"text_completion\",\"created\":{created},\"model\":\"{}\",\
-             \"choices\":[{{\"index\":0,\"text\":\"{}\",\"finish_reason\":\"{}\"}}],{usage_json}}}",
-            parse::json_escape(&model), parse::json_escape(&text), reason.as_str()),
-    };
-    (200, body.into())
+    if let Some(l) = log.as_mut() {
+        // Prefill lands after the token lines because its record only reaches this layer with the
+        // terminal item. The reader dispatches on `object` and does not care about line order.
+        l.line(&wire::prefill_line(&report.prefill, &meta));
+        l.line(&wire::summary_line(&report, &meta, reason));
+    }
+    (200, wire::completion_object(&text, reason, &report, &meta).to_string().into())
 }
 
 /// OpenAI speech synthesis. Serves `Capability::TTS` and returns audio bytes, not JSON.
@@ -605,10 +624,40 @@ fn respond_stream(stream: &mut TcpStream, code: u16, s: &SseStream) -> std::io::
     if matches!(s.kind, SseKind::Chat) {
         stream.write_all(format!("data: {}\n\n", s.render_role()).as_bytes())?;
     }
+    let meta = s.meta();
+    let mut log = crate::run_log::RunLog::open(&s.id);
+    if let Some(l) = log.as_mut() { l.header(&meta); }
     for item in s.rx.iter() {
+        // Exactly one of `Text` and `Step` drives the frames, never both: a record's `emit` is the
+        // same bytes the text item carries, so the stream reads identically either way. With stats
+        // off this is byte-for-byte the stream that existed before telemetry.
         let frame = match item {
-            StreamItem::Text(t) => s.render_text(&t),
-            StreamItem::Done { reason, .. } => s.render_done(reason),
+            StreamItem::Text(t) => {
+                if s.stats { continue }
+                s.render_text(&t)
+            }
+            StreamItem::Step(r) => {
+                if log.is_none() && !s.stats { continue }
+                // Rendered once and used for both destinations: the log and the wire must carry
+                // the same bytes, and rendering twice is how they stop doing that.
+                let line = wire::chunk_line(&r, &meta);
+                if let Some(l) = log.as_mut() { l.line(&line); }
+                if !s.stats { continue }
+                line.to_string()
+            }
+            StreamItem::Done { reason, report, .. } => {
+                if let Some(l) = log.as_mut() {
+                    l.line(&wire::prefill_line(&report.prefill, &meta));
+                    l.line(&wire::summary_line(&report, &meta, reason));
+                }
+                // The finish frame first, so a client that stops at `finish_reason` still sees the
+                // stream end where it always did; the summary is an extra frame after it, and only
+                // for a caller that asked -- OpenAI gates its own trailing usage chunk the same way,
+                // because a strict client is entitled to be surprised by an unknown `object`.
+                stream.write_all(format!("data: {}\n\n", s.render_done(reason)).as_bytes())?;
+                if !s.stats { continue }
+                wire::summary_line(&report, &meta, reason).to_string()
+            }
             StreamItem::Error(e) => s.render_error(&e.to_string()),
         };
         stream.write_all(format!("data: {frame}\n\n").as_bytes())?;
@@ -737,6 +786,20 @@ pub mod parse {
         pub prompt: npu_engine::Prompt,
         pub params: npu_engine::GenerateParams,
         pub stream: bool,
+        /// Per-token measurement in the stream. Opt-in, not because measuring is expensive -- the
+        /// records exist either way -- but because it is 173 bytes per token on the wire (measured
+        /// 2026-09-09 over a 64-token qwen3-0.6b completion: 354 B/token with it, 182 without), and a
+        /// client that did not ask for them should not pay to carry them.
+        pub stats: bool,
+    }
+
+    /// `stream_options: {"include_stats": true}`, spelled after OpenAI's own `include_usage` so it
+    /// sits where a caller already looks, with a top-level `x_npu_stats` as the curl-friendly
+    /// shorthand.
+    pub fn wants_stats(v: &serde_json::Value) -> bool {
+        v.get("stream_options").and_then(|o| o.get("include_stats")).and_then(|b| b.as_bool())
+            .or_else(|| v.get("x_npu_stats").and_then(|b| b.as_bool()))
+            .unwrap_or(false)
     }
 
     /// `/v1/chat/completions`: the full `messages` array (system prompt + history, not just the last
@@ -759,7 +822,8 @@ pub mod parse {
         let params = parse_generate_params(&v)?;
         let stream = v.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
         reject_unsupported(&v, false)?;
-        Ok(ParsedGenerate { model, prompt: npu_engine::Prompt::Chat(chat), params, stream })
+        Ok(ParsedGenerate { model, prompt: npu_engine::Prompt::Chat(chat), params, stream,
+                            stats: wants_stats(&v) })
     }
 
     /// A message's `content`: a plain string, or OpenAI's multi-part array form when every part is
@@ -801,7 +865,8 @@ pub mod parse {
         let params = parse_generate_params(&v)?;
         let stream = v.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
         reject_unsupported(&v, true)?;
-        Ok(ParsedGenerate { model, prompt: npu_engine::Prompt::Raw(prompt), params, stream })
+        Ok(ParsedGenerate { model, prompt: npu_engine::Prompt::Raw(prompt), params, stream,
+                            stats: wants_stats(&v) })
     }
 
     /// The shared sampling surface: OpenAI's fields plus `top_k`/`repetition_penalty`, neither in
@@ -887,9 +952,22 @@ pub mod parse {
             v.get("logprobs").and_then(|x| x.as_bool()).unwrap_or(false)
         };
         if logprobs_wanted { return Err("\"logprobs\" is not supported".into()); }
-        for field in ["logit_bias", "tools", "tool_choice", "response_format", "stream_options"] {
+        for field in ["logit_bias", "tools", "tool_choice", "response_format"] {
             if v.get(field).map(|x| !x.is_null()).unwrap_or(false) {
                 return Err(format!("\"{field}\" is not supported"));
+            }
+        }
+        // `stream_options` used to be rejected whole. It carries `include_stats` now, so the
+        // rejection narrows to the keys inside it rather than disappearing: `include_usage` is a
+        // real OpenAI feature this server does not emit, and quietly accepting it would be exactly
+        // the silent no-op this function exists to prevent.
+        if let Some(o) = v.get("stream_options").filter(|x| !x.is_null()) {
+            let Some(o) = o.as_object() else { return Err("\"stream_options\" must be an object".into()) };
+            for k in o.keys() {
+                if k != "include_stats" {
+                    return Err(format!("\"stream_options.{k}\" is not supported \
+                                        (this server honours \"include_stats\")"));
+                }
             }
         }
         if completions {
@@ -1489,7 +1567,8 @@ mod generate_tests {
     use crate::config::{Config, ModelCfg, ServerCfg};
     use crate::loader::{ModelLoader, Servable, StreamServable};
     use npu_engine::capability::{Capability, Request as EngineReq, Response as EngineResp};
-    use npu_engine::{Chunk, FinishReason, GenerateParams, GenerateUsage, Prompt, TextGenerator};
+    use npu_engine::{Chunk, FinishReason, GenerateParams, GenerateUsage, GenerationReport, Prompt,
+                     StepRecord, TextGenerator};
     use npu_engine::EngineError;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -1512,18 +1591,35 @@ mod generate_tests {
             sink: &mut dyn FnMut(Chunk<'_>) -> bool) -> Result<(), EngineError> {
             *self.seen.lock().unwrap() = Some((prompt.clone(), params.clone()));
             let mut usage = GenerateUsage::default();
+            let mut report = GenerationReport::default();
+            let t0 = std::time::Instant::now();
             let cap = (params.max_tokens.unwrap_or(npu_engine::DEFAULT_MAX_TOKENS) as usize).min(self.tokens.len());
-            for tok in self.tokens.iter().take(cap) {
+            for (i, tok) in self.tokens.iter().take(cap).enumerate() {
                 if !self.delay.is_zero() { std::thread::sleep(self.delay); }
                 self.sent.fetch_add(1, Ordering::SeqCst);
                 usage.completion_tokens += 1;
-                if !sink(Chunk::Text(tok)) {
-                    let _ = sink(Chunk::Done { reason: FinishReason::Aborted, usage });
+                let t_us = t0.elapsed().as_micros() as u64;
+                let rec = StepRecord {
+                    seq: i as u32,
+                    token: Some(1000 + i as u32),
+                    text: tok.clone(),
+                    emit: tok.clone(),
+                    t_us,
+                    dt_us: t_us.saturating_sub(report.steps.last().map(|s| s.t_us).unwrap_or(0)),
+                    ..StepRecord::default()
+                };
+                let live = sink(Chunk::Text(&rec.emit)) && sink(Chunk::Step(&rec));
+                report.steps.push(rec);
+                if !live {
+                    report.usage = usage;
+                    let _ = sink(Chunk::Done { reason: FinishReason::Aborted, usage, report: &report });
                     return Ok(());
                 }
             }
             let reason = if cap < self.tokens.len() { FinishReason::Length } else { FinishReason::Stop };
-            sink(Chunk::Done { reason, usage });
+            report.usage = usage;
+            report.generate_us = t0.elapsed().as_micros() as u64;
+            sink(Chunk::Done { reason, usage, report: &report });
             Ok(())
         }
     }
@@ -1567,6 +1663,70 @@ mod generate_tests {
         cfg.save(&p).unwrap();
         let (h, j) = start(cfg, Box::new(loader)).unwrap();
         (h, j, dir, p, sent, seen)
+    }
+
+    /// A buffered response carries its own measurements, always. This is the surface a human hits
+    /// with curl and the one Open WebUI reads; making it opt-in would mean the default answer to
+    /// "how fast was that" is silence.
+    #[test]
+    fn a_buffered_response_always_carries_its_measurements() {
+        let (h, j, _d, p, _sent, _seen) = gen_handle(ss(&["Hello", ", ", "world"]), Duration::from_millis(5));
+        let (code, body) = route(&post("/v1/chat/completions",
+            r#"{"messages":[{"role":"user","content":"hi"}]}"#), &h, &p);
+        assert_eq!(code, 200, "{body}");
+        let v: serde_json::Value = serde_json::from_str(body.text()).unwrap();
+        // usage is untouched: the OpenAI contract does not move because we added to it.
+        assert_eq!(v["usage"]["completion_tokens"], 3);
+        assert_eq!(v["timings"]["predicted_n"], 3, "llama.cpp-shaped, for the tools that read it");
+        assert!(v["timings"]["predicted_per_second"].as_f64().unwrap() > 0.0);
+        let x = &v["x_npu"];
+        assert!(x["tok_per_s"].as_f64().unwrap() > 0.0);
+        assert!(x["itl_ms"]["p99"].as_f64().is_some());
+        assert!(x["spans_ms"]["total"].as_f64().unwrap() >= x["spans_ms"]["decode"].as_f64().unwrap());
+        assert!(x["bound"].as_str().is_some(), "a verdict, not just numbers");
+        assert!(x["lever"].as_str().is_some(), "and what to do about it");
+        h.shutdown(); let _ = j.join();
+    }
+
+    #[test]
+    fn stats_are_requested_by_either_spelling_and_off_by_default() {
+        use parse::wants_stats;
+        let v = |b: &str| serde_json::from_str::<serde_json::Value>(b).unwrap();
+        assert!(!wants_stats(&v(r#"{"messages":[]}"#)));
+        assert!(wants_stats(&v(r#"{"stream_options":{"include_stats":true}}"#)));
+        assert!(wants_stats(&v(r#"{"x_npu_stats":true}"#)));
+        assert!(!wants_stats(&v(r#"{"x_npu_stats":false}"#)));
+        // Not a false cognate: OpenAI's own include_usage means something else and must not turn
+        // per-token telemetry on by itself.
+        assert!(!wants_stats(&v(r#"{"stream_options":{"include_usage":true}}"#)));
+    }
+
+    /// The run log has to be readable by the thing that reads run logs. Writing a format nothing
+    /// parses is the classic way an instrument becomes decoration.
+    #[test]
+    fn a_written_run_log_parses_back_into_the_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = wire::RunMeta { id: "chatcmpl-x".into(), created: 1, model: "m".into(), chat: true };
+        let mut log = crate::run_log::RunLog::open_in(dir.path(), &meta.id).unwrap();
+        log.header(&meta);
+        let mut report = GenerationReport { usage: GenerateUsage { prompt_tokens: 2, completion_tokens: 2 },
+                                            generate_us: 40_000, ..Default::default() };
+        for i in 0..2u32 {
+            let rec = StepRecord { seq: i, token: Some(7 + i), text: format!("t{i}"), emit: format!("t{i}"),
+                                   t_us: 20_000 * (i as u64 + 1), dt_us: 20_000, ..Default::default() };
+            log.line(&wire::chunk_line(&rec, &meta));
+            report.steps.push(rec);
+        }
+        log.line(&wire::prefill_line(&report.prefill, &meta));
+        log.line(&wire::summary_line(&report, &meta, FinishReason::Stop));
+        drop(log);
+
+        let text = std::fs::read_to_string(dir.path().join("chatcmpl-x.jsonl")).unwrap();
+        let run = wire::parse_run(&text).unwrap();
+        assert_eq!(run.id, "chatcmpl-x");
+        assert_eq!(run.steps, report.steps);
+        assert_eq!(run.finish_reason.as_deref(), Some("stop"));
+        assert_eq!(run.summary.unwrap().completion_tokens, 2);
     }
 
     #[test]
@@ -1872,6 +2032,7 @@ mod generate_tests {
                     assert!(frame["choices"][0]["finish_reason"].is_null());
                     texts.push(t);
                 }
+                StreamItem::Step(_) => {}
                 StreamItem::Done { reason, .. } => {
                     let frame: serde_json::Value = serde_json::from_str(&s.render_done(reason)).unwrap();
                     assert_eq!(frame["choices"][0]["finish_reason"], reason.as_str());

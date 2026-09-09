@@ -16,6 +16,8 @@ thesis - it is the frame everything else follows from.
   decoder's lm-head and argmax onto the NPU: the dead-ends and the fix.
 - [benchmark-methodology.md](benchmark-methodology.md) - how the NPU-vs-CPU numbers are
   measured (RAPL energy, quiesce + idle-subtract) so they are reproducible.
+- [measurement.md](measurement.md) - what every served request records about itself, the
+  attribution rules behind those numbers, and the JSONL run-log format.
 - [s2-ar-graph-map.md](s2-ar-graph-map.md) - inventory of the S2 autoregressive
   forward pass: every operation with tensor names, shapes, brick assignments, and L1
   sizing notes.

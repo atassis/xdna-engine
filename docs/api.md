@@ -129,10 +129,11 @@ Bodies are capped at 16 MiB. Streaming responses use Server-Sent Events with no
   and history, not just the last turn), the sampling fields below, and `stream` (bool). Message
   `content` is a plain string or OpenAI's multi-part array form where every part is
   `{"type":"text","text":...}`; any other part type is rejected with 400, not silently dropped.
-  Non-streaming response: `chat.completion` object with `choices[0].message.content` and a
-  `usage` object (`prompt_tokens`, `completion_tokens`, `total_tokens`). Streaming: SSE frames
-  of `chat.completion.chunk` objects (a role-announcement chunk first, then content deltas,
-  terminated by a `finish_reason` chunk and a literal `data: [DONE]`).
+  Non-streaming response: `chat.completion` object with `choices[0].message.content`, a
+  `usage` object (`prompt_tokens`, `completion_tokens`, `total_tokens`), and the measurement
+  objects `timings` and `x_npu` described in [measurement.md](measurement.md). Streaming: SSE
+  frames of `chat.completion.chunk` objects (a role-announcement chunk first, then content
+  deltas, terminated by a `finish_reason` chunk and a literal `data: [DONE]`).
 - `POST /v1/completions` -- same generation path over a raw, non-templated prompt. Body:
   `model`, `prompt` (string only -- an array of prompts, OpenAI's batching form, is rejected
   with 400), sampling fields, `stream`. Response shape mirrors chat completions with
@@ -159,9 +160,15 @@ vLLM/SGLang spelling, read by Qwen3-family templates -- any other key inside
 `GenerateParams::default()` -- OpenAI's own defaults, never a silent substitution of greedy
 decoding.
 
+`stream_options` accepts exactly one key, `include_stats` (bool), which adds per-token
+measurement to a streaming response -- see [measurement.md](measurement.md). Any other key
+inside it, including OpenAI's own `include_usage`, is a 400: this server does not emit a
+trailing usage chunk, and accepting the field without honouring it is the silent no-op the rest
+of this paragraph exists to avoid.
+
 Fields the surface does not implement are rejected with 400, not silently ignored: `n != 1`,
-`logprobs`, `logit_bias`, `tools`, `tool_choice`, `response_format`, `stream_options`, and,
-completions-only, `echo`, `best_of != 1`, `suffix`.
+`logprobs`, `logit_bias`, `tools`, `tool_choice`, `response_format`, and, completions-only,
+`echo`, `best_of != 1`, `suffix`.
 
 ### Errors
 

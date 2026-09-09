@@ -9,12 +9,14 @@ mod cli_def;
 mod doctor;
 mod exit;
 mod media;
+mod stats;
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser};
 
 use cli_def::{Cli, Cmd, ConfigCmd, OutFormat, OutputFormat, SamplingArgs, WeightsCmd};
 use clap_complete::Shell;
+use npu_engine::telemetry::wire;
 use exit::{engine_error, Code, Tagged};
 use npu_runtime::actor::{start, start_lazy};
 use npu_engine::capability::Capability;
@@ -56,12 +58,22 @@ fn run(cli: &Cli, path: &Path) -> Result<()> {
     let as_json = cli.output == OutputFormat::Json;
     match &cli.cmd {
         Cmd::Serve { port, allow_degraded } => serve(path, *port, *allow_degraded),
-        Cmd::Transcribe { input, model } => transcribe(path, input, model.as_deref()),
-        Cmd::Generate { prompt, model, sampling, no_stream, raw } =>
-            generate(path, prompt, model.as_deref(), sampling, *no_stream, *raw),
+        Cmd::Transcribe { input, model } => transcribe(path, input, model.as_deref(), as_json),
+        Cmd::Generate { prompt, model, sampling, no_stream, raw, stats, stats_log } =>
+            generate(path, prompt, model.as_deref(), sampling, *no_stream, *raw,
+                     *stats, stats_log.as_deref(), as_json),
+        // A REPL has no single response to serialize, so `--output json` cannot mean anything here.
+        // Saying so beats accepting the flag and ignoring it, which is what every command in this
+        // match used to do with it.
+        Cmd::Chat { .. } if as_json =>
+            Err(anyhow!("`--output json` is not supported for the chat REPL (there is no single \
+                         response to serialize) -- use `npu generate --output json`, or \
+                         `npu chat --stats-log FILE` for a machine-readable record of the turns")),
         Cmd::Chat { prompt, model, sampling, no_stream } =>
             chat(path, prompt.as_deref(), model.as_deref(), sampling, *no_stream),
-        Cmd::Embed { text, model } => embed(path, text, model.as_deref()),
+        Cmd::Embed { text, model } => embed(path, text, model.as_deref(), as_json),
+        Cmd::Stats { log, diff } => stats_cmd(log, diff.as_deref()),
+        Cmd::Replay { log, realtime, frames } => replay_cmd(log, *realtime, *frames),
         Cmd::Diarize { wav, model, json } => diarize(path, wav, model.as_deref(), *json || as_json),
         Cmd::TranscribeMedia { input, out, format, asr, diarize: diar, track, no_diarize } =>
             transcribe_media(path, input, out.as_deref(), *format, asr.as_deref(),
@@ -257,7 +269,7 @@ fn serve(path: &Path, port: Option<u16>, allow_degraded: bool) -> Result<()> {
     http::serve(handle, path.to_path_buf(), port).context("serve")
 }
 
-fn transcribe(path: &Path, input: &Path, model: Option<&str>) -> Result<()> {
+fn transcribe(path: &Path, input: &Path, model: Option<&str>, as_json: bool) -> Result<()> {
     quiet_one_shot();
     let cfg = load_cfg(path)?;
     let root = root(&cfg, path)?;
@@ -270,7 +282,12 @@ fn transcribe(path: &Path, input: &Path, model: Option<&str>) -> Result<()> {
     let out = handle.transcribe(model, samples, 16_000)
         .map_err(|e| Tagged(engine_error(&e), e.to_string()));
     handle.shutdown(); let _ = join.join();
-    println!("{}", out?.value);
+    let served = out?;
+    if as_json {
+        println!("{}", serde_json::json!({ "model": served.model, "text": served.value }));
+    } else {
+        println!("{}", served.value);
+    }
     Ok(())
 }
 
@@ -314,20 +331,86 @@ fn build_params(s: &SamplingArgs) -> Result<npu_engine::GenerateParams, String> 
 /// already IS the engine; (3) `Handle::generate`'s `Prompt::Chat` with real history is exactly what
 /// a REPL wants and is not staged through JSON at all this way.
 ///
+/// What one generation produced: the text, and everything measured about producing it.
+struct Generated {
+    text: String,
+    reason: npu_engine::FinishReason,
+    report: npu_engine::GenerationReport,
+}
+
 /// Drains `rx` to completion either way, so `Cmd::Generate` on the actor side always finishes even
 /// under `--no-stream`.
-fn drain_generation(rx: std::sync::mpsc::Receiver<StreamItem>, stream: bool) -> Result<String> {
+///
+/// `echo` prints tokens as they arrive; the text is accumulated regardless, because `--output json`
+/// needs the whole completion in hand and a second drain does not exist. The run log is written as
+/// the tokens arrive rather than at the end, so a run that is interrupted still leaves the part
+/// that happened -- which is when a log is worth the most.
+fn drain_generation(
+    rx: std::sync::mpsc::Receiver<StreamItem>,
+    echo: bool,
+    meta: &wire::RunMeta,
+    log: Option<&Path>,
+) -> Result<Generated> {
+    let mut file = match log {
+        Some(p) => {
+            let mut f = std::fs::File::create(p).with_context(|| format!("run log {}", p.display()))?;
+            writeln!(f, "{}", wire::header_line(
+                &npu_runtime::conditions::at_start(&meta.model, meta.created), meta))?;
+            Some(f)
+        }
+        None => None,
+    };
     let mut text = String::new();
     loop {
         match rx.recv() {
             Ok(StreamItem::Text(t)) => {
-                if stream { print!("{t}"); std::io::stdout().flush().ok(); }
-                else { text.push_str(&t); }
+                if echo { print!("{t}"); std::io::stdout().flush().ok(); }
+                text.push_str(&t);
             }
-            Ok(StreamItem::Done { .. }) => return Ok(text),
+            Ok(StreamItem::Step(r)) => {
+                if let Some(f) = file.as_mut() {
+                    writeln!(f, "{}", wire::chunk_line(&r, meta))?;
+                }
+            }
+            Ok(StreamItem::Done { reason, report, .. }) => {
+                if let Some(f) = file.as_mut() {
+                    writeln!(f, "{}", wire::prefill_line(&report.prefill, meta))?;
+                    writeln!(f, "{}", wire::summary_line(&report, meta, reason))?;
+                }
+                return Ok(Generated { text, reason, report: *report });
+            }
             Ok(StreamItem::Error(e)) => bail!("{e}"),
             Err(_) => bail!("generation ended without a result"),
         }
+    }
+}
+
+/// Identity for one CLI generation, so its log lines and its `--output json` body agree.
+///
+/// `chat` follows the prompt, not the command: `--raw` is `/v1/completions` semantics, so its
+/// records and its JSON body take the `text_completion` shape the HTTP route would have used.
+fn cli_meta(model: &str, chat: bool) -> wire::RunMeta {
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos()).unwrap_or(0);
+    wire::RunMeta {
+        // Same prefixes the HTTP route uses, chosen the same way, so a log written by the CLI and
+        // one written by the service are not distinguishable by an accident of naming.
+        id: format!("{}-{nanos:x}", if chat { "chatcmpl" } else { "cmpl" }),
+        created: (nanos / 1_000_000_000) as i64,
+        model: model.to_string(),
+        chat,
+    }
+}
+
+/// The compact overlay, on stderr after every generation.
+///
+/// stderr, not stdout, and unconditional: measuring costs nothing, so the numbers should not need
+/// asking for -- but `npu generate ... | jq` must still see only the answer.
+fn print_stats_footer(g: &Generated, full: bool) {
+    if full {
+        eprint!("{}", stats::table(&g.report));
+    } else {
+        eprintln!("{}", stats::one_line(&g.report.summarize()));
     }
 }
 
@@ -339,8 +422,10 @@ fn drain_generation(rx: std::sync::mpsc::Receiver<StreamItem>, stream: bool) -> 
 /// `npu generate 'Привет!'` -- 256 tokens of invented statistics homework, in three languages,
 /// with a YouTube link. The stop machinery was working; the prompt simply never gave it a stop to
 /// find.
+#[allow(clippy::too_many_arguments)]
 fn generate(path: &Path, prompt: &str, model: Option<&str>, sampling: &SamplingArgs,
-            no_stream: bool, raw: bool) -> Result<()> {
+            no_stream: bool, raw: bool, stats: bool, stats_log: Option<&Path>,
+            as_json: bool) -> Result<()> {
     quiet_one_shot();
     let cfg = load_cfg(path)?;
     let root = root(&cfg, path)?;
@@ -368,11 +453,56 @@ fn generate(path: &Path, prompt: &str, model: Option<&str>, sampling: &SamplingA
             } else { Tagged(code, msg) };
             anyhow::Error::from(tagged)
         })
-        .and_then(|served| drain_generation(served.value, !no_stream));
+        // JSON output is a single object, so nothing may be streamed to stdout ahead of it.
+        .and_then(|served| {
+            let meta = cli_meta(&served.model, !raw);
+            drain_generation(served.value, !no_stream && !as_json, &meta, stats_log)
+                .map(|g| (meta, g))
+        });
     handle.shutdown(); let _ = join.join();
-    let text = result?;
-    if no_stream { print!("{text}"); }
-    println!();
+    let (meta, g) = result?;
+    if as_json {
+        println!("{}", wire::completion_object(&g.text, g.reason, &g.report, &meta));
+    } else {
+        if no_stream { print!("{}", g.text); }
+        println!();
+        print_stats_footer(&g, stats);
+    }
+    Ok(())
+}
+
+fn stats_cmd(log: &Path, diff: Option<&Path>) -> Result<()> {
+    match diff {
+        Some(other) => print!("{}", stats::diff(log, other)?),
+        None => print!("{}", stats::from_log(log)?),
+    }
+    Ok(())
+}
+
+/// Re-emit a recorded run. No config, no engine, no device: a run log holds the frames that were
+/// served, so replaying is reading them back.
+fn replay_cmd(log: &Path, realtime: bool, frames: bool) -> Result<()> {
+    let text = std::fs::read_to_string(log).with_context(|| format!("{}", log.display()))?;
+    let run = wire::parse_run(&text).map_err(|e| anyhow!("{}: {e}", log.display()))?;
+    let mut out = std::io::stdout();
+    for (i, step) in run.steps.iter().enumerate() {
+        if realtime && i > 0 {
+            std::thread::sleep(std::time::Duration::from_micros(step.dt_us));
+        }
+        if frames {
+            // The recorded bytes, not a re-rendering of them: a replay that re-serialized would be
+            // testing this version's renderer instead of reproducing what the client actually saw.
+            writeln!(out, "data: {}", run.frames[i])?;
+        } else {
+            write!(out, "{}", step.emit)?;
+        }
+        out.flush()?;
+    }
+    if frames { writeln!(out, "data: [DONE]")?; } else { writeln!(out)?; }
+    match &run.summary {
+        Some(s) => eprintln!("{}", stats::one_line(s)),
+        None => eprintln!("(truncated run log: no summary)"),
+    }
     Ok(())
 }
 
@@ -412,10 +542,12 @@ fn chat(path: &Path, opening: Option<&str>, model: Option<&str>, sampling: &Samp
             history.push(npu_engine::ChatMessage { role: "user".into(), content: line });
             let served = handle.generate(model, npu_engine::Prompt::Chat(history.clone()), params.clone())
                 .map_err(|e| Tagged(engine_error(&e), e.to_string()))?;
-            let reply = drain_generation(served.value, !no_stream)?;
-            if no_stream { print!("{reply}"); }
+            let meta = cli_meta(&served.model, true);
+            let g = drain_generation(served.value, !no_stream, &meta, None)?;
+            if no_stream { print!("{}", g.text); }
             println!();
-            history.push(npu_engine::ChatMessage { role: "assistant".into(), content: reply });
+            print_stats_footer(&g, false);
+            history.push(npu_engine::ChatMessage { role: "assistant".into(), content: g.text });
         }
     })();
     handle.shutdown(); let _ = join.join();
@@ -581,7 +713,7 @@ fn render_segments(segs: &[npu_engine::capability::Segment], json: bool) -> Stri
         .join("\n")
 }
 
-fn embed(path: &Path, text: &str, model: Option<&str>) -> Result<()> {
+fn embed(path: &Path, text: &str, model: Option<&str>, as_json: bool) -> Result<()> {
     quiet_one_shot();
     let cfg = load_cfg(path)?;
     let root = root(&cfg, path)?;
@@ -591,9 +723,17 @@ fn embed(path: &Path, text: &str, model: Option<&str>) -> Result<()> {
         .map_err(|e| Tagged(engine_error(&e), e.to_string()))?;
     let out = handle.embed(model, text).map_err(|e| Tagged(engine_error(&e), e.to_string()));
     handle.shutdown(); let _ = join.join();
-    let v = out?.value;
-    let arr = v.iter().map(|x| format!("{x}")).collect::<Vec<_>>().join(",");
-    println!("[{arr}]");
+    let served = out?;
+    if as_json {
+        // The OpenAI embeddings shape, so the one-shot and the HTTP route answer alike.
+        println!("{}", serde_json::json!({
+            "object": "list", "model": served.model,
+            "data": [{ "object": "embedding", "index": 0, "embedding": served.value }],
+        }));
+    } else {
+        let arr = served.value.iter().map(|x| format!("{x}")).collect::<Vec<_>>().join(",");
+        println!("[{arr}]");
+    }
     Ok(())
 }
 
@@ -1277,7 +1417,7 @@ mod tests {
             "--stop", "STOP", "--seed", "3", "--no-stream",
         ]).expect("must parse");
         match cli.cmd {
-            Cmd::Generate { prompt, sampling, no_stream, model, raw } => {
+            Cmd::Generate { prompt, sampling, no_stream, model, raw, .. } => {
                 assert_eq!(prompt, "- a bullet point");
                 assert_eq!(sampling.temperature, Some(0.5));
                 assert_eq!(sampling.stop, vec!["END".to_string(), "STOP".to_string()]);

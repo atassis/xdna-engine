@@ -334,6 +334,13 @@ impl DecodeStep for NpuDecodeStep {
         NpuDecodeStep::reset(self)
     }
 
+    /// Live dispatch/transition totals, or `None` when the log is off. The generator differences
+    /// these per token, so a decode run says how many dispatches each token actually cost instead
+    /// of asserting one -- the same claim `dispatch_report` makes for the generation as a whole.
+    fn counters(&self) -> Option<(u32, u32)> {
+        npu_xrt::dispatch_log::enabled().then(npu_xrt::dispatch_log::counts)
+    }
+
     /// One decode step is one dispatch of the fused ELF, so the count here is the claim
     /// "one dispatch per token for all 28 layers" measured rather than asserted. `switch_ms` is
     /// 0.0 deliberately: this rail holds ONE xclbin, so a predicted switch tax priced off a

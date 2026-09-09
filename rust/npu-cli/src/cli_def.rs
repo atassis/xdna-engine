@@ -91,6 +91,22 @@ pub enum Cmd {
         #[arg(allow_hyphen_values = true)] prompt: String,
         #[arg(long)] model: Option<String>,
         #[command(flatten)] sampling: SamplingArgs,
+        /// Print the full per-token measurement breakdown after the answer.
+        ///
+        /// The one-line form is printed after every generation anyway, on stderr -- measuring is
+        /// free, so it always happens, and stderr keeps a pipe's stdout clean. This asks for the
+        /// whole table: the phase split, the latency tail, and the conditions the run happened
+        /// under.
+        #[arg(long)]
+        stats: bool,
+        /// Write a JSONL run log here: one line per decoded token, each an OpenAI stream chunk
+        /// carrying that token's own timing, wrapped in a conditions header and a summary.
+        ///
+        /// Replay it with `npu replay`, render it with `npu stats`, compare two with
+        /// `npu stats --diff`. The server writes these too, for every request, when
+        /// `NPU_TELEMETRY_LOG` names a directory.
+        #[arg(long, value_name = "FILE", value_hint = ValueHint::FilePath)]
+        stats_log: Option<PathBuf>,
         /// Print the whole completion at once instead of streaming it token by token.
         #[arg(long)] no_stream: bool,
         /// Send the prompt verbatim, with no chat template -- raw continuation.
@@ -157,6 +173,35 @@ pub enum Cmd {
     Weights {
         #[command(subcommand)]
         action: WeightsCmd,
+    },
+    /// Read a JSONL run log written by `--stats-log` or `NPU_TELEMETRY_LOG`.
+    ///
+    /// Renders the same overlay a live generation prints, from a file -- so a run from another day
+    /// or another machine reads the same way, and the renderer has exactly one input type.
+    Stats {
+        /// The run log to read.
+        #[arg(value_hint = ValueHint::FilePath)]
+        log: PathBuf,
+        /// Compare against a second run: token divergence first, then the timing deltas, with the
+        /// two conditions stamps side by side.
+        #[arg(long, value_name = "OTHER", value_hint = ValueHint::FilePath)]
+        diff: Option<PathBuf>,
+    },
+    /// Re-emit a run log's completion, with no device and no model.
+    ///
+    /// The chunk lines in a log ARE the stream frames that were served, so replaying is reading
+    /// them back out. Useful to drive a client against a recorded run, and to reproduce a bad
+    /// answer without needing the NPU free.
+    Replay {
+        /// The run log to replay.
+        #[arg(value_hint = ValueHint::FilePath)]
+        log: PathBuf,
+        /// Reproduce the original inter-token timing instead of emitting as fast as possible.
+        #[arg(long)]
+        realtime: bool,
+        /// Emit the raw SSE frames as recorded, rather than just the text.
+        #[arg(long)]
+        frames: bool,
     },
     /// Print a shell completion script (zsh, bash, fish, elvish, powershell).
     ///

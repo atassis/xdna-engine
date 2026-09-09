@@ -2,7 +2,8 @@
 // a live `TcpStream` -- the `[DONE]` terminator, and a client that actually hangs up mid-stream.
 // Run with: cargo test -p npu-runtime --test streaming
 use npu_engine::capability::{Capability, Request as EngineReq, Response as EngineResp};
-use npu_engine::{Chunk, EngineError, FinishReason, GenerateParams, GenerateUsage, Prompt, TextGenerator};
+use npu_engine::{Chunk, EngineError, FinishReason, GenerateParams, GenerateUsage, GenerationReport,
+                 Prompt, StepRecord, TextGenerator};
 use npu_runtime::actor::start;
 use npu_runtime::config::{Config, ModelCfg, ServerCfg};
 use npu_runtime::loader::{ModelLoader, Servable, StreamServable};
@@ -19,17 +20,34 @@ impl TextGenerator for ScriptedGenerator {
     fn generate(&mut self, _prompt: &Prompt, params: &GenerateParams,
         sink: &mut dyn FnMut(Chunk<'_>) -> bool) -> Result<(), EngineError> {
         let mut usage = GenerateUsage::default();
+        let mut report = GenerationReport::default();
+        let t0 = std::time::Instant::now();
         let cap = (params.max_tokens.unwrap_or(npu_engine::DEFAULT_MAX_TOKENS) as usize).min(self.tokens.len());
-        for tok in self.tokens.iter().take(cap) {
+        for (i, tok) in self.tokens.iter().take(cap).enumerate() {
             if !self.delay.is_zero() { std::thread::sleep(self.delay); }
             self.sent.fetch_add(1, Ordering::SeqCst);
             usage.completion_tokens += 1;
-            if !sink(Chunk::Text(tok)) {
-                let _ = sink(Chunk::Done { reason: FinishReason::Aborted, usage });
+            let t_us = t0.elapsed().as_micros() as u64;
+            let rec = StepRecord {
+                seq: i as u32,
+                token: Some(1000 + i as u32),
+                text: tok.clone(),
+                emit: tok.clone(),
+                t_us,
+                dt_us: t_us.saturating_sub(report.steps.last().map(|s| s.t_us).unwrap_or(0)),
+                ..StepRecord::default()
+            };
+            let live = sink(Chunk::Text(&rec.emit)) && sink(Chunk::Step(&rec));
+            report.steps.push(rec);
+            if !live {
+                report.usage = usage;
+                let _ = sink(Chunk::Done { reason: FinishReason::Aborted, usage, report: &report });
                 return Ok(());
             }
         }
-        sink(Chunk::Done { reason: FinishReason::Stop, usage });
+        report.usage = usage;
+        report.generate_us = t0.elapsed().as_micros() as u64;
+        sink(Chunk::Done { reason: FinishReason::Stop, usage, report: &report });
         Ok(())
     }
 }
@@ -101,6 +119,80 @@ fn read_status_and_headers(reader: &mut BufReader<TcpStream>) -> String {
         if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" { break; }
     }
     status
+}
+
+/// Collect the `data:` payloads of an SSE response, minus the `[DONE]` terminator.
+fn sse_frames(addr: std::net::SocketAddr, body: &str) -> Vec<serde_json::Value> {
+    let client = post_stream(addr, "/v1/chat/completions", body);
+    let mut reader = BufReader::new(client);
+    assert!(read_status_and_headers(&mut reader).contains("200"));
+    let mut out = Vec::new();
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap() == 0 { break; }
+        let Some(rest) = line.trim_end().strip_prefix("data: ") else { continue };
+        if rest == "[DONE]" { break; }
+        out.push(serde_json::from_str(rest).unwrap());
+    }
+    out
+}
+
+/// Without the opt-in the stream is what it always was: role chunk, one content chunk per token,
+/// a finish chunk, `[DONE]`. Nothing extra on the wire, no unknown `object` for a strict client to
+/// trip over. This is the regression that matters most -- telemetry must be invisible by default.
+#[test]
+fn a_stream_without_the_opt_in_is_unchanged() {
+    let tokens: Vec<String> = ["Hello", ", ", "world"].iter().map(|s| s.to_string()).collect();
+    let sent = Arc::new(AtomicUsize::new(0));
+    let (handle, join, addr) = spawn_server(GenLoader { tokens, delay: Duration::ZERO, sent });
+    let frames = sse_frames(addr, r#"{"messages":[{"role":"user","content":"hi"}],"stream":true}"#);
+
+    assert_eq!(frames.len(), 5, "role + 3 content + finish");
+    assert_eq!(frames[0]["choices"][0]["delta"]["role"], "assistant");
+    let text: String = frames[1..4].iter()
+        .map(|f| f["choices"][0]["delta"]["content"].as_str().unwrap()).collect();
+    assert_eq!(text, "Hello, world");
+    assert!(frames.iter().all(|f| f["object"] == "chat.completion.chunk"), "no new object kinds");
+    assert!(frames.iter().all(|f| f.get("x_npu").is_none()), "no payload nobody asked for");
+    assert_eq!(frames[4]["choices"][0]["finish_reason"], "stop");
+    handle.shutdown(); let _ = join.join();
+}
+
+/// With the opt-in every content frame carries its own measurement and the stream closes with a
+/// summary. The frames stay valid OpenAI chunks -- that is the whole premise of the format, and the
+/// text has to come out identical to the run without it.
+#[test]
+fn an_opted_in_stream_carries_per_token_measurements_and_a_summary() {
+    let tokens: Vec<String> = ["Hello", ", ", "world"].iter().map(|s| s.to_string()).collect();
+    let sent = Arc::new(AtomicUsize::new(0));
+    let (handle, join, addr) = spawn_server(GenLoader { tokens, delay: Duration::from_millis(3), sent });
+    let frames = sse_frames(addr,
+        r#"{"messages":[{"role":"user","content":"hi"}],"stream":true,"stream_options":{"include_stats":true}}"#);
+
+    let content: Vec<&serde_json::Value> = frames.iter()
+        .filter(|f| f["object"] == "chat.completion.chunk" && f["x_npu"].is_object()).collect();
+    assert_eq!(content.len(), 3, "one measured frame per token");
+    let text: String = content.iter()
+        .map(|f| f["choices"][0]["delta"]["content"].as_str().unwrap()).collect();
+    assert_eq!(text, "Hello, world", "same bytes as the stream without stats");
+    for (i, f) in content.iter().enumerate() {
+        assert_eq!(f["x_npu"]["det"]["seq"], i as u64);
+        assert!(f["x_npu"]["time"]["dt_ms"].as_f64().is_some());
+        assert!(f["choices"][0]["finish_reason"].is_null(), "still a normal chunk");
+    }
+    // The 3 ms sleep per token has to show up, or the numbers on the wire are decoration.
+    let dt = content[2]["x_npu"]["time"]["dt_ms"].as_f64().unwrap();
+    assert!(dt >= 2.0, "measured gap should reflect the scripted delay, got {dt} ms");
+
+    let summary = frames.iter().find(|f| f["object"] == "npu.run.summary").expect("summary frame");
+    assert_eq!(summary["usage"]["completion_tokens"], 3);
+    assert!(summary["timings"]["predicted_per_second"].as_f64().unwrap() > 0.0);
+    assert_eq!(summary["finish_reason"], "stop");
+    // The finish chunk still precedes it: a client that stops at finish_reason sees the same end.
+    let fin = frames.iter().position(|f| f["choices"][0]["finish_reason"] == "stop").unwrap();
+    let sum = frames.iter().position(|f| f["object"] == "npu.run.summary").unwrap();
+    assert!(fin < sum);
+    handle.shutdown(); let _ = join.join();
 }
 
 #[test]

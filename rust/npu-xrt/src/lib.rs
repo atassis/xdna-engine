@@ -239,6 +239,17 @@ pub mod dispatch_log {
         L.with(|l| *l.borrow_mut() = Log::default())
     }
 
+    /// `(dispatches, transitions)` so far, for a caller that wants the numbers rather than the
+    /// rendered report -- per-token telemetry differences consecutive reads. Thread-local like the
+    /// rest of this log, which is what makes per-generation scoping meaningful: the engine actor is
+    /// one thread and owns the device.
+    pub fn counts() -> (u32, u32) {
+        L.with(|l| {
+            let l = l.borrow();
+            (l.dispatches as u32, l.transitions as u32)
+        })
+    }
+
     /// The recorded dispatch order, one label per line. Feed to the switch-cost probe so its
     /// "rotating" arm is the REAL sequence and its "grouped" arm is that same multiset sorted --
     /// identical bytes and compute, only the transition count differs.

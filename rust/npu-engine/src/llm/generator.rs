@@ -3,13 +3,14 @@
 //! XRT/`ElfResident` backend against a measured fused-decode artifact is a later agent's job.
 
 use std::collections::VecDeque;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::api::EngineError;
 use crate::llm::config::ModelConfig;
 use crate::llm::detokenize::{IncrementalDetokenizer, StopFeed, StopMatcher};
 use crate::llm::sampling::{self, LogitView, SamplingConfig, SplitMix64};
 use crate::pipeline::{Chunk, FinishReason, GenerateParams, GenerateUsage, Prompt, TextGenerator};
+use crate::telemetry::{GenerationReport, PrefillRecord, StepPhases, StepRecord};
 
 /// One decode step against whatever backend holds the model: feed `token` at KV-cache position
 /// `pos`, get back full-vocabulary logits. `pos` is 0 for the first prompt token; the caller (this
@@ -58,6 +59,18 @@ pub trait DecodeStep {
         Ok(0)
     }
 
+    /// Cumulative (dispatches, hardware-context transitions) since [`DecodeStep::reset`], or
+    /// `None` when this backend does not count them. The generator differences consecutive reads
+    /// to charge each token what it actually cost, so an implementation returns running totals and
+    /// never has to know about tokens.
+    ///
+    /// `None` propagates all the way to the report as `null`, which is not the same as `0`: one
+    /// says nobody measured, the other says the backend dispatched nothing. Collapsing them makes
+    /// a switched-off counter look like a device that did no work.
+    fn counters(&self) -> Option<(u32, u32)> {
+        None
+    }
+
     /// Per-generation device accounting, or `None` when the backend has none or it is not enabled.
     /// Emitted by [`LlmGenerator::generate`] after the loop, paired with [`DecodeStep::reset`]
     /// before it, so the numbers cover exactly one generation. A host-side backend returns `None`;
@@ -65,6 +78,17 @@ pub trait DecodeStep {
     fn dispatch_report(&self) -> Option<String> {
         None
     }
+}
+
+/// Difference two cumulative counter reads. `None` on either side stays `None` all the way to the
+/// report: a backend that does not count is not a backend that dispatched nothing.
+fn counter_delta(prev: &mut Option<(u32, u32)>, now: Option<(u32, u32)>) -> (Option<u32>, Option<u32>) {
+    let d = match (*prev, now) {
+        (Some((pd, pt)), Some((nd, nt))) => (Some(nd.saturating_sub(pd)), Some(nt.saturating_sub(pt))),
+        _ => (None, None),
+    };
+    *prev = now;
+    d
 }
 
 /// Tokenize a prompt. `Prompt::Chat` renders through the model's chat template first;
@@ -105,6 +129,11 @@ pub struct ScriptedDecodeStep {
     /// test cannot see it in the output at all -- this is what makes "did the generator take it,
     /// and with how much of the prompt" observable without a device.
     pub prefill_calls: Vec<usize>,
+    /// Sleep inside `step`, so the report's `step_us` can be checked against a duration the test
+    /// chose. An instrument nobody put a known input through is not a measurement.
+    step_delay: std::time::Duration,
+    /// Cumulative dispatch/transition counts, when the mock is asked to keep them.
+    counters: Option<(u32, u32)>,
 }
 
 impl ScriptedDecodeStep {
@@ -114,7 +143,21 @@ impl ScriptedDecodeStep {
             max_context: None,
             prefill_batch: None,
             prefill_calls: Vec::new(),
+            step_delay: std::time::Duration::ZERO,
+            counters: None,
         }
+    }
+
+    /// Make every `step` take a known amount of time.
+    pub fn with_step_delay(mut self, d: std::time::Duration) -> Self {
+        self.step_delay = d;
+        self
+    }
+
+    /// Count dispatches the way a device backend does: one per `step`, reset with the cache.
+    pub fn with_counters(mut self) -> Self {
+        self.counters = Some((0, 0));
+        self
     }
 
     /// Give the mock a finite KV window, so the bound in [`LlmGenerator::generate`] is testable
@@ -134,7 +177,17 @@ impl ScriptedDecodeStep {
 
 impl DecodeStep for ScriptedDecodeStep {
     fn step(&mut self, _token: u32, _pos: usize) -> Result<Vec<f32>, EngineError> {
+        if !self.step_delay.is_zero() {
+            std::thread::sleep(self.step_delay);
+        }
+        if let Some((d, _)) = self.counters.as_mut() {
+            *d += 1;
+        }
         self.steps.pop_front().ok_or_else(|| EngineError::Device("scripted decode exhausted".to_string()))
+    }
+
+    fn counters(&self) -> Option<(u32, u32)> {
+        self.counters
     }
 
     fn max_context(&self) -> Option<usize> {
@@ -209,10 +262,18 @@ impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
         params: &GenerateParams,
         sink: &mut dyn FnMut(Chunk<'_>) -> bool,
     ) -> Result<(), EngineError> {
+        // One clock for the whole generation: every span in the report is measured against `t0`,
+        // so the parts and the wall clock cannot drift apart and the residual means something.
+        let t0 = Instant::now();
         // Every generation starts from an empty context. The device backend's KV cache only
-        // grows with `pos`, so without this each request continues the previous one's.
+        // grows with `pos`, so without this each request continues the previous one's. Zeroing it
+        // is prompt-side setup, so its cost belongs to the prefill window rather than to a span of
+        // its own; tokenization is carved back out of the middle of that window below.
         self.decode.reset()?;
+        let mut prefill_us = t0.elapsed().as_micros() as u64;
+        let t_tokenize = Instant::now();
         let prompt_ids = tokenize_prompt(&self.cfg, prompt, params.enable_thinking)?;
+        let tokenize_us = t_tokenize.elapsed().as_micros() as u64;
         if prompt_ids.is_empty() {
             return Err(EngineError::Unsupported("prompt tokenized to zero tokens".to_string()));
         }
@@ -255,6 +316,8 @@ impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
         // position before it is a pure KV side effect, which is exactly what the batched path
         // produces. `primed <= prompt_ids.len() - 1` therefore holds by construction and the loop
         // below always runs at least once.
+        let t_prefill = Instant::now();
+        let mut counters = self.decode.counters();
         let batchable = prompt_ids.len() - 1;
         let mut primed = 0usize;
         if let Some(m) = self.decode.prefill_batch() {
@@ -266,6 +329,18 @@ impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
         for (i, &tok) in prompt_ids.iter().enumerate().skip(primed) {
             logits = self.decode.step(tok, i)?;
         }
+        prefill_us += t_prefill.elapsed().as_micros() as u64;
+        let (prefill_dispatches, _) = counter_delta(&mut counters, self.decode.counters());
+        let prefill = PrefillRecord {
+            tokens: prompt_tokens,
+            batched: primed as u32,
+            stepwise: (prompt_ids.len() - primed) as u32,
+            us: prefill_us,
+            dispatches: prefill_dispatches,
+        };
+        let mut steps: Vec<StepRecord> = Vec::new();
+        let mut last_t = t0.elapsed().as_micros() as u64;
+        let mut pending_step_us = 0u64;
 
         let max_tokens = gen.max_tokens;
 
@@ -284,9 +359,13 @@ impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
             // absent ids. It becomes live traffic once a device-side top-k slice
             // (`llm-onchip-topk-feedback`) replaces `LogitView::full` -- the field already exists so
             // that swap does not need a new signature to carry the count.
+            let t_sample = Instant::now();
             let outcome = sampling::sample(LogitView::full(&logits), &history, &sampling_cfg, &mut rng);
+            let sample_us = t_sample.elapsed().as_micros() as u64;
             let tok = outcome.token;
 
+            // The stop token gets no record: it is never emitted, and the dispatch that produced
+            // its logits falls outside the first-to-last-token window the decode rate spans.
             if self.cfg.stop.is_stop(tok) {
                 finish = FinishReason::Stop;
                 break;
@@ -294,21 +373,48 @@ impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
             history.push(tok);
             completion_tokens += 1;
 
+            let t_detok = Instant::now();
             let text = detok.push(tok, &self.cfg.tokenizer)?;
-            match stopper.feed(&text) {
-                StopFeed::Emit(t) => {
-                    if !t.is_empty() && !sink(Chunk::Text(&t)) {
-                        finish = FinishReason::Aborted;
-                        break 'decode;
-                    }
-                }
-                StopFeed::Matched(t) => {
-                    if !t.is_empty() {
-                        sink(Chunk::Text(&t));
-                    }
-                    finish = FinishReason::Stop;
-                    break 'decode;
-                }
+            let (emit, matched) = match stopper.feed(&text) {
+                StopFeed::Emit(t) => (t, false),
+                StopFeed::Matched(t) => (t, true),
+            };
+            let detok_us = t_detok.elapsed().as_micros() as u64;
+
+            let t_us = t0.elapsed().as_micros() as u64;
+            let (dispatches, transitions) = counter_delta(&mut counters, self.decode.counters());
+            let rec = StepRecord {
+                seq: completion_tokens - 1,
+                token: Some(tok),
+                text,
+                emit,
+                t_us,
+                dt_us: t_us.saturating_sub(last_t),
+                // `pending_step_us` is the dispatch from the END of the previous iteration -- the
+                // one that produced the logits this token was sampled from. The first token's is 0:
+                // its logits came from priming, and charging them here would double-count prefill.
+                phases: StepPhases { step_us: std::mem::take(&mut pending_step_us), sample_us, detok_us },
+                dispatches,
+                transitions,
+            };
+            last_t = t_us;
+
+            // The text frame first, then its measurement, so a consumer that renders from `Step`
+            // alone sees the same order a consumer rendering from `Text` does. Both are asked
+            // whether the client is still there; a token that completed no codepoint emits no text,
+            // and `Step` is then the only place a disconnect can be noticed.
+            let live = rec.emit.is_empty() || sink(Chunk::Text(&rec.emit));
+            let live = sink(Chunk::Step(&rec)) && live;
+            steps.push(rec);
+            if matched {
+                // A matched stop ends the generation on its own terms, so a client that hangs up on
+                // this last frame still reports `Stop` -- which is what the loop did before.
+                finish = FinishReason::Stop;
+                break 'decode;
+            }
+            if !live {
+                finish = FinishReason::Aborted;
+                break 'decode;
             }
 
             if completion_tokens >= max_tokens {
@@ -321,15 +427,39 @@ impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
                 finish = FinishReason::Length;
                 break;
             }
+            let t_step = Instant::now();
             logits = self.decode.step(tok, pos)?;
+            pending_step_us = t_step.elapsed().as_micros() as u64;
             pos += 1;
         }
 
         let tail = stopper.flush();
         if !tail.is_empty() {
-            sink(Chunk::Text(&tail));
+            // Text with no token behind it. It still gets a record, with `token: None`: a log that
+            // dropped these frames would not replay to the same bytes, and a rate that counted them
+            // as tokens would be wrong in the other direction.
+            let t_us = t0.elapsed().as_micros() as u64;
+            let rec = StepRecord {
+                seq: steps.len() as u32,
+                token: None,
+                emit: tail,
+                t_us,
+                dt_us: t_us.saturating_sub(last_t),
+                ..StepRecord::default()
+            };
+            sink(Chunk::Text(&rec.emit));
+            sink(Chunk::Step(&rec));
+            steps.push(rec);
         }
-        sink(Chunk::Done { reason: finish, usage: GenerateUsage { prompt_tokens, completion_tokens } });
+        let report = GenerationReport {
+            tokenize_us,
+            prefill,
+            steps,
+            generate_us: t0.elapsed().as_micros() as u64,
+            usage: GenerateUsage { prompt_tokens, completion_tokens },
+            ..GenerationReport::default()
+        };
+        sink(Chunk::Done { reason: finish, usage: report.usage, report: &report });
         // After Done, never before: the report is diagnostics, and a caller streaming to a socket
         // must get its terminator whatever the backend has to say. stderr, so it cannot land in
         // an SSE body.
@@ -343,6 +473,7 @@ impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::telemetry::Bound;
     use crate::llm::chat_template::ChatTemplate;
     use crate::pipeline::GenerationDefaults;
     use crate::llm::config::StopTokens;
@@ -628,6 +759,87 @@ mod tests {
         assert_eq!(usage.completion_tokens, 2);
     }
 
+    /// Control the instrument before trusting it: drive the loop with a backend whose step time
+    /// the test chose, and check the report says so. Without this every number downstream is
+    /// plausible and unverified.
+    #[test]
+    fn the_report_measures_a_known_step_delay() {
+        use std::time::Duration;
+        let cfg = build_cfg(None);
+        // Four decode steps, none of them the stop token, then the script runs out -- so the loop
+        // ends on max_tokens with four tokens recorded.
+        let decode = ScriptedDecodeStep::new(vec![vec![0.0, 0.0, 9.0, 0.0, 0.0]; 5])
+            .with_step_delay(Duration::from_millis(5))
+            .with_counters();
+        let mut gen = LlmGenerator::new(cfg, decode);
+        let params = GenerateParams { max_tokens: Some(4), temperature: Some(0.0), ..GenerateParams::default() };
+        let mut steps: Vec<StepRecord> = Vec::new();
+        let mut report = GenerationReport::default();
+        gen.generate(&Prompt::Raw("hello".to_string()), &params, &mut |c| {
+            match c {
+                Chunk::Step(r) => steps.push(r.clone()),
+                Chunk::Done { report: r, .. } => report = r.clone(),
+                Chunk::Text(_) => {}
+            }
+            true
+        })
+        .unwrap();
+
+        assert_eq!(steps.len(), 4, "one record per token");
+        assert_eq!(report.steps, steps, "the streamed records and the final report are one object");
+        assert_eq!(report.usage.completion_tokens, 4);
+        assert!(steps.iter().enumerate().all(|(i, s)| s.seq == i as u32), "seq is dense and in order");
+        assert!(steps.iter().all(|s| s.token == Some(2)), "the scripted argmax is token 2");
+
+        // The first token's logits came from priming, so its step is prefill's, not its own.
+        assert_eq!(steps[0].phases.step_us, 0);
+        for s in &steps[1..] {
+            assert!(
+                (4_000..50_000).contains(&s.phases.step_us),
+                "5 ms sleep should land in step_us, got {} us",
+                s.phases.step_us
+            );
+            assert!(s.dt_us >= s.phases.step_us, "a gap cannot be shorter than the phase inside it");
+        }
+
+        // The prompt walk is prefill: one dispatch per prompt token, none of them charged to a
+        // completion token. `hello` is one token in the test tokenizer.
+        assert_eq!(report.prefill.tokens, 1);
+        assert_eq!(report.prefill.stepwise, 1);
+        assert_eq!(report.prefill.dispatches, Some(1));
+        assert_eq!(steps[0].dispatches, Some(0), "no dispatch produced the first token's logits");
+        assert!(steps[1..].iter().all(|s| s.dispatches == Some(1)));
+
+        let sum = report.summarize();
+        assert_eq!(sum.completion_tokens, 4);
+        assert_eq!(sum.bound, Bound::Device, "a 5 ms device step against microsecond host work");
+        assert!(sum.tok_per_s > 0.0 && sum.tok_per_s < 400.0, "tok/s: {}", sum.tok_per_s);
+        assert!(sum.total_us >= sum.decode_us);
+    }
+
+    /// The records must reproduce the bytes the text frames carried. A log that cannot do this is
+    /// not a log of the run, and every replay built on it is fiction.
+    #[test]
+    fn concatenated_emits_reproduce_the_streamed_text() {
+        let cfg = build_cfg(None);
+        let decode = ScriptedDecodeStep::new(vec![vec![0.0, 0.0, 9.0, 0.0, 0.0]; 4]);
+        let mut gen = LlmGenerator::new(cfg, decode);
+        let params = GenerateParams { max_tokens: Some(3), temperature: Some(0.0), ..GenerateParams::default() };
+        let mut streamed = String::new();
+        let mut from_records = String::new();
+        gen.generate(&Prompt::Raw("hello".to_string()), &params, &mut |c| {
+            match c {
+                Chunk::Text(t) => streamed.push_str(t),
+                Chunk::Step(r) => from_records.push_str(&r.emit),
+                Chunk::Done { .. } => {}
+            }
+            true
+        })
+        .unwrap();
+        assert!(!streamed.is_empty());
+        assert_eq!(streamed, from_records);
+    }
+
     #[test]
     fn sink_returning_false_aborts_with_aborted_reason() {
         let cfg = build_cfg(None);
@@ -637,6 +849,7 @@ mod tests {
         let mut finish = None;
         gen.generate(&Prompt::Raw("hello".to_string()), &params, &mut |c| match c {
             Chunk::Text(_) => false, // abort on the very first text chunk
+            Chunk::Step(_) => true,
             Chunk::Done { reason, .. } => {
                 finish = Some(reason);
                 true

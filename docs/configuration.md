@@ -288,6 +288,7 @@ Each candidate is only accepted if it actually contains a `scenarios/` directory
 | `NPU_KERNEL_MANIFEST_VERIFY` | Set (to any value) to re-hash kernel artifacts against their manifest at load time. Default off. |
 | `NPU_HOST_PROF` | Set to enable the per-op host-side profiler (ASR host reference path). Default off, zero cost. |
 | `NPU_DISPATCH_LOG` | Set to log per-`(xclbin, insts)` dispatch blocking time and hw_context-transition counts. Covers EVERY kernel dispatch in the engine, not only LLM decode. |
+| `NPU_TELEMETRY_LOG` | Directory to write one JSONL run log per generation into, named by completion id. See [measurement.md](measurement.md). Unset by default; writing is best-effort and can never fail a request. Not rotated -- one file per generation, so point it somewhere you will clean up. |
 
 This is the operator-facing surface. The kernel and dataflow crates carry additional
 environment-gated switches used for research and ablation during kernel development;
