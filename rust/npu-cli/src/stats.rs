@@ -69,11 +69,59 @@ pub fn table(r: &GenerationReport) -> String {
     }
     o.push_str(&format!("  {:<14} {:>8}    {}\n", "BOUND", s.bound.as_str(), s.bound.lever()));
 
+    // Split `device` further, by AIE design -- from `npu_xrt::dispatch_log`, which every device
+    // dispatch already funnels through. Nested under BOUND rather than a peer row: it explains the
+    // one row above it, and its own residual is host glue around the dispatch (step_us also counts
+    // whatever the backend wraps the call in), not a second unattributed bucket.
+    if !s.design_breakdown.is_empty() {
+        o.push_str("      ── device, by design ─────────────────────────────\n");
+        let mut designs = s.design_breakdown.clone();
+        designs.sort_by(|a, b| b.secs.partial_cmp(&a.secs).unwrap_or(std::cmp::Ordering::Equal));
+        let named_us: f64 = designs.iter().map(|d| d.secs * 1e6).sum();
+        for d in &designs {
+            let dev_us = d.secs * 1e6;
+            let share = if s.phases.step_us == 0 { 0.0 } else { 100.0 * dev_us / s.phases.step_us as f64 };
+            o.push_str(&format!(
+                "      {:<28} x{:<4} {:>8.3} ms/tok {:>6.1}%\n", d.label, d.dispatches, dev_us / 1e3 / n, share));
+        }
+        let residual_us = (s.phases.step_us as f64 - named_us).max(0.0);
+        let residual_share = if s.phases.step_us == 0 { 0.0 } else { 100.0 * residual_us / s.phases.step_us as f64 };
+        o.push_str(&format!(
+            "      {:<28} {:<5} {:>8.3} ms/tok {:>6.1}%  (host glue around the dispatches)\n",
+            "unattributed", "", residual_us / 1e3 / n, residual_share));
+    }
+
     if let (Some(d), Some(t)) = (s.dispatches, s.transitions) {
         o.push_str(&format!("  dispatches {d} · context transitions {t}\n"));
     } else {
-        o.push_str("  dispatches     not counted (set NPU_DISPATCH_LOG=1)\n");
+        o.push_str("  dispatches     not counted (set NPU_DISPATCH_LOG=1, or pass --dispatch-log for this run)\n");
     }
+
+    let p = &s.provenance;
+    let mut bits = Vec::new();
+    if let Some(h) = &p.head_dtype { bits.push(format!("head {h}")); }
+    if let Some(m) = &p.mlp_dtype {
+        bits.push(match p.quant_group {
+            Some(g) => format!("mlp {m} (g={g})"),
+            None => format!("mlp {m}"),
+        });
+    }
+    if !p.fusion_flags.is_empty() { bits.push(format!("flags {}", p.fusion_flags.join(","))); }
+    if let Some(v) = p.max_seq { bits.push(format!("max_seq {v}")); }
+    if let Some(v) = p.n_past { bits.push(format!("n_past {v}")); }
+    if bits.is_empty() {
+        o.push_str("  arm            not reported by this backend\n");
+    } else {
+        o.push_str(&format!("  arm            {}\n", bits.join(" · ")));
+    }
+    if p.artifact_path.is_some() || p.artifact_hash.is_some() || p.toolchain_pin_hash.is_some() {
+        o.push_str(&format!(
+            "                 artifact {} ({}) · toolchain {}\n",
+            p.artifact_path.as_deref().unwrap_or("?"),
+            p.artifact_hash.as_deref().unwrap_or("?"),
+            p.toolchain_pin_hash.as_deref().unwrap_or("?")));
+    }
+
     o.push_str(&format!(
         "  conditions     {} · power mode {} · {}\n",
         r.conditions.engine_version,
@@ -89,6 +137,14 @@ pub fn table(r: &GenerationReport) -> String {
         o.push_str("                 (unpinned or unreadable -- a tok/s taken now is not comparable\n\
                      \x20                 to one taken under a different mode)\n");
     }
+    // The mode above is a coarse driver enum (Default/Low/.../Turbo), not a clock. On this chip the
+    // actual AIE core clock (an 8-level 792-1800 MHz DPM ladder) has no runtime read path at all --
+    // `GET_CURRENT_DPM_LEVEL` exists only on AIE4 firmware, and aie2p's `aie2_msg_priv.h` carries no
+    // power/DPM MSG_OP. So any "% of peak" claim here must be stated as a cycle ratio, never scaled
+    // by an assumed clock.
+    o.push_str("  clock          not independently readable on this chip (power mode above is the\n\
+                 \x20                only readable proxy) -- treat any %-of-peak figure as a cycle\n\
+                 \x20                ratio, not a clock-scaled one\n");
     o
 }
 
@@ -170,7 +226,7 @@ mod tests {
             emit: "x".into(),
             t_us: 1_000 + 20_000 * i as u64,
             dt_us: if i == 0 { 1_000 } else { 20_000 },
-            phases: StepPhases { step_us, sample_us: 100, detok_us: 20 },
+            phases: StepPhases { step_us, sample_us: 100, detok_us: 20, sample_phases: None },
             ..StepRecord::default()
         }).collect();
         GenerationReport {

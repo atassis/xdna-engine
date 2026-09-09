@@ -10,7 +10,7 @@ use crate::llm::config::ModelConfig;
 use crate::llm::detokenize::{IncrementalDetokenizer, StopFeed, StopMatcher};
 use crate::llm::sampling::{self, LogitView, SamplingConfig, SplitMix64};
 use crate::pipeline::{Chunk, FinishReason, GenerateParams, GenerateUsage, Prompt, TextGenerator};
-use crate::telemetry::{GenerationReport, PrefillRecord, StepPhases, StepRecord};
+use crate::telemetry::{ArmProvenance, DesignCost, GenerationReport, PrefillRecord, StepPhases, StepRecord};
 
 /// One decode step against whatever backend holds the model: feed `token` at KV-cache position
 /// `pos`, get back full-vocabulary logits. `pos` is 0 for the first prompt token; the caller (this
@@ -77,6 +77,28 @@ pub trait DecodeStep {
     /// nothing in the loop branches on the answer.
     fn dispatch_report(&self) -> Option<String> {
         None
+    }
+
+    /// Per-design blocking time this generation cost, `(label, dispatch count, total seconds)`.
+    /// Every backend's device dispatches funnel through `npu_xrt::Kernel`, which is what makes this
+    /// default correct for ALL of them with no override needed: a backend that never touches the
+    /// device (the scripted mock, in tests) truthfully reports nothing, and one that does gets it
+    /// for free. Scoped to one generation the same way `counters()` is, by
+    /// [`DecodeStep::reset`]/[`npu_xrt::dispatch_log::reset`].
+    fn design_breakdown(&self) -> Vec<DesignCost> {
+        npu_xrt::dispatch_log::enabled()
+            .then(npu_xrt::dispatch_log::per_kernel_snapshot)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(label, dispatches, secs)| DesignCost { label, dispatches, secs })
+            .collect()
+    }
+
+    /// Which build this backend is. Default: nothing known. A device backend overrides it with what
+    /// its artifact's `meta.json` recorded; `n_past` is filled by the generator itself afterward,
+    /// from the KV position this generation actually reached.
+    fn provenance(&self) -> ArmProvenance {
+        ArmProvenance::default()
     }
 }
 
@@ -262,6 +284,9 @@ impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
         params: &GenerateParams,
         sink: &mut dyn FnMut(Chunk<'_>) -> bool,
     ) -> Result<(), EngineError> {
+        // Per-request override, set BEFORE `reset()` so its own `dispatch_log::enabled()` check
+        // (which zeroes the log for this generation) already sees it, not the previous request's.
+        npu_xrt::dispatch_log::set_override(params.dispatch_log);
         // One clock for the whole generation: every span in the report is measured against `t0`,
         // so the parts and the wall clock cannot drift apart and the residual means something.
         let t0 = Instant::now();
@@ -393,7 +418,14 @@ impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
                 // `pending_step_us` is the dispatch from the END of the previous iteration -- the
                 // one that produced the logits this token was sampled from. The first token's is 0:
                 // its logits came from priming, and charging them here would double-count prefill.
-                phases: StepPhases { step_us: std::mem::take(&mut pending_step_us), sample_us, detok_us },
+                // `sample_phases: None` -- `sampling::SampleOutcome` does not carry per-stage timing
+                // yet. See `SamplePhases`'s doc for the wiring this is waiting on.
+                phases: StepPhases {
+                    step_us: std::mem::take(&mut pending_step_us),
+                    sample_us,
+                    detok_us,
+                    sample_phases: None,
+                },
                 dispatches,
                 transitions,
             };
@@ -451,12 +483,18 @@ impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
             sink(Chunk::Step(&rec));
             steps.push(rec);
         }
+        // `pos` is the KV position the next dispatch would have written -- i.e. the one this
+        // generation actually reached, prompt included. The backend supplies everything else about
+        // the build that produced these numbers; this is the one field only the loop can see.
+        let provenance = ArmProvenance { n_past: Some(pos as u32), ..self.decode.provenance() };
         let report = GenerationReport {
             tokenize_us,
             prefill,
             steps,
             generate_us: t0.elapsed().as_micros() as u64,
             usage: GenerateUsage { prompt_tokens, completion_tokens },
+            design_breakdown: self.decode.design_breakdown(),
+            provenance,
             ..GenerationReport::default()
         };
         sink(Chunk::Done { reason: finish, usage: report.usage, report: &report });

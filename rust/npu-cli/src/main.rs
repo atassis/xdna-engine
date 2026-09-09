@@ -311,6 +311,11 @@ fn build_params(s: &SamplingArgs) -> Result<npu_engine::GenerateParams, String> 
         (false, true) => Some(false),
         _ => None,
     };
+    p.dispatch_log = match (s.dispatch_log, s.no_dispatch_log) {
+        (true, false) => Some(true),
+        (false, true) => Some(false),
+        _ => None,
+    };
     // The SAME check the HTTP surface runs, from the same function -- two surfaces validating
     // separately is how they drift on what they accept.
     p.validate()?;
@@ -1449,7 +1454,7 @@ mod tests {
         let s = cli_def::SamplingArgs {
             temperature: None, top_p: None, top_k: None, max_tokens: None,
             max_completion_tokens: None, presence_penalty: None, frequency_penalty: None,
-            repetition_penalty: None, stop: vec![], seed: None, think: false, no_think: false,
+            repetition_penalty: None, stop: vec![], seed: None, think: false, no_think: false, dispatch_log: false, no_dispatch_log: false,
         };
         let p = build_params(&s).unwrap();
         // Everything UNSET, exactly like an HTTP body with no sampling fields -- the CLI must not
@@ -1473,7 +1478,7 @@ mod tests {
             temperature: Some(0.4), top_p: Some(0.9), top_k: Some(50), max_tokens: None,
             max_completion_tokens: Some(64), presence_penalty: Some(0.5),
             frequency_penalty: Some(-0.5), repetition_penalty: Some(1.2),
-            stop: vec!["END".into()], seed: Some(7), think: false, no_think: true,
+            stop: vec!["END".into()], seed: Some(7), think: false, no_think: true, dispatch_log: false, no_dispatch_log: false,
         };
         let p = build_params(&s).unwrap();
         assert_eq!(p.presence_penalty, Some(0.5));
@@ -1487,7 +1492,7 @@ mod tests {
         let mk = |a, b| cli_def::SamplingArgs {
             temperature: None, top_p: None, top_k: None, max_tokens: a,
             max_completion_tokens: b, presence_penalty: None, frequency_penalty: None,
-            repetition_penalty: None, stop: vec![], seed: None, think: false, no_think: false,
+            repetition_penalty: None, stop: vec![], seed: None, think: false, no_think: false, dispatch_log: false, no_dispatch_log: false,
         };
         assert_eq!(build_params(&mk(Some(8), Some(8))).unwrap().max_tokens, Some(8));
         let err = build_params(&mk(Some(8), Some(9))).unwrap_err();
@@ -1502,7 +1507,7 @@ mod tests {
         let mk = |t, tp| cli_def::SamplingArgs {
             temperature: t, top_p: tp, top_k: None, max_tokens: None,
             max_completion_tokens: None, presence_penalty: None, frequency_penalty: None,
-            repetition_penalty: None, stop: vec![], seed: None, think: false, no_think: false,
+            repetition_penalty: None, stop: vec![], seed: None, think: false, no_think: false, dispatch_log: false, no_dispatch_log: false,
         };
         assert!(build_params(&mk(Some(-1.0), None)).unwrap_err().contains("temperature"));
         assert!(build_params(&mk(Some(3.0), None)).unwrap_err().contains("temperature"));
@@ -1517,7 +1522,7 @@ mod tests {
             temperature: Some(0.4), top_p: Some(0.9), top_k: Some(50), max_tokens: Some(64),
             max_completion_tokens: None, presence_penalty: None, frequency_penalty: None,
             repetition_penalty: None,
-            stop: vec!["END".into(), "STOP".into()], seed: Some(7), think: false, no_think: true,
+            stop: vec!["END".into(), "STOP".into()], seed: Some(7), think: false, no_think: true, dispatch_log: false, no_dispatch_log: false,
         };
         let p = build_params(&s).unwrap();
         assert_eq!(p.temperature, Some(0.4));
@@ -1539,7 +1544,7 @@ mod tests {
             max_completion_tokens: None, presence_penalty: None, frequency_penalty: None,
             repetition_penalty: None,
             temperature: None, top_p: None, top_k: None, max_tokens: None,
-            stop: vec![], seed: None, think, no_think,
+            stop: vec![], seed: None, think, no_think, dispatch_log: false, no_dispatch_log: false,
         };
         assert_eq!(build_params(&base(false, false)).unwrap().enable_thinking, None);
         assert_eq!(build_params(&base(true, false)).unwrap().enable_thinking, Some(true));

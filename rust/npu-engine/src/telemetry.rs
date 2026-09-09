@@ -33,16 +33,35 @@ pub struct StepPhases {
     /// `DecodeStep::step`: the device dispatch that produced this token's logits, plus whatever
     /// host glue the backend wraps around it.
     pub step_us: u64,
-    /// Logit sampling: penalties, top-k/top-p, the draw.
+    /// Logit sampling: penalties, top-k/top-p, the draw. See [`SamplePhases`] for the split.
     pub sample_us: u64,
     /// Incremental detokenization and stop-sequence matching.
     pub detok_us: u64,
+    /// The four stages inside `sample_us`, when the backend supplies them. `None` today: it needs
+    /// `sampling::SampleOutcome` to carry per-stage timing, which this crate does not yet -- see
+    /// [`SamplePhases`]'s own doc.
+    pub sample_phases: Option<SamplePhases>,
 }
 
 impl StepPhases {
     pub fn sum_us(&self) -> u64 {
         self.step_us + self.sample_us + self.detok_us
     }
+}
+
+/// The stages inside [`StepPhases::sample_us`]: penalties, top-k, top-p, the draw -- pipeline order,
+/// matching `sampling::sample`'s own. MEASURED 2026-09-09: the default Qwen3 arm (temperature 0.6,
+/// top_p 0.95, top_k 20) costs 2.725-3.079 ms/token against 0.132 at temperature 0, a 21x spread an
+/// A/B was needed to find. This struct is the fix -- once populated, the spread is one `--stats`
+/// call, not an A/B. `None` on [`StepPhases::sample_phases`] until `sampling::SampleOutcome` carries
+/// these; `Some` including on the greedy path, where each stage is a true, measured zero (greedy
+/// skips them, not "did not measure them").
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SamplePhases {
+    pub penalties_us: u64,
+    pub top_k_us: u64,
+    pub top_p_us: u64,
+    pub draw_us: u64,
 }
 
 /// What one decoded token cost, and what it produced.
@@ -119,9 +138,46 @@ pub struct RunConditions {
     pub started_unix: i64,
 }
 
+/// One AIE design's blocking dispatch time inside a generation, from `npu_xrt::dispatch_log`.
+/// `label` is `npu_xrt::Kernel`'s own label (an xclbin stem), not a device-agnostic design name --
+/// two designs sharing an xclbin (`SHARE_DESIGNS`) collapse to one row here, and that collapse is
+/// itself a finding, not a loss of information.
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DesignCost {
+    pub label: String,
+    pub dispatches: u32,
+    pub secs: f64,
+}
+
+/// Which build produced this run's numbers: precision, quantization, the fusion flags baked into
+/// the artifact, and its identity on disk. The fix for the project's most expensive recurring
+/// error -- differencing two absolute numbers from two builds measured hours apart with nothing in
+/// the output saying they were different builds at all. Every field is `None`/empty until a backend
+/// supplies it (`DecodeStep::provenance`); `n_past` is the one field the generator itself fills, from
+/// the KV position this generation actually reached.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArmProvenance {
+    pub head_dtype: Option<String>,
+    pub mlp_dtype: Option<String>,
+    pub quant_group: Option<u32>,
+    /// Fusion/env flags active in this artifact's build (`FUSE_QKV_DP`, `TMV_CTX`, ...).
+    pub fusion_flags: Vec<String>,
+    /// The artifact's built `dims.S` -- the KV window it was compiled for, not necessarily the one
+    /// this generation used.
+    pub max_seq: Option<u32>,
+    /// KV position reached by the end of THIS generation (prompt + completion).
+    pub n_past: Option<u32>,
+    pub artifact_path: Option<String>,
+    pub artifact_hash: Option<String>,
+    pub toolchain_pin_hash: Option<String>,
+}
+
 /// Everything one generation measured. Produced by the generation loop; the fields the loop cannot
 /// see (`queue_us`, `load_us`, `conditions`) are filled by the layer that can.
-#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// No longer `Eq`: `design_breakdown`'s `secs: f64` cannot be. Nothing depended on it -- `PartialEq`
+/// is what every test here (`assert_eq!`) actually needs.
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GenerationReport {
     pub conditions: RunConditions,
     /// Time the request waited for the device-owning actor. Real and currently invisible: one
@@ -141,6 +197,12 @@ pub struct GenerationReport {
     /// turn this pair into a J/token figure -- it cannot carry one.
     pub npu_power_start_uw: Option<u64>,
     pub npu_power_end_uw: Option<u64>,
+    /// Per-design blocking time inside [`StepPhases::step_us`], from `npu_xrt::dispatch_log` --
+    /// see `DecodeStep::design_breakdown`. Empty means either the log was off for this generation or
+    /// the backend dispatches through no `npu_xrt::Kernel` at all; both render as nothing to show.
+    pub design_breakdown: Vec<DesignCost>,
+    /// Which build produced these numbers. See [`ArmProvenance`].
+    pub provenance: ArmProvenance,
 }
 
 /// Which layer the run was actually spending its time in.
@@ -227,6 +289,11 @@ pub struct Summary {
     pub bound: Bound,
     /// `bound`'s share of `total_us`, 0..1.
     pub bound_share: f64,
+    /// See [`GenerationReport::design_breakdown`]. Copied through verbatim: it is a single
+    /// per-generation aggregate, not something derived from `steps`.
+    pub design_breakdown: Vec<DesignCost>,
+    /// See [`GenerationReport::provenance`].
+    pub provenance: ArmProvenance,
 }
 
 /// Nearest-rank percentile over an already-sorted slice. Exact, because at a few thousand samples
@@ -331,6 +398,8 @@ impl GenerationReport {
             transitions: sum_opt(|s| s.transitions, None),
             bound,
             bound_share,
+            design_breakdown: self.design_breakdown.clone(),
+            provenance: self.provenance.clone(),
         }
     }
 }
@@ -347,7 +416,7 @@ mod tests {
             emit: "x".into(),
             t_us: 1_000 + dt_us * seq as u64,
             dt_us,
-            phases: StepPhases { step_us, sample_us: 10, detok_us: 5 },
+            phases: StepPhases { step_us, sample_us: 10, detok_us: 5, sample_phases: None },
             ..StepRecord::default()
         }
     }
@@ -400,7 +469,7 @@ mod tests {
         // 1000 us between tokens, 200 of it claimed by phases: 800 is unattributed, and saying so
         // is the point. A breakdown that renormalized to 100% would report "device 100%" here.
         let steps: Vec<StepRecord> = (0..5)
-            .map(|i| StepRecord { phases: StepPhases { step_us: 185, sample_us: 10, detok_us: 5 }, ..step(i, 1_000, 185) })
+            .map(|i| StepRecord { phases: StepPhases { step_us: 185, sample_us: 10, detok_us: 5, sample_phases: None }, ..step(i, 1_000, 185) })
             .collect();
         let s = report(steps).summarize();
         assert_eq!(s.decode_us, 4_000);

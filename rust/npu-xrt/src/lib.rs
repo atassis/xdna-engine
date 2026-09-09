@@ -116,7 +116,26 @@ pub mod dispatch_log {
     use std::collections::BTreeMap;
     use std::sync::OnceLock;
 
+    // Per-request switch, checked before the env var. `None` (the default) falls through to the
+    // process-wide `NPU_DISPATCH_LOG` latch below; `Some(v)` wins regardless of it.
+    //
+    // Exists because a `OnceLock` env read is a defect, not just an inconvenience, in a long-lived
+    // daemon: it latches at first read, the CLI is a socket client so setting the var on the client
+    // changes nothing on the service, and turning it on for one run otherwise means restarting the
+    // service. Thread-local like the rest of this log, which is what makes it request-scoped at
+    // all -- the engine actor is one thread, so `LlmGenerator::generate` setting this on entry
+    // scopes it to exactly the generation that follows, and the next request's own call replaces it
+    // rather than inheriting a sticky value.
+    thread_local!(static OVERRIDE: RefCell<Option<bool>> = const { RefCell::new(None) });
+
+    pub fn set_override(v: Option<bool>) {
+        OVERRIDE.with(|o| *o.borrow_mut() = v);
+    }
+
     pub fn enabled() -> bool {
+        if let Some(v) = OVERRIDE.with(|o| *o.borrow()) {
+            return v;
+        }
         static ON: OnceLock<bool> = OnceLock::new();
         *ON.get_or_init(|| std::env::var("NPU_DISPATCH_LOG").map(|v| v != "0").unwrap_or(false))
     }
@@ -247,6 +266,21 @@ pub mod dispatch_log {
         L.with(|l| {
             let l = l.borrow();
             (l.dispatches as u32, l.transitions as u32)
+        })
+    }
+
+    /// `(label, dispatch count, total blocking seconds)` since the last `reset`, one row per
+    /// distinct label. The structured sibling of `report()`'s prose: a per-request overlay wants
+    /// ms/token PER DESIGN, not a page of text to parse, and every dispatch already funnels through
+    /// a labelled [`crate::Kernel`] with no per-site edits needed to attribute it. Empty when the
+    /// log is off.
+    pub fn per_kernel_snapshot() -> Vec<(String, u32, f64)> {
+        L.with(|l| {
+            let l = l.borrow();
+            l.per_kernel
+                .iter()
+                .map(|(k, &n)| (k.clone(), n as u32, l.secs_by_kernel.get(k).copied().unwrap_or(0.0)))
+                .collect()
         })
     }
 

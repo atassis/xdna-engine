@@ -270,6 +270,12 @@ pub struct SamplingArgs {
     #[arg(long, overrides_with = "think")] pub no_think: bool,
     /// Force the `<think>` block on even if the model's template would omit it.
     #[arg(long, overrides_with = "no_think")] pub think: bool,
+    /// Force per-dispatch/hw-context-transition accounting on for THIS generation, regardless of
+    /// `NPU_DISPATCH_LOG` on the service. The service is long-lived and that env var latches at its
+    /// first read, so this is the only way to turn accounting on for one run without a restart.
+    #[arg(long, overrides_with = "no_dispatch_log")] pub dispatch_log: bool,
+    /// Force it off for this one generation even if `NPU_DISPATCH_LOG=1` is set on the service.
+    #[arg(long, overrides_with = "dispatch_log")] pub no_dispatch_log: bool,
 }
 
 /// Transcript output formats.

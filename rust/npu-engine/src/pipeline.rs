@@ -113,6 +113,14 @@ pub struct GenerateParams {
     pub presence_penalty: Option<f32>,
     pub frequency_penalty: Option<f32>,
     pub repetition_penalty: Option<f32>,
+    /// Per-request override for `npu_xrt::dispatch_log`. `None` leaves the service's
+    /// `NPU_DISPATCH_LOG` default alone; `Some(v)` forces it on/off for THIS generation only.
+    ///
+    /// Exists because the service is long-lived and that env var latches at first read: the CLI is
+    /// a socket client, so setting it on the client changes nothing on the service, and turning it
+    /// on for one run otherwise means restarting the service. See
+    /// `LlmGenerator::generate`/`npu_xrt::dispatch_log::set_override`.
+    pub dispatch_log: Option<bool>,
 }
 
 impl Default for GenerateParams {
@@ -130,6 +138,7 @@ impl Default for GenerateParams {
             presence_penalty: None,
             frequency_penalty: None,
             repetition_penalty: None,
+            dispatch_log: None,
         }
     }
 }
