@@ -37,6 +37,48 @@ def main():
     c.scratch_buffer.device = "cpu"
     c.scratch_buffer.to("npu")
 
+    # ARENA OVERLAP CHECK, before anything is dispatched. The corrupted logits sit in the last
+    # two of the lm-head's eight column blocks, and a correct xf feeding a wrong logits vector is
+    # what a buffer landing on the output region looks like. The layout is queried off the compiled
+    # object (the same call gen_llm_decode.py::main makes), never a hand-written list.
+    names = ["logits", *md["inputs"], *weights.keys(), *md.get("cache_names", [])]
+    for l in range(md["NL"]):
+        names += [f"L{l}_{t}" for t in
+                  ("q", "k", "v", "kr", "vr", "vt", "sc", "sw", "cx", "a",
+                   "hn", "hf", "g", "u", "gh", "d", "ls", "qkv")]
+        names += [f"x{l}", f"x{l+1}"]
+    names += ["xf"]
+    lay = {}
+    for n in dict.fromkeys(names):
+        try:
+            lay[n] = fused.get_layout_for_buffer(n)
+        except Exception:
+            pass
+
+    def ext(e):
+        # get_layout_for_buffer returns a plain (buf_type, offset_bytes, length_bytes) tuple
+        # (iron/common/sequence.py), with sliced buffers already resolved to the parent's
+        # absolute offset.
+        t, off, ln = e
+        return t, int(off), int(ln)
+
+    if "logits" in lay:
+        la, lo, ll = ext(lay["logits"])
+        print(f"\n[layout] logits: arena {la} off {lo} len {ll} ({ll//2} bf16 elements)")
+        hits = []
+        for n, e in lay.items():
+            if n == "logits":
+                continue
+            oa, oo, ol = ext(e)
+            if oa == la and oo < lo + ll and lo < oo + ol:
+                hits.append((n, oo, ol, max(lo, oo) - lo))
+        for n, oo, ol, rel in sorted(hits, key=lambda h: h[3]):
+            print(f"[layout] OVERLAP {n:28} off {oo:10} len {ol:9} "
+                  f"-> from byte {rel} of logits (element {rel//2}, column block {rel//2//32768})")
+        if not hits:
+            print(f"[layout] nothing overlaps logits in arena {la}")
+    print(f"[layout] resolved {len(lay)} buffer locations\n")
+
     # Run the graph once at pos 0, then look at the logits ELEMENT-WISE. The bisect says xf is
     # clean and logits is not, and the weights survive a write/flush/read, so the remaining
     # candidate is a buffer written DURING the dispatch landing on the output region. Where the
@@ -68,6 +110,19 @@ def main():
         seg = lg[lo:hi]
         print(f"  [{lo:7}:{hi:7}] |max| {float(np.abs(seg).max()):12.6g}  "
               f"mean|.| {float(np.abs(seg).mean()):12.6g}  zeros {int((seg==0).sum()):5}")
+    z = np.flatnonzero(lg == 0)
+    if z.size:
+        # Contiguity tells apart a missing TRANSFER (one run) from a missing element per
+        # descriptor (a stride). Runs are maximal spans of consecutive zero indices.
+        brk = np.flatnonzero(np.diff(z) != 1)
+        starts = np.concatenate(([z[0]], z[brk + 1]))
+        ends = np.concatenate((z[brk], [z[-1]]))
+        runs = [(int(a), int(b - a + 1)) for a, b in zip(starts, ends)]
+        runs.sort(key=lambda r: -r[1])
+        print(f"  zeros: {z.size} in {len(runs)} runs; longest: {runs[:6]}")
+        print(f"  zero run lengths seen: {sorted(set(l for _, l in runs))[:12]}")
+        print(f"  zeros per column block: "
+              f"{ {int(k): int(v) for k, v in zip(*np.unique(z // 32768, return_counts=True))} }")
     big = np.flatnonzero(np.abs(lg) > 1e3)
     print(f"  elements with |logit| > 1e3: {big.size}"
           + (f", first at {int(big[0])}, last at {int(big[-1])}" if big.size else ""))
