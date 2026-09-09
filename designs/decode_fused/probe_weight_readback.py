@@ -17,7 +17,7 @@ import ml_dtypes
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import newstack_compat  # noqa: F401,E402
-from gen_llm_decode import build_graph, load_weight_buffer  # noqa: E402
+from gen_llm_decode import build_graph, isolate_build_dir, load_weight_buffer  # noqa: E402
 
 BF16 = ml_dtypes.bfloat16
 
@@ -28,6 +28,10 @@ def main():
     ap.add_argument("--weights", required=True)
     ap.add_argument("--layers", type=int, default=None)
     a = ap.parse_args()
+    # Same isolation verify_llm_decode does. Without it the build lands in CWD and
+    # params.txt is not found, so the ParameterScratchpad never binds and every
+    # per-token write fails -- which shows up as `params` being None at depth.
+    isolate_build_dir("probe")
 
     sp, fused, weights, md = build_graph(a.spec, a.weights, a.layers, 2048)
     c = fused.get_callable()
@@ -101,7 +105,37 @@ def main():
     c.params.write("sm_mask", 1)
     c.params.sync()
     c()
-    lg = np.asarray(c.get_buffer("logits").data, BF16).astype(np.float32)
+    lg = np.asarray(c.get_buffer("logits").data, BF16).astype(np.float32).copy()
+    # RE-SYNC AND RE-READ, the documented absorb for the host-only BO coherency race
+    # ([[npu-hostonly-bo-coherency-race]]): sync(FROM_DEVICE) can return before the last DMA line is
+    # visible, and the host then reads the PRE-DMA value -- which for a zeroed output buffer is
+    # exactly zero. That is the shape of the 2169 unwritten elements. A genuine miscompute is
+    # deterministic and survives every attempt, so a bounded re-read absorbs only the transient
+    # window and cannot hide a real fault.
+    for attempt in range(1, 6):
+        arena = c.get_buffer("logits")
+        try:
+            arena.device = "npu"; arena.to("cpu")
+        except Exception:
+            pass
+        lg_r = np.asarray(arena.data, BF16).astype(np.float32).copy()
+        nz_before, nz_after = int((lg == 0).sum()), int((lg_r == 0).sum())
+        if not np.array_equal(lg, lg_r):
+            print(f"[coherency] re-sync attempt {attempt} CHANGED the buffer: "
+                  f"zeros {nz_before} -> {nz_after}, "
+                  f"{int((lg != lg_r).sum())} elements differ")
+            lg = lg_r
+        else:
+            print(f"[coherency] re-sync attempt {attempt}: identical (zeros {nz_after})")
+            break
+    # Second dispatch on the SAME build with the SAME inputs. A race in BD reuse would land
+    # differently run to run; a structural fault reproduces exactly. This is the fork that decides
+    # whether the defect is a timing hazard or a wrong descriptor program.
+    c()
+    lg2 = np.asarray(c.get_buffer("logits").data, BF16).astype(np.float32).copy()
+    same = np.array_equal(lg, lg2)
+    print(f"\n[redispatch] second dispatch identical: {same}"
+          + ("" if same else f"  ({int((lg != lg2).sum())} of {lg.size} elements differ)"))
     print(f"\nlogits buffer: {lg.size} elements, "
           f"finite {int(np.isfinite(lg).sum())}, zeros {int((lg == 0).sum())}, "
           f"|max| {float(np.abs(lg[np.isfinite(lg)]).max()):.6g}")

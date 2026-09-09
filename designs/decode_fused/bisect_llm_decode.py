@@ -22,7 +22,7 @@ import ml_dtypes
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import newstack_compat  # noqa: F401,E402
-from gen_llm_decode import build_graph, COLS  # noqa: E402
+from gen_llm_decode import build_graph, isolate_build_dir, COLS  # noqa: E402
 from llm_decode_spec import k_chunks_for  # noqa: E402
 
 BF16 = ml_dtypes.bfloat16
@@ -80,6 +80,10 @@ def main():
     ap.add_argument("--detail-from", type=int, default=None,
                     help="also print node detail for layers >= this index")
     a = ap.parse_args()
+    # Same isolation verify_llm_decode does. Without it the build lands in CWD and
+    # params.txt is not found, so the ParameterScratchpad never binds and every
+    # per-token write fails -- which shows up as `params` being None at depth.
+    isolate_build_dir("bisect")
 
     sp, fused, weights, md = build_graph(a.spec, a.weights, a.layers)
     NL, D, FF = md["NL"], sp.d_model, sp.ffn

@@ -86,7 +86,23 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--spec", required=True)
     ap.add_argument("--weights", required=True)
-    ap.add_argument("--ref", required=True,
+    ap.add_argument("--trace-residual", action="store_true",
+                    help="after the first dispatch, print the RMS of every layer's residual buffer "
+                         "x0..xNL. The host maths keeps this O(1) at every depth -- each layer's "
+                         "input_layernorm renormalises the carry and re-injects O(1) contributions, "
+                         "so it CANNOT compound. A device stream that instead tracks "
+                         "prod(layer_scalar) is the defect, and this says which layer it starts at.")
+    ap.add_argument("--tokenizer", default=None,
+                    help="path to tokenizer.json, read directly for --smoke-prompt decoding")
+    ap.add_argument("--smoke-prompt", default=None,
+                    help="run WITHOUT a reference: comma-separated PROMPT IDS to generate from and print the tokens "
+                         "and their detokenized text. A weak gate on purpose -- it cannot catch a "
+                         "near-miss the way token parity can -- but it needs NO reference model in "
+                         "memory, where a full-depth bf16 oracle for a 12B is ~23 GB and will swap "
+                         "a shared box into the ground. Coherent text still rules out the failure "
+                         "modes seen here: a holed lm-head output and a collapsed residual both "
+                         "produce garbage, not sentences.")
+    ap.add_argument("--ref", required=False, default=None,
                     help="bf16_oracle.json -- the MATCHING-PRECISION oracle. greedy_ref.json "
                          "is HF f32 and is a contrast, not a gate: a bf16 device cannot win a "
                          "step where f32 and bf16 legitimately disagree.")
@@ -124,12 +140,31 @@ def main():
 
     report_artifact_freshness(a.weights)
 
-    ref = json.load(open(a.ref))
+    if a.ref is None and not a.smoke_prompt:
+        raise SystemExit("[verify] need --ref (token parity) or --smoke-prompt (no-reference smoke run)")
+    ref = json.load(open(a.ref)) if a.ref else {"prompt": a.smoke_prompt, "gen_ids": [], "margins": []}
     # A reference captured at a DIFFERENT depth is not a reference for this build. It presents as a
     # token mismatch at step 0, which reads as a device defect; refuse instead. `layers` is absent
     # on refs captured before it was recorded, and absent means full depth.
     ref_layers = ref.get("layers")
-    if ref_layers != a.layers:
+    if a.smoke_prompt:
+        # No reference model, and no `transformers` either -- it is not in the build venv and adding
+        # it to reach a tokenizer would be the wrong dependency for the wrong reason. The prompt ids
+        # come from an existing ref (same prompt, same tokenizer, so the same ids), and decoding
+        # reads tokenizer.json's vocab directly: it is a plain id->piece map plus SentencePiece's
+        # U+2581 word-boundary convention.
+        ref["prompt_ids"] = [int(x) for x in a.smoke_prompt.split(",")]
+        _vocab = json.load(open(a.tokenizer))["model"]["vocab"]
+        _inv = {v: k for k, v in (_vocab.items() if isinstance(_vocab, dict)
+                                  else ((t, i) for i, t in enumerate(_vocab)))}
+
+        def _decode(ids):
+            return "".join(_inv.get(int(i), f"<{i}>") for i in ids).replace("\u2581", " ")
+
+        _tok = type("T", (), {"decode": staticmethod(
+            lambda ids, skip_special_tokens=False: _decode(ids))})()
+        print(f"[verify] SMOKE RUN, no reference. prompt ids {ref['prompt_ids']}", file=sys.stderr)
+    elif ref_layers != a.layers:
         raise SystemExit(
             f"reference was captured at layers={ref_layers} but this build is layers={a.layers}. "
             f"Re-capture with scripts/llm_hf_bf16_ref.py --layers {a.layers}.")
@@ -261,6 +296,8 @@ def main():
         # global layers the sliding layers' KV offset.
         for slot_name, slot_hd in kv_slots:
             params.write(slot_name, int(pos * slot_hd))
+        if a.trace_residual and pos == 0:
+            _pending_trace = True
         params.write("sm_mask", int(pos + 1))
         params.sync()
         # ONE dispatch per position. The duplicate that used to sit here worked around
@@ -268,6 +305,24 @@ def main():
         # source now (iron/common/sequence.py forces host residency, mirroring _sync_outputs), so
         # a second dispatch would only double the cost and mask a regression in the real fix.
         c()
+        if a.trace_residual and pos == 0:
+            c.scratch_buffer.device = "npu"
+            c.scratch_buffer.to("cpu")
+            print("[trace] per-layer residual RMS (host keeps this O(1) at every depth):",
+                  file=sys.stderr)
+            for _l in range(md["NL"] + 1):
+                try:
+                    _v = np.asarray(c.get_buffer(f"x{_l}").data, np.float32)
+                except Exception:
+                    continue
+                try:
+                    _t, _off, _len = fused.get_layout_for_buffer(f"x{_l}")
+                except Exception:
+                    _t, _off, _len = "?", -1, -1
+                _r = float(np.sqrt((_v.astype(np.float64)**2).mean()))
+                print(f"[trace]   x{_l:<3} RMS {_r:11.4e}  arena {_t} off {_off:>13,} "
+                      f"({_off/2**30:7.3f} GiB){'  <-- UNWRITTEN' if _r == 0.0 else ''}",
+                      file=sys.stderr)
         if head_c is not None:
             # stack -> xf (a declared OUTPUT, so it is synced), then the head graph -> logits.
             _xf = np.asarray(c.get_buffer("xf").data, BF16)
@@ -329,6 +384,15 @@ def main():
             tok = gen_ids[i] if (a.teacher_force and i < len(gen_ids)) else nxt
         if len(produced) >= steps:
             break
+
+    if a.smoke_prompt:
+        txt = _tok.decode(produced, skip_special_tokens=False)
+        print(f"\n[verify] generated ids : {produced}")
+        print(f"[verify] generated text: {txt!r}")
+        print("[verify] SMOKE RUN -- coherent text is evidence, NOT a gate. Token parity against a "
+              "matching-precision oracle is the gate; this exists because that oracle is ~23 GB "
+              "for a 12B and will swap a shared box into the ground.")
+        return 0
 
     n = min(len(produced), len(gen_ids))
     match = sum(1 for i in range(n) if produced[i] == gen_ids[i])
