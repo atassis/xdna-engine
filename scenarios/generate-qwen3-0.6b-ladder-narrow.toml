@@ -1,0 +1,27 @@
+[scenario]
+kind = "generate"
+name = "qwen3-0.6b-ladder-narrow"
+
+# POSITIVE CONTROL for the ladder, not a shipping config.
+#
+# The primary is the 256-window arm; every WIDER arm is reachable only through `decode_ladder`. So
+# the ladder's presence is OBSERVABLE rather than inferred: `max_context` is the widest rung, which
+# is 4096 if the arms loaded and 256 if `decode_ladder` was silently ignored. A generation past 256
+# positions therefore succeeds only when the ladder really engaged.
+#
+# This exists because the parity and crossing gates both compare a ladder against a control that
+# would pass identically if the ladder were a no-op. A test that cannot fail proves nothing.
+[artifacts]
+decode = "artifacts/qwen3-0.6b/ladder4096/w256"
+decode_ladder = [
+    "artifacts/qwen3-0.6b/ladder4096/w512",
+    "artifacts/qwen3-0.6b/ladder4096/w1024",
+    "artifacts/qwen3-0.6b/ladder4096/w1536",
+    "artifacts/qwen3-0.6b/ladder4096/w2048",
+    "artifacts/qwen3-0.6b/ladder4096/w4096",
+]
+weights = "artifacts/qwen3-0.6b/weights"
+tokenizer_dir = "artifacts/qwen3-0.6b/tokenizer"
+
+[generation]
+max_tokens = 1024

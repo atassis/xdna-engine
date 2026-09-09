@@ -1,0 +1,27 @@
+[scenario]
+kind = "generate"
+name = "qwen3-0.6b-ladder"
+
+# The SAME model as `qwen3-0.6b`, served by a resident ladder of attention-window arms over ONE
+# 4096-position KV allocation. `decode` is the top rung; `decode_ladder` names the narrower ones.
+#
+# The window is a BUILD-time constant per arm, so following n_past means selecting an arm rather
+# than resizing one. All six share this arena's weights and KV cache -- verified: 310 persistent
+# buffers agree byte for byte across every arm -- so the cost is hardware contexts, not memory.
+#
+# Built with KV_ALLOC=4096 LADDER_SCRATCH_ORDER=1; the ordering flag is what pins the persistent
+# buffers to the arena front so the arms agree at all.
+[artifacts]
+decode = "artifacts/qwen3-0.6b/ladder4096/w4096"
+decode_ladder = [
+    "artifacts/qwen3-0.6b/ladder4096/w256",
+    "artifacts/qwen3-0.6b/ladder4096/w512",
+    "artifacts/qwen3-0.6b/ladder4096/w1024",
+    "artifacts/qwen3-0.6b/ladder4096/w1536",
+    "artifacts/qwen3-0.6b/ladder4096/w2048",
+]
+weights = "artifacts/qwen3-0.6b/weights"
+tokenizer_dir = "artifacts/qwen3-0.6b/tokenizer"
+
+[generation]
+max_tokens = 1024
