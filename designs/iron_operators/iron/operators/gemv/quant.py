@@ -1,10 +1,19 @@
 # SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Host-side packer for the GEMV `weight_dtype` axis (int4 / int8 group-quantized A).
+"""Host-side packer for the GEMV `weight_dtype` axis (group-quantized A).
 
-Byte-for-byte contract with aie_kernels/generic/mv_quant.cc: one row of the MxK weight matrix
-packs as ``[n_groups x scale][payload]``, payload = K/2 nibble-packed bytes (int4, low nibble
-= even column) or K int8 bytes (int8, one byte per element). Scale defaults to f32 (4B/group,
+Four dtypes, two families. Byte-for-byte contract with aie_kernels/generic/mv_quant.cc:
+
+  SYMMETRIC ("int4", "int8")   w = q*s,      q signed, one scale per (row, group).
+      row = ``[n_groups x scale][payload]``
+  AFFINE    ("int4a", "int8a") w = q*s + m,  q signed, a bf16 scale AND a bf16 min per
+      (row, group).  row = ``[n_groups x bf16 scale][n_groups x bf16 min][payload]``
+
+payload = K/2 nibble-packed bytes (int4, low nibble = even column) or K int8 bytes.
+At equal BYTES the affine family is strictly better on this model: at K=1024 the symmetric
+f32-scale g=128 row and the affine g=128 row are both 544 B, and mean dequant rel-L2 over the
+MLP tensors is 0.1230 against 0.1034. The extra expressiveness is worth more than a finer group:
+affine g=256 (528 B) also beats symmetric g=128 (544 B), cheaper AND closer. Scale defaults to f32 (4B/group,
 matching today's kernel) and is selectable to bf16 (2B/group, `scale_dtype="bf16"`) -- see
 `scale_dtype` below and mv_quant.cc's `SCALE_BF16` build macro. This lives beside the operator
 (not in a model generator) because it IS the kernel's on-wire format, not a model-specific concern
@@ -23,6 +32,34 @@ import numpy as np
 _QMAX = {"int4": 7, "int8": 127}
 _SCALE_BYTES = {"f32": 4, "bf16": 2}
 
+# AFFINE ("a"-suffixed) weight dtypes: dequant = q*s + m, with a bf16 scale AND a bf16 min per
+# (row, group). This is GGUF Q4_1's shape and is what FastFlowLM's shipped codec stores -- see
+# mlir-air-q4nx programming_examples/fused_decode/proj_qmm_pack.py:6-9 (bf16 scales, then bf16
+# mins, then the nibbles) and kernels/q4_k.h:228-230, which folds the min into the accumulator
+# as min*sum(B) rather than subtracting it per element.
+#
+# Two deliberate divergences from that reference, both free:
+#   * q is SIGNED here, [-8, 7], where theirs is unsigned [0, 15]. Sixteen levels either way --
+#     m re-centres them -- so signed keeps mv_quant.cc's existing `vector_cast<int4>` unpack and
+#     avoids a signed/unsigned unpack switch, which is exactly the ambient-representation seam
+#     this tree keeps paying for.
+#   * the header is scale AND min at bf16, so it is 4 B/group: ALWAYS 4-byte aligned and 16-byte
+#     aligned whenever n_groups % 4 == 0. A uint4/uint8 zero point instead would make the header
+#     3 B/group, which is what put the payload at a 24 B offset and made an int4 vector load
+#     misaligned -- the constraint that was read as forcing a tile-planar [Q][S][Z] layout.
+_AFFINE = {"int4a": 4, "int8a": 8}
+_AFFINE_HEADER_BYTES = 4          # bf16 scale + bf16 min, per group
+
+
+def _affine_levels(weight_dtype):
+    n = _AFFINE[weight_dtype]
+    lo = -(1 << (n - 1))
+    return lo, (1 << (n - 1)) - 1
+
+
+def is_affine(weight_dtype):
+    return weight_dtype in _AFFINE
+
 
 def _scale_header_bytes(n_groups: int, scale_dtype: str) -> int:
     if scale_dtype not in _SCALE_BYTES:
@@ -31,11 +68,16 @@ def _scale_header_bytes(n_groups: int, scale_dtype: str) -> int:
 
 
 def row_stride_bytes(K: int, group_size: int, weight_dtype: str, scale_dtype: str = "f32") -> int:
-    if weight_dtype not in _QMAX:
-        raise ValueError(f"unknown weight_dtype {weight_dtype!r} (expected 'int4' or 'int8')")
+    if weight_dtype not in _QMAX and weight_dtype not in _AFFINE:
+        raise ValueError(f"unknown weight_dtype {weight_dtype!r} "
+                         f"(expected 'int4', 'int8', 'int4a' or 'int8a')")
     if K % group_size != 0:
         raise ValueError(f"K={K} must be a whole number of groups (group_size={group_size})")
     n_groups = K // group_size
+    if is_affine(weight_dtype):
+        payload = K // 2 if weight_dtype == "int4a" else K
+        header = _AFFINE_HEADER_BYTES * n_groups
+        return header + payload      # 4 B/group: always %4, no alignment case to check
     payload = K // 2 if weight_dtype == "int4" else K
     header = _scale_header_bytes(n_groups, scale_dtype)
     stride = header + payload
@@ -82,6 +124,63 @@ def _mse_optimal_scale(Wg: np.ndarray, qmax: int, n_candidates: int,
     return best_scale
 
 
+def _pack_affine(W: np.ndarray, group_size: int, weight_dtype: str) -> np.ndarray:
+    """Affine pack: row = [n_groups x bf16 scale][n_groups x bf16 min][payload].
+
+    The scale and min are rounded to bf16 BEFORE q is solved, so the fit is against the values
+    the kernel will actually read rather than against f32 values that are then narrowed. That is
+    the same reason the f32 scale buys nothing in the symmetric path -- the rounding cancels when
+    it is inside the fit and does not when it is applied after.
+    """
+    import ml_dtypes
+    M, K = W.shape
+    lo, hi = _affine_levels(weight_dtype)
+    n_groups = K // group_size
+    Wg = np.asarray(W, dtype=np.float32).reshape(M, n_groups, group_size)
+    wmin, wmax = Wg.min(axis=2), Wg.max(axis=2)
+    s = ((wmax - wmin) / (hi - lo)).astype(np.float32)
+    s = np.where(s > 0, s, 1.0).astype(ml_dtypes.bfloat16).astype(np.float32)
+    m = (wmin - lo * s).astype(ml_dtypes.bfloat16).astype(np.float32)
+    q = np.clip(np.round((Wg - m[:, :, None]) / s[:, :, None]), lo, hi).astype(np.int32)
+    q = q.reshape(M, K)
+
+    stride = row_stride_bytes(K, group_size, weight_dtype)
+    out = np.zeros((M, stride), dtype=np.uint8)
+    hdr = 2 * n_groups
+    out[:, :hdr] = s.astype(ml_dtypes.bfloat16).view(np.uint8).reshape(M, hdr)
+    out[:, hdr:2 * hdr] = m.astype(ml_dtypes.bfloat16).view(np.uint8).reshape(M, hdr)
+    if weight_dtype == "int4a":
+        nib = (q.astype(np.int16) & 0xF).astype(np.uint8)
+        out[:, 2 * hdr:] = (nib[:, 0::2] | (nib[:, 1::2] << 4)).astype(np.uint8)
+    else:
+        out[:, 2 * hdr:] = q.astype(np.int8).view(np.uint8)
+    return out.reshape(-1).view(np.int8)
+
+
+def _unpack_affine(packed: np.ndarray, M: int, K: int, group_size: int,
+                    weight_dtype: str) -> np.ndarray:
+    import ml_dtypes
+    stride = row_stride_bytes(K, group_size, weight_dtype)
+    n_groups = K // group_size
+    hdr = 2 * n_groups
+    rows = np.asarray(packed).view(np.uint8).reshape(M, stride)
+    s = rows[:, :hdr].view(ml_dtypes.bfloat16).reshape(M, n_groups).astype(np.float32)
+    m = rows[:, hdr:2 * hdr].view(ml_dtypes.bfloat16).reshape(M, n_groups).astype(np.float32)
+    payload = rows[:, 2 * hdr:]
+    if weight_dtype == "int4a":
+        lo_n = (payload & 0x0F).astype(np.int8)
+        lo_n = np.where(lo_n >= 8, lo_n - 16, lo_n)
+        hi_n = ((payload >> 4) & 0x0F).astype(np.int8)
+        hi_n = np.where(hi_n >= 8, hi_n - 16, hi_n)
+        q = np.empty((M, K), dtype=np.int8)
+        q[:, 0::2] = lo_n
+        q[:, 1::2] = hi_n
+    else:
+        q = payload.view(np.int8)
+    q = q.reshape(M, n_groups, group_size).astype(np.float32)
+    return (q * s[:, :, None] + m[:, :, None]).reshape(M, K)
+
+
 def quantize_weight(W: np.ndarray, group_size: int, weight_dtype: str, *,
                      clip_search: bool = False, n_clip_candidates: int = 61,
                      clip_range: tuple = (0.4, 1.0), scale_dtype: str = "f32") -> np.ndarray:
@@ -99,6 +198,11 @@ def quantize_weight(W: np.ndarray, group_size: int, weight_dtype: str, *,
     bytes, shrinking row_stride_bytes accordingly. mv_quant.cc must be built with the matching
     `SCALE_BF16` setting to read this format; the two sides move together (see file docstring).
     """
+    if is_affine(weight_dtype):
+        if clip_search:
+            raise ValueError("clip_search is a symmetric-scale search and does not apply to the "
+                             "affine dtypes; the affine fit already uses the group's full range")
+        return _pack_affine(W, group_size, weight_dtype)
     if weight_dtype not in _QMAX:
         raise ValueError(f"unknown weight_dtype {weight_dtype!r} (expected 'int4' or 'int8')")
     M, K = W.shape
@@ -149,6 +253,8 @@ def dequantize_weight(packed: np.ndarray, M: int, K: int, group_size: int, weigh
     no-op in effect (but not literally skipped) when scale_dtype="bf16", since the header is
     already bf16-narrow by construction.
     """
+    if is_affine(weight_dtype):
+        return _unpack_affine(packed, M, K, group_size, weight_dtype)
     stride = row_stride_bytes(K, group_size, weight_dtype, scale_dtype)
     n_groups = K // group_size
     header_bytes = _scale_header_bytes(n_groups, scale_dtype)

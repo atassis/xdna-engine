@@ -106,6 +106,12 @@ def bf16(a):
 # NOT a quality claim: this axis is validated as a byte-stream + determinism engineering check on
 # Qwen3-0.6B, not a token-quality gate (tests/refs/qwen3-0.6b/bf16_oracle.json is 1 prompt / 8
 # free-running tokens with knife-edge logit margins -- too small to see quantization damage).
+# Accepted values: "bf16" (default, no-op), the SYMMETRIC "int4"/"int8" (w = q*s), and the
+# AFFINE "int4a"/"int8a" (w = q*s + m, a bf16 scale and a bf16 min per group -- GGUF Q4_1's
+# shape, and what FastFlowLM's shipped codec stores). Affine costs the same bytes as symmetric
+# at the same nominal width once the f32 scale is dropped, and is measured better everywhere;
+# see iron/operators/gemv/quant.py for the layout and the byte arithmetic.
+_QUANT_DTYPES = ("bf16", "int4", "int8", "int4a", "int8a")
 QUANT_MLP_DTYPE = os.environ.get("QUANT_MLP_DTYPE", "bf16")
 QUANT_MLP_GROUP = int(os.environ.get("QUANT_MLP_GROUP", "128"))
 
@@ -133,6 +139,14 @@ QUANT_HEAD_GROUP = int(os.environ.get("QUANT_HEAD_GROUP", "128"))
 # scale from its absmax; 1 grid-searches the clip ratio minimising that group's reconstruction MSE.
 # Host-side only -- same wire format, same kernel -- so it A/Bs against a shipped artifact.
 QUANT_CLIP_SEARCH = os.environ.get("QUANT_CLIP_SEARCH", "0") != "0"
+
+for _n, _v in (("QUANT_MLP_DTYPE", QUANT_MLP_DTYPE), ("QUANT_ATTN_DTYPE", QUANT_ATTN_DTYPE),
+               ("QUANT_HEAD_DTYPE", QUANT_HEAD_DTYPE)):
+    # Fail here rather than at link. An unknown value reaches design.py as part of a kernel
+    # symbol name (matvec_vectorized_<dtype>_bf16) and an archive name, so a typo currently
+    # surfaces as "undefined symbol" after a full compile.
+    if _v not in _QUANT_DTYPES:
+        raise SystemExit(f"{_n}={_v!r} is not one of {_QUANT_DTYPES}")
 
 DECODE_PLACER_FLAGS_DEFAULT = "--cores-per-col 1"
 

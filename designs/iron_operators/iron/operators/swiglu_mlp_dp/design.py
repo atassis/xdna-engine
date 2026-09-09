@@ -196,7 +196,9 @@ def my_swiglu_mlp_dp(
         f"FF/N ({FF_PER_CORE}) must be a multiple of 32"
     )
     # WEIGHT WIRE UNITS. bf16 weights are addressed in ELEMENTS; a group-quantized weight is a flat
-    # byte row -- [n_groups x f32 scale][packed payload] -- so every weight size, offset and stride
+    # byte row -- [n_groups x f32 scale][packed payload] for the symmetric dtypes, and
+    # [n_groups x bf16 scale][n_groups x bf16 min][packed payload] for the affine ones ("int4a" /
+    # "int8a") -- so every weight size, offset and stride
     # below is in whatever unit the wire format uses. Activations (hf, gh, nxt, cx) are ALWAYS bf16
     # and keep their element units; mixing the two is exactly the bytes-vs-elements seam that has
     # no owner, so the weight quantities are named WROW_* and nothing else changes.
@@ -206,7 +208,8 @@ def my_swiglu_mlp_dp(
         WROW_QD = QD
     else:
         from iron.operators.gemv.quant import row_stride_bytes
-        assert weight_dtype in ("int4", "int8"), f"unknown weight_dtype {weight_dtype!r}"
+        assert weight_dtype in ("int4", "int8", "int4a", "int8a"), \
+            f"unknown weight_dtype {weight_dtype!r}"
         assert group_size > 0, "weight_dtype != 'bf16' needs an explicit group_size > 0"
         assert n_aie_rows == 1, (
             "quantized weights are only derived for the plain (n_aie_rows=1) topology -- the "

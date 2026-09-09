@@ -9,9 +9,12 @@
 // M=1 decode (nothing to speed up, pack/unpack only adds ops), so this kernel still does a bf16
 // MAC. The lever is DDR/L2 bytes for the weight, not FLOPs.
 //
-// Row layout (one row = one output feature), K elements, GROUP_SIZE-wide quant groups,
-// n_groups = DIM_K / GROUP_SIZE:
-//   [n_groups x scale][ payload ]
+// Two families, four exported symbols. The SYMMETRIC pair (matvec_vectorized_int4/int8_bf16)
+// dequantizes w = q*s; the AFFINE pair (..._int4a/int8a_bf16, further down) dequantizes
+// w = q*s + m and is documented at its own definition. Row layout (one row = one output
+// feature), K elements, GROUP_SIZE-wide quant groups, n_groups = DIM_K / GROUP_SIZE:
+//   symmetric: [n_groups x scale][ payload ]
+//   affine:    [n_groups x bf16 scale][n_groups x bf16 min][ payload ]
 // payload is K/2 nibble-packed bytes (int4, low nibble = even column, high nibble = odd column --
 // same convention as dequant_int4_group_row.cc) or K int8 bytes (int8, one byte per element).
 // Packing the scale into the SAME buffer as the weight (rather than a 3rd input FIFO) is forced by
@@ -132,6 +135,110 @@ void matvec_int8_dequant(uint32_t m, const int8_t *__restrict a, const bfloat16 
   ::aie::set_rounding(saved_rounding);
 }
 
+// ---------------------------------------------------------------------------------------------
+// AFFINE forms: dequant = q*s + m, with a bf16 scale AND a bf16 min per (row, group), q signed.
+//
+// Row layout, n_groups = DIM_K / GROUP_SIZE:
+//   [n_groups x bf16 scale][n_groups x bf16 min][ payload ]
+// The header is 4 B/group, so the payload offset is always 4-byte aligned and is 16-byte aligned
+// whenever n_groups % 4 == 0 -- which is why this format needs no tile-planar [Q][S][Z] layout.
+//
+// The min NEVER touches the inner loop. Its contribution to a row's dot product is
+//   sum_k m_g(k) * b_k  =  sum_g m_g * (sum_{k in g} b_k)
+// so it collapses to one per-group sum of B, computed ONCE for all `m` rows before the row loop,
+// and n_groups scalar FMAs per row afterwards. That is the same factorisation FastFlowLM's own
+// codec uses (`c_accum = aie::mac(c_accum, a_mins, reduce_b)`, mlir-air-q4nx
+// programming_examples/fused_decode/kernels/q4_k.h:229). It is what lets the affine form keep the
+// symmetric kernel's ONE flat loop and ONE reduce per row: a per-element `sub` against a zero
+// point -- the other way to spell an asymmetric quantizer -- would add a broadcast and a vector
+// subtract to every chunk instead, K/r times per row rather than n_groups times.
+template <uint32_t r, uint32_t k, uint32_t g>
+void group_sums_of_b(const bfloat16 *__restrict b, float *__restrict bsum) {
+  constexpr uint32_t chunks_per_group = g / r;
+  const ::aie::vector<bfloat16, r> ones = ::aie::broadcast<bfloat16, r>((bfloat16)1.0f);
+  for (uint32_t gi = 0; gi < k / g; gi++) {
+    ::aie::accum<accfloat, r> acc = ::aie::zeros<accfloat, r>();
+    for (uint32_t ci = 0; ci < chunks_per_group; ci++)
+      acc = ::aie::mac(acc, ::aie::load_v<r>(b + gi * g + ci * r), ones);
+    bsum[gi] = ::aie::reduce_add(acc.template to_vector<float>());
+  }
+}
+
+template <uint32_t r, uint32_t k, uint32_t g>
+void matvec_int4_affine(uint32_t m, const int8_t *__restrict a, const bfloat16 *__restrict b,
+                        bfloat16 *__restrict c) {
+  static_assert(g % r == 0, "GROUP_SIZE must be a multiple of VEC_SIZE");
+  static_assert(k % g == 0, "DIM_K must be a whole number of groups");
+  constexpr uint32_t n_groups = k / g;
+  constexpr uint32_t row_stride = 4 * n_groups + k / 2;
+  static_assert(row_stride % 4 == 0, "row stride must be 4-byte aligned (per-row header read)");
+
+  float bsum[n_groups];
+  group_sums_of_b<r, k, g>(b, bsum);
+
+  const auto saved_rounding = ::aie::swap_rounding(::aie::rounding_mode::conv_even);
+  const uint8_t *a_bytes = reinterpret_cast<const uint8_t *>(a);
+  for (uint32_t row = 0; row < m; row++) {
+    const uint8_t *rowp = a_bytes + row * row_stride;
+    const bfloat16 *scale = reinterpret_cast<const bfloat16 *>(rowp);
+    const bfloat16 *mins = reinterpret_cast<const bfloat16 *>(rowp + 2 * n_groups);
+    const int8_t *packed = reinterpret_cast<const int8_t *>(rowp + 4 * n_groups);
+    ::aie::accum<accfloat, r> acc = ::aie::zeros<accfloat, r>();
+    uint32_t chunk = 0;
+    for (const bfloat16 *__restrict b_cur = b; b_cur < b + k; b_cur += r, chunk++) {
+      ::aie::vector<int8, r / 2> raw = ::aie::load_v<r / 2>(packed + chunk * (r / 2));
+      ::aie::vector<int8, r> q8 = ::aie::unpack(::aie::vector_cast<int4>(raw));
+      ::aie::vector<bfloat16, r> qbf = ::aie::to_float<bfloat16>(q8, 0);
+      ::aie::vector<bfloat16, r> sv = ::aie::broadcast<bfloat16, r>(scale[(chunk * r) / g]);
+      acc = ::aie::mac(acc, ::aie::mul(qbf, sv).template to_vector<bfloat16>(),
+                       ::aie::load_v<r>(b_cur));
+    }
+    float row_sum = ::aie::reduce_add(acc.template to_vector<float>());
+    for (uint32_t gi = 0; gi < n_groups; gi++)
+      row_sum += (float)mins[gi] * bsum[gi];
+    c[row] = static_cast<bfloat16>(row_sum);
+  }
+  ::aie::set_rounding(saved_rounding);
+}
+
+template <uint32_t r, uint32_t k, uint32_t g>
+void matvec_int8_affine(uint32_t m, const int8_t *__restrict a, const bfloat16 *__restrict b,
+                        bfloat16 *__restrict c) {
+  static_assert(g % r == 0, "GROUP_SIZE must be a multiple of VEC_SIZE");
+  static_assert(k % g == 0, "DIM_K must be a whole number of groups");
+  constexpr uint32_t n_groups = k / g;
+  constexpr uint32_t row_stride = 4 * n_groups + k;
+  static_assert(row_stride % 4 == 0, "row stride must be 4-byte aligned (per-row header read)");
+  constexpr uint32_t chunks_per_group = g / r;
+
+  float bsum[n_groups];
+  group_sums_of_b<r, k, g>(b, bsum);
+
+  const auto saved_rounding = ::aie::swap_rounding(::aie::rounding_mode::conv_even);
+  const uint8_t *a_bytes = reinterpret_cast<const uint8_t *>(a);
+  for (uint32_t row = 0; row < m; row++) {
+    const uint8_t *rowp = a_bytes + row * row_stride;
+    const bfloat16 *scale = reinterpret_cast<const bfloat16 *>(rowp);
+    const bfloat16 *mins = reinterpret_cast<const bfloat16 *>(rowp + 2 * n_groups);
+    const int8_t *packed = reinterpret_cast<const int8_t *>(rowp + 4 * n_groups);
+    const bfloat16 *__restrict b_cur = b;
+    float row_sum = 0.0f;
+    for (uint32_t gi = 0; gi < n_groups; gi++) {
+      ::aie::accum<accfloat, r> acc = ::aie::zeros<accfloat, r>();
+      for (uint32_t ci = 0; ci < chunks_per_group; ci++) {
+        ::aie::vector<int8, r> q8 = ::aie::load_v<r>(packed + (gi * chunks_per_group + ci) * r);
+        ::aie::vector<bfloat16, r> qbf = ::aie::to_float<bfloat16>(q8, 0);
+        acc = ::aie::mac(acc, qbf, ::aie::load_v<r>(b_cur));
+        b_cur += r;
+      }
+      row_sum += (float)scale[gi] * ::aie::reduce_add(acc.template to_vector<float>()) +
+                 (float)mins[gi] * bsum[gi];
+    }
+    c[row] = static_cast<bfloat16>(row_sum);
+  }
+  ::aie::set_rounding(saved_rounding);
+}
+
 }  // namespace
 
 extern "C" {
@@ -148,6 +255,18 @@ void matvec_vectorized_int8_bf16(uint32_t m, uint32_t row_offset, const int8_t *
                                  const bfloat16 *__restrict b_in, bfloat16 *__restrict c_out) {
   c_out += row_offset;
   matvec_int8_dequant<VEC_SIZE, DIM_K, GROUP_SIZE>(m, a_in, b_in, c_out);
+}
+
+void matvec_vectorized_int4a_bf16(uint32_t m, uint32_t row_offset, const int8_t *__restrict a_in,
+                                  const bfloat16 *__restrict b_in, bfloat16 *__restrict c_out) {
+  c_out += row_offset;
+  matvec_int4_affine<VEC_SIZE, DIM_K, GROUP_SIZE>(m, a_in, b_in, c_out);
+}
+
+void matvec_vectorized_int8a_bf16(uint32_t m, uint32_t row_offset, const int8_t *__restrict a_in,
+                                  const bfloat16 *__restrict b_in, bfloat16 *__restrict c_out) {
+  c_out += row_offset;
+  matvec_int8_affine<VEC_SIZE, DIM_K, GROUP_SIZE>(m, a_in, b_in, c_out);
 }
 
 }  // extern "C"
