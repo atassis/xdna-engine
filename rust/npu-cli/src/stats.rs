@@ -91,6 +91,28 @@ pub fn table(r: &GenerationReport) -> String {
             "unattributed", "", residual_us / 1e3 / n, residual_share));
     }
 
+    // Split `sampling` further, by internal stage -- from `sampling::sample`'s own timing, wired
+    // through `SampleOutcome::timings`. Same nesting convention as device-by-design: shares are of
+    // the SAMPLING row's own total, not of the decode window, and the residual is real host cost
+    // (RNG draw setup, allocation) the four named stages do not claim.
+    if let Some(sp) = s.phases.sample_phases {
+        if s.phases.sample_us > 0 {
+            o.push_str("      ── sampling, by stage ────────────────────────────\n");
+            let stage_rows =
+                [("penalties", sp.penalties_us), ("top_k", sp.top_k_us), ("top_p", sp.top_p_us), ("draw", sp.draw_us)];
+            let named_us: u64 = stage_rows.iter().map(|(_, v)| v).sum();
+            for (name, v) in stage_rows {
+                let share = 100.0 * v as f64 / s.phases.sample_us as f64;
+                o.push_str(&format!("      {:<28} {:>8.3} ms/tok {:>6.1}%\n", name, ms(v) / n, share));
+            }
+            let residual_us = s.phases.sample_us.saturating_sub(named_us);
+            let residual_share = 100.0 * residual_us as f64 / s.phases.sample_us as f64;
+            o.push_str(&format!(
+                "      {:<28} {:>8.3} ms/tok {:>6.1}%  (host glue around the four stages)\n",
+                "unattributed", ms(residual_us) / n, residual_share));
+        }
+    }
+
     if let (Some(d), Some(t)) = (s.dispatches, s.transitions) {
         o.push_str(&format!("  dispatches {d} · context transitions {t}\n"));
     } else {
@@ -262,6 +284,26 @@ mod tests {
         let t = table(&run(2_000, &[1, 2, 3, 4]));
         assert!(t.contains("unattributed"), "{t}");
         assert!(t.contains("BOUND"), "{t}");
+    }
+
+    #[test]
+    fn sampling_by_stage_nests_under_the_sampling_row_and_shares_its_total() {
+        let mut r = run(18_000, &[1, 2, 3, 4]);
+        for s in &mut r.steps {
+            s.phases.sample_phases =
+                Some(npu_engine::telemetry::SamplePhases { penalties_us: 10, top_k_us: 20, top_p_us: 30, draw_us: 15 });
+        }
+        let t = table(&r);
+        assert!(t.contains("sampling, by stage"), "{t}");
+        assert!(t.contains("penalties"), "{t}");
+        assert!(t.contains("top_k"), "{t}");
+        assert!(t.contains("top_p"), "{t}");
+        assert!(t.contains("draw"), "{t}");
+        // sample_us is 100/token, the four named stages sum to 75 -- the remaining 25 must show up
+        // as its own unattributed row inside the nested block, not be silently absorbed into one of
+        // the four. That is a SECOND "unattributed": the top-level decode residual row is always
+        // there too (design_breakdown is empty here, so its own nested residual does not add a third).
+        assert_eq!(t.matches("unattributed").count(), 2, "{t}");
     }
 
     #[test]

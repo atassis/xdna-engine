@@ -10,7 +10,7 @@ use crate::llm::config::ModelConfig;
 use crate::llm::detokenize::{IncrementalDetokenizer, StopFeed, StopMatcher};
 use crate::llm::sampling::{self, LogitView, SamplingConfig, SplitMix64};
 use crate::pipeline::{Chunk, FinishReason, GenerateParams, GenerateUsage, Prompt, TextGenerator};
-use crate::telemetry::{ArmProvenance, DesignCost, GenerationReport, PrefillRecord, StepPhases, StepRecord};
+use crate::telemetry::{ArmProvenance, DesignCost, GenerationReport, PrefillRecord, SamplePhases, StepPhases, StepRecord};
 
 /// One decode step against whatever backend holds the model: feed `token` at KV-cache position
 /// `pos`, get back full-vocabulary logits. `pos` is 0 for the first prompt token; the caller (this
@@ -418,13 +418,18 @@ impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
                 // `pending_step_us` is the dispatch from the END of the previous iteration -- the
                 // one that produced the logits this token was sampled from. The first token's is 0:
                 // its logits came from priming, and charging them here would double-count prefill.
-                // `sample_phases: None` -- `sampling::SampleOutcome` does not carry per-stage timing
-                // yet. See `SamplePhases`'s doc for the wiring this is waiting on.
+                // `Some` even on the greedy short-circuit: `outcome.timings` is a true measured zero
+                // there, not an absent measurement -- see `SamplePhases`'s doc.
                 phases: StepPhases {
                     step_us: std::mem::take(&mut pending_step_us),
                     sample_us,
                     detok_us,
-                    sample_phases: None,
+                    sample_phases: Some(SamplePhases {
+                        penalties_us: outcome.timings.penalties_ns / 1_000,
+                        top_k_us: outcome.timings.top_k_ns / 1_000,
+                        top_p_us: outcome.timings.top_p_ns / 1_000,
+                        draw_us: outcome.timings.draw_ns / 1_000,
+                    }),
                 },
                 dispatches,
                 transitions,
@@ -948,6 +953,58 @@ mod tests {
             gen.generate_to_string(&Prompt::Raw("hello".to_string()), &params).unwrap().0
         };
         assert_eq!(run(), run());
+    }
+
+    #[test]
+    fn sample_phases_is_some_and_zeroed_on_the_greedy_path() {
+        let cfg = build_cfg(None);
+        let decode = ScriptedDecodeStep::new(vec![
+            vec![0.0, 0.0, 9.0, 0.0, 0.0],
+            vec![0.0, 0.0, 0.0, 0.0, 9.0],
+        ]);
+        let mut gen = LlmGenerator::new(cfg, decode);
+        let params = GenerateParams { max_tokens: Some(50), temperature: Some(0.0), ..GenerateParams::default() };
+        let mut steps: Vec<StepRecord> = Vec::new();
+        gen.generate(&Prompt::Raw("hello".to_string()), &params, &mut |c| {
+            if let Chunk::Step(r) = c {
+                steps.push(r.clone());
+            }
+            true
+        })
+        .unwrap();
+        assert_eq!(steps.len(), 1);
+        assert_eq!(
+            steps[0].phases.sample_phases,
+            Some(crate::telemetry::SamplePhases::default()),
+            "greedy must report a measured zero, not an absent measurement"
+        );
+    }
+
+    #[test]
+    fn sample_phases_is_populated_on_the_sampled_path() {
+        // Wiring check only: is `outcome.timings` reaching the record at all as `Some`. Magnitude
+        // (that a stage's cost is really nonzero) is sampling::sample's own test, at its native
+        // nanosecond precision -- at this vocab size (5) the microsecond-truncated fields here can
+        // legitimately all read 0, which would make an `> 0` assertion at THIS layer flaky, not wrong.
+        let cfg = build_cfg(None);
+        let decode = ScriptedDecodeStep::new(vec![vec![1.0, 2.0, 3.0, 1.0, 0.0]]);
+        let mut gen = LlmGenerator::new(cfg, decode);
+        let params = GenerateParams {
+            max_tokens: Some(1),
+            temperature: Some(0.9),
+            top_k: Some(3),
+            seed: Some(7),
+            ..GenerateParams::default()
+        };
+        let mut steps: Vec<StepRecord> = Vec::new();
+        gen.generate(&Prompt::Raw("hello".to_string()), &params, &mut |c| {
+            if let Chunk::Step(r) = c {
+                steps.push(r.clone());
+            }
+            true
+        })
+        .unwrap();
+        assert!(steps[0].phases.sample_phases.is_some(), "sampling must report its phases");
     }
 
     #[test]

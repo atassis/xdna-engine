@@ -334,11 +334,23 @@ impl GenerationReport {
         let itl_mean_us = if gaps.is_empty() { 0 } else { gaps.iter().sum::<u64>() / gaps.len() as u64 };
 
         let mut phases = StepPhases::default();
+        let mut sample_sum = SamplePhases::default();
+        let mut any_sample_phases = false;
         for s in &toks {
             phases.step_us += s.phases.step_us;
             phases.sample_us += s.phases.sample_us;
             phases.detok_us += s.phases.detok_us;
+            if let Some(sp) = s.phases.sample_phases {
+                any_sample_phases = true;
+                sample_sum.penalties_us += sp.penalties_us;
+                sample_sum.top_k_us += sp.top_k_us;
+                sample_sum.top_p_us += sp.top_p_us;
+                sample_sum.draw_us += sp.draw_us;
+            }
         }
+        // Same `None`-means-unmeasured rule as `sum_opt` below: only real if at least one step
+        // actually carried it, never a zeroed struct standing in for "nobody reported this".
+        phases.sample_phases = any_sample_phases.then_some(sample_sum);
         // Against the decode window, not against the phase sum: anything the phases missed has to
         // show up somewhere, and here is where.
         let residual_us = decode_us.saturating_sub(phases.sum_us());
@@ -511,5 +523,20 @@ mod tests {
         steps[1].dispatches = Some(1);
         steps[2].dispatches = Some(1);
         assert_eq!(report(steps).summarize().dispatches, Some(3));
+    }
+
+    #[test]
+    fn sample_phases_sums_across_steps_and_stays_none_when_unmeasured() {
+        // None when no step measured it -- same rule as dispatches/transitions above.
+        let s = report((0..3).map(|i| step(i, 20, 5)).collect()).summarize();
+        assert_eq!(s.phases.sample_phases, None);
+
+        let mut steps: Vec<StepRecord> = (0..3).map(|i| step(i, 20, 5)).collect();
+        for st in &mut steps {
+            st.phases.sample_phases =
+                Some(SamplePhases { penalties_us: 1, top_k_us: 2, top_p_us: 3, draw_us: 4 });
+        }
+        let sp = report(steps).summarize().phases.sample_phases.expect("measured on every step");
+        assert_eq!(sp, SamplePhases { penalties_us: 3, top_k_us: 6, top_p_us: 9, draw_us: 12 });
     }
 }

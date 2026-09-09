@@ -17,4 +17,4 @@ pub use detokenize::{IncrementalDetokenizer, StopFeed, StopMatcher};
 pub use generator::{DecodeStep, LlmGenerator, ScriptedDecodeStep};
 pub use npu_decode::NpuDecodeStep;
 pub use npu_prefill::{chunk_plan, NpuPrefill, PrefillChunk};
-pub use sampling::{LogitView, SampleOutcome, SamplingConfig};
+pub use sampling::{LogitView, SampleOutcome, SamplingConfig, SampleTimings};

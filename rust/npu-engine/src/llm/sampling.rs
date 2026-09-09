@@ -19,6 +19,7 @@
 //! f64, matching `scripts/gemma_sampling_ref.py` bit-for-bit.
 
 use std::collections::HashMap;
+use std::time::Instant;
 
 /// Logits paired with the token ids they stand for. `ids: None` is the identity view
 /// (`values[i]` is the logit for token id `i`) -- the full-vocabulary case. `ids: Some(ids)` is a
@@ -114,6 +115,21 @@ pub struct SampleOutcome {
     /// was handed a history token it cannot see" -- the caller decides whether that is acceptable
     /// (it is, for a genuine top-k slice) or should trigger a full-logits fallback.
     pub penalties_skipped: u32,
+    /// Per-stage cost of this call. Zeroed (not absent) on the greedy short-circuit -- greedy
+    /// truly skips penalties/top-k/top-p/draw, which is a real zero, not a missing measurement;
+    /// `telemetry::StepPhases::sample_phases` is where the measured-vs-unmeasured distinction lives.
+    pub timings: SampleTimings,
+}
+
+/// Nanosecond cost of each stage inside one [`sample`] call, pipeline order. Nanoseconds because
+/// `telemetry::SamplePhases` (microseconds) is coarse enough to round a real sub-us stage down to
+/// the same 0 as "not measured" -- the caller sums before that rounding happens.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SampleTimings {
+    pub penalties_ns: u64,
+    pub top_k_ns: u64,
+    pub top_p_ns: u64,
+    pub draw_ns: u64,
 }
 
 /// Deterministic 64-bit PRNG (Vigna's splitmix64) -- chosen so `scripts/gemma_sampling_ref.py` can
@@ -267,26 +283,38 @@ fn filter_top_p(logits: &mut [f64], top_p: f64) {
 /// `cfg.temperature <= 0.0`; otherwise runs the full pipeline.
 pub fn sample(view: LogitView, history: &[u32], cfg: &SamplingConfig, rng: &mut SplitMix64) -> SampleOutcome {
     if cfg.temperature <= 0.0 {
-        return SampleOutcome { token: argmax(view), penalties_skipped: 0 };
+        return SampleOutcome { token: argmax(view), penalties_skipped: 0, timings: SampleTimings::default() };
     }
+    let t_start = Instant::now();
     let mut work: Vec<f64> = (0..view.len()).map(|r| view.value_at_rank(r) as f64).collect();
     let penalties_skipped = apply_penalties(&mut work, &view, history, cfg);
     let temperature = cfg.temperature as f64;
     for v in work.iter_mut() {
         *v /= temperature;
     }
+    let t_penalties = Instant::now();
     filter_top_k(&mut work, cfg.top_k);
+    let t_top_k = Instant::now();
     filter_top_p(&mut work, cfg.top_p as f64);
+    let t_top_p = Instant::now();
     let probs = softmax_f64(&work);
     let u = rng.next_f64();
     let mut cum = 0.0f64;
+    let mut picked_rank = probs.len() - 1; // last-ulp edge case: nothing crossed `u`, take the tail
     for (r, &p) in probs.iter().enumerate() {
         cum += p;
         if u < cum {
-            return SampleOutcome { token: view.id_at_rank(r), penalties_skipped };
+            picked_rank = r;
+            break;
         }
     }
-    SampleOutcome { token: view.id_at_rank(probs.len() - 1), penalties_skipped } // last-ulp edge case
+    let timings = SampleTimings {
+        penalties_ns: (t_penalties - t_start).as_nanos() as u64,
+        top_k_ns: (t_top_k - t_penalties).as_nanos() as u64,
+        top_p_ns: (t_top_p - t_top_k).as_nanos() as u64,
+        draw_ns: t_top_p.elapsed().as_nanos() as u64,
+    };
+    SampleOutcome { token: view.id_at_rank(picked_rank), penalties_skipped, timings }
 }
 
 #[cfg(test)]
@@ -305,6 +333,20 @@ mod tests {
         assert_eq!(out.token, argmax(LogitView::full(&SAMPLE_LOGITS)));
         assert_eq!(out.token, 4); // index of the 4.0 logit
         assert_eq!(out.penalties_skipped, 0);
+        assert_eq!(out.timings, SampleTimings::default(), "greedy must report a true zero, not skip measuring");
+    }
+
+    #[test]
+    fn a_non_greedy_draw_times_every_stage() {
+        let cfg = SamplingConfig { temperature: 0.8, top_k: 4, top_p: 0.9, ..SamplingConfig::default() };
+        let mut rng = SplitMix64::new(1);
+        let out = sample(LogitView::full(&SAMPLE_LOGITS), &[], &cfg, &mut rng);
+        // Real `Instant` calls: assert they ran (a stage cost of exactly 0ns would mean the clock
+        // never advanced, i.e. this stage was skipped, not that it was fast), not a magnitude.
+        assert!(out.timings.penalties_ns > 0, "{:?}", out.timings);
+        assert!(out.timings.top_k_ns > 0, "{:?}", out.timings);
+        assert!(out.timings.top_p_ns > 0, "{:?}", out.timings);
+        assert!(out.timings.draw_ns > 0, "{:?}", out.timings);
     }
 
     #[test]
