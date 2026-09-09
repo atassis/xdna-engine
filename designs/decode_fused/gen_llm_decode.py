@@ -602,6 +602,12 @@ def gemv_tile_output(M, K, cols=None, tsi=None):
 def gemv(M, K, ctx, **kw):
     """GEMV tiled as large as both the design asserts AND L1 allow."""
     tsi, tso = gemv_tile_output(M, K)
+    g = kw.get("group_size", 0)
+    if g and g < 64:
+        # mv_quant.cc's dequant chunk must not straddle a quant group, and GEMV asserts
+        # group_size % kernel_vector_size == 0. 64 is the default and the only width the shipped
+        # groups (>=128) ever needed; a 32-wide group needs 32.
+        kw["kernel_vector_size"] = g
     return GEMV(M=M, K=K, num_aie_columns=COLS, tile_size_input=tsi,
                 tile_size_output=tso, context=ctx, **kw)
 

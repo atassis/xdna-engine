@@ -124,13 +124,33 @@ def _mse_optimal_scale(Wg: np.ndarray, qmax: int, n_candidates: int,
     return best_scale
 
 
-def _pack_affine(W: np.ndarray, group_size: int, weight_dtype: str) -> np.ndarray:
+def _pack_affine(W: np.ndarray, group_size: int, weight_dtype: str,
+                  zero_on_grid: bool = True) -> np.ndarray:
     """Affine pack: row = [n_groups x bf16 scale][n_groups x bf16 min][payload].
 
     The scale and min are rounded to bf16 BEFORE q is solved, so the fit is against the values
     the kernel will actually read rather than against f32 values that are then narrowed. That is
     the same reason the f32 scale buys nothing in the symmetric path -- the rounding cancels when
     it is inside the fit and does not when it is applied after.
+
+    zero_on_grid CONSTRAINS the min to -z*s with an integer z, so the reconstruction grid contains
+    exact zero the way a symmetric grid always does. It costs a fraction of a step of range and it
+    is the DEFAULT, because the fraction is worth far less than the zero. Measured on Qwen3-0.6B's
+    MLP weights at group 32, 6000 paired positions of natural prose: symmetric +11.59%
+    perplexity, free-min affine +16.26%, zero-on-grid affine **+3.90%**. The mechanism is visible
+    in the packed weights -- symmetric reconstructs 13.9% of MLP weights as exactly zero and
+    free-min only 0.20%, because an unconstrained offset puts the whole grid off zero and every
+    small weight picks up a residue.
+
+    It is NOT universally better, and the exception is worth carrying: on the ATTENTION
+    projections the free-min form measures -0.50% [-1.6, +0.7], indistinguishable from bf16, while
+    zero-on-grid costs +2.13%. Those weights are less concentrated at zero, so the better range
+    fit wins. Per-class is therefore the right granularity when qkv is quantized, which it is not
+    yet.
+
+    Either way this is the SAME WIRE FORMAT and the same bytes -- the kernel cannot tell them
+    apart. Only which min value gets written changes, exactly like `clip_search` on the symmetric
+    side.
     """
     import ml_dtypes
     M, K = W.shape
@@ -141,6 +161,11 @@ def _pack_affine(W: np.ndarray, group_size: int, weight_dtype: str) -> np.ndarra
     s = ((wmax - wmin) / (hi - lo)).astype(np.float32)
     s = np.where(s > 0, s, 1.0).astype(ml_dtypes.bfloat16).astype(np.float32)
     m = (wmin - lo * s).astype(ml_dtypes.bfloat16).astype(np.float32)
+    if zero_on_grid:
+        # w = (q - z)*s, so m = -z*s. q = lo must land on wmin: (lo - z)*s = wmin
+        # => z = lo + round(-wmin/s), and the grid then contains exact zero at q = z.
+        z = lo + np.round(-wmin / s)
+        m = (-z * s).astype(ml_dtypes.bfloat16).astype(np.float32)
     q = np.clip(np.round((Wg - m[:, :, None]) / s[:, :, None]), lo, hi).astype(np.int32)
     q = q.reshape(M, K)
 
@@ -183,7 +208,8 @@ def _unpack_affine(packed: np.ndarray, M: int, K: int, group_size: int,
 
 def quantize_weight(W: np.ndarray, group_size: int, weight_dtype: str, *,
                      clip_search: bool = False, n_clip_candidates: int = 61,
-                     clip_range: tuple = (0.4, 1.0), scale_dtype: str = "f32") -> np.ndarray:
+                     clip_range: tuple = (0.4, 1.0), scale_dtype: str = "f32",
+                     affine_zero_on_grid: bool = True) -> np.ndarray:
     """W: [M, K] float-ish array. Returns a flat np.int8 array of M * row_stride_bytes bytes,
     the exact device-side wire format mv_quant.cc reads (bit-for-bit; dtype is int8 purely so the
     generated MLIR types this buffer's shim BDs as ``i8``, matching decode_ddr_bytes.py's parser --
@@ -202,7 +228,7 @@ def quantize_weight(W: np.ndarray, group_size: int, weight_dtype: str, *,
         if clip_search:
             raise ValueError("clip_search is a symmetric-scale search and does not apply to the "
                              "affine dtypes; the affine fit already uses the group's full range")
-        return _pack_affine(W, group_size, weight_dtype)
+        return _pack_affine(W, group_size, weight_dtype, zero_on_grid=affine_zero_on_grid)
     if weight_dtype not in _QMAX:
         raise ValueError(f"unknown weight_dtype {weight_dtype!r} (expected 'int4' or 'int8')")
     M, K = W.shape
