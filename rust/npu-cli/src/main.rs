@@ -1131,6 +1131,61 @@ fn reload(path: &Path, port: Option<u16>) -> Result<()> {
     Ok(())
 }
 
+/// What an edit did, for the path where the SERVICE performed it and this process therefore never
+/// built the local `note`. Kept beside `admin_call` so the two stay in step.
+fn describe(action: &ConfigCmd) -> String {
+    match action {
+        ConfigCmd::Show => String::new(),
+        ConfigCmd::AddModel { name, scenario } => format!("model {name} -> {scenario}"),
+        ConfigCmd::RemoveModel { name } => format!("removed model {name}"),
+        ConfigCmd::Pin { model } => format!("pinned {model} resident"),
+        ConfigCmd::Unpin { model } => format!("unpinned {model}"),
+        ConfigCmd::Set { key, value } => format!("server.{key} = {value}"),
+        ConfigCmd::SetDefault { capability, model } => format!("default {capability} = {model}"),
+    }
+}
+
+/// The `/admin` call that performs one config mutation, or `None` for a read-only subcommand.
+///
+/// `engine.toml` has two possible writers -- this CLI and the service, which rewrites it for every
+/// other `/admin` route -- and two writers on one file is a race waiting for the day both run at
+/// once. So when a service is up it does the writing, and this reduces to naming the request; the
+/// local path below is for when there is no service, where there is no one to race.
+fn admin_call(action: &ConfigCmd) -> Option<(&'static str, String, String)> {
+    let esc = npu_runtime::http::parse::json_escape;
+    match action {
+        ConfigCmd::Show => None,
+        ConfigCmd::AddModel { name, scenario } => Some((
+            "POST", "/admin/models".into(),
+            format!("{{\"name\":\"{}\",\"scenario\":\"{}\"}}", esc(name), esc(scenario)))),
+        ConfigCmd::RemoveModel { name } => Some(("DELETE", format!("/admin/models/{name}"), String::new())),
+        ConfigCmd::Pin { model } => Some((
+            "POST", format!("/admin/models/{model}/resident"), "{\"resident\":true}".into())),
+        ConfigCmd::Unpin { model } => Some((
+            "POST", format!("/admin/models/{model}/resident"), "{\"resident\":false}".into())),
+        ConfigCmd::Set { key, value } => Some((
+            "POST", "/admin/server".into(),
+            format!("{{\"key\":\"{}\",\"value\":\"{}\"}}", esc(key), esc(value)))),
+        ConfigCmd::SetDefault { capability, model } => Some((
+            "POST", "/admin/defaults".into(),
+            format!("{{\"capability\":\"{}\",\"model\":\"{}\"}}", esc(capability), esc(model)))),
+    }
+}
+
+/// Ask the running service to make the edit. Returns its reconcile summary.
+///
+/// A rejection here is the CLI's error: `http_req` returns only the body, so a 400 would otherwise
+/// read as success -- the same `{"error":...}` convention `npu load` already follows.
+fn edit_via_service(port: u16, action: &ConfigCmd) -> Result<String> {
+    let (method, route, body) = admin_call(action).expect("caller checked this is a mutation");
+    let resp = http_req(port, method, &route, &body)
+        .context(Tagged(Code::NoService, "config edit (is the server running?)".into()))?;
+    let v: serde_json::Value = serde_json::from_str(&resp)
+        .with_context(|| format!("unexpected reply: {resp}"))?;
+    if let Some(e) = v.get("error").and_then(|e| e.as_str()) { return Err(admin_err(e, port)) }
+    Ok(summarise_reload(&resp))
+}
+
 /// Apply a just-saved config to the running service, if there is one.
 ///
 /// An edit to desired state that leaves actual state alone is a footgun with a manual step: the
@@ -1332,6 +1387,22 @@ fn config_cmd(path: &Path, action: &ConfigCmd, no_reload: bool) -> Result<()> {
         print!("{}", render(&load_cfg(path)?));
         return Ok(());
     }
+    // The service owns the file whenever there is one. `--no-reload` opts out of that too: it
+    // means "change desired state without disturbing what is running", and routing the write
+    // through the process that would immediately reconcile is the opposite of that.
+    let port = load_cfg(path).map(|c| c.server.port).unwrap_or(0);
+    if !no_reload && port != 0 && listener_is_ours(port) {
+        let applied = edit_via_service(port, action)?;
+        // Re-read: the SERVICE wrote it, so this reports the file as it now is rather than as this
+        // process believes it should be.
+        let cfg = load_cfg(path)?;
+        println!("{}  [{}]", describe(action), path.display());
+        println!("applied: {applied}");
+        if let Some(w) = cfg.pin_overcommit() { eprintln!("WARNING: {w}"); }
+        if let Some(w) = pins_behind_admission(&cfg) { eprintln!("WARNING: {w}"); }
+        return Ok(());
+    }
+
     let mut doc = npu_runtime::ConfigDoc::load(path).map_err(|e| anyhow!(e))?;
     // What to print once the write lands. Held rather than printed inline so a command that then
     // fails validation says nothing, instead of reporting a change it did not make.
@@ -1538,6 +1609,29 @@ mod tests {
         assert_eq!(hms(59), "59s");
         assert_eq!(hms(61), "1m01s");
         assert_eq!(hms(3_661), "1h01m01s");
+    }
+
+    /// Every mutating subcommand must have a route, or it would silently fall back to writing the
+    /// file itself while a service was running -- which is the two-writer case this closes.
+    #[test]
+    fn every_config_mutation_maps_to_an_admin_route() {
+        for action in [
+            ConfigCmd::AddModel { name: "m".into(), scenario: "s.toml".into() },
+            ConfigCmd::RemoveModel { name: "m".into() },
+            ConfigCmd::Pin { model: "m".into() },
+            ConfigCmd::Unpin { model: "m".into() },
+            ConfigCmd::Set { key: "max_resident".into(), value: "2".into() },
+            ConfigCmd::SetDefault { capability: "asr".into(), model: "m".into() },
+        ] {
+            let call = admin_call(&action);
+            assert!(call.is_some(), "no route for {}", describe(&action));
+            let (method, route, _) = call.unwrap();
+            assert!(matches!(method, "POST" | "DELETE"), "{method} {route}");
+            assert!(route.starts_with("/admin/"), "{route}");
+            assert!(!describe(&action).is_empty(), "a mutation must describe itself");
+        }
+        // Show reads; it has nothing to send.
+        assert!(admin_call(&ConfigCmd::Show).is_none());
     }
 
     #[test]

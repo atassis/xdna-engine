@@ -184,6 +184,7 @@ pub fn route(req: &Request, handle: &Handle, cfg_path: &Path) -> Response {
         ("POST", "/admin/reload") => admin_reload(handle, cfg_path),
         ("POST", "/admin/models") => admin_add_model(req, handle, cfg_path),
         ("POST", "/admin/defaults") => admin_set_default(req, handle, cfg_path),
+        ("POST", "/admin/server") => admin_set_server(req, handle, cfg_path),
         // Before the generic model routes: these are sub-resources, and a prefix match on
         // `/admin/models/` would otherwise swallow them.
         ("POST", p) if p.starts_with("/admin/models/") && p.ends_with("/resident") =>
@@ -459,6 +460,20 @@ fn admin_set_resident(name: &str, req: &Request, handle: &Handle, cfg_path: &Pat
         true => Ok(()),
         false => Err(format!("unknown model {name:?} (not in the config)")),
     })
+}
+
+/// Set one `[server]` key. The last config mutation the CLI still performed itself, which meant
+/// two processes wrote `engine.toml`: the service through every other `/admin` route, and the CLI
+/// through this one. One file, one writer -- and the writer is whoever owns the reconcile.
+fn admin_set_server(req: &Request, handle: &Handle, cfg_path: &Path) -> Response {
+    let body = String::from_utf8_lossy(&req.body).to_string();
+    let (key, value) = match (extract_str_field(&body, "key"), extract_str_field(&body, "value")) {
+        (Some(k), Some(v)) => (k, v),
+        _ => return (400, "{\"error\":\"need key + value\"}".into()),
+    };
+    // `set_server` validates the key and the value's shape, so an unknown key is a 400 with the
+    // reason rather than a silently ignored write.
+    mutate_and_reconcile(handle, cfg_path, |doc| doc.set_server(&key, &value))
 }
 
 fn admin_set_default(req: &Request, handle: &Handle, cfg_path: &Path) -> Response {
@@ -1687,6 +1702,26 @@ mod generate_tests {
         assert!(x["spans_ms"]["total"].as_f64().unwrap() >= x["spans_ms"]["decode"].as_f64().unwrap());
         assert!(x["bound"].as_str().is_some(), "a verdict, not just numbers");
         assert!(x["lever"].as_str().is_some(), "and what to do about it");
+        h.shutdown(); let _ = j.join();
+    }
+
+    /// The route that closes the two-writer gap: `[server]` keys were the last mutation the CLI
+    /// made to `engine.toml` itself while the service rewrote the same file for everything else.
+    #[test]
+    fn admin_server_edits_the_file_and_rejects_a_key_it_does_not_know() {
+        let (h, j, dir, p, _s, _seen) = gen_handle(ss(&["x"]), Duration::ZERO);
+        let _ = dir;
+        let (code, body) = route(&post("/admin/server", r#"{"key":"max_resident","value":"3"}"#), &h, &p);
+        assert_eq!(code, 200, "{body}");
+        assert!(body.text().contains("\"loaded\""), "answers with a reconcile report: {body}");
+        assert!(std::fs::read_to_string(&p).unwrap().contains("max_resident = 3"),
+            "the SERVICE wrote the file");
+
+        // A key nothing reads is a 400 with the reason, not a silently ignored write.
+        let (code, body) = route(&post("/admin/server", r#"{"key":"no_such_key","value":"1"}"#), &h, &p);
+        assert_eq!(code, 400, "{body}");
+        let (code, _) = route(&post("/admin/server", r#"{"key":"max_resident"}"#), &h, &p);
+        assert_eq!(code, 400, "a request missing `value` is refused");
         h.shutdown(); let _ = j.join();
     }
 
