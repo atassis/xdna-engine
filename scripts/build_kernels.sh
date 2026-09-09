@@ -5,6 +5,36 @@
 # bf16 builds. See docs/08.
 set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"; cd "$REPO"
+
+# ONE FAILING SHAPE MUST NOT STARVE THE REST. Under bare `set -euo pipefail` the first `make` that
+# dies takes the whole script with it, so every family below it is never attempted -- and because
+# the artifacts are gitignored build output, the result looks like "those kernels were never part of
+# this build" rather than like a failure. The comments at the K=768 and native-modal sections record
+# this happening twice before; on 2026-09-09 it happened a third time, at
+# `final_512x768x3072_64x32x96_8c` ('aie.tile' op allocated buffers exceeded available memory), which
+# truncated the whole K=800 modal family, the GELU variant, softmax400 and the parakeet delegation.
+#
+# So: wrap `make` itself -- one definition covers every call site -- record failures, keep going, and
+# exit NON-ZERO with the list at the end. This is not a downgrade of the gate: a partial build still
+# fails loudly and by name. It is the silent TRUNCATION that is removed.
+BUILD_FAILURES=()
+make() {
+  if ! command make "$@"; then
+    BUILD_FAILURES+=("make $*")
+    echo "[build_kernels] FAILED (continuing): make $*" >&2
+  fi
+}
+report_failures() {
+  local rc=$?
+  if [ ${#BUILD_FAILURES[@]} -gt 0 ]; then
+    echo >&2
+    echo "[build_kernels] ${#BUILD_FAILURES[@]} build(s) FAILED:" >&2
+    printf '  %s\n' "${BUILD_FAILURES[@]}" >&2
+    exit 1
+  fi
+  exit $rc
+}
+trap report_failures EXIT
 source scripts/iron_env.sh
 source scripts/kernel_sandbox.sh
 
@@ -82,7 +112,17 @@ cp $PE/ml/silu/build/insts.bin     $PE/ml/silu/build/insts_1228800.bin
 echo "== matmul bf16->f32 (rm stale dtype-agnostic objects first) =="
 rm -f $MM/build/mm_*.o $MMW/build/mm_*.o
 for KN in 768x768 3072x768 768x1536; do K=${KN%x*}; N=${KN#*x}
-  make -C $MM NPU2=1 M=512 K=$K N=$N dtype_in=bf16 dtype_out=f32           # single_core (1 col)
+  # Tolerate the exit, then REQUIRE the xclbin. makefile-common's `all` is
+  # `${xclbin_target} ${targetname}.exe`; the .exe needs a working system XRT, and on this box
+  # xrt-config.cmake raises FATAL_ERROR from inside its own config file. So `all` fails at the
+  # HOST test after the xclbin is already built, and under `set -euo pipefail` that killed this
+  # script and everything below it -- including the whole K=768/K=800 whole_array family, which
+  # then kept the PREVIOUS pin's published copies under the new pin's stamp. Second time this
+  # script has lost that family to an early abort; the comment at the top records the first.
+  # Naming the target directly is not an option: xclbin_target is a make variable.
+  make -C $MM NPU2=1 M=512 K=$K N=$N dtype_in=bf16 dtype_out=f32 || true
+  ls $MM/build/final_*.xclbin >/dev/null 2>&1 \
+    || { echo "[build_kernels] FAIL: single_core K=$K N=$N produced no xclbin" >&2; exit 1; }
 done
 # --- V2 encoder whole_array kernels (default = FAST BFP16_IREE, tile 64x32x96) ---
 # The shipped V2 encoder (two_ctx) runs the WHOLE encoder on ONE resident 768x3072 xclbin via per-N
@@ -153,7 +193,36 @@ done
 # GELU mode (3-branch superset: rtp[0]=2) — only the FFN fc1 width (N=3072). Opt-in via NPU_ENC_GELU_FUSED
 # (folds the Whisper encoder FFN GELU into the fc1 epilogue, ~5-12% encoder / -5% e2e; WER 0.1245 marginal).
 WA_C_DEPTH=1 make -C $MMW -f Makefile.modal NPU2=1 M=512 K=800 N=3072 m=64 k=32 n=96 n_aie_cols=8 emulate_bfloat16_mmul_with_bfp16=1 bfp16_iree=1 gelu=1 build/final_512x800x3072_64x32x96_8c_modalgelu.xclbin
+# WHISPER-TURBO (K_aug=1312). The loops above are K_aug=800, i.e. d_model 768 + the 32-row bias
+# augment; turbo is d_model 1280 -> 1312, with N=1280 (proj/out) and N=5120 (FFN fc1). Same
+# Makefiles, same flags, different numbers -- these were NEVER in this script, so ctx2.rs could ask
+# for a turbo shape that nothing here builds. Found 2026-09-09: the 09-09 re-pin retired the shared
+# sandbox and all six vanished from the live path, leaving copies only in `.stale-*` dirs that
+# kernel_sandbox.sh reaps at 7 days. ctx2.rs:1583 already asserts `kaug() == 1312`, and ci_gate.sh
+# calls the gap "known, in-progress debt" -- it is buildable and now built.
+for N in 1280 5120; do
+  WA_C_DEPTH=1 make -C $MMW -f Makefile.modal NPU2=1 M=512 K=1312 N=$N m=32 k=32 n=32 n_aie_cols=8 emulate_bfloat16_mmul_with_bfp16=1 bfp16_iree=1           build/final_512x1312x${N}_32x32x32_8c_modalsilu.xclbin
+  WA_C_DEPTH=1 make -C $MMW -f Makefile.modal NPU2=1 M=512 K=1312 N=$N m=32 k=32 n=32 n_aie_cols=8 emulate_bfloat16_mmul_with_bfp16=1 bfp16_iree=1 no_silu=1 build/final_512x1312x${N}_32x32x32_8c_modalid.xclbin
+done
+# The two turbo shapes that are not a plain {silu,id} pair: the 64x32x32 proj tile, and the FFN GELU.
+WA_C_DEPTH=1 make -C $MMW -f Makefile.modal NPU2=1 M=512 K=1312 N=1280 m=64 k=32 n=32 n_aie_cols=8 emulate_bfloat16_mmul_with_bfp16=1 bfp16_iree=1 no_silu=1 build/final_512x1312x1280_64x32x32_8c_modalid.xclbin
+WA_C_DEPTH=1 make -C $MMW -f Makefile.modal NPU2=1 M=512 K=1312 N=5120 m=32 k=32 n=32 n_aie_cols=8 emulate_bfloat16_mmul_with_bfp16=1 bfp16_iree=1 gelu=1    build/final_512x1312x5120_32x32x32_8c_modalgelu.xclbin
+make -C $MMW -f Makefile.silu NPU2=1 M=512 K=1312 N=1280 n_aie_cols=8 no_silu=1 build/final_512x1312x1280_32x32x32_8c_bias.xclbin
+
 make -C $PE/ml/softmax400 NPU2=1 build/final.xclbin   # softmax-400 (pad->416)
+
+# PARAKEET/CONFORMER MODAL + RESIDENT BRICKS. Delegated, not inlined: build_parakeet_modal_kernels.sh
+# owns the K=1024 modal family, the LN/FFN/conv brick set and the artifacts/parakeet/ln staging +
+# manifest refresh, and a second copy of that list here would be a seam with no owner.
+#
+# WHY IT IS CALLED FROM HERE AT ALL (2026-09-09). Both scripts write the SAME shared
+# whole_array/build sandbox and both call ensure_fresh_sandbox on it, so whichever ran first after a
+# re-pin retired the dir and rebuilt only ITS OWN subset -- the other family then existed nowhere on
+# the live path. Measured after the 09-09 re-pin: the installed kernel dir held 6 xclbins from the
+# new pin and 11 from the old one under a single current .toolchain-stamp, with 7 shapes missing
+# outright. Chaining them makes "rebuild the kernels" one command with one definition of ALL.
+# The second ensure_fresh_sandbox is a no-op: the stamp matches by then.
+bash scripts/build_parakeet_modal_kernels.sh
 
 echo "All encoder + fusion xclbins built."
 echo "Verify Rust fused encoder: rust/target/release/verify_encoder"
