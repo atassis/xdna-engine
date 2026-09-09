@@ -94,9 +94,17 @@ mod tests {
         assert!(i8.int8_fast_epi);
     }
 
+    /// Serialises the three tests below. They mutate process-global environment variables, and
+    /// cargo runs a crate's tests as threads in ONE process, so without this they interleave and
+    /// each reads a value another one set. Each already carried a comment saying "run
+    /// single-threaded"; nothing enforced it, and the gate went red on a run where the interleaving
+    /// happened to bite. Poisoning is recovered rather than propagated, so one failing test reports
+    /// its own assertion instead of cascading into the others.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn env_override_beats_default() {
-        // mutates process env -> run single-threaded (cargo test -- --test-threads=1)
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("NPU_GLU_FUSED", "0");
         let c = TuningConfig::baked_default(Precision::FastBf16).with_env_overrides();
         assert!(!c.glu_fused, "NPU_GLU_FUSED=0 must override the baked true");
@@ -105,7 +113,7 @@ mod tests {
 
     #[test]
     fn ffn_resident_requested_is_one_semantics() {
-        // mutates process env -> run single-threaded (cargo test -- --test-threads=1)
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("NPU_ENC_FFN_RESIDENT");
         assert!(!ffn_resident_requested(), "unset must resolve to the baked-off default");
         std::env::set_var("NPU_ENC_FFN_RESIDENT", "0");
@@ -120,6 +128,7 @@ mod tests {
     /// -- the defect the single accessor closes.
     #[test]
     fn ffn_resident_agrees_across_both_encoders_env_states() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         for (val, want) in [(None, false), (Some("0"), false), (Some("1"), true)] {
             match val {
                 Some(v) => std::env::set_var("NPU_ENC_FFN_RESIDENT", v),
