@@ -225,6 +225,14 @@ SCALE_IN_QNORM = os.environ.get("SCALE_IN_QNORM", "1") == "1"
 # The previous attempt at this group (fuse/qkv-head) measured +28.2% SLOWER, and neither of its two
 # defects was fusing: see the operator's design.py. Needs FUSE_QKV_GEMV for the concatenated weight.
 FUSE_QKV_DP = os.environ.get("FUSE_QKV_DP", "1") == "1"
+# Build the lm-head as its OWN graph instead of the last op of the fused one, and hand `xf` between
+# them through the host. Measured 2026-09-09: inside the fused graph at >=6 Gemma-4 layers the
+# lm-head's output comes back with whole runs unwritten (2169 elements in 16 runs at 6 layers,
+# doubling at 7) and a few wildly wrong, while the SAME GEMV at the SAME shape is exact standalone
+# (rel-L2 1.41e-05, zero unwritten). So the fault is an interaction with the surrounding design and
+# not the operation. `xf` is D*2 = 7680 bytes, so the round trip is negligible against a step that
+# is already dispatch-dominated. See the-gemma4-fault-is-in-the-lm-head-output-not-the-layers.
+SPLIT_LM_HEAD = os.environ.get("SPLIT_LM_HEAD", "0") == "1"
 
 # Fold the attention output projection (`a = Wo @ cx`) into the SwiGLU MLP data-parallel design:
 # every core computes its own D/N row-slice of `a` from its own row-slice of Wo before doing
@@ -1329,7 +1337,9 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
         weights["W_head"] = bf16(embed_f32).reshape(-1)
     if not scale_in_qnorm:
         weights["attn_scale"] = np.full(Hq * S, sp.attn_scale, BF16)
-    rl += [(op_norm, cur, "n_final", "xf"), (op_head, "W_head", "xf", "logits")]
+    rl += [(op_norm, cur, "n_final", "xf")]
+    if not SPLIT_LM_HEAD:
+        rl += [(op_head, "W_head", "xf", "logits")]
     bufsz["xf"] = D * 2
     bufsz["logits"] = VOCAB * 2
 
@@ -1362,12 +1372,32 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
     # KV StridedCopys. Each duplicate pair costs an extra aiex.configure PER LAYER -- 56 per token
     # against a measured ~40 us each. SHARE_DESIGNS=0 restores the unshared build for an A/B.
     share = os.environ.get("SHARE_DESIGNS", "1") == "1"
+    # Under SPLIT_LM_HEAD the stack's output is `xf`, not the logits. Declaring it as an OUTPUT
+    # rather than leaving it a scratch intermediate is load-bearing twice over: the second graph
+    # needs it, and the output arena is the one that gets synced back -- a scratch read of `xf`
+    # returns zeros at 12 layers while the device plainly computed from it.
+    head_name = "logits" if not SPLIT_LM_HEAD else "xf"
     fused = OperatorSequence(sequence_name(sp, NL, S, placer_flags), rl,
-                              input_args=inputs, output_args=["logits"],
+                              input_args=inputs, output_args=[head_name],
                               buffer_sizes=bufsz, context=ctx, extra_flags=placer_flags,
                               share_designs=share)
     fused.compile()
+
+    # The lm-head as its own graph: one op, `xf` in, logits out, its own W_head. No arena sharing --
+    # `xf` is 7680 bytes and crosses through the host, which costs one small copy per token against a
+    # step that is already dispatch-dominated. Arena sharing via scratch_order is the faster form and
+    # the mechanism exists (gen_llm_prefill.py::decode_arena_plan); this is the correctness fix, and
+    # the two are independent.
+    head = None
+    if SPLIT_LM_HEAD:
+        head_rl = [(op_head, "W_head", "xf", "logits")]
+        head = OperatorSequence(f"{sequence_name(sp, NL, S, placer_flags)}_lmhead", head_rl,
+                                input_args=["xf"], output_args=["logits"],
+                                buffer_sizes={"xf": D * 2, "logits": VOCAB * 2},
+                                context=ctx, extra_flags=placer_flags, share_designs=share)
+        head.compile()
     return sp, fused, weights, dict(NL=NL, S=S, inputs=inputs, cache_names=cache_names,
+                                    head=head, split_lm_head=SPLIT_LM_HEAD,
                                     embed_blob=embed_blob, host_embed=host_embed,
                                     kv_slots=kv_slots)
 

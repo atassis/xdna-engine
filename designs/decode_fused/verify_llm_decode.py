@@ -150,7 +150,13 @@ def main():
                          "the ELF cannot be driven per-token")
     print("[verify] ParameterScratchpad bound (kv_off, sm_mask)")
 
+    # With the lm-head split out, W_head belongs to the SECOND graph's arena and is not in this
+    # one's layout. Partition explicitly rather than skipping on KeyError, so a weight that belongs
+    # to neither graph is still a loud failure.
+    head_only = {"W_head"} if md.get("split_lm_head") else set()
     for name, arr in weights.items():
+        if name in head_only:
+            continue
         buf = c.get_buffer(name)
         load_weight_buffer(buf, arr)
     # FLUSH SCRATCH. Every weight and both KV caches live in the scratch arena, and the callable
@@ -220,6 +226,16 @@ def main():
     # the dtype already matches (see gen_llm_decode.py::npy for what that cost).
     head_w = (np.load(os.path.join(a.weights, f"{sp.weight_prefix}embed_tokens.weight.npy"),
                       mmap_mode="r") if a.host_lm_head else None)
+    # The split-lm-head arm: a second graph holding only the lm-head. Its W_head is loaded into its
+    # OWN arena, and `xf` crosses between the two through the host -- 7680 bytes a token.
+    head_seq = md.get("head")
+    head_c = None
+    if head_seq is not None:
+        head_c = head_seq.get_callable()
+        load_weight_buffer(head_c.get_buffer("W_head"), weights["W_head"])
+        head_c.scratch_buffer.device = "cpu"
+        head_c.scratch_buffer.to("npu")
+        print(f"[verify] lm-head split into its own dispatch ({head_seq.name})", file=sys.stderr)
     topk_ids, topk_logits = [], []
     # Per produced step: (device top-1 logit, logit the device gave the ORACLE's token).
     # This is what classifies a mismatch. The oracle's stored `margins` describe a DIFFERENT
@@ -252,7 +268,18 @@ def main():
         # source now (iron/common/sequence.py forces host residency, mirroring _sync_outputs), so
         # a second dispatch would only double the cost and mask a regression in the real fix.
         c()
-        if a.host_lm_head:
+        if head_c is not None:
+            # stack -> xf (a declared OUTPUT, so it is synced), then the head graph -> logits.
+            _xf = np.asarray(c.get_buffer("xf").data, BF16)
+            if pos == 0:
+                _f = np.asarray(_xf, np.float32)
+                print(f"[split] xf: size={_f.size} nonzero={int((_f!=0).sum())} "
+                      f"norm={float(np.linalg.norm(_f)):.6g}", file=sys.stderr)
+            with head_c.get_buffer("xf").overwrite() as _b:
+                _b[:] = _xf.reshape(-1)
+            head_c()
+            lg = np.asarray(head_c.get_buffer("logits").data[:VOCAB], dtype=np.float32)
+        elif a.host_lm_head:
             # `xf` lives in the SCRATCH arena, and the device is non-coherent: the host's copy is
             # whatever was last written from this side unless it is pulled back. The output arena is
             # synced for us, scratch is not -- which is why this read returned all zeros at 12
