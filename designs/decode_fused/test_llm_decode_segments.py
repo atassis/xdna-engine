@@ -127,3 +127,26 @@ def test_a_segment_declares_only_the_angle_tables_its_layers_read(build, nseg):
 def test_more_segments_than_layers_is_refused(build):
     with pytest.raises(SystemExit, match="exceeds the"):
         build(LAYERS + 1)
+
+
+@pytest.mark.parametrize("nseg", [2, 3])
+def test_each_segment_declares_only_its_own_kv_slots(build, nseg):
+    """kv_off/kv_off1/... are named per GEOMETRY and baked into that geometry's StridedCopy.
+
+    A segment's scratchpad therefore declares only the slots its own layers' head_dims use, and
+    writing one it does not have raises "ParameterScratchpad: unknown parameter". Gemma-4-12B is
+    where this bites -- sliding layers at head_dim 256, global at 512 -- and it cost a device run
+    on 2026-09-09. gemma3-270m is uniform so this passes trivially here; the assertion exists to
+    fail if the derivation regresses on a multi-geometry spec.
+    """
+    sp, _f, _w, md = build(nseg)
+    segs = md["segments"]
+    every = {n for s in segs for n, _ in s["kv_slots"]}
+    for s in segs:
+        la, lb = s["layers"]
+        want = {sp.head_dim_for(l) for l in range(la, lb)}
+        assert {hd for _, hd in s["kv_slots"]} == want, \
+            f"segment {s['seq'].name} slots do not match its layers' head_dims"
+    # Union over segments must be the whole model's slot set -- a slot owned by nobody is a KV
+    # cache the host never advances, which reads as a model that stops attending to its history.
+    assert every == {n for n, _ in md["kv_slots"]}

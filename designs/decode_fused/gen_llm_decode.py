@@ -1632,8 +1632,18 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
         seg_caches = cache_names if one else [n for n in cache_names if n in refs]
         check_arena_offsets_are_addressable(
             seq, [*seg_inputs, seg_out, *(weights if one else seg_weights), *seg_caches])
+        # PER-SEGMENT KV SLOTS. `kv_off`/`kv_off1`/... are named per GEOMETRY in first-appearance
+        # order and baked into that geometry's StridedCopy, so a segment's scratchpad declares only
+        # the slots its own layers' head_dims use. Gemma-4 is the case: sliding layers are hd 256
+        # and global ones hd 512, so a segment holding no global layer has no `kv_off1` and writing
+        # one raises "ParameterScratchpad: unknown parameter". Derived from head_dim_for(), the same
+        # source the names were assigned from, rather than by probing the scratchpad -- a probe
+        # would silently skip a slot that SHOULD have been there.
+        seg_hds = {sp.head_dim_for(l) for l in range(la, lb)}
+        seg_kv_slots = [(n, hd) for n, hd in kv_slots if hd in seg_hds]
         segments.append(dict(seq=seq, layers=(la, lb), inlet=seg_in, outlet=seg_out,
-                             weights=seg_weights, caches=seg_caches, inputs=seg_inputs))
+                             weights=seg_weights, caches=seg_caches, inputs=seg_inputs,
+                             kv_slots=seg_kv_slots))
         if len(cuts) > 1:
             print(f"[gen] segment {si}: layers {la}..{lb - 1}, {seg_in} -> {seg_out}, "
                   f"{len(seg_weights)} weights, arena {seq.buffer_sizes[2] / 2**30:.3f} GiB",

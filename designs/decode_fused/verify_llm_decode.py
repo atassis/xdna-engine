@@ -335,7 +335,9 @@ def main():
             # ONE WRITE PER DISTINCT head_dim, off the artifact's own kv_params. `pos * head_dim` is
             # two different byte offsets under per-layer geometry, and a single write silently hands
             # the global layers the sliding layers' KV offset.
-            for slot_name, slot_hd in kv_slots:
+            # THIS SEGMENT'S slots, not the whole graph's: the names are per geometry, so a
+            # segment with no global layer has no `kv_off1` and writing one raises.
+            for slot_name, slot_hd in _st["sg"]["kv_slots"]:
                 _sp_.write(slot_name, int(pos * slot_hd))
             _sp_.write("sm_mask", int(pos + 1))
             _sp_.sync()
