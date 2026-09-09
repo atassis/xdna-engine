@@ -32,6 +32,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import newstack_compat  # noqa: F401,E402
 from gen_llm_decode import build_graph, report_artifact_freshness, load_weight_buffer, isolate_build_dir  # noqa: E402
 from redispatch_check import assert_redispatch_identical  # noqa: E402
+from iron.common.kv_layout import KVLayout  # noqa: E402
 
 BF16 = ml_dtypes.bfloat16
 
@@ -109,9 +110,10 @@ def main():
     steps = a.steps if a.steps is not None else len(gen_ids)
 
     sp, fused, weights, md = build_graph(a.spec, a.weights, a.layers, a.max_seq)
-    NL, S = md["NL"], md["S"]
+    NL, S, T = md["NL"], md["S"], md["T"]
     HD, D, VOCAB = sp.head_dim, sp.d_model, sp.vocab
-    print(f"[verify] {sp.name}: {NL} layers, S={S}, vocab={VOCAB}")
+    kv_layout = KVLayout(Hkv=sp.n_kv_heads, S=S, HD=HD, T=T)
+    print(f"[verify] {sp.name}: {NL} layers, S={S}, kv_block={T}, vocab={VOCAB}")
 
     c = fused.get_callable()
     params = c.params
@@ -175,7 +177,7 @@ def main():
             _buf[:] = np.asarray(embed[tok] * scale, BF16).reshape(-1)
         with rope_buf.overwrite() as _buf:
             _buf[:] = rope_row(pos, HD, sp.rope_theta_global).reshape(-1)
-        params.write("kv_off", int(pos * HD))
+        params.write("kv_off", int(kv_layout.kv_off(pos)))
         params.write("sm_mask", int(pos + 1))
         params.sync()
         # ONE dispatch per position. The duplicate that used to sit here worked around

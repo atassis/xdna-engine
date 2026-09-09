@@ -133,14 +133,26 @@ pub struct LlmArtifact {
     pub vocab: Option<usize>,
     pub n_layers: usize,
     /// `meta.json`'s `dims.S` -- how many token positions the on-device KV cache holds. `kc`/`vc`
-    /// are `[Hkv, S, HD]`, so this is an exact capacity, not a hint, and it is a BUILD parameter:
-    /// the head stride depends on it, so changing the window means a different artifact.
+    /// are laid out `[S/kv_block, Hkv, kv_block, HD]` (see [`Self::kv_block`]), so this is an
+    /// exact capacity, not a hint, and it is a BUILD parameter: the cache's own strides depend on
+    /// it, so changing the window means a different artifact.
     ///
     /// Required, like its sibling dims, deliberately. It was recorded here and read by nobody,
     /// which left `pos` unbounded all the way to the dispatch -- and the overrun is silent, since
     /// position S lands on head 1's row 0 rather than outside the arena. An artifact that cannot
     /// say how big its window is cannot have that window enforced, so it fails to load instead.
     pub max_seq: usize,
+    /// `meta.json`'s `dims.kv_heads` -- the KV cache's head count, needed (alongside
+    /// [`Self::max_seq`] and [`Self::head_dim`]) to compute [`crate::llm::kv_layout::kv_off`]'s
+    /// block term. Was already emitted in `meta.json` and simply never read into this struct
+    /// before the KV cache had more than one block to address.
+    pub kv_heads: usize,
+    /// `meta.json`'s `dims.kv_block` -- `iron.common.kv_layout.KVLayout`'s `T`: how many
+    /// positions share one contiguous run per head before the cache layout returns to head 0's
+    /// next block. Equal to [`Self::max_seq`] (one block, the pre-blocking flat layout) on any
+    /// artifact built before this field existed, via a default rather than a parse failure -- an
+    /// artifact with no `dims.kv_block` at all IS a flat-layout one, not a malformed one.
+    pub kv_block: usize,
     /// `meta.json`'s `dims.M` -- how many token positions ONE dispatch of this ELF covers. 1 on a
     /// decode artifact (absent from its meta, and the decode graph IS the M=1 instance of the
     /// prefill graph); the batch on a prefill artifact, where it is required and where every
@@ -289,6 +301,27 @@ impl LlmArtifact {
         };
         let n_layers = dim("layers")?;
         let max_seq = dim("S")?;
+        // Both absent on any artifact built before blocking landed (including this file's own
+        // pre-blocking test fixtures). Default kv_block to max_seq -- one block, the pre-blocking
+        // flat layout, exactly what such an artifact IS -- rather than failing to load an
+        // otherwise valid old artifact over a field it had no reason to carry. kv_heads then
+        // defaults harmlessly to 0: kv_off's block term multiplies by kv_heads only when
+        // `pos / kv_block > 0`, which cannot happen while kv_block == max_seq and pos < max_seq,
+        // so an unknown kv_heads is provably never read in that case.
+        let kv_block = match dims.get("kv_block") {
+            None | Some(serde_json::Value::Null) => max_seq,
+            Some(v) => v
+                .as_u64()
+                .ok_or_else(|| ctx("dims.kv_block present but non-numeric".to_string()))?
+                as usize,
+        };
+        let kv_heads = match dims.get("kv_heads") {
+            None | Some(serde_json::Value::Null) if kv_block == max_seq => 0,
+            other => other
+                .and_then(|v| v.as_u64())
+                .ok_or_else(|| ctx("dims.kv_heads missing/non-numeric".to_string()))?
+                as usize,
+        };
         // `dims.M` is what makes a prefill artifact drivable: it sizes `x` and the RoPE angle
         // block, it is the padded chunk width, and it is the batch the causal width is derived
         // from. A decode artifact does not carry it and does not need to -- decode IS M=1.
@@ -583,6 +616,8 @@ impl LlmArtifact {
             vocab,
             n_layers,
             max_seq,
+            kv_heads,
+            kv_block,
             batch,
             embed_scale,
             rope_theta_global,
@@ -1054,6 +1089,48 @@ mod tests {
         meta["dims"]["S"] = serde_json::json!(512);
         write_meta(dir.path(), &meta);
         assert_eq!(LlmArtifact::load(dir.path()).unwrap().max_seq, 512);
+    }
+
+    #[test]
+    fn an_artifact_with_no_dims_kv_block_reads_as_the_flat_pre_blocking_layout() {
+        // base_meta() (and every fixture in this file that predates the KV-blocked-layout task)
+        // declares neither dims.kv_block nor dims.kv_heads -- exactly what a real artifact built
+        // before that task looks like. It must still load, with kv_block defaulting to max_seq.
+        let dir = tempfile::tempdir().unwrap();
+        let mut meta = base_meta(8, 4, serde_json::json!({"rope_global": {"type": "input", "offset": 8, "len": 8}}));
+        meta["dims"]["S"] = serde_json::json!(512);
+        assert!(meta["dims"].get("kv_block").is_none());
+        write_meta(dir.path(), &meta);
+        let art = LlmArtifact::load(dir.path()).unwrap();
+        assert_eq!(art.kv_block, 512);
+        assert_eq!(art.kv_block, art.max_seq);
+    }
+
+    #[test]
+    fn a_blocked_artifact_declares_both_kv_block_and_kv_heads() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut meta = base_meta(8, 4, serde_json::json!({"rope_global": {"type": "input", "offset": 8, "len": 8}}));
+        meta["dims"]["S"] = serde_json::json!(4096);
+        meta["dims"]["kv_block"] = serde_json::json!(128);
+        meta["dims"]["kv_heads"] = serde_json::json!(8);
+        write_meta(dir.path(), &meta);
+        let art = LlmArtifact::load(dir.path()).unwrap();
+        assert_eq!(art.kv_block, 128);
+        assert_eq!(art.kv_heads, 8);
+    }
+
+    #[test]
+    fn a_blocked_artifact_missing_kv_heads_fails_loud_rather_than_guessing() {
+        // kv_block < max_seq with kv_heads absent CANNOT default harmlessly (unlike the flat
+        // case): the block term is genuinely read once pos crosses one block. Silently defaulting
+        // to 0 would compute a wrong kv_off instead of refusing to load.
+        let dir = tempfile::tempdir().unwrap();
+        let mut meta = base_meta(8, 4, serde_json::json!({"rope_global": {"type": "input", "offset": 8, "len": 8}}));
+        meta["dims"]["S"] = serde_json::json!(4096);
+        meta["dims"]["kv_block"] = serde_json::json!(128);
+        write_meta(dir.path(), &meta);
+        let err = LlmArtifact::load(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("kv_heads"), "must name the missing field: {err}");
     }
 
     // ------------------------------------------------------------------------------------

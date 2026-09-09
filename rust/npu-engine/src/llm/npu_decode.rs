@@ -6,7 +6,8 @@
 //! (`designs/decode_fused/verify_llm_decode.py:99-112`):
 //!   1. host gathers `embed[token] * scale` -> write to `x`
 //!   2. host computes the RoPE angle row for `pos` -> write to `rope_global`
-//!   3. host writes ctrl-scratchpad `kv_off = pos*head_dim` and `sm_mask = pos+1`
+//!   3. host writes ctrl-scratchpad `kv_off = crate::llm::kv_layout::kv_off(pos, ...)` (`pos*head_dim`
+//!      at the pre-blocking `kv_block == max_seq` default) and `sm_mask = pos+1`
 //!   4. one dispatch (the whole layer stack)
 //!   5. read back `logits`
 //!
@@ -454,7 +455,13 @@ impl DecodeStep for NpuDecodeStep {
         // `kv_off` is "addr"-kind (element-unit BD offset, no shift); `sm_mask` is "core"-kind and
         // the firmware's UPDATE_REG convention requires the host to pre-shift it left by 2 bits
         // (matches `asr::whisper_decoder::FusedDecoder::dispatch_resident`).
-        let kv_val = (pos * self.artifact.head_dim) as u32;
+        //
+        // `crate::llm::kv_layout::kv_off` is the single owner of this formula -- see its module
+        // doc. At `kv_block == max_seq` (every artifact built before the KV cache was blocked)
+        // this is exactly `pos * head_dim`, the formula this line used to spell out directly.
+        let kv_val = crate::llm::kv_layout::kv_off(
+            pos, self.artifact.kv_block, self.artifact.head_dim, self.artifact.kv_heads,
+        ) as u32;
         self.res
             .write_scratchpad(self.artifact.kv_off.byte_offset, &kv_val.to_le_bytes())
             .map_err(|e| EngineError::Device(format!("write kv_off scratchpad: {e}")))?;
