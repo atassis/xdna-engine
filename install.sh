@@ -528,6 +528,13 @@ stage_copy() {  # name, source
     mv "$dst" "$ENGINE_ROOT/$name.prev-$(date +%Y%m%dT%H%M%S)"
   fi
   mv "$new" "$dst"
+  # Keep exactly ONE previous copy. Retiring on every run is right -- the whole point of copying is
+  # that production survives the source tree changing, so the rollback must not live in the source
+  # either -- but without a prune it grows by a full tree per install, and three runs in one evening
+  # left two dead artifacts.prev-* here. Newest survives; the rest go.
+  ls -1dt "$ENGINE_ROOT/$name.prev-"* 2>/dev/null | tail -n +2 | while IFS= read -r old; do
+    rm -rf -- "$old" && echo "  pruned superseded $(basename "$old")"
+  done
   local sz; sz="$(du -sh "$dst" 2>/dev/null | cut -f1)"
   ok "  $name copied ($sz, extents shared where the filesystem allows) <- $(readlink -f "$src")"
 }
@@ -548,6 +555,42 @@ if [ -L "$ENGINE_ROOT/mlir-aie" ] || [ -d "$ENGINE_ROOT/mlir-aie" ]; then
   ok "  retired the mlir-aie link from a previous install (a compiler tree is not an artifact)"
 fi
 ok "Production root staged."
+
+# ---- The THIRD half: artifacts must agree with the lock staged beside them ----
+# Section 4 copies kernels and toolchain.lock TOGETHER because two halves from different pins made
+# the service refuse to start. Artifacts are a third half and nothing checked them: a re-pin in the
+# checkout followed by an install stages the NEW lock next to artifacts built against the OLD one,
+# and `npu generate` then dies with `toolchain-stale` -- correctly, but only at first use, which is
+# after the operator has walked away. Observed 2026-09-09, twice in one evening.
+#
+# Artifacts are NOT rebuilt here (a decode build is minutes and needs its own flags and IRON), so
+# this refuses and names the command instead of guessing.
+staged_pin=$(sed -e 's/[[:space:]]*#.*$//' -e '/^[[:space:]]*$/d' "$ENGINE_ROOT/toolchain.lock" \
+             | sha256sum | cut -c1-12)
+while IFS= read -r scen; do
+  [ -n "$scen" ] || continue
+  case "$scen" in /*) scen_abs="$scen" ;; *) scen_abs="$ENGINE_ROOT/$scen" ;; esac
+  [ -f "$scen_abs" ] || continue
+  dec=$(grep -oP '^\s*decode\s*=\s*"\K[^"]+' "$scen_abs" | head -1 || true)
+  [ -n "$dec" ] || continue
+  case "$dec" in /*) dec_abs="$dec" ;; *) dec_abs="$ENGINE_ROOT/$dec" ;; esac
+  meta="$dec_abs/meta.json"
+  [ -f "$meta" ] || continue
+  # json, not grep: meta.json is pretty-printed, so `"toolchain": {` and `"hash":` sit on different
+  # lines and a line-based -oP finds nothing. That failed OPEN -- the check silently passed every
+  # artifact -- which is the worst way for a guard to be wrong.
+  built=$("$ONNX_ASR_PY" -c 'import json,sys
+print(json.load(open(sys.argv[1])).get("toolchain",{}).get("hash",""))' "$meta" 2>/dev/null || true)
+  [ -n "$built" ] || continue          # unstamped: the engine warns, this does not block
+  [ "$built" = "$staged_pin" ] || die "artifact/toolchain mismatch in the staged root:
+  $meta
+  built against $built, but the staged toolchain.lock is $staged_pin.
+  The service will refuse to load this model. Rebuild it against the current pin:
+    FUSE_DECODE_LAYER=1 scripts/build_llm_decode.sh $(basename "$(dirname "$dec_abs")") \"\" <out>
+    DECODE_META=<out>/meta.json scripts/build_prefill.sh ...
+  then re-run install. Or restore the previous pin in toolchain.lock if the bump was not intended."
+done < <(grep -oP '^\s*scenario\s*=\s*"\K[^"]+' "$ENGINE_CONFIG")
+ok "Staged artifacts agree with the staged pin ($staged_pin)."
 
 info "Preflighting engine config: $ENGINE_CONFIG"
 [ -f "$ENGINE_CONFIG" ] || die "engine config missing: $ENGINE_CONFIG
