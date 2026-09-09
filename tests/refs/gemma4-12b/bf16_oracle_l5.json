@@ -1,6 +1,6 @@
 {
   "model": "unsloth/gemma-4-12b-it",
-  "layers": 6,
+  "layers": 5,
   "logit_softcap_disabled": true,
   "logit_softcap_value": 30.0,
   "prompt": "The capital of France is",
@@ -12,24 +12,24 @@
     563
   ],
   "gen_ids": [
-    219173,
-    94522,
     255999,
-    30363,
-    148113,
-    111872,
-    236871,
-    594
+    236889,
+    3365,
+    14912,
+    116893,
+    255999,
+    236889,
+    13314
   ],
   "margins": [
-    4.0,
-    26.0,
-    24.0,
-    24.0,
+    18.0,
+    8.0,
     2.0,
-    22.0,
-    0.0,
-    8.0
+    4.0,
+    20.0,
+    96.0,
+    6.0,
+    4.0
   ],
   "hf_f32_gen_ids": null,
   "note": "Faithful bf16 host forward via the checkpoint's own modeling code -- the oracle a bf16 DEVICE should match 1:1. `margins` is top1-top2 per step: a mismatch at a margin near the device's own logit error is a knife-edge, not a defect. hf_f32_gen_ids is kept for contrast; it is NOT the gate."

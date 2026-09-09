@@ -1342,7 +1342,14 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
             print(f"  {k:16} {v:5}")
         raise SystemExit(0)
 
-    inputs = ["x", "rope_global"] + (["rope_local"] if sp.rope_theta_local is not None else [])
+    # Declare the angle buffers the BUILT layers actually read, not the ones the spec could
+    # produce at full depth. The two differ under truncation: Gemma-4 is global on layers
+    # where (l+1)%sw_pattern == 0, so `--layers 5` is sliding-only and declaring
+    # `rope_global` there makes calculate_buffer_layout refuse the design -- "Input argument
+    # rope_global not found in runlist buffers" -- because no op consumes it. Same rule as
+    # the per-layer `ang` selection above, read over the range that was emitted.
+    angs = {"rope_global" if sp.is_global(l) else "rope_local" for l in range(NL)}
+    inputs = ["x"] + [n for n in ("rope_global", "rope_local") if n in angs]
     # cores-per-col=1 spreads each operator's workers one per column instead of stacking them four
     # deep in two columns, which is what the default column-major SequentialPlacer does. Every op
     # here has <= 8 workers, so one per column fits the 8-column array. Overridable because this is
