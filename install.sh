@@ -493,6 +493,24 @@ while IFS= read -r scen; do
     [ -d "$wabs" ] && [ -n "$(ls -A "$wabs" 2>/dev/null)" ] \
       || die "scenario '$scen_abs' points at missing/empty weights: $wabs"
   fi
+
+  # A batched-prefill artifact shares one FusedArena with its decode ELF (prefill emits no
+  # weight .bin files of its own -- meta.json's `weights_from` names decode's `buffers/`
+  # instead), so every weight/cache buffer must sit at an identical scratch offset in both.
+  # rust/npu-engine/src/llm/artifact.rs::check_shared_layout_agrees re-checks this at LOAD and
+  # refuses to bind a disagreeing pair -- but only a rebuild of prefill exercises that path, so
+  # a decode rebuilt without its paired prefill installed clean and crash-looped the service on
+  # restart (observed 2026-09-09). Catch it here instead. Scenarios with no `prefill` line (or
+  # a prefill built with NO_ARENA_SHARE=1, which leaves `weights_from` unset) are not
+  # arena-shared and the checker below is a no-op for them.
+  decode_rel=$(grep -oP '^\s*decode\s*=\s*"\K[^"]+' "$scen_abs" | head -1)
+  prefill_rel=$(grep -oP '^\s*prefill\s*=\s*"\K[^"]+' "$scen_abs" | head -1)
+  if [ -n "$decode_rel" ] && [ -n "$prefill_rel" ]; then
+    case "$decode_rel" in /*) decode_abs="$decode_rel" ;; *) decode_abs="$ENGINE_ROOT/$decode_rel" ;; esac
+    case "$prefill_rel" in /*) prefill_abs="$prefill_rel" ;; *) prefill_abs="$ENGINE_ROOT/$prefill_rel" ;; esac
+    "$ONNX_ASR_PY" "$REPO/scripts/check_prefill_arena_pairing.py" "$decode_abs" "$prefill_abs" \
+      || die "scenario '$scen_abs': decode/prefill shared-arena preflight failed -- see the message above."
+  fi
   ok "  scenario OK: $(basename "$scen_abs") (kind=$kind, weights=${wdir:-<none>})"
 done < <(grep -oP '^\s*scenario\s*=\s*"\K[^"]+' "$ENGINE_CONFIG")
 
