@@ -80,8 +80,9 @@ serve` is the one process that owns the NPU continuously and answers HTTP reques
 
 Every generation prints a one-line measurement to stderr (tokens/s, ms/token, the latency
 tail, and which layer the time actually went to). `npu generate --stats` prints the full
-breakdown instead; `--stats-log FILE` writes a per-token record you can read back with
-`npu stats` or re-emit with `npu replay`. See [measurement.md](measurement.md).
+breakdown instead. `--output json` streams the whole thing as NDJSON on stdout -- one line
+per token, carrying that token's own timing -- so `> run.jsonl` gives you a file `npu
+stats` and `npu replay` read back. See [measurement.md](measurement.md).
 
 ## What success looks like
 

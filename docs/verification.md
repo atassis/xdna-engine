@@ -128,7 +128,7 @@ For a change that is supposed to alter nothing about decode at all -- instrument
 plumbing, a refactor -- the same bar applies with the shipped binary as its own reference:
 run the candidate and the pre-change build over one prompt at a fixed seed and temperature
 0 and require byte-identical output, plus repetitions of each to separate a real
-difference from run-to-run drift. A JSONL run log (`npu generate --stats-log`, see
+difference from run-to-run drift. A JSONL run log (`npu generate --output json`, see
 [measurement.md](measurement.md)) makes that comparison token-level rather than
 text-level: `npu stats --diff` aligns two runs on `seq`, reports the first divergent
 token id before it prints any timing, and refuses to read a speed difference as a speedup

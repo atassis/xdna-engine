@@ -157,19 +157,30 @@ truncated log parses: a run killed mid-generation is exactly when a log is worth
 reports as truncated rather than as a run with no tokens. An unknown `object` is skipped rather than
 rejected, so a log written by a later version stays readable.
 
-Write one with `npu generate --stats-log FILE`, or set `NPU_TELEMETRY_LOG=<dir>` on the service to
-get one per request. The env var serves the case the per-request opt-in cannot: the run you did not
-know you would need to explain, which you only find out about afterwards.
+Write one by redirecting the CLI's own output -- `npu generate "..." --output json > run.jsonl` --
+or set `NPU_TELEMETRY_LOG=<dir>` on the service to get one per request. There is deliberately no
+"log to this file" flag: the shell already redirects, tees and pipes, and such a flag would be a
+second output destination that can disagree with the first. The env var is the exception, because a
+daemon has no per-request stdout to redirect, and it serves the case the per-request opt-in cannot:
+the run you did not know you would need to explain, which you only find out about afterwards.
 
 ## 7. Reading them back
 
 ```
-npu generate "..." --stats            # full breakdown after the answer, on stderr
-npu generate "..." --output json      # the completion object, with timings and x_npu
-npu stats run.jsonl                   # render a log
-npu stats a.jsonl --diff b.jsonl      # compare two runs
+npu generate "..." --stats               # full breakdown after the answer, on stderr
+npu generate "..." --output json         # NDJSON on stdout, one line per token, live
+npu generate "..." --output json --no-stream   # one chat.completion object instead
+npu stats run.jsonl                      # render a log
+npu stats a.jsonl --diff b.jsonl         # compare two runs
 npu replay run.jsonl [--realtime] [--frames]
 ```
+
+`--output json` follows the stream flag, the way `/v1/chat/completions` does, so the streaming form
+IS the run-log format: `> run.jsonl` produces a file the two readers below accept, `| tee run.jsonl`
+keeps one while you watch, and `| jq 'select(.object=="chat.completion.chunk") | .x_npu.time.dt_ms'`
+prints inter-token latencies as they happen. Lines are flushed individually, because a
+block-buffered pipe would otherwise hold the whole run and emit it at the end. In JSON mode the
+completion text is not echoed separately -- it is inside each chunk's `delta.content`.
 
 `npu stats --diff` reports **token divergence first**. A timing difference between two runs that
 produced different tokens is not a regression, it is a different computation, and printing the

@@ -19,6 +19,12 @@ pub struct Cli {
     #[arg(long, global = true, value_hint = ValueHint::FilePath)]
     pub config: Option<PathBuf>,
     /// Output format for commands that have a machine-readable form.
+    ///
+    /// For `generate` and `chat`, `json` follows the stream flag the way `/v1/chat/completions`
+    /// does: streaming (the default) writes NDJSON to stdout -- a conditions header, one
+    /// `chat.completion.chunk` per decoded token carrying that token's own timing under `x_npu`,
+    /// then a summary -- flushed per line, so `> run.jsonl` produces a file `npu stats` and
+    /// `npu replay` read. `--no-stream` writes the single `chat.completion` object instead.
     // No `short = 'o'`, though the design asked for `-o`: `transcribe-media` already spells its
     // output FILE `-o`, and a global short collides with it -- clap panics there with "Short option
     // names must be unique". Freeing `-o` means renaming that one, which is a user-visible break and
@@ -99,14 +105,6 @@ pub enum Cmd {
         /// under.
         #[arg(long)]
         stats: bool,
-        /// Write a JSONL run log here: one line per decoded token, each an OpenAI stream chunk
-        /// carrying that token's own timing, wrapped in a conditions header and a summary.
-        ///
-        /// Replay it with `npu replay`, render it with `npu stats`, compare two with
-        /// `npu stats --diff`. The server writes these too, for every request, when
-        /// `NPU_TELEMETRY_LOG` names a directory.
-        #[arg(long, value_name = "FILE", value_hint = ValueHint::FilePath)]
-        stats_log: Option<PathBuf>,
         /// Print the whole completion at once instead of streaming it token by token.
         #[arg(long)] no_stream: bool,
         /// Send the prompt verbatim, with no chat template -- raw continuation.
@@ -174,7 +172,7 @@ pub enum Cmd {
         #[command(subcommand)]
         action: WeightsCmd,
     },
-    /// Read a JSONL run log written by `--stats-log` or `NPU_TELEMETRY_LOG`.
+    /// Read a JSONL run log written by `--output json` or `NPU_TELEMETRY_LOG`.
     ///
     /// Renders the same overlay a live generation prints, from a file -- so a run from another day
     /// or another machine reads the same way, and the renderer has exactly one input type.

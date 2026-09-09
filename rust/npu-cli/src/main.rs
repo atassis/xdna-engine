@@ -59,18 +59,10 @@ fn run(cli: &Cli, path: &Path) -> Result<()> {
     match &cli.cmd {
         Cmd::Serve { port, allow_degraded } => serve(path, *port, *allow_degraded),
         Cmd::Transcribe { input, model } => transcribe(path, input, model.as_deref(), as_json),
-        Cmd::Generate { prompt, model, sampling, no_stream, raw, stats, stats_log } =>
-            generate(path, prompt, model.as_deref(), sampling, *no_stream, *raw,
-                     *stats, stats_log.as_deref(), as_json),
-        // A REPL has no single response to serialize, so `--output json` cannot mean anything here.
-        // Saying so beats accepting the flag and ignoring it, which is what every command in this
-        // match used to do with it.
-        Cmd::Chat { .. } if as_json =>
-            Err(anyhow!("`--output json` is not supported for the chat REPL (there is no single \
-                         response to serialize) -- use `npu generate --output json`, or \
-                         `npu chat --stats-log FILE` for a machine-readable record of the turns")),
+        Cmd::Generate { prompt, model, sampling, no_stream, raw, stats } =>
+            generate(path, prompt, model.as_deref(), sampling, *no_stream, *raw, *stats, as_json),
         Cmd::Chat { prompt, model, sampling, no_stream } =>
-            chat(path, prompt.as_deref(), model.as_deref(), sampling, *no_stream),
+            chat(path, prompt.as_deref(), model.as_deref(), sampling, *no_stream, as_json),
         Cmd::Embed { text, model } => embed(path, text, model.as_deref(), as_json),
         Cmd::Stats { log, diff } => stats_cmd(log, diff.as_deref()),
         Cmd::Replay { log, realtime, frames } => replay_cmd(log, *realtime, *frames),
@@ -341,25 +333,24 @@ struct Generated {
 /// Drains `rx` to completion either way, so `Cmd::Generate` on the actor side always finishes even
 /// under `--no-stream`.
 ///
-/// `echo` prints tokens as they arrive; the text is accumulated regardless, because `--output json`
-/// needs the whole completion in hand and a second drain does not exist. The run log is written as
-/// the tokens arrive rather than at the end, so a run that is interrupted still leaves the part
-/// that happened -- which is when a log is worth the most.
+/// `echo` prints tokens as they arrive; the text is accumulated regardless, because the buffered
+/// `--output json` needs the whole completion in hand and a second drain does not exist.
+///
+/// `json`, when present, receives the NDJSON stream: a conditions header, one line per decoded
+/// token, then the prefill and summary records. It takes a writer rather than a path on purpose --
+/// the shell already redirects, tees and pipes, and a `--stats-log FILE` flag was this function
+/// reimplementing `>` badly, with its own path handling and a second destination that could
+/// disagree with the first.
 fn drain_generation(
     rx: std::sync::mpsc::Receiver<StreamItem>,
     echo: bool,
     meta: &wire::RunMeta,
-    log: Option<&Path>,
+    mut json: Option<&mut dyn Write>,
 ) -> Result<Generated> {
-    let mut file = match log {
-        Some(p) => {
-            let mut f = std::fs::File::create(p).with_context(|| format!("run log {}", p.display()))?;
-            writeln!(f, "{}", wire::header_line(
-                &npu_runtime::conditions::at_start(&meta.model, meta.created), meta))?;
-            Some(f)
-        }
-        None => None,
-    };
+    if let Some(w) = json.as_mut() {
+        writeln!(w, "{}", wire::header_line(
+            &npu_runtime::conditions::at_start(&meta.model, meta.created), meta))?;
+    }
     let mut text = String::new();
     loop {
         match rx.recv() {
@@ -368,14 +359,19 @@ fn drain_generation(
                 text.push_str(&t);
             }
             Ok(StreamItem::Step(r)) => {
-                if let Some(f) = file.as_mut() {
-                    writeln!(f, "{}", wire::chunk_line(&r, meta))?;
+                if let Some(w) = json.as_mut() {
+                    writeln!(w, "{}", wire::chunk_line(&r, meta))?;
+                    // Per line, not per run: the point of streaming is that the consumer sees a
+                    // token when it happens, and a pipe is block-buffered by default, so without
+                    // this `| jq` would sit silent and then emit the whole run at once.
+                    w.flush()?;
                 }
             }
             Ok(StreamItem::Done { reason, report, .. }) => {
-                if let Some(f) = file.as_mut() {
-                    writeln!(f, "{}", wire::prefill_line(&report.prefill, meta))?;
-                    writeln!(f, "{}", wire::summary_line(&report, meta, reason))?;
+                if let Some(w) = json.as_mut() {
+                    writeln!(w, "{}", wire::prefill_line(&report.prefill, meta))?;
+                    writeln!(w, "{}", wire::summary_line(&report, meta, reason))?;
+                    w.flush()?;
                 }
                 return Ok(Generated { text, reason, report: *report });
             }
@@ -424,8 +420,7 @@ fn print_stats_footer(g: &Generated, full: bool) {
 /// find.
 #[allow(clippy::too_many_arguments)]
 fn generate(path: &Path, prompt: &str, model: Option<&str>, sampling: &SamplingArgs,
-            no_stream: bool, raw: bool, stats: bool, stats_log: Option<&Path>,
-            as_json: bool) -> Result<()> {
+            no_stream: bool, raw: bool, stats: bool, as_json: bool) -> Result<()> {
     quiet_one_shot();
     let cfg = load_cfg(path)?;
     let root = root(&cfg, path)?;
@@ -433,6 +428,7 @@ fn generate(path: &Path, prompt: &str, model: Option<&str>, sampling: &SamplingA
         .map_err(|e| Tagged(engine_error(&e), e.to_string()))?;
     // Code::Failure, the documented generic bucket: this closed set has no invalid-argument code,
     // and NoService (2) would tell a caller to start a server for what is a bad flag value.
+    let ndjson = as_json && !no_stream;
     let params = build_params(sampling).map_err(|m| Tagged(Code::Failure, m))?;
     let prompt = if raw {
         npu_engine::Prompt::Raw(prompt.to_string())
@@ -453,21 +449,32 @@ fn generate(path: &Path, prompt: &str, model: Option<&str>, sampling: &SamplingA
             } else { Tagged(code, msg) };
             anyhow::Error::from(tagged)
         })
-        // JSON output is a single object, so nothing may be streamed to stdout ahead of it.
         .and_then(|served| {
             let meta = cli_meta(&served.model, !raw);
-            drain_generation(served.value, !no_stream && !as_json, &meta, stats_log)
-                .map(|g| (meta, g))
+            // `--output json` follows the stream flag, the way /v1/chat/completions does:
+            // streaming means NDJSON on stdout, buffered means one object printed below. In
+            // either JSON mode the text is never echoed separately -- the chunks carry it.
+            let r = if ndjson {
+                let mut out = std::io::stdout();
+                drain_generation(served.value, false, &meta, Some(&mut out))
+            } else {
+                drain_generation(served.value, !no_stream && !as_json, &meta, None)
+            };
+            r.map(|g| (meta, g))
         });
     handle.shutdown(); let _ = join.join();
     let (meta, g) = result?;
     if as_json {
-        println!("{}", wire::completion_object(&g.text, g.reason, &g.report, &meta));
+        // The streaming arm already wrote every line; only the buffered arm has anything left.
+        if !ndjson {
+            println!("{}", wire::completion_object(&g.text, g.reason, &g.report, &meta));
+        }
     } else {
         if no_stream { print!("{}", g.text); }
         println!();
-        print_stats_footer(&g, stats);
     }
+    // stderr either way, so it never lands in the JSON a pipe is reading.
+    if !as_json || stats { print_stats_footer(&g, stats); }
     Ok(())
 }
 
@@ -511,7 +518,7 @@ fn replay_cmd(log: &Path, realtime: bool, frames: bool) -> Result<()> {
 /// `npu generate`, which builds the identical single-message `Prompt::Chat`; duplicating it here
 /// would add a second name for a command we have and drop the history that makes this one a REPL.
 fn chat(path: &Path, opening: Option<&str>, model: Option<&str>, sampling: &SamplingArgs,
-        no_stream: bool) -> Result<()> {
+        no_stream: bool, as_json: bool) -> Result<()> {
     quiet_one_shot();
     let cfg = load_cfg(path)?;
     let root = root(&cfg, path)?;
@@ -528,12 +535,21 @@ fn chat(path: &Path, opening: Option<&str>, model: Option<&str>, sampling: &Samp
         loop {
             let line = match opening.take() {
                 // Echoed at the prompt so the transcript reads the same whether the turn came from
-                // argv or the keyboard.
-                Some(turn) => { println!("> {turn}"); turn }
+                // argv or the keyboard. In JSON mode the prompt and the echo go to stderr, because
+                // stdout is the NDJSON stream and a `> ` in the middle of it is not parseable.
+                Some(turn) => {
+                    if as_json { eprintln!("> {turn}") } else { println!("> {turn}") }
+                    turn
+                }
                 None => {
-                    print!("> "); std::io::stdout().flush().ok();
+                    if as_json { eprint!("> "); std::io::stderr().flush().ok(); }
+                    else { print!("> "); std::io::stdout().flush().ok(); }
                     let mut line = String::new();
-                    if stdin.lock().read_line(&mut line)? == 0 { println!(); return Ok(()); } // Ctrl-D
+                    // Ctrl-D
+                    if stdin.lock().read_line(&mut line)? == 0 {
+                        if as_json { eprintln!() } else { println!() }
+                        return Ok(());
+                    }
                     let line = line.trim_end().to_string();
                     if line.is_empty() { continue; }
                     line
@@ -543,10 +559,19 @@ fn chat(path: &Path, opening: Option<&str>, model: Option<&str>, sampling: &Samp
             let served = handle.generate(model, npu_engine::Prompt::Chat(history.clone()), params.clone())
                 .map_err(|e| Tagged(engine_error(&e), e.to_string()))?;
             let meta = cli_meta(&served.model, true);
-            let g = drain_generation(served.value, !no_stream, &meta, None)?;
-            if no_stream { print!("{}", g.text); }
-            println!();
-            print_stats_footer(&g, false);
+            // One NDJSON run per turn -- header, tokens, summary -- so a piped chat session is a
+            // concatenation of run logs rather than a format of its own.
+            let g = if as_json {
+                let mut out = std::io::stdout();
+                drain_generation(served.value, false, &meta, Some(&mut out))?
+            } else {
+                drain_generation(served.value, !no_stream, &meta, None)?
+            };
+            if !as_json {
+                if no_stream { print!("{}", g.text); }
+                println!();
+                print_stats_footer(&g, false);
+            }
             history.push(npu_engine::ChatMessage { role: "assistant".into(), content: g.text });
         }
     })();
@@ -1166,6 +1191,57 @@ fn http_req(port: u16, method: &str, path: &str, body: &str) -> Result<String> {
 mod tests {
     use super::*;
     use npu_runtime::config::{Defaults, ModelCfg, ServerCfg};
+
+    /// `--output json` streaming has to produce something the readers accept, or `> run.jsonl` is
+    /// a lie. Drives the drain with a scripted channel and reads its own output back through the
+    /// same parser `npu stats` and `npu replay` use.
+    #[test]
+    fn streaming_json_writes_a_run_log_its_own_readers_can_parse() {
+        use npu_engine::{FinishReason, GenerateUsage, GenerationReport, StepRecord};
+
+        let meta = wire::RunMeta { id: "chatcmpl-t".into(), created: 7, model: "m".into(), chat: true };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut report = GenerationReport::default();
+        for (i, word) in ["Hello", ", ", "world"].iter().enumerate() {
+            let rec = StepRecord {
+                seq: i as u32,
+                token: Some(100 + i as u32),
+                text: word.to_string(),
+                emit: word.to_string(),
+                t_us: 1_000 * (i as u64 + 1),
+                dt_us: 1_000,
+                ..StepRecord::default()
+            };
+            tx.send(StreamItem::Text(rec.emit.clone())).unwrap();
+            tx.send(StreamItem::Step(rec.clone())).unwrap();
+            report.steps.push(rec);
+        }
+        report.usage = GenerateUsage { prompt_tokens: 2, completion_tokens: 3 };
+        report.generate_us = 3_000;
+        tx.send(StreamItem::Done {
+            reason: FinishReason::Stop, usage: report.usage, report: Box::new(report),
+        }).unwrap();
+        drop(tx);
+
+        let mut buf: Vec<u8> = Vec::new();
+        let g = {
+            let w: &mut dyn Write = &mut buf;
+            drain_generation(rx, false, &meta, Some(w)).unwrap()
+        };
+        let out = String::from_utf8(buf).unwrap();
+
+        // Every line is a JSON object, and the first one is the conditions header -- which is what
+        // makes the redirected stream a run log rather than a bare chunk stream.
+        assert!(out.lines().all(|l| serde_json::from_str::<serde_json::Value>(l).is_ok()));
+        assert!(out.lines().next().unwrap().contains("npu.run.header"));
+
+        let run = wire::parse_run(&out).expect("its own reader must accept it");
+        assert_eq!(run.steps, g.report.steps, "the stream and the report describe one run");
+        assert_eq!(run.steps.iter().map(|s| s.emit.as_str()).collect::<String>(), "Hello, world");
+        assert_eq!(g.text, "Hello, world", "the text is recoverable without echoing it separately");
+        assert_eq!(run.summary.expect("summary line").completion_tokens, 3);
+        assert_eq!(run.frames.len(), 3, "one replayable frame per token");
+    }
 
     /// The listing has to stay splittable: `npu models | awk '{print $1}'` is the obvious use, and a
     /// scenario path can contain no spaces while a model name never does -- so name first, path last.

@@ -101,7 +101,7 @@ pub fn npu_power_uw() -> Option<u64> {
 
 /// The conditions a serving thread can see at the moment a run starts.
 ///
-/// One constructor, used by both the service's run log and the CLI's `--stats-log`. They had
+/// One constructor, used by both the service's run log and the CLI's `--output json`. They had
 /// diverged the first time round -- the CLI wrote a header with every condition null while the
 /// service wrote a full one -- which is exactly the drift that makes two surfaces disagree about
 /// one run. `resident` is not here: only the device actor knows whether the model was already
