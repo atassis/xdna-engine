@@ -119,21 +119,20 @@ QUANT_ATTN_GROUP = int(os.environ.get("QUANT_ATTN_GROUP", "128"))
 # Same axis again, applied to W_head, the FINAL lm-head GEMV's weight.
 #
 # W_head IS THE TIED EMBEDDING TABLE, not an independent lm-head weight -- built below from
-# `model.embed_tokens.weight` (Qwen3 ties them). It is NOT decode-graph-local: rust/npu-engine's
-# NpuDecodeStep::step (npu_decode.rs) mmaps this exact buffer, buffers/W_head.bin, and gathers the
-# NEXT step's `embed[token]` straight out of it as a raw bf16 [vocab, d_model] row -- see that
-# struct's doc comment ("the host embedding gather reads the tied W_head blob that is already
-# there"). quantize_weight()'s on-wire row layout ([n_groups x f32 scale][packed payload]) is a
-# DIFFERENT byte layout from a bf16 row AND a different SIZE, so QUANT_HEAD_DTYPE != "bf16" makes
-# the artifact refuse to load: npu_decode.rs:125-137 gates on `vocab * d_model * 2` and returns a
-# Load error naming the mismatch. That is a loud failure, not a silent misread -- the gate exists
-# for exactly this class ("a W_head built for another vocab ... would otherwise gather a wrong row
-# quietly"). Verified by reading the gate, not inferred. This flag only rewires
-# the ON-DEVICE lm-head GEMV; making the artifact runnable end to end additionally needs
-# NpuDecodeStep to dequantize the row it gathers (or a second, always-bf16 embedding blob), which
-# is rust/npu-engine's code and out of this axis's scope -- see the loud build-time warning below.
+# `model.embed_tokens.weight` (Qwen3 ties them), and rust/npu-engine's NpuDecodeStep gathers the
+# next step's `embed[token]` out of a bf16 [vocab, d_model] blob. Quantizing splits the tensor
+# across its two consumers: the device GEMV reads the packed W_head, while `meta.json`'s
+# `embed_blob` points the host gather at a bf16 W_embed sidecar emitted beside it (npu_decode.rs
+# resolves that field and size-gates whichever blob it names). The sidecar costs 311 MB of disk
+# and ZERO device arena -- the host faults in one 2 KB row per token -- and it holds the embedding
+# INPUT at full width, so this axis moves the lm-head projection alone.
 QUANT_HEAD_DTYPE = os.environ.get("QUANT_HEAD_DTYPE", "bf16")
 QUANT_HEAD_GROUP = int(os.environ.get("QUANT_HEAD_GROUP", "128"))
+
+# Scale-selection method shared by every quantized weight class above. Default takes each group's
+# scale from its absmax; 1 grid-searches the clip ratio minimising that group's reconstruction MSE.
+# Host-side only -- same wire format, same kernel -- so it A/Bs against a shipped artifact.
+QUANT_CLIP_SEARCH = os.environ.get("QUANT_CLIP_SEARCH", "0") != "0"
 
 DECODE_PLACER_FLAGS_DEFAULT = "--cores-per-col 1"
 
@@ -815,9 +814,9 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
                             ("Wg", "mlp.gate_proj"), ("Wu", "mlp.up_proj"), ("Wd", "mlp.down_proj")):
             w = npy(f"model.layers.{l}.{tensor}.weight")  # [M, K], f32
             if key in mlp_keys and QUANT_MLP_DTYPE != "bf16":
-                weights[p + key] = quantize_weight(w, QUANT_MLP_GROUP, QUANT_MLP_DTYPE)
+                weights[p + key] = quantize_weight(w, QUANT_MLP_GROUP, QUANT_MLP_DTYPE, clip_search=QUANT_CLIP_SEARCH)
             elif key == "Wo" and QUANT_ATTN_DTYPE != "bf16":
-                weights[p + key] = quantize_weight(w, QUANT_ATTN_GROUP, QUANT_ATTN_DTYPE)
+                weights[p + key] = quantize_weight(w, QUANT_ATTN_GROUP, QUANT_ATTN_DTYPE, clip_search=QUANT_CLIP_SEARCH)
             elif key == "Wo" and fuse_o:
                 # Pad FIRST, then quantize: the pad rows must be a whole number of groups in the
                 # same wire format as the rest of the channel. Zero rows quantize to amax=0 ->
@@ -832,7 +831,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
                 pad_rows = op_mlp_dp._wo_rows_padded - D
                 w_padded = np.pad(w, ((0, pad_rows), (0, 0)))
                 weights[p + key] = (
-                    quantize_weight(w_padded, QUANT_MLP_GROUP, QUANT_MLP_DTYPE)
+                    quantize_weight(w_padded, QUANT_MLP_GROUP, QUANT_MLP_DTYPE, clip_search=QUANT_CLIP_SEARCH)
                     if QUANT_MLP_DTYPE != "bf16" else bf16(w_padded).reshape(-1)
                 )
             elif key in qkv_keys and FUSE_QKV_GEMV:
@@ -982,7 +981,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
     # 2 KB row it gathers.
     embed_blob, host_embed = "W_head", None
     if QUANT_HEAD_DTYPE != "bf16":
-        weights["W_head"] = quantize_weight(embed_f32, QUANT_HEAD_GROUP, QUANT_HEAD_DTYPE)
+        weights["W_head"] = quantize_weight(embed_f32, QUANT_HEAD_GROUP, QUANT_HEAD_DTYPE, clip_search=QUANT_CLIP_SEARCH)
         embed_blob = "W_embed"
         host_embed = bf16(embed_f32).reshape(-1)
     else:
@@ -1101,9 +1100,12 @@ def main():
         "layer_types": ["global" if sp.is_global(l) else "sliding" for l in range(NL)],
         "cache_buffers": cache_names,
         # Engineering-check axis (see QUANT_MLP_DTYPE above), not a validated model default.
+        # clip_search rides here rather than in the design name: it moves weight VALUES only, so
+        # two arms share one compiled design and differ solely in the bytes loaded into it.
         "weight_quant": {"mlp_dtype": QUANT_MLP_DTYPE, "mlp_group_size": QUANT_MLP_GROUP,
                          "attn_dtype": QUANT_ATTN_DTYPE, "attn_group_size": QUANT_ATTN_GROUP,
-                         "head_dtype": QUANT_HEAD_DTYPE, "head_group_size": QUANT_HEAD_GROUP},
+                         "head_dtype": QUANT_HEAD_DTYPE, "head_group_size": QUANT_HEAD_GROUP,
+                         "clip_search": QUANT_CLIP_SEARCH},
     }
     prov = toolchain_provenance()
     if prov:
