@@ -4,7 +4,7 @@
 //!
 //! The NPU is single-tenant: stop `flm-asr.service`/`voxd.service` before constructing a Device.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ffi::{c_void, CStr, CString};
 use std::os::raw::{c_char, c_int, c_uint};
@@ -636,6 +636,12 @@ pub struct Device {
     /// The paths are kept (not just a count) so the second load can say WHICH other path it split
     /// from and whether the bytes there are the same -- a warning nobody had when it first happened.
     stems: RefCell<HashMap<String, Vec<String>>>,
+    /// Live total of pinned BO bytes: every [`alloc_bo`](Self::alloc_bo)/[`alloc_bo_raw`](Self::alloc_bo_raw)
+    /// adds `nbytes`, every counted [`Bo`]'s drop subtracts it. `Rc<Cell<_>>` (not a plain field) so a
+    /// `Bo` can carry its own clone and decrement on drop with no back-pointer to this `Device`.
+    /// [`Bo::sub`] deliberately does not get a clone -- a sub-buffer view aliases its parent's memory,
+    /// so counting it would report bytes nobody separately allocated.
+    bo_bytes: Rc<Cell<u64>>,
 }
 
 /// An xclbin loaded into a hw_context with its kernel resolved.
@@ -686,6 +692,10 @@ pub struct ElfResident {
 pub struct Bo {
     ptr: *mut CBo,
     nbytes: usize,
+    /// `Some` for a real allocation (drop must give its bytes back to [`Device::bo_bytes`]); `None`
+    /// for a [`Bo::sub`] view, which shares its parent's memory and must not double-count or
+    /// decrement bytes it never added.
+    counted: Option<Rc<Cell<u64>>>,
 }
 
 /// An in-flight (async) NPU dispatch. Created by [`Kernel::run_matmul8_start`], which submits the
@@ -735,8 +745,16 @@ impl Device {
                 ptr,
                 kernels: RefCell::new(HashMap::new()),
                 stems: RefCell::new(HashMap::new()),
+                bo_bytes: Rc::new(Cell::new(0)),
             })
         }
+    }
+
+    /// Live total of pinned BO bytes this device has allocated and not yet freed. Excludes
+    /// [`Bo::sub`] views (they alias, not allocate). The residency accountant's real number --
+    /// see `npu_engine::Model::bo_bytes` and `npu_runtime::loader::EngineModel::footprint`.
+    pub fn resident_bo_bytes(&self) -> u64 {
+        self.bo_bytes.get()
     }
 
     /// Load an xclbin and resolve its kernel. `name=None` uses the first kernel in the xclbin.
@@ -821,7 +839,8 @@ impl Device {
         if ptr.is_null() {
             Err(format!("alloc_bo({nbytes}, flag={flag}, gid={group_id}): {}", last_error()))
         } else {
-            Ok(Bo { ptr, nbytes })
+            self.bo_bytes.set(self.bo_bytes.get() + nbytes as u64);
+            Ok(Bo { ptr, nbytes, counted: Some(self.bo_bytes.clone()) })
         }
     }
 
@@ -832,7 +851,8 @@ impl Device {
         if ptr.is_null() {
             Err(format!("alloc_bo_raw({nbytes}, flag={flag}, gid={group_id}): {}", last_error()))
         } else {
-            Ok(Bo { ptr, nbytes })
+            self.bo_bytes.set(self.bo_bytes.get() + nbytes as u64);
+            Ok(Bo { ptr, nbytes, counted: Some(self.bo_bytes.clone()) })
         }
     }
 
@@ -1350,6 +1370,18 @@ impl FusedArena {
         self.output.sync_from_device()
     }
 
+    /// Sync the SCRATCH arena back from the device, so the host can read state a dispatch wrote
+    /// there rather than only what it emitted as an output.
+    ///
+    /// Not on the per-token path: scratch holds the resident weights and the KV cache, so this is
+    /// a multi-gigabyte transfer and calling it in a decode loop would dominate the step. It exists
+    /// for GATES -- comparing a prefill's per-layer KV against a CPU golden, or against what `P`
+    /// sequential M=1 steps wrote -- which is the one check that localises a divergence to a layer
+    /// instead of inferring it from logits at the end of 28 of them.
+    pub fn sync_scratch_from_device(&self) -> Result<()> {
+        self.scratch.sync_from_device()
+    }
+
     /// Dispatch the fused ELF over `[input, output, scratch]`.
     pub fn dispatch(&self, kern: &ElfKernel) -> Result<()> {
         kern.run_elf(&[&self.input, &self.output, &self.scratch])
@@ -1396,7 +1428,8 @@ impl Bo {
         if ptr.is_null() {
             Err(format!("sub(offset={offset}, size={size}): {}", last_error()))
         } else {
-            Ok(Bo { ptr, nbytes: size })
+            // Not counted: this view aliases the parent's memory, which is already counted there.
+            Ok(Bo { ptr, nbytes: size, counted: None })
         }
     }
 
@@ -1439,6 +1472,9 @@ impl Bo {
 
 impl Drop for Bo {
     fn drop(&mut self) {
+        if let Some(c) = &self.counted {
+            c.set(c.get().saturating_sub(self.nbytes as u64));
+        }
         unsafe { shim_bo_free(self.ptr) }
     }
 }

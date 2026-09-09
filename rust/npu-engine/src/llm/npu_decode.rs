@@ -18,16 +18,18 @@
 //! inherit the defect PROVIDED every write is followed by a real sync. Never special-case that away
 //! (e.g. "skip the sync when nothing changed"): that is exactly the shortcut that reintroduces it.
 
+use std::borrow::Cow;
 use std::path::Path;
 use std::rc::Rc;
 
 use npu_xrt::{Device, ElfResident, FusedArena};
 
 use crate::api::EngineError;
-use crate::llm::artifact::{EmbedScale, LlmArtifact};
+use crate::llm::artifact::{EmbedScale, LlmArtifact, RopeWrite};
 use crate::llm::generator::DecodeStep;
+use crate::llm::npu_prefill::NpuPrefill;
 
-fn pack_bf16_bytes(f: &[f32]) -> Vec<u8> {
+pub(crate) fn pack_bf16_bytes(f: &[f32]) -> Vec<u8> {
     let mut bits = vec![0u16; f.len()];
     npu_xrt::pack_f32_to_bf16(f, &mut bits);
     let mut out = vec![0u8; bits.len() * 2];
@@ -48,7 +50,7 @@ fn unpack_bf16_bytes(bytes: &[u8]) -> Vec<f32> {
 /// `iron/operators/rope/reference.py` documents and `verify_llm_decode.py:34`'s `rope_row` implements.
 /// This is NOT mlir-air's half-split `[cos..., sin...]` packing; porting that convention here would
 /// compile, dispatch, and produce plausible-looking wrong logits.
-fn rope_row(pos: usize, head_dim: usize, theta: f64, rope_angles: usize) -> Vec<f32> {
+pub(crate) fn rope_row(pos: usize, head_dim: usize, theta: f64, rope_angles: usize) -> Vec<f32> {
     let half = head_dim / 2;
     let mut row = vec![0f32; head_dim];
     for i in 0..half {
@@ -76,7 +78,7 @@ fn rope_row(pos: usize, head_dim: usize, theta: f64, rope_angles: usize) -> Vec<
 /// `_compute_proportional_rope_parameters` does -- 64 of 256 at Gemma-4-12B's global head_dim 512
 /// and 0.25. `None` (every model shipped today) rotates all of them, which makes the partial path
 /// bit-identical to the full one rather than a second arm to keep in step.
-fn rope_angles(head_dim: usize, partial: Option<f64>) -> usize {
+pub(crate) fn rope_angles(head_dim: usize, partial: Option<f64>) -> usize {
     match partial {
         Some(f) => (f * head_dim as f64 / 2.0).floor() as usize,
         None => head_dim / 2,
@@ -97,6 +99,22 @@ fn apply_logit_softcap(logits: &mut [f32], cap: Option<f64>) {
     }
 }
 
+fn upload_blob(arena: &FusedArena, artifact: &LlmArtifact, name: &str) -> Result<(), EngineError> {
+    let bytes = std::fs::read(artifact.weight_blob_path(name))
+        .map_err(|e| EngineError::Load(format!("read weight buffer {name}.bin: {e}")))?;
+    let loc = artifact.loc(name);
+    if bytes.len() != loc.len {
+        return Err(EngineError::Load(format!(
+            "weight buffer {name}.bin is {} bytes, layout declares {}",
+            bytes.len(),
+            loc.len
+        )));
+    }
+    arena
+        .write_at(loc.arena, loc.off, &bytes)
+        .map_err(|e| EngineError::Load(format!("write weight buffer {name}: {e}")))
+}
+
 /// A resident device backend for one decoder-LLM fused decode ELF. Construction registers the
 /// constant ELF and loads every weight buffer ONCE; [`step`](DecodeStep::step) then costs exactly one
 /// dispatch. Holds the KV cache: a single instance decodes ONE generation (`pos` only ever
@@ -104,17 +122,94 @@ fn apply_logit_softcap(logits: &mut [f32], cap: Option<f64>) {
 /// instance -- a fresh [`NpuDecodeStep::new`] is just as correct and costs the weight reload.
 pub struct NpuDecodeStep {
     artifact: LlmArtifact,
-    arena: FusedArena,
+    arena: Rc<FusedArena>,
     res: ElfResident,
+    embed: EmbedTable,
+    /// Each declared RoPE input buffer with the base its rows are computed from, resolved at load.
+    rope_writes: Vec<RopeWrite>,
+    /// The batched-prefill half, when the scenario names a prefill artifact and it agrees with this
+    /// one on every shared arena offset. `None` is the whole existing rail: one dispatch per prompt
+    /// token, no second ELF, no second hardware context.
+    prefill: Option<NpuPrefill>,
+}
+
+/// The host embedding gather, shared verbatim by the per-token and the batched path. Sharing the
+/// FUNCTION rather than the convention is what keeps the two bit-identical: the token-identity gate
+/// compares a batched prompt against `P` sequential steps, and a second implementation of the
+/// scale-then-narrow is exactly the kind of difference that would show up there as a real
+/// divergence.
+pub(crate) struct EmbedTable {
     /// The tied `W_head` blob, mmapped: `[vocab, d_model]` bf16 row-major, which IS the embedding
     /// table -- `gen_llm_decode.py` builds `W_head` from `model.embed_tokens.weight`. Gathered one
-    /// row per step, so a generation never materialises the table.
+    /// row per position, so a generation never materialises the table.
     ///
     /// bf16 here is the artifact's real precision rather than a narrowing: the checkpoint ships
     /// bf16 and `dump_llm_weights.py` widens it with `.float()`, so the f32 `.npy` this reads
     /// instead of carries no information a bf16 does not.
-    embed: memmap2::Mmap,
-    embed_scale: f32,
+    map: memmap2::Mmap,
+    scale: f32,
+    d_model: usize,
+    vocab: usize,
+}
+
+impl EmbedTable {
+    fn open(artifact: &LlmArtifact) -> Result<Self, EngineError> {
+        // Gate on the BYTE LENGTH the layout declares, not on the file merely existing: a W_head
+        // built for another vocab is the failure that would otherwise gather a wrong row quietly.
+        // `meta.json`'s `embed_blob` names the bf16 table the gather reads. It is "W_head" unless
+        // the lm-head was quantised, in which case W_head.bin is packed [scale|payload] rows and
+        // the generator emits a bf16 sidecar for this read. Defaults to "W_head" so every artifact
+        // built before that field keeps working.
+        let path = artifact.weight_blob_path(artifact.embed_blob());
+        let vocab = artifact
+            .vocab
+            .ok_or_else(|| EngineError::Load("decode artifact declares no dims.vocab".to_string()))?;
+        let want = vocab * artifact.d_model * 2;
+        let f = std::fs::File::open(&path)
+            .map_err(|e| EngineError::Load(format!("open {}: {e}", path.display())))?;
+        // SAFETY: the artifact directory is owned by the engine and read-only for its lifetime; a
+        // concurrent truncation would be a corrupted install, which every other blob read shares.
+        let map = unsafe { memmap2::Mmap::map(&f) }
+            .map_err(|e| EngineError::Load(format!("mmap {}: {e}", path.display())))?;
+        if map.len() != want {
+            return Err(EngineError::Load(format!(
+                "{} is {} bytes, artifact declares vocab={vocab} d_model={} (bf16 -> {} bytes)",
+                path.display(), map.len(), artifact.d_model, want
+            )));
+        }
+        let scale = match artifact.embed_scale {
+            None | Some(EmbedScale::None) => 1.0,
+            Some(EmbedScale::SqrtDModel) => (artifact.d_model as f32).sqrt(),
+        };
+        Ok(EmbedTable { map, scale, d_model: artifact.d_model, vocab })
+    }
+
+    pub(crate) fn d_model(&self) -> usize {
+        self.d_model
+    }
+
+    pub(crate) fn vocab(&self) -> usize {
+        self.vocab
+    }
+
+    /// `embed[token] * scale`, as the `d_model * 2` bf16 bytes `x` wants.
+    ///
+    /// The row is already bf16 in exactly that layout, so an unscaled model borrows the mmapped
+    /// bytes: no unpack, no repack, no copy. A scaled model pays a conversion on one row, and the
+    /// f32 it converts through is the same value the old whole-table path held, so both arms stay
+    /// bit-identical to it.
+    pub(crate) fn row(&self, token: u32) -> Result<Cow<'_, [u8]>, EngineError> {
+        let tok = token as usize;
+        if tok >= self.vocab {
+            return Err(EngineError::Unsupported(format!("token {tok} >= vocab {}", self.vocab)));
+        }
+        let raw = &self.map[tok * self.d_model * 2..(tok + 1) * self.d_model * 2];
+        if self.scale == 1.0 {
+            return Ok(Cow::Borrowed(raw));
+        }
+        let v: Vec<f32> = unpack_bf16_bytes(raw).iter().map(|&e| e * self.scale).collect();
+        Ok(Cow::Owned(pack_bf16_bytes(&v)))
+    }
 }
 
 impl NpuDecodeStep {
@@ -122,6 +217,25 @@ impl NpuDecodeStep {
     /// the ONLY input: the host embedding gather reads the tied `W_head` blob that is already there,
     /// so the checkpoint's dumped `.npy` weights are a build input and no longer a runtime one.
     pub fn new(dev: &Rc<Device>, decode_dir: &Path) -> Result<Self, EngineError> {
+        Self::build(dev, decode_dir, None)
+    }
+
+    /// Same, plus a batched-prefill ELF sharing this instance's arena.
+    ///
+    /// One `FusedArena`, sized to the larger of the two artifacts' three arenas, holds the weights
+    /// ONCE and both ELFs bind to it -- which is the whole architecture, not an optimisation: the
+    /// weights live in scratch (`gen_llm_decode.py` declares only `x`/`rope_global` as inputs), so a
+    /// second arena would mean a second 1.110 GiB weight copy plus a host round-trip of the KV cache
+    /// between the halves. `arena_share_probe` cleared this on device -- two hardware contexts, one
+    /// arena, a device-side scratch write in one visible to the other, 0/303872 bytes differ.
+    ///
+    /// The agreement it rests on is CHECKED here, not assumed: see
+    /// [`LlmArtifact::check_shared_layout_agrees`].
+    pub fn with_prefill(dev: &Rc<Device>, decode_dir: &Path, prefill_dir: &Path) -> Result<Self, EngineError> {
+        Self::build(dev, decode_dir, Some(prefill_dir))
+    }
+
+    fn build(dev: &Rc<Device>, decode_dir: &Path, prefill_dir: Option<&Path>) -> Result<Self, EngineError> {
         let artifact = LlmArtifact::load(decode_dir)?;
         // Mirrors this exact loop's writes below (`x_loc`, `rope_loc`) -- an artifact declaring a
         // third per-token input buffer would otherwise leave it unwritten every token, silently.
@@ -131,27 +245,38 @@ impl NpuDecodeStep {
         // every model on this rail until Gemma-3, and then reported the missing `rope_local` write
         // as an artifact defect -- which is exactly what the check is for, but the fix belongs
         // here.
-        let mut writes: Vec<&str> = vec!["x", "rope_global"];
-        if artifact.rope_theta_local.is_some() { writes.push("rope_local"); }
-        artifact.check_per_token_writes(&writes)?;
+        artifact.check_per_token_writes(&artifact.per_dispatch_writes())?;
+        let rope_writes = artifact.rope_writes(&artifact)?;
 
-        let arena = FusedArena::new(dev, artifact.input_size, artifact.output_size, artifact.scratch_size)
-            .map_err(|e| EngineError::Load(format!("alloc fused arenas: {e}")))?;
+        let pre_art = prefill_dir.map(LlmArtifact::load_prefill).transpose()?;
+        if let Some(p) = &pre_art {
+            artifact.check_shared_layout_agrees(p)?;
+            artifact.check_prefill_pairing(p)?;
+            p.check_per_token_writes(&p.per_dispatch_writes())?;
+        }
+
+        // One arena for both ELFs, sized to the larger of each of the three. A buffer is addressed
+        // by offset within its arena, so a larger arena is transparent to the smaller graph.
+        let max3 = |f: fn(&LlmArtifact) -> usize| {
+            f(&artifact).max(pre_art.as_ref().map_or(0, f))
+        };
+        let arena = Rc::new(
+            FusedArena::new(dev, max3(|a| a.input_size), max3(|a| a.output_size), max3(|a| a.scratch_size))
+                .map_err(|e| EngineError::Load(format!("alloc fused arenas: {e}")))?,
+        );
 
         for name in &artifact.weights {
-            let bytes = std::fs::read(artifact.weight_blob_path(name))
-                .map_err(|e| EngineError::Load(format!("read weight buffer {name}.bin: {e}")))?;
-            let loc = artifact.loc(name);
-            if bytes.len() != loc.len {
-                return Err(EngineError::Load(format!(
-                    "weight buffer {name}.bin is {} bytes, layout declares {}",
-                    bytes.len(),
-                    loc.len
-                )));
+            upload_blob(&arena, &artifact, name)?;
+        }
+        // A prefill artifact may declare weights the decode graph has no use for. There is no such
+        // buffer today -- the causal mask turned out to be a per-row width VECTOR the host writes
+        // per chunk, not a constant the ELF carries -- but a prefill-only weight stays legal, and
+        // it comes from ITS buffers dir; the shared ones were just written from decode's and must
+        // not be written twice.
+        if let Some(p) = &pre_art {
+            for name in p.weights.iter().filter(|n| !artifact.layout.contains_key(n.as_str())) {
+                upload_blob(&arena, p, name)?;
             }
-            arena
-                .write_at(loc.arena, loc.off, &bytes)
-                .map_err(|e| EngineError::Load(format!("write weight buffer {name}: {e}")))?;
         }
         // Zero every KV-cache buffer EXPLICITLY, rather than relying on its `buffers/<name>.bin`
         // happening to be an all-zero blob (today all 56 are, but nothing enforces that). This is
@@ -177,32 +302,13 @@ impl NpuDecodeStep {
             .map_err(|e| EngineError::Load(format!("open_elf_resident: decode ELF lacks a ctrl scratchpad: {e}")))?;
         arena.bind_resident(&res).map_err(|e| EngineError::Load(format!("bind resident arena BOs: {e}")))?;
 
-        // Gate on the BYTE LENGTH the layout declares, not on the file merely existing: a W_head
-        // built for another vocab is the failure that would otherwise gather a wrong row quietly.
-        // `meta.json`'s `embed_blob` names the bf16 table the gather reads. It is "W_head" unless
-        // the lm-head was quantised, in which case W_head.bin is packed [scale|payload] rows and
-        // the generator emits a bf16 sidecar for this read. Defaults to "W_head" so every artifact
-        // built before that field keeps working.
-        let embed_path = artifact.weight_blob_path(artifact.embed_blob());
-        let want = artifact.vocab * artifact.d_model * 2;
-        let f = std::fs::File::open(&embed_path)
-            .map_err(|e| EngineError::Load(format!("open {}: {e}", embed_path.display())))?;
-        // SAFETY: the artifact directory is owned by the engine and read-only for its lifetime; a
-        // concurrent truncation would be a corrupted install, which every other blob read shares.
-        let embed = unsafe { memmap2::Mmap::map(&f) }
-            .map_err(|e| EngineError::Load(format!("mmap {}: {e}", embed_path.display())))?;
-        if embed.len() != want {
-            return Err(EngineError::Load(format!(
-                "{} is {} bytes, artifact declares vocab={} d_model={} (bf16 -> {} bytes)",
-                embed_path.display(), embed.len(), artifact.vocab, artifact.d_model, want
-            )));
-        }
-        let embed_scale = match artifact.embed_scale {
-            EmbedScale::None => 1.0,
-            EmbedScale::SqrtDModel => (artifact.d_model as f32).sqrt(),
-        };
+        // Prefill's angle rows are computed from the DECODE artifact's bases -- it is the authority
+        // for a model constant and may leave them undeclared, and `check_prefill_pairing` has
+        // already refused a pair whose prefill half declares a different one.
+        let prefill = pre_art.map(|a| NpuPrefill::open(dev, a, &artifact, &arena)).transpose()?;
+        let embed = EmbedTable::open(&artifact)?;
 
-        Ok(NpuDecodeStep { artifact, arena, res, embed, embed_scale })
+        Ok(NpuDecodeStep { artifact, arena, res, embed, rope_writes, prefill })
     }
 
     /// Re-zero every KV-cache scratch buffer (`meta.json`'s `cache_buffers`) and sync. Call before
@@ -275,66 +381,41 @@ impl DecodeStep for NpuDecodeStep {
         })
     }
 
-    fn step(&mut self, token: u32, pos: usize) -> Result<Vec<f32>, EngineError> {
-        let tok = token as usize;
-        if tok >= self.artifact.vocab {
-            return Err(EngineError::Unsupported(format!("token {tok} >= vocab {}", self.artifact.vocab)));
-        }
+    /// The prefill artifact's `dims.M`, or `None` when this instance has no prefill ELF or the
+    /// batched path is switched off (`NPU_LLM_PREFILL_BATCHED=0`). Returning `None` is what makes
+    /// the A/B a one-variable change: the generator's own fallback is the per-token path.
+    fn prefill_batch(&self) -> Option<usize> {
+        self.prefill.as_ref().filter(|p| p.batched_enabled()).map(NpuPrefill::batch)
+    }
 
-        // The row is already bf16 in exactly the layout `x` wants, so an unscaled model writes the
-        // mmapped bytes straight through: no unpack, no repack. A scaled model pays a conversion on
-        // one row, and the f32 it converts through is the same value the old whole-table path held,
-        // so both arms stay bit-identical to it.
-        let d = self.artifact.d_model;
-        let row = &self.embed[tok * d * 2..(tok + 1) * d * 2];
-        let scaled;
-        let x_bytes: &[u8] = if self.embed_scale == 1.0 {
-            row
-        } else {
-            let v: Vec<f32> = unpack_bf16_bytes(row).iter().map(|&e| e * self.embed_scale).collect();
-            scaled = pack_bf16_bytes(&v);
-            &scaled
-        };
+    fn prefill(&mut self, tokens: &[u32]) -> Result<usize, EngineError> {
+        let Some(p) = self.prefill.as_ref().filter(|p| p.batched_enabled()) else { return Ok(0) };
+        p.prime(&self.arena, &self.embed, tokens)
+    }
+
+    fn step(&mut self, token: u32, pos: usize) -> Result<Vec<f32>, EngineError> {
+        let x_bytes = self.embed.row(token)?;
         let x_loc = self.artifact.loc("x");
         self.arena
-            .write_at(x_loc.arena, x_loc.off, x_bytes)
+            .write_at(x_loc.arena, x_loc.off, &x_bytes)
             .map_err(|e| EngineError::Device(format!("write x: {e}")))?;
 
-        // The row WIDTH comes from the buffer the artifact declares, not from a scalar head_dim.
-        // That is the number the ELF actually reads, so the two cannot drift apart -- and it makes
-        // the per-layer case free: Gemma-4-12B's global layers use head_dim 512 where its sliding
-        // layers use 256, so `rope_global` and `rope_local` must differ in WIDTH and not only in
-        // theta, which a single artifact.head_dim cannot express.
-        let rope_loc = self.artifact.loc("rope_global");
-        let rope_hd = rope_loc.len / 2;
-        // Partial rotary is a GLOBAL-layer axis: Gemma-4-12B's config gives full_attention
-        // rope_type "proportional" with partial_rotary_factor 0.25 and sliding_attention plain
-        // "default", so only this row narrows.
-        let rope = rope_row(
-            pos,
-            rope_hd,
-            self.artifact.rope_theta_global,
-            rope_angles(rope_hd, self.artifact.rope_partial_rotary),
-        );
-        // The width/head_dim cross-check moved to `LlmArtifact::load`, which sees BOTH angle rows
+        // One angle row per declared RoPE table -- same position, different base, and its OWN
+        // width. Gemma-3 interleaves local and global attention layers and the ELF reads a
+        // separate table for each; a global-only model has one entry here. The width and the
+        // partial-rotary factor ride on the RopeWrite because Gemma-4-12B's global layers rotate
+        // at head_dim 512 where its sliding layers use 256, so the rows differ in WIDTH and not
+        // only in theta -- which one artifact.head_dim cannot express.
+        //
+        // The width/head_dim cross-check lives in `LlmArtifact::load`, which sees BOTH angle rows
         // and every declared geometry at once. Here it could only ever compare one row against one
         // scalar, which is why it was gated on `kv_offs.len() == 1` and did nothing in the
         // per-layer case it was written for.
-        let rope_bytes = pack_bf16_bytes(&rope);
-        self.arena
-            .write_at(rope_loc.arena, rope_loc.off, &rope_bytes)
-            .map_err(|e| EngineError::Device(format!("write rope_global: {e}")))?;
-
-        // Same row, different base. Gemma-3 interleaves local and global attention layers and the
-        // ELF reads a separate angle table for each; a model without local layers has no such
-        // buffer and this is skipped.
-        if let Some(theta_local) = self.artifact.rope_theta_local {
-            let loc = self.artifact.loc("rope_local");
-            let rope_l = rope_row(pos, loc.len / 2, theta_local, rope_angles(loc.len / 2, None));
-            let rope_l_bytes = pack_bf16_bytes(&rope_l);
+        for w in &self.rope_writes {
+            let rope = rope_row(pos, w.width, w.theta, rope_angles(w.width, w.partial));
             self.arena
-                .write_at(loc.arena, loc.off, &rope_l_bytes)
-                .map_err(|e| EngineError::Device(format!("write rope_local: {e}")))?;
+                .write_at(w.loc.arena, w.loc.off, &pack_bf16_bytes(&rope))
+                .map_err(|e| EngineError::Device(format!("write rope table @{}: {e}", w.loc.off)))?;
         }
 
         // `kv_off` is "addr"-kind (element-unit BD offset, no shift); `sm_mask` is "core"-kind and
@@ -352,10 +433,13 @@ impl DecodeStep for NpuDecodeStep {
                 .write_scratchpad(slot.byte_offset, &kv_val.to_le_bytes())
                 .map_err(|e| EngineError::Device(format!("write kv_off scratchpad: {e}")))?;
         }
+        let sm = self.artifact.sm_mask.ok_or_else(|| {
+            EngineError::Load("decode artifact declares no scratchpad mask_param".to_string())
+        })?;
         let sm_raw = (pos + 1) as u32;
-        let sm_val = if self.artifact.sm_mask.core { sm_raw << 2 } else { sm_raw };
+        let sm_val = if sm.core { sm_raw << 2 } else { sm_raw };
         self.res
-            .write_scratchpad(self.artifact.sm_mask.byte_offset, &sm_val.to_le_bytes())
+            .write_scratchpad(sm.byte_offset, &sm_val.to_le_bytes())
             .map_err(|e| EngineError::Device(format!("write sm_mask scratchpad: {e}")))?;
 
         // Unconditional every token -- see the module doc. No arm here may skip a step "because
@@ -365,13 +449,14 @@ impl DecodeStep for NpuDecodeStep {
         self.res.dispatch().map_err(EngineError::Device)?;
         self.arena.sync_from_device().map_err(|e| EngineError::Device(format!("sync output: {e}")))?;
 
-        let out_loc = self.artifact.loc(&self.artifact.output);
+        let out_name = self.artifact.output_name()?;
+        let out_loc = self.artifact.loc(out_name);
         let mut bytes = vec![0u8; out_loc.len];
         self.arena
             .read_at(out_loc.arena, out_loc.off, &mut bytes)
-            .map_err(|e| EngineError::Device(format!("read {}: {e}", self.artifact.output)))?;
+            .map_err(|e| EngineError::Device(format!("read {out_name}: {e}")))?;
         let mut logits = unpack_bf16_bytes(&bytes);
-        logits.truncate(self.artifact.vocab);
+        logits.truncate(self.embed.vocab());
         apply_logit_softcap(&mut logits, self.artifact.logit_softcap);
         Ok(logits)
     }

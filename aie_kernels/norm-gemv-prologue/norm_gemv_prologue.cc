@@ -51,6 +51,10 @@ void norm_prologue(bfloat16 *restrict a) {
   float inv = ::aie::invsqrt(var + epsilon);
   ::aie::vector<float, V> meanv = ::aie::broadcast<float, V>(mean);
   ::aie::vector<float, V> invv = ::aie::broadcast<float, V>(inv);
+  // conv_even across the narrowing store ONLY. The reduction above runs in the ambient mode
+  // deliberately: swapping conv_even in ahead of a norm's reduction regressed WER 8.2 -> 8.8
+  // (mm_mode_lnaffcast.cc). crRnd is one sticky register per core, hence the hand-back.
+  const auto saved_rounding = ::aie::swap_rounding(::aie::rounding_mode::conv_even);
   for (int i = 0; i < EPI_MK; i += V) {
     ::aie::accum<accfloat, V> xa;
     xa.from_vector(::aie::load_v<V>(a + i), 0);        // bf16 -> f32 accum
@@ -59,10 +63,13 @@ void norm_prologue(bfloat16 *restrict a) {
     ::aie::accum<accfloat, V> ya; ya.from_vector(y, 0);
     ::aie::store_v(a + i, ya.template to_vector<bfloat16>());
   }
+  ::aie::set_rounding(saved_rounding);
 #else  // NORM_rms
   float ms = ssq / (float)EPI_K;
   float inv = ::aie::invsqrt(ms + epsilon);
   ::aie::vector<float, V> invv = ::aie::broadcast<float, V>(inv);
+  // Same store-only conv_even split as the LN arm.
+  const auto saved_rounding = ::aie::swap_rounding(::aie::rounding_mode::conv_even);
   for (int i = 0; i < EPI_MK; i += V) {
     ::aie::accum<accfloat, V> xa;
     xa.from_vector(::aie::load_v<V>(a + i), 0);
@@ -70,6 +77,7 @@ void norm_prologue(bfloat16 *restrict a) {
     ::aie::accum<accfloat, V> ya; ya.from_vector(y, 0);
     ::aie::store_v(a + i, ya.template to_vector<bfloat16>());
   }
+  ::aie::set_rounding(saved_rounding);
 #endif
   event1();
 }

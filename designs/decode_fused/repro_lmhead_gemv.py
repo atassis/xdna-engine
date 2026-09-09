@@ -30,7 +30,7 @@ from gen_llm_decode import gemv_tile_output, COLS  # noqa: E402
 BF16 = ml_dtypes.bfloat16
 
 
-def run_one(M, K, cols, tsi, tso, seed, dispatches=2):
+def run_one(M, K, cols, tsi, tso, seed):
     """Build + run ONE GEMV; return (rel-L2, rel-L2 of sorted values, tiles per column)."""
     ctx = AIEContext()
     op = GEMV(M=M, K=K, num_aie_columns=cols, tile_size_input=tsi,
@@ -43,17 +43,11 @@ def run_one(M, K, cols, tsi, tso, seed, dispatches=2):
     rng = np.random.default_rng(seed)
     W = np.asarray(rng.standard_normal((M, K)) * 0.05, BF16).astype(np.float32)
     x = np.asarray(rng.standard_normal(K) * 0.5, BF16).astype(np.float32)
-    np.copyto(c.get_buffer("W").data, np.asarray(W, BF16).reshape(-1))
-    np.copyto(c.get_buffer("x").data, np.asarray(x, BF16).reshape(-1))
-    # TWO dispatches, first result discarded ON PURPOSE. On this rail the FIRST dispatch after a
-    # host input write computes on the PREVIOUS input -- measured 2026-09-05, see
-    # docs/kb/first-dispatch-after-a-host-input-write-computes-on-the-previous-input.md in the
-    # journal. For a freshly built design the "previous input" is an unwritten arena, so a
-    # single-dispatch run here was reporting a GEMV of whatever happened to be in memory. That is
-    # what produced the large exact-zero counts, verdicts that disagreed between runs of the SAME
-    # config, and a pattern no tiling parameter could explain.
-    for _ in range(dispatches):
-        c()
+    with c.get_buffer("W").overwrite() as _buf:
+        _buf[:] = np.asarray(W, BF16).reshape(-1)
+    with c.get_buffer("x").overwrite() as _buf:
+        _buf[:] = np.asarray(x, BF16).reshape(-1)
+    c()
     got = np.asarray(c.get_buffer("y").data, np.float32)[:M]
     ref = np.asarray(W @ x, BF16).astype(np.float32)
     n = np.linalg.norm(np.float64(ref))
@@ -106,8 +100,6 @@ def main():
     ap.add_argument("--tsi", type=int, default=None)
     ap.add_argument("--tso", type=int, default=None)
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--dispatches", type=int, default=2,
-                    help="dispatches per run; the FIRST computes on the previous input")
     ap.add_argument("--converge", type=int, default=0,
                     help="build once, dispatch N times, report after each")
     ap.add_argument("--sweep", default=None,
@@ -124,7 +116,7 @@ def main():
         for spec in a.sweep.split(","):
             m, k, tsi, tso = (int(v) for v in spec.split(":"))
             try:
-                d, ds, nt, nz = run_one(m, k, a.cols, tsi, tso, a.seed, a.dispatches)
+                d, ds, nt, nz = run_one(m, k, a.cols, tsi, tso, a.seed)
             except Exception as e:
                 print(f"{m:8} {k:6} {tsi:4} {tso:7} {'-':>9} {'BUILD FAIL':>11} {'-':>11} {'-':>13}  {type(e).__name__}: {str(e)[:34]}")
                 continue
@@ -157,17 +149,11 @@ def main():
     rng = np.random.default_rng(a.seed)
     W = np.asarray(rng.standard_normal((a.m, a.k)) * 0.05, BF16).astype(np.float32)
     x = np.asarray(rng.standard_normal(a.k) * 0.5, BF16).astype(np.float32)
-    np.copyto(c.get_buffer("W").data, np.asarray(W, BF16).reshape(-1))
-    np.copyto(c.get_buffer("x").data, np.asarray(x, BF16).reshape(-1))
-    # TWO dispatches, first result discarded ON PURPOSE. On this rail the FIRST dispatch after a
-    # host input write computes on the PREVIOUS input -- measured 2026-09-05, see
-    # docs/kb/first-dispatch-after-a-host-input-write-computes-on-the-previous-input.md in the
-    # journal. For a freshly built design the "previous input" is an unwritten arena, so a
-    # single-dispatch run here was reporting a GEMV of whatever happened to be in memory. That is
-    # what produced the large exact-zero counts, verdicts that disagreed between runs of the SAME
-    # config, and a pattern no tiling parameter could explain.
-    for _ in range(a.dispatches):
-        c()
+    with c.get_buffer("W").overwrite() as _buf:
+        _buf[:] = np.asarray(W, BF16).reshape(-1)
+    with c.get_buffer("x").overwrite() as _buf:
+        _buf[:] = np.asarray(x, BF16).reshape(-1)
+    c()
     got = np.asarray(c.get_buffer("y").data, np.float32)[:a.m]
     ref = np.asarray(W @ x, BF16).astype(np.float32)
 

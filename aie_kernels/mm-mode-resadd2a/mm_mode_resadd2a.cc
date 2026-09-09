@@ -27,6 +27,13 @@
 // edges from the core, so an object this one CALLED would never reach the link
 // line. Same shape mm_mode_lnaffcast.cc uses.
 //
+// K001: inherits -- every output here is f32, and the one narrowing to bf16 is `(bfloat16)scale`.
+// That cast is crRnd-governed like any other (Peano lowers it to vconv.bf16.fp32), but it cannot
+// round: whole_array_modal_iron.py rejects a --resadd2a-scale whose f32 bits carry a mantissa tail,
+// so the value is already bf16-exact when it arrives. The inherited mode is therefore the GEMM's --
+// Makefile.modal links mm.cc into this same core ELF, and mm.cc installs floor unless built with
+// -DROUND_CONV_EVEN -- and it does not reach any result. Delete this if `scale` stops being guarded.
+//
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 #include <aie_api/aie.hpp>
 #include <stdint.h>

@@ -66,7 +66,15 @@ pub fn try_build(cfg_path: &Path, root: &Path) -> Result<Scenario, EngineError> 
             let decode_dir = root.join(&cfg.artifacts.decode);
             let tokenizer_dir = root.join(&cfg.artifacts.tokenizer_dir);
             let model_cfg = crate::llm::ModelConfig::load(&tokenizer_dir)?;
-            let decode = crate::llm::NpuDecodeStep::new(&dev, &decode_dir)?;
+            // A scenario naming `artifacts.prefill` gets the batched priming path; the two ELFs
+            // share one arena and one weight upload, so this costs no extra device memory. Absent
+            // (the default) is byte-for-byte the per-token rail.
+            let decode = if cfg.artifacts.prefill.is_empty() {
+                crate::llm::NpuDecodeStep::new(&dev, &decode_dir)?
+            } else {
+                let prefill_dir = root.join(&cfg.artifacts.prefill);
+                crate::llm::NpuDecodeStep::with_prefill(&dev, &decode_dir, &prefill_dir)?
+            };
             Scenario::Generate(Box::new(crate::llm::LlmGenerator::new(model_cfg, decode)
                 .with_scenario_defaults(cfg.generation.to_defaults())))
         }

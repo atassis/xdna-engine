@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 # Reproduce the open mlir-aie/Peano kernel build environment on this CachyOS box.
 # Idempotent: safe to re-run. mlir-aie is a PINNED git submodule (see docs/11) checked out on our fork
-# integration branch atassis/mlir-aie:xdna2-asr (the CachyOS fixes + toolchain patches are COMMITS on it,
-# no apply-patch step); .venv-iron is .gitignored. Durable record of the env (fork branch + gcc-13 shims +
+# branch xdna2-asr, which this script RECREATES at MLIR_AIE_FORK_COMMIT on every run -- so it is a
+# label for the pin, not an integration line, and nothing may be carried as a commit on it. (It was
+# described here as carrying "the CachyOS fixes + toolchain patches" as commits; that stopped being
+# true when the pin went zero-carry, and the stale sentence is why 34 orphaned commits looked
+# maintained. Our source lives in designs/ and aie_kernels/ and is synced forward by
+# sync_kernels.sh.) .venv-iron is .gitignored. Durable record of the env (fork branch + gcc-13 shims +
 # pinned toolchain wheels) needed to build/run on Arch/CachyOS.
 set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -128,8 +132,21 @@ git -C mlir-aie remote get-url fork >/dev/null 2>&1 \
   || git -C mlir-aie remote add fork "${MLIR_AIE_FORK_URL:-https://github.com/atassis/mlir-aie}"
 git -C mlir-aie cat-file -e "${MLIR_AIE_FORK_COMMIT}^{commit}" 2>/dev/null \
   || git -C mlir-aie fetch fork xdna2-asr
-git -C mlir-aie checkout -B xdna2-asr "$MLIR_AIE_FORK_COMMIT" \
-  && echo "  mlir-aie on xdna2-asr @ ${MLIR_AIE_FORK_COMMIT:0:12}"
+# FAIL LOUD. This used to be `checkout -B ... && echo`, so a checkout blocked by an untracked file
+# short-circuited the && and the script carried on to sync_kernels.sh and printed "Route B env ready"
+# with exit 0. The sandbox then stayed on whatever commit it happened to hold. Measured 2026-09-09:
+# it had been failing that way since the pin went zero-carry, leaving the tree 252 commits behind and
+# containing NONE of the last five pins -- while build_kernels.sh's newer ancestor check reported the
+# drift correctly and was read as a new problem. A checkout that cannot land is a hard error.
+if ! git -C mlir-aie checkout -B xdna2-asr "$MLIR_AIE_FORK_COMMIT"; then
+  echo "[setup_kernel_env] FAIL: cannot check out MLIR_AIE_FORK_COMMIT (${MLIR_AIE_FORK_COMMIT:0:12}) in mlir-aie." >&2
+  echo "  The sandbox is a DERIVED tree: designs/ + aie_kernels/ are the tracked source and are re-synced" >&2
+  echo "  below, so local files there are expendable -- but resolve it deliberately, do not delete blindly:" >&2
+  echo "    git -C mlir-aie status --short" >&2
+  echo "  Anything of value must be moved into designs/ or aie_kernels/ FIRST; see sync_kernels.sh." >&2
+  exit 1
+fi
+echo "  mlir-aie on xdna2-asr @ ${MLIR_AIE_FORK_COMMIT:0:12}"
 
 # INSTALL D: our custom kernels/designs. designs/ (tracked) is the single source of
 # truth; copy them FORWARD into the gitignored mlir-aie build sandbox (one-directional => no

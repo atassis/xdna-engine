@@ -9,9 +9,10 @@ use npu_whisper::config::WhisperCfg;
 use npu_whisper::encoder::WhisperEncoder;
 
 const TOL_HOST: f32 = 5e-3;
-/// P2 make-or-break gate: NPU (bf16/int8 over 12 layers) vs ONNX golden.
-#[cfg(feature = "npu")]
-const TOL_NPU: f32 = 0.08;
+/// P2 make-or-break gate: NPU (bf16/bfp16) vs ONNX golden. PER-CONFIG now (2026-09-08): read from
+/// `cfg.tol_npu` (`WhisperCfg::{SMALL,TURBO}`) below, not a single binary-wide constant -- error
+/// accumulates over `n_layers`, so a bound for 12 layers does not transfer to 32. See each variant's
+/// own derivation comment in `npu_whisper::config`.
 /// Calibrated 2026-08-31 (device, k768-gelu-rail item (iv)): the two currently-shipped
 /// computation paths for `block_{n-1}` measure |alpha| = 2.069e-3 (NPU_ENC_GELU_FUSED on-chip
 /// GELU epilogue) and 3.426e-3 (host GELU, unfused) against the ONNX golden -- both believed
@@ -109,7 +110,7 @@ fn main() {
         {
             // root = worktree root (cwd), where mlir-aie/.../whole_array/build resolves.
             let enc = WhisperEncoder::new_npu(Path::new(&artifacts), cfg, Path::new("."));
-            (enc, TOL_NPU, "npu")
+            (enc, cfg.tol_npu, "npu")
         }
         #[cfg(not(feature = "npu"))]
         {

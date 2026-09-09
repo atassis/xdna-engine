@@ -20,9 +20,15 @@ cd "$REPO"
 # (found 2026-09-03): the write produced a 0-byte stamp, and the comparison then compared '' with
 # '', so the guard reused the artifact for every pin, forever. It failed OPEN -- degrading silently
 # to exactly the existence-only skip it had been added to replace, and doing so only AFTER the
-# first run, which is when it looks like it is working. Same definition as conveyor_bd_prebuild.sh
-# and relpos_prebuild.sh so all three agree on what "the toolchain" is.
-_lock_id() { sed -e 's/[[:space:]]*#.*$//' -e '/^[[:space:]]*$/d' "$REPO/toolchain.lock" | sha256sum | cut -c1-12; }
+# first run, which is when it looks like it is working. NOW SOURCED from kernel_sandbox.sh
+# (current_toolchain_hash) rather than a second hand-rolled copy of the same derivation -- the
+# duplication is exactly the class of defect this comment already describes: two definitions of
+# "the toolchain" that could silently drift (task artifact-families-with-no-freshness-stamp,
+# 2026-09-08). Byte-for-byte the same sed+sha256sum+cut-c1-12 pipeline; kept as a thin wrapper so
+# every call site below (_lock_id) needs no edit.
+# shellcheck disable=SC1091
+source "$REPO/scripts/kernel_sandbox.sh"
+_lock_id() { current_toolchain_hash "$REPO"; }
 
 # 8-head conveyor build dims (MUST match npu.rs CONV_* and conveyor_attn_iron.py).
 TQ=8; T=176; DK=128; NQT=22; HEADS=8

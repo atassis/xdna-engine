@@ -291,6 +291,17 @@ fn main() {
     let mut out_bytes = vec![0u8; olen];
     arena.read_at(oa, ooff, &mut out_bytes).unwrap();
 
+    // GATE_DUMP_DIR=<dir>: hand the raw device bytes to Tier 1 (scripts/gate_numeric.py), which
+    // judges them element-wise against a float32 reference. The rel-L2 line below stays and is
+    // still useful, but a summary statistic cannot be the gate -- one structurally wrong element
+    // in 262144 moves it by nothing, and that is the defect class this rail keeps hitting.
+    if let Ok(d) = std::env::var("GATE_DUMP_DIR") {
+        std::fs::create_dir_all(&d).unwrap_or_else(|e| panic!("mkdir {d}: {e}"));
+        let p = Path::new(&d).join(format!("{}.bin", meta.output));
+        std::fs::write(&p, &out_bytes).unwrap_or_else(|e| panic!("write {}: {e}", p.display()));
+        println!("  [gate] dumped {} B of {} -> {}", out_bytes.len(), meta.output, p.display());
+    }
+
     let got = bf16_to_f32(&out_bytes);
     let want = bf16_to_f32(&read(&dir.join("buffers").join(format!("{}.bin", meta.output))));
     // For the e2e/NPU logits ELF the output is logits[VOCAB_PAD] with pad rows = -1e30 (they never win

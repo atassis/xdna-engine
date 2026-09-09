@@ -97,6 +97,16 @@ static inline void cascade_kreduce_partial_tile(const bfloat16 *__restrict pA,
 
   constexpr unsigned kSteps = K / 8;
 
+  // conv_even for the accumulator -> bf16 narrow at the bottom of the nest. crRnd is one sticky
+  // register per core that aie_api never initialises, so without this the partial's rounding is
+  // whatever the previous kernel on this core left.
+  //
+  // Hoisted out of the loops, as gemm_bfp16_ebs8.cc does for the same mmul shape, and the K steps
+  // inside are deliberately covered: the MAC itself never reads crRnd, but under the bf16-mmul
+  // bfp16 emulation the A/B quantization does, and that is the site mlir-aie#3442 is about.
+  // Round-to-nearest there is wanted for the same reason it is wanted at the narrow.
+  const auto saved_rounding = aie::swap_rounding(aie::rounding_mode::conv_even);
+
   for (unsigned mi = 0; mi < M / 8; ++mi) {
     for (unsigned ni = 0; ni < N / 8; ++ni) {
       MMUL acc;
@@ -121,6 +131,7 @@ static inline void cascade_kreduce_partial_tile(const bfloat16 *__restrict pA,
       aie::store_v(pC_tile, acc.template to_vector<bfloat16>());
     }
   }
+  aie::set_rounding(saved_rounding);
 }
 
 #if defined(XDNA_BRICK_CASCADE_KREDUCE_USE_ADF)
@@ -160,36 +171,48 @@ static inline void cascade_kreduce_middle_adf(input_cascade<accfloat> *cin,
 //           forces -- see PR-draft note) + this core's partial.
 //   TAIL   (last core, drains to the [tile,D] stream): total = recv +
 //           partial, truncate f32 accumulate -> bf16, write the final slab.
+//
+// Each stage narrows its f32 sum under conv_even, which is the convention golden.py's `_to_bf16`
+// docstring already asserts the device follows -- so a stage that inherited floor would be graded
+// against a round-nearest reference. The narrow READS as a scalar cast, but Peano lowers
+// `static_cast<bfloat16>(float)` to `vconv.bf16.fp32` -- the same converter the vector path uses,
+// with no rounding operand of its own -- so crRnd reaches it and the mode has to be set here.
 // ---------------------------------------------------------------------------
 
 static inline void cascade_kreduce_head_bf16(uint32_t n,
                                               const bfloat16 *__restrict partial,
                                               const bfloat16 *__restrict r,
                                               bfloat16 *__restrict out) {
+  const auto saved_rounding = aie::swap_rounding(aie::rounding_mode::conv_even);
   for (uint32_t i = 0; i < n; i++) {
     out[i] = static_cast<bfloat16>(static_cast<float>(partial[i]) +
                                     static_cast<float>(r[i]));
   }
+  aie::set_rounding(saved_rounding);
 }
 
 static inline void cascade_kreduce_middle_bf16(uint32_t n,
                                                 const bfloat16 *__restrict recv,
                                                 const bfloat16 *__restrict partial,
                                                 bfloat16 *__restrict out) {
+  const auto saved_rounding = aie::swap_rounding(aie::rounding_mode::conv_even);
   for (uint32_t i = 0; i < n; i++) {
     out[i] = static_cast<bfloat16>(static_cast<float>(recv[i]) +
                                     static_cast<float>(partial[i]));
   }
+  aie::set_rounding(saved_rounding);
 }
 
 static inline void cascade_kreduce_tail_bf16(uint32_t n,
                                               const bfloat16 *__restrict recv,
                                               const bfloat16 *__restrict partial,
                                               bfloat16 *__restrict out) {
+  const auto saved_rounding = aie::swap_rounding(aie::rounding_mode::conv_even);
   for (uint32_t i = 0; i < n; i++) {
     out[i] = static_cast<bfloat16>(static_cast<float>(recv[i]) +
                                     static_cast<float>(partial[i]));
   }
+  aie::set_rounding(saved_rounding);
 }
 
 extern "C" {

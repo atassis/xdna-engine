@@ -33,6 +33,11 @@ echo "[4/5] reload amdxdna (probe + bind the fresh device)"
 modprobe amdxdna 2>/dev/null || true
 sleep 2
 echo "[5/5] verify"
+# Report which amdxdna actually loaded, not just that a device node appeared: PCI remove + rescan
+# does not itself select which built module answers the re-probe, and a machine with more than one
+# amdxdna.ko on the module search path (stock + a locally built one) can silently rebind the wrong
+# one -- exit 0 from modprobe only means the command ran, not which module ended up resident.
+lsmod | grep -q '^amdxdna ' && echo "  loaded module: $(modinfo -F filename amdxdna 2>/dev/null || echo unknown) srcversion=$(modinfo -F srcversion amdxdna 2>/dev/null || echo unknown)" || echo "  amdxdna NOT in lsmod after reload"
 if [ -e /dev/accel/accel0 ]; then
   echo "RECOVERED: /dev/accel/accel0 is back"
   exit 0

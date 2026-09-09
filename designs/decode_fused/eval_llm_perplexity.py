@@ -117,8 +117,10 @@ def main():
 
     nll, t0, top1_hits = [], time.perf_counter(), 0
     for pos in range(n):
-        np.copyto(xin.data, np.asarray(embed[ids[pos]] * scale, BF16).reshape(-1))
-        np.copyto(rope_buf.data, rope_row(pos, HD, sp.rope_theta_global).reshape(-1))
+        with xin.overwrite() as _buf:
+            _buf[:] = np.asarray(embed[ids[pos]] * scale, BF16).reshape(-1)
+        with rope_buf.overwrite() as _buf:
+            _buf[:] = rope_row(pos, HD, sp.rope_theta_global).reshape(-1)
         params.write("kv_off", int(pos * HD))
         params.write("sm_mask", int(pos + 1))
         params.sync()

@@ -41,8 +41,11 @@ SRC_DIRS=(
   "$PE/ml/layernorm/build"
 )
 # NOT published, and named here rather than silently absent:
-#   ml/mha_decode/build -- carries no .toolchain-stamp and is not covered by
-#     check_kernel_artifact_freshness.sh either. It is reached only from ctx_decode.rs, the opt-in
+#   ml/mha_decode/build -- check_kernel_artifact_freshness.sh added it to DIRS 2026-09-08 (task
+#     artifact-families-with-no-freshness-stamp), and build_mha_decode.sh already writes the
+#     stamp via ensure_fresh_sandbox; but the artifact ON DISK right now predates both fixes and
+#     still carries no .toolchain-stamp -- it needs an actual rebuild (bash scripts/build_mha_decode.sh)
+#     before this exclusion can come out. It is reached only from ctx_decode.rs, the opt-in
 #     NPU_DECODE per-op backend that NPU_DECODE_FUSED takes precedence over, so nothing the service
 #     selects by default needs it. Add it here once it is stamped; do not add it unstamped.
 
@@ -83,6 +86,25 @@ for d in "${SRC_DIRS[@]}"; do
   done < <(find "$d" -maxdepth 1 -type f \( -name '*.xclbin' -o -name 'insts*.txt' -o -name 'insts*.bin' \))
 done
 [ "$fail" -eq 0 ] || { note "refusing to publish"; exit 1; }
+
+# Retire the OUTGOING published set before overwriting it, keyed by the pin it was built for.
+# Added 2026-09-09. `cp -f` below replaces the shipped artifacts in place, and on a re-pin those
+# are usually the only COMPLETE previous-pin set on the box -- the build dirs they came from are
+# routinely partial (measured: whole_array/build held 209 files and no xclbin at re-pin time,
+# because an earlier retire had already moved the finished set aside). So publishing destroyed the
+# only baseline arm a device parity gate could have run against, and that gate had to go one-armed:
+# `new-burst`, the check that catches a manufactured error burst, needs a live baseline and could
+# not run at all. Move-aside, don't delete, and reap by age -- the same discipline
+# scripts/kernel_sandbox.sh already applies to the build dirs, and for the same reason.
+prev_stamp="$(cat "$DEST/.toolchain-stamp" 2>/dev/null || echo none)"
+if [ -d "$DEST" ] && [ -n "$(ls -A "$DEST" 2>/dev/null)" ] && [ "$prev_stamp" != "$stamp" ]; then
+  retired="${DEST}.prev-${prev_stamp}-$(date +%Y%m%dT%H%M%S)"
+  note "retiring the outgoing published set (pin $prev_stamp) -> ${retired##*/}"
+  cp -a "$DEST" "$retired" || note "WARNING: could not retire $DEST -- publishing over it anyway"
+fi
+keep_days="${PUBLISH_KERNELS_KEEP_DAYS:-14}"
+find "$(dirname "$DEST")" -maxdepth 1 -type d -name "$(basename "$DEST").prev-*" -mtime "+${keep_days}" \
+     -exec echo "[publish_kernels] reaping aged published set {}" \; -exec rm -rf {} + 2>/dev/null || true
 
 n=0
 for key in "${!owner[@]}"; do

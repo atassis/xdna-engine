@@ -47,19 +47,22 @@ def main():
     c = fused.get_callable()
     params = c.params
     for n, arr in weights.items():
-        np.copyto(c.get_buffer(n).data, np.asarray(arr, BF16).reshape(-1))
+        with c.get_buffer(n).overwrite() as _buf:
+            _buf[:] = np.asarray(arr, BF16).reshape(-1)
 
     def npy(n):
         return np.load(os.path.join(a.weights, f"{n}.npy")).astype(np.float32)
 
     embed = npy("model.embed_tokens.weight")
-    np.copyto(c.get_buffer("x").data, np.asarray(embed[a.token], BF16).reshape(-1))
+    with c.get_buffer("x").overwrite() as _buf:
+        _buf[:] = np.asarray(embed[a.token], BF16).reshape(-1)
     half = HD // 2
     inv = 1.0 / (sp.rope_theta_global ** (np.arange(0, HD, 2, dtype=np.float64)[:half] / HD))
     row = np.empty(HD, np.float32)
     row[0::2] = np.cos(0 * inv)
     row[1::2] = np.sin(0 * inv)
-    np.copyto(c.get_buffer("rope_global").data, np.asarray(row, BF16))
+    with c.get_buffer("rope_global").overwrite() as _buf:
+        _buf[:] = np.asarray(row, BF16)
     params.write("kv_off", 0)
     params.write("sm_mask", 1)
     params.sync()

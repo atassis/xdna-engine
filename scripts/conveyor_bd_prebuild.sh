@@ -10,8 +10,12 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$REPO"
 # mtime against $MLIR_AIE_INSTANCE -- wrong, because that directory's mtime moves whenever anything
 # inside it changes (sync_kernels.sh copies kernels in on every build), so it would rebuild
 # spuriously and constantly, which is how guards end up deleted. Compare the semantic lock hash --
-# the same value toolchain_up.sh uses to NAME .cache/instances/<hash>.
-_lock_id() { sed -e 's/[[:space:]]*#.*$//' -e '/^[[:space:]]*$/d' "$REPO/toolchain.lock" | sha256sum | cut -c1-12; }
+# the same value toolchain_up.sh uses to NAME .cache/instances/<hash>. SOURCED from
+# kernel_sandbox.sh (current_toolchain_hash) rather than hand-rolled here a second time -- see
+# conveyor_prebuild.sh's identical fix (task artifact-families-with-no-freshness-stamp, 2026-09-08).
+# shellcheck disable=SC1091
+source "$REPO/scripts/kernel_sandbox.sh"
+_lock_id() { current_toolchain_hash "$REPO"; }
 TQ=8; T=176; DK=128; NQT=22; BD_KB=39; H=4; INV=0.08838835
 EX=mlir-aie/programming_examples/basic/conveyor_proto
 out="artifacts/conveyor_bd/single"

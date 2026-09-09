@@ -87,15 +87,26 @@ use Semantics::*;
 /// The full census, in crate order. See the module doc for what is deliberately excluded.
 pub const FLAGS: &[Flag] = &[
     // -- npu-engine: llm decode ------------------------------------------------------------------
-    Flag { name: "NPU_LLM_REUSE_KV", owner: "npu-engine", site: "npu-engine/src/llm/npu_decode.rs:198",
+    Flag { name: "NPU_LLM_REUSE_KV", owner: "npu-engine", site: "npu-engine/src/llm/npu_decode.rs:301",
         semantics: NotZero, default: "true",
         doc: "reuse the KV-cache buffers across requests instead of re-zeroing them each time. \
               Default ON: the buffers are zeroed explicitly at load and sm_mask excludes every \
               position at or beyond n_past, so the per-request pass cost 224 MiB of host memset \
               plus an arena write (~60 ms/request at S=2048) and changed no output. Set =0 to \
               restore it when bisecting a suspected KV bug." },
-
-    // -- npu-asr-host --------------------------------------------------------------------------
+    Flag { name: "NPU_LLM_PREFILL_BATCHED", owner: "npu-engine", site: "npu-engine/src/llm/npu_prefill.rs:66",
+        semantics: NotZero, default: "true",
+        doc: "prime the KV cache over a prompt in batches of the prefill artifact's dims.M instead \
+              of one dispatch per token. DEFAULT ON since 2026-09-09; =0 restores per-token \
+              priming. It was opt-in until its gate existed, and what was missing was a SUBJECT \
+              rather than a measurement -- --tier2 drives verify_llm_decode.py, which is \
+              decode-only by its own header, so the end-to-end gate had never run this path. \
+              scripts/gate_llm.sh --tier2-prefill does, at seven prompt geometries against a \
+              float32 reference: 14/14 PASS, and teacher-forced (all 32 steps independently \
+              comparable rather than only the first divergence) the reference token is in the \
+              device's top-5 at 32/32 steps at every length in both arms. Worth 35.8-37.1x on \
+              priming, 707-742 tok/s against 49.9-51.5 ms/token. Set =0 to bisect a suspected \
+              prefill bug or to reproduce the pre-2026-09-09 output." },
     Flag { name: "NPU_PAR_SUBSAMPLE", owner: "npu-asr-host", site: "npu-asr-host/src/lib.rs:507",
         semantics: NotZero, default: "true",
         doc: "host-side subsample matmul runs multithreaded via rayon; opt out with =0." },
@@ -255,7 +266,7 @@ pub const FLAGS: &[Flag] = &[
     Flag { name: "INT8_CV_HEADROOM", owner: "npu-engine", site: "npu-engine/src/asr/whisper_decoder.rs:1370",
         semantics: Value, default: "1.0",
         doc: "int8 quantization headroom multiplier for cross-attn V." },
-    Flag { name: "WHISPER_ENC_HOST", owner: "npu-engine", site: "npu-engine/src/asr/whisper.rs:317",
+    Flag { name: "WHISPER_ENC_HOST", owner: "npu-engine", site: "npu-engine/src/asr/whisper.rs:324",
         semantics: IsOk, default: "false",
         doc: "runs the Whisper encoder on host ONNX instead of the NPU; opt-in, loud (never a \
               silent fallback)." },
@@ -292,57 +303,57 @@ pub const FLAGS: &[Flag] = &[
     Flag { name: "PARAKEET_DUMP_CONVIN", owner: "npu-parakeet", site: "npu-parakeet/src/encoder.rs:32",
         semantics: Value, default: "unset (off)",
         doc: "dumps the conv-front input tensor to {dir}/{tag}_b{blk}.npy, for parity bisection." },
-    Flag { name: "PARAKEET_RESIDENT_FF", owner: "npu-parakeet", site: "npu-parakeet/src/encoder.rs:159",
+    Flag { name: "PARAKEET_RESIDENT_FF", owner: "npu-parakeet", site: "npu-parakeet/src/encoder.rs:168",
         semantics: NotZero, default: "true",
         doc: "resident on-chip LN->fc1->SiLU FFN stage 1 on the modal resident path. NOT a \
               duplicate of PARAKEET_RESIDENT_FFN: this one gates the outer stage; FFN (below) \
               gates whether fc2's K-split ALSO stays on-device, nested inside this one." },
-    Flag { name: "PARAKEET_RESIDENT_FFN", owner: "npu-parakeet", site: "npu-parakeet/src/encoder.rs:175",
+    Flag { name: "PARAKEET_RESIDENT_FFN", owner: "npu-parakeet", site: "npu-parakeet/src/encoder.rs:184",
         semantics: NotZero, default: "true",
         doc: "nested inside PARAKEET_RESIDENT_FF: keeps fc2's K-split accumulation on-device too \
               (deinterleave + sub-BO chunks + host-sum, bit-identical to the host 4x K-split)." },
-    Flag { name: "PARAKEET_FFN_DEVACC", owner: "npu-parakeet", site: "npu-parakeet/src/encoder.rs:182",
+    Flag { name: "PARAKEET_FFN_DEVACC", owner: "npu-parakeet", site: "npu-parakeet/src/encoder.rs:191",
         semantics: NotZero, default: "true (also requires !hybrid())",
         doc: "accumulates fc2 ON-DEVICE via the acc_add brick instead of host K-split-sum; falls \
               through to resident_ffn if the acc_add xclbin is absent. Read via resident_on(), a \
-              dynamic-name closure (encoder.rs:276) -- invisible to a grep for the literal string." },
-    Flag { name: "PARAKEET_HYBRID", owner: "npu-parakeet", site: "npu-parakeet/src/encoder.rs:270",
+              dynamic-name closure (encoder.rs:285) -- invisible to a grep for the literal string." },
+    Flag { name: "PARAKEET_HYBRID", owner: "npu-parakeet", site: "npu-parakeet/src/encoder.rs:279",
         semantics: NotZero, default: "false",
         doc: "hybrid encoder mode (measured 8.425% WER at ~1.89 s/clip vs the default's 8.791%/ \
               0.98s); forces every PARAKEET_RESIDENT_*/FUSED_BLOCK off via resident_on(), and uses \
               all 16 of the driver's hw_contexts." },
-    Flag { name: "PARAKEET_RESIDENT_MHA", owner: "npu-parakeet", site: "npu-parakeet/src/encoder.rs:386",
+    Flag { name: "PARAKEET_RESIDENT_MHA", owner: "npu-parakeet", site: "npu-parakeet/src/encoder.rs:395",
         semantics: NotZero, default: "true (also requires !hybrid())",
         doc: "resident on-chip multi-head attention. Read via resident_on() (dynamic name); also \
-              checked at line 540." },
-    Flag { name: "PARAKEET_RESIDENT_CONV", owner: "npu-parakeet", site: "npu-parakeet/src/encoder.rs:777",
+              checked at line 549." },
+    Flag { name: "PARAKEET_RESIDENT_CONV", owner: "npu-parakeet", site: "npu-parakeet/src/encoder.rs:786",
         semantics: NotZero, default: "true (also requires !hybrid())",
         doc: "resident on-chip conv module. Read via resident_on() (dynamic name)." },
-    Flag { name: "PARAKEET_RESIDENT_SILU", owner: "npu-parakeet", site: "npu-parakeet/src/encoder.rs:779",
+    Flag { name: "PARAKEET_RESIDENT_SILU", owner: "npu-parakeet", site: "npu-parakeet/src/encoder.rs:788",
         semantics: NotZero, default: "true (also requires !hybrid())",
         doc: "resident on-chip SiLU activation. Read via resident_on() (dynamic name)." },
-    Flag { name: "PARAKEET_FUSED_BLOCK", owner: "npu-parakeet", site: "npu-parakeet/src/encoder.rs:948",
+    Flag { name: "PARAKEET_FUSED_BLOCK", owner: "npu-parakeet", site: "npu-parakeet/src/encoder.rs:957",
         semantics: NotZero, default: "true (also requires !hybrid())",
         doc: "fully fused encoder block dispatch. Read via resident_on() (dynamic name)." },
-    Flag { name: "PARAKEET_SUBSAMPLE_OUT_NPU", owner: "npu-parakeet", site: "npu-parakeet/src/encoder.rs:358",
+    Flag { name: "PARAKEET_SUBSAMPLE_OUT_NPU", owner: "npu-parakeet", site: "npu-parakeet/src/encoder.rs:367",
         semantics: NotZero, default: "false",
         doc: "subsampling output stage dispatches on NPU." },
-    Flag { name: "PARAKEET_MHA_HOSTQKV", owner: "npu-parakeet", site: "npu-parakeet/src/encoder.rs:394",
+    Flag { name: "PARAKEET_MHA_HOSTQKV", owner: "npu-parakeet", site: "npu-parakeet/src/encoder.rs:403",
         semantics: IsOk, default: "false (set = diagnostic ON)",
         doc: "DIAGNOSTIC, inverted polarity: when SET, keeps the resident attention block but \
               feeds it HOST f32-LN + mm_lazy q/k/v instead of the resident QKV, to isolate the \
               LN->QKV seam. No effect unless PARAKEET_RESIDENT_MHA is active." },
-    Flag { name: "PARAKEET_MHA_SPLITA", owner: "npu-parakeet", site: "npu-parakeet/src/encoder.rs:404",
+    Flag { name: "PARAKEET_MHA_SPLITA", owner: "npu-parakeet", site: "npu-parakeet/src/encoder.rs:413",
         semantics: NotZero, default: "true",
         doc: "bf16x2 device-A split for resident MHA (WER-neutral 8.5); opt out =0 for the old \
               single-bf16-A path (WER 8.9)." },
-    Flag { name: "PARAKEET_MHA_QKV_AB", owner: "npu-parakeet", site: "npu-parakeet/src/encoder.rs:458",
+    Flag { name: "PARAKEET_MHA_QKV_AB", owner: "npu-parakeet", site: "npu-parakeet/src/encoder.rs:467",
         semantics: IsOk, default: "false",
         doc: "A/B diagnostic: resident LN->QKV vs host layernorm+matmul, rel-L2 per projection." },
-    Flag { name: "PARAKEET_MHA_AB", owner: "npu-parakeet", site: "npu-parakeet/src/encoder.rs:548",
+    Flag { name: "PARAKEET_MHA_AB", owner: "npu-parakeet", site: "npu-parakeet/src/encoder.rs:557",
         semantics: IsOk, default: "false",
         doc: "A/B diagnostic: resident MHA context vs f32 host golden, for head 0 and a mid head." },
-    Flag { name: "PARAKEET_CONVEYOR_MHA", owner: "npu-parakeet", site: "npu-parakeet/src/encoder.rs:680",
+    Flag { name: "PARAKEET_CONVEYOR_MHA", owner: "npu-parakeet", site: "npu-parakeet/src/encoder.rs:689",
         semantics: IsOk, default: "false",
         doc: "conveyor (8-head merged dispatch) MHA path. The \"TODO stub\" this doc used to claim was \
               wired by 9ef97ea on 2026-07-17 and the source comment corrected by 9abcaf2; this \

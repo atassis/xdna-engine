@@ -49,8 +49,11 @@ STARTER_PROMPT*.md
 # Generated brick-verification artifacts (rebuilt by the verify scripts)
 aie_kernels/_test/gen/
 
-# toolchain instance cache (~500MB) and root-level cargo target (~5GB)
-/.cache/
+# toolchain instance cache (toolchain instances, mlir-distro, ccache, goldens) and the
+# root-level cargo target (~5GB). No trailing slash on .cache: it may legitimately be a
+# SYMLINK to a shared cache outside the repo (see scripts/cache_env.sh), and `/.cache/`
+# matches only a real directory -- which would leave that symlink untracked-but-committable.
+/.cache
 /target/
 
 # whole_array probe build output (per-pin dirs are disposable, like probes/build)

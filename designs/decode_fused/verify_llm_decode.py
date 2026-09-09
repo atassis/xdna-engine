@@ -31,6 +31,7 @@ import ml_dtypes
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import newstack_compat  # noqa: F401,E402
 from gen_llm_decode import build_graph, report_artifact_freshness, load_weight_buffer, isolate_build_dir  # noqa: E402
+from redispatch_check import assert_redispatch_identical  # noqa: E402
 
 BF16 = ml_dtypes.bfloat16
 
@@ -93,10 +94,22 @@ def main():
     ap.add_argument("--max-seq", type=int, default=2048)
     ap.add_argument("--steps", type=int, default=None, help="free-running tokens to compare")
     ap.add_argument("--dump-logits", default=None, help="write step-0 logits to this .npy for offline compare")
+    ap.add_argument("--emit-topk", default=None,
+                    help="TIER 2 capture: write this run's per-step top-K token ids and logits to "
+                         "a JSON for scripts/gate_token_set.py. With this set the script CAPTURES "
+                         "rather than judges -- its own 1:1 parity line stays as a note and the "
+                         "exit status reports whether the DEVICE RUN worked, not whether the "
+                         "tokens matched, because the verdict is the token-set gate's to give.")
+    ap.add_argument("--topk", type=int, default=5,
+                    help="how many candidates per step to record (GATE_K in gate_llm_reference.py)")
     ap.add_argument("--teacher-force", action="store_true",
                     help="feed the ORACLE's tokens instead of the device's own, so each step is "
                          "judged independently. Free-running conflates one bad token with the "
                          "trajectory it then drags behind it.")
+    ap.add_argument("--redispatch-check", action="store_true",
+                    help="redispatch check: write step-0's "
+                         "inputs once, dispatch twice with nothing rewritten in between, and "
+                         "require byte-identical logits. Runs instead of the parity loop.")
     a = ap.parse_args()
     isolate_build_dir("verify")
 
@@ -180,26 +193,40 @@ def main():
     rope_loc_buf = c.get_buffer("rope_local") if "rope_local" in declared else None
     out = c.get_buffer("logits")
 
+    if a.redispatch_check:
+        tok0 = prompt_ids[0]
+        with xin.overwrite() as _buf:
+            _buf[:] = np.asarray(embed[tok0] * scale, BF16).reshape(-1)
+        with rope_buf.overwrite() as _buf:
+            _buf[:] = rope_row(0, HD, sp.rope_theta_global).reshape(-1)
+        params.write("kv_off", 0)
+        params.write("sm_mask", 1)
+        params.sync()
+        assert_redispatch_identical(c, out, label=sp.name, vocab=VOCAB)
+        return
+
     fed = list(prompt_ids)
     produced = []
+    topk_ids, topk_logits = [], []
     # Per produced step: (device top-1 logit, logit the device gave the ORACLE's token).
     # This is what classifies a mismatch. The oracle's stored `margins` describe a DIFFERENT
     # implementation's forward pass; the device's own gap describes this one.
     step_logits = []
     tok = fed[0]
     for pos in range(len(fed) + steps - 1):
-        np.copyto(xin.data, np.asarray(embed[tok] * scale, BF16).reshape(-1))
+        with xin.overwrite() as _buf:
+            _buf[:] = np.asarray(embed[tok] * scale, BF16).reshape(-1)
         # WIDTH PER BUFFER, not one spec-wide HD. Gemma-4-12B's global layers rotate at head_dim
         # 512 and its sliding layers at 256, so the two rows differ in width as well as theta;
         # taking both from `sp.head_dim` writes the wrong number of angles into one of them.
         if rope_buf is not None:
-            np.copyto(rope_buf.data,
-                      rope_row(pos, rope_buf.data.size, sp.rope_theta_global,
-                               sp.rope_partial_rotary).reshape(-1))
+            with rope_buf.overwrite() as _buf:
+                _buf[:] = rope_row(pos, _buf.size, sp.rope_theta_global,
+                                   sp.rope_partial_rotary).reshape(-1)
         if rope_loc_buf is not None:
             # Sliding layers are rope_type "default" -- nothing narrowed.
-            np.copyto(rope_loc_buf.data,
-                      rope_row(pos, rope_loc_buf.data.size, sp.rope_theta_local).reshape(-1))
+            with rope_loc_buf.overwrite() as _buf:
+                _buf[:] = rope_row(pos, _buf.size, sp.rope_theta_local).reshape(-1)
         # ONE WRITE PER DISTINCT head_dim, off the artifact's own kv_params. `pos * head_dim` is two
         # different byte offsets under per-layer geometry, and a single write silently hands the
         # global layers the sliding layers' KV offset.
@@ -234,6 +261,12 @@ def main():
             produced.append(nxt)
             want = gen_ids[i] if i < len(gen_ids) else nxt
             step_logits.append((float(lg[nxt]), float(lg[want])))
+            # The device's own top-K, captured whether or not this step matched: the token-set gate
+            # needs the candidates AT the first divergence, which is not knowable in advance.
+            top = np.argpartition(-lg, a.topk)[:a.topk]
+            top = top[np.argsort(-lg[top])]
+            topk_ids.append([int(t) for t in top])
+            topk_logits.append([float(lg[t]) for t in top])
             # Free-running: one wrong token puts every later step on a different trajectory, so a
             # single flip reads as N failures. Teacher-forcing feeds the oracle's token instead,
             # which makes each step an independent test of the forward pass.
@@ -277,6 +310,21 @@ def main():
         extra = f", host margin {margins[i]:.4f}" if margins and i < len(margins) else ""
         print(f"           step {i}: oracle {gen_ids[i]} vs NPU {produced[i]}{extra} -> {kind}")
     print("*** PARITY PASS ***" if match == n else f"*** {n-match} MISMATCH ***")
+    if a.emit_topk:
+        json.dump({
+            "spec": sp.name, "backend": f"npu fused decode, {NL} layers, S={S}",
+            "prompt": ref.get("prompt"), "prompt_ids": prompt_ids,
+            "n_tokens": len(produced), "k": a.topk, "gen_ids": produced,
+            "topk_ids": topk_ids, "topk_logits": topk_logits,
+            "teacher_forced": bool(a.teacher_force),
+            "note": "Device capture for scripts/gate_token_set.py. The 1:1 parity line this run "
+                    "also printed is the OLD gate and is kept as a note: it demands byte-identical "
+                    "tokens against one particular host implementation, which stops being "
+                    "achievable as soon as a rail has two implementations of an op.",
+        }, open(a.emit_topk, "w"), indent=1)
+        print(f"[verify] top-{a.topk} capture -> {a.emit_topk}; the VERDICT is "
+              f"scripts/gate_token_set.py's, not this line's")
+        return 0
     return 0 if match == n else 1
 
 

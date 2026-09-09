@@ -12,7 +12,11 @@
 # pinned SHA is reachable on the real remote).
 set -euo pipefail
 ORIG="$(cd "$(dirname "$0")/.." && pwd)"
-SHA=8373e49165649644f1ec414c2e406c0abbbf51cf
+# The expected gitlink is DERIVED from toolchain.lock, never written here. A literal was wrong
+# from 2026-07-11, when 59756ef moved the gitlink in passing and nothing linked the two records --
+# so this assertion compared against a June SHA for two months and could only pass by coincidence.
+SHA="$(. "$ORIG/toolchain.lock"; echo "$MLIR_AIE_FORK_COMMIT")"
+[ -n "$SHA" ] || { echo "FAIL: toolchain.lock has no MLIR_AIE_FORK_COMMIT" >&2; exit 1; }
 USE_GITHUB=0; [ "${1:-}" = "--github" ] && USE_GITHUB=1
 
 [ -d "$ORIG/.venv-iron" ] || { echo "FAIL: this test reuses the existing .venv-iron toolchain, which is absent. Run scripts/setup_kernel_env.sh first." >&2; exit 1; }
@@ -29,6 +33,13 @@ cd "$TMP/repo"
 
 echo "== [2/6] reuse toolchain: symlink .venv-iron -> original (skips venv+wheel install) =="
 ln -s "$ORIG/.venv-iron" "$TMP/repo/.venv-iron"
+# Same reuse, one layer down. XDNA_CACHE now defaults INSIDE the repo, so without this the temp
+# clone resolves its own EMPTY .cache and toolchain_up.sh has neither a built instance nor the
+# provisioned MLIR distro -- outside this test's agreed scope, which reuses the toolchain rather
+# than provisioning one. Point the whole cache at the original, not just TOOLCHAIN_HOME: that
+# names only instances/, and the first attempt at this failed on "MLIR distro ... not provisioned"
+# because mlir-distro/, ccache/ and goldens/ hang off XDNA_CACHE too.
+export XDNA_CACHE="$ORIG/.cache"
 
 echo "== [3/6] submodule update --init -> resolve the pinned gitlink =="
 if [ "$USE_GITHUB" = 1 ]; then
@@ -45,16 +56,21 @@ fi
 GOT="$(git -C mlir-aie rev-parse HEAD)"
 [ "$GOT" = "$SHA" ] && echo "   OK: submodule at pinned SHA $GOT" || fail "submodule SHA $GOT != pinned $SHA"
 
-echo "== [4/6] run the real setup_kernel_env.sh (skips venv/wheels/init via guards; applies patch + syncs) =="
+echo "== [4/6] run the real setup_kernel_env.sh (skips venv/wheels/init via guards; syncs kernels) =="
 bash scripts/setup_kernel_env.sh
-# assert the patch landed on all 3 upstream files
-for f in programming_examples/common.cmake \
-         programming_examples/basic/matrix_multiplication/common.h \
-         programming_examples/ml/layernorm/Makefile; do
-  git -C mlir-aie diff --quiet -- "$f" && fail "patch did not modify $f"
-done
-grep -q 'LOCAL PATCH (CachyOS)' mlir-aie/programming_examples/common.cmake || fail "cmake patch marker missing"
-echo "   OK: tethered patch applied to the 3 upstream files"
+# This used to assert a tethered patch had modified common.cmake, common.h and the layernorm
+# Makefile, and to grep for a 'LOCAL PATCH (CachyOS)' marker. That mechanism is GONE by design --
+# setup_kernel_env.sh states it ("There is no apply-patch step"), the build fixes are carried as
+# COMMITS on the branch toolchain.lock pins, and the CachyOS cmake fix is supplied by iron_env.sh's
+# XRT_INC_DIR/XRT_LIB_DIR exports instead. The assertion outlived what it was checking and failed
+# the test on a retirement, not a regression.
+#
+# What replaced it is the property that actually matters now: setup must leave the checkout ON the
+# pinned commit. That is where the fixes live, so a setup step that moves it off the pin silently
+# drops them -- the same failure the old assertion existed to catch.
+GOT_AFTER_SETUP="$(git -C mlir-aie rev-parse HEAD)"
+[ "$GOT_AFTER_SETUP" = "$SHA" ] || fail "setup_kernel_env.sh left mlir-aie at $GOT_AFTER_SETUP, not the pinned $SHA"
+echo "   OK: setup left mlir-aie on the pinned commit (fixes ride the branch, not a patch)"
 # assert our kernels synced forward
 for k in aie_kernels/aie2p/dwconv1d.cc aie_kernels/aie2p/mm_silu_epilogue.cc \
          programming_examples/ml/dwconv1d/Makefile programming_examples/ml/softmax400/softmax400.py \
@@ -64,16 +80,46 @@ done
 echo "   OK: custom kernels copied-forward"
 
 echo "== [5/6] build_kernels.sh against the fresh tree (reusing toolchain) =="
-bash scripts/build_kernels.sh
+# Do NOT let a partial build short-circuit step 6. build_kernels.sh now exits non-zero with a NAMED
+# list when some shapes fail rather than dying at the first one, and step 6 is the only thing in
+# this tree that asserts WHICH xclbins must exist -- so aborting here threw away the completeness
+# check to report a failure step 6 would have described precisely. The build's own failure list is
+# already on stderr; step 6 decides the verdict.
+bash scripts/build_kernels.sh || echo "   (build reported failures -- step 6 says whether any REQUIRED xclbin is affected)"
 
 echo "== [6/6] assert the encoder xclbins were produced =="
 MM=programming_examples/basic/matrix_multiplication
+# THE DECLARED SHAPE SET. This is the only place that says which xclbins must EXIST, and it is why
+# it is worth keeping wider than feels necessary: neither guard downstream can express completeness.
+# `.toolchain-stamp` is per-DIRECTORY and passes on one file being present; `kernel_manifest.json`
+# is explicitly descriptive ("cannot assert anything the directory doesn't currently contain"), so
+# regenerating it after a partial build simply adopts the smaller reality. On 2026-09-09 the
+# installed dir lost seven shapes and every guard reported OK.
+#
+# Every entry below is CURRENTLY BUILDABLE and was verified present after a from-zero run. The
+# K=768 fast tiles (64x32x96, 64x64x96) are deliberately NOT here: they overflow L1 on this
+# toolchain AND on the previous one, so listing them would paint the test permanently red for a
+# known, separate defect rather than for a regression.
 MUST=(
   programming_examples/ml/dwconv1d/build/final.xclbin
   programming_examples/ml/layernorm/build/final.xclbin
   "$MM/whole_array/build/final_512x800x3072_32x32x32_8c_silu.xclbin"
   "$MM/whole_array/build/final_512x3104x768_32x32x32_8c_bias.xclbin"
   programming_examples/ml/softmax400/build/final.xclbin
+  # K_aug=800 modal (Whisper-small / Parakeet, d_model 768 + the 32-row bias augment)
+  "$MM/whole_array/build/final_512x800x768_64x32x96_8c_modalsilu.xclbin"
+  "$MM/whole_array/build/final_512x800x1536_64x32x96_8c_modalsilu.xclbin"
+  "$MM/whole_array/build/final_512x800x3072_64x32x96_8c_modalsilu.xclbin"
+  "$MM/whole_array/build/final_512x800x3072_64x32x96_8c_modalid.xclbin"
+  "$MM/whole_array/build/final_512x800x3072_64x32x96_8c_modalgelu.xclbin"
+  # K_aug=1312 (Whisper-turbo, d_model 1280 + 32). ctx2.rs:1583 asserts kaug()==1312; these were
+  # absent from every build script until 2026-09-09 and vanished from the live path at a re-pin.
+  "$MM/whole_array/build/final_512x1312x1280_32x32x32_8c_modalid.xclbin"
+  "$MM/whole_array/build/final_512x1312x5120_32x32x32_8c_modalsilu.xclbin"
+  "$MM/whole_array/build/final_512x1312x5120_32x32x32_8c_modalgelu.xclbin"
+  # K=1024 modal resident (Parakeet zero-switch encoder) -- the delegated half of the build
+  "$MM/whole_array/build/final_512x1024x4096_64x32x128_8c_modalsilu.xclbin"
+  "$MM/whole_array/build/final_512x4096x1024_64x32x128_8c_modalid.xclbin"
 )
 ok=1
 for x in "${MUST[@]}"; do

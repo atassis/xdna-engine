@@ -7,12 +7,14 @@ pub mod config;
 pub mod detokenize;
 pub mod generator;
 pub mod npu_decode;
+pub mod npu_prefill;
 pub mod sampling;
 
-pub use artifact::{EmbedScale, LlmArtifact};
+pub use artifact::{ArtifactRole, EmbedScale, LlmArtifact};
 pub use chat_template::ChatTemplate;
 pub use config::{ModelConfig, StopTokens};
 pub use detokenize::{IncrementalDetokenizer, StopFeed, StopMatcher};
 pub use generator::{DecodeStep, LlmGenerator, ScriptedDecodeStep};
 pub use npu_decode::NpuDecodeStep;
+pub use npu_prefill::{chunk_plan, NpuPrefill, PrefillChunk};
 pub use sampling::{LogitView, SampleOutcome, SamplingConfig};

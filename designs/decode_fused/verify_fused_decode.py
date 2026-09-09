@@ -275,7 +275,8 @@ def main():
     xout = callable_.get_buffer(out_name)
     for step in range(a.steps):
         x = bf16(emb_t[tok] + emb_p[step])
-        np.copyto(xin.data, x.reshape(-1))
+        with xin.overwrite() as _buf:
+            _buf[:] = x.reshape(-1)
         # patch
         off_val = step * HD * 2
         patches = {i: (base + off_val, 0xFFFFFFFF) for i, base in kv_loc_base.items()}

@@ -98,6 +98,11 @@ extern "C" {
 //          golden.py's build_cossin_resident) -- the device performs no trig call at all.
 void rope_interleaved_prologue(bfloat16 *restrict qk, const float *restrict cossin) {
   event0();
+  // conv_even for the narrow back to bf16, matching the host's round-nearest pack that golden.py
+  // is compared against. Safe to hold across the whole pass -- rotation is elementwise, so there
+  // is no reduction here for the mode to perturb. Handed back because crRnd is one sticky register
+  // per core and this runs as a prologue to whatever consumes the rotated tile.
+  const auto saved_rounding = ::aie::swap_rounding(::aie::rounding_mode::conv_even);
 
   for (unsigned m = 0; m < ROPE_M; ++m) {
     bfloat16 *row = qk + (size_t)m * ROPE_D;
@@ -135,6 +140,7 @@ void rope_interleaved_prologue(bfloat16 *restrict qk, const float *restrict coss
     // row[ROPE_ROT, ROPE_D) untouched (partial-rotary pass-through) -- already correct in place.
   }
 
+  ::aie::set_rounding(saved_rounding);
   event1();
 }
 

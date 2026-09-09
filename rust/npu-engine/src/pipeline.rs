@@ -19,6 +19,10 @@ pub trait Encoder {
 /// (engine-errors-are-real).
 pub trait AsrModel {
     fn transcribe(&self, samples: &[i16]) -> Result<String, EngineError>;
+
+    /// Pinned device BO bytes this model currently holds. `0` is the honest "unmeasured" answer for
+    /// a model whose device handle is not reachable from here yet -- see `capability::Servable::footprint`.
+    fn bo_bytes(&self) -> u64 { 0 }
 }
 
 /// Raw input -> encoder input activations + valid_len.
@@ -39,12 +43,19 @@ pub trait Head {
 /// pipeline's inherent `embed` (no recursion, inherent methods preserved for the verify bins).
 pub trait Embedder {
     fn embed_one(&self, text: String) -> Result<Vec<f32>, EngineError>;
+
+    /// See `AsrModel::bo_bytes`.
+    fn bo_bytes(&self) -> u64 { 0 }
 }
 
 /// Speaker diarization: PCM in, speaker-attributed spans out. Same `&self` shape as `AsrModel`;
 /// no interior mutability is needed because the ONNX sessions behind it are stateless per call.
 pub trait Diarizer {
     fn diarize(&self, pcm: &[i16]) -> Result<Vec<crate::capability::Segment>, EngineError>;
+
+    /// See `AsrModel::bo_bytes`. `0` is not "unmeasured" here -- v1 diarization is host-only
+    /// (`registry::try_build` opens no device for it), so it genuinely pins zero device bytes.
+    fn bo_bytes(&self) -> u64 { 0 }
 }
 
 /// One assembled, ready-to-serve pipeline. The registry returns this; `engine_serve` matches on it.
@@ -277,6 +288,9 @@ pub trait TextGenerator {
         params: &GenerateParams,
         sink: &mut dyn FnMut(Chunk<'_>) -> bool,
     ) -> Result<(), EngineError>;
+
+    /// See `AsrModel::bo_bytes`.
+    fn bo_bytes(&self) -> u64 { 0 }
 
     /// Collect a whole generation into a String. Provided, not required: this is the buffered
     /// surface expressed in terms of the streaming one, which is the point of the single method.
