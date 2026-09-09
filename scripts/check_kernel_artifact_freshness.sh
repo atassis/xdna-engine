@@ -63,8 +63,26 @@ DIRS=(
 # the owner running the command, which is the cheapest possible detector and the wrong one to
 # depend on. artifacts/gemma4-12b/decode is deliberately absent: it has no meta.json, so it
 # predates the convention and adding it would report UNSTAMPED forever with no producer to fix it.
+# CORRECTED 2026-09-09, same day and same failure as the note above. That note recorded the
+# owner finding a stale artifact by running the command, called that "the wrong [detector] to
+# depend on" -- and then listed only qwen3-0.6b/decode, leaving PREFILL out. Prefill is named by
+# the same scenario file, three lines below decode, and it went stale invisibly until the owner
+# ran `npu chat` and got the identical error the note describes. Two of the four artifacts the
+# installed scenarios load were stale on top of it.
+#
+# So the list is now the SCENARIO-REFERENCED set, not the ones someone remembered. Membership is
+# "an installed scenario names it", which is checkable; `grep -hE '^(decode|prefill) *=' \
+# ~/.local/share/xdna-engine/scenarios/*.toml` enumerates it in one line. Adding a scenario that
+# names a new ELF artifact means adding it here -- and the cost of forgetting is a model that
+# refuses to load, which is what this gate exists to catch BEFORE the owner does.
+#
+# artifacts/gemma4-12b/decode stays deliberately absent: no meta.json, no producer, and no
+# scenario names it, so it would report UNSTAMPED forever.
 ELF_DIRS=(
   "$REPO/artifacts/qwen3-0.6b/decode|scripts/build_llm_decode.sh qwen3-0.6b"
+  "$REPO/artifacts/qwen3-0.6b/prefill|scripts/build_prefill.sh 28 256 2048"
+  "$REPO/artifacts/qwen3-0.6b/decode_s512|GEN_EXTRA='--max-seq 512' scripts/build_llm_decode.sh qwen3-0.6b '' \$PWD/artifacts/qwen3-0.6b/decode_s512   (OUT must be ABSOLUTE: the script cds into a work dir first)"
+  "$REPO/artifacts/gemma3-270m/decode|scripts/build_llm_decode.sh gemma3-270m"
 )
 
 FAMILY_DIRS=(
@@ -106,8 +124,18 @@ check_elf_one() {
     echo "[check_kernel_artifact_freshness] STALE     $rel was built for toolchain.lock=$stamp, but toolchain.lock is now $current -- it was re-pinned and this dir was never rebuilt; rebuild with $regen" >&2
     fail=1; return
   fi
-  if [ ! -s "$dir/decode.elf" ]; then
-    echo "[check_kernel_artifact_freshness] EMPTY     $rel is stamped current ($current) but holds no decode.elf; rebuild with $regen" >&2
+  # The ELF's NAME comes from meta.json, which declares it ("elf": "decode.elf" / "prefill.elf"),
+  # rather than being hardcoded. It was `decode.elf` until 2026-09-09, which was invisible while
+  # this list held only decode dirs and reported EMPTY the moment prefill joined -- a stamped,
+  # complete, freshly built artifact called a failure because the checker knew one filename.
+  local elf
+  elf="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("elf") or "")' "$meta" 2>/dev/null)"
+  if [ -z "$elf" ]; then
+    echo "[check_kernel_artifact_freshness] UNSTAMPED $rel meta.json names no elf -- rebuild with $regen" >&2
+    fail=1; return
+  fi
+  if [ ! -s "$dir/$elf" ]; then
+    echo "[check_kernel_artifact_freshness] EMPTY     $rel is stamped current ($current) but holds no $elf; rebuild with $regen" >&2
     fail=1; return
   fi
   echo "[check_kernel_artifact_freshness] OK        $rel (toolchain.lock=$current)"
