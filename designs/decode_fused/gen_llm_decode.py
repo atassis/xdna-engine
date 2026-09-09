@@ -1578,6 +1578,17 @@ def main():
     os.makedirs(os.path.join(a.out, "buffers"), exist_ok=True)
     sp, fused, weights, md = build_graph(a.spec, a.weights, a.layers, a.max_seq)
     NL, S, inputs, cache_names = md["NL"], md["S"], md["inputs"], md["cache_names"]
+    # meta.json describes ONE elf and ONE layout. A segmented stack is N of each plus the seam
+    # order between them, and none of that has a field here yet -- so writing the artifact anyway
+    # would emit segment 0 under the full model's name: a Gemma-4 artifact that loads, runs, and
+    # silently decodes the first sixteen layers. Refuse instead. verify_llm_decode.py drives the
+    # segments in-process and is the gate until this format grows the fields.
+    if len(md["segments"]) > 1:
+        raise SystemExit(
+            f"DECODE_SEGMENTS={len(md['segments'])}: this writer emits a single-ELF artifact and "
+            f"would record only segment 0 ({md['segments'][0]['layers'][1]} of {NL} layers) as the "
+            f"whole model. Gate a segmented stack through verify_llm_decode.py, which drives every "
+            f"segment, until meta.json carries the per-segment ELF list and seam order.")
     embed_blob, host_embed = md["embed_blob"], md["host_embed"]
     D, HD, Hq, Hkv, VOCAB = sp.d_model, sp.head_dim, sp.n_q_heads, sp.n_kv_heads, sp.vocab
     FF = sp.ffn
