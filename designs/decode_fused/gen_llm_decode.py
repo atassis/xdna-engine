@@ -234,6 +234,25 @@ FUSE_QKV_DP = os.environ.get("FUSE_QKV_DP", "1") == "1"
 # is already dispatch-dominated. See the-gemma4-fault-is-in-the-lm-head-output-not-the-layers.
 SPLIT_LM_HEAD = os.environ.get("SPLIT_LM_HEAD", "0") == "1"
 
+# Split the LAYER STACK across N dispatches, threading the residual between them through the host.
+# The arena limit this exists for is `aiex.npu.address_patch`'s I32 arg_plus (see
+# check_arena_offsets_are_addressable): a single 48-layer Gemma-4-12B arena is 9.13 GiB, so no
+# arrangement of one dispatch can address it, and the fix that needs no toolchain change is to make
+# each dispatch's arena small enough that the question does not arise.
+#
+# Splitting also closes the guard's known GAP for free. The guard tests a buffer's START offset and
+# cannot see a buffer that starts below 2^32 and STREAMS across it -- the partial case that still
+# holes the 6-layer lm-head. When every arena is under 4 GiB no buffer can start or end past the
+# boundary, so the sufficient condition holds by construction rather than by measurement.
+#
+# Cost, stated because it is real: each extra segment is one more hardware-context transition per
+# token, and a decode step is already ~90% dispatch. Correctness first, per the build methodology --
+# judge a move by whether it advances the single-hardware graph, not by whether it is faster today.
+# 1 is the default and is byte-for-byte the unsplit build.
+DECODE_SEGMENTS = int(os.environ.get("DECODE_SEGMENTS", "1"))
+if DECODE_SEGMENTS < 1:
+    raise SystemExit(f"DECODE_SEGMENTS={DECODE_SEGMENTS} must be >= 1")
+
 # Fold the attention output projection (`a = Wo @ cx`) into the SwiGLU MLP data-parallel design:
 # every core computes its own D/N row-slice of `a` from its own row-slice of Wo before doing
 # anything else, all-gathers it through the same DRAM-scratch mechanism gh already uses, then
@@ -616,6 +635,21 @@ def gemv(M, K, ctx, **kw):
 # narrowing a field both ends of it carry at 64 bits, so it is fixable upstream; until it is, refuse
 # here rather than emit a design that lies.
 ADDRESS_PATCH_MAX_OFFSET = 1 << 32
+
+
+def runlist_buffer_names(entries):
+    """Every buffer an OperatorSequence runlist slice touches, as bare names.
+
+    Operands are strings, and `split_over_k` writes BYTE-SLICED ones (`L0_Wd[0:1234]`) whose base
+    buffer is what the layout actually names -- so the bracket is stripped here rather than at each
+    call site. Non-string entries (the operator object in position 0) are skipped.
+    """
+    out = set()
+    for e in entries:
+        for arg in e[1:]:
+            if isinstance(arg, str):
+                out.add(arg.split("[", 1)[0])
+    return out
 
 
 def check_arena_offsets_are_addressable(seq, names):
@@ -1108,8 +1142,13 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
 
     weights, bufsz, cache_names, rl = {}, {}, [], []
     cur = "x"
+    # (runlist index, residual buffer entering this layer) per layer, so the stack can be cut into
+    # segments AFTER it is built. Recorded rather than reconstructed: the residual chain is
+    # x -> x1 -> ... -> xNL and a cut is only sound at a layer boundary, which is exactly here.
+    layer_marks = []
 
     for l in range(NL):
+        layer_marks.append((len(rl), cur))
         # The layer's attention geometry. Uniform for every shipped spec, so this is the same
         # namespace object every iteration and the ops are shared exactly as they were when they
         # were module-level; Gemma-4-12B is where it starts returning two.
@@ -1442,12 +1481,71 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
     # needs it, and the output arena is the one that gets synced back -- a scratch read of `xf`
     # returns zeros at 12 layers while the device plainly computed from it.
     head_name = "logits" if not SPLIT_LM_HEAD else "xf"
-    fused = OperatorSequence(sequence_name(sp, NL, S, placer_flags), rl,
-                              input_args=inputs, output_args=[head_name],
-                              buffer_sizes=bufsz, context=ctx, extra_flags=placer_flags,
-                              share_designs=share)
-    fused.compile()
-    check_arena_offsets_are_addressable(fused, [*inputs, head_name, *weights.keys(), *cache_names])
+
+    if DECODE_SEGMENTS > NL:
+        raise SystemExit(f"DECODE_SEGMENTS={DECODE_SEGMENTS} exceeds the {NL} layers there are to "
+                         f"split; a segment boundary only exists at a layer boundary")
+    # Cut points in LAYER index. Contiguous and near-equal, remainder to the earliest segments, so
+    # 48 over 3 is 16/16/16 and 48 over 5 is 10/10/10/9/9. The last segment also carries the tail
+    # (final norm, and the lm-head unless SPLIT_LM_HEAD moved it out), which is why an equal layer
+    # split still leaves the last arena the largest.
+    q, r = divmod(NL, DECODE_SEGMENTS)
+    cuts, _a = [], 0
+    for i in range(DECODE_SEGMENTS):
+        _b = _a + q + (1 if i < r else 0)
+        cuts.append((_a, _b))
+        _a = _b
+
+    segments = []
+    for si, (la, lb) in enumerate(cuts):
+        first, last = si == 0, si == len(cuts) - 1
+        lo = layer_marks[la][0]
+        hi = layer_marks[lb][0] if lb < NL else len(rl)
+        entries = rl[lo:hi] if not last else rl[lo:]
+        seg_in = layer_marks[la][1]
+        seg_out = head_name if last else layer_marks[lb][1]
+        # Which buffers this slice touches, read off the entries themselves rather than rebuilt from
+        # a name convention -- `split_over_k` emits BYTE-SLICED operands (`Wd[0:1234]`), and a
+        # convention-based list would silently drop or duplicate them.
+        refs = runlist_buffer_names(entries)
+        # UNSPLIT IS VERBATIM. At one segment the arg lists must be the objects the pre-segmentation
+        # build passed, not a filtered reconstruction of them -- `bufsz` carries entries no op reads
+        # (`logits` under SPLIT_LM_HEAD), and dropping them would change the default artifact while
+        # looking like a refactor. The filtered path exists only where there is a seam to fit.
+        one = len(cuts) == 1
+        seg_inputs = inputs if one else [seg_in] + [n for n in inputs if n != "x" and n in refs]
+        seg_bufsz = bufsz if one else {n: v for n, v in bufsz.items() if n in refs}
+        # The residual chain x -> x1 -> ... -> xNL is sized implicitly in the unsplit build, because
+        # every link is produced and consumed inside one graph. A cut turns one link into a declared
+        # arg on both sides of the seam, and a declared arg needs a size -- the same reason the
+        # lm-head split passes `{"xf": D * 2}` rather than letting it be inferred. `x` itself stays
+        # out: it is the model input and the unsplit build does not size it either.
+        if not first:
+            seg_bufsz[seg_in] = D * 2
+        if not last:
+            seg_bufsz[seg_out] = D * 2
+        name = (sequence_name(sp, NL, S, placer_flags) if len(cuts) == 1
+                else f"{sequence_name(sp, NL, S, placer_flags)}_seg{si}of{len(cuts)}")
+        seq = OperatorSequence(name, entries,
+                               input_args=seg_inputs, output_args=[seg_out],
+                               buffer_sizes=seg_bufsz, context=ctx, extra_flags=placer_flags,
+                               share_designs=share)
+        seq.compile()
+        # Per-segment weight set, refs-filtered even when unsplit: under SPLIT_LM_HEAD `weights`
+        # still holds W_head but no op in this graph reads it, so a consumer that loads by this list
+        # asks for a buffer the arena does not have. The addressability CHECK keeps taking the full
+        # list when unsplit, because that is what it took before and it tolerates a missing name.
+        seg_weights = sorted(n for n in weights if n in refs)
+        seg_caches = cache_names if one else [n for n in cache_names if n in refs]
+        check_arena_offsets_are_addressable(
+            seq, [*seg_inputs, seg_out, *(weights if one else seg_weights), *seg_caches])
+        segments.append(dict(seq=seq, layers=(la, lb), inlet=seg_in, outlet=seg_out,
+                             weights=seg_weights, caches=seg_caches, inputs=seg_inputs))
+        if len(cuts) > 1:
+            print(f"[gen] segment {si}: layers {la}..{lb - 1}, {seg_in} -> {seg_out}, "
+                  f"{len(seg_weights)} weights, arena {seq.buffer_sizes[2] / 2**30:.3f} GiB",
+                  file=sys.stderr)
+    fused = segments[0]["seq"]
 
     # The lm-head as its own graph: one op, `xf` in, logits out, its own W_head. No arena sharing --
     # `xf` is 7680 bytes and crosses through the host, which costs one small copy per token against a
@@ -1464,6 +1562,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
         head.compile()
     return sp, fused, weights, dict(NL=NL, S=S, inputs=inputs, cache_names=cache_names,
                                     head=head, split_lm_head=SPLIT_LM_HEAD,
+                                    segments=segments, layer_marks=layer_marks,
                                     embed_blob=embed_blob, host_embed=host_embed,
                                     kv_slots=kv_slots)
 

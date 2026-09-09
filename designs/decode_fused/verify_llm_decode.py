@@ -178,39 +178,59 @@ def main():
     HD, D, VOCAB = sp.head_dim, sp.d_model, sp.vocab
     print(f"[verify] {sp.name}: {NL} layers, S={S}, vocab={VOCAB}")
 
-    c = fused.get_callable()
-    params = c.params
-    if params is None:
-        raise SystemExit("[verify] no runtime parameters bound -- params.txt missing from the build; "
-                         "the ELF cannot be driven per-token")
+    # THE STACK IS A LIST OF DISPATCHES, length 1 unless DECODE_SEGMENTS cut it. The arena limit
+    # that forces the cut is per DISPATCH (aiex.npu.address_patch's I32 arg_plus, 4 GiB), so a
+    # 48-layer Gemma-4 whose single arena is 9.13 GiB fits as three small ones. Each segment owns
+    # its own layers' weights and KV caches; only the residual crosses, 7680 bytes a seam a token.
+    segs = md["segments"]
+    stack = []
+    for si, sg in enumerate(segs):
+        sc = sg["seq"].get_callable()
+        if sc.params is None:
+            raise SystemExit(f"[verify] segment {si} ({sg['seq'].name}): no runtime parameters "
+                             f"bound -- params.txt missing from the build; the ELF cannot be "
+                             f"driven per-token")
+        # Each segment's weights come off the GRAPH's own buffer list, not off a filter applied
+        # here. A weight that belongs to no segment is then a loud KeyError below rather than a
+        # silent skip -- the property the lm-head split's `head_only` partition was protecting.
+        for name in sg["weights"]:
+            load_weight_buffer(sc.get_buffer(name), weights[name])
+        # FLUSH SCRATCH. Every weight and both KV caches live in the scratch arena, and the callable
+        # syncs only input (host->device) and output (device->host) -- scratch in NEITHER direction,
+        # deliberately, because it is large and "whoever loads it" is supposed to sync it. Nobody did.
+        # So these writes sat in dirty host cache lines over DRAM the device then read, and what the
+        # device saw depended on which lines the CPU had happened to write back.
+        #
+        # MEASURED 2026-09-07 with probe_decode_first_divergence.py, two identical passes of the
+        # 2-layer decode: without this flush BOTH arms are nondeterministic -- the TMV arm first
+        # diverges at L0_q (the Q projection, runlist index 1, 95/114 snapshots differing and a
+        # different token by step 2) and the kv arm at L0_kr by 64 elements = exactly 2 x 64-byte
+        # cache lines. With it, both arms are bit-identical across passes and agree token for token.
+        # The "kv arm is 0/336" that this defect was localised against was luck, not a property.
+        # The Rust rail has always done this -- rust/npu-engine/src/llm/npu_decode.rs:113, one bulk
+        # arena.sync_to_device() after the weight load, with the write -> sync_input -> dispatch ->
+        # sync_from_device contract in that module's doc. Only the Python path was missing it.
+        sc.scratch_buffer.device = "cpu"
+        sc.scratch_buffer.to("npu")
+        stack.append(dict(c=sc, params=sc.params, sg=sg,
+                          inlet=(sc.get_buffer(sg["inlet"]) if si else None),
+                          outlet=sc.get_buffer(sg["outlet"]),
+                          # Rope angles are an INPUT to every segment that has a layer reading
+                          # them, so the host writes the row into each one. Driving only the first
+                          # segment's would leave every later layer rotating against zeros.
+                          rope_g=(sc.get_buffer("rope_global")
+                                  if "rope_global" in sg["inputs"] else None),
+                          rope_l=(sc.get_buffer("rope_local")
+                                  if "rope_local" in sg["inputs"] else None)))
+    c = stack[0]["c"]
+    params = stack[0]["params"]
     print("[verify] ParameterScratchpad bound (kv_off, sm_mask)")
-
-    # With the lm-head split out, W_head belongs to the SECOND graph's arena and is not in this
-    # one's layout. Partition explicitly rather than skipping on KeyError, so a weight that belongs
-    # to neither graph is still a loud failure.
-    head_only = {"W_head"} if md.get("split_lm_head") else set()
-    for name, arr in weights.items():
-        if name in head_only:
-            continue
-        buf = c.get_buffer(name)
-        load_weight_buffer(buf, arr)
-    # FLUSH SCRATCH. Every weight and both KV caches live in the scratch arena, and the callable
-    # syncs only input (host->device) and output (device->host) -- scratch in NEITHER direction,
-    # deliberately, because it is large and "whoever loads it" is supposed to sync it. Nobody did.
-    # So these writes sat in dirty host cache lines over DRAM the device then read, and what the
-    # device saw depended on which lines the CPU had happened to write back.
-    #
-    # MEASURED 2026-09-07 with probe_decode_first_divergence.py, two identical passes of the
-    # 2-layer decode: without this flush BOTH arms are nondeterministic -- the TMV arm first
-    # diverges at L0_q (the Q projection, runlist index 1, 95/114 snapshots differing and a
-    # different token by step 2) and the kv arm at L0_kr by 64 elements = exactly 2 x 64-byte
-    # cache lines. With it, both arms are bit-identical across passes and agree token for token.
-    # The "kv arm is 0/336" that this defect was localised against was luck, not a property.
-    # The Rust rail has always done this -- rust/npu-engine/src/llm/npu_decode.rs:113, one bulk
-    # arena.sync_to_device() after the weight load, with the write -> sync_input -> dispatch ->
-    # sync_from_device contract in that module's doc. Only the Python path was missing it.
-    c.scratch_buffer.device = "cpu"
-    c.scratch_buffer.to("npu")
+    if len(stack) > 1:
+        for si, st in enumerate(stack):
+            la, lb = st["sg"]["layers"]
+            print(f"[verify] segment {si}: layers {la}..{lb - 1}, "
+                  f"{st['sg']['inlet']} -> {st['sg']['outlet']}, "
+                  f"{len(st['sg']['weights'])} weights", file=sys.stderr)
     print(f"[verify] {len(weights)} weight buffers loaded and scratch flushed to the device")
 
     # embed_tokens doubles as the tied lm-head; the host gathers the row for the current token.
@@ -239,9 +259,13 @@ def main():
     # artifact. `md["kv_slots"]` is [(param_name, head_dim)], the same list the generator turns into
     # meta.json's `scratchpad.kv_params`.
     kv_slots = md["kv_slots"]
-    rope_buf = c.get_buffer("rope_global") if "rope_global" in declared else None
-    rope_loc_buf = c.get_buffer("rope_local") if "rope_local" in declared else None
-    out = c.get_buffer("logits")
+    rope_buf = stack[0]["rope_g"]
+    rope_loc_buf = stack[0]["rope_l"]
+    # The logits come out of the LAST segment (or, under SPLIT_LM_HEAD, out of the head graph --
+    # `lg` is taken from there below). Reading them off segment 0 was right only while there was
+    # exactly one segment, and would have returned a buffer the stack never writes once there are
+    # three.
+    out = stack[-1]["c"].get_buffer("logits")
 
     if a.redispatch_check:
         tok0 = prompt_ids[0]
@@ -252,6 +276,10 @@ def main():
         params.write("kv_off", 0)
         params.write("sm_mask", 1)
         params.sync()
+        if len(stack) > 1:
+            raise SystemExit("[verify] --redispatch-check drives ONE dispatch and compares it with "
+                             "itself; across a segmented stack it would re-run only segment 0 and "
+                             "report determinism for a fraction of the model. Run it unsegmented.")
         assert_redispatch_identical(c, out, label=sp.name, vocab=VOCAB)
         return
 
@@ -280,52 +308,71 @@ def main():
     for pos in range(len(fed) + steps - 1):
         with xin.overwrite() as _buf:
             _buf[:] = np.asarray(embed[tok] * scale, BF16).reshape(-1)
-        # WIDTH PER BUFFER, not one spec-wide HD. Gemma-4-12B's global layers rotate at head_dim
-        # 512 and its sliding layers at 256, so the two rows differ in width as well as theta;
-        # taking both from `sp.head_dim` writes the wrong number of angles into one of them.
-        if rope_buf is not None:
-            with rope_buf.overwrite() as _buf:
-                _buf[:] = rope_row(pos, _buf.size, sp.rope_theta_global,
-                                   sp.rope_partial_rotary).reshape(-1)
-        if rope_loc_buf is not None:
-            # Sliding layers are rope_type "default" -- nothing narrowed.
-            with rope_loc_buf.overwrite() as _buf:
-                _buf[:] = rope_row(pos, _buf.size, sp.rope_theta_local).reshape(-1)
-        # ONE WRITE PER DISTINCT head_dim, off the artifact's own kv_params. `pos * head_dim` is two
-        # different byte offsets under per-layer geometry, and a single write silently hands the
-        # global layers the sliding layers' KV offset.
-        for slot_name, slot_hd in kv_slots:
-            params.write(slot_name, int(pos * slot_hd))
         if a.trace_residual and pos == 0:
             _pending_trace = True
-        params.write("sm_mask", int(pos + 1))
-        params.sync()
-        # ONE dispatch per position. The duplicate that used to sit here worked around
-        # _sync_inputs() trusting a coherence map this harness never updates; that is fixed at the
-        # source now (iron/common/sequence.py forces host residency, mirroring _sync_outputs), so
-        # a second dispatch would only double the cost and mask a regression in the real fix.
-        c()
+        # ONE PASS PER SEGMENT, in order, the residual handed forward through the host. At one
+        # segment this is exactly the single dispatch it always was; the loop body is per-segment
+        # because EVERY input of every segment has to be driven, not just the first one's.
+        for _si, _st in enumerate(stack):
+            _sc, _sp_ = _st["c"], _st["params"]
+            if _si:
+                # The seam. The previous segment's outlet is a declared OUTPUT, so it is synced
+                # back for us; this copies it into the next segment's inlet, D*2 = 7680 bytes.
+                _res = np.asarray(stack[_si - 1]["outlet"].data, BF16)
+                with _st["inlet"].overwrite() as _b:
+                    _b[:] = _res.reshape(-1)
+            # WIDTH PER BUFFER, not one spec-wide HD. Gemma-4-12B's global layers rotate at head_dim
+            # 512 and its sliding layers at 256, so the two rows differ in width as well as theta;
+            # taking both from `sp.head_dim` writes the wrong number of angles into one of them.
+            if _st["rope_g"] is not None:
+                with _st["rope_g"].overwrite() as _buf:
+                    _buf[:] = rope_row(pos, _buf.size, sp.rope_theta_global,
+                                       sp.rope_partial_rotary).reshape(-1)
+            if _st["rope_l"] is not None:
+                # Sliding layers are rope_type "default" -- nothing narrowed.
+                with _st["rope_l"].overwrite() as _buf:
+                    _buf[:] = rope_row(pos, _buf.size, sp.rope_theta_local).reshape(-1)
+            # ONE WRITE PER DISTINCT head_dim, off the artifact's own kv_params. `pos * head_dim` is
+            # two different byte offsets under per-layer geometry, and a single write silently hands
+            # the global layers the sliding layers' KV offset.
+            for slot_name, slot_hd in kv_slots:
+                _sp_.write(slot_name, int(pos * slot_hd))
+            _sp_.write("sm_mask", int(pos + 1))
+            _sp_.sync()
+            # ONE dispatch per position per segment. The duplicate that used to sit here worked
+            # around _sync_inputs() trusting a coherence map this harness never updates; that is
+            # fixed at the source now (iron/common/sequence.py forces host residency, mirroring
+            # _sync_outputs), so a second dispatch would only double the cost and mask a regression
+            # in the real fix.
+            _sc()
         if a.trace_residual and pos == 0:
-            c.scratch_buffer.device = "npu"
-            c.scratch_buffer.to("cpu")
+            for _st in stack:
+                _st["c"].scratch_buffer.device = "npu"
+                _st["c"].scratch_buffer.to("cpu")
             print("[trace] per-layer residual RMS (host keeps this O(1) at every depth):",
                   file=sys.stderr)
+            # SEARCH EVERY SEGMENT for each residual. Under a split, x0..x15 live in segment 0's
+            # arena and x16..x31 in segment 1's, at offsets that restart near zero -- so a walk over
+            # one segment would report the rest as absent and read as a truncated stack. The segment
+            # index is printed because "off 1.2 GiB" means a different thing in each arena.
             for _l in range(md["NL"] + 1):
-                try:
-                    _v = np.asarray(c.get_buffer(f"x{_l}").data, np.float32)
-                except Exception:
-                    continue
-                try:
-                    _t, _off, _len = fused.get_layout_for_buffer(f"x{_l}")
-                except Exception:
-                    _t, _off, _len = "?", -1, -1
-                _r = float(np.sqrt((_v.astype(np.float64)**2).mean()))
-                print(f"[trace]   x{_l:<3} RMS {_r:11.4e}  arena {_t} off {_off:>13,} "
-                      f"({_off/2**30:7.3f} GiB){'  <-- UNWRITTEN' if _r == 0.0 else ''}",
-                      file=sys.stderr)
+                for _si, _st in enumerate(stack):
+                    try:
+                        _v = np.asarray(_st["c"].get_buffer(f"x{_l}").data, np.float32)
+                    except Exception:
+                        continue
+                    try:
+                        _t, _off, _len = _st["sg"]["seq"].get_layout_for_buffer(f"x{_l}")
+                    except Exception:
+                        _t, _off, _len = "?", -1, -1
+                    _r = float(np.sqrt((_v.astype(np.float64)**2).mean()))
+                    print(f"[trace]   x{_l:<3} seg{_si} RMS {_r:11.4e}  arena {_t} "
+                          f"off {_off:>13,} ({_off/2**30:7.3f} GiB)"
+                          f"{'  <-- UNWRITTEN' if _r == 0.0 else ''}", file=sys.stderr)
+                    break
         if head_c is not None:
             # stack -> xf (a declared OUTPUT, so it is synced), then the head graph -> logits.
-            _xf = np.asarray(c.get_buffer("xf").data, BF16)
+            _xf = np.asarray(stack[-1]["outlet"].data, BF16)
             if pos == 0:
                 _f = np.asarray(_xf, np.float32)
                 print(f"[split] xf: size={_f.size} nonzero={int((_f!=0).sum())} "
@@ -339,9 +386,10 @@ def main():
             # whatever was last written from this side unless it is pulled back. The output arena is
             # synced for us, scratch is not -- which is why this read returned all zeros at 12
             # layers while working at 6, a depth-dependent lie rather than a model result.
-            c.scratch_buffer.device = "npu"
-            c.scratch_buffer.to("cpu")
-            xf = np.asarray(c.get_buffer("xf").data, dtype=np.float32)
+            _last = stack[-1]["c"]
+            _last.scratch_buffer.device = "npu"
+            _last.scratch_buffer.to("cpu")
+            xf = np.asarray(_last.get_buffer("xf").data, dtype=np.float32)
             if pos == 0:
                 print(f"[host-lm-head] xf: size={xf.size} nonzero={int((xf!=0).sum())} "
                       f"norm={float(np.linalg.norm(xf)):.6g}", file=sys.stderr)
