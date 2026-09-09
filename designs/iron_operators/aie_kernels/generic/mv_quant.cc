@@ -23,10 +23,20 @@
 // tile-granularity one) keeps the row stride uniform, so the existing per-column contiguous TAP
 // arithmetic in gemv/design.py needs no tiling-aware special case.
 //
-// Dequant follows the established, device-gated idiom (dequant_int4_group.cc /
-// gemm_int8xint4_dequant.cc): scalar nibble/byte unpack into a float buffer, vector multiply by
-// the (broadcast) group scale, narrow to bf16 via an explicit accum with conv_even rounding rather
-// than a raw cast (the banked WER lesson: default truncation biases toward zero).
+// Dequant unpacks the nibble/byte, vector-multiplies by the broadcast group scale and narrows to
+// bf16 through an explicit accum with conv_even rounding rather than a raw cast (the banked WER
+// lesson: default truncation biases toward zero).
+//
+// PROVENANCE, stated honestly because it was overstated here before: this is NOT the same idiom as
+// dequant_int4_group.cc, which sign-extends with the scalar sext4() below, nor as
+// gemm_int8xint4_dequant.cc, which feeds a native int4 vector to aie::mmul and carries its own
+// "numerical correctness is UNVERIFIED" note. Neither validates `vector_cast<int4>` + `unpack`.
+// For the SYMMETRIC path that gap never mattered: it clips to [-7,7], so nibble 0x8 is never
+// emitted. The AFFINE path emits it by construction -- m = wmin - lo*s puts each group's own
+// minimum at exactly q = -8 -- so the signed unpack is load-bearing here for the first time.
+// It reads correct at the source (int4 is registered signed, and vector<T,N>::unpack() forwards
+// is_signed() to unpack_sign), and it is UNTESTED ON DEVICE. A device gate must force a group
+// containing its own minimum, which every real weight group does.
 #include <aie_api/aie.hpp>
 #include <stdint.h>
 

@@ -253,6 +253,22 @@ def my_swiglu_mlp_dp(
         assert O_OVERLAP < TSI_O                      # ceil() guarantees this; sanity check
         WO_ROWS_PADDED = D + O_OVERLAP                # Wo's own arg spec size, in rows
 
+    # The affine kernels keep one float per quant group on the STACK (mv_quant.cc's
+    # `float bsum[n_groups]`, the per-group sums of B). It is the only stack term this design
+    # controls, and stack_size is otherwise an opaque constant the budget below just adds -- so
+    # size it here rather than let it be a hanging number. Worst case is the widest K, since
+    # n_groups = K/group_size: at FF=3072 group_size=32 that is 96 floats = 384 B of the 2048 B
+    # default. The 512 B floor left for everything else (two accums, the ones vector, the frame)
+    # is a policy, not a measurement; aiecc validates the real requirement against stack_size per
+    # core and fails the build if it is short, so this assert exists to fail EARLIER and to name
+    # the term, not to be the only guard.
+    if weight_dtype in ("int4a", "int8a"):
+        bsum_bytes = 4 * (max(K for K in (D, FF) + ((QD,) if fuse_o else ())) // group_size)
+        assert bsum_bytes + 512 <= stack_size, (
+            f"affine bsum[] needs {bsum_bytes} B of the {stack_size} B core stack at "
+            f"group_size={group_size}; raise stack_size or the group"
+        )
+
     # L1 budget check (64 KB/core) -- see module docstring's channel accounting for what each
     # buffer is. Computed, not guessed: this is exactly the "hanging numbers are bugs" rule.
     L1_BYTES = 65536
