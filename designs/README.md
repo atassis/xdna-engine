@@ -5,13 +5,13 @@ sources into one artifact (xclbin+insts, or an ELF for the fused-decode path). "
 AMD's own noun for this (1399 uses in mlir-aie, their `aie_design.py` convention).
 
 This directory, `aie_kernels/`, `experiments/` and `patches/` are what `route_b_kernels/`
-split into in `81e513d` ("designs: retire route_b_kernels..."), 2026-09-05 -- 14 shipping
+split into in `81e513d` ("designs: retire route_b_kernels..."), 2026-09-05 -- 16 shipping
 designs here, 7 one-off studies to `experiments/`, the mlir-air PR drafts to `patches/`. That
 commit deleted `route_b_kernels/README.md` (40 lines) with no replacement; this file is it.
 
 ## Build models -- three, not two, and checked by counting `Makefile*` per dir
 
-- **sync+Makefile** (10 of 14: `ctx_ln`, `decode_norm_gemv`, `dwconv1d`, `ffn_gemm2`,
+- **sync+Makefile** (11 of 16: `conveyor_proto`, `ctx_ln`, `decode_norm_gemv`, `dwconv1d`, `ffn_gemm2`,
   `mha_decode`, `m_stationary`, `relpos_mha`, `silu`, `softmax400`, `whole_array_fused`): a
   `*_iron.py` generator emits MLIR; `scripts/sync_kernels.sh` copies it, plus the
   `aie_kernels/` sources it needs, into the mlir-aie build sandbox; a Makefile drives the OLD
@@ -20,11 +20,15 @@ commit deleted `route_b_kernels/README.md` (40 lines) with no replacement; this 
   flow that our MLIR-only generators can't drive -- see the `WHY` comment at the top of that
   file. `toolchain_stamp.mk` (included by these Makefiles) makes every build target depend on
   the toolchain instance's identity, not just file mtimes.
-- **direct python/IRON, no Makefile** (2 of 14: `decode_fused`, `codec_block`): a `gen_*.py`
+- **direct python/IRON, no Makefile** (2 of 16: `decode_fused`, `codec_block`): a `gen_*.py`
   builds an `OperatorSequence` (or, for `codec_block`, an `aie.iron.Program`) and drives
   IRON's own build path directly; a `scripts/build_*.sh` wrapper sets up
   `PYTHONPATH`/`AIECC_PATH` and runs it. See `scripts/build_llm_decode.sh`.
-- **neither** (2 of 14, both pre-design-stage): `cascade_ffn` builds through **mlir-air**
+- **neither** (3 of 16: `iron_operators`, `cascade_ffn`, `subsample_conv2d`):
+  `iron_operators` is not a design at all -- it is our IRON operator set mirrored out of the
+  fork so the operators `decode_fused` composes are readable in this tree (see its own
+  README); it has no generator and nothing builds it here. The other two are
+  pre-design-stage: `cascade_ffn` builds through **mlir-air**
   (`aircc`, sourced via a "mlir-air airenv"), a different toolchain from mlir-aie/IRON
   entirely -- see `build_cascade_ffn.sh`. `subsample_conv2d` has no dataflow-graph generator
   at all yet: `build_check.sh` is a bare Peano kernel compile-check plus a numpy golden, which
@@ -61,7 +65,7 @@ found, not a runtime guarantee for every code path or feature flag.
 
 ## Also in this tree
 
-- **`aie_kernels/`** (49 dirs: 48 kernels + `_test/`) -- the hand-written kernel sources these
+- **`aie_kernels/`** (51 dirs: 50 kernels + `_test/`) -- the hand-written kernel sources these
   designs compile in. Per-kernel index, golden coverage and device status:
   [`aie_kernels/INDEX.md`](../aie_kernels/INDEX.md).
 - **`aie_kernels/_test/`** -- device-verify harness for kernels in isolation (40 `verify_*.py`
