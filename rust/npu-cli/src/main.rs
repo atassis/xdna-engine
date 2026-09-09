@@ -82,7 +82,10 @@ fn run(cli: &Cli, path: &Path) -> Result<()> {
         Cmd::Completions { shell } => {
             let mut cmd = Cli::command();
             let name = cmd.get_name().to_string();
-            clap_complete::generate(*shell, &mut cmd, name, &mut std::io::stdout());
+            let mut buf: Vec<u8> = Vec::new();
+            clap_complete::generate(*shell, &mut cmd, name, &mut buf);
+            let script = String::from_utf8(buf).expect("clap emits utf-8");
+            print!("{}", if matches!(shell, Shell::Zsh) { with_model_completion(&script) } else { script });
             Ok(())
         }
     }
@@ -323,6 +326,50 @@ fn build_params(s: &SamplingArgs) -> Result<npu_engine::GenerateParams, String> 
 /// already IS the engine; (3) `Handle::generate`'s `Prompt::Chat` with real history is exactly what
 /// a REPL wants and is not staged through JSON at all this way.
 ///
+/// Teach the generated zsh script to complete model NAMES for `--model`/`--asr`/`--diarize`.
+///
+/// clap has no way to express "the values come from the user's config", so it emits `_default` for
+/// these -- which in zsh means FILE completion, and `npu generate --model=<TAB>` offering filenames
+/// is worse than offering nothing. The names have to come from `npu models`, which reads the config
+/// and a status file and answers in about a millisecond with no device and no service.
+///
+/// This is a rewrite of generated text, which is fragile if clap changes its output. It is pinned
+/// by a test that fails if the actions it looks for stop appearing.
+fn with_model_completion(script: &str) -> String {
+    // `${words[2]}` is the subcommand, so one function serves every site and each one offers only
+    // the models that can actually serve it -- `npu transcribe --model=` should not list an
+    // embedding model. An explicit argument wins, for the flags that name their capability.
+    const HELPER: &str = r#"
+_npu_models() {
+  local kind=$1
+  if [[ -z $kind ]]; then
+    case ${words[2]} in
+      transcribe|transcribe-media) kind=asr ;;
+      embed) kind=embed ;;
+      diarize) kind=diarize ;;
+      generate|chat) kind=generate ;;
+    esac
+  fi
+  local -a names
+  # Gate on the STATE column rather than on line position: the table has a header and a trailing
+  # "(live state as of ...)" note, and a row is exactly a line whose second field is a load state.
+  names=(${(f)"$(npu models 2>/dev/null | awk -v k="$kind" \
+    '$2 ~ /^(loaded|unloaded|failed)$/ && (k=="" || $3==k) {print $1}')"})
+  (( ${#names} )) && compadd -a names
+}
+"#;
+    let mut out = script.replacen("#compdef npu\n", &format!("#compdef npu\n{HELPER}"), 1);
+    out = out.replace(":MODEL:_default", ":MODEL:_npu_models");
+    out = out.replace(":ASR:_default", ":ASR:_npu_models asr");
+    out = out.replace(":DIARIZE:_default", ":DIARIZE:_npu_models diarize");
+    // The POSITIONAL model of `load` / `unload` / `config pin` / `config unpin`, where completion
+    // matters most: those commands take nothing but a model name. `name` is deliberately left
+    // alone -- `config add` names a model that does not exist yet, so offering the existing ones
+    // there would suggest exactly the wrong answers.
+    out = out.replace("':model:_default'", "':model:_npu_models'");
+    out
+}
+
 /// What one generation produced: the text, and everything measured about producing it.
 struct Generated {
     text: String,
@@ -1191,6 +1238,43 @@ fn http_req(port: u16, method: &str, path: &str, body: &str) -> Result<String> {
 mod tests {
     use super::*;
     use npu_runtime::config::{Defaults, ModelCfg, ServerCfg};
+
+    /// `--model=<TAB>` used to offer FILENAMES: clap cannot express "the values come from the
+    /// user's config", so it emits `_default`, which is zsh for file completion. This pins both
+    /// halves -- that clap still emits what the rewrite looks for, and that nothing it aims at
+    /// survives. The first assertion is the load-bearing one: without it, a clap change would make
+    /// the rewrite a silent no-op and the completion would quietly go back to offering files.
+    #[test]
+    fn model_arguments_complete_to_model_names_not_filenames() {
+        let mut cmd = Cli::command();
+        let mut buf: Vec<u8> = Vec::new();
+        clap_complete::generate(Shell::Zsh, &mut cmd, "npu", &mut buf);
+        let raw = String::from_utf8(buf).unwrap();
+        assert!(raw.contains(":MODEL:_default"),
+            "clap no longer emits _default for --model; the rewrite is now aimed at nothing");
+        assert!(raw.contains("':model:_default'"),
+            "clap no longer emits _default for the positional model");
+
+        let out = with_model_completion(&raw);
+        assert!(out.contains("_npu_models()"), "the helper must be defined in the script it is called from");
+        assert!(!out.contains(":MODEL:_default"));
+        assert!(!out.contains("':model:_default'"));
+        assert!(out.contains(":ASR:_npu_models asr"), "capability-specific flags keep their filter");
+        assert!(out.contains(":DIARIZE:_npu_models diarize"));
+        // `config add` names a model that does not exist yet, so it must NOT be rewritten.
+        assert!(out.contains("':name:_default'"), "a NEW model's name must not complete to existing ones");
+    }
+
+    /// An argument with no doc comment completes with an empty description, which is how
+    /// `--model=[]` shipped. Every model-valued flag has to say what it selects.
+    #[test]
+    fn every_model_flag_carries_a_description() {
+        let mut cmd = Cli::command();
+        let mut buf: Vec<u8> = Vec::new();
+        clap_complete::generate(Shell::Zsh, &mut cmd, "npu", &mut buf);
+        let raw = String::from_utf8(buf).unwrap();
+        assert!(!raw.contains("--model=[]"), "some --model still has no help text");
+    }
 
     /// `--output json` streaming has to produce something the readers accept, or `> run.jsonl` is
     /// a lie. Drives the drain with a scripted channel and reads its own output back through the

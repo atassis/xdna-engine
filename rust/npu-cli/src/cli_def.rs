@@ -50,6 +50,7 @@ pub enum Cmd {
     /// `transcribe-media`.
     Transcribe {
         #[arg(value_hint = ValueHint::FilePath)] input: PathBuf,
+        /// ASR model name; omit to use the configured asr default.
         #[arg(long)] model: Option<String>,
     },
     /// Transcribe a media file (video or audio) to a speaker-attributed transcript FILE.
@@ -77,6 +78,7 @@ pub enum Cmd {
     /// Speaker diarization of a 16 kHz mono 16-bit WAV: who spoke when.
     Diarize {
         #[arg(value_hint = ValueHint::FilePath)] wav: PathBuf,
+        /// Diarization model name; omit to use the configured diarize default.
         #[arg(long)] model: Option<String>,
         /// Emit the same JSON body the HTTP route returns, instead of readable lines.
         #[arg(long)] json: bool,
@@ -86,7 +88,11 @@ pub enum Cmd {
     /// `allow_hyphen_values`: the text to embed is prose, and prose begins with `-` all the time
     /// (every Markdown bullet). Without it clap read a bullet as an unknown flag and failed with a
     /// usage error, so the CLI rejected inputs the HTTP route accepted.
-    Embed { #[arg(allow_hyphen_values = true)] text: String, #[arg(long)] model: Option<String> },
+    Embed {
+        #[arg(allow_hyphen_values = true)] text: String,
+        /// Embedding model name; omit to use the configured embed default.
+        #[arg(long)] model: Option<String>,
+    },
     /// One-shot text generation, streamed to stdout by default.
     ///
     /// The prompt goes through the model's chat template, so an instruction-tuned model answers it
@@ -95,6 +101,7 @@ pub enum Cmd {
     /// nothing in the prompt ever gives it a turn to end.
     Generate {
         #[arg(allow_hyphen_values = true)] prompt: String,
+        /// Generation model name; omit to use the configured generate default.
         #[arg(long)] model: Option<String>,
         #[command(flatten)] sampling: SamplingArgs,
         /// Print the full per-token measurement breakdown after the answer.
@@ -119,6 +126,7 @@ pub enum Cmd {
     Chat {
         /// Opening turn, answered immediately. Omit it to start at an empty prompt.
         #[arg(allow_hyphen_values = true)] prompt: Option<String>,
+        /// Generation model name; omit to use the configured generate default.
         #[arg(long)] model: Option<String>,
         #[command(flatten)] sampling: SamplingArgs,
         #[arg(long)] no_stream: bool,
@@ -149,6 +157,7 @@ pub enum Cmd {
     /// Runtime state, not config: it does not edit `engine.toml` and does not survive a restart.
     /// For that, pin the model (`npu config pin`).
     Load {
+        /// The configured model to make resident.
         model: String,
         #[arg(long)] port: Option<u16>,
     },
@@ -158,6 +167,7 @@ pub enum Cmd {
     /// still knows what the model is, and the next request that needs it loads it again. This is
     /// what frees the NPU for another process without `systemctl stop`.
     Unload {
+        /// The resident model whose device memory to release.
         model: String,
         #[arg(long)] port: Option<u16>,
     },
