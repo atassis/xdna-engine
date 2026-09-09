@@ -634,13 +634,52 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
     Hq, Hkv, QD, KVD, VOCAB = sp.n_q_heads, sp.n_kv_heads, sp.q_dim, sp.kv_dim, sp.vocab
 
     # KV-cache layout: [S/T, Hkv, T, HD], block-major -- see iron.common.kv_layout, the single
-    # owner of this addressing (kv-cache-layout-for-full-context task, commit 1: the seam fix).
-    # T == S (one block) reproduces the pre-existing flat [Hkv, S, HD] layout byte-for-byte; every
-    # site below that used to hand-write `S*HD`/`pos*HD` now asks `kv_layout` instead. Commit 2
-    # derives T < S from the target model's DMA field widths for the arms that can address a
-    # blocked cache; this commit changes ONLY where the formula lives, not what it computes.
-    T = S
+    # owner of this addressing (kv-cache-layout-for-full-context task). T == S (one block)
+    # reproduces the pre-existing flat [Hkv, S, HD] layout byte-for-byte; T < S makes head_stride
+    # and block_stride INDEPENDENT of S, which is what lets a wide S address at all -- flat
+    # [Hkv,S,HD]'s per-head stride is S*HD elements, and that lands in the shim's 20-bit BD step
+    # field (32-bit address granules), capping S at ~8191 for head_dim=128 regardless of anything
+    # else in the design (see [[the-kv-window-and-the-kv-capacity-are-separable]]).
+    #
+    # T is DERIVED, not chosen -- derive_block_size picks the largest T whose strides fit the
+    # NARROWER of the shim (20-bit) and mem-tile (17-bit) step fields, because the mem-tile bound
+    # is what a later staging step needs and re-deriving T when that lands would mean re-checking
+    # every stride again. For Qwen3's shape (Hkv=8, HD=128) that is 128: at T=256 the block stride
+    # is 262144 elements = 131072 granules, ONE over the mem-tile field's 131071; at T=128 it is
+    # 65536 granules, comfortably under both fields.
+    #
+    # Only activated for the arms that can actually ADDRESS a blocked cache today: gemv's
+    # group_reuse coalesced path (GROUPED_K, batch_group>1) and tmatvec's one-head-per-column path
+    # (TMV_CTX). Any other combination stays on the flat layout -- not a regression (identical to
+    # every arm's behaviour before this task), a capability gate matching qkv_dp_why/mlp_dp_why's
+    # own convention just above. Both arms read/write the SAME buffers, so this must be ONE
+    # decision reaching every site, never re-evaluated per site -- a stale T on any one of them
+    # would silently disagree with the layout the others wrote.
+    KV_BLOCK_ELIGIBLE = GROUPED_K and TMV_CTX
+    _kv_block_env = os.environ.get("KV_BLOCK_T")
+    if _kv_block_env is not None:
+        T = int(_kv_block_env)
+        if T != S:
+            assert KV_BLOCK_ELIGIBLE, (
+                f"KV_BLOCK_T={T} forces blocking but GROUPED_K={GROUPED_K}/TMV_CTX={TMV_CTX} "
+                f"do not support it (see the blocked-tap NotImplementedError in gemv/tmatvec "
+                f"design.py) -- set GQA_GROUPED_K=1 TMV_CTX=1 or KV_BLOCK_T={S}"
+            )
+    else:
+        T = derive_block_size(HD, Hkv) if KV_BLOCK_ELIGIBLE else S
+    if T != S:
+        assert S % T == 0, (
+            f"T={T} does not divide S ({S}) -- pick an S that is a multiple of T"
+        )
+        assert (S // COLS) % T == 0, (
+            f"blocked GEMV needs each of the {COLS} columns' share of S ({S // COLS}) to be a "
+            f"whole number of blocks (T={T})"
+        )
     kv_layout = KVLayout(Hkv=Hkv, S=S, HD=HD, T=T)
+    print(f"[gen] KV cache layout: T={T}"
+          + (" (flat [Hkv,S,HD])" if T == S else
+             f" (blocked [S/T,Hkv,T,HD], head_stride={kv_layout.head_stride}, "
+             f"block_stride={kv_layout.block_stride} elements)"))
 
     def npy(name):
         return np.load(os.path.join(weights_dir, f"{name}.npy")).astype(np.float32)
