@@ -65,8 +65,21 @@ echo "### Peano / llvm-aie wheel pin"
 echo "  pinned: $PEANO_DIST"
 WHEEL_DIR="$REPO/.venv-iron/lib/python3.14/site-packages"
 if [ -d "$WHEEL_DIR" ]; then
-  installed="$(ls -d "$WHEEL_DIR"/llvm_aie* 2>/dev/null | head -1 | xargs -r basename)"
-  echo "  installed in .venv-iron: ${installed:-<none>}"
+  # Report the ACTIVE compiler, not pip's metadata. Since install_peano_local.sh started
+  # symlinking site-packages/llvm-aie at a locally-built tree, the llvm_aie-*.dist-info left
+  # behind describes a wheel that is no longer what runs -- on 2026-09-09 it read
+  # 21.0.0.2026062301+cb664e8c (June, three pins stale) while clang++ was 22.0.0git at
+  # PEANO_FORK_COMMIT. A version attached to the wrong noun is the failure this whole assess
+  # step exists to prevent, so read the binary and label the metadata as metadata.
+  CC="$WHEEL_DIR/llvm-aie/bin/clang++"
+  if [ -x "$CC" ]; then
+    echo "  active clang++: $("$CC" --version 2>/dev/null | head -1)"
+    [ -L "$WHEEL_DIR/llvm-aie" ] && echo "  llvm-aie -> $(readlink "$WHEEL_DIR/llvm-aie")"
+  else
+    echo "  active clang++: <none at $CC>"
+  fi
+  installed="$(ls -d "$WHEEL_DIR"/llvm_aie*.dist-info 2>/dev/null | head -1 | xargs -r basename)"
+  echo "  stale pip metadata in .venv-iron: ${installed:-<none>}"
 fi
 echo "  latest nightly: see https://github.com/Xilinx/llvm-aie/releases (bump PEANO_DIST + re-smoke if newer & needed)"
 
