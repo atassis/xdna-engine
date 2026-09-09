@@ -820,16 +820,86 @@ fn embed(path: &Path, text: &str, model: Option<&str>, as_json: bool) -> Result<
 /// signal -- no probe, no handshake, no timeout, and no way to mistake ollama on the shared 11434
 /// for us. A wedged service cannot hang this command, because reading bytes is not connecting; it
 /// shows the last published state and how old it is, and lets the reader judge.
+/// What a model's scenario file declares, for the columns that must answer with the service down.
+///
+/// `kind` and `precision` are properties of the manifest, not of a running process, so reading them
+/// here is what lets `npu models` stay useful (and shell completion stay capability-filtered) when
+/// nothing is serving. Nine small TOMLs parse in well under a millisecond; the command has to stay
+/// cheap enough to back a `<TAB>`.
+struct Declared {
+    kind: Option<String>,
+    /// `None` when the scenario has no `[model]` block at all -- an LLM's precision lives in its
+    /// decode artifact, not the manifest, and inventing "bf16" for it would be a guess wearing a
+    /// measurement's clothes.
+    precision: Option<String>,
+}
+
+fn declared(root: Option<&PathBuf>, scenario: &str) -> Declared {
+    let sc = root
+        .map(|r| r.join(scenario))
+        .and_then(|p| npu_engine::config::ScenarioConfig::load(&p).ok());
+    Declared {
+        // Through the canonical mapping, not the raw string: a scenario says `kind = "embeddings"`
+        // while the capability -- and the live status, and every other surface -- says `embed`.
+        // Reporting the manifest's spelling here would make the column change vocabulary depending
+        // on whether the service happened to be running.
+        kind: sc.as_ref().and_then(|c| {
+            npu_engine::capability::Capability::from_scenario_kind(&c.scenario.kind).map(|k| k.0.to_string())
+        }),
+        precision: sc.as_ref().and_then(|c| c.model.as_ref().map(|m| m.precision.clone())),
+    }
+}
+
+/// The precision cell: what the scenario declares, plus a brace note naming anything that overrides
+/// or refines it. Braces appear ONLY on a deviation -- a column that annotates every row annotates
+/// nothing.
+fn precision_cell(d: &Declared) -> String {
+    let Some(p) = d.precision.as_deref() else { return "-".to_string() };
+    // Process-wide, so it applies to every model at once and belongs in every row that has one.
+    match std::env::var("NPU_PRECISION").ok().filter(|v| v != p) {
+        Some(env) => format!("{p} {{env:{env}}}"),
+        None => p.to_string(),
+    }
+}
+
+/// Device buffer-object bytes, or `-` when nothing measured them.
+///
+/// `bo_bytes` defaults to 0 across the `Servable` tree and only some implementations override it,
+/// so a literal 0 means "unmeasured" far more often than it means "no device memory". Printing
+/// `0 B` would be a measurement nobody took.
+fn mem_cell(bytes: Option<u64>) -> String {
+    match bytes {
+        None | Some(0) => "-".to_string(),
+        Some(b) if b >= 1 << 30 => format!("{:.1}G", b as f64 / (1u64 << 30) as f64),
+        Some(b) if b >= 1 << 20 => format!("{:.0}M", b as f64 / (1u64 << 20) as f64),
+        Some(b) => format!("{:.0}K", b as f64 / 1024.0),
+    }
+}
+
 fn models(path: &Path, as_json: bool, port: Option<u16>) -> Result<()> {
     let cfg = load_cfg(path)?;
     let live = read_live_status(port.unwrap_or(cfg.server.port));
+    let root = root(&cfg, path).ok();
 
     if as_json {
         let rows: Vec<_> = cfg.models.iter().map(|m| {
             let l = live.as_ref().and_then(|(_, v)| find_live(v, &m.name));
+            let d = declared(root.as_ref(), &m.scenario);
+            let bo = l.and_then(|x| x.get("bo_bytes")).and_then(|b| b.as_u64());
             serde_json::json!({
                 "id": m.name, "scenario": m.scenario,
                 "state": l.and_then(|x| x.get("state").and_then(|s| s.as_str())).unwrap_or("unknown"),
+                // Declared beside live, for the same reason `pinned` and `live_pinned` are both
+                // here: the manifest answers with the service down, the service answers what it
+                // actually loaded, and a disagreement is the interesting case.
+                "kind": d.kind,
+                "live_kind": l.and_then(|x| x.get("kind").and_then(|s| s.as_str())),
+                "precision": d.precision,
+                // null, never 0: `bo_bytes` defaults to 0 for every implementation that does not
+                // measure itself, so 0 would report "no device memory" for "nobody looked".
+                "bo_bytes": bo.filter(|b| *b > 0),
+                "busy": l.and_then(|x| x.get("busy")).and_then(|b| b.as_bool()),
+                "idle_s": l.and_then(|x| x.get("idle_s")).and_then(|i| i.as_u64()),
                 // Both, because they are allowed to differ: the config is desired state and the
                 // service only adopts it on reload. That gap is the thing worth reporting.
                 "pinned": m.resident,
@@ -842,14 +912,33 @@ fn models(path: &Path, as_json: bool, port: Option<u16>) -> Result<()> {
         return Ok(());
     }
 
-    println!("{:<22} {:<9} {:<8} {:<5}  {}", "NAME", "STATE", "KIND", "PIN", "SCENARIO");
+    // Column ORDER is load-bearing: `npu models | awk '{print $1}'` is a documented use with a
+    // test, and the shell completion this command backs reads $2 (state) and $3 (kind). New columns
+    // append on the right, and the free-text one goes last.
+    println!("{:<22} {:<9} {:<11} {:<5} {:<6} {:<5}  {}",
+             "NAME", "STATE", "KIND", "PIN", "MEM", "BUSY", "PRECISION");
     let mut drifted = false;
     for m in &cfg.models {
         let l = live.as_ref().and_then(|(_, v)| find_live(v, &m.name));
         let f = |k: &str| l.and_then(|x| x.get(k).and_then(|s| s.as_str())).unwrap_or("-").to_string();
+        let d = declared(root.as_ref(), &m.scenario);
+        // Live kind when a service is up, the manifest's otherwise. Without the fallback this cell
+        // is `-` whenever nothing is serving, which made capability-filtered completion answer
+        // nothing at exactly the moment you are most likely to be typing a command.
+        let kind = match f("kind").as_str() {
+            "-" => d.kind.clone().unwrap_or_else(|| "-".into()),
+            live_kind => live_kind.to_string(),
+        };
         let pin = pin_cell(m.resident, l.and_then(|x| x.get("pinned")).and_then(|p| p.as_bool()));
         if pin.ends_with('*') { drifted = true; }
-        println!("{:<22} {:<9} {:<8} {:<5}  {}", m.name, f("state"), f("kind"), pin, m.scenario);
+        let busy = match l.and_then(|x| x.get("busy")).and_then(|b| b.as_bool()) {
+            Some(true) => "yes".to_string(),
+            Some(false) => "no".to_string(),
+            None => "-".to_string(),
+        };
+        let mem = mem_cell(l.and_then(|x| x.get("bo_bytes")).and_then(|b| b.as_u64()));
+        println!("{:<22} {:<9} {:<11} {:<5} {:<6} {:<5}  {}",
+                 m.name, f("state"), kind, pin, mem, busy, precision_cell(&d));
     }
     match &live {
         Some((age, _)) => println!("\n(live state as of {age}s ago)"),
@@ -1238,6 +1327,46 @@ fn http_req(port: u16, method: &str, path: &str, body: &str) -> Result<String> {
 mod tests {
     use super::*;
     use npu_runtime::config::{Defaults, ModelCfg, ServerCfg};
+
+    #[test]
+    fn unmeasured_device_memory_reads_as_absent_not_as_zero() {
+        // `bo_bytes` defaults to 0 for every Servable that does not measure itself, so 0 means
+        // "nobody looked" far more often than "no device memory". Printing 0 B would report a
+        // measurement nobody took.
+        assert_eq!(mem_cell(None), "-");
+        assert_eq!(mem_cell(Some(0)), "-");
+        assert_eq!(mem_cell(Some(7_340_047)), "7M");
+        assert_eq!(mem_cell(Some(2 * (1 << 30))), "2.0G");
+        assert_eq!(mem_cell(Some(4096)), "4K");
+    }
+
+    #[test]
+    fn precision_is_absent_when_the_scenario_declares_none() {
+        // An LLM scenario has no `[model]` block -- its precision lives in the decode artifact.
+        // Defaulting the column to bf16 there would be a guess printed as a fact.
+        let none = Declared { kind: Some("generate".into()), precision: None };
+        assert_eq!(precision_cell(&none), "-");
+        let bf16 = Declared { kind: Some("asr".into()), precision: Some("bf16".into()) };
+        assert_eq!(precision_cell(&bf16), "bf16");
+    }
+
+    #[test]
+    fn a_precision_override_is_noted_in_braces_and_only_when_it_differs() {
+        // Serialised against the other env-mutating tests in this binary for the reason
+        // npu-asr::tuning learned the hard way: set_var is process-global and cargo runs tests as
+        // threads in one process.
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = Declared { kind: Some("asr".into()), precision: Some("bf16".into()) };
+
+        std::env::remove_var("NPU_PRECISION");
+        assert_eq!(precision_cell(&d), "bf16", "no override, no braces");
+        std::env::set_var("NPU_PRECISION", "bf16");
+        assert_eq!(precision_cell(&d), "bf16", "an override that agrees is not a deviation");
+        std::env::set_var("NPU_PRECISION", "int8");
+        assert_eq!(precision_cell(&d), "bf16 {env:int8}", "a real override is named");
+        std::env::remove_var("NPU_PRECISION");
+    }
 
     /// `--model=<TAB>` used to offer FILENAMES: clap cannot express "the values come from the
     /// user's config", so it emits `_default`, which is zsh for file completion. This pins both

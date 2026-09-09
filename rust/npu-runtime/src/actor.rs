@@ -198,6 +198,13 @@ fn spawn(cfg: Config, loader: Box<dyn ModelLoader + Send>, eager: bool) -> Resul
                     let r = match ready {
                         Err(e) => Err(e),
                         Ok(name) => {
+                            // Publish BUSY before the work, not after: this loop does not come back
+                            // round until the request finishes, so the end-of-iteration publish can
+                            // never observe a model that is serving. Best-effort, like every other
+                            // status write -- a status file that cannot be written must not be able
+                            // to fail a request.
+                            crate::status_file::publish(cfg.server.port,
+                                &reg.status_serving(Instant::now(), Some(&name)));
                             let out = guard(|| run_named(&mut reg, &name, req))
                                 .unwrap_or_else(|msg| Err(EngineError::Device(msg)));
                             match out {
@@ -266,6 +273,8 @@ fn spawn(cfg: Config, loader: Box<dyn ModelLoader + Send>, eager: bool) -> Resul
                                     // abort signal.
                                     tx.send(item).is_ok()
                                 };
+                                crate::status_file::publish(cfg.server.port,
+                                    &reg.status_serving(Instant::now(), Some(&name)));
                                 let out = guard(|| run_generate(&mut reg, &name, &prompt, &params, &mut sink))
                                     .unwrap_or_else(|msg| Err(EngineError::Device(msg)));
                                 if let Err(e) = out {
@@ -370,6 +379,8 @@ fn spawn(cfg: Config, loader: Box<dyn ModelLoader + Send>, eager: bool) -> Resul
             // resident. This thread is the only owner of the registry, so the file is written from
             // the same place the state lives and cannot disagree with it. Best-effort: see
             // `status_file`, a service that cannot write its status must keep serving.
+            // Clears BUSY implicitly: `status_at` never sets it, so returning to the top of the
+            // loop is exactly the moment nothing is being served.
             crate::status_file::publish(cfg.server.port, &reg.status_at(Instant::now()));
         }
     });
