@@ -414,9 +414,10 @@ fn admin_reload(handle: &Handle, cfg_path: &Path) -> Response {
     match Config::load(cfg_path) {
         Ok(cfg) => match handle.reconcile(cfg) {
             Ok(rep) => (200, format!(
-                "{{\"loaded\":{},\"unloaded\":{},\"failed\":{},\"deferred\":{},\"pinned_deferred\":{}}}",
+                "{{\"loaded\":{},\"unloaded\":{},\"failed\":{},\"deferred\":{},\"pinned_deferred\":{},\
+                 \"evicted\":{},\"pinned_over_cap\":{}}}",
                 rep.loaded.len(), rep.unloaded.len(), rep.failed.len(), rep.deferred.len(),
-                rep.pinned_deferred.len()).into()),
+                rep.pinned_deferred.len(), rep.evicted.len(), rep.pinned_over_cap.len()).into()),
             Err(e) => engine_err(&e),
         },
         Err(e) => (400, format!("{{\"error\":\"{}\"}}", parse::json_escape(&e)).into()),
@@ -519,9 +520,10 @@ fn mutate_and_reconcile(handle: &Handle, cfg_path: &Path,
     let cfg = match doc.save(cfg_path) { Ok(c) => c, Err(e) => return bad(500, e) };
     match handle.reconcile(cfg) {
         Ok(rep) => (200, format!(
-            "{{\"loaded\":{},\"unloaded\":{},\"failed\":{},\"deferred\":{},\"pinned_deferred\":{}}}",
+            "{{\"loaded\":{},\"unloaded\":{},\"failed\":{},\"deferred\":{},\"pinned_deferred\":{},\
+             \"evicted\":{},\"pinned_over_cap\":{}}}",
             rep.loaded.len(), rep.unloaded.len(), rep.failed.len(), rep.deferred.len(),
-            rep.pinned_deferred.len()).into()),
+            rep.pinned_deferred.len(), rep.evicted.len(), rep.pinned_over_cap.len()).into()),
         Err(e) => engine_err(&e),
     }
 }
