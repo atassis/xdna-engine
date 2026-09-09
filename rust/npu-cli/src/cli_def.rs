@@ -235,7 +235,17 @@ pub enum Cmd {
     Completions { shell: Shell },
     /// Inspect / edit the desired-state config.
     #[command(subcommand_required = true, arg_required_else_help = true)]
-    Config { #[command(subcommand)] action: ConfigCmd },
+    Config {
+        #[command(subcommand)] action: ConfigCmd,
+        /// Save the edit without applying it to a running service.
+        ///
+        /// The default is to apply it, because a desired-state file that the running service has
+        /// not adopted is two sources of truth and one manual step between them. Use this when the
+        /// edit is meant for a later start, or when a reconcile now would evict a model something
+        /// is mid-way through using.
+        #[arg(long, global = true)]
+        no_reload: bool,
+    },
     /// Read-only self-test: device/driver versions, power mode, who holds the device, which
     /// config is in effect and why, whether configured models' artifacts resolve, service status.
     ///

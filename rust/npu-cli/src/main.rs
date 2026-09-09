@@ -95,7 +95,7 @@ fn run(cli: &Cli, path: &Path) -> Result<()> {
         Cmd::Load { model, port } => load_model(&path, model, *port),
         Cmd::Unload { model, port } => unload_model(&path, model, *port),
         Cmd::Bake { name } => bake(&path, name),
-        Cmd::Config { action } => config_cmd(&path, action),
+        Cmd::Config { action, no_reload } => config_cmd(&path, action, *no_reload),
         Cmd::Flags { json } => flags_cmd(*json || as_json),
         Cmd::Weights { action } => weights_cmd(&path, action),
         Cmd::Doctor { json } => doctor::doctor(&cli, *json || as_json),
@@ -1131,6 +1131,47 @@ fn reload(path: &Path, port: Option<u16>) -> Result<()> {
     Ok(())
 }
 
+/// Apply a just-saved config to the running service, if there is one.
+///
+/// An edit to desired state that leaves actual state alone is a footgun with a manual step: the
+/// file said `max_resident = 2`, the service ran five models, and the only thing standing between
+/// them was remembering to type `npu reload`. So a config edit reconciles by default.
+///
+/// A service that is not running is NOT an error -- editing the config with the engine stopped is
+/// ordinary, and the edit is still saved. Nor is a failed reload: the file is already written, so
+/// reporting the failure and exiting 0 tells the truth (the edit landed, the running service did
+/// not take it) where a non-zero exit would suggest the edit did not.
+fn apply_now(path: &Path, cfg: &Config) -> Result<()> {
+    let port = cfg.server.port;
+    if !listener_is_ours(port) {
+        println!("(no service on port {port} -- takes effect when one starts)");
+        return Ok(());
+    }
+    match http_post(port, "/admin/reload", "") {
+        Ok(body) => {
+            println!("applied: {}", summarise_reload(&body));
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("WARNING: saved, but the running server did not reload: {e}");
+            eprintln!("         run `npu reload` once it is reachable");
+            Ok(())
+        }
+    }
+}
+
+/// The reconcile report as one line. The raw object is five-to-seven counts, most of them zero
+/// most of the time; what an operator wants to know is what actually moved.
+fn summarise_reload(body: &str) -> String {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else { return body.trim().to_string() };
+    let n = |k: &str| v.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
+    let mut parts = Vec::new();
+    for k in ["loaded", "unloaded", "evicted", "failed", "deferred", "pinned_deferred", "pinned_over_cap"] {
+        if n(k) > 0 { parts.push(format!("{} {k}", n(k))); }
+    }
+    if parts.is_empty() { "nothing to change".to_string() } else { parts.join(", ") }
+}
+
 /// `npu load` / `npu unload` talk to the SERVICE, not the device.
 ///
 /// Every other one-shot command drives the engine in-process, but residency is a property of the
@@ -1286,7 +1327,7 @@ fn weights_cmd(path: &Path, action: &WeightsCmd) -> Result<()> {
 /// deserialized `Config` back through the serializer. The struct does not carry comments, so the
 /// old path silently deleted every one of them -- including the ones the engine's own generated
 /// config ships with.
-fn config_cmd(path: &Path, action: &ConfigCmd) -> Result<()> {
+fn config_cmd(path: &Path, action: &ConfigCmd, no_reload: bool) -> Result<()> {
     if let ConfigCmd::Show = action {
         print!("{}", render(&load_cfg(path)?));
         return Ok(());
@@ -1331,11 +1372,11 @@ fn config_cmd(path: &Path, action: &ConfigCmd) -> Result<()> {
     // where it is made rather than at the next boot.
     if let Some(w) = cfg.pin_overcommit() { eprintln!("WARNING: {w}"); }
     if let Some(w) = pins_behind_admission(&cfg) { eprintln!("WARNING: {w}"); }
-    // The file is desired state; the running service only picks it up when asked.
-    if matches!(action, ConfigCmd::Pin { .. } | ConfigCmd::Unpin { .. } | ConfigCmd::Set { .. }) {
-        println!("run `npu reload` to apply this to a running server");
+    if no_reload {
+        println!("--no-reload: saved only; run `npu reload` to apply it to a running server");
+        return Ok(());
     }
-    Ok(())
+    apply_now(path, &cfg)
 }
 
 /// Every registered `NPU_*`/related env var against the LIVE process environment: whether it is
@@ -1497,6 +1538,21 @@ mod tests {
         assert_eq!(hms(59), "59s");
         assert_eq!(hms(61), "1m01s");
         assert_eq!(hms(3_661), "1h01m01s");
+    }
+
+    #[test]
+    fn a_reload_summary_names_only_what_moved() {
+        // The raw report is seven counts, most of them zero most of the time. An operator wants
+        // the ones that are not.
+        assert_eq!(summarise_reload(
+            r#"{"loaded":0,"unloaded":0,"failed":0,"deferred":4,"pinned_deferred":1,"evicted":3,"pinned_over_cap":0}"#),
+            "3 evicted, 4 deferred, 1 pinned_deferred");
+        assert_eq!(summarise_reload(
+            r#"{"loaded":0,"unloaded":0,"failed":0,"deferred":0,"pinned_deferred":0,"evicted":0,"pinned_over_cap":0}"#),
+            "nothing to change");
+        // A body that is not the report at all is passed through rather than reduced to a
+        // confident-looking "nothing to change".
+        assert_eq!(summarise_reload("service exploded\n"), "service exploded");
     }
 
     #[test]
@@ -1694,21 +1750,21 @@ mod tests {
         let p = dir.path().join("engine.toml");
         std::fs::write(&p, "# keep me\n[server]\nmax_resident = 2\n\n[[model]]\nname = \"a\"\nscenario = \"s.toml\"\n").unwrap();
 
-        config_cmd(&p, &ConfigCmd::Pin { model: "a".into() }).unwrap();
+        config_cmd(&p, &ConfigCmd::Pin { model: "a".into() }, true).unwrap();
         assert!(npu_runtime::config::Config::load(&p).unwrap().find("a").unwrap().resident);
 
-        config_cmd(&p, &ConfigCmd::Set { key: "idle_unload_s".into(), value: "0".into() }).unwrap();
+        config_cmd(&p, &ConfigCmd::Set { key: "idle_unload_s".into(), value: "0".into() }, true).unwrap();
         let cfg = npu_runtime::config::Config::load(&p).unwrap();
         assert_eq!(cfg.server.idle_unload(), None, "0 is how idle unload is switched off");
         assert_eq!(cfg.server.max_resident, 2, "an unnamed key must not move");
 
         // Re-pointing a scenario must not silently unpin.
-        config_cmd(&p, &ConfigCmd::AddModel { name: "a".into(), scenario: "t.toml".into() }).unwrap();
+        config_cmd(&p, &ConfigCmd::AddModel { name: "a".into(), scenario: "t.toml".into() }, true).unwrap();
         let cfg = npu_runtime::config::Config::load(&p).unwrap();
         assert_eq!(cfg.find("a").unwrap().scenario, "t.toml");
         assert!(cfg.find("a").unwrap().resident);
 
-        config_cmd(&p, &ConfigCmd::Unpin { model: "a".into() }).unwrap();
+        config_cmd(&p, &ConfigCmd::Unpin { model: "a".into() }, true).unwrap();
         assert!(!npu_runtime::config::Config::load(&p).unwrap().find("a").unwrap().resident);
 
         assert!(std::fs::read_to_string(&p).unwrap().contains("# keep me"),
@@ -1721,10 +1777,10 @@ mod tests {
         let p = dir.path().join("engine.toml");
         std::fs::write(&p, "[[model]]\nname = \"a\"\nscenario = \"s\"\n").unwrap();
         let before = std::fs::read_to_string(&p).unwrap();
-        assert!(config_cmd(&p, &ConfigCmd::Pin { model: "nope".into() }).is_err());
-        assert!(config_cmd(&p, &ConfigCmd::Unpin { model: "nope".into() }).is_err());
-        assert!(config_cmd(&p, &ConfigCmd::RemoveModel { name: "nope".into() }).is_err());
-        assert!(config_cmd(&p, &ConfigCmd::Set { key: "max_resident".into(), value: "-1".into() }).is_err());
+        assert!(config_cmd(&p, &ConfigCmd::Pin { model: "nope".into() }, true).is_err());
+        assert!(config_cmd(&p, &ConfigCmd::Unpin { model: "nope".into() }, true).is_err());
+        assert!(config_cmd(&p, &ConfigCmd::RemoveModel { name: "nope".into() }, true).is_err());
+        assert!(config_cmd(&p, &ConfigCmd::Set { key: "max_resident".into(), value: "-1".into() }, true).is_err());
         assert_eq!(std::fs::read_to_string(&p).unwrap(), before, "a refused command writes nothing");
     }
 
