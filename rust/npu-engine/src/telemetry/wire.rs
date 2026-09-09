@@ -22,7 +22,10 @@
 use serde_json::{json, Map, Value};
 
 use crate::pipeline::FinishReason;
-use crate::telemetry::{Bound, GenerationReport, PrefillRecord, RunConditions, StepPhases, StepRecord, Summary};
+use crate::telemetry::{
+    ArmProvenance, Bound, DesignCost, GenerationReport, PrefillRecord, RunConditions, SamplePhases,
+    StepPhases, StepRecord, Summary,
+};
 
 /// Identity every line in one file shares.
 #[derive(Debug, Clone)]
@@ -67,7 +70,36 @@ pub fn prefill_line(p: &PrefillRecord, m: &RunMeta) -> Value {
 }
 
 fn phases_json(p: &StepPhases) -> Value {
-    json!({ "step_ms": us_f(p.step_us), "sample_ms": us_f(p.sample_us), "detok_ms": us_f(p.detok_us) })
+    let mut v = json!({ "step_ms": us_f(p.step_us), "sample_ms": us_f(p.sample_us), "detok_ms": us_f(p.detok_us) });
+    if let Some(sp) = p.sample_phases {
+        v["sample_phases_ms"] = json!({
+            "penalties": us_f(sp.penalties_us),
+            "top_k": us_f(sp.top_k_us),
+            "top_p": us_f(sp.top_p_us),
+            "draw": us_f(sp.draw_us),
+        });
+    }
+    v
+}
+
+fn design_breakdown_json(v: &[DesignCost]) -> Value {
+    Value::Array(v.iter().map(|d| json!({
+        "label": d.label, "dispatches": d.dispatches, "ms": d.secs * 1e3,
+    })).collect())
+}
+
+fn provenance_json(p: &ArmProvenance) -> Value {
+    json!({
+        "head_dtype": p.head_dtype,
+        "mlp_dtype": p.mlp_dtype,
+        "quant_group": p.quant_group,
+        "fusion_flags": p.fusion_flags,
+        "max_seq": p.max_seq,
+        "n_past": p.n_past,
+        "artifact_path": p.artifact_path,
+        "artifact_hash": p.artifact_hash,
+        "toolchain_pin_hash": p.toolchain_pin_hash,
+    })
 }
 
 /// One decoded token, as an OpenAI stream chunk carrying its own measurement.
@@ -196,11 +228,13 @@ pub fn npu_object(s: &Summary) -> Value {
         },
         "decode_phases_ms": phases_json(&s.phases),
         "decode_residual_ms": us_f(s.residual_us),
+        "device_by_design": design_breakdown_json(&s.design_breakdown),
         "dispatches": s.dispatches,
         "transitions": s.transitions,
         "bound": s.bound.as_str(),
         "bound_share": s.bound_share,
         "lever": s.bound.lever(),
+        "provenance": provenance_json(&s.provenance),
     })
 }
 
@@ -258,6 +292,52 @@ fn opt_u32(v: Option<&Value>) -> Option<u32> {
     v.and_then(|x| if x.is_null() { None } else { x.as_u64() }).map(|n| n as u32)
 }
 
+/// Shared by the per-token chunk and the run summary: both carry the same `ph` shape.
+fn parse_step_phases(ph: &Value) -> StepPhases {
+    let sp = ph.get("sample_phases_ms");
+    StepPhases {
+        step_us: f64_ms_to_us(ph.get("step_ms")),
+        sample_us: f64_ms_to_us(ph.get("sample_ms")),
+        detok_us: f64_ms_to_us(ph.get("detok_ms")),
+        sample_phases: sp.map(|sp| SamplePhases {
+            penalties_us: f64_ms_to_us(sp.get("penalties")),
+            top_k_us: f64_ms_to_us(sp.get("top_k")),
+            top_p_us: f64_ms_to_us(sp.get("top_p")),
+            draw_us: f64_ms_to_us(sp.get("draw")),
+        }),
+    }
+}
+
+fn parse_design_breakdown(v: &Value) -> Vec<DesignCost> {
+    v.as_array()
+        .map(|a| {
+            a.iter()
+                .map(|d| DesignCost {
+                    label: d["label"].as_str().unwrap_or_default().to_string(),
+                    dispatches: d["dispatches"].as_u64().unwrap_or(0) as u32,
+                    secs: d["ms"].as_f64().unwrap_or(0.0) / 1e3,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn parse_provenance(p: &Value) -> ArmProvenance {
+    ArmProvenance {
+        head_dtype: p["head_dtype"].as_str().map(str::to_string),
+        mlp_dtype: p["mlp_dtype"].as_str().map(str::to_string),
+        quant_group: p["quant_group"].as_u64().map(|n| n as u32),
+        fusion_flags: p["fusion_flags"].as_array().map(|a| {
+            a.iter().filter_map(|f| f.as_str().map(str::to_string)).collect()
+        }).unwrap_or_default(),
+        max_seq: p["max_seq"].as_u64().map(|n| n as u32),
+        n_past: p["n_past"].as_u64().map(|n| n as u32),
+        artifact_path: p["artifact_path"].as_str().map(str::to_string),
+        artifact_hash: p["artifact_hash"].as_str().map(str::to_string),
+        toolchain_pin_hash: p["toolchain_pin_hash"].as_str().map(str::to_string),
+    }
+}
+
 /// Read a run log back. Unknown `object` values are skipped rather than rejected: a log written by
 /// a later version must still be readable by this one, or the format stops being a debugging tool
 /// the first time it grows a field.
@@ -308,11 +388,7 @@ pub fn parse_run(text: &str) -> Result<Run, String> {
                     emit: emit.as_str().unwrap_or_default().to_string(),
                     t_us: f64_ms_to_us(x["time"].get("t_ms")),
                     dt_us: f64_ms_to_us(x["time"].get("dt_ms")),
-                    phases: StepPhases {
-                        step_us: f64_ms_to_us(ph.get("step_ms")),
-                        sample_us: f64_ms_to_us(ph.get("sample_ms")),
-                        detok_us: f64_ms_to_us(ph.get("detok_ms")),
-                    },
+                    phases: parse_step_phases(ph),
                     dispatches: opt_u32(x["dev"].get("dispatches")),
                     transitions: opt_u32(x["dev"].get("transitions")),
                 });
@@ -340,11 +416,7 @@ pub fn parse_run(text: &str) -> Result<Run, String> {
                     itl_p95_us: f64_ms_to_us(itl.get("p95")),
                     itl_p99_us: f64_ms_to_us(itl.get("p99")),
                     itl_max_us: f64_ms_to_us(itl.get("max")),
-                    phases: StepPhases {
-                        step_us: f64_ms_to_us(ph.get("step_ms")),
-                        sample_us: f64_ms_to_us(ph.get("sample_ms")),
-                        detok_us: f64_ms_to_us(ph.get("detok_ms")),
-                    },
+                    phases: parse_step_phases(ph),
                     residual_us: f64_ms_to_us(n.get("decode_residual_ms")),
                     dispatches: opt_u32(n.get("dispatches")),
                     transitions: opt_u32(n.get("transitions")),
@@ -359,6 +431,8 @@ pub fn parse_run(text: &str) -> Result<Run, String> {
                         _ => Bound::Unattributed,
                     },
                     bound_share: n["bound_share"].as_f64().unwrap_or(0.0),
+                    design_breakdown: parse_design_breakdown(&n["device_by_design"]),
+                    provenance: parse_provenance(&n["provenance"]),
                 });
             }
             _ => {}
@@ -389,7 +463,7 @@ mod tests {
                 emit: format!("t{i}"),
                 t_us: 5_000 + 20_000 * i as u64,
                 dt_us: if i == 0 { 5_000 } else { 20_000 },
-                phases: StepPhases { step_us: if i == 0 { 0 } else { 18_000 }, sample_us: 300, detok_us: 90 },
+                phases: StepPhases { step_us: if i == 0 { 0 } else { 18_000 }, sample_us: 300, detok_us: 90, sample_phases: None },
                 dispatches: Some(if i == 0 { 0 } else { 1 }),
                 transitions: Some(0),
             })
@@ -412,6 +486,8 @@ mod tests {
             usage: GenerateUsage { prompt_tokens: 12, completion_tokens: 4 },
             npu_power_start_uw: None,
             npu_power_end_uw: None,
+            design_breakdown: Vec::new(),
+            provenance: ArmProvenance::default(),
         }
     }
 

@@ -23,11 +23,13 @@ use std::path::Path;
 use std::rc::Rc;
 
 use npu_xrt::{Device, ElfResident, FusedArena};
+use sha2::{Digest, Sha256};
 
 use crate::api::EngineError;
 use crate::llm::artifact::{BufLoc, EmbedScale, LlmArtifact};
 use crate::llm::generator::DecodeStep;
 use crate::llm::npu_prefill::NpuPrefill;
+use crate::telemetry::ArmProvenance;
 
 pub(crate) fn pack_bf16_bytes(f: &[f32]) -> Vec<u8> {
     let mut bits = vec![0u16; f.len()];
@@ -62,6 +64,41 @@ pub(crate) fn rope_row(pos: usize, head_dim: usize, theta: f64) -> Vec<f32> {
     row
 }
 
+/// `meta.json` fields `LlmArtifact` does not model: `weight_quant` and `sequence_name`. Read
+/// directly here, best-effort -- provenance is a record, not a gate, mirroring
+/// `gen_llm_decode.py`'s own `toolchain_provenance()`/`generator_provenance()`, which return `{}`
+/// rather than raise. A malformed or absent field degrades to `None`/empty; it must never fail a
+/// load `LlmArtifact::load` already validated for correctness.
+///
+/// `sequence_name` is reported WHOLE rather than parsed apart: `gen_llm_decode.py` names it as the
+/// one field that disambiguates two arms sharing identical dims/weight_quant (TMV_CTX, FUSE_MLP_DP,
+/// WEIGHT_DEPTH, ...), but its suffix vocabulary is a live, growing convention on the Python side
+/// (three switches were added to it after the fact and missed on the first pass) -- reverse-parsing
+/// flag names out of it here would be exactly the guess the hanging-numbers rule warns against.
+/// `clip_search` gets its own entry because it does NOT ride in `sequence_name`: it moves weight
+/// VALUES only (`gen_llm_decode.py:1103`), so an arm that quietly enabled it would otherwise be
+/// unattributable everywhere in `--stats`.
+fn provenance_extras(decode_dir: &Path) -> ArmProvenance {
+    let mut p = ArmProvenance::default();
+    let Ok(bytes) = std::fs::read(decode_dir.join("meta.json")) else { return p };
+    let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&bytes) else { return p };
+
+    if let Some(wq) = meta.get("weight_quant") {
+        p.mlp_dtype = wq.get("mlp_dtype").and_then(|v| v.as_str()).map(str::to_string);
+        p.head_dtype = wq.get("head_dtype").and_then(|v| v.as_str()).map(str::to_string);
+        // Paired with `mlp_dtype`: attn/head each declare their own group size too, and
+        // `ArmProvenance` has one typed slot, not three -- see its doc for the trade-off.
+        p.quant_group = wq.get("mlp_group_size").and_then(|v| v.as_u64()).map(|v| v as u32);
+        if wq.get("clip_search").and_then(|v| v.as_bool()) == Some(true) {
+            p.fusion_flags.push("clip_search".to_string());
+        }
+    }
+    if let Some(name) = meta.get("sequence_name").and_then(|v| v.as_str()) {
+        p.fusion_flags.insert(0, format!("sequence:{name}"));
+    }
+    p
+}
+
 fn upload_blob(arena: &FusedArena, artifact: &LlmArtifact, name: &str) -> Result<(), EngineError> {
     let bytes = std::fs::read(artifact.weight_blob_path(name))
         .map_err(|e| EngineError::Load(format!("read weight buffer {name}.bin: {e}")))?;
@@ -94,6 +131,9 @@ pub struct NpuDecodeStep {
     /// one on every shared arena offset. `None` is the whole existing rail: one dispatch per prompt
     /// token, no second ELF, no second hardware context.
     prefill: Option<NpuPrefill>,
+    /// Computed once at load and cloned out per generation -- `artifact_hash` hashes the ELF
+    /// (tens of MB), which `provenance()` must not redo on every call. See [`DecodeStep::provenance`].
+    provenance: ArmProvenance,
 }
 
 /// The host embedding gather, shared verbatim by the per-token and the batched path. Sharing the
@@ -260,6 +300,16 @@ impl NpuDecodeStep {
 
         let elf = std::fs::read(artifact.elf_path())
             .map_err(|e| EngineError::Load(format!("read {}: {e}", artifact.elf_path().display())))?;
+        // Content identity of the literal bytes this instance is about to run -- NOT a
+        // reproducibility check (a full-ELF hash is not stable rebuild-to-rebuild, bootgen leaks
+        // heap into it; see aiecc-full-elf-md5-is-not-an-identity-check). The point here is only
+        // "were two reports the same binary", which a content hash answers even when the source
+        // that built it did not change -- exactly the case a toolchain-pin match can miss.
+        let artifact_hash: String = {
+            let mut h = Sha256::new();
+            h.update(&elf);
+            h.finalize().iter().take(6).map(|b| format!("{b:02x}")).collect()
+        };
         let res = dev
             .open_elf_resident(&elf, Some(&artifact.kernel_name))
             .map_err(|e| EngineError::Load(format!("open_elf_resident: decode ELF lacks a ctrl scratchpad: {e}")))?;
@@ -271,7 +321,15 @@ impl NpuDecodeStep {
         let prefill = pre_art.map(|a| NpuPrefill::open(dev, a, &artifact, &arena)).transpose()?;
         let embed = EmbedTable::open(&artifact)?;
 
-        Ok(NpuDecodeStep { artifact, arena, res, embed, rope_writes, prefill })
+        let provenance = ArmProvenance {
+            artifact_path: Some(artifact.decode_dir.display().to_string()),
+            artifact_hash: Some(artifact_hash),
+            toolchain_pin_hash: artifact.toolchain_hash.clone(),
+            max_seq: Some(artifact.max_seq as u32),
+            ..provenance_extras(&artifact.decode_dir)
+        };
+
+        Ok(NpuDecodeStep { artifact, arena, res, embed, rope_writes, prefill, provenance })
     }
 
     /// Re-zero every KV-cache scratch buffer (`meta.json`'s `cache_buffers`) and sync. Call before
@@ -356,6 +414,12 @@ impl DecodeStep for NpuDecodeStep {
         npu_xrt::dispatch_log::enabled().then(|| {
             format!("{}\n{}", npu_xrt::dispatch_log::report(0.0), npu_xrt::context_report())
         })
+    }
+
+    /// Computed once at load ([`Self::build`]) and cloned out here -- see [`provenance_extras`] for
+    /// what `LlmArtifact` does not model and why the ELF hash is not redone per call.
+    fn provenance(&self) -> ArmProvenance {
+        self.provenance.clone()
     }
 
     /// The prefill artifact's `dims.M`, or `None` when this instance has no prefill ELF or the
@@ -452,6 +516,58 @@ mod tests {
     #[test]
     fn rope_row_length_matches_head_dim() {
         assert_eq!(rope_row(5, 128, 1_000_000.0).len(), 128);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // `provenance_extras`: pure function over a `meta.json`, no device -- exercised directly rather
+    // than through a full `NpuDecodeStep::build`, which needs real hardware.
+    // ---------------------------------------------------------------------------------------
+
+    #[test]
+    fn provenance_extras_reads_weight_quant_and_flags_clip_search() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("meta.json"), serde_json::json!({
+            "sequence_name": "qwen3_0_6b_decode_mlpdp8",
+            "weight_quant": {
+                "mlp_dtype": "int8", "mlp_group_size": 128,
+                "attn_dtype": "bf16", "attn_group_size": 128,
+                "head_dtype": "int4", "head_group_size": 64,
+                "clip_search": true,
+            },
+        }).to_string()).unwrap();
+
+        let p = provenance_extras(dir.path());
+        assert_eq!(p.mlp_dtype.as_deref(), Some("int8"));
+        assert_eq!(p.head_dtype.as_deref(), Some("int4"));
+        assert_eq!(p.quant_group, Some(128), "quant_group pairs with mlp_group_size, not attn/head");
+        assert!(p.fusion_flags.contains(&"clip_search".to_string()), "{:?}", p.fusion_flags);
+        assert!(p.fusion_flags.iter().any(|f| f.contains("qwen3_0_6b_decode_mlpdp8")), "{:?}", p.fusion_flags);
+    }
+
+    #[test]
+    fn provenance_extras_omits_clip_search_flag_when_false() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("meta.json"), serde_json::json!({
+            "sequence_name": "qwen3_0_6b_decode",
+            "weight_quant": {"mlp_dtype": "bf16", "mlp_group_size": 128, "head_dtype": "bf16",
+                             "head_group_size": 128, "clip_search": false},
+        }).to_string()).unwrap();
+
+        let p = provenance_extras(dir.path());
+        assert!(!p.fusion_flags.iter().any(|f| f == "clip_search"), "{:?}", p.fusion_flags);
+    }
+
+    #[test]
+    fn provenance_extras_degrades_to_default_on_a_missing_or_malformed_meta() {
+        let dir = tempfile::tempdir().unwrap();
+        // No meta.json at all.
+        assert_eq!(provenance_extras(dir.path()), ArmProvenance::default());
+        // Present but not valid JSON.
+        std::fs::write(dir.path().join("meta.json"), b"not json").unwrap();
+        assert_eq!(provenance_extras(dir.path()), ArmProvenance::default());
+        // Valid JSON but no weight_quant/sequence_name keys at all.
+        std::fs::write(dir.path().join("meta.json"), "{}").unwrap();
+        assert_eq!(provenance_extras(dir.path()), ArmProvenance::default());
     }
 
     /// Diagnostic, NOT a device test: dump the exact `x`/`rope_global` BYTES this rail would write

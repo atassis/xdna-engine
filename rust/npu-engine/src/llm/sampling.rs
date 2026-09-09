@@ -19,6 +19,7 @@
 //! f64, matching `scripts/gemma_sampling_ref.py` bit-for-bit.
 
 use std::collections::HashMap;
+use std::time::Instant;
 
 /// Logits paired with the token ids they stand for. `ids: None` is the identity view
 /// (`values[i]` is the logit for token id `i`) -- the full-vocabulary case. `ids: Some(ids)` is a
@@ -114,6 +115,21 @@ pub struct SampleOutcome {
     /// was handed a history token it cannot see" -- the caller decides whether that is acceptable
     /// (it is, for a genuine top-k slice) or should trigger a full-logits fallback.
     pub penalties_skipped: u32,
+    /// Per-stage cost of this call. Zeroed (not absent) on the greedy short-circuit -- greedy
+    /// truly skips penalties/top-k/top-p/draw, which is a real zero, not a missing measurement;
+    /// `telemetry::StepPhases::sample_phases` is where the measured-vs-unmeasured distinction lives.
+    pub timings: SampleTimings,
+}
+
+/// Nanosecond cost of each stage inside one [`sample`] call, pipeline order. Nanoseconds because
+/// `telemetry::SamplePhases` (microseconds) is coarse enough to round a real sub-us stage down to
+/// the same 0 as "not measured" -- the caller sums before that rounding happens.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SampleTimings {
+    pub penalties_ns: u64,
+    pub top_k_ns: u64,
+    pub top_p_ns: u64,
+    pub draw_ns: u64,
 }
 
 /// Deterministic 64-bit PRNG (Vigna's splitmix64) -- chosen so `scripts/gemma_sampling_ref.py` can
@@ -198,38 +214,67 @@ fn apply_penalties(work: &mut [f64], view: &LogitView, history: &[u32], cfg: &Sa
     skipped
 }
 
+/// Descending by value, ascending by rank on a tie. A TOTAL order, which is what lets the filters
+/// below use selection instead of a full sort: `select_nth_unstable_by` is only well-defined for a
+/// consistent comparator, and `partial_cmp` is not one (it has no answer for NaN). Ties break
+/// toward the lower rank, matching [`argmax`]'s first-wins convention so the two agree at `k == 1`.
+fn by_desc(v: &[f64], a: usize, b: usize) -> std::cmp::Ordering {
+    v[b].total_cmp(&v[a]).then(a.cmp(&b))
+}
+
 /// Keep only the `k` largest logits (by rank); mask the rest to `-inf`. `k == 0` disables the filter.
+///
+/// Selection, not a sort: the caller wants the `k` survivors as a SET, and their order is never
+/// read -- `filter_top_p` re-derives its own ordering and the inverse-CDF draw walks ranks. So this
+/// is O(V) via `select_nth_unstable_by` rather than O(V log V), which at Qwen3's V = 151936 and
+/// k = 20 is the difference that made host sampling cost 2.7 ms/token.
 fn filter_top_k(logits: &mut [f64], k: usize) {
     if k == 0 || k >= logits.len() {
         return;
     }
     let mut idx: Vec<usize> = (0..logits.len()).collect();
-    idx.sort_unstable_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap());
-    for &i in &idx[k..] {
+    let (_, _, tail) = idx.select_nth_unstable_by(k - 1, |&a, &b| by_desc(logits, a, b));
+    for &i in &*tail {
         logits[i] = f64::NEG_INFINITY;
     }
 }
 
 /// Nucleus filter: keep the smallest prefix (by descending probability) whose cumulative mass is
 /// `>= top_p`; mask the rest to `-inf`. `top_p >= 1.0` disables the filter.
+///
+/// Runs over the FINITE entries only, which is exact rather than an approximation: `softmax_f64`
+/// maps a `-inf` logit to exactly 0.0 and normalises over the same denominator either way, so a
+/// masked entry cannot change a surviving entry's probability, and it sorts last with 0 mass so it
+/// cannot fall inside the nucleus. When `filter_top_k` ran first that leaves `k` entries here
+/// instead of `V`, which is what removes the second full-vocabulary sort.
 fn filter_top_p(logits: &mut [f64], top_p: f64) {
     if top_p >= 1.0 {
         return;
     }
-    let probs = softmax_f64(logits);
-    let mut idx: Vec<usize> = (0..logits.len()).collect();
-    idx.sort_unstable_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
+    let idx: Vec<usize> = (0..logits.len()).filter(|&i| logits[i].is_finite()).collect();
+    if idx.is_empty() {
+        return;
+    }
+    // Softmax over the survivors, which is the same arithmetic `softmax_f64` would do over the
+    // whole vocabulary: a `-inf` entry contributes exactly 0 to both the numerator and the sum, so
+    // it moves no surviving probability, and it can never enter the nucleus at 0 mass. Doing it
+    // here rather than over all V avoids materialising a V-length f64 vector per token.
+    let max = idx.iter().map(|&i| logits[i]).fold(f64::NEG_INFINITY, f64::max);
+    let exp: Vec<f64> = idx.iter().map(|&i| (logits[i] - max).exp()).collect();
+    let sum: f64 = exp.iter().sum();
+    let mut ord: Vec<usize> = (0..idx.len()).collect();
+    ord.sort_unstable_by(|&a, &b| exp[b].total_cmp(&exp[a]).then(idx[a].cmp(&idx[b])));
     let mut cum = 0.0f64;
-    let mut cutoff = idx.len();
-    for (pos, &i) in idx.iter().enumerate() {
-        cum += probs[i];
+    let mut cutoff = ord.len();
+    for (pos, &r) in ord.iter().enumerate() {
+        cum += exp[r] / sum;
         if cum >= top_p {
             cutoff = pos + 1;
             break;
         }
     }
-    for &i in &idx[cutoff..] {
-        logits[i] = f64::NEG_INFINITY;
+    for &r in &ord[cutoff..] {
+        logits[idx[r]] = f64::NEG_INFINITY;
     }
 }
 
@@ -238,26 +283,38 @@ fn filter_top_p(logits: &mut [f64], top_p: f64) {
 /// `cfg.temperature <= 0.0`; otherwise runs the full pipeline.
 pub fn sample(view: LogitView, history: &[u32], cfg: &SamplingConfig, rng: &mut SplitMix64) -> SampleOutcome {
     if cfg.temperature <= 0.0 {
-        return SampleOutcome { token: argmax(view), penalties_skipped: 0 };
+        return SampleOutcome { token: argmax(view), penalties_skipped: 0, timings: SampleTimings::default() };
     }
+    let t_start = Instant::now();
     let mut work: Vec<f64> = (0..view.len()).map(|r| view.value_at_rank(r) as f64).collect();
     let penalties_skipped = apply_penalties(&mut work, &view, history, cfg);
     let temperature = cfg.temperature as f64;
     for v in work.iter_mut() {
         *v /= temperature;
     }
+    let t_penalties = Instant::now();
     filter_top_k(&mut work, cfg.top_k);
+    let t_top_k = Instant::now();
     filter_top_p(&mut work, cfg.top_p as f64);
+    let t_top_p = Instant::now();
     let probs = softmax_f64(&work);
     let u = rng.next_f64();
     let mut cum = 0.0f64;
+    let mut picked_rank = probs.len() - 1; // last-ulp edge case: nothing crossed `u`, take the tail
     for (r, &p) in probs.iter().enumerate() {
         cum += p;
         if u < cum {
-            return SampleOutcome { token: view.id_at_rank(r), penalties_skipped };
+            picked_rank = r;
+            break;
         }
     }
-    SampleOutcome { token: view.id_at_rank(probs.len() - 1), penalties_skipped } // last-ulp edge case
+    let timings = SampleTimings {
+        penalties_ns: (t_penalties - t_start).as_nanos() as u64,
+        top_k_ns: (t_top_k - t_penalties).as_nanos() as u64,
+        top_p_ns: (t_top_p - t_top_k).as_nanos() as u64,
+        draw_ns: t_top_p.elapsed().as_nanos() as u64,
+    };
+    SampleOutcome { token: view.id_at_rank(picked_rank), penalties_skipped, timings }
 }
 
 #[cfg(test)]
@@ -276,6 +333,20 @@ mod tests {
         assert_eq!(out.token, argmax(LogitView::full(&SAMPLE_LOGITS)));
         assert_eq!(out.token, 4); // index of the 4.0 logit
         assert_eq!(out.penalties_skipped, 0);
+        assert_eq!(out.timings, SampleTimings::default(), "greedy must report a true zero, not skip measuring");
+    }
+
+    #[test]
+    fn a_non_greedy_draw_times_every_stage() {
+        let cfg = SamplingConfig { temperature: 0.8, top_k: 4, top_p: 0.9, ..SamplingConfig::default() };
+        let mut rng = SplitMix64::new(1);
+        let out = sample(LogitView::full(&SAMPLE_LOGITS), &[], &cfg, &mut rng);
+        // Real `Instant` calls: assert they ran (a stage cost of exactly 0ns would mean the clock
+        // never advanced, i.e. this stage was skipped, not that it was fast), not a magnitude.
+        assert!(out.timings.penalties_ns > 0, "{:?}", out.timings);
+        assert!(out.timings.top_k_ns > 0, "{:?}", out.timings);
+        assert!(out.timings.top_p_ns > 0, "{:?}", out.timings);
+        assert!(out.timings.draw_ns > 0, "{:?}", out.timings);
     }
 
     #[test]
