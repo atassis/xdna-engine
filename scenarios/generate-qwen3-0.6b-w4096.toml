@@ -1,0 +1,13 @@
+[scenario]
+kind = "generate"
+name = "qwen3-0.6b-w4096"
+
+# The ladder's CONTROL: the identical top-rung artifact with no ladder declared, so it runs the
+# single-arm rail. Any token-id difference against the ladder scenario is the ladder, not the build.
+[artifacts]
+decode = "artifacts/qwen3-0.6b/ladder4096/w4096"
+weights = "artifacts/qwen3-0.6b/weights"
+tokenizer_dir = "artifacts/qwen3-0.6b/tokenizer"
+
+[generation]
+max_tokens = 1024

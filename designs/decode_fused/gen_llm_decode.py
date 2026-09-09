@@ -244,6 +244,17 @@ FUSE_MLP_O = os.environ.get("FUSE_MLP_O", "1") == "1"
 # GEMV achieves, and a core stalling on every weight tile is the shape that would explain
 # it. An A/B axis, not a settled default.
 WEIGHT_DEPTH = int(os.environ.get("WEIGHT_DEPTH", "2"))
+# KV_ALLOC -- allocate the KV cache for a WIDE capacity while attention computes over a NARROW
+# window, so a ladder of window arms can share ONE cache. Since the blocked layout landed this is
+# nearly free to express: KVLayout owns every stride and buffer size, so widening the capacity is
+# ONE argument to it plus the operators' own alloc_M/alloc_K. Default 0 = capacity is the window,
+# byte for byte the pre-existing build.
+KV_ALLOC = int(os.environ.get("KV_ALLOC", "0"))
+# Pin the persistent buffers (weights + KV cache) to the FRONT of the scratch arena so a ladder of
+# window arms presents ONE layout for everything that survives a bucket crossing. Without it the
+# window-sized softmax scratch (sc/sw, Hq*S) sits ahead of them and shifts every later offset:
+# measured, arms at window 256 and 512 over one allocation disagreed on 304 of 313 named offsets.
+LADDER_SCRATCH_ORDER = os.environ.get("LADDER_SCRATCH_ORDER", "0") == "1"
 # Weight tile ROWS for the fused MLP. Trades against WEIGHT_DEPTH at constant L1.
 MLP_TILE_ROWS = int(os.environ.get("MLP_TILE_ROWS", "0"))
 
@@ -325,6 +336,8 @@ def sequence_name(sp, NL, S, placer_flags, decode_layer_active=False, T=None):
     # buffers completely differently, so it must not share a name with the flat build.
     if T is not None and T != S:
         parts.append(f"kvt{T}")
+    if KV_ALLOC and KV_ALLOC != S:
+        parts.append(f"ka{KV_ALLOC}")
     if GROUPED_V:
         parts.append("gv")
     if TMV_CTX and TMV_RPC != TMV_RPC_DEFAULT:
@@ -675,7 +688,14 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
             f"blocked GEMV needs each of the {COLS} columns' share of S ({S // COLS}) to be a "
             f"whole number of blocks (T={T})"
         )
-    kv_layout = KVLayout(Hkv=Hkv, S=S, HD=HD, T=T)
+    # The descriptor is built on the CAPACITY, not the window: kv_off and the strides are
+    # S-independent under blocking, so this only sizes the cache -- and every site that asks
+    # kv_layout (buffer sizing, the append tap, the host's kv_off) then follows with no further
+    # edit. Before the seam fix this same change had to be spelled out at five sites.
+    KVA = KV_ALLOC or S
+    if KVA < S:
+        raise ValueError(f"KV_ALLOC={KVA} < max_seq={S}: it is the capacity, not a window")
+    kv_layout = KVLayout(Hkv=Hkv, S=KVA, HD=HD, T=T)
     print(f"[gen] KV cache layout: T={T}"
           + (" (flat [Hkv,S,HD])" if T == S else
              f" (blocked [S/T,Hkv,T,HD], head_stride={kv_layout.head_stride}, "
@@ -762,7 +782,10 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
     op_qkv_dp = None
     if qkv_dp_why is None:
         from iron.operators.qkv_head_dp.op import QKVHeadDataParallel
-        op_qkv_dp = QKVHeadDataParallel(D=D, HD=HD, Hq=Hq, Hkv=Hkv, max_seq=S,
+        # max_seq here is the cache EXTENT, not a compute bound -- the fused head appends ONE
+        # token's k/v at the runtime kv_off -- so it takes the CAPACITY. The seam fix owns the
+        # OFFSET; the extent is a separate concern KV_ALLOC has to reach on its own.
+        op_qkv_dp = QKVHeadDataParallel(D=D, HD=HD, Hq=Hq, Hkv=Hkv, max_seq=KVA,
                                         num_aie_columns=sp.qkv_dp_cols(COLS), epsilon=sp.eps,
                                         tile_size_input=TSI, context=ctx,
                                         weight_depth=WEIGHT_DEPTH, kv_block_size=T)
@@ -774,7 +797,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
     sc = dict(input_sizes=(Hkv, HD), input_strides=(HD, 1), input_offset=0,
               output_sizes=(1, Hkv, HD), output_strides=(0, kv_layout.head_stride, 1),
               output_offset=0,
-              input_buffer_size=Hkv * HD, output_buffer_size=Hkv * S * HD, num_aie_channels=1)
+              input_buffer_size=Hkv * HD, output_buffer_size=kv_layout.total_elems, num_aie_channels=1)
     op_sck = StridedCopy(**sc, output_offset_parameter="kv_off", context=ctx)
     # V stays [S][HD]. A transposed append would delete op_trv, but a SINGLE-token transposed write
     # is 1024 isolated bf16 elements (h*HD*S + d*S + p) and the shim address generator steps in
@@ -802,7 +825,8 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
     op_rep_k = Repeat(rows=Hkv, cols=S * HD, repeat=sp.gqa_group, transfer_size=HD, context=ctx)
     op_rep_v = Repeat(rows=Hkv, cols=S * HD, repeat=sp.gqa_group, transfer_size=HD, context=ctx)
     op_scores = gemv(S, HD, ctx, num_batches=Hq,
-                     batch_group=sp.gqa_group if GROUPED_K else 1, block_size=T)
+                     batch_group=sp.gqa_group if GROUPED_K else 1, block_size=T,
+                     alloc_M=None if KVA == S else KVA)
     # Folded into n_qn when SCALE_IN_QNORM; built anyway so the A/B arm stays reachable.
     scale_in_qnorm = SCALE_IN_QNORM and sp.qk_norm
     op_scale = (None if scale_in_qnorm else
@@ -851,7 +875,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
         if rpc != TMV_RPC:
             print(f"[gen] TMatVec rows_per_chunk {TMV_RPC} -> {rpc} (L1 fit at head_dim={HD})")
         op_ctx = TMatVec(M=HD, K=S, num_aie_columns=Hkv, num_batches=Hq,
-                         batch_group=sp.gqa_group,
+                         batch_group=sp.gqa_group, alloc_K=None if KVA == S else KVA,
                          rows_per_chunk=rpc, context=ctx, block_size=T)
     else:
         op_ctx = gemv(HD, S, ctx, num_batches=Hq)
@@ -1192,7 +1216,8 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
                                            decode_layer_active=op_decode_layer is not None, T=T), rl,
                               input_args=inputs, output_args=["logits"],
                               buffer_sizes=bufsz, context=ctx, extra_flags=placer_flags,
-                              share_designs=share)
+                              share_designs=share,
+                              **({"scratch_order": list(weights.keys())} if LADDER_SCRATCH_ORDER else {}))
     fused.compile()
     return sp, fused, weights, dict(NL=NL, S=S, T=T, inputs=inputs, cache_names=cache_names,
                                     embed_blob=embed_blob, host_embed=host_embed)

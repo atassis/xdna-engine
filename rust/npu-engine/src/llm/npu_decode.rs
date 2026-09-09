@@ -121,10 +121,45 @@ fn upload_blob(arena: &FusedArena, artifact: &LlmArtifact, name: &str) -> Result
 /// dispatch. Holds the KV cache: a single instance decodes ONE generation (`pos` only ever
 /// increases). Call [`reset`](NpuDecodeStep::reset) before starting another generation on the same
 /// instance -- a fresh [`NpuDecodeStep::new`] is just as correct and costs the weight reload.
+/// One rung of the resident window ladder: an ELF built for `window` attention positions over the
+/// SHARED KV allocation, bound to the one arena every other rung uses.
+///
+/// The arms differ only in how much of the cache attention READS per token; what the cache HOLDS is
+/// the allocation, identical in every arm, which is what lets them share an arena and makes a
+/// crossing free of any cache re-layout.
+struct Arm {
+    /// The artifact's own `dims.S`, read from its meta -- never parsed from a directory name.
+    window: usize,
+    artifact: LlmArtifact,
+    res: ElfResident,
+}
+
+/// The narrowest rung that can hold `pos`'s history, or the widest when none can.
+///
+/// Split out of `step` because it is the ladder's whole correctness surface while the rest of
+/// `step` needs a device: an off-by-one here does not crash, it attends a window one position
+/// short and returns a plausible wrong token. `arms` is sorted ascending, so the first match is
+/// the narrowest. Falling back to the widest is a floor, not a policy -- the generator's own
+/// `max_context` bound already refuses a position past the top rung.
+fn rung_index<I: Iterator<Item = usize>>(windows: I, pos: usize) -> Option<usize> {
+    let need = pos + 1;
+    let mut widest = None;
+    for (i, w) in windows.enumerate() {
+        if w >= need {
+            return Some(i);
+        }
+        widest = Some(i);
+    }
+    widest
+}
+
 pub struct NpuDecodeStep {
     artifact: LlmArtifact,
     arena: Rc<FusedArena>,
-    res: ElfResident,
+    /// Ascending by `window`, NEVER empty: index 0 is the narrowest rung, the last is the widest
+    /// and is therefore the context this instance can hold. A scenario naming no ladder gets
+    /// exactly one arm and every dispatch below is byte-for-byte what it was before the ladder.
+    arms: Vec<Arm>,
     embed: EmbedTable,
     /// Each declared RoPE input buffer with the base its rows are computed from, resolved at load.
     rope_writes: Vec<(BufLoc, f64)>,
@@ -239,7 +274,28 @@ impl NpuDecodeStep {
         Self::build(dev, decode_dir, Some(prefill_dir))
     }
 
+    /// Same, plus a ladder of narrower-window ELFs over the same KV allocation. Each is checked
+    /// against the primary with [`LlmArtifact::check_shared_layout_agrees`] before it is bound, so
+    /// an arm generated against a different allocation fails loud instead of corrupting weights.
+    pub fn with_ladder(
+        dev: &Rc<Device>,
+        decode_dir: &Path,
+        prefill_dir: Option<&Path>,
+        ladder_dirs: &[std::path::PathBuf],
+    ) -> Result<Self, EngineError> {
+        Self::build_with(dev, decode_dir, prefill_dir, ladder_dirs)
+    }
+
     fn build(dev: &Rc<Device>, decode_dir: &Path, prefill_dir: Option<&Path>) -> Result<Self, EngineError> {
+        Self::build_with(dev, decode_dir, prefill_dir, &[])
+    }
+
+    fn build_with(
+        dev: &Rc<Device>,
+        decode_dir: &Path,
+        prefill_dir: Option<&Path>,
+        ladder_dirs: &[std::path::PathBuf],
+    ) -> Result<Self, EngineError> {
         let artifact = LlmArtifact::load(decode_dir)?;
         // Mirrors this exact loop's writes below (`x_loc`, `rope_loc`) -- an artifact declaring a
         // third per-token input buffer would otherwise leave it unwritten every token, silently.
@@ -259,10 +315,23 @@ impl NpuDecodeStep {
             p.check_per_token_writes(&p.per_dispatch_writes())?;
         }
 
-        // One arena for both ELFs, sized to the larger of each of the three. A buffer is addressed
-        // by offset within its arena, so a larger arena is transparent to the smaller graph.
+        // Ladder arms, checked exactly as the prefill half is: they share the arena, so a
+        // disagreement on any offset would let one ELF overwrite another's weights or KV cache.
+        let mut arm_arts: Vec<LlmArtifact> = Vec::new();
+        for dir in ladder_dirs {
+            let a = LlmArtifact::load(dir)?;
+            artifact.check_shared_layout_agrees(&a)?;
+            a.check_per_token_writes(&a.per_dispatch_writes())?;
+            arm_arts.push(a);
+        }
+
+        // One arena for every ELF, sized to the largest of each of the three. A buffer is addressed
+        // by offset within its arena, so a larger arena is transparent to the smaller graph -- which
+        // is what lets a narrow arm, whose own scratch is smaller, run in the widest arm's arena.
         let max3 = |f: fn(&LlmArtifact) -> usize| {
-            f(&artifact).max(pre_art.as_ref().map_or(0, f))
+            f(&artifact)
+                .max(pre_art.as_ref().map_or(0, f))
+                .max(arm_arts.iter().map(f).max().unwrap_or(0))
         };
         let arena = Rc::new(
             FusedArena::new(dev, max3(|a| a.input_size), max3(|a| a.output_size), max3(|a| a.scratch_size))
@@ -330,7 +399,27 @@ impl NpuDecodeStep {
             ..provenance_extras(&artifact.decode_dir)
         };
 
-        Ok(NpuDecodeStep { artifact, arena, res, embed, rope_writes, prefill, provenance })
+        
+
+        // The primary is itself a rung -- it is the widest one unless a ladder dir names a wider.
+        let mut arms = vec![Arm { window: artifact.max_seq, artifact: artifact.clone(), res }];
+        for a in arm_arts {
+            let elf = std::fs::read(a.elf_path())
+                .map_err(|e| EngineError::Load(format!("read {}: {e}", a.elf_path().display())))?;
+            let r = dev
+                .open_elf_resident(&elf, Some(&a.kernel_name))
+                .map_err(|e| EngineError::Load(format!("open_elf_resident (arm S={}): {e}", a.max_seq)))?;
+            arena
+                .bind_resident(&r)
+                .map_err(|e| EngineError::Load(format!("bind arm S={} to the shared arena: {e}", a.max_seq)))?;
+            arms.push(Arm { window: a.max_seq, artifact: a, res: r });
+        }
+        arms.sort_by_key(|a| a.window);
+        arms.dedup_by_key(|a| a.window);
+
+        
+
+        Ok(NpuDecodeStep { artifact, arena, arms, embed, rope_writes, prefill, provenance })
     }
 
     /// Re-zero every KV-cache scratch buffer (`meta.json`'s `cache_buffers`) and sync. Call before
@@ -377,7 +466,9 @@ impl DecodeStep for NpuDecodeStep {
     /// The artifact's own `dims.S`. This is what makes the generator's bound real: without it the
     /// trait default is `None` and the decode loop walks `pos` past the end of the KV cache.
     fn max_context(&self) -> Option<usize> {
-        Some(self.artifact.max_seq)
+        // The WIDEST rung, not the primary: with a ladder the primary may be a narrow arm and the
+        // context this instance can hold is whatever the widest one attends.
+        self.arms.last().map(|a| a.window)
     }
 
     /// Zero every KV cache buffer. The inherent `reset` already did this; wiring it through the
@@ -455,29 +546,39 @@ impl DecodeStep for NpuDecodeStep {
         // `kv_off` is "addr"-kind (element-unit BD offset, no shift); `sm_mask` is "core"-kind and
         // the firmware's UPDATE_REG convention requires the host to pre-shift it left by 2 bits
         // (matches `asr::whisper_decoder::FusedDecoder::dispatch_resident`).
-        //
+        // Pick the NARROWEST rung whose window can hold this position's history. The window is a
+        // build-time constant per arm, so following `n_past` means selecting an arm, not resizing
+        // one. Crossing a bucket is free -- measured -8.3 us (-0.07%) on this dispatch path,
+        // because the fused decode dispatches a full ELF and each arm is its own hardware context
+        // with no xclbin path cache in between.
+        let idx = rung_index(self.arms.iter().map(|a| a.window), pos)
+            .ok_or_else(|| EngineError::Load("decode instance has no arms".to_string()))?;
+        let arm = &self.arms[idx];
+
         // `crate::llm::kv_layout::kv_off` is the single owner of this formula -- see its module
-        // doc. At `kv_block == max_seq` (every artifact built before the KV cache was blocked)
-        // this is exactly `pos * head_dim`, the formula this line used to spell out directly.
+        // doc. At `kv_block == max_seq` this is exactly `pos * head_dim`, the formula this line
+        // used to spell out directly. Parameterised by the ARM's own artifact, not the primary's:
+        // the arms share a cache layout today, and reading the primary's would be a silent bug the
+        // day one of them does not.
         let kv_val = crate::llm::kv_layout::kv_off(
-            pos, self.artifact.kv_block, self.artifact.head_dim, self.artifact.kv_heads,
+            pos, arm.artifact.kv_block, arm.artifact.head_dim, arm.artifact.kv_heads,
         ) as u32;
-        self.res
-            .write_scratchpad(self.artifact.kv_off.byte_offset, &kv_val.to_le_bytes())
+        arm.res
+            .write_scratchpad(arm.artifact.kv_off.byte_offset, &kv_val.to_le_bytes())
             .map_err(|e| EngineError::Device(format!("write kv_off scratchpad: {e}")))?;
-        let sm = self.artifact.sm_mask.ok_or_else(|| {
+        let sm = arm.artifact.sm_mask.ok_or_else(|| {
             EngineError::Load("decode artifact declares no scratchpad mask_param".to_string())
         })?;
         let sm_raw = (pos + 1) as u32;
         let sm_val = if sm.core { sm_raw << 2 } else { sm_raw };
-        self.res
+        arm.res
             .write_scratchpad(sm.byte_offset, &sm_val.to_le_bytes())
             .map_err(|e| EngineError::Device(format!("write sm_mask scratchpad: {e}")))?;
 
         // Unconditional every token -- see the module doc. No arm here may skip a step "because
         // nothing changed"; that branch is exactly the defect this mirrors away from.
         self.arena.sync_input().map_err(|e| EngineError::Device(format!("sync input: {e}")))?;
-        self.res.dispatch().map_err(|e| EngineError::Device(format!("resident dispatch: {e}")))?;
+        arm.res.dispatch().map_err(|e| EngineError::Device(format!("resident dispatch: {e}")))?;
         self.arena.sync_from_device().map_err(|e| EngineError::Device(format!("sync output: {e}")))?;
 
         let out_name = self.artifact.output_name()?;
@@ -494,6 +595,43 @@ impl DecodeStep for NpuDecodeStep {
 
 #[cfg(test)]
 mod tests {
+    use super::rung_index;
+
+    /// The ladder must pick the NARROWEST rung that still holds the history, and the boundary is
+    /// `pos + 1` positions, not `pos`: at pos 255 the cache holds 256 entries and a 256-window arm
+    /// is exactly big enough. Off by one here returns a plausible wrong token rather than failing.
+    #[test]
+    fn a_rung_is_chosen_by_positions_held_not_by_position_index() {
+        let ladder = [256usize, 512, 1024, 1536, 2048, 4096];
+        let pick = |pos| ladder[rung_index(ladder.iter().copied(), pos).unwrap()];
+        assert_eq!(pick(0), 256, "the first token needs one position, so the narrowest rung");
+        assert_eq!(pick(254), 256);
+        assert_eq!(pick(255), 256, "pos 255 holds 256 positions -- still fits the 256 rung");
+        assert_eq!(pick(256), 512, "pos 256 holds 257 -- one past, so the next rung up");
+        assert_eq!(pick(511), 512);
+        assert_eq!(pick(512), 1024);
+        assert_eq!(pick(4095), 4096);
+    }
+
+    /// Past the top rung the selector floors at the widest rather than failing: the generator's
+    /// `max_context` bound is what refuses an out-of-range position, and two checks disagreeing
+    /// about the same limit is how one of them ends up wrong.
+    #[test]
+    fn past_the_top_rung_it_floors_at_the_widest() {
+        let ladder = [256usize, 512];
+        assert_eq!(rung_index(ladder.iter().copied(), 9_999), Some(1));
+        assert_eq!(rung_index(std::iter::empty(), 0), None, "no arms is an error, not a default");
+    }
+
+    /// A single-arm instance -- every scenario that names no ladder -- must select that arm at
+    /// every position, so the dispatch path is unchanged for them.
+    #[test]
+    fn one_arm_is_always_chosen() {
+        for pos in [0usize, 1, 2047, 100_000] {
+            assert_eq!(rung_index(std::iter::once(2048), pos), Some(0));
+        }
+    }
+
     use super::*;
     use ndarray::Array2;
 

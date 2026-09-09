@@ -226,6 +226,18 @@ pub struct Artifacts {
     /// pair fails loud rather than corrupting the weights.
     #[serde(default)]
     pub prefill: String,
+    /// `kind = "generate"`, optional: additional decode ELFs for the SAME model at NARROWER
+    /// attention windows over the SAME KV allocation -- a resident window ladder. Each is bound to
+    /// the one arena `decode` already owns, so N arms cost N hardware contexts and no extra weight
+    /// memory; the engine picks the narrowest arm whose window covers the current position, and
+    /// the padded window stops being paid at every position below the top rung.
+    ///
+    /// Each arm's window is read from its own `meta.json` `dims.S`, never from its path, and every
+    /// arm's shared arena offsets are checked against `decode`'s at load -- so an arm generated
+    /// against a different allocation fails loud rather than corrupting the cache. Empty (the
+    /// default) is exactly the single-arm rail.
+    #[serde(default)]
+    pub decode_ladder: Vec<String>,
     /// `kind = "generate"` only: the checkpoint's directory (`tokenizer.json`,
     /// `tokenizer_config.json`, `generation_config.json`), read through `llm::ModelConfig::load`.
     /// Separate from `tokenizer` above, which every other scenario points at a single
@@ -361,6 +373,30 @@ manifest = "artifacts/pyannote/diarize.json"
             assert!(!p.starts_with('/'), "artifact path must be root-relative, got {p:?}");
             assert!(p.starts_with("artifacts/qwen3-0.6b/"), "unexpected artifact path {p:?}");
         }
+    }
+
+    /// The ladder is opt-in and its ABSENCE must stay the single-arm rail: every scenario shipped
+    /// before it parses unchanged, with no arms. Asserted on an inline scenario rather than a
+    /// shipped file, so it does not pin that file's current content.
+    #[test]
+    fn a_scenario_naming_no_ladder_gets_no_arms() {
+        let c = ScenarioConfig::from_str(
+            "[scenario]\nkind = \"generate\"\nname = \"m\"\n[artifacts]\ndecode = \"d\"\nweights = \"w\"\ntokenizer_dir = \"t\"\n",
+        )
+        .expect("a scenario with no decode_ladder must parse");
+        assert!(c.artifacts.decode_ladder.is_empty());
+    }
+
+    /// And when it IS named, the arms arrive in declaration order. Order is not load-bearing --
+    /// the engine sorts by each artifact's own `dims.S` -- but a config that silently dropped
+    /// entries would look identical to one that named none.
+    #[test]
+    fn a_declared_ladder_parses_every_arm() {
+        let c = ScenarioConfig::from_str(
+            "[scenario]\nkind = \"generate\"\nname = \"m\"\n[artifacts]\ndecode = \"d\"\nweights = \"w\"\ntokenizer_dir = \"t\"\ndecode_ladder = [\"l/w256\", \"l/w512\", \"l/w1024\"]\n",
+        )
+        .expect("a scenario declaring decode_ladder must parse");
+        assert_eq!(c.artifacts.decode_ladder, ["l/w256", "l/w512", "l/w1024"]);
     }
 
     #[test]
