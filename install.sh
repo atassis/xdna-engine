@@ -592,6 +592,28 @@ print(json.load(open(sys.argv[1])).get("toolchain",{}).get("hash",""))' "$meta" 
 done < <(grep -oP '^\s*scenario\s*=\s*"\K[^"]+' "$ENGINE_CONFIG")
 ok "Staged artifacts agree with the staged pin ($staged_pin)."
 
+# ---- ...and so must the KERNELS, which are the half this script thought it had covered ----
+# Section 4's comment says kernels and toolchain.lock are copied together so they cannot come from
+# different pins. They are copied together, but their PINS are not the same thing: the lock is
+# copied from the checkout while the stamp comes from whatever pin the kernel BUILD DIR was built
+# at, so a re-pin without a kernel rebuild publishes 3a786d9c7793 beside a lock saying 83a1c34f3362
+# and nothing here notices. npu-parakeet::preflight -> kernel_registry::check_toolchain_freshness
+# then refuses at first ASR request.
+#
+# WARN, not die: unlike an LLM artifact, the fix is a long xclbin rebuild into a SHARED sandbox that
+# a re-pin purges, so failing the install would strand an operator who cannot run it right now. The
+# LLM half is refused above because rebuilding that is minutes and touches nothing shared.
+kern_stamp=$(cat "$ENGINE_KERNELS/.toolchain-stamp" 2>/dev/null || true)
+if [ -n "$kern_stamp" ] && [ "$kern_stamp" != "$staged_pin" ]; then
+  warn "published kernels are stamped $kern_stamp but the staged lock is $staged_pin."
+  warn "  ASR/encoder models WILL REFUSE to load until the kernels are rebuilt at the current pin:"
+  warn "    scripts/build_parakeet_kernels.sh   (and build_parakeet_modal_kernels.sh if the modal"
+  warn "    resident is in use). NOTE it purges the shared whole_array/build on a pin change."
+  warn "  LLM generate is unaffected -- it loads the decode ELF, not these xclbins."
+else
+  ok "Published kernels agree with the staged pin ($staged_pin)."
+fi
+
 info "Preflighting engine config: $ENGINE_CONFIG"
 [ -f "$ENGINE_CONFIG" ] || die "engine config missing: $ENGINE_CONFIG
   Create it (see the [server]/[defaults]/[[model]] example in the README), or point
