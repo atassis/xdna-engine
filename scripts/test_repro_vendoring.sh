@@ -64,16 +64,46 @@ done
 echo "   OK: custom kernels copied-forward"
 
 echo "== [5/6] build_kernels.sh against the fresh tree (reusing toolchain) =="
-bash scripts/build_kernels.sh
+# Do NOT let a partial build short-circuit step 6. build_kernels.sh now exits non-zero with a NAMED
+# list when some shapes fail rather than dying at the first one, and step 6 is the only thing in
+# this tree that asserts WHICH xclbins must exist -- so aborting here threw away the completeness
+# check to report a failure step 6 would have described precisely. The build's own failure list is
+# already on stderr; step 6 decides the verdict.
+bash scripts/build_kernels.sh || echo "   (build reported failures -- step 6 says whether any REQUIRED xclbin is affected)"
 
 echo "== [6/6] assert the encoder xclbins were produced =="
 MM=programming_examples/basic/matrix_multiplication
+# THE DECLARED SHAPE SET. This is the only place that says which xclbins must EXIST, and it is why
+# it is worth keeping wider than feels necessary: neither guard downstream can express completeness.
+# `.toolchain-stamp` is per-DIRECTORY and passes on one file being present; `kernel_manifest.json`
+# is explicitly descriptive ("cannot assert anything the directory doesn't currently contain"), so
+# regenerating it after a partial build simply adopts the smaller reality. On 2026-09-09 the
+# installed dir lost seven shapes and every guard reported OK.
+#
+# Every entry below is CURRENTLY BUILDABLE and was verified present after a from-zero run. The
+# K=768 fast tiles (64x32x96, 64x64x96) are deliberately NOT here: they overflow L1 on this
+# toolchain AND on the previous one, so listing them would paint the test permanently red for a
+# known, separate defect rather than for a regression.
 MUST=(
   programming_examples/ml/dwconv1d/build/final.xclbin
   programming_examples/ml/layernorm/build/final.xclbin
   "$MM/whole_array/build/final_512x800x3072_32x32x32_8c_silu.xclbin"
   "$MM/whole_array/build/final_512x3104x768_32x32x32_8c_bias.xclbin"
   programming_examples/ml/softmax400/build/final.xclbin
+  # K_aug=800 modal (Whisper-small / Parakeet, d_model 768 + the 32-row bias augment)
+  "$MM/whole_array/build/final_512x800x768_64x32x96_8c_modalsilu.xclbin"
+  "$MM/whole_array/build/final_512x800x1536_64x32x96_8c_modalsilu.xclbin"
+  "$MM/whole_array/build/final_512x800x3072_64x32x96_8c_modalsilu.xclbin"
+  "$MM/whole_array/build/final_512x800x3072_64x32x96_8c_modalid.xclbin"
+  "$MM/whole_array/build/final_512x800x3072_64x32x96_8c_modalgelu.xclbin"
+  # K_aug=1312 (Whisper-turbo, d_model 1280 + 32). ctx2.rs:1583 asserts kaug()==1312; these were
+  # absent from every build script until 2026-09-09 and vanished from the live path at a re-pin.
+  "$MM/whole_array/build/final_512x1312x1280_32x32x32_8c_modalid.xclbin"
+  "$MM/whole_array/build/final_512x1312x5120_32x32x32_8c_modalsilu.xclbin"
+  "$MM/whole_array/build/final_512x1312x5120_32x32x32_8c_modalgelu.xclbin"
+  # K=1024 modal resident (Parakeet zero-switch encoder) -- the delegated half of the build
+  "$MM/whole_array/build/final_512x1024x4096_64x32x128_8c_modalsilu.xclbin"
+  "$MM/whole_array/build/final_512x4096x1024_64x32x128_8c_modalid.xclbin"
 )
 ok=1
 for x in "${MUST[@]}"; do
