@@ -151,7 +151,12 @@ def main():
     print(f"[verify] {len(weights)} weight buffers loaded and scratch flushed to the device")
 
     # embed_tokens doubles as the tied lm-head; the host gathers the row for the current token.
-    embed = np.load(os.path.join(a.weights, "model.embed_tokens.weight.npy")).astype(np.float32)
+    # The name comes off the SPEC, like every other tensor name: `weight_prefix` is "model." on a
+    # text-only checkpoint and "model.language_model." on Gemma-4-12B, whose text stack sits beside
+    # a vision and an audio embedder. Hardcoding it made this the last single-model assumption in
+    # the harness, and it failed AFTER the graph built and 208 buffers had reached the device.
+    embed_npy = os.path.join(a.weights, f"{sp.weight_prefix}embed_tokens.weight.npy")
+    embed = np.load(embed_npy).astype(np.float32)
     scale = np.sqrt(D) if sp.embed_scale == "sqrt_d_model" else 1.0
 
     xin = c.get_buffer("x")
@@ -166,11 +171,11 @@ def main():
     # harness was the half still missing it, so a gate run here would have mis-rotated most
     # layers and presented as a device divergence.
     declared = set(md["inputs"])
-    # `kv_params` is the list form; `kv_param` is the pre-per-layer single slot every older
-    # artifact carries. Falling back keeps this harness able to gate an artifact built before the
-    # list existed.
-    kv_slots = md["scratchpad"].get("kv_params") or [{"param": md["scratchpad"]["kv_param"],
-                                                      "head_dim": HD}]
+    # ONE SLOT PER DISTINCT head_dim, from the graph metadata build_graph returns -- NOT from a
+    # meta.json, which this harness never reads: it rebuilds the graph rather than loading an
+    # artifact. `md["kv_slots"]` is [(param_name, head_dim)], the same list the generator turns into
+    # meta.json's `scratchpad.kv_params`.
+    kv_slots = md["kv_slots"]
     rope_buf = c.get_buffer("rope_global") if "rope_global" in declared else None
     rope_loc_buf = c.get_buffer("rope_local") if "rope_local" in declared else None
     out = c.get_buffer("logits")
@@ -198,8 +203,8 @@ def main():
         # ONE WRITE PER DISTINCT head_dim, off the artifact's own kv_params. `pos * head_dim` is two
         # different byte offsets under per-layer geometry, and a single write silently hands the
         # global layers the sliding layers' KV offset.
-        for slot in kv_slots:
-            params.write(slot["param"], int(pos * slot["head_dim"]))
+        for slot_name, slot_hd in kv_slots:
+            params.write(slot_name, int(pos * slot_hd))
         params.write("sm_mask", int(pos + 1))
         params.sync()
         # ONE dispatch per position. The duplicate that used to sit here worked around
