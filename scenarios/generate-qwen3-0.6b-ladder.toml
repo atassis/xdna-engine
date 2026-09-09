@@ -18,11 +18,11 @@ name = "qwen3-0.6b-ladder"
 # Built with KV_ALLOC=4096 LADDER_SCRATCH_ORDER=1; the ordering flag is what pins the persistent
 # buffers to the arena front so the arms agree at all.
 [artifacts]
-decode = "artifacts/qwen3-0.6b/ladder4096/w4096"
+decode = "artifacts/qwen3-0.6b/fusedladder/w4096"
 decode_ladder = [
-    "artifacts/qwen3-0.6b/ladder4096/w1024",
-    "artifacts/qwen3-0.6b/ladder4096/w2048",
-    "artifacts/qwen3-0.6b/ladder4096/w3072",
+    "artifacts/qwen3-0.6b/fusedladder/w1024",
+    "artifacts/qwen3-0.6b/fusedladder/w2048",
+    "artifacts/qwen3-0.6b/fusedladder/w3072",
 ]
 weights = "artifacts/qwen3-0.6b/weights"
 tokenizer_dir = "artifacts/qwen3-0.6b/tokenizer"
