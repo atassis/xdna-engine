@@ -172,6 +172,16 @@ def main():
     margins = ref.get("margins")
     hf_ids = ref.get("hf_f32_gen_ids")
     steps = a.steps if a.steps is not None else len(gen_ids)
+    # A SMOKE RUN HAS NO gen_ids TO SIZE ITSELF FROM, so this used to come out 0: the harness built
+    # the graph, loaded every weight, dispatched nothing, printed "generated ids : []" and exited 0.
+    # Measured 2026-09-10: a full-depth Gemma-4 run cost 3 minutes and 11.3 GB to produce exactly
+    # that, and it reads as a pass at a glance. Default it instead, and refuse zero outright --
+    # a run that generates nothing is never what the caller meant.
+    if a.smoke_prompt and a.steps is None:
+        steps = 8
+    if steps <= 0:
+        raise SystemExit(f"[verify] steps resolved to {steps}: nothing would be generated. Pass "
+                         f"--steps N, or use a --ref whose gen_ids are non-empty.")
 
     sp, fused, weights, md = build_graph(a.spec, a.weights, a.layers, a.max_seq)
     NL, S = md["NL"], md["S"]
