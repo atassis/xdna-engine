@@ -636,6 +636,53 @@ def gemv(M, K, ctx, **kw):
 # here rather than emit a design that lies.
 ADDRESS_PATCH_MAX_OFFSET = 1 << 32
 
+_ARGPLUS64 = None
+
+
+def toolchain_carries_argplus64():
+    """Does the toolchain that will COMPILE this design carry the 64-bit arg_plus widening?
+
+    PROBED, not read off a source file or a pin string, and that choice is the lesson of
+    2026-09-09: the shared instance spent an hour with a hand-patched `src/` whose binaries had
+    been rebuilt out from under it, so source and binaries disagreed and a check reading either
+    one alone would have been confidently wrong. The only authority is the binary that runs.
+
+    Feeds `aie-translate` an `address_patch` with an i64 arg_plus. The narrowed dialect rejects it
+    at verification ("operand #0 must be 32-bit signless integer"); the widened one accepts it.
+
+    UNKNOWN COUNTS AS NARROW. Guessing wrong in that direction refuses a design that would have
+    been fine, which is a build error someone reads. Guessing wrong the other way emits a design
+    that builds, runs and writes to the wrong address in silence -- the failure this whole guard
+    exists for.
+    """
+    global _ARGPLUS64
+    if _ARGPLUS64 is not None:
+        return _ARGPLUS64
+    inst = os.environ.get("MLIR_AIE_INSTANCE")
+    exe = os.path.join(inst, "bin", "aie-translate") if inst else None
+    if not exe or not os.path.exists(exe):
+        _ARGPLUS64 = False
+        return _ARGPLUS64
+    probe = ("module { aie.device(npu2) { aie.runtime_sequence(%a0: memref<8xi32>) {\n"
+             "  %off = arith.constant 5000000000 : i64\n"
+             "  aiex.npu.address_patch(%off : i64) {addr = 74560 : ui32, arg_idx = 0 : i32}\n"
+             "} } }\n")
+    import subprocess
+    import tempfile
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".mlir", delete=False) as fh:
+            fh.write(probe)
+            path = fh.name
+        try:
+            r = subprocess.run([exe, "--aie-npu-to-binary", "-aie-output-binary=false", path],
+                               capture_output=True, text=True, timeout=60)
+            _ARGPLUS64 = r.returncode == 0
+        finally:
+            os.unlink(path)
+    except Exception:
+        _ARGPLUS64 = False
+    return _ARGPLUS64
+
 
 def runlist_buffer_names(entries):
     """Every buffer an OperatorSequence runlist slice touches, as bare names.
@@ -655,37 +702,58 @@ def runlist_buffer_names(entries):
 def check_arena_offsets_are_addressable(seq, names):
     """Refuse a design whose buffers cannot be addressed by a 32-bit arg_plus.
 
+    SKIPPED ENTIRELY when the toolchain carries the 64-bit widening -- the cap is a property of the
+    COMPILER, not of the hardware (aie-rt declares `u64 argplus` and the TXN op has the high word),
+    so a toolchain that emits both words has no boundary to violate. Probed, never assumed: see
+    toolchain_carries_argplus64().
+
     CATCHES the total failure: a buffer whose START is at or past 2^32 gets a wrapped BD offset and
     is never written -- measured as exactly-zero residual buffers from layer 8 (12 layers, bf16) and
     layer 26 (48 layers, int4).
 
-    DOES NOT catch the partial case, and that gap is known rather than assumed. At 6 layers every
-    buffer starts below 2^32 and this check passes, yet the lm-head's output still comes back with
-    2169 elements unwritten -- there `W_head` starts under the boundary and STREAMS across it. So a
-    transfer crossing 2^32 is not always safe either, and the sufficient condition is narrower than
-    this test. Until that is measured, treat a pass here as necessary, not sufficient.
+    DOES NOT catch the PARTIAL case, and that case is genuinely UNRESOLVED rather than merely
+    uncaught. Two measurements on the same mechanism point opposite ways:
+
+      * 5 layers: `W_head` runs 2.41 -> 4.12 GiB, crosses 2^32, and the design is CLEAN on device.
+      * 6 layers: every buffer STARTS below 2^32, this check passes, and the lm-head still comes
+        back with 2169 elements unwritten in 16 runs.
+
+    So "a transfer crossing the boundary is safe" and "crossing it is fatal" are each refuted by one
+    of the two, and no rule here separates them. An `off + len` test would reject the 5-layer design
+    that works; the START test passes the 6-layer design that does not. Both readings are recorded
+    because picking one would be a guess wearing a measurement's clothes. Treat a pass as NECESSARY,
+    NOT SUFFICIENT, and prefer DECODE_SEGMENTS, which removes the question by construction: with
+    every arena under 4 GiB no buffer can start or span past the boundary at all.
     """
+    if toolchain_carries_argplus64():
+        return
     bad = []
     for n in names:
         try:
             arena, off, ln = seq.get_layout_for_buffer(n)
         except Exception:
             continue
-        # The START offset is what gets patched into the BD; the DMA then streams `len` bytes from
-        # there and crossing the boundary mid-transfer is fine. Measured: at 5 layers `W_head`
-        # begins at 2.41 GiB and runs to 4.12 GiB, past 2^32, and that design is CLEAN on device.
-        # An `off + len` test would reject it -- a check that rejects a working configuration is
-        # worse than no check.
+        # START offset only, because that is the value the BD is patched with. This deliberately
+        # does NOT test `off + len`: the 5-layer W_head spans 2.41 -> 4.12 GiB, across 2^32, and is
+        # clean on device, so an end-of-buffer test would reject a working configuration. That is a
+        # reason to keep the test narrow, NOT evidence that crossing is safe -- the 6-layer lm-head
+        # crosses too and loses 2169 elements. See the docstring: the partial case is open.
         if off >= ADDRESS_PATCH_MAX_OFFSET:
             bad.append((n, arena, off, ln))
     if not bad:
         return
     if os.environ.get("ALLOW_UNADDRESSABLE_OFFSETS") == "1":
-        # Escape hatch for testing a TOOLCHAIN that no longer has the I32 cap. The guard encodes an
-        # mlir-aie limitation, not a hardware one, so a build against a fixed aie-translate must be
-        # able to get past it -- otherwise the guard would prevent proving its own obsolescence.
-        print(f"[gen] {len(bad)} buffer(s) past 4 GiB, allowed by ALLOW_UNADDRESSABLE_OFFSETS=1 "
-              f"(first {bad[0][0]!r} at {bad[0][2]:,})")
+        # Escape hatch, now NARROWER than it was: a fixed toolchain no longer needs it, because
+        # toolchain_carries_argplus64() detects that case and returns above. What is left is the
+        # case where the probe could not run (no MLIR_AIE_INSTANCE) but the operator knows the
+        # toolchain is fixed. Anything else and this is an override of a measured failure, so it
+        # says so at the volume the risk deserves.
+        print(f"[gen] WARNING: {len(bad)} buffer(s) at or past 4 GiB, allowed by "
+              f"ALLOW_UNADDRESSABLE_OFFSETS=1 (first {bad[0][0]!r} at {bad[0][2]:,}). The probe "
+              f"says this toolchain NARROWS arg_plus to 32 bits, so these BDs are expected to be "
+              f"patched with a wrapped offset and write to the wrong place SILENTLY. Verify the "
+              f"emitted npu_insts DDR_PATCH high words before trusting any result from this build.",
+              file=sys.stderr)
         return
     bad.sort(key=lambda b: b[2])
     first = bad[0]
