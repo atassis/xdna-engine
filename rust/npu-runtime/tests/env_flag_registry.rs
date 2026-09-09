@@ -1,28 +1,23 @@
 //! The registry has to stay true, and only a test can keep it that way.
 //!
-//! `env_flags::FLAGS` records a `file:line` per flag. A line number is a hanging number -- it
-//! carries no way to verify itself -- and this one rotted within hours of being written: the
-//! 2026-09-08 CLI merge moved `npu-cli/src/main.rs`'s body into `run()` and added a subcommand,
-//! shifting every line below -- and **5 of 95 `site` fields immediately stopped pointing at their
-//! flag** (`NPU_CONFIG`, `NPU_QUIET`, `XDNA_ENGINE_ROOT`, `XDG_DATA_HOME`, `NPU_ASR_MAX_SPAN_S`).
-//! Nothing noticed, because nothing was looking.
-//!
-//! So: assert every entry still points at its flag. The check is deliberately fuzzy about the exact
-//! line (edits above a site shift it by a few) and strict about the file and the name.
+//! `env_flags::FLAGS` records the FILE that reads each flag, and this test asserts it still does.
 //!
 //! It matches the name as a QUOTED STRING LITERAL, not as a bare substring, and that detail is the
 //! whole test. The first version searched for the bare name and passed against a deliberately wrong
-//! line, because `main.rs` carries a doc comment reading "`--config` beats `$NPU_CONFIG` beats the
-//! default path" six lines away -- prose about the flag satisfied a check meant to find the read of
-//! it. A read is spelled `env::var("NAME")`, `var_os("NAME")` or a closure literal
-//! `resident_on("NAME")`; all three quote it, and comments generally do not.
+//! site, because `main.rs` carries a doc comment reading "`--config` beats `$NPU_CONFIG` beats the
+//! default path" -- prose about the flag satisfying a check meant to find the read of it. A read is
+//! spelled `env::var("NAME")`, `var_os("NAME")` or a closure literal `resident_on("NAME")`; all
+//! three quote it, and comments generally do not.
+//!
+//! `site` USED TO carry a `:line`, and the line was checked with a +-6 tolerance. That number could
+//! not be kept true: it rotted within hours of being written (the 2026-09-08 CLI merge moved
+//! `main.rs`'s body into `run()` and five entries immediately stopped pointing at their flag), and
+//! then failed this gate three more times on 2026-09-09 for edits that moved a function without
+//! touching a flag -- four failures, zero real defects. It was a second guard for a hole the quoted
+//! literal had already closed, so it is gone rather than tolerated: the invariant worth asserting is
+//! "this file reads this flag", and `grep` finds the line in the time it takes to read it.
 
 use npu_runtime::env_flags::FLAGS;
-
-/// How far from the recorded line the name may have drifted before this is a stale entry rather
-/// than ordinary churn. Wide enough that unrelated edits nearby do not fail the build, narrow
-/// enough that a moved flag does.
-const DRIFT: usize = 6;
 
 #[test]
 fn every_registry_site_still_points_at_its_flag() {
@@ -32,34 +27,21 @@ fn every_registry_site_still_points_at_its_flag() {
 
     let mut stale = Vec::new();
     for f in FLAGS {
-        let Some((rel, line)) = f.site.rsplit_once(':') else {
-            stale.push(format!("{}: site {:?} is not file:line", f.name, f.site));
-            continue;
-        };
-        let Ok(line) = line.parse::<usize>() else {
-            stale.push(format!("{}: site {:?} has no line number", f.name, f.site));
-            continue;
-        };
+        let rel = f.site;
         let path = rust_root.join(rel);
         let Ok(text) = std::fs::read_to_string(&path) else {
             stale.push(format!("{}: {} does not exist", f.name, path.display()));
             continue;
         };
-        let lines: Vec<&str> = text.lines().collect();
-        let lo = line.saturating_sub(DRIFT + 1);
-        let hi = (line + DRIFT).min(lines.len());
         let quoted = format!("\"{}\"", f.name);
-        if !lines[lo..hi].iter().any(|l| l.contains(&quoted)) {
-            stale.push(format!(
-                "{}: {} line {} no longer mentions it (searched +-{} lines)",
-                f.name, rel, line, DRIFT
-            ));
+        if !text.lines().any(|l| l.contains(&quoted)) {
+            stale.push(format!("{}: {} no longer reads it", f.name, rel));
         }
     }
 
     assert!(
         stale.is_empty(),
-        "registry entries have gone stale -- update `site` in env_flags.rs:\n  {}",
+        "registry entries name a file that no longer reads their flag -- fix `site` in env_flags.rs:\n  {}",
         stale.join("\n  ")
     );
 }
@@ -73,7 +55,7 @@ fn every_registry_entry_names_a_file_that_reads_it() {
     let rust_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
     let mut orphaned = Vec::new();
     for f in FLAGS {
-        let Some((rel, _)) = f.site.rsplit_once(':') else { continue };
+        let rel = f.site;
         if let Ok(text) = std::fs::read_to_string(rust_root.join(rel)) {
             if !text.contains(&format!("\"{}\"", f.name)) {
                 orphaned.push(format!("{} is not read anywhere in {}", f.name, rel));
