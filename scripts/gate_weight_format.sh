@@ -33,6 +33,19 @@ SPEC="${1:?usage: gate_weight_format.sh <spec> <corpus> <out-dir> [ARM ...]}"
 CORPUS="${2:?corpus}"; OUT="${3:?out-dir}"; shift 3
 ARMS=("$@"); [ ${#ARMS[@]} -gt 0 ] || ARMS=("QUANT_MLP_DTYPE=bf16")
 VENV="${VENV_IRON:-$REPO/.venv-iron}"
+# bench_llm_decode.py drives the same graph the generator builds, so it needs the SAME toolchain
+# environment build_llm_decode.sh assembles -- without it the harness dies at "[newstack_compat]
+# resolved aie is not the pinned instance" before it reaches the device. run_llm_perplexity.sh
+# sets this up for itself; the bench is invoked directly, so it is set up here once for both.
+. "$REPO/scripts/amd_paths.sh"
+IRON="${IRON:-$IRON_DIR}"
+INST="$("$REPO/scripts/toolchain_up.sh")"
+export PYTHONPATH="$INST/python:$IRON${PYTHONPATH:+:$PYTHONPATH}"
+export AIECC_PATH="${AIECC_PATH:-$INST/bin/aiecc}"
+export PEANO_INSTALL_DIR="${PEANO_INSTALL_DIR:-$VENV/lib/python3.14/site-packages/llvm-aie}"
+export MLIR_AIE_INSTANCE="$INST"
+export PATH="$VENV/bin:$VENV/cc-shim:$AIEBU_ASM_DIR:$PATH"
+export CUDA_VISIBLE_DEVICES=""
 POS="${GATE_POSITIONS:-1 64 256}"; REPS="${GATE_REPS:-30}"
 TOK="${GATE_TOKENS:-2000}"; PASSES="${GATE_PASSES:-2}"
 mkdir -p "$OUT"
