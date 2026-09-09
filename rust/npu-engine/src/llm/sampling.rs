@@ -198,38 +198,67 @@ fn apply_penalties(work: &mut [f64], view: &LogitView, history: &[u32], cfg: &Sa
     skipped
 }
 
+/// Descending by value, ascending by rank on a tie. A TOTAL order, which is what lets the filters
+/// below use selection instead of a full sort: `select_nth_unstable_by` is only well-defined for a
+/// consistent comparator, and `partial_cmp` is not one (it has no answer for NaN). Ties break
+/// toward the lower rank, matching [`argmax`]'s first-wins convention so the two agree at `k == 1`.
+fn by_desc(v: &[f64], a: usize, b: usize) -> std::cmp::Ordering {
+    v[b].total_cmp(&v[a]).then(a.cmp(&b))
+}
+
 /// Keep only the `k` largest logits (by rank); mask the rest to `-inf`. `k == 0` disables the filter.
+///
+/// Selection, not a sort: the caller wants the `k` survivors as a SET, and their order is never
+/// read -- `filter_top_p` re-derives its own ordering and the inverse-CDF draw walks ranks. So this
+/// is O(V) via `select_nth_unstable_by` rather than O(V log V), which at Qwen3's V = 151936 and
+/// k = 20 is the difference that made host sampling cost 2.7 ms/token.
 fn filter_top_k(logits: &mut [f64], k: usize) {
     if k == 0 || k >= logits.len() {
         return;
     }
     let mut idx: Vec<usize> = (0..logits.len()).collect();
-    idx.sort_unstable_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap());
-    for &i in &idx[k..] {
+    let (_, _, tail) = idx.select_nth_unstable_by(k - 1, |&a, &b| by_desc(logits, a, b));
+    for &i in &*tail {
         logits[i] = f64::NEG_INFINITY;
     }
 }
 
 /// Nucleus filter: keep the smallest prefix (by descending probability) whose cumulative mass is
 /// `>= top_p`; mask the rest to `-inf`. `top_p >= 1.0` disables the filter.
+///
+/// Runs over the FINITE entries only, which is exact rather than an approximation: `softmax_f64`
+/// maps a `-inf` logit to exactly 0.0 and normalises over the same denominator either way, so a
+/// masked entry cannot change a surviving entry's probability, and it sorts last with 0 mass so it
+/// cannot fall inside the nucleus. When `filter_top_k` ran first that leaves `k` entries here
+/// instead of `V`, which is what removes the second full-vocabulary sort.
 fn filter_top_p(logits: &mut [f64], top_p: f64) {
     if top_p >= 1.0 {
         return;
     }
-    let probs = softmax_f64(logits);
-    let mut idx: Vec<usize> = (0..logits.len()).collect();
-    idx.sort_unstable_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
+    let idx: Vec<usize> = (0..logits.len()).filter(|&i| logits[i].is_finite()).collect();
+    if idx.is_empty() {
+        return;
+    }
+    // Softmax over the survivors, which is the same arithmetic `softmax_f64` would do over the
+    // whole vocabulary: a `-inf` entry contributes exactly 0 to both the numerator and the sum, so
+    // it moves no surviving probability, and it can never enter the nucleus at 0 mass. Doing it
+    // here rather than over all V avoids materialising a V-length f64 vector per token.
+    let max = idx.iter().map(|&i| logits[i]).fold(f64::NEG_INFINITY, f64::max);
+    let exp: Vec<f64> = idx.iter().map(|&i| (logits[i] - max).exp()).collect();
+    let sum: f64 = exp.iter().sum();
+    let mut ord: Vec<usize> = (0..idx.len()).collect();
+    ord.sort_unstable_by(|&a, &b| exp[b].total_cmp(&exp[a]).then(idx[a].cmp(&idx[b])));
     let mut cum = 0.0f64;
-    let mut cutoff = idx.len();
-    for (pos, &i) in idx.iter().enumerate() {
-        cum += probs[i];
+    let mut cutoff = ord.len();
+    for (pos, &r) in ord.iter().enumerate() {
+        cum += exp[r] / sum;
         if cum >= top_p {
             cutoff = pos + 1;
             break;
         }
     }
-    for &i in &idx[cutoff..] {
-        logits[i] = f64::NEG_INFINITY;
+    for &r in &ord[cutoff..] {
+        logits[idx[r]] = f64::NEG_INFINITY;
     }
 }
 
