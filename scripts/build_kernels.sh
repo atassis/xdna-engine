@@ -93,7 +93,11 @@ echo "== layernorm [400x768] =="
 # aggregate rel-L2, not an elementwise atol). Deciding between re-gating the probe and restoring the
 # older design is open -- the step is here because the SCRIPT ABORTING is what starved the K=768
 # family, and that part is fixed.
-make -C $PE/ml/norm NPU2=1 op=layer sequence_length=400 embedding_dim=768
+# -f Makefile.norm: ours, identical to upstream's except it uses jit_xclbin rather than
+# jit_xclbin_elf. Upstream's grouped target always passes --elf-path, whose aiecc edge shells
+# out to aiebu-asm -- present only in the XRT-src checkout -- so the stock Makefile makes this
+# step unbuildable from a bare clone of this repo, for an elf nothing downstream reads.
+make -C $PE/ml/norm -f Makefile.norm NPU2=1 op=layer sequence_length=400 embedding_dim=768
 cp $PE/ml/norm/build/final.xclbin $PE/ml/layernorm/build/final.xclbin
 cp $PE/ml/norm/build/insts.bin    $PE/ml/layernorm/build/insts.bin
 

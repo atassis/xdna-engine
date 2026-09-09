@@ -151,6 +151,10 @@ sync_cp "$RB/m_stationary/Makefile.mstatln"         "$MM/whole_array/Makefile.ms
 # ctxLN — encoder LayerNorm on the NPU (Step D, internal notes): f32 two-pass kernel + design
 sync_cp "$AK/ln-2pass/ln_2pass.cc"     "$K/ln_2pass.cc"
 sync_cp "$RB/ctx_ln/ctx_ln_iron.py"       "$PE/ml/layernorm/ctx_ln_iron.py"
+# Our elf-free build of upstream's ml/norm. Upstream's own Makefile always emits an
+# insts.elf via aiebu-asm, which lives only in the XRT-src checkout, so a bare clone of
+# this repo cannot build the encoder LayerNorm at all. See Makefile.norm's header.
+sync_cp "$RB/ctx_ln/Makefile.norm"        "$PE/ml/norm/Makefile.norm"
 sync_cp "$RB/ctx_ln/Makefile.ctxln"       "$PE/ml/layernorm/Makefile.ctxln"
 # device-side f32->bf16 cast (resident-rails seam primitive)
 sync_cp "$AK/cast-f32-bf16/cast_f32_bf16.cc" "$K/cast_f32_bf16.cc"

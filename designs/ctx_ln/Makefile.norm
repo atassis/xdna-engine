@@ -1,0 +1,46 @@
+##===- Makefile.norm ------------------------------------------------------===##
+#
+# Our build of upstream's ml/norm example, differing from its Makefile in ONE way:
+# it uses jit_xclbin, not jit_xclbin_elf.
+#
+# WHY. Upstream's `all` is `xclbin insts elf`, and jit_xclbin_elf is a GROUPED target
+# (`$(1) $(2) $(3) &:`) whose single recipe always passes --elf-path -- so naming
+# build/final.xclbin explicitly does NOT skip the elf edge. That edge shells out to
+# `aiebu-asm`, which exists on this box only inside the XRT-src checkout, so a build
+# from a bare clone of this repo dies with "tool 'aiebu-asm' not found in search paths
+# or PATH" on aiecc's LAST edge, after all the real work has already succeeded.
+#
+# Nothing consumes this elf. makefile-common documents it as being "for testbenches
+# that use xrt::elf + xrt::module", and build_kernels.sh copies only final.xclbin and
+# insts.bin onward. So the dependency was paid for an artifact we throw away.
+#
+# The host .exe target is dropped for the same reason: `all` pulled it in, and it needs
+# the system XRT cmake export, which is broken on CachyOS (missing static .a).
+#
+##===----------------------------------------------------------------------===##
+
+srcdir := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
+
+include ${srcdir}/../../makefile-common
+
+SHELL := /bin/bash
+
+targetname = norm
+op ?= rms
+sequence_length ?= 64
+embedding_dim ?= 4096
+
+aie_py_src = ${targetname}.py
+aieargs = -d ${devicename} -s ${sequence_length} -e ${embedding_dim} -o ${op}
+
+xclbin_target = build/final.xclbin
+insts_target  = build/insts.bin
+
+.PHONY: all
+all: ${xclbin_target} ${insts_target}
+
+$(eval $(call jit_xclbin,${xclbin_target},${insts_target},${aie_py_src},${aieargs}))
+
+.PHONY: clean
+clean:
+	rm -rf build __pycache__
