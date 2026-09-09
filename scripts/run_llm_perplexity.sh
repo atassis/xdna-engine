@@ -14,9 +14,9 @@
 # `[newstack_compat] resolved aie is not the pinned instance` without it, and every recorded run of
 # it so far was assembled by hand in a throwaway worktree.
 #
-# Device is single-tenant. Wrap the whole sequence of arms in
-# xdna-engine-private/journal/scripts/npu_lock.sh (`queue`), not each arm -- it is non-destructive
-# and waits for a free device rather than stopping anyone's service.
+# The NPU is single-tenant. Wrap the WHOLE sequence of arms in your device lock, not each arm --
+# holding it across the set is what makes the control contemporaneous, and re-acquiring per arm
+# invites another tenant in between two things you are comparing.
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WS="$(cd "$REPO/.." && pwd)"
