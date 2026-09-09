@@ -42,6 +42,7 @@ import gen_llm_decode as G  # noqa: E402
 from gen_llm_decode import (build_graph, load_weight_buffer,  # noqa: E402
                             report_artifact_freshness)
 from bench_llm_decode import rope_row  # noqa: E402
+from iron.common.kv_layout import KVLayout  # noqa: E402
 
 BF16 = ml_dtypes.bfloat16
 
@@ -157,6 +158,7 @@ def main():
         arms.append(dict(spec=spec, L=L, fmo=fmo, cols=cols, qdt=qdt, wdepth=wdepth,
                          sp=sp, c=c,
                          params=params,
+                         kv_layout=KVLayout(Hkv=sp.n_kv_heads, S=md["S"], HD=sp.head_dim, T=md["T"]),
                          xin=c.get_buffer("x"), rope_buf=c.get_buffer("rope_global"),
                          scale=scale))
     print(f"[layer-arms] {len(arms)} arms resident, dispatching at pos={a.pos}", flush=True)
@@ -166,7 +168,7 @@ def main():
             _buf[:] = np.asarray(embed[TOK] * arm["scale"], BF16).reshape(-1)
         with arm["rope_buf"].overwrite() as _buf:
             _buf[:] = rope_row(a.pos, arm["sp"].head_dim, arm["sp"].rope_theta_global).reshape(-1)
-        arm["params"].write("kv_off", int(a.pos * arm["sp"].head_dim))
+        arm["params"].write("kv_off", int(arm["kv_layout"].kv_off(a.pos)))
         arm["params"].write("sm_mask", int(a.pos + 1))
         arm["params"].sync()
         arm["c"]()

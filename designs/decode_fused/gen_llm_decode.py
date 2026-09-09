@@ -76,6 +76,7 @@ TMV_RPC = int(os.environ.get("TMV_RPC", str(TMV_RPC_DEFAULT)))
 
 import newstack_compat  # noqa: F401,E402 -- MUST precede iron imports (new-mlir-aie port shim)
 from iron.common import AIEContext  # noqa: E402
+from iron.common.kv_layout import KVLayout, derive_block_size  # noqa: E402
 from elf_dispatch_compat import OperatorSequence, load_elf  # noqa: E402
 from iron.operators.gemv.op import GEMV  # noqa: E402
 from iron.operators.gemv.quant import quantize_weight  # noqa: E402
@@ -300,7 +301,7 @@ def load_weight_buffer(buf, arr):
 
 
 
-def sequence_name(sp, NL, S, placer_flags, decode_layer_active=False):
+def sequence_name(sp, NL, S, placer_flags, decode_layer_active=False, T=None):
     """Name the fused sequence after everything that changes its graph, not just the model.
 
     IRON keys the cached artifact by this name. Every knob below produces a DIFFERENT ELF, so
@@ -319,6 +320,11 @@ def sequence_name(sp, NL, S, placer_flags, decode_layer_active=False):
         parts.append("noctx")
     if not GROUPED_K:
         parts.append("nogk")
+    # The KV cache's block size (iron.common.kv_layout). T == S (or None, pre-this-task callers)
+    # is the flat pre-blocking layout and keeps the bare name; T < S addresses the SAME cache
+    # buffers completely differently, so it must not share a name with the flat build.
+    if T is not None and T != S:
+        parts.append(f"kvt{T}")
     if GROUPED_V:
         parts.append("gv")
     if TMV_CTX and TMV_RPC != TMV_RPC_DEFAULT:
@@ -627,6 +633,54 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
     D, FF, HD = sp.d_model, sp.ffn, sp.head_dim
     Hq, Hkv, QD, KVD, VOCAB = sp.n_q_heads, sp.n_kv_heads, sp.q_dim, sp.kv_dim, sp.vocab
 
+    # KV-cache layout: [S/T, Hkv, T, HD], block-major -- see iron.common.kv_layout, the single
+    # owner of this addressing (kv-cache-layout-for-full-context task). T == S (one block)
+    # reproduces the pre-existing flat [Hkv, S, HD] layout byte-for-byte; T < S makes head_stride
+    # and block_stride INDEPENDENT of S, which is what lets a wide S address at all -- flat
+    # [Hkv,S,HD]'s per-head stride is S*HD elements, and that lands in the shim's 20-bit BD step
+    # field (32-bit address granules), capping S at ~8191 for head_dim=128 regardless of anything
+    # else in the design (see [[the-kv-window-and-the-kv-capacity-are-separable]]).
+    #
+    # T is DERIVED, not chosen -- derive_block_size picks the largest T whose strides fit the
+    # NARROWER of the shim (20-bit) and mem-tile (17-bit) step fields, because the mem-tile bound
+    # is what a later staging step needs and re-deriving T when that lands would mean re-checking
+    # every stride again. For Qwen3's shape (Hkv=8, HD=128) that is 128: at T=256 the block stride
+    # is 262144 elements = 131072 granules, ONE over the mem-tile field's 131071; at T=128 it is
+    # 65536 granules, comfortably under both fields.
+    #
+    # Only activated for the arms that can actually ADDRESS a blocked cache today: gemv's
+    # group_reuse coalesced path (GROUPED_K, batch_group>1) and tmatvec's one-head-per-column path
+    # (TMV_CTX). Any other combination stays on the flat layout -- not a regression (identical to
+    # every arm's behaviour before this task), a capability gate matching qkv_dp_why/mlp_dp_why's
+    # own convention just above. Both arms read/write the SAME buffers, so this must be ONE
+    # decision reaching every site, never re-evaluated per site -- a stale T on any one of them
+    # would silently disagree with the layout the others wrote.
+    KV_BLOCK_ELIGIBLE = GROUPED_K and TMV_CTX
+    _kv_block_env = os.environ.get("KV_BLOCK_T")
+    if _kv_block_env is not None:
+        T = int(_kv_block_env)
+        if T != S:
+            assert KV_BLOCK_ELIGIBLE, (
+                f"KV_BLOCK_T={T} forces blocking but GROUPED_K={GROUPED_K}/TMV_CTX={TMV_CTX} "
+                f"do not support it (see the blocked-tap NotImplementedError in gemv/tmatvec "
+                f"design.py) -- set GQA_GROUPED_K=1 TMV_CTX=1 or KV_BLOCK_T={S}"
+            )
+    else:
+        T = derive_block_size(HD, Hkv) if KV_BLOCK_ELIGIBLE else S
+    if T != S:
+        assert S % T == 0, (
+            f"T={T} does not divide S ({S}) -- pick an S that is a multiple of T"
+        )
+        assert (S // COLS) % T == 0, (
+            f"blocked GEMV needs each of the {COLS} columns' share of S ({S // COLS}) to be a "
+            f"whole number of blocks (T={T})"
+        )
+    kv_layout = KVLayout(Hkv=Hkv, S=S, HD=HD, T=T)
+    print(f"[gen] KV cache layout: T={T}"
+          + (" (flat [Hkv,S,HD])" if T == S else
+             f" (blocked [S/T,Hkv,T,HD], head_stride={kv_layout.head_stride}, "
+             f"block_stride={kv_layout.block_stride} elements)"))
+
     def npy(name):
         return np.load(os.path.join(weights_dir, f"{name}.npy")).astype(np.float32)
 
@@ -711,12 +765,15 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
         op_qkv_dp = QKVHeadDataParallel(D=D, HD=HD, Hq=Hq, Hkv=Hkv, max_seq=S,
                                         num_aie_columns=sp.qkv_dp_cols(COLS), epsilon=sp.eps,
                                         tile_size_input=TSI, context=ctx,
-                                        weight_depth=WEIGHT_DEPTH)
+                                        weight_depth=WEIGHT_DEPTH, kv_block_size=T)
     op_rope_q = RoPE(rows=Hq, cols=HD, angle_rows=1, context=ctx)
     op_rope_k = RoPE(rows=Hkv, cols=HD, angle_rows=1, context=ctx)
-    # KV append: deep-C scratchpad offset "kv_off" (element units = n_past*HD), constant ELF.
+    # KV append: deep-C scratchpad offset "kv_off" (element units, kv_layout.kv_off(n_past)),
+    # constant ELF. The per-head stride is kv_layout.head_stride, not a restated `S*HD` -- see
+    # iron.common.kv_layout, this formula's single owner.
     sc = dict(input_sizes=(Hkv, HD), input_strides=(HD, 1), input_offset=0,
-              output_sizes=(1, Hkv, HD), output_strides=(0, S * HD, 1), output_offset=0,
+              output_sizes=(1, Hkv, HD), output_strides=(0, kv_layout.head_stride, 1),
+              output_offset=0,
               input_buffer_size=Hkv * HD, output_buffer_size=Hkv * S * HD, num_aie_channels=1)
     op_sck = StridedCopy(**sc, output_offset_parameter="kv_off", context=ctx)
     # V stays [S][HD]. A transposed append would delete op_trv, but a SINGLE-token transposed write
@@ -745,7 +802,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
     op_rep_k = Repeat(rows=Hkv, cols=S * HD, repeat=sp.gqa_group, transfer_size=HD, context=ctx)
     op_rep_v = Repeat(rows=Hkv, cols=S * HD, repeat=sp.gqa_group, transfer_size=HD, context=ctx)
     op_scores = gemv(S, HD, ctx, num_batches=Hq,
-                     batch_group=sp.gqa_group if GROUPED_K else 1)
+                     batch_group=sp.gqa_group if GROUPED_K else 1, block_size=T)
     # Folded into n_qn when SCALE_IN_QNORM; built anyway so the A/B arm stays reachable.
     scale_in_qnorm = SCALE_IN_QNORM and sp.qk_norm
     op_scale = (None if scale_in_qnorm else
@@ -795,7 +852,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
             print(f"[gen] TMatVec rows_per_chunk {TMV_RPC} -> {rpc} (L1 fit at head_dim={HD})")
         op_ctx = TMatVec(M=HD, K=S, num_aie_columns=Hkv, num_batches=Hq,
                          batch_group=sp.gqa_group,
-                         rows_per_chunk=rpc, context=ctx)
+                         rows_per_chunk=rpc, context=ctx, block_size=T)
     else:
         op_ctx = gemv(HD, S, ctx, num_batches=Hq)
     # MLP weight-stream dtype axis (Wg/Wu/Wd -- "MLP weights" in the byte breakdown, the largest
@@ -933,8 +990,10 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
                 weights[p + "Wqkv"] = np.concatenate(parts, axis=0).reshape(-1)
             else:
                 weights[p + "Wqkv"] = np.concatenate(qkv_parts)
-        weights[p + "kc"] = np.zeros(Hkv * S * HD, BF16)
-        weights[p + "vc"] = np.zeros(Hkv * S * HD, BF16)
+        # Total size is layout-independent: kv_layout.total_elems == Hkv*S*HD whether or not the
+        # cache is blocked (T < S rearranges the SAME elements, it does not add or remove any).
+        weights[p + "kc"] = np.zeros(kv_layout.total_elems, BF16)
+        weights[p + "vc"] = np.zeros(kv_layout.total_elems, BF16)
         cache_names += [p + "kc", p + "vc"]
         ang = "rope_global" if sp.is_global(l) else "rope_local"
 
@@ -948,8 +1007,8 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
             # eligibility precondition); `n_pf` stays separate, the MLP half's own argument.
             weights[p + "norms"] = np.concatenate(
                 [weights.pop(p + "n_in"), weights.pop(p + "n_qn"), weights.pop(p + "n_kn")])
-            bufsz[p + "kc"] = Hkv * S * HD * 2
-            bufsz[p + "vc"] = Hkv * S * HD * 2
+            bufsz[p + "kc"] = kv_layout.total_elems * 2
+            bufsz[p + "vc"] = kv_layout.total_elems * 2
             bufsz[p + "cx"] = QD * 2
             rl.append((op_decode_layer, cur, p + "norms", p + "Wqkv", ang, p + "kc", p + "vc",
                        p + "cx", p + "n_pf", p + "Wo", p + "Wg", p + "Wu", p + "Wd",
@@ -983,7 +1042,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
             # 28 layers that is 672 MiB of arena that nothing reads -- 33.8% of the 1.99 GiB scratch,
             # and it reconciles exactly: 1.9898 GiB total minus 1.32904 GiB of named buffers = 0.661.
             bufsz.update({
-                p + "kc": Hkv * S * HD * 2, p + "vc": Hkv * S * HD * 2,
+                p + "kc": kv_layout.total_elems * 2, p + "vc": kv_layout.total_elems * 2,
                 p + "sc": Hq * S * 2, p + "sw": Hq * S * 2,
                 p + "cx": QD * 2,
                 p + "g": FF * 2, p + "u": FF * 2, p + "gh": FF * 2, p + "d": D * 2,
@@ -1130,12 +1189,12 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
     # against a measured ~40 us each. SHARE_DESIGNS=0 restores the unshared build for an A/B.
     share = os.environ.get("SHARE_DESIGNS", "1") == "1"
     fused = OperatorSequence(sequence_name(sp, NL, S, placer_flags,
-                                           decode_layer_active=op_decode_layer is not None), rl,
+                                           decode_layer_active=op_decode_layer is not None, T=T), rl,
                               input_args=inputs, output_args=["logits"],
                               buffer_sizes=bufsz, context=ctx, extra_flags=placer_flags,
                               share_designs=share)
     fused.compile()
-    return sp, fused, weights, dict(NL=NL, S=S, inputs=inputs, cache_names=cache_names,
+    return sp, fused, weights, dict(NL=NL, S=S, T=T, inputs=inputs, cache_names=cache_names,
                                     embed_blob=embed_blob, host_embed=host_embed)
 
 
@@ -1149,7 +1208,7 @@ def main():
     a = ap.parse_args()
     os.makedirs(os.path.join(a.out, "buffers"), exist_ok=True)
     sp, fused, weights, md = build_graph(a.spec, a.weights, a.layers, a.max_seq)
-    NL, S, inputs, cache_names = md["NL"], md["S"], md["inputs"], md["cache_names"]
+    NL, S, T, inputs, cache_names = md["NL"], md["S"], md["T"], md["inputs"], md["cache_names"]
     embed_blob, host_embed = md["embed_blob"], md["host_embed"]
     D, HD, Hq, Hkv, VOCAB = sp.d_model, sp.head_dim, sp.n_q_heads, sp.n_kv_heads, sp.vocab
     FF = sp.ffn
@@ -1202,12 +1261,17 @@ def main():
         "scratchpad": {"params": scratchpad_params, "kv_param": "kv_off", "mask_param": "sm_mask",
                        "head_dim": HD, "kv_heads": Hkv},
         "dims": {"layers": NL, "d_model": D, "q_heads": Hq, "kv_heads": Hkv, "head_dim": HD,
-                 "ffn": FF, "vocab": VOCAB, "S": S,
+                 "ffn": FF, "vocab": VOCAB, "S": S, "kv_block": T,
                  "sliding_window": sp.sliding_window, "sw_pattern": sp.sw_pattern},
         # Per-token host protocol (the ELF is constant; only these change):
         #   x        = embed[token], scaled by sqrt(d_model) iff embed_scale == "sqrt_d_model"
         #   rope_*   = precomputed [S,HD] angle tables; the row for n_past is used
-        #   kv_off   = n_past * head_dim   (addr kind, element units, raw)
+        #   kv_off   = the RUNTIME half of iron.common.kv_layout.KVLayout(kv_heads, S, head_dim,
+        #              kv_block).kv_off(n_past) -- element units, addr kind, raw. At kv_block == S
+        #              (dims.kv_block == dims.S) this is exactly `n_past * head_dim`, the
+        #              pre-blocking formula; the host must compute the general form (block *
+        #              block_stride + within_block * head_dim) whenever kv_block < S. See
+        #              kv_layout.py -- the single owner of this arithmetic -- not this comment.
         #   sm_mask  = n_past + 1          (core kind, causal width; host writes it <<2)
         "host_protocol": {"embed_scale": sp.embed_scale, "attn_scale": float(sp.attn_scale),
                           "act": sp.act, "norm_gain": sp.norm_gain, "eps": sp.eps,
