@@ -1299,6 +1299,16 @@ pub struct FusedArena {
 }
 
 impl FusedArena {
+    /// Live device BO bytes on the device these arenas came from -- the same quantity
+    /// [`Device::resident_bo_bytes`] reports, reachable from a model that holds an arena but not
+    /// the `Device` itself. Every `Bo` carries a handle to its device's counter precisely so the
+    /// count can be decremented on drop; reading it here costs nothing and needs no new plumbing.
+    ///
+    /// `0` only if this arena's buffers are views rather than allocations, which `new` never makes.
+    pub fn device_bo_bytes(&self) -> u64 {
+        self.input.counted.as_ref().map_or(0, |c| c.get())
+    }
+
     /// Allocate the three arenas (host_only, group_id 0 — IRON's XRTTensor convention). Sizes come
     /// from the fused operator's `buffer_sizes`. A zero-size arena is rounded up to 2 bytes (XRT
     /// rejects 0-byte BOs; IRON does the same `max(size, itemsize)`).

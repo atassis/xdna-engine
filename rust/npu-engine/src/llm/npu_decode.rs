@@ -334,6 +334,13 @@ impl DecodeStep for NpuDecodeStep {
         NpuDecodeStep::reset(self)
     }
 
+    /// Everything this rail has on the device: the fused arena's three buffers hold the weights,
+    /// the KV cache and the scratch, and `device_bo_bytes` reads the device's own live counter
+    /// rather than re-deriving a size that could disagree with it.
+    fn bo_bytes(&self) -> u64 {
+        self.arena.device_bo_bytes()
+    }
+
     /// Live dispatch/transition totals, or `None` when the log is off. The generator differences
     /// these per token, so a decode run says how many dispatches each token actually cost instead
     /// of asserting one -- the same claim `dispatch_report` makes for the generation as a whole.
@@ -582,7 +589,11 @@ mod tests {
     /// Mirrors `verify_llm_decode.py --teacher-force` exactly: teacher-force through the prompt,
     /// then at each generated position feed the ORACLE's token regardless of the device's own
     /// argmax, so every step is graded independently of any earlier miss.
-    fn teacher_forced_run(step: &mut NpuDecodeStep, prompt_ids: &[u32], gen_ids: &[u32]) -> Vec<u32> {
+    fn teacher_forced_run(
+        step: &mut NpuDecodeStep,
+        prompt_ids: &[u32],
+        gen_ids: &[u32],
+    ) -> Vec<u32> {
         let fed = prompt_ids;
         let n_steps = gen_ids.len();
         let mut produced = Vec::with_capacity(n_steps);
@@ -664,7 +675,8 @@ mod tests {
         eprintln!("[gate] oracle : {gen_ids:?}");
         eprintln!("[gate] NPU    : {produced:?}");
         eprintln!("[gate] teacher-forced parity: {matches}/{}", gen_ids.len());
-        assert_eq!(produced, gen_ids, "teacher-forced greedy parity {matches}/{} -- see stderr for the sequences", gen_ids.len());
+
+assert_eq!(produced, gen_ids, "teacher-forced greedy parity {matches}/{} -- see stderr for the sequences", gen_ids.len());
     }
 
     /// Gate 3: the SAME prompt, decoded free-running >=5 times on one resident instance (`reset()`

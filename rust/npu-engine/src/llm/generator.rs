@@ -59,6 +59,15 @@ pub trait DecodeStep {
         Ok(0)
     }
 
+    /// Live device BO bytes this backend holds, or 0 for a host backend that holds none.
+    ///
+    /// Reported so `npu models` can weigh the biggest resident thing on the box. An LLM's weights,
+    /// KV cache and scratch are the dominant device allocation in this engine, and until this
+    /// existed the MEM column read `-` for exactly the model most worth measuring.
+    fn bo_bytes(&self) -> u64 {
+        0
+    }
+
     /// Cumulative (dispatches, hardware-context transitions) since [`DecodeStep::reset`], or
     /// `None` when this backend does not count them. The generator differences consecutive reads
     /// to charge each token what it actually cost, so an implementation returns running totals and
@@ -256,6 +265,10 @@ fn default_seed() -> u64 {
 }
 
 impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
+    fn bo_bytes(&self) -> u64 {
+        self.decode.bo_bytes()
+    }
+
     fn generate(
         &mut self,
         prompt: &Prompt,
