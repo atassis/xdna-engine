@@ -21,6 +21,7 @@ import ml_dtypes
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import newstack_compat  # noqa: F401,E402
 from gen_llm_decode import build_graph  # noqa: E402
+from iron.common.kv_layout import KVLayout  # noqa: E402
 
 BF16 = ml_dtypes.bfloat16
 
@@ -43,6 +44,7 @@ def main():
 
     sp, fused, weights, md = build_graph(a.spec, a.weights, a.layers)
     S, HD, Hq, Hkv = md["S"], sp.head_dim, sp.n_q_heads, sp.n_kv_heads
+    kv_layout = KVLayout(Hkv=Hkv, S=S, HD=HD, T=md["T"])
     grp = Hq // Hkv
     toks = [int(t) for t in a.tokens.split(",")]
     L = a.layer
@@ -73,7 +75,7 @@ def main():
         row[1::2] = np.sin(pos * inv)
         with c.get_buffer("rope_global").overwrite() as _buf:
             _buf[:] = np.asarray(row, BF16)
-        params.write("kv_off", int(pos * HD))
+        params.write("kv_off", int(kv_layout.kv_off(pos)))
         params.write("sm_mask", int(pos + 1))
         params.sync()
         c()

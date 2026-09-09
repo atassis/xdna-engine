@@ -51,6 +51,7 @@ import ml_dtypes
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import newstack_compat  # noqa: F401,E402 -- MUST precede iron imports (new-mlir-aie port shim)
 from gen_llm_decode import build_graph, report_artifact_freshness, load_weight_buffer, isolate_build_dir  # noqa: E402
+from iron.common.kv_layout import KVLayout  # noqa: E402
 
 BF16 = ml_dtypes.bfloat16
 
@@ -117,8 +118,9 @@ def main():
     t0 = now()
     sp, fused, weights, md = build_graph(a.spec, a.weights, a.layers, a.max_seq)
     build_s = now() - t0
-    NL, S = md["NL"], md["S"]
+    NL, S, T = md["NL"], md["S"], md["T"]
     HD, D, VOCAB = sp.head_dim, sp.d_model, sp.vocab
+    kv_layout = KVLayout(Hkv=sp.n_kv_heads, S=S, HD=HD, T=T)
     print(f"[bench] build_graph: {build_s:.1f}s  ({sp.name}, {NL} layers, S={S}, vocab={VOCAB})",
           flush=True)
     try:
@@ -189,7 +191,7 @@ def main():
         with rope_buf.overwrite() as _buf:
             _buf[:] = rope_row(pos, HD, sp.rope_theta_global).reshape(-1)
         t2 = now()
-        params.write("kv_off", int(pos * HD))
+        params.write("kv_off", int(kv_layout.kv_off(pos)))
         params.write("sm_mask", int(pos + 1))
         params.sync()
         t3 = now()

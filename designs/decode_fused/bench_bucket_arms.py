@@ -31,6 +31,7 @@ import ml_dtypes
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import newstack_compat  # noqa: F401,E402
 from gen_llm_decode import build_graph, report_artifact_freshness  # noqa: E402
+from iron.common.kv_layout import KVLayout  # noqa: E402
 from bench_llm_decode import rope_row  # noqa: E402
 
 BF16 = ml_dtypes.bfloat16
@@ -83,6 +84,7 @@ def main():
                 _buf[:] = np.asarray(arr, BF16).reshape(-1)
         scale = np.sqrt(sp.d_model) if sp.embed_scale == "sqrt_d_model" else 1.0
         arms.append(dict(s=s, sp=sp, c=c, params=params,
+                          kv_layout=KVLayout(Hkv=sp.n_kv_heads, S=md["S"], HD=sp.head_dim, T=md["T"]),
                           xin=c.get_buffer("x"), rope_buf=c.get_buffer("rope_global"),
                           out=c.get_buffer("logits"), scale=scale, vocab=sp.vocab))
     print(f"[bucket-arms] {len(arms)} arms resident concurrently, dispatching at pos={a.pos}",
@@ -93,7 +95,7 @@ def main():
             _buf[:] = np.asarray(embed[TOK] * arm["scale"], BF16).reshape(-1)
         with arm["rope_buf"].overwrite() as _buf:
             _buf[:] = rope_row(a.pos, arm["sp"].head_dim, arm["sp"].rope_theta_global).reshape(-1)
-        arm["params"].write("kv_off", int(a.pos * arm["sp"].head_dim))
+        arm["params"].write("kv_off", int(arm["kv_layout"].kv_off(a.pos)))
         arm["params"].write("sm_mask", int(a.pos + 1))
         arm["params"].sync()
         arm["c"]()
