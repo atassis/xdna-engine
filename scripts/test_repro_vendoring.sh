@@ -12,7 +12,11 @@
 # pinned SHA is reachable on the real remote).
 set -euo pipefail
 ORIG="$(cd "$(dirname "$0")/.." && pwd)"
-SHA=8373e49165649644f1ec414c2e406c0abbbf51cf
+# The expected gitlink is DERIVED from toolchain.lock, never written here. A literal was wrong
+# from 2026-07-11, when 59756ef moved the gitlink in passing and nothing linked the two records --
+# so this assertion compared against a June SHA for two months and could only pass by coincidence.
+SHA="$(. "$ORIG/toolchain.lock"; echo "$MLIR_AIE_FORK_COMMIT")"
+[ -n "$SHA" ] || { echo "FAIL: toolchain.lock has no MLIR_AIE_FORK_COMMIT" >&2; exit 1; }
 USE_GITHUB=0; [ "${1:-}" = "--github" ] && USE_GITHUB=1
 
 [ -d "$ORIG/.venv-iron" ] || { echo "FAIL: this test reuses the existing .venv-iron toolchain, which is absent. Run scripts/setup_kernel_env.sh first." >&2; exit 1; }
@@ -29,6 +33,10 @@ cd "$TMP/repo"
 
 echo "== [2/6] reuse toolchain: symlink .venv-iron -> original (skips venv+wheel install) =="
 ln -s "$ORIG/.venv-iron" "$TMP/repo/.venv-iron"
+# Same reuse, one layer down. XDNA_CACHE now defaults INSIDE the repo, so without this the temp
+# clone resolves its own empty .cache and toolchain_up.sh builds a fresh instance from source --
+# 1-2 h, and outside this test's agreed scope (it reuses the toolchain, it does not provision one).
+export TOOLCHAIN_HOME="$ORIG/.cache/instances"
 
 echo "== [3/6] submodule update --init -> resolve the pinned gitlink =="
 if [ "$USE_GITHUB" = 1 ]; then
