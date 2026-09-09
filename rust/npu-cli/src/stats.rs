@@ -69,12 +69,26 @@ pub fn table(r: &GenerationReport) -> String {
     }
     o.push_str(&format!("  {:<14} {:>8}    {}\n", "BOUND", s.bound.as_str(), s.bound.lever()));
 
-    // Split `device` further, by AIE design -- from `npu_xrt::dispatch_log`, which every device
-    // dispatch already funnels through. Nested under BOUND rather than a peer row: it explains the
-    // one row above it, and its own residual is host glue around the dispatch (step_us also counts
-    // whatever the backend wraps the call in), not a second unattributed bucket.
-    if !s.design_breakdown.is_empty() {
-        o.push_str("      ── device, by design ─────────────────────────────\n");
+    // Split `device` further -- from `npu_xrt::dispatch_log`, which every device dispatch already
+    // funnels through. Nested under BOUND rather than a peer row: it explains the one row above it,
+    // and its own residual is host glue around the dispatch (step_us also counts whatever the
+    // backend wraps the call in), not a second unattributed bucket.
+    //
+    // BY XCLBIN/STREAM, not "by design": the log keys on (xclbin, instruction stream), and a fused
+    // decode issues its whole layer stack as one instruction stream inside one XRT dispatch. One row
+    // is therefore not a degenerate case of a split, it is the ONLY case this instrument can ever
+    // produce for a fused design -- rendering it as a table with one row would claim a per-operator
+    // attribution that never happened, so it gets one honest line instead.
+    if s.design_breakdown.len() == 1 {
+        let d = &s.design_breakdown[0];
+        let dev_us = d.secs * 1e6;
+        o.push_str(&format!(
+            "      one xclbin/stream ({}, x{} dispatches, {:.3} ms/tok) IS the device row above --\n\
+             \x20     everything dispatches inside a single XRT call, so no sub-dispatch/per-operator\n\
+             \x20     split is visible to the host; this is a limit of the instrument, not a result\n",
+            d.label, d.dispatches, dev_us / 1e3 / n));
+    } else if !s.design_breakdown.is_empty() {
+        o.push_str("      ── device, by xclbin/stream ──────────────────────\n");
         let mut designs = s.design_breakdown.clone();
         designs.sort_by(|a, b| b.secs.partial_cmp(&a.secs).unwrap_or(std::cmp::Ordering::Equal));
         let named_us: f64 = designs.iter().map(|d| d.secs * 1e6).sum();
@@ -238,6 +252,7 @@ pub fn diff(a: &Path, b: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use npu_engine::telemetry::DesignCost;
     use npu_engine::{StepPhases, StepRecord};
 
     fn run(step_us: u64, tokens: &[u32]) -> GenerationReport {
@@ -304,6 +319,34 @@ mod tests {
         // the four. That is a SECOND "unattributed": the top-level decode residual row is always
         // there too (design_breakdown is empty here, so its own nested residual does not add a third).
         assert_eq!(t.matches("unattributed").count(), 2, "{t}");
+    }
+
+    #[test]
+    fn a_single_stream_degrades_to_one_line_instead_of_a_fake_split() {
+        // A fused decode always produces exactly this: one xclbin/stream carrying the whole device
+        // row. Rendering it as a one-row table would claim a per-operator split that never happened.
+        let mut r = run(18_000, &[1, 2, 3, 4]);
+        r.design_breakdown =
+            vec![DesignCost { label: "main:sequence".to_string(), dispatches: 4, secs: 4.0 * 17_000e-6 }];
+        let t = table(&r);
+        assert!(t.contains("one xclbin/stream"), "{t}");
+        assert!(t.contains("main:sequence"), "{t}");
+        assert!(!t.contains("by design"), "must not use the retired, misleading label: {t}");
+        assert!(!t.contains("by xclbin/stream ──"), "one row must not render as a table: {t}");
+    }
+
+    #[test]
+    fn multiple_streams_still_render_as_a_breakdown_table() {
+        let mut r = run(18_000, &[1, 2, 3, 4]);
+        r.design_breakdown = vec![
+            DesignCost { label: "prefill.xclbin".to_string(), dispatches: 1, secs: 0.010 },
+            DesignCost { label: "decode.xclbin".to_string(), dispatches: 3, secs: 0.041 },
+        ];
+        let t = table(&r);
+        assert!(t.contains("by xclbin/stream"), "{t}");
+        assert!(t.contains("prefill.xclbin"), "{t}");
+        assert!(t.contains("decode.xclbin"), "{t}");
+        assert!(!t.contains("one xclbin/stream"), "a real split must not use the degraded line: {t}");
     }
 
     #[test]

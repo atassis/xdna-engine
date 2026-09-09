@@ -138,15 +138,42 @@ pub struct RunConditions {
     pub started_unix: i64,
 }
 
-/// One AIE design's blocking dispatch time inside a generation, from `npu_xrt::dispatch_log`.
-/// `label` is `npu_xrt::Kernel`'s own label (an xclbin stem), not a device-agnostic design name --
-/// two designs sharing an xclbin (`SHARE_DESIGNS`) collapse to one row here, and that collapse is
-/// itself a finding, not a loss of information.
+/// One (xclbin, instruction-stream) pair's blocking dispatch time inside a generation, from
+/// `npu_xrt::dispatch_log`. `label` is `npu_xrt::Kernel`'s own label (an xclbin stem), not a
+/// device-agnostic design name -- two designs sharing an xclbin (`SHARE_DESIGNS`) collapse to one
+/// row here, and that collapse is itself a finding, not a loss of information. And the log can only
+/// ever split by STREAM: a fused decode issues every layer as one instruction stream inside one XRT
+/// dispatch, so this can legitimately be a single row that IS the whole device row -- see
+/// `stats::table`'s one-stream case, which renders that as a fact rather than as a completed split.
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DesignCost {
     pub label: String,
     pub dispatches: u32,
     pub secs: f64,
+}
+
+/// `after` minus `before`, matched by `label`. `LlmGenerator::generate` uses this to scope the
+/// device-by-stream breakdown to the decode window: `before` is the log right after prefill,
+/// `after` is the log as of the last token this generation actually attributed a dispatch to --
+/// same boundary `StepPhases::step_us`'s own per-token sum stops at (see the stop-token comment in
+/// `generator.rs`), which is what keeps a diffed row from exceeding the device row it explains. A
+/// label present only in `after` keeps its full count; `saturating_sub`/`.max(0.0)` guard the
+/// reverse, which cannot happen in practice (dispatches never un-happen) but must never underflow
+/// or go negative if it somehow did.
+pub fn diff_design_breakdown(before: &[DesignCost], after: &[DesignCost]) -> Vec<DesignCost> {
+    let base: std::collections::HashMap<&str, &DesignCost> =
+        before.iter().map(|d| (d.label.as_str(), d)).collect();
+    after
+        .iter()
+        .map(|a| {
+            let (bd, bs) = base.get(a.label.as_str()).map_or((0, 0.0), |b| (b.dispatches, b.secs));
+            DesignCost {
+                label: a.label.clone(),
+                dispatches: a.dispatches.saturating_sub(bd),
+                secs: (a.secs - bs).max(0.0),
+            }
+        })
+        .collect()
 }
 
 /// Which build produced this run's numbers: precision, quantization, the fusion flags baked into
@@ -197,9 +224,11 @@ pub struct GenerationReport {
     /// turn this pair into a J/token figure -- it cannot carry one.
     pub npu_power_start_uw: Option<u64>,
     pub npu_power_end_uw: Option<u64>,
-    /// Per-design blocking time inside [`StepPhases::step_us`], from `npu_xrt::dispatch_log` --
-    /// see `DecodeStep::design_breakdown`. Empty means either the log was off for this generation or
-    /// the backend dispatches through no `npu_xrt::Kernel` at all; both render as nothing to show.
+    /// Per-stream blocking time inside [`StepPhases::step_us`], scoped to the DECODE window only --
+    /// see `DecodeStep::design_breakdown` and [`diff_design_breakdown`], which `LlmGenerator::generate`
+    /// uses to subtract prefill's dispatches out of it. Empty means either the log was off for this
+    /// generation or the backend dispatches through no `npu_xrt::Kernel` at all; both render as
+    /// nothing to show.
     pub design_breakdown: Vec<DesignCost>,
     /// Which build produced these numbers. See [`ArmProvenance`].
     pub provenance: ArmProvenance,

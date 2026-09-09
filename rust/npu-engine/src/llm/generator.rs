@@ -10,7 +10,10 @@ use crate::llm::config::ModelConfig;
 use crate::llm::detokenize::{IncrementalDetokenizer, StopFeed, StopMatcher};
 use crate::llm::sampling::{self, LogitView, SamplingConfig, SplitMix64};
 use crate::pipeline::{Chunk, FinishReason, GenerateParams, GenerateUsage, Prompt, TextGenerator};
-use crate::telemetry::{ArmProvenance, DesignCost, GenerationReport, PrefillRecord, SamplePhases, StepPhases, StepRecord};
+use crate::telemetry::{
+    diff_design_breakdown, ArmProvenance, DesignCost, GenerationReport, PrefillRecord, SamplePhases,
+    StepPhases, StepRecord,
+};
 
 /// One decode step against whatever backend holds the model: feed `token` at KV-cache position
 /// `pos`, get back full-vocabulary logits. `pos` is 0 for the first prompt token; the caller (this
@@ -156,6 +159,11 @@ pub struct ScriptedDecodeStep {
     step_delay: std::time::Duration,
     /// Cumulative dispatch/transition counts, when the mock is asked to keep them.
     counters: Option<(u32, u32)>,
+    /// Cumulative (dispatches, secs), when the mock is asked to track it -- deliberately advanced
+    /// by every `step()` call, prefill-stepwise included, to mirror `npu_xrt::dispatch_log`'s own
+    /// single accumulator closely enough to reproduce the prefill-contamination bug in a test.
+    design: Option<(u32, f64)>,
+    design_secs_per_dispatch: f64,
 }
 
 impl ScriptedDecodeStep {
@@ -167,6 +175,8 @@ impl ScriptedDecodeStep {
             prefill_calls: Vec::new(),
             step_delay: std::time::Duration::ZERO,
             counters: None,
+            design: None,
+            design_secs_per_dispatch: 0.0,
         }
     }
 
@@ -179,6 +189,16 @@ impl ScriptedDecodeStep {
     /// Count dispatches the way a device backend does: one per `step`, reset with the cache.
     pub fn with_counters(mut self) -> Self {
         self.counters = Some((0, 0));
+        self
+    }
+
+    /// Track a `DesignCost` breakdown the way `npu_xrt::dispatch_log` does: one shared cumulative
+    /// counter, advanced `secs_per_dispatch` on every `step()` call regardless of whether it ran
+    /// during prefill or decode. Lets a test reproduce -- and check the generator differences away
+    /// -- a prefill dispatch landing in the same accumulator the decode window is later read from.
+    pub fn with_design_tracking(mut self, secs_per_dispatch: f64) -> Self {
+        self.design = Some((0, 0.0));
+        self.design_secs_per_dispatch = secs_per_dispatch;
         self
     }
 
@@ -205,11 +225,21 @@ impl DecodeStep for ScriptedDecodeStep {
         if let Some((d, _)) = self.counters.as_mut() {
             *d += 1;
         }
+        if let Some((d, s)) = self.design.as_mut() {
+            *d += 1;
+            *s += self.design_secs_per_dispatch;
+        }
         self.steps.pop_front().ok_or_else(|| EngineError::Device("scripted decode exhausted".to_string()))
     }
 
     fn counters(&self) -> Option<(u32, u32)> {
         self.counters
+    }
+
+    fn design_breakdown(&self) -> Vec<DesignCost> {
+        self.design
+            .map(|(dispatches, secs)| vec![DesignCost { label: "scripted".to_string(), dispatches, secs }])
+            .unwrap_or_default()
     }
 
     fn max_context(&self) -> Option<usize> {
@@ -363,6 +393,13 @@ impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
             us: prefill_us,
             dispatches: prefill_dispatches,
         };
+        // Floor for the decode-only design breakdown: everything dispatched up to here is
+        // prefill's, on the SAME accumulator `reset()` zeroed before prefill ran. `decode_design`
+        // tracks forward from it at the per-token cadence below (mirroring `counters`), so the diff
+        // at the end can never include a prefill dispatch and stops at the boundary `phases.step_us`
+        // itself stops at.
+        let prefill_design = self.decode.design_breakdown();
+        let mut decode_design = prefill_design.clone();
         let mut steps: Vec<StepRecord> = Vec::new();
         let mut last_t = t0.elapsed().as_micros() as u64;
         let mut pending_step_us = 0u64;
@@ -408,6 +445,9 @@ impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
 
             let t_us = t0.elapsed().as_micros() as u64;
             let (dispatches, transitions) = counter_delta(&mut counters, self.decode.counters());
+            // Same boundary as `dispatches` above, so the two can never disagree about how far the
+            // decode window extends.
+            decode_design = self.decode.design_breakdown();
             let rec = StepRecord {
                 seq: completion_tokens - 1,
                 token: Some(tok),
@@ -498,7 +538,7 @@ impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
             steps,
             generate_us: t0.elapsed().as_micros() as u64,
             usage: GenerateUsage { prompt_tokens, completion_tokens },
-            design_breakdown: self.decode.design_breakdown(),
+            design_breakdown: diff_design_breakdown(&prefill_design, &decode_design),
             provenance,
             ..GenerationReport::default()
         };
@@ -858,6 +898,57 @@ mod tests {
         assert_eq!(sum.bound, Bound::Device, "a 5 ms device step against microsecond host work");
         assert!(sum.tok_per_s > 0.0 && sum.tok_per_s < 400.0, "tok/s: {}", sum.tok_per_s);
         assert!(sum.total_us >= sum.decode_us);
+    }
+
+    /// Reproduces the production bug directly: a stepwise prefill and the decode loop both dispatch
+    /// through the SAME `design_breakdown()` accumulator (mirroring `npu_xrt::dispatch_log`, which
+    /// is reset once at generation start, before prefill runs). Before the fix this test's report
+    /// would show 4 dispatches / 0.04s -- prefill's 3 plus decode's 1 -- against a device row built
+    /// from one 20ms decode dispatch, i.e. a device-by-stream total exceeding the device row it is
+    /// supposed to be a breakdown of, exactly what produced 109.9% in production.
+    #[test]
+    fn design_breakdown_excludes_prefill_dispatches() {
+        use std::time::Duration;
+        let cfg = build_cfg(None);
+        let peak = |id: usize| { let mut v = vec![0.0; 7]; v[id] = 9.0; v };
+        // "hello world foo" -- 3 prompt tokens, no batched prefill, so priming walks all 3 positions
+        // through `step()` (3 dispatches) before the first sample. One more decode dispatch fetches
+        // the second token's logits, and `max_tokens: 2` stops the loop right after -- no wasted
+        // trailing dispatch, so every decode dispatch here is cleanly attributed.
+        let decode = ScriptedDecodeStep::new(vec![vec![0.0; 7], vec![0.0; 7], peak(2), peak(5)])
+            .with_step_delay(Duration::from_millis(20))
+            .with_design_tracking(0.01);
+        let mut gen = LlmGenerator::new(cfg, decode);
+        let params = GenerateParams { max_tokens: Some(2), temperature: Some(0.0), ..GenerateParams::default() };
+        let mut report = GenerationReport::default();
+        gen.generate(&Prompt::Raw("hello world foo".to_string()), &params, &mut |c| {
+            if let Chunk::Done { report: r, .. } = c {
+                report = r.clone();
+            }
+            true
+        })
+        .unwrap();
+
+        assert_eq!(report.usage.completion_tokens, 2);
+        assert_eq!(report.prefill.stepwise, 3);
+        assert_eq!(report.design_breakdown.len(), 1);
+        assert_eq!(
+            report.design_breakdown[0].dispatches, 1,
+            "prefill's 3 dispatches must not be in the decode-window breakdown: {:?}", report.design_breakdown
+        );
+        assert!(
+            (report.design_breakdown[0].secs - 0.01).abs() < 1e-9,
+            "expected one decode dispatch's worth of secs, got {:?}", report.design_breakdown
+        );
+
+        let sum = report.summarize();
+        let design_total_us: f64 = sum.design_breakdown.iter().map(|d| d.secs * 1e6).sum();
+        assert!(
+            design_total_us <= sum.phases.step_us as f64,
+            "device-by-stream total ({design_total_us} us) must never exceed the device row \
+             ({} us) it explains -- this inequality failing is what 109.9% looked like",
+            sum.phases.step_us
+        );
     }
 
     /// The records must reproduce the bytes the text frames carried. A log that cannot do this is
