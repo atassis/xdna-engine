@@ -265,7 +265,11 @@ def main():
     # `lg` is taken from there below). Reading them off segment 0 was right only while there was
     # exactly one segment, and would have returned a buffer the stack never writes once there are
     # three.
-    out = stack[-1]["c"].get_buffer("logits")
+    # ... and under SPLIT_LM_HEAD it is in NEITHER: the stack ends at `xf` and `logits` belongs to
+    # the head graph's arena, so asking the last segment for it is a KeyError. Only the unsplit-head
+    # path reads `out` (the free-running arm below and --redispatch-check); the split path takes its
+    # logits off head_c.
+    out = None if md.get("split_lm_head") else stack[-1]["c"].get_buffer("logits")
 
     if a.redispatch_check:
         tok0 = prompt_ids[0]
@@ -280,6 +284,11 @@ def main():
             raise SystemExit("[verify] --redispatch-check drives ONE dispatch and compares it with "
                              "itself; across a segmented stack it would re-run only segment 0 and "
                              "report determinism for a fraction of the model. Run it unsegmented.")
+        if out is None:
+            raise SystemExit("[verify] --redispatch-check needs the logits in the graph it "
+                             "re-dispatches; under SPLIT_LM_HEAD they are in the head graph, so it "
+                             "would compare a buffer this dispatch never writes. Run it with "
+                             "SPLIT_LM_HEAD=0.")
         assert_redispatch_identical(c, out, label=sp.name, vocab=VOCAB)
         return
 
