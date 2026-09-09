@@ -145,12 +145,24 @@ fn root(cfg: &Config, config_path: &Path) -> Result<PathBuf> {
         return Ok(PathBuf::from(p));
     }
     let home = std::env::var("HOME").ok().map(PathBuf::from);
-    let install = std::env::var("XDG_DATA_HOME").ok().map(PathBuf::from)
-        .or_else(|| home.map(|h| h.join(".local/share")))
-        // The prefix install.sh stages and bakes into the unit (`ENGINE_ROOT`, install.sh). If that
-        // name changes there, it must change here: these are one constant in two files, and the
-        // only reason it is not shared is that one of them is bash.
-        .map(|d| d.join("xdna-engine"));
+    // The prefix install.sh stages and bakes into the unit (`ENGINE_ROOT`, install.sh). If that
+    // name changes there, it must change here: these are one constant in two files, and the
+    // only reason it is not shared is that one of them is bash.
+    //
+    // The XDG id is `npu` -- the same one as ~/.config/npu/engine.toml and the `npu` binary. It was
+    // `xdna-engine` until 2026-09-09, which meant config and data disagreed about the application's
+    // name for no reason anyone recorded; XDG keys both off one id and this is it. `xdna-engine`
+    // stays the REPO name, and remains accepted below so an install predating the move still
+    // resolves instead of silently looking empty.
+    let data_home = std::env::var("XDG_DATA_HOME").ok().map(PathBuf::from)
+        .or_else(|| home.map(|h| h.join(".local/share")));
+    let install = data_home.map(|d| {
+        let current = d.join("npu");
+        if current.is_dir() { return current }
+        let legacy = d.join("xdna-engine");
+        if legacy.is_dir() { return legacy }
+        current
+    });
     let cwd = std::env::current_dir().ok();
     for cand in root_candidates(cfg, config_path, cwd, install) {
         if cand.join("scenarios").is_dir() { return Ok(cand) }

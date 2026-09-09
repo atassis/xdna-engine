@@ -39,7 +39,12 @@ pub fn dir_from(runtime_directory: Option<&str>, xdg_runtime_dir: Option<&str>) 
         // directory name containing a colon that silently never matches the reader's.
         return d.split(':').next().filter(|s| !s.is_empty()).map(PathBuf::from);
     }
-    xdg_runtime_dir.filter(|s| !s.is_empty()).map(|d| PathBuf::from(d).join("xdna-engine"))
+    // `npu`, the same XDG id as ~/.config/npu and ~/.local/share/npu (was `xdna-engine` until
+    // 2026-09-09). No legacy fallback here, unlike the data root: this directory holds only the
+    // status file, is recreated on every start, and lives in a tmpfs that does not survive a
+    // reboot -- so a stale one is not something to find, it is something already gone. Writer and
+    // reader are the same binary, so they cannot disagree across the rename.
+    xdg_runtime_dir.filter(|s| !s.is_empty()).map(|d| PathBuf::from(d).join("npu"))
 }
 
 pub fn path() -> Option<PathBuf> { dir().map(|d| d.join(FILE_NAME)) }
@@ -89,12 +94,16 @@ mod tests {
     }
 
     /// Both sides must compute the same path, or the service publishes where nothing reads. That is
-    /// the correspondence this module exists to keep single, and `RuntimeDirectory=xdna-engine` in a
-    /// USER unit resolves to exactly `$XDG_RUNTIME_DIR/xdna-engine`.
+    /// the correspondence this module exists to keep single, and `RuntimeDirectory=npu` in a
+    /// USER unit resolves to exactly `$XDG_RUNTIME_DIR/npu`.
+    ///
+    /// This test earned its keep on 2026-09-09: renaming the XDG id from `xdna-engine` to `npu`
+    /// touched this fallback and NOT `RuntimeDirectory=` in install.sh's unit, and this is what
+    /// caught it. The two are one constant in two files -- change them together.
     #[test]
     fn xdg_fallback_matches_what_a_user_unit_creates() {
         assert_eq!(dir_from(None, Some("/run/user/1000")).unwrap(),
-                   PathBuf::from("/run/user/1000/xdna-engine"));
+                   PathBuf::from("/run/user/1000/npu"));
     }
 
     /// Neither set: publish nothing rather than guess a path. A status file in the wrong place is

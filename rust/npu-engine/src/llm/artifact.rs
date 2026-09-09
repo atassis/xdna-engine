@@ -615,7 +615,20 @@ impl LlmArtifact {
     /// function all agree byte-for-byte). `Ok(None)` means no lock was found, which is the normal
     /// shape for a production install and must not be treated as an error.
     fn resolve_current_pin_hash(start: &Path) -> std::io::Result<Option<String>> {
-        let mut dir = start.canonicalize()?;
+        // ABSOLUTE, NOT CANONICAL -- do not resolve symlinks here. `install.sh` stages a production
+        // root holding its own `toolchain.lock` (the pin the artifacts were BUILT against) beside an
+        // `artifacts` SYMLINK into the dev checkout. Canonicalizing follows that symlink, so the
+        // walk-up sails past the staged lock and lands on whatever the developer's tree is pinned at
+        // right now -- gating a shipped artifact on an unrelated working tree.
+        //
+        // Measured 2026-09-09: a re-pin in the checkout made every installed artifact fail to load
+        // with `toolchain-stale`, while the staged lock sitting directly above them still hashed to
+        // exactly what they were built with. The artifact was fine and the right answer was one
+        // directory up; canonicalize() walked past it.
+        //
+        // Lexical walk-up gives each artifact the lock of the tree it LIVES in, which is the
+        // question this check is actually asking. A dev-tree artifact still resolves the dev pin.
+        let mut dir = std::path::absolute(start)?;
         loop {
             if dir.join("toolchain.lock").is_file() {
                 return kernel_registry::current_toolchain_hash(&dir).map(Some);
@@ -1082,6 +1095,46 @@ mod tests {
         assert!(err.contains("toolchain-stale"), "{err}");
         assert!(err.contains("9da6356ac521"), "{err}");
         assert!(err.contains(&current), "{err}");
+    }
+
+    /// A staged production root shadows the dev checkout its `artifacts` symlink points into.
+    /// This is the 2026-09-09 outage: a re-pin in the checkout made every INSTALLED artifact fail
+    /// to load, because the walk-up canonicalized through the symlink and found the dev pin rather
+    /// than the staged lock those artifacts were built against.
+    #[test]
+    fn staged_install_root_wins_over_the_checkout_its_artifacts_symlink_into() {
+        let root = tempfile::tempdir().unwrap();
+        let checkout = root.path().join("checkout");
+        let staged = root.path().join("staged");
+        fs::create_dir_all(checkout.join("artifacts/qwen3/decode")).unwrap();
+        fs::create_dir_all(&staged).unwrap();
+
+        // The two trees are pinned DIFFERENTLY -- that disagreement is the whole test.
+        fs::write(checkout.join("toolchain.lock"), b"PIN=dev_moved_on\n").unwrap();
+        fs::write(staged.join("toolchain.lock"), b"PIN=what_it_was_built_with\n").unwrap();
+        let staged_hash = kernel_registry::current_toolchain_hash(&staged).unwrap();
+        let dev_hash = kernel_registry::current_toolchain_hash(&checkout).unwrap();
+        assert_ne!(staged_hash, dev_hash, "test setup must actually disagree");
+
+        // install.sh's shape: artifacts is a SYMLINK into the checkout, beside a staged lock.
+        std::os::unix::fs::symlink(checkout.join("artifacts"), staged.join("artifacts")).unwrap();
+
+        // Stamp the artifact with the STAGED pin -- it was built when that was current.
+        let mut meta = base_meta(8, 4, serde_json::json!({"rope_global": {"type": "input", "offset": 8, "len": 8}}));
+        meta["toolchain"] = serde_json::json!({ "hash": staged_hash });
+        write_meta(&checkout.join("artifacts/qwen3/decode"), &meta);
+
+        // Loaded by its INSTALLED path, it must resolve the staged lock and be Fresh.
+        LlmArtifact::load(&staged.join("artifacts/qwen3/decode"))
+            .expect("installed artifact must be gated on the staged pin, not the dev checkout's");
+
+        // Same bytes reached through the CHECKOUT path are a dev artifact and still get the dev
+        // pin -- the check keeps its teeth where it has them.
+        let err = LlmArtifact::load(&checkout.join("artifacts/qwen3/decode"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("toolchain-stale"), "{err}");
+        assert!(err.contains(&dev_hash), "{err}");
     }
 
     #[test]
