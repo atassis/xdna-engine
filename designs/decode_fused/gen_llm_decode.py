@@ -599,6 +599,64 @@ def gemv(M, K, ctx, **kw):
                 tile_size_output=tso, context=ctx, **kw)
 
 
+
+# A runtime buffer's offset is patched into its BD by `aiex.npu.address_patch`, whose `arg_plus`
+# operand mlir-aie declares as I32 (AIEX.td) and emits through a uint32_t path
+# (AIETargetNPU.cpp::appendAddressPatch -> TxnEncoding.h::txn_append_address_patch). Anything at or
+# past 2^32 therefore WRAPS, and the BD writes to the wrong place -- silently, with no diagnostic at
+# any layer, on a design that builds and runs.
+#
+# Measured 2026-09-09 on Gemma-4-12B: at 12 layers the residual buffer at offset 3,897,195,520 is
+# written and the next one at 4,379,395,584 reads back exactly zero; at 48 layers int4 the boundary
+# falls between 4,216,907,776 and 4,376,916,480. Both bracket 2^32, the second to within 160 MB. It
+# cost this chain a long hunt through arithmetic that was never wrong.
+#
+# The hardware and the driver are NOT the limit -- aie-rt's patch_op_t declares `u64 argplus`
+# (xaiegbl.h) and the 12-word TXN op reserves the high word right after it. This is mlir-aie
+# narrowing a field both ends of it carry at 64 bits, so it is fixable upstream; until it is, refuse
+# here rather than emit a design that lies.
+ADDRESS_PATCH_MAX_OFFSET = 1 << 32
+
+
+def check_arena_offsets_are_addressable(seq, names):
+    """Refuse a design whose buffers cannot be addressed by a 32-bit arg_plus.
+
+    CATCHES the total failure: a buffer whose START is at or past 2^32 gets a wrapped BD offset and
+    is never written -- measured as exactly-zero residual buffers from layer 8 (12 layers, bf16) and
+    layer 26 (48 layers, int4).
+
+    DOES NOT catch the partial case, and that gap is known rather than assumed. At 6 layers every
+    buffer starts below 2^32 and this check passes, yet the lm-head's output still comes back with
+    2169 elements unwritten -- there `W_head` starts under the boundary and STREAMS across it. So a
+    transfer crossing 2^32 is not always safe either, and the sufficient condition is narrower than
+    this test. Until that is measured, treat a pass here as necessary, not sufficient.
+    """
+    bad = []
+    for n in names:
+        try:
+            arena, off, ln = seq.get_layout_for_buffer(n)
+        except Exception:
+            continue
+        # The START offset is what gets patched into the BD; the DMA then streams `len` bytes from
+        # there and crossing the boundary mid-transfer is fine. Measured: at 5 layers `W_head`
+        # begins at 2.41 GiB and runs to 4.12 GiB, past 2^32, and that design is CLEAN on device.
+        # An `off + len` test would reject it -- a check that rejects a working configuration is
+        # worse than no check.
+        if off >= ADDRESS_PATCH_MAX_OFFSET:
+            bad.append((n, arena, off, ln))
+    if not bad:
+        return
+    bad.sort(key=lambda b: b[2])
+    first = bad[0]
+    raise ValueError(
+        f"{len(bad)} buffer(s) sit at or past the 4 GiB that aiex.npu.address_patch's I32 arg_plus "
+        f"can address, so their BDs would be patched with a WRAPPED offset and write to the wrong "
+        f"place -- silently. First: {first[0]!r} in arena {first[1]} at offset {first[2]:,} "
+        f"(+{first[3]:,} bytes) = {(first[2] + first[3]) / 2**30:.3f} GiB. "
+        f"Split this graph so each dispatch's arena stays under 4 GiB, or narrow the weights."
+    )
+
+
 def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
     """Construct the fused decode graph + its weight dict for a spec.
 
@@ -1382,6 +1440,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
                               buffer_sizes=bufsz, context=ctx, extra_flags=placer_flags,
                               share_designs=share)
     fused.compile()
+    check_arena_offsets_are_addressable(fused, [*inputs, head_name, *weights.keys(), *cache_names])
 
     # The lm-head as its own graph: one op, `xf` in, logits out, its own W_head. No arena sharing --
     # `xf` is 7680 bytes and crosses through the host, which costs one small copy per token against a
