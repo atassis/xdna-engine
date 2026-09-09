@@ -48,6 +48,9 @@ export PATH="$VENV/bin:$VENV/cc-shim:$AIEBU_ASM_DIR:$PATH"
 export CUDA_VISIBLE_DEVICES=""
 POS="${GATE_POSITIONS:-1 64 256}"; REPS="${GATE_REPS:-30}"
 TOK="${GATE_TOKENS:-2000}"; PASSES="${GATE_PASSES:-2}"
+# GATE_PHASES=all|bench|ppl. Splitting them is for re-running ONE half after a harness fix; a
+# real gate runs both in one device hold, because that is what makes the control contemporaneous.
+PHASES="${GATE_PHASES:-all}"
 mkdir -p "$OUT"
 echo "[gate] $SPEC  arms=${#ARMS[@]}  passes=$PASSES  positions=$POS  ppl-tokens=$TOK"
 echo "[gate] power mode: $(xrt-smi examine -r platform 2>/dev/null | grep -i 'power mode' | head -1)"
@@ -55,6 +58,7 @@ echo "[gate] power mode: $(xrt-smi examine -r platform 2>/dev/null | grep -i 'po
 tag_of() { echo "$1" | tr ',=' '__' | sed 's/QUANT_//g;s/_DTYPE//g;s/_GROUP//g'; }
 
 # 1+2: determinism and latency, ABBA over the arm list so drift lands on every arm equally.
+if [ "$PHASES" = all ] || [ "$PHASES" = bench ]; then
 for pass in $(seq 1 "$PASSES"); do
   for arm in "${ARMS[@]}"; do
     t="$(tag_of "$arm")"
@@ -67,7 +71,10 @@ for pass in $(seq 1 "$PASSES"); do
   done
 done
 
+fi
+
 # 3: quality, one pass per arm, same corpus and positions for all of them.
+if [ "$PHASES" = all ] || [ "$PHASES" = ppl ]; then
 for arm in "${ARMS[@]}"; do
   t="$(tag_of "$arm")"
   echo "=== ppl $t ==="
@@ -75,5 +82,6 @@ for arm in "${ARMS[@]}"; do
     bash "$REPO/scripts/run_llm_perplexity.sh" "$SPEC" "$CORPUS" "$OUT/ppl-$t" "$TOK" ) \
     || echo "[gate] ppl $t FAILED"
 done
+fi
 echo "[gate] done -- results in $OUT"
 echo "[gate] pair the arms:  python designs/decode_fused/hostlab/pairwise.py <tag> A:B"
