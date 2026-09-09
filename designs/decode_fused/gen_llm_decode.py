@@ -935,7 +935,12 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
         op_decode_layer = DecodeLayerDataParallel(
             D=D, FF=FF, HD=HD, Hq=Hq, Hkv=Hkv, max_seq=S, attn_cols=Hkv, mlp_cols=MLP_DP_COLS,
             eps_attn=sp.eps, eps_mlp=sp.eps, tile_size_input=TSI, context=ctx,
-            weight_depth=WEIGHT_DEPTH, wqkv_head_major=True)
+            weight_depth=WEIGHT_DEPTH, wqkv_head_major=True,
+            # max_seq stays the WINDOW the attention math iterates; these two carry the capacity
+            # and the blocked storage, the same split gemv/tmatvec already have. Both None on the
+            # unwidened, unblocked default, which is byte-identical to before they existed.
+            kv_alloc=None if KVA == S else KVA,
+            kv_block_size=None if T == S else T)
     print(f"[gen] fused arm decode_layer_dp: "
           f"{'OFF -- ' + decode_layer_why if decode_layer_why else 'on'}")
 
