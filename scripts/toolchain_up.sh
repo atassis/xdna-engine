@@ -235,8 +235,8 @@ echo "[toolchain_up] building instance $LOCKHASH ..." >&2
 # configure-time hard requirements -- cmake FATAL_ERRORs without them.
 "$REPO/.venv-iron/bin/python" -m pip install -q "nanobind==$NANOBIND" pybind11
 mkdir -p "$INST"
-# Source = a CLEAN checkout of the fork integration-branch commit (NO dirty working tree); the our kernels
-# are overlaid by sync_kernels (policy B). The prebuilt MLIR distro + cmake helpers come from the submodule.
+# Source = a CLEAN checkout of the fork integration-branch commit (NO dirty working tree). Our
+# kernels are NOT overlaid here; designs reach them through lib_kernels_dir -> aie_kernels/. The prebuilt MLIR distro + cmake helpers come from the submodule.
 SRC="$INST/src"
 if [ ! -e "$SRC/tools/aiecc/aiecc.cpp" ]; then
   rm -rf "$SRC"; git -C "$REPO/mlir-aie" worktree prune
@@ -276,7 +276,12 @@ if [ ! -e "$SRC/tools/aiecc/aiecc.cpp" ]; then
     fi
     [ -e "$REPO/mlir-aie/$nested" ] && { rm -rf "$SRC/$nested"; ln -sfn "$REPO/mlir-aie/$nested" "$SRC/$nested"; }
   done
-  bash "$REPO/scripts/sync_kernels.sh" "$SRC" >&2
+  # NO sync_kernels here. It exits 2 on an instance-store target by design -- the store is
+  # content-addressed and verify_kernel_source.sh reads vendor ground truth out of it, so
+  # overlaying our kernels made the gate's reference the mutated tree. Our designs compile from
+  # aie_kernels/ via lib_kernels_dir instead. The call survived the policy change and only ever
+  # fired on a FRESH instance, so it went unnoticed until the first fresh build after the guard
+  # landed -- where it aborted the build outright under set -e.
 fi
 # AIE_ENABLE_XRT_PYTHON_BINDINGS=ON builds _parameter_scratchpad, the host side of runtime
 # scratchpad params. Despite the option name the module is XRT-free (TEST_UTILS_USE_XRT=0, raw
