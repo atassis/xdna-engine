@@ -154,6 +154,7 @@ def _pack_affine(W: np.ndarray, group_size: int, weight_dtype: str,
     """
     import ml_dtypes
     M, K = W.shape
+    nbits = _AFFINE[weight_dtype]
     lo, hi = _affine_levels(weight_dtype)
     n_groups = K // group_size
     Wg = np.asarray(W, dtype=np.float32).reshape(M, n_groups, group_size)
@@ -161,7 +162,17 @@ def _pack_affine(W: np.ndarray, group_size: int, weight_dtype: str,
     s = ((wmax - wmin) / (hi - lo)).astype(np.float32)
     s = np.where(s > 0, s, 1.0).astype(ml_dtypes.bfloat16).astype(np.float32)
     m = (wmin - lo * s).astype(ml_dtypes.bfloat16).astype(np.float32)
-    if zero_on_grid:
+    # ONLY AT 4 BITS -- and that is a property of bf16's significand, not a preference.
+    # m must equal -z*s exactly for the grid to contain zero, and m is STORED as bf16, which
+    # carries 8 significand bits. At 4 bits |z| <= 8 spends 4 of them and the product survives;
+    # at 8 bits |z| <= 128 spends all 8, so bf16 cannot hold z*s and the stored m is not -z*s.
+    # The constraint then fails at its own job AND costs range. Measured on this model's MLP
+    # tensors: at int8/g32 it reaches only 0.20% exact zeros against the free min's 0.02% -- no
+    # real difference -- while rel-L2 goes 0.00478 -> 0.00490 and clipping 0.177% -> 0.584%.
+    # At int4/g32 it reaches 10.99% against 0.19%, which is the whole point of it.
+    # There is nothing to recover here: 256 levels do not need the offset that 16 do
+    # (symmetric int8 -0.06% against affine int8 +0.21% on the model, indistinguishable).
+    if zero_on_grid and nbits == 4:
         # w = (q - z)*s, so m = -z*s. q = lo must land on wmin: (lo - z)*s = wmin
         # => z = lo + round(-wmin/s), and the grid then contains exact zero at q = z.
         z = lo + np.round(-wmin / s)
