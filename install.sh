@@ -260,6 +260,27 @@ else
   archive_binary_by_build_id "$ENGINE_BIN" "installed"
 fi
 
+# The installed binary must RUN, in the environment a person actually has.
+#
+# Everything above this point is a preflight -- it checks what the build needs. Nothing checked what
+# the install produced, so this script could print "Done" having installed a binary that cannot
+# start. That is not hypothetical: on 2026-09-09 a binary built without the RPATH baked at step 3
+# was installed by hand, and `npu models` died with "error while loading shared libraries:
+# libonnxruntime.so.1" for every interactive user. The SERVICE kept working the whole time, because
+# its unit sets LD_LIBRARY_PATH -- so the failure was invisible to anything that tested with a
+# developer's environment, which is every test anyone had run.
+#
+# `env -u LD_LIBRARY_PATH` is the whole point: it reproduces a plain login shell, where the binary
+# has to resolve its own libraries through DT_RUNPATH or not at all.
+info "Smoke-testing the installed binary in a clean environment"
+if smoke=$(env -u LD_LIBRARY_PATH "$ENGINE_BIN" models --output json 2>&1); then
+  ok "Installed binary runs standalone"
+else
+  warn "The installed binary does not run without LD_LIBRARY_PATH:"
+  printf '%s\n' "$smoke" | sed 's/^/    /' >&2
+  die "Refusing to report success. Usually a missing RPATH -- check step 3's RUSTFLAGS."
+fi
+
 # Bounded: keep the newest 10 (~170 MB worst case, and far less while hardlinks share storage with
 # the live binary). Unbounded would trade one silent failure for another.
 if [ -d "$ENGINE_BIN_ARCHIVE" ]; then

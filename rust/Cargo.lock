@@ -1001,6 +1001,7 @@ dependencies = [
  "anyhow",
  "clap",
  "clap_complete",
+ "libc",
  "ndarray",
  "ndarray-npy",
  "npu-asr",

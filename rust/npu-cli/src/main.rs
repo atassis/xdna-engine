@@ -39,7 +39,25 @@ fn config_path_and_source(cli: &Cli) -> (PathBuf, &'static str) {
 /// The one place an error becomes a process exit code (`exit::of`) -- see `exit.rs`. Printing
 /// stays exactly what `Result<(), E: Debug>`'s stdlib `Termination` impl already did (`Error:
 /// {e:?}`, the anyhow chain with "Caused by:"); only the exit status is new.
+/// Put SIGPIPE back to its default disposition.
+///
+/// Rust ignores SIGPIPE at startup, so a closed stdout surfaces as an `EPIPE` from `println!`,
+/// which panics -- `npu models | head` printed a panic and a backtrace note instead of just
+/// stopping. Every other program in a pipeline dies silently there, and a CLI whose output is
+/// meant to be piped (`npu models | awk`, which the shell completion itself does) has to behave
+/// the same way.
+///
+/// Unsafe because it is a raw libc call; sound because it runs before any thread exists and only
+/// restores the disposition the process would have had without Rust's startup code.
+fn restore_sigpipe() {
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
 fn main() -> ExitCode {
+    restore_sigpipe();
     let cli = Cli::parse();
     let path = config_path(&cli);
     match run(&cli, &path) {
