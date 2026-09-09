@@ -34,9 +34,12 @@ cd "$TMP/repo"
 echo "== [2/6] reuse toolchain: symlink .venv-iron -> original (skips venv+wheel install) =="
 ln -s "$ORIG/.venv-iron" "$TMP/repo/.venv-iron"
 # Same reuse, one layer down. XDNA_CACHE now defaults INSIDE the repo, so without this the temp
-# clone resolves its own empty .cache and toolchain_up.sh builds a fresh instance from source --
-# 1-2 h, and outside this test's agreed scope (it reuses the toolchain, it does not provision one).
-export TOOLCHAIN_HOME="$ORIG/.cache/instances"
+# clone resolves its own EMPTY .cache and toolchain_up.sh has neither a built instance nor the
+# provisioned MLIR distro -- outside this test's agreed scope, which reuses the toolchain rather
+# than provisioning one. Point the whole cache at the original, not just TOOLCHAIN_HOME: that
+# names only instances/, and the first attempt at this failed on "MLIR distro ... not provisioned"
+# because mlir-distro/, ccache/ and goldens/ hang off XDNA_CACHE too.
+export XDNA_CACHE="$ORIG/.cache"
 
 echo "== [3/6] submodule update --init -> resolve the pinned gitlink =="
 if [ "$USE_GITHUB" = 1 ]; then
@@ -53,16 +56,21 @@ fi
 GOT="$(git -C mlir-aie rev-parse HEAD)"
 [ "$GOT" = "$SHA" ] && echo "   OK: submodule at pinned SHA $GOT" || fail "submodule SHA $GOT != pinned $SHA"
 
-echo "== [4/6] run the real setup_kernel_env.sh (skips venv/wheels/init via guards; applies patch + syncs) =="
+echo "== [4/6] run the real setup_kernel_env.sh (skips venv/wheels/init via guards; syncs kernels) =="
 bash scripts/setup_kernel_env.sh
-# assert the patch landed on all 3 upstream files
-for f in programming_examples/common.cmake \
-         programming_examples/basic/matrix_multiplication/common.h \
-         programming_examples/ml/layernorm/Makefile; do
-  git -C mlir-aie diff --quiet -- "$f" && fail "patch did not modify $f"
-done
-grep -q 'LOCAL PATCH (CachyOS)' mlir-aie/programming_examples/common.cmake || fail "cmake patch marker missing"
-echo "   OK: tethered patch applied to the 3 upstream files"
+# This used to assert a tethered patch had modified common.cmake, common.h and the layernorm
+# Makefile, and to grep for a 'LOCAL PATCH (CachyOS)' marker. That mechanism is GONE by design --
+# setup_kernel_env.sh states it ("There is no apply-patch step"), the build fixes are carried as
+# COMMITS on the branch toolchain.lock pins, and the CachyOS cmake fix is supplied by iron_env.sh's
+# XRT_INC_DIR/XRT_LIB_DIR exports instead. The assertion outlived what it was checking and failed
+# the test on a retirement, not a regression.
+#
+# What replaced it is the property that actually matters now: setup must leave the checkout ON the
+# pinned commit. That is where the fixes live, so a setup step that moves it off the pin silently
+# drops them -- the same failure the old assertion existed to catch.
+GOT_AFTER_SETUP="$(git -C mlir-aie rev-parse HEAD)"
+[ "$GOT_AFTER_SETUP" = "$SHA" ] || fail "setup_kernel_env.sh left mlir-aie at $GOT_AFTER_SETUP, not the pinned $SHA"
+echo "   OK: setup left mlir-aie on the pinned commit (fixes ride the branch, not a patch)"
 # assert our kernels synced forward
 for k in aie_kernels/aie2p/dwconv1d.cc aie_kernels/aie2p/mm_silu_epilogue.cc \
          programming_examples/ml/dwconv1d/Makefile programming_examples/ml/softmax400/softmax400.py \
