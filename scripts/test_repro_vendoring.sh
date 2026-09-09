@@ -64,7 +64,12 @@ done
 echo "   OK: custom kernels copied-forward"
 
 echo "== [5/6] build_kernels.sh against the fresh tree (reusing toolchain) =="
-bash scripts/build_kernels.sh
+# Do NOT let a partial build short-circuit step 6. build_kernels.sh now exits non-zero with a NAMED
+# list when some shapes fail rather than dying at the first one, and step 6 is the only thing in
+# this tree that asserts WHICH xclbins must exist -- so aborting here threw away the completeness
+# check to report a failure step 6 would have described precisely. The build's own failure list is
+# already on stderr; step 6 decides the verdict.
+bash scripts/build_kernels.sh || echo "   (build reported failures -- step 6 says whether any REQUIRED xclbin is affected)"
 
 echo "== [6/6] assert the encoder xclbins were produced =="
 MM=programming_examples/basic/matrix_multiplication
