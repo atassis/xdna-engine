@@ -153,6 +153,7 @@ const FREE_FORM_ARGS: &[(&str, &str)] = &[
     ("scenario", "scenario TOML file path"),
     ("value", "a `config set` value -- shape depends on which key, checked at write time"),
     ("log", "JSONL run-log path to read"),
+    ("interval", "refresh seconds -- an arbitrary number"),
     ("diff", "second JSONL run log to compare against"),
 ];
 

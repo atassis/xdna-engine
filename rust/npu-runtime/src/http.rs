@@ -214,8 +214,8 @@ pub fn models_json(status: &[ModelStatus]) -> String {
         let state = match s.state { LoadState::Loaded => "loaded", LoadState::Failed => "failed", LoadState::Unloaded => "unloaded" };
         let idle = match s.idle_s { Some(n) => n.to_string(), None => "null".to_string() };
         data.push_str(&format!(
-            "{{\"id\":\"{}\",\"object\":\"model\",\"kind\":\"{kind}\",\"state\":\"{state}\",\"detail\":\"{}\",\"bo_bytes\":{},\"idle_s\":{idle},\"pinned\":{},\"busy\":{}}}",
-            s.name, parse::json_escape(&s.detail), s.bo_bytes, s.pinned, s.busy));
+            "{{\"id\":\"{}\",\"object\":\"model\",\"kind\":\"{kind}\",\"state\":\"{state}\",\"detail\":\"{}\",\"bo_bytes\":{},\"idle_s\":{idle},\"pinned\":{},\"busy\":{},\"served\":{},\"busy_us\":{}}}",
+            s.name, parse::json_escape(&s.detail), s.bo_bytes, s.pinned, s.busy, s.served, s.busy_us));
     }
     format!("{{\"object\":\"list\",\"data\":[{data}]}}")
 }

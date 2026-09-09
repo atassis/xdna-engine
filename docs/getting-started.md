@@ -84,6 +84,11 @@ breakdown instead. `--output json` streams the whole thing as NDJSON on stdout -
 per token, carrying that token's own timing -- so `> run.jsonl` gives you a file `npu
 stats` and `npu replay` read back. See [measurement.md](measurement.md).
 
+`npu top` is the live view of the device: who is resident, what is serving right now,
+how much device memory each model holds, and what share of the service's uptime each one
+has occupied the NPU for. It reads the status file the service publishes, so it never
+touches the device and cannot hang on a busy one.
+
 ## What success looks like
 
 With the service running:

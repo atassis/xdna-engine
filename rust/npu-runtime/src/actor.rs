@@ -205,8 +205,13 @@ fn spawn(cfg: Config, loader: Box<dyn ModelLoader + Send>, eager: bool) -> Resul
                             // to fail a request.
                             crate::status_file::publish(cfg.server.port,
                                 &reg.status_serving(Instant::now(), Some(&name)));
+                            let t_serve = Instant::now();
                             let out = guard(|| run_named(&mut reg, &name, req))
                                 .unwrap_or_else(|msg| Err(EngineError::Device(msg)));
+                            // Charged whether it succeeded or failed: a request that held the
+                            // device and then errored still held it, and occupancy that only
+                            // counted successes would understate exactly the runs worth noticing.
+                            reg.charge(&name, t_serve.elapsed().as_micros() as u64);
                             match out {
                                 Ok(value) => Ok(Served { model: name, value }),
                                 Err(e) => {
@@ -275,8 +280,10 @@ fn spawn(cfg: Config, loader: Box<dyn ModelLoader + Send>, eager: bool) -> Resul
                                 };
                                 crate::status_file::publish(cfg.server.port,
                                     &reg.status_serving(Instant::now(), Some(&name)));
+                                let t_serve = Instant::now();
                                 let out = guard(|| run_generate(&mut reg, &name, &prompt, &params, &mut sink))
                                     .unwrap_or_else(|msg| Err(EngineError::Device(msg)));
+                                reg.charge(&name, t_serve.elapsed().as_micros() as u64);
                                 if let Err(e) = out {
                                     if condemns_model(&e) {
                                         reg.mark_failed(&name, &e.to_string());

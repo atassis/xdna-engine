@@ -182,6 +182,23 @@ pub enum Cmd {
         #[command(subcommand)]
         action: WeightsCmd,
     },
+    /// Live view of the device: who is resident, who is serving, and where the time went.
+    ///
+    /// `docker stats` for the NPU. Reads the status file the service publishes -- no socket, no
+    /// probe, nothing that can hang on a busy device -- and refreshes in place. With the service
+    /// down it says so rather than showing an empty table.
+    Top {
+        /// Seconds between refreshes.
+        #[arg(long, default_value_t = 1.0)]
+        interval: f64,
+        /// Print one snapshot and exit. The default when stdout is not a terminal, so
+        /// `npu top | ...` behaves like every other command here.
+        #[arg(long)]
+        once: bool,
+        /// Read the status published for this port instead of the config's.
+        #[arg(long)]
+        port: Option<u16>,
+    },
     /// Read a JSONL run log written by `--output json` or `NPU_TELEMETRY_LOG`.
     ///
     /// Renders the same overlay a live generation prints, from a file -- so a run from another day

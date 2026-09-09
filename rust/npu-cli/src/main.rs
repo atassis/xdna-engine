@@ -16,6 +16,7 @@ use clap::{CommandFactory, Parser};
 
 use cli_def::{Cli, Cmd, ConfigCmd, OutFormat, OutputFormat, SamplingArgs, WeightsCmd};
 use clap_complete::Shell;
+use std::io::IsTerminal;
 use npu_engine::telemetry::wire;
 use exit::{engine_error, Code, Tagged};
 use npu_runtime::actor::{start, start_lazy};
@@ -82,6 +83,7 @@ fn run(cli: &Cli, path: &Path) -> Result<()> {
         Cmd::Chat { prompt, model, sampling, no_stream } =>
             chat(path, prompt.as_deref(), model.as_deref(), sampling, *no_stream, as_json),
         Cmd::Embed { text, model } => embed(path, text, model.as_deref(), as_json),
+        Cmd::Top { interval, once, port } => top(path, *interval, *once, *port),
         Cmd::Stats { log, diff } => stats_cmd(log, diff.as_deref()),
         Cmd::Replay { log, realtime, frames } => replay_cmd(log, *realtime, *frames),
         Cmd::Diarize { wav, model, json } => diarize(path, wav, model.as_deref(), *json || as_json),
@@ -978,6 +980,101 @@ fn models(path: &Path, as_json: bool, port: Option<u16>) -> Result<()> {
 ///
 /// The pid check costs one `stat` of `/proc/<pid>`, cannot hang, and cannot be fooled by a leftover
 /// directory -- which the directory test could not say the same of.
+/// `hh:mm:ss` from seconds, or `mm:ss` under an hour. Uptimes and device times are read at a
+/// glance far more often than they are computed with.
+fn hms(secs: u64) -> String {
+    let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+    if h > 0 { format!("{h}h{m:02}m{s:02}s") } else if m > 0 { format!("{m}m{s:02}s") } else { format!("{s}s") }
+}
+
+/// One frame of `npu top`, rendered from a status snapshot.
+///
+/// Pure so the layout is testable without a service, a device or a clock: everything it needs is
+/// the parsed document and the moment it was read.
+fn top_frame(doc: &serde_json::Value, age_s: u64, now_unix: i64) -> String {
+    let models = doc["models"]["data"].as_array().cloned().unwrap_or_default();
+    let started = doc["started_unix"].as_i64().unwrap_or(0);
+    // A service that publishes no start time (an older binary) gets no denominator, and therefore
+    // no percentage -- rather than a percentage of a guessed window.
+    let uptime = (started > 0).then(|| (now_unix - started).max(0) as u64);
+
+    let n = |m: &serde_json::Value, k: &str| m.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+    let busy_total: u64 = models.iter().map(|m| n(m, "busy_us")).sum();
+    let resident = models.iter().filter(|m| m["state"] == "loaded").count();
+    let on_device: u64 = models.iter().map(|m| n(m, "bo_bytes")).sum();
+    let serving = models.iter().find(|m| m["busy"] == true);
+
+    let mut o = String::new();
+    o.push_str(&format!(
+        "npu top  ·  pid {}  ·  port {}  ·  up {}  ·  snapshot {age_s}s old\n",
+        doc["pid"].as_u64().unwrap_or(0), doc["port"].as_u64().unwrap_or(0),
+        uptime.map(hms).unwrap_or_else(|| "?".into())));
+    let occupancy = match uptime.filter(|u| *u > 0) {
+        Some(u) => format!("{:.1}%", 100.0 * (busy_total as f64 / 1e6) / u as f64),
+        None => "-".into(),
+    };
+    o.push_str(&format!(
+        "device busy {occupancy}  ·  {resident}/{} resident  ·  {} on device  ·  now: {}\n\n",
+        models.len(), mem_cell(Some(on_device)),
+        serving.map(|m| format!("serving {}", m["id"].as_str().unwrap_or("?")))
+               .unwrap_or_else(|| "idle".into())));
+
+    o.push_str(&format!("{:<22} {:<9} {:<9} {:<6} {:<5} {:>7} {:>10} {:>6} {:>6}\n",
+        "MODEL", "KIND", "STATE", "MEM", "BUSY", "SERVED", "DEVICE", "SHARE", "IDLE"));
+    // Busiest first: the question a top asks is "what is using this", and an alphabetical answer
+    // makes the reader do the sorting.
+    let mut rows: Vec<&serde_json::Value> = models.iter().collect();
+    rows.sort_by_key(|m| std::cmp::Reverse(n(m, "busy_us")));
+    for m in rows {
+        let busy_us = n(m, "busy_us");
+        let share = match uptime.filter(|u| *u > 0) {
+            Some(u) => format!("{:.1}%", 100.0 * (busy_us as f64 / 1e6) / u as f64),
+            None => "-".into(),
+        };
+        o.push_str(&format!("{:<22} {:<9} {:<9} {:<6} {:<5} {:>7} {:>10} {:>6} {:>6}\n",
+            m["id"].as_str().unwrap_or("?"),
+            m["kind"].as_str().unwrap_or("-"),
+            m["state"].as_str().unwrap_or("-"),
+            mem_cell(m.get("bo_bytes").and_then(|b| b.as_u64())),
+            if m["busy"] == true { "yes" } else { "no" },
+            n(m, "served"),
+            hms(busy_us / 1_000_000),
+            share,
+            m.get("idle_s").and_then(|i| i.as_u64()).map(|i| hms(i)).unwrap_or_else(|| "-".into())));
+    }
+    o
+}
+
+fn top(path: &Path, interval: f64, once: bool, port: Option<u16>) -> Result<()> {
+    let cfg = load_cfg(path)?;
+    let want = port.unwrap_or(cfg.server.port);
+    // Piping a repainting screen produces escape-code soup, so a non-terminal gets one snapshot --
+    // the same reasoning that puts the generation footer on stderr.
+    let once = once || !std::io::stdout().is_terminal();
+    let period = std::time::Duration::from_secs_f64(interval.max(0.1));
+    loop {
+        match read_live_status(want) {
+            Some((age, doc)) => {
+                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64).unwrap_or(0);
+                let frame = top_frame(&doc, age, now);
+                // Home + clear-below, not clear-screen: the terminal keeps its scrollback and the
+                // frame does not flash.
+                if !once { print!("\x1b[H\x1b[J"); }
+                print!("{frame}");
+                std::io::stdout().flush().ok();
+            }
+            None => {
+                if !once { print!("\x1b[H\x1b[J"); }
+                println!("npu top: no service publishing status for port {want} \
+                          (start it with `systemctl --user start xdna-engine`)");
+            }
+        }
+        if once { return Ok(()); }
+        std::thread::sleep(period);
+    }
+}
+
 fn read_live_status(want_port: u16) -> Option<(u64, serde_json::Value)> {
     let p = npu_runtime::status_file::path()?;
     let body = std::fs::read_to_string(p).ok()?;
@@ -1345,6 +1442,57 @@ fn http_req(port: u16, method: &str, path: &str, body: &str) -> Result<String> {
 mod tests {
     use super::*;
     use npu_runtime::config::{Defaults, ModelCfg, ServerCfg};
+
+    fn top_doc(started: i64, extra: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "pid": 42, "port": 11434, "started_unix": started,
+            "models": { "data": [
+                {"id":"qwen3-0.6b","kind":"generate","state":"loaded","bo_bytes":1_500_000_000u64,
+                 "busy":false,"served":3,"busy_us":3_000_000u64,"idle_s":1},
+                {"id":"bge-base","kind":"embed","state":"loaded","bo_bytes":0,
+                 "busy":true,"served":1,"busy_us":500_000u64,"idle_s":0},
+                extra,
+            ]}
+        })
+    }
+
+    #[test]
+    fn top_reports_occupancy_against_uptime_and_sorts_by_it() {
+        let idle = serde_json::json!({"id":"whisper-turbo","kind":"asr","state":"unloaded",
+                                      "bo_bytes":0,"busy":false,"served":0,"busy_us":0});
+        // 3.5 s of device time over 100 s of uptime.
+        let f = top_frame(&top_doc(1_000, idle), 0, 1_100);
+        assert!(f.contains("up 1m40s"), "{f}");
+        assert!(f.contains("device busy 3.5%"), "{f}");
+        assert!(f.contains("serving bge-base"), "a busy model is named in the header: {f}");
+        assert!(f.contains("1.4G"), "device totals are humanised: {f}");
+
+        // Busiest first -- a top that answers alphabetically makes the reader do the sorting.
+        let rows: Vec<&str> = f.lines().skip_while(|l| !l.starts_with("MODEL")).skip(1).collect();
+        assert!(rows[0].starts_with("qwen3-0.6b"), "{rows:?}");
+        assert!(rows[1].starts_with("bge-base"), "{rows:?}");
+        assert!(rows[0].contains("7.4%") || rows[0].contains("3.0%"), "share is per model: {}", rows[0]);
+    }
+
+    #[test]
+    fn top_shows_no_percentage_when_the_service_publishes_no_start_time() {
+        // An older service publishes no `started_unix`. A percentage needs a window, and inventing
+        // one would be a measurement over a guess.
+        let idle = serde_json::json!({"id":"x","kind":"asr","state":"unloaded","bo_bytes":0,
+                                      "busy":false,"served":0,"busy_us":0});
+        let f = top_frame(&top_doc(0, idle), 5, 1_100);
+        assert!(f.contains("up ?"), "{f}");
+        assert!(f.contains("device busy -"), "{f}");
+        assert!(f.contains("snapshot 5s old"), "staleness is always shown: {f}");
+    }
+
+    #[test]
+    fn hms_reads_at_a_glance() {
+        assert_eq!(hms(0), "0s");
+        assert_eq!(hms(59), "59s");
+        assert_eq!(hms(61), "1m01s");
+        assert_eq!(hms(3_661), "1h01m01s");
+    }
 
     #[test]
     fn unmeasured_device_memory_reads_as_absent_not_as_zero() {

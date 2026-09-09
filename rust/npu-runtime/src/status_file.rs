@@ -50,14 +50,25 @@ pub fn path() -> Option<PathBuf> { dir().map(|d| d.join(FILE_NAME)) }
 ///
 /// Written to a temporary and renamed, because a reader that catches a half-written file would get
 /// a parse error that reads like a corrupt service rather than a race.
+/// When this process began serving, in unix seconds. Fixed at the first publish, which is close
+/// enough to start-up for the denominator of a utilisation figure and needs no new plumbing.
+///
+/// `npu top` divides cumulative busy time by this to get device occupancy. Without it the reader
+/// would have to guess a window, and a percentage over a guessed window is not a measurement.
+fn started_unix() -> u64 {
+    static T: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *T.get_or_init(|| std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0))
+}
+
 pub fn publish(port: u16, status: &[ModelStatus]) {
     let Some(p) = path() else { return };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     let body = crate::http::models_json(status);
     let doc = format!(
-        "{{\"written_unix\":{now},\"pid\":{},\"port\":{port},\"models\":{body}}}",
-        std::process::id());
+        "{{\"written_unix\":{now},\"started_unix\":{},\"pid\":{},\"port\":{port},\"models\":{body}}}",
+        started_unix(), std::process::id());
     let tmp = p.with_extension("json.tmp");
     if let Some(parent) = p.parent() {
         let _ = std::fs::create_dir_all(parent);

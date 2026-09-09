@@ -173,6 +173,7 @@ npu generate "..." --output json --no-stream   # one chat.completion object inst
 npu stats run.jsonl                      # render a log
 npu stats a.jsonl --diff b.jsonl         # compare two runs
 npu replay run.jsonl [--realtime] [--frames]
+npu top                                  # live: who is resident, serving, and for how long
 ```
 
 `--output json` follows the stream flag, the way `/v1/chat/completions` does, so the streaming form
