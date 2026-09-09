@@ -21,6 +21,12 @@
 #ifndef ATTN_NO_CTX
 #define ATTN_NO_CTX 0
 #endif
+// The bisect switch at the mm_2x2 sites. It joins its four siblings above only now, because
+// nothing ever defined it and `#if` on an undefined macro is silently 0 -- until the toolchain
+// started passing -Werror=undef, which turned the two uses into build errors. Value unchanged.
+#ifndef ATTN_MMUL_REF
+#define ATTN_MMUL_REF 0
+#endif
 // aie2p load_v is an ALIGNED op: an unaligned base is SILENTLY truncated to the 128b boundary
 // (see the aie2p-unaligned-vector-load-truncation note). Every tile offset here is naturally
 // aligned, so only the objectFIFO buffer BASE can break it -- and that is allocator-dependent,
