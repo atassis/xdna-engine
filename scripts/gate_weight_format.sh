@@ -47,6 +47,9 @@ export MLIR_AIE_INSTANCE="$INST"
 export PATH="$VENV/bin:$VENV/cc-shim:$AIEBU_ASM_DIR:$PATH"
 export CUDA_VISIBLE_DEVICES=""
 POS="${GATE_POSITIONS:-1 64 256}"; REPS="${GATE_REPS:-30}"
+# The bench builds its own graph and defaults --max-seq 2048. A ladder arm is defined by its
+# window, so without this the harness silently measures a DIFFERENT graph from the one shipped.
+MAXSEQ="${GATE_MAX_SEQ:-}"
 TOK="${GATE_TOKENS:-2000}"; PASSES="${GATE_PASSES:-2}"
 # GATE_PHASES=all|bench|ppl. Splitting them is for re-running ONE half after a harness fix; a
 # real gate runs both in one device hold, because that is what makes the control contemporaneous.
@@ -67,6 +70,7 @@ for pass in $(seq 1 "$PASSES"); do
       # shellcheck disable=SC2086  -- POS is a deliberate word list
       "$VENV/bin/python" "$REPO/designs/decode_fused/bench_llm_decode.py" --spec "$SPEC" \
         --weights "$REPO/artifacts/$SPEC/weights" --positions $POS --reps "$REPS" \
+        ${MAXSEQ:+--max-seq $MAXSEQ} \
         --det-runs 5 --out-json "$OUT/bench-$t-p$pass.json" ) || echo "[gate] bench $t FAILED"
   done
 done
