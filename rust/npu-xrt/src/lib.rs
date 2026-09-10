@@ -1271,6 +1271,14 @@ impl ElfResident {
         unsafe { shim_elf_resident_scratchpad_size(self.ptr) }
     }
 
+    /// The kernel name this resident dispatches -- `main:sequence`, or `main:<variant>` for one
+    /// opened by [`ElfResident::open_named`]. Exposed so a caller can PROVE which control code ran
+    /// rather than assume it: a variant that silently fell back to the default would otherwise
+    /// produce a passing parity test that tested nothing.
+    pub fn kernel_name(&self) -> &str {
+        &self.label
+    }
+
     /// A SECOND named control code out of the same ELF, on the same registered `hw_context`.
     ///
     /// A full ELF may carry several runtime sequences; aiecc emits one control code per sequence

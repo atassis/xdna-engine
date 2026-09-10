@@ -449,6 +449,21 @@ impl NpuDecodeStep {
         Ok(NpuDecodeStep { artifact, arena, buckets, embed, rope_writes, prefill, provenance })
     }
 
+    /// `(window, kernel name)` for every bucket, ascending by window. The kernel name is what
+    /// proves a rung is a distinct control code rather than the default under another label:
+    /// rungs read `main:<variant>` while a bucket-artifact ladder reads `main:sequence` for all of
+    /// them, because those are separate ELFs.
+    pub fn bucket_kernels(&self) -> Vec<(usize, String)> {
+        self.buckets.iter().map(|b| (b.window, b.res.kernel_name().to_string())).collect()
+    }
+
+    /// Which bucket `pos` selects -- `(window, kernel name)`. Exposed for gates: a rung crossing
+    /// is only tested if the test can show the arm actually changed at the boundary.
+    pub fn bucket_for(&self, pos: usize) -> (usize, String) {
+        let i = bucket_index(self.buckets.iter().map(|b| b.window), pos).unwrap();
+        (self.buckets[i].window, self.buckets[i].res.kernel_name().to_string())
+    }
+
     /// Re-zero every KV-cache scratch buffer (`meta.json`'s `cache_buffers`) and sync. Call before
     /// each new generation on a REUSED instance; a freshly-constructed instance is already zero (the
     /// artifact's own cache-buffer blobs are all-zero) and does not need this.
