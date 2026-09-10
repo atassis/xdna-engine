@@ -70,13 +70,49 @@ pub enum Scenario {
 // Text generation (decoder-LLM). Added for `llm-serve-openai-surface`.
 // ---------------------------------------------------------------------------------------------
 
-/// One turn of a chat conversation. `role` is OpenAI's vocabulary (`system`/`user`/`assistant`);
-/// it stays a String because the set is the wire protocol's, not ours, and a model's chat template
-/// is free to recognise roles we have never heard of.
-#[derive(Debug, Clone)]
+/// One assistant tool call.
+///
+/// `arguments` is the model's JSON as parsed, and `id` is ours: OpenAI requires one on every call
+/// and no model emits it, so the parser assigns `call_<n>` by position.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: serde_json::Value,
+}
+
+/// One turn of a chat conversation. `role` is OpenAI's vocabulary (`system`/`user`/`assistant`/
+/// `tool`); it stays a String because the set is the wire protocol's, not ours, and a model's chat
+/// template is free to recognise roles we have never heard of.
+///
+/// Construct with [`ChatMessage::new`] rather than a struct literal: this type grew two fields on
+/// 2026-09-10 and broke six literal sites doing it.
+#[derive(Debug, Clone, Default)]
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+    /// Non-empty only on an assistant turn that called a tool. Chat templates read this directly
+    /// (`{%- if message.tool_calls %}`), so it must be ABSENT rather than empty when rendering --
+    /// Jinja truthiness and `transformers` agree on that only if we do not emit the key.
+    pub tool_calls: Vec<ToolCall>,
+    /// `role == "tool"` only. Qwen3's template ignores it; others thread it back to the call.
+    pub tool_call_id: Option<String>,
+}
+
+impl ChatMessage {
+    pub fn new(role: impl Into<String>, content: impl Into<String>) -> Self {
+        ChatMessage { role: role.into(), content: content.into(), ..Default::default() }
+    }
+
+    pub fn with_tool_calls(mut self, calls: Vec<ToolCall>) -> Self {
+        self.tool_calls = calls;
+        self
+    }
+
+    pub fn with_tool_call_id(mut self, id: impl Into<String>) -> Self {
+        self.tool_call_id = Some(id.into());
+        self
+    }
 }
 
 /// What the caller wants continued. The distinction is not cosmetic: `Chat` must go through the
@@ -403,5 +439,25 @@ mod generation_tests {
         assert!(p(None, None, Some(-2.1)).validate().unwrap_err().contains("presence_penalty"));
         assert!(p(Some(f32::NAN), None, None).validate().unwrap_err().contains("finite"));
         assert!(p(Some(f32::INFINITY), None, None).validate().unwrap_err().contains("finite"));
+    }
+
+    /// A tool-result turn and an assistant turn that called a tool are both MESSAGES, and every
+    /// chat template reads `message.tool_calls` and `role == "tool"` directly. Carrying only
+    /// `{role, content}` made the tool half of every template unreachable.
+    #[test]
+    fn chat_message_carries_tool_calls_and_defaults_to_none() {
+        let plain = ChatMessage::new("user", "hi");
+        assert!(plain.tool_calls.is_empty() && plain.tool_call_id.is_none());
+
+        let called = ChatMessage::new("assistant", "").with_tool_calls(vec![ToolCall {
+            id: "call_0".into(),
+            name: "get_weather".into(),
+            arguments: serde_json::json!({ "city": "Paris" }),
+        }]);
+        assert_eq!(called.tool_calls[0].name, "get_weather");
+        assert_eq!(called.tool_calls[0].arguments["city"], "Paris");
+
+        let result = ChatMessage::new("tool", r#"{"temp_c": 14}"#).with_tool_call_id("call_0");
+        assert_eq!(result.tool_call_id.as_deref(), Some("call_0"));
     }
 }

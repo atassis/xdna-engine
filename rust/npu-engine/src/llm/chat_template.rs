@@ -237,7 +237,7 @@ mod tests {
     }
 
     fn msg(role: &str, content: &str) -> ChatMessage {
-        ChatMessage { role: role.to_string(), content: content.to_string() }
+        ChatMessage::new(role, content)
     }
 
     #[test]

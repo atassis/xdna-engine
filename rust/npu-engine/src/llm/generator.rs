@@ -1189,7 +1189,7 @@ mod tests {
         ]);
         let mut gen = LlmGenerator::new(cfg, decode);
         let params = GenerateParams { max_tokens: Some(5), temperature: Some(0.0), ..GenerateParams::default() };
-        let prompt = Prompt::Chat(vec![ChatMessage { role: "user".to_string(), content: "hello world".to_string() }]);
+        let prompt = Prompt::Chat(vec![ChatMessage::new("user", "hello world")]);
         let (text, reason, usage) = gen.generate_to_string(&prompt, &params).unwrap();
         assert_eq!(text, "");
         assert_eq!(reason, FinishReason::Stop);

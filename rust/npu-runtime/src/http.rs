@@ -834,7 +834,7 @@ pub mod parse {
             let role = m.get("role").and_then(|r| r.as_str())
                 .ok_or_else(|| format!("messages[{i}]: missing \"role\""))?.to_string();
             let content = parse_content(m.get("content")).map_err(|e| format!("messages[{i}]: {e}"))?;
-            chat.push(npu_engine::ChatMessage { role, content });
+            chat.push(npu_engine::ChatMessage::new(role, content));
         }
         let params = parse_generate_params(&v)?;
         let stream = v.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);

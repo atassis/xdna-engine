@@ -517,10 +517,7 @@ fn generate(path: &Path, prompt: &str, model: Option<&str>, sampling: &SamplingA
     let prompt = if raw {
         npu_engine::Prompt::Raw(prompt.to_string())
     } else {
-        npu_engine::Prompt::Chat(vec![npu_engine::ChatMessage {
-            role: "user".to_string(),
-            content: prompt.to_string(),
-        }])
+        npu_engine::Prompt::Chat(vec![npu_engine::ChatMessage::new("user", prompt)])
     };
     let result = handle.generate(model, prompt, params)
         .map_err(|e| {
@@ -639,7 +636,7 @@ fn chat(path: &Path, opening: Option<&str>, model: Option<&str>, sampling: &Samp
                     line
                 }
             };
-            history.push(npu_engine::ChatMessage { role: "user".into(), content: line });
+            history.push(npu_engine::ChatMessage::new("user", line));
             let served = handle.generate(model, npu_engine::Prompt::Chat(history.clone()), params.clone())
                 .map_err(|e| Tagged(engine_error(&e), e.to_string()))?;
             let meta = cli_meta(&served.model, true);
@@ -656,7 +653,7 @@ fn chat(path: &Path, opening: Option<&str>, model: Option<&str>, sampling: &Samp
                 println!();
                 print_stats_footer(&g, false);
             }
-            history.push(npu_engine::ChatMessage { role: "assistant".into(), content: g.text });
+            history.push(npu_engine::ChatMessage::new("assistant", g.text));
         }
     })();
     handle.shutdown(); let _ = join.join();
