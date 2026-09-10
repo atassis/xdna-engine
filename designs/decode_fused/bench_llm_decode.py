@@ -8,7 +8,7 @@ build_graph so the numbers describe the artifact the parity gate already exercis
 copy that can drift from it.
 
   python designs/decode_fused/bench_llm_decode.py --spec qwen3-0.6b \
-      --weights /path/to/artifacts-qwen3-0.6b/weights --out-json /tmp/bench.json
+      --weights artifacts/qwen3-0.6b/weights --out-json /tmp/bench.json
 
 Measured with time.perf_counter() (monotonic), never wall clock:
 
@@ -46,6 +46,8 @@ import sys
 import time
 
 import numpy as np
+
+from verify_llm_decode import window_len  # one owner for the formula; see its docstring
 import ml_dtypes
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -119,6 +121,8 @@ def main():
     sp, fused, weights, md = build_graph(a.spec, a.weights, a.layers, a.max_seq)
     build_s = now() - t0
     NL, S, T = md["NL"], md["S"], md["T"]
+    # None unless the build wired a runtime window; gates every attn_window write below.
+    window_granule = md.get("window_granule")
     HD, D, VOCAB = sp.head_dim, sp.d_model, sp.vocab
     kv_layout = KVLayout(Hkv=sp.n_kv_heads, S=S, HD=HD, T=T)
     print(f"[bench] build_graph: {build_s:.1f}s  ({sp.name}, {NL} layers, S={S}, vocab={VOCAB})",
@@ -193,6 +197,14 @@ def main():
         t2 = now()
         params.write("kv_off", int(kv_layout.kv_off(pos)))
         params.write("sm_mask", int(pos + 1))
+        # The attended length, when the build declared a runtime window. Timing this graph with
+        # attn_window UNWRITTEN would not merely be inaccurate -- the core bounds both KV-chunk
+        # loops on it, so it would time a garbage window. Raw value, no shift: ParameterScratchpad
+        # resolves the kind from params.txt and shifts core-kind itself (param_scratchpad_compat
+        # .py:84), so pre-shifting here would shift twice. Same call shape verify_llm_decode.py
+        # uses; that file owns window_len and the two must not drift.
+        if window_granule is not None:
+            params.write("attn_window", min(window_len(pos, window_granule), S))
         params.sync()
         t3 = now()
         c()
