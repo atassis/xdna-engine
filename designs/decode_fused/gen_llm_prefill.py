@@ -664,13 +664,26 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
                 shared=[n for n in dec_order if not n.startswith("__decode_gap")],
                 reserved=dec_reserved, prefill_local=prefill_local,
                 rl=rl, runlist_len=len(rl), per_layer=len(rl) // NL,
-                # The CONFIGURE count. `share_designs` collapses operators reporting the same
-                # design_key onto one design, which is built, prefixed and configured ONCE -- so
-                # this, not the runlist length, is how many setups a dispatch pays for. Measured
-                # 2026-09-09: a block's dispatch time is `per-design setup + bytes`, and the setup
-                # term is the larger one at M=256, so the number belongs in the artifact.
-                n_designs=len(fused.unique_designs()[0]))
+                # TWO different numbers, and conflating them understated the configure count by
+                # 31x. `n_designs` is how many designs get BUILT -- `share_designs` collapses
+                # operators reporting the same design_key onto one. `n_configures` is how many
+                # setups the dispatch PAYS for, and D009 prices that one: a configure covers a
+                # CONTIGUOUS same-design block, offsets free inside it, so one design reached at
+                # three separate points in the runlist costs three. Runs inside a block ride free.
+                n_designs=len(fused.unique_designs()[0]),
+                n_configures=count_configures(rl, fused))
     return sp, fused, dims
+
+
+def count_configures(runlist, fused):
+    """Contiguous same-design blocks in `runlist` -- the unit D009 prices, at 51.0-61.9 us each.
+
+    Uses the sequence's OWN design assignment (`unique_designs()[1]`) rather than a second notion
+    of identity here, so this cannot drift from what the build actually configures.
+    """
+    _, design_of = fused.unique_designs()
+    ids = [design_of[id(op)] for op, *_ in runlist]
+    return 1 + sum(1 for a, b in zip(ids, ids[1:]) if a != b) if ids else 0
 
 
 def operand_traffic(op, bufs, resolve):
@@ -903,8 +916,9 @@ def main():
               if dec_meta_path else
               f"[layout] {NL} layers, M={M} S={S}: {dims['runlist_len']} runlist entries, "
               f"{dims['n_designs']} designs, scratch {scr/1e6:.1f}MB (standalone arena)")
-        print(f"[layout] designs (= configures) {dims['n_designs']}, "
-              f"{dims['n_designs']/NL:.1f}/layer")
+        print(f"[layout] {dims['n_designs']} designs built; "
+              f"{dims['n_configures']} CONFIGURES paid "
+              f"({dims['n_configures']/NL:.1f}/layer) -- the unit D009 prices")
         op_census(dims["rl"], fused.get_layout_for_buffer, NL)
         return
     D, FF, HD = sp.d_model, sp.ffn, sp.head_dim
@@ -1031,7 +1045,7 @@ def main():
                  "tile_n_scores": dims["tn_sc"],
                  "tile_n_ctx": dims["tn_cx"], "cols": dims["cols"],
                  "runlist": dims["runlist_len"], "runlist_per_layer": dims["per_layer"],
-                 "designs": dims["n_designs"]},
+                 "designs": dims["n_designs"], "configures": dims["n_configures"]},
         "host_protocol": {
             "batch": M,
             "x": f"[{M}, {D}] bf16 token-major embeddings for this chunk "
