@@ -1252,8 +1252,13 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
                                     # DYNAMIC_WINDOW alone, so a stray env var on an ineligible
                                     # spec cannot claim a window_param/window_granule that was
                                     # never actually built.
-                                    window_granule=(op_decode_layer.window_granule
-                                                    if op_decode_layer is not None else None))
+                                    # getattr, not attribute access: the guard above establishes
+                                    # that the op EXISTS, not that it carries this field. An IRON
+                                    # whose decode_layer_dp predates window_parameter -- the
+                                    # default IRON_DIR is one -- builds a perfectly good op with
+                                    # no such attribute, and reading it raises. Second instance of
+                                    # the same seam as the kwarg above, found the same way.
+                                    window_granule=getattr(op_decode_layer, "window_granule", None))
 
 
 def main():
