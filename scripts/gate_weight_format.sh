@@ -47,7 +47,7 @@ export MLIR_AIE_INSTANCE="$INST"
 export PATH="$VENV/bin:$VENV/cc-shim:$AIEBU_ASM_DIR:$PATH"
 export CUDA_VISIBLE_DEVICES=""
 POS="${GATE_POSITIONS:-1 64 256}"; REPS="${GATE_REPS:-30}"
-# The bench builds its own graph and defaults --max-seq 2048. A ladder arm is defined by its
+# The bench builds its own graph and defaults --max-seq 2048. A window bucket is defined by its
 # window, so without this the harness silently measures a DIFFERENT graph from the one shipped.
 MAXSEQ="${GATE_MAX_SEQ:-}"
 TOK="${GATE_TOKENS:-2000}"; PASSES="${GATE_PASSES:-2}"

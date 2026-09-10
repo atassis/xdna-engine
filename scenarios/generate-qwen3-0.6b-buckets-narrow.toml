@@ -1,0 +1,25 @@
+[scenario]
+kind = "generate"
+name = "qwen3-0.6b-buckets-narrow"
+
+# POSITIVE CONTROL for bucketing, not a shipping config.
+#
+# The primary is the 1024-window bucket; every WIDER one is reachable only through
+# `decode_buckets`. So bucketing's presence is OBSERVABLE rather than inferred: `max_context` is
+# the widest bucket, which is 4096 if they loaded and 1024 if `decode_buckets` was silently
+# ignored. A generation past 1024 positions therefore succeeds only when bucketing really engaged.
+#
+# This exists because the parity and crossing gates both compare a bucketed run against a control
+# that would pass identically if bucketing were a no-op. A test that cannot fail proves nothing.
+[artifacts]
+decode = "artifacts/qwen3-0.6b/buckets4096/w1024"
+decode_buckets = [
+    "artifacts/qwen3-0.6b/buckets4096/w2048",
+    "artifacts/qwen3-0.6b/buckets4096/w3072",
+    "artifacts/qwen3-0.6b/buckets4096/w4096",
+]
+weights = "artifacts/qwen3-0.6b/weights"
+tokenizer_dir = "artifacts/qwen3-0.6b/tokenizer"
+
+[generation]
+max_tokens = 1024

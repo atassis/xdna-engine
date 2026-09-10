@@ -92,9 +92,9 @@ pub enum RopeBase {
 /// A validated, ready-to-drive fused decode ELF: every buffer the artifact declares has a checked
 /// location, and the scratchpad protocol (`kv_off`/`sm_mask`) is resolved to concrete offsets.
 ///
-/// `Clone` is metadata-only and paid once at load: a window ladder keeps one of these per arm so
-/// every arm reads its OWN scratchpad offsets rather than the primary's. It clones maps and paths,
-/// never a buffer -- the arena and the ELF bytes live elsewhere.
+/// `Clone` is metadata-only and paid once at load: window bucketing keeps one of these per bucket
+/// so every bucket reads its OWN scratchpad offsets rather than the primary's. It clones maps and
+/// paths, never a buffer -- the arena and the ELF bytes live elsewhere.
 #[derive(Debug, Clone)]
 pub struct LlmArtifact {
     pub role: ArtifactRole,

@@ -245,16 +245,16 @@ FUSE_MLP_O = os.environ.get("FUSE_MLP_O", "1") == "1"
 # it. An A/B axis, not a settled default.
 WEIGHT_DEPTH = int(os.environ.get("WEIGHT_DEPTH", "2"))
 # KV_ALLOC -- allocate the KV cache for a WIDE capacity while attention computes over a NARROW
-# window, so a ladder of window arms can share ONE cache. Since the blocked layout landed this is
+# window, so window buckets can share ONE cache. Since the blocked layout landed this is
 # nearly free to express: KVLayout owns every stride and buffer size, so widening the capacity is
 # ONE argument to it plus the operators' own alloc_M/alloc_K. Default 0 = capacity is the window,
 # byte for byte the pre-existing build.
 KV_ALLOC = int(os.environ.get("KV_ALLOC", "0"))
-# Pin the persistent buffers (weights + KV cache) to the FRONT of the scratch arena so a ladder of
-# window arms presents ONE layout for everything that survives a bucket crossing. Without it the
+# Pin the persistent buffers (weights + KV cache) to the FRONT of the scratch arena so window
+# buckets present ONE layout for everything that survives a bucket crossing. Without it the
 # window-sized softmax scratch (sc/sw, Hq*S) sits ahead of them and shifts every later offset:
-# measured, arms at window 256 and 512 over one allocation disagreed on 304 of 313 named offsets.
-LADDER_SCRATCH_ORDER = os.environ.get("LADDER_SCRATCH_ORDER", "0") == "1"
+# measured, buckets at window 256 and 512 over one allocation disagreed on 304 of 313 offsets.
+BUCKET_SCRATCH_ORDER = os.environ.get("BUCKET_SCRATCH_ORDER", "0") == "1"
 # Weight tile ROWS for the fused MLP. Trades against WEIGHT_DEPTH at constant L1.
 MLP_TILE_ROWS = int(os.environ.get("MLP_TILE_ROWS", "0"))
 
@@ -1228,7 +1228,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
                               input_args=inputs, output_args=["logits"],
                               buffer_sizes=bufsz, context=ctx, extra_flags=placer_flags,
                               share_designs=share,
-                              **({"scratch_order": list(weights.keys())} if LADDER_SCRATCH_ORDER else {}))
+                              **({"scratch_order": list(weights.keys())} if BUCKET_SCRATCH_ORDER else {}))
     fused.compile()
     return sp, fused, weights, dict(NL=NL, S=S, T=T, inputs=inputs, cache_names=cache_names,
                                     embed_blob=embed_blob, host_embed=host_embed)

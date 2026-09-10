@@ -2,10 +2,11 @@
 kind = "generate"
 name = "qwen3-0.6b-w4096"
 
-# The ladder's CONTROL: the identical top-rung artifact with no ladder declared, so it runs the
-# single-arm rail. Any token-id difference against the ladder scenario is the ladder, not the build.
+# The CONTROL for bucketing: the identical widest artifact with no buckets declared, so it runs the
+# single-bucket rail. Any token-id difference against the bucketed scenario is bucketing, not the
+# build.
 [artifacts]
-decode = "artifacts/qwen3-0.6b/ladder4096/w4096"
+decode = "artifacts/qwen3-0.6b/buckets4096/w4096"
 weights = "artifacts/qwen3-0.6b/weights"
 tokenizer_dir = "artifacts/qwen3-0.6b/tokenizer"
 

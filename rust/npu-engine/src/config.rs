@@ -77,11 +77,11 @@ pub struct DiarizationCfg {
     pub manifest: String,
 }
 
-/// Decode-backend tier: a rung on the device ladder, not an
-/// implementation name, so a kernel rename or a new artifact dir under an existing tier never
-/// touches a scenario file. Named after the three backends `WhisperAsr::build` already has:
-/// `FusedDecoder` (whole-decoder ELF, one dispatch/token), the per-op `NPU_DECODE` NPU path
-/// (~72 dispatches/token), and the host ONNX decoder graphs -- the one arm BELOW the ladder.
+/// Decode-backend tier: how far onto the device the decoder runs, not an implementation name, so
+/// a kernel rename or a new artifact dir under an existing tier never touches a scenario file.
+/// Named after the three backends `WhisperAsr::build` already has: `FusedDecoder` (whole-decoder
+/// ELF, one dispatch/token), the per-op `NPU_DECODE` NPU path (~72 dispatches/token), and the host
+/// ONNX decoder graphs -- the one tier that never reaches the device at all.
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum DecodeTier {
@@ -227,17 +227,17 @@ pub struct Artifacts {
     #[serde(default)]
     pub prefill: String,
     /// `kind = "generate"`, optional: additional decode ELFs for the SAME model at NARROWER
-    /// attention windows over the SAME KV allocation -- a resident window ladder. Each is bound to
-    /// the one arena `decode` already owns, so N arms cost N hardware contexts and no extra weight
-    /// memory; the engine picks the narrowest arm whose window covers the current position, and
-    /// the padded window stops being paid at every position below the top rung.
+    /// attention windows over the SAME KV allocation -- resident window buckets. Each is bound to
+    /// the one arena `decode` already owns, so N buckets cost N hardware contexts and no extra
+    /// weight memory; the engine picks the narrowest bucket whose window covers the current
+    /// position, and the padded window stops being paid below the widest one.
     ///
-    /// Each arm's window is read from its own `meta.json` `dims.S`, never from its path, and every
-    /// arm's shared arena offsets are checked against `decode`'s at load -- so an arm generated
-    /// against a different allocation fails loud rather than corrupting the cache. Empty (the
-    /// default) is exactly the single-arm rail.
+    /// Each bucket's window is read from its own `meta.json` `dims.S`, never from its path, and
+    /// every bucket's shared arena offsets are checked against `decode`'s at load -- so a bucket
+    /// generated against a different allocation fails loud rather than corrupting the cache. Empty
+    /// (the default) is exactly the single-bucket rail.
     #[serde(default)]
-    pub decode_ladder: Vec<String>,
+    pub decode_buckets: Vec<String>,
     /// `kind = "generate"` only: the checkpoint's directory (`tokenizer.json`,
     /// `tokenizer_config.json`, `generation_config.json`), read through `llm::ModelConfig::load`.
     /// Separate from `tokenizer` above, which every other scenario points at a single
@@ -375,28 +375,28 @@ manifest = "artifacts/pyannote/diarize.json"
         }
     }
 
-    /// The ladder is opt-in and its ABSENCE must stay the single-arm rail: every scenario shipped
-    /// before it parses unchanged, with no arms. Asserted on an inline scenario rather than a
-    /// shipped file, so it does not pin that file's current content.
+    /// Bucketing is opt-in and its ABSENCE must stay the single-bucket rail: every scenario
+    /// shipped before it parses unchanged, declaring none. Asserted on an inline scenario rather
+    /// than a shipped file, so it does not pin that file's current content.
     #[test]
-    fn a_scenario_naming_no_ladder_gets_no_arms() {
+    fn a_scenario_declaring_no_buckets_gets_none() {
         let c = ScenarioConfig::from_str(
             "[scenario]\nkind = \"generate\"\nname = \"m\"\n[artifacts]\ndecode = \"d\"\nweights = \"w\"\ntokenizer_dir = \"t\"\n",
         )
-        .expect("a scenario with no decode_ladder must parse");
-        assert!(c.artifacts.decode_ladder.is_empty());
+        .expect("a scenario with no decode_buckets must parse");
+        assert!(c.artifacts.decode_buckets.is_empty());
     }
 
-    /// And when it IS named, the arms arrive in declaration order. Order is not load-bearing --
-    /// the engine sorts by each artifact's own `dims.S` -- but a config that silently dropped
+    /// And when they ARE named, the buckets arrive in declaration order. Order is not load-bearing
+    /// -- the engine sorts by each artifact's own `dims.S` -- but a config that silently dropped
     /// entries would look identical to one that named none.
     #[test]
-    fn a_declared_ladder_parses_every_arm() {
+    fn a_declared_bucket_list_parses_every_entry() {
         let c = ScenarioConfig::from_str(
-            "[scenario]\nkind = \"generate\"\nname = \"m\"\n[artifacts]\ndecode = \"d\"\nweights = \"w\"\ntokenizer_dir = \"t\"\ndecode_ladder = [\"l/w256\", \"l/w512\", \"l/w1024\"]\n",
+            "[scenario]\nkind = \"generate\"\nname = \"m\"\n[artifacts]\ndecode = \"d\"\nweights = \"w\"\ntokenizer_dir = \"t\"\ndecode_buckets = [\"b/w256\", \"b/w512\", \"b/w1024\"]\n",
         )
-        .expect("a scenario declaring decode_ladder must parse");
-        assert_eq!(c.artifacts.decode_ladder, ["l/w256", "l/w512", "l/w1024"]);
+        .expect("a scenario declaring decode_buckets must parse");
+        assert_eq!(c.artifacts.decode_buckets, ["b/w256", "b/w512", "b/w1024"]);
     }
 
     #[test]
