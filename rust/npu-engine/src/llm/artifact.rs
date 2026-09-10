@@ -854,20 +854,14 @@ impl LlmArtifact {
     /// artifact declares, and the causal widths on a causal one. Derived, never a literal -- the
     /// list is model-shaped (Gemma-3 has a third table) and role-shaped (the prefill generator
     /// names its single table `rope`).
+    /// Every `Arena::Input` BUFFER the caller must write each token. Scratchpad REGISTERS
+    /// (`kv_off`, `sm_mask`, `attn_window`) are deliberately absent: `check_per_token_writes`
+    /// validates this list against `layout` entries, a register has no `layout` entry, so naming
+    /// one here would read as a guard while checking nothing.
     pub fn per_dispatch_writes(&self) -> Vec<&str> {
         std::iter::once("x")
             .chain(self.rope_inputs.iter().map(|(n, _)| n.as_str()))
             .chain(self.mask_widths.iter().map(|m| m.buffer.as_str()))
-            // "attn_window" is the contract's fixed key (`scratchpad.params.attn_window`), not
-            // stored as a string anywhere on this struct -- `attn_window` only carries its
-            // resolved `ScratchpadParam`, the same shape `kv_off`/`sm_mask` do. NOTE: unlike `x`,
-            // the RoPE tables and `mask_widths.buffer`, this name never names an `Arena::Input`
-            // `layout` entry (it is a scratchpad register, not a buffer), so
-            // `check_per_token_writes` -- which only flags a `layout` Arena::Input entry absent
-            // from this list -- cannot actually catch a missing `attn_window` write. Listed here
-            // for the same reason the others are (so a caller building its own write list from
-            // this artifact sees it), not because the existing guard covers it.
-            .chain(self.attn_window.is_some().then_some("attn_window"))
             .collect()
     }
 
@@ -1142,7 +1136,6 @@ mod tests {
         let art = LlmArtifact::load(dir.path()).unwrap();
         assert!(art.attn_window.is_none());
         assert_eq!(art.window_granule, None);
-        assert!(!art.per_dispatch_writes().contains(&"attn_window"));
     }
 
     #[test]
@@ -1159,7 +1152,6 @@ mod tests {
         assert_eq!(aw.byte_offset, 8);
         assert!(aw.core, "attn_window is kind: core");
         assert_eq!(art.window_granule, Some(128));
-        assert!(art.per_dispatch_writes().contains(&"attn_window"));
     }
 
     #[test]
