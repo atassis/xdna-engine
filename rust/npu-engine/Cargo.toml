@@ -20,12 +20,17 @@ ndarray-npy = { version = "0.9", default-features = false }
 memmap2 = "0.9"
 rayon = "1"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `preserve_order`: a tool schema's key order is the CLIENT's, and it moves the rendered prompt
+# (measured 2026-09-10: reordering one schema's keys shares 74 of 159 tokens). Without this,
+# `Value` is a BTreeMap and every schema comes back alphabetized.
+serde_json = { version = "1", features = ["preserve_order"] }
 sha2 = "0.10"
 thiserror = "1"
 toml = "0.8"
 tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
-minijinja = { version = "2", default-features = false, features = ["builtins", "serde"] }
+# `preserve_order` here too, and for the same reason: minijinja's own ValueMap is a BTreeMap
+# without it, so a schema that survived serde_json in order would be re-sorted on the way in.
+minijinja = { version = "2", default-features = false, features = ["builtins", "serde", "preserve_order"] }
 npu-xrt = { path = "../npu-xrt" }
 npu-asr = { path = "../npu-asr", features = ["two_ctx"] }
 npu-asr-host = { path = "../npu-asr-host" }

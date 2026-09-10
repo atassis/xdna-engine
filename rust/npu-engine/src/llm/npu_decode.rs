@@ -28,7 +28,7 @@ use sha2::{Digest, Sha256};
 
 use crate::api::EngineError;
 use crate::llm::artifact::{BufLoc, EmbedScale, LlmArtifact};
-use crate::llm::generator::DecodeStep;
+use crate::llm::generator::{CacheState, DecodeStep};
 use crate::llm::npu_prefill::NpuPrefill;
 use crate::telemetry::ArmProvenance;
 
@@ -434,7 +434,7 @@ impl NpuDecodeStep {
     /// Re-zero every KV-cache scratch buffer (`meta.json`'s `cache_buffers`) and sync. Call before
     /// each new generation on a REUSED instance; a freshly-constructed instance is already zero (the
     /// artifact's own cache-buffer blobs are all-zero) and does not need this.
-    pub fn reset(&mut self) -> Result<(), EngineError> {
+    pub fn reset(&mut self) -> Result<CacheState, EngineError> {
         // The cache buffers are ALREADY zero when the model loads: every one of them is listed in
         // `meta.json`'s `weights` too, and its `buffers/<name>.bin` is an all-zero blob, so
         // `new()`'s weight loop zeroes them and syncs once. This per-request pass exists only to
@@ -459,7 +459,7 @@ impl NpuDecodeStep {
         //
         // NPU_LLM_REUSE_KV=0 restores the per-request pass, for bisecting a suspected KV bug.
         if std::env::var("NPU_LLM_REUSE_KV").ok().as_deref() != Some("0") {
-            return Ok(());
+            return Ok(CacheState::Retained);
         }
         for name in &self.artifact.cache_buffers {
             let loc = self.artifact.loc(name);
@@ -467,7 +467,10 @@ impl NpuDecodeStep {
                 .write_at(loc.arena, loc.off, &vec![0u8; loc.len])
                 .map_err(|e| EngineError::Device(format!("zero cache buffer {name}: {e}")))?;
         }
-        self.arena.sync_to_device().map_err(|e| EngineError::Device(format!("sync reset KV to device: {e}")))
+        self.arena
+            .sync_to_device()
+            .map_err(|e| EngineError::Device(format!("sync reset KV to device: {e}")))?;
+        Ok(CacheState::Cleared)
     }
 }
 
@@ -482,7 +485,7 @@ impl DecodeStep for NpuDecodeStep {
 
     /// Zero every KV cache buffer. The inherent `reset` already did this; wiring it through the
     /// trait is what makes it actually run, since the generator only ever sees `dyn DecodeStep`.
-    fn reset(&mut self) -> Result<(), EngineError> {
+    fn reset(&mut self) -> Result<CacheState, EngineError> {
         // Zero the dispatch accounting alongside the KV cache, so a report covers exactly the
         // generation that follows and not everything the process has ever dispatched. Both are
         // no-ops unless NPU_DISPATCH_LOG is set; the log is thread-local and the engine actor is
@@ -530,9 +533,9 @@ impl DecodeStep for NpuDecodeStep {
         self.prefill.as_ref().filter(|p| p.batched_enabled()).map(NpuPrefill::batch)
     }
 
-    fn prefill(&mut self, tokens: &[u32]) -> Result<usize, EngineError> {
-        let Some(p) = self.prefill.as_ref().filter(|p| p.batched_enabled()) else { return Ok(0) };
-        p.prime(&self.arena, &self.embed, tokens)
+    fn prefill(&mut self, tokens: &[u32], from: usize) -> Result<usize, EngineError> {
+        let Some(p) = self.prefill.as_ref().filter(|p| p.batched_enabled()) else { return Ok(from) };
+        p.prime(&self.arena, &self.embed, tokens, from)
     }
 
     fn step(&mut self, token: u32, pos: usize) -> Result<Vec<f32>, EngineError> {

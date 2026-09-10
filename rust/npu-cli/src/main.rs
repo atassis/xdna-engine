@@ -410,6 +410,9 @@ _npu_models() {
 /// What one generation produced: the text, and everything measured about producing it.
 struct Generated {
     text: String,
+    /// Tool calls the model made. Echoed as JSON rather than as prose: a call is something to
+    /// EXECUTE, and printing it as text would put it in the transcript as if the model had said it.
+    calls: Vec<npu_engine::ToolCall>,
     reason: npu_engine::FinishReason,
     report: npu_engine::GenerationReport,
 }
@@ -436,11 +439,19 @@ fn drain_generation(
             &npu_runtime::conditions::at_start(&meta.model, meta.created), meta))?;
     }
     let mut text = String::new();
+    let mut calls: Vec<npu_engine::ToolCall> = Vec::new();
     loop {
         match rx.recv() {
             Ok(StreamItem::Text(t)) => {
                 if echo { print!("{t}"); std::io::stdout().flush().ok(); }
                 text.push_str(&t);
+            }
+            Ok(StreamItem::ToolCall(c)) => {
+                if echo {
+                    println!("\n[tool_call] {} {}", c.name, c.arguments);
+                    std::io::stdout().flush().ok();
+                }
+                calls.push(c);
             }
             Ok(StreamItem::Step(r)) => {
                 if let Some(w) = json.as_mut() {
@@ -457,7 +468,7 @@ fn drain_generation(
                     writeln!(w, "{}", wire::summary_line(&report, meta, reason))?;
                     w.flush()?;
                 }
-                return Ok(Generated { text, reason, report: *report });
+                return Ok(Generated { text, calls, reason, report: *report });
             }
             Ok(StreamItem::Error(e)) => bail!("{e}"),
             Err(_) => bail!("generation ended without a result"),
@@ -517,10 +528,7 @@ fn generate(path: &Path, prompt: &str, model: Option<&str>, sampling: &SamplingA
     let prompt = if raw {
         npu_engine::Prompt::Raw(prompt.to_string())
     } else {
-        npu_engine::Prompt::Chat(vec![npu_engine::ChatMessage {
-            role: "user".to_string(),
-            content: prompt.to_string(),
-        }])
+        npu_engine::Prompt::Chat(vec![npu_engine::ChatMessage::new("user", prompt)])
     };
     let result = handle.generate(model, prompt, params)
         .map_err(|e| {
@@ -551,7 +559,7 @@ fn generate(path: &Path, prompt: &str, model: Option<&str>, sampling: &SamplingA
     if as_json {
         // The streaming arm already wrote every line; only the buffered arm has anything left.
         if !ndjson {
-            println!("{}", wire::completion_object(&g.text, g.reason, &g.report, &meta));
+            println!("{}", wire::completion_object_with_calls(&g.text, &g.calls, g.reason, &g.report, &meta));
         }
     } else {
         if no_stream { print!("{}", g.text); }
@@ -639,7 +647,7 @@ fn chat(path: &Path, opening: Option<&str>, model: Option<&str>, sampling: &Samp
                     line
                 }
             };
-            history.push(npu_engine::ChatMessage { role: "user".into(), content: line });
+            history.push(npu_engine::ChatMessage::new("user", line));
             let served = handle.generate(model, npu_engine::Prompt::Chat(history.clone()), params.clone())
                 .map_err(|e| Tagged(engine_error(&e), e.to_string()))?;
             let meta = cli_meta(&served.model, true);
@@ -656,7 +664,7 @@ fn chat(path: &Path, opening: Option<&str>, model: Option<&str>, sampling: &Samp
                 println!();
                 print_stats_footer(&g, false);
             }
-            history.push(npu_engine::ChatMessage { role: "assistant".into(), content: g.text });
+            history.push(npu_engine::ChatMessage::new("assistant", g.text));
         }
     })();
     handle.shutdown(); let _ = join.join();
