@@ -14,9 +14,13 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WS="$(cd "$REPO/.." && pwd)"
 ROUNDS="${1:-2}"; REPS="${2:-2}"; LENS="${3:-256,512,1024}"
 DEC="${DECODE_ART:-$WS/xdna-engine/artifacts/qwen3-0.6b/decode}"
-PRE="${PREFILL_ART:-/mnt/data/xdna-scratch/prefill/full_l28_m256_s2048}"
-OUT="${TIME_OUT:-/mnt/data/xdna-scratch/prefill/timing}"
-BIN="$REPO/rust/target/release/prefill_time_probe"
+PRE="${PREFILL_ART:-/mnt/data/xdna/scratch/prefill/full_l28_m256_s2048}"
+OUT="${TIME_OUT:-/mnt/data/xdna/scratch/prefill/timing}"
+# Ask cargo where it puts binaries: rust/.cargo/config.toml redirects target-dir off /home, and a
+# stale rust/target/ directory survives there, so a hardcoded path finds a directory and no binary.
+TGT="$(cd "$REPO/rust" && cargo metadata --format-version 1 --no-deps 2>/dev/null \
+       | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])' 2>/dev/null)"
+BIN="${TGT:-$REPO/rust/target}/release/prefill_time_probe"
 [ -x "$BIN" ] || { echo "ERROR: build it first: cargo build --release -p npu-probes --bin prefill_time_probe"; exit 2; }
 mkdir -p "$OUT"
 echo "[time] decode=$DEC"; echo "[time] prefill=$PRE"; echo "[time] rounds=$ROUNDS reps=$REPS lens=$LENS"

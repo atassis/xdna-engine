@@ -94,6 +94,20 @@ pub const FLAGS: &[Flag] = &[
               position at or beyond n_past, so the per-request pass cost 224 MiB of host memset \
               plus an arena write (~60 ms/request at S=2048) and changed no output. Set =0 to \
               restore it when bisecting a suspected KV bug." },
+    Flag { name: "NPU_LLM_PREFILL_MIN_TOKENS", owner: "npu-engine", site: "npu-engine/src/llm/generator.rs",
+        semantics: Value, default: "12 (the measured break-even)",
+        doc: "the fewest BATCHABLE prompt tokens (prompt length minus one) that make the batched \
+              prefill path worth taking. The default was the artifact's dims.M -- one whole chunk \
+              -- until 2026-09-10, justified by ROWS (a padded chunk pays for rows it never uses) \
+              on a device whose cost is DISPATCHES. Measured on qwen3-0.6b M=256 S=2048, alternated: \
+              the batched arm is FLAT at ~362 ms per prompt (one padded chunk, one dispatch) and \
+              the per-token arm is ~31.6 ms/token, so the crossover is 11.5 tokens and every \
+              prompt from 12 to 255 batchable tokens was paying 2.8x to 22.4x for nothing. Below \
+              the crossover batching genuinely loses -- 10 tokens measured 315 ms per-token \
+              against 362 batched -- so this is 12, not 1. Both terms are artifact-specific; \
+              re-run scripts/time_prefill.sh after an artifact change rather than trusting it. \
+              Raise it to dims.M to restore the pre-2026-09-10 behaviour, or higher to bisect a \
+              suspected short-prompt prefill bug." },
     Flag { name: "NPU_LLM_PREFILL_BATCHED", owner: "npu-engine", site: "npu-engine/src/llm/npu_prefill.rs",
         semantics: NotZero, default: "true",
         doc: "prime the KV cache over a prompt in batches of the prefill artifact's dims.M instead \
