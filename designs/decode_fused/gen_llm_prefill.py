@@ -425,7 +425,14 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
     op_gkv = gemm_for("kv", D, KVD, blocking=(
         (qkv_blocking["k"][0], qkv_group_rows * D) if hm else None))
     op_o = gemm_for("o", QD, D)
+    # PREFILL_FUSE_SILU: the gate GEMM applies SiLU to its own C tile before it leaves L1, so the
+    # standalone SiLU op and `g`'s whole DDR round-trip disappear. Configure-NEUTRAL by
+    # construction -- gate and up stop sharing one design (the epilogue changes it), so their
+    # shared configure becomes two while SiLU's one goes away -- which makes this a clean read of
+    # what the BYTES alone are worth: -3.0 MiB/layer, -84 MiB/dispatch.
+    fuse_silu = os.environ.get("PREFILL_FUSE_SILU", "0") == "1" and sp.act == "silu"
     op_gu = gemm_for("gate_up", D, FF)
+    op_gate = gemm_for("gate_up", D, FF, extra=dict(epilogue="silu")) if fuse_silu else None
     op_down = gemm_for("down", FF, D)
     # scores: B is the kv cache read as [N=S, K=HD] -> b_col_maj. ctx: the SAME bytes read as
     # [K=S, N=HD] -> plain. Either way the blocked axis is the physical leading one, positions, so
@@ -527,7 +534,7 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
         "h": M * D * 2, "q": M * QD * 2, "k": M * KVD * 2, "v": M * KVD * 2,
         "sc": Hq * M * S * 2, "sw": Hq * M * S * 2,
         "cxt": M * QD * 2, "a": M * D * 2, "xs": M * D * 2,
-        "hf": M * D * 2, "g": M * FF * 2, "gs": M * FF * 2, "u": M * FF * 2,
+        "hf": M * D * 2, "gs": M * FF * 2, "u": M * FF * 2,
         "gh": M * FF * 2, "d": M * D * 2,
     }
     if attn_order != "off":
@@ -535,6 +542,8 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
         # size from the arg spec, and a sliced one only from here. Same size the whole-buffer arm
         # gets from op_sm's spec, so the input arena is byte-identical between the arms.
         bufsz[SM_WIDTHS] = Hq * M * 4
+    if not fuse_silu:
+        bufsz["g"] = M * FF * 2
     if not seam:
         bufsz["qh"] = M * QD * 2
         bufsz["cx"] = M * QD * 2
@@ -658,9 +667,8 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
             (op_o, "cxt", wo, "a"),
             (op_add, src, "a", "xs"),
             (op_norm, "xs", p + "n_pf", "hf"),
-            (op_gu, "hf", p + "Wg", "g"),
-            (op_gu, "hf", p + "Wu", "u"),
-            (op_act, "g", "gs"),
+        ] + ([(op_gate, "hf", p + "Wg", "gs"), (op_gu, "hf", p + "Wu", "u")] if fuse_silu else
+             [(op_gu, "hf", p + "Wg", "g"), (op_gu, "hf", p + "Wu", "u"), (op_act, "g", "gs")]) + [
             (op_mul, "gs", "u", "gh"),
             (op_down, "gh", p + "Wd", "d"),
             (op_add, "xs", "d", dst),
@@ -710,6 +718,8 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
         name += "_mqn"
     if seam:
         name += "_nseam"
+    if fuse_silu:
+        name += "_fsilu"
     # The tiling is now a per-shape lookup, so it is a GRAPH knob like the three above and has to
     # be in the name for the same reason: a re-sweep that moves one GEMM's tile must not link the
     # previous tiling's ELF out of the artifact cache. Hashed rather than spelled out -- seven
