@@ -1298,6 +1298,13 @@ def main():
                        "head_dim": HD, "kv_heads": Hkv},
         "dims": {"layers": NL, "d_model": D, "q_heads": Hq, "kv_heads": Hkv, "head_dim": HD,
                  "ffn": FF, "vocab": VOCAB, "S": S, "kv_block": T,
+                 # Wqkv's ROW ORDER, stated because another generator reads this buffer out of the
+                 # shared arena and cannot see the flag that produced it. Prefill went on slicing
+                 # the stock [Wq|Wk|Wv] for a week after this became head-major, which is a
+                 # plausible wrong answer and never an error. Absent in older artifacts -- a
+                 # consumer reads that as the stock order, which is what those artifacts hold.
+                 "wqkv_head_major": bool(
+                     op_decode_layer is not None and op_decode_layer.wqkv_head_major),
                  "sliding_window": sp.sliding_window, "sw_pattern": sp.sw_pattern},
         # Per-token host protocol (the ELF is constant; only these change):
         #   x        = embed[token], scaled by sqrt(d_model) iff embed_scale == "sqrt_d_model"

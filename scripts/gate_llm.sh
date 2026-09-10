@@ -166,7 +166,14 @@ EOP
     DECODE_ART="$paired"
   fi
   local out="${GATE_DUMP_ROOT:-/mnt/data/xdna/scratch/prefill/gate}/tier2p"
-  local bin="$REPO/rust/target/release/prefill_token_gate_probe"
+  # Ask cargo where it puts binaries. rust/.cargo/config.toml redirects target-dir off /home, so
+  # a hardcoded $REPO/rust/target silently misses -- and the DEVICE STEP then does nothing while
+  # the judge below replays whatever dumps already existed, reporting stale PASSes.
+  local tgt
+  tgt="$(cd "$REPO/rust" && cargo metadata --format-version 1 --no-deps 2>/dev/null \
+         | "$PY" -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])' 2>/dev/null)"
+  [ -n "$tgt" ] || tgt="$REPO/rust/target"
+  local bin="$tgt/release/prefill_token_gate_probe"
   local rc=0 refs=() r arm name
   [ -d "$refdir" ] || { echo "ERROR: no prefill references in $refdir -- make them first:"; \
       echo "  bash scripts/gate_llm.sh --make-prefill-refs"; return 2; }

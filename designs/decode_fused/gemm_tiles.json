@@ -551,10 +551,10 @@
       "prio_accuracy": false,
       "tile_m": 64,
       "tile_k": 64,
-      "tile_n": 64,
+      "tile_n": 32,
       "cols": 8,
       "b_col_maj": true,
-      "source": "seed",
+      "source": "assumed",
       "labels": [
         "qwen3-0.6b:k",
         "qwen3-0.6b:v"
@@ -571,10 +571,10 @@
       "prio_accuracy": true,
       "tile_m": 64,
       "tile_k": 64,
-      "tile_n": 64,
+      "tile_n": 32,
       "cols": 8,
       "b_col_maj": true,
-      "source": "seed",
+      "source": "assumed",
       "labels": [
         "qwen3-0.6b:k",
         "qwen3-0.6b:v"
@@ -591,10 +591,10 @@
       "prio_accuracy": false,
       "tile_m": 64,
       "tile_k": 64,
-      "tile_n": 64,
+      "tile_n": 32,
       "cols": 8,
       "b_col_maj": true,
-      "source": "seed",
+      "source": "assumed",
       "labels": [
         "qwen3-0.6b:k",
         "qwen3-0.6b:v"
@@ -611,10 +611,10 @@
       "prio_accuracy": true,
       "tile_m": 64,
       "tile_k": 64,
-      "tile_n": 64,
+      "tile_n": 32,
       "cols": 8,
       "b_col_maj": true,
-      "source": "seed",
+      "source": "assumed",
       "labels": [
         "qwen3-0.6b:k",
         "qwen3-0.6b:v"

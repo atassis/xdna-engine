@@ -121,6 +121,7 @@ from prefill_ref import (f32, gate_block, layer_stack, npy_weights,  # noqa: E40
 
 import newstack_compat  # noqa: F401,E402 -- MUST precede iron imports
 from iron.common import AIEContext  # noqa: E402
+from iron.common.kv_layout import KVLayout  # noqa: E402
 from elf_dispatch_compat import OperatorSequence, load_elf  # noqa: E402
 from iron.operators.gemm.op import GEMM  # noqa: E402
 from iron.operators.rms_norm.op import RMSNorm  # noqa: E402
@@ -241,6 +242,48 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
     Hq, Hkv, QD, KVD = sp.n_q_heads, sp.n_kv_heads, sp.q_dim, sp.kv_dim
     grp = sp.gqa_group
 
+    # The KV block size comes FROM THE DECODE ARTIFACT and is never re-derived here. Prefill writes
+    # the cache decode reads, so the two must agree on its addressing, and two generators deriving
+    # `T` independently is exactly how they came to disagree: decode blocked at T=128 on
+    # 2026-09-10 while this file still wrote flat [Hkv, S, HD], and every batched-prefill
+    # generation came back as one token repeated -- a correct KV write read through the wrong
+    # layout. An absent `kv_block` means the pre-blocking flat cache, for which KVLayout(T=S)
+    # reduces to exactly the strides this file used to hardcode.
+    dm_early = json.load(open(dec_meta_path)) if dec_meta_path else None
+    kv_T = (dm_early["dims"].get("kv_block") or S) if dm_early else S
+    kvl = KVLayout(Hkv=Hkv, S=S, HD=HD, T=kv_T)
+    print(f"[gen] prefill KV layout: T={kv_T} "
+          + ("(flat [Hkv,S,HD])" if kv_T == S else
+             f"(blocked [S/T,Hkv,T,HD], head_stride={kvl.head_stride}, "
+             f"block_stride={kvl.block_stride})"))
+
+    # Wqkv's ROW ORDER, likewise taken from the decode artifact rather than assumed.
+    # decode_layer_dp's attn column c reads ONE contiguous run of (gqa+2) head blocks -- its gqa
+    # query heads, then its own k head, then its own v head -- so decode REORDERS the stock
+    # [Wq|Wk|Wv] rows at build time (gen_llm_decode.py, wqkv_head_major=True). Prefill reads the
+    # same buffer out of the same arena, so it reads the same order, as three blocked operands over
+    # one matrix.
+    #
+    # `wqkv_head_major` in dims is the artifact SAYING so; artifacts built before that field
+    # existed are read off `norms`, which decode packs in the same branch and only in that branch.
+    # Either way `check_shared_weights()` verifies the answer against the .npy source, because this
+    # is the third thing decode changed under prefill in one week -- the blocked KV cache, the
+    # packed norms, this -- and all three were silent: a reordered weight is a plausible wrong
+    # answer, never an error.
+    hm = False
+    if dm_early:
+        stated = dm_early["dims"].get("wqkv_head_major")
+        hm = bool(stated) if stated is not None else any(
+            k.endswith("_norms") for k in dm_early["layout"])
+    # One kv head's run of rows, and where each role's block sits inside it.
+    qkv_group_rows = (grp + 2) * HD
+    qkv_blocking = {  # role -> (rows in one block, first row of the first block)
+        "q": (grp * HD, 0), "k": (HD, grp * HD), "v": (HD, (grp + 1) * HD),
+    } if hm else {}
+    print(f"[gen] prefill Wqkv row order: "
+          + (f"head-major, {grp}+1+1 head blocks of {HD} rows per kv head"
+             if hm else "stock [Wq|Wk|Wv]"))
+
     # Op-types this graph does not carry. Named here rather than left to produce a plausible
     # wrong answer: the golden below has no sandwich norms either, so the two would AGREE and the
     # gate would pass on a model this graph cannot run.
@@ -330,8 +373,13 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
     reg = registry()
     tiles = {}
 
-    def gemm_for(label, K, Nout, b_col_maj=True):
-        """One GEMM at the registry's tiling for its shape, checked twice on the way through."""
+    def gemm_for(label, K, Nout, b_col_maj=True, blocking=None):
+        """One GEMM at the registry's tiling for its shape, checked twice on the way through.
+
+        `blocking` is `(rows_per_block, block_stride)` when B's rows are not one contiguous slab in
+        the shared arena -- the KV cache under `kvl`, or one role's head rows inside a head-major
+        `Wqkv`. `None` is the contiguous case every other call builds.
+        """
         ch = reg.lookup(M, K, Nout, emulate=emulate, prio_accuracy=prio_acc,
                         b_col_maj=b_col_maj, label=label)
         # The spec-shaped check as well as the registry's own: it names the SPEC and the op, which
@@ -342,9 +390,10 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
         tiles[label] = {"tile": [ch.tile_m, ch.tile_k, ch.tile_n], "cols": ch.cols,
                         "source": ch.source, "K": K, "N": Nout,
                         "measured": ch.measured}
+        blk = dict(b_block_rows=blocking[0], b_block_stride=blocking[1]) if blocking else {}
         return GEMM(M=M, K=K, N=Nout, b_col_maj=b_col_maj, context=ctx,
                     emulate_bf16_mmul_with_bfp16=emulate, prio_accuracy=prio_acc,
-                    round_conv_even=round_even, **ch.gemm_kwargs)
+                    round_conv_even=round_even, **blk, **ch.gemm_kwargs)
 
     op_norm = RMSNorm(size=M * D, num_aie_columns=cols, num_channels=1, tile_size=D,
                       weighted=True, epsilon=sp.eps, context=ctx)
@@ -354,17 +403,22 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
                     weighted=True, epsilon=sp.eps, context=ctx)
     op_rq = RoPE(rows=M * Hq, cols=HD, angle_rows=M, num_aie_columns=cols, context=ctx)
     op_rk = RoPE(rows=M * Hkv, cols=HD, angle_rows=M, num_aie_columns=cols, context=ctx)
-    op_gq = gemm_for("q", D, QD)
-    # ONE design serves k and v (same shape), and one serves gate and up -- so the label is the
-    # pair. `GEMM_TILES_OVERRIDE` keys on these labels or on the registry key.
-    op_gkv = gemm_for("kv", D, KVD)
+    op_gq = gemm_for("q", D, QD, blocking=(
+        (qkv_blocking["q"][0], qkv_group_rows * D) if hm else None))
+    # ONE design serves k and v (same shape, and under head-major the same block geometry -- only
+    # the slice base differs), and one serves gate and up, so the label is the pair.
+    # `GEMM_TILES_OVERRIDE` keys on these labels or on the registry key.
+    op_gkv = gemm_for("kv", D, KVD, blocking=(
+        (qkv_blocking["k"][0], qkv_group_rows * D) if hm else None))
     op_o = gemm_for("o", QD, D)
     op_gu = gemm_for("gate_up", D, FF)
     op_down = gemm_for("down", FF, D)
-    # scores: B is the kv cache stored [S, HD], i.e. [N, K] -> read b_col_maj.
-    # ctx:    B is the same cache read as [K=S, N=HD] -> plain.
-    op_sc = gemm_for("scores", HD, S)
-    op_cx = gemm_for("ctx", S, HD, b_col_maj=False)
+    # scores: B is the kv cache read as [N=S, K=HD] -> b_col_maj. ctx: the SAME bytes read as
+    # [K=S, N=HD] -> plain. Either way the blocked axis is the physical leading one, positions, so
+    # one `b_blocked` serves both and the descriptor rewrite lives in the operator.
+    kv_blocking = (kvl.T, kvl.block_stride) if kvl.T != kvl.S else None
+    op_sc = gemm_for("scores", HD, S, blocking=kv_blocking)
+    op_cx = gemm_for("ctx", S, HD, b_col_maj=False, blocking=kv_blocking)
     tn_sc, tn_cx = tiles["scores"]["tile"][2], tiles["ctx"]["tile"][2]
     print("[tiles] " + "  ".join(
         f"{k}={v['tile'][0]}x{v['tile'][1]}x{v['tile'][2]}@{v['cols']}c({v['source']})"
@@ -388,10 +442,27 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
     # dimension, not a new mechanism. The SOURCE is token-major [M, Hkv, HD], so the (M, Hkv) axes
     # swap in the descriptor: input walks h fastest within a token, output walks m fastest within
     # a head.
+    if kvl.T == kvl.S:
+        # Flat [Hkv, S, HD]: M consecutive positions are M contiguous rows per head.
+        kv_in_sizes, kv_in_strides = (M, Hkv, HD), (Hkv * HD, HD, 1)
+        kv_out_sizes, kv_out_strides = (M, Hkv, HD), (HD, kvl.head_stride, 1)
+    else:
+        # Blocked [S/T, Hkv, T, HD]. A chunk starts at a multiple of M and M is a whole number of
+        # blocks, so the write stays block-aligned and the descriptor gains one outer dimension
+        # rather than needing a scatter.
+        if M % kvl.T:
+            raise ValueError(
+                f"prefill batch M={M} is not a whole number of KV blocks (T={kvl.T}); the append "
+                f"would straddle a block boundary mid-descriptor")
+        nb = M // kvl.T
+        kv_in_sizes = (nb, Hkv, kvl.T, HD)
+        kv_in_strides = (kvl.T * Hkv * HD, HD, Hkv * HD, 1)
+        kv_out_sizes = (nb, Hkv, kvl.T, HD)
+        kv_out_strides = (kvl.block_stride, kvl.head_stride, HD, 1)
     op_kvapp = StridedCopy(
-        input_sizes=(M, Hkv, HD), input_strides=(Hkv * HD, HD, 1), input_offset=0,
-        output_sizes=(M, Hkv, HD), output_strides=(HD, S * HD, 1), output_offset=0,
-        input_buffer_size=M * Hkv * HD, output_buffer_size=Hkv * S * HD,
+        input_sizes=kv_in_sizes, input_strides=kv_in_strides, input_offset=0,
+        output_sizes=kv_out_sizes, output_strides=kv_out_strides, output_offset=0,
+        input_buffer_size=M * Hkv * HD, output_buffer_size=kvl.total_elems,
         transfer_size=pick_transfer(M * Hkv * HD), num_aie_channels=1,
         output_offset_parameter="kv_off", context=ctx)
     # The head-axis seam, both directions. See the module docstring for why these exist and what
@@ -428,26 +499,65 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
                                  f"intermediate of the same name")
             bufsz[name] = length
 
+    def qkv_slab(p, role, op):
+        """One projection's operand inside `L*_Wqkv`.
+
+        Stock, the three roles are three contiguous slabs. Head-major, each role's rows are one
+        block per kv head, so the operand runs from its FIRST block to the end of its last one and
+        the operator's blocked descriptor picks its own rows out of the span -- `op.b_elems` is
+        that span, asked of the operator rather than recomputed here.
+        """
+        if not hm:
+            base, span = ({"q": (0, QD), "k": (QD, KVD), "v": (QD + KVD, KVD)}[role][0] * D,
+                          {"q": QD, "k": KVD, "v": KVD}[role] * D)
+        else:
+            base, span = qkv_blocking[role][1] * D, op.b_elems
+        return f"{p}Wqkv[{base * 2}:{(base + span) * 2}]"
+
+    def kv_slab(buf, kv):
+        """A kv head's slab: from its base to the end of its LAST block, not `S*HD` -- across
+        blocks the head's positions are `block_stride` apart with the other heads in between.
+        `kvl` owns both numbers, and both reduce to the flat `kv*S*HD` slice at T == S."""
+        base = kvl.head_base(kv)
+        return f"{buf}[{base * 2}:{(base + kvl.head_span) * 2}]"
+
+    def attn_norms(p):
+        """This layer's (input-norm, q-norm, k-norm) operands, as the decode arena actually holds
+        them.
+
+        Decode packs the three into ONE `norms` buffer under FUSE_DECODE_LAYER (its default since
+        2026-09-10) and keeps them separate otherwise. Prefill has to read whichever it finds,
+        because naming a buffer the shared arena does NOT have is not an error: it allocates a
+        prefill-local scratch buffer that nothing ever fills, so the norm weight reads as ZERO,
+        every position attends identically, and the model emits one token repeated. The general
+        form of that trap is checked below; this is the instance that paid for the check.
+        """
+        if p + "norms" in dec_sizes:
+            b = p + "norms"
+            return (f"{b}[0:{D * 2}]", f"{b}[{D * 2}:{(D + HD) * 2}]",
+                    f"{b}[{(D + HD) * 2}:{(D + 2 * HD) * 2}]")
+        return (p + "n_in", p + "n_qn", p + "n_kn")
+
     rl, cache_names = [], []
     for l in range(NL):
         p = f"L{l}_"
         src = "x" if l == 0 else "xs"
         dst = "xout" if l == NL - 1 else "xs"
-        wq = f"{p}Wqkv[0:{QD * D * 2}]"
-        wk = f"{p}Wqkv[{QD * D * 2}:{(QD + KVD) * D * 2}]"
-        wv = f"{p}Wqkv[{(QD + KVD) * D * 2}:{(QD + 2 * KVD) * D * 2}]"
+        wq, wk, wv = (qkv_slab(p, "q", op_gq), qkv_slab(p, "k", op_gkv),
+                      qkv_slab(p, "v", op_gkv))
         # Decode pads Wo by two rows for swiglu_mlp_dp's fuse_o tiling; the projection is the
         # first D rows and the pad rows are zero, so prefill reads the unpadded prefix.
         wo = f"{p}Wo[0:{D * QD * 2}]"
+        w_nin, w_nqn, w_nkn = attn_norms(p)
         rl += [
-            (op_norm, src, p + "n_in", "h"),
+            (op_norm, src, w_nin, "h"),
             (op_gq, "h", wq, "q"),
             (op_gkv, "h", wk, "k"),
             (op_gkv, "h", wv, "v"),
         ]
         rl += [
-            (op_qn, "q", p + "n_qn", "q"),
-            (op_kn, "k", p + "n_kn", "k"),
+            (op_qn, "q", w_nqn, "q"),
+            (op_kn, "k", w_nkn, "k"),
             (op_rq, "q", "rope", "q"),
             (op_rk, "k", "rope", "k"),
             # K after qk-norm AND after RoPE; V raw, projection only. Different points in the
@@ -457,18 +567,16 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
             (op_q2h, "q", "qh"),
         ]
         for h in range(Hq):
-            kv = h // grp
             rl.append((op_sc, f"qh[{h * M * HD * 2}:{(h + 1) * M * HD * 2}]",
-                       f"{p}kc[{kv * S * HD * 2}:{(kv + 1) * S * HD * 2}]",
+                       kv_slab(p + "kc", h // grp),
                        f"sc[{h * M * S * 2}:{(h + 1) * M * S * 2}]"))
         # The widths buffer is an INPUT of the softmax step, not a side channel: op.get_arg_spec()
         # puts it between in and out, so it is the middle name here.
         rl.append((op_sm, "sc", SM_WIDTHS, "sw") if causal == "rows"
                   else (op_sm, "sc", "sw"))
         for h in range(Hq):
-            kv = h // grp
             rl.append((op_cx, f"sw[{h * M * S * 2}:{(h + 1) * M * S * 2}]",
-                       f"{p}vc[{kv * S * HD * 2}:{(kv + 1) * S * HD * 2}]",
+                       kv_slab(p + "vc", h // grp),
                        f"cx[{h * M * HD * 2}:{(h + 1) * M * HD * 2}]"))
         rl += [
             (op_h2t, "cx", "cxt"),
@@ -488,6 +596,28 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
     # them: add_buffers walks input_args in order, and the host's x/rope writes are the same in
     # both arms.
     inputs = ["x", "rope"] + ([SM_WIDTHS] if causal == "rows" else [])
+
+    # Every buffer this graph READS and never writes has to come from somewhere -- a host input, or
+    # the decode arena. One that comes from neither is a prefill-local scratch buffer nothing fills:
+    # it reads as ZERO, which for a weight is silent all the way to the tokens. That is precisely
+    # how prefill went on naming L*_n_in/n_qn/n_kn after decode packed the three into L*_norms; the
+    # build stayed green, the shared-arena assert stayed green (it compares the buffers both sides
+    # DO declare), and every batched generation came back as one token repeated. Checkable only on
+    # the shared-arena path -- with --no-arena-share nothing is provided and every weight is an
+    # orphan by construction.
+    if dec_meta_path:
+        read, written = set(), set()
+        for op, *bufs in rl:
+            for spec, nm in zip(op.get_arg_spec(), bufs):
+                base = nm.split("[")[0]
+                (written if spec.direction in ("out", "inout") else read).add(base)
+        orphans = sorted(read - written - set(dec_sizes) - set(inputs))
+        if orphans:
+            raise ValueError(
+                f"{len(orphans)} buffer(s) are read by the prefill graph, never written by it, and "
+                f"not provided by the decode arena or the host: {orphans}. They would be allocated "
+                f"as zeroed scratch and read as zero. If the decode artifact renamed or packed "
+                f"them, follow it here")
     # Every knob that changes the GRAPH must be in the name: IRON keys the cached artifact by
     # it, so an arm whose name collides with an earlier one silently RUNS THE EARLIER
     # BINARY. Measured here 2026-09-08: a PREFILL_BFP16=0 rebuild produced an ELF with the
@@ -529,6 +659,7 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
 
     dims = dict(NL=NL, M=M, S=S, inputs=inputs, cache_names=cache_names,
                 tn_sc=tn_sc, tn_cx=tn_cx, tiles=tiles, cols=cols, causal=causal,
+                kv_block=kvl.T, wqkv_head_major=hm,
                 sm_widths=(SM_WIDTHS if causal == "rows" else None), sm_rows=Hq * M,
                 shared=[n for n in dec_order if not n.startswith("__decode_gap")],
                 reserved=dec_reserved, prefill_local=prefill_local,
@@ -542,6 +673,29 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
     return sp, fused, dims
 
 
+def operand_traffic(op, bufs, resolve):
+    """Bytes each of `op`'s operands actually moves, one per name in `bufs`.
+
+    Not the slice length. A blocked operand's slice runs from its first block to the end of its
+    last, past the peer matrices interleaved in between -- a KV head's slab spans 7.5x the bytes
+    the head holds, and a head-major Wqkv role spans ~2.8x its own rows. StridedCopy is counted off
+    its access pattern and GEMM off its shapes; everything else still reads its slice, which for a
+    contiguous operand is the same number.
+    """
+    if isinstance(op, StridedCopy):
+        return [int(np.prod(op.input_sizes)) * 2] * len(bufs)
+    if isinstance(op, GEMM):
+        return [op.M * op.K * 2, op.K * op.N * 2, op.M * op.N * 2]
+    out = []
+    for name in bufs:
+        if "[" in name:
+            lo, hi = name[name.index("[") + 1:-1].split(":")
+            out.append(int(hi) - int(lo))
+        else:
+            out.append(int(resolve(name)[2]))
+    return out
+
+
 def op_census(runlist, resolve, n_layers):
     """Bytes and invocation count PER OPERATOR TYPE, for one layer.
 
@@ -553,17 +707,9 @@ def op_census(runlist, resolve, n_layers):
     pure DMA. Read it to rank suspects, then measure the winner.
     """
     per = {}
-
-    def length(name):
-        if "[" in name:
-            lo, hi = name[name.index("[") + 1:-1].split(":")
-            return int(hi) - int(lo)
-        return int(resolve(name)[2])
-
     for op, *bufs in runlist:
         kind = type(op).__name__
-        moved = int(np.prod(op.input_sizes)) * 2 if isinstance(op, StridedCopy) else None
-        b = sum(moved if moved is not None else length(x) for x in bufs)
+        b = sum(operand_traffic(op, bufs, resolve))
         e = per.setdefault(kind, [0, 0])
         e[0] += 1
         e[1] += b
@@ -588,13 +734,10 @@ def operand_bytes(runlist, resolve, shared):
     grows with the compiled WINDOW rather than with the batch, which is the term the MLP block
     could not exercise.
 
-    StridedCopy is counted off its own access pattern: its operand is the whole [Hkv, S, HD]
-    cache while the descriptor moves M rows of it.
-
-    Slice lengths are parsed from the name rather than taken from `get_layout_for_buffer`, whose
-    third element is a LENGTH for a plain buffer and an absolute END offset for a slice
-    (iron/common/sequence.py: `return buf_type, parent_start + start, parent_start + end`).
-    Reading it as a length here made a 40 MB layer read as 93 GB.
+    Per-operand bytes come from `operand_traffic`, which is where the slice-length trap lives:
+    `get_layout_for_buffer`'s third element is a LENGTH for a plain buffer and an absolute END
+    offset for a slice (iron/common/sequence.py), and reading it as a length made a 40 MB layer
+    read as 93 GB.
     """
     out = {"weights": 0, "cache": 0, "scores": 0, "activations": 0}
 
@@ -606,16 +749,9 @@ def operand_bytes(runlist, resolve, shared):
             return "scores"
         return "weights" if base in shared else "activations"
 
-    def length(name):
-        if "[" in name:
-            lo, hi = name[name.index("[") + 1:-1].split(":")
-            return int(hi) - int(lo)
-        return int(resolve(name)[2])
-
     for op, *bufs in runlist:
-        moved = int(np.prod(op.input_sizes)) * 2 if isinstance(op, StridedCopy) else None
-        for b in bufs:
-            out[klass(b)] += moved if moved is not None else length(b)
+        for name, moved in zip(bufs, operand_traffic(op, bufs, resolve)):
+            out[klass(name)] += moved
     return out
 
 
@@ -642,6 +778,68 @@ def golden(sp, weights_dir, NL, M, S, base, causal, X, table, rnd=bf16):
     """
     return layer_stack(sp, npy_weights(weights_dir), NL, M, S, base, X, table,
                        golden_widths(sp, M, S, base, causal), rnd)
+
+
+def check_shared_weights(dec_meta_path, weights_dir, sp, dims):
+    """Every claim this graph makes about a decode weight buffer, checked against the .npy source.
+
+    Prefill does not own these bytes -- it borrows decode's arena -- so every read is an assumption
+    about a layout decode chose and can change. Three of them changed under prefill in one week and
+    all three were silent, because a mis-read weight is a plausible wrong answer and never an error:
+    decode blocked the KV cache, packed `n_in|n_qn|n_kn` into `norms`, and reordered `Wqkv` into
+    head-major. This is the check that turns the next one into a build failure. Layer 0 only: these
+    are per-layer transforms applied uniformly, so a disagreement shows there.
+
+    Skipped when the caller has no weights (`--no-golden`); it costs one layer's tensors otherwise.
+    """
+    bdir = os.path.join(os.path.dirname(os.path.abspath(dec_meta_path)), "buffers")
+    npy = lambda t: np.load(os.path.join(weights_dir, f"model.layers.0.{t}.weight.npy"))
+    raw = lambda n: np.fromfile(os.path.join(bdir, f"L0_{n}.bin"), dtype=BF16)
+    same = lambda a, b: np.array_equal(np.asarray(a).view(np.uint16),
+                                       np.asarray(np.asarray(b).astype(BF16)).view(np.uint16))
+    D, HD, grp = sp.d_model, sp.head_dim, sp.gqa_group
+    QD, KVD = sp.q_dim, sp.kv_dim
+    bad = []
+
+    def claim(ok, what):
+        if not ok:
+            bad.append(what)
+
+    n = raw("norms") if os.path.exists(os.path.join(bdir, "L0_norms.bin")) else None
+    if n is not None:
+        claim(same(n[:D], npy("input_layernorm")), "norms[0:D] is the input layernorm")
+        # decode folds attn_scale into the q-norm gain (SCALE_IN_QNORM); prefill applies no scale
+        # of its own, so the FOLDED tensor is what it must be reading.
+        claim(same(n[D:D + HD], np.asarray(npy("self_attn.q_norm"), np.float32) * sp.attn_scale),
+              "norms[D:D+HD] is the q-norm with attn_scale folded in")
+        claim(same(n[D + HD:D + 2 * HD], npy("self_attn.k_norm")), "norms[D+HD:] is the k-norm")
+    claim(same(raw("n_pf"), npy("post_attention_layernorm").reshape(-1)),
+          "n_pf is the post-attention layernorm")
+    claim(same(raw("Wo")[:D * QD], npy("self_attn.o_proj").reshape(-1)),
+          "Wo's first D rows are o_proj (decode pads the tail for fuse_o)")
+    for nm, t in (("Wg", "mlp.gate_proj"), ("Wu", "mlp.up_proj"), ("Wd", "mlp.down_proj")):
+        claim(same(raw(nm), npy(t).reshape(-1)), f"{nm} is {t} unreordered")
+
+    w = raw("Wqkv").reshape(-1, D)
+    q, k, v = (npy(f"self_attn.{r}_proj") for r in ("q", "k", "v"))
+    if dims["wqkv_head_major"]:
+        ok = True
+        for c in range(sp.n_kv_heads):
+            b = c * (grp + 2) * HD
+            for g in range(grp):
+                ok &= same(w[b + g * HD:b + (g + 1) * HD], q[(c * grp + g) * HD:(c * grp + g + 1) * HD])
+            ok &= same(w[b + grp * HD:b + (grp + 1) * HD], k[c * HD:(c + 1) * HD])
+            ok &= same(w[b + (grp + 1) * HD:b + (grp + 2) * HD], v[c * HD:(c + 1) * HD])
+        claim(ok, f"Wqkv is head-major ({grp} q + 1 k + 1 v head blocks per kv head)")
+    else:
+        claim(same(w[:QD], q) and same(w[QD:QD + KVD], k) and same(w[QD + KVD:], v),
+              "Wqkv is the stock [Wq|Wk|Wv] stacking")
+    if bad:
+        raise SystemExit("ERROR: the decode arena does not hold what this graph assumes:\n  - "
+                         + "\n  - ".join(bad)
+                         + "\nFollow the decode generator's layout here, or rebuild the decode "
+                           "artifact from a generator that agrees with this one.")
+    print(f"[gen] shared-weight contract verified against {weights_dir} (layer 0)")
 
 
 def main():
@@ -673,6 +871,13 @@ def main():
         raise SystemExit(f"ERROR: --decode-meta {dec_meta_path} does not exist")
     if dec_meta_path:
         dm = json.load(open(dec_meta_path))
+        # kv_block is checked because its ABSENCE from this list is what let a blocked decode and
+        # a flat prefill share an arena, agree on every offset, and disagree about what the bytes
+        # in it mean -- caught only on device, as one token repeated.
+        dkb = dm["dims"].get("kv_block")
+        if dkb and a.batch % dkb:
+            raise SystemExit(f"ERROR: decode artifact kv_block={dkb} does not divide --batch "
+                             f"{a.batch}; the KV append would straddle a block boundary")
         for key, ours in (("S", a.seq), ("layers", a.layers), ("d_model", sp.d_model),
                           ("head_dim", sp.head_dim), ("kv_heads", sp.n_kv_heads)):
             theirs = dm["dims"][key]
@@ -687,6 +892,8 @@ def main():
 
     sp_, fused, dims = build_graph(a.spec, a.layers, a.batch, a.seq, a.causal,
                                    dec_meta_path, do_compile=not a.layout_only)
+    if dec_meta_path and a.weights:
+        check_shared_weights(dec_meta_path, a.weights, sp, dims)
     M, S, NL = dims["M"], dims["S"], dims["NL"]
     if a.layout_only:
         in_sz, out_sz, scr = fused.buffer_sizes
@@ -812,6 +1019,13 @@ def main():
         },
         "dims": {"layers": NL, "M": M, "S": S, "d_model": D, "ffn": FF,
                  "q_heads": Hq, "kv_heads": Hkv, "head_dim": HD, "q_dim": QD,
+                 # Spelled exactly as decode spells it, and load-bearing rather than descriptive:
+                 # the Rust host reads `dims.kv_block` off THIS artifact for the per-chunk kv_off,
+                 # and an artifact that omits it is read as FLAT (artifact.rs defaults it to
+                 # max_seq). A prefill built blocked but silent about it primes the right values at
+                 # flat addresses, which no gate below the token can see. This dict is a hand-
+                 # written literal, not `dims` above -- adding a key there does not reach here.
+                 "kv_block": dims["kv_block"],
                  "tiles": dims["tiles"],
                  "tile_sources": sorted({v["source"] for v in dims["tiles"].values()}),
                  "tile_n_scores": dims["tn_sc"],
@@ -850,7 +1064,13 @@ def main():
             "tail of the cache. The KV of layer 0 is still correct (K/V are appended before any "
             "softmax runs); the KV of layers >= 1 is not, because it is computed from a "
             "non-causal layer-0 output. This arm is the A/B control, not a seed for a decode.",
-        ]) + [
+        ]) + ([
+            f"KV cache is blocked (T={dims['kv_block']}): the scores/ctx GEMMs address it in "
+            "place, "
+            "through a rewritten B descriptor (GEMM's b_block_rows/b_block_stride), so blocking "
+            "costs no extra bytes here -- the discarded alternative, gathering it back flat, cost "
+            f"{2 * NL * (Hkv * S * HD * 2) / 2**20:.1f} MB per prefill of zero-compute DMA.",
+        ] if dims["kv_block"] != S else []) + [
             "The two head-axis rearranges cost 4.0 MB/layer at M=256 of zero-compute DMA.",
             f"The widths cost a THIRD shim DMA channel per softmax core ({dims['cols']} here; "
             "read off the generated MLIR: one BD per core, sm_rows/cores int32 each, not one "

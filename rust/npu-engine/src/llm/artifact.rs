@@ -856,13 +856,24 @@ impl LlmArtifact {
     /// wrong token and nothing else.
     pub fn check_prefill_pairing(&self, prefill: &LlmArtifact) -> Result<(), EngineError> {
         let mut checks: Vec<(&str, usize, usize)> = vec![
-            // `S` is the head stride of the `[Hkv, S, HD]` cache, so a disagreement puts prefill's
-            // KV rows under decode's head boundaries -- in-arena, past every bounds check.
+            // `S` is the capacity both halves address, so a disagreement puts prefill's KV rows
+            // under decode's head boundaries -- in-arena, past every bounds check.
             ("dims.S", self.max_seq, prefill.max_seq),
             ("dims.head_dim", self.head_dim, prefill.head_dim),
             ("dims.d_model", self.d_model, prefill.d_model),
             ("dims.layers", self.n_layers, prefill.n_layers),
+            // The block size, which is what the shared bytes MEAN. It defaults to `S` when the
+            // artifact does not declare it, so this also catches the case that cost 2026-09-10: a
+            // decode blocked at 128 paired with a prefill silent about blocking, priming the right
+            // values at flat addresses. Every generation came back as one token repeated, and
+            // nothing between the two halves compared the one number that differed.
+            ("dims.kv_block", self.kv_block, prefill.kv_block),
         ];
+        // 0 means "not declared, and provably never read" -- see the loader. Only compare two
+        // artifacts that both state it.
+        if self.kv_heads != 0 && prefill.kv_heads != 0 {
+            checks.push(("dims.kv_heads", self.kv_heads, prefill.kv_heads));
+        }
         // Optional on the prefill half (it has no lm-head), checked when declared.
         if let (Some(d), Some(p)) = (self.vocab, prefill.vocab) {
             checks.push(("dims.vocab", d, p));

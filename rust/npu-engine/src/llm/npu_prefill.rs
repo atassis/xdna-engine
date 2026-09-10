@@ -258,7 +258,13 @@ impl NpuPrefill {
             // "core"-kind and the firmware's UPDATE_REG convention requires the host to pre-shift
             // by 2 bits. Both values are the decode ones with `M` substituted for 1, so a prefill
             // ELF built at M=1 would be driven byte-identically to the decode ELF.
-            let kv = (chunk.start * hd) as u32;
+            // The BLOCKED offset, via the same helper decode uses. This was `chunk.start * hd`,
+            // the flat formula: correct while the cache was [Hkv, S, HD] and silently wrong once
+            // decode blocked it, because prefill then primed the right bytes at the wrong
+            // addresses. At kv_block == max_seq the helper returns exactly `pos * head_dim`, so
+            // the flat path is unchanged.
+            let kv = crate::llm::kv_layout::kv_off(
+                chunk.start, self.artifact.kv_block, hd, self.artifact.kv_heads) as u32;
             self.res
                 .write_scratchpad(self.artifact.kv_off.byte_offset, &kv.to_le_bytes())
                 .map_err(|e| EngineError::Device(format!("write prefill kv_off scratchpad: {e}")))?;
