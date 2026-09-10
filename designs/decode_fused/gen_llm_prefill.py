@@ -397,6 +397,19 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
 
     op_norm = RMSNorm(size=M * D, num_aie_columns=cols, num_channels=1, tile_size=D,
                       weighted=True, epsilon=sp.eps, context=ctx)
+    # PREFILL_MERGE_QKNORM: run the q-norm as `grp` chunks of the K-NORM'S OWN DESIGN instead of
+    # one wider design of its own. Both normalise independent HD tiles, QD is exactly grp*KVD, and
+    # a chunk boundary at a multiple of HD never splits a tile -- so the arithmetic is identical
+    # and the q chunks and the k run become grp+1 ADJACENT runs of one design, which D009 charges
+    # as ONE configure instead of two. Predicted -28 configures on a 28-layer graph; at the
+    # measured 193.2 us that is -5.4 ms, and it was a forward test of that rate in the REDUCTION
+    # direction (it was measured by adding). MEASURED -4.87 ms, 3 alternated rounds,
+    # non-overlapping -- 90% of prediction -- and 14/14 on gate_llm.sh --tier2-prefill. Default ON
+    # since 2026-09-10; =0 restores the two-design form.
+    merge_qknorm = os.environ.get("PREFILL_MERGE_QKNORM", "1") == "1"
+    if merge_qknorm and QD != grp * KVD:
+        raise ValueError(f"PREFILL_MERGE_QKNORM needs QD ({QD}) == gqa_group ({grp}) * KVD "
+                         f"({KVD}); this spec does not split evenly")
     op_qn = RMSNorm(size=M * QD, num_aie_columns=cols, num_channels=1, tile_size=HD,
                     weighted=True, epsilon=sp.eps, context=ctx)
     op_kn = RMSNorm(size=M * KVD, num_aie_columns=cols, num_channels=1, tile_size=HD,
@@ -579,8 +592,10 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
             (op_gkv, "h", wk, "k"),
             (op_gkv, "h", wv, "v"),
         ]
-        rl += [
-            (op_qn, "q", w_nqn, "q"),
+        qn_runs = ([(op_kn, f"q[{i * M * KVD * 2}:{(i + 1) * M * KVD * 2}]", w_nqn,
+                     f"q[{i * M * KVD * 2}:{(i + 1) * M * KVD * 2}]") for i in range(grp)]
+                   if merge_qknorm else [(op_qn, "q", w_nqn, "q")])
+        rl += qn_runs + [
             (op_kn, "k", w_nkn, "k"),
             (op_rq, "q", "rope", "q"),
             (op_rk, "k", "rope", "k"),
@@ -675,6 +690,8 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
     # identical between them -- exactly the collision that silently links the earlier arm's ELF.
     if attn_order != "off":
         name += f"_ao{attn_order}" + (f"{n_il}" if attn_order == "interleaved" else "")
+    if merge_qknorm:
+        name += "_mqn"
     # The tiling is now a per-shape lookup, so it is a GRAPH knob like the three above and has to
     # be in the name for the same reason: a re-sweep that moves one GEMM's tile must not link the
     # previous tiling's ELF out of the artifact cache. Hashed rather than spelled out -- seven
