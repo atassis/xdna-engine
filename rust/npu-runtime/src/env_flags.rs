@@ -94,6 +94,16 @@ pub const FLAGS: &[Flag] = &[
               position at or beyond n_past, so the per-request pass cost 224 MiB of host memset \
               plus an arena write (~60 ms/request at S=2048) and changed no output. Set =0 to \
               restore it when bisecting a suspected KV bug." },
+    Flag { name: "NPU_LLM_REUSE_KV_BATCHED", owner: "npu-engine", site: "npu-engine/src/llm/generator.rs",
+        semantics: NotZero, default: "false",
+        doc: "let the cross-request prefix ledger drive the BATCHED prefill path, not just the \
+              per-token one. Default OFF because that path is device-UNGATED: main fails every \
+              batched dispatch against the installed artifacts (it added a per-token attn_window \
+              scratchpad parameter they predate), so nobody has watched prefix reuse run there. \
+              The per-token path is gated and reuses unconditionally. Safe to try -- a resume \
+              point is rounded down to a multiple of the prefill batch and prime() refuses a \
+              misaligned one, because blocked KV is contiguous only inside a block. Flip the \
+              default once a decode+prefill pair rebuilt from current main gates it." },
     Flag { name: "NPU_LLM_PREFILL_MIN_TOKENS", owner: "npu-engine", site: "npu-engine/src/llm/generator.rs",
         semantics: Value, default: "12 (the measured break-even)",
         doc: "the fewest BATCHABLE prompt tokens (prompt length minus one) that make the batched \

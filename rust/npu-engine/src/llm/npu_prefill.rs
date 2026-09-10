@@ -229,6 +229,25 @@ impl NpuPrefill {
         tokens: &[u32],
         from: usize,
     ) -> Result<usize, EngineError> {
+        // `from` MUST be batch-aligned, and this is a correctness check, not a tidiness one.
+        //
+        // One `kv_off` is written per chunk and the device then writes `batch` CONSECUTIVE
+        // positions from it. Blocked, a head's positions are contiguous only inside a block
+        // (`kv_layout`: `[S/T blocks, Hkv heads, T positions, HD dims]`), so a chunk that straddles
+        // a block boundary primes the right bytes at the wrong addresses -- the exact failure the
+        // `kv_off` call below documents having already been fixed once.
+        //
+        // Before the prefix ledger, every chunk started at a multiple of `batch` and the pairing
+        // check's `S % M == 0` made that sufficient. An arbitrary `from` reintroduces the straddle,
+        // so the caller aligns and this refuses rather than trusting it: silent KV corruption reads
+        // as a model that has got worse, not as a bug.
+        if from % self.batch != 0 {
+            return Err(EngineError::Unsupported(format!(
+                "prefill resume point {from} is not a multiple of the prefill batch {}; a chunk \
+                 would straddle a KV block and prime at the wrong addresses",
+                self.batch
+            )));
+        }
         if tokens.len() <= from {
             return Ok(tokens.len());
         }

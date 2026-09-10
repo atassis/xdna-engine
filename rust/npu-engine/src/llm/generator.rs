@@ -151,6 +151,40 @@ fn counter_delta(prev: &mut Option<(u32, u32)>, now: Option<(u32, u32)>) -> (Opt
 /// `Prompt::Raw` tokenizes directly. The returned length is the TRUE tokenized prompt length --
 /// never recover it later by filtering EOS out of a padded buffer: EOS doubles as the chat
 /// template's own turn separator, so that recovery undercounts and desyncs every position after it.
+/// Where the BATCHED prefill path may resume, given how much of the prompt is already resident.
+///
+/// Batched prefill writes `batch` consecutive positions from ONE `kv_off`, and blocked KV is
+/// contiguous only inside a block (`kv_layout`: `[S/T blocks, Hkv heads, T positions, HD dims]`),
+/// so a chunk starting mid-block straddles one and primes the right bytes at the wrong addresses.
+/// Before the ledger every chunk started at a multiple of `batch`, which the pairing check's
+/// `S % M == 0` made sufficient; an arbitrary resume point reintroduces the straddle.
+///
+/// Rounding down costs at most `batch - 1` re-primed positions, which rewrite what is already
+/// there. `None` is the per-token path, which writes one position per `kv_off` and needs no
+/// alignment at all.
+fn batched_resume_point(reused: usize, batch: Option<usize>) -> usize {
+    match batch {
+        Some(m) if m > 0 => reused - reused % m,
+        _ => reused,
+    }
+}
+
+/// Whether prefix reuse may drive the BATCHED prefill path. Default OFF.
+///
+/// Not caution for its own sake: the per-token path is device-gated (2026-09-10, 233x on an
+/// identical repeat, 12.3x on a 22-token extension) and the batched path is NOT, because `main`
+/// fails every batched dispatch against the installed artifacts -- it added a per-token
+/// `attn_window` scratchpad parameter that they predate. A path nobody could run is a path nobody
+/// measured, and this engine's rule is validate-then-flip.
+///
+/// The alignment guard makes it SAFE to try (`batched_resume_point`, and `NpuPrefill::prime`
+/// refuses a misaligned resume outright); this flag is what keeps it from shipping ON before
+/// anyone has watched it run. Flip the default once a decode+prefill pair rebuilt from current
+/// main gates it.
+fn reuse_on_batched_prefill() -> bool {
+    std::env::var("NPU_LLM_REUSE_KV_BATCHED").is_ok_and(|v| v != "0")
+}
+
 /// How many leading ids two sequences share.
 fn common_prefix_len(a: &[u32], b: &[u32]) -> usize {
     a.iter().zip(b).take_while(|(x, y)| x == y).count()
@@ -509,6 +543,20 @@ impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
         // `step` returns logits and the first `sample()` reads them: an identical repeat must still
         // run its last position, or there is nothing to sample from.
         let reused = common_prefix_len(&self.resident, &prompt_ids).min(batchable);
+        // The BATCHED path can only resume on a batch boundary -- it writes `batch` consecutive
+        // positions from one `kv_off`, and blocked KV is contiguous only inside a block, so a
+        // chunk starting mid-block would straddle one. `prime()` refuses a misaligned resume; this
+        // is where the alignment is chosen. The cost is at most `batch - 1` re-primed positions,
+        // which rewrite the values already there.
+        //
+        // The per-token path has no such constraint: `step` writes one position at its own
+        // `kv_off`, so it resumes at `reused` exactly.
+        let batched_from = match reuse_on_batched_prefill() {
+            true => batched_resume_point(reused, self.decode.prefill_batch()),
+            // Off: the batched path re-primes from zero exactly as it did before the ledger, so
+            // main's behaviour on that path is byte-identical to today's.
+            false => 0,
+        };
         // From here to the end of the decode loop the ledger describes state we are OVERWRITING.
         // Drop it now and rebuild it on success: an error between here and there leaves an unknown
         // number of positions written, and a ledger that survives that is the silent-wrong-answer
@@ -518,8 +566,8 @@ impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
         // `prefill_batch()` is the CAPABILITY probe -- `Some` means a batched prefill artifact is
         // loaded. Its `M` no longer gates the decision: `prime()` pads a partial chunk itself, and
         // paying for the padding beats paying for the dispatches. See `prefill_min_tokens()`.
-        if self.decode.prefill_batch().is_some() && batchable - reused >= prefill_min_tokens() {
-            primed = self.decode.prefill(&prompt_ids[..batchable], reused)?;
+        if self.decode.prefill_batch().is_some() && batchable - batched_from >= prefill_min_tokens() {
+            primed = self.decode.prefill(&prompt_ids[..batchable], batched_from)?;
         }
         let mut logits = Vec::new();
         for (i, &tok) in prompt_ids.iter().enumerate().skip(primed) {
@@ -1516,6 +1564,9 @@ mod ledger_tests {
         primes: Log,
         steps: Steps,
         fail_prime: bool,
+        /// `None` presents as a backend with no batched artifact -- the PER-TOKEN path, which is
+        /// the one device-gated on 2026-09-10 and the one prefix reuse is live on by default.
+        batch: Option<usize>,
     }
 
     impl DecodeStep for Recording {
@@ -1524,7 +1575,7 @@ mod ledger_tests {
             self.inner.step(t, p)
         }
         fn prefill_batch(&self) -> Option<usize> {
-            Some(1)
+            self.batch
         }
         fn prefill(&mut self, tokens: &[u32], from: usize) -> Result<usize, EngineError> {
             self.primes.borrow_mut().push((from, tokens.len()));
@@ -1546,11 +1597,17 @@ mod ledger_tests {
         ["hello", "world", "foo", "bar"].iter().cycle().take(n).copied().collect::<Vec<_>>().join(" ")
     }
 
+    /// The per-token backend: prefix reuse is unconditional there, and it is what the device
+    /// measurements ran on.
     fn gen_with(fail_prime: bool) -> (LlmGenerator<Recording>, Log, Steps) {
-        gen_for(build_cfg(None), fail_prime)
+        gen_for(build_cfg(None), fail_prime, None)
     }
 
-    fn gen_for(cfg: ModelConfig, fail_prime: bool) -> (LlmGenerator<Recording>, Log, Steps) {
+    fn gen_for(
+        cfg: ModelConfig,
+        fail_prime: bool,
+        batch: Option<usize>,
+    ) -> (LlmGenerator<Recording>, Log, Steps) {
         let primes: Log = Default::default();
         let steps: Steps = Default::default();
         let decode = Recording {
@@ -1560,6 +1617,7 @@ mod ledger_tests {
             primes: primes.clone(),
             steps: steps.clone(),
             fail_prime,
+            batch,
         };
         (LlmGenerator::new(cfg, decode), primes, steps)
     }
@@ -1573,14 +1631,15 @@ mod ledger_tests {
     /// happens to return the same text.
     #[test]
     fn a_shared_prefix_is_not_reprimed() {
-        let (mut gen, primes, _steps) = gen_with(false);
+        let (mut gen, _primes, steps) = gen_with(false);
         let p = params();
         gen.generate_to_string(&Prompt::Raw(words(20)), &p).unwrap();
-        assert_eq!(primes.borrow()[0], (0, 19), "first request must prime from zero");
+        assert_eq!(steps.borrow()[0], 0, "first request must start from position zero");
         assert_eq!(gen.resident.len(), 20);
 
+        steps.borrow_mut().clear();
         gen.generate_to_string(&Prompt::Raw(words(40)), &p).unwrap();
-        assert_eq!(primes.borrow()[1].0, 20, "re-primed a prefix the cache already held");
+        assert_eq!(steps.borrow()[0], 20, "re-primed a prefix the cache already held");
     }
 
     /// The `enable_thinking=false` case, in the small: turn N is NOT a prefix of turn N+1 (Qwen3
@@ -1588,13 +1647,14 @@ mod ledger_tests {
     /// short hit -- it must not assume append and prime from the wrong position.
     #[test]
     fn a_diverging_prompt_reprimes_from_the_divergence_point() {
-        let (mut gen, primes, _steps) = gen_with(false);
+        let (mut gen, _primes, steps) = gen_with(false);
         let p = params();
         gen.generate_to_string(&Prompt::Raw(words(40)), &p).unwrap();
         // Same first five words, then a different one, then the rest.
         let diverged = format!("hello world foo bar hello bar {}", words(40));
+        steps.borrow_mut().clear();
         gen.generate_to_string(&Prompt::Raw(diverged), &p).unwrap();
-        assert_eq!(primes.borrow()[1].0, 5, "shared prefix is the first five words, nothing more");
+        assert_eq!(steps.borrow()[0], 5, "shared prefix is the first five words, nothing more");
     }
 
     /// An identical repeat still has to run one step: only `step` returns logits, and the first
@@ -1617,21 +1677,24 @@ mod ledger_tests {
     /// be cleared -- one that outlives its KV state answers the next request from stale attention
     /// with no error, no warning, and no failing happy-path test.
     #[test]
-    fn an_error_mid_prime_clears_the_ledger() {
-        let (mut gen, primes, _steps) = gen_with(false);
+    fn an_error_mid_generation_clears_the_ledger() {
+        let (mut gen, _primes, steps) = gen_with(false);
         let p = params();
         gen.generate_to_string(&Prompt::Raw(words(20)), &p).unwrap();
         assert!(!gen.resident.is_empty());
 
-        gen.decode.fail_prime = true;
+        // A step failure is the per-token path's version of the same hazard: an unknown number of
+        // positions landed, so the ledger cannot describe the cache any more.
+        gen.decode.inner = ScriptedDecodeStep::new(Vec::new());
         gen.generate_to_string(&Prompt::Raw(words(40)), &p)
-            .expect_err("a scripted prime failure must propagate");
-        assert!(gen.resident.is_empty(), "the ledger survived a failed prime");
+            .expect_err("running out of scripted logits must propagate");
+        assert!(gen.resident.is_empty(), "the ledger survived a failed generation");
 
-        // And the next request re-primes from zero rather than trusting the dead ledger.
-        gen.decode.fail_prime = false;
+        // And the next request starts from zero rather than trusting the dead ledger.
+        gen.decode.inner = ScriptedDecodeStep::new(vec![logit_for(4); 200]);
+        steps.borrow_mut().clear();
         gen.generate_to_string(&Prompt::Raw(words(20)), &p).unwrap();
-        assert_eq!(primes.borrow().last().unwrap().0, 0);
+        assert_eq!(steps.borrow()[0], 0);
     }
 
     /// A backend that reports `Cleared` invalidates the ledger. That is what `NPU_LLM_REUSE_KV=0`
@@ -1645,37 +1708,76 @@ mod ledger_tests {
             fn prefill(&mut self, t: &[u32], f: usize) -> Result<usize, EngineError> { self.0.prefill(t, f) }
             fn reset(&mut self) -> Result<CacheState, EngineError> { Ok(CacheState::Cleared) }
         }
-        let (inner, primes, _steps) = gen_with(false);
+        let (inner, _primes, steps) = gen_with(false);
         let mut gen = LlmGenerator::new(build_cfg(None), Clearing(inner.decode));
         let p = params();
         gen.generate_to_string(&Prompt::Raw(words(20)), &p).unwrap();
+        steps.borrow_mut().clear();
         gen.generate_to_string(&Prompt::Raw(words(40)), &p).unwrap();
-        assert_eq!(primes.borrow()[1].0, 0, "reused a prefix from a cache the backend had zeroed");
+        assert_eq!(steps.borrow()[0], 0, "reused a prefix from a cache the backend had zeroed");
     }
 
     /// The tool loop is the case this exists for: every round-trip re-sends the whole conversation
     /// and each one is a pure extension of the last (measured on the real Qwen3 template: 159 of
     /// 159 tokens shared, call -> result). Without the ledger, N tool calls cost O(N^2) prefill.
     #[test]
-    fn a_growing_conversation_primes_only_what_it_added() {
-        let (mut gen, primes, _steps) =
-            gen_for(build_cfg(Some("{% for m in messages %}{{ m.content }} {% endfor %}")), false);
+    fn a_growing_conversation_walks_only_what_it_added() {
+        let (mut gen, _primes, steps) =
+            gen_for(build_cfg(Some("{% for m in messages %}{{ m.content }} {% endfor %}")), false, None);
         let p = params();
 
         let mut convo = vec![ChatMessage::new("user", words(20))];
         gen.generate_to_string(&Prompt::Chat(convo.clone()), &p).unwrap();
-        let first = primes.borrow().last().copied().unwrap();
-        assert_eq!(first.0, 0);
+        let first_len = gen.resident.len();
+        assert_eq!(steps.borrow()[0], 0);
 
         convo.push(ChatMessage::new("assistant", words(20)));
         convo.push(ChatMessage::new("user", words(20)));
+        steps.borrow_mut().clear();
         gen.generate_to_string(&Prompt::Chat(convo), &p).unwrap();
-        let second = primes.borrow().last().copied().unwrap();
+        let resumed = steps.borrow()[0];
 
         assert!(
-            second.0 >= first.1,
-            "the second turn re-primed the first turn's positions: {second:?} against {first:?}"
+            resumed >= first_len - 1,
+            "the second turn re-walked the first turn's positions: resumed at {resumed}, \
+             first turn held {first_len}"
         );
-        assert!(second.1 > second.0, "the second turn primed nothing new: {second:?}");
+    }
+
+    /// SHIPPED default: the batched path does not reuse at all, so it primes from zero exactly as
+    /// it did before the ledger existed. That path is device-UNGATED -- `main` fails every batched
+    /// dispatch against the installed artifacts -- and this engine validates before it flips.
+    /// `NPU_LLM_REUSE_KV_BATCHED=1` opts in; the alignment rule below is what makes that safe.
+    #[test]
+    fn the_batched_path_does_not_reuse_by_default() {
+        let (mut gen, primes, _steps) = gen_for(build_cfg(None), false, Some(8));
+        let p = params();
+        gen.generate_to_string(&Prompt::Raw(words(30)), &p).unwrap();
+        // 30 resident; the next prompt shares all 30, and the batched path must ignore that.
+        gen.generate_to_string(&Prompt::Raw(words(60)), &p).unwrap();
+        for (from, _) in primes.borrow().iter() {
+            assert_eq!(*from, 0, "batched prefill reused a prefix on an ungated path");
+        }
+    }
+
+    /// The rule itself, which `NpuPrefill::prime` refuses to run without. Rounding DOWN matters in
+    /// both directions: up would resume past what the cache holds, and discarding the reuse
+    /// entirely would make a long conversation pay full prefill on every turn.
+    #[test]
+    fn batched_resume_point_rounds_down_and_never_past_what_is_resident() {
+        assert_eq!(batched_resume_point(30, Some(8)), 24);
+        assert_eq!(batched_resume_point(24, Some(8)), 24, "an aligned point is left alone");
+        assert_eq!(batched_resume_point(7, Some(8)), 0, "less than one batch is no reuse");
+        assert_eq!(batched_resume_point(0, Some(8)), 0);
+        // The per-token path writes one position per kv_off, so it resumes exactly.
+        assert_eq!(batched_resume_point(30, None), 30);
+        for reused in 0..600usize {
+            for m in [1usize, 8, 64, 256] {
+                let at = batched_resume_point(reused, Some(m));
+                assert!(at <= reused, "resumed past the resident prefix: {at} > {reused}");
+                assert_eq!(at % m, 0, "resume {at} straddles a block at batch {m}");
+                assert!(reused - at < m, "discarded more reuse than one batch");
+            }
+        }
     }
 }
