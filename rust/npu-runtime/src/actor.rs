@@ -261,6 +261,7 @@ fn spawn(cfg: Config, loader: Box<dyn ModelLoader + Send>, eager: bool) -> Resul
                                     let item = match c {
                                         Chunk::Text(t) => StreamItem::Text(t.to_string()),
                                         Chunk::Step(r) => StreamItem::Step(r.clone()),
+                                        Chunk::ToolCall(c) => StreamItem::ToolCall(c.clone()),
                                         Chunk::Done { reason, usage, report } => {
                                             // The generator measured the generation; only this
                                             // thread saw the queue, the load and the machine.

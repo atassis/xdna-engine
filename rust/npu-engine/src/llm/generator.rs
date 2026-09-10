@@ -9,7 +9,8 @@ use crate::api::EngineError;
 use crate::llm::config::ModelConfig;
 use crate::llm::detokenize::{IncrementalDetokenizer, StopFeed, StopMatcher};
 use crate::llm::sampling::{self, LogitView, SamplingConfig, SplitMix64};
-use crate::pipeline::{Chunk, FinishReason, GenerateParams, GenerateUsage, Prompt, TextGenerator};
+use crate::llm::tool_parse::{ParseOut, StreamingToolParser};
+use crate::pipeline::{Chunk, FinishReason, GenerateParams, GenerateUsage, Prompt, TextGenerator, ToolCall};
 use crate::telemetry::{
     diff_design_breakdown, ArmProvenance, DesignCost, GenerationReport, PrefillRecord, SamplePhases,
     StepPhases, StepRecord,
@@ -130,10 +131,31 @@ fn counter_delta(prev: &mut Option<(u32, u32)>, now: Option<(u32, u32)>) -> (Opt
 /// `Prompt::Raw` tokenizes directly. The returned length is the TRUE tokenized prompt length --
 /// never recover it later by filtering EOS out of a padded buffer: EOS doubles as the chat
 /// template's own turn separator, so that recovery undercounts and desyncs every position after it.
+/// Push `text` through the parser, replacing it with what the parser released and returning the
+/// calls it completed. With no parser (no tools declared, or a tool-incapable model) this is the
+/// identity and costs nothing.
+fn release_through(
+    parser: Option<&mut StreamingToolParser>,
+    text: &mut String,
+) -> Vec<ToolCall> {
+    let Some(p) = parser else { return Vec::new() };
+    let outs = p.push(text);
+    text.clear();
+    let mut calls = Vec::new();
+    for out in outs {
+        match out {
+            ParseOut::Text(t) => text.push_str(&t),
+            ParseOut::Call(c) => calls.push(c),
+        }
+    }
+    calls
+}
+
 pub fn tokenize_prompt(
     cfg: &ModelConfig,
     prompt: &Prompt,
     enable_thinking: Option<bool>,
+    tools: &[serde_json::Value],
 ) -> Result<Vec<u32>, EngineError> {
     let (text, add_special_tokens) = match prompt {
         Prompt::Chat(messages) => {
@@ -143,7 +165,7 @@ pub fn tokenize_prompt(
                 .ok_or_else(|| EngineError::Unsupported("model has no chat_template for Prompt::Chat".to_string()))?;
             // The template already writes out the literal special-token text (`<|im_start|>`, ...);
             // asking the tokenizer to ALSO add its own would duplicate them.
-            (tmpl.render_with(messages, true, enable_thinking)?, false)
+            (tmpl.render_full(messages, true, enable_thinking, tools)?, false)
         }
         Prompt::Raw(s) => (s.clone(), true),
     };
@@ -371,7 +393,7 @@ impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
         self.decode.reset()?;
         let mut prefill_us = t0.elapsed().as_micros() as u64;
         let t_tokenize = Instant::now();
-        let prompt_ids = tokenize_prompt(&self.cfg, prompt, params.enable_thinking)?;
+        let prompt_ids = tokenize_prompt(&self.cfg, prompt, params.enable_thinking, &params.tools)?;
         let tokenize_us = t_tokenize.elapsed().as_micros() as u64;
         if prompt_ids.is_empty() {
             return Err(EngineError::Unsupported("prompt tokenized to zero tokens".to_string()));
@@ -409,6 +431,13 @@ impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
         let mut history: Vec<u32> = prompt_ids.clone();
         let mut detok = IncrementalDetokenizer::new();
         let mut stopper = StopMatcher::new(params.stop.clone());
+        // Only when the caller declared tools AND this model's template says how it writes a call.
+        // Absent either, the sink sees exactly the stream it saw before tool calling existed --
+        // no hold-back, no scanning, byte-for-byte the old path.
+        let mut tools = (!params.tools.is_empty())
+            .then(|| self.cfg.tool_syntax.as_ref().map(StreamingToolParser::new))
+            .flatten();
+        let mut tool_calls: Vec<ToolCall> = Vec::new();
 
         // Prime the KV cache over the prompt. The last position always goes through `step`,
         // because only `step` returns logits and those are what the first `sample()` reads; every
@@ -452,7 +481,7 @@ impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
         let max_tokens = gen.max_tokens;
 
         let mut completion_tokens = 0u32;
-        let finish: FinishReason;
+        let mut finish: FinishReason;
         let mut pos = prompt_ids.len();
 
         // Checked BOTH before sampling (so `max_tokens: 0` never samples at all) and again right
@@ -525,8 +554,17 @@ impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
             // alone sees the same order a consumer rendering from `Text` does. Both are asked
             // whether the client is still there; a token that completed no codepoint emits no text,
             // and `Step` is then the only place a disconnect can be noticed.
+            // With tools active, `rec.emit` is rewritten to the text the parser RELEASED, and the
+            // calls it recognised are emitted after the step. Rewriting `emit` rather than only
+            // filtering the `Text` frame keeps the documented invariant that a record's `emit`
+            // repeats the text the preceding `Text` carried -- a consumer rendering from `Step`
+            // alone must not see delimiters the `Text` consumer never got.
+            let mut rec = rec;
+            let calls = release_through(tools.as_mut(), &mut rec.emit);
             let live = rec.emit.is_empty() || sink(Chunk::Text(&rec.emit));
             let live = sink(Chunk::Step(&rec)) && live;
+            let live = calls.iter().fold(live, |ok, c| sink(Chunk::ToolCall(c)) && ok);
+            tool_calls.extend(calls);
             steps.push(rec);
             if matched {
                 // A matched stop ends the generation on its own terms, so a client that hangs up on
@@ -569,9 +607,52 @@ impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
                 dt_us: t_us.saturating_sub(last_t),
                 ..StepRecord::default()
             };
+            let mut rec = rec;
+            let calls = release_through(tools.as_mut(), &mut rec.emit);
             sink(Chunk::Text(&rec.emit));
             sink(Chunk::Step(&rec));
+            for c in &calls {
+                sink(Chunk::ToolCall(c));
+            }
+            tool_calls.extend(calls);
             steps.push(rec);
+        }
+        // Whatever the parser is still holding. An unterminated call comes back as content here,
+        // matching the buffered path -- a truncated payload must never become a call the client
+        // would then execute.
+        if let Some(p) = tools.as_mut() {
+            let mut flushed = String::new();
+            let mut calls = Vec::new();
+            for out in p.finish() {
+                match out {
+                    ParseOut::Text(t) => flushed.push_str(&t),
+                    ParseOut::Call(c) => calls.push(c),
+                }
+            }
+            if !flushed.is_empty() {
+                let t_us = t0.elapsed().as_micros() as u64;
+                let rec = StepRecord {
+                    seq: steps.len() as u32,
+                    token: None,
+                    emit: flushed,
+                    t_us,
+                    dt_us: t_us.saturating_sub(last_t),
+                    ..StepRecord::default()
+                };
+                sink(Chunk::Text(&rec.emit));
+                sink(Chunk::Step(&rec));
+                steps.push(rec);
+            }
+            for c in &calls {
+                sink(Chunk::ToolCall(c));
+            }
+            tool_calls.extend(calls);
+        }
+        // OpenAI's own terminal reason, and a client routes on it: `tool_calls` means "execute
+        // something and come back", `stop` means "show this to the user". Length still wins -- a
+        // completion cut off mid-call did not finish calling.
+        if !tool_calls.is_empty() && finish == FinishReason::Stop {
+            finish = FinishReason::ToolCalls;
         }
         // `pos` is the KV position the next dispatch would have written -- i.e. the one this
         // generation actually reached, prompt included. The backend supplies everything else about
@@ -613,7 +694,7 @@ mod tests {
     use tokenizers::Tokenizer;
 
     /// vocab ids: 0 <unk>, 1 hello, 2 world, 3 stop_word, 4 im_end (EOS), plus room for tests.
-    fn build_cfg(chat_template: Option<&str>) -> ModelConfig {
+    pub(crate) fn build_cfg(chat_template: Option<&str>) -> ModelConfig {
         let vocab: HashMap<String, u32> = [
             ("<unk>", 0u32),
             ("hello", 1),
@@ -622,6 +703,10 @@ mod tests {
             ("<|im_end|>", 4),
             ("foo", 5),
             ("bar", 6),
+            // Tool-call pieces, so a scripted completion can spell one with a word-level vocab.
+            ("<CALL>", 7),
+            (r#"{"name":"get_weather","arguments":{"city":"Paris"}}"#, 8),
+            ("</CALL>", 9),
         ]
         .into_iter()
         .map(|(k, v)| (k.to_string(), v))
@@ -632,6 +717,13 @@ mod tests {
         tok.with_decoder(Some(WordPieceDecoder::default()));
         let stop = StopTokens { chat_eos: 4, generation_eos: None };
         ModelConfig::new(tok, chat_template.map(|s| ChatTemplate::new(s.to_string())), stop)
+    }
+
+    /// A logit vector whose argmax is `id`, sized for the fixture vocab.
+    pub(crate) fn logit_for(id: usize) -> Vec<f32> {
+        let mut v = vec![0.0; 10];
+        v[id] = 9.0;
+        v
     }
 
     // Priming consumes exactly `prompt_ids.len()` script entries; the LAST one primed is what the
@@ -939,7 +1031,7 @@ mod tests {
             match c {
                 Chunk::Step(r) => steps.push(r.clone()),
                 Chunk::Done { report: r, .. } => report = r.clone(),
-                Chunk::Text(_) => {}
+                Chunk::Text(_) | Chunk::ToolCall(_) => {}
             }
             true
         })
@@ -1042,7 +1134,7 @@ mod tests {
             match c {
                 Chunk::Text(t) => streamed.push_str(t),
                 Chunk::Step(r) => from_records.push_str(&r.emit),
-                Chunk::Done { .. } => {}
+                Chunk::Done { .. } | Chunk::ToolCall(_) => {}
             }
             true
         })
@@ -1060,7 +1152,7 @@ mod tests {
         let mut finish = None;
         gen.generate(&Prompt::Raw("hello".to_string()), &params, &mut |c| match c {
             Chunk::Text(_) => false, // abort on the very first text chunk
-            Chunk::Step(_) => true,
+            Chunk::Step(_) | Chunk::ToolCall(_) => true,
             Chunk::Done { reason, .. } => {
                 finish = Some(reason);
                 true
@@ -1204,5 +1296,125 @@ mod tests {
         let params = GenerateParams { max_tokens: Some(5), temperature: Some(0.0), ..GenerateParams::default() };
         let (_, _, usage) = gen.generate_to_string(&Prompt::Raw("hello".to_string()), &params).unwrap();
         assert_eq!(usage.prompt_tokens, 1);
+    }
+}
+
+#[cfg(test)]
+mod tool_tests {
+    use super::tests::{build_cfg, logit_for};
+    use super::*;
+    use crate::pipeline::ChatMessage;
+
+    /// A template of a shape nothing here has seen: `<CALL>`/`</CALL>`, not Qwen3's `<tool_call>`.
+    /// The generator never learns those literals -- it gets them from `ToolSyntax::probe`, which is
+    /// the whole point of the design.
+    const TOOL_TEMPLATE: &str = "{% for m in messages %}{% if m.tool_calls %}\
+        {% for c in m.tool_calls %}<CALL>{{ {'name': c.function.name, 'arguments': c.function.arguments} | tojson }}</CALL>\
+        {% endfor %}{% else %}{{ m.content }}{% endif %}{% endfor %}";
+
+    fn one_tool() -> Vec<serde_json::Value> {
+        vec![serde_json::json!({
+            "type": "function",
+            "function": { "name": "get_weather", "parameters": { "type": "object" } }
+        })]
+    }
+
+    /// Script the three tokens that spell a call, and require the generator to hand back a
+    /// `Chunk::ToolCall` with no delimiter left in the text -- and `finish_reason: tool_calls`.
+    #[test]
+    fn a_scripted_tool_call_comes_back_as_a_call_not_as_text() {
+        let cfg = build_cfg(Some(TOOL_TEMPLATE));
+        assert!(cfg.tool_syntax.is_some(), "probe must have found this template's syntax");
+        let decode = ScriptedDecodeStep::new(vec![
+            logit_for(7), // <CALL>
+            logit_for(8), // the payload
+            logit_for(9), // </CALL>
+            logit_for(4), // EOS
+        ]);
+        let mut gen = LlmGenerator::new(cfg, decode);
+        let params = GenerateParams {
+            temperature: Some(0.0),
+            max_tokens: Some(8),
+            tools: one_tool(),
+            ..GenerateParams::default()
+        };
+        let (mut text, mut calls, mut reason) = (String::new(), Vec::new(), None);
+        gen.generate(
+            &Prompt::Chat(vec![ChatMessage::new("user", "hello")]),
+            &params,
+            &mut |c| {
+                match c {
+                    Chunk::Text(t) => text.push_str(t),
+                    Chunk::ToolCall(tc) => calls.push(tc.clone()),
+                    Chunk::Done { reason: r, .. } => reason = Some(r),
+                    Chunk::Step(_) => {}
+                }
+                true
+            },
+        )
+        .unwrap();
+
+        assert_eq!(calls.len(), 1, "text was {text:?}");
+        assert_eq!(calls[0].name, "get_weather");
+        assert_eq!(calls[0].arguments, serde_json::json!({ "city": "Paris" }));
+        assert!(!text.contains("<CALL>"), "delimiter leaked into content: {text:?}");
+        assert_eq!(reason, Some(FinishReason::ToolCalls));
+    }
+
+    /// The same script with NO tools declared must behave exactly as it did before tool calling
+    /// existed: the delimiters are just text, and the reason is `stop`. A parser that ran anyway
+    /// would silently change every request that never asked for tools.
+    #[test]
+    fn without_declared_tools_the_stream_is_untouched() {
+        let cfg = build_cfg(Some(TOOL_TEMPLATE));
+        let decode = ScriptedDecodeStep::new(vec![
+            logit_for(7),
+            logit_for(8),
+            logit_for(9),
+            logit_for(4),
+        ]);
+        let mut gen = LlmGenerator::new(cfg, decode);
+        let params =
+            GenerateParams { temperature: Some(0.0), max_tokens: Some(8), ..GenerateParams::default() };
+        let (mut text, mut calls, mut reason) = (String::new(), 0usize, None);
+        gen.generate(
+            &Prompt::Chat(vec![ChatMessage::new("user", "hello")]),
+            &params,
+            &mut |c| {
+                match c {
+                    Chunk::Text(t) => text.push_str(t),
+                    Chunk::ToolCall(_) => calls += 1,
+                    Chunk::Done { reason: r, .. } => reason = Some(r),
+                    Chunk::Step(_) => {}
+                }
+                true
+            },
+        )
+        .unwrap();
+        assert_eq!(calls, 0);
+        assert!(text.contains("<CALL>"), "text was {text:?}");
+        assert_eq!(reason, Some(FinishReason::Stop));
+    }
+
+    /// A model with no tool branch in its template stays tool-incapable even when the caller
+    /// declares tools. No parser, no calls, and the completion is unchanged -- the request layer is
+    /// what turns this into a 400; the generator must not pretend either way.
+    #[test]
+    fn a_tool_incapable_model_generates_normally_with_tools_declared() {
+        let cfg = build_cfg(Some("{% for m in messages %}{{ m.content }}{% endfor %}"));
+        assert!(cfg.tool_syntax.is_none());
+        let decode = ScriptedDecodeStep::new(vec![logit_for(2), logit_for(4)]);
+        let mut gen = LlmGenerator::new(cfg, decode);
+        let params = GenerateParams {
+            temperature: Some(0.0),
+            max_tokens: Some(4),
+            tools: one_tool(),
+            ..GenerateParams::default()
+        };
+        let (text, reason, _) = gen
+            .generate_to_string(&Prompt::Chat(vec![ChatMessage::new("user", "hello")]), &params)
+            .unwrap();
+        assert_eq!(text, "world");
+        assert_eq!(reason, FinishReason::Stop);
     }
 }

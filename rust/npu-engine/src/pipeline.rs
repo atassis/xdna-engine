@@ -157,6 +157,12 @@ pub struct GenerateParams {
     /// on for one run otherwise means restarting the service. See
     /// `LlmGenerator::generate`/`npu_xrt::dispatch_log::set_override`.
     pub dispatch_log: Option<bool>,
+    /// Tool schemas the caller declared, as the client's JSON. Empty means no tools -- which is
+    /// what an ABSENT `tools` and an EMPTY `tools: []` both mean, and why neither is an error.
+    ///
+    /// Rendered into the prompt by the model's own template. The engine never inspects a schema;
+    /// it passes the client's JSON through, key order included.
+    pub tools: Vec<serde_json::Value>,
 }
 
 impl Default for GenerateParams {
@@ -175,6 +181,7 @@ impl Default for GenerateParams {
             frequency_penalty: None,
             repetition_penalty: None,
             dispatch_log: None,
+            tools: Vec::new(),
         }
     }
 }
@@ -189,6 +196,9 @@ pub enum FinishReason {
     Length,
     /// The sink asked to stop -- client disconnected mid-stream.
     Aborted,
+    /// The completion ended with at least one tool call. OpenAI's own terminal reason for it, and
+    /// distinct from `Stop`: a client routes on this to decide whether to execute something.
+    ToolCalls,
 }
 
 /// One tier of generation defaults. The same shape serves the scenario's `[generation]` block and
@@ -293,6 +303,7 @@ impl FinishReason {
         match self {
             FinishReason::Stop | FinishReason::Aborted => "stop",
             FinishReason::Length => "length",
+            FinishReason::ToolCalls => "tool_calls",
         }
     }
 }
@@ -319,6 +330,13 @@ pub enum Chunk<'a> {
     /// `emit` inside the record repeats the text the preceding `Text` carried, borrowed from the
     /// same buffer rather than cloned, so a consumer can render frames from `Step` alone.
     Step(&'a StepRecord),
+    /// One completed tool call, in the order the model produced it.
+    ///
+    /// Emitted by the generator, not reconstructed downstream: the syntax comes from the model's
+    /// chat template, and the streaming parser has to hold back a partial delimiter BEFORE it
+    /// reaches a sink. A consumer that re-parsed `Text` would be parsing text the delimiters had
+    /// already been removed from.
+    ToolCall(&'a ToolCall),
     /// Terminal. Emitted exactly once, after the last `Text`.
     ///
     /// `usage` stays a field of its own rather than being read out of `report`: it is the OpenAI
@@ -363,6 +381,9 @@ pub trait TextGenerator {
             match c {
                 Chunk::Text(t) => out.push_str(t),
                 Chunk::Step(_) => {}
+                // Dropped, not rendered back into the string: this surface returns TEXT, and a
+                // caller that wants calls uses `generate` and reads them as chunks.
+                Chunk::ToolCall(_) => {}
                 Chunk::Done { reason, usage: u, .. } => {
                     fin = reason;
                     usage = u;
