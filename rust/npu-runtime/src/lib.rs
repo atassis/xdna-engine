@@ -12,6 +12,7 @@ pub mod reconcile;
 pub mod actor;
 pub mod http;
 pub mod media;
+pub mod ollama;
 pub mod run_log;
 pub mod stream;
 
