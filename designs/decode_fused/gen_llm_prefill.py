@@ -373,7 +373,7 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
     reg = registry()
     tiles = {}
 
-    def gemm_for(label, K, Nout, b_col_maj=True, blocking=None):
+    def gemm_for(label, K, Nout, b_col_maj=True, blocking=None, extra=None):
         """One GEMM at the registry's tiling for its shape, checked twice on the way through.
 
         `blocking` is `(rows_per_block, block_stride)` when B's rows are not one contiguous slab in
@@ -391,6 +391,7 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
                         "source": ch.source, "K": K, "N": Nout,
                         "measured": ch.measured}
         blk = dict(b_block_rows=blocking[0], b_block_stride=blocking[1]) if blocking else {}
+        blk.update(extra or {})
         return GEMM(M=M, K=K, N=Nout, b_col_maj=b_col_maj, context=ctx,
                     emulate_bf16_mmul_with_bfp16=emulate, prio_accuracy=prio_acc,
                     round_conv_even=round_even, **blk, **ch.gemm_kwargs)
@@ -430,8 +431,16 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
     # [K=S, N=HD] -> plain. Either way the blocked axis is the physical leading one, positions, so
     # one `b_blocked` serves both and the descriptor rewrite lives in the operator.
     kv_blocking = (kvl.T, kvl.block_stride) if kvl.T != kvl.S else None
-    op_sc = gemm_for("scores", HD, S, blocking=kv_blocking)
-    op_cx = gemm_for("ctx", S, HD, b_col_maj=False, blocking=kv_blocking)
+    # PREFILL_HEAD_SEAM=0 keeps the two head-axis rearranges. With them (the default) scores reads
+    # its A operand as a per-head SLICE of the token-major `q` and ctx writes its C the same way
+    # into `cxt`, at row pitch QD -- so `op_q2h` and `op_h2t` disappear entirely, with their two
+    # configures per layer and their 4.0 MB/layer of zero-compute DMA. Head selection stays a
+    # buffer SLICE, so the descriptor is head-independent and one design still serves all Hq.
+    seam = os.environ.get("PREFILL_HEAD_SEAM", "1") == "1"
+    op_sc = gemm_for("scores", HD, S, blocking=kv_blocking,
+                     extra=dict(a_row_stride=QD) if seam else {})
+    op_cx = gemm_for("ctx", S, HD, b_col_maj=False, blocking=kv_blocking,
+                     extra=dict(c_row_stride=QD) if seam else {})
     tn_sc, tn_cx = tiles["scores"]["tile"][2], tiles["ctx"]["tile"][2]
     print("[tiles] " + "  ".join(
         f"{k}={v['tile'][0]}x{v['tile'][1]}x{v['tile'][2]}@{v['cols']}c({v['source']})"
@@ -516,8 +525,8 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
     # would be 28 * 43 MB of arena for no reason.
     bufsz = {
         "h": M * D * 2, "q": M * QD * 2, "k": M * KVD * 2, "v": M * KVD * 2,
-        "qh": M * QD * 2, "sc": Hq * M * S * 2, "sw": Hq * M * S * 2,
-        "cx": M * QD * 2, "cxt": M * QD * 2, "a": M * D * 2, "xs": M * D * 2,
+        "sc": Hq * M * S * 2, "sw": Hq * M * S * 2,
+        "cxt": M * QD * 2, "a": M * D * 2, "xs": M * D * 2,
         "hf": M * D * 2, "g": M * FF * 2, "gs": M * FF * 2, "u": M * FF * 2,
         "gh": M * FF * 2, "d": M * D * 2,
     }
@@ -526,6 +535,9 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
         # size from the arg spec, and a sliced one only from here. Same size the whole-buffer arm
         # gets from op_sm's spec, so the input arena is byte-identical between the arms.
         bufsz[SM_WIDTHS] = Hq * M * 4
+    if not seam:
+        bufsz["qh"] = M * QD * 2
+        bufsz["cx"] = M * QD * 2
     prefill_local = sorted(bufsz)
     dec_meta, dec_order, dec_sizes, dec_reserved = (None, [], {}, 0)
     if dec_meta_path:
@@ -603,13 +615,17 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
             # pipeline, and the M=1 path a decode step resumes from depends on both.
             (op_kvapp, "k", p + "kc"),
             (op_kvapp, "v", p + "vc"),
-            (op_q2h, "q", "qh"),
-        ]
+        ] + ([] if seam else [(op_q2h, "q", "qh")])
         # The widths buffer is an INPUT of the softmax step, not a side channel: op.get_arg_spec()
         # puts it between in and out, so it is the middle name here.
+        def qslice(h):
+            """Head h's queries: a strided slice of token-major `q`, or the head-major copy."""
+            if not seam:
+                return f"qh[{h * M * HD * 2}:{(h + 1) * M * HD * 2}]"
+            return f"q[{h * HD * 2}:{(h * HD + op_sc.a_elems) * 2}]"
+
         def score(h):
-            return (op_sc, f"qh[{h * M * HD * 2}:{(h + 1) * M * HD * 2}]",
-                    kv_slab(p + "kc", h // grp),
+            return (op_sc, qslice(h), kv_slab(p + "kc", h // grp),
                     f"sc[{h * M * S * 2}:{(h + 1) * M * S * 2}]")
 
         def soft(h):
@@ -634,11 +650,11 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
             rl.append((op_sm, "sc", SM_WIDTHS, "sw") if causal == "rows"
                       else (op_sm, "sc", "sw"))
         for h in range(Hq):
+            cx_out = (f"cxt[{h * HD * 2}:{(h * HD + op_cx.c_elems) * 2}]" if seam
+                      else f"cx[{h * M * HD * 2}:{(h + 1) * M * HD * 2}]")
             rl.append((op_cx, f"sw[{h * M * S * 2}:{(h + 1) * M * S * 2}]",
-                       kv_slab(p + "vc", h // grp),
-                       f"cx[{h * M * HD * 2}:{(h + 1) * M * HD * 2}]"))
-        rl += [
-            (op_h2t, "cx", "cxt"),
+                       kv_slab(p + "vc", h // grp), cx_out))
+        rl += ([] if seam else [(op_h2t, "cx", "cxt")]) + [
             (op_o, "cxt", wo, "a"),
             (op_add, src, "a", "xs"),
             (op_norm, "xs", p + "n_pf", "hf"),
@@ -692,6 +708,8 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
         name += f"_ao{attn_order}" + (f"{n_il}" if attn_order == "interleaved" else "")
     if merge_qknorm:
         name += "_mqn"
+    if seam:
+        name += "_nseam"
     # The tiling is now a per-shape lookup, so it is a GRAPH knob like the three above and has to
     # be in the name for the same reason: a re-sweep that moves one GEMM's tile must not link the
     # previous tiling's ELF out of the artifact cache. Hashed rather than spelled out -- seven
