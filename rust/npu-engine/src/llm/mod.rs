@@ -17,7 +17,7 @@ pub use artifact::{ArtifactRole, EmbedScale, LlmArtifact};
 pub use chat_template::ChatTemplate;
 pub use config::{ModelConfig, StopTokens};
 pub use detokenize::{IncrementalDetokenizer, StopFeed, StopMatcher};
-pub use generator::{DecodeStep, LlmGenerator, ScriptedDecodeStep};
+pub use generator::{CacheState, DecodeStep, LlmGenerator, ScriptedDecodeStep};
 pub use kv_layout::kv_off;
 pub use npu_decode::NpuDecodeStep;
 pub use npu_prefill::{chunk_plan, NpuPrefill, PrefillChunk};

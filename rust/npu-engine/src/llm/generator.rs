@@ -19,16 +19,32 @@ use crate::telemetry::{
 /// One decode step against whatever backend holds the model: feed `token` at KV-cache position
 /// `pos`, get back full-vocabulary logits. `pos` is 0 for the first prompt token; the caller (this
 /// module) drives it, so an implementation is stateless about position.
+/// What [`DecodeStep::reset`] did to the KV cache. Named rather than a `bool` because the caller's
+/// prefix ledger is only correct if this is right, and a bare `true` is the kind of thing an
+/// implementation returns without thinking about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheState {
+    /// The cache still holds what it held. The ledger stays valid.
+    Retained,
+    /// The cache is empty. The ledger MUST be dropped.
+    Cleared,
+}
+
 pub trait DecodeStep {
     fn step(&mut self, token: u32, pos: usize) -> Result<Vec<f32>, EngineError>;
 
-    /// Drop any per-generation state before a new one starts. A device backend holds a KV cache
-    /// that only grows with `pos`, so without this the second request continues the first one's
-    /// context and answers differently -- which is what an end-to-end run caught after every layer
-    /// passed its own tests: the scripted mock has no KV state, so no unit test could see it.
-    /// Default no-op, so a stateless implementation needs no change.
-    fn reset(&mut self) -> Result<(), EngineError> {
-        Ok(())
+    /// Drop any per-generation state before a new one starts, and SAY whether the KV cache was
+    /// emptied doing it.
+    ///
+    /// The return value is load-bearing, which is why it is an enum and not a `bool`: the caller
+    /// keeps a ledger of which token ids sit at which cache positions, and a ledger that outlives
+    /// the state it describes answers the next request from stale attention -- fluently, with no
+    /// error, and invisibly to any test that only checks happy-path output. An implementation that
+    /// clears its cache here and reports [`CacheState::Retained`] creates exactly that.
+    ///
+    /// The default body does nothing, so it truthfully reports `Retained`.
+    fn reset(&mut self) -> Result<CacheState, EngineError> {
+        Ok(CacheState::Retained)
     }
 
     /// The largest number of token positions this backend's KV cache can hold, or `None` when the
@@ -52,16 +68,20 @@ pub trait DecodeStep {
         None
     }
 
-    /// Prime the KV cache for `tokens` at positions `[0, tokens.len())` in batches of
-    /// [`prefill_batch`](DecodeStep::prefill_batch), and return how many positions were primed.
+    /// Prime the KV cache for `tokens[from..]` at positions `[from, tokens.len())` in batches of
+    /// [`prefill_batch`](DecodeStep::prefill_batch), and return how many positions are now primed.
     ///
-    /// Returning fewer than `tokens.len()` (including 0) is legal and is how a backend declines:
-    /// the caller resumes the per-token loop at the returned position. It produces no logits --
-    /// prefill's product is the KV cache -- so the caller must keep at least the prompt's LAST
-    /// token for [`step`](DecodeStep::step), which is what it samples from.
-    fn prefill(&mut self, tokens: &[u32]) -> Result<usize, EngineError> {
+    /// `tokens` is the whole prompt prefix and `from` is where the cache already agrees with it --
+    /// see the prefix ledger in `LlmGenerator::generate`. Positions before `from` are ALREADY in
+    /// the KV cache from an earlier request; re-priming them would rewrite the same values.
+    ///
+    /// Returning fewer than `tokens.len()` (including `from`) is legal and is how a backend
+    /// declines: the caller resumes the per-token loop at the returned position. It produces no
+    /// logits -- prefill's product is the KV cache -- so the caller must keep at least the prompt's
+    /// LAST token for [`step`](DecodeStep::step), which is what it samples from.
+    fn prefill(&mut self, tokens: &[u32], from: usize) -> Result<usize, EngineError> {
         let _ = tokens;
-        Ok(0)
+        Ok(from)
     }
 
     /// Live device BO bytes this backend holds, or 0 for a host backend that holds none.
@@ -131,6 +151,11 @@ fn counter_delta(prev: &mut Option<(u32, u32)>, now: Option<(u32, u32)>) -> (Opt
 /// `Prompt::Raw` tokenizes directly. The returned length is the TRUE tokenized prompt length --
 /// never recover it later by filtering EOS out of a padded buffer: EOS doubles as the chat
 /// template's own turn separator, so that recovery undercounts and desyncs every position after it.
+/// How many leading ids two sequences share.
+fn common_prefix_len(a: &[u32], b: &[u32]) -> usize {
+    a.iter().zip(b).take_while(|(x, y)| x == y).count()
+}
+
 /// Push `text` through the parser, replacing it with what the parser released and returning the
 /// calls it completed. With no parser (no tools declared, or a tool-incapable model) this is the
 /// identity and costs nothing.
@@ -282,8 +307,10 @@ impl DecodeStep for ScriptedDecodeStep {
         self.prefill_batch
     }
 
-    fn prefill(&mut self, tokens: &[u32]) -> Result<usize, EngineError> {
-        self.prefill_calls.push(tokens.len());
+    fn prefill(&mut self, tokens: &[u32], from: usize) -> Result<usize, EngineError> {
+        // The COUNT actually primed, not the prompt length: a test asserting the ledger skipped
+        // work reads this, and recording `tokens.len()` would report the same number either way.
+        self.prefill_calls.push(tokens.len() - from);
         Ok(tokens.len())
     }
 }
@@ -295,11 +322,27 @@ pub struct LlmGenerator<D: DecodeStep> {
     decode: D,
     /// The scenario's `[generation]` block -- the tier between the request and the checkpoint.
     scenario_defaults: crate::pipeline::GenerationDefaults,
+    /// The token ids currently held in the backend's KV cache, at positions `[0, resident.len())`.
+    ///
+    /// This is bookkeeping over state that already survives: `NpuDecodeStep::reset` stopped
+    /// re-zeroing the cache per request on 2026-09-08, because `sm_mask` masks everything at or
+    /// past `n_past` to -inf. What was missing was any record of WHAT is in there, so every request
+    /// re-primed from position 0 and rewrote the same values.
+    ///
+    /// One slot, a plain `Vec`, no radix tree: one model is resident and one generation runs at a
+    /// time, so there is never a second sequence to choose between.
+    ///
+    /// # This field can answer a request wrongly with no error
+    ///
+    /// If it claims a prefix the cache does not hold, generation reads another request's attention
+    /// state -- fluently, with no warning, and no happy-path test would see it. Every path that
+    /// writes KV must update it or clear it. There is no third option.
+    resident: Vec<u32>,
 }
 
 impl<D: DecodeStep> LlmGenerator<D> {
     pub fn new(cfg: ModelConfig, decode: D) -> Self {
-        LlmGenerator { cfg, decode, scenario_defaults: Default::default() }
+        LlmGenerator { cfg, decode, scenario_defaults: Default::default(), resident: Vec::new() }
     }
 
     /// Set the scenario's generation defaults. A request that names a field still wins; these
@@ -390,7 +433,11 @@ impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
         // grows with `pos`, so without this each request continues the previous one's. Zeroing it
         // is prompt-side setup, so its cost belongs to the prefill window rather than to a span of
         // its own; tokenization is carved back out of the middle of that window below.
-        self.decode.reset()?;
+        // A backend that actually zeroed its cache (what `NPU_LLM_REUSE_KV=0` restores) invalidates
+        // the ledger: describing a zeroed cache is the same defect as describing a stale one.
+        if self.decode.reset()? == CacheState::Cleared {
+            self.resident.clear();
+        }
         let mut prefill_us = t0.elapsed().as_micros() as u64;
         let t_tokenize = Instant::now();
         let prompt_ids = tokenize_prompt(&self.cfg, prompt, params.enable_thinking, &params.tools)?;
@@ -458,12 +505,21 @@ impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
         let t_prefill = Instant::now();
         let mut counters = self.decode.counters();
         let batchable = prompt_ids.len() - 1;
-        let mut primed = 0usize;
+        // How much of this prompt the cache already holds. Clamped to `batchable` because only
+        // `step` returns logits and the first `sample()` reads them: an identical repeat must still
+        // run its last position, or there is nothing to sample from.
+        let reused = common_prefix_len(&self.resident, &prompt_ids).min(batchable);
+        // From here to the end of the decode loop the ledger describes state we are OVERWRITING.
+        // Drop it now and rebuild it on success: an error between here and there leaves an unknown
+        // number of positions written, and a ledger that survives that is the silent-wrong-answer
+        // path this field's doc warns about.
+        self.resident.clear();
+        let mut primed = reused;
         // `prefill_batch()` is the CAPABILITY probe -- `Some` means a batched prefill artifact is
         // loaded. Its `M` no longer gates the decision: `prime()` pads a partial chunk itself, and
         // paying for the padding beats paying for the dispatches. See `prefill_min_tokens()`.
-        if self.decode.prefill_batch().is_some() && batchable >= prefill_min_tokens() {
-            primed = self.decode.prefill(&prompt_ids[..batchable])?;
+        if self.decode.prefill_batch().is_some() && batchable - reused >= prefill_min_tokens() {
+            primed = self.decode.prefill(&prompt_ids[..batchable], reused)?;
         }
         let mut logits = Vec::new();
         for (i, &tok) in prompt_ids.iter().enumerate().skip(primed) {
@@ -668,6 +724,12 @@ impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
         // `pos` is the KV position the next dispatch would have written -- i.e. the one this
         // generation actually reached, prompt included. The backend supplies everything else about
         // the build that produced these numbers; this is the one field only the loop can see.
+        // The cache now holds the prompt plus everything generated, at `[0, pos)`. `history` is
+        // exactly that sequence -- it is the prompt ids with each accepted token pushed -- and it
+        // is truncated to `pos` because the last sampled token was never fed back through `step`,
+        // so its position holds nothing.
+        self.resident = history;
+        self.resident.truncate(pos);
         let provenance = ArmProvenance { n_past: Some(pos as u32), ..self.decode.provenance() };
         let report = GenerationReport {
             tokenize_us,
@@ -995,7 +1057,7 @@ mod tests {
         impl DecodeStep for Declining {
             fn step(&mut self, t: u32, p: usize) -> Result<Vec<f32>, EngineError> { self.0.step(t, p) }
             fn prefill_batch(&self) -> Option<usize> { Some(1) }
-            fn prefill(&mut self, _tokens: &[u32]) -> Result<usize, EngineError> { Ok(0) }
+            fn prefill(&mut self, _tokens: &[u32], from: usize) -> Result<usize, EngineError> { Ok(from) }
         }
         let peak = |id: usize| { let mut v = vec![0.0; 7]; v[id] = 9.0; v };
         let decode = Declining(ScriptedDecodeStep::new(vec![peak(0), peak(0), peak(2), peak(4)]));
@@ -1437,5 +1499,183 @@ mod tool_tests {
             .unwrap();
         assert_eq!(text, "world");
         assert_eq!(reason, FinishReason::Stop);
+    }
+}
+
+#[cfg(test)]
+mod ledger_tests {
+    use super::tests::{build_cfg, logit_for};
+    use super::*;
+    use crate::pipeline::ChatMessage;
+
+    /// A backend that primes whatever it is asked to and records the `(from, len)` of every call,
+    /// so a test can assert on WORK DONE rather than on output. Its `reset` reports `Retained`,
+    /// which is what the device backend reports by default since 2026-09-08.
+    struct Recording {
+        inner: ScriptedDecodeStep,
+        primes: Log,
+        steps: Steps,
+        fail_prime: bool,
+    }
+
+    impl DecodeStep for Recording {
+        fn step(&mut self, t: u32, p: usize) -> Result<Vec<f32>, EngineError> {
+            self.steps.borrow_mut().push(p);
+            self.inner.step(t, p)
+        }
+        fn prefill_batch(&self) -> Option<usize> {
+            Some(1)
+        }
+        fn prefill(&mut self, tokens: &[u32], from: usize) -> Result<usize, EngineError> {
+            self.primes.borrow_mut().push((from, tokens.len()));
+            if self.fail_prime {
+                return Err(EngineError::Device("scripted prime failure".into()));
+            }
+            Ok(tokens.len())
+        }
+    }
+
+    type Log = std::rc::Rc<std::cell::RefCell<Vec<(usize, usize)>>>;
+    type Steps = std::rc::Rc<std::cell::RefCell<Vec<usize>>>;
+
+    /// `n` vocab words. Prompts here must clear `prefill_min_tokens()` (12) on the TAIL, or the
+    /// batched path declines and the test observes the threshold instead of the ledger. The
+    /// environment is deliberately not touched: these tests run in parallel threads of one process,
+    /// and `NPU_LLM_PREFILL_MIN_TOKENS` is read per call.
+    fn words(n: usize) -> String {
+        ["hello", "world", "foo", "bar"].iter().cycle().take(n).copied().collect::<Vec<_>>().join(" ")
+    }
+
+    fn gen_with(fail_prime: bool) -> (LlmGenerator<Recording>, Log, Steps) {
+        gen_for(build_cfg(None), fail_prime)
+    }
+
+    fn gen_for(cfg: ModelConfig, fail_prime: bool) -> (LlmGenerator<Recording>, Log, Steps) {
+        let primes: Log = Default::default();
+        let steps: Steps = Default::default();
+        let decode = Recording {
+            // Long enough that a prompt is never limited by the script; the first sample is EOS,
+            // so every generation stops at once and `pos` lands on the prompt length.
+            inner: ScriptedDecodeStep::new(vec![logit_for(4); 200]),
+            primes: primes.clone(),
+            steps: steps.clone(),
+            fail_prime,
+        };
+        (LlmGenerator::new(cfg, decode), primes, steps)
+    }
+
+    fn params() -> GenerateParams {
+        GenerateParams { max_tokens: Some(1), temperature: Some(0.0), ..GenerateParams::default() }
+    }
+
+    /// Two requests sharing a prefix must prime only the divergent tail. This asserts on the work
+    /// the backend was asked to do, which is the only thing separating a cache from a no-op that
+    /// happens to return the same text.
+    #[test]
+    fn a_shared_prefix_is_not_reprimed() {
+        let (mut gen, primes, _steps) = gen_with(false);
+        let p = params();
+        gen.generate_to_string(&Prompt::Raw(words(20)), &p).unwrap();
+        assert_eq!(primes.borrow()[0], (0, 19), "first request must prime from zero");
+        assert_eq!(gen.resident.len(), 20);
+
+        gen.generate_to_string(&Prompt::Raw(words(40)), &p).unwrap();
+        assert_eq!(primes.borrow()[1].0, 20, "re-primed a prefix the cache already held");
+    }
+
+    /// The `enable_thinking=false` case, in the small: turn N is NOT a prefix of turn N+1 (Qwen3
+    /// #1826, 26 of 30 tokens on the real template). The ledger is token-LCP, so it degrades to a
+    /// short hit -- it must not assume append and prime from the wrong position.
+    #[test]
+    fn a_diverging_prompt_reprimes_from_the_divergence_point() {
+        let (mut gen, primes, _steps) = gen_with(false);
+        let p = params();
+        gen.generate_to_string(&Prompt::Raw(words(40)), &p).unwrap();
+        // Same first five words, then a different one, then the rest.
+        let diverged = format!("hello world foo bar hello bar {}", words(40));
+        gen.generate_to_string(&Prompt::Raw(diverged), &p).unwrap();
+        assert_eq!(primes.borrow()[1].0, 5, "shared prefix is the first five words, nothing more");
+    }
+
+    /// An identical repeat still has to run one step: only `step` returns logits, and the first
+    /// `sample()` reads them. `L` is clamped to `len - 1`, so the last position is never reused.
+    #[test]
+    fn an_identical_prompt_still_steps_its_last_position() {
+        let (mut gen, _primes, steps) = gen_with(false);
+        let p = params();
+        gen.generate_to_string(&Prompt::Raw(words(20)), &p).unwrap();
+        steps.borrow_mut().clear();
+        gen.generate_to_string(&Prompt::Raw(words(20)), &p).unwrap();
+        assert_eq!(
+            *steps.borrow(),
+            vec![19],
+            "an exact repeat must step exactly its last position -- no more, and never none"
+        );
+    }
+
+    /// THE hazard. A failed prime leaves an unknown number of positions written, so the ledger must
+    /// be cleared -- one that outlives its KV state answers the next request from stale attention
+    /// with no error, no warning, and no failing happy-path test.
+    #[test]
+    fn an_error_mid_prime_clears_the_ledger() {
+        let (mut gen, primes, _steps) = gen_with(false);
+        let p = params();
+        gen.generate_to_string(&Prompt::Raw(words(20)), &p).unwrap();
+        assert!(!gen.resident.is_empty());
+
+        gen.decode.fail_prime = true;
+        gen.generate_to_string(&Prompt::Raw(words(40)), &p)
+            .expect_err("a scripted prime failure must propagate");
+        assert!(gen.resident.is_empty(), "the ledger survived a failed prime");
+
+        // And the next request re-primes from zero rather than trusting the dead ledger.
+        gen.decode.fail_prime = false;
+        gen.generate_to_string(&Prompt::Raw(words(20)), &p).unwrap();
+        assert_eq!(primes.borrow().last().unwrap().0, 0);
+    }
+
+    /// A backend that reports `Cleared` invalidates the ledger. That is what `NPU_LLM_REUSE_KV=0`
+    /// restores, and describing a zeroed cache is the same defect as describing a stale one.
+    #[test]
+    fn a_backend_that_clears_its_cache_invalidates_the_ledger() {
+        struct Clearing(Recording);
+        impl DecodeStep for Clearing {
+            fn step(&mut self, t: u32, p: usize) -> Result<Vec<f32>, EngineError> { self.0.step(t, p) }
+            fn prefill_batch(&self) -> Option<usize> { self.0.prefill_batch() }
+            fn prefill(&mut self, t: &[u32], f: usize) -> Result<usize, EngineError> { self.0.prefill(t, f) }
+            fn reset(&mut self) -> Result<CacheState, EngineError> { Ok(CacheState::Cleared) }
+        }
+        let (inner, primes, _steps) = gen_with(false);
+        let mut gen = LlmGenerator::new(build_cfg(None), Clearing(inner.decode));
+        let p = params();
+        gen.generate_to_string(&Prompt::Raw(words(20)), &p).unwrap();
+        gen.generate_to_string(&Prompt::Raw(words(40)), &p).unwrap();
+        assert_eq!(primes.borrow()[1].0, 0, "reused a prefix from a cache the backend had zeroed");
+    }
+
+    /// The tool loop is the case this exists for: every round-trip re-sends the whole conversation
+    /// and each one is a pure extension of the last (measured on the real Qwen3 template: 159 of
+    /// 159 tokens shared, call -> result). Without the ledger, N tool calls cost O(N^2) prefill.
+    #[test]
+    fn a_growing_conversation_primes_only_what_it_added() {
+        let (mut gen, primes, _steps) =
+            gen_for(build_cfg(Some("{% for m in messages %}{{ m.content }} {% endfor %}")), false);
+        let p = params();
+
+        let mut convo = vec![ChatMessage::new("user", words(20))];
+        gen.generate_to_string(&Prompt::Chat(convo.clone()), &p).unwrap();
+        let first = primes.borrow().last().copied().unwrap();
+        assert_eq!(first.0, 0);
+
+        convo.push(ChatMessage::new("assistant", words(20)));
+        convo.push(ChatMessage::new("user", words(20)));
+        gen.generate_to_string(&Prompt::Chat(convo), &p).unwrap();
+        let second = primes.borrow().last().copied().unwrap();
+
+        assert!(
+            second.0 >= first.1,
+            "the second turn re-primed the first turn's positions: {second:?} against {first:?}"
+        );
+        assert!(second.1 > second.0, "the second turn primed nothing new: {second:?}");
     }
 }

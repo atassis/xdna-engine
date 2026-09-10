@@ -410,6 +410,9 @@ _npu_models() {
 /// What one generation produced: the text, and everything measured about producing it.
 struct Generated {
     text: String,
+    /// Tool calls the model made. Echoed as JSON rather than as prose: a call is something to
+    /// EXECUTE, and printing it as text would put it in the transcript as if the model had said it.
+    calls: Vec<npu_engine::ToolCall>,
     reason: npu_engine::FinishReason,
     report: npu_engine::GenerationReport,
 }
@@ -436,11 +439,19 @@ fn drain_generation(
             &npu_runtime::conditions::at_start(&meta.model, meta.created), meta))?;
     }
     let mut text = String::new();
+    let mut calls: Vec<npu_engine::ToolCall> = Vec::new();
     loop {
         match rx.recv() {
             Ok(StreamItem::Text(t)) => {
                 if echo { print!("{t}"); std::io::stdout().flush().ok(); }
                 text.push_str(&t);
+            }
+            Ok(StreamItem::ToolCall(c)) => {
+                if echo {
+                    println!("\n[tool_call] {} {}", c.name, c.arguments);
+                    std::io::stdout().flush().ok();
+                }
+                calls.push(c);
             }
             Ok(StreamItem::Step(r)) => {
                 if let Some(w) = json.as_mut() {
@@ -457,7 +468,7 @@ fn drain_generation(
                     writeln!(w, "{}", wire::summary_line(&report, meta, reason))?;
                     w.flush()?;
                 }
-                return Ok(Generated { text, reason, report: *report });
+                return Ok(Generated { text, calls, reason, report: *report });
             }
             Ok(StreamItem::Error(e)) => bail!("{e}"),
             Err(_) => bail!("generation ended without a result"),
@@ -548,7 +559,7 @@ fn generate(path: &Path, prompt: &str, model: Option<&str>, sampling: &SamplingA
     if as_json {
         // The streaming arm already wrote every line; only the buffered arm has anything left.
         if !ndjson {
-            println!("{}", wire::completion_object(&g.text, g.reason, &g.report, &meta));
+            println!("{}", wire::completion_object_with_calls(&g.text, &g.calls, g.reason, &g.report, &meta));
         }
     } else {
         if no_stream { print!("{}", g.text); }
