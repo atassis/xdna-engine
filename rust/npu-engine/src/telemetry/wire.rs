@@ -21,7 +21,7 @@
 
 use serde_json::{json, Map, Value};
 
-use crate::pipeline::FinishReason;
+use crate::pipeline::{FinishReason, ToolCall};
 use crate::telemetry::{
     ArmProvenance, Bound, DesignCost, GenerationReport, PrefillRecord, RunConditions, SamplePhases,
     StepPhases, StepRecord, Summary,
@@ -243,9 +243,28 @@ pub fn npu_object(s: &Summary) -> Value {
 /// One definition, used by the HTTP route and by the CLI's `--output json`. Two hand-rolled copies
 /// of the same object is how the two surfaces end up reporting different numbers for one run.
 pub fn completion_object(text: &str, reason: FinishReason, r: &GenerationReport, m: &RunMeta) -> Value {
+    completion_object_with_calls(text, &[], reason, r, m)
+}
+
+/// `completion_object` plus the tool calls the model made.
+///
+/// `content` goes to null, not `""`, when a call is present and no text is: that is OpenAI's own
+/// shape, and clients branch on `content == null` to decide there is nothing to show the user.
+pub fn completion_object_with_calls(
+    text: &str,
+    calls: &[ToolCall],
+    reason: FinishReason,
+    r: &GenerationReport,
+    m: &RunMeta,
+) -> Value {
     let s = r.summarize();
     let choice = if m.chat {
-        json!({ "index": 0, "message": { "role": "assistant", "content": text }, "finish_reason": reason.as_str() })
+        let content = if text.is_empty() && !calls.is_empty() { Value::Null } else { json!(text) };
+        let mut message = json!({ "role": "assistant", "content": content });
+        if !calls.is_empty() {
+            message["tool_calls"] = Value::Array(calls.iter().map(tool_call_object).collect());
+        }
+        json!({ "index": 0, "message": message, "finish_reason": reason.as_str() })
     } else {
         json!({ "index": 0, "text": text, "finish_reason": reason.as_str() })
     };
@@ -262,6 +281,16 @@ pub fn completion_object(text: &str, reason: FinishReason, r: &GenerationReport,
         },
         "timings": timings_object(&s),
         "x_npu": npu_object(&s),
+    })
+}
+
+/// One tool call in OpenAI's wire shape. `arguments` is a STRING of JSON, not an object -- that is
+/// the API's own encoding, and a client that `JSON.parse`s it would choke on a nested object.
+pub fn tool_call_object(c: &ToolCall) -> Value {
+    json!({
+        "id": c.id,
+        "type": "function",
+        "function": { "name": c.name, "arguments": c.arguments.to_string() },
     })
 }
 

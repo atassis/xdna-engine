@@ -434,9 +434,20 @@ impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
         // Only when the caller declared tools AND this model's template says how it writes a call.
         // Absent either, the sink sees exactly the stream it saw before tool calling existed --
         // no hold-back, no scanning, byte-for-byte the old path.
-        let mut tools = (!params.tools.is_empty())
-            .then(|| self.cfg.tool_syntax.as_ref().map(StreamingToolParser::new))
-            .flatten();
+        let mut tools = match (params.tools.is_empty(), self.cfg.tool_syntax.as_ref()) {
+            (true, _) => None,
+            (false, Some(syn)) => Some(StreamingToolParser::new(syn)),
+            // Declared tools this model cannot serve. A 400, not a quiet drop: with no tool branch
+            // in its template the tools are never rendered, so the model CANNOT call one, and
+            // answering anyway would answer a different request than the one sent. Spec S6.
+            (false, None) => {
+                return Err(EngineError::Unsupported(
+                    "this model's chat template does not render tool calls, so \"tools\" cannot be \
+                     honoured -- send the request without it"
+                        .to_string(),
+                ))
+            }
+        };
         let mut tool_calls: Vec<ToolCall> = Vec::new();
 
         // Prime the KV cache over the prompt. The last position always goes through `step`,
@@ -1396,11 +1407,11 @@ mod tool_tests {
         assert_eq!(reason, Some(FinishReason::Stop));
     }
 
-    /// A model with no tool branch in its template stays tool-incapable even when the caller
-    /// declares tools. No parser, no calls, and the completion is unchanged -- the request layer is
-    /// what turns this into a 400; the generator must not pretend either way.
+    /// A model with no tool branch in its template cannot render the tools, so it can never call
+    /// one. Answering anyway would answer a different request than the one sent -- so it is an
+    /// `Unsupported`, which the HTTP layer already classifies as a 400.
     #[test]
-    fn a_tool_incapable_model_generates_normally_with_tools_declared() {
+    fn a_tool_incapable_model_refuses_declared_tools_rather_than_ignoring_them() {
         let cfg = build_cfg(Some("{% for m in messages %}{{ m.content }}{% endfor %}"));
         assert!(cfg.tool_syntax.is_none());
         let decode = ScriptedDecodeStep::new(vec![logit_for(2), logit_for(4)]);
@@ -1411,8 +1422,18 @@ mod tool_tests {
             tools: one_tool(),
             ..GenerateParams::default()
         };
-        let (text, reason, _) = gen
+        let err = gen
             .generate_to_string(&Prompt::Chat(vec![ChatMessage::new("user", "hello")]), &params)
+            .expect_err("declared tools on a tool-incapable model must not answer as if they were honoured");
+        assert!(matches!(err, EngineError::Unsupported(_)), "{err:?}");
+
+        // Without tools it serves normally -- the model is not broken, the request was.
+        let cfg = build_cfg(Some("{% for m in messages %}{{ m.content }}{% endfor %}"));
+        let decode = ScriptedDecodeStep::new(vec![logit_for(2), logit_for(4)]);
+        let mut gen = LlmGenerator::new(cfg, decode);
+        let plain = GenerateParams { tools: Vec::new(), ..params };
+        let (text, reason, _) = gen
+            .generate_to_string(&Prompt::Chat(vec![ChatMessage::new("user", "hello")]), &plain)
             .unwrap();
         assert_eq!(text, "world");
         assert_eq!(reason, FinishReason::Stop);

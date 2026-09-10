@@ -130,6 +130,24 @@ impl SseStream {
                 self.id, self.created, parse::json_escape(&self.model), reason.as_str()),
         }
     }
+    /// One tool call as a single streaming delta.
+    ///
+    /// OpenAI's wire format is a fragment concatenation -- `function.arguments` arrives in pieces
+    /// that the client joins by `index` -- so ONE fragment carrying the whole call is valid and
+    /// every client handles it. Streaming the arguments token by token is a later refinement with
+    /// no format change; it would not make anything parse that does not parse now.
+    fn render_tool_call(&self, c: &npu_engine::ToolCall, index: usize) -> String {
+        let call = serde_json::json!({
+            "index": index,
+            "id": c.id,
+            "type": "function",
+            "function": { "name": c.name, "arguments": c.arguments.to_string() },
+        });
+        format!(
+            "{{\"id\":\"{}\",\"object\":\"chat.completion.chunk\",\"created\":{},\"model\":\"{}\",\
+             \"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{call}]}},\"finish_reason\":null}}]}}",
+            self.id, self.created, parse::json_escape(&self.model))
+    }
     fn render_error(&self, msg: &str) -> String {
         format!("{{\"error\":{{\"message\":\"{}\"}}}}", parse::json_escape(msg))
     }
@@ -288,9 +306,11 @@ fn render_buffered(model: String, rx: std::sync::mpsc::Receiver<StreamItem>, kin
     let mut log = crate::run_log::RunLog::open(&id);
     if let Some(l) = log.as_mut() { l.header(&meta); }
     let mut text = String::new();
+    let mut calls: Vec<npu_engine::ToolCall> = Vec::new();
     let (reason, report) = loop {
         match rx.recv() {
             Ok(StreamItem::Text(t)) => text.push_str(&t),
+            Ok(StreamItem::ToolCall(c)) => calls.push(c),
             Ok(StreamItem::Step(r)) => {
                 if let Some(l) = log.as_mut() { l.line(&wire::chunk_line(&r, &meta)); }
             }
@@ -308,7 +328,7 @@ fn render_buffered(model: String, rx: std::sync::mpsc::Receiver<StreamItem>, kin
         l.line(&wire::prefill_line(&report.prefill, &meta));
         l.line(&wire::summary_line(&report, &meta, reason));
     }
-    (200, wire::completion_object(&text, reason, &report, &meta).to_string().into())
+    (200, wire::completion_object_with_calls(&text, &calls, reason, &report, &meta).to_string().into())
 }
 
 /// OpenAI speech synthesis. Serves `Capability::TTS` and returns audio bytes, not JSON.
@@ -644,6 +664,9 @@ fn respond_stream(stream: &mut TcpStream, code: u16, s: &SseStream) -> std::io::
     let meta = s.meta();
     let mut log = crate::run_log::RunLog::open(&s.id);
     if let Some(l) = log.as_mut() { l.header(&meta); }
+    // OpenAI indexes tool calls within the choice, and a client concatenates argument fragments by
+    // that index. We emit each call whole, so every index appears exactly once.
+    let mut tool_calls_seen = 0usize;
     for item in s.rx.iter() {
         // Exactly one of `Text` and `Step` drives the frames, never both: a record's `emit` is the
         // same bytes the text item carries, so the stream reads identically either way. With stats
@@ -674,6 +697,14 @@ fn respond_stream(stream: &mut TcpStream, code: u16, s: &SseStream) -> std::io::
                 stream.write_all(format!("data: {}\n\n", s.render_done(reason)).as_bytes())?;
                 if !s.stats { continue }
                 wire::summary_line(&report, &meta, reason).to_string()
+            }
+            // Tool-call frames are never suppressed by `stats`. `Text` can be, because the same
+            // bytes come back on the `Step` line; a call has no other carrier, and dropping one
+            // would leave the client with a `tool_calls` finish reason and nothing to execute.
+            StreamItem::ToolCall(c) => {
+                let i = tool_calls_seen;
+                tool_calls_seen += 1;
+                s.render_tool_call(&c, i)
             }
             StreamItem::Error(e) => s.render_error(&e.to_string()),
         };
@@ -833,22 +864,90 @@ pub mod parse {
         for (i, m) in messages.iter().enumerate() {
             let role = m.get("role").and_then(|r| r.as_str())
                 .ok_or_else(|| format!("messages[{i}]: missing \"role\""))?.to_string();
-            let content = parse_content(m.get("content")).map_err(|e| format!("messages[{i}]: {e}"))?;
-            chat.push(npu_engine::ChatMessage::new(role, content));
+            // An assistant turn that called a tool carries the call in `tool_calls`, not in
+            // `content`, and OpenAI sends `content: null` for it. That is not missing content.
+            let calls = match m.get("tool_calls").and_then(|c| c.as_array()) {
+                Some(c) if !c.is_empty() => parse_tool_calls(c).map_err(|e| format!("messages[{i}]: {e}"))?,
+                _ => Vec::new(),
+            };
+            let content = parse_content(m.get("content"), !calls.is_empty())
+                .map_err(|e| format!("messages[{i}]: {e}"))?;
+            let mut msg = npu_engine::ChatMessage::new(role, content);
+            if !calls.is_empty() {
+                msg = msg.with_tool_calls(calls);
+            }
+            if let Some(id) = m.get("tool_call_id").and_then(|c| c.as_str()) {
+                msg = msg.with_tool_call_id(id);
+            }
+            chat.push(msg);
         }
-        let params = parse_generate_params(&v)?;
+        let mut params = parse_generate_params(&v)?;
+        params.tools = parse_tools(&v)?;
         let stream = v.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
         reject_unsupported(&v, false)?;
         Ok(ParsedGenerate { model, prompt: npu_engine::Prompt::Chat(chat), params, stream,
                             stats: wants_stats(&v) })
     }
 
+    /// The declared `tools`, after `tool_choice` has had its say.
+    ///
+    /// `tool_choice: "none"` returns an EMPTY list rather than being recorded as a flag: "the model
+    /// will not call a tool" is exactly what an unrendered tools block means, so there is nothing
+    /// further downstream to know about. `"required"` and a named function are rejected in
+    /// `reject_unsupported` -- we cannot GUARANTEE either without constrained decoding, and
+    /// accepting them and hoping is the silent substitution this surface exists to refuse.
+    fn parse_tools(v: &serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+        if v.get("tool_choice").and_then(|c| c.as_str()) == Some("none") {
+            return Ok(Vec::new());
+        }
+        let Some(tools) = v.get("tools").filter(|t| !t.is_null()) else { return Ok(Vec::new()) };
+        let tools = tools.as_array().ok_or_else(|| "\"tools\" must be an array".to_string())?;
+        for (i, t) in tools.iter().enumerate() {
+            if t.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()).is_none() {
+                return Err(format!("tools[{i}]: missing \"function.name\""));
+            }
+        }
+        Ok(tools.clone())
+    }
+
+    /// The `tool_calls` on an assistant turn we are being sent BACK, so the model can see what it
+    /// called. `arguments` is a JSON string on the wire; a template renders it as an object, so it
+    /// is decoded here rather than left for the template to fail on.
+    fn parse_tool_calls(calls: &[serde_json::Value]) -> Result<Vec<npu_engine::ToolCall>, String> {
+        calls
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let f = c.get("function")
+                    .ok_or_else(|| format!("tool_calls[{i}]: missing \"function\""))?;
+                let name = f.get("name").and_then(|n| n.as_str())
+                    .ok_or_else(|| format!("tool_calls[{i}]: missing \"function.name\""))?;
+                let arguments = match f.get("arguments") {
+                    Some(serde_json::Value::String(s)) if s.trim().is_empty() => serde_json::json!({}),
+                    Some(serde_json::Value::String(s)) => serde_json::from_str(s)
+                        .map_err(|e| format!("tool_calls[{i}]: \"arguments\" is not JSON: {e}"))?,
+                    Some(other) => other.clone(),
+                    None => serde_json::json!({}),
+                };
+                Ok(npu_engine::ToolCall {
+                    id: c.get("id").and_then(|x| x.as_str()).unwrap_or("call_0").to_string(),
+                    name: name.to_string(),
+                    arguments,
+                })
+            })
+            .collect()
+    }
+
     /// A message's `content`: a plain string, or OpenAI's multi-part array form when every part is
     /// `{"type":"text","text":...}`. Any other part type is REJECTED rather than silently dropped (the
     /// old behaviour) -- this surface has no vision/audio input, and dropping content changes the
     /// prompt's meaning with no trace, which is exactly what spec S6 bans.
-    fn parse_content(v: Option<&serde_json::Value>) -> Result<String, String> {
+    fn parse_content(v: Option<&serde_json::Value>, has_tool_calls: bool) -> Result<String, String> {
         match v {
+            // OpenAI sends `content: null` on an assistant turn whose payload is `tool_calls`, and
+            // omits it entirely on some clients. That is not missing content -- the turn's content
+            // IS the call. Only a turn with no call either way is still an error.
+            Some(serde_json::Value::Null) | None if has_tool_calls => Ok(String::new()),
             Some(serde_json::Value::String(s)) => Ok(s.clone()),
             Some(serde_json::Value::Array(parts)) => {
                 let mut out = String::new();
@@ -959,6 +1058,17 @@ pub mod parse {
     /// surface cannot honour must be a 400, not a quiet no-op. `n != 1`, `logprobs`, `logit_bias`,
     /// `tools` and friends all change what the RESPONSE IS; accepting them and ignoring their effect
     /// would answer a request other than the one that was sent, with no trace of the substitution.
+    /// `null`, `[]` or `{}` -- the three ways a client says "nothing here". A field with one of
+    /// these asks for no behaviour, so it can be accepted whatever the field means.
+    fn is_empty_collection(v: &serde_json::Value) -> bool {
+        match v {
+            serde_json::Value::Null => true,
+            serde_json::Value::Array(a) => a.is_empty(),
+            serde_json::Value::Object(o) => o.is_empty(),
+            _ => false,
+        }
+    }
+
     fn reject_unsupported(v: &serde_json::Value, completions: bool) -> Result<(), String> {
         if let Some(n) = v.get("n").and_then(|x| x.as_u64()) {
             if n != 1 { return Err("\"n\" != 1 is not supported".into()); }
@@ -969,9 +1079,27 @@ pub mod parse {
             v.get("logprobs").and_then(|x| x.as_bool()).unwrap_or(false)
         };
         if logprobs_wanted { return Err("\"logprobs\" is not supported".into()); }
-        for field in ["logit_bias", "tools", "tool_choice", "response_format"] {
-            if v.get(field).map(|x| !x.is_null()).unwrap_or(false) {
+        // NOT `!is_null()`: an EMPTY collection requests nothing, so honouring it and ignoring it
+        // are the SAME response and S6 does not apply. `tools: []` is what a client sends on a
+        // plain chat with tool support switched on, and rejecting it was a hard 400 on every
+        // message. `logit_bias: {}` is the same shape.
+        for field in ["logit_bias", "response_format"] {
+            if v.get(field).is_some_and(|x| !is_empty_collection(x)) {
                 return Err(format!("\"{field}\" is not supported"));
+            }
+        }
+        // `auto` and `none` are both honoured -- `none` by not rendering the tools block, which is
+        // exactly what it means. `required` and a named function are not: without constrained
+        // decoding we cannot make the model call anything, and answering as if we had is the silent
+        // substitution this function exists to prevent.
+        match v.get("tool_choice") {
+            None => {}
+            Some(x) if is_empty_collection(x) => {}
+            Some(serde_json::Value::String(s)) if s == "auto" || s == "none" => {}
+            Some(_) => {
+                return Err("\"tool_choice\" other than \"auto\" or \"none\" is not supported \
+                            (this server does not constrain decoding, so it cannot guarantee a call)"
+                    .into())
             }
         }
         // `stream_options` used to be rejected whole. It carries `include_stats` now, so the
@@ -1578,7 +1706,7 @@ mod route_tests {
 /// own fixture -- a scripted generator that emits a fixed token list with a settable per-token delay,
 /// per the task's own prescription for testing this surface without a real decoder.
 #[cfg(test)]
-mod generate_tests {
+pub(crate) mod generate_tests {
     use super::*;
     use crate::actor::start;
     use crate::config::{Config, ModelCfg, ServerCfg};
@@ -1591,10 +1719,10 @@ mod generate_tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    fn post(path: &str, body: &str) -> Request {
+    pub(crate) fn post(path: &str, body: &str) -> Request {
         Request { method: "POST".into(), path: path.into(), boundary: String::new(), body: body.as_bytes().to_vec() }
     }
-    fn ss(v: &[&str]) -> Vec<String> { v.iter().map(|s| s.to_string()).collect() }
+    pub(crate) fn ss(v: &[&str]) -> Vec<String> { v.iter().map(|s| s.to_string()).collect() }
     fn close(a: f32, b: f32) -> bool { (a - b).abs() < 1e-6 }
 
     type Seen = Arc<Mutex<Option<(Prompt, GenerateParams)>>>;
@@ -1633,7 +1761,20 @@ mod generate_tests {
                     return Ok(());
                 }
             }
-            let reason = if cap < self.tokens.len() { FinishReason::Length } else { FinishReason::Stop };
+            // Declaring tools makes the scripted model call one. That is the whole contract this
+            // layer has to carry: the generator decides, the wire renders.
+            let mut reason = if cap < self.tokens.len() { FinishReason::Length } else { FinishReason::Stop };
+            if !params.tools.is_empty() {
+                let call = npu_engine::ToolCall {
+                    id: "call_0".into(),
+                    name: "get_weather".into(),
+                    arguments: serde_json::json!({ "city": "Paris" }),
+                };
+                sink(Chunk::ToolCall(&call));
+                if reason == FinishReason::Stop {
+                    reason = FinishReason::ToolCalls;
+                }
+            }
             report.usage = usage;
             report.generate_us = t0.elapsed().as_micros() as u64;
             sink(Chunk::Done { reason, usage, report: &report });
@@ -1665,7 +1806,7 @@ mod generate_tests {
         fn declared_capability(&self, _cfg: &ModelCfg) -> Option<Capability> { Some(Capability::GENERATE) }
     }
 
-    fn gen_handle(tokens: Vec<String>, delay: Duration)
+    pub(crate) fn gen_handle(tokens: Vec<String>, delay: Duration)
         -> (Handle, std::thread::JoinHandle<()>, tempfile::TempDir, PathBuf, Arc<AtomicUsize>, Seen) {
         let sent = Arc::new(AtomicUsize::new(0));
         let seen: Seen = Arc::new(Mutex::new(None));
@@ -2069,7 +2210,7 @@ mod generate_tests {
                     assert!(frame["choices"][0]["finish_reason"].is_null());
                     texts.push(t);
                 }
-                StreamItem::Step(_) => {}
+                StreamItem::Step(_) | StreamItem::ToolCall(_) => {}
                 StreamItem::Done { reason, .. } => {
                     let frame: serde_json::Value = serde_json::from_str(&s.render_done(reason)).unwrap();
                     assert_eq!(frame["choices"][0]["finish_reason"], reason.as_str());
@@ -2135,5 +2276,192 @@ mod generate_tests {
             r#"{"messages":[{"role":"user","content":"hi"}]}"#), &h, &p);
         assert_eq!(code, 200, "{body}");
         h.shutdown(); j.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tool_route_tests {
+    use super::generate_tests::{gen_handle, post, ss};
+    use super::*;
+    use std::time::Duration;
+
+    const WEATHER: &str = r#"{"type":"function","function":{"name":"get_weather",
+        "parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}"#;
+
+    /// An EMPTY collection requests nothing, so honouring it and ignoring it are the SAME response
+    /// and S6 does not apply. The predicate tested `!x.is_null()`, which over-fires -- and
+    /// `tools: []` is what a client sends on a plain chat with tool support switched on, so this
+    /// alone was a hard 400 on every message.
+    #[test]
+    fn an_empty_collection_is_not_a_rejection() {
+        let (h, _j, _d, p, _s, _seen) = gen_handle(ss(&["hi"]), Duration::ZERO);
+        for body in [
+            r#"{"messages":[{"role":"user","content":"hi"}],"tools":[]}"#,
+            r#"{"messages":[{"role":"user","content":"hi"}],"logit_bias":{}}"#,
+            r#"{"messages":[{"role":"user","content":"hi"}],"tool_choice":null}"#,
+            r#"{"messages":[{"role":"user","content":"hi"}],"response_format":{}}"#,
+        ] {
+            let (code, out) = route(&post("/v1/chat/completions", body), &h, &p);
+            assert_eq!(code, 200, "rejected {body}: {out}");
+        }
+    }
+
+    /// A non-empty `logit_bias` or `response_format` still cannot be honoured, and saying so is the
+    /// point of `reject_unsupported`. Narrowing the predicate must not have widened the acceptance.
+    #[test]
+    fn a_non_empty_unsupported_field_is_still_a_400() {
+        let (h, _j, _d, p, _s, _seen) = gen_handle(ss(&["hi"]), Duration::ZERO);
+        for body in [
+            r#"{"messages":[{"role":"user","content":"hi"}],"logit_bias":{"5":1}}"#,
+            r#"{"messages":[{"role":"user","content":"hi"}],"response_format":{"type":"json_object"}}"#,
+        ] {
+            assert_eq!(route(&post("/v1/chat/completions", body), &h, &p).0, 400, "accepted {body}");
+        }
+    }
+
+    /// `required` and a named function cannot be GUARANTEED without constrained decoding. Accepting
+    /// them and hoping is exactly the silent substitution this surface refuses.
+    #[test]
+    fn tool_choice_we_cannot_guarantee_is_a_400() {
+        let (h, _j, _d, p, _s, _seen) = gen_handle(ss(&["hi"]), Duration::ZERO);
+        for tc in [r#""required""#, r#"{"type":"function","function":{"name":"get_weather"}}"#] {
+            let body = format!(
+                r#"{{"messages":[{{"role":"user","content":"hi"}}],"tools":[{WEATHER}],"tool_choice":{tc}}}"#
+            );
+            assert_eq!(route(&post("/v1/chat/completions", &body), &h, &p).0, 400, "accepted {tc}");
+        }
+    }
+
+    /// `none` means the model will not call a tool, and an unrendered tools block IS that. The
+    /// engine must receive no tools -- not a flag it would have to remember to honour.
+    #[test]
+    fn tool_choice_none_reaches_the_engine_as_no_tools() {
+        let (h, _j, _d, p, _s, seen) = gen_handle(ss(&["hi"]), Duration::ZERO);
+        let body = format!(
+            r#"{{"messages":[{{"role":"user","content":"hi"}}],"tools":[{WEATHER}],"tool_choice":"none"}}"#
+        );
+        assert_eq!(route(&post("/v1/chat/completions", &body), &h, &p).0, 200);
+        let (_, params) = seen.lock().unwrap().clone().unwrap();
+        assert!(params.tools.is_empty(), "tool_choice:none still sent tools to the engine");
+    }
+
+    #[test]
+    fn declared_tools_reach_the_engine_verbatim() {
+        let (h, _j, _d, p, _s, seen) = gen_handle(ss(&["hi"]), Duration::ZERO);
+        let body = format!(r#"{{"messages":[{{"role":"user","content":"hi"}}],"tools":[{WEATHER}]}}"#);
+        assert_eq!(route(&post("/v1/chat/completions", &body), &h, &p).0, 200);
+        let (_, params) = seen.lock().unwrap().clone().unwrap();
+        assert_eq!(params.tools.len(), 1);
+        assert_eq!(params.tools[0]["function"]["name"], "get_weather");
+    }
+
+    /// The round trip a tool loop actually makes: the client sends back the assistant turn that
+    /// called, and the tool turn answering it. Both must survive into the prompt the engine sees.
+    #[test]
+    fn a_tool_result_turn_round_trips_into_the_prompt() {
+        let (h, _j, _d, p, _s, seen) = gen_handle(ss(&["ok"]), Duration::ZERO);
+        let body = format!(
+            r#"{{"messages":[
+                {{"role":"user","content":"weather?"}},
+                {{"role":"assistant","content":null,"tool_calls":[
+                    {{"id":"call_0","type":"function",
+                      "function":{{"name":"get_weather","arguments":"{{\"city\": \"Paris\"}}"}}}}]}},
+                {{"role":"tool","tool_call_id":"call_0","content":"{{\"temp_c\": 14}}"}}
+            ],"tools":[{WEATHER}]}}"#
+        );
+        let (code, out) = route(&post("/v1/chat/completions", &body), &h, &p);
+        assert_eq!(code, 200, "{out}");
+        let (prompt, _) = seen.lock().unwrap().clone().unwrap();
+        let npu_engine::Prompt::Chat(msgs) = prompt else { panic!("not a chat prompt") };
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[1].tool_calls.len(), 1);
+        assert_eq!(msgs[1].tool_calls[0].name, "get_weather");
+        // Decoded from the wire's JSON STRING into an object, because that is what a template
+        // renders. Left as a string, `tojson` would emit a quoted blob.
+        assert_eq!(msgs[1].tool_calls[0].arguments, serde_json::json!({ "city": "Paris" }));
+        assert_eq!(msgs[2].tool_call_id.as_deref(), Some("call_0"));
+    }
+
+    /// `arguments` goes out as a JSON STRING, not an object: that is OpenAI's own encoding, and a
+    /// client calling JSON.parse on an object would throw.
+    #[test]
+    fn a_buffered_response_renders_openai_shaped_tool_calls() {
+        let (h, _j, _d, p, _s, _seen) = gen_handle(Vec::new(), Duration::ZERO);
+        let body = format!(r#"{{"messages":[{{"role":"user","content":"hi"}}],"tools":[{WEATHER}]}}"#);
+        let (code, out) = route(&post("/v1/chat/completions", &body), &h, &p);
+        assert_eq!(code, 200, "{out}");
+        let v: serde_json::Value = serde_json::from_str(out.text()).unwrap();
+        assert_eq!(v["choices"][0]["finish_reason"], "tool_calls");
+        let call = &v["choices"][0]["message"]["tool_calls"][0];
+        assert_eq!(call["id"], "call_0");
+        assert_eq!(call["type"], "function");
+        assert_eq!(call["function"]["name"], "get_weather");
+        assert_eq!(call["function"]["arguments"], r#"{"city":"Paris"}"#);
+        // No text and a call present -> null, which is what a client branches on to decide there
+        // is nothing to show the user.
+        assert!(v["choices"][0]["message"]["content"].is_null());
+    }
+
+    /// A plain completion must still say `content: ""` and carry no `tool_calls` key at all.
+    #[test]
+    fn a_response_with_no_calls_is_unchanged() {
+        let (h, _j, _d, p, _s, _seen) = gen_handle(ss(&["Hello"]), Duration::ZERO);
+        let (code, out) =
+            route(&post("/v1/chat/completions", r#"{"messages":[{"role":"user","content":"hi"}]}"#), &h, &p);
+        assert_eq!(code, 200, "{out}");
+        let v: serde_json::Value = serde_json::from_str(out.text()).unwrap();
+        assert_eq!(v["choices"][0]["message"]["content"], "Hello");
+        assert_eq!(v["choices"][0]["finish_reason"], "stop");
+        assert!(v["choices"][0]["message"].get("tool_calls").is_none());
+    }
+
+    #[test]
+    fn a_malformed_tool_declaration_is_a_400() {
+        let (h, _j, _d, p, _s, _seen) = gen_handle(ss(&["hi"]), Duration::ZERO);
+        for body in [
+            r#"{"messages":[{"role":"user","content":"hi"}],"tools":{"a":1}}"#,
+            r#"{"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function"}]}"#,
+        ] {
+            assert_eq!(route(&post("/v1/chat/completions", body), &h, &p).0, 400, "accepted {body}");
+        }
+    }
+
+    /// The streaming frame. `arguments` is a JSON string here too -- a client concatenates
+    /// fragments by `index` and then parses, so the two surfaces must agree on the encoding or the
+    /// same completion decodes differently depending on a flag the client set.
+    #[test]
+    fn a_streamed_tool_call_is_an_openai_delta() {
+        let (h, _j, _d, p, _s, _seen) = gen_handle(Vec::new(), Duration::ZERO);
+        let body = format!(
+            r#"{{"messages":[{{"role":"user","content":"hi"}}],"tools":[{WEATHER}],"stream":true}}"#
+        );
+        let (code, resp) = route(&post("/v1/chat/completions", &body), &h, &p);
+        assert_eq!(code, 200);
+        let Body::Stream(st) = resp else { panic!("not a stream") };
+        let mut deltas = Vec::new();
+        let mut finish = None;
+        let mut seen = 0usize;
+        for item in st.rx.iter() {
+            match item {
+                StreamItem::ToolCall(c) => {
+                    let frame: serde_json::Value =
+                        serde_json::from_str(&st.render_tool_call(&c, seen)).unwrap();
+                    seen += 1;
+                    deltas.push(frame);
+                }
+                StreamItem::Done { reason, .. } => finish = Some(reason),
+                _ => {}
+            }
+        }
+        assert_eq!(deltas.len(), 1);
+        let call = &deltas[0]["choices"][0]["delta"]["tool_calls"][0];
+        assert_eq!(deltas[0]["object"], "chat.completion.chunk");
+        assert_eq!(call["index"], 0);
+        assert_eq!(call["id"], "call_0");
+        assert_eq!(call["type"], "function");
+        assert_eq!(call["function"]["name"], "get_weather");
+        assert_eq!(call["function"]["arguments"], r#"{"city":"Paris"}"#);
+        assert!(deltas[0]["choices"][0]["finish_reason"].is_null());
+        assert_eq!(finish.map(|f| f.as_str()), Some("tool_calls"));
     }
 }
