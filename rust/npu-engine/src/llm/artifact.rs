@@ -123,6 +123,18 @@ pub struct LlmArtifact {
     /// causal one masks with [`Self::mask_widths`] instead, and the non-causal control masks
     /// nothing. Either way `scratchpad.mask_param` is `null` and there is nothing to write.
     pub sm_mask: Option<ScratchpadParam>,
+    /// The attention-window scratchpad parameter (`scratchpad.window_param`, resolved the same
+    /// way as [`Self::kv_off`]/[`Self::sm_mask`]). `None` on every artifact today -- the window
+    /// is still a build-time constant and the engine ships four separately-compiled designs, one
+    /// per window, selected per token the way [`crate::llm::npu_decode`]'s bucket selector
+    /// already does. Present only on an artifact built for the dynamic-window design, and always
+    /// together with [`Self::window_granule`] -- see the cross-check at the end of [`Self::load_role`].
+    pub attn_window: Option<ScratchpadParam>,
+    /// `meta.json`'s `dims.window_granule` -- the unit the host rounds an attended length up to
+    /// before writing [`Self::attn_window`] (`crate::llm::npu_decode::window_len`). Present
+    /// exactly when `attn_window` is: a scratchpad pointer with no granule has no unit to round
+    /// against, and a granule with no pointer has nothing to write it to.
+    pub window_granule: Option<usize>,
     /// The per-row causal widths, when `meta.json` says `causal: true`. Prefill only -- decode is
     /// M=1, where one scalar width says everything there is to say. See [`MaskWidths`].
     pub mask_widths: Option<MaskWidths>,
@@ -326,6 +338,15 @@ impl LlmArtifact {
                 .ok_or_else(|| ctx("dims.kv_heads missing/non-numeric".to_string()))?
                 as usize,
         };
+        // Absent on every artifact today -- the dynamic-window design this pairs with
+        // (`scratchpad.window_param`, read below) hasn't shipped one yet. `null` and absent both
+        // mean "no granule", the same convention `kv_block`/`rope_theta_local` use.
+        let window_granule = match dims.get("window_granule") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(v) => Some(
+                v.as_u64().ok_or_else(|| ctx("dims.window_granule present but non-numeric".to_string()))? as usize,
+            ),
+        };
         // `dims.M` is what makes a prefill artifact drivable: it sizes `x` and the RoPE angle
         // block, it is the padded chunk width, and it is the batch the causal width is derived
         // from. A decode artifact does not carry it and does not need to -- decode IS M=1.
@@ -402,6 +423,27 @@ impl LlmArtifact {
         };
         let kv_off = read_param(kv_param_name)?;
         let sm_mask = mask_param_name.map(read_param).transpose()?;
+        // The third scratchpad pointer, mirroring `kv_param`/`mask_param`: absent (or explicit
+        // `null`) on every artifact today, since the window is still a build-time constant. A
+        // window pointer with no granule to round against -- or a granule with nothing to write
+        // it to -- is a half-wired artifact, so the two are required together rather than each
+        // silently defaulting to "not declared" on its own.
+        let window_param_name = match sp.get("window_param") {
+            Some(serde_json::Value::Null) | None => None,
+            other => Some(
+                other
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| ctx("scratchpad.window_param present but non-string".to_string()))?,
+            ),
+        };
+        let attn_window = window_param_name.map(read_param).transpose()?;
+        if attn_window.is_some() != window_granule.is_some() {
+            return Err(ctx(format!(
+                "scratchpad.window_param ({window_param_name:?}) and dims.window_granule \
+                 ({window_granule:?}) must both be present or both absent -- one without the \
+                 other computes an attended length against an undefined unit"
+            )));
+        }
 
         // The RoPE angle buffers, resolved from what the artifact DECLARES. `rope` and
         // `rope_global` are the same thing under two spellings -- the decode generator emits the
@@ -613,6 +655,8 @@ impl LlmArtifact {
             embed_blob,
             kv_off,
             sm_mask,
+            attn_window,
+            window_granule,
             mask_widths,
             rope_inputs,
             head_dim,
@@ -814,6 +858,16 @@ impl LlmArtifact {
         std::iter::once("x")
             .chain(self.rope_inputs.iter().map(|(n, _)| n.as_str()))
             .chain(self.mask_widths.iter().map(|m| m.buffer.as_str()))
+            // "attn_window" is the contract's fixed key (`scratchpad.params.attn_window`), not
+            // stored as a string anywhere on this struct -- `attn_window` only carries its
+            // resolved `ScratchpadParam`, the same shape `kv_off`/`sm_mask` do. NOTE: unlike `x`,
+            // the RoPE tables and `mask_widths.buffer`, this name never names an `Arena::Input`
+            // `layout` entry (it is a scratchpad register, not a buffer), so
+            // `check_per_token_writes` -- which only flags a `layout` Arena::Input entry absent
+            // from this list -- cannot actually catch a missing `attn_window` write. Listed here
+            // for the same reason the others are (so a caller building its own write list from
+            // this artifact sees it), not because the existing guard covers it.
+            .chain(self.attn_window.is_some().then_some("attn_window"))
             .collect()
     }
 
@@ -1072,6 +1126,64 @@ mod tests {
         assert_eq!(art.embed_scale, Some(EmbedScale::None));
         assert!(!art.kv_off.core);
         assert!(art.sm_mask.unwrap().core);
+    }
+
+    // ------------------------------------------------------------------------------------
+    // `attn_window` / `window_granule` -- the third scratchpad parameter. Absent on every
+    // artifact today (base_meta's default scratchpad block); a dynamic-window artifact adds
+    // scratchpad.params.attn_window + scratchpad.window_param + dims.window_granule together.
+    // ------------------------------------------------------------------------------------
+
+    #[test]
+    fn no_window_fields_yields_none_for_both() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = base_meta(8, 4, serde_json::json!({"rope_global": {"type": "input", "offset": 8, "len": 8}}));
+        write_meta(dir.path(), &meta);
+        let art = LlmArtifact::load(dir.path()).unwrap();
+        assert!(art.attn_window.is_none());
+        assert_eq!(art.window_granule, None);
+        assert!(!art.per_dispatch_writes().contains(&"attn_window"));
+    }
+
+    #[test]
+    fn all_three_window_fields_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut meta = base_meta(8, 4, serde_json::json!({"rope_global": {"type": "input", "offset": 8, "len": 8}}));
+        meta["scratchpad"]["params"]["attn_window"] =
+            serde_json::json!({"byte_offset": 8, "kind": "core"});
+        meta["scratchpad"]["window_param"] = serde_json::json!("attn_window");
+        meta["dims"]["window_granule"] = serde_json::json!(128);
+        write_meta(dir.path(), &meta);
+        let art = LlmArtifact::load(dir.path()).unwrap();
+        let aw = art.attn_window.expect("window_param declared");
+        assert_eq!(aw.byte_offset, 8);
+        assert!(aw.core, "attn_window is kind: core");
+        assert_eq!(art.window_granule, Some(128));
+        assert!(art.per_dispatch_writes().contains(&"attn_window"));
+    }
+
+    #[test]
+    fn window_param_without_granule_fails_loud_rather_than_guessing_a_unit() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut meta = base_meta(8, 4, serde_json::json!({"rope_global": {"type": "input", "offset": 8, "len": 8}}));
+        meta["scratchpad"]["params"]["attn_window"] =
+            serde_json::json!({"byte_offset": 8, "kind": "core"});
+        meta["scratchpad"]["window_param"] = serde_json::json!("attn_window");
+        // dims.window_granule deliberately left undeclared.
+        write_meta(dir.path(), &meta);
+        let err = LlmArtifact::load(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("window_param") && err.contains("window_granule"), "{err}");
+    }
+
+    #[test]
+    fn granule_without_window_param_fails_loud_rather_than_guessing_an_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut meta = base_meta(8, 4, serde_json::json!({"rope_global": {"type": "input", "offset": 8, "len": 8}}));
+        meta["dims"]["window_granule"] = serde_json::json!(128);
+        // scratchpad.window_param deliberately left undeclared.
+        write_meta(dir.path(), &meta);
+        let err = LlmArtifact::load(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("window_param") && err.contains("window_granule"), "{err}");
     }
 
     #[test]

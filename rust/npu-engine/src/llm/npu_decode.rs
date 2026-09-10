@@ -153,6 +153,15 @@ fn bucket_index<I: Iterator<Item = usize>>(windows: I, pos: usize) -> Option<usi
     widest
 }
 
+/// The attended length for `pos`: the positions the cache holds, rounded UP to `granule`.
+///
+/// Split out for the same reason the bucket selector is: an off-by-one does not crash, it
+/// attends a window one position short and returns a plausible wrong token.
+fn window_len(pos: usize, granule: usize) -> usize {
+    let need = pos + 1;
+    need.div_ceil(granule) * granule
+}
+
 pub struct NpuDecodeStep {
     artifact: LlmArtifact,
     arena: Rc<FusedArena>,
@@ -575,6 +584,25 @@ impl DecodeStep for NpuDecodeStep {
             .write_scratchpad(sm.byte_offset, &sm_val.to_le_bytes())
             .map_err(|e| EngineError::Device(format!("write sm_mask scratchpad: {e}")))?;
 
+        // Opt-in: `attn_window` is absent on every artifact today (the window is still baked
+        // into which bucket ELF is selected above), so this block is dead weight until a
+        // dynamic-window artifact ships one -- and the dispatch path is UNCHANGED for every
+        // artifact that doesn't. `.min(bucket.window)` clamps to the design this bucket was
+        // built for: `window_len` alone can round past it near the top of a bucket's range,
+        // and attending past what the ELF's own taps cover is not a smaller bug than attending
+        // short of it.
+        if let Some(aw) = bucket.artifact.attn_window {
+            let granule = bucket.artifact.window_granule.ok_or_else(|| {
+                EngineError::Load("decode artifact declares attn_window with no window_granule".to_string())
+            })?;
+            let l = window_len(pos, granule).min(bucket.window) as u32;
+            // Same "core"-kind UPDATE_REG convention as `sm_mask` above: pre-shift left by 2.
+            let l_val = if aw.core { l << 2 } else { l };
+            bucket.res
+                .write_scratchpad(aw.byte_offset, &l_val.to_le_bytes())
+                .map_err(|e| EngineError::Device(format!("write attn_window scratchpad: {e}")))?;
+        }
+
         // Unconditional every token -- see the module doc. No path here may skip a step "because
         // nothing changed"; that branch is exactly the defect this mirrors away from.
         self.arena.sync_input().map_err(|e| EngineError::Device(format!("sync input: {e}")))?;
@@ -596,6 +624,20 @@ impl DecodeStep for NpuDecodeStep {
 #[cfg(test)]
 mod tests {
     use super::bucket_index;
+    use super::window_len;
+
+    /// Boundaries only, at two granules so a fixed-128 coincidence can't hide an off-by-one:
+    /// `pos == granule-1` still holds inside the first granule, `pos == granule` needs a second.
+    #[test]
+    fn window_len_rounds_the_attended_length_up_to_the_granule() {
+        assert_eq!(window_len(0, 128), 128, "pos 0 needs 1 position -- the first granule");
+        assert_eq!(window_len(127, 128), 128, "pos 127 needs exactly 128 -- still fits");
+        assert_eq!(window_len(128, 128), 256, "pos 128 needs 129 -- one past, next granule");
+
+        assert_eq!(window_len(0, 96), 96);
+        assert_eq!(window_len(95, 96), 96);
+        assert_eq!(window_len(96, 96), 192);
+    }
 
     /// Selection must pick the NARROWEST bucket that still holds the history, and the boundary is
     /// `pos + 1` positions, not `pos`: at pos 255 the cache holds 256 entries and a 256-window
