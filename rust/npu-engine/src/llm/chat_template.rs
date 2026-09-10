@@ -26,8 +26,7 @@ impl ChatTemplate {
     }
 
     /// Render `messages`, appending the assistant-turn opener when `add_generation_prompt`.
-    /// `tools` is always an empty list -- tool-calling is out of scope for this milestone, so the
-    /// template's `{% if tools %}` branch is never taken.
+    /// No tools, no `enable_thinking`.
     pub fn render(&self, messages: &[ChatMessage], add_generation_prompt: bool) -> Result<String, EngineError> {
         self.render_with(messages, add_generation_prompt, None)
     }
@@ -42,6 +41,22 @@ impl ChatTemplate {
         add_generation_prompt: bool,
         enable_thinking: Option<bool>,
     ) -> Result<String, EngineError> {
+        self.render_full(messages, add_generation_prompt, enable_thinking, &[])
+    }
+
+    /// `render_with` plus the declared `tools`. The narrower entry points delegate here.
+    ///
+    /// `tools` was hardcoded to an empty list until 2026-09-10, which made every chat template's
+    /// tool half unreachable. It is the CLIENT's JSON passed through untouched -- key order
+    /// included, because the rendered block is part of the cached prefix and reordering it moves
+    /// the prompt (measured: 74 of 159 tokens shared when one schema's keys were re-sorted).
+    pub fn render_full(
+        &self,
+        messages: &[ChatMessage],
+        add_generation_prompt: bool,
+        enable_thinking: Option<bool>,
+        tools: &[serde_json::Value],
+    ) -> Result<String, EngineError> {
         let mut env = env();
         env.add_template("chat", &self.source)
             .map_err(|e| EngineError::Load(format!("chat template parse: {e}")))?;
@@ -49,21 +64,19 @@ impl ChatTemplate {
             .get_template("chat")
             .map_err(|e| EngineError::Load(format!("chat template lookup: {e}")))?;
 
-        let msgs: Value = messages
-            .iter()
-            .map(|m| Value::from_iter([("role", Value::from(m.role.clone())), ("content", Value::from(m.content.clone()))]))
-            .collect();
+        let msgs: Value = messages.iter().map(message_value).collect();
+        let tools = Value::from_serialize(tools);
         let ctx = match enable_thinking {
             Some(t) => context! {
                 messages => msgs,
                 add_generation_prompt => add_generation_prompt,
-                tools => Value::from(Vec::<Value>::new()),
+                tools => tools,
                 enable_thinking => t,
             },
             None => context! {
                 messages => msgs,
                 add_generation_prompt => add_generation_prompt,
-                tools => Value::from(Vec::<Value>::new()),
+                tools => tools,
             },
         };
         tmpl.render(ctx).map_err(|e| EngineError::Load(format!("chat template render: {e}")))
@@ -82,6 +95,36 @@ impl ChatTemplate {
             .map_err(|e| EngineError::Load(format!("chat template lookup: {e}")))?;
         tmpl.render(ctx).map_err(|e| EngineError::Load(format!("chat template render: {e}")))
     }
+}
+
+/// One message as the template sees it.
+///
+/// `tool_calls` and `tool_call_id` are emitted only when they carry something. That is not tidiness:
+/// templates test `{%- if message.tool_calls %}`, and an empty list is falsy in Jinja but a `None`
+/// tool_call_id serialised as null is NOT -- emitting the keys unconditionally makes our render
+/// diverge from `transformers` on exactly the turns tool calling depends on.
+fn message_value(m: &ChatMessage) -> Value {
+    let mut fields = vec![
+        ("role", Value::from(m.role.clone())),
+        ("content", Value::from(m.content.clone())),
+    ];
+    if !m.tool_calls.is_empty() {
+        let calls: Vec<serde_json::Value> = m
+            .tool_calls
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "type": "function",
+                    "function": { "name": c.name, "arguments": c.arguments },
+                })
+            })
+            .collect();
+        fields.push(("tool_calls", Value::from_serialize(&calls)));
+    }
+    if let Some(id) = &m.tool_call_id {
+        fields.push(("tool_call_id", Value::from(id.clone())));
+    }
+    Value::from_iter(fields)
 }
 
 /// The one environment every render uses. Built per call because `add_template` borrows the source.
@@ -234,6 +277,98 @@ mod tests {
             .render_probe(minijinja::context! { x => serde_json::json!({"city": "Köln"}) })
             .unwrap();
         assert_eq!(out, r#"{"city": "Köln"}"#);
+    }
+
+    fn weather_tool() -> serde_json::Value {
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": { "city": { "type": "string" } },
+                    "required": ["city"]
+                }
+            }
+        })
+    }
+
+    /// The real Qwen3 template's `{% if tools %}` branch, unreachable while `tools` was hardcoded
+    /// to an empty list. The expected substring carries `json.dumps` spacing AND insertion key
+    /// order, so this is also the regression test for both `preserve_order` features.
+    #[test]
+    fn real_qwen3_template_renders_the_tools_block() {
+        let path = qwen3_tokenizer_config_path();
+        if !path.exists() {
+            eprintln!("SKIP: {} missing", path.display());
+            return;
+        }
+        let cfg: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let tmpl = ChatTemplate::new(cfg["chat_template"].as_str().unwrap().to_string());
+        let tools = [weather_tool()];
+        let out = tmpl
+            .render_full(&[msg("user", "Weather in Paris?")], true, None, &tools)
+            .unwrap();
+
+        assert!(out.contains("# Tools"), "tools branch not taken:\n{out}");
+        assert!(
+            out.contains(r#"{"type": "function", "function": {"name": "get_weather", "#),
+            "tool schema is not json.dumps-shaped:\n{out}"
+        );
+        assert!(out.contains("<tool_call>"), "call-format instructions missing:\n{out}");
+    }
+
+    /// An assistant turn that CALLED a tool, and the tool turn answering it. Both are message
+    /// shapes the template branches on and neither was representable before 2026-09-10.
+    #[test]
+    fn real_qwen3_template_renders_a_tool_call_turn_and_its_result() {
+        let path = qwen3_tokenizer_config_path();
+        if !path.exists() {
+            eprintln!("SKIP: {} missing", path.display());
+            return;
+        }
+        let cfg: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let tmpl = ChatTemplate::new(cfg["chat_template"].as_str().unwrap().to_string());
+        let tools = [weather_tool()];
+        let convo = [
+            msg("user", "Weather in Paris?"),
+            ChatMessage::new("assistant", "").with_tool_calls(vec![crate::pipeline::ToolCall {
+                id: "call_0".into(),
+                name: "get_weather".into(),
+                arguments: serde_json::json!({ "city": "Paris" }),
+            }]),
+            ChatMessage::new("tool", r#"{"temp_c": 14}"#).with_tool_call_id("call_0"),
+        ];
+        let out = tmpl.render_full(&convo, true, None, &tools).unwrap();
+
+        assert!(
+            out.contains(r#"<tool_call>
+{"name": "get_weather", "arguments": {"city": "Paris"}}
+</tool_call>"#),
+            "call turn not rendered as the template documents:\n{out}"
+        );
+        assert!(
+            out.contains("<tool_response>\n{\"temp_c\": 14}\n</tool_response>"),
+            "tool result not wrapped:\n{out}"
+        );
+    }
+
+    /// A message with no tool calls must not emit the key at all. Templates test
+    /// `{%- if message.tool_calls %}`, and a present-but-empty list changes nothing in Jinja but a
+    /// present-and-null `tool_call_id` is truthy -- so emitting unconditionally would diverge from
+    /// `transformers` on ordinary turns, not just tool ones.
+    #[test]
+    fn a_plain_turn_emits_neither_tool_key() {
+        let tmpl = ChatTemplate::new(
+            "{% for m in messages %}{{ 'HAS' if m.tool_calls is defined else 'NONE' }}\
+             {{ 'ID' if m.tool_call_id is defined else 'NOID' }}{% endfor %}"
+                .to_string(),
+        );
+        let out = tmpl.render(&[msg("user", "hi")], false).unwrap();
+        assert_eq!(out, "NONENOID");
     }
 
     fn msg(role: &str, content: &str) -> ChatMessage {
