@@ -954,7 +954,12 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
             # unwidened, unblocked default, which is byte-identical to before they existed.
             kv_alloc=None if KVA == S else KVA,
             kv_block_size=None if T == S else T,
-            window_parameter="attn_window" if DYNAMIC_WINDOW else None)
+            # Passed as a kwarg ONLY when the flag is on. Handing it through unconditionally --
+            # even as None -- is a TypeError against any IRON whose decode_layer_dp predates the
+            # field, and the default IRON_DIR (wt-iron-integ) is exactly that. Measured 2026-09-10:
+            # it broke every decode build on the default path, DYNAMIC_WINDOW=0 included, because
+            # an unknown kwarg fails at the call and never reaches the flag test inside.
+            **({"window_parameter": "attn_window"} if DYNAMIC_WINDOW else {}))
     print(f"[gen] fused arm decode_layer_dp: "
           f"{'OFF -- ' + decode_layer_why if decode_layer_why else 'on'}")
 
