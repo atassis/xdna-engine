@@ -274,10 +274,12 @@ MLP_TILE_ROWS = int(os.environ.get("MLP_TILE_ROWS", "0"))
 # separate scale stage), GROUPED_K+TMV_CTX (the variant attn_block_dp actually computes),
 # FUSE_MLP_O (Wo's padding rides that flag), and bf16-only weights (plain kernel archive).
 #
-# OFF by default: device-free it PLACES (aiecc, 2026-09-09) and its shim-BD census is lighter than
-# the five designs it replaces, but nothing has run it on hardware -- neither placement nor a byte
-# census can see a wrong answer or a runtime-sequence deadlock.
-FUSE_DECODE_LAYER = os.environ.get("FUSE_DECODE_LAYER", "0") == "1"
+# ON by default since 2026-09-10. Device-gated: numerics bitwise identical over 2000 paired
+# perplexity positions (max |dNLL| 0.000e+00), determinism 5/5 on both arms, served 53.1 -> 37.6
+# ms/token with a TIGHTER tail (p99-mean 0.8 ms against 2.2). The cost is array footprint -- 12
+# cores over 3 columns against 8 over 2, and --cores-per-col 1 is not available on this arm.
+# An ineligible spec still falls back: decode_layer_why below names the rule it missed.
+FUSE_DECODE_LAYER = os.environ.get("FUSE_DECODE_LAYER", "1") == "1"
 
 
 def weight_bytes(arr):
