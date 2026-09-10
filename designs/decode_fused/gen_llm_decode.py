@@ -280,6 +280,13 @@ MLP_TILE_ROWS = int(os.environ.get("MLP_TILE_ROWS", "0"))
 # cores over 3 columns against 8 over 2, and --cores-per-col 1 is not available on this arm.
 # An ineligible spec still falls back: decode_layer_why below names the rule it missed.
 FUSE_DECODE_LAYER = os.environ.get("FUSE_DECODE_LAYER", "1") == "1"
+# Thread decode_layer_dp's window_parameter through: the AIE core reads its attention window from
+# a per-dispatch ScratchpadParameter ("attn_window", int32) instead of baking N_KV_CHUNKS into the
+# build. Only takes effect when decode_layer_dp itself is eligible (decode_layer_why is None below)
+# -- there is nowhere else in this graph for it to attach. Default 0 = build-constant window,
+# byte-for-byte the pre-existing graph and meta.json; params.txt (read further down) picks up the
+# new parameter's real offset for free once this is on, so the meta writer never hardcodes one.
+DYNAMIC_WINDOW = os.environ.get("DYNAMIC_WINDOW", "0") == "1"
 
 
 def weight_bytes(arr):
@@ -946,7 +953,8 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
             # and the blocked storage, the same split gemv/tmatvec already have. Both None on the
             # unwidened, unblocked default, which is byte-identical to before they existed.
             kv_alloc=None if KVA == S else KVA,
-            kv_block_size=None if T == S else T)
+            kv_block_size=None if T == S else T,
+            window_parameter="attn_window" if DYNAMIC_WINDOW else None)
     print(f"[gen] fused arm decode_layer_dp: "
           f"{'OFF -- ' + decode_layer_why if decode_layer_why else 'on'}")
 
@@ -1231,7 +1239,16 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
                               **({"scratch_order": list(weights.keys())} if BUCKET_SCRATCH_ORDER else {}))
     fused.compile()
     return sp, fused, weights, dict(NL=NL, S=S, T=T, inputs=inputs, cache_names=cache_names,
-                                    embed_blob=embed_blob, host_embed=host_embed)
+                                    embed_blob=embed_blob, host_embed=host_embed,
+                                    decode_layer_active=op_decode_layer is not None,
+                                    # None whenever decode_layer_dp itself did not build (either
+                                    # FUSE_DECODE_LAYER off or the spec ineligible) -- the meta
+                                    # writer gates on DYNAMIC_WINDOW AND this being set, never on
+                                    # DYNAMIC_WINDOW alone, so a stray env var on an ineligible
+                                    # spec cannot claim a window_param/window_granule that was
+                                    # never actually built.
+                                    window_granule=(op_decode_layer.window_granule
+                                                    if op_decode_layer is not None else None))
 
 
 def main():
@@ -1246,6 +1263,9 @@ def main():
     sp, fused, weights, md = build_graph(a.spec, a.weights, a.layers, a.max_seq)
     NL, S, T, inputs, cache_names = md["NL"], md["S"], md["T"], md["inputs"], md["cache_names"]
     embed_blob, host_embed = md["embed_blob"], md["host_embed"]
+    decode_layer_active = md["decode_layer_active"]
+    window_granule = md["window_granule"]
+    dynamic_window = DYNAMIC_WINDOW and decode_layer_active
     D, HD, Hq, Hkv, VOCAB = sp.d_model, sp.head_dim, sp.n_q_heads, sp.n_kv_heads, sp.vocab
     FF = sp.ffn
     elf = load_elf(fused).view(np.uint8).tobytes()
@@ -1294,8 +1314,13 @@ def main():
         # W_head itself unless the lm-head was quantised, in which case W_head is packed and this
         # names the bf16 sidecar. Absent in older artifacts -- consumers default to "W_head".
         "embed_blob": embed_blob,
+        # window_param mirrors kv_param/mask_param -- the POINTER into scratchpad.params, not the
+        # entry itself. That entry ("attn_window": {byte_offset, kind, dtype}) needs no special
+        # case here: it is already in scratchpad_params, read generically off params.txt above
+        # like every other declared ScratchpadParameter, so its offset is never a literal.
         "scratchpad": {"params": scratchpad_params, "kv_param": "kv_off", "mask_param": "sm_mask",
-                       "head_dim": HD, "kv_heads": Hkv},
+                       "head_dim": HD, "kv_heads": Hkv,
+                       **({"window_param": "attn_window"} if dynamic_window else {})},
         "dims": {"layers": NL, "d_model": D, "q_heads": Hq, "kv_heads": Hkv, "head_dim": HD,
                  "ffn": FF, "vocab": VOCAB, "S": S, "kv_block": T,
                  # Wqkv's ROW ORDER, stated because another generator reads this buffer out of the
@@ -1303,9 +1328,15 @@ def main():
                  # the stock [Wq|Wk|Wv] for a week after this became head-major, which is a
                  # plausible wrong answer and never an error. Absent in older artifacts -- a
                  # consumer reads that as the stock order, which is what those artifacts hold.
-                 "wqkv_head_major": bool(
-                     op_decode_layer is not None and op_decode_layer.wqkv_head_major),
-                 "sliding_window": sp.sliding_window, "sw_pattern": sp.sw_pattern},
+                 "wqkv_head_major": decode_layer_active,
+                 "sliding_window": sp.sliding_window, "sw_pattern": sp.sw_pattern,
+                 # The runtime attn_window value's required granularity -- lcm(stream-tile rows,
+                 # kv block), computed once at op construction (decode_layer_dp/op.py's
+                 # window_granule). Ships explicitly so the host never re-derives it from
+                 # kv_block: the two coincide (128) at this model's shape but would not at a
+                 # different head_dim or tile_size_input, and a host that derived it anyway would
+                 # be right here and silently wrong on the next model.
+                 **({"window_granule": int(window_granule)} if dynamic_window else {})},
         # Per-token host protocol (the ELF is constant; only these change):
         #   x        = embed[token], scaled by sqrt(d_model) iff embed_scale == "sqrt_d_model"
         #   rope_*   = precomputed [S,HD] angle tables; the row for n_past is used
