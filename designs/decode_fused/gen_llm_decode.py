@@ -649,12 +649,16 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
     Hq, Hkv, QD, KVD, VOCAB = sp.n_q_heads, sp.n_kv_heads, sp.q_dim, sp.kv_dim, sp.vocab
 
     # KV-cache layout: [S/T, Hkv, T, HD], block-major -- see iron.common.kv_layout, the single
-    # owner of this addressing (kv-cache-layout-for-full-context task). T == S (one block)
-    # reproduces the pre-existing flat [Hkv, S, HD] layout byte-for-byte; T < S makes head_stride
-    # and block_stride INDEPENDENT of S, which is what lets a wide S address at all -- flat
-    # [Hkv,S,HD]'s per-head stride is S*HD elements, and that lands in the shim's 20-bit BD step
-    # field (32-bit address granules), capping S at ~8191 for head_dim=128 regardless of anything
-    # else in the design (see [[the-kv-window-and-the-kv-capacity-are-separable]]).
+    # owner of this addressing. T == S (one block) reproduces the pre-existing flat [Hkv, S, HD]
+    # layout byte-for-byte; T < S makes head_stride and block_stride INDEPENDENT of S, which is
+    # what lets a wide S address at all -- flat [Hkv,S,HD]'s per-head stride is S*HD elements,
+    # and that lands in the shim's 20-bit BD step field (32-bit address granules), capping S at
+    # ~8191 for head_dim=128 regardless of anything else in the design.
+    #
+    # The cache CAPACITY (what is allocated and addressable) and the attention WINDOW (how many
+    # positions a dispatch reads) are separable: a narrow window over a wide allocation costs no
+    # extra bytes above the coalescing threshold, and measured -0.388 ms rather than the 6.06 ms
+    # penalty a naive read-the-whole-allocation model predicts.
     #
     # T is DERIVED, not chosen -- derive_block_size picks the largest T whose strides fit the
     # NARROWER of the shim (20-bit) and mem-tile (17-bit) step fields, because the mem-tile bound
