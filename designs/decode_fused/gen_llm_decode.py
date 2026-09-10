@@ -287,6 +287,28 @@ FUSE_DECODE_LAYER = os.environ.get("FUSE_DECODE_LAYER", "1") == "1"
 # byte-for-byte the pre-existing graph and meta.json; params.txt (read further down) picks up the
 # new parameter's real offset for free once this is on, so the meta writer never hardcodes one.
 DYNAMIC_WINDOW = os.environ.get("DYNAMIC_WINDOW", "0") == "1"
+# WINDOW_RUNGS -- extra attention windows, comma-separated, served from THE SAME ELF as named
+# control codes rather than as separate artifacts.
+#
+# WHY THIS EXISTS. The core already takes its window from a scratchpad parameter at 128-position
+# granularity (DYNAMIC_WINDOW above), but the SHIM's KV fill size is a static BD field and cannot be
+# made runtime without leaving the resident full-ELF dispatch model -- the static TXN target rejects
+# every non-constant operand, address patches excepted. So the fill streams the whole built window
+# every token and a drain discards the surplus, which is the entire measured regression against the
+# bucketed model. A rung is a SECOND `decode_layer_dp` design at a narrower window over the SAME KV
+# capacity, reached through its own named runtime sequence: aiecc emits one control code per
+# `aie.runtime_sequence` and XRT resolves `main:<name>` against ONE registered hw_context, so the
+# rungs cost neither a rebuild nor a context. Device-proven on a two-sequence module before this
+# landed.
+#
+# The rungs quantise the FILL only; the core keeps its fine runtime window, so compute stays at
+# 128-position granularity and only the streamed bytes round up to a rung.
+#
+# Needs decode_layer_dp to be eligible (there is no other design here holding a window) and every
+# rung must be < max_seq and satisfy the same divisibility the top window does.
+WINDOW_RUNGS = tuple(
+    int(w) for w in os.environ.get("WINDOW_RUNGS", "").replace(" ", "").split(",") if w
+)
 
 
 def weight_bytes(arr):
@@ -952,23 +974,49 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
                         "needs QUANT_MLP_DTYPE=bf16 and QUANT_ATTN_DTYPE=bf16 (plain-bf16 kernel "
                         "archive, no quantized-weight variant)"
                         if QUANT_MLP_DTYPE != "bf16" or QUANT_ATTN_DTYPE != "bf16" else None)
+    rung_ops = {}
     if decode_layer_why is None:
         from iron.operators.decode_layer_dp.op import DecodeLayerDataParallel
-        op_decode_layer = DecodeLayerDataParallel(
-            D=D, FF=FF, HD=HD, Hq=Hq, Hkv=Hkv, max_seq=S, attn_cols=Hkv, mlp_cols=MLP_DP_COLS,
-            eps_attn=sp.eps, eps_mlp=sp.eps, tile_size_input=TSI, context=ctx,
-            weight_depth=WEIGHT_DEPTH, wqkv_head_major=True,
-            # max_seq stays the WINDOW the attention math iterates; these two carry the capacity
-            # and the blocked storage, the same split gemv/tmatvec already have. Both None on the
-            # unwidened, unblocked default, which is byte-identical to before they existed.
-            kv_alloc=None if KVA == S else KVA,
-            kv_block_size=None if T == S else T,
-            # Passed as a kwarg ONLY when the flag is on. Handing it through unconditionally --
-            # even as None -- is a TypeError against any IRON whose decode_layer_dp predates the
-            # field, and the default IRON_DIR (wt-iron-integ) is exactly that. Measured 2026-09-10:
-            # it broke every decode build on the default path, DYNAMIC_WINDOW=0 included, because
-            # an unknown kwarg fails at the call and never reaches the flag test inside.
-            **({"window_parameter": "attn_window"} if DYNAMIC_WINDOW else {}))
+
+        def _decode_layer(window):
+            return DecodeLayerDataParallel(
+                D=D, FF=FF, HD=HD, Hq=Hq, Hkv=Hkv, max_seq=window, attn_cols=Hkv,
+                mlp_cols=MLP_DP_COLS,
+                eps_attn=sp.eps, eps_mlp=sp.eps, tile_size_input=TSI, context=ctx,
+                weight_depth=WEIGHT_DEPTH, wqkv_head_major=True,
+                # max_seq stays the WINDOW the attention math iterates; these two carry the
+                # capacity and the blocked storage, the same split gemv/tmatvec already have. Both
+                # None on the unwidened, unblocked default, which is byte-identical to before they
+                # existed. Compared against THIS op's own window, not against the top one: a rung
+                # is precisely the case where capacity and window differ, and comparing to `S`
+                # would hand a rung `kv_alloc=None` and silently shrink its cache to its window.
+                kv_alloc=None if KVA == window else KVA,
+                kv_block_size=None if T == S else T,
+                # Passed as a kwarg ONLY when the flag is on. Handing it through unconditionally --
+                # even as None -- is a TypeError against any IRON whose decode_layer_dp predates
+                # the field, and the default IRON_DIR (wt-iron-integ) is exactly that. Measured
+                # 2026-09-10: it broke every decode build on the default path, DYNAMIC_WINDOW=0
+                # included, because an unknown kwarg fails at the call and never reaches the flag
+                # test inside.
+                **({"window_parameter": "attn_window"} if DYNAMIC_WINDOW else {}))
+
+        op_decode_layer = _decode_layer(S)
+        # A rung is the SAME design at a narrower window over the SAME capacity, so `kv_alloc`
+        # doing the capacity/window split is what makes the rungs share one arena byte for byte:
+        # `kc`/`vc` are sized from KVA, not from the window. Rejected loudly rather than clamped --
+        # a rung wider than the top window would stream MORE than the design it is meant to
+        # undercut, and a duplicate would silently emit two control codes doing the same thing.
+        for _w in WINDOW_RUNGS:
+            if _w >= S:
+                raise SystemExit(f"WINDOW_RUNGS: rung {_w} is not narrower than max_seq {S}")
+            if _w in rung_ops:
+                raise SystemExit(f"WINDOW_RUNGS: rung {_w} listed twice")
+            rung_ops[_w] = _decode_layer(_w)
+    elif WINDOW_RUNGS:
+        raise SystemExit(
+            f"WINDOW_RUNGS={','.join(map(str, WINDOW_RUNGS))} needs decode_layer_dp, which is "
+            f"OFF here: {decode_layer_why}"
+        )
     print(f"[gen] fused arm decode_layer_dp: "
           f"{'OFF -- ' + decode_layer_why if decode_layer_why else 'on'}")
 
@@ -1245,11 +1293,25 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
     # KV StridedCopys. Each duplicate pair costs an extra aiex.configure PER LAYER -- 56 per token
     # against a measured ~40 us each. SHARE_DESIGNS=0 restores the unshared build for an A/B.
     share = os.environ.get("SHARE_DESIGNS", "1") == "1"
+    # A rung's runlist is THIS runlist with the layer design substituted -- same buffers, same
+    # order, same weights, only a narrower attention window. Derived rather than rebuilt because
+    # the loop above mutates `weights` (it pops n_in/n_qn/n_kn into a packed `norms`), so running
+    # it twice would consume entries that no longer exist.
+    extra_runlists = {
+        f"sequence_w{w}": [
+            ((rung if op is op_decode_layer else op), *bufs) for op, *bufs in rl
+        ]
+        for w, rung in sorted(rung_ops.items())
+    }
+    if extra_runlists:
+        print(f"# {sp.name}: window rungs {sorted(rung_ops)} + top {S}, "
+              f"{len(extra_runlists) + 1} named control codes in one ELF")
     fused = OperatorSequence(sequence_name(sp, NL, S, placer_flags,
                                            decode_layer_active=op_decode_layer is not None, T=T), rl,
                               input_args=inputs, output_args=["logits"],
                               buffer_sizes=bufsz, context=ctx, extra_flags=placer_flags,
                               share_designs=share,
+                              **({"extra_runlists": extra_runlists} if extra_runlists else {}),
                               **({"scratch_order": list(weights.keys())} if BUCKET_SCRATCH_ORDER else {}))
     fused.compile()
     return sp, fused, weights, dict(NL=NL, S=S, T=T, inputs=inputs, cache_names=cache_names,
@@ -1267,7 +1329,8 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
                                     # default IRON_DIR is one -- builds a perfectly good op with
                                     # no such attribute, and reading it raises. Second instance of
                                     # the same seam as the kwarg above, found the same way.
-                                    window_granule=getattr(op_decode_layer, "window_granule", None))
+                                    window_granule=getattr(op_decode_layer, "window_granule", None),
+                                    window_rungs={f"sequence_w{w}": w for w in sorted(rung_ops)})
 
 
 def main():
@@ -1284,6 +1347,7 @@ def main():
     embed_blob, host_embed = md["embed_blob"], md["host_embed"]
     decode_layer_active = md["decode_layer_active"]
     window_granule = md["window_granule"]
+    window_rungs = md["window_rungs"]
     dynamic_window = DYNAMIC_WINDOW and decode_layer_active
     D, HD, Hq, Hkv, VOCAB = sp.d_model, sp.head_dim, sp.n_q_heads, sp.n_kv_heads, sp.vocab
     FF = sp.ffn
@@ -1356,6 +1420,14 @@ def main():
                  # different head_dim or tile_size_input, and a host that derived it anyway would
                  # be right here and silently wrong on the next model.
                  **({"window_granule": int(window_granule)} if dynamic_window else {})},
+        # The named control codes this ELF carries BESIDES `main:sequence`, each a decode_layer_dp
+        # design at a narrower attention window over the SAME KV capacity and the SAME arena. A
+        # host binds one xrt::ext::kernel per entry against the ONE hw_context this ELF registers
+        # and dispatches whichever rung covers n_past; `main:sequence` at dims.S stays the
+        # fallback and is what a consumer that ignores this field keeps using. Absent when no
+        # rungs were built, which is every artifact before this existed.
+        **({"window_rungs": dict(sorted(window_rungs.items(), key=lambda kv: kv[1]))}
+           if window_rungs else {}),
         # Per-token host protocol (the ELF is constant; only these change):
         #   x        = embed[token], scaled by sqrt(d_model) iff embed_scale == "sqrt_d_model"
         #   rope_*   = precomputed [S,HD] angle tables; the row for n_past is used

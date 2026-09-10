@@ -411,7 +411,25 @@ impl NpuDecodeStep {
         
 
         // The primary is itself a bucket -- the widest one unless a declared dir names a wider.
-        let mut buckets = vec![Bucket { window: artifact.max_seq, artifact: artifact.clone(), res }];
+        let mut buckets = vec![];
+        // Rungs FIRST, while `res` is still owned here: each is another named control code in the
+        // SAME ELF on the SAME registered hw_context, so a rung costs neither a context nor an
+        // artifact. They carry the primary's meta unchanged -- one meta.json describes them all,
+        // and every field `step` reads off a bucket's artifact (kv_block, head_dim, kv_heads,
+        // kv_off, sm_mask, attn_window, window_granule) is a property of the model, not of the
+        // window. Only `window` differs, and that is what the selector and the attn_window clamp
+        // use. Each rung has its OWN run and therefore its OWN ctrl scratchpad, which is why the
+        // per-token writes in `step` go through `bucket.res` and not through a shared handle.
+        for (name, window) in &artifact.window_rungs {
+            let r = res
+                .open_named(&format!("main:{name}"))
+                .map_err(|e| EngineError::Load(format!("open window rung {name} (S={window}): {e}")))?;
+            arena.bind_resident(&r).map_err(|e| {
+                EngineError::Load(format!("bind window rung {name} to the shared arena: {e}"))
+            })?;
+            buckets.push(Bucket { window: *window, artifact: artifact.clone(), res: r });
+        }
+        buckets.push(Bucket { window: artifact.max_seq, artifact: artifact.clone(), res });
         for a in bucket_arts {
             let elf = std::fs::read(a.elf_path())
                 .map_err(|e| EngineError::Load(format!("read {}: {e}", a.elf_path().display())))?;

@@ -359,6 +359,22 @@ ShimElfResident* shim_elf_resident_open(ShimDevice* d, const void* elf_bytes, si
   )
 }
 
+ShimElfResident* shim_elf_resident_open_named(ShimElfResident* base, const char* kernel_name) {
+  if (!base) { set_err("resident_open_named: null base"); return nullptr; }
+  GUARD_PTR(
+    // xrt::elf and xrt::hw_context are refcounted handles, so copying them here shares the ONE
+    // registered context rather than creating a second. That sharing is the whole point: a
+    // hw_context is the expensive object (16 of them device-wide) and a variant must not spend one.
+    xrt::ext::kernel k(base->ctx, std::string(kernel_name));
+    xrt::run run(k);
+    xrt::bo sp = run.get_ctrl_scratchpad_bo();
+    uint8_t* mp = sp.map<uint8_t*>();
+    size_t sz = sp.size();
+    return new ShimElfResident{ base->elf, base->ctx, std::move(k), std::move(run),
+                                std::move(sp), mp, sz };
+  )
+}
+
 void shim_elf_resident_close(ShimElfResident* r) { delete r; }
 
 size_t shim_elf_resident_scratchpad_size(ShimElfResident* r) {

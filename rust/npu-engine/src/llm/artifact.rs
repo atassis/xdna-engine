@@ -135,6 +135,16 @@ pub struct LlmArtifact {
     /// exactly when `attn_window` is: a scratchpad pointer with no granule has no unit to round
     /// against, and a granule with no pointer has nothing to write it to.
     pub window_granule: Option<usize>,
+    /// `meta.json`'s `window_rungs`: the NAMED control codes this one ELF carries besides
+    /// `main:sequence`, each a decode-layer design at a narrower attention window over the SAME KV
+    /// capacity and the SAME arena, as `(kernel subname, window)` sorted ascending by window.
+    ///
+    /// A rung is not another artifact. aiecc emits one control code per `aie.runtime_sequence` and
+    /// XRT resolves them by `main:<name>` against the ONE `hw_context` the ELF registers, so the
+    /// rungs cost extra ELF and neither a context nor a rebuild -- which is the whole difference
+    /// from the bucket-artifact ladder this supersedes. Empty on every artifact built before rungs
+    /// existed, and empty is exactly "one window, the old behaviour".
+    pub window_rungs: Vec<(String, usize)>,
     /// The per-row causal widths, when `meta.json` says `causal: true`. Prefill only -- decode is
     /// M=1, where one scalar width says everything there is to say. See [`MaskWidths`].
     pub mask_widths: Option<MaskWidths>,
@@ -445,6 +455,38 @@ impl LlmArtifact {
             )));
         }
 
+        // Rungs are validated here rather than trusted, because a bad one is a plausible wrong
+        // answer and never an error: a rung claiming a window it was not built at would attend
+        // short and return a believable token. A rung wider than `S` is refused for the same
+        // reason the generator refuses to build one.
+        let mut window_rungs: Vec<(String, usize)> = Vec::new();
+        if let Some(v) = meta.get("window_rungs") {
+            let obj = v
+                .as_object()
+                .ok_or_else(|| ctx("window_rungs present but not an object".to_string()))?;
+            for (name, w) in obj {
+                let w = w
+                    .as_u64()
+                    .ok_or_else(|| ctx(format!("window_rungs[{name}] is non-numeric")))?
+                    as usize;
+                if w == 0 || w > max_seq {
+                    return Err(ctx(format!(
+                        "window_rungs[{name}] = {w} is not a window inside dims.S = {max_seq}"
+                    )));
+                }
+                window_rungs.push((name.clone(), w));
+            }
+            window_rungs.sort_by_key(|(_, w)| *w);
+            if attn_window.is_none() {
+                return Err(ctx(
+                    "window_rungs without scratchpad.window_param: a rung quantises the shim's \
+                     FILL and relies on the core taking its own window at runtime, so a rung set \
+                     with no runtime window would attend the rung's whole width at every position"
+                        .to_string(),
+                ));
+            }
+        }
+
         // The RoPE angle buffers, resolved from what the artifact DECLARES. `rope` and
         // `rope_global` are the same thing under two spellings -- the decode generator emits the
         // second, the prefill generator the first, and a single-table model has exactly one.
@@ -657,6 +699,7 @@ impl LlmArtifact {
             sm_mask,
             attn_window,
             window_granule,
+            window_rungs,
             mask_widths,
             rope_inputs,
             head_dim,
@@ -1152,6 +1195,67 @@ mod tests {
         assert_eq!(aw.byte_offset, 8);
         assert!(aw.core, "attn_window is kind: core");
         assert_eq!(art.window_granule, Some(128));
+    }
+
+    // ------------------------------------------------------------------------------------
+    // `window_rungs` -- the named control codes this ELF carries besides `main:sequence`.
+    // ------------------------------------------------------------------------------------
+
+    /// A dynamic-window meta, which is the only kind a rung set is legal on.
+    fn dynwindow_meta() -> serde_json::Value {
+        let mut meta = base_meta(8, 4, serde_json::json!({"rope_global": {"type": "input", "offset": 8, "len": 8}}));
+        meta["scratchpad"]["params"]["attn_window"] =
+            serde_json::json!({"byte_offset": 8, "kind": "core"});
+        meta["scratchpad"]["window_param"] = serde_json::json!("attn_window");
+        meta["dims"]["window_granule"] = serde_json::json!(128);
+        meta
+    }
+
+    #[test]
+    fn no_rungs_is_the_old_single_window_behaviour() {
+        let dir = tempfile::tempdir().unwrap();
+        write_meta(dir.path(), &dynwindow_meta());
+        let art = LlmArtifact::load(dir.path()).unwrap();
+        assert!(art.window_rungs.is_empty(), "a meta with no rungs must declare none");
+    }
+
+    #[test]
+    fn rungs_parse_and_sort_ascending_by_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut meta = dynwindow_meta();
+        // Deliberately out of order: JSON object order is not window order, and the selector
+        // walks this list assuming ascending, so the sort is load-bearing rather than cosmetic.
+        meta["window_rungs"] = serde_json::json!({"sequence_w4": 4, "sequence_w2": 2});
+        write_meta(dir.path(), &meta);
+        let art = LlmArtifact::load(dir.path()).unwrap();
+        assert_eq!(
+            art.window_rungs,
+            vec![("sequence_w2".to_string(), 2), ("sequence_w4".to_string(), 4)]
+        );
+    }
+
+    #[test]
+    fn a_rung_wider_than_the_top_window_fails_loud() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut meta = dynwindow_meta();
+        let s = meta["dims"]["S"].as_u64().unwrap();
+        meta["window_rungs"] = serde_json::json!({"sequence_wide": s + 1});
+        write_meta(dir.path(), &meta);
+        let err = LlmArtifact::load(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("window_rungs") && err.contains("dims.S"), "{err}");
+    }
+
+    #[test]
+    fn rungs_without_a_runtime_window_fail_loud() {
+        // A rung quantises the SHIM's fill; the CORE still needs its runtime window or every
+        // dispatch attends the rung's full width. Accepting this pair would be a plausible wrong
+        // answer -- correct tokens near a rung boundary, silently over-attending elsewhere.
+        let dir = tempfile::tempdir().unwrap();
+        let mut meta = base_meta(8, 4, serde_json::json!({"rope_global": {"type": "input", "offset": 8, "len": 8}}));
+        meta["window_rungs"] = serde_json::json!({"sequence_w4": 4});
+        write_meta(dir.path(), &meta);
+        let err = LlmArtifact::load(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("window_rungs") && err.contains("window_param"), "{err}");
     }
 
     #[test]

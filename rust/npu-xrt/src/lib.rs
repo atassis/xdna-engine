@@ -575,6 +575,10 @@ extern "C" {
     fn shim_elf_resident_close(r: *mut CElfResident);
     fn shim_elf_resident_scratchpad_size(r: *mut CElfResident) -> usize;
     fn shim_elf_resident_bind(r: *mut CElfResident, bos: *const *mut CBo, n_bos: usize) -> c_int;
+    fn shim_elf_resident_open_named(
+        base: *mut CElfResident,
+        kernel_name: *const c_char,
+    ) -> *mut CElfResident;
     fn shim_elf_resident_write(
         r: *mut CElfResident,
         offset: usize,
@@ -1265,6 +1269,27 @@ impl ElfResident {
     /// Size of the ctrl scratchpad (bytes). >0 means the ELF carries scratchpad parameters.
     pub fn scratchpad_size(&self) -> usize {
         unsafe { shim_elf_resident_scratchpad_size(self.ptr) }
+    }
+
+    /// A SECOND named control code out of the same ELF, on the same registered `hw_context`.
+    ///
+    /// A full ELF may carry several runtime sequences; aiecc emits one control code per sequence
+    /// and XRT resolves them by `main:<name>`, so variants of one program (attention-window rungs,
+    /// prefill batch sizes, precision arms) cost extra ELF but not a second context -- and a
+    /// context is the scarce object here, 16 device-wide.
+    ///
+    /// Each variant owns its OWN run and therefore its OWN ctrl scratchpad, so it needs its own
+    /// [`ElfResident::bind`] and its own per-dispatch [`ElfResident::write_scratchpad`]. Writing a
+    /// parameter to one variant and dispatching another silently uses the other's stale scratchpad
+    /// -- which is a wrong answer, not an error.
+    pub fn open_named(&self, kernel_name: &str) -> Result<ElfResident> {
+        let cname = CString::new(kernel_name).map_err(|e| format!("kernel name: {e}"))?;
+        let ptr = unsafe { shim_elf_resident_open_named(self.ptr, cname.as_ptr()) };
+        if ptr.is_null() {
+            Err(format!("resident open_named({kernel_name}): {}", last_error()))
+        } else {
+            Ok(ElfResident { ptr, label: kernel_name.to_string() })
+        }
     }
 
     /// Bind the arena BOs to run args 0..N once (reused every dispatch).
