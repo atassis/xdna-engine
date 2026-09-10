@@ -428,8 +428,27 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
     # also what makes the causal mask a plain vector: row Hq*M is (head, token) flattened, and the
     # width depends only on the token half.
     sm_kw = dict(vector_size_source="rows") if causal == "rows" else {}
+    # PREFILL_ATTN_ORDER is a CONFIGURE-COST CONTROL, not a feature. Both arms split the softmax
+    # per head -- legal because softmax is per ROW and every head's sc/sw/widths slice is
+    # contiguous -- so the two arms run IDENTICAL ops over IDENTICAL bytes with IDENTICAL designs,
+    # and differ only in runlist ORDER, hence only in how many contiguous same-design blocks the
+    # dispatch configures. `grouped` is 2 blocks for the 32 ops, `interleaved` is 32.
+    #
+    # It exists because D009's 51.0-61.9 us per configure is measured on DECODE and the prefill
+    # regime cell is `p`. If prefill's per-configure cost really is ~55 us, +30 configures/layer
+    # costs ~46 ms; if the per-layer residual is un-overlapped objectFIFO fill/drain at ~350 us a
+    # configure, it costs ~294 ms. The arms separate those by 6x, which no drift can hide.
+    # `off` (the default) is the shipped single whole-buffer softmax, unchanged.
+    attn_order = os.environ.get("PREFILL_ATTN_ORDER", "off")
+    if attn_order not in ("off", "grouped", "interleaved"):
+        raise ValueError(f"PREFILL_ATTN_ORDER={attn_order!r}; want off|grouped|interleaved")
+    n_il = int(os.environ.get("PREFILL_ATTN_HEADS", Hq))
     op_sm = Softmax(rows=Hq * M, cols=S, num_aie_columns=cols, num_channels=1,
                     context=ctx, **sm_kw)
+    # One design serves every head: same rows, same cols. Only how many times the runlist SWITCHES
+    # to it changes between the arms.
+    op_sm_head = (Softmax(rows=M, cols=S, num_aie_columns=cols, num_channels=1,
+                          context=ctx, **sm_kw) if attn_order != "off" else None)
     if sp.act == "silu":
         op_act = SiLU(size=M * FF, num_aie_columns=cols, tile_size=FF // cols, context=ctx)
     else:
@@ -489,6 +508,11 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
         "hf": M * D * 2, "g": M * FF * 2, "gs": M * FF * 2, "u": M * FF * 2,
         "gh": M * FF * 2, "d": M * D * 2,
     }
+    if attn_order != "off":
+        # Slicing an INPUT needs its size declared: calculate_buffer_layout takes a plain buffer's
+        # size from the arg spec, and a sliced one only from here. Same size the whole-buffer arm
+        # gets from op_sm's spec, so the input arena is byte-identical between the arms.
+        bufsz[SM_WIDTHS] = Hq * M * 4
     prefill_local = sorted(bufsz)
     dec_meta, dec_order, dec_sizes, dec_reserved = (None, [], {}, 0)
     if dec_meta_path:
@@ -566,14 +590,34 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
             (op_kvapp, "v", p + "vc"),
             (op_q2h, "q", "qh"),
         ]
-        for h in range(Hq):
-            rl.append((op_sc, f"qh[{h * M * HD * 2}:{(h + 1) * M * HD * 2}]",
-                       kv_slab(p + "kc", h // grp),
-                       f"sc[{h * M * S * 2}:{(h + 1) * M * S * 2}]"))
         # The widths buffer is an INPUT of the softmax step, not a side channel: op.get_arg_spec()
         # puts it between in and out, so it is the middle name here.
-        rl.append((op_sm, "sc", SM_WIDTHS, "sw") if causal == "rows"
-                  else (op_sm, "sc", "sw"))
+        def score(h):
+            return (op_sc, f"qh[{h * M * HD * 2}:{(h + 1) * M * HD * 2}]",
+                    kv_slab(p + "kc", h // grp),
+                    f"sc[{h * M * S * 2}:{(h + 1) * M * S * 2}]")
+
+        def soft(h):
+            sl = f"sc[{h * M * S * 2}:{(h + 1) * M * S * 2}]"
+            out = f"sw[{h * M * S * 2}:{(h + 1) * M * S * 2}]"
+            w = f"{SM_WIDTHS}[{h * M * 4}:{(h + 1) * M * 4}]"
+            return (op_sm_head, sl, w, out) if causal == "rows" else (op_sm_head, sl, out)
+
+        if attn_order == "interleaved":
+            # Only the first `n_il` heads alternate; the rest stay grouped. The knob exists because
+            # a configure costs ~80 KB of instruction stream, so interleaving all 16 heads built a
+            # 157 MB ELF that the driver refuses to allocate a BO for (CREATE_BO EAGAIN,
+            # reproducible). +2 configures per interleaved head per layer.
+            for h in range(n_il):
+                rl += [score(h), soft(h)]
+            rl += [score(h) for h in range(n_il, Hq)]
+            rl += [soft(h) for h in range(n_il, Hq)]
+        elif attn_order == "grouped":
+            rl += [score(h) for h in range(Hq)] + [soft(h) for h in range(Hq)]
+        else:
+            rl += [score(h) for h in range(Hq)]
+            rl.append((op_sm, "sc", SM_WIDTHS, "sw") if causal == "rows"
+                      else (op_sm, "sc", "sw"))
         for h in range(Hq):
             rl.append((op_cx, f"sw[{h * M * S * 2}:{(h + 1) * M * S * 2}]",
                        kv_slab(p + "vc", h // grp),
@@ -627,6 +671,10 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
             f"_m{M}_s{S}_l{NL}_c{cols}_{causal}_bfp{int(emulate)}_acc{int(prio_acc)}_re{int(round_even)}")
     if causal != "none":
         name += f"_{causal}"
+    # The two configure-cost arms differ ONLY in runlist order, so every other name component is
+    # identical between them -- exactly the collision that silently links the earlier arm's ELF.
+    if attn_order != "off":
+        name += f"_ao{attn_order}" + (f"{n_il}" if attn_order == "interleaved" else "")
     # The tiling is now a per-shape lookup, so it is a GRAPH knob like the three above and has to
     # be in the name for the same reason: a re-sweep that moves one GEMM's tile must not link the
     # previous tiling's ELF out of the artifact cache. Hashed rather than spelled out -- seven
