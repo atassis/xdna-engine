@@ -236,7 +236,12 @@ pub struct Artifacts {
     /// every bucket's shared arena offsets are checked against `decode`'s at load -- so a bucket
     /// generated against a different allocation fails loud rather than corrupting the cache. Empty
     /// (the default) is exactly the single-bucket rail.
-    #[serde(default)]
+    ///
+    /// `alias` is load-bearing, not politeness: the field was named `decode_ladder` until
+    /// 2026-09-10, serde ignores an unknown key with no error, and a scenario whose only bucket
+    /// key went unread would load its primary alone and pay the full window at every position --
+    /// silently, as a ~20% latency regression rather than a failure. Measured that way once.
+    #[serde(default, alias = "decode_ladder")]
     pub decode_buckets: Vec<String>,
     /// `kind = "generate"` only: the checkpoint's directory (`tokenizer.json`,
     /// `tokenizer_config.json`, `generation_config.json`), read through `llm::ModelConfig::load`.
@@ -390,6 +395,18 @@ manifest = "artifacts/pyannote/diarize.json"
     /// And when they ARE named, the buckets arrive in declaration order. Order is not load-bearing
     /// -- the engine sorts by each artifact's own `dims.S` -- but a config that silently dropped
     /// entries would look identical to one that named none.
+    /// A scenario written before the rename must still load its buckets. The failure this guards
+    /// is silent: serde drops an unknown key, so the model comes up with its primary design alone
+    /// and pays the padded window every token, with nothing logged.
+    #[test]
+    fn the_pre_rename_field_name_still_parses() {
+        let c = ScenarioConfig::from_str(
+            "[scenario]\nkind = \"generate\"\nname = \"m\"\n[artifacts]\ndecode = \"d\"\nweights = \"w\"\ntokenizer_dir = \"t\"\ndecode_ladder = [\"b/w1024\", \"b/w2048\"]\n",
+        )
+        .expect("a scenario using the pre-rename key must parse");
+        assert_eq!(c.artifacts.decode_buckets, ["b/w1024", "b/w2048"]);
+    }
+
     #[test]
     fn a_declared_bucket_list_parses_every_entry() {
         let c = ScenarioConfig::from_str(
