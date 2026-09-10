@@ -42,8 +42,7 @@ impl ChatTemplate {
         add_generation_prompt: bool,
         enable_thinking: Option<bool>,
     ) -> Result<String, EngineError> {
-        let mut env = Environment::new();
-        env.set_unknown_method_callback(pycompat_method);
+        let mut env = env();
         env.add_template("chat", &self.source)
             .map_err(|e| EngineError::Load(format!("chat template parse: {e}")))?;
         let tmpl = env
@@ -68,6 +67,83 @@ impl ChatTemplate {
             },
         };
         tmpl.render(ctx).map_err(|e| EngineError::Load(format!("chat template render: {e}")))
+    }
+
+    /// Render an arbitrary context against this template. The conversation path goes through
+    /// [`render_with`](Self::render_with), which is the only caller that knows the variable names a
+    /// chat template expects; this exists for the tool-syntax probe and for exercising one filter in
+    /// isolation.
+    pub(crate) fn render_probe(&self, ctx: minijinja::value::Value) -> Result<String, EngineError> {
+        let mut env = env();
+        env.add_template("chat", &self.source)
+            .map_err(|e| EngineError::Load(format!("chat template parse: {e}")))?;
+        let tmpl = env
+            .get_template("chat")
+            .map_err(|e| EngineError::Load(format!("chat template lookup: {e}")))?;
+        tmpl.render(ctx).map_err(|e| EngineError::Load(format!("chat template render: {e}")))
+    }
+}
+
+/// The one environment every render uses. Built per call because `add_template` borrows the source.
+fn env<'a>() -> Environment<'a> {
+    let mut env = Environment::new();
+    env.set_unknown_method_callback(pycompat_method);
+    // `transformers` renders `tojson` as `json.dumps(..., ensure_ascii=False)` -- a space after
+    // every `:` and `,`. minijinja's builtin is `serde_json::to_string`, which emits neither, so the
+    // SAME template produces a different prompt here than in transformers, vLLM, llama.cpp or
+    // Ollama. Measured 2026-09-10 on one Qwen3 tool schema: 60 tokens against HF's 82, diverging at
+    // token 2. Neither side is wrong alone -- compact JSON is JSON, and the defect lives only in
+    // their disagreement, which is why nothing caught it until `tools` stopped being hardcoded `[]`.
+    env.add_filter("tojson", |v: Value| -> Result<String, Error> {
+        let json: serde_json::Value = serde_json::to_value(&v).map_err(|e| {
+            Error::new(ErrorKind::InvalidOperation, "cannot serialize to JSON").with_source(e)
+        })?;
+        Ok(json_dumps_py(&json))
+    });
+    env
+}
+
+/// `json.dumps(obj, ensure_ascii=False)`: `", "` between items, `": "` after a key, insertion order
+/// preserved (both `serde_json` and `minijinja` need their `preserve_order` feature for that, and
+/// both have it -- a schema re-sorted on either hop moves the prompt).
+///
+/// Written out rather than configured: `serde_json`'s `Formatter` cannot express this separator pair
+/// without a custom impl either way, and non-ASCII already passes through as UTF-8, which is exactly
+/// what `ensure_ascii=False` means.
+fn json_dumps_py(v: &serde_json::Value) -> String {
+    let mut s = String::new();
+    write_dumps(v, &mut s);
+    s
+}
+
+fn write_dumps(v: &serde_json::Value, s: &mut String) {
+    use std::fmt::Write;
+    match v {
+        serde_json::Value::Object(m) => {
+            s.push('{');
+            for (i, (k, val)) in m.iter().enumerate() {
+                if i > 0 {
+                    s.push_str(", ");
+                }
+                let _ = write!(s, "{}: ", serde_json::Value::String(k.clone()));
+                write_dumps(val, s);
+            }
+            s.push('}');
+        }
+        serde_json::Value::Array(a) => {
+            s.push('[');
+            for (i, val) in a.iter().enumerate() {
+                if i > 0 {
+                    s.push_str(", ");
+                }
+                write_dumps(val, s);
+            }
+            s.push(']');
+        }
+        // Scalars: `serde_json`'s own Display is already `json.dumps`-compatible, escaping included.
+        other => {
+            let _ = write!(s, "{other}");
+        }
     }
 }
 
@@ -130,6 +206,35 @@ fn py_strip(s: &str, args: &[Value], left: bool, right: bool) -> Result<String, 
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    /// minijinja's `tojson` is `serde_json::to_string` -- COMPACT. `transformers` renders the same
+    /// filter as `json.dumps(..., ensure_ascii=False)`, which puts a space after every `:` and `,`.
+    /// Every HF chat template that renders a tool calls `tojson`, for the schema and again for the
+    /// call's arguments, so without the override the model sees a tools block no other server
+    /// produces: measured 60 tokens against HF's 82 on one schema, diverging at token 2.
+    ///
+    /// The key order in the expected string is the INSERTION order, not the alphabetical one. It
+    /// holds only because `serde_json` and `minijinja` both carry `preserve_order`; drop either and
+    /// this reads `{"a": [1, 2], "b": 1}`.
+    #[test]
+    fn tojson_matches_python_json_dumps_separators_and_order() {
+        let tmpl = ChatTemplate::new("{{ x | tojson }}".to_string());
+        let out = tmpl
+            .render_probe(minijinja::context! { x => serde_json::json!({"b": 1, "a": [1, 2]}) })
+            .unwrap();
+        assert_eq!(out, r#"{"b": 1, "a": [1, 2]}"#);
+    }
+
+    /// Non-ASCII passes through as UTF-8 rather than as `\uXXXX`, which is what `ensure_ascii=False`
+    /// means and what every HF template is rendered with.
+    #[test]
+    fn tojson_does_not_escape_non_ascii() {
+        let tmpl = ChatTemplate::new("{{ x | tojson }}".to_string());
+        let out = tmpl
+            .render_probe(minijinja::context! { x => serde_json::json!({"city": "Köln"}) })
+            .unwrap();
+        assert_eq!(out, r#"{"city": "Köln"}"#);
+    }
 
     fn msg(role: &str, content: &str) -> ChatMessage {
         ChatMessage { role: role.to_string(), content: content.to_string() }
