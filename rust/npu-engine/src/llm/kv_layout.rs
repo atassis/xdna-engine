@@ -1,7 +1,9 @@
 //! Rust mirror of `iron.common.kv_layout`'s `KVLayout.kv_off` -- the Python checkout owns the
 //! definition, this module owns agreeing with it. See that module's docstring for the full
-//! addressing model (`[S/T blocks, Hkv heads, T positions, HD dims]`, block-major); this file
-//! carries only the RUNTIME half the host writes per token, `kv_off`.
+//! addressing model (`[S/T blocks, Hkv heads, T positions, HD dims]`, block-major). `kv_off` is
+//! the RUNTIME half the host writes per token; `head_base`/`head_runs` are the build-time half,
+//! here because a host that READS the cache back (the debug probes) needs what a host that only
+//! drives it does not.
 //!
 //! Until 2026-09-09 this formula was `pos * head_dim`, hand-written at
 //! [`crate::llm::npu_decode::NpuDecodeStep::step`] with nothing checking it against the four
@@ -23,6 +25,34 @@ pub fn kv_off(pos: usize, kv_block: usize, head_dim: usize, kv_heads: usize) -> 
     let within = pos % kv_block;
     let block_stride = kv_heads * kv_block * head_dim;
     block * block_stride + within * head_dim
+}
+
+/// The BUILD-TIME per-head term `kv_off` deliberately omits: where head `head`'s positions start
+/// inside each block. A host that only drives the cache never needs it; a host that READS the
+/// cache back -- the debug probes, which compare a slab against a CPU golden -- does.
+pub fn head_base(head: usize, kv_block: usize, head_dim: usize) -> usize {
+    head * kv_block * head_dim
+}
+
+/// The contiguous runs making up `cache[head, 0..positions, :]`, as `(element offset, positions)`
+/// in position order.
+///
+/// Blocked, a head's positions are contiguous only INSIDE a block -- across blocks the other
+/// heads sit in between -- so a reader takes one run per block where the flat layout gave it one
+/// slice. At `kv_block >= positions` that is a single run at `head * kv_block * head_dim`, which
+/// is exactly the `head * max_seq * head_dim` the probes hand-wrote before blocking.
+pub fn head_runs(
+    head: usize, positions: usize, kv_block: usize, head_dim: usize, kv_heads: usize,
+) -> Vec<(usize, usize)> {
+    let mut runs = Vec::new();
+    let mut pos = 0;
+    while pos < positions {
+        let take = (kv_block - pos % kv_block).min(positions - pos);
+        runs.push((kv_off(pos, kv_block, head_dim, kv_heads) + head_base(head, kv_block, head_dim),
+                   take));
+        pos += take;
+    }
+    runs
 }
 
 #[cfg(test)]
@@ -68,5 +98,40 @@ mod tests {
         for &(pos, expect) in cases {
             assert_eq!(kv_off(pos, 128, 128, 8), expect, "pos={pos}");
         }
+    }
+
+    #[test]
+    fn head_runs_is_one_flat_slice_when_the_window_is_one_block() {
+        // The pre-blocking read the probes hand-wrote: head h at h * max_seq * head_dim, one run.
+        for head in 0..8 {
+            assert_eq!(head_runs(head, 256, 2048, 128, 8), vec![(head * 2048 * 128, 256)]);
+        }
+    }
+
+    #[test]
+    fn head_runs_covers_every_position_exactly_where_kv_off_puts_it() {
+        // Element-by-element against the formula the DEVICE writes through, for a slab that spans
+        // several blocks -- the case where a single flat slice reads seven other heads' bytes.
+        let (kv_block, head_dim, kv_heads, n) = (128usize, 128usize, 8usize, 300usize);
+        for head in 0..kv_heads {
+            let mut pos = 0;
+            for (off, take) in head_runs(head, n, kv_block, head_dim, kv_heads) {
+                for i in 0..take {
+                    assert_eq!(off + i * head_dim,
+                               kv_off(pos, kv_block, head_dim, kv_heads)
+                                   + head_base(head, kv_block, head_dim),
+                               "head={head} pos={pos}");
+                    pos += 1;
+                }
+            }
+            assert_eq!(pos, n);
+        }
+    }
+
+    #[test]
+    fn head_runs_splits_at_block_boundaries_not_at_the_slab_start() {
+        // 300 positions over 128-position blocks: 128 + 128 + 44, not three equal runs.
+        let runs = head_runs(0, 300, 128, 128, 8);
+        assert_eq!(runs.iter().map(|(_, n)| *n).collect::<Vec<_>>(), vec![128, 128, 44]);
     }
 }

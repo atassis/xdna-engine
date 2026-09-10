@@ -17,6 +17,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use npu_engine::llm::kv_layout;
 use npu_xrt::{unpack_bf16_to_f32, Arena, Device, FusedArena};
 use serde::Deserialize;
 
@@ -170,17 +171,25 @@ fn main() {
     let hkv = meta.dims.get("kv_heads").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
     let hd = meta.dims.get("head_dim").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
     let s = meta.dims.get("S").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    // Absent kv_block means the pre-blocking flat cache, for which head_runs gives one slice.
+    let blk = meta.dims.get("kv_block").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let blk = if blk == 0 { s } else { blk };
     for l in 0..nl {
         for which in ["kc", "vc"] {
             let name = format!("L{l}_{which}");
             let Some(gpath) = meta.golden.get(&name) else { continue };
             let (a, off, _len) = arena_of(&meta, &name);
             // The golden is the SLAB cache[h, base:base+M, :] for base=0, not the whole cache.
+            // One read per (head, BLOCK): a head's positions are contiguous only inside a block,
+            // so the single `h * S * HD` slice this used to take read the other heads' bytes and
+            // reported a scrambled diff as a numeric defect.
             let mut got = vec![0u8; hkv * m * hd * 2];
             for h in 0..hkv {
-                let src = off + h * s * hd * 2;
-                let dst = h * m * hd * 2;
-                arena.read_at(a, src, &mut got[dst..dst + m * hd * 2]).unwrap();
+                let mut dst = h * m * hd * 2;
+                for (src, take) in kv_layout::head_runs(h, m, blk, hd, hkv) {
+                    arena.read_at(a, off + src * 2, &mut got[dst..dst + take * hd * 2]).unwrap();
+                    dst += take * hd * 2;
+                }
             }
             dump(&gate_dir, &name, &got);
             let want = read(&dir.join(gpath));

@@ -16,6 +16,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use npu_engine::llm::kv_layout;
 use npu_xrt::{unpack_bf16_to_f32, Arena, Device, ElfResident, FusedArena};
 use serde::Deserialize;
 
@@ -111,14 +112,23 @@ fn diff(a: &[u8], b: &[u8]) -> (f64, usize, usize) {
 }
 
 /// Snapshot cache[h, 0..n, :] for every kv head, for one cache buffer.
+///
+/// One read per (head, BLOCK), not per head: blocked, a head's positions are contiguous only
+/// inside a block. This used to be a single `h * S * HD` slice, which under blocking reads the
+/// other seven heads' bytes and produces a scrambled diff that looks like a numeric defect --
+/// see the `prefill-debug-probes-assume-a-flat-cache` task. `head_runs` returns that one slice
+/// again when the cache is unblocked.
 fn slab(m: &Meta, ar: &FusedArena, name: &str, n: usize) -> Vec<u8> {
     let (hkv, hd, s) = (m.d("kv_heads"), m.d("head_dim"), m.d("S"));
+    let blk = match m.d("kv_block") { 0 => s, b => b };
     let (a, off, _) = m.at(name);
     let mut out = vec![0u8; hkv * n * hd * 2];
     for h in 0..hkv {
-        let src = off + h * s * hd * 2;
-        let dst = h * n * hd * 2;
-        ar.read_at(a, src, &mut out[dst..dst + n * hd * 2]).unwrap();
+        let mut dst = h * n * hd * 2;
+        for (src, take) in kv_layout::head_runs(h, n, blk, hd, hkv) {
+            ar.read_at(a, off + src * 2, &mut out[dst..dst + take * hd * 2]).unwrap();
+            dst += take * hd * 2;
+        }
     }
     out
 }
@@ -189,7 +199,12 @@ fn main() {
         let (ra, ro, _) = dm.at("rope_global");
         arena.write_at(ra, ro, &pack(&rope_row(i, hd, theta))).unwrap();
         arena.sync_input().unwrap();
-        d_res.write_scratchpad(kvp.byte_offset, &((i * hd) as u32).to_le_bytes()).unwrap();
+        // The DECODE artifact's own blocking, through the helper the engine drives with. This was
+        // `i * hd`, the flat formula: under a blocked cache it lands arm A's tokens at addresses
+        // the decode ELF does not read, so the probe reported a batching defect that was its own.
+        let dblk = match dm.d("kv_block") { 0 => dm.d("S"), b => b };
+        let off = kv_layout::kv_off(i, dblk, hd, dm.d("kv_heads"));
+        d_res.write_scratchpad(kvp.byte_offset, &(off as u32).to_le_bytes()).unwrap();
         if let Some(s) = smp {
             let v = (i as u32 + 1) << if s.kind == "core" { 2 } else { 0 };
             d_res.write_scratchpad(s.byte_offset, &v.to_le_bytes()).unwrap();
@@ -245,6 +260,35 @@ fn main() {
         let toks_bytes: Vec<u8> = toks.iter().flat_map(|t| t.to_le_bytes()).collect();
         std::fs::write(format!("{d}/tokens.bin"), &toks_bytes).unwrap();
         println!("dumped both arms' KV + tokens to {d}\n");
+    }
+
+    // Where did each arm actually WRITE? Every slab comparison assumes both arms put their bytes
+    // where the reader looks; when an arm reads back all-zero, that assumption is the thing in
+    // question. This census asks the arena instead -- every named SCRATCH buffer, nonzero byte
+    // count -- so a write that landed at the wrong address is found rather than reported missing.
+    if std::env::var("KV_CENSUS").is_ok() {
+        let mut names: Vec<&String> = pm.layout.keys().collect();
+        names.sort();
+        let mut wrote = 0usize;
+        for nm in names {
+            let e = &pm.layout[nm];
+            if e.kind != "scratch" {
+                continue;
+            }
+            let mut b = vec![0u8; e.len];
+            arena.read_at(Arena::Scratch, e.offset, &mut b).unwrap();
+            let nz = b.iter().filter(|x| **x != 0).count();
+            if nz > 0 {
+                wrote += 1;
+            }
+            // Weights are uploaded, not written by the dispatch -- naming them would bury the
+            // handful of buffers the dispatch is actually responsible for. A zero row is the
+            // POINT here, so non-weight buffers print whether or not they hold anything.
+            if !pm.weights.contains(nm) {
+                println!("[census] {nm:<12} off {:>10} len {:>9}: {nz} nonzero bytes", e.offset, e.len);
+            }
+        }
+        println!("[census] {wrote} scratch buffer(s) hold nonzero bytes after the batched dispatch\n");
     }
 
     println!("{:<10} {:>12} {:>16}", "cache", "rel-L2", "differing/total");
