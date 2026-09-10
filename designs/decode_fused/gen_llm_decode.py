@@ -674,6 +674,15 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
     # is 262144 elements = 131072 granules, ONE over the mem-tile field's 131071; at T=128 it is
     # 65536 granules, comfortably under both fields.
     #
+    # That field bound is not the only constraint on T: the blocked GEMV below also needs each of
+    # the COLS columns' share of S to be a whole number of T-blocks, and the field bound alone
+    # knows nothing about S or COLS. The two collide on single-KV-head geometries, where a small
+    # Hkv lets the field bound keep doubling T past S//COLS before it ever binds -- Gemma3-270M
+    # (Hkv=1, HD=256) is exactly that case (field bound alone: T=512; S//COLS=256; unbuildable).
+    # Qwen3 (Hkv=8) never hits this second bound -- its field-derived T=128 already divides
+    # S//COLS=256, incidentally, not because the field bound knows about columns. So pass S/COLS
+    # in and let derive_block_size enforce both.
+    #
     # Only activated for the arms that can actually ADDRESS a blocked cache today: gemv's
     # group_reuse coalesced path (GROUPED_K, batch_group>1) and tmatvec's one-head-per-column path
     # (TMV_CTX). Any other combination stays on the flat layout -- not a regression (identical to
@@ -692,7 +701,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
                 f"design.py) -- set GQA_GROUPED_K=1 TMV_CTX=1 or KV_BLOCK_T={S}"
             )
     else:
-        T = derive_block_size(HD, Hkv) if KV_BLOCK_ELIGIBLE else S
+        T = derive_block_size(HD, Hkv, S=S, n_cols=COLS) if KV_BLOCK_ELIGIBLE else S
     if T != S:
         assert S % T == 0, (
             f"T={T} does not divide S ({S}) -- pick an S that is a multiple of T"
