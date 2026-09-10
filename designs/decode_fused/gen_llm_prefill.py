@@ -432,7 +432,11 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
     # what the BYTES alone are worth: -3.0 MiB/layer, -84 MiB/dispatch.
     fuse_silu = os.environ.get("PREFILL_FUSE_SILU", "0") == "1" and sp.act == "silu"
     op_gu = gemm_for("gate_up", D, FF)
-    op_gate = gemm_for("gate_up", D, FF, extra=dict(epilogue="silu")) if fuse_silu else None
+    # PREFILL_EPI_ELEMS=0 builds the NULL CONTROL: same fused design, same call, no arithmetic.
+    epi_n = os.environ.get("PREFILL_EPI_ELEMS")
+    op_gate = gemm_for("gate_up", D, FF, extra=dict(
+        epilogue="silu", **({"epilogue_elems": int(epi_n)} if epi_n is not None else {}),
+    )) if fuse_silu else None
     op_down = gemm_for("down", FF, D)
     # scores: B is the kv cache read as [N=S, K=HD] -> b_col_maj. ctx: the SAME bytes read as
     # [K=S, N=HD] -> plain. Either way the blocked axis is the physical leading one, positions, so
