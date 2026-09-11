@@ -8,6 +8,13 @@
 #
 #   bash scripts/time_prefill.sh [rounds] [reps] [lens]
 #
+# Auto-ingests the batched-vs-per-token CROSSOVER into $PRE/meta.json afterward
+# (scripts/ingest_prefill_break_even.py) unless NO_INGEST=1 -- see that script's own header for
+# why this exists: a hand-edited Rust constant for this number went stale the first time an
+# artifact rebuilt without a matching re-sweep (2026-09-11). Include at least one length under
+# ~30 tokens in $LENS to actually exercise the region a wrong crossover would bite in; the
+# ingest script itself refuses to write (loud, not a guess) if either arm is not flat.
+#
 # Single-tenant: stop `npu serve` (pkill -x npu, never -f) and run under npu_lock.sh.
 set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -32,3 +39,6 @@ for r in $(seq 1 "$ROUNDS"); do
   done
 done
 echo "[time] logs in $OUT"
+if [ "${NO_INGEST:-0}" != "1" ]; then
+  python3 "$REPO/scripts/ingest_prefill_break_even.py" --timing-dir "$OUT" --prefill-art "$PRE"
+fi

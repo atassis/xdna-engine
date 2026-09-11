@@ -206,6 +206,12 @@ impl NpuPrefill {
         self.batch
     }
 
+    /// `self.artifact`'s measured crossover, or `None` on a pre-2026-09-11 artifact -- see
+    /// [`LlmArtifact::prefill_break_even_tokens`]'s doc comment.
+    pub fn break_even_tokens(&self) -> Option<usize> {
+        self.artifact.prefill_break_even_tokens
+    }
+
     pub(crate) fn batched_enabled(&self) -> bool {
         batched_prefill_enabled()
     }

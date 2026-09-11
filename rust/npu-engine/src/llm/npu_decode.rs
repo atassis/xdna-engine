@@ -566,6 +566,10 @@ impl DecodeStep for NpuDecodeStep {
         self.prefill.as_ref().filter(|p| p.batched_enabled()).map(NpuPrefill::batch)
     }
 
+    fn prefill_break_even_tokens(&self) -> Option<usize> {
+        self.prefill.as_ref().and_then(NpuPrefill::break_even_tokens)
+    }
+
     fn prefill(&mut self, tokens: &[u32], from: usize) -> Result<usize, EngineError> {
         let Some(p) = self.prefill.as_ref().filter(|p| p.batched_enabled()) else { return Ok(from) };
         p.prime(&self.arena, &self.embed, tokens, from)

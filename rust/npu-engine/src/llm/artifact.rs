@@ -203,6 +203,16 @@ pub struct LlmArtifact {
     /// against (`gen_llm_decode.py`, added 2026-09-05). `None` on any artifact built before this
     /// field existed. See [`LlmArtifact::load`]'s freshness check below.
     pub toolchain_hash: Option<String>,
+    /// `meta.json`'s `dims.prefill_break_even_tokens` -- the measured prompt-length crossover
+    /// above which one batched dispatch (a fixed cost, independent of how many of its `dims.M`
+    /// rows are real tokens) beats priming per-token. A property of the ARTIFACT, not a Rust
+    /// constant: a fixed dispatch cost that changes with tiling/M/S changes across a rebuild used
+    /// to live in `generator.rs::PREFILL_BREAK_EVEN_TOKENS`, and went stale the first time an
+    /// artifact rebuilt without a matching re-sweep -- caught 2026-09-11 when a 13-token prompt
+    /// used the batched path at ~1.6x what per-token priming would have cost. `None` on a decode
+    /// artifact (irrelevant there) and on any prefill artifact built before this field existed;
+    /// the caller falls back to a hardcoded default in that case.
+    pub prefill_break_even_tokens: Option<usize>,
 }
 
 /// Verdict from comparing an artifact's [`LlmArtifact::toolchain_hash`] against the currently
@@ -366,6 +376,14 @@ impl LlmArtifact {
                 Ok(0) => return Err(ctx("dims.M = 0".to_string())),
                 other => other?,
             },
+        };
+
+        // See `prefill_break_even_tokens`'s own doc comment for why this lives here rather than
+        // as a Rust constant. Absent (pre-2026-09-11 artifacts, and every decode artifact) is a
+        // valid state, not an error -- the caller supplies its own default.
+        let prefill_break_even_tokens = match role {
+            ArtifactRole::Decode => None,
+            ArtifactRole::Prefill => dims.get("prefill_break_even_tokens").and_then(|v| v.as_u64()).map(|v| v as usize),
         };
 
         // Optional as a whole only for prefill, whose model constants come from the decode half.
@@ -714,6 +732,7 @@ impl LlmArtifact {
             rope_theta_global,
             rope_theta_local,
             toolchain_hash,
+            prefill_break_even_tokens,
         })
     }
 

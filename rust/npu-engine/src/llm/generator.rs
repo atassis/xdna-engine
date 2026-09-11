@@ -68,6 +68,14 @@ pub trait DecodeStep {
         None
     }
 
+    /// The loaded prefill artifact's own measured break-even token count (see
+    /// `LlmArtifact::prefill_break_even_tokens`), or `None` when there is no prefill artifact or
+    /// it predates that field. The generator falls back to [`prefill_min_tokens`] in that case --
+    /// see the call site in `generate`.
+    fn prefill_break_even_tokens(&self) -> Option<usize> {
+        None
+    }
+
     /// Prime the KV cache for `tokens[from..]` at positions `[from, tokens.len())` in batches of
     /// [`prefill_batch`](DecodeStep::prefill_batch), and return how many positions are now primed.
     ///
@@ -393,7 +401,11 @@ impl<D: DecodeStep> LlmGenerator<D> {
     }
 }
 
-/// The fewest batchable prompt tokens that make the batched-prefill path worth taking.
+/// The fallback break-even when the loaded prefill artifact carries no measured
+/// `dims.prefill_break_even_tokens` of its own (pre-2026-09-11 artifacts). The call site in
+/// `generate` prefers `self.decode.prefill_break_even_tokens()` -- the artifact's OWN measurement
+/// -- over this function; see [`LlmArtifact::prefill_break_even_tokens`] for why that field exists
+/// at all: this exact constant is the KILL-IF this doc comment predicted coming true.
 ///
 /// A MEASURED break-even, not a derived one. The old rule was one whole chunk
 /// (`batchable >= M`, 255 here) and was justified by ROWS -- a prefill dispatch costs a padded
@@ -418,9 +430,23 @@ impl<D: DecodeStep> LlmGenerator<D> {
 /// 12 is the smallest threshold that cannot lose. Batching below it is a real regression: at 10
 /// tokens it costs 47 ms to avoid nothing.
 ///
-/// KILL-IF: both terms are artifact-specific. A different `M`, a different window, or a decode
-/// step that gets faster moves the crossover, and this constant is then wrong in whichever
-/// direction that went. Re-run the sweep rather than trusting it across an artifact change.
+/// CONFIRMED STALE 2026-09-11: a rebuild to M=256 S=4096 (to pair with the served rung-ladder
+/// decode artifact -- see `prefill-is-decode-at-m1`) moved the fixed dispatch cost to ~539 ms,
+/// and a 13-token request used the batched path (13 >= 12) at ~1.6x what per-token priming would
+/// have cost. Re-measured, same method, THREE alternated rounds x 3 reps, lens
+/// 4/8/12/16/20/24/28/32/48/64 (`scripts/time_prefill.sh 3 3 4,8,12,...`), but Power Mode TURBO
+/// (pinned for an unrelated GEMM-tile sweep earlier the same session, not yet reverted) --
+/// per-token 27.36-27.55 ms/token (flat), batched 538.0-541.1 ms (flat): crossover =
+/// 539.3/27.43 = 19.66, so 20 is the smallest threshold that cannot lose. NOT re-verified at
+/// Power Mode Default; if both terms scale with clock roughly proportionally the ratio should
+/// hold, but that is a hypothesis, not a measurement -- re-run the sweep after any power-mode
+/// change alongside an artifact change, not just after the artifact change alone.
+///
+/// KILL-IF: both terms are artifact-specific (AND, per the correction above, power-mode-specific
+/// until proven otherwise). A different `M`, a different window, a different power mode, or a
+/// decode step that gets faster moves the crossover. Re-run the sweep rather than trusting a
+/// number across ANY of those changes -- this fallback is a constant precisely because doing so
+/// is exactly what did not happen last time.
 ///
 /// `NPU_LLM_PREFILL_MIN_TOKENS` overrides it -- raise it to the artifact's `dims.M` for the
 /// pre-2026-09-10 behaviour, or higher to bisect a suspected short-prompt prefill bug.
@@ -428,8 +454,8 @@ fn prefill_min_tokens() -> usize {
     prefill_min_tokens_from(std::env::var("NPU_LLM_PREFILL_MIN_TOKENS").ok().as_deref())
 }
 
-/// The measured crossover above. Named rather than spelled `12` at the call site.
-const PREFILL_BREAK_EVEN_TOKENS: usize = 12;
+/// The measured fallback crossover above. Named rather than spelled `20` at the call site.
+const PREFILL_BREAK_EVEN_TOKENS: usize = 20;
 
 /// Split out from the env read so it can be tested without touching the process environment --
 /// these tests run in parallel threads of one process, and a test that sets a variable another
@@ -565,8 +591,12 @@ impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
         let mut primed = reused;
         // `prefill_batch()` is the CAPABILITY probe -- `Some` means a batched prefill artifact is
         // loaded. Its `M` no longer gates the decision: `prime()` pads a partial chunk itself, and
-        // paying for the padding beats paying for the dispatches. See `prefill_min_tokens()`.
-        if self.decode.prefill_batch().is_some() && batchable - batched_from >= prefill_min_tokens() {
+        // paying for the padding beats paying for the dispatches. The THRESHOLD is a different
+        // question -- prefer the loaded artifact's own measured crossover
+        // (`prefill_break_even_tokens`) over the hardcoded fallback (`prefill_min_tokens()`), so a
+        // rebuilt artifact with a different dispatch cost cannot silently reuse a stale number.
+        let break_even = self.decode.prefill_break_even_tokens().unwrap_or_else(prefill_min_tokens);
+        if self.decode.prefill_batch().is_some() && batchable - batched_from >= break_even {
             primed = self.decode.prefill(&prompt_ids[..batchable], batched_from)?;
         }
         let mut logits = Vec::new();
@@ -1003,18 +1033,20 @@ mod tests {
     #[test]
     fn a_prompt_of_at_least_one_batch_is_primed_by_prefill_except_its_last_token() {
         let cfg = build_cfg(None);
-        // 14 prompt tokens against a batch of 2 -- several whole chunks. Prefill takes the first
-        // thirteen; only the last position goes through `step`, so the script needs exactly two
+        // 22 prompt tokens against a batch of 2 -- several whole chunks. Prefill takes the first
+        // twenty-one; only the last position goes through `step`, so the script needs exactly two
         // entries (that priming step, then one more after the first accepted token). The prompt is
-        // long enough to clear the break-even threshold, which is a separate decision.
+        // long enough to clear the break-even threshold (21 >= PREFILL_BREAK_EVEN_TOKENS's 20),
+        // which is a separate decision.
         let peak = |id: usize| { let mut v = vec![0.0; 7]; v[id] = 9.0; v };
         let decode = ScriptedDecodeStep::new(vec![peak(2), peak(4)]).with_prefill_batch(2);
         let mut gen = LlmGenerator::new(cfg, decode);
         let params = GenerateParams { max_tokens: Some(50), temperature: Some(0.0), ..GenerateParams::default() };
-        let (text, reason, usage) =
-            gen.generate_to_string(&Prompt::Raw("a b c d e f g h i j k l m n".to_string()), &params).unwrap();
-        assert_eq!(gen.backend().prefill_calls, vec![13], "prefill takes the prompt minus its last token");
-        assert_eq!(usage.prompt_tokens, 14);
+        let (text, reason, usage) = gen
+            .generate_to_string(&Prompt::Raw("a b c d e f g h i j k l m n o p q r s t u v".to_string()), &params)
+            .unwrap();
+        assert_eq!(gen.backend().prefill_calls, vec![21], "prefill takes the prompt minus its last token");
+        assert_eq!(usage.prompt_tokens, 22);
         assert_eq!(text, "world");
         assert_eq!(reason, FinishReason::Stop);
     }
@@ -1038,18 +1070,18 @@ mod tests {
 
     #[test]
     fn a_partial_chunk_over_the_break_even_is_primed_in_one_call() {
-        // 14 prompt tokens against a batch of 256: 13 batchable, over the crossover but far under
-        // one chunk. The whole point of the 2026-09-10 flip -- the old `batchable >= M` rule sent
-        // this prompt through 14 sequential dispatches to avoid padding one.
+        // 22 prompt tokens against a batch of 256: 21 batchable, over the crossover (>=20) but far
+        // under one chunk. The whole point of the 2026-09-10 flip -- the old `batchable >= M` rule
+        // sent this prompt through 22 sequential dispatches to avoid padding one.
         let cfg = build_cfg(None);
         let peak = |id: usize| { let mut v = vec![0.0; 7]; v[id] = 9.0; v };
         let decode = ScriptedDecodeStep::new(vec![peak(2), peak(4)]).with_prefill_batch(256);
         let mut gen = LlmGenerator::new(cfg, decode);
         let params = GenerateParams { max_tokens: Some(50), temperature: Some(0.0), ..GenerateParams::default() };
-        let prompt = Prompt::Raw("a b c d e f g h i j k l m n".to_string());
+        let prompt = Prompt::Raw("a b c d e f g h i j k l m n o p q r s t u v".to_string());
         let (_, _, usage) = gen.generate_to_string(&prompt, &params).unwrap();
-        assert_eq!(usage.prompt_tokens, 14);
-        assert_eq!(gen.backend().prefill_calls, vec![13], "one call, not 13 steps");
+        assert_eq!(usage.prompt_tokens, 22);
+        assert_eq!(gen.backend().prefill_calls, vec![21], "one call, not 21 steps");
     }
 
     #[test]
@@ -1085,16 +1117,17 @@ mod tests {
     #[test]
     fn the_last_prompt_token_always_goes_through_step_even_at_an_exact_multiple() {
         let cfg = build_cfg(None);
-        // 14 prompt tokens, batch 1: prefill could cover all fourteen, and must not -- only `step`
-        // returns logits and the first sample() reads them. It takes thirteen.
+        // 22 prompt tokens, batch 1: prefill could cover all twenty-two, and must not -- only
+        // `step` returns logits and the first sample() reads them. It takes twenty-one.
         let peak = |id: usize| { let mut v = vec![0.0; 7]; v[id] = 9.0; v };
         let decode = ScriptedDecodeStep::new(vec![peak(2), peak(4)]).with_prefill_batch(1);
         let mut gen = LlmGenerator::new(cfg, decode);
         let params = GenerateParams { max_tokens: Some(50), temperature: Some(0.0), ..GenerateParams::default() };
-        let (text, _, _) =
-            gen.generate_to_string(&Prompt::Raw("a b c d e f g h i j k l m n".to_string()), &params).unwrap();
-        assert_eq!(gen.backend().prefill_calls, vec![13]);
-        assert_eq!(text, "world", "the sampled logits came from step(pos=13), not from prefill");
+        let (text, _, _) = gen
+            .generate_to_string(&Prompt::Raw("a b c d e f g h i j k l m n o p q r s t u v".to_string()), &params)
+            .unwrap();
+        assert_eq!(gen.backend().prefill_calls, vec![21]);
+        assert_eq!(text, "world", "the sampled logits came from step(pos=21), not from prefill");
     }
 
     #[test]
@@ -1589,10 +1622,12 @@ mod ledger_tests {
     type Log = std::rc::Rc<std::cell::RefCell<Vec<(usize, usize)>>>;
     type Steps = std::rc::Rc<std::cell::RefCell<Vec<usize>>>;
 
-    /// `n` vocab words. Prompts here must clear `prefill_min_tokens()` (12) on the TAIL, or the
-    /// batched path declines and the test observes the threshold instead of the ledger. The
-    /// environment is deliberately not touched: these tests run in parallel threads of one process,
-    /// and `NPU_LLM_PREFILL_MIN_TOKENS` is read per call.
+    /// `n` vocab words. Prompts here must clear the break-even threshold (`PREFILL_BREAK_EVEN_TOKENS`,
+    /// currently 20 -- `Recording` never overrides `prefill_break_even_tokens()`, so tests run
+    /// against this fallback, not an artifact-measured one) on the TAIL, or the batched path
+    /// declines and the test observes the threshold instead of the ledger. The environment is
+    /// deliberately not touched: these tests run in parallel threads of one process, and
+    /// `NPU_LLM_PREFILL_MIN_TOKENS` is read per call.
     fn words(n: usize) -> String {
         ["hello", "world", "foo", "bar"].iter().cycle().take(n).copied().collect::<Vec<_>>().join(" ")
     }
