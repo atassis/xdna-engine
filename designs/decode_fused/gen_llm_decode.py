@@ -81,6 +81,7 @@ from iron.common import AIEContext  # noqa: E402
 from iron.common.kv_layout import KVLayout, derive_block_size  # noqa: E402
 from elf_dispatch_compat import OperatorSequence, load_elf  # noqa: E402
 from iron.operators.gemv.op import GEMV  # noqa: E402
+from iron.operators.gemv.design import MAX_GROUP_REUSE  # noqa: E402
 from iron.common.quant import quantize_weight, row_stride_bytes  # noqa: E402
 import precision  # noqa: E402
 from iron.operators.rms_norm.op import RMSNorm  # noqa: E402
@@ -1364,8 +1365,35 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         # route that needs none.
         op_rep_k = Repeat(rows=hkv, cols=S * hd, repeat=gqa, transfer_size=hd, context=ctx)
         op_rep_v = Repeat(rows=hkv, cols=S * hd, repeat=gqa, transfer_size=hd, context=ctx)
-        op_scores = gemv(S, hd, ctx, num_batches=Hq, batch_group=gqa if GROUPED_K else 1,
-                             block_size=T, alloc_M=None if KVA == S else KVA)
+        # GQA's own group_reuse gate (gemv/design.py) DECLINES batch_group > MAX_GROUP_REUSE (a
+        # measured shim-BD ceiling) and falls back to a stride-0 outer BD that re-reads the whole
+        # matrix once per query head -- measured 14.71x on Gemma-4's global layers (hkv=1,
+        # gqa=Hq=16), 270.01 MB/token against 18.35 MB unique. Below the ceiling (sliding, gqa=2)
+        # this is unreachable and op_scores is unchanged.
+        #
+        # The fix stays inside group_reuse instead of raising the ceiling (a known dead end --
+        # batch_group=16 makes aiecc's B_L3L1_0 exceed 16 blocks, see MAX_GROUP_REUSE's own
+        # comment): build op_scores at batch_group=MAX_GROUP_REUSE (n_matrices=1, matching the
+        # ONE real K matrix) and call it scores_groups times over MAX_GROUP_REUSE-head slices --
+        # the same "one configure, N runs over slices" idiom down_runlist/o_runlist already use.
+        scores_group_fix = GROUPED_K and gqa > MAX_GROUP_REUSE
+        if scores_group_fix:
+            assert hkv == 1, (
+                f"scores group-reuse fallback assumes ONE real K matrix per geometry (hkv=1); "
+                f"got hkv={hkv} (hd={hd}) -- the per-slice K addressing is unimplemented for "
+                f"hkv>1"
+            )
+            assert gqa % MAX_GROUP_REUSE == 0, (
+                f"scores group-reuse fallback slices gqa into fixed {MAX_GROUP_REUSE}-head "
+                f"calls; gqa={gqa} (hd={hd}) is not a multiple of it"
+            )
+            scores_groups = gqa // MAX_GROUP_REUSE
+            op_scores = gemv(S, hd, ctx, num_batches=MAX_GROUP_REUSE, batch_group=MAX_GROUP_REUSE,
+                                 block_size=T, alloc_M=None if KVA == S else KVA)
+        else:
+            scores_groups = 1
+            op_scores = gemv(S, hd, ctx, num_batches=Hq, batch_group=gqa if GROUPED_K else 1,
+                                 block_size=T, alloc_M=None if KVA == S else KVA)
         # num_batches=Hq, not Hq separate invocations. transpose/design.py's L3 tensors already hold
         # "num_batches contiguous (M,N) matrices stacked along the row dimension", which is EXACTLY
         # what vr/vt are; calling it per head issued 448 configure+run pairs per token to do 28 ops'
@@ -1411,7 +1439,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
             op_rope_q=op_rope_q, op_rope_k=op_rope_k, op_sck=op_sck, op_scv=op_scv,
             op_rep_k=op_rep_k, op_rep_v=op_rep_v, op_scores=op_scores, op_trv=op_trv,
             op_ctx=op_ctx, op_v_norm=op_v_norm, has_v=has_v, kv_parts=kv_parts,
-            uses_tmv_ctx=uses_tmv)
+            uses_tmv_ctx=uses_tmv, scores_groups=scores_groups)
         _attn_cache[(hd, hkv, has_v)] = g
         return g
 
@@ -1622,6 +1650,27 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
 
     def o_runlist(p, g):
         return split_over_k(g.op_o, p + "Wo", p + "cx", p + "a", g.o_chunks, g.qd, p + "a")
+
+    def scores_runlist(p, g, ref_q):
+        """(g.op_scores, K-buffer, q-slice, sc-slice) tuples.
+
+        One call, byte-identical to the pre-fix single call, when g.scores_groups==1 (every
+        geometry whose gqa fits MAX_GROUP_REUSE). Otherwise g.scores_groups calls of the SAME op
+        -- built at batch_group=MAX_GROUP_REUSE in attn_ops -- each over a MAX_GROUP_REUSE-head
+        slice of q and the matching slice of sc, all reading the one real K matrix at its
+        unsliced offset. `ref_q` may itself already be a byte slice of a wider qkv buffer
+        (FUSE_QKV_GEMV); Q always starts at byte 0 of whichever buffer it names, so slicing off
+        that base reaches the same bytes a further bracket on `ref_q` would.
+        """
+        a = p + ("kc" if GROUPED_K else "kr")
+        if g.scores_groups == 1:
+            return [(g.op_scores, a, ref_q, p + "sc")]
+        base, n = ref_q.split("[", 1)[0], MAX_GROUP_REUSE
+        return [
+            (g.op_scores, a, f"{base}[{i*n*g.hd*2}:{(i+1)*n*g.hd*2}]",
+             f"{p}sc[{i*n*S*2}:{(i+1)*n*S*2}]")
+            for i in range(g.scores_groups)
+        ]
     # W_head weight-stream dtype axis (see QUANT_HEAD_DTYPE above -- READ THE TIED-EMBEDDING NOTE
     # before turning this on).
     head_quant_kw = _quant_kw("head")
@@ -1888,7 +1937,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                 # TMV_CTX subsumes the v-side grouping: TMatVec reads vc per kv head itself, so a
                 # Repeat would materialise a `vr` nothing consumes.
                 *([] if (GROUPED_V or g.uses_tmv_ctx) else [(g.op_rep_v, p + "vc", p + "vr")]),
-                (g.op_scores, p + ("kc" if GROUPED_K else "kr"), ref_q, p + "sc"),
+                *scores_runlist(p, g, ref_q),
                 *([] if scale_in_qnorm else [(op_scale, p + "sc", "attn_scale", p + "sc")]),
                 (op_softmax, p + "sc", p + "sw"),
                 *([] if g.uses_tmv_ctx else
