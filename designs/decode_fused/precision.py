@@ -201,12 +201,21 @@ def parse_plan(text: str) -> Dict[str, Spec]:
     return plan
 
 
-# Named points. `reach` is the arm each can be BUILT on, which is not the same question as
-# whether it is a good format -- `all-int8` is the measured quality optimum and the fused layer
-# cannot carry it, because q/k/v share the cache's fifo. Run `precision.py --list` for the table.
+# Named points. Three questions are independent here and a preset answers only the first two:
+# what it COSTS IN BYTES, what it costs in QUALITY, and what its KERNEL costs. On the third the
+# record is blunt and it does not follow the other two -- measured on the unfused graph at an
+# identical dispatch count, symmetric int4 is at parity with bf16 (0.99x), symmetric int8 is
+# 2.10x SLOWER (its dequant loop), and BOTH affine forms add a constant +47.3/+48.3 ms from
+# `group_sums_of_b`'s per-call cost ([[narrow-weights-are-slower-on-the-current-decode-graph]]).
+# So the best-measured arm is the symmetric int4 one, not the best-quality or fewest-bytes one.
+# `reach` is which arm each can be BUILT on, a fourth and separate question.
 PRESETS = {
     "bf16": ({}, "fused"),
-    # Wo rides the MLP's fifo under fuse_o, so the two move together by construction.
+    # SYMMETRIC, and deliberately: the affine forms are better on quality at the same bytes and
+    # carry a measured constant that dwarfs the difference. Wo rides the MLP's fifo under fuse_o,
+    # so the two move together by construction.
+    "mlp-int4-sym": ({"mlp": "int4/g128", "attn_o": "int4/g128"}, "fused"),
+    "mlp-int8-sym": ({"mlp": "int8/g128", "attn_o": "int8/g128"}, "fused"),
     "mlp-int8": ({"mlp": "int8a/g128", "attn_o": "int8a/g128"}, "fused"),
     "mlp-head-int8": ({"mlp": "int8a/g128", "attn_o": "int8a/g128", "head": "int8a/g128"},
                       "fused"),

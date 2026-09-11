@@ -20,7 +20,7 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WS="$(cd "$REPO/.." && pwd)"
 LOCK="$WS/xdna-engine-private/journal/scripts/npu_lock.sh"
 OUT="${PRECISION_AB_OUT:-/mnt/data/xdna/scratch/precision/ab}"
-ARMS=(bf16 '{"head":"int8a/g128"}' mlp-int8 mlp-head-int8)
+ARMS=(bf16 mlp-int4-sym mlp-int8-sym mlp-int8)
 WARM_ONLY=0
 [ "${1:-}" = "--warm" ] && { WARM_ONLY=1; shift; }
 SESSIONS="${1:-3}"
