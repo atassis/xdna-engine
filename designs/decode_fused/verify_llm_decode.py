@@ -32,7 +32,7 @@ import ml_dtypes
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import newstack_compat  # noqa: F401,E402
 from gen_llm_decode import (build_graph, report_artifact_freshness, load_weight_buffer,  # noqa: E402
-                            isolate_build_dir, QUANT_MLP_DTYPE, QUANT_MLP_GROUP)
+                            isolate_build_dir, PRECISION_PLAN)
 from redispatch_check import assert_redispatch_identical  # noqa: E402
 from iron.common.kv_layout import KVLayout  # noqa: E402
 
@@ -213,8 +213,11 @@ def main():
         # gates on `if PACKED:` for the same reason. dump_llm_weights.py writes quant.json
         # UNCONDITIONALLY, so a plain bf16 dump carries {"dtype": "bf16", "packed": []}, and reading
         # that as an authority makes an int8 build look like a bf16 one and refuses a correct run.
+        _mlp = PRECISION_PLAN.get("mlp")
         bq = ({"dtype": _j["dtype"], "group": int(_j["group_size"])}
-              if _j and _j.get("packed") else {"dtype": QUANT_MLP_DTYPE, "group": QUANT_MLP_GROUP})
+              if _j and _j.get("packed")
+              else {"dtype": getattr(_mlp, "dtype", "bf16"),
+                    "group": getattr(_mlp, "group_size", 0) or 128})
         if (rq["dtype"], int(rq["group"])) != (bq["dtype"], int(bq["group"])) and not (
                 rq["dtype"] == "bf16" and bq["dtype"] == "bf16"):
             raise SystemExit(

@@ -1023,22 +1023,22 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         raise SystemExit(f"{_qmf_path}: lists {len(PACKED)} packed tensors but dtype is bf16")
     if PACKED:
         # A packed dump is the AUTHORITY for the weight format, because the bytes are already on
-        # disk in it -- the env can no longer choose. An env var that was EXPLICITLY SET to
-        # something else is a contradiction and fails loudly here; an unset one simply adopts the
-        # manifest. Presence, not value, is what distinguishes "the operator asked" from "this is
-        # the default", which is the same contract env-flag-presence-means-on names.
+        # disk in it -- the plan can no longer choose. A plan that asks for something ELSE at a
+        # packed site is a contradiction and fails loudly here; a site left at bf16 simply adopts
+        # the manifest's format. The scale_kind is the dump's own: it moved weight VALUES at pack
+        # time, so re-declaring it here would claim a calibration this build did not do.
         _mdt, _mgs = _qmf["dtype"], int(_qmf["group_size"])
-        for _v, _want in (("QUANT_MLP_DTYPE", _mdt), ("QUANT_ATTN_DTYPE", _mdt),
-                          ("QUANT_QKV_DTYPE", _mdt), ("QUANT_MLP_GROUP", str(_mgs)),
-                          ("QUANT_ATTN_GROUP", str(_mgs)), ("QUANT_QKV_GROUP", str(_mgs))):
-            _got = os.environ.get(_v)
-            if _got is not None and _got != _want:
+        _dump_spec = precision.Spec(dtype=_mdt, group_size=_mgs)
+        for _site in ("mlp", "attn_o", "qkv"):
+            _cur = PRECISION_PLAN.get(_site, precision.BF16_SPEC)
+            if _cur.quantized and (_cur.dtype, _cur.group_size) != (_mdt, _mgs):
                 raise SystemExit(
-                    f"{_v}={_got!r} contradicts {_qmf_path} ({_want!r}). The dump is already "
-                    f"packed at {_mdt} g{_mgs}; the build cannot re-choose the format. Unset "
-                    f"{_v} to take the dump's, or re-dump at the format you want.")
-        globals().update(QUANT_MLP_DTYPE=_mdt, QUANT_ATTN_DTYPE=_mdt, QUANT_QKV_DTYPE=_mdt,
-                         QUANT_MLP_GROUP=_mgs, QUANT_ATTN_GROUP=_mgs, QUANT_QKV_GROUP=_mgs)
+                    f"the precision plan asks for {_cur} at site {_site!r}, but {_qmf_path} is "
+                    f"already packed at {_mdt} g{_mgs} and the build cannot re-choose the format. "
+                    f"Drop {_site!r} from the plan to take the dump's, or re-dump at the format "
+                    f"you want.")
+            PRECISION_PLAN[_site] = _dump_spec
+        print(f"[gen] packed dump is the authority: {_mdt} g{_mgs} at mlp/attn_o/qkv")
 
     def load_norm(name):
         # Gemma-3 stores RMSNorm gain as w with the kernel computing x_hat*(1+w); Qwen3 stores it
@@ -1129,8 +1129,15 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
     # qkv_dp_why/mlp_dp_why (the spec-shape rules attn_block_dp and swiglu_mlp_dp already check)
     # plus what is true only of the MERGED device: attn_block_dp's own Hkv==COLS rule, and no
     # sandwich norms (the op has no post-attn/post-ffn norm slot).
+    # ONE geometry. decode_layer_dp bakes HD/Hq/Hkv into a single design and the runlist
+    # substitutes ONE op per layer (that is also what a window rung rewrites), so a spec whose
+    # layers disagree about head_dim has no single design to substitute. Refuse by name rather
+    # than build the first geometry's design and run every layer through it.
+    _geom1 = geoms[0] if len(geoms) == 1 else None
     decode_layer_why = ("FUSE_DECODE_LAYER=0" if not FUSE_DECODE_LAYER else
-                        qkv_dp_why if qkv_dp_why else
+                        f"needs ONE attention geometry; {sp.name} has {len(geoms)}: {geoms}"
+                        if _geom1 is None else
+                        qkv_dp_why[_geom1] if qkv_dp_why[_geom1] else
                         mlp_dp_why if mlp_dp_why else
                         "needs FUSE_MLP_O=1 (Wo's padding is wired through that flag via "
                         "op_mlp_dp._wo_rows_padded, and decode_layer_dp always fuses Wo)"
@@ -1226,9 +1233,9 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                         if (sp.qk_norm and SPLIT_QKNORM) else op_qk_norm)
         # QKV projection: one GEMV over the concatenated weight, or the three separate ones. op_kv
         # is built in both arms because share_designs pairs Wk with Wv only in the unfused one.
-        if QUANT_QKV_DTYPE != "bf16" and dp_why is None:
+        if _spec("qkv").quantized and dp_why is None:
             raise NotImplementedError(
-                f"QUANT_QKV_DTYPE={QUANT_QKV_DTYPE!r} but the fused QKV head is on, and "
+                f"the precision plan sets qkv to {_spec('qkv')} but the fused QKV head is on, and "
                 "QKVHeadDataParallel has no weight_dtype axis -- it would consume packed bytes as "
                 "bf16 values. Set FUSE_QKV_DP=0, or add the axis to the operator.")
         # attention_k_eq_v: a layer with no v_proj concatenates TWO parts, not three, so both the
@@ -1810,8 +1817,6 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                        p + "cx", p + "n_pf", p + "Wo", p + "Wg", p + "Wu", p + "Wd",
                        "mlp_gh", "mlp_a_scratch", nxt))
         else:
-            # The unfused arms only. With the fused head, the per-head norms, the projection and the
-            # RoPE are all inside one design and none of these runlist entries exists.
             qk = proj = rope = vnorm = []
             if sp.qk_norm and g.op_qkv_dp is None:
                 hq = [f"{qhb}[{qho + h*g.hd*2}:{qho + (h+1)*g.hd*2}]" for h in range(Hq)]
@@ -1882,121 +1887,19 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                     rl.append((op_mlp_dp, cur, p + "a", p + "n_pf", p + "Wg", p + "Wu", p + "Wd",
                                "mlp_gh", nxt))
             else:
-                # q/k/v are byte slices of ONE `qkv` buffer in the fused arm -- op_qkv writes all three
-                # in one pass, and q|k adjacency is what lets a single RoPE cover both. Declared with an
-                # explicit size because a parent that is only ever referenced sliced has no arg spec to
-                # take its length from (iron/common/sequence.py: calculate_buffer_layout).
-                if op_qkv_dp is not None:
-                    # The fused head appends k and v to the caches itself, so neither ever becomes an L3
-                    # buffer and only `q` survives as an intermediate.
-                    ref_q = p + "q"
-                    bufsz[ref_q] = QD * 2
-                elif FUSE_QKV_GEMV:
-                    qkvb, kb, vb = p + "qkv", QD * 2, (QD + KVD) * 2
-                    ref_q, ref_k = f"{qkvb}[0:{kb}]", f"{qkvb}[{kb}:{vb}]"
-                    ref_v, ref_qk = f"{qkvb}[{vb}:{vb + KVD * 2}]", f"{qkvb}[0:{vb}]"
-                    qhb, qho, khb, kho = qkvb, 0, qkvb, kb    # per-head qk-norm slice base + byte offset
-                    bufsz[qkvb] = (QD + 2 * KVD) * 2
-                else:
-                    ref_q, ref_k, ref_v = p + "q", p + "k", p + "v"
-                    qhb, qho, khb, kho = p + "q", 0, p + "k", 0
-                    bufsz.update({p + "q": QD * 2, p + "k": KVD * 2, p + "v": KVD * 2})
-                # kr/vr/vt are the GQA-broadcast and V-transpose intermediates, and each exists ONLY in the
-                # arm whose op writes it. Declaring them unconditionally allocated them anyway: an entry in
-                # `buffer_sizes` that no runlist op references still lands in the scratch arena, because
-                # calculate_buffer_layout appends every explicit buffer not already placed
-                # (iron/common/sequence.py, the `explicit_buf not in scratch_args` branch). At the shipped
-                # defaults (GROUPED_K=1, TMV_CTX=1) all three are dead, and at Hq*S*HD*2 = 8 MiB each over
-                # 28 layers that is 672 MiB of arena that nothing reads -- 33.8% of the 1.99 GiB scratch,
-                # and it reconciles exactly: 1.9898 GiB total minus 1.32904 GiB of named buffers = 0.661.
-                bufsz.update({
-                    p + "kc": kv_layout.total_elems * 2, p + "vc": kv_layout.total_elems * 2,
-                    p + "sc": Hq * S * 2, p + "sw": Hq * S * 2,
-                    p + "cx": QD * 2,
-                    p + "g": FF * 2, p + "u": FF * 2, p + "gh": FF * 2, p + "d": D * 2,
-                    p + "hn": D * 2, p + "hf": D * 2,
-                })
-                if not GROUPED_K:
-                    bufsz[p + "kr"] = Hq * S * HD * 2
-                if not (GROUPED_V or TMV_CTX):
-                    bufsz[p + "vr"] = Hq * S * HD * 2
-                if not TMV_CTX:
-                    bufsz[p + "vt"] = Hq * S * HD * 2
-                # `a` is purely internal to op_mlp_dp's own fuse_o path (never an L3 buffer -- see
-                # design.py) once folded; only declare it when something outside that design still reads
-                # or writes it.
-                if not fuse_o:
-                    bufsz[p + "a"] = D * 2
-                # The unfused arms only. With the fused head, the per-head norms, the projection and the
-                # RoPE are all inside one design and none of these runlist entries exists.
-                qk = proj = rope = []
-                if sp.qk_norm and op_qkv_dp is None:
-                    hq = [f"{qhb}[{qho + h*HD*2}:{qho + (h+1)*HD*2}]" for h in range(Hq)]
-                    hk = [f"{khb}[{kho + h*HD*2}:{kho + (h+1)*HD*2}]" for h in range(Hkv)]
-                    qk = [*[((op_qk_norm if h % 2 == 0 else op_qk_norm_b),
-                             hq[h], p + "n_qn", hq[h]) for h in range(Hq)],
-                          *[((op_qk_norm if h % 2 == 0 else op_qk_norm_b),
-                             hk[h], p + "n_kn", hk[h]) for h in range(Hkv)]]
-                if op_qkv_dp is None:
-                    proj = ([(op_qkv, p + "Wqkv", p + "hn", p + "qkv")] if FUSE_QKV_GEMV else
-                            [(op_q, p + "Wq", p + "hn", ref_q),
-                             (op_kv, p + "Wk", p + "hn", ref_k),
-                             (op_kv, p + "Wv", p + "hn", ref_v)])
-                    rope = ([(op_rope_qk, ref_qk, ang, ref_qk)] if fuse_rope else
-                            [(op_rope_q, ref_q, ang, ref_q),
-                             (op_rope_k, ref_k, ang, ref_k)])
-                # The fused head replaces the norm, the projection, every qk-norm and the RoPE with one
-                # design; `hn` lives and dies in L1 instead of round-tripping DDR between four of them.
-                # The fused head absorbs the KV append too: k and v are drained straight into the caches
-                # at `kv_off` instead of into buffers a StridedCopy then re-reads and re-writes. The caches
-                # were their only consumer, so the intermediate had no reader -- it existed because the
-                # append was a separate operator. Two runs and one more configure per layer.
-                head = ([(op_qkv_dp, cur, p + "n_in", p + "Wqkv", p + "n_qn", p + "n_kn", ang,
-                          ref_q, p + "kc", p + "vc")]
-                        if op_qkv_dp is not None else
-                        [(op_norm, cur, p + "n_in", p + "hn"), *proj, *qk, *rope,
-                         (op_sck, ref_k, p + "kc"), (op_scv, ref_v, p + "vc")])
                 rl += [
-                    *head,
-                    *([] if GROUPED_K else [(op_rep_k, p + "kc", p + "kr")]),
-                    # TMV_CTX subsumes the v-side grouping: TMatVec reads vc per kv head itself, so a
-                    # Repeat would materialise a `vr` nothing consumes.
-                    *([] if (GROUPED_V or TMV_CTX) else [(op_rep_v, p + "vc", p + "vr")]),
-                    (op_scores, p + ("kc" if GROUPED_K else "kr"), ref_q, p + "sc"),
-                    *([] if scale_in_qnorm else [(op_scale, p + "sc", "attn_scale", p + "sc")]),
-                    (op_softmax, p + "sc", p + "sw"),
-                    *([] if TMV_CTX else [(op_trv, p + ("vc" if GROUPED_V else "vr"), p + "vt")]),
-                    (op_ctx, p + ("vc" if TMV_CTX else "vt"), p + "sw", p + "cx"),
-                    *([] if fuse_o else [(op_o, p + "Wo", p + "cx", p + "a")]),
+                    (op_add, cur, p + "a", p + "x1"),
+                    (op_norm, p + "x1", p + "n_pf", p + "hf"),
+                    (op_gate, p + "Wg", p + "hf", p + "g"),
+                    (op_up, p + "Wu", p + "hf", p + "u"),
+                    *([] if op_act is None else [(op_act, p + "g", p + "g")]),
+                    (op_mul_ffn, p + "g", p + "u", p + "gh"),
+                    *down_runlist(p),
                 ]
-                if sp.sandwich_norms:
-                    rl.append((op_norm, p + "a", p + "n_pa", p + "a"))
-                if op_mlp_dp is not None:
-                    # cur + a -> x1 -> norm -> gate/up -> silu -> mul -> down -> +x1, all inside one design.
-                    # x1/hf/g/u/gh/d never reach DDR; `mlp_gh` is the all-gather round-trip buffer and is
-                    # shared across layers because the sequence runs them one at a time. FUSE_MLP_O folds
-                    # `a = Wo @ cx` in too: `cx`/`Wo` replace `a` as the design's own inputs, and
-                    # `mlp_a_scratch` is a's own all-gather round-trip buffer, the same idiom as mlp_gh's.
-                    if fuse_o:
-                        rl.append((op_mlp_dp, cur, p + "cx", p + "n_pf", p + "Wo", p + "Wg", p + "Wu",
-                                   p + "Wd", "mlp_gh", "mlp_a_scratch", nxt))
-                    else:
-                        rl.append((op_mlp_dp, cur, p + "a", p + "n_pf", p + "Wg", p + "Wu", p + "Wd",
-                                   "mlp_gh", nxt))
-                else:
-                    rl += [
-                        (op_add, cur, p + "a", p + "x1"),
-                        (op_norm, p + "x1", p + "n_pf", p + "hf"),
-                        (op_gate, p + "Wg", p + "hf", p + "g"),
-                        (op_up, p + "Wu", p + "hf", p + "u"),
-                        *([] if op_act is None else [(op_act, p + "g", p + "g")]),
-                        (op_mul_ffn, p + "g", p + "u", p + "gh"),
-                        *down_runlist(p),
-                    ]
-                if sp.sandwich_norms:
-                    rl.append((op_norm, p + "d", p + "n_pff", p + "d"))
-                if op_mlp_dp is None:
-                    rl.append((op_add, p + "x1", p + "d", nxt))
+            if sp.sandwich_norms:
+                rl.append((op_norm, p + "d", p + "n_pff", p + "d"))
+            if op_mlp_dp is None:
+                rl.append((op_add, p + "x1", p + "d", nxt))
         bufsz[p + "x1"] = D * 2
         if op_lscale is not None:
             # `hidden_states *= self.layer_scalar` is the LAST statement of the reference decoder
@@ -2186,7 +2089,16 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         head.compile()
     return sp, fused, weights, dict(NL=NL, S=S, T=T, inputs=inputs, cache_names=cache_names,
                                         decode_layer_active=op_decode_layer is not None,
-                                        window_granule=window_granule,
+                                        # getattr, not attribute access: a spec whose fused
+                                        # layer did not build has no such attribute.
+                                        # Only when the parameter was actually WIRED. The
+                                        # operator carries a granule either way, so reporting
+                                        # it unconditionally makes the host write a scratchpad
+                                        # parameter the ELF never declared.
+                                        window_granule=(getattr(op_decode_layer,
+                                                                "window_granule", None)
+                                                        if DYNAMIC_WINDOW else None),
+                                        window_rungs={f"sequence_w{w}": w for w in sorted(rung_ops)},
                                     head=head, split_lm_head=SPLIT_LM_HEAD,
                                     segments=segments, layer_marks=layer_marks,
                                     embed_blob=embed_blob, host_embed=host_embed,
