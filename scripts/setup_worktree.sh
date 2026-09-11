@@ -17,9 +17,9 @@
 # is sccache's job (rustc-wrapper in ~/.cargo/config.toml), which needs neither.
 set -euo pipefail
 
-store="${XDNA_ARTIFACT_STORE:-/mnt/data/models/xdna-artifacts}"
-models="${XDNA_MODEL_STORE:-/mnt/data/models/xdna-models}"
-build_root="${XDNA_BUILD_ROOT:-/mnt/data/xdna-build}"
+store="${XDNA_ARTIFACT_STORE:-/mnt/data/xdna/artifacts}"
+models="${XDNA_MODEL_STORE:-/mnt/data/xdna/models}"
+build_root="${XDNA_BUILD_ROOT:-/mnt/data/xdna/build}"
 
 root="$(git rev-parse --show-toplevel)"
 name="$(basename "$root")"

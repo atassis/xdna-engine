@@ -45,7 +45,7 @@ from llm_decode_spec import (  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
 ARM_GEN = HERE / "gen_gemm_tile_arm.py"
-DEFAULT_OUT = Path("/mnt/data/xdna-scratch/gemm_sweep")
+DEFAULT_OUT = Path("/mnt/data/xdna/scratch/gemm_sweep")
 
 # The grid to BUILD from, when the legal set is not capped. Coarser than the census grid on
 # purpose: the census answers "what is legal" over everything the microkernel admits, the build

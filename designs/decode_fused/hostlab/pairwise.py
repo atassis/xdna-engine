@@ -8,7 +8,7 @@ paired t on the per-position NLL difference between the two arms directly.
 import os as _os
 # Work root: corpora/ and runs/ live here, NOT in the repo -- a 6000-position logprob
 # memmap is 3.6 GB and belongs on nvme. Override with QLAB_WORK.
-QLAB = _os.environ.get("QLAB_WORK", "/mnt/data/qlab")
+QLAB = _os.environ.get("QLAB_WORK", "/mnt/data/xdna/qlab")
 import sys, glob, os, numpy as np
 
 

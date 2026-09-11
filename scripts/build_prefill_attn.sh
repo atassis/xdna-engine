@@ -6,7 +6,7 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WS="$(cd "$REPO/.." && pwd)"
 BATCH="${1:-256}"; SEQ="${2:-2048}"
-OUT="${3:-/mnt/data/xdna-scratch/prefill/attn_m${BATCH}_s${SEQ}}"
+OUT="${3:-/mnt/data/xdna/scratch/prefill/attn_m${BATCH}_s${SEQ}}"
 VENV_IRON="${VENV_IRON:-$REPO/.venv-iron}"
 [ -x "$VENV_IRON/bin/python" ] || VENV_IRON="$WS/xdna-engine/.venv-iron"
 . "$REPO/scripts/amd_paths.sh"
@@ -24,7 +24,7 @@ export PEANO_INSTALL_DIR="${PEANO_INSTALL_DIR:-$VENV_IRON/lib/python3.14/site-pa
 export MLIR_AIE_INSTANCE="$INST"
 export PATH="$VENV_IRON/bin:$VENV_IRON/cc-shim:$AIEBU_ASM_DIR:$PATH"
 export AIE_DEVICE="${AIE_DEVICE:-npu2}"
-WORK="${KEEP_WORK:-/mnt/data/xdna-scratch/prefill/build_attn_m${BATCH}_s${SEQ}}"
+WORK="${KEEP_WORK:-/mnt/data/xdna/scratch/prefill/build_attn_m${BATCH}_s${SEQ}}"
 mkdir -p "$WORK" "$OUT"; cd "$WORK"
 exec "$VENV_IRON/bin/python" "$REPO/designs/decode_fused/gen_llm_prefill_attn.py" \
   --spec qwen3-0.6b --out "$OUT" --batch "$BATCH" --seq "$SEQ"

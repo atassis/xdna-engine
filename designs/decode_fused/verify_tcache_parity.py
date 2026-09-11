@@ -192,7 +192,7 @@ def main():
     ap.add_argument("--tr", required=True, help="build dir of the --coalesce-self-tr arm")
     ap.add_argument("--base", required=True, help="build dir of the baseline arm")
     ap.add_argument("--steps", type=int, default=64, help="tokens to advance (0 = the full width)")
-    ap.add_argument("--weights", default="/mnt/data/models/xdna-artifacts/whisper-small/"
+    ap.add_argument("--weights", default="/mnt/data/xdna/artifacts/whisper-small/"
                                          "whisper_decoder",
                     help="decoder weights, for the token-argmax report; skipped when absent")
     # The cache is seeded with num_preceding columns, so the first token lands at an ODD column
