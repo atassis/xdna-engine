@@ -229,6 +229,85 @@ class TestByteModel:
         assert abs(P.predicted_ms_delta(p) - delta_mb * P.MARGINAL_US_PER_MB / 1e3) < 1e-9
 
 
+class TestCensusPerSpec:
+    """The defect this fixes: gemma4-12b built and printed qwen3-0.6b's 1664.09 MB/token because
+    the census had no spec axis. CENSUS gives every function here a spec_name; qwen3-0.6b's
+    default must stay byte-identical to what it printed before CENSUS existed."""
+
+    def test_default_spec_name_is_qwen3(self):
+        assert P.DEFAULT_CENSUS_SPEC == "qwen3-0.6b"
+
+    def test_qwen3_token_mb_is_unchanged_by_the_spec_axis(self):
+        assert P.token_mb(plan()) == P.token_mb(plan(), "qwen3-0.6b")
+        assert abs(P.token_mb(plan())["total"] - P.CENSUS_TOKEN_MB) < 0.01
+
+    def test_qwen3_describe_is_byte_identical_to_the_pre_census_output(self):
+        """Reconstructs exactly what describe() returned before CENSUS existed, straight from
+        the module's own SITES/CENSUS_TOKEN_MB constants -- not a frozen string copy, so this
+        cannot drift out of sync with a legitimate qwen3 re-measurement."""
+        p = plan(mlp="int8a")
+        mb = P.token_mb(p)
+        lines = [f"precision plan (census {P.CENSUS_DATE}, window {P.CENSUS_WINDOW}, "
+                 f"{P.CENSUS_TOKEN_MB:.2f} MB/token bf16)"]
+        for key, site in sorted(P.SITES.items(), key=lambda kv: -kv[1].mb_per_token):
+            spec = p.get(key, P.BF16_SPEC)
+            lines.append(f"  {key:7} {str(spec):22} {site.mb_per_token:8.2f} -> "
+                         f"{mb[key]:8.2f} MB  ({100 * mb[key] / site.mb_per_token:5.1f}%)")
+        lines.append(f"  {'TOTAL':7} {'':22} {P.CENSUS_TOKEN_MB:8.2f} -> {mb['total']:8.2f} MB")
+        lines.append(f"  transport prediction: {P.predicted_ms_delta(p):+.2f} ms/token "
+                     "(byte term only; the dequant's core cost is not in this number)")
+        assert P.describe(p) == "\n".join(lines)
+
+    def test_gemma4_reproduces_its_own_census_at_the_measured_plan(self):
+        """The shipped gemma4-12b build quantized mlp/qkv/attn_o int8/g64
+        (scenarios/generate-gemma4-12b.toml); querying that exact plan must reproduce the
+        measured total, not re-shrink an already-quantized figure a second time."""
+        p = plan(mlp="int8a/g64", qkv="int8a/g64", attn_o="int8a/g64")
+        assert abs(P.token_mb(p, "gemma4-12b")["total"] - 17108.56) < 0.01
+
+    def test_gemma4_bf16_plan_prices_above_the_measured_int8_total(self):
+        """17108.56 is what the build measured with mlp/qkv/attn_o ALREADY at int8/g64 -- a
+        bf16-everywhere plan undoes that quantization and must cost strictly more, not
+        reproduce the same figure (the double-discount Census.baseline exists to prevent)."""
+        assert P.token_mb(plan(), "gemma4-12b")["total"] > 17108.56
+
+    def test_gemma4_census_sites_match_the_measured_ground_truth(self):
+        c = P.CENSUS["gemma4-12b"]
+        assert c.site_mb["mlp"] == 9046.42
+        assert c.site_mb["kv"] == 1280.74
+        assert c.site_mb["head"] == 2013.27
+        assert c.site_mb["qkv"] == 2859.94
+        assert c.site_mb["attn_o"] == 0.0
+
+    def test_every_census_entry_carries_its_provenance(self):
+        """A measured constant with no traceable source is the exact failure class the census
+        constants had before this fix -- CENSUS must not reintroduce it under a new name."""
+        for name, c in P.CENSUS.items():
+            assert c.method, name
+            assert c.date, name
+
+    def test_gemma4_describe_does_not_crash_on_the_unsplit_attn_o_site(self):
+        """attn_o's baseline is 0 (qkv carries the combined Wqkv+Wo figure) -- describe() must
+        not divide by it."""
+        out = P.describe(plan(), "gemma4-12b")
+        assert "attn_o" in out
+        assert "n/a" in out
+
+    def test_unknown_spec_is_refused_not_silently_priced_as_qwen3(self):
+        with pytest.raises(ValueError, match="no precision census"):
+            P.token_mb(plan(), "gemma3-270m")
+        with pytest.raises(ValueError, match="no precision census"):
+            P.predicted_ms_delta(plan(), "gemma3-270m")
+
+    def test_unknown_spec_describe_prints_unpriced_rather_than_a_borrowed_number(self):
+        out = P.describe(plan(), "gemma3-270m")
+        assert "no census" in out
+        assert "1664.09" not in out and "17108.56" not in out
+        # gen_llm_decode.py prints describe(...).splitlines()[1:] -- a one-line message here
+        # would be silently swallowed there, which is the exact failure this refuses.
+        assert len(out.splitlines()) >= 2
+
+
 class TestNaming:
     def test_two_plans_that_differ_do_not_share_an_artifact_name(self):
         names = {P.suffix(parse) for parse in (

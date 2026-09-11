@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Dict, Mapping, Optional, Tuple
 
 BF16 = "bf16"
@@ -357,6 +357,74 @@ QWEN3_06B = GraphContext(
     d_model=1024, ffn=3072, q_dim=2048, head_dim=128,
 )
 
+# Gemma-4-12B's SLIDING geometry (head_dim=256, q_dim=16*256=4096) -- used only to pick a
+# group-divisible K for site_k() below, never for check(): the fused arms in check()'s
+# GraphContext are decided per build from the real (mixed sliding/global) dims, in
+# gen_llm_decode.py. K-independence of the wire rate (test_the_rate_is_K_independent_for_the_
+# shipped_layout) is what makes one representative K safe to price with.
+GEMMA4_12B = GraphContext(
+    fused_layer=True, fuse_o=True, fused_qkv_gemv=True, fused_qkv_dp=True,
+    d_model=3840, ffn=15360, q_dim=4096, head_dim=256,
+)
+
+
+@dataclass(frozen=True)
+class Census:
+    """One spec's measured per-token byte census -- SITES' mb_per_token, generalized off one
+    model+build. `token_mb()`/`describe()` key off this instead of the qwen3-only constants.
+
+    `site_mb[key]` is the byte count MEASURED, at whatever format that site's weight actually
+    had in the censused build -- `baseline[key]`, defaulting to bf16 when a site is absent from
+    `baseline`. A census is a property of a FORMAT CONFIGURATION, not of the model: qwen3-0.6b's
+    build was all-bf16, so its `baseline` is empty and every site scales off 2 B/element; a
+    build that ships some sites pre-quantized (gemma4-12b's mlp/qkv/attn_o) must record what
+    format `site_mb` was measured at, or `token_mb()` would re-apply that site's own shrink on
+    top of itself for the one plan the census actually describes.
+    """
+    token_mb: float
+    window: int
+    date: str
+    method: str                                    # what measured this and how to refresh it
+    site_mb: Mapping[str, float]
+    baseline: Mapping[str, "Spec"] = field(default_factory=dict)
+
+
+# CENSUS is the fix for the defect this module shipped with: SITES/CENSUS_TOKEN_MB above are
+# QWEN3-0.6B's numbers with no spec axis, so gemma4-12b silently printed them too (10.3x off).
+# qwen3-0.6b's entry is DERIVED from those constants, not restated, so the two can never drift
+# against each other and the byte-identity gate ties to one source.
+CENSUS = {
+    "qwen3-0.6b": Census(
+        CENSUS_TOKEN_MB, CENSUS_WINDOW, CENSUS_DATE,
+        method="scripts/decode_ddr_bytes.py off the shipped rung-ladder build's own fused MLIR "
+               "(artifacts/qwen3-0.6b, generator 58c4db4, window rung 4096), all-bf16; "
+               "refreshed by scripts/precision_census.py --spec qwen3-0.6b --check",
+        site_mb={k: s.mb_per_token for k, s in SITES.items()}),
+    # MEASURED 2026-09-11, scripts/decode_ddr_bytes.py off the shipped gemma4-12b build's shim
+    # BDs (artifacts/gemma4-12b/decode_int8g64, 48 layers, S=2048; weights dumped by
+    # scripts/dump_llm_weights.py --quant int8 --quant-group 64 on gate/up/down/o/q/k/v_proj,
+    # per scenarios/generate-gemma4-12b.toml -- lm_head/embed are NOT in that --quant-leaves
+    # list, so head stayed bf16). qkv carries the combined Wqkv+Wo figure; the census has no
+    # per-site split between them, so attn_o prices at 0 MB regardless of its own dtype -- an
+    # unfused arm that quantizes attn_o independently of qkv/mlp shows no byte change here until
+    # a per-site gemma4 census is run. Refreshed by scripts/precision_census.py --spec
+    # gemma4-12b --check.
+    "gemma4-12b": Census(
+        17108.56, 2048, "2026-09-11",
+        method="scripts/decode_ddr_bytes.py, artifacts/gemma4-12b/decode_int8g64 "
+               "(scenarios/generate-gemma4-12b.toml)",
+        site_mb={"mlp": 9046.42, "kv": 1280.74, "head": 2013.27,
+                 "qkv": 2859.94, "attn_o": 0.0},
+        # int8a vs symmetric int8, and the exact scale_kind, are not guesses that matter here:
+        # wire_bytes_per_element depends only on dtype-family bit width and group size
+        # (_HEADER_BYTES, _PAYLOAD_BITS) -- scale_kind moves weight VALUES, not wire bytes. The
+        # kinds below just follow _AFFINE_OFFSET_BY_CLASS's own per-class convention.
+        baseline={"mlp": Spec("int8a", 64, "zero_grid"), "qkv": Spec("int8a", 64, "free_min"),
+                  "attn_o": Spec("int8a", 64, "zero_grid")}),
+}
+CENSUS_CTX = {"qwen3-0.6b": QWEN3_06B, "gemma4-12b": GEMMA4_12B}
+DEFAULT_CENSUS_SPEC = "qwen3-0.6b"
+
 
 def dedicated_channel_cost(ctx: GraphContext) -> Dict[str, int]:
     """What it costs to give the KV cache a dtype of its own.
@@ -462,12 +530,28 @@ def kv_addr_gran_elems(plan: Mapping[str, Spec]) -> int:
     return 4 // elem_bytes
 
 
-def token_mb(plan: Mapping[str, Spec]) -> Dict[str, float]:
-    """Projected MB/token per site under `plan`, against the census baseline."""
-    out = {key: site.mb_per_token
-           * wire_bytes_per_element(plan.get(key, BF16_SPEC), site_k(key, QWEN3_06B)[0]) / 2
-           for key, site in SITES.items()}
-    out["unsited"] = CENSUS_UNSITED_MB
+def token_mb(plan: Mapping[str, Spec],
+             spec_name: str = DEFAULT_CENSUS_SPEC) -> Dict[str, float]:
+    """Projected MB/token per site under `plan`, against `spec_name`'s measured census.
+
+    Raises for a spec CENSUS has no entry for -- printing another model's numbers under a wrong
+    name is the defect this refuses (gemma4-12b built and printed qwen3-0.6b's 1664.09
+    MB/token).
+    """
+    if spec_name not in CENSUS:
+        raise ValueError(f"no precision census for spec {spec_name!r}; have {sorted(CENSUS)}. "
+                          f"Run scripts/precision_census.py against a built {spec_name} MLIR "
+                          "and add the result to precision.py's CENSUS.")
+    census, ctx = CENSUS[spec_name], CENSUS_CTX[spec_name]
+    # Scaled relative to `baseline[key]` (default bf16), NOT unconditionally /2: a site whose
+    # census was measured already-quantized (Census's own docstring) must divide out ITS format,
+    # or requesting exactly that format back re-applies the shrink on top of itself.
+    out = {}
+    for key, site_mb in census.site_mb.items():
+        K = site_k(key, ctx)[0]
+        base_rate = wire_bytes_per_element(census.baseline.get(key, BF16_SPEC), K)
+        out[key] = site_mb * wire_bytes_per_element(plan.get(key, BF16_SPEC), K) / base_rate
+    out["unsited"] = round(census.token_mb - sum(census.site_mb.values()), 2)
     out["total"] = sum(out.values())
     return out
 
@@ -479,13 +563,14 @@ def token_mb(plan: Mapping[str, Spec]) -> Dict[str, float]:
 MARGINAL_US_PER_MB = 1e6 / 54.71e3
 
 
-def predicted_ms_delta(plan: Mapping[str, Spec]) -> float:
+def predicted_ms_delta(plan: Mapping[str, Spec], spec_name: str = DEFAULT_CENSUS_SPEC) -> float:
     """Predicted change in ms/token from the byte cut alone. Negative is faster.
 
     This is a TRANSPORT prediction and nothing else. It is blind to what the dequant costs on the
     core, which is the term that once made an int4 arm 11.7x slower than bf16 at fewer bytes.
     """
-    return (token_mb(plan)["total"] - CENSUS_TOKEN_MB) * MARGINAL_US_PER_MB / 1e3
+    return ((token_mb(plan, spec_name)["total"] - CENSUS[spec_name].token_mb)
+            * MARGINAL_US_PER_MB / 1e3)
 
 
 def packer_capability() -> Tuple[Tuple[str, ...], bool]:
@@ -511,16 +596,43 @@ def packer_capability() -> Tuple[Tuple[str, ...], bool]:
     return dtypes, takes_kind
 
 
-def describe(plan: Mapping[str, Spec]) -> str:
-    mb = token_mb(plan)
-    lines = [f"precision plan (census {CENSUS_DATE}, window {CENSUS_WINDOW}, "
-             f"{CENSUS_TOKEN_MB:.2f} MB/token bf16)"]
-    for key, site in sorted(SITES.items(), key=lambda kv: -kv[1].mb_per_token):
-        spec = plan.get(key, BF16_SPEC)
-        lines.append(f"  {key:7} {str(spec):22} {site.mb_per_token:8.2f} -> {mb[key]:8.2f} MB"
-                     f"  ({100 * mb[key] / site.mb_per_token:5.1f}%)")
-    lines.append(f"  {'TOTAL':7} {'':22} {CENSUS_TOKEN_MB:8.2f} -> {mb['total']:8.2f} MB")
-    lines.append(f"  transport prediction: {predicted_ms_delta(plan):+.2f} ms/token "
+def describe(plan: Mapping[str, Spec], spec_name: str = DEFAULT_CENSUS_SPEC) -> str:
+    """Human-readable per-site byte table for `plan` under `spec_name`'s census.
+
+    A spec CENSUS has no entry for prints an explicit "no census" line instead of refusing --
+    this is a build-log diagnostic, not a gate, so a model with no census yet (e.g. a spec
+    landed before its census is run) should still build; it just prints unpriced rather than a
+    borrowed number.
+    """
+    if spec_name not in CENSUS:
+        # Two lines, not one: gen_llm_decode.py prints describe()'s lines[1:] (it drops the
+        # header line below), so a one-line message here would be silently swallowed there --
+        # the exact silent-wrong-number failure mode this function exists to refuse.
+        return (f"precision plan: no census for spec {spec_name!r}\n"
+                f"  sizes UNPRICED -- have census for {sorted(CENSUS)}; run "
+                f"scripts/precision_census.py against a built {spec_name} MLIR and add the "
+                "result to precision.py's CENSUS")
+    census = CENSUS[spec_name]
+    mb = token_mb(plan, spec_name)
+    # qwen3-0.6b's header text is byte-identical to what this printed before CENSUS existed --
+    # every other spec's census was NOT measured all-bf16 (see CENSUS's gemma4-12b comment), so
+    # only qwen3-0.6b's header carries the "bf16" claim.
+    header = (f"precision plan (census {census.date}, window {census.window}, "
+              f"{census.token_mb:.2f} MB/token bf16)" if spec_name == DEFAULT_CENSUS_SPEC else
+              f"precision plan ({spec_name}, census {census.date}, window {census.window}, "
+              f"{census.token_mb:.2f} MB/token)")
+    lines = [header]
+    for key, site_mb in sorted(census.site_mb.items(), key=lambda kv: -kv[1]):
+        site_spec = plan.get(key, BF16_SPEC)
+        pct = f"{100 * mb[key] / site_mb:5.1f}%" if site_mb else "  n/a"
+        # "@format" only when the census's own baseline for this site is not bf16 -- qwen3-0.6b
+        # never sets one, so this is always "" there and the line stays byte-identical.
+        base = census.baseline.get(key, BF16_SPEC)
+        at = f" measured@{base}" if base.quantized else ""
+        lines.append(f"  {key:7} {str(site_spec):22} {site_mb:8.2f}{at} -> {mb[key]:8.2f} MB"
+                     f"  ({pct})")
+    lines.append(f"  {'TOTAL':7} {'':22} {census.token_mb:8.2f} -> {mb['total']:8.2f} MB")
+    lines.append(f"  transport prediction: {predicted_ms_delta(plan, spec_name):+.2f} ms/token "
                  f"(byte term only; the dequant's core cost is not in this number)")
     return "\n".join(lines)
 
@@ -533,19 +645,27 @@ def suffix(plan: Mapping[str, Spec]) -> str:
     return "_".join(parts)
 
 
-def resolved_context(**over) -> GraphContext:
-    """QWEN3_06B with the packer capability of whatever IRON is on this PYTHONPATH."""
+def resolved_context(spec_name: str = DEFAULT_CENSUS_SPEC, **over) -> GraphContext:
+    """`spec_name`'s CENSUS_CTX with the packer capability of whatever IRON is on this
+    PYTHONPATH. Falls back to QWEN3_06B's dims for a spec with no census-context entry."""
     dtypes, kind = packer_capability()
-    return replace(QWEN3_06B, packer_dtypes=dtypes, packer_takes_scale_kind=kind, **over)
+    base = CENSUS_CTX.get(spec_name, QWEN3_06B)
+    return replace(base, packer_dtypes=dtypes, packer_takes_scale_kind=kind, **over)
 
 
 def _main(argv):
+    argv = list(argv)
+    spec_name = DEFAULT_CENSUS_SPEC
+    for i, a in enumerate(argv):
+        if a.startswith("--spec="):
+            spec_name = argv.pop(i).split("=", 1)[1]
+            break
     if argv and argv[0] in ("--list", "-l"):
         print(f"{'preset':16} {'arm':10} {'MB/token':>9} {'ms':>7}  plan")
         for name, (raw, reach) in PRESETS.items():
             plan = parse_plan(json.dumps(raw))
-            print(f"{name:16} {reach:10} {token_mb(plan)['total']:9.1f} "
-                  f"{predicted_ms_delta(plan):+7.2f}  "
+            print(f"{name:16} {reach:10} {token_mb(plan, spec_name)['total']:9.1f} "
+                  f"{predicted_ms_delta(plan, spec_name):+7.2f}  "
                   f"{ {k: str(v) for k, v in plan.items() if v.quantized} or 'bf16'}")
         return 0
     if argv and argv[0] in PRESETS:
@@ -556,11 +676,11 @@ def _main(argv):
         plan, prov = plan_from_env()
     # The arm P003's own message recommends: FUSE_DECODE_LAYER=0 FUSE_QKV_DP=0 FUSE_QKV_GEMV=1.
     # Turning off only the layer leaves qkv_head_dp holding Wqkv, which has no axis either.
-    ctx = resolved_context(**({"fused_layer": False, "fuse_o": False, "fused_qkv_dp": False}
-                              if "--unfused" in argv else {}))
+    unfused = {"fused_layer": False, "fuse_o": False, "fused_qkv_dp": False}
+    ctx = resolved_context(spec_name, **(unfused if "--unfused" in argv else {}))
     print(f"[{prov}]  packer: dtypes={list(ctx.packer_dtypes)} "
           f"scale-selection={ctx.packer_takes_scale_kind}")
-    print(describe(plan))
+    print(describe(plan, spec_name))
     try:
         check(plan, ctx)
     except PrecisionRefusal as exc:

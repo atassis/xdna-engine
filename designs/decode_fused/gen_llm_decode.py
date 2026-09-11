@@ -1234,7 +1234,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         packer_dtypes=_pdtypes, packer_takes_scale_kind=_pkind)
     precision.check(PRECISION_PLAN, precision_ctx)
     print(f"[gen] precision [{PRECISION_PROV}]")
-    for _line in precision.describe(PRECISION_PLAN).splitlines()[1:]:
+    for _line in precision.describe(PRECISION_PLAN, sp.name).splitlines()[1:]:
         print(f"[gen] {_line}")
 
     # Wqkv's own dtype axis. The concatenated [Wq|Wk|Wv] GEMV has its own weight ObjectFifo, so
@@ -2339,8 +2339,11 @@ def main():
         "weight_quant": {
             "plan": {k: str(v) for k, v in sorted(PRECISION_PLAN.items())},
             "plan_source": PRECISION_PROV,
-            "projected_mb_per_token": round(
-                precision.token_mb(PRECISION_PLAN)["total"], 2),
+            # None, not another spec's number, when precision.py carries no census for sp.name
+            # yet -- see precision.py's CENSUS and the gemma4-12b defect it fixes.
+            "projected_mb_per_token": (
+                round(precision.token_mb(PRECISION_PLAN, sp.name)["total"], 2)
+                if sp.name in precision.CENSUS else None),
             "mlp_dtype": _spec("mlp").dtype, "mlp_group_size": _spec("mlp").group_size or 128,
             "attn_dtype": _spec("attn_o").dtype,
             "attn_group_size": _spec("attn_o").group_size or 128,

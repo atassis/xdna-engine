@@ -6,12 +6,15 @@
 priced before anything is built. A constant nobody can refresh is how a figure survives past the
 graph it described, so this is the refresh, and `--check` is the staleness detector:
 
-  python scripts/precision_census.py <fused.mlir>            # print the table
-  python scripts/precision_census.py <fused.mlir> --check    # exit 1 if the constants drifted
+  python scripts/precision_census.py <fused.mlir> --spec qwen3-0.6b          # print the table
+  python scripts/precision_census.py <fused.mlir> --spec qwen3-0.6b --check  # exit 1 on drift
 
 Reads the same shim BDs scripts/decode_ddr_bytes.py reads, and attributes them to SITES by the
 decode layer's argument ORDER -- the list decode_layer_dp/op.py::get_arg_spec declares, which is
-that order's single owner.
+that order's single owner (shared across specs; only the byte counts it multiplies are
+per-spec). `--spec` names which of precision.py's CENSUS entries the MLIR is checked against --
+a wrong pick here recreates exactly the defect this tool exists to catch, so it has no silent
+default.
 
 ONE RUNG ONLY. A rung-ladder build carries several decode_layer_dp designs, one per attention
 window, and exactly one runs per token; summing them prices a token nobody dispatches. The widest
@@ -74,7 +77,14 @@ def main():
     ap.add_argument("--window", type=int, default=None,
                     help="pick a rung by its S; default is the widest")
     ap.add_argument("--tol", type=float, default=0.5, help="MB/token tolerance for --check")
+    ap.add_argument("--spec", default="qwen3-0.6b",
+                    help="which precision.py CENSUS entry to compare the MLIR against")
     a = ap.parse_args()
+
+    if a.spec not in P.CENSUS:
+        sys.exit(f"no census for spec {a.spec!r} in precision.py; have {sorted(P.CENSUS)}. "
+                 "Add it to CENSUS before checking this spec's build.")
+    census = P.CENSUS[a.spec]
 
     src = open(a.mlir).read()
     devs = device_bodies(src)
@@ -122,27 +132,28 @@ def main():
         site_mb["unsited"] += (sum(pa.values()) - bb) / 1e6
 
     total = sum(site_mb.values())
-    print(f"{os.path.basename(a.mlir)}\n  rung {chosen}\n  {n_layers} layers\n")
+    print(f"{os.path.basename(a.mlir)}\n  spec {a.spec}\n  rung {chosen}\n"
+          f"  {n_layers} layers\n")
     print(f"  {'site':8} {'MB/token':>9} {'share':>7}   {'recorded':>9}  {'delta':>8}")
     drift = []
-    for key in sorted(P.SITES, key=lambda k: -site_mb[k]):
-        got, rec = site_mb[key], P.SITES[key].mb_per_token
+    for key in sorted(census.site_mb, key=lambda k: -site_mb[k]):
+        got, rec = site_mb[key], census.site_mb[key]
         print(f"  {key:8} {got:9.2f} {100 * got / total:6.1f}%   {rec:9.2f}  {got - rec:+8.2f}")
         if abs(got - rec) > a.tol:
             drift.append((key, rec, got))
     print(f"  {'unsited':8} {site_mb['unsited']:9.2f}")
-    print(f"  {'TOTAL':8} {total:9.2f}            {P.CENSUS_TOKEN_MB:9.2f}  "
-          f"{total - P.CENSUS_TOKEN_MB:+8.2f}")
+    print(f"  {'TOTAL':8} {total:9.2f}            {census.token_mb:9.2f}  "
+          f"{total - census.token_mb:+8.2f}")
 
     if a.check:
-        if abs(total - P.CENSUS_TOKEN_MB) > a.tol:
-            drift.append(("TOTAL", P.CENSUS_TOKEN_MB, total))
+        if abs(total - census.token_mb) > a.tol:
+            drift.append(("TOTAL", census.token_mb, total))
         if drift:
-            print("\nDRIFT -- precision.py's census no longer describes this build:")
+            print(f"\nDRIFT -- precision.py's {a.spec} census no longer describes this build:")
             for key, rec, got in drift:
                 print(f"  {key}: recorded {rec:.2f}, measured {got:.2f}")
-            print("Update SITES/CENSUS_TOKEN_MB and CENSUS_DATE, and re-price anything ranked "
-                  "off the old table.")
+            print("Update CENSUS[spec] and its date, and re-price anything ranked off the old "
+                  "table.")
             return 1
         print("\ncheck: the recorded census describes this build")
     return 0

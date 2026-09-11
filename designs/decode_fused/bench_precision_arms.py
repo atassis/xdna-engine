@@ -88,7 +88,7 @@ def main():
         t0 = time.perf_counter()
         sp, fused, weights, md = build_graph(a.spec, a.weights, a.layers, a.max_seq,
                                              precision_plan=plan)
-        mb = P.token_mb(plan)["total"]
+        mb = P.token_mb(plan, a.spec)["total"] if a.spec in P.CENSUS else float("nan")
         print(f"[prec-arms] built {tag} in {time.perf_counter() - t0:.1f}s "
               f"({md['NL']} layers, {mb:.1f} MB/token projected)", flush=True)
         c = fused.get_callable()
