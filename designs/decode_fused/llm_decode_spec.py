@@ -521,11 +521,13 @@ class LlmSpec:
         return None
 
     def mlp_dp_reason(self) -> str | None:
-        """Why SwiGLUMLPDataParallel does not cover this spec, or None when it does."""
-        if self.sandwich_norms:
-            return "the fused block has no sandwich norms (this spec normalises the FFN output)"
-        if self.act != "silu":
-            return f"the fused block is SwiGLU; this spec's activation is {self.act!r}"
+        """Why SwiGLUMLPDataParallel does not cover this spec, or None when it does.
+
+        Both prior refusals (sandwich norms, non-SiLU activation) are covered by the operator's
+        `post_norm`/`act` parameters (T2.1, iron/operators/swiglu_mlp_dp) -- gen_llm_decode.py
+        passes `act=self.act, post_norm=self.sandwich_norms` through at every construction site.
+        No other spec-shape gap is known, so this always returns None.
+        """
         return None
 
     def has_v_proj(self, layer: int) -> bool:

@@ -1536,6 +1536,11 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                                           QD=QD if fuse_o else None, fuse_o=fuse_o,
                                           context=ctx, weight_depth=WEIGHT_DEPTH,
                                           tile_rows_gu=MLP_TILE_ROWS,
+                                          # T2.1, same IRON-vintage discipline as decode_layer_dp's
+                                          # own act/post_norm kwargs below: new fields, omitted at
+                                          # the byte-identical default.
+                                          **({"act": sp.act} if sp.act != "silu" else {}),
+                                          **({"post_norm": True} if sp.sandwich_norms else {}),
                                           **mlp_quant_kw)
     # The whole decoder layer (attention + MLP) as ONE fused device -- see FUSE_DECODE_LAYER above.
     op_decode_layer = None
@@ -1569,6 +1574,11 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                 **({"split_gh": SPLIT_GH_DRAIN} if SPLIT_GH_DRAIN != 1 else {}),
                 **({"attn_split": ATTN_SPLIT} if ATTN_SPLIT else {}),
                 **({"window_parameter": "attn_window"} if DYNAMIC_WINDOW else {}),
+                # Same discipline again (T2.1): `act`/`post_norm` are new fields on
+                # decode_layer_dp, so an unknown kwarg is a TypeError against any IRON that
+                # predates them -- omitted entirely at the byte-identical default.
+                **({"act": sp.act} if sp.act != "silu" else {}),
+                **({"post_norm": True} if sp.sandwich_norms else {}),
                 # Same discipline again. The MLP half's four weights (Wo, Wg, Wu, Wd) share one
                 # fifo and one format, which P002 has already enforced.
                 **_quant_kw("mlp"))
@@ -1884,9 +1894,17 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
             bufsz[p + "kc"] = kv_layout.total_elems * 2
             bufsz[p + "vc"] = kv_layout.total_elems * 2
             bufsz[p + "cx"] = QD * 2
+            if sp.sandwich_norms:
+                # decode_layer_dp's MLP half is always fuse_o=True, so post_norms packs both
+                # gains ([pa | pff], 2*D -- see swiglu_mlp_dp/design.py's POST_NORMS_ty). Arg
+                # count 15 -> 16 exactly here, matching op.py's get_arg_spec ordering.
+                weights[p + "post_norms"] = np.concatenate(
+                    [weights.pop(p + "n_pa"), weights.pop(p + "n_pff")])
             rl.append((op_decode_layer, cur, p + "norms", p + "Wqkv", ang, p + "kc", p + "vc",
                        p + "cx", p + "n_pf", p + "Wo", p + "Wg", p + "Wu", p + "Wd",
-                       "mlp_gh", "mlp_a_scratch", nxt))
+                       "mlp_gh", "mlp_a_scratch",
+                       *([p + "post_norms"] if sp.sandwich_norms else []),
+                       nxt))
         else:
             qk = proj = rope = vnorm = []
             if sp.qk_norm and g.op_qkv_dp is None:
@@ -1945,7 +1963,13 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                 (g.op_ctx, p + ("vc" if g.uses_tmv_ctx else "vt"), p + "sw", p + "cx"),
                 *([] if fuse_o else o_runlist(p, g)),
             ]
-            if sp.sandwich_norms:
+            # `a`'s own pre-residual sandwich norm: only when NOTHING downstream computes `a`
+            # on-chip. fuse_o's op_mlp_dp does (post_norm covers it internally, see below); the
+            # unfused arm and the non-fuse_o op_mlp_dp arm both still take `a` as an external
+            # input and need it normalised here first (op_mlp_dp's design.py docstring: fuse_o is
+            # the only arm that computes `a` ON-CHIP, so it is the only one that must normalise it
+            # itself).
+            if sp.sandwich_norms and not fuse_o:
                 rl.append((op_norm, p + "a", p + "n_pa", p + "a"))
             if op_mlp_dp is not None:
                 # cur + a -> x1 -> norm -> gate/up -> silu -> mul -> down -> +x1, all inside one design.
@@ -1953,12 +1977,21 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                 # shared across layers because the sequence runs them one at a time. FUSE_MLP_O folds
                 # `a = Wo @ cx` in too: `cx`/`Wo` replace `a` as the design's own inputs, and
                 # `mlp_a_scratch` is a's own all-gather round-trip buffer, the same idiom as mlp_gh's.
+                if sp.sandwich_norms:
+                    # post_norms packs [pa | pff] at 2*D under fuse_o (both gains computed
+                    # on-chip); [pff] alone at D otherwise ('a' arrived pre-normalised above, only
+                    # the post-FFN gain rides the on-chip path -- see design.py's POST_NORMS_ty).
+                    weights[p + "post_norms"] = (
+                        np.concatenate([weights.pop(p + "n_pa"), weights.pop(p + "n_pff")])
+                        if fuse_o else weights.pop(p + "n_pff"))
                 if fuse_o:
                     rl.append((op_mlp_dp, cur, p + "cx", p + "n_pf", p + "Wo", p + "Wg", p + "Wu",
-                               p + "Wd", "mlp_gh", "mlp_a_scratch", nxt))
+                               p + "Wd", "mlp_gh", "mlp_a_scratch",
+                               *([p + "post_norms"] if sp.sandwich_norms else []), nxt))
                 else:
                     rl.append((op_mlp_dp, cur, p + "a", p + "n_pf", p + "Wg", p + "Wu", p + "Wd",
-                               "mlp_gh", nxt))
+                               "mlp_gh",
+                               *([p + "post_norms"] if sp.sandwich_norms else []), nxt))
             else:
                 rl += [
                     (op_add, cur, p + "a", p + "x1"),
@@ -1969,7 +2002,9 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                     (op_mul_ffn, p + "g", p + "u", p + "gh"),
                     *down_runlist(p),
                 ]
-            if sp.sandwich_norms:
+            # The post-FFN `d` norm: only the fully unfused arm still needs it here -- op_mlp_dp
+            # (either fuse_o arm) already folded it into post_norms above.
+            if sp.sandwich_norms and op_mlp_dp is None:
                 rl.append((op_norm, p + "d", p + "n_pff", p + "d"))
             if op_mlp_dp is None:
                 rl.append((op_add, p + "x1", p + "d", nxt))
