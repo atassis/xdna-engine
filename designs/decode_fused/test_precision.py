@@ -15,7 +15,8 @@ import pytest
 import precision as P
 
 FULL = replace(P.QWEN3_06B, packer_dtypes=P.DTYPES, packer_takes_scale_kind=True)
-UNFUSED = replace(FULL, fused_layer=False, fuse_o=False)
+# Every fused arm off: Wqkv lands on a plain GEMV, which is the one carrier with the axis.
+UNFUSED = replace(FULL, fused_layer=False, fuse_o=False, fused_qkv_dp=False)
 
 
 def plan(**kw):
@@ -86,7 +87,7 @@ class TestOneFifoOneDtype:
         refusal("P002", P.check, plan(mlp="int8a", attn_o="bf16"), FULL)
 
     def test_wo_is_free_when_it_has_its_own_channel(self):
-        P.check(plan(mlp="int8a", attn_o="bf16"), replace(UNFUSED, fused_qkv_gemv=True))
+        P.check(plan(mlp="int8a", attn_o="bf16"), UNFUSED)
 
 
 class TestDeclaringOperator:
@@ -94,8 +95,15 @@ class TestDeclaringOperator:
         exc = refusal("P003", P.check, plan(qkv="int8a", kv="int8a"), FULL)
         assert "attn_block_dp" in str(exc)
 
-    def test_qkv_is_reachable_on_the_unfused_arm(self):
+    def test_qkv_is_reachable_only_on_a_plain_gemv(self):
         P.check(plan(qkv="int8a"), UNFUSED)
+
+    def test_qkv_head_dp_has_no_axis_either(self):
+        """The carrier that is neither the fused layer nor a plain GEMV. Missing it built an
+        artifact whose Wqkv buffer was packed to 4325376 B against a declared 8388608."""
+        exc = refusal("P003", P.check, plan(qkv="int8a"),
+                      replace(UNFUSED, fused_qkv_dp=True))
+        assert "qkv_head_dp" in str(exc)
 
     def test_split_qkv_gemvs_cannot_take_the_axis(self):
         refusal("P003", P.check, plan(qkv="int8a"), replace(UNFUSED, fused_qkv_gemv=False))

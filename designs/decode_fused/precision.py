@@ -298,6 +298,7 @@ class GraphContext:
     fused_layer: bool            # decode_layer_dp carries the layer
     fuse_o: bool                 # Wo rides swiglu_mlp_dp's weight fifo
     fused_qkv_gemv: bool         # one concatenated Wqkv GEMV
+    fused_qkv_dp: bool           # qkv_head_dp carries Wqkv, norms, RoPE and the KV append
     d_model: int
     ffn: int
     q_dim: int
@@ -324,7 +325,7 @@ def site_k(site_key: str, ctx: GraphContext) -> Tuple[int, ...]:
 
 
 QWEN3_06B = GraphContext(
-    fused_layer=True, fuse_o=True, fused_qkv_gemv=True,
+    fused_layer=True, fuse_o=True, fused_qkv_gemv=True, fused_qkv_dp=True,
     d_model=1024, ffn=3072, q_dim=2048, head_dim=128,
 )
 
@@ -392,19 +393,6 @@ def check(plan: Mapping[str, Spec], ctx: GraphContext) -> None:
                         f"against margins of {c['in_margin']} / {c['out_margin']} -- over by "
                         f"{c['in_over']} / {c['out_over']} of {ctx.shim_limit} each")
 
-    # P003 -- a buffer's declaring operator must be able to size it in packed bytes.
-    if ctx.fused_layer:
-        if get("qkv").quantized or get("kv").quantized:
-            raise PrecisionRefusal(
-                "P003", f"the fused layer's attention half declares Wqkv/kc/vc "
-                        f"(qkv={get('qkv')} kv={get('kv')}) and attn_block_dp has no weight_dtype "
-                        "axis, so the buffers would be sized in bf16 elements against packed "
-                        "bytes. Needs the axis on attn_block_dp, or the unfused arm")
-    elif ctx.fused_qkv_gemv is False and get("qkv").quantized:
-        raise PrecisionRefusal(
-            "P003", f"qkv={get('qkv')} with FUSE_QKV_GEMV=0 splits Wqkv across three GEMVs whose "
-                    "weights are packed separately; set FUSE_QKV_GEMV=1 or leave qkv at bf16")
-
     # P006 -- one scale per row, and for the cache a row is one cached position.
     if get("kv").quantized and _PAYLOAD_BITS[get("kv").dtype] < 8:
         raise PrecisionRefusal(
@@ -412,6 +400,24 @@ def check(plan: Mapping[str, Spec], ctx: GraphContext) -> None:
                     "POSITION, so this is per-token scaling. Published practice wants "
                     "per-channel for K, whose outliers are channel-consistent; per-token is "
                     "usually acceptable at 8 bits and is not at 4")
+
+    # P003 -- the operator that DECLARES a buffer must be able to size it in packed bytes.
+    # Named per carrier, because "which operator holds Wqkv" is four different answers depending
+    # on the fused arms and only one of them has the axis.
+    if get("qkv").quantized or get("kv").quantized:
+        carrier = ("attn_block_dp (inside the fused layer)" if ctx.fused_layer else
+                   "qkv_head_dp" if ctx.fused_qkv_dp else
+                   None if ctx.fused_qkv_gemv else
+                   "three separate GEMVs over one concatenated Wqkv blob")
+        if get("kv").quantized and carrier is None:
+            carrier = "whichever operator reads kc/vc"
+        if carrier is not None:
+            raise PrecisionRefusal(
+                "P003", f"qkv={get('qkv')} kv={get('kv')}: {carrier} declares these buffers and "
+                        "has no weight_dtype axis, so they would be sized in bf16 elements "
+                        "against packed bytes -- an artifact that builds clean and fails its "
+                        "own load-time size check. Reach the axis with FUSE_DECODE_LAYER=0 "
+                        "FUSE_QKV_DP=0 FUSE_QKV_GEMV=1, which puts Wqkv on a plain GEMV")
 
 
 def kv_addr_gran_elems(plan: Mapping[str, Spec]) -> int:

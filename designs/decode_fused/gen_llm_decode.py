@@ -126,6 +126,17 @@ def _quant_kw(site):
                                               group_size=spec.group_size)
 
 
+_SITE_OF_SUFFIX = {"Wqkv": "qkv", "Wq": "qkv", "Wk": "qkv", "Wv": "qkv", "Wo": "attn_o",
+                   "Wg": "mlp", "Wu": "mlp", "Wd": "mlp", "W_head": "head",
+                   "kc": "kv", "vc": "kv"}
+
+
+def _site_of(buffer_name):
+    """Which census site a weight buffer belongs to, by its `L<n>_<key>` suffix."""
+    return _SITE_OF_SUFFIX.get(buffer_name.rsplit("_", 1)[-1]
+                               if buffer_name.startswith("L") else buffer_name)
+
+
 def _pack(w, site):
     """Host-side pack of one weight under its site's spec, into the packer's wire format."""
     spec = _spec(site)
@@ -835,6 +846,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
     precision_ctx = precision.GraphContext(
         fused_layer=decode_layer_why is None and FUSE_DECODE_LAYER,
         fuse_o=fuse_o, fused_qkv_gemv=bool(FUSE_QKV_GEMV),
+        fused_qkv_dp=qkv_dp_why is None,
         d_model=D, ffn=FF, q_dim=QD, head_dim=HD, attn_cols=COLS,
         packer_dtypes=_pdtypes, packer_takes_scale_kind=_pkind)
     precision.check(PRECISION_PLAN, precision_ctx)
@@ -1390,7 +1402,19 @@ def main():
 
     bdir = os.path.join(a.out, "buffers")
     for n_, arr in weights.items():
-        open(os.path.join(bdir, f"{n_}.bin"), "wb").write(weight_bytes(arr))
+        b = weight_bytes(arr)
+        # The seam a precision plan crosses: the HOST packs a weight and an OPERATOR declares the
+        # buffer it lands in, and neither side can see the other's units. Each is correct alone;
+        # a disagreement exists only between them, which is why it survives every type check and
+        # surfaces as a load-time size error against an artifact that built clean.
+        declared = lay[n_][2]          # (buf_type, offset_bytes, length_bytes)
+        if len(b) != declared:
+            raise SystemExit(
+                f"[gen] {n_}: packed {len(b)} B, the graph declares {declared} B. The precision "
+                f"plan ({PRECISION_PLAN.get(_site_of(n_), precision.BF16_SPEC)} at site "
+                f"{_site_of(n_)!r}) is not the format the operator holding this buffer was built "
+                "for -- see precision.py P003.")
+        open(os.path.join(bdir, f"{n_}.bin"), "wb").write(b)
     if embed_blob != "W_head":
         # Host-only, deliberately not in `wnames`: see the tied-embedding note at its build site.
         open(os.path.join(bdir, f"{embed_blob}.bin"), "wb").write(weight_bytes(host_embed))
