@@ -181,7 +181,10 @@ def main():
                          "tasks, configures and designs; 'g<G>' = SPLIT_QKNORM, which deals the "
                          "qk-norm runs to two IDENTICAL RMSNorm designs in contiguous groups of G "
                          "heads and so moves ONLY the configure count -- the order-only control "
-                         "D009's rate needs, at constant runs, bytes, designs and output.")
+                         "D009's rate needs, at constant runs, bytes, designs and output; 'h0' = "
+                         "SHARE_DESIGNS=0, which un-pairs gate/up and the two KV StridedCopys and "
+                         "so adds configures of the EXPENSIVE kind. Paired with g<G>'s cheap ones "
+                         "it says whether a configure costs a flat amount or tracks its blob.")
     ap.add_argument("--max-seq", type=int, default=512)
     ap.add_argument("--pos", type=int, required=True)
     ap.add_argument("--reps", type=int, default=25)
@@ -212,8 +215,8 @@ def main():
     arms = []
     census = {}
     for spec in a.arms:
-        m = re.fullmatch(r"(\d+)(f?)(?:c(\d+))?(?:q(\w+?))?(?:d(\d+))?(?:s(\d+))?(?:g(\d+))?",
-                         spec)
+        m = re.fullmatch(r"(\d+)(f?)(?:c(\d+))?(?:q(\w+?))?(?:d(\d+))?(?:s(\d+))?(?:g(\d+))?"
+                         r"(?:h(\d))?", spec)
         if not m:
             raise SystemExit(f"bad arm spec {spec!r}")
         L = int(m.group(1))
@@ -223,6 +226,7 @@ def main():
         wdepth = int(m.group(5)) if m.group(5) else 2
         sgh = int(m.group(6)) if m.group(6) else 1
         sqk = int(m.group(7)) if m.group(7) else 0
+        share = m.group(8) if m.group(8) else "1"
         # These are captured at gen_llm_decode IMPORT time, so flipping os.environ here would be
         # silently ignored -- set the module globals the generator actually reads.
         G.FUSE_MLP_O = fmo
@@ -231,13 +235,17 @@ def main():
         G.WEIGHT_DEPTH = wdepth
         G.SPLIT_GH_DRAIN = sgh
         G.SPLIT_QKNORM = sqk
+        # build_graph reads SHARE_DESIGNS from the environment at call time, not at import, so this
+        # is the env and not a module global like the rest.
+        os.environ["SHARE_DESIGNS"] = share
         t0 = time.perf_counter()
         sp, fused, weights, md = build_graph(a.spec, a.weights, L, a.max_seq)
         # A fit's CONTROL variables need the same evidence as its result: print every quantity
         # that differs between arms BEFORE fitting, not just the one being varied.
         census[spec] = census_from_mlir(fused, md, sgh=sgh)
         census[spec].update(fuse_mlp_o=fmo, mlp_dp_cols=cols, quant_mlp=qdt,
-                            weight_depth=wdepth, split_gh=sgh, split_qknorm=sqk)
+                            weight_depth=wdepth, split_gh=sgh, split_qknorm=sqk,
+                            share_designs=share)
         print(f"[layer-arms] built {spec} in {time.perf_counter()-t0:.1f}s  census={census[spec]}",
               flush=True)
         if a.build_only:
@@ -257,7 +265,7 @@ def main():
         del weights
         scale = np.sqrt(sp.d_model) if sp.embed_scale == "sqrt_d_model" else 1.0
         arms.append(dict(spec=spec, L=L, fmo=fmo, cols=cols, qdt=qdt, wdepth=wdepth, sgh=sgh,
-                         sqk=sqk,
+                         sqk=sqk, share=share,
                          sp=sp, c=c,
                          params=params,
                          # The runtime attention window, when the arm built one. An arm whose core
@@ -327,6 +335,7 @@ def main():
         report[sp_] = {"reps": xs, "median_ms": med, "spread_pct": spread, "L": arm["L"],
                        "fuse_mlp_o": arm["fmo"], "cols": arm["cols"], "qdt": arm["qdt"],
                        "wdepth": arm["wdepth"], "sgh": arm["sgh"], "sqk": arm["sqk"],
+                       "share": arm["share"],
                        "mb": census[sp_].get("mb"), "min_ms": min(xs), "census": census[sp_]}
         print(f"{sp_:>10} {arm['L']:4} {census[sp_].get('configures', 0):5} "
               f"{census[sp_].get('mb', float('nan')):9.2f} {len(xs):4} "

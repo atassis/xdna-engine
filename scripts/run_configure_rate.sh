@@ -22,10 +22,18 @@ WEIGHTS="${WEIGHTS:-/mnt/data/xdna/artifacts/$SPEC/weights_int8g64}"
 OUT="${CONFIGURE_RATE_OUT:-/mnt/data/xdna/scratch/gemma4/configure-rate}"
 WORK="${CONFIGURE_RATE_WORK:-/mnt/data/xdna/build/gemma4-configure-rate}"
 ARMS=(${CONFIGURE_RATE_ARMS:-g0 g4 g2 g1})
+# --warm takes LAYERS as its only positional. Sharing one positional list with the timing form
+# silently built L=6 for `--warm 12`, and a census of the wrong depth looks exactly like a census
+# of the right one.
 WARM_ONLY=0
-[ "${1:-}" = "--warm" ] && { WARM_ONLY=1; shift; }
-SESSIONS="${1:-3}"
-LAYERS="${2:-6}"
+if [ "${1:-}" = "--warm" ]; then
+  WARM_ONLY=1; shift
+  SESSIONS=0; LAYERS="${1:-6}"
+else
+  SESSIONS="${1:-3}"; LAYERS="${2:-6}"
+fi
+case "$LAYERS" in (*[!0-9]*|"") echo "LAYERS must be a positive integer, got '$LAYERS'" >&2; exit 2 ;; esac
+[ $((LAYERS % 6)) -eq 0 ] || echo "[warn] LAYERS=$LAYERS is not a multiple of 6; the 5-sliding-1-global pattern is broken and the per-layer configure count will not match the shipped graph's" >&2
 MAXSEQ="${MAXSEQ:-512}"
 POS="${POS:-7}"
 REPS="${REPS:-25}"
