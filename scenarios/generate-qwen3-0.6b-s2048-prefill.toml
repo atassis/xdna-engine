@@ -1,0 +1,35 @@
+[scenario]
+kind = "generate"
+# RENAMED 2026-09-11, not retired. This is the only configuration carrying a BATCHED PREFILL
+# artifact, and it is an S=2048 build -- prefill/meta.json says S=2048 M=256, so it cannot pair
+# with the 4096-window decode that now serves `qwen3-0.6b`. Keeping it named and buildable is what
+# makes the prefill gap visible instead of silently lost: measured 2026-09-11, per-token priming on
+# the 4096 rail costs ~22 ms per PROMPT token, linear (65 tok -> 1.46 s, 260 -> 5.69 s, 780 ->
+# 17.08 s). Closing that means building an S=4096 prefill to pair with the rung ladder.
+name = "qwen3-0.6b-s2048-prefill"
+
+# Root-relative like every other scenario here: paths resolve against XDNA_ENGINE_ROOT under the
+# service and against the repo in-tree, so one file works in both. The first version of this
+# scenario named absolute paths -- first into a session scratchpad under /tmp, then into this
+# developer's home -- and neither survives being installed anywhere else.
+#
+#   decode     scripts/build_llm_decode.sh qwen3-0.6b   (fused 28-layer ELF + meta.json, ~3.4 min)
+#   weights    scripts/dump_llm_weights.py --spec qwen3-0.6b --out artifacts/qwen3-0.6b/weights
+#   tokenizer  the HF snapshot dir: tokenizer.json, config.json, generation_config.json
+[artifacts]
+decode = "artifacts/qwen3-0.6b/decode"
+# Batched prefill: primes the KV cache dims.M positions per dispatch instead of one per token.
+# Optional -- drop this line and the rail falls back to per-token priming with no other change.
+# The pair is checked at load (dims, RoPE base, embed scale, S % M, and every shared scratch
+# offset), so a prefill built against a different decode build is refused rather than mis-bound.
+#   prefill  scripts/build_prefill.sh 28 256 2048
+prefill = "artifacts/qwen3-0.6b/prefill"
+weights = "artifacts/qwen3-0.6b/weights"
+tokenizer_dir = "artifacts/qwen3-0.6b/tokenizer"
+
+# Per-model completion budget, applied when a request omits `max_tokens`; an explicit request value
+# still wins, in both directions. 256 (the engine default, OpenAI's number) is the wrong default for
+# a reasoning model: Qwen3 opens a `<think>` block and at 256 the whole budget goes to reasoning with
+# no answer ever emitted -- see 8398acb, which fixed the template half of that same problem.
+[generation]
+max_tokens = 1024

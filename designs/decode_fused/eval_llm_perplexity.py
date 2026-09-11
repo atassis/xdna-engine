@@ -34,6 +34,7 @@ import ml_dtypes
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import newstack_compat  # noqa: F401,E402
+from verify_llm_decode import window_len  # noqa: E402 -- one owner for the rounding
 from gen_llm_decode import (build_graph, report_artifact_freshness,  # noqa: E402
                             load_weight_buffer, isolate_build_dir)
 from qwen_bpe import QwenBPE  # noqa: E402
@@ -94,6 +95,8 @@ def main():
 
     sp, fused, weights, md = build_graph(a.spec, a.weights, a.layers, a.max_seq)
     S, HD, D, VOCAB = md["S"], sp.head_dim, sp.d_model, sp.vocab
+    # None unless build_graph actually built decode_layer_dp with window_parameter="attn_window".
+    window_granule = md.get("window_granule")
     kv_layout = KVLayout(Hkv=sp.n_kv_heads, S=S, HD=HD, T=md["T"])
     # One KV slot per fed token, and the last fed token's logits predict nothing we score.
     n = min(a.max_tokens, len(ids) - 1, S - 1)
@@ -125,6 +128,13 @@ def main():
             _buf[:] = rope_row(pos, HD, sp.rope_theta_global).reshape(-1)
         params.write("kv_off", int(kv_layout.kv_off(pos)))
         params.write("sm_mask", int(pos + 1))
+        if window_granule is not None:
+            # A dynamic-window build reads its attended length from this parameter every dispatch.
+            # Omitting it does NOT fail -- the core reads whatever the scratchpad happens to hold,
+            # attends a garbage window, and returns NaN logits. That is silent for the whole run:
+            # this harness reported `running ppl nan` for 20000 positions over 34 minutes before
+            # anyone looked at why. Clamped to S exactly as verify_llm_decode.py does.
+            params.write("attn_window", min(window_len(pos, window_granule), S))
         params.sync()
         c()
         lg = np.asarray(out.data[:VOCAB], dtype=np.float32)
