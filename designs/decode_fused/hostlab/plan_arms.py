@@ -44,7 +44,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import precision as P                                            # noqa: E402
 import wq_formats as F                                           # noqa: E402
-from wq_eval import TARGETS, load_model, baseline_bf16, paired, run, tokenize   # noqa: E402
+from wq_eval import TARGETS, load_model, baseline_bf16, paired, run, tokenize, HF_REPO  # noqa: E402
 
 QLAB = os.environ.get("QLAB_WORK", "/mnt/data/xdna/qlab")
 
@@ -86,9 +86,17 @@ def coverage(plan):
     return out
 
 
-def uncovered_mb(plan):
-    """MB/token the verdict does NOT account for."""
-    return sum(P.SITES[k].mb_per_token for k, (ok, _) in coverage(plan).items() if not ok)
+def site_mb_for(spec_name):
+    """Per-site MB/token for spec_name -- CENSUS when this model has one (every non-qwen3 spec
+    needs it; P.SITES' own mb_per_token is qwen3-0.6b's number under a spec-independent name)."""
+    return (P.CENSUS[spec_name].site_mb if spec_name in P.CENSUS
+            else {k: s.mb_per_token for k, s in P.SITES.items()})
+
+
+def uncovered_mb(plan, spec_name=P.DEFAULT_CENSUS_SPEC):
+    """MB/token the verdict does NOT account for, against spec_name's measured census."""
+    site_mb = site_mb_for(spec_name)
+    return sum(site_mb.get(k, 0.0) for k, (ok, _) in coverage(plan).items() if not ok)
 
 
 def sensitivity(d_nats, power=0.80, alpha=0.05):
@@ -139,6 +147,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--plan", required=True, help="a preset name, JSON, or a path -- the SAME "
                                                   "value PRECISION takes")
+    ap.add_argument("--model", default=P.DEFAULT_CENSUS_SPEC, choices=sorted(HF_REPO),
+                    help="which checkpoint -- also picks the byte census plan is priced against")
     ap.add_argument("--corpus", required=True)
     ap.add_argument("--tokens", type=int, default=2000)
     ap.add_argument("--max-ppl-pct", type=float, default=None,
@@ -147,25 +157,29 @@ def main():
     ap.add_argument("--threads", type=int, default=int(os.environ.get("QLAB_THREADS", "10")))
     a = ap.parse_args()
     torch.set_num_threads(a.threads)
+    model_id = HF_REPO[a.model]
 
     plan = (P.parse_plan(json.dumps(P.PRESETS[a.plan][0])) if a.plan in P.PRESETS
             else P.parse_plan(a.plan))
     cov = coverage(plan)
-    print(P.describe(plan))
+    site_mb = site_mb_for(a.model)
+    print(P.describe(plan, a.model))
     print("\ncoverage of this eval:")
-    for key, (ok, why) in sorted(cov.items(), key=lambda kv: -P.SITES[kv[0]].mb_per_token):
-        print(f"  {'yes' if ok else 'NO ':3}  {key:7} {P.SITES[key].mb_per_token:8.2f} MB  {why}")
-    un = uncovered_mb(plan)
-    if un:
-        print(f"  -> {un:.2f} MB/token ({100 * un / P.CENSUS_TOKEN_MB:.1f}%) is NOT in the "
-              "verdict below")
+    for key, (ok, why) in sorted(cov.items(), key=lambda kv: -site_mb.get(kv[0], 0.0)):
+        print(f"  {'yes' if ok else 'NO ':3}  {key:7} {site_mb.get(key, 0.0):8.2f} MB  {why}")
+    un = uncovered_mb(plan, a.model)
+    token_mb = P.CENSUS[a.model].token_mb if a.model in P.CENSUS else None
+    if un and token_mb:
+        print(f"  -> {un:.2f} MB/token ({100 * un / token_mb:.1f}%) is NOT in the verdict below")
+    elif un:
+        print(f"  -> {un:.2f} MB/token is NOT in the verdict below (no census for {a.model!r})")
 
     from transformers import AutoTokenizer
-    tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B", local_files_only=True)
+    tok = AutoTokenizer.from_pretrained(model_id, local_files_only=True)
     ids = tokenize(a.corpus, a.tokens, tok)
 
     t0 = time.time()
-    model = load_model()
+    model = load_model(model_id)
     baseline_bf16(model)
     all_cls = [s.hostlab_class for s in P.SITES.values() if s.hostlab_class]
     touched_all = list(touched(model, all_cls))
@@ -178,10 +192,11 @@ def main():
     pw = paired(r1["nll"], r0["nll"])
     sens = sensitivity(r1["nll"] - r0["nll"])
     res = {
-        "plan": {k: str(v) for k, v in sorted(plan.items())},
+        "plan": {k: str(v) for k, v in sorted(plan.items())}, "model": a.model,
         "corpus": os.path.basename(a.corpus), "tokens": a.tokens,
         "params_quantized": int(npar), "mean_bits": round(bits, 3),
-        "projected_mb_per_token": round(P.token_mb(plan)["total"], 2),
+        "projected_mb_per_token": (round(P.token_mb(plan, a.model)["total"], 2)
+                                   if a.model in P.CENSUS else None),
         "uncovered_mb_per_token": round(un, 2),
         "control_ppl": float(np.exp(r0["nll"].mean())),
         "arm_ppl": float(np.exp(r1["nll"].mean())),

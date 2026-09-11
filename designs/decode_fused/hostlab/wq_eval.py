@@ -1,4 +1,8 @@
-"""Host-side model-level quality lab for weight formats, Qwen3-0.6B on CPU.
+"""Host-side model-level quality lab for weight formats, on CPU. Qwen3-0.6B by default; any spec
+in HF_REPO works the same way -- TARGETS is HF module-name SUFFIXES (self_attn.q_proj etc.), which
+match regardless of a spec's prefix depth (Gemma-4's "model.language_model.layers.N..." against
+Qwen3's "model.layers.N..."). Only which checkpoint loads is spec-specific. Gemma-4-12B (45 GB at
+f32) is not a CPU-load candidate here; gemma3-270m (549 MB) and qwen3-0.6b (1.5 GB) are.
 
 Why host: the device harness (designs/decode_fused/eval_llm_perplexity.py) costs an xclbin
 build plus one NPU dispatch per token and is single-tenant, which makes a FORMAT SWEEP
@@ -25,7 +29,12 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import wq_formats as F
 
-MODEL = "Qwen/Qwen3-0.6B"
+# Mirrors scripts/dump_llm_weights.py's own HF_REPO -- a 3-line id map, not the packed-row
+# contract the doctrine's "one owner" rule is about, so a second copy here (device dump vs host
+# lab, genuinely different consumers) is low-risk. Keep the two in sync by inspection.
+HF_REPO = {"qwen3-0.6b": "Qwen/Qwen3-0.6B", "gemma3-270m": "unsloth/gemma-3-270m-it",
+          "gemma4-12b": "unsloth/gemma-4-12b-it"}
+MODEL = HF_REPO["qwen3-0.6b"]   # back-compat default for load_model()/main() with no --spec
 TARGETS = {
     "mlp":    ("mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"),
     "attn_o": ("self_attn.o_proj",),
@@ -33,15 +42,15 @@ TARGETS = {
 }
 
 
-def load_model():
+def load_model(model_id=None):
     from transformers import AutoModelForCausalLM
-    m = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.float32,
+    m = AutoModelForCausalLM.from_pretrained(model_id or MODEL, dtype=torch.float32,
                                              local_files_only=True)
     m.eval()
-    # Qwen3-0.6B ties lm_head to embed_tokens. Our engine SPLITS them: the device GEMV
-    # reads a quantized W_head while the host gathers embeddings from a bf16 sidecar
-    # (gen_llm_decode.py:1062-1073). Untie here so the split is reproduced and quantizing
-    # the head never touches the embedding input.
+    # This project's engine SPLITS a tied lm_head/embedding: the device GEMV reads a quantized
+    # W_head while the host gathers embeddings from a bf16 sidecar (gen_llm_decode.py:1062-1073,
+    # true of Qwen3-0.6B and Gemma-4-12B alike -- both dump no separate lm_head tensor). Untie
+    # here so the split is reproduced and quantizing the head never touches the embedding input.
     m.lm_head.weight = torch.nn.Parameter(m.lm_head.weight.detach().clone())
     return m
 
@@ -137,6 +146,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--corpus", required=True)
     ap.add_argument("--tokens", type=int, default=2000)
+    ap.add_argument("--model", default="qwen3-0.6b", choices=sorted(HF_REPO),
+                    help="which checkpoint (HF_REPO key), not the format spec below")
     ap.add_argument("--spec", required=True, help='JSON, e.g. {"scheme":"affine","group":32}')
     ap.add_argument("--targets", default="", help="comma list: mlp,attn_o,qkv,head")
     ap.add_argument("--ref-mm", default=None, help="reference logprob memmap to compare against")
@@ -146,15 +157,16 @@ def main():
     ap.add_argument("--threads", type=int, default=int(os.environ.get("QLAB_THREADS", "18")))
     a = ap.parse_args()
     torch.set_num_threads(a.threads)
+    model_id = HF_REPO[a.model]
 
     from transformers import AutoTokenizer
-    tok = AutoTokenizer.from_pretrained(MODEL, local_files_only=True)
+    tok = AutoTokenizer.from_pretrained(model_id, local_files_only=True)
     ids = tokenize(a.corpus, a.tokens, tok)
 
     spec = json.loads(a.spec)
     targets = [t for t in a.targets.split(",") if t]
     t0 = time.time()
-    model = load_model()
+    model = load_model(model_id)
     baseline_bf16(model)
     n_t, n_p, b0, b1 = apply_format(model, spec, targets)
 
@@ -169,8 +181,8 @@ def main():
     if out_mm is not None:
         out_mm.flush()
 
-    res = dict(corpus=os.path.basename(a.corpus), tokens=T, spec=spec, targets=targets,
-               tensors=n_t, params=int(n_p), mb_before=b0 / 1e6, mb_after=b1 / 1e6,
+    res = dict(model=a.model, corpus=os.path.basename(a.corpus), tokens=T, spec=spec,
+               targets=targets, tensors=n_t, params=int(n_p), mb_before=b0 / 1e6, mb_after=b1 / 1e6,
                mean_nll=float(r["nll"].mean()), ppl=float(np.exp(r["nll"].mean())),
                top1_acc=float((r["top1"] == r["tgt"]).mean()),
                secs=round(time.time() - t0, 1))

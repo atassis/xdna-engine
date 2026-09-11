@@ -22,7 +22,7 @@ import argparse, json, re, sys
 import numpy as np, torch
 sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
 import wq_formats as F
-from wq_eval import load_model, baseline_bf16, TARGETS
+from wq_eval import load_model, baseline_bf16, TARGETS, HF_REPO
 
 PROBES = [
     ("Answer with exactly one word: what colour is a clear daytime sky?", r"^\W*blue\b"),
@@ -105,23 +105,25 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--arms", required=True)
     ap.add_argument("--tag", required=True)
+    ap.add_argument("--model", default="qwen3-0.6b", choices=sorted(HF_REPO))
     ap.add_argument("--n-arc", type=int, default=800)
     ap.add_argument("--threads", type=int, default=18)
     a = ap.parse_args()
     torch.set_num_threads(a.threads)
+    model_id = HF_REPO[a.model]
     import pyarrow.parquet as pq
     from transformers import AutoTokenizer
-    tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B", local_files_only=True)
+    tok = AutoTokenizer.from_pretrained(model_id, local_files_only=True)
     items = pq.read_table(QLAB + "/corpora/arc-easy-test.parquet").to_pylist()[:a.n_arc]
 
-    m = load_model(); baseline_bf16(m)
+    m = load_model(model_id); baseline_bf16(m)
     base = arc(m, tok, items)
     bc, btxt = compliance(m, tok)
     print(json.dumps(dict(arm="bf16-control", arc=float(base.mean()),
                           compliance=f"{sum(bc)}/{len(bc)}")), flush=True)
     res = []
     for arm in json.loads(open(a.arms).read()):
-        m = load_model(); baseline_bf16(m); quantize(m, arm)
+        m = load_model(model_id); baseline_bf16(m); quantize(m, arm)
         c = arc(m, tok, items)
         cc, _ = compliance(m, tok)
         res.append(dict(arm=arm["name"], arc=float(c.mean()),

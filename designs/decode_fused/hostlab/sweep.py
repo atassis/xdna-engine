@@ -9,7 +9,7 @@ import argparse, json, os, sys, time
 import numpy as np, torch
 sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
 import wq_formats as F
-from wq_eval import load_model, baseline_bf16, run, paired, tokenize, TARGETS
+from wq_eval import load_model, baseline_bf16, run, paired, tokenize, TARGETS, HF_REPO
 
 BF16 = F.BF16
 
@@ -27,24 +27,30 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--corpus", required=True)
     ap.add_argument("--tokens", type=int, default=2000)
+    ap.add_argument("--model", default="qwen3-0.6b", choices=sorted(HF_REPO))
     ap.add_argument("--arms", required=True, help="JSON list of {name,spec,targets}")
     ap.add_argument("--tag", required=True)
     ap.add_argument("--threads", type=int, default=18)
     ap.add_argument("--no-kl", action="store_true", help="skip the logprob memmap (saves 1.2GB/corpus)")
     a = ap.parse_args()
     torch.set_num_threads(a.threads)
+    model_id = HF_REPO[a.model]
     arms = json.loads(open(a.arms).read()) if os.path.exists(a.arms) else json.loads(a.arms)
 
     from transformers import AutoTokenizer
-    tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B", local_files_only=True)
+    tok = AutoTokenizer.from_pretrained(model_id, local_files_only=True)
     ids = tokenize(a.corpus, a.tokens, tok)
 
-    model = load_model()
+    model = load_model(model_id)
     baseline_bf16(model)
     all_t = ["mlp", "attn_o", "qkv", "head"]
     pristine = {n: m.weight.detach().numpy().astype(BF16).copy()
                 for n, m in touched(model, all_t)}
-    print(f"pristine cache {sum(v.nbytes for v in pristine.values())/1e9:.2f} GB", flush=True)
+    # Touched-tensor totals, not Qwen3's own hardcoded 596.05e6 params / 1192.0 MB -- those were
+    # this model's numbers read as a constant, silently wrong for any other --model.
+    touched_params = sum(v.size for v in pristine.values())
+    touched_mb_bf16 = sum(v.nbytes for v in pristine.values()) / 1e6
+    print(f"pristine cache {touched_mb_bf16/1e3:.2f} GB", flush=True)
 
     V = model.config.vocab_size
     refp = f"{QLAB}/runs/{a.tag}-ref.npy"
@@ -59,7 +65,7 @@ def main():
     base = dict(name="bf16-control", spec={"scheme": "bf16"}, targets=[],
                 mean_nll=float(r0["nll"].mean()), ppl=float(np.exp(r0["nll"].mean())),
                 top1_acc=float((r0["top1"] == r0["tgt"]).mean()), bits=16.0,
-                weight_mb=1192.0, secs=round(time.time() - t0, 1))
+                weight_mb=touched_mb_bf16, secs=round(time.time() - t0, 1))
     results = [base]
     print(json.dumps(base), flush=True)
 
@@ -88,7 +94,7 @@ def main():
         bits = qbits / npar if npar else 16.0
         rec = dict(name=arm["name"], spec=sp, targets=tg, params=int(npar), bits=bits,
                    quant_mb=qbits / 8 / 1e6,
-                   weight_mb=(596.05e6 - npar) * 2 / 1e6 + qbits / 8 / 1e6,
+                   weight_mb=(touched_params - npar) * 2 / 1e6 + qbits / 8 / 1e6,
                    mean_nll=float(r["nll"].mean()), ppl=float(np.exp(r["nll"].mean())),
                    top1_acc=float((r["top1"] == r["tgt"]).mean()),
                    paired=paired(r["nll"], r0["nll"]), secs=round(time.time() - t0, 1))
