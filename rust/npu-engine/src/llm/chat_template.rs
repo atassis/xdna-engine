@@ -18,11 +18,24 @@ use crate::pipeline::ChatMessage;
 #[derive(Debug, Clone)]
 pub struct ChatTemplate {
     source: String,
+    /// `bos_token` / `eos_token` from tokenizer_config.json, because a template may SUBSTITUTE
+    /// them rather than spell them: Gemma-4's opens with `{{ bos_token }}`. Left undefined they
+    /// render empty, and the prompt silently loses its BOS -- which this model answers by
+    /// reporting that it received no message at all. Qwen3's template does not use them, which
+    /// is why the gap survived.
+    bos_token: Option<String>,
+    eos_token: Option<String>,
 }
 
 impl ChatTemplate {
     pub fn new(source: String) -> Self {
-        ChatTemplate { source }
+        ChatTemplate { source, bos_token: None, eos_token: None }
+    }
+
+    pub fn with_special_tokens(mut self, bos: Option<String>, eos: Option<String>) -> Self {
+        self.bos_token = bos;
+        self.eos_token = eos;
+        self
     }
 
     /// Render `messages`, appending the assistant-turn opener when `add_generation_prompt`.
@@ -72,11 +85,15 @@ impl ChatTemplate {
                 add_generation_prompt => add_generation_prompt,
                 tools => tools,
                 enable_thinking => t,
+                bos_token => self.bos_token,
+                eos_token => self.eos_token,
             },
             None => context! {
                 messages => msgs,
                 add_generation_prompt => add_generation_prompt,
                 tools => tools,
+                bos_token => self.bos_token,
+                eos_token => self.eos_token,
             },
         };
         tmpl.render(ctx).map_err(|e| EngineError::Load(format!("chat template render: {e}")))
@@ -190,9 +207,19 @@ fn write_dumps(v: &serde_json::Value, s: &mut String) {
     }
 }
 
-/// Python `str` methods called as OBJECT methods (`x.strip('\n')`) by HF chat templates. Anything
-/// else falls through to minijinja's normal "unknown method" error.
+/// Python `str` and `dict` methods called as OBJECT methods (`x.strip('\n')`, `d.get(k)`) by HF
+/// chat templates. Anything else falls through to minijinja's normal "unknown method" error.
 fn pycompat_method(_state: &State, value: &Value, method: &str, args: &[Value]) -> Result<Value, Error> {
+    // `dict.get(key[, default])` before the str arm: Gemma-4's template calls it on message
+    // objects, and minijinja exposes mapping lookup only as `d[k]` / the `get` FILTER, which
+    // raises on a missing key instead of returning the default. A template that guards an
+    // optional field with .get() is asking for exactly that default.
+    if method == "get" && value.as_str().is_none() {
+        if let Some(key) = args.first() {
+            let got = value.get_item(key).ok().filter(|v| !v.is_undefined());
+            return Ok(got.unwrap_or_else(|| args.get(1).cloned().unwrap_or(Value::from(()))));
+        }
+    }
     let s = match value.as_str() {
         Some(s) => s,
         None => return Err(Error::from(ErrorKind::UnknownMethod)),

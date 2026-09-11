@@ -30,7 +30,12 @@ toml = "0.8"
 tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
 # `preserve_order` here too, and for the same reason: minijinja's own ValueMap is a BTreeMap
 # without it, so a schema that survived serde_json in order would be re-sorted on the way in.
-minijinja = { version = "2", default-features = false, features = ["builtins", "serde", "preserve_order"] }
+# `macros` because a chat template may DEFINE its own: Gemma-4's declares five
+# (format_parameters, format_function_declaration, format_argument, strip_thinking, ...)
+# and they carry its tool-call rendering and thinking-channel stripping. Without the
+# feature minijinja parses the file and fails with "unknown statement macro", which reads
+# as a broken template rather than a missing capability on our side.
+minijinja = { version = "2", default-features = false, features = ["builtins", "serde", "preserve_order", "macros"] }
 npu-xrt = { path = "../npu-xrt" }
 npu-asr = { path = "../npu-asr", features = ["two_ctx"] }
 npu-asr-host = { path = "../npu-asr-host" }

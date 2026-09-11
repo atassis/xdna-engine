@@ -154,7 +154,15 @@ impl ModelConfig {
 
         let stop = resolve_stop_tokens(&tokenizer, &tokenizer_config, generation_config.as_ref())?;
         let chat_template =
-            tokenizer_config.get("chat_template").and_then(|v| v.as_str()).map(|s| ChatTemplate::new(s.to_string()));
+            tokenizer_config.get("chat_template").and_then(|v| v.as_str()).map(|s| {
+                // A special token is either a bare string or {"content": ...} in
+                // tokenizer_config.json; both spellings are in the wild.
+                let tok = |k: &str| tokenizer_config.get(k).and_then(|v| v.as_str()
+                    .map(str::to_string)
+                    .or_else(|| v.get("content").and_then(|c| c.as_str()).map(str::to_string)));
+                ChatTemplate::new(s.to_string())
+                    .with_special_tokens(tok("bos_token"), tok("eos_token"))
+            });
 
         let checkpoint_defaults =
             generation_config.as_ref().map(generation_sampling).unwrap_or_default();
