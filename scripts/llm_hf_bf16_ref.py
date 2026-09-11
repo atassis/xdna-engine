@@ -54,7 +54,8 @@ def main():
                          "format the device build will run. A quantized device cannot be gated on "
                          "exact tokens against a bf16 oracle -- the format's own error is real and "
                          "expected, and charging the implementation for it is how "
-                         "[[the-gemma4-int4-failure-is-the-format-not-the-path]] cost a bisect. "
+                         "charging the implementation for it cost this tree a bisect for a defect that "
+                         "was not there. "
                          "With this set, device-vs-reference exact parity isolates the "
                          "IMPLEMENTATION, and the format's cost is a separate host measurement.")
     ap.add_argument("--quant-group", type=int, default=128)

@@ -78,6 +78,17 @@ npu models                      # what this install is configured to serve
 they need in-process and exit -- they do not require the service to be running. `npu
 serve` is the one process that owns the NPU continuously and answers HTTP requests.
 
+Every generation prints a one-line measurement to stderr (tokens/s, ms/token, the latency
+tail, and which layer the time actually went to). `npu generate --stats` prints the full
+breakdown instead. `--output json` streams the whole thing as NDJSON on stdout -- one line
+per token, carrying that token's own timing -- so `> run.jsonl` gives you a file `npu
+stats` and `npu replay` read back. See [measurement.md](measurement.md).
+
+`npu top` is the live view of the device: who is resident, what is serving right now,
+how much device memory each model holds, and what share of the service's uptime each one
+has occupied the NPU for. It reads the status file the service publishes, so it never
+touches the device and cannot hang on a busy one.
+
 ## What success looks like
 
 With the service running:

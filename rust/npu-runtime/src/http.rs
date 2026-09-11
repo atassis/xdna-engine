@@ -12,6 +12,7 @@ use crate::config::Config;
 use crate::config_doc::ConfigDoc;
 use crate::registry::{LoadState, ModelStatus};
 use crate::stream::StreamItem;
+use npu_engine::telemetry::wire;
 use npu_engine::capability::{Capability, Request as EngineReq, Response as EngineResp};
 use npu_engine::FinishReason;
 
@@ -46,7 +47,12 @@ impl Body {
         match self {
             Body::Json(_) => "application/json",
             Body::Wav(_) => "audio/wav",
-            Body::Stream(_) => "text/event-stream",
+            // Ollama's stream is newline-delimited JSON, not SSE -- a client that got
+            // `text/event-stream` here would look for `data:` prefixes that are not coming.
+            Body::Stream(st) => match st.kind {
+                SseKind::OllamaChat => "application/x-ndjson",
+                _ => "text/event-stream",
+            },
         }
     }
     pub fn bytes(&self) -> &[u8] {
@@ -67,7 +73,7 @@ impl From<&str> for Body { fn from(s: &str) -> Body { Body::Json(s.to_string()) 
 
 /// Which OpenAI route an `SseStream` is rendering for -- the two shapes differ (`delta` vs `text`,
 /// and chat alone has a role-announcement chunk).
-pub enum SseKind { Chat, Completion }
+pub enum SseKind { Chat, Completion, OllamaChat }
 
 /// A streaming generation in progress, plus what `respond()` needs to render OpenAI-shaped frames
 /// from it without knowing anything about JSON itself living on the actor side.
@@ -77,12 +83,30 @@ pub struct SseStream {
     created: i64,
     model: String,
     kind: SseKind,
+    /// Render frames from the per-token records instead of the plain text items, and close with a
+    /// summary frame. Off, the stream is byte-for-byte what it was before telemetry existed.
+    stats: bool,
 }
 
 impl SseStream {
-    fn new(rx: std::sync::mpsc::Receiver<StreamItem>, model: String, kind: SseKind) -> SseStream {
-        let prefix = match kind { SseKind::Chat => "chatcmpl", SseKind::Completion => "cmpl" };
-        SseStream { rx, id: gen_id(prefix), created: unix_now(), model, kind }
+    fn new(rx: std::sync::mpsc::Receiver<StreamItem>, model: String, kind: SseKind, stats: bool) -> SseStream {
+        let prefix = match kind {
+            SseKind::Chat => "chatcmpl",
+            SseKind::Completion => "cmpl",
+            SseKind::OllamaChat => "ollama",
+        };
+        SseStream { rx, id: gen_id(prefix), created: unix_now(), model, kind, stats }
+    }
+
+    /// The identity every rendered line shares, so the SSE frames and the run log cannot disagree
+    /// about which run they describe.
+    fn meta(&self) -> wire::RunMeta {
+        wire::RunMeta {
+            id: self.id.clone(),
+            created: self.created,
+            model: self.model.clone(),
+            chat: matches!(self.kind, SseKind::Chat),
+        }
     }
     /// The chat-only preamble: OpenAI announces the role before any content, in its own chunk.
     fn render_role(&self) -> String {
@@ -101,6 +125,7 @@ impl SseStream {
                 "{{\"id\":\"{}\",\"object\":\"text_completion\",\"created\":{},\"model\":\"{}\",\
                  \"choices\":[{{\"index\":0,\"text\":\"{}\",\"finish_reason\":null}}]}}",
                 self.id, self.created, parse::json_escape(&self.model), parse::json_escape(text)),
+            SseKind::OllamaChat => crate::ollama::chat_chunk(&self.model, &self.created_at(), text),
         }
     }
     fn render_done(&self, reason: FinishReason) -> String {
@@ -113,7 +138,34 @@ impl SseStream {
                 "{{\"id\":\"{}\",\"object\":\"text_completion\",\"created\":{},\"model\":\"{}\",\
                  \"choices\":[{{\"index\":0,\"text\":\"\",\"finish_reason\":\"{}\"}}]}}",
                 self.id, self.created, parse::json_escape(&self.model), reason.as_str()),
+            // Unused: the Ollama stream's terminal frame carries the report, so `respond_stream`
+            // builds it from `StreamItem::Done` directly rather than through this.
+            SseKind::OllamaChat => String::new(),
         }
+    }
+
+    /// RFC3339 for the Ollama surface, which stamps `created_at` as a string where OpenAI stamps
+    /// `created` as a unix integer.
+    fn created_at(&self) -> String {
+        rfc3339(self.created)
+    }
+    /// One tool call as a single streaming delta.
+    ///
+    /// OpenAI's wire format is a fragment concatenation -- `function.arguments` arrives in pieces
+    /// that the client joins by `index` -- so ONE fragment carrying the whole call is valid and
+    /// every client handles it. Streaming the arguments token by token is a later refinement with
+    /// no format change; it would not make anything parse that does not parse now.
+    fn render_tool_call(&self, c: &npu_engine::ToolCall, index: usize) -> String {
+        let call = serde_json::json!({
+            "index": index,
+            "id": c.id,
+            "type": "function",
+            "function": { "name": c.name, "arguments": c.arguments.to_string() },
+        });
+        format!(
+            "{{\"id\":\"{}\",\"object\":\"chat.completion.chunk\",\"created\":{},\"model\":\"{}\",\
+             \"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{call}]}},\"finish_reason\":null}}]}}",
+            self.id, self.created, parse::json_escape(&self.model))
     }
     fn render_error(&self, msg: &str) -> String {
         format!("{{\"error\":{{\"message\":\"{}\"}}}}", parse::json_escape(msg))
@@ -163,12 +215,19 @@ pub fn route(req: &Request, handle: &Handle, cfg_path: &Path) -> Response {
         ("POST", "/v1/chat/completions") => chat_completions(req, handle),
         ("POST", "/v1/completions") => completions(req, handle),
         ("POST", "/v1/embeddings") => embeddings(req, handle),
+        // The Ollama surface. Same models, same engine -- a second wire, because OpenAI's has no
+        // field for a capability or a context length and every client therefore asks the user.
+        ("GET", "/api/version") => (200, crate::ollama::version_json().into()),
+        ("GET", "/api/tags") | ("GET", "/api/ps") => ollama_tags(handle, cfg_path),
+        ("POST", "/api/show") => ollama_show(req, handle, cfg_path),
+        ("POST", "/api/chat") => ollama_chat(req, handle),
         ("POST", "/v1/audio/speech") => audio_speech(req, handle),
         ("POST", "/v1/audio/transcriptions") => transcriptions(req, handle),
         ("POST", "/v1/audio/diarizations") => diarizations(req, handle),
         ("POST", "/admin/reload") => admin_reload(handle, cfg_path),
         ("POST", "/admin/models") => admin_add_model(req, handle, cfg_path),
         ("POST", "/admin/defaults") => admin_set_default(req, handle, cfg_path),
+        ("POST", "/admin/server") => admin_set_server(req, handle, cfg_path),
         // Before the generic model routes: these are sub-resources, and a prefix match on
         // `/admin/models/` would otherwise swallow them.
         ("POST", p) if p.starts_with("/admin/models/") && p.ends_with("/resident") =>
@@ -199,8 +258,8 @@ pub fn models_json(status: &[ModelStatus]) -> String {
         let state = match s.state { LoadState::Loaded => "loaded", LoadState::Failed => "failed", LoadState::Unloaded => "unloaded" };
         let idle = match s.idle_s { Some(n) => n.to_string(), None => "null".to_string() };
         data.push_str(&format!(
-            "{{\"id\":\"{}\",\"object\":\"model\",\"kind\":\"{kind}\",\"state\":\"{state}\",\"detail\":\"{}\",\"bo_bytes\":{},\"idle_s\":{idle},\"pinned\":{}}}",
-            s.name, parse::json_escape(&s.detail), s.bo_bytes, s.pinned));
+            "{{\"id\":\"{}\",\"object\":\"model\",\"kind\":\"{kind}\",\"state\":\"{state}\",\"detail\":\"{}\",\"bo_bytes\":{},\"idle_s\":{idle},\"pinned\":{},\"busy\":{},\"served\":{},\"busy_us\":{}}}",
+            s.name, parse::json_escape(&s.detail), s.bo_bytes, s.pinned, s.busy, s.served, s.busy_us));
     }
     format!("{{\"object\":\"list\",\"data\":[{data}]}}")
 }
@@ -232,10 +291,87 @@ fn chat_completions(req: &Request, handle: &Handle) -> Response {
         Err(e) => return engine_err(&e),
     };
     if parsed.stream {
-        (200, Body::Stream(SseStream::new(served.value, served.model, SseKind::Chat)))
+        (200, Body::Stream(SseStream::new(served.value, served.model, SseKind::Chat, parsed.stats)))
     } else {
         render_buffered(served.model, served.value, SseKind::Chat)
     }
+}
+
+/// The install root scenarios resolve against -- the same resolution `npu-cli` does, and the same
+/// one `EngineLoader` was handed. Derived from the config's own location when the variable is
+/// unset, because `engine.toml` lives at the root by construction.
+fn engine_root(cfg_path: &Path) -> std::path::PathBuf {
+    if let Ok(p) = std::env::var("XDNA_ENGINE_ROOT") {
+        return std::path::PathBuf::from(p);
+    }
+    cfg_path.parent().map(Path::to_path_buf).unwrap_or_default()
+}
+
+/// Capabilities for one model, by name, resolved from the config's scenario without loading it.
+fn caps_for(cfg_path: &Path, name: &str) -> Option<crate::ollama::GenerateCapabilities> {
+    let cfg = Config::load(cfg_path).ok()?;
+    let m = cfg.models.iter().find(|m| m.name == name)?;
+    crate::ollama::capabilities(&engine_root(cfg_path), &m.scenario, name)
+}
+
+/// `GET /api/tags`. Generate models only: Ollama has no vocabulary for an ASR or embedding model,
+/// and listing one would drop it into a client's chat picker where every request 400s.
+fn ollama_tags(handle: &Handle, cfg_path: &Path) -> Response {
+    let st: Vec<ModelStatus> =
+        handle.status().into_iter().filter(crate::ollama::is_chat_model).collect();
+    (200, crate::ollama::tags_json(&st, &|n| caps_for(cfg_path, n)).into())
+}
+
+/// `POST /api/show`. The endpoint a client reads `capabilities` and `<arch>.context_length` from.
+fn ollama_show(req: &Request, handle: &Handle, cfg_path: &Path) -> Response {
+    let body = String::from_utf8_lossy(&req.body).to_string();
+    let name = match extract_str_field(&body, "model").or_else(|| extract_str_field(&body, "name")) {
+        Some(n) => n,
+        None => return (400, "{\"error\":\"missing \\\"model\\\"\"}".into()),
+    };
+    let st = handle.status();
+    match crate::ollama::show_json(&name, &st, caps_for(cfg_path, &name).as_ref()) {
+        Some(j) => (200, j.into()),
+        None => (404, format!("{{\"error\":\"model {} not found\"}}", parse::json_escape(&name)).into()),
+    }
+}
+
+/// `POST /api/chat`. The same generation path as `/v1/chat/completions` over Ollama's shapes --
+/// `options` instead of top-level sampling fields, NDJSON instead of SSE, and `stream` defaulting
+/// to TRUE rather than false, which is the one default that differs and the one a client notices.
+fn ollama_chat(req: &Request, handle: &Handle) -> Response {
+    let body = String::from_utf8_lossy(&req.body).to_string();
+    let parsed = match parse::parse_ollama_chat_request(&body) {
+        Ok(p) => p,
+        Err(e) => return (400, format!("{{\"error\":\"{}\"}}", parse::json_escape(&e)).into()),
+    };
+    let served = match handle.generate(parsed.model.as_deref(), parsed.prompt, parsed.params) {
+        Ok(s) => s,
+        Err(e) => return engine_err(&e),
+    };
+    if parsed.stream {
+        (200, Body::Stream(SseStream::new(served.value, served.model, SseKind::OllamaChat, false)))
+    } else {
+        render_ollama_buffered(served.model, served.value)
+    }
+}
+
+/// Drain a generation and render Ollama's single-object body.
+fn render_ollama_buffered(model: String, rx: std::sync::mpsc::Receiver<StreamItem>) -> Response {
+    let created = unix_now();
+    let mut text = String::new();
+    let mut calls: Vec<npu_engine::ToolCall> = Vec::new();
+    let (reason, report) = loop {
+        match rx.recv() {
+            Ok(StreamItem::Text(t)) => text.push_str(&t),
+            Ok(StreamItem::ToolCall(c)) => calls.push(c),
+            Ok(StreamItem::Step(_)) => {}
+            Ok(StreamItem::Done { reason, report, .. }) => break (reason, report),
+            Ok(StreamItem::Error(e)) => return engine_err(&e),
+            Err(_) => return (500, "{\"error\":\"generation ended without a result\"}".into()),
+        }
+    };
+    (200, crate::ollama::chat_buffered(&model, &rfc3339(created), &text, &calls, reason, &report).into())
 }
 
 /// OpenAI text completions: same generation path as chat, over a raw (non-templated) prompt string.
@@ -250,7 +386,7 @@ fn completions(req: &Request, handle: &Handle) -> Response {
         Err(e) => return engine_err(&e),
     };
     if parsed.stream {
-        (200, Body::Stream(SseStream::new(served.value, served.model, SseKind::Completion)))
+        (200, Body::Stream(SseStream::new(served.value, served.model, SseKind::Completion, parsed.stats)))
     } else {
         render_buffered(served.model, served.value, SseKind::Completion)
     }
@@ -259,12 +395,28 @@ fn completions(req: &Request, handle: &Handle) -> Response {
 /// Drain a generation to completion and render the OpenAI non-streaming shape. Draining fully
 /// (rather than stopping at the first error) is deliberate: the actor side always sends exactly one
 /// terminal item (`Done` or `Error`), so this loop always terminates.
+///
+/// The measurement objects are UNCONDITIONAL here, the way llama-server's `timings` is. There is no
+/// bandwidth argument against them on a buffered response -- they are a few hundred bytes once --
+/// and a client that did not ask for them ignores two unknown keys. The streaming path is where the
+/// opt-in lives, because there the cost is per token.
 fn render_buffered(model: String, rx: std::sync::mpsc::Receiver<StreamItem>, kind: SseKind) -> Response {
+    let chat = matches!(kind, SseKind::Chat);
+    let id = gen_id(if chat { "chatcmpl" } else { "cmpl" });
+    let created = unix_now();
+    let meta = wire::RunMeta { id: id.clone(), created, model: model.clone(), chat };
+    let mut log = crate::run_log::RunLog::open(&id);
+    if let Some(l) = log.as_mut() { l.header(&meta); }
     let mut text = String::new();
-    let (reason, usage) = loop {
+    let mut calls: Vec<npu_engine::ToolCall> = Vec::new();
+    let (reason, report) = loop {
         match rx.recv() {
             Ok(StreamItem::Text(t)) => text.push_str(&t),
-            Ok(StreamItem::Done { reason, usage }) => break (reason, usage),
+            Ok(StreamItem::ToolCall(c)) => calls.push(c),
+            Ok(StreamItem::Step(r)) => {
+                if let Some(l) = log.as_mut() { l.line(&wire::chunk_line(&r, &meta)); }
+            }
+            Ok(StreamItem::Done { reason, report, .. }) => break (reason, report),
             // Classified, not blanket-500: a prompt that does not fit the context window is the
             // caller's to fix, and `engine_err` already knows that `Unsupported` is a 400.
             Ok(StreamItem::Error(e)) => return engine_err(&e),
@@ -272,23 +424,13 @@ fn render_buffered(model: String, rx: std::sync::mpsc::Receiver<StreamItem>, kin
                 return (500, "{\"error\":\"generation ended without a result\"}".into()),
         }
     };
-    let id = gen_id(match kind { SseKind::Chat => "chatcmpl", SseKind::Completion => "cmpl" });
-    let created = unix_now();
-    let total = usage.prompt_tokens + usage.completion_tokens;
-    let usage_json = format!("\"usage\":{{\"prompt_tokens\":{},\"completion_tokens\":{},\"total_tokens\":{total}}}",
-        usage.prompt_tokens, usage.completion_tokens);
-    let body = match kind {
-        SseKind::Chat => format!(
-            "{{\"id\":\"{id}\",\"object\":\"chat.completion\",\"created\":{created},\"model\":\"{}\",\
-             \"choices\":[{{\"index\":0,\"message\":{{\"role\":\"assistant\",\"content\":\"{}\"}},\
-             \"finish_reason\":\"{}\"}}],{usage_json}}}",
-            parse::json_escape(&model), parse::json_escape(&text), reason.as_str()),
-        SseKind::Completion => format!(
-            "{{\"id\":\"{id}\",\"object\":\"text_completion\",\"created\":{created},\"model\":\"{}\",\
-             \"choices\":[{{\"index\":0,\"text\":\"{}\",\"finish_reason\":\"{}\"}}],{usage_json}}}",
-            parse::json_escape(&model), parse::json_escape(&text), reason.as_str()),
-    };
-    (200, body.into())
+    if let Some(l) = log.as_mut() {
+        // Prefill lands after the token lines because its record only reaches this layer with the
+        // terminal item. The reader dispatches on `object` and does not care about line order.
+        l.line(&wire::prefill_line(&report.prefill, &meta));
+        l.line(&wire::summary_line(&report, &meta, reason));
+    }
+    (200, wire::completion_object_with_calls(&text, &calls, reason, &report, &meta).to_string().into())
 }
 
 /// OpenAI speech synthesis. Serves `Capability::TTS` and returns audio bytes, not JSON.
@@ -395,9 +537,10 @@ fn admin_reload(handle: &Handle, cfg_path: &Path) -> Response {
     match Config::load(cfg_path) {
         Ok(cfg) => match handle.reconcile(cfg) {
             Ok(rep) => (200, format!(
-                "{{\"loaded\":{},\"unloaded\":{},\"failed\":{},\"deferred\":{},\"pinned_deferred\":{}}}",
+                "{{\"loaded\":{},\"unloaded\":{},\"failed\":{},\"deferred\":{},\"pinned_deferred\":{},\
+                 \"evicted\":{},\"pinned_over_cap\":{}}}",
                 rep.loaded.len(), rep.unloaded.len(), rep.failed.len(), rep.deferred.len(),
-                rep.pinned_deferred.len()).into()),
+                rep.pinned_deferred.len(), rep.evicted.len(), rep.pinned_over_cap.len()).into()),
             Err(e) => engine_err(&e),
         },
         Err(e) => (400, format!("{{\"error\":\"{}\"}}", parse::json_escape(&e)).into()),
@@ -439,6 +582,20 @@ fn admin_set_resident(name: &str, req: &Request, handle: &Handle, cfg_path: &Pat
         true => Ok(()),
         false => Err(format!("unknown model {name:?} (not in the config)")),
     })
+}
+
+/// Set one `[server]` key. The last config mutation the CLI still performed itself, which meant
+/// two processes wrote `engine.toml`: the service through every other `/admin` route, and the CLI
+/// through this one. One file, one writer -- and the writer is whoever owns the reconcile.
+fn admin_set_server(req: &Request, handle: &Handle, cfg_path: &Path) -> Response {
+    let body = String::from_utf8_lossy(&req.body).to_string();
+    let (key, value) = match (extract_str_field(&body, "key"), extract_str_field(&body, "value")) {
+        (Some(k), Some(v)) => (k, v),
+        _ => return (400, "{\"error\":\"need key + value\"}".into()),
+    };
+    // `set_server` validates the key and the value's shape, so an unknown key is a 400 with the
+    // reason rather than a silently ignored write.
+    mutate_and_reconcile(handle, cfg_path, |doc| doc.set_server(&key, &value))
 }
 
 fn admin_set_default(req: &Request, handle: &Handle, cfg_path: &Path) -> Response {
@@ -500,9 +657,10 @@ fn mutate_and_reconcile(handle: &Handle, cfg_path: &Path,
     let cfg = match doc.save(cfg_path) { Ok(c) => c, Err(e) => return bad(500, e) };
     match handle.reconcile(cfg) {
         Ok(rep) => (200, format!(
-            "{{\"loaded\":{},\"unloaded\":{},\"failed\":{},\"deferred\":{},\"pinned_deferred\":{}}}",
+            "{{\"loaded\":{},\"unloaded\":{},\"failed\":{},\"deferred\":{},\"pinned_deferred\":{},\
+             \"evicted\":{},\"pinned_over_cap\":{}}}",
             rep.loaded.len(), rep.unloaded.len(), rep.failed.len(), rep.deferred.len(),
-            rep.pinned_deferred.len()).into()),
+            rep.pinned_deferred.len(), rep.evicted.len(), rep.pinned_over_cap.len()).into()),
         Err(e) => engine_err(&e),
     }
 }
@@ -598,6 +756,9 @@ fn reason_phrase(code: u16) -> &'static str {
 /// generator's sink returns `false` -- this is the entire disconnect-abort mechanism; nothing here
 /// signals the actor directly.
 fn respond_stream(stream: &mut TcpStream, code: u16, s: &SseStream) -> std::io::Result<()> {
+    if matches!(s.kind, SseKind::OllamaChat) {
+        return respond_ndjson(stream, code, s);
+    }
     let head = format!(
         "HTTP/1.1 {code} {}\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\
          Connection: close\r\n\r\n", reason_phrase(code));
@@ -605,15 +766,87 @@ fn respond_stream(stream: &mut TcpStream, code: u16, s: &SseStream) -> std::io::
     if matches!(s.kind, SseKind::Chat) {
         stream.write_all(format!("data: {}\n\n", s.render_role()).as_bytes())?;
     }
+    let meta = s.meta();
+    let mut log = crate::run_log::RunLog::open(&s.id);
+    if let Some(l) = log.as_mut() { l.header(&meta); }
+    // OpenAI indexes tool calls within the choice, and a client concatenates argument fragments by
+    // that index. We emit each call whole, so every index appears exactly once.
+    let mut tool_calls_seen = 0usize;
     for item in s.rx.iter() {
+        // Exactly one of `Text` and `Step` drives the frames, never both: a record's `emit` is the
+        // same bytes the text item carries, so the stream reads identically either way. With stats
+        // off this is byte-for-byte the stream that existed before telemetry.
         let frame = match item {
-            StreamItem::Text(t) => s.render_text(&t),
-            StreamItem::Done { reason, .. } => s.render_done(reason),
+            StreamItem::Text(t) => {
+                if s.stats { continue }
+                s.render_text(&t)
+            }
+            StreamItem::Step(r) => {
+                if log.is_none() && !s.stats { continue }
+                // Rendered once and used for both destinations: the log and the wire must carry
+                // the same bytes, and rendering twice is how they stop doing that.
+                let line = wire::chunk_line(&r, &meta);
+                if let Some(l) = log.as_mut() { l.line(&line); }
+                if !s.stats { continue }
+                line.to_string()
+            }
+            StreamItem::Done { reason, report, .. } => {
+                if let Some(l) = log.as_mut() {
+                    l.line(&wire::prefill_line(&report.prefill, &meta));
+                    l.line(&wire::summary_line(&report, &meta, reason));
+                }
+                // The finish frame first, so a client that stops at `finish_reason` still sees the
+                // stream end where it always did; the summary is an extra frame after it, and only
+                // for a caller that asked -- OpenAI gates its own trailing usage chunk the same way,
+                // because a strict client is entitled to be surprised by an unknown `object`.
+                stream.write_all(format!("data: {}\n\n", s.render_done(reason)).as_bytes())?;
+                if !s.stats { continue }
+                wire::summary_line(&report, &meta, reason).to_string()
+            }
+            // Tool-call frames are never suppressed by `stats`. `Text` can be, because the same
+            // bytes come back on the `Step` line; a call has no other carrier, and dropping one
+            // would leave the client with a `tool_calls` finish reason and nothing to execute.
+            StreamItem::ToolCall(c) => {
+                let i = tool_calls_seen;
+                tool_calls_seen += 1;
+                s.render_tool_call(&c, i)
+            }
             StreamItem::Error(e) => s.render_error(&e.to_string()),
         };
         stream.write_all(format!("data: {frame}\n\n").as_bytes())?;
     }
     stream.write_all(b"data: [DONE]\n\n")?;
+    stream.flush()
+}
+
+
+/// Ollama's stream: one bare JSON object per line. No `data:` prefix, no blank-line separator, no
+/// `[DONE]` sentinel -- the last object carries `done: true` and IS the terminator.
+///
+/// The disconnect-abort mechanism is the SSE path's, unchanged: a failed write drops `s.rx`, the
+/// actor's next send fails, and the generator's sink returns false.
+fn respond_ndjson(stream: &mut TcpStream, code: u16, s: &SseStream) -> std::io::Result<()> {
+    let head = format!(
+        "HTTP/1.1 {code} {}\r\nContent-Type: application/x-ndjson\r\nCache-Control: no-cache\r\n\
+         Connection: close\r\n\r\n", reason_phrase(code));
+    stream.write_all(head.as_bytes())?;
+    let stamp = s.created_at();
+    for item in s.rx.iter() {
+        let line = match item {
+            StreamItem::Text(t) => crate::ollama::chat_chunk(&s.model, &stamp, &t),
+            // A tool call has no other carrier on this wire, so it is never suppressed.
+            StreamItem::ToolCall(c) => crate::ollama::chat_tool_call_chunk(&s.model, &stamp, &c),
+            StreamItem::Step(_) => continue,
+            StreamItem::Done { reason, report, .. } =>
+                crate::ollama::chat_done(&s.model, &stamp, reason, &report),
+            // Ollama has no error frame in-stream; a client reads the field and stops.
+            StreamItem::Error(e) =>
+                serde_json::json!({ "error": e.to_string() }).to_string(),
+        };
+        stream.write_all(line.as_bytes())?;
+        stream.write_all(b"\n")?;
+        stream.flush()?;
+    }
     stream.flush()
 }
 
@@ -737,6 +970,20 @@ pub mod parse {
         pub prompt: npu_engine::Prompt,
         pub params: npu_engine::GenerateParams,
         pub stream: bool,
+        /// Per-token measurement in the stream. Opt-in, not because measuring is expensive -- the
+        /// records exist either way -- but because it is 173 bytes per token on the wire (measured
+        /// 2026-09-09 over a 64-token qwen3-0.6b completion: 354 B/token with it, 182 without), and a
+        /// client that did not ask for them should not pay to carry them.
+        pub stats: bool,
+    }
+
+    /// `stream_options: {"include_stats": true}`, spelled after OpenAI's own `include_usage` so it
+    /// sits where a caller already looks, with a top-level `x_npu_stats` as the curl-friendly
+    /// shorthand.
+    pub fn wants_stats(v: &serde_json::Value) -> bool {
+        v.get("stream_options").and_then(|o| o.get("include_stats")).and_then(|b| b.as_bool())
+            .or_else(|| v.get("x_npu_stats").and_then(|b| b.as_bool()))
+            .unwrap_or(false)
     }
 
     /// `/v1/chat/completions`: the full `messages` array (system prompt + history, not just the last
@@ -753,21 +1000,150 @@ pub mod parse {
         for (i, m) in messages.iter().enumerate() {
             let role = m.get("role").and_then(|r| r.as_str())
                 .ok_or_else(|| format!("messages[{i}]: missing \"role\""))?.to_string();
-            let content = parse_content(m.get("content")).map_err(|e| format!("messages[{i}]: {e}"))?;
-            chat.push(npu_engine::ChatMessage { role, content });
+            // An assistant turn that called a tool carries the call in `tool_calls`, not in
+            // `content`, and OpenAI sends `content: null` for it. That is not missing content.
+            let calls = match m.get("tool_calls").and_then(|c| c.as_array()) {
+                Some(c) if !c.is_empty() => parse_tool_calls(c).map_err(|e| format!("messages[{i}]: {e}"))?,
+                _ => Vec::new(),
+            };
+            let content = parse_content(m.get("content"), !calls.is_empty())
+                .map_err(|e| format!("messages[{i}]: {e}"))?;
+            let mut msg = npu_engine::ChatMessage::new(role, content);
+            if !calls.is_empty() {
+                msg = msg.with_tool_calls(calls);
+            }
+            if let Some(id) = m.get("tool_call_id").and_then(|c| c.as_str()) {
+                msg = msg.with_tool_call_id(id);
+            }
+            chat.push(msg);
         }
-        let params = parse_generate_params(&v)?;
+        let mut params = parse_generate_params(&v)?;
+        params.tools = parse_tools(&v)?;
         let stream = v.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
         reject_unsupported(&v, false)?;
-        Ok(ParsedGenerate { model, prompt: npu_engine::Prompt::Chat(chat), params, stream })
+        Ok(ParsedGenerate { model, prompt: npu_engine::Prompt::Chat(chat), params, stream,
+                            stats: wants_stats(&v) })
+    }
+
+    /// The declared `tools`, after `tool_choice` has had its say.
+    ///
+    /// `tool_choice: "none"` returns an EMPTY list rather than being recorded as a flag: "the model
+    /// will not call a tool" is exactly what an unrendered tools block means, so there is nothing
+    /// further downstream to know about. `"required"` and a named function are rejected in
+    /// `reject_unsupported` -- we cannot GUARANTEE either without constrained decoding, and
+    /// accepting them and hoping is the silent substitution this surface exists to refuse.
+    fn parse_tools(v: &serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+        if v.get("tool_choice").and_then(|c| c.as_str()) == Some("none") {
+            return Ok(Vec::new());
+        }
+        let Some(tools) = v.get("tools").filter(|t| !t.is_null()) else { return Ok(Vec::new()) };
+        let tools = tools.as_array().ok_or_else(|| "\"tools\" must be an array".to_string())?;
+        for (i, t) in tools.iter().enumerate() {
+            if t.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()).is_none() {
+                return Err(format!("tools[{i}]: missing \"function.name\""));
+            }
+        }
+        Ok(tools.clone())
+    }
+
+    /// The `tool_calls` on an assistant turn we are being sent BACK, so the model can see what it
+    /// called. `arguments` is a JSON string on the wire; a template renders it as an object, so it
+    /// is decoded here rather than left for the template to fail on.
+    fn parse_tool_calls(calls: &[serde_json::Value]) -> Result<Vec<npu_engine::ToolCall>, String> {
+        calls
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let f = c.get("function")
+                    .ok_or_else(|| format!("tool_calls[{i}]: missing \"function\""))?;
+                let name = f.get("name").and_then(|n| n.as_str())
+                    .ok_or_else(|| format!("tool_calls[{i}]: missing \"function.name\""))?;
+                let arguments = match f.get("arguments") {
+                    Some(serde_json::Value::String(s)) if s.trim().is_empty() => serde_json::json!({}),
+                    Some(serde_json::Value::String(s)) => serde_json::from_str(s)
+                        .map_err(|e| format!("tool_calls[{i}]: \"arguments\" is not JSON: {e}"))?,
+                    Some(other) => other.clone(),
+                    None => serde_json::json!({}),
+                };
+                Ok(npu_engine::ToolCall {
+                    id: c.get("id").and_then(|x| x.as_str()).unwrap_or("call_0").to_string(),
+                    name: name.to_string(),
+                    arguments,
+                })
+            })
+            .collect()
+    }
+
+    /// `POST /api/chat`. Ollama's request shape over the same `ParsedGenerate` the OpenAI routes
+    /// produce, so exactly one generation path exists downstream.
+    ///
+    /// Three real differences from `parse_chat_request`, each a bug if assumed away:
+    ///   * sampling lives under `options`, not at the top level;
+    ///   * `stream` defaults to TRUE (OpenAI's defaults to false);
+    ///   * `num_predict: -1` means "no limit", which is the ABSENCE of a request value here rather
+    ///     than a number, so the model's own budget still applies.
+    pub fn parse_ollama_chat_request(body: &str) -> Result<ParsedGenerate, String> {
+        let v: serde_json::Value = serde_json::from_str(body).map_err(|e| format!("invalid JSON: {e}"))?;
+        let model = v.get("model").and_then(|m| m.as_str()).map(str::to_string);
+        let messages = v.get("messages").and_then(|m| m.as_array())
+            .ok_or_else(|| "missing \"messages\" array".to_string())?;
+        if messages.is_empty() { return Err("\"messages\" must not be empty".into()); }
+        let mut chat = Vec::with_capacity(messages.len());
+        for (i, m) in messages.iter().enumerate() {
+            let role = m.get("role").and_then(|r| r.as_str())
+                .ok_or_else(|| format!("messages[{i}]: missing \"role\""))?.to_string();
+            let calls = match m.get("tool_calls").and_then(|c| c.as_array()) {
+                Some(c) if !c.is_empty() => parse_tool_calls(c).map_err(|e| format!("messages[{i}]: {e}"))?,
+                _ => Vec::new(),
+            };
+            let content = parse_content(m.get("content"), !calls.is_empty())
+                .map_err(|e| format!("messages[{i}]: {e}"))?;
+            let mut msg = npu_engine::ChatMessage::new(role, content);
+            if !calls.is_empty() { msg = msg.with_tool_calls(calls); }
+            if let Some(id) = m.get("tool_call_id").and_then(|c| c.as_str()) {
+                msg = msg.with_tool_call_id(id);
+            }
+            chat.push(msg);
+        }
+
+        let mut params = npu_engine::GenerateParams::default();
+        let opts = v.get("options").and_then(|o| o.as_object());
+        let opt = |k: &str| opts.and_then(|o| o.get(k));
+        params.temperature = opt("temperature").and_then(|x| x.as_f64()).map(|f| f as f32);
+        params.top_p = opt("top_p").and_then(|x| x.as_f64()).map(|f| f as f32);
+        params.top_k = opt("top_k").and_then(|x| x.as_u64()).map(|n| n as u32);
+        params.seed = opt("seed").and_then(|x| x.as_u64());
+        params.repetition_penalty = opt("repeat_penalty").and_then(|x| x.as_f64()).map(|f| f as f32);
+        params.max_tokens = match opt("num_predict").and_then(|x| x.as_i64()) {
+            Some(n) if n >= 0 => Some(n as u32),
+            _ => None,
+        };
+        params.stop = match opt("stop") {
+            Some(serde_json::Value::String(s)) => vec![s.clone()],
+            Some(serde_json::Value::Array(a)) =>
+                a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect(),
+            _ => Vec::new(),
+        };
+        params.tools = parse_tools(&v)?;
+        // `think` is Ollama's spelling of the kwarg our template calls `enable_thinking`. Absent
+        // leaves it UNSET, which is not the same as true -- see `ChatTemplate::render_with`.
+        params.enable_thinking = v.get("think").and_then(|x| x.as_bool());
+        params.validate()?;
+
+        let stream = v.get("stream").and_then(|s| s.as_bool()).unwrap_or(true);
+        Ok(ParsedGenerate { model, prompt: npu_engine::Prompt::Chat(chat), params, stream, stats: false })
     }
 
     /// A message's `content`: a plain string, or OpenAI's multi-part array form when every part is
     /// `{"type":"text","text":...}`. Any other part type is REJECTED rather than silently dropped (the
     /// old behaviour) -- this surface has no vision/audio input, and dropping content changes the
     /// prompt's meaning with no trace, which is exactly what spec S6 bans.
-    fn parse_content(v: Option<&serde_json::Value>) -> Result<String, String> {
+    fn parse_content(v: Option<&serde_json::Value>, has_tool_calls: bool) -> Result<String, String> {
         match v {
+            // OpenAI sends `content: null` on an assistant turn whose payload is `tool_calls`, and
+            // omits it entirely on some clients. That is not missing content -- the turn's content
+            // IS the call. Only a turn with no call either way is still an error.
+            Some(serde_json::Value::Null) | None if has_tool_calls => Ok(String::new()),
             Some(serde_json::Value::String(s)) => Ok(s.clone()),
             Some(serde_json::Value::Array(parts)) => {
                 let mut out = String::new();
@@ -801,7 +1177,8 @@ pub mod parse {
         let params = parse_generate_params(&v)?;
         let stream = v.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
         reject_unsupported(&v, true)?;
-        Ok(ParsedGenerate { model, prompt: npu_engine::Prompt::Raw(prompt), params, stream })
+        Ok(ParsedGenerate { model, prompt: npu_engine::Prompt::Raw(prompt), params, stream,
+                            stats: wants_stats(&v) })
     }
 
     /// The shared sampling surface: OpenAI's fields plus `top_k`/`repetition_penalty`, neither in
@@ -877,6 +1254,17 @@ pub mod parse {
     /// surface cannot honour must be a 400, not a quiet no-op. `n != 1`, `logprobs`, `logit_bias`,
     /// `tools` and friends all change what the RESPONSE IS; accepting them and ignoring their effect
     /// would answer a request other than the one that was sent, with no trace of the substitution.
+    /// `null`, `[]` or `{}` -- the three ways a client says "nothing here". A field with one of
+    /// these asks for no behaviour, so it can be accepted whatever the field means.
+    fn is_empty_collection(v: &serde_json::Value) -> bool {
+        match v {
+            serde_json::Value::Null => true,
+            serde_json::Value::Array(a) => a.is_empty(),
+            serde_json::Value::Object(o) => o.is_empty(),
+            _ => false,
+        }
+    }
+
     fn reject_unsupported(v: &serde_json::Value, completions: bool) -> Result<(), String> {
         if let Some(n) = v.get("n").and_then(|x| x.as_u64()) {
             if n != 1 { return Err("\"n\" != 1 is not supported".into()); }
@@ -887,9 +1275,40 @@ pub mod parse {
             v.get("logprobs").and_then(|x| x.as_bool()).unwrap_or(false)
         };
         if logprobs_wanted { return Err("\"logprobs\" is not supported".into()); }
-        for field in ["logit_bias", "tools", "tool_choice", "response_format", "stream_options"] {
-            if v.get(field).map(|x| !x.is_null()).unwrap_or(false) {
+        // NOT `!is_null()`: an EMPTY collection requests nothing, so honouring it and ignoring it
+        // are the SAME response and S6 does not apply. `tools: []` is what a client sends on a
+        // plain chat with tool support switched on, and rejecting it was a hard 400 on every
+        // message. `logit_bias: {}` is the same shape.
+        for field in ["logit_bias", "response_format"] {
+            if v.get(field).is_some_and(|x| !is_empty_collection(x)) {
                 return Err(format!("\"{field}\" is not supported"));
+            }
+        }
+        // `auto` and `none` are both honoured -- `none` by not rendering the tools block, which is
+        // exactly what it means. `required` and a named function are not: without constrained
+        // decoding we cannot make the model call anything, and answering as if we had is the silent
+        // substitution this function exists to prevent.
+        match v.get("tool_choice") {
+            None => {}
+            Some(x) if is_empty_collection(x) => {}
+            Some(serde_json::Value::String(s)) if s == "auto" || s == "none" => {}
+            Some(_) => {
+                return Err("\"tool_choice\" other than \"auto\" or \"none\" is not supported \
+                            (this server does not constrain decoding, so it cannot guarantee a call)"
+                    .into())
+            }
+        }
+        // `stream_options` used to be rejected whole. It carries `include_stats` now, so the
+        // rejection narrows to the keys inside it rather than disappearing: `include_usage` is a
+        // real OpenAI feature this server does not emit, and quietly accepting it would be exactly
+        // the silent no-op this function exists to prevent.
+        if let Some(o) = v.get("stream_options").filter(|x| !x.is_null()) {
+            let Some(o) = o.as_object() else { return Err("\"stream_options\" must be an object".into()) };
+            for k in o.keys() {
+                if k != "include_stats" {
+                    return Err(format!("\"stream_options.{k}\" is not supported \
+                                        (this server honours \"include_stats\")"));
+                }
             }
         }
         if completions {
@@ -1483,22 +1902,23 @@ mod route_tests {
 /// own fixture -- a scripted generator that emits a fixed token list with a settable per-token delay,
 /// per the task's own prescription for testing this surface without a real decoder.
 #[cfg(test)]
-mod generate_tests {
+pub(crate) mod generate_tests {
     use super::*;
     use crate::actor::start;
     use crate::config::{Config, ModelCfg, ServerCfg};
     use crate::loader::{ModelLoader, Servable, StreamServable};
     use npu_engine::capability::{Capability, Request as EngineReq, Response as EngineResp};
-    use npu_engine::{Chunk, FinishReason, GenerateParams, GenerateUsage, Prompt, TextGenerator};
+    use npu_engine::{Chunk, FinishReason, GenerateParams, GenerateUsage, GenerationReport, Prompt,
+                     StepRecord, TextGenerator};
     use npu_engine::EngineError;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    fn post(path: &str, body: &str) -> Request {
+    pub(crate) fn post(path: &str, body: &str) -> Request {
         Request { method: "POST".into(), path: path.into(), boundary: String::new(), body: body.as_bytes().to_vec() }
     }
-    fn ss(v: &[&str]) -> Vec<String> { v.iter().map(|s| s.to_string()).collect() }
+    pub(crate) fn ss(v: &[&str]) -> Vec<String> { v.iter().map(|s| s.to_string()).collect() }
     fn close(a: f32, b: f32) -> bool { (a - b).abs() < 1e-6 }
 
     type Seen = Arc<Mutex<Option<(Prompt, GenerateParams)>>>;
@@ -1512,18 +1932,48 @@ mod generate_tests {
             sink: &mut dyn FnMut(Chunk<'_>) -> bool) -> Result<(), EngineError> {
             *self.seen.lock().unwrap() = Some((prompt.clone(), params.clone()));
             let mut usage = GenerateUsage::default();
+            let mut report = GenerationReport::default();
+            let t0 = std::time::Instant::now();
             let cap = (params.max_tokens.unwrap_or(npu_engine::DEFAULT_MAX_TOKENS) as usize).min(self.tokens.len());
-            for tok in self.tokens.iter().take(cap) {
+            for (i, tok) in self.tokens.iter().take(cap).enumerate() {
                 if !self.delay.is_zero() { std::thread::sleep(self.delay); }
                 self.sent.fetch_add(1, Ordering::SeqCst);
                 usage.completion_tokens += 1;
-                if !sink(Chunk::Text(tok)) {
-                    let _ = sink(Chunk::Done { reason: FinishReason::Aborted, usage });
+                let t_us = t0.elapsed().as_micros() as u64;
+                let rec = StepRecord {
+                    seq: i as u32,
+                    token: Some(1000 + i as u32),
+                    text: tok.clone(),
+                    emit: tok.clone(),
+                    t_us,
+                    dt_us: t_us.saturating_sub(report.steps.last().map(|s| s.t_us).unwrap_or(0)),
+                    ..StepRecord::default()
+                };
+                let live = sink(Chunk::Text(&rec.emit)) && sink(Chunk::Step(&rec));
+                report.steps.push(rec);
+                if !live {
+                    report.usage = usage;
+                    let _ = sink(Chunk::Done { reason: FinishReason::Aborted, usage, report: &report });
                     return Ok(());
                 }
             }
-            let reason = if cap < self.tokens.len() { FinishReason::Length } else { FinishReason::Stop };
-            sink(Chunk::Done { reason, usage });
+            // Declaring tools makes the scripted model call one. That is the whole contract this
+            // layer has to carry: the generator decides, the wire renders.
+            let mut reason = if cap < self.tokens.len() { FinishReason::Length } else { FinishReason::Stop };
+            if !params.tools.is_empty() {
+                let call = npu_engine::ToolCall {
+                    id: "call_0".into(),
+                    name: "get_weather".into(),
+                    arguments: serde_json::json!({ "city": "Paris" }),
+                };
+                sink(Chunk::ToolCall(&call));
+                if reason == FinishReason::Stop {
+                    reason = FinishReason::ToolCalls;
+                }
+            }
+            report.usage = usage;
+            report.generate_us = t0.elapsed().as_micros() as u64;
+            sink(Chunk::Done { reason, usage, report: &report });
             Ok(())
         }
     }
@@ -1552,7 +2002,7 @@ mod generate_tests {
         fn declared_capability(&self, _cfg: &ModelCfg) -> Option<Capability> { Some(Capability::GENERATE) }
     }
 
-    fn gen_handle(tokens: Vec<String>, delay: Duration)
+    pub(crate) fn gen_handle(tokens: Vec<String>, delay: Duration)
         -> (Handle, std::thread::JoinHandle<()>, tempfile::TempDir, PathBuf, Arc<AtomicUsize>, Seen) {
         let sent = Arc::new(AtomicUsize::new(0));
         let seen: Seen = Arc::new(Mutex::new(None));
@@ -1567,6 +2017,90 @@ mod generate_tests {
         cfg.save(&p).unwrap();
         let (h, j) = start(cfg, Box::new(loader)).unwrap();
         (h, j, dir, p, sent, seen)
+    }
+
+    /// A buffered response carries its own measurements, always. This is the surface a human hits
+    /// with curl and the one Open WebUI reads; making it opt-in would mean the default answer to
+    /// "how fast was that" is silence.
+    #[test]
+    fn a_buffered_response_always_carries_its_measurements() {
+        let (h, j, _d, p, _sent, _seen) = gen_handle(ss(&["Hello", ", ", "world"]), Duration::from_millis(5));
+        let (code, body) = route(&post("/v1/chat/completions",
+            r#"{"messages":[{"role":"user","content":"hi"}]}"#), &h, &p);
+        assert_eq!(code, 200, "{body}");
+        let v: serde_json::Value = serde_json::from_str(body.text()).unwrap();
+        // usage is untouched: the OpenAI contract does not move because we added to it.
+        assert_eq!(v["usage"]["completion_tokens"], 3);
+        assert_eq!(v["timings"]["predicted_n"], 3, "llama.cpp-shaped, for the tools that read it");
+        assert!(v["timings"]["predicted_per_second"].as_f64().unwrap() > 0.0);
+        let x = &v["x_npu"];
+        assert!(x["tok_per_s"].as_f64().unwrap() > 0.0);
+        assert!(x["itl_ms"]["p99"].as_f64().is_some());
+        assert!(x["spans_ms"]["total"].as_f64().unwrap() >= x["spans_ms"]["decode"].as_f64().unwrap());
+        assert!(x["bound"].as_str().is_some(), "a verdict, not just numbers");
+        assert!(x["lever"].as_str().is_some(), "and what to do about it");
+        h.shutdown(); let _ = j.join();
+    }
+
+    /// The route that closes the two-writer gap: `[server]` keys were the last mutation the CLI
+    /// made to `engine.toml` itself while the service rewrote the same file for everything else.
+    #[test]
+    fn admin_server_edits_the_file_and_rejects_a_key_it_does_not_know() {
+        let (h, j, dir, p, _s, _seen) = gen_handle(ss(&["x"]), Duration::ZERO);
+        let _ = dir;
+        let (code, body) = route(&post("/admin/server", r#"{"key":"max_resident","value":"3"}"#), &h, &p);
+        assert_eq!(code, 200, "{body}");
+        assert!(body.text().contains("\"loaded\""), "answers with a reconcile report: {body}");
+        assert!(std::fs::read_to_string(&p).unwrap().contains("max_resident = 3"),
+            "the SERVICE wrote the file");
+
+        // A key nothing reads is a 400 with the reason, not a silently ignored write.
+        let (code, body) = route(&post("/admin/server", r#"{"key":"no_such_key","value":"1"}"#), &h, &p);
+        assert_eq!(code, 400, "{body}");
+        let (code, _) = route(&post("/admin/server", r#"{"key":"max_resident"}"#), &h, &p);
+        assert_eq!(code, 400, "a request missing `value` is refused");
+        h.shutdown(); let _ = j.join();
+    }
+
+    #[test]
+    fn stats_are_requested_by_either_spelling_and_off_by_default() {
+        use parse::wants_stats;
+        let v = |b: &str| serde_json::from_str::<serde_json::Value>(b).unwrap();
+        assert!(!wants_stats(&v(r#"{"messages":[]}"#)));
+        assert!(wants_stats(&v(r#"{"stream_options":{"include_stats":true}}"#)));
+        assert!(wants_stats(&v(r#"{"x_npu_stats":true}"#)));
+        assert!(!wants_stats(&v(r#"{"x_npu_stats":false}"#)));
+        // Not a false cognate: OpenAI's own include_usage means something else and must not turn
+        // per-token telemetry on by itself.
+        assert!(!wants_stats(&v(r#"{"stream_options":{"include_usage":true}}"#)));
+    }
+
+    /// The run log has to be readable by the thing that reads run logs. Writing a format nothing
+    /// parses is the classic way an instrument becomes decoration.
+    #[test]
+    fn a_written_run_log_parses_back_into_the_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = wire::RunMeta { id: "chatcmpl-x".into(), created: 1, model: "m".into(), chat: true };
+        let mut log = crate::run_log::RunLog::open_in(dir.path(), &meta.id).unwrap();
+        log.header(&meta);
+        let mut report = GenerationReport { usage: GenerateUsage { prompt_tokens: 2, completion_tokens: 2 },
+                                            generate_us: 40_000, ..Default::default() };
+        for i in 0..2u32 {
+            let rec = StepRecord { seq: i, token: Some(7 + i), text: format!("t{i}"), emit: format!("t{i}"),
+                                   t_us: 20_000 * (i as u64 + 1), dt_us: 20_000, ..Default::default() };
+            log.line(&wire::chunk_line(&rec, &meta));
+            report.steps.push(rec);
+        }
+        log.line(&wire::prefill_line(&report.prefill, &meta));
+        log.line(&wire::summary_line(&report, &meta, FinishReason::Stop));
+        drop(log);
+
+        let text = std::fs::read_to_string(dir.path().join("chatcmpl-x.jsonl")).unwrap();
+        let run = wire::parse_run(&text).unwrap();
+        assert_eq!(run.id, "chatcmpl-x");
+        assert_eq!(run.steps, report.steps);
+        assert_eq!(run.finish_reason.as_deref(), Some("stop"));
+        assert_eq!(run.summary.unwrap().completion_tokens, 2);
     }
 
     #[test]
@@ -1872,6 +2406,7 @@ mod generate_tests {
                     assert!(frame["choices"][0]["finish_reason"].is_null());
                     texts.push(t);
                 }
+                StreamItem::Step(_) | StreamItem::ToolCall(_) => {}
                 StreamItem::Done { reason, .. } => {
                     let frame: serde_json::Value = serde_json::from_str(&s.render_done(reason)).unwrap();
                     assert_eq!(frame["choices"][0]["finish_reason"], reason.as_str());
@@ -1937,5 +2472,395 @@ mod generate_tests {
             r#"{"messages":[{"role":"user","content":"hi"}]}"#), &h, &p);
         assert_eq!(code, 200, "{body}");
         h.shutdown(); j.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tool_route_tests {
+    use super::generate_tests::{gen_handle, post, ss};
+    use super::*;
+    use std::time::Duration;
+
+    const WEATHER: &str = r#"{"type":"function","function":{"name":"get_weather",
+        "parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}"#;
+
+    /// An EMPTY collection requests nothing, so honouring it and ignoring it are the SAME response
+    /// and S6 does not apply. The predicate tested `!x.is_null()`, which over-fires -- and
+    /// `tools: []` is what a client sends on a plain chat with tool support switched on, so this
+    /// alone was a hard 400 on every message.
+    #[test]
+    fn an_empty_collection_is_not_a_rejection() {
+        let (h, _j, _d, p, _s, _seen) = gen_handle(ss(&["hi"]), Duration::ZERO);
+        for body in [
+            r#"{"messages":[{"role":"user","content":"hi"}],"tools":[]}"#,
+            r#"{"messages":[{"role":"user","content":"hi"}],"logit_bias":{}}"#,
+            r#"{"messages":[{"role":"user","content":"hi"}],"tool_choice":null}"#,
+            r#"{"messages":[{"role":"user","content":"hi"}],"response_format":{}}"#,
+        ] {
+            let (code, out) = route(&post("/v1/chat/completions", body), &h, &p);
+            assert_eq!(code, 200, "rejected {body}: {out}");
+        }
+    }
+
+    /// A non-empty `logit_bias` or `response_format` still cannot be honoured, and saying so is the
+    /// point of `reject_unsupported`. Narrowing the predicate must not have widened the acceptance.
+    #[test]
+    fn a_non_empty_unsupported_field_is_still_a_400() {
+        let (h, _j, _d, p, _s, _seen) = gen_handle(ss(&["hi"]), Duration::ZERO);
+        for body in [
+            r#"{"messages":[{"role":"user","content":"hi"}],"logit_bias":{"5":1}}"#,
+            r#"{"messages":[{"role":"user","content":"hi"}],"response_format":{"type":"json_object"}}"#,
+        ] {
+            assert_eq!(route(&post("/v1/chat/completions", body), &h, &p).0, 400, "accepted {body}");
+        }
+    }
+
+    /// `required` and a named function cannot be GUARANTEED without constrained decoding. Accepting
+    /// them and hoping is exactly the silent substitution this surface refuses.
+    #[test]
+    fn tool_choice_we_cannot_guarantee_is_a_400() {
+        let (h, _j, _d, p, _s, _seen) = gen_handle(ss(&["hi"]), Duration::ZERO);
+        for tc in [r#""required""#, r#"{"type":"function","function":{"name":"get_weather"}}"#] {
+            let body = format!(
+                r#"{{"messages":[{{"role":"user","content":"hi"}}],"tools":[{WEATHER}],"tool_choice":{tc}}}"#
+            );
+            assert_eq!(route(&post("/v1/chat/completions", &body), &h, &p).0, 400, "accepted {tc}");
+        }
+    }
+
+    /// `none` means the model will not call a tool, and an unrendered tools block IS that. The
+    /// engine must receive no tools -- not a flag it would have to remember to honour.
+    #[test]
+    fn tool_choice_none_reaches_the_engine_as_no_tools() {
+        let (h, _j, _d, p, _s, seen) = gen_handle(ss(&["hi"]), Duration::ZERO);
+        let body = format!(
+            r#"{{"messages":[{{"role":"user","content":"hi"}}],"tools":[{WEATHER}],"tool_choice":"none"}}"#
+        );
+        assert_eq!(route(&post("/v1/chat/completions", &body), &h, &p).0, 200);
+        let (_, params) = seen.lock().unwrap().clone().unwrap();
+        assert!(params.tools.is_empty(), "tool_choice:none still sent tools to the engine");
+    }
+
+    #[test]
+    fn declared_tools_reach_the_engine_verbatim() {
+        let (h, _j, _d, p, _s, seen) = gen_handle(ss(&["hi"]), Duration::ZERO);
+        let body = format!(r#"{{"messages":[{{"role":"user","content":"hi"}}],"tools":[{WEATHER}]}}"#);
+        assert_eq!(route(&post("/v1/chat/completions", &body), &h, &p).0, 200);
+        let (_, params) = seen.lock().unwrap().clone().unwrap();
+        assert_eq!(params.tools.len(), 1);
+        assert_eq!(params.tools[0]["function"]["name"], "get_weather");
+    }
+
+    /// The round trip a tool loop actually makes: the client sends back the assistant turn that
+    /// called, and the tool turn answering it. Both must survive into the prompt the engine sees.
+    #[test]
+    fn a_tool_result_turn_round_trips_into_the_prompt() {
+        let (h, _j, _d, p, _s, seen) = gen_handle(ss(&["ok"]), Duration::ZERO);
+        let body = format!(
+            r#"{{"messages":[
+                {{"role":"user","content":"weather?"}},
+                {{"role":"assistant","content":null,"tool_calls":[
+                    {{"id":"call_0","type":"function",
+                      "function":{{"name":"get_weather","arguments":"{{\"city\": \"Paris\"}}"}}}}]}},
+                {{"role":"tool","tool_call_id":"call_0","content":"{{\"temp_c\": 14}}"}}
+            ],"tools":[{WEATHER}]}}"#
+        );
+        let (code, out) = route(&post("/v1/chat/completions", &body), &h, &p);
+        assert_eq!(code, 200, "{out}");
+        let (prompt, _) = seen.lock().unwrap().clone().unwrap();
+        let npu_engine::Prompt::Chat(msgs) = prompt else { panic!("not a chat prompt") };
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[1].tool_calls.len(), 1);
+        assert_eq!(msgs[1].tool_calls[0].name, "get_weather");
+        // Decoded from the wire's JSON STRING into an object, because that is what a template
+        // renders. Left as a string, `tojson` would emit a quoted blob.
+        assert_eq!(msgs[1].tool_calls[0].arguments, serde_json::json!({ "city": "Paris" }));
+        assert_eq!(msgs[2].tool_call_id.as_deref(), Some("call_0"));
+    }
+
+    /// `arguments` goes out as a JSON STRING, not an object: that is OpenAI's own encoding, and a
+    /// client calling JSON.parse on an object would throw.
+    #[test]
+    fn a_buffered_response_renders_openai_shaped_tool_calls() {
+        let (h, _j, _d, p, _s, _seen) = gen_handle(Vec::new(), Duration::ZERO);
+        let body = format!(r#"{{"messages":[{{"role":"user","content":"hi"}}],"tools":[{WEATHER}]}}"#);
+        let (code, out) = route(&post("/v1/chat/completions", &body), &h, &p);
+        assert_eq!(code, 200, "{out}");
+        let v: serde_json::Value = serde_json::from_str(out.text()).unwrap();
+        assert_eq!(v["choices"][0]["finish_reason"], "tool_calls");
+        let call = &v["choices"][0]["message"]["tool_calls"][0];
+        assert_eq!(call["id"], "call_0");
+        assert_eq!(call["type"], "function");
+        assert_eq!(call["function"]["name"], "get_weather");
+        assert_eq!(call["function"]["arguments"], r#"{"city":"Paris"}"#);
+        // No text and a call present -> null, which is what a client branches on to decide there
+        // is nothing to show the user.
+        assert!(v["choices"][0]["message"]["content"].is_null());
+    }
+
+    /// A plain completion must still say `content: ""` and carry no `tool_calls` key at all.
+    #[test]
+    fn a_response_with_no_calls_is_unchanged() {
+        let (h, _j, _d, p, _s, _seen) = gen_handle(ss(&["Hello"]), Duration::ZERO);
+        let (code, out) =
+            route(&post("/v1/chat/completions", r#"{"messages":[{"role":"user","content":"hi"}]}"#), &h, &p);
+        assert_eq!(code, 200, "{out}");
+        let v: serde_json::Value = serde_json::from_str(out.text()).unwrap();
+        assert_eq!(v["choices"][0]["message"]["content"], "Hello");
+        assert_eq!(v["choices"][0]["finish_reason"], "stop");
+        assert!(v["choices"][0]["message"].get("tool_calls").is_none());
+    }
+
+    #[test]
+    fn a_malformed_tool_declaration_is_a_400() {
+        let (h, _j, _d, p, _s, _seen) = gen_handle(ss(&["hi"]), Duration::ZERO);
+        for body in [
+            r#"{"messages":[{"role":"user","content":"hi"}],"tools":{"a":1}}"#,
+            r#"{"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function"}]}"#,
+        ] {
+            assert_eq!(route(&post("/v1/chat/completions", body), &h, &p).0, 400, "accepted {body}");
+        }
+    }
+
+    /// The streaming frame. `arguments` is a JSON string here too -- a client concatenates
+    /// fragments by `index` and then parses, so the two surfaces must agree on the encoding or the
+    /// same completion decodes differently depending on a flag the client set.
+    #[test]
+    fn a_streamed_tool_call_is_an_openai_delta() {
+        let (h, _j, _d, p, _s, _seen) = gen_handle(Vec::new(), Duration::ZERO);
+        let body = format!(
+            r#"{{"messages":[{{"role":"user","content":"hi"}}],"tools":[{WEATHER}],"stream":true}}"#
+        );
+        let (code, resp) = route(&post("/v1/chat/completions", &body), &h, &p);
+        assert_eq!(code, 200);
+        let Body::Stream(st) = resp else { panic!("not a stream") };
+        let mut deltas = Vec::new();
+        let mut finish = None;
+        let mut seen = 0usize;
+        for item in st.rx.iter() {
+            match item {
+                StreamItem::ToolCall(c) => {
+                    let frame: serde_json::Value =
+                        serde_json::from_str(&st.render_tool_call(&c, seen)).unwrap();
+                    seen += 1;
+                    deltas.push(frame);
+                }
+                StreamItem::Done { reason, .. } => finish = Some(reason),
+                _ => {}
+            }
+        }
+        assert_eq!(deltas.len(), 1);
+        let call = &deltas[0]["choices"][0]["delta"]["tool_calls"][0];
+        assert_eq!(deltas[0]["object"], "chat.completion.chunk");
+        assert_eq!(call["index"], 0);
+        assert_eq!(call["id"], "call_0");
+        assert_eq!(call["type"], "function");
+        assert_eq!(call["function"]["name"], "get_weather");
+        assert_eq!(call["function"]["arguments"], r#"{"city":"Paris"}"#);
+        assert!(deltas[0]["choices"][0]["finish_reason"].is_null());
+        assert_eq!(finish.map(|f| f.as_str()), Some("tool_calls"));
+    }
+}
+
+/// Days since the Unix epoch to (year, month, day). Howard Hinnant's `civil_from_days`, which is
+/// the standard branch-free form of this and is here because `created_at` needs an RFC3339 stamp
+/// and nothing in the dependency set provides one.
+/// A unix timestamp as RFC3339 UTC. The Ollama surface stamps `created_at` as a string where
+/// OpenAI stamps `created` as an integer, and nothing in the dependency set formats a date.
+fn rfc3339(secs: i64) -> String {
+    let secs = secs.max(0) as u64;
+    let (h, m, sec) = ((secs % 86_400) / 3600, (secs % 3600) / 60, secs % 60);
+    let (y, mo, d) = civil_from_days((secs / 86_400) as i64);
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{sec:02}Z")
+}
+
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+#[cfg(test)]
+mod ollama_route_tests {
+    use super::generate_tests::{gen_handle, post, ss};
+    use super::*;
+    use std::time::Duration;
+
+    fn get(path: &str) -> Request {
+        Request { method: "GET".into(), path: path.into(), boundary: String::new(), body: vec![] }
+    }
+
+    const WEATHER: &str = r#"{"type":"function","function":{"name":"get_weather",
+        "parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}"#;
+
+    /// A client probes `/api/version` to decide it is talking to an Ollama server at all. Nothing
+    /// else on this surface is reachable until this answers.
+    #[test]
+    fn version_identifies_the_server() {
+        let (h, _j, _d, p, _s, _seen) = gen_handle(ss(&["hi"]), Duration::ZERO);
+        let (code, body) = route(&get("/api/version"), &h, &p);
+        assert_eq!(code, 200);
+        let v: serde_json::Value = serde_json::from_str(body.text()).unwrap();
+        assert!(v["version"].as_str().unwrap().contains("xdna-engine"), "{body}");
+    }
+
+    /// Ollama has no vocabulary for an ASR or embedding model, and listing one would drop it into a
+    /// client's chat picker where every request 400s.
+    #[test]
+    fn tags_lists_only_generate_models() {
+        let (h, _j, _d, p, _s, _seen) = gen_handle(ss(&["hi"]), Duration::ZERO);
+        let (code, body) = route(&get("/api/tags"), &h, &p);
+        assert_eq!(code, 200);
+        let v: serde_json::Value = serde_json::from_str(body.text()).unwrap();
+        let models = v["models"].as_array().unwrap();
+        assert_eq!(models.len(), 1, "{body}");
+        assert_eq!(models[0]["name"], "llm");
+        assert_eq!(models[0]["model"], "llm", "Ollama clients key on `model`, not only `name`");
+    }
+
+    #[test]
+    fn show_reports_capabilities_and_404s_an_unknown_model() {
+        let (h, _j, _d, p, _s, _seen) = gen_handle(ss(&["hi"]), Duration::ZERO);
+        let (code, body) = route(&post("/api/show", r#"{"model":"llm"}"#), &h, &p);
+        assert_eq!(code, 200, "{body}");
+        let v: serde_json::Value = serde_json::from_str(body.text()).unwrap();
+        // `completion` always; `tools` only where the template proves it, which the mock's
+        // scenario cannot, so its absence here is the honest answer rather than a gap.
+        let caps: Vec<&str> = v["capabilities"].as_array().unwrap()
+            .iter().map(|c| c.as_str().unwrap()).collect();
+        assert!(caps.contains(&"completion"), "{body}");
+        assert_eq!(route(&post("/api/show", r#"{"model":"nope"}"#), &h, &p).0, 404);
+        // `name` is the older spelling and clients still send it.
+        assert_eq!(route(&post("/api/show", r#"{"name":"llm"}"#), &h, &p).0, 200);
+    }
+
+    /// The one default that differs from OpenAI, and the one a client notices: absent `stream`
+    /// means STREAM on this surface.
+    #[test]
+    fn stream_defaults_to_true_unlike_openai() {
+        let one = |body: &str| {
+            let v: serde_json::Value = serde_json::from_str(body).unwrap();
+            let _ = v;
+            parse::parse_ollama_chat_request(body).unwrap().stream
+        };
+        assert!(one(r#"{"messages":[{"role":"user","content":"hi"}]}"#));
+        assert!(!one(r#"{"messages":[{"role":"user","content":"hi"},{"role":"user","content":"x"}],"stream":false}"#));
+        // ...and OpenAI's stays false, so the two parsers cannot be collapsed.
+        assert!(!parse::parse_chat_request(r#"{"messages":[{"role":"user","content":"hi"}]}"#).unwrap().stream);
+    }
+
+    /// Sampling lives under `options` here. Reading it from the top level would silently serve
+    /// every Ollama request at the engine's defaults instead of the client's.
+    #[test]
+    fn sampling_is_read_from_options_not_the_top_level() {
+        let p = parse::parse_ollama_chat_request(
+            r#"{"messages":[{"role":"user","content":"hi"}],
+                "options":{"temperature":0.25,"top_k":7,"top_p":0.5,"seed":42,
+                           "num_predict":16,"repeat_penalty":1.2,"stop":["END"]}}"#).unwrap();
+        assert_eq!(p.params.temperature, Some(0.25));
+        assert_eq!(p.params.top_k, Some(7));
+        assert_eq!(p.params.top_p, Some(0.5));
+        assert_eq!(p.params.seed, Some(42));
+        assert_eq!(p.params.max_tokens, Some(16));
+        assert_eq!(p.params.repetition_penalty, Some(1.2));
+        assert_eq!(p.params.stop, vec!["END".to_string()]);
+    }
+
+    /// `num_predict: -1` is Ollama's "no limit". It is the ABSENCE of a request value, not a
+    /// number -- read as one it would be a nonsense cap, and clamped to 0 it would emit nothing.
+    #[test]
+    fn num_predict_minus_one_is_unset_not_a_cap() {
+        let p = parse::parse_ollama_chat_request(
+            r#"{"messages":[{"role":"user","content":"hi"}],"options":{"num_predict":-1}}"#).unwrap();
+        assert_eq!(p.params.max_tokens, None);
+    }
+
+    /// `think` is Ollama's spelling of `enable_thinking`, and ABSENT is not the same as true --
+    /// the template distinguishes "unset" from "false" and only false is an instruction.
+    #[test]
+    fn think_maps_onto_enable_thinking_and_absent_stays_unset() {
+        let t = |b: &str| parse::parse_ollama_chat_request(b).unwrap().params.enable_thinking;
+        assert_eq!(t(r#"{"messages":[{"role":"user","content":"hi"}],"think":false}"#), Some(false));
+        assert_eq!(t(r#"{"messages":[{"role":"user","content":"hi"}],"think":true}"#), Some(true));
+        assert_eq!(t(r#"{"messages":[{"role":"user","content":"hi"}]}"#), None);
+    }
+
+    /// The buffered body is ONE object with `done: true` -- not OpenAI's `choices` array.
+    #[test]
+    fn a_buffered_chat_is_one_done_object() {
+        let (h, _j, _d, p, _s, _seen) = gen_handle(ss(&["Hello", " there"]), Duration::ZERO);
+        let (code, body) = route(
+            &post("/api/chat", r#"{"model":"llm","messages":[{"role":"user","content":"hi"}],"stream":false}"#),
+            &h, &p);
+        assert_eq!(code, 200, "{body}");
+        let v: serde_json::Value = serde_json::from_str(body.text()).unwrap();
+        assert_eq!(v["message"]["role"], "assistant");
+        assert_eq!(v["message"]["content"], "Hello there");
+        assert_eq!(v["done"], true);
+        assert_eq!(v["done_reason"], "stop");
+        assert!(v.get("choices").is_none(), "leaked the OpenAI shape onto the Ollama wire");
+        assert_eq!(v["eval_count"], 2);
+        assert!(v["created_at"].as_str().unwrap().ends_with('Z'), "created_at must be RFC3339");
+    }
+
+    /// `arguments` is an OBJECT here and a JSON STRING on /v1. Getting this backwards hands the
+    /// client a quoted blob where it expects a map.
+    #[test]
+    fn a_tool_call_carries_arguments_as_an_object_not_a_string() {
+        let (h, _j, _d, p, _s, _seen) = gen_handle(Vec::new(), Duration::ZERO);
+        let body = format!(
+            r#"{{"model":"llm","stream":false,"messages":[{{"role":"user","content":"hi"}}],"tools":[{WEATHER}]}}"#);
+        let (code, out) = route(&post("/api/chat", &body), &h, &p);
+        assert_eq!(code, 200, "{out}");
+        let v: serde_json::Value = serde_json::from_str(out.text()).unwrap();
+        let args = &v["message"]["tool_calls"][0]["function"]["arguments"];
+        assert!(args.is_object(), "arguments must be an object on this wire, got {args}");
+        assert_eq!(args["city"], "Paris");
+        assert_eq!(v["message"]["tool_calls"][0]["function"]["name"], "get_weather");
+    }
+
+    /// The streaming wire: bare JSON per line, terminated by an object with `done: true`. No
+    /// `data:` prefix and no `[DONE]` -- a client parsing SSE here would read nothing at all.
+    #[test]
+    fn the_stream_is_ndjson_terminated_by_done() {
+        let (h, _j, _d, p, _s, _seen) = gen_handle(ss(&["a", "b"]), Duration::ZERO);
+        let (code, resp) = route(
+            &post("/api/chat", r#"{"model":"llm","messages":[{"role":"user","content":"hi"}]}"#), &h, &p);
+        assert_eq!(code, 200);
+        assert_eq!(resp.content_type(), "application/x-ndjson");
+        let Body::Stream(st) = resp else { panic!("not a stream") };
+        let stamp = st.created_at();
+        let (mut text, mut done) = (String::new(), None);
+        for item in st.rx.iter() {
+            match item {
+                StreamItem::Text(t) => {
+                    let line = crate::ollama::chat_chunk(&st.model, &stamp, &t);
+                    assert!(!line.starts_with("data:"), "SSE framing leaked onto the Ollama wire");
+                    let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+                    assert_eq!(v["done"], false);
+                    text.push_str(v["message"]["content"].as_str().unwrap());
+                }
+                StreamItem::Done { reason, report, .. } =>
+                    done = Some(crate::ollama::chat_done(&st.model, &stamp, reason, &report)),
+                _ => {}
+            }
+        }
+        assert_eq!(text, "ab");
+        let v: serde_json::Value = serde_json::from_str(&done.expect("no terminal frame")).unwrap();
+        assert_eq!(v["done"], true);
+    }
+
+    #[test]
+    fn rfc3339_formats_a_known_instant() {
+        // 1970-01-01T00:00:00Z and a date past a leap year, so the civil conversion is exercised.
+        assert_eq!(rfc3339(0), "1970-01-01T00:00:00Z");
+        assert_eq!(rfc3339(1_700_000_000), "2023-11-14T22:13:20Z");
     }
 }

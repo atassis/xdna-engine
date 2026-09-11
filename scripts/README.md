@@ -1,6 +1,6 @@
 # scripts/
 
-316 entries, flat on disk, doing eight unrelated jobs. This index groups them by job so you
+330 entries, flat on disk, doing eight unrelated jobs. This index groups them by job so you
 can find the one you want without reading filenames. Descriptions are each script's own
 header line, not a re-description.
 

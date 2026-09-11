@@ -42,11 +42,12 @@ import gen_llm_decode as G  # noqa: E402
 from gen_llm_decode import (build_graph, load_weight_buffer,  # noqa: E402
                             report_artifact_freshness)
 from bench_llm_decode import rope_row  # noqa: E402
+from iron.common.kv_layout import KVLayout  # noqa: E402
 
 BF16 = ml_dtypes.bfloat16
 
 
-def census_from_mlir(fused, md):
+def census_from_mlir(fused, md, sgh=1):
     """The arm's CONTROL variables, read off its own fused MLIR rather than assumed.
 
     A fit's control variables need the same evidence as its result: the 39.3 us/configure fit this
@@ -60,6 +61,30 @@ def census_from_mlir(fused, md):
         out["configures"] = len(re.findall(r"aiex\.configure\s+@", src))
         out["runs"] = len(re.findall(r"aiex\.run\s+@", src))
         out["designs"] = len(re.findall(r"aie\.device\(", src))
+        # The per-LAYER counts do NOT live in the shared fused MLIR -- that file is only the
+        # top-level orchestration (one configure + NL runs of one design), so dividing its awaits
+        # by NL is off by the number of runs. The layer's own sequence is in the design's sibling
+        # MLIR, and counting THERE reproduces the published 105 awaits / 10 sync points per layer.
+        import glob
+        d = os.path.dirname(path)
+        # Select by NAME, not by mtime. Arms share a build dir and IRON does not rewrite a cached
+        # artifact, so on a re-run every arm's MLIR is already present with stale mtimes and
+        # "newest" silently resolves to whichever arm was built last -- MEASURED: a clean re-run
+        # labelled all four arms with sgh12's 21 sync points, the exact silent-wrong-answer shape
+        # isolate_build_dir's docstring warns about. The `_sgh<k>` suffix is the discriminator, so
+        # match on it; k=1 is the arm that carries no suffix at all.
+        cand = sorted(glob.glob(os.path.join(d, "DecodeLayerDataParallel_*.mlir")))
+        want = f"_sgh{sgh}.mlir"
+        cand = [c for c in cand
+                if (c.endswith(want) if sgh != 1 else "_sgh" not in os.path.basename(c))]
+        if len(cand) != 1:
+            out["census_error"] = f"{len(cand)} layer MLIRs match sgh={sgh}, need exactly 1"
+        if cand:
+            out["layer_mlir"] = os.path.basename(cand[0])
+            lsrc = open(cand[0]).read()
+            out["layer_awaits"] = len(re.findall(r"aiex\.dma_await_task", lsrc))
+            out["layer_syncs"] = count_sync_points(lsrc)
+            out["layer_bds"] = len(re.findall(r"aie\.dma_bd", lsrc))
         # DDR bytes are a varying control the moment an arm changes a weight DTYPE, so census them
         # per arm from the same shim BDs rather than carrying a figure over from another build.
         tool = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -71,6 +96,26 @@ def census_from_mlir(fused, md):
     except Exception as e:
         out["census_error"] = repr(e)
     return out
+
+
+def count_sync_points(src):
+    """Sync points = maximal CONTIGUOUS blocks of `aiex.dma_await_task`, walked in order.
+
+    The count that matters is not the number of awaits but the number of places the shim queue
+    actually drains, so N adjacent awaits closing one TaskGroup are ONE sync point. This
+    reproduces the 10/layer counted independently from the operators' Python source, which is
+    the check that the rule
+    below is reading the right thing. A `finish()` with no waited task emits no await at all and
+    correctly does not appear here.
+    """
+    ops = re.findall(r"(?m)^\s*(?:%\S+\s*=\s*)?([a-zA-Z_][\w]*(?:\.[\w]+)+)", src)
+    n, prev = 0, False
+    for op in ops:
+        cur = op == "aiex.dma_await_task"
+        if cur and not prev:
+            n += 1
+        prev = cur
+    return n
 
 
 def median_spread(xs):
@@ -87,6 +132,11 @@ def fit_affine(pairs):
     sxx = sum(L * L for L, _ in pairs)
     sxy = sum(L * t for L, t in pairs)
     den = n * sxx - sx * sx
+    if den == 0:
+        # Every arm at the same L: this is a sweep of something OTHER than depth (the `s` arm is
+        # one), and there is no depth slope to fit. Say so instead of dividing by zero AFTER the
+        # timing has already been paid for and BEFORE --out-json is written.
+        return None, None, None
     alpha = (n * sxy - sx * sy) / den
     beta = (sy - alpha * sx) / n
     resid = [t - (alpha * L + beta) for L, t in pairs]
@@ -102,7 +152,10 @@ def main():
                          "op_o into the MLP design, 5 runs/layer instead of 6, bytes ~unchanged); "
                          "'cN' = MLP_DP_COLS=N; 'q<dtype>' = QUANT_MLP_DTYPE (Wg/Wu/Wd), which "
                          "moves per-layer WEIGHT bytes at constant configures -- the only way to "
-                         "measure the layer body's marginal weight-byte rate.")
+                         "measure the layer body's marginal weight-byte rate; 's<K>' = "
+                         "SPLIT_GH_DRAIN, which chops the MLP's gh drain group into K groups and "
+                         "moves ONLY the sync-point count, +(K-1) per layer, at constant bytes, "
+                         "tasks, configures and designs.")
     ap.add_argument("--max-seq", type=int, default=512)
     ap.add_argument("--pos", type=int, required=True)
     ap.add_argument("--reps", type=int, default=25)
@@ -120,7 +173,7 @@ def main():
     arms = []
     census = {}
     for spec in a.arms:
-        m = re.fullmatch(r"(\d+)(f?)(?:c(\d+))?(?:q(\w+?))?(?:d(\d+))?", spec)
+        m = re.fullmatch(r"(\d+)(f?)(?:c(\d+))?(?:q(\w+?))?(?:d(\d+))?(?:s(\d+))?", spec)
         if not m:
             raise SystemExit(f"bad arm spec {spec!r}")
         L = int(m.group(1))
@@ -128,19 +181,21 @@ def main():
         cols = int(m.group(3)) if m.group(3) else 8
         qdt = m.group(4) or "bf16"
         wdepth = int(m.group(5)) if m.group(5) else 2
+        sgh = int(m.group(6)) if m.group(6) else 1
         # These are captured at gen_llm_decode IMPORT time, so flipping os.environ here would be
         # silently ignored -- set the module globals the generator actually reads.
         G.FUSE_MLP_O = fmo
         G.MLP_DP_COLS = cols
         G.QUANT_MLP_DTYPE = qdt
         G.WEIGHT_DEPTH = wdepth
+        G.SPLIT_GH_DRAIN = sgh
         t0 = time.perf_counter()
         sp, fused, weights, md = build_graph(a.spec, a.weights, L, a.max_seq)
         # A fit's CONTROL variables need the same evidence as its result: print every quantity
         # that differs between arms BEFORE fitting, not just the one being varied.
-        census[spec] = census_from_mlir(fused, md)
+        census[spec] = census_from_mlir(fused, md, sgh=sgh)
         census[spec].update(fuse_mlp_o=fmo, mlp_dp_cols=cols, quant_mlp=qdt,
-                            weight_depth=wdepth)
+                            weight_depth=wdepth, split_gh=sgh)
         print(f"[layer-arms] built {spec} in {time.perf_counter()-t0:.1f}s  census={census[spec]}",
               flush=True)
         c = fused.get_callable()
@@ -154,20 +209,40 @@ def main():
             load_weight_buffer(c.get_buffer(name), arr)
         del weights
         scale = np.sqrt(sp.d_model) if sp.embed_scale == "sqrt_d_model" else 1.0
-        arms.append(dict(spec=spec, L=L, fmo=fmo, cols=cols, qdt=qdt, wdepth=wdepth,
+        arms.append(dict(spec=spec, L=L, fmo=fmo, cols=cols, qdt=qdt, wdepth=wdepth, sgh=sgh,
                          sp=sp, c=c,
                          params=params,
+                         # The runtime attention window, when the arm built one. An arm whose core
+                         # reads `attn_window` and never has it written attends ZERO KV chunks and
+                         # times a fraction of the real work -- fast, plausible, and wrong, with
+                         # nothing in the output to say so. `window_granule` is None on a
+                         # build-constant arm, and then this stays None and nothing is written.
+                         # Mirror the META WRITER's own gate -- `DYNAMIC_WINDOW and
+                         # window_granule` -- not the granule alone. The op sets window_granule
+                         # unconditionally, so gating on it alone writes `attn_window` into a
+                         # build that has no such parameter and the run dies with
+                         # "ParameterScratchpad: unknown parameter 'attn_window'". That made
+                         # DYNAMIC_WINDOW=0 unrunnable through this harness.
+                         granule=(md.get("window_granule") if G.DYNAMIC_WINDOW else None),
+                         kv_layout=KVLayout(Hkv=sp.n_kv_heads, S=md["S"], HD=sp.head_dim, T=md["T"]),
                          xin=c.get_buffer("x"), rope_buf=c.get_buffer("rope_global"),
                          scale=scale))
     print(f"[layer-arms] {len(arms)} arms resident, dispatching at pos={a.pos}", flush=True)
+
+    max_seq = a.max_seq
 
     def one(arm):
         with arm["xin"].overwrite() as _buf:
             _buf[:] = np.asarray(embed[TOK] * arm["scale"], BF16).reshape(-1)
         with arm["rope_buf"].overwrite() as _buf:
             _buf[:] = rope_row(a.pos, arm["sp"].head_dim, arm["sp"].rope_theta_global).reshape(-1)
-        arm["params"].write("kv_off", int(a.pos * arm["sp"].head_dim))
+        arm["params"].write("kv_off", int(arm["kv_layout"].kv_off(a.pos)))
         arm["params"].write("sm_mask", int(a.pos + 1))
+        if arm["granule"]:
+            g = int(arm["granule"])
+            # Same rule the host uses: round the attended length up to the granule, clamp to the
+            # window this arm was built for.
+            arm["params"].write("attn_window", min(-(-(a.pos + 1) // g) * g, max_seq))
         arm["params"].sync()
         arm["c"]()
         return float(arm["c"].last_elapsed)
@@ -189,7 +264,8 @@ def main():
         xs = [t * 1e3 for t in samples[sp_]]
         med, spread = median_spread(xs)
         report[sp_] = {"reps": xs, "median_ms": med, "spread_pct": spread, "L": arm["L"],
-                       "fuse_mlp_o": arm["fmo"], "cols": arm["cols"], "qdt": arm["qdt"], "wdepth": arm["wdepth"],
+                       "fuse_mlp_o": arm["fmo"], "cols": arm["cols"], "qdt": arm["qdt"],
+                       "wdepth": arm["wdepth"], "sgh": arm["sgh"],
                        "mb": census[sp_].get("mb"), "min_ms": min(xs), "census": census[sp_]}
         print(f"{sp_:>8} {arm['L']:4} {census[sp_].get('configures', 0):5} "
               f"{census[sp_].get('mb', float('nan')):9.2f} {len(xs):4} "
@@ -199,20 +275,24 @@ def main():
     # variance (four-configures-a-layer-came-off-without-a-new-kernel: one cell read 110.261 ms at
     # sd 0.147), so a spread filter cannot catch it -- agreement between the two fits is the check.
     keys = sorted({(report[s_]["fuse_mlp_o"], report[s_]["cols"], report[s_]["qdt"],
-                    report[s_]["wdepth"]) for s_ in report})
+                    report[s_]["wdepth"], report[s_]["sgh"]) for s_ in report})
     for key in keys:
         group = sorted((s_ for s_ in report
-                        if (report[s_]["fuse_mlp_o"], report[s_]["cols"],
-                            report[s_]["qdt"], report[s_]["wdepth"]) == key),
+                        if (report[s_]["fuse_mlp_o"], report[s_]["cols"], report[s_]["qdt"],
+                            report[s_]["wdepth"], report[s_]["sgh"]) == key),
                        key=lambda s_: report[s_]["L"])
         if len(group) < 2:
             continue
-        fmo, cols, qdt, wdepth = key
+        fmo, cols, qdt, wdepth, sgh_ = key
         tag = (f"FUSE_MLP_O={int(fmo)} ({6-int(fmo)} runs/layer), MLP_DP_COLS={cols}, "
-               f"QUANT_MLP={qdt}, WEIGHT_DEPTH={wdepth}")
+               f"QUANT_MLP={qdt}, WEIGHT_DEPTH={wdepth}, SPLIT_GH_DRAIN={sgh_}")
         for label, key in (("median", "median_ms"), ("min", "min_ms")):
             pairs = [(report[s_]["L"], report[s_][key]) for s_ in group]
             alpha, beta, resid = fit_affine(pairs)
+            if alpha is None:
+                print(f"\n{tag} -- fit on {label}s: skipped, every arm is at L={pairs[0][0]} "
+                      f"(not a depth sweep)")
+                continue
             print(f"\n{tag} -- fit on {label}s:  t = {alpha:.4f} ms/layer * L + {beta:.4f} ms")
             for (L, t), r in zip(pairs, resid):
                 print(f"   L={L:3}  {t:9.3f}   residual {r:+7.3f}")

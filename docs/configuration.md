@@ -247,8 +247,12 @@ root** -- the directory holding `scenarios/` and `artifacts/`. Resolution order:
 2. An absolute `.../scenarios/x.toml` scenario path in the config names its own root.
 3. The config file's own directory.
 4. The current working directory.
-5. `${XDG_DATA_HOME:-~/.local/share}/xdna-engine` (where `install.sh` stages a production
-   root).
+5. `${XDG_DATA_HOME:-~/.local/share}/npu` (where `install.sh` stages a production root), falling
+   back to `.../xdna-engine` if that does not exist. The XDG id moved `xdna-engine` -> `npu` on
+   2026-09-09 so config and data key off ONE id; the old path is still accepted so an install
+   predating the move resolves instead of silently looking empty. **Write the new one.** Anything
+   still pointing at the legacy path CREATES it, and `install.sh` then refuses to stage at all --
+   it cannot tell a stray directory from a genuine pre-migration install.
 
 Each candidate is only accepted if it actually contains a `scenarios/` directory.
 
@@ -258,14 +262,14 @@ Each candidate is only accepted if it actually contains a `scenarios/` directory
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `ONNX_ASR_VENV` | searches `./.venv`, then `~/.local/share/xdna-engine/onnx-asr-venv` | Python venv with `onnx_asr` importable; used to run the service and generate ASR artifacts. |
+| `ONNX_ASR_VENV` | searches `./.venv`, then `~/.local/share/npu/onnx-asr-venv` | Python venv with `onnx_asr` importable; used to run the service and generate ASR artifacts. |
 | `EXPORT_VENV` | `$REPO/.venv` | Venv used to (re)generate encoder artifacts via the export scripts. |
 | `XRT_INC_DIR` | `/usr/include` | Where to find `xrt/xrt_bo.h`. |
 | `XRT_LIB_DIR` | `/usr/lib` | Where to find `libxrt_coreutil.so*`. |
 | `MODEL` | `parakeet` | `parakeet` or `gigaam`; selects which artifact set the install preflight checks for. |
 | `ENGINE_BIN_DIR` | `~/.local/bin` | Where the `npu` binary is installed. |
 | `ENGINE_CONFIG` | `~/.config/npu/engine.toml` | The config the installed unit is pointed at. |
-| `ENGINE_ROOT` | `${XDG_DATA_HOME:-~/.local/share}/xdna-engine` | The stable production root staged for the service (`XDNA_ENGINE_ROOT` in the unit). |
+| `ENGINE_ROOT` | `${XDG_DATA_HOME:-~/.local/share}/npu` | The stable production root staged for the service (`XDNA_ENGINE_ROOT` in the unit). Was `.../xdna-engine` before 2026-09-09; see the resolution order above for why writing the legacy path now breaks `install.sh`. |
 | `ENGINE_ARTIFACTS` | `$REPO/artifacts` | What `$ENGINE_ROOT/artifacts` symlinks to. Point this elsewhere if weights live on another partition. |
 | `ENGINE_MLIR_AIE` | `$REPO/mlir-aie` | Source for the kernel publish step. |
 | `STABLE_LIB_DIR` | `~/.local/lib/xdna-engine` | Where the hardened `libonnxruntime.so` copy lives. |
@@ -288,6 +292,7 @@ Each candidate is only accepted if it actually contains a `scenarios/` directory
 | `NPU_KERNEL_MANIFEST_VERIFY` | Set (to any value) to re-hash kernel artifacts against their manifest at load time. Default off. |
 | `NPU_HOST_PROF` | Set to enable the per-op host-side profiler (ASR host reference path). Default off, zero cost. |
 | `NPU_DISPATCH_LOG` | Set to log per-`(xclbin, insts)` dispatch blocking time and hw_context-transition counts. Covers EVERY kernel dispatch in the engine, not only LLM decode. |
+| `NPU_TELEMETRY_LOG` | Directory to write one JSONL run log per generation into, named by completion id. See [measurement.md](measurement.md). Unset by default; writing is best-effort and can never fail a request. Not rotated -- one file per generation, so point it somewhere you will clean up. |
 
 This is the operator-facing surface. The kernel and dataflow crates carry additional
 environment-gated switches used for research and ablation during kernel development;

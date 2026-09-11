@@ -37,7 +37,7 @@ SCOPE. This is a PER-KERNEL / PER-BLOCK gate. bf16 rounding compounds down a dee
 Tier 2's (top-k token-set inclusion, scripts/gate_token_set.py).
 
   # judge a dump that already exists (no device):
-  python3 scripts/gate_numeric.py /mnt/data/xdna-scratch/prefill/mlp_m256 --dump <dumpdir>
+  python3 scripts/gate_numeric.py /mnt/data/xdna/scratch/prefill/mlp_m256 --dump <dumpdir>
 
   # the device half that produces <dumpdir> is a separate command -- see scripts/gate_llm.sh
 """

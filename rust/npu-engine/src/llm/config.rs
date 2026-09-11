@@ -8,6 +8,7 @@ use tokenizers::Tokenizer;
 
 use crate::api::EngineError;
 use crate::llm::chat_template::ChatTemplate;
+use crate::llm::tool_syntax::ToolSyntax;
 use crate::pipeline::GenerationDefaults;
 
 /// Stop-token ids, each resolved from its OWN authority rather than picked. Qwen-family checkpoints
@@ -112,12 +113,26 @@ pub struct ModelConfig {
     ///
     /// Empty when the file is absent or names none of them; a request or a scenario still wins.
     pub checkpoint_defaults: GenerationDefaults,
+    /// How this model writes a tool call, probed from its own `chat_template`. `None` means the
+    /// template has no tool branch, or renders one we cannot scan for -- either way the model is
+    /// tool-incapable and `tools` stays a 400 for it.
+    ///
+    /// Probed ONCE, here, because it costs two template renders and the alternative is Jinja on
+    /// the per-request path.
+    pub tool_syntax: Option<ToolSyntax>,
 }
 
 impl ModelConfig {
     /// Direct construction, e.g. from a tokenizer already loaded elsewhere, or from a test fixture.
     pub fn new(tokenizer: Tokenizer, chat_template: Option<ChatTemplate>, stop: StopTokens) -> Self {
-        ModelConfig { tokenizer, chat_template, stop, checkpoint_defaults: GenerationDefaults::default() }
+        let tool_syntax = chat_template.as_ref().and_then(ToolSyntax::probe);
+        ModelConfig {
+            tokenizer,
+            chat_template,
+            stop,
+            checkpoint_defaults: GenerationDefaults::default(),
+            tool_syntax,
+        }
     }
 
     /// Same, with the checkpoint's own sampling settings attached.
@@ -144,7 +159,8 @@ impl ModelConfig {
         let checkpoint_defaults =
             generation_config.as_ref().map(generation_sampling).unwrap_or_default();
 
-        Ok(ModelConfig { tokenizer, chat_template, stop, checkpoint_defaults })
+        let tool_syntax = chat_template.as_ref().and_then(ToolSyntax::probe);
+        Ok(ModelConfig { tokenizer, chat_template, stop, checkpoint_defaults, tool_syntax })
     }
 }
 

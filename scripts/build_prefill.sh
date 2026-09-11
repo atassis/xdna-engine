@@ -12,13 +12,16 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WS="$(cd "$REPO/.." && pwd)"
 LAYERS="${1:-1}"; BATCH="${2:-256}"; SEQ="${3:-2048}"
-OUT="${4:-/mnt/data/xdna-scratch/prefill/full_l${LAYERS}_m${BATCH}_s${SEQ}}"
+OUT="${4:-/mnt/data/xdna/scratch/prefill/full_l${LAYERS}_m${BATCH}_s${SEQ}}"
 CAUSAL="${CAUSAL:-rows}"
 VENV_IRON="${VENV_IRON:-$REPO/.venv-iron}"
 [ -x "$VENV_IRON/bin/python" ] || VENV_IRON="$WS/xdna-engine/.venv-iron"
 . "$REPO/scripts/amd_paths.sh"
 IRON="${IRON:-$WS/wt-iron-causal}"
-WEIGHTS="${WEIGHTS:-$WS/artifacts-qwen3-0.6b/weights}"
+# $REPO/artifacts/<spec>, not "$WS/artifacts-<spec>" -- the latter has a hyphen where a path
+# separator belongs and is anchored at the workspace; it resolves to a directory that has
+# never existed, so the build died on a missing weight rather than on a clear message.
+WEIGHTS="${WEIGHTS:-$REPO/artifacts/qwen3-0.6b/weights}"
 DECODE_META="${DECODE_META:-$WS/xdna-engine/artifacts/qwen3-0.6b/decode/meta.json}"
 
 [ -x "$VENV_IRON/bin/python" ] || { echo "ERROR: no iron venv at $VENV_IRON"; exit 1; }
@@ -50,6 +53,11 @@ if [ "${LAYOUT_ONLY:-0}" = "1" ]; then
 fi
 if [ "${NO_GOLDEN:-0}" = "1" ]; then
   GOLDEN_ARGS+=(--no-golden)
+  # Still pass the weights when they are there: --no-golden skips the CPU reference, but the
+  # generator also uses this directory to verify that the decode arena holds what the graph
+  # assumes (check_shared_weights). Skipping that on the quick build path is how a silently
+  # reordered weight reaches the device.
+  [ -d "$WEIGHTS" ] && GOLDEN_ARGS+=(--weights "$WEIGHTS")
 else
   [ -d "$WEIGHTS" ] || { echo "ERROR: no weights at $WEIGHTS (or set NO_GOLDEN=1)"; exit 1; }
   GOLDEN_ARGS+=(--weights "$WEIGHTS")
@@ -66,7 +74,7 @@ export AIE_DEVICE="${AIE_DEVICE:-npu2}"   # build off the device lock; see gen_l
 
 # Build artifacts go to NVMe, never the tmpfs scratchpad. Per-arm work dir, because IRON keys
 # cached operator artifacts by NAME and a shared dir lets one arm link another's binaries.
-WORK="${KEEP_WORK:-/mnt/data/xdna-scratch/prefill/build_full_l${LAYERS}_m${BATCH}_s${SEQ}_${CAUSAL}}"
+WORK="${KEEP_WORK:-/mnt/data/xdna/scratch/prefill/build_full_l${LAYERS}_m${BATCH}_s${SEQ}_${CAUSAL}}"
 mkdir -p "$WORK" "$OUT"
 cd "$WORK"
 exec "$VENV_IRON/bin/python" "$REPO/designs/decode_fused/gen_llm_prefill.py" \

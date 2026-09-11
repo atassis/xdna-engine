@@ -47,14 +47,16 @@ REPO="$(dirname "$SCRIPT_PATH")"
 # locations, in order, taking the first one that actually validates:
 #   1. ./.venv                                          (repo-local; shared with EXPORT_VENV
 #                                                         below if one venv has everything)
-#   2. ${XDG_DATA_HOME:-~/.local/share}/xdna-engine/onnx-asr-venv   (documented convention)
+#   2. ${XDG_DATA_HOME:-~/.local/share}/npu/onnx-asr-venv           (documented convention;
+#                                                         the pre-2026-09-09 xdna-engine/ path is
+#                                                         still searched after it)
 #   3. ~/npuvox-asr-bench/.venv                         (legacy; the venv this was developed
 #                                                         against -- last resort, never the
 #                                                         default, and the only reason it stays
 #                                                         is that removing it broke the build on
 #                                                         the machine where it does exist)
 ONNX_ASR_VENV="${ONNX_ASR_VENV:-}"
-ONNX_ASR_VENV_CANDIDATES="$REPO/.venv ${XDG_DATA_HOME:-$HOME/.local/share}/xdna-engine/onnx-asr-venv $HOME/npuvox-asr-bench/.venv"
+ONNX_ASR_VENV_CANDIDATES="$REPO/.venv ${XDG_DATA_HOME:-$HOME/.local/share}/npu/onnx-asr-venv ${XDG_DATA_HOME:-$HOME/.local/share}/xdna-engine/onnx-asr-venv $HOME/npuvox-asr-bench/.venv"
 
 # Repo export venv (has onnx + onnxruntime). Used to (re)generate the
 # artifacts/encoder/ encoder weights via extract_encoder.py.
@@ -84,7 +86,7 @@ ENGINE_BIN_DIR="${ENGINE_BIN_DIR:-$HOME/.local/bin}"
 ENGINE_BIN="$ENGINE_BIN_DIR/npu"
 # Where installed binaries are kept, keyed by build-id, so a core outliving its executable can
 # still be symbolised. See archive_binary_by_build_id below for what this cost when it was absent.
-ENGINE_BIN_ARCHIVE="${ENGINE_BIN_ARCHIVE:-${XDG_DATA_HOME:-$HOME/.local/share}/xdna-engine/bin-archive}"
+ENGINE_BIN_ARCHIVE="${ENGINE_BIN_ARCHIVE:-${XDG_DATA_HOME:-$HOME/.local/share}/npu/bin-archive}"
 
 # ASK cargo where it puts artifacts; do not assume $REPO/rust/target.
 #
@@ -108,7 +110,37 @@ ENGINE_CONFIG="${ENGINE_CONFIG:-$HOME/.config/npu/engine.toml}"
 # would then silently resolve artifacts and xclbins somewhere else (or nowhere). So installation
 # stages a fixed prefix and the unit names it explicitly via XDNA_ENGINE_ROOT, which npu-cli's
 # root() already honours ahead of any cwd fallback.
-ENGINE_ROOT="${ENGINE_ROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/xdna-engine}"
+# XDG id is `npu` -- the same one as ~/.config/npu/engine.toml and the `npu` binary. It was
+# `xdna-engine` here until 2026-09-09, so config and data disagreed about the application's name;
+# `xdna-engine` remains the REPO name. npu-cli's root() carries the matching constant and accepts
+# the old directory as a fallback, so an install that predates this still resolves.
+_XDG_DATA="${XDG_DATA_HOME:-$HOME/.local/share}"
+ENGINE_ROOT="${ENGINE_ROOT:-$_XDG_DATA/npu}"
+# One-shot migration: MOVE a pre-rename root rather than leave it orphaned beside the new one.
+# Never MERGE two roots -- the loser's kernels and toolchain.lock would end up describing the
+# winner's artifacts, which is the silent-mismatch class this script exists to refuse.
+#
+# And never silently PICK one either. `npu` was this project's XDG id once before and abandoned:
+# on this machine ~/.local/share/npu was a July-2026 layout (scenarios/asr.toml, an artifacts
+# symlink to a different store, no kernels/ and no toolchain.lock) sitting beside the live
+# xdna-engine root. A guard that only checked "does the destination exist" declined to migrate and
+# then installed INTO the stale root -- picking the wrong one is worse than refusing, because the
+# service comes up resolving July's scenarios and nothing says so.
+if [ "$ENGINE_ROOT" = "$_XDG_DATA/npu" ] && [ -d "$_XDG_DATA/xdna-engine" ]; then
+  if [ ! -e "$ENGINE_ROOT" ]; then
+    mv "$_XDG_DATA/xdna-engine" "$ENGINE_ROOT"
+    echo "[install] migrated $_XDG_DATA/xdna-engine -> $ENGINE_ROOT (XDG id is now 'npu')"
+  else
+    echo "[install] REFUSING: two engine roots exist and I will not guess which is live." >&2
+    echo "[install]   $ENGINE_ROOT" >&2
+    echo "[install]   $_XDG_DATA/xdna-engine   (pre-2026-09-09 name)" >&2
+    echo "[install] Move the stale one aside, then re-run. A root with no toolchain.lock and no" >&2
+    echo "[install] kernels/ predates both and is almost certainly the stale one:" >&2
+    echo "[install]   mv $ENGINE_ROOT $ENGINE_ROOT.abandoned-\$(date +%Y%m%dT%H%M%S)" >&2
+    echo "[install]   mv $_XDG_DATA/xdna-engine $ENGINE_ROOT" >&2
+    exit 1
+  fi
+fi
 
 # Where the staged root's artifacts/ and mlir-aie/ point. Default to this checkout, but they are
 # overridable BECAUSE this script may legitimately be run from a git worktree: a worktree supplies
@@ -258,6 +290,27 @@ else
   install -m 0755 "$BUILT_BIN" "$ENGINE_BIN"
   ok "Installed: $ENGINE_BIN ($(date -r "$ENGINE_BIN" '+%Y-%m-%d %H:%M'))"
   archive_binary_by_build_id "$ENGINE_BIN" "installed"
+fi
+
+# The installed binary must RUN, in the environment a person actually has.
+#
+# Everything above this point is a preflight -- it checks what the build needs. Nothing checked what
+# the install produced, so this script could print "Done" having installed a binary that cannot
+# start. That is not hypothetical: on 2026-09-09 a binary built without the RPATH baked at step 3
+# was installed by hand, and `npu models` died with "error while loading shared libraries:
+# libonnxruntime.so.1" for every interactive user. The SERVICE kept working the whole time, because
+# its unit sets LD_LIBRARY_PATH -- so the failure was invisible to anything that tested with a
+# developer's environment, which is every test anyone had run.
+#
+# `env -u LD_LIBRARY_PATH` is the whole point: it reproduces a plain login shell, where the binary
+# has to resolve its own libraries through DT_RUNPATH or not at all.
+info "Smoke-testing the installed binary in a clean environment"
+if smoke=$(env -u LD_LIBRARY_PATH "$ENGINE_BIN" models --output json 2>&1); then
+  ok "Installed binary runs standalone"
+else
+  warn "The installed binary does not run without LD_LIBRARY_PATH:"
+  printf '%s\n' "$smoke" | sed 's/^/    /' >&2
+  die "Refusing to report success. Usually a missing RPATH -- check step 3's RUSTFLAGS."
 fi
 
 # Bounded: keep the newest 10 (~170 MB worst case, and far less while hardlinks share storage with
@@ -419,13 +472,24 @@ fi
 # ---------------------------------------------------------------------------
 # 4b. Stage the stable production root
 # ---------------------------------------------------------------------------
-# scenarios/ are COPIED (small, and a copy cannot be changed under the service by a checkout
-# switching branches). Kernels are COPIED too, in section 4 above.
+# EVERYTHING in the production root is a COPY. scenarios/, kernels/ (section 4), toolchain.lock and
+# now artifacts/ -- nothing here resolves back into a checkout, so a branch switch, a rebuild or a
+# re-pin in the dev tree cannot change what a running service loads.
 #
-# artifacts/ stays a SYMLINK, deliberately and as the only one: it is the model weights, 3.8 GB, and
-# duplicating that is the cost worth avoiding. Point ENGINE_ARTIFACTS at wherever they live -- the
-# default resolves to this checkout, which makes the install depend on it, and an operator with the
-# weights on another partition should say so rather than have the project assume.
+# artifacts/ WAS a symlink, deliberately, to avoid duplicating ~4-7 GB of model weights. That
+# objection is gone on a CoW filesystem: `cp --reflink` shares the extents, so the copy costs
+# ~0 bytes and ~0 seconds until one side is written, and then only the changed blocks. We get
+# isolation at the price of the metadata.
+#
+# The symlink cost us an outage on 2026-09-09: a re-pin in the checkout re-stamped every INSTALLED
+# artifact stale, because the freshness walk-up canonicalized through this link into the dev tree
+# and found its lock instead of the staged one sitting right beside them. Both halves are fixed --
+# the walk-up no longer resolves symlinks (llm/artifact.rs::resolve_current_pin_hash) and there is
+# no longer a link for it to resolve.
+#
+# ENGINE_ARTIFACTS still says where the SOURCE lives (another partition is fine). ENGINE_ARTIFACTS_LINK=1
+# restores the old symlink behaviour for an operator who genuinely cannot spare the copy -- on a
+# non-CoW filesystem this is a real duplication and the warning below says so.
 info "Staging production root -> $ENGINE_ROOT"
 mkdir -p "$ENGINE_ROOT"
 rm -rf "$ENGINE_ROOT/scenarios"
@@ -438,7 +502,50 @@ stage_link() {  # name, source
     warn "  $1 missing ($2) -- the service may not resolve all models"
   fi
 }
-stage_link artifacts "$ENGINE_ARTIFACTS"
+
+# Copy a tree into the production root, sharing extents where the filesystem can.
+# Stages beside the live one and swaps, so an interrupted install never leaves a half-tree in
+# place of a working one; the previous copy is RETIRED rather than deleted, matching the kernel
+# sandbox convention, so a rollback has something to roll back to.
+stage_copy() {  # name, source
+  local name="$1" src="$2" dst="$ENGINE_ROOT/$1" new="$ENGINE_ROOT/$1.staging-$$"
+  if [ ! -e "$src" ]; then
+    warn "  $name missing ($src) -- the service may not resolve all models"
+    return 0
+  fi
+  rm -rf "$new"
+  # --reflink=auto: CoW share on btrfs/xfs, silent full copy elsewhere. Never fails over to an
+  # error, so one code path covers both and the cost difference is reported, not enforced.
+  if ! cp -a --reflink=auto "$(readlink -f "$src")/." "$new" 2>/dev/null; then
+    rm -rf "$new"
+    die "staging $name failed: could not copy $src -> $dst"
+  fi
+  # NO trailing slash on any of these paths: $dst may still be a SYMLINK from an older install,
+  # and `rm -rf link/` follows it and would delete the CHECKOUT's artifacts instead of the link.
+  if [ -L "$dst" ]; then
+    rm -f "$dst"                       # a symlink: drop the link, never what it points at
+  elif [ -d "$dst" ]; then
+    mv "$dst" "$ENGINE_ROOT/$name.prev-$(date +%Y%m%dT%H%M%S)"
+  fi
+  mv "$new" "$dst"
+  # Keep exactly ONE previous copy. Retiring on every run is right -- the whole point of copying is
+  # that production survives the source tree changing, so the rollback must not live in the source
+  # either -- but without a prune it grows by a full tree per install, and three runs in one evening
+  # left two dead artifacts.prev-* here. Newest survives; the rest go.
+  ls -1dt "$ENGINE_ROOT/$name.prev-"* 2>/dev/null | tail -n +2 | while IFS= read -r old; do
+    rm -rf -- "$old" && echo "  pruned superseded $(basename "$old")"
+  done
+  local sz; sz="$(du -sh "$dst" 2>/dev/null | cut -f1)"
+  ok "  $name copied ($sz, extents shared where the filesystem allows) <- $(readlink -f "$src")"
+}
+
+if [ "${ENGINE_ARTIFACTS_LINK:-0}" = "1" ]; then
+  warn "ENGINE_ARTIFACTS_LINK=1: artifacts/ staged as a SYMLINK into $ENGINE_ARTIFACTS."
+  warn "  A rebuild or branch switch in that tree then changes what the running service loads."
+  stage_link artifacts "$ENGINE_ARTIFACTS"
+else
+  stage_copy artifacts "$ENGINE_ARTIFACTS"
+fi
 # NO `stage_link mlir-aie`. A compiler tree does not belong in a production install; section 4
 # published the artifacts a running engine actually resolves.
 if [ -L "$ENGINE_ROOT/mlir-aie" ] || [ -d "$ENGINE_ROOT/mlir-aie" ]; then
@@ -448,6 +555,64 @@ if [ -L "$ENGINE_ROOT/mlir-aie" ] || [ -d "$ENGINE_ROOT/mlir-aie" ]; then
   ok "  retired the mlir-aie link from a previous install (a compiler tree is not an artifact)"
 fi
 ok "Production root staged."
+
+# ---- The THIRD half: artifacts must agree with the lock staged beside them ----
+# Section 4 copies kernels and toolchain.lock TOGETHER because two halves from different pins made
+# the service refuse to start. Artifacts are a third half and nothing checked them: a re-pin in the
+# checkout followed by an install stages the NEW lock next to artifacts built against the OLD one,
+# and `npu generate` then dies with `toolchain-stale` -- correctly, but only at first use, which is
+# after the operator has walked away. Observed 2026-09-09, twice in one evening.
+#
+# Artifacts are NOT rebuilt here (a decode build is minutes and needs its own flags and IRON), so
+# this refuses and names the command instead of guessing.
+staged_pin=$(sed -e 's/[[:space:]]*#.*$//' -e '/^[[:space:]]*$/d' "$ENGINE_ROOT/toolchain.lock" \
+             | sha256sum | cut -c1-12)
+while IFS= read -r scen; do
+  [ -n "$scen" ] || continue
+  case "$scen" in /*) scen_abs="$scen" ;; *) scen_abs="$ENGINE_ROOT/$scen" ;; esac
+  [ -f "$scen_abs" ] || continue
+  dec=$(grep -oP '^\s*decode\s*=\s*"\K[^"]+' "$scen_abs" | head -1 || true)
+  [ -n "$dec" ] || continue
+  case "$dec" in /*) dec_abs="$dec" ;; *) dec_abs="$ENGINE_ROOT/$dec" ;; esac
+  meta="$dec_abs/meta.json"
+  [ -f "$meta" ] || continue
+  # json, not grep: meta.json is pretty-printed, so `"toolchain": {` and `"hash":` sit on different
+  # lines and a line-based -oP finds nothing. That failed OPEN -- the check silently passed every
+  # artifact -- which is the worst way for a guard to be wrong.
+  built=$("$ONNX_ASR_PY" -c 'import json,sys
+print(json.load(open(sys.argv[1])).get("toolchain",{}).get("hash",""))' "$meta" 2>/dev/null || true)
+  [ -n "$built" ] || continue          # unstamped: the engine warns, this does not block
+  [ "$built" = "$staged_pin" ] || die "artifact/toolchain mismatch in the staged root:
+  $meta
+  built against $built, but the staged toolchain.lock is $staged_pin.
+  The service will refuse to load this model. Rebuild it against the current pin:
+    FUSE_DECODE_LAYER=1 scripts/build_llm_decode.sh $(basename "$(dirname "$dec_abs")") \"\" <out>
+    DECODE_META=<out>/meta.json scripts/build_prefill.sh ...
+  then re-run install. Or restore the previous pin in toolchain.lock if the bump was not intended."
+done < <(grep -oP '^\s*scenario\s*=\s*"\K[^"]+' "$ENGINE_CONFIG")
+ok "Staged artifacts agree with the staged pin ($staged_pin)."
+
+# ---- ...and so must the KERNELS, which are the half this script thought it had covered ----
+# Section 4's comment says kernels and toolchain.lock are copied together so they cannot come from
+# different pins. They are copied together, but their PINS are not the same thing: the lock is
+# copied from the checkout while the stamp comes from whatever pin the kernel BUILD DIR was built
+# at, so a re-pin without a kernel rebuild publishes 3a786d9c7793 beside a lock saying 83a1c34f3362
+# and nothing here notices. npu-parakeet::preflight -> kernel_registry::check_toolchain_freshness
+# then refuses at first ASR request.
+#
+# WARN, not die: unlike an LLM artifact, the fix is a long xclbin rebuild into a SHARED sandbox that
+# a re-pin purges, so failing the install would strand an operator who cannot run it right now. The
+# LLM half is refused above because rebuilding that is minutes and touches nothing shared.
+kern_stamp=$(cat "$ENGINE_KERNELS/.toolchain-stamp" 2>/dev/null || true)
+if [ -n "$kern_stamp" ] && [ "$kern_stamp" != "$staged_pin" ]; then
+  warn "published kernels are stamped $kern_stamp but the staged lock is $staged_pin."
+  warn "  ASR/encoder models WILL REFUSE to load until the kernels are rebuilt at the current pin:"
+  warn "    scripts/build_parakeet_kernels.sh   (and build_parakeet_modal_kernels.sh if the modal"
+  warn "    resident is in use). NOTE it purges the shared whole_array/build on a pin change."
+  warn "  LLM generate is unaffected -- it loads the decode ELF, not these xclbins."
+else
+  ok "Published kernels agree with the staged pin ($staged_pin)."
+fi
 
 info "Preflighting engine config: $ENGINE_CONFIG"
 [ -f "$ENGINE_CONFIG" ] || die "engine config missing: $ENGINE_CONFIG
@@ -464,13 +629,36 @@ while IFS= read -r scen; do
   [ -f "$scen_abs" ] || die "engine config references a missing scenario: $scen_abs
   (from $ENGINE_CONFIG)"
 
-  kind=$(grep -oP '^\s*kind\s*=\s*"\K[^"]+' "$scen_abs" | head -1)
-  wdir=$(grep -oP '^\s*weights\s*=\s*"\K[^"]+' "$scen_abs" | head -1)
+  # `|| true` on every one of these: a no-match grep exits 1, and under `set -euo pipefail` a
+  # bare assignment from a failing pipeline kills the script SILENTLY -- no message, no line
+  # number, exit 1. Measured 2026-09-09: preflight died on the FIRST scenario because asr.toml
+  # has no `decode =` line, which is not an error, it is what a non-LLM scenario looks like.
+  # Absence is legitimate for all four; the explicit checks below are what should speak.
+  kind=$(grep -oP '^\s*kind\s*=\s*"\K[^"]+' "$scen_abs" | head -1 || true)
+  wdir=$(grep -oP '^\s*weights\s*=\s*"\K[^"]+' "$scen_abs" | head -1 || true)
   [ -n "$kind" ] || die "scenario has no [scenario].kind: $scen_abs"
   if [ -n "$wdir" ]; then
     case "$wdir" in /*) wabs="$wdir" ;; *) wabs="$ENGINE_ROOT/$wdir" ;; esac
     [ -d "$wabs" ] && [ -n "$(ls -A "$wabs" 2>/dev/null)" ] \
       || die "scenario '$scen_abs' points at missing/empty weights: $wabs"
+  fi
+
+  # A batched-prefill artifact shares one FusedArena with its decode ELF (prefill emits no
+  # weight .bin files of its own -- meta.json's `weights_from` names decode's `buffers/`
+  # instead), so every weight/cache buffer must sit at an identical scratch offset in both.
+  # rust/npu-engine/src/llm/artifact.rs::check_shared_layout_agrees re-checks this at LOAD and
+  # refuses to bind a disagreeing pair -- but only a rebuild of prefill exercises that path, so
+  # a decode rebuilt without its paired prefill installed clean and crash-looped the service on
+  # restart (observed 2026-09-09). Catch it here instead. Scenarios with no `prefill` line (or
+  # a prefill built with NO_ARENA_SHARE=1, which leaves `weights_from` unset) are not
+  # arena-shared and the checker below is a no-op for them.
+  decode_rel=$(grep -oP '^\s*decode\s*=\s*"\K[^"]+' "$scen_abs" | head -1 || true)
+  prefill_rel=$(grep -oP '^\s*prefill\s*=\s*"\K[^"]+' "$scen_abs" | head -1 || true)
+  if [ -n "$decode_rel" ] && [ -n "$prefill_rel" ]; then
+    case "$decode_rel" in /*) decode_abs="$decode_rel" ;; *) decode_abs="$ENGINE_ROOT/$decode_rel" ;; esac
+    case "$prefill_rel" in /*) prefill_abs="$prefill_rel" ;; *) prefill_abs="$ENGINE_ROOT/$prefill_rel" ;; esac
+    "$ONNX_ASR_PY" "$REPO/scripts/check_prefill_arena_pairing.py" "$decode_abs" "$prefill_abs" \
+      || die "scenario '$scen_abs': decode/prefill shared-arena preflight failed -- see the message above."
   fi
   ok "  scenario OK: $(basename "$scen_abs") (kind=$kind, weights=${wdir:-<none>})"
 done < <(grep -oP '^\s*scenario\s*=\s*"\K[^"]+' "$ENGINE_CONFIG")
@@ -555,7 +743,7 @@ After=graphical-session.target
 Type=simple
 # systemd creates this on start and REMOVES it on stop, so the status file's presence is the
 # liveness signal: npu models needs no port, probe or timeout to read live state.
-RuntimeDirectory=xdna-engine
+RuntimeDirectory=npu
 # The engine's root for artifacts/, scenarios/ and the mlir-aie xclbins. npu-cli's root() reads
 # this before falling back to a scenario path or to cwd.
 Environment=XDNA_ENGINE_ROOT=$ENGINE_ROOT

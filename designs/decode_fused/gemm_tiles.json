@@ -551,10 +551,10 @@
       "prio_accuracy": false,
       "tile_m": 64,
       "tile_k": 64,
-      "tile_n": 64,
+      "tile_n": 32,
       "cols": 8,
       "b_col_maj": true,
-      "source": "seed",
+      "source": "assumed",
       "labels": [
         "qwen3-0.6b:k",
         "qwen3-0.6b:v"
@@ -571,10 +571,10 @@
       "prio_accuracy": true,
       "tile_m": 64,
       "tile_k": 64,
-      "tile_n": 64,
+      "tile_n": 32,
       "cols": 8,
       "b_col_maj": true,
-      "source": "seed",
+      "source": "assumed",
       "labels": [
         "qwen3-0.6b:k",
         "qwen3-0.6b:v"
@@ -591,10 +591,10 @@
       "prio_accuracy": false,
       "tile_m": 64,
       "tile_k": 64,
-      "tile_n": 64,
+      "tile_n": 32,
       "cols": 8,
       "b_col_maj": true,
-      "source": "seed",
+      "source": "assumed",
       "labels": [
         "qwen3-0.6b:k",
         "qwen3-0.6b:v"
@@ -611,10 +611,10 @@
       "prio_accuracy": true,
       "tile_m": 64,
       "tile_k": 64,
-      "tile_n": 64,
+      "tile_n": 32,
       "cols": 8,
       "b_col_maj": true,
-      "source": "seed",
+      "source": "assumed",
       "labels": [
         "qwen3-0.6b:k",
         "qwen3-0.6b:v"
@@ -854,6 +854,41 @@
       "measured": null,
       "candidates_considered": null
     },
+    "m256_k128_n4096_bf162bf16_bfp1_acc0": {
+      "M": 256,
+      "K": 128,
+      "N": 4096,
+      "dtype": "bf16>bf16",
+      "emulate": true,
+      "prio_accuracy": false,
+      "tile_m": 64,
+      "tile_k": 64,
+      "tile_n": 64,
+      "cols": 4,
+      "b_col_maj": true,
+      "source": "sweep",
+      "labels": [
+        "scores"
+      ],
+      "measured": {
+        "warm_min_us": 332.2,
+        "warm_avg_us": 344.8,
+        "single_shot_us": 498.9,
+        "rel_l2": 0.0097,
+        "ddr_bytes": 3211264,
+        "macs": 134217728,
+        "iters": 200,
+        "warmup": 20,
+        "date": "2026-09-11",
+        "power_mode": "turbo",
+        "probe": "fused_elf_probe",
+        "selection": "time",
+        "runner_up_us": [
+          373.0
+        ]
+      },
+      "candidates_considered": 16
+    },
     "m256_k2048_n1024_bf162bf16_bfp0_acc0": {
       "M": 256,
       "K": 2048,
@@ -1081,6 +1116,41 @@
       ],
       "measured": null,
       "candidates_considered": null
+    },
+    "m256_k4096_n128_bf162bf16_bfp1_acc0": {
+      "M": 256,
+      "K": 4096,
+      "N": 128,
+      "dtype": "bf16>bf16",
+      "emulate": true,
+      "prio_accuracy": false,
+      "tile_m": 64,
+      "tile_k": 32,
+      "tile_n": 32,
+      "cols": 4,
+      "b_col_maj": false,
+      "source": "sweep",
+      "labels": [
+        "ctx"
+      ],
+      "measured": {
+        "warm_min_us": 378.2,
+        "warm_avg_us": 391.9,
+        "single_shot_us": 601.4,
+        "rel_l2": 0.01666,
+        "ddr_bytes": 3211264,
+        "macs": 134217728,
+        "iters": 200,
+        "warmup": 20,
+        "date": "2026-09-11",
+        "power_mode": "turbo",
+        "probe": "fused_elf_probe",
+        "selection": "time",
+        "runner_up_us": [
+          396.5
+        ]
+      },
+      "candidates_considered": 16
     },
     "m512_k1024_n1024_bf162bf16_bfp0_acc0": {
       "M": 512,

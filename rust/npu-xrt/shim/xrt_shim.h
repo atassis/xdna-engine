@@ -135,6 +135,17 @@ typedef struct ShimElfResident ShimElfResident;
 ShimElfResident* shim_elf_resident_open(ShimDevice*, const void* elf_bytes, size_t nbytes,
                                         const char* kernel_name, int qos_priority);
 void             shim_elf_resident_close(ShimElfResident*);
+/* A SECOND named control code out of the SAME ELF, on the SAME hw_context.
+ *
+ * One full ELF can carry several runtime sequences, each emitted as its own control code and
+ * resolved by XRT as `main:<name>`; the context is registered once by the ELF, and every variant
+ * is another `xrt::ext::kernel` against it. So a caller can pre-create one resident per variant at
+ * load and pick per dispatch -- no re-registration, no second context, no artifact swap. Each
+ * variant gets its OWN run and therefore its OWN ctrl scratchpad, so bind() and the per-dispatch
+ * scratchpad writes must go to the variant that will actually be dispatched.
+ *
+ * Returns NULL if the ELF has no such kernel name (or no scratchpad, as `open`). */
+ShimElfResident* shim_elf_resident_open_named(ShimElfResident* base, const char* kernel_name);
 size_t           shim_elf_resident_scratchpad_size(ShimElfResident*);
 /* Bind the N arena BOs to run args 0..N once (same handles reused every dispatch). 0 on success. */
 int              shim_elf_resident_bind(ShimElfResident*, ShimBo* const* bos, size_t n_bos);

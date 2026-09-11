@@ -131,28 +131,35 @@ class SwiGLUMLPDataParallel(MLIROperator):
         # int8, which is the only thing the WTILE_ty change alters. GROUP_SIZE is the extra flag.
         _qsrc = kdir / "generic" / ("mv.cc" if self.weight_dtype == "bf16" else "mv_quant.cc")
         _qtag = "" if self.weight_dtype == "bf16" else f"_{self.weight_dtype}g{self.group_size}"
+        # A vector chunk must not straddle a quant group, so the kernel's VEC_SIZE is capped by
+        # the group width. 64 is the native width and the only value the symmetric builds ever
+        # used (their smallest shipped group is 128); a 32-wide group -- FastFlowLM's operating
+        # point -- needs 32. It is in the object name because two objects compiled at different
+        # VEC_SIZE export the SAME symbol, which is the artifact-key collision this file already
+        # documents for the dtype axis.
+        _vec = 64 if self.weight_dtype == "bf16" else min(64, self.group_size)
         _qflags = ([] if self.weight_dtype == "bf16"
                    else [f"-DGROUP_SIZE={self.group_size}"])
         mv_gu_obj = KernelObjectArtifact(
-            f"gemv_{self.D}k_64vs{_qtag}.o",
+            f"gemv_{self.D}k_{_vec}vs{_qtag}.o",
             dependencies=[SourceArtifact(_qsrc)],
-            extra_flags=[f"-DDIM_K={self.D}", "-DVEC_SIZE=64"] + _qflags,
+            extra_flags=[f"-DDIM_K={self.D}", f"-DVEC_SIZE={_vec}"] + _qflags,
         )
         # Same exported symbol as mv_gu_obj (DIM_K is baked in, not part of the name); this
         # object's own device-wide symbol table entry must be distinct, so it is compiled with a
         # prefix -- see design.py's mv_d_kernel comment and fuse/mlp-block's identical mechanism.
         mv_d_obj = KernelObjectArtifact(
-            f"down_gemv_{self.FF}k_64vs{_qtag}.o",
+            f"down_gemv_{self.FF}k_{_vec}vs{_qtag}.o",
             dependencies=[SourceArtifact(_qsrc)],
-            extra_flags=[f"-DDIM_K={self.FF}", "-DVEC_SIZE=64"] + _qflags,
+            extra_flags=[f"-DDIM_K={self.FF}", f"-DVEC_SIZE={_vec}"] + _qflags,
             prefix_symbols="down_",
         )
         deps = [add_obj, mul_obj, rms_norm_obj, silu_obj, mv_gu_obj, mv_d_obj]
         if self.fuse_o:
             mv_o_obj = KernelObjectArtifact(
-                f"o_gemv_{self.QD}k_64vs{_qtag}.o",
+                f"o_gemv_{self.QD}k_{_vec}vs{_qtag}.o",
                 dependencies=[SourceArtifact(_qsrc)],
-                extra_flags=[f"-DDIM_K={self.QD}", "-DVEC_SIZE=64"] + _qflags,
+                extra_flags=[f"-DDIM_K={self.QD}", f"-DVEC_SIZE={_vec}"] + _qflags,
                 prefix_symbols="o_",
             )
             # copy_offset_bf16_vector (in add.cc) is generic (pointer + runtime size/offset, no

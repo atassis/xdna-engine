@@ -22,6 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import newstack_compat  # noqa: F401,E402
 import gen_llm_decode as G  # noqa: E402
 from gen_llm_decode import build_graph  # noqa: E402
+from iron.common.kv_layout import KVLayout  # noqa: E402
 
 BF16 = ml_dtypes.bfloat16
 
@@ -44,6 +45,7 @@ def main():
 
     sp, fused, weights, md = build_graph(a.spec, a.weights, a.layers)
     S, HD, Hq, Hkv = md["S"], sp.head_dim, sp.n_q_heads, sp.n_kv_heads
+    kv_layout = KVLayout(Hkv=Hkv, S=S, HD=HD, T=md["T"])
     grp = Hq // Hkv
     toks = [int(t) for t in a.tokens.split(",")]
     L = a.layer
@@ -110,13 +112,13 @@ def main():
         row[1::2] = np.sin(pos * inv)
         with c.get_buffer("rope_global").overwrite() as _buf:
             _buf[:] = np.asarray(row, BF16)
-        params.write("kv_off", int(pos * HD))
+        params.write("kv_off", int(kv_layout.kv_off(pos)))
         params.write("sm_mask", int(pos + 1))
         params.sync()
-        # TWO dispatches, first discarded. On this rail the FIRST dispatch after a host input write
-        # computes on the PREVIOUS input (journal
-        # docs/kb/first-dispatch-after-a-host-input-write-computes-on-the-previous-input.md), so a
-        # one-dispatch capture records position p-1's k/v under position p. The KV append is
+        # TWO dispatches, first discarded. On this rail the FIRST dispatch after a host input
+        # write computes on the PREVIOUS input -- the write is not visible to the device until the
+        # dispatch after the one that follows it -- so a one-dispatch capture records position
+        # p-1's k/v under position p. The KV append is
         # idempotent here -- kv_off is unchanged between the two -- so the second write lands on the
         # same row with the same value. Everything this harness reads AFTER the loop (the caches,
         # the softmax row sum, the context) was already settled and unaffected; it is the

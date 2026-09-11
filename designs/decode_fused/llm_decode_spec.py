@@ -371,7 +371,9 @@ class LlmSpec:
     # Each was read off the checkpoint or `transformers/models/gemma4_unified/`, never inferred from
     # Gemma-3 by family resemblance -- which is the trap that put `norm_gain="one_plus_w"` in the
     # stranded literal, wrong on all 193 norm tensors. Facts and citations:
-    # [[gemma4-norm-gain-is-w-not-one-plus-w]].
+    # norm_gain is "w", not "one_plus_w": Gemma4UnifiedRMSNorm inits the weight to ones and
+    # multiplies directly, and the trained weights (means 6-20, max 604) are only sane under a
+    # direct multiply.
     #
     # They are fields BEFORE they are capabilities on purpose. A spec that cannot say what a model
     # needs cannot refuse it by name either, and "gemma4-12b is not supported" is a far worse
@@ -784,7 +786,7 @@ QWEN3_0_6B = LlmSpec(
 # Gemma-4-12B-IT (unsloth/gemma-4-12b-it, "unsloth_fixed": true). Every axis below is VERIFIED
 # against the packed dump and the checkpoint header by scripts/check_llm_spec_against_dump.py --
 # nothing here is typed from config.json alone, and the axis facts live on
-# [[gemma4-norm-gain-is-w-not-one-plus-w]].
+# norm_gain "w" vs "one_plus_w": verified against the checkpoint, not read off config.json.
 #
 # Two corrections to the earlier stranded literal are baked in here. norm_gain is "w", NOT
 # "one_plus_w": Gemma4UnifiedRMSNorm inits the weight to ones and multiplies directly, and the

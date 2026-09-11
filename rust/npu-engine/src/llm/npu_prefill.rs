@@ -99,16 +99,22 @@ impl PrefillChunk {
     }
 }
 
-/// The `ceil(n / batch)` dispatches that cover positions `[0, n)`, each padded to `batch`.
+/// The dispatches covering positions `[start, n)`, each padded to `batch`.
 ///
-/// Total device positions written is `ceil(n/batch) * batch`, which is why the pairing check
-/// requires `S % M == 0`: at `n <= S-1` that product can then never exceed the KV window.
-pub fn chunk_plan(n: usize, batch: usize) -> Vec<PrefillChunk> {
+/// Total device positions written is `ceil((n-start)/batch) * batch`, which is why the pairing
+/// check requires `S % M == 0`: at `n <= S-1` that product can then never exceed the KV window.
+///
+/// `start` was pinned to 0 until the prefix ledger existed. Nothing ELSE on this path had to change
+/// for it, because everything downstream already takes an absolute position: `PrefillChunk::start`
+/// is documented as one, and `rope_block`, `mask_widths_block` and `kv_off` are each computed from
+/// it. Only the plan's own origin was the assumption.
+pub fn chunk_plan(start: usize, n: usize, batch: usize) -> Vec<PrefillChunk> {
     assert!(batch > 0, "prefill batch must be non-zero (dims.M is validated at load)");
-    (0..n.div_ceil(batch))
+    assert!(start <= n, "prefill plan start {start} is past its end {n}");
+    (0..(n - start).div_ceil(batch))
         .map(|c| {
-            let start = c * batch;
-            PrefillChunk { start, real: (n - start).min(batch) }
+            let at = start + c * batch;
+            PrefillChunk { start: at, real: (n - at).min(batch) }
         })
         .collect()
 }
@@ -200,12 +206,24 @@ impl NpuPrefill {
         self.batch
     }
 
+    /// `self.artifact`'s measured crossover, or `None` on a pre-2026-09-11 artifact -- see
+    /// [`LlmArtifact::prefill_break_even_tokens`]'s doc comment.
+    pub fn break_even_tokens(&self) -> Option<usize> {
+        self.artifact.prefill_break_even_tokens
+    }
+
     pub(crate) fn batched_enabled(&self) -> bool {
         batched_prefill_enabled()
     }
 
-    /// Prime the KV cache for `tokens` at absolute positions `[0, tokens.len())`. Returns the number
-    /// of positions primed, which is `tokens.len()` -- the caller resumes the per-token loop there.
+    /// Prime the KV cache for `tokens[from..]` at absolute positions `[from, tokens.len())`.
+    /// Returns the number of positions now primed, which is `tokens.len()` -- the caller resumes
+    /// the per-token loop there.
+    ///
+    /// `tokens` is the WHOLE prompt prefix, not the tail: `from` shifts the plan's origin only, so
+    /// `tokens[chunk.start + i]` keeps indexing the prompt by absolute position and the KV position
+    /// a row lands at is the same number as its index. Passing a pre-sliced tail would make those
+    /// two disagree, which is exactly the bug the ledger could introduce.
     ///
     /// The caller must NOT include the prompt's last token: prefill produces no logits, so that one
     /// still goes through the decode ELF, which is also what leaves the KV in exactly the state a
@@ -215,16 +233,36 @@ impl NpuPrefill {
         arena: &FusedArena,
         embed: &EmbedTable,
         tokens: &[u32],
+        from: usize,
     ) -> Result<usize, EngineError> {
-        if tokens.is_empty() {
-            return Ok(0);
+        // `from` MUST be batch-aligned, and this is a correctness check, not a tidiness one.
+        //
+        // One `kv_off` is written per chunk and the device then writes `batch` CONSECUTIVE
+        // positions from it. Blocked, a head's positions are contiguous only inside a block
+        // (`kv_layout`: `[S/T blocks, Hkv heads, T positions, HD dims]`), so a chunk that straddles
+        // a block boundary primes the right bytes at the wrong addresses -- the exact failure the
+        // `kv_off` call below documents having already been fixed once.
+        //
+        // Before the prefix ledger, every chunk started at a multiple of `batch` and the pairing
+        // check's `S % M == 0` made that sufficient. An arbitrary `from` reintroduces the straddle,
+        // so the caller aligns and this refuses rather than trusting it: silent KV corruption reads
+        // as a model that has got worse, not as a bug.
+        if from % self.batch != 0 {
+            return Err(EngineError::Unsupported(format!(
+                "prefill resume point {from} is not a multiple of the prefill batch {}; a chunk \
+                 would straddle a KV block and prime at the wrong addresses",
+                self.batch
+            )));
+        }
+        if tokens.len() <= from {
+            return Ok(tokens.len());
         }
         let d = embed.d_model();
         let hd = self.artifact.head_dim;
         let x_loc = *self.artifact.loc("x");
         let mut x = vec![0u8; self.batch * d * 2];
 
-        for chunk in chunk_plan(tokens.len(), self.batch) {
+        for chunk in chunk_plan(from, tokens.len(), self.batch) {
             // Pad rows repeat the chunk's last real token rather than an arbitrary id: any token is
             // correct (the pad rows' KV lands past n_past and is masked), and repeating a real one
             // keeps the activations in-distribution, so a NaN in the padded tail is a genuine defect
@@ -260,7 +298,13 @@ impl NpuPrefill {
             // "core"-kind and the firmware's UPDATE_REG convention requires the host to pre-shift
             // by 2 bits. Both values are the decode ones with `M` substituted for 1, so a prefill
             // ELF built at M=1 would be driven byte-identically to the decode ELF.
-            let kv = (chunk.start * hd) as u32;
+            // The BLOCKED offset, via the same helper decode uses. This was `chunk.start * hd`,
+            // the flat formula: correct while the cache was [Hkv, S, HD] and silently wrong once
+            // decode blocked it, because prefill then primed the right bytes at the wrong
+            // addresses. At kv_block == max_seq the helper returns exactly `pos * head_dim`, so
+            // the flat path is unchanged.
+            let kv = crate::llm::kv_layout::kv_off(
+                chunk.start, self.artifact.kv_block, hd, self.artifact.kv_heads) as u32;
             self.res
                 .write_scratchpad(self.artifact.kv_off.byte_offset, &kv.to_le_bytes())
                 .map_err(|e| EngineError::Device(format!("write prefill kv_off scratchpad: {e}")))?;
@@ -289,7 +333,7 @@ mod tests {
     use super::*;
 
     fn plan(n: usize, m: usize) -> Vec<(usize, usize, usize)> {
-        chunk_plan(n, m).into_iter().map(|c| (c.start, c.real, c.pad(m))).collect()
+        chunk_plan(0, n, m).into_iter().map(|c| (c.start, c.real, c.pad(m))).collect()
     }
 
     #[test]
@@ -323,7 +367,7 @@ mod tests {
 
     #[test]
     fn an_empty_prompt_is_no_dispatches_at_all() {
-        assert!(chunk_plan(0, 256).is_empty());
+        assert!(chunk_plan(0, 0, 256).is_empty());
     }
 
     #[test]
@@ -333,7 +377,7 @@ mod tests {
         // pure padding over live KV).
         for m in [1usize, 2, 64, 256] {
             for n in 0..600usize {
-                let cs = chunk_plan(n, m);
+                let cs = chunk_plan(0, n, m);
                 assert_eq!(cs.len(), n.div_ceil(m), "n={n} m={m}");
                 assert_eq!(cs.iter().map(|c| c.real).sum::<usize>(), n, "n={n} m={m}");
                 for (i, c) in cs.iter().enumerate() {
@@ -350,7 +394,7 @@ mod tests {
         // argued: at any prompt the window admits, the padded span still fits.
         for (s, m) in [(2048usize, 256usize), (512, 256), (2048, 64), (1024, 1024)] {
             for n in 1..s {
-                let cs = chunk_plan(n, m);
+                let cs = chunk_plan(0, n, m);
                 assert!(cs.len() * m <= s, "S={s} M={m} n={n} would write {} positions", cs.len() * m);
             }
         }
@@ -462,7 +506,7 @@ mod tests {
         // strictly increasing from 1 -- never restarting, never skipping a position.
         let (s, m) = (2048usize, 64usize);
         let mut want = 1u32;
-        for c in chunk_plan(512, m) {
+        for c in chunk_plan(0, 512, m) {
             for w in widths(c.start, m, 1, s) {
                 assert_eq!(w, want, "chunk at {}", c.start);
                 want += 1;

@@ -863,6 +863,7 @@ version = "2.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2929e494b2280e1e18959bb2e121da03347ae896896fdfaceaab43c88a02803f"
 dependencies = [
+ "indexmap",
  "memo-map",
  "serde",
 ]
@@ -1001,6 +1002,7 @@ dependencies = [
  "anyhow",
  "clap",
  "clap_complete",
+ "libc",
  "ndarray",
  "ndarray-npy",
  "npu-asr",
@@ -1037,6 +1039,7 @@ dependencies = [
  "safetensors",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror",
  "tokenizers",
@@ -1717,6 +1720,7 @@ version = "1.0.150"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e8014e44b4736ed0538adeecded0fce2a272f22dc9578a7eb6b2d9993c74cfb9"
 dependencies = [
+ "indexmap",
  "itoa",
  "memchr",
  "serde",

@@ -19,6 +19,12 @@ pub struct Cli {
     #[arg(long, global = true, value_hint = ValueHint::FilePath)]
     pub config: Option<PathBuf>,
     /// Output format for commands that have a machine-readable form.
+    ///
+    /// For `generate` and `chat`, `json` follows the stream flag the way `/v1/chat/completions`
+    /// does: streaming (the default) writes NDJSON to stdout -- a conditions header, one
+    /// `chat.completion.chunk` per decoded token carrying that token's own timing under `x_npu`,
+    /// then a summary -- flushed per line, so `> run.jsonl` produces a file `npu stats` and
+    /// `npu replay` read. `--no-stream` writes the single `chat.completion` object instead.
     // No `short = 'o'`, though the design asked for `-o`: `transcribe-media` already spells its
     // output FILE `-o`, and a global short collides with it -- clap panics there with "Short option
     // names must be unique". Freeing `-o` means renaming that one, which is a user-visible break and
@@ -44,6 +50,7 @@ pub enum Cmd {
     /// `transcribe-media`.
     Transcribe {
         #[arg(value_hint = ValueHint::FilePath)] input: PathBuf,
+        /// ASR model name; omit to use the configured asr default.
         #[arg(long)] model: Option<String>,
     },
     /// Transcribe a media file (video or audio) to a speaker-attributed transcript FILE.
@@ -71,6 +78,7 @@ pub enum Cmd {
     /// Speaker diarization of a 16 kHz mono 16-bit WAV: who spoke when.
     Diarize {
         #[arg(value_hint = ValueHint::FilePath)] wav: PathBuf,
+        /// Diarization model name; omit to use the configured diarize default.
         #[arg(long)] model: Option<String>,
         /// Emit the same JSON body the HTTP route returns, instead of readable lines.
         #[arg(long)] json: bool,
@@ -80,7 +88,11 @@ pub enum Cmd {
     /// `allow_hyphen_values`: the text to embed is prose, and prose begins with `-` all the time
     /// (every Markdown bullet). Without it clap read a bullet as an unknown flag and failed with a
     /// usage error, so the CLI rejected inputs the HTTP route accepted.
-    Embed { #[arg(allow_hyphen_values = true)] text: String, #[arg(long)] model: Option<String> },
+    Embed {
+        #[arg(allow_hyphen_values = true)] text: String,
+        /// Embedding model name; omit to use the configured embed default.
+        #[arg(long)] model: Option<String>,
+    },
     /// One-shot text generation, streamed to stdout by default.
     ///
     /// The prompt goes through the model's chat template, so an instruction-tuned model answers it
@@ -89,8 +101,17 @@ pub enum Cmd {
     /// nothing in the prompt ever gives it a turn to end.
     Generate {
         #[arg(allow_hyphen_values = true)] prompt: String,
+        /// Generation model name; omit to use the configured generate default.
         #[arg(long)] model: Option<String>,
         #[command(flatten)] sampling: SamplingArgs,
+        /// Print the full per-token measurement breakdown after the answer.
+        ///
+        /// The one-line form is printed after every generation anyway, on stderr -- measuring is
+        /// free, so it always happens, and stderr keeps a pipe's stdout clean. This asks for the
+        /// whole table: the phase split, the latency tail, and the conditions the run happened
+        /// under.
+        #[arg(long)]
+        stats: bool,
         /// Print the whole completion at once instead of streaming it token by token.
         #[arg(long)] no_stream: bool,
         /// Send the prompt verbatim, with no chat template -- raw continuation.
@@ -105,6 +126,7 @@ pub enum Cmd {
     Chat {
         /// Opening turn, answered immediately. Omit it to start at an empty prompt.
         #[arg(allow_hyphen_values = true)] prompt: Option<String>,
+        /// Generation model name; omit to use the configured generate default.
         #[arg(long)] model: Option<String>,
         #[command(flatten)] sampling: SamplingArgs,
         #[arg(long)] no_stream: bool,
@@ -135,6 +157,7 @@ pub enum Cmd {
     /// Runtime state, not config: it does not edit `engine.toml` and does not survive a restart.
     /// For that, pin the model (`npu config pin`).
     Load {
+        /// The configured model to make resident.
         model: String,
         #[arg(long)] port: Option<u16>,
     },
@@ -144,6 +167,7 @@ pub enum Cmd {
     /// still knows what the model is, and the next request that needs it loads it again. This is
     /// what frees the NPU for another process without `systemctl stop`.
     Unload {
+        /// The resident model whose device memory to release.
         model: String,
         #[arg(long)] port: Option<u16>,
     },
@@ -158,6 +182,52 @@ pub enum Cmd {
         #[command(subcommand)]
         action: WeightsCmd,
     },
+    /// Live view of the device: who is resident, who is serving, and where the time went.
+    ///
+    /// `docker stats` for the NPU. Reads the status file the service publishes -- no socket, no
+    /// probe, nothing that can hang on a busy device -- and refreshes in place. With the service
+    /// down it says so rather than showing an empty table.
+    Top {
+        /// Seconds between refreshes.
+        #[arg(long, default_value_t = 1.0)]
+        interval: f64,
+        /// Print one snapshot and exit. The default when stdout is not a terminal, so
+        /// `npu top | ...` behaves like every other command here.
+        #[arg(long)]
+        once: bool,
+        /// Read the status published for this port instead of the config's.
+        #[arg(long)]
+        port: Option<u16>,
+    },
+    /// Read a JSONL run log written by `--output json` or `NPU_TELEMETRY_LOG`.
+    ///
+    /// Renders the same overlay a live generation prints, from a file -- so a run from another day
+    /// or another machine reads the same way, and the renderer has exactly one input type.
+    Stats {
+        /// The run log to read.
+        #[arg(value_hint = ValueHint::FilePath)]
+        log: PathBuf,
+        /// Compare against a second run: token divergence first, then the timing deltas, with the
+        /// two conditions stamps side by side.
+        #[arg(long, value_name = "OTHER", value_hint = ValueHint::FilePath)]
+        diff: Option<PathBuf>,
+    },
+    /// Re-emit a run log's completion, with no device and no model.
+    ///
+    /// The chunk lines in a log ARE the stream frames that were served, so replaying is reading
+    /// them back out. Useful to drive a client against a recorded run, and to reproduce a bad
+    /// answer without needing the NPU free.
+    Replay {
+        /// The run log to replay.
+        #[arg(value_hint = ValueHint::FilePath)]
+        log: PathBuf,
+        /// Reproduce the original inter-token timing instead of emitting as fast as possible.
+        #[arg(long)]
+        realtime: bool,
+        /// Emit the raw SSE frames as recorded, rather than just the text.
+        #[arg(long)]
+        frames: bool,
+    },
     /// Print a shell completion script (zsh, bash, fish, elvish, powershell).
     ///
     /// Generated from the clap command tree, so it covers every subcommand and flag and cannot
@@ -165,7 +235,17 @@ pub enum Cmd {
     Completions { shell: Shell },
     /// Inspect / edit the desired-state config.
     #[command(subcommand_required = true, arg_required_else_help = true)]
-    Config { #[command(subcommand)] action: ConfigCmd },
+    Config {
+        #[command(subcommand)] action: ConfigCmd,
+        /// Save the edit without applying it to a running service.
+        ///
+        /// The default is to apply it, because a desired-state file that the running service has
+        /// not adopted is two sources of truth and one manual step between them. Use this when the
+        /// edit is meant for a later start, or when a reconcile now would evict a model something
+        /// is mid-way through using.
+        #[arg(long, global = true)]
+        no_reload: bool,
+    },
     /// Read-only self-test: device/driver versions, power mode, who holds the device, which
     /// config is in effect and why, whether configured models' artifacts resolve, service status.
     ///
@@ -217,6 +297,12 @@ pub struct SamplingArgs {
     #[arg(long, overrides_with = "think")] pub no_think: bool,
     /// Force the `<think>` block on even if the model's template would omit it.
     #[arg(long, overrides_with = "no_think")] pub think: bool,
+    /// Force per-dispatch/hw-context-transition accounting on for THIS generation, regardless of
+    /// `NPU_DISPATCH_LOG` on the service. The service is long-lived and that env var latches at its
+    /// first read, so this is the only way to turn accounting on for one run without a restart.
+    #[arg(long, overrides_with = "no_dispatch_log")] pub dispatch_log: bool,
+    /// Force it off for this one generation even if `NPU_DISPATCH_LOG=1` is set on the service.
+    #[arg(long, overrides_with = "dispatch_log")] pub no_dispatch_log: bool,
 }
 
 /// Transcript output formats.

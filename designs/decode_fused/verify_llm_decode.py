@@ -3,8 +3,9 @@
 """Greedy token-parity gate for a fused decode ELF, on device.
 
 Drives the SAME graph gen_llm_decode.py built (via build_graph, not a re-typed runlist) one token at
-a time through the deep-C constant-ELF protocol -- host writes `x`, the RoPE angle row and the two
-scratchpad params, then ONE dispatch -- and compares the greedy token sequence against a HuggingFace
+a time through the deep-C constant-ELF protocol -- host writes `x`, the RoPE angle row and the
+scratchpad params (kv_off/sm_mask, plus attn_window when the build declares a dynamic window), then
+ONE dispatch -- and compares the greedy token sequence against a HuggingFace
 bf16 reference captured off-device (scripts/llm_decode_bf16_oracle.py -> refs/bf16_oracle.json).
 NOTE tests/refs/<model>/ holds TWO refs and only one of them is a legitimate gate for a bf16
 device: greedy_ref.json is HF **f32** and has no `margins`; bf16_oracle.json is the bf16
@@ -33,6 +34,7 @@ import newstack_compat  # noqa: F401,E402
 from gen_llm_decode import (build_graph, report_artifact_freshness, load_weight_buffer,  # noqa: E402
                             isolate_build_dir, QUANT_MLP_DTYPE, QUANT_MLP_GROUP)
 from redispatch_check import assert_redispatch_identical  # noqa: E402
+from iron.common.kv_layout import KVLayout  # noqa: E402
 
 BF16 = ml_dtypes.bfloat16
 
@@ -65,6 +67,31 @@ def rope_row(pos, head_dim, theta, partial=None):
     row[0::2] = np.cos(ang)
     row[1::2] = np.sin(ang)
     return row.astype(BF16)
+
+
+def window_len(pos, granule):
+    """The attended length for `pos`: positions the cache holds (pos+1), rounded UP to `granule`.
+
+    Mirrors rust/npu-engine/src/llm/npu_decode.rs::window_len exactly -- same rounding, no clamp
+    (the caller mins against dims.S, same as the Rust call site does against bucket.window). Two
+    implementations of one formula that disagree is precisely what this parity gate exists to
+    catch, and it would present as a mismatch blamed on the kernel rather than on the host.
+    """
+    need = pos + 1
+    return -(-need // granule) * granule
+
+
+# Self-check at import time, not a separate test file: mirrors the Rust unit test
+# (window_len_rounds_the_attended_length_up_to_the_granule) verbatim, plus the dims.S clamp the
+# Rust side applies at its call site. A second granule (96, not just 128) is required -- a
+# granule-independent bug (e.g. a hardcoded 128) would still pass the first block.
+assert window_len(0, 128) == 128, "pos 0 needs 1 position -- the first granule"
+assert window_len(127, 128) == 128, "pos 127 needs exactly 128 -- still fits"
+assert window_len(128, 128) == 256, "pos 128 needs 129 -- one past, next granule"
+assert window_len(0, 96) == 96
+assert window_len(95, 96) == 96
+assert window_len(96, 96) == 192
+assert min(window_len(200, 96), 192) == 192, "clamp: 288 > dims.S=192 caps to the built window"
 
 
 def bf16_ulp(x):
@@ -214,9 +241,14 @@ def main():
 
     sp, fused, weights, md = build_graph(a.spec, a.weights, a.layers, a.max_seq)
     n_weight_buffers = len(weights)   # the loop below empties `weights` to halve peak residency
-    NL, S = md["NL"], md["S"]
+    NL, S, T = md["NL"], md["S"], md["T"]
+    # None unless build_graph actually built decode_layer_dp with window_parameter="attn_window"
+    # (DYNAMIC_WINDOW=1 at build time AND the spec eligible) -- gated on both, never on the env
+    # var alone, so a stray DYNAMIC_WINDOW cannot claim a param never wired into the graph.
+    window_granule = md.get("window_granule")
     HD, D, VOCAB = sp.head_dim, sp.d_model, sp.vocab
-    print(f"[verify] {sp.name}: {NL} layers, S={S}, vocab={VOCAB}")
+    kv_layout = KVLayout(Hkv=sp.n_kv_heads, S=S, HD=HD, T=T)
+    print(f"[verify] {sp.name}: {NL} layers, S={S}, kv_block={T}, vocab={VOCAB}")
 
     # THE STACK IS A LIST OF DISPATCHES, length 1 unless DECODE_SEGMENTS cut it. The arena limit
     # that forces the cut is per DISPATCH (aiex.npu.address_patch's I32 arg_plus, 4 GiB), so a
@@ -271,7 +303,8 @@ def main():
                                   if "rope_local" in sg["inputs"] else None)))
     c = stack[0]["c"]
     params = stack[0]["params"]
-    print("[verify] ParameterScratchpad bound (kv_off, sm_mask)")
+    print("[verify] ParameterScratchpad bound (kv_off, sm_mask"
+          + (", attn_window" if window_granule is not None else "") + ")")
     if len(stack) > 1:
         for si, st in enumerate(stack):
             la, lb = st["sg"]["layers"]
@@ -326,6 +359,12 @@ def main():
             _buf[:] = rope_row(0, HD, sp.rope_theta_global).reshape(-1)
         params.write("kv_off", 0)
         params.write("sm_mask", 1)
+        if window_granule is not None:
+            # No manual << 2 here: params.write() already resolves attn_window's "core" kind from
+            # params.txt and pre-shifts internally, exactly as it does for sm_mask above -- adding
+            # a second shift on top would silently double it (<<4, not <<2), the wrong-window
+            # class of bug the header warns about.
+            params.write("attn_window", min(window_len(0, window_granule), S))
         params.sync()
         if len(stack) > 1:
             raise SystemExit("[verify] --redispatch-check drives ONE dispatch and compares it with "
@@ -394,8 +433,24 @@ def main():
             # THIS SEGMENT'S slots, not the whole graph's: the names are per geometry, so a
             # segment with no global layer has no `kv_off1` and writing one raises.
             for slot_name, slot_hd in _st["sg"]["kv_slots"]:
-                _sp_.write(slot_name, int(pos * slot_hd))
+                # `kv_layout.kv_off` owns this formula (main), but it needs kv_heads for the block
+                # stride and `kv_slots` carries only head_dim. At T == S the block term vanishes
+                # (block 0, within == pos) and the two agree exactly, which is every artifact built
+                # today. Refuse loudly rather than write a plausible wrong offset: a KV offset that
+                # is wrong per geometry is silent, and this chain has already paid for one.
+                if T != S and len(_st["sg"]["kv_slots"]) > 1:
+                    raise SystemExit(
+                        f"[verify] blocked KV (T={T}, S={S}) with per-layer geometry is not wired: "
+                        f"kv_slots carry head_dim but not kv_heads, and the block stride needs both. "
+                        f"Emit kv_heads per slot in gen_llm_decode.py before using this combination.")
+                _kvl = KVLayout(Hkv=sp.n_kv_heads, S=S, HD=slot_hd, T=T)
+                _sp_.write(slot_name, int(_kvl.kv_off(pos)))
             _sp_.write("sm_mask", int(pos + 1))
+            if window_granule is not None:
+                # params.write() pre-shifts "core"-kind params by name, so the raw length is
+                # correct here. Clamp to this build's S: window_len can round past the window the
+                # ELF's taps cover, and over-attending is not a smaller bug than under-attending.
+                _sp_.write("attn_window", min(window_len(pos, window_granule), S))
             _sp_.sync()
             # ONE dispatch per position per segment. The duplicate that used to sit here worked
             # around _sync_inputs() trusting a coherence map this harness never updates; that is

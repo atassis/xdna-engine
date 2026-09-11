@@ -4,6 +4,7 @@
 use ndarray::Array2;
 
 use crate::api::EngineError;
+use crate::telemetry::{GenerationReport, StepRecord};
 
 /// The genuinely-shared, genuinely-hard NPU stage. INTERFACE CONTRACT for sibling models
 /// (GigaAM Conformer, Parakeet FastConformer, BERT): implement this and the registry can host it.
@@ -69,13 +70,49 @@ pub enum Scenario {
 // Text generation (decoder-LLM). Added for `llm-serve-openai-surface`.
 // ---------------------------------------------------------------------------------------------
 
-/// One turn of a chat conversation. `role` is OpenAI's vocabulary (`system`/`user`/`assistant`);
-/// it stays a String because the set is the wire protocol's, not ours, and a model's chat template
-/// is free to recognise roles we have never heard of.
-#[derive(Debug, Clone)]
+/// One assistant tool call.
+///
+/// `arguments` is the model's JSON as parsed, and `id` is ours: OpenAI requires one on every call
+/// and no model emits it, so the parser assigns `call_<n>` by position.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: serde_json::Value,
+}
+
+/// One turn of a chat conversation. `role` is OpenAI's vocabulary (`system`/`user`/`assistant`/
+/// `tool`); it stays a String because the set is the wire protocol's, not ours, and a model's chat
+/// template is free to recognise roles we have never heard of.
+///
+/// Construct with [`ChatMessage::new`] rather than a struct literal: this type grew two fields on
+/// 2026-09-10 and broke six literal sites doing it.
+#[derive(Debug, Clone, Default)]
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+    /// Non-empty only on an assistant turn that called a tool. Chat templates read this directly
+    /// (`{%- if message.tool_calls %}`), so it must be ABSENT rather than empty when rendering --
+    /// Jinja truthiness and `transformers` agree on that only if we do not emit the key.
+    pub tool_calls: Vec<ToolCall>,
+    /// `role == "tool"` only. Qwen3's template ignores it; others thread it back to the call.
+    pub tool_call_id: Option<String>,
+}
+
+impl ChatMessage {
+    pub fn new(role: impl Into<String>, content: impl Into<String>) -> Self {
+        ChatMessage { role: role.into(), content: content.into(), ..Default::default() }
+    }
+
+    pub fn with_tool_calls(mut self, calls: Vec<ToolCall>) -> Self {
+        self.tool_calls = calls;
+        self
+    }
+
+    pub fn with_tool_call_id(mut self, id: impl Into<String>) -> Self {
+        self.tool_call_id = Some(id.into());
+        self
+    }
 }
 
 /// What the caller wants continued. The distinction is not cosmetic: `Chat` must go through the
@@ -112,6 +149,20 @@ pub struct GenerateParams {
     pub presence_penalty: Option<f32>,
     pub frequency_penalty: Option<f32>,
     pub repetition_penalty: Option<f32>,
+    /// Per-request override for `npu_xrt::dispatch_log`. `None` leaves the service's
+    /// `NPU_DISPATCH_LOG` default alone; `Some(v)` forces it on/off for THIS generation only.
+    ///
+    /// Exists because the service is long-lived and that env var latches at first read: the CLI is
+    /// a socket client, so setting it on the client changes nothing on the service, and turning it
+    /// on for one run otherwise means restarting the service. See
+    /// `LlmGenerator::generate`/`npu_xrt::dispatch_log::set_override`.
+    pub dispatch_log: Option<bool>,
+    /// Tool schemas the caller declared, as the client's JSON. Empty means no tools -- which is
+    /// what an ABSENT `tools` and an EMPTY `tools: []` both mean, and why neither is an error.
+    ///
+    /// Rendered into the prompt by the model's own template. The engine never inspects a schema;
+    /// it passes the client's JSON through, key order included.
+    pub tools: Vec<serde_json::Value>,
 }
 
 impl Default for GenerateParams {
@@ -129,6 +180,8 @@ impl Default for GenerateParams {
             presence_penalty: None,
             frequency_penalty: None,
             repetition_penalty: None,
+            dispatch_log: None,
+            tools: Vec::new(),
         }
     }
 }
@@ -143,6 +196,9 @@ pub enum FinishReason {
     Length,
     /// The sink asked to stop -- client disconnected mid-stream.
     Aborted,
+    /// The completion ended with at least one tool call. OpenAI's own terminal reason for it, and
+    /// distinct from `Stop`: a client routes on this to decide whether to execute something.
+    ToolCalls,
 }
 
 /// One tier of generation defaults. The same shape serves the scenario's `[generation]` block and
@@ -247,12 +303,13 @@ impl FinishReason {
         match self {
             FinishReason::Stop | FinishReason::Aborted => "stop",
             FinishReason::Length => "length",
+            FinishReason::ToolCalls => "tool_calls",
         }
     }
 }
 
 /// Token accounting, OpenAI's `usage` object.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GenerateUsage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
@@ -265,8 +322,26 @@ pub enum Chunk<'a> {
     /// appends to a String never allocates per token. May be empty: a multi-byte UTF-8 codepoint
     /// split across BPE tokens produces nothing until it completes.
     Text(&'a str),
+    /// What the token just produced cost. Emitted once per DECODED TOKEN, immediately after the
+    /// `Text` it produced -- which is NOT once per `Text`: a token that completes no codepoint
+    /// emits no text at all, and a stop-sequence flush emits text with no token behind it. A
+    /// consumer that wants one record per token must read this and not count `Text` frames.
+    ///
+    /// `emit` inside the record repeats the text the preceding `Text` carried, borrowed from the
+    /// same buffer rather than cloned, so a consumer can render frames from `Step` alone.
+    Step(&'a StepRecord),
+    /// One completed tool call, in the order the model produced it.
+    ///
+    /// Emitted by the generator, not reconstructed downstream: the syntax comes from the model's
+    /// chat template, and the streaming parser has to hold back a partial delimiter BEFORE it
+    /// reaches a sink. A consumer that re-parsed `Text` would be parsing text the delimiters had
+    /// already been removed from.
+    ToolCall(&'a ToolCall),
     /// Terminal. Emitted exactly once, after the last `Text`.
-    Done { reason: FinishReason, usage: GenerateUsage },
+    ///
+    /// `usage` stays a field of its own rather than being read out of `report`: it is the OpenAI
+    /// contract and every caller needs it, while the report is for callers that want the timeline.
+    Done { reason: FinishReason, usage: GenerateUsage, report: &'a GenerationReport },
 }
 
 /// An autoregressive text model. ONE method serves both the streaming and the buffered surface --
@@ -305,7 +380,11 @@ pub trait TextGenerator {
         self.generate(prompt, params, &mut |c| {
             match c {
                 Chunk::Text(t) => out.push_str(t),
-                Chunk::Done { reason, usage: u } => {
+                Chunk::Step(_) => {}
+                // Dropped, not rendered back into the string: this surface returns TEXT, and a
+                // caller that wants calls uses `generate` and reads them as chunks.
+                Chunk::ToolCall(_) => {}
+                Chunk::Done { reason, usage: u, .. } => {
                     fin = reason;
                     usage = u;
                 }
@@ -381,5 +460,25 @@ mod generation_tests {
         assert!(p(None, None, Some(-2.1)).validate().unwrap_err().contains("presence_penalty"));
         assert!(p(Some(f32::NAN), None, None).validate().unwrap_err().contains("finite"));
         assert!(p(Some(f32::INFINITY), None, None).validate().unwrap_err().contains("finite"));
+    }
+
+    /// A tool-result turn and an assistant turn that called a tool are both MESSAGES, and every
+    /// chat template reads `message.tool_calls` and `role == "tool"` directly. Carrying only
+    /// `{role, content}` made the tool half of every template unreachable.
+    #[test]
+    fn chat_message_carries_tool_calls_and_defaults_to_none() {
+        let plain = ChatMessage::new("user", "hi");
+        assert!(plain.tool_calls.is_empty() && plain.tool_call_id.is_none());
+
+        let called = ChatMessage::new("assistant", "").with_tool_calls(vec![ToolCall {
+            id: "call_0".into(),
+            name: "get_weather".into(),
+            arguments: serde_json::json!({ "city": "Paris" }),
+        }]);
+        assert_eq!(called.tool_calls[0].name, "get_weather");
+        assert_eq!(called.tool_calls[0].arguments["city"], "Paris");
+
+        let result = ChatMessage::new("tool", r#"{"temp_c": 14}"#).with_tool_call_id("call_0");
+        assert_eq!(result.tool_call_id.as_deref(), Some("call_0"));
     }
 }

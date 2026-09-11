@@ -40,6 +40,15 @@ iron_at="$(iron_require_api "gen_llm_decode.py" \
   "iron/operators/tmatvec/op.py:class TMatVec" \
   "iron/operators/gemv/quant.py:def quantize_weight" \
   "iron/operators/qkv_head_dp/op.py:class QKVHeadDataParallel")" || exit 1
+# WINDOW_RUNGS needs an API surface that the DEFAULT IRON_DIR does not have, so it is gated
+# separately rather than added to the list above -- requiring it unconditionally would break every
+# decode build against an IRON without it, including the rung-free default this arm leaves inert.
+# Without this the failure is a late TypeError naming a kwarg, which is the same shape that broke
+# every decode build on 2026-09-10 when window_parameter was handed through unconditionally.
+if [ -n "${WINDOW_RUNGS:-}" ]; then
+  iron_require_api "gen_llm_decode.py (WINDOW_RUNGS=$WINDOW_RUNGS)" \
+    "iron/common/sequence.py:extra_runlists" >/dev/null || exit 1
+fi
 echo "[build] IRON on $iron_at (API surface verified)"
 [ -d "$WEIGHTS" ] || { echo "ERROR: no weights at $WEIGHTS (run scripts/dump_llm_weights.py)"; exit 1; }
 
@@ -51,18 +60,30 @@ export MLIR_AIE_INSTANCE="$INST"
 export PATH="$VENV_IRON/bin:$VENV_IRON/cc-shim:$AIEBU_ASM_DIR:$PATH"
 [ -x "$AIECC_PATH" ] || { echo "ERROR: instance aiecc missing at $AIECC_PATH"; exit 1; }
 
-# IRON writes build/ intermediates under CWD. KEEP_WORK=<dir> keeps them: the fused .mlir is the
-# only input scripts/decode_ddr_bytes.py takes, and the shipped artifact does not carry the shim
-# BDs -- so with the unconditional trap a byte census is reproducible only by accident, from a
-# build that happened to choose its own directory.
-. "$REPO/scripts/require_disk_backed.sh"
-require_disk_backed "$OUT" "OUT (the built artifact)" || exit 1
+# IRON writes build/ intermediates under CWD, and IRON's own cache is mtime-vs-dependencies
+# (iron/common/compilation/base.py::is_available_in_filesystem). A fresh mktemp per build threw
+# that cache away every time: MEASURED, a rebuild of an already-built arm takes 41 s against
+# roughly 4 min cold, ~6x, producing a byte-size identical ELF.
+#
+# The isolation the temp dir provided is OBSOLETE, and sequence_name()'s own docstring says why --
+# "Isolating the build dir hides the collision; naming the arm removes it". Every graph-changing
+# knob is now in the artifact name, so two arms cannot share a filename and a shared dir is safe.
+#
+# KEEP_WORK still pins a specific dir: the fused .mlir is the only input decode_ddr_bytes.py takes,
+# and the shipped artifact does not carry the shim BDs, so a byte census needs a known location.
 if [ -n "${KEEP_WORK:-}" ]; then
-    require_disk_backed "$KEEP_WORK" "KEEP_WORK (build intermediates)" || exit 1
     WORK="$KEEP_WORK"; mkdir -p "$WORK"; echo "[build] keeping intermediates in $WORK"
 else
-    WORK="$(disk_backed_mktemp)"; trap 'rm -rf "$WORK"' EXIT
+    WORK="${BUILD_CACHE:-${XDNA_CACHE:-/mnt/data/xdna/cache}/llm-build/$SPEC}"
+    mkdir -p "$WORK"
 fi
+# Serialise builds sharing one dir. The cache is shared BY DESIGN (kernel objects do not depend on
+# the arm), and this box runs more than one session against this checkout -- two concurrent builds
+# in one dir race on the same .o files rather than merely duplicating work. flock makes the second
+# wait instead of corrupting the first; the temp-dir version never needed this because it never
+# shared anything.
+exec 9>"$WORK/.build.lock"
+if ! flock -n 9; then echo "[build] another build holds $WORK -- waiting"; flock 9; fi
 mkdir -p "$OUT"
 echo "[build] spec=$SPEC layers=${LAYERS:-full} inst=$(basename "$INST") iron=$(basename "$IRON")"
 ( cd "$WORK" && "$VENV_IRON/bin/python" "$GEN" --spec "$SPEC" --weights "$WEIGHTS" \

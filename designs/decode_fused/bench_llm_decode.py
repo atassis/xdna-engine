@@ -8,7 +8,7 @@ build_graph so the numbers describe the artifact the parity gate already exercis
 copy that can drift from it.
 
   python designs/decode_fused/bench_llm_decode.py --spec qwen3-0.6b \
-      --weights /path/to/artifacts-qwen3-0.6b/weights --out-json /tmp/bench.json
+      --weights artifacts/qwen3-0.6b/weights --out-json /tmp/bench.json
 
 Measured with time.perf_counter() (monotonic), never wall clock:
 
@@ -46,11 +46,14 @@ import sys
 import time
 
 import numpy as np
+
+from verify_llm_decode import window_len  # one owner for the formula; see its docstring
 import ml_dtypes
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import newstack_compat  # noqa: F401,E402 -- MUST precede iron imports (new-mlir-aie port shim)
 from gen_llm_decode import build_graph, report_artifact_freshness, load_weight_buffer, isolate_build_dir  # noqa: E402
+from iron.common.kv_layout import KVLayout  # noqa: E402
 
 BF16 = ml_dtypes.bfloat16
 
@@ -117,8 +120,11 @@ def main():
     t0 = now()
     sp, fused, weights, md = build_graph(a.spec, a.weights, a.layers, a.max_seq)
     build_s = now() - t0
-    NL, S = md["NL"], md["S"]
+    NL, S, T = md["NL"], md["S"], md["T"]
+    # None unless the build wired a runtime window; gates every attn_window write below.
+    window_granule = md.get("window_granule")
     HD, D, VOCAB = sp.head_dim, sp.d_model, sp.vocab
+    kv_layout = KVLayout(Hkv=sp.n_kv_heads, S=S, HD=HD, T=T)
     print(f"[bench] build_graph: {build_s:.1f}s  ({sp.name}, {NL} layers, S={S}, vocab={VOCAB})",
           flush=True)
     try:
@@ -189,8 +195,16 @@ def main():
         with rope_buf.overwrite() as _buf:
             _buf[:] = rope_row(pos, HD, sp.rope_theta_global).reshape(-1)
         t2 = now()
-        params.write("kv_off", int(pos * HD))
+        params.write("kv_off", int(kv_layout.kv_off(pos)))
         params.write("sm_mask", int(pos + 1))
+        # The attended length, when the build declared a runtime window. Timing this graph with
+        # attn_window UNWRITTEN would not merely be inaccurate -- the core bounds both KV-chunk
+        # loops on it, so it would time a garbage window. Raw value, no shift: ParameterScratchpad
+        # resolves the kind from params.txt and shifts core-kind itself (param_scratchpad_compat
+        # .py:84), so pre-shifting here would shift twice. Same call shape verify_llm_decode.py
+        # uses; that file owns window_len and the two must not drift.
+        if window_granule is not None:
+            params.write("attn_window", min(window_len(pos, window_granule), S))
         params.sync()
         t3 = now()
         c()

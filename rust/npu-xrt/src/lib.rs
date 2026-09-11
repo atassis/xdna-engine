@@ -116,7 +116,26 @@ pub mod dispatch_log {
     use std::collections::BTreeMap;
     use std::sync::OnceLock;
 
+    // Per-request switch, checked before the env var. `None` (the default) falls through to the
+    // process-wide `NPU_DISPATCH_LOG` latch below; `Some(v)` wins regardless of it.
+    //
+    // Exists because a `OnceLock` env read is a defect, not just an inconvenience, in a long-lived
+    // daemon: it latches at first read, the CLI is a socket client so setting the var on the client
+    // changes nothing on the service, and turning it on for one run otherwise means restarting the
+    // service. Thread-local like the rest of this log, which is what makes it request-scoped at
+    // all -- the engine actor is one thread, so `LlmGenerator::generate` setting this on entry
+    // scopes it to exactly the generation that follows, and the next request's own call replaces it
+    // rather than inheriting a sticky value.
+    thread_local!(static OVERRIDE: RefCell<Option<bool>> = const { RefCell::new(None) });
+
+    pub fn set_override(v: Option<bool>) {
+        OVERRIDE.with(|o| *o.borrow_mut() = v);
+    }
+
     pub fn enabled() -> bool {
+        if let Some(v) = OVERRIDE.with(|o| *o.borrow()) {
+            return v;
+        }
         static ON: OnceLock<bool> = OnceLock::new();
         *ON.get_or_init(|| std::env::var("NPU_DISPATCH_LOG").map(|v| v != "0").unwrap_or(false))
     }
@@ -237,6 +256,32 @@ pub mod dispatch_log {
 
     pub fn reset() {
         L.with(|l| *l.borrow_mut() = Log::default())
+    }
+
+    /// `(dispatches, transitions)` so far, for a caller that wants the numbers rather than the
+    /// rendered report -- per-token telemetry differences consecutive reads. Thread-local like the
+    /// rest of this log, which is what makes per-generation scoping meaningful: the engine actor is
+    /// one thread and owns the device.
+    pub fn counts() -> (u32, u32) {
+        L.with(|l| {
+            let l = l.borrow();
+            (l.dispatches as u32, l.transitions as u32)
+        })
+    }
+
+    /// `(label, dispatch count, total blocking seconds)` since the last `reset`, one row per
+    /// distinct label. The structured sibling of `report()`'s prose: a per-request overlay wants
+    /// ms/token PER DESIGN, not a page of text to parse, and every dispatch already funnels through
+    /// a labelled [`crate::Kernel`] with no per-site edits needed to attribute it. Empty when the
+    /// log is off.
+    pub fn per_kernel_snapshot() -> Vec<(String, u32, f64)> {
+        L.with(|l| {
+            let l = l.borrow();
+            l.per_kernel
+                .iter()
+                .map(|(k, &n)| (k.clone(), n as u32, l.secs_by_kernel.get(k).copied().unwrap_or(0.0)))
+                .collect()
+        })
     }
 
     /// The recorded dispatch order, one label per line. Feed to the switch-cost probe so its
@@ -538,6 +583,10 @@ extern "C" {
     fn shim_elf_resident_close(r: *mut CElfResident);
     fn shim_elf_resident_scratchpad_size(r: *mut CElfResident) -> usize;
     fn shim_elf_resident_bind(r: *mut CElfResident, bos: *const *mut CBo, n_bos: usize) -> c_int;
+    fn shim_elf_resident_open_named(
+        base: *mut CElfResident,
+        kernel_name: *const c_char,
+    ) -> *mut CElfResident;
     fn shim_elf_resident_write(
         r: *mut CElfResident,
         offset: usize,
@@ -1240,6 +1289,35 @@ impl ElfResident {
         unsafe { shim_elf_resident_scratchpad_size(self.ptr) }
     }
 
+    /// The kernel name this resident dispatches -- `main:sequence`, or `main:<variant>` for one
+    /// opened by [`ElfResident::open_named`]. Exposed so a caller can PROVE which control code ran
+    /// rather than assume it: a variant that silently fell back to the default would otherwise
+    /// produce a passing parity test that tested nothing.
+    pub fn kernel_name(&self) -> &str {
+        &self.label
+    }
+
+    /// A SECOND named control code out of the same ELF, on the same registered `hw_context`.
+    ///
+    /// A full ELF may carry several runtime sequences; aiecc emits one control code per sequence
+    /// and XRT resolves them by `main:<name>`, so variants of one program (attention-window rungs,
+    /// prefill batch sizes, precision arms) cost extra ELF but not a second context -- and a
+    /// context is the scarce object here, 16 device-wide.
+    ///
+    /// Each variant owns its OWN run and therefore its OWN ctrl scratchpad, so it needs its own
+    /// [`ElfResident::bind`] and its own per-dispatch [`ElfResident::write_scratchpad`]. Writing a
+    /// parameter to one variant and dispatching another silently uses the other's stale scratchpad
+    /// -- which is a wrong answer, not an error.
+    pub fn open_named(&self, kernel_name: &str) -> Result<ElfResident> {
+        let cname = CString::new(kernel_name).map_err(|e| format!("kernel name: {e}"))?;
+        let ptr = unsafe { shim_elf_resident_open_named(self.ptr, cname.as_ptr()) };
+        if ptr.is_null() {
+            Err(format!("resident open_named({kernel_name}): {}", last_error()))
+        } else {
+            Ok(ElfResident { ptr, label: kernel_name.to_string() })
+        }
+    }
+
     /// Bind the arena BOs to run args 0..N once (reused every dispatch).
     pub fn bind(&self, bos: &[&Bo]) -> Result<()> {
         let ptrs: Vec<*mut CBo> = bos.iter().map(|b| b.ptr).collect();
@@ -1306,6 +1384,16 @@ pub struct FusedArena {
 }
 
 impl FusedArena {
+    /// Live device BO bytes on the device these arenas came from -- the same quantity
+    /// [`Device::resident_bo_bytes`] reports, reachable from a model that holds an arena but not
+    /// the `Device` itself. Every `Bo` carries a handle to its device's counter precisely so the
+    /// count can be decremented on drop; reading it here costs nothing and needs no new plumbing.
+    ///
+    /// `0` only if this arena's buffers are views rather than allocations, which `new` never makes.
+    pub fn device_bo_bytes(&self) -> u64 {
+        self.input.counted.as_ref().map_or(0, |c| c.get())
+    }
+
     /// Allocate the three arenas (host_only, group_id 0 — IRON's XRTTensor convention). Sizes come
     /// from the fused operator's `buffer_sizes`. A zero-size arena is rounded up to 2 bytes (XRT
     /// rejects 0-byte BOs; IRON does the same `max(size, itemsize)`).

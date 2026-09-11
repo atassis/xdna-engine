@@ -1,0 +1,14 @@
+[scenario]
+kind = "generate"
+name = "qwen3-0.6b-w4096"
+
+# The CONTROL for bucketing: the identical widest artifact with no buckets declared, so it runs the
+# single-bucket rail. Any token-id difference against the bucketed scenario is bucketing, not the
+# build.
+[artifacts]
+decode = "artifacts/qwen3-0.6b/buckets4096/w4096"
+weights = "artifacts/qwen3-0.6b/weights"
+tokenizer_dir = "artifacts/qwen3-0.6b/tokenizer"
+
+[generation]
+max_tokens = 1024

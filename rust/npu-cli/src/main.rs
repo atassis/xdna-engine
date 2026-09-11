@@ -9,12 +9,15 @@ mod cli_def;
 mod doctor;
 mod exit;
 mod media;
+mod stats;
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser};
 
 use cli_def::{Cli, Cmd, ConfigCmd, OutFormat, OutputFormat, SamplingArgs, WeightsCmd};
 use clap_complete::Shell;
+use std::io::IsTerminal;
+use npu_engine::telemetry::wire;
 use exit::{engine_error, Code, Tagged};
 use npu_runtime::actor::{start, start_lazy};
 use npu_engine::capability::Capability;
@@ -37,7 +40,25 @@ fn config_path_and_source(cli: &Cli) -> (PathBuf, &'static str) {
 /// The one place an error becomes a process exit code (`exit::of`) -- see `exit.rs`. Printing
 /// stays exactly what `Result<(), E: Debug>`'s stdlib `Termination` impl already did (`Error:
 /// {e:?}`, the anyhow chain with "Caused by:"); only the exit status is new.
+/// Put SIGPIPE back to its default disposition.
+///
+/// Rust ignores SIGPIPE at startup, so a closed stdout surfaces as an `EPIPE` from `println!`,
+/// which panics -- `npu models | head` printed a panic and a backtrace note instead of just
+/// stopping. Every other program in a pipeline dies silently there, and a CLI whose output is
+/// meant to be piped (`npu models | awk`, which the shell completion itself does) has to behave
+/// the same way.
+///
+/// Unsafe because it is a raw libc call; sound because it runs before any thread exists and only
+/// restores the disposition the process would have had without Rust's startup code.
+fn restore_sigpipe() {
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
 fn main() -> ExitCode {
+    restore_sigpipe();
     let cli = Cli::parse();
     let path = config_path(&cli);
     match run(&cli, &path) {
@@ -56,12 +77,15 @@ fn run(cli: &Cli, path: &Path) -> Result<()> {
     let as_json = cli.output == OutputFormat::Json;
     match &cli.cmd {
         Cmd::Serve { port, allow_degraded } => serve(path, *port, *allow_degraded),
-        Cmd::Transcribe { input, model } => transcribe(path, input, model.as_deref()),
-        Cmd::Generate { prompt, model, sampling, no_stream, raw } =>
-            generate(path, prompt, model.as_deref(), sampling, *no_stream, *raw),
+        Cmd::Transcribe { input, model } => transcribe(path, input, model.as_deref(), as_json),
+        Cmd::Generate { prompt, model, sampling, no_stream, raw, stats } =>
+            generate(path, prompt, model.as_deref(), sampling, *no_stream, *raw, *stats, as_json),
         Cmd::Chat { prompt, model, sampling, no_stream } =>
-            chat(path, prompt.as_deref(), model.as_deref(), sampling, *no_stream),
-        Cmd::Embed { text, model } => embed(path, text, model.as_deref()),
+            chat(path, prompt.as_deref(), model.as_deref(), sampling, *no_stream, as_json),
+        Cmd::Embed { text, model } => embed(path, text, model.as_deref(), as_json),
+        Cmd::Top { interval, once, port } => top(path, *interval, *once, *port),
+        Cmd::Stats { log, diff } => stats_cmd(log, diff.as_deref()),
+        Cmd::Replay { log, realtime, frames } => replay_cmd(log, *realtime, *frames),
         Cmd::Diarize { wav, model, json } => diarize(path, wav, model.as_deref(), *json || as_json),
         Cmd::TranscribeMedia { input, out, format, asr, diarize: diar, track, no_diarize } =>
             transcribe_media(path, input, out.as_deref(), *format, asr.as_deref(),
@@ -71,14 +95,17 @@ fn run(cli: &Cli, path: &Path) -> Result<()> {
         Cmd::Load { model, port } => load_model(&path, model, *port),
         Cmd::Unload { model, port } => unload_model(&path, model, *port),
         Cmd::Bake { name } => bake(&path, name),
-        Cmd::Config { action } => config_cmd(&path, action),
+        Cmd::Config { action, no_reload } => config_cmd(&path, action, *no_reload),
         Cmd::Flags { json } => flags_cmd(*json || as_json),
         Cmd::Weights { action } => weights_cmd(&path, action),
         Cmd::Doctor { json } => doctor::doctor(&cli, *json || as_json),
         Cmd::Completions { shell } => {
             let mut cmd = Cli::command();
             let name = cmd.get_name().to_string();
-            clap_complete::generate(*shell, &mut cmd, name, &mut std::io::stdout());
+            let mut buf: Vec<u8> = Vec::new();
+            clap_complete::generate(*shell, &mut cmd, name, &mut buf);
+            let script = String::from_utf8(buf).expect("clap emits utf-8");
+            print!("{}", if matches!(shell, Shell::Zsh) { with_model_completion(&script) } else { script });
             Ok(())
         }
     }
@@ -118,12 +145,24 @@ fn root(cfg: &Config, config_path: &Path) -> Result<PathBuf> {
         return Ok(PathBuf::from(p));
     }
     let home = std::env::var("HOME").ok().map(PathBuf::from);
-    let install = std::env::var("XDG_DATA_HOME").ok().map(PathBuf::from)
-        .or_else(|| home.map(|h| h.join(".local/share")))
-        // The prefix install.sh stages and bakes into the unit (`ENGINE_ROOT`, install.sh). If that
-        // name changes there, it must change here: these are one constant in two files, and the
-        // only reason it is not shared is that one of them is bash.
-        .map(|d| d.join("xdna-engine"));
+    // The prefix install.sh stages and bakes into the unit (`ENGINE_ROOT`, install.sh). If that
+    // name changes there, it must change here: these are one constant in two files, and the
+    // only reason it is not shared is that one of them is bash.
+    //
+    // The XDG id is `npu` -- the same one as ~/.config/npu/engine.toml and the `npu` binary. It was
+    // `xdna-engine` until 2026-09-09, which meant config and data disagreed about the application's
+    // name for no reason anyone recorded; XDG keys both off one id and this is it. `xdna-engine`
+    // stays the REPO name, and remains accepted below so an install predating the move still
+    // resolves instead of silently looking empty.
+    let data_home = std::env::var("XDG_DATA_HOME").ok().map(PathBuf::from)
+        .or_else(|| home.map(|h| h.join(".local/share")));
+    let install = data_home.map(|d| {
+        let current = d.join("npu");
+        if current.is_dir() { return current }
+        let legacy = d.join("xdna-engine");
+        if legacy.is_dir() { return legacy }
+        current
+    });
     let cwd = std::env::current_dir().ok();
     for cand in root_candidates(cfg, config_path, cwd, install) {
         if cand.join("scenarios").is_dir() { return Ok(cand) }
@@ -257,7 +296,7 @@ fn serve(path: &Path, port: Option<u16>, allow_degraded: bool) -> Result<()> {
     http::serve(handle, path.to_path_buf(), port).context("serve")
 }
 
-fn transcribe(path: &Path, input: &Path, model: Option<&str>) -> Result<()> {
+fn transcribe(path: &Path, input: &Path, model: Option<&str>, as_json: bool) -> Result<()> {
     quiet_one_shot();
     let cfg = load_cfg(path)?;
     let root = root(&cfg, path)?;
@@ -270,7 +309,12 @@ fn transcribe(path: &Path, input: &Path, model: Option<&str>) -> Result<()> {
     let out = handle.transcribe(model, samples, 16_000)
         .map_err(|e| Tagged(engine_error(&e), e.to_string()));
     handle.shutdown(); let _ = join.join();
-    println!("{}", out?.value);
+    let served = out?;
+    if as_json {
+        println!("{}", serde_json::json!({ "model": served.model, "text": served.value }));
+    } else {
+        println!("{}", served.value);
+    }
     Ok(())
 }
 
@@ -299,6 +343,11 @@ fn build_params(s: &SamplingArgs) -> Result<npu_engine::GenerateParams, String> 
         (false, true) => Some(false),
         _ => None,
     };
+    p.dispatch_log = match (s.dispatch_log, s.no_dispatch_log) {
+        (true, false) => Some(true),
+        (false, true) => Some(false),
+        _ => None,
+    };
     // The SAME check the HTTP surface runs, from the same function -- two surfaces validating
     // separately is how they drift on what they accept.
     p.validate()?;
@@ -314,20 +363,145 @@ fn build_params(s: &SamplingArgs) -> Result<npu_engine::GenerateParams, String> 
 /// already IS the engine; (3) `Handle::generate`'s `Prompt::Chat` with real history is exactly what
 /// a REPL wants and is not staged through JSON at all this way.
 ///
+/// Teach the generated zsh script to complete model NAMES for `--model`/`--asr`/`--diarize`.
+///
+/// clap has no way to express "the values come from the user's config", so it emits `_default` for
+/// these -- which in zsh means FILE completion, and `npu generate --model=<TAB>` offering filenames
+/// is worse than offering nothing. The names have to come from `npu models`, which reads the config
+/// and a status file and answers in about a millisecond with no device and no service.
+///
+/// This is a rewrite of generated text, which is fragile if clap changes its output. It is pinned
+/// by a test that fails if the actions it looks for stop appearing.
+fn with_model_completion(script: &str) -> String {
+    // `${words[2]}` is the subcommand, so one function serves every site and each one offers only
+    // the models that can actually serve it -- `npu transcribe --model=` should not list an
+    // embedding model. An explicit argument wins, for the flags that name their capability.
+    const HELPER: &str = r#"
+_npu_models() {
+  local kind=$1
+  if [[ -z $kind ]]; then
+    case ${words[2]} in
+      transcribe|transcribe-media) kind=asr ;;
+      embed) kind=embed ;;
+      diarize) kind=diarize ;;
+      generate|chat) kind=generate ;;
+    esac
+  fi
+  local -a names
+  # Gate on the STATE column rather than on line position: the table has a header and a trailing
+  # "(live state as of ...)" note, and a row is exactly a line whose second field is a load state.
+  names=(${(f)"$(npu models 2>/dev/null | awk -v k="$kind" \
+    '$2 ~ /^(loaded|unloaded|failed)$/ && (k=="" || $3==k) {print $1}')"})
+  (( ${#names} )) && compadd -a names
+}
+"#;
+    let mut out = script.replacen("#compdef npu\n", &format!("#compdef npu\n{HELPER}"), 1);
+    out = out.replace(":MODEL:_default", ":MODEL:_npu_models");
+    out = out.replace(":ASR:_default", ":ASR:_npu_models asr");
+    out = out.replace(":DIARIZE:_default", ":DIARIZE:_npu_models diarize");
+    // The POSITIONAL model of `load` / `unload` / `config pin` / `config unpin`, where completion
+    // matters most: those commands take nothing but a model name. `name` is deliberately left
+    // alone -- `config add` names a model that does not exist yet, so offering the existing ones
+    // there would suggest exactly the wrong answers.
+    out = out.replace("':model:_default'", "':model:_npu_models'");
+    out
+}
+
+/// What one generation produced: the text, and everything measured about producing it.
+struct Generated {
+    text: String,
+    /// Tool calls the model made. Echoed as JSON rather than as prose: a call is something to
+    /// EXECUTE, and printing it as text would put it in the transcript as if the model had said it.
+    calls: Vec<npu_engine::ToolCall>,
+    reason: npu_engine::FinishReason,
+    report: npu_engine::GenerationReport,
+}
+
 /// Drains `rx` to completion either way, so `Cmd::Generate` on the actor side always finishes even
 /// under `--no-stream`.
-fn drain_generation(rx: std::sync::mpsc::Receiver<StreamItem>, stream: bool) -> Result<String> {
+///
+/// `echo` prints tokens as they arrive; the text is accumulated regardless, because the buffered
+/// `--output json` needs the whole completion in hand and a second drain does not exist.
+///
+/// `json`, when present, receives the NDJSON stream: a conditions header, one line per decoded
+/// token, then the prefill and summary records. It takes a writer rather than a path on purpose --
+/// the shell already redirects, tees and pipes, and a `--stats-log FILE` flag was this function
+/// reimplementing `>` badly, with its own path handling and a second destination that could
+/// disagree with the first.
+fn drain_generation(
+    rx: std::sync::mpsc::Receiver<StreamItem>,
+    echo: bool,
+    meta: &wire::RunMeta,
+    mut json: Option<&mut dyn Write>,
+) -> Result<Generated> {
+    if let Some(w) = json.as_mut() {
+        writeln!(w, "{}", wire::header_line(
+            &npu_runtime::conditions::at_start(&meta.model, meta.created), meta))?;
+    }
     let mut text = String::new();
+    let mut calls: Vec<npu_engine::ToolCall> = Vec::new();
     loop {
         match rx.recv() {
             Ok(StreamItem::Text(t)) => {
-                if stream { print!("{t}"); std::io::stdout().flush().ok(); }
-                else { text.push_str(&t); }
+                if echo { print!("{t}"); std::io::stdout().flush().ok(); }
+                text.push_str(&t);
             }
-            Ok(StreamItem::Done { .. }) => return Ok(text),
+            Ok(StreamItem::ToolCall(c)) => {
+                if echo {
+                    println!("\n[tool_call] {} {}", c.name, c.arguments);
+                    std::io::stdout().flush().ok();
+                }
+                calls.push(c);
+            }
+            Ok(StreamItem::Step(r)) => {
+                if let Some(w) = json.as_mut() {
+                    writeln!(w, "{}", wire::chunk_line(&r, meta))?;
+                    // Per line, not per run: the point of streaming is that the consumer sees a
+                    // token when it happens, and a pipe is block-buffered by default, so without
+                    // this `| jq` would sit silent and then emit the whole run at once.
+                    w.flush()?;
+                }
+            }
+            Ok(StreamItem::Done { reason, report, .. }) => {
+                if let Some(w) = json.as_mut() {
+                    writeln!(w, "{}", wire::prefill_line(&report.prefill, meta))?;
+                    writeln!(w, "{}", wire::summary_line(&report, meta, reason))?;
+                    w.flush()?;
+                }
+                return Ok(Generated { text, calls, reason, report: *report });
+            }
             Ok(StreamItem::Error(e)) => bail!("{e}"),
             Err(_) => bail!("generation ended without a result"),
         }
+    }
+}
+
+/// Identity for one CLI generation, so its log lines and its `--output json` body agree.
+///
+/// `chat` follows the prompt, not the command: `--raw` is `/v1/completions` semantics, so its
+/// records and its JSON body take the `text_completion` shape the HTTP route would have used.
+fn cli_meta(model: &str, chat: bool) -> wire::RunMeta {
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos()).unwrap_or(0);
+    wire::RunMeta {
+        // Same prefixes the HTTP route uses, chosen the same way, so a log written by the CLI and
+        // one written by the service are not distinguishable by an accident of naming.
+        id: format!("{}-{nanos:x}", if chat { "chatcmpl" } else { "cmpl" }),
+        created: (nanos / 1_000_000_000) as i64,
+        model: model.to_string(),
+        chat,
+    }
+}
+
+/// The compact overlay, on stderr after every generation.
+///
+/// stderr, not stdout, and unconditional: measuring costs nothing, so the numbers should not need
+/// asking for -- but `npu generate ... | jq` must still see only the answer.
+fn print_stats_footer(g: &Generated, full: bool) {
+    if full {
+        eprint!("{}", stats::table(&g.report));
+    } else {
+        eprintln!("{}", stats::one_line(&g.report.summarize()));
     }
 }
 
@@ -339,8 +513,9 @@ fn drain_generation(rx: std::sync::mpsc::Receiver<StreamItem>, stream: bool) -> 
 /// `npu generate 'Привет!'` -- 256 tokens of invented statistics homework, in three languages,
 /// with a YouTube link. The stop machinery was working; the prompt simply never gave it a stop to
 /// find.
+#[allow(clippy::too_many_arguments)]
 fn generate(path: &Path, prompt: &str, model: Option<&str>, sampling: &SamplingArgs,
-            no_stream: bool, raw: bool) -> Result<()> {
+            no_stream: bool, raw: bool, stats: bool, as_json: bool) -> Result<()> {
     quiet_one_shot();
     let cfg = load_cfg(path)?;
     let root = root(&cfg, path)?;
@@ -348,14 +523,12 @@ fn generate(path: &Path, prompt: &str, model: Option<&str>, sampling: &SamplingA
         .map_err(|e| Tagged(engine_error(&e), e.to_string()))?;
     // Code::Failure, the documented generic bucket: this closed set has no invalid-argument code,
     // and NoService (2) would tell a caller to start a server for what is a bad flag value.
+    let ndjson = as_json && !no_stream;
     let params = build_params(sampling).map_err(|m| Tagged(Code::Failure, m))?;
     let prompt = if raw {
         npu_engine::Prompt::Raw(prompt.to_string())
     } else {
-        npu_engine::Prompt::Chat(vec![npu_engine::ChatMessage {
-            role: "user".to_string(),
-            content: prompt.to_string(),
-        }])
+        npu_engine::Prompt::Chat(vec![npu_engine::ChatMessage::new("user", prompt)])
     };
     let result = handle.generate(model, prompt, params)
         .map_err(|e| {
@@ -368,11 +541,67 @@ fn generate(path: &Path, prompt: &str, model: Option<&str>, sampling: &SamplingA
             } else { Tagged(code, msg) };
             anyhow::Error::from(tagged)
         })
-        .and_then(|served| drain_generation(served.value, !no_stream));
+        .and_then(|served| {
+            let meta = cli_meta(&served.model, !raw);
+            // `--output json` follows the stream flag, the way /v1/chat/completions does:
+            // streaming means NDJSON on stdout, buffered means one object printed below. In
+            // either JSON mode the text is never echoed separately -- the chunks carry it.
+            let r = if ndjson {
+                let mut out = std::io::stdout();
+                drain_generation(served.value, false, &meta, Some(&mut out))
+            } else {
+                drain_generation(served.value, !no_stream && !as_json, &meta, None)
+            };
+            r.map(|g| (meta, g))
+        });
     handle.shutdown(); let _ = join.join();
-    let text = result?;
-    if no_stream { print!("{text}"); }
-    println!();
+    let (meta, g) = result?;
+    if as_json {
+        // The streaming arm already wrote every line; only the buffered arm has anything left.
+        if !ndjson {
+            println!("{}", wire::completion_object_with_calls(&g.text, &g.calls, g.reason, &g.report, &meta));
+        }
+    } else {
+        if no_stream { print!("{}", g.text); }
+        println!();
+    }
+    // stderr either way, so it never lands in the JSON a pipe is reading.
+    if !as_json || stats { print_stats_footer(&g, stats); }
+    Ok(())
+}
+
+fn stats_cmd(log: &Path, diff: Option<&Path>) -> Result<()> {
+    match diff {
+        Some(other) => print!("{}", stats::diff(log, other)?),
+        None => print!("{}", stats::from_log(log)?),
+    }
+    Ok(())
+}
+
+/// Re-emit a recorded run. No config, no engine, no device: a run log holds the frames that were
+/// served, so replaying is reading them back.
+fn replay_cmd(log: &Path, realtime: bool, frames: bool) -> Result<()> {
+    let text = std::fs::read_to_string(log).with_context(|| format!("{}", log.display()))?;
+    let run = wire::parse_run(&text).map_err(|e| anyhow!("{}: {e}", log.display()))?;
+    let mut out = std::io::stdout();
+    for (i, step) in run.steps.iter().enumerate() {
+        if realtime && i > 0 {
+            std::thread::sleep(std::time::Duration::from_micros(step.dt_us));
+        }
+        if frames {
+            // The recorded bytes, not a re-rendering of them: a replay that re-serialized would be
+            // testing this version's renderer instead of reproducing what the client actually saw.
+            writeln!(out, "data: {}", run.frames[i])?;
+        } else {
+            write!(out, "{}", step.emit)?;
+        }
+        out.flush()?;
+    }
+    if frames { writeln!(out, "data: [DONE]")?; } else { writeln!(out)?; }
+    match &run.summary {
+        Some(s) => eprintln!("{}", stats::one_line(s)),
+        None => eprintln!("(truncated run log: no summary)"),
+    }
     Ok(())
 }
 
@@ -381,7 +610,7 @@ fn generate(path: &Path, prompt: &str, model: Option<&str>, sampling: &SamplingA
 /// `npu generate`, which builds the identical single-message `Prompt::Chat`; duplicating it here
 /// would add a second name for a command we have and drop the history that makes this one a REPL.
 fn chat(path: &Path, opening: Option<&str>, model: Option<&str>, sampling: &SamplingArgs,
-        no_stream: bool) -> Result<()> {
+        no_stream: bool, as_json: bool) -> Result<()> {
     quiet_one_shot();
     let cfg = load_cfg(path)?;
     let root = root(&cfg, path)?;
@@ -398,24 +627,44 @@ fn chat(path: &Path, opening: Option<&str>, model: Option<&str>, sampling: &Samp
         loop {
             let line = match opening.take() {
                 // Echoed at the prompt so the transcript reads the same whether the turn came from
-                // argv or the keyboard.
-                Some(turn) => { println!("> {turn}"); turn }
+                // argv or the keyboard. In JSON mode the prompt and the echo go to stderr, because
+                // stdout is the NDJSON stream and a `> ` in the middle of it is not parseable.
+                Some(turn) => {
+                    if as_json { eprintln!("> {turn}") } else { println!("> {turn}") }
+                    turn
+                }
                 None => {
-                    print!("> "); std::io::stdout().flush().ok();
+                    if as_json { eprint!("> "); std::io::stderr().flush().ok(); }
+                    else { print!("> "); std::io::stdout().flush().ok(); }
                     let mut line = String::new();
-                    if stdin.lock().read_line(&mut line)? == 0 { println!(); return Ok(()); } // Ctrl-D
+                    // Ctrl-D
+                    if stdin.lock().read_line(&mut line)? == 0 {
+                        if as_json { eprintln!() } else { println!() }
+                        return Ok(());
+                    }
                     let line = line.trim_end().to_string();
                     if line.is_empty() { continue; }
                     line
                 }
             };
-            history.push(npu_engine::ChatMessage { role: "user".into(), content: line });
+            history.push(npu_engine::ChatMessage::new("user", line));
             let served = handle.generate(model, npu_engine::Prompt::Chat(history.clone()), params.clone())
                 .map_err(|e| Tagged(engine_error(&e), e.to_string()))?;
-            let reply = drain_generation(served.value, !no_stream)?;
-            if no_stream { print!("{reply}"); }
-            println!();
-            history.push(npu_engine::ChatMessage { role: "assistant".into(), content: reply });
+            let meta = cli_meta(&served.model, true);
+            // One NDJSON run per turn -- header, tokens, summary -- so a piped chat session is a
+            // concatenation of run logs rather than a format of its own.
+            let g = if as_json {
+                let mut out = std::io::stdout();
+                drain_generation(served.value, false, &meta, Some(&mut out))?
+            } else {
+                drain_generation(served.value, !no_stream, &meta, None)?
+            };
+            if !as_json {
+                if no_stream { print!("{}", g.text); }
+                println!();
+                print_stats_footer(&g, false);
+            }
+            history.push(npu_engine::ChatMessage::new("assistant", g.text));
         }
     })();
     handle.shutdown(); let _ = join.join();
@@ -581,7 +830,7 @@ fn render_segments(segs: &[npu_engine::capability::Segment], json: bool) -> Stri
         .join("\n")
 }
 
-fn embed(path: &Path, text: &str, model: Option<&str>) -> Result<()> {
+fn embed(path: &Path, text: &str, model: Option<&str>, as_json: bool) -> Result<()> {
     quiet_one_shot();
     let cfg = load_cfg(path)?;
     let root = root(&cfg, path)?;
@@ -591,9 +840,17 @@ fn embed(path: &Path, text: &str, model: Option<&str>) -> Result<()> {
         .map_err(|e| Tagged(engine_error(&e), e.to_string()))?;
     let out = handle.embed(model, text).map_err(|e| Tagged(engine_error(&e), e.to_string()));
     handle.shutdown(); let _ = join.join();
-    let v = out?.value;
-    let arr = v.iter().map(|x| format!("{x}")).collect::<Vec<_>>().join(",");
-    println!("[{arr}]");
+    let served = out?;
+    if as_json {
+        // The OpenAI embeddings shape, so the one-shot and the HTTP route answer alike.
+        println!("{}", serde_json::json!({
+            "object": "list", "model": served.model,
+            "data": [{ "object": "embedding", "index": 0, "embedding": served.value }],
+        }));
+    } else {
+        let arr = served.value.iter().map(|x| format!("{x}")).collect::<Vec<_>>().join(",");
+        println!("[{arr}]");
+    }
     Ok(())
 }
 
@@ -608,16 +865,86 @@ fn embed(path: &Path, text: &str, model: Option<&str>) -> Result<()> {
 /// signal -- no probe, no handshake, no timeout, and no way to mistake ollama on the shared 11434
 /// for us. A wedged service cannot hang this command, because reading bytes is not connecting; it
 /// shows the last published state and how old it is, and lets the reader judge.
+/// What a model's scenario file declares, for the columns that must answer with the service down.
+///
+/// `kind` and `precision` are properties of the manifest, not of a running process, so reading them
+/// here is what lets `npu models` stay useful (and shell completion stay capability-filtered) when
+/// nothing is serving. Nine small TOMLs parse in well under a millisecond; the command has to stay
+/// cheap enough to back a `<TAB>`.
+struct Declared {
+    kind: Option<String>,
+    /// `None` when the scenario has no `[model]` block at all -- an LLM's precision lives in its
+    /// decode artifact, not the manifest, and inventing "bf16" for it would be a guess wearing a
+    /// measurement's clothes.
+    precision: Option<String>,
+}
+
+fn declared(root: Option<&PathBuf>, scenario: &str) -> Declared {
+    let sc = root
+        .map(|r| r.join(scenario))
+        .and_then(|p| npu_engine::config::ScenarioConfig::load(&p).ok());
+    Declared {
+        // Through the canonical mapping, not the raw string: a scenario says `kind = "embeddings"`
+        // while the capability -- and the live status, and every other surface -- says `embed`.
+        // Reporting the manifest's spelling here would make the column change vocabulary depending
+        // on whether the service happened to be running.
+        kind: sc.as_ref().and_then(|c| {
+            npu_engine::capability::Capability::from_scenario_kind(&c.scenario.kind).map(|k| k.0.to_string())
+        }),
+        precision: sc.as_ref().and_then(|c| c.model.as_ref().map(|m| m.precision.clone())),
+    }
+}
+
+/// The precision cell: what the scenario declares, plus a brace note naming anything that overrides
+/// or refines it. Braces appear ONLY on a deviation -- a column that annotates every row annotates
+/// nothing.
+fn precision_cell(d: &Declared) -> String {
+    let Some(p) = d.precision.as_deref() else { return "-".to_string() };
+    // Process-wide, so it applies to every model at once and belongs in every row that has one.
+    match std::env::var("NPU_PRECISION").ok().filter(|v| v != p) {
+        Some(env) => format!("{p} {{env:{env}}}"),
+        None => p.to_string(),
+    }
+}
+
+/// Device buffer-object bytes, or `-` when nothing measured them.
+///
+/// `bo_bytes` defaults to 0 across the `Servable` tree and only some implementations override it,
+/// so a literal 0 means "unmeasured" far more often than it means "no device memory". Printing
+/// `0 B` would be a measurement nobody took.
+fn mem_cell(bytes: Option<u64>) -> String {
+    match bytes {
+        None | Some(0) => "-".to_string(),
+        Some(b) if b >= 1 << 30 => format!("{:.1}G", b as f64 / (1u64 << 30) as f64),
+        Some(b) if b >= 1 << 20 => format!("{:.0}M", b as f64 / (1u64 << 20) as f64),
+        Some(b) => format!("{:.0}K", b as f64 / 1024.0),
+    }
+}
+
 fn models(path: &Path, as_json: bool, port: Option<u16>) -> Result<()> {
     let cfg = load_cfg(path)?;
     let live = read_live_status(port.unwrap_or(cfg.server.port));
+    let root = root(&cfg, path).ok();
 
     if as_json {
         let rows: Vec<_> = cfg.models.iter().map(|m| {
             let l = live.as_ref().and_then(|(_, v)| find_live(v, &m.name));
+            let d = declared(root.as_ref(), &m.scenario);
+            let bo = l.and_then(|x| x.get("bo_bytes")).and_then(|b| b.as_u64());
             serde_json::json!({
                 "id": m.name, "scenario": m.scenario,
                 "state": l.and_then(|x| x.get("state").and_then(|s| s.as_str())).unwrap_or("unknown"),
+                // Declared beside live, for the same reason `pinned` and `live_pinned` are both
+                // here: the manifest answers with the service down, the service answers what it
+                // actually loaded, and a disagreement is the interesting case.
+                "kind": d.kind,
+                "live_kind": l.and_then(|x| x.get("kind").and_then(|s| s.as_str())),
+                "precision": d.precision,
+                // null, never 0: `bo_bytes` defaults to 0 for every implementation that does not
+                // measure itself, so 0 would report "no device memory" for "nobody looked".
+                "bo_bytes": bo.filter(|b| *b > 0),
+                "busy": l.and_then(|x| x.get("busy")).and_then(|b| b.as_bool()),
+                "idle_s": l.and_then(|x| x.get("idle_s")).and_then(|i| i.as_u64()),
                 // Both, because they are allowed to differ: the config is desired state and the
                 // service only adopts it on reload. That gap is the thing worth reporting.
                 "pinned": m.resident,
@@ -630,14 +957,33 @@ fn models(path: &Path, as_json: bool, port: Option<u16>) -> Result<()> {
         return Ok(());
     }
 
-    println!("{:<22} {:<9} {:<8} {:<5}  {}", "NAME", "STATE", "KIND", "PIN", "SCENARIO");
+    // Column ORDER is load-bearing: `npu models | awk '{print $1}'` is a documented use with a
+    // test, and the shell completion this command backs reads $2 (state) and $3 (kind). New columns
+    // append on the right, and the free-text one goes last.
+    println!("{:<22} {:<9} {:<11} {:<5} {:<6} {:<5}  {}",
+             "NAME", "STATE", "KIND", "PIN", "MEM", "BUSY", "PRECISION");
     let mut drifted = false;
     for m in &cfg.models {
         let l = live.as_ref().and_then(|(_, v)| find_live(v, &m.name));
         let f = |k: &str| l.and_then(|x| x.get(k).and_then(|s| s.as_str())).unwrap_or("-").to_string();
+        let d = declared(root.as_ref(), &m.scenario);
+        // Live kind when a service is up, the manifest's otherwise. Without the fallback this cell
+        // is `-` whenever nothing is serving, which made capability-filtered completion answer
+        // nothing at exactly the moment you are most likely to be typing a command.
+        let kind = match f("kind").as_str() {
+            "-" => d.kind.clone().unwrap_or_else(|| "-".into()),
+            live_kind => live_kind.to_string(),
+        };
         let pin = pin_cell(m.resident, l.and_then(|x| x.get("pinned")).and_then(|p| p.as_bool()));
         if pin.ends_with('*') { drifted = true; }
-        println!("{:<22} {:<9} {:<8} {:<5}  {}", m.name, f("state"), f("kind"), pin, m.scenario);
+        let busy = match l.and_then(|x| x.get("busy")).and_then(|b| b.as_bool()) {
+            Some(true) => "yes".to_string(),
+            Some(false) => "no".to_string(),
+            None => "-".to_string(),
+        };
+        let mem = mem_cell(l.and_then(|x| x.get("bo_bytes")).and_then(|b| b.as_u64()));
+        println!("{:<22} {:<9} {:<11} {:<5} {:<6} {:<5}  {}",
+                 m.name, f("state"), kind, pin, mem, busy, precision_cell(&d));
     }
     match &live {
         Some((age, _)) => println!("\n(live state as of {age}s ago)"),
@@ -659,6 +1005,101 @@ fn models(path: &Path, as_json: bool, port: Option<u16>) -> Result<()> {
 ///
 /// The pid check costs one `stat` of `/proc/<pid>`, cannot hang, and cannot be fooled by a leftover
 /// directory -- which the directory test could not say the same of.
+/// `hh:mm:ss` from seconds, or `mm:ss` under an hour. Uptimes and device times are read at a
+/// glance far more often than they are computed with.
+fn hms(secs: u64) -> String {
+    let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+    if h > 0 { format!("{h}h{m:02}m{s:02}s") } else if m > 0 { format!("{m}m{s:02}s") } else { format!("{s}s") }
+}
+
+/// One frame of `npu top`, rendered from a status snapshot.
+///
+/// Pure so the layout is testable without a service, a device or a clock: everything it needs is
+/// the parsed document and the moment it was read.
+fn top_frame(doc: &serde_json::Value, age_s: u64, now_unix: i64) -> String {
+    let models = doc["models"]["data"].as_array().cloned().unwrap_or_default();
+    let started = doc["started_unix"].as_i64().unwrap_or(0);
+    // A service that publishes no start time (an older binary) gets no denominator, and therefore
+    // no percentage -- rather than a percentage of a guessed window.
+    let uptime = (started > 0).then(|| (now_unix - started).max(0) as u64);
+
+    let n = |m: &serde_json::Value, k: &str| m.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+    let busy_total: u64 = models.iter().map(|m| n(m, "busy_us")).sum();
+    let resident = models.iter().filter(|m| m["state"] == "loaded").count();
+    let on_device: u64 = models.iter().map(|m| n(m, "bo_bytes")).sum();
+    let serving = models.iter().find(|m| m["busy"] == true);
+
+    let mut o = String::new();
+    o.push_str(&format!(
+        "npu top  ·  pid {}  ·  port {}  ·  up {}  ·  snapshot {age_s}s old\n",
+        doc["pid"].as_u64().unwrap_or(0), doc["port"].as_u64().unwrap_or(0),
+        uptime.map(hms).unwrap_or_else(|| "?".into())));
+    let occupancy = match uptime.filter(|u| *u > 0) {
+        Some(u) => format!("{:.1}%", 100.0 * (busy_total as f64 / 1e6) / u as f64),
+        None => "-".into(),
+    };
+    o.push_str(&format!(
+        "device busy {occupancy}  ·  {resident}/{} resident  ·  {} on device  ·  now: {}\n\n",
+        models.len(), mem_cell(Some(on_device)),
+        serving.map(|m| format!("serving {}", m["id"].as_str().unwrap_or("?")))
+               .unwrap_or_else(|| "idle".into())));
+
+    o.push_str(&format!("{:<22} {:<9} {:<9} {:<6} {:<5} {:>7} {:>10} {:>6} {:>6}\n",
+        "MODEL", "KIND", "STATE", "MEM", "BUSY", "SERVED", "DEVICE", "SHARE", "IDLE"));
+    // Busiest first: the question a top asks is "what is using this", and an alphabetical answer
+    // makes the reader do the sorting.
+    let mut rows: Vec<&serde_json::Value> = models.iter().collect();
+    rows.sort_by_key(|m| std::cmp::Reverse(n(m, "busy_us")));
+    for m in rows {
+        let busy_us = n(m, "busy_us");
+        let share = match uptime.filter(|u| *u > 0) {
+            Some(u) => format!("{:.1}%", 100.0 * (busy_us as f64 / 1e6) / u as f64),
+            None => "-".into(),
+        };
+        o.push_str(&format!("{:<22} {:<9} {:<9} {:<6} {:<5} {:>7} {:>10} {:>6} {:>6}\n",
+            m["id"].as_str().unwrap_or("?"),
+            m["kind"].as_str().unwrap_or("-"),
+            m["state"].as_str().unwrap_or("-"),
+            mem_cell(m.get("bo_bytes").and_then(|b| b.as_u64())),
+            if m["busy"] == true { "yes" } else { "no" },
+            n(m, "served"),
+            hms(busy_us / 1_000_000),
+            share,
+            m.get("idle_s").and_then(|i| i.as_u64()).map(|i| hms(i)).unwrap_or_else(|| "-".into())));
+    }
+    o
+}
+
+fn top(path: &Path, interval: f64, once: bool, port: Option<u16>) -> Result<()> {
+    let cfg = load_cfg(path)?;
+    let want = port.unwrap_or(cfg.server.port);
+    // Piping a repainting screen produces escape-code soup, so a non-terminal gets one snapshot --
+    // the same reasoning that puts the generation footer on stderr.
+    let once = once || !std::io::stdout().is_terminal();
+    let period = std::time::Duration::from_secs_f64(interval.max(0.1));
+    loop {
+        match read_live_status(want) {
+            Some((age, doc)) => {
+                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64).unwrap_or(0);
+                let frame = top_frame(&doc, age, now);
+                // Home + clear-below, not clear-screen: the terminal keeps its scrollback and the
+                // frame does not flash.
+                if !once { print!("\x1b[H\x1b[J"); }
+                print!("{frame}");
+                std::io::stdout().flush().ok();
+            }
+            None => {
+                if !once { print!("\x1b[H\x1b[J"); }
+                println!("npu top: no service publishing status for port {want} \
+                          (start it with `systemctl --user start xdna-engine`)");
+            }
+        }
+        if once { return Ok(()); }
+        std::thread::sleep(period);
+    }
+}
+
 fn read_live_status(want_port: u16) -> Option<(u64, serde_json::Value)> {
     let p = npu_runtime::status_file::path()?;
     let body = std::fs::read_to_string(p).ok()?;
@@ -708,6 +1149,102 @@ fn reload(path: &Path, port: Option<u16>) -> Result<()> {
         .context(Tagged(Code::NoService, "reload (is the server running?)".into()))?;
     println!("{body}");
     Ok(())
+}
+
+/// What an edit did, for the path where the SERVICE performed it and this process therefore never
+/// built the local `note`. Kept beside `admin_call` so the two stay in step.
+fn describe(action: &ConfigCmd) -> String {
+    match action {
+        ConfigCmd::Show => String::new(),
+        ConfigCmd::AddModel { name, scenario } => format!("model {name} -> {scenario}"),
+        ConfigCmd::RemoveModel { name } => format!("removed model {name}"),
+        ConfigCmd::Pin { model } => format!("pinned {model} resident"),
+        ConfigCmd::Unpin { model } => format!("unpinned {model}"),
+        ConfigCmd::Set { key, value } => format!("server.{key} = {value}"),
+        ConfigCmd::SetDefault { capability, model } => format!("default {capability} = {model}"),
+    }
+}
+
+/// The `/admin` call that performs one config mutation, or `None` for a read-only subcommand.
+///
+/// `engine.toml` has two possible writers -- this CLI and the service, which rewrites it for every
+/// other `/admin` route -- and two writers on one file is a race waiting for the day both run at
+/// once. So when a service is up it does the writing, and this reduces to naming the request; the
+/// local path below is for when there is no service, where there is no one to race.
+fn admin_call(action: &ConfigCmd) -> Option<(&'static str, String, String)> {
+    let esc = npu_runtime::http::parse::json_escape;
+    match action {
+        ConfigCmd::Show => None,
+        ConfigCmd::AddModel { name, scenario } => Some((
+            "POST", "/admin/models".into(),
+            format!("{{\"name\":\"{}\",\"scenario\":\"{}\"}}", esc(name), esc(scenario)))),
+        ConfigCmd::RemoveModel { name } => Some(("DELETE", format!("/admin/models/{name}"), String::new())),
+        ConfigCmd::Pin { model } => Some((
+            "POST", format!("/admin/models/{model}/resident"), "{\"resident\":true}".into())),
+        ConfigCmd::Unpin { model } => Some((
+            "POST", format!("/admin/models/{model}/resident"), "{\"resident\":false}".into())),
+        ConfigCmd::Set { key, value } => Some((
+            "POST", "/admin/server".into(),
+            format!("{{\"key\":\"{}\",\"value\":\"{}\"}}", esc(key), esc(value)))),
+        ConfigCmd::SetDefault { capability, model } => Some((
+            "POST", "/admin/defaults".into(),
+            format!("{{\"capability\":\"{}\",\"model\":\"{}\"}}", esc(capability), esc(model)))),
+    }
+}
+
+/// Ask the running service to make the edit. Returns its reconcile summary.
+///
+/// A rejection here is the CLI's error: `http_req` returns only the body, so a 400 would otherwise
+/// read as success -- the same `{"error":...}` convention `npu load` already follows.
+fn edit_via_service(port: u16, action: &ConfigCmd) -> Result<String> {
+    let (method, route, body) = admin_call(action).expect("caller checked this is a mutation");
+    let resp = http_req(port, method, &route, &body)
+        .context(Tagged(Code::NoService, "config edit (is the server running?)".into()))?;
+    let v: serde_json::Value = serde_json::from_str(&resp)
+        .with_context(|| format!("unexpected reply: {resp}"))?;
+    if let Some(e) = v.get("error").and_then(|e| e.as_str()) { return Err(admin_err(e, port)) }
+    Ok(summarise_reload(&resp))
+}
+
+/// Apply a just-saved config to the running service, if there is one.
+///
+/// An edit to desired state that leaves actual state alone is a footgun with a manual step: the
+/// file said `max_resident = 2`, the service ran five models, and the only thing standing between
+/// them was remembering to type `npu reload`. So a config edit reconciles by default.
+///
+/// A service that is not running is NOT an error -- editing the config with the engine stopped is
+/// ordinary, and the edit is still saved. Nor is a failed reload: the file is already written, so
+/// reporting the failure and exiting 0 tells the truth (the edit landed, the running service did
+/// not take it) where a non-zero exit would suggest the edit did not.
+fn apply_now(path: &Path, cfg: &Config) -> Result<()> {
+    let port = cfg.server.port;
+    if !listener_is_ours(port) {
+        println!("(no service on port {port} -- takes effect when one starts)");
+        return Ok(());
+    }
+    match http_post(port, "/admin/reload", "") {
+        Ok(body) => {
+            println!("applied: {}", summarise_reload(&body));
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("WARNING: saved, but the running server did not reload: {e}");
+            eprintln!("         run `npu reload` once it is reachable");
+            Ok(())
+        }
+    }
+}
+
+/// The reconcile report as one line. The raw object is five-to-seven counts, most of them zero
+/// most of the time; what an operator wants to know is what actually moved.
+fn summarise_reload(body: &str) -> String {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else { return body.trim().to_string() };
+    let n = |k: &str| v.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
+    let mut parts = Vec::new();
+    for k in ["loaded", "unloaded", "evicted", "failed", "deferred", "pinned_deferred", "pinned_over_cap"] {
+        if n(k) > 0 { parts.push(format!("{} {k}", n(k))); }
+    }
+    if parts.is_empty() { "nothing to change".to_string() } else { parts.join(", ") }
 }
 
 /// `npu load` / `npu unload` talk to the SERVICE, not the device.
@@ -865,11 +1402,27 @@ fn weights_cmd(path: &Path, action: &WeightsCmd) -> Result<()> {
 /// deserialized `Config` back through the serializer. The struct does not carry comments, so the
 /// old path silently deleted every one of them -- including the ones the engine's own generated
 /// config ships with.
-fn config_cmd(path: &Path, action: &ConfigCmd) -> Result<()> {
+fn config_cmd(path: &Path, action: &ConfigCmd, no_reload: bool) -> Result<()> {
     if let ConfigCmd::Show = action {
         print!("{}", render(&load_cfg(path)?));
         return Ok(());
     }
+    // The service owns the file whenever there is one. `--no-reload` opts out of that too: it
+    // means "change desired state without disturbing what is running", and routing the write
+    // through the process that would immediately reconcile is the opposite of that.
+    let port = load_cfg(path).map(|c| c.server.port).unwrap_or(0);
+    if !no_reload && port != 0 && listener_is_ours(port) {
+        let applied = edit_via_service(port, action)?;
+        // Re-read: the SERVICE wrote it, so this reports the file as it now is rather than as this
+        // process believes it should be.
+        let cfg = load_cfg(path)?;
+        println!("{}  [{}]", describe(action), path.display());
+        println!("applied: {applied}");
+        if let Some(w) = cfg.pin_overcommit() { eprintln!("WARNING: {w}"); }
+        if let Some(w) = pins_behind_admission(&cfg) { eprintln!("WARNING: {w}"); }
+        return Ok(());
+    }
+
     let mut doc = npu_runtime::ConfigDoc::load(path).map_err(|e| anyhow!(e))?;
     // What to print once the write lands. Held rather than printed inline so a command that then
     // fails validation says nothing, instead of reporting a change it did not make.
@@ -910,11 +1463,11 @@ fn config_cmd(path: &Path, action: &ConfigCmd) -> Result<()> {
     // where it is made rather than at the next boot.
     if let Some(w) = cfg.pin_overcommit() { eprintln!("WARNING: {w}"); }
     if let Some(w) = pins_behind_admission(&cfg) { eprintln!("WARNING: {w}"); }
-    // The file is desired state; the running service only picks it up when asked.
-    if matches!(action, ConfigCmd::Pin { .. } | ConfigCmd::Unpin { .. } | ConfigCmd::Set { .. }) {
-        println!("run `npu reload` to apply this to a running server");
+    if no_reload {
+        println!("--no-reload: saved only; run `npu reload` to apply it to a running server");
+        return Ok(());
     }
-    Ok(())
+    apply_now(path, &cfg)
 }
 
 /// Every registered `NPU_*`/related env var against the LIVE process environment: whether it is
@@ -1027,6 +1580,223 @@ mod tests {
     use super::*;
     use npu_runtime::config::{Defaults, ModelCfg, ServerCfg};
 
+    fn top_doc(started: i64, extra: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "pid": 42, "port": 11434, "started_unix": started,
+            "models": { "data": [
+                {"id":"qwen3-0.6b","kind":"generate","state":"loaded","bo_bytes":1_500_000_000u64,
+                 "busy":false,"served":3,"busy_us":3_000_000u64,"idle_s":1},
+                {"id":"bge-base","kind":"embed","state":"loaded","bo_bytes":0,
+                 "busy":true,"served":1,"busy_us":500_000u64,"idle_s":0},
+                extra,
+            ]}
+        })
+    }
+
+    #[test]
+    fn top_reports_occupancy_against_uptime_and_sorts_by_it() {
+        let idle = serde_json::json!({"id":"whisper-turbo","kind":"asr","state":"unloaded",
+                                      "bo_bytes":0,"busy":false,"served":0,"busy_us":0});
+        // 3.5 s of device time over 100 s of uptime.
+        let f = top_frame(&top_doc(1_000, idle), 0, 1_100);
+        assert!(f.contains("up 1m40s"), "{f}");
+        assert!(f.contains("device busy 3.5%"), "{f}");
+        assert!(f.contains("serving bge-base"), "a busy model is named in the header: {f}");
+        assert!(f.contains("1.4G"), "device totals are humanised: {f}");
+
+        // Busiest first -- a top that answers alphabetically makes the reader do the sorting.
+        let rows: Vec<&str> = f.lines().skip_while(|l| !l.starts_with("MODEL")).skip(1).collect();
+        assert!(rows[0].starts_with("qwen3-0.6b"), "{rows:?}");
+        assert!(rows[1].starts_with("bge-base"), "{rows:?}");
+        assert!(rows[0].contains("7.4%") || rows[0].contains("3.0%"), "share is per model: {}", rows[0]);
+    }
+
+    #[test]
+    fn top_shows_no_percentage_when_the_service_publishes_no_start_time() {
+        // An older service publishes no `started_unix`. A percentage needs a window, and inventing
+        // one would be a measurement over a guess.
+        let idle = serde_json::json!({"id":"x","kind":"asr","state":"unloaded","bo_bytes":0,
+                                      "busy":false,"served":0,"busy_us":0});
+        let f = top_frame(&top_doc(0, idle), 5, 1_100);
+        assert!(f.contains("up ?"), "{f}");
+        assert!(f.contains("device busy -"), "{f}");
+        assert!(f.contains("snapshot 5s old"), "staleness is always shown: {f}");
+    }
+
+    #[test]
+    fn hms_reads_at_a_glance() {
+        assert_eq!(hms(0), "0s");
+        assert_eq!(hms(59), "59s");
+        assert_eq!(hms(61), "1m01s");
+        assert_eq!(hms(3_661), "1h01m01s");
+    }
+
+    /// Every mutating subcommand must have a route, or it would silently fall back to writing the
+    /// file itself while a service was running -- which is the two-writer case this closes.
+    #[test]
+    fn every_config_mutation_maps_to_an_admin_route() {
+        for action in [
+            ConfigCmd::AddModel { name: "m".into(), scenario: "s.toml".into() },
+            ConfigCmd::RemoveModel { name: "m".into() },
+            ConfigCmd::Pin { model: "m".into() },
+            ConfigCmd::Unpin { model: "m".into() },
+            ConfigCmd::Set { key: "max_resident".into(), value: "2".into() },
+            ConfigCmd::SetDefault { capability: "asr".into(), model: "m".into() },
+        ] {
+            let call = admin_call(&action);
+            assert!(call.is_some(), "no route for {}", describe(&action));
+            let (method, route, _) = call.unwrap();
+            assert!(matches!(method, "POST" | "DELETE"), "{method} {route}");
+            assert!(route.starts_with("/admin/"), "{route}");
+            assert!(!describe(&action).is_empty(), "a mutation must describe itself");
+        }
+        // Show reads; it has nothing to send.
+        assert!(admin_call(&ConfigCmd::Show).is_none());
+    }
+
+    #[test]
+    fn a_reload_summary_names_only_what_moved() {
+        // The raw report is seven counts, most of them zero most of the time. An operator wants
+        // the ones that are not.
+        assert_eq!(summarise_reload(
+            r#"{"loaded":0,"unloaded":0,"failed":0,"deferred":4,"pinned_deferred":1,"evicted":3,"pinned_over_cap":0}"#),
+            "3 evicted, 4 deferred, 1 pinned_deferred");
+        assert_eq!(summarise_reload(
+            r#"{"loaded":0,"unloaded":0,"failed":0,"deferred":0,"pinned_deferred":0,"evicted":0,"pinned_over_cap":0}"#),
+            "nothing to change");
+        // A body that is not the report at all is passed through rather than reduced to a
+        // confident-looking "nothing to change".
+        assert_eq!(summarise_reload("service exploded\n"), "service exploded");
+    }
+
+    #[test]
+    fn unmeasured_device_memory_reads_as_absent_not_as_zero() {
+        // `bo_bytes` defaults to 0 for every Servable that does not measure itself, so 0 means
+        // "nobody looked" far more often than "no device memory". Printing 0 B would report a
+        // measurement nobody took.
+        assert_eq!(mem_cell(None), "-");
+        assert_eq!(mem_cell(Some(0)), "-");
+        assert_eq!(mem_cell(Some(7_340_047)), "7M");
+        assert_eq!(mem_cell(Some(2 * (1 << 30))), "2.0G");
+        assert_eq!(mem_cell(Some(4096)), "4K");
+    }
+
+    #[test]
+    fn precision_is_absent_when_the_scenario_declares_none() {
+        // An LLM scenario has no `[model]` block -- its precision lives in the decode artifact.
+        // Defaulting the column to bf16 there would be a guess printed as a fact.
+        let none = Declared { kind: Some("generate".into()), precision: None };
+        assert_eq!(precision_cell(&none), "-");
+        let bf16 = Declared { kind: Some("asr".into()), precision: Some("bf16".into()) };
+        assert_eq!(precision_cell(&bf16), "bf16");
+    }
+
+    #[test]
+    fn a_precision_override_is_noted_in_braces_and_only_when_it_differs() {
+        // Serialised against the other env-mutating tests in this binary for the reason
+        // npu-asr::tuning learned the hard way: set_var is process-global and cargo runs tests as
+        // threads in one process.
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = Declared { kind: Some("asr".into()), precision: Some("bf16".into()) };
+
+        std::env::remove_var("NPU_PRECISION");
+        assert_eq!(precision_cell(&d), "bf16", "no override, no braces");
+        std::env::set_var("NPU_PRECISION", "bf16");
+        assert_eq!(precision_cell(&d), "bf16", "an override that agrees is not a deviation");
+        std::env::set_var("NPU_PRECISION", "int8");
+        assert_eq!(precision_cell(&d), "bf16 {env:int8}", "a real override is named");
+        std::env::remove_var("NPU_PRECISION");
+    }
+
+    /// `--model=<TAB>` used to offer FILENAMES: clap cannot express "the values come from the
+    /// user's config", so it emits `_default`, which is zsh for file completion. This pins both
+    /// halves -- that clap still emits what the rewrite looks for, and that nothing it aims at
+    /// survives. The first assertion is the load-bearing one: without it, a clap change would make
+    /// the rewrite a silent no-op and the completion would quietly go back to offering files.
+    #[test]
+    fn model_arguments_complete_to_model_names_not_filenames() {
+        let mut cmd = Cli::command();
+        let mut buf: Vec<u8> = Vec::new();
+        clap_complete::generate(Shell::Zsh, &mut cmd, "npu", &mut buf);
+        let raw = String::from_utf8(buf).unwrap();
+        assert!(raw.contains(":MODEL:_default"),
+            "clap no longer emits _default for --model; the rewrite is now aimed at nothing");
+        assert!(raw.contains("':model:_default'"),
+            "clap no longer emits _default for the positional model");
+
+        let out = with_model_completion(&raw);
+        assert!(out.contains("_npu_models()"), "the helper must be defined in the script it is called from");
+        assert!(!out.contains(":MODEL:_default"));
+        assert!(!out.contains("':model:_default'"));
+        assert!(out.contains(":ASR:_npu_models asr"), "capability-specific flags keep their filter");
+        assert!(out.contains(":DIARIZE:_npu_models diarize"));
+        // `config add` names a model that does not exist yet, so it must NOT be rewritten.
+        assert!(out.contains("':name:_default'"), "a NEW model's name must not complete to existing ones");
+    }
+
+    /// An argument with no doc comment completes with an empty description, which is how
+    /// `--model=[]` shipped. Every model-valued flag has to say what it selects.
+    #[test]
+    fn every_model_flag_carries_a_description() {
+        let mut cmd = Cli::command();
+        let mut buf: Vec<u8> = Vec::new();
+        clap_complete::generate(Shell::Zsh, &mut cmd, "npu", &mut buf);
+        let raw = String::from_utf8(buf).unwrap();
+        assert!(!raw.contains("--model=[]"), "some --model still has no help text");
+    }
+
+    /// `--output json` streaming has to produce something the readers accept, or `> run.jsonl` is
+    /// a lie. Drives the drain with a scripted channel and reads its own output back through the
+    /// same parser `npu stats` and `npu replay` use.
+    #[test]
+    fn streaming_json_writes_a_run_log_its_own_readers_can_parse() {
+        use npu_engine::{FinishReason, GenerateUsage, GenerationReport, StepRecord};
+
+        let meta = wire::RunMeta { id: "chatcmpl-t".into(), created: 7, model: "m".into(), chat: true };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut report = GenerationReport::default();
+        for (i, word) in ["Hello", ", ", "world"].iter().enumerate() {
+            let rec = StepRecord {
+                seq: i as u32,
+                token: Some(100 + i as u32),
+                text: word.to_string(),
+                emit: word.to_string(),
+                t_us: 1_000 * (i as u64 + 1),
+                dt_us: 1_000,
+                ..StepRecord::default()
+            };
+            tx.send(StreamItem::Text(rec.emit.clone())).unwrap();
+            tx.send(StreamItem::Step(rec.clone())).unwrap();
+            report.steps.push(rec);
+        }
+        report.usage = GenerateUsage { prompt_tokens: 2, completion_tokens: 3 };
+        report.generate_us = 3_000;
+        tx.send(StreamItem::Done {
+            reason: FinishReason::Stop, usage: report.usage, report: Box::new(report),
+        }).unwrap();
+        drop(tx);
+
+        let mut buf: Vec<u8> = Vec::new();
+        let g = {
+            let w: &mut dyn Write = &mut buf;
+            drain_generation(rx, false, &meta, Some(w)).unwrap()
+        };
+        let out = String::from_utf8(buf).unwrap();
+
+        // Every line is a JSON object, and the first one is the conditions header -- which is what
+        // makes the redirected stream a run log rather than a bare chunk stream.
+        assert!(out.lines().all(|l| serde_json::from_str::<serde_json::Value>(l).is_ok()));
+        assert!(out.lines().next().unwrap().contains("npu.run.header"));
+
+        let run = wire::parse_run(&out).expect("its own reader must accept it");
+        assert_eq!(run.steps, g.report.steps, "the stream and the report describe one run");
+        assert_eq!(run.steps.iter().map(|s| s.emit.as_str()).collect::<String>(), "Hello, world");
+        assert_eq!(g.text, "Hello, world", "the text is recoverable without echoing it separately");
+        assert_eq!(run.summary.expect("summary line").completion_tokens, 3);
+        assert_eq!(run.frames.len(), 3, "one replayable frame per token");
+    }
+
     /// The listing has to stay splittable: `npu models | awk '{print $1}'` is the obvious use, and a
     /// scenario path can contain no spaces while a model name never does -- so name first, path last.
     #[test]
@@ -1094,21 +1864,21 @@ mod tests {
         let p = dir.path().join("engine.toml");
         std::fs::write(&p, "# keep me\n[server]\nmax_resident = 2\n\n[[model]]\nname = \"a\"\nscenario = \"s.toml\"\n").unwrap();
 
-        config_cmd(&p, &ConfigCmd::Pin { model: "a".into() }).unwrap();
+        config_cmd(&p, &ConfigCmd::Pin { model: "a".into() }, true).unwrap();
         assert!(npu_runtime::config::Config::load(&p).unwrap().find("a").unwrap().resident);
 
-        config_cmd(&p, &ConfigCmd::Set { key: "idle_unload_s".into(), value: "0".into() }).unwrap();
+        config_cmd(&p, &ConfigCmd::Set { key: "idle_unload_s".into(), value: "0".into() }, true).unwrap();
         let cfg = npu_runtime::config::Config::load(&p).unwrap();
         assert_eq!(cfg.server.idle_unload(), None, "0 is how idle unload is switched off");
         assert_eq!(cfg.server.max_resident, 2, "an unnamed key must not move");
 
         // Re-pointing a scenario must not silently unpin.
-        config_cmd(&p, &ConfigCmd::AddModel { name: "a".into(), scenario: "t.toml".into() }).unwrap();
+        config_cmd(&p, &ConfigCmd::AddModel { name: "a".into(), scenario: "t.toml".into() }, true).unwrap();
         let cfg = npu_runtime::config::Config::load(&p).unwrap();
         assert_eq!(cfg.find("a").unwrap().scenario, "t.toml");
         assert!(cfg.find("a").unwrap().resident);
 
-        config_cmd(&p, &ConfigCmd::Unpin { model: "a".into() }).unwrap();
+        config_cmd(&p, &ConfigCmd::Unpin { model: "a".into() }, true).unwrap();
         assert!(!npu_runtime::config::Config::load(&p).unwrap().find("a").unwrap().resident);
 
         assert!(std::fs::read_to_string(&p).unwrap().contains("# keep me"),
@@ -1121,10 +1891,10 @@ mod tests {
         let p = dir.path().join("engine.toml");
         std::fs::write(&p, "[[model]]\nname = \"a\"\nscenario = \"s\"\n").unwrap();
         let before = std::fs::read_to_string(&p).unwrap();
-        assert!(config_cmd(&p, &ConfigCmd::Pin { model: "nope".into() }).is_err());
-        assert!(config_cmd(&p, &ConfigCmd::Unpin { model: "nope".into() }).is_err());
-        assert!(config_cmd(&p, &ConfigCmd::RemoveModel { name: "nope".into() }).is_err());
-        assert!(config_cmd(&p, &ConfigCmd::Set { key: "max_resident".into(), value: "-1".into() }).is_err());
+        assert!(config_cmd(&p, &ConfigCmd::Pin { model: "nope".into() }, true).is_err());
+        assert!(config_cmd(&p, &ConfigCmd::Unpin { model: "nope".into() }, true).is_err());
+        assert!(config_cmd(&p, &ConfigCmd::RemoveModel { name: "nope".into() }, true).is_err());
+        assert!(config_cmd(&p, &ConfigCmd::Set { key: "max_resident".into(), value: "-1".into() }, true).is_err());
         assert_eq!(std::fs::read_to_string(&p).unwrap(), before, "a refused command writes nothing");
     }
 
@@ -1149,7 +1919,7 @@ mod tests {
         let s = cli_def::SamplingArgs {
             temperature: None, top_p: None, top_k: None, max_tokens: None,
             max_completion_tokens: None, presence_penalty: None, frequency_penalty: None,
-            repetition_penalty: None, stop: vec![], seed: None, think: false, no_think: false,
+            repetition_penalty: None, stop: vec![], seed: None, think: false, no_think: false, dispatch_log: false, no_dispatch_log: false,
         };
         let p = build_params(&s).unwrap();
         // Everything UNSET, exactly like an HTTP body with no sampling fields -- the CLI must not
@@ -1173,7 +1943,7 @@ mod tests {
             temperature: Some(0.4), top_p: Some(0.9), top_k: Some(50), max_tokens: None,
             max_completion_tokens: Some(64), presence_penalty: Some(0.5),
             frequency_penalty: Some(-0.5), repetition_penalty: Some(1.2),
-            stop: vec!["END".into()], seed: Some(7), think: false, no_think: true,
+            stop: vec!["END".into()], seed: Some(7), think: false, no_think: true, dispatch_log: false, no_dispatch_log: false,
         };
         let p = build_params(&s).unwrap();
         assert_eq!(p.presence_penalty, Some(0.5));
@@ -1187,7 +1957,7 @@ mod tests {
         let mk = |a, b| cli_def::SamplingArgs {
             temperature: None, top_p: None, top_k: None, max_tokens: a,
             max_completion_tokens: b, presence_penalty: None, frequency_penalty: None,
-            repetition_penalty: None, stop: vec![], seed: None, think: false, no_think: false,
+            repetition_penalty: None, stop: vec![], seed: None, think: false, no_think: false, dispatch_log: false, no_dispatch_log: false,
         };
         assert_eq!(build_params(&mk(Some(8), Some(8))).unwrap().max_tokens, Some(8));
         let err = build_params(&mk(Some(8), Some(9))).unwrap_err();
@@ -1202,7 +1972,7 @@ mod tests {
         let mk = |t, tp| cli_def::SamplingArgs {
             temperature: t, top_p: tp, top_k: None, max_tokens: None,
             max_completion_tokens: None, presence_penalty: None, frequency_penalty: None,
-            repetition_penalty: None, stop: vec![], seed: None, think: false, no_think: false,
+            repetition_penalty: None, stop: vec![], seed: None, think: false, no_think: false, dispatch_log: false, no_dispatch_log: false,
         };
         assert!(build_params(&mk(Some(-1.0), None)).unwrap_err().contains("temperature"));
         assert!(build_params(&mk(Some(3.0), None)).unwrap_err().contains("temperature"));
@@ -1217,7 +1987,7 @@ mod tests {
             temperature: Some(0.4), top_p: Some(0.9), top_k: Some(50), max_tokens: Some(64),
             max_completion_tokens: None, presence_penalty: None, frequency_penalty: None,
             repetition_penalty: None,
-            stop: vec!["END".into(), "STOP".into()], seed: Some(7), think: false, no_think: true,
+            stop: vec!["END".into(), "STOP".into()], seed: Some(7), think: false, no_think: true, dispatch_log: false, no_dispatch_log: false,
         };
         let p = build_params(&s).unwrap();
         assert_eq!(p.temperature, Some(0.4));
@@ -1239,7 +2009,7 @@ mod tests {
             max_completion_tokens: None, presence_penalty: None, frequency_penalty: None,
             repetition_penalty: None,
             temperature: None, top_p: None, top_k: None, max_tokens: None,
-            stop: vec![], seed: None, think, no_think,
+            stop: vec![], seed: None, think, no_think, dispatch_log: false, no_dispatch_log: false,
         };
         assert_eq!(build_params(&base(false, false)).unwrap().enable_thinking, None);
         assert_eq!(build_params(&base(true, false)).unwrap().enable_thinking, Some(true));
@@ -1277,7 +2047,7 @@ mod tests {
             "--stop", "STOP", "--seed", "3", "--no-stream",
         ]).expect("must parse");
         match cli.cmd {
-            Cmd::Generate { prompt, sampling, no_stream, model, raw } => {
+            Cmd::Generate { prompt, sampling, no_stream, model, raw, .. } => {
                 assert_eq!(prompt, "- a bullet point");
                 assert_eq!(sampling.temperature, Some(0.5));
                 assert_eq!(sampling.stop, vec!["END".to_string(), "STOP".to_string()]);

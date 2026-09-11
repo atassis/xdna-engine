@@ -124,6 +124,16 @@ arm to also check run-to-run determinism, and requires: candidate == shipped on 
 clip, each NPU arm equal to itself across reps, and each NPU arm byte-equal to the ONNX
 reference.
 
+For a change that is supposed to alter nothing about decode at all -- instrumentation,
+plumbing, a refactor -- the same bar applies with the shipped binary as its own reference:
+run the candidate and the pre-change build over one prompt at a fixed seed and temperature
+0 and require byte-identical output, plus repetitions of each to separate a real
+difference from run-to-run drift. A JSONL run log (`npu generate --output json`, see
+[measurement.md](measurement.md)) makes that comparison token-level rather than
+text-level: `npu stats --diff` aligns two runs on `seq`, reports the first divergent
+token id before it prints any timing, and refuses to read a speed difference as a speedup
+when the two runs did not compute the same thing or ran under different power modes.
+
 ## What none of this proves
 
 - **Cross-hardware generalization.** Every gate above ran on the one Krackan/XDNA2 box

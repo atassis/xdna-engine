@@ -63,7 +63,7 @@ fn main() {
         step.reset().expect("reset KV between prompt lengths");
         let ids = prompt_ids(p, vocab);
         // Prime everything but the last token; the last token is what `step` samples from.
-        let primed = step.prefill(&ids[..p - 1]).expect("prefill");
+        let primed = step.prefill(&ids[..p - 1], 0).expect("prefill");
         for (i, &t) in ids[primed..p - 1].iter().enumerate() {
             step.step(t, primed + i).expect("prime step");
         }

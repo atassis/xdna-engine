@@ -77,11 +77,11 @@ pub struct DiarizationCfg {
     pub manifest: String,
 }
 
-/// Decode-backend tier: a rung on the device ladder, not an
-/// implementation name, so a kernel rename or a new artifact dir under an existing tier never
-/// touches a scenario file. Named after the three backends `WhisperAsr::build` already has:
-/// `FusedDecoder` (whole-decoder ELF, one dispatch/token), the per-op `NPU_DECODE` NPU path
-/// (~72 dispatches/token), and the host ONNX decoder graphs -- the one arm BELOW the ladder.
+/// Decode-backend tier: how far onto the device the decoder runs, not an implementation name, so
+/// a kernel rename or a new artifact dir under an existing tier never touches a scenario file.
+/// Named after the three backends `WhisperAsr::build` already has: `FusedDecoder` (whole-decoder
+/// ELF, one dispatch/token), the per-op `NPU_DECODE` NPU path (~72 dispatches/token), and the host
+/// ONNX decoder graphs -- the one tier that never reaches the device at all.
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum DecodeTier {
@@ -226,6 +226,23 @@ pub struct Artifacts {
     /// pair fails loud rather than corrupting the weights.
     #[serde(default)]
     pub prefill: String,
+    /// `kind = "generate"`, optional: additional decode ELFs for the SAME model at NARROWER
+    /// attention windows over the SAME KV allocation -- resident window buckets. Each is bound to
+    /// the one arena `decode` already owns, so N buckets cost N hardware contexts and no extra
+    /// weight memory; the engine picks the narrowest bucket whose window covers the current
+    /// position, and the padded window stops being paid below the widest one.
+    ///
+    /// Each bucket's window is read from its own `meta.json` `dims.S`, never from its path, and
+    /// every bucket's shared arena offsets are checked against `decode`'s at load -- so a bucket
+    /// generated against a different allocation fails loud rather than corrupting the cache. Empty
+    /// (the default) is exactly the single-bucket rail.
+    ///
+    /// `alias` is load-bearing, not politeness: the field was named `decode_ladder` until
+    /// 2026-09-10, serde ignores an unknown key with no error, and a scenario whose only bucket
+    /// key went unread would load its primary alone and pay the full window at every position --
+    /// silently, as a ~20% latency regression rather than a failure. Measured that way once.
+    #[serde(default, alias = "decode_ladder")]
+    pub decode_buckets: Vec<String>,
     /// `kind = "generate"` only: the checkpoint's directory (`tokenizer.json`,
     /// `tokenizer_config.json`, `generation_config.json`), read through `llm::ModelConfig::load`.
     /// Separate from `tokenizer` above, which every other scenario points at a single
@@ -361,6 +378,42 @@ manifest = "artifacts/pyannote/diarize.json"
             assert!(!p.starts_with('/'), "artifact path must be root-relative, got {p:?}");
             assert!(p.starts_with("artifacts/qwen3-0.6b/"), "unexpected artifact path {p:?}");
         }
+    }
+
+    /// Bucketing is opt-in and its ABSENCE must stay the single-bucket rail: every scenario
+    /// shipped before it parses unchanged, declaring none. Asserted on an inline scenario rather
+    /// than a shipped file, so it does not pin that file's current content.
+    #[test]
+    fn a_scenario_declaring_no_buckets_gets_none() {
+        let c = ScenarioConfig::from_str(
+            "[scenario]\nkind = \"generate\"\nname = \"m\"\n[artifacts]\ndecode = \"d\"\nweights = \"w\"\ntokenizer_dir = \"t\"\n",
+        )
+        .expect("a scenario with no decode_buckets must parse");
+        assert!(c.artifacts.decode_buckets.is_empty());
+    }
+
+    /// And when they ARE named, the buckets arrive in declaration order. Order is not load-bearing
+    /// -- the engine sorts by each artifact's own `dims.S` -- but a config that silently dropped
+    /// entries would look identical to one that named none.
+    /// A scenario written before the rename must still load its buckets. The failure this guards
+    /// is silent: serde drops an unknown key, so the model comes up with its primary design alone
+    /// and pays the padded window every token, with nothing logged.
+    #[test]
+    fn the_pre_rename_field_name_still_parses() {
+        let c = ScenarioConfig::from_str(
+            "[scenario]\nkind = \"generate\"\nname = \"m\"\n[artifacts]\ndecode = \"d\"\nweights = \"w\"\ntokenizer_dir = \"t\"\ndecode_ladder = [\"b/w1024\", \"b/w2048\"]\n",
+        )
+        .expect("a scenario using the pre-rename key must parse");
+        assert_eq!(c.artifacts.decode_buckets, ["b/w1024", "b/w2048"]);
+    }
+
+    #[test]
+    fn a_declared_bucket_list_parses_every_entry() {
+        let c = ScenarioConfig::from_str(
+            "[scenario]\nkind = \"generate\"\nname = \"m\"\n[artifacts]\ndecode = \"d\"\nweights = \"w\"\ntokenizer_dir = \"t\"\ndecode_buckets = [\"b/w256\", \"b/w512\", \"b/w1024\"]\n",
+        )
+        .expect("a scenario declaring decode_buckets must parse");
+        assert_eq!(c.artifacts.decode_buckets, ["b/w256", "b/w512", "b/w1024"]);
     }
 
     #[test]

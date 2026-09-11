@@ -6,8 +6,9 @@
 
 pub mod api;
 pub use api::{Engine, EngineError, Model, ModelKind};
-pub use pipeline::{ChatMessage, Chunk, DEFAULT_MAX_TOKENS, FinishReason, GenerateParams, GenerateUsage, Prompt,
+pub use pipeline::{ChatMessage, Chunk, ToolCall, DEFAULT_MAX_TOKENS, FinishReason, GenerateParams, GenerateUsage, Prompt,
                    TextGenerator};
+pub use telemetry::{Bound, GenerationReport, PrefillRecord, RunConditions, StepPhases, StepRecord, Summary};
 
 #[doc(hidden)] pub mod config;
 #[doc(hidden)] pub mod pipeline;
@@ -22,3 +23,4 @@ pub use pipeline::{ChatMessage, Chunk, DEFAULT_MAX_TOKENS, FinishReason, Generat
 // yet the wired-in replacement for `pipeline::Scenario` / `npu-runtime`'s closed routing.
 #[doc(hidden)] pub mod capability;
 #[doc(hidden)] pub mod llm;
+#[doc(hidden)] pub mod telemetry;

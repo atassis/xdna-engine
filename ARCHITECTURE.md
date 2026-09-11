@@ -46,7 +46,7 @@ request path. Unifying them is open work, not a shipped property; see "Known sea
 | `npu-sr` | Super-resolution engine: frame in / frame out video upscaling (ESPCN, EDSR). Own schedule JSON, own `SrEngine` ABI, drives `npu-xrt` directly. |
 | `npu-sr-capi` | C ABI over `npu-sr` (`libxdna_sr.so`) for the ffmpeg `vf_xdna_sr` filter and other embedders. |
 | `npu-capi` | C ABI over `npu-engine` (cdylib + staticlib, cbindgen header) for in-process embedding from any language. |
-| `npu-cli` | `npu` multitool: serve, transcribe, embed, models, config, reload, bake. |
+| `npu-cli` | `npu` multitool: serve, transcribe, embed, generate, chat, diarize, models, config, reload, bake, doctor, `top`, and the measurement readers `stats` / `replay`. |
 | `npu-probes` | 53 device probes, parity checks and benchmarks. Dev tooling, not shipped: NOT in `default-members`, so it costs nothing on a product build. `cargo build -p npu-probes`. |
 | `npu-dispatch` | Byte-marshaling helpers and dispatch profiling with zero model-specific semantics; the one definition of `PAD_M`/`WA_SUBDIR`/`u16_bytes` that `npu-asr`, `npu-parakeet` and `npu-whisper` each used to copy. |
 | `npu-s2` | S2 TTS codec: opens one exported streamed design (`final.xclbin` + `insts.bin` + `meta.json`) once and dispatches it many times. |

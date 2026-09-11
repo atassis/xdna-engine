@@ -106,7 +106,11 @@ pub enum RopeBase {
 
 /// A validated, ready-to-drive fused decode ELF: every buffer the artifact declares has a checked
 /// location, and the scratchpad protocol (`kv_off`/`sm_mask`) is resolved to concrete offsets.
-#[derive(Debug)]
+///
+/// `Clone` is metadata-only and paid once at load: window bucketing keeps one of these per bucket
+/// so every bucket reads its OWN scratchpad offsets rather than the primary's. It clones maps and
+/// paths, never a buffer -- the arena and the ELF bytes live elsewhere.
+#[derive(Debug, Clone)]
 pub struct LlmArtifact {
     pub role: ArtifactRole,
     pub decode_dir: PathBuf,
@@ -145,6 +149,28 @@ pub struct LlmArtifact {
     /// causal one masks with [`Self::mask_widths`] instead, and the non-causal control masks
     /// nothing. Either way `scratchpad.mask_param` is `null` and there is nothing to write.
     pub sm_mask: Option<ScratchpadParam>,
+    /// The attention-window scratchpad parameter (`scratchpad.window_param`, resolved the same
+    /// way as [`Self::kv_off`]/[`Self::sm_mask`]). `None` on every artifact today -- the window
+    /// is still a build-time constant and the engine ships four separately-compiled designs, one
+    /// per window, selected per token the way [`crate::llm::npu_decode`]'s bucket selector
+    /// already does. Present only on an artifact built for the dynamic-window design, and always
+    /// together with [`Self::window_granule`] -- see the cross-check at the end of [`Self::load_role`].
+    pub attn_window: Option<ScratchpadParam>,
+    /// `meta.json`'s `dims.window_granule` -- the unit the host rounds an attended length up to
+    /// before writing [`Self::attn_window`] (`crate::llm::npu_decode::window_len`). Present
+    /// exactly when `attn_window` is: a scratchpad pointer with no granule has no unit to round
+    /// against, and a granule with no pointer has nothing to write it to.
+    pub window_granule: Option<usize>,
+    /// `meta.json`'s `window_rungs`: the NAMED control codes this one ELF carries besides
+    /// `main:sequence`, each a decode-layer design at a narrower attention window over the SAME KV
+    /// capacity and the SAME arena, as `(kernel subname, window)` sorted ascending by window.
+    ///
+    /// A rung is not another artifact. aiecc emits one control code per `aie.runtime_sequence` and
+    /// XRT resolves them by `main:<name>` against the ONE `hw_context` the ELF registers, so the
+    /// rungs cost extra ELF and neither a context nor a rebuild -- which is the whole difference
+    /// from the bucket-artifact ladder this supersedes. Empty on every artifact built before rungs
+    /// existed, and empty is exactly "one window, the old behaviour".
+    pub window_rungs: Vec<(String, usize)>,
     /// The per-row causal widths, when `meta.json` says `causal: true`. Prefill only -- decode is
     /// M=1, where one scalar width says everything there is to say. See [`MaskWidths`].
     pub mask_widths: Option<MaskWidths>,
@@ -159,14 +185,26 @@ pub struct LlmArtifact {
     pub vocab: Option<usize>,
     pub n_layers: usize,
     /// `meta.json`'s `dims.S` -- how many token positions the on-device KV cache holds. `kc`/`vc`
-    /// are `[Hkv, S, HD]`, so this is an exact capacity, not a hint, and it is a BUILD parameter:
-    /// the head stride depends on it, so changing the window means a different artifact.
+    /// are laid out `[S/kv_block, Hkv, kv_block, HD]` (see [`Self::kv_block`]), so this is an
+    /// exact capacity, not a hint, and it is a BUILD parameter: the cache's own strides depend on
+    /// it, so changing the window means a different artifact.
     ///
     /// Required, like its sibling dims, deliberately. It was recorded here and read by nobody,
     /// which left `pos` unbounded all the way to the dispatch -- and the overrun is silent, since
     /// position S lands on head 1's row 0 rather than outside the arena. An artifact that cannot
     /// say how big its window is cannot have that window enforced, so it fails to load instead.
     pub max_seq: usize,
+    /// `meta.json`'s `dims.kv_heads` -- the KV cache's head count, needed (alongside
+    /// [`Self::max_seq`] and [`Self::head_dim`]) to compute [`crate::llm::kv_layout::kv_off`]'s
+    /// block term. Was already emitted in `meta.json` and simply never read into this struct
+    /// before the KV cache had more than one block to address.
+    pub kv_heads: usize,
+    /// `meta.json`'s `dims.kv_block` -- `iron.common.kv_layout.KVLayout`'s `T`: how many
+    /// positions share one contiguous run per head before the cache layout returns to head 0's
+    /// next block. Equal to [`Self::max_seq`] (one block, the pre-blocking flat layout) on any
+    /// artifact built before this field existed, via a default rather than a parse failure -- an
+    /// artifact with no `dims.kv_block` at all IS a flat-layout one, not a malformed one.
+    pub kv_block: usize,
     /// `meta.json`'s `dims.M` -- how many token positions ONE dispatch of this ELF covers. 1 on a
     /// decode artifact (absent from its meta, and the decode graph IS the M=1 instance of the
     /// prefill graph); the batch on a prefill artifact, where it is required and where every
@@ -203,6 +241,16 @@ pub struct LlmArtifact {
     /// against (`gen_llm_decode.py`, added 2026-09-05). `None` on any artifact built before this
     /// field existed. See [`LlmArtifact::load`]'s freshness check below.
     pub toolchain_hash: Option<String>,
+    /// `meta.json`'s `dims.prefill_break_even_tokens` -- the measured prompt-length crossover
+    /// above which one batched dispatch (a fixed cost, independent of how many of its `dims.M`
+    /// rows are real tokens) beats priming per-token. A property of the ARTIFACT, not a Rust
+    /// constant: a fixed dispatch cost that changes with tiling/M/S changes across a rebuild used
+    /// to live in `generator.rs::PREFILL_BREAK_EVEN_TOKENS`, and went stale the first time an
+    /// artifact rebuilt without a matching re-sweep -- caught 2026-09-11 when a 13-token prompt
+    /// used the batched path at ~1.6x what per-token priming would have cost. `None` on a decode
+    /// artifact (irrelevant there) and on any prefill artifact built before this field existed;
+    /// the caller falls back to a hardcoded default in that case.
+    pub prefill_break_even_tokens: Option<usize>,
 }
 
 /// Verdict from comparing an artifact's [`LlmArtifact::toolchain_hash`] against the currently
@@ -327,6 +375,36 @@ impl LlmArtifact {
         };
         let n_layers = dim("layers")?;
         let max_seq = dim("S")?;
+        // Both absent on any artifact built before blocking landed (including this file's own
+        // pre-blocking test fixtures). Default kv_block to max_seq -- one block, the pre-blocking
+        // flat layout, exactly what such an artifact IS -- rather than failing to load an
+        // otherwise valid old artifact over a field it had no reason to carry. kv_heads then
+        // defaults harmlessly to 0: kv_off's block term multiplies by kv_heads only when
+        // `pos / kv_block > 0`, which cannot happen while kv_block == max_seq and pos < max_seq,
+        // so an unknown kv_heads is provably never read in that case.
+        let kv_block = match dims.get("kv_block") {
+            None | Some(serde_json::Value::Null) => max_seq,
+            Some(v) => v
+                .as_u64()
+                .ok_or_else(|| ctx("dims.kv_block present but non-numeric".to_string()))?
+                as usize,
+        };
+        let kv_heads = match dims.get("kv_heads") {
+            None | Some(serde_json::Value::Null) if kv_block == max_seq => 0,
+            other => other
+                .and_then(|v| v.as_u64())
+                .ok_or_else(|| ctx("dims.kv_heads missing/non-numeric".to_string()))?
+                as usize,
+        };
+        // Absent on every artifact today -- the dynamic-window design this pairs with
+        // (`scratchpad.window_param`, read below) hasn't shipped one yet. `null` and absent both
+        // mean "no granule", the same convention `kv_block`/`rope_theta_local` use.
+        let window_granule = match dims.get("window_granule") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(v) => Some(
+                v.as_u64().ok_or_else(|| ctx("dims.window_granule present but non-numeric".to_string()))? as usize,
+            ),
+        };
         // `dims.M` is what makes a prefill artifact drivable: it sizes `x` and the RoPE angle
         // block, it is the padded chunk width, and it is the batch the causal width is derived
         // from. A decode artifact does not carry it and does not need to -- decode IS M=1.
@@ -336,6 +414,14 @@ impl LlmArtifact {
                 Ok(0) => return Err(ctx("dims.M = 0".to_string())),
                 other => other?,
             },
+        };
+
+        // See `prefill_break_even_tokens`'s own doc comment for why this lives here rather than
+        // as a Rust constant. Absent (pre-2026-09-11 artifacts, and every decode artifact) is a
+        // valid state, not an error -- the caller supplies its own default.
+        let prefill_break_even_tokens = match role {
+            ArtifactRole::Decode => None,
+            ArtifactRole::Prefill => dims.get("prefill_break_even_tokens").and_then(|v| v.as_u64()).map(|v| v as usize),
         };
 
         // Optional as a whole only for prefill, whose model constants come from the decode half.
@@ -447,6 +533,59 @@ impl LlmArtifact {
             _ => vec![(kv_off.clone(), head_dim)],
         };
         let sm_mask = mask_param_name.map(read_param).transpose()?;
+        // The third scratchpad pointer, mirroring `kv_param`/`mask_param`: absent (or explicit
+        // `null`) on every artifact today, since the window is still a build-time constant. A
+        // window pointer with no granule to round against -- or a granule with nothing to write
+        // it to -- is a half-wired artifact, so the two are required together rather than each
+        // silently defaulting to "not declared" on its own.
+        let window_param_name = match sp.get("window_param") {
+            Some(serde_json::Value::Null) | None => None,
+            other => Some(
+                other
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| ctx("scratchpad.window_param present but non-string".to_string()))?,
+            ),
+        };
+        let attn_window = window_param_name.map(read_param).transpose()?;
+        if attn_window.is_some() != window_granule.is_some() {
+            return Err(ctx(format!(
+                "scratchpad.window_param ({window_param_name:?}) and dims.window_granule \
+                 ({window_granule:?}) must both be present or both absent -- one without the \
+                 other computes an attended length against an undefined unit"
+            )));
+        }
+
+        // Rungs are validated here rather than trusted, because a bad one is a plausible wrong
+        // answer and never an error: a rung claiming a window it was not built at would attend
+        // short and return a believable token. A rung wider than `S` is refused for the same
+        // reason the generator refuses to build one.
+        let mut window_rungs: Vec<(String, usize)> = Vec::new();
+        if let Some(v) = meta.get("window_rungs") {
+            let obj = v
+                .as_object()
+                .ok_or_else(|| ctx("window_rungs present but not an object".to_string()))?;
+            for (name, w) in obj {
+                let w = w
+                    .as_u64()
+                    .ok_or_else(|| ctx(format!("window_rungs[{name}] is non-numeric")))?
+                    as usize;
+                if w == 0 || w > max_seq {
+                    return Err(ctx(format!(
+                        "window_rungs[{name}] = {w} is not a window inside dims.S = {max_seq}"
+                    )));
+                }
+                window_rungs.push((name.clone(), w));
+            }
+            window_rungs.sort_by_key(|(_, w)| *w);
+            if attn_window.is_none() {
+                return Err(ctx(
+                    "window_rungs without scratchpad.window_param: a rung quantises the shim's \
+                     FILL and relies on the core taking its own window at runtime, so a rung set \
+                     with no runtime window would attend the rung's whole width at every position"
+                        .to_string(),
+                ));
+            }
+        }
 
         // The RoPE angle buffers, resolved from what the artifact DECLARES. `rope` and
         // `rope_global` are the same thing under two spellings -- the decode generator emits the
@@ -696,6 +835,9 @@ impl LlmArtifact {
             kv_off,
             kv_offs,
             sm_mask,
+            attn_window,
+            window_granule,
+            window_rungs,
             mask_widths,
             rope_inputs,
             head_dim,
@@ -703,6 +845,8 @@ impl LlmArtifact {
             vocab,
             n_layers,
             max_seq,
+            kv_heads,
+            kv_block,
             batch,
             embed_scale,
             rope_theta_global,
@@ -710,6 +854,7 @@ impl LlmArtifact {
             rope_partial_rotary,
             logit_softcap,
             toolchain_hash,
+            prefill_break_even_tokens,
         })
     }
 
@@ -737,7 +882,20 @@ impl LlmArtifact {
     /// function all agree byte-for-byte). `Ok(None)` means no lock was found, which is the normal
     /// shape for a production install and must not be treated as an error.
     fn resolve_current_pin_hash(start: &Path) -> std::io::Result<Option<String>> {
-        let mut dir = start.canonicalize()?;
+        // ABSOLUTE, NOT CANONICAL -- do not resolve symlinks here. `install.sh` stages a production
+        // root holding its own `toolchain.lock` (the pin the artifacts were BUILT against) beside an
+        // `artifacts` SYMLINK into the dev checkout. Canonicalizing follows that symlink, so the
+        // walk-up sails past the staged lock and lands on whatever the developer's tree is pinned at
+        // right now -- gating a shipped artifact on an unrelated working tree.
+        //
+        // Measured 2026-09-09: a re-pin in the checkout made every installed artifact fail to load
+        // with `toolchain-stale`, while the staged lock sitting directly above them still hashed to
+        // exactly what they were built with. The artifact was fine and the right answer was one
+        // directory up; canonicalize() walked past it.
+        //
+        // Lexical walk-up gives each artifact the lock of the tree it LIVES in, which is the
+        // question this check is actually asking. A dev-tree artifact still resolves the dev pin.
+        let mut dir = std::path::absolute(start)?;
         loop {
             if dir.join("toolchain.lock").is_file() {
                 return kernel_registry::current_toolchain_hash(&dir).map(Some);
@@ -880,6 +1038,10 @@ impl LlmArtifact {
     /// artifact declares, and the causal widths on a causal one. Derived, never a literal -- the
     /// list is model-shaped (Gemma-3 has a third table) and role-shaped (the prefill generator
     /// names its single table `rope`).
+    /// Every `Arena::Input` BUFFER the caller must write each token. Scratchpad REGISTERS
+    /// (`kv_off`, `sm_mask`, `attn_window`) are deliberately absent: `check_per_token_writes`
+    /// validates this list against `layout` entries, a register has no `layout` entry, so naming
+    /// one here would read as a guard while checking nothing.
     pub fn per_dispatch_writes(&self) -> Vec<&str> {
         std::iter::once("x")
             .chain(self.rope_inputs.iter().map(|(n, _)| n.as_str()))
@@ -939,13 +1101,24 @@ impl LlmArtifact {
     /// wrong token and nothing else.
     pub fn check_prefill_pairing(&self, prefill: &LlmArtifact) -> Result<(), EngineError> {
         let mut checks: Vec<(&str, usize, usize)> = vec![
-            // `S` is the head stride of the `[Hkv, S, HD]` cache, so a disagreement puts prefill's
-            // KV rows under decode's head boundaries -- in-arena, past every bounds check.
+            // `S` is the capacity both halves address, so a disagreement puts prefill's KV rows
+            // under decode's head boundaries -- in-arena, past every bounds check.
             ("dims.S", self.max_seq, prefill.max_seq),
             ("dims.head_dim", self.head_dim, prefill.head_dim),
             ("dims.d_model", self.d_model, prefill.d_model),
             ("dims.layers", self.n_layers, prefill.n_layers),
+            // The block size, which is what the shared bytes MEAN. It defaults to `S` when the
+            // artifact does not declare it, so this also catches the case that cost 2026-09-10: a
+            // decode blocked at 128 paired with a prefill silent about blocking, priming the right
+            // values at flat addresses. Every generation came back as one token repeated, and
+            // nothing between the two halves compared the one number that differed.
+            ("dims.kv_block", self.kv_block, prefill.kv_block),
         ];
+        // 0 means "not declared, and provably never read" -- see the loader. Only compare two
+        // artifacts that both state it.
+        if self.kv_heads != 0 && prefill.kv_heads != 0 {
+            checks.push(("dims.kv_heads", self.kv_heads, prefill.kv_heads));
+        }
         // Optional on the prefill half (it has no lm-head), checked when declared.
         if let (Some(d), Some(p)) = (self.vocab, prefill.vocab) {
             checks.push(("dims.vocab", d, p));
@@ -1298,6 +1471,48 @@ mod tests {
         assert_eq!(LlmArtifact::load(dir.path()).unwrap().max_seq, 512);
     }
 
+    #[test]
+    fn an_artifact_with_no_dims_kv_block_reads_as_the_flat_pre_blocking_layout() {
+        // base_meta() (and every fixture in this file that predates the KV-blocked-layout task)
+        // declares neither dims.kv_block nor dims.kv_heads -- exactly what a real artifact built
+        // before that task looks like. It must still load, with kv_block defaulting to max_seq.
+        let dir = tempfile::tempdir().unwrap();
+        let mut meta = base_meta(8, 4, serde_json::json!({"rope_global": {"type": "input", "offset": 8, "len": 8}}));
+        meta["dims"]["S"] = serde_json::json!(512);
+        assert!(meta["dims"].get("kv_block").is_none());
+        write_meta(dir.path(), &meta);
+        let art = LlmArtifact::load(dir.path()).unwrap();
+        assert_eq!(art.kv_block, 512);
+        assert_eq!(art.kv_block, art.max_seq);
+    }
+
+    #[test]
+    fn a_blocked_artifact_declares_both_kv_block_and_kv_heads() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut meta = base_meta(8, 4, serde_json::json!({"rope_global": {"type": "input", "offset": 8, "len": 8}}));
+        meta["dims"]["S"] = serde_json::json!(4096);
+        meta["dims"]["kv_block"] = serde_json::json!(128);
+        meta["dims"]["kv_heads"] = serde_json::json!(8);
+        write_meta(dir.path(), &meta);
+        let art = LlmArtifact::load(dir.path()).unwrap();
+        assert_eq!(art.kv_block, 128);
+        assert_eq!(art.kv_heads, 8);
+    }
+
+    #[test]
+    fn a_blocked_artifact_missing_kv_heads_fails_loud_rather_than_guessing() {
+        // kv_block < max_seq with kv_heads absent CANNOT default harmlessly (unlike the flat
+        // case): the block term is genuinely read once pos crosses one block. Silently defaulting
+        // to 0 would compute a wrong kv_off instead of refusing to load.
+        let dir = tempfile::tempdir().unwrap();
+        let mut meta = base_meta(8, 4, serde_json::json!({"rope_global": {"type": "input", "offset": 8, "len": 8}}));
+        meta["dims"]["S"] = serde_json::json!(4096);
+        meta["dims"]["kv_block"] = serde_json::json!(128);
+        write_meta(dir.path(), &meta);
+        let err = LlmArtifact::load(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("kv_heads"), "must name the missing field: {err}");
+    }
+
     // ------------------------------------------------------------------------------------
     // Toolchain freshness (2026-09-05): closes the hole a stale fused decode ELF exploited
     // silently -- it read 7/8 teacher-forced and looked like a precision tie. The
@@ -1337,6 +1552,46 @@ mod tests {
         assert!(err.contains("toolchain-stale"), "{err}");
         assert!(err.contains("9da6356ac521"), "{err}");
         assert!(err.contains(&current), "{err}");
+    }
+
+    /// A staged production root shadows the dev checkout its `artifacts` symlink points into.
+    /// This is the 2026-09-09 outage: a re-pin in the checkout made every INSTALLED artifact fail
+    /// to load, because the walk-up canonicalized through the symlink and found the dev pin rather
+    /// than the staged lock those artifacts were built against.
+    #[test]
+    fn staged_install_root_wins_over_the_checkout_its_artifacts_symlink_into() {
+        let root = tempfile::tempdir().unwrap();
+        let checkout = root.path().join("checkout");
+        let staged = root.path().join("staged");
+        fs::create_dir_all(checkout.join("artifacts/qwen3/decode")).unwrap();
+        fs::create_dir_all(&staged).unwrap();
+
+        // The two trees are pinned DIFFERENTLY -- that disagreement is the whole test.
+        fs::write(checkout.join("toolchain.lock"), b"PIN=dev_moved_on\n").unwrap();
+        fs::write(staged.join("toolchain.lock"), b"PIN=what_it_was_built_with\n").unwrap();
+        let staged_hash = kernel_registry::current_toolchain_hash(&staged).unwrap();
+        let dev_hash = kernel_registry::current_toolchain_hash(&checkout).unwrap();
+        assert_ne!(staged_hash, dev_hash, "test setup must actually disagree");
+
+        // install.sh's shape: artifacts is a SYMLINK into the checkout, beside a staged lock.
+        std::os::unix::fs::symlink(checkout.join("artifacts"), staged.join("artifacts")).unwrap();
+
+        // Stamp the artifact with the STAGED pin -- it was built when that was current.
+        let mut meta = base_meta(8, 4, serde_json::json!({"rope_global": {"type": "input", "offset": 8, "len": 8}}));
+        meta["toolchain"] = serde_json::json!({ "hash": staged_hash });
+        write_meta(&checkout.join("artifacts/qwen3/decode"), &meta);
+
+        // Loaded by its INSTALLED path, it must resolve the staged lock and be Fresh.
+        LlmArtifact::load(&staged.join("artifacts/qwen3/decode"))
+            .expect("installed artifact must be gated on the staged pin, not the dev checkout's");
+
+        // Same bytes reached through the CHECKOUT path are a dev artifact and still get the dev
+        // pin -- the check keeps its teeth where it has them.
+        let err = LlmArtifact::load(&checkout.join("artifacts/qwen3/decode"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("toolchain-stale"), "{err}");
+        assert!(err.contains(&dev_hash), "{err}");
     }
 
     #[test]

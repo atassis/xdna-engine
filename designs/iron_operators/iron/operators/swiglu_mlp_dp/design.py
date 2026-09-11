@@ -196,7 +196,9 @@ def my_swiglu_mlp_dp(
         f"FF/N ({FF_PER_CORE}) must be a multiple of 32"
     )
     # WEIGHT WIRE UNITS. bf16 weights are addressed in ELEMENTS; a group-quantized weight is a flat
-    # byte row -- [n_groups x f32 scale][packed payload] -- so every weight size, offset and stride
+    # byte row -- [n_groups x f32 scale][packed payload] for the symmetric dtypes, and
+    # [n_groups x bf16 scale][n_groups x bf16 min][packed payload] for the affine ones ("int4a" /
+    # "int8a") -- so every weight size, offset and stride
     # below is in whatever unit the wire format uses. Activations (hf, gh, nxt, cx) are ALWAYS bf16
     # and keep their element units; mixing the two is exactly the bytes-vs-elements seam that has
     # no owner, so the weight quantities are named WROW_* and nothing else changes.
@@ -206,7 +208,8 @@ def my_swiglu_mlp_dp(
         WROW_QD = QD
     else:
         from iron.operators.gemv.quant import row_stride_bytes
-        assert weight_dtype in ("int4", "int8"), f"unknown weight_dtype {weight_dtype!r}"
+        assert weight_dtype in ("int4", "int8", "int4a", "int8a"), \
+            f"unknown weight_dtype {weight_dtype!r}"
         assert group_size > 0, "weight_dtype != 'bf16' needs an explicit group_size > 0"
         assert n_aie_rows == 1, (
             "quantized weights are only derived for the plain (n_aie_rows=1) topology -- the "
@@ -249,6 +252,22 @@ def my_swiglu_mlp_dp(
         O_OVERLAP = O_WINDOW - D_PER_CORE             # extra rows read past this core's own slice
         assert O_OVERLAP < TSI_O                      # ceil() guarantees this; sanity check
         WO_ROWS_PADDED = D + O_OVERLAP                # Wo's own arg spec size, in rows
+
+    # The affine kernels keep one float per quant group on the STACK (mv_quant.cc's
+    # `float bsum[n_groups]`, the per-group sums of B). It is the only stack term this design
+    # controls, and stack_size is otherwise an opaque constant the budget below just adds -- so
+    # size it here rather than let it be a hanging number. Worst case is the widest K, since
+    # n_groups = K/group_size: at FF=3072 group_size=32 that is 96 floats = 384 B of the 2048 B
+    # default. The 512 B floor left for everything else (two accums, the ones vector, the frame)
+    # is a policy, not a measurement; aiecc validates the real requirement against stack_size per
+    # core and fails the build if it is short, so this assert exists to fail EARLIER and to name
+    # the term, not to be the only guard.
+    if weight_dtype in ("int4a", "int8a"):
+        bsum_bytes = 4 * (max(K for K in (D, FF) + ((QD,) if fuse_o else ())) // group_size)
+        assert bsum_bytes + 512 <= stack_size, (
+            f"affine bsum[] needs {bsum_bytes} B of the {stack_size} B core stack at "
+            f"group_size={group_size}; raise stack_size or the group"
+        )
 
     # L1 budget check (64 KB/core) -- see module docstring's channel accounting for what each
     # buffer is. Computed, not guessed: this is exactly the "hanging numbers are bugs" rule.

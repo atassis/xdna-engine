@@ -111,7 +111,7 @@ fn main() {
     step.reset().expect("reset KV before the run");
     // Prime everything but the LAST prompt token: prefill emits no logits, so that one goes through
     // the decode ELF -- which is also what leaves the KV in the state P sequential steps would.
-    let primed = step.prefill(&prompt_ids[..p - 1]).expect("prefill");
+    let primed = step.prefill(&prompt_ids[..p - 1], 0).expect("prefill");
     for (i, &t) in prompt_ids[primed..p - 1].iter().enumerate() {
         step.step(t, primed + i).expect("prime step");
     }
@@ -141,7 +141,7 @@ fn main() {
     let mut tf_topk: Vec<Vec<u32>> = Vec::with_capacity(n_tokens);
     if !ref_gen.is_empty() {
         step.reset().expect("reset KV before the teacher-forced pass");
-        let primed_tf = step.prefill(&prompt_ids[..p - 1]).expect("prefill (teacher-forced)");
+        let primed_tf = step.prefill(&prompt_ids[..p - 1], 0).expect("prefill (teacher-forced)");
         for (i, &t) in prompt_ids[primed_tf..p - 1].iter().enumerate() {
             step.step(t, primed_tf + i).expect("prime step (teacher-forced)");
         }

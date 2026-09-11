@@ -24,6 +24,8 @@ clap_complete = "4"
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# SIGPIPE only; see `restore_sigpipe` in main.rs.
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

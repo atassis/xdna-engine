@@ -1,0 +1,29 @@
+[scenario]
+kind = "generate"
+name = "qwen3-0.6b-dynwindow"
+
+# ONE decode design for every context length: the attention window arrives per dispatch in the
+# `attn_window` scratchpad parameter instead of the engine selecting among pre-built fixed-window
+# designs. Granule 128 positions (lcm of the 32-position stream tile and the 128-position KV
+# block), against the bucketed model's 1024 -- 8x finer, from a single hardware context.
+#
+# COMPUTE IS DYNAMIC, TRANSPORT IS NOT, and the name overstates it. The core bounds both KV-chunk
+# loops, the mask/softmax row length and a drain loop on the runtime length, but the K/V fill still
+# streams the full 4096-position window every token and the drain discards the surplus. Making the
+# fill follow the window needs a runtime BD size, which exists only on the EmitC target -- a
+# different dispatch model from this resident ELF. See the task; that is the next piece.
+#
+# So this is NOT expected to beat `qwen3-0.6b-buckets` on latency: buckets shrink the BYTES at
+# 1024 granularity, this shrinks the COMPUTE at 128. On a movement-bound rail bytes dominate. It is
+# configured here as a named model to be measured against them, deliberately not as the default.
+#
+# MEASURED against the FIXED-window design (not against buckets): -7 to -9% per token below
+# position 1024, decaying to +0.1% at 2047 where the runtime window meets the built ceiling and the
+# two are the same design. That convergence is the measurement's own control.
+[artifacts]
+decode = "artifacts/qwen3-0.6b/dynwindow4096"
+weights = "artifacts/qwen3-0.6b/weights"
+tokenizer_dir = "artifacts/qwen3-0.6b/tokenizer"
+
+[generation]
+max_tokens = 1024

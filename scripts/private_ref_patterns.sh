@@ -52,4 +52,8 @@ private_ref_regex="$(IFS='|'; echo "${private_ref_patterns[*]}")"
 # before allowlisting: its only `package`-prefixed slug is
 # `package-rapl-is-root-only-...`, which the exact-token form below cannot match.
 private_ref_wikilink_re='\[\[[a-z0-9][a-z0-9-]*\]\]'
-private_ref_benign_wikilink_re='\[\[(bin|model|last|nxt|package)\]\]'
+# Fifth, verified 2026-09-09: `[[slug]]` -- the METAVARIABLE, as in "a private-KB [[slug]]".
+# There is no note named `slug`; it is how the guard's own documentation and commit messages
+# refer to the shape being matched, so describing the rule trips it. Same self-reference as
+# aa87154 ("allowlist [[package]], which blocked the commit that added it").
+private_ref_benign_wikilink_re='\[\[(bin|model|last|nxt|package|slug)\]\]'

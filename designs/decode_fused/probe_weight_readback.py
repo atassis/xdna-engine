@@ -107,7 +107,7 @@ def main():
     c()
     lg = np.asarray(c.get_buffer("logits").data, BF16).astype(np.float32).copy()
     # RE-SYNC AND RE-READ, the documented absorb for the host-only BO coherency race
-    # ([[npu-hostonly-bo-coherency-race]]): sync(FROM_DEVICE) can return before the last DMA line is
+    # (a host-only BO coherency race): sync(FROM_DEVICE) can return before the last DMA line is
     # visible, and the host then reads the PRE-DMA value -- which for a zeroed output buffer is
     # exactly zero. That is the shape of the 2169 unwritten elements. A genuine miscompute is
     # deterministic and survives every attempt, so a bounded re-read absorbs only the transient

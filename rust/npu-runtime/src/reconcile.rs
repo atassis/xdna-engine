@@ -1,5 +1,6 @@
 //! Bring the registry (actual) in line with the config (desired): load missing, unload removed,
-//! reload changed. Each step independent; failures recorded as Failed, never fatal.
+//! reload changed, evict over the cap. Each step independent; failures recorded as Failed, never
+//! fatal.
 use crate::config::Config;
 use crate::loader::ModelLoader;
 use crate::registry::{LoadState, Registry};
@@ -12,6 +13,21 @@ pub struct ReconcileReport {
     /// Configured and wanted, but left out of residency by `max_resident`. Not a failure: these load
     /// on demand when a request asks for them.
     pub deferred: Vec<String>,
+    /// Released because `max_resident` was lowered under what is already resident.
+    ///
+    /// `max_resident` used to be an ADMISSION limit only: `try_load` refused new loads over it and
+    /// nothing looked at the models already in. So lowering it from 5 to 2 left five resident, and
+    /// `npu reload` -- whose entire job is making actual match desired -- reported `deferred: 4`
+    /// and changed nothing. The cap converged only through the idle sweep or through a later load
+    /// evicting one victim at a time, which is to say through traffic rather than through the
+    /// command that was asked to do it.
+    pub evicted: Vec<String>,
+    /// Still resident over the cap after eviction, because a pin is not an eviction candidate.
+    ///
+    /// Reported rather than resolved: `resident = true` means "never an eviction victim", and a
+    /// cap that silently overrode it would make a pin mean nothing. Both numbers being visible is
+    /// what lets an operator see that the two settings disagree.
+    pub pinned_over_cap: Vec<String>,
     /// Deferred models that the config PINS (`resident = true`). A pin is only exempt-from-eviction,
     /// not entitlement to a slot -- admission is still first-N-in-config-order -- so a pin listed
     /// after enough unpinned models never becomes resident at boot. That is a real outcome, but it
@@ -55,6 +71,21 @@ pub fn reconcile(cfg: &Config, reg: &mut Registry, loader: &dyn ModelLoader) -> 
         }
         else { rep.failed.push(m.name.clone()); }
     }
+
+    // Evict down to the cap. LRU order, and `lru_victim` already excludes pins, so this stops when
+    // only pinned models remain over the cap rather than breaking the pin contract to satisfy the
+    // number. The loop terminates because every iteration releases one resident model.
+    while reg.resident_count() > cfg.server.max_resident {
+        let Some(victim) = reg.lru_victim() else { break };
+        reg.release(&victim, &format!("evicted: over max_resident ({})", cfg.server.max_resident));
+        rep.evicted.push(victim);
+    }
+    if reg.resident_count() > cfg.server.max_resident {
+        rep.pinned_over_cap = reg.entries.iter()
+            .filter(|e| e.model.is_some() && e.cfg.resident)
+            .map(|e| e.cfg.name.clone())
+            .collect();
+    }
     rep
 }
 
@@ -79,6 +110,61 @@ mod tests {
             ..Default::default()
         }
     }
+    /// The reported bug: `npu config set max_resident 2` then `npu reload` left five models
+    /// resident and answered `deferred: 4`. The cap was an admission limit only.
+    #[test]
+    fn lowering_the_cap_evicts_down_to_it() {
+        let l = loader(&[("a", true), ("b", true), ("c", true)]);
+        let mut c = cfg(&["a", "b", "c"]);
+        let mut reg = Registry::default();
+        reconcile(&c, &mut reg, &l);
+        assert_eq!(reg.resident_count(), 3, "all three fit under the default cap");
+
+        c.server.max_resident = 1;
+        let rep = reconcile(&c, &mut reg, &l);
+        assert_eq!(reg.resident_count(), 1, "the cap is now enforced downward");
+        assert_eq!(rep.evicted.len(), 2, "and says what it dropped: {:?}", rep.evicted);
+        assert!(rep.failed.is_empty(), "eviction is not a failure: {:?}", rep.failed);
+        assert!(rep.pinned_over_cap.is_empty());
+    }
+
+    /// A pin means "never an eviction victim". A cap that overrode it would make a pin mean
+    /// nothing, so the disagreement is reported instead of resolved.
+    #[test]
+    fn a_pin_is_not_evicted_to_satisfy_the_cap() {
+        let l = loader(&[("a", true), ("b", true)]);
+        let mut c = cfg(&["a", "b"]);
+        c.models[0].resident = true;
+        c.models[1].resident = true;
+        let mut reg = Registry::default();
+        reconcile(&c, &mut reg, &l);
+        assert_eq!(reg.resident_count(), 2);
+
+        c.server.max_resident = 1;
+        let rep = reconcile(&c, &mut reg, &l);
+        assert_eq!(reg.resident_count(), 2, "both are pinned, so neither is a candidate");
+        assert!(rep.evicted.is_empty());
+        assert_eq!(rep.pinned_over_cap.len(), 2, "the operator is told the two settings disagree");
+    }
+
+    /// Unpinned first, and only as many as the cap requires -- the pin survives, the cap is met.
+    #[test]
+    fn eviction_takes_unpinned_models_and_stops_at_the_cap() {
+        let l = loader(&[("a", true), ("b", true), ("c", true)]);
+        let mut c = cfg(&["a", "b", "c"]);
+        c.models[0].resident = true;               // `a` is pinned
+        let mut reg = Registry::default();
+        reconcile(&c, &mut reg, &l);
+
+        c.server.max_resident = 2;
+        let rep = reconcile(&c, &mut reg, &l);
+        assert_eq!(reg.resident_count(), 2);
+        assert_eq!(rep.evicted.len(), 1, "exactly one over the cap: {:?}", rep.evicted);
+        assert!(!rep.evicted.contains(&"a".to_string()), "the pin is not the victim");
+        assert!(reg.get_loaded("a").is_some(), "the pin is still resident");
+        assert!(rep.pinned_over_cap.is_empty());
+    }
+
     #[test]
     fn loads_unloads_and_records_failures() {
         let l = loader(&[("a", true), ("b", false)]);

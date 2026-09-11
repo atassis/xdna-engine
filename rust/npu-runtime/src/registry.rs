@@ -68,6 +68,23 @@ pub struct ModelStatus {
     /// Seconds since this model last served a request, for resident models only. `None` when the
     /// model is not resident (nothing is holding the device on its behalf).
     pub idle_s: Option<u64>,
+    /// Requests this model has served since the process started, and the wall time it held the
+    /// device for. Cumulative, not a rate: a rate needs a window, and every consumer wants a
+    /// different one -- `npu top` divides by process uptime, a future scrape would difference two
+    /// samples. Publishing the raw counters lets both be correct from the same field.
+    ///
+    /// The device is single-tenant and the actor is single-flight, so these sum to real occupancy
+    /// rather than to something that can exceed the wall clock.
+    pub served: u64,
+    pub busy_us: u64,
+    /// True while this model is the one the device actor is currently inside a request for.
+    ///
+    /// At most one model can be busy: the actor is single-flight, which is precisely why this is
+    /// worth reporting -- it is the difference between "the engine is slow" and "something else has
+    /// the device and you are queued behind it". It is published from around the serve rather than
+    /// from the end of the actor loop, because the loop does not come back round until the request
+    /// it is serving has finished, so a status written there could never observe a busy model.
+    pub busy: bool,
     /// `resident = true` in the config: exempt from the idle sweep and never an eviction victim.
     ///
     /// Reported because a pin was otherwise invisible from outside -- `/v1/models` showed a pinned
@@ -111,6 +128,26 @@ impl Registry {
         self.entries.iter().filter(|e| e.model.is_some()).count()
     }
     pub fn status(&self) -> Vec<ModelStatus> { self.status_at(Instant::now()) }
+    /// Charge a completed request to a model: one more served, and the device time it held.
+    ///
+    /// Called by the actor after the work, not before, so an in-flight request is `busy` but not
+    /// yet counted -- a request that is still running has no duration to charge.
+    pub fn charge(&mut self, name: &str, busy_us: u64) {
+        if let Some(e) = self.entries.iter_mut().find(|e| e.cfg.name == name) {
+            e.status.served += 1;
+            e.status.busy_us += busy_us;
+        }
+    }
+
+    /// `status_at`, with `serving` (if any) marked busy. The actor is single-flight, so at most one
+    /// name is ever passed here.
+    pub fn status_serving(&self, now: Instant, serving: Option<&str>) -> Vec<ModelStatus> {
+        let mut v = self.status_at(now);
+        if let Some(name) = serving {
+            if let Some(s) = v.iter_mut().find(|s| s.name == name) { s.busy = true; }
+        }
+        v
+    }
     /// `status()` with the clock passed in, so idle reporting is testable without sleeping.
     pub fn status_at(&self, now: Instant) -> Vec<ModelStatus> {
         let live = self.resident_count();
@@ -190,6 +227,9 @@ impl Registry {
                     // is the difference between an unmeasured bound and a silent one.
                     detail: if bo == 0 { UNWEIGHED.into() } else { String::new() },
                     capability: Some(m.capabilities()), bo_bytes: bo, idle_s: Some(0),
+                    served: 0,
+                    busy_us: 0,
+                    busy: false,
                     pinned: cfg.resident,
                 };
                 self.upsert(Entry { cfg: cfg.clone(), model: Some(m), status, last_used: now,
@@ -288,7 +328,7 @@ impl Registry {
             model: None,
             status: ModelStatus {
                 name: cfg.name.clone(), state: LoadState::Unloaded, detail, capability, bo_bytes: 0,
-                idle_s: None, pinned: cfg.resident,
+                idle_s: None, served: 0, busy_us: 0, busy: false, pinned: cfg.resident,
             },
             last_used: Instant::now(),
             deferred_capacity: None,
@@ -383,6 +423,9 @@ impl Registry {
         let capability = self.known_capability(&cfg.name).or(declared);
         let status = ModelStatus {
             name: cfg.name.clone(), state, detail, capability, bo_bytes: 0, idle_s: None,
+            served: 0,
+            busy_us: 0,
+            busy: false,
             pinned: cfg.resident,
         };
         self.upsert(Entry { cfg: cfg.clone(), model: None, status, last_used: Instant::now(),
