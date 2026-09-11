@@ -165,6 +165,30 @@ class TestWireArithmetic:
                     quant.row_stride_bytes(k, g, dtype), (dtype, k, g)
 
 
+class TestPackerContract:
+    """The plan's scale_kind has to reach the packer under the name the packer uses. A wrong
+    keyword is a TypeError three frames into the build, which is the failure P001 exists for."""
+
+    def test_every_scale_kind_reaches_the_packer(self):
+        quant = pytest.importorskip("iron.operators.gemv.quant")
+        import inspect
+        import numpy as np
+        params = inspect.signature(quant.quantize_weight).parameters
+        for kind, kw in (("clip", "clip_search"), ("zero_grid", "affine_zero_on_grid"),
+                         ("free_min", "affine_zero_on_grid")):
+            assert kw in params, f"scale_kind {kind!r} has no packer argument {kw!r}"
+        W = np.random.default_rng(0).standard_normal((8, 1024), dtype=np.float32)
+        for dtype in P.SYMMETRIC + P.AFFINE:
+            if dtype not in P.packer_capability()[0]:
+                pytest.skip(f"packer on this path has no {dtype}")
+            spec = P.parse_spec(f"{dtype}/g128")
+            packed = quant.quantize_weight(
+                W, 128, dtype,
+                **({"clip_search": False} if dtype in P.SYMMETRIC
+                   else {"affine_zero_on_grid": spec.scale_kind == "zero_grid"}))
+            assert packed.nbytes == 8 * P.wire_row_units(spec, 1024)
+
+
 class TestByteModel:
     def test_bf16_reproduces_the_census(self):
         assert abs(P.token_mb(plan())["total"] - P.CENSUS_TOKEN_MB) < 0.01

@@ -143,10 +143,10 @@ def _pack(w, site):
     if not spec.quantized:
         return bf16(w).reshape(-1)
     kw = {}
-    if spec.dtype in precision.SYMMETRIC and spec.scale_kind == "clip":
-        kw["clip_search"] = True
-    elif spec.dtype in precision.AFFINE:
-        kw["zero_on_grid"] = spec.scale_kind == "zero_grid"
+    if spec.dtype in precision.SYMMETRIC:
+        kw["clip_search"] = spec.scale_kind == "clip"
+    else:
+        kw["affine_zero_on_grid"] = spec.scale_kind == "zero_grid"
     return quantize_weight(w, spec.group_size, spec.dtype, **kw)
 
 
