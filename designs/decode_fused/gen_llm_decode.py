@@ -288,13 +288,19 @@ def _quantize_cached(w, group_size, dtype, kw):
 
 DECODE_PLACER_FLAGS_DEFAULT = "--cores-per-col 1"
 
-# INSTRUMENT, not a feature. Alternates the per-head qk-norm between two IDENTICAL RMSNorm
-# instances. RMSNorm has no design_key, so two instances are two DESIGNS: the 24 consecutive runs
-# stop sharing one aiex.configure and become 24. Runs, bytes and output are unchanged, so it
-# isolates the cost of a CHEAP configure (18 KB of views) the way share_designs isolated an
-# expensive one. Predicted +644 configures/token; at the measured 61.9 us for a big configure that
-# is +39.9 ms if the cost is flat, and ~0 if it tracks the view count.
-SPLIT_QKNORM = os.environ.get("SPLIT_QKNORM", "0") == "1"
+# INSTRUMENT, not a feature. Deals the per-head qk-norm runs alternately to two IDENTICAL RMSNorm
+# instances in contiguous groups of SPLIT_QKNORM heads. RMSNorm has no design_key, so two instances
+# are two DESIGNS, and a group boundary is a design switch: the one contiguous block of
+# `n_q_heads + n_kv_heads` runs becomes ceil(N/G) blocks. Runs, bytes, designs (2 at every G>0) and
+# output are all unchanged across the sweep, so the only quantity that moves is the CONFIGURE
+# count -- which is the order-only control D009's rate needs, and the same shape that measured
+# prefill's rate: two arms, same designs and same runlist, differing only in how the identical runs
+# are ORDERED.
+#
+# G=1 is the old boolean arm (every run its own configure). G>1 gives the intermediate points a
+# fitted SLOPE needs rather than two absolutes (D031). The head index runs ACROSS the q and k
+# lists, so the block count is ceil((Hq+Hkv)/G) and does not depend on where q ends.
+SPLIT_QKNORM = int(os.environ.get("SPLIT_QKNORM", "0"))
 
 # INSTRUMENT, not a feature -- the sibling of SPLIT_QKNORM above, aimed at the other count.
 # SPLIT_QKNORM isolated a CONFIGURE by turning one design into many; this chops swiglu_mlp_dp's gh
@@ -744,7 +750,7 @@ def sequence_name(sp, NL, S, placer_flags, decode_layer_active=False, T=None, tm
             _frag += f"s{_BUILD_STATE['scale_dtype']}"
         parts.append(_frag)
     if SPLIT_QKNORM:
-        parts.append("splitqk")
+        parts.append(f"splitqk{SPLIT_QKNORM}")
     # Suffix stays ON the default here, unlike the other switches: the shipped artifact was BUILT
     # and gated under this name, and aiecc is not byte-reproducible, so a rename would mean the
     # next rebuild produces a different ELF under a name nothing was ever gated against.
@@ -2083,6 +2089,10 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         op_qk_norm_b = (RMSNorm(size=hd, num_aie_columns=1, num_channels=1, tile_size=hd,
                                 weighted=True, epsilon=sp.eps, context=ctx)
                         if (sp.qk_norm and SPLIT_QKNORM) else op_qk_norm)
+        # Which of the two instances head `i` (q heads 0..Hq-1, then k heads Hq..Hq+Hkv-1) runs on.
+        # Off, both names are one object and every head returns it, so there is one block.
+        def _qkn(i, _a=op_qk_norm, _b=op_qk_norm_b, _g=SPLIT_QKNORM):
+            return _a if (not _g or (i // _g) % 2 == 0) else _b
         # QKV projection: one GEMV over the concatenated weight, or the three separate ones. op_kv
         # is built in both arms because share_designs pairs Wk with Wv only in the unfused one.
         #
@@ -2269,7 +2279,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                 v_norm=sp.v_norm, **_quant_kw("qkv", force_header_first=True))
         g = SimpleNamespace(
             hd=hd, hkv=hkv, qd=qd, kvd=kvd, gqa=gqa, kv_slot=slot, o_chunks=o_chunks,
-            op_qk_norm=op_qk_norm, op_qk_norm_b=op_qk_norm_b, op_qkv=op_qkv, op_q=op_q,
+            op_qk_norm=op_qk_norm, op_qk_norm_b=op_qk_norm_b, qkn=_qkn, op_qkv=op_qkv, op_q=op_q,
             op_kv=op_kv, op_o=op_o, op_rope_qk=op_rope_qk, op_qkv_dp=op_qkv_dp,
             op_rope_q=op_rope_q, op_rope_k=op_rope_k, op_sck=op_sck, op_scv=op_scv,
             op_rep_k=op_rep_k, op_rep_v=op_rep_v, op_scores=op_scores, op_trv=op_trv,
@@ -2972,10 +2982,8 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                 if sp.qk_norm and g.op_qkv_dp is None:
                     hq = [f"{qhb}[{qho + h*g.hd*2}:{qho + (h+1)*g.hd*2}]" for h in range(Hq)]
                     hk = [f"{khb}[{kho + h*g.hd*2}:{kho + (h+1)*g.hd*2}]" for h in range(g.hkv)]
-                    qk = [*[((g.op_qk_norm if h % 2 == 0 else g.op_qk_norm_b),
-                             hq[h], p + "n_qn", hq[h]) for h in range(Hq)],
-                          *[((g.op_qk_norm if h % 2 == 0 else g.op_qk_norm_b),
-                             hk[h], p + "n_kn", hk[h]) for h in range(g.hkv)]]
+                    qk = [*[(g.qkn(h), hq[h], p + "n_qn", hq[h]) for h in range(Hq)],
+                          *[(g.qkn(Hq + h), hk[h], p + "n_kn", hk[h]) for h in range(g.hkv)]]
                 if g.op_qkv_dp is None:
                     proj = ([(g.op_qkv, p + "Wqkv", p + "hn", p + "qkv")] if FUSE_QKV_GEMV else
                             [(g.op_q, p + "Wq", p + "hn", ref_q),

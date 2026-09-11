@@ -41,6 +41,7 @@ import newstack_compat  # noqa: F401,E402
 import gen_llm_decode as G  # noqa: E402
 from gen_llm_decode import (build_graph, load_weight_buffer,  # noqa: E402
                             report_artifact_freshness)
+from llm_decode_spec import SPECS  # noqa: E402
 from bench_llm_decode import rope_row  # noqa: E402
 from iron.common.kv_layout import KVLayout  # noqa: E402
 
@@ -118,6 +119,28 @@ def count_sync_points(src):
     return n
 
 
+def require_headroom(fused, spec, n_loaded, floor_gb=3.0):
+    """Refuse to make one more arm resident when the box cannot hold it.
+
+    Arms are held resident SIMULTANEOUSLY -- that is what makes the round-robin immune to drift --
+    so N arms cost N arenas, and at Gemma-4 an arena is 3.35 GB even at 6 of 48 layers because the
+    bf16 lm-head is 1.88 GB of it. MEASURED 2026-09-11: four arms took the OOM killer at the third
+    load, which costs the device lock, the session and every other job on a 30 GB box. Reading
+    MemAvailable (not MemFree -- reclaimable page cache counts) against the arena the graph itself
+    declares turns that into a refusal naming both numbers.
+    """
+    need = sum(fused.buffer_sizes)
+    avail = next(int(l.split()[1]) * 1024 for l in open("/proc/meminfo")
+                 if l.startswith("MemAvailable:"))
+    if need > avail - floor_gb * 2**30:
+        raise SystemExit(
+            f"[layer-arms] arm {spec} needs {need/2**30:.2f} GB of arena and MemAvailable is "
+            f"{avail/2**30:.2f} GB, under a {floor_gb:.1f} GB floor with {n_loaded} arm(s) already "
+            f"resident. Run fewer arms per session -- keep the same anchor arm in each so the "
+            f"sessions are still comparable -- or drop --layers.")
+    return need
+
+
 def median_spread(xs):
     xs = sorted(xs)
     med = statistics.median(xs)
@@ -155,25 +178,42 @@ def main():
                          "measure the layer body's marginal weight-byte rate; 's<K>' = "
                          "SPLIT_GH_DRAIN, which chops the MLP's gh drain group into K groups and "
                          "moves ONLY the sync-point count, +(K-1) per layer, at constant bytes, "
-                         "tasks, configures and designs.")
+                         "tasks, configures and designs; 'g<G>' = SPLIT_QKNORM, which deals the "
+                         "qk-norm runs to two IDENTICAL RMSNorm designs in contiguous groups of G "
+                         "heads and so moves ONLY the configure count -- the order-only control "
+                         "D009's rate needs, at constant runs, bytes, designs and output.")
     ap.add_argument("--max-seq", type=int, default=512)
     ap.add_argument("--pos", type=int, required=True)
     ap.add_argument("--reps", type=int, default=25)
     ap.add_argument("--warmup", type=int, default=5)
     ap.add_argument("--out-json", default=None)
+    ap.add_argument("--build-only", action="store_true",
+                    help="build every arm and print its census, then stop before the device is "
+                         "opened. Fills the shared build cache and answers the device-FREE half "
+                         "of an arm sweep -- whether the control variables moved the way the arm "
+                         "was designed to move them -- which is worth knowing before the lock is "
+                         "taken.")
     a = ap.parse_args()
 
     report_artifact_freshness(a.weights)
     if a.pos + 1 > a.max_seq:
         raise SystemExit(f"--pos {a.pos} needs sm_mask={a.pos+1} <= max_seq {a.max_seq}")
 
-    embed = np.load(os.path.join(a.weights, "model.embed_tokens.weight.npy")).astype(np.float32)
     TOK = 100
+    # One ROW, memory-mapped, under the SPEC's own weight prefix. The eager `.astype(np.float32)`
+    # this replaces materialised the whole table -- 4.03 GB at Gemma-4's 262144 x 3840 -- to read a
+    # single row, on a box whose arms are already 5 GB each; and the bare `model.` prefix it
+    # assumed is qwen3's, so every prefixed spec (Gemma-4 is `model.language_model.`) died here on
+    # a missing file. gen_llm_decode.py builds this name from `sp.weight_prefix`.
+    embed = np.asarray(np.load(os.path.join(
+        a.weights, f"{SPECS[a.spec].weight_prefix}embed_tokens.weight.npy"),
+        mmap_mode="r")[TOK], dtype=np.float32)
 
     arms = []
     census = {}
     for spec in a.arms:
-        m = re.fullmatch(r"(\d+)(f?)(?:c(\d+))?(?:q(\w+?))?(?:d(\d+))?(?:s(\d+))?", spec)
+        m = re.fullmatch(r"(\d+)(f?)(?:c(\d+))?(?:q(\w+?))?(?:d(\d+))?(?:s(\d+))?(?:g(\d+))?",
+                         spec)
         if not m:
             raise SystemExit(f"bad arm spec {spec!r}")
         L = int(m.group(1))
@@ -182,6 +222,7 @@ def main():
         qdt = m.group(4) or "bf16"
         wdepth = int(m.group(5)) if m.group(5) else 2
         sgh = int(m.group(6)) if m.group(6) else 1
+        sqk = int(m.group(7)) if m.group(7) else 0
         # These are captured at gen_llm_decode IMPORT time, so flipping os.environ here would be
         # silently ignored -- set the module globals the generator actually reads.
         G.FUSE_MLP_O = fmo
@@ -189,15 +230,21 @@ def main():
         G.QUANT_MLP_DTYPE = qdt
         G.WEIGHT_DEPTH = wdepth
         G.SPLIT_GH_DRAIN = sgh
+        G.SPLIT_QKNORM = sqk
         t0 = time.perf_counter()
         sp, fused, weights, md = build_graph(a.spec, a.weights, L, a.max_seq)
         # A fit's CONTROL variables need the same evidence as its result: print every quantity
         # that differs between arms BEFORE fitting, not just the one being varied.
         census[spec] = census_from_mlir(fused, md, sgh=sgh)
         census[spec].update(fuse_mlp_o=fmo, mlp_dp_cols=cols, quant_mlp=qdt,
-                            weight_depth=wdepth, split_gh=sgh)
+                            weight_depth=wdepth, split_gh=sgh, split_qknorm=sqk)
         print(f"[layer-arms] built {spec} in {time.perf_counter()-t0:.1f}s  census={census[spec]}",
               flush=True)
+        if a.build_only:
+            del weights
+            continue
+        need = require_headroom(fused, spec, len(arms))
+        print(f"[layer-arms] {spec}: arena {need/2**30:.2f} GB", flush=True)
         c = fused.get_callable()
         params = c.params
         if params is None:
@@ -210,6 +257,7 @@ def main():
         del weights
         scale = np.sqrt(sp.d_model) if sp.embed_scale == "sqrt_d_model" else 1.0
         arms.append(dict(spec=spec, L=L, fmo=fmo, cols=cols, qdt=qdt, wdepth=wdepth, sgh=sgh,
+                         sqk=sqk,
                          sp=sp, c=c,
                          params=params,
                          # The runtime attention window, when the arm built one. An arm whose core
@@ -227,13 +275,26 @@ def main():
                          kv_layout=KVLayout(Hkv=sp.n_kv_heads, S=md["S"], HD=sp.head_dim, T=md["T"]),
                          xin=c.get_buffer("x"), rope_buf=c.get_buffer("rope_global"),
                          scale=scale))
+    if a.build_only:
+        print(f"\n{'arm':>10} {'L':>4} {'cfg':>6} {'runs':>6} {'designs':>8} {'MB':>10}")
+        for spec in a.arms:
+            c_ = census[spec]
+            print(f"{spec:>10} {c_.get('NL'):4} {c_.get('configures', 0):6} "
+                  f"{c_.get('runs', 0):6} {c_.get('designs', 0):8} "
+                  f"{c_.get('mb', float('nan')):10.2f}")
+        if a.out_json:
+            json.dump({"spec": a.spec, "max_seq": a.max_seq, "census": census},
+                      open(a.out_json, "w"), indent=2)
+            print(f"\n[layer-arms] wrote {a.out_json}")
+        return
+
     print(f"[layer-arms] {len(arms)} arms resident, dispatching at pos={a.pos}", flush=True)
 
     max_seq = a.max_seq
 
     def one(arm):
         with arm["xin"].overwrite() as _buf:
-            _buf[:] = np.asarray(embed[TOK] * arm["scale"], BF16).reshape(-1)
+            _buf[:] = np.asarray(embed * arm["scale"], BF16).reshape(-1)
         with arm["rope_buf"].overwrite() as _buf:
             _buf[:] = rope_row(a.pos, arm["sp"].head_dim, arm["sp"].rope_theta_global).reshape(-1)
         arm["params"].write("kv_off", int(arm["kv_layout"].kv_off(a.pos)))
@@ -256,18 +317,18 @@ def main():
         for arm in arms:
             samples[arm["spec"]].append(one(arm))
 
-    print(f"\n{'arm':>8} {'L':>4} {'cfg':>5} {'MB':>9} {'n':>4} {'median_ms':>10} "
+    print(f"\n{'arm':>10} {'L':>4} {'cfg':>5} {'MB':>9} {'n':>4} {'median_ms':>10} "
           f"{'spread_%':>9} {'min_ms':>9} {'max_ms':>9}")
     report = {}
-    for arm in sorted(arms, key=lambda x: (x["qdt"], x["cols"], x["fmo"], x["L"])):
+    for arm in sorted(arms, key=lambda x: (x["qdt"], x["cols"], x["fmo"], x["L"], x["sqk"])):
         sp_ = arm["spec"]
         xs = [t * 1e3 for t in samples[sp_]]
         med, spread = median_spread(xs)
         report[sp_] = {"reps": xs, "median_ms": med, "spread_pct": spread, "L": arm["L"],
                        "fuse_mlp_o": arm["fmo"], "cols": arm["cols"], "qdt": arm["qdt"],
-                       "wdepth": arm["wdepth"], "sgh": arm["sgh"],
+                       "wdepth": arm["wdepth"], "sgh": arm["sgh"], "sqk": arm["sqk"],
                        "mb": census[sp_].get("mb"), "min_ms": min(xs), "census": census[sp_]}
-        print(f"{sp_:>8} {arm['L']:4} {census[sp_].get('configures', 0):5} "
+        print(f"{sp_:>10} {arm['L']:4} {census[sp_].get('configures', 0):5} "
               f"{census[sp_].get('mb', float('nan')):9.2f} {len(xs):4} "
               f"{med:10.3f} {spread:9.2f} {min(xs):9.3f} {max(xs):9.3f}")
 
@@ -275,17 +336,20 @@ def main():
     # variance (four-configures-a-layer-came-off-without-a-new-kernel: one cell read 110.261 ms at
     # sd 0.147), so a spread filter cannot catch it -- agreement between the two fits is the check.
     keys = sorted({(report[s_]["fuse_mlp_o"], report[s_]["cols"], report[s_]["qdt"],
-                    report[s_]["wdepth"], report[s_]["sgh"]) for s_ in report})
+                    report[s_]["wdepth"], report[s_]["sgh"], report[s_]["sqk"])
+                   for s_ in report})
     for key in keys:
         group = sorted((s_ for s_ in report
                         if (report[s_]["fuse_mlp_o"], report[s_]["cols"], report[s_]["qdt"],
-                            report[s_]["wdepth"], report[s_]["sgh"]) == key),
+                            report[s_]["wdepth"], report[s_]["sgh"],
+                            report[s_]["sqk"]) == key),
                        key=lambda s_: report[s_]["L"])
         if len(group) < 2:
             continue
-        fmo, cols, qdt, wdepth, sgh_ = key
+        fmo, cols, qdt, wdepth, sgh_, sqk_ = key
         tag = (f"FUSE_MLP_O={int(fmo)} ({6-int(fmo)} runs/layer), MLP_DP_COLS={cols}, "
-               f"QUANT_MLP={qdt}, WEIGHT_DEPTH={wdepth}, SPLIT_GH_DRAIN={sgh_}")
+               f"QUANT_MLP={qdt}, WEIGHT_DEPTH={wdepth}, SPLIT_GH_DRAIN={sgh_}, "
+               f"SPLIT_QKNORM={sqk_}")
         for label, key in (("median", "median_ms"), ("min", "min_ms")):
             pairs = [(report[s_]["L"], report[s_][key]) for s_ in group]
             alpha, beta, resid = fit_affine(pairs)
@@ -297,6 +361,23 @@ def main():
             for (L, t), r in zip(pairs, resid):
                 print(f"   L={L:3}  {t:9.3f}   residual {r:+7.3f}")
             print(f"   extrapolated to L=28: {alpha*28 + beta:.3f} ms")
+
+    # The configure fit, for arms that hold depth fixed and vary only the configure count. The
+    # depth fit above charges configures to `beta` and cannot see them; this is the axis D009's
+    # rate lives on, and it is fitted rather than differenced so one arm cannot carry the answer.
+    for L_ in sorted({report[s_]["L"] for s_ in report}):
+        grp = [s_ for s_ in report if report[s_]["L"] == L_
+               and report[s_]["census"].get("configures")]
+        cfgs = {report[s_]["census"]["configures"] for s_ in grp}
+        if len(grp) < 2 or len(cfgs) < 2:
+            continue
+        for label, key in (("median", "median_ms"), ("min", "min_ms")):
+            pairs = sorted((report[s_]["census"]["configures"], report[s_][key]) for s_ in grp)
+            rate, base, resid = fit_affine(pairs)
+            print(f"\nL={L_} configure fit on {label}s:  t = {rate*1e3:.2f} us/configure * cfg "
+                  f"+ {base:.3f} ms")
+            for (c_, t_), r_ in zip(pairs, resid):
+                print(f"   cfg={c_:5}  {t_:9.3f}   residual {r_:+7.3f}")
 
     if a.out_json:
         json.dump({"spec": a.spec, "pos": a.pos, "max_seq": a.max_seq, "arms": report},
