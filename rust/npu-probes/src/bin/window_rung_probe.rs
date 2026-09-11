@@ -11,7 +11,8 @@
 //! would look. So this asserts the selected kernel NAME differs side to side at the crossing
 //! before it compares any token.
 //!
-//! NPU is single-tenant -- stop `npu serve` and serialise (journal/scripts/npu_lock.sh).
+//! NPU is single-tenant: stop `npu serve` and serialise against any other device user before
+//! running, or the timing below measures contention rather than the arms.
 //!
 //! Usage: window_rung_probe <rung_decode_dir> <control_decode_dir> [--prime N] [--gen N]
 
@@ -119,7 +120,7 @@ fn main() {
     }
     let vocab = 151936u32;
 
-    let dev = Rc::new(Device::open(0).expect("open NPU (single-tenant -- use npu_lock.sh)"));
+    let dev = Rc::new(Device::open(0).expect("open NPU (single-tenant -- serialise against other device users)"));
     let mut rung = NpuDecodeStep::new(&dev, Path::new(&rung_dir)).expect("load rung artifact");
     println!("rung buckets:    {:?}", rung.bucket_kernels());
     let mut ctl = NpuDecodeStep::new(&dev, Path::new(&ctl_dir)).expect("load control artifact");
