@@ -135,14 +135,18 @@ def main():
     c.scratch_buffer.to("npu")
     print(f"[ppl] {len(weights)} weight buffers loaded, scratch flushed")
 
-    embed = np.load(os.path.join(a.weights, "model.embed_tokens.weight.npy")).astype(np.float32)
+    # mmap, not np.load -- Gemma-4-12B's embed table is 4 GB at f32, and a plain np.load()
+    # followed by .astype(f32) reads the whole thing AND copies it (up to 8 GB transient) for a
+    # loop that only ever touches one row per token.
+    embed = np.load(os.path.join(a.weights, "model.embed_tokens.weight.npy"), mmap_mode="r")
     scale = np.sqrt(D) if sp.embed_scale == "sqrt_d_model" else 1.0
     xin, rope_buf, out = c.get_buffer("x"), c.get_buffer("rope_global"), c.get_buffer("logits")
 
     nll, t0, top1_hits = [], time.perf_counter(), 0
     for pos in range(n):
         with xin.overwrite() as _buf:
-            _buf[:] = np.asarray(embed[ids[pos]] * scale, BF16).reshape(-1)
+            row = np.asarray(embed[ids[pos]], dtype=np.float32) * scale
+            _buf[:] = np.asarray(row, BF16).reshape(-1)
         with rope_buf.overwrite() as _buf:
             _buf[:] = rope_row(pos, HD, sp.rope_theta_global).reshape(-1)
         params.write("kv_off", int(kv_layout.kv_off(pos)))
