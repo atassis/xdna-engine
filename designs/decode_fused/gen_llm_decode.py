@@ -858,29 +858,12 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
     # at K=32768 it is 131072 B against a 64 KB L1 and the build dies on a dead operator. Measured
     # 2026-09-11 -- that is exactly what blocked the first 32k decode build, AFTER split-K had
     # already placed attn_block_dp at the same window.
-    decode_layer_why = ("FUSE_DECODE_LAYER=0" if not FUSE_DECODE_LAYER else
-                        qkv_dp_why if qkv_dp_why else
-                        mlp_dp_why if mlp_dp_why else
-                        "needs FUSE_MLP_O=1 (Wo's padding is wired through that flag via "
-                        "op_mlp_dp._wo_rows_padded, and decode_layer_dp always fuses Wo)"
-                        if not FUSE_MLP_O else
-                        f"needs Hkv ({Hkv}) == COLS ({COLS})" if Hkv != COLS else
-                        "needs SCALE_IN_QNORM=1 (attn_block_dp has no separate scale stage)"
-                        if not (SCALE_IN_QNORM and sp.qk_norm) else
-                        "needs GQA_GROUPED_K=1 and TMV_CTX=1 (attn_block_dp computes exactly "
-                        "that variant internally)" if not (GROUPED_K and TMV_CTX) else
-                        "needs QUANT_MLP_DTYPE=bf16 and QUANT_ATTN_DTYPE=bf16 (plain-bf16 kernel "
-                        "archive, no quantized-weight variant)"
-                        if QUANT_MLP_DTYPE != "bf16" or QUANT_ATTN_DTYPE != "bf16" else None)
-    fuse_o = FUSE_MLP_O and mlp_dp_why is None
-    for arm, why in (("qkv_head_dp", qkv_dp_why), ("swiglu_mlp_dp", mlp_dp_why)):
-        print(f"[gen] fused arm {arm}: {'OFF -- ' + why if why else 'on'}")
-    # WHICH ARM CARRIES THE LAYER, decided before anything is constructed: the precision check
-    # below is conditional on it, and every clause here is a spec/flag question that needs no
-    # operator. Eligibility is the union of qkv_dp_why/mlp_dp_why (the spec-shape rules
-    # attn_block_dp and swiglu_mlp_dp already check) plus what is true only of the MERGED device:
-    # attn_block_dp's own Hkv==COLS rule, and no sandwich norms (the op has no post-attn/post-ffn
-    # norm slot).
+    #
+    # WHICH ARM CARRIES THE LAYER: the precision check below is conditional on it, and every
+    # clause here is a spec/flag question that needs no operator. Eligibility is the union of
+    # qkv_dp_why/mlp_dp_why (the spec-shape rules attn_block_dp and swiglu_mlp_dp already check)
+    # plus what is true only of the MERGED device: attn_block_dp's own Hkv==COLS rule, and no
+    # sandwich norms (the op has no post-attn/post-ffn norm slot).
     decode_layer_why = ("FUSE_DECODE_LAYER=0" if not FUSE_DECODE_LAYER else
                         qkv_dp_why if qkv_dp_why else
                         mlp_dp_why if mlp_dp_why else
@@ -897,6 +880,9 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                         # a REFUSAL (P003), not a reason to quietly drop to the unfused arm --
                         # which is what silently unfusing a whole decoder layer used to be.
                         None)
+    fuse_o = FUSE_MLP_O and mlp_dp_why is None
+    for arm, why in (("qkv_head_dp", qkv_dp_why), ("swiglu_mlp_dp", mlp_dp_why)):
+        print(f"[gen] fused arm {arm}: {'OFF -- ' + why if why else 'on'}")
 
     # THE PRECISION PLAN IS CHECKED HERE, not at the top of the file: which combinations are
     # buildable depends on the fused arms decided just above (which weights share an ObjectFifo,

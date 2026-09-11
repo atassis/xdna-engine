@@ -10,26 +10,37 @@
 # the deltas trustworthy is INSIDE the harness (all arms resident, round-robin per rep); the
 # repeated sessions here are the coarser replication on top.
 #
-# NON-DESTRUCTIVE: npu_lock.sh `queue` waits its turn and defers with exit 75 if production holds
-# the device. It never stops npu-serve.
+# Device guard: see the NPU_LOCK block below. An exit of 75 from the lock is read as
+# "device busy, defer" rather than as a failure.
 #
 # Pre-warm the per-arm build caches first or the first session compiles 28 layers per arm while
 # holding the lock:  bash scripts/run_precision_ab.sh --warm
 set -u
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WS="$(cd "$REPO/.." && pwd)"
-# Device serialisation helper. The NPU is single-tenant, so arms must not overlap. Point
-# NPU_LOCK at a serialiser exposing `<lock> queue -- <cmd...>`; it lives outside this repo,
-# so it is named by env rather than by path. Unset is a hard error, not a silent unlocked
-# run: two arms sharing the device produce plausible, wrong timings rather than a failure.
+# Device serialisation. The NPU is single-tenant, so arms must not overlap. Point NPU_LOCK at a
+# serialiser exposing `<lock> queue -- <cmd...>`; it lives outside this repo, so it is named by
+# env rather than by path. Unset is a hard error and not a silent unlocked run -- two arms
+# sharing the device produce plausible, wrong timings rather than a failure.
+#
+# PRECISION_AB_UNLOCKED=1 opts out, and only for a box where nothing else can take the device.
+# It asserts the device is free first, which is strictly weaker: `fuser` proves the device is
+# free NOW, and only a lock says anything about the next sixty seconds -- the argument
+# scripts/_npu_services.sh makes in its own header.
 LOCK="${NPU_LOCK:-}"
-if [ -z "$LOCK" ] || [ ! -x "$LOCK" ]; then
-  echo "run_precision_ab.sh: set NPU_LOCK to an executable device serialiser" >&2
-  echo "  (it must accept: \$NPU_LOCK queue -- <command...>)" >&2
+if [ -n "$LOCK" ]; then
+  [ -x "$LOCK" ] || { echo "run_precision_ab.sh: NPU_LOCK=$LOCK is not executable" >&2; exit 2; }
+elif [ "${PRECISION_AB_UNLOCKED:-0}" = 1 ]; then
+  . "$REPO/scripts/_npu_services.sh"
+  npu_svc_require_device_free || { echo "device is held"; exit 75; }
+else
+  echo "run_precision_ab.sh: set NPU_LOCK to a device serialiser accepting" >&2
+  echo "  \$NPU_LOCK queue -- <command...>" >&2
+  echo "  or PRECISION_AB_UNLOCKED=1 if nothing else can take this device" >&2
   exit 2
 fi
 OUT="${PRECISION_AB_OUT:-/mnt/data/xdna/scratch/precision/ab}"
-ARMS=(bf16 '{"head":"int8a/g128"}' mlp-int8 mlp-head-int8)
+ARMS=(bf16 mlp-int4-sym mlp-int8-sym mlp-int8)
 WARM_ONLY=0
 [ "${1:-}" = "--warm" ] && { WARM_ONLY=1; shift; }
 SESSIONS="${1:-3}"
@@ -79,7 +90,7 @@ for s in $(seq 1 "$SESSIONS"); do
   echo "############ session $s  $(date +%H:%M:%S)"
   # Run FROM the warm dir: the harness writes IRON's build/ intermediates under its cwd, and
   # this is where --warm left them.
-  ( cd "$WORK" && "$LOCK" queue -- "$VENV_IRON/bin/python" \
+  ( cd "$WORK" && ${LOCK:+"$LOCK" queue --} "$VENV_IRON/bin/python" \
       "$REPO/designs/decode_fused/bench_precision_arms.py" \
       --spec qwen3-0.6b --weights "$REPO/artifacts/qwen3-0.6b/weights" \
       --layers 28 --max-seq 4096 --pos "$POS" --reps 30 --warmup 5 \
