@@ -158,15 +158,23 @@ def bf16(a):
     return np.asarray(a).astype(BF16)
 
 
-def rope_table(base, rows, head_dim, theta):
+def rope_table(base, rows, head_dim, theta, partial=None):
     """[rows, head_dim] bf16 angle table for absolute positions base..base+rows-1.
 
     Same derivation and the same INTERLEAVED [cos, sin, cos, sin, ...] packing as
     verify_llm_decode.rope_row, one row per position instead of one row per dispatch. NOT the
     half-split [cos..., sin...] packing mlir-air's examples use.
+
+    `partial` is `LlmSpec.rope_partial_rotary` for rope_type "proportional": zero the inverse
+    frequency past `int(partial * head_dim // 2)` pairs, keeping the full head_dim width -- a zero
+    frequency is the identity rotation. The exponent's denominator stays head_dim regardless (that
+    is what makes it "proportional"). Same rule as verify_llm_decode.rope_row and
+    rust/npu-engine/src/llm/npu_decode.rs::rope_row, batched over rows instead of one position.
     """
     half = head_dim // 2
     inv = 1.0 / (theta ** (np.arange(0, head_dim, 2, dtype=np.float64)[:half] / head_dim))
+    if partial is not None:
+        inv[int(partial * head_dim // 2):] = 0.0
     ang = np.arange(base, base + rows, dtype=np.float64)[:, None] * inv[None, :]
     t = np.empty((rows, head_dim), np.float32)
     t[:, 0::2] = np.cos(ang)
@@ -287,12 +295,10 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
     # Op-types this graph does not carry. Named here rather than left to produce a plausible
     # wrong answer: the golden below has no sandwich norms either, so the two would AGREE and the
     # gate would pass on a model this graph cannot run.
-    if sp.sandwich_norms:
-        raise ValueError(f"{sp.name}: sandwich norms (attn/FFN output normalised before the "
-                         f"residual add) are not in this graph's vocabulary")
-    if sp.rope_theta_local is not None:
-        raise ValueError(f"{sp.name}: dual-theta RoPE needs a second angle table; this graph "
-                         f"declares one `rope` input")
+    if not sp.geometry_is_uniform():
+        raise ValueError(f"{sp.name}: two attention geometries (global_head_dim/global_n_kv_heads) "
+                         f"not in this graph's vocabulary -- every GEMM/RMSNorm/RoPE/Softmax below "
+                         f"is built once, sized off the spec's single head_dim/n_kv_heads")
     if not sp.qk_norm:
         # Not a missing brick so much as a missing multiply: `attn_scale` rides on the shared
         # q-norm gain (decode's SCALE_IN_QNORM), so a spec without a q-norm has nowhere to put it
@@ -600,6 +606,15 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
                     f"{b}[{(D + HD) * 2}:{(D + 2 * HD) * 2}]")
         return (p + "n_in", p + "n_qn", p + "n_kn")
 
+    # Dual-theta RoPE: a spec with a local/global theta split declares TWO host-written angle
+    # tables instead of one, and each layer's q/k RoPE reads whichever is_global() says -- global
+    # and sliding layers rotate the same head_dim by different theta values (and, on Gemma-4,
+    # `rope_global` alone is also partial-rotary; see main()'s table construction).
+    dual_rope = sp.rope_theta_local is not None
+
+    def ang_buf(l):
+        return ("rope_global" if sp.is_global(l) else "rope_local") if dual_rope else "rope"
+
     rl, cache_names = [], []
     for l in range(NL):
         p = f"L{l}_"
@@ -622,8 +637,8 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
                    if merge_qknorm else [(op_qn, "q", w_nqn, "q")])
         rl += qn_runs + [
             (op_kn, "k", w_nkn, "k"),
-            (op_rq, "q", "rope", "q"),
-            (op_rk, "k", "rope", "k"),
+            (op_rq, "q", ang_buf(l), "q"),
+            (op_rk, "k", ang_buf(l), "k"),
             # K after qk-norm AND after RoPE; V raw, projection only. Different points in the
             # pipeline, and the M=1 path a decode step resumes from depends on both.
             (op_kvapp, "k", p + "kc"),
@@ -669,12 +684,14 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
                        kv_slab(p + "vc", h // grp), cx_out))
         rl += ([] if seam else [(op_h2t, "cx", "cxt")]) + [
             (op_o, "cxt", wo, "a"),
+        ] + ([(op_norm, "a", p + "n_pa", "a")] if sp.sandwich_norms else []) + [
             (op_add, src, "a", "xs"),
             (op_norm, "xs", p + "n_pf", "hf"),
         ] + ([(op_gate, "hf", p + "Wg", "gs"), (op_gu, "hf", p + "Wu", "u")] if fuse_silu else
              [(op_gu, "hf", p + "Wg", "g"), (op_gu, "hf", p + "Wu", "u"), (op_act, "g", "gs")]) + [
             (op_mul, "gs", "u", "gh"),
             (op_down, "gh", p + "Wd", "d"),
+        ] + ([(op_norm, "d", p + "n_pff", "d")] if sp.sandwich_norms else []) + [
             (op_add, "xs", "d", dst),
         ]
         cache_names += [p + "kc", p + "vc"]
@@ -682,7 +699,8 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
     # `sm_widths` goes LAST so x and rope keep the input-arena offsets the non-causal arm gives
     # them: add_buffers walks input_args in order, and the host's x/rope writes are the same in
     # both arms.
-    inputs = ["x", "rope"] + ([SM_WIDTHS] if causal == "rows" else [])
+    inputs = ["x"] + (["rope_local", "rope_global"] if dual_rope else ["rope"]) + \
+        ([SM_WIDTHS] if causal == "rows" else [])
 
     # Every buffer this graph READS and never writes has to come from somewhere -- a host input, or
     # the decode arena. One that comes from neither is a prefill-local scratch buffer nothing fills:
@@ -1020,15 +1038,33 @@ def main():
         return
     D, FF, HD = sp.d_model, sp.ffn, sp.head_dim
     Hq, Hkv, QD = sp.n_q_heads, sp.n_kv_heads, sp.q_dim
+    dual_rope = sp.rope_theta_local is not None
+
+    # prefill_ref.layer_stack is a plain pre-norm, single-theta, uniform-geometry golden -- it has
+    # no sandwich-norm, dual-theta, v-norm or layer-scalar arm. Building one of those specs with a
+    # golden would silently compare the device against a dataflow it does not run.
+    golden_gaps = [n for n, on in (("sandwich_norms", sp.sandwich_norms), ("dual-theta RoPE",
+                   dual_rope), ("v_norm", sp.v_norm), ("layer_scalar", sp.layer_scalar)) if on]
+    if golden_gaps and not a.no_golden:
+        raise SystemExit(f"ERROR: {sp.name} sets {golden_gaps}, which prefill_ref.layer_stack "
+                         f"does not model yet -- pass --no-golden (the device graph itself has no "
+                         f"such restriction)")
 
     rng = np.random.default_rng(11)
     X = bf16(rng.standard_normal((M, D)).astype(np.float32) * 0.02)
-    table = rope_table(a.base, M, HD, sp.rope_theta_global)
+    # `table` doubles as the single-theta case's whole input and dual-theta's GLOBAL half -- Gemma-4
+    # rotates only 0.25 of the global layers' frequency pairs (rope_type "proportional").
+    table = rope_table(a.base, M, HD, sp.rope_theta_global, partial=sp.rope_partial_rotary)
 
     os.makedirs(os.path.join(a.out, "buffers"), exist_ok=True)
     bdir = os.path.join(a.out, "buffers")
     open(os.path.join(bdir, "x.bin"), "wb").write(X.tobytes())
-    open(os.path.join(bdir, "rope.bin"), "wb").write(table.tobytes())
+    if dual_rope:
+        open(os.path.join(bdir, "rope_local.bin"), "wb").write(
+            rope_table(a.base, M, HD, sp.rope_theta_local).tobytes())
+        open(os.path.join(bdir, "rope_global.bin"), "wb").write(table.tobytes())
+    else:
+        open(os.path.join(bdir, "rope.bin"), "wb").write(table.tobytes())
     if dims["sm_widths"]:
         widths = causal_widths(a.base, M, S, Hq)
         want = fused.get_layout_for_buffer(SM_WIDTHS)[2]
@@ -1147,9 +1183,13 @@ def main():
             "batch": M,
             "x": f"[{M}, {D}] bf16 token-major embeddings for this chunk "
                  f"(embed_scale={sp.embed_scale})",
-            "rope": f"[{M}, {HD}] bf16, one row per absolute position base..base+{M}-1, "
-                    f"INTERLEAVED [cos, sin, cos, sin, ...], theta="
-                    f"{sp.rope_theta_global}",
+            **({"rope_local": f"[{M}, {HD}] bf16, one row per absolute position base..base+{M}-1, "
+                              f"INTERLEAVED [cos, sin, cos, sin, ...], theta={sp.rope_theta_local}",
+                "rope_global": f"[{M}, {HD}] bf16, same layout, theta={sp.rope_theta_global}"
+                              f"{f', partial={sp.rope_partial_rotary}' if sp.rope_partial_rotary else ''}"}
+              if dual_rope else
+              {"rope": f"[{M}, {HD}] bf16, one row per absolute position base..base+{M}-1, "
+                       f"INTERLEAVED [cos, sin, cos, sin, ...], theta={sp.rope_theta_global}"}),
             "kv_off": "base * head_dim, element units, addr kind, written raw",
             SM_WIDTHS: (f"[{dims['sm_rows']}] int32 = q_heads({Hq}) * M({M}), row r = h*M + i "
                         f"holding clamp(base + i + 1, 1, {S}); a plain input-arena write, not a "
