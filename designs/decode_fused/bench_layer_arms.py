@@ -119,6 +119,13 @@ def count_sync_points(src):
     return n
 
 
+def precision_plan_for(text):
+    """A per-arm precision plan, from a preset name or a plan spec."""
+    import precision as P
+    raw = P.PRESETS[text][0] if text in P.PRESETS else None
+    return P.parse_plan(json.dumps(raw)) if raw is not None else P.parse_plan(text)
+
+
 def rope_bufs(callable_, sp, md):
     """Every declared RoPE angle table, each with the theta its own layers use.
 
@@ -191,7 +198,8 @@ def main():
                          "op_o into the MLP design, 5 runs/layer instead of 6, bytes ~unchanged); "
                          "'cN' = MLP_DP_COLS=N; 'q<dtype>' = QUANT_MLP_DTYPE (Wg/Wu/Wd), which "
                          "moves per-layer WEIGHT bytes at constant configures -- the only way to "
-                         "measure the layer body's marginal weight-byte rate; 's<K>' = "
+                         "measure the layer body's marginal weight-byte rate -- given as a "
+                         "precision-plan spec or preset, e.g. q'int8/g64' or qbf16; 's<K>' = "
                          "SPLIT_GH_DRAIN, which chops the MLP's gh drain group into K groups and "
                          "moves ONLY the sync-point count, +(K-1) per layer, at constant bytes, "
                          "tasks, configures and designs; 'g<G>' = SPLIT_QKNORM, which deals the "
@@ -233,24 +241,27 @@ def main():
     arms = []
     census = {}
     for spec in a.arms:
-        m = re.fullmatch(r"(\d+)(f?)(?:c(\d+))?(?:q(\w+?))?(?:d(\d+))?(?:s(\d+))?(?:g(\d+))?"
-                         r"(?:h(\d))?(?:r(\d+))?", spec)
+        m = re.fullmatch(r"(\d+)(f?)(?:c(\d+))?(?:d(\d+))?(?:s(\d+))?(?:g(\d+))?"
+                         r"(?:h(\d))?(?:r(\d+))?(?:q(.+))?", spec)
         if not m:
             raise SystemExit(f"bad arm spec {spec!r}")
         L = int(m.group(1))
         fmo = m.group(2) == "f"
         cols = int(m.group(3)) if m.group(3) else 8
-        qdt = m.group(4) or "bf16"
-        wdepth = int(m.group(5)) if m.group(5) else 2
-        sgh = int(m.group(6)) if m.group(6) else 1
-        sqk = int(m.group(7)) if m.group(7) else 0
-        share = m.group(8) if m.group(8) else "1"
-        dummy = int(m.group(9)) if m.group(9) else 0
+        wdepth = int(m.group(4)) if m.group(4) else 2
+        sgh = int(m.group(5)) if m.group(5) else 1
+        sqk = int(m.group(6)) if m.group(6) else 0
+        share = m.group(7) if m.group(7) else "1"
+        dummy = int(m.group(8)) if m.group(8) else 0
+        qdt = m.group(9) or "bf16"
         # These are captured at gen_llm_decode IMPORT time, so flipping os.environ here would be
         # silently ignored -- set the module globals the generator actually reads.
         G.FUSE_MLP_O = fmo
         G.MLP_DP_COLS = cols
-        G.QUANT_MLP_DTYPE = qdt
+        # build_graph takes a plan precisely so one process can hold several precision arms
+        # resident; the legacy QUANT_* module attribute this replaces is read by nothing
+        # (gen_llm_decode.py names it legacy), so every `q<dtype>` arm was silently the default.
+        plan = None if qdt == "bf16" else precision_plan_for(qdt)
         G.WEIGHT_DEPTH = wdepth
         G.SPLIT_GH_DRAIN = sgh
         G.SPLIT_QKNORM = sqk
@@ -259,11 +270,13 @@ def main():
         os.environ["SHARE_DESIGNS"] = share
         G.DUMMY_NORM_RUNS = dummy
         t0 = time.perf_counter()
-        sp, fused, weights, md = build_graph(a.spec, a.weights, L, a.max_seq)
+        sp, fused, weights, md = build_graph(a.spec, a.weights, L, a.max_seq,
+                                             precision_plan=plan)
         # A fit's CONTROL variables need the same evidence as its result: print every quantity
         # that differs between arms BEFORE fitting, not just the one being varied.
         census[spec] = census_from_mlir(fused, md, sgh=sgh)
-        census[spec].update(fuse_mlp_o=fmo, mlp_dp_cols=cols, quant_mlp=qdt,
+        census[spec].update(fuse_mlp_o=fmo, mlp_dp_cols=cols,
+                            quant_mlp=str(G.PRECISION_PLAN.get("mlp")),
                             weight_depth=wdepth, split_gh=sgh, split_qknorm=sqk,
                             share_designs=share, dummy_runs=dummy)
         print(f"[layer-arms] built {spec} in {time.perf_counter()-t0:.1f}s  census={census[spec]}",
