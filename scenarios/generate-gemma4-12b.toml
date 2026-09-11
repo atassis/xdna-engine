@@ -1,0 +1,33 @@
+[scenario]
+kind = "generate"
+name = "gemma4-12b"
+
+# Gemma-4-12B, all 48 layers on the NPU. The first non-uniform model on this rail: its sliding
+# layers are head_dim 256 / 8 kv heads and its global layers 512 / 1, so attention ops are built
+# per GEOMETRY (gen_llm_decode.py's attn_ops factory) rather than once for the stack.
+#
+#   weights  scripts/dump_llm_weights.py --spec gemma4-12b --quant int8 --quant-group 64 \
+#              --quant-leaves gate_proj,up_proj,down_proj,o_proj,q_proj,k_proj,v_proj
+#   decode   TMV_CTX=0 GQA_GROUPED_K=1 GQA_GROUPED_V=1 FUSE_QKV_DP=0 SPLIT_LM_HEAD=0 \
+#              bash scripts/build_llm_decode.sh gemma4-12b
+#
+# int8 g64, and BOTH halves of that are load-bearing.
+#   int8, not int4: symmetric RTN int4 is 12.3% weight rel-L2 against a gate that wants ~0.3%
+#     logit accuracy, and no group size or calibration closes it.
+#   g64, not g128: at K=3840 the int8 width derivation returns VEC_SIZE=8, and aie::vector<int8,8>
+#     is 64 bits -- below aie_api's minimum vector, so there is no vector_storage specialisation
+#     and the kernel does not compile. g64 derives 16 (128-bit) and is legal.
+#
+# TMV_CTX=0 is REQUIRED: the global layers (head_dim 512, one kv head, batch_group 16) have no
+# TMatVec tiling that fits L1. SPLIT_LM_HEAD=0 because the host loader carries one elf/kernel name,
+# so a split head would be a second dispatch it cannot express.
+#
+# NOT the default generate model, deliberately: ~1.2 tok/s and a 15.3 GB resident arena against
+# qwen3-0.6b's 27.87 ms/token and 1.4 GB. Name it per request.
+[artifacts]
+decode = "artifacts/gemma4-12b/decode_int8g64"
+weights = "artifacts/gemma4-12b/weights_int8g64"
+tokenizer_dir = "artifacts/gemma4-12b/tokenizer"
+
+[generation]
+max_tokens = 512
