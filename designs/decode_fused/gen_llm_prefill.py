@@ -306,6 +306,15 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
         # and would produce unscaled scores.
         raise ValueError(f"{sp.name}: no per-head q-norm, so attn_scale has no gain to ride on; "
                          f"this graph has no separate score scale")
+    if sp.layer_scalar:
+        # Landed as a refusal, not a silent gap: a real build would compile and run, missing
+        # `hidden_states *= self.layer_scalar` (the last statement of the reference decoder layer,
+        # after both residual adds), and produce a plausible-looking wrong token stream. Needs a
+        # per-layer D-wide constant multiplied into every one of M rows -- ElementwiseMul takes two
+        # EQUAL-sized operands (gen_llm_decode.py:1615 is M=1, so `ls` and the block output are
+        # already the same size there), and no broadcast primitive for a [D] gain against an
+        # [M, D] tensor has been verified device-side at M=256 yet.
+        raise ValueError(f"{sp.name}: layer_scalar is not applied by this graph yet")
 
     # ---- K007: every shape constraint asserted where the shape is picked, PER GEOMETRY ----
     # The GEMM tilings come from the registry below, at the point each GEMM is constructed --
