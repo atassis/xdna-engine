@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Guard: refuse to COMMIT private material into the public xdna-engine repo.
+# Activate with:  git config core.hooksPath hooks
+#
+# Layered with hooks/pre-push deliberately, and the split is the point:
+#   pre-commit  scans the STAGED CHANGE  -- what THIS commit adds. Cheap, and it stops a
+#               leak from entering history at all, where fixing it later needs a rewrite.
+#   pre-push    scans the whole TREE being pushed (--rev) -- the backstop that catches a
+#               leak already in history, including one committed before this hook existed.
+#
+# Only the files this commit touches are scanned, NOT the whole index. A pre-existing
+# violation elsewhere in the tree must not block an unrelated commit -- that is the
+# pre-push tree guard's job, and making every commit hostage to the tree's worst file is
+# how a guard gets disabled with --no-verify.
+set -euo pipefail
+[ -x scripts/check_no_private_refs.sh ] || exit 0
+
+# ACMR: added/copied/modified/renamed. A DELETED file has no content to leak, and passing
+# its path to `git grep --cached` would just error.
+mapfile -t staged < <(git diff --cached --name-only --diff-filter=ACMR)
+[ "${#staged[@]}" -eq 0 ] && exit 0
+
+if ! scripts/check_no_private_refs.sh --staged "${staged[@]}" >&2; then
+  echo "" >&2
+  echo "pre-commit guard refused the commit: staged content references private material." >&2
+  echo "Genericize the reference (state the fact in-tree) or drop it." >&2
+  echo "Do NOT use --no-verify unless you are certain." >&2
+  exit 1
+fi
+exit 0

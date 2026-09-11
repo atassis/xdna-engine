@@ -6,9 +6,8 @@ Sibling to bench_bucket_arms.py, which varies `max_seq` (KV bytes) at fixed form
 the weight FORMAT (weight bytes) at fixed shape, and it exists to answer two questions at once.
 
   1. Does a narrow weight stream pay on LATENCY? The standing objection is that int8's dequant has
-     no zero-overhead loop where int4's does, so its byte win carries an unpriced compute cost
-     ([[int8-dequant-loses-the-zero-overhead-loop-for-nothing]]). That has never been measured in
-     either direction.
+     no zero-overhead loop where int4's does, so its byte win carries an unpriced compute cost.
+     That has never been measured in either direction.
 
   2. What does a byte cut CONVERT at on this base? Two measured models disagree by 1.5x -- the
      transport law's fitted marginal rate (18.28 us/MB) against the ~2/3 of floor arithmetic the

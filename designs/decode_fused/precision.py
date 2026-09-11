@@ -212,11 +212,11 @@ PRESETS = {
                       "fused"),
     # The whole weight stream at int8, group 128. Host-measured at +0.02% perplexity
     # [-0.2, +0.3] over 3000 paired positions -- the only format measured on this model whose
-    # generation also holds ([[int8-weights-are-quality-free-and-unpriced]]).
+    # generation also holds.
     "all-int8": ({"mlp": "int8a/g128", "attn_o": "int8a/g128", "head": "int8a/g128",
                   "qkv": "int8a/g128"}, "no-fusion"),
     # The arm the device has run end to end: +7.50% perplexity [+4.05, +11.06] t=4.35 on 2000
-    # paired positions ([[the-affine-grid-must-contain-zero]]).
+    # paired positions.
     "mlp-int4": ({"mlp": "int4a/g128/zero_grid", "attn_o": "int4a/g128/zero_grid"}, "fused"),
 }
 
@@ -443,8 +443,8 @@ def token_mb(plan: Mapping[str, Spec]) -> Dict[str, float]:
     return out
 
 
-# `t = bytes/54.71 GB/s + 67.3 us per command`, fitted on a GEMV stream-length sweep
-# ([[decode-transport-is-one-law-bytes-at-the-ceiling-plus-a-per-command-floor]]). A precision arm
+# `t = bytes/54.71 GB/s + 67.3 us per command`, fitted on a GEMV stream-length sweep.
+# A precision arm
 # moves the byte term only: it changes no command count and the fitted leftover is measured
 # byte-independent across a 352 MB span, so the marginal rate is the whole prediction.
 MARGINAL_US_PER_MB = 1e6 / 54.71e3

@@ -212,7 +212,7 @@ class TestByteModel:
             P.wire_bytes_per_element(P.parse_spec("int4/g128"))
 
     def test_int8_weights_land_on_the_recorded_615_mb(self):
-        """[[int8-weights-are-quality-free-and-unpriced]] records weights falling 1193 -> 615 MB
+        """int8 at every weight site takes the token's weight bytes 1193 -> 615 MB, measured,
         for exactly this plan."""
         p = plan(mlp="int8a", attn_o="int8a", qkv="int8a", head="int8a")
         mb = P.token_mb(p)

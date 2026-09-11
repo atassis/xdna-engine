@@ -18,7 +18,16 @@
 set -u
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WS="$(cd "$REPO/.." && pwd)"
-LOCK="$WS/xdna-engine-private/journal/scripts/npu_lock.sh"
+# Device serialisation helper. The NPU is single-tenant, so arms must not overlap. Point
+# NPU_LOCK at a serialiser exposing `<lock> queue -- <cmd...>`; it lives outside this repo,
+# so it is named by env rather than by path. Unset is a hard error, not a silent unlocked
+# run: two arms sharing the device produce plausible, wrong timings rather than a failure.
+LOCK="${NPU_LOCK:-}"
+if [ -z "$LOCK" ] || [ ! -x "$LOCK" ]; then
+  echo "run_precision_ab.sh: set NPU_LOCK to an executable device serialiser" >&2
+  echo "  (it must accept: \$NPU_LOCK queue -- <command...>)" >&2
+  exit 2
+fi
 OUT="${PRECISION_AB_OUT:-/mnt/data/xdna/scratch/precision/ab}"
 ARMS=(bf16 '{"head":"int8a/g128"}' mlp-int8 mlp-head-int8)
 WARM_ONLY=0
