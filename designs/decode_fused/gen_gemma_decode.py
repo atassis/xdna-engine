@@ -49,6 +49,7 @@ import ml_dtypes
 
 import newstack_compat  # noqa: F401 -- MUST precede iron imports (new-mlir-aie port shim)
 from iron.common import AIEContext
+from buffer_blob import write_blob
 from elf_dispatch_compat import OperatorSequence, load_elf
 from iron.operators.gemv.op import GEMV
 from iron.operators.rms_norm.op import RMSNorm
@@ -288,7 +289,7 @@ def main():
     bdir = os.path.join(a.out, "buffers")
 
     def wb(n, v):
-        open(os.path.join(bdir, f"{n}.bin"), "wb").write(np.asarray(v, BF16).tobytes())
+        write_blob(os.path.join(bdir, f"{n}.bin"), np.asarray(v, BF16).tobytes())
     for nm, arr in weights.items():
         wb(nm, arr)
     open(os.path.join(a.out, "decode.elf"), "wb").write(elf)

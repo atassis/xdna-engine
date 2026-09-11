@@ -22,6 +22,7 @@ import torch
 
 import newstack_compat  # noqa: F401 — MUST precede iron imports (new-mlir-aie port shim)
 from iron.common import AIEContext
+from buffer_blob import write_blob
 from elf_dispatch_compat import OperatorSequence, load_elf
 from iron.operators.gemv.op import GEMV
 from iron.operators.layer_norm.op import LayerNorm
@@ -588,7 +589,7 @@ def main():
         v = np.asarray(v)
         # int8 buffers (quantized weights / golden K/V) write RAW bytes; everything else is bf16.
         data = v.tobytes() if v.dtype == np.int8 else np.asarray(v, BF16).tobytes()
-        open(os.path.join(bdir, f"{n}.bin"), "wb").write(data)
+        write_blob(os.path.join(bdir, f"{n}.bin"), data)
     wb("x", x); wb(out_name, x_out)
     for nm, arr in weights_to_write.items():
         wb(nm, arr)

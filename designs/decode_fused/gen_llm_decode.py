@@ -39,6 +39,7 @@ import numpy as np
 import ml_dtypes
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from buffer_blob import write_blob  # noqa: E402
 from llm_decode_spec import (SPECS, C_TILE_GRANULE, L1_BYTES, L1_RESERVE,  # noqa: E402,F401
                              gemv_fits, gemv_tile_output, k_chunks_for)
 
@@ -2247,10 +2248,10 @@ def main():
                 f"plan ({PRECISION_PLAN.get(_site_of(n_), precision.BF16_SPEC)} at site "
                 f"{_site_of(n_)!r}) is not the format the operator holding this buffer was built "
                 "for -- see precision.py P003.")
-        open(os.path.join(bdir, f"{n_}.bin"), "wb").write(b)
+        write_blob(os.path.join(bdir, f"{n_}.bin"), b)
     if embed_blob != "W_head":
         # Host-only, deliberately not in `wnames`: see the tied-embedding note at its build site.
-        open(os.path.join(bdir, f"{embed_blob}.bin"), "wb").write(weight_bytes(host_embed))
+        write_blob(os.path.join(bdir, f"{embed_blob}.bin"), weight_bytes(host_embed))
     open(os.path.join(a.out, "decode.elf"), "wb").write(elf)
 
     meta = {
