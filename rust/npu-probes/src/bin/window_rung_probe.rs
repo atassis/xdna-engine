@@ -111,10 +111,16 @@ fn main() {
     let rung_dir = a.next().expect("usage: window_rung_probe <rung_dir> <control_dir>");
     let ctl_dir = a.next().expect("usage: window_rung_probe <rung_dir> <control_dir>");
     let (mut prime, mut gen) = (900usize, 200usize);
+    // `--no-crossing` compares two builds of the SAME graph, where neither side switches arms --
+    // the shape a toolchain change needs (chained vs unchained emission), as opposed to the rung
+    // case where the whole point is that one side crosses. It drops ONLY the two arm assertions;
+    // token identity is still the gate.
+    let mut require_crossing = true;
     while let Some(f) = a.next() {
         match f.as_str() {
             "--prime" => prime = a.next().and_then(|s| s.parse().ok()).unwrap_or(prime),
             "--gen" => gen = a.next().and_then(|s| s.parse().ok()).unwrap_or(gen),
+            "--no-crossing" => require_crossing = false,
             other => panic!("unknown flag {other}"),
         }
     }
@@ -134,6 +140,7 @@ fn main() {
 
     // 1. The rung arm must actually CROSS: a different control code at the start than at the end.
     //    Without this the parity below could pass on an artifact whose rungs were never selected.
+    if require_crossing {
     assert_ne!(
         r_first.1, r_last.1,
         "no rung crossing in positions {}..{} -- widen --gen or lower --prime; this gate is \
@@ -144,6 +151,7 @@ fn main() {
     // 2. The control must NOT cross -- it is one window, so its arm is constant. If it changed,
     //    the two sides are not the comparison this claims to be.
     assert_eq!(c_first.1, c_last.1, "control changed arms; it is not a single-window build");
+    }
     // 3. And only then, token identity.
     let bad: Vec<usize> = (0..gen).filter(|&i| r_tok[i] != c_tok[i]).collect();
     if bad.is_empty() {
