@@ -7,7 +7,9 @@ the weight FORMAT (weight bytes) at fixed shape, and it exists to answer two que
 
   1. Does a narrow weight stream pay on LATENCY? The standing objection is that int8's dequant has
      no zero-overhead loop where int4's does, so its byte win carries an unpriced compute cost.
-     That has never been measured in either direction.
+     It is priced now, and against int8: symmetric int8 measured 2.10x SLOWER than bf16 while
+     symmetric int4 sat at parity. What is unmeasured is whether that survives two fixes -- the
+     flat dequant loop, and a payload alignment that no longer forces a half-width load.
 
   2. What does a byte cut CONVERT at on this base? Two measured models disagree by 1.5x -- the
      transport law's fitted marginal rate (18.28 us/MB) against the ~2/3 of floor arithmetic the

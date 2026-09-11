@@ -148,11 +148,13 @@ class TestWireArithmetic:
         refusal("P007", P.wire_row_units, P.parse_spec("int4/g2"), 6)
 
     def test_int4_and_affine_int4_are_the_same_bytes_at_the_same_group(self):
-        assert P.wire_bytes_per_element(P.parse_spec("int4/g128")) == \
-            P.wire_bytes_per_element(P.parse_spec("int4a/g128"))
+        assert P.wire_bytes_per_element(P.parse_spec("int4/g128"), 1024) == \
+            P.wire_bytes_per_element(P.parse_spec("int4a/g128"), 1024)
 
     def test_int4_g128_is_the_measured_3_765x(self):
-        got = 2.0 / P.wire_bytes_per_element(P.parse_spec("int4/g128"))
+        """int4's header needs no pad at this shape -- 32 B of scales against a 32 B load -- so
+        the recorded ratio is untouched by the alignment fix. int8's is not."""
+        got = 2.0 / P.wire_bytes_per_element(P.parse_spec("int4/g128"), 1024)
         assert abs(got - 3.765) < 0.001
 
     def test_the_plane_agrees_with_the_packer(self):
@@ -202,22 +204,24 @@ class TestByteModel:
         halves the row count of every bf16 reshape -- it corrupted Wqkv's head-major reorder."""
         assert P.wire_row_units(P.BF16_SPEC, 1024) == 1024
 
-    def test_the_header_amortises_at_a_rate_K_does_not_change(self):
-        """The MLP's three weights are 2:1 across two row widths (Wg/Wu along D, Wd along FF).
-        They price identically, because n_groups scales with K -- so the byte model needs no
-        per-K split, and a finer group is the only thing that moves the header cost."""
-        spec = P.parse_spec("int4/g128")
-        assert P.wire_row_units(spec, 1024) / 1024 == P.wire_row_units(spec, 3072) / 3072
-        assert P.wire_bytes_per_element(P.parse_spec("int4/g32")) > \
-            P.wire_bytes_per_element(P.parse_spec("int4/g128"))
+    def test_the_rate_is_K_independent_for_the_shipped_layout(self):
+        """header+payload with n_groups scaling in K, so the per-element rate does not move with
+        K. It stopped being true the afternoon the header was padded to the load width, which is
+        why the byte model asks the packer rather than assuming."""
+        for dt in ("int4/g128", "int8/g128"):
+            spec = P.parse_spec(dt)
+            assert P.wire_bytes_per_element(spec, 1024) == P.wire_bytes_per_element(spec, 3072)
+        assert P.wire_bytes_per_element(P.parse_spec("int4/g32"), 1024) > \
+            P.wire_bytes_per_element(P.parse_spec("int4/g128"), 1024)
 
     def test_int8_weights_land_on_the_recorded_615_mb(self):
         """int8 at every weight site takes the token's weight bytes 1193 -> 615 MB, measured,
-        for exactly this plan."""
+        for exactly this plan. Alignment is bought with the LOAD WIDTH, not with header padding,
+        so the bytes are unchanged -- a pad would have cost 17 MB here."""
         p = plan(mlp="int8a", attn_o="int8a", qkv="int8a", head="int8a")
         mb = P.token_mb(p)
         weights = mb["mlp"] + mb["attn_o"] + mb["qkv"] + mb["head"]
-        assert 610 < weights < 620
+        assert 610 < weights < 620, weights
 
     def test_the_transport_prediction_is_the_byte_delta_at_the_fitted_rate(self):
         p = plan(mlp="int8a")

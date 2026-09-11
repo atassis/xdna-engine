@@ -11,6 +11,7 @@ loop where mv.cc's is a 6-bundle ZOL -- 11.7x on the decode step, found only by 
 import argparse
 import os
 import re
+import glob
 import shutil
 import subprocess
 import sys
@@ -22,16 +23,39 @@ MAC = re.compile(r"\bv(?:mac|mul)\.")
 
 
 def objdump():
-    for cand in (os.environ.get("LLVM_OBJDUMP"),
-                 os.path.join(os.environ.get("PEANO_INSTALL_DIR", ""), "bin", "llvm-objdump"),
-                 shutil.which("llvm-objdump")):
-        if cand and os.path.exists(cand):
+    """An llvm-objdump that can target AIE.
+
+    The system one cannot: it reads the core ELF's header, reports `elf32-unknown`, and fails
+    with "unable to get target for 'unknown--'". Falling back to it silently is why this checker
+    reported "no instructions disassembled" on every input including a known-good bf16 core --
+    it fails closed, so wiring it into a gate would have blocked every build, which is the most
+    likely reason it was never wired into one.
+    """
+    cands = [os.environ.get("LLVM_OBJDUMP"),
+             os.path.join(os.environ.get("PEANO_INSTALL_DIR", ""), "bin", "llvm-objdump")]
+    for root in (os.environ.get("VIRTUAL_ENV", ""), sys.prefix):
+        if root:
+            cands += glob.glob(os.path.join(root, "lib", "python*", "site-packages",
+                                            "llvm-aie", "bin", "llvm-objdump"))
+    cands.append(shutil.which("llvm-objdump"))
+    for cand in cands:
+        if cand and os.path.exists(cand) and _targets_aie(cand):
             return cand
-    sys.exit("no llvm-objdump: set PEANO_INSTALL_DIR or LLVM_OBJDUMP")
+    sys.exit("no AIE-capable llvm-objdump: set PEANO_INSTALL_DIR or LLVM_OBJDUMP (the system "
+             "llvm-objdump cannot target AIE and is not a usable fallback)")
+
+
+def _targets_aie(binary):
+    out = subprocess.run([binary, "--version"], capture_output=True, text=True).stdout
+    return "aie" in out.lower()
 
 
 def parse(path):
-    text = subprocess.run([objdump(), "-d", path], capture_output=True, text=True).stdout
+    # --triple is REQUIRED: without it even the Peano objdump prints the section header and no
+    # instructions, which this file's own failure message then reports as an empty kernel.
+    triple = os.environ.get("AIE_TRIPLE", "aie2p")
+    text = subprocess.run([objdump(), "-d", f"--triple={triple}", path],
+                          capture_output=True, text=True).stdout
     labels, instrs = [], []
     for line in text.splitlines():
         m = LABEL.match(line)
