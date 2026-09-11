@@ -60,14 +60,14 @@ fn main() {
         // does not, and mixing it into the median measures the load, not the prefill.
         step.reset().expect("reset");
         let ids = prompt_ids(p, vocab);
-        let _ = step.prefill(&ids).expect("warmup prefill");
+        let _ = step.prefill(&ids, 0).expect("warmup prefill");
 
         let mut ms = Vec::with_capacity(reps);
         let mut primed_n = 0usize;
         for _ in 0..reps {
             step.reset().expect("reset KV between reps");
             let t = Instant::now();
-            let primed = step.prefill(&ids).expect("prefill");
+            let primed = step.prefill(&ids, 0).expect("prefill");
             for (i, &tok) in ids[primed..].iter().enumerate() {
                 step.step(tok, primed + i).expect("prime step");
             }
