@@ -159,6 +159,16 @@ DECODE_PLACER_FLAGS_DEFAULT = "--cores-per-col 1"
 # is +39.9 ms if the cost is flat, and ~0 if it tracks the view count.
 SPLIT_QKNORM = os.environ.get("SPLIT_QKNORM", "0") == "1"
 
+# INSTRUMENT, not a feature -- the sibling of SPLIT_QKNORM above, aimed at the other count.
+# SPLIT_QKNORM isolated a CONFIGURE by turning one design into many; this chops swiglu_mlp_dp's gh
+# drain group into k groups over the SAME drains in the SAME order, so bytes, shim tasks, BDs,
+# configures, designs and output are all identical and the ONLY quantity that moves is the number
+# of SYNC POINTS: +(k-1) per layer, +28*(k-1) per token. That is the last unrefuted candidate for
+# the per-layer transport residual -- 0.135-0.159 ms/layer over 10 TaskGroup closes is 13.5-15.9 us
+# each, so at L=28 a k=12 arm predicts +4.2 to +4.9 ms if the cost is per sync point, and ~0 if it
+# is not. 1 (default) is byte for byte the unsplit path.
+SPLIT_GH_DRAIN = int(os.environ.get("SPLIT_GH_DRAIN", "1"))
+
 # Fold the FFN activation into the gate GEMV as a fused tile epilogue.
 #
 # DEFAULT OFF, because on THIS graph it is a wash and the counting is the lesson. Deleting op_act
@@ -415,6 +425,8 @@ def sequence_name(sp, NL, S, placer_flags, decode_layer_active=False, T=None):
     # copy of that logic is exactly the kind of drift this file's other suffixes warn about.
     if decode_layer_active:
         parts.append("declayer")
+    if SPLIT_GH_DRAIN != 1:
+        parts.append(f"sgh{SPLIT_GH_DRAIN}")
     if WEIGHT_DEPTH != 2:
         parts.append(f"wd{WEIGHT_DEPTH}")
     if MLP_TILE_ROWS:
@@ -998,6 +1010,10 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
                 # 2026-09-10: it broke every decode build on the default path, DYNAMIC_WINDOW=0
                 # included, because an unknown kwarg fails at the call and never reaches the flag
                 # test inside.
+                # Conditional for the SAME reason window_parameter is: an unknown kwarg is a
+                # TypeError at the call against any IRON whose decode_layer_dp predates the field,
+                # and it never reaches the flag test inside.
+                **({"split_gh": SPLIT_GH_DRAIN} if SPLIT_GH_DRAIN != 1 else {}),
                 **({"window_parameter": "attn_window"} if DYNAMIC_WINDOW else {}))
 
         op_decode_layer = _decode_layer(S)
