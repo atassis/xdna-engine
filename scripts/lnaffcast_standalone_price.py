@@ -164,7 +164,7 @@ def main(o):
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--ln-dir", default="/mnt/data/models/xdna-artifacts/parakeet/ln",
+    p.add_argument("--ln-dir", default="/mnt/data/xdna/artifacts/parakeet/ln",
                    help="the SHIPPED artifact dir -- price what the encoder loads, not a rebuild")
     p.add_argument("--stem", default=f"lnaffcast_{ROWS}x{COLS}")
     p.add_argument("--artifacts", default="artifacts")

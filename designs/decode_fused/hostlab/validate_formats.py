@@ -3,7 +3,7 @@ Gate 2: reproduce the recorded rel-L2 sweep so the instrument is anchored to the
 import os as _os
 # Work root: corpora/ and runs/ live here, NOT in the repo -- a 6000-position logprob
 # memmap is 3.6 GB and belongs on nvme. Override with QLAB_WORK.
-QLAB = _os.environ.get("QLAB_WORK", "/mnt/data/qlab")
+QLAB = _os.environ.get("QLAB_WORK", "/mnt/data/xdna/qlab")
 import sys, glob, numpy as np
 sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
 # the shipped packer, three levels up from designs/decode_fused/hostlab/

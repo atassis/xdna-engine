@@ -12,7 +12,7 @@ The reference is computed from the artifact's OWN `buffers/*.bin` -- the exact b
 handed -- not from a re-run of the generator's RNG. Same seed, same numbers, but only one of the
 two is a fact about this artifact.
 
-  python3 scripts/refresh_prefill_goldens.py /mnt/data/xdna-scratch/prefill/mlp_m256
+  python3 scripts/refresh_prefill_goldens.py /mnt/data/xdna/scratch/prefill/mlp_m256
   python3 scripts/refresh_prefill_goldens.py --weights <npy dir> <full prefill artifact>
 
 Kind is read off `meta.json`'s `output` field: `out` = MLP block, `cx` = attention block,

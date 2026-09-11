@@ -56,7 +56,7 @@ BASE="${BASE:-512x1024x1024_32x32x128_8c_modalidbf16outkrtpkrllnaff1024}"
 X1=${BASE}scat21x
 REPS="${REPS:-5}"
 ROWS="${ROWS:-512}"
-LN_DIR="${LN_DIR:-/mnt/data/models/xdna-artifacts/parakeet/ln}"
+LN_DIR="${LN_DIR:-/mnt/data/xdna/artifacts/parakeet/ln}"
 
 log "===== lnaffcast: mode vs the SHIPPED standalone op at ${ROWS} rows  $(date -Is) ====="
 log "[svc] stopping xdna-engine + npu-vox"

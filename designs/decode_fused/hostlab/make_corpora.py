@@ -1,7 +1,7 @@
 import os as _os
 # Work root: corpora/ and runs/ live here, NOT in the repo -- a 6000-position logprob
 # memmap is 3.6 GB and belongs on nvme. Override with QLAB_WORK.
-QLAB = _os.environ.get("QLAB_WORK", "/mnt/data/qlab")
+QLAB = _os.environ.get("QLAB_WORK", "/mnt/data/xdna/qlab")
 #!/usr/bin/env python3
 """Build the corpus set for the weight-format quality lab. Four genres, so a delta
 that is a property of ONE genre cannot hide as a property of the format."""
