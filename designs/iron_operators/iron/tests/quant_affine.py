@@ -30,7 +30,7 @@ import sys, pathlib
 import numpy as np
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
-from iron.operators.gemv.quant import (quantize_weight, dequantize_weight,  # noqa: E402
+from iron.common.quant import (quantize_weight, dequantize_weight,  # noqa: E402
                                         row_stride_bytes, is_affine)
 try:
     import ml_dtypes

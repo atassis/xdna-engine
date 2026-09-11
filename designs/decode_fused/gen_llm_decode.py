@@ -79,7 +79,7 @@ from iron.common import AIEContext  # noqa: E402
 from iron.common.kv_layout import KVLayout, derive_block_size  # noqa: E402
 from elf_dispatch_compat import OperatorSequence, load_elf  # noqa: E402
 from iron.operators.gemv.op import GEMV  # noqa: E402
-from iron.operators.gemv.quant import quantize_weight  # noqa: E402
+from iron.common.quant import quantize_weight  # noqa: E402
 import precision  # noqa: E402
 from iron.operators.rms_norm.op import RMSNorm  # noqa: E402
 from iron.operators.rope.op import RoPE  # noqa: E402

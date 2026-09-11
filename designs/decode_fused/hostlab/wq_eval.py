@@ -6,7 +6,7 @@ impossible. A format changes only which numbers the weights hold, so the informa
 destroys is measurable without the device. The device then confirms ONE chosen point.
 
 The instrument is anchored, not assumed: validate_formats.py shows the `sym` path is
-bit-identical to the shipped packer (iron/operators/gemv/quant.py) and reproduces the
+bit-identical to the shipped packer (iron/common/quant.py) and reproduces the
 recorded rel-L2 sweep to four decimals at every group size.
 
 Metrics, and what each can and cannot see -- see the report; briefly:

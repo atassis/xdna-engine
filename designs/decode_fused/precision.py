@@ -19,7 +19,7 @@ the combination has to be refused before the build. The rules below are the refu
 the source that owns the constraint, and `check()` raises naming it.
 
 WHAT THIS MODULE DOES NOT OWN. The on-wire byte layout of a quantized row belongs to
-`iron/operators/gemv/quant.py`, which is the kernel's contract. This module owns which site gets
+`iron/common/quant.py`, which is the kernel's contract. This module owns which site gets
 which format and whether that combination can be built at all. `wire_bytes_per_element()` below
 duplicates the packer's arithmetic on purpose and `check_packer_agreement()` cross-examines it, so
 a divergence between what we price and what we ship is a test failure rather than a wrong census.
@@ -62,7 +62,7 @@ class Rule:
 RULES = {r.id: r for r in (
     Rule("P001", "a site's dtype must be one this tree's packer implements, with the signature "
                  "the generator calls",
-         "iron/operators/gemv/quant.py::quantize_weight"),
+         "iron/common/quant.py::quantize_weight"),
     Rule("P002", "every weight on one ObjectFifo carries one dtype for the fifo's lifetime",
          "iron/operators/attn_block_dp/design.py (STREAM channel), "
          "iron/operators/swiglu_mlp_dp/design.py (shared weight fifo)"),
@@ -76,9 +76,9 @@ RULES = {r.id: r for r in (
     Rule("P005", "a non-bf16 KV cache must derive its block size on its own address granule",
          "iron/common/kv_layout.py::derive_block_size (addr_gran_elems defaults to bf16's 2)"),
     Rule("P006", "the KV cache's quantization axis is per POSITION, which 4 bits cannot carry",
-         "iron/operators/gemv/quant.py (scale per row per group; for kc a row is a position)"),
+         "iron/common/quant.py (scale per row per group; for kc a row is a position)"),
     Rule("P007", "K must be a whole number of groups and the packed row 4-byte aligned",
-         "iron/operators/gemv/quant.py::row_stride_bytes"),
+         "iron/common/quant.py::row_stride_bytes"),
     Rule("P008", "a scale_kind must belong to its dtype's family",
          "this module's SCALE_KINDS"),
     Rule("P009", "quantizing the head splits the tied embedding and needs the bf16 sidecar",
@@ -264,7 +264,7 @@ def plan_from_env(env: Optional[Mapping[str, str]] = None) -> Tuple[Dict[str, Sp
 
 
 # The payload's vector-load width in bytes, per dtype, at the kernel's VEC_SIZE=64. int4 packs
-# two nibbles per byte so it loads half as wide. Mirrors iron/operators/gemv/quant.py's own
+# two nibbles per byte so it loads half as wide. Mirrors iron/common/quant.py's own
 # `_LOAD_BYTES`; used only by the fallback below.
 _LOAD_BYTES = {"int4": 32, "int4a": 32, "int8": 64, "int8a": 64}
 
@@ -287,7 +287,7 @@ def wire_row_units(spec: Spec, K: int) -> int:
     if not spec.quantized:
         return K
     try:
-        from iron.operators.gemv.quant import row_stride_bytes
+        from iron.common.quant import row_stride_bytes
     except ImportError:
         pass
     else:
@@ -497,14 +497,14 @@ def packer_capability() -> Tuple[Tuple[str, ...], bool]:
     """
     try:
         import inspect
-        from iron.operators.gemv.quant import quantize_weight
+        from iron.common.quant import quantize_weight
     except ImportError:
         return (BF16,), False
     params = inspect.signature(quantize_weight).parameters
     takes_kind = "clip_search" in params or "scale_kind" in params or \
         any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
     try:
-        from iron.operators.gemv.quant import is_affine  # affine-capable packers export this
+        from iron.common.quant import is_affine  # affine-capable packers export this
         dtypes = DTYPES
     except ImportError:
         dtypes = (BF16,) + SYMMETRIC

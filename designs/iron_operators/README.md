@@ -18,7 +18,7 @@ one-to-one.
 | `iron/operators/qkv_head_dp/` | decode QKV head, data-parallel across columns |
 | `iron/operators/swiglu_mlp_dp/` | decode SwiGLU MLP, every core runs every stage on 1/N |
 | `iron/operators/tmatvec/` | transposed mat-vec |
-| `iron/operators/gemv/quant.py` | the gemv quantised path |
+| `iron/common/quant.py` | the gemv quantised path |
 | `aie_kernels/generic/mv_quant.cc`, `mv_taccum.cc` | kernels those operators compile |
 | `iron/tests/infrastructure/element_size.py` | test helper they import |
 

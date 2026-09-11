@@ -160,7 +160,7 @@ class TestWireArithmetic:
     def test_the_plane_agrees_with_the_packer(self):
         """The plane prices an arm the packer ships. A divergence is this test, not a wrong
         census."""
-        quant = pytest.importorskip("iron.operators.gemv.quant")
+        quant = pytest.importorskip("iron.common.quant")
         for dtype in ("int4", "int8"):
             for k, g in ((1024, 128), (3072, 128), (2048, 64), (1024, 32)):
                 assert P.wire_row_units(P.parse_spec(f"{dtype}/g{g}"), k) == \
@@ -172,7 +172,7 @@ class TestPackerContract:
     keyword is a TypeError three frames into the build, which is the failure P001 exists for."""
 
     def test_every_scale_kind_reaches_the_packer(self):
-        quant = pytest.importorskip("iron.operators.gemv.quant")
+        quant = pytest.importorskip("iron.common.quant")
         import inspect
         import numpy as np
         params = inspect.signature(quant.quantize_weight).parameters
