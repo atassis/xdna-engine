@@ -158,10 +158,18 @@ def main():
         arms.append(dict(spec=spec, L=L, fmo=fmo, cols=cols, qdt=qdt, wdepth=wdepth,
                          sp=sp, c=c,
                          params=params,
+                         # The runtime attention window, when the arm built one. An arm whose core
+                         # reads `attn_window` and never has it written attends ZERO KV chunks and
+                         # times a fraction of the real work -- fast, plausible, and wrong, with
+                         # nothing in the output to say so. `window_granule` is None on a
+                         # build-constant arm, and then this stays None and nothing is written.
+                         granule=md.get("window_granule"),
                          kv_layout=KVLayout(Hkv=sp.n_kv_heads, S=md["S"], HD=sp.head_dim, T=md["T"]),
                          xin=c.get_buffer("x"), rope_buf=c.get_buffer("rope_global"),
                          scale=scale))
     print(f"[layer-arms] {len(arms)} arms resident, dispatching at pos={a.pos}", flush=True)
+
+    max_seq = a.max_seq
 
     def one(arm):
         with arm["xin"].overwrite() as _buf:
@@ -170,6 +178,11 @@ def main():
             _buf[:] = rope_row(a.pos, arm["sp"].head_dim, arm["sp"].rope_theta_global).reshape(-1)
         arm["params"].write("kv_off", int(arm["kv_layout"].kv_off(a.pos)))
         arm["params"].write("sm_mask", int(a.pos + 1))
+        if arm["granule"]:
+            g = int(arm["granule"])
+            # Same rule the host uses: round the attended length up to the granule, clamp to the
+            # window this arm was built for.
+            arm["params"].write("attn_window", min(-(-(a.pos + 1) // g) * g, max_seq))
         arm["params"].sync()
         arm["c"]()
         return float(arm["c"].last_elapsed)
