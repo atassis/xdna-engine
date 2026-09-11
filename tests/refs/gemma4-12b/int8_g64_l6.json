@@ -1,0 +1,53 @@
+{
+  "model": "/mnt/data/cache/huggingface/hub/models--unsloth--gemma-4-12b-it/snapshots/55cdba0740a9765956f49501f689a66b098feda3",
+  "layers": 6,
+  "logit_softcap_disabled": true,
+  "logit_softcap_value": 30.0,
+  "prompt": "The capital of France is",
+  "prompt_ids": [
+    818,
+    5279,
+    529,
+    7001,
+    563
+  ],
+  "gen_ids": [
+    219173,
+    94522,
+    255999,
+    30363,
+    148113,
+    111872,
+    717,
+    239234
+  ],
+  "margins": [
+    6.0,
+    26.0,
+    22.0,
+    25.0,
+    4.0,
+    16.0,
+    2.0,
+    12.0
+  ],
+  "quant": {
+    "dtype": "int8",
+    "group": 64,
+    "tensors": 41,
+    "leaves": [
+      "down_proj",
+      "gate_proj",
+      "k_proj",
+      "o_proj",
+      "q_proj",
+      "up_proj",
+      "v_proj"
+    ],
+    "mean_weight_rel_l2": 0.006810332126006848,
+    "max_weight_rel_l2": 0.009147210977971554,
+    "skipped_not_group_aligned": []
+  },
+  "hf_f32_gen_ids": null,
+  "note": "Faithful bf16 host forward via the checkpoint's own modeling code -- the oracle a bf16 DEVICE should match 1:1. `margins` is top1-top2 per step: a mismatch at a margin near the device's own logit error is a knife-edge, not a defect. hf_f32_gen_ids is kept for contrast; it is NOT the gate."
+}
