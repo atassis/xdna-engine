@@ -16,7 +16,14 @@ WT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$WT"
 MANIFEST="${1:?usage: time_gemm_tiles.sh <sweep-dir>/manifest.json}"
 [ -f "$MANIFEST" ] || { echo "ERROR: no manifest at $MANIFEST"; exit 1; }
 LOG="$(dirname "$MANIFEST")/time.log"
-PROBE="$WT/rust/target/release/fused_elf_probe"
+# Ask cargo where it puts binaries: rust/.cargo/config.toml redirects target-dir off /home (see
+# ../.cargo/config.toml), so a hardcoded $WT/rust/target silently misses -- the probe build below
+# reports success against the real target-dir while this looked in the wrong one. Same fix as
+# gate_llm.sh's tier2p path.
+CARGO_TGT="$(cd "$WT/rust" && cargo metadata --format-version 1 --no-deps 2>/dev/null \
+             | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])' 2>/dev/null)"
+[ -n "$CARGO_TGT" ] || CARGO_TGT="$WT/rust/target"
+PROBE="${PROBE:-$CARGO_TGT/release/fused_elf_probe}"
 LDLIB="${LDLIB:-$HOME/.local/lib/npu-asr}"
 : > "$LOG"
 log(){ echo -e "$*" | tee -a "$LOG"; }
