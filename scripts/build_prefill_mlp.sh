@@ -8,7 +8,7 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WS="$(cd "$REPO/.." && pwd)"
 BATCH="${1:-256}"
-OUT="${2:-/mnt/data/xdna-scratch/prefill/mlp_m$BATCH}"
+OUT="${2:-/mnt/data/xdna/scratch/prefill/mlp_m$BATCH}"
 VENV_IRON="${VENV_IRON:-$REPO/.venv-iron}"
 [ -x "$VENV_IRON/bin/python" ] || VENV_IRON="$WS/xdna-engine/.venv-iron"
 . "$REPO/scripts/amd_paths.sh"
@@ -35,7 +35,7 @@ export AIE_DEVICE="${AIE_DEVICE:-npu2}"   # build off the device lock; see gen_l
 [ -x "$AIECC_PATH" ] || { echo "ERROR: instance aiecc missing at $AIECC_PATH"; exit 1; }
 
 # Build artifacts go to NVMe, never the tmpfs scratchpad.
-WORK="${KEEP_WORK:-/mnt/data/xdna-scratch/prefill/build_m$BATCH}"
+WORK="${KEEP_WORK:-/mnt/data/xdna/scratch/prefill/build_m$BATCH}"
 mkdir -p "$WORK" "$OUT"
 cd "$WORK"
 exec "$VENV_IRON/bin/python" "$GEN" --spec qwen3-0.6b --weights "$WEIGHTS" --out "$OUT" --batch "$BATCH"
