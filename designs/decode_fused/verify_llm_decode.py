@@ -213,6 +213,7 @@ def main():
                          f"--steps N, or use a --ref whose gen_ids are non-empty.")
 
     sp, fused, weights, md = build_graph(a.spec, a.weights, a.layers, a.max_seq)
+    n_weight_buffers = len(weights)   # the loop below empties `weights` to halve peak residency
     NL, S = md["NL"], md["S"]
     HD, D, VOCAB = sp.head_dim, sp.d_model, sp.vocab
     print(f"[verify] {sp.name}: {NL} layers, S={S}, vocab={VOCAB}")
@@ -233,7 +234,14 @@ def main():
         # here. A weight that belongs to no segment is then a loud KeyError below rather than a
         # silent skip -- the property the lm-head split's `head_only` partition was protecting.
         for name in sg["weights"]:
-            load_weight_buffer(sc.get_buffer(name), weights[name])
+            # POP, not index. load_weight_buffer COPIES into the device buffer (`dst[:] = ...`)
+            # and keeps no reference, so holding the numpy array afterwards keeps every weight
+            # resident TWICE -- once as host anon memory and once as the shmem-backed XRT BO the
+            # amdxdna driver allocates. At int8 that is ~11 GB of duplicate for Gemma-4-12B, and
+            # it is what a 48-layer build died of: total-vm 27.9 GB on a 30 GB box, with the
+            # driver reporting `amdxdna_insert_pages: Failed shmem mmap -12`. The device-side
+            # requirement is irreducible; this duplicate is not.
+            load_weight_buffer(sc.get_buffer(name), weights.pop(name))
         # FLUSH SCRATCH. Every weight and both KV caches live in the scratch arena, and the callable
         # syncs only input (host->device) and output (device->host) -- scratch in NEITHER direction,
         # deliberately, because it is large and "whoever loads it" is supposed to sync it. Nobody did.
@@ -270,7 +278,7 @@ def main():
             print(f"[verify] segment {si}: layers {la}..{lb - 1}, "
                   f"{st['sg']['inlet']} -> {st['sg']['outlet']}, "
                   f"{len(st['sg']['weights'])} weights", file=sys.stderr)
-    print(f"[verify] {len(weights)} weight buffers loaded and scratch flushed to the device")
+    print(f"[verify] {n_weight_buffers} weight buffers loaded and scratch flushed to the device")
 
     # embed_tokens doubles as the tied lm-head; the host gathers the row for the current token.
     # The name comes off the SPEC, like every other tensor name: `weight_prefix` is "model." on a
@@ -343,7 +351,7 @@ def main():
     head_c = None
     if head_seq is not None:
         head_c = head_seq.get_callable()
-        load_weight_buffer(head_c.get_buffer("W_head"), weights["W_head"])
+        load_weight_buffer(head_c.get_buffer("W_head"), weights.pop("W_head"))
         head_c.scratch_buffer.device = "cpu"
         head_c.scratch_buffer.to("npu")
         print(f"[verify] lm-head split into its own dispatch ({head_seq.name})", file=sys.stderr)
