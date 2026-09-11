@@ -287,6 +287,16 @@ FUSE_DECODE_LAYER = os.environ.get("FUSE_DECODE_LAYER", "1") == "1"
 # byte-for-byte the pre-existing graph and meta.json; params.txt (read further down) picks up the
 # new parameter's real offset for free once this is on, so the meta writer never hardcodes one.
 DYNAMIC_WINDOW = os.environ.get("DYNAMIC_WINDOW", "0") == "1"
+# ATTN_SPLIT -- process the attention window in segments of this many positions, carrying the
+# softmax's running max/sum across them (split-K flash). sc/sw are then sized to a SEGMENT, so L1
+# stops scaling with max_seq and the 4544-position window cap goes away: `attn_block_dp` places at
+# max_seq=32768 with .text byte-identical to its 2048 build, because the segment loop is a runtime
+# loop. 0 (default) is one segment, byte for byte the pre-split design.
+#
+# The cap moves onto the SPLIT, and it is 4542 by the same arithmetic that used to bound the window
+# (65536 L1 minus 29196 of fixed terms, over the 8 B/position sc+sw cost). Must be a multiple of
+# lcm(stream-tile rows, kv block, 64).
+ATTN_SPLIT = int(os.environ.get("ATTN_SPLIT", "0"))
 # WINDOW_RUNGS -- extra attention windows, comma-separated, served from THE SAME ELF as named
 # control codes rather than as separate artifacts.
 #
@@ -415,6 +425,8 @@ def sequence_name(sp, NL, S, placer_flags, decode_layer_active=False, T=None):
     # copy of that logic is exactly the kind of drift this file's other suffixes warn about.
     if decode_layer_active:
         parts.append("declayer")
+    if ATTN_SPLIT:
+        parts.append(f"sp{ATTN_SPLIT}")
     if WEIGHT_DEPTH != 2:
         parts.append(f"wd{WEIGHT_DEPTH}")
     if MLP_TILE_ROWS:
@@ -802,6 +814,29 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
                   "needs FUSE_QKV_GEMV=1 for the concatenated Wqkv" if not FUSE_QKV_GEMV else
                   sp.qkv_dp_reason(COLS))
     mlp_dp_why = "FUSE_MLP_DP=0" if not FUSE_MLP_DP else sp.mlp_dp_reason()
+
+    # HOISTED ABOVE THE UNFUSED ATTENTION OPERATORS, and the move is load-bearing rather than
+    # tidy-up. When the fused layer wins, op_rep_k/op_rep_v/op_scores/op_softmax/op_trv/op_ctx are
+    # constructed and then never reach a runlist -- every use of them is inside the `else` arm
+    # below. Constructing them anyway means their CONSTRAINTS still gate the build, and TMatVec's
+    # in particular is a window cap the fused arm does not have: its W buffer is batch_group*K, so
+    # at K=32768 it is 131072 B against a 64 KB L1 and the build dies on a dead operator. Measured
+    # 2026-09-11 -- that is exactly what blocked the first 32k decode build, AFTER split-K had
+    # already placed attn_block_dp at the same window.
+    decode_layer_why = ("FUSE_DECODE_LAYER=0" if not FUSE_DECODE_LAYER else
+                        qkv_dp_why if qkv_dp_why else
+                        mlp_dp_why if mlp_dp_why else
+                        "needs FUSE_MLP_O=1 (Wo's padding is wired through that flag via "
+                        "op_mlp_dp._wo_rows_padded, and decode_layer_dp always fuses Wo)"
+                        if not FUSE_MLP_O else
+                        f"needs Hkv ({Hkv}) == COLS ({COLS})" if Hkv != COLS else
+                        "needs SCALE_IN_QNORM=1 (attn_block_dp has no separate scale stage)"
+                        if not (SCALE_IN_QNORM and sp.qk_norm) else
+                        "needs GQA_GROUPED_K=1 and TMV_CTX=1 (attn_block_dp computes exactly "
+                        "that variant internally)" if not (GROUPED_K and TMV_CTX) else
+                        "needs QUANT_MLP_DTYPE=bf16 and QUANT_ATTN_DTYPE=bf16 (plain-bf16 kernel "
+                        "archive, no quantized-weight variant)"
+                        if QUANT_MLP_DTYPE != "bf16" or QUANT_ATTN_DTYPE != "bf16" else None)
     fuse_o = FUSE_MLP_O and mlp_dp_why is None
     for arm, why in (("qkv_head_dp", qkv_dp_why), ("swiglu_mlp_dp", mlp_dp_why)):
         print(f"[gen] fused arm {arm}: {'OFF -- ' + why if why else 'on'}")
@@ -866,63 +901,70 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
     # "read/write a narrower window of a wider-strided buffer" is new IRON capability, not a
     # generator change. Bucketing S UNIFORMLY (this build already takes it as `max_seq`) is the
     # route that needs none.
-    op_rep_k = Repeat(rows=Hkv, cols=S * HD, repeat=sp.gqa_group, transfer_size=HD, context=ctx)
-    op_rep_v = Repeat(rows=Hkv, cols=S * HD, repeat=sp.gqa_group, transfer_size=HD, context=ctx)
-    op_scores = gemv(S, HD, ctx, num_batches=Hq,
-                     batch_group=sp.gqa_group if GROUPED_K else 1, block_size=T,
-                     alloc_M=None if KVA == S else KVA)
-    # Folded into n_qn when SCALE_IN_QNORM; built anyway so the A/B arm stays reachable.
+    # Only when the unfused arm will actually RUN them: see decode_layer_why's hoist above. `None`
+    # rather than skipped names, so a use that escapes the `else` arm is an immediate TypeError
+    # naming the operator instead of a NameError three frames away.
+    # Read at the weight-folding site and in the unfused runlist alike, so it stays OUTSIDE the
+    # guard below: it is a decision about how n_qn is built, not an unfused-operator detail.
     scale_in_qnorm = SCALE_IN_QNORM and sp.qk_norm
-    op_scale = (None if scale_in_qnorm else
-                ElementwiseMul(size=Hq * S, tile_size=S // COLS, num_aie_columns=COLS,
-                               context=ctx))
-    # Not COLS: with fewer q heads than columns each core gets less than one tile and the
-    # op computes nothing (IRON raises). Gemma-3's 4 heads run at 4 columns.
-    op_softmax = Softmax(rows=Hq, cols=S, num_aie_columns=sp.softmax_cols(COLS),
-                         num_channels=1, rtp_vector_size=S,
-                         vector_size_parameter="sm_mask", context=ctx)
-    # num_batches=Hq, not Hq separate invocations. transpose/design.py's L3 tensors already hold
-    # "num_batches contiguous (M,N) matrices stacked along the row dimension", which is EXACTLY what
-    # vr/vt are; calling it per head issued 448 configure+run pairs per token to do 28 ops' work.
-    #
-    # It is NOT a speed fix and must not be quoted as one. Isolated on device against the same
-    # placer: -0.01 ms/token, 0.0%. Dropping 420 dispatches per token is worth nothing measurable,
-    # because these are mode selections inside ONE hardware context. Kept because it is correct,
-    # free, and 2.2 MB smaller in the ELF -- not because it is faster.
-    # 4, not COLS: Transpose splits N across columns as `N // num_columns // n`, and at N=HD=128
-    # with n=32 that is 4 tiles, so 8 columns divides to ZERO. Its __post_init__ does not catch it
-    # -- it checks M*N % (m*n*cols*channels), which 8 satisfies -- and the failure surfaces deep in
-    # taplib as "All sizes must be >= 1, but got [8, 0, 256, 32]", naming no operator and no
-    # parameter. 4 is the real ceiling at this n; raising it needs n=16.
-    # GQA broadcast as an ACCESS PATTERN instead of a materialised copy. gqa_group query heads
-    # attend to one kv head; with batch_group the consumer reads that head directly and the Repeat
-    # that duplicated it into DDR disappears. Opt-in per side because k and v are not the same edit
-    # (k: Repeat feeds the GEMV; v: Repeat feeds a Transpose that feeds the GEMV), so they must be
-    # gated separately to stay attributable in an A/B ladder.
-    op_trv = Transpose(M=S, N=HD, num_aie_columns=4, num_channels=1, m=256, n=32, s=8,
-                       num_batches=Hq, batch_group=sp.gqa_group if GROUPED_V else 1, context=ctx)
-    # CONTEXT STEP. op_trv exists only because gemv reduces ALONG a row: it wants [HD][S] and the
-    # cache is [S][HD], so the whole cache is rearranged every token -- 16.777 MB/layer measured, at
-    # 0% compute. TMatVec reduces DOWN the rows instead and reads `vc` as it is stored, so the
-    # transpose has nothing left to do. One kv head per column (n_matrices == cols == Hkv), so each
-    # column streams its own head ONCE and applies both query heads' softmax rows out of L1 -- the
-    # stride-0 group re-read goes too. rows_per_chunk=64 puts the L1 A tile at 16 KB double-buffered.
-    if TMV_CTX:
-        # TMV_RPC is a CAP, not the value: the largest chunk that fits L1 depends on head_dim, and
-        # 64 is right for Qwen3's HD=128 and too big for Gemma-3's 256. check_l1_fits is the
-        # operator's own arithmetic, so ask it rather than carrying a second copy of the L1 model
-        # here -- or an env constant that was correct for one model and silently wrong for the next.
-        from iron.operators.tmatvec.design import check_l1_fits
-        rpc = TMV_RPC
-        while rpc > 1 and (S % rpc or check_l1_fits(HD, S, sp.gqa_group, rpc) is not None):
-            rpc //= 2
-        if rpc != TMV_RPC:
-            print(f"[gen] TMatVec rows_per_chunk {TMV_RPC} -> {rpc} (L1 fit at head_dim={HD})")
-        op_ctx = TMatVec(M=HD, K=S, num_aie_columns=Hkv, num_batches=Hq,
-                         batch_group=sp.gqa_group, alloc_K=None if KVA == S else KVA,
-                         rows_per_chunk=rpc, context=ctx, block_size=T)
-    else:
-        op_ctx = gemv(HD, S, ctx, num_batches=Hq)
+    op_rep_k = op_rep_v = op_scores = op_scale = op_softmax = op_trv = op_ctx = None
+    if decode_layer_why is not None:
+        op_rep_k = Repeat(rows=Hkv, cols=S * HD, repeat=sp.gqa_group, transfer_size=HD, context=ctx)
+        op_rep_v = Repeat(rows=Hkv, cols=S * HD, repeat=sp.gqa_group, transfer_size=HD, context=ctx)
+        op_scores = gemv(S, HD, ctx, num_batches=Hq,
+                         batch_group=sp.gqa_group if GROUPED_K else 1, block_size=T,
+                         alloc_M=None if KVA == S else KVA)
+        # Folded into n_qn when SCALE_IN_QNORM; built anyway so the A/B arm stays reachable.
+        op_scale = (None if scale_in_qnorm else
+                    ElementwiseMul(size=Hq * S, tile_size=S // COLS, num_aie_columns=COLS,
+                                   context=ctx))
+        # Not COLS: with fewer q heads than columns each core gets less than one tile and the
+        # op computes nothing (IRON raises). Gemma-3's 4 heads run at 4 columns.
+        op_softmax = Softmax(rows=Hq, cols=S, num_aie_columns=sp.softmax_cols(COLS),
+                             num_channels=1, rtp_vector_size=S,
+                             vector_size_parameter="sm_mask", context=ctx)
+        # num_batches=Hq, not Hq separate invocations. transpose/design.py's L3 tensors already hold
+        # "num_batches contiguous (M,N) matrices stacked along the row dimension", which is EXACTLY what
+        # vr/vt are; calling it per head issued 448 configure+run pairs per token to do 28 ops' work.
+        #
+        # It is NOT a speed fix and must not be quoted as one. Isolated on device against the same
+        # placer: -0.01 ms/token, 0.0%. Dropping 420 dispatches per token is worth nothing measurable,
+        # because these are mode selections inside ONE hardware context. Kept because it is correct,
+        # free, and 2.2 MB smaller in the ELF -- not because it is faster.
+        # 4, not COLS: Transpose splits N across columns as `N // num_columns // n`, and at N=HD=128
+        # with n=32 that is 4 tiles, so 8 columns divides to ZERO. Its __post_init__ does not catch it
+        # -- it checks M*N % (m*n*cols*channels), which 8 satisfies -- and the failure surfaces deep in
+        # taplib as "All sizes must be >= 1, but got [8, 0, 256, 32]", naming no operator and no
+        # parameter. 4 is the real ceiling at this n; raising it needs n=16.
+        # GQA broadcast as an ACCESS PATTERN instead of a materialised copy. gqa_group query heads
+        # attend to one kv head; with batch_group the consumer reads that head directly and the Repeat
+        # that duplicated it into DDR disappears. Opt-in per side because k and v are not the same edit
+        # (k: Repeat feeds the GEMV; v: Repeat feeds a Transpose that feeds the GEMV), so they must be
+        # gated separately to stay attributable in an A/B ladder.
+        op_trv = Transpose(M=S, N=HD, num_aie_columns=4, num_channels=1, m=256, n=32, s=8,
+                           num_batches=Hq, batch_group=sp.gqa_group if GROUPED_V else 1, context=ctx)
+        # CONTEXT STEP. op_trv exists only because gemv reduces ALONG a row: it wants [HD][S] and the
+        # cache is [S][HD], so the whole cache is rearranged every token -- 16.777 MB/layer measured, at
+        # 0% compute. TMatVec reduces DOWN the rows instead and reads `vc` as it is stored, so the
+        # transpose has nothing left to do. One kv head per column (n_matrices == cols == Hkv), so each
+        # column streams its own head ONCE and applies both query heads' softmax rows out of L1 -- the
+        # stride-0 group re-read goes too. rows_per_chunk=64 puts the L1 A tile at 16 KB double-buffered.
+        if TMV_CTX:
+            # TMV_RPC is a CAP, not the value: the largest chunk that fits L1 depends on head_dim, and
+            # 64 is right for Qwen3's HD=128 and too big for Gemma-3's 256. check_l1_fits is the
+            # operator's own arithmetic, so ask it rather than carrying a second copy of the L1 model
+            # here -- or an env constant that was correct for one model and silently wrong for the next.
+            from iron.operators.tmatvec.design import check_l1_fits
+            rpc = TMV_RPC
+            while rpc > 1 and (S % rpc or check_l1_fits(HD, S, sp.gqa_group, rpc) is not None):
+                rpc //= 2
+            if rpc != TMV_RPC:
+                print(f"[gen] TMatVec rows_per_chunk {TMV_RPC} -> {rpc} (L1 fit at head_dim={HD})")
+            op_ctx = TMatVec(M=HD, K=S, num_aie_columns=Hkv, num_batches=Hq,
+                             batch_group=sp.gqa_group, alloc_K=None if KVA == S else KVA,
+                             rows_per_chunk=rpc, context=ctx, block_size=T)
+        else:
+            op_ctx = gemv(HD, S, ctx, num_batches=Hq)
     # MLP weight-stream dtype axis (Wg/Wu/Wd -- "MLP weights" in the byte breakdown, the largest
     # single weight class). bf16 (default) is byte-for-byte the pre-existing path; QUANT_MLP_DTYPE
     # is an engineering-check toggle (see its definition above), not a quality-validated default.
@@ -960,20 +1002,6 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
     # quantized weight stream (its kernel archive is plain bf16 mv.cc, built once, not per weight
     # dtype -- see get_kernel_artifacts in iron/operators/decode_layer_dp/op.py).
     op_decode_layer = None
-    decode_layer_why = ("FUSE_DECODE_LAYER=0" if not FUSE_DECODE_LAYER else
-                        qkv_dp_why if qkv_dp_why else
-                        mlp_dp_why if mlp_dp_why else
-                        "needs FUSE_MLP_O=1 (Wo's padding is wired through that flag via "
-                        "op_mlp_dp._wo_rows_padded, and decode_layer_dp always fuses Wo)"
-                        if not FUSE_MLP_O else
-                        f"needs Hkv ({Hkv}) == COLS ({COLS})" if Hkv != COLS else
-                        "needs SCALE_IN_QNORM=1 (attn_block_dp has no separate scale stage)"
-                        if not (SCALE_IN_QNORM and sp.qk_norm) else
-                        "needs GQA_GROUPED_K=1 and TMV_CTX=1 (attn_block_dp computes exactly "
-                        "that variant internally)" if not (GROUPED_K and TMV_CTX) else
-                        "needs QUANT_MLP_DTYPE=bf16 and QUANT_ATTN_DTYPE=bf16 (plain-bf16 kernel "
-                        "archive, no quantized-weight variant)"
-                        if QUANT_MLP_DTYPE != "bf16" or QUANT_ATTN_DTYPE != "bf16" else None)
     rung_ops = {}
     if decode_layer_why is None:
         from iron.operators.decode_layer_dp.op import DecodeLayerDataParallel
@@ -998,6 +1026,10 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
                 # 2026-09-10: it broke every decode build on the default path, DYNAMIC_WINDOW=0
                 # included, because an unknown kwarg fails at the call and never reaches the flag
                 # test inside.
+                # Conditional for the SAME reason window_parameter is: an unknown kwarg is a
+                # TypeError at the call against any IRON whose decode_layer_dp predates the field,
+                # and it never reaches the flag test inside.
+                **({"attn_split": ATTN_SPLIT} if ATTN_SPLIT else {}),
                 **({"window_parameter": "attn_window"} if DYNAMIC_WINDOW else {}))
 
         op_decode_layer = _decode_layer(S)
