@@ -20,6 +20,8 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LAYERS="${1:-12}"
 OUT="${2:-$REPO/artifacts/fused_decode12}"
+. "$REPO/scripts/require_disk_backed.sh"
+require_disk_backed "$OUT" "OUT (the built artifact)" || exit 1
 VENV_IRON="${VENV_IRON:-$REPO/.venv-iron}"
 . "$REPO/scripts/amd_paths.sh"       # -> IRON_DIR, AIEBU_ASM_DIR (relocatable; env-overridable)
 IRON="${IRON:-$IRON_DIR}"

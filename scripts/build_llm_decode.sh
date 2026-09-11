@@ -16,6 +16,8 @@ WS="$(cd "$REPO/.." && pwd)"
 SPEC="${1:?usage: build_llm_decode.sh <spec> [LAYERS] [OUT]}"
 LAYERS="${2:-}"
 OUT="${3:-$REPO/artifacts/$SPEC/decode${LAYERS:+_l$LAYERS}}"
+. "$REPO/scripts/require_disk_backed.sh"
+require_disk_backed "$OUT" "OUT (the built artifact)" || exit 1
 VENV_IRON="${VENV_IRON:-$REPO/.venv-iron}"
 [ -x "$VENV_IRON/bin/python" ] || VENV_IRON="$WS/xdna-engine/.venv-iron"
 . "$REPO/scripts/amd_paths.sh"        # -> IRON_DIR, AIEBU_ASM_DIR (relocatable; env-overridable)

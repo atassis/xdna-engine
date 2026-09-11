@@ -347,7 +347,16 @@ class ARHParams:
     fast_has_project_in: bool = False
     has_fast_decoder: bool = False
 
-    im_end_id: int = -1  # tokenizer special token, not in this GGUF's hparams; caller-supplied
+    # The chat-turn terminator, `<|im_end|>` = 151645 on this checkpoint, from tokenizer.json's
+    # added_tokens -- what s2.cpp resolves and appends when BUILDING the prompt, so both sides of
+    # generation use the same id. NOT in the GGUF hparams, so a caller must supply it.
+    #
+    # It must NOT be filled from `fish_speech.audio_pad_token_id` (151677): the tokenizer names
+    # that `<|audio_pad|>`, a PAD rather than a terminator. The audio terminator is a third token
+    # again, `<|audio_end|>` 151676, declared nowhere in the GGUF and used by neither
+    # implementation. The AR half gates against this reference, so taking the pad id made a pad
+    # the gate's stop token.
+    im_end_id: int = -1
 
     @property
     def head_dim(self) -> int:
@@ -399,7 +408,7 @@ def read_ar_hparams(gg: GGUFFile) -> ARHParams:
         hp.fast_rms_norm_eps = float(g("fish_speech.fast_layer_norm_rms_eps", 1e-6))
         hp.fast_attention_qk_norm = bool(g("fish_speech.fast_attention_qk_norm", False))
         hp.fast_has_project_in = bool(g("fish_speech.fast_project_in", False))
-    hp.im_end_id = int(g("fish_speech.audio_pad_token_id", -1))
+    # im_end_id is deliberately NOT set here -- see its declaration.
     return hp
 
 
@@ -768,6 +777,13 @@ def generate_greedy(hp: ARHParams, w: ARWeights, prompt: np.ndarray, max_new_tok
     prompt-template construction is out of scope, see module docstring). Returns
     codes: (num_codebooks, n_frames) int array, matching s2::GenerateResult.codes' layout."""
     sem_lo, sem_hi = hp.semantic_begin_id, hp.semantic_end_id
+    if hp.im_end_id < 0:
+        # Loud, because the failure is otherwise invisible: with no stop token the loop below can
+        # only end at max_new_tokens, and every run looks like a model that never stops rather
+        # than a caller that forgot an id.
+        print("[s2_ar_ref] WARNING: hp.im_end_id is unset, so generation can only stop at "
+              "max_new_tokens and <|im_end|> is absent from the LM-head mask. Pass the "
+              "tokenizer's id (151645 on this checkpoint); it is not in the GGUF.", flush=True)
     mask_row_ids = np.arange(sem_lo, sem_hi + 1)
     if hp.im_end_id >= 0:
         mask_row_ids = np.concatenate([mask_row_ids, [hp.im_end_id]])
