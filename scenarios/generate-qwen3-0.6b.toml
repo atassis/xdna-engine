@@ -2,28 +2,28 @@
 kind = "generate"
 name = "qwen3-0.6b"
 
-# Root-relative like every other scenario here: paths resolve against XDNA_ENGINE_ROOT under the
-# service and against the repo in-tree, so one file works in both. The first version of this
-# scenario named absolute paths -- first into a session scratchpad under /tmp, then into this
-# developer's home -- and neither survives being installed anywhere else.
+# The SAME model as `qwen3-0.6b-dynwindow`, and ONE artifact, but the ELF carries FIVE named
+# control codes instead of one: `main:sequence` at window 4096 plus `main:sequence_w{256,512,
+# 1024,2048}`. XRT resolves a control code by kernel name against the one hw_context the ELF
+# registers, so the rungs cost extra ELF and neither a context nor a rebuild.
 #
-#   decode     scripts/build_llm_decode.sh qwen3-0.6b   (fused 28-layer ELF + meta.json, ~3.4 min)
-#   weights    scripts/dump_llm_weights.py --spec qwen3-0.6b --out artifacts/qwen3-0.6b/weights
-#   tokenizer  the HF snapshot dir: tokenizer.json, config.json, generation_config.json
+# WHAT A RUNG FIXES. `qwen3-0.6b-dynwindow` takes its attention window from a scratchpad parameter
+# per dispatch, but only the CORE does -- the shim's KV fill size is a static BD field, so it
+# streams the whole built window every token and a drain discards the surplus. That is the entire
+# measured regression against `qwen3-0.6b-buckets`. A rung is a second decode-layer design at a
+# narrower window over the SAME KV capacity, so the FILL follows the window too, quantised to the
+# rung rather than to the byte.
+#
+# The two mechanisms COMPOSE and neither replaces the other: the rung picks how many bytes the shim
+# streams (coarse, one of five), the scratchpad parameter picks how many positions the core attends
+# (fine, 128-position granule). Compute stays at 128 granularity at every position.
+#
+# Against `qwen3-0.6b-buckets` this is the same byte behaviour from ONE hardware context instead of
+# four, one artifact instead of four, and no rebuild to add a window.
 [artifacts]
-decode = "artifacts/qwen3-0.6b/decode"
-# Batched prefill: primes the KV cache dims.M positions per dispatch instead of one per token.
-# Optional -- drop this line and the rail falls back to per-token priming with no other change.
-# The pair is checked at load (dims, RoPE base, embed scale, S % M, and every shared scratch
-# offset), so a prefill built against a different decode build is refused rather than mis-bound.
-#   prefill  scripts/build_prefill.sh 28 256 2048
-prefill = "artifacts/qwen3-0.6b/prefill"
+decode = "artifacts/qwen3-0.6b/rungs4096"
 weights = "artifacts/qwen3-0.6b/weights"
 tokenizer_dir = "artifacts/qwen3-0.6b/tokenizer"
 
-# Per-model completion budget, applied when a request omits `max_tokens`; an explicit request value
-# still wins, in both directions. 256 (the engine default, OpenAI's number) is the wrong default for
-# a reasoning model: Qwen3 opens a `<think>` block and at 256 the whole budget goes to reasoning with
-# no answer ever emitted -- see 8398acb, which fixed the template half of that same problem.
 [generation]
 max_tokens = 1024
