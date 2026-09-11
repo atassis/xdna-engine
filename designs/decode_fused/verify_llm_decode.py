@@ -30,7 +30,8 @@ import ml_dtypes
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import newstack_compat  # noqa: F401,E402
-from gen_llm_decode import build_graph, report_artifact_freshness, load_weight_buffer, isolate_build_dir  # noqa: E402
+from gen_llm_decode import (build_graph, report_artifact_freshness, load_weight_buffer,  # noqa: E402
+                            isolate_build_dir, QUANT_MLP_DTYPE, QUANT_MLP_GROUP)
 from redispatch_check import assert_redispatch_identical  # noqa: E402
 
 BF16 = ml_dtypes.bfloat16
@@ -168,6 +169,29 @@ def main():
         raise SystemExit(
             f"reference was captured at layers={ref_layers} but this build is layers={a.layers}. "
             f"Re-capture with scripts/llm_hf_bf16_ref.py --layers {a.layers}.")
+    # The reference's WEIGHT FORMAT, checked the same way and for the same reason as its depth: a
+    # format disagreement presents as a token mismatch, which reads as a device defect. It is not.
+    # An int4 arm gated against a bf16 oracle cost this project a bisect for a bug that was not
+    # there -- symmetric RTN int4 is 12.3% weight rel-L2 against a gate whose margins are 4.0/2.0/
+    # 0.0. `quant` is absent on refs captured before it was recorded, and absent means bf16.
+    if not a.smoke_prompt:
+        rq = ref.get("quant") or {"dtype": "bf16", "group": 0}
+        # Same authority order build_graph uses: a packed dump's quant.json wins over the env,
+        # because the bytes are already on disk in it. Read here rather than importing the
+        # generator's module globals, which the manifest only overrides once build_graph runs --
+        # and the point of this check is to fire BEFORE the build is paid for.
+        _qm = os.path.join(a.weights, "quant.json")
+        bq = ({"dtype": (_j := json.load(open(_qm)))["dtype"], "group": int(_j["group_size"])}
+              if os.path.isfile(_qm) else {"dtype": QUANT_MLP_DTYPE, "group": QUANT_MLP_GROUP})
+        if (rq["dtype"], int(rq["group"])) != (bq["dtype"], int(bq["group"])) and not (
+                rq["dtype"] == "bf16" and bq["dtype"] == "bf16"):
+            raise SystemExit(
+                f"reference is {rq['dtype']} g{rq['group']} but this build's MLP weight format is "
+                f"{bq['dtype']} g{bq['group']}. Exact token parity across two weight formats is "
+                f"not a defect test -- it charges the implementation for the format's own error. "
+                f"Re-capture with scripts/llm_hf_bf16_ref.py --quant-dtype {bq['dtype']} "
+                f"--quant-group {bq['group']}, or build at the reference's format.")
+
     prompt_ids, gen_ids = ref["prompt_ids"], ref["gen_ids"]
     margins = ref.get("margins")
     hf_ids = ref.get("hf_f32_gen_ids")

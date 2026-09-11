@@ -27,6 +27,7 @@ all. A gate that cannot execute against the model it gates is not a gate.
 import argparse
 import json
 import os
+import sys
 
 
 def main():
@@ -47,6 +48,19 @@ def main():
                     help="truncate the model to the first N decoder layers, to gate a build made "
                          "with the same --layers. `layer_types` is truncated with it, so the "
                          "sliding/global pattern stays the one the generator used.")
+    ap.add_argument("--quant-dtype", default="bf16", choices=("bf16", "int4", "int8"),
+                    help="apply the SHIPPED packer's quantize->dequantize to the projection "
+                         "weights before the forward, so the reference is in the same weight "
+                         "format the device build will run. A quantized device cannot be gated on "
+                         "exact tokens against a bf16 oracle -- the format's own error is real and "
+                         "expected, and charging the implementation for it is how "
+                         "[[the-gemma4-int4-failure-is-the-format-not-the-path]] cost a bisect. "
+                         "With this set, device-vs-reference exact parity isolates the "
+                         "IMPLEMENTATION, and the format's cost is a separate host measurement.")
+    ap.add_argument("--quant-group", type=int, default=128)
+    ap.add_argument("--quant-leaves", default="gate_proj,up_proj,down_proj,o_proj,q_proj,k_proj,v_proj",
+                    help="projection leaves to quantize; must match what the build quantizes "
+                         "(QUANT_MLP/ATTN/QKV_DTYPE, or the dump's quant.json)")
     ap.add_argument("--f32-contrast", action="store_true",
                     help="also run an f32 pass for contrast (loads a SECOND copy of the weights; "
                          "see the module docstring for why this is off by default)")
@@ -98,6 +112,45 @@ def main():
         kw["config"].get_text_config().final_logit_softcapping = None
     model = AutoModelForCausalLM.from_pretrained(a.model, dtype=torch.bfloat16, **kw).eval()
 
+    quant_stats = None
+    if a.quant_dtype != "bf16":
+        # The packer IS the kernel's on-wire format (iron/operators/gemv/quant.py, byte-for-byte
+        # with mv_quant.cc), so a roundtrip through it reproduces exactly the numbers the device
+        # computes with -- not an approximation of them.
+        import numpy as np
+        sys.path.insert(0, os.environ.get("IRON_DIR", os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "..", "wt-iron-integ")))
+        from iron.operators.gemv.quant import quantize_weight, dequantize_weight
+
+        leaves = {x for x in a.quant_leaves.split(",") if x}
+        errs, skipped = [], []
+        with torch.no_grad():
+            for name, mod in model.named_modules():
+                if (name.split(".")[-1] not in leaves or not hasattr(mod, "weight")
+                        or mod.weight is None or mod.weight.ndim != 2):
+                    continue
+                W = mod.weight.detach().float().numpy()
+                if W.shape[1] % a.quant_group:
+                    skipped.append(name)
+                    continue
+                Wq = dequantize_weight(quantize_weight(W, a.quant_group, a.quant_dtype),
+                                       *W.shape, a.quant_group, a.quant_dtype)
+                errs.append(float(np.linalg.norm(Wq - W) / max(np.linalg.norm(W), 1e-30)))
+                mod.weight.copy_(torch.from_numpy(Wq).to(model.dtype))
+                del W, Wq
+        if not errs:
+            raise SystemExit(f"--quant-dtype {a.quant_dtype} matched NO tensor from "
+                             f"--quant-leaves {sorted(leaves)}. A reference that silently skipped "
+                             f"quantization would gate the device against the wrong format.")
+        quant_stats = {"dtype": a.quant_dtype, "group": a.quant_group,
+                       "tensors": len(errs), "leaves": sorted(leaves),
+                       "mean_weight_rel_l2": float(np.mean(errs)),
+                       "max_weight_rel_l2": float(np.max(errs)),
+                       "skipped_not_group_aligned": skipped}
+        print(f"[ref] quantized {len(errs)} tensors at {a.quant_dtype} g{a.quant_group}; "
+              f"mean weight rel-L2 {np.mean(errs):.4e}"
+              + (f"; SKIPPED {len(skipped)} not group-aligned" if skipped else ""))
+
     ids = tok(a.prompt, return_tensors="pt").input_ids
     prompt_ids = ids[0].tolist()
 
@@ -141,6 +194,10 @@ def main():
         "prompt_ids": prompt_ids,
         "gen_ids": gen_ids,
         "margins": margins,
+        # The weight FORMAT this reference was computed in. null = bf16. The device harness must
+        # refuse a build whose format disagrees, for the same reason the softcap setting lives
+        # here: a format disagreement presents as a token mismatch, not as a config error.
+        "quant": quant_stats,
         "hf_f32_gen_ids": hf32,   # null unless --f32-contrast; it is a contrast, never the gate
         "note": "Faithful bf16 host forward via the checkpoint's own modeling code -- the oracle a "
                 "bf16 DEVICE should match 1:1. `margins` is top1-top2 per step: a mismatch at a "
