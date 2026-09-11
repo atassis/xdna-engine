@@ -21,6 +21,11 @@ implementation of the same model.
       --weights artifacts/qwen3-0.6b/weights --text some.txt --max-tokens 1024
 
 Single-tenant; arm is selected by the same env flags gen_llm_decode.py reads.
+
+--ids takes pre-tokenized ids (tokenize_corpus.py's output) instead of --text, for a tokenizer
+qwen_bpe.py cannot read (Gemma's). --ref-nll/--ref-meta pair this run against a PRIOR run's
+--dump-nll output on the SAME corpus and positions: paired, not two bare perplexities, using
+hostlab/pairwise.py's stat so an arm-vs-bf16 verdict is one command, not a second script.
 """
 import argparse
 import json
@@ -33,11 +38,13 @@ import numpy as np
 import ml_dtypes
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "hostlab"))
 import newstack_compat  # noqa: F401,E402
 from verify_llm_decode import window_len  # noqa: E402 -- one owner for the rounding
 from gen_llm_decode import (build_graph, report_artifact_freshness,  # noqa: E402
                             load_weight_buffer, isolate_build_dir)
 from qwen_bpe import QwenBPE  # noqa: E402
+from pairwise import paired  # noqa: E402 -- one owner for the paired-comparison stat
 from iron.common.kv_layout import KVLayout  # noqa: E402
 
 BF16 = ml_dtypes.bfloat16
@@ -68,7 +75,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--spec", required=True)
     ap.add_argument("--weights", required=True)
-    ap.add_argument("--text", required=True, help="UTF-8 corpus file")
+    ap.add_argument("--text", default=None, help="UTF-8 corpus file, tokenized here with QwenBPE "
+                                                 "-- Qwen-family specs only")
+    ap.add_argument("--ids", default=None, help="pre-tokenized ids (tokenize_corpus.py's json "
+                                                "output), for a spec QwenBPE cannot read")
     ap.add_argument("--tokenizer", default=None, help="tokenizer.json (default: the HF cache)")
     ap.add_argument("--ref", default=None, help="oracle json; if given, the tokenizer self-tests "
                                                 "against its prompt_ids before anything runs")
@@ -77,21 +87,30 @@ def main():
     ap.add_argument("--max-seq", type=int, default=2048)
     ap.add_argument("--out-json", default=None)
     ap.add_argument("--dump-nll", default=None, help="per-position NLL .npy -- the arms share a\n                    corpus and positions, so a PAIRED comparison is available and a difference of\n                    two means is not the right test")
+    ap.add_argument("--ref-nll", default=None, help="a PRIOR run's --dump-nll .npy (e.g. the bf16\n                    control) on the SAME corpus and positions -- paired-compares this run against it")
+    ap.add_argument("--ref-meta", default=None, help="that prior run's --out-json, checked for\n                    corpus/position agreement before the pairing is trusted")
     a = ap.parse_args()
+    if bool(a.text) == bool(a.ids):
+        raise SystemExit("[ppl] give exactly one of --text or --ids")
     isolate_build_dir("ppl")
     report_artifact_freshness(a.weights)
 
-    tj = a.tokenizer or os.path.expanduser(
-        "~/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots")
-    if os.path.isdir(tj):
-        tj = os.path.join(tj, sorted(os.listdir(tj))[0], "tokenizer.json")
-    if a.ref:
-        from qwen_bpe import self_test
-        self_test(tj, a.ref)
-        print(f"[ppl] tokenizer self-test PASS against {os.path.basename(a.ref)}")
-    tok = QwenBPE(tj)
-    ids = tok.encode(open(a.text, encoding="utf-8").read())
-    print(f"[ppl] corpus {a.text}: {len(ids)} tokens")
+    if a.ids:
+        ids = json.load(open(a.ids))
+        corpus_name = os.path.basename(a.ids)
+    else:
+        tj = a.tokenizer or os.path.expanduser(
+            "~/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots")
+        if os.path.isdir(tj):
+            tj = os.path.join(tj, sorted(os.listdir(tj))[0], "tokenizer.json")
+        if a.ref:
+            from qwen_bpe import self_test
+            self_test(tj, a.ref)
+            print(f"[ppl] tokenizer self-test PASS against {os.path.basename(a.ref)}")
+        tok = QwenBPE(tj)
+        ids = tok.encode(open(a.text, encoding="utf-8").read())
+        corpus_name = os.path.basename(a.text)
+    print(f"[ppl] corpus {corpus_name}: {len(ids)} tokens")
 
     sp, fused, weights, md = build_graph(a.spec, a.weights, a.layers, a.max_seq)
     S, HD, D, VOCAB = md["S"], sp.head_dim, sp.d_model, sp.vocab
@@ -153,7 +172,7 @@ def main():
 
     mean_nll = float(np.mean(nll))
     res = {
-        "spec": sp.name, "layers": md["NL"], "text": os.path.basename(a.text),
+        "spec": sp.name, "layers": md["NL"], "text": corpus_name,
         "n_scored": n, "mean_nll": mean_nll, "perplexity": math.exp(mean_nll),
         "top1_acc": top1_hits / n, "median_nll": float(np.median(nll)),
         # NOT a benchmark, and named so it cannot be quoted as one. No warmup, no alternation,
@@ -163,12 +182,32 @@ def main():
         # for timing; this is a progress indicator.
         "wall_s": wall, "harness_ms_per_position_NOT_A_BENCHMARK": 1000.0 * wall / n,
         "env": {k: os.environ.get(k) for k in
-                ("QUANT_MLP_DTYPE", "QUANT_MLP_GROUP", "FUSE_MLP_DP", "FUSE_QKV_DP")},
+                ("PRECISION", "QUANT_MLP_DTYPE", "QUANT_MLP_GROUP", "FUSE_MLP_DP", "FUSE_QKV_DP")},
     }
     print(f"\n[ppl] mean NLL {mean_nll:.6f}   PERPLEXITY {res['perplexity']:.4f}   "
           f"top-1 {100*res['top1_acc']:.2f}%   ({n} positions, "
           f"{res['harness_ms_per_position_NOT_A_BENCHMARK']:.1f} ms/pos -- harness rate, NOT a "
           f"decode benchmark: no warmup, and a host f64 log-softmax per position)")
+
+    if a.ref_nll:
+        # Paired, not two bare perplexities: the two runs share a corpus and positions, so the
+        # per-position DIFFERENCE is the powerful statistic (hostlab/README.md's own point).
+        # --ref-meta is optional but the only thing that catches a mismatched corpus/--max-tokens
+        # before it silently pairs position i of one run against position i of an unrelated one.
+        ref_arr = np.load(a.ref_nll)
+        if a.ref_meta:
+            rm = json.load(open(a.ref_meta))
+            if rm.get("text") != corpus_name or rm.get("n_scored") != n:
+                raise SystemExit(f"[ppl] --ref-meta mismatch: this run is {corpus_name} n={n}, "
+                                 f"ref is {rm.get('text')} n={rm.get('n_scored')}")
+        elif len(ref_arr) != n:
+            raise SystemExit(f"[ppl] --ref-nll has {len(ref_arr)} positions, this run scored {n} "
+                             "-- pass --ref-meta to check corpus agreement, or match --max-tokens")
+        pw = paired(np.asarray(nll, dtype=np.float64), ref_arr)
+        res["paired_vs_ref"] = pw
+        print(f"[ppl] vs ref: {pw['pct']:+.2f}% [{pw['ci'][0]:+.2f}, {pw['ci'][1]:+.2f}] "
+              f"t={pw['t']:.2f}  (n={pw['n']}, frac_worse={pw['frac_worse']:.3f})")
+
     if a.dump_nll:
         np.save(a.dump_nll, np.asarray(nll, dtype=np.float64))
         print(f"[ppl] per-position NLL -> {a.dump_nll}")
