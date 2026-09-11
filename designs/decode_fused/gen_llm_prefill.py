@@ -109,6 +109,7 @@ import json
 import os
 import shutil
 import sys
+from types import SimpleNamespace
 
 import numpy as np
 import ml_dtypes
@@ -283,22 +284,22 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
         stated = dm_early["dims"].get("wqkv_head_major")
         hm = bool(stated) if stated is not None else any(
             k.endswith("_norms") for k in dm_early["layout"])
-    # One kv head's run of rows, and where each role's block sits inside it.
-    qkv_group_rows = (grp + 2) * HD
-    qkv_blocking = {  # role -> (rows in one block, first row of the first block)
-        "q": (grp * HD, 0), "k": (HD, grp * HD), "v": (HD, (grp + 1) * HD),
-    } if hm else {}
-    print(f"[gen] prefill Wqkv row order: "
-          + (f"head-major, {grp}+1+1 head blocks of {HD} rows per kv head"
-             if hm else "stock [Wq|Wk|Wv]"))
+    print(f"[gen] prefill Wqkv row order: " + ("head-major" if hm else "stock [Wq|Wk|Wv]"))
 
-    # Op-types this graph does not carry. Named here rather than left to produce a plausible
-    # wrong answer: the golden below has no sandwich norms either, so the two would AGREE and the
-    # gate would pass on a model this graph cannot run.
-    if not sp.geometry_is_uniform():
-        raise ValueError(f"{sp.name}: two attention geometries (global_head_dim/global_n_kv_heads) "
-                         f"not in this graph's vocabulary -- every GEMM/RMSNorm/RoPE/Softmax below "
-                         f"is built once, sized off the spec's single head_dim/n_kv_heads")
+    # Every ATTENTION geometry this build touches: (head_dim, n_kv_heads, has_v_proj), one entry
+    # per distinct triple over all NL layers. Uniform for every spec except Gemma-4-12B, whose
+    # global layers are (512, 1, False) against the sliding (256, 8, True) -- has_v_proj is its own
+    # axis (attention_k_eq_v), not derived from the other two, for the reason
+    # gen_llm_decode.py:1262-1265 gives: a model where the two splits do not coincide would silently
+    # mis-key on a two-part key.
+    geoms = sorted({(sp.head_dim_for(l), sp.n_kv_heads_for(l), sp.has_v_proj(l))
+                    for l in range(NL)})
+    for hd, hkv, has_v in geoms:
+        g_grp = Hq // hkv
+        print(f"[gen] geometry head_dim={hd} n_kv_heads={hkv} has_v_proj={has_v}: "
+              + (f"head-major, {g_grp}+{2 if has_v else 1} head blocks of {hd} rows per kv head"
+                 if hm else "stock [Wq|Wk|Wv]"))
+
     if not sp.qk_norm:
         # Not a missing brick so much as a missing multiply: `attn_scale` rides on the shared
         # q-norm gain (decode's SCALE_IN_QNORM), so a spec without a q-norm has nowhere to put it
@@ -306,7 +307,7 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
         raise ValueError(f"{sp.name}: no per-head q-norm, so attn_scale has no gain to ride on; "
                          f"this graph has no separate score scale")
 
-    # ---- K007: every shape constraint asserted where the shape is picked ----
+    # ---- K007: every shape constraint asserted where the shape is picked, PER GEOMETRY ----
     # The GEMM tilings come from the registry below, at the point each GEMM is constructed --
     # `Registry.lookup` runs the same `gemm_tiling_rejection` these checks do, so a shape that
     # reaches an operator has already had its modulus, L1 and MemTile budgets named. What is left
@@ -315,21 +316,23 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
     # count, which is what makes the block convention the RIGHT one for a token-major tensor --
     # so these three moduli are the whole contract, and the fourth condition (that the buffer is
     # token-major) is structural and lives in the runlist.
-    if HD % 32 or HD < 32:
-        raise ValueError(f"rope: cols=head_dim={HD} must be a multiple of 32 and >= 32")
-    if M % cols:
-        raise ValueError(f"rope: angle_rows=M={M} must be divisible by num_aie_columns={cols}")
-    for label, heads in (("q", Hq), ("k", Hkv)):
-        if (M * heads) % cols:
-            raise ValueError(f"rope {label}: rows=M*heads={M * heads} must be divisible by "
-                             f"num_aie_columns={cols}")
-    for label, size in (("norm", M * D), ("qk-norm q", M * QD), ("qk-norm k", M * KVD)):
-        tile = D if label == "norm" else HD
-        if size % (cols * tile):
-            raise ValueError(f"RMSNorm {label}: size={size} not a multiple of "
-                             f"num_aie_columns*tile_size={cols * tile}")
-    if (Hq * M) % cols:
-        raise ValueError(f"Softmax rows=Hq*M={Hq * M} not divisible by num_aie_columns={cols}")
+    for hd, hkv, has_v in geoms:
+        qd, kvd = Hq * hd, hkv * hd
+        if hd % 32 or hd < 32:
+            raise ValueError(f"rope: cols=head_dim={hd} must be a multiple of 32 and >= 32")
+        if M % cols:
+            raise ValueError(f"rope: angle_rows=M={M} must be divisible by num_aie_columns={cols}")
+        for label, heads in (("q", Hq), ("k", hkv)):
+            if (M * heads) % cols:
+                raise ValueError(f"rope {label} @hd={hd}: rows=M*heads={M * heads} must be "
+                                 f"divisible by num_aie_columns={cols}")
+        for label, size in (("norm", M * D), ("qk-norm q", M * qd), ("qk-norm k", M * kvd)):
+            tile = D if label == "norm" else hd
+            if size % (cols * tile):
+                raise ValueError(f"RMSNorm {label} @hd={hd}: size={size} not a multiple of "
+                                 f"num_aie_columns*tile_size={cols * tile}")
+        if (Hq * M) % cols:
+            raise ValueError(f"Softmax rows=Hq*M={Hq * M} not divisible by num_aie_columns={cols}")
     if S % 16:
         raise ValueError(f"Softmax cols=S={S} must be a multiple of 16")
 
@@ -405,32 +408,125 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
     op_norm = RMSNorm(size=M * D, num_aie_columns=cols, num_channels=1, tile_size=D,
                       weighted=True, epsilon=sp.eps, context=ctx)
     # PREFILL_MERGE_QKNORM: run the q-norm as `grp` chunks of the K-NORM'S OWN DESIGN instead of
-    # one wider design of its own. Both normalise independent HD tiles, QD is exactly grp*KVD, and
-    # a chunk boundary at a multiple of HD never splits a tile -- so the arithmetic is identical
-    # and the q chunks and the k run become grp+1 ADJACENT runs of one design, which D009 charges
-    # as ONE configure instead of two. Predicted -28 configures on a 28-layer graph; at the
-    # measured 193.2 us that is -5.4 ms, and it was a forward test of that rate in the REDUCTION
-    # direction (it was measured by adding). MEASURED -4.87 ms, 3 alternated rounds,
-    # non-overlapping -- 90% of prediction -- and 14/14 on gate_llm.sh --tier2-prefill. Default ON
-    # since 2026-09-10; =0 restores the two-design form.
+    # one wider design of its own -- see `attn_ops` below for the per-geometry construction. Both
+    # normalise independent head_dim tiles, q_dim is exactly grp*kv_dim BY CONSTRUCTION (grp is
+    # q_heads//kv_heads for the SAME kv_heads that gives kv_dim, so the two cancel regardless of
+    # which geometry), and a chunk boundary at a multiple of head_dim never splits a tile -- so the
+    # arithmetic is identical and the q chunks and the k run become grp+1 ADJACENT runs of one
+    # design, which D009 charges as ONE configure instead of two. Predicted -28 configures on a
+    # 28-layer graph; at the measured 193.2 us that is -5.4 ms, and it was a forward test of that
+    # rate in the REDUCTION direction (it was measured by adding). MEASURED -4.87 ms, 3 alternated
+    # rounds, non-overlapping -- 90% of prediction -- and 14/14 on gate_llm.sh --tier2-prefill.
+    # Default ON since 2026-09-10; =0 restores the two-design form.
     merge_qknorm = os.environ.get("PREFILL_MERGE_QKNORM", "1") == "1"
-    if merge_qknorm and QD != grp * KVD:
-        raise ValueError(f"PREFILL_MERGE_QKNORM needs QD ({QD}) == gqa_group ({grp}) * KVD "
-                         f"({KVD}); this spec does not split evenly")
-    op_qn = RMSNorm(size=M * QD, num_aie_columns=cols, num_channels=1, tile_size=HD,
-                    weighted=True, epsilon=sp.eps, context=ctx)
-    op_kn = RMSNorm(size=M * KVD, num_aie_columns=cols, num_channels=1, tile_size=HD,
-                    weighted=True, epsilon=sp.eps, context=ctx)
-    op_rq = RoPE(rows=M * Hq, cols=HD, angle_rows=M, num_aie_columns=cols, context=ctx)
-    op_rk = RoPE(rows=M * Hkv, cols=HD, angle_rows=M, num_aie_columns=cols, context=ctx)
-    op_gq = gemm_for("q", D, QD, blocking=(
-        (qkv_blocking["q"][0], qkv_group_rows * D) if hm else None))
-    # ONE design serves k and v (same shape, and under head-major the same block geometry -- only
-    # the slice base differs), and one serves gate and up, so the label is the pair.
-    # `GEMM_TILES_OVERRIDE` keys on these labels or on the registry key.
-    op_gkv = gemm_for("kv", D, KVD, blocking=(
-        (qkv_blocking["k"][0], qkv_group_rows * D) if hm else None))
-    op_o = gemm_for("o", QD, D)
+    # PREFILL_HEAD_SEAM=0 keeps the two head-axis rearranges. With them (the default) scores reads
+    # its A operand as a per-head SLICE of the token-major `q` and ctx writes its C the same way
+    # into `cxt`, at row pitch q_dim -- so `op_q2h` and `op_h2t` disappear entirely, with their two
+    # configures per layer and their 4.0 MB/layer of zero-compute DMA. Head selection stays a
+    # buffer SLICE, so the descriptor is head-independent and one design still serves all Hq.
+    seam = os.environ.get("PREFILL_HEAD_SEAM", "1") == "1"
+
+    # ---- attention op vocabulary, keyed on the layer's (head_dim, n_kv_heads, has_v_proj) ----
+    # Uniform for every shipped spec except Gemma-4-12B, which has two geometries. A memoized
+    # factory keeps the uniform case UNCHANGED (one cache entry, same objects every layer) and
+    # costs the non-uniform case one more entry rather than a rewrite -- same shape as
+    # gen_llm_decode.py's `attn_ops` (gen_llm_decode.py:1259).
+    multi_geom = len(geoms) > 1
+    _attn_cache = {}
+
+    def attn_ops(hd, hkv, has_v):
+        key = (hd, hkv, has_v)
+        if key in _attn_cache:
+            return _attn_cache[key]
+        qd, kvd, g_grp = Hq * hd, hkv * hd, Hq // hkv
+        if not has_v and not sp.v_norm:
+            raise ValueError(f"{sp.name}: head_dim={hd} has no v_proj (attention_k_eq_v) and no "
+                             f"v_norm to derive v from k -- this graph has no other mechanism to "
+                             f"populate V")
+        if merge_qknorm and qd != g_grp * kvd:
+            raise ValueError(f"PREFILL_MERGE_QKNORM needs q_dim ({qd}) == gqa_group ({g_grp}) * "
+                             f"kv_dim ({kvd}) at head_dim={hd}; this geometry does not split evenly")
+        sfx = f"_hd{hd}" if multi_geom else ""
+        op_qn = RMSNorm(size=M * qd, num_aie_columns=cols, num_channels=1, tile_size=hd,
+                        weighted=True, epsilon=sp.eps, context=ctx)
+        op_kn = RMSNorm(size=M * kvd, num_aie_columns=cols, num_channels=1, tile_size=hd,
+                        weighted=True, epsilon=sp.eps, context=ctx)
+        # Gemma-4's gainless value-norm rides the SAME design as op_kn (decode's identical move,
+        # gen_llm_decode.py:1305-1317): a weighted RMSNorm fed decode's shared `ones_h{hd}` gain is
+        # bit-identical to an unweighted one, and reusing the object -- not building a `weighted=
+        # False` twin -- makes the v-norm and k-norm runs one contiguous same-design block.
+        op_vn = op_kn if sp.v_norm else None
+        op_rq = RoPE(rows=M * Hq, cols=hd, angle_rows=M, num_aie_columns=cols, context=ctx)
+        op_rk = RoPE(rows=M * hkv, cols=hd, angle_rows=M, num_aie_columns=cols, context=ctx)
+        # One kv head's run of rows, and where each role's block sits inside it. A layer with no
+        # v_proj (attention_k_eq_v) concatenates grp+1 blocks, not grp+2 -- verified against the
+        # decode dump: L*_Wqkv is 62,914,560 B at sliding (grp+2=4 blocks) and 66,846,720 B at
+        # global (grp+1=17 blocks), not 70,778,880 (what grp+2 would give there).
+        qkv_rows = (g_grp + (2 if has_v else 1)) * hd
+        blocking = {"q": (g_grp * hd, 0), "k": (hd, g_grp * hd)}
+        if has_v:
+            blocking["v"] = (hd, (g_grp + 1) * hd)
+        op_gq = gemm_for(f"q{sfx}", D, qd, blocking=(
+            (blocking["q"][0], qkv_rows * D) if hm else None))
+        op_gkv = gemm_for(f"kv{sfx}", D, kvd, blocking=(
+            (blocking["k"][0], qkv_rows * D) if hm else None))
+        op_o = gemm_for(f"o{sfx}", qd, D)
+        # scores: B is the kv cache read as [N=S, K=hd] -> b_col_maj. ctx: the SAME bytes read as
+        # [K=S, N=hd] -> plain. `kv_T` is the SAME block size for every geometry -- the only shared
+        # arenas measured so far are flat (kv_T==S) on Gemma-4 and blocked on the uniform-geometry
+        # gemma3-270m, so a per-geometry T has never been exercised; assumed here, not verified.
+        kvl_g = KVLayout(Hkv=hkv, S=S, HD=hd, T=kv_T)
+        kv_blk = (kvl_g.T, kvl_g.block_stride) if kvl_g.T != kvl_g.S else None
+        op_sc = gemm_for(f"scores{sfx}", hd, S, blocking=kv_blk,
+                         extra=dict(a_row_stride=qd) if seam else {})
+        op_cx = gemm_for(f"ctx{sfx}", S, hd, b_col_maj=False, blocking=kv_blk,
+                         extra=dict(c_row_stride=qd) if seam else {})
+        # KV append. The cache is [hkv, S, hd] and `kv_off` is an element-unit BD offset, so M
+        # consecutive positions are M contiguous rows per head -- the M=1 BD with an extra outer
+        # dimension, not a new mechanism. The SOURCE is token-major [M, hkv, hd], so the (M, hkv)
+        # axes swap in the descriptor: input walks h fastest within a token, output walks m
+        # fastest within a head.
+        if kvl_g.T == kvl_g.S:
+            kv_in_sizes, kv_in_strides = (M, hkv, hd), (hkv * hd, hd, 1)
+            kv_out_sizes, kv_out_strides = (M, hkv, hd), (hd, kvl_g.head_stride, 1)
+        else:
+            if M % kvl_g.T:
+                raise ValueError(
+                    f"prefill batch M={M} is not a whole number of KV blocks (T={kvl_g.T}) at "
+                    f"head_dim={hd}; the append would straddle a block boundary mid-descriptor")
+            nb = M // kvl_g.T
+            kv_in_sizes = (nb, hkv, kvl_g.T, hd)
+            kv_in_strides = (kvl_g.T * hkv * hd, hd, hkv * hd, 1)
+            kv_out_sizes = (nb, hkv, kvl_g.T, hd)
+            kv_out_strides = (kvl_g.block_stride, kvl_g.head_stride, hd, 1)
+        op_kvapp = StridedCopy(
+            input_sizes=kv_in_sizes, input_strides=kv_in_strides, input_offset=0,
+            output_sizes=kv_out_sizes, output_strides=kv_out_strides, output_offset=0,
+            input_buffer_size=M * hkv * hd, output_buffer_size=kvl_g.total_elems,
+            transfer_size=pick_transfer(M * hkv * hd), num_aie_channels=1,
+            output_offset_parameter="kv_off", context=ctx)
+        # The head-axis seam, both directions -- only built (and only ever used) when `not seam`.
+        # See the module docstring for why these exist and what they cost; pure DMA, 0% compute.
+        op_q2h = op_h2t = None
+        if not seam:
+            op_q2h = StridedCopy(
+                input_sizes=(Hq, M, hd), input_strides=(hd, qd, 1), input_offset=0,
+                output_sizes=(Hq, M, hd), output_strides=(M * hd, hd, 1), output_offset=0,
+                input_buffer_size=M * qd, output_buffer_size=M * qd,
+                transfer_size=pick_transfer(M * qd), num_aie_channels=1, context=ctx)
+            op_h2t = StridedCopy(
+                input_sizes=(M, Hq, hd), input_strides=(hd, M * hd, 1), input_offset=0,
+                output_sizes=(M, Hq, hd), output_strides=(Hq * hd, hd, 1), output_offset=0,
+                input_buffer_size=M * qd, output_buffer_size=M * qd,
+                transfer_size=pick_transfer(M * qd), num_aie_channels=1, context=ctx)
+        g = SimpleNamespace(hd=hd, hkv=hkv, has_v=has_v, qd=qd, kvd=kvd, grp=g_grp, sfx=sfx,
+                            qkv_rows=qkv_rows, blocking=blocking, kvl=kvl_g,
+                            op_qn=op_qn, op_kn=op_kn, op_vn=op_vn, op_rq=op_rq, op_rk=op_rk,
+                            op_gq=op_gq, op_gkv=op_gkv, op_o=op_o, op_sc=op_sc, op_cx=op_cx,
+                            op_kvapp=op_kvapp, op_q2h=op_q2h, op_h2t=op_h2t)
+        _attn_cache[key] = g
+        return g
+
     # PREFILL_FUSE_SILU: the gate GEMM applies SiLU to its own C tile before it leaves L1, so the
     # standalone SiLU op and `g`'s whole DDR round-trip disappear. Configure-NEUTRAL by
     # construction -- gate and up stop sharing one design (the epilogue changes it), so their
@@ -444,21 +540,8 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
         epilogue="silu", **({"epilogue_elems": int(epi_n)} if epi_n is not None else {}),
     )) if fuse_silu else None
     op_down = gemm_for("down", FF, D)
-    # scores: B is the kv cache read as [N=S, K=HD] -> b_col_maj. ctx: the SAME bytes read as
-    # [K=S, N=HD] -> plain. Either way the blocked axis is the physical leading one, positions, so
-    # one `b_blocked` serves both and the descriptor rewrite lives in the operator.
-    kv_blocking = (kvl.T, kvl.block_stride) if kvl.T != kvl.S else None
-    # PREFILL_HEAD_SEAM=0 keeps the two head-axis rearranges. With them (the default) scores reads
-    # its A operand as a per-head SLICE of the token-major `q` and ctx writes its C the same way
-    # into `cxt`, at row pitch QD -- so `op_q2h` and `op_h2t` disappear entirely, with their two
-    # configures per layer and their 4.0 MB/layer of zero-compute DMA. Head selection stays a
-    # buffer SLICE, so the descriptor is head-independent and one design still serves all Hq.
-    seam = os.environ.get("PREFILL_HEAD_SEAM", "1") == "1"
-    op_sc = gemm_for("scores", HD, S, blocking=kv_blocking,
-                     extra=dict(a_row_stride=QD) if seam else {})
-    op_cx = gemm_for("ctx", S, HD, b_col_maj=False, blocking=kv_blocking,
-                     extra=dict(c_row_stride=QD) if seam else {})
-    tn_sc, tn_cx = tiles["scores"]["tile"][2], tiles["ctx"]["tile"][2]
+    for hd, hkv, has_v in geoms:
+        attn_ops(hd, hkv, has_v)   # build now so [tiles] below reports every geometry
     print("[tiles] " + "  ".join(
         f"{k}={v['tile'][0]}x{v['tile'][1]}x{v['tile'][2]}@{v['cols']}c({v['source']})"
         for k, v in sorted(tiles.items())))
@@ -495,58 +578,32 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
                       tile_size=FF // cols, context=ctx)
     op_mul = ElementwiseMul(size=M * FF, num_aie_columns=cols, tile_size=FF // cols, context=ctx)
     op_add = ElementwiseAdd(size=M * D, num_aie_columns=cols, tile_size=D // cols, context=ctx)
-    # KV append. The cache is [Hkv, S, HD] and `kv_off` is an element-unit BD offset, so M
-    # consecutive positions are M contiguous rows per head -- the M=1 BD with an extra outer
-    # dimension, not a new mechanism. The SOURCE is token-major [M, Hkv, HD], so the (M, Hkv) axes
-    # swap in the descriptor: input walks h fastest within a token, output walks m fastest within
-    # a head.
-    if kvl.T == kvl.S:
-        # Flat [Hkv, S, HD]: M consecutive positions are M contiguous rows per head.
-        kv_in_sizes, kv_in_strides = (M, Hkv, HD), (Hkv * HD, HD, 1)
-        kv_out_sizes, kv_out_strides = (M, Hkv, HD), (HD, kvl.head_stride, 1)
-    else:
-        # Blocked [S/T, Hkv, T, HD]. A chunk starts at a multiple of M and M is a whole number of
-        # blocks, so the write stays block-aligned and the descriptor gains one outer dimension
-        # rather than needing a scatter.
-        if M % kvl.T:
-            raise ValueError(
-                f"prefill batch M={M} is not a whole number of KV blocks (T={kvl.T}); the append "
-                f"would straddle a block boundary mid-descriptor")
-        nb = M // kvl.T
-        kv_in_sizes = (nb, Hkv, kvl.T, HD)
-        kv_in_strides = (kvl.T * Hkv * HD, HD, Hkv * HD, 1)
-        kv_out_sizes = (nb, Hkv, kvl.T, HD)
-        kv_out_strides = (kvl.block_stride, kvl.head_stride, HD, 1)
-    op_kvapp = StridedCopy(
-        input_sizes=kv_in_sizes, input_strides=kv_in_strides, input_offset=0,
-        output_sizes=kv_out_sizes, output_strides=kv_out_strides, output_offset=0,
-        input_buffer_size=M * Hkv * HD, output_buffer_size=kvl.total_elems,
-        transfer_size=pick_transfer(M * Hkv * HD), num_aie_channels=1,
-        output_offset_parameter="kv_off", context=ctx)
-    # The head-axis seam, both directions. See the module docstring for why these exist and what
-    # they cost; they are pure DMA and do 0% compute.
-    op_q2h = StridedCopy(
-        input_sizes=(Hq, M, HD), input_strides=(HD, QD, 1), input_offset=0,
-        output_sizes=(Hq, M, HD), output_strides=(M * HD, HD, 1), output_offset=0,
-        input_buffer_size=M * QD, output_buffer_size=M * QD,
-        transfer_size=pick_transfer(M * QD), num_aie_channels=1, context=ctx)
-    op_h2t = StridedCopy(
-        input_sizes=(M, Hq, HD), input_strides=(HD, M * HD, 1), input_offset=0,
-        output_sizes=(M, Hq, HD), output_strides=(Hq * HD, HD, 1), output_offset=0,
-        input_buffer_size=M * QD, output_buffer_size=M * QD,
-        transfer_size=pick_transfer(M * QD), num_aie_channels=1, context=ctx)
-
     # ---- buffers ----
     # Every prefill intermediate is ONE buffer shared by all layers: the sequence runs layers one
     # at a time, so nothing outlives its layer. Decode declares them per layer; at M=256 that
     # would be 28 * 43 MB of arena for no reason.
+    # q/k/v/cxt are geometry-shaped: IRON's calculate_buffer_layout rejects one buffer NAME
+    # declared at two different operator shapes (a GEMM's own arg spec, not just this file's
+    # `bufsz`), so a multi-geometry build needs one buffer per geometry, suffixed exactly like the
+    # tile labels (`sfx` in `attn_ops`) -- `q` unsuffixed when every spec has one geometry, which
+    # keeps the uniform case's buffer set (and arena) byte-identical to before this axis existed.
     bufsz = {
-        "h": M * D * 2, "q": M * QD * 2, "k": M * KVD * 2, "v": M * KVD * 2,
+        "h": M * D * 2,
         "sc": Hq * M * S * 2, "sw": Hq * M * S * 2,
-        "cxt": M * QD * 2, "a": M * D * 2, "xs": M * D * 2,
+        "a": M * D * 2, "xs": M * D * 2,
         "hf": M * D * 2, "gs": M * FF * 2, "u": M * FF * 2,
         "gh": M * FF * 2, "d": M * D * 2,
     }
+    for hd, hkv, has_v in geoms:
+        gsfx = f"_hd{hd}" if multi_geom else ""
+        qd, kvd = Hq * hd, hkv * hd
+        bufsz[f"q{gsfx}"] = M * qd * 2
+        bufsz[f"k{gsfx}"] = M * kvd * 2
+        bufsz[f"v{gsfx}"] = M * kvd * 2
+        bufsz[f"cxt{gsfx}"] = M * qd * 2
+        if not seam:
+            bufsz[f"qh{gsfx}"] = M * qd * 2
+            bufsz[f"cx{gsfx}"] = M * qd * 2
     if attn_order != "off":
         # Slicing an INPUT needs its size declared: calculate_buffer_layout takes a plain buffer's
         # size from the arg spec, and a sliced one only from here. Same size the whole-buffer arm
@@ -554,42 +611,50 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
         bufsz[SM_WIDTHS] = Hq * M * 4
     if not fuse_silu:
         bufsz["g"] = M * FF * 2
-    if not seam:
-        bufsz["qh"] = M * QD * 2
-        bufsz["cx"] = M * QD * 2
-    prefill_local = sorted(bufsz)
     dec_meta, dec_order, dec_sizes, dec_reserved = (None, [], {}, 0)
     if dec_meta_path:
         dec_meta, dec_order, dec_sizes, dec_reserved = decode_arena_plan(dec_meta_path)
+        # Scratch for a K-split weight (weight_gemm below), added ONLY when the shared arena
+        # actually holds one -- every shipped uniform-geometry spec never does, and this keeps
+        # their arena byte-identical to before weight_gemm existed. Both down and o produce a
+        # D-wide C, so one pair covers either, reused across layers and across the two roles.
+        if any(f"L{l}_{base}k0" in dec_sizes for l in range(NL) for base in ("Wd", "Wo")):
+            bufsz["kacc"] = M * D * 2
+            bufsz["kpart"] = M * D * 2
+        prefill_local = sorted(bufsz)
         for name, length in dec_sizes.items():
             if name in bufsz:
                 raise ValueError(f"decode scratch name {name!r} collides with a prefill "
                                  f"intermediate of the same name")
             bufsz[name] = length
+    else:
+        prefill_local = sorted(bufsz)
 
-    def qkv_slab(p, role, op):
-        """One projection's operand inside `L*_Wqkv`.
+    def qkv_slab(p, role, geom):
+        """One projection's operand inside `L*_Wqkv`, at THIS layer's geometry.
 
         Stock, the three roles are three contiguous slabs. Head-major, each role's rows are one
         block per kv head, so the operand runs from its FIRST block to the end of its last one and
-        the operator's blocked descriptor picks its own rows out of the span -- `op.b_elems` is
-        that span, asked of the operator rather than recomputed here.
+        the operator's blocked descriptor picks its own rows out of the span -- `b_elems` is that
+        span, asked of the operator rather than recomputed here.
         """
+        op = {"q": geom.op_gq, "k": geom.op_gkv, "v": geom.op_gkv}[role]
         if not hm:
-            base, span = ({"q": (0, QD), "k": (QD, KVD), "v": (QD + KVD, KVD)}[role][0] * D,
-                          {"q": QD, "k": KVD, "v": KVD}[role] * D)
+            base, span = ({"q": (0, geom.qd), "k": (geom.qd, geom.kvd),
+                          "v": (geom.qd + geom.kvd, geom.kvd)}[role][0] * D,
+                          {"q": geom.qd, "k": geom.kvd, "v": geom.kvd}[role] * D)
         else:
-            base, span = qkv_blocking[role][1] * D, op.b_elems
+            base, span = geom.blocking[role][1] * D, op.b_elems
         return f"{p}Wqkv[{base * 2}:{(base + span) * 2}]"
 
-    def kv_slab(buf, kv):
-        """A kv head's slab: from its base to the end of its LAST block, not `S*HD` -- across
+    def kv_slab(buf, kv, geom):
+        """A kv head's slab: from its base to the end of its LAST block, not `S*hd` -- across
         blocks the head's positions are `block_stride` apart with the other heads in between.
-        `kvl` owns both numbers, and both reduce to the flat `kv*S*HD` slice at T == S."""
-        base = kvl.head_base(kv)
-        return f"{buf}[{base * 2}:{(base + kvl.head_span) * 2}]"
+        `geom.kvl` owns both numbers, and both reduce to the flat `kv*S*hd` slice at T == S."""
+        base = geom.kvl.head_base(kv)
+        return f"{buf}[{base * 2}:{(base + geom.kvl.head_span) * 2}]"
 
-    def attn_norms(p):
+    def attn_norms(p, hd):
         """This layer's (input-norm, q-norm, k-norm) operands, as the decode arena actually holds
         them.
 
@@ -602,9 +667,62 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
         """
         if p + "norms" in dec_sizes:
             b = p + "norms"
-            return (f"{b}[0:{D * 2}]", f"{b}[{D * 2}:{(D + HD) * 2}]",
-                    f"{b}[{(D + HD) * 2}:{(D + 2 * HD) * 2}]")
+            return (f"{b}[0:{D * 2}]", f"{b}[{D * 2}:{(D + hd) * 2}]",
+                    f"{b}[{(D + hd) * 2}:{(D + 2 * hd) * 2}]")
         return (p + "n_in", p + "n_qn", p + "n_kn")
+
+    # A K-split weight's chunk GEMM + its accumulate-add, memoized by (chunk_K, Nout): every layer
+    # needing a chunked down-projection shares one pair of designs, exactly like `attn_ops` shares
+    # one attention op set per geometry.
+    _chunked_cache = {}
+
+    def weight_gemm(p, base_name, plain_op, K, Nout, a_buf, out_buf, label):
+        """Runlist entries computing `plain_op(a_buf, p+base_name) -> out_buf`.
+
+        Reads `p+base_name` whole when the decode arena holds it as one buffer. Gemma-4's
+        down-projection (K=15360, every layer) and global layers' o-projection (K=8192) exceed
+        GEVM's L1 budget at K-chunk 1, so decode's own generator ALWAYS splits those two weights
+        (`k_chunks_for`, llm_decode_spec.py:317) regardless of build flags -- verified against the
+        dump: L0/L5 of decode_l6 both carry `Wdk0..Wdk3`/`Wok0..Wok1`, never a plain `Wd`/`Wo`.
+        Prefill's GEMM has no L1 problem at this K (it tiles K internally via tile_k) and reads the
+        chunks itself: one GEMM per chunk, each taking its K-slice of the token-major `a_buf` via
+        `a_row_stride` -- the same strided-read mechanism `PREFILL_HEAD_SEAM` already uses for a
+        head slice of `q` -- with the partial C tiles summed by ElementwiseAdd. All `n` chunk GEMMs
+        share ONE op object (same shape, same stride), so they collapse to one configure, matching
+        every other per-head/per-chunk loop in this file.
+        """
+        plain = p + base_name
+        if not dec_meta_path or plain in dec_sizes:
+            return [(plain_op, a_buf, f"{plain}[0:{K * Nout * 2}]", out_buf)]
+        n = 0
+        while f"{plain}k{n}" in dec_sizes:
+            n += 1
+        if not n:
+            raise ValueError(f"{plain}: neither a plain buffer nor {plain}k0.. chunks exist in "
+                             f"the decode shared arena")
+        if K % n:
+            raise ValueError(f"{plain}: K={K} not divisible by its own {n} decode-arena chunks")
+        chunk_k = K // n
+        ckey = (chunk_k, Nout)
+        if ckey not in _chunked_cache:
+            chunk_op = gemm_for(f"{label}_k{chunk_k}of{n}", chunk_k, Nout,
+                                extra=dict(a_row_stride=K))
+            add_op = (ElementwiseAdd(size=M * Nout, num_aie_columns=cols, tile_size=Nout // cols,
+                                     context=ctx) if n > 1 else None)
+            _chunked_cache[ckey] = (chunk_op, add_op)
+        chunk_op, add_op = _chunked_cache[ckey]
+
+        def a_slice(i):
+            lo = i * chunk_k
+            return f"{a_buf}[{lo * 2}:{(lo + chunk_op.a_elems) * 2}]"
+
+        ops = [(chunk_op, a_slice(0), f"{plain}k0[0:{chunk_k * Nout * 2}]",
+                "kacc" if n > 1 else out_buf)]
+        for i in range(1, n):
+            ops.append((chunk_op, a_slice(i), f"{plain}k{i}[0:{chunk_k * Nout * 2}]", "kpart"))
+            dst = out_buf if i == n - 1 else "kacc"
+            ops.append((add_op, "kacc", "kpart", dst))
+        return ops
 
     # Dual-theta RoPE: a spec with a local/global theta split declares TWO host-written angle
     # tables instead of one, and each layer's q/k RoPE reads whichever is_global() says -- global
@@ -620,40 +738,48 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
         p = f"L{l}_"
         src = "x" if l == 0 else "xs"
         dst = "xout" if l == NL - 1 else "xs"
-        wq, wk, wv = (qkv_slab(p, "q", op_gq), qkv_slab(p, "k", op_gkv),
-                      qkv_slab(p, "v", op_gkv))
-        # Decode pads Wo by two rows for swiglu_mlp_dp's fuse_o tiling; the projection is the
-        # first D rows and the pad rows are zero, so prefill reads the unpadded prefix.
-        wo = f"{p}Wo[0:{D * QD * 2}]"
-        w_nin, w_nqn, w_nkn = attn_norms(p)
+        g = attn_ops(sp.head_dim_for(l), sp.n_kv_heads_for(l), sp.has_v_proj(l))
+        hd, grp = g.hd, g.grp
+        # Geometry-suffixed buffer names -- see the bufsz comment above for why one shared "q"
+        # cannot serve two geometries.
+        qb, kb, vb, cxtb = f"q{g.sfx}", f"k{g.sfx}", f"v{g.sfx}", f"cxt{g.sfx}"
+        qhb, cxb = f"qh{g.sfx}", f"cx{g.sfx}"
+        wq, wk = qkv_slab(p, "q", g), qkv_slab(p, "k", g)
+        w_nin, w_nqn, w_nkn = attn_norms(p, hd)
         rl += [
             (op_norm, src, w_nin, "h"),
-            (op_gq, "h", wq, "q"),
-            (op_gkv, "h", wk, "k"),
-            (op_gkv, "h", wv, "v"),
-        ]
-        qn_runs = ([(op_kn, f"q[{i * M * KVD * 2}:{(i + 1) * M * KVD * 2}]", w_nqn,
-                     f"q[{i * M * KVD * 2}:{(i + 1) * M * KVD * 2}]") for i in range(grp)]
-                   if merge_qknorm else [(op_qn, "q", w_nqn, "q")])
+            (g.op_gq, "h", wq, qb),
+            (g.op_gkv, "h", wk, kb),
+        ] + ([(g.op_gkv, "h", qkv_slab(p, "v", g), vb)] if g.has_v else [])
+        if sp.v_norm and not g.has_v:
+            # attention_k_eq_v: no v_proj at all. v_norm reads the RAW k projection -- before
+            # qk-norm and RoPE, which mutate `k` in place below -- and writes `v`; that IS the
+            # copy, so no separate copy operator (mirrors gen_llm_decode.py:1907-1922 exactly).
+            rl.append((g.op_vn, kb, f"ones_h{hd}", vb))
+        elif sp.v_norm:
+            rl.append((g.op_vn, vb, f"ones_h{hd}", vb))
+        qn_runs = ([(g.op_kn, f"{qb}[{i * M * g.kvd * 2}:{(i + 1) * M * g.kvd * 2}]", w_nqn,
+                     f"{qb}[{i * M * g.kvd * 2}:{(i + 1) * M * g.kvd * 2}]") for i in range(grp)]
+                   if merge_qknorm else [(g.op_qn, qb, w_nqn, qb)])
         rl += qn_runs + [
-            (op_kn, "k", w_nkn, "k"),
-            (op_rq, "q", ang_buf(l), "q"),
-            (op_rk, "k", ang_buf(l), "k"),
+            (g.op_kn, kb, w_nkn, kb),
+            (g.op_rq, qb, ang_buf(l), qb),
+            (g.op_rk, kb, ang_buf(l), kb),
             # K after qk-norm AND after RoPE; V raw, projection only. Different points in the
             # pipeline, and the M=1 path a decode step resumes from depends on both.
-            (op_kvapp, "k", p + "kc"),
-            (op_kvapp, "v", p + "vc"),
-        ] + ([] if seam else [(op_q2h, "q", "qh")])
+            (g.op_kvapp, kb, p + "kc"),
+            (g.op_kvapp, vb, p + "vc"),
+        ] + ([] if seam else [(g.op_q2h, qb, qhb)])
         # The widths buffer is an INPUT of the softmax step, not a side channel: op.get_arg_spec()
         # puts it between in and out, so it is the middle name here.
         def qslice(h):
             """Head h's queries: a strided slice of token-major `q`, or the head-major copy."""
             if not seam:
-                return f"qh[{h * M * HD * 2}:{(h + 1) * M * HD * 2}]"
-            return f"q[{h * HD * 2}:{(h * HD + op_sc.a_elems) * 2}]"
+                return f"{qhb}[{h * M * hd * 2}:{(h + 1) * M * hd * 2}]"
+            return f"{qb}[{h * hd * 2}:{(h * hd + g.op_sc.a_elems) * 2}]"
 
         def score(h):
-            return (op_sc, qslice(h), kv_slab(p + "kc", h // grp),
+            return (g.op_sc, qslice(h), kv_slab(p + "kc", h // grp, g),
                     f"sc[{h * M * S * 2}:{(h + 1) * M * S * 2}]")
 
         def soft(h):
@@ -678,20 +804,23 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
             rl.append((op_sm, "sc", SM_WIDTHS, "sw") if causal == "rows"
                       else (op_sm, "sc", "sw"))
         for h in range(Hq):
-            cx_out = (f"cxt[{h * HD * 2}:{(h * HD + op_cx.c_elems) * 2}]" if seam
-                      else f"cx[{h * M * HD * 2}:{(h + 1) * M * HD * 2}]")
-            rl.append((op_cx, f"sw[{h * M * S * 2}:{(h + 1) * M * S * 2}]",
-                       kv_slab(p + "vc", h // grp), cx_out))
-        rl += ([] if seam else [(op_h2t, "cx", "cxt")]) + [
-            (op_o, "cxt", wo, "a"),
-        ] + ([(op_norm, "a", p + "n_pa", "a")] if sp.sandwich_norms else []) + [
+            cx_out = (f"{cxtb}[{h * hd * 2}:{(h * hd + g.op_cx.c_elems) * 2}]" if seam
+                      else f"{cxb}[{h * M * hd * 2}:{(h + 1) * M * hd * 2}]")
+            rl.append((g.op_cx, f"sw[{h * M * S * 2}:{(h + 1) * M * S * 2}]",
+                       kv_slab(p + "vc", h // grp, g), cx_out))
+        rl += ([] if seam else [(g.op_h2t, cxb, cxtb)]) + \
+            weight_gemm(p, "Wo", g.op_o, g.qd, D, cxtb, "a", f"o_hd{hd}") + \
+            ([(op_norm, "a", p + "n_pa", "a")] if sp.sandwich_norms else []) + [
             (op_add, src, "a", "xs"),
             (op_norm, "xs", p + "n_pf", "hf"),
-        ] + ([(op_gate, "hf", p + "Wg", "gs"), (op_gu, "hf", p + "Wu", "u")] if fuse_silu else
-             [(op_gu, "hf", p + "Wg", "g"), (op_gu, "hf", p + "Wu", "u"), (op_act, "g", "gs")]) + [
+        ] + (weight_gemm(p, "Wg", op_gate, D, FF, "hf", "gs", "gate_up") +
+             weight_gemm(p, "Wu", op_gu, D, FF, "hf", "u", "gate_up") if fuse_silu else
+             weight_gemm(p, "Wg", op_gu, D, FF, "hf", "g", "gate_up") +
+             weight_gemm(p, "Wu", op_gu, D, FF, "hf", "u", "gate_up") +
+             [(op_act, "g", "gs")]) + [
             (op_mul, "gs", "u", "gh"),
-            (op_down, "gh", p + "Wd", "d"),
-        ] + ([(op_norm, "d", p + "n_pff", "d")] if sp.sandwich_norms else []) + [
+        ] + weight_gemm(p, "Wd", op_down, FF, D, "gh", "d", "down") + \
+            ([(op_norm, "d", p + "n_pff", "d")] if sp.sandwich_norms else []) + [
             (op_add, "xs", "d", dst),
         ]
         cache_names += [p + "kc", p + "vc"]
@@ -772,6 +901,11 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
                     f"scratch offset {want['offset']} len {want['len']} -- the two ELFs cannot "
                     f"share one FusedArena")
 
+    # meta.json's tile_n_scores/tile_n_ctx are ONE representative number; a multi-geometry build
+    # reports the base (sliding) geometry's and the full per-geometry breakdown is in `tiles`.
+    _base_sfx = f"_hd{HD}" if multi_geom else ""
+    tn_sc = tiles[f"scores{_base_sfx}"]["tile"][2]
+    tn_cx = tiles[f"ctx{_base_sfx}"]["tile"][2]
     dims = dict(NL=NL, M=M, S=S, inputs=inputs, cache_names=cache_names,
                 tn_sc=tn_sc, tn_cx=tn_cx, tiles=tiles, cols=cols, causal=causal,
                 kv_block=kvl.T, wqkv_head_major=hm,
@@ -1044,7 +1178,8 @@ def main():
     # no sandwich-norm, dual-theta, v-norm or layer-scalar arm. Building one of those specs with a
     # golden would silently compare the device against a dataflow it does not run.
     golden_gaps = [n for n, on in (("sandwich_norms", sp.sandwich_norms), ("dual-theta RoPE",
-                   dual_rope), ("v_norm", sp.v_norm), ("layer_scalar", sp.layer_scalar)) if on]
+                   dual_rope), ("v_norm", sp.v_norm), ("layer_scalar", sp.layer_scalar),
+                   ("non-uniform geometry", not sp.geometry_is_uniform())) if on]
     if golden_gaps and not a.no_golden:
         raise SystemExit(f"ERROR: {sp.name} sets {golden_gaps}, which prefill_ref.layer_stack "
                          f"does not model yet -- pass --no-golden (the device graph itself has no "
@@ -1053,8 +1188,10 @@ def main():
     rng = np.random.default_rng(11)
     X = bf16(rng.standard_normal((M, D)).astype(np.float32) * 0.02)
     # `table` doubles as the single-theta case's whole input and dual-theta's GLOBAL half -- Gemma-4
-    # rotates only 0.25 of the global layers' frequency pairs (rope_type "proportional").
-    table = rope_table(a.base, M, HD, sp.rope_theta_global, partial=sp.rope_partial_rotary)
+    # rotates only 0.25 of the global layers' frequency pairs (rope_type "proportional"), over that
+    # geometry's OWN head_dim, which may differ from the base `HD` (512 vs 256 on Gemma-4).
+    global_hd = sp.global_head_dim if sp.global_head_dim is not None else HD
+    table = rope_table(a.base, M, global_hd, sp.rope_theta_global, partial=sp.rope_partial_rotary)
 
     os.makedirs(os.path.join(a.out, "buffers"), exist_ok=True)
     bdir = os.path.join(a.out, "buffers")
@@ -1185,7 +1322,7 @@ def main():
                  f"(embed_scale={sp.embed_scale})",
             **({"rope_local": f"[{M}, {HD}] bf16, one row per absolute position base..base+{M}-1, "
                               f"INTERLEAVED [cos, sin, cos, sin, ...], theta={sp.rope_theta_local}",
-                "rope_global": f"[{M}, {HD}] bf16, same layout, theta={sp.rope_theta_global}"
+                "rope_global": f"[{M}, {global_hd}] bf16, same layout, theta={sp.rope_theta_global}"
                               f"{f', partial={sp.rope_partial_rotary}' if sp.rope_partial_rotary else ''}"}
               if dual_rope else
               {"rope": f"[{M}, {HD}] bf16, one row per absolute position base..base+{M}-1, "
