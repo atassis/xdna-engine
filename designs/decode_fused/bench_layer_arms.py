@@ -119,6 +119,22 @@ def count_sync_points(src):
     return n
 
 
+def rope_bufs(callable_, sp, md):
+    """Every declared RoPE angle table, each with the theta its own layers use.
+
+    A two-geometry spec declares two tables of DIFFERENT widths -- Gemma-4's `rope_global` is 512
+    and `rope_local` 256 -- so the width comes from the device buffer, never from `sp.head_dim`,
+    which names only the sliding geometry. Same rule bisect_llm_decode.py follows.
+
+    The values are the plain cos/sin form, not this spec's partial-rotary or proportional variant:
+    this harness times and does not check logits (see the module docstring), and a RoPE angle
+    changes no byte count, no configure and no dispatch.
+    """
+    thetas = {"rope_global": sp.rope_theta_global,
+              "rope_local": sp.rope_theta_local or sp.rope_theta_global}
+    return [(callable_.get_buffer(n), thetas[n]) for n in thetas if n in md["inputs"]]
+
+
 def require_headroom(fused, spec, n_loaded, floor_gb=3.0):
     """Refuse to make one more arm resident when the box cannot hold it.
 
@@ -180,6 +196,8 @@ def main():
                          "moves ONLY the sync-point count, +(K-1) per layer, at constant bytes, "
                          "tasks, configures and designs; 'g<G>' = SPLIT_QKNORM, which deals the "
                          "qk-norm runs to two IDENTICAL RMSNorm designs in contiguous groups of G "
+                         "heads; 'r<K>' = DUMMY_NORM_RUNS, the MIRROR arm -- K extra qk-norm runs a "
+                         "layer into a dead buffer, moving RUNS at fixed configures and bytes; "
                          "heads and so moves ONLY the configure count -- the order-only control "
                          "D009's rate needs, at constant runs, bytes, designs and output; 'h0' = "
                          "SHARE_DESIGNS=0, which un-pairs gate/up and the two KV StridedCopys and "
@@ -216,7 +234,7 @@ def main():
     census = {}
     for spec in a.arms:
         m = re.fullmatch(r"(\d+)(f?)(?:c(\d+))?(?:q(\w+?))?(?:d(\d+))?(?:s(\d+))?(?:g(\d+))?"
-                         r"(?:h(\d))?", spec)
+                         r"(?:h(\d))?(?:r(\d+))?", spec)
         if not m:
             raise SystemExit(f"bad arm spec {spec!r}")
         L = int(m.group(1))
@@ -227,6 +245,7 @@ def main():
         sgh = int(m.group(6)) if m.group(6) else 1
         sqk = int(m.group(7)) if m.group(7) else 0
         share = m.group(8) if m.group(8) else "1"
+        dummy = int(m.group(9)) if m.group(9) else 0
         # These are captured at gen_llm_decode IMPORT time, so flipping os.environ here would be
         # silently ignored -- set the module globals the generator actually reads.
         G.FUSE_MLP_O = fmo
@@ -238,6 +257,7 @@ def main():
         # build_graph reads SHARE_DESIGNS from the environment at call time, not at import, so this
         # is the env and not a module global like the rest.
         os.environ["SHARE_DESIGNS"] = share
+        G.DUMMY_NORM_RUNS = dummy
         t0 = time.perf_counter()
         sp, fused, weights, md = build_graph(a.spec, a.weights, L, a.max_seq)
         # A fit's CONTROL variables need the same evidence as its result: print every quantity
@@ -245,7 +265,7 @@ def main():
         census[spec] = census_from_mlir(fused, md, sgh=sgh)
         census[spec].update(fuse_mlp_o=fmo, mlp_dp_cols=cols, quant_mlp=qdt,
                             weight_depth=wdepth, split_gh=sgh, split_qknorm=sqk,
-                            share_designs=share)
+                            share_designs=share, dummy_runs=dummy)
         print(f"[layer-arms] built {spec} in {time.perf_counter()-t0:.1f}s  census={census[spec]}",
               flush=True)
         if a.build_only:
@@ -265,7 +285,7 @@ def main():
         del weights
         scale = np.sqrt(sp.d_model) if sp.embed_scale == "sqrt_d_model" else 1.0
         arms.append(dict(spec=spec, L=L, fmo=fmo, cols=cols, qdt=qdt, wdepth=wdepth, sgh=sgh,
-                         sqk=sqk, share=share,
+                         sqk=sqk, share=share, dummy=dummy,
                          sp=sp, c=c,
                          params=params,
                          # The runtime attention window, when the arm built one. An arm whose core
@@ -281,7 +301,7 @@ def main():
                          # DYNAMIC_WINDOW=0 unrunnable through this harness.
                          granule=(md.get("window_granule") if G.DYNAMIC_WINDOW else None),
                          kv_layout=KVLayout(Hkv=sp.n_kv_heads, S=md["S"], HD=sp.head_dim, T=md["T"]),
-                         xin=c.get_buffer("x"), rope_buf=c.get_buffer("rope_global"),
+                         xin=c.get_buffer("x"), rope_bufs=rope_bufs(c, sp, md),
                          scale=scale))
     if a.build_only:
         print(f"\n{'arm':>10} {'L':>4} {'cfg':>6} {'runs':>6} {'designs':>8} {'MB':>10}")
@@ -303,8 +323,9 @@ def main():
     def one(arm):
         with arm["xin"].overwrite() as _buf:
             _buf[:] = np.asarray(embed * arm["scale"], BF16).reshape(-1)
-        with arm["rope_buf"].overwrite() as _buf:
-            _buf[:] = rope_row(a.pos, arm["sp"].head_dim, arm["sp"].rope_theta_global).reshape(-1)
+        for _buffer, _theta in arm["rope_bufs"]:
+            with _buffer.overwrite() as _buf:
+                _buf[:] = rope_row(a.pos, _buf.size, _theta).reshape(-1)
         arm["params"].write("kv_off", int(arm["kv_layout"].kv_off(a.pos)))
         arm["params"].write("sm_mask", int(a.pos + 1))
         if arm["granule"]:
@@ -335,7 +356,7 @@ def main():
         report[sp_] = {"reps": xs, "median_ms": med, "spread_pct": spread, "L": arm["L"],
                        "fuse_mlp_o": arm["fmo"], "cols": arm["cols"], "qdt": arm["qdt"],
                        "wdepth": arm["wdepth"], "sgh": arm["sgh"], "sqk": arm["sqk"],
-                       "share": arm["share"],
+                       "share": arm["share"], "dummy": arm["dummy"],
                        "mb": census[sp_].get("mb"), "min_ms": min(xs), "census": census[sp_]}
         print(f"{sp_:>10} {arm['L']:4} {census[sp_].get('configures', 0):5} "
               f"{census[sp_].get('mb', float('nan')):9.2f} {len(xs):4} "

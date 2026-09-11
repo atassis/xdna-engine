@@ -302,6 +302,18 @@ DECODE_PLACER_FLAGS_DEFAULT = "--cores-per-col 1"
 # lists, so the block count is ceil((Hq+Hkv)/G) and does not depend on where q ends.
 SPLIT_QKNORM = int(os.environ.get("SPLIT_QKNORM", "0"))
 
+# INSTRUMENT, not a feature -- the MIRROR of SPLIT_QKNORM above, and the arm the performance
+# contract says no board arm provides: it moves RUNS at fixed configures, where SPLIT_QKNORM moved
+# configures at fixed runs. K extra qk-norm runs per layer are appended to the qk-norm block,
+# reading one head slice and writing a scratch buffer nothing reads. Same design, and contiguous
+# with the block they follow, so the configure count does not move; 1 KB per run against a layer's
+# 250 MB, so the byte count does not either. Output is unchanged because the destination is dead.
+#
+# D009 says runs ride free (-420 runs, -0.0%). The per-layer residual, if it is per-run, is
+# ~162 us each. At K=8 over 12 layers that is +96 runs: +15.6 ms if per-run, ~0 if free. Two
+# outcomes far apart, one build.
+DUMMY_NORM_RUNS = int(os.environ.get("DUMMY_NORM_RUNS", "0"))
+
 # INSTRUMENT, not a feature -- the sibling of SPLIT_QKNORM above, aimed at the other count.
 # SPLIT_QKNORM isolated a CONFIGURE by turning one design into many; this chops swiglu_mlp_dp's gh
 # drain group into k groups over the SAME drains in the SAME order, so bytes, shim tasks, BDs,
@@ -751,6 +763,8 @@ def sequence_name(sp, NL, S, placer_flags, decode_layer_active=False, T=None, tm
         parts.append(_frag)
     if SPLIT_QKNORM:
         parts.append(f"splitqk{SPLIT_QKNORM}")
+    if DUMMY_NORM_RUNS:
+        parts.append(f"dummyrun{DUMMY_NORM_RUNS}")
     # Suffix stays ON the default here, unlike the other switches: the shipped artifact was BUILT
     # and gated under this name, and aiecc is not byte-reproducible, so a rename would mean the
     # next rebuild produces a different ELF under a name nothing was ever gated against.
@@ -2669,6 +2683,9 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         return np.concatenate([_pack(np.ascontiguousarray(part), "mlp")
                                for part in np.split(w, n_chunks, axis=1)])
 
+    if DUMMY_NORM_RUNS:
+        for _hd in sorted({gk[0] for gk in geoms}):
+            bufsz[f"dead_h{_hd}"] = _hd * 2
     cur = "x"
     # (runlist index, residual buffer entering this layer) per layer, so the stack can be cut into
     # segments AFTER it is built. Recorded rather than reconstructed: the residual chain is
@@ -2984,6 +3001,11 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                     hk = [f"{khb}[{kho + h*g.hd*2}:{kho + (h+1)*g.hd*2}]" for h in range(g.hkv)]
                     qk = [*[(g.qkn(h), hq[h], p + "n_qn", hq[h]) for h in range(Hq)],
                           *[(g.qkn(Hq + h), hk[h], p + "n_kn", hk[h]) for h in range(g.hkv)]]
+                if DUMMY_NORM_RUNS and g.op_qk_norm is not None:
+                    # Appended AFTER the qk entries, on the same design, so the block stays one
+                    # contiguous configure. Reads a live q head; writes a buffer with no reader.
+                    qk = [*qk, *[(g.op_qk_norm, hq[0], p + "n_qn", f"dead_h{g.hd}")
+                                 for _ in range(DUMMY_NORM_RUNS)]]
                 if g.op_qkv_dp is None:
                     proj = ([(g.op_qkv, p + "Wqkv", p + "hn", p + "qkv")] if FUSE_QKV_GEMV else
                             [(g.op_q, p + "Wq", p + "hn", ref_q),

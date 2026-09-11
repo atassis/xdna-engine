@@ -41,10 +41,15 @@ REPS="${REPS:-25}"
 # Device serialisation, named by env rather than by path: the serialiser lives outside this repo,
 # and more than one session runs against this box. Unset is a hard error, not a silent unlocked run
 # -- two arms sharing the device produce plausible, wrong timings rather than a failure.
-LOCK="${NPU_LOCK:-}"
+#
+# NOT `NPU_LOCK`. That name is already taken by the serialiser this variable POINTS AT, where it
+# means the lock FILE to open -- so exporting the serialiser's own path as NPU_LOCK makes it
+# `exec 9>` its own source and truncate itself to zero bytes. An empty executable script then runs,
+# prints nothing and exits 0, so every session "succeeds" having dispatched nothing.
+LOCK="${NPU_LOCK_CMD:-}"
 if [ "$WARM_ONLY" != 1 ]; then
-  [ -n "$LOCK" ] || { echo "set NPU_LOCK to a serialiser accepting \$NPU_LOCK queue -- <cmd...>" >&2; exit 2; }
-  [ -x "$LOCK" ] || { echo "NPU_LOCK=$LOCK is not executable" >&2; exit 2; }
+  [ -n "$LOCK" ] || { echo "set NPU_LOCK_CMD to a serialiser accepting <cmd> queue -- <args...>" >&2; exit 2; }
+  [ -x "$LOCK" ] || { echo "NPU_LOCK_CMD=$LOCK is not executable" >&2; exit 2; }
 fi
 
 mkdir -p "$OUT" "$WORK"
@@ -69,8 +74,15 @@ export GQA_GROUPED_K=1 GQA_GROUPED_V=1 FUSE_QKV_DP=0 SPLIT_LM_HEAD=0
 # ONE build dir for every arm, on the same condition build_llm_decode.sh relies on: the arm is in
 # the artifact NAME (`splitqk<G>`), so two arms cannot share a filename. Verified in --warm, which
 # prints each arm's resolved census before any device time is spent on it.
-ARGS=(--spec "$SPEC" --weights "$WEIGHTS" --max-seq "$MAXSEQ" --pos "$POS"
-      --arms "${ARMS[@]/#/$LAYERS}")
+# An arm already carrying its own depth ("18g0") is taken verbatim; a bare one ("g0") gets
+# $LAYERS. Without this an arm list could only ever be ONE depth -- a depth sweep, which is the
+# other half of this instrument, was not expressible, and asking for one silently ran the default
+# arms at a single depth instead.
+SPECS=()
+for _a in "${ARMS[@]}"; do
+  case "$_a" in ([0-9]*) SPECS+=("$_a") ;; (*) SPECS+=("$LAYERS$_a") ;; esac
+done
+ARGS=(--spec "$SPEC" --weights "$WEIGHTS" --max-seq "$MAXSEQ" --pos "$POS" --arms "${SPECS[@]}")
 
 if [ "$WARM_ONLY" = 1 ]; then
   ( cd "$WORK" && "$VENV_IRON/bin/python" "$REPO/designs/decode_fused/bench_layer_arms.py" \
