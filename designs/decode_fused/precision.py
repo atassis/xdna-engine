@@ -201,12 +201,21 @@ def parse_plan(text: str) -> Dict[str, Spec]:
     return plan
 
 
-# Named points. `reach` is the arm each can be BUILT on, which is not the same question as
-# whether it is a good format -- `all-int8` is the measured quality optimum and the fused layer
-# cannot carry it, because q/k/v share the cache's fifo. Run `precision.py --list` for the table.
+# Named points. Three questions are independent here and a preset answers only the first two:
+# what it COSTS IN BYTES, what it costs in QUALITY, and what its KERNEL costs. On the third the
+# record is blunt and it does not follow the other two -- measured on the unfused graph at an
+# identical dispatch count, symmetric int4 is at parity with bf16 (0.99x), symmetric int8 is
+# 2.10x SLOWER (its dequant loop), and BOTH affine forms add a constant +47.3/+48.3 ms from
+# `group_sums_of_b`'s per-call cost.
+# So the best-measured arm is the symmetric int4 one, not the best-quality or fewest-bytes one.
+# `reach` is which arm each can be BUILT on, a fourth and separate question.
 PRESETS = {
     "bf16": ({}, "fused"),
-    # Wo rides the MLP's fifo under fuse_o, so the two move together by construction.
+    # SYMMETRIC, and deliberately: the affine forms are better on quality at the same bytes and
+    # carry a measured constant that dwarfs the difference. Wo rides the MLP's fifo under fuse_o,
+    # so the two move together by construction.
+    "mlp-int4-sym": ({"mlp": "int4/g128", "attn_o": "int4/g128"}, "fused"),
+    "mlp-int8-sym": ({"mlp": "int8/g128", "attn_o": "int8/g128"}, "fused"),
     "mlp-int8": ({"mlp": "int8a/g128", "attn_o": "int8a/g128"}, "fused"),
     "mlp-head-int8": ({"mlp": "int8a/g128", "attn_o": "int8a/g128", "head": "int8a/g128"},
                       "fused"),
@@ -254,18 +263,10 @@ def plan_from_env(env: Optional[Mapping[str, str]] = None) -> Tuple[Dict[str, Sp
     return plan, f"legacy QUANT_* env ({','.join(sorted(legacy))})"
 
 
-def wire_bytes_per_element(spec: Spec) -> float:
-    """Bytes on the wire per weight element.
-
-    Independent of K: the row is `[n_groups x header][payload]` and n_groups is K/group, so the
-    header amortises at a fixed rate per element. K decides only whether the row is LEGAL, which
-    is `check_row` below. That is why a finer group and a wider format trade against each other
-    directly -- affine int4 at g128 and symmetric int4 with an f32 scale at g128 are the same
-    544-byte row at K=1024, and the same 0.53125 B/element at every other K too.
-    """
-    if not spec.quantized:
-        return 2.0
-    return _HEADER_BYTES[spec.dtype] / spec.group_size + _PAYLOAD_BITS[spec.dtype] / 8
+# The payload's vector-load width in bytes, per dtype, at the kernel's VEC_SIZE=64. int4 packs
+# two nibbles per byte so it loads half as wide. Mirrors iron/operators/gemv/quant.py's own
+# `_LOAD_BYTES`; used only by the fallback below.
+_LOAD_BYTES = {"int4": 32, "int4a": 32, "int8": 64, "int8a": 64}
 
 
 def wire_row_units(spec: Spec, K: int) -> int:
@@ -274,21 +275,48 @@ def wire_row_units(spec: Spec, K: int) -> int:
     UNITS, not bytes: bf16 elements for an unquantized weight and packed bytes for a quantized
     one, because those are the units each array is actually indexed in. Returning bytes for both
     is the bytes-vs-elements seam -- it reads correct, and it silently halves the row count of
-    every bf16 reshape. Matches swiglu_mlp_dp/op.py::_wrow, which is the same question one level
-    down.
+    every bf16 reshape.
+
+    THE PACKER OWNS THIS NUMBER and this defers to it whenever it can be imported. The
+    arithmetic below is a FALLBACK for pricing a plan against a tree that cannot build it, and
+    it is deliberately not the authority: a packed row is not simply header+payload, because the
+    header is padded so the payload clears its own vector-load width. A plane that re-derived
+    the unpadded form would price every arm slightly wrong and disagree with what shipped.
+    `test_the_plane_agrees_with_the_packer` is what keeps the fallback honest.
     """
     if not spec.quantized:
         return K
+    try:
+        from iron.operators.gemv.quant import row_stride_bytes
+    except ImportError:
+        pass
+    else:
+        try:
+            return row_stride_bytes(K, spec.group_size, spec.dtype)
+        except ValueError as exc:
+            raise PrecisionRefusal("P007", f"{spec} at K={K}: {exc}") from exc
     if K % spec.group_size:
         raise PrecisionRefusal(
             "P007", f"K={K} is not a whole number of groups (group_size={spec.group_size})")
-    stride = int(wire_bytes_per_element(spec) * K)
-    if stride % 4:
+    load = _LOAD_BYTES[spec.dtype]
+    header = -(-(_HEADER_BYTES[spec.dtype] * (K // spec.group_size)) // load) * load
+    stride = header + K * _PAYLOAD_BITS[spec.dtype] // 8
+    if stride % load:
         raise PrecisionRefusal(
-            "P007", f"packed row stride {stride} B is not 4-byte aligned at K={K} "
-                    f"group_size={spec.group_size} {spec.dtype} -- the per-row scale read would "
-                    "be misaligned on every row past the first")
+            "P007", f"packed row stride {stride} B does not clear the {load} B load width at "
+                    f"K={K} group_size={spec.group_size} {spec.dtype}")
     return stride
+
+
+def wire_bytes_per_element(spec: Spec, K: int) -> float:
+    """Bytes on the wire per weight element, at row width K.
+
+    Takes K because the packer owns the answer and the packer takes K. The rate happens to be
+    K-independent for the formats shipped here -- the row is header+payload and n_groups scales
+    with K -- but that is a property of the current layout, not of the question, and it stopped
+    being true for one afternoon when the header was padded.
+    """
+    return 2.0 if not spec.quantized else wire_row_units(spec, K) / K
 
 
 @dataclass(frozen=True)
@@ -436,7 +464,8 @@ def kv_addr_gran_elems(plan: Mapping[str, Spec]) -> int:
 
 def token_mb(plan: Mapping[str, Spec]) -> Dict[str, float]:
     """Projected MB/token per site under `plan`, against the census baseline."""
-    out = {key: site.mb_per_token * wire_bytes_per_element(plan.get(key, BF16_SPEC)) / 2
+    out = {key: site.mb_per_token
+           * wire_bytes_per_element(plan.get(key, BF16_SPEC), site_k(key, QWEN3_06B)[0]) / 2
            for key, site in SITES.items()}
     out["unsited"] = CENSUS_UNSITED_MB
     out["total"] = sum(out.values())
