@@ -19,10 +19,10 @@ CANNOT:
     did not. `coverage()` reports this rather than letting the number be read as whole-plan.
   * the kernel's own arithmetic. `kernel_round` emulates the bf16 narrowing mv_quant.cc does per
     product and nothing else -- not accumulation order, not the rounding MODE the core register
-    happens to hold ([[bfp16-emulation-inherits-floor-rounding]]: the documented default is floor
+    happens to hold (: the documented default is floor
     and it cost 1.3x accuracy on a real encoder, invisible to every gate in this tree).
   * trajectory drift. Every position is scored on the TRUE prefix, so compounding is invisible by
-    construction ([[perplexity-cannot-see-what-generation-does]]). divergence.py is the instrument
+    construction. divergence.py is the instrument
     for that question and it is a different run.
   * latency, in either direction. A byte cut is not a time cut until a device A/B says so, and the
     standing objection to int8 is precisely that its dequant has no zero-overhead loop.

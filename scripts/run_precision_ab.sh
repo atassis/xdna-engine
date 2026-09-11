@@ -10,15 +10,16 @@
 # the deltas trustworthy is INSIDE the harness (all arms resident, round-robin per rep); the
 # repeated sessions here are the coarser replication on top.
 #
-# NON-DESTRUCTIVE: npu_lock.sh `queue` waits its turn and defers with exit 75 if production holds
-# the device. It never stops npu-serve.
+# DEVICE GUARD, two policies and the caller picks. By default this asserts the device is free
+# (scripts/_npu_services.sh) and refuses if anything holds it -- self-contained, no daemons
+# stopped. Set NPU_LOCK_CMD to a serialising wrapper to queue behind other sessions instead;
+# it is invoked as `$NPU_LOCK_CMD -- <cmd>` and an exit of 75 is read as "device busy, defer".
 #
 # Pre-warm the per-arm build caches first or the first session compiles 28 layers per arm while
 # holding the lock:  bash scripts/run_precision_ab.sh --warm
 set -u
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WS="$(cd "$REPO/.." && pwd)"
-LOCK="$WS/xdna-engine-private/journal/scripts/npu_lock.sh"
 OUT="${PRECISION_AB_OUT:-/mnt/data/xdna/scratch/precision/ab}"
 ARMS=(bf16 mlp-int4-sym mlp-int8-sym mlp-int8)
 WARM_ONLY=0
@@ -66,11 +67,20 @@ fi
 # is recorded rather than assumed, once per session set.
 xrt-smi examine -r platform 2>/dev/null | grep -i mode | tee "$OUT/power-mode.txt" || true
 
+if [ -n "${NPU_LOCK_CMD:-}" ]; then
+  LOCK_CMD="$NPU_LOCK_CMD --"
+else
+  LOCK_CMD=""
+  . "$REPO/scripts/_npu_services.sh"
+  npu_svc_require_device_free || {
+    echo "device is held -- free it, or set NPU_LOCK_CMD to a wrapper that queues"; exit 75; }
+fi
+
 for s in $(seq 1 "$SESSIONS"); do
   echo "############ session $s  $(date +%H:%M:%S)"
   # Run FROM the warm dir: the harness writes IRON's build/ intermediates under its cwd, and
   # this is where --warm left them.
-  ( cd "$WORK" && "$LOCK" queue -- "$VENV_IRON/bin/python" \
+  ( cd "$WORK" && $LOCK_CMD "$VENV_IRON/bin/python" \
       "$REPO/designs/decode_fused/bench_precision_arms.py" \
       --spec qwen3-0.6b --weights "$REPO/artifacts/qwen3-0.6b/weights" \
       --layers 28 --max-seq 4096 --pos "$POS" --reps 30 --warmup 5 \

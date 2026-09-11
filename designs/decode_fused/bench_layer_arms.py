@@ -103,7 +103,7 @@ def count_sync_points(src):
 
     The count that matters is not the number of awaits but the number of places the shim queue
     actually drains, so N adjacent awaits closing one TaskGroup are ONE sync point. This
-    reproduces the 10/layer that [[2026-09-11-neither-shim-tasks-nor-barriers-explain-the-residual]]
+    reproduces the 10/layer that
     counted independently from the operators' Python source -- which is the check that the rule
     below is reading the right thing. A `finish()` with no waited task emits no await at all and
     correctly does not appear here.
