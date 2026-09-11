@@ -873,10 +873,32 @@ fn embed(path: &Path, text: &str, model: Option<&str>, as_json: bool) -> Result<
 /// cheap enough to back a `<TAB>`.
 struct Declared {
     kind: Option<String>,
-    /// `None` when the scenario has no `[model]` block at all -- an LLM's precision lives in its
-    /// decode artifact, not the manifest, and inventing "bf16" for it would be a guess wearing a
-    /// measurement's clothes.
+    /// `None` only when nothing DECLARES one. A `[model]` block declares it directly; a generate
+    /// scenario has no such block, but its decode artifact records `weight_quant` -- which is a
+    /// measurement, not a guess, so reading it is exactly what this column is for. Before that it
+    /// printed `-` for every LLM, which read as "unquantized" for a model serving int8.
     precision: Option<String>,
+}
+
+/// The weight format a decode artifact was BUILT at, from its own `meta.json`.
+///
+/// Reported as the MLP site's, because that is the byte majority of a decode token, with a brace
+/// note when the lm-head differs -- the same "braces only on a deviation" rule the env override
+/// follows. Best-effort throughout: this backs a `<TAB>` completion and must never fail a listing
+/// because an artifact is mid-build or predates the field.
+fn artifact_precision(root: Option<&PathBuf>, decode: &str) -> Option<String> {
+    let meta = root?.join(decode).join("meta.json");
+    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(meta).ok()?).ok()?;
+    let wq = v.get("weight_quant")?;
+    let dtype = wq.get("mlp_dtype").and_then(|d| d.as_str())?;
+    let cell = match wq.get("mlp_group_size").and_then(|g| g.as_u64()) {
+        Some(g) if dtype != "bf16" => format!("{dtype}/g{g}"),
+        _ => dtype.to_string(),
+    };
+    match wq.get("head_dtype").and_then(|d| d.as_str()) {
+        Some(h) if h != dtype => Some(format!("{cell} {{head:{h}}}")),
+        _ => Some(cell),
+    }
 }
 
 fn declared(root: Option<&PathBuf>, scenario: &str) -> Declared {
@@ -891,7 +913,15 @@ fn declared(root: Option<&PathBuf>, scenario: &str) -> Declared {
         kind: sc.as_ref().and_then(|c| {
             npu_engine::capability::Capability::from_scenario_kind(&c.scenario.kind).map(|k| k.0.to_string())
         }),
-        precision: sc.as_ref().and_then(|c| c.model.as_ref().map(|m| m.precision.clone())),
+        // The manifest wins where it speaks; the artifact answers for generate, which has no
+        // [model] block to speak with.
+        precision: sc
+            .as_ref()
+            .and_then(|c| c.model.as_ref().map(|m| m.precision.clone()))
+            .or_else(|| {
+                let d = &sc.as_ref()?.artifacts.decode;
+                (!d.is_empty()).then(|| artifact_precision(root, d))?
+            }),
     }
 }
 
