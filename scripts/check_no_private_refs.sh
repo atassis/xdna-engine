@@ -11,6 +11,9 @@
 #   scripts/check_no_private_refs.sh --message  # scan stdin as free text (a commit
 #                                                # message, not a tracked file) --
 #                                                # used by hooks/pre-push per commit.
+#   scripts/check_no_private_refs.sh --staged [files...]   # scan the INDEX (hook mode
+#                                                # for hooks/pre-commit) -- what is about
+#                                                # to be committed, not the working tree.
 #
 # Exit 0 = clean; exit 1 = found a private reference (prints file:line, or the
 # matching line(s) of the text in --message mode).
@@ -66,9 +69,20 @@ cd "$(git rev-parse --show-toplevel)"
 # session had an uncommitted `[[slug]]` in gen_llm_decode.py, while the pushed tree was
 # clean. The working-tree default stays for every other caller -- catching a brand-new
 # unstaged file is exactly why --untracked is load-bearing above.
+#
+# --staged: scan the INDEX (`git grep --cached`), which is what hooks/pre-commit wants --
+# the question there is "does what I am about to COMMIT carry a private reference". Not the
+# working tree, for the same reason --rev exists: a concurrent session sharing this checkout
+# has unsaved edits, and blocking a commit on somebody else's unstaged `[[slug]]` is the
+# 2026-09-09 false-block repeated one stage earlier. Not --rev either, because at pre-commit
+# time the commit does not exist yet.
 REV=""
+STAGED=0
+if [ "${1:-}" = "--staged" ]; then STAGED=1; shift; fi
 if [ "${1:-}" = "--rev" ]; then REV="${2:?--rev needs a committish}"; shift 2; fi
-if [ -n "$REV" ]; then SCAN=("$REV"); UNTRACKED=(); else SCAN=(); UNTRACKED=(--untracked); fi
+if [ "$STAGED" -eq 1 ]; then SCAN=(); UNTRACKED=(--cached)
+elif [ -n "$REV" ]; then SCAN=("$REV"); UNTRACKED=()
+else SCAN=(); UNTRACKED=(--untracked); fi
 
 if [ "$#" -gt 0 ]; then
   files=()
