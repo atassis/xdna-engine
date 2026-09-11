@@ -214,7 +214,7 @@ PRESETS = {
     # [-0.2, +0.3] over 3000 paired positions -- the only format measured on this model whose
     # generation also holds ([[int8-weights-are-quality-free-and-unpriced]]).
     "all-int8": ({"mlp": "int8a/g128", "attn_o": "int8a/g128", "head": "int8a/g128",
-                  "qkv": "int8a/g128"}, "unfused"),
+                  "qkv": "int8a/g128"}, "no-fusion"),
     # The arm the device has run end to end: +7.50% perplexity [+4.05, +11.06] t=4.35 on 2000
     # paired positions ([[the-affine-grid-must-contain-zero]]).
     "mlp-int4": ({"mlp": "int4a/g128/zero_grid", "attn_o": "int4a/g128/zero_grid"}, "fused"),
@@ -512,10 +512,10 @@ def resolved_context(**over) -> GraphContext:
 
 def _main(argv):
     if argv and argv[0] in ("--list", "-l"):
-        print(f"{'preset':16} {'arm':8} {'MB/token':>9} {'ms':>7}  plan")
+        print(f"{'preset':16} {'arm':10} {'MB/token':>9} {'ms':>7}  plan")
         for name, (raw, reach) in PRESETS.items():
             plan = parse_plan(json.dumps(raw))
-            print(f"{name:16} {reach:8} {token_mb(plan)['total']:9.1f} "
+            print(f"{name:16} {reach:10} {token_mb(plan)['total']:9.1f} "
                   f"{predicted_ms_delta(plan):+7.2f}  "
                   f"{ {k: str(v) for k, v in plan.items() if v.quantized} or 'bf16'}")
         return 0
@@ -525,7 +525,9 @@ def _main(argv):
         plan, prov = parse_plan(argv[0]), "argv"
     else:
         plan, prov = plan_from_env()
-    ctx = resolved_context(**({"fused_layer": False, "fuse_o": False}
+    # The arm P003's own message recommends: FUSE_DECODE_LAYER=0 FUSE_QKV_DP=0 FUSE_QKV_GEMV=1.
+    # Turning off only the layer leaves qkv_head_dp holding Wqkv, which has no axis either.
+    ctx = resolved_context(**({"fused_layer": False, "fuse_o": False, "fused_qkv_dp": False}
                               if "--unfused" in argv else {}))
     print(f"[{prov}]  packer: dtypes={list(ctx.packer_dtypes)} "
           f"scale-selection={ctx.packer_takes_scale_kind}")
