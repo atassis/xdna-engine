@@ -426,7 +426,7 @@ def load_weight_buffer(buf, arr):
 
 
 
-def sequence_name(sp, NL, S, placer_flags, decode_layer_active=False, T=None):
+def sequence_name(sp, NL, S, placer_flags, decode_layer_active=False, T=None, tmv_declined=()):
     """Name the fused sequence after everything that changes its graph, not just the model.
 
     IRON keys the cached artifact by this name. Every knob below produces a DIFFERENT ELF, so
@@ -441,8 +441,13 @@ def sequence_name(sp, NL, S, placer_flags, decode_layer_active=False, T=None):
     """
     base = f"{sp.name.replace('-','_').replace('.','_')}_decode"
     parts = []
+    # `noctx` means the whole graph is on the transpose+GEMV context path; `noctx<hd>` means only
+    # the named head_dims are, because TMatVec does not fit their L1. The two MUST NOT share a name:
+    # they are different graphs over the same buffers, and IRON keys its artifact cache on this.
     if not TMV_CTX:
         parts.append("noctx")
+    elif tmv_declined:
+        parts.append("noctx" + "".join(f"_{h}" for h in sorted(tmv_declined)))
     if not GROUPED_K:
         parts.append("nogk")
     # The KV cache's block size (iron.common.kv_layout). T == S (or None, pre-this-task callers)
@@ -955,7 +960,47 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
     # own convention just above. Both arms read/write the SAME buffers, so this must be ONE
     # decision reaching every site, never re-evaluated per site -- a stale T on any one of them
     # would silently disagree with the layout the others wrote.
-    KV_BLOCK_ELIGIBLE = GROUPED_K and TMV_CTX
+    # GEOMETRIES, and the TMatVec verdict per geometry. Both are pure functions of the spec, and
+    # they are derived HERE -- above the KV-block decision -- because that decision has to know
+    # whether EVERY geometry can take the tmatvec path, not just whether the flag is on.
+    geoms = []
+    for l in range(NL):
+        gk = (sp.head_dim_for(l), sp.n_kv_heads_for(l), sp.has_v_proj(l))
+        if gk not in geoms:
+            geoms.append(gk)
+
+    # TMV_CTX IS A PER-GEOMETRY CAPABILITY, NOT A BUILD-WIDE ONE. It used to be refused outright
+    # when any geometry could not take it, which cost Gemma-4 the tmatvec path on all 48 layers
+    # because 8 of them cannot: at head_dim 512 with batch_group 16 the W term alone
+    # (batch_group*K*2) is the entire L1, and no rows_per_chunk touches it. The other 40 fit at
+    # rows_per_chunk 32. The refusal was never about buildability -- it was about the artifact NAME,
+    # since sequence_name() read the global flag and a mixed graph would have collided in the build
+    # cache with an all-tmatvec one. sequence_name() now carries the declining head_dims, so the
+    # name describes the graph and the decline can be per geometry.
+    #
+    # ONE OWNER for the verdict: this dict, consulted by attn_ops below and by the KV-block gate
+    # just under it. Computing it twice is how a stale T silently disagrees with the layout the
+    # other sites wrote -- the failure the KV_BLOCK_ELIGIBLE comment already warns about.
+    tmv_rpc = {}
+    if TMV_CTX:
+        from iron.operators.tmatvec.design import check_l1_fits
+        for _hd, _hkv, _ in geoms:
+            _gqa, _r = Hq // _hkv, TMV_RPC
+            while _r > 1 and (S % _r or check_l1_fits(_hd, S, _gqa, _r) is not None):
+                _r //= 2
+            tmv_rpc[_hd] = None if check_l1_fits(_hd, S, _gqa, _r) is not None else _r
+        for _hd, _r in sorted(tmv_rpc.items()):
+            if _r is None:
+                print(f"[gen] TMV_CTX declined at head_dim={_hd}: TMatVec does not fit L1 at any "
+                      f"rows_per_chunk; that geometry keeps the transpose+GEMV context path")
+            elif _r != TMV_RPC:
+                print(f"[gen] TMatVec rows_per_chunk {TMV_RPC} -> {_r} (L1 fit at head_dim={_hd})")
+
+    # The blocked cache stays a BUILD-WIDE decision even though the tmatvec verdict is not: both
+    # arms read and write the same buffers, so a geometry on the fallback path would be addressing a
+    # layout it cannot express. Blocking therefore needs EVERY geometry on the tmatvec path.
+    _tmv_declined = tuple(sorted(h for h, r in tmv_rpc.items() if r is None))
+    KV_BLOCK_ELIGIBLE = GROUPED_K and TMV_CTX and not _tmv_declined
     _kv_block_env = os.environ.get("KV_BLOCK_T")
     if _kv_block_env is not None:
         T = int(_kv_block_env)
@@ -1090,11 +1135,6 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
     # MLP vocabulary are shaped by d_model, ffn and n_q_heads, none of which varies per layer, so
     # hoisting them in would key them on something they do not depend on and multiply designs for
     # nothing.
-    geoms = []
-    for l in range(NL):
-        gk = (sp.head_dim_for(l), sp.n_kv_heads_for(l), sp.has_v_proj(l))
-        if gk not in geoms:
-            geoms.append(gk)
 
     # ---- which fused arms this MODEL can use ----
     # Whether a fused arm applies is the OPERATOR's rule, not a choice here -- the same shape as
@@ -1146,7 +1186,8 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                         "needs SCALE_IN_QNORM=1 (attn_block_dp has no separate scale stage)"
                         if not (SCALE_IN_QNORM and sp.qk_norm) else
                         "needs GQA_GROUPED_K=1 and TMV_CTX=1 (attn_block_dp computes exactly "
-                        "that variant internally)" if not (GROUPED_K and TMV_CTX) else
+                        "that variant internally)"
+                        if not (GROUPED_K and TMV_CTX and not _tmv_declined) else
                         # The weight FORMAT is not a clause here. The MLP half forwards its
                         # dtype to swiglu_mlp_dp, and a format the attention half cannot carry is
                         # a REFUSAL (P003), not a reason to quietly drop to the unfused arm --
@@ -1353,43 +1394,11 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         # (n_matrices == cols == hkv), so each column streams its own head ONCE and applies both
         # query heads' softmax rows out of L1 -- the stride-0 group re-read goes too.
         # rows_per_chunk=64 puts the L1 A tile at 16 KB double-buffered.
-        if TMV_CTX:
-            # TMV_RPC is a CAP, not the value: the largest chunk that fits L1 depends on head_dim,
-            # and 64 is right for Qwen3's hd=128 and too big for Gemma-3's 256. check_l1_fits is the
-            # operator's own arithmetic, so ask it rather than carrying a second copy of the L1
-            # model here -- or an env constant that was correct for one model and silently wrong for
-            # the next. It runs PER GEOMETRY for the same reason: the answer is a function of hd.
-            from iron.operators.tmatvec.design import check_l1_fits
-            rpc = TMV_RPC
-            while rpc > 1 and (S % rpc or check_l1_fits(hd, S, gqa, rpc) is not None):
-                rpc //= 2
-            if rpc != TMV_RPC:
-                print(f"[gen] TMatVec rows_per_chunk {TMV_RPC} -> {rpc} (L1 fit at head_dim={hd})")
-            # RAISE HERE, NAMING THE FLAG, rather than letting the operator raise two frames down.
-            # rpc bottoms out at 1 and the shape can still not fit: Gemma-4's global layers are the
-            # case, where C = 2*gqa*hd*2 and acc = gqa*hd*4 are 32768 B each at gqa 16, hd 512 and
-            # fill L1 between them with W at zero -- neither depends on rows_per_chunk or on S, so
-            # the loop above cannot help and shrinking max_seq cannot either.
-            #
-            # NOT auto-falling-back to op_trv, though that path exists and is correct. The decline
-            # would be PER GEOMETRY while sequence_name() reads the GLOBAL TMV_CTX, so a Gemma-4
-            # build would emit a mixed graph -- global layers on op_trv, sliding layers on TMatVec
-            # -- under a name claiming TMV_CTX throughout, and collide in the build cache with a
-            # design that is genuinely all-TMatVec. An artifact whose name does not describe it is
-            # worse than a build error.
-            #
-            # Cost of not naming the flag, measured 2026-09-09: a session lost a full build to
-            # `TMatVec does not fit L1` on a model whose recorded working config sets TMV_CTX=0,
-            # with nothing connecting the two. The reproduction flags lived in the task, not here.
-            msg = check_l1_fits(hd, S, gqa, rpc)
-            if msg is not None:
-                raise SystemExit(
-                    f"[gen] TMV_CTX=1 cannot serve this geometry (head_dim={hd}, S={S}, "
-                    f"batch_group={gqa}): {msg}\n"
-                    f"[gen] Set TMV_CTX=0. That selects the op_trv context path, which is correct "
-                    f"here and is the config this model's artifacts were built with; it is slower "
-                    f"(TMV_CTX was worth ~1.25x in the 2026-09-07 four-arm A/B), which is why this "
-                    f"is your decision and not a silent fallback.")
+        # The verdict and its rows_per_chunk come from `tmv_rpc`, derived once above -- not
+        # recomputed here. A second copy of the L1 model is exactly how the two would drift.
+        rpc = tmv_rpc.get(hd)
+        uses_tmv = rpc is not None
+        if uses_tmv:
             op_ctx = TMatVec(M=hd, K=S, num_aie_columns=hkv, num_batches=Hq, batch_group=gqa,
                                  alloc_K=None if KVA == S else KVA, block_size=T,
                              rows_per_chunk=rpc, context=ctx)
@@ -1401,7 +1410,8 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
             op_kv=op_kv, op_o=op_o, op_rope_qk=op_rope_qk, op_qkv_dp=op_qkv_dp,
             op_rope_q=op_rope_q, op_rope_k=op_rope_k, op_sck=op_sck, op_scv=op_scv,
             op_rep_k=op_rep_k, op_rep_v=op_rep_v, op_scores=op_scores, op_trv=op_trv,
-            op_ctx=op_ctx, op_v_norm=op_v_norm, has_v=has_v, kv_parts=kv_parts)
+            op_ctx=op_ctx, op_v_norm=op_v_norm, has_v=has_v, kv_parts=kv_parts,
+            uses_tmv_ctx=uses_tmv)
         _attn_cache[(hd, hkv, has_v)] = g
         return g
 
@@ -1803,9 +1813,9 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         })
         if not GROUPED_K:
             bufsz[p + "kr"] = Hq * S * g.hd * 2
-        if not (GROUPED_V or TMV_CTX):
+        if not (GROUPED_V or g.uses_tmv_ctx):
             bufsz[p + "vr"] = Hq * S * g.hd * 2
-        if not TMV_CTX:
+        if not g.uses_tmv_ctx:
             bufsz[p + "vt"] = Hq * S * g.hd * 2
         # `a` is purely internal to op_mlp_dp's own fuse_o path (never an L3 buffer -- see
         # design.py) once folded; only declare it when something outside that design still reads
@@ -1877,12 +1887,13 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                 *([] if GROUPED_K else [(g.op_rep_k, p + "kc", p + "kr")]),
                 # TMV_CTX subsumes the v-side grouping: TMatVec reads vc per kv head itself, so a
                 # Repeat would materialise a `vr` nothing consumes.
-                *([] if (GROUPED_V or TMV_CTX) else [(g.op_rep_v, p + "vc", p + "vr")]),
+                *([] if (GROUPED_V or g.uses_tmv_ctx) else [(g.op_rep_v, p + "vc", p + "vr")]),
                 (g.op_scores, p + ("kc" if GROUPED_K else "kr"), ref_q, p + "sc"),
                 *([] if scale_in_qnorm else [(op_scale, p + "sc", "attn_scale", p + "sc")]),
                 (op_softmax, p + "sc", p + "sw"),
-                *([] if TMV_CTX else [(g.op_trv, p + ("vc" if GROUPED_V else "vr"), p + "vt")]),
-                (g.op_ctx, p + ("vc" if TMV_CTX else "vt"), p + "sw", p + "cx"),
+                *([] if g.uses_tmv_ctx else
+                  [(g.op_trv, p + ("vc" if GROUPED_V else "vr"), p + "vt")]),
+                (g.op_ctx, p + ("vc" if g.uses_tmv_ctx else "vt"), p + "sw", p + "cx"),
                 *([] if fuse_o else o_runlist(p, g)),
             ]
             if sp.sandwich_norms:
@@ -2041,7 +2052,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
             seg_bufsz[seg_in] = D * 2
         if not last:
             seg_bufsz[seg_out] = D * 2
-        _sn = sequence_name(sp, NL, S, placer_flags,
+        _sn = sequence_name(sp, NL, S, placer_flags, tmv_declined=_tmv_declined,
                             decode_layer_active=op_decode_layer is not None, T=T)
         name = _sn if len(cuts) == 1 else f"{_sn}_seg{si}of{len(cuts)}"
         # A rung is THIS runlist with the layer design substituted. Only for an unsplit
@@ -2095,7 +2106,8 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
     head = None
     if SPLIT_LM_HEAD:
         head_rl = [(op_head, "W_head", "xf", "logits")]
-        head = OperatorSequence(f"{sequence_name(sp, NL, S, placer_flags)}_lmhead", head_rl,
+        head = OperatorSequence(
+            f"{sequence_name(sp, NL, S, placer_flags, tmv_declined=_tmv_declined)}_lmhead", head_rl,
                                 input_args=["xf"], output_args=["logits"],
                                 buffer_sizes={"xf": D * 2, "logits": VOCAB * 2},
                                 context=ctx, extra_flags=placer_flags, share_designs=share)
