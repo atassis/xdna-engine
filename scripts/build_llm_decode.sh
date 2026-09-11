@@ -40,6 +40,15 @@ iron_at="$(iron_require_api "gen_llm_decode.py" \
   "iron/operators/tmatvec/op.py:class TMatVec" \
   "iron/operators/gemv/quant.py:def quantize_weight" \
   "iron/operators/qkv_head_dp/op.py:class QKVHeadDataParallel")" || exit 1
+# WINDOW_RUNGS needs an API surface that the DEFAULT IRON_DIR does not have, so it is gated
+# separately rather than added to the list above -- requiring it unconditionally would break every
+# decode build against an IRON without it, including the rung-free default this arm leaves inert.
+# Without this the failure is a late TypeError naming a kwarg, which is the same shape that broke
+# every decode build on 2026-09-10 when window_parameter was handed through unconditionally.
+if [ -n "${WINDOW_RUNGS:-}" ]; then
+  iron_require_api "gen_llm_decode.py (WINDOW_RUNGS=$WINDOW_RUNGS)" \
+    "iron/common/sequence.py:extra_runlists" >/dev/null || exit 1
+fi
 echo "[build] IRON on $iron_at (API surface verified)"
 [ -d "$WEIGHTS" ] || { echo "ERROR: no weights at $WEIGHTS (run scripts/dump_llm_weights.py)"; exit 1; }
 
