@@ -181,8 +181,13 @@ def main():
         # generator's module globals, which the manifest only overrides once build_graph runs --
         # and the point of this check is to fire BEFORE the build is paid for.
         _qm = os.path.join(a.weights, "quant.json")
-        bq = ({"dtype": (_j := json.load(open(_qm)))["dtype"], "group": int(_j["group_size"])}
-              if os.path.isfile(_qm) else {"dtype": QUANT_MLP_DTYPE, "group": QUANT_MLP_GROUP})
+        _j = json.load(open(_qm)) if os.path.isfile(_qm) else None
+        # PACKED, not the file's existence, is what makes the manifest the authority -- build_graph
+        # gates on `if PACKED:` for the same reason. dump_llm_weights.py writes quant.json
+        # UNCONDITIONALLY, so a plain bf16 dump carries {"dtype": "bf16", "packed": []}, and reading
+        # that as an authority makes an int8 build look like a bf16 one and refuses a correct run.
+        bq = ({"dtype": _j["dtype"], "group": int(_j["group_size"])}
+              if _j and _j.get("packed") else {"dtype": QUANT_MLP_DTYPE, "group": QUANT_MLP_GROUP})
         if (rq["dtype"], int(rq["group"])) != (bq["dtype"], int(bq["group"])) and not (
                 rq["dtype"] == "bf16" and bq["dtype"] == "bf16"):
             raise SystemExit(
