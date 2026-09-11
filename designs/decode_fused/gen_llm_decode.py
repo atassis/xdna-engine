@@ -80,6 +80,7 @@ from iron.common.kv_layout import KVLayout, derive_block_size  # noqa: E402
 from elf_dispatch_compat import OperatorSequence, load_elf  # noqa: E402
 from iron.operators.gemv.op import GEMV  # noqa: E402
 from iron.operators.gemv.quant import quantize_weight  # noqa: E402
+import precision  # noqa: E402
 from iron.operators.rms_norm.op import RMSNorm  # noqa: E402
 from iron.operators.rope.op import RoPE  # noqa: E402
 from iron.operators.elementwise_add.op import ElementwiseAdd  # noqa: E402
@@ -101,53 +102,42 @@ def bf16(a):
     return np.asarray(a).astype(BF16)
 
 
-# Engineering-check MLP weight quantization axis (Wg/Wu/Wd -- the "MLP weights" byte class), gated
-# by env vars so build/verify/bench need no CLI plumbing to A/B it, matching DECODE_PLACER_FLAGS'
-# convention. QUANT_MLP_DTYPE="bf16" (default) is a no-op: every GEMV byte-for-byte unchanged.
-# NOT a quality claim: this axis is validated as a byte-stream + determinism engineering check on
-# Qwen3-0.6B, not a token-quality gate (tests/refs/qwen3-0.6b/bf16_oracle.json is 1 prompt / 8
-# free-running tokens with knife-edge logit margins -- too small to see quantization damage).
-# Accepted values: "bf16" (default, no-op), the SYMMETRIC "int4"/"int8" (w = q*s), and the
-# AFFINE "int4a"/"int8a" (w = q*s + m, a bf16 scale and a bf16 min per group -- GGUF Q4_1's
-# shape, and what FastFlowLM's shipped codec stores). Affine costs the same bytes as symmetric
-# at the same nominal width once the f32 scale is dropped, and is measured better everywhere;
-# see iron/operators/gemv/quant.py for the layout and the byte arithmetic.
-_QUANT_DTYPES = ("bf16", "int4", "int8", "int4a", "int8a")
-QUANT_MLP_DTYPE = os.environ.get("QUANT_MLP_DTYPE", "bf16")
-QUANT_MLP_GROUP = int(os.environ.get("QUANT_MLP_GROUP", "128"))
-
-# Same axis, same GEMV(weight_dtype=...) mechanism, applied to Wo (attention output projection,
-# "Wo" -- the "attention weights" byte class) instead of the MLP. Independent env vars so an A/B
-# can quantize Wo without touching Wg/Wu/Wd, and vice versa. Same caveat as QUANT_MLP_DTYPE: an
-# engineering-check byte-stream axis, not a validated model default.
-QUANT_ATTN_DTYPE = os.environ.get("QUANT_ATTN_DTYPE", "bf16")
-QUANT_ATTN_GROUP = int(os.environ.get("QUANT_ATTN_GROUP", "128"))
-
-# Same axis again, applied to W_head, the FINAL lm-head GEMV's weight.
+# PRECISION. The per-site weight-format plan is declarative and lives in designs/decode_fused/
+# precision.py: `PRECISION=<preset>`, `PRECISION='{"mlp": "int8a/g128"}'`, or a path to such a
+# file. The legacy QUANT_MLP_DTYPE / QUANT_ATTN_DTYPE / QUANT_HEAD_DTYPE / QUANT_*_GROUP /
+# QUANT_CLIP_SEARCH variables still resolve to a plan, and setting both forms is refused.
 #
-# W_head IS THE TIED EMBEDDING TABLE, not an independent lm-head weight -- built below from
-# `model.embed_tokens.weight` (Qwen3 ties them), and rust/npu-engine's NpuDecodeStep gathers the
-# next step's `embed[token]` out of a bf16 [vocab, d_model] blob. Quantizing splits the tensor
-# across its two consumers: the device GEMV reads the packed W_head, while `meta.json`'s
-# `embed_blob` points the host gather at a bf16 W_embed sidecar emitted beside it (npu_decode.rs
-# resolves that field and size-gates whichever blob it names). The sidecar costs 311 MB of disk
-# and ZERO device arena -- the host faults in one 2 KB row per token -- and it holds the embedding
-# INPUT at full width, so this axis moves the lm-head projection alone.
-QUANT_HEAD_DTYPE = os.environ.get("QUANT_HEAD_DTYPE", "bf16")
-QUANT_HEAD_GROUP = int(os.environ.get("QUANT_HEAD_GROUP", "128"))
+# WHICH COMBINATIONS ARE BUILDABLE is a property of this graph, not of the formats: it depends on
+# which weights share an ObjectFifo, which operator declares each buffer, and how many shim
+# channels are left. None of that is knowable here, so the plan is CHECKED in build_graph once
+# the fused arms are decided, and `precision.check()` names the rule it refuses on.
+PRECISION_PLAN, PRECISION_PROV = precision.plan_from_env()
 
-# Scale-selection method shared by every quantized weight class above. Default takes each group's
-# scale from its absmax; 1 grid-searches the clip ratio minimising that group's reconstruction MSE.
-# Host-side only -- same wire format, same kernel -- so it A/Bs against a shipped artifact.
-QUANT_CLIP_SEARCH = os.environ.get("QUANT_CLIP_SEARCH", "0") != "0"
 
-for _n, _v in (("QUANT_MLP_DTYPE", QUANT_MLP_DTYPE), ("QUANT_ATTN_DTYPE", QUANT_ATTN_DTYPE),
-               ("QUANT_HEAD_DTYPE", QUANT_HEAD_DTYPE)):
-    # Fail here rather than at link. An unknown value reaches design.py as part of a kernel
-    # symbol name (matvec_vectorized_<dtype>_bf16) and an archive name, so a typo currently
-    # surfaces as "undefined symbol" after a full compile.
-    if _v not in _QUANT_DTYPES:
-        raise SystemExit(f"{_n}={_v!r} is not one of {_QUANT_DTYPES}")
+def _spec(site):
+    return PRECISION_PLAN.get(site, precision.BF16_SPEC)
+
+
+def _quant_kw(site):
+    """`weight_dtype`/`group_size` kwargs for the operator carrying one site's weight. Empty at
+    bf16, so an unquantized call is the shape it would have had with no precision plane."""
+    spec = _spec(site)
+    return {} if not spec.quantized else dict(weight_dtype=spec.dtype,
+                                              group_size=spec.group_size)
+
+
+def _pack(w, site):
+    """Host-side pack of one weight under its site's spec, into the packer's wire format."""
+    spec = _spec(site)
+    if not spec.quantized:
+        return bf16(w).reshape(-1)
+    kw = {}
+    if spec.dtype in precision.SYMMETRIC and spec.scale_kind == "clip":
+        kw["clip_search"] = True
+    elif spec.dtype in precision.AFFINE:
+        kw["zero_on_grid"] = spec.scale_kind == "zero_grid"
+    return quantize_weight(w, spec.group_size, spec.dtype, **kw)
+
 
 DECODE_PLACER_FLAGS_DEFAULT = "--cores-per-col 1"
 
@@ -384,12 +374,18 @@ def sequence_name(sp, NL, S, placer_flags, decode_layer_active=False, T=None):
         parts.append("noropeqk")
     if sp.qk_norm and not SCALE_IN_QNORM:
         parts.append("noscaleqn")
-    if QUANT_MLP_DTYPE != "bf16":
-        parts.append(f"{QUANT_MLP_DTYPE}g{QUANT_MLP_GROUP}")
-    if QUANT_ATTN_DTYPE != "bf16":
-        parts.append(f"attn{QUANT_ATTN_DTYPE}g{QUANT_ATTN_GROUP}")
-    if QUANT_HEAD_DTYPE != "bf16":
-        parts.append(f"head{QUANT_HEAD_DTYPE}g{QUANT_HEAD_GROUP}")
+    # One fragment per quantized site. scale_kind rides the name only when it is not the class
+    # default: it moves weight VALUES at a fixed wire format, so two arms differing in it are the
+    # same GRAPH and would otherwise collide as ARTIFACTS.
+    for _site, _tag in (("mlp", ""), ("attn_o", "attn"), ("head", "head"), ("qkv", "qkv"),
+                        ("kv", "kv")):
+        _sp = PRECISION_PLAN.get(_site, precision.BF16_SPEC)
+        if not _sp.quantized:
+            continue
+        _frag = f"{_tag}{_sp.dtype}g{_sp.group_size}"
+        if _sp != precision.parse_spec(f"{_sp.dtype}/g{_sp.group_size}", _site):
+            _frag += _sp.scale_kind
+        parts.append(_frag)
     if SPLIT_QKNORM:
         parts.append("splitqk")
     # Suffix stays ON the default here, unlike the other switches: the shipped artifact was BUILT
@@ -723,7 +719,12 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
                 f"design.py) -- set GQA_GROUPED_K=1 TMV_CTX=1 or KV_BLOCK_T={S}"
             )
     else:
-        T = derive_block_size(HD, Hkv, S=S, n_cols=COLS) if KV_BLOCK_ELIGIBLE else S
+        # addr_gran_elems is dtype-dependent -- a 4-byte granule over the cache's element width
+        # -- and derive_block_size's own default is bf16's answer to a question it does not know
+        # it is asking. precision.kv_addr_gran_elems owns that conversion.
+        T = (derive_block_size(HD, Hkv, S=S, n_cols=COLS,
+                               addr_gran_elems=precision.kv_addr_gran_elems(PRECISION_PLAN))
+             if KV_BLOCK_ELIGIBLE else S)
     if T != S:
         assert S % T == 0, (
             f"T={T} does not divide S ({S}) -- pick an S that is a multiple of T"
@@ -787,10 +788,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
                     if (sp.qk_norm and SPLIT_QKNORM) else op_qk_norm)
     # QKV projection: one GEMV over the concatenated weight, or the three separate ones. op_kv is
     # built in both arms because share_designs pairs Wk with Wv only in the unfused one.
-    # Wo weight-stream dtype axis (see QUANT_ATTN_DTYPE above). bf16 (default) is byte-for-byte the
-    # pre-existing path.
-    attn_quant_kw = (dict(weight_dtype=QUANT_ATTN_DTYPE, group_size=QUANT_ATTN_GROUP)
-                     if QUANT_ATTN_DTYPE != "bf16" else {})
+    attn_quant_kw = _quant_kw("attn_o")
     # ---- which fused arms this MODEL can use ----
     # Whether a fused arm applies is the OPERATOR's rule, not a choice here -- the same shape as
     # fuse_act further down, which already asks the GEMV instead of assuming. The env flag can only
@@ -805,17 +803,49 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
     fuse_o = FUSE_MLP_O and mlp_dp_why is None
     for arm, why in (("qkv_head_dp", qkv_dp_why), ("swiglu_mlp_dp", mlp_dp_why)):
         print(f"[gen] fused arm {arm}: {'OFF -- ' + why if why else 'on'}")
-    if fuse_o:
-        if QUANT_ATTN_DTYPE != "bf16":
-            # Under fuse_o, Wo rides the MLP design's single weight ObjectFifo, and one fifo
-            # carries one wire format. So Wo's dtype is QUANT_MLP_DTYPE's, not its own axis --
-            # QUANT_ATTN_DTYPE would silently mean nothing here rather than a little.
-            raise NotImplementedError(
-                "FUSE_MLP_O folds Wo into swiglu_mlp_dp's shared weight channel, so Wo takes "
-                f"QUANT_MLP_DTYPE ({QUANT_MLP_DTYPE!r}), not QUANT_ATTN_DTYPE "
-                f"({QUANT_ATTN_DTYPE!r}); set FUSE_MLP_O=0 to quantize Wo independently"
-            )
-    op_qkv = gemv(QD + 2 * KVD, D, ctx) if FUSE_QKV_GEMV else None
+    # WHICH ARM CARRIES THE LAYER, decided before anything is constructed: the precision check
+    # below is conditional on it, and every clause here is a spec/flag question that needs no
+    # operator. Eligibility is the union of qkv_dp_why/mlp_dp_why (the spec-shape rules
+    # attn_block_dp and swiglu_mlp_dp already check) plus what is true only of the MERGED device:
+    # attn_block_dp's own Hkv==COLS rule, and no sandwich norms (the op has no post-attn/post-ffn
+    # norm slot).
+    decode_layer_why = ("FUSE_DECODE_LAYER=0" if not FUSE_DECODE_LAYER else
+                        qkv_dp_why if qkv_dp_why else
+                        mlp_dp_why if mlp_dp_why else
+                        "needs FUSE_MLP_O=1 (Wo's padding is wired through that flag via "
+                        "op_mlp_dp._wo_rows_padded, and decode_layer_dp always fuses Wo)"
+                        if not FUSE_MLP_O else
+                        f"needs Hkv ({Hkv}) == COLS ({COLS})" if Hkv != COLS else
+                        "needs SCALE_IN_QNORM=1 (attn_block_dp has no separate scale stage)"
+                        if not (SCALE_IN_QNORM and sp.qk_norm) else
+                        "needs GQA_GROUPED_K=1 and TMV_CTX=1 (attn_block_dp computes exactly "
+                        "that variant internally)" if not (GROUPED_K and TMV_CTX) else
+                        # The weight FORMAT is not a clause here. The MLP half forwards its
+                        # dtype to swiglu_mlp_dp, and a format the attention half cannot carry is
+                        # a REFUSAL (P003), not a reason to quietly drop to the unfused arm --
+                        # which is what silently unfusing a whole decoder layer used to be.
+                        None)
+
+    # THE PRECISION PLAN IS CHECKED HERE, not at the top of the file: which combinations are
+    # buildable depends on the fused arms decided just above (which weights share an ObjectFifo,
+    # which operator declares which buffer, how many shim channels are spent). Refusing here is
+    # what turns "undefined symbol" and "weight byte-size mismatch: buf 6291456 vs arr 1671168"
+    # into a named rule.
+    _pdtypes, _pkind = precision.packer_capability()
+    precision_ctx = precision.GraphContext(
+        fused_layer=decode_layer_why is None and FUSE_DECODE_LAYER,
+        fuse_o=fuse_o, fused_qkv_gemv=bool(FUSE_QKV_GEMV),
+        d_model=D, ffn=FF, q_dim=QD, head_dim=HD, attn_cols=COLS,
+        packer_dtypes=_pdtypes, packer_takes_scale_kind=_pkind)
+    precision.check(PRECISION_PLAN, precision_ctx)
+    print(f"[gen] precision [{PRECISION_PROV}]")
+    for _line in precision.describe(PRECISION_PLAN).splitlines()[1:]:
+        print(f"[gen] {_line}")
+
+    # Wqkv's own dtype axis. The concatenated [Wq|Wk|Wv] GEMV has its own weight ObjectFifo, so
+    # it takes a format independently -- which the fused layer's attention half does NOT, because
+    # attn_block_dp streams Wqkv, K and V down one fifo per core (P002/P003 above).
+    op_qkv = gemv(QD + 2 * KVD, D, ctx, **_quant_kw("qkv")) if FUSE_QKV_GEMV else None
     op_q = gemv(QD, D, ctx)
     op_kv = gemv(KVD, D, ctx)
     op_o = None if fuse_o else gemv(D, QD, ctx, **attn_quant_kw)
@@ -923,11 +953,10 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
                          rows_per_chunk=rpc, context=ctx, block_size=T)
     else:
         op_ctx = gemv(HD, S, ctx, num_batches=Hq)
-    # MLP weight-stream dtype axis (Wg/Wu/Wd -- "MLP weights" in the byte breakdown, the largest
-    # single weight class). bf16 (default) is byte-for-byte the pre-existing path; QUANT_MLP_DTYPE
+    # MLP weight-stream dtype axis (Wg/Wu/Wd -- "mlp" in the byte census, the largest single
+    # weight class).
     # is an engineering-check toggle (see its definition above), not a quality-validated default.
-    mlp_quant_kw = (dict(weight_dtype=QUANT_MLP_DTYPE, group_size=QUANT_MLP_GROUP)
-                    if QUANT_MLP_DTYPE != "bf16" else {})
+    mlp_quant_kw = _quant_kw("mlp")
     # The activation runs on the gate projection's output, immediately after it and before anything
     # else reads `g`, so folding it into that GEMV's epilogue preserves the order exactly.
     # Two things can veto the fold, and both are the operator's own rules rather than choices here:
@@ -937,7 +966,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
     _gate_tso = gemv_tile_output(FF, D)[1]
     fuse_act = (
         FUSE_ACT
-        and QUANT_MLP_DTYPE == "bf16"
+        and not _spec("mlp").quantized
         and _gate_tso % 32 == 0
     )
     op_gate = gemv(FF, D, ctx, **mlp_quant_kw,
@@ -954,26 +983,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
                                           tile_rows_gu=MLP_TILE_ROWS,
                                           **mlp_quant_kw)
     # The whole decoder layer (attention + MLP) as ONE fused device -- see FUSE_DECODE_LAYER above.
-    # Eligibility is the union of qkv_dp_why/mlp_dp_why (the spec-shape rules attn_block_dp and
-    # swiglu_mlp_dp already check) plus what is true only of the MERGED device: attn_block_dp's own
-    # Hkv==COLS rule, no sandwich norms (the op has no post-attn/post-ffn norm slot), and no
-    # quantized weight stream (its kernel archive is plain bf16 mv.cc, built once, not per weight
-    # dtype -- see get_kernel_artifacts in iron/operators/decode_layer_dp/op.py).
     op_decode_layer = None
-    decode_layer_why = ("FUSE_DECODE_LAYER=0" if not FUSE_DECODE_LAYER else
-                        qkv_dp_why if qkv_dp_why else
-                        mlp_dp_why if mlp_dp_why else
-                        "needs FUSE_MLP_O=1 (Wo's padding is wired through that flag via "
-                        "op_mlp_dp._wo_rows_padded, and decode_layer_dp always fuses Wo)"
-                        if not FUSE_MLP_O else
-                        f"needs Hkv ({Hkv}) == COLS ({COLS})" if Hkv != COLS else
-                        "needs SCALE_IN_QNORM=1 (attn_block_dp has no separate scale stage)"
-                        if not (SCALE_IN_QNORM and sp.qk_norm) else
-                        "needs GQA_GROUPED_K=1 and TMV_CTX=1 (attn_block_dp computes exactly "
-                        "that variant internally)" if not (GROUPED_K and TMV_CTX) else
-                        "needs QUANT_MLP_DTYPE=bf16 and QUANT_ATTN_DTYPE=bf16 (plain-bf16 kernel "
-                        "archive, no quantized-weight variant)"
-                        if QUANT_MLP_DTYPE != "bf16" or QUANT_ATTN_DTYPE != "bf16" else None)
     rung_ops = {}
     if decode_layer_why is None:
         from iron.operators.decode_layer_dp.op import DecodeLayerDataParallel
@@ -998,7 +1008,12 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
                 # 2026-09-10: it broke every decode build on the default path, DYNAMIC_WINDOW=0
                 # included, because an unknown kwarg fails at the call and never reaches the flag
                 # test inside.
-                **({"window_parameter": "attn_window"} if DYNAMIC_WINDOW else {}))
+                **({"window_parameter": "attn_window"} if DYNAMIC_WINDOW else {}),
+                # Same conditional-kwarg discipline as window_parameter above, for the same
+                # reason: an IRON whose decode_layer_dp predates the axis takes a TypeError on
+                # the call, before any flag test inside it. The MLP half's four weights (Wo, Wg,
+                # Wu, Wd) share one fifo and one format, which P002 has already enforced.
+                **_quant_kw("mlp"))
 
         op_decode_layer = _decode_layer(S)
         # A rung is the SAME design at a narrower window over the SAME capacity, so `kv_alloc`
@@ -1028,10 +1043,9 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
     op_mul_ffn = ElementwiseMul(size=FF, tile_size=FF // COLS, num_aie_columns=COLS, context=ctx)
     op_down = gemv(D, FF, ctx, **mlp_quant_kw)
     op_add = ElementwiseAdd(size=D, tile_size=D // COLS, num_aie_columns=COLS, context=ctx)
-    # W_head weight-stream dtype axis (see QUANT_HEAD_DTYPE above -- READ THE TIED-EMBEDDING NOTE
+    # W_head weight-stream dtype axis (READ THE TIED-EMBEDDING NOTE
     # before turning this on).
-    head_quant_kw = (dict(weight_dtype=QUANT_HEAD_DTYPE, group_size=QUANT_HEAD_GROUP)
-                     if QUANT_HEAD_DTYPE != "bf16" else {})
+    head_quant_kw = _quant_kw("head")
     op_head = gemv(VOCAB, D, ctx, **head_quant_kw)
 
     weights, bufsz, cache_names, rl = {}, {}, [], []
@@ -1055,29 +1069,26 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
                             ("Wv", "self_attn.v_proj"), ("Wo", "self_attn.o_proj"),
                             ("Wg", "mlp.gate_proj"), ("Wu", "mlp.up_proj"), ("Wd", "mlp.down_proj")):
             w = npy(f"model.layers.{l}.{tensor}.weight")  # [M, K], f32
-            if key in mlp_keys and QUANT_MLP_DTYPE != "bf16":
-                weights[p + key] = quantize_weight(w, QUANT_MLP_GROUP, QUANT_MLP_DTYPE, clip_search=QUANT_CLIP_SEARCH)
-            elif key == "Wo" and QUANT_ATTN_DTYPE != "bf16":
-                weights[p + key] = quantize_weight(w, QUANT_ATTN_GROUP, QUANT_ATTN_DTYPE, clip_search=QUANT_CLIP_SEARCH)
-            elif key == "Wo" and fuse_o:
-                # Pad FIRST, then quantize: the pad rows must be a whole number of groups in the
-                # same wire format as the rest of the channel. Zero rows quantize to amax=0 ->
-                # scale 1.0, q=0, so their contribution stays exactly zero.
-                # swiglu_mlp_dp's fuse_o tiles Wo's D output rows in TSI_O=3-row groups shared
-                # byte-identically with Wg/Wu/Wd's weight channel; D/MLP_DP_COLS is never a
-                # multiple of 3 (D is a power of two), so every core reads one row PAST its own
-                # slice and the last core's read would run off the end of Wo -- padded here with
-                # `_wo_rows_padded - D` zero rows so that read stays in bounds. Their computed
-                # contribution is exactly zero and is never drained (see design.py's FUSE_O
-                # module docstring for the full derivation).
-                pad_rows = op_mlp_dp._wo_rows_padded - D
-                w_padded = np.pad(w, ((0, pad_rows), (0, 0)))
-                weights[p + key] = (
-                    quantize_weight(w_padded, QUANT_MLP_GROUP, QUANT_MLP_DTYPE, clip_search=QUANT_CLIP_SEARCH)
-                    if QUANT_MLP_DTYPE != "bf16" else bf16(w_padded).reshape(-1)
-                )
+            if key in mlp_keys:
+                weights[p + key] = _pack(w, "mlp")
+            elif key == "Wo":
+                if fuse_o:
+                    # Pad FIRST, then quantize: the pad rows must be a whole number of groups in
+                    # the same wire format as the rest of the channel. Zero rows quantize to
+                    # amax=0 -> scale 1.0, q=0, so their contribution stays exactly zero.
+                    # swiglu_mlp_dp's fuse_o tiles Wo's D output rows in TSI_O=3-row groups shared
+                    # byte-identically with Wg/Wu/Wd's weight channel; D/MLP_DP_COLS is never a
+                    # multiple of 3 (D is a power of two), so every core reads one row PAST its
+                    # own slice and the last core's read would run off the end of Wo -- padded
+                    # here with `_wo_rows_padded - D` zero rows so that read stays in bounds.
+                    # Their computed contribution is exactly zero and is never drained (see
+                    # design.py's FUSE_O module docstring for the full derivation).
+                    w = np.pad(w, ((0, op_mlp_dp._wo_rows_padded - D), (0, 0)))
+                # Under fuse_o, Wo rides the MLP's weight fifo and takes its format; P002 has
+                # already refused any plan where the two disagree.
+                weights[p + key] = _pack(w, "mlp" if fuse_o else "attn_o")
             elif key in qkv_keys and FUSE_QKV_GEMV:
-                qkv_parts.append(bf16(w).reshape(-1))     # row-major, so concatenation IS stacking
+                qkv_parts.append(_pack(w, "qkv"))         # row-major, so concatenation IS stacking
             else:
                 weights[p + key] = bf16(w).reshape(-1)
         if FUSE_QKV_GEMV:
@@ -1087,7 +1098,10 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
                 # of (gqa+2) HD-row blocks: its gqa query heads, then its own k head, then its own
                 # v head -- a build-time numpy reorder of the stock [Wq|Wk|Wv] rows, same bytes.
                 gqa = Hq // Hkv
-                wq2, wk2, wv2 = (a.reshape(-1, D) for a in qkv_parts)
+                # Row width in WIRE UNITS, not D: a packed row is `[header][payload]` bytes
+                # wide, so the reorder steps by the wire stride or it shuffles row fragments.
+                row_w = precision.wire_row_units(_spec("qkv"), D)
+                wq2, wk2, wv2 = (a.reshape(-1, row_w) for a in qkv_parts)
                 parts = []
                 for c in range(Hkv):
                     parts += [wq2[(gqa * c + g) * HD:(gqa * c + g + 1) * HD] for g in range(gqa)]
@@ -1252,8 +1266,8 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
     # file costs 311 MB of disk and ZERO device arena, and the host only ever faults in the one
     # 2 KB row it gathers.
     embed_blob, host_embed = "W_head", None
-    if QUANT_HEAD_DTYPE != "bf16":
-        weights["W_head"] = quantize_weight(embed_f32, QUANT_HEAD_GROUP, QUANT_HEAD_DTYPE, clip_search=QUANT_CLIP_SEARCH)
+    if _spec("head").quantized:
+        weights["W_head"] = _pack(embed_f32, "head")
         embed_blob = "W_embed"
         host_embed = bf16(embed_f32).reshape(-1)
     else:
@@ -1444,13 +1458,22 @@ def main():
                           "rope_theta_local": sp.rope_theta_local},
         "layer_types": ["global" if sp.is_global(l) else "sliding" for l in range(NL)],
         "cache_buffers": cache_names,
-        # Engineering-check axis (see QUANT_MLP_DTYPE above), not a validated model default.
-        # clip_search rides here rather than in the design name: it moves weight VALUES only, so
-        # two arms share one compiled design and differ solely in the bytes loaded into it.
-        "weight_quant": {"mlp_dtype": QUANT_MLP_DTYPE, "mlp_group_size": QUANT_MLP_GROUP,
-                         "attn_dtype": QUANT_ATTN_DTYPE, "attn_group_size": QUANT_ATTN_GROUP,
-                         "head_dtype": QUANT_HEAD_DTYPE, "head_group_size": QUANT_HEAD_GROUP,
-                         "clip_search": QUANT_CLIP_SEARCH},
+        # `plan` is the whole per-site truth and `projected_mb_per_token` is what it was priced
+        # at; the flat keys beside them are the shape npu_decode.rs::provenance_extras reads.
+        # scale_kind rides here rather than in the design name whenever it is the class default:
+        # it moves weight VALUES only, so two such arms share one compiled design and differ
+        # solely in the bytes loaded into it.
+        "weight_quant": {
+            "plan": {k: str(v) for k, v in sorted(PRECISION_PLAN.items())},
+            "plan_source": PRECISION_PROV,
+            "projected_mb_per_token": round(
+                precision.token_mb(PRECISION_PLAN)["total"], 2),
+            "mlp_dtype": _spec("mlp").dtype, "mlp_group_size": _spec("mlp").group_size or 128,
+            "attn_dtype": _spec("attn_o").dtype,
+            "attn_group_size": _spec("attn_o").group_size or 128,
+            "head_dtype": _spec("head").dtype, "head_group_size": _spec("head").group_size or 128,
+            "clip_search": any(v.scale_kind == "clip" for v in PRECISION_PLAN.values()),
+        },
     }
     prov = toolchain_provenance()
     if prov:
@@ -1474,4 +1497,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except precision.PrecisionRefusal as exc:
+        # A refused plan is a diagnostic, not a crash: it names a rule and the source that owns
+        # it, and a traceback through the generator adds nothing to either.
+        sys.exit(f"\n[gen] precision plan REFUSED\n{exc}\n")
