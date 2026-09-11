@@ -1263,10 +1263,16 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         # Gemma-4 applies a GAINLESS RMSNorm to the value path of every layer. with_scale=False in
         # the reference removes the learned gain, not the normalisation, so there is no weight
         # tensor anywhere in the checkpoint -- which is why nothing could ever have failed on its
-        # absence. `weighted=False` is the operator's own axis for exactly this (its runtime arg
-        # spec drops the weight fifo), so it needs no new kernel and no ones-filled buffer.
-        op_v_norm = (RMSNorm(size=hd, num_aie_columns=1, num_channels=1, tile_size=hd,
-                             weighted=False, epsilon=sp.eps, context=ctx) if sp.v_norm else None)
+        # absence.
+        #
+        # It reuses the QK-NORM OBJECT rather than a `weighted=False` one of its own, fed a
+        # ones-filled gain. The operator has that axis and using it costs a configure: designs are
+        # shared by object IDENTITY (RMSNorm declares no design_key), and the v-norm entries sit
+        # immediately before the qk-norm entries in the runlist, so one object makes them ONE
+        # contiguous same-design block instead of two. Bit-identical, not approximately: the
+        # weighted path is the same gainless normalise followed by a multiply, and bf16 1.0 is an
+        # exact multiplicative identity. Costs one 512 B buffer per geometry, shared by every layer.
+        op_v_norm = op_qk_norm if sp.v_norm else None
         if sp.v_norm and dp_why is None:
             # The fused head drains k and v straight into the caches, so `v` never exists as a
             # buffer this graph can normalise -- the norm would be silently skipped rather than
@@ -1612,6 +1618,12 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
     op_head = gemv(VOCAB, D, ctx, **head_quant_kw)
 
     weights, bufsz, cache_names, rl = {}, {}, [], []
+    if sp.v_norm:
+        # The gainless v-norm's gain, one per head_dim and shared by EVERY layer -- a true constant,
+        # unlike the per-layer learned gains beside it, so it is registered once here rather than in
+        # the layer loop.
+        for _hd in sorted({gk[0] for gk in geoms}):
+            weights[f"ones_h{_hd}"] = np.ones(_hd, dtype=BF16)
     cur = "x"
     # (runlist index, residual buffer entering this layer) per layer, so the stack can be cut into
     # segments AFTER it is built. Recorded rather than reconstructed: the residual chain is
@@ -1834,8 +1846,9 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                         [(g.op_rope_q, ref_q, ang, ref_q),
                          (g.op_rope_k, ref_k, ang, ref_k)])
                 if g.op_v_norm is not None:
-                    # Per kv head over head_dim, NOT rotated -- RoPE is a q/k-only step. Two args, not
-                    # three: the unweighted design has no weight fifo (rms_norm/op.py runtime_args).
+                    # Per kv head over head_dim, NOT rotated -- RoPE is a q/k-only step. Three args:
+                    # this is the qk-norm design, so it takes a gain, and `ones` is what makes it
+                    # gainless (see the construction site).
                     #
                     # SOURCE, and this is the whole of attention_k_eq_v: where the layer has a v_proj
                     # this is in place on v, but where it does not, V is the RAW k_proj output and the
@@ -1847,7 +1860,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                     hv = [f"{vhb}[{vho + h*g.hd*2}:{vho + (h+1)*g.hd*2}]" for h in range(g.hkv)]
                     src = ([f"{khb}[{kho + h*g.hd*2}:{kho + (h+1)*g.hd*2}]" for h in range(g.hkv)]
                            if not g.has_v else hv)
-                    vnorm = [(g.op_v_norm, a, b) for a, b in zip(src, hv)]
+                    vnorm = [(g.op_v_norm, a, f"ones_h{g.hd}", b) for a, b in zip(src, hv)]
             # The fused head replaces the norm, the projection, every qk-norm and the RoPE with one
             # design; `hn` lives and dies in L1 instead of round-tripping DDR between four of them.
             # The fused head absorbs the KV append too: k and v are drained straight into the caches
