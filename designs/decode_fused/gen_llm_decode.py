@@ -669,13 +669,27 @@ def gemv(M, K, ctx, **kw):
                 tile_size_output=tso, context=ctx, **kw)
 
 
-def build_graph(spec_name, weights_dir, layers=None, max_seq=2048):
+def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_plan=None):
     """Construct the fused decode graph + its weight dict for a spec.
 
     Shared by the generator CLI and verify_llm_decode.py so the harness drives the SAME graph the
     artifact was built from, rather than a re-typed copy that can drift from it.
     Returns (spec, fused, weights, meta_dims).
+
+    `precision_plan` overrides the env-resolved plan for this call only, so one process can build
+    several precision arms and hold them resident -- which is what an interleaved A/B needs, and
+    the env cannot express twice in one process. The swap is scoped and restored, because the
+    module-level helpers (`_spec`, `_quant_kw`, `_pack`) read the global by design: they are also
+    called from the CLI path, where there is exactly one plan.
     """
+    global PRECISION_PLAN
+    if precision_plan is not None:
+        _saved_plan = PRECISION_PLAN
+        PRECISION_PLAN = dict(precision_plan)
+        try:
+            return build_graph(spec_name, weights_dir, layers, max_seq)
+        finally:
+            PRECISION_PLAN = _saved_plan
     sp = SPECS[spec_name]
     sp.check(cols=COLS, tsi=TSI)
     sp.check_seq(max_seq)
