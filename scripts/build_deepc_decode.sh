@@ -18,9 +18,9 @@
 #   WEIGHTS    = whisper decoder weights dir.  default: <repo>/artifacts/whisper-small/whisper_decoder
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-. "$REPO/scripts/require_disk_backed.sh"
 LAYERS="${1:-12}"
 OUT="${2:-$REPO/artifacts/fused_decode12}"
+. "$REPO/scripts/require_disk_backed.sh"
 require_disk_backed "$OUT" "OUT (the built artifact)" || exit 1
 VENV_IRON="${VENV_IRON:-$REPO/.venv-iron}"
 . "$REPO/scripts/amd_paths.sh"       # -> IRON_DIR, AIEBU_ASM_DIR (relocatable; env-overridable)
@@ -60,7 +60,7 @@ export PYTHONPATH="$INST/python:$IRON${PYTHONPATH:+:$PYTHONPATH}"
 export AIECC_PATH="${AIECC_PATH:-$INST/bin/aiecc}"
 [ -x "$AIECC_PATH" ] || { echo "ERROR: instance aiecc not at $AIECC_PATH (run scripts/toolchain_up.sh)"; exit 1; }
 
-WORK="$(disk_backed_mktemp)"; trap 'rm -rf "$WORK"' EXIT   # amd/IRON writes build/ intermediates under CWD
+WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT   # amd/IRON writes build/ intermediates under CWD
 mkdir -p "$OUT"
 echo "[build] gen_decode --layers $LAYERS -> $OUT (work=$WORK) ${GEN_EXTRA:+extra: $GEN_EXTRA}"
 ( cd "$WORK" && "$VENV_IRON/bin/python" "$GEN" --weights "$WEIGHTS" --layers "$LAYERS" --out "$OUT" ${GEN_EXTRA:-} )

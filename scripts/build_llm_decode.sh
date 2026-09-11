@@ -16,6 +16,8 @@ WS="$(cd "$REPO/.." && pwd)"
 SPEC="${1:?usage: build_llm_decode.sh <spec> [LAYERS] [OUT]}"
 LAYERS="${2:-}"
 OUT="${3:-$REPO/artifacts/$SPEC/decode${LAYERS:+_l$LAYERS}}"
+. "$REPO/scripts/require_disk_backed.sh"
+require_disk_backed "$OUT" "OUT (the built artifact)" || exit 1
 VENV_IRON="${VENV_IRON:-$REPO/.venv-iron}"
 [ -x "$VENV_IRON/bin/python" ] || VENV_IRON="$WS/xdna-engine/.venv-iron"
 . "$REPO/scripts/amd_paths.sh"        # -> IRON_DIR, AIEBU_ASM_DIR (relocatable; env-overridable)
@@ -32,13 +34,13 @@ iron_require_pin || exit 1
 # Gate on the modules gen_llm_decode.py ACTUALLY IMPORTS at module scope. The first two are the
 # API surface the generator was ported to; the last two are operators that exist only on the
 # integration stack, and WITHOUT THEM LISTED this gate passed against a checkout that then died at
-# `ModuleNotFoundError: No module named 'iron.operators.gemv.quant'`. A gate whose purpose is to
+# `ModuleNotFoundError: No module named 'iron.common.quant'`. A gate whose purpose is to
 # fail early, failing late, on a message naming a Python module rather than a mis-pointed IRON_DIR.
 iron_at="$(iron_require_api "gen_llm_decode.py" \
   "iron/common/sequence.py:class OperatorSequence" \
   "iron/operators/strided_copy/op.py:output_offset_parameter" \
   "iron/operators/tmatvec/op.py:class TMatVec" \
-  "iron/operators/gemv/quant.py:def quantize_weight" \
+  "iron/common/quant.py:def quantize_weight" \
   "iron/operators/qkv_head_dp/op.py:class QKVHeadDataParallel")" || exit 1
 # WINDOW_RUNGS needs an API surface that the DEFAULT IRON_DIR does not have, so it is gated
 # separately rather than added to the list above -- requiring it unconditionally would break every

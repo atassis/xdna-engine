@@ -8,7 +8,7 @@ reproduce the kernel's accumulation order -- that is a different question, and t
 Two families:
 
   sym    w = q*s,           q in [-qmax, qmax] signed,  s = amax/qmax per (row, group).
-         This is what we ship (iron/operators/gemv/quant.py).
+         This is what we ship (iron/common/quant.py).
 
   affine w = q*s + m,       q signed, s and m free per (row, group).
          GGUF Q4_1 / FastFlowLM Q4NX shape. Read mlir-air-q4nx proj_qmm_pack.py:6-9 and

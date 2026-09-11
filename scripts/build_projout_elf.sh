@@ -3,8 +3,8 @@
 # Usage: [SKIP_IRON_PATCH=1] scripts/build_projout_elf.sh [OUT_DIR]
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-. "$REPO/scripts/require_disk_backed.sh"
 OUT="${1:-$REPO/artifacts/projout_elf}"
+. "$REPO/scripts/require_disk_backed.sh"
 require_disk_backed "$OUT" "OUT (the built artifact)" || exit 1
 VENV_IRON="${VENV_IRON:-$REPO/.venv-iron}"
 . "$REPO/scripts/amd_paths.sh"       # -> IRON_DIR, AIEBU_ASM_DIR (relocatable; env-overridable)
@@ -17,7 +17,7 @@ GEN="$REPO/designs/decode_fused/gen_projout.py"
 export PATH="$VENV_IRON/bin:$VENV_IRON/cc-shim:$AIEBU_DIR:$PATH"
 export PEANO_INSTALL_DIR="$VENV_IRON/lib/python3.14/site-packages/llvm-aie"
 export PYTHONPATH="$IRON${PYTHONPATH:+:$PYTHONPATH}"
-WORK="$(disk_backed_mktemp)"; trap 'rm -rf "$WORK"' EXIT
+WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
 mkdir -p "$OUT"
 # Default = fuse the on-NPU argmax (complete e2e/NPU lm-head: ELF returns a token id). PROJOUT_NO_ARGMAX=1
 # builds the logits-only ELF (host argmax) instead.

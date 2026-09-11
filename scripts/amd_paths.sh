@@ -20,7 +20,7 @@ export XDNA_WS
 # IRON_DIR points at the INTEGRATION STACK, not the bare fork checkout.
 #
 # The shared $XDNA_WS/IRON checkout sits on whatever branch it was last left on and carries neither
-# iron/operators/tmatvec/ nor iron/operators/gemv/quant.py -- both imported at module scope by
+# iron/operators/tmatvec/ nor iron/common/quant.py -- both imported at module scope by
 # designs/decode_fused/gen_llm_decode.py. So the documented build command for the LLM decode failed
 # at import with the default resolution, and every caller had to know to pass IRON=<worktree>.
 #

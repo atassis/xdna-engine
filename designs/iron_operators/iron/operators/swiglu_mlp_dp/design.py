@@ -207,7 +207,7 @@ def my_swiglu_mlp_dp(
         WROW_D, WROW_FF = D, FF
         WROW_QD = QD
     else:
-        from iron.operators.gemv.quant import row_stride_bytes
+        from iron.common.quant import row_stride_bytes
         assert weight_dtype in ("int4", "int8", "int4a", "int8a"), \
             f"unknown weight_dtype {weight_dtype!r}"
         assert group_size > 0, "weight_dtype != 'bf16' needs an explicit group_size > 0"

@@ -11,7 +11,7 @@ sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.dirname(
     _os.path.dirname(_os.path.abspath(__file__)))), "iron_operators"))
 from safetensors.numpy import load_file
 import wq_formats as F
-from iron.operators.gemv.quant import quantize_weight, dequantize_weight
+from iron.common.quant import quantize_weight, dequantize_weight
 
 from huggingface_hub import snapshot_download
 snap = _os.path.join(

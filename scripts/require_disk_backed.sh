@@ -10,7 +10,7 @@
 # loudly rather than succeed and slow everything down invisibly.
 #
 # ALLOW_TMPFS_BUILD=1 overrides, for genuinely small probe builds.
-# XDNA_SCRATCH names the disk-backed scratch root (default /mnt/data/xdna-scratch).
+# XDNA_SCRATCH names the disk-backed scratch root (default /mnt/data/xdna/scratch).
 
 _fs_type() { df -PT "$1" 2>/dev/null | awk 'NR==2 {print $2}'; }
 
@@ -24,7 +24,7 @@ require_disk_backed() {
                 echo "ERROR: $label is on $fs, which is RAM: $path"
                 echo "  A decode artifact is ~1.4 GB. Building into RAM competes with the weight"
                 echo "  buffers the model itself must hold resident (Gemma-4-12B: ~8 GB)."
-                echo "  Use a disk-backed path, e.g. \${XDNA_SCRATCH:-/mnt/data/xdna-scratch}/<name>."
+                echo "  Use a disk-backed path, e.g. \${XDNA_SCRATCH:-/mnt/data/xdna/scratch}/<name>."
                 echo "  Set ALLOW_TMPFS_BUILD=1 to override (small probe builds only)."
             } >&2
             [ "${ALLOW_TMPFS_BUILD:-0}" = "1" ] || return 1
@@ -37,7 +37,7 @@ require_disk_backed() {
 # A mktemp -d that is not on RAM. Falls back to plain mktemp only when the disk root is unusable,
 # and says so -- silently landing back on tmpfs is the failure this file exists to stop.
 disk_backed_mktemp() {
-    local root="${XDNA_SCRATCH:-/mnt/data/xdna-scratch}"
+    local root="${XDNA_SCRATCH:-/mnt/data/xdna/scratch}"
     if mkdir -p "$root" 2>/dev/null && [ -w "$root" ]; then
         case "$(_fs_type "$root")" in
             tmpfs | ramfs) ;;

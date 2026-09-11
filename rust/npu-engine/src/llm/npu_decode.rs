@@ -697,7 +697,9 @@ impl DecodeStep for NpuDecodeStep {
         // Unconditional every token -- see the module doc. No path here may skip a step "because
         // nothing changed"; that branch is exactly the defect this mirrors away from.
         self.arena.sync_input().map_err(|e| EngineError::Device(format!("sync input: {e}")))?;
-        bucket.res.dispatch().map_err(|e| EngineError::Device(format!("resident dispatch: {e}")))?;
+        // ElfResident::dispatch already prefixes "resident dispatch: " (npu-xrt/src/lib.rs);
+        // wrapping it again printed the prefix twice.
+        bucket.res.dispatch().map_err(EngineError::Device)?;
         self.arena.sync_from_device().map_err(|e| EngineError::Device(format!("sync output: {e}")))?;
 
         let out_name = self.artifact.output_name()?;

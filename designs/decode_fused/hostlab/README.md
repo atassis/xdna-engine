@@ -14,7 +14,7 @@ in about twenty seconds an arm. The device then confirms the point you picked.
 Two gates, both cheap, both in this directory. Run them before trusting a number out of here.
 
     validate_formats.py   the symmetric path must be BIT-IDENTICAL to the shipped packer
-                          (iron/operators/gemv/quant.py) and must reproduce the recorded rel-L2
+                          (iron/common/quant.py) and must reproduce the recorded rel-L2
                           sweep at every group size.
     fold_check.py         the AWQ fold must be neutral on a NON-TRIVIAL scale. awq_eval's own
                           gate reported 0.0 and proved nothing: with no quantization the alpha
