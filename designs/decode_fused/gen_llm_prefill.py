@@ -626,10 +626,12 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
         # Scratch for a K-split weight (weight_gemm below), added ONLY when the shared arena
         # actually holds one -- every shipped uniform-geometry spec never does, and this keeps
         # their arena byte-identical to before weight_gemm existed. Both down and o produce a
-        # D-wide C, so one pair covers either, reused across layers and across the two roles.
+        # D-wide C, so one triple covers either, reused across layers and across the two roles.
+        # `kpart2` is the pairwise-tree fold's third slot (weight_gemm below, n=4 case).
         if any(f"L{l}_{base}k0" in dec_sizes for l in range(NL) for base in ("Wd", "Wo")):
             bufsz["kacc"] = M * D * 2
             bufsz["kpart"] = M * D * 2
+            bufsz["kpart2"] = M * D * 2
         prefill_local = sorted(bufsz)
         for name, length in dec_sizes.items():
             if name in bufsz:
@@ -725,13 +727,36 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
             lo = i * chunk_k
             return f"{a_buf}[{lo * 2}:{(lo + chunk_op.a_elems) * 2}]"
 
-        ops = [(chunk_op, a_slice(0), f"{plain}k0[0:{chunk_k * Nout * 2}]",
-                "kacc" if n > 1 else out_buf)]
-        for i in range(1, n):
-            ops.append((chunk_op, a_slice(i), f"{plain}k{i}[0:{chunk_k * Nout * 2}]", "kpart"))
-            dst = out_buf if i == n - 1 else "kacc"
-            ops.append((add_op, "kacc", "kpart", dst))
-        return ops
+        def wk(i):
+            return f"{plain}k{i}[0:{chunk_k * Nout * 2}]"
+
+        # Pairwise-tree fold, mirroring split_over_k's grouping (gen_llm_decode.py): bf16 rounds
+        # on every add, so combining adjacent chunks first keeps the rounding depth at
+        # ceil(log2(n)) instead of this file's old n-1 linear chain. Measured on Gemma-4's real
+        # n=4 down_proj chunks (int8/g32 dump, M=256 activation): tree-vs-f32-truth rel-L2
+        # 3.03e-3, linear-vs-truth 3.15e-3, tree-vs-linear (the decode/prefill disagreement)
+        # 2.88e-3 -- the same order as this file's own PREFILL_ROUND_EVEN ULP effect (3.9e-3),
+        # so the chain was a second, avoidable source of prefill/decode divergence.
+        if n == 1:
+            return [(chunk_op, a_slice(0), wk(0), out_buf)]
+        if n == 2:
+            return [
+                (chunk_op, a_slice(0), wk(0), "kacc"),
+                (chunk_op, a_slice(1), wk(1), "kpart"),
+                (add_op, "kacc", "kpart", out_buf),
+            ]
+        if n == 4:
+            return [
+                (chunk_op, a_slice(0), wk(0), "kacc"),
+                (chunk_op, a_slice(1), wk(1), "kpart"),
+                (add_op, "kacc", "kpart", "kacc"),        # kacc = chunk0 + chunk1
+                (chunk_op, a_slice(2), wk(2), "kpart"),
+                (chunk_op, a_slice(3), wk(3), "kpart2"),
+                (add_op, "kpart", "kpart2", "kpart"),      # kpart = chunk2 + chunk3
+                (add_op, "kacc", "kpart", out_buf),
+            ]
+        raise ValueError(f"{plain}: pairwise K-split fold not implemented for n={n} chunks "
+                         f"(only 1, 2 and 4 are used by any shipped spec)")
 
     # Dual-theta RoPE: a spec with a local/global theta split declares TWO host-written angle
     # tables instead of one, and each layer's q/k RoPE reads whichever is_global() says -- global
