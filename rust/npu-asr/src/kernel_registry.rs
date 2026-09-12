@@ -639,11 +639,18 @@ fn is_executable(path: &Path) -> bool {
 /// prevent another family's stem from being attempted. Pure orchestration -- it does not publish
 /// or re-verify; the caller does both, because "did the rebuild actually work" can only be
 /// answered by looking at the kernels_root again afterward, not by trusting an exit code.
+///
+/// `repo_root` MUST be absolute. It is both joined with `recipe` and passed as the spawned
+/// adapter's `current_dir`; a relative `repo_root` makes `recipe_path` relative too, and the
+/// child then re-resolves that already-relative path against ITS new cwd -- silently wrong
+/// (this exact failure shape was hit and fixed once already, at the CLI entry point in
+/// `bin/build_declared_kernels.rs`, which canonicalizes before calling in).
 pub fn build_missing_declared_kernels(
     declared: &DeclaredKernelSet,
     repo_root: &Path,
     kernels_root: &Path,
 ) -> Vec<BuildResult> {
+    debug_assert!(repo_root.is_absolute(), "repo_root must be absolute, got {repo_root:?}");
     let report = verify_declared_kernel_set(declared, kernels_root);
     let mut results = Vec::with_capacity(report.len());
     for entry in report {

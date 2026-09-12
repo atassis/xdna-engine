@@ -45,6 +45,7 @@ fn main() {
     let results = build_missing_declared_kernels(&declared, &repo_root, &kernels_root);
     let attempted =
         results.iter().filter(|r| matches!(r.outcome, BuildOutcome::Built | BuildOutcome::BuildFailed(_))).count();
+    let no_recipe = results.iter().filter(|r| matches!(r.outcome, BuildOutcome::NoRecipe(_))).count();
 
     for r in &results {
         match &r.outcome {
@@ -72,6 +73,10 @@ fn main() {
             Ok(s) => println!("[build-declared-kernels] WARNING: publish_kernels.sh exited {s}"),
             Err(e) => println!("[build-declared-kernels] WARNING: could not run publish_kernels.sh: {e}"),
         }
+    } else if no_recipe > 0 {
+        println!(
+            "[build-declared-kernels] {no_recipe} Missing stem(s) had no usable recipe -- publish skipped"
+        );
     } else {
         println!("[build-declared-kernels] nothing was Missing -- publish skipped");
     }
