@@ -388,7 +388,14 @@ FUSE_DECODE_LAYER = os.environ.get("FUSE_DECODE_LAYER", "1") == "1"
 # -- there is nowhere else in this graph for it to attach. Default 0 = build-constant window,
 # byte-for-byte the pre-existing graph and meta.json; params.txt (read further down) picks up the
 # new parameter's real offset for free once this is on, so the meta writer never hardcodes one.
-DYNAMIC_WINDOW = os.environ.get("DYNAMIC_WINDOW", "0") == "1"
+#
+# Implied by WINDOW_RUNGS: a rung quantises the shim's FILL and relies on the core taking its own
+# window at runtime, so building a rung set with a build-constant window compiles clean and the
+# service refuses to load it at start ("window_rungs without scratchpad.window_param"). Found
+# 2026-09-12 rebuilding the shipped rung-ladder artifact without knowing this. Making the implied
+# flag explicit-only would leave the same trap for the next caller; deriving it removes the trap.
+DYNAMIC_WINDOW = (os.environ.get("DYNAMIC_WINDOW", "0") == "1"
+                   or bool(os.environ.get("WINDOW_RUNGS", "").strip()))
 # ATTN_SPLIT -- process the attention window in segments of this many positions, carrying the
 # softmax's running max/sum across them (split-K flash). sc/sw are then sized to a SEGMENT, so L1
 # stops scaling with max_seq and the 4544-position window cap goes away: `attn_block_dp` places at
