@@ -28,6 +28,9 @@ use npu_asr::kernel_registry::{
 fn main() {
     let mut args = std::env::args().skip(1);
     let repo_root = args.next().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    // Recipe/script paths built from repo_root get passed to Command::current_dir(repo_root) --
+    // if repo_root were still relative, the child resolves them against ITS new cwd, not ours.
+    let repo_root = repo_root.canonicalize().unwrap_or(repo_root);
     let kernels_root = args.next().map(PathBuf::from).unwrap_or_else(|| repo_root.join(PUBLISHED_KERNELS_DIR));
     let mlir_aie_root = args.next().map(PathBuf::from).unwrap_or_else(|| repo_root.join("mlir-aie"));
 
@@ -40,7 +43,8 @@ fn main() {
     };
 
     let results = build_missing_declared_kernels(&declared, &repo_root, &kernels_root);
-    let attempted = results.iter().filter(|r| !matches!(r.outcome, BuildOutcome::AlreadyPresent)).count();
+    let attempted =
+        results.iter().filter(|r| matches!(r.outcome, BuildOutcome::Built | BuildOutcome::BuildFailed(_))).count();
 
     for r in &results {
         match &r.outcome {
