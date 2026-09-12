@@ -498,7 +498,7 @@ pub fn check_toolchain_freshness(dir: &Path, repo_root: &Path) -> Result<(), Fre
 // ---------------------------------------------------------------------------------------------
 
 /// One family's declared requirement: every stem that must exist under `kernels/<family>/`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DeclaredFamily {
     pub required: Vec<String>,
     /// Path (relative to the repo root) to this family's adapter script. Contract:
