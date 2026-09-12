@@ -306,15 +306,6 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
         # and would produce unscaled scores.
         raise ValueError(f"{sp.name}: no per-head q-norm, so attn_scale has no gain to ride on; "
                          f"this graph has no separate score scale")
-    if sp.layer_scalar:
-        # Landed as a refusal, not a silent gap: a real build would compile and run, missing
-        # `hidden_states *= self.layer_scalar` (the last statement of the reference decoder layer,
-        # after both residual adds), and produce a plausible-looking wrong token stream. Needs a
-        # per-layer D-wide constant multiplied into every one of M rows -- ElementwiseMul takes two
-        # EQUAL-sized operands (gen_llm_decode.py:1615 is M=1, so `ls` and the block output are
-        # already the same size there), and no broadcast primitive for a [D] gain against an
-        # [M, D] tensor has been verified device-side at M=256 yet.
-        raise ValueError(f"{sp.name}: layer_scalar is not applied by this graph yet")
 
     # ---- K007: every shape constraint asserted where the shape is picked, PER GEOMETRY ----
     # The GEMM tilings come from the registry below, at the point each GEMM is constructed --
@@ -587,6 +578,10 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
                       tile_size=FF // cols, context=ctx)
     op_mul = ElementwiseMul(size=M * FF, num_aie_columns=cols, tile_size=FF // cols, context=ctx)
     op_add = ElementwiseAdd(size=M * D, num_aie_columns=cols, tile_size=D // cols, context=ctx)
+    # ElementwiseMul has no broadcast access pattern for a [D] gain against [M, D], so this stays
+    # D-sized (decode's own op, gen_llm_decode.py:1643) and runs once per row below.
+    op_lscale = (ElementwiseMul(size=D, tile_size=D // cols, num_aie_columns=cols, context=ctx)
+                 if sp.layer_scalar else None)
     # ---- buffers ----
     # Every prefill intermediate is ONE buffer shared by all layers: the sequence runs layers one
     # at a time, so nothing outlives its layer. Decode declares them per layer; at M=256 that
@@ -871,6 +866,11 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
             ([(op_norm, "d", p + "n_pff", "d")] if sp.sandwich_norms else []) + [
             (op_add, "xs", "d", dst),
         ]
+        if op_lscale is not None:
+            # Last statement of the layer, after both residual adds -- in place on `dst`, against
+            # decode's shared `p+"ls"` (same arena slot, same D-wide value every row).
+            rl += [(op_lscale, f"{dst}[{r * D * 2}:{(r + 1) * D * 2}]", p + "ls",
+                    f"{dst}[{r * D * 2}:{(r + 1) * D * 2}]") for r in range(M)]
         cache_names += [p + "kc", p + "vc"]
 
     # `sm_widths` goes LAST so x and rope keep the input-arena offsets the non-causal arm gives
