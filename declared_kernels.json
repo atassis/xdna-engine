@@ -3,7 +3,8 @@
     "required": [
       "dwconv_silu_1024x400",
       "dwconv_silu_t_1024x400"
-    ]
+    ],
+    "recipe": "scripts/kernel_families/dwconv1d.sh"
   },
   "layernorm": {
     "required": [
@@ -22,7 +23,8 @@
       "resadd_512x1024_s100",
       "resadd_512x1024_s100_bf16b",
       "silu_1024x400"
-    ]
+    ],
+    "recipe": "scripts/kernel_families/layernorm.sh"
   },
   "whole_array": {
     "required": [
@@ -62,6 +64,7 @@
       "512x800x768_32x32x32_8c_bias",
       "512x800x768_64x32x96_8c_modalid",
       "512x800x768_64x32x96_8c_modalsilu"
-    ]
+    ],
+    "recipe": "scripts/kernel_families/whole_array.sh"
   }
 }

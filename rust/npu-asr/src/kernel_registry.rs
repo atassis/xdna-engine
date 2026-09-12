@@ -501,6 +501,10 @@ pub fn check_toolchain_freshness(dir: &Path, repo_root: &Path) -> Result<(), Fre
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DeclaredFamily {
     pub required: Vec<String>,
+    /// Path (relative to the repo root) to this family's adapter script. Contract:
+    /// `<recipe> build <stem>` produces the artifact `resolve()` expects; `<recipe> list-variants
+    /// <range-spec>` optionally prints stems for sweep mode.
+    pub recipe: String,
 }
 
 /// Family name -> its declared stems. Keyed the same way `publish_kernels.sh` names a
@@ -920,7 +924,13 @@ mod tests {
         entries
             .iter()
             .map(|(fam, stems)| {
-                (fam.to_string(), DeclaredFamily { required: stems.iter().map(|s| s.to_string()).collect() })
+                (
+                    fam.to_string(),
+                    DeclaredFamily {
+                        required: stems.iter().map(|s| s.to_string()).collect(),
+                        recipe: format!("scripts/kernel_families/{fam}.sh"),
+                    },
+                )
             })
             .collect()
     }
@@ -992,6 +1002,22 @@ mod tests {
         let json = serde_json::to_string_pretty(&declared).unwrap();
         let back: DeclaredKernelSet = serde_json::from_str(&json).unwrap();
         assert_eq!(back, declared);
+    }
+
+    #[test]
+    fn declared_family_carries_a_recipe_path() {
+        let mut declared = DeclaredKernelSet::new();
+        declared.insert(
+            "whole_array".to_string(),
+            DeclaredFamily {
+                required: vec!["512x768x768_32x32x32_8c".to_string()],
+                recipe: "scripts/kernel_families/whole_array.sh".to_string(),
+            },
+        );
+        let json = serde_json::to_string_pretty(&declared).unwrap();
+        assert!(json.contains("scripts/kernel_families/whole_array.sh"));
+        let back: DeclaredKernelSet = serde_json::from_str(&json).unwrap();
+        assert_eq!(back["whole_array"].recipe, "scripts/kernel_families/whole_array.sh");
     }
 }
 
