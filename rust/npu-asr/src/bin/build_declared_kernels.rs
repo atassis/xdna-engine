@@ -3,9 +3,11 @@
 //! landed.
 //!
 //! For each Missing declared stem, dispatches to its family's `recipe` adapter script
-//! (`<recipe> build <stem> <dest-dir>`) -- see `kernel_registry::build_missing_declared_kernels`.
-//! One family's failure does not stop another's attempt. After every dispatch (successful or
-//! not), runs `scripts/publish_kernels.sh` so a rebuilt kernel gets hashed into
+//! (`<recipe> build <stem> <mlir-aie-root>`) -- see `kernel_registry::build_missing_declared_kernels`.
+//! An adapter's job is to build and stamp its own build dir under `mlir-aie-root`; it never
+//! writes into `kernels_root` itself. One family's failure does not stop another's attempt.
+//! After every dispatch (successful or not), runs `scripts/publish_kernels.sh` -- the ONLY thing
+//! that copies artifacts into `kernels_root` -- so a rebuilt kernel gets hashed into
 //! `kernel_manifest.json` the same way any other publish does, then re-verifies the WHOLE
 //! declared set (not just what was just attempted) so the final report reflects reality rather
 //! than trusting an adapter's exit code.
@@ -42,7 +44,7 @@ fn main() {
         }
     };
 
-    let results = build_missing_declared_kernels(&declared, &repo_root, &kernels_root);
+    let results = build_missing_declared_kernels(&declared, &repo_root, &kernels_root, &mlir_aie_root);
     let attempted =
         results.iter().filter(|r| matches!(r.outcome, BuildOutcome::Built | BuildOutcome::BuildFailed(_))).count();
     let no_recipe = results.iter().filter(|r| matches!(r.outcome, BuildOutcome::NoRecipe(_))).count();

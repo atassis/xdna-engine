@@ -633,12 +633,16 @@ fn is_executable(path: &Path) -> bool {
 }
 
 /// For every declared stem that `verify_declared_kernel_set` reports Missing, resolve its
-/// family's `recipe` (relative to `repo_root`) and invoke `<recipe> build <stem> <kernels_root>`.
+/// family's `recipe` (relative to `repo_root`) and invoke `<recipe> build <stem> <mlir_aie_root>`.
 /// Every OTHER declared stem (Present, PresentUnverified, HashMismatch) is left alone -- this
 /// function only ever acts on Missing, and it never stops early: one family's failure does not
-/// prevent another family's stem from being attempted. Pure orchestration -- it does not publish
-/// or re-verify; the caller does both, because "did the rebuild actually work" can only be
-/// answered by looking at the kernels_root again afterward, not by trusting an exit code.
+/// prevent another family's stem from being attempted. An adapter's only job is to build and
+/// stamp its own build dir under `mlir_aie_root`; it does not write into `kernels_root` at all --
+/// publishing there is the caller's job via `publish_kernels.sh`, run once after every attempt,
+/// not this function's or the adapter's. `kernels_root` is used only above, to decide what's
+/// Missing; this function does not publish or re-verify afterward either, because "did the
+/// rebuild actually work" can only be answered by looking at `kernels_root` again once
+/// `publish_kernels.sh` has run, not by trusting an adapter's exit code.
 ///
 /// `repo_root` MUST be absolute. It is both joined with `recipe` and passed as the spawned
 /// adapter's `current_dir`; a relative `repo_root` makes `recipe_path` relative too, and the
@@ -649,6 +653,7 @@ pub fn build_missing_declared_kernels(
     declared: &DeclaredKernelSet,
     repo_root: &Path,
     kernels_root: &Path,
+    mlir_aie_root: &Path,
 ) -> Vec<BuildResult> {
     debug_assert!(repo_root.is_absolute(), "repo_root must be absolute, got {repo_root:?}");
     let report = verify_declared_kernel_set(declared, kernels_root);
@@ -664,7 +669,7 @@ pub fn build_missing_declared_kernels(
                     match std::process::Command::new(&recipe_path)
                         .arg("build")
                         .arg(&entry.stem)
-                        .arg(kernels_root.join(&entry.family))
+                        .arg(mlir_aie_root)
                         .current_dir(repo_root)
                         .status()
                     {
@@ -1180,8 +1185,7 @@ mod tests {
         let adapter = write_fake_adapter(
             repo.path(),
             "dwconv1d_adapter.sh",
-            "#!/bin/sh\necho \"called with: $1 $2\" > \"$(dirname \"$0\")/dwconv1d_call.log\"\n\
-             mkdir -p \"$3\"\ntouch \"$3/final_$2.xclbin\"\nexit 0\n",
+            "#!/bin/sh\necho \"called with: $1 $2 $3\" > \"$(dirname \"$0\")/dwconv1d_call.log\"\nexit 0\n",
         );
         let mut declared = DeclaredKernelSet::new();
         declared.insert(
@@ -1196,7 +1200,8 @@ mod tests {
             },
         );
 
-        let results = build_missing_declared_kernels(&declared, repo.path(), &kernels_root);
+        let mlir_aie_root = repo.path().join("fake-mlir-aie");
+        let results = build_missing_declared_kernels(&declared, repo.path(), &kernels_root, &mlir_aie_root);
 
         let wa = results.iter().find(|r| r.family == "whole_array").unwrap();
         assert!(matches!(wa.outcome, BuildOutcome::AlreadyPresent), "{:?}", wa.outcome);
@@ -1206,6 +1211,10 @@ mod tests {
 
         let log = std::fs::read_to_string(repo.path().join("dwconv1d_call.log")).unwrap();
         assert!(log.contains("build missing_stem"), "adapter should be called as: build <stem>, got: {log}");
+        assert!(
+            log.contains(mlir_aie_root.to_str().unwrap()),
+            "adapter should receive mlir_aie_root as its third argument, got: {log}"
+        );
     }
 
     #[test]
@@ -1223,7 +1232,8 @@ mod tests {
             },
         );
 
-        let results = build_missing_declared_kernels(&declared, repo.path(), &kernels_root);
+        let mlir_aie_root = repo.path().join("mlir-aie");
+        let results = build_missing_declared_kernels(&declared, repo.path(), &kernels_root, &mlir_aie_root);
         assert_eq!(results.len(), 1);
         assert!(matches!(&results[0].outcome, BuildOutcome::NoRecipe(_)), "{:?}", results[0].outcome);
     }
@@ -1252,7 +1262,8 @@ mod tests {
             },
         );
 
-        let results = build_missing_declared_kernels(&declared, repo.path(), &kernels_root);
+        let mlir_aie_root = repo.path().join("mlir-aie");
+        let results = build_missing_declared_kernels(&declared, repo.path(), &kernels_root, &mlir_aie_root);
         assert_eq!(results.len(), 1);
         assert!(matches!(&results[0].outcome, BuildOutcome::NoRecipe(_)), "{:?}", results[0].outcome);
     }
@@ -1264,11 +1275,7 @@ mod tests {
         std::fs::create_dir_all(&kernels_root).unwrap();
 
         let failing = write_fake_adapter(repo.path(), "failing.sh", "#!/bin/sh\nexit 7\n");
-        let succeeding = write_fake_adapter(
-            repo.path(),
-            "succeeding.sh",
-            "#!/bin/sh\nmkdir -p \"$3\"\ntouch \"$3/final_$2.xclbin\"\nexit 0\n",
-        );
+        let succeeding = write_fake_adapter(repo.path(), "succeeding.sh", "#!/bin/sh\nexit 0\n");
 
         let mut declared = DeclaredKernelSet::new();
         declared.insert(
@@ -1283,7 +1290,8 @@ mod tests {
             },
         );
 
-        let results = build_missing_declared_kernels(&declared, repo.path(), &kernels_root);
+        let mlir_aie_root = repo.path().join("mlir-aie");
+        let results = build_missing_declared_kernels(&declared, repo.path(), &kernels_root, &mlir_aie_root);
         assert_eq!(results.len(), 2, "one family failing must not stop the other from being attempted");
 
         let failed = results.iter().find(|r| r.family == "layernorm").unwrap();

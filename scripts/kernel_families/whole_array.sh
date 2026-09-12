@@ -1,7 +1,14 @@
 #!/usr/bin/env bash
 # Adapter for the declared-kernel build driver. Contract: `whole_array.sh build <stem>
-# <dest-dir>` must leave `<dest-dir>/final_<stem>.xclbin` (+ insts, when the family
-# produces one) in place, or exit non-zero. Only the plain bf16, M=512, tile 32x32x32,
+# <mlir-aie-root>` builds the artifact into its normal mlir-aie build dir and stamps
+# that dir (via ensure_fresh_sandbox), then exits 0, or exits non-zero on failure. It
+# does NOT copy anything anywhere -- publish_kernels.sh, which the caller already runs
+# right after any build attempt, is the sole writer into the install-owned kernels
+# dir; an adapter doing its own copy on top was redundant and is gone.
+# `<mlir-aie-root>` is where mlir-aie lives, so the adapter can find its own build dir
+# under it instead of assuming a fixed path relative to this repo -- the rest of this
+# system (build_declared_kernels' CLI, publish_kernels.sh) already takes that root as
+# an argument rather than hardcoding it. Only the plain bf16, M=512, tile 32x32x32,
 # 8-column matmul family is understood -- that is the one uniform loop in
 # scripts/build_kernels.sh (`for KN in 768x768 3072x768 ...; do make -C $MMW NPU2=1
 # M=512 K=$K N=$N dtype_in=bf16 dtype_out=f32 n_aie_cols=8 use_iron=1; done`), generic
@@ -14,13 +21,13 @@
 # catch, not reintroduce.
 set -euo pipefail
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
-MMW="$REPO/mlir-aie/programming_examples/basic/matrix_multiplication/whole_array"
 # shellcheck source=../kernel_sandbox.sh
 source "$REPO/scripts/kernel_sandbox.sh"
 
-cmd="${1:?usage: whole_array.sh build <stem> <dest-dir>}"
-stem="${2:?usage: whole_array.sh build <stem> <dest-dir>}"
-dest="${3:?usage: whole_array.sh build <stem> <dest-dir>}"
+cmd="${1:?usage: whole_array.sh build <stem> <mlir-aie-root>}"
+stem="${2:?usage: whole_array.sh build <stem> <mlir-aie-root>}"
+mlir_aie_root="${3:?usage: whole_array.sh build <stem> <mlir-aie-root>}"
+MMW="$mlir_aie_root/programming_examples/basic/matrix_multiplication/whole_array"
 
 case "$cmd" in
   build) ;;
@@ -56,14 +63,7 @@ make -C "$MMW" NPU2=1 M=512 K="$K" N="$N" dtype_in=bf16 dtype_out=f32 n_aie_cols
 built="$MMW/build/final_512x${K}x${N}_32x32x32_8c.xclbin"
 [ -f "$built" ] || { echo "[whole_array] make reported success but $built is missing" >&2; exit 1; }
 
-mkdir -p "$dest"
-cp -f "$built" "$dest/final_${stem}.xclbin.tmp"
-mv -f "$dest/final_${stem}.xclbin.tmp" "$dest/final_${stem}.xclbin"
-# makefile-common's insts_target is `.bin`, not `.txt` -- verified against the built
-# artifact names on disk and against makefile-common's `insts_target?=build/insts_${target_suffix}.bin`.
-insts="$MMW/build/insts_512x${K}x${N}_32x32x32_8c.bin"
-if [ -f "$insts" ]; then
-  cp -f "$insts" "$dest/insts_${stem}.bin.tmp"
-  mv -f "$dest/insts_${stem}.bin.tmp" "$dest/insts_${stem}.bin"
-fi
-echo "[whole_array] built and staged $stem -> $dest/final_${stem}.xclbin"
+# makefile-common's insts_target is `.bin`, not `.txt` -- the adapter doesn't need to know or
+# care anymore, since it no longer touches insts files itself; publish_kernels.sh finds
+# whichever extension is on disk.
+echo "[whole_array] built $stem in $MMW/build (publish_kernels.sh will collect it)"
