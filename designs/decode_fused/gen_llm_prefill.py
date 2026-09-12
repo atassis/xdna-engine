@@ -206,6 +206,62 @@ def pick_transfer(total_elems, target=None):
     return best
 
 
+# ---- quantized weight sourcing (Task 5) -----------------------------------------------------
+# gemm_for()'s registry tiling (tile_m/k/n, cols) comes from (M, K, N, emulate, prio_accuracy)
+# alone, same lookup a plain bf16 GEMM at that shape gets -- weight_dtype/group_size are an
+# ADDITIONAL axis GEMM validates against whichever tile that lookup picked (tile_k must be a
+# whole number of groups; see iron/operators/gemm/op.py:_validate_weight_dtype), not a second
+# tiling decision.
+QUANT_TENSOR = {
+    "Wq": "self_attn.q_proj.weight", "Wk": "self_attn.k_proj.weight",
+    "Wv": "self_attn.v_proj.weight", "Wo": "self_attn.o_proj.weight",
+    "Wg": "mlp.gate_proj.weight", "Wu": "mlp.up_proj.weight", "Wd": "mlp.down_proj.weight",
+}
+
+
+def read_quant_manifest(src_dir):
+    """(dtype, group_size) exactly as `src_dir`'s own quant.json records them -- read, never
+    hardcoded, so a dump that changes its own group_size cannot silently drift from this file."""
+    with open(os.path.join(src_dir, "quant.json")) as fh:
+        m = json.load(fh)
+    return m["dtype"], int(m["group_size"])
+
+
+def build_quant_plan(quant_weights, quant_attn_o_weights):
+    """{'qkv': (dtype, group, dir), 'mlp': (...), 'o': (...)}, or {} for the all-bf16 build every
+    spec had before this axis existed.
+
+    Two directories, not one: Gemma-4-12B's own mix is most sites at one group_size, `attn_o` at
+    another, and neither dump states that mix on its own -- weights_int8g32/quant.json and
+    weights_int8g64/quant.json each pack EVERY site at their own uniform group (verified
+    2026-09-12), so the per-site MIX is which directory a site reads from, not a manifest field.
+    """
+    if not quant_weights:
+        return {}
+    dtype, group = read_quant_manifest(quant_weights)
+    o_dir = quant_attn_o_weights or quant_weights
+    o_dtype, o_group = (dtype, group) if o_dir == quant_weights else read_quant_manifest(o_dir)
+    return {"qkv": (dtype, group, quant_weights), "mlp": (dtype, group, quant_weights),
+            "o": (o_dtype, o_group, o_dir)}
+
+
+def quant_source_files(src_dir, prefix, tensor):
+    """The dumped file(s) for `{prefix}{tensor}`, in K order: `[]` if neither form exists, one
+    plain `{tensor}.npy`, or decode's own `k_chunks_for` split (`.kchunk0.npy ..`) -- baked into
+    the dump itself (down always, o only on a global/K=8192 layer; verified 2026-09-12: layer 5's
+    `o_proj` is two kchunks, layer 0's is one plain file). Prefill's GEMM has no reason to
+    replicate this split -- it tiles K internally -- but the dump only offers it this way, so a
+    quantized o/down is packed per chunk, same as its full-K sibling is packed whole.
+    """
+    if os.path.exists(os.path.join(src_dir, f"{prefix}{tensor}.npy")):
+        return [f"{prefix}{tensor}.npy"]
+    files, n = [], 0
+    while os.path.exists(os.path.join(src_dir, f"{prefix}{tensor}.kchunk{n}.npy")):
+        files.append(f"{prefix}{tensor}.kchunk{n}.npy")
+        n += 1
+    return files
+
+
 def decode_arena_plan(meta_path):
     """Reconstruct the decode ELF's scratch arena as an ordered (name, size) list.
 
@@ -240,12 +296,17 @@ def decode_arena_plan(meta_path):
     return meta, order, sizes, cursor
 
 
-def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compile=True):
+def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compile=True,
+                quant_plan=None):
     """Construct the fused prefill graph. Returns (spec, fused, dims).
 
     `do_compile=False` stops after the buffer layout, which is what the shared-arena assert needs
     -- seconds instead of an aiecc run, so the arena contract is checkable on every edit.
+
+    `quant_plan` is `build_quant_plan()`'s `{site: (dtype, group_size, src_dir)}` map, or `None`
+    for the all-bf16 graph every spec had before this axis existed.
     """
+    quant_plan = quant_plan or {}
     sp = SPECS[spec_name]
     D, FF, HD = sp.d_model, sp.ffn, sp.head_dim
     Hq, Hkv, QD, KVD = sp.n_q_heads, sp.n_kv_heads, sp.q_dim, sp.kv_dim
@@ -382,12 +443,40 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
     reg = registry()
     tiles = {}
 
-    def gemm_for(label, K, Nout, b_col_maj=True, blocking=None, extra=None):
+    def quant_kwargs(site):
+        """weight_dtype/group_size kwargs for `site` ("qkv"/"o"/"mlp"), or `{}` for the plain
+        bf16 operand every caller had before this axis existed -- the same shape decode's own
+        precision plane hands its operators."""
+        if site not in quant_plan:
+            return {}
+        dtype, group, _ = quant_plan[site]
+        return dict(weight_dtype=dtype, group_size=group)
+
+    # Buffers this build packs itself (Task 5), one entry per (layer, chunk): where the packed
+    # bytes come from and the exact tile config they were packed for. Consumed by main(), after
+    # compile, to write `buffers/<name>.bin` -- never serialized into meta.json itself.
+    quant_pack = []
+
+    def b_bytes(op):
+        """`op`'s B (weight) operand size in BYTES. `get_arg_spec` already states it in the unit
+        GEMM actually declares -- packed int8 bytes when quantized, bf16 elements otherwise -- so
+        this is the one place that knows which unit applies, not a second `K*N*2` guess that goes
+        stale the moment a call site quantizes."""
+        n = 1
+        for d in op.get_arg_spec()[1].shape:
+            n *= d
+        return n if op.weight_dtype != "bf16" else n * 2
+
+    def gemm_for(label, K, Nout, b_col_maj=True, blocking=None, extra=None, site=None):
         """One GEMM at the registry's tiling for its shape, checked twice on the way through.
 
         `blocking` is `(rows_per_block, block_stride)` when B's rows are not one contiguous slab in
         the shared arena -- the KV cache under `kvl`, or one role's head rows inside a head-major
         `Wqkv`. `None` is the contiguous case every other call builds.
+
+        `site` selects a quantized weight_dtype/group_size from `quant_plan`, or `None` for plain
+        bf16. A quantized weight is packed fresh (see weight_gemm/qkv_operand below), never
+        decode's aliased arena slab, so `blocking` never applies to one.
         """
         ch = reg.lookup(M, K, Nout, emulate=emulate, prio_accuracy=prio_acc,
                         b_col_maj=b_col_maj, label=label)
@@ -399,8 +488,11 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
         tiles[label] = {"tile": [ch.tile_m, ch.tile_k, ch.tile_n], "cols": ch.cols,
                         "source": ch.source, "K": K, "N": Nout,
                         "measured": ch.measured}
-        blk = dict(b_block_rows=blocking[0], b_block_stride=blocking[1]) if blocking else {}
+        qkw = quant_kwargs(site)
+        blk = dict(b_block_rows=blocking[0], b_block_stride=blocking[1]) \
+            if (blocking and not qkw) else {}
         blk.update(extra or {})
+        blk.update(qkw)
         return GEMM(M=M, K=K, N=Nout, b_col_maj=b_col_maj, context=ctx,
                     emulate_bf16_mmul_with_bfp16=emulate, prio_accuracy=prio_acc,
                     round_conv_even=round_even, **blk, **ch.gemm_kwargs)
@@ -467,10 +559,10 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
         if has_v:
             blocking["v"] = (hd, (g_grp + 1) * hd)
         op_gq = gemm_for(f"q{sfx}", D, qd, blocking=(
-            (blocking["q"][0], qkv_rows * D) if hm else None))
+            (blocking["q"][0], qkv_rows * D) if hm else None), site="qkv")
         op_gkv = gemm_for(f"kv{sfx}", D, kvd, blocking=(
-            (blocking["k"][0], qkv_rows * D) if hm else None))
-        op_o = gemm_for(f"o{sfx}", qd, D)
+            (blocking["k"][0], qkv_rows * D) if hm else None), site="qkv")
+        op_o = gemm_for(f"o{sfx}", qd, D, site="o")
         # scores: B is the kv cache read as [N=S, K=hd] -> b_col_maj. ctx: the SAME bytes read as
         # [K=S, N=hd] -> plain. `kv_T` is the SAME block size for every geometry -- the only shared
         # arenas measured so far are flat (kv_T==S) on Gemma-4 and blocked on the uniform-geometry
@@ -533,13 +625,13 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
     # shared configure becomes two while SiLU's one goes away -- which makes this a clean read of
     # what the BYTES alone are worth: -3.0 MiB/layer, -84 MiB/dispatch.
     fuse_silu = os.environ.get("PREFILL_FUSE_SILU", "0") == "1" and sp.act == "silu"
-    op_gu = gemm_for("gate_up", D, FF)
+    op_gu = gemm_for("gate_up", D, FF, site="mlp")
     # PREFILL_EPI_ELEMS=0 builds the NULL CONTROL: same fused design, same call, no arithmetic.
     epi_n = os.environ.get("PREFILL_EPI_ELEMS")
     op_gate = gemm_for("gate_up", D, FF, extra=dict(
         epilogue="silu", **({"epilogue_elems": int(epi_n)} if epi_n is not None else {}),
-    )) if fuse_silu else None
-    op_down = gemm_for("down", FF, D)
+    ), site="mlp") if fuse_silu else None
+    op_down = gemm_for("down", FF, D, site="mlp")
     for hd, hkv, has_v in geoms:
         attn_ops(hd, hkv, has_v)   # build now so [tiles] below reports every geometry
     print("[tiles] " + "  ".join(
@@ -630,17 +722,19 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
             bufsz["kacc"] = M * D * 2
             bufsz["kpart"] = M * D * 2
             bufsz["kpart2"] = M * D * 2
-        prefill_local = sorted(bufsz)
         for name, length in dec_sizes.items():
             if name in bufsz:
                 raise ValueError(f"decode scratch name {name!r} collides with a prefill "
                                  f"intermediate of the same name")
             bufsz[name] = length
-    else:
-        prefill_local = sorted(bufsz)
+    # `prefill_local` is resolved AFTER every op below (including a quantized site's packed
+    # weight buffers, registered into `bufsz` as they are built) rather than snapshotted here --
+    # everything in `bufsz` that isn't one of decode's own shared names is prefill's, regardless
+    # of how late it was added.
 
     def qkv_slab(p, role, geom):
-        """One projection's operand inside `L*_Wqkv`, at THIS layer's geometry.
+        """One projection's operand inside `L*_Wqkv`, at THIS layer's geometry (decode's shared
+        bf16 arena only -- see `qkv_operand` for the quantized case, which never reads this).
 
         Stock, the three roles are three contiguous slabs. Head-major, each role's rows are one
         block per kv head, so the operand runs from its FIRST block to the end of its last one and
@@ -655,6 +749,35 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
         else:
             base, span = geom.blocking[role][1] * D, op.b_elems
         return f"{p}Wqkv[{base * 2}:{(base + span) * 2}]"
+
+    def qkv_operand(p, role, geom, layer):
+        """Q/K/V's weight operand: `qkv_slab` (decode's head-major `Wqkv` slice) when bf16, or a
+        buffer this build packs itself from the "qkv" site's own dump when quantized.
+
+        These never share bytes even at the same (K, N, dtype, group_size): decode's arena
+        interleaves q/k/v by head for its OWN GEVM, and a packed GEMM operand is a tile-planar
+        permutation of the row form (`iron.common.quant.repack_gemm_weight`'s whole job) -- two
+        different layouts neither side can read as the other. So a quantized qkv reads its own
+        per-role `.npy` straight off the dump, no interleave needed at all.
+        """
+        if "qkv" not in quant_plan:
+            return qkv_slab(p, role, geom)
+        dtype, group, src_dir = quant_plan["qkv"]
+        op = {"q": geom.op_gq, "k": geom.op_gkv, "v": geom.op_gkv}[role]
+        prefix = f"{sp.weight_prefix}layers.{layer}."
+        tensor = QUANT_TENSOR[{"q": "Wq", "k": "Wk", "v": "Wv"}[role]]
+        srcs = quant_source_files(src_dir, prefix, tensor)
+        if len(srcs) != 1:
+            raise ValueError(f"{prefix}{tensor}: expected exactly one dumped file (qkv never "
+                             f"K-splits), found {len(srcs)} under {src_dir}")
+        name = f"{p}W{role}_qp"
+        nbytes = b_bytes(op)
+        bufsz[name] = nbytes
+        quant_pack.append(dict(buf=name, src_dir=src_dir, src_file=srcs[0],
+                               N=op.N, K=op.K, tile_k=op.tile_k, tile_n=op.tile_n,
+                               group_size=group, weight_dtype=dtype, cols=op.num_aie_columns,
+                               mmul=op._mmul_rst))
+        return f"{name}[0:{nbytes}]"
 
     def kv_slab(buf, kv, geom):
         """A kv head's slab: from its base to the end of its LAST block, not `S*hd` -- across
@@ -685,7 +808,7 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
     # one attention op set per geometry.
     _chunked_cache = {}
 
-    def weight_gemm(p, base_name, plain_op, K, Nout, a_buf, out_buf, label):
+    def weight_gemm(p, base_name, plain_op, K, Nout, a_buf, out_buf, label, site=None, layer=None):
         """Runlist entries computing `plain_op(a_buf, p+base_name) -> out_buf`.
 
         Reads `p+base_name` whole when the decode arena holds it as one buffer. Gemma-4's
@@ -699,45 +822,111 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
         head slice of `q` -- with the partial C tiles summed by ElementwiseAdd. All `n` chunk GEMMs
         share ONE op object (same shape, same stride), so they collapse to one configure, matching
         every other per-head/per-chunk loop in this file.
+
+        When `site` is quantized (`layer` then required), NONE of the above applies: `plain`
+        (decode's arena name) is never read at all. A packed weight is a different byte layout
+        from decode's row-packed GEVM operand at the same (K, N, dtype, group_size) --
+        `iron.common.quant.repack_gemm_weight`'s whole job is that permutation -- so this packs
+        fresh from the same per-tensor `.npy` dump decode's own GEVM reads, into a buffer THIS
+        build owns (`buffers/<name>.bin`, uploaded from prefill's own artifact dir as "a
+        prefill-only weight", `rust/npu-engine/src/llm/npu_decode.rs`), never decode's shared
+        arena. The dump is chunked exactly where decode's own `k_chunks_for` chunks it (down
+        always, o only on a global layer) -- Prefill has no L1 reason to re-chunk on its own, but
+        the dump does not offer an unchunked K=15360/K=8192 tensor to begin with, so it packs and
+        folds each chunk the same way the decode-arena branch above does.
         """
         plain = p + base_name
-        if not dec_meta_path or plain in dec_sizes:
+        if site in quant_plan:
+            dtype, group, src_dir = quant_plan[site]
+            prefix = f"{sp.weight_prefix}layers.{layer}."
+            tensor = QUANT_TENSOR[base_name]
+            srcs = quant_source_files(src_dir, prefix, tensor)
+            n = len(srcs)
+            if not n:
+                raise ValueError(f"{prefix}{tensor}: no plain or .kchunkN.npy file under "
+                                 f"{src_dir}")
+            if K % n:
+                raise ValueError(f"{plain}: K={K} not divisible by its own {n} dumped chunks")
+            chunk_k = K // n
+            if n == 1:
+                # No split at all: `plain_op` (the caller's already-built full-K op, site= already
+                # baked in) is exactly the right shape -- packing a second, redundant "_k{K}of1"
+                # design would be pure waste.
+                chunk_op, add_op = plain_op, None
+            else:
+                # C stays bf16 regardless of B's weight_dtype (GEMM's own "A and C stay bf16"),
+                # so this is the SAME D-wide kacc/kpart/kpart2 the decode-arena branch below
+                # checks -- guarded the same way, for the same reason.
+                want = M * Nout * 2
+                have = bufsz.get("kacc")
+                if have != want:
+                    raise ValueError(f"{plain}: K-split scratch (kacc/kpart/kpart2) is {have}B, "
+                                     f"sized for a different Nout than this call's {Nout} "
+                                     f"({want}B needed)")
+                ckey = (chunk_k, Nout, site)
+                if ckey not in _chunked_cache:
+                    chunk_op_ = gemm_for(f"{label}_k{chunk_k}of{n}", chunk_k, Nout,
+                                        extra=dict(a_row_stride=K), site=site)
+                    add_op_ = ElementwiseAdd(size=M * Nout, num_aie_columns=cols,
+                                            tile_size=Nout // cols, context=ctx)
+                    _chunked_cache[ckey] = (chunk_op_, add_op_)
+                chunk_op, add_op = _chunked_cache[ckey]
+
+            def a_slice(i):
+                if n == 1:
+                    return a_buf
+                lo = i * chunk_k
+                return f"{a_buf}[{lo * 2}:{(lo + chunk_op.a_elems) * 2}]"
+
+            nbytes = b_bytes(chunk_op)
+
+            def wk(i):
+                name = f"{plain}_qp{f'_c{i}' if n > 1 else ''}"
+                bufsz[name] = nbytes
+                quant_pack.append(dict(buf=name, src_dir=src_dir, src_file=srcs[i],
+                                       N=Nout, K=chunk_k, tile_k=chunk_op.tile_k,
+                                       tile_n=chunk_op.tile_n, group_size=group,
+                                       weight_dtype=dtype, cols=chunk_op.num_aie_columns,
+                                       mmul=chunk_op._mmul_rst))
+                return f"{name}[0:{nbytes}]"
+        elif not dec_meta_path or plain in dec_sizes:
             return [(plain_op, a_buf, f"{plain}[0:{K * Nout * 2}]", out_buf)]
-        n = 0
-        while f"{plain}k{n}" in dec_sizes:
-            n += 1
-        if not n:
-            raise ValueError(f"{plain}: neither a plain buffer nor {plain}k0.. chunks exist in "
-                             f"the decode shared arena")
-        if K % n:
-            raise ValueError(f"{plain}: K={K} not divisible by its own {n} decode-arena chunks")
-        chunk_k = K // n
-        if n > 1:
-            # kacc/kpart/kpart2 are pre-sized D-wide, above, for the only two roles the shared
-            # arena chunks today (Wd, Wo). A future K-split at a different Nout (Wg/Wu -> FF)
-            # would silently write an FF-wide tile into this D-wide scratch; fail loud instead,
-            # before spending a GEMM tile lookup on a shape we are about to reject anyway.
-            want = M * Nout * 2
-            have = bufsz.get("kacc")
-            if have != want:
-                raise ValueError(f"{plain}: K-split scratch (kacc/kpart/kpart2) is {have}B, "
-                                 f"sized for a different Nout than this call's {Nout} "
-                                 f"({want}B needed)")
-        ckey = (chunk_k, Nout)
-        if ckey not in _chunked_cache:
-            chunk_op = gemm_for(f"{label}_k{chunk_k}of{n}", chunk_k, Nout,
-                                extra=dict(a_row_stride=K))
-            add_op = (ElementwiseAdd(size=M * Nout, num_aie_columns=cols, tile_size=Nout // cols,
-                                     context=ctx) if n > 1 else None)
-            _chunked_cache[ckey] = (chunk_op, add_op)
-        chunk_op, add_op = _chunked_cache[ckey]
+        else:
+            n = 0
+            while f"{plain}k{n}" in dec_sizes:
+                n += 1
+            if not n:
+                raise ValueError(f"{plain}: neither a plain buffer nor {plain}k0.. chunks exist in "
+                                 f"the decode shared arena")
+            if K % n:
+                raise ValueError(f"{plain}: K={K} not divisible by its own {n} decode-arena chunks")
+            chunk_k = K // n
+            if n > 1:
+                # kacc/kpart/kpart2 are pre-sized D-wide, above, for the only two roles the shared
+                # arena chunks today (Wd, Wo). A future K-split at a different Nout (Wg/Wu -> FF)
+                # would silently write an FF-wide tile into this D-wide scratch; fail loud instead,
+                # before spending a GEMM tile lookup on a shape we are about to reject anyway.
+                want = M * Nout * 2
+                have = bufsz.get("kacc")
+                if have != want:
+                    raise ValueError(f"{plain}: K-split scratch (kacc/kpart/kpart2) is {have}B, "
+                                     f"sized for a different Nout than this call's {Nout} "
+                                     f"({want}B needed)")
+            ckey = (chunk_k, Nout)
+            if ckey not in _chunked_cache:
+                chunk_op = gemm_for(f"{label}_k{chunk_k}of{n}", chunk_k, Nout,
+                                    extra=dict(a_row_stride=K))
+                add_op = (ElementwiseAdd(size=M * Nout, num_aie_columns=cols, tile_size=Nout // cols,
+                                         context=ctx) if n > 1 else None)
+                _chunked_cache[ckey] = (chunk_op, add_op)
+            chunk_op, add_op = _chunked_cache[ckey]
 
-        def a_slice(i):
-            lo = i * chunk_k
-            return f"{a_buf}[{lo * 2}:{(lo + chunk_op.a_elems) * 2}]"
+            def a_slice(i):
+                lo = i * chunk_k
+                return f"{a_buf}[{lo * 2}:{(lo + chunk_op.a_elems) * 2}]"
 
-        def wk(i):
-            return f"{plain}k{i}[0:{chunk_k * Nout * 2}]"
+            def wk(i):
+                return f"{plain}k{i}[0:{chunk_k * Nout * 2}]"
 
         # Pairwise-tree fold, mirroring split_over_k's grouping (gen_llm_decode.py): bf16 rounds
         # on every add, so combining adjacent chunks first keeps the rounding depth at
@@ -787,13 +976,13 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
         # cannot serve two geometries.
         qb, kb, vb, cxtb = f"q{g.sfx}", f"k{g.sfx}", f"v{g.sfx}", f"cxt{g.sfx}"
         qhb, cxb = f"qh{g.sfx}", f"cx{g.sfx}"
-        wq, wk = qkv_slab(p, "q", g), qkv_slab(p, "k", g)
+        wq, wk = qkv_operand(p, "q", g, l), qkv_operand(p, "k", g, l)
         w_nin, w_nqn, w_nkn = attn_norms(p, hd)
         rl += [
             (op_norm, src, w_nin, "h"),
             (g.op_gq, "h", wq, qb),
             (g.op_gkv, "h", wk, kb),
-        ] + ([(g.op_gkv, "h", qkv_slab(p, "v", g), vb)] if g.has_v else [])
+        ] + ([(g.op_gkv, "h", qkv_operand(p, "v", g, l), vb)] if g.has_v else [])
         if sp.v_norm and not g.has_v:
             # attention_k_eq_v: no v_proj at all. v_norm reads the RAW k projection -- before
             # qk-norm and RoPE, which mutate `k` in place below -- and writes `v`; that IS the
@@ -852,17 +1041,18 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
             rl.append((g.op_cx, f"sw[{h * M * S * 2}:{(h + 1) * M * S * 2}]",
                        kv_slab(p + "vc", h // grp, g), cx_out))
         rl += ([] if seam else [(g.op_h2t, cxb, cxtb)]) + \
-            weight_gemm(p, "Wo", g.op_o, g.qd, D, cxtb, "a", f"o_hd{hd}") + \
+            weight_gemm(p, "Wo", g.op_o, g.qd, D, cxtb, "a", f"o_hd{hd}", site="o", layer=l) + \
             ([(op_norm, "a", p + "n_pa", "a")] if sp.sandwich_norms else []) + [
             (op_add, src, "a", "xs"),
             (op_norm, "xs", p + "n_pf", "hf"),
-        ] + (weight_gemm(p, "Wg", op_gate, D, FF, "hf", "gs", "gate_up") +
-             weight_gemm(p, "Wu", op_gu, D, FF, "hf", "u", "gate_up") if fuse_silu else
-             weight_gemm(p, "Wg", op_gu, D, FF, "hf", "g", "gate_up") +
-             weight_gemm(p, "Wu", op_gu, D, FF, "hf", "u", "gate_up") +
+        ] + (weight_gemm(p, "Wg", op_gate, D, FF, "hf", "gs", "gate_up", site="mlp", layer=l) +
+             weight_gemm(p, "Wu", op_gu, D, FF, "hf", "u", "gate_up", site="mlp", layer=l)
+             if fuse_silu else
+             weight_gemm(p, "Wg", op_gu, D, FF, "hf", "g", "gate_up", site="mlp", layer=l) +
+             weight_gemm(p, "Wu", op_gu, D, FF, "hf", "u", "gate_up", site="mlp", layer=l) +
              [(op_act, "g", "gs")]) + [
             (op_mul, "gs", "u", "gh"),
-        ] + weight_gemm(p, "Wd", op_down, FF, D, "gh", "d", "down") + \
+        ] + weight_gemm(p, "Wd", op_down, FF, D, "gh", "d", "down", site="mlp", layer=l) + \
             ([(op_norm, "d", p + "n_pff", "d")] if sp.sandwich_norms else []) + [
             (op_add, "xs", "d", dst),
         ]
@@ -893,7 +1083,11 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
             for spec, nm in zip(op.get_arg_spec(), bufs):
                 base = nm.split("[")[0]
                 (written if spec.direction in ("out", "inout") else read).add(base)
-        orphans = sorted(read - written - set(dec_sizes) - set(inputs))
+        # A THIRD source, beside the decode arena and the host: a quantized site's own packed
+        # weight, filled by THIS build (main(), after compile) rather than left for a request to
+        # write -- see weight_gemm/qkv_operand's quantized branch and quant_pack above.
+        quant_names = {e["buf"] for e in quant_pack}
+        orphans = sorted(read - written - set(dec_sizes) - set(inputs) - quant_names)
         if orphans:
             raise ValueError(
                 f"{len(orphans)} buffer(s) are read by the prefill graph, never written by it, and "
@@ -954,12 +1148,17 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
     _base_sfx = f"_hd{HD}" if multi_geom else ""
     tn_sc = tiles[f"scores{_base_sfx}"]["tile"][2]
     tn_cx = tiles[f"ctx{_base_sfx}"]["tile"][2]
+    # Resolved HERE, not snapshotted earlier: every op above (including a quantized site's own
+    # packed-weight buffers) has had its chance to add to `bufsz` by now, and everything in it
+    # that is not one of decode's own shared names is prefill's, regardless of how late it was
+    # added.
+    prefill_local = sorted(n for n in bufsz if n not in dec_sizes)
     dims = dict(NL=NL, M=M, S=S, inputs=inputs, cache_names=cache_names,
                 tn_sc=tn_sc, tn_cx=tn_cx, tiles=tiles, cols=cols, causal=causal,
                 kv_block=kvl.T, wqkv_head_major=hm,
                 sm_widths=(SM_WIDTHS if causal == "rows" else None), sm_rows=Hq * M,
                 shared=[n for n in dec_order if not n.startswith("__decode_gap")],
-                reserved=dec_reserved, prefill_local=prefill_local,
+                reserved=dec_reserved, prefill_local=prefill_local, quant_pack=quant_pack,
                 rl=rl, runlist_len=len(rl), per_layer=len(rl) // NL,
                 # TWO different numbers, and conflating them understated the configure count by
                 # 31x. `n_designs` is how many designs get BUILT -- `share_designs` collapses
@@ -1170,6 +1369,13 @@ def main():
                     help="decode artifact meta.json to pin the shared scratch arena against; "
                          "omit (or --no-arena-share) to build a standalone arena")
     ap.add_argument("--no-arena-share", action="store_true")
+    ap.add_argument("--quant-weights",
+                    help="dir of a row-packed quantized (.npy) weight dump (decode's own dump "
+                         "format -- quant.json + per-tensor .npy/.kchunkN.npy); enables GEMM's "
+                         "weight_dtype path for qkv/gate/up/down. Omit for an all-bf16 build.")
+    ap.add_argument("--quant-attn-o-weights",
+                    help="separate quantized dump for attn_o (o_proj) only, when it uses a "
+                         "different group_size than --quant-weights (defaults to it)")
     ap.add_argument("--no-golden", action="store_true")
     ap.add_argument("--layout-only", action="store_true",
                     help="stop after the buffer layout + shared-arena assert; no aiecc, no ELF")
@@ -1200,8 +1406,10 @@ def main():
                 raise SystemExit(f"ERROR: decode artifact {key}={theirs}, this build {ours} -- "
                                  f"the shared cache/weight buffers would not match")
 
+    quant_plan = build_quant_plan(a.quant_weights, a.quant_attn_o_weights)
     sp_, fused, dims = build_graph(a.spec, a.layers, a.batch, a.seq, a.causal,
-                                   dec_meta_path, do_compile=not a.layout_only)
+                                   dec_meta_path, do_compile=not a.layout_only,
+                                   quant_plan=quant_plan)
     if dec_meta_path and a.weights:
         check_shared_weights(dec_meta_path, a.weights, sp, dims)
     M, S, NL = dims["M"], dims["S"], dims["NL"]
@@ -1258,6 +1466,24 @@ def main():
                              f"layout -- AIERuntimeArgSpec.dtype defaults to bfloat16, so this is "
                              f"what an unset dtype looks like")
         open(os.path.join(bdir, f"{SM_WIDTHS}.bin"), "wb").write(widths.tobytes())
+
+    # Quantized weight buffers (Task 5): unlike x/rope/sm_widths above, these are STATIC model
+    # weights, packed ONCE, here, at build time -- not per-request. Each is a permutation of the
+    # same per-tensor dump decode's own GEVM reads (`iron.common.quant.repack_gemm_weight`;
+    # nothing is requantized), cut to the exact tile config the op that owns it was built with, so
+    # a mismatch between the two would be a coding error in this file, not a device numerics gap.
+    if dims["quant_pack"]:
+        from iron.common.quant import repack_gemm_weight
+
+        for e in dims["quant_pack"]:
+            row_packed = np.load(os.path.join(e["src_dir"], e["src_file"]))
+            _, mmul_s, mmul_t = e["mmul"]
+            packed = repack_gemm_weight(row_packed, e["N"], e["K"], e["tile_k"], e["tile_n"],
+                                        e["group_size"], e["weight_dtype"], mmul_s, mmul_t,
+                                        e["cols"])
+            packed.tofile(os.path.join(bdir, f"{e['buf']}.bin"))
+        print(f"[gen] packed {len(dims['quant_pack'])} quantized weight buffer(s) into {bdir} "
+              f"(sites: {sorted({s for s in quant_plan})})")
 
     golden_files, gate = {}, None
     if not a.no_golden:
@@ -1318,8 +1544,12 @@ def main():
         "layout": {n: {"type": v[0], "offset": int(v[1]), "len": int(v[2])}
                    for n, v in lay.items()},
         "inputs": dims["inputs"], "output": "xout",
-        "weights": dims["shared"],
-        # No weight .bin files are emitted: the bytes ARE decode's, at decode's offsets.
+        # decode's shared names carry no .bin here (the bytes ARE decode's, at decode's offsets,
+        # `weights_from` below) -- a quantized site's own buffers DO, in THIS artifact's own
+        # `buffers/` dir, because they are a different byte layout from anything decode holds
+        # (see weight_gemm's quantized branch). Rust's loader already has a path for exactly this
+        # ("a prefill-only weight stays legal", npu_decode.rs) -- it just had no producer before.
+        "weights": dims["shared"] + sorted({e["buf"] for e in dims["quant_pack"]}),
         "weights_from": (os.path.join(os.path.dirname(os.path.abspath(dec_meta_path)), "buffers")
                          if dec_meta_path else None),
         "cache_buffers": dims["cache_names"],
