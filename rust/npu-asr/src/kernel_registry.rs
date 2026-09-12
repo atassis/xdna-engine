@@ -476,6 +476,105 @@ pub fn check_toolchain_freshness(dir: &Path, repo_root: &Path) -> Result<(), Fre
     Ok(())
 }
 
+// ---------------------------------------------------------------------------------------------
+// The declared set: checked-in, says what MUST exist. Different territory from the manifest
+// above on purpose -- that one is generated per-directory and answers "do these bytes still
+// match what I hashed", which requires the file to already be there. Nothing upstream of it can
+// say "is anything missing", because a manifest built by scanning a directory can only describe
+// what the directory currently contains. This is the other half: a small, hand-maintained,
+// version-controlled list of logical kernels the engine needs, independent of whether any of
+// them currently exist on disk.
+//
+// This does NOT replace `generate_manifest`/`resolve_checked`. It is a layer above them: for
+// each declared stem, check presence, and where a per-directory manifest already exists, defer
+// to `resolve_checked` for the hash verification it already does well. A stem that resolves
+// with no manifest to check against is reported, not silently accepted -- see
+// `DeclaredStatus::PresentUnverified`, the "ungated is marked ungated" rule from the design spec.
+//
+// Deliberately does NOT enforce anything. `verify_declared_kernel_set` returns a report; nothing
+// here panics, exits non-zero, or blocks a caller. Wiring a report into a hard failure (npu.rs's
+// silent fallbacks, or install.sh's gate) is a separate, later decision -- this is the
+// observability step first.
+// ---------------------------------------------------------------------------------------------
+
+/// One family's declared requirement: every stem that must exist under `kernels/<family>/`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DeclaredFamily {
+    pub required: Vec<String>,
+}
+
+/// Family name -> its declared stems. Keyed the same way `publish_kernels.sh` names a
+/// family (the directory ABOVE `build`, e.g. `whole_array`, `dwconv1d`, `layernorm`), so a
+/// declared family maps 1:1 onto `resolve_kernel_dir`'s `kernels/<family>` destination.
+pub type DeclaredKernelSet = BTreeMap<String, DeclaredFamily>;
+
+/// The checked-in declaration file, at the repo root -- NOT `MANIFEST_FILE`, and not inside any
+/// kernel build/publish directory. Those are per-directory and generated; this is repo-wide and
+/// hand-maintained. Two different files because they answer two different questions, not two
+/// formats racing to answer the same one.
+pub const DECLARED_KERNELS_FILE: &str = "declared_kernels.json";
+
+pub fn declared_kernels_path(repo_root: &Path) -> PathBuf {
+    repo_root.join(DECLARED_KERNELS_FILE)
+}
+
+pub fn load_declared_kernel_set(repo_root: &Path) -> std::io::Result<DeclaredKernelSet> {
+    let bytes = std::fs::read(declared_kernels_path(repo_root))?;
+    serde_json::from_slice(&bytes)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
+}
+
+/// One declared stem's outcome against `kernels_root/<family>/`.
+#[derive(Debug)]
+pub enum DeclaredStatus {
+    /// The artifact exists and matched its family's `kernel_manifest.json` record.
+    Present,
+    /// The artifact exists but there is no per-directory manifest to check it against -- the file
+    /// is there, but nothing has verified its bytes. Reported, not silently accepted.
+    PresentUnverified,
+    /// The artifact exists but its content hash disagrees with the family manifest.
+    HashMismatch(ManifestError),
+    /// Declared but not found at `kernels_root/<family>/final_{stem}.xclbin` at all.
+    Missing,
+}
+
+/// One row of a declared-set verification: which family/stem, and what was found.
+#[derive(Debug)]
+pub struct DeclaredVerifyEntry {
+    pub family: String,
+    pub stem: String,
+    pub status: DeclaredStatus,
+}
+
+/// Check every declared family/stem against `kernels_root` (the install's published `kernels/`
+/// directory, or any other directory laid out the same way -- one subdirectory per family).
+/// Pure filesystem, no device. Never panics and never returns an error for a missing artifact --
+/// "missing" IS a reportable outcome, not a failure of this function.
+pub fn verify_declared_kernel_set(
+    declared: &DeclaredKernelSet,
+    kernels_root: &Path,
+) -> Vec<DeclaredVerifyEntry> {
+    let mut out = Vec::new();
+    for (family, decl) in declared {
+        let dir = kernels_root.join(family);
+        for stem in &decl.required {
+            let status = if !xclbin_path(&dir, stem).is_file() {
+                DeclaredStatus::Missing
+            } else {
+                match resolve_checked(&dir, stem) {
+                    Ok(_) => DeclaredStatus::Present,
+                    Err(ManifestError::MissingManifest(_) | ManifestError::UnknownStem { .. }) => {
+                        DeclaredStatus::PresentUnverified
+                    }
+                    Err(e) => DeclaredStatus::HashMismatch(e),
+                }
+            };
+            out.push(DeclaredVerifyEntry { family: family.clone(), stem: stem.clone(), status });
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -810,6 +909,89 @@ mod tests {
         // No xclbin written.
         let err = check_toolchain_freshness(&dir, repo.path()).expect_err("empty dir must fail");
         assert!(matches!(err, FreshnessError::NoArtifacts(d) if d == dir));
+    }
+
+    // ------------------------------------------------------------------------------------
+    // verify_declared_kernel_set: the four outcomes a declared stem can land in, each
+    // constructed directly rather than inferred from a combination of the other tests.
+    // ------------------------------------------------------------------------------------
+
+    fn declare(entries: &[(&str, &[&str])]) -> DeclaredKernelSet {
+        entries
+            .iter()
+            .map(|(fam, stems)| {
+                (fam.to_string(), DeclaredFamily { required: stems.iter().map(|s| s.to_string()).collect() })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn declared_set_reports_missing_when_nothing_was_ever_built() {
+        let td = tempfile::tempdir().unwrap();
+        let declared = declare(&[("layernorm", &["ctxln_512x1024"])]);
+        let report = verify_declared_kernel_set(&declared, td.path());
+        assert_eq!(report.len(), 1);
+        assert!(matches!(report[0].status, DeclaredStatus::Missing));
+        assert_eq!(report[0].family, "layernorm");
+        assert_eq!(report[0].stem, "ctxln_512x1024");
+    }
+
+    #[test]
+    fn declared_set_reports_present_when_manifest_backs_it() {
+        let td = tempfile::tempdir().unwrap();
+        let dir = td.path().join("whole_array");
+        std::fs::create_dir(&dir).unwrap();
+        let stem = "512x1024x1024_64x32x128_8c";
+        write_fake_kernel(&dir, stem, b"real-bytes", Some(b"real-insts"));
+        let manifest = generate_manifest(&dir).unwrap();
+        write_manifest(&dir, &manifest).unwrap();
+
+        let declared = declare(&[("whole_array", &[stem])]);
+        let report = verify_declared_kernel_set(&declared, td.path());
+        assert!(matches!(report[0].status, DeclaredStatus::Present));
+    }
+
+    #[test]
+    fn declared_set_reports_unverified_when_file_exists_with_no_manifest() {
+        let td = tempfile::tempdir().unwrap();
+        let dir = td.path().join("dwconv1d");
+        std::fs::create_dir(&dir).unwrap();
+        let stem = "dwconv_silu_1024x400";
+        write_fake_kernel(&dir, stem, b"present-but-never-inventoried", None);
+        // No generate_manifest/write_manifest: exactly the "ungated" case the design spec names --
+        // the file is there, but nothing has verified it, and that must be a distinct outcome from
+        // both Present and Missing, not silently folded into either.
+
+        let declared = declare(&[("dwconv1d", &[stem])]);
+        let report = verify_declared_kernel_set(&declared, td.path());
+        assert!(matches!(report[0].status, DeclaredStatus::PresentUnverified));
+    }
+
+    #[test]
+    fn declared_set_reports_hash_mismatch_when_content_drifted() {
+        let td = tempfile::tempdir().unwrap();
+        let dir = td.path().join("layernorm");
+        std::fs::create_dir(&dir).unwrap();
+        let stem = "glu_512x1024";
+        write_fake_kernel(&dir, stem, b"the-original-bytes", None);
+        let manifest = generate_manifest(&dir).unwrap();
+        write_manifest(&dir, &manifest).unwrap();
+        std::fs::write(xclbin_path(&dir, stem), b"a-different-build-overwrote-this").unwrap();
+
+        let declared = declare(&[("layernorm", &[stem])]);
+        let report = verify_declared_kernel_set(&declared, td.path());
+        assert!(matches!(report[0].status, DeclaredStatus::HashMismatch(_)));
+    }
+
+    #[test]
+    fn declared_kernel_set_round_trips_through_json() {
+        let declared = declare(&[
+            ("whole_array", &["512x1024x1024_64x32x128_8c", "512x768x768_32x32x32_8c"]),
+            ("layernorm", &["ctxln_512x1024"]),
+        ]);
+        let json = serde_json::to_string_pretty(&declared).unwrap();
+        let back: DeclaredKernelSet = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, declared);
     }
 }
 

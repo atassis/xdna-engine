@@ -1,0 +1,67 @@
+{
+  "dwconv1d": {
+    "required": [
+      "dwconv_silu_1024x400",
+      "dwconv_silu_t_1024x400"
+    ]
+  },
+  "layernorm": {
+    "required": [
+      "accadd_512x1024",
+      "accadd_512x1024_bf16b",
+      "affcast_512x1024",
+      "cast_512x1024",
+      "cast_512x4096",
+      "ctxln_512x1024",
+      "ctxln_512x768",
+      "deint_512x4096",
+      "glu_512x1024",
+      "lnaffcast_512x1024",
+      "resadd_512x1024_s050",
+      "resadd_512x1024_s050_bf16b",
+      "resadd_512x1024_s100",
+      "resadd_512x1024_s100_bf16b",
+      "silu_1024x400"
+    ]
+  },
+  "whole_array": {
+    "required": [
+      "512x1024x1024_32x32x32_8c",
+      "512x1024x1024_64x32x128_8c",
+      "512x1024x1024_64x32x128_8c_modalid",
+      "512x1024x2048_32x32x32_8c",
+      "512x1024x2048_64x32x128_8c",
+      "512x1024x2048_64x32x128_8c_modalid",
+      "512x1024x4096_32x32x128_8c_modalsilubf16outpanel1024",
+      "512x1024x4096_32x32x32_8c",
+      "512x1024x4096_64x32x128_8c",
+      "512x1024x4096_64x32x128_8c_modalsilu",
+      "512x1312x1280_32x32x32_8c_bias",
+      "512x1312x1280_32x32x32_8c_modalid",
+      "512x1312x1280_32x32x32_8c_modalsilu",
+      "512x1312x1280_64x32x32_8c_modalid",
+      "512x1312x5120_32x32x32_8c_modalgelu",
+      "512x1312x5120_32x32x32_8c_modalid",
+      "512x1312x5120_32x32x32_8c_modalsilu",
+      "512x3072x768_32x32x32_8c",
+      "512x3104x768_32x32x32_8c_bias",
+      "512x4096x1024_64x32x128_8c_modalid",
+      "512x768x1536_32x32x32_8c",
+      "512x768x1536_64x64x96_8c_modalint8dq",
+      "512x768x3072_32x32x32_8c",
+      "512x768x3072_64x64x96_8c_modalint8dq",
+      "512x768x768_32x32x32_8c",
+      "512x768x768_64x64x96_8c_modalint8dq",
+      "512x800x1536_32x32x32_8c_bias",
+      "512x800x1536_64x32x96_8c_modalid",
+      "512x800x1536_64x32x96_8c_modalsilu",
+      "512x800x3072_32x32x32_8c_silu",
+      "512x800x3072_64x32x96_8c_modalgelu",
+      "512x800x3072_64x32x96_8c_modalid",
+      "512x800x3072_64x32x96_8c_modalsilu",
+      "512x800x768_32x32x32_8c_bias",
+      "512x800x768_64x32x96_8c_modalid",
+      "512x800x768_64x32x96_8c_modalsilu"
+    ]
+  }
+}
