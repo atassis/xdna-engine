@@ -89,17 +89,27 @@ pub fn xclbin_path(dir: &Path, stem: &str) -> PathBuf {
 /// genuine MIX (32 `.txt`, 4 `.bin`, confirmed by direct inspection) from before/after that
 /// toolchain change. Falls back to the `.txt` path when NEITHER exists, preserving the exact
 /// prior behavior for a genuinely-missing kernel (callers checking `.exists()` still correctly
-/// see `false`; error messages still name a sensible path).
+/// see `false`; error messages still name a sensible path). If BOTH exist -- a stale leftover from
+/// before a toolchain change, the same failure shape as the repin-freshness check below -- `.txt`
+/// wins and this warns rather than silently picking one, since most call sites (`ctx2.rs`,
+/// `npu.rs`) use this path directly with no hash-verification safety net.
 pub fn insts_path(dir: &Path, stem: &str) -> PathBuf {
     let txt = dir.join(format!("insts_{stem}.txt"));
-    if txt.is_file() {
-        return txt;
-    }
     let bin = dir.join(format!("insts_{stem}.bin"));
-    if bin.is_file() {
-        return bin;
+    match (txt.is_file(), bin.is_file()) {
+        (true, true) => {
+            eprintln!(
+                "[kernel_registry] both {} and {} exist for stem '{stem}' -- using .txt; \
+                 remove the stale one",
+                txt.display(),
+                bin.display()
+            );
+            txt
+        }
+        (true, false) => txt,
+        (false, true) => bin,
+        (false, false) => txt,
     }
-    txt
 }
 
 /// Resolve both artifacts for one `stem` under `dir`. Does NOT check that anything exists or
@@ -835,6 +845,18 @@ mod tests {
         let manifest = generate_manifest(td.path()).unwrap();
         let entry = &manifest[stem];
         assert!(entry.insts_sha256.is_some(), "a .bin-suffixed insts file must be found, not silently treated as absent");
+    }
+
+    /// A stale leftover from before a toolchain change could leave both extensions on disk for
+    /// the same stem. Pin the precedence (.txt wins) as intentional, not an untested accident.
+    #[test]
+    fn insts_path_prefers_txt_when_both_extensions_exist() {
+        let td = tempfile::tempdir().unwrap();
+        let stem = "512x768x768_32x32x32_8c";
+        std::fs::write(td.path().join(format!("insts_{stem}.txt")), b"fake-insts-txt").unwrap();
+        std::fs::write(td.path().join(format!("insts_{stem}.bin")), b"fake-insts-bin").unwrap();
+
+        assert_eq!(insts_path(td.path(), stem), td.path().join(format!("insts_{stem}.txt")));
     }
 
     #[test]
