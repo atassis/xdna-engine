@@ -22,11 +22,24 @@ name = "gemma4-12b"
 # TMatVec tiling that fits L1. SPLIT_LM_HEAD=0 because the host loader carries one elf/kernel name,
 # so a split head would be a second dispatch it cannot express.
 #
-# NOT the default generate model, deliberately: ~1.2 tok/s and a 15.3 GB resident arena against
-# qwen3-0.6b's 27.87 ms/token and 1.4 GB. Name it per request.
+# NOT the default generate model, deliberately: ~529 ms/token on the g32 arm below (~1.9 tok/s)
+# and a 15.3 GB resident arena against qwen3-0.6b's 1.4 GB. Name it per request. The ~1.2 tok/s
+# this line used to quote was the g64 arm.
+# GROUP SIZE 32, AND THIS OVERRIDES A FAILED QUALITY GATE -- owner's call 2026-09-12, recorded
+# here so it is not read later as an oversight. g32 is the FASTER arm (~529 ms/token against g64's
+# ~801) and it LOST its perplexity gate: paired wikitext-2, 2000 positions, BOS, 48 layers, arms
+# differing only in the packed dump -- g32 mean NLL 6.55059 / ppl 699.658 against g64's 6.50277 /
+# 666.990, i.e. g32 worse by +4.898% [+1.821, +8.068], t=3.15. It was rolled back to g64 on that
+# evidence and is being put back deliberately, trading measured output quality for latency.
+# Two traps for whoever reads this next:
+#   - top-1 is UNCHANGED (29.05% g32 vs 28.85% g64), so a short argmax parity check will not see
+#     the regression; the damage is a broad distributional shift, worse at 54.2% of positions.
+#   - per-site weight rel-L2 says g32 is BETTER at every site (head 0.569% vs 0.654%). It
+#     disagreed with the end-to-end result in SIGN. Do not re-argue this from a weight-space norm.
+# Roll back by pointing both lines at the _int8g64 pair; both artifacts are on disk.
 [artifacts]
-decode = "artifacts/gemma4-12b/decode_int8g64"
-weights = "artifacts/gemma4-12b/weights_int8g64"
+decode = "artifacts/gemma4-12b/decode_int8g32"
+weights = "artifacts/gemma4-12b/weights_int8g32"
 tokenizer_dir = "artifacts/gemma4-12b/tokenizer"
 
 [generation]
