@@ -32,7 +32,14 @@ fi
 K="${BASH_REMATCH[1]}"
 N="${BASH_REMATCH[2]}"
 
-make -C "$MMW" NPU2=1 M=512 K="$K" N="$N" dtype_in=bf16 dtype_out=f32 n_aie_cols=8 use_iron=1
+# Tolerate the exit, then REQUIRE the xclbin -- makefile-common's `all` target is
+# `${xclbin_target} ${targetname}.exe`, and the `.exe` half needs a working system XRT
+# cmake config; on this box `xrt-config.cmake` fails to find `libxilinxopencl.a` and
+# `all` dies there AFTER the xclbin is already built. Confirmed by direct observation:
+# a real build here produced a correct xclbin+insts pair and still exited non-zero from
+# the unrelated .exe step. `build_kernels.sh` already carries this exact tolerance for
+# the same reason; naive `set -e` here would report a false failure on every build.
+make -C "$MMW" NPU2=1 M=512 K="$K" N="$N" dtype_in=bf16 dtype_out=f32 n_aie_cols=8 use_iron=1 || true
 
 built="$MMW/build/final_512x${K}x${N}_32x32x32_8c.xclbin"
 [ -f "$built" ] || { echo "[whole_array] make reported success but $built is missing" >&2; exit 1; }
