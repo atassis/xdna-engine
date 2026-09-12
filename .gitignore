@@ -61,3 +61,5 @@ experiments/probes/build*/
 
 # per-worktree cargo target-dir, written by scripts/setup_worktree.sh
 /.cargo/
+
+scratch/

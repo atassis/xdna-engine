@@ -13,7 +13,10 @@ VENV_IRON="${VENV_IRON:-$REPO/.venv-iron}"
 [ -x "$VENV_IRON/bin/python" ] || VENV_IRON="$WS/xdna-engine/.venv-iron"
 . "$REPO/scripts/amd_paths.sh"
 IRON="${IRON:-$IRON_DIR}"
-WEIGHTS="${WEIGHTS:-$WS/artifacts-qwen3-0.6b/weights}"
+# $REPO/artifacts/<spec>, not "$WS/artifacts-<spec>" -- the latter has a hyphen where a path
+# separator belongs and is anchored at the workspace; it resolves to a directory that has
+# never existed, so the build died on a missing weight rather than on a clear message.
+WEIGHTS="${WEIGHTS:-$REPO/artifacts/qwen3-0.6b/weights}"
 GEN="$REPO/designs/decode_fused/gen_llm_prefill_mlp.py"
 
 [ -x "$VENV_IRON/bin/python" ] || { echo "ERROR: no iron venv at $VENV_IRON"; exit 1; }

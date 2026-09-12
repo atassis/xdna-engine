@@ -137,6 +137,23 @@ fn provenance_extras(decode_dir: &Path) -> ArmProvenance {
     p
 }
 
+/// Check `name`'s blob against its layout length without reading it. A cache buffer is never
+/// uploaded, so this is all that remains of what [`upload_blob`] contributed for one: the catch
+/// for an artifact whose blobs and layout disagree.
+fn check_blob_len(artifact: &LlmArtifact, name: &str) -> Result<(), EngineError> {
+    let path = artifact.weight_blob_path(name);
+    let got = std::fs::metadata(&path)
+        .map_err(|e| EngineError::Load(format!("stat weight buffer {name}.bin: {e}")))?
+        .len() as usize;
+    let want = artifact.loc(name).len;
+    if got != want {
+        return Err(EngineError::Load(format!(
+            "weight buffer {name}.bin is {got} bytes, layout declares {want}"
+        )));
+    }
+    Ok(())
+}
+
 fn upload_blob(arena: &FusedArena, artifact: &LlmArtifact, name: &str) -> Result<(), EngineError> {
     let bytes = std::fs::read(artifact.weight_blob_path(name))
         .map_err(|e| EngineError::Load(format!("read weight buffer {name}.bin: {e}")))?;
@@ -384,8 +401,16 @@ impl NpuDecodeStep {
                 .map_err(|e| EngineError::Load(format!("alloc fused arenas: {e}")))?,
         );
 
+        // A cache buffer's blob is not uploaded: the zeroing pass below overwrites that whole
+        // region, so reading it would place bytes nothing goes on to observe. Measured across the
+        // 115 cache-bearing artifacts on this box (2026-09-11), that read is 0.22 GB per artifact
+        // at the median and 3.50 GB at the widest (S=32768).
         for name in &artifact.weights {
-            upload_blob(&arena, &artifact, name)?;
+            if artifact.cache_buffers.contains(name) {
+                check_blob_len(&artifact, name)?;
+            } else {
+                upload_blob(&arena, &artifact, name)?;
+            }
         }
         // A prefill artifact may declare weights the decode graph has no use for. There is no such
         // buffer today -- the causal mask turned out to be a per-row width VECTOR the host writes
