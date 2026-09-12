@@ -579,6 +579,68 @@ pub fn verify_declared_kernel_set(
     out
 }
 
+/// What happened when the driver tried to produce one declared-but-missing stem.
+#[derive(Debug)]
+pub enum BuildOutcome {
+    /// Already resolved before any build was attempted -- the adapter was never called.
+    AlreadyPresent,
+    /// The adapter exited 0.
+    Built,
+    /// The adapter ran and exited non-zero, or could not be spawned at all.
+    BuildFailed(String),
+    /// The declared family's `recipe` path does not exist or is not executable.
+    NoRecipe(PathBuf),
+}
+
+#[derive(Debug)]
+pub struct BuildResult {
+    pub family: String,
+    pub stem: String,
+    pub outcome: BuildOutcome,
+}
+
+/// For every declared stem that `verify_declared_kernel_set` reports Missing, resolve its
+/// family's `recipe` (relative to `repo_root`) and invoke `<recipe> build <stem> <kernels_root>`.
+/// Every OTHER declared stem (Present, PresentUnverified, HashMismatch) is left alone -- this
+/// function only ever acts on Missing, and it never stops early: one family's failure does not
+/// prevent another family's stem from being attempted. Pure orchestration -- it does not publish
+/// or re-verify; the caller does both, because "did the rebuild actually work" can only be
+/// answered by looking at the kernels_root again afterward, not by trusting an exit code.
+pub fn build_missing_declared_kernels(
+    declared: &DeclaredKernelSet,
+    repo_root: &Path,
+    kernels_root: &Path,
+) -> Vec<BuildResult> {
+    let report = verify_declared_kernel_set(declared, kernels_root);
+    let mut results = Vec::with_capacity(report.len());
+    for entry in report {
+        let outcome = match entry.status {
+            DeclaredStatus::Missing => {
+                let recipe_rel = &declared[&entry.family].recipe;
+                let recipe_path = repo_root.join(recipe_rel);
+                if !recipe_path.is_file() {
+                    BuildOutcome::NoRecipe(recipe_path)
+                } else {
+                    match std::process::Command::new(&recipe_path)
+                        .arg("build")
+                        .arg(&entry.stem)
+                        .arg(kernels_root.join(&entry.family))
+                        .current_dir(repo_root)
+                        .status()
+                    {
+                        Ok(s) if s.success() => BuildOutcome::Built,
+                        Ok(s) => BuildOutcome::BuildFailed(format!("adapter exited {s}")),
+                        Err(e) => BuildOutcome::BuildFailed(e.to_string()),
+                    }
+                }
+            }
+            _ => BuildOutcome::AlreadyPresent,
+        };
+        results.push(BuildResult { family: entry.family, stem: entry.stem, outcome });
+    }
+    results
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -1018,6 +1080,119 @@ mod tests {
         assert!(json.contains("scripts/kernel_families/whole_array.sh"));
         let back: DeclaredKernelSet = serde_json::from_str(&json).unwrap();
         assert_eq!(back["whole_array"].recipe, "scripts/kernel_families/whole_array.sh");
+    }
+
+    // ------------------------------------------------------------------------------------
+    // build_missing_declared_kernels: dispatch to a family's recipe script for every Missing
+    // stem, collect every outcome (never stop early), never touch a stem that already resolves.
+    // ------------------------------------------------------------------------------------
+
+    fn write_fake_adapter(dir: &Path, name: &str, script: &str) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, script).unwrap();
+        let mut perm = std::fs::metadata(&path).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o755);
+        std::fs::set_permissions(&path, perm).unwrap();
+        path
+    }
+
+    #[test]
+    fn build_missing_calls_the_right_adapter_and_does_not_touch_present_stems() {
+        let repo = tempfile::tempdir().unwrap();
+        let kernels_root = repo.path().join("kernels");
+        std::fs::create_dir_all(&kernels_root).unwrap();
+
+        // whole_array's stem already exists -- must not be touched.
+        let wa_dir = kernels_root.join("whole_array");
+        std::fs::create_dir(&wa_dir).unwrap();
+        write_fake_kernel(&wa_dir, "already_here", b"bytes", None);
+
+        // dwconv1d's stem is missing -- the adapter must be called with it.
+        let adapter = write_fake_adapter(
+            repo.path(),
+            "dwconv1d_adapter.sh",
+            "#!/bin/sh\necho \"called with: $1 $2\" > \"$(dirname \"$0\")/dwconv1d_call.log\"\n\
+             mkdir -p \"$3\"\ntouch \"$3/final_$2.xclbin\"\nexit 0\n",
+        );
+        let mut declared = DeclaredKernelSet::new();
+        declared.insert(
+            "whole_array".to_string(),
+            DeclaredFamily { required: vec!["already_here".to_string()], recipe: "no_such_adapter.sh".to_string() },
+        );
+        declared.insert(
+            "dwconv1d".to_string(),
+            DeclaredFamily {
+                required: vec!["missing_stem".to_string()],
+                recipe: adapter.to_str().unwrap().to_string(),
+            },
+        );
+
+        let results = build_missing_declared_kernels(&declared, repo.path(), &kernels_root);
+
+        let wa = results.iter().find(|r| r.family == "whole_array").unwrap();
+        assert!(matches!(wa.outcome, BuildOutcome::AlreadyPresent), "{:?}", wa.outcome);
+
+        let dw = results.iter().find(|r| r.family == "dwconv1d").unwrap();
+        assert!(matches!(dw.outcome, BuildOutcome::Built), "{:?}", dw.outcome);
+
+        let log = std::fs::read_to_string(repo.path().join("dwconv1d_call.log")).unwrap();
+        assert!(log.contains("build missing_stem"), "adapter should be called as: build <stem>, got: {log}");
+    }
+
+    #[test]
+    fn build_missing_reports_no_recipe_without_touching_anything() {
+        let repo = tempfile::tempdir().unwrap();
+        let kernels_root = repo.path().join("kernels");
+        std::fs::create_dir_all(&kernels_root).unwrap();
+
+        let mut declared = DeclaredKernelSet::new();
+        declared.insert(
+            "layernorm".to_string(),
+            DeclaredFamily {
+                required: vec!["ctxln_512x1024".to_string()],
+                recipe: "definitely_does_not_exist.sh".to_string(),
+            },
+        );
+
+        let results = build_missing_declared_kernels(&declared, repo.path(), &kernels_root);
+        assert_eq!(results.len(), 1);
+        assert!(matches!(&results[0].outcome, BuildOutcome::NoRecipe(_)), "{:?}", results[0].outcome);
+    }
+
+    #[test]
+    fn build_missing_collects_a_failure_and_keeps_going() {
+        let repo = tempfile::tempdir().unwrap();
+        let kernels_root = repo.path().join("kernels");
+        std::fs::create_dir_all(&kernels_root).unwrap();
+
+        let failing = write_fake_adapter(repo.path(), "failing.sh", "#!/bin/sh\nexit 7\n");
+        let succeeding = write_fake_adapter(
+            repo.path(),
+            "succeeding.sh",
+            "#!/bin/sh\nmkdir -p \"$3\"\ntouch \"$3/final_$2.xclbin\"\nexit 0\n",
+        );
+
+        let mut declared = DeclaredKernelSet::new();
+        declared.insert(
+            "layernorm".to_string(),
+            DeclaredFamily { required: vec!["will_fail".to_string()], recipe: failing.to_str().unwrap().to_string() },
+        );
+        declared.insert(
+            "dwconv1d".to_string(),
+            DeclaredFamily {
+                required: vec!["will_succeed".to_string()],
+                recipe: succeeding.to_str().unwrap().to_string(),
+            },
+        );
+
+        let results = build_missing_declared_kernels(&declared, repo.path(), &kernels_root);
+        assert_eq!(results.len(), 2, "one family failing must not stop the other from being attempted");
+
+        let failed = results.iter().find(|r| r.family == "layernorm").unwrap();
+        assert!(matches!(&failed.outcome, BuildOutcome::BuildFailed(_)), "{:?}", failed.outcome);
+
+        let ok = results.iter().find(|r| r.family == "dwconv1d").unwrap();
+        assert!(matches!(ok.outcome, BuildOutcome::Built), "{:?}", ok.outcome);
     }
 }
 
