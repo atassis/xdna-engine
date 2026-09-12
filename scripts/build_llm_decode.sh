@@ -64,6 +64,7 @@ export AIECC_PATH="${AIECC_PATH:-$INST/bin/aiecc}"
 export PEANO_INSTALL_DIR="${PEANO_INSTALL_DIR:-$VENV_IRON/lib/python3.14/site-packages/llvm-aie}"
 export MLIR_AIE_INSTANCE="$INST"
 export PATH="$VENV_IRON/bin:$VENV_IRON/cc-shim:$AIEBU_ASM_DIR:$PATH"
+export AIE_DEVICE="${AIE_DEVICE:-npu2}"   # build off the device lock; see gen_llm_decode.py
 [ -x "$AIECC_PATH" ] || { echo "ERROR: instance aiecc missing at $AIECC_PATH"; exit 1; }
 
 # IRON writes build/ intermediates under CWD, and IRON's own cache is mtime-vs-dependencies
