@@ -628,6 +628,9 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
         # their arena byte-identical to before weight_gemm existed. Both down and o produce a
         # D-wide C, so one triple covers either, reused across layers and across the two roles.
         # `kpart2` is the pairwise-tree fold's third slot (weight_gemm below, n=4 case).
+        # weight_gemm asserts this D-sizing against whatever Nout a call actually needs, so a
+        # future K-split at a different width (Wg/Wu, FF-wide) fails loud instead of overrunning
+        # this.
         if any(f"L{l}_{base}k0" in dec_sizes for l in range(NL) for base in ("Wd", "Wo")):
             bufsz["kacc"] = M * D * 2
             bufsz["kpart"] = M * D * 2
@@ -714,6 +717,17 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
         if K % n:
             raise ValueError(f"{plain}: K={K} not divisible by its own {n} decode-arena chunks")
         chunk_k = K // n
+        if n > 1:
+            # kacc/kpart/kpart2 are pre-sized D-wide, above, for the only two roles the shared
+            # arena chunks today (Wd, Wo). A future K-split at a different Nout (Wg/Wu -> FF)
+            # would silently write an FF-wide tile into this D-wide scratch; fail loud instead,
+            # before spending a GEMM tile lookup on a shape we are about to reject anyway.
+            want = M * Nout * 2
+            have = bufsz.get("kacc")
+            if have != want:
+                raise ValueError(f"{plain}: K-split scratch (kacc/kpart/kpart2) is {have}B, "
+                                 f"sized for a different Nout than this call's {Nout} "
+                                 f"({want}B needed)")
         ckey = (chunk_k, Nout)
         if ckey not in _chunked_cache:
             chunk_op = gemm_for(f"{label}_k{chunk_k}of{n}", chunk_k, Nout,
