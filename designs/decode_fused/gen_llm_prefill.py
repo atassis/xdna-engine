@@ -1390,8 +1390,12 @@ def main():
         # kv_block is checked because its ABSENCE from this list is what let a blocked decode and
         # a flat prefill share an arena, agree on every offset, and disagree about what the bytes
         # in it mean -- caught only on device, as one token repeated.
+        #
+        # dkb == S is the KVLayout(T=S) degenerate case: one block, byte-identical to the flat
+        # layout, no boundary to straddle. Exempted here to match the KV-append descriptor below
+        # (`if kvl_g.T == kvl_g.S`), which imposes no divisibility requirement either.
         dkb = dm["dims"].get("kv_block")
-        if dkb and a.batch % dkb:
+        if dkb and dkb != dm["dims"]["S"] and a.batch % dkb:
             raise SystemExit(f"ERROR: decode artifact kv_block={dkb} does not divide --batch "
                              f"{a.batch}; the KV append would straddle a block boundary")
         for key, ours in (("S", a.seq), ("layers", a.layers), ("d_model", sp.d_model),
