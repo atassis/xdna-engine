@@ -14,6 +14,7 @@ WS="$(cd "$REPO/.." && pwd)"
 LAYERS="${1:-1}"; BATCH="${2:-256}"; SEQ="${3:-2048}"
 OUT="${4:-/mnt/data/xdna/scratch/prefill/full_l${LAYERS}_m${BATCH}_s${SEQ}}"
 CAUSAL="${CAUSAL:-rows}"
+SPEC="${SPEC:-qwen3-0.6b}"   # override for a non-qwen3 spec (e.g. gemma4-12b)
 VENV_IRON="${VENV_IRON:-$REPO/.venv-iron}"
 [ -x "$VENV_IRON/bin/python" ] || VENV_IRON="$WS/xdna-engine/.venv-iron"
 . "$REPO/scripts/amd_paths.sh"
@@ -72,11 +73,16 @@ export PATH="$VENV_IRON/bin:$VENV_IRON/cc-shim:$AIEBU_ASM_DIR:$PATH"
 export AIE_DEVICE="${AIE_DEVICE:-npu2}"   # build off the device lock; see gen_llm_decode.py
 [ -x "$AIECC_PATH" ] || { echo "ERROR: instance aiecc missing at $AIECC_PATH"; exit 1; }
 
+# Per-site quantized weights (Task 5's GEMM weight_dtype/group_size axis): optional, additive.
+QUANT_ARGS=()
+[ -n "${QUANT_WEIGHTS:-}" ] && QUANT_ARGS+=(--quant-weights "$QUANT_WEIGHTS")
+[ -n "${QUANT_ATTN_O_WEIGHTS:-}" ] && QUANT_ARGS+=(--quant-attn-o-weights "$QUANT_ATTN_O_WEIGHTS")
+
 # Build artifacts go to NVMe, never the tmpfs scratchpad. Per-arm work dir, because IRON keys
 # cached operator artifacts by NAME and a shared dir lets one arm link another's binaries.
 WORK="${KEEP_WORK:-/mnt/data/xdna/scratch/prefill/build_full_l${LAYERS}_m${BATCH}_s${SEQ}_${CAUSAL}}"
 mkdir -p "$WORK" "$OUT"
 cd "$WORK"
 exec "$VENV_IRON/bin/python" "$REPO/designs/decode_fused/gen_llm_prefill.py" \
-  --spec qwen3-0.6b --out "$OUT" --layers "$LAYERS" --batch "$BATCH" --seq "$SEQ" \
-  --causal "$CAUSAL" "${ARENA_ARGS[@]}" "${GOLDEN_ARGS[@]}"
+  --spec "$SPEC" --out "$OUT" --layers "$LAYERS" --batch "$BATCH" --seq "$SEQ" \
+  --causal "$CAUSAL" "${ARENA_ARGS[@]}" "${GOLDEN_ARGS[@]}" "${QUANT_ARGS[@]}"
