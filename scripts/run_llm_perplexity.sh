@@ -4,8 +4,13 @@
 #
 #   bash scripts/run_llm_perplexity.sh <spec> <corpus> <out-prefix> [MAX_TOKENS]
 #
-# The arm is selected by gen_llm_decode.py's env flags (QUANT_MLP_DTYPE, QUANT_MLP_GROUP, ...),
-# so a caller runs this once per arm with the same corpus and the same --max-tokens; the arms then
+# <corpus> is UTF-8 text, or a tokenize_corpus.py `.ids.json` -- taken as --ids when the name ends
+# .json, because QwenBPE cannot read Gemma's tokenizer. LAYERS, MAX_SEQ, REF_NLL and REF_META pass
+# through to the harness; REF_NLL makes the run print the paired verdict instead of a bare number.
+#
+# The arm is selected by gen_llm_decode.py's env flags (QUANT_MLP_DTYPE, QUANT_MLP_GROUP, ...), or
+# by WEIGHTS alone when the dump is pre-packed -- its quant.json is then the authority and the plan
+# cannot re-choose. A caller runs this once per arm with the same corpus and --max-tokens; the arms
 # share positions and the comparison is PAIRED. designs/decode_fused/hostlab/pairwise.py does the
 # test on the emitted .nll.npy files -- do NOT compare two arms by differencing their
 # control-relative percentages.
@@ -31,6 +36,12 @@ IRON="${IRON:-$IRON_DIR}"
 WEIGHTS="${WEIGHTS:-$REPO/artifacts/$SPEC/weights}"
 [ -d "$WEIGHTS" ] || { echo "ERROR: no weights at $WEIGHTS"; exit 1; }
 [ -r "$CORPUS" ] || { echo "ERROR: cannot read corpus $CORPUS"; exit 1; }
+case "$CORPUS" in *.json) CORPUS_FLAG=--ids ;; *) CORPUS_FLAG=--text ;; esac
+EXTRA=()
+[ -n "${LAYERS:-}" ]   && EXTRA+=(--layers "$LAYERS")
+[ -n "${MAX_SEQ:-}" ]  && EXTRA+=(--max-seq "$MAX_SEQ")
+[ -n "${REF_NLL:-}" ]  && EXTRA+=(--ref-nll "$REF_NLL")
+[ -n "${REF_META:-}" ] && EXTRA+=(--ref-meta "$REF_META")
 
 INST="$("$REPO/scripts/toolchain_up.sh")"
 export PYTHONPATH="$INST/python:$IRON${PYTHONPATH:+:$PYTHONPATH}"
@@ -45,5 +56,5 @@ echo "[ppl] spec=$SPEC inst=$(basename "$INST") iron=$(basename "$IRON") tokens=
 echo "[ppl] arm: QUANT_MLP_DTYPE=${QUANT_MLP_DTYPE:-bf16} g=${QUANT_MLP_GROUP:-128}" \
      "QUANT_HEAD_DTYPE=${QUANT_HEAD_DTYPE:-bf16} QUANT_ATTN_DTYPE=${QUANT_ATTN_DTYPE:-bf16}"
 exec "$VENV_IRON/bin/python" "$REPO/designs/decode_fused/eval_llm_perplexity.py" \
-    --spec "$SPEC" --weights "$WEIGHTS" --text "$CORPUS" --max-tokens "$MAXTOK" \
-    --dump-nll "$OUTP.nll.npy" --out-json "$OUTP.json"
+    --spec "$SPEC" --weights "$WEIGHTS" "$CORPUS_FLAG" "$CORPUS" --max-tokens "$MAXTOK" \
+    "${EXTRA[@]}" --dump-nll "$OUTP.nll.npy" --out-json "$OUTP.json"

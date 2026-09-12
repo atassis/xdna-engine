@@ -40,24 +40,15 @@ import ml_dtypes
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "hostlab"))
 import newstack_compat  # noqa: F401,E402
-from verify_llm_decode import window_len  # noqa: E402 -- one owner for the rounding
+from verify_llm_decode import window_len, rope_row  # noqa: E402 -- one owner for each
 from gen_llm_decode import (build_graph, report_artifact_freshness,  # noqa: E402
                             load_weight_buffer, isolate_build_dir)
-from qwen_bpe import QwenBPE  # noqa: E402
 from pairwise import paired  # noqa: E402 -- one owner for the paired-comparison stat
 from iron.common.kv_layout import KVLayout  # noqa: E402
 
 BF16 = ml_dtypes.bfloat16
 
 
-def rope_row(pos, head_dim, theta):
-    half = head_dim // 2
-    inv = 1.0 / (theta ** (np.arange(0, head_dim, 2, dtype=np.float64)[:half] / head_dim))
-    ang = pos * inv
-    row = np.empty(head_dim, dtype=np.float32)
-    row[0::2] = np.cos(ang)
-    row[1::2] = np.sin(ang)
-    return row.astype(BF16)
 
 
 def log_softmax_at(logits, idx):
@@ -103,8 +94,9 @@ def main():
             "~/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots")
         if os.path.isdir(tj):
             tj = os.path.join(tj, sorted(os.listdir(tj))[0], "tokenizer.json")
+        from qwen_bpe import QwenBPE, self_test  # imported here: the --ids path is for specs
+        # QwenBPE cannot read, and its `regex` dependency is not in .venv-iron.
         if a.ref:
-            from qwen_bpe import self_test
             self_test(tj, a.ref)
             print(f"[ppl] tokenizer self-test PASS against {os.path.basename(a.ref)}")
         tok = QwenBPE(tj)
@@ -138,18 +130,40 @@ def main():
     # mmap, not np.load -- Gemma-4-12B's embed table is 4 GB at f32, and a plain np.load()
     # followed by .astype(f32) reads the whole thing AND copies it (up to 8 GB transient) for a
     # loop that only ever touches one row per token.
-    embed = np.load(os.path.join(a.weights, "model.embed_tokens.weight.npy"), mmap_mode="r")
+    embed = np.load(os.path.join(a.weights, f"{sp.weight_prefix}embed_tokens.weight.npy"),
+                    mmap_mode="r")
     scale = np.sqrt(D) if sp.embed_scale == "sqrt_d_model" else 1.0
-    xin, rope_buf, out = c.get_buffer("x"), c.get_buffer("rope_global"), c.get_buffer("logits")
+    xin, out = c.get_buffer("x"), c.get_buffer("logits")
+    # Every per-position input this graph declares, driven the way verify_llm_decode.py drives it.
+    # A dual-theta spec declares a SECOND angle buffer for its sliding layers, and under per-layer
+    # geometry the two differ in WIDTH as well as theta -- so the row comes off each buffer's own
+    # size, never off sp.head_dim. Writing only rope_global leaves 40 of Gemma-4's 48 layers
+    # rotating against a buffer the host never touched.
+    rope_g = c.get_buffer("rope_global") if "rope_global" in md["inputs"] else None
+    rope_l = c.get_buffer("rope_local") if "rope_local" in md["inputs"] else None
+    # One KV offset per distinct head_dim: `pos * head_dim` is two different byte offsets here.
+    if md["T"] != S and len(md["kv_slots"]) > 1:
+        raise SystemExit(f"[ppl] blocked KV (T={md['T']}, S={S}) with per-layer geometry is not "
+                         "wired -- kv_slots carry head_dim but not kv_heads. See "
+                         "verify_llm_decode.py, which refuses the same combination.")
+    kv_slots = [(nm, KVLayout(Hkv=sp.n_kv_heads, S=S, HD=hd, T=md["T"]))
+                for nm, hd in md["kv_slots"]] or [("kv_off", kv_layout)]
 
-    nll, t0, top1_hits = [], time.perf_counter(), 0
+    nll, t0, top1_hits, n_sat = [], time.perf_counter(), 0, 0
     for pos in range(n):
         with xin.overwrite() as _buf:
             row = np.asarray(embed[ids[pos]], dtype=np.float32) * scale
             _buf[:] = np.asarray(row, BF16).reshape(-1)
-        with rope_buf.overwrite() as _buf:
-            _buf[:] = rope_row(pos, HD, sp.rope_theta_global).reshape(-1)
-        params.write("kv_off", int(kv_layout.kv_off(pos)))
+        if rope_g is not None:
+            with rope_g.overwrite() as _buf:
+                _buf[:] = rope_row(pos, _buf.size, sp.rope_theta_global,
+                                   sp.rope_partial_rotary).reshape(-1)
+        if rope_l is not None:
+            # Sliding layers are rope_type "default" -- nothing narrowed.
+            with rope_l.overwrite() as _buf:
+                _buf[:] = rope_row(pos, _buf.size, sp.rope_theta_local).reshape(-1)
+        for _slot, _kvl in kv_slots:
+            params.write(_slot, int(_kvl.kv_off(pos)))
         params.write("sm_mask", int(pos + 1))
         if window_granule is not None:
             # A dynamic-window build reads its attended length from this parameter every dispatch.
@@ -161,6 +175,15 @@ def main():
         params.sync()
         c()
         lg = np.asarray(out.data[:VOCAB], dtype=np.float32)
+        if sp.logit_softcap is not None:
+            # final_logit_softcapping, the transform rust/npu-engine applies after readback. This
+            # IS the model's output distribution, so a perplexity that skips it scores a different
+            # model: on Gemma-4-12B, skipping it read mean NLL 19.9 -- above ln(vocab), i.e. worse
+            # than uniform. It saturates in f32 rather than changing the argmax in exact
+            # arithmetic, hence the tie count below: this instrument's control on a stack too
+            # shallow to gate.
+            lg = np.tanh(lg / sp.logit_softcap) * sp.logit_softcap
+            n_sat += int((np.abs(lg) >= sp.logit_softcap * (1 - 1e-6)).sum())
         nll.append(-log_softmax_at(lg, ids[pos + 1]))
         top1_hits += int(np.argmax(lg) == ids[pos + 1])
         if (pos + 1) % 256 == 0:
@@ -174,9 +197,15 @@ def main():
                 np.save(a.dump_nll, np.asarray(nll, dtype=np.float64))
     wall = time.perf_counter() - t0
 
+    if sp.logit_softcap is not None and n_sat > 0.001 * n * VOCAB:
+        print(f"[ppl] WARNING: {n_sat/(n*VOCAB):.1%} of logits saturate the "
+              f"{sp.logit_softcap} softcap -- the argmax is index order there and this run does "
+              "not gate the model. A truncated stack does this; a full-depth one does not.",
+              file=sys.stderr)
     mean_nll = float(np.mean(nll))
     res = {
         "spec": sp.name, "layers": md["NL"], "text": corpus_name,
+        "logit_softcap": sp.logit_softcap, "softcap_saturated_frac": n_sat / (n * VOCAB),
         "n_scored": n, "mean_nll": mean_nll, "perplexity": math.exp(mean_nll),
         "top1_acc": top1_hits / n, "median_nll": float(np.median(nll)),
         # NOT a benchmark, and named so it cannot be quoted as one. No warmup, no alternation,
