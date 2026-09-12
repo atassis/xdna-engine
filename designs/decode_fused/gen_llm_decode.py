@@ -619,13 +619,13 @@ def isolate_build_dir(tag):
             raise SystemExit(
                 f"[{tag}] DECODE_WORK={explicit} is on {fs}, which is RAM. A decode artifact is "
                 f"~1.4 GB and competes with the weight buffers the model holds resident. Use a "
-                f"disk-backed path (e.g. ${{XDNA_SCRATCH:-/mnt/data/xdna-scratch}}/{tag}), or set "
+                f"disk-backed path (e.g. ${{XDNA_SCRATCH:-/mnt/data/xdna/scratch}}/{tag}), or set "
                 f"ALLOW_TMPFS_BUILD=1 for a small probe build.")
         os.chdir(explicit)
         print(f"[{tag}] build dir {explicit} (DECODE_WORK, kept)", flush=True)
         return explicit
 
-    root = os.environ.get("XDNA_SCRATCH", "/mnt/data/xdna-scratch")
+    root = os.environ.get("XDNA_SCRATCH", "/mnt/data/xdna/scratch")
     base, why = None, ""
     try:
         os.makedirs(root, exist_ok=True)

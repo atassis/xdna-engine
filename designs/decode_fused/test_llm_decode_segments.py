@@ -24,7 +24,7 @@ import pytest
 gen = pytest.importorskip("gen_llm_decode")
 
 SPEC = "gemma3-270m"
-WEIGHTS = "/mnt/data/models/xdna-artifacts/gemma3-270m/weights"
+WEIGHTS = "/mnt/data/xdna/artifacts/gemma3-270m/weights"
 LAYERS = 6
 
 pytestmark = pytest.mark.skipif(
