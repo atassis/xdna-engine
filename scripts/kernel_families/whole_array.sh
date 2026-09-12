@@ -15,6 +15,8 @@
 set -euo pipefail
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 MMW="$REPO/mlir-aie/programming_examples/basic/matrix_multiplication/whole_array"
+# shellcheck source=../kernel_sandbox.sh
+source "$REPO/scripts/kernel_sandbox.sh"
 
 cmd="${1:?usage: whole_array.sh build <stem> <dest-dir>}"
 stem="${2:?usage: whole_array.sh build <stem> <dest-dir>}"
@@ -31,6 +33,16 @@ if [[ ! "$stem" =~ ^512x([0-9]+)x([0-9]+)_32x32x32_8c$ ]]; then
 fi
 K="${BASH_REMATCH[1]}"
 N="${BASH_REMATCH[2]}"
+
+# Stamp the build dir with the current toolchain hash BEFORE building, same as
+# build_kernels.sh does via ensure_fresh_sandbox. Without this, publish_kernels.sh's own
+# pin-consistency check finds no .toolchain-stamp and refuses to publish ANY family's
+# build, so a rebuild lands on disk but never gets a kernel_manifest.json entry --
+# confirmed by direct observation: a real end-to-end run built and staged a correct
+# xclbin, and still came back PresentUnverified rather than Present, for exactly this
+# reason. `ensure_fresh_sandbox` reads `$REPO` from this same shell (sourced, not a
+# subprocess) -- it's already set above, correctly, to this script's own repo root.
+ensure_fresh_sandbox "$MMW/build"
 
 # Tolerate the exit, then REQUIRE the xclbin -- makefile-common's `all` target is
 # `${xclbin_target} ${targetname}.exe`, and the `.exe` half needs a working system XRT
