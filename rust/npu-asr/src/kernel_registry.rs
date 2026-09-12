@@ -599,6 +599,14 @@ pub struct BuildResult {
     pub outcome: BuildOutcome,
 }
 
+/// A recipe that exists but lacks the executable bit would otherwise reach `Command::new(..).status()`
+/// and surface as `BuildFailed("Permission denied (os error 13)")` -- indistinguishable from a real
+/// build failure. Checking this here keeps that mistake diagnosable as `NoRecipe`.
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).map(|m| m.permissions().mode() & 0o111 != 0).unwrap_or(false)
+}
+
 /// For every declared stem that `verify_declared_kernel_set` reports Missing, resolve its
 /// family's `recipe` (relative to `repo_root`) and invoke `<recipe> build <stem> <kernels_root>`.
 /// Every OTHER declared stem (Present, PresentUnverified, HashMismatch) is left alone -- this
@@ -618,7 +626,7 @@ pub fn build_missing_declared_kernels(
             DeclaredStatus::Missing => {
                 let recipe_rel = &declared[&entry.family].recipe;
                 let recipe_path = repo_root.join(recipe_rel);
-                if !recipe_path.is_file() {
+                if !recipe_path.is_file() || !is_executable(&recipe_path) {
                     BuildOutcome::NoRecipe(recipe_path)
                 } else {
                     match std::process::Command::new(&recipe_path)
@@ -1151,6 +1159,35 @@ mod tests {
             DeclaredFamily {
                 required: vec!["ctxln_512x1024".to_string()],
                 recipe: "definitely_does_not_exist.sh".to_string(),
+            },
+        );
+
+        let results = build_missing_declared_kernels(&declared, repo.path(), &kernels_root);
+        assert_eq!(results.len(), 1);
+        assert!(matches!(&results[0].outcome, BuildOutcome::NoRecipe(_)), "{:?}", results[0].outcome);
+    }
+
+    /// A recipe that exists but was never `chmod +x`'d (an easy mistake when packaging a new
+    /// family's adapter) must report `NoRecipe`, not reach the spawn and fail as `BuildFailed`
+    /// with an opaque "Permission denied".
+    #[test]
+    fn build_missing_reports_no_recipe_when_the_file_is_not_executable() {
+        let repo = tempfile::tempdir().unwrap();
+        let kernels_root = repo.path().join("kernels");
+        std::fs::create_dir_all(&kernels_root).unwrap();
+
+        let recipe = repo.path().join("not_executable.sh");
+        std::fs::write(&recipe, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut perm = std::fs::metadata(&recipe).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o644);
+        std::fs::set_permissions(&recipe, perm).unwrap();
+
+        let mut declared = DeclaredKernelSet::new();
+        declared.insert(
+            "layernorm".to_string(),
+            DeclaredFamily {
+                required: vec!["ctxln_512x1024".to_string()],
+                recipe: recipe.to_str().unwrap().to_string(),
             },
         );
 
