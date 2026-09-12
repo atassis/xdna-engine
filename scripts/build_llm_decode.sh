@@ -36,11 +36,15 @@ iron_require_pin || exit 1
 # integration stack, and WITHOUT THEM LISTED this gate passed against a checkout that then died at
 # `ModuleNotFoundError: No module named 'iron.common.quant'`. A gate whose purpose is to
 # fail early, failing late, on a message naming a Python module rather than a mis-pointed IRON_DIR.
+# The packer moved in IRON 6a347dc; gate whichever path this tree actually has, so the SIGNATURE
+# is still checked on both sides of the rename rather than the line being dropped.
+QUANT_SPEC="iron/common/quant.py:def quantize_weight(clip_search,scale_dtype)"
+[ -f "$IRON/iron/common/quant.py" ] || QUANT_SPEC="iron/operators/gemv/quant.py:def quantize_weight(clip_search,scale_dtype)"
 iron_at="$(iron_require_api "gen_llm_decode.py" \
   "iron/common/sequence.py:class OperatorSequence" \
   "iron/operators/strided_copy/op.py:output_offset_parameter" \
   "iron/operators/tmatvec/op.py:class TMatVec" \
-  "iron/common/quant.py:def quantize_weight" \
+  "$QUANT_SPEC" \
   "iron/operators/qkv_head_dp/op.py:class QKVHeadDataParallel")" || exit 1
 # WINDOW_RUNGS needs an API surface that the DEFAULT IRON_DIR does not have, so it is gated
 # separately rather than added to the list above -- requiring it unconditionally would break every

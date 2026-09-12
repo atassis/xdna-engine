@@ -78,12 +78,39 @@ TMV_RPC_DEFAULT = 64
 TMV_RPC = int(os.environ.get("TMV_RPC", str(TMV_RPC_DEFAULT)))
 
 import newstack_compat  # noqa: F401,E402 -- MUST precede iron imports (new-mlir-aie port shim)
+# Row-batch the scores GEMV by DEFAULT. SCORES_ROWBATCH is a ROWS COUNT read by IRON's
+# decode_layer_dp/op.py, not a boolean, and IRON defaults it to 1 = OFF; aie::reduce_add_v folds at
+# most 4 vectors, so 4 is the maximum. Measured on device at -1.218 / -2.426 / -4.742 ms per token
+# at window 1024 / 2048 / 4096, 6/6 points faster, identical dispatch count. Gated 2026-09-12: both
+# arms PASS tier2 with identical top-5 logits at the divergence step, which is the token-for-token
+# parity the reordered bf16 accumulation needed.
+#
+# It is set HERE, not in scripts/build_llm_decode.sh, because verify_llm_decode.py imports
+# build_graph from this file and never runs that script -- setting it there passed the gate
+# VACUOUSLY, on IRON's default of 1. And not in IRON itself, which is a shared checkout.
+# Override with SCORES_ROWBATCH=1.
+os.environ.setdefault("SCORES_ROWBATCH", "4")  # noqa: E402
+
 from iron.common import AIEContext  # noqa: E402
 from iron.common.kv_layout import KVLayout, derive_block_size  # noqa: E402
 from elf_dispatch_compat import OperatorSequence, load_elf  # noqa: E402
 from iron.operators.gemv.op import GEMV  # noqa: E402
 from iron.operators.gemv.design import MAX_GROUP_REUSE  # noqa: E402
-from iron.common.quant import quantize_weight, row_stride_bytes  # noqa: E402
+# The packer MOVED in IRON 6a347dc ("the weight packer has two operators now, move it to
+# iron/common"), and the workspace carries trees on both sides of it: integration-stack has only
+# the new path, the vendored designs/iron_operators only the old. Try both and, if neither is
+# there, say so naming both paths -- a bare ModuleNotFoundError names a module and not the
+# mis-pointed IRON tree, which is the failure scripts/build_llm_decode.sh's gate exists to prevent.
+try:                                                                            # noqa: E402
+    from iron.common.quant import quantize_weight, row_stride_bytes             # noqa: E402
+except ModuleNotFoundError:                                                     # noqa: E402
+    try:                                                                        # noqa: E402
+        from iron.operators.gemv.quant import quantize_weight, row_stride_bytes  # noqa: E402
+    except ModuleNotFoundError as e:                                            # noqa: E402
+        raise ModuleNotFoundError(
+            "no weight packer in this IRON tree: tried iron.common.quant (post-6a347dc) and "
+            "iron.operators.gemv.quant (pre-6a347dc). Point IRON at a tree carrying one of them."
+        ) from e
 import precision  # noqa: E402
 from iron.operators.rms_norm.op import RMSNorm  # noqa: E402
 from iron.operators.rope.op import RoPE  # noqa: E402

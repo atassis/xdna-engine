@@ -96,7 +96,33 @@ iron_require_api() {
   on="$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
   for spec in "$@"; do
     f="${spec%%:*}"; sym="${spec#*:}"
-    grep -qF -- "$sym" "$dir/$f" 2>/dev/null && continue
+    # A spec of the form `file:def fn(kwarg[,kwarg...])` is checked by PARSING the file and
+    # asking whether `fn` accepts those arguments. `grep -qF` alone answers "does this string
+    # appear", which is a different question and passed a tree whose `quantize_weight` existed
+    # with the wrong signature -- K019, a gate that cannot fail the case it was written for.
+    case "$sym" in
+      "def "*"("*")")
+        if python3 - "$dir/$f" "$sym" <<'PYEOF'
+import ast, sys
+path, spec = sys.argv[1], sys.argv[2]
+fn = spec[4:spec.index("(")].strip()
+want = [a.strip() for a in spec[spec.index("(") + 1:spec.rindex(")")].split(",") if a.strip()]
+try:
+    tree = ast.parse(open(path).read())
+except (OSError, SyntaxError):
+    sys.exit(1)
+for node in ast.walk(tree):
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == fn:
+        a = node.args
+        have = {x.arg for x in a.args + a.posonlyargs + a.kwonlyargs}
+        if a.kwarg or all(w in have for w in want):
+            sys.exit(0)
+sys.exit(1)
+PYEOF
+        then continue; fi ;;
+      *)
+        grep -qF -- "$sym" "$dir/$f" 2>/dev/null && continue ;;
+    esac
     echo "ERROR: $dir ('$on') lacks '$sym' in $f -- required by $label" >&2
     missing=1
   done
