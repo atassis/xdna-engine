@@ -42,7 +42,7 @@ impl fmt::Display for LoadError {
                 "{}: block count {found} != expected {expected} (wrong model artifacts?)",
                 path.display()
             ),
-            LoadError::Device(e) => write!(f, "open NPU (single-tenant: stop npu-asr/voxd): {e}"),
+            LoadError::Device(e) => write!(f, "open NPU (single-tenant: stop xdna-engine/npu-vox): {e}"),
             LoadError::Kernel { path, source } => {
                 write!(f, "load resident {}: {source}", path.display())
             }

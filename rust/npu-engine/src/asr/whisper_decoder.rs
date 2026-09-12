@@ -298,7 +298,7 @@ impl HostDecoder {
     }
 
     /// Build a decoder whose per-token matmuls run on the NPU. `dev` is an open device (single-tenant
-    /// — stop npu-asr/voxd first); `root` is the worktree root (where the `mlir-aie` symlink and
+    /// — stop xdna-engine/npu-vox first); `root` is the worktree root (where the `mlir-aie` symlink and
     /// the `whole_array/build` xclbins live). Registers every per-token weight ONCE (fused self-QKV,
     /// self out, cross q/out, fc1, fc2) — this loads the needed resident xclbins and panics with a
     /// clear message if a shape's xclbin is missing (build via scripts/build_decode_kernels.sh).

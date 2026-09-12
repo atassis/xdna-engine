@@ -18,7 +18,7 @@
 //!   ctx : [12, 64]                       f32    -> ABI slot 5 (C), read back
 //!   run_matmul8(3, instr, n, q, kv, ctx, tmp, trace).
 //!
-//! NPU is single-tenant — stop npu-asr.service / voxd.service BEFORE, restart AFTER.
+//! NPU is single-tenant — stop xdna-engine.service / npu-vox.service BEFORE, restart AFTER.
 //! Run from the worktree root (paths are relative to ".").
 //!
 //! Usage:  mha_decode_probe [S ...]   (defaults: 1 30 64 200 448)
@@ -221,7 +221,7 @@ fn main() {
         .collect();
     let buckets = if args.is_empty() { vec![1usize, 30, 64, 200, 448] } else { args };
 
-    let dev = Device::open(0).expect("open NPU (stop npu-asr.service/voxd.service first)");
+    let dev = Device::open(0).expect("open NPU (stop xdna-engine.service/npu-vox.service first)");
 
     let mut worst = 0f32;
     let mut results = Vec::new();

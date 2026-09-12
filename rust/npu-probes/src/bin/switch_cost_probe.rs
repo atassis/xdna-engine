@@ -16,7 +16,7 @@
 //!   REPLAY   the real per-clip sequence       -> the encoder's actual transition count
 //!
 //! Feed REPLAY the sequence dumped by `NPU_DISPATCH_LOG=1 NPU_DISPATCH_SEQ=<file>
-//! parakeet_encode_npu`. NPU is single-tenant: stop npu-asr/flm-asr/voxd first.
+//! parakeet_encode_npu`. NPU is single-tenant: stop xdna-engine/flm-asr/npu-vox first.
 //!
 //! Usage: switch_cost_probe <repo_root> <sequence_file>
 

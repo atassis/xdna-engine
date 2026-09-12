@@ -18,7 +18,7 @@
 //! 3=A=activation[64,K] bf16, 4=B=weight[K,N_pad] bf16, 5=C=output[64,N_pad] f32, 6=tmp, 7=trace;
 //! run_matmul8(opcode=3, instr, n_instr, A, B, C, tmp, trace).
 //!
-//! NPU is single-tenant — stop npu-asr.service / voxd.service before any on-device run.
+//! NPU is single-tenant — stop xdna-engine.service / npu-vox.service before any on-device run.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -729,7 +729,7 @@ mod tests {
     }
 
     /// Device-gated parity: on-NPU GEMV vs host f32 matmul `x·W`, [768,768], rel-L2 <= 0.08.
-    /// Requires the NPU (single-tenant: stop npu-asr/voxd first) and the 768x768 xclbin.
+    /// Requires the NPU (single-tenant: stop xdna-engine/npu-vox first) and the 768x768 xclbin.
     /// Run with:  cargo test -p npu-asr ctx_decode -- --ignored --test-threads=1
     #[test]
     #[ignore]
@@ -752,7 +752,7 @@ mod tests {
         // symlink (and the whole_array build dir) lives.
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let root = root.as_path();
-        let dev = Rc::new(Device::open(0).expect("open NPU (stop npu-asr.service/voxd.service first)"));
+        let dev = Rc::new(Device::open(0).expect("open NPU (stop xdna-engine.service/npu-vox.service first)"));
         let mut dec = CtxDecode::new(&dev, root);
         let dw = dec.register_weight(&w, DecodeEpi::None, &[]);
         let y_npu = dec.gemv(&dw, &x).expect("gemv");
@@ -812,7 +812,7 @@ mod tests {
         }
 
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let dev = Rc::new(Device::open(0).expect("open NPU (stop npu-asr/voxd first)"));
+        let dev = Rc::new(Device::open(0).expect("open NPU (stop xdna-engine/npu-vox first)"));
         let mut dec = CtxDecode::new(&dev, root.as_path());
         let fw = dec.register_fused(&w, Norm::Ln { gamma, beta, eps }, &bias);
         let y_npu = dec.fused_norm_gemv(&fw, &x).expect("fused_norm_gemv");
