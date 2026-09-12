@@ -82,9 +82,24 @@ pub fn xclbin_path(dir: &Path, stem: &str) -> PathBuf {
     dir.join(format!("final_{stem}.xclbin"))
 }
 
-/// The instruction-stream path for a kernel `stem` under `dir`: `dir/insts_{stem}.txt`.
+/// The instruction-stream path for a kernel `stem` under `dir`. Checks the filesystem for
+/// whichever extension actually exists -- `.txt` is the long-standing convention and is checked
+/// first, but `whole_array`'s Makefile convention (verified against the currently pinned
+/// mlir-aie's makefile-common) now emits `.bin` for some kernels, and the live install has a
+/// genuine MIX (32 `.txt`, 4 `.bin`, confirmed by direct inspection) from before/after that
+/// toolchain change. Falls back to the `.txt` path when NEITHER exists, preserving the exact
+/// prior behavior for a genuinely-missing kernel (callers checking `.exists()` still correctly
+/// see `false`; error messages still name a sensible path).
 pub fn insts_path(dir: &Path, stem: &str) -> PathBuf {
-    dir.join(format!("insts_{stem}.txt"))
+    let txt = dir.join(format!("insts_{stem}.txt"));
+    if txt.is_file() {
+        return txt;
+    }
+    let bin = dir.join(format!("insts_{stem}.bin"));
+    if bin.is_file() {
+        return bin;
+    }
+    txt
 }
 
 /// Resolve both artifacts for one `stem` under `dir`. Does NOT check that anything exists or
@@ -803,6 +818,23 @@ mod tests {
         assert_eq!(a.tokens.shape, Some(vec![512, 1024, 4096]));
         let b = &manifest["ctxln_512x1024"];
         assert_eq!(b.insts_sha256, None); // no insts file was written for this stem
+    }
+
+    /// whole_array's Makefile convention emits `.bin` insts for some stems (verified against the
+    /// pinned mlir-aie's makefile-common); generate_manifest must find and hash those too, not
+    /// silently record `insts_sha256: None` as if the stem had no insts file at all.
+    #[test]
+    fn generate_manifest_finds_insts_with_a_bin_extension_too() {
+        let td = tempfile::tempdir().unwrap();
+        let stem = "512x768x768_32x32x32_8c";
+        std::fs::write(xclbin_path(td.path(), stem), b"fake-xclbin").unwrap();
+        // Written directly, NOT via write_fake_kernel/insts_path, so this test doesn't launder
+        // the bug through the same function it's meant to catch.
+        std::fs::write(td.path().join(format!("insts_{stem}.bin")), b"fake-insts-bin").unwrap();
+
+        let manifest = generate_manifest(td.path()).unwrap();
+        let entry = &manifest[stem];
+        assert!(entry.insts_sha256.is_some(), "a .bin-suffixed insts file must be found, not silently treated as absent");
     }
 
     #[test]
