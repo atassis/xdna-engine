@@ -38,9 +38,13 @@ built="$MMW/build/final_512x${K}x${N}_32x32x32_8c.xclbin"
 [ -f "$built" ] || { echo "[whole_array] make reported success but $built is missing" >&2; exit 1; }
 
 mkdir -p "$dest"
-cp -f "$built" "$dest/final_${stem}.xclbin"
+cp -f "$built" "$dest/final_${stem}.xclbin.tmp"
+mv -f "$dest/final_${stem}.xclbin.tmp" "$dest/final_${stem}.xclbin"
 # makefile-common's insts_target is `.bin`, not `.txt` -- verified against the built
 # artifact names on disk and against makefile-common's `insts_target?=build/insts_${target_suffix}.bin`.
 insts="$MMW/build/insts_512x${K}x${N}_32x32x32_8c.bin"
-[ -f "$insts" ] && cp -f "$insts" "$dest/insts_${stem}.bin"
+if [ -f "$insts" ]; then
+  cp -f "$insts" "$dest/insts_${stem}.bin.tmp"
+  mv -f "$dest/insts_${stem}.bin.tmp" "$dest/insts_${stem}.bin"
+fi
 echo "[whole_array] built and staged $stem -> $dest/final_${stem}.xclbin"
