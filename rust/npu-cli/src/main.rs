@@ -94,7 +94,6 @@ fn run(cli: &Cli, path: &Path) -> Result<()> {
         Cmd::Reload { port } => reload(&path, *port),
         Cmd::Load { model, port } => load_model(&path, model, *port),
         Cmd::Unload { model, port } => unload_model(&path, model, *port),
-        Cmd::Bake { name } => bake(&path, name),
         Cmd::Config { action, no_reload } => config_cmd(&path, action, *no_reload),
         Cmd::Flags { json } => flags_cmd(*json || as_json),
         Cmd::Weights { action } => weights_cmd(&path, action),
@@ -1339,8 +1338,8 @@ fn unload_model(path: &Path, model: &str, port: Option<u16>) -> Result<()> {
 /// than the service it is talking to hits every time.
 fn admin_err(e: &str, port: u16) -> anyhow::Error {
     if e == "not found" {
-        return anyhow!("the server on port {port} has no load/unload route -- it is older than \
-                        this CLI.{}", restart_hint(port));
+        return anyhow!("the server on port {port} does not support this operation -- it is older \
+                        than this CLI.{}", restart_hint(port));
     }
     anyhow!("{e}")
 }
@@ -1391,15 +1390,39 @@ fn unit_of(pid: u64) -> Option<String> {
         .map(str::to_string)
 }
 
-fn bake(path: &Path, name: &str) -> Result<()> {
+/// `npu weights bake --name <model>`: bake a CONFIGURED model's declarative spec, resolved from
+/// its scenario. Prefers the SERVICE, the same reason `npu load`/`npu unload` do: a resident
+/// model's checkpoint file may be mmap'd by the very process this would overwrite. Unlike
+/// load/unload, baking is still meaningful with nothing running -- there is no live registry to
+/// serve, but a checkpoint on disk is a useful thing to produce anyway -- so this falls back
+/// in-process instead of refusing, matching `npu config`'s fallback shape rather than
+/// load/unload's service-only one.
+fn bake_by_name(path: &Path, name: &str, force: bool) -> Result<()> {
     let cfg = load_cfg(path)?;
+    let port = cfg.server.port;
+    if port != 0 && listener_is_ours(port) {
+        let body = http_post(port, &format!("/admin/models/{name}/bake"), &format!("{{\"force\":{force}}}"))
+            .context(Tagged(Code::NoService, "bake (is the server running?)".into()))?;
+        let v: serde_json::Value = serde_json::from_str(&body)
+            .with_context(|| format!("unexpected reply: {body}"))?;
+        if let Some(e) = v.get("error").and_then(|e| e.as_str()) { return Err(admin_err(e, port)) }
+        return Ok(match v.get("checkpoint").and_then(|c| c.as_str()) {
+            Some(p) => println!("baked: {p}"),
+            None => println!("nothing to bake ({name} uses legacy npy weights)"),
+        });
+    }
     let m = cfg.find(name)
         .ok_or_else(|| Tagged(Code::NoModel, format!("unknown model {name:?} in config")))?;
-    let sc = npu_engine::config::ScenarioConfig::load(Path::new(&m.scenario))
+    let root = root(&cfg, path)?;
+    // Resolve against root the same way EngineLoader::scenario_path does -- a relative
+    // `scenario = "scenarios/x.toml"` is root-relative, not cwd-relative.
+    let scenario_path = Path::new(&m.scenario);
+    let scenario_path = if scenario_path.is_absolute() { scenario_path.to_path_buf() } else { root.join(scenario_path) };
+    let sc = npu_engine::config::ScenarioConfig::load(&scenario_path)
         .with_context(|| format!("scenario {}", m.scenario))?;
     match sc.artifacts.model_spec()? {
-        Some(spec) => { let p = spec.ensure_checkpoint(&root(&cfg, path)?, false)?; println!("baked: {}", p.display()); }
-        None => println!("nothing to bake ({} uses legacy npy weights)", name),
+        Some(spec) => { let p = spec.ensure_checkpoint(&root, force)?; println!("baked: {}", p.display()); }
+        None => println!("nothing to bake ({name} uses legacy npy weights)"),
     }
     Ok(())
 }
@@ -1416,9 +1439,14 @@ fn weights_cmd(path: &Path, action: &WeightsCmd) -> Result<()> {
         .unwrap_or_else(std::env::current_dir)
         .context("repo root")?;
     match action {
-        WeightsCmd::Bake { source, arch, checkpoint, force } => {
+        WeightsCmd::Bake { name: Some(name), force, .. } => bake_by_name(path, name, *force)?,
+        WeightsCmd::Bake { source, arch, checkpoint, force, .. } => {
+            // clap's `required_unless_present = "name"` guarantees both are Some here.
             let spec = ModelSpec {
-                source: Source::parse(source)?, arch: arch.clone(), checkpoint: checkpoint.clone() };
+                source: Source::parse(source.as_deref().expect("clap requires --source without --name"))?,
+                arch: arch.clone().expect("clap requires --arch without --name"),
+                checkpoint: checkpoint.clone(),
+            };
             let p = spec.ensure_checkpoint(&root, *force)?;
             println!("checkpoint ready: {}", p.display());
         }

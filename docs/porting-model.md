@@ -58,7 +58,7 @@ arch: String, checkpoint: Option<PathBuf> }`. `ModelSpec::ensure_checkpoint()` r
 the source files, fingerprints them (sha256), and bakes a `.safetensors` checkpoint under
 `artifacts/checkpoints/<arch>__<source>__<fp12>.safetensors` if one isn't already there --
 this is the single entry point both the engine and the `npu weights bake` /
-`npu bake <model>` CLI commands call (`rust/npu-cli/src/main.rs`).
+`npu weights bake --name <model>` CLI commands call (`rust/npu-cli/src/main.rs`).
 
 A scenario TOML opts into this by setting, under `[artifacts]`:
 

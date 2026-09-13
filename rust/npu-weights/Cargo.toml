@@ -9,13 +9,8 @@ description = "Rust-native weight loader: bake HF safetensors/ONNX into a mmap B
 name = "npu_weights"
 path = "src/lib.rs"
 
-[[bin]]
-name = "npu-weights"
-path = "src/bin/npu_weights.rs"
-
 [dependencies]
 anyhow = "1"
-clap = { version = "4", features = ["derive"] }
 safetensors = "0.4"
 memmap2 = "0.9"
 # hf-hub 0.3 exposes only default/online/tokio; "online" provides the sync ureq

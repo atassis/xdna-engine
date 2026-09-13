@@ -72,7 +72,7 @@ npu embed "some text"                       # run embeddings
 npu models                                  # list loaded models
 ```
 
-Weight checkpoints are baked from Hugging Face checkpoints with `npu bake` (see
+Weight checkpoints are baked from Hugging Face checkpoints with `npu weights bake` (see
 `rust/npu-weights`). Model export/convert scripts live in `scripts/`.
 
 Building the AIE kernels themselves is a separate path with its own toolchain: the fork

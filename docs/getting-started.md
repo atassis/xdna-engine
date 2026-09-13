@@ -122,7 +122,7 @@ Weight checkpoints for models on the declarative `npu-weights` path (see
 [configuration.md](configuration.md)) can also be baked on demand:
 
 ```
-npu bake <model-name>          # bake the checkpoint a configured model's scenario declares
+npu weights bake --name <model-name>   # bake the checkpoint a configured model's scenario declares
 npu weights bake --source hf:facebook/opt-125m --arch opt
 ```
 

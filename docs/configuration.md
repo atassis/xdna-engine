@@ -302,6 +302,7 @@ those are not part of the stable configuration surface and are not covered here.
 
 ```
 npu weights bake --source hf:facebook/opt-125m --arch opt [--checkpoint PATH] [--force]
+npu weights bake --name <model-name> [--force]
 npu weights load --checkpoint PATH --arch opt
 npu weights verify --checkpoint PATH --arch opt --refs DIR
 ```
@@ -309,8 +310,10 @@ npu weights verify --checkpoint PATH --arch opt --refs DIR
 `bake` skips the work if a checkpoint already exists and is fresh, unless `--force`.
 `verify` checks a baked checkpoint's tensors against a directory of reference `.npy`
 files within a `5e-2` max relative-error tolerance and prints `PARITY PASS` or fails
-loud with the offending tensor's error. `npu bake <model-name>` is a shortcut that reads
-the source/arch from a model already in `engine.toml`.
+loud with the offending tensor's error. `--name <model-name>` is a shortcut that reads
+the source/arch from a model already in `engine.toml`, and -- unlike the `--source`/
+`--arch` form -- talks to the running service first so a resident model's checkpoint is
+never rewritten out from under it.
 
 ## HTTP API surface
 

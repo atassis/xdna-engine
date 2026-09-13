@@ -171,12 +171,9 @@ pub enum Cmd {
         model: String,
         #[arg(long)] port: Option<u16>,
     },
-    /// Pre-bake a model's weight checkpoint (host-only, no device).
-    Bake { name: String },
     /// Weight-checkpoint tooling: bake, inspect, and parity-check.
-    // Folded in from the separate `npu-weights` binary: `npu` is documented as the single
-    // entrypoint, `npu bake` already overlapped `npu-weights bake`, and a second binary was a
-    // second completion surface with none of this one's coverage guarantees.
+    // Folded in from the separate `npu-weights` binary AND the top-level `npu bake <name>`, which
+    // fully overlapped `npu weights bake --name`: one namespace, one completion surface.
     #[command(subcommand_required = true, arg_required_else_help = true)]
     Weights {
         #[command(subcommand)]
@@ -184,9 +181,9 @@ pub enum Cmd {
     },
     /// Live view of the device: who is resident, who is serving, and where the time went.
     ///
-    /// `docker stats` for the NPU. Reads the status file the service publishes -- no socket, no
-    /// probe, nothing that can hang on a busy device -- and refreshes in place. With the service
-    /// down it says so rather than showing an empty table.
+    /// `docker stats` for the NPU. Reads the control socket's status snapshot -- answered
+    /// out-of-band, so nothing here can hang on a busy device -- and refreshes in place. With the
+    /// service down it says so rather than showing an empty table.
     Top {
         /// Seconds between refreshes.
         #[arg(long, default_value_t = 1.0)]
@@ -327,13 +324,21 @@ impl OutFormat {
 pub enum WeightsCmd {
     /// Bake source weights into a bf16 checkpoint (skips if fresh, unless --force).
     Bake {
-        /// `hf:<repo>[@rev]` or `path:/abs`.
-        #[arg(long)] source: String,
-        /// npu-weights arch transform.
+        /// Bake a CONFIGURED model by name instead: resolves its scenario's declarative spec.
+        /// Talks to the running service when one is up (a resident model's checkpoint may be
+        /// mmap'd by that same process), falling back to running in-process otherwise. Mutually
+        /// exclusive with --source/--arch, which take a spec directly with no configured model.
+        #[arg(long, conflicts_with_all = ["source", "arch"])]
+        name: Option<String>,
+        /// `hf:<repo>[@rev]` or `path:/abs`. Required unless --name is given.
+        #[arg(long, required_unless_present = "name")]
+        source: Option<String>,
+        /// npu-weights arch transform. Required unless --name is given.
         // Values from ARCH_NAMES, so completion cannot offer an arch npu-weights does not
         // implement, nor fall behind when `arch/` grows a module.
-        #[arg(long, value_parser = PossibleValuesParser::new(npu_weights::arch::ARCH_NAMES.to_vec()))]
-        arch: String,
+        #[arg(long, required_unless_present = "name",
+              value_parser = PossibleValuesParser::new(npu_weights::arch::ARCH_NAMES.to_vec()))]
+        arch: Option<String>,
         #[arg(long, value_hint = ValueHint::FilePath)] checkpoint: Option<PathBuf>,
         #[arg(long)] force: bool,
     },

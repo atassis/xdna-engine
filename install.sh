@@ -452,21 +452,16 @@ fi  # end MODEL=gigaam artifact block
 # clean and then dies (or worse, serves nothing) at runtime. A re-pin silently broke the shipped
 # ASR service for five days exactly this way. So: resolve the whole chain here and refuse.
 # ---------------------------------------------------------------------------
-# 4a2. Replace any previously installed npu-weights with the deprecation shim
+# 4a2. Remove any previously installed npu-weights binary
 # ---------------------------------------------------------------------------
-# The weight tooling moved into `npu weights`. A shim only helps if it is actually INSTALLED:
-# without this step an old npu-weights binary sits in ~/.local/bin doing the pre-fold thing
-# indefinitely, which is exactly the silent-stale-binary failure the shim exists to prevent.
-# (Observed: a July build still answering `--arena` months after that flag was renamed.)
-SHIM_BIN="$CARGO_TARGET_DIR_RESOLVED/release/npu-weights"
-if [ -f "$SHIM_BIN" ]; then
-  if [ -e "$ENGINE_BIN_DIR/npu-weights" ]; then
-    info "Replacing npu-weights with the deprecation shim (tooling moved to \`npu weights\`)"
-  fi
-  install -m 0755 "$SHIM_BIN" "$ENGINE_BIN_DIR/npu-weights"
-  ok "npu-weights -> shim that forwards to \`npu weights\`"
-else
-  warn "no npu-weights build at $SHIM_BIN; any stale copy in $ENGINE_BIN_DIR is left as-is"
+# The weight tooling folded fully into npu-cli's `npu weights` subcommand, including the
+# name-keyed bake `npu bake <name>` used to do standalone -- one namespace, one completion
+# surface. The deprecation shim that used to forward here is retired too, not rebuilt: delete
+# rather than leave it, or a stale binary that still forwards correctly becomes a second
+# completion surface nobody maintains.
+if [ -e "$ENGINE_BIN_DIR/npu-weights" ]; then
+  rm -f "$ENGINE_BIN_DIR/npu-weights"
+  ok "removed npu-weights ($ENGINE_BIN_DIR) -- folded into \`npu weights\`, no longer a separate binary"
 fi
 
 # ---------------------------------------------------------------------------
