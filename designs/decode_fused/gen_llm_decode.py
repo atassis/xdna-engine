@@ -90,6 +90,11 @@ import newstack_compat  # noqa: F401,E402 -- MUST precede iron imports (new-mlir
 # VACUOUSLY, on IRON's default of 1. And not in IRON itself, which is a shared checkout.
 # Override with SCORES_ROWBATCH=1.
 os.environ.setdefault("SCORES_ROWBATCH", "4")  # noqa: E402
+# Read back for sequence_name(): decode_layer_dp/op.py's own artifact name now tags a >1 rowbatch
+# (see its `name` property), and this file's name must not diverge from it -- an rb=1 and an rb=4
+# build were sharing this function's name entirely, the same collision TMV_CTX/GROUPED_K are
+# named for above.
+SCORES_ROWBATCH = int(os.environ["SCORES_ROWBATCH"])
 
 from iron.common import AIEContext  # noqa: E402
 from iron.common.kv_layout import KVLayout, derive_block_size  # noqa: E402
@@ -549,6 +554,8 @@ def sequence_name(sp, NL, S, placer_flags, decode_layer_active=False, T=None, tm
         parts.append(f"sgh{SPLIT_GH_DRAIN}")
     if ATTN_SPLIT:
         parts.append(f"sp{ATTN_SPLIT}")
+    if SCORES_ROWBATCH > 1:
+        parts.append(f"rb{SCORES_ROWBATCH}")
     if WEIGHT_DEPTH != 2:
         parts.append(f"wd{WEIGHT_DEPTH}")
     if MLP_TILE_ROWS:
