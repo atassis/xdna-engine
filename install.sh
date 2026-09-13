@@ -761,7 +761,7 @@ Environment=XDNA_ENGINE_ROOT=$ENGINE_ROOT
 # Resolve libonnxruntime.so.1 from the STABLE dir (not the volatile cargo build tree). The
 # binary's DT_RUNPATH is searched AFTER LD_LIBRARY_PATH, so this wins and survives cargo clean.
 Environment=LD_LIBRARY_PATH=$STABLE_LIB_DIR
-# `npu serve` dropped --port; NPU_HTTP_ENDPOINT is its replacement (unset, it would fall back to
+# \`npu serve\` dropped --port; NPU_HTTP_ENDPOINT is its replacement (unset, it would fall back to
 # engine.toml's own server.port, which should also read $PORT -- this makes it explicit rather
 # than relying on the two staying in sync).
 Environment=NPU_HTTP_ENDPOINT=127.0.0.1:$PORT
