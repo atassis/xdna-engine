@@ -4,7 +4,7 @@
 //! the bge bake + export).
 //!
 //! Populate artifacts first (host-only, fast):
-//!   ~/.local/bin/npu-weights bake --source hf:BAAI/bge-base-en-v1.5 --arch bert
+//!   ~/.local/bin/npu checkpoint bake --source hf:BAAI/bge-base-en-v1.5 --arch bert
 //!   .venv/bin/python scripts/export_bge.py
 
 use std::path::{Path, PathBuf};
