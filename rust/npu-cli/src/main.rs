@@ -1684,7 +1684,7 @@ fn unit_of(pid: u64) -> Option<String> {
         .map(str::to_string)
 }
 
-/// `npu weights bake --name <model>`: bake a CONFIGURED model's declarative spec, resolved from
+/// `npu checkpoint bake --name <model>`: bake a CONFIGURED model's declarative spec, resolved from
 /// its scenario. Prefers the SERVICE, the same reason `npu model start`/`npu model stop` do: a
 /// resident model's checkpoint file may be mmap'd by the very process this would overwrite. Unlike
 /// start/stop, baking is still meaningful with nothing running -- there is no live registry to
