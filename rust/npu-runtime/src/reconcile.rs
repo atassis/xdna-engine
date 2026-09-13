@@ -198,7 +198,7 @@ mod tests {
         assert_eq!(reg.resident_count(), 0, "nothing is pinned, so nothing is loaded");
         assert!(rep.loaded.is_empty() && rep.deferred.is_empty() && rep.failed.is_empty(),
             "unpinned models are declared, not attempted, so none of these can name one: {rep:?}");
-        // Declared, not silently absent: routing and `npu models` still know what each one is.
+        // Declared, not silently absent: routing and `npu model ls` still know what each one is.
         for n in ["a", "b", "c"] {
             assert_eq!(reg.known_capability(n), Some(Capability::EMBED), "{n} must still be declared");
         }

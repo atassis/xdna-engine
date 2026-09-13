@@ -301,7 +301,7 @@ impl Registry {
     ///
     /// This never evicts, and that is the whole difference from `ensure_resident`. On the request
     /// path the byte ceiling is an evict trigger: a request names a capability, not a capacity, so
-    /// swapping a model in to serve it is the right answer. An explicit `npu load` is the opposite
+    /// swapping a model in to serve it is the right answer. An explicit `npu model start` is the opposite
     /// -- it IS a statement about capacity -- and silently dropping a model someone else pinned or
     /// is about to use, in order to honour it, answers a question that was not asked. So it refuses,
     /// and the refusal names what is holding the budget, because "over budget" alone tells the
@@ -318,7 +318,7 @@ impl Registry {
                 .map(|e| e.cfg.name.as_str()).collect();
             return Err(EngineError::Unsupported(format!(
                 "{} cannot be made resident: {} MB of {} MB in use. Resident now: {}. \
-                 Free one with `npu unload <model>`, or raise memory_ceiling_mb.",
+                 Free one with `npu model stop <model>`, or raise memory_ceiling_mb.",
                 cfg.name, self.resident_bytes() / (1024 * 1024), srv.memory_ceiling_mb,
                 held.join(" "))));
         }
@@ -531,7 +531,7 @@ mod tests {
         assert!(e.contains("no instruction stream"), "a load failure must surface its cause: {e}");
     }
 
-    /// A pin must not be collateral damage: refusing to evict is what makes `npu load` safe to run
+    /// A pin must not be collateral damage: refusing to evict is what makes `npu model start` safe to run
     /// against a server someone else is using.
     #[test]
     fn load_explicit_refuses_rather_than_touching_a_pinned_model() {

@@ -94,7 +94,7 @@ pub trait DecodeStep {
 
     /// Live device BO bytes this backend holds, or 0 for a host backend that holds none.
     ///
-    /// Reported so `npu models` can weigh the biggest resident thing on the box. An LLM's weights,
+    /// Reported so `npu model ls` can weigh the biggest resident thing on the box. An LLM's weights,
     /// KV cache and scratch are the dominant device allocation in this engine, and until this
     /// existed the MEM column read `-` for exactly the model most worth measuring.
     fn bo_bytes(&self) -> u64 {
