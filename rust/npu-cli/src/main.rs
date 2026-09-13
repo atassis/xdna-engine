@@ -16,7 +16,7 @@ mod stats;
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser};
 
-use cli_def::{Cli, Cmd, ConfigCmd, OutFormat, OutputFormat, SamplingArgs, WeightsCmd};
+use cli_def::{Cli, Cmd, ConfigCmd, ModelCmd, OutFormat, OutputFormat, SamplingArgs, WeightsCmd};
 use clap_complete::Shell;
 use std::io::IsTerminal;
 use npu_engine::telemetry::wire;
@@ -91,10 +91,8 @@ fn run(cli: &Cli, path: &Path) -> Result<()> {
         Cmd::TranscribeMedia { input, out, format, asr, diarize: diar, track, no_diarize } =>
             transcribe_media(input, out.as_deref(), *format, asr.as_deref(),
                              diar.as_deref(), *track, *no_diarize),
-        Cmd::Models { json } => models(&path, *json || as_json),
-        Cmd::Load { model } => load_model(&path, model),
-        Cmd::Unload { model } => unload_model(&path, model),
-        Cmd::Config { action, no_reload } => config_cmd(&path, action, *no_reload),
+        Cmd::Model { action } => model_cmd(&path, action, as_json),
+        Cmd::Config { action } => config_cmd(&path, action),
         Cmd::Flags { json } => flags_cmd(*json || as_json),
         Cmd::Weights { action } => weights_cmd(&path, action),
         Cmd::Doctor { json } => doctor::doctor(&cli, *json || as_json),
@@ -1060,7 +1058,22 @@ fn mem_cell(bytes: Option<u64>) -> String {
     }
 }
 
-fn models(path: &Path, as_json: bool) -> Result<()> {
+fn model_cmd(path: &Path, action: &ModelCmd, as_json: bool) -> Result<()> {
+    match action {
+        ModelCmd::Ls { json, verbose } => model_ls(path, *json || as_json, *verbose),
+        ModelCmd::Show { model, json } => model_show(path, model, *json || as_json),
+        ModelCmd::Start { model } => model_start(path, model),
+        ModelCmd::Stop { model } => model_stop(path, model),
+        // Enable/Disable/Add/Rm/Default all edit engine.toml (or ask the running service to);
+        // `--no-reload` isn't exposed on `npu model` today (it lived on `npu config` because only
+        // config-shaped edits needed it) -- these five always reconcile, matching `pin`'s existing
+        // default-on behavior. Passing `false` here preserves that.
+        ModelCmd::Enable { .. } | ModelCmd::Disable { .. } | ModelCmd::Add { .. }
+            | ModelCmd::Rm { .. } | ModelCmd::Default { .. } => model_mutate(path, action, false),
+    }
+}
+
+fn model_ls(path: &Path, as_json: bool, _verbose: bool) -> Result<()> {
     let cfg = load_cfg(path)?;
     let live = read_live_status();
     let root = root(&cfg, path).ok();
@@ -1137,6 +1150,26 @@ fn models(path: &Path, as_json: bool) -> Result<()> {
         println!("* the running server has a different pin than the config -- `npu config pin`/`unpin` \
                   reconcile it automatically; a config edited by hand needs \
                   `systemctl --user restart xdna-engine`");
+    }
+    Ok(())
+}
+
+fn model_show(path: &Path, model: &str, as_json: bool) -> Result<()> {
+    let cfg = load_cfg(path)?;
+    let Some(m) = cfg.find(model) else {
+        return Err(Tagged(Code::NoModel, format!("unknown model {model:?} (not in the config)")).into());
+    };
+    let root = root(&cfg, path).ok();
+    let d = declared(root.as_ref(), &m.scenario);
+    if as_json {
+        println!("{}", serde_json::json!({"id": m.name, "scenario": m.scenario,
+            "pinned": m.resident, "kind": d.kind, "precision": d.precision}));
+    } else {
+        println!("{:<12} {}", "NAME", m.name);
+        println!("{:<12} {}", "SCENARIO", m.scenario);
+        println!("{:<12} {}", "ENABLED", m.resident);
+        println!("{:<12} {}", "KIND", d.kind.as_deref().unwrap_or("-"));
+        println!("{:<12} {}", "PRECISION", precision_cell(&d));
     }
     Ok(())
 }
@@ -1318,44 +1351,64 @@ fn find_live<'a>(doc: &'a serde_json::Value, name: &str) -> Option<&'a serde_jso
         .iter().find(|m| m.get("id").and_then(|i| i.as_str()) == Some(name))
 }
 
-/// What an edit did, for the path where the SERVICE performed it and this process therefore never
-/// built the local `note`. Kept beside `admin_call` so the two stay in step.
-fn describe(action: &ConfigCmd) -> String {
+/// What `ConfigCmd::Set` and every mutating `ModelCmd` variant reduce to: one of five config edits.
+/// `admin_call`/`describe`/the local-write fallback below all match on THIS, not on the CLI enums
+/// directly -- so a new mutating verb on either `npu config` or `npu model` costs one arm here, not
+/// three duplicated match statements.
+enum ModelMutation<'a> {
+    AddModel { name: &'a str, scenario: &'a str },
+    RemoveModel { name: &'a str },
+    SetResident { model: &'a str, on: bool },
+    SetServer { key: &'a str, value: &'a str },
+    SetDefault { capability: &'a str, model: &'a str },
+}
+
+fn model_mutation_of(action: &ModelCmd) -> ModelMutation<'_> {
     match action {
-        ConfigCmd::Show => String::new(),
-        ConfigCmd::AddModel { name, scenario } => format!("model {name} -> {scenario}"),
-        ConfigCmd::RemoveModel { name } => format!("removed model {name}"),
-        ConfigCmd::Pin { model } => format!("pinned {model} resident"),
-        ConfigCmd::Unpin { model } => format!("unpinned {model}"),
-        ConfigCmd::Set { key, value } => format!("server.{key} = {value}"),
-        ConfigCmd::SetDefault { capability, model } => format!("default {capability} = {model}"),
+        ModelCmd::Add { name, scenario } => ModelMutation::AddModel { name, scenario },
+        ModelCmd::Rm { name } => ModelMutation::RemoveModel { name },
+        ModelCmd::Enable { model } => ModelMutation::SetResident { model, on: true },
+        ModelCmd::Disable { model } => ModelMutation::SetResident { model, on: false },
+        ModelCmd::Default { capability, model } => ModelMutation::SetDefault { capability, model },
+        ModelCmd::Ls { .. } | ModelCmd::Show { .. } | ModelCmd::Start { .. } | ModelCmd::Stop { .. } =>
+            unreachable!("model_cmd routes these elsewhere"),
     }
 }
 
-/// The `/admin` call that performs one config mutation, or `None` for a read-only subcommand.
+/// What an edit did, for the path where the SERVICE performed it and this process therefore never
+/// built the local `note`. Kept beside `admin_call` so the two stay in step.
+fn describe(m: &ModelMutation) -> String {
+    match m {
+        ModelMutation::AddModel { name, scenario } => format!("model {name} -> {scenario}"),
+        ModelMutation::RemoveModel { name } => format!("removed model {name}"),
+        ModelMutation::SetResident { model, on: true } => format!("enabled {model}"),
+        ModelMutation::SetResident { model, on: false } => format!("disabled {model}"),
+        ModelMutation::SetServer { key, value } => format!("server.{key} = {value}"),
+        ModelMutation::SetDefault { capability, model } => format!("default {capability} = {model}"),
+    }
+}
+
+/// The `/admin` call that performs one config mutation.
 ///
 /// `engine.toml` has two possible writers -- this CLI and the service, which rewrites it for every
 /// other `/admin` route -- and two writers on one file is a race waiting for the day both run at
 /// once. So when a service is up it does the writing, and this reduces to naming the request; the
 /// local path below is for when there is no service, where there is no one to race.
-fn admin_call(action: &ConfigCmd) -> Option<(&'static str, String, String)> {
+fn admin_call(m: &ModelMutation) -> (&'static str, String, String) {
     let esc = npu_runtime::http::parse::json_escape;
-    match action {
-        ConfigCmd::Show => None,
-        ConfigCmd::AddModel { name, scenario } => Some((
+    match m {
+        ModelMutation::AddModel { name, scenario } => (
             "POST", "/admin/models".into(),
-            format!("{{\"name\":\"{}\",\"scenario\":\"{}\"}}", esc(name), esc(scenario)))),
-        ConfigCmd::RemoveModel { name } => Some(("DELETE", format!("/admin/models/{name}"), String::new())),
-        ConfigCmd::Pin { model } => Some((
-            "POST", format!("/admin/models/{model}/resident"), "{\"resident\":true}".into())),
-        ConfigCmd::Unpin { model } => Some((
-            "POST", format!("/admin/models/{model}/resident"), "{\"resident\":false}".into())),
-        ConfigCmd::Set { key, value } => Some((
+            format!("{{\"name\":\"{}\",\"scenario\":\"{}\"}}", esc(name), esc(scenario))),
+        ModelMutation::RemoveModel { name } => ("DELETE", format!("/admin/models/{name}"), String::new()),
+        ModelMutation::SetResident { model, on } => (
+            "POST", format!("/admin/models/{model}/resident"), format!("{{\"resident\":{on}}}")),
+        ModelMutation::SetServer { key, value } => (
             "POST", "/admin/server".into(),
-            format!("{{\"key\":\"{}\",\"value\":\"{}\"}}", esc(key), esc(value)))),
-        ConfigCmd::SetDefault { capability, model } => Some((
+            format!("{{\"key\":\"{}\",\"value\":\"{}\"}}", esc(key), esc(value))),
+        ModelMutation::SetDefault { capability, model } => (
             "POST", "/admin/defaults".into(),
-            format!("{{\"capability\":\"{}\",\"model\":\"{}\"}}", esc(capability), esc(model)))),
+            format!("{{\"capability\":\"{}\",\"model\":\"{}\"}}", esc(capability), esc(model))),
     }
 }
 
@@ -1363,8 +1416,8 @@ fn admin_call(action: &ConfigCmd) -> Option<(&'static str, String, String)> {
 ///
 /// A rejection here is the CLI's error: `http_req` returns only the body, so a 400 would otherwise
 /// read as success -- the same `{"error":...}` convention `npu load` already follows.
-fn edit_via_service(addr: &str, action: &ConfigCmd) -> Result<String> {
-    let (method, route, body) = admin_call(action).expect("caller checked this is a mutation");
+fn edit_via_service(addr: &str, m: &ModelMutation) -> Result<String> {
+    let (method, route, body) = admin_call(m);
     let resp = http_req(addr, method, &route, &body)
         .context(Tagged(Code::NoService, "config edit (is the server running?)".into()))?;
     let v: serde_json::Value = serde_json::from_str(&resp)
@@ -1421,7 +1474,7 @@ fn summarise_reload(body: &str) -> String {
 /// running server's registry -- the thing that owns admission, eviction and the idle sweep.
 /// Loading a model into this process would take its own hardware context and change nothing the
 /// server can see, which is the opposite of what was asked.
-fn load_model(path: &Path, model: &str) -> Result<()> {
+fn model_start(path: &Path, model: &str) -> Result<()> {
     let addr = resolve_http_addr(&load_cfg(path)?);
     let body = http_post(&addr, &format!("/admin/models/{model}/load"), "")
         .context(Tagged(Code::NoService, "load (is the server running?)".into()))?;
@@ -1443,7 +1496,7 @@ fn load_model(path: &Path, model: &str) -> Result<()> {
     Ok(())
 }
 
-fn unload_model(path: &Path, model: &str) -> Result<()> {
+fn model_stop(path: &Path, model: &str) -> Result<()> {
     let addr = resolve_http_addr(&load_cfg(path)?);
     let body = http_post(&addr, &format!("/admin/models/{model}/unload"), "")
         .context(Tagged(Code::NoService, "unload (is the server running?)".into()))?;
@@ -1593,28 +1646,19 @@ fn weights_cmd(path: &Path, action: &WeightsCmd) -> Result<()> {
     Ok(())
 }
 
-/// Every mutation goes through `ConfigDoc`, which edits the FILE rather than round-tripping a
-/// deserialized `Config` back through the serializer. The struct does not carry comments, so the
-/// old path silently deleted every one of them -- including the ones the engine's own generated
-/// config ships with.
-fn config_cmd(path: &Path, action: &ConfigCmd, no_reload: bool) -> Result<()> {
-    if let ConfigCmd::Show = action {
-        let cfg = load_cfg(path)?;
-        let root = root(&cfg, path)?;
-        print!("{}", render(&cfg, &root));
-        return Ok(());
-    }
-    // The service owns the file whenever there is one. `--no-reload` opts out of that too: it
-    // means "change desired state without disturbing what is running", and routing the write
-    // through the process that would immediately reconcile is the opposite of that.
+/// Apply one `ModelMutation`: `Show` never reaches here (both callers handle it before this). The
+/// service owns the file whenever there is one. `--no-reload` opts out of that too: it means "change
+/// desired state without disturbing what is running", and routing the write through the process that
+/// would immediately reconcile is the opposite of that.
+fn apply_mutation(path: &Path, m: &ModelMutation, no_reload: bool) -> Result<()> {
     let addr = load_cfg(path).map(|c| resolve_http_addr(&c)).ok();
     if !no_reload && addr.as_deref().is_some_and(listener_is_ours) {
         let addr = addr.unwrap();
-        let applied = edit_via_service(&addr, action)?;
+        let applied = edit_via_service(&addr, m)?;
         // Re-read: the SERVICE wrote it, so this reports the file as it now is rather than as this
         // process believes it should be.
         let cfg = load_cfg(path)?;
-        println!("{}  [{}]", describe(action), path.display());
+        println!("{}  [{}]", describe(m), path.display());
         println!("applied: {applied}");
         if let Some(w) = cfg.pin_overcommit(declared_footprint_fn(&root(&cfg, path)?)) {
             eprintln!("WARNING: {w}");
@@ -1623,34 +1667,28 @@ fn config_cmd(path: &Path, action: &ConfigCmd, no_reload: bool) -> Result<()> {
     }
 
     let mut doc = npu_runtime::ConfigDoc::load(path).map_err(|e| anyhow!(e))?;
-    // What to print once the write lands. Held rather than printed inline so a command that then
-    // fails validation says nothing, instead of reporting a change it did not make.
-    let note = match action {
-        ConfigCmd::Show => unreachable!("handled above"),
-        ConfigCmd::AddModel { name, scenario } => {
+    let note = match m {
+        ModelMutation::AddModel { name, scenario } => {
             doc.add_model(name, scenario).map_err(|e| anyhow!(e))?;
             format!("model {name} -> {scenario}")
         }
-        ConfigCmd::RemoveModel { name } => {
+        ModelMutation::RemoveModel { name } => {
             if !doc.remove_model(name).map_err(|e| anyhow!(e))? {
                 return Err(Tagged(Code::NoModel, format!("unknown model {name:?} (not in the config)")).into());
             }
             format!("removed model {name}")
         }
-        ConfigCmd::Pin { model } | ConfigCmd::Unpin { model } => {
-            let on = matches!(action, ConfigCmd::Pin { .. });
-            // Refuse rather than write: a pin on a name the config does not have is a typo, and
-            // there is nothing in the file for the key to attach to.
-            if !doc.set_resident(model, on).map_err(|e| anyhow!(e))? {
+        ModelMutation::SetResident { model, on } => {
+            if !doc.set_resident(model, *on).map_err(|e| anyhow!(e))? {
                 return Err(Tagged(Code::NoModel, format!("unknown model {model:?} (not in the config)")).into());
             }
-            if on { format!("pinned {model} resident") } else { format!("unpinned {model}") }
+            if *on { format!("enabled {model}") } else { format!("disabled {model}") }
         }
-        ConfigCmd::Set { key, value } => {
+        ModelMutation::SetServer { key, value } => {
             doc.set_server(key, value).map_err(|e| anyhow!(e))?;
             format!("server.{key} = {value}")
         }
-        ConfigCmd::SetDefault { capability, model } => match Capability::from_name(capability) {
+        ModelMutation::SetDefault { capability, model } => match Capability::from_name(capability) {
             Some(cap) => { doc.set_default(cap, model); format!("default {capability} = {model}") }
             None => return Err(anyhow!("unknown capability {capability:?} (one of: {})",
                 Capability::ALL.iter().map(|c| c.0).collect::<Vec<_>>().join("|"))),
@@ -1658,8 +1696,6 @@ fn config_cmd(path: &Path, action: &ConfigCmd, no_reload: bool) -> Result<()> {
     };
     let cfg = doc.save(path).map_err(|e| anyhow!(e))?;
     println!("{note}  [{}]", path.display());
-    // Warn on the same condition `npu config show` does, so an edit that creates one is caught
-    // where it is made rather than at the next boot.
     if let Some(w) = cfg.pin_overcommit(declared_footprint_fn(&root(&cfg, path)?)) {
         eprintln!("WARNING: {w}");
     }
@@ -1669,6 +1705,26 @@ fn config_cmd(path: &Path, action: &ConfigCmd, no_reload: bool) -> Result<()> {
         return Ok(());
     }
     apply_now(&cfg)
+}
+
+/// `npu config show`/`npu config set`. `Show` is read-only and never becomes a `ModelMutation`.
+fn config_cmd(path: &Path, action: &ConfigCmd) -> Result<()> {
+    match action {
+        ConfigCmd::Show => {
+            let cfg = load_cfg(path)?;
+            let root = root(&cfg, path)?;
+            print!("{}", render(&cfg, &root));
+            Ok(())
+        }
+        ConfigCmd::Set { key, value } =>
+            apply_mutation(path, &ModelMutation::SetServer { key, value }, false),
+    }
+}
+
+/// `npu model enable/disable/add/rm/default`. `Ls`/`Show`/`Start`/`Stop` never reach here (see
+/// `model_cmd`).
+fn model_mutate(path: &Path, action: &ModelCmd, no_reload: bool) -> Result<()> {
+    apply_mutation(path, &model_mutation_of(action), no_reload)
 }
 
 /// Every registered `NPU_*`/related env var against the LIVE process environment: whether it is
@@ -1829,24 +1885,20 @@ mod tests {
     /// Every mutating subcommand must have a route, or it would silently fall back to writing the
     /// file itself while a service was running -- which is the two-writer case this closes.
     #[test]
-    fn every_config_mutation_maps_to_an_admin_route() {
-        for action in [
-            ConfigCmd::AddModel { name: "m".into(), scenario: "s.toml".into() },
-            ConfigCmd::RemoveModel { name: "m".into() },
-            ConfigCmd::Pin { model: "m".into() },
-            ConfigCmd::Unpin { model: "m".into() },
-            ConfigCmd::Set { key: "memory_ceiling_mb".into(), value: "2048".into() },
-            ConfigCmd::SetDefault { capability: "asr".into(), model: "m".into() },
+    fn every_mutation_maps_to_an_admin_route() {
+        for m in [
+            ModelMutation::AddModel { name: "m", scenario: "s.toml" },
+            ModelMutation::RemoveModel { name: "m" },
+            ModelMutation::SetResident { model: "m", on: true },
+            ModelMutation::SetResident { model: "m", on: false },
+            ModelMutation::SetServer { key: "memory_ceiling_mb", value: "2048" },
+            ModelMutation::SetDefault { capability: "asr", model: "m" },
         ] {
-            let call = admin_call(&action);
-            assert!(call.is_some(), "no route for {}", describe(&action));
-            let (method, route, _) = call.unwrap();
+            let (method, route, _) = admin_call(&m);
             assert!(matches!(method, "POST" | "DELETE"), "{method} {route}");
             assert!(route.starts_with("/admin/"), "{route}");
-            assert!(!describe(&action).is_empty(), "a mutation must describe itself");
+            assert!(!describe(&m).is_empty(), "a mutation must describe itself");
         }
-        // Show reads; it has nothing to send.
-        assert!(admin_call(&ConfigCmd::Show).is_none());
     }
 
     #[test]
@@ -2237,28 +2289,29 @@ mod tests {
         assert!(out.contains("pinned resident: b"), "{out}");
     }
 
-    /// `npu config` edits the file a human wrote. Every verb has to leave the rest of it alone.
+    /// `npu config`/`npu model` edit the file a human wrote. Every verb has to leave the rest of it
+    /// alone.
     #[test]
     fn config_verbs_edit_in_place_without_destroying_the_file() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("engine.toml");
         std::fs::write(&p, "# keep me\n[server]\nmemory_ceiling_mb = 2048\n\n[[model]]\nname = \"a\"\nscenario = \"s.toml\"\n").unwrap();
 
-        config_cmd(&p, &ConfigCmd::Pin { model: "a".into() }, true).unwrap();
+        apply_mutation(&p, &ModelMutation::SetResident { model: "a", on: true }, true).unwrap();
         assert!(npu_runtime::config::Config::load(&p).unwrap().find("a").unwrap().resident);
 
-        config_cmd(&p, &ConfigCmd::Set { key: "idle_unload_s".into(), value: "0".into() }, true).unwrap();
+        apply_mutation(&p, &ModelMutation::SetServer { key: "idle_unload_s", value: "0" }, true).unwrap();
         let cfg = npu_runtime::config::Config::load(&p).unwrap();
         assert_eq!(cfg.server.idle_unload(), None, "0 is how idle unload is switched off");
         assert_eq!(cfg.server.memory_ceiling_mb, 2048, "an unnamed key must not move");
 
-        // Re-pointing a scenario must not silently unpin.
-        config_cmd(&p, &ConfigCmd::AddModel { name: "a".into(), scenario: "t.toml".into() }, true).unwrap();
+        // Re-pointing a scenario must not silently disable.
+        apply_mutation(&p, &ModelMutation::AddModel { name: "a", scenario: "t.toml" }, true).unwrap();
         let cfg = npu_runtime::config::Config::load(&p).unwrap();
         assert_eq!(cfg.find("a").unwrap().scenario, "t.toml");
         assert!(cfg.find("a").unwrap().resident);
 
-        config_cmd(&p, &ConfigCmd::Unpin { model: "a".into() }, true).unwrap();
+        apply_mutation(&p, &ModelMutation::SetResident { model: "a", on: false }, true).unwrap();
         assert!(!npu_runtime::config::Config::load(&p).unwrap().find("a").unwrap().resident);
 
         assert!(std::fs::read_to_string(&p).unwrap().contains("# keep me"),
@@ -2271,10 +2324,10 @@ mod tests {
         let p = dir.path().join("engine.toml");
         std::fs::write(&p, "[[model]]\nname = \"a\"\nscenario = \"s\"\n").unwrap();
         let before = std::fs::read_to_string(&p).unwrap();
-        assert!(config_cmd(&p, &ConfigCmd::Pin { model: "nope".into() }, true).is_err());
-        assert!(config_cmd(&p, &ConfigCmd::Unpin { model: "nope".into() }, true).is_err());
-        assert!(config_cmd(&p, &ConfigCmd::RemoveModel { name: "nope".into() }, true).is_err());
-        assert!(config_cmd(&p, &ConfigCmd::Set { key: "max_resident".into(), value: "-1".into() }, true).is_err());
+        assert!(apply_mutation(&p, &ModelMutation::SetResident { model: "nope", on: true }, true).is_err());
+        assert!(apply_mutation(&p, &ModelMutation::SetResident { model: "nope", on: false }, true).is_err());
+        assert!(apply_mutation(&p, &ModelMutation::RemoveModel { name: "nope" }, true).is_err());
+        assert!(apply_mutation(&p, &ModelMutation::SetServer { key: "max_resident", value: "-1" }, true).is_err());
         assert_eq!(std::fs::read_to_string(&p).unwrap(), before, "a refused command writes nothing");
     }
 
