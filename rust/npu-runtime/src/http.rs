@@ -579,7 +579,7 @@ fn admin_remove_model(name: &str, handle: &Handle, cfg_path: &Path) -> Response 
 
 /// Pin or unpin a model: `{"resident": true}`.
 ///
-/// The live half of `npu config pin`. It takes effect without a restart because reconcile now
+/// The live half of `npu model enable`. It takes effect without a restart because reconcile now
 /// adopts a changed `ModelCfg` for an already-loaded model instead of only noticing a scenario
 /// change -- see `Registry::update_cfg`.
 fn admin_set_resident(name: &str, req: &Request, handle: &Handle, cfg_path: &Path) -> Response {
@@ -1805,7 +1805,7 @@ mod route_tests {
     #[test]
     fn healthz_is_503_and_names_the_model_that_failed() {
         // Neither is pinned, so reconcile only declares them now -- explicitly load both, the same
-        // way a real `npu load` (or a request) would, to actually attempt `broken` and let it fail.
+        // way a real `npu model start` (or a request) would, to actually attempt `broken` and let it fail.
         let (h, j, _d, p) = health_setup(&[("bge", true), ("broken", false)], 2);
         route(&post("/admin/models/bge/load", ""), &h, &p);
         route(&post("/admin/models/broken/load", ""), &h, &p);
@@ -1817,7 +1817,7 @@ mod route_tests {
         h.shutdown(); j.join().unwrap();
     }
 
-    /// The live half of `npu config pin`: the file is edited and the running registry adopts it,
+    /// The live half of `npu model enable`: the file is edited and the running registry adopts it,
     /// with no unload and no restart.
     #[test]
     fn admin_resident_pins_a_loaded_model_in_place() {
@@ -1843,7 +1843,7 @@ mod route_tests {
     fn admin_load_refuses_at_capacity_with_409_and_never_evicts() {
         let (h, j, _d, p) = health_setup(&[("bge", true), ("e5", true)], 1);
         // Neither is pinned, so nothing is resident yet -- take the only MB explicitly, the way a
-        // real `npu load` would, instead of relying on boot to have done it.
+        // real `npu model start` would, instead of relying on boot to have done it.
         route(&post("/admin/models/bge/load", ""), &h, &p);
         let (code, body) = route(&post("/admin/models/e5/load", ""), &h, &p);
         assert_eq!(code, 409, "at capacity is a state conflict, not a bad request: {body}");
@@ -1876,7 +1876,7 @@ mod route_tests {
         h.shutdown(); j.join().unwrap();
     }
 
-    /// Residency is runtime state. `npu load` must not quietly rewrite what the box serves at boot.
+    /// Residency is runtime state. `npu model start` must not quietly rewrite what the box serves at boot.
     #[test]
     fn admin_load_and_unload_leave_the_config_file_untouched() {
         let (h, j, _d, p) = mock_handle();

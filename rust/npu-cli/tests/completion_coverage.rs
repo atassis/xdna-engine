@@ -88,7 +88,7 @@ fn enumerated_flags_offer_their_values_not_an_empty_set() {
 #[test]
 fn capability_values_come_from_the_engine_not_a_hardcoded_list() {
     let script = zsh_script();
-    // `config set-default <capability>` must offer exactly what this binary can serve.
+    // `model default <capability>` must offer exactly what this binary can serve.
     for cap in npu_engine::capability::Capability::ALL {
         assert!(script.contains(cap.0),
             "capability {:?} is implemented but not offered by completion", cap.0);
@@ -215,6 +215,22 @@ fn reserved_queue_names_do_not_parse() {
              unrelated purpose, which is what this test exists to catch."
         );
     }
+}
+
+/// `main()`'s walk-to-the-deepest-resolving-subcommand logic isn't reachable from here (this crate
+/// has no `[lib]` target, so an integration test can only see what `cli_def.rs` builds, never the
+/// binary's own entry point) -- so this only proves the walk has correct data to walk: each
+/// malformed input's `find_subcommand` chain stops exactly where `main()` needs it to. The full
+/// end-to-end proof (that `main()` actually prints real help) is the manual check in the plan.
+#[test]
+fn a_wrong_call_resolves_to_the_right_help_target() {
+    let cmd = cli_def::Cli::command();
+    assert!(cmd.find_subcommand("bogusverb").is_none(), "top-level walk should stop at the root");
+
+    let model = cmd.find_subcommand("model").expect("npu model must exist");
+    assert!(model.find_subcommand("bogus").is_none(), "npu model's walk should stop at npu model");
+    assert!(model.find_subcommand("ls").is_some());
+    assert!(model.find_subcommand("start").is_some());
 }
 
 /// clap validates the command tree (duplicate long names, colliding shorts, bad defaults) only in

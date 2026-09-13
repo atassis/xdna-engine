@@ -99,6 +99,21 @@ pub struct ModelStatus {
     pub pin_honored: bool,
 }
 
+/// Why a model stopped being resident. Distinct from `deferred_capacity`/`try_load`'s admission
+/// refusal path -- that fires on a model that was never loaded at all and never calls `release()`.
+/// This exists so `reconcile()` can tell "never loaded yet" apart from "operator said stop" without
+/// parsing the free-text `status.detail` string, which stays exactly as it is today -- this is an
+/// ADDITIONAL typed fact computed at the same call sites, not a replacement for the display string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnloadReason {
+    /// `npu model stop`, or the HTTP `/admin/models/<name>/unload` route it calls.
+    Operator,
+    /// LRU eviction to make room for another model, or the cap-eviction pass in `reconcile()`.
+    Evicted,
+    /// The idle sweep released it after `idle_unload_s`.
+    Idle,
+}
+
 pub struct Entry {
     pub cfg: ModelCfg,
     pub model: Option<Box<dyn StreamServable>>,
@@ -117,6 +132,9 @@ pub struct Entry {
     /// becomes evictable like any unpinned model instead of jamming eviction with a guarantee the
     /// invariant has already refused to keep. Recomputed every `reconcile` pass, never trusted stale.
     pub pin_honored: bool,
+    /// `Some` after `release()` un-residents this entry; `None` for a never-loaded/freshly-declared
+    /// entry. `reconcile()`'s admission loop reads this to skip reloading an operator-stopped pin.
+    pub unload_reason: Option<UnloadReason>,
 }
 
 #[derive(Default)]
@@ -259,7 +277,8 @@ impl Registry {
                     pin_honored: cfg.resident,
                 };
                 self.upsert(Entry { cfg: cfg.clone(), model: Some(m), status, last_used: now,
-                                    deferred_capacity: None, pin_honored: cfg.resident });
+                                    deferred_capacity: None, pin_honored: cfg.resident,
+                                    unload_reason: None });
             }
             Err(e) => { let cap = self.declared(cfg, loader); self.set_failed(cfg, e.to_string(), cap) }
         }
@@ -286,7 +305,7 @@ impl Registry {
             // rather than loop forever. `pin_honored` entries are excluded from `lru_victim`, so an
             // honoured pin is never sacrificed to make room for something else.
             match self.lru_victim() {
-                Some(v) => self.release(&v, &format!("evicted for {}", cfg.name)),
+                Some(v) => self.release(&v, &format!("evicted for {}", cfg.name), UnloadReason::Evicted),
                 None => break,
             }
         }
@@ -301,7 +320,7 @@ impl Registry {
     ///
     /// This never evicts, and that is the whole difference from `ensure_resident`. On the request
     /// path the byte ceiling is an evict trigger: a request names a capability, not a capacity, so
-    /// swapping a model in to serve it is the right answer. An explicit `npu load` is the opposite
+    /// swapping a model in to serve it is the right answer. An explicit `npu model start` is the opposite
     /// -- it IS a statement about capacity -- and silently dropping a model someone else pinned or
     /// is about to use, in order to honour it, answers a question that was not asked. So it refuses,
     /// and the refusal names what is holding the budget, because "over budget" alone tells the
@@ -318,7 +337,7 @@ impl Registry {
                 .map(|e| e.cfg.name.as_str()).collect();
             return Err(EngineError::Unsupported(format!(
                 "{} cannot be made resident: {} MB of {} MB in use. Resident now: {}. \
-                 Free one with `npu unload <model>`, or raise memory_ceiling_mb.",
+                 Free one with `npu model stop <model>`, or raise memory_ceiling_mb.",
                 cfg.name, self.resident_bytes() / (1024 * 1024), srv.memory_ceiling_mb,
                 held.join(" "))));
         }
@@ -362,6 +381,7 @@ impl Registry {
             last_used: Instant::now(),
             deferred_capacity: None,
             pin_honored: cfg.resident,
+            unload_reason: None,
         });
     }
 
@@ -383,20 +403,21 @@ impl Registry {
             .filter(|e| e.model.is_some() && !e.pin_honored
                 && now.saturating_duration_since(e.last_used) >= idle)
             .map(|e| e.cfg.name.clone()).collect();
-        for n in &expired { self.release(n, &format!("unloaded: idle >= {}s", idle.as_secs())); }
+        for n in &expired { self.release(n, &format!("unloaded: idle >= {}s", idle.as_secs()), UnloadReason::Idle); }
         expired
     }
 
     /// Drop the model but KEEP the entry, so `/v1/models` can still show what happened to it (and
     /// so routing remembers its capability). Contrast `unload`, which forgets the entry entirely
     /// because the config no longer asks for it.
-    pub fn release(&mut self, name: &str, reason: &str) {
+    pub fn release(&mut self, name: &str, reason: &str, why: UnloadReason) {
         if let Some(e) = self.entries.iter_mut().find(|e| e.cfg.name == name) {
             e.model = None;
             e.status.state = LoadState::Unloaded;
             e.status.detail = reason.to_string();
             e.status.bo_bytes = 0;
             e.status.idle_s = None;
+            e.unload_reason = Some(why);
         }
     }
     pub fn unload(&mut self, name: &str) {
@@ -473,7 +494,8 @@ impl Registry {
             pin_honored: false,
         };
         self.upsert(Entry { cfg: cfg.clone(), model: None, status, last_used: Instant::now(),
-                            deferred_capacity: ceiling_bytes, pin_honored: false });
+                            deferred_capacity: ceiling_bytes, pin_honored: false,
+                            unload_reason: None });
     }
     fn upsert(&mut self, e: Entry) {
         if let Some(slot) = self.entries.iter_mut().find(|x| x.cfg.name == e.cfg.name) { *slot = e; }
@@ -531,7 +553,7 @@ mod tests {
         assert!(e.contains("no instruction stream"), "a load failure must surface its cause: {e}");
     }
 
-    /// A pin must not be collateral damage: refusing to evict is what makes `npu load` safe to run
+    /// A pin must not be collateral damage: refusing to evict is what makes `npu model start` safe to run
     /// against a server someone else is using.
     #[test]
     fn load_explicit_refuses_rather_than_touching_a_pinned_model() {
@@ -904,6 +926,16 @@ mod tests {
         // Not a memory assertion (RSS is not a unit-testable quantity) -- just that the platform has
         // the call, so a green test suite cannot hide a silently no-op second idle level.
         assert!(release_free_memory(), "glibc target should have malloc_trim");
+    }
+    #[test]
+    fn release_records_a_typed_reason() {
+        let l = loader(&["a"]);
+        let mut r = Registry::default();
+        r.try_load(&cfg("a"), &l, &ServerCfg::default(), Instant::now());
+        assert!(r.get_loaded("a").is_some());
+        r.release("a", "unloaded: asked for", UnloadReason::Operator);
+        let e = r.entries.iter().find(|e| e.cfg.name == "a").unwrap();
+        assert_eq!(e.unload_reason, Some(UnloadReason::Operator));
     }
     #[test]
     fn ensure_resident_reports_why_a_load_failed() {

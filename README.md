@@ -71,7 +71,7 @@ ONNX_ASR_VENV=/path/to/venv ./install.sh    # build + install the service
 npu serve                                   # start the engine
 npu transcribe audio.wav                    # run ASR
 npu embed "some text"                       # run embeddings
-npu models                                  # list loaded models
+npu model ls                                # list loaded models
 ```
 
 Weight checkpoints are baked from Hugging Face checkpoints with `npu weights bake` (see

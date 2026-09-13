@@ -149,6 +149,6 @@ threshold; check the arch transform against the source checkpoint's actual layou
 
 Most failures in this codebase carry the fix in the message: preflight failures name
 the exact missing path or scenario, device errors say what to stop first, and load
-failures are attributed to the model that caused them (`/v1/models` and `npu models`
+failures are attributed to the model that caused them (`/v1/models` and `npu model ls`
 report `state` and `detail` per model). Read the message before searching for a
 workaround.

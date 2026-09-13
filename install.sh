@@ -222,7 +222,7 @@ ok "XRT: inc=$XRT_INC_DIR lib=$XRT_LIB_DIR"
 info "Building Rust workspace (cargo build --release)..."
 # Bake an RPATH to the stable onnxruntime dir so the binary resolves libonnxruntime.so.1 on its
 # own. Without it only the SERVICE works (its unit sets LD_LIBRARY_PATH) and plain CLI use --
-# `npu --help`, `npu models`, `npu transcribe` -- dies with
+# `npu --help`, `npu model ls`, `npu transcribe` -- dies with
 #   npu: error while loading shared libraries: libonnxruntime.so.1
 # NB: setting RUSTFLAGS here OVERRIDES rust/.cargo/config.toml's build.rustflags rather than
 # appending to it, so -C target-cpu=native must be repeated or the build silently loses AVX-512.
@@ -297,7 +297,7 @@ fi
 # Everything above this point is a preflight -- it checks what the build needs. Nothing checked what
 # the install produced, so this script could print "Done" having installed a binary that cannot
 # start. That is not hypothetical: on 2026-09-09 a binary built without the RPATH baked at step 3
-# was installed by hand, and `npu models` died with "error while loading shared libraries:
+# was installed by hand, and `npu model ls` died with "error while loading shared libraries:
 # libonnxruntime.so.1" for every interactive user. The SERVICE kept working the whole time, because
 # its unit sets LD_LIBRARY_PATH -- so the failure was invisible to anything that tested with a
 # developer's environment, which is every test anyone had run.
@@ -753,7 +753,7 @@ After=graphical-session.target
 [Service]
 Type=simple
 # systemd creates this on start and REMOVES it on stop, so the status file's presence is the
-# liveness signal: npu models needs no port, probe or timeout to read live state.
+# liveness signal: npu model ls needs no port, probe or timeout to read live state.
 RuntimeDirectory=npu
 # The engine's root for artifacts/, scenarios/ and the mlir-aie xclbins. npu-cli's root() reads
 # this before falling back to a scenario path or to cwd.

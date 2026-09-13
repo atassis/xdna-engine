@@ -84,14 +84,14 @@ resident = false
 - `scenario` -- path to the scenario TOML, resolved against the engine root (see below)
   if relative.
 - `resident` (default `false`) -- pin this model so it is never chosen as an eviction
-  victim and never idle-unloaded. Set it with `npu config pin <model>` / `npu config unpin
+  victim and never idle-unloaded. Set it with `npu model enable <model>` / `npu model disable
   <model>`, or by hand.
 
   **A pin is an exemption, not an entitlement.** It keeps a model that IS resident from being
   swept or evicted; it does not win it a slot it would not otherwise have had. Boot admission
   is still the first `max_resident` models in config order, so a pin listed after enough
   others is simply not loaded at startup -- it loads on the first request that routes to it
-  and then stays. `npu config show`, `npu config pin` and the server's startup log all say so
+  and then stays. `npu config show`, `npu model enable` and the server's startup log all say so
   when that is the case, rather than leaving the config stating an intent the runtime declined.
 
   Pinning every model leaves no eviction victim at all; `npu config show` and the config
@@ -101,11 +101,11 @@ resident = false
 
 ```
 npu config show
-npu config add-model <name> <scenario-path>
-npu config remove-model <name>
-npu config set-default <capability> <model>
-npu config pin <model>                # resident = true
-npu config unpin <model>              # resident = false
+npu model add <name> <scenario-path>
+npu model rm <name>
+npu model default <capability> <model>
+npu model enable <model>              # resident = true
+npu model disable <model>             # resident = false
 npu config set <key> <value>          # one [server] key; `npu config set --help` lists them
 ```
 
@@ -118,7 +118,7 @@ nothing.
 Each of these edits `engine.toml` **in place** and saves it atomically (temp file + rename).
 In place, not re-serialized from the parsed struct: the struct does not carry comments, so
 rewriting the file from it deleted every one of them -- including the comments the generated
-config ships with. Re-running `add-model` on a name already present updates that entry's
+config ships with. Re-running `npu model add` on a name already present updates that entry's
 scenario and leaves its other keys, including `resident`, alone.
 
 ### Residency at runtime
@@ -127,15 +127,15 @@ scenario and leaves its other keys, including `resident`, alone.
 or restarting:
 
 ```
-npu load <model>          # make it resident now
-npu unload <model>        # give its device memory back now
+npu model start <model>   # make it resident now
+npu model stop <model>    # give its device memory back now
 ```
 
-`npu load` **refuses** rather than evicting when the server is already at `max_resident`, and the
+`npu model start` **refuses** rather than evicting when the server is already at `max_resident`, and the
 refusal names what is holding the slots. That is deliberate and is the one place the operator path
 differs from the request path: a request names a capability, so swapping a model in to serve it is
 right; an explicit load is a statement about *capacity*, and honouring it by dropping a model
-someone else pinned would answer a different question. Free a slot with `npu unload`, or raise the
+someone else pinned would answer a different question. Free a slot with `npu model stop`, or raise the
 cap with `npu config set max_resident <n>`.
 
 Both are idempotent, and neither touches `engine.toml` -- so neither survives a restart. For
@@ -145,7 +145,7 @@ residency that does, pin the model.
 > across resident models; Parakeet reports its actual pinned device BO total, and every other shipped
 > model still returns a hardcoded `0` (`npu-engine/src/pipeline.rs`'s trait defaults, unwired for
 > Whisper, the generic GigaAM ASR path, BERT/ESM embed, and text generation). A ceiling with a
-> non-Parakeet model resident is not enforcing anything for that model's share. `npu load` says which
+> non-Parakeet model resident is not enforcing anything for that model's share. `npu model start` says which
 > resident models the accountant could not weigh, rather than letting a ceiling you just set look
 > like it covers everything that is loaded. `max_resident` (a model COUNT) is the only limit
 > enforced uniformly across every model kind.

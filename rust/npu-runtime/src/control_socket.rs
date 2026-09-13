@@ -74,7 +74,7 @@ impl LiveStatus {
     pub fn get(&self) -> String { self.0.lock().unwrap().clone() }
 }
 
-/// The same document shape `status.json` carried, so `npu models`/`npu top` need no format change
+/// The same document shape `status.json` carried, so `npu model ls`/`npu top` need no format change
 /// to read this instead of a file.
 pub fn render(port: u16, started_unix: u64, status: &[ModelStatus]) -> String {
     let now = std::time::SystemTime::now()

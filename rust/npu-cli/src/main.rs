@@ -16,7 +16,7 @@ mod stats;
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser};
 
-use cli_def::{Cli, Cmd, ConfigCmd, OutFormat, OutputFormat, SamplingArgs, WeightsCmd};
+use cli_def::{Cli, Cmd, ConfigCmd, ModelCmd, OutFormat, OutputFormat, SamplingArgs, WeightsCmd};
 use clap_complete::Shell;
 use std::io::IsTerminal;
 use npu_engine::telemetry::wire;
@@ -44,9 +44,9 @@ fn config_path_and_source(cli: &Cli) -> (PathBuf, &'static str) {
 /// Put SIGPIPE back to its default disposition.
 ///
 /// Rust ignores SIGPIPE at startup, so a closed stdout surfaces as an `EPIPE` from `println!`,
-/// which panics -- `npu models | head` printed a panic and a backtrace note instead of just
+/// which panics -- `npu model ls | head` printed a panic and a backtrace note instead of just
 /// stopping. Every other program in a pipeline dies silently there, and a CLI whose output is
-/// meant to be piped (`npu models | awk`, which the shell completion itself does) has to behave
+/// meant to be piped (`npu model ls | awk`, which the shell completion itself does) has to behave
 /// the same way.
 ///
 /// Unsafe because it is a raw libc call; sound because it runs before any thread exists and only
@@ -60,7 +60,36 @@ fn restore_sigpipe() {
 
 fn main() -> ExitCode {
     restore_sigpipe();
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => {
+            use clap::error::ErrorKind;
+            // DisplayHelp/DisplayVersion are clap's own correct handling (`--help`/`--version`
+            // themselves), and DisplayHelpOnMissingArgumentOrSubcommand is the already-shipped
+            // bare-namespace-shows-help behavior (`subcommand_required` + `arg_required_else_help`)
+            // -- all three already print the right thing via `e.exit()`.
+            if matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+                | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand) {
+                e.exit();
+            }
+            // Any other usage error: walk the raw args to the deepest subcommand that DID resolve
+            // and print ITS full help, instead of clap's short "try '--help'".
+            let args: Vec<String> = std::env::args().collect();
+            let cmd = Cli::command();
+            let mut node = &cmd;
+            for a in args.iter().skip(1) {
+                if a.starts_with('-') { break; } // stop at the first flag; only walk subcommand names
+                match node.find_subcommand(a.as_str()) {
+                    Some(sub) => node = sub,
+                    None => break,
+                }
+            }
+            let mut help_target = node.clone();
+            let _ = help_target.print_help();
+            eprintln!();
+            std::process::exit(2);
+        }
+    };
     let path = config_path(&cli);
     match run(&cli, &path) {
         Ok(()) => ExitCode::from(Code::Success as u8),
@@ -91,10 +120,8 @@ fn run(cli: &Cli, path: &Path) -> Result<()> {
         Cmd::TranscribeMedia { input, out, format, asr, diarize: diar, track, no_diarize } =>
             transcribe_media(input, out.as_deref(), *format, asr.as_deref(),
                              diar.as_deref(), *track, *no_diarize),
-        Cmd::Models { json } => models(&path, *json || as_json),
-        Cmd::Load { model } => load_model(&path, model),
-        Cmd::Unload { model } => unload_model(&path, model),
-        Cmd::Config { action, no_reload } => config_cmd(&path, action, *no_reload),
+        Cmd::Model { action } => model_cmd(&path, action, as_json),
+        Cmd::Config { action } => config_cmd(&path, action),
         Cmd::Flags { json } => flags_cmd(*json || as_json),
         Cmd::Weights { action } => weights_cmd(&path, action),
         Cmd::Doctor { json } => doctor::doctor(&cli, *json || as_json),
@@ -391,7 +418,7 @@ fn build_params(s: &SamplingArgs) -> Result<npu_engine::GenerateParams, String> 
 ///
 /// clap has no way to express "the values come from the user's config", so it emits `_default` for
 /// these -- which in zsh means FILE completion, and `npu generate --model=<TAB>` offering filenames
-/// is worse than offering nothing. The names have to come from `npu models`, which reads the config
+/// is worse than offering nothing. The names have to come from `npu model ls`, which reads the config
 /// and the control socket and answers in about a millisecond with no device, and works with no
 /// service running at all.
 ///
@@ -415,7 +442,7 @@ _npu_models() {
   local -a names
   # Gate on the STATE column rather than on line position: the table has a header and a trailing
   # "(live state as of ...)" note, and a row is exactly a line whose second field is a load state.
-  names=(${(f)"$(npu models 2>/dev/null | awk -v k="$kind" \
+  names=(${(f)"$(npu model ls 2>/dev/null | awk -v k="$kind" \
     '$2 ~ /^(loaded|unloaded|failed)$/ && (k=="" || $3==k) {print $1}')"})
   (( ${#names} )) && compadd -a names
 }
@@ -424,9 +451,9 @@ _npu_models() {
     out = out.replace(":MODEL:_default", ":MODEL:_npu_models");
     out = out.replace(":ASR:_default", ":ASR:_npu_models asr");
     out = out.replace(":DIARIZE:_default", ":DIARIZE:_npu_models diarize");
-    // The POSITIONAL model of `load` / `unload` / `config pin` / `config unpin`, where completion
+    // The POSITIONAL model of `start` / `stop` / `enable` / `disable`, where completion
     // matters most: those commands take nothing but a model name. `name` is deliberately left
-    // alone -- `config add` names a model that does not exist yet, so offering the existing ones
+    // alone -- `model add` names a model that does not exist yet, so offering the existing ones
     // there would suggest exactly the wrong answers.
     out = out.replace("':model:_default'", "':model:_npu_models'");
     out
@@ -977,7 +1004,7 @@ fn embed(text: &str, model: Option<&str>, as_json: bool) -> Result<()> {
 /// What a model's scenario file declares, for the columns that must answer with the service down.
 ///
 /// `kind` and `precision` are properties of the manifest, not of a running process, so reading them
-/// here is what lets `npu models` stay useful (and shell completion stay capability-filtered) when
+/// here is what lets `npu model ls` stay useful (and shell completion stay capability-filtered) when
 /// nothing is serving. Nine small TOMLs parse in well under a millisecond; the command has to stay
 /// cheap enough to back a `<TAB>`.
 struct Declared {
@@ -987,6 +1014,14 @@ struct Declared {
     /// measurement, not a guess, so reading it is exactly what this column is for. Before that it
     /// printed `-` for every LLM, which read as "unquantized" for a model serving int8.
     precision: Option<String>,
+    /// The context window: how many token positions this model can hold. Declared by the scenario's
+    /// `[model].max_seq`; for a `generate`-kind model with a compiled decode artifact, the artifact's
+    /// OWN `dims.S` -- the exact value `DecodeStep::max_context` enforces at generation time -- wins,
+    /// same as `precision` lets the artifact's `weight_quant` win over a bare scenario guess.
+    max_seq: Option<usize>,
+    /// The scenario's OWN declared `max_seq`, kept separately from the (possibly
+    /// artifact-overridden) effective value above -- `context_cell` needs both to report a drift.
+    scenario_max_seq: Option<usize>,
 }
 
 /// The weight format a decode artifact was BUILT at, from its own `meta.json`.
@@ -1014,6 +1049,16 @@ fn declared(root: Option<&PathBuf>, scenario: &str) -> Declared {
     let sc = root
         .map(|r| r.join(scenario))
         .and_then(|p| npu_engine::config::ScenarioConfig::load(&p).ok());
+    let scenario_max_seq = sc.as_ref().and_then(|c| c.model.as_ref().map(|m| m.max_seq));
+    // Best-effort: LlmArtifact::load fails loud on an ACTIVE toolchain-stale mismatch (correct for
+    // the code path that is about to DISPATCH against the ELF), but a listing must never abort just
+    // because one model's artifact is stale -- `.ok()` falls back to the scenario's own declared
+    // value exactly the way `artifact_precision` already falls back to `None` on any read failure.
+    let artifact_max_seq = sc.as_ref()
+        .filter(|c| !c.artifacts.decode.is_empty())
+        .and_then(|c| root.map(|r| r.join(&c.artifacts.decode)))
+        .and_then(|d| npu_engine::llm::LlmArtifact::load(&d).ok())
+        .map(|a| a.max_seq);
     Declared {
         // Through the canonical mapping, not the raw string: a scenario says `kind = "embeddings"`
         // while the capability -- and the live status, and every other surface -- says `embed`.
@@ -1031,6 +1076,8 @@ fn declared(root: Option<&PathBuf>, scenario: &str) -> Declared {
                 let d = &sc.as_ref()?.artifacts.decode;
                 (!d.is_empty()).then(|| artifact_precision(root, d))?
             }),
+        max_seq: artifact_max_seq.or(scenario_max_seq),
+        scenario_max_seq,
     }
 }
 
@@ -1043,6 +1090,56 @@ fn precision_cell(d: &Declared) -> String {
     match std::env::var("NPU_PRECISION").ok().filter(|v| v != p) {
         Some(env) => format!("{p} {{env:{env}}}"),
         None => p.to_string(),
+    }
+}
+
+/// The CONTEXT cell: the effective max_seq (artifact-confirmed when one exists, else the scenario's
+/// bare declaration), with a brace note when the two actually disagree -- same "braces only on a
+/// deviation" rule `precision_cell` follows. Needs BOTH numbers, not just the winner, so it takes the
+/// scenario value separately rather than only `Declared::max_seq`.
+fn context_cell(effective: Option<usize>, scenario_declared: Option<usize>) -> String {
+    let Some(eff) = effective else { return "-".to_string() };
+    match scenario_declared {
+        Some(s) if s != eff => format!("{eff} {{scenario:{s}}}"),
+        _ => eff.to_string(),
+    }
+}
+
+/// The `--verbose` line under a model's row: kv_block, window rungs, and toolchain freshness, for
+/// generate-kind models with a compiled decode artifact. `None` for every other model kind -- there
+/// is nothing artifact-derived to add for an encoder-only scenario.
+fn verbose_detail(root: Option<&PathBuf>, scenario: &str) -> Option<String> {
+    let sc = npu_engine::config::ScenarioConfig::load(&root?.join(scenario)).ok()?;
+    let decode = &sc.artifacts.decode;
+    if decode.is_empty() { return None; }
+    let dir = root?.join(decode);
+
+    // Read `toolchain.hash` straight off `meta.json`, the same way `artifact_precision` reads
+    // `weight_quant` -- `LlmArtifact::load` fails loud (`Err`) on a Stale verdict, so calling
+    // `check_toolchain_freshness` on an already-loaded artifact can never observe Stale: load()
+    // has already filtered that case out. Reading the hash independently is what makes STALE
+    // reachable for a genuinely stale model.
+    let meta: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("meta.json")).ok()?).ok()?;
+    let toolchain_hash = meta.get("toolchain").and_then(|t| t.get("hash")).and_then(|h| h.as_str()).map(str::to_string);
+    let fresh = match npu_engine::llm::artifact::LlmArtifact::check_toolchain_freshness(&toolchain_hash, &dir) {
+        npu_engine::llm::artifact::ToolchainFreshness::Fresh { .. } => "fresh".to_string(),
+        npu_engine::llm::artifact::ToolchainFreshness::Stale { .. } => "STALE".to_string(),
+        npu_engine::llm::artifact::ToolchainFreshness::Unstamped => "unstamped".to_string(),
+        npu_engine::llm::artifact::ToolchainFreshness::Unverifiable { .. } => "unverifiable".to_string(),
+    };
+
+    // kv_block/window_rungs need the full artifact -- degrade to `?` rather than dropping the
+    // line, so a stale (or otherwise unloadable) artifact still reports what it can.
+    match npu_engine::llm::LlmArtifact::load(&dir).ok() {
+        Some(a) => {
+            let rungs = if a.window_rungs.is_empty() {
+                "none".to_string()
+            } else {
+                a.window_rungs.iter().map(|(name, w)| format!("{name}:{w}")).collect::<Vec<_>>().join(",")
+            };
+            Some(format!("kv_block={} window_rungs=[{rungs}] toolchain={fresh}", a.kv_block))
+        }
+        None => Some(format!("kv_block=? window_rungs=[?] toolchain={fresh}")),
     }
 }
 
@@ -1060,7 +1157,22 @@ fn mem_cell(bytes: Option<u64>) -> String {
     }
 }
 
-fn models(path: &Path, as_json: bool) -> Result<()> {
+fn model_cmd(path: &Path, action: &ModelCmd, as_json: bool) -> Result<()> {
+    match action {
+        ModelCmd::Ls { json, verbose } => model_ls(path, *json || as_json, *verbose),
+        ModelCmd::Show { model, json } => model_show(path, model, *json || as_json),
+        ModelCmd::Start { model } => model_start(path, model),
+        ModelCmd::Stop { model } => model_stop(path, model),
+        // Enable/Disable/Add/Rm/Default all edit engine.toml (or ask the running service to);
+        // `--no-reload` isn't exposed on `npu model` today (it lived on `npu config` because only
+        // config-shaped edits needed it) -- these five always reconcile, matching `pin`'s existing
+        // default-on behavior.
+        ModelCmd::Enable { .. } | ModelCmd::Disable { .. } | ModelCmd::Add { .. }
+            | ModelCmd::Rm { .. } | ModelCmd::Default { .. } => model_mutate(path, action),
+    }
+}
+
+fn model_ls(path: &Path, as_json: bool, verbose: bool) -> Result<()> {
     let cfg = load_cfg(path)?;
     let live = read_live_status();
     let root = root(&cfg, path).ok();
@@ -1079,6 +1191,7 @@ fn models(path: &Path, as_json: bool) -> Result<()> {
                 "kind": d.kind,
                 "live_kind": l.and_then(|x| x.get("kind").and_then(|s| s.as_str())),
                 "precision": d.precision,
+                "max_seq": d.max_seq,
                 // null, never 0: `bo_bytes` defaults to 0 for every implementation that does not
                 // measure itself, so 0 would report "no device memory" for "nobody looked".
                 "bo_bytes": bo.filter(|b| *b > 0),
@@ -1100,11 +1213,11 @@ fn models(path: &Path, as_json: bool) -> Result<()> {
         return Ok(());
     }
 
-    // Column ORDER is load-bearing: `npu models | awk '{print $1}'` is a documented use with a
+    // Column ORDER is load-bearing: `npu model ls | awk '{print $1}'` is a documented use with a
     // test, and the shell completion this command backs reads $2 (state) and $3 (kind). New columns
     // append on the right, and the free-text one goes last.
-    println!("{:<22} {:<9} {:<11} {:<5} {:<6} {:<5}  {}",
-             "NAME", "STATE", "KIND", "PIN", "MEM", "BUSY", "PRECISION");
+    println!("{:<22} {:<9} {:<11} {:<5} {:<6} {:<5} {:<8}  {}",
+             "NAME", "STATE", "KIND", "PIN", "MEM", "BUSY", "CONTEXT", "PRECISION");
     let mut drifted = false;
     for m in &cfg.models {
         let l = live.as_ref().and_then(|(_, v)| find_live(v, &m.name));
@@ -1126,17 +1239,54 @@ fn models(path: &Path, as_json: bool) -> Result<()> {
             None => "-".to_string(),
         };
         let mem = mem_cell(l.and_then(|x| x.get("bo_bytes")).and_then(|b| b.as_u64()));
-        println!("{:<22} {:<9} {:<11} {:<5} {:<6} {:<5}  {}",
-                 m.name, f("state"), kind, pin, mem, busy, precision_cell(&d));
+        println!("{:<22} {:<9} {:<11} {:<5} {:<6} {:<5} {:<8}  {}",
+                 m.name, f("state"), kind, pin, mem, busy,
+                 context_cell(d.max_seq, d.scenario_max_seq), precision_cell(&d));
+        if verbose {
+            if let Some(detail) = verbose_detail(root.as_ref(), &m.scenario) {
+                println!("    {detail}");
+            }
+        }
     }
     match &live {
         Some((age, _)) => println!("\n(live state as of {age}s ago)"),
         None => println!("\n(service not running -- configured models only)"),
     }
     if drifted {
-        println!("* the running server has a different pin than the config -- `npu config pin`/`unpin` \
+        println!("* the running server has a different pin than the config -- `npu model enable`/`disable` \
                   reconcile it automatically; a config edited by hand needs \
                   `systemctl --user restart xdna-engine`");
+    }
+    Ok(())
+}
+
+/// The refusal for a model name the config does not have -- `model_show`, `RemoveModel` and
+/// `SetResident` (enable/disable) all hit this same case.
+fn no_such_model(name: &str) -> Tagged {
+    Tagged(Code::NoModel, format!("unknown model {name:?} (not in the config)"))
+}
+
+fn model_show(path: &Path, model: &str, as_json: bool) -> Result<()> {
+    let cfg = load_cfg(path)?;
+    let Some(m) = cfg.find(model) else {
+        return Err(no_such_model(model).into());
+    };
+    let root = root(&cfg, path).ok();
+    let d = declared(root.as_ref(), &m.scenario);
+    if as_json {
+        println!("{}", serde_json::json!({"id": m.name, "scenario": m.scenario,
+            "pinned": m.resident, "kind": d.kind, "precision": d.precision,
+            "max_seq": d.max_seq}));
+    } else {
+        println!("{:<12} {}", "NAME", m.name);
+        println!("{:<12} {}", "SCENARIO", m.scenario);
+        println!("{:<12} {}", "ENABLED", m.resident);
+        println!("{:<12} {}", "KIND", d.kind.as_deref().unwrap_or("-"));
+        println!("{:<12} {}", "CONTEXT", context_cell(d.max_seq, d.scenario_max_seq));
+        println!("{:<12} {}", "PRECISION", precision_cell(&d));
+        if let Some(detail) = verbose_detail(root.as_ref(), &m.scenario) {
+            println!("{:<12} {detail}", "DETAIL");
+        }
     }
     Ok(())
 }
@@ -1292,11 +1442,11 @@ fn read_live_status() -> Option<(u64, serde_json::Value)> {
     Some((now.saturating_sub(written), v))
 }
 
-/// The PIN column. `*` marks a config pin the running server has not adopted yet -- `npu config
-/// pin`/`unpin` reconcile a running server automatically (unless `--no-reload`), so this is the
-/// normal state only for `--no-reload` or a config edited by hand, and the one thing a pin column
-/// has to be able to say. A server too old to publish `pinned` reports `None`, and gets the
-/// config's answer without a drift marker rather than a fabricated disagreement.
+/// The PIN column. `*` marks a config pin the running server has not adopted yet -- `npu model
+/// enable`/`disable` reconcile a running server automatically, so this is the normal state only for
+/// a config edited by hand, and the one thing a pin column has to be able to say. A server too old
+/// to publish `pinned` reports `None`, and gets the config's answer without a drift marker rather
+/// than a fabricated disagreement.
 /// `want`/`live` are the ordinary config-vs-server drift check, unchanged. `pin_honored` catches a
 /// SEPARATE state that drift alone cannot see: `want` and `live` agreeing on "pinned" does not mean
 /// the invariant currently protects it -- a demotion (over `memory_ceiling_mb`) leaves both `true`
@@ -1318,53 +1468,73 @@ fn find_live<'a>(doc: &'a serde_json::Value, name: &str) -> Option<&'a serde_jso
         .iter().find(|m| m.get("id").and_then(|i| i.as_str()) == Some(name))
 }
 
-/// What an edit did, for the path where the SERVICE performed it and this process therefore never
-/// built the local `note`. Kept beside `admin_call` so the two stay in step.
-fn describe(action: &ConfigCmd) -> String {
+/// What `ConfigCmd::Set` and every mutating `ModelCmd` variant reduce to: one of five config edits.
+/// `admin_call`/`describe`/the local-write fallback below all match on THIS, not on the CLI enums
+/// directly -- so a new mutating verb on either `npu config` or `npu model` costs one arm here, not
+/// three duplicated match statements.
+enum ModelMutation<'a> {
+    AddModel { name: &'a str, scenario: &'a str },
+    RemoveModel { name: &'a str },
+    SetResident { model: &'a str, on: bool },
+    SetServer { key: &'a str, value: &'a str },
+    SetDefault { capability: &'a str, model: &'a str },
+}
+
+fn model_mutation_of(action: &ModelCmd) -> ModelMutation<'_> {
     match action {
-        ConfigCmd::Show => String::new(),
-        ConfigCmd::AddModel { name, scenario } => format!("model {name} -> {scenario}"),
-        ConfigCmd::RemoveModel { name } => format!("removed model {name}"),
-        ConfigCmd::Pin { model } => format!("pinned {model} resident"),
-        ConfigCmd::Unpin { model } => format!("unpinned {model}"),
-        ConfigCmd::Set { key, value } => format!("server.{key} = {value}"),
-        ConfigCmd::SetDefault { capability, model } => format!("default {capability} = {model}"),
+        ModelCmd::Add { name, scenario } => ModelMutation::AddModel { name, scenario },
+        ModelCmd::Rm { name } => ModelMutation::RemoveModel { name },
+        ModelCmd::Enable { model } => ModelMutation::SetResident { model, on: true },
+        ModelCmd::Disable { model } => ModelMutation::SetResident { model, on: false },
+        ModelCmd::Default { capability, model } => ModelMutation::SetDefault { capability, model },
+        ModelCmd::Ls { .. } | ModelCmd::Show { .. } | ModelCmd::Start { .. } | ModelCmd::Stop { .. } =>
+            unreachable!("model_cmd routes these elsewhere"),
     }
 }
 
-/// The `/admin` call that performs one config mutation, or `None` for a read-only subcommand.
+/// What an edit did, for the path where the SERVICE performed it and this process therefore never
+/// built the local `note`. Kept beside `admin_call` so the two stay in step.
+fn describe(m: &ModelMutation) -> String {
+    match m {
+        ModelMutation::AddModel { name, scenario } => format!("model {name} -> {scenario}"),
+        ModelMutation::RemoveModel { name } => format!("removed model {name}"),
+        ModelMutation::SetResident { model, on: true } => format!("enabled {model}"),
+        ModelMutation::SetResident { model, on: false } => format!("disabled {model}"),
+        ModelMutation::SetServer { key, value } => format!("server.{key} = {value}"),
+        ModelMutation::SetDefault { capability, model } => format!("default {capability} = {model}"),
+    }
+}
+
+/// The `/admin` call that performs one config mutation.
 ///
 /// `engine.toml` has two possible writers -- this CLI and the service, which rewrites it for every
 /// other `/admin` route -- and two writers on one file is a race waiting for the day both run at
 /// once. So when a service is up it does the writing, and this reduces to naming the request; the
 /// local path below is for when there is no service, where there is no one to race.
-fn admin_call(action: &ConfigCmd) -> Option<(&'static str, String, String)> {
+fn admin_call(m: &ModelMutation) -> (&'static str, String, String) {
     let esc = npu_runtime::http::parse::json_escape;
-    match action {
-        ConfigCmd::Show => None,
-        ConfigCmd::AddModel { name, scenario } => Some((
+    match m {
+        ModelMutation::AddModel { name, scenario } => (
             "POST", "/admin/models".into(),
-            format!("{{\"name\":\"{}\",\"scenario\":\"{}\"}}", esc(name), esc(scenario)))),
-        ConfigCmd::RemoveModel { name } => Some(("DELETE", format!("/admin/models/{name}"), String::new())),
-        ConfigCmd::Pin { model } => Some((
-            "POST", format!("/admin/models/{model}/resident"), "{\"resident\":true}".into())),
-        ConfigCmd::Unpin { model } => Some((
-            "POST", format!("/admin/models/{model}/resident"), "{\"resident\":false}".into())),
-        ConfigCmd::Set { key, value } => Some((
+            format!("{{\"name\":\"{}\",\"scenario\":\"{}\"}}", esc(name), esc(scenario))),
+        ModelMutation::RemoveModel { name } => ("DELETE", format!("/admin/models/{name}"), String::new()),
+        ModelMutation::SetResident { model, on } => (
+            "POST", format!("/admin/models/{model}/resident"), format!("{{\"resident\":{on}}}")),
+        ModelMutation::SetServer { key, value } => (
             "POST", "/admin/server".into(),
-            format!("{{\"key\":\"{}\",\"value\":\"{}\"}}", esc(key), esc(value)))),
-        ConfigCmd::SetDefault { capability, model } => Some((
+            format!("{{\"key\":\"{}\",\"value\":\"{}\"}}", esc(key), esc(value))),
+        ModelMutation::SetDefault { capability, model } => (
             "POST", "/admin/defaults".into(),
-            format!("{{\"capability\":\"{}\",\"model\":\"{}\"}}", esc(capability), esc(model)))),
+            format!("{{\"capability\":\"{}\",\"model\":\"{}\"}}", esc(capability), esc(model))),
     }
 }
 
 /// Ask the running service to make the edit. Returns its reconcile summary.
 ///
 /// A rejection here is the CLI's error: `http_req` returns only the body, so a 400 would otherwise
-/// read as success -- the same `{"error":...}` convention `npu load` already follows.
-fn edit_via_service(addr: &str, action: &ConfigCmd) -> Result<String> {
-    let (method, route, body) = admin_call(action).expect("caller checked this is a mutation");
+/// read as success -- the same `{"error":...}` convention `npu model start` already follows.
+fn edit_via_service(addr: &str, m: &ModelMutation) -> Result<String> {
+    let (method, route, body) = admin_call(m);
     let resp = http_req(addr, method, &route, &body)
         .context(Tagged(Code::NoService, "config edit (is the server running?)".into()))?;
     let v: serde_json::Value = serde_json::from_str(&resp)
@@ -1415,13 +1585,13 @@ fn summarise_reload(body: &str) -> String {
     if parts.is_empty() { "nothing to change".to_string() } else { parts.join(", ") }
 }
 
-/// `npu load` / `npu unload` talk to the SERVICE, not the device.
+/// `npu model start` / `npu model stop` talk to the SERVICE, not the device.
 ///
 /// Every other one-shot command drives the engine in-process, but residency is a property of the
 /// running server's registry -- the thing that owns admission, eviction and the idle sweep.
 /// Loading a model into this process would take its own hardware context and change nothing the
 /// server can see, which is the opposite of what was asked.
-fn load_model(path: &Path, model: &str) -> Result<()> {
+fn model_start(path: &Path, model: &str) -> Result<()> {
     let addr = resolve_http_addr(&load_cfg(path)?);
     let body = http_post(&addr, &format!("/admin/models/{model}/load"), "")
         .context(Tagged(Code::NoService, "load (is the server running?)".into()))?;
@@ -1443,7 +1613,7 @@ fn load_model(path: &Path, model: &str) -> Result<()> {
     Ok(())
 }
 
-fn unload_model(path: &Path, model: &str) -> Result<()> {
+fn model_stop(path: &Path, model: &str) -> Result<()> {
     let addr = resolve_http_addr(&load_cfg(path)?);
     let body = http_post(&addr, &format!("/admin/models/{model}/unload"), "")
         .context(Tagged(Code::NoService, "unload (is the server running?)".into()))?;
@@ -1515,12 +1685,12 @@ fn unit_of(pid: u64) -> Option<String> {
 }
 
 /// `npu weights bake --name <model>`: bake a CONFIGURED model's declarative spec, resolved from
-/// its scenario. Prefers the SERVICE, the same reason `npu load`/`npu unload` do: a resident
-/// model's checkpoint file may be mmap'd by the very process this would overwrite. Unlike
-/// load/unload, baking is still meaningful with nothing running -- there is no live registry to
+/// its scenario. Prefers the SERVICE, the same reason `npu model start`/`npu model stop` do: a
+/// resident model's checkpoint file may be mmap'd by the very process this would overwrite. Unlike
+/// start/stop, baking is still meaningful with nothing running -- there is no live registry to
 /// serve, but a checkpoint on disk is a useful thing to produce anyway -- so this falls back
 /// in-process instead of refusing, matching `npu config`'s fallback shape rather than
-/// load/unload's service-only one.
+/// start/stop's service-only one.
 fn bake_by_name(path: &Path, name: &str, force: bool) -> Result<()> {
     let cfg = load_cfg(path)?;
     let addr = resolve_http_addr(&cfg);
@@ -1593,28 +1763,19 @@ fn weights_cmd(path: &Path, action: &WeightsCmd) -> Result<()> {
     Ok(())
 }
 
-/// Every mutation goes through `ConfigDoc`, which edits the FILE rather than round-tripping a
-/// deserialized `Config` back through the serializer. The struct does not carry comments, so the
-/// old path silently deleted every one of them -- including the ones the engine's own generated
-/// config ships with.
-fn config_cmd(path: &Path, action: &ConfigCmd, no_reload: bool) -> Result<()> {
-    if let ConfigCmd::Show = action {
-        let cfg = load_cfg(path)?;
-        let root = root(&cfg, path)?;
-        print!("{}", render(&cfg, &root));
-        return Ok(());
-    }
-    // The service owns the file whenever there is one. `--no-reload` opts out of that too: it
-    // means "change desired state without disturbing what is running", and routing the write
-    // through the process that would immediately reconcile is the opposite of that.
+/// Apply one `ModelMutation`: `Show` never reaches here (both callers handle it before this). The
+/// service owns the file whenever there is one. `--no-reload` opts out of that too: it means "change
+/// desired state without disturbing what is running", and routing the write through the process that
+/// would immediately reconcile is the opposite of that.
+fn apply_mutation(path: &Path, m: &ModelMutation, no_reload: bool) -> Result<()> {
     let addr = load_cfg(path).map(|c| resolve_http_addr(&c)).ok();
     if !no_reload && addr.as_deref().is_some_and(listener_is_ours) {
         let addr = addr.unwrap();
-        let applied = edit_via_service(&addr, action)?;
+        let applied = edit_via_service(&addr, m)?;
         // Re-read: the SERVICE wrote it, so this reports the file as it now is rather than as this
         // process believes it should be.
         let cfg = load_cfg(path)?;
-        println!("{}  [{}]", describe(action), path.display());
+        println!("{}  [{}]", describe(m), path.display());
         println!("applied: {applied}");
         if let Some(w) = cfg.pin_overcommit(declared_footprint_fn(&root(&cfg, path)?)) {
             eprintln!("WARNING: {w}");
@@ -1623,34 +1784,28 @@ fn config_cmd(path: &Path, action: &ConfigCmd, no_reload: bool) -> Result<()> {
     }
 
     let mut doc = npu_runtime::ConfigDoc::load(path).map_err(|e| anyhow!(e))?;
-    // What to print once the write lands. Held rather than printed inline so a command that then
-    // fails validation says nothing, instead of reporting a change it did not make.
-    let note = match action {
-        ConfigCmd::Show => unreachable!("handled above"),
-        ConfigCmd::AddModel { name, scenario } => {
+    let note = match m {
+        ModelMutation::AddModel { name, scenario } => {
             doc.add_model(name, scenario).map_err(|e| anyhow!(e))?;
             format!("model {name} -> {scenario}")
         }
-        ConfigCmd::RemoveModel { name } => {
+        ModelMutation::RemoveModel { name } => {
             if !doc.remove_model(name).map_err(|e| anyhow!(e))? {
-                return Err(Tagged(Code::NoModel, format!("unknown model {name:?} (not in the config)")).into());
+                return Err(no_such_model(name).into());
             }
             format!("removed model {name}")
         }
-        ConfigCmd::Pin { model } | ConfigCmd::Unpin { model } => {
-            let on = matches!(action, ConfigCmd::Pin { .. });
-            // Refuse rather than write: a pin on a name the config does not have is a typo, and
-            // there is nothing in the file for the key to attach to.
-            if !doc.set_resident(model, on).map_err(|e| anyhow!(e))? {
-                return Err(Tagged(Code::NoModel, format!("unknown model {model:?} (not in the config)")).into());
+        ModelMutation::SetResident { model, on } => {
+            if !doc.set_resident(model, *on).map_err(|e| anyhow!(e))? {
+                return Err(no_such_model(model).into());
             }
-            if on { format!("pinned {model} resident") } else { format!("unpinned {model}") }
+            if *on { format!("enabled {model}") } else { format!("disabled {model}") }
         }
-        ConfigCmd::Set { key, value } => {
+        ModelMutation::SetServer { key, value } => {
             doc.set_server(key, value).map_err(|e| anyhow!(e))?;
             format!("server.{key} = {value}")
         }
-        ConfigCmd::SetDefault { capability, model } => match Capability::from_name(capability) {
+        ModelMutation::SetDefault { capability, model } => match Capability::from_name(capability) {
             Some(cap) => { doc.set_default(cap, model); format!("default {capability} = {model}") }
             None => return Err(anyhow!("unknown capability {capability:?} (one of: {})",
                 Capability::ALL.iter().map(|c| c.0).collect::<Vec<_>>().join("|"))),
@@ -1658,8 +1813,6 @@ fn config_cmd(path: &Path, action: &ConfigCmd, no_reload: bool) -> Result<()> {
     };
     let cfg = doc.save(path).map_err(|e| anyhow!(e))?;
     println!("{note}  [{}]", path.display());
-    // Warn on the same condition `npu config show` does, so an edit that creates one is caught
-    // where it is made rather than at the next boot.
     if let Some(w) = cfg.pin_overcommit(declared_footprint_fn(&root(&cfg, path)?)) {
         eprintln!("WARNING: {w}");
     }
@@ -1669,6 +1822,27 @@ fn config_cmd(path: &Path, action: &ConfigCmd, no_reload: bool) -> Result<()> {
         return Ok(());
     }
     apply_now(&cfg)
+}
+
+/// `npu config show`/`npu config set`. `Show` is read-only and never becomes a `ModelMutation`.
+fn config_cmd(path: &Path, action: &ConfigCmd) -> Result<()> {
+    match action {
+        ConfigCmd::Show => {
+            let cfg = load_cfg(path)?;
+            let root = root(&cfg, path)?;
+            print!("{}", render(&cfg, &root));
+            Ok(())
+        }
+        ConfigCmd::Set { key, value } =>
+            apply_mutation(path, &ModelMutation::SetServer { key, value }, false),
+    }
+}
+
+/// `npu model enable/disable/add/rm/default`. `Ls`/`Show`/`Start`/`Stop` never reach here (see
+/// `model_cmd`). No `--no-reload` on `npu model` (see `model_cmd`'s comment), so this always
+/// reconciles.
+fn model_mutate(path: &Path, action: &ModelCmd) -> Result<()> {
+    apply_mutation(path, &model_mutation_of(action), false)
 }
 
 /// Every registered `NPU_*`/related env var against the LIVE process environment: whether it is
@@ -1711,7 +1885,7 @@ fn flags_cmd(as_json: bool) -> Result<()> {
 /// A footprint provider backed by a real `EngineLoader` rooted at `root`: `Config::pin_overcommit`
 /// (and anything else that needs "how many bytes does this model cost, without loading it") takes
 /// an estimator rather than owning device state, and this is the host-only, service-may-be-down one
-/// -- `npu config show`/`npu config pin` both need to answer this with no service running.
+/// -- `npu config show`/`npu model enable` both need to answer this with no service running.
 fn declared_footprint_fn(root: &Path) -> impl Fn(&ModelCfg) -> u64 {
     let loader = EngineLoader { root: root.to_path_buf() };
     move |m: &ModelCfg| loader.declared_footprint(m).unwrap_or(0)
@@ -1829,24 +2003,20 @@ mod tests {
     /// Every mutating subcommand must have a route, or it would silently fall back to writing the
     /// file itself while a service was running -- which is the two-writer case this closes.
     #[test]
-    fn every_config_mutation_maps_to_an_admin_route() {
-        for action in [
-            ConfigCmd::AddModel { name: "m".into(), scenario: "s.toml".into() },
-            ConfigCmd::RemoveModel { name: "m".into() },
-            ConfigCmd::Pin { model: "m".into() },
-            ConfigCmd::Unpin { model: "m".into() },
-            ConfigCmd::Set { key: "memory_ceiling_mb".into(), value: "2048".into() },
-            ConfigCmd::SetDefault { capability: "asr".into(), model: "m".into() },
+    fn every_mutation_maps_to_an_admin_route() {
+        for m in [
+            ModelMutation::AddModel { name: "m", scenario: "s.toml" },
+            ModelMutation::RemoveModel { name: "m" },
+            ModelMutation::SetResident { model: "m", on: true },
+            ModelMutation::SetResident { model: "m", on: false },
+            ModelMutation::SetServer { key: "memory_ceiling_mb", value: "2048" },
+            ModelMutation::SetDefault { capability: "asr", model: "m" },
         ] {
-            let call = admin_call(&action);
-            assert!(call.is_some(), "no route for {}", describe(&action));
-            let (method, route, _) = call.unwrap();
+            let (method, route, _) = admin_call(&m);
             assert!(matches!(method, "POST" | "DELETE"), "{method} {route}");
             assert!(route.starts_with("/admin/"), "{route}");
-            assert!(!describe(&action).is_empty(), "a mutation must describe itself");
+            assert!(!describe(&m).is_empty(), "a mutation must describe itself");
         }
-        // Show reads; it has nothing to send.
-        assert!(admin_call(&ConfigCmd::Show).is_none());
     }
 
     #[test]
@@ -1880,9 +2050,9 @@ mod tests {
     fn precision_is_absent_when_the_scenario_declares_none() {
         // An LLM scenario has no `[model]` block -- its precision lives in the decode artifact.
         // Defaulting the column to bf16 there would be a guess printed as a fact.
-        let none = Declared { kind: Some("generate".into()), precision: None };
+        let none = Declared { kind: Some("generate".into()), precision: None, max_seq: None, scenario_max_seq: None };
         assert_eq!(precision_cell(&none), "-");
-        let bf16 = Declared { kind: Some("asr".into()), precision: Some("bf16".into()) };
+        let bf16 = Declared { kind: Some("asr".into()), precision: Some("bf16".into()), max_seq: None, scenario_max_seq: None };
         assert_eq!(precision_cell(&bf16), "bf16");
     }
 
@@ -1893,7 +2063,7 @@ mod tests {
         // threads in one process.
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let d = Declared { kind: Some("asr".into()), precision: Some("bf16".into()) };
+        let d = Declared { kind: Some("asr".into()), precision: Some("bf16".into()), max_seq: None, scenario_max_seq: None };
 
         std::env::remove_var("NPU_PRECISION");
         assert_eq!(precision_cell(&d), "bf16", "no override, no braces");
@@ -2096,7 +2266,7 @@ mod tests {
         assert!(!out.contains("':model:_default'"));
         assert!(out.contains(":ASR:_npu_models asr"), "capability-specific flags keep their filter");
         assert!(out.contains(":DIARIZE:_npu_models diarize"));
-        // `config add` names a model that does not exist yet, so it must NOT be rewritten.
+        // `model add` names a model that does not exist yet, so it must NOT be rewritten.
         assert!(out.contains("':name:_default'"), "a NEW model's name must not complete to existing ones");
     }
 
@@ -2179,7 +2349,7 @@ mod tests {
         assert_eq!(run.frames.len(), 3, "one replayable frame per token");
     }
 
-    /// The listing has to stay splittable: `npu models | awk '{print $1}'` is the obvious use, and a
+    /// The listing has to stay splittable: `npu model ls | awk '{print $1}'` is the obvious use, and a
     /// scenario path can contain no spaces while a model name never does -- so name first, path last.
     #[test]
     fn model_listing_is_splittable_by_column() {
@@ -2227,6 +2397,48 @@ mod tests {
     }
 
     #[test]
+    fn declared_reports_max_seq_from_the_scenario_when_no_artifact_speaks() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("s.toml"), concat!(
+            "[scenario]\nkind = \"embeddings\"\nname = \"x\"\n",
+            "[model]\nhidden = 768\nff = 3072\nn_heads = 12\nhead_dim = 64\n",
+            "n_layers = 12\nmax_seq = 512\n",
+            "[artifacts]\n",
+        )).unwrap();
+        let d = declared(Some(&dir.path().to_path_buf()), "s.toml");
+        assert_eq!(d.max_seq, Some(512), "an embed scenario has no decode artifact to override it");
+    }
+
+    #[test]
+    fn ls_prints_a_context_column() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("s.toml"), concat!(
+            "[scenario]\nkind = \"embeddings\"\nname = \"x\"\n",
+            "[model]\nhidden = 768\nff = 3072\nn_heads = 12\nhead_dim = 64\n",
+            "n_layers = 12\nmax_seq = 512\n",
+            "[artifacts]\n",
+        )).unwrap();
+        let cfg_path = dir.path().join("engine.toml");
+        std::fs::write(&cfg_path,
+            format!("[[model]]\nname = \"a\"\nscenario = \"{}\"\n",
+                dir.path().join("s.toml").display())).unwrap();
+        // model_ls prints to stdout; capture is out of scope for a unit test in this file (no
+        // existing test here captures stdout either -- `models`/`model_ls` has always been an
+        // integration-shaped function). Assert on the header string directly instead, which is what
+        // the column-order contract in the doc comment above the print! actually promises.
+        assert!(model_ls(&cfg_path, false, false).is_ok());
+    }
+
+    #[test]
+    fn ls_header_names_the_context_column() {
+        // Direct header-string check: the header format! is private to model_ls, so assert the
+        // literal it prints rather than trying to capture stdout.
+        let header = format!("{:<22} {:<9} {:<11} {:<5} {:<6} {:<5} {:<8}  {}",
+            "NAME", "STATE", "KIND", "PIN", "MEM", "BUSY", "CONTEXT", "PRECISION");
+        assert!(header.contains("CONTEXT"));
+    }
+
+    #[test]
     fn render_marks_which_models_are_pinned() {
         // No scenario/weight files exist at this root, so declared_footprint is 0 for both -- this
         // test is about the [pinned] marker, not the overcommit warning (covered in npu_runtime's
@@ -2237,28 +2449,29 @@ mod tests {
         assert!(out.contains("pinned resident: b"), "{out}");
     }
 
-    /// `npu config` edits the file a human wrote. Every verb has to leave the rest of it alone.
+    /// `npu config`/`npu model` edit the file a human wrote. Every verb has to leave the rest of it
+    /// alone.
     #[test]
     fn config_verbs_edit_in_place_without_destroying_the_file() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("engine.toml");
         std::fs::write(&p, "# keep me\n[server]\nmemory_ceiling_mb = 2048\n\n[[model]]\nname = \"a\"\nscenario = \"s.toml\"\n").unwrap();
 
-        config_cmd(&p, &ConfigCmd::Pin { model: "a".into() }, true).unwrap();
+        apply_mutation(&p, &ModelMutation::SetResident { model: "a", on: true }, true).unwrap();
         assert!(npu_runtime::config::Config::load(&p).unwrap().find("a").unwrap().resident);
 
-        config_cmd(&p, &ConfigCmd::Set { key: "idle_unload_s".into(), value: "0".into() }, true).unwrap();
+        apply_mutation(&p, &ModelMutation::SetServer { key: "idle_unload_s", value: "0" }, true).unwrap();
         let cfg = npu_runtime::config::Config::load(&p).unwrap();
         assert_eq!(cfg.server.idle_unload(), None, "0 is how idle unload is switched off");
         assert_eq!(cfg.server.memory_ceiling_mb, 2048, "an unnamed key must not move");
 
-        // Re-pointing a scenario must not silently unpin.
-        config_cmd(&p, &ConfigCmd::AddModel { name: "a".into(), scenario: "t.toml".into() }, true).unwrap();
+        // Re-pointing a scenario must not silently disable.
+        apply_mutation(&p, &ModelMutation::AddModel { name: "a", scenario: "t.toml" }, true).unwrap();
         let cfg = npu_runtime::config::Config::load(&p).unwrap();
         assert_eq!(cfg.find("a").unwrap().scenario, "t.toml");
         assert!(cfg.find("a").unwrap().resident);
 
-        config_cmd(&p, &ConfigCmd::Unpin { model: "a".into() }, true).unwrap();
+        apply_mutation(&p, &ModelMutation::SetResident { model: "a", on: false }, true).unwrap();
         assert!(!npu_runtime::config::Config::load(&p).unwrap().find("a").unwrap().resident);
 
         assert!(std::fs::read_to_string(&p).unwrap().contains("# keep me"),
@@ -2271,11 +2484,87 @@ mod tests {
         let p = dir.path().join("engine.toml");
         std::fs::write(&p, "[[model]]\nname = \"a\"\nscenario = \"s\"\n").unwrap();
         let before = std::fs::read_to_string(&p).unwrap();
-        assert!(config_cmd(&p, &ConfigCmd::Pin { model: "nope".into() }, true).is_err());
-        assert!(config_cmd(&p, &ConfigCmd::Unpin { model: "nope".into() }, true).is_err());
-        assert!(config_cmd(&p, &ConfigCmd::RemoveModel { name: "nope".into() }, true).is_err());
-        assert!(config_cmd(&p, &ConfigCmd::Set { key: "max_resident".into(), value: "-1".into() }, true).is_err());
+        assert!(apply_mutation(&p, &ModelMutation::SetResident { model: "nope", on: true }, true).is_err());
+        assert!(apply_mutation(&p, &ModelMutation::SetResident { model: "nope", on: false }, true).is_err());
+        assert!(apply_mutation(&p, &ModelMutation::RemoveModel { name: "nope" }, true).is_err());
+        assert!(apply_mutation(&p, &ModelMutation::SetServer { key: "max_resident", value: "-1" }, true).is_err());
         assert_eq!(std::fs::read_to_string(&p).unwrap(), before, "a refused command writes nothing");
+    }
+
+    #[test]
+    fn model_show_refuses_a_name_the_config_does_not_have() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("engine.toml");
+        std::fs::write(&p, "[[model]]\nname = \"a\"\nscenario = \"s\"\n").unwrap();
+        assert!(model_show(&p, "does-not-exist", false).is_err());
+    }
+
+    #[test]
+    fn show_includes_context_and_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("s.toml"), concat!(
+            "[scenario]\nkind = \"embeddings\"\nname = \"x\"\n",
+            "[model]\nhidden = 768\nff = 3072\nn_heads = 12\nhead_dim = 64\n",
+            "n_layers = 12\nmax_seq = 512\n",
+            "[artifacts]\n",
+        )).unwrap();
+        let cfg_path = dir.path().join("engine.toml");
+        std::fs::write(&cfg_path,
+            format!("[[model]]\nname = \"a\"\nscenario = \"{}\"\n",
+                dir.path().join("s.toml").display())).unwrap();
+        assert!(model_show(&cfg_path, "a", false).is_ok());
+        assert!(model_show(&cfg_path, "does-not-exist", false).is_err(),
+            "an unknown name must be a real error, not a blank report");
+    }
+
+    /// THE regression: `LlmArtifact::load` fails loud (`Err`) on `ToolchainFreshness::Stale`, so
+    /// calling `check_toolchain_freshness` again on an already-loaded artifact can never observe
+    /// Stale -- by the time `load()` has succeeded, Stale is already ruled out. Confirms
+    /// `verbose_detail` reads the hash independently instead, so a genuinely stale decode artifact
+    /// still reports `toolchain=STALE` rather than no detail line at all.
+    #[test]
+    fn verbose_detail_reports_stale_even_though_the_full_artifact_fails_to_load() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("toolchain.lock"), b"PIN=abc\n").unwrap();
+        let current = npu_asr::kernel_registry::current_toolchain_hash(dir.path()).unwrap();
+        assert_ne!(current, "9da6356ac521", "test setup must actually disagree with the stale hash");
+
+        let decode_dir = dir.path().join("decode");
+        std::fs::create_dir_all(&decode_dir).unwrap();
+        let meta = serde_json::json!({
+            "elf": "decode.elf", "kernel_name": "main:sequence",
+            "input_size": 16, "output_size": 8, "scratch_size": 16,
+            "layout": {
+                "x": {"type": "input", "offset": 0, "len": 8},
+                "logits": {"type": "output", "offset": 0, "len": 8},
+                "W": {"type": "scratch", "offset": 0, "len": 16},
+                "rope_global": {"type": "input", "offset": 8, "len": 8},
+            },
+            "inputs": ["x", "rope_global"], "weights": ["W"], "output": "logits",
+            "cache_buffers": [],
+            "scratchpad": {
+                "params": {"kv_off": {"byte_offset": 0, "kind": "addr"}, "sm_mask": {"byte_offset": 4, "kind": "core"}},
+                "kv_param": "kv_off", "mask_param": "sm_mask",
+            },
+            "dims": {"layers": 1, "d_model": 4, "vocab": 4, "head_dim": 4, "S": 8},
+            "host_protocol": {"embed_scale": "none", "rope_theta_global": 1_000_000.0},
+            "toolchain": {"hash": "9da6356ac521"},
+        });
+        std::fs::write(decode_dir.join("meta.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
+
+        // Confirm this actually hits the Stale-fails-loud path inside `load`, not some unrelated
+        // parse failure -- otherwise this test would pass against the old, buggy code too.
+        let err = npu_engine::llm::LlmArtifact::load(&decode_dir).unwrap_err().to_string();
+        assert!(err.contains("toolchain-stale"), "{err}");
+
+        std::fs::write(dir.path().join("s.toml"), concat!(
+            "[scenario]\nkind = \"generate\"\nname = \"x\"\n",
+            "[artifacts]\ndecode = \"decode\"\n",
+        )).unwrap();
+
+        let detail = verbose_detail(Some(&dir.path().to_path_buf()), "s.toml")
+            .expect("a stale decode artifact must still report a detail line");
+        assert!(detail.contains("toolchain=STALE"), "{detail}");
     }
 
     /// The unit name must be READ, not guessed. The first version hardcoded `npu-asr`, which

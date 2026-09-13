@@ -861,7 +861,11 @@ impl LlmArtifact {
     /// Compare `toolchain_hash` (from `meta.json`) against the toolchain.lock found by walking up
     /// from `decode_dir`. Never touches an env var or a fixed repo path -- a production install has
     /// no toolchain.lock at all, and that is a valid, expected state, not an error.
-    fn check_toolchain_freshness(toolchain_hash: &Option<String>, decode_dir: &Path) -> ToolchainFreshness {
+    ///
+    /// Public so a read-only caller (`npu model ls --verbose`/`show`) can report freshness without
+    /// re-deriving this logic -- `LlmArtifact::load` already runs it internally and only prints a
+    /// warning or fails loud; nothing about the verdict itself survives on the loaded struct.
+    pub fn check_toolchain_freshness(toolchain_hash: &Option<String>, decode_dir: &Path) -> ToolchainFreshness {
         let Some(built) = toolchain_hash else {
             return ToolchainFreshness::Unstamped;
         };

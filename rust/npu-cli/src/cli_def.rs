@@ -134,39 +134,12 @@ pub enum Cmd {
         #[command(flatten)] sampling: SamplingArgs,
         #[arg(long)] no_stream: bool,
     },
-    /// The configured models, plus what the service currently has resident.
-    ///
-    /// Answers from the config, so it works with the service down. When the service IS up it merges
-    /// the state answered over the control socket's out-of-band snapshot -- nothing to hang on --
-    /// and prints how old that snapshot is. A `*` in PIN means the running server's pin disagrees
-    /// with the config; `npu config pin`/`unpin` reconcile a running server automatically, and a
-    /// config edited by hand needs `systemctl --user restart xdna-engine` to take effect.
-    Models {
-        /// Machine-readable output. Carries both `pinned` (config) and `live_pinned` (server), which
-        /// the table collapses into one PIN cell, so a script can act on the drift the `*` only flags.
-        #[arg(long)] json: bool,
-    },
-    /// Make a model resident on the running server, now.
-    ///
-    /// Fails rather than evicting when the server is already over `memory_ceiling_mb` -- an explicit
-    /// load is a statement about capacity, so honouring it by dropping someone else's model would
-    /// answer a different question. The refusal names what is holding the budget. Serving a request
-    /// still evicts as before; this is the operator path, not the request path.
-    ///
-    /// Runtime state, not config: it does not edit `engine.toml` and does not survive a restart.
-    /// For that, pin the model (`npu config pin`).
-    Load {
-        /// The configured model to make resident.
-        model: String,
-    },
-    /// Give a model's device memory back now, without stopping the service.
-    ///
-    /// The same release the idle sweep performs, fired by hand: the config entry stays, routing
-    /// still knows what the model is, and the next request that needs it loads it again. This is
-    /// what frees the NPU for another process without `systemctl stop`.
-    Unload {
-        /// The resident model whose device memory to release.
-        model: String,
+    /// Model lifecycle and inventory: what's configured, what's resident, start/stop it now,
+    /// enable/disable it always-on, add/remove it from config, set capability defaults.
+    #[command(subcommand_required = true, arg_required_else_help = true)]
+    Model {
+        #[command(subcommand)]
+        action: ModelCmd,
     },
     /// Weight-checkpoint tooling: bake, inspect, and parity-check.
     // Folded in from the separate `npu-weights` binary AND the top-level `npu bake <name>`, which
@@ -228,14 +201,6 @@ pub enum Cmd {
     #[command(subcommand_required = true, arg_required_else_help = true)]
     Config {
         #[command(subcommand)] action: ConfigCmd,
-        /// Save the edit without applying it to a running service.
-        ///
-        /// The default is to apply it, because a desired-state file that the running service has
-        /// not adopted is two sources of truth and one manual step between them. Use this when the
-        /// edit is meant for a later start, or when a reconcile now would evict a model something
-        /// is mid-way through using.
-        #[arg(long, global = true)]
-        no_reload: bool,
     },
     /// Read-only self-test: device/driver versions, power mode, who holds the device, which
     /// config is in effect and why, whether configured models' artifacts resolve, service status.
@@ -357,43 +322,15 @@ pub enum WeightsCmd {
 pub enum ConfigCmd {
     /// Print the config's own view: `[server]`, defaults, and every `[[model]]` with its pin state.
     ///
-    /// Reads the FILE, not the running server -- unlike `npu models`, nothing here is merged with
+    /// Reads the FILE, not the running server -- unlike `npu model ls`, nothing here is merged with
     /// live state, so it works with the service down. This is also where a pin overcommit or a
     /// pin the admission order will not honour gets surfaced, on purpose: before the write that
     /// would trip it, not after.
     Show,
-    /// Add a model, or repoint an existing one's scenario.
-    ///
-    /// Updates the entry IN PLACE when `name` is already in the config: only `scenario` changes,
-    /// residency and every other key on that model stay as they were. The old writer instead
-    /// dropped the entry and pushed a fresh one, which silently unpinned a model the moment its
-    /// scenario path was corrected.
-    AddModel { name: String, #[arg(value_hint = ValueHint::FilePath)] scenario: String },
-    /// Delete a model's `[[model]]` entry entirely.
-    ///
-    /// Unlike `unpin`, nothing of the model is left behind -- no scenario, no pin state, nothing
-    /// for `npu load`/`npu models` to resolve. Fails on a name the config does not have, the same
-    /// refusal `pin`/`unpin` make: there is nothing to act on, so silently doing nothing would only
-    /// hide the typo.
-    RemoveModel { name: String },
-    /// Pin a model resident: always on. Admitted before any on-demand model at boot/reload, exempt
-    /// from idle unload, never chosen as an eviction victim.
-    ///
-    /// The one exception is the invariant itself: `sum(pinned bytes) <= memory_ceiling_mb`. A pin
-    /// that would push the sum over the ceiling is not silently granted -- it is refused at admission
-    /// (a pin nothing has loaded yet), or demoted (an already-resident pin the ceiling was lowered
-    /// under, or whose own footprint grew), reported either way rather than declined in silence.
-    /// Takes effect immediately on a running server (this command reconciles it automatically
-    /// unless `--no-reload` is given); no restart, no device churn.
-    Pin { model: String },
-    /// Drop a model's residency pin: it becomes swept when idle and evictable again.
-    Unpin { model: String },
     /// Set one `[server]` key. `npu config set --help` lists them.
     ///
     /// The key list is closed on purpose: an unrecognised key would produce a file that still
     /// parses and silently does nothing, which is the one failure a config typo must never have.
-    // Values from SERVER_KEYS, so completion cannot offer a knob the binary does not read, nor
-    // fall behind when one is added.
     #[command(after_long_help = npu_runtime::config_doc::server_key_help_text())]
     Set {
         #[arg(value_parser = PossibleValuesParser::new(
@@ -401,10 +338,88 @@ pub enum ConfigCmd {
         key: String,
         value: String,
     },
+}
+
+#[derive(Subcommand)]
+pub enum ModelCmd {
+    /// The configured models, plus what the service currently has resident.
+    ///
+    /// Answers from the config, so it works with the service down. When the service IS up it merges
+    /// the state answered over the control socket's out-of-band snapshot -- nothing to hang on --
+    /// and prints how old that snapshot is. A `*` in PIN means the running server's pin disagrees
+    /// with the config; `npu model enable`/`disable` reconcile a running server automatically, and a
+    /// config edited by hand needs `systemctl --user restart xdna-engine` to take effect.
+    Ls {
+        /// Machine-readable output. Carries both `pinned` (config) and `live_pinned` (server), which
+        /// the table collapses into one PIN cell, so a script can act on the drift the `*` only flags.
+        #[arg(long)] json: bool,
+        /// Add columns beyond what an operator needs day to day: KV block size, attention-window
+        /// rungs, toolchain freshness, and the full weight-quant breakdown. Developer detail, not
+        /// hidden -- just not printed by default.
+        #[arg(long)] verbose: bool,
+    },
+    /// Config-declared detail for one model: kind, context window, precision, and (for a generate
+    /// model) kv/window/toolchain detail -- everything `ls --verbose` shows from the config side,
+    /// plus SCENARIO, which `ls` doesn't print. It does not read live server status, so it has no
+    /// STATE/MEM/BUSY/pin-drift columns.
+    Show {
+        model: String,
+        /// Machine-readable output.
+        #[arg(long)] json: bool,
+    },
+    /// Make a model resident on the running server, now.
+    ///
+    /// Fails rather than evicting when the server is already over `memory_ceiling_mb` -- an explicit
+    /// start is a statement about capacity, so honouring it by dropping someone else's model would
+    /// answer a different question. The refusal names what is holding the budget. Serving a request
+    /// still evicts as before; this is the operator path, not the request path.
+    ///
+    /// Runtime state, not config: it does not edit `engine.toml` and does not survive a restart.
+    /// For that, enable the model (`npu model enable`).
+    Start {
+        /// The configured model to make resident.
+        model: String,
+    },
+    /// Give a model's device memory back now, without stopping the service.
+    ///
+    /// The config entry stays, routing still knows what the model is, and a real request that needs
+    /// it loads it again on demand. If the model is ENABLED (always-on), this still sticks: it will
+    /// NOT be reloaded by an unrelated config edit or reconcile pass, only by an explicit `npu model
+    /// start`, a re-`enable`, or an actual service restart -- matching Docker's `restart: always`
+    /// semantics, where a manual stop is respected until the daemon itself restarts.
+    Stop {
+        /// The resident model whose device memory to release.
+        model: String,
+    },
+    /// Enable a model: always on. Admitted before any on-demand model at boot/reload, exempt from
+    /// idle unload, never chosen as an eviction victim.
+    ///
+    /// The one exception is the invariant itself: `sum(enabled bytes) <= memory_ceiling_mb`. An
+    /// enable that would push the sum over the ceiling is not silently granted -- it is refused at
+    /// admission (nothing loaded yet), or demoted (an already-resident enable the ceiling was
+    /// lowered under, or whose own footprint grew), reported either way rather than declined in
+    /// silence. Takes effect immediately on a running server (this command reconciles it
+    /// automatically); no restart, no device churn.
+    Enable { model: String },
+    /// Disable a model: it becomes swept when idle and evictable again. Does NOT force it off the
+    /// device right now -- it drains via the ordinary idle sweep/LRU, same as any unpinned model.
+    Disable { model: String },
+    /// Add a model, or repoint an existing one's scenario.
+    ///
+    /// Updates the entry IN PLACE when `name` is already in the config: only `scenario` changes,
+    /// residency and every other key on that model stay as they were. The old writer instead
+    /// dropped the entry and pushed a fresh one, which silently disabled a model the moment its
+    /// scenario path was corrected.
+    Add { name: String, #[arg(value_hint = ValueHint::FilePath)] scenario: String },
+    /// Delete a model's `[[model]]` entry entirely.
+    ///
+    /// Unlike `disable`, nothing of the model is left behind -- no scenario, no enable state, nothing
+    /// for `npu model start`/`ls` to resolve. Fails on a name the config does not have, the same
+    /// refusal `enable`/`disable` make: there is nothing to act on, so silently doing nothing would
+    /// only hide the typo.
+    Rm { name: String },
     /// Set the default model for a capability.
-    // Values come from Capability::ALL, so completion cannot offer a capability this binary does
-    // not implement, nor fall behind when one is added.
-    SetDefault {
+    Default {
         #[arg(value_parser = PossibleValuesParser::new(
             Capability::ALL.iter().map(|c| c.0).collect::<Vec<_>>()))]
         capability: String,
