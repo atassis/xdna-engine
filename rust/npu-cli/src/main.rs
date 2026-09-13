@@ -1067,9 +1067,9 @@ fn model_cmd(path: &Path, action: &ModelCmd, as_json: bool) -> Result<()> {
         // Enable/Disable/Add/Rm/Default all edit engine.toml (or ask the running service to);
         // `--no-reload` isn't exposed on `npu model` today (it lived on `npu config` because only
         // config-shaped edits needed it) -- these five always reconcile, matching `pin`'s existing
-        // default-on behavior. Passing `false` here preserves that.
+        // default-on behavior.
         ModelCmd::Enable { .. } | ModelCmd::Disable { .. } | ModelCmd::Add { .. }
-            | ModelCmd::Rm { .. } | ModelCmd::Default { .. } => model_mutate(path, action, false),
+            | ModelCmd::Rm { .. } | ModelCmd::Default { .. } => model_mutate(path, action),
     }
 }
 
@@ -1147,17 +1147,23 @@ fn model_ls(path: &Path, as_json: bool, _verbose: bool) -> Result<()> {
         None => println!("\n(service not running -- configured models only)"),
     }
     if drifted {
-        println!("* the running server has a different pin than the config -- `npu config pin`/`unpin` \
+        println!("* the running server has a different pin than the config -- `npu model enable`/`disable` \
                   reconcile it automatically; a config edited by hand needs \
                   `systemctl --user restart xdna-engine`");
     }
     Ok(())
 }
 
+/// The refusal for a model name the config does not have -- `model_show`, `RemoveModel` and
+/// `SetResident` (enable/disable) all hit this same case.
+fn no_such_model(name: &str) -> Tagged {
+    Tagged(Code::NoModel, format!("unknown model {name:?} (not in the config)"))
+}
+
 fn model_show(path: &Path, model: &str, as_json: bool) -> Result<()> {
     let cfg = load_cfg(path)?;
     let Some(m) = cfg.find(model) else {
-        return Err(Tagged(Code::NoModel, format!("unknown model {model:?} (not in the config)")).into());
+        return Err(no_such_model(model).into());
     };
     let root = root(&cfg, path).ok();
     let d = declared(root.as_ref(), &m.scenario);
@@ -1325,11 +1331,11 @@ fn read_live_status() -> Option<(u64, serde_json::Value)> {
     Some((now.saturating_sub(written), v))
 }
 
-/// The PIN column. `*` marks a config pin the running server has not adopted yet -- `npu config
-/// pin`/`unpin` reconcile a running server automatically (unless `--no-reload`), so this is the
-/// normal state only for `--no-reload` or a config edited by hand, and the one thing a pin column
-/// has to be able to say. A server too old to publish `pinned` reports `None`, and gets the
-/// config's answer without a drift marker rather than a fabricated disagreement.
+/// The PIN column. `*` marks a config pin the running server has not adopted yet -- `npu model
+/// enable`/`disable` reconcile a running server automatically, so this is the normal state only for
+/// a config edited by hand, and the one thing a pin column has to be able to say. A server too old
+/// to publish `pinned` reports `None`, and gets the config's answer without a drift marker rather
+/// than a fabricated disagreement.
 /// `want`/`live` are the ordinary config-vs-server drift check, unchanged. `pin_honored` catches a
 /// SEPARATE state that drift alone cannot see: `want` and `live` agreeing on "pinned" does not mean
 /// the invariant currently protects it -- a demotion (over `memory_ceiling_mb`) leaves both `true`
@@ -1674,13 +1680,13 @@ fn apply_mutation(path: &Path, m: &ModelMutation, no_reload: bool) -> Result<()>
         }
         ModelMutation::RemoveModel { name } => {
             if !doc.remove_model(name).map_err(|e| anyhow!(e))? {
-                return Err(Tagged(Code::NoModel, format!("unknown model {name:?} (not in the config)")).into());
+                return Err(no_such_model(name).into());
             }
             format!("removed model {name}")
         }
         ModelMutation::SetResident { model, on } => {
             if !doc.set_resident(model, *on).map_err(|e| anyhow!(e))? {
-                return Err(Tagged(Code::NoModel, format!("unknown model {model:?} (not in the config)")).into());
+                return Err(no_such_model(model).into());
             }
             if *on { format!("enabled {model}") } else { format!("disabled {model}") }
         }
@@ -1722,9 +1728,10 @@ fn config_cmd(path: &Path, action: &ConfigCmd) -> Result<()> {
 }
 
 /// `npu model enable/disable/add/rm/default`. `Ls`/`Show`/`Start`/`Stop` never reach here (see
-/// `model_cmd`).
-fn model_mutate(path: &Path, action: &ModelCmd, no_reload: bool) -> Result<()> {
-    apply_mutation(path, &model_mutation_of(action), no_reload)
+/// `model_cmd`). No `--no-reload` on `npu model` (see `model_cmd`'s comment), so this always
+/// reconciles.
+fn model_mutate(path: &Path, action: &ModelCmd) -> Result<()> {
+    apply_mutation(path, &model_mutation_of(action), false)
 }
 
 /// Every registered `NPU_*`/related env var against the LIVE process environment: whether it is
@@ -1767,7 +1774,7 @@ fn flags_cmd(as_json: bool) -> Result<()> {
 /// A footprint provider backed by a real `EngineLoader` rooted at `root`: `Config::pin_overcommit`
 /// (and anything else that needs "how many bytes does this model cost, without loading it") takes
 /// an estimator rather than owning device state, and this is the host-only, service-may-be-down one
-/// -- `npu config show`/`npu config pin` both need to answer this with no service running.
+/// -- `npu config show`/`npu model enable` both need to answer this with no service running.
 fn declared_footprint_fn(root: &Path) -> impl Fn(&ModelCfg) -> u64 {
     let loader = EngineLoader { root: root.to_path_buf() };
     move |m: &ModelCfg| loader.declared_footprint(m).unwrap_or(0)
@@ -2329,6 +2336,14 @@ mod tests {
         assert!(apply_mutation(&p, &ModelMutation::RemoveModel { name: "nope" }, true).is_err());
         assert!(apply_mutation(&p, &ModelMutation::SetServer { key: "max_resident", value: "-1" }, true).is_err());
         assert_eq!(std::fs::read_to_string(&p).unwrap(), before, "a refused command writes nothing");
+    }
+
+    #[test]
+    fn model_show_refuses_a_name_the_config_does_not_have() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("engine.toml");
+        std::fs::write(&p, "[[model]]\nname = \"a\"\nscenario = \"s\"\n").unwrap();
+        assert!(model_show(&p, "does-not-exist", false).is_err());
     }
 
     /// The unit name must be READ, not guessed. The first version hardcoded `npu-asr`, which
