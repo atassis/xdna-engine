@@ -133,7 +133,7 @@ note "published $n file(s) -> $DEST  (pin $stamp)"
 # otherwise-successful publish; it should be loud so the gap doesn't go quiet again.
 GEN_MANIFEST="${GEN_KERNEL_MANIFEST_BIN:-}"
 if [ -z "$GEN_MANIFEST" ]; then
-  target_dir="$(cd "$REPO/rust" && cargo metadata --format-version 1 --no-deps 2>/dev/null \
+  target_dir="$(cd "$REPO/rust" && cargo metadata --format-version 1 --no-deps \
     | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])' 2>/dev/null)"
   [ -n "$target_dir" ] || target_dir="$REPO/rust/target"
   GEN_MANIFEST="$target_dir/release/gen_kernel_manifest"
