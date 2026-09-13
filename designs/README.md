@@ -48,7 +48,7 @@ found, not a runtime guarantee for every code path or feature flag.
 
 | Design | Build model | What it is | Engine dispatch |
 |---|---|---|---|
-| `decode_fused/` | direct python/IRON | fused Qwen3/Gemma decode step: QKV, MLP, attention, argmax, cross-attn | **yes** -- `rust/npu-gemma`, `rust/npu-engine/src/llm/npu_decode.rs`, the Whisper decoder's `verify_llm_decode.py`/`gen_projout.py` path |
+| `decode_fused/` | direct python/IRON | fused Qwen3/Gemma decode step: QKV, MLP, attention, argmax, cross-attn | **yes** -- `rust/npu-engine/src/llm/npu_decode.rs`, the Whisper decoder's `verify_llm_decode.py`/`gen_projout.py` path |
 | `whole_array_fused/` | sync+Makefile | 8-column whole-array GEMM family: plain/modal/silu/gelu/int8 epilogues | **yes** -- `rust/npu-asr/src/block.rs` (`WAEpilogue::new(..,"silu",..)`), `ctx2.rs`, `engines.rs` |
 | `mha_decode/` | sync+Makefile | resident single-query streaming/flash MHA | **yes** -- `rust/npu-asr/src/ctx_decode.rs::attn()` (public call site, not just a loader comment) |
 | `ctx_ln/` | sync+Makefile | two-pass on-chip LayerNorm (normalize-only; host applies affine) | **yes, opt-in** -- `rust/npu-asr/src/ctx_ln.rs::CtxLn`, wired through `block.rs` behind the `two_ctx` feature |

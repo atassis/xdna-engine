@@ -27,7 +27,7 @@ request path. Unifying them is open work, not a shipped property; see "Known sea
 
 ## Crates
 
-17 workspace members (`rust/Cargo.toml`). `cargo build` at the workspace root builds the 16
+16 workspace members (`rust/Cargo.toml`). `cargo build` at the workspace root builds the 15
 `default-members`; `npu-probes` is excluded and built on request.
 
 | Crate | Responsibility |
@@ -42,7 +42,6 @@ request path. Unifying them is open work, not a shipped property; see "Known sea
 | `npu-asr` / `npu-asr-host` | GigaAM-v3 encoder on the NPU (`npu-asr`) and its pure host-CPU reference math (`npu-asr-host`). |
 | `npu-parakeet` | Parakeet-TDT FastConformer encoder (rel-pos attention, depthwise conv1d k=9, /8 conv2D subsample). |
 | `npu-whisper` | Whisper-small encoder + decoder reference and the on-NPU decode path. |
-| `npu-gemma` | Gemma 3 small-LLM decoder. SCAFFOLD: reference math, a `Brick` decode schedule and sampling, but no serving path - nothing depends on it and it depends on no other crate here. |
 | `npu-sr` | Super-resolution engine: frame in / frame out video upscaling (ESPCN, EDSR). Own schedule JSON, own `SrEngine` ABI, drives `npu-xrt` directly. |
 | `npu-sr-capi` | C ABI over `npu-sr` (`libxdna_sr.so`) for the ffmpeg `vf_xdna_sr` filter and other embedders. |
 | `npu-capi` | C ABI over `npu-engine` (cdylib + staticlib, cbindgen header) for in-process embedding from any language. |
@@ -89,7 +88,7 @@ Where the tree does not yet match the story above. Named here so a reader is not
   and ESM model implementations that happen to share its manifest.
 - **The capability set is closed.** `ModelKind { Asr, Embed }` is threaded through
   `api.rs`, `pipeline.rs`, `loader.rs`, `actor.rs` and `select.rs`, so a third modality means
-  editing all five. This is why `npu-sr` and `npu-gemma` sit outside the request path.
+  editing all five. This is why `npu-sr` sits outside the request path.
 - **Kernel binaries are selected by hardcoded path.** Model crates name xclbins as string
   literals with shape, tile, column count and variant encoded in the filename (for example
   `final_512x1024x4096_64x32x128_8c_modalsilu.xclbin`). There is no machine-readable

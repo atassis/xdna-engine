@@ -1,18 +1,19 @@
 //! Token-level sampling over a logits VIEW: temperature, top-k, top-p (nucleus), and
 //! repetition/frequency/presence penalties.
 //!
-//! Copied from `npu-gemma::sampling` and fixed for one defect: the original took a bare
-//! `&[f32]` indexed by TOKEN ID, so `sample()`/`argmax()` returned a raw array index (a token id
-//! only for a full-vocabulary array) and `apply_penalties`'s `logits.get_mut(tok as usize)` silently
-//! dropped the penalty for any history token outside the array. [`LogitView`] makes the index space
-//! explicit -- full vocab is the identity view, a top-k slice is an explicit one -- so every return
-//! is a real token id and a history token missing from the view is a counted, reported decision
-//! ([`SampleOutcome::penalties_skipped`]), never a silent no-op.
+//! Ported from this workspace's retired `npu-gemma` crate (see git history) and fixed for one
+//! defect: the original took a bare `&[f32]` indexed by TOKEN ID, so `sample()`/`argmax()` returned
+//! a raw array index (a token id only for a full-vocabulary array) and `apply_penalties`'s
+//! `logits.get_mut(tok as usize)` silently dropped the penalty for any history token outside the
+//! array. [`LogitView`] makes the index space explicit -- full vocab is the identity view, a top-k
+//! slice is an explicit one -- so every return is a real token id and a history token missing from
+//! the view is a counted, reported decision ([`SampleOutcome::penalties_skipped`]), never a silent
+//! no-op.
 //!
 //! **Default is GREEDY** (`SamplingConfig::default()` has `temperature: 0.0`). `sample()`
 //! short-circuits straight to [`argmax`] when `temperature <= 0.0` -- no RNG draw, no penalty/top-k/
-//! top-p pass, byte-for-byte the same greedy path `npu-gemma::sampling` validates against the host
-//! oracle.
+//! top-p pass, byte-for-byte the same greedy path this module validates against the host oracle
+//! below.
 //!
 //! Pipeline order (mirrors the common llama.cpp/HF convention): penalties -> temperature -> top-k ->
 //! top-p -> softmax -> inverse-CDF draw via the seeded [`SplitMix64`] PRNG. All internal math runs in

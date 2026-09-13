@@ -70,12 +70,12 @@ N = int(os.environ.get("PROBE_N", 4096))
 TILE = int(os.environ.get("PROBE_TILE", 1024))
 # PROBE_PATH=fused    -> OperatorSequence (emits ELFs for the Rust engine; its Python
 #                        callable path appears to be exercised by nobody)
-# PROBE_PATH=sequence -> OperatorSequence, the path gen_gemma_decode drives to token parity
-#                        and the one that received the residency fix in 2970f8a
+# PROBE_PATH=sequence -> OperatorSequence, the path the retired gen_gemma_decode.py drove to
+#                        token parity and the one that received the residency fix in 2970f8a
 PATH = os.environ.get("PROBE_PATH", "fused")
 # PROBE_OP=identity -> the hand-written Identity op in this directory
 # PROBE_OP=memcopy  -> IRON's BUILT-IN MemCopy. This is the discriminator: gen_gemma_decode
-#                     drives built-in operators to 8/8 token parity on this same runtime, so
+#                     drove built-in operators to 8/8 token parity on this same runtime, so
 #                     if a built-in round-trips and the hand-written one does not, the fault
 #                     is in how a locally-defined MLIROperator declares itself, not the path.
 OP = os.environ.get("PROBE_OP", "identity")

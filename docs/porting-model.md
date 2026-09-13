@@ -17,9 +17,12 @@ Two different things count as "a new model" here, and they cost differently:
   a vision backbone. This is the cheap path: BERT-family embeddings live entirely as
   three small files inside `npu-engine` (`rust/npu-engine/src/bert/`).
 - **A new architecture family** -- an autoregressive decoder, or anything whose control
-  flow doesn't fit `Encoder::forward_last`'s single forward pass. This gets its own
-  crate (`npu-whisper`, `npu-parakeet`, `npu-gemma` are each a crate), and reuses the
-  fused-decode / KV-cache primitives rather than the `Encoder` trait.
+  flow doesn't fit `Encoder::forward_last`'s single forward pass. An encoder-decoder gets
+  its own crate (`npu-whisper`, `npu-parakeet`), reusing the fused-decode / KV-cache
+  primitives rather than the `Encoder` trait. A decoder-only small LLM is cheaper still:
+  it is DATA over the generic `designs/decode_fused/llm_decode_spec.py` rail (an
+  `LlmSpec` entry, driving `gen_llm_decode.py`) rather than a new crate at all -- see
+  Qwen3, Gemma 3 and Gemma 4-12B, none of which own a model-specific crate.
 
 `ARCHITECTURE.md`'s "Known seams" section is honest about the cost of the second path:
 model placement has no single rule (GigaAM is `npu-asr`, Parakeet is `npu-parakeet`, BERT
@@ -167,13 +170,13 @@ pattern (`make -C <mlir-aie-example-dir> NPU2=1`) against the `mlir-aie` submodu
 `scripts/sync_kernels.sh` copies the canonical kernel/design sources in.
 
 For a decoder-only LLM specifically, don't estimate the job from scratch -- read
-`rust/npu-gemma/src/lib.rs`'s module doc comment first. It is a worked port-map table for
-Gemma 3: most rows are REUSE (fused-decode GEMV, KV-cache write via `StridedCopy`,
-softmax, on-chip argmax -- all already shipped for the Whisper decoder) or WIRE (an
-operator that exists in the vendored IRON operator library but isn't plumbed into this
-engine yet, e.g. `rms_norm`, `rope`, `swiglu_decode`), and exactly one row needed new
-kernel authoring (`head_dim=256` in the prefill flash-attention kernel, which hardcodes
-`d=64`). Write the equivalent op-by-op table for your model before estimating the work.
+`designs/decode_fused/llm_decode_spec.py`'s `LlmSpec` entries for Qwen3, Gemma 3 and
+Gemma 4-12B first, and `gen_llm_decode.py`'s docstring for how a spec becomes a fused
+ELF. Most of a new model's ops are REUSE (fused-decode GEMV, KV-cache write via
+`StridedCopy`, softmax, on-chip argmax) or WIRE (an operator that exists in the vendored
+IRON operator library but isn't plumbed into this engine yet, e.g. `rms_norm`, `rope`,
+`swiglu_decode`); genuinely new kernel authoring is the exception, not the rule. Write
+the equivalent op-by-op table for your model before estimating the work.
 
 ## 4. Gating correctness
 
@@ -201,8 +204,8 @@ Four independent gates, each catching a different class of mistake:
    labeled set, or agreement against a known CPU/ONNX baseline) rather than skip this
    gate.
 
-**CI coverage.** `.github/workflows/rust-ci.yml` builds, clippies and tests exactly three
-crates on a hosted runner -- `npu-asr-host`, `npu-gemma`, `npu-weights` -- because nothing
+**CI coverage.** `.github/workflows/rust-ci.yml` builds, clippies and tests exactly two
+crates on a hosted runner -- `npu-asr-host`, `npu-weights` -- because nothing
 else in the workspace compiles without XRT and onnxruntime headers/libs. This is exactly
 why a new `Arch` implementation and its parity test belong in `npu-weights`: it's the one
 place a new model's weight-conversion correctness is machine-checked without hardware.

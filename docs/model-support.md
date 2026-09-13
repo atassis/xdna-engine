@@ -78,8 +78,8 @@ encoder does not implement.
 | Model | Status | Evidence |
 | --- | --- | --- |
 | Qwen3-0.6B | Supported | `scenarios/generate-qwen3-0.6b.toml`; `rust/npu-engine/src/llm/npu_decode.rs`'s `NpuDecodeStep` drives a real `ElfResident`/`FusedArena` device dispatch, one fused ELF per token |
+| Gemma 3-270M, Gemma 4-12B | Supported | `scenarios/generate-gemma3-270m.toml`, `scenarios/generate-gemma4-12b.toml`; the same `NpuDecodeStep` dispatch as Qwen3, via `designs/decode_fused/llm_decode_spec.py`'s `GEMMA3_270M`/`GEMMA4_12B` specs |
 | opt-125m | Host-only | see below |
-| Gemma 3 (270m, e2b bring-up) | Host-only | see below |
 
 **opt-125m** (`rust/npu-probes/src/bin/opt125m_decode.rs`) is a greedy-decode host
 reference validated token-for-token against the HF golden (`scripts/opt125m_reference.py`),
@@ -90,18 +90,10 @@ It is dimension-identical to Whisper-small (768/12/12/3072/64), so wiring it to 
 existing on-NPU decode kernels is plausible future work, but it has not happened in this
 tree.
 
-**Gemma 3** (`rust/npu-gemma`) is, in its own `Cargo.toml` description, a "Phase 0
-scaffold (host-CPU reference + the NPU port map)." The host reference
-(`scripts/gemma_ref_generate.py`) reproduces `transformers`' output on CPU. The `npu`
-Cargo feature (off by default) compiles a routing skeleton, but
-`rust/npu-gemma/src/npu.rs`'s `GemmaNpuDecoder::step` unconditionally returns
-`NpuError::DeviceBackendUnlinked` -- there is no device backend to link yet. Nothing in
-the engine depends on this crate and it depends on nothing else in the workspace.
-
-The top-level README currently describes both of these as "reusing the resident-FFN +
-fused-decode + KV primitives" alongside Qwen3, which reads as one tier of NPU support
-across all three. From the code, only Qwen3 is there; opt-125m and Gemma 3 are host-side
-research/scaffolding toward that goal, not instances of it yet.
+The top-level README's "reusing the resident-FFN + fused-decode + KV primitives"
+description is accurate for Qwen3, Gemma 3 and Gemma 4-12B -- all three dispatch through
+the same `NpuDecodeStep`. It does not describe opt-125m, which is host-side
+research/scaffolding toward that goal, not an instance of it yet (see above).
 
 ## Vision
 

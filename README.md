@@ -21,6 +21,8 @@ freeing the CPU - see [docs/data-movement-thesis.md](docs/data-movement-thesis.m
 
 - **LLM decode** - Qwen3-0.6B generates on the NPU: the whole MLP block and the whole QKV
   head each compile to one design, and a token costs 170 dispatches against 8 designs.
+  Gemma 3-270M and Gemma 4-12B generate on the same fused-decode rail, as data
+  (`designs/decode_fused/llm_decode_spec.py`) rather than a second implementation.
 - **ASR** - GigaAM-v3 and Parakeet FastConformer encoders on the NPU; Whisper-small
   encoder + a full 12-layer decoder fused into a single ELF dispatch.
 - **Embeddings** - BGE-base on the NPU, served over an OpenAI-compatible `/v1/embeddings`
@@ -29,9 +31,9 @@ freeing the CPU - see [docs/data-movement-thesis.md](docs/data-movement-thesis.m
   through the `xdna-sr` CLI and an ffmpeg filter rather than `npu serve`.
 - **Precision** - selectable bf16 / bfp16 / int8, per-op, gated on WER/accuracy.
 
-Weights convert and match a reference for MiniLM, E5, ModernBERT, ViT, DINOv2, ResNet-18,
-opt-125m and Gemma 3, but their forward pass still runs on the host. The rails those models
-need are the ones the LLM decode work is building now, so finishing them is wiring, not
+Weights convert and match a reference for MiniLM, E5, ModernBERT, ViT, DINOv2, ResNet-18
+and opt-125m, but their forward pass still runs on the host. The rails those models need
+are the ones the LLM decode work is building now, so finishing them is wiring, not
 research.
 
 Representative measured results (host: AMD Ryzen AI 9 465, XDNA2, Linux):

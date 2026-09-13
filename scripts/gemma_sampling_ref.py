@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Host-CPU reference sampler -- the correctness oracle for `npu-gemma::sampling` (Rust).
+"""Host-CPU reference sampler -- the correctness oracle for `npu_engine::llm::sampling` (Rust).
 
 Pure Python (stdlib `math` only, no numpy/torch): implements the IDENTICAL algorithm and the SAME
-SplitMix64 PRNG, bit-for-bit, as `rust/npu-gemma/src/sampling.rs`. A fixed seed + fixed logits vector
+SplitMix64 PRNG, bit-for-bit, as `rust/npu-engine/src/llm/sampling.rs`. A fixed seed + fixed logits vector
 must produce the identical token id in both languages -- this is the "not vibes" correctness gate the
 Rust unit tests (`sampling::tests::cross_lang_*`) bake in as expected constants. Re-runnable by hand to
 regenerate those constants if the algorithm ever changes (deliberately NOT wired into `cargo test` --
@@ -125,7 +125,7 @@ def sample(logits, history, temperature, top_k, top_p, rep, freq, pres, rng):
 
 
 if __name__ == "__main__":
-    # Fixed vectors, mirrored 1:1 in rust/npu-gemma/src/sampling.rs unit tests (cross_lang_* / SAMPLE_LOGITS).
+    # Fixed vectors, mirrored 1:1 in rust/npu-engine/src/llm/sampling.rs unit tests (cross_lang_* / SAMPLE_LOGITS).
     logits = [1.0, 3.0, 2.0, 0.5, 4.0, -1.0, 2.5, 0.0]
     history = [1, 1, 4]
 

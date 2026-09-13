@@ -7,9 +7,9 @@ on:
 
 jobs:
   # A hosted runner has neither XRT nor onnxruntime, so it cannot build the crates that link them.
-  # It CAN build the three pure-host crates, which run 73 of the 146 workspace tests (measured, not
-  # counted from #[test] attributes -- several npu-weights integration tests need artifacts that are
-  # not in the repo and execute nothing).
+  # It CAN build the two pure-host crates, which run 78 workspace tests (measured, not counted from
+  # #[test] attributes -- several npu-weights integration tests need artifacts that are not in the
+  # repo and execute nothing).
   #
   # This is deliberately the WEAKER half of the gate. It does NOT cover npu-parakeet, npu-xrt,
   # npu-capi or npu-sr-capi, so of the three breakages that motivated scripts/ci_gate.sh it would
@@ -32,13 +32,13 @@ jobs:
         working-directory: rust
         env:
           RUSTFLAGS: ""
-        run: cargo clippy -p npu-asr-host -p npu-gemma -p npu-weights --all-targets
+        run: cargo clippy -p npu-asr-host -p npu-weights --all-targets
 
       - name: test (host-only crates)
         working-directory: rust
         env:
           RUSTFLAGS: ""
-        run: cargo test -p npu-asr-host -p npu-gemma -p npu-weights
+        run: cargo test -p npu-asr-host -p npu-weights
 
   # ARCHITECTURE.md and scripts/README.md both state counts of the things they index. Nothing ran
   # scripts/check_selfdescribing_indexes.py, so `delete npu-vod-chain-skeleton` (313ea34) left a

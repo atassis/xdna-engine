@@ -19,11 +19,11 @@ executed nothing. `ci_gate.sh` runs with `--nocapture` and greps the log for `^S
 specifically so a passing-by-skipping test doesn't read as a real pass -- but only if you
 read that part of the output.
 
-**Public CI** (`.github/workflows/rust-ci.yml`) builds, lints, and tests exactly three
-crates on a hosted runner -- `npu-asr-host`, `npu-gemma`, `npu-weights` -- because a
+**Public CI** (`.github/workflows/rust-ci.yml`) builds, lints, and tests exactly two
+crates on a hosted runner -- `npu-asr-host`, `npu-weights` -- because a
 hosted runner has neither XRT nor `onnxruntime` and cannot link anything else in the
 workspace. The workflow's own comment calls this "deliberately the WEAKER half of the
-gate." It runs 73 of the repo's workspace tests, none of which touch real NPU hardware.
+gate." It runs 78 of the repo's workspace tests, none of which touch real NPU hardware.
 
 ## 2. Weight-checkpoint parity -- is the conversion correct
 

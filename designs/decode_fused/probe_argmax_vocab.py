@@ -17,7 +17,7 @@ Two things are worth checking before trusting it there, and neither is obvious:
     tie-break rule (argmax_slice.cc uses strict `>`, so first-max wins, matching numpy).
 
 This runs the op standalone -- no decode graph, no weights -- so it is independent of the
-open port/re-pin decision on gen_gemma_decode.py.
+now-retired gen_gemma_decode.py path (see git history).
 
 Run under the NPU lock:  python probe_argmax_vocab.py
 """

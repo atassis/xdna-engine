@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Decoder-LLM whole decode stack as ONE fused ELF, built from an `LlmSpec`.
 
-Generalises gen_gemma_decode.py from one checkpoint to the spec vocabulary in llm_decode_spec.py:
+Generalises the retired gen_gemma_decode.py (see git history) from one checkpoint to the spec
+vocabulary in llm_decode_spec.py:
 a MODEL is a spec plus its weights, not a generator. Same deep-C mechanism as the shipped Whisper
 fused decode (gen_decode.py): the ELF is CONSTANT across tokens; per token the host writes `x`, the
 RoPE angle row, and two scratchpad params (`kv_off`, `sm_mask`), then dispatches ONCE.

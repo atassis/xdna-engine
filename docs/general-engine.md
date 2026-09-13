@@ -138,15 +138,14 @@ shares the device and the weight-loading approach, not the request path -- it is
 through the HTTP server or the `Model`/`Scenario` types described here or in
 [api.md](api.md).
 
-**Small-LLM decode reuses primitives, not code, across models.** Qwen3 is served today through
-`npu_engine::llm` (`NpuDecodeStep` driving a fused-decode ELF, wired into the registry's
-`Generate` arm). Gemma 3's bring-up lives in the separate `npu-gemma` crate, which
-`ARCHITECTURE.md` marks a "SCAFFOLD: reference math, a `Brick` decode schedule and sampling,
-but no serving path -- nothing depends on it and it depends on no other crate here." Both reuse
-the same conceptual primitives (resident FFN, fused decode, a KV cache) named in the top-level
-README, but that reuse is currently at the level of technique, not shared Rust: Gemma is not
-reachable through a scenario TOML or the registry the way GigaAM, Parakeet, BERT, and ESM-2
-are.
+**Small-LLM decode reuses primitives, not code-per-model, across models.** Qwen3, Gemma 3 and
+Gemma 4-12B are all served through the same `npu_engine::llm` path (`NpuDecodeStep` driving a
+fused-decode ELF, wired into the registry's `Generate` arm) -- none of them owns a model-specific
+crate. A model is an `LlmSpec` entry in `designs/decode_fused/llm_decode_spec.py`
+(`GEMMA3_270M`, `GEMMA4_12B` alongside Qwen3's own entry) plus a scenario TOML
+(`scenarios/generate-gemma3-270m.toml`, `scenarios/generate-gemma4-12b.toml`), the same shape
+Qwen3 uses. This is the "models are data over reusable op-types" rail: adding a model means
+writing its spec and authoring only the op-types not already in the vocabulary, not a new crate.
 
 **Kernel-binary selection is a per-model hardcoded path, not a lookup.** A model crate names
 its xclbin as a string literal encoding shape, tile, column count, and precision variant in the

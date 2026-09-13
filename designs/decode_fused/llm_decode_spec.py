@@ -262,7 +262,7 @@ def gemv_tile_output(M, K, cols=8, tsi=None):
 
     Taking m_output = M//cols (the largest the asserts allow) blows constraint 2 on the lm-head:
     vocab 151936 -> 18992 elements -> 37984 B, double-buffered 76 KB against 64 KB of L1. Both the
-    tracked gen_gemma_decode.py (vocab//8 = 32768) and a naive port hit this.
+    retired gen_gemma_decode.py (vocab//8 = 32768, see git history) and a naive port hit this.
 
     Returns (tile_size_input, tile_size_output).
     """
@@ -567,9 +567,10 @@ class LlmSpec:
         `M % cols == 0` and `(M//cols) % tsi == 0`. GEMV additionally needs `K % 64 == 0`
         (kernel_vector_size); the K side is every dim that feeds a projection.
 
-        NOTE this is why the tracked gen_gemma_decode.py cannot build as written: its op_kv passes
-        tile_size_output=head_dim//2=128 while M//cols is 32, violating `m_output <= M//cols`. The
-        device run that gated Gemma used a scratchpad diag copy, not that file.
+        NOTE this is why the retired gen_gemma_decode.py (see git history) could not build as
+        written: its op_kv passed tile_size_output=head_dim//2=128 while M//cols is 32, violating
+        `m_output <= M//cols`. The device run that gated Gemma used a scratchpad diag copy, not
+        that file.
         """
         gaps = self.unimplemented()
         if gaps:
@@ -761,7 +762,7 @@ class LlmSpec:
 
 
 # Gemma-3 270M -- the checkpoint the rail was brought up on (8/8 greedy token parity on device,
-# 2026-07-19). Dims from unsloth/gemma-3-270m-it config.json; mirrors rust/npu-gemma GEMMA3_270M.
+# 2026-07-19). Dims from unsloth/gemma-3-270m-it config.json.
 GEMMA3_270M = LlmSpec(
     name="gemma3-270m", d_model=640, n_layers=18, n_q_heads=4, n_kv_heads=1, head_dim=256,
     ffn=2048, vocab=262144, eps=1e-6, act="gelu_tanh", norm_gain="one_plus_w",

@@ -18,8 +18,8 @@ with `onnx_asr` importable. `install.sh` preflights both and documents exactly w
 checks and where (`XRT_INC_DIR`/`XRT_LIB_DIR`/`ONNX_ASR_VENV`) -- read its top comment
 before debugging a build failure that's actually a missing prerequisite.
 
-If you don't have XRT or onnxruntime available, three crates build and test standalone
-with no NPU and no ONNX runtime: `npu-asr-host`, `npu-gemma`, `npu-weights`. That's also
+If you don't have XRT or onnxruntime available, two crates build and test standalone
+with no NPU and no ONNX runtime: `npu-asr-host`, `npu-weights`. That's also
 exactly the subset `.github/workflows/rust-ci.yml` runs on a hosted runner.
 
 Building AIE kernels/xclbins is a separate toolchain path (`toolchain.lock`,
@@ -39,14 +39,14 @@ This runs `cargo clippy --workspace --all-targets`, `cargo test --workspace`, an
 `cargo check -p npu-parakeet --no-default-features` (the last one guards npu-parakeet's
 contract that it builds standalone, without XRT). It needs XRT and onnxruntime, so run it
 on a machine that has them -- it's the real gate; the hosted CI workflow is a weaker
-subset that covers only the three host-only crates.
+subset that covers only the two host-only crates.
 
-If your change is confined to those three crates and you don't have XRT/onnxruntime:
+If your change is confined to those two crates and you don't have XRT/onnxruntime:
 
 ```
 cd rust
-cargo clippy -p npu-asr-host -p npu-gemma -p npu-weights --all-targets
-cargo test -p npu-asr-host -p npu-gemma -p npu-weights
+cargo clippy -p npu-asr-host -p npu-weights --all-targets
+cargo test -p npu-asr-host -p npu-weights
 ```
 
 For a kernel or IRON design change under `aie_kernels/`/`designs/`, run

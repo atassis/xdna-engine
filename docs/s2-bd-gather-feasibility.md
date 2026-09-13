@@ -133,7 +133,7 @@ input DMA start offset is controlled entirely by a host-written `ScratchpadParam
 re-dispatches the SAME compiled ELF three times with three different offsets, asserting exact
 output each time (`test.py:53-78`). And it is **already shipping in this exact repo**: the
 per-token KV-cache-append offset `kv_off` used by `designs/decode_fused/gen_decode.py:
-193-198`, `gen_gemma_decode.py:123-128`, and gated by
+193-198`, the retired `gen_gemma_decode.py:123-128` (see git history), and gated by
 `decode_fused/verify_fused_decode_sp.py:110-111,218` (`sp.write("kv_off", step * HD)`) is the
 exact same `offset_parameter` mechanism, already proven on-device for a different per-token
 runtime offset. `docs/aie2p-architecture-and-roofline.md:103` records it: "RTP scratchpad | per-token
