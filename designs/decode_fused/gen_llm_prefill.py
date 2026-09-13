@@ -403,6 +403,11 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
         _aie_utils.set_current_device(_from_name(os.environ["AIE_DEVICE"], n_cols=None))
 
     ctx = AIEContext()
+    # ALLOC_SCHEME_ALL: EXPERIMENT ONLY, device-wide allocation_scheme for the tile-sharing
+    # investigation on aiecc-dma-lowering-may-be-superlinear item 1 -- not a default, not wired
+    # for real. Applies to every operator; GEMM_ALLOC_SCHEME (gemm_for) overrides it for GEMM
+    # specifically if both are set.
+    alloc_all = os.environ.get("ALLOC_SCHEME_ALL")
     # PREFILL_BFP16=0 turns OFF IRON GEMM's default bfp16 emulation.
     #
     # Not a tuning knob -- a NUMERICS one, and it is the axis that decides whether batched prefill
@@ -493,12 +498,17 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
             if (blocking and not qkw) else {}
         blk.update(extra or {})
         blk.update(qkw)
+        # GEMM_ALLOC_SCHEME: EXPERIMENT ONLY, for the tile-sharing investigation on
+        # aiecc-dma-lowering-may-be-superlinear item 1 -- not a default, not wired for real.
+        alloc = os.environ.get("GEMM_ALLOC_SCHEME") or alloc_all
+        if alloc:
+            blk["allocation_scheme"] = alloc
         return GEMM(M=M, K=K, N=Nout, b_col_maj=b_col_maj, context=ctx,
                     emulate_bf16_mmul_with_bfp16=emulate, prio_accuracy=prio_acc,
                     round_conv_even=round_even, **blk, **ch.gemm_kwargs)
 
     op_norm = RMSNorm(size=M * D, num_aie_columns=cols, num_channels=1, tile_size=D,
-                      weighted=True, epsilon=sp.eps, context=ctx)
+                      weighted=True, epsilon=sp.eps, context=ctx, allocation_scheme=alloc_all)
     # PREFILL_MERGE_QKNORM: run the q-norm as `grp` chunks of the K-NORM'S OWN DESIGN instead of
     # one wider design of its own -- see `attn_ops` below for the per-geometry construction. Both
     # normalise independent head_dim tiles, q_dim is exactly grp*kv_dim BY CONSTRUCTION (grp is
@@ -540,16 +550,18 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
                              f"kv_dim ({kvd}) at head_dim={hd}; this geometry does not split evenly")
         sfx = f"_hd{hd}" if multi_geom else ""
         op_qn = RMSNorm(size=M * qd, num_aie_columns=cols, num_channels=1, tile_size=hd,
-                        weighted=True, epsilon=sp.eps, context=ctx)
+                        weighted=True, epsilon=sp.eps, context=ctx, allocation_scheme=alloc_all)
         op_kn = RMSNorm(size=M * kvd, num_aie_columns=cols, num_channels=1, tile_size=hd,
-                        weighted=True, epsilon=sp.eps, context=ctx)
+                        weighted=True, epsilon=sp.eps, context=ctx, allocation_scheme=alloc_all)
         # Gemma-4's gainless value-norm rides the SAME design as op_kn (decode's identical move,
         # gen_llm_decode.py:1305-1317): a weighted RMSNorm fed decode's shared `ones_h{hd}` gain is
         # bit-identical to an unweighted one, and reusing the object -- not building a `weighted=
         # False` twin -- makes the v-norm and k-norm runs one contiguous same-design block.
         op_vn = op_kn if sp.v_norm else None
-        op_rq = RoPE(rows=M * Hq, cols=hd, angle_rows=M, num_aie_columns=cols, context=ctx)
-        op_rk = RoPE(rows=M * hkv, cols=hd, angle_rows=M, num_aie_columns=cols, context=ctx)
+        op_rq = RoPE(rows=M * Hq, cols=hd, angle_rows=M, num_aie_columns=cols, context=ctx,
+                    allocation_scheme=alloc_all)
+        op_rk = RoPE(rows=M * hkv, cols=hd, angle_rows=M, num_aie_columns=cols, context=ctx,
+                    allocation_scheme=alloc_all)
         # One kv head's run of rows, and where each role's block sits inside it. A layer with no
         # v_proj (attention_k_eq_v) concatenates grp+1 blocks, not grp+2 -- verified against the
         # decode dump: L*_Wqkv is 62,914,560 B at sliding (grp+2=4 blocks) and 66,846,720 B at
@@ -658,18 +670,22 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
         raise ValueError(f"PREFILL_ATTN_ORDER={attn_order!r}; want off|grouped|interleaved")
     n_il = int(os.environ.get("PREFILL_ATTN_HEADS", Hq))
     op_sm = Softmax(rows=Hq * M, cols=S, num_aie_columns=cols, num_channels=1,
-                    context=ctx, **sm_kw)
+                    context=ctx, allocation_scheme=alloc_all, **sm_kw)
     # One design serves every head: same rows, same cols. Only how many times the runlist SWITCHES
     # to it changes between the arms.
     op_sm_head = (Softmax(rows=M, cols=S, num_aie_columns=cols, num_channels=1,
-                          context=ctx, **sm_kw) if attn_order != "off" else None)
+                          context=ctx, allocation_scheme=alloc_all, **sm_kw)
+                  if attn_order != "off" else None)
     if sp.act == "silu":
-        op_act = SiLU(size=M * FF, num_aie_columns=cols, tile_size=FF // cols, context=ctx)
+        op_act = SiLU(size=M * FF, num_aie_columns=cols, tile_size=FF // cols, context=ctx,
+                      allocation_scheme=alloc_all)
     else:
         op_act = GELU(size=M * FF, num_aie_columns=cols, num_channels=1,
-                      tile_size=FF // cols, context=ctx)
-    op_mul = ElementwiseMul(size=M * FF, num_aie_columns=cols, tile_size=FF // cols, context=ctx)
-    op_add = ElementwiseAdd(size=M * D, num_aie_columns=cols, tile_size=D // cols, context=ctx)
+                      tile_size=FF // cols, context=ctx, allocation_scheme=alloc_all)
+    op_mul = ElementwiseMul(size=M * FF, num_aie_columns=cols, tile_size=FF // cols, context=ctx,
+                            allocation_scheme=alloc_all)
+    op_add = ElementwiseAdd(size=M * D, num_aie_columns=cols, tile_size=D // cols, context=ctx,
+                            allocation_scheme=alloc_all)
     # ElementwiseMul has no broadcast access pattern for a [D] gain against [M, D], so this stays
     # D-sized (decode's own op, gen_llm_decode.py:1643) and runs once per row below.
     op_lscale = (ElementwiseMul(size=D, tile_size=D // cols, num_aie_columns=cols, context=ctx)
@@ -868,7 +884,8 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
                     chunk_op_ = gemm_for(f"{label}_k{chunk_k}of{n}", chunk_k, Nout,
                                         extra=dict(a_row_stride=K), site=site)
                     add_op_ = ElementwiseAdd(size=M * Nout, num_aie_columns=cols,
-                                            tile_size=Nout // cols, context=ctx)
+                                            tile_size=Nout // cols, context=ctx,
+                                            allocation_scheme=alloc_all)
                     _chunked_cache[ckey] = (chunk_op_, add_op_)
                 chunk_op, add_op = _chunked_cache[ckey]
 
@@ -1302,7 +1319,7 @@ def check_shared_weights(dec_meta_path, weights_dir, sp, dims):
     Skipped when the caller has no weights (`--no-golden`); it costs one layer's tensors otherwise.
     """
     bdir = os.path.join(os.path.dirname(os.path.abspath(dec_meta_path)), "buffers")
-    npy = lambda t: np.load(os.path.join(weights_dir, f"model.layers.0.{t}.weight.npy"))
+    npy = lambda t: np.load(os.path.join(weights_dir, f"{sp.weight_prefix}layers.0.{t}.weight.npy"))
     raw = lambda n: np.fromfile(os.path.join(bdir, f"L0_{n}.bin"), dtype=BF16)
     same = lambda a, b: np.array_equal(np.asarray(a).view(np.uint16),
                                        np.asarray(np.asarray(b).astype(BF16)).view(np.uint16))
