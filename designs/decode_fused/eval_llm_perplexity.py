@@ -34,23 +34,13 @@ import ml_dtypes
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import newstack_compat  # noqa: F401,E402
-from verify_llm_decode import window_len  # noqa: E402 -- one owner for the rounding
+from verify_llm_decode import window_len, rope_row  # noqa: E402 -- one owner for each
 from gen_llm_decode import (build_graph, report_artifact_freshness,  # noqa: E402
                             load_weight_buffer, isolate_build_dir)
 from qwen_bpe import QwenBPE  # noqa: E402
 from iron.common.kv_layout import KVLayout  # noqa: E402
 
 BF16 = ml_dtypes.bfloat16
-
-
-def rope_row(pos, head_dim, theta):
-    half = head_dim // 2
-    inv = 1.0 / (theta ** (np.arange(0, head_dim, 2, dtype=np.float64)[:half] / head_dim))
-    ang = pos * inv
-    row = np.empty(head_dim, dtype=np.float32)
-    row[0::2] = np.cos(ang)
-    row[1::2] = np.sin(ang)
-    return row.astype(BF16)
 
 
 def log_softmax_at(logits, idx):
@@ -116,17 +106,34 @@ def main():
     c.scratch_buffer.to("npu")
     print(f"[ppl] {len(weights)} weight buffers loaded, scratch flushed")
 
-    embed = np.load(os.path.join(a.weights, "model.embed_tokens.weight.npy")).astype(np.float32)
+    embed = np.load(os.path.join(a.weights, f"{sp.weight_prefix}embed_tokens.weight.npy")).astype(np.float32)
     scale = np.sqrt(D) if sp.embed_scale == "sqrt_d_model" else 1.0
-    xin, rope_buf, out = c.get_buffer("x"), c.get_buffer("rope_global"), c.get_buffer("logits")
+    xin, out = c.get_buffer("x"), c.get_buffer("logits")
+    # Every per-position input this graph declares, driven the way verify_llm_decode.py drives it.
+    # A dual-theta spec declares a SECOND angle buffer for its sliding layers, and under per-layer
+    # geometry the two differ in WIDTH as well as theta -- so the row comes off each buffer's own
+    # size, never off sp.head_dim (a single global head_dim is wrong for Gemma-4's mixed
+    # sliding/global geometry -- writing only rope_global at sp.head_dim left 40 of 48 layers
+    # rotating against a buffer the host never wrote).
+    rope_g = c.get_buffer("rope_global") if "rope_global" in md["inputs"] else None
+    rope_l = c.get_buffer("rope_local") if "rope_local" in md["inputs"] else None
+    # One KV offset per distinct head_dim: `pos * head_dim` is two different byte offsets here.
+    kv_slots = [(nm, KVLayout(Hkv=sp.n_kv_heads, S=S, HD=hd, T=md["T"]))
+                for nm, hd in md["kv_slots"]] or [("kv_off", kv_layout)]
 
-    nll, t0, top1_hits = [], time.perf_counter(), 0
+    nll, t0, top1_hits, n_sat = [], time.perf_counter(), 0, 0
     for pos in range(n):
         with xin.overwrite() as _buf:
             _buf[:] = np.asarray(embed[ids[pos]] * scale, BF16).reshape(-1)
-        with rope_buf.overwrite() as _buf:
-            _buf[:] = rope_row(pos, HD, sp.rope_theta_global).reshape(-1)
-        params.write("kv_off", int(kv_layout.kv_off(pos)))
+        if rope_g is not None:
+            with rope_g.overwrite() as _buf:
+                _buf[:] = rope_row(pos, _buf.size, sp.rope_theta_global,
+                                   sp.rope_partial_rotary).reshape(-1)
+        if rope_l is not None:
+            with rope_l.overwrite() as _buf:
+                _buf[:] = rope_row(pos, _buf.size, sp.rope_theta_local).reshape(-1)
+        for _slot, _kvl in kv_slots:
+            params.write(_slot, int(_kvl.kv_off(pos)))
         params.write("sm_mask", int(pos + 1))
         if window_granule is not None:
             # A dynamic-window build reads its attended length from this parameter every dispatch.
@@ -138,6 +145,12 @@ def main():
         params.sync()
         c()
         lg = np.asarray(out.data[:VOCAB], dtype=np.float32)
+        if sp.logit_softcap is not None:
+            # final_logit_softcapping, applied after readback -- this IS the model's output
+            # distribution. Skipping it on Gemma-4-12B reads mean NLL 19.9, above ln(vocab): a
+            # different model, not an approximation of this one.
+            lg = np.tanh(lg / sp.logit_softcap) * sp.logit_softcap
+            n_sat += int((np.abs(lg) >= sp.logit_softcap * (1 - 1e-6)).sum())
         nll.append(-log_softmax_at(lg, ids[pos + 1]))
         top1_hits += int(np.argmax(lg) == ids[pos + 1])
         if (pos + 1) % 256 == 0:
@@ -151,9 +164,15 @@ def main():
                 np.save(a.dump_nll, np.asarray(nll, dtype=np.float64))
     wall = time.perf_counter() - t0
 
+    if sp.logit_softcap is not None and n_sat > 0.001 * n * VOCAB:
+        print(f"[ppl] WARNING: {n_sat/(n*VOCAB):.1%} of logits saturate the "
+              f"{sp.logit_softcap} softcap -- the argmax is index order there and this run does "
+              "not gate the model. A truncated stack does this; a full-depth one does not.",
+              file=sys.stderr)
     mean_nll = float(np.mean(nll))
     res = {
         "spec": sp.name, "layers": md["NL"], "text": os.path.basename(a.text),
+        "logit_softcap": sp.logit_softcap, "softcap_saturated_frac": n_sat / (n * VOCAB),
         "n_scored": n, "mean_nll": mean_nll, "perplexity": math.exp(mean_nll),
         "top1_acc": top1_hits / n, "median_nll": float(np.median(nll)),
         # NOT a benchmark, and named so it cannot be quoted as one. No warmup, no alternation,
