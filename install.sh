@@ -360,6 +360,22 @@ dir_has_content() { [ -d "$1" ] && [ -n "$(ls -A "$1" 2>/dev/null)" ]; }
 ENGINE_KERNELS="$ENGINE_ROOT/kernels"
 info "Publishing kernels -> $ENGINE_KERNELS"
 mkdir -p "$ENGINE_ROOT"
+
+# Rebuild whatever the 3 DECLARED families (whole_array/dwconv1d/layernorm) are Missing
+# against the CURRENT pin before the plain publish below -- this is what makes a re-pin
+# self-healing instead of requiring a manual build_parakeet_kernels.sh run every time.
+# Its own exit code is advisory, not a gate: modal/turbo whole_array variants and
+# mha_decode are still adapter-less by design (reported NoRecipe, not built), and the
+# die-checks below (publish_kernels.sh's pin-consistency refusal, section 4c's
+# artifact/pin agreement check) remain the real safety net for anything left missing.
+DECLARED_KERNELS_BIN="$CARGO_TARGET_DIR_RESOLVED/release/build_declared_kernels"
+if [ -x "$DECLARED_KERNELS_BIN" ]; then
+  "$DECLARED_KERNELS_BIN" "$REPO" "$ENGINE_KERNELS" "$ENGINE_MLIR_AIE" \
+    || warn "build_declared_kernels reported a problem (see above) -- falling through to the plain publish/preflight below"
+else
+  warn "build_declared_kernels not found at $DECLARED_KERNELS_BIN -- skipping the automatic rebuild step"
+fi
+
 bash "$REPO/scripts/publish_kernels.sh" "$ENGINE_KERNELS" "$ENGINE_MLIR_AIE" \
   || die "kernel publish refused -- see the message above. The usual cause is a build dir that was
   never rebuilt after a re-pin; scripts/check_kernel_artifact_freshness.sh names every stale one."
