@@ -103,6 +103,10 @@ enum Cmd {
     /// Give a model's device memory back now, keeping its config entry so routing still knows what
     /// it is and the next request reloads it. The same call the idle sweep makes, fired by hand.
     Unload { name: String, reply: Sender<Result<bool, EngineError>> },
+    /// Host-only, no device: bake a model's declarative weight spec into a checkpoint. Goes through
+    /// the actor (not run inline in the HTTP handler) so it serializes against every other command
+    /// touching this model's config entry, same as `Load`/`Unload`.
+    Bake { name: String, force: bool, reply: Sender<Result<Option<std::path::PathBuf>, EngineError>> },
     Status { reply: Sender<Vec<ModelStatus>> },
     Shutdown,
 }
@@ -334,6 +338,15 @@ fn spawn(cfg: Config, loader: Box<dyn ModelLoader + Send>, eager: bool) -> Resul
                     };
                     let _ = reply.send(r);
                 }
+                Ok(Cmd::Bake { name, force, reply }) => {
+                    let r = match cfg.find(&name).cloned() {
+                        None => Err(EngineError::Load(format!(
+                            "unknown model {name:?} (not in the config)"))),
+                        Some(m) => guard(|| loader.bake(&m, force))
+                            .unwrap_or_else(|msg| Err(EngineError::Load(msg))),
+                    };
+                    let _ = reply.send(r);
+                }
                 Ok(Cmd::Unload { name, reply }) => {
                     let r = match cfg.find(&name) {
                         None => Err(EngineError::Load(format!(
@@ -521,6 +534,14 @@ impl Handle {
     pub fn unload(&self, name: &str) -> Result<bool, EngineError> {
         let (r, rx) = channel();
         self.tx.send(Cmd::Unload { name: name.to_string(), reply: r })
+            .map_err(|_| EngineError::Device("actor stopped".into()))?;
+        rx.recv().map_err(|_| EngineError::Device("actor dropped reply".into()))?
+    }
+    /// Bake a model's declarative weight spec into a checkpoint, host-only. `Ok(None)` means the
+    /// scenario has no such spec (legacy `weights =` npy path).
+    pub fn bake(&self, name: &str, force: bool) -> Result<Option<std::path::PathBuf>, EngineError> {
+        let (r, rx) = channel();
+        self.tx.send(Cmd::Bake { name: name.to_string(), force, reply: r })
             .map_err(|_| EngineError::Device("actor stopped".into()))?;
         rx.recv().map_err(|_| EngineError::Device("actor dropped reply".into()))?
     }

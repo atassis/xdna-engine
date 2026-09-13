@@ -47,6 +47,13 @@ pub trait ModelLoader {
     /// tell cheaply"; a caller weighs that as 0, the same honest-unmeasured convention `footprint()`
     /// already uses, not "zero bytes".
     fn declared_footprint(&self, _cfg: &ModelCfg) -> Option<u64> { None }
+
+    /// Bake this model's declarative `{source, arch, checkpoint}` spec into a checkpoint on disk,
+    /// host-only, no device. `Ok(None)` means the scenario has no such spec (legacy `weights =`
+    /// npy path) -- nothing to bake, not a failure.
+    fn bake(&self, _cfg: &ModelCfg, _force: bool) -> Result<Option<std::path::PathBuf>, EngineError> {
+        Ok(None)
+    }
 }
 
 /// Real loader: turns a ModelCfg's scenario TOML into a live npu_engine::Model.
@@ -120,6 +127,20 @@ impl ModelLoader for EngineLoader {
     fn declared_footprint(&self, cfg: &ModelCfg) -> Option<u64> {
         let sc = npu_engine::config::ScenarioConfig::load(&self.scenario_path(cfg)).ok()?;
         dir_or_file_size(&self.root.join(&sc.artifacts.weights))
+    }
+
+    /// Mirrors the CLI's own `bake()`: load the scenario, resolve its declarative spec if it has
+    /// one, and bake against THIS loader's root -- the same root `load()` resolves scenarios
+    /// against, so a bake and the load that follows it agree on where the checkpoint lives.
+    fn bake(&self, cfg: &ModelCfg, force: bool) -> Result<Option<std::path::PathBuf>, EngineError> {
+        let sc = npu_engine::config::ScenarioConfig::load(&self.scenario_path(cfg))
+            .map_err(|e| EngineError::Load(e.to_string()))?;
+        match sc.artifacts.model_spec().map_err(|e| EngineError::Load(e.to_string()))? {
+            Some(spec) => spec.ensure_checkpoint(&self.root, force)
+                .map(Some)
+                .map_err(|e| EngineError::Load(e.to_string())),
+            None => Ok(None),
+        }
     }
 }
 

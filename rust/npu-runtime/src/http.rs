@@ -237,6 +237,8 @@ pub fn route(req: &Request, handle: &Handle, cfg_path: &Path) -> Response {
             admin_load(&p["/admin/models/".len()..p.len() - "/load".len()], handle),
         ("POST", p) if p.starts_with("/admin/models/") && p.ends_with("/unload") =>
             admin_unload(&p["/admin/models/".len()..p.len() - "/unload".len()], handle),
+        ("POST", p) if p.starts_with("/admin/models/") && p.ends_with("/bake") =>
+            admin_bake(&p["/admin/models/".len()..p.len() - "/bake".len()], req, handle),
         ("DELETE", p) if p.starts_with("/admin/models/") =>
             admin_remove_model(&p["/admin/models/".len()..].to_string(), handle, cfg_path),
         ("GET", _) => (404, "{\"error\":\"not found\"}".into()),
@@ -650,6 +652,21 @@ fn admin_unload(name: &str, handle: &Handle) -> Response {
     }
 }
 
+/// Host-only, no device: bake a model's declarative weight spec into a checkpoint. `force`
+/// defaults to false on a missing/malformed body -- unlike `resident`, this overrides an
+/// already-idempotent operation (`ensure_checkpoint` skips a fresh checkpoint on its own) rather
+/// than instructing a state, so there is nothing to reject a bad body for.
+fn admin_bake(name: &str, req: &Request, handle: &Handle) -> Response {
+    let force = serde_json::from_slice::<serde_json::Value>(&req.body)
+        .ok().as_ref().and_then(|v| v.get("force")).and_then(|v| v.as_bool()).unwrap_or(false);
+    match handle.bake(name, force) {
+        Ok(p) => (200, format!("{{\"checkpoint\":{}}}",
+            p.map(|p| format!("\"{}\"", parse::json_escape(&p.display().to_string())))
+             .unwrap_or_else(|| "null".into())).into()),
+        Err(e) => engine_err(&e),
+    }
+}
+
 fn mutate_and_reconcile(handle: &Handle, cfg_path: &Path,
                         f: impl FnOnce(&mut ConfigDoc) -> Result<(), String>) -> Response {
     let bad = |code: u16, e: String| -> Response {
@@ -743,7 +760,7 @@ fn respond(stream: &mut TcpStream, code: u16, body: &Body) -> std::io::Result<()
     stream.flush()
 }
 
-fn reason_phrase(code: u16) -> &'static str {
+pub(crate) fn reason_phrase(code: u16) -> &'static str {
     match code {
         200 => "OK", 400 => "Bad Request", 404 => "Not Found", 413 => "Payload Too Large",
         500 => "Internal Server Error", 501 => "Not Implemented", 503 => "Service Unavailable",
@@ -1797,6 +1814,25 @@ mod route_tests {
         let (h, j, _d, p) = mock_handle();
         assert_ne!(route(&post("/admin/models/nope/load", ""), &h, &p).0, 200);
         assert_ne!(route(&post("/admin/models/nope/unload", ""), &h, &p).0, 200);
+        h.shutdown(); j.join().unwrap();
+    }
+
+    /// A mock model has no declarative spec (`ModelLoader::bake`'s default), the same "legacy npy
+    /// weights" case the CLI's own `npu bake` reports -- so the route must answer 200 with a null
+    /// checkpoint, not treat "nothing to do" as a failure.
+    #[test]
+    fn admin_bake_reports_nothing_to_bake_for_a_legacy_weights_model() {
+        let (h, j, _d, p) = mock_handle();
+        let (code, body) = route(&post("/admin/models/bge/bake", ""), &h, &p);
+        assert_eq!(code, 200, "{body}");
+        assert!(body.text().contains("\"checkpoint\":null"), "{body}");
+        h.shutdown(); j.join().unwrap();
+    }
+
+    #[test]
+    fn admin_bake_rejects_a_model_that_is_not_configured() {
+        let (h, j, _d, p) = mock_handle();
+        assert_ne!(route(&post("/admin/models/nope/bake", ""), &h, &p).0, 200);
         h.shutdown(); j.join().unwrap();
     }
 
