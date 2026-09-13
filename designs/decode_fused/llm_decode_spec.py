@@ -797,7 +797,9 @@ QWEN3_0_6B = LlmSpec(
 # head_dim**-0.5 the spec would otherwise compute -- 1/16 on sliding layers and 1/22.6 on global,
 # which would have built and run quietly wrong.
 #
-# NOT BUILDABLE: check() refuses it, naming six features. That is the point of landing it.
+# unimplemented() is empty (see its docstring above) -- check() no longer refuses this spec on
+# missing features. Builds and dispatches through the same NpuDecodeStep rail as Qwen3 and
+# Gemma-3-270M.
 GEMMA4_12B = LlmSpec(
     name="gemma4-12b", d_model=3840, n_layers=48, n_q_heads=16, n_kv_heads=8, head_dim=256,
     ffn=15360, vocab=262144, eps=1e-6, act="gelu_tanh", norm_gain="w",
