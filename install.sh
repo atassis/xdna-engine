@@ -305,7 +305,7 @@ fi
 # `env -u LD_LIBRARY_PATH` is the whole point: it reproduces a plain login shell, where the binary
 # has to resolve its own libraries through DT_RUNPATH or not at all.
 info "Smoke-testing the installed binary in a clean environment"
-if smoke=$(env -u LD_LIBRARY_PATH "$ENGINE_BIN" models --output json 2>&1); then
+if smoke=$(env -u LD_LIBRARY_PATH "$ENGINE_BIN" model ls --output json 2>&1); then
   ok "Installed binary runs standalone"
 else
   warn "The installed binary does not run without LD_LIBRARY_PATH:"
