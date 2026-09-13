@@ -88,7 +88,7 @@ fn enumerated_flags_offer_their_values_not_an_empty_set() {
 #[test]
 fn capability_values_come_from_the_engine_not_a_hardcoded_list() {
     let script = zsh_script();
-    // `config set-default <capability>` must offer exactly what this binary can serve.
+    // `model default <capability>` must offer exactly what this binary can serve.
     for cap in npu_engine::capability::Capability::ALL {
         assert!(script.contains(cap.0),
             "capability {:?} is implemented but not offered by completion", cap.0);

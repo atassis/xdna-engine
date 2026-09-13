@@ -1113,19 +1113,34 @@ fn verbose_detail(root: Option<&PathBuf>, scenario: &str) -> Option<String> {
     let decode = &sc.artifacts.decode;
     if decode.is_empty() { return None; }
     let dir = root?.join(decode);
-    let a = npu_engine::llm::LlmArtifact::load(&dir).ok()?;
-    let rungs = if a.window_rungs.is_empty() {
-        "none".to_string()
-    } else {
-        a.window_rungs.iter().map(|(name, w)| format!("{name}:{w}")).collect::<Vec<_>>().join(",")
-    };
-    let fresh = match npu_engine::llm::artifact::LlmArtifact::check_toolchain_freshness(&a.toolchain_hash, &dir) {
+
+    // Read `toolchain.hash` straight off `meta.json`, the same way `artifact_precision` reads
+    // `weight_quant` -- `LlmArtifact::load` fails loud (`Err`) on a Stale verdict, so calling
+    // `check_toolchain_freshness` on an already-loaded artifact can never observe Stale: load()
+    // has already filtered that case out. Reading the hash independently is what makes STALE
+    // reachable for a genuinely stale model.
+    let meta: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("meta.json")).ok()?).ok()?;
+    let toolchain_hash = meta.get("toolchain").and_then(|t| t.get("hash")).and_then(|h| h.as_str()).map(str::to_string);
+    let fresh = match npu_engine::llm::artifact::LlmArtifact::check_toolchain_freshness(&toolchain_hash, &dir) {
         npu_engine::llm::artifact::ToolchainFreshness::Fresh { .. } => "fresh".to_string(),
         npu_engine::llm::artifact::ToolchainFreshness::Stale { .. } => "STALE".to_string(),
         npu_engine::llm::artifact::ToolchainFreshness::Unstamped => "unstamped".to_string(),
         npu_engine::llm::artifact::ToolchainFreshness::Unverifiable { .. } => "unverifiable".to_string(),
     };
-    Some(format!("kv_block={} window_rungs=[{rungs}] toolchain={fresh}", a.kv_block))
+
+    // kv_block/window_rungs need the full artifact -- degrade to `?` rather than dropping the
+    // line, so a stale (or otherwise unloadable) artifact still reports what it can.
+    match npu_engine::llm::LlmArtifact::load(&dir).ok() {
+        Some(a) => {
+            let rungs = if a.window_rungs.is_empty() {
+                "none".to_string()
+            } else {
+                a.window_rungs.iter().map(|(name, w)| format!("{name}:{w}")).collect::<Vec<_>>().join(",")
+            };
+            Some(format!("kv_block={} window_rungs=[{rungs}] toolchain={fresh}", a.kv_block))
+        }
+        None => Some(format!("kv_block=? window_rungs=[?] toolchain={fresh}")),
+    }
 }
 
 /// Device buffer-object bytes, or `-` when nothing measured them.
@@ -2500,6 +2515,56 @@ mod tests {
         assert!(model_show(&cfg_path, "a", false).is_ok());
         assert!(model_show(&cfg_path, "does-not-exist", false).is_err(),
             "an unknown name must be a real error, not a blank report");
+    }
+
+    /// THE regression: `LlmArtifact::load` fails loud (`Err`) on `ToolchainFreshness::Stale`, so
+    /// calling `check_toolchain_freshness` again on an already-loaded artifact can never observe
+    /// Stale -- by the time `load()` has succeeded, Stale is already ruled out. Confirms
+    /// `verbose_detail` reads the hash independently instead, so a genuinely stale decode artifact
+    /// still reports `toolchain=STALE` rather than no detail line at all.
+    #[test]
+    fn verbose_detail_reports_stale_even_though_the_full_artifact_fails_to_load() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("toolchain.lock"), b"PIN=abc\n").unwrap();
+        let current = npu_asr::kernel_registry::current_toolchain_hash(dir.path()).unwrap();
+        assert_ne!(current, "9da6356ac521", "test setup must actually disagree with the stale hash");
+
+        let decode_dir = dir.path().join("decode");
+        std::fs::create_dir_all(&decode_dir).unwrap();
+        let meta = serde_json::json!({
+            "elf": "decode.elf", "kernel_name": "main:sequence",
+            "input_size": 16, "output_size": 8, "scratch_size": 16,
+            "layout": {
+                "x": {"type": "input", "offset": 0, "len": 8},
+                "logits": {"type": "output", "offset": 0, "len": 8},
+                "W": {"type": "scratch", "offset": 0, "len": 16},
+                "rope_global": {"type": "input", "offset": 8, "len": 8},
+            },
+            "inputs": ["x", "rope_global"], "weights": ["W"], "output": "logits",
+            "cache_buffers": [],
+            "scratchpad": {
+                "params": {"kv_off": {"byte_offset": 0, "kind": "addr"}, "sm_mask": {"byte_offset": 4, "kind": "core"}},
+                "kv_param": "kv_off", "mask_param": "sm_mask",
+            },
+            "dims": {"layers": 1, "d_model": 4, "vocab": 4, "head_dim": 4, "S": 8},
+            "host_protocol": {"embed_scale": "none", "rope_theta_global": 1_000_000.0},
+            "toolchain": {"hash": "9da6356ac521"},
+        });
+        std::fs::write(decode_dir.join("meta.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
+
+        // Confirm this actually hits the Stale-fails-loud path inside `load`, not some unrelated
+        // parse failure -- otherwise this test would pass against the old, buggy code too.
+        let err = npu_engine::llm::LlmArtifact::load(&decode_dir).unwrap_err().to_string();
+        assert!(err.contains("toolchain-stale"), "{err}");
+
+        std::fs::write(dir.path().join("s.toml"), concat!(
+            "[scenario]\nkind = \"generate\"\nname = \"x\"\n",
+            "[artifacts]\ndecode = \"decode\"\n",
+        )).unwrap();
+
+        let detail = verbose_detail(Some(&dir.path().to_path_buf()), "s.toml")
+            .expect("a stale decode artifact must still report a detail line");
+        assert!(detail.contains("toolchain=STALE"), "{detail}");
     }
 
     /// The unit name must be READ, not guessed. The first version hardcoded `npu-asr`, which

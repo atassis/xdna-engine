@@ -358,7 +358,10 @@ pub enum ModelCmd {
         /// hidden -- just not printed by default.
         #[arg(long)] verbose: bool,
     },
-    /// Full detail for one model: everything `ls --verbose` shows, for a single name.
+    /// Config-declared detail for one model: kind, context window, precision, and (for a generate
+    /// model) kv/window/toolchain detail -- everything `ls --verbose` shows from the config side,
+    /// plus SCENARIO, which `ls` doesn't print. It does not read live server status, so it has no
+    /// STATE/MEM/BUSY/pin-drift columns.
     Show {
         model: String,
         /// Machine-readable output.
