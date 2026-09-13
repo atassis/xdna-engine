@@ -142,12 +142,15 @@ pub enum Cmd {
         action: ModelCmd,
     },
     /// Weight-checkpoint tooling: bake, inspect, and parity-check.
+    ///
+    /// Named `checkpoint`, the canonical ML term, matching the existing `--checkpoint` flag on every
+    /// verb below and keeping the analogy legible: checkpoint : model :: image : container.
     // Folded in from the separate `npu-weights` binary AND the top-level `npu bake <name>`, which
     // fully overlapped `npu weights bake --name`: one namespace, one completion surface.
     #[command(subcommand_required = true, arg_required_else_help = true)]
-    Weights {
+    Checkpoint {
         #[command(subcommand)]
-        action: WeightsCmd,
+        action: CheckpointCmd,
     },
     /// Live view of the device: who is resident, who is serving, and where the time went.
     ///
@@ -280,7 +283,7 @@ impl OutFormat {
 }
 
 #[derive(Subcommand)]
-pub enum WeightsCmd {
+pub enum CheckpointCmd {
     /// Bake source weights into a bf16 checkpoint (skips if fresh, unless --force).
     Bake {
         /// Bake a CONFIGURED model by name instead: resolves its scenario's declarative spec.
@@ -298,11 +301,14 @@ pub enum WeightsCmd {
         #[arg(long, required_unless_present = "name",
               value_parser = PossibleValuesParser::new(npu_weights::arch::ARCH_NAMES.to_vec()))]
         arch: Option<String>,
+        /// Output checkpoint path (default: derived from --source/--name and --arch).
         #[arg(long, value_hint = ValueHint::FilePath)] checkpoint: Option<PathBuf>,
+        /// Re-bake even if a checkpoint already exists and is fresh.
         #[arg(long)] force: bool,
     },
     /// mmap-load a checkpoint and print tensor stats.
     Load {
+        /// Checkpoint file path to load.
         #[arg(long, value_hint = ValueHint::FilePath)] checkpoint: PathBuf,
         /// npu-weights arch transform.
         #[arg(long, value_parser = PossibleValuesParser::new(npu_weights::arch::ARCH_NAMES.to_vec()))]
@@ -310,10 +316,12 @@ pub enum WeightsCmd {
     },
     /// Verify checkpoint tensors match a directory of reference .npy within tolerance.
     Verify {
+        /// Checkpoint file path to verify.
         #[arg(long, value_hint = ValueHint::FilePath)] checkpoint: PathBuf,
         /// npu-weights arch transform.
         #[arg(long, value_parser = PossibleValuesParser::new(npu_weights::arch::ARCH_NAMES.to_vec()))]
         arch: String,
+        /// Reference .npy directory path.
         #[arg(long, value_hint = ValueHint::DirPath)] refs: PathBuf,
     },
 }

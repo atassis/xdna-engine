@@ -18,7 +18,7 @@ fn sr_engine_through_servable_matches_the_direct_call() {
         .to_path_buf();
     if !root.join("target/test-checkpoints/espcn.safetensors").exists() {
         eprintln!("SKIP: checkpoint missing at target/test-checkpoints/espcn.safetensors -- bake via \
-                   `npu-weights bake --source path:artifacts/espcn/espcn_x3_dyn.onnx --arch espcn \
+                   `npu checkpoint bake --source path:artifacts/espcn/espcn_x3_dyn.onnx --arch espcn \
                    --checkpoint target/test-checkpoints/espcn.safetensors` from the repo root");
         return;
     }

@@ -95,7 +95,7 @@ fn capability_values_come_from_the_engine_not_a_hardcoded_list() {
     }
 }
 
-/// Every subcommand `Command` node reachable from the root, keyed by its full path (`"weights
+/// Every subcommand `Command` node reachable from the root, keyed by its full path (`"checkpoint
 /// bake"`). Unlike `walk()` above, this keeps the `&Command` itself, not just its name/flags, so a
 /// test can inspect `get_about()` / `get_arguments()` -- what `--help` actually renders.
 fn walk_commands<'a>(cmd: &'a clap::Command, path: &str, out: &mut Vec<(String, &'a clap::Command)>) {

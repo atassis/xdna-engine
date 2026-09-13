@@ -157,7 +157,7 @@ mod tests {
 /// Compare each checkpoint tensor against `refs/<name>.npy` (tensor name '/' -> path separator).
 /// Returns `(tensors_compared, max_abs_rel_err)`; refs may be a SUBSET, missing ones are skipped.
 ///
-/// Lives in the library because two callers need it -- the `npu weights verify` subcommand and the
+/// Lives in the library because two callers need it -- the `npu checkpoint verify` subcommand and the
 /// parity test -- and it is checkpoint logic, not CLI plumbing. It previously lived inside the
 /// standalone binary, which is why the test had to shell out to that binary to reach it.
 pub fn verify_against_npy(l: &Loaded, refs: &std::path::Path) -> anyhow::Result<(usize, f32)> {

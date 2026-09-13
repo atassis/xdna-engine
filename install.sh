@@ -470,14 +470,14 @@ fi  # end MODEL=gigaam artifact block
 # ---------------------------------------------------------------------------
 # 4a2. Remove any previously installed npu-weights binary
 # ---------------------------------------------------------------------------
-# The weight tooling folded fully into npu-cli's `npu weights` subcommand, including the
+# The weight tooling folded fully into npu-cli's `npu checkpoint` subcommand, including the
 # name-keyed bake `npu bake <name>` used to do standalone -- one namespace, one completion
 # surface. The deprecation shim that used to forward here is retired too, not rebuilt: delete
 # rather than leave it, or a stale binary that still forwards correctly becomes a second
 # completion surface nobody maintains.
 if [ -e "$ENGINE_BIN_DIR/npu-weights" ]; then
   rm -f "$ENGINE_BIN_DIR/npu-weights"
-  ok "removed npu-weights ($ENGINE_BIN_DIR) -- folded into \`npu weights\`, no longer a separate binary"
+  ok "removed npu-weights ($ENGINE_BIN_DIR) -- folded into \`npu checkpoint\`, no longer a separate binary"
 fi
 
 # ---------------------------------------------------------------------------

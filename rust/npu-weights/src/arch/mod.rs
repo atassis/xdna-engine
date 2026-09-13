@@ -37,7 +37,7 @@ type Ctor = fn() -> Box<dyn Arch>;
 
 /// (name, constructor), alphabetical, one entry per `arch/*.rs` module. The single source for both
 /// [`get`]'s dispatch and [`ARCH_NAMES`] -- a new module is wired in by adding one line here, and
-/// `npu weights --arch`'s clap possible-values + help text (`npu-cli/src/cli_def.rs`) read
+/// `npu checkpoint --arch`'s clap possible-values + help text (`npu-cli/src/cli_def.rs`) read
 /// `ARCH_NAMES`, so a module that forgets this line cannot be dispatched to either, and one that
 /// remembers it cannot be missing from the CLI's help.
 const REGISTRY: &[(&str, Ctor)] = &[

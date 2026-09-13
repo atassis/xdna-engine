@@ -60,8 +60,8 @@ Wire it up declaratively, not by hand-running a script. `npu_weights::spec::Mode
 arch: String, checkpoint: Option<PathBuf> }`. `ModelSpec::ensure_checkpoint()` resolves
 the source files, fingerprints them (sha256), and bakes a `.safetensors` checkpoint under
 `artifacts/checkpoints/<arch>__<source>__<fp12>.safetensors` if one isn't already there --
-this is the single entry point both the engine and the `npu weights bake` /
-`npu weights bake --name <model>` CLI commands call (`rust/npu-cli/src/main.rs`).
+this is the single entry point both the engine and the `npu checkpoint bake` /
+`npu checkpoint bake --name <model>` CLI commands call (`rust/npu-cli/src/main.rs`).
 
 A scenario TOML opts into this by setting, under `[artifacts]`:
 
@@ -188,7 +188,7 @@ Four independent gates, each catching a different class of mistake:
    records, per kernel, whether a `golden.py` exists (31 of 48 do) and which `verify_*.py`
    harness runs it -- and is honest where a kernel has never actually run on device.
 2. **Weight-checkpoint parity.** `max rel-err < 5e-2` (the bf16 floor sits around
-   3.89e-3), enforced in code by `checkpoint::verify_against_npy` (`npu weights verify`,
+   3.89e-3), enforced in code by `checkpoint::verify_against_npy` (`npu checkpoint verify`,
    `rust/npu-cli/src/main.rs`) and by one `rust/npu-weights/tests/parity_<arch>.rs` per
    registered arch -- write the analogous test for a new one. These run with no NPU.
 3. **Device numeric parity**, when a change touches an existing on-NPU path:

@@ -1,7 +1,7 @@
 //! Shared helper for the checkpoint parity tests.
 //!
 //! These used to each shell out to the `npu-weights` executable. That binary is now a deprecation
-//! shim (the tooling moved to `npu weights`), and more to the point the subprocess was never what
+//! shim (the tooling moved to `npu checkpoint`), and more to the point the subprocess was never what
 //! the tests were checking -- they check that a baked checkpoint matches a Python oracle, which is
 //! library behaviour. Going through the library also makes a failure a Rust panic with a message
 //! instead of a non-zero exit code and a scraped stdout string.
@@ -20,7 +20,7 @@ pub fn repo_root() -> PathBuf {
 /// Bake `source` under `arch` and compare every tensor to `refs/<name>.npy`.
 ///
 /// Panics with the tensor count and worst rel-err on failure. The 5e-2 bound is the same one the
-/// `npu weights verify` subcommand enforces, so the test and the tool agree by construction.
+/// `npu checkpoint verify` subcommand enforces, so the test and the tool agree by construction.
 pub fn bake_and_verify(label: &str, source: &str, arch: &str, refs: &Path) {
     let root = repo_root();
     let checkpoint = root.join(format!("target/test-checkpoints/{label}.safetensors"));

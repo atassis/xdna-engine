@@ -140,7 +140,7 @@ not a bad request, which is why it is `503` and not `400`.
 
 ## Weight checkpoints
 
-**`parity FAILED: max rel-err ... >= 5e-2`** from `npu weights verify` -- the baked
+**`parity FAILED: max rel-err ... >= 5e-2`** from `npu checkpoint verify` -- the baked
 checkpoint's tensors disagree with the reference `.npy` files beyond tolerance. This
 means the bake transform for that `arch` is wrong for this checkpoint, not a flaky
 threshold; check the arch transform against the source checkpoint's actual layout.
