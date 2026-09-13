@@ -7,6 +7,7 @@ name = "gemma4-12b"
 # per GEOMETRY (gen_llm_decode.py's attn_ops factory) rather than once for the stack.
 #
 #   weights  scripts/dump_llm_weights.py --spec gemma4-12b --quant int8 --quant-group 64 \
+#              --quant-layout row_group_planar \
 #              --quant-leaves gate_proj,up_proj,down_proj,o_proj,q_proj,k_proj,v_proj
 #   decode   TMV_CTX=0 GQA_GROUPED_K=1 GQA_GROUPED_V=1 FUSE_QKV_DP=0 SPLIT_LM_HEAD=0 \
 #              bash scripts/build_llm_decode.sh gemma4-12b
@@ -16,30 +17,57 @@ name = "gemma4-12b"
 #     logit accuracy, and no group size or calibration closes it.
 #   g64, not g128: at K=3840 the int8 width derivation returns VEC_SIZE=8, and aie::vector<int8,8>
 #     is 64 bits -- below aie_api's minimum vector, so there is no vector_storage specialisation
-#     and the kernel does not compile. g64 derives 16 (128-bit) and is legal.
+#     and the kernel does not compile. g64 derives 16 (128-bit) and is legal, but was PUNISHED to
+#     that width by the header sitting in the row -- see the corrections list below.
 #
 # TMV_CTX=0 is REQUIRED: the global layers (head_dim 512, one kv head, batch_group 16) have no
 # TMatVec tiling that fits L1. SPLIT_LM_HEAD=0 because the host loader carries one elf/kernel name,
 # so a split head would be a second dispatch it cannot express.
 #
-# NOT the default generate model, deliberately: ~529 ms/token on the g32 arm below (~1.9 tok/s)
-# and a 15.3 GB resident arena against qwen3-0.6b's 1.4 GB. Name it per request. The ~1.2 tok/s
-# this line used to quote was the g64 arm.
-# GROUP SIZE 32, AND THIS OVERRIDES A FAILED QUALITY GATE -- owner's call 2026-09-12, recorded
-# here so it is not read later as an oversight. g32 is the FASTER arm (~529 ms/token against g64's
-# ~801) and it LOST its perplexity gate: paired wikitext-2, 2000 positions, BOS, 48 layers, arms
-# differing only in the packed dump -- g32 mean NLL 6.55059 / ppl 699.658 against g64's 6.50277 /
-# 666.990, i.e. g32 worse by +4.898% [+1.821, +8.068], t=3.15. It was rolled back to g64 on that
-# evidence and is being put back deliberately, trading measured output quality for latency.
-# Two traps for whoever reads this next:
-#   - top-1 is UNCHANGED (29.05% g32 vs 28.85% g64), so a short argmax parity check will not see
-#     the regression; the damage is a broad distributional shift, worse at 54.2% of positions.
-#   - per-site weight rel-L2 says g32 is BETTER at every site (head 0.569% vs 0.654%). It
-#     disagreed with the end-to-end result in SIGN. Do not re-argue this from a weight-space norm.
-# Roll back by pointing both lines at the _int8g64 pair; both artifacts are on disk.
+# DEFAULT SINCE 2026-09-13: row_group_planar (`decode_int8g64_planar`). ms/token history, this box,
+# same TMV_CTX/GQA/FUSE_QKV/SPLIT_LM_HEAD config throughout, real service:
+#   1. int8 g64, header_first (shipped first)         801.46 ms/token   1.248 tok/s
+#   2. int8 g32, header_first (traded quality for speed,
+#      shipped 2026-09-12 over a FAILED perplexity gate -- see below)  528.91 ms/token   1.884 tok/s
+#   3. int8 g64, row_group_planar (THIS DEFAULT)       406.6-406.8 ms/token   ~2.40 tok/s
+# (3) beats (2)'s speed while staying on (1)'s quality-gated format -- no quality tradeoff needed.
+# Row_group_planar measures ~3% faster than header_first even at g32, where the width argument
+# below does not apply (g32's own group size already caps VEC_SIZE, header or no header) -- the
+# residual is attributed to DMA/access-pattern contiguity (payload region is one contiguous run
+# under planar, interleaved with the header every row under header_first), not traced further.
+#
+# WHY row_group_planar IS FASTER: at K=3840 g64, header_first's per-row scale sits between the
+# buffer base and the payload, capping the dequant vector load at VEC_SIZE=16 (128-bit) -- see the
+# note above about g128 not compiling; g64 was legal but similarly punished. row_group_planar moves
+# every block's scales out of the row (`[payload_0..payload_{G-1}][scale_0..scale_{G-1}]`, G=4,
+# derived per K022 -- NOT hand-picked, two prior sessions guessed 8 and it overruns L1 by 9-28 KB at
+# every Gemma-4 quantized GEMV site), which lifts K=3840 to the full 512-bit VEC_SIZE=64. Kernel
+# side: `iron/operators/gemv/op.py` layout/row_group axis (IRON integration-stack commit `b90bde1`).
+#
+# CORRECTIONS APPLIED TO SPEED UP THIS KERNEL, dated, so this list is the answer to "what have we
+# already tried" instead of re-deriving it:
+#   2026-09-12  int8 g64 header_first shipped (from bf16), first quantized arm.        801.46 ms/tok
+#   2026-09-12  int8 g32 header_first shipped as a quality/speed TRADE (perplexity      528.91 ms/tok
+#               gate FAILED, +4.898% NLL vs g64, shipped anyway on owner's call).
+#   2026-09-13  int8 g64 row_group_planar: removes the header-imposed VEC_SIZE cap       406.7 ms/tok
+#               at K=3840 (16->64, 128b->512b) with NO accuracy cost (bytes reordered,
+#               values untouched) -- SUPERSEDES g32, now both faster and quality-safe.
+# Tried and NOT adopted (kept here so they are not re-tried blind):
+#   int4 (any layout)        12.3% weight rel-L2 against a ~0.3% logit-accuracy budget; no group
+#                             size or calibration closes it -- see the "int8, not int4" note above.
+#   g128                     does not compile at K=3840 (VEC_SIZE derives 8, below aie_api's
+#                             minimum vector width) -- see the "g64, not g128" note above.
+#
+# Two traps from the g32 episode, kept because they generalize to any future quantization change:
+#   - top-1 argmax can be UNCHANGED while perplexity moves broadly (g32 vs g64: 29.05% vs 28.85%
+#     top-1, but g32 worse at 54.2% of positions) -- an argmax-only parity check will not see this
+#     class of regression. Gate on paired perplexity, not just greedy token match.
+#   - per-site weight rel-L2 can disagree with the end-to-end quality result IN SIGN (g32 measured
+#     BETTER at every site, 0.569% vs 0.654% at the head, and was worse end to end). Do not judge a
+#     format change from a weight-space norm alone.
 [artifacts]
-decode = "artifacts/gemma4-12b/decode_int8g32"
-weights = "artifacts/gemma4-12b/weights_int8g32"
+decode = "artifacts/gemma4-12b/decode_int8g64_planar"
+weights = "artifacts/gemma4-12b/weights_int8g64_planar"
 tokenizer_dir = "artifacts/gemma4-12b/tokenizer"
 
 [generation]

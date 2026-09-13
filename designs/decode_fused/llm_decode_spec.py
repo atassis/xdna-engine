@@ -247,7 +247,7 @@ L1_RESERVE = 8192     # stack + the allocator's own slack; measured headroom, no
 C_TILE_GRANULE = 8    # tile_size_output must be a multiple of this (16 bytes of bf16); see gemv_tile_output
 
 
-def gemv_tile_output(M, K, cols=8, tsi=None):
+def gemv_tile_output(M, K, cols=8, tsi=None, a_row_bytes=None):
     """Largest legal `tile_size_output` for a GEMV that also FITS L1.
 
     Two independent constraints, and only the first is checked by the toolchain:
@@ -264,8 +264,16 @@ def gemv_tile_output(M, K, cols=8, tsi=None):
     vocab 151936 -> 18992 elements -> 37984 B, double-buffered 76 KB against 64 KB of L1. Both the
     retired gen_gemma_decode.py (vocab//8 = 32768, see git history) and a naive port hit this.
 
+    `a_row_bytes` is one A row's width in BYTES. Default None keeps the bf16 model below
+    (`K * 2`), which is what every caller has always got and what every shipped tiling was chosen
+    against. A QUANTIZED design's row is `iron.common.quant.row_stride_bytes` -- 1.125*K at int8
+    g32, so the bf16 model overstates its A tile by 1.78x and refuses tilings that fit. It is
+    opt-in rather than derived from weight_dtype here because changing it silently would re-tile
+    every existing artifact.
+
     Returns (tile_size_input, tile_size_output).
     """
+    a_row_bytes = K * 2 if a_row_bytes is None else a_row_bytes
     per_col = M // cols
     # m_input must shrink too: the A tile is m_input x K, so at K=3072 (the FFN down projection)
     # A+B double-buffered already exceed L1 at m_input=4 and leave the C tile nothing. Search
@@ -279,7 +287,7 @@ def gemv_tile_output(M, K, cols=8, tsi=None):
     for cand_tsi in ([tsi] if tsi is not None else (4, 2, 1)):
         if per_col % cand_tsi:
             continue
-        budget = L1_BYTES - L1_RESERVE - 2 * (cand_tsi * K * 2) - 2 * (K * 2)
+        budget = L1_BYTES - L1_RESERVE - 2 * (cand_tsi * a_row_bytes) - 2 * (K * 2)
         if budget <= 0:
             continue
         cap = budget // 4                  # C is double-buffered, 2 bytes per element
