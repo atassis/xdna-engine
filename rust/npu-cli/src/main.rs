@@ -1231,13 +1231,18 @@ fn model_show(path: &Path, model: &str, as_json: bool) -> Result<()> {
     let d = declared(root.as_ref(), &m.scenario);
     if as_json {
         println!("{}", serde_json::json!({"id": m.name, "scenario": m.scenario,
-            "pinned": m.resident, "kind": d.kind, "precision": d.precision}));
+            "pinned": m.resident, "kind": d.kind, "precision": d.precision,
+            "max_seq": d.max_seq}));
     } else {
         println!("{:<12} {}", "NAME", m.name);
         println!("{:<12} {}", "SCENARIO", m.scenario);
         println!("{:<12} {}", "ENABLED", m.resident);
         println!("{:<12} {}", "KIND", d.kind.as_deref().unwrap_or("-"));
+        println!("{:<12} {}", "CONTEXT", context_cell(d.max_seq, d.scenario_max_seq));
         println!("{:<12} {}", "PRECISION", precision_cell(&d));
+        if let Some(detail) = verbose_detail(root.as_ref(), &m.scenario) {
+            println!("{:<12} {detail}", "DETAIL");
+        }
     }
     Ok(())
 }
@@ -2448,6 +2453,24 @@ mod tests {
         let p = dir.path().join("engine.toml");
         std::fs::write(&p, "[[model]]\nname = \"a\"\nscenario = \"s\"\n").unwrap();
         assert!(model_show(&p, "does-not-exist", false).is_err());
+    }
+
+    #[test]
+    fn show_includes_context_and_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("s.toml"), concat!(
+            "[scenario]\nkind = \"embeddings\"\nname = \"x\"\n",
+            "[model]\nhidden = 768\nff = 3072\nn_heads = 12\nhead_dim = 64\n",
+            "n_layers = 12\nmax_seq = 512\n",
+            "[artifacts]\n",
+        )).unwrap();
+        let cfg_path = dir.path().join("engine.toml");
+        std::fs::write(&cfg_path,
+            format!("[[model]]\nname = \"a\"\nscenario = \"{}\"\n",
+                dir.path().join("s.toml").display())).unwrap();
+        assert!(model_show(&cfg_path, "a", false).is_ok());
+        assert!(model_show(&cfg_path, "does-not-exist", false).is_err(),
+            "an unknown name must be a real error, not a blank report");
     }
 
     /// The unit name must be READ, not guessed. The first version hardcoded `npu-asr`, which
