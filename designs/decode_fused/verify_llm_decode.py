@@ -435,7 +435,7 @@ def main():
             # the global layers the sliding layers' KV offset.
             # THIS SEGMENT'S slots, not the whole graph's: the names are per geometry, so a
             # segment with no global layer has no `kv_off1` and writing one raises.
-            for slot_name, slot_hd in _st["sg"]["kv_slots"]:
+            for slot_name, slot_hd, slot_w, slot_mask in _st["sg"]["geom_slots"]:
                 # `kv_layout.kv_off` owns this formula (main), but it needs kv_heads for the block
                 # stride and `kv_slots` carries only head_dim. At T == S the block term vanishes
                 # (block 0, within == pos) and the two agree exactly, which is every artifact built
@@ -446,9 +446,13 @@ def main():
                         f"[verify] blocked KV (T={T}, S={S}) with per-layer geometry is not wired: "
                         f"kv_slots carry head_dim but not kv_heads, and the block stride needs both. "
                         f"Emit kv_heads per slot in gen_llm_decode.py before using this combination.")
-                _kvl = KVLayout(Hkv=sp.n_kv_heads, S=S, HD=slot_hd, T=T)
-                _sp_.write(slot_name, int(_kvl.kv_off(pos)))
-            _sp_.write("sm_mask", int(pos + 1))
+                # SLIDING_KV_CIRCULAR: this geometry's capacity is slot_w, not the build's S. The
+                # cache wraps (pos % slot_w) and the mask clamps to the same bound -- see
+                # gen_llm_decode.py's SLIDING_KV_CIRCULAR doc for why this is exact, not an
+                # approximation (softmax order-independence + RoPE at absolute-position write time).
+                _kvl = KVLayout(Hkv=sp.n_kv_heads, S=slot_w, HD=slot_hd, T=min(T, slot_w))
+                _sp_.write(slot_name, int(_kvl.kv_off(pos % slot_w)))
+                _sp_.write(slot_mask, min(pos + 1, slot_w))
             if window_granule is not None:
                 # params.write() pre-shifts "core"-kind params by name, so the raw length is
                 # correct here. Clamp to this build's S: window_len can round past the window the

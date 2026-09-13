@@ -117,9 +117,14 @@ def main():
     # rotating against a buffer the host never wrote).
     rope_g = c.get_buffer("rope_global") if "rope_global" in md["inputs"] else None
     rope_l = c.get_buffer("rope_local") if "rope_local" in md["inputs"] else None
-    # One KV offset per distinct head_dim: `pos * head_dim` is two different byte offsets here.
-    kv_slots = [(nm, KVLayout(Hkv=sp.n_kv_heads, S=S, HD=hd, T=md["T"]))
-                for nm, hd in md["kv_slots"]] or [("kv_off", kv_layout)]
+    # One (kv_off, sm_mask) pair per distinct GEOMETRY, off geom_slots -- not kv_slots/mask_slots
+    # alone, which cannot be zipped positionally (mask_slots is keyed by distinct WINDOW, so two
+    # geometries sharing one window collapse to its single entry while kv_slots still has two; see
+    # gen_llm_decode.py's geom_slots comment). Falls back to the pre-existing single-slot form when
+    # the build predates geom_slots (older artifacts, or SLIDING_KV_CIRCULAR-unaware paths).
+    geom_slots = md.get("geom_slots") or [("kv_off", HD, S, "sm_mask")]
+    geoms = [(nm, KVLayout(Hkv=sp.n_kv_heads, S=ww, HD=hd, T=min(md["T"], ww)), ww, mn)
+             for nm, hd, ww, mn in geom_slots]
 
     nll, t0, top1_hits, n_sat = [], time.perf_counter(), 0, 0
     for pos in range(n):
@@ -132,9 +137,14 @@ def main():
         if rope_l is not None:
             with rope_l.overwrite() as _buf:
                 _buf[:] = rope_row(pos, _buf.size, sp.rope_theta_local).reshape(-1)
-        for _slot, _kvl in kv_slots:
-            params.write(_slot, int(_kvl.kv_off(pos)))
-        params.write("sm_mask", int(pos + 1))
+        # SLIDING_KV_CIRCULAR: this geometry's capacity is ww, not the build's S. The cache wraps
+        # (pos % ww) and the mask clamps to the same bound -- exact, not approximate, because
+        # softmax is order-independent and RoPE is written against the ABSOLUTE position above, so
+        # a rotated slot ordering downstream is not observable. See gen_llm_decode.py's
+        # SLIDING_KV_CIRCULAR doc.
+        for _slot, _kvl, _ww, _mask in geoms:
+            params.write(_slot, int(_kvl.kv_off(pos % _ww)))
+            params.write(_mask, min(pos + 1, _ww))
         if window_granule is not None:
             # A dynamic-window build reads its attended length from this parameter every dispatch.
             # Omitting it does NOT fail -- the core reads whatever the scratchpad happens to hold,

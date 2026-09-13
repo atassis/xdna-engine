@@ -358,6 +358,20 @@ WEIGHT_DEPTH = int(os.environ.get("WEIGHT_DEPTH", "2"))
 # ONE argument to it plus the operators' own alloc_M/alloc_K. Default 0 = capacity is the window,
 # byte for byte the pre-existing build.
 KV_ALLOC = int(os.environ.get("KV_ALLOC", "0"))
+# SLIDING_KV_CIRCULAR -- give layers with a declared `sliding_window` (spec.sliding_window) a
+# per-geometry KV cache sized to the WINDOW instead of the build's max_seq, addressed circularly:
+# kv_off = (pos % W) * head_dim, sm_mask = min(pos+1, W). Correct because softmax is
+# order-independent and RoPE is applied at KV-append time against the ABSOLUTE position, so a
+# rotated slot ordering downstream is not observable -- see g4-t3-sliding-window.md. `mask_bf16`
+# (aie_kernels/aie2p/softmax.cc) already masks the SUFFIX [unmasked, total), which is exactly what
+# circular warmup (pos < W) needs, so no kernel changes.
+#
+# HOST-HARNESS ONLY as of 2026-09-14: verify_llm_decode.py and eval_llm_perplexity.py compute the
+# modulo; the Rust serving path's Artifact::kv_offs writes `pos * head_dim` uniformly for every
+# slot in `kv_params` (this file's own comment on `kv_slots`, below) and does NOT know about this
+# flag. A build with this on is NOT safe to serve from `npu generate` -- it will write past the
+# smaller buffer the moment n_past exceeds W. Default 0 = today's graph, byte-for-byte unchanged.
+SLIDING_KV_CIRCULAR = os.environ.get("SLIDING_KV_CIRCULAR", "0") == "1"
 # Pin the persistent buffers (weights + KV cache) to the FRONT of the scratch arena so window
 # buckets present ONE layout for everything that survives a bucket crossing. Without it the
 # window-sized softmax scratch (sc/sw, Hq*S) sits ahead of them and shifts every later offset:
@@ -1354,7 +1368,26 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
     # the slot, not restated at the meta site, because the pairing IS the contract: which slot a
     # layer's KV-append reads and which head_dim scales it are the same decision.
     kv_slots = []
+    # One (scratchpad slot, window) pair per DISTINCT geometry that gets its OWN softmax/mask --
+    # same contract as kv_slots, appended beside the Softmax op that consumes it. Empty (today's
+    # default) means every geometry shares the ONE build-wide `sm_mask` built outside attn_ops;
+    # SLIDING_KV_CIRCULAR is what makes this list non-empty.
+    mask_slots = []
+    # Per-GEOMETRY record, kept separate from kv_slots (whose 2-tuple shape other call sites
+    # already destructure -- extending it would break them). One entry per distinct geometry,
+    # carrying everything a host loop needs to drive it: which kv_off slot, its head_dim, this
+    # geometry's own capacity, and which sm_mask slot pairs with it. kv_slots and mask_slots
+    # cannot be zipped positionally for this -- mask_slots is keyed by DISTINCT WINDOW, so two
+    # geometries sharing one window (every artifact before this flag) collapse to ONE mask_slots
+    # entry while kv_slots still has two.
+    geom_slots = []
     _attn_cache = {}
+    # Softmax/scale keyed by WINDOW, not by the full geometry key: two geometries sharing a window
+    # (today, always -- both at S) must share the SAME design object, exactly as the pre-existing
+    # single build-wide op_softmax did, or gemma4-12b's default build silently gains a second
+    # configure block it did not have. Only SLIDING_KV_CIRCULAR narrowing one geometry's w away
+    # from S makes this cache produce more than one entry.
+    _win_cache = {}
 
     def attn_ops(hd, hkv, has_v):
         """The ops shaped by one (head_dim, n_kv_heads, has_v_proj) triple.
@@ -1367,6 +1400,33 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         if (hd, hkv, has_v) in _attn_cache:
             return _attn_cache[(hd, hkv, has_v)]
         qd, kvd, gqa = Hq * hd, hkv * hd, Hq // hkv
+        # This geometry's own attention capacity. The GLOBAL geometry (identified by matching
+        # spec.global_head_dim/global_n_kv_heads, not by an explicit flag -- attn_ops is keyed
+        # purely on (hd, hkv, has_v)) always stays at the build's max_seq; a declared
+        # sliding_window narrows every OTHER geometry only under SLIDING_KV_CIRCULAR.
+        is_global_geom = hd == sp.global_head_dim and hkv == sp.global_n_kv_heads
+        w = (S if (is_global_geom or not SLIDING_KV_CIRCULAR or sp.sliding_window is None)
+             else sp.sliding_window)
+        KVA_g = KV_ALLOC or w
+        # T (the KVLayout block size) is derived once, globally, against S -- today always S
+        # itself (flat, "one block"). A geometry whose own capacity is w < T needs its OWN flat
+        # block size, or the GEMV/TMatVec block_size%alloc_M==0 check fails (T does not divide a
+        # smaller alloc). Keeping the same "one block" convention this build already uses for S
+        # means T_g is simply w, not a blocking scheme of its own.
+        T_g = min(T, w)
+        if w not in _win_cache:
+            # First geometry at this window keeps the bare name "sm_mask" -- same convention as
+            # kv_slots's bare "kv_off", and for the same reason (baked into the design, host's
+            # pre-list fallback reads that spelling).
+            mask_slot = "sm_mask" if not mask_slots else f"sm_mask{len(mask_slots)}"
+            mask_slots.append((mask_slot, w))
+            win_softmax = Softmax(rows=Hq, cols=w, num_aie_columns=sp.softmax_cols(COLS),
+                                  num_channels=1, rtp_vector_size=w,
+                                  vector_size_parameter=mask_slot, context=ctx)
+            win_scale = ElementwiseMul(size=Hq * w, tile_size=w // COLS, num_aie_columns=COLS,
+                                       context=ctx)
+            _win_cache[w] = (win_softmax, win_scale, mask_slot)
+        op_softmax, op_scale, mask_slot = _win_cache[w]
         dp_why = qkv_dp_why[(hd, hkv, has_v)]
         op_qk_norm = RMSNorm(size=hd, num_aie_columns=1, num_channels=1, tile_size=hd,
                              weighted=True, epsilon=sp.eps, context=ctx) if sp.qk_norm else None
@@ -1433,9 +1493,10 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         # host's pre-list fallback reads that spelling.
         slot = "kv_off" if not kv_slots else f"kv_off{len(kv_slots)}"
         kv_slots.append((slot, hd))
+        geom_slots.append((slot, hd, w, mask_slot))
         sc = dict(input_sizes=(hkv, hd), input_strides=(hd, 1), input_offset=0,
-                  output_sizes=(1, hkv, hd), output_strides=(0, S * hd, 1), output_offset=0,
-                  input_buffer_size=hkv * hd, output_buffer_size=hkv * S * hd, num_aie_channels=1)
+                  output_sizes=(1, hkv, hd), output_strides=(0, w * hd, 1), output_offset=0,
+                  input_buffer_size=hkv * hd, output_buffer_size=hkv * w * hd, num_aie_channels=1)
         op_sck = StridedCopy(**sc, output_offset_parameter=slot, context=ctx)
         # V stays [S][hd]. A transposed append would delete op_trv, but a SINGLE-token transposed
         # write is 1024 isolated bf16 elements (h*hd*S + d*S + p) and the shim address generator
@@ -1463,8 +1524,8 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         # so "read/write a narrower window of a wider-strided buffer" is new IRON capability, not a
         # generator change. Bucketing S UNIFORMLY (this build already takes it as `max_seq`) is the
         # route that needs none.
-        op_rep_k = Repeat(rows=hkv, cols=S * hd, repeat=gqa, transfer_size=hd, context=ctx)
-        op_rep_v = Repeat(rows=hkv, cols=S * hd, repeat=gqa, transfer_size=hd, context=ctx)
+        op_rep_k = Repeat(rows=hkv, cols=w * hd, repeat=gqa, transfer_size=hd, context=ctx)
+        op_rep_v = Repeat(rows=hkv, cols=w * hd, repeat=gqa, transfer_size=hd, context=ctx)
         # GQA's own group_reuse gate (gemv/design.py) DECLINES batch_group > MAX_GROUP_REUSE (a
         # measured shim-BD ceiling) and falls back to a stride-0 outer BD that re-reads the whole
         # matrix once per query head -- measured 14.71x on Gemma-4's global layers (hkv=1,
@@ -1488,12 +1549,12 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                 f"calls; gqa={gqa} (hd={hd}) is not a multiple of it"
             )
             scores_groups = gqa // MAX_GROUP_REUSE
-            op_scores = gemv(S, hd, ctx, num_batches=MAX_GROUP_REUSE, batch_group=MAX_GROUP_REUSE,
-                                 block_size=T, alloc_M=None if KVA == S else KVA)
+            op_scores = gemv(w, hd, ctx, num_batches=MAX_GROUP_REUSE, batch_group=MAX_GROUP_REUSE,
+                                 block_size=T_g, alloc_M=None if KVA_g == w else KVA_g)
         else:
             scores_groups = 1
-            op_scores = gemv(S, hd, ctx, num_batches=Hq, batch_group=gqa if GROUPED_K else 1,
-                                 block_size=T, alloc_M=None if KVA == S else KVA)
+            op_scores = gemv(w, hd, ctx, num_batches=Hq, batch_group=gqa if GROUPED_K else 1,
+                                 block_size=T_g, alloc_M=None if KVA_g == w else KVA_g)
         # num_batches=Hq, not Hq separate invocations. transpose/design.py's L3 tensors already hold
         # "num_batches contiguous (M,N) matrices stacked along the row dimension", which is EXACTLY
         # what vr/vt are; calling it per head issued 448 configure+run pairs per token to do 28 ops'
@@ -1513,7 +1574,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         # duplicated it into DDR disappears. Opt-in per side because k and v are not the same edit
         # (k: Repeat feeds the GEMV; v: Repeat feeds a Transpose that feeds the GEMV), so they must
         # be gated separately to stay attributable in an A/B ladder.
-        op_trv = Transpose(M=S, N=hd, num_aie_columns=4, num_channels=1, m=256, n=32, s=8,
+        op_trv = Transpose(M=w, N=hd, num_aie_columns=4, num_channels=1, m=256, n=32, s=8,
                            num_batches=Hq, batch_group=gqa if GROUPED_V else 1, context=ctx)
         # CONTEXT STEP. op_trv exists only because gemv reduces ALONG a row: it wants [hd][S] and
         # the cache is [S][hd], so the whole cache is rearranged every token -- 16.777 MB/layer
@@ -1527,11 +1588,11 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         rpc = tmv_rpc.get(hd)
         uses_tmv = rpc is not None
         if uses_tmv:
-            op_ctx = TMatVec(M=hd, K=S, num_aie_columns=hkv, num_batches=Hq, batch_group=gqa,
-                                 alloc_K=None if KVA == S else KVA, block_size=T,
+            op_ctx = TMatVec(M=hd, K=w, num_aie_columns=hkv, num_batches=Hq, batch_group=gqa,
+                                 alloc_K=None if KVA_g == w else KVA_g, block_size=T_g,
                              rows_per_chunk=rpc, context=ctx)
         else:
-            op_ctx = gemv(hd, S, ctx, num_batches=Hq)
+            op_ctx = gemv(hd, w, ctx, num_batches=Hq)
         g = SimpleNamespace(
             hd=hd, hkv=hkv, qd=qd, kvd=kvd, gqa=gqa, kv_slot=slot, o_chunks=o_chunks,
             op_qk_norm=op_qk_norm, op_qk_norm_b=op_qk_norm_b, op_qkv=op_qkv, op_q=op_q,
@@ -1539,7 +1600,9 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
             op_rope_q=op_rope_q, op_rope_k=op_rope_k, op_sck=op_sck, op_scv=op_scv,
             op_rep_k=op_rep_k, op_rep_v=op_rep_v, op_scores=op_scores, op_trv=op_trv,
             op_ctx=op_ctx, op_v_norm=op_v_norm, has_v=has_v, kv_parts=kv_parts,
-            uses_tmv_ctx=uses_tmv, scores_groups=scores_groups)
+            uses_tmv_ctx=uses_tmv, scores_groups=scores_groups,
+            op_softmax=op_softmax, op_scale=op_scale, mask_slot=mask_slot, window=w,
+            circular=(w != S))
         _attn_cache[(hd, hkv, has_v)] = g
         return g
 
@@ -1903,8 +1966,10 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
             else:
                 weights[p + "Wqkv"] = np.concatenate(qkv_parts)
         # Size is layout-independent (T < S rearranges the same elements), but it is
-        # PER GEOMETRY: Gemma-4 global layers are hkv=1/hd=512 against sliding 8/256.
-        _kvl = KVLayout(Hkv=g.hkv, S=S, HD=g.hd, T=T)
+        # PER GEOMETRY: Gemma-4 global layers are hkv=1/hd=512 against sliding 8/256, and under
+        # SLIDING_KV_CIRCULAR the capacity itself (g.window) is per geometry too, not just the
+        # shape -- g.window degrades to S when the flag is off or this geometry is global.
+        _kvl = KVLayout(Hkv=g.hkv, S=g.window, HD=g.hd, T=min(T, g.window))
         weights[p + "kc"] = np.zeros(_kvl.total_elems, BF16)
         weights[p + "vc"] = np.zeros(_kvl.total_elems, BF16)
         cache_names += [p + "kc", p + "vc"]
@@ -1948,8 +2013,8 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         # 28 layers that is 672 MiB of arena that nothing reads -- 33.8% of the 1.99 GiB scratch,
         # and it reconciles exactly: 1.9898 GiB total minus 1.32904 GiB of named buffers = 0.661.
         bufsz.update({
-            p + "kc": g.hkv * S * g.hd * 2, p + "vc": g.hkv * S * g.hd * 2,
-            p + "sc": Hq * S * 2, p + "sw": Hq * S * 2,
+            p + "kc": g.hkv * g.window * g.hd * 2, p + "vc": g.hkv * g.window * g.hd * 2,
+            p + "sc": Hq * g.window * 2, p + "sw": Hq * g.window * 2,
             p + "cx": g.qd * 2,
             p + "g": FF * 2, p + "u": FF * 2, p + "gh": FF * 2, p + "d": D * 2,
             # every partial and fold-level buffer the K-split introduces; the names come FROM
@@ -1961,11 +2026,11 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
             p + "hn": D * 2, p + "hf": D * 2,
         })
         if not GROUPED_K:
-            bufsz[p + "kr"] = Hq * S * g.hd * 2
+            bufsz[p + "kr"] = Hq * g.window * g.hd * 2
         if not (GROUPED_V or g.uses_tmv_ctx):
-            bufsz[p + "vr"] = Hq * S * g.hd * 2
+            bufsz[p + "vr"] = Hq * g.window * g.hd * 2
         if not g.uses_tmv_ctx:
-            bufsz[p + "vt"] = Hq * S * g.hd * 2
+            bufsz[p + "vt"] = Hq * g.window * g.hd * 2
         # `a` is purely internal to op_mlp_dp's own fuse_o path (never an L3 buffer -- see
         # design.py) once folded; only declare it when something outside that design still reads
         # or writes it.
@@ -2038,8 +2103,8 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                 # Repeat would materialise a `vr` nothing consumes.
                 *([] if (GROUPED_V or g.uses_tmv_ctx) else [(g.op_rep_v, p + "vc", p + "vr")]),
                 *scores_runlist(p, g, ref_q),
-                *([] if scale_in_qnorm else [(op_scale, p + "sc", "attn_scale", p + "sc")]),
-                (op_softmax, p + "sc", p + "sw"),
+                *([] if scale_in_qnorm else [(g.op_scale, p + "sc", "attn_scale", p + "sc")]),
+                (g.op_softmax, p + "sc", p + "sw"),
                 *([] if g.uses_tmv_ctx else
                   [(g.op_trv, p + ("vc" if GROUPED_V else "vr"), p + "vt")]),
                 (g.op_ctx, p + ("vc" if g.uses_tmv_ctx else "vt"), p + "sw", p + "cx"),
@@ -2238,9 +2303,17 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         # would silently skip a slot that SHOULD have been there.
         seg_hds = {sp.head_dim_for(l) for l in range(la, lb)}
         seg_kv_slots = [(n, hd) for n, hd in kv_slots if hd in seg_hds]
+        seg_geom_slots = [(n, hd, ww, mn) for n, hd, ww, mn in geom_slots if hd in seg_hds]
+        # Same reasoning as seg_kv_slots, one axis over: a segment whose layers are all one
+        # geometry has no reason to declare the OTHER geometry's mask slot.
+        seg_ws = {sp.sliding_window if (SLIDING_KV_CIRCULAR and sp.sliding_window is not None
+                                        and not sp.is_global(l)) else S
+                 for l in range(la, lb)}
+        seg_mask_slots = [(n, ww) for n, ww in mask_slots if ww in seg_ws]
         segments.append(dict(seq=seq, layers=(la, lb), inlet=seg_in, outlet=seg_out,
                              weights=seg_weights, caches=seg_caches, inputs=seg_inputs,
-                             kv_slots=seg_kv_slots))
+                             kv_slots=seg_kv_slots, mask_slots=seg_mask_slots,
+                             geom_slots=seg_geom_slots))
         if len(cuts) > 1:
             print(f"[gen] segment {si}: layers {la}..{lb - 1}, {seg_in} -> {seg_out}, "
                   f"{len(seg_weights)} weights, arena {seq.buffer_sizes[2] / 2**30:.3f} GiB",
@@ -2276,7 +2349,8 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                                     head=head, split_lm_head=SPLIT_LM_HEAD,
                                     segments=segments, layer_marks=layer_marks,
                                     embed_blob=embed_blob, host_embed=host_embed,
-                                    kv_slots=kv_slots)
+                                    kv_slots=kv_slots, mask_slots=mask_slots,
+                                    geom_slots=geom_slots)
 
 
 def main():
@@ -2381,6 +2455,17 @@ def main():
         "scratchpad": {"params": scratchpad_params, "kv_param": "kv_off",
                        "mask_param": "sm_mask",
                        "kv_params": [{"param": n, "head_dim": hd} for n, hd in md["kv_slots"]],
+                       # mask_params mirrors kv_params one axis over: one entry per DISTINCT
+                       # window this build actually declared a Softmax for. A single entry here
+                       # (today's default, and every artifact before SLIDING_KV_CIRCULAR) means
+                       # every geometry shares "sm_mask" -- byte-identical to before this existed.
+                       "mask_params": [{"param": n, "window": ww} for n, ww in md["mask_slots"]],
+                       # Per-GEOMETRY join of the two lists above -- see geom_slots's own comment
+                       # at its declaration. Not consumed by the Rust host as of 2026-09-14 (see
+                       # SLIDING_KV_CIRCULAR's own doc); present so a future consumer has the
+                       # pairing without re-deriving it, and so this artifact is self-describing.
+                       "kv_windows": [{"kv_param": n, "head_dim": hd, "window": ww,
+                                      "mask_param": mn} for n, hd, ww, mn in md["geom_slots"]],
                        "head_dim": HD, "kv_heads": Hkv,
                        **({"window_param": "attn_window"} if dynamic_window else {})},
         "dims": {"layers": NL, "d_model": D, "q_heads": Hq, "kv_heads": Hkv, "head_dim": HD,
@@ -2392,6 +2477,11 @@ def main():
                  # consumer reads that as the stock order, which is what those artifacts hold.
                  "wqkv_head_major": decode_layer_active,
                  "sliding_window": sp.sliding_window, "sw_pattern": sp.sw_pattern,
+                 # Declared BEFORE this existed too (sliding_window/sw_pattern above), but never
+                 # wired to anything on-device -- this is the one field a host harness needs to
+                 # tell "declared and honoured" apart from "declared and ignored" without grepping
+                 # env vars the artifact itself does not otherwise record.
+                 "sliding_kv_circular": SLIDING_KV_CIRCULAR,
                  # The runtime attn_window value's required granularity -- lcm(stream-tile rows,
                  # kv block), computed once at op construction (decode_layer_dp/op.py's
                  # window_granule). Ships explicitly so the host never re-derives it from
