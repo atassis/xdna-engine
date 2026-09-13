@@ -75,19 +75,14 @@ def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k):
     import ml_dtypes
     BF16 = ml_dtypes.bfloat16
 
-    # Refuse rather than approximate. Every one of these axes is a same-name-different-meaning trap
-    # that llm_decode_spec.py's header already catalogues, and a reference that quietly runs the
-    # wrong one is worse than no reference: it fails the device for the reference's bug.
-    for flag, why in ((sp.rope_theta_local is not None, "local/global split RoPE theta"),
-                      (sp.sliding_window is not None, "sliding-window attention"),
-                      (sp.sandwich_norms, "sandwich norms (the pre/post-FFN weight NAMES move "
-                                          "with them -- Gemma's post_attention_layernorm is a "
-                                          "different tensor from Qwen3's)")):
-        if flag:
-            raise SystemExit(f"ERROR: spec {sp.name} has {why}, which this reference does not "
-                             f"implement. Implement it; do not let a plainer forward pass stand in.")
-    NL, D, HD = sp.n_layers, sp.d_model, sp.head_dim
-    Hq, Hkv, grp = sp.n_q_heads, sp.n_kv_heads, sp.gqa_group
+    # Refuse rather than approximate: an axis this reference does not know the shape of (a rope_type
+    # other than the one Gemma-4 actually uses) is exactly the same-name-different-meaning trap the
+    # sandwich/dual-theta/sliding-window/per-layer-geometry axes below already were.
+    if sp.rope_type_global not in (None, "proportional"):
+        raise SystemExit(f"ERROR: spec {sp.name} has rope_type_global={sp.rope_type_global!r}, "
+                         f"which this reference only implements for 'proportional'.")
+    NL, D = sp.n_layers, sp.d_model
+    dual_rope = sp.rope_theta_local is not None
 
     def npy(n):
         """bf16-quantise on load: the reference must start from the weights the DEVICE holds, so
@@ -95,8 +90,26 @@ def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k):
         a = np.load(os.path.join(weights_dir, f"{n}.npy")).astype(np.float32)
         return np.asarray(np.asarray(a, BF16), np.float32)
 
-    def rms(x, w):
-        g = (1.0 + w) if sp.norm_gain == "one_plus_w" else w
+    def npy_bf16(n):
+        """Like `npy`, but STAYS bf16 -- for the big per-layer/embedding matrices only.
+
+        Gemma-4-12B's dump is 45GB of float32 .npy on disk; holding every layer's projection
+        weights upcast to float32 at once (the shape `npy()` above returns) does not fit this box's
+        RAM (30GB). Kept bf16-resident (22.5GB) and widened to float32 per matmul call in `mm()`
+        below instead -- the SAME rounding, just deferred. Measured: a 3840x15360 cast is 11.8ms at
+        10 GB/s, so re-casting the whole model's weights once per position (~22.5GB) costs ~2.3s;
+        over an 800-position run that is ~30 minutes of pure cast overhead, not hours.
+        """
+        return np.asarray(np.load(os.path.join(weights_dir, f"{n}.npy")).astype(np.float32), BF16)
+
+    def mm(w_bf16, v):
+        return w_bf16.astype(np.float32) @ v
+
+    def rms(x, w=None):
+        """`w=None` is the v_norm case: gainless (with_scale=False in the checkpoint, so there is no
+        weight tensor to load -- multiplying by 1.0 is the operator's own definition, not a stand-in
+        for a missing one)."""
+        g = 1.0 if w is None else ((1.0 + w) if sp.norm_gain == "one_plus_w" else w)
         return x / np.sqrt((x * x).mean(-1, keepdims=True) + sp.eps) * g
 
     def act(x):
@@ -104,54 +117,105 @@ def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k):
             return x / (1.0 + np.exp(-np.clip(x, -60, 60)))
         return 0.5 * x * (1.0 + np.tanh(0.7978845608 * (x + 0.044715 * x ** 3)))
 
-    inv = 1.0 / (sp.rope_theta_global ** (np.arange(0, HD, 2, dtype=np.float64)[:HD // 2] / HD))
-
-    def rope(v, pos):
+    def rope(v, pos, hd, theta, partial):
+        """`partial` zeroes the inverse frequency past `int(partial*hd//2)` pairs -- a zero
+        frequency is the identity rotation -- matching gen_llm_prefill.rope_table's "proportional"
+        rule exactly (same derivation, one position instead of a row per chunk)."""
+        inv = 1.0 / (theta ** (np.arange(0, hd, 2, dtype=np.float64)[:hd // 2] / hd))
+        if partial is not None:
+            inv[int(partial * hd // 2):] = 0.0
         c, s = np.cos(pos * inv).astype(np.float32), np.sin(pos * inv).astype(np.float32)
-        v = v.reshape(-1, HD)
-        x1, x2 = v[:, :HD // 2], v[:, HD // 2:]
+        v = v.reshape(-1, hd)
+        x1, x2 = v[:, :hd // 2], v[:, hd // 2:]
         return np.concatenate([x1 * c - x2 * s, x2 * c + x1 * s], -1).reshape(-1)
 
-    embed, n_final = npy("model.embed_tokens.weight"), npy("model.norm.weight")
-    names = [("n_in", "input_layernorm.weight"), ("n_pf", "post_attention_layernorm.weight"),
-             ("Wq", "self_attn.q_proj.weight"), ("Wk", "self_attn.k_proj.weight"),
-             ("Wv", "self_attn.v_proj.weight"), ("Wo", "self_attn.o_proj.weight"),
-             ("Wg", "mlp.gate_proj.weight"), ("Wu", "mlp.up_proj.weight"),
-             ("Wd", "mlp.down_proj.weight")]
-    if sp.qk_norm:
-        names += [("n_qn", "self_attn.q_norm.weight"), ("n_kn", "self_attn.k_norm.weight")]
-    Wt = {l: {k_: npy(f"model.layers.{l}.{v}") for k_, v in names} for l in range(NL)}
+    def rope_for(l, v, pos):
+        """Dual-theta: the global geometry rotates its OWN head_dim (which may differ from the
+        sliding one -- 512 vs 256 on Gemma-4) and, on Gemma-4, only a fraction of it; the sliding
+        geometry always rotates its full head_dim at the local theta. Single-theta specs get
+        rope_theta_global everywhere and no partial rotary, matching gen_llm_prefill's non-dual arm."""
+        hd = sp.head_dim_for(l)
+        if not dual_rope:
+            return rope(v, pos, hd, sp.rope_theta_global, None)
+        g = sp.is_global(l)
+        theta = sp.rope_theta_global if g else sp.rope_theta_local
+        partial = sp.rope_partial_rotary if g else None
+        return rope(v, pos, hd, theta, partial)
+
+    embed = npy_bf16(f"{sp.weight_prefix}embed_tokens.weight")
+    n_final = npy(f"{sp.weight_prefix}norm.weight")
+
+    Wt = {}
+    for l in range(NL):
+        p = f"{sp.weight_prefix}layers.{l}."
+        w = {k_: npy(v) for k_, v in sp.norm_weight_names(l).items()}
+        w["Wq"] = npy_bf16(p + "self_attn.q_proj.weight")
+        w["Wk"] = npy_bf16(p + "self_attn.k_proj.weight")
+        if sp.has_v_proj(l):
+            w["Wv"] = npy_bf16(p + "self_attn.v_proj.weight")
+        w["Wo"] = npy_bf16(p + "self_attn.o_proj.weight")
+        w["Wg"] = npy_bf16(p + "mlp.gate_proj.weight")
+        w["Wu"] = npy_bf16(p + "mlp.up_proj.weight")
+        w["Wd"] = npy_bf16(p + "mlp.down_proj.weight")
+        if sp.layer_scalar:
+            w["ls"] = float(npy(sp.layer_scalar_name(l)).reshape(-1)[0])
+        Wt[l] = w
 
     S = len(prompt_ids) + n_tokens + 1
-    kc = [np.zeros((Hkv, S, HD), np.float32) for _ in range(NL)]
-    vc = [np.zeros((Hkv, S, HD), np.float32) for _ in range(NL)]
+    kc = [np.zeros((sp.n_kv_heads_for(l), S, sp.head_dim_for(l)), np.float32) for l in range(NL)]
+    vc = [np.zeros((sp.n_kv_heads_for(l), S, sp.head_dim_for(l)), np.float32) for l in range(NL)]
     scale = np.sqrt(D) if sp.embed_scale == "sqrt_d_model" else 1.0
+    attn_scale = sp.attn_scale
 
     produced, tops, margins = [], [], []
     tok = prompt_ids[0]
     for pos in range(len(prompt_ids) + n_tokens - 1):
-        x = embed[tok] * scale
+        x = embed[tok].astype(np.float32) * scale
         for l in range(NL):
             w = Wt[l]
+            hd, kvh = sp.head_dim_for(l), sp.n_kv_heads_for(l)
+            grp, has_v, is_glob = sp.n_q_heads // kvh, sp.has_v_proj(l), sp.is_global(l)
+            window = None if (sp.sliding_window is None or is_glob) else sp.sliding_window
+
             h = rms(x, w["n_in"])
-            q, k_, v = w["Wq"] @ h, w["Wk"] @ h, w["Wv"] @ h
+            q, k_ = mm(w["Wq"], h), mm(w["Wk"], h)
+            v = mm(w["Wv"], h) if has_v else None
+            if sp.v_norm:
+                # attention_k_eq_v: v_norm reads the RAW k projection -- before qk-norm and RoPE,
+                # which mutate q/k_ below -- and its output IS v; mirrors gen_llm_prefill.py's
+                # ordering exactly (op_vn runs before qn_runs/op_kn in the emitted op list).
+                src = k_ if not has_v else v
+                v = np.concatenate([rms(src.reshape(kvh, hd)[i]) for i in range(kvh)])
             if sp.qk_norm:
-                q = np.concatenate([rms(q.reshape(Hq, HD)[i], w["n_qn"]) for i in range(Hq)])
-                k_ = np.concatenate([rms(k_.reshape(Hkv, HD)[i], w["n_kn"]) for i in range(Hkv)])
-            q, k_ = rope(q, pos), rope(k_, pos)
-            kc[l][:, pos, :] = k_.reshape(Hkv, HD)
-            vc[l][:, pos, :] = v.reshape(Hkv, HD)
-            qh = q.reshape(Hq, HD)
-            ctx = np.empty((Hq, HD), np.float32)
-            for hh in range(Hq):
-                kv = hh // grp
-                sc = (kc[l][kv, :pos + 1] @ qh[hh]) * sp.attn_scale
+                q = np.concatenate([rms(q.reshape(sp.n_q_heads, hd)[i], w["n_qn"])
+                                    for i in range(sp.n_q_heads)])
+                k_ = np.concatenate([rms(k_.reshape(kvh, hd)[i], w["n_kn"]) for i in range(kvh)])
+            q, k_ = rope_for(l, q, pos), rope_for(l, k_, pos)
+            kc[l][:, pos, :] = k_.reshape(kvh, hd)
+            vc[l][:, pos, :] = v.reshape(kvh, hd)
+            qh = q.reshape(sp.n_q_heads, hd)
+            ctx = np.empty((sp.n_q_heads, hd), np.float32)
+            lo = 0 if window is None else max(0, pos - window + 1)
+            for hh in range(sp.n_q_heads):
+                kvi = hh // grp
+                sc = (kc[l][kvi, lo:pos + 1] @ qh[hh]) * attn_scale
                 sc = np.exp(sc - sc.max())
-                ctx[hh] = (sc / sc.sum()) @ vc[l][kv, :pos + 1]
-            x = x + w["Wo"] @ ctx.reshape(-1)
+                ctx[hh] = (sc / sc.sum()) @ vc[l][kvi, lo:pos + 1]
+            a_out = mm(w["Wo"], ctx.reshape(-1))
+            if sp.sandwich_norms:
+                a_out = rms(a_out, w["n_pa"])
+            x = x + a_out
             hf = rms(x, w["n_pf"])
-            x = x + w["Wd"] @ (act(w["Wg"] @ hf) * (w["Wu"] @ hf))
-        lg = embed @ rms(x, n_final)          # tied lm head
+            d_out = mm(w["Wd"], act(mm(w["Wg"], hf)) * mm(w["Wu"], hf))
+            if sp.sandwich_norms:
+                d_out = rms(d_out, w["n_pff"])
+            x = x + d_out
+            if sp.layer_scalar:
+                x = x * w["ls"]
+        lg = mm(embed, rms(x, n_final))        # tied lm head
+        if sp.logit_softcap is not None:
+            c = sp.logit_softcap
+            lg = c * np.tanh(lg / c)
         ids, vals = topk(lg, k)
         if pos + 1 < len(prompt_ids):
             tok = prompt_ids[pos + 1]         # teacher-force through the prompt
