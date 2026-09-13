@@ -396,7 +396,7 @@ pub enum ModelCmd {
     /// admission (nothing loaded yet), or demoted (an already-resident enable the ceiling was
     /// lowered under, or whose own footprint grew), reported either way rather than declined in
     /// silence. Takes effect immediately on a running server (this command reconciles it
-    /// automatically unless `--no-reload` is given); no restart, no device churn.
+    /// automatically); no restart, no device churn.
     Enable { model: String },
     /// Disable a model: it becomes swept when idle and evictable again. Does NOT force it off the
     /// device right now -- it drains via the ordinary idle sweep/LRU, same as any unpinned model.

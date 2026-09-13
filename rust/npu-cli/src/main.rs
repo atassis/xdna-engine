@@ -44,9 +44,9 @@ fn config_path_and_source(cli: &Cli) -> (PathBuf, &'static str) {
 /// Put SIGPIPE back to its default disposition.
 ///
 /// Rust ignores SIGPIPE at startup, so a closed stdout surfaces as an `EPIPE` from `println!`,
-/// which panics -- `npu models | head` printed a panic and a backtrace note instead of just
+/// which panics -- `npu model ls | head` printed a panic and a backtrace note instead of just
 /// stopping. Every other program in a pipeline dies silently there, and a CLI whose output is
-/// meant to be piped (`npu models | awk`, which the shell completion itself does) has to behave
+/// meant to be piped (`npu model ls | awk`, which the shell completion itself does) has to behave
 /// the same way.
 ///
 /// Unsafe because it is a raw libc call; sound because it runs before any thread exists and only
@@ -389,7 +389,7 @@ fn build_params(s: &SamplingArgs) -> Result<npu_engine::GenerateParams, String> 
 ///
 /// clap has no way to express "the values come from the user's config", so it emits `_default` for
 /// these -- which in zsh means FILE completion, and `npu generate --model=<TAB>` offering filenames
-/// is worse than offering nothing. The names have to come from `npu models`, which reads the config
+/// is worse than offering nothing. The names have to come from `npu model ls`, which reads the config
 /// and the control socket and answers in about a millisecond with no device, and works with no
 /// service running at all.
 ///
@@ -413,7 +413,7 @@ _npu_models() {
   local -a names
   # Gate on the STATE column rather than on line position: the table has a header and a trailing
   # "(live state as of ...)" note, and a row is exactly a line whose second field is a load state.
-  names=(${(f)"$(npu models 2>/dev/null | awk -v k="$kind" \
+  names=(${(f)"$(npu model ls 2>/dev/null | awk -v k="$kind" \
     '$2 ~ /^(loaded|unloaded|failed)$/ && (k=="" || $3==k) {print $1}')"})
   (( ${#names} )) && compadd -a names
 }
@@ -422,9 +422,9 @@ _npu_models() {
     out = out.replace(":MODEL:_default", ":MODEL:_npu_models");
     out = out.replace(":ASR:_default", ":ASR:_npu_models asr");
     out = out.replace(":DIARIZE:_default", ":DIARIZE:_npu_models diarize");
-    // The POSITIONAL model of `load` / `unload` / `config pin` / `config unpin`, where completion
+    // The POSITIONAL model of `start` / `stop` / `enable` / `disable`, where completion
     // matters most: those commands take nothing but a model name. `name` is deliberately left
-    // alone -- `config add` names a model that does not exist yet, so offering the existing ones
+    // alone -- `model add` names a model that does not exist yet, so offering the existing ones
     // there would suggest exactly the wrong answers.
     out = out.replace("':model:_default'", "':model:_npu_models'");
     out
@@ -975,7 +975,7 @@ fn embed(text: &str, model: Option<&str>, as_json: bool) -> Result<()> {
 /// What a model's scenario file declares, for the columns that must answer with the service down.
 ///
 /// `kind` and `precision` are properties of the manifest, not of a running process, so reading them
-/// here is what lets `npu models` stay useful (and shell completion stay capability-filtered) when
+/// here is what lets `npu model ls` stay useful (and shell completion stay capability-filtered) when
 /// nothing is serving. Nine small TOMLs parse in well under a millisecond; the command has to stay
 /// cheap enough to back a `<TAB>`.
 struct Declared {
@@ -1113,7 +1113,7 @@ fn model_ls(path: &Path, as_json: bool, _verbose: bool) -> Result<()> {
         return Ok(());
     }
 
-    // Column ORDER is load-bearing: `npu models | awk '{print $1}'` is a documented use with a
+    // Column ORDER is load-bearing: `npu model ls | awk '{print $1}'` is a documented use with a
     // test, and the shell completion this command backs reads $2 (state) and $3 (kind). New columns
     // append on the right, and the free-text one goes last.
     println!("{:<22} {:<9} {:<11} {:<5} {:<6} {:<5}  {}",
@@ -1421,7 +1421,7 @@ fn admin_call(m: &ModelMutation) -> (&'static str, String, String) {
 /// Ask the running service to make the edit. Returns its reconcile summary.
 ///
 /// A rejection here is the CLI's error: `http_req` returns only the body, so a 400 would otherwise
-/// read as success -- the same `{"error":...}` convention `npu load` already follows.
+/// read as success -- the same `{"error":...}` convention `npu model start` already follows.
 fn edit_via_service(addr: &str, m: &ModelMutation) -> Result<String> {
     let (method, route, body) = admin_call(m);
     let resp = http_req(addr, method, &route, &body)
@@ -1474,7 +1474,7 @@ fn summarise_reload(body: &str) -> String {
     if parts.is_empty() { "nothing to change".to_string() } else { parts.join(", ") }
 }
 
-/// `npu load` / `npu unload` talk to the SERVICE, not the device.
+/// `npu model start` / `npu model stop` talk to the SERVICE, not the device.
 ///
 /// Every other one-shot command drives the engine in-process, but residency is a property of the
 /// running server's registry -- the thing that owns admission, eviction and the idle sweep.
@@ -1574,12 +1574,12 @@ fn unit_of(pid: u64) -> Option<String> {
 }
 
 /// `npu weights bake --name <model>`: bake a CONFIGURED model's declarative spec, resolved from
-/// its scenario. Prefers the SERVICE, the same reason `npu load`/`npu unload` do: a resident
-/// model's checkpoint file may be mmap'd by the very process this would overwrite. Unlike
-/// load/unload, baking is still meaningful with nothing running -- there is no live registry to
+/// its scenario. Prefers the SERVICE, the same reason `npu model start`/`npu model stop` do: a
+/// resident model's checkpoint file may be mmap'd by the very process this would overwrite. Unlike
+/// start/stop, baking is still meaningful with nothing running -- there is no live registry to
 /// serve, but a checkpoint on disk is a useful thing to produce anyway -- so this falls back
 /// in-process instead of refusing, matching `npu config`'s fallback shape rather than
-/// load/unload's service-only one.
+/// start/stop's service-only one.
 fn bake_by_name(path: &Path, name: &str, force: bool) -> Result<()> {
     let cfg = load_cfg(path)?;
     let addr = resolve_http_addr(&cfg);
@@ -2155,7 +2155,7 @@ mod tests {
         assert!(!out.contains("':model:_default'"));
         assert!(out.contains(":ASR:_npu_models asr"), "capability-specific flags keep their filter");
         assert!(out.contains(":DIARIZE:_npu_models diarize"));
-        // `config add` names a model that does not exist yet, so it must NOT be rewritten.
+        // `model add` names a model that does not exist yet, so it must NOT be rewritten.
         assert!(out.contains("':name:_default'"), "a NEW model's name must not complete to existing ones");
     }
 
@@ -2238,7 +2238,7 @@ mod tests {
         assert_eq!(run.frames.len(), 3, "one replayable frame per token");
     }
 
-    /// The listing has to stay splittable: `npu models | awk '{print $1}'` is the obvious use, and a
+    /// The listing has to stay splittable: `npu model ls | awk '{print $1}'` is the obvious use, and a
     /// scenario path can contain no spaces while a model name never does -- so name first, path last.
     #[test]
     fn model_listing_is_splittable_by_column() {

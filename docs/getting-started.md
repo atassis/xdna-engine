@@ -71,7 +71,7 @@ Then, from another shell:
 ```
 npu transcribe audio.wav        # one-shot ASR, prints the transcript
 npu embed "some text"           # one-shot embedding
-npu models                      # what this install is configured to serve
+npu model ls                    # what this install is configured to serve
 ```
 
 `npu transcribe`/`npu embed`/`npu generate`/`npu chat`/`npu diarize` each load the model
