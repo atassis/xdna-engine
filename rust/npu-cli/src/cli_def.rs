@@ -142,12 +142,15 @@ pub enum Cmd {
         action: ModelCmd,
     },
     /// Weight-checkpoint tooling: bake, inspect, and parity-check.
-    // Folded in from the separate `npu-weights` binary AND the top-level `npu bake <name>`, which
-    // fully overlapped `npu weights bake --name`: one namespace, one completion surface.
+    ///
+    /// Named `checkpoint`, the canonical ML term, matching the existing `--checkpoint` flag on every
+    /// verb below and keeping the analogy legible: checkpoint : model :: image : container. Folded
+    /// in from the separate `npu-weights` binary AND the top-level `npu bake <name>`, which fully
+    /// overlapped `npu weights bake --name`: one namespace, one completion surface.
     #[command(subcommand_required = true, arg_required_else_help = true)]
-    Weights {
+    Checkpoint {
         #[command(subcommand)]
-        action: WeightsCmd,
+        action: CheckpointCmd,
     },
     /// Live view of the device: who is resident, who is serving, and where the time went.
     ///
@@ -280,7 +283,7 @@ impl OutFormat {
 }
 
 #[derive(Subcommand)]
-pub enum WeightsCmd {
+pub enum CheckpointCmd {
     /// Bake source weights into a bf16 checkpoint (skips if fresh, unless --force).
     Bake {
         /// Bake a CONFIGURED model by name instead: resolves its scenario's declarative spec.

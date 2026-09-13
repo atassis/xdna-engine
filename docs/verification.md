@@ -31,7 +31,7 @@ gate." It runs 78 of the repo's workspace tests, none of which touch real NPU ha
 `whisper`, `gigaam`, `parakeet`, `opt`, `vit`, `dinov2`, `resnet`, `clip`, `modernbert`,
 `minilm`, `espcn`, `edsr`). Each bakes a real HF/ONNX checkpoint through the Rust `Arch`
 transform and diffs every output tensor against a Python-oracle `.npy`. The threshold,
-enforced identically by the `npu weights verify` CLI command
+enforced identically by the `npu checkpoint verify` CLI command
 (`rust/npu-cli/src/main.rs`) and by the shared test helper
 (`rust/npu-weights/tests/common/mod.rs`) so the tool and the tests can't drift apart:
 

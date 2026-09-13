@@ -298,13 +298,13 @@ This is the operator-facing surface. The kernel and dataflow crates carry additi
 environment-gated switches used for research and ablation during kernel development;
 those are not part of the stable configuration surface and are not covered here.
 
-## Weight checkpoints (`npu weights`)
+## Weight checkpoints (`npu checkpoint`)
 
 ```
-npu weights bake --source hf:facebook/opt-125m --arch opt [--checkpoint PATH] [--force]
-npu weights bake --name <model-name> [--force]
-npu weights load --checkpoint PATH --arch opt
-npu weights verify --checkpoint PATH --arch opt --refs DIR
+npu checkpoint bake --source hf:facebook/opt-125m --arch opt [--checkpoint PATH] [--force]
+npu checkpoint bake --name <model-name> [--force]
+npu checkpoint load --checkpoint PATH --arch opt
+npu checkpoint verify --checkpoint PATH --arch opt --refs DIR
 ```
 
 `bake` skips the work if a checkpoint already exists and is fresh, unless `--force`.

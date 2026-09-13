@@ -16,7 +16,7 @@ mod stats;
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser};
 
-use cli_def::{Cli, Cmd, ConfigCmd, ModelCmd, OutFormat, OutputFormat, SamplingArgs, WeightsCmd};
+use cli_def::{CheckpointCmd, Cli, Cmd, ConfigCmd, ModelCmd, OutFormat, OutputFormat, SamplingArgs};
 use clap_complete::Shell;
 use std::io::IsTerminal;
 use npu_engine::telemetry::wire;
@@ -123,7 +123,7 @@ fn run(cli: &Cli, path: &Path) -> Result<()> {
         Cmd::Model { action } => model_cmd(&path, action, as_json),
         Cmd::Config { action } => config_cmd(&path, action),
         Cmd::Flags { json } => flags_cmd(*json || as_json),
-        Cmd::Weights { action } => weights_cmd(&path, action),
+        Cmd::Checkpoint { action } => checkpoint_cmd(&path, action),
         Cmd::Doctor { json } => doctor::doctor(&cli, *json || as_json),
         Cmd::Completions { shell } => {
             let mut cmd = Cli::command();
@@ -1726,15 +1726,15 @@ fn bake_by_name(path: &Path, name: &str, force: bool) -> Result<()> {
 /// Resolves the repo root the SAME way every other subcommand does (`root()`: XDNA_ENGINE_ROOT,
 /// then an absolute scenario path, then cwd). The standalone binary used a bare `current_dir()`,
 /// which is the cwd dependency the service install just removed -- folding it in drops that too.
-fn weights_cmd(path: &Path, action: &WeightsCmd) -> Result<()> {
+fn checkpoint_cmd(path: &Path, action: &CheckpointCmd) -> Result<()> {
     use npu_weights::{checkpoint, spec::ModelSpec, spec::Source};
     let root = load_cfg(path).ok().and_then(|c| root(&c, path).ok())
         .map(Ok)
         .unwrap_or_else(std::env::current_dir)
         .context("repo root")?;
     match action {
-        WeightsCmd::Bake { name: Some(name), force, .. } => bake_by_name(path, name, *force)?,
-        WeightsCmd::Bake { source, arch, checkpoint, force, .. } => {
+        CheckpointCmd::Bake { name: Some(name), force, .. } => bake_by_name(path, name, *force)?,
+        CheckpointCmd::Bake { source, arch, checkpoint, force, .. } => {
             // clap's `required_unless_present = "name"` guarantees both are Some here.
             let spec = ModelSpec {
                 source: Source::parse(source.as_deref().expect("clap requires --source without --name"))?,
@@ -1744,7 +1744,7 @@ fn weights_cmd(path: &Path, action: &WeightsCmd) -> Result<()> {
             let p = spec.ensure_checkpoint(&root, *force)?;
             println!("checkpoint ready: {}", p.display());
         }
-        WeightsCmd::Load { checkpoint, arch } => {
+        CheckpointCmd::Load { checkpoint, arch } => {
             let l = checkpoint::load(checkpoint, arch)?;
             println!("arch={} version={} tensors={}", l.arch, l.meta_version, l.names.len());
             for n in l.names.iter().take(5) {
@@ -1752,7 +1752,7 @@ fn weights_cmd(path: &Path, action: &WeightsCmd) -> Result<()> {
                 println!("  {n} {sh:?}");
             }
         }
-        WeightsCmd::Verify { checkpoint, arch, refs } => {
+        CheckpointCmd::Verify { checkpoint, arch, refs } => {
             let l = checkpoint::load(checkpoint, arch)?;
             let (n, max) = checkpoint::verify_against_npy(&l, refs)?;
             println!("verified {n} tensors; max abs rel-err {max:.4e}");

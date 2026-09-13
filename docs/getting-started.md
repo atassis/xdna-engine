@@ -122,8 +122,8 @@ Weight checkpoints for models on the declarative `npu-weights` path (see
 [configuration.md](configuration.md)) can also be baked on demand:
 
 ```
-npu weights bake --name <model-name>   # bake the checkpoint a configured model's scenario declares
-npu weights bake --source hf:facebook/opt-125m --arch opt
+npu checkpoint bake --name <model-name>   # bake the checkpoint a configured model's scenario declares
+npu checkpoint bake --source hf:facebook/opt-125m --arch opt
 ```
 
 ## Building the AIE kernels
