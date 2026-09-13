@@ -9,7 +9,7 @@ name = "gemma4-12b"
 #   weights  scripts/dump_llm_weights.py --spec gemma4-12b --quant int8 --quant-group 64 \
 #              --quant-layout row_group_planar \
 #              --quant-leaves gate_proj,up_proj,down_proj,o_proj,q_proj,k_proj,v_proj
-#   decode   TMV_CTX=0 GQA_GROUPED_K=1 GQA_GROUPED_V=1 FUSE_QKV_DP=0 SPLIT_LM_HEAD=0 \
+#   decode   GQA_GROUPED_K=1 GQA_GROUPED_V=1 FUSE_QKV_DP=0 SPLIT_LM_HEAD=0 \
 #              bash scripts/build_llm_decode.sh gemma4-12b
 #
 # int8 g64, and BOTH halves of that are load-bearing.
@@ -20,16 +20,31 @@ name = "gemma4-12b"
 #     and the kernel does not compile. g64 derives 16 (128-bit) and is legal, but was PUNISHED to
 #     that width by the header sitting in the row -- see the corrections list below.
 #
-# TMV_CTX=0 is REQUIRED: the global layers (head_dim 512, one kv head, batch_group 16) have no
-# TMatVec tiling that fits L1. SPLIT_LM_HEAD=0 because the host loader carries one elf/kernel name,
-# so a split head would be a second dispatch it cannot express.
+# TMV_CTX left UNSET (generator default "1", per-geometry -- gen_llm_decode.py:77). It is NOT a
+# build-wide flag: the global layers (head_dim 512, one kv head, batch_group 16) have no TMatVec
+# tiling that fits L1 and decline it automatically (`8ce4727`, 2026-09-11), while the 40 sliding
+# layers take it and drop their zero-compute V-transpose. This was forced to TMV_CTX=0 here from
+# 2026-09-11 to 2026-09-13 -- the per-geometry fix landed the same day as this scenario's first
+# quantized arm but the recipe was never revisited, leaving a real win on the table for two days.
+# SPLIT_LM_HEAD=0 because the host loader carries one elf/kernel name, so a split head would be a
+# second dispatch it cannot express.
 #
-# DEFAULT SINCE 2026-09-13: row_group_planar (`decode_int8g64_planar`). ms/token history, this box,
-# same TMV_CTX/GQA/FUSE_QKV/SPLIT_LM_HEAD config throughout, real service:
-#   1. int8 g64, header_first (shipped first)         801.46 ms/token   1.248 tok/s
-#   2. int8 g32, header_first (traded quality for speed,
+# DEFAULT SINCE 2026-09-14: row_group_planar + TMV_CTX on (`decode_int8g64_planar`). ms/token
+# history, this box, same GQA/FUSE_QKV/SPLIT_LM_HEAD config throughout, real service unless noted:
+#   1. int8 g64, header_first, TMV_CTX=0 (shipped first)  801.46 ms/token   1.248 tok/s
+#   2. int8 g32, header_first, TMV_CTX=0 (traded quality for speed,
 #      shipped 2026-09-12 over a FAILED perplexity gate -- see below)  528.91 ms/token   1.884 tok/s
-#   3. int8 g64, row_group_planar (THIS DEFAULT)       406.6-406.8 ms/token   ~2.40 tok/s
+#   3. int8 g64, row_group_planar, TMV_CTX=0                406.6-406.8 ms/token   ~2.40 tok/s
+#   4. int8 g64, row_group_planar, TMV_CTX on (THIS DEFAULT) alternated ABBA vs (3), device-time
+#      accounting, n=2 pairs: -13.68% (-50.41 ms/tok), sign-consistent both pairs, arm identity
+#      verified by artifact hash each round. NOT confirmed by a full-depth perplexity gate -- that
+#      harness was found broken for this model (never received 3 of 4 Gemma-4 fixes that landed on
+#      an unmerged branch, `g4/precision-quality`), partially repaired, still reads
+#      worse-than-uniform NLL on both arms alike as of 2026-09-14 -- open, not diagnosed further.
+#      TMV_CTX changes bf16 reduction ORDER only (context step: GEMV-along-a-row -> TMatVec-down-
+#      rows), never a value or a weight byte, and the L=6 exact-oracle gate went 8/8 (the pre-planar
+#      TMV_CTX-alone gate tied/missed at this same step; here it passes clean) -- lower risk class
+#      than (2)'s format narrowing, but the ship call rests on device-time + parity, not perplexity.
 # (3) beats (2)'s speed while staying on (1)'s quality-gated format -- no quality tradeoff needed.
 # Row_group_planar measures ~3% faster than header_first even at g32, where the width argument
 # below does not apply (g32's own group size already caps VEC_SIZE, header or no header) -- the
@@ -52,6 +67,10 @@ name = "gemma4-12b"
 #   2026-09-13  int8 g64 row_group_planar: removes the header-imposed VEC_SIZE cap       406.7 ms/tok
 #               at K=3840 (16->64, 128b->512b) with NO accuracy cost (bytes reordered,
 #               values untouched) -- SUPERSEDES g32, now both faster and quality-safe.
+#   2026-09-14  TMV_CTX on (per-geometry, was force-OFF since 2026-09-11 though the    -13.68% device
+#               generator default flipped to on the same day): deletes the sliding      (~356 ms/tok)
+#               layers' zero-compute V-transpose (1342.18 MB/token, 7.9% of the byte
+#               census). Reorders a bf16 reduction, changes no value.
 # Tried and NOT adopted (kept here so they are not re-tried blind):
 #   int4 (any layout)        12.3% weight rel-L2 against a ~0.3% logit-accuracy budget; no group
 #                             size or calibration closes it -- see the "int8, not int4" note above.
