@@ -72,7 +72,8 @@ pub fn reconcile(cfg: &Config, reg: &mut Registry, loader: &dyn ModelLoader) -> 
         let existing = reg.entries.iter().find(|e| e.cfg.name == m.name);
         let needs = match existing {
             None => true,                                  // not present
-            Some(e) if e.model.is_none() => true,          // present but failed/unloaded -> retry
+            Some(e) if e.model.is_none() =>
+                e.unload_reason != Some(crate::registry::UnloadReason::Operator),
             Some(e) => e.cfg.scenario != m.scenario,        // spec changed -> reload
         };
         if !needs {
@@ -375,5 +376,36 @@ mod tests {
         let rep = reconcile(&c, &mut reg, &l);
         assert_eq!(rep.loaded, vec!["a"], "the pin must come back on its own");
         assert!(reg.get_loaded("b").is_none(), "the unpinned model stays cold until a request asks for it");
+    }
+
+    /// The bug this fixes, reproduced directly: an operator STOP on a pinned model must not be
+    /// undone by an unrelated reconcile trigger (here: pinning a second, different model, which is
+    /// exactly what `npu model enable <other>` does in production via `mutate_and_reconcile`).
+    #[test]
+    fn an_operator_stop_on_a_pin_survives_an_unrelated_reconcile() {
+        let l = loader(&[("a", true), ("b", true)]);
+        let mut reg = Registry::default();
+        let mut c = cfg(&["a", "b"]);
+        c.models[0].resident = true; // "a" pinned
+        reconcile(&c, &mut reg, &l);
+        assert!(reg.get_loaded("a").is_some());
+
+        reg.release("a", "unloaded: asked for", UnloadReason::Operator);
+        assert!(reg.get_loaded("a").is_none());
+
+        // Pin a DIFFERENT model -- an unrelated config write, exactly the trigger the bug fired on.
+        c.models[1].resident = true;
+        let rep = reconcile(&c, &mut reg, &l);
+        assert!(reg.get_loaded("a").is_none(),
+            "an operator-stopped pin must not come back from an unrelated reconcile");
+        assert!(reg.get_loaded("b").is_some(), "the actually-requested pin still loads");
+        assert!(!rep.loaded.contains(&"a".to_string()));
+
+        // An explicit re-load clears the mark.
+        reg.load_explicit(&model("a"), &l, &c.server, std::time::Instant::now()).unwrap();
+        assert!(reg.get_loaded("a").is_some());
+        let rep2 = reconcile(&c, &mut reg, &l); // any later reconcile leaves it loaded
+        assert!(reg.get_loaded("a").is_some());
+        assert!(rep2.loaded.is_empty(), "already loaded with a matching scenario -- nothing to redo");
     }
 }
