@@ -31,13 +31,15 @@ pub enum KeyType {
 
 /// The `[server]` keys `npu config set` accepts, in the order `npu config show` prints them.
 ///
-/// This list is deliberately CLOSED. Writing an unrecognised key would produce a file that parses
-/// (nothing in `Config` is `deny_unknown_fields`) and silently does nothing -- a knob that looks
-/// set and is not, which is the failure mode a typo in a config should never have.
+/// This list is deliberately CLOSED, matching `ServerCfg`'s own `deny_unknown_fields`: writing an
+/// unrecognised key must fail loud, not produce a file that parses and silently does nothing -- a
+/// knob that looks set and is not, which is the failure mode a typo in a config should never have.
+/// `max_resident` retired from this list on the same principle: memory is bounded by
+/// `memory_ceiling_mb` alone now, and an old config still naming it fails to parse at load time with
+/// a message pointing here, rather than being quietly accepted and ignored.
 pub const SERVER_KEYS: &[(&str, KeyType)] = &[
     ("port", KeyType::Int),
     ("memory_ceiling_mb", KeyType::Int),
-    ("max_resident", KeyType::Int),
     ("idle_unload_s", KeyType::Int),
     ("sweep_interval_s", KeyType::Int),
     ("idle_release_s", KeyType::Int),
@@ -49,12 +51,12 @@ pub const SERVER_KEYS: &[(&str, KeyType)] = &[
 pub fn server_key_help() -> Vec<(&'static str, &'static str)> {
     vec![
         ("port", "TCP port the service binds"),
-        ("memory_ceiling_mb", "ceiling on summed device-BO bytes (inert while footprints read 0)"),
-        ("max_resident", "how many models may hold the device at once"),
+        ("memory_ceiling_mb", "ceiling on summed device-BO bytes -- the one capacity knob: bounds \
+                               admission, eviction, and the sum of pinned models' bytes"),
         ("idle_unload_s", "unload a model idle this long; 0 disables idle unload"),
         ("sweep_interval_s", "how often the actor looks for expired models (clamped to >= 1)"),
         ("idle_release_s", "return the allocator's free pages this long after the last request; 0 disables"),
-        ("evict_policy", "lru | none -- what gives up a slot when max_resident is full"),
+        ("evict_policy", "lru | none -- what gives up room when memory_ceiling_mb is full"),
     ]
 }
 
@@ -213,8 +215,8 @@ mod tests {
     /// The whole reason this module exists. A commented config must come back with its comments.
     const COMMENTED: &str = r#"# top of file
 [server]
-# 2, not 1: an alternating workload pays a full reload every request otherwise.
-max_resident = 5
+# 4096, not 2048: two ASR models plus diarization together need this much.
+memory_ceiling_mb = 4096
 idle_unload_s = 900
 
 [defaults]
@@ -248,7 +250,7 @@ scenario = "scenarios/asr.toml"
             let mut d = doc(COMMENTED);
             edit(&mut d);
             let out = d.to_toml_string();
-            for c in ["# top of file", "# 2, not 1:", "# Qwen3-0.6B, fully resident"] {
+            for c in ["# top of file", "# 4096, not 2048:", "# Qwen3-0.6B, fully resident"] {
                 assert!(out.contains(c), "{label} destroyed {c:?}:\n{out}");
             }
             d.validate().unwrap_or_else(|e| panic!("{label} produced an unparseable config: {e}"));
@@ -297,14 +299,15 @@ scenario = "scenarios/asr.toml"
     #[test]
     fn set_server_rejects_an_unknown_key_and_a_wrong_value() {
         let mut d = doc(COMMENTED);
-        assert!(d.set_server("max_residents", "3").is_err(), "a plural typo must not be written");
+        assert!(d.set_server("memory_ceilingmb", "3").is_err(), "a typo must not be written");
+        assert!(d.set_server("max_resident", "3").is_err(), "retired -- no longer a settable key");
         assert!(d.set_server("evict_policy", "lru2").is_err());
-        assert!(d.set_server("max_resident", "-1").is_err());
-        assert!(d.set_server("max_resident", "abc").is_err());
-        d.set_server("max_resident", "3").unwrap();
+        assert!(d.set_server("memory_ceiling_mb", "-1").is_err());
+        assert!(d.set_server("memory_ceiling_mb", "abc").is_err());
+        d.set_server("memory_ceiling_mb", "8192").unwrap();
         d.set_server("evict_policy", "none").unwrap();
         let cfg = d.validate().unwrap();
-        assert_eq!(cfg.server.max_resident, 3);
+        assert_eq!(cfg.server.memory_ceiling_mb, 8192);
         assert_eq!(cfg.server.evict_policy, EvictPolicy::None);
     }
 
@@ -326,11 +329,11 @@ scenario = "scenarios/asr.toml"
         d.add_model("a", "s.toml").unwrap();
         d.set_resident("a", true).unwrap();
         d.set_default(Capability::ASR, "a");
-        d.set_server("max_resident", "2").unwrap();
+        d.set_server("memory_ceiling_mb", "2048").unwrap();
         let cfg = d.validate().unwrap();
         assert!(cfg.find("a").unwrap().resident);
         assert_eq!(cfg.defaults.get(Capability::ASR).map(String::as_str), Some("a"));
-        assert_eq!(cfg.server.max_resident, 2);
+        assert_eq!(cfg.server.memory_ceiling_mb, 2048);
     }
 
     /// Refuse a shape we would otherwise silently rewrite.

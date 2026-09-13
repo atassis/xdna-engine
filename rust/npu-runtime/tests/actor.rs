@@ -13,7 +13,7 @@ fn actor_serves_and_echoes_model() {
     t.insert("bge".to_string(), Ok((Capability::EMBED, 1)));
     t.insert("asr".to_string(), Ok((Capability::ASR, 1)));
     let cfg = Config {
-        server: ServerCfg { max_resident: 8, ..Default::default() },
+        server: ServerCfg::default(),
         defaults: Defaults::from_pairs([
             (Capability::ASR, "asr".to_string()), (Capability::EMBED, "bge".to_string())]),
         models: vec![
@@ -37,10 +37,10 @@ fn actor_serves_and_echoes_model() {
 #[test]
 fn actor_hot_swaps_at_one_slot() {
     let mut t = BTreeMap::new();
-    t.insert("bge".to_string(), Ok((Capability::EMBED, 1)));
-    t.insert("asr".to_string(), Ok((Capability::ASR, 1)));
+    t.insert("bge".to_string(), Ok((Capability::EMBED, 1024 * 1024)));
+    t.insert("asr".to_string(), Ok((Capability::ASR, 1024 * 1024)));
     let cfg = Config {
-        server: ServerCfg { max_resident: 1, idle_unload_s: 0, ..Default::default() },
+        server: ServerCfg { memory_ceiling_mb: 1, idle_unload_s: 0, ..Default::default() },
         defaults: Defaults::from_pairs([
             (Capability::ASR, "asr".to_string()), (Capability::EMBED, "bge".to_string())]),
         models: vec![
@@ -67,7 +67,7 @@ fn actor_serves_a_capability_with_no_typed_helper() {
     let mut t = BTreeMap::new();
     t.insert("kokoro".to_string(), Ok((Capability::TTS, 1)));
     let cfg = Config {
-        server: ServerCfg { max_resident: 1, idle_unload_s: 0, ..Default::default() },
+        server: ServerCfg { idle_unload_s: 0, ..Default::default() },
         defaults: Defaults::from_pairs([(Capability::TTS, "kokoro".to_string())]),
         models: vec![ModelCfg { name: "kokoro".into(), scenario: "x".into(), resident: false }],
     };
@@ -93,7 +93,7 @@ fn diarize_routes_by_capability_and_leaves_the_asr_default_alone() {
     table.insert("parakeet".to_string(), Ok((Capability::ASR, 1u64)));
     let l = MockLoader { table };
     let cfg = Config {
-        server: ServerCfg { max_resident: 2, ..Default::default() },
+        server: ServerCfg::default(),
         defaults: Defaults::from_pairs([(Capability::ASR, "parakeet".to_string())]),
         models: vec![ModelCfg { name: "parakeet".into(), scenario: "x".into(), resident: false }],
     };

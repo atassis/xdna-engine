@@ -199,7 +199,7 @@ pub fn route(req: &Request, handle: &Handle, cfg_path: &Path) -> Response {
         // `ok` is COMPUTED, not asserted. It used to be the literal `true`, so a service whose model
         // had failed to load reported healthy to systemd while answering every request with an error
         // -- the shape that hid a 5-day outage. A Failed model makes this 503; `Unloaded` never does,
-        // because that is deliberate (deferred by max_resident, or swept for being idle).
+        // because that is deliberate (deferred over the byte budget, or swept for being idle).
         ("GET", "/healthz") => {
             let npu = npu_engine::Engine::available();
             let st = handle.status();
@@ -249,7 +249,10 @@ pub fn route(req: &Request, handle: &Handle, cfg_path: &Path) -> Response {
 /// `state` + `idle_s` are what make a hot swap observable from outside: `idle_s` counts seconds since
 /// the model last served a request and is `null` while it is not resident. `pinned` is the config's
 /// `resident = true`, reported because otherwise the only way to check whether a pin had reached the
-/// running service was to read the file and assume.
+/// running service was to read the file and assume. `pin_honored` is a SEPARATE fact from `pinned`:
+/// `pinned && !pin_honored` means the invariant currently refuses to protect this pin (over
+/// `memory_ceiling_mb`) -- a state `npu reload` cannot fix by re-asserting the same config, unlike
+/// ordinary pin/unpin drift, so a reader needs both bits to tell the two apart.
 pub fn models_json(status: &[ModelStatus]) -> String {
     let mut data = String::new();
     for (i, s) in status.iter().enumerate() {
@@ -258,8 +261,8 @@ pub fn models_json(status: &[ModelStatus]) -> String {
         let state = match s.state { LoadState::Loaded => "loaded", LoadState::Failed => "failed", LoadState::Unloaded => "unloaded" };
         let idle = match s.idle_s { Some(n) => n.to_string(), None => "null".to_string() };
         data.push_str(&format!(
-            "{{\"id\":\"{}\",\"object\":\"model\",\"kind\":\"{kind}\",\"state\":\"{state}\",\"detail\":\"{}\",\"bo_bytes\":{},\"idle_s\":{idle},\"pinned\":{},\"busy\":{},\"served\":{},\"busy_us\":{}}}",
-            s.name, parse::json_escape(&s.detail), s.bo_bytes, s.pinned, s.busy, s.served, s.busy_us));
+            "{{\"id\":\"{}\",\"object\":\"model\",\"kind\":\"{kind}\",\"state\":\"{state}\",\"detail\":\"{}\",\"bo_bytes\":{},\"idle_s\":{idle},\"pinned\":{},\"pin_honored\":{},\"busy\":{},\"served\":{},\"busy_us\":{}}}",
+            s.name, parse::json_escape(&s.detail), s.bo_bytes, s.pinned, s.pin_honored, s.busy, s.served, s.busy_us));
     }
     format!("{{\"object\":\"list\",\"data\":[{data}]}}")
 }
@@ -628,8 +631,8 @@ fn admin_set_default(req: &Request, handle: &Handle, cfg_path: &Path) -> Respons
 fn admin_load(name: &str, handle: &Handle) -> Response {
     match handle.load(name) {
         Ok(r) => (200, format!(
-            "{{\"loaded\":{},\"resident\":{},\"max_resident\":{},\"unweighed\":[{}]}}",
-            r.loaded, r.resident, r.max_resident,
+            "{{\"loaded\":{},\"resident_mb\":{},\"ceiling_mb\":{},\"unweighed\":[{}]}}",
+            r.loaded, r.resident_mb, r.ceiling_mb,
             r.unweighed.iter().map(|n| format!("\"{}\"", parse::json_escape(n)))
                 .collect::<Vec<_>>().join(",")).into()),
         Err(e @ npu_engine::EngineError::Unsupported(_)) =>
@@ -1591,7 +1594,7 @@ mod route_tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg_path = dir.path().join("engine.toml");
         let cfg = Config {
-            server: ServerCfg { max_resident: 8, ..Default::default() },
+            server: ServerCfg::default(),
             models: vec![ModelCfg { name: "bge".into(), scenario: "x".into(), resident: false }],
             ..Default::default()
         };
@@ -1643,7 +1646,7 @@ mod route_tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("engine.toml");
         let cfg = Config {
-            server: ServerCfg { max_resident: 2, idle_unload_s: 0, ..Default::default() },
+            server: ServerCfg { idle_unload_s: 0, ..Default::default() },
             models: vec![ModelCfg { name: "tts".into(), scenario: "y".into(), resident: false }],
             ..Default::default()
         };
@@ -1666,17 +1669,18 @@ mod route_tests {
     /// merely unloaded -- deferral and idle-sweep are deliberate, and a health check that cries wolf
     /// on them gets ignored.
     /// Build a server from (name, load-result) pairs, so a test can put a model in a chosen state.
-    fn health_setup(models: &[(&str, bool)], max_resident: usize)
+    /// Every model costs one MB, so `ceiling_mb` admits exactly that many.
+    fn health_setup(models: &[(&str, bool)], ceiling_mb: u64)
         -> (Handle, std::thread::JoinHandle<()>, tempfile::TempDir, PathBuf) {
         let mut t = BTreeMap::new();
         for (n, ok) in models {
             t.insert((*n).to_string(),
-                if *ok { Ok((Capability::EMBED, 1)) } else { Err("no such xclbin".to_string()) });
+                if *ok { Ok((Capability::EMBED, 1024 * 1024)) } else { Err("no such xclbin".to_string()) });
         }
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("engine.toml");
         let cfg = Config {
-            server: ServerCfg { max_resident, idle_unload_s: 0, ..Default::default() },
+            server: ServerCfg { memory_ceiling_mb: ceiling_mb, idle_unload_s: 0, ..Default::default() },
             models: models.iter()
                 .map(|(n, _)| ModelCfg { name: (*n).into(), scenario: "x".into(), resident: false }).collect(),
             ..Default::default()
@@ -1686,8 +1690,8 @@ mod route_tests {
         (h, j, dir, p)
     }
 
-    /// A model left unloaded by `max_resident` is deliberate. A health check that cries wolf on it
-    /// gets ignored, which would defeat the point of the one below.
+    /// A model left unloaded over the byte budget is deliberate. A health check that cries wolf on
+    /// it gets ignored, which would defeat the point of the one below.
     #[test]
     fn healthz_is_ok_when_a_model_is_merely_deferred() {
         let (h, j, _d, p) = health_setup(&[("bge", true), ("e5", true)], 1);
@@ -1739,7 +1743,7 @@ mod route_tests {
         // `bge` took the only slot at boot.
         let (code, body) = route(&post("/admin/models/e5/load", ""), &h, &p);
         assert_eq!(code, 409, "at capacity is a state conflict, not a bad request: {body}");
-        assert!(body.text().contains("1/1 slots in use"), "{body}");
+        assert!(body.text().contains("1 MB of 1 MB in use"), "{body}");
         assert!(body.text().contains("bge"), "the refusal names what is in the way: {body}");
         let models = route(&get("/v1/models"), &h, &p).1;
         assert!(models.text().contains("\"id\":\"bge\",\"object\":\"model\",\"kind\":\"embed\",\"state\":\"loaded\""),
@@ -1758,7 +1762,7 @@ mod route_tests {
         // ...which is what makes room for the load that was refused a moment ago.
         let (code, body) = route(&post("/admin/models/e5/load", ""), &h, &p);
         assert_eq!(code, 200, "{body}");
-        assert!(body.text().contains("\"loaded\":true") && body.text().contains("\"resident\":1"), "{body}");
+        assert!(body.text().contains("\"loaded\":true") && body.text().contains("\"resident_mb\":1"), "{body}");
 
         // Idempotent in both directions: asking for a state that already holds is not an error.
         assert!(route(&post("/admin/models/e5/load", ""), &h, &p).1.text().contains("\"loaded\":false"));
@@ -1852,12 +1856,12 @@ mod route_tests {
         // One slot, two configured models: /v1/models is where an operator sees which one holds the
         // device right now, and what happened to the other.
         let mut t = BTreeMap::new();
-        t.insert("bge".to_string(), Ok((Capability::EMBED, 1)));
-        t.insert("e5".to_string(), Ok((Capability::EMBED, 1)));
+        t.insert("bge".to_string(), Ok((Capability::EMBED, 1024 * 1024)));
+        t.insert("e5".to_string(), Ok((Capability::EMBED, 1024 * 1024)));
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("engine.toml");
         let cfg = Config {
-            server: ServerCfg { max_resident: 1, idle_unload_s: 0, ..Default::default() },
+            server: ServerCfg { memory_ceiling_mb: 1, idle_unload_s: 0, ..Default::default() },
             models: vec![
                 ModelCfg { name: "bge".into(), scenario: "x".into(), resident: false },
                 ModelCfg { name: "e5".into(), scenario: "y".into(), resident: false },
@@ -2010,7 +2014,7 @@ pub(crate) mod generate_tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("engine.toml");
         let cfg = Config {
-            server: ServerCfg { max_resident: 1, idle_unload_s: 0, ..Default::default() },
+            server: ServerCfg { idle_unload_s: 0, ..Default::default() },
             models: vec![ModelCfg { name: "llm".into(), scenario: "x".into(), resident: false }],
             ..Default::default()
         };
@@ -2048,16 +2052,18 @@ pub(crate) mod generate_tests {
     fn admin_server_edits_the_file_and_rejects_a_key_it_does_not_know() {
         let (h, j, dir, p, _s, _seen) = gen_handle(ss(&["x"]), Duration::ZERO);
         let _ = dir;
-        let (code, body) = route(&post("/admin/server", r#"{"key":"max_resident","value":"3"}"#), &h, &p);
+        let (code, body) = route(&post("/admin/server", r#"{"key":"memory_ceiling_mb","value":"3"}"#), &h, &p);
         assert_eq!(code, 200, "{body}");
         assert!(body.text().contains("\"loaded\""), "answers with a reconcile report: {body}");
-        assert!(std::fs::read_to_string(&p).unwrap().contains("max_resident = 3"),
+        assert!(std::fs::read_to_string(&p).unwrap().contains("memory_ceiling_mb = 3"),
             "the SERVICE wrote the file");
 
-        // A key nothing reads is a 400 with the reason, not a silently ignored write.
-        let (code, body) = route(&post("/admin/server", r#"{"key":"no_such_key","value":"1"}"#), &h, &p);
+        // A key nothing reads is a 400 with the reason, not a silently ignored write. `max_resident`
+        // is the meaningful instance of this, not a made-up one: retired, and must fail the same way
+        // a typo would, not parse and silently do nothing.
+        let (code, body) = route(&post("/admin/server", r#"{"key":"max_resident","value":"1"}"#), &h, &p);
         assert_eq!(code, 400, "{body}");
-        let (code, _) = route(&post("/admin/server", r#"{"key":"max_resident"}"#), &h, &p);
+        let (code, _) = route(&post("/admin/server", r#"{"key":"memory_ceiling_mb"}"#), &h, &p);
         assert_eq!(code, 400, "a request missing `value` is refused");
         h.shutdown(); let _ = j.join();
     }
@@ -2259,7 +2265,7 @@ pub(crate) mod generate_tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("engine.toml");
         let cfg = Config {
-            server: ServerCfg { max_resident: 1, idle_unload_s: 0, ..Default::default() },
+            server: ServerCfg { idle_unload_s: 0, ..Default::default() },
             models: vec![ModelCfg { name: "llm".into(), scenario: "x".into(), resident: false }],
             ..Default::default()
         };

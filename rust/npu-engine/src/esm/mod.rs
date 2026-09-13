@@ -23,6 +23,9 @@ pub struct EsmEmbedPipeline {
     frontend: Frontend_,
     encoder: Box<dyn Encoder>,
     head: EmbedHead,
+    /// Kept alongside the encoder's own clone so `bo_bytes()` can read the device's resident counter
+    /// without a downcast through `Box<dyn Encoder>`.
+    dev: Rc<Device>,
 }
 impl EsmEmbedPipeline {
     pub fn build(cfg: &ScenarioConfig, root: &Path, dev: Rc<Device>) -> Result<Self, EngineError> {
@@ -35,15 +38,15 @@ impl EsmEmbedPipeline {
         );
         let frontend = Frontend_::new(w.clone(), m.max_seq);
         let encoder: Box<dyn Encoder> = if m.kernel == "native" {
-            Box::new(EsmEncoderNative::new(dev, root, &w, m.hidden, m.ff, m.n_heads, m.head_dim))
+            Box::new(EsmEncoderNative::new(dev.clone(), root, &w, m.hidden, m.ff, m.n_heads, m.head_dim))
         } else {
-            Box::new(EsmEncoder::new(dev, root, &w, m.hidden, m.ff, m.n_heads, m.head_dim))
+            Box::new(EsmEncoder::new(dev.clone(), root, &w, m.hidden, m.ff, m.n_heads, m.head_dim))
         };
         let head = EmbedHead {
             pooling: Pooling::parse(&cfg.embeddings.pooling),
             normalize: cfg.embeddings.normalize,
         };
-        Ok(EsmEmbedPipeline { frontend, encoder, head })
+        Ok(EsmEmbedPipeline { frontend, encoder, head, dev })
     }
     /// Full pipeline: protein string -> embedding vector.
     pub fn embed(&self, seq: String) -> Vec<f32> {
@@ -56,5 +59,8 @@ impl EsmEmbedPipeline {
 impl crate::pipeline::Embedder for EsmEmbedPipeline {
     fn embed_one(&self, text: String) -> Result<Vec<f32>, EngineError> {
         Ok(self.embed(text))
+    }
+    fn bo_bytes(&self) -> u64 {
+        self.dev.resident_bo_bytes()
     }
 }

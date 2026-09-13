@@ -14,26 +14,28 @@ pub struct Config {
 
 /// Every field carries its own `#[serde(default)]`. Without them a `[server]` table that omits any
 /// key failed the whole parse, and toml reported it as a span over `[server]` -- which reads like a
-/// syntax error in the table rather than "you left out max_resident".
+/// syntax error in the table rather than naming the missing key.
+///
+/// `deny_unknown_fields`: closed on purpose, same reason `config_doc::SERVER_KEYS` is a closed list
+/// for `npu config set` -- an unrecognised key must fail loud, not parse fine and silently do
+/// nothing. This is also the migration path for the retired `max_resident`: a config still carrying
+/// it now fails to parse with a message naming the field, rather than being quietly ignored.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServerCfg {
     #[serde(default = "default_port")] pub port: u16,
-    /// Ceiling on the summed DEVICE-BO bytes of resident models, from `Servable::footprint`.
+    /// Ceiling on the summed DEVICE-BO bytes of resident models, from `Servable::footprint`, and the
+    /// ONE capacity knob: it gates admission, drives eviction, and bounds the sum of pinned models'
+    /// bytes (see `Registry`/`reconcile`). Real for Parakeet, Whisper, the embedders and Generate;
+    /// `0` for a model kind nobody has wired yet, which `Registry::unweighed_residents` reports
+    /// rather than letting the ceiling silently not apply to it.
     ///
-    /// It does NOT bound host RSS, which is the memory that actually took this service down: that
-    /// failure was the onnxruntime arena sizing itself for the diarization embedder's batch
+    /// It does NOT bound host RSS, which is the memory that actually took this service down once:
+    /// that failure was the onnxruntime arena sizing itself for the diarization embedder's batch
     /// (measured 1519 MB at batch 32 against 568 MB at 8), and no device-BO accountant would ever
     /// have seen it. `NPU_DIARIZE_MEM_MB` is the knob for that one; `idle_release_s` is what gives
     /// host pages back.
-    ///
-    /// INERT TODAY: every shipped model reports `footprint() == 0`, so the sum is always 0 and the
-    /// check never fires. A model that loads without a measured footprint says so in its status
-    /// detail rather than passing silently -- an unenforceable bound that looks enforced is the
-    /// failure this note exists to prevent.
     #[serde(default = "default_memory_ceiling_mb")] pub memory_ceiling_mb: u64,
-    /// How many models may be resident at once. Not a refusal: at the cap, a request for another
-    /// model evicts per `evict_policy` (see `Registry::ensure_resident`).
-    #[serde(default = "default_max_resident")] pub max_resident: usize,
     /// Unload a model that has not served a request for this long, releasing the device. `0`
     /// disables idle unload entirely.
     #[serde(default = "default_idle_unload_s")] pub idle_unload_s: u64,
@@ -45,12 +47,11 @@ pub struct ServerCfg {
     /// unload, measured). Counts from the last REQUEST -- a `/healthz` or `/v1/models` poll must not
     /// be able to keep the process fat forever. `0` disables it.
     #[serde(default = "default_idle_release_s")] pub idle_release_s: u64,
-    /// What to drop when a load needs a slot and `max_resident` is already full.
+    /// What to drop when a load needs room and `memory_ceiling_mb` is already spent.
     #[serde(default)] pub evict_policy: EvictPolicy,
 }
 fn default_port() -> u16 { 11434 }
 fn default_memory_ceiling_mb() -> u64 { 4096 }
-fn default_max_resident() -> usize { 1 }
 fn default_idle_unload_s() -> u64 { 900 }
 fn default_sweep_interval_s() -> u64 { 30 }
 fn default_idle_release_s() -> u64 { 1800 }
@@ -59,7 +60,6 @@ impl Default for ServerCfg {
         ServerCfg {
             port: default_port(),
             memory_ceiling_mb: default_memory_ceiling_mb(),
-            max_resident: default_max_resident(),
             idle_unload_s: default_idle_unload_s(),
             sweep_interval_s: default_sweep_interval_s(),
             idle_release_s: default_idle_release_s(),
@@ -87,8 +87,8 @@ impl ServerCfg {
 pub enum EvictPolicy {
     /// Drop the least-recently-used resident model.
     #[default] Lru,
-    /// Never evict: a load that would exceed `max_resident` is refused. This is the behaviour from
-    /// before hot-swap existed, kept as an opt-out for a box that must not pay reload latency.
+    /// Never evict: a load that would exceed `memory_ceiling_mb` is refused. This is the behaviour
+    /// from before hot-swap existed, kept as an opt-out for a box that must not pay reload latency.
     None,
 }
 /// Which model serves a capability when a request does not name one, keyed by capability name.
@@ -113,11 +113,13 @@ impl Defaults {
 pub struct ModelCfg {
     pub name: String,
     pub scenario: String,
-    /// Pin this model in residency: exempt from idle unload and never chosen as an eviction victim.
-    ///
-    /// The cost is a permanently occupied slot, so pinning every model would leave `ensure_resident`
-    /// no victim and turn LRU eviction into a refusal. `Config::pin_overcommit` reports that case
-    /// rather than letting it surface later as a load that cannot find room.
+    /// Pin this model: always on. Eagerly admitted (ahead of any unpinned model, see `reconcile`),
+    /// exempt from idle unload, never chosen as an eviction victim -- as long as the invariant in
+    /// `Config::pin_overcommit` holds. A pin that does not fit is refused, not silently granted: the
+    /// registry tracks whether a declared pin is currently HONOURED separately from this raw config
+    /// value (`Entry::pin_honored`), because "declared pinned" and "actually protected right now"
+    /// are not the same fact once the invariant can be violated by something other than this field
+    /// changing (the budget being lowered, or a live model's own footprint growing).
     #[serde(default)] pub resident: bool,
 }
 
@@ -126,7 +128,18 @@ impl Config {
     /// Load from path; a MISSING file yields the default empty config (resilient startup).
     pub fn load(path: &Path) -> Result<Config, String> {
         match std::fs::read_to_string(path) {
-            Ok(s) => Config::from_str(&s).map_err(|e| format!("{}: {e}", path.display())),
+            Ok(s) => Config::from_str(&s).map_err(|e| {
+                let e = format!("{}: {e}", path.display());
+                // `deny_unknown_fields` already fails loud on a retired `max_resident` key -- this
+                // just turns "unknown field `max_resident`" into an actionable next step, the same
+                // spirit as SERVER_KEYS' closed list, rather than leaving the operator to guess one.
+                if e.contains("max_resident") {
+                    format!("{e}\nmax_resident was removed: memory is bounded by memory_ceiling_mb \
+                             alone now. Delete the max_resident line from [server].")
+                } else {
+                    e
+                }
+            }),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
             Err(e) => Err(format!("{}: {e}", path.display())),
         }
@@ -142,13 +155,21 @@ impl Config {
     pub fn find(&self, name: &str) -> Option<&ModelCfg> { self.models.iter().find(|m| m.name == name) }
     /// Pinned models, in config order.
     pub fn pinned(&self) -> impl Iterator<Item = &ModelCfg> { self.models.iter().filter(|m| m.resident) }
-    /// `Some(message)` when pins leave no slot to evict, i.e. pinned >= `max_resident`. Advisory:
-    /// the registry still runs, but a load for an unpinned model can no longer make room.
-    pub fn pin_overcommit(&self) -> Option<String> {
-        let n = self.pinned().count();
-        (n >= self.server.max_resident).then(|| format!(
-            "{n} model(s) pinned resident but max_resident = {}: no slot is left to evict, so \
-             loading any other model will be refused", self.server.max_resident))
+    /// `Some(message)` when the pinned set's total estimated bytes exceed `memory_ceiling_mb`.
+    ///
+    /// Takes an estimator rather than owning device state: the same check answers "does the config
+    /// on disk make sense" (an offline, declared-footprint estimator, works with the service down)
+    /// and "does the invariant hold right now" (a live, registry-backed one) without two
+    /// implementations of the arithmetic. Advisory in the sense that this reports the violation --
+    /// `reconcile` is what refuses to admit the model(s) that push the sum over, and demotes
+    /// anything already loaded that no longer fits (see `Entry::pin_honored`).
+    pub fn pin_overcommit(&self, footprint: impl Fn(&ModelCfg) -> u64) -> Option<String> {
+        let pinned: Vec<&ModelCfg> = self.pinned().collect();
+        let total: u64 = pinned.iter().map(|m| footprint(m)).sum();
+        let ceiling = self.server.memory_ceiling_mb * 1024 * 1024;
+        (total > ceiling).then(|| format!(
+            "{} model(s) pinned resident total ~{} MB, over memory_ceiling_mb = {} MB",
+            pinned.len(), total / (1024 * 1024), self.server.memory_ceiling_mb))
     }
 }
 impl Default for Config {
@@ -169,20 +190,24 @@ mod tests {
         assert!(c.find("b").unwrap().resident);
         assert_eq!(c.pinned().map(|m| m.name.as_str()).collect::<Vec<_>>(), vec!["b"]);
     }
+    /// The estimator every `pin_overcommit` test uses: 100 MB per pinned model, so the arithmetic in
+    /// each assertion is easy to check by hand.
+    fn hundred_mb(_m: &ModelCfg) -> u64 { 100 * 1024 * 1024 }
+
     #[test]
-    fn pin_overcommit_fires_only_when_no_slot_is_left() {
-        let mk = |n: usize, max: usize| {
+    fn pin_overcommit_fires_only_when_the_pinned_sum_exceeds_the_ceiling() {
+        let mk = |n: usize, ceiling_mb: u64| {
             let mut c = Config::default();
-            c.server.max_resident = max;
+            c.server.memory_ceiling_mb = ceiling_mb;
             c.models = (0..n).map(|i| ModelCfg {
                 name: format!("m{i}"), scenario: "x".into(), resident: true }).collect();
             c
         };
-        assert!(mk(1, 5).pin_overcommit().is_none(), "one pin of five slots leaves room");
-        assert!(mk(4, 5).pin_overcommit().is_none(), "four pins of five still leave one evictable slot");
-        assert!(mk(5, 5).pin_overcommit().is_some_and(|w| w.contains("max_resident = 5")),
-            "pins equal to the cap leave no victim at all");
-        assert!(mk(6, 5).pin_overcommit().is_some(), "over the cap is the same failure, worse");
+        assert!(mk(1, 500).pin_overcommit(hundred_mb).is_none(), "100 MB pinned under a 500 MB ceiling");
+        assert!(mk(4, 500).pin_overcommit(hundred_mb).is_none(), "400 MB pinned still fits 500 MB");
+        assert!(mk(5, 500).pin_overcommit(hundred_mb).is_none(), "exactly at the ceiling is not OVER it");
+        let w = mk(6, 500).pin_overcommit(hundred_mb).expect("600 MB pinned over a 500 MB ceiling");
+        assert!(w.contains("600 MB") && w.contains("memory_ceiling_mb = 500 MB"), "{w}");
     }
     #[test]
     fn roundtrip_and_defaults() {
@@ -190,7 +215,6 @@ mod tests {
 [server]
 port = 11434
 memory_ceiling_mb = 4096
-max_resident = 1
 [defaults]
 asr = "parakeet"
 [[model]]
@@ -204,7 +228,7 @@ scenario = "scenarios/asr.toml"
         // missing file -> default empty
         let missing = Config::load(Path::new("/nope/x.toml")).unwrap();
         assert!(missing.models.is_empty());
-        assert_eq!(missing.server.max_resident, 1);
+        assert_eq!(missing.server.memory_ceiling_mb, 4096);
     }
     #[test]
     fn partial_server_table_uses_field_defaults() {
@@ -212,13 +236,23 @@ scenario = "scenarios/asr.toml"
         // this was a hard error whose span pointed at `[server]`, reading like a syntax error.
         let c = Config::from_str("[server]\nport = 9999\n").unwrap();
         assert_eq!(c.server.port, 9999);
-        assert_eq!(c.server.max_resident, 1);
         assert_eq!(c.server.memory_ceiling_mb, 4096);
         assert_eq!(c.server.idle_unload_s, 900);
         assert_eq!(c.server.sweep_interval_s, 30);
         assert_eq!(c.server.evict_policy, EvictPolicy::Lru);
         // ...and an empty file is the full default config.
         assert_eq!(Config::from_str("").unwrap(), Config::default());
+    }
+    /// The migration path: `deny_unknown_fields` makes a retired key a parse error rather than a
+    /// silent no-op, and `Config::load`'s wrapper turns that into an actionable message.
+    #[test]
+    fn a_config_still_carrying_max_resident_fails_loud_and_names_the_fix() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("engine.toml");
+        std::fs::write(&p, "[server]\nmax_resident = 2\n").unwrap();
+        let e = Config::load(&p).unwrap_err();
+        assert!(e.contains("max_resident"), "{e}");
+        assert!(e.contains("memory_ceiling_mb"), "the message must name the replacement: {e}");
     }
     #[test]
     fn idle_and_sweep_knobs() {

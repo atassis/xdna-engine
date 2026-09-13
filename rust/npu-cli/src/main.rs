@@ -21,9 +21,9 @@ use npu_engine::telemetry::wire;
 use exit::{engine_error, Code, Tagged};
 use npu_runtime::actor::{start, start_lazy};
 use npu_engine::capability::Capability;
-use npu_runtime::config::{Config, EvictPolicy};
+use npu_runtime::config::{Config, EvictPolicy, ModelCfg};
 use npu_runtime::http;
-use npu_runtime::loader::EngineLoader;
+use npu_runtime::loader::{EngineLoader, ModelLoader};
 use npu_runtime::stream::StreamItem;
 
 fn config_path(cli: &Cli) -> PathBuf { config_path_and_source(cli).0 }
@@ -727,7 +727,7 @@ fn transcribe_media(path: &Path, input: &Path, out: Option<&Path>, format: OutFo
         wanted.iter().map(|t| t.label()).collect::<Vec<_>>().join(", "));
 
     // One actor for the whole run: the models stay resident across tracks and segments instead of
-    // reloading per call. `max_resident` must be >= 2 for asr + diarize to coexist.
+    // reloading per call. `memory_ceiling_mb` must be enough for asr + diarize together to coexist.
     let (handle, join) = start_lazy(cfg, Box::new(EngineLoader { root }))
         .map_err(|e| Tagged(engine_error(&e), e.to_string()))?;
     let tmp = std::env::temp_dir().join(format!("npu-media-{}", std::process::id()));
@@ -979,6 +979,10 @@ fn models(path: &Path, as_json: bool, port: Option<u16>) -> Result<()> {
                 // service only adopts it on reload. That gap is the thing worth reporting.
                 "pinned": m.resident,
                 "live_pinned": l.and_then(|x| x.get("pinned").and_then(|s| s.as_bool())),
+                // Distinct from the drift above: `pinned` and `live_pinned` can agree and this can
+                // still be false, if the invariant demoted the pin over memory_ceiling_mb. `npu
+                // reload` fixes drift; it does not fix this.
+                "pin_honored": l.and_then(|x| x.get("pin_honored").and_then(|s| s.as_bool())),
             })
         }).collect();
         let age = live.as_ref().map(|(a, _)| serde_json::json!(a));
@@ -1004,7 +1008,8 @@ fn models(path: &Path, as_json: bool, port: Option<u16>) -> Result<()> {
             "-" => d.kind.clone().unwrap_or_else(|| "-".into()),
             live_kind => live_kind.to_string(),
         };
-        let pin = pin_cell(m.resident, l.and_then(|x| x.get("pinned")).and_then(|p| p.as_bool()));
+        let pin = pin_cell(m.resident, l.and_then(|x| x.get("pinned")).and_then(|p| p.as_bool()),
+            l.and_then(|x| x.get("pin_honored")).and_then(|p| p.as_bool()));
         if pin.ends_with('*') { drifted = true; }
         let busy = match l.and_then(|x| x.get("busy")).and_then(|b| b.as_bool()) {
             Some(true) => "yes".to_string(),
@@ -1160,7 +1165,15 @@ fn read_live_status(want_port: u16) -> Option<(u64, serde_json::Value)> {
 /// normal state between `npu config pin` and `npu reload`, and the one thing a pin column has to be
 /// able to say. A server too old to publish `pinned` reports `None`, and gets the config's answer
 /// without a drift marker rather than a fabricated disagreement.
-fn pin_cell(want: bool, live: Option<bool>) -> String {
+/// `want`/`live` are the ordinary config-vs-server drift check, unchanged. `pin_honored` catches a
+/// SEPARATE state that drift alone cannot see: `want` and `live` agreeing on "pinned" does not mean
+/// the invariant currently protects it -- a demotion (over `memory_ceiling_mb`) leaves both `true`
+/// and only `pin_honored` says otherwise. `npu reload` fixes ordinary drift; it does NOT fix this,
+/// which is why it renders differently rather than as another `*`.
+fn pin_cell(want: bool, live: Option<bool>, pin_honored: Option<bool>) -> String {
+    if want && live == Some(true) && pin_honored == Some(false) {
+        return "refused(budget)".to_string();
+    }
     let w = if want { "yes" } else { "no" };
     match live {
         Some(l) if l != want => format!("{w}*"),
@@ -1239,8 +1252,8 @@ fn edit_via_service(port: u16, action: &ConfigCmd) -> Result<String> {
 /// Apply a just-saved config to the running service, if there is one.
 ///
 /// An edit to desired state that leaves actual state alone is a footgun with a manual step: the
-/// file said `max_resident = 2`, the service ran five models, and the only thing standing between
-/// them was remembering to type `npu reload`. So a config edit reconciles by default.
+/// file said `memory_ceiling_mb = 2048`, the service ran five models, and the only thing standing
+/// between them was remembering to type `npu reload`. So a config edit reconciles by default.
 ///
 /// A service that is not running is NOT an error -- editing the config with the engine stopped is
 /// ordinary, and the edit is still saved. Nor is a failed reload: the file is already written, so
@@ -1280,7 +1293,7 @@ fn summarise_reload(body: &str) -> String {
 /// `npu load` / `npu unload` talk to the SERVICE, not the device.
 ///
 /// Every other one-shot command drives the engine in-process, but residency is a property of the
-/// running server's registry -- the thing that owns `max_resident`, eviction and the idle sweep.
+/// running server's registry -- the thing that owns admission, eviction and the idle sweep.
 /// Loading a model into this process would take its own hardware context and change nothing the
 /// server can see, which is the opposite of what was asked.
 fn load_model(path: &Path, model: &str, port: Option<u16>) -> Result<()> {
@@ -1291,9 +1304,9 @@ fn load_model(path: &Path, model: &str, port: Option<u16>) -> Result<()> {
         .with_context(|| format!("unexpected reply: {body}"))?;
     if let Some(e) = v.get("error").and_then(|e| e.as_str()) { return Err(admin_err(e, port)) }
     let n = |k: &str| v.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
-    println!("{model}: {}  ({}/{} resident)",
+    println!("{model}: {}  ({} MB of {} MB in use)",
         if v.get("loaded").and_then(|x| x.as_bool()) == Some(true) { "loaded" } else { "already resident" },
-        n("resident"), n("max_resident"));
+        n("resident_mb"), n("ceiling_mb"));
     // Say when the ceiling the operator may have just set is not bounding anything. An unenforceable
     // limit that looks enforced is the failure `memory_ceiling_mb`'s own doc comment warns about.
     let unweighed: Vec<&str> = v.get("unweighed").and_then(|x| x.as_array())
@@ -1434,7 +1447,9 @@ fn weights_cmd(path: &Path, action: &WeightsCmd) -> Result<()> {
 /// config ships with.
 fn config_cmd(path: &Path, action: &ConfigCmd, no_reload: bool) -> Result<()> {
     if let ConfigCmd::Show = action {
-        print!("{}", render(&load_cfg(path)?));
+        let cfg = load_cfg(path)?;
+        let root = root(&cfg, path)?;
+        print!("{}", render(&cfg, &root));
         return Ok(());
     }
     // The service owns the file whenever there is one. `--no-reload` opts out of that too: it
@@ -1448,8 +1463,9 @@ fn config_cmd(path: &Path, action: &ConfigCmd, no_reload: bool) -> Result<()> {
         let cfg = load_cfg(path)?;
         println!("{}  [{}]", describe(action), path.display());
         println!("applied: {applied}");
-        if let Some(w) = cfg.pin_overcommit() { eprintln!("WARNING: {w}"); }
-        if let Some(w) = pins_behind_admission(&cfg) { eprintln!("WARNING: {w}"); }
+        if let Some(w) = cfg.pin_overcommit(declared_footprint_fn(&root(&cfg, path)?)) {
+            eprintln!("WARNING: {w}");
+        }
         return Ok(());
     }
 
@@ -1489,10 +1505,11 @@ fn config_cmd(path: &Path, action: &ConfigCmd, no_reload: bool) -> Result<()> {
     };
     let cfg = doc.save(path).map_err(|e| anyhow!(e))?;
     println!("{note}  [{}]", path.display());
-    // Warn on the same conditions `npu config show` does, so an edit that creates one is caught
+    // Warn on the same condition `npu config show` does, so an edit that creates one is caught
     // where it is made rather than at the next boot.
-    if let Some(w) = cfg.pin_overcommit() { eprintln!("WARNING: {w}"); }
-    if let Some(w) = pins_behind_admission(&cfg) { eprintln!("WARNING: {w}"); }
+    if let Some(w) = cfg.pin_overcommit(declared_footprint_fn(&root(&cfg, path)?)) {
+        eprintln!("WARNING: {w}");
+    }
     if no_reload {
         println!("--no-reload: saved only; run `npu reload` to apply it to a running server");
         return Ok(());
@@ -1537,34 +1554,23 @@ fn flags_cmd(as_json: bool) -> Result<()> {
     Ok(())
 }
 
-/// `Some(message)` when a pinned model sits behind enough unpinned ones that boot admission will
-/// not reach it.
-///
-/// A pin means exempt-from-eviction, NOT entitled to a slot: `reconcile` walks the models in CONFIG
-/// ORDER and stops admitting at `max_resident`, and `Config::pinned()` has no caller there. So the
-/// pin is real but arrives late -- the model loads on demand and then stays. Worth saying, because
-/// the config states an intent the runtime partly declines and used to do so in silence.
-fn pins_behind_admission(cfg: &Config) -> Option<String> {
-    let late: Vec<&str> = cfg.models.iter().enumerate()
-        .filter(|(i, m)| m.resident && *i >= cfg.server.max_resident)
-        .map(|(_, m)| m.name.as_str()).collect();
-    (!late.is_empty()).then(|| format!(
-        "pinned but not admitted at boot: {}. A pin exempts a model from eviction and the idle \
-         sweep; it does not win a slot. Admission is the first {} models in config order, so these \
-         load on demand (and then stay). Move them earlier, or raise max_resident.",
-        late.join(" "), cfg.server.max_resident))
+/// A footprint provider backed by a real `EngineLoader` rooted at `root`: `Config::pin_overcommit`
+/// (and anything else that needs "how many bytes does this model cost, without loading it") takes
+/// an estimator rather than owning device state, and this is the host-only, service-may-be-down one
+/// -- `npu config show`/`npu config pin` both need to answer this with no service running.
+fn declared_footprint_fn(root: &Path) -> impl Fn(&ModelCfg) -> u64 {
+    let loader = EngineLoader { root: root.to_path_buf() };
+    move |m: &ModelCfg| loader.declared_footprint(m).unwrap_or(0)
 }
 
-/// Human-readable config summary (pure, testable).
-fn render(cfg: &Config) -> String {
-    // The ceiling's scope is printed with it. It bounds summed DEVICE-BO bytes, and a model that
-    // reports no footprint is exempt -- which today is every shipped model, so the number alone
-    // reads as a guarantee it does not give. The wording stays true once footprints are measured,
-    // rather than being an "inert" note that would go stale silently. `npu status` has the live
-    // per-model answer.
-    let mut s = format!("port {}  max_resident {}  memory_ceiling_mb {} (device BOs; \
-                         models reporting no footprint are exempt)\n",
-        cfg.server.port, cfg.server.max_resident, cfg.server.memory_ceiling_mb);
+/// Human-readable config summary (pure with respect to the filesystem `root` names -- it stats
+/// weight artifacts but never opens a device).
+fn render(cfg: &Config, root: &Path) -> String {
+    // The ceiling's scope is printed with it. It bounds summed DEVICE-BO bytes, and a model kind
+    // nobody has wired footprint() for is exempt -- `npu status` has the live per-model answer for
+    // which ones, today.
+    let mut s = format!("port {}  memory_ceiling_mb {} (device BOs; models reporting no footprint \
+                         are exempt)\n", cfg.server.port, cfg.server.memory_ceiling_mb);
     s.push_str(&format!("residency: idle_unload_s {}  idle_release_s {}  sweep_interval_s {}  evict_policy {}\n",
         cfg.server.idle_unload_s, cfg.server.idle_release_s, cfg.server.sweep_interval_s,
         match cfg.server.evict_policy { EvictPolicy::Lru => "lru", EvictPolicy::None => "none" }));
@@ -1573,8 +1579,9 @@ fn render(cfg: &Config) -> String {
         if pins.is_empty() { "(none)".to_string() } else { pins.join(" ") }));
     // Surface the overcommit here rather than only at load time: the config summary is where an
     // operator looks BEFORE a refusal, not after one.
-    if let Some(w) = cfg.pin_overcommit() { s.push_str(&format!("WARNING: {w}\n")); }
-    if let Some(w) = pins_behind_admission(cfg) { s.push_str(&format!("WARNING: {w}\n")); }
+    if let Some(w) = cfg.pin_overcommit(declared_footprint_fn(root)) {
+        s.push_str(&format!("WARNING: {w}\n"));
+    }
     let defaults = cfg.defaults.0.iter().map(|(c, m)| format!("{c}={m}")).collect::<Vec<_>>();
     s.push_str(&format!("defaults: {}\n",
         if defaults.is_empty() { "(none)".to_string() } else { defaults.join(" ") }));
@@ -1670,7 +1677,7 @@ mod tests {
             ConfigCmd::RemoveModel { name: "m".into() },
             ConfigCmd::Pin { model: "m".into() },
             ConfigCmd::Unpin { model: "m".into() },
-            ConfigCmd::Set { key: "max_resident".into(), value: "2".into() },
+            ConfigCmd::Set { key: "memory_ceiling_mb".into(), value: "2048".into() },
             ConfigCmd::SetDefault { capability: "asr".into(), model: "m".into() },
         ] {
             let call = admin_call(&action);
@@ -1847,41 +1854,39 @@ mod tests {
     /// which is the normal state between `npu config pin` and `npu reload`.
     #[test]
     fn pin_cell_marks_config_and_server_disagreeing() {
-        assert_eq!(pin_cell(true, Some(true)), "yes");
-        assert_eq!(pin_cell(false, Some(false)), "no");
-        assert_eq!(pin_cell(true, Some(false)), "yes*", "pinned in the config, not yet reloaded");
-        assert_eq!(pin_cell(false, Some(true)), "no*", "unpinned in the config, not yet reloaded");
+        assert_eq!(pin_cell(true, Some(true), Some(true)), "yes");
+        assert_eq!(pin_cell(false, Some(false), None), "no");
+        assert_eq!(pin_cell(true, Some(false), None), "yes*", "pinned in the config, not yet reloaded");
+        assert_eq!(pin_cell(false, Some(true), Some(false)), "no*", "unpinned in the config, not yet reloaded");
         // A server too old to publish `pinned`, or none running: report the config, invent nothing.
-        assert_eq!(pin_cell(true, None), "yes");
-        assert_eq!(pin_cell(false, None), "no");
+        assert_eq!(pin_cell(true, None, None), "yes");
+        assert_eq!(pin_cell(false, None, None), "no");
     }
 
-    fn pin_cfg(max_resident: usize, models: &[(&str, bool)]) -> npu_runtime::config::Config {
+    /// The state ordinary drift cannot see: config and server AGREE it is pinned (no `*`), but the
+    /// invariant has demoted it over `memory_ceiling_mb`. `npu reload` will not fix this, which is
+    /// why it must not render as the same `*` that reload does fix.
+    #[test]
+    fn pin_cell_distinguishes_a_budget_refusal_from_ordinary_drift() {
+        assert_eq!(pin_cell(true, Some(true), Some(false)), "refused(budget)");
+        assert_eq!(pin_cell(true, Some(true), Some(true)), "yes", "honoured pins render plainly");
+    }
+
+    fn pin_cfg(models: &[(&str, bool)]) -> npu_runtime::config::Config {
         npu_runtime::config::Config {
-            server: ServerCfg { max_resident, ..Default::default() },
+            server: ServerCfg::default(),
             models: models.iter().map(|(n, r)| ModelCfg {
                 name: (*n).into(), scenario: "x".into(), resident: *r }).collect(),
             ..Default::default()
         }
     }
 
-    /// A pin is exempt-from-eviction, not entitled to a slot. Saying so where the pin is SET beats
-    /// leaving it to be discovered in `/v1/models` after something has already gone wrong.
-    #[test]
-    fn a_pin_boot_admission_cannot_reach_is_reported() {
-        assert!(pins_behind_admission(&pin_cfg(1, &[("a", false), ("b", true)]))
-            .is_some_and(|w| w.contains('b')), "b is pinned but second with one slot");
-        assert!(pins_behind_admission(&pin_cfg(2, &[("a", false), ("b", true)])).is_none(),
-            "two slots reach b, so there is nothing to warn about");
-        assert!(pins_behind_admission(&pin_cfg(1, &[("b", true), ("a", false)])).is_none(),
-            "a pin first in config order is admitted; order is what decides, not the pin");
-        assert!(pins_behind_admission(&pin_cfg(1, &[("a", false), ("b", false)])).is_none(),
-            "an unpinned deferral is ordinary capacity, not a declined intent");
-    }
-
     #[test]
     fn render_marks_which_models_are_pinned() {
-        let out = render(&pin_cfg(4, &[("a", false), ("b", true)]));
+        // No scenario/weight files exist at this root, so declared_footprint is 0 for both -- this
+        // test is about the [pinned] marker, not the overcommit warning (covered in npu_runtime's
+        // own pin_overcommit unit tests).
+        let out = render(&pin_cfg(&[("a", false), ("b", true)]), Path::new("/nonexistent"));
         assert!(out.contains("model b -> x  [pinned]"), "{out}");
         assert!(out.contains("model a -> x\n"), "an unpinned model gets no marker: {out}");
         assert!(out.contains("pinned resident: b"), "{out}");
@@ -1892,7 +1897,7 @@ mod tests {
     fn config_verbs_edit_in_place_without_destroying_the_file() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("engine.toml");
-        std::fs::write(&p, "# keep me\n[server]\nmax_resident = 2\n\n[[model]]\nname = \"a\"\nscenario = \"s.toml\"\n").unwrap();
+        std::fs::write(&p, "# keep me\n[server]\nmemory_ceiling_mb = 2048\n\n[[model]]\nname = \"a\"\nscenario = \"s.toml\"\n").unwrap();
 
         config_cmd(&p, &ConfigCmd::Pin { model: "a".into() }, true).unwrap();
         assert!(npu_runtime::config::Config::load(&p).unwrap().find("a").unwrap().resident);
@@ -1900,7 +1905,7 @@ mod tests {
         config_cmd(&p, &ConfigCmd::Set { key: "idle_unload_s".into(), value: "0".into() }, true).unwrap();
         let cfg = npu_runtime::config::Config::load(&p).unwrap();
         assert_eq!(cfg.server.idle_unload(), None, "0 is how idle unload is switched off");
-        assert_eq!(cfg.server.max_resident, 2, "an unnamed key must not move");
+        assert_eq!(cfg.server.memory_ceiling_mb, 2048, "an unnamed key must not move");
 
         // Re-pointing a scenario must not silently unpin.
         config_cmd(&p, &ConfigCmd::AddModel { name: "a".into(), scenario: "t.toml".into() }, true).unwrap();
@@ -2215,7 +2220,7 @@ mod tests {
     #[test]
     fn render_empty_and_populated() {
         let empty = Config::default();
-        let r = render(&empty);
+        let r = render(&empty, Path::new("/nonexistent"));
         assert!(r.contains("models: (none)"));
         assert!(r.contains("port 11434"));
         assert!(r.contains("defaults: (none)"), "{r}");
@@ -2225,7 +2230,7 @@ mod tests {
                 (Capability::ASR, "parakeet".to_string()), (Capability::TTS, "kokoro".to_string())]),
             models: vec![ModelCfg { name: "parakeet".into(), scenario: "scenarios/asr.toml".into(), resident: false }],
         };
-        let r = render(&c);
+        let r = render(&c, Path::new("/nonexistent"));
         assert!(r.contains("model parakeet -> scenarios/asr.toml"));
         // Every configured default is rendered, including one no `ModelKind` variant can name.
         assert!(r.contains("asr=parakeet") && r.contains("tts=kokoro"), "{r}");

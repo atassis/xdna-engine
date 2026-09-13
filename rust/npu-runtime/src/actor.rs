@@ -27,8 +27,8 @@ pub struct LoadReport {
     /// False when the model was ALREADY resident. The load is idempotent, and saying which of the
     /// two happened is the difference between "I warmed the device" and "nothing to do".
     pub loaded: bool,
-    pub resident: usize,
-    pub max_resident: usize,
+    pub resident_mb: u64,
+    pub ceiling_mb: u64,
     /// Resident models the memory accountant cannot weigh. Non-empty means `memory_ceiling_mb` is
     /// not bounding anything, which an operator who just set it needs told.
     pub unweighed: Vec<String>,
@@ -43,16 +43,15 @@ fn wrong_shape(cap: Capability, model: &str, got: &Response) -> EngineError {
 
 /// Say when the config pinned a model that admission then declined.
 ///
-/// `resident = true` means exempt-from-eviction, not entitled to a slot: admission is still
-/// first-N-in-config-order against `max_resident`. So a pin behind enough unpinned models simply
-/// does not become resident, and until this existed the only trace was a `/v1/models` detail line
-/// nobody reads until something is already wrong -- the config stated an intent and the runtime
-/// declined it in silence.
+/// Pins are admitted BEFORE any on-demand model, so landing here means the pin does not fit even
+/// walked first -- either alone against `memory_ceiling_mb`, or against an earlier pin in config
+/// order. Until this existed the only trace was a `/v1/models` detail line nobody reads until
+/// something is already wrong -- the config stated an intent and the runtime declined it in silence.
 fn warn_declined_pins(rep: &ReconcileReport) {
     for n in &rep.pinned_deferred {
-        eprintln!("[npu] WARNING: {n} is pinned (resident = true) but was not made resident: \
-                   at max_resident, and a pin does not outrank a model declared before it. \
-                   Raise max_resident, or move it earlier in the config.");
+        eprintln!("[npu] WARNING: {n} is pinned (resident = true) but was not made resident: it \
+                   does not fit under memory_ceiling_mb even admitted first. Raise \
+                   memory_ceiling_mb, or move it earlier among the other pins.");
     }
 }
 
@@ -97,9 +96,9 @@ enum Cmd {
         enqueued: Instant,
     },
     Reconcile { cfg: Box<Config>, reply: Sender<ReconcileReport> },
-    /// Make a model resident because an operator asked. NEVER evicts: at `max_resident` this fails
-    /// and names what holds the slots. The request path (`Cmd::Serve`) still evicts, because a
-    /// request asks for a capability while this asks for capacity.
+    /// Make a model resident because an operator asked. NEVER evicts: over `memory_ceiling_mb` this
+    /// fails and names what holds the budget. The request path (`Cmd::Serve`) still evicts, because
+    /// a request asks for a capability while this asks for capacity.
     Load { name: String, reply: Sender<Result<LoadReport, EngineError>> },
     /// Give a model's device memory back now, keeping its config entry so routing still knows what
     /// it is and the next request reloads it. The same call the idle sweep makes, fired by hand.
@@ -127,10 +126,10 @@ pub fn start(cfg: Config, loader: Box<dyn ModelLoader + Send>) -> Result<(Handle
 /// no device) and load when a request routes to one.
 ///
 /// For a one-shot `npu embed` / `npu transcribe`, the eager reconcile is pure waste and worse than
-/// waste: with `max_resident = 1` it loads the first configured model, and the request then evicts it
-/// to load the one it actually wanted -- two full device loads to serve one request. Worse, `npu
-/// embed` against an ASR-only config paid a complete parakeet load before it could report that no
-/// embed model was configured at all. Declaring is enough to route correctly.
+/// waste: at a tight ceiling it loads the first configured model that fits, and the request then
+/// evicts it to load the one it actually wanted -- two full device loads to serve one request.
+/// Worse, `npu embed` against an ASR-only config paid a complete parakeet load before it could
+/// report that no embed model was configured at all. Declaring is enough to route correctly.
 pub fn start_lazy(cfg: Config, loader: Box<dyn ModelLoader + Send>) -> Result<(Handle, JoinHandle<()>), EngineError> {
     spawn(cfg, loader, false)
 }
@@ -151,7 +150,11 @@ fn spawn(cfg: Config, loader: Box<dyn ModelLoader + Send>, eager: bool) -> Resul
         // the floor (`let _ = ready_rx.recv()` used to discard it, handing the caller a `Handle` to
         // an actor whose initial reconcile silently never ran).
         let init: Result<(), String> = if eager {
-            if let Some(w) = cfg.pin_overcommit() { eprintln!("[npu] WARNING: {w}"); }
+            // Declared, not live: nothing is loaded yet at this point, so the only number available
+            // is the loader's pre-load estimate for each pinned model.
+            if let Some(w) = cfg.pin_overcommit(|m| loader.declared_footprint(m).unwrap_or(0)) {
+                eprintln!("[npu] WARNING: {w}");
+            }
             guard(|| reconcile(&cfg, &mut reg, loader.as_ref())).map(|report| warn_declined_pins(&report))
         } else {
             for m in &cfg.models {
@@ -322,8 +325,8 @@ fn spawn(cfg: Config, loader: Box<dyn ModelLoader + Send>, eager: bool) -> Resul
                                     reg.touch(&name, now);
                                     LoadReport {
                                         loaded: !already,
-                                        resident: reg.resident_count(),
-                                        max_resident: cfg.server.max_resident,
+                                        resident_mb: reg.resident_bytes() / (1024 * 1024),
+                                        ceiling_mb: cfg.server.memory_ceiling_mb,
                                         unweighed: reg.unweighed_residents(),
                                     }
                                 })
@@ -506,7 +509,7 @@ impl Handle {
             .map_err(|_| EngineError::Device("actor stopped".into()))?;
         rx.recv().map_err(|_| EngineError::Device("actor dropped reply".into()))
     }
-    /// Make a model resident now. `Err` at `max_resident` -- this never evicts; see
+    /// Make a model resident now. `Err` over `memory_ceiling_mb` -- this never evicts; see
     /// `Registry::load_explicit` for why the request path and this one differ.
     pub fn load(&self, name: &str) -> Result<LoadReport, EngineError> {
         let (r, rx) = channel();
@@ -540,12 +543,14 @@ mod tests {
     use std::collections::BTreeMap;
     use std::time::Duration;
 
-    /// asr + embed configured, but only ONE slot: serving both means swapping. `.unwrap()`: a mock
-    /// loader's initial reconcile does not panic, so a start() failure here is a real regression.
+    const MB: u64 = 1024 * 1024;
+    /// asr + embed configured, but only ONE MB of budget by default: serving both means swapping.
+    /// `.unwrap()`: a mock loader's initial reconcile does not panic, so a start() failure here is a
+    /// real regression.
     fn swap_setup(srv: ServerCfg) -> (Handle, JoinHandle<()>) {
         let mut t = BTreeMap::new();
-        t.insert("asr".to_string(), Ok((Capability::ASR, 1)));
-        t.insert("bge".to_string(), Ok((Capability::EMBED, 1)));
+        t.insert("asr".to_string(), Ok((Capability::ASR, MB)));
+        t.insert("bge".to_string(), Ok((Capability::EMBED, MB)));
         let cfg = Config {
             server: srv,
             defaults: Defaults::from_pairs([
@@ -563,8 +568,8 @@ mod tests {
 
     #[test]
     fn one_slot_serves_both_models_by_swapping() {
-        // idle_unload off: this test is about max_resident as an evict trigger, nothing else.
-        let (h, j) = swap_setup(ServerCfg { max_resident: 1, idle_unload_s: 0, ..Default::default() });
+        // idle_unload off: this test is about the byte ceiling as an evict trigger, nothing else.
+        let (h, j) = swap_setup(ServerCfg { memory_ceiling_mb: 1, idle_unload_s: 0, ..Default::default() });
         // Boot loaded the first configured model and deferred the second.
         assert_eq!(state_of(&h, "asr"), LoadState::Loaded);
         assert_eq!(state_of(&h, "bge"), LoadState::Unloaded);
@@ -581,7 +586,7 @@ mod tests {
 
     #[test]
     fn explicit_model_wins_over_the_default() {
-        let (h, j) = swap_setup(ServerCfg { max_resident: 2, idle_unload_s: 0, ..Default::default() });
+        let (h, j) = swap_setup(ServerCfg { memory_ceiling_mb: 2, idle_unload_s: 0, ..Default::default() });
         assert_eq!(h.embed(Some("bge"), "hi").unwrap().model, "bge");
         // Naming an ASR model on the embed route is still a WrongKind error, not a silent swap.
         assert!(h.embed(Some("asr"), "hi").is_err());
@@ -591,7 +596,7 @@ mod tests {
     #[test]
     fn idle_sweep_releases_the_device_then_reloads_on_demand() {
         let (h, j) = swap_setup(ServerCfg {
-            max_resident: 2, idle_unload_s: 1, sweep_interval_s: 1, ..Default::default()
+            memory_ceiling_mb: 2, idle_unload_s: 1, sweep_interval_s: 1, ..Default::default()
         });
         assert_eq!(h.embed(None, "hi").unwrap().model, "bge");
         // Poll until the actor's own sweep releases it. Polling this fast is deliberate: it is the
@@ -617,7 +622,7 @@ mod tests {
         t.insert("asr".to_string(), Ok((Capability::ASR, 1)));
         t.insert("bge".to_string(), Ok((Capability::EMBED, 1)));
         let cfg = Config {
-            server: ServerCfg { max_resident: 1, idle_unload_s: 0, ..Default::default() },
+            server: ServerCfg { memory_ceiling_mb: 1, idle_unload_s: 0, ..Default::default() },
             defaults: Defaults::from_pairs([
                 (Capability::ASR, "asr".to_string()), (Capability::EMBED, "bge".to_string())]),
             models: vec![
@@ -631,7 +636,7 @@ mod tests {
         assert!(s.iter().all(|x| x.state == LoadState::Unloaded), "lazy start must not load: {s:?}");
         assert_eq!(s.iter().find(|x| x.name == "bge").unwrap().capability, Some(Capability::EMBED));
         // The embed request loads bge and ONLY bge -- eagerly, this would have loaded asr first and
-        // then evicted it at max_resident = 1.
+        // then evicted it to fit the tight ceiling.
         assert_eq!(h.embed(None, "hi").unwrap().model, "bge");
         assert_eq!(state_of(&h, "bge"), LoadState::Loaded);
         assert_eq!(state_of(&h, "asr"), LoadState::Unloaded);
@@ -645,7 +650,7 @@ mod tests {
         let mut t = BTreeMap::new();
         t.insert("asr".to_string(), Ok((Capability::ASR, 1)));
         let cfg = Config {
-            server: ServerCfg { max_resident: 1, idle_unload_s: 0, ..Default::default() },
+            server: ServerCfg { memory_ceiling_mb: 1, idle_unload_s: 0, ..Default::default() },
             defaults: Defaults::from_pairs([(Capability::ASR, "asr".to_string())]),
             models: vec![ModelCfg { name: "asr".into(), scenario: "x".into(), resident: false }],
         };
@@ -661,7 +666,7 @@ mod tests {
     #[test]
     fn idle_unload_zero_keeps_models_resident() {
         let (h, j) = swap_setup(ServerCfg {
-            max_resident: 2, idle_unload_s: 0, sweep_interval_s: 1, ..Default::default()
+            memory_ceiling_mb: 2, idle_unload_s: 0, sweep_interval_s: 1, ..Default::default()
         });
         assert_eq!(h.embed(None, "hi").unwrap().model, "bge");
         std::thread::sleep(Duration::from_millis(2500));
@@ -702,7 +707,7 @@ mod tests {
     #[test]
     fn a_model_that_panics_while_serving_is_marked_failed() {
         let cfg = Config {
-            server: ServerCfg { max_resident: 1, idle_unload_s: 0, ..Default::default() },
+            server: ServerCfg { memory_ceiling_mb: 1, idle_unload_s: 0, ..Default::default() },
             defaults: Defaults::from_pairs([(Capability::EMBED, "bge".to_string())]),
             models: vec![ModelCfg { name: "bge".into(), scenario: "x".into(), resident: false }],
         };
@@ -720,7 +725,7 @@ mod tests {
     /// ...but a request-shaped error must NOT condemn a working model.
     #[test]
     fn a_wrong_capability_request_does_not_condemn_the_model() {
-        let (h, j) = swap_setup(ServerCfg { max_resident: 2, idle_unload_s: 0, ..Default::default() });
+        let (h, j) = swap_setup(ServerCfg { memory_ceiling_mb: 2, idle_unload_s: 0, ..Default::default() });
         assert_eq!(h.embed(None, "hi").unwrap().model, "bge");
         assert!(h.embed(Some("asr"), "hi").is_err(), "asr cannot embed");
         assert_ne!(state_of(&h, "asr"), LoadState::Failed, "a routing error is the caller's fault");
@@ -732,7 +737,7 @@ mod tests {
     #[test]
     fn a_panicking_load_on_the_request_path_is_recorded_not_propagated() {
         let cfg = Config {
-            server: ServerCfg { max_resident: 1, idle_unload_s: 0, ..Default::default() },
+            server: ServerCfg { memory_ceiling_mb: 1, idle_unload_s: 0, ..Default::default() },
             defaults: Defaults::from_pairs([(Capability::EMBED, "bge".to_string())]),
             models: vec![ModelCfg { name: "bge".into(), scenario: "x".into(), resident: false }],
         };
@@ -755,7 +760,7 @@ mod tests {
     #[test]
     fn a_panicking_load_during_reconcile_is_recorded_as_failed() {
         let cfg = Config {
-            server: ServerCfg { max_resident: 1, idle_unload_s: 0, ..Default::default() },
+            server: ServerCfg { memory_ceiling_mb: 1, idle_unload_s: 0, ..Default::default() },
             defaults: Defaults::from_pairs([(Capability::ASR, "asr".to_string())]),
             models: vec![ModelCfg { name: "asr".into(), scenario: "x".into(), resident: false }],
         };

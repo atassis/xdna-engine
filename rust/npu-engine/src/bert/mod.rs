@@ -19,6 +19,9 @@ pub struct EmbedPipeline {
     frontend: EmbedFrontend,
     encoder: BertEncoder,
     head: EmbedHead,
+    /// Kept alongside `encoder`'s own clone so `bo_bytes()` can read the device's resident counter
+    /// without reaching into the encoder's private fields.
+    dev: Rc<Device>,
 }
 
 impl EmbedPipeline {
@@ -32,12 +35,12 @@ impl EmbedPipeline {
         );
         let frontend = EmbedFrontend::new(
             &root.join(&cfg.artifacts.tokenizer), weights.clone(), m.max_seq);
-        let encoder = BertEncoder::new(dev, root, &weights, m.n_heads, m.head_dim);
+        let encoder = BertEncoder::new(dev.clone(), root, &weights, m.n_heads, m.head_dim);
         let head = EmbedHead {
             pooling: Pooling::parse(&cfg.embeddings.pooling),
             normalize: cfg.embeddings.normalize,
         };
-        Ok(EmbedPipeline { frontend, encoder, head })
+        Ok(EmbedPipeline { frontend, encoder, head, dev })
     }
 
     /// Full pipeline: text -> embedding vector.
@@ -51,6 +54,9 @@ impl EmbedPipeline {
 impl crate::pipeline::Embedder for EmbedPipeline {
     fn embed_one(&self, text: String) -> Result<Vec<f32>, EngineError> {
         Ok(self.embed(text))
+    }
+    fn bo_bytes(&self) -> u64 {
+        self.dev.resident_bo_bytes()
     }
 }
 

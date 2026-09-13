@@ -38,6 +38,15 @@ pub trait ModelLoader {
     /// load one to find out -- which on this engine means seconds and the whole device. `None` means
     /// "cannot tell cheaply"; the caller then falls back to loading.
     fn declared_capability(&self, _cfg: &ModelCfg) -> Option<Capability> { None }
+
+    /// Best-effort pre-load size estimate in bytes, without loading or touching a device.
+    ///
+    /// The pin invariant (sum of pinned bytes <= memory_ceiling_mb) has to be checkable for a model
+    /// that has never been loaded -- there is no live device counter yet, and `npu config show`/`npu
+    /// models` already work with the service down, so this can't wait for one. `None` means "cannot
+    /// tell cheaply"; a caller weighs that as 0, the same honest-unmeasured convention `footprint()`
+    /// already uses, not "zero bytes".
+    fn declared_footprint(&self, _cfg: &ModelCfg) -> Option<u64> { None }
 }
 
 /// Real loader: turns a ModelCfg's scenario TOML into a live npu_engine::Model.
@@ -103,6 +112,31 @@ impl ModelLoader for EngineLoader {
         let sc = npu_engine::config::ScenarioConfig::load(&self.scenario_path(cfg)).ok()?;
         Capability::from_scenario_kind(&sc.scenario.kind)
     }
+
+    /// Reads the same scenario TOML `declared_capability` does, then stats `artifacts.weights` --
+    /// a file's own size, or the recursive sum of a directory's. Approximate (host bytes, not device
+    /// BO bytes -- padding/quantization can disagree with either), but it's the only number that
+    /// exists before anything is loaded.
+    fn declared_footprint(&self, cfg: &ModelCfg) -> Option<u64> {
+        let sc = npu_engine::config::ScenarioConfig::load(&self.scenario_path(cfg)).ok()?;
+        dir_or_file_size(&self.root.join(&sc.artifacts.weights))
+    }
+}
+
+/// A file's own size, or the recursive sum of a directory's. `None` if `path` does not exist or a
+/// read fails partway -- an estimate that silently under-counts a partial failure is worse than one
+/// that says it does not know.
+fn dir_or_file_size(path: &std::path::Path) -> Option<u64> {
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_dir() {
+        return Some(meta.len());
+    }
+    let mut total = 0u64;
+    for entry in std::fs::read_dir(path).ok()? {
+        let entry = entry.ok()?;
+        total += dir_or_file_size(&entry.path())?;
+    }
+    Some(total)
 }
 
 /// A scripted loader for tests + the actor integration test (gated behind `testkit`).
@@ -144,6 +178,12 @@ pub mod mock {
         /// The scripted capability, standing in for the scenario TOML the real loader reads.
         fn declared_capability(&self, cfg: &ModelCfg) -> Option<Capability> {
             match self.table.get(&cfg.name) { Some(Ok((c, _))) => Some(*c), _ => None }
+        }
+        /// The scripted footprint, standing in for a stat of the weight artifact. Tests do not
+        /// distinguish pre-load estimate from post-load live bytes -- both come from the same table
+        /// entry, which is fine for exercising admission logic that only cares about the number.
+        fn declared_footprint(&self, cfg: &ModelCfg) -> Option<u64> {
+            match self.table.get(&cfg.name) { Some(Ok((_, bo))) => Some(*bo), _ => None }
         }
     }
 }
@@ -190,5 +230,47 @@ mod tests {
             "EngineModel::run dispatches Request::Audio on the model KIND; nothing in the type \
              system enforces this, so this test is the guard");
         assert_eq!(m.capabilities(), Capability::DIARIZE);
+    }
+
+    fn write_scenario(root: &std::path::Path, weights: &str) {
+        std::fs::write(root.join("scenario.toml"), format!(
+            "[scenario]\nkind = \"embeddings\"\nname = \"m\"\n[artifacts]\nweights = \"{weights}\"\n"
+        )).unwrap();
+    }
+    fn cfg() -> ModelCfg {
+        ModelCfg { name: "m".into(), scenario: "scenario.toml".into(), resident: false }
+    }
+
+    /// The pre-load size estimate this needs to exist for at all: a pin-time budget check on a model
+    /// that has never been loaded has no live device counter to read, only the weight artifact's own
+    /// size on disk.
+    #[test]
+    fn declared_footprint_sums_every_file_under_the_weight_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        write_scenario(dir.path(), "w");
+        let wdir = dir.path().join("w");
+        std::fs::create_dir(&wdir).unwrap();
+        std::fs::write(wdir.join("a.bin"), vec![0u8; 100]).unwrap();
+        std::fs::write(wdir.join("b.bin"), vec![0u8; 250]).unwrap();
+        let l = EngineLoader { root: dir.path().to_path_buf() };
+        assert_eq!(l.declared_footprint(&cfg()), Some(350));
+    }
+
+    #[test]
+    fn declared_footprint_works_when_weights_names_a_single_file() {
+        let dir = tempfile::tempdir().unwrap();
+        write_scenario(dir.path(), "w.bin");
+        std::fs::write(dir.path().join("w.bin"), vec![0u8; 42]).unwrap();
+        let l = EngineLoader { root: dir.path().to_path_buf() };
+        assert_eq!(l.declared_footprint(&cfg()), Some(42));
+    }
+
+    #[test]
+    fn declared_footprint_is_none_when_the_scenario_or_weights_do_not_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let l = EngineLoader { root: dir.path().to_path_buf() };
+        assert_eq!(l.declared_footprint(&cfg()), None, "no scenario.toml at all");
+        write_scenario(dir.path(), "nowhere");
+        assert_eq!(l.declared_footprint(&cfg()), None, "scenario parses but the weight path is missing");
     }
 }

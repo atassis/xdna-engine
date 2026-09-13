@@ -61,7 +61,7 @@ mod tests {
         let mut t = BTreeMap::new();
         for (n, c) in models { t.insert((*n).to_string(), Ok((*c, 1))); }
         let l = MockLoader { table: t };
-        let srv = ServerCfg { max_resident: 8, ..Default::default() };
+        let srv = ServerCfg::default();
         let mut r = Registry::default();
         let now = std::time::Instant::now();
         let mut c = Config::default();

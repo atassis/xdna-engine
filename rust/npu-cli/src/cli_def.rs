@@ -149,10 +149,10 @@ pub enum Cmd {
     Reload { #[arg(long)] port: Option<u16> },
     /// Make a model resident on the running server, now.
     ///
-    /// Fails rather than evicting when the server is already at `max_resident` -- an explicit load
-    /// is a statement about capacity, so honouring it by dropping someone else's model would answer
-    /// a different question. The refusal names what is holding the slots. Serving a request still
-    /// evicts as before; this is the operator path, not the request path.
+    /// Fails rather than evicting when the server is already over `memory_ceiling_mb` -- an explicit
+    /// load is a statement about capacity, so honouring it by dropping someone else's model would
+    /// answer a different question. The refusal names what is holding the budget. Serving a request
+    /// still evicts as before; this is the operator path, not the request path.
     ///
     /// Runtime state, not config: it does not edit `engine.toml` and does not survive a restart.
     /// For that, pin the model (`npu config pin`).
@@ -377,12 +377,14 @@ pub enum ConfigCmd {
     /// refusal `pin`/`unpin` make: there is nothing to act on, so silently doing nothing would only
     /// hide the typo.
     RemoveModel { name: String },
-    /// Pin a model resident: exempt from idle unload, never chosen as an eviction victim.
+    /// Pin a model resident: always on. Admitted before any on-demand model at boot/reload, exempt
+    /// from idle unload, never chosen as an eviction victim.
     ///
-    /// What a pin does NOT do is win a slot it would not otherwise have had. Admission is still
-    /// first-N-in-config-order against `max_resident`, so pinning a model listed after enough
-    /// others leaves it loading on demand as before -- the server says so on startup rather than
-    /// declining the intent silently. Takes effect on `npu reload`; no restart, no device churn.
+    /// The one exception is the invariant itself: `sum(pinned bytes) <= memory_ceiling_mb`. A pin
+    /// that would push the sum over the ceiling is not silently granted -- it is refused at admission
+    /// (a pin nothing has loaded yet), or demoted (an already-resident pin the ceiling was lowered
+    /// under, or whose own footprint grew), reported either way rather than declined in silence.
+    /// Takes effect on `npu reload`; no restart, no device churn.
     Pin { model: String },
     /// Drop a model's residency pin: it becomes swept when idle and evictable again.
     Unpin { model: String },

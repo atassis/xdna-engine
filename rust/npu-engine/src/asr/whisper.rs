@@ -828,6 +828,15 @@ fn window_bounds(samples: &[i16]) -> Vec<(usize, usize)> {
 }
 
 impl AsrModel for WhisperAsr {
+    /// Pinned device BO bytes. The encoder and whichever NPU decoder backend is active (`npu_decoder`
+    /// / `npu_fused` / `npu_fused_batch`) share ONE `Rc<Device>` -- `enc.device()` is it, per
+    /// `build()`'s `let dev = enc.device()...` -- so this is the whole model's footprint, not just
+    /// the encoder's, with no summing across the three backends needed. `None` under
+    /// `WHISPER_ENC_HOST=1`, which genuinely holds no device bytes.
+    fn bo_bytes(&self) -> u64 {
+        self.enc.device().map(|d| d.resident_bo_bytes()).unwrap_or(0)
+    }
+
     /// Transcribe audio of ANY length, window by window, each window detecting its own language.
     fn transcribe(&self, samples: &[i16]) -> Result<String, EngineError> {
         // WHISPER_LANG_PIN=1 detects once and reuses that tag for every window. OFF by default,
