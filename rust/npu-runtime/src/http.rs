@@ -1606,6 +1606,9 @@ mod route_tests {
     #[test]
     fn healthz_models_chat_and_unknown() {
         let (h, j, _d, p) = mock_handle();
+        // Not pinned, so not resident yet -- this test is about the reported shape of a loaded
+        // model, so make it one explicitly.
+        route(&post("/admin/models/bge/load", ""), &h, &p);
         assert_eq!(route(&get("/healthz"), &h, &p).0, 200);
         let (code, body) = route(&get("/v1/models"), &h, &p);
         assert_eq!(code, 200);
@@ -1705,8 +1708,11 @@ mod route_tests {
     /// be the literal `true`, which is how a 5-day outage looked healthy to systemd.
     #[test]
     fn healthz_is_503_and_names_the_model_that_failed() {
-        // Two slots so `broken` is actually attempted rather than deferred by capacity.
+        // Neither is pinned, so reconcile only declares them now -- explicitly load both, the same
+        // way a real `npu load` (or a request) would, to actually attempt `broken` and let it fail.
         let (h, j, _d, p) = health_setup(&[("bge", true), ("broken", false)], 2);
+        route(&post("/admin/models/bge/load", ""), &h, &p);
+        route(&post("/admin/models/broken/load", ""), &h, &p);
         let (code, body) = route(&get("/healthz"), &h, &p);
         assert_eq!(code, 503, "a failed model must make the service unhealthy: {body}");
         assert!(body.text().contains("\"ok\":false"), "{body}");
@@ -1740,7 +1746,9 @@ mod route_tests {
     #[test]
     fn admin_load_refuses_at_capacity_with_409_and_never_evicts() {
         let (h, j, _d, p) = health_setup(&[("bge", true), ("e5", true)], 1);
-        // `bge` took the only slot at boot.
+        // Neither is pinned, so nothing is resident yet -- take the only MB explicitly, the way a
+        // real `npu load` would, instead of relying on boot to have done it.
+        route(&post("/admin/models/bge/load", ""), &h, &p);
         let (code, body) = route(&post("/admin/models/e5/load", ""), &h, &p);
         assert_eq!(code, 409, "at capacity is a state conflict, not a bad request: {body}");
         assert!(body.text().contains("1 MB of 1 MB in use"), "{body}");
@@ -1754,6 +1762,8 @@ mod route_tests {
     #[test]
     fn admin_load_then_unload_round_trips_and_frees_the_slot() {
         let (h, j, _d, p) = health_setup(&[("bge", true), ("e5", true)], 1);
+        // Neither is pinned; load `bge` explicitly so there is a slot to free below.
+        route(&post("/admin/models/bge/load", ""), &h, &p);
 
         let (code, body) = route(&post("/admin/models/bge/unload", ""), &h, &p);
         assert_eq!(code, 200, "{body}");

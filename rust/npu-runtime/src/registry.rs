@@ -443,7 +443,7 @@ impl Registry {
     /// Behind `guard` because `declared_capability` reads and parses a scenario file, and the real
     /// loader's callees still `.expect()` in places -- a malformed manifest must leave the model
     /// unlabelled, not unwind through a reconcile.
-    fn declared(&self, cfg: &ModelCfg, loader: &dyn ModelLoader) -> Option<Capability> {
+    pub(crate) fn declared(&self, cfg: &ModelCfg, loader: &dyn ModelLoader) -> Option<Capability> {
         crate::actor::guard(|| loader.declared_capability(cfg)).unwrap_or(None)
     }
     fn set_failed(&mut self, cfg: &ModelCfg, detail: String, declared: Option<Capability>) {

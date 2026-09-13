@@ -7,12 +7,17 @@ use crate::registry::{LoadState, Registry};
 
 #[derive(Debug, Default, PartialEq)]
 pub struct ReconcileReport {
+    /// A PIN this pass actually loaded. Unpinned models are declared, not loaded, here -- see the
+    /// load loop below -- so this (and `failed`) only ever names pins.
     pub loaded: Vec<String>,
     pub unloaded: Vec<String>,
+    /// A PIN whose load failed. An unpinned model's load failure is discovered lazily, on the
+    /// request that actually wants it, not by this eager pass.
     pub failed: Vec<String>,
-    /// Configured and wanted, but left out of residency because it does not fit under
-    /// `memory_ceiling_mb`. Not a failure: an unpinned entry here loads on demand when a request
-    /// asks for it (via `ensure_resident`, which evicts to make room; this pass never does).
+    /// A PIN, wanted resident, but left out because it does not fit under `memory_ceiling_mb`.
+    /// Pins-only: an unpinned model is never attempted here at all (see the load loop below), so it
+    /// can never be deferred by it either -- it loads on demand when a request actually asks for it
+    /// (via `ensure_resident`, which evicts to make room; this pass never does).
     pub deferred: Vec<String>,
     /// Released because `memory_ceiling_mb` was lowered under what is already resident, or an
     /// already-resident pin's own live footprint grew past what the invariant can still protect.
@@ -50,10 +55,17 @@ pub fn reconcile(cfg: &Config, reg: &mut Registry, loader: &dyn ModelLoader) -> 
         .filter(|n| !want.contains(n.as_str())).collect();
     for n in to_unload { reg.unload(&n); rep.unloaded.push(n); }
 
-    // load / reload -- PINS FIRST, in config order, then everything else in config order. This is
-    // the whole boot-order fix: `try_load`'s own byte-ceiling check reads `resident_bytes()`, which
-    // accumulates as each successful load lands, so walking pins first is what gives them first
-    // claim on the budget. No second admission check needed here.
+    // load / reload -- PINS ONLY. Reconcile is the eager pass ("a server should come up warm"),
+    // and a pin is the sole way to declare "always on" -- so it is also the sole thing eager
+    // admission reaches for. An unpinned model that isn't already resident is DECLARED (host-only,
+    // no device touch, exactly what `start_lazy` already does for everything), never proactively
+    // loaded; a real request drives its actual load via `ensure_resident`. This was not always
+    // true: before the byte-based rewrite, EVERY configured model was walked through `try_load`
+    // here, gated only by `max_resident`/the ceiling -- which meant "how much eager admission
+    // reaches" was an accident of whatever cap happened to be set, not a declared intent. Measured
+    // cost of that: a 13-model config with a 20 GB ceiling (sized for one large model) tried to
+    // eagerly load most of them at boot, competing for host memory it had no real reason to spend
+    // before anything asked for it.
     let (pinned_models, other_models): (Vec<&crate::config::ModelCfg>, Vec<&crate::config::ModelCfg>) =
         cfg.models.iter().partition(|m| m.resident);
     for m in pinned_models.into_iter().chain(other_models) {
@@ -67,6 +79,17 @@ pub fn reconcile(cfg: &Config, reg: &mut Registry, loader: &dyn ModelLoader) -> 
             // The loaded model is still the right one, but the rest of the ModelCfg may have moved.
             // Without this a pin/unpin took effect only after something else unloaded the model.
             reg.update_cfg(&m.name, m);
+            continue;
+        }
+        if !m.resident {
+            // New, or its scenario changed: re-declare under the fresh manifest. `model.is_none()`
+            // alone (an idle-swept or previously-declared entry, scenario unchanged) is left exactly
+            // as it is -- `declare` would no-op on it anyway, and there is nothing to refresh.
+            if existing.is_none() || existing.is_some_and(|e| e.cfg.scenario != m.scenario) {
+                reg.unload(&m.name);
+                let cap = reg.declared(m, loader);
+                reg.declare(m, cap);
+            }
             continue;
         }
         reg.unload(&m.name);
@@ -130,6 +153,9 @@ mod tests {
         }
         MockLoader { table: t }
     }
+    fn model(name: &str) -> ModelCfg {
+        ModelCfg { name: name.into(), scenario: "x".into(), resident: false }
+    }
     fn cfg(names: &[&str]) -> Config {
         Config {
             server: ServerCfg { memory_ceiling_mb: 8, ..Default::default() },
@@ -138,13 +164,18 @@ mod tests {
         }
     }
     /// The reported bug: `npu config set max_resident 2` then `npu reload` left five models
-    /// resident and answered `deferred: 4`. The cap was an admission limit only.
+    /// resident and answered `deferred: 4`. The cap was an admission limit only. Unpinned models are
+    /// no longer eagerly loaded by reconcile at all (see `nothing_is_eagerly_loaded_with_no_pins`),
+    /// so this now warms them the way a real deployment would -- through requests -- via
+    /// `load_explicit`, then checks reconcile still enforces a lowered cap on whatever is actually
+    /// resident, regardless of how it got there.
     #[test]
     fn lowering_the_cap_evicts_down_to_it() {
         let l = loader(&[("a", true), ("b", true), ("c", true)]);
         let mut c = cfg(&["a", "b", "c"]);
         let mut reg = Registry::default();
-        reconcile(&c, &mut reg, &l);
+        let now = std::time::Instant::now();
+        for n in ["a", "b", "c"] { reg.load_explicit(&model(n), &l, &c.server, now).unwrap(); }
         assert_eq!(reg.resident_count(), 3, "all three fit under the default cap");
 
         c.server.memory_ceiling_mb = 1;
@@ -153,6 +184,24 @@ mod tests {
         assert_eq!(rep.evicted.len(), 2, "and says what it dropped: {:?}", rep.evicted);
         assert!(rep.failed.is_empty(), "eviction is not a failure: {:?}", rep.failed);
         assert!(rep.pinned_over_cap.is_empty());
+    }
+
+    /// The owner's exact question: with nothing pinned, `npu serve`'s eager reconcile must not touch
+    /// the device at all -- not "load whatever fits the ceiling". A 20 GB ceiling sized for one large
+    /// model must not turn into an invitation to warm every other configured model at boot.
+    #[test]
+    fn nothing_is_eagerly_loaded_with_no_pins() {
+        let l = loader(&[("a", true), ("b", true), ("c", true)]);
+        let c = cfg(&["a", "b", "c"]); // default ceiling is generous; all three would fit
+        let mut reg = Registry::default();
+        let rep = reconcile(&c, &mut reg, &l);
+        assert_eq!(reg.resident_count(), 0, "nothing is pinned, so nothing is loaded");
+        assert!(rep.loaded.is_empty() && rep.deferred.is_empty() && rep.failed.is_empty(),
+            "unpinned models are declared, not attempted, so none of these can name one: {rep:?}");
+        // Declared, not silently absent: routing and `npu models` still know what each one is.
+        for n in ["a", "b", "c"] {
+            assert_eq!(reg.known_capability(n), Some(Capability::EMBED), "{n} must still be declared");
+        }
     }
 
     /// Two pins together exceed a lowered ceiling: the invariant is restored by demoting the
@@ -176,18 +225,23 @@ mod tests {
         assert_eq!(rep.evicted, vec!["a".to_string()], "and is then evicted like any unpinned model");
         assert!(reg.get_loaded("a").is_none());
         assert!(reg.get_loaded("b").is_some(), "the newer pin still fits and survives");
-        assert_eq!(reg.status().into_iter().find(|s| s.name == "a").unwrap().pinned, true,
+        assert!(reg.status().into_iter().find(|s| s.name == "a").unwrap().pinned,
             "the config's own declared intent is untouched by the demotion");
     }
 
     /// Unpinned first, and only as many as the cap requires -- the pin survives, the cap is met.
+    /// `b`/`c` are warmed via `load_explicit` (real request traffic, not eager reconcile -- they are
+    /// unpinned, so reconcile alone would only declare them); the pin comes from the first
+    /// `reconcile`, matching how it would actually get there in a running service.
     #[test]
     fn eviction_takes_unpinned_models_and_stops_at_the_cap() {
         let l = loader(&[("a", true), ("b", true), ("c", true)]);
         let mut c = cfg(&["a", "b", "c"]);
         c.models[0].resident = true;               // `a` is pinned
         let mut reg = Registry::default();
+        let now = std::time::Instant::now();
         reconcile(&c, &mut reg, &l);
+        for n in ["b", "c"] { reg.load_explicit(&model(n), &l, &c.server, now).unwrap(); }
 
         c.server.memory_ceiling_mb = 2;
         let rep = reconcile(&c, &mut reg, &l);
@@ -198,22 +252,32 @@ mod tests {
         assert!(rep.pinned_over_cap.is_empty());
     }
 
+    /// `loaded`/`failed` only ever name PINS now -- an unpinned model is declared, not attempted, so
+    /// both are pinned here to actually exercise this path.
     #[test]
     fn loads_unloads_and_records_failures() {
         let l = loader(&[("a", true), ("b", false)]);
         let mut reg = Registry::default();
-        let rep = reconcile(&cfg(&["a", "b"]), &mut reg, &l);
+        let mut c = cfg(&["a", "b"]);
+        c.models[0].resident = true;
+        c.models[1].resident = true;
+        let rep = reconcile(&c, &mut reg, &l);
         assert_eq!(rep.loaded, vec!["a"]);
         assert_eq!(rep.failed, vec!["b"]);
-        let rep2 = reconcile(&cfg(&["b"]), &mut reg, &l);
+        let mut c2 = cfg(&["b"]);
+        c2.models[0].resident = true;
+        let rep2 = reconcile(&c2, &mut reg, &l);
         assert!(rep2.unloaded.contains(&"a".to_string()));
         assert!(reg.get_loaded("a").is_none());
     }
+    /// Same reasoning: `deferred` only ever names a pin that does not fit. Both pinned here.
     #[test]
     fn over_capacity_reports_deferred_not_failed() {
         let l = loader(&[("a", true), ("b", true)]);
         let mut reg = Registry::default();
         let mut c = cfg(&["a", "b"]);
+        c.models[0].resident = true;
+        c.models[1].resident = true;
         c.server.memory_ceiling_mb = 1;
         let rep = reconcile(&c, &mut reg, &l);
         assert_eq!(rep.loaded, vec!["a"]);
@@ -221,13 +285,14 @@ mod tests {
         assert!(rep.failed.is_empty(), "{:?}", rep.failed);
     }
     /// The bug `update_cfg` exists for: a pin only took effect once something else had unloaded the
-    /// model, i.e. never while it was the thing you were trying to protect.
+    /// model, i.e. never while it was the thing you were trying to protect. "a" is unpinned, so it
+    /// is warmed via `load_explicit` (real request traffic), not by reconcile's own eager pass.
     #[test]
     fn a_pin_flipped_on_a_loaded_model_takes_effect_without_a_reload() {
         let l = loader(&[("a", true)]);
         let mut reg = Registry::default();
         let mut c = cfg(&["a"]);
-        reconcile(&c, &mut reg, &l);
+        reg.load_explicit(&model("a"), &l, &c.server, std::time::Instant::now()).unwrap();
         assert_eq!(reg.lru_victim().as_deref(), Some("a"), "unpinned, so it is an eviction candidate");
 
         c.models[0].resident = true;
@@ -242,10 +307,11 @@ mod tests {
         assert!(!reg.status()[0].pinned);
     }
 
-    /// A pin now outranks config order at boot: admitted first (see the load loop), so a pin listed
-    /// SECOND in the file still wins the only slot over an unpinned model listed first. This is
-    /// `boot-admission-order-ignores-pins` resolved by construction, not measured and left as a
-    /// judgment call.
+    /// A pin outranks an unpinned model at boot trivially now: the unpinned one was never a
+    /// candidate for eager admission to begin with (declared, not attempted), so "second in the
+    /// file" cannot cost it a slot it was never competing for either. This is
+    /// `boot-admission-order-ignores-pins` resolved by construction -- the contention it used to
+    /// name (a pin losing to an EARLIER unpinned model) no longer exists as a category.
     #[test]
     fn a_pin_now_outranks_config_order_at_boot() {
         let l = loader(&[("a", true), ("b", true)]);
@@ -254,9 +320,10 @@ mod tests {
         c.server.memory_ceiling_mb = 1;
         c.models[1].resident = true;               // pinned, second in the file, wins anyway
         let rep = reconcile(&c, &mut reg, &l);
-        assert_eq!(rep.loaded, vec!["b"], "the pin is admitted first, regardless of file order");
-        assert_eq!(rep.deferred, vec!["a"], "the unpinned model loses the only MB to the pin");
+        assert_eq!(rep.loaded, vec!["b"], "the pin is admitted regardless of file order");
+        assert!(rep.deferred.is_empty(), "the unpinned model was declared, never a candidate: {rep:?}");
         assert!(rep.pinned_deferred.is_empty(), "the pin itself was admitted -- nothing was declined");
+        assert!(reg.get_loaded("a").is_none(), "unpinned, so still cold");
     }
 
     /// Two competing pins can still collide with EACH OTHER's order -- pins-first narrows the old
@@ -275,25 +342,38 @@ mod tests {
         assert_eq!(rep.pinned_deferred, vec!["b"], "a declined pin must still be named");
     }
 
+    /// An unpinned model too small to be the issue here: even against a ceiling that could not admit
+    /// it if it TRIED, it is never deferred OR failed, because it is never attempted at all.
     #[test]
-    fn an_unpinned_deferral_is_not_reported_as_a_declined_pin() {
+    fn an_unpinned_model_over_the_ceiling_is_declared_not_deferred() {
         let l = loader(&[("a", true), ("b", true)]);
         let mut reg = Registry::default();
         let mut c = cfg(&["a", "b"]);
         c.server.memory_ceiling_mb = 1;
         let rep = reconcile(&c, &mut reg, &l);
-        assert_eq!(rep.deferred, vec!["b"]);
+        assert!(rep.deferred.is_empty(), "neither is pinned, so neither is a candidate: {rep:?}");
         assert!(rep.pinned_deferred.is_empty(), "nothing was pinned, so nothing was declined");
+        assert_eq!(reg.known_capability("b"), Some(Capability::EMBED), "declared anyway, not silently absent");
     }
 
+    /// A PIN the idle sweep released comes back on the next reconcile -- that is the whole point of
+    /// "always on". An UNPINNED model released the same way does not: reconcile only ever eagerly
+    /// loads pins (see `nothing_is_eagerly_loaded_with_no_pins`), so bringing an unpinned model back
+    /// is left to the request that actually wants it next.
     #[test]
-    fn reconcile_reloads_a_model_the_sweep_released() {
-        let l = loader(&[("a", true)]);
+    fn reconcile_reloads_a_released_pin_but_not_a_released_unpinned_model() {
+        let l = loader(&[("a", true), ("b", true)]);
         let mut reg = Registry::default();
-        let c = cfg(&["a"]);
+        let mut c = cfg(&["a", "b"]);
+        c.models[0].resident = true; // "a" pinned, "b" not
         reconcile(&c, &mut reg, &l);
+        reg.load_explicit(&model("b"), &l, &c.server, std::time::Instant::now()).unwrap();
+        assert!(reg.get_loaded("a").is_some() && reg.get_loaded("b").is_some());
+
         reg.release("a", "idle");
+        reg.release("b", "idle");
         let rep = reconcile(&c, &mut reg, &l);
-        assert_eq!(rep.loaded, vec!["a"], "an idle-unloaded model must come back on /admin/reload");
+        assert_eq!(rep.loaded, vec!["a"], "the pin must come back on its own");
+        assert!(reg.get_loaded("b").is_none(), "the unpinned model stays cold until a request asks for it");
     }
 }

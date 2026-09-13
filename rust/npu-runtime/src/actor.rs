@@ -570,10 +570,10 @@ mod tests {
     fn one_slot_serves_both_models_by_swapping() {
         // idle_unload off: this test is about the byte ceiling as an evict trigger, nothing else.
         let (h, j) = swap_setup(ServerCfg { memory_ceiling_mb: 1, idle_unload_s: 0, ..Default::default() });
-        // Boot loaded the first configured model and deferred the second.
-        assert_eq!(state_of(&h, "asr"), LoadState::Loaded);
+        // Neither is pinned, so boot loads neither -- both cold until a request wants one.
+        assert_eq!(state_of(&h, "asr"), LoadState::Unloaded);
         assert_eq!(state_of(&h, "bge"), LoadState::Unloaded);
-        // An embed request pulls bge in on demand, evicting asr...
+        // An embed request pulls bge in on demand...
         assert_eq!(h.embed(None, "hi").unwrap().model, "bge");
         assert_eq!(state_of(&h, "bge"), LoadState::Loaded);
         assert_eq!(state_of(&h, "asr"), LoadState::Unloaded);
@@ -709,7 +709,9 @@ mod tests {
         let cfg = Config {
             server: ServerCfg { memory_ceiling_mb: 1, idle_unload_s: 0, ..Default::default() },
             defaults: Defaults::from_pairs([(Capability::EMBED, "bge".to_string())]),
-            models: vec![ModelCfg { name: "bge".into(), scenario: "x".into(), resident: false }],
+            // Pinned: this test needs it loaded before the dispatch that panics, and only a pin is
+            // eagerly loaded by reconcile now.
+            models: vec![ModelCfg { name: "bge".into(), scenario: "x".into(), resident: true }],
         };
         let (h, j) = start(cfg, Box::new(PanicOnRunLoader)).unwrap();
         assert_eq!(state_of(&h, "bge"), LoadState::Loaded, "it loads fine; the panic is at dispatch");
@@ -762,7 +764,9 @@ mod tests {
         let cfg = Config {
             server: ServerCfg { memory_ceiling_mb: 1, idle_unload_s: 0, ..Default::default() },
             defaults: Defaults::from_pairs([(Capability::ASR, "asr".to_string())]),
-            models: vec![ModelCfg { name: "asr".into(), scenario: "x".into(), resident: false }],
+            // Pinned: reconcile only ever ATTEMPTS a load for a pin, which is the whole premise of
+            // this test ("during reconcile").
+            models: vec![ModelCfg { name: "asr".into(), scenario: "x".into(), resident: true }],
         };
         let (h, j) = match start(cfg, Box::new(PanicLoader)) {
             Ok(v) => v,
