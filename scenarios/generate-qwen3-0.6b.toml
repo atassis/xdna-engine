@@ -21,14 +21,29 @@ name = "qwen3-0.6b"
 # Against `qwen3-0.6b-buckets` this is the same byte behaviour from ONE hardware context instead of
 # four, one artifact instead of four, and no rebuild to add a window.
 [artifacts]
-decode = "artifacts/qwen3-0.6b/rungs4096"
+decode = "artifacts/qwen3-0.6b/rungs4096-rowbatch"
 # Batched prefill, S=4096 to pair with the rung ladder's own window (scripts/build_prefill.sh 28
 # 256 4096; the pair is checked at load, so a mismatch refuses to bind rather than mis-binding).
-# Closes the gap the ladder's own result note named: stepwise priming ran ~28-32 ms/prompt-token
-# regardless of length; this measures 1.9-2.2 ms/prompt-token, ~13-17x, growing with length because
-# stepwise's per-dispatch cost is flat while batched amortises over the M=256 batch. Gated 14/14 on
-# scripts/gate_llm.sh --tier2-prefill (7 prompt lengths x pertok/batched arms) before landing here.
-# Optional -- drop this line and the rail falls back to per-token priming with no other change.
+# Closes the gap the ladder's own result note named: stepwise priming runs 27.6-28.5 ms/prompt-token
+# flat; this measures 8.43 ms/token at P=64 (sub-chunk, still one dispatch) down to 2.05-2.11 ms/token
+# at P>=256, ~13-14x at P=768. Gated 14/14 on scripts/gate_llm.sh --tier2-prefill (7 prompt lengths x
+# pertok/batched arms) before landing here. Optional -- drop this line and the rail falls back to
+# per-token priming with no other change.
+#
+# REBUILT 2026-09-13 to pair with rungs4096-rowbatch (the 2026-09-12 pairing, against plain
+# rungs4096, went stale when decode picked up the rowbatch flip and was disabled here rather than
+# mis-bound). Two independent blockers, both fixed rather than routed around:
+#   1. gen_llm_prefill.py imports iron.common.kv_layout, which wt-iron-causal (build_prefill.sh's
+#      default IRON) does not have. wt-iron-integ (integration-stack) does, is a strict superset of
+#      causal-softmax's own required API surface, and satisfies toolchain.lock's IRON_FORK_COMMIT
+#      floor -- so the fix is IRON=wt-iron-integ, not a wt-iron-causal rebase.
+#   2. The shared toolchain instance for the deployed pin (dc6ee51323ee, instance a7a75a7751d2 under
+#      /mnt/data/xdna/cache/instances/) had 137 dangling symlinks into a since-deleted worktree
+#      (wt-toolchain-repin) -- the documented "linked worktree is ephemeral" failure mode
+#      (toolchain_up.sh's own comment, "Observed three times on 2026-09-06") recurring. Repointed
+#      each symlink at the same instance's own src/build/ (bin, python) or a persistent checkout
+#      (mlir-aie/, xdna-engine/.venv-iron -- neither prunable); 0 remain dangling.
+# Old artifact (paired to plain rungs4096) kept as prefill4096.stale-paired-rungs4096-*.
 prefill = "artifacts/qwen3-0.6b/prefill4096"
 weights = "artifacts/qwen3-0.6b/weights"
 tokenizer_dir = "artifacts/qwen3-0.6b/tokenizer"
