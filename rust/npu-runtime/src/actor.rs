@@ -8,7 +8,7 @@ use crate::config::Config;
 use crate::control_socket::LiveStatus;
 use crate::loader::ModelLoader;
 use crate::reconcile::{reconcile, ReconcileReport};
-use crate::registry::{deep_release_due, release_free_memory, Capability, ModelStatus, Registry};
+use crate::registry::{deep_release_due, release_free_memory, Capability, ModelStatus, Registry, UnloadReason};
 use crate::select::resolve;
 use crate::stream::StreamItem;
 use npu_engine::capability::{Request, Response, Segment};
@@ -366,7 +366,7 @@ fn spawn(cfg: Config, loader: Box<dyn ModelLoader + Send>, eager: bool) -> Resul
                             // `model-teardown-segfaults-the-service`.
                             match was {
                                 false => Ok(false),
-                                true => match guard(|| reg.release(&name, "unloaded: asked for")) {
+                                true => match guard(|| reg.release(&name, "unloaded: asked for", UnloadReason::Operator)) {
                                     Ok(()) => {
                                         // An unload frees a working set, so the deep release has
                                         // something new to trim -- as after the idle sweep.

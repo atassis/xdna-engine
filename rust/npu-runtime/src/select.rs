@@ -54,7 +54,7 @@ mod tests {
     use super::*;
     use crate::config::{Config, Defaults, ModelCfg, ServerCfg};
     use crate::loader::mock::MockLoader;
-    use crate::registry::Registry;
+    use crate::registry::{Registry, UnloadReason};
     use std::collections::BTreeMap;
     /// A registry with every named model loaded, plus a Config that lists them all.
     fn reg_with(models: &[(&str, Capability)]) -> (Config, Registry) {
@@ -84,7 +84,7 @@ mod tests {
     #[test]
     fn explicit_name_resolves_while_unloaded_so_it_can_load_on_demand() {
         let (c, mut r) = reg_with(&[("bge", Capability::EMBED)]);
-        r.release("bge", "idle");
+        r.release("bge", "idle", UnloadReason::Idle);
         assert_eq!(resolve(&c, &r, Capability::EMBED, Some("bge")).unwrap(), "bge",
             "a swept-out model must still be routable -- the caller reloads it");
         // The remembered kind still rejects a capability mismatch without paying a load.
@@ -102,7 +102,7 @@ mod tests {
     fn ambiguity_survives_a_sweep() {
         let (c, mut r) = reg_with(&[("bge", Capability::EMBED), ("e5", Capability::EMBED)]);
         assert!(resolve(&c, &r, Capability::EMBED, None).is_err());
-        r.release("bge", "idle");
+        r.release("bge", "idle", UnloadReason::Idle);
         let e = resolve(&c, &r, Capability::EMBED, None).unwrap_err().to_string();
         assert!(e.contains("model required"), "unloading one of two must not silently pick the other: {e}");
     }
@@ -110,7 +110,7 @@ mod tests {
     fn default_resolves_after_release() {
         let (mut c, mut r) = reg_with(&[("asr", Capability::ASR)]);
         c.defaults = Defaults::from_pairs([(Capability::ASR, "asr".to_string())]);
-        r.release("asr", "idle");
+        r.release("asr", "idle", UnloadReason::Idle);
         assert_eq!(resolve(&c, &r, Capability::ASR, None).unwrap(), "asr",
             "the shipped path (no model named, one default) must survive an idle unload");
     }

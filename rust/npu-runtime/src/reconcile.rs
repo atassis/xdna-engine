@@ -3,7 +3,7 @@
 //! fatal.
 use crate::config::Config;
 use crate::loader::ModelLoader;
-use crate::registry::{LoadState, Registry};
+use crate::registry::{LoadState, Registry, UnloadReason};
 
 #[derive(Debug, Default, PartialEq)]
 pub struct ReconcileReport {
@@ -131,7 +131,7 @@ pub fn reconcile(cfg: &Config, reg: &mut Registry, loader: &dyn ModelLoader) -> 
     while reg.resident_bytes() > ceiling {
         let Some(victim) = reg.lru_victim() else { break };
         reg.release(&victim, &format!("evicted: over memory_ceiling_mb ({} MB)",
-            cfg.server.memory_ceiling_mb));
+            cfg.server.memory_ceiling_mb), UnloadReason::Evicted);
         rep.evicted.push(victim);
     }
     rep
@@ -370,8 +370,8 @@ mod tests {
         reg.load_explicit(&model("b"), &l, &c.server, std::time::Instant::now()).unwrap();
         assert!(reg.get_loaded("a").is_some() && reg.get_loaded("b").is_some());
 
-        reg.release("a", "idle");
-        reg.release("b", "idle");
+        reg.release("a", "idle", UnloadReason::Idle);
+        reg.release("b", "idle", UnloadReason::Idle);
         let rep = reconcile(&c, &mut reg, &l);
         assert_eq!(rep.loaded, vec!["a"], "the pin must come back on its own");
         assert!(reg.get_loaded("b").is_none(), "the unpinned model stays cold until a request asks for it");
