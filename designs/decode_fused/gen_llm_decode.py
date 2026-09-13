@@ -219,6 +219,13 @@ SPLIT_GH_DRAIN = int(os.environ.get("SPLIT_GH_DRAIN", "1"))
 # pair. Turn it on with FUSE_ACT=1.
 FUSE_ACT = os.environ.get("FUSE_ACT", "0") == "1"
 
+# iron/operators/_trace.py wires per-op hardware trace into EVERY design.py this file can reach
+# (decode_layer_dp's fused arm and the older per-operator arms alike), but is a documented no-op at
+# its own default -- `maybe_enable_trace` returns before touching `prog` when this is 0, so it never
+# perturbs a production build. Read here anyway: it is still a real graph change once set, and a
+# traced .mlir must not share this function's name with the same build untraced.
+IRON_TRACE_SIZE = int(os.environ.get("IRON_TRACE_SIZE", "0"))
+
 # Replace the MLP block's SIX designs with ONE data-parallel fused design: every core runs every
 # stage on its own 1/N slice, N=8 (one core per column). Measured standalone at -29.3% against the
 # same six designs with a contemporaneous alternated control -- 1770.5 -> 1251.9 us/layer. N=16 and
@@ -562,6 +569,10 @@ def sequence_name(sp, NL, S, placer_flags, decode_layer_active=False, T=None, tm
         parts.append(f"tr{MLP_TILE_ROWS}")
     if FUSE_ACT:
         parts.append("fuseact")
+    # Flat, not nested under decode_layer_active: _trace.py wires into every design.py this file
+    # can build, fused or not, so the suffix must apply on both paths.
+    if IRON_TRACE_SIZE > 0:
+        parts.append(f"trace{IRON_TRACE_SIZE}")
     if NL != sp.n_layers:
         parts.append(f"l{NL}")
     if S != 2048:
