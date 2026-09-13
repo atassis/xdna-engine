@@ -463,13 +463,13 @@ pub const FLAGS: &[Flag] = &[
     Flag { name: "FFMPEG", owner: "npu-runtime", site: "npu-runtime/src/media.rs",
         semantics: Value, default: "\"ffmpeg\"",
         doc: "ffmpeg binary override, for a box where it is not on PATH." },
-    Flag { name: "RUNTIME_DIRECTORY", owner: "npu-runtime", site: "npu-runtime/src/status_file.rs",
+    Flag { name: "RUNTIME_DIRECTORY", owner: "npu-runtime", site: "npu-runtime/src/control_socket.rs",
         semantics: Value, default: "unset",
-        doc: "systemd RuntimeDirectory= for publishing the service status file; the unit sets \
-              this. Falls back to XDG_RUNTIME_DIR when unset." },
-    Flag { name: "XDG_RUNTIME_DIR", owner: "npu-runtime", site: "npu-runtime/src/status_file.rs",
+        doc: "systemd RuntimeDirectory= for the control socket; the unit sets this. Falls back to \
+              XDG_RUNTIME_DIR when unset." },
+    Flag { name: "XDG_RUNTIME_DIR", owner: "npu-runtime", site: "npu-runtime/src/control_socket.rs",
         semantics: Value, default: "unset",
-        doc: "user-session runtime dir fallback for the status file when RUNTIME_DIRECTORY is unset." },
+        doc: "user-session runtime dir fallback for the control socket when RUNTIME_DIRECTORY is unset." },
 
     // -- npu-weights ------------------------------------------------------------------------------
     Flag { name: "XDNA_CHECKPOINT_DIR", owner: "npu-weights", site: "npu-weights/src/spec.rs",

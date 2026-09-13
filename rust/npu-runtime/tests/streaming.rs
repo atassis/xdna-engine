@@ -192,6 +192,16 @@ fn an_opted_in_stream_carries_per_token_measurements_and_a_summary() {
     let fin = frames.iter().position(|f| f["choices"][0]["finish_reason"] == "stop").unwrap();
     let sum = frames.iter().position(|f| f["object"] == "npu.run.summary").unwrap();
     assert!(fin < sum);
+
+    // The full report, opt-in like the summary: a CLI-over-socket client deserializes this frame
+    // directly into `GenerationReport` for its stats footer, rather than reconstructing one from
+    // the human-oriented summary/x_npu renderings above.
+    let report_frame = frames.iter().find(|f| f["x_npu_report"].is_object()).expect("report frame");
+    let report: npu_engine::GenerationReport =
+        serde_json::from_value(report_frame["x_npu_report"].clone()).expect("must deserialize");
+    assert_eq!(report.summarize().completion_tokens, 3);
+    let rep = frames.iter().position(|f| f["x_npu_report"].is_object()).unwrap();
+    assert!(fin < rep && rep < sum, "finish, then report, then summary");
     handle.shutdown(); let _ = join.join();
 }
 

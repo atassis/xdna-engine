@@ -2,7 +2,7 @@
 //! single-flight server (one request at a time). OpenAI-shaped inference routes + control/admin
 //! routes. The request->response decision is the pure `route()` fn (host-testable with a mock
 //! Handle); `serve()` is only the socket plumbing.
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -435,7 +435,15 @@ fn render_buffered(model: String, rx: std::sync::mpsc::Receiver<StreamItem>, kin
         l.line(&wire::prefill_line(&report.prefill, &meta));
         l.line(&wire::summary_line(&report, &meta, reason));
     }
-    (200, wire::completion_object_with_calls(&text, &calls, reason, &report, &meta).to_string().into())
+    let mut obj = wire::completion_object_with_calls(&text, &calls, reason, &report, &meta);
+    // The full report, not just `timings`/`x_npu` (which are `Summary`, missing e.g. `prefill`):
+    // this is what lets a CLI-over-socket client render the exact same stats table/footer the
+    // in-process path does, from the identical `GenerationReport` -- an OpenAI-shaped client reads
+    // only the fields above and ignores this one.
+    if let Some(m) = obj.as_object_mut() {
+        m.insert("x_npu_report".to_string(), serde_json::to_value(&*report).unwrap_or(serde_json::Value::Null));
+    }
+    (200, obj.to_string().into())
 }
 
 /// OpenAI speech synthesis. Serves `Capability::TTS` and returns audio bytes, not JSON.
@@ -716,10 +724,13 @@ pub fn serve_on(listener: TcpListener, handle: Handle, cfg_path: PathBuf) -> std
     Ok(())
 }
 
-fn handle_conn(mut stream: TcpStream, handle: &Handle, cfg_path: &Path) -> std::io::Result<()> {
-    let _ = stream.set_read_timeout(Some(SOCKET_TIMEOUT));
-    let _ = stream.set_write_timeout(Some(SOCKET_TIMEOUT));
-    let mut reader = BufReader::new(stream.try_clone()?);
+/// Parse one HTTP-shaped request off `reader`. Shared by every transport (this module's own
+/// `handle_conn` for TCP, `control_socket`'s Unix front end) so a request looks identical no matter
+/// which socket carried it -- the two used to parse independently, which is how the Unix side went
+/// three-plus months without noticing it never read `boundary` at all.
+///
+/// `Err` of kind `InvalidData` means the declared body is over `MAX_BODY`; every other `Err` is IO.
+pub(crate) fn parse_request(reader: &mut impl BufRead) -> std::io::Result<Request> {
     let mut line = String::new();
     reader.read_line(&mut line)?;
     let mut parts = line.split_whitespace();
@@ -738,15 +749,62 @@ fn handle_conn(mut stream: TcpStream, handle: &Handle, cfg_path: &Path) -> std::
             if let Some(idx) = l.find("boundary=") { boundary = h[idx + "boundary=".len()..].trim().trim_matches('"').to_string(); }
         }
     }
-    if content_len > MAX_BODY { return respond(&mut stream, 413, &"{\"error\":\"too large\"}".into()); }
+    if content_len > MAX_BODY {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "body too large"));
+    }
     let mut body = vec![0u8; content_len];
     reader.read_exact(&mut body)?;
-    let req = Request { method, path, boundary, body };
+    Ok(Request { method, path, boundary, body })
+}
+
+#[cfg(test)]
+mod parse_request_tests {
+    use super::*;
+
+    /// The Unix front end used to parse the request line and headers itself, and its own copy never
+    /// read `Content-Type`/`boundary` at all -- silent over stub tests, live only once a multipart
+    /// upload (transcribe/diarize) actually hit it. Sharing `parse_request` closes the class rather
+    /// than the instance; this pins the field it dropped.
+    #[test]
+    fn a_multipart_content_type_yields_its_boundary() {
+        let raw = "POST /v1/audio/transcriptions HTTP/1.1\r\n\
+                   Content-Type: multipart/form-data; boundary=XYZ\r\n\
+                   Content-Length: 3\r\n\r\nabc";
+        let mut r = std::io::BufReader::new(raw.as_bytes());
+        let req = parse_request(&mut r).unwrap();
+        assert_eq!(req.method, "POST");
+        assert_eq!(req.path, "/v1/audio/transcriptions");
+        assert_eq!(req.boundary, "XYZ");
+        assert_eq!(req.body, b"abc");
+    }
+
+    #[test]
+    fn a_body_over_the_limit_is_reported_before_reading_it() {
+        let raw = format!("POST /x HTTP/1.1\r\nContent-Length: {}\r\n\r\n", MAX_BODY + 1);
+        let mut r = std::io::BufReader::new(raw.as_bytes());
+        let e = match parse_request(&mut r) { Err(e) => e, Ok(_) => panic!("expected an error") };
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
+    }
+}
+
+fn handle_conn(mut stream: TcpStream, handle: &Handle, cfg_path: &Path) -> std::io::Result<()> {
+    let _ = stream.set_read_timeout(Some(SOCKET_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(SOCKET_TIMEOUT));
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let req = match parse_request(&mut reader) {
+        Ok(r) => r,
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData =>
+            return respond(&mut stream, 413, &"{\"error\":\"too large\"}".into()),
+        Err(e) => return Err(e),
+    };
     let (code, body) = route(&req, handle, cfg_path);
     respond(&mut stream, code, &body)
 }
 
-fn respond(stream: &mut TcpStream, code: u16, body: &Body) -> std::io::Result<()> {
+/// Write one response, over any stream that can be written to -- TCP (this module's own callers) or
+/// the control socket (`control_socket.rs`), so a streamed generation renders byte-identically
+/// regardless of transport.
+pub(crate) fn respond<W: Write>(stream: &mut W, code: u16, body: &Body) -> std::io::Result<()> {
     if let Body::Stream(s) = body {
         return respond_stream(stream, code, s);
     }
@@ -775,7 +833,7 @@ pub(crate) fn reason_phrase(code: u16) -> &'static str {
 /// stream, which drops `s.rx` on the way out. The actor's next `tx.send` then fails and the
 /// generator's sink returns `false` -- this is the entire disconnect-abort mechanism; nothing here
 /// signals the actor directly.
-fn respond_stream(stream: &mut TcpStream, code: u16, s: &SseStream) -> std::io::Result<()> {
+fn respond_stream<W: Write>(stream: &mut W, code: u16, s: &SseStream) -> std::io::Result<()> {
     if matches!(s.kind, SseKind::OllamaChat) {
         return respond_ndjson(stream, code, s);
     }
@@ -821,6 +879,14 @@ fn respond_stream(stream: &mut TcpStream, code: u16, s: &SseStream) -> std::io::
                 // because a strict client is entitled to be surprised by an unknown `object`.
                 stream.write_all(format!("data: {}\n\n", s.render_done(reason)).as_bytes())?;
                 if !s.stats { continue }
+                // A CLI-over-socket client always requests `stats` (see `npu-cli`'s socket client)
+                // regardless of its OWN `--stats` display flag, precisely to get this: the full
+                // report is what lets it render either the one-line or the full table locally, from
+                // the identical `GenerationReport` the in-process path used. Gated the same as
+                // `summary_line` below -- `stats: false` keeps this stream byte-for-byte what it was
+                // before telemetry existed, which `a_stream_without_the_opt_in_is_unchanged` pins.
+                let report_frame = serde_json::json!({"x_npu_report": &*report}).to_string();
+                stream.write_all(format!("data: {report_frame}\n\n").as_bytes())?;
                 wire::summary_line(&report, &meta, reason).to_string()
             }
             // Tool-call frames are never suppressed by `stats`. `Text` can be, because the same
@@ -845,7 +911,7 @@ fn respond_stream(stream: &mut TcpStream, code: u16, s: &SseStream) -> std::io::
 ///
 /// The disconnect-abort mechanism is the SSE path's, unchanged: a failed write drops `s.rx`, the
 /// actor's next send fails, and the generator's sink returns false.
-fn respond_ndjson(stream: &mut TcpStream, code: u16, s: &SseStream) -> std::io::Result<()> {
+fn respond_ndjson<W: Write>(stream: &mut W, code: u16, s: &SseStream) -> std::io::Result<()> {
     let head = format!(
         "HTTP/1.1 {code} {}\r\nContent-Type: application/x-ndjson\r\nCache-Control: no-cache\r\n\
          Connection: close\r\n\r\n", reason_phrase(code));
@@ -1255,6 +1321,14 @@ pub mod parse {
                 .collect::<Result<Vec<_>, _>>()?,
             Some(_) => return Err("\"stop\" must be a string or an array of strings".into()),
         };
+        // `x_npu_` like `x_npu_stats`: not an OpenAI field, so it needs the same escape hatch.
+        // Until now only reachable in-process (`npu generate --dispatch-log`, which built a
+        // `GenerateParams` directly); the CLI becoming a socket client needs a wire carrier or the
+        // flag silently stops doing anything the moment `generate`/`chat` stop calling the engine
+        // in-process.
+        if let Some(x) = v.get("x_npu_dispatch_log") {
+            p.dispatch_log = Some(x.as_bool().ok_or("\"x_npu_dispatch_log\" must be a boolean")?);
+        }
         // Shared with the CLI so the two surfaces cannot drift on what they accept.
         p.validate()?;
         Ok(p)
@@ -2092,6 +2166,23 @@ pub(crate) mod generate_tests {
         h.shutdown(); let _ = j.join();
     }
 
+    /// `x_npu_report` is the full `GenerationReport`, not the `Summary` `timings`/`x_npu` render --
+    /// this is what lets a CLI-over-socket client build the exact same stats table the in-process
+    /// path does, by deserializing the identical struct rather than reconstructing it from a
+    /// human-oriented rendering.
+    #[test]
+    fn the_buffered_response_carries_the_full_report_for_a_socket_client_to_deserialize() {
+        let (h, j, _d, p, _sent, _seen) = gen_handle(ss(&["a", "b", "c"]), Duration::from_millis(1));
+        let (code, body) = route(&post("/v1/chat/completions",
+            r#"{"messages":[{"role":"user","content":"hi"}]}"#), &h, &p);
+        assert_eq!(code, 200, "{body}");
+        let v: serde_json::Value = serde_json::from_str(body.text()).unwrap();
+        let report: npu_engine::GenerationReport =
+            serde_json::from_value(v["x_npu_report"].clone()).expect("must deserialize");
+        assert_eq!(report.summarize().completion_tokens, 3);
+        h.shutdown(); let _ = j.join();
+    }
+
     /// The route that closes the two-writer gap: `[server]` keys were the last mutation the CLI
     /// made to `engine.toml` itself while the service rewrote the same file for everything else.
     #[test]
@@ -2220,6 +2311,24 @@ pub(crate) mod generate_tests {
             assert_eq!(code, 200, "{resp}");
             let (_, params) = seen.lock().unwrap().clone().unwrap();
             assert_eq!(params.enable_thinking, want, "body: {body}");
+            h.shutdown(); j.join().unwrap();
+        }
+    }
+
+    /// `--dispatch-log` was in-process-only until the CLI became a socket client: this is the wire
+    /// carrier it needs, or the flag silently stops doing anything.
+    #[test]
+    fn x_npu_dispatch_log_round_trips_and_defaults_to_unset() {
+        for (body, want) in [
+            (r#"{"messages":[{"role":"user","content":"hi"}],"x_npu_dispatch_log":true}"#, Some(true)),
+            (r#"{"messages":[{"role":"user","content":"hi"}],"x_npu_dispatch_log":false}"#, Some(false)),
+            (r#"{"messages":[{"role":"user","content":"hi"}]}"#, None),
+        ] {
+            let (h, j, _d, p, _sent, seen) = gen_handle(ss(&["ok"]), Duration::ZERO);
+            let (code, resp) = route(&post("/v1/chat/completions", body), &h, &p);
+            assert_eq!(code, 200, "{resp}");
+            let (_, params) = seen.lock().unwrap().clone().unwrap();
+            assert_eq!(params.dispatch_log, want, "body: {body}");
             h.shutdown(); j.join().unwrap();
         }
     }

@@ -5,6 +5,7 @@ use std::thread::JoinHandle;
 use std::time::Instant;
 
 use crate::config::Config;
+use crate::control_socket::LiveStatus;
 use crate::loader::ModelLoader;
 use crate::reconcile::{reconcile, ReconcileReport};
 use crate::registry::{deep_release_due, release_free_memory, Capability, ModelStatus, Registry};
@@ -112,7 +113,7 @@ enum Cmd {
 }
 
 #[derive(Clone)]
-pub struct Handle { tx: Sender<Cmd> }
+pub struct Handle { tx: Sender<Cmd>, live: LiveStatus }
 
 /// Spawn the actor with an initial config + a loader; performs the initial reconcile before returning.
 /// This is the SERVICE start: a server should come up warm and answer `/v1/models` with what is
@@ -144,7 +145,14 @@ fn spawn(cfg: Config, loader: Box<dyn ModelLoader + Send>, eager: bool) -> Resul
     // Off the request path on purpose: it is a subprocess, and the first request must not pay for
     // it. See `conditions::spawn_probe`.
     crate::conditions::spawn_probe();
+    let live = LiveStatus::default();
+    let live_actor = live.clone();
+    // Fixed once at spawn, not read fresh per publish: it is the denominator `npu top` divides
+    // cumulative busy time by, and needs to name when THIS process started serving.
+    let started_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     let join = std::thread::spawn(move || {
+        let live = live_actor;
         let mut reg = Registry::default();
         let mut cfg = cfg;
         // A panic anywhere below used to kill this thread, after which every request failed with
@@ -207,11 +215,9 @@ fn spawn(cfg: Config, loader: Box<dyn ModelLoader + Send>, eager: bool) -> Resul
                         Ok(name) => {
                             // Publish BUSY before the work, not after: this loop does not come back
                             // round until the request finishes, so the end-of-iteration publish can
-                            // never observe a model that is serving. Best-effort, like every other
-                            // status write -- a status file that cannot be written must not be able
-                            // to fail a request.
-                            crate::status_file::publish(cfg.server.port,
-                                &reg.status_serving(Instant::now(), Some(&name)));
+                            // never observe a model that is serving.
+                            live.set(crate::control_socket::render(cfg.server.port, started_unix,
+                                &reg.status_serving(Instant::now(), Some(&name))));
                             let t_serve = Instant::now();
                             let out = guard(|| run_named(&mut reg, &name, req))
                                 .unwrap_or_else(|msg| Err(EngineError::Device(msg)));
@@ -286,8 +292,8 @@ fn spawn(cfg: Config, loader: Box<dyn ModelLoader + Send>, eager: bool) -> Resul
                                     // abort signal.
                                     tx.send(item).is_ok()
                                 };
-                                crate::status_file::publish(cfg.server.port,
-                                    &reg.status_serving(Instant::now(), Some(&name)));
+                                live.set(crate::control_socket::render(cfg.server.port, started_unix,
+                                    &reg.status_serving(Instant::now(), Some(&name))));
                                 let t_serve = Instant::now();
                                 let out = guard(|| run_generate(&mut reg, &name, &prompt, &params, &mut sink))
                                     .unwrap_or_else(|msg| Err(EngineError::Device(msg)));
@@ -400,16 +406,16 @@ fn spawn(cfg: Config, loader: Box<dyn ModelLoader + Send>, eager: bool) -> Resul
                 next_sweep = now + cfg.server.sweep_interval();
             }
             // Publish after every command and every sweep -- the two things that can change what is
-            // resident. This thread is the only owner of the registry, so the file is written from
-            // the same place the state lives and cannot disagree with it. Best-effort: see
-            // `status_file`, a service that cannot write its status must keep serving.
-            // Clears BUSY implicitly: `status_at` never sets it, so returning to the top of the
-            // loop is exactly the moment nothing is being served.
-            crate::status_file::publish(cfg.server.port, &reg.status_at(Instant::now()));
+            // resident. This thread is the only owner of the registry, so the snapshot is written
+            // from the same place the state lives and cannot disagree with it. Clears BUSY
+            // implicitly: `status_at` never sets it, so returning to the top of the loop is exactly
+            // the moment nothing is being served.
+            live.set(crate::control_socket::render(cfg.server.port, started_unix,
+                &reg.status_at(Instant::now())));
         }
     });
     match ready_rx.recv() {
-        Ok(Ok(())) => Ok((Handle { tx }, join)),
+        Ok(Ok(())) => Ok((Handle { tx, live }, join)),
         Ok(Err(msg)) => {
             // The thread already exited on its own (init_failed branch above); Shutdown is a no-op if
             // it beat us here, harmless either way. join() cannot hang: the thread returns right after
@@ -550,6 +556,9 @@ impl Handle {
         if self.tx.send(Cmd::Status { reply: r }).is_err() { return vec![]; }
         rx.recv().unwrap_or_default()
     }
+    /// The out-of-band snapshot the control socket answers `GET /v1/models` from -- an `Arc` clone,
+    /// cheap, and readable without ever touching the actor's channel.
+    pub fn live_status(&self) -> LiveStatus { self.live.clone() }
     pub fn shutdown(&self) { let _ = self.tx.send(Cmd::Shutdown); }
 }
 
