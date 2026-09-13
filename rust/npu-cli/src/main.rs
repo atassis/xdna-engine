@@ -60,7 +60,36 @@ fn restore_sigpipe() {
 
 fn main() -> ExitCode {
     restore_sigpipe();
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => {
+            use clap::error::ErrorKind;
+            // DisplayHelp/DisplayVersion are clap's own correct handling (`--help`/`--version`
+            // themselves), and DisplayHelpOnMissingArgumentOrSubcommand is the already-shipped
+            // bare-namespace-shows-help behavior (`subcommand_required` + `arg_required_else_help`)
+            // -- all three already print the right thing via `e.exit()`.
+            if matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+                | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand) {
+                e.exit();
+            }
+            // Any other usage error: walk the raw args to the deepest subcommand that DID resolve
+            // and print ITS full help, instead of clap's short "try '--help'".
+            let args: Vec<String> = std::env::args().collect();
+            let cmd = Cli::command();
+            let mut node = &cmd;
+            for a in args.iter().skip(1) {
+                if a.starts_with('-') { break; } // stop at the first flag; only walk subcommand names
+                match node.find_subcommand(a.as_str()) {
+                    Some(sub) => node = sub,
+                    None => break,
+                }
+            }
+            let mut help_target = node.clone();
+            let _ = help_target.print_help();
+            eprintln!();
+            std::process::exit(2);
+        }
+    };
     let path = config_path(&cli);
     match run(&cli, &path) {
         Ok(()) => ExitCode::from(Code::Success as u8),
