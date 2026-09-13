@@ -21,6 +21,12 @@
 # catch, not reintroduce.
 set -euo pipefail
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
+# Spawned as a subprocess (Command::new, not a shell built-in), so it inherits no ambient
+# PYTHONPATH/AIECC_PATH from an interactively-sourced iron_env.sh -- unlike build_kernels.sh,
+# which is normally run from a shell where a developer already sourced it. Source it here so
+# the adapter is correct when invoked exactly as its own contract describes, standalone.
+# shellcheck source=../iron_env.sh
+source "$REPO/scripts/iron_env.sh"
 # shellcheck source=../kernel_sandbox.sh
 source "$REPO/scripts/kernel_sandbox.sh"
 
