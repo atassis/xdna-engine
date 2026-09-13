@@ -27,7 +27,7 @@ use npu_xrt::{Device, ElfResident, FusedArena};
 use sha2::{Digest, Sha256};
 
 use crate::api::EngineError;
-use crate::llm::artifact::{BufLoc, EmbedScale, LlmArtifact, RopeWrite};
+use crate::llm::artifact::{BufLoc, EmbedScale, LlmArtifact, RopeWrite, ScratchpadParam};
 use crate::llm::generator::{CacheState, DecodeStep};
 use crate::llm::npu_prefill::NpuPrefill;
 use crate::telemetry::ArmProvenance;
@@ -214,6 +214,30 @@ fn bucket_index<I: Iterator<Item = usize>>(windows: I, pos: usize) -> Option<usi
 fn window_len(pos: usize, granule: usize) -> usize {
     let need = pos + 1;
     need.div_ceil(granule) * granule
+}
+
+/// The mask writes one decode step needs from `LlmArtifact::kv_windows`, one entry per DISTINCT
+/// mask slot -- a slot shared by two geometries (every model before SLIDING_KV_CIRCULAR narrows
+/// one geometry away from the others) is written once, not once per geometry sharing it. Mirrors
+/// the generator's own `_win_cache`, which dedupes mask objects by window for exactly this
+/// reason; getting this wrong is an extra scratchpad write on every existing model's default
+/// (flag-off) path, not only a new-feature bug.
+///
+/// Split out for the same reason `bucket_index`/`window_len` are: this is the part that can be
+/// checked without a device.
+fn mask_writes(
+    kv_windows: &[(ScratchpadParam, usize, usize, ScratchpadParam)], pos: usize,
+) -> Vec<(ScratchpadParam, usize)> {
+    let mut seen = Vec::new();
+    let mut out = Vec::new();
+    for &(_, _, capacity, mask) in kv_windows {
+        if seen.contains(&mask.byte_offset) {
+            continue;
+        }
+        seen.push(mask.byte_offset);
+        out.push((mask, (pos + 1).min(capacity)));
+    }
+    out
 }
 
 pub struct NpuDecodeStep {
@@ -674,31 +698,34 @@ impl DecodeStep for NpuDecodeStep {
             .ok_or_else(|| EngineError::Load("decode instance has no window buckets".to_string()))?;
         let bucket = &self.buckets[idx];
 
-        // `crate::llm::kv_layout::kv_off` is the single owner of this formula -- see its module
-        // doc. At `kv_block == max_seq` this is exactly `pos * head_dim`, the formula this line
-        // used to spell out directly. Parameterised by the BUCKET's own artifact, not the
-        // primary's: the buckets share a cache layout today, and reading the primary's would be a
-        // silent bug the day one of them does not.
-        // ONE WRITE PER DISTINCT head_dim. `kv_offs` has a single entry on every model but
-        // Gemma-4-12B, whose geometry is per-layer -- sliding head_dim 256, global 512 -- so the
-        // same logical position is two different byte offsets and one slot cannot carry both.
-        // The offset formula stays owned by `kv_layout::kv_off`; only the head_dim varies here.
-        for (slot, head_dim) in &bucket.artifact.kv_offs {
-            let kv_val = crate::llm::kv_layout::kv_off(
-                pos, bucket.artifact.kv_block, *head_dim, bucket.artifact.kv_heads,
+        // `crate::llm::kv_layout::kv_off_circular` is the single owner of this formula -- see its
+        // module doc. At `capacity == max_seq` (every geometry but a narrowed SLIDING_KV_CIRCULAR
+        // one) `pos % capacity == pos`, so this is byte-identical to the pre-circular
+        // `kv_off`/`sm_mask` writes it replaces. Parameterised by the BUCKET's own artifact, not
+        // the primary's: the buckets share a cache layout today, and reading the primary's would
+        // be a silent bug the day one of them does not.
+        // ONE WRITE PER GEOMETRY, to that geometry's OWN kv_off slot AND its OWN mask slot.
+        // `kv_windows` has a single entry on every model but Gemma-4-12B, whose geometry is
+        // per-layer -- sliding head_dim 256 (narrowed to `sliding_window` under
+        // SLIDING_KV_CIRCULAR), global 512 (at the full `max_seq`) -- so the same logical
+        // position is two different byte offsets, two different masks, and one slot/mask pair
+        // cannot carry both.
+        for (slot, head_dim, capacity, _) in &bucket.artifact.kv_windows {
+            let kv_val = crate::llm::kv_layout::kv_off_circular(
+                pos, *capacity, bucket.artifact.kv_block, *head_dim, bucket.artifact.kv_heads,
             ) as u32;
             bucket.res
                 .write_scratchpad(slot.byte_offset, &kv_val.to_le_bytes())
                 .map_err(|e| EngineError::Device(format!("write kv_off scratchpad: {e}")))?;
         }
-        let sm = bucket.artifact.sm_mask.ok_or_else(|| {
-            EngineError::Load("decode artifact declares no scratchpad mask_param".to_string())
-        })?;
-        let sm_raw = (pos + 1) as u32;
-        let sm_val = if sm.core { sm_raw << 2 } else { sm_raw };
-        bucket.res
-            .write_scratchpad(sm.byte_offset, &sm_val.to_le_bytes())
-            .map_err(|e| EngineError::Device(format!("write sm_mask scratchpad: {e}")))?;
+        // Deduped by slot -- see `mask_writes`' own doc for why a naive per-geometry loop here
+        // would be a regression on every model's default (flag-off, mask-shared) path.
+        for (mask, sm_raw) in mask_writes(&bucket.artifact.kv_windows, pos) {
+            let sm_val = if mask.core { (sm_raw as u32) << 2 } else { sm_raw as u32 };
+            bucket.res
+                .write_scratchpad(mask.byte_offset, &sm_val.to_le_bytes())
+                .map_err(|e| EngineError::Device(format!("write sm_mask scratchpad: {e}")))?;
+        }
 
         // Opt-in: `attn_window` is absent on every artifact today (the window is still baked
         // into which bucket ELF is selected above), so this block is dead weight until a
@@ -743,7 +770,50 @@ impl DecodeStep for NpuDecodeStep {
 #[cfg(test)]
 mod tests {
     use super::bucket_index;
+    use super::mask_writes;
     use super::window_len;
+    use crate::llm::artifact::ScratchpadParam;
+
+    fn param(byte_offset: usize) -> ScratchpadParam {
+        ScratchpadParam { byte_offset, core: false }
+    }
+
+    /// Two geometries sharing one window (every model before SLIDING_KV_CIRCULAR narrows one
+    /// away from the others) must write that shared mask slot ONCE, not once per geometry --
+    /// mirrors the generator's own `_win_cache`, which dedupes mask objects by window for
+    /// exactly this reason. Getting this wrong is an extra scratchpad write on every existing
+    /// model's default (flag-off) path, not a new-feature bug.
+    #[test]
+    fn a_mask_slot_shared_by_two_geometries_is_written_once() {
+        let shared = param(4);
+        let kv_windows = vec![
+            (param(0), 256usize, 2048usize, shared),
+            (param(8), 512usize, 2048usize, shared),
+        ];
+        let writes = mask_writes(&kv_windows, 10);
+        assert_eq!(writes, vec![(shared, 11)]);
+    }
+
+    /// A narrowed geometry's own mask slot is independent and gets its own write, clamped to
+    /// ITS capacity -- the case SLIDING_KV_CIRCULAR actually introduces.
+    #[test]
+    fn distinct_mask_slots_each_get_their_own_clamped_write() {
+        let sliding_mask = param(4);
+        let global_mask = param(12);
+        let kv_windows = vec![
+            (param(0), 256usize, 1024usize, sliding_mask), // narrowed
+            (param(8), 512usize, 2048usize, global_mask),  // full S
+        ];
+        assert_eq!(
+            mask_writes(&kv_windows, 1023),
+            vec![(sliding_mask, 1024), (global_mask, 1024)]
+        );
+        // Past the sliding geometry's capacity, its mask clamps; the global one keeps growing.
+        assert_eq!(
+            mask_writes(&kv_windows, 2000),
+            vec![(sliding_mask, 1024), (global_mask, 2001)]
+        );
+    }
 
     /// Boundaries only, at two granules so a fixed-128 coincidence can't hide an off-by-one:
     /// `pos == granule-1` still holds inside the first granule, `pos == granule` needs a second.

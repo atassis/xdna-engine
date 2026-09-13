@@ -27,6 +27,18 @@ pub fn kv_off(pos: usize, kv_block: usize, head_dim: usize, kv_heads: usize) -> 
     block * block_stride + within * head_dim
 }
 
+/// The circular-KV-cache runtime value: `pos` wrapped by this geometry's own `capacity` before
+/// blocking, so a narrowed geometry (SLIDING_KV_CIRCULAR's sliding layers, `capacity < S`) reuses
+/// its buffer instead of addressing ever-further blocks past it. Mirrors the Python write at
+/// `verify_llm_decode.py`: `KVLayout(Hkv, S=capacity, HD, T=min(T, capacity)).kv_off(pos %
+/// capacity)`. At `capacity == S` (every non-circular geometry) `pos % capacity == pos` for any
+/// valid position, so this is exactly `kv_off` with no behavior change.
+pub fn kv_off_circular(
+    pos: usize, capacity: usize, kv_block: usize, head_dim: usize, kv_heads: usize,
+) -> usize {
+    kv_off(pos % capacity, kv_block.min(capacity), head_dim, kv_heads)
+}
+
 /// The BUILD-TIME per-head term `kv_off` deliberately omits: where head `head`'s positions start
 /// inside each block. A host that only drives the cache never needs it; a host that READS the
 /// cache back -- the debug probes, which compare a slab against a CPU golden -- does.
@@ -58,6 +70,37 @@ pub fn head_runs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kv_off_circular_wraps_pos_by_capacity_before_blocking() {
+        // Matches verify_llm_decode.py's SLIDING_KV_CIRCULAR write:
+        // KVLayout(Hkv, S=capacity, HD, T=min(T, capacity)).kv_off(pos % capacity).
+        // A flat (one-block) geometry, the common case per gen_llm_decode.py's T_g = min(T, w):
+        // this degenerates to exactly (pos % capacity) * head_dim.
+        let (capacity, head_dim, kv_heads) = (128usize, 128usize, 8usize);
+        for pos in [0usize, 1, 127, 128, 129, 255, 256, 4095] {
+            assert_eq!(
+                kv_off_circular(pos, capacity, capacity, head_dim, kv_heads),
+                (pos % capacity) * head_dim
+            );
+        }
+        // Wraparound: position `capacity + k` must address the SAME slot as position `k` -- the
+        // property that makes this safe to serve from a buffer sized for only one capacity.
+        for k in [0usize, 1, 64, 127] {
+            assert_eq!(
+                kv_off_circular(capacity + k, capacity, capacity, head_dim, kv_heads),
+                kv_off_circular(k, capacity, capacity, head_dim, kv_heads)
+            );
+        }
+        // Below capacity, it must agree with the un-wrapped formula exactly (no behavior change
+        // for the global/non-circular geometry, where capacity == S and pos never reaches it).
+        for pos in [0usize, 1, 127] {
+            assert_eq!(
+                kv_off_circular(pos, capacity, capacity, head_dim, kv_heads),
+                kv_off(pos, capacity, head_dim, kv_heads)
+            );
+        }
+    }
 
     #[test]
     fn degenerate_kv_block_equals_max_seq_is_the_old_pos_times_head_dim() {

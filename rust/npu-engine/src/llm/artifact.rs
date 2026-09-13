@@ -32,7 +32,7 @@ pub struct BufLoc {
 /// firmware's UPDATE_REG convention applies -- the host must shift the value left by 2 bits before
 /// writing it (see `asr::whisper_decoder`'s `dispatch_resident`, which this mirrors); `core: false`
 /// ("addr" kind) is written raw.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScratchpadParam {
     pub byte_offset: usize,
     pub core: bool,
@@ -144,6 +144,18 @@ pub struct LlmArtifact {
     /// Populated from `meta.json`'s `scratchpad.kv_params` when present, else derived from the
     /// single `kv_param` + `dims.head_dim` so every existing artifact keeps loading unchanged.
     pub kv_offs: Vec<(ScratchpadParam, usize)>,
+    /// One entry per attention geometry: `(kv_off slot, head_dim, capacity, mask slot)`.
+    /// `capacity` is this geometry's own KV-cache size -- `max_seq` on every geometry that isn't
+    /// narrowed, or `sliding_window` on one that is (SLIDING_KV_CIRCULAR). `step()` writes
+    /// `kv_layout::kv_off_circular(pos, capacity, ...)` and a mask clamped to `capacity` through
+    /// EACH entry's own slots, instead of `kv_offs`'s shared, unbounded `pos * head_dim` and the
+    /// single build-wide `sm_mask`.
+    ///
+    /// Populated from `meta.json`'s `scratchpad.kv_windows` when present, else derived from
+    /// `kv_offs` at `capacity = max_seq` paired with the single `sm_mask` -- every artifact built
+    /// before SLIDING_KV_CIRCULAR existed keeps loading, and dispatching through this list is then
+    /// byte-identical to today's `kv_offs`/`sm_mask` writes (`pos % max_seq == pos`).
+    pub kv_windows: Vec<(ScratchpadParam, usize, usize, ScratchpadParam)>,
     /// The scalar causal-width parameter. Required on a decode artifact. `None` on every prefill
     /// artifact the current generator emits, in BOTH arms and for two different reasons: the
     /// causal one masks with [`Self::mask_widths`] instead, and the non-causal control masks
@@ -533,6 +545,46 @@ impl LlmArtifact {
             _ => vec![(kv_off.clone(), head_dim)],
         };
         let sm_mask = mask_param_name.map(read_param).transpose()?;
+        // `scratchpad.kv_windows`: [{"kv_param", "head_dim", "window", "mask_param"}, ...], one
+        // entry per attention geometry. Absent on every artifact built before SLIDING_KV_CIRCULAR
+        // existed, so fall back to `kv_offs` at the full build capacity paired with the single
+        // shared `sm_mask` -- see `kv_windows`'s own doc comment for why that fallback is exact,
+        // not an approximation.
+        let kv_windows = match sp.get("kv_windows").and_then(|v| v.as_array()) {
+            Some(list) if !list.is_empty() => {
+                let mut out = Vec::with_capacity(list.len());
+                for e in list {
+                    let kv_nm = e.get("kv_param").and_then(|v| v.as_str()).ok_or_else(|| {
+                        ctx("scratchpad.kv_windows entry missing string `kv_param`".to_string())
+                    })?;
+                    let hd = e.get("head_dim").and_then(|v| v.as_u64()).ok_or_else(|| {
+                        ctx(format!("scratchpad.kv_windows entry `{kv_nm}` missing numeric `head_dim`"))
+                    })? as usize;
+                    let capacity = e.get("window").and_then(|v| v.as_u64()).ok_or_else(|| {
+                        ctx(format!("scratchpad.kv_windows entry `{kv_nm}` missing numeric `window`"))
+                    })? as usize;
+                    let mask_nm = e.get("mask_param").and_then(|v| v.as_str()).ok_or_else(|| {
+                        ctx(format!("scratchpad.kv_windows entry `{kv_nm}` missing string `mask_param`"))
+                    })?;
+                    if capacity == 0 || capacity > max_seq {
+                        return Err(ctx(format!(
+                            "scratchpad.kv_windows entry `{kv_nm}` window={capacity} is not a \
+                             capacity inside dims.S = {max_seq}"
+                        )));
+                    }
+                    out.push((read_param(kv_nm)?, hd, capacity, read_param(mask_nm)?));
+                }
+                out
+            }
+            // `sm_mask` is itself optional -- `None` on every prefill artifact (masked instead by
+            // `mask_widths`, a different mechanism entirely). No mask slot means no geometry to
+            // bound here either, so this degrades to empty rather than erroring; nothing in the
+            // prefill dispatch path reads `kv_windows`.
+            _ => match sm_mask {
+                Some(sm) => kv_offs.iter().map(|&(p, hd)| (p, hd, max_seq, sm)).collect(),
+                None => Vec::new(),
+            },
+        };
         // The third scratchpad pointer, mirroring `kv_param`/`mask_param`: absent (or explicit
         // `null`) on every artifact today, since the window is still a build-time constant. A
         // window pointer with no granule to round against -- or a granule with nothing to write
@@ -834,6 +886,7 @@ impl LlmArtifact {
             embed_blob,
             kv_off,
             kv_offs,
+            kv_windows,
             sm_mask,
             attn_window,
             window_granule,
@@ -1355,6 +1408,47 @@ mod tests {
         assert_eq!(art.kv_offs.len(), 2);
         assert_eq!(art.loc("rope_global").len / 2, 8);
         assert_eq!(art.loc("rope_local").len / 2, 4);
+    }
+
+    /// SLIDING_KV_CIRCULAR's contract: `scratchpad.kv_windows` (`{kv_param, head_dim, window,
+    /// mask_param}` per geometry) carries a NARROWER capacity than `dims.S` for the sliding
+    /// geometry, with its own mask slot -- the pairing `step()` needs to write a wraparound
+    /// `kv_off` and a per-geometry clamp instead of the single shared `sm_mask`.
+    #[test]
+    fn per_geometry_kv_windows_parse_with_their_own_capacity_and_mask() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut meta = two_geometry_meta();
+        meta["scratchpad"]["params"]["sm_mask1"] =
+            serde_json::json!({"byte_offset": 12, "kind": "core"});
+        meta["scratchpad"]["mask_params"] = serde_json::json!([
+            {"param": "sm_mask", "window": 4},
+            {"param": "sm_mask1", "window": 8},
+        ]);
+        meta["scratchpad"]["kv_windows"] = serde_json::json!([
+            {"kv_param": "kv_off", "head_dim": 8, "window": 4, "mask_param": "sm_mask"},
+            {"kv_param": "kv_off1", "head_dim": 4, "window": 8, "mask_param": "sm_mask1"},
+        ]);
+        write_meta(dir.path(), &meta);
+        let art = LlmArtifact::load(dir.path()).expect("per-geometry windows must load");
+        assert_eq!(art.kv_windows.len(), 2);
+        assert_eq!(art.kv_windows[0].1, 8, "head_dim");
+        assert_eq!(art.kv_windows[0].2, 4, "narrowed capacity");
+        assert_eq!(art.kv_windows[1].1, 4);
+        assert_eq!(art.kv_windows[1].2, 8, "global geometry keeps the full S");
+    }
+
+    /// Every artifact built before SLIDING_KV_CIRCULAR existed declares no `kv_windows` at all --
+    /// this must degrade to exactly today's behavior: one entry per `kv_offs` slot, at the full
+    /// build capacity, paired with the single shared `sm_mask`.
+    #[test]
+    fn kv_windows_falls_back_to_kv_offs_at_full_capacity_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        write_meta(dir.path(), &base_meta(8, 4, serde_json::json!({})));
+        let art = LlmArtifact::load(dir.path()).expect("uniform artifact must still load");
+        assert_eq!(art.kv_windows.len(), 1);
+        assert_eq!(art.kv_windows[0].1, art.head_dim);
+        assert_eq!(art.kv_windows[0].2, art.max_seq, "capacity == S when not narrowed");
+        assert_eq!(art.kv_windows[0].3, art.sm_mask.unwrap());
     }
 
     /// THE failure the cross-check exists for: the generator declares two KV geometries and one
