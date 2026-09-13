@@ -292,7 +292,7 @@ impl DoctorReport {
         };
         let parakeet_preflight = engine_root.as_ref()
             .map(|r| crate::preflight_artifacts(&cfg, r));
-        let service = crate::read_live_status(cfg.server.port);
+        let service = crate::read_live_status();
 
         DoctorReport {
             device_node_present, examine, platform, hw_contexts,

@@ -705,8 +705,13 @@ fn extract_str_field(body: &str, key: &str) -> Option<String> {
 }
 
 /// Blocking single-flight server. Reads each request, routes it, writes the response.
+///
+/// `$NPU_HTTP_ENDPOINT` (`host:port`), if set, overrides `port` entirely -- an explicit bind
+/// address for a container or a test, the same override tier `control_socket::socket_path` gives
+/// the control socket. Unset, this binds `127.0.0.1:<port>` exactly as before that variable existed.
 pub fn serve(handle: Handle, cfg_path: PathBuf, port: u16) -> std::io::Result<()> {
-    let listener = TcpListener::bind(format!("127.0.0.1:{port}"))?;
+    let addr = std::env::var("NPU_HTTP_ENDPOINT").unwrap_or_else(|_| format!("127.0.0.1:{port}"));
+    let listener = TcpListener::bind(addr)?;
     serve_on(listener, handle, cfg_path)
 }
 

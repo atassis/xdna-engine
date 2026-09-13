@@ -77,24 +77,23 @@ fn run(cli: &Cli, path: &Path) -> Result<()> {
     // Either asks for JSON, so they are OR-ed rather than one overriding the other.
     let as_json = cli.output == OutputFormat::Json;
     match &cli.cmd {
-        Cmd::Serve { port, allow_degraded } => serve(path, *port, *allow_degraded),
+        Cmd::Serve { allow_degraded } => serve(path, *allow_degraded),
         Cmd::Transcribe { input, model } => transcribe(input, model.as_deref(), as_json),
         Cmd::Generate { prompt, model, sampling, no_stream, raw, stats } =>
             generate(prompt, model.as_deref(), sampling, *no_stream, *raw, *stats, as_json),
         Cmd::Chat { prompt, model, sampling, no_stream } =>
             chat(prompt.as_deref(), model.as_deref(), sampling, *no_stream, as_json),
         Cmd::Embed { text, model } => embed(text, model.as_deref(), as_json),
-        Cmd::Top { interval, once, port } => top(path, *interval, *once, *port),
+        Cmd::Top { interval, once } => top(*interval, *once),
         Cmd::Stats { log, diff } => stats_cmd(log, diff.as_deref()),
         Cmd::Replay { log, realtime, frames } => replay_cmd(log, *realtime, *frames),
         Cmd::Diarize { wav, model, json } => diarize(wav, model.as_deref(), *json || as_json),
         Cmd::TranscribeMedia { input, out, format, asr, diarize: diar, track, no_diarize } =>
             transcribe_media(input, out.as_deref(), *format, asr.as_deref(),
                              diar.as_deref(), *track, *no_diarize),
-        Cmd::Models { json, port } => models(&path, *json || as_json, *port),
-        Cmd::Reload { port } => reload(&path, *port),
-        Cmd::Load { model, port } => load_model(&path, model, *port),
-        Cmd::Unload { model, port } => unload_model(&path, model, *port),
+        Cmd::Models { json } => models(&path, *json || as_json),
+        Cmd::Load { model } => load_model(&path, model),
+        Cmd::Unload { model } => unload_model(&path, model),
         Cmd::Config { action, no_reload } => config_cmd(&path, action, *no_reload),
         Cmd::Flags { json } => flags_cmd(*json || as_json),
         Cmd::Weights { action } => weights_cmd(&path, action),
@@ -199,26 +198,26 @@ fn root_candidates(cfg: &Config, config_path: &Path, cwd: Option<PathBuf>,
     out
 }
 
-/// Is the thing listening on `port` an xdna-engine, or somebody else's server?
+/// Is the thing listening at `addr` an xdna-engine, or somebody else's server?
 ///
 /// 11434 is a shared default -- ollama and FLM take it too -- so every command that talks to it has
 /// to ask, not assume. `preflight_serve` already did; `models` did not, and would print a foreign
 /// server's model list as ours. One function so the next caller cannot forget.
-fn listener_is_ours(port: u16) -> bool {
-    http_get(port, "/healthz").map(|b| b.contains("\"npu\"")).unwrap_or(false)
+fn listener_is_ours(addr: &str) -> bool {
+    http_get(addr, "/healthz").map(|b| b.contains("\"npu\"")).unwrap_or(false)
 }
 
-/// Fail SOFTLY when the port is already taken, instead of loading models first and dying on an
+/// Fail SOFTLY when the address is already taken, instead of loading models first and dying on an
 /// opaque "Address already in use" (os error 98) after a panic.
 ///
 /// 11434 is NOT ours exclusively -- ollama, FLM and others default to it too -- so we do not claim
 /// to know who is there. Probe `/healthz` and only name xdna-engine when the reply is actually
 /// ours; otherwise report an unidentified listener and let the operator decide.
-fn preflight_serve(port: u16) -> Result<()> {
+fn preflight_serve(addr: &str) -> Result<()> {
     use std::time::Duration;
-    let addr = match format!("127.0.0.1:{port}").parse() { Ok(a) => a, Err(_) => return Ok(()) };
-    if TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_err() {
-        // Nothing listening; the port is ours to bind.
+    let sockaddr = match addr.parse() { Ok(a) => a, Err(_) => return Ok(()) };
+    if TcpStream::connect_timeout(&sockaddr, Duration::from_millis(300)).is_err() {
+        // Nothing listening; the address is ours to bind.
         return if npu_engine::Engine::available() {
             Ok(())
         } else {
@@ -228,19 +227,20 @@ fn preflight_serve(port: u16) -> Result<()> {
         };
     }
     // Something is listening. Ask it who it is rather than assuming.
-    if listener_is_ours(port) {
+    if listener_is_ours(addr) {
         bail!(
-            "port {port} is already served by an xdna-engine instance.\n  \
+            "{addr} is already served by an xdna-engine instance.\n  \
              status : systemctl --user status xdna-engine\n  \
              stop   : systemctl --user stop xdna-engine\n  \
-             or use another port: npu serve --port <other>"
+             or use another address: NPU_HTTP_ENDPOINT=<host:port> npu serve"
         );
     }
     bail!(
-        "port {port} is already in use by another process (it did not answer /healthz as an\n  \
-         xdna-engine, so it is likely ollama, FLM or a different server -- {port} is a shared\n  \
-         default). Identify it with:  ss -ltnp 'sport = :{port}'\n  \
-         Then stop it, or use another port: npu serve --port <other>"
+        "{addr} is already in use by another process (it did not answer /healthz as an\n  \
+         xdna-engine, so it is likely ollama, FLM or a different server -- {addr} is a shared\n  \
+         default). Identify it with:  ss -ltnp 'sport = :{}'\n  \
+         Then stop it, or use another address: NPU_HTTP_ENDPOINT=<host:port> npu serve",
+        sockaddr.port()
     );
 }
 
@@ -268,15 +268,41 @@ fn preflight_artifacts(cfg: &Config, root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn serve(path: &Path, port: Option<u16>, allow_degraded: bool) -> Result<()> {
+/// `NPU_HTTP_ENDPOINT`/`NPU_SOCKET_ENDPOINT` are independent overrides, but `npu serve` needs both
+/// binds either way -- setting only one (a container/test that meant to redirect both) most likely
+/// means the other one's default was forgotten, not chosen. A log line, not a refusal: an operator
+/// who really does want the default for one of them is not wrong to see it stated plainly either.
+fn lopsided_endpoint_note(port: u16, http_set: bool, socket_set: bool) -> Option<String> {
+    if http_set && !socket_set {
+        Some("NPU_HTTP_ENDPOINT is set but NPU_SOCKET_ENDPOINT is not -- the control socket still \
+              binds its RuntimeDirectory-derived default.".to_string())
+    } else if socket_set && !http_set {
+        Some(format!("NPU_SOCKET_ENDPOINT is set but NPU_HTTP_ENDPOINT is not -- the HTTP surface \
+                       still binds 127.0.0.1:{port} from engine.toml."))
+    } else {
+        None
+    }
+}
+
+fn warn_on_lopsided_endpoint_override(cfg: &Config) {
+    let http_set = std::env::var_os("NPU_HTTP_ENDPOINT").is_some();
+    let socket_set = std::env::var_os("NPU_SOCKET_ENDPOINT").is_some();
+    if let Some(msg) = lopsided_endpoint_note(cfg.server.port, http_set, socket_set) {
+        eprintln!("[npu-serve] NOTE: {msg}");
+    }
+}
+
+fn serve(path: &Path, allow_degraded: bool) -> Result<()> {
     let cfg = load_cfg(path)?;
-    let port = port.unwrap_or(cfg.server.port);
-    preflight_serve(port)?;
+    let addr = resolve_http_addr(&cfg);
+    let port = cfg.server.port;
+    warn_on_lopsided_endpoint_override(&cfg);
+    preflight_serve(&addr)?;
     let root = root(&cfg, path)?;
     preflight_artifacts(&cfg, &root)?;
     let (handle, _join) = start(cfg, Box::new(EngineLoader { root }))
         .map_err(|e| Tagged(engine_error(&e), e.to_string()))?;
-    // Do not bind a port the service cannot serve from. The initial reconcile records a load
+    // Do not bind an address the service cannot serve from. The initial reconcile records a load
     // failure as `Failed` rather than panicking, so before this the socket came up and every
     // request answered "actor dropped reply" while systemd showed active -- how a 5-day outage
     // went unnoticed. Refuse instead, naming each model and its cause.
@@ -288,7 +314,7 @@ fn serve(path: &Path, port: Option<u16>, allow_degraded: bool) -> Result<()> {
         }
         if !allow_degraded {
             handle.shutdown();
-            bail!("{} of the configured models failed to load; refusing to bind port {port} \
+            bail!("{} of the configured models failed to load; refusing to bind {addr} \
                    (use --allow-degraded to serve anyway)", failed.len());
         }
         eprintln!("[npu-serve] --allow-degraded: binding anyway, /healthz will report 503");
@@ -300,10 +326,10 @@ fn serve(path: &Path, port: Option<u16>, allow_degraded: bool) -> Result<()> {
             let (h, live, p) = (handle.clone(), handle.live_status(), path.to_path_buf());
             std::thread::spawn(move || npu_runtime::control_socket::serve(listener, h, live, p));
         }
-        // No RUNTIME_DIRECTORY/XDG_RUNTIME_DIR: the CLI's socket commands (models, and every
-        // device command) simply have nothing to connect to, the same as a service that never
-        // started -- not a reason to refuse serving the HTTP surface.
-        None => eprintln!("[npu-serve] WARNING: no RUNTIME_DIRECTORY/XDG_RUNTIME_DIR -- control socket disabled"),
+        // No RUNTIME_DIRECTORY/XDG_RUNTIME_DIR/NPU_SOCKET_ENDPOINT: the CLI's socket commands
+        // (models, and every device command) simply have nothing to connect to, the same as a
+        // service that never started -- not a reason to refuse serving the HTTP surface.
+        None => eprintln!("[npu-serve] WARNING: no RUNTIME_DIRECTORY/XDG_RUNTIME_DIR/NPU_SOCKET_ENDPOINT -- control socket disabled"),
     }
     http::serve(handle, path.to_path_buf(), port).context("serve")
 }
@@ -361,15 +387,6 @@ fn build_params(s: &SamplingArgs) -> Result<npu_engine::GenerateParams, String> 
     Ok(p)
 }
 
-/// `npu generate`/`npu chat` run IN-PROCESS (`start_lazy` + `EngineLoader`), the same pattern as
-/// `transcribe`/`embed`/`diarize`, rather than talking to a running server over HTTP the way `npu
-/// models`/`npu reload` do. Reasons: (1) those two already load their own model one-shot with no
-/// server required, which is the point of a CLI generate command existing at all; (2) streaming
-/// tokens to stdout is a direct callback from `Handle::generate`'s receiver, whereas an HTTP client
-/// here would mean writing an incremental SSE parser in the CLI for no benefit, since the process
-/// already IS the engine; (3) `Handle::generate`'s `Prompt::Chat` with real history is exactly what
-/// a REPL wants and is not staged through JSON at all this way.
-///
 /// Teach the generated zsh script to complete model NAMES for `--model`/`--asr`/`--diarize`.
 ///
 /// clap has no way to express "the values come from the user's config", so it emits `_default` for
@@ -1043,9 +1060,9 @@ fn mem_cell(bytes: Option<u64>) -> String {
     }
 }
 
-fn models(path: &Path, as_json: bool, port: Option<u16>) -> Result<()> {
+fn models(path: &Path, as_json: bool) -> Result<()> {
     let cfg = load_cfg(path)?;
-    let live = read_live_status(port.unwrap_or(cfg.server.port));
+    let live = read_live_status();
     let root = root(&cfg, path).ok();
 
     if as_json {
@@ -1117,7 +1134,9 @@ fn models(path: &Path, as_json: bool, port: Option<u16>) -> Result<()> {
         None => println!("\n(service not running -- configured models only)"),
     }
     if drifted {
-        println!("* the running server has a different pin than the config -- run `npu reload`");
+        println!("* the running server has a different pin than the config -- `npu config pin`/`unpin` \
+                  reconcile it automatically; a config edited by hand needs \
+                  `systemctl --user restart xdna-engine`");
     }
     Ok(())
 }
@@ -1197,15 +1216,13 @@ fn top_frame(doc: &serde_json::Value, age_s: u64, now_unix: i64) -> String {
     o
 }
 
-fn top(path: &Path, interval: f64, once: bool, port: Option<u16>) -> Result<()> {
-    let cfg = load_cfg(path)?;
-    let want = port.unwrap_or(cfg.server.port);
+fn top(interval: f64, once: bool) -> Result<()> {
     // Piping a repainting screen produces escape-code soup, so a non-terminal gets one snapshot --
     // the same reasoning that puts the generation footer on stderr.
     let once = once || !std::io::stdout().is_terminal();
     let period = std::time::Duration::from_secs_f64(interval.max(0.1));
     loop {
-        match read_live_status(want) {
+        match read_live_status() {
             Some((age, doc)) => {
                 let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs() as i64).unwrap_or(0);
@@ -1218,7 +1235,7 @@ fn top(path: &Path, interval: f64, once: bool, port: Option<u16>) -> Result<()> 
             }
             None => {
                 if !once { print!("\x1b[H\x1b[J"); }
-                println!("npu top: no service publishing status for port {want} \
+                println!("npu top: no service publishing status \
                           (start it with `systemctl --user start xdna-engine`)");
             }
         }
@@ -1258,23 +1275,16 @@ fn query_control_socket() -> Option<serde_json::Value> {
     serde_json::from_slice(&body).ok()
 }
 
-fn read_live_status(want_port: u16) -> Option<(u64, serde_json::Value)> {
+/// The live status document, or `None` when nothing is reachable. No port-matching check: the
+/// control socket (`control_socket::bind`) refuses a second bind while a live listener already
+/// holds its path (AddrInUse, never silently stolen), so there is structurally at most one instance
+/// ever reachable at a given socket path -- the ambiguity a port filter used to guard against
+/// (status.json's "another engine, another port, one shared directory") cannot arise here.
+fn read_live_status() -> Option<(u64, serde_json::Value)> {
     let v = query_control_socket()?;
     let pid = v.get("pid")?.as_u64()?;
     if !std::path::Path::new(&format!("/proc/{pid}")).exists() {
         return None; // the socket answered, but the pid it named is already gone
-    }
-    // The path is per-USER, so another engine on another port publishes here too -- a test instance,
-    // a parallel session. Without this the command reports someone else's models as ours, which it
-    // did today. Same check `preflight_serve` makes about who holds a socket.
-    //
-    // ABSENT is not WRONG. A service running an older binary publishes no `port` at all, and the
-    // first version of this check read that as a mismatch and called a live service down -- during
-    // exactly the rolling upgrade where the two binaries differ. An unknown port falls back to the
-    // pid, which is weaker identification but an honest one.
-    match v.get("port").and_then(|p| p.as_u64()) {
-        Some(p) if p != want_port as u64 => return None,
-        _ => {}
     }
     let written = v.get("written_unix")?.as_u64()?;
     let now = std::time::SystemTime::now()
@@ -1282,14 +1292,15 @@ fn read_live_status(want_port: u16) -> Option<(u64, serde_json::Value)> {
     Some((now.saturating_sub(written), v))
 }
 
-/// The PIN column. `*` marks a config pin the running server has not adopted yet -- which is the
-/// normal state between `npu config pin` and `npu reload`, and the one thing a pin column has to be
-/// able to say. A server too old to publish `pinned` reports `None`, and gets the config's answer
-/// without a drift marker rather than a fabricated disagreement.
+/// The PIN column. `*` marks a config pin the running server has not adopted yet -- `npu config
+/// pin`/`unpin` reconcile a running server automatically (unless `--no-reload`), so this is the
+/// normal state only for `--no-reload` or a config edited by hand, and the one thing a pin column
+/// has to be able to say. A server too old to publish `pinned` reports `None`, and gets the
+/// config's answer without a drift marker rather than a fabricated disagreement.
 /// `want`/`live` are the ordinary config-vs-server drift check, unchanged. `pin_honored` catches a
 /// SEPARATE state that drift alone cannot see: `want` and `live` agreeing on "pinned" does not mean
 /// the invariant currently protects it -- a demotion (over `memory_ceiling_mb`) leaves both `true`
-/// and only `pin_honored` says otherwise. `npu reload` fixes ordinary drift; it does NOT fix this,
+/// and only `pin_honored` says otherwise. Reconciling fixes ordinary drift; it does NOT fix this,
 /// which is why it renders differently rather than as another `*`.
 fn pin_cell(want: bool, live: Option<bool>, pin_honored: Option<bool>) -> String {
     if want && live == Some(true) && pin_honored == Some(false) {
@@ -1305,14 +1316,6 @@ fn pin_cell(want: bool, live: Option<bool>, pin_honored: Option<bool>) -> String
 fn find_live<'a>(doc: &'a serde_json::Value, name: &str) -> Option<&'a serde_json::Value> {
     doc.get("models")?.get("data")?.as_array()?
         .iter().find(|m| m.get("id").and_then(|i| i.as_str()) == Some(name))
-}
-
-fn reload(path: &Path, port: Option<u16>) -> Result<()> {
-    let port = resolve_port(path, port)?;
-    let body = http_post(port, "/admin/reload", "")
-        .context(Tagged(Code::NoService, "reload (is the server running?)".into()))?;
-    println!("{body}");
-    Ok(())
 }
 
 /// What an edit did, for the path where the SERVICE performed it and this process therefore never
@@ -1360,13 +1363,13 @@ fn admin_call(action: &ConfigCmd) -> Option<(&'static str, String, String)> {
 ///
 /// A rejection here is the CLI's error: `http_req` returns only the body, so a 400 would otherwise
 /// read as success -- the same `{"error":...}` convention `npu load` already follows.
-fn edit_via_service(port: u16, action: &ConfigCmd) -> Result<String> {
+fn edit_via_service(addr: &str, action: &ConfigCmd) -> Result<String> {
     let (method, route, body) = admin_call(action).expect("caller checked this is a mutation");
-    let resp = http_req(port, method, &route, &body)
+    let resp = http_req(addr, method, &route, &body)
         .context(Tagged(Code::NoService, "config edit (is the server running?)".into()))?;
     let v: serde_json::Value = serde_json::from_str(&resp)
         .with_context(|| format!("unexpected reply: {resp}"))?;
-    if let Some(e) = v.get("error").and_then(|e| e.as_str()) { return Err(admin_err(e, port)) }
+    if let Some(e) = v.get("error").and_then(|e| e.as_str()) { return Err(admin_err(e, addr)) }
     Ok(summarise_reload(&resp))
 }
 
@@ -1374,26 +1377,27 @@ fn edit_via_service(port: u16, action: &ConfigCmd) -> Result<String> {
 ///
 /// An edit to desired state that leaves actual state alone is a footgun with a manual step: the
 /// file said `memory_ceiling_mb = 2048`, the service ran five models, and the only thing standing
-/// between them was remembering to type `npu reload`. So a config edit reconciles by default.
+/// between them was remembering to reconcile it by hand. So a config edit reconciles by default.
 ///
 /// A service that is not running is NOT an error -- editing the config with the engine stopped is
 /// ordinary, and the edit is still saved. Nor is a failed reload: the file is already written, so
 /// reporting the failure and exiting 0 tells the truth (the edit landed, the running service did
 /// not take it) where a non-zero exit would suggest the edit did not.
-fn apply_now(path: &Path, cfg: &Config) -> Result<()> {
-    let port = cfg.server.port;
-    if !listener_is_ours(port) {
-        println!("(no service on port {port} -- takes effect when one starts)");
+fn apply_now(cfg: &Config) -> Result<()> {
+    let addr = resolve_http_addr(cfg);
+    if !listener_is_ours(&addr) {
+        println!("(no service at {addr} -- takes effect when one starts)");
         return Ok(());
     }
-    match http_post(port, "/admin/reload", "") {
+    match http_post(&addr, "/admin/reload", "") {
         Ok(body) => {
             println!("applied: {}", summarise_reload(&body));
             Ok(())
         }
         Err(e) => {
             eprintln!("WARNING: saved, but the running server did not reload: {e}");
-            eprintln!("         run `npu reload` once it is reachable");
+            eprintln!("         the file is correct; pick it up with \
+                       `systemctl --user restart xdna-engine` once it is reachable");
             Ok(())
         }
     }
@@ -1417,13 +1421,13 @@ fn summarise_reload(body: &str) -> String {
 /// running server's registry -- the thing that owns admission, eviction and the idle sweep.
 /// Loading a model into this process would take its own hardware context and change nothing the
 /// server can see, which is the opposite of what was asked.
-fn load_model(path: &Path, model: &str, port: Option<u16>) -> Result<()> {
-    let port = resolve_port(path, port)?;
-    let body = http_post(port, &format!("/admin/models/{model}/load"), "")
+fn load_model(path: &Path, model: &str) -> Result<()> {
+    let addr = resolve_http_addr(&load_cfg(path)?);
+    let body = http_post(&addr, &format!("/admin/models/{model}/load"), "")
         .context(Tagged(Code::NoService, "load (is the server running?)".into()))?;
     let v: serde_json::Value = serde_json::from_str(&body)
         .with_context(|| format!("unexpected reply: {body}"))?;
-    if let Some(e) = v.get("error").and_then(|e| e.as_str()) { return Err(admin_err(e, port)) }
+    if let Some(e) = v.get("error").and_then(|e| e.as_str()) { return Err(admin_err(e, &addr)) }
     let n = |k: &str| v.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
     println!("{model}: {}  ({} MB of {} MB in use)",
         if v.get("loaded").and_then(|x| x.as_bool()) == Some(true) { "loaded" } else { "already resident" },
@@ -1439,13 +1443,13 @@ fn load_model(path: &Path, model: &str, port: Option<u16>) -> Result<()> {
     Ok(())
 }
 
-fn unload_model(path: &Path, model: &str, port: Option<u16>) -> Result<()> {
-    let port = resolve_port(path, port)?;
-    let body = http_post(port, &format!("/admin/models/{model}/unload"), "")
+fn unload_model(path: &Path, model: &str) -> Result<()> {
+    let addr = resolve_http_addr(&load_cfg(path)?);
+    let body = http_post(&addr, &format!("/admin/models/{model}/unload"), "")
         .context(Tagged(Code::NoService, "unload (is the server running?)".into()))?;
     let v: serde_json::Value = serde_json::from_str(&body)
         .with_context(|| format!("unexpected reply: {body}"))?;
-    if let Some(e) = v.get("error").and_then(|e| e.as_str()) { return Err(admin_err(e, port)) }
+    if let Some(e) = v.get("error").and_then(|e| e.as_str()) { return Err(admin_err(e, &addr)) }
     println!("{model}: {}", match v.get("released").and_then(|x| x.as_bool()) {
         Some(true) => "released",
         _ => "was not resident",
@@ -1458,15 +1462,18 @@ fn unload_model(path: &Path, model: &str, port: Option<u16>) -> Result<()> {
 /// `http_req` keeps only the body, so a 404 arrives as this server's generic `not found` and reads
 /// as though the MODEL was not found -- which is the wrong thing entirely, and is what a CLI newer
 /// than the service it is talking to hits every time.
-fn admin_err(e: &str, port: u16) -> anyhow::Error {
+fn admin_err(e: &str, addr: &str) -> anyhow::Error {
     if e == "not found" {
-        return anyhow!("the server on port {port} does not support this operation -- it is older \
-                        than this CLI.{}", restart_hint(port));
+        return anyhow!("the server at {addr} does not support this operation -- it is older \
+                        than this CLI.{}", restart_hint());
     }
     anyhow!("{e}")
 }
 
-/// How to restart whatever is serving `port` -- RESOLVED from the running process, not guessed.
+/// How to restart the running server -- RESOLVED from the process the control socket names, not
+/// guessed. Socket-sourced rather than HTTP-address-sourced: the control socket is exclusively
+/// bound (`control_socket::bind` refuses a second listener), so whatever it reports IS the one
+/// server there is, independent of which HTTP address this particular call happened to target.
 ///
 /// The first version hardcoded `systemctl --user restart npu-asr`, and install.sh had just
 /// superseded that unit, so the advice named a service the box does not have. The unit name is
@@ -1475,8 +1482,8 @@ fn admin_err(e: &str, port: u16) -> anyhow::Error {
 /// started before that keeps running the old one, which the kernel marks `(deleted)`.
 ///
 /// Returns "" rather than a guess when the process cannot be identified. Silence beats wrong advice.
-fn restart_hint(port: u16) -> String {
-    let Some(pid) = serving_pid(port) else { return String::new() };
+fn restart_hint() -> String {
+    let Some(pid) = serving_pid() else { return String::new() };
     let stale = std::fs::read_link(format!("/proc/{pid}/exe"))
         .map(|p| p.to_string_lossy().ends_with("(deleted)")).unwrap_or(false);
     let why = if stale {
@@ -1490,13 +1497,9 @@ fn restart_hint(port: u16) -> String {
     }
 }
 
-/// The pid the running server published, or `None` when nothing is serving this port.
-fn serving_pid(port: u16) -> Option<u64> {
+/// The pid the running server published over the control socket, or `None` when nothing answers.
+fn serving_pid() -> Option<u64> {
     let v = query_control_socket()?;
-    match v.get("port").and_then(|p| p.as_u64()) {
-        Some(p) if p != port as u64 => return None,
-        _ => {}
-    }
     let pid = v.get("pid")?.as_u64()?;
     std::path::Path::new(&format!("/proc/{pid}")).exists().then_some(pid)
 }
@@ -1520,13 +1523,13 @@ fn unit_of(pid: u64) -> Option<String> {
 /// load/unload's service-only one.
 fn bake_by_name(path: &Path, name: &str, force: bool) -> Result<()> {
     let cfg = load_cfg(path)?;
-    let port = cfg.server.port;
-    if port != 0 && listener_is_ours(port) {
-        let body = http_post(port, &format!("/admin/models/{name}/bake"), &format!("{{\"force\":{force}}}"))
+    let addr = resolve_http_addr(&cfg);
+    if listener_is_ours(&addr) {
+        let body = http_post(&addr, &format!("/admin/models/{name}/bake"), &format!("{{\"force\":{force}}}"))
             .context(Tagged(Code::NoService, "bake (is the server running?)".into()))?;
         let v: serde_json::Value = serde_json::from_str(&body)
             .with_context(|| format!("unexpected reply: {body}"))?;
-        if let Some(e) = v.get("error").and_then(|e| e.as_str()) { return Err(admin_err(e, port)) }
+        if let Some(e) = v.get("error").and_then(|e| e.as_str()) { return Err(admin_err(e, &addr)) }
         return Ok(match v.get("checkpoint").and_then(|c| c.as_str()) {
             Some(p) => println!("baked: {p}"),
             None => println!("nothing to bake ({name} uses legacy npy weights)"),
@@ -1604,9 +1607,10 @@ fn config_cmd(path: &Path, action: &ConfigCmd, no_reload: bool) -> Result<()> {
     // The service owns the file whenever there is one. `--no-reload` opts out of that too: it
     // means "change desired state without disturbing what is running", and routing the write
     // through the process that would immediately reconcile is the opposite of that.
-    let port = load_cfg(path).map(|c| c.server.port).unwrap_or(0);
-    if !no_reload && port != 0 && listener_is_ours(port) {
-        let applied = edit_via_service(port, action)?;
+    let addr = load_cfg(path).map(|c| resolve_http_addr(&c)).ok();
+    if !no_reload && addr.as_deref().is_some_and(listener_is_ours) {
+        let addr = addr.unwrap();
+        let applied = edit_via_service(&addr, action)?;
         // Re-read: the SERVICE wrote it, so this reports the file as it now is rather than as this
         // process believes it should be.
         let cfg = load_cfg(path)?;
@@ -1660,10 +1664,11 @@ fn config_cmd(path: &Path, action: &ConfigCmd, no_reload: bool) -> Result<()> {
         eprintln!("WARNING: {w}");
     }
     if no_reload {
-        println!("--no-reload: saved only; run `npu reload` to apply it to a running server");
+        println!("--no-reload: saved only; `systemctl --user restart xdna-engine` applies it to \
+                  a running server");
         return Ok(());
     }
-    apply_now(path, &cfg)
+    apply_now(&cfg)
 }
 
 /// Every registered `NPU_*`/related env var against the LIVE process environment: whether it is
@@ -1745,15 +1750,18 @@ fn render(cfg: &Config, root: &Path) -> String {
     s
 }
 
-fn resolve_port(path: &Path, port: Option<u16>) -> Result<u16> {
-    Ok(port.unwrap_or_else(|| Config::load(path).map(|c| c.server.port).unwrap_or(11434)))
+/// The HTTP endpoint every remaining admin/preflight call reaches -- `$NPU_HTTP_ENDPOINT` if set,
+/// else `127.0.0.1:<engine.toml's configured port>`. Mirrors `http::serve`'s own resolution
+/// exactly, so a client and the server it is about to reach never disagree about where that is.
+fn resolve_http_addr(cfg: &Config) -> String {
+    std::env::var("NPU_HTTP_ENDPOINT").unwrap_or_else(|_| format!("127.0.0.1:{}", cfg.server.port))
 }
 
 // --- minimal HTTP/1.1 client (std only) ---
-fn http_get(port: u16, path: &str) -> Result<String> { http_req(port, "GET", path, "") }
-fn http_post(port: u16, path: &str, body: &str) -> Result<String> { http_req(port, "POST", path, body) }
-fn http_req(port: u16, method: &str, path: &str, body: &str) -> Result<String> {
-    let mut s = TcpStream::connect(("127.0.0.1", port))?;
+fn http_get(addr: &str, path: &str) -> Result<String> { http_req(addr, "GET", path, "") }
+fn http_post(addr: &str, path: &str, body: &str) -> Result<String> { http_req(addr, "POST", path, body) }
+fn http_req(addr: &str, method: &str, path: &str, body: &str) -> Result<String> {
+    let mut s = TcpStream::connect(addr)?;
     let req = format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
     s.write_all(req.as_bytes())?;
     let mut resp = String::new();
@@ -1896,6 +1904,16 @@ mod tests {
         std::env::remove_var("NPU_PRECISION");
     }
 
+    #[test]
+    fn lopsided_endpoint_override_is_noted_only_when_exactly_one_is_set() {
+        assert_eq!(lopsided_endpoint_note(11434, false, false), None, "neither set, nothing to note");
+        assert_eq!(lopsided_endpoint_note(11434, true, true), None, "both set, no lopsidedness");
+        let http_only = lopsided_endpoint_note(11434, true, false).unwrap();
+        assert!(http_only.contains("NPU_SOCKET_ENDPOINT"), "{http_only}");
+        let socket_only = lopsided_endpoint_note(11434, false, true).unwrap();
+        assert!(socket_only.contains("NPU_HTTP_ENDPOINT") && socket_only.contains("11434"), "{socket_only}");
+    }
+
     /// A model that answers `Capability::EMBED` deterministically from its input bytes -- enough to
     /// tell two calls apart without a real device, and to compare the CLI-over-socket path against
     /// the HTTP route byte for byte.
@@ -1948,11 +1966,12 @@ mod tests {
 
         assert_eq!(handle.embed(None, "hi").unwrap().model, "bge");
 
-        let (age, doc) = read_live_status(PORT).expect("a live socket must answer");
+        // `port` is informational only now (the config's own, for display) -- no matching logic:
+        // the control socket is exclusively bound, so whatever answers IS the one instance there is.
+        let (age, doc) = read_live_status().expect("a live socket must answer");
         assert!(age < 5, "just published: {age}");
         assert_eq!(doc["port"], PORT);
-        assert!(serving_pid(PORT).is_some());
-        assert!(serving_pid(PORT + 1).is_none(), "a different port must not match this service");
+        assert!(serving_pid().is_some());
 
         std::env::remove_var("XDG_RUNTIME_DIR");
         handle.shutdown();
@@ -2177,7 +2196,7 @@ mod tests {
     }
 
     /// The one thing a PIN column must be able to say: the config and the running server disagree,
-    /// which is the normal state between `npu config pin` and `npu reload`.
+    /// which is the normal state under `--no-reload` or a config edited by hand.
     #[test]
     fn pin_cell_marks_config_and_server_disagreeing() {
         assert_eq!(pin_cell(true, Some(true), Some(true)), "yes");
@@ -2190,8 +2209,8 @@ mod tests {
     }
 
     /// The state ordinary drift cannot see: config and server AGREE it is pinned (no `*`), but the
-    /// invariant has demoted it over `memory_ceiling_mb`. `npu reload` will not fix this, which is
-    /// why it must not render as the same `*` that reload does fix.
+    /// invariant has demoted it over `memory_ceiling_mb`. Reconciling will not fix this, which is
+    /// why it must not render as the same `*` that reconciling does fix.
     #[test]
     fn pin_cell_distinguishes_a_budget_refusal_from_ordinary_drift() {
         assert_eq!(pin_cell(true, Some(true), Some(false)), "refused(budget)");

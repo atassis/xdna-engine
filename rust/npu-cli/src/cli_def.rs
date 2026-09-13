@@ -38,8 +38,11 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Cmd {
     /// Run the HTTP service (single device owner).
+    ///
+    /// The HTTP bind and the control socket path are both `$NPU_HTTP_ENDPOINT`/
+    /// `$NPU_SOCKET_ENDPOINT`-overridable (unset, they default to `engine.toml`'s `server.port`
+    /// and the systemd `RuntimeDirectory`) -- see `npu flags`.
     Serve {
-        #[arg(long)] port: Option<u16>,
         /// Bind even when a configured model failed to load. `/healthz` still reports 503.
         #[arg(long)] allow_degraded: bool,
     },
@@ -134,19 +137,15 @@ pub enum Cmd {
     /// The configured models, plus what the service currently has resident.
     ///
     /// Answers from the config, so it works with the service down. When the service IS up it merges
-    /// the state it publishes to a file -- no socket, no probe, nothing to hang on -- and prints how
-    /// old that snapshot is. A `*` in PIN means the running server's pin disagrees with the config,
-    /// which is what `npu reload` fixes.
+    /// the state answered over the control socket's out-of-band snapshot -- nothing to hang on --
+    /// and prints how old that snapshot is. A `*` in PIN means the running server's pin disagrees
+    /// with the config; `npu config pin`/`unpin` reconcile a running server automatically, and a
+    /// config edited by hand needs `systemctl --user restart xdna-engine` to take effect.
     Models {
         /// Machine-readable output. Carries both `pinned` (config) and `live_pinned` (server), which
         /// the table collapses into one PIN cell, so a script can act on the drift the `*` only flags.
         #[arg(long)] json: bool,
-        /// Read the status published for this port instead of the config's, to inspect a second
-        /// instance. The port is the key the service files its status under, not something dialled.
-        #[arg(long)] port: Option<u16>,
     },
-    /// Ask a running server to re-read the config and reconcile.
-    Reload { #[arg(long)] port: Option<u16> },
     /// Make a model resident on the running server, now.
     ///
     /// Fails rather than evicting when the server is already over `memory_ceiling_mb` -- an explicit
@@ -159,7 +158,6 @@ pub enum Cmd {
     Load {
         /// The configured model to make resident.
         model: String,
-        #[arg(long)] port: Option<u16>,
     },
     /// Give a model's device memory back now, without stopping the service.
     ///
@@ -169,7 +167,6 @@ pub enum Cmd {
     Unload {
         /// The resident model whose device memory to release.
         model: String,
-        #[arg(long)] port: Option<u16>,
     },
     /// Weight-checkpoint tooling: bake, inspect, and parity-check.
     // Folded in from the separate `npu-weights` binary AND the top-level `npu bake <name>`, which
@@ -192,9 +189,6 @@ pub enum Cmd {
         /// `npu top | ...` behaves like every other command here.
         #[arg(long)]
         once: bool,
-        /// Read the status published for this port instead of the config's.
-        #[arg(long)]
-        port: Option<u16>,
     },
     /// Read a JSONL run log written by `--output json` or `NPU_TELEMETRY_LOG`.
     ///
@@ -389,7 +383,8 @@ pub enum ConfigCmd {
     /// that would push the sum over the ceiling is not silently granted -- it is refused at admission
     /// (a pin nothing has loaded yet), or demoted (an already-resident pin the ceiling was lowered
     /// under, or whose own footprint grew), reported either way rather than declined in silence.
-    /// Takes effect on `npu reload`; no restart, no device churn.
+    /// Takes effect immediately on a running server (this command reconciles it automatically
+    /// unless `--no-reload` is given); no restart, no device churn.
     Pin { model: String },
     /// Drop a model's residency pin: it becomes swept when idle and evictable again.
     Unpin { model: String },

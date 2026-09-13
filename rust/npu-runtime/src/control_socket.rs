@@ -37,7 +37,13 @@ pub fn dir_from(runtime_directory: Option<&str>, xdg_runtime_dir: Option<&str>) 
     xdg_runtime_dir.filter(|s| !s.is_empty()).map(|d| PathBuf::from(d).join("npu"))
 }
 
-pub fn socket_path() -> Option<PathBuf> { dir().map(|d| d.join(SOCKET_NAME)) }
+/// `$NPU_SOCKET_ENDPOINT` if set -- an explicit override, for a container or test where
+/// `XDG_RUNTIME_DIR` is not set up the normal desktop way -- else the `RuntimeDirectory`-derived
+/// default. `npu serve` binds this; every socket-based CLI command connects to it.
+pub fn socket_path() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("NPU_SOCKET_ENDPOINT") { return Some(PathBuf::from(p)); }
+    dir().map(|d| d.join(SOCKET_NAME))
+}
 
 /// Bind the control socket, clearing a stale path first: `UnixListener::bind` fails `AddrInUse` on
 /// an existing file regardless of whether anything is listening, and an unclean shutdown (a crash, a

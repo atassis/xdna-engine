@@ -470,6 +470,19 @@ pub const FLAGS: &[Flag] = &[
     Flag { name: "XDG_RUNTIME_DIR", owner: "npu-runtime", site: "npu-runtime/src/control_socket.rs",
         semantics: Value, default: "unset",
         doc: "user-session runtime dir fallback for the control socket when RUNTIME_DIRECTORY is unset." },
+    Flag { name: "NPU_SOCKET_ENDPOINT", owner: "npu-runtime", site: "npu-runtime/src/control_socket.rs",
+        semantics: Value, default: "unset (RUNTIME_DIRECTORY/XDG_RUNTIME_DIR-derived path)",
+        doc: "explicit control-socket path, overriding the RuntimeDirectory-derived default entirely -- \
+              for a container or test where XDG_RUNTIME_DIR is not set up the normal desktop way. \
+              `npu serve` binds it; every CLI command that talks over the socket connects to it. Also \
+              read by npu-cli/src/main.rs's own resolve_http_addr sibling check (see NPU_HTTP_ENDPOINT) \
+              to warn when only one of the pair is set." },
+    Flag { name: "NPU_HTTP_ENDPOINT", owner: "npu-cli", site: "npu-runtime/src/http.rs",
+        semantics: Value, default: "unset (127.0.0.1:<engine.toml's server.port>)",
+        doc: "explicit host:port for the OpenAI-compatible HTTP surface, overriding engine.toml's \
+              `server.port` (and the removed CLI `--port`) entirely. `npu serve` binds it; every \
+              remaining HTTP-based admin command (load/unload/config's auto-reload, the version- \
+              mismatch preflight) connects to it. Also read by npu-cli/src/main.rs's resolve_http_addr." },
 
     // -- npu-weights ------------------------------------------------------------------------------
     Flag { name: "XDNA_CHECKPOINT_DIR", owner: "npu-weights", site: "npu-weights/src/spec.rs",
