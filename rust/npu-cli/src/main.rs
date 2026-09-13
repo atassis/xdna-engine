@@ -2,6 +2,7 @@
 //! npu-engine. Subcommands: serve, transcribe, embed, models, config, reload, bake.
 use std::io::{BufRead, Read, Write};
 use std::net::TcpStream;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -9,6 +10,7 @@ mod cli_def;
 mod doctor;
 mod exit;
 mod media;
+mod socket_client;
 mod stats;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -19,12 +21,11 @@ use clap_complete::Shell;
 use std::io::IsTerminal;
 use npu_engine::telemetry::wire;
 use exit::{engine_error, Code, Tagged};
-use npu_runtime::actor::{start, start_lazy};
+use npu_runtime::actor::start;
 use npu_engine::capability::Capability;
 use npu_runtime::config::{Config, EvictPolicy, ModelCfg};
 use npu_runtime::http;
 use npu_runtime::loader::{EngineLoader, ModelLoader};
-use npu_runtime::stream::StreamItem;
 
 fn config_path(cli: &Cli) -> PathBuf { config_path_and_source(cli).0 }
 
@@ -77,18 +78,18 @@ fn run(cli: &Cli, path: &Path) -> Result<()> {
     let as_json = cli.output == OutputFormat::Json;
     match &cli.cmd {
         Cmd::Serve { port, allow_degraded } => serve(path, *port, *allow_degraded),
-        Cmd::Transcribe { input, model } => transcribe(path, input, model.as_deref(), as_json),
+        Cmd::Transcribe { input, model } => transcribe(input, model.as_deref(), as_json),
         Cmd::Generate { prompt, model, sampling, no_stream, raw, stats } =>
-            generate(path, prompt, model.as_deref(), sampling, *no_stream, *raw, *stats, as_json),
+            generate(prompt, model.as_deref(), sampling, *no_stream, *raw, *stats, as_json),
         Cmd::Chat { prompt, model, sampling, no_stream } =>
-            chat(path, prompt.as_deref(), model.as_deref(), sampling, *no_stream, as_json),
-        Cmd::Embed { text, model } => embed(path, text, model.as_deref(), as_json),
+            chat(prompt.as_deref(), model.as_deref(), sampling, *no_stream, as_json),
+        Cmd::Embed { text, model } => embed(text, model.as_deref(), as_json),
         Cmd::Top { interval, once, port } => top(path, *interval, *once, *port),
         Cmd::Stats { log, diff } => stats_cmd(log, diff.as_deref()),
         Cmd::Replay { log, realtime, frames } => replay_cmd(log, *realtime, *frames),
-        Cmd::Diarize { wav, model, json } => diarize(path, wav, model.as_deref(), *json || as_json),
+        Cmd::Diarize { wav, model, json } => diarize(wav, model.as_deref(), *json || as_json),
         Cmd::TranscribeMedia { input, out, format, asr, diarize: diar, track, no_diarize } =>
-            transcribe_media(path, input, out.as_deref(), *format, asr.as_deref(),
+            transcribe_media(input, out.as_deref(), *format, asr.as_deref(),
                              diar.as_deref(), *track, *no_diarize),
         Cmd::Models { json, port } => models(&path, *json || as_json, *port),
         Cmd::Reload { port } => reload(&path, *port),
@@ -292,27 +293,34 @@ fn serve(path: &Path, port: Option<u16>, allow_degraded: bool) -> Result<()> {
         }
         eprintln!("[npu-serve] --allow-degraded: binding anyway, /healthz will report 503");
     }
+    match npu_runtime::control_socket::socket_path() {
+        Some(sock_path) => {
+            let listener = npu_runtime::control_socket::bind(&sock_path)
+                .with_context(|| format!("control socket {}", sock_path.display()))?;
+            let (h, live, p) = (handle.clone(), handle.live_status(), path.to_path_buf());
+            std::thread::spawn(move || npu_runtime::control_socket::serve(listener, h, live, p));
+        }
+        // No RUNTIME_DIRECTORY/XDG_RUNTIME_DIR: the CLI's socket commands (models, and every
+        // device command) simply have nothing to connect to, the same as a service that never
+        // started -- not a reason to refuse serving the HTTP surface.
+        None => eprintln!("[npu-serve] WARNING: no RUNTIME_DIRECTORY/XDG_RUNTIME_DIR -- control socket disabled"),
+    }
     http::serve(handle, path.to_path_buf(), port).context("serve")
 }
 
-fn transcribe(path: &Path, input: &Path, model: Option<&str>, as_json: bool) -> Result<()> {
+/// Sent whole to `/v1/audio/transcriptions` over the control socket -- the server decodes it
+/// (ffmpeg, any container) the same way an OpenAI-shaped upload would, so this no longer needs its
+/// own local decode step at all.
+fn transcribe(input: &Path, model: Option<&str>, as_json: bool) -> Result<()> {
     quiet_one_shot();
-    let cfg = load_cfg(path)?;
-    let root = root(&cfg, path)?;
-    // Decode BEFORE loading a model: a bad path or a file with no audio should fail in a second,
-    // not after a multi-second model load.
-    let samples = npu_runtime::media::decode_file(input).map_err(|e| anyhow!(e))?;
-    // Lazy: a one-shot run should load the model it serves, and nothing else.
-    let (handle, join) = start_lazy(cfg, Box::new(EngineLoader { root }))
-        .map_err(|e| Tagged(engine_error(&e), e.to_string()))?;
-    let out = handle.transcribe(model, samples, 16_000)
-        .map_err(|e| Tagged(engine_error(&e), e.to_string()));
-    handle.shutdown(); let _ = join.join();
-    let served = out?;
+    let bytes = std::fs::read(input).with_context(|| format!("read {}", input.display()))?;
+    let filename = input.file_name().and_then(|n| n.to_str()).unwrap_or("audio");
+    let v = socket_client::call_multipart("/v1/audio/transcriptions", model, filename, &bytes)?;
+    let text = v["text"].as_str().unwrap_or_default();
     if as_json {
-        println!("{}", serde_json::json!({ "model": served.model, "text": served.value }));
+        println!("{}", serde_json::json!({ "model": v["model"], "text": text }));
     } else {
-        println!("{}", served.value);
+        println!("{text}");
     }
     Ok(())
 }
@@ -367,7 +375,8 @@ fn build_params(s: &SamplingArgs) -> Result<npu_engine::GenerateParams, String> 
 /// clap has no way to express "the values come from the user's config", so it emits `_default` for
 /// these -- which in zsh means FILE completion, and `npu generate --model=<TAB>` offering filenames
 /// is worse than offering nothing. The names have to come from `npu models`, which reads the config
-/// and a status file and answers in about a millisecond with no device and no service.
+/// and the control socket and answers in about a millisecond with no device, and works with no
+/// service running at all.
 ///
 /// This is a rewrite of generated text, which is fragile if clap changes its output. It is pinned
 /// by a test that fails if the actions it looks for stop appearing.
@@ -416,62 +425,157 @@ struct Generated {
     report: npu_engine::GenerationReport,
 }
 
-/// Drains `rx` to completion either way, so `Cmd::Generate` on the actor side always finishes even
-/// under `--no-stream`.
-///
-/// `echo` prints tokens as they arrive; the text is accumulated regardless, because the buffered
-/// `--output json` needs the whole completion in hand and a second drain does not exist.
-///
-/// `json`, when present, receives the NDJSON stream: a conditions header, one line per decoded
-/// token, then the prefill and summary records. It takes a writer rather than a path on purpose --
-/// the shell already redirects, tees and pipes, and a `--stats-log FILE` flag was this function
-/// reimplementing `>` badly, with its own path handling and a second destination that could
-/// disagree with the first.
-fn drain_generation(
-    rx: std::sync::mpsc::Receiver<StreamItem>,
-    echo: bool,
-    meta: &wire::RunMeta,
-    mut json: Option<&mut dyn Write>,
-) -> Result<Generated> {
-    if let Some(w) = json.as_mut() {
-        writeln!(w, "{}", wire::header_line(
-            &npu_runtime::conditions::at_start(&meta.model, meta.created), meta))?;
+/// `FinishReason::as_str`'s inverse. `"stop"` is the default for anything unrecognized -- the wire
+/// itself collapses `Aborted` into `"stop"` (OpenAI has no vocabulary for "the client hung up"), and
+/// a socket client draining its own stream to completion never produces `Aborted` either way.
+fn parse_finish_reason(s: &str) -> npu_engine::FinishReason {
+    match s {
+        "length" => npu_engine::FinishReason::Length,
+        "tool_calls" => npu_engine::FinishReason::ToolCalls,
+        _ => npu_engine::FinishReason::Stop,
     }
+}
+
+/// One OpenAI-wire tool call (buffered `message.tool_calls[i]` or a streamed `delta.tool_calls[i]`
+/// fragment -- `render_tool_call`'s doc: one fragment always carries the WHOLE call, so there is no
+/// multi-fragment accumulation to do here, unlike `function.arguments` in general).
+fn tool_call_from_json(c: &serde_json::Value) -> npu_engine::ToolCall {
+    let f = &c["function"];
+    let arguments = f["arguments"].as_str()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    npu_engine::ToolCall {
+        id: c["id"].as_str().unwrap_or("call_0").to_string(),
+        name: f["name"].as_str().unwrap_or("").to_string(),
+        arguments,
+    }
+}
+
+/// A buffered `/v1/chat/completions` or `/v1/completions` response into the same [`Generated`] the
+/// in-process path produced -- `x_npu_report` (always present, see `render_buffered`) IS the
+/// `GenerationReport`, not a rendering of it, so this is a deserialize, not a reconstruction.
+fn generated_from_buffered(v: &serde_json::Value, chat: bool) -> Result<Generated> {
+    let choice = &v["choices"][0];
+    let text = if chat { choice["message"]["content"].as_str().unwrap_or("").to_string() }
+               else { choice["text"].as_str().unwrap_or("").to_string() };
+    let calls = choice["message"]["tool_calls"].as_array()
+        .map(|a| a.iter().map(tool_call_from_json).collect()).unwrap_or_default();
+    let reason = parse_finish_reason(choice["finish_reason"].as_str().unwrap_or("stop"));
+    let report = serde_json::from_value(v["x_npu_report"].clone())
+        .context("response missing x_npu_report")?;
+    Ok(Generated { text, calls, reason, report })
+}
+
+/// The streaming twin of `generated_from_buffered`, and `drain_generation`'s replacement: an SSE
+/// frame arrives already OpenAI-shaped, so this reads deltas instead of `StreamItem`s, but produces
+/// the identical `Generated` -- same struct, same `print_stats_footer`/`--output json` rendering
+/// downstream, regardless of which transport the tokens came over.
+///
+/// `json`, when present, receives the same NDJSON shape `drain_generation` always wrote: a
+/// conditions header (computed locally -- host state, not something only the server can see), one
+/// line per decoded token, then prefill and summary. The resolved model name is not known until the
+/// first frame arrives -- every frame shape carries `"model"`, including the terminal ones, so
+/// peeking it there costs nothing extra.
+///
+/// The wire has no separate "internal" frame for a token: `wire::chunk_line` (sent as the sole
+/// per-token frame once `stats` is on, which every socket request now requests) reuses the SAME
+/// `chat.completion.chunk`/`text_completion` object OpenAI clients read, just with an extra
+/// `"x_npu"` sibling key -- that key is what marks a frame as "the one NDJSON wants", not the
+/// `object` tag, which is shared with the plain role/finish frames that carry no token at all.
+/// `npu.prefill` never reaches the wire (only the run LOG gets it); it is reconstructed here the
+/// moment the report itself is known, from `report.prefill`, the same field `drain_generation`
+/// read directly off `StreamItem::Done`.
+fn drain_sse<R: BufRead>(mut sse: socket_client::SseCall<R>, echo: bool, chat: bool,
+             mut json: Option<&mut dyn Write>) -> Result<(wire::RunMeta, Generated)> {
     let mut text = String::new();
     let mut calls: Vec<npu_engine::ToolCall> = Vec::new();
-    loop {
-        match rx.recv() {
-            Ok(StreamItem::Text(t)) => {
-                if echo { print!("{t}"); std::io::stdout().flush().ok(); }
-                text.push_str(&t);
+    let mut reason = npu_engine::FinishReason::Stop;
+    let mut report: Option<npu_engine::GenerationReport> = None;
+    let mut meta: Option<wire::RunMeta> = None;
+    while let Some(frame) = sse.next_frame() {
+        let v = frame?;
+        if meta.is_none() {
+            if let Some(m) = v.get("model").and_then(|m| m.as_str()) {
+                let mm = wire::RunMeta {
+                    id: v.get("id").and_then(|i| i.as_str()).unwrap_or_default().to_string(),
+                    created: v.get("created").and_then(|c| c.as_i64()).unwrap_or(0),
+                    model: m.to_string(), chat,
+                };
+                if let Some(w) = json.as_mut() {
+                    writeln!(w, "{}", wire::header_line(
+                        &npu_runtime::conditions::at_start(&mm.model, mm.created), &mm))?;
+                }
+                meta = Some(mm);
             }
-            Ok(StreamItem::ToolCall(c)) => {
+        }
+        if let Some(msg) = v.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str()) {
+            bail!("{msg}");
+        }
+        if let Some(r) = v.get("x_npu_report") {
+            let rep: npu_engine::GenerationReport = serde_json::from_value(r.clone())?;
+            if let Some(w) = json.as_mut() {
+                let m = meta.as_ref().context("control socket: report arrived before any model frame")?;
+                writeln!(w, "{}", wire::prefill_line(&rep.prefill, m))?;
+                w.flush()?;
+            }
+            report = Some(rep);
+            continue;
+        }
+        if v.get("object").and_then(|o| o.as_str()) == Some("npu.run.summary") {
+            if let Some(w) = json.as_mut() { writeln!(w, "{v}")?; w.flush()?; }
+            continue;
+        }
+        if v.get("x_npu").is_some() {
+            if let Some(w) = json.as_mut() {
+                // Per line, not per run: the point of streaming is that the consumer sees a token
+                // when it happens, and a pipe is block-buffered by default, so without this `| jq`
+                // would sit silent and then emit the whole run at once.
+                writeln!(w, "{v}")?;
+                w.flush()?;
+            }
+        }
+        let choice = &v["choices"][0];
+        if let Some(delta) = choice.get("delta") {
+            if let Some(t) = delta.get("content").and_then(|c| c.as_str()) {
+                if echo { print!("{t}"); std::io::stdout().flush().ok(); }
+                text.push_str(t);
+            }
+            for c in delta.get("tool_calls").and_then(|c| c.as_array()).into_iter().flatten() {
+                let call = tool_call_from_json(c);
                 if echo {
-                    println!("\n[tool_call] {} {}", c.name, c.arguments);
+                    println!("\n[tool_call] {} {}", call.name, call.arguments);
                     std::io::stdout().flush().ok();
                 }
-                calls.push(c);
+                calls.push(call);
             }
-            Ok(StreamItem::Step(r)) => {
-                if let Some(w) = json.as_mut() {
-                    writeln!(w, "{}", wire::chunk_line(&r, meta))?;
-                    // Per line, not per run: the point of streaming is that the consumer sees a
-                    // token when it happens, and a pipe is block-buffered by default, so without
-                    // this `| jq` would sit silent and then emit the whole run at once.
-                    w.flush()?;
-                }
-            }
-            Ok(StreamItem::Done { reason, report, .. }) => {
-                if let Some(w) = json.as_mut() {
-                    writeln!(w, "{}", wire::prefill_line(&report.prefill, meta))?;
-                    writeln!(w, "{}", wire::summary_line(&report, meta, reason))?;
-                    w.flush()?;
-                }
-                return Ok(Generated { text, calls, reason, report: *report });
-            }
-            Ok(StreamItem::Error(e)) => bail!("{e}"),
-            Err(_) => bail!("generation ended without a result"),
+        } else if let Some(t) = choice.get("text").and_then(|c| c.as_str()).filter(|t| !t.is_empty()) {
+            if echo { print!("{t}"); std::io::stdout().flush().ok(); }
+            text.push_str(t);
         }
+        if let Some(fr) = choice.get("finish_reason").and_then(|f| f.as_str()) {
+            reason = parse_finish_reason(fr);
+        }
+    }
+    let meta = meta.context("control socket: stream produced no frames")?;
+    let report = report.context("control socket: stream ended without a report frame")?;
+    Ok((meta, Generated { text, calls, reason, report }))
+}
+
+/// One generation call over the control socket, buffered or streamed -- the only two shapes
+/// `/v1/chat/completions`/`/v1/completions` answer with. Returns the resolved model name (the
+/// server's echo, same as `Served::model` before this task) alongside the drained result.
+fn socket_generate(path: &str, base: serde_json::Value, model: Option<&str>,
+                    params: &npu_engine::GenerateParams, chat: bool, stream: bool, echo: bool,
+                    json: Option<&mut dyn Write>) -> Result<(String, Generated)> {
+    let body = socket_client::generate_request_json(base, model, params, stream);
+    if stream {
+        let sse = socket_client::SseCall::open(path, &body)?;
+        let (meta, g) = drain_sse(sse, echo, chat, json)?;
+        Ok((meta.model, g))
+    } else {
+        let v = socket_client::call_json(path, &body)?;
+        let served_model = v["model"].as_str().unwrap_or_default().to_string();
+        Ok((served_model, generated_from_buffered(&v, chat)?))
     }
 }
 
@@ -512,52 +616,50 @@ fn print_stats_footer(g: &Generated, full: bool) {
 /// `npu generate 'Привет!'` -- 256 tokens of invented statistics homework, in three languages,
 /// with a YouTube link. The stop machinery was working; the prompt simply never gave it a stop to
 /// find.
+/// Sent to `/v1/chat/completions` (or `/v1/completions` under `--raw`) over the control socket.
+/// `stream` on the wire now follows `--no-stream` directly -- under the old in-process design
+/// `Handle::generate` was always a stream and `--no-stream` only changed local echo, but the socket
+/// makes buffered/streamed a real request-shape choice, and "give me the answer when it is done"
+/// is exactly what `--no-stream` asks for.
 #[allow(clippy::too_many_arguments)]
-fn generate(path: &Path, prompt: &str, model: Option<&str>, sampling: &SamplingArgs,
+fn generate(prompt: &str, model: Option<&str>, sampling: &SamplingArgs,
             no_stream: bool, raw: bool, stats: bool, as_json: bool) -> Result<()> {
     quiet_one_shot();
-    let cfg = load_cfg(path)?;
-    let root = root(&cfg, path)?;
-    let (handle, join) = start_lazy(cfg, Box::new(EngineLoader { root }))
-        .map_err(|e| Tagged(engine_error(&e), e.to_string()))?;
     // Code::Failure, the documented generic bucket: this closed set has no invalid-argument code,
     // and NoService (2) would tell a caller to start a server for what is a bad flag value.
-    let ndjson = as_json && !no_stream;
     let params = build_params(sampling).map_err(|m| Tagged(Code::Failure, m))?;
-    let prompt = if raw {
-        npu_engine::Prompt::Raw(prompt.to_string())
+    let chat = !raw;
+    let path = if raw { "/v1/completions" } else { "/v1/chat/completions" };
+    let base = if raw {
+        serde_json::json!({ "prompt": prompt })
     } else {
-        npu_engine::Prompt::Chat(vec![npu_engine::ChatMessage::new("user", prompt)])
+        serde_json::json!({ "messages": socket_client::chat_messages_json(
+            &[npu_engine::ChatMessage::new("user", prompt)]) })
     };
-    let result = handle.generate(model, prompt, params)
-        .map_err(|e| {
-            // A base LM with no chat template is a legitimate case; name the flag rather than
-            // silently answering a different request than the one that was sent.
-            let code = engine_error(&e);
-            let msg = e.to_string();
-            let tagged = if msg.contains("chat_template") {
-                Tagged(code, format!("{msg}\n  this model has no chat template -- use `npu generate --raw`"))
-            } else { Tagged(code, msg) };
-            anyhow::Error::from(tagged)
-        })
-        .and_then(|served| {
-            let meta = cli_meta(&served.model, !raw);
-            // `--output json` follows the stream flag, the way /v1/chat/completions does:
-            // streaming means NDJSON on stdout, buffered means one object printed below. In
-            // either JSON mode the text is never echoed separately -- the chunks carry it.
-            let r = if ndjson {
-                let mut out = std::io::stdout();
-                drain_generation(served.value, false, &meta, Some(&mut out))
-            } else {
-                drain_generation(served.value, !no_stream && !as_json, &meta, None)
-            };
-            r.map(|g| (meta, g))
-        });
-    handle.shutdown(); let _ = join.join();
-    let (meta, g) = result?;
+    // `--output json` follows the stream flag, the way /v1/chat/completions does: streaming means
+    // NDJSON on stdout, buffered means one object printed below. In either JSON mode the text is
+    // never echoed separately -- the chunks (or the object) carry it.
+    let ndjson = as_json && !no_stream;
+    let result = if ndjson {
+        let mut out = std::io::stdout();
+        socket_generate(path, base, model, &params, chat, true, false, Some(&mut out))
+    } else {
+        socket_generate(path, base, model, &params, chat, !no_stream, !no_stream && !as_json, None)
+    }.map_err(|e| {
+        // A base LM with no chat template is a legitimate case; name the flag rather than silently
+        // answering a different request than the one that was sent. The code the server tagged the
+        // response with survives -- only the message grows a hint.
+        let msg = e.to_string();
+        if msg.contains("chat_template") {
+            anyhow::Error::from(Tagged(exit::of(&e),
+                format!("{msg}\n  this model has no chat template -- use `npu generate --raw`")))
+        } else { e }
+    });
+    let (served_model, g) = result?;
     if as_json {
         // The streaming arm already wrote every line; only the buffered arm has anything left.
         if !ndjson {
+            let meta = cli_meta(&served_model, chat);
             println!("{}", wire::completion_object_with_calls(&g.text, &g.calls, g.reason, &g.report, &meta));
         }
     } else {
@@ -608,13 +710,9 @@ fn replay_cmd(log: &Path, realtime: bool, frames: bool) -> Result<()> {
 /// then the REPL continues from it -- a seeded session, not a one-shot. The one-shot spelling is
 /// `npu generate`, which builds the identical single-message `Prompt::Chat`; duplicating it here
 /// would add a second name for a command we have and drop the history that makes this one a REPL.
-fn chat(path: &Path, opening: Option<&str>, model: Option<&str>, sampling: &SamplingArgs,
+fn chat(opening: Option<&str>, model: Option<&str>, sampling: &SamplingArgs,
         no_stream: bool, as_json: bool) -> Result<()> {
     quiet_one_shot();
-    let cfg = load_cfg(path)?;
-    let root = root(&cfg, path)?;
-    let (handle, join) = start_lazy(cfg, Box::new(EngineLoader { root }))
-        .map_err(|e| Tagged(engine_error(&e), e.to_string()))?;
     // Code::Failure, the documented generic bucket: this closed set has no invalid-argument code,
     // and NoService (2) would tell a caller to start a server for what is a bad flag value.
     let params = build_params(sampling).map_err(|m| Tagged(Code::Failure, m))?;
@@ -622,52 +720,48 @@ fn chat(path: &Path, opening: Option<&str>, model: Option<&str>, sampling: &Samp
     let stdin = std::io::stdin();
     // Whitespace-only counts as absent: `npu chat ""` must open the REPL, not send an empty turn.
     let mut opening = opening.map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
-    let result = (|| -> Result<()> {
-        loop {
-            let line = match opening.take() {
-                // Echoed at the prompt so the transcript reads the same whether the turn came from
-                // argv or the keyboard. In JSON mode the prompt and the echo go to stderr, because
-                // stdout is the NDJSON stream and a `> ` in the middle of it is not parseable.
-                Some(turn) => {
-                    if as_json { eprintln!("> {turn}") } else { println!("> {turn}") }
-                    turn
-                }
-                None => {
-                    if as_json { eprint!("> "); std::io::stderr().flush().ok(); }
-                    else { print!("> "); std::io::stdout().flush().ok(); }
-                    let mut line = String::new();
-                    // Ctrl-D
-                    if stdin.lock().read_line(&mut line)? == 0 {
-                        if as_json { eprintln!() } else { println!() }
-                        return Ok(());
-                    }
-                    let line = line.trim_end().to_string();
-                    if line.is_empty() { continue; }
-                    line
-                }
-            };
-            history.push(npu_engine::ChatMessage::new("user", line));
-            let served = handle.generate(model, npu_engine::Prompt::Chat(history.clone()), params.clone())
-                .map_err(|e| Tagged(engine_error(&e), e.to_string()))?;
-            let meta = cli_meta(&served.model, true);
-            // One NDJSON run per turn -- header, tokens, summary -- so a piped chat session is a
-            // concatenation of run logs rather than a format of its own.
-            let g = if as_json {
-                let mut out = std::io::stdout();
-                drain_generation(served.value, false, &meta, Some(&mut out))?
-            } else {
-                drain_generation(served.value, !no_stream, &meta, None)?
-            };
-            if !as_json {
-                if no_stream { print!("{}", g.text); }
-                println!();
-                print_stats_footer(&g, false);
+    loop {
+        let line = match opening.take() {
+            // Echoed at the prompt so the transcript reads the same whether the turn came from
+            // argv or the keyboard. In JSON mode the prompt and the echo go to stderr, because
+            // stdout is the NDJSON stream and a `> ` in the middle of it is not parseable.
+            Some(turn) => {
+                if as_json { eprintln!("> {turn}") } else { println!("> {turn}") }
+                turn
             }
-            history.push(npu_engine::ChatMessage::new("assistant", g.text));
+            None => {
+                if as_json { eprint!("> "); std::io::stderr().flush().ok(); }
+                else { print!("> "); std::io::stdout().flush().ok(); }
+                let mut line = String::new();
+                // Ctrl-D
+                if stdin.lock().read_line(&mut line)? == 0 {
+                    if as_json { eprintln!() } else { println!() }
+                    return Ok(());
+                }
+                let line = line.trim_end().to_string();
+                if line.is_empty() { continue; }
+                line
+            }
+        };
+        history.push(npu_engine::ChatMessage::new("user", line));
+        let base = serde_json::json!({ "messages": socket_client::chat_messages_json(&history) });
+        // One NDJSON run per turn -- header, tokens, summary -- so a piped chat session is a
+        // concatenation of run logs rather than a format of its own. Always streamed in JSON mode
+        // (unlike `generate`, which buffers under `--no-stream` even with `--output json`) --
+        // preserved from the in-process design, where every chat turn drained the same way.
+        let (_, g) = if as_json {
+            let mut out = std::io::stdout();
+            socket_generate("/v1/chat/completions", base, model, &params, true, true, false, Some(&mut out))?
+        } else {
+            socket_generate("/v1/chat/completions", base, model, &params, true, !no_stream, !no_stream, None)?
+        };
+        if !as_json {
+            if no_stream { print!("{}", g.text); }
+            println!();
+            print_stats_footer(&g, false);
         }
-    })();
-    handle.shutdown(); let _ = join.join();
-    result
+        history.push(npu_engine::ChatMessage::new("assistant", g.text));
+    }
 }
 
 /// Shortest span worth sending to ASR. Below this a "segment" is a diarization edge artefact and
@@ -704,15 +798,19 @@ fn parse_asr_window(raw: Option<&std::ffi::OsStr>) -> Result<f32> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn transcribe_media(path: &Path, input: &Path, out: Option<&Path>, format: OutFormat,
+/// `SPEAKER_NN` back to its index. The socket only ever gives back the rendered string (the same
+/// thing an HTTP client sees), never the `Segment` struct that carried the raw number.
+fn parse_speaker_index(s: &str) -> u32 {
+    s.strip_prefix("SPEAKER_").and_then(|n| n.parse().ok()).unwrap_or(0)
+}
+
+fn transcribe_media(input: &Path, out: Option<&Path>, format: OutFormat,
                     asr: Option<&str>, diar: Option<&str>, only_track: Option<usize>,
                     no_diarize: bool) -> Result<()> {
     quiet_one_shot();
-    // Before the device, ffmpeg or diarization: a bad NPU_ASR_MAX_SPAN_S is an operator typo, and
-    // reporting it after a model load and a diarize pass is loud but far too late.
+    // Before ffmpeg or a request goes out: a bad NPU_ASR_MAX_SPAN_S is an operator typo, and
+    // reporting it after a diarize round trip is loud but far too late.
     let max_span = asr_window_s()?;
-    let cfg = load_cfg(path)?;
-    let root = root(&cfg, path)?;
     let tracks = media::probe_audio_tracks(input)?;
     if tracks.is_empty() { bail!("{} has no audio tracks", input.display()); }
     let wanted: Vec<&media::AudioTrack> = match only_track {
@@ -725,10 +823,6 @@ fn transcribe_media(path: &Path, input: &Path, out: Option<&Path>, format: OutFo
     eprintln!("[npu] {} audio track(s): {}", wanted.len(),
         wanted.iter().map(|t| t.label()).collect::<Vec<_>>().join(", "));
 
-    // One actor for the whole run: the models stay resident across tracks and segments instead of
-    // reloading per call. `memory_ceiling_mb` must be enough for asr + diarize together to coexist.
-    let (handle, join) = start_lazy(cfg, Box::new(EngineLoader { root }))
-        .map_err(|e| Tagged(engine_error(&e), e.to_string()))?;
     let tmp = std::env::temp_dir().join(format!("npu-media-{}", std::process::id()));
     std::fs::create_dir_all(&tmp).context("temp dir")?;
 
@@ -742,13 +836,19 @@ fn transcribe_media(path: &Path, input: &Path, out: Option<&Path>, format: OutFo
                 .ok_or_else(|| anyhow!("track {} did not decode to 16k mono 16-bit", t.ord))?;
             let label = t.label();
 
-            // Spans to transcribe: diarized turns, or the whole track when diarization is off.
+            // Spans to transcribe: diarized turns, or the whole track when diarization is off. The
+            // whole-track WAV already in hand goes straight over the socket -- no local decode was
+            // needed for this call, only for the per-span slicing below.
             let spans: Vec<(f32, f32, u32)> = if no_diarize {
                 vec![(0.0, pcm.len() as f32 / 16_000.0, 0)]
             } else {
-                handle.diarize(diar, pcm.clone(), 16_000)
-                    .map_err(|e| Tagged(engine_error(&e), format!("diarize track {}: {e}", t.ord)))?
-                    .value.iter().map(|s| (s.start_s, s.end_s, s.speaker)).collect()
+                let v = socket_client::call_multipart("/v1/audio/diarizations", diar, "track.wav", &bytes)
+                    .with_context(|| format!("diarize track {}", t.ord))?;
+                v["segments"].as_array().cloned().unwrap_or_default().iter()
+                    .map(|s| (s["start"].as_f64().unwrap_or(0.0) as f32,
+                              s["end"].as_f64().unwrap_or(0.0) as f32,
+                              parse_speaker_index(s["speaker"].as_str().unwrap_or(""))))
+                    .collect()
             };
             let n_spk = spans.iter().map(|s| s.2).collect::<std::collections::BTreeSet<_>>().len();
             eprintln!("[npu] {label}: {} span(s), {n_spk} speaker(s)", spans.len());
@@ -762,14 +862,16 @@ fn transcribe_media(path: &Path, input: &Path, out: Option<&Path>, format: OutFo
             for (start_s, end_s, spk) in spans {
                 if end_s - start_s < MIN_UTTERANCE_S { continue }
                 // Slice the PCM directly rather than re-invoking ffmpeg per span: the samples are
-                // already in memory and a subprocess per utterance would dominate the runtime.
+                // already in memory and a subprocess per utterance would dominate the runtime. The
+                // upload endpoint takes a file, so the slice is wrapped back into a WAV -- the
+                // upload's byte cost, not a device cost, and paid once per span either way.
                 let (a, b) = ((start_s * 16_000.0) as usize, (end_s * 16_000.0) as usize);
                 let slice = pcm[a.min(pcm.len())..b.min(pcm.len())].to_vec();
                 if slice.is_empty() { continue }
-                let text = handle.transcribe(asr, slice, 16_000)
-                    .map_err(|e| Tagged(engine_error(&e),
-                        format!("transcribe {label} [{start_s:.2}-{end_s:.2}]: {e}")))?
-                    .value.trim().to_string();
+                let wav_bytes = media::write_wav_i16(&slice, 16_000);
+                let v = socket_client::call_multipart("/v1/audio/transcriptions", asr, "span.wav", &wav_bytes)
+                    .with_context(|| format!("transcribe {label} [{start_s:.2}-{end_s:.2}]"))?;
+                let text = v["text"].as_str().unwrap_or("").trim().to_string();
                 if text.is_empty() { continue }
                 utts.push(media::Utterance {
                     start_s, end_s,
@@ -783,7 +885,6 @@ fn transcribe_media(path: &Path, input: &Path, out: Option<&Path>, format: OutFo
         Ok(utts)
     })();
 
-    handle.shutdown(); let _ = join.join();
     let _ = std::fs::remove_dir_all(&tmp);
     let utts = result?;
 
@@ -797,57 +898,52 @@ fn transcribe_media(path: &Path, input: &Path, out: Option<&Path>, format: OutFo
     Ok(())
 }
 
-fn diarize(path: &Path, wav: &Path, model: Option<&str>, json: bool) -> Result<()> {
+/// Sent whole to `/v1/audio/diarizations` over the control socket, same reason as `transcribe`.
+fn diarize(wav: &Path, model: Option<&str>, json: bool) -> Result<()> {
     quiet_one_shot();
-    let cfg = load_cfg(path)?;
-    let root = root(&cfg, path)?;
-    // Lazy, same reason as `transcribe`: a one-shot run loads the model it serves and nothing else.
-    let (handle, join) = start_lazy(cfg, Box::new(EngineLoader { root }))
-        .map_err(|e| Tagged(engine_error(&e), e.to_string()))?;
     let bytes = std::fs::read(wav).with_context(|| format!("read {}", wav.display()))?;
-    let samples = http::parse::parse_wav_i16(&bytes)
-        .ok_or_else(|| anyhow!("bad wav (need 16k mono 16-bit)"))?;
-    let out = handle.diarize(model, samples, 16_000)
-        .map_err(|e| Tagged(engine_error(&e), e.to_string()));
-    handle.shutdown(); let _ = join.join();
-    println!("{}", render_segments(&out?.value, json));
+    let filename = wav.file_name().and_then(|n| n.to_str()).unwrap_or("audio.wav");
+    let v = socket_client::call_multipart("/v1/audio/diarizations", model, filename, &bytes)?;
+    println!("{}", render_segments_json(&v, json));
     Ok(())
 }
 
 /// Human lines by default, the HTTP JSON body under `--json`. Pure, so it is testable without a
-/// device, a model or a server.
-fn render_segments(segs: &[npu_engine::capability::Segment], json: bool) -> String {
+/// device, a model or a server. From the wire shape `/v1/audio/diarizations` answers with
+/// (`speaker` already rendered as `"SPEAKER_NN"`) rather than from `Segment` structs -- a socket
+/// client never gets those back, only their JSON rendering.
+fn render_segments_json(v: &serde_json::Value, json: bool) -> String {
+    let empty = Vec::new();
+    let segs = v["segments"].as_array().unwrap_or(&empty);
     if json {
-        let items: Vec<String> = segs.iter().map(|s| format!(
-            "{{\"start\":{:.3},\"end\":{:.3},\"speaker\":\"SPEAKER_{:02}\"}}",
-            s.start_s, s.end_s, s.speaker)).collect();
-        return format!("{{\"segments\":[{}]}}", items.join(","));
+        return serde_json::json!({"segments": segs}).to_string();
     }
     segs.iter()
-        .map(|s| format!("[{:.2} - {:.2}] SPEAKER_{:02}", s.start_s, s.end_s, s.speaker))
+        .map(|s| format!("[{:.2} - {:.2}] {}",
+            s["start"].as_f64().unwrap_or(0.0), s["end"].as_f64().unwrap_or(0.0),
+            s["speaker"].as_str().unwrap_or("?")))
         .collect::<Vec<_>>()
         .join("\n")
 }
 
-fn embed(path: &Path, text: &str, model: Option<&str>, as_json: bool) -> Result<()> {
+/// Sent over the control socket to `/v1/embeddings` -- the exact request an HTTP client would make,
+/// so `route()` is the only place "what does embed do" is decided. No service running is a refusal,
+/// not an in-process fallback.
+fn embed(text: &str, model: Option<&str>, as_json: bool) -> Result<()> {
     quiet_one_shot();
-    let cfg = load_cfg(path)?;
-    let root = root(&cfg, path)?;
-    // Lazy: `npu embed` against an ASR-only config used to pay a full parakeet load before it could
-    // say there was no embed model at all.
-    let (handle, join) = start_lazy(cfg, Box::new(EngineLoader { root }))
-        .map_err(|e| Tagged(engine_error(&e), e.to_string()))?;
-    let out = handle.embed(model, text).map_err(|e| Tagged(engine_error(&e), e.to_string()));
-    handle.shutdown(); let _ = join.join();
-    let served = out?;
+    let mut body = serde_json::json!({ "input": text });
+    if let Some(m) = model { body["model"] = serde_json::json!(m); }
+    let v = socket_client::call_json("/v1/embeddings", &body)?;
+    let served_model = v["model"].as_str().unwrap_or_default();
+    let embedding = v["data"][0]["embedding"].as_array().cloned().unwrap_or_default();
     if as_json {
         // The OpenAI embeddings shape, so the one-shot and the HTTP route answer alike.
         println!("{}", serde_json::json!({
-            "object": "list", "model": served.model,
-            "data": [{ "object": "embedding", "index": 0, "embedding": served.value }],
+            "object": "list", "model": served_model,
+            "data": [{ "object": "embedding", "index": 0, "embedding": embedding }],
         }));
     } else {
-        let arr = served.value.iter().map(|x| format!("{x}")).collect::<Vec<_>>().join(",");
+        let arr = embedding.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(",");
         println!("[{arr}]");
     }
     Ok(())
@@ -855,15 +951,12 @@ fn embed(path: &Path, text: &str, model: Option<&str>, as_json: bool) -> Result<
 
 /// The configured models, and -- when the service is running -- what it currently has resident.
 ///
-/// Never contacts the service. The CLI and the service must not depend on each other: every other
-/// one-shot command drives the engine directly, and this one used to need a running HTTP server to
-/// say anything at all.
-///
-/// Live state comes from a FILE the service publishes, not a socket or the port. `RuntimeDirectory=`
-/// has systemd create that directory on start and remove it on stop, so its presence is the liveness
-/// signal -- no probe, no handshake, no timeout, and no way to mistake ollama on the shared 11434
-/// for us. A wedged service cannot hang this command, because reading bytes is not connecting; it
-/// shows the last published state and how old it is, and lets the reader judge.
+/// Live state comes from the control socket's `GET /v1/models`, answered from the actor's
+/// out-of-band snapshot rather than a device-serialized query -- a busy service cannot hang this
+/// command. `RuntimeDirectory=` has systemd create that directory on start and remove it on stop,
+/// so the socket's absence is the liveness signal -- no probe, no handshake, and no way to mistake
+/// ollama on the shared 11434 for us. `query_control_socket`'s connect/read timeouts bound the one
+/// failure a file read never had: a process that is alive but wedged below the listener thread.
 /// What a model's scenario file declares, for the columns that must answer with the service down.
 ///
 /// `kind` and `precision` are properties of the manifest, not of a running process, so reading them
@@ -1134,13 +1227,42 @@ fn top(path: &Path, interval: f64, once: bool, port: Option<u16>) -> Result<()> 
     }
 }
 
+/// `GET /v1/models` over the control socket, with a connect and a read/write timeout: a socket CAN
+/// hang where a file read never could, so a wedged-but-alive server must not be able to hold this
+/// command past a bound. `None` for every failure mode (no socket, refused, timed out, bad JSON) --
+/// all of them mean the same thing to a caller: no live status to show.
+fn query_control_socket() -> Option<serde_json::Value> {
+    let path = npu_runtime::control_socket::socket_path()?;
+    let timeout = std::time::Duration::from_secs(2);
+    let mut stream = UnixStream::connect(&path).ok()?;
+    stream.set_read_timeout(Some(timeout)).ok()?;
+    stream.set_write_timeout(Some(timeout)).ok()?;
+    stream.write_all(b"GET /v1/models HTTP/1.1\r\n\r\n").ok()?;
+    let mut reader = std::io::BufReader::new(stream);
+    let mut status_line = String::new();
+    reader.read_line(&mut status_line).ok()?;
+    let code: u16 = status_line.split_whitespace().nth(1)?.parse().ok()?;
+    let mut content_len = 0usize;
+    loop {
+        let mut h = String::new();
+        if reader.read_line(&mut h).ok()? == 0 { break; }
+        let h = h.trim_end();
+        if h.is_empty() { break; }
+        if let Some(v) = h.to_ascii_lowercase().strip_prefix("content-length:") {
+            content_len = v.trim().parse().ok()?;
+        }
+    }
+    if code != 200 { return None; }
+    let mut body = vec![0u8; content_len];
+    reader.read_exact(&mut body).ok()?;
+    serde_json::from_slice(&body).ok()
+}
+
 fn read_live_status(want_port: u16) -> Option<(u64, serde_json::Value)> {
-    let p = npu_runtime::status_file::path()?;
-    let body = std::fs::read_to_string(p).ok()?;
-    let v: serde_json::Value = serde_json::from_str(&body).ok()?;
+    let v = query_control_socket()?;
     let pid = v.get("pid")?.as_u64()?;
     if !std::path::Path::new(&format!("/proc/{pid}")).exists() {
-        return None; // stale file from a process that is gone
+        return None; // the socket answered, but the pid it named is already gone
     }
     // The path is per-USER, so another engine on another port publishes here too -- a test instance,
     // a parallel session. Without this the command reports someone else's models as ours, which it
@@ -1370,8 +1492,7 @@ fn restart_hint(port: u16) -> String {
 
 /// The pid the running server published, or `None` when nothing is serving this port.
 fn serving_pid(port: u16) -> Option<u64> {
-    let v: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(npu_runtime::status_file::path()?).ok()?).ok()?;
+    let v = query_control_socket()?;
     match v.get("port").and_then(|p| p.as_u64()) {
         Some(p) if p != port as u64 => return None,
         _ => {}
@@ -1643,6 +1764,7 @@ fn http_req(port: u16, method: &str, path: &str, body: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use npu_runtime::actor::start_lazy;
     use npu_runtime::config::{Defaults, ModelCfg, ServerCfg};
 
     fn top_doc(started: i64, extra: serde_json::Value) -> serde_json::Value {
@@ -1774,6 +1896,165 @@ mod tests {
         std::env::remove_var("NPU_PRECISION");
     }
 
+    /// A model that answers `Capability::EMBED` deterministically from its input bytes -- enough to
+    /// tell two calls apart without a real device, and to compare the CLI-over-socket path against
+    /// the HTTP route byte for byte.
+    struct EchoEmbed;
+    impl npu_runtime::loader::Servable for EchoEmbed {
+        fn capabilities(&self) -> Capability { Capability::EMBED }
+        fn run(&mut self, req: npu_engine::capability::Request)
+            -> Result<npu_engine::capability::Response, npu_engine::EngineError> {
+            match req {
+                npu_engine::capability::Request::Text(t) =>
+                    Ok(npu_engine::capability::Response::Vector(t.bytes().map(|b| b as f32).collect())),
+                other => panic!("EchoEmbed cannot serve {other:?}"),
+            }
+        }
+    }
+    impl npu_runtime::loader::StreamServable for EchoEmbed {}
+    struct EchoEmbedLoader;
+    impl ModelLoader for EchoEmbedLoader {
+        fn load(&self, _cfg: &ModelCfg) -> Result<Box<dyn npu_runtime::loader::StreamServable>, npu_engine::EngineError> {
+            Ok(Box::new(EchoEmbed))
+        }
+        fn declared_capability(&self, _cfg: &ModelCfg) -> Option<Capability> { Some(Capability::EMBED) }
+    }
+
+    /// A real actor behind a real control socket, `XDG_RUNTIME_DIR` pointed at a fresh tempdir.
+    /// Every caller of this must hold `ENV_LOCK` -- `socket_path()` reads process-global env.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    fn embed_socket_harness(port: u16) -> (npu_runtime::actor::Handle, std::thread::JoinHandle<()>, tempfile::TempDir) {
+        let cfg = Config {
+            server: ServerCfg { port, idle_unload_s: 0, ..Default::default() },
+            defaults: Defaults::from_pairs([(Capability::EMBED, "bge".to_string())]),
+            models: vec![ModelCfg { name: "bge".into(), scenario: "x".into(), resident: false }],
+        };
+        let (handle, join) = start_lazy(cfg, Box::new(EchoEmbedLoader)).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::remove_var("RUNTIME_DIRECTORY");
+        std::env::set_var("XDG_RUNTIME_DIR", dir.path());
+        let sock_path = npu_runtime::control_socket::socket_path().unwrap();
+        let listener = npu_runtime::control_socket::bind(&sock_path).unwrap();
+        let (h2, live, cfg_path) = (handle.clone(), handle.live_status(), dir.path().join("engine.toml"));
+        std::thread::spawn(move || npu_runtime::control_socket::serve(listener, h2, live, cfg_path));
+        (handle, join, dir)
+    }
+
+    #[test]
+    fn read_live_status_and_serving_pid_round_trip_through_a_real_control_socket() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        const PORT: u16 = 19191;
+        let (handle, join, _dir) = embed_socket_harness(PORT);
+
+        assert_eq!(handle.embed(None, "hi").unwrap().model, "bge");
+
+        let (age, doc) = read_live_status(PORT).expect("a live socket must answer");
+        assert!(age < 5, "just published: {age}");
+        assert_eq!(doc["port"], PORT);
+        assert!(serving_pid(PORT).is_some());
+        assert!(serving_pid(PORT + 1).is_none(), "a different port must not match this service");
+
+        std::env::remove_var("XDG_RUNTIME_DIR");
+        handle.shutdown();
+        join.join().unwrap();
+    }
+
+    /// The equality oracle this whole migration turns on: the CLI-over-socket and the HTTP route
+    /// must answer identically for the same input. One actor, both transports, one comparison --
+    /// not an assertion about either in isolation.
+    #[test]
+    fn embed_over_the_socket_matches_the_http_route_byte_for_byte() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        const PORT: u16 = 19193;
+        let (handle, join, dir) = embed_socket_harness(PORT);
+
+        let body = serde_json::json!({"input": "hello"});
+        let via_socket = socket_client::call_json("/v1/embeddings", &body).unwrap();
+
+        let cfg_path = dir.path().join("engine.toml");
+        let req = npu_runtime::http::Request {
+            method: "POST".into(), path: "/v1/embeddings".into(),
+            boundary: String::new(), body: body.to_string().into_bytes(),
+        };
+        let (code, resp) = npu_runtime::http::route(&req, &handle, &cfg_path);
+        assert_eq!(code, 200, "{}", resp.text());
+        let via_http: serde_json::Value = serde_json::from_str(resp.text()).unwrap();
+
+        assert_eq!(via_socket, via_http, "the CLI-over-socket and HTTP route must agree exactly");
+
+        std::env::remove_var("XDG_RUNTIME_DIR");
+        handle.shutdown();
+        join.join().unwrap();
+    }
+
+    /// Order step 5 (`2026-09-05-cli-as-client-design.md` §5): a device command with no service
+    /// running must fail with the fix, not fall back to an in-process copy -- option (a). Every
+    /// migrated command shares this through `socket_client::call`, so pinning it once here covers
+    /// embed/transcribe/diarize/transcribe-media/generate/chat alike.
+    #[test]
+    fn a_device_command_with_no_service_running_refuses_with_the_fix() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::remove_var("RUNTIME_DIRECTORY");
+        std::env::set_var("XDG_RUNTIME_DIR", dir.path());
+        // No `control_socket::bind` call at all -- nothing is listening.
+
+        let err = embed("hi", None, false).unwrap_err();
+        let tagged = err.downcast_ref::<Tagged>().expect("refusal must be a Tagged error");
+        assert_eq!(tagged.0, Code::NoService);
+        assert!(tagged.1.contains("systemctl --user start xdna-engine"), "{}", tagged.1);
+
+        std::env::remove_var("XDG_RUNTIME_DIR");
+    }
+
+    /// A device command's socket client must never carry a short read timeout copied from the
+    /// status-check pattern -- a real generate/transcribe legitimately takes longer than any such
+    /// timeout would allow. Three seconds is not special; it only has to comfortably clear a
+    /// mistakenly-reintroduced short timeout (the bug this pins: an earlier draft of this task used
+    /// 2s, which failed nearly every real call) without making the suite slow.
+    #[test]
+    fn a_device_command_outlives_a_short_timeout() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        struct SlowEmbed;
+        impl npu_runtime::loader::Servable for SlowEmbed {
+            fn capabilities(&self) -> Capability { Capability::EMBED }
+            fn run(&mut self, _req: npu_engine::capability::Request)
+                -> Result<npu_engine::capability::Response, npu_engine::EngineError> {
+                std::thread::sleep(std::time::Duration::from_secs(3));
+                Ok(npu_engine::capability::Response::Vector(vec![1.0]))
+            }
+        }
+        impl npu_runtime::loader::StreamServable for SlowEmbed {}
+        struct SlowEmbedLoader;
+        impl ModelLoader for SlowEmbedLoader {
+            fn load(&self, _cfg: &ModelCfg) -> Result<Box<dyn npu_runtime::loader::StreamServable>, npu_engine::EngineError> {
+                Ok(Box::new(SlowEmbed))
+            }
+            fn declared_capability(&self, _cfg: &ModelCfg) -> Option<Capability> { Some(Capability::EMBED) }
+        }
+        const PORT: u16 = 19194;
+        let cfg = Config {
+            server: ServerCfg { port: PORT, idle_unload_s: 0, ..Default::default() },
+            defaults: Defaults::from_pairs([(Capability::EMBED, "bge".to_string())]),
+            models: vec![ModelCfg { name: "bge".into(), scenario: "x".into(), resident: false }],
+        };
+        let (handle, join) = start_lazy(cfg, Box::new(SlowEmbedLoader)).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::remove_var("RUNTIME_DIRECTORY");
+        std::env::set_var("XDG_RUNTIME_DIR", dir.path());
+        let sock_path = npu_runtime::control_socket::socket_path().unwrap();
+        let listener = npu_runtime::control_socket::bind(&sock_path).unwrap();
+        let (h2, live, cfg_path) = (handle.clone(), handle.live_status(), dir.path().join("engine.toml"));
+        std::thread::spawn(move || npu_runtime::control_socket::serve(listener, h2, live, cfg_path));
+
+        let v = socket_client::call_json("/v1/embeddings", &serde_json::json!({"input": "hi"})).unwrap();
+        assert!(v["data"][0]["embedding"].is_array());
+
+        std::env::remove_var("XDG_RUNTIME_DIR");
+        handle.shutdown();
+        join.join().unwrap();
+    }
+
     /// `--model=<TAB>` used to offer FILENAMES: clap cannot express "the values come from the
     /// user's config", so it emits `_default`, which is zsh for file completion. This pins both
     /// halves -- that clap still emits what the rewrite looks for, and that nothing it aims at
@@ -1812,15 +2093,26 @@ mod tests {
     }
 
     /// `--output json` streaming has to produce something the readers accept, or `> run.jsonl` is
-    /// a lie. Drives the drain with a scripted channel and reads its own output back through the
-    /// same parser `npu stats` and `npu replay` use.
+    /// a lie. Drives `drain_sse` off a hand-scripted SSE body -- the exact bytes a real service
+    /// would send, per-token `chunk_line` frames included -- and reads the NDJSON it wrote back
+    /// through the same parser `npu stats`/`npu replay` use.
+    ///
+    /// The one property this pins that is easy to get wrong: a `chat.completion.chunk` frame is
+    /// NOT on its own the signal to emit an NDJSON line -- the role/finish frames share that same
+    /// `object` tag and carry no token. Only a frame with an `"x_npu"` sibling key (what `stats`
+    /// mode attaches to a real per-token chunk) is one.
     #[test]
     fn streaming_json_writes_a_run_log_its_own_readers_can_parse() {
         use npu_engine::{FinishReason, GenerateUsage, GenerationReport, StepRecord};
 
         let meta = wire::RunMeta { id: "chatcmpl-t".into(), created: 7, model: "m".into(), chat: true };
-        let (tx, rx) = std::sync::mpsc::channel();
         let mut report = GenerationReport::default();
+        let mut sse = String::new();
+        let role = serde_json::json!({
+            "id": meta.id, "object": "chat.completion.chunk", "created": meta.created, "model": meta.model,
+            "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": null}],
+        });
+        sse.push_str(&format!("data: {role}\n\n"));
         for (i, word) in ["Hello", ", ", "world"].iter().enumerate() {
             let rec = StepRecord {
                 seq: i as u32,
@@ -1831,21 +2123,27 @@ mod tests {
                 dt_us: 1_000,
                 ..StepRecord::default()
             };
-            tx.send(StreamItem::Text(rec.emit.clone())).unwrap();
-            tx.send(StreamItem::Step(rec.clone())).unwrap();
+            // The exact frame a real service sends in stats mode -- `chat.completion.chunk` PLUS
+            // `x_npu`, never a separate plain-text delta alongside it.
+            sse.push_str(&format!("data: {}\n\n", wire::chunk_line(&rec, &meta)));
             report.steps.push(rec);
         }
         report.usage = GenerateUsage { prompt_tokens: 2, completion_tokens: 3 };
         report.generate_us = 3_000;
-        tx.send(StreamItem::Done {
-            reason: FinishReason::Stop, usage: report.usage, report: Box::new(report),
-        }).unwrap();
-        drop(tx);
+        let finish = serde_json::json!({
+            "id": meta.id, "object": "chat.completion.chunk", "created": meta.created, "model": meta.model,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        });
+        sse.push_str(&format!("data: {finish}\n\n"));
+        sse.push_str(&format!("data: {}\n\n", serde_json::json!({"x_npu_report": &report})));
+        sse.push_str(&format!("data: {}\n\n", wire::summary_line(&report, &meta, FinishReason::Stop)));
+        sse.push_str("data: [DONE]\n\n");
 
         let mut buf: Vec<u8> = Vec::new();
         let g = {
             let w: &mut dyn Write = &mut buf;
-            drain_generation(rx, false, &meta, Some(w)).unwrap()
+            let sse_call = socket_client::SseCall::from_reader(std::io::BufReader::new(sse.as_bytes()));
+            drain_sse(sse_call, false, true, Some(w)).unwrap().1
         };
         let out = String::from_utf8(buf).unwrap();
 
@@ -2272,25 +2570,34 @@ mod tests {
             "the ceiling's scope must be printed with it: {r}");
     }
 
+    /// The shape `/v1/audio/diarizations` actually answers with -- `speaker` pre-rendered as
+    /// `"SPEAKER_NN"`, the only form a socket client ever sees.
     #[test]
     fn diarize_lines_are_human_readable_and_json_is_machine_readable() {
-        let segs = vec![
-            npu_engine::capability::Segment { start_s: 0.5, end_s: 3.25, speaker: 0 },
-            npu_engine::capability::Segment { start_s: 3.25, end_s: 9.0, speaker: 1 },
-        ];
-        let lines = render_segments(&segs, false);
+        let v = serde_json::json!({"segments": [
+            {"start": 0.5, "end": 3.25, "speaker": "SPEAKER_00"},
+            {"start": 3.25, "end": 9.0, "speaker": "SPEAKER_01"},
+        ]});
+        let lines = render_segments_json(&v, false);
         assert_eq!(lines.lines().count(), 2, "{lines}");
         assert!(lines.starts_with("[0.50 - 3.25] SPEAKER_00"), "{lines}");
         assert!(lines.contains("[3.25 - 9.00] SPEAKER_01"), "{lines}");
-        let json = render_segments(&segs, true);
+        let json = render_segments_json(&v, true);
         assert!(json.starts_with('{') && json.contains("\"segments\""), "{json}");
         assert!(json.contains("\"speaker\":\"SPEAKER_01\""), "{json}");
     }
 
     #[test]
     fn an_empty_diarization_renders_without_panicking() {
-        assert_eq!(render_segments(&[], false), "");
-        assert!(render_segments(&[], true).contains("\"segments\":[]"));
+        let empty = serde_json::json!({"segments": []});
+        assert_eq!(render_segments_json(&empty, false), "");
+        assert!(render_segments_json(&empty, true).contains("\"segments\":[]"));
+    }
+
+    #[test]
+    fn parse_speaker_index_reads_the_trailing_number() {
+        assert_eq!(parse_speaker_index("SPEAKER_07"), 7);
+        assert_eq!(parse_speaker_index("garbage"), 0, "an unparseable label defaults rather than panics");
     }
 
     /// Builds a fake `root` with a real `toolchain.lock`, a `scenarios/asr.toml` naming the

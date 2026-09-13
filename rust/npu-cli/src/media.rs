@@ -190,9 +190,40 @@ pub fn split_turn(start_s: f32, end_s: f32, max_s: f32) -> Vec<(f32, f32)> {
     }).collect()
 }
 
+/// A mono 16-bit PCM WAV, for uploading a PCM slice (a diarized span) to `/v1/audio/transcriptions`
+/// over the control socket -- the server decodes any container ffmpeg can read, so this only needs
+/// to be a valid WAV, not a minimal or exhaustive one.
+pub fn write_wav_i16(samples: &[i16], sample_rate: u32) -> Vec<u8> {
+    let data_len = (samples.len() * 2) as u32;
+    let mut out = Vec::with_capacity(44 + data_len as usize);
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&(36 + data_len).to_le_bytes());
+    out.extend_from_slice(b"WAVE");
+    out.extend_from_slice(b"fmt ");
+    out.extend_from_slice(&16u32.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    out.extend_from_slice(&1u16.to_le_bytes()); // mono
+    out.extend_from_slice(&sample_rate.to_le_bytes());
+    out.extend_from_slice(&(sample_rate * 2).to_le_bytes()); // byte rate
+    out.extend_from_slice(&2u16.to_le_bytes()); // block align
+    out.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+    out.extend_from_slice(b"data");
+    out.extend_from_slice(&data_len.to_le_bytes());
+    for s in samples { out.extend_from_slice(&s.to_le_bytes()); }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn write_wav_i16_round_trips_through_the_engine_s_own_parser() {
+        let samples: Vec<i16> = (0..1000).map(|i| (i * 7 % 2000 - 1000) as i16).collect();
+        let wav = write_wav_i16(&samples, 16_000);
+        let back = npu_runtime::http::parse::parse_wav_i16(&wav).expect("must parse");
+        assert_eq!(back, samples);
+    }
 
     #[test]
     fn ffprobe_tracks_carry_their_titles_and_languages() {

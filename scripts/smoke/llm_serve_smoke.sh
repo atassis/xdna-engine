@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # End-to-end smoke for the LLM serving surface: /healthz, /v1/models, chat completions buffered and
 # streamed, /v1/completions, temperature-0 determinism, the 400 on an unsupported param, and the
-# `npu generate` CLI. Opens the NPU, so it is single-tenant: set NPU_LOCK to a serializing wrapper
-# (`NPU_LOCK=/path/to/lock.sh queue --`) or make sure nothing else holds /dev/accel/accel0.
+# `npu generate` CLI (a control-socket client of the same server, not a second device holder --
+# `cli-as-client-over-a-socket`). `npu serve` is still the one thing that opens the NPU directly and
+# is single-tenant: set NPU_LOCK to a serializing wrapper (`NPU_LOCK=/path/to/lock.sh queue --`) or
+# make sure nothing else holds /dev/accel/accel0.
 #
 # Report a result together with the driver it ran against: `cat /sys/module/amdxdna/srcversion`.
 set -uo pipefail
@@ -101,12 +103,15 @@ record "unsupported n:2 -> expect 400" curl -s -o /dev/null -w "%{http_code}\n" 
   "http://127.0.0.1:$PORT/v1/chat/completions" -H 'content-type: application/json' \
   -d '{"model":"qwen3-0.6b","messages":[{"role":"user","content":"hi"}],"n":2}'
 
+# Before stopping the server: `npu generate` is a control-socket CLIENT of the SAME server now, not
+# a second in-process device holder, so it needs one running -- unlike before this task, when it
+# worked equally well (worse: took its own hardware context) with the server already dead.
+log "== npu generate CLI (one-shot, streams to stdout) =="
+"$BIN" --config "$CFG" generate "Say hello in one short sentence." --max-tokens 32 --temperature 0 \
+  2>&1 | tee -a "$TRANSCRIPT"
+
 log "== stopping server =="
 kill "$SERVE_PID" 2>/dev/null
 wait "$SERVE_PID" 2>/dev/null
-
-log "== npu generate CLI (one-shot, streams to stdout) =="
-"${NPU_LOCK_ARGV[@]}" "$BIN" --config "$CFG" generate "Say hello in one short sentence." --max-tokens 32 --temperature 0 \
-  2>&1 | tee -a "$TRANSCRIPT"
 
 log "== done, transcript at $TRANSCRIPT =="
