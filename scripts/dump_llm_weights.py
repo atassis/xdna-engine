@@ -47,6 +47,13 @@ def main():
                     help="pack the PROJECTION matrices at this width (norms and the embedding stay "
                          "f32 and readable). bf16 writes the plain f32 dump.")
     ap.add_argument("--quant-group", type=int, default=64)
+    ap.add_argument("--quant-layout", default="header_first",
+                    choices=("header_first", "row_group_planar"),
+                    help="on-wire row layout (iron/common/quant.py). row_group_planar moves the "
+                         "per-row scale out of the row, which is what lets g64 reach a 512-bit "
+                         "load at K=3840 instead of the 128-bit header_first gives it -- see "
+                         "quant.max_legal_vec_size's docstring. ROW_GROUP is DERIVED per tensor "
+                         "(K022), never chosen here.")
     ap.add_argument("--cols", type=int, default=8,
                     help="num_aie_columns the CONSUMER will build with. Only used to decide which "
                          "packed tensors must be pre-chunked over K, via the same k_chunks_for the "
@@ -70,6 +77,7 @@ def main():
 
     quant_leaves = {x for x in a.quant_leaves.split(",") if x}
     quantize_weight = None
+    derive_row_group = None
     if a.quant != "bf16":
         unknown = quant_leaves - set(EXP_LEAVES)
         if unknown:
@@ -78,7 +86,16 @@ def main():
         # Imported from IRON rather than reimplemented here, because the on-wire row layout
         # ([n_groups x f32 scale][packed payload]) is shared with the matvec kernel. A second copy
         # of it is a seam with no owner, which is the class this whole manifest exists to close.
-        from iron.operators.gemv.quant import quantize_weight
+        # The packer MOVED in IRON 6a347dc; try both sides (see gen_llm_decode.py's identical
+        # compat shim). derive_row_group is post-move only -- row_group_planar needs it.
+        try:
+            from iron.common.quant import quantize_weight, derive_row_group
+        except ModuleNotFoundError:
+            from iron.operators.gemv.quant import quantize_weight
+            if a.quant_layout == "row_group_planar":
+                ap.error("--quant-layout row_group_planar needs iron.common.quant "
+                         "(derive_row_group); this IRON tree only has the pre-move "
+                         "iron.operators.gemv.quant. Point IRON at a tree past 6a347dc.")
 
     from huggingface_hub import snapshot_download
     from safetensors import safe_open
@@ -136,6 +153,17 @@ def main():
     want[f"{sp.weight_prefix}embed_tokens.weight"] = None
     exp_per_key[f"{sp.weight_prefix}embed_tokens.weight"] = (V_, D_)
 
+    def _layout_kw(K):
+        """layout=/row_group= kwargs for one tensor's OWN K (post-chunking) -- row_group is a
+        pure function of (K, group_size, dtype), so this always agrees with what GEMV's own
+        __post_init__ derives for a GEMV built at the same K/group/dtype (no shared state, no
+        quant.json round-trip needed for the value itself)."""
+        if a.quant_layout != "row_group_planar":
+            return {}
+        vec = min(64, a.quant_group)
+        return {"layout": a.quant_layout,
+                "row_group": derive_row_group([K], a.quant_group, a.quant, vec_size=vec)}
+
     n, packed = 0, []
     for key in sorted(want):
         w = get(key)
@@ -163,12 +191,13 @@ def main():
                 for i, part in enumerate(np.split(w, nch, axis=1)):
                     name = f"{key}.kchunk{i}"
                     np.save(os.path.join(a.out, f"{name}.npy"),
-                            quantize_weight(np.ascontiguousarray(part), a.quant_group, a.quant))
+                            quantize_weight(np.ascontiguousarray(part), a.quant_group, a.quant,
+                                            **_layout_kw(part.shape[1])))
                     packed.append(name)
                 n += nch - 1
                 continue
             np.save(os.path.join(a.out, f"{key}.npy"),
-                    quantize_weight(w, a.quant_group, a.quant))
+                    quantize_weight(w, a.quant_group, a.quant, **_layout_kw(w.shape[1])))
             packed.append(key)
         else:
             np.save(os.path.join(a.out, f"{key}.npy"), w)
@@ -177,6 +206,7 @@ def main():
     manifest = {
         "dtype": a.quant,
         "group_size": a.quant_group,
+        "layout": a.quant_layout,
         "packed": sorted(packed),
         "note": "packed arrays are np.int8 on-wire bytes, NOT values -- never .astype()",
     }

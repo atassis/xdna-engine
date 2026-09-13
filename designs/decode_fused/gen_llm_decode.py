@@ -107,10 +107,12 @@ from iron.operators.gemv.design import MAX_GROUP_REUSE  # noqa: E402
 # there, say so naming both paths -- a bare ModuleNotFoundError names a module and not the
 # mis-pointed IRON tree, which is the failure scripts/build_llm_decode.sh's gate exists to prevent.
 try:                                                                            # noqa: E402
-    from iron.common.quant import quantize_weight, row_stride_bytes             # noqa: E402
+    from iron.common.quant import (                                            # noqa: E402
+        quantize_weight, row_stride_bytes, derive_row_group)                    # noqa: E402
 except ModuleNotFoundError:                                                     # noqa: E402
     try:                                                                        # noqa: E402
         from iron.operators.gemv.quant import quantize_weight, row_stride_bytes  # noqa: E402
+        derive_row_group = None  # pre-move tree: row_group_planar is unavailable  # noqa: E402
     except ModuleNotFoundError as e:                                            # noqa: E402
         raise ModuleNotFoundError(
             "no weight packer in this IRON tree: tried iron.common.quant (post-6a347dc) and "
@@ -154,12 +156,25 @@ def _spec(site):
     return PRECISION_PLAN.get(site, precision.BF16_SPEC)
 
 
+# Row layout of a quantized weight -- see iron/common/quant.py. Not a site-level precision choice
+# (every site shares one on-wire row shape); set from the dump's own quant.json declaration in
+# build_graph, before any GEMV is constructed, and read here rather than threaded as a parameter
+# because _quant_kw/_pack are module-level and the dump isn't known until a spec_name is chosen.
+_BUILD_STATE = {"layout": "header_first"}
+
+
 def _quant_kw(site):
-    """`weight_dtype`/`group_size` kwargs for the operator carrying one site's weight. Empty at
-    bf16, so an unquantized call is the shape it would have had with no precision plane."""
+    """`weight_dtype`/`group_size`/`layout` kwargs for the operator carrying one site's weight.
+    Empty at bf16, so an unquantized call is the shape it would have had with no precision plane.
+    row_group is deliberately omitted: GEMV self-derives it (K022), and passing it here would be
+    a second, possibly-disagreeing computation of the same value."""
     spec = _spec(site)
-    return {} if not spec.quantized else dict(weight_dtype=spec.dtype,
-                                              group_size=spec.group_size)
+    if not spec.quantized:
+        return {}
+    kw = dict(weight_dtype=spec.dtype, group_size=spec.group_size)
+    if _BUILD_STATE["layout"] != "header_first":
+        kw["layout"] = _BUILD_STATE["layout"]
+    return kw
 
 
 _SITE_OF_SUFFIX = {"Wqkv": "qkv", "Wq": "qkv", "Wk": "qkv", "Wv": "qkv", "Wo": "attn_o",
@@ -183,6 +198,17 @@ def _pack(w, site):
         kw["clip_search"] = spec.scale_kind == "clip"
     else:
         kw["affine_zero_on_grid"] = spec.scale_kind == "zero_grid"
+    layout = _BUILD_STATE["layout"]
+    if layout != "header_first":
+        if derive_row_group is None:
+            raise ModuleNotFoundError(
+                f"_BUILD_STATE layout={layout!r} but this IRON tree has no derive_row_group "
+                f"(pre-6a347dc). Point IRON at a tree past the quant.py move."
+            )
+        K = w.shape[-1]
+        kw["layout"] = layout
+        kw["row_group"] = derive_row_group([K], spec.group_size, spec.dtype,
+                                           vec_size=min(64, spec.group_size))
     return quantize_weight(w, spec.group_size, spec.dtype, **kw)
 
 
@@ -939,7 +965,15 @@ def check_arena_offsets_are_addressable(seq, names):
     )
 def gemv(M, K, ctx, **kw):
     """GEMV tiled as large as both the design asserts AND L1 allow."""
-    tsi, tso = gemv_tile_output(M, K)
+    wdt = kw.get("weight_dtype", "bf16")
+    # gemv_tile_output's default budget assumes a bf16 A row (K*2 B). A quantized row is narrower
+    # -- 1.125*K at int8 g32, K at int8 g64 -- and the bf16 model overstates it by up to 1.78x,
+    # which refuses tile_size_input values a quantized design actually fits (4371511). Row-group
+    # planar makes this load-bearing, not just tighter: a planar block cannot be cut, so
+    # tile_size_input must be a MULTIPLE of the derived row_group, and the overstated bf16 budget
+    # was rejecting exactly the tsi values row_group_planar needs.
+    a_row_bytes = row_stride_bytes(K, kw["group_size"], wdt) if wdt != "bf16" else None
+    tsi, tso = gemv_tile_output(M, K, a_row_bytes=a_row_bytes)
     g = kw.get("group_size", 0)
     if g and g < 64:
         # mv_quant.cc's dequant chunk must not straddle a quant group, and GEMV asserts
@@ -1118,6 +1152,18 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
     _qmf = (json.load(open(_qmf_path)) if os.path.isfile(_qmf_path)
             else {"dtype": "bf16", "group_size": 0, "packed": []})
     PACKED = set(_qmf.get("packed", []))
+    # Layout is not a per-site plan choice (every quantized site shares one on-wire row shape),
+    # so unlike dtype/group_size below there is nothing to conflict-check against -- the dump's
+    # declaration is simply adopted, same as PACKED itself. Old dumps have no "layout" key and
+    # default to header_first, byte-identical to every build before this axis existed.
+    _dump_layout = _qmf.get("layout", "header_first")
+    if _dump_layout not in ("header_first", "row_group_planar"):
+        raise SystemExit(f"{_qmf_path}: unknown layout {_dump_layout!r}")
+    if _dump_layout == "row_group_planar" and derive_row_group is None:
+        raise SystemExit(
+            f"{_qmf_path}: dump is row_group_planar but this IRON tree has no derive_row_group "
+            f"(pre-6a347dc). Point IRON at a tree past the quant.py move.")
+    _BUILD_STATE["layout"] = _dump_layout
     if PACKED and _qmf.get("dtype", "bf16") == "bf16":
         raise SystemExit(f"{_qmf_path}: lists {len(PACKED)} packed tensors but dtype is bf16")
     if PACKED:
