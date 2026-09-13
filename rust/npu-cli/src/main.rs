@@ -985,6 +985,14 @@ struct Declared {
     /// measurement, not a guess, so reading it is exactly what this column is for. Before that it
     /// printed `-` for every LLM, which read as "unquantized" for a model serving int8.
     precision: Option<String>,
+    /// The context window: how many token positions this model can hold. Declared by the scenario's
+    /// `[model].max_seq`; for a `generate`-kind model with a compiled decode artifact, the artifact's
+    /// OWN `dims.S` -- the exact value `DecodeStep::max_context` enforces at generation time -- wins,
+    /// same as `precision` lets the artifact's `weight_quant` win over a bare scenario guess.
+    max_seq: Option<usize>,
+    /// The scenario's OWN declared `max_seq`, kept separately from the (possibly
+    /// artifact-overridden) effective value above -- `context_cell` needs both to report a drift.
+    scenario_max_seq: Option<usize>,
 }
 
 /// The weight format a decode artifact was BUILT at, from its own `meta.json`.
@@ -1012,6 +1020,16 @@ fn declared(root: Option<&PathBuf>, scenario: &str) -> Declared {
     let sc = root
         .map(|r| r.join(scenario))
         .and_then(|p| npu_engine::config::ScenarioConfig::load(&p).ok());
+    let scenario_max_seq = sc.as_ref().and_then(|c| c.model.as_ref().map(|m| m.max_seq));
+    // Best-effort: LlmArtifact::load fails loud on an ACTIVE toolchain-stale mismatch (correct for
+    // the code path that is about to DISPATCH against the ELF), but a listing must never abort just
+    // because one model's artifact is stale -- `.ok()` falls back to the scenario's own declared
+    // value exactly the way `artifact_precision` already falls back to `None` on any read failure.
+    let artifact_max_seq = sc.as_ref()
+        .filter(|c| !c.artifacts.decode.is_empty())
+        .and_then(|c| root.map(|r| r.join(&c.artifacts.decode)))
+        .and_then(|d| npu_engine::llm::LlmArtifact::load(&d).ok())
+        .map(|a| a.max_seq);
     Declared {
         // Through the canonical mapping, not the raw string: a scenario says `kind = "embeddings"`
         // while the capability -- and the live status, and every other surface -- says `embed`.
@@ -1029,6 +1047,8 @@ fn declared(root: Option<&PathBuf>, scenario: &str) -> Declared {
                 let d = &sc.as_ref()?.artifacts.decode;
                 (!d.is_empty()).then(|| artifact_precision(root, d))?
             }),
+        max_seq: artifact_max_seq.or(scenario_max_seq),
+        scenario_max_seq,
     }
 }
 
@@ -1041,6 +1061,18 @@ fn precision_cell(d: &Declared) -> String {
     match std::env::var("NPU_PRECISION").ok().filter(|v| v != p) {
         Some(env) => format!("{p} {{env:{env}}}"),
         None => p.to_string(),
+    }
+}
+
+/// The CONTEXT cell: the effective max_seq (artifact-confirmed when one exists, else the scenario's
+/// bare declaration), with a brace note when the two actually disagree -- same "braces only on a
+/// deviation" rule `precision_cell` follows. Needs BOTH numbers, not just the winner, so it takes the
+/// scenario value separately rather than only `Declared::max_seq`.
+fn context_cell(effective: Option<usize>, scenario_declared: Option<usize>) -> String {
+    let Some(eff) = effective else { return "-".to_string() };
+    match scenario_declared {
+        Some(s) if s != eff => format!("{eff} {{scenario:{s}}}"),
+        _ => eff.to_string(),
     }
 }
 
@@ -1939,9 +1971,9 @@ mod tests {
     fn precision_is_absent_when_the_scenario_declares_none() {
         // An LLM scenario has no `[model]` block -- its precision lives in the decode artifact.
         // Defaulting the column to bf16 there would be a guess printed as a fact.
-        let none = Declared { kind: Some("generate".into()), precision: None };
+        let none = Declared { kind: Some("generate".into()), precision: None, max_seq: None, scenario_max_seq: None };
         assert_eq!(precision_cell(&none), "-");
-        let bf16 = Declared { kind: Some("asr".into()), precision: Some("bf16".into()) };
+        let bf16 = Declared { kind: Some("asr".into()), precision: Some("bf16".into()), max_seq: None, scenario_max_seq: None };
         assert_eq!(precision_cell(&bf16), "bf16");
     }
 
@@ -1952,7 +1984,7 @@ mod tests {
         // threads in one process.
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let d = Declared { kind: Some("asr".into()), precision: Some("bf16".into()) };
+        let d = Declared { kind: Some("asr".into()), precision: Some("bf16".into()), max_seq: None, scenario_max_seq: None };
 
         std::env::remove_var("NPU_PRECISION");
         assert_eq!(precision_cell(&d), "bf16", "no override, no braces");
@@ -2283,6 +2315,19 @@ mod tests {
                 name: (*n).into(), scenario: "x".into(), resident: *r }).collect(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn declared_reports_max_seq_from_the_scenario_when_no_artifact_speaks() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("s.toml"), concat!(
+            "[scenario]\nkind = \"embeddings\"\nname = \"x\"\n",
+            "[model]\nhidden = 768\nff = 3072\nn_heads = 12\nhead_dim = 64\n",
+            "n_layers = 12\nmax_seq = 512\n",
+            "[artifacts]\n",
+        )).unwrap();
+        let d = declared(Some(&dir.path().to_path_buf()), "s.toml");
+        assert_eq!(d.max_seq, Some(512), "an embed scenario has no decode artifact to override it");
     }
 
     #[test]
