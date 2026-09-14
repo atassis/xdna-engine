@@ -38,6 +38,7 @@ from verify_llm_decode import window_len, rope_row  # noqa: E402 -- one owner fo
 from gen_llm_decode import (build_graph, report_artifact_freshness,  # noqa: E402
                             load_weight_buffer, isolate_build_dir)
 from iron.common.kv_layout import KVLayout  # noqa: E402
+from llm_decode_spec import SPECS  # noqa: E402
 
 BF16 = ml_dtypes.bfloat16
 
@@ -58,12 +59,11 @@ def main():
     ap.add_argument("--spec", required=True)
     ap.add_argument("--weights", required=True)
     ap.add_argument("--text", default=None, help="UTF-8 corpus file, tokenized here with QwenBPE "
-                                                 "-- Qwen-family specs only")
+                                                 "-- only for specs in qwen_bpe's "
+                                                 "TEXT_TOKENIZER_HINT; others must use --ids")
     ap.add_argument("--ids", default=None, help="pre-tokenized ids (tokenize_corpus.py's json "
-                                                "output), for a spec QwenBPE cannot read (e.g. "
-                                                "Gemma's Split pretokenizer). LOCAL, UNCOMMITTED "
-                                                "harness patch -- see wt-g4-qual's e50f2ce, never "
-                                                "ported to main (899354e).")
+                                                "output). The only route for a spec QwenBPE "
+                                                "cannot read, e.g. Gemma's Split pretokenizer.")
     ap.add_argument("--tokenizer", default=None, help="tokenizer.json (default: the HF cache)")
     ap.add_argument("--ref", default=None, help="oracle json; if given, the tokenizer self-tests "
                                                 "against its prompt_ids before anything runs")
@@ -81,19 +81,32 @@ def main():
     if a.ids:
         ids = json.load(open(a.ids))
         corpus_name = os.path.basename(a.ids)
+        tokenizer_prov = f"pre-tokenized ({corpus_name})"
     else:
-        tj = a.tokenizer or os.path.expanduser(
-            "~/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots")
+        from qwen_bpe import QwenBPE, self_test, text_tokenizer_hint
+        tj = a.tokenizer or text_tokenizer_hint(a.spec)
+        if tj is None:
+            raise SystemExit(
+                f"[ppl] --text cannot read {a.spec}: QwenBPE parses a Qwen-style tokenizer.json "
+                f"and this spec's is not one. Pre-tokenize with tokenize_corpus.py and pass "
+                f"--ids. (Defaulting to another spec's tokenizer is what scored Gemma text "
+                f"against a Qwen vocabulary: NLL 19.836 against a 12.477 uniform, top-1 0.0.)")
         if os.path.isdir(tj):
             tj = os.path.join(tj, sorted(os.listdir(tj))[0], "tokenizer.json")
-        from qwen_bpe import QwenBPE, self_test
         if a.ref:
             self_test(tj, a.ref)
             print(f"[ppl] tokenizer self-test PASS against {os.path.basename(a.ref)}")
         tok = QwenBPE(tj)
         ids = tok.encode(open(a.text, encoding="utf-8").read())
         corpus_name = os.path.basename(a.text)
-    print(f"[ppl] corpus {corpus_name}: {len(ids)} tokens")
+        tokenizer_prov = tj
+    # An id the model has no embedding row for is a corpus/spec mismatch, and the run that
+    # follows would look like a quality result rather than a wrong one.
+    _vocab = SPECS[a.spec].vocab
+    if max(ids) >= _vocab:
+        raise SystemExit(f"[ppl] corpus {corpus_name} has id {max(ids)} against {a.spec}'s "
+                         f"vocab {_vocab} -- wrong tokenizer for this spec")
+    print(f"[ppl] corpus {corpus_name}: {len(ids)} tokens, tokenizer {tokenizer_prov}")
 
     sp, fused, weights, md = build_graph(a.spec, a.weights, a.layers, a.max_seq)
     S, HD, D, VOCAB = md["S"], sp.head_dim, sp.d_model, sp.vocab
@@ -194,6 +207,9 @@ def main():
     mean_nll = float(np.mean(nll))
     res = {
         "spec": sp.name, "layers": md["NL"], "text": corpus_name,
+        # Which tokenizer produced the ids. Absent from every run recorded before 2026-09-14, so
+        # a wrong-vocabulary run could not be told from a bad-weights one after the fact.
+        "tokenizer": tokenizer_prov,
         "logit_softcap": sp.logit_softcap, "softcap_saturated_frac": n_sat / (n * VOCAB),
         "n_scored": n, "mean_nll": mean_nll, "perplexity": math.exp(mean_nll),
         "top1_acc": top1_hits / n, "median_nll": float(np.median(nll)),
