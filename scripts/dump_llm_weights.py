@@ -198,7 +198,9 @@ def main():
               "scale_dtype": a.quant_scale_dtype}
         if a.quant_layout != "row_group_planar":
             return kw
-        vec = min(64, a.quant_group)
+        # Same rule the operator derives row_group from -- see widest_chunk's docstring.
+        from iron.common.quant import widest_chunk
+        vec = widest_chunk(a.quant_group, a.quant)
         kw.update(layout=a.quant_layout,
                   row_group=derive_row_group([K], a.quant_group, a.quant, vec_size=vec))
         return kw

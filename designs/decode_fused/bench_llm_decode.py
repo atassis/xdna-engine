@@ -47,7 +47,11 @@ import time
 
 import numpy as np
 
-from verify_llm_decode import window_len  # one owner for the formula; see its docstring
+# One owner for each, same as eval_llm_perplexity.py; see their docstrings. The rope_row copy
+# that used to live in this file said "copied verbatim from verify_llm_decode.py" and had since
+# drifted: it never grew the `partial` argument, so on a partial-rotary spec it computed a
+# different angle row than the gate it is supposed to be timing.
+from verify_llm_decode import window_len, rope_row  # noqa: E402
 import ml_dtypes
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -56,17 +60,6 @@ from gen_llm_decode import build_graph, report_artifact_freshness, load_weight_b
 from iron.common.kv_layout import KVLayout  # noqa: E402
 
 BF16 = ml_dtypes.bfloat16
-
-
-def rope_row(pos, head_dim, theta):
-    """Copied verbatim from verify_llm_decode.py -- see that file for the layout note."""
-    half = head_dim // 2
-    inv = 1.0 / (theta ** (np.arange(0, head_dim, 2, dtype=np.float64)[:half] / head_dim))
-    ang = pos * inv
-    row = np.empty(head_dim, dtype=np.float32)
-    row[0::2] = np.cos(ang)
-    row[1::2] = np.sin(ang)
-    return row.astype(BF16)
 
 
 def now():
@@ -152,11 +145,27 @@ def main():
     c.scratch_buffer.to("npu")
     print(f"[bench] weight load: {now() - t0:.1f}s ({len(weights)} buffers)", flush=True)
 
-    embed = np.load(os.path.join(a.weights, "model.embed_tokens.weight.npy")).astype(np.float32)
+    # The prefix comes off the spec, as it does in verify_llm_decode.py and
+    # eval_llm_perplexity.py: it is "model." on a text-only checkpoint and
+    # "model.language_model." on Gemma-4, whose text stack sits beside a vision and audio tower.
+    embed = np.load(os.path.join(
+        a.weights, f"{sp.weight_prefix}embed_tokens.weight.npy")).astype(np.float32)
     scale = np.sqrt(D) if sp.embed_scale == "sqrt_d_model" else 1.0
 
     xin = c.get_buffer("x")
-    rope_buf = c.get_buffer("rope_global")
+    # Every per-position input this graph declares, driven the way verify_llm_decode.py and
+    # eval_llm_perplexity.py drive it. A dual-theta spec declares a SECOND angle buffer for its
+    # sliding layers, and under per-layer geometry the two differ in WIDTH -- so each row comes
+    # off its own buffer's size, never off sp.head_dim, which is a single value this model does
+    # not have.
+    rope_g = c.get_buffer("rope_global") if "rope_global" in md["inputs"] else None
+    rope_l = c.get_buffer("rope_local") if "rope_local" in md["inputs"] else None
+    # One (kv_off, sm_mask) pair per distinct GEOMETRY. The single-slot form below is the
+    # fallback for a build that predates geom_slots; see gen_llm_decode.py's geom_slots comment
+    # for why kv_slots and mask_slots cannot be zipped positionally.
+    geom_slots = md.get("geom_slots") or [("kv_off", HD, S, "sm_mask")]
+    geoms = [(nm, KVLayout(Hkv=sp.n_kv_heads, S=ww, HD=hd, T=min(T, ww)), ww, mn)
+             for nm, hd, ww, mn in geom_slots]
     out = c.get_buffer("logits")
 
     # ---- instrumentation: wrap THIS instance's methods, no tracked file touched ----
@@ -192,11 +201,17 @@ def main():
         with xin.overwrite() as _buf:
             _buf[:] = np.asarray(embed[tok] * scale, BF16).reshape(-1)
         t1 = now()
-        with rope_buf.overwrite() as _buf:
-            _buf[:] = rope_row(pos, HD, sp.rope_theta_global).reshape(-1)
+        if rope_g is not None:
+            with rope_g.overwrite() as _buf:
+                _buf[:] = rope_row(pos, _buf.size, sp.rope_theta_global,
+                                   sp.rope_partial_rotary).reshape(-1)
+        if rope_l is not None:
+            with rope_l.overwrite() as _buf:
+                _buf[:] = rope_row(pos, _buf.size, sp.rope_theta_local).reshape(-1)
         t2 = now()
-        params.write("kv_off", int(kv_layout.kv_off(pos)))
-        params.write("sm_mask", int(pos + 1))
+        for _slot, _kvl, _ww, _mask in geoms:
+            params.write(_slot, int(_kvl.kv_off(pos % _ww)))
+            params.write(_mask, min(pos + 1, _ww))
         # The attended length, when the build declared a runtime window. Timing this graph with
         # attn_window UNWRITTEN would not merely be inaccurate -- the core bounds both KV-chunk
         # loops on it, so it would time a garbage window. Raw value, no shift: ParameterScratchpad

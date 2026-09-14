@@ -59,6 +59,11 @@ def main():
                          "With this set, device-vs-reference exact parity isolates the "
                          "IMPLEMENTATION, and the format's cost is a separate host measurement.")
     ap.add_argument("--quant-group", type=int, default=128)
+    ap.add_argument("--quant-from", default=None, metavar="WEIGHTS_DIR",
+                    help="adopt every format axis from this dump's quant.json -- dtype, group, "
+                         "layout, scale width, and the calibration flags. The reference and the "
+                         "device build then cannot disagree about the format, which is the only "
+                         "way a parity miss means what it claims to.")
     ap.add_argument("--quant-leaves", default="gate_proj,up_proj,down_proj,o_proj,q_proj,k_proj,v_proj",
                     help="projection leaves to quantize; must match what the build quantizes "
                          "(QUANT_MLP/ATTN/QKV_DTYPE, or the dump's quant.json)")
@@ -121,7 +126,44 @@ def main():
         import numpy as np
         sys.path.insert(0, os.environ.get("IRON_DIR", os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "..", "wt-iron-integ")))
-        from iron.operators.gemv.quant import quantize_weight, dequantize_weight
+        # Loaded as a FILE, not imported as `iron.common.quant`: that package's __init__ pulls in
+        # `aie`, the on-device toolchain, which a host-only reference has no business needing and
+        # this venv deliberately does not carry. quant.py itself is numpy + ml_dtypes.
+        import importlib.util
+        _iron = os.environ.get("IRON_DIR") or os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "..", "wt-iron-integ")
+        _qp = os.path.join(_iron, "iron", "common", "quant.py")
+        if not os.path.isfile(_qp):  # pre-6a347dc tree, before the packer moved
+            _qp = os.path.join(_iron, "iron", "operators", "gemv", "quant.py")
+        if not os.path.isfile(_qp):
+            raise SystemExit(f"no packer at {_qp} -- set IRON_DIR to a checkout that has one")
+        _sp = importlib.util.spec_from_file_location("_packer", _qp)
+        _pk = importlib.util.module_from_spec(_sp)
+        _sp.loader.exec_module(_pk)
+        quantize_weight, dequantize_weight = _pk.quantize_weight, _pk.dequantize_weight
+        derive_row_group = getattr(_pk, "derive_row_group", None)
+
+        # The format the DEVICE will read, taken from the dump rather than restated here. A
+        # reference built at a different width or level range charges the device for the gap
+        # between two host-side choices -- which is what this flag exists to make impossible.
+        qkw, dkw = {}, {"emulate_kernel_scale_cast": True}
+        if a.quant_from:
+            _mf = json.load(open(os.path.join(a.quant_from, "quant.json")))
+            a.quant_dtype, a.quant_group = _mf["dtype"], int(_mf["group_size"])
+            _layout = _mf.get("layout", "header_first")
+            _sd = _mf.get("scale_dtype", "f32")
+            qkw["full_range"] = bool(_mf.get("full_range", False))
+            qkw["clip_search"] = bool(_mf.get("clip_search", False))
+            if _sd != "f32":
+                qkw["scale_dtype"] = dkw["scale_dtype"] = _sd
+            if _layout != "header_first":
+                if derive_row_group is None:
+                    raise SystemExit(f"{a.quant_from}: layout={_layout} needs a tree with "
+                                     f"iron.common.quant.derive_row_group")
+                qkw["layout"] = dkw["layout"] = _layout
+            print(f"[ref] format from {a.quant_from}/quant.json: {a.quant_dtype} g{a.quant_group} "
+                  f"{_layout} scale={_sd} full_range={qkw['full_range']} "
+                  f"clip_search={qkw['clip_search']}")
 
         leaves = {x for x in a.quant_leaves.split(",") if x}
         errs, skipped = [], []
@@ -134,8 +176,14 @@ def main():
                 if W.shape[1] % a.quant_group:
                     skipped.append(name)
                     continue
-                Wq = dequantize_weight(quantize_weight(W, a.quant_group, a.quant_dtype),
-                                       *W.shape, a.quant_group, a.quant_dtype)
+                _kw, _dkw = dict(qkw), dict(dkw)
+                if "layout" in _kw:
+                    _rg = derive_row_group([W.shape[1]], a.quant_group, a.quant_dtype,
+                                           vec_size=min(64, a.quant_group),
+                                           scale_dtype=_dkw.get("scale_dtype", "f32"))
+                    _kw["row_group"] = _dkw["row_group"] = _rg
+                Wq = dequantize_weight(quantize_weight(W, a.quant_group, a.quant_dtype, **_kw),
+                                       *W.shape, a.quant_group, a.quant_dtype, **_dkw)
                 errs.append(float(np.linalg.norm(Wq - W) / max(np.linalg.norm(W), 1e-30)))
                 mod.weight.copy_(torch.from_numpy(Wq).to(model.dtype))
                 del W, Wq
