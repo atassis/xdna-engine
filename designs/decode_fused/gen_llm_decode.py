@@ -989,6 +989,19 @@ def gemv(M, K, ctx, **kw):
     # was rejecting exactly the tsi values row_group_planar needs.
     a_row_bytes = row_stride_bytes(K, kw["group_size"], wdt) if wdt != "bf16" else None
     tsi, tso = gemv_tile_output(M, K, a_row_bytes=a_row_bytes)
+    if kw.get("layout") == "row_group_planar":
+        # The free search picks tsi for the LARGEST legal C tile, which can be SMALLER than the
+        # row_group needs -- a planar block cannot be cut, so tsi must be a MULTIPLE of it
+        # (K022), but a smaller tsi frees L1 budget quadratically (gemv_tile_output's own
+        # docstring) and can win on tile size anyway. Measured at the lm-head shape (M=262144,
+        # K=3840, row_group=4): free search returns tsi=1 (8192-elt C tile) over tsi=4's legal
+        # 2048-elt one, because 1 has the bigger tile -- and GEMV.__post_init__'s own
+        # derive_row_group then refuses it. Pin tsi to the row_group only when the free answer
+        # would violate it; every site whose free answer already clears this (mlp/attn_o/qkv, as
+        # built and shipped) takes the same tsi as today, unchanged.
+        rg = derive_row_group([K], kw["group_size"], wdt, vec_size=min(64, kw["group_size"]))
+        if tsi % rg:
+            tsi, tso = gemv_tile_output(M, K, a_row_bytes=a_row_bytes, tsi=rg)
     g = kw.get("group_size", 0)
     if g and g < 64:
         # mv_quant.cc's dequant chunk must not straddle a quant group, and GEMV asserts
@@ -1167,6 +1180,12 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
     _qmf = (json.load(open(_qmf_path)) if os.path.isfile(_qmf_path)
             else {"dtype": "bf16", "group_size": 0, "packed": []})
     PACKED = set(_qmf.get("packed", []))
+    # The tied head/embedding packs into its OWN sidecar name (dump_llm_weights.py's
+    # _pack_head_chunked), never the bare key -- unlike mlp/attn_o/qkv the base f32 tensor always
+    # stays on disk too (the host embedding-gather reads it), so membership has to be checked by
+    # this exact name rather than assumed from PACKED being non-empty.
+    _head_key = f"{sp.weight_prefix}embed_tokens.weight"
+    _head_packed = f"{_head_key}.headpack" in PACKED
     # Layout is not a per-site plan choice (every quantized site shares one on-wire row shape),
     # so unlike dtype/group_size below there is nothing to conflict-check against -- the dump's
     # declaration is simply adopted, same as PACKED itself. Old dumps have no "layout" key and
@@ -1198,7 +1217,17 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                     f"Drop {_site!r} from the plan to take the dump's, or re-dump at the format "
                     f"you want.")
             PRECISION_PLAN[_site] = _dump_spec
-        print(f"[gen] packed dump is the authority: {_mdt} g{_mgs} at mlp/attn_o/qkv")
+        if _head_packed:
+            _cur = PRECISION_PLAN.get("head", precision.BF16_SPEC)
+            if _cur.quantized and (_cur.dtype, _cur.group_size) != (_mdt, _mgs):
+                raise SystemExit(
+                    f"the precision plan asks for {_cur} at site 'head', but {_qmf_path} carries "
+                    f"a packed head sidecar at {_mdt} g{_mgs} and the build cannot re-choose the "
+                    f"format. Drop 'head' from the plan to take the dump's, or re-dump at the "
+                    f"format you want.")
+            PRECISION_PLAN["head"] = _dump_spec
+        print(f"[gen] packed dump is the authority: {_mdt} g{_mgs} at mlp/attn_o/qkv"
+             + ("+head" if _head_packed else ""))
 
     def load_norm(name):
         # Gemma-3 stores RMSNorm gain as w with the kernel computing x_hat*(1+w); Qwen3 stores it
@@ -2169,7 +2198,11 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
     # 2 KB row it gathers.
     embed_blob, host_embed = "W_head", None
     if _spec("head").quantized:
-        weights["W_head"] = _pack(embed_f32, "head")
+        # Pre-packed by the dump when available (_head_packed) -- read the bytes straight off
+        # disk rather than re-quantizing here, which is what OOM'd on Gemma-4-12B's 262144x3840
+        # table (dump_llm_weights.py's _pack_head_chunked does the same math in row chunks).
+        weights["W_head"] = npy_raw(f"{_head_key}.headpack") if _head_packed else \
+            _pack(embed_f32, "head")
         embed_blob = "W_embed"
         host_embed = bf16(embed_f32).reshape(-1)
     else:

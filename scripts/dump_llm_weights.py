@@ -36,6 +36,11 @@ HF_REPO = {"qwen3-0.6b": "Qwen/Qwen3-0.6B", "gemma3-270m": "unsloth/gemma-3-270m
 # embedding table. Only these are packable.
 EXP_LEAVES = ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj")
 
+# The tied embedding/lm-head. Handled separately from EXP_LEAVES: it always stays dumped f32 (the
+# host embedding-gather reads it directly), and packing it ADDS a sidecar rather than replacing
+# the array -- see _pack_head_chunked.
+HEAD_LEAF = "embed_tokens"
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -44,8 +49,9 @@ def main():
     ap.add_argument("--repo", default=None, help="override the HF repo id")
     ap.add_argument("--layers", type=int, default=None)
     ap.add_argument("--quant", default="bf16", choices=("bf16", "int4", "int8"),
-                    help="pack the PROJECTION matrices at this width (norms and the embedding stay "
-                         "f32 and readable). bf16 writes the plain f32 dump.")
+                    help="pack the PROJECTION matrices at this width (norms stay f32 and readable; "
+                         "the embedding stays f32 and readable too unless --quant-leaves names "
+                         "'embed_tokens'). bf16 writes the plain f32 dump.")
     ap.add_argument("--quant-group", type=int, default=64)
     ap.add_argument("--quant-layout", default="header_first",
                     choices=("header_first", "row_group_planar"),
@@ -65,7 +71,8 @@ def main():
     # than quietly widening the bytes.
     ap.add_argument("--quant-leaves", default="gate_proj,up_proj,down_proj,o_proj",
                     help="comma-separated projection leaves to pack (default: the ones the "
-                         "generator can read back)")
+                         "generator can read back). Add 'embed_tokens' to also pack the tied "
+                         "lm-head/embedding into a '<key>.headpack' sidecar (P009).")
     a = ap.parse_args()
     sp = SPECS[a.spec]
     repo = a.repo or HF_REPO[a.spec]
@@ -79,10 +86,10 @@ def main():
     quantize_weight = None
     derive_row_group = None
     if a.quant != "bf16":
-        unknown = quant_leaves - set(EXP_LEAVES)
+        unknown = quant_leaves - set(EXP_LEAVES) - {HEAD_LEAF}
         if unknown:
-            ap.error(f"--quant-leaves has non-projection leaves {sorted(unknown)}; "
-                     f"expected a subset of {sorted(EXP_LEAVES)}")
+            ap.error(f"--quant-leaves has unknown leaves {sorted(unknown)}; expected a subset of "
+                     f"{sorted(EXP_LEAVES)} plus {HEAD_LEAF!r}")
         # Imported from IRON rather than reimplemented here, because the on-wire row layout
         # ([n_groups x f32 scale][packed payload]) is shared with the matvec kernel. A second copy
         # of it is a seam with no owner, which is the class this whole manifest exists to close.
@@ -164,6 +171,25 @@ def main():
         return {"layout": a.quant_layout,
                 "row_group": derive_row_group([K], a.quant_group, a.quant, vec_size=vec)}
 
+    # Row-chunk budget for packing the tied head/embedding -- bounds quantize_weight's OWN
+    # transient arrays (its abs/div/round/clip/astype chain each allocates a full chunk-sized f32
+    # temporary) regardless of K. A dense call over Gemma-4-12B's 262144x3840 table peaks near
+    # 22 GiB and OOMs a 30 GiB box; chunked, each temporary is ~64 MiB. Quantization is per-row
+    # (a group never spans rows) and row_group_planar's block rearrange is per ROW_GROUP-row
+    # block, so any chunk size that is a multiple of row_group concatenates byte-for-byte equal
+    # to one dense call -- this is a memory fix, not a format change.
+    HEAD_CHUNK_BUDGET_BYTES = 64 * 1024 * 1024
+
+    def _pack_head_chunked(w):
+        M, K = w.shape
+        row_group = _layout_kw(K).get("row_group", 1)
+        chunk_rows = max(row_group,
+                         (HEAD_CHUNK_BUDGET_BYTES // (K * 4) // row_group) * row_group)
+        parts = [quantize_weight(w[r0:min(r0 + chunk_rows, M)], a.quant_group, a.quant,
+                                 **_layout_kw(K))
+                for r0 in range(0, M, chunk_rows)]
+        return np.concatenate(parts)
+
     n, packed = 0, []
     for key in sorted(want):
         w = get(key)
@@ -173,7 +199,16 @@ def main():
             raise ValueError(f"{key}: shape {w.shape} != expected {want_shape} for spec {sp.name}")
         # Shapes are checked ABOVE, on the f32 array, before any packing -- a packed tensor is a
         # flat byte run and has no shape left to check.
-        if quantize_weight is not None and leaf in quant_leaves:
+        if leaf == HEAD_LEAF:
+            # Always dumped f32 -- the host's embedding-gather table reads this file directly,
+            # tied or not (P009). Packing ADDS a sidecar rather than replacing it.
+            np.save(os.path.join(a.out, f"{key}.npy"), w)
+            if quantize_weight is not None and HEAD_LEAF in quant_leaves:
+                sidecar = f"{key}.headpack"
+                np.save(os.path.join(a.out, f"{sidecar}.npy"), _pack_head_chunked(w))
+                packed.append(sidecar)
+                n += 1
+        elif quantize_weight is not None and leaf in quant_leaves:
             # PRE-CHUNK before packing when the generator will split this tensor over K.
             # A packed tensor is a flat byte run with no axis left to slice, so a K-split
             # CANNOT happen after quantizing -- it would cut through a quantization group and
