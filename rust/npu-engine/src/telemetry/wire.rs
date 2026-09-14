@@ -184,7 +184,9 @@ pub fn summary_line(r: &GenerationReport, m: &RunMeta, reason: FinishReason) -> 
         "object": "npu.run.summary",
         "id": m.id,
         "model": m.model,
-        "finish_reason": reason.as_str(),
+        // `name`, not `as_str`: this log is ours and is read to explain a run, so "the operator
+        // stopped it" must not arrive indistinguishable from "it finished".
+        "finish_reason": reason.name(),
         "usage": {
             "prompt_tokens": s.prompt_tokens,
             "completion_tokens": s.completion_tokens,

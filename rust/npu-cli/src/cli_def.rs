@@ -154,6 +154,13 @@ pub enum Cmd {
     },
     /// Live view of the device: who is resident, who is serving, and where the time went.
     ///
+    /// Stop the generation the device is currently running.
+    ///
+    /// Answered out-of-band, like `top` and `model ls`: it does NOT queue behind the work it is
+    /// stopping, which is the point -- the actor is exactly what is busy. The generation ends
+    /// within one dispatch (~0.5 s on a large model) and whatever was waiting for the device is
+    /// then serviced normally. Says so and exits 0 when nothing is running.
+    Cancel,
     /// `docker stats` for the NPU. Reads the control socket's status snapshot -- answered
     /// out-of-band, so nothing here can hang on a busy device -- and refreshes in place. With the
     /// service down it says so rather than showing an empty table.
@@ -398,6 +405,12 @@ pub enum ModelCmd {
     Stop {
         /// The resident model whose device memory to release.
         model: String,
+        /// Leave a running generation alone instead of cancelling it.
+        ///
+        /// The default is a HARD stop: a generation on this model is cancelled first, so `stop`
+        /// does what it says. `--soft` queues for the device the ordinary way instead, and reports
+        /// the model busy rather than interrupting whoever is using it.
+        #[arg(long)] soft: bool,
     },
     /// Enable a model: always on. Admitted before any on-demand model at boot/reload, exempt from
     /// idle unload, never chosen as an eviction victim.

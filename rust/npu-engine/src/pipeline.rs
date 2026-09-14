@@ -304,8 +304,25 @@ impl GenerateParams {
 }
 
 impl FinishReason {
-    /// The wire name. `Aborted` reports as `stop`: OpenAI has no vocabulary for "the client hung
-    /// up", and by the time it matters nobody is reading the field.
+    /// The TRUE name, for surfaces that are ours. Distinct from [`as_str`](Self::as_str), which is
+    /// constrained to OpenAI's four values and cannot say `aborted` at all.
+    ///
+    /// Worth the second method because the two now disagree about something a reader needs: a run
+    /// the operator stopped and a run that finished are the same `stop` on the wire.
+    pub fn name(self) -> &'static str {
+        match self {
+            FinishReason::Aborted => "aborted",
+            other => other.as_str(),
+        }
+    }
+
+    /// The wire name. `Aborted` reports as `stop`, because OpenAI's vocabulary is
+    /// `stop|length|tool_calls|content_filter|function_call` and none of them mean "stopped early".
+    ///
+    /// This used to be justified by "nobody is reading the field" -- true while an abort only ever
+    /// meant the client had left. It stopped being true when `npu model stop` became a hard stop:
+    /// that client IS still reading, and to it a cancelled generation looks like a finished one.
+    /// The wire value stays standard; [`name`](Self::name) is what our own surfaces record.
     pub fn as_str(self) -> &'static str {
         match self {
             FinishReason::Stop | FinishReason::Aborted => "stop",

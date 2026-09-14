@@ -113,6 +113,7 @@ fn run(cli: &Cli, path: &Path) -> Result<()> {
         Cmd::Chat { prompt, model, sampling, no_stream } =>
             chat(prompt.as_deref(), model.as_deref(), sampling, *no_stream, as_json),
         Cmd::Embed { text, model } => embed(text, model.as_deref(), as_json),
+        Cmd::Cancel => cancel_running(path),
         Cmd::Top { interval, once } => top(*interval, *once),
         Cmd::Stats { log, diff } => stats_cmd(log, diff.as_deref()),
         Cmd::Replay { log, realtime, frames } => replay_cmd(log, *realtime, *frames),
@@ -1162,7 +1163,7 @@ fn model_cmd(path: &Path, action: &ModelCmd, as_json: bool) -> Result<()> {
         ModelCmd::Ls { json, verbose } => model_ls(path, *json || as_json, *verbose),
         ModelCmd::Show { model, json } => model_show(path, model, *json || as_json),
         ModelCmd::Start { model } => model_start(path, model),
-        ModelCmd::Stop { model } => model_stop(path, model),
+        ModelCmd::Stop { model, soft } => model_stop(path, model, *soft),
         // Enable/Disable/Add/Rm/Default all edit engine.toml (or ask the running service to);
         // `--no-reload` isn't exposed on `npu model` today (it lived on `npu config` because only
         // config-shaped edits needed it) -- these five always reconcile, matching `pin`'s existing
@@ -1553,6 +1554,20 @@ fn edit_via_service(addr: &str, m: &ModelMutation) -> Result<String> {
 /// ordinary, and the edit is still saved. Nor is a failed reload: the file is already written, so
 /// reporting the failure and exiting 0 tells the truth (the edit landed, the running service did
 /// not take it) where a non-zero exit would suggest the edit did not.
+/// `npu cancel`. Nothing to cancel is not an error: an operator racing the end of a generation
+/// must not be told something failed for winning the race.
+fn cancel_running(path: &Path) -> Result<()> {
+    let addr = resolve_http_addr(&load_cfg(path)?);
+    let body = http_post(&addr, "/admin/cancel", "")
+        .context(Tagged(Code::NoService, "cancel (is the server running?)".into()))?;
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+    match v.get("model").and_then(|m| m.as_str()) {
+        Some(m) => println!("{m}: generation cancelled"),
+        None => println!("nothing is running"),
+    }
+    Ok(())
+}
+
 fn apply_now(cfg: &Config) -> Result<()> {
     let addr = resolve_http_addr(cfg);
     if !listener_is_ours(&addr) {
@@ -1613,14 +1628,21 @@ fn model_start(path: &Path, model: &str) -> Result<()> {
     Ok(())
 }
 
-fn model_stop(path: &Path, model: &str) -> Result<()> {
+fn model_stop(path: &Path, model: &str, soft: bool) -> Result<()> {
     let addr = resolve_http_addr(&load_cfg(path)?);
-    let body = http_post(&addr, &format!("/admin/models/{model}/unload"), "")
+    let req = match soft { true => "{\"soft\":true}", false => "" };
+    let body = http_post(&addr, &format!("/admin/models/{model}/unload"), req)
         .context(Tagged(Code::NoService, "unload (is the server running?)".into()))?;
     let v: serde_json::Value = serde_json::from_str(&body)
         .with_context(|| format!("unexpected reply: {body}"))?;
     if let Some(e) = v.get("error").and_then(|e| e.as_str()) { return Err(admin_err(e, &addr)) }
-    println!("{model}: {}", match v.get("released").and_then(|x| x.as_bool()) {
+    // Say when a generation was interrupted. A stop that silently killed someone's request and
+    // reported only "released" would hide the one consequence worth knowing about.
+    let note = match v.get("cancelled").and_then(|x| x.as_bool()) {
+        Some(true) => " (cancelled a running generation)",
+        _ => "",
+    };
+    println!("{model}: {}{note}", match v.get("released").and_then(|x| x.as_bool()) {
         Some(true) => "released",
         _ => "was not resident",
     });

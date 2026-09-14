@@ -143,10 +143,17 @@ impl SseStream {
         }
     }
     fn render_done(&self, reason: FinishReason) -> String {
+        // OpenAI's `finish_reason` cannot say "stopped early" -- its vocabulary has no such value --
+        // so a cancelled generation reports `stop` there and carries the truth beside it. Without
+        // this a client whose run an operator killed sees a completion that merely looks short.
+        let cut = match reason {
+            FinishReason::Aborted => ",\"x_npu_finish\":\"aborted\"",
+            _ => "",
+        };
         match self.kind {
             SseKind::Chat => format!(
                 "{{\"id\":\"{}\",\"object\":\"chat.completion.chunk\",\"created\":{},\"model\":\"{}\",\
-                 \"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"{}\"}}]}}",
+                 \"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"{}\"}}]{cut}}}",
                 self.id, self.created, parse::json_escape(&self.model), reason.as_str()),
             SseKind::Completion => format!(
                 "{{\"id\":\"{}\",\"object\":\"text_completion\",\"created\":{},\"model\":\"{}\",\
@@ -245,6 +252,10 @@ pub fn route(req: &Request, handle: &Handle, cfg_path: &Path) -> Response {
         ("POST", "/v1/audio/speech") => audio_speech(req, handle),
         ("POST", "/v1/audio/transcriptions") => transcriptions(req, handle),
         ("POST", "/v1/audio/diarizations") => diarizations(req, handle),
+        // Deliberately BEFORE the reload/model routes and deliberately not going through the
+        // actor: this is the one command whose whole purpose is to be answerable while the actor
+        // is busy.
+        ("POST", "/admin/cancel") => admin_cancel(handle),
         ("POST", "/admin/reload") => admin_reload(handle, cfg_path),
         ("POST", "/admin/models") => admin_add_model(req, handle, cfg_path),
         ("POST", "/admin/defaults") => admin_set_default(req, handle, cfg_path),
@@ -257,7 +268,7 @@ pub fn route(req: &Request, handle: &Handle, cfg_path: &Path) -> Response {
         ("POST", p) if p.starts_with("/admin/models/") && p.ends_with("/load") =>
             admin_load(&p["/admin/models/".len()..p.len() - "/load".len()], handle),
         ("POST", p) if p.starts_with("/admin/models/") && p.ends_with("/unload") =>
-            admin_unload(&p["/admin/models/".len()..p.len() - "/unload".len()], handle),
+            admin_unload(&p["/admin/models/".len()..p.len() - "/unload".len()], req, handle),
         ("POST", p) if p.starts_with("/admin/models/") && p.ends_with("/bake") =>
             admin_bake(&p["/admin/models/".len()..p.len() - "/bake".len()], req, handle),
         ("DELETE", p) if p.starts_with("/admin/models/") =>
@@ -699,6 +710,16 @@ fn admin_set_default(req: &Request, handle: &Handle, cfg_path: &Path) -> Respons
 /// 409 rather than 400 at capacity: the request is well-formed and the server understood it, the
 /// state just conflicts. A client can act on that (unload something, raise the cap) where a 400
 /// would tell it to fix its request.
+/// Stop the running generation. 200 either way -- "there was nothing to cancel" is an answer, not
+/// a failure, and a caller racing the end of a generation must not see an error for winning.
+fn admin_cancel(handle: &Handle) -> Response {
+    match handle.cancel_current() {
+        Some(model) => (200, format!(
+            "{{\"cancelled\":true,\"model\":\"{}\"}}", parse::json_escape(&model)).into()),
+        None => (200, "{\"cancelled\":false}".into()),
+    }
+}
+
 fn admin_load(name: &str, handle: &Handle) -> Response {
     match handle.load(name) {
         Ok(r) => (200, format!(
@@ -714,9 +735,22 @@ fn admin_load(name: &str, handle: &Handle) -> Response {
 
 /// Release a model's device memory, keeping its config entry. `released: false` means it was not
 /// resident -- not an error: the caller asked for a state and that state already holds.
-fn admin_unload(name: &str, handle: &Handle) -> Response {
+/// Release a model's device memory. HARD by default: a generation running on that model is
+/// cancelled first.
+///
+/// "Stop" is an instruction, not a request, and an operator who types it has a reason -- so the
+/// default is that it works. Refusing while the model is busy left the only way out as waiting the
+/// generation out, which for a long prompt is an hour. `{"soft": true}` is the opt-out: it leaves a
+/// running generation alone and queues for the device the ordinary way, which may answer 503 busy.
+///
+/// Only THIS model's generation is cancelled -- see `InFlight::cancel_if`.
+fn admin_unload(name: &str, req: &Request, handle: &Handle) -> Response {
+    let soft = String::from_utf8_lossy(&req.body).contains("\"soft\":true")
+        || String::from_utf8_lossy(&req.body).contains("\"soft\": true");
+    let cancelled = !soft && handle.cancel_model(name);
     match handle.unload(name) {
-        Ok(released) => (200, format!("{{\"released\":{released}}}").into()),
+        Ok(released) => (200,
+            format!("{{\"released\":{released},\"cancelled\":{cancelled}}}").into()),
         Err(e) => engine_err(&e),
     }
 }
@@ -3200,6 +3234,25 @@ mod ollama_route_tests {
 #[cfg(test)]
 mod cancel_tests {
     use super::*;
+
+    /// A cancelled run must be distinguishable from a finished one. OpenAI's `finish_reason` has no
+    /// value for it, so the standard field stays standard and the truth rides beside it -- otherwise
+    /// a client whose generation an operator stopped just sees a short answer.
+    #[test]
+    fn an_aborted_stream_says_so_beside_the_standard_finish_reason() {
+        let (_tx, s) = {
+            let (tx, rx) = std::sync::mpsc::channel();
+            (tx, SseStream::new(rx, "m".into(), SseKind::Chat, false, npu_engine::Cancel::new()))
+        };
+        let aborted: serde_json::Value =
+            serde_json::from_str(&s.render_done(FinishReason::Aborted)).unwrap();
+        assert_eq!(aborted["choices"][0]["finish_reason"], "stop", "the wire value stays standard");
+        assert_eq!(aborted["x_npu_finish"], "aborted");
+
+        let done: serde_json::Value =
+            serde_json::from_str(&s.render_done(FinishReason::Stop)).unwrap();
+        assert!(done.get("x_npu_finish").is_none(), "an ordinary stop must not be marked");
+    }
 
     /// A socket that reports its client gone and accepts writes. Both halves matter: the probe must
     /// be what decides, not a write that happens to fail.

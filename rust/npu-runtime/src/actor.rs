@@ -1,6 +1,7 @@
 //! The single device owner. One thread holds the Registry (and the !Send models) and serves a
 //! cloneable Send Handle over an mpsc channel - total serialization of the single-tenant NPU.
 use std::sync::mpsc::{channel, sync_channel, RecvTimeoutError, Sender, SyncSender};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::thread::JoinHandle;
 use std::time::Instant;
@@ -113,8 +114,57 @@ enum Cmd {
     Shutdown,
 }
 
+/// The in-flight generation's cancel handle, published so a thread that is NOT the actor can stop
+/// the work the actor is inside.
+///
+/// This is the whole of stage 2a, and it is deliberately not a scheduler. An operator whose device
+/// is held by a generation cannot be helped by ASKING the actor -- the actor is precisely what is
+/// busy -- so the actor publishes the one thing that ends the work, and anybody can pull it. The
+/// generation then stops within one dispatch and the queued command is serviced normally.
+///
+/// What this is NOT: preemption of the actor's LOOP. Commands still queue; they just stop queueing
+/// behind work nobody wants. Interleaving two generations needs per-sequence KV (`kv_off` addresses
+/// the cache by global position) and is a different project.
+#[derive(Clone, Default)]
+pub struct InFlight(Arc<Mutex<Option<(String, npu_engine::Cancel)>>>);
+
+impl InFlight {
+    fn set(&self, model: &str, cancel: npu_engine::Cancel) {
+        *self.0.lock().unwrap() = Some((model.to_string(), cancel));
+    }
+
+    fn clear(&self) {
+        *self.0.lock().unwrap() = None;
+    }
+
+    /// Cancel the running generation only if it belongs to `model`.
+    ///
+    /// Stopping one model must never abort a generation belonging to another: the device is
+    /// single-flight, so a request for a DIFFERENT model is simply queued behind that generation
+    /// and waits for it in the ordinary way.
+    fn cancel_if(&self, model: &str) -> bool {
+        let held = self.0.lock().unwrap().clone();
+        match held {
+            Some((n, c)) if n == model => {
+                c.cancel(npu_engine::CancelReason::Operator);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Cancel whatever is running, naming it. `None` when nothing is.
+    fn cancel(&self) -> Option<String> {
+        let held = self.0.lock().unwrap().clone();
+        held.map(|(name, c)| {
+            c.cancel(npu_engine::CancelReason::Operator);
+            name
+        })
+    }
+}
+
 #[derive(Clone)]
-pub struct Handle { tx: Sender<Cmd>, live: LiveStatus }
+pub struct Handle { tx: Sender<Cmd>, live: LiveStatus, inflight: InFlight }
 
 /// Spawn the actor with an initial config + a loader; performs the initial reconcile before returning.
 /// This is the SERVICE start: a server should come up warm and answer `/v1/models` with what is
@@ -152,8 +202,11 @@ fn spawn(cfg: Config, loader: Box<dyn ModelLoader + Send>, eager: bool) -> Resul
         .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     let live = LiveStatus::new(cfg.server.port, started_unix);
     let live_actor = live.clone();
+    let inflight = InFlight::default();
+    let inflight_actor = inflight.clone();
     let join = std::thread::spawn(move || {
         let live = live_actor;
+        let inflight = inflight_actor;
         let mut reg = Registry::default();
         let mut cfg = cfg;
         // A panic anywhere below used to kill this thread, after which every request failed with
@@ -302,9 +355,14 @@ fn spawn(cfg: Config, loader: Box<dyn ModelLoader + Send>, eager: bool) -> Resul
                                     tx.send(item).is_ok()
                                 };
                                 live.set_doing(reg.status_serving(Instant::now(), Some(&name)), Some(format!("serving {name}")));
+                                // Published BEFORE the work and cleared after it, panic included --
+                                // `guard` catches the unwind, so a lost clear would leave a stale
+                                // handle that cancels the NEXT generation instead of this one.
+                                inflight.set(&name, params.cancel.clone());
                                 let t_serve = Instant::now();
                                 let out = guard(|| run_generate(&mut reg, &name, &prompt, &params, &mut sink))
                                     .unwrap_or_else(|msg| Err(EngineError::Device(msg)));
+                                inflight.clear();
                                 reg.charge(&name, t_serve.elapsed().as_micros() as u64);
                                 if let Err(e) = out {
                                     if condemns_model(&e) {
@@ -429,7 +487,7 @@ fn spawn(cfg: Config, loader: Box<dyn ModelLoader + Send>, eager: bool) -> Resul
         }
     });
     match ready_rx.recv() {
-        Ok(Ok(())) => Ok((Handle { tx, live }, join)),
+        Ok(Ok(())) => Ok((Handle { tx, live, inflight }, join)),
         Ok(Err(msg)) => {
             // The thread already exited on its own (init_failed branch above); Shutdown is a no-op if
             // it beat us here, harmless either way. join() cannot hang: the thread returns right after
@@ -541,11 +599,19 @@ impl Handle {
     fn busy_note(&self) -> String {
         let snap = self.live.get();
         if let Some(d) = snap.doing {
-            return format!("the device actor is {d} (snapshot {}s old)", snap.at.elapsed().as_secs());
+            // A generation can be stopped; a load cannot, so only the first gets the suggestion.
+            let fix = match d.starts_with("serving") {
+                true => "; stop it with `npu cancel`",
+                false => "",
+            };
+            return format!(
+                "the device actor is {d} (snapshot {}s old){fix}",
+                snap.at.elapsed().as_secs()
+            );
         }
         match snap.models.iter().find(|m| m.busy).map(|m| m.name.clone()) {
             Some(n) => format!(
-                "the device is serving {n} (snapshot {}s old); retry, or cancel that request",
+                "the device is serving {n} (snapshot {}s old); retry, or stop it with `npu cancel`",
                 snap.at.elapsed().as_secs()
             ),
             None => format!(
@@ -559,6 +625,20 @@ impl Handle {
     /// why asking is not an option on a status path.
     pub fn snapshot(&self) -> crate::control_socket::Snapshot {
         self.live.get()
+    }
+
+    /// Stop the running generation, naming the model it was serving. `None` when none is running.
+    ///
+    /// Does NOT go through the actor, for the same reason status does not: the actor is what is
+    /// busy. The generation ends within one dispatch and whatever was queued behind it is then
+    /// serviced in the ordinary way.
+    pub fn cancel_current(&self) -> Option<String> {
+        self.inflight.cancel()
+    }
+
+    /// Stop the running generation if it is `model`'s. See [`InFlight::cancel_if`].
+    pub fn cancel_model(&self, model: &str) -> bool {
+        self.inflight.cancel_if(model)
     }
 }
 
@@ -922,7 +1002,7 @@ mod bound_tests {
         live.set(models);
         // `_never_read` is returned so the channel is not Disconnected -- an actor that is BUSY and
         // an actor that is GONE are different answers, and this exercises the first.
-        (Handle { tx: tx.clone(), live }, tx)
+        (Handle { tx: tx.clone(), live, inflight: InFlight::default() }, tx)
     }
 
     /// The bound. A reply that never comes has to become an ANSWER: every one of these was a bare
@@ -963,6 +1043,51 @@ mod bound_tests {
             EngineError::Busy(m) => assert!(m.contains("nothing serving"), "{m}"),
             other => panic!("expected Busy, got {other:?}"),
         }
+    }
+
+    /// Stage 2a's primitive: the actor publishes the running generation's cancel handle, so a
+    /// thread that is NOT the actor can end the work the actor is inside. Asking the actor cannot
+    /// work here -- the actor is what is busy.
+    #[test]
+    fn cancelling_the_current_generation_names_it_and_sets_the_flag() {
+        let (h, _keep) = handle_with(vec![]);
+        let c = npu_engine::Cancel::new();
+        h.inflight.set("gemma4-12b", c.clone());
+        assert_eq!(h.cancel_current().as_deref(), Some("gemma4-12b"));
+        assert_eq!(c.reason(), Some(npu_engine::CancelReason::Operator));
+    }
+
+    /// Racing the end of a generation and winning is not a failure.
+    #[test]
+    fn cancelling_with_nothing_running_is_not_an_error() {
+        let (h, _keep) = handle_with(vec![]);
+        assert_eq!(h.cancel_current(), None);
+    }
+
+    /// `model stop` is hard by default, but it must only stop ITS model: the device is
+    /// single-flight, so a request for another model queues behind that generation rather than
+    /// being entitled to kill it.
+    #[test]
+    fn cancelling_by_model_never_touches_another_models_generation() {
+        let (h, _keep) = handle_with(vec![]);
+        let c = npu_engine::Cancel::new();
+        h.inflight.set("gemma4-12b", c.clone());
+        assert!(!h.cancel_model("qwen3-0.6b"), "stopping one model claimed another's run");
+        assert!(!c.is_cancelled());
+        assert!(h.cancel_model("gemma4-12b"));
+        assert_eq!(c.reason(), Some(npu_engine::CancelReason::Operator));
+    }
+
+    /// A stale handle would cancel the NEXT generation instead of the one the operator meant --
+    /// silently, and only sometimes. The clear runs after `guard` catches a panic for this reason.
+    #[test]
+    fn a_cleared_handle_cannot_cancel_the_next_run() {
+        let (h, _keep) = handle_with(vec![]);
+        let first = npu_engine::Cancel::new();
+        h.inflight.set("m", first.clone());
+        h.inflight.clear();
+        assert_eq!(h.cancel_current(), None);
+        assert!(!first.is_cancelled(), "clearing must not cancel what it cleared");
     }
 
     /// The status path must not touch the channel at all -- that is the whole point. Readable even
