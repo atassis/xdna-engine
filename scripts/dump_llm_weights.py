@@ -53,6 +53,13 @@ def main():
                          "the embedding stays f32 and readable too unless --quant-leaves names "
                          "'embed_tokens'). bf16 writes the plain f32 dump.")
     ap.add_argument("--quant-group", type=int, default=64)
+    ap.add_argument("--quant-full-range", action="store_true",
+                    help="quantize onto all 2**n levels rather than the symmetric subset. "
+                         "Needed to land on the grid of a checkpoint QAT-trained for this "
+                         "width; worth ~0.5 points on any other checkpoint (K025).")
+    ap.add_argument("--quant-clip-search", action="store_true",
+                    help="per-group MSE-optimal scale instead of amax/qmax. Pair with "
+                         "--quant-full-range: the grid-exact scale is a search candidate.")
     ap.add_argument("--quant-layout", default="header_first",
                     choices=("header_first", "row_group_planar"),
                     help="on-wire row layout (iron/common/quant.py). row_group_planar moves the "
@@ -161,15 +168,19 @@ def main():
     exp_per_key[f"{sp.weight_prefix}embed_tokens.weight"] = (V_, D_)
 
     def _layout_kw(K):
-        """layout=/row_group= kwargs for one tensor's OWN K (post-chunking) -- row_group is a
+        """quantize_weight kwargs for one tensor's OWN K (post-chunking) -- row_group is a
         pure function of (K, group_size, dtype), so this always agrees with what GEMV's own
         __post_init__ derives for a GEMV built at the same K/group/dtype (no shared state, no
-        quant.json round-trip needed for the value itself)."""
+        quant.json round-trip needed for the value itself). The scale-selection axes ride here
+        too so that every packing path in this script -- dense, K-chunked and head-chunked --
+        goes through one funnel and cannot disagree about the format."""
+        kw = {"full_range": a.quant_full_range, "clip_search": a.quant_clip_search}
         if a.quant_layout != "row_group_planar":
-            return {}
+            return kw
         vec = min(64, a.quant_group)
-        return {"layout": a.quant_layout,
-                "row_group": derive_row_group([K], a.quant_group, a.quant, vec_size=vec)}
+        kw.update(layout=a.quant_layout,
+                  row_group=derive_row_group([K], a.quant_group, a.quant, vec_size=vec))
+        return kw
 
     # Row-chunk budget for packing the tied head/embedding -- bounds quantize_weight's OWN
     # transient arrays (its abs/div/round/clip/astype chain each allocates a full chunk-sized f32
@@ -242,6 +253,8 @@ def main():
         "dtype": a.quant,
         "group_size": a.quant_group,
         "layout": a.quant_layout,
+        "full_range": a.quant_full_range,
+        "clip_search": a.quant_clip_search,
         "packed": sorted(packed),
         "note": "packed arrays are np.int8 on-wire bytes, NOT values -- never .astype()",
     }

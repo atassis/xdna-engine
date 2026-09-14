@@ -50,7 +50,15 @@ GROUPS = (32, 64, 128, 256)
 # zero_grid/free_min are the two affine offset conventions precision.py's SCALE_KINDS names.
 FORMATS = [(dt, g, sk) for g in GROUPS for dt, sk in (
     ("int8", "absmax"), ("int8a", "zero_grid"), ("int8a", "free_min"),
-    ("int4", "absmax"), ("int4", "clip"), ("int4a", "zero_grid"), ("int4a", "free_min"))]
+    ("int4", "absmax"), ("int4", "clip"), ("int4", "clip_full"),
+    ("int4a", "zero_grid"), ("int4a", "free_min"))]
+
+# clip_full searches the same scale grid as clip but over all 2**n levels rather than the
+# symmetric subset. It separates "4 bits is too coarse for these weights" from "these weights
+# sit on a 4-bit grid we are declining to land on" -- the two are indistinguishable under clip
+# alone, and a QAT checkpoint is the case where they differ by an order of magnitude.
+CLIP_FULL_KW = dict(clip_search=True, full_range=True,
+                    clip_range=(0.85, 1.05), n_clip_candidates=81)
 
 
 def vec_legal(K, group, dtype):
@@ -163,8 +171,12 @@ def main():
                 Wc64 = Wc.astype(np.float64)
                 orig_sq += float(np.sum(Wc64 * Wc64))
                 for dtype, group, scale_kind in legal:
-                    kw = dict(affine_zero_on_grid=(scale_kind == "zero_grid")) if dtype in \
-                        ("int4a", "int8a") else dict(clip_search=(scale_kind == "clip"))
+                    if dtype in ("int4a", "int8a"):
+                        kw = dict(affine_zero_on_grid=(scale_kind == "zero_grid"))
+                    elif scale_kind == "clip_full":
+                        kw = dict(CLIP_FULL_KW)
+                    else:
+                        kw = dict(clip_search=(scale_kind == "clip"))
                     packed = quantize_weight(Wc, group, dtype, **kw)
                     recon = dequantize_weight(packed, Wc.shape[0], K, group, dtype)
                     diff = Wc64 - recon.astype(np.float64)
