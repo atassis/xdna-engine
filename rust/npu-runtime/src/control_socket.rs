@@ -11,7 +11,7 @@ use std::io::BufReader;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::actor::Handle;
 use crate::http::{parse_request, respond, route, Body};
@@ -63,15 +63,69 @@ pub fn bind(path: &Path) -> std::io::Result<UnixListener> {
     UnixListener::bind(path)
 }
 
-/// The out-of-band status document. The actor renders it fresh after every command and sweep and
-/// stores it here; a reader takes the current bytes under one uncontended lock, never sending
-/// anything to the actor's channel.
+/// The out-of-band status snapshot. The actor republishes it after every command and every sweep;
+/// a reader clones it under one uncontended lock and never sends anything to the actor's channel.
+///
+/// STRUCTURED rather than a rendered document, because two surfaces need different renderings of
+/// the same facts and a reader that parses a string back into them is a second format to keep in
+/// agreement with the first.
 #[derive(Clone, Default)]
-pub struct LiveStatus(Arc<Mutex<String>>);
+pub struct LiveStatus {
+    inner: Arc<Mutex<Snapshot>>,
+    /// Process constants, kept here so a READER can render the whole document without reaching for
+    /// the config the actor owns -- which is the reach this type exists to avoid.
+    port: u16,
+    started_unix: u64,
+}
+
+/// What the actor last published, and when.
+///
+/// The timestamp is not decoration. A reader that cannot say how old its answer is cannot tell
+/// "nothing is happening" from "the actor has not come round the loop in 22 minutes" -- and the
+/// second is the one worth acting on.
+#[derive(Clone)]
+pub struct Snapshot {
+    pub models: Arc<Vec<ModelStatus>>,
+    pub at: Instant,
+    /// What the actor is inside RIGHT NOW, when that is not visible in `models`.
+    ///
+    /// A model being served shows up as `busy`; a model being LOADED does not, because loading
+    /// happens before there is anything to mark. That made the longest single thing the actor does
+    /// -- a 15 GB load -- the one thing it never reported, so a caller waiting on it saw an idle
+    /// snapshot going stale and no reason for either.
+    pub doing: Option<String>,
+}
+
+impl Default for Snapshot {
+    fn default() -> Snapshot {
+        Snapshot { models: Arc::new(Vec::new()), at: Instant::now(), doing: None }
+    }
+}
 
 impl LiveStatus {
-    pub fn set(&self, doc: String) { *self.0.lock().unwrap() = doc; }
-    pub fn get(&self) -> String { self.0.lock().unwrap().clone() }
+    pub fn new(port: u16, started_unix: u64) -> LiveStatus {
+        LiveStatus { inner: Default::default(), port, started_unix }
+    }
+
+    pub fn set(&self, models: Vec<ModelStatus>) {
+        self.set_doing(models, None)
+    }
+
+    /// Publish, naming what the actor is about to do. Call it BEFORE the long thing, not after:
+    /// the point is to be readable while it runs.
+    pub fn set_doing(&self, models: Vec<ModelStatus>, doing: Option<String>) {
+        *self.inner.lock().unwrap() =
+            Snapshot { models: Arc::new(models), at: Instant::now(), doing };
+    }
+
+    pub fn get(&self) -> Snapshot {
+        self.inner.lock().unwrap().clone()
+    }
+
+    /// The `status.json`-shaped document `npu model ls` / `npu top` read.
+    pub fn doc(&self) -> String {
+        render(self.port, self.started_unix, &self.get().models)
+    }
 }
 
 /// The same document shape `status.json` carried, so `npu model ls`/`npu top` need no format change
@@ -124,7 +178,7 @@ fn handle_conn(mut stream: UnixStream, handle: &Handle, live: &LiveStatus, cfg_p
     // exactly the hang this transport exists to avoid. Every other path -- including a streamed
     // generation -- is unchanged `route()`/`respond()`, the same code the TCP surface runs.
     let (code, resp) = if req.method == "GET" && req.path == "/v1/models" {
-        (200, Body::Json(live.get()))
+        (200, Body::Json(live.doc()))
     } else {
         route(&req, handle, cfg_path)
     };

@@ -1,6 +1,7 @@
 //! The single device owner. One thread holds the Registry (and the !Send models) and serves a
 //! cloneable Send Handle over an mpsc channel - total serialization of the single-tenant NPU.
 use std::sync::mpsc::{channel, sync_channel, RecvTimeoutError, Sender, SyncSender};
+use std::time::Duration;
 use std::thread::JoinHandle;
 use std::time::Instant;
 
@@ -145,12 +146,12 @@ fn spawn(cfg: Config, loader: Box<dyn ModelLoader + Send>, eager: bool) -> Resul
     // Off the request path on purpose: it is a subprocess, and the first request must not pay for
     // it. See `conditions::spawn_probe`.
     crate::conditions::spawn_probe();
-    let live = LiveStatus::default();
-    let live_actor = live.clone();
     // Fixed once at spawn, not read fresh per publish: it is the denominator `npu top` divides
     // cumulative busy time by, and needs to name when THIS process started serving.
     let started_unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let live = LiveStatus::new(cfg.server.port, started_unix);
+    let live_actor = live.clone();
     let join = std::thread::spawn(move || {
         let live = live_actor;
         let mut reg = Registry::default();
@@ -200,6 +201,9 @@ fn spawn(cfg: Config, loader: Box<dyn ModelLoader + Send>, eager: bool) -> Resul
         // trim runs once per idle stretch, and is re-armed by a request or by an unload freeing more.
         let mut last_request = Instant::now();
         let mut released = false;
+        // Before the first command or sweep, so a reader at boot sees what reconcile made resident
+        // rather than an empty list it cannot distinguish from a server with no models.
+        live.set(reg.status_at(Instant::now()));
         loop {
             match rx.recv_timeout(next_sweep.saturating_duration_since(Instant::now())) {
                 Ok(Cmd::Serve { cap, model, req, reply }) => {
@@ -208,6 +212,8 @@ fn spawn(cfg: Config, loader: Box<dyn ModelLoader + Send>, eager: bool) -> Resul
                     // fails. The shipped failure is a PANIC inside the dispatch (a missing insts
                     // file panics in npu-asr), which unwinds past any Result handling inside the
                     // call -- so condemning the model has to happen out here, after catch_unwind.
+                    live.set_doing(reg.status_at(Instant::now()),
+                        Some(format!("loading for {cap}{}", named(model.as_deref()))));
                     let ready = guard(|| serve_ready(&cfg, &mut reg, loader.as_ref(), cap, model.as_deref()))
                         .unwrap_or_else(|msg| Err(EngineError::Device(msg)));
                     let r = match ready {
@@ -216,8 +222,7 @@ fn spawn(cfg: Config, loader: Box<dyn ModelLoader + Send>, eager: bool) -> Resul
                             // Publish BUSY before the work, not after: this loop does not come back
                             // round until the request finishes, so the end-of-iteration publish can
                             // never observe a model that is serving.
-                            live.set(crate::control_socket::render(cfg.server.port, started_unix,
-                                &reg.status_serving(Instant::now(), Some(&name))));
+                            live.set_doing(reg.status_serving(Instant::now(), Some(&name)), Some(format!("serving {name}")));
                             let t_serve = Instant::now();
                             let out = guard(|| run_named(&mut reg, &name, req))
                                 .unwrap_or_else(|msg| Err(EngineError::Device(msg)));
@@ -248,6 +253,8 @@ fn spawn(cfg: Config, loader: Box<dyn ModelLoader + Send>, eager: bool) -> Resul
                     let resident_before: Vec<String> = reg.entries.iter()
                         .filter(|e| e.model.is_some()).map(|e| e.cfg.name.clone()).collect();
                     let t_load = Instant::now();
+                    live.set_doing(reg.status_at(Instant::now()),
+                        Some(format!("loading for generate{}", named(model.as_deref()))));
                     let ready = guard(|| serve_ready(&cfg, &mut reg, loader.as_ref(),
                             Capability::GENERATE, model.as_deref()))
                         .unwrap_or_else(|msg| Err(EngineError::Device(msg)));
@@ -294,8 +301,7 @@ fn spawn(cfg: Config, loader: Box<dyn ModelLoader + Send>, eager: bool) -> Resul
                                     // abort signal.
                                     tx.send(item).is_ok()
                                 };
-                                live.set(crate::control_socket::render(cfg.server.port, started_unix,
-                                    &reg.status_serving(Instant::now(), Some(&name))));
+                                live.set_doing(reg.status_serving(Instant::now(), Some(&name)), Some(format!("serving {name}")));
                                 let t_serve = Instant::now();
                                 let out = guard(|| run_generate(&mut reg, &name, &prompt, &params, &mut sink))
                                     .unwrap_or_else(|msg| Err(EngineError::Device(msg)));
@@ -314,6 +320,7 @@ fn spawn(cfg: Config, loader: Box<dyn ModelLoader + Send>, eager: bool) -> Resul
                 Ok(Cmd::Reconcile { cfg: newcfg, reply }) => {
                     last_request = Instant::now(); released = false;
                     cfg = *newcfg;
+                    live.set_doing(reg.status_at(Instant::now()), Some("reconciling".into()));
                     let rep = guard(|| reconcile(&cfg, &mut reg, loader.as_ref()))
                         .unwrap_or_else(|msg| ReconcileReport { failed: vec![msg], ..Default::default() });
                     warn_declined_pins(&rep);
@@ -323,6 +330,10 @@ fn spawn(cfg: Config, loader: Box<dyn ModelLoader + Send>, eager: bool) -> Resul
                     // Counts as activity: an operator warming the device must not have it swept out
                     // from under them by an idle window that started before they asked.
                     last_request = Instant::now(); released = false;
+                    // A cold 15 GB load is the longest thing this loop does -- measured ~12 s on
+                    // gemma4-12b -- so anyone waiting on it is entitled to be told that is what
+                    // they are waiting for.
+                    live.set_doing(reg.status_at(Instant::now()), Some(format!("loading {name}")));
                     let now = Instant::now();
                     let r = match cfg.find(&name).cloned() {
                         None => Err(EngineError::Load(format!(
@@ -347,6 +358,7 @@ fn spawn(cfg: Config, loader: Box<dyn ModelLoader + Send>, eager: bool) -> Resul
                     let _ = reply.send(r);
                 }
                 Ok(Cmd::Bake { name, force, reply }) => {
+                    live.set_doing(reg.status_at(Instant::now()), Some(format!("baking {name}")));
                     let r = match cfg.find(&name).cloned() {
                         None => Err(EngineError::Load(format!(
                             "unknown model {name:?} (not in the config)"))),
@@ -356,6 +368,7 @@ fn spawn(cfg: Config, loader: Box<dyn ModelLoader + Send>, eager: bool) -> Resul
                     let _ = reply.send(r);
                 }
                 Ok(Cmd::Unload { name, reply }) => {
+                    live.set_doing(reg.status_at(Instant::now()), Some(format!("unloading {name}")));
                     let r = match cfg.find(&name) {
                         None => Err(EngineError::Load(format!(
                             "unknown model {name:?} (not in the config)"))),
@@ -412,8 +425,7 @@ fn spawn(cfg: Config, loader: Box<dyn ModelLoader + Send>, eager: bool) -> Resul
             // from the same place the state lives and cannot disagree with it. Clears BUSY
             // implicitly: `status_at` never sets it, so returning to the top of the loop is exactly
             // the moment nothing is being served.
-            live.set(crate::control_socket::render(cfg.server.port, started_unix,
-                &reg.status_at(Instant::now())));
+            live.set(reg.status_at(Instant::now()));
         }
     });
     match ready_rx.recv() {
@@ -478,6 +490,78 @@ fn condemns_model(e: &EngineError) -> bool {
     matches!(e, EngineError::Device(_) | EngineError::Load(_))
 }
 
+
+/// How long a caller waits for the actor before calling it busy.
+///
+/// Generous on purpose: a cold load of a 15 GB model behind a running generation is legitimate work
+/// and turning it into an error would be worse than the hang. The point is a BOUND, not a tight one.
+/// `" (model-name)"`, or empty when the request named none and routing will pick the default.
+fn named(model: Option<&str>) -> String {
+    model.map(|m| format!(" ({m})")).unwrap_or_default()
+}
+
+fn actor_timeout() -> Duration {
+    std::env::var("NPU_ACTOR_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::from_secs(120))
+}
+
+impl Handle {
+    /// Wait for the actor's reply, BOUNDED.
+    ///
+    /// Every one of these was a bare `recv()`. One long command then made every other caller look
+    /// broken in the same way, and none could say why: `npu model stop`, a request naming a model
+    /// that does not exist, and `/v1/models` all simply never returned. Measured 2026-09-14 during
+    /// a ~60-minute prefill.
+    fn await_reply<T>(&self, rx: std::sync::mpsc::Receiver<T>) -> Result<T, EngineError> {
+        self.await_reply_within(rx, actor_timeout())
+    }
+
+    /// The bound, taken as an argument so a test can choose it. `NPU_ACTOR_TIMEOUT_MS` is
+    /// process-global and these tests run in parallel threads of one process, so a test that set it
+    /// would be setting it for every other test at the same time.
+    fn await_reply_within<T>(
+        &self,
+        rx: std::sync::mpsc::Receiver<T>,
+        within: Duration,
+    ) -> Result<T, EngineError> {
+        match rx.recv_timeout(within) {
+            Ok(v) => Ok(v),
+            Err(RecvTimeoutError::Disconnected) => {
+                Err(EngineError::Device("actor dropped reply".into()))
+            }
+            Err(RecvTimeoutError::Timeout) => Err(EngineError::Busy(self.busy_note())),
+        }
+    }
+
+
+    /// What is holding the actor -- readable precisely because the snapshot does NOT go through it.
+    fn busy_note(&self) -> String {
+        let snap = self.live.get();
+        if let Some(d) = snap.doing {
+            return format!("the device actor is {d} (snapshot {}s old)", snap.at.elapsed().as_secs());
+        }
+        match snap.models.iter().find(|m| m.busy).map(|m| m.name.clone()) {
+            Some(n) => format!(
+                "the device is serving {n} (snapshot {}s old); retry, or cancel that request",
+                snap.at.elapsed().as_secs()
+            ),
+            None => format!(
+                "the device actor did not answer in {}s and reports nothing serving",
+                actor_timeout().as_secs()
+            ),
+        }
+    }
+
+    /// The actor's last published status, without asking the actor. See [`Handle::await_reply`] for
+    /// why asking is not an option on a status path.
+    pub fn snapshot(&self) -> crate::control_socket::Snapshot {
+        self.live.get()
+    }
+}
+
 impl Handle {
     /// Serve any capability. The typed helpers below are conveniences over this; a caller with a
     /// capability that has no helper (tts, generate) uses it directly.
@@ -486,7 +570,7 @@ impl Handle {
         let (r, rx) = channel();
         self.tx.send(Cmd::Serve { cap, model: model.map(String::from), req, reply: r })
             .map_err(|_| EngineError::Device("actor stopped".into()))?;
-        rx.recv().map_err(|_| EngineError::Device("actor dropped reply".into()))?
+        self.await_reply(rx)?
     }
     /// Text generation. Unlike `serve`, this does not wait for a `Response`: it returns as soon as
     /// routing/loading is decided, handing back a receiver the caller drains at its own pace (an SSE
@@ -499,7 +583,7 @@ impl Handle {
         self.tx.send(Cmd::Generate { model: model.map(String::from), prompt, params, tx,
                                      ack: ack_tx, enqueued: Instant::now() })
             .map_err(|_| EngineError::Device("actor stopped".into()))?;
-        let name = ack_rx.recv().map_err(|_| EngineError::Device("actor dropped reply".into()))??;
+        let name = self.await_reply(ack_rx)??;
         Ok(Served { model: name, value: rx })
     }
     pub fn transcribe(&self, model: Option<&str>, pcm: Vec<i16>, sr: u32) -> Result<Served<String>, EngineError> {
@@ -528,7 +612,7 @@ impl Handle {
         let (r, rx) = channel();
         self.tx.send(Cmd::Reconcile { cfg: Box::new(cfg), reply: r })
             .map_err(|_| EngineError::Device("actor stopped".into()))?;
-        rx.recv().map_err(|_| EngineError::Device("actor dropped reply".into()))
+        self.await_reply(rx)
     }
     /// Make a model resident now. `Err` over `memory_ceiling_mb` -- this never evicts; see
     /// `Registry::load_explicit` for why the request path and this one differ.
@@ -536,14 +620,14 @@ impl Handle {
         let (r, rx) = channel();
         self.tx.send(Cmd::Load { name: name.to_string(), reply: r })
             .map_err(|_| EngineError::Device("actor stopped".into()))?;
-        rx.recv().map_err(|_| EngineError::Device("actor dropped reply".into()))?
+        self.await_reply(rx)?
     }
     /// Release a model's device memory. `Ok(false)` when it was not resident to begin with.
     pub fn unload(&self, name: &str) -> Result<bool, EngineError> {
         let (r, rx) = channel();
         self.tx.send(Cmd::Unload { name: name.to_string(), reply: r })
             .map_err(|_| EngineError::Device("actor stopped".into()))?;
-        rx.recv().map_err(|_| EngineError::Device("actor dropped reply".into()))?
+        self.await_reply(rx)?
     }
     /// Bake a model's declarative weight spec into a checkpoint, host-only. `Ok(None)` means the
     /// scenario has no such spec (legacy `weights =` npy path).
@@ -551,12 +635,12 @@ impl Handle {
         let (r, rx) = channel();
         self.tx.send(Cmd::Bake { name: name.to_string(), force, reply: r })
             .map_err(|_| EngineError::Device("actor stopped".into()))?;
-        rx.recv().map_err(|_| EngineError::Device("actor dropped reply".into()))?
+        self.await_reply(rx)?
     }
     pub fn status(&self) -> Vec<ModelStatus> {
         let (r, rx) = channel();
         if self.tx.send(Cmd::Status { reply: r }).is_err() { return vec![]; }
-        rx.recv().unwrap_or_default()
+        self.await_reply(rx).unwrap_or_default()
     }
     /// The out-of-band snapshot the control socket answers `GET /v1/models` from -- an `Arc` clone,
     /// cheap, and readable without ever touching the actor's channel.
@@ -808,5 +892,87 @@ mod tests {
         assert_eq!(s.state, LoadState::Failed, "the model must not look healthy");
         assert!(s.detail.contains("boom"), "the panic message is the cause: {}", s.detail);
         h.shutdown(); j.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod bound_tests {
+    use super::*;
+    use crate::registry::LoadState;
+
+    fn busy_model(name: &str, busy: bool) -> ModelStatus {
+        ModelStatus {
+            name: name.into(),
+            state: LoadState::Loaded,
+            detail: String::new(),
+            capability: Capability::from_name("generate"),
+            bo_bytes: 0,
+            idle_s: None,
+            served: 0,
+            busy_us: 0,
+            busy,
+            pinned: false,
+            pin_honored: false,
+        }
+    }
+
+    fn handle_with(models: Vec<ModelStatus>) -> (Handle, Sender<Cmd>) {
+        let (tx, _never_read) = channel();
+        let live = LiveStatus::new(11434, 0);
+        live.set(models);
+        // `_never_read` is returned so the channel is not Disconnected -- an actor that is BUSY and
+        // an actor that is GONE are different answers, and this exercises the first.
+        (Handle { tx: tx.clone(), live }, tx)
+    }
+
+    /// The bound. A reply that never comes has to become an ANSWER: every one of these was a bare
+    /// `recv()`, so one long command left every other caller waiting with nothing to look at.
+    #[test]
+    fn a_reply_that_never_comes_becomes_busy_naming_what_holds_the_device() {
+        let (h, _keep) = handle_with(vec![busy_model("gemma4-12b", true)]);
+        let (_reply_tx, rx) = channel::<u8>();
+        let e = h.await_reply_within(rx, Duration::from_millis(50)).unwrap_err();
+        match e {
+            EngineError::Busy(m) => {
+                assert!(m.contains("gemma4-12b"), "the wait must name what holds the device: {m}")
+            }
+            other => panic!("expected Busy, got {other:?}"),
+        }
+    }
+
+    /// A busy actor and a dead one need different answers: one is worth retrying and the other is
+    /// not, and before the bound they were indistinguishable because neither returned.
+    #[test]
+    fn a_dropped_actor_is_a_device_error_not_a_busy_one() {
+        let (h, _keep) = handle_with(vec![busy_model("m", true)]);
+        let (reply_tx, rx) = channel::<u8>();
+        drop(reply_tx);
+        match h.await_reply_within(rx, Duration::from_secs(5)).unwrap_err() {
+            EngineError::Device(_) => {}
+            other => panic!("expected Device, got {other:?}"),
+        }
+    }
+
+    /// Nothing serving is a different sentence from something serving, because the operator's next
+    /// move differs: cancel a request, or look at why the actor stopped coming round its loop.
+    #[test]
+    fn an_idle_but_unresponsive_actor_says_so() {
+        let (h, _keep) = handle_with(vec![busy_model("m", false)]);
+        let (_reply_tx, rx) = channel::<u8>();
+        match h.await_reply_within(rx, Duration::from_millis(50)).unwrap_err() {
+            EngineError::Busy(m) => assert!(m.contains("nothing serving"), "{m}"),
+            other => panic!("expected Busy, got {other:?}"),
+        }
+    }
+
+    /// The status path must not touch the channel at all -- that is the whole point. Readable even
+    /// with no actor on the other end.
+    #[test]
+    fn a_snapshot_is_readable_with_no_actor_at_all() {
+        let (h, keep) = handle_with(vec![busy_model("gemma4-12b", true)]);
+        drop(keep);
+        let snap = h.snapshot();
+        assert_eq!(snap.models.len(), 1);
+        assert_eq!(snap.models[0].name, "gemma4-12b");
     }
 }

@@ -450,6 +450,15 @@ pub const FLAGS: &[Flag] = &[
         doc: "phase-timing profiler (Npu/Host/Marshal buckets) for the encode path." },
 
     // -- npu-runtime ------------------------------------------------------------------------------
+    Flag { name: "NPU_ACTOR_TIMEOUT_MS", owner: "npu-runtime", site: "npu-runtime/src/actor.rs",
+        semantics: Value, default: "120000",
+        doc: "how long a caller waits for the device actor before the request is answered 503 \
+              `busy` naming what holds it. The actor is single-flight over a single-tenant NPU, so \
+              a second request genuinely does queue; what must not happen is queueing FOREVER, \
+              which is what a bare recv() did -- measured 2026-09-14, one ~60-minute prefill left \
+              `npu model stop`, an unknown-model request and /v1/models all hanging with no way to \
+              see why. Generous by default: a cold 15 GB load behind a running generation is real \
+              work, not a fault. Lower it to make a saturated server fail fast." },
     Flag { name: "NPU_TELEMETRY_LOG", owner: "npu-runtime", site: "npu-runtime/src/run_log.rs",
         semantics: Value, default: "unset (no run logs)",
         doc: "directory to write one JSONL run log per generation into, named by completion id \

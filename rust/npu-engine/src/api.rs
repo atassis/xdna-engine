@@ -67,6 +67,14 @@ pub enum EngineError {
     Unsupported(String),
     #[error("device error: {0}")]
     Device(String),
+    /// The device actor did not answer in time: it is inside a long command -- a big model's load,
+    /// or a generation. A 503 naming what holds it, never a hang.
+    ///
+    /// Before this every `Handle` call waited on the actor with an unbounded `recv()`, so one long
+    /// request made `npu model stop`, a request for an unknown model, and `/v1/models` all look
+    /// broken in the same way, and none of them could say why.
+    #[error("busy: {0}")]
+    Busy(String),
 }
 
 /// Process-level engine facts.

@@ -32,6 +32,10 @@ pub enum Code {
     /// renumbering -- see main.rs's report on why this is expected.
     #[allow(dead_code)]
     Cancelled = 5,
+    /// The service is up and answering, but the device actor is inside a long command. Distinct
+    /// from `Device` because it is not a fault and distinct from `NoService` because the server is
+    /// fine: the right response is to retry, or to cancel whatever holds the device.
+    Busy = 6,
 }
 
 /// Tags an error with the exit code its caller should surface, without changing anything a user
@@ -54,6 +58,7 @@ pub fn engine_error(e: &EngineError) -> Code {
     match e {
         EngineError::NotAvailable | EngineError::Device(_) => Code::Device,
         EngineError::NoModel(_) => Code::NoModel,
+        EngineError::Busy(_) => Code::Busy,
         EngineError::WrongKind { .. } | EngineError::Unsupported(_) | EngineError::Load(_) =>
             Code::Failure,
     }

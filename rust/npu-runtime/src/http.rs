@@ -216,7 +216,8 @@ pub fn route(req: &Request, handle: &Handle, cfg_path: &Path) -> Response {
         // because that is deliberate (deferred over the byte budget, or swept for being idle).
         ("GET", "/healthz") => {
             let npu = npu_engine::Engine::available();
-            let st = handle.status();
+            // Same rule as `/v1/models`: a health check that can hang is not a health check.
+            let st = handle.snapshot().models;
             let n = st.iter().filter(|s| s.state == LoadState::Loaded).count();
             let failed: Vec<&ModelStatus> = st.iter().filter(|s| s.state == LoadState::Failed).collect();
             let names = failed.iter()
@@ -225,7 +226,13 @@ pub fn route(req: &Request, handle: &Handle, cfg_path: &Path) -> Response {
             (if ok { 200 } else { 503 },
              format!("{{\"ok\":{ok},\"npu\":{npu},\"loaded\":{n},\"failed\":[{names}]}}").into())
         }
-        ("GET", "/v1/models") => (200, models_json(&handle.status()).into()),
+        // From the actor's last PUBLICATION, never by asking it. A status read that queues behind
+        // the command it exists to explain is the failure this replaced: while one generation ran,
+        // this route timed out for an hour and there was no way to see why.
+        ("GET", "/v1/models") => {
+            let snap = handle.snapshot();
+            (200, models_json_aged(&snap.models, snap.at.elapsed().as_secs(), snap.doing.as_deref()).into())
+        }
         ("POST", "/v1/chat/completions") => chat_completions(req, handle),
         ("POST", "/v1/completions") => completions(req, handle),
         ("POST", "/v1/embeddings") => embeddings(req, handle),
@@ -270,6 +277,19 @@ pub fn route(req: &Request, handle: &Handle, cfg_path: &Path) -> Response {
 /// `memory_ceiling_mb`) -- a state `npu reload` cannot fix by re-asserting the same config, unlike
 /// ordinary pin/unpin drift, so a reader needs both bits to tell the two apart.
 pub fn models_json(status: &[ModelStatus]) -> String {
+    models_doc(status, None, None)
+}
+
+/// The same list, plus how old the snapshot behind it is.
+///
+/// The HTTP surface answers from the actor's last publication rather than by asking the actor, so a
+/// reader is entitled to know whether that publication is a second old or twenty minutes -- which
+/// is the difference between "idle" and "something has held the device since before you looked".
+pub fn models_json_aged(status: &[ModelStatus], age_s: u64, doing: Option<&str>) -> String {
+    models_doc(status, Some(age_s), doing)
+}
+
+fn models_doc(status: &[ModelStatus], age_s: Option<u64>, doing: Option<&str>) -> String {
     let mut data = String::new();
     for (i, s) in status.iter().enumerate() {
         if i > 0 { data.push(','); }
@@ -280,7 +300,16 @@ pub fn models_json(status: &[ModelStatus]) -> String {
             "{{\"id\":\"{}\",\"object\":\"model\",\"kind\":\"{kind}\",\"state\":\"{state}\",\"detail\":\"{}\",\"bo_bytes\":{},\"idle_s\":{idle},\"pinned\":{},\"pin_honored\":{},\"busy\":{},\"served\":{},\"busy_us\":{}}}",
             s.name, parse::json_escape(&s.detail), s.bo_bytes, s.pinned, s.pin_honored, s.busy, s.served, s.busy_us));
     }
-    format!("{{\"object\":\"list\",\"data\":[{data}]}}")
+    let Some(age) = age_s else {
+        return format!("{{\"object\":\"list\",\"data\":[{data}]}}");
+    };
+    // `doing` names a phase `data` cannot show -- a model being LOADED is not yet anything to mark
+    // busy, and that is the longest wait the actor has.
+    let doing = match doing {
+        Some(d) => format!(",\"doing\":\"{}\"", parse::json_escape(d)),
+        None => String::new(),
+    };
+    format!("{{\"object\":\"list\",\"data\":[{data}],\"age_s\":{age}{doing}}}")
 }
 
 /// Map an engine error onto a status code. `NoModel` is 503, not 400: nothing is wrong with the
@@ -289,7 +318,11 @@ pub fn models_json(status: &[ModelStatus]) -> String {
 /// generate or tts model is configured yet; both routes are otherwise complete.
 fn engine_err(e: &npu_engine::EngineError) -> Response {
     let code = match e {
-        npu_engine::EngineError::NoModel(_) | npu_engine::EngineError::NotAvailable => 503,
+        // Busy is a 503 with a reason, not a hang and not a 500: nothing is wrong with the request
+        // and retrying it later is exactly the right thing to do.
+        npu_engine::EngineError::NoModel(_)
+        | npu_engine::EngineError::NotAvailable
+        | npu_engine::EngineError::Busy(_) => 503,
         npu_engine::EngineError::WrongKind { .. } | npu_engine::EngineError::Unsupported(_) => 400,
         npu_engine::EngineError::Load(_) | npu_engine::EngineError::Device(_) => 500,
     };
