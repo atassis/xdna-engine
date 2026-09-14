@@ -91,19 +91,23 @@ def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k):
         return np.asarray(np.asarray(a, BF16), np.float32)
 
     def npy_bf16(n):
-        """Like `npy`, but STAYS bf16 -- for the big per-layer/embedding matrices only.
+        """Like `npy`, but returns an mmap VIEW instead of a materialised bf16 array -- see `mm()`.
 
-        Gemma-4-12B's dump is 45GB of float32 .npy on disk; holding every layer's projection
-        weights upcast to float32 at once (the shape `npy()` above returns) does not fit this box's
-        RAM (30GB). Kept bf16-resident (22.5GB) and widened to float32 per matmul call in `mm()`
-        below instead -- the SAME rounding, just deferred. Measured: a 3840x15360 cast is 11.8ms at
-        10 GB/s, so re-casting the whole model's weights once per position (~22.5GB) costs ~2.3s;
-        over an 800-position run that is ~30 minutes of pure cast overhead, not hours.
+        Gemma-4-12B's dump is 45GB of float32 .npy on disk across 48 layers; holding every layer's
+        projection weights bf16-resident at once (~22.5GB) does not survive this box's real
+        headroom once production/desktop overhead is accounted for -- crashed the run twice.
+        mmap defers the bf16-round-then-widen to `mm()`'s per-call cast: the OS backs the float32 read with
+        reclaimable page cache instead of pinned anonymous memory, so peak RSS is bounded by one
+        weight matrix's transient cast, not all 48 layers' worth. Same rounding as before, paid per
+        matmul call instead of once (~30 min of cast overhead over an 800-position run, per the
+        prior measurement this replaces).
         """
-        return np.asarray(np.load(os.path.join(weights_dir, f"{n}.npy")).astype(np.float32), BF16)
+        return np.load(os.path.join(weights_dir, f"{n}.npy"), mmap_mode="r")
 
-    def mm(w_bf16, v):
-        return w_bf16.astype(np.float32) @ v
+    def mm(w_view, v):
+        """`w_view` is an mmap'd float32 view (see `npy_bf16`) -- round to bf16 THEN widen, so the
+        arithmetic matches `npy()`'s bf16-quantise-on-load contract exactly, just deferred."""
+        return np.asarray(np.asarray(w_view, BF16), np.float32) @ v
 
     def rms(x, w=None):
         """`w=None` is the v_norm case: gainless (with_scale=False in the checkpoint, so there is no
@@ -170,7 +174,7 @@ def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k):
     produced, tops, margins = [], [], []
     tok = prompt_ids[0]
     for pos in range(len(prompt_ids) + n_tokens - 1):
-        x = embed[tok].astype(np.float32) * scale
+        x = np.asarray(np.asarray(embed[tok], BF16), np.float32) * scale
         for l in range(NL):
             w = Wt[l]
             hd, kvh = sp.head_dim_for(l), sp.n_kv_heads_for(l)
