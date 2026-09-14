@@ -104,10 +104,13 @@ def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k):
         """
         return np.load(os.path.join(weights_dir, f"{n}.npy"), mmap_mode="r")
 
-    def mm(w_view, v):
-        """`w_view` is an mmap'd float32 view (see `npy_bf16`) -- round to bf16 THEN widen, so the
-        arithmetic matches `npy()`'s bf16-quantise-on-load contract exactly, just deferred."""
-        return np.asarray(np.asarray(w_view, BF16), np.float32) @ v
+    def cast_weight(w_view):
+        """Round an mmap'd float32 view (see `npy_bf16`) to bf16 THEN widen, so the arithmetic
+        matches `npy()`'s bf16-quantise-on-load contract exactly, just deferred to the caller."""
+        return np.asarray(np.asarray(w_view, BF16), np.float32)
+
+    def mm(w_f32, v):
+        return w_f32 @ v
 
     def rms(x, w=None):
         """`w=None` is the v_norm case: gainless (with_scale=False in the checkpoint, so there is no
@@ -146,11 +149,11 @@ def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k):
         partial = sp.rope_partial_rotary if g else None
         return rope(v, pos, hd, theta, partial)
 
-    embed = npy_bf16(f"{sp.weight_prefix}embed_tokens.weight")
+    # embed_tokens is also the tied lm head (mm(embed_f32, ...) below), hit once per generated
+    # token (33 times across a 32-token run) -- materialised once here for the same reason the
+    # per-layer tensors are, in materialized_layer_weights().
+    embed_f32 = cast_weight(npy_bf16(f"{sp.weight_prefix}embed_tokens.weight"))
     n_final = npy(f"{sp.weight_prefix}norm.weight")
-
-    def bf16_round(a):
-        return np.asarray(np.asarray(a, BF16), np.float32)
 
     def layer_weights(l):
         p = f"{sp.weight_prefix}layers.{l}."
@@ -165,6 +168,21 @@ def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k):
         w["Wd"] = npy_bf16(p + "mlp.down_proj.weight")
         if sp.layer_scalar:
             w["ls"] = float(npy(sp.layer_scalar_name(l)).reshape(-1)[0])
+        return w
+
+    BIG_TENSORS = ("Wq", "Wk", "Wv", "Wo", "Wg", "Wu", "Wd")
+
+    def materialized_layer_weights(l):
+        """`layer_weights(l)` plus the once-per-call `cast_weight()` `mm()` used to do internally.
+        Split out so the prefix sweep below can cast ONCE per layer and reuse across every known
+        position instead of once per (position, layer) -- the mmap fix amortised the disk READ
+        across positions, but not this, and the cast dominated: measured on the real 48-layer model,
+        the P=64 (smallest of 7 lengths) run was still going after 16 minutes with only 20 of ~45GB
+        read, CPU-bound the whole time, not I/O-blocked."""
+        w = layer_weights(l)
+        for key in BIG_TENSORS:
+            if key in w:
+                w[key] = cast_weight(w[key])
         return w
 
     def layer_step(l, w, xi, pos, kc_l, vc_l):
@@ -225,13 +243,13 @@ def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k):
     # this box has 30GB RAM against a 45GB dump, so re-reading the whole model per position (the
     # position-outer form still below, for the tail) thrashes rather than merely being slow. This
     # is the batched half of "batched prefill"; the free-running tail cannot be, see below.
-    x = np.stack([bf16_round(np.asarray(embed[t])) for t in prompt_ids]) * scale
+    x = embed_f32[np.asarray(prompt_ids)] * scale
     for l in range(NL):
-        w = layer_weights(l)
+        w = materialized_layer_weights(l)
         for pos in range(P):
             x[pos] = layer_step(l, w, x[pos], pos, kc[l], vc[l])
 
-    lg = mm(embed, rms(x[P - 1], n_final))        # tied lm head, only the transition position
+    lg = mm(embed_f32, rms(x[P - 1], n_final))     # tied lm head, only the transition position
     if sp.logit_softcap is not None:
         c = sp.logit_softcap
         lg = c * np.tanh(lg / c)
@@ -244,10 +262,10 @@ def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k):
     for pos in range(P, P + n_tokens - 1):
         if len(produced) >= n_tokens:
             break
-        xi = bf16_round(embed[tok]) * scale
+        xi = embed_f32[tok] * scale
         for l in range(NL):
-            xi = layer_step(l, layer_weights(l), xi, pos, kc[l], vc[l])
-        lg = mm(embed, rms(xi, n_final))
+            xi = layer_step(l, materialized_layer_weights(l), xi, pos, kc[l], vc[l])
+        lg = mm(embed_f32, rms(xi, n_final))
         if sp.logit_softcap is not None:
             c = sp.logit_softcap
             lg = c * np.tanh(lg / c)
