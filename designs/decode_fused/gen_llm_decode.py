@@ -196,7 +196,9 @@ def _pack(w, site):
         return bf16(w).reshape(-1)
     kw = {}
     if spec.dtype in precision.SYMMETRIC:
-        kw["clip_search"] = spec.scale_kind == "clip"
+        kw["clip_search"] = spec.scale_kind in ("clip", "clip_full")
+        if spec.scale_kind == "clip_full":
+            kw["full_range"] = True
     else:
         kw["affine_zero_on_grid"] = spec.scale_kind == "zero_grid"
     layout = _BUILD_STATE["layout"]
@@ -1368,13 +1370,14 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
     # which operator declares which buffer, how many shim channels are spent). Refusing here is
     # what turns "undefined symbol" and "weight byte-size mismatch: buf 6291456 vs arr 1671168"
     # into a named rule.
-    _pdtypes, _pkind = precision.packer_capability()
+    _pdtypes, _pkind, _pfull = precision.packer_capability()
     precision_ctx = precision.GraphContext(
         fused_layer=decode_layer_why is None and FUSE_DECODE_LAYER,
         fuse_o=fuse_o, fused_qkv_gemv=bool(FUSE_QKV_GEMV),
         fused_qkv_dp=qkv_dp_why is None,
         d_model=D, ffn=FF, q_dim=QD, head_dim=HD, attn_cols=COLS,
-        packer_dtypes=_pdtypes, packer_takes_scale_kind=_pkind)
+        packer_dtypes=_pdtypes, packer_takes_scale_kind=_pkind,
+        packer_takes_full_range=_pfull)
     precision.check(PRECISION_PLAN, precision_ctx)
     print(f"[gen] precision [{PRECISION_PROV}]")
     for _line in precision.describe(PRECISION_PLAN, sp.name).splitlines()[1:]:
@@ -2573,7 +2576,9 @@ def main():
             "qkv_dtype": _spec("qkv").dtype,
             "qkv_group_size": _spec("qkv").group_size or 128,
             "head_dtype": _spec("head").dtype, "head_group_size": _spec("head").group_size or 128,
-            "clip_search": any(v.scale_kind == "clip" for v in PRECISION_PLAN.values()),
+            "clip_search": any(v.scale_kind in ("clip", "clip_full")
+                              for v in PRECISION_PLAN.values()),
+            "full_range": any(v.scale_kind == "clip_full" for v in PRECISION_PLAN.values()),
         },
     }
     prov = toolchain_provenance()

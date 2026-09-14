@@ -42,9 +42,11 @@ _HEADER_BYTES = {"int4": 4, "int8": 4, "int4a": 4, "int8a": 4}
 SCALE_KINDS = {
     BF16: ("none",),
     # Symmetric: how the per-group scale is chosen. `clip` grid-searches the clip ratio that
-    # minimises the group's reconstruction MSE; same wire format, host-side only.
-    "int4": ("absmax", "clip"),
-    "int8": ("absmax", "clip"),
+    # minimises the group's reconstruction MSE; same wire format, host-side only. `clip_full`
+    # searches the same ratio over all 2**n levels rather than the symmetric subset -- the only
+    # kind that can land on the grid of a checkpoint QAT-trained for this width (K025).
+    "int4": ("absmax", "clip", "clip_full"),
+    "int8": ("absmax", "clip", "clip_full"),
     # Affine: where the offset puts the grid. `zero_grid` constrains the reconstruction grid to
     # contain exact zero; `free_min` fits the range. Which wins is per weight class and measured.
     "int4a": ("zero_grid", "free_min"),
@@ -338,6 +340,7 @@ class GraphContext:
     kv_dedicated_channels: bool = False
     packer_dtypes: Tuple[str, ...] = DTYPES
     packer_takes_scale_kind: bool = True
+    packer_takes_full_range: bool = True
 
 
 # The row width each site's weight is quantized along. A group runs along K, so K is what has to
@@ -457,6 +460,11 @@ def check(plan: Mapping[str, Spec], ctx: GraphContext) -> None:
             raise PrecisionRefusal(
                 "P001", f"{key}={spec}: the packer on this PYTHONPATH has no scale-selection "
                         f"argument, so scale_kind={spec.scale_kind!r} cannot be honoured")
+        if spec.scale_kind == "clip_full" and not ctx.packer_takes_full_range:
+            raise PrecisionRefusal(
+                "P001", f"{key}={spec}: the packer on this PYTHONPATH has no full_range argument, "
+                        f"so this would silently pack the symmetric subset -- the one failure "
+                        f"clip_full exists to avoid. Point IRON at a checkout that has it")
         for k in site_k(key, ctx):
             wire_row_units(spec, k)                  # P007
 
@@ -573,7 +581,7 @@ def predicted_ms_delta(plan: Mapping[str, Spec], spec_name: str = DEFAULT_CENSUS
             * MARGINAL_US_PER_MB / 1e3)
 
 
-def packer_capability() -> Tuple[Tuple[str, ...], bool]:
+def packer_capability() -> Tuple[Tuple[str, ...], bool, bool]:
     """What the packer on this PYTHONPATH can actually do.
 
     The build's own API gate checks that `quantize_weight` EXISTS. It has a signature too, and a
@@ -584,16 +592,18 @@ def packer_capability() -> Tuple[Tuple[str, ...], bool]:
         import inspect
         from iron.common.quant import quantize_weight
     except ImportError:
-        return (BF16,), False
+        return (BF16,), False, False
     params = inspect.signature(quantize_weight).parameters
     takes_kind = "clip_search" in params or "scale_kind" in params or \
+        any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+    takes_full_range = "full_range" in params or \
         any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
     try:
         from iron.common.quant import is_affine  # affine-capable packers export this
         dtypes = DTYPES
     except ImportError:
         dtypes = (BF16,) + SYMMETRIC
-    return dtypes, takes_kind
+    return dtypes, takes_kind, takes_full_range
 
 
 def describe(plan: Mapping[str, Spec], spec_name: str = DEFAULT_CENSUS_SPEC) -> str:
@@ -648,9 +658,10 @@ def suffix(plan: Mapping[str, Spec]) -> str:
 def resolved_context(spec_name: str = DEFAULT_CENSUS_SPEC, **over) -> GraphContext:
     """`spec_name`'s CENSUS_CTX with the packer capability of whatever IRON is on this
     PYTHONPATH. Falls back to QWEN3_06B's dims for a spec with no census-context entry."""
-    dtypes, kind = packer_capability()
+    dtypes, kind, full_range = packer_capability()
     base = CENSUS_CTX.get(spec_name, QWEN3_06B)
-    return replace(base, packer_dtypes=dtypes, packer_takes_scale_kind=kind, **over)
+    return replace(base, packer_dtypes=dtypes, packer_takes_scale_kind=kind,
+                   packer_takes_full_range=full_range, **over)
 
 
 def _main(argv):
