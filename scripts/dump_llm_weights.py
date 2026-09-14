@@ -61,6 +61,11 @@ def main():
                     help="quantize onto all 2**n levels rather than the symmetric subset. "
                          "Needed to land on the grid of a checkpoint QAT-trained for this "
                          "width; worth ~0.5 points on any other checkpoint (K025).")
+    ap.add_argument("--quant-scale-dtype", default="f32", choices=("f32", "bf16"),
+                    help="stored width of the per-group scale. mv_quant.cc casts it to bfloat16 "
+                         "before the MAC either way, so f32 stores 2 B/group the core discards -- "
+                         "1 bit/weight at int4 g32. The kernel must be built to match "
+                         "(GEMV(scale_dtype=...) -> -DSCALE_BF16), so the two move together.")
     ap.add_argument("--quant-clip-search", action="store_true",
                     help="per-group MSE-optimal scale instead of amax/qmax. Pair with "
                          "--quant-full-range: the grid-exact scale is a search candidate.")
@@ -184,7 +189,8 @@ def main():
         quant.json round-trip needed for the value itself). The scale-selection axes ride here
         too so that every packing path in this script -- dense, K-chunked and head-chunked --
         goes through one funnel and cannot disagree about the format."""
-        kw = {"full_range": a.quant_full_range, "clip_search": a.quant_clip_search}
+        kw = {"full_range": a.quant_full_range, "clip_search": a.quant_clip_search,
+              "scale_dtype": a.quant_scale_dtype}
         if a.quant_layout != "row_group_planar":
             return kw
         vec = min(64, a.quant_group)
@@ -263,6 +269,7 @@ def main():
         "dtype": a.quant,
         "group_size": a.quant_group,
         "layout": a.quant_layout,
+        "scale_dtype": a.quant_scale_dtype,
         "full_range": a.quant_full_range,
         "clip_search": a.quant_clip_search,
         "packed": sorted(packed),
@@ -273,8 +280,9 @@ def main():
 
     tail = ""
     if packed:
-        bits = ((4 if a.quant == "int4" else 8) * a.quant_group + 32) / a.quant_group
-        tail = f", {len(packed)} packed at {a.quant} g{a.quant_group} = {bits:.2f} bits/weight"
+        _scale_bits = 32 if a.quant_scale_dtype == "f32" else 16
+        bits = ((4 if a.quant == "int4" else 8) * a.quant_group + _scale_bits) / a.quant_group
+        tail = f", {len(packed)} packed at {a.quant} g{a.quant_group} scale {a.quant_scale_dtype} = {bits:.2f} bits/weight"
     print(f"wrote {n} tensors to {a.out} (spec {sp.name}, {NL} layers) -- all shapes checked{tail}")
 
 
