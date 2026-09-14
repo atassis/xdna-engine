@@ -119,7 +119,11 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(a.model, dtype=torch.bfloat16, **kw).eval()
 
     quant_stats = None
-    if a.quant_dtype != "bf16":
+    # `--quant-from` SETS quant_dtype, and it is read inside this block -- so gating only on
+    # quant_dtype made the flag a no-op that still wrote a plausible reference with
+    # quant=null. A bf16 oracle handed to an int4 gate is the exact confusion the flag
+    # exists to prevent, and verify_llm_decode.py can only refuse it when it is declared.
+    if a.quant_dtype != "bf16" or a.quant_from:
         # The packer IS the kernel's on-wire format (iron/operators/gemv/quant.py, byte-for-byte
         # with mv_quant.cc), so a roundtrip through it reproduces exactly the numbers the device
         # computes with -- not an approximation of them.

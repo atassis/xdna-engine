@@ -189,9 +189,14 @@ def main():
 
     def _layout_kw(K):
         """quantize_weight kwargs for one tensor's OWN K (post-chunking) -- row_group is a
-        pure function of (K, group_size, dtype), so this always agrees with what GEMV's own
-        __post_init__ derives for a GEMV built at the same K/group/dtype (no shared state, no
-        quant.json round-trip needed for the value itself). The scale-selection axes ride here
+        pure function of (K, group_size, dtype, SCALE_DTYPE), so this always agrees with what
+        GEMV's own __post_init__ derives for a GEMV built at the same four (no shared state,
+        no quant.json round-trip needed for the value itself). The scale width is in it
+        because it sets the row stride: at int4/g32/K=3840 an f32 scale gives stride 2400 and
+        row_group 1, a bf16 scale gives 2160 and row_group 2. Omitting it here defaulted the
+        derivation to f32 and packed every bf16-scale dump one block-shape off what the
+        kernel reads -- silently, because the bytes are a permutation and every value is
+        still there. The scale-selection axes ride here
         too so that every packing path in this script -- dense, K-chunked and head-chunked --
         goes through one funnel and cannot disagree about the format."""
         kw = {"full_range": a.quant_full_range, "clip_search": a.quant_clip_search,
@@ -202,7 +207,8 @@ def main():
         from iron.common.quant import widest_chunk
         vec = widest_chunk(a.quant_group, a.quant)
         kw.update(layout=a.quant_layout,
-                  row_group=derive_row_group([K], a.quant_group, a.quant, vec_size=vec))
+                  row_group=derive_row_group([K], a.quant_group, a.quant, vec_size=vec,
+                                             scale_dtype=a.quant_scale_dtype))
         return kw
 
     # Row-chunk budget for packing the tied head/embedding -- bounds quantize_weight's OWN

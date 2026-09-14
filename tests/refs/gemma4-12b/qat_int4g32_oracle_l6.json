@@ -1,0 +1,53 @@
+{
+  "model": "/mnt/data/xdna/artifacts/gemma4-12b-qat/checkpoint",
+  "layers": 6,
+  "logit_softcap_disabled": true,
+  "logit_softcap_value": 30.0,
+  "prompt": "The capital of France is",
+  "prompt_ids": [
+    818,
+    5279,
+    529,
+    7001,
+    563
+  ],
+  "gen_ids": [
+    98309,
+    258882,
+    193649,
+    130189,
+    258882,
+    92165,
+    96432,
+    253761
+  ],
+  "margins": [
+    17.0,
+    146.0,
+    12.0,
+    2.0,
+    244.0,
+    6.0,
+    5.0,
+    9.0
+  ],
+  "quant": {
+    "dtype": "int4",
+    "group": 32,
+    "tensors": 41,
+    "leaves": [
+      "down_proj",
+      "gate_proj",
+      "k_proj",
+      "o_proj",
+      "q_proj",
+      "up_proj",
+      "v_proj"
+    ],
+    "mean_weight_rel_l2": 0.0021148981333414954,
+    "max_weight_rel_l2": 0.002175128785893321,
+    "skipped_not_group_aligned": []
+  },
+  "hf_f32_gen_ids": null,
+  "note": "Faithful bf16 host forward via the checkpoint's own modeling code -- the oracle a bf16 DEVICE should match 1:1. `margins` is top1-top2 per step: a mismatch at a margin near the device's own logit error is a knife-edge, not a defect. hf_f32_gen_ids is kept for contrast; it is NOT the gate."
+}

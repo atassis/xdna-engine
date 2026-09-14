@@ -109,11 +109,11 @@ from iron.operators.gemv.design import MAX_GROUP_REUSE  # noqa: E402
 # mis-pointed IRON tree, which is the failure scripts/build_llm_decode.sh's gate exists to prevent.
 try:                                                                            # noqa: E402
     from iron.common.quant import (                                            # noqa: E402
-        quantize_weight, row_stride_bytes, derive_row_group)                    # noqa: E402
+        quantize_weight, row_stride_bytes, derive_row_group, widest_chunk)      # noqa: E402
 except ModuleNotFoundError:                                                     # noqa: E402
     try:                                                                        # noqa: E402
         from iron.operators.gemv.quant import quantize_weight, row_stride_bytes  # noqa: E402
-        derive_row_group = None  # pre-move tree: row_group_planar is unavailable  # noqa: E402
+        derive_row_group = widest_chunk = None  # pre-move tree: no row_group_planar  # noqa: E402
     except ModuleNotFoundError as e:                                            # noqa: E402
         raise ModuleNotFoundError(
             "no weight packer in this IRON tree: tried iron.common.quant (post-6a347dc) and "
@@ -214,8 +214,13 @@ def _pack(w, site):
             )
         K = w.shape[-1]
         kw["layout"] = layout
+        # K026: the width is `widest_chunk`, not `min(64, group_size)`. Those agreed until
+        # chunk_scales (IRON 836ac0d) let a chunk span two groups and doubled the reader's
+        # width for int4; this site kept the old rule, so int4 g32 sbf16 at K=3840 packed
+        # row_group=1 while GEMV read row_group=2 -- a silent layout mismatch on every
+        # K=3840 site. int8 g64 is unaffected (both rules give 64).
         kw["row_group"] = derive_row_group([K], spec.group_size, spec.dtype,
-                                           vec_size=min(64, spec.group_size),
+                                           vec_size=widest_chunk(spec.group_size, spec.dtype),
                                            scale_dtype=_BUILD_STATE["scale_dtype"])
     if _BUILD_STATE["scale_dtype"] != "f32":
         kw["scale_dtype"] = _BUILD_STATE["scale_dtype"]
@@ -1014,15 +1019,21 @@ def gemv(M, K, ctx, **kw):
         # derive_row_group then refuses it. Pin tsi to the row_group only when the free answer
         # would violate it; every site whose free answer already clears this (mlp/attn_o/qkv, as
         # built and shipped) takes the same tsi as today, unchanged.
-        rg = derive_row_group([K], kw["group_size"], wdt, vec_size=min(64, kw["group_size"]))
+        rg = derive_row_group([K], kw["group_size"], wdt,
+                              vec_size=widest_chunk(kw["group_size"], wdt),
+                              scale_dtype=_BUILD_STATE["scale_dtype"])
         if tsi % rg:
             tsi, tso = gemv_tile_output(M, K, a_row_bytes=a_row_bytes, tsi=rg)
     g = kw.get("group_size", 0)
     if g and g < 64:
-        # mv_quant.cc's dequant chunk must not straddle a quant group, and GEMV asserts
-        # group_size % kernel_vector_size == 0. 64 is the default and the only width the shipped
-        # groups (>=128) ever needed; a 32-wide group needs 32.
-        kw["kernel_vector_size"] = g
+        # The width a chunk may span, from the one function that owns it. This used to pin
+        # kernel_vector_size = group_size on the premise that "the dequant chunk must not
+        # straddle a quant group" -- true until chunk_scales (IRON 836ac0d) made mv_quant.cc
+        # build the scale vector as two half-broadcasts. GEMV's own guard already allows
+        # kvs == 2*group_size; this was the last site still enforcing the old rule, and it
+        # capped int4 g32 at 32 lanes on a 64-lane core (0.438 bundles/element against
+        # int8 g64's 0.250) no matter what widest_chunk derived upstream.
+        kw["kernel_vector_size"] = widest_chunk(g, wdt)
     return GEMV(M=M, K=K, num_aie_columns=COLS, tile_size_input=tsi,
                 tile_size_output=tso, context=ctx, **kw)
 
