@@ -112,6 +112,11 @@ def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k):
     def mm(w_f32, v):
         return w_f32 @ v
 
+    def mm_batch(w_f32, X):
+        """Batched form of mm(): X is (P, D_in), returns (P, D_out) -- ONE GEMM reusing w_f32
+        across every row instead of P separate GEMVs. See layer_step_batch()."""
+        return X @ w_f32.T
+
     def rms(x, w=None):
         """`w=None` is the v_norm case: gainless (with_scale=False in the checkpoint, so there is no
         weight tensor to load -- multiplying by 1.0 is the operator's own definition, not a stand-in
@@ -148,6 +153,29 @@ def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k):
         theta = sp.rope_theta_global if g else sp.rope_theta_local
         partial = sp.rope_partial_rotary if g else None
         return rope(v, pos, hd, theta, partial)
+
+    def rope_batch(v, positions, hd, theta, partial):
+        """Batched form of rope(): `v` is (P, n_heads*hd), `positions` is (P,) absolute positions
+        -- each row rotated by ITS OWN position's angle. Identical math to calling rope() once per
+        row; only vectorized across rows (and, as in rope(), across heads within a row)."""
+        inv = 1.0 / (theta ** (np.arange(0, hd, 2, dtype=np.float64)[:hd // 2] / hd))
+        if partial is not None:
+            inv[int(partial * hd // 2):] = 0.0
+        pos_col = np.asarray(positions, dtype=np.float64).reshape(-1, 1)
+        c = np.cos(pos_col * inv).astype(np.float32)[:, None, :]
+        s = np.sin(pos_col * inv).astype(np.float32)[:, None, :]
+        v = v.reshape(v.shape[0], -1, hd)
+        x1, x2 = v[..., :hd // 2], v[..., hd // 2:]
+        return np.concatenate([x1 * c - x2 * s, x2 * c + x1 * s], -1).reshape(v.shape[0], -1)
+
+    def rope_for_batch(l, v, positions):
+        hd = sp.head_dim_for(l)
+        if not dual_rope:
+            return rope_batch(v, positions, hd, sp.rope_theta_global, None)
+        g = sp.is_global(l)
+        theta = sp.rope_theta_global if g else sp.rope_theta_local
+        partial = sp.rope_partial_rotary if g else None
+        return rope_batch(v, positions, hd, theta, partial)
 
     # embed_tokens is also the tied lm head (mm(embed_f32, ...) below), hit once per generated
     # token (33 times across a 32-token run) -- materialised once here for the same reason the
@@ -230,6 +258,58 @@ def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k):
             xi = xi * w["ls"]
         return xi
 
+    def layer_step_batch(l, w, X, positions, kc_l, vc_l):
+        """Batched form of layer_step(): `X` is (P, D) for a KNOWN batch of `positions`. Every
+        projection and the MLP run as ONE GEMM across all P rows instead of P separate GEMVs --
+        this is the actual fix for the cost mm() showed under profiling (80% of runtime, 21980
+        GEMV calls: each one re-reads a whole weight matrix to do a single row's worth of work).
+        Attention stays per-position (causal, and cheap relative to the projections/MLP -- only
+        head_dim-by-window sized, not D- or FFN-sized), reading the SAME kc_l/vc_l this batch-fills
+        up front; that's safe because attention at position `pos` only ever reads up to `pos`,
+        never beyond, regardless of whether later positions' K/V were already written too."""
+        P_ = X.shape[0]
+        hd, kvh = sp.head_dim_for(l), sp.n_kv_heads_for(l)
+        grp, has_v, is_glob = sp.n_q_heads // kvh, sp.has_v_proj(l), sp.is_global(l)
+        window = None if (sp.sliding_window is None or is_glob) else sp.sliding_window
+
+        H = rms(X, w["n_in"])
+        Q, K = mm_batch(w["Wq"], H), mm_batch(w["Wk"], H)
+        V = mm_batch(w["Wv"], H) if has_v else None
+        if sp.v_norm:
+            src = (K if not has_v else V).reshape(P_, kvh, hd)
+            V = np.stack([rms(src[:, i, :]) for i in range(kvh)], axis=1).reshape(P_, kvh * hd)
+        if sp.qk_norm:
+            Qh = Q.reshape(P_, sp.n_q_heads, hd)
+            Q = np.stack([rms(Qh[:, i, :], w["n_qn"]) for i in range(sp.n_q_heads)],
+                        axis=1).reshape(P_, sp.n_q_heads * hd)
+            Kh = K.reshape(P_, kvh, hd)
+            K = np.stack([rms(Kh[:, i, :], w["n_kn"]) for i in range(kvh)],
+                        axis=1).reshape(P_, kvh * hd)
+        Q, K = rope_for_batch(l, Q, positions), rope_for_batch(l, K, positions)
+        kc_l[:, positions, :] = K.reshape(P_, kvh, hd).transpose(1, 0, 2)
+        vc_l[:, positions, :] = V.reshape(P_, kvh, hd).transpose(1, 0, 2)
+        Qh = Q.reshape(P_, sp.n_q_heads, hd)
+        Ctx = np.empty((P_, sp.n_q_heads, hd), np.float32)
+        for i, pos in enumerate(positions):
+            lo = 0 if window is None else max(0, pos - window + 1)
+            for hh in range(sp.n_q_heads):
+                kvi = hh // grp
+                sc = (kc_l[kvi, lo:pos + 1] @ Qh[i, hh]) * attn_scale
+                sc = np.exp(sc - sc.max())
+                Ctx[i, hh] = (sc / sc.sum()) @ vc_l[kvi, lo:pos + 1]
+        A_out = mm_batch(w["Wo"], Ctx.reshape(P_, -1))
+        if sp.sandwich_norms:
+            A_out = rms(A_out, w["n_pa"])
+        X = X + A_out
+        HF = rms(X, w["n_pf"])
+        D_out = mm_batch(w["Wd"], act(mm_batch(w["Wg"], HF)) * mm_batch(w["Wu"], HF))
+        if sp.sandwich_norms:
+            D_out = rms(D_out, w["n_pff"])
+        X = X + D_out
+        if sp.layer_scalar:
+            X = X * w["ls"]
+        return X
+
     P = len(prompt_ids)
     S = P + n_tokens + 1
     kc = [np.zeros((sp.n_kv_heads_for(l), S, sp.head_dim_for(l)), np.float32) for l in range(NL)]
@@ -244,10 +324,9 @@ def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k):
     # position-outer form still below, for the tail) thrashes rather than merely being slow. This
     # is the batched half of "batched prefill"; the free-running tail cannot be, see below.
     x = embed_f32[np.asarray(prompt_ids)] * scale
+    positions = np.arange(P)
     for l in range(NL):
-        w = materialized_layer_weights(l)
-        for pos in range(P):
-            x[pos] = layer_step(l, w, x[pos], pos, kc[l], vc[l])
+        x = layer_step_batch(l, materialized_layer_weights(l), x, positions, kc[l], vc[l])
 
     lg = mm(embed_f32, rms(x[P - 1], n_final))     # tied lm head, only the transition position
     if sp.logit_softcap is not None:
