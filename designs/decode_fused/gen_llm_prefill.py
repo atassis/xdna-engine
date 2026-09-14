@@ -1302,7 +1302,7 @@ def check_shared_weights(dec_meta_path, weights_dir, sp, dims):
     Skipped when the caller has no weights (`--no-golden`); it costs one layer's tensors otherwise.
     """
     bdir = os.path.join(os.path.dirname(os.path.abspath(dec_meta_path)), "buffers")
-    npy = lambda t: np.load(os.path.join(weights_dir, f"model.layers.0.{t}.weight.npy"))
+    npy = lambda t: np.load(os.path.join(weights_dir, f"{sp.weight_prefix}layers.0.{t}.weight.npy"))
     raw = lambda n: np.fromfile(os.path.join(bdir, f"L0_{n}.bin"), dtype=BF16)
     same = lambda a, b: np.array_equal(np.asarray(a).view(np.uint16),
                                        np.asarray(np.asarray(b).astype(BF16)).view(np.uint16))
@@ -1328,6 +1328,13 @@ def check_shared_weights(dec_meta_path, weights_dir, sp, dims):
           "Wo's first D rows are o_proj (decode pads the tail for fuse_o)")
     for nm, t in (("Wg", "mlp.gate_proj"), ("Wu", "mlp.up_proj"), ("Wd", "mlp.down_proj")):
         claim(same(raw(nm), npy(t).reshape(-1)), f"{nm} is {t} unreordered")
+
+    if sp.layer_scalar:
+        # layer_scalar_name() has no ".weight" suffix, unlike every other leaf `npy()` assumes --
+        # a bespoke load. decode's `L0_ls` buffer holds it broadcast D-wide (same value every row).
+        ls_val = np.load(os.path.join(weights_dir, f"{sp.layer_scalar_name(0)}.npy")).reshape(-1)[0]
+        claim(same(raw("ls"), np.full(D, ls_val, np.float32)),
+              "ls is the layer_scalar gain, broadcast D-wide")
 
     w = raw("Wqkv").reshape(-1, D)
     q, k, v = (npy(f"self_attn.{r}_proj") for r in ("q", "k", "v"))
