@@ -149,8 +149,10 @@ def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k):
     embed = npy_bf16(f"{sp.weight_prefix}embed_tokens.weight")
     n_final = npy(f"{sp.weight_prefix}norm.weight")
 
-    Wt = {}
-    for l in range(NL):
+    def bf16_round(a):
+        return np.asarray(np.asarray(a, BF16), np.float32)
+
+    def layer_weights(l):
         p = f"{sp.weight_prefix}layers.{l}."
         w = {k_: npy(v) for k_, v in sp.norm_weight_names(l).items()}
         w["Wq"] = npy_bf16(p + "self_attn.q_proj.weight")
@@ -163,73 +165,97 @@ def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k):
         w["Wd"] = npy_bf16(p + "mlp.down_proj.weight")
         if sp.layer_scalar:
             w["ls"] = float(npy(sp.layer_scalar_name(l)).reshape(-1)[0])
-        Wt[l] = w
+        return w
 
-    S = len(prompt_ids) + n_tokens + 1
+    def layer_step(l, w, xi, pos, kc_l, vc_l):
+        """Layer `l`'s attention+MLP block on residual `xi` at absolute position `pos`, against
+        this layer's own KV cache slices. Same ops regardless of whether the caller is sweeping a
+        batch of known positions or a single free-running one -- see the two call sites below."""
+        hd, kvh = sp.head_dim_for(l), sp.n_kv_heads_for(l)
+        grp, has_v, is_glob = sp.n_q_heads // kvh, sp.has_v_proj(l), sp.is_global(l)
+        window = None if (sp.sliding_window is None or is_glob) else sp.sliding_window
+
+        h = rms(xi, w["n_in"])
+        q, k_ = mm(w["Wq"], h), mm(w["Wk"], h)
+        v = mm(w["Wv"], h) if has_v else None
+        if sp.v_norm:
+            # attention_k_eq_v: v_norm reads the RAW k projection -- before qk-norm and RoPE,
+            # which mutate q/k_ below -- and its output IS v; mirrors gen_llm_prefill.py's
+            # ordering exactly (op_vn runs before qn_runs/op_kn in the emitted op list).
+            src = k_ if not has_v else v
+            v = np.concatenate([rms(src.reshape(kvh, hd)[i]) for i in range(kvh)])
+        if sp.qk_norm:
+            q = np.concatenate([rms(q.reshape(sp.n_q_heads, hd)[i], w["n_qn"])
+                                for i in range(sp.n_q_heads)])
+            k_ = np.concatenate([rms(k_.reshape(kvh, hd)[i], w["n_kn"]) for i in range(kvh)])
+        q, k_ = rope_for(l, q, pos), rope_for(l, k_, pos)
+        kc_l[:, pos, :] = k_.reshape(kvh, hd)
+        vc_l[:, pos, :] = v.reshape(kvh, hd)
+        qh = q.reshape(sp.n_q_heads, hd)
+        ctx = np.empty((sp.n_q_heads, hd), np.float32)
+        lo = 0 if window is None else max(0, pos - window + 1)
+        for hh in range(sp.n_q_heads):
+            kvi = hh // grp
+            sc = (kc_l[kvi, lo:pos + 1] @ qh[hh]) * attn_scale
+            sc = np.exp(sc - sc.max())
+            ctx[hh] = (sc / sc.sum()) @ vc_l[kvi, lo:pos + 1]
+        a_out = mm(w["Wo"], ctx.reshape(-1))
+        if sp.sandwich_norms:
+            a_out = rms(a_out, w["n_pa"])
+        xi = xi + a_out
+        hf = rms(xi, w["n_pf"])
+        d_out = mm(w["Wd"], act(mm(w["Wg"], hf)) * mm(w["Wu"], hf))
+        if sp.sandwich_norms:
+            d_out = rms(d_out, w["n_pff"])
+        xi = xi + d_out
+        if sp.layer_scalar:
+            xi = xi * w["ls"]
+        return xi
+
+    P = len(prompt_ids)
+    S = P + n_tokens + 1
     kc = [np.zeros((sp.n_kv_heads_for(l), S, sp.head_dim_for(l)), np.float32) for l in range(NL)]
     vc = [np.zeros((sp.n_kv_heads_for(l), S, sp.head_dim_for(l)), np.float32) for l in range(NL)]
     scale = np.sqrt(D) if sp.embed_scale == "sqrt_d_model" else 1.0
     attn_scale = sp.attn_scale
 
-    produced, tops, margins = [], [], []
-    tok = prompt_ids[0]
-    for pos in range(len(prompt_ids) + n_tokens - 1):
-        x = np.asarray(np.asarray(embed[tok], BF16), np.float32) * scale
-        for l in range(NL):
-            w = Wt[l]
-            hd, kvh = sp.head_dim_for(l), sp.n_kv_heads_for(l)
-            grp, has_v, is_glob = sp.n_q_heads // kvh, sp.has_v_proj(l), sp.is_global(l)
-            window = None if (sp.sliding_window is None or is_glob) else sp.sliding_window
+    # KNOWN prefix (every input token is prompt_ids, teacher-forced): sweep LAYER-outer instead of
+    # position-outer. Every position needs the SAME layer's weights, so loading them once per layer
+    # instead of once per (position, layer) cuts this portion's weight reads from O(P) to O(1) --
+    # this box has 30GB RAM against a 45GB dump, so re-reading the whole model per position (the
+    # position-outer form still below, for the tail) thrashes rather than merely being slow. This
+    # is the batched half of "batched prefill"; the free-running tail cannot be, see below.
+    x = np.stack([bf16_round(np.asarray(embed[t])) for t in prompt_ids]) * scale
+    for l in range(NL):
+        w = layer_weights(l)
+        for pos in range(P):
+            x[pos] = layer_step(l, w, x[pos], pos, kc[l], vc[l])
 
-            h = rms(x, w["n_in"])
-            q, k_ = mm(w["Wq"], h), mm(w["Wk"], h)
-            v = mm(w["Wv"], h) if has_v else None
-            if sp.v_norm:
-                # attention_k_eq_v: v_norm reads the RAW k projection -- before qk-norm and RoPE,
-                # which mutate q/k_ below -- and its output IS v; mirrors gen_llm_prefill.py's
-                # ordering exactly (op_vn runs before qn_runs/op_kn in the emitted op list).
-                src = k_ if not has_v else v
-                v = np.concatenate([rms(src.reshape(kvh, hd)[i]) for i in range(kvh)])
-            if sp.qk_norm:
-                q = np.concatenate([rms(q.reshape(sp.n_q_heads, hd)[i], w["n_qn"])
-                                    for i in range(sp.n_q_heads)])
-                k_ = np.concatenate([rms(k_.reshape(kvh, hd)[i], w["n_kn"]) for i in range(kvh)])
-            q, k_ = rope_for(l, q, pos), rope_for(l, k_, pos)
-            kc[l][:, pos, :] = k_.reshape(kvh, hd)
-            vc[l][:, pos, :] = v.reshape(kvh, hd)
-            qh = q.reshape(sp.n_q_heads, hd)
-            ctx = np.empty((sp.n_q_heads, hd), np.float32)
-            lo = 0 if window is None else max(0, pos - window + 1)
-            for hh in range(sp.n_q_heads):
-                kvi = hh // grp
-                sc = (kc[l][kvi, lo:pos + 1] @ qh[hh]) * attn_scale
-                sc = np.exp(sc - sc.max())
-                ctx[hh] = (sc / sc.sum()) @ vc[l][kvi, lo:pos + 1]
-            a_out = mm(w["Wo"], ctx.reshape(-1))
-            if sp.sandwich_norms:
-                a_out = rms(a_out, w["n_pa"])
-            x = x + a_out
-            hf = rms(x, w["n_pf"])
-            d_out = mm(w["Wd"], act(mm(w["Wg"], hf)) * mm(w["Wu"], hf))
-            if sp.sandwich_norms:
-                d_out = rms(d_out, w["n_pff"])
-            x = x + d_out
-            if sp.layer_scalar:
-                x = x * w["ls"]
-        lg = mm(embed, rms(x, n_final))        # tied lm head
+    lg = mm(embed, rms(x[P - 1], n_final))        # tied lm head, only the transition position
+    if sp.logit_softcap is not None:
+        c = sp.logit_softcap
+        lg = c * np.tanh(lg / c)
+    ids, vals = topk(lg, k)
+    produced, tops, margins = [ids[0]], [(ids, vals)], [vals[0] - vals[1]]
+    tok = ids[0]
+
+    # FREE-RUNNING tail: each position's input is the PREVIOUS position's sampled output, so this
+    # genuinely cannot be batched -- position-outer, layer-inner, weights reloaded every step.
+    for pos in range(P, P + n_tokens - 1):
+        if len(produced) >= n_tokens:
+            break
+        xi = bf16_round(embed[tok]) * scale
+        for l in range(NL):
+            xi = layer_step(l, layer_weights(l), xi, pos, kc[l], vc[l])
+        lg = mm(embed, rms(xi, n_final))
         if sp.logit_softcap is not None:
             c = sp.logit_softcap
             lg = c * np.tanh(lg / c)
         ids, vals = topk(lg, k)
-        if pos + 1 < len(prompt_ids):
-            tok = prompt_ids[pos + 1]         # teacher-force through the prompt
-        else:
-            produced.append(ids[0])
-            tops.append((ids, vals))
-            margins.append(vals[0] - vals[1])
-            tok = ids[0]
-        if len(produced) >= n_tokens:
-            break
+        produced.append(ids[0])
+        tops.append((ids, vals))
+        margins.append(vals[0] - vals[1])
+        tok = ids[0]
     return produced, tops, margins
 
 
