@@ -161,7 +161,7 @@ def _spec(site):
 # (every site shares one on-wire row shape); set from the dump's own quant.json declaration in
 # build_graph, before any GEMV is constructed, and read here rather than threaded as a parameter
 # because _quant_kw/_pack are module-level and the dump isn't known until a spec_name is chosen.
-_BUILD_STATE = {"layout": "header_first"}
+_BUILD_STATE = {"layout": "header_first", "scale_dtype": "f32"}
 
 
 def _quant_kw(site):
@@ -175,6 +175,10 @@ def _quant_kw(site):
     kw = dict(weight_dtype=spec.dtype, group_size=spec.group_size)
     if _BUILD_STATE["layout"] != "header_first":
         kw["layout"] = _BUILD_STATE["layout"]
+    if _BUILD_STATE["scale_dtype"] != "f32":
+        # Sizes the weight buffer's row and the kernel's header: a build that reads a bf16-scale
+        # dump with the f32 stride lands every payload pointer n_groups*2 bytes late.
+        kw["scale_dtype"] = _BUILD_STATE["scale_dtype"]
     return kw
 
 
@@ -211,7 +215,10 @@ def _pack(w, site):
         K = w.shape[-1]
         kw["layout"] = layout
         kw["row_group"] = derive_row_group([K], spec.group_size, spec.dtype,
-                                           vec_size=min(64, spec.group_size))
+                                           vec_size=min(64, spec.group_size),
+                                           scale_dtype=_BUILD_STATE["scale_dtype"])
+    if _BUILD_STATE["scale_dtype"] != "f32":
+        kw["scale_dtype"] = _BUILD_STATE["scale_dtype"]
     return quantize_weight(w, spec.group_size, spec.dtype, **kw)
 
 
@@ -574,6 +581,12 @@ def sequence_name(sp, NL, S, placer_flags, decode_layer_active=False, T=None, tm
         _frag = f"{_tag}{_sp.dtype}g{_sp.group_size}"
         if _sp != precision.parse_spec(f"{_sp.dtype}/g{_sp.group_size}", _site):
             _frag += _sp.scale_kind
+        # Unlike scale_kind, the scale WIDTH changes the graph: it sizes the weight row and picks
+        # the kernel's header type, so two arms differing in it are different ELFs and must not
+        # share a name. It rides every quantized fragment because the dump declares one width for
+        # all of them.
+        if _BUILD_STATE["scale_dtype"] != "f32":
+            _frag += f"s{_BUILD_STATE['scale_dtype']}"
         parts.append(_frag)
     if SPLIT_QKNORM:
         parts.append("splitqk")
@@ -1200,6 +1213,13 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
             f"{_qmf_path}: dump is row_group_planar but this IRON tree has no derive_row_group "
             f"(pre-6a347dc). Point IRON at a tree past the quant.py move.")
     _BUILD_STATE["layout"] = _dump_layout
+    # Same adoption rule as layout: one on-wire scale width for the whole dump, taken from the
+    # manifest rather than declared here. Old dumps have no key and are f32, which is what every
+    # build before this axis wrote.
+    _dump_scale_dtype = _qmf.get("scale_dtype", "f32")
+    if _dump_scale_dtype not in ("f32", "bf16"):
+        raise SystemExit(f"{_qmf_path}: unknown scale_dtype {_dump_scale_dtype!r}")
+    _BUILD_STATE["scale_dtype"] = _dump_scale_dtype
     if PACKED and _qmf.get("dtype", "bf16") == "bf16":
         raise SystemExit(f"{_qmf_path}: lists {len(PACKED)} packed tensors but dtype is bf16")
     if PACKED:
