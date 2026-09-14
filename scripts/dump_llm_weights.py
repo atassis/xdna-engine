@@ -47,6 +47,10 @@ def main():
     ap.add_argument("--spec", required=True, choices=sorted(SPECS))
     ap.add_argument("--out", required=True)
     ap.add_argument("--repo", default=None, help="override the HF repo id")
+    ap.add_argument("--checkpoint-dir", default=None,
+                    help="read safetensors from this local directory instead of resolving --repo "
+                         "through the HF cache. For a checkpoint already fetched to a local_dir, "
+                         "which the cache does not see and would otherwise re-download.")
     ap.add_argument("--layers", type=int, default=None)
     ap.add_argument("--quant", default="bf16", choices=("bf16", "int4", "int8"),
                     help="pack the PROJECTION matrices at this width (norms stay f32 and readable; "
@@ -111,10 +115,16 @@ def main():
                          "(derive_row_group); this IRON tree only has the pre-move "
                          "iron.operators.gemv.quant. Point IRON at a tree past 6a347dc.")
 
-    from huggingface_hub import snapshot_download
     from safetensors import safe_open
 
-    path = snapshot_download(repo, allow_patterns=["*.safetensors", "*.json"])
+    if a.checkpoint_dir:
+        path = a.checkpoint_dir
+        if not any(f.endswith(".safetensors") for f in os.listdir(path)):
+            ap.error(f"--checkpoint-dir {path} holds no .safetensors")
+        repo = f"{path} (local)"
+    else:
+        from huggingface_hub import snapshot_download
+        path = snapshot_download(repo, allow_patterns=["*.safetensors", "*.json"])
     shards = [os.path.join(path, f) for f in sorted(os.listdir(path)) if f.endswith(".safetensors")]
     index = {}
     for s in shards:
