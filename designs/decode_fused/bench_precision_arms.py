@@ -118,7 +118,7 @@ def main():
         arm["params"].write("sm_mask", int(a.pos + 1))
         arm["params"].sync()
         arm["c"]()
-        return float(arm["c"].last_elapsed)
+        return float(arm["c"].last_elapsed) * 1e3
 
     for arm in arms:
         for _ in range(a.warmup):
