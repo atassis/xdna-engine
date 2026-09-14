@@ -84,17 +84,28 @@ pub fn render(port: u16, started_unix: u64, status: &[ModelStatus]) -> String {
         std::process::id(), crate::http::models_json(status))
 }
 
-/// Blocking accept loop, one connection at a time -- control traffic is rare and every request
-/// answered here is immediate, so there is no case for the concurrency `http::serve_on` also does
-/// not have.
+/// Accept loop, one thread per connection.
+///
+/// It used to serve connections inline, on the reasoning that control traffic is rare and every
+/// answer here is immediate. The second half was never true: a status read is served from
+/// [`LiveStatus`] and is immediate, but anything MUTATING goes to the actor and waits as long as
+/// the actor is busy. Inline, one `npu model stop` behind a long generation stopped the socket
+/// answering at all -- including the status reads that would have explained why.
 pub fn serve(listener: UnixListener, handle: Handle, live: LiveStatus, cfg_path: PathBuf) {
     for stream in listener.incoming() {
-        match stream {
-            Ok(s) => { if let Err(e) = handle_conn(s, &handle, &live, &cfg_path) {
+        let s = match stream {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[npu-control] accept: {e}");
+                continue;
+            }
+        };
+        let (handle, live, cfg_path) = (handle.clone(), live.clone(), cfg_path.clone());
+        let _ = std::thread::Builder::new().name("npu-control".into()).spawn(move || {
+            if let Err(e) = handle_conn(s, &handle, &live, &cfg_path) {
                 eprintln!("[npu-control] {e}");
-            } }
-            Err(e) => eprintln!("[npu-control] accept: {e}"),
-        }
+            }
+        });
     }
 }
 

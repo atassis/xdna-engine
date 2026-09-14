@@ -5,6 +5,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use crate::actor::Handle;
@@ -18,6 +19,10 @@ use npu_engine::FinishReason;
 
 const MAX_BODY: usize = 16 * 1024 * 1024;
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Connections served at once. A ceiling, not a tuning knob: past it the honest answer is 503
+/// rather than an unbounded thread pile, and the device behind them is single-tenant anyway.
+const MAX_CONNECTIONS: usize = 64;
 
 /// A parsed request, enough for routing.
 pub struct Request {
@@ -83,19 +88,28 @@ pub struct SseStream {
     created: i64,
     model: String,
     kind: SseKind,
+    /// Set when this response's client goes away. The generator polls it at every dispatch
+    /// boundary, which is what lets a prefill -- emitting nothing for minutes -- still be stopped.
+    cancel: npu_engine::Cancel,
     /// Render frames from the per-token records instead of the plain text items, and close with a
     /// summary frame. Off, the stream is byte-for-byte what it was before telemetry existed.
     stats: bool,
 }
 
 impl SseStream {
-    fn new(rx: std::sync::mpsc::Receiver<StreamItem>, model: String, kind: SseKind, stats: bool) -> SseStream {
+    fn new(
+        rx: std::sync::mpsc::Receiver<StreamItem>,
+        model: String,
+        kind: SseKind,
+        stats: bool,
+        cancel: npu_engine::Cancel,
+    ) -> SseStream {
         let prefix = match kind {
             SseKind::Chat => "chatcmpl",
             SseKind::Completion => "cmpl",
             SseKind::OllamaChat => "ollama",
         };
-        SseStream { rx, id: gen_id(prefix), created: unix_now(), model, kind, stats }
+        SseStream { rx, id: gen_id(prefix), created: unix_now(), model, kind, stats, cancel }
     }
 
     /// The identity every rendered line shares, so the SSE frames and the run log cannot disagree
@@ -291,12 +305,16 @@ fn chat_completions(req: &Request, handle: &Handle) -> Response {
         Ok(p) => p,
         Err(e) => return (400, format!("{{\"error\":\"{}\"}}", parse::json_escape(&e)).into()),
     };
+    // Cloned BEFORE the params move into the actor: this is the handle the READER uses to stop the
+    // WRITER once the client goes away, and it is the only path that works while prefill is
+    // producing nothing.
+    let cancel = parsed.params.cancel.clone();
     let served = match handle.generate(parsed.model.as_deref(), parsed.prompt, parsed.params) {
         Ok(s) => s,
         Err(e) => return engine_err(&e),
     };
     if parsed.stream {
-        (200, Body::Stream(SseStream::new(served.value, served.model, SseKind::Chat, parsed.stats)))
+        (200, Body::Stream(SseStream::new(served.value, served.model, SseKind::Chat, parsed.stats, cancel)))
     } else {
         render_buffered(served.model, served.value, SseKind::Chat)
     }
@@ -350,12 +368,16 @@ fn ollama_chat(req: &Request, handle: &Handle) -> Response {
         Ok(p) => p,
         Err(e) => return (400, format!("{{\"error\":\"{}\"}}", parse::json_escape(&e)).into()),
     };
+    // Cloned BEFORE the params move into the actor: this is the handle the READER uses to stop the
+    // WRITER once the client goes away, and it is the only path that works while prefill is
+    // producing nothing.
+    let cancel = parsed.params.cancel.clone();
     let served = match handle.generate(parsed.model.as_deref(), parsed.prompt, parsed.params) {
         Ok(s) => s,
         Err(e) => return engine_err(&e),
     };
     if parsed.stream {
-        (200, Body::Stream(SseStream::new(served.value, served.model, SseKind::OllamaChat, false)))
+        (200, Body::Stream(SseStream::new(served.value, served.model, SseKind::OllamaChat, false, cancel)))
     } else {
         render_ollama_buffered(served.model, served.value)
     }
@@ -370,7 +392,8 @@ fn render_ollama_buffered(model: String, rx: std::sync::mpsc::Receiver<StreamIte
         match rx.recv() {
             Ok(StreamItem::Text(t)) => text.push_str(&t),
             Ok(StreamItem::ToolCall(c)) => calls.push(c),
-            Ok(StreamItem::Step(_)) => {}
+            // A buffered caller sees nothing until the end; progress has no one to reassure.
+            Ok(StreamItem::Step(_)) | Ok(StreamItem::Progress { .. }) => {}
             Ok(StreamItem::Done { reason, report, .. }) => break (reason, report),
             Ok(StreamItem::Error(e)) => return engine_err(&e),
             Err(_) => return (500, "{\"error\":\"generation ended without a result\"}".into()),
@@ -386,12 +409,16 @@ fn completions(req: &Request, handle: &Handle) -> Response {
         Ok(p) => p,
         Err(e) => return (400, format!("{{\"error\":\"{}\"}}", parse::json_escape(&e)).into()),
     };
+    // Cloned BEFORE the params move into the actor: this is the handle the READER uses to stop the
+    // WRITER once the client goes away, and it is the only path that works while prefill is
+    // producing nothing.
+    let cancel = parsed.params.cancel.clone();
     let served = match handle.generate(parsed.model.as_deref(), parsed.prompt, parsed.params) {
         Ok(s) => s,
         Err(e) => return engine_err(&e),
     };
     if parsed.stream {
-        (200, Body::Stream(SseStream::new(served.value, served.model, SseKind::Completion, parsed.stats)))
+        (200, Body::Stream(SseStream::new(served.value, served.model, SseKind::Completion, parsed.stats, cancel)))
     } else {
         render_buffered(served.model, served.value, SseKind::Completion)
     }
@@ -421,6 +448,7 @@ fn render_buffered(model: String, rx: std::sync::mpsc::Receiver<StreamItem>, kin
             Ok(StreamItem::Step(r)) => {
                 if let Some(l) = log.as_mut() { l.line(&wire::chunk_line(&r, &meta)); }
             }
+            Ok(StreamItem::Progress { .. }) => {}
             Ok(StreamItem::Done { reason, report, .. }) => break (reason, report),
             // Classified, not blanket-500: a prompt that does not fit the context window is the
             // caller's to fix, and `engine_err` already knows that `Unsupported` is a 400.
@@ -720,11 +748,34 @@ pub fn serve(handle: Handle, cfg_path: PathBuf, port: u16) -> std::io::Result<()
 /// `local_addr()` before handing the listener over here -- no bind-then-guess race.
 pub fn serve_on(listener: TcpListener, handle: Handle, cfg_path: PathBuf) -> std::io::Result<()> {
     eprintln!("[npu-serve] ready on http://{}", listener.local_addr()?);
+    let live = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     for stream in listener.incoming() {
-        match stream {
-            Ok(s) => { if let Err(e) = handle_conn(s, &handle, &cfg_path) { eprintln!("[npu-serve] {e}"); } }
-            Err(e) => eprintln!("[npu-serve] accept: {e}"),
+        let s = match stream {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[npu-serve] accept: {e}");
+                continue;
+            }
+        };
+        // A connection per thread. The DEVICE stays serialized -- the actor is still its only owner
+        // -- but the socket must not be: handling connections in the accept loop made one slow
+        // request a total outage, and `/health` (a constant, touching no state) could not answer
+        // while a generation ran because the loop never came back to accept it.
+        if live.fetch_add(1, Ordering::Relaxed) >= MAX_CONNECTIONS {
+            live.fetch_sub(1, Ordering::Relaxed);
+            let mut s = s;
+            let _ = respond(&mut s, 503, &"{\"error\":\"too many connections\"}".into());
+            continue;
         }
+        let (handle, cfg_path, live) = (handle.clone(), cfg_path.clone(), live.clone());
+        // Detached: nothing joins these, and a panicking connection must not take the listener with
+        // it. `handle_conn` already converts its own errors into responses.
+        let _ = std::thread::Builder::new().name("npu-http".into()).spawn(move || {
+            if let Err(e) = handle_conn(s, &handle, &cfg_path) {
+                eprintln!("[npu-serve] {e}");
+            }
+            live.fetch_sub(1, Ordering::Relaxed);
+        });
     }
     Ok(())
 }
@@ -809,7 +860,46 @@ fn handle_conn(mut stream: TcpStream, handle: &Handle, cfg_path: &Path) -> std::
 /// Write one response, over any stream that can be written to -- TCP (this module's own callers) or
 /// the control socket (`control_socket.rs`), so a streamed generation renders byte-identically
 /// regardless of transport.
-pub(crate) fn respond<W: Write>(stream: &mut W, code: u16, body: &Body) -> std::io::Result<()> {
+/// How often a streaming response asks whether its client is still there.
+///
+/// Needed because "did a write fail" is not an answer during prefill: nothing is being written.
+/// Bounds detection to this plus one dispatch.
+const PEER_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Whether the client is still connected, WITHOUT consuming anything it sent.
+///
+/// The default is "alive". A transport that cannot answer cheaply must never guess `false`: a
+/// wrong "gone" kills a live generation, which is strictly worse than noticing a dead one late.
+pub(crate) trait PeerAlive {
+    fn peer_alive(&self) -> bool {
+        true
+    }
+}
+
+impl PeerAlive for TcpStream {
+    /// `peek` is `recv(MSG_PEEK)`: it looks without consuming, so a pipelined request still arrives
+    /// intact. `Ok(0)` is the orderly close we are hunting; `WouldBlock` is a healthy connection
+    /// with nothing to say, which is the common case and must not read as gone.
+    fn peer_alive(&self) -> bool {
+        if self.set_nonblocking(true).is_err() {
+            return true;
+        }
+        let alive = match self.peek(&mut [0u8; 1]) {
+            Ok(0) => false,
+            Ok(_) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => true,
+            Err(_) => false,
+        };
+        let _ = self.set_nonblocking(false);
+        alive
+    }
+}
+
+/// The control socket is the CLI, which does not abandon a request mid-flight the way a browser
+/// does. Left on the default rather than given a second implementation nothing exercises.
+impl PeerAlive for std::os::unix::net::UnixStream {}
+
+pub(crate) fn respond<W: Write + PeerAlive>(stream: &mut W, code: u16, body: &Body) -> std::io::Result<()> {
     if let Body::Stream(s) = body {
         return respond_stream(stream, code, s);
     }
@@ -831,6 +921,33 @@ pub(crate) fn reason_phrase(code: u16) -> &'static str {
     }
 }
 
+/// The next item, or `None` once the generation is over.
+///
+/// This is where a streaming response learns its client left. Waiting on the channel alone cannot
+/// tell: during prefill the generator produces nothing for minutes, so there is no write to fail
+/// and no item to arrive. Polling the socket on the timeout is the only signal that does not
+/// require traffic -- and setting `cancel` is what reaches the generator, which is otherwise
+/// several dispatches deep in the driver.
+///
+/// `Err` is returned only for a write failure by the caller; a vanished peer is a clean end.
+fn next_item<W: Write + PeerAlive>(
+    stream: &mut W,
+    s: &SseStream,
+) -> std::io::Result<Option<StreamItem>> {
+    loop {
+        match s.rx.recv_timeout(PEER_POLL_INTERVAL) {
+            Ok(item) => return Ok(Some(item)),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(None),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if !stream.peer_alive() {
+                    s.cancel.cancel(npu_engine::CancelReason::PeerGone);
+                    return Ok(None);
+                }
+            }
+        }
+    }
+}
+
 /// Stream Server-Sent Events as the actor produces them: one `data:` frame per item, `[DONE]`
 /// terminates. No `Content-Length` -- the length is not known up front, which is the whole point.
 ///
@@ -838,7 +955,7 @@ pub(crate) fn reason_phrase(code: u16) -> &'static str {
 /// stream, which drops `s.rx` on the way out. The actor's next `tx.send` then fails and the
 /// generator's sink returns `false` -- this is the entire disconnect-abort mechanism; nothing here
 /// signals the actor directly.
-fn respond_stream<W: Write>(stream: &mut W, code: u16, s: &SseStream) -> std::io::Result<()> {
+fn respond_stream<W: Write + PeerAlive>(stream: &mut W, code: u16, s: &SseStream) -> std::io::Result<()> {
     if matches!(s.kind, SseKind::OllamaChat) {
         return respond_ndjson(stream, code, s);
     }
@@ -855,7 +972,7 @@ fn respond_stream<W: Write>(stream: &mut W, code: u16, s: &SseStream) -> std::io
     // OpenAI indexes tool calls within the choice, and a client concatenates argument fragments by
     // that index. We emit each call whole, so every index appears exactly once.
     let mut tool_calls_seen = 0usize;
-    for item in s.rx.iter() {
+    while let Some(item) = next_item(stream, s)? {
         // Exactly one of `Text` and `Step` drives the frames, never both: a record's `emit` is the
         // same bytes the text item carries, so the stream reads identically either way. With stats
         // off this is byte-for-byte the stream that existed before telemetry.
@@ -863,6 +980,13 @@ fn respond_stream<W: Write>(stream: &mut W, code: u16, s: &SseStream) -> std::io
             StreamItem::Text(t) => {
                 if s.stats { continue }
                 s.render_text(&t)
+            }
+            // An SSE COMMENT, not a data frame: spec-legal, ignored by every client, and it is what
+            // stops a proxy timing out a prefill that produces nothing for minutes. A `data:` frame
+            // would reach a strict client as an unknown object in the middle of a completion.
+            StreamItem::Progress { prefilled, total } => {
+                stream.write_all(format!(": prefill {prefilled}/{total}\n\n").as_bytes())?;
+                continue;
             }
             StreamItem::Step(r) => {
                 if log.is_none() && !s.stats { continue }
@@ -906,6 +1030,14 @@ fn respond_stream<W: Write>(stream: &mut W, code: u16, s: &SseStream) -> std::io
         };
         stream.write_all(format!("data: {frame}\n\n").as_bytes())?;
     }
+    // A client that left gets no terminator -- there is nobody to read it -- but the LOG still owes
+    // an ending, or this run is a header and nothing else.
+    if let Some(r) = s.cancel.reason() {
+        if let Some(l) = log.as_mut() {
+            l.line(&wire::aborted_line(&meta, r.as_str()));
+        }
+        return Ok(());
+    }
     stream.write_all(b"data: [DONE]\n\n")?;
     stream.flush()
 }
@@ -916,18 +1048,19 @@ fn respond_stream<W: Write>(stream: &mut W, code: u16, s: &SseStream) -> std::io
 ///
 /// The disconnect-abort mechanism is the SSE path's, unchanged: a failed write drops `s.rx`, the
 /// actor's next send fails, and the generator's sink returns false.
-fn respond_ndjson<W: Write>(stream: &mut W, code: u16, s: &SseStream) -> std::io::Result<()> {
+fn respond_ndjson<W: Write + PeerAlive>(stream: &mut W, code: u16, s: &SseStream) -> std::io::Result<()> {
     let head = format!(
         "HTTP/1.1 {code} {}\r\nContent-Type: application/x-ndjson\r\nCache-Control: no-cache\r\n\
          Connection: close\r\n\r\n", reason_phrase(code));
     stream.write_all(head.as_bytes())?;
     let stamp = s.created_at();
-    for item in s.rx.iter() {
+    while let Some(item) = next_item(stream, s)? {
         let line = match item {
             StreamItem::Text(t) => crate::ollama::chat_chunk(&s.model, &stamp, &t),
             // A tool call has no other carrier on this wire, so it is never suppressed.
             StreamItem::ToolCall(c) => crate::ollama::chat_tool_call_chunk(&s.model, &stamp, &c),
-            StreamItem::Step(_) => continue,
+            // Ollama's wire is NDJSON; it has no comment syntax to carry a heartbeat in.
+            StreamItem::Step(_) | StreamItem::Progress { .. } => continue,
             StreamItem::Done { reason, report, .. } =>
                 crate::ollama::chat_done(&s.model, &stamp, reason, &report),
             // Ollama has no error frame in-stream; a client reads the field and stops.
@@ -2572,7 +2705,7 @@ pub(crate) mod generate_tests {
                     assert!(frame["choices"][0]["finish_reason"].is_null());
                     texts.push(t);
                 }
-                StreamItem::Step(_) | StreamItem::ToolCall(_) => {}
+                StreamItem::Step(_) | StreamItem::ToolCall(_) | StreamItem::Progress { .. } => {}
                 StreamItem::Done { reason, .. } => {
                     let frame: serde_json::Value = serde_json::from_str(&s.render_done(reason)).unwrap();
                     assert_eq!(frame["choices"][0]["finish_reason"], reason.as_str());
@@ -3028,5 +3161,67 @@ mod ollama_route_tests {
         // 1970-01-01T00:00:00Z and a date past a leap year, so the civil conversion is exercised.
         assert_eq!(rfc3339(0), "1970-01-01T00:00:00Z");
         assert_eq!(rfc3339(1_700_000_000), "2023-11-14T22:13:20Z");
+    }
+}
+
+#[cfg(test)]
+mod cancel_tests {
+    use super::*;
+
+    /// A socket that reports its client gone and accepts writes. Both halves matter: the probe must
+    /// be what decides, not a write that happens to fail.
+    struct Peer(bool);
+    impl std::io::Write for Peer {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> { Ok(b.len()) }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+    impl PeerAlive for Peer {
+        fn peer_alive(&self) -> bool { self.0 }
+    }
+
+    fn stream(cancel: npu_engine::Cancel) -> (std::sync::mpsc::Sender<StreamItem>, SseStream) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        (tx, SseStream::new(rx, "m".into(), SseKind::Chat, false, cancel))
+    }
+
+    /// The whole point. With nothing on the channel -- which is exactly prefill, for minutes -- no
+    /// write can fail, so the only way to learn the client left is to ASK; and asking has to reach
+    /// the generator, which is several dispatches deep in the driver and reads only this flag.
+    #[test]
+    fn a_vanished_peer_cancels_the_generation_with_no_traffic_at_all() {
+        let cancel = npu_engine::Cancel::new();
+        // `_tx` is HELD: dropping it would end the wait by disconnecting the channel, which is the
+        // other exit and would make this pass for the wrong reason.
+        let (_tx, s) = stream(cancel.clone());
+        assert!(next_item(&mut Peer(false), &s).unwrap().is_none());
+        assert_eq!(cancel.reason(), Some(npu_engine::CancelReason::PeerGone));
+    }
+
+    /// The control, and the one that matters more: a connection with nothing to say is the COMMON
+    /// case, and reading it as gone would kill every live generation that pauses.
+    #[test]
+    fn a_quiet_but_live_peer_is_not_cancelled() {
+        let cancel = npu_engine::Cancel::new();
+        let (tx, s) = stream(cancel.clone());
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(600));
+            let _ = tx.send(StreamItem::Text("hi".into()));
+        });
+        // Spans several poll intervals, so the probe is consulted repeatedly and must keep saying
+        // "still there" rather than timing the generation out.
+        let got = next_item(&mut Peer(true), &s).unwrap();
+        assert!(matches!(got, Some(StreamItem::Text(_))), "a quiet connection was treated as gone");
+        assert!(!cancel.is_cancelled());
+    }
+
+    /// A finished generation is not a cancelled one: the actor dropping its sender is the ordinary
+    /// end, and it must not be recorded as the client leaving.
+    #[test]
+    fn a_finished_generation_ends_without_a_cancel_reason() {
+        let cancel = npu_engine::Cancel::new();
+        let (tx, s) = stream(cancel.clone());
+        drop(tx);
+        assert!(next_item(&mut Peer(true), &s).unwrap().is_none());
+        assert_eq!(cancel.reason(), None);
     }
 }

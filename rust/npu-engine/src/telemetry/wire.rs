@@ -214,6 +214,20 @@ pub fn summary_line(r: &GenerationReport, m: &RunMeta, reason: FinishReason) -> 
     line
 }
 
+/// A run that ended because its CLIENT did, written where the summary line would have gone.
+///
+/// The generator's `Done` cannot reach the surface that keeps this log -- the receiver is gone by
+/// then, which is the whole reason the run ended -- so without this the record for an abandoned run
+/// stops at its header. That is the run most likely to need explaining and the least explained.
+pub fn aborted_line(m: &RunMeta, reason: &str) -> Value {
+    json!({
+        "object": "npu.run.aborted",
+        "id": m.id,
+        "model": m.model,
+        "reason": reason,
+    })
+}
+
 /// Our own namespaced view: the things no other engine reports, and the ones it would be dishonest
 /// to fold into a compat field.
 pub fn npu_object(s: &Summary) -> Value {

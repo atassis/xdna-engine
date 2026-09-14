@@ -3,7 +3,7 @@
 //! XRT/`ElfResident` backend against a measured fused-decode artifact is a later agent's job.
 
 use std::collections::VecDeque;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::api::EngineError;
 use crate::llm::config::ModelConfig;
@@ -196,6 +196,52 @@ fn reuse_on_batched_prefill() -> bool {
 /// How many leading ids two sequences share.
 fn common_prefix_len(a: &[u32], b: &[u32]) -> usize {
     a.iter().zip(b).take_while(|(x, y)| x == y).count()
+}
+
+/// Dispatch groups between cancellation checks on the BATCHED prefill path. One group is
+/// `prefill_batch()` positions, so this trades cancel latency against per-call overhead; 1 means
+/// every batch, which is what the per-token path does anyway.
+const PREFILL_CHUNKS_PER_CHECK: usize = 1;
+
+/// How often prefill tells the sink it is still alive. Not per position: a 6k-token prompt would
+/// emit 6k frames. Chosen well under the 60 s socket timeout so a long prefill cannot look idle.
+const PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Prefill's cancellation and heartbeat seam.
+///
+/// Two cadences on purpose. The cancel flag is read on EVERY call -- an atomic load next to a
+/// device dispatch is free, and it is what makes the stop latency one dispatch. A `Progress` chunk
+/// goes out on a TIME cadence, because its job is to keep the connection from looking idle and to
+/// give the sink something to refuse, neither of which needs per-position resolution.
+struct PrefillProgress {
+    total: u32,
+    /// `None` until the first frame, so one goes out as soon as prefill has done anything. A long
+    /// prompt should say "started" at its first dispatch, not one interval into a silence.
+    last: Option<Instant>,
+}
+
+impl PrefillProgress {
+    fn new(total: u32) -> PrefillProgress {
+        PrefillProgress { total, last: None }
+    }
+
+    /// `false` once this generation should stop -- either the flag was set, or the sink refused the
+    /// progress chunk, which is the same "the client is gone" answer the decode loop already acts on.
+    fn tick(
+        &mut self,
+        prefilled: usize,
+        cancel: &crate::cancel::Cancel,
+        sink: &mut dyn FnMut(Chunk<'_>) -> bool,
+    ) -> bool {
+        if cancel.is_cancelled() {
+            return false;
+        }
+        if self.last.is_some_and(|t| t.elapsed() < PROGRESS_INTERVAL) {
+            return true;
+        }
+        self.last = Some(Instant::now());
+        sink(Chunk::Progress { prefilled: prefilled as u32, total: self.total })
+    }
 }
 
 /// Push `text` through the parser, replacing it with what the parser released and returning the
@@ -611,19 +657,51 @@ impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
         // (`prefill_break_even_tokens`) over the hardcoded fallback (`prefill_min_tokens()`), so a
         // rebuilt artifact with a different dispatch cost cannot silently reuse a stale number.
         let break_even = self.decode.prefill_break_even_tokens().unwrap_or_else(prefill_min_tokens);
-        if self.decode.prefill_batch().is_some() && batchable - batched_from >= break_even {
-            primed = self.decode.prefill(&prompt_ids[..batchable], batched_from)?;
+        // Prefill's cancellation seam. Both arms below come back here between DISPATCHES, which is
+        // the finest granularity there is: a dispatch already on the device cannot be recalled.
+        let mut progress = PrefillProgress::new(prompt_tokens);
+        let mut prefill_stopped = false;
+        if let Some(batch) =
+            self.decode.prefill_batch().filter(|_| batchable - batched_from >= break_even)
+        {
+            // Chunked HERE rather than inside `prefill`, so a cancelled request stops after one
+            // group of dispatches instead of after the whole prompt.
+            let stride = batch * PREFILL_CHUNKS_PER_CHECK;
+            let mut at = batched_from;
+            while at < batchable {
+                let end = (at + stride).min(batchable);
+                let now = self.decode.prefill(&prompt_ids[..end], at)?;
+                // A backend that primed nothing is DECLINING (see `DecodeStep::prefill`), and the
+                // per-token loop below takes over. Without this the loop spins on it forever.
+                if now <= at {
+                    break;
+                }
+                at = now;
+                if !progress.tick(at, &params.cancel, sink) {
+                    prefill_stopped = true;
+                    break;
+                }
+            }
+            primed = at;
         }
         let mut logits = Vec::new();
-        for (i, &tok) in prompt_ids.iter().enumerate().skip(primed) {
-            logits = self.decode.step(tok, i)?;
+        let mut prefilled = primed;
+        if !prefill_stopped {
+            for (i, &tok) in prompt_ids.iter().enumerate().skip(primed) {
+                logits = self.decode.step(tok, i)?;
+                prefilled = i + 1;
+                if !progress.tick(prefilled, &params.cancel, sink) {
+                    prefill_stopped = true;
+                    break;
+                }
+            }
         }
         prefill_us += t_prefill.elapsed().as_micros() as u64;
         let (prefill_dispatches, _) = counter_delta(&mut counters, self.decode.counters());
         let prefill = PrefillRecord {
             tokens: prompt_tokens,
             batched: primed as u32,
-            stepwise: (prompt_ids.len() - primed) as u32,
+            stepwise: (prefilled - primed) as u32,
             us: prefill_us,
             dispatches: prefill_dispatches,
         };
@@ -647,6 +725,12 @@ impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
         // Checked BOTH before sampling (so `max_tokens: 0` never samples at all) and again right
         // after a token is accepted (so the loop never pays for a device dispatch it will not use).
         'decode: loop {
+            // Covers both a prefill that stopped early and a cancel arriving mid-decode. FIRST, so
+            // `logits` is never sampled -- a stopped prefill leaves it empty or stale.
+            if prefill_stopped || params.cancel.is_cancelled() {
+                finish = FinishReason::Aborted;
+                break;
+            }
             if completion_tokens >= max_tokens {
                 finish = FinishReason::Length;
                 break;
@@ -821,8 +905,16 @@ impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
         // exactly that sequence -- it is the prompt ids with each accepted token pushed -- and it
         // is truncated to `pos` because the last sampled token was never fed back through `step`,
         // so its position holds nothing.
-        self.resident = history;
-        self.resident.truncate(pos);
+        // A prefill that stopped early primed fewer positions than `pos` counts, and a ledger that
+        // OVERSTATES the cache is the silent-wrong-answer path this field's doc warns about: the
+        // next request would reuse positions that hold nothing. Dropping it costs one re-prime.
+        match prefill_stopped {
+            true => self.resident.clear(),
+            false => {
+                self.resident = history;
+                self.resident.truncate(pos);
+            }
+        }
         let provenance = ArmProvenance { n_past: Some(pos as u32), ..self.decode.provenance() };
         let report = GenerationReport {
             tokenize_us,
@@ -1062,7 +1154,8 @@ mod tests {
         let (text, reason, usage) = gen
             .generate_to_string(&Prompt::Raw("a b c d e f g h i j k l m n o p q r s t u v".to_string()), &params)
             .unwrap();
-        assert_eq!(gen.backend().prefill_calls, vec![21], "prefill takes the prompt minus its last token");
+        let primed: usize = gen.backend().prefill_calls.iter().sum();
+        assert_eq!(primed, 21, "prefill takes the prompt minus its last token");
         assert_eq!(usage.prompt_tokens, 22);
         assert_eq!(text, "world");
         assert_eq!(reason, FinishReason::Stop);
@@ -1143,7 +1236,8 @@ mod tests {
         let (text, _, _) = gen
             .generate_to_string(&Prompt::Raw("a b c d e f g h i j k l m n o p q r s t u v".to_string()), &params)
             .unwrap();
-        assert_eq!(gen.backend().prefill_calls, vec![21]);
+        let primed: usize = gen.backend().prefill_calls.iter().sum();
+        assert_eq!(primed, 21);
         assert_eq!(text, "world", "the sampled logits came from step(pos=21), not from prefill");
     }
 
@@ -1202,7 +1296,7 @@ mod tests {
             match c {
                 Chunk::Step(r) => steps.push(r.clone()),
                 Chunk::Done { report: r, .. } => report = r.clone(),
-                Chunk::Text(_) | Chunk::ToolCall(_) => {}
+                Chunk::Text(_) | Chunk::ToolCall(_) | Chunk::Progress { .. } => {}
             }
             true
         })
@@ -1305,7 +1399,7 @@ mod tests {
             match c {
                 Chunk::Text(t) => streamed.push_str(t),
                 Chunk::Step(r) => from_records.push_str(&r.emit),
-                Chunk::Done { .. } | Chunk::ToolCall(_) => {}
+                Chunk::Done { .. } | Chunk::ToolCall(_) | Chunk::Progress { .. } => {}
             }
             true
         })
@@ -1323,7 +1417,7 @@ mod tests {
         let mut finish = None;
         gen.generate(&Prompt::Raw("hello".to_string()), &params, &mut |c| match c {
             Chunk::Text(_) => false, // abort on the very first text chunk
-            Chunk::Step(_) | Chunk::ToolCall(_) => true,
+            Chunk::Step(_) | Chunk::ToolCall(_) | Chunk::Progress { .. } => true,
             Chunk::Done { reason, .. } => {
                 finish = Some(reason);
                 true
@@ -1518,7 +1612,7 @@ mod tool_tests {
                     Chunk::Text(t) => text.push_str(t),
                     Chunk::ToolCall(tc) => calls.push(tc.clone()),
                     Chunk::Done { reason: r, .. } => reason = Some(r),
-                    Chunk::Step(_) => {}
+                    Chunk::Step(_) | Chunk::Progress { .. } => {}
                 }
                 true
             },
@@ -1556,7 +1650,7 @@ mod tool_tests {
                     Chunk::Text(t) => text.push_str(t),
                     Chunk::ToolCall(_) => calls += 1,
                     Chunk::Done { reason: r, .. } => reason = Some(r),
-                    Chunk::Step(_) => {}
+                    Chunk::Step(_) | Chunk::Progress { .. } => {}
                 }
                 true
             },
@@ -1600,6 +1694,134 @@ mod tool_tests {
             .unwrap();
         assert_eq!(text, "world");
         assert_eq!(reason, FinishReason::Stop);
+    }
+
+    // ---- cancellation -------------------------------------------------------------------------
+
+    /// A backend that counts its dispatches and can pull the cancel flag at a chosen one. That is
+    /// how "the client left in the middle of prefill" is reproduced with no device and no clock.
+    struct CancelAt {
+        dispatches: std::rc::Rc<std::cell::Cell<usize>>,
+        at: Option<usize>,
+        cancel: crate::cancel::Cancel,
+    }
+
+    impl DecodeStep for CancelAt {
+        fn step(&mut self, _token: u32, _pos: usize) -> Result<Vec<f32>, EngineError> {
+            let n = self.dispatches.get() + 1;
+            self.dispatches.set(n);
+            if self.at == Some(n) {
+                self.cancel.cancel(crate::cancel::CancelReason::PeerGone);
+            }
+            Ok(logit_for(2))
+        }
+    }
+
+    /// 20 tokens, enough that "stopped early" is distinguishable from "ran the prompt".
+    fn long_prompt() -> Prompt {
+        Prompt::Raw("hello world foo bar ".repeat(5).trim_end().to_string())
+    }
+
+    fn run_with(
+        cancel: crate::cancel::Cancel,
+        at: Option<usize>,
+        sink: &mut dyn FnMut(Chunk<'_>) -> bool,
+    ) -> (usize, Option<FinishReason>) {
+        let dispatches = std::rc::Rc::new(std::cell::Cell::new(0));
+        let decode = CancelAt { dispatches: dispatches.clone(), at, cancel: cancel.clone() };
+        let mut gen = LlmGenerator::new(build_cfg(None), decode);
+        let params = GenerateParams {
+            temperature: Some(0.0),
+            max_tokens: Some(8),
+            cancel,
+            ..GenerateParams::default()
+        };
+        let mut finish = None;
+        let mut tap = |c: Chunk<'_>| {
+            if let Chunk::Done { reason, .. } = c {
+                finish = Some(reason);
+            }
+            sink(c)
+        };
+        gen.generate(&long_prompt(), &params, &mut tap).unwrap();
+        (dispatches.get(), finish)
+    }
+
+    /// The defect this exists for: prefill emits nothing, so before the cancel flag there was no
+    /// way to stop it at all. Measured on device 2026-09-14, a ~6k-token Gemma-4 prefill ran ~60
+    /// minutes after the client had gone.
+    #[test]
+    fn a_cancel_before_the_first_dispatch_stops_prefill_at_one() {
+        let cancel = crate::cancel::Cancel::new();
+        cancel.cancel(crate::cancel::CancelReason::PeerGone);
+        let (dispatches, finish) = run_with(cancel, None, &mut |_| true);
+        assert_eq!(finish, Some(FinishReason::Aborted));
+        assert_eq!(dispatches, 1, "a cancelled request must not walk the prompt");
+    }
+
+    /// The floor, asserted: cancellation lands on the dispatch where the flag became visible, never
+    /// inside one. A dispatch already on the device cannot be recalled.
+    #[test]
+    fn a_cancel_during_prefill_stops_on_that_dispatch() {
+        let cancel = crate::cancel::Cancel::new();
+        let (dispatches, finish) = run_with(cancel, Some(3), &mut |_| true);
+        assert_eq!(finish, Some(FinishReason::Aborted));
+        assert_eq!(dispatches, 3, "stop is one dispatch, not one prompt");
+    }
+
+    /// Prefill must not be a silent gap. The frame is what a proxy sees instead of an idle
+    /// connection, and what the sink gets to refuse.
+    #[test]
+    fn prefill_reports_progress_against_the_real_prompt_length() {
+        let cancel = crate::cancel::Cancel::new();
+        let mut seen: Vec<(u32, u32)> = Vec::new();
+        let (_, finish) = run_with(cancel, None, &mut |c| {
+            if let Chunk::Progress { prefilled, total } = c {
+                seen.push((prefilled, total));
+            }
+            true
+        });
+        assert_eq!(finish, Some(FinishReason::Length), "this backend never emits EOS");
+        assert!(!seen.is_empty(), "a long prefill reported nothing");
+        let (prefilled, total) = seen[0];
+        assert_eq!(total, 20, "total is the prompt, not the window");
+        assert!(prefilled >= 1 && prefilled <= total, "{prefilled} of {total}");
+    }
+
+    /// A sink refusing a progress chunk is the same "client is gone" answer the decode loop already
+    /// acts on, and prefill has to honour it identically.
+    #[test]
+    fn a_sink_refusing_progress_aborts_prefill() {
+        let cancel = crate::cancel::Cancel::new();
+        let (dispatches, finish) =
+            run_with(cancel, None, &mut |c| !matches!(c, Chunk::Progress { .. }));
+        assert_eq!(finish, Some(FinishReason::Aborted));
+        assert_eq!(dispatches, 1);
+    }
+
+    /// The ledger must never outlive what was primed. A prefill stopped at dispatch 3 primed 3
+    /// positions; a ledger claiming 20 would answer the NEXT request from cache lines holding
+    /// nothing -- fluently, with no error. So the next run must re-prime the whole prompt.
+    #[test]
+    fn an_aborted_prefill_leaves_no_ledger_for_the_next_request() {
+        let dispatches = std::rc::Rc::new(std::cell::Cell::new(0));
+        let cancel = crate::cancel::Cancel::new();
+        let decode =
+            CancelAt { dispatches: dispatches.clone(), at: Some(3), cancel: cancel.clone() };
+        let mut gen = LlmGenerator::new(build_cfg(None), decode);
+        let base = GenerateParams { temperature: Some(0.0), max_tokens: Some(1), ..GenerateParams::default() };
+
+        let aborted = GenerateParams { cancel, ..base.clone() };
+        let (_, reason, _) = gen.generate_to_string(&long_prompt(), &aborted).unwrap();
+        assert_eq!(reason, FinishReason::Aborted);
+        assert_eq!(dispatches.get(), 3);
+
+        // Same prompt again, nothing cancelled. With a ledger left behind it would reuse the prefix
+        // and prime almost nothing; correct behaviour is to walk all 20 positions again.
+        dispatches.set(0);
+        let (_, reason, _) = gen.generate_to_string(&long_prompt(), &base).unwrap();
+        assert_ne!(reason, FinishReason::Aborted, "nothing cancelled the second run");
+        assert!(dispatches.get() >= 20, "re-primed only {} of 20 positions -- a stale ledger survived", dispatches.get());
     }
 }
 
@@ -1810,8 +2032,19 @@ mod ledger_tests {
         gen.generate_to_string(&Prompt::Raw(words(30)), &p).unwrap();
         // 30 resident; the next prompt shares all 30, and the batched path must ignore that.
         gen.generate_to_string(&Prompt::Raw(words(60)), &p).unwrap();
-        for (from, _) in primes.borrow().iter() {
-            assert_eq!(*from, 0, "batched prefill reused a prefix on an ungated path");
+        let calls = primes.borrow();
+        assert_eq!(calls.first().map(|c| c.0), Some(0), "the first generation did not start at zero");
+        for w in calls.windows(2) {
+            let (prev, cur) = (w[0], w[1]);
+            // Prefill is chunked at the call site, so `from` advances WITHIN one generation. A
+            // chunk that is neither the continuation nor a fresh start is a reused prefix.
+            // The log records (from, tokens.len()), so a continuation starts where the previous
+            // slice ENDED.
+            assert!(
+                cur.0 == prev.1 || cur.0 == 0,
+                "batched prefill resumed at {} after a chunk ending at {} -- a prefix was reused",
+                cur.0, prev.1
+            );
         }
     }
 
