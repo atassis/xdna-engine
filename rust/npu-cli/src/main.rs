@@ -113,7 +113,6 @@ fn run(cli: &Cli, path: &Path) -> Result<()> {
         Cmd::Chat { prompt, model, sampling, no_stream } =>
             chat(prompt.as_deref(), model.as_deref(), sampling, *no_stream, as_json),
         Cmd::Embed { text, model } => embed(text, model.as_deref(), as_json),
-        Cmd::Cancel => cancel_running(path),
         Cmd::Top { interval, once } => top(*interval, *once),
         Cmd::Stats { log, diff } => stats_cmd(log, diff.as_deref()),
         Cmd::Replay { log, realtime, frames } => replay_cmd(log, *realtime, *frames),
@@ -1163,6 +1162,13 @@ fn model_cmd(path: &Path, action: &ModelCmd, as_json: bool) -> Result<()> {
         ModelCmd::Ls { json, verbose } => model_ls(path, *json || as_json, *verbose),
         ModelCmd::Show { model, json } => model_show(path, model, *json || as_json),
         ModelCmd::Start { model } => model_start(path, model),
+        ModelCmd::Cancel { model, all } => match (model, all) {
+            (Some(m), _) => model_cancel(path, Some(m)),
+            (None, true) => model_cancel(path, None),
+            // Unreachable: `arg_required_else_help` prints help for the bare form.
+            (None, false) => Err(anyhow!(Tagged(Code::Failure,
+                "name a model, or pass --all".into()))),
+        },
         ModelCmd::Stop { model, all, soft } => match (model, all) {
             (Some(m), _) => model_stop(path, m, *soft),
             (None, true) => model_stop_all(path, *soft),
@@ -1493,7 +1499,8 @@ fn model_mutation_of(action: &ModelCmd) -> ModelMutation<'_> {
         ModelCmd::Enable { model } => ModelMutation::SetResident { model, on: true },
         ModelCmd::Disable { model } => ModelMutation::SetResident { model, on: false },
         ModelCmd::Default { capability, model } => ModelMutation::SetDefault { capability, model },
-        ModelCmd::Ls { .. } | ModelCmd::Show { .. } | ModelCmd::Start { .. } | ModelCmd::Stop { .. } =>
+        ModelCmd::Ls { .. } | ModelCmd::Show { .. } | ModelCmd::Start { .. }
+        | ModelCmd::Stop { .. } | ModelCmd::Cancel { .. } =>
             unreachable!("model_cmd routes these elsewhere"),
     }
 }
@@ -1561,14 +1568,26 @@ fn edit_via_service(addr: &str, m: &ModelMutation) -> Result<String> {
 /// not take it) where a non-zero exit would suggest the edit did not.
 /// `npu cancel`. Nothing to cancel is not an error: an operator racing the end of a generation
 /// must not be told something failed for winning the race.
-fn cancel_running(path: &Path) -> Result<()> {
+/// `npu model cancel`. `None` is the `--all` form: stop whatever is running.
+///
+/// Nothing to cancel is not an error. An operator racing the end of a generation and winning must
+/// not be told something failed for it.
+fn model_cancel(path: &Path, model: Option<&str>) -> Result<()> {
     let addr = resolve_http_addr(&load_cfg(path)?);
-    let body = http_post(&addr, "/admin/cancel", "")
+    let route = match model {
+        Some(m) => format!("/admin/models/{m}/cancel"),
+        None => "/admin/cancel".to_string(),
+    };
+    let body = http_post(&addr, &route, "")
         .context(Tagged(Code::NoService, "cancel (is the server running?)".into()))?;
     let v: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
-    match v.get("model").and_then(|m| m.as_str()) {
-        Some(m) => println!("{m}: generation cancelled"),
-        None => println!("nothing is running"),
+    if let Some(e) = v.get("error").and_then(|e| e.as_str()) { return Err(admin_err(e, &addr)) }
+    match (v.get("model").and_then(|m| m.as_str()), model) {
+        (Some(m), _) => println!("{m}: generation cancelled"),
+        // Naming the model back is the difference between "it was not running" and "something else
+        // was" -- the second is what an operator who picked the wrong name needs told.
+        (None, Some(m)) => println!("{m}: not generating"),
+        (None, None) => println!("nothing is running"),
     }
     Ok(())
 }

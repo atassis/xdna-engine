@@ -154,13 +154,6 @@ pub enum Cmd {
     },
     /// Live view of the device: who is resident, who is serving, and where the time went.
     ///
-    /// Stop the generation the device is currently running.
-    ///
-    /// Answered out-of-band, like `top` and `model ls`: it does NOT queue behind the work it is
-    /// stopping, which is the point -- the actor is exactly what is busy. The generation ends
-    /// within one dispatch (~0.5 s on a large model) and whatever was waiting for the device is
-    /// then serviced normally. Says so and exits 0 when nothing is running.
-    Cancel,
     /// `docker stats` for the NPU. Reads the control socket's status snapshot -- answered
     /// out-of-band, so nothing here can hang on a busy device -- and refreshes in place. With the
     /// service down it says so rather than showing an empty table.
@@ -395,6 +388,22 @@ pub enum ModelCmd {
         /// The configured model to make resident.
         model: String,
     },
+    /// Stop the generation a model is running, WITHOUT releasing the model.
+    ///
+    /// `stop` cancels and unloads; this cancels and leaves the model resident, so the next request
+    /// does not pay the load again. Answered out-of-band, like `ls` and `top`: it does not queue
+    /// behind the work it is stopping, which is the point -- the actor is exactly what is busy. The
+    /// generation ends within one dispatch (~0.5 s on a large model).
+    ///
+    /// Name a model or pass `--all`; there is no bare form, because a command that silently means
+    /// "everything" is the one you type by accident.
+    #[command(arg_required_else_help = true)]
+    Cancel {
+        /// The model whose generation to stop. Omit it with `--all`.
+        model: Option<String>,
+        /// Stop whatever is running, whichever model it belongs to.
+        #[arg(long, conflicts_with = "model")] all: bool,
+    },
     /// Give a model's device memory back now, without stopping the service.
     ///
     /// The config entry stays, routing still knows what the model is, and a real request that needs
@@ -402,6 +411,7 @@ pub enum ModelCmd {
     /// NOT be reloaded by an unrelated config edit or reconcile pass, only by an explicit `npu model
     /// start`, a re-`enable`, or an actual service restart -- matching Docker's `restart: always`
     /// semantics, where a manual stop is respected until the daemon itself restarts.
+    #[command(arg_required_else_help = true)]
     Stop {
         /// The resident model whose device memory to release. Omit it with `--all`.
         model: Option<String>,

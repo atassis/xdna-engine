@@ -265,6 +265,8 @@ pub fn route(req: &Request, handle: &Handle, cfg_path: &Path) -> Response {
         ("POST", p) if p.starts_with("/admin/models/") && p.ends_with("/resident") =>
             admin_set_resident(&p["/admin/models/".len()..p.len() - "/resident".len()],
                                req, handle, cfg_path),
+        ("POST", p) if p.starts_with("/admin/models/") && p.ends_with("/cancel") =>
+            admin_cancel_model(&p["/admin/models/".len()..p.len() - "/cancel".len()], handle),
         ("POST", p) if p.starts_with("/admin/models/") && p.ends_with("/load") =>
             admin_load(&p["/admin/models/".len()..p.len() - "/load".len()], handle),
         ("POST", p) if p.starts_with("/admin/models/") && p.ends_with("/unload") =>
@@ -717,6 +719,17 @@ fn admin_cancel(handle: &Handle) -> Response {
         Some(model) => (200, format!(
             "{{\"cancelled\":true,\"model\":\"{}\"}}", parse::json_escape(&model)).into()),
         None => (200, "{\"cancelled\":false}".into()),
+    }
+}
+
+/// Stop the generation belonging to ONE model. 200 whether or not it was that model's turn: "it was
+/// not generating" is an answer, and the reply names what was actually stopped so a caller who
+/// picked the wrong model can tell that from nothing running at all.
+fn admin_cancel_model(name: &str, handle: &Handle) -> Response {
+    match handle.cancel_model(name) {
+        true => (200, format!(
+            "{{\"cancelled\":true,\"model\":\"{}\"}}", parse::json_escape(name)).into()),
+        false => (200, "{\"cancelled\":false}".into()),
     }
 }
 
