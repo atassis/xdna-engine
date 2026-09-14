@@ -163,6 +163,12 @@ pub struct GenerateParams {
     /// Rendered into the prompt by the model's own template. The engine never inspects a schema;
     /// it passes the client's JSON through, key order included.
     pub tools: Vec<serde_json::Value>,
+    /// The signal that ends this generation early. Polled by the generator at every dispatch
+    /// boundary, so it works while nothing is being produced -- which is the whole point: prefill
+    /// emits no chunks, so the sink's abort path cannot fire there at all.
+    ///
+    /// `Default` is a token nobody else holds, so a caller that never cancels is unaffected.
+    pub cancel: crate::cancel::Cancel,
 }
 
 impl Default for GenerateParams {
@@ -182,6 +188,7 @@ impl Default for GenerateParams {
             repetition_penalty: None,
             dispatch_log: None,
             tools: Vec::new(),
+            cancel: crate::cancel::Cancel::new(),
         }
     }
 }
@@ -337,6 +344,11 @@ pub enum Chunk<'a> {
     /// reaches a sink. A consumer that re-parsed `Text` would be parsing text the delimiters had
     /// already been removed from.
     ToolCall(&'a ToolCall),
+    /// Prefill advanced. Carries no model output -- prefill's product is the KV cache -- and exists
+    /// so a long prompt is not a silent gap: it gives the sink something to answer (which is how a
+    /// vanished client is noticed) and the wire something to send (which is how a proxy is kept
+    /// from timing the connection out). Emitted on a time cadence, not per position.
+    Progress { prefilled: u32, total: u32 },
     /// Terminal. Emitted exactly once, after the last `Text`.
     ///
     /// `usage` stays a field of its own rather than being read out of `report`: it is the OpenAI
@@ -384,6 +396,8 @@ pub trait TextGenerator {
                 // Dropped, not rendered back into the string: this surface returns TEXT, and a
                 // caller that wants calls uses `generate` and reads them as chunks.
                 Chunk::ToolCall(_) => {}
+                // Prefill progress carries no output; a buffered caller has nothing to do with it.
+                Chunk::Progress { .. } => {}
                 Chunk::Done { reason, usage: u, .. } => {
                     fin = reason;
                     usage = u;

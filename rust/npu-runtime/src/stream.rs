@@ -16,6 +16,10 @@ pub enum StreamItem {
     /// One completed tool call, in model order. Produced by the generator rather than reconstructed
     /// here -- the delimiters are gone from `Text` by the time it arrives.
     ToolCall(npu_engine::ToolCall),
+    /// Prefill advanced. Carries no model output; it exists so a long prompt is not a silent gap
+    /// on the wire. On a ~6k-token Gemma-4 prompt prefill runs ~60 minutes before the first token,
+    /// which any proxy or client with an idle timeout reads as a dead connection.
+    Progress { prefilled: u32, total: u32 },
     /// Terminal on a clean end (stop condition, `max_tokens`, or an aborted sink). Exactly one,
     /// always last.
     ///
