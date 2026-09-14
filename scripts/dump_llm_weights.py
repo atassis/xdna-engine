@@ -66,6 +66,11 @@ def main():
                          "before the MAC either way, so f32 stores 2 B/group the core discards -- "
                          "1 bit/weight at int4 g32. The kernel must be built to match "
                          "(GEMV(scale_dtype=...) -> -DSCALE_BF16), so the two move together.")
+    ap.add_argument("--resume", action="store_true",
+                    help="skip keys already written, per this dir's _dump_progress.json. A full "
+                         "dump is ~1h and has no other way to survive an interruption; the "
+                         "progress file records the format it was written under and refuses to "
+                         "resume into a different one.")
     ap.add_argument("--quant-clip-search", action="store_true",
                     help="per-group MSE-optimal scale instead of amax/qmax. Pair with "
                          "--quant-full-range: the grid-exact scale is a search candidate.")
@@ -217,8 +222,35 @@ def main():
                 for r0 in range(0, M, chunk_rows)]
         return np.concatenate(parts)
 
+    prog_path = os.path.join(a.out, "_dump_progress.json")
+    fmt_key = json.dumps({k: getattr(a, k) for k in (
+        "quant", "quant_group", "quant_layout", "quant_scale_dtype", "quant_full_range",
+        "quant_clip_search", "quant_leaves", "layers", "cols")}, sort_keys=True)
+    done = {}
+    if a.resume and os.path.isfile(prog_path):
+        _prev = json.load(open(prog_path))
+        if _prev.get("fmt") != fmt_key:
+            raise SystemExit(
+                f"[dump] --resume refused: {prog_path} was written under a different format.\n"
+                f"  there: {_prev.get('fmt')}\n  here:  {fmt_key}\n"
+                f"  delete the directory and start over rather than mixing two formats in it")
+        done = _prev.get("done", {})
+        print(f"[dump] resuming: {len(done)} keys already written")
+
+    def _record(key, names):
+        """Mark one key complete. Written per key, because the cost of losing the position is an
+        hour and the cost of the write is a few hundred bytes."""
+        done[key] = names
+        with open(prog_path, "w") as f:
+            json.dump({"fmt": fmt_key, "done": done}, f)
+
     n, packed = 0, []
     for key in sorted(want):
+        if key in done:
+            packed.extend(done[key])
+            n += 1
+            continue
+        _mark = len(packed)
         w = get(key)
         leaf = key.rsplit(".", 2)[-2]
         want_shape = exp_per_key.get(key)
@@ -257,6 +289,7 @@ def main():
                                             **_layout_kw(part.shape[1])))
                     packed.append(name)
                 n += nch - 1
+                _record(key, packed[_mark:])
                 continue
             np.save(os.path.join(a.out, f"{key}.npy"),
                     quantize_weight(w, a.quant_group, a.quant, **_layout_kw(w.shape[1])))
@@ -264,6 +297,7 @@ def main():
         else:
             np.save(os.path.join(a.out, f"{key}.npy"), w)
         n += 1
+        _record(key, packed[_mark:])
 
     manifest = {
         "dtype": a.quant,
