@@ -536,26 +536,41 @@ impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
         // Penalties see the whole context, prompt included -- OpenAI's own wording ("existing
         // frequency in the text so far") and every mainstream server read this as prompt+completion.
         let mut history: Vec<u32> = prompt_ids.clone();
-        let mut detok = IncrementalDetokenizer::new();
         let mut stopper = StopMatcher::new(params.stop.clone());
         // Only when the caller declared tools AND this model's template says how it writes a call.
         // Absent either, the sink sees exactly the stream it saw before tool calling existed --
         // no hold-back, no scanning, byte-for-byte the old path.
-        let mut tools = match (params.tools.is_empty(), self.cfg.tool_syntax.as_ref()) {
+        let mut tools = match (params.tools.is_empty(), self.cfg.tool_syntax()) {
             (true, _) => None,
             (false, Some(syn)) => Some(StreamingToolParser::new(syn)),
-            // Declared tools this model cannot serve. A 400, not a quiet drop: with no tool branch
-            // in its template the tools are never rendered, so the model CANNOT call one, and
+            // Declared tools this model cannot serve. A 400, not a quiet drop: the tools are never
+            // rendered in a form we could read back, so a call cannot reach the client, and
             // answering anyway would answer a different request than the one sent. Spec S6.
+            //
+            // The refusal carries the probe's verdict and the render behind it. "Unsupported" alone
+            // is indistinguishable between a model with no tool branch and a format this server
+            // simply cannot read yet, and only the second is ours to fix.
             (false, None) => {
-                return Err(EngineError::Unsupported(
-                    "this model's chat template does not render tool calls, so \"tools\" cannot be \
-                     honoured -- send the request without it"
-                        .to_string(),
-                ))
+                let probe = &self.cfg.tool_probe;
+                let sample = match probe.sample.is_empty() {
+                    true => String::new(),
+                    false => format!(" -- its chat template rendered: {}", probe.sample),
+                };
+                return Err(EngineError::Unsupported(format!(
+                    "\"tools\" cannot be honoured for this model: {} [{}]{sample}",
+                    probe.reason.explain(),
+                    probe.reason.as_str(),
+                )));
             }
         };
         let mut tool_calls: Vec<ToolCall> = Vec::new();
+        // Only a request that is actually parsing calls pays for the keep-special decode, so a
+        // plain chat's stream stays byte-for-byte what it was. Empty `tool_special_strip` means
+        // this model's delimiters survive the ordinary decode and there is nothing to choose.
+        let mut detok = match tools.is_some() && !self.cfg.tool_special_strip.is_empty() {
+            true => IncrementalDetokenizer::keeping_special(self.cfg.tool_special_strip.clone()),
+            false => IncrementalDetokenizer::new(),
+        };
 
         // Prime the KV cache over the prompt. The last position always goes through `step`,
         // because only `step` returns logits and those are what the first `sample()` reads; every
@@ -817,6 +832,8 @@ impl<D: DecodeStep> TextGenerator for LlmGenerator<D> {
             usage: GenerateUsage { prompt_tokens, completion_tokens },
             design_breakdown: diff_design_breakdown(&prefill_design, &decode_design),
             provenance,
+            tool_parse_rejects: tools.map(|p| p.rejects().to_vec()).unwrap_or_default(),
+            stripped_control_tokens: detok.stripped().to_vec(),
             ..GenerationReport::default()
         };
         sink(Chunk::Done { reason: finish, usage: report.usage, report: &report });
@@ -1478,7 +1495,7 @@ mod tool_tests {
     #[test]
     fn a_scripted_tool_call_comes_back_as_a_call_not_as_text() {
         let cfg = build_cfg(Some(TOOL_TEMPLATE));
-        assert!(cfg.tool_syntax.is_some(), "probe must have found this template's syntax");
+        assert!(cfg.tool_syntax().is_some(), "probe must have found this template's syntax");
         let decode = ScriptedDecodeStep::new(vec![
             logit_for(7), // <CALL>
             logit_for(8), // the payload
@@ -1556,7 +1573,7 @@ mod tool_tests {
     #[test]
     fn a_tool_incapable_model_refuses_declared_tools_rather_than_ignoring_them() {
         let cfg = build_cfg(Some("{% for m in messages %}{{ m.content }}{% endfor %}"));
-        assert!(cfg.tool_syntax.is_none());
+        assert!(cfg.tool_syntax().is_none());
         let decode = ScriptedDecodeStep::new(vec![logit_for(2), logit_for(4)]);
         let mut gen = LlmGenerator::new(cfg, decode);
         let params = GenerateParams {
@@ -1568,7 +1585,10 @@ mod tool_tests {
         let err = gen
             .generate_to_string(&Prompt::Chat(vec![ChatMessage::new("user", "hello")]), &params)
             .expect_err("declared tools on a tool-incapable model must not answer as if they were honoured");
-        assert!(matches!(err, EngineError::Unsupported(_)), "{err:?}");
+        let EngineError::Unsupported(msg) = &err else { panic!("{err:?}") };
+        // The refusal has to say WHICH way the probe failed. Without that a reader cannot tell a
+        // model that has no tool branch from a format this server has not learned to read.
+        assert!(msg.contains("no-tool-branch"), "refusal names no reason: {msg}");
 
         // Without tools it serves normally -- the model is not broken, the request was.
         let cfg = build_cfg(Some("{% for m in messages %}{{ m.content }}{% endfor %}"));

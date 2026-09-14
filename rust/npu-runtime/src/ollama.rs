@@ -35,6 +35,10 @@ pub struct GenerateCapabilities {
     /// The chat template renders tool calls in a syntax we can scan for. Same probe the generator
     /// uses, so this cannot claim a capability the request path would then refuse.
     pub tools: bool,
+    /// What that probe concluded: the payload family it recovered, or the reason code for why it
+    /// did not. Reported because `tools: false` alone sends an operator looking for a model
+    /// limitation when the limitation may be this server's -- and the two have different fixes.
+    pub tool_format: String,
     /// The template reads `enable_thinking` -- the reasoning-model kwarg.
     pub thinking: bool,
     /// `model_type` from the checkpoint's `config.json` (`qwen3`, `gemma3`, ...). Ollama keys
@@ -82,7 +86,12 @@ fn probe(root: &std::path::Path, scenario: &str) -> Option<GenerateCapabilities>
             out.thinking = src.contains("enable_thinking");
             // The SAME probe the generator gates on. Advertising `tools` off a keyword match would
             // let a client offer a capability the request path then answers 400 for.
-            out.tools = ToolSyntax::probe(&ChatTemplate::new(src.to_string())).is_some();
+            let report = ToolSyntax::probe_report(&ChatTemplate::new(src.to_string()));
+            out.tool_format = match &report.syntax {
+                Some(syn) => syn.payload.name().to_string(),
+                None => report.reason.as_str().to_string(),
+            };
+            out.tools = report.syntax.is_some();
         }
     }
     if out.arch.is_empty() {
@@ -153,6 +162,12 @@ pub fn show_json(name: &str, status: &[ModelStatus], c: Option<&GenerateCapabili
     let mut model_info = serde_json::Map::new();
     if let Some(c) = c {
         model_info.insert("general.architecture".into(), json!(c.arch));
+        // Ours, namespaced: Ollama has no key for it and a client ignores what it does not know.
+        // The point is that `tools` missing from `capabilities` is READABLE here -- which format
+        // was recovered, or which way the recovery failed.
+        if !c.tool_format.is_empty() {
+            model_info.insert("npu.tool_format".into(), json!(c.tool_format));
+        }
         if let Some(n) = c.context_length {
             // Ollama keys this by ARCHITECTURE, and a client looks it up under the architecture it
             // read from the same object -- so the two must be derived from one source, as they are.
@@ -257,4 +272,62 @@ pub fn chat_buffered(
 /// embedding model, and listing one would put it in a client's chat picker.
 pub fn is_chat_model(s: &ModelStatus) -> bool {
     s.capability.map(|c| c.0) == Some("generate") && s.state != LoadState::Failed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::registry::LoadState;
+
+    fn status() -> Vec<ModelStatus> {
+        vec![ModelStatus {
+            name: "llm".into(),
+            state: LoadState::Loaded,
+            detail: String::new(),
+            capability: npu_engine::capability::Capability::from_name("generate"),
+            bo_bytes: 0,
+            idle_s: None,
+            served: 0,
+            busy_us: 0,
+            busy: false,
+            pinned: false,
+            pin_honored: false,
+        }]
+    }
+
+    fn shown(c: GenerateCapabilities) -> Value {
+        let st = status();
+        serde_json::from_str(&show_json("llm", &st, Some(&c)).unwrap()).unwrap()
+    }
+
+    fn caps(v: &Value) -> Vec<String> {
+        v["capabilities"].as_array().unwrap().iter().map(|c| c.as_str().unwrap().into()).collect()
+    }
+
+    #[test]
+    fn show_names_the_tool_format_it_recovered() {
+        let v = shown(GenerateCapabilities {
+            tools: true,
+            tool_format: "named-dsl".into(),
+            arch: "gemma4".into(),
+            ..GenerateCapabilities::default()
+        });
+        assert!(caps(&v).contains(&"tools".to_string()), "{v}");
+        assert_eq!(v["model_info"]["npu.tool_format"], "named-dsl");
+    }
+
+    /// The half an operator cannot otherwise see. `tools` missing from `capabilities` reads as a
+    /// model limitation; the reason code says whether it is one or a format this server has not
+    /// learned to read, and only the second is ours to fix.
+    #[test]
+    fn show_names_why_tools_are_unavailable() {
+        let v = shown(GenerateCapabilities {
+            tools: false,
+            tool_format: "unknown-payload".into(),
+            arch: "llama".into(),
+            ..GenerateCapabilities::default()
+        });
+        assert!(!caps(&v).contains(&"tools".to_string()), "{v}");
+        assert_eq!(v["model_info"]["npu.tool_format"], "unknown-payload");
+    }
 }

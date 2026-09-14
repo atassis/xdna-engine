@@ -8,7 +8,7 @@ use tokenizers::Tokenizer;
 
 use crate::api::EngineError;
 use crate::llm::chat_template::ChatTemplate;
-use crate::llm::tool_syntax::ToolSyntax;
+use crate::llm::tool_syntax::{ToolProbe, ToolSyntax};
 use crate::pipeline::GenerationDefaults;
 
 /// Stop-token ids, each resolved from its OWN authority rather than picked. Qwen-family checkpoints
@@ -113,25 +113,31 @@ pub struct ModelConfig {
     ///
     /// Empty when the file is absent or names none of them; a request or a scenario still wins.
     pub checkpoint_defaults: GenerationDefaults,
-    /// How this model writes a tool call, probed from its own `chat_template`. `None` means the
-    /// template has no tool branch, or renders one we cannot scan for -- either way the model is
-    /// tool-incapable and `tools` stays a 400 for it.
+    /// How this model writes a tool call, probed from its own `chat_template`, with the verdict
+    /// and a sample of the render kept alongside it. A model whose syntax was not recovered is
+    /// tool-incapable and `tools` stays a 400 for it -- one that quotes the sample, so the format
+    /// it could not read is legible instead of inferred.
     ///
-    /// Probed ONCE, here, because it costs two template renders and the alternative is Jinja on
-    /// the per-request path.
-    pub tool_syntax: Option<ToolSyntax>,
+    /// Probed ONCE, here, because it costs a handful of template renders and the alternative is
+    /// Jinja on the per-request path.
+    pub tool_probe: ToolProbe,
+    /// Special tokens to delete from generated text, non-empty only when this model's tool-call
+    /// syntax is itself written in special tokens. See [`special_tokens_outside`].
+    pub tool_special_strip: Vec<String>,
 }
 
 impl ModelConfig {
     /// Direct construction, e.g. from a tokenizer already loaded elsewhere, or from a test fixture.
     pub fn new(tokenizer: Tokenizer, chat_template: Option<ChatTemplate>, stop: StopTokens) -> Self {
-        let tool_syntax = chat_template.as_ref().and_then(ToolSyntax::probe);
+        let tool_probe = probe_tools(chat_template.as_ref());
+        let tool_special_strip = tool_special_strip(&tokenizer, &tool_probe);
         ModelConfig {
             tokenizer,
             chat_template,
             stop,
             checkpoint_defaults: GenerationDefaults::default(),
-            tool_syntax,
+            tool_probe,
+            tool_special_strip,
         }
     }
 
@@ -167,8 +173,49 @@ impl ModelConfig {
         let checkpoint_defaults =
             generation_config.as_ref().map(generation_sampling).unwrap_or_default();
 
-        let tool_syntax = chat_template.as_ref().and_then(ToolSyntax::probe);
-        Ok(ModelConfig { tokenizer, chat_template, stop, checkpoint_defaults, tool_syntax })
+        let tool_probe = probe_tools(chat_template.as_ref());
+        let tool_special_strip = tool_special_strip(&tokenizer, &tool_probe);
+        Ok(ModelConfig {
+            tokenizer,
+            chat_template,
+            stop,
+            checkpoint_defaults,
+            tool_probe,
+            tool_special_strip,
+        })
+    }
+
+    /// This model's tool-call syntax, or `None` when the probe could not read one. The reason and
+    /// the render that produced it are on [`ModelConfig::tool_probe`].
+    pub fn tool_syntax(&self) -> Option<&ToolSyntax> {
+        self.tool_probe.syntax.as_ref()
+    }
+}
+
+/// What a keep-special decode would have to delete for this model, empty when its tool-call syntax
+/// needs no special token kept. Gemma-4 spells all four of its call literals in special ids, so its
+/// delimiters and its string quote vanish from an ordinary decode; Qwen3's are ordinary added
+/// tokens, which is why its stream needs nothing here.
+fn tool_special_strip(tokenizer: &Tokenizer, probe: &ToolProbe) -> Vec<String> {
+    let Some(syn) = probe.syntax.as_ref() else { return Vec::new() };
+    let quote = match &syn.payload {
+        crate::llm::tool_syntax::PayloadFormat::NamedDsl { quote } => quote.as_str(),
+        crate::llm::tool_syntax::PayloadFormat::Json { .. } => "",
+    };
+    crate::llm::detokenize::special_tokens_outside(tokenizer, &[&syn.open, &syn.close, quote])
+        .unwrap_or_default()
+}
+
+/// A model with no chat template cannot be told about tools at all, which is a different fact from
+/// a template whose tool branch we failed to read.
+fn probe_tools(tmpl: Option<&ChatTemplate>) -> ToolProbe {
+    match tmpl {
+        Some(t) => ToolSyntax::probe_report(t),
+        None => ToolProbe {
+            syntax: None,
+            reason: crate::llm::tool_syntax::ProbeReason::NoToolBranch,
+            sample: String::new(),
+        },
     }
 }
 
@@ -332,5 +379,31 @@ mod tests {
             )
         });
         dir.join("tokenizer.json").exists().then_some(dir)
+    }
+
+    /// The probe through the path the engine actually takes -- a real model directory, special
+    /// tokens and all -- rather than a template string handed straight to the prober.
+    #[test]
+    fn the_real_gemma4_checkpoint_probes_to_its_named_dsl() {
+        let dir = PathBuf::from("../../artifacts/gemma4-12b/tokenizer");
+        if !dir.join("tokenizer_config.json").exists() {
+            return; // artifacts are not always present in a bare checkout
+        }
+        let cfg = ModelConfig::load(&dir).expect("load real Gemma-4 config");
+        let probe = &cfg.tool_probe;
+        let syn = probe.syntax.as_ref().unwrap_or_else(|| {
+            panic!("Gemma-4 renders tool calls; probe said {}: {}", probe.reason.as_str(), probe.sample)
+        });
+        assert_eq!(syn.payload.name(), "named-dsl");
+        assert_eq!(probe.reason, crate::llm::tool_syntax::ProbeReason::Recovered);
+    }
+
+    /// A model with no chat template at all cannot be TOLD about tools, which is a different fact
+    /// from a template whose tool branch could not be read -- and the refusal has to say which.
+    #[test]
+    fn a_model_without_a_chat_template_is_tool_incapable_for_a_stated_reason() {
+        let probe = probe_tools(None);
+        assert!(probe.syntax.is_none());
+        assert_eq!(probe.reason.as_str(), "no-tool-branch");
     }
 }

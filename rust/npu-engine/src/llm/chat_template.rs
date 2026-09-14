@@ -19,10 +19,13 @@ use crate::pipeline::ChatMessage;
 pub struct ChatTemplate {
     source: String,
     /// `bos_token` / `eos_token` from tokenizer_config.json, because a template may SUBSTITUTE
-    /// them rather than spell them: Gemma-4's opens with `{{ bos_token }}`. Left undefined they
-    /// render empty, and the prompt silently loses its BOS -- which this model answers by
-    /// reporting that it received no message at all. Qwen3's template does not use them, which
-    /// is why the gap survived.
+    /// them rather than spell them: Gemma-4's opens with `{{ bos_token }}`. Absent, the prompt
+    /// silently loses its BOS -- which this model answers by reporting that it received no message
+    /// at all. Qwen3's template does not use them, which is why the gap survived.
+    ///
+    /// Rendered as an empty string rather than handed over as `None`: minijinja writes a none value
+    /// out as the four characters `none`, so a template with no token to substitute would open the
+    /// prompt with a word instead of with nothing.
     bos_token: Option<String>,
     eos_token: Option<String>,
 }
@@ -85,15 +88,15 @@ impl ChatTemplate {
                 add_generation_prompt => add_generation_prompt,
                 tools => tools,
                 enable_thinking => t,
-                bos_token => self.bos_token,
-                eos_token => self.eos_token,
+                bos_token => self.bos_token.clone().unwrap_or_default(),
+                eos_token => self.eos_token.clone().unwrap_or_default(),
             },
             None => context! {
                 messages => msgs,
                 add_generation_prompt => add_generation_prompt,
                 tools => tools,
-                bos_token => self.bos_token,
-                eos_token => self.eos_token,
+                bos_token => self.bos_token.clone().unwrap_or_default(),
+                eos_token => self.eos_token.clone().unwrap_or_default(),
             },
         };
         tmpl.render(ctx).map_err(|e| EngineError::Load(format!("chat template render: {e}")))
@@ -120,6 +123,10 @@ impl ChatTemplate {
 /// templates test `{%- if message.tool_calls %}`, and an empty list is falsy in Jinja but a `None`
 /// tool_call_id serialised as null is NOT -- emitting the keys unconditionally makes our render
 /// diverge from `transformers` on exactly the turns tool calling depends on.
+///
+/// A call's `id` goes out with it because a template may be the thing that JOINS a tool result to
+/// the call it answers: Gemma-4 matches `tool_call.id` against the following turn's `tool_call_id`
+/// to recover the function name, and without the id every tool response renders as `unknown`.
 fn message_value(m: &ChatMessage) -> Value {
     let mut fields = vec![
         ("role", Value::from(m.role.clone())),
@@ -131,6 +138,7 @@ fn message_value(m: &ChatMessage) -> Value {
             .iter()
             .map(|c| {
                 serde_json::json!({
+                    "id": c.id,
                     "type": "function",
                     "function": { "name": c.name, "arguments": c.arguments },
                 })
@@ -527,5 +535,61 @@ mod tests {
         assert!(off.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"),
                 "thinking-off pre-fills an empty think block, got {off:?}");
         assert!(!on.contains("<think>"), "thinking-on leaves the block to the model, got {on:?}");
+    }
+
+    /// A tool RESULT has to get back to the model attached to the call it answers. Gemma-4 does
+    /// that join in the template -- it matches `tool_call.id` against the next turn's
+    /// `tool_call_id` to recover the function name -- so dropping the id renders every result as
+    /// `response:unknown` and the model is told which tool ran by nothing at all.
+    #[test]
+    fn a_tool_result_is_rendered_against_the_call_it_answers() {
+        let path = match std::env::var("GEMMA4_TOKENIZER_DIR") {
+            Ok(dir) => PathBuf::from(dir).join("tokenizer_config.json"),
+            Err(_) => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("artifacts/gemma4-12b/tokenizer/tokenizer_config.json"),
+        };
+        if !path.exists() {
+            eprintln!("SKIP: {} missing", path.display());
+            return;
+        }
+        let cfg: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let tmpl = ChatTemplate::new(cfg["chat_template"].as_str().unwrap().to_string());
+        let tools = [serde_json::json!({
+            "type": "function",
+            "function": { "name": "get_weather", "parameters": { "type": "object" } }
+        })];
+        let out = tmpl
+            .render_full(
+                &[
+                    ChatMessage::new("user", "w?"),
+                    ChatMessage::new("assistant", "").with_tool_calls(vec![crate::pipeline::ToolCall {
+                        id: "call_0".into(),
+                        name: "get_weather".into(),
+                        arguments: serde_json::json!({ "city": "Paris" }),
+                    }]),
+                    ChatMessage::new("tool", "17C").with_tool_call_id("call_0"),
+                ],
+                true,
+                Some(false),
+                &tools,
+            )
+            .unwrap();
+        assert!(out.contains("response:get_weather"), "tool result lost its call: {out:?}");
+        assert!(!out.contains("response:unknown"), "tool result fell back to unknown: {out:?}");
+    }
+
+    /// A template that substitutes `bos_token` must get nothing when there is nothing, not the
+    /// rendering of a none value.
+    #[test]
+    fn an_absent_special_token_renders_as_nothing() {
+        let tmpl = ChatTemplate::new("{{- bos_token -}}x{{- eos_token -}}".to_string());
+        assert_eq!(tmpl.render(&[], false).unwrap(), "x");
+        let with = tmpl.clone().with_special_tokens(Some("<s>".into()), Some("</s>".into()));
+        assert_eq!(with.render(&[], false).unwrap(), "<s>x</s>");
     }
 }

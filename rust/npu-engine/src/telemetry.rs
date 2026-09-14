@@ -232,6 +232,15 @@ pub struct GenerationReport {
     pub design_breakdown: Vec<DesignCost>,
     /// Which build produced these numbers. See [`ArmProvenance`].
     pub provenance: ArmProvenance,
+    /// Spans the model wrote between its own tool-call delimiters that did not decode, truncated.
+    /// They reach the client as ordinary assistant text, which reads as the model rambling rather
+    /// than as a parser miss, so the run record is where a format we read wrongly is visible.
+    #[serde(default)]
+    pub tool_parse_rejects: Vec<String>,
+    /// Control tokens this generation emitted that were deleted from its text -- the model wrote a
+    /// construct this server does not model. See `IncrementalDetokenizer::stripped`.
+    #[serde(default)]
+    pub stripped_control_tokens: Vec<String>,
 }
 
 /// Which layer the run was actually spending its time in.

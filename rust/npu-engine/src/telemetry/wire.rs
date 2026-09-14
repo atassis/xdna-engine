@@ -180,7 +180,7 @@ pub fn ollama_object(s: &Summary) -> Value {
 /// report that do not describe the same run is a bug nothing downstream could detect.
 pub fn summary_line(r: &GenerationReport, m: &RunMeta, reason: FinishReason) -> Value {
     let s = &r.summarize();
-    json!({
+    let mut line = json!({
         "object": "npu.run.summary",
         "id": m.id,
         "model": m.model,
@@ -201,7 +201,17 @@ pub fn summary_line(r: &GenerationReport, m: &RunMeta, reason: FinishReason) -> 
             // Two samples at the ends of the generation, never an integral -- see the field docs.
             "npu_power_uw": { "start": r.npu_power_start_uw, "end": r.npu_power_end_uw },
         },
-    })
+    });
+    // A tool call this server could not read reaches the client as ordinary assistant text, which
+    // reads as the model rambling. The log is where it is legible as what it was. Omitted when
+    // empty so an ordinary run's line does not grow a field that is always absent.
+    if !r.tool_parse_rejects.is_empty() {
+        line["tool_parse_rejects"] = json!(r.tool_parse_rejects);
+    }
+    if !r.stripped_control_tokens.is_empty() {
+        line["stripped_control_tokens"] = json!(r.stripped_control_tokens);
+    }
+    line
 }
 
 /// Our own namespaced view: the things no other engine reports, and the ones it would be dishonest
@@ -517,6 +527,8 @@ mod tests {
             npu_power_end_uw: None,
             design_breakdown: Vec::new(),
             provenance: ArmProvenance::default(),
+            tool_parse_rejects: Vec::new(),
+            stripped_control_tokens: Vec::new(),
         }
     }
 
@@ -633,5 +645,23 @@ mod tests {
             "eval duration is one quantity in two units"
         );
         assert_eq!(o["prompt_eval_duration"].as_u64().unwrap(), s.prefill_us * 1_000);
+    }
+
+    /// A parser miss is otherwise invisible: the bytes reach the client as assistant text and
+    /// nothing anywhere says a call was attempted. The summary line is where it survives the run.
+    #[test]
+    fn tool_parse_rejects_reach_the_summary_line_and_only_when_there_are_any() {
+        let plain = summary_line(&a_report(), &meta(), FinishReason::Stop);
+        assert!(plain.get("tool_parse_rejects").is_none(), "{plain}");
+        assert!(plain.get("stripped_control_tokens").is_none(), "{plain}");
+
+        let r = GenerationReport {
+            tool_parse_rejects: vec!["f{a:".into()],
+            stripped_control_tokens: vec!["<|channel>".into()],
+            ..a_report()
+        };
+        let v = summary_line(&r, &meta(), FinishReason::ToolCalls);
+        assert_eq!(v["tool_parse_rejects"][0], "f{a:");
+        assert_eq!(v["stripped_control_tokens"][0], "<|channel>");
     }
 }

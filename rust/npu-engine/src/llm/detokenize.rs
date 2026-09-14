@@ -11,12 +11,60 @@ use crate::api::EngineError;
 /// fake decoder without building a real BPE vocabulary.
 pub trait Detokenize {
     fn decode_ids(&self, ids: &[u32]) -> Result<String, EngineError>;
+
+    /// The same, with the model's special tokens left in the text.
+    ///
+    /// A tool-call syntax may be SPELLED in special tokens: Gemma-4 writes a call as
+    /// `<|tool_call>call:f{k:<|"|>v<|"|>}<tool_call|>`, and all four literals are special ids. The
+    /// default decode drops them, so the parser is handed `call:f{k:v}` -- no delimiters to find,
+    /// and a string it can no longer tell from a number. Qwen3's `<tool_call>` is an added token
+    /// that is NOT special, which is why the default path works there and hid this.
+    ///
+    /// Defaulted to the plain decode so a fake decoder in a test need not model a special vocabulary.
+    fn decode_ids_keeping_special(&self, ids: &[u32]) -> Result<String, EngineError> {
+        self.decode_ids(ids)
+    }
 }
 
 impl Detokenize for tokenizers::Tokenizer {
     fn decode_ids(&self, ids: &[u32]) -> Result<String, EngineError> {
         self.decode(ids, true).map_err(|e| EngineError::Load(format!("detokenize: {e}")))
     }
+
+    fn decode_ids_keeping_special(&self, ids: &[u32]) -> Result<String, EngineError> {
+        self.decode(ids, false).map_err(|e| EngineError::Load(format!("detokenize: {e}")))
+    }
+}
+
+/// The special tokens a keep-special decode would have to delete by hand, or `None` when none of
+/// them spells any of `syntax` and the ordinary decode is already right.
+///
+/// Keeping specials is all-or-nothing in `tokenizers`, so the price of seeing `<|tool_call>` is
+/// also seeing `<|channel>thought` and every other control token the model writes -- which belong
+/// to the transcript, not to the answer. One decision, so one function: a caller cannot end up
+/// keeping every control token and deleting none.
+///
+/// A special token that is a SUBSTRING of a syntax literal counts as part of it and is never
+/// deleted -- deleting it would cut the delimiter in half, which is worse than letting a standalone
+/// emission of that token through.
+pub fn special_tokens_outside(tok: &tokenizers::Tokenizer, syntax: &[&str]) -> Option<Vec<String>> {
+    let (mut spells_syntax, mut outside) = (false, Vec::new());
+    for t in tok.get_added_tokens_decoder().into_values().filter(|t| t.special) {
+        if t.content.is_empty() {
+            continue;
+        }
+        match syntax.iter().any(|s| s.contains(t.content.as_str())) {
+            true => spells_syntax = true,
+            false => outside.push(t.content),
+        }
+    }
+    if !spells_syntax {
+        return None;
+    }
+    // Longest first: a shorter token that is a substring of a longer one must not be deleted out of
+    // it, leaving the remainder behind as text.
+    outside.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    Some(outside)
 }
 
 /// Streams text out of a growing token sequence, buffering across a token boundary that splits a
@@ -26,18 +74,60 @@ impl Detokenize for tokenizers::Tokenizer {
 pub struct IncrementalDetokenizer {
     ids: Vec<u32>,
     emitted: usize, // byte length of the decoded text already emitted
+    /// Special tokens to delete from the decoded text. NON-EMPTY also switches the decode itself to
+    /// the keep-special one: the two are one decision (see [`special_tokens_outside`]), and holding
+    /// them apart would let a caller keep every control token and delete none.
+    strip: Vec<String>,
+    /// Which of `strip` this generation actually hit, in the order first seen.
+    ///
+    /// A deletion nobody records is the failure mode this whole path exists to avoid: the model
+    /// writes a construct this server does not model, the markers vanish, and what reaches the user
+    /// is the construct's leftover text with no trace of why. Gemma-4 opens its answer after a tool
+    /// result with an empty `<|channel>thought\n<channel|>`, whose markers are special and whose
+    /// name is not -- so the answer begins with the bare word `thought` and nothing anywhere says
+    /// a channel was seen and dropped.
+    stripped: Vec<String>,
 }
 
 impl IncrementalDetokenizer {
     pub fn new() -> Self {
-        IncrementalDetokenizer { ids: Vec::new(), emitted: 0 }
+        IncrementalDetokenizer { ids: Vec::new(), emitted: 0, strip: Vec::new(), stripped: Vec::new() }
+    }
+
+    /// Decode with special tokens kept, deleting `strip` from the result. For a model whose
+    /// tool-call syntax is written in special tokens; `strip` is everything special that is not.
+    pub fn keeping_special(strip: Vec<String>) -> Self {
+        IncrementalDetokenizer { ids: Vec::new(), emitted: 0, strip, stripped: Vec::new() }
+    }
+
+    /// Control tokens deleted from this generation's text. See the field.
+    pub fn stripped(&self) -> &[String] {
+        &self.stripped
     }
 
     /// Push one new token id; returns the newly-completed text (may be empty -- that is correct
     /// while a multi-byte codepoint is still pending across a later token).
     pub fn push<D: Detokenize>(&mut self, tok: u32, d: &D) -> Result<String, EngineError> {
         self.ids.push(tok);
-        let text = d.decode_ids(&self.ids)?;
+        let text = match self.strip.is_empty() {
+            true => d.decode_ids(&self.ids)?,
+            // Stripping the WHOLE decode each push, not the new tail: `emitted` indexes into the
+            // text this returns, so both sides of that offset have to have been through the same
+            // transform. Safe to do repeatedly because one id decodes to one whole special literal,
+            // so no pattern ever straddles the boundary between pushes.
+            false => {
+                let mut t = d.decode_ids_keeping_special(&self.ids)?;
+                for s in &self.strip {
+                    if t.contains(s.as_str()) {
+                        t = t.replace(s.as_str(), "");
+                        if !self.stripped.contains(s) {
+                            self.stripped.push(s.clone());
+                        }
+                    }
+                }
+                t
+            }
+        };
         if text.ends_with('\u{FFFD}') || text.len() <= self.emitted {
             return Ok(String::new());
         }

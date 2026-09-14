@@ -23,4 +23,4 @@ pub use npu_decode::NpuDecodeStep;
 pub use npu_prefill::{chunk_plan, NpuPrefill, PrefillChunk};
 pub use sampling::{LogitView, SampleOutcome, SamplingConfig, SampleTimings};
 pub use tool_parse::{parse_completion, ParseOut, ParsedCompletion, StreamingToolParser};
-pub use tool_syntax::ToolSyntax;
+pub use tool_syntax::{PayloadFormat, ProbeReason, ToolProbe, ToolSyntax};
