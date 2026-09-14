@@ -37,7 +37,6 @@ import newstack_compat  # noqa: F401,E402
 from verify_llm_decode import window_len, rope_row  # noqa: E402 -- one owner for each
 from gen_llm_decode import (build_graph, report_artifact_freshness,  # noqa: E402
                             load_weight_buffer, isolate_build_dir)
-from qwen_bpe import QwenBPE  # noqa: E402
 from iron.common.kv_layout import KVLayout  # noqa: E402
 
 BF16 = ml_dtypes.bfloat16
@@ -58,7 +57,13 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--spec", required=True)
     ap.add_argument("--weights", required=True)
-    ap.add_argument("--text", required=True, help="UTF-8 corpus file")
+    ap.add_argument("--text", default=None, help="UTF-8 corpus file, tokenized here with QwenBPE "
+                                                 "-- Qwen-family specs only")
+    ap.add_argument("--ids", default=None, help="pre-tokenized ids (tokenize_corpus.py's json "
+                                                "output), for a spec QwenBPE cannot read (e.g. "
+                                                "Gemma's Split pretokenizer). LOCAL, UNCOMMITTED "
+                                                "harness patch -- see wt-g4-qual's e50f2ce, never "
+                                                "ported to main (899354e).")
     ap.add_argument("--tokenizer", default=None, help="tokenizer.json (default: the HF cache)")
     ap.add_argument("--ref", default=None, help="oracle json; if given, the tokenizer self-tests "
                                                 "against its prompt_ids before anything runs")
@@ -71,17 +76,24 @@ def main():
     isolate_build_dir("ppl")
     report_artifact_freshness(a.weights)
 
-    tj = a.tokenizer or os.path.expanduser(
-        "~/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots")
-    if os.path.isdir(tj):
-        tj = os.path.join(tj, sorted(os.listdir(tj))[0], "tokenizer.json")
-    if a.ref:
-        from qwen_bpe import self_test
-        self_test(tj, a.ref)
-        print(f"[ppl] tokenizer self-test PASS against {os.path.basename(a.ref)}")
-    tok = QwenBPE(tj)
-    ids = tok.encode(open(a.text, encoding="utf-8").read())
-    print(f"[ppl] corpus {a.text}: {len(ids)} tokens")
+    if bool(a.text) == bool(a.ids):
+        raise SystemExit("[ppl] give exactly one of --text or --ids")
+    if a.ids:
+        ids = json.load(open(a.ids))
+        corpus_name = os.path.basename(a.ids)
+    else:
+        tj = a.tokenizer or os.path.expanduser(
+            "~/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots")
+        if os.path.isdir(tj):
+            tj = os.path.join(tj, sorted(os.listdir(tj))[0], "tokenizer.json")
+        from qwen_bpe import QwenBPE, self_test
+        if a.ref:
+            self_test(tj, a.ref)
+            print(f"[ppl] tokenizer self-test PASS against {os.path.basename(a.ref)}")
+        tok = QwenBPE(tj)
+        ids = tok.encode(open(a.text, encoding="utf-8").read())
+        corpus_name = os.path.basename(a.text)
+    print(f"[ppl] corpus {corpus_name}: {len(ids)} tokens")
 
     sp, fused, weights, md = build_graph(a.spec, a.weights, a.layers, a.max_seq)
     S, HD, D, VOCAB = md["S"], sp.head_dim, sp.d_model, sp.vocab
@@ -181,7 +193,7 @@ def main():
               file=sys.stderr)
     mean_nll = float(np.mean(nll))
     res = {
-        "spec": sp.name, "layers": md["NL"], "text": os.path.basename(a.text),
+        "spec": sp.name, "layers": md["NL"], "text": corpus_name,
         "logit_softcap": sp.logit_softcap, "softcap_saturated_frac": n_sat / (n * VOCAB),
         "n_scored": n, "mean_nll": mean_nll, "perplexity": math.exp(mean_nll),
         "top1_acc": top1_hits / n, "median_nll": float(np.median(nll)),
