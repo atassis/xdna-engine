@@ -295,6 +295,12 @@ fn spawn(cfg: Config, loader: Box<dyn ModelLoader + Send>, eager: bool) -> Resul
                             }
                         }
                     };
+                    // Publish BEFORE replying. The end-of-iteration publish happens AFTER
+                    // this send, so a caller that mutates and then reads status could see
+                    // state older than the command it just completed -- `npu model start`
+                    // returning, then `/v1/models` not showing it. The reply must not
+                    // outrun the snapshot it changed.
+                    live.set(reg.status_at(Instant::now()));
                     let _ = reply.send(r);
                 }
                 Ok(Cmd::Generate { model, prompt, params, tx, ack, enqueued }) => {
@@ -382,6 +388,12 @@ fn spawn(cfg: Config, loader: Box<dyn ModelLoader + Send>, eager: bool) -> Resul
                     let rep = guard(|| reconcile(&cfg, &mut reg, loader.as_ref()))
                         .unwrap_or_else(|msg| ReconcileReport { failed: vec![msg], ..Default::default() });
                     warn_declined_pins(&rep);
+                    // Publish BEFORE replying. The end-of-iteration publish happens AFTER
+                    // this send, so a caller that mutates and then reads status could see
+                    // state older than the command it just completed -- `npu model start`
+                    // returning, then `/v1/models` not showing it. The reply must not
+                    // outrun the snapshot it changed.
+                    live.set(reg.status_at(Instant::now()));
                     let _ = reply.send(rep);
                 }
                 Ok(Cmd::Load { name, reply }) => {
@@ -413,6 +425,12 @@ fn spawn(cfg: Config, loader: Box<dyn ModelLoader + Send>, eager: bool) -> Resul
                                 })
                         }
                     };
+                    // Publish BEFORE replying. The end-of-iteration publish happens AFTER
+                    // this send, so a caller that mutates and then reads status could see
+                    // state older than the command it just completed -- `npu model start`
+                    // returning, then `/v1/models` not showing it. The reply must not
+                    // outrun the snapshot it changed.
+                    live.set(reg.status_at(Instant::now()));
                     let _ = reply.send(r);
                 }
                 Ok(Cmd::Bake { name, force, reply }) => {
@@ -451,6 +469,12 @@ fn spawn(cfg: Config, loader: Box<dyn ModelLoader + Send>, eager: bool) -> Resul
                             }
                         }
                     };
+                    // Publish BEFORE replying. The end-of-iteration publish happens AFTER
+                    // this send, so a caller that mutates and then reads status could see
+                    // state older than the command it just completed -- `npu model start`
+                    // returning, then `/v1/models` not showing it. The reply must not
+                    // outrun the snapshot it changed.
+                    live.set(reg.status_at(Instant::now()));
                     let _ = reply.send(r);
                 }
                 Ok(Cmd::Status { reply }) => { let _ = reply.send(reg.status()); }
@@ -743,6 +767,33 @@ mod tests {
     /// asr + embed configured, but only ONE MB of budget by default: serving both means swapping.
     /// `.unwrap()`: a mock loader's initial reconcile does not panic, so a start() failure here is a
     /// real regression.
+    /// The ordering invariant behind moving status off the actor: a mutating command must not
+    /// RETURN before the published snapshot reflects it.
+    ///
+    /// Broken for one commit. The reply was sent inside the command arm and the publish happened at
+    /// the end of the loop iteration, so `npu model start` could return while `/v1/models` still
+    /// showed the model unloaded. Two route tests caught it as an intermittent failure, which is
+    /// exactly how a race presents and exactly why it is worth a test that names the rule.
+    #[test]
+    fn a_mutating_command_does_not_return_before_the_snapshot_reflects_it() {
+        let (h, j) = swap_setup(ServerCfg {
+            memory_ceiling_mb: 64,
+            idle_unload_s: 0,
+            ..Default::default()
+        });
+        h.load("asr").expect("load asr");
+        let snap = h.snapshot();
+        let asr = snap.models.iter().find(|m| m.name == "asr").expect("asr missing from snapshot");
+        assert_eq!(asr.state, LoadState::Loaded, "load returned before the snapshot saw it");
+
+        h.unload("asr").expect("unload asr");
+        let snap = h.snapshot();
+        let asr = snap.models.iter().find(|m| m.name == "asr").expect("asr missing from snapshot");
+        assert_eq!(asr.state, LoadState::Unloaded, "unload returned before the snapshot saw it");
+        h.shutdown();
+        j.join().unwrap();
+    }
+
     fn swap_setup(srv: ServerCfg) -> (Handle, JoinHandle<()>) {
         let mut t = BTreeMap::new();
         t.insert("asr".to_string(), Ok((Capability::ASR, MB)));

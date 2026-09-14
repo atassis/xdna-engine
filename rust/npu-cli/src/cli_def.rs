@@ -403,8 +403,14 @@ pub enum ModelCmd {
     /// start`, a re-`enable`, or an actual service restart -- matching Docker's `restart: always`
     /// semantics, where a manual stop is respected until the daemon itself restarts.
     Stop {
-        /// The resident model whose device memory to release.
-        model: String,
+        /// The resident model whose device memory to release. Omit it with `--all`.
+        model: Option<String>,
+        /// Release every resident model instead of one.
+        ///
+        /// Walks what `/v1/models` reports as loaded, one release each, so the output names what
+        /// actually moved. A model that loads WHILE this runs is not covered -- requests queue on
+        /// the device and a queued one can start the moment this finishes.
+        #[arg(long, conflicts_with = "model")] all: bool,
         /// Leave a running generation alone instead of cancelling it.
         ///
         /// The default is a HARD stop: a generation on this model is cancelled first, so `stop`

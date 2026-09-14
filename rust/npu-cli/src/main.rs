@@ -1163,7 +1163,12 @@ fn model_cmd(path: &Path, action: &ModelCmd, as_json: bool) -> Result<()> {
         ModelCmd::Ls { json, verbose } => model_ls(path, *json || as_json, *verbose),
         ModelCmd::Show { model, json } => model_show(path, model, *json || as_json),
         ModelCmd::Start { model } => model_start(path, model),
-        ModelCmd::Stop { model, soft } => model_stop(path, model, *soft),
+        ModelCmd::Stop { model, all, soft } => match (model, all) {
+            (Some(m), _) => model_stop(path, m, *soft),
+            (None, true) => model_stop_all(path, *soft),
+            (None, false) => Err(anyhow!(Tagged(Code::Failure,
+                "name a model, or pass --all".into()))),
+        },
         // Enable/Disable/Add/Rm/Default all edit engine.toml (or ask the running service to);
         // `--no-reload` isn't exposed on `npu model` today (it lived on `npu config` because only
         // config-shaped edits needed it) -- these five always reconcile, matching `pin`'s existing
@@ -1624,6 +1629,35 @@ fn model_start(path: &Path, model: &str) -> Result<()> {
     if !unweighed.is_empty() {
         eprintln!("note: memory_ceiling_mb is not bounding these -- they report no measured \
                    footprint: {}", unweighed.join(" "));
+    }
+    Ok(())
+}
+
+/// `npu model stop --all`. Reads what is resident and releases each in turn.
+///
+/// Client-side rather than a new endpoint: it reuses `model_stop` exactly, so `--all` cannot drift
+/// from the single-model semantics, and the output names each model instead of one aggregate count.
+///
+/// Nothing resident is reported, not silently ignored -- "there was nothing to do" and "it worked"
+/// are different answers and an operator clearing the device wants to know which one they got.
+fn model_stop_all(path: &Path, soft: bool) -> Result<()> {
+    let addr = resolve_http_addr(&load_cfg(path)?);
+    let body = http_get(&addr, "/v1/models")
+        .context(Tagged(Code::NoService, "models (is the server running?)".into()))?;
+    let v: serde_json::Value = serde_json::from_str(&body)
+        .with_context(|| format!("unexpected reply: {body}"))?;
+    let resident: Vec<String> = v.get("data").and_then(|d| d.as_array()).map(|rows| {
+        rows.iter()
+            .filter(|m| m.get("state").and_then(|s| s.as_str()) == Some("loaded"))
+            .filter_map(|m| m.get("id").and_then(|i| i.as_str()).map(str::to_string))
+            .collect()
+    }).unwrap_or_default();
+    if resident.is_empty() {
+        println!("nothing is resident");
+        return Ok(());
+    }
+    for m in &resident {
+        model_stop(path, m, soft)?;
     }
     Ok(())
 }
