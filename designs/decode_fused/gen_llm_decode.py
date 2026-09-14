@@ -1757,9 +1757,12 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
     op_mlp_dp = None
     if mlp_dp_why is None:
         from iron.operators.swiglu_mlp_dp.op import SwiGLUMLPDataParallel
+        # act/post_norm carry the two clauses mlp_dp_reason() used to refuse on. Both default to
+        # silu/False, so a spec that never needed them (qwen3) builds the identical design.
         op_mlp_dp = SwiGLUMLPDataParallel(D=D, FF=FF, num_aie_columns=MLP_DP_COLS,
                                           epsilon=sp.eps,
                                           QD=QD if fuse_o else None, fuse_o=fuse_o,
+                                          act=sp.act, post_norm=sp.sandwich_norms,
                                           context=ctx, weight_depth=WEIGHT_DEPTH,
                                           tile_rows_gu=MLP_TILE_ROWS,
                                           **mlp_quant_kw)
@@ -2181,12 +2184,20 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                 # shared across layers because the sequence runs them one at a time. FUSE_MLP_O folds
                 # `a = Wo @ cx` in too: `cx`/`Wo` replace `a` as the design's own inputs, and
                 # `mlp_a_scratch` is a's own all-gather round-trip buffer, the same idiom as mlp_gh's.
+                # post_norm adds ONE argument before `nxt` (get_arg_spec's post_norms_spec):
+                # [n_pff] at D here, [n_pa | n_pff] at 2*D under fuse_o -- so the fused design
+                # applies the post-FFN norm itself and the standalone op_norm below must not.
                 if fuse_o:
+                    if sp.sandwich_norms:
+                        raise NotImplementedError(
+                            "FUSE_MLP_O + sandwich norms needs the post-norm gains PACKED as one "
+                            "2*D buffer [n_pa | n_pff]; the generator has them as two D buffers. "
+                            "Set FUSE_MLP_O=0 (which two q_dims already force on Gemma-4).")
                     rl.append((op_mlp_dp, cur, p + "cx", p + "n_pf", p + "Wo", p + "Wg", p + "Wu",
                                p + "Wd", "mlp_gh", "mlp_a_scratch", nxt))
                 else:
                     rl.append((op_mlp_dp, cur, p + "a", p + "n_pf", p + "Wg", p + "Wu", p + "Wd",
-                               "mlp_gh", nxt))
+                               "mlp_gh", *([p + "n_pff"] if sp.sandwich_norms else []), nxt))
             else:
                 rl += [
                     (op_add, cur, p + "a", p + "x1"),
@@ -2197,7 +2208,9 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                     (op_mul_ffn, p + "g", p + "u", p + "gh"),
                     *down_runlist(p),
                 ]
-            if sp.sandwich_norms:
+            # `d` is the unfused chain's own output buffer and does not exist in the fused arm,
+            # which carries this norm internally (see the post_norm argument above).
+            if sp.sandwich_norms and op_mlp_dp is None:
                 rl.append((op_norm, p + "d", p + "n_pff", p + "d"))
             if op_mlp_dp is None:
                 rl.append((op_add, p + "x1", p + "d", nxt))
