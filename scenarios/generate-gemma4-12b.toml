@@ -84,9 +84,35 @@ name = "gemma4-12b"
 #   - per-site weight rel-L2 can disagree with the end-to-end quality result IN SIGN (g32 measured
 #     BETTER at every site, 0.569% vs 0.654% at the head, and was worse end to end). Do not judge a
 #     format change from a weight-space norm alone.
+#
+# DEFAULT SINCE 2026-09-14 (later same day): decode_s6912_headint8_l48. TWO capability changes,
+# not a speed change -- owner-authorized after both were independently device-gated clean:
+#   1. Context ceiling 2048 -> 6912 (3.375x), SLIDING_KV_CIRCULAR=1. The real ceiling was found by
+#      BUILDING, not by the generator's own stated constraint (TMatVec's check_l1_fits on the
+#      sliding geometry never was the binding wall -- the global geometry's fallback GEMV's own L1
+#      limit is: fits through K=6912, fails at 7168). None of 8192/16384/32768 build.
+#   2. lm-head int8 g64 (was bf16): -943.7 MB/token, 5.5% of the token. Blocked for weeks by an
+#      OOM in the packed dump (in-process quantize peaks ~22 GiB on this 262144x3840 tensor);
+#      fixed via row-chunked quantization at dump time, real peak RSS 6.29 GiB. Exposed and fixed a
+#      second bug one level down: GEMV's free tile_size_input search picks an illegal tiling at
+#      this tensor's M=262144 shape under row_group_planar -- verified as a true no-op for every
+#      OTHER site via byte-identical ELF sha256 before/after.
+# GATED, combined, on THIS artifact (not just each piece alone): L=6 oracle parity 7/8 (identical
+# margins to the head-int8-alone gate; the one miss is a classified bf16-ulp tie, gap 0.0 against a
+# 2.0 threshold, not a new divergence). Paired A/B vs the S=2048 int8-head control, same corpus/
+# weights, varying only --max-seq: BIT-EXACT over the full [0:1024) shared range (max|diff| 0.0,
+# 1024/1024 positions exact), new [1024:2560) range sane (no NaN/Inf, mean NLL 6.470 in line with
+# the run). Rust serving path confirmed to honour SLIDING_KV_CIRCULAR (merged same day, kv_off_
+# circular + per-geometry kv_windows, unit-tested) but not yet end-to-end smoke-tested through a
+# live `npu generate` request on this exact artifact -- do that once before trusting it unattended.
+# Also fixed the SAME DAY: eval_llm_perplexity.py's Gemma-4 tokenization, broken since 899354e left
+# it out of scope -- QwenBPE cannot parse Gemma's Split pretokenizer (KeyError: 'pretokenizers').
+# --ids now accepts tokenize_corpus.py's pre-tokenized output; this is what made the paired A/B
+# above possible at all. Prior arm (4)'s "worse-than-uniform NLL on both arms alike, not diagnosed"
+# note above may be this same bug -- not re-verified, flagged for whoever picks that up next.
 [artifacts]
-decode = "artifacts/gemma4-12b/decode_int8g64_planar"
-weights = "artifacts/gemma4-12b/weights_int8g64_planar"
+decode = "artifacts/gemma4-12b/decode_s6912_headint8_l48"
+weights = "artifacts/gemma4-12b/weights_int8g64_planar_headint8"
 tokenizer_dir = "artifacts/gemma4-12b/tokenizer"
 
 [generation]
