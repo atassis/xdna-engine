@@ -6,11 +6,23 @@ name = "gemma4-12b"
 # layers are head_dim 256 / 8 kv heads and its global layers 512 / 1, so attention ops are built
 # per GEOMETRY (gen_llm_decode.py's attn_ops factory) rather than once for the stack.
 #
-#   weights  scripts/dump_llm_weights.py --spec gemma4-12b --quant int8 --quant-group 64 \
-#              --quant-layout row_group_planar \
-#              --quant-leaves gate_proj,up_proj,down_proj,o_proj,q_proj,k_proj,v_proj
+#   weights  scripts/dump_llm_weights.py --spec gemma4-12b \
+#              --repo google/gemma-4-12B-it-qat-q4_0-unquantized \
+#              --quant int4 --quant-group 32 --quant-layout row_group_planar \
+#              --quant-scale-dtype bf16 --quant-full-range --quant-clip-search \
+#              --quant-leaves gate_proj,up_proj,down_proj,o_proj,q_proj,k_proj,v_proj \
+#              --out artifacts/gemma4-12b/weights_int4g32sbf16_planar_qat_rg
 #   decode   GQA_GROUPED_K=1 GQA_GROUPED_V=1 FUSE_QKV_DP=0 SPLIT_LM_HEAD=0 \
-#              bash scripts/build_llm_decode.sh gemma4-12b
+#              WEIGHTS=$PWD/artifacts/gemma4-12b/weights_int4g32sbf16_planar_qat_rg \
+#              bash scripts/build_llm_decode.sh gemma4-12b 48 \
+#                $PWD/artifacts/gemma4-12b/decode_int4g32qat_s6912_l48_rg
+#
+# EVERY FLAG ABOVE IS LOAD-BEARING and the artifact's own quant.json is the check:
+# {dtype int4, group_size 32, layout row_group_planar, scale_dtype bf16, full_range true,
+#  clip_search true, row_group 2}. --quant-full-range is what reaches the QAT checkpoint's own
+# 16-level [-8,7] grid; without it the packer clips to the symmetric 15-level subset and measures
+# the cost of declining the grid the checkpoint was trained on. g32 is the grid's own block (g64
+# reads 7.19% rel-L2), and g128 does not compile at K=3840 at all.
 #
 # int8 g64, and BOTH halves of that are load-bearing.
 #   int8, not int4: symmetric RTN int4 is 12.3% weight rel-L2 against a gate that wants ~0.3%
@@ -115,9 +127,14 @@ name = "gemma4-12b"
 # tokenization bug alone -- it was the missing softcap, and the tokenizer defect entered with the
 # re-run that fixed the softcap. Both are fixed; neither has yet been confirmed by a run carrying
 # both corrections.
+# THIS FILE IS THE SOURCE OF TRUTH, not the copy under XDNA_ENGINE_ROOT/scenarios.
+# install.sh stages this one over that one, so a default flipped only in the staged copy is
+# reverted by the next install and leaves no trace in git. That happened: int4 g32 QAT shipped
+# 2026-09-15 by editing the staged file alone, and an install on the same day silently put the
+# engine back on int8 g64. Flip a default HERE, then install.
 [artifacts]
-decode = "artifacts/gemma4-12b/decode_s6912_headint8_l48"
-weights = "artifacts/gemma4-12b/weights_int8g64_planar_headint8"
+decode = "artifacts/gemma4-12b/decode_int4g32qat_s6912_l48_rg"
+weights = "artifacts/gemma4-12b/weights_int4g32sbf16_planar_qat_rg"
 tokenizer_dir = "artifacts/gemma4-12b/tokenizer"
 
 [generation]
