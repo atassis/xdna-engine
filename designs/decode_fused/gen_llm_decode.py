@@ -1370,7 +1370,15 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                         # a REFUSAL (P003), not a reason to quietly drop to the unfused arm --
                         # which is what silently unfusing a whole decoder layer used to be.
                         None)
-    fuse_o = FUSE_MLP_O and mlp_dp_why is None
+    # Sandwich norms pass the post-FFN gain as the fused design's own argument, and under fuse_o
+    # get_arg_spec wants BOTH post-norm gains packed as one 2*D buffer [n_pa | n_pff] while the
+    # generator holds them as two D buffers. Declining fuse_o is not a fallback here, it is the
+    # only expressible arm: the unfused runlist below already carries n_pff correctly.
+    fuse_o_why = ("sandwich norms need the post-norm gains packed as one 2*D buffer"
+                  if sp.sandwich_norms else None)
+    fuse_o = FUSE_MLP_O and mlp_dp_why is None and fuse_o_why is None
+    if FUSE_MLP_O and mlp_dp_why is None and fuse_o_why:
+        print(f"[gen] fused arm mlp_o: OFF -- {fuse_o_why}")
     for g in geoms:
         why, tag = qkv_dp_why[g], "" if len(geoms) == 1 else f" [head_dim={g[0]}, kv_heads={g[1]}, v_proj={g[2]}]"
         print(f"[gen] fused arm qkv_head_dp{tag}: {'OFF -- ' + why if why else 'on'}")
@@ -2188,11 +2196,8 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                 # [n_pff] at D here, [n_pa | n_pff] at 2*D under fuse_o -- so the fused design
                 # applies the post-FFN norm itself and the standalone op_norm below must not.
                 if fuse_o:
-                    if sp.sandwich_norms:
-                        raise NotImplementedError(
-                            "FUSE_MLP_O + sandwich norms needs the post-norm gains PACKED as one "
-                            "2*D buffer [n_pa | n_pff]; the generator has them as two D buffers. "
-                            "Set FUSE_MLP_O=0 (which two q_dims already force on Gemma-4).")
+                    # sandwich norms cannot reach here: fuse_o declines them at its derivation,
+                    # where op_o and the arg specs are shaped to match.
                     rl.append((op_mlp_dp, cur, p + "cx", p + "n_pf", p + "Wo", p + "Wg", p + "Wu",
                                p + "Wd", "mlp_gh", "mlp_a_scratch", nxt))
                 else:
