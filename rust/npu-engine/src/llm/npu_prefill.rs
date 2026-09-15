@@ -160,6 +160,16 @@ pub fn mask_widths_block(start: usize, batch: usize, heads: usize, max_seq: usiz
     out
 }
 
+/// The highest position a prefill ELF of window `max_seq` can prime in batches of `batch`.
+///
+/// Batch-aligned DOWN, because a chunk writes `batch` consecutive positions from a single `kv_off`
+/// and so cannot be shortened to fit under `max_seq` -- it runs whole or not at all. A caller that
+/// primed past this would get rows whose causal width `mask_widths_block` clamps, and a clamped
+/// width masks nothing.
+pub fn prefill_window(max_seq: usize, batch: usize) -> usize {
+    if batch == 0 { 0 } else { (max_seq / batch) * batch }
+}
+
 /// A resident device backend for one batched-prefill ELF, bound to a `FusedArena` it does not own.
 ///
 /// Constructed only through [`NpuDecodeStep::with_prefill`](crate::llm::NpuDecodeStep::with_prefill),
@@ -217,8 +227,10 @@ impl NpuPrefill {
     }
 
     /// Prime the KV cache for `tokens[from..]` at absolute positions `[from, tokens.len())`.
-    /// Returns the number of positions now primed, which is `tokens.len()` -- the caller resumes
-    /// the per-token loop there.
+    /// Returns the number of positions now primed, which the caller resumes the per-token loop at.
+    /// That is `tokens.len()` for a prompt inside this ELF's window and the batch-aligned window
+    /// otherwise -- see the `window` binding below for why a long prompt is declined rather than
+    /// truncated or clamped.
     ///
     /// `tokens` is the WHOLE prompt prefix, not the tail: `from` shifts the plan's origin only, so
     /// `tokens[chunk.start + i]` keeps indexing the prompt by absolute position and the KV position
@@ -257,12 +269,31 @@ impl NpuPrefill {
         if tokens.len() <= from {
             return Ok(tokens.len());
         }
+        // How far this ELF can prime, batch-aligned DOWN. Two separate reasons, and neither is a
+        // tidiness bound:
+        //
+        // `mask_widths_block` clamps a row's causal width to `max_seq`, and a clamped width masks
+        // NOTHING -- the row attends every position in the window instead of only those at or
+        // before itself. It is silent, it is correct-looking, and it only appears for prompts long
+        // enough to reach the clamp.
+        //
+        // And a chunk writes `batch` CONSECUTIVE positions from one `kv_off`, so a chunk crossing
+        // `max_seq` cannot be shortened to fit: it runs whole or not at all.
+        //
+        // Today `check_prefill_pairing` requires `dims.S` equal across the halves and `S % M == 0`,
+        // which makes this exactly `tokens.len()` and the decline unreachable. It is the
+        // precondition for relaxing either of those, not a live behaviour change.
+        let window = prefill_window(self.artifact.max_seq, self.batch);
+        let end = tokens.len().min(window);
+        if end <= from {
+            return Ok(from);
+        }
         let d = embed.d_model();
         let hd = self.artifact.head_dim;
         let x_loc = *self.artifact.loc("x");
         let mut x = vec![0u8; self.batch * d * 2];
 
-        for chunk in chunk_plan(from, tokens.len(), self.batch) {
+        for chunk in chunk_plan(from, end, self.batch) {
             // Pad rows repeat the chunk's last real token rather than an arbitrary id: any token is
             // correct (the pad rows' KV lands past n_past and is masked), and repeating a real one
             // keeps the activations in-distribution, so a NaN in the padded tail is a genuine defect
@@ -324,7 +355,7 @@ impl NpuPrefill {
             arena.sync_input().map_err(|e| EngineError::Device(format!("sync prefill input: {e}")))?;
             self.res.dispatch().map_err(|e| EngineError::Device(format!("prefill dispatch: {e}")))?;
         }
-        Ok(tokens.len())
+        Ok(end)
     }
 }
 
@@ -334,6 +365,18 @@ mod tests {
 
     fn plan(n: usize, m: usize) -> Vec<(usize, usize, usize)> {
         chunk_plan(0, n, m).into_iter().map(|c| (c.start, c.real, c.pad(m))).collect()
+    }
+
+    #[test]
+    fn the_window_is_the_batch_aligned_floor_of_max_seq() {
+        // What the pairing check guarantees today: S % M == 0, so nothing is ever declined.
+        assert_eq!(prefill_window(4096, 256), 4096);
+        assert_eq!(prefill_window(2048, 256), 2048);
+        // Gemma-4's largest legal sliding window is 2040, which is NOT a multiple of 256. The last
+        // chunk would cover 1792..2048 and run 8 positions past the cache, so it does not run.
+        assert_eq!(prefill_window(2040, 256), 1792);
+        // A window shorter than one batch primes nothing: there is no whole chunk to run.
+        assert_eq!(prefill_window(200, 256), 0);
     }
 
     #[test]
