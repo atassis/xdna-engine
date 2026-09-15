@@ -153,3 +153,53 @@ iron_require_pin() {
     echo "  Rebase onto the pin, or re-pin toolchain.lock to a new merge-base if the floor moved." >&2
     return 1; }
 }
+
+# aiecc_require_pin [path] -- the aiecc that will RUN must be the one built from toolchain.lock's
+# MLIR_AIE_FORK_COMMIT. Equality, not ancestry (the opposite of iron_require_pin above): aiecc is a
+# built binary, not a source tree, so "descends from the pin" says nothing about what is inside it.
+#
+# The hole this closes: every build script resolves the compiler as ${AIECC_PATH:-$INST/bin/aiecc},
+# so an env var silently replaces the pinned toolchain, and provenance records the LOCK rather than
+# the binary -- an artifact built by another compiler is indistinguishable from a pinned one.
+# aiecc has always self-reported its git SHA and mlir-aie's _tool_identity has always read it, but
+# only as a cache key, so a wrong compiler minted a fresh cache namespace instead of failing.
+#
+# AIECC_PIN_OVERRIDE must NAME the sha it accepts, so it cannot be exported once and forgotten:
+# it goes stale the moment the binary changes. An absent sha is not a pass.
+# Captured when this file is SOURCED, like XDNA_WS above: inside a function BASH_SOURCE resolves
+# against however the caller spelled the source path, so a relative `. scripts/amd_paths.sh` lost
+# the repo root and the check failed closed on a lock it simply could not find.
+_AMD_PATHS_DIR="${_AMD_PATHS_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)}"
+
+aiecc_require_pin() {
+  local bin="${1:-${AIECC_PATH:-}}"
+  local lock="${MLIR_AIE_LOCK:-$_AMD_PATHS_DIR/../toolchain.lock}"
+  local want got
+  [ -x "$bin" ] || { echo "ERROR: aiecc_require_pin: no aiecc at '${bin:-<unset>}'" >&2; return 1; }
+  want="$(sed -n 's/^MLIR_AIE_FORK_COMMIT=\([0-9a-f]\{7,\}\).*/\1/p' "$lock" 2>/dev/null | head -1)"
+  [ -n "$want" ] || { echo "ERROR: no MLIR_AIE_FORK_COMMIT in $lock -- refusing to build unpinned" >&2; return 1; }
+  got="$("$bin" --version 2>/dev/null | sed -n 's/^[[:space:]]*git SHA:[[:space:]]*\([0-9a-f]\{7,\}\).*/\1/p' | head -1)"
+  [ -n "$got" ] || { echo "ERROR: $bin printed no git SHA -- cannot identify it, refusing to build" >&2; return 1; }
+  case "$want" in "$got"*) return 0 ;; esac
+  [ "${AIECC_PIN_OVERRIDE:-}" = "$got" ] && {
+    echo "[aiecc] WARNING: running UNPINNED aiecc $got (pin $want) by AIECC_PIN_OVERRIDE" >&2; return 0; }
+  echo "ERROR: aiecc is not the pinned compiler." >&2
+  echo "  binary: $bin" >&2
+  echo "  is:     $got" >&2
+  echo "  pin:    $want  (MLIR_AIE_FORK_COMMIT in $lock)" >&2
+  echo "  Unset AIECC_PATH to use the pinned instance, or re-pin toolchain.lock to land the fix" >&2
+  echo "  you want in the pin. To accept this binary deliberately: AIECC_PIN_OVERRIDE=$got" >&2
+  return 1
+}
+
+# aiecc_resolve [instance_dir] -- the ONLY way a build should obtain an aiecc.
+#
+# Thirteen scripts each spelled `export AIECC_PATH="${AIECC_PATH:-$INST/bin/aiecc}"`, so the choice
+# of compiler had thirteen owners and no checker. It keeps the env override (AIECC_PIN_OVERRIDE is
+# the deliberate way past) but no longer lets it pass unexamined.
+aiecc_resolve() {
+  local inst="${1:-${MLIR_AIE_INSTANCE:-}}"
+  [ -n "$inst" ] || { echo "ERROR: aiecc_resolve: no instance dir (pass one, or set MLIR_AIE_INSTANCE)" >&2; return 1; }
+  export AIECC_PATH="${AIECC_PATH:-$inst/bin/aiecc}"
+  aiecc_require_pin
+}

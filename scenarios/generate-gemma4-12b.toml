@@ -41,15 +41,23 @@ name = "gemma4-12b"
 # SPLIT_LM_HEAD=0 because the host loader carries one elf/kernel name, so a split head would be a
 # second dispatch it cannot express.
 #
-# DEFAULT SINCE 2026-09-14: row_group_planar + TMV_CTX on (`decode_int8g64_planar`). ms/token
-# history, this box, same GQA/FUSE_QKV/SPLIT_LM_HEAD config throughout, real service unless noted:
+# DEFAULT SINCE 2026-09-15: int4 g32 QAT row_group_planar + TMV_CTX on, S=6912
+# (`decode_int4g32qat_s6912_l48_rg`). ms/token history, this box, same GQA/FUSE_QKV/SPLIT_LM_HEAD
+# config throughout, real service unless noted.
+#
+# EVERY FIGURE BELOW IS `itl_ms.p50` FROM A RUN OF n>=140. Do not quote
+# `predicted_per_token_ms`: it divides a decode span covering n-1 steps by n tokens, so it reads
+# (n-1)/n of the truth -- -14.2% at n=7. Rows 1-3 as originally recorded were short-run figures and
+# are corrected here; the "~316 ms/token TMV build" that appeared in the KB never existed. See
+# the KB note on span-over-count bias, and D030.
 #   1. int8 g64, header_first, TMV_CTX=0 (shipped first)  801.46 ms/token   1.248 tok/s
 #   2. int8 g32, header_first, TMV_CTX=0 (traded quality for speed,
 #      shipped 2026-09-12 over a FAILED perplexity gate -- see below)  528.91 ms/token   1.884 tok/s
-#   3. int8 g64, row_group_planar, TMV_CTX=0                406.6-406.8 ms/token   ~2.40 tok/s
-#   4. int8 g64, row_group_planar, TMV_CTX on (THIS DEFAULT) alternated ABBA vs (3), device-time
-#      accounting, n=2 pairs: -13.68% (-50.41 ms/tok), sign-consistent both pairs, arm identity
-#      verified by artifact hash each round. NOT confirmed by a full-depth perplexity gate -- that
+#   3. int8 g64, row_group_planar, TMV_CTX=0, S=2048   416.27 ms/token  (hash b89a907d0b7b, n=140)
+#   4. int8 g64, row_group_planar, TMV_CTX on, S=2048  371.14 ms/token  (hash ebea682c3e91, n=337)
+#      -45.13 ms, -10.84% against (3) -- the real TMV_CTX win. The -13.68% recorded on 2026-09-14
+#      was an ABBA over short runs at unequal n and is superseded. NOT confirmed by a full-depth
+#      perplexity gate -- that
 #      harness was found broken for this model (never received 3 of 4 Gemma-4 fixes that landed on
 #      an unmerged branch, `g4/precision-quality`), partially repaired, still reads
 #      worse-than-uniform NLL on both arms alike as of 2026-09-14 -- DIAGNOSED 2026-09-14: two
@@ -60,6 +68,17 @@ name = "gemma4-12b"
 #      rows), never a value or a weight byte, and the L=6 exact-oracle gate went 8/8 (the pre-planar
 #      TMV_CTX-alone gate tied/missed at this same step; here it passes clean) -- lower risk class
 #      than (2)'s format narrowing, but the ship call rests on device-time + parity, not perplexity.
+#   5. as (4) but S=6912                               429.79 ms/token  (hash bff9d3434418, n=247)
+#      +58.65 ms against (4), and CONFIRMED 2026-09-15 by an alternated A-B-A-B at matched head
+#      dtype (a37e16f6adfe vs bff9d3434418, 100 tok/rep): 367.82 -> 428.99, +61.17 ms, +16.63%,
+#      both B reps above both A reps. The raise gated on CORRECTNESS only and was never priced;
+#      the overstated -13.68% in (4) is what concealed it. It is not a byte cost -- the same raise
+#      put the sliding layers on a 1024 ring and the global ones at 6912, taking KV traffic from
+#      704 to 448 MB/token while latency ROSE. It is core time in the global geometry's fallback
+#      GEMV, whose K is S on 8 layers. Split-K or a narrower global window is the lever.
+#   6. int4 g32 QAT, S=6912 (THIS DEFAULT)             410.00 ms/token  (hash 7ddc443b8e8d, n=270)
+#      -19.79 ms against (5). Shipped for arena 14.2 -> 8.07 GB and weight rel-L2 0.599 -> 0.211%,
+#      not for speed: a 35.7% byte cut converted at 2.2% (int4-vs-int8 A-B-A, 2026-09-15).
 # (3) beats (2)'s speed while staying on (1)'s quality-gated format -- no quality tradeoff needed.
 # Row_group_planar measures ~3% faster than header_first even at g32, where the width argument
 # below does not apply (g32's own group size already caps VEC_SIZE, header or no header) -- the
@@ -79,16 +98,27 @@ name = "gemma4-12b"
 #   2026-09-12  int8 g64 header_first shipped (from bf16), first quantized arm.        801.46 ms/tok
 #   2026-09-12  int8 g32 header_first shipped as a quality/speed TRADE (perplexity      528.91 ms/tok
 #               gate FAILED, +4.898% NLL vs g64, shipped anyway on owner's call).
-#   2026-09-13  int8 g64 row_group_planar: removes the header-imposed VEC_SIZE cap       406.7 ms/tok
+#   2026-09-13  int8 g64 row_group_planar: removes the header-imposed VEC_SIZE cap      416.27 ms/tok
 #               at K=3840 (16->64, 128b->512b) with NO accuracy cost (bytes reordered,
 #               values untouched) -- SUPERSEDES g32, now both faster and quality-safe.
-#   2026-09-14  TMV_CTX on (per-geometry, was force-OFF since 2026-09-11 though the    -13.68% device
-#               generator default flipped to on the same day): deletes the sliding      (~356 ms/tok)
+#   2026-09-14  TMV_CTX on (per-geometry, was force-OFF since 2026-09-11 though the     371.14 ms/tok
+#               generator default flipped to on the same day): deletes the sliding          -10.84%
 #               layers' zero-compute V-transpose (1342.18 MB/token, 7.9% of the byte
 #               census). Reorders a bf16 reduction, changes no value.
+#   2026-09-14  S=6912 long-context raise: +58.65 ms/tok, a REGRESSION, gated on       429.79 ms/tok
+#               correctness only. Core time in the global fallback GEMV (K=S on 8           +15.80%
+#               layers), not bytes -- KV traffic FELL 704 -> 448 MB/token across it.
+#   2026-09-15  int4 g32 QAT: arena 14.2 -> 8.07 GB, weight rel-L2 0.599 -> 0.211%.    410.00 ms/tok
+#               A 35.7% byte cut converted at 2.2% -- shipped for arena, not speed.         -4.60%
 # Tried and NOT adopted (kept here so they are not re-tried blind):
 #   int4 (any layout)        12.3% weight rel-L2 against a ~0.3% logit-accuracy budget; no group
-#                             size or calibration closes it -- see the "int8, not int4" note above.
+#                             size or calibration closes it -- SUPERSEDED 2026-09-15 by the QAT
+#                             checkpoint at full range, which ships (see the recipe above).
+#   int8/int4 KV cache       REFUSED by precision.py, not untried: P003 (the operator declaring
+#                             kc/vc has no weight_dtype axis) blocks any quantized KV, and P006
+#                             additionally blocks sub-8-bit because a kc row is a POSITION, so the
+#                             packer would scale per token where K wants per-channel. Worth 4.0%
+#                             of the token at S=6912 and 18.7% at 131072 -- arena, not latency.
 #   g128                     does not compile at K=3840 (VEC_SIZE derives 8, below aie_api's
 #                             minimum vector width) -- see the "g64, not g128" note above.
 #
