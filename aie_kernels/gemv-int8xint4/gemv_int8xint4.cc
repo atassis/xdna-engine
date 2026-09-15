@@ -73,6 +73,14 @@
 #define GEMV_N 256    // full output dim for this brick instance / tile
 #endif
 
+// The A contract above -- row 0 real, rows 1..M_NATIVE-1 zero -- makes the per-k-tile A
+// staging a single 16-element load into a zeroed vector instead of a 64-element scalar
+// gather of which 3/4 copies zeros. Bit-identical under that contract; 83 -> 16 bundles.
+// Set to 0 for a caller whose A really carries M>1 rows.
+#ifndef GEMV_A_ZERO_PAD
+#define GEMV_A_ZERO_PAD 1
+#endif
+
 static_assert(GEMV_K % GEMV_K_NATIVE == 0, "GEMV_K must be a multiple of the native K tile");
 static_assert(GEMV_N % GEMV_N_NATIVE == 0, "GEMV_N must be a multiple of the native N tile");
 
@@ -111,12 +119,17 @@ void gemv_int8xint4(const int8 *restrict a, const int4 *restrict b, int32_t *res
       // by gathering per-row K_NATIVE chunks (native A vector = M*K_NATIVE
       // contiguous elements in mmul's expected order == per-row concat,
       // matching how norm_gemv_prologue treats the resident A tile linearly).
+#if GEMV_A_ZERO_PAD
+      ::aie::vector<int8, MMUL::size_A> A = ::aie::zeros<int8, MMUL::size_A>();
+      A.insert(0, ::aie::load_v<GEMV_K_NATIVE>(a + kt * GEMV_K_NATIVE));
+#else
       int8 a_stage[GEMV_M_NATIVE * GEMV_K_NATIVE];
       for (int m = 0; m < GEMV_M_NATIVE; m++) {
         const int8 *row = a + m * GEMV_K + kt * GEMV_K_NATIVE;
         for (int kk = 0; kk < GEMV_K_NATIVE; kk++) a_stage[m * GEMV_K_NATIVE + kk] = row[kk];
       }
       ::aie::vector<int8, MMUL::size_A> A = ::aie::load_v<MMUL::size_A>(a_stage);
+#endif
 
       // (K_NATIVE*N_NATIVE)/2 bytes/block: int4* advances 1 byte/lane on Peano,
       // and a contiguously packed 16x16 int4 block is 128 bytes (= size_B/2).
