@@ -449,6 +449,13 @@ def packed_zero_rows(n_rows, K, group_size, weight_dtype):
 # cores over 3 columns against 8 over 2, and --cores-per-col 1 is not available on this arm.
 # An ineligible spec still falls back: decode_layer_why below names the rule it missed.
 FUSE_DECODE_LAYER = os.environ.get("FUSE_DECODE_LAYER", "1") == "1"
+# attn_block_dp ALONE, without decode_layer_dp's whole-layer requirements (no FUSE_MLP_O, no MLP
+# shape check, no single-geometry constraint) -- so a spec whose layers disagree about attention
+# geometry (Gemma-4-12B: sliding 256/8, global 512/1) can fuse the geometries that qualify and
+# fall back to the unfused chain on the rest. Per geometry: see attn_block_why in build_graph,
+# which reuses qkv_dp_why/_tmv_declined rather than re-deriving the same rules decode_layer_why
+# already checks. Default OFF: device-free only so far.
+FUSE_ATTN_BLOCK = os.environ.get("FUSE_ATTN_BLOCK", "0") == "1"
 # Thread decode_layer_dp's window_parameter through: the AIE core reads its attention window from
 # a per-dispatch ScratchpadParameter ("attn_window", int32) instead of baking N_KV_CHUNKS into the
 # build. Only takes effect when decode_layer_dp itself is eligible (decode_layer_why is None below)
@@ -530,7 +537,7 @@ def load_weight_buffer(buf, arr):
 
 
 def sequence_name(sp, NL, S, placer_flags, decode_layer_active=False, T=None, tmv_declined=(),
-                  tmv_chunked=()):
+                  tmv_chunked=(), attn_block_geoms=()):
     """Name the fused sequence after everything that changes its graph, not just the model.
 
     IRON keys the cached artifact by this name. Every knob below produces a DIFFERENT ELF, so
@@ -623,6 +630,12 @@ def sequence_name(sp, NL, S, placer_flags, decode_layer_active=False, T=None, tm
     # copy of that logic is exactly the kind of drift this file's other suffixes warn about.
     if decode_layer_active:
         parts.append("declayer")
+    # attn_block_dp used WITHOUT decode_layer_dp, per geometry -- a different graph over the same
+    # buffers as the unfused chain, same collision this function's docstring warns about. Passed
+    # in rather than re-derived, same reason decode_layer_active is: build_graph already computed
+    # attn_block_why. Empty when no geometry qualifies, so an on-but-inert flag keeps the name.
+    if attn_block_geoms:
+        parts.append("ab" + "".join(f"_{h}" for h in sorted(attn_block_geoms)))
     if SPLIT_GH_DRAIN != 1:
         parts.append(f"sgh{SPLIT_GH_DRAIN}")
     if ATTN_SPLIT:
@@ -1387,6 +1400,37 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                 f"{_BUILD_STATE['layout']}/{_BUILD_STATE['scale_dtype']} dump this build packs"
             )
 
+    # Per-GEOMETRY eligibility for attn_block_dp used WITHOUT decode_layer_dp. Same clauses
+    # decode_layer_why checks below for the one geometry it requires, reused via qkv_dp_why/
+    # _tmv_declined rather than re-derived, so the two verdicts cannot drift apart -- but with no
+    # opinion on the MLP half (no mlp_dp_why, no FUSE_MLP_O) and no single-geometry requirement, so
+    # a spec whose layers disagree about attention geometry can fuse some and fall back on others.
+    #
+    # v_norm is its own clause, not folded into the has_v one above: design.py's algorithm
+    # (`v = Wv[head c] @ hn`, no norm) shows attn_block_dp has no value-norm stage at all, the
+    # same gap op_qkv_dp is already known to have (see its own NotImplementedError below) -- so a
+    # v_norm spec is refused on EVERY geometry, has_v or not. This is Gemma-4-12B today: v_norm=True
+    # blocks both its sliding and global layers, so FUSE_ATTN_BLOCK=1 fuses nothing on it until the
+    # operator grows one.
+    def _attn_block_why(g):
+        hd, hkv, has_v = g
+        return ("FUSE_ATTN_BLOCK=0" if not FUSE_ATTN_BLOCK else
+                qkv_dp_why[g] if qkv_dp_why[g] else
+                f"needs Hkv ({hkv}) == COLS ({COLS})" if hkv != COLS else
+                "attn_block_dp always fuses K and V; this geometry has no v_proj" if not has_v else
+                "attn_block_dp has no value-norm stage (see op_qkv_dp's own v_norm refusal "
+                "below)" if sp.v_norm else
+                "needs SCALE_IN_QNORM=1 (attn_block_dp has no separate scale stage)"
+                if not (SCALE_IN_QNORM and sp.qk_norm) else
+                "needs GQA_GROUPED_K=1 and TMV_CTX=1 (attn_block_dp computes exactly that "
+                "variant internally)" if not (GROUPED_K and TMV_CTX and hd not in _tmv_declined)
+                else None)
+
+    attn_block_why = {g: _attn_block_why(g) for g in geoms}
+    # head_dims that actually qualify, for sequence_name()'s suffix -- computed once here, same
+    # discipline as _tmv_declined/_tmv_chunked above, rather than re-derived at the call site.
+    _attn_block_fused = tuple(sorted(g[0] for g in geoms if attn_block_why[g] is None))
+
     # HOISTED ABOVE THE UNFUSED ATTENTION OPERATORS, and the move is load-bearing rather than
     # tidy-up. When the fused layer wins, op_rep_k/op_rep_v/op_scores/op_softmax/op_trv/op_ctx are
     # constructed and then never reach a runlist -- every use of them is inside the `else` arm
@@ -1437,6 +1481,10 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
     for g in geoms:
         why, tag = qkv_dp_why[g], "" if len(geoms) == 1 else f" [head_dim={g[0]}, kv_heads={g[1]}, v_proj={g[2]}]"
         print(f"[gen] fused arm qkv_head_dp{tag}: {'OFF -- ' + why if why else 'on'}")
+    for g in geoms:
+        why = attn_block_why[g]
+        tag = "" if len(geoms) == 1 else f" [head_dim={g[0]}, kv_heads={g[1]}]"
+        print(f"[gen] fused arm attn_block_dp{tag}: {'OFF -- ' + why if why else 'on'}")
     print(f"[gen] fused arm swiglu_mlp_dp: {'OFF -- ' + mlp_dp_why if mlp_dp_why else 'on'}")
     if fuse_o:
         if _spec("attn_o") != _spec("mlp"):
@@ -1720,6 +1768,20 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                              rows_per_chunk=rpc, m_chunk=mc, context=ctx)
         else:
             op_ctx = gemv(hd, w, ctx, num_batches=Hq)
+        # attn_block_dp AS A WHOLE, for this geometry alone -- one memoized object per (hd, hkv,
+        # has_v), same trap as every other op above: a fresh object per LAYER would defeat
+        # unique_designs' id()-keyed collapse and build one configure per layer instead of one per
+        # geometry. kv_offset_parameter/mask_parameter must match this geometry's own slot names
+        # (`slot`/`mask_slot`, assigned above), not the operator's single-geometry defaults, or the
+        # host writes a scratchpad parameter this design never reads.
+        op_attn_block = None
+        if attn_block_why[(hd, hkv, has_v)] is None:
+            from iron.operators.attn_block_dp.op import AttnBlockDataParallel
+            op_attn_block = AttnBlockDataParallel(
+                D=D, HD=hd, Hq=Hq, Hkv=hkv, max_seq=w, num_aie_columns=hkv, epsilon=sp.eps,
+                tile_size_input=TSI, context=ctx, weight_depth=WEIGHT_DEPTH,
+                wqkv_head_major=True, kv_offset_parameter=slot, mask_parameter=mask_slot,
+                kv_alloc=None if KVA_g == w else KVA_g, kv_block_size=None if T_g == w else T_g)
         g = SimpleNamespace(
             hd=hd, hkv=hkv, qd=qd, kvd=kvd, gqa=gqa, kv_slot=slot, o_chunks=o_chunks,
             op_qk_norm=op_qk_norm, op_qk_norm_b=op_qk_norm_b, op_qkv=op_qkv, op_q=op_q,
@@ -1729,7 +1791,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
             op_ctx=op_ctx, op_v_norm=op_v_norm, has_v=has_v, kv_parts=kv_parts,
             uses_tmv_ctx=uses_tmv, scores_groups=scores_groups,
             op_softmax=op_softmax, op_scale=op_scale, mask_slot=mask_slot, window=w,
-            circular=(w != S))
+            op_attn_block=op_attn_block, circular=(w != S))
         _attn_cache[(hd, hkv, has_v)] = g
         return g
 
@@ -2079,7 +2141,8 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
             assert len(qkv_parts) == want, (
                 f"L{l}: expected {want} concat parts ({'Wq, Wk, Wv' if g.has_v else 'Wq, Wk'}); "
                 f"got {len(qkv_parts)}")
-            if (op_decode_layer is not None and op_decode_layer.wqkv_head_major
+            if ((op_decode_layer is not None and op_decode_layer.wqkv_head_major
+                 or g.op_attn_block is not None and g.op_attn_block.wqkv_head_major)
                     and g.has_v):
                 # attn_block_dp wqkv_head_major: one contiguous run of (gqa+2) hd-row
                 # blocks per core. Per GEOMETRY -- gqa and the row height are g.hd/g.hkv,
@@ -2183,63 +2246,70 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                        p + "cx", p + "n_pf", p + "Wo", p + "Wg", p + "Wu", p + "Wd",
                        "mlp_gh", "mlp_a_scratch", nxt))
         else:
-            qk = proj = rope = vnorm = []
-            if sp.qk_norm and g.op_qkv_dp is None:
-                hq = [f"{qhb}[{qho + h*g.hd*2}:{qho + (h+1)*g.hd*2}]" for h in range(Hq)]
-                hk = [f"{khb}[{kho + h*g.hd*2}:{kho + (h+1)*g.hd*2}]" for h in range(g.hkv)]
-                qk = [*[((g.op_qk_norm if h % 2 == 0 else g.op_qk_norm_b),
-                         hq[h], p + "n_qn", hq[h]) for h in range(Hq)],
-                      *[((g.op_qk_norm if h % 2 == 0 else g.op_qk_norm_b),
-                         hk[h], p + "n_kn", hk[h]) for h in range(g.hkv)]]
-            if g.op_qkv_dp is None:
-                proj = ([(g.op_qkv, p + "Wqkv", p + "hn", p + "qkv")] if FUSE_QKV_GEMV else
-                        [(g.op_q, p + "Wq", p + "hn", ref_q),
-                         (g.op_kv, p + "Wk", p + "hn", ref_k),
-                         *([(g.op_kv, p + "Wv", p + "hn", ref_v)] if g.has_v else [])])
-                rope = ([(g.op_rope_qk, ref_qk, ang, ref_qk)] if fuse_rope else
-                        [(g.op_rope_q, ref_q, ang, ref_q),
-                         (g.op_rope_k, ref_k, ang, ref_k)])
-                if g.op_v_norm is not None:
-                    # Per kv head over head_dim, NOT rotated -- RoPE is a q/k-only step. Three args:
-                    # this is the qk-norm design, so it takes a gain, and `ones` is what makes it
-                    # gainless (see the construction site).
-                    #
-                    # SOURCE, and this is the whole of attention_k_eq_v: where the layer has a v_proj
-                    # this is in place on v, but where it does not, V is the RAW k_proj output and the
-                    # norm READS the k slice and WRITES the v buffer. That out-of-place form is also
-                    # the copy, so k_eq_v needs no copy operator at all.
-                    #
-                    # ORDER is load-bearing in the second case and free in the first, so it is placed
-                    # for the second: BEFORE the qk-norm and RoPE entries, which mutate k in place.
-                    hv = [f"{vhb}[{vho + h*g.hd*2}:{vho + (h+1)*g.hd*2}]" for h in range(g.hkv)]
-                    src = ([f"{khb}[{kho + h*g.hd*2}:{kho + (h+1)*g.hd*2}]" for h in range(g.hkv)]
-                           if not g.has_v else hv)
-                    vnorm = [(g.op_v_norm, a, f"ones_h{g.hd}", b) for a, b in zip(src, hv)]
-            # The fused head replaces the norm, the projection, every qk-norm and the RoPE with one
-            # design; `hn` lives and dies in L1 instead of round-tripping DDR between four of them.
-            # The fused head absorbs the KV append too: k and v are drained straight into the caches
-            # at `kv_off` instead of into buffers a StridedCopy then re-reads and re-writes. The caches
-            # were their only consumer, so the intermediate had no reader -- it existed because the
-            # append was a separate operator. Two runs and one more configure per layer.
-            head = ([(g.op_qkv_dp, cur, p + "n_in", p + "Wqkv", p + "n_qn", p + "n_kn", ang,
-                      ref_q, p + "kc", p + "vc")]
-                    if g.op_qkv_dp is not None else
-                    [(op_norm, cur, p + "n_in", p + "hn"), *proj, *vnorm, *qk, *rope,
-                     (g.op_sck, ref_k, p + "kc"), (g.op_scv, ref_v, p + "vc")])
-            rl += [
-                *head,
-                *([] if GROUPED_K else [(g.op_rep_k, p + "kc", p + "kr")]),
-                # TMV_CTX subsumes the v-side grouping: TMatVec reads vc per kv head itself, so a
-                # Repeat would materialise a `vr` nothing consumes.
-                *([] if (GROUPED_V or g.uses_tmv_ctx) else [(g.op_rep_v, p + "vc", p + "vr")]),
-                *scores_runlist(p, g, ref_q),
-                *([] if scale_in_qnorm else [(g.op_scale, p + "sc", "attn_scale", p + "sc")]),
-                (g.op_softmax, p + "sc", p + "sw"),
-                *([] if g.uses_tmv_ctx else
-                  [(g.op_trv, p + ("vc" if GROUPED_V else "vr"), p + "vt")]),
-                (g.op_ctx, p + ("vc" if g.uses_tmv_ctx else "vt"), p + "sw", p + "cx"),
-                *([] if fuse_o else o_runlist(p, g)),
-            ]
+            if g.op_attn_block is not None:
+                # One device replaces norm/QKV/qk-norm/RoPE/KV-append/scores/softmax/ctx below; see
+                # attn_block_why for the per-geometry eligibility this reuses. o_runlist (Wo) and
+                # the MLP half are unaffected -- attn_block_dp stops at `cx`, same as op_ctx does.
+                attn_rl = [(g.op_attn_block, cur, p + "n_in", p + "Wqkv", p + "n_qn", p + "n_kn",
+                            ang, p + "kc", p + "vc", p + "cx")]
+            else:
+                qk = proj = rope = vnorm = []
+                if sp.qk_norm and g.op_qkv_dp is None:
+                    hq = [f"{qhb}[{qho + h*g.hd*2}:{qho + (h+1)*g.hd*2}]" for h in range(Hq)]
+                    hk = [f"{khb}[{kho + h*g.hd*2}:{kho + (h+1)*g.hd*2}]" for h in range(g.hkv)]
+                    qk = [*[((g.op_qk_norm if h % 2 == 0 else g.op_qk_norm_b),
+                             hq[h], p + "n_qn", hq[h]) for h in range(Hq)],
+                          *[((g.op_qk_norm if h % 2 == 0 else g.op_qk_norm_b),
+                             hk[h], p + "n_kn", hk[h]) for h in range(g.hkv)]]
+                if g.op_qkv_dp is None:
+                    proj = ([(g.op_qkv, p + "Wqkv", p + "hn", p + "qkv")] if FUSE_QKV_GEMV else
+                            [(g.op_q, p + "Wq", p + "hn", ref_q),
+                             (g.op_kv, p + "Wk", p + "hn", ref_k),
+                             *([(g.op_kv, p + "Wv", p + "hn", ref_v)] if g.has_v else [])])
+                    rope = ([(g.op_rope_qk, ref_qk, ang, ref_qk)] if fuse_rope else
+                            [(g.op_rope_q, ref_q, ang, ref_q),
+                             (g.op_rope_k, ref_k, ang, ref_k)])
+                    if g.op_v_norm is not None:
+                        # Per kv head over head_dim, NOT rotated -- RoPE is a q/k-only step. Three args:
+                        # this is the qk-norm design, so it takes a gain, and `ones` is what makes it
+                        # gainless (see the construction site).
+                        #
+                        # SOURCE, and this is the whole of attention_k_eq_v: where the layer has a v_proj
+                        # this is in place on v, but where it does not, V is the RAW k_proj output and the
+                        # norm READS the k slice and WRITES the v buffer. That out-of-place form is also
+                        # the copy, so k_eq_v needs no copy operator at all.
+                        #
+                        # ORDER is load-bearing in the second case and free in the first, so it is placed
+                        # for the second: BEFORE the qk-norm and RoPE entries, which mutate k in place.
+                        hv = [f"{vhb}[{vho + h*g.hd*2}:{vho + (h+1)*g.hd*2}]" for h in range(g.hkv)]
+                        src = ([f"{khb}[{kho + h*g.hd*2}:{kho + (h+1)*g.hd*2}]" for h in range(g.hkv)]
+                               if not g.has_v else hv)
+                        vnorm = [(g.op_v_norm, a, f"ones_h{g.hd}", b) for a, b in zip(src, hv)]
+                # The fused head replaces the norm, the projection, every qk-norm and the RoPE with one
+                # design; `hn` lives and dies in L1 instead of round-tripping DDR between four of them.
+                # The fused head absorbs the KV append too: k and v are drained straight into the caches
+                # at `kv_off` instead of into buffers a StridedCopy then re-reads and re-writes. The caches
+                # were their only consumer, so the intermediate had no reader -- it existed because the
+                # append was a separate operator. Two runs and one more configure per layer.
+                head = ([(g.op_qkv_dp, cur, p + "n_in", p + "Wqkv", p + "n_qn", p + "n_kn", ang,
+                          ref_q, p + "kc", p + "vc")]
+                        if g.op_qkv_dp is not None else
+                        [(op_norm, cur, p + "n_in", p + "hn"), *proj, *vnorm, *qk, *rope,
+                         (g.op_sck, ref_k, p + "kc"), (g.op_scv, ref_v, p + "vc")])
+                attn_rl = [
+                    *head,
+                    *([] if GROUPED_K else [(g.op_rep_k, p + "kc", p + "kr")]),
+                    # TMV_CTX subsumes the v-side grouping: TMatVec reads vc per kv head itself, so a
+                    # Repeat would materialise a `vr` nothing consumes.
+                    *([] if (GROUPED_V or g.uses_tmv_ctx) else [(g.op_rep_v, p + "vc", p + "vr")]),
+                    *scores_runlist(p, g, ref_q),
+                    *([] if scale_in_qnorm else [(g.op_scale, p + "sc", "attn_scale", p + "sc")]),
+                    (g.op_softmax, p + "sc", p + "sw"),
+                    *([] if g.uses_tmv_ctx else
+                      [(g.op_trv, p + ("vc" if GROUPED_V else "vr"), p + "vt")]),
+                    (g.op_ctx, p + ("vc" if g.uses_tmv_ctx else "vt"), p + "sw", p + "cx"),
+                ]
+            rl += [*attn_rl, *([] if fuse_o else o_runlist(p, g))]
             if sp.sandwich_norms:
                 rl.append((op_norm, p + "a", p + "n_pa", p + "a"))
             if op_mlp_dp is not None:
@@ -2408,7 +2478,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         if not last:
             seg_bufsz[seg_out] = D * 2
         _sn = sequence_name(sp, NL, S, placer_flags, tmv_declined=_tmv_declined,
-                            tmv_chunked=_tmv_chunked,
+                            tmv_chunked=_tmv_chunked, attn_block_geoms=_attn_block_fused,
                             decode_layer_active=op_decode_layer is not None, T=T)
         name = _sn if len(cuts) == 1 else f"{_sn}_seg{si}of{len(cuts)}"
         # A rung is THIS runlist with the layer design substituted. Only for an unsplit
