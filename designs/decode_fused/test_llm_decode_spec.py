@@ -5,9 +5,11 @@ Run:
   PYTHONPATH=designs/decode_fused .venv-iron/bin/python -m pytest \
       designs/decode_fused/test_llm_decode_spec.py -v
 """
+import re
+
 import pytest
 
-from llm_decode_spec import GEMMA3_270M, QWEN3_0_6B
+from llm_decode_spec import GEMMA3_270M, GEMMA4_12B, QWEN3_0_6B
 
 
 class TestCheckPrefillQwen:
@@ -89,6 +91,47 @@ class TestCheckPrefillGemma:
         GEMMA3_270M.check_prefill_seq(256, 1024, tile_n_overrides={"ctx": 32})
 
 
+class TestPrefillSuggestionIsActionable:
+    """A tile_n printed as a fix must clear the capacity checks that run after the one it resolves.
+
+    gemma4-12b is the case that separates the two rules: d_model=3840 admits tile_n up to 480 on
+    divisibility alone, but 480 needs 265472B of a 64KB L1, so advising it sends the reader
+    straight into a second rejection. 80 is the largest that clears both.
+    """
+
+    def _follow_advice(self, spec, batch=256):
+        """Apply each suggested override in turn, as a reader would, until it passes or stalls."""
+        overrides = {}
+        for _ in range(8):
+            try:
+                spec.check_prefill(batch, tile_n_overrides=overrides)
+                return overrides
+            except ValueError as exc:
+                m = re.search(r"tile_n_overrides=\{'(\w+)': (\d+)\}", str(exc))
+                if m is None:
+                    pytest.fail(f"no actionable suggestion in: {exc}")
+                overrides[m.group(1)] = int(m.group(2))
+        pytest.fail(f"advice did not converge, reached {overrides}")
+
+    def test_gemma4_advice_converges(self):
+        assert self._follow_advice(GEMMA4_12B) == {"o": 80, "down": 80}
+
+    def test_gemma3_advice_converges(self):
+        assert self._follow_advice(GEMMA3_270M) == {"o": 80, "down": 80}
+
+    def test_gemma4_suggestion_fits_l1(self):
+        with pytest.raises(ValueError) as exc:
+            GEMMA4_12B.check_prefill(256)
+        assert "tile_n_overrides={'o': 80}" in str(exc.value)
+
+    def test_gemma4_prefill_is_legal_at_256(self):
+        """Both attention geometries (sliding head_dim=256, global 512) at the S=2048 window."""
+        GEMMA4_12B.check_prefill(256, tile_n_overrides={"o": 80, "down": 80})
+        GEMMA4_12B.check_prefill_seq(256, 2048, tile_n_overrides={"ctx": 16})
+        assert GEMMA4_12B.legal_prefill_batches(
+            600, tile_n_overrides={"o": 80, "down": 80}) == [256, 512]
+
+
 class TestCheckPrefillTileRules:
     def test_tile_m_must_be_multiple_of_16_under_bfp16(self):
         with pytest.raises(ValueError) as exc:
@@ -143,7 +186,7 @@ class TestCheckPrefillProjections:
         """
         with pytest.raises(ValueError) as exc:
             QWEN3_0_6B.check_prefill_projections(256, (("ctx", 2048, 64),), cols=8)
-        assert "no tile_n multiple of 16 divides" in str(exc.value)
+        assert "no tile_n multiple of 16 both divides" in str(exc.value)
 
     def test_an_illegal_column_count_is_named_as_such(self):
         with pytest.raises(ValueError) as exc:
