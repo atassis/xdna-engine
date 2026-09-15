@@ -44,6 +44,7 @@ iron_at="$(iron_require_api "gen_llm_decode.py" \
   "iron/common/sequence.py:class OperatorSequence" \
   "iron/operators/strided_copy/op.py:output_offset_parameter" \
   "iron/operators/tmatvec/op.py:class TMatVec" \
+  "iron/operators/tmatvec/op.py:m_chunk" \
   "$QUANT_SPEC" \
   "iron/operators/qkv_head_dp/op.py:class QKVHeadDataParallel" \
   "iron/operators/swiglu_mlp_dp/op.py:post_norm")" || exit 1
