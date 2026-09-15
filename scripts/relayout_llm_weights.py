@@ -22,6 +22,11 @@ ap.add_argument("--src", required=True, help="packed dump to read")
 ap.add_argument("--bf16", required=True, help="bf16 dump supplying tensor shapes")
 ap.add_argument("--out", required=True)
 ap.add_argument("--iron", default=os.environ.get("IRON_DIR", ""))
+ap.add_argument("--src-row-group", type=int,
+                help="row_group the SOURCE was packed at, when its quant.json does not record one. "
+                     "There is no safe default: a wrong value is a silent garbage permutation that "
+                     "every self-consistency check still passes. Confirm it by dequantizing one "
+                     "tensor against the bf16 dump -- the wrong value reads as nan or noise.")
 ap.add_argument("--layout", default="row_group_planar",
                 choices=("row_group_planar", "header_first"),
                 help="layout to WRITE. row_group_planar (default) re-derives the row_group, which is "
@@ -61,6 +66,20 @@ def shape_of(name):
     assert K % n_chunks == 0, (name, K, n_chunks)
     return M, K // n_chunks
 
+# A wrong source row_group permutes every row into garbage and still round-trips cleanly, so it is
+# refused rather than defaulted. Measured 2026-09-15: weights_int8g64_planar records no row_group and
+# was packed at 4, where the former default of 1 dequantizes to nan against the bf16 dump.
+if "row_group" in man:
+    SRC_RG = int(man["row_group"])
+    if a.src_row_group is not None and a.src_row_group != SRC_RG:
+        sys.exit(f"--src-row-group {a.src_row_group} contradicts {a.src}/quant.json's {SRC_RG}")
+elif a.src_row_group is not None:
+    SRC_RG = a.src_row_group
+else:
+    sys.exit(f"{a.src}/quant.json records no row_group and this tool will not guess one -- "
+             f"pass --src-row-group. Confirm the value by dequantizing one tensor against the "
+             f"bf16 dump at each candidate; only the right one is not nan.")
+
 os.makedirs(a.out, exist_ok=True)
 moved = same = 0
 for f in sorted(os.listdir(a.src)):
@@ -73,7 +92,7 @@ for f in sorted(os.listdir(a.src)):
     M, K = shape_of(name)
     stride = row_stride_bytes(K, G, DT, SDT)
     new_rg = derive_row_group([K], G, DT, vec_size=widest_chunk(G, DT), scale_dtype=SDT)
-    old_rg = man.get("row_group", 1)          # unrecorded in legacy dumps; 1 is what they wrote
+    old_rg = SRC_RG
     blob = np.load(src, mmap_mode="r")
     assert blob.nbytes == M * stride, (name, blob.nbytes, M, stride)
     if new_rg == old_rg and a.layout == "row_group_planar":
