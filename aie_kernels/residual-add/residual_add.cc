@@ -32,12 +32,22 @@ void residual_add_row(const float *restrict a, const bfloat16 *restrict b,
   event0();
   const auto saved_rounding =
       ::aie::swap_rounding(::aie::rounding_mode::conv_even);
-  const ::aie::vector<float, N> sv = ::aie::broadcast<float, N>(scale);
-  for (int i = 0; i < cols; i += N) {
-    ::aie::accum<accfloat, N> ba;
-    ba.from_vector(::aie::load_v<N>(b + i), 0);
-    ::aie::vector<float, N> sb = ::aie::mul(ba.template to_vector<float>(), sv);
-    ::aie::store_v(out + i, ::aie::add(::aie::load_v<N>(a + i), sb));
+  if (scale == 1.0f) {
+    // See the f32 arm.
+    for (int i = 0; i < cols; i += N) {
+      ::aie::accum<accfloat, N> ba;
+      ba.from_vector(::aie::load_v<N>(b + i), 0);
+      ::aie::store_v(out + i, ::aie::add(::aie::load_v<N>(a + i),
+                                         ba.template to_vector<float>()));
+    }
+  } else {
+    const ::aie::vector<float, N> sv = ::aie::broadcast<float, N>(scale);
+    for (int i = 0; i < cols; i += N) {
+      ::aie::accum<accfloat, N> ba;
+      ba.from_vector(::aie::load_v<N>(b + i), 0);
+      ::aie::vector<float, N> sb = ::aie::mul(ba.template to_vector<float>(), sv);
+      ::aie::store_v(out + i, ::aie::add(::aie::load_v<N>(a + i), sb));
+    }
   }
   ::aie::set_rounding(saved_rounding);
   event1();
@@ -58,6 +68,19 @@ void residual_add_row(const bfloat16 *restrict a, const bfloat16 *restrict b,
   // bf16 is a rounding site the f32 arm does not have.
   const auto saved_rounding =
       ::aie::swap_rounding(::aie::rounding_mode::conv_even);
+  if (scale == 1.0f) {
+    // See the f32 arm. The add stays at f32 -- only the multiply goes.
+    for (int i = 0; i < cols; i += N) {
+      ::aie::accum<accfloat, N> aa;
+      aa.from_vector(::aie::load_v<N>(a + i), 0);
+      ::aie::accum<accfloat, N> ba;
+      ba.from_vector(::aie::load_v<N>(b + i), 0);
+      ::aie::accum<accfloat, N> ya;
+      ya.from_vector(::aie::add(aa.template to_vector<float>(),
+                                ba.template to_vector<float>()));
+      ::aie::store_v(out + i, ya.template to_vector<bfloat16>());
+    }
+  } else {
   const ::aie::vector<float, N> sv = ::aie::broadcast<float, N>(scale);
   for (int i = 0; i < cols; i += N) {
     // bf16 -> f32 is exact (bf16 is a truncated f32), so widening costs nothing numerically
@@ -71,6 +94,7 @@ void residual_add_row(const bfloat16 *restrict a, const bfloat16 *restrict b,
     ::aie::accum<accfloat, N> ya;
     ya.from_vector(y);
     ::aie::store_v(out + i, ya.template to_vector<bfloat16>());
+  }
   }
   ::aie::set_rounding(saved_rounding);
   event1();
@@ -95,12 +119,21 @@ void residual_add_row(const float *restrict a, const float *restrict b,
   // one happened to run first, which is invisible in every artifact we diff.
   const auto saved_rounding =
       ::aie::swap_rounding(::aie::rounding_mode::conv_even);
-  const ::aie::vector<float, N> sv = ::aie::broadcast<float, N>(scale);
-  for (int i = 0; i < cols; i += N) {
-    ::aie::vector<float, N> av = ::aie::load_v<N>(a + i);
-    ::aie::vector<float, N> bv = ::aie::load_v<N>(b + i);
-    ::aie::vector<float, N> sb = ::aie::mul(bv, sv);  // scale*b
-    ::aie::store_v(out + i, ::aie::add(av, sb));      // a + scale*b
+  if (scale == 1.0f) {
+    // s100 is the full residual, and `scale` reaches this object as a runtime argument (the
+    // IRON Kernel types it np.float32), so the multiply cannot fold at the call site. aie2p has
+    // no native f32 vector multiply, so that multiply is ~19 emitted vector ops against one
+    // load; dropping it is exact and takes the body 61 -> 13 bundles. Tested once per CALL.
+    for (int i = 0; i < cols; i += N)
+      ::aie::store_v(out + i, ::aie::add(::aie::load_v<N>(a + i), ::aie::load_v<N>(b + i)));
+  } else {
+    const ::aie::vector<float, N> sv = ::aie::broadcast<float, N>(scale);
+    for (int i = 0; i < cols; i += N) {
+      ::aie::vector<float, N> av = ::aie::load_v<N>(a + i);
+      ::aie::vector<float, N> bv = ::aie::load_v<N>(b + i);
+      ::aie::vector<float, N> sb = ::aie::mul(bv, sv);  // scale*b
+      ::aie::store_v(out + i, ::aie::add(av, sb));      // a + scale*b
+    }
   }
   ::aie::set_rounding(saved_rounding);
   event1();
