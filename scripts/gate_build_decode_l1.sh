@@ -22,7 +22,9 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 NL="${1:-1}"
 REF_SHA="370686d71d65b9f181f5a51b16230e690ccaf1bdc39b6e0e8f96c8667f538a04"
 
-export AIECC_PATH="${AIECC_PATH:-$("$REPO/scripts/toolchain_up.sh")/bin/aiecc}"
+. "$REPO/scripts/amd_paths.sh"   # -> aiecc_resolve (pins the compiler)
+_INST="${_INST:-$("$REPO/scripts/toolchain_up.sh")}"
+aiecc_resolve "$_INST" || exit 1
 export AIECC_PHASE_TIMERS="${AIECC_PHASE_TIMERS:-1}"
 export AIECC_JOBS="${AIECC_JOBS:-16}"
 

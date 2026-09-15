@@ -23,7 +23,8 @@ AIEBU_DIR="$AIEBU_ASM_DIR"
 WEIGHTS="$REPO/artifacts/whisper-small/whisper_decoder"
 GENDIR="$REPO/designs/decode_fused"
 
-export AIECC_PATH="${AIECC_PATH:-$("$REPO/scripts/toolchain_up.sh")/bin/aiecc}"
+_INST="${_INST:-$("$REPO/scripts/toolchain_up.sh")}"
+aiecc_resolve "$_INST" || exit 1
 export AIECC_PHASE_TIMERS="${AIECC_PHASE_TIMERS:-1}"
 export AIECC_PHASE_TIMERS_FILE="${AIECC_PHASE_TIMERS_FILE:-$FROZEN_DIR/phase_timers.log}"
 export AIECC_JOBS="${AIECC_JOBS:-16}"

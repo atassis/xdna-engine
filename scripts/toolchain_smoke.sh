@@ -9,7 +9,8 @@ INST="$("$REPO/scripts/toolchain_up.sh")"
 export PEANO_INSTALL_DIR="$REPO/.venv-iron/lib/python3.14/site-packages/llvm-aie"
 export PATH="$REPO/.venv-iron/bin:$PATH"   # make's `python3` = venv python (deps: ml_dtypes etc.)...
 export PYTHONPATH="$INST/python:${PYTHONPATH:-}"   # ...while `aie` resolves to the fork instance (place-tiles)
-export AIECC_PATH="$INST/bin/aiecc"
+. "$REPO/scripts/amd_paths.sh"   # -> aiecc_resolve (pins the compiler)
+aiecc_resolve "$INST" || exit 1
 export MLIR_AIE_INSTANCE="$INST"   # design_override.mk hard-requires this; without it the gate
                                    # dies in make before compiling anything, which reads as a
                                    # toolchain failure rather than the missing export it is.

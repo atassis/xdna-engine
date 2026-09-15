@@ -57,7 +57,7 @@ export PYTHONPATH="$INST/python:$IRON${PYTHONPATH:+:$PYTHONPATH}"
 # script fell through to $VENV_IRON/bin/aiecc (the wheel slot). Matches the gate scripts.
 # NOTE: re-confirm the decode byte-gate on the first build after this switch (instance aiecc may differ
 # from the previously-swapped wheel binary).
-export AIECC_PATH="${AIECC_PATH:-$INST/bin/aiecc}"
+aiecc_resolve "$INST" || exit 1
 [ -x "$AIECC_PATH" ] || { echo "ERROR: instance aiecc not at $AIECC_PATH (run scripts/toolchain_up.sh)"; exit 1; }
 
 WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT   # amd/IRON writes build/ intermediates under CWD

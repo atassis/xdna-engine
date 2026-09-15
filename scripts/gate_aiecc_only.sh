@@ -18,7 +18,8 @@ VENV_IRON="$REPO/.venv-iron"
 AIEBU_DIR="$AIEBU_ASM_DIR"
 PEANO="$VENV_IRON/lib/python3.14/site-packages/llvm-aie"
 
-export AIECC_PATH="${AIECC_PATH:-$("$REPO/scripts/toolchain_up.sh")/bin/aiecc}"
+_INST="${_INST:-$("$REPO/scripts/toolchain_up.sh")}"
+aiecc_resolve "$_INST" || exit 1
 export AIECC_JOBS="${AIECC_JOBS:-16}"
 WORK="${WORK:-$(mktemp -d)}"
 export AIECC_PHASE_TIMERS=1

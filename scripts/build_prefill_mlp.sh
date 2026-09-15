@@ -30,7 +30,7 @@ echo "[build] IRON on $iron_at (API surface verified)"
 
 INST="$("$REPO/scripts/toolchain_up.sh")"
 export PYTHONPATH="$INST/python:$IRON${PYTHONPATH:+:$PYTHONPATH}"
-export AIECC_PATH="${AIECC_PATH:-$INST/bin/aiecc}"
+aiecc_resolve "$INST" || exit 1
 export PEANO_INSTALL_DIR="${PEANO_INSTALL_DIR:-$VENV_IRON/lib/python3.14/site-packages/llvm-aie}"
 export MLIR_AIE_INSTANCE="$INST"
 export PATH="$VENV_IRON/bin:$VENV_IRON/cc-shim:$AIEBU_ASM_DIR:$PATH"

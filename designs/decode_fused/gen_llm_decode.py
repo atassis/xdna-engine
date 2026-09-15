@@ -785,6 +785,20 @@ def toolchain_provenance():
     inst = os.environ.get("MLIR_AIE_INSTANCE")
     if inst:
         prov["instance"] = os.path.basename(inst.rstrip("/"))
+    # The COMPILER that ran, not the lock that named it. `hash` and `instance` both describe
+    # toolchain.lock and are blind to AIECC_PATH, so an artifact built by another aiecc recorded
+    # provenance indistinguishable from a pinned one -- see aiecc_require_pin in scripts/amd_paths.sh.
+    aiecc = os.environ.get("AIECC_PATH")
+    if aiecc and os.path.exists(aiecc):
+        try:
+            out = subprocess.run([aiecc, "--version"], capture_output=True, timeout=30).stdout.decode(errors="replace")
+            for ln in out.splitlines():
+                if "git SHA:" in ln:
+                    prov["aiecc_sha"] = ln.split("git SHA:")[1].strip()
+                    break
+        except (OSError, subprocess.SubprocessError):
+            pass
+        prov["aiecc_path"] = aiecc
     return prov
 
 
