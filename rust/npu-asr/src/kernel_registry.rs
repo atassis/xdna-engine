@@ -320,6 +320,14 @@ pub fn generate_manifest(dir: &Path) -> std::io::Result<Manifest> {
 /// [`generate_manifest`], stamping each entry with the kernel-source digest the artifacts were
 /// built from. Pass `None` only where the source genuinely is not known -- a wrong digest is worse
 /// than an absent one, because absent reports as unverified and wrong reports as fresh.
+///
+/// KNOWN GAP: the caller passes the digest of the source tree as it is NOW, not of whatever the
+/// build dir was actually compiled from, so publishing stale build output launders it as fresh.
+/// The normal path self-corrects -- an edit marks the stems stale, the rebuild runs, and publish
+/// then stamps artifacts that really are current -- but running `publish_kernels.sh` directly
+/// after editing a kernel, with no rebuild in between, still records a digest the bytes never had.
+/// Closing it means stamping at BUILD time in each family recipe and having publish carry the
+/// stamp across rather than recomputing it.
 pub fn generate_manifest_with_source(
     dir: &Path,
     src_digest: Option<&str>,
