@@ -297,7 +297,7 @@ def decode_arena_plan(meta_path):
 
 
 def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compile=True,
-                quant_plan=None):
+                quant_plan=None, kv_alloc=0):
     """Construct the fused prefill graph. Returns (spec, fused, dims).
 
     `do_compile=False` stops after the buffer layout, which is what the shared-arena assert needs
@@ -305,6 +305,12 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
 
     `quant_plan` is `build_quant_plan()`'s `{site: (dtype, group_size, src_dir)}` map, or `None`
     for the all-bf16 graph every spec had before this axis existed.
+
+    `kv_alloc` is decode's `KV_ALLOC` under its own name: the KV cache is ALLOCATED for that many
+    positions while attention still computes over `S`. It exists so the two halves can share one
+    cache when decode was built for a wide capacity -- `check_shared_layout_agrees` compares buffer
+    LENGTHS, so a prefill sizing `kc`/`vc` by its own narrower window cannot bind to that arena at
+    all. 0 means capacity is the window, byte for byte the pre-existing build.
     """
     quant_plan = quant_plan or {}
     sp = SPECS[spec_name]
@@ -321,9 +327,18 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
     # reduces to exactly the strides this file used to hardcode.
     dm_early = json.load(open(dec_meta_path)) if dec_meta_path else None
     kv_T = (dm_early["dims"].get("kv_block") or S) if dm_early else S
-    kvl = KVLayout(Hkv=Hkv, S=S, HD=HD, T=kv_T)
-    print(f"[gen] prefill KV layout: T={kv_T} "
-          + ("(flat [Hkv,S,HD])" if kv_T == S else
+    KVA = kv_alloc or S
+    if KVA < S:
+        raise ValueError(f"--kv-alloc {KVA} < --seq {S}: it is the CAPACITY the cache is allocated "
+                         f"for, never a window. Attention computes over --seq; a capacity under it "
+                         f"would put the window's own positions past the end of the cache")
+    if KVA % kv_T:
+        raise ValueError(f"--kv-alloc {KVA} is not a whole number of kv_block={kv_T} blocks; the "
+                         f"blocked layout addresses a partial trailing block at strides no "
+                         f"consumer computes")
+    kvl = KVLayout(Hkv=Hkv, S=KVA, HD=HD, T=kv_T)
+    print(f"[gen] prefill KV layout: T={kv_T} capacity={KVA} window={S} "
+          + ("(flat [Hkv,S,HD])" if kv_T == KVA else
              f"(blocked [S/T,Hkv,T,HD], head_stride={kvl.head_stride}, "
              f"block_stride={kvl.block_stride})"))
 
@@ -579,7 +594,7 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
         # [K=S, N=hd] -> plain. `kv_T` is the SAME block size for every geometry -- the only shared
         # arenas measured so far are flat (kv_T==S) on Gemma-4 and blocked on the uniform-geometry
         # gemma3-270m, so a per-geometry T has never been exercised; assumed here, not verified.
-        kvl_g = KVLayout(Hkv=hkv, S=S, HD=hd, T=kv_T)
+        kvl_g = KVLayout(Hkv=hkv, S=KVA, HD=hd, T=kv_T)
         kv_blk = (kvl_g.T, kvl_g.block_stride) if kvl_g.T != kvl_g.S else None
         op_sc = gemm_for(f"scores{sfx}", hd, S, blocking=kv_blk,
                          extra=dict(a_row_stride=qd) if seam else {})
@@ -1376,6 +1391,11 @@ def main():
     ap.add_argument("--layers", type=int, default=1)
     ap.add_argument("--batch", type=int, default=256)
     ap.add_argument("--seq", type=int, default=2048, help="compiled KV window S")
+    ap.add_argument("--kv-alloc", type=int, default=int(os.environ.get("KV_ALLOC", "0")),
+                    help="allocate kc/vc for this many positions while attention computes over "
+                         "--seq, so a narrow-window prefill can share a wide-capacity decode's "
+                         "arena. Defaults to $KV_ALLOC, the name decode reads, so one exported "
+                         "value drives both generators. 0 = capacity is the window.")
     ap.add_argument("--base", type=int, default=0,
                     help="absolute position of the chunk's first token; the ELF is constant "
                          "across chunks, so this only shapes the emitted inputs and golden")
@@ -1430,7 +1450,7 @@ def main():
     quant_plan = build_quant_plan(a.quant_weights, a.quant_attn_o_weights)
     sp_, fused, dims = build_graph(a.spec, a.layers, a.batch, a.seq, a.causal,
                                    dec_meta_path, do_compile=not a.layout_only,
-                                   quant_plan=quant_plan)
+                                   quant_plan=quant_plan, kv_alloc=a.kv_alloc)
     if dec_meta_path and a.weights:
         check_shared_weights(dec_meta_path, a.weights, sp, dims)
     M, S, NL = dims["M"], dims["S"], dims["NL"]
