@@ -42,7 +42,7 @@ import ml_dtypes
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from buffer_blob import write_blob  # noqa: E402
 from llm_decode_spec import (SPECS, C_TILE_GRANULE, L1_BYTES, L1_RESERVE,  # noqa: E402,F401
-                             gemv_fits, gemv_tile_output, k_chunks_for)
+                             gemv_fits, gemv_tile_output, k_chunks_for, operator_rejects)
 
 # Dataflow switches, read ONCE at module scope. They are consumed in three different functions
 # (graph construction, the runlist, and the meta writer), and defining them next to their first
@@ -1331,6 +1331,15 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
     else:
         qkv_dp_why = {g: sp.qkv_dp_reason(COLS, head_dim=g[0]) for g in geoms}
     mlp_dp_why = "FUSE_MLP_DP=0" if not FUSE_MLP_DP else sp.mlp_dp_reason()
+    if mlp_dp_why is None:
+        from iron.operators.swiglu_mlp_dp.op import SwiGLUMLPDataParallel
+
+        _unaccepted = operator_rejects(SwiGLUMLPDataParallel, _quant_kw("mlp"))
+        if _unaccepted:
+            mlp_dp_why = (
+                f"swiglu_mlp_dp takes no {'/'.join(_unaccepted)} parameter, so it cannot read the "
+                f"{_BUILD_STATE['layout']}/{_BUILD_STATE['scale_dtype']} dump this build packs"
+            )
 
     # HOISTED ABOVE THE UNFUSED ATTENTION OPERATORS, and the move is load-bearing rather than
     # tidy-up. When the fused layer wins, op_rep_k/op_rep_v/op_scores/op_softmax/op_trv/op_ctx are
