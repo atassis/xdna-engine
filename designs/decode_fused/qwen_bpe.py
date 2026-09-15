@@ -26,6 +26,24 @@ except ModuleNotFoundError as e:  # pragma: no cover - environment, not logic
     ) from e
 
 
+# Where a spec's --text corpus may be tokenized from. Keyed by spec, and ABSENT means refuse:
+# this module parses a Qwen-style tokenizer.json, and a Gemma one is a Split pretokenizer it
+# cannot read. The failure a default would hide is silent, not loud -- scoring Gemma ids against
+# a Qwen vocabulary read mean NLL 19.836 (uniform is 12.477) and top-1 exactly 0.0 over 2560
+# positions, which is the same shape a ruined weight format produces.
+TEXT_TOKENIZER_HINT = {
+    "qwen3-0.6b": "~/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots",
+}
+
+
+def text_tokenizer_hint(spec_name):
+    """Default tokenizer dir/file for `spec_name`, or None if this module cannot read its
+    tokenizer. None means the caller must pre-tokenize and pass ids, never that it may fall back
+    to another spec's tokenizer."""
+    hint = TEXT_TOKENIZER_HINT.get(spec_name)
+    return os.path.expanduser(hint) if hint else None
+
+
 @functools.lru_cache(maxsize=1)
 def _byte_encoder():
     """GPT-2's byte->unicode map: every byte gets a printable codepoint so BPE runs over text."""

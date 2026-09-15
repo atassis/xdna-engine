@@ -109,11 +109,11 @@ from iron.operators.gemv.design import MAX_GROUP_REUSE  # noqa: E402
 # mis-pointed IRON tree, which is the failure scripts/build_llm_decode.sh's gate exists to prevent.
 try:                                                                            # noqa: E402
     from iron.common.quant import (                                            # noqa: E402
-        quantize_weight, row_stride_bytes, derive_row_group)                    # noqa: E402
+        quantize_weight, row_stride_bytes, derive_row_group, widest_chunk)      # noqa: E402
 except ModuleNotFoundError:                                                     # noqa: E402
     try:                                                                        # noqa: E402
         from iron.operators.gemv.quant import quantize_weight, row_stride_bytes  # noqa: E402
-        derive_row_group = None  # pre-move tree: row_group_planar is unavailable  # noqa: E402
+        derive_row_group = widest_chunk = None  # pre-move tree: no row_group_planar  # noqa: E402
     except ModuleNotFoundError as e:                                            # noqa: E402
         raise ModuleNotFoundError(
             "no weight packer in this IRON tree: tried iron.common.quant (post-6a347dc) and "
@@ -161,7 +161,7 @@ def _spec(site):
 # (every site shares one on-wire row shape); set from the dump's own quant.json declaration in
 # build_graph, before any GEMV is constructed, and read here rather than threaded as a parameter
 # because _quant_kw/_pack are module-level and the dump isn't known until a spec_name is chosen.
-_BUILD_STATE = {"layout": "header_first"}
+_BUILD_STATE = {"layout": "header_first", "scale_dtype": "f32"}
 
 
 def _quant_kw(site):
@@ -175,6 +175,10 @@ def _quant_kw(site):
     kw = dict(weight_dtype=spec.dtype, group_size=spec.group_size)
     if _BUILD_STATE["layout"] != "header_first":
         kw["layout"] = _BUILD_STATE["layout"]
+    if _BUILD_STATE["scale_dtype"] != "f32":
+        # Sizes the weight buffer's row and the kernel's header: a build that reads a bf16-scale
+        # dump with the f32 stride lands every payload pointer n_groups*2 bytes late.
+        kw["scale_dtype"] = _BUILD_STATE["scale_dtype"]
     return kw
 
 
@@ -196,7 +200,9 @@ def _pack(w, site):
         return bf16(w).reshape(-1)
     kw = {}
     if spec.dtype in precision.SYMMETRIC:
-        kw["clip_search"] = spec.scale_kind == "clip"
+        kw["clip_search"] = spec.scale_kind in ("clip", "clip_full")
+        if spec.scale_kind == "clip_full":
+            kw["full_range"] = True
     else:
         kw["affine_zero_on_grid"] = spec.scale_kind == "zero_grid"
     layout = _BUILD_STATE["layout"]
@@ -208,8 +214,16 @@ def _pack(w, site):
             )
         K = w.shape[-1]
         kw["layout"] = layout
+        # K026: the width is `widest_chunk`, not `min(64, group_size)`. Those agreed until
+        # chunk_scales (IRON 836ac0d) let a chunk span two groups and doubled the reader's
+        # width for int4; this site kept the old rule, so int4 g32 sbf16 at K=3840 packed
+        # row_group=1 while GEMV read row_group=2 -- a silent layout mismatch on every
+        # K=3840 site. int8 g64 is unaffected (both rules give 64).
         kw["row_group"] = derive_row_group([K], spec.group_size, spec.dtype,
-                                           vec_size=min(64, spec.group_size))
+                                           vec_size=widest_chunk(spec.group_size, spec.dtype),
+                                           scale_dtype=_BUILD_STATE["scale_dtype"])
+    if _BUILD_STATE["scale_dtype"] != "f32":
+        kw["scale_dtype"] = _BUILD_STATE["scale_dtype"]
     return quantize_weight(w, spec.group_size, spec.dtype, **kw)
 
 
@@ -572,6 +586,12 @@ def sequence_name(sp, NL, S, placer_flags, decode_layer_active=False, T=None, tm
         _frag = f"{_tag}{_sp.dtype}g{_sp.group_size}"
         if _sp != precision.parse_spec(f"{_sp.dtype}/g{_sp.group_size}", _site):
             _frag += _sp.scale_kind
+        # Unlike scale_kind, the scale WIDTH changes the graph: it sizes the weight row and picks
+        # the kernel's header type, so two arms differing in it are different ELFs and must not
+        # share a name. It rides every quantized fragment because the dump declares one width for
+        # all of them.
+        if _BUILD_STATE["scale_dtype"] != "f32":
+            _frag += f"s{_BUILD_STATE['scale_dtype']}"
         parts.append(_frag)
     if SPLIT_QKNORM:
         parts.append("splitqk")
@@ -999,15 +1019,21 @@ def gemv(M, K, ctx, **kw):
         # derive_row_group then refuses it. Pin tsi to the row_group only when the free answer
         # would violate it; every site whose free answer already clears this (mlp/attn_o/qkv, as
         # built and shipped) takes the same tsi as today, unchanged.
-        rg = derive_row_group([K], kw["group_size"], wdt, vec_size=min(64, kw["group_size"]))
+        rg = derive_row_group([K], kw["group_size"], wdt,
+                              vec_size=widest_chunk(kw["group_size"], wdt),
+                              scale_dtype=_BUILD_STATE["scale_dtype"])
         if tsi % rg:
             tsi, tso = gemv_tile_output(M, K, a_row_bytes=a_row_bytes, tsi=rg)
     g = kw.get("group_size", 0)
     if g and g < 64:
-        # mv_quant.cc's dequant chunk must not straddle a quant group, and GEMV asserts
-        # group_size % kernel_vector_size == 0. 64 is the default and the only width the shipped
-        # groups (>=128) ever needed; a 32-wide group needs 32.
-        kw["kernel_vector_size"] = g
+        # The width a chunk may span, from the one function that owns it. This used to pin
+        # kernel_vector_size = group_size on the premise that "the dequant chunk must not
+        # straddle a quant group" -- true until chunk_scales (IRON 836ac0d) made mv_quant.cc
+        # build the scale vector as two half-broadcasts. GEMV's own guard already allows
+        # kvs == 2*group_size; this was the last site still enforcing the old rule, and it
+        # capped int4 g32 at 32 lanes on a 64-lane core (0.438 bundles/element against
+        # int8 g64's 0.250) no matter what widest_chunk derived upstream.
+        kw["kernel_vector_size"] = widest_chunk(g, wdt)
     return GEMV(M=M, K=K, num_aie_columns=COLS, tile_size_input=tsi,
                 tile_size_output=tso, context=ctx, **kw)
 
@@ -1198,6 +1224,13 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
             f"{_qmf_path}: dump is row_group_planar but this IRON tree has no derive_row_group "
             f"(pre-6a347dc). Point IRON at a tree past the quant.py move.")
     _BUILD_STATE["layout"] = _dump_layout
+    # Same adoption rule as layout: one on-wire scale width for the whole dump, taken from the
+    # manifest rather than declared here. Old dumps have no key and are f32, which is what every
+    # build before this axis wrote.
+    _dump_scale_dtype = _qmf.get("scale_dtype", "f32")
+    if _dump_scale_dtype not in ("f32", "bf16"):
+        raise SystemExit(f"{_qmf_path}: unknown scale_dtype {_dump_scale_dtype!r}")
+    _BUILD_STATE["scale_dtype"] = _dump_scale_dtype
     if PACKED and _qmf.get("dtype", "bf16") == "bf16":
         raise SystemExit(f"{_qmf_path}: lists {len(PACKED)} packed tensors but dtype is bf16")
     if PACKED:
@@ -1337,7 +1370,15 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                         # a REFUSAL (P003), not a reason to quietly drop to the unfused arm --
                         # which is what silently unfusing a whole decoder layer used to be.
                         None)
-    fuse_o = FUSE_MLP_O and mlp_dp_why is None
+    # Sandwich norms pass the post-FFN gain as the fused design's own argument, and under fuse_o
+    # get_arg_spec wants BOTH post-norm gains packed as one 2*D buffer [n_pa | n_pff] while the
+    # generator holds them as two D buffers. Declining fuse_o is not a fallback here, it is the
+    # only expressible arm: the unfused runlist below already carries n_pff correctly.
+    fuse_o_why = ("sandwich norms need the post-norm gains packed as one 2*D buffer"
+                  if sp.sandwich_norms else None)
+    fuse_o = FUSE_MLP_O and mlp_dp_why is None and fuse_o_why is None
+    if FUSE_MLP_O and mlp_dp_why is None and fuse_o_why:
+        print(f"[gen] fused arm mlp_o: OFF -- {fuse_o_why}")
     for g in geoms:
         why, tag = qkv_dp_why[g], "" if len(geoms) == 1 else f" [head_dim={g[0]}, kv_heads={g[1]}, v_proj={g[2]}]"
         print(f"[gen] fused arm qkv_head_dp{tag}: {'OFF -- ' + why if why else 'on'}")
@@ -1368,13 +1409,14 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
     # which operator declares which buffer, how many shim channels are spent). Refusing here is
     # what turns "undefined symbol" and "weight byte-size mismatch: buf 6291456 vs arr 1671168"
     # into a named rule.
-    _pdtypes, _pkind = precision.packer_capability()
+    _pdtypes, _pkind, _pfull = precision.packer_capability()
     precision_ctx = precision.GraphContext(
         fused_layer=decode_layer_why is None and FUSE_DECODE_LAYER,
         fuse_o=fuse_o, fused_qkv_gemv=bool(FUSE_QKV_GEMV),
         fused_qkv_dp=qkv_dp_why is None,
         d_model=D, ffn=FF, q_dim=QD, head_dim=HD, attn_cols=COLS,
-        packer_dtypes=_pdtypes, packer_takes_scale_kind=_pkind)
+        packer_dtypes=_pdtypes, packer_takes_scale_kind=_pkind,
+        packer_takes_full_range=_pfull)
     precision.check(PRECISION_PLAN, precision_ctx)
     print(f"[gen] precision [{PRECISION_PROV}]")
     for _line in precision.describe(PRECISION_PLAN, sp.name).splitlines()[1:]:
@@ -1723,9 +1765,12 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
     op_mlp_dp = None
     if mlp_dp_why is None:
         from iron.operators.swiglu_mlp_dp.op import SwiGLUMLPDataParallel
+        # act/post_norm carry the two clauses mlp_dp_reason() used to refuse on. Both default to
+        # silu/False, so a spec that never needed them (qwen3) builds the identical design.
         op_mlp_dp = SwiGLUMLPDataParallel(D=D, FF=FF, num_aie_columns=MLP_DP_COLS,
                                           epsilon=sp.eps,
                                           QD=QD if fuse_o else None, fuse_o=fuse_o,
+                                          act=sp.act, post_norm=sp.sandwich_norms,
                                           context=ctx, weight_depth=WEIGHT_DEPTH,
                                           tile_rows_gu=MLP_TILE_ROWS,
                                           **mlp_quant_kw)
@@ -2147,12 +2192,17 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                 # shared across layers because the sequence runs them one at a time. FUSE_MLP_O folds
                 # `a = Wo @ cx` in too: `cx`/`Wo` replace `a` as the design's own inputs, and
                 # `mlp_a_scratch` is a's own all-gather round-trip buffer, the same idiom as mlp_gh's.
+                # post_norm adds ONE argument before `nxt` (get_arg_spec's post_norms_spec):
+                # [n_pff] at D here, [n_pa | n_pff] at 2*D under fuse_o -- so the fused design
+                # applies the post-FFN norm itself and the standalone op_norm below must not.
                 if fuse_o:
+                    # sandwich norms cannot reach here: fuse_o declines them at its derivation,
+                    # where op_o and the arg specs are shaped to match.
                     rl.append((op_mlp_dp, cur, p + "cx", p + "n_pf", p + "Wo", p + "Wg", p + "Wu",
                                p + "Wd", "mlp_gh", "mlp_a_scratch", nxt))
                 else:
                     rl.append((op_mlp_dp, cur, p + "a", p + "n_pf", p + "Wg", p + "Wu", p + "Wd",
-                               "mlp_gh", nxt))
+                               "mlp_gh", *([p + "n_pff"] if sp.sandwich_norms else []), nxt))
             else:
                 rl += [
                     (op_add, cur, p + "a", p + "x1"),
@@ -2163,7 +2213,9 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                     (op_mul_ffn, p + "g", p + "u", p + "gh"),
                     *down_runlist(p),
                 ]
-            if sp.sandwich_norms:
+            # `d` is the unfused chain's own output buffer and does not exist in the fused arm,
+            # which carries this norm internally (see the post_norm argument above).
+            if sp.sandwich_norms and op_mlp_dp is None:
                 rl.append((op_norm, p + "d", p + "n_pff", p + "d"))
             if op_mlp_dp is None:
                 rl.append((op_add, p + "x1", p + "d", nxt))
@@ -2573,7 +2625,9 @@ def main():
             "qkv_dtype": _spec("qkv").dtype,
             "qkv_group_size": _spec("qkv").group_size or 128,
             "head_dtype": _spec("head").dtype, "head_group_size": _spec("head").group_size or 128,
-            "clip_search": any(v.scale_kind == "clip" for v in PRECISION_PLAN.values()),
+            "clip_search": any(v.scale_kind in ("clip", "clip_full")
+                              for v in PRECISION_PLAN.values()),
+            "full_range": any(v.scale_kind == "clip_full" for v in PRECISION_PLAN.values()),
         },
     }
     prov = toolchain_provenance()

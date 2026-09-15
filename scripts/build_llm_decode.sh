@@ -45,7 +45,8 @@ iron_at="$(iron_require_api "gen_llm_decode.py" \
   "iron/operators/strided_copy/op.py:output_offset_parameter" \
   "iron/operators/tmatvec/op.py:class TMatVec" \
   "$QUANT_SPEC" \
-  "iron/operators/qkv_head_dp/op.py:class QKVHeadDataParallel")" || exit 1
+  "iron/operators/qkv_head_dp/op.py:class QKVHeadDataParallel" \
+  "iron/operators/swiglu_mlp_dp/op.py:post_norm")" || exit 1
 # WINDOW_RUNGS needs an API surface that the DEFAULT IRON_DIR does not have, so it is gated
 # separately rather than added to the list above -- requiring it unconditionally would break every
 # decode build against an IRON without it, including the rung-free default this arm leaves inert.

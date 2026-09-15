@@ -1,0 +1,37 @@
+{
+ "model": "google/gemma-4-12B-it-qat-q4_0-unquantized",
+ "layers": 6,
+ "logit_softcap_disabled": true,
+ "logit_softcap_value": 30.0,
+ "prompt": "The capital of France is",
+ "prompt_ids": [
+  818,
+  5279,
+  529,
+  7001,
+  563
+ ],
+ "gen_ids": [
+  98309,
+  258882,
+  193649,
+  255094,
+  258882,
+  254525,
+  184349,
+  144075
+ ],
+ "margins": [
+  20.0,
+  146.0,
+  12.0,
+  0.0,
+  74.0,
+  0.0,
+  62.0,
+  23.0
+ ],
+ "quant": null,
+ "hf_f32_gen_ids": null,
+ "note": "Faithful bf16 host forward via the checkpoint's own modeling code -- the oracle a bf16 DEVICE built from THIS checkpoint should match 1:1. `margins` is top1-top2 per step: a mismatch at a margin near the device's own logit error is a knife-edge, not a defect. DO NOT gate a QAT build against bf16_oracle_l6.json, whose parent is the vanilla unsloth checkpoint -- the two agree on 0/8 tokens here, so that comparison reports the QAT training as a defect. Generated with transformers 5.17.0 (4.57.6 has no gemma4 at all); .venv-export cannot hold it because optimum is not transformers-5 compatible, so it lives in a separate venv."
+}

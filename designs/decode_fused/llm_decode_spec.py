@@ -530,10 +530,10 @@ class LlmSpec:
 
     def mlp_dp_reason(self) -> str | None:
         """Why SwiGLUMLPDataParallel does not cover this spec, or None when it does."""
-        if self.sandwich_norms:
-            return "the fused block has no sandwich norms (this spec normalises the FFN output)"
-        if self.act != "silu":
-            return f"the fused block is SwiGLU; this spec's activation is {self.act!r}"
+        # sandwich_norms and act were refusals until the operator grew `post_norm` and `act`
+        # (IRON ef5dd58). They are parameters now, threaded at the construction site in
+        # gen_llm_decode.py; build_llm_decode.sh gates on the symbol so an older IRON fails by
+        # name instead of by TypeError.
         return None
 
     def has_v_proj(self, layer: int) -> bool:

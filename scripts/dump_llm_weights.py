@@ -47,12 +47,33 @@ def main():
     ap.add_argument("--spec", required=True, choices=sorted(SPECS))
     ap.add_argument("--out", required=True)
     ap.add_argument("--repo", default=None, help="override the HF repo id")
+    ap.add_argument("--checkpoint-dir", default=None,
+                    help="read safetensors from this local directory instead of resolving --repo "
+                         "through the HF cache. For a checkpoint already fetched to a local_dir, "
+                         "which the cache does not see and would otherwise re-download.")
     ap.add_argument("--layers", type=int, default=None)
     ap.add_argument("--quant", default="bf16", choices=("bf16", "int4", "int8"),
                     help="pack the PROJECTION matrices at this width (norms stay f32 and readable; "
                          "the embedding stays f32 and readable too unless --quant-leaves names "
                          "'embed_tokens'). bf16 writes the plain f32 dump.")
     ap.add_argument("--quant-group", type=int, default=64)
+    ap.add_argument("--quant-full-range", action="store_true",
+                    help="quantize onto all 2**n levels rather than the symmetric subset. "
+                         "Needed to land on the grid of a checkpoint QAT-trained for this "
+                         "width; worth ~0.5 points on any other checkpoint (K025).")
+    ap.add_argument("--quant-scale-dtype", default="f32", choices=("f32", "bf16"),
+                    help="stored width of the per-group scale. mv_quant.cc casts it to bfloat16 "
+                         "before the MAC either way, so f32 stores 2 B/group the core discards -- "
+                         "1 bit/weight at int4 g32. The kernel must be built to match "
+                         "(GEMV(scale_dtype=...) -> -DSCALE_BF16), so the two move together.")
+    ap.add_argument("--resume", action="store_true",
+                    help="skip keys already written, per this dir's _dump_progress.json. A full "
+                         "dump is ~1h and has no other way to survive an interruption; the "
+                         "progress file records the format it was written under and refuses to "
+                         "resume into a different one.")
+    ap.add_argument("--quant-clip-search", action="store_true",
+                    help="per-group MSE-optimal scale instead of amax/qmax. Pair with "
+                         "--quant-full-range: the grid-exact scale is a search candidate.")
     ap.add_argument("--quant-layout", default="header_first",
                     choices=("header_first", "row_group_planar"),
                     help="on-wire row layout (iron/common/quant.py). row_group_planar moves the "
@@ -104,10 +125,16 @@ def main():
                          "(derive_row_group); this IRON tree only has the pre-move "
                          "iron.operators.gemv.quant. Point IRON at a tree past 6a347dc.")
 
-    from huggingface_hub import snapshot_download
     from safetensors import safe_open
 
-    path = snapshot_download(repo, allow_patterns=["*.safetensors", "*.json"])
+    if a.checkpoint_dir:
+        path = a.checkpoint_dir
+        if not any(f.endswith(".safetensors") for f in os.listdir(path)):
+            ap.error(f"--checkpoint-dir {path} holds no .safetensors")
+        repo = f"{path} (local)"
+    else:
+        from huggingface_hub import snapshot_download
+        path = snapshot_download(repo, allow_patterns=["*.safetensors", "*.json"])
     shards = [os.path.join(path, f) for f in sorted(os.listdir(path)) if f.endswith(".safetensors")]
     index = {}
     for s in shards:
@@ -161,15 +188,28 @@ def main():
     exp_per_key[f"{sp.weight_prefix}embed_tokens.weight"] = (V_, D_)
 
     def _layout_kw(K):
-        """layout=/row_group= kwargs for one tensor's OWN K (post-chunking) -- row_group is a
-        pure function of (K, group_size, dtype), so this always agrees with what GEMV's own
-        __post_init__ derives for a GEMV built at the same K/group/dtype (no shared state, no
-        quant.json round-trip needed for the value itself)."""
+        """quantize_weight kwargs for one tensor's OWN K (post-chunking) -- row_group is a
+        pure function of (K, group_size, dtype, SCALE_DTYPE), so this always agrees with what
+        GEMV's own __post_init__ derives for a GEMV built at the same four (no shared state,
+        no quant.json round-trip needed for the value itself). The scale width is in it
+        because it sets the row stride: at int4/g32/K=3840 an f32 scale gives stride 2400 and
+        row_group 1, a bf16 scale gives 2160 and row_group 2. Omitting it here defaulted the
+        derivation to f32 and packed every bf16-scale dump one block-shape off what the
+        kernel reads -- silently, because the bytes are a permutation and every value is
+        still there. The scale-selection axes ride here
+        too so that every packing path in this script -- dense, K-chunked and head-chunked --
+        goes through one funnel and cannot disagree about the format."""
+        kw = {"full_range": a.quant_full_range, "clip_search": a.quant_clip_search,
+              "scale_dtype": a.quant_scale_dtype}
         if a.quant_layout != "row_group_planar":
-            return {}
-        vec = min(64, a.quant_group)
-        return {"layout": a.quant_layout,
-                "row_group": derive_row_group([K], a.quant_group, a.quant, vec_size=vec)}
+            return kw
+        # Same rule the operator derives row_group from -- see widest_chunk's docstring.
+        from iron.common.quant import widest_chunk
+        vec = widest_chunk(a.quant_group, a.quant)
+        kw.update(layout=a.quant_layout,
+                  row_group=derive_row_group([K], a.quant_group, a.quant, vec_size=vec,
+                                             scale_dtype=a.quant_scale_dtype))
+        return kw
 
     # Row-chunk budget for packing the tied head/embedding -- bounds quantize_weight's OWN
     # transient arrays (its abs/div/round/clip/astype chain each allocates a full chunk-sized f32
@@ -190,8 +230,35 @@ def main():
                 for r0 in range(0, M, chunk_rows)]
         return np.concatenate(parts)
 
+    prog_path = os.path.join(a.out, "_dump_progress.json")
+    fmt_key = json.dumps({k: getattr(a, k) for k in (
+        "quant", "quant_group", "quant_layout", "quant_scale_dtype", "quant_full_range",
+        "quant_clip_search", "quant_leaves", "layers", "cols")}, sort_keys=True)
+    done = {}
+    if a.resume and os.path.isfile(prog_path):
+        _prev = json.load(open(prog_path))
+        if _prev.get("fmt") != fmt_key:
+            raise SystemExit(
+                f"[dump] --resume refused: {prog_path} was written under a different format.\n"
+                f"  there: {_prev.get('fmt')}\n  here:  {fmt_key}\n"
+                f"  delete the directory and start over rather than mixing two formats in it")
+        done = _prev.get("done", {})
+        print(f"[dump] resuming: {len(done)} keys already written")
+
+    def _record(key, names):
+        """Mark one key complete. Written per key, because the cost of losing the position is an
+        hour and the cost of the write is a few hundred bytes."""
+        done[key] = names
+        with open(prog_path, "w") as f:
+            json.dump({"fmt": fmt_key, "done": done}, f)
+
     n, packed = 0, []
     for key in sorted(want):
+        if key in done:
+            packed.extend(done[key])
+            n += 1
+            continue
+        _mark = len(packed)
         w = get(key)
         leaf = key.rsplit(".", 2)[-2]
         want_shape = exp_per_key.get(key)
@@ -230,6 +297,7 @@ def main():
                                             **_layout_kw(part.shape[1])))
                     packed.append(name)
                 n += nch - 1
+                _record(key, packed[_mark:])
                 continue
             np.save(os.path.join(a.out, f"{key}.npy"),
                     quantize_weight(w, a.quant_group, a.quant, **_layout_kw(w.shape[1])))
@@ -237,11 +305,15 @@ def main():
         else:
             np.save(os.path.join(a.out, f"{key}.npy"), w)
         n += 1
+        _record(key, packed[_mark:])
 
     manifest = {
         "dtype": a.quant,
         "group_size": a.quant_group,
         "layout": a.quant_layout,
+        "scale_dtype": a.quant_scale_dtype,
+        "full_range": a.quant_full_range,
+        "clip_search": a.quant_clip_search,
         "packed": sorted(packed),
         "note": "packed arrays are np.int8 on-wire bytes, NOT values -- never .astype()",
     }
@@ -250,8 +322,9 @@ def main():
 
     tail = ""
     if packed:
-        bits = ((4 if a.quant == "int4" else 8) * a.quant_group + 32) / a.quant_group
-        tail = f", {len(packed)} packed at {a.quant} g{a.quant_group} = {bits:.2f} bits/weight"
+        _scale_bits = 32 if a.quant_scale_dtype == "f32" else 16
+        bits = ((4 if a.quant == "int4" else 8) * a.quant_group + _scale_bits) / a.quant_group
+        tail = f", {len(packed)} packed at {a.quant} g{a.quant_group} scale {a.quant_scale_dtype} = {bits:.2f} bits/weight"
     print(f"wrote {n} tensors to {a.out} (spec {sp.name}, {NL} layers) -- all shapes checked{tail}")
 
 

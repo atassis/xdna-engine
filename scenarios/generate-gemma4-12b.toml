@@ -40,7 +40,10 @@ name = "gemma4-12b"
 #      verified by artifact hash each round. NOT confirmed by a full-depth perplexity gate -- that
 #      harness was found broken for this model (never received 3 of 4 Gemma-4 fixes that landed on
 #      an unmerged branch, `g4/precision-quality`), partially repaired, still reads
-#      worse-than-uniform NLL on both arms alike as of 2026-09-14 -- open, not diagnosed further.
+#      worse-than-uniform NLL on both arms alike as of 2026-09-14 -- DIAGNOSED 2026-09-14: two
+#      separate defects, a missing final_logit_softcapping and, in the re-run that fixed it, a
+#      tokenizer hardcoded to Qwen's for every spec. No run has ever had both right, so the gate
+#      is unblocked but still unvalidated. See the KB note on the two masking defects.
 #      TMV_CTX changes bf16 reduction ORDER only (context step: GEMV-along-a-row -> TMatVec-down-
 #      rows), never a value or a weight byte, and the L=6 exact-oracle gate went 8/8 (the pre-planar
 #      TMV_CTX-alone gate tied/missed at this same step; here it passes clean) -- lower risk class
@@ -108,8 +111,10 @@ name = "gemma4-12b"
 # Also fixed the SAME DAY: eval_llm_perplexity.py's Gemma-4 tokenization, broken since 899354e left
 # it out of scope -- QwenBPE cannot parse Gemma's Split pretokenizer (KeyError: 'pretokenizers').
 # --ids now accepts tokenize_corpus.py's pre-tokenized output; this is what made the paired A/B
-# above possible at all. Prior arm (4)'s "worse-than-uniform NLL on both arms alike, not diagnosed"
-# note above may be this same bug -- not re-verified, flagged for whoever picks that up next.
+# above possible at all. Prior arm (4)'s "worse-than-uniform NLL on both arms alike" was NOT this
+# tokenization bug alone -- it was the missing softcap, and the tokenizer defect entered with the
+# re-run that fixed the softcap. Both are fixed; neither has yet been confirmed by a run carrying
+# both corrections.
 [artifacts]
 decode = "artifacts/gemma4-12b/decode_s6912_headint8_l48"
 weights = "artifacts/gemma4-12b/weights_int8g64_planar_headint8"
