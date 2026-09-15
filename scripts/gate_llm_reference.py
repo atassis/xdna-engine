@@ -91,19 +91,31 @@ def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k):
         return np.asarray(np.asarray(a, BF16), np.float32)
 
     def npy_bf16(n):
-        """Like `npy`, but STAYS bf16 -- for the big per-layer/embedding matrices only.
+        """Like `npy`, but returns an mmap VIEW instead of a materialised bf16 array -- see `mm()`.
 
-        Gemma-4-12B's dump is 45GB of float32 .npy on disk; holding every layer's projection
-        weights upcast to float32 at once (the shape `npy()` above returns) does not fit this box's
-        RAM (30GB). Kept bf16-resident (22.5GB) and widened to float32 per matmul call in `mm()`
-        below instead -- the SAME rounding, just deferred. Measured: a 3840x15360 cast is 11.8ms at
-        10 GB/s, so re-casting the whole model's weights once per position (~22.5GB) costs ~2.3s;
-        over an 800-position run that is ~30 minutes of pure cast overhead, not hours.
+        Gemma-4-12B's dump is 45GB of float32 .npy on disk across 48 layers; holding every layer's
+        projection weights bf16-resident at once (~22.5GB) does not survive this box's real
+        headroom once production/desktop overhead is accounted for -- crashed the run twice.
+        mmap defers the bf16-round-then-widen to `mm()`'s per-call cast: the OS backs the float32 read with
+        reclaimable page cache instead of pinned anonymous memory, so peak RSS is bounded by one
+        weight matrix's transient cast, not all 48 layers' worth. Same rounding as before, paid per
+        matmul call instead of once (~30 min of cast overhead over an 800-position run, per the
+        prior measurement this replaces).
         """
-        return np.asarray(np.load(os.path.join(weights_dir, f"{n}.npy")).astype(np.float32), BF16)
+        return np.load(os.path.join(weights_dir, f"{n}.npy"), mmap_mode="r")
 
-    def mm(w_bf16, v):
-        return w_bf16.astype(np.float32) @ v
+    def cast_weight(w_view):
+        """Round an mmap'd float32 view (see `npy_bf16`) to bf16 THEN widen, so the arithmetic
+        matches `npy()`'s bf16-quantise-on-load contract exactly, just deferred to the caller."""
+        return np.asarray(np.asarray(w_view, BF16), np.float32)
+
+    def mm(w_f32, v):
+        return w_f32 @ v
+
+    def mm_batch(w_f32, X):
+        """Batched form of mm(): X is (P, D_in), returns (P, D_out) -- ONE GEMM reusing w_f32
+        across every row instead of P separate GEMVs. See layer_step_batch()."""
+        return X @ w_f32.T
 
     def rms(x, w=None):
         """`w=None` is the v_norm case: gainless (with_scale=False in the checkpoint, so there is no
@@ -142,11 +154,36 @@ def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k):
         partial = sp.rope_partial_rotary if g else None
         return rope(v, pos, hd, theta, partial)
 
-    embed = npy_bf16(f"{sp.weight_prefix}embed_tokens.weight")
+    def rope_batch(v, positions, hd, theta, partial):
+        """Batched form of rope(): `v` is (P, n_heads*hd), `positions` is (P,) absolute positions
+        -- each row rotated by ITS OWN position's angle. Identical math to calling rope() once per
+        row; only vectorized across rows (and, as in rope(), across heads within a row)."""
+        inv = 1.0 / (theta ** (np.arange(0, hd, 2, dtype=np.float64)[:hd // 2] / hd))
+        if partial is not None:
+            inv[int(partial * hd // 2):] = 0.0
+        pos_col = np.asarray(positions, dtype=np.float64).reshape(-1, 1)
+        c = np.cos(pos_col * inv).astype(np.float32)[:, None, :]
+        s = np.sin(pos_col * inv).astype(np.float32)[:, None, :]
+        v = v.reshape(v.shape[0], -1, hd)
+        x1, x2 = v[..., :hd // 2], v[..., hd // 2:]
+        return np.concatenate([x1 * c - x2 * s, x2 * c + x1 * s], -1).reshape(v.shape[0], -1)
+
+    def rope_for_batch(l, v, positions):
+        hd = sp.head_dim_for(l)
+        if not dual_rope:
+            return rope_batch(v, positions, hd, sp.rope_theta_global, None)
+        g = sp.is_global(l)
+        theta = sp.rope_theta_global if g else sp.rope_theta_local
+        partial = sp.rope_partial_rotary if g else None
+        return rope_batch(v, positions, hd, theta, partial)
+
+    # embed_tokens is also the tied lm head (mm(embed_f32, ...) below), hit once per generated
+    # token (33 times across a 32-token run) -- materialised once here for the same reason the
+    # per-layer tensors are, in materialized_layer_weights().
+    embed_f32 = cast_weight(npy_bf16(f"{sp.weight_prefix}embed_tokens.weight"))
     n_final = npy(f"{sp.weight_prefix}norm.weight")
 
-    Wt = {}
-    for l in range(NL):
+    def layer_weights(l):
         p = f"{sp.weight_prefix}layers.{l}."
         w = {k_: npy(v) for k_, v in sp.norm_weight_names(l).items()}
         w["Wq"] = npy_bf16(p + "self_attn.q_proj.weight")
@@ -159,73 +196,163 @@ def run_numpy(sp, weights_dir, prompt_ids, n_tokens, k):
         w["Wd"] = npy_bf16(p + "mlp.down_proj.weight")
         if sp.layer_scalar:
             w["ls"] = float(npy(sp.layer_scalar_name(l)).reshape(-1)[0])
-        Wt[l] = w
+        return w
 
-    S = len(prompt_ids) + n_tokens + 1
+    BIG_TENSORS = ("Wq", "Wk", "Wv", "Wo", "Wg", "Wu", "Wd")
+
+    def materialized_layer_weights(l):
+        """`layer_weights(l)` plus the once-per-call `cast_weight()` `mm()` used to do internally.
+        Split out so the prefix sweep below can cast ONCE per layer and reuse across every known
+        position instead of once per (position, layer) -- the mmap fix amortised the disk READ
+        across positions, but not this, and the cast dominated: measured on the real 48-layer model,
+        the P=64 (smallest of 7 lengths) run was still going after 16 minutes with only 20 of ~45GB
+        read, CPU-bound the whole time, not I/O-blocked."""
+        w = layer_weights(l)
+        for key in BIG_TENSORS:
+            if key in w:
+                w[key] = cast_weight(w[key])
+        return w
+
+    def layer_step(l, w, xi, pos, kc_l, vc_l):
+        """Layer `l`'s attention+MLP block on residual `xi` at absolute position `pos`, against
+        this layer's own KV cache slices. Same ops regardless of whether the caller is sweeping a
+        batch of known positions or a single free-running one -- see the two call sites below."""
+        hd, kvh = sp.head_dim_for(l), sp.n_kv_heads_for(l)
+        grp, has_v, is_glob = sp.n_q_heads // kvh, sp.has_v_proj(l), sp.is_global(l)
+        window = None if (sp.sliding_window is None or is_glob) else sp.sliding_window
+
+        h = rms(xi, w["n_in"])
+        q, k_ = mm(w["Wq"], h), mm(w["Wk"], h)
+        v = mm(w["Wv"], h) if has_v else None
+        if sp.v_norm:
+            # attention_k_eq_v: v_norm reads the RAW k projection -- before qk-norm and RoPE,
+            # which mutate q/k_ below -- and its output IS v; mirrors gen_llm_prefill.py's
+            # ordering exactly (op_vn runs before qn_runs/op_kn in the emitted op list).
+            src = k_ if not has_v else v
+            v = np.concatenate([rms(src.reshape(kvh, hd)[i]) for i in range(kvh)])
+        if sp.qk_norm:
+            q = np.concatenate([rms(q.reshape(sp.n_q_heads, hd)[i], w["n_qn"])
+                                for i in range(sp.n_q_heads)])
+            k_ = np.concatenate([rms(k_.reshape(kvh, hd)[i], w["n_kn"]) for i in range(kvh)])
+        q, k_ = rope_for(l, q, pos), rope_for(l, k_, pos)
+        kc_l[:, pos, :] = k_.reshape(kvh, hd)
+        vc_l[:, pos, :] = v.reshape(kvh, hd)
+        qh = q.reshape(sp.n_q_heads, hd)
+        ctx = np.empty((sp.n_q_heads, hd), np.float32)
+        lo = 0 if window is None else max(0, pos - window + 1)
+        for hh in range(sp.n_q_heads):
+            kvi = hh // grp
+            sc = (kc_l[kvi, lo:pos + 1] @ qh[hh]) * attn_scale
+            sc = np.exp(sc - sc.max())
+            ctx[hh] = (sc / sc.sum()) @ vc_l[kvi, lo:pos + 1]
+        a_out = mm(w["Wo"], ctx.reshape(-1))
+        if sp.sandwich_norms:
+            a_out = rms(a_out, w["n_pa"])
+        xi = xi + a_out
+        hf = rms(xi, w["n_pf"])
+        d_out = mm(w["Wd"], act(mm(w["Wg"], hf)) * mm(w["Wu"], hf))
+        if sp.sandwich_norms:
+            d_out = rms(d_out, w["n_pff"])
+        xi = xi + d_out
+        if sp.layer_scalar:
+            xi = xi * w["ls"]
+        return xi
+
+    def layer_step_batch(l, w, X, positions, kc_l, vc_l):
+        """Batched form of layer_step(): `X` is (P, D) for a KNOWN batch of `positions`. Every
+        projection and the MLP run as ONE GEMM across all P rows instead of P separate GEMVs --
+        this is the actual fix for the cost mm() showed under profiling (80% of runtime, 21980
+        GEMV calls: each one re-reads a whole weight matrix to do a single row's worth of work).
+        Attention stays per-position (causal, and cheap relative to the projections/MLP -- only
+        head_dim-by-window sized, not D- or FFN-sized), reading the SAME kc_l/vc_l this batch-fills
+        up front; that's safe because attention at position `pos` only ever reads up to `pos`,
+        never beyond, regardless of whether later positions' K/V were already written too."""
+        P_ = X.shape[0]
+        hd, kvh = sp.head_dim_for(l), sp.n_kv_heads_for(l)
+        grp, has_v, is_glob = sp.n_q_heads // kvh, sp.has_v_proj(l), sp.is_global(l)
+        window = None if (sp.sliding_window is None or is_glob) else sp.sliding_window
+
+        H = rms(X, w["n_in"])
+        Q, K = mm_batch(w["Wq"], H), mm_batch(w["Wk"], H)
+        V = mm_batch(w["Wv"], H) if has_v else None
+        if sp.v_norm:
+            src = (K if not has_v else V).reshape(P_, kvh, hd)
+            V = np.stack([rms(src[:, i, :]) for i in range(kvh)], axis=1).reshape(P_, kvh * hd)
+        if sp.qk_norm:
+            Qh = Q.reshape(P_, sp.n_q_heads, hd)
+            Q = np.stack([rms(Qh[:, i, :], w["n_qn"]) for i in range(sp.n_q_heads)],
+                        axis=1).reshape(P_, sp.n_q_heads * hd)
+            Kh = K.reshape(P_, kvh, hd)
+            K = np.stack([rms(Kh[:, i, :], w["n_kn"]) for i in range(kvh)],
+                        axis=1).reshape(P_, kvh * hd)
+        Q, K = rope_for_batch(l, Q, positions), rope_for_batch(l, K, positions)
+        kc_l[:, positions, :] = K.reshape(P_, kvh, hd).transpose(1, 0, 2)
+        vc_l[:, positions, :] = V.reshape(P_, kvh, hd).transpose(1, 0, 2)
+        Qh = Q.reshape(P_, sp.n_q_heads, hd)
+        Ctx = np.empty((P_, sp.n_q_heads, hd), np.float32)
+        for i, pos in enumerate(positions):
+            lo = 0 if window is None else max(0, pos - window + 1)
+            for hh in range(sp.n_q_heads):
+                kvi = hh // grp
+                sc = (kc_l[kvi, lo:pos + 1] @ Qh[i, hh]) * attn_scale
+                sc = np.exp(sc - sc.max())
+                Ctx[i, hh] = (sc / sc.sum()) @ vc_l[kvi, lo:pos + 1]
+        A_out = mm_batch(w["Wo"], Ctx.reshape(P_, -1))
+        if sp.sandwich_norms:
+            A_out = rms(A_out, w["n_pa"])
+        X = X + A_out
+        HF = rms(X, w["n_pf"])
+        D_out = mm_batch(w["Wd"], act(mm_batch(w["Wg"], HF)) * mm_batch(w["Wu"], HF))
+        if sp.sandwich_norms:
+            D_out = rms(D_out, w["n_pff"])
+        X = X + D_out
+        if sp.layer_scalar:
+            X = X * w["ls"]
+        return X
+
+    P = len(prompt_ids)
+    S = P + n_tokens + 1
     kc = [np.zeros((sp.n_kv_heads_for(l), S, sp.head_dim_for(l)), np.float32) for l in range(NL)]
     vc = [np.zeros((sp.n_kv_heads_for(l), S, sp.head_dim_for(l)), np.float32) for l in range(NL)]
     scale = np.sqrt(D) if sp.embed_scale == "sqrt_d_model" else 1.0
     attn_scale = sp.attn_scale
 
-    produced, tops, margins = [], [], []
-    tok = prompt_ids[0]
-    for pos in range(len(prompt_ids) + n_tokens - 1):
-        x = embed[tok].astype(np.float32) * scale
-        for l in range(NL):
-            w = Wt[l]
-            hd, kvh = sp.head_dim_for(l), sp.n_kv_heads_for(l)
-            grp, has_v, is_glob = sp.n_q_heads // kvh, sp.has_v_proj(l), sp.is_global(l)
-            window = None if (sp.sliding_window is None or is_glob) else sp.sliding_window
+    # KNOWN prefix (every input token is prompt_ids, teacher-forced): sweep LAYER-outer instead of
+    # position-outer. Every position needs the SAME layer's weights, so loading them once per layer
+    # instead of once per (position, layer) cuts this portion's weight reads from O(P) to O(1) --
+    # this box has 30GB RAM against a 45GB dump, so re-reading the whole model per position (the
+    # position-outer form still below, for the tail) thrashes rather than merely being slow. This
+    # is the batched half of "batched prefill"; the free-running tail cannot be, see below.
+    x = embed_f32[np.asarray(prompt_ids)] * scale
+    positions = np.arange(P)
+    for l in range(NL):
+        x = layer_step_batch(l, materialized_layer_weights(l), x, positions, kc[l], vc[l])
 
-            h = rms(x, w["n_in"])
-            q, k_ = mm(w["Wq"], h), mm(w["Wk"], h)
-            v = mm(w["Wv"], h) if has_v else None
-            if sp.v_norm:
-                # attention_k_eq_v: v_norm reads the RAW k projection -- before qk-norm and RoPE,
-                # which mutate q/k_ below -- and its output IS v; mirrors gen_llm_prefill.py's
-                # ordering exactly (op_vn runs before qn_runs/op_kn in the emitted op list).
-                src = k_ if not has_v else v
-                v = np.concatenate([rms(src.reshape(kvh, hd)[i]) for i in range(kvh)])
-            if sp.qk_norm:
-                q = np.concatenate([rms(q.reshape(sp.n_q_heads, hd)[i], w["n_qn"])
-                                    for i in range(sp.n_q_heads)])
-                k_ = np.concatenate([rms(k_.reshape(kvh, hd)[i], w["n_kn"]) for i in range(kvh)])
-            q, k_ = rope_for(l, q, pos), rope_for(l, k_, pos)
-            kc[l][:, pos, :] = k_.reshape(kvh, hd)
-            vc[l][:, pos, :] = v.reshape(kvh, hd)
-            qh = q.reshape(sp.n_q_heads, hd)
-            ctx = np.empty((sp.n_q_heads, hd), np.float32)
-            lo = 0 if window is None else max(0, pos - window + 1)
-            for hh in range(sp.n_q_heads):
-                kvi = hh // grp
-                sc = (kc[l][kvi, lo:pos + 1] @ qh[hh]) * attn_scale
-                sc = np.exp(sc - sc.max())
-                ctx[hh] = (sc / sc.sum()) @ vc[l][kvi, lo:pos + 1]
-            a_out = mm(w["Wo"], ctx.reshape(-1))
-            if sp.sandwich_norms:
-                a_out = rms(a_out, w["n_pa"])
-            x = x + a_out
-            hf = rms(x, w["n_pf"])
-            d_out = mm(w["Wd"], act(mm(w["Wg"], hf)) * mm(w["Wu"], hf))
-            if sp.sandwich_norms:
-                d_out = rms(d_out, w["n_pff"])
-            x = x + d_out
-            if sp.layer_scalar:
-                x = x * w["ls"]
-        lg = mm(embed, rms(x, n_final))        # tied lm head
+    lg = mm(embed_f32, rms(x[P - 1], n_final))     # tied lm head, only the transition position
+    if sp.logit_softcap is not None:
+        c = sp.logit_softcap
+        lg = c * np.tanh(lg / c)
+    ids, vals = topk(lg, k)
+    produced, tops, margins = [ids[0]], [(ids, vals)], [vals[0] - vals[1]]
+    tok = ids[0]
+
+    # FREE-RUNNING tail: each position's input is the PREVIOUS position's sampled output, so this
+    # genuinely cannot be batched -- position-outer, layer-inner, weights reloaded every step.
+    for pos in range(P, P + n_tokens - 1):
+        if len(produced) >= n_tokens:
+            break
+        xi = embed_f32[tok] * scale
+        for l in range(NL):
+            xi = layer_step(l, materialized_layer_weights(l), xi, pos, kc[l], vc[l])
+        lg = mm(embed_f32, rms(xi, n_final))
         if sp.logit_softcap is not None:
             c = sp.logit_softcap
             lg = c * np.tanh(lg / c)
         ids, vals = topk(lg, k)
-        if pos + 1 < len(prompt_ids):
-            tok = prompt_ids[pos + 1]         # teacher-force through the prompt
-        else:
-            produced.append(ids[0])
-            tops.append((ids, vals))
-            margins.append(vals[0] - vals[1])
-            tok = ids[0]
-        if len(produced) >= n_tokens:
-            break
+        produced.append(ids[0])
+        tops.append((ids, vals))
+        margins.append(vals[0] - vals[1])
+        tok = ids[0]
     return produced, tops, margins
 
 

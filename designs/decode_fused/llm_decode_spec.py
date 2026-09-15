@@ -114,6 +114,28 @@ def largest_valid_tile_n(Nout: int, cols: int, bfp16: bool = True) -> int | None
     return max((d for d in range(step, per_col + 1, step) if per_col % d == 0), default=None)
 
 
+def largest_fitting_tile_n(Nout: int, cols: int, tile_m: int, tile_k: int, *,
+                           bfp16: bool = True, prio_accuracy: bool = False,
+                           check_memtile: bool = True) -> int | None:
+    """Largest tile_n clearing every rule `gemm_shape_rejection` applies, the capacity ones included.
+
+    `largest_valid_tile_n` answers the N-divisibility rule alone, so it returns the widest tile --
+    which is the one most likely to overrun L1. At Gemma-4's `Nout=3840, cols=8` that is 480, whose
+    footprint is 265472B against a 64KB budget. A tile_n printed as a fix has to survive the checks
+    that run after the one it resolves.
+    """
+    if Nout % cols:
+        return None
+    step = 2 * gemm_mac_dims(bfp16)[2]
+    per_col = Nout // cols
+    return max((d for d in range(step, per_col + 1, step)
+                if per_col % d == 0
+                and gemm_l1_bytes(tile_m, tile_k, d, prio_accuracy=prio_accuracy) <= L1_BYTES
+                and (not check_memtile
+                     or gemm_memtile_bytes(tile_m, tile_k, d, cols) <= MEMTILE_BYTES)),
+               default=None)
+
+
 def gemm_tile_rejection(tile_m: int, tile_k: int, tile_n: int, cols: int, *,
                         bfp16: bool = True) -> TilingRejection | None:
     """The tile-granularity rules, which depend on neither the batch nor the projection shape."""
@@ -169,10 +191,12 @@ def gemm_shape_rejection(K: int, Nout: int, tile_m: int, tile_k: int, tile_n: in
                                     f"(op.py: K % tile_k == 0)")
     min_N = tile_n * cols
     if Nout % min_N:
-        fix = largest_valid_tile_n(Nout, cols, bfp16)
+        fix = largest_fitting_tile_n(Nout, cols, tile_m, tile_k, bfp16=bfp16,
+                                     prio_accuracy=prio_accuracy, check_memtile=check_memtile)
         hint = (f"; tile_n={fix} would satisfy it" if fix
-                else f"; no tile_n multiple of {2 * gemm_mac_dims(bfp16)[2]} divides "
-                     f"Nout={Nout} at cols={cols}")
+                else f"; no tile_n multiple of {2 * gemm_mac_dims(bfp16)[2]} both divides "
+                     f"Nout={Nout} at cols={cols} and fits L1/MemTile at "
+                     f"tile_m={tile_m}, tile_k={tile_k}")
         return TilingRejection("N", f"Nout={Nout} not divisible by tile_n({tile_n})*cols({cols})"
                                     f"={min_N} (op.py: N % (tile_n*num_aie_columns) == 0){hint}")
     l1 = gemm_l1_bytes(tile_m, tile_k, tile_n, prio_accuracy=prio_accuracy)
@@ -682,7 +706,8 @@ class LlmSpec:
                 continue
             detail = rej.detail
             if rej.code == "N" and "would satisfy it" in detail:
-                fix = largest_valid_tile_n(Nout, cols, bfp16)
+                fix = largest_fitting_tile_n(Nout, cols, tile_m, tile_k, bfp16=bfp16,
+                                             prio_accuracy=prio_accuracy)
                 detail = detail.replace(f"; tile_n={fix} would satisfy it",
                                         f"; tile_n_overrides={{{label!r}: {fix}}} would satisfy it")
             raise ValueError(f"{self.name}: prefill {label} {detail}")
