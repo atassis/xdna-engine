@@ -846,3 +846,23 @@ GEMMA4_12B = LlmSpec(
 )
 
 SPECS = {s.name: s for s in (GEMMA3_270M, QWEN3_0_6B, GEMMA4_12B)}
+
+
+def operator_rejects(op_cls, kwargs):
+    """Which of `kwargs` this operator's __init__ does not accept. Empty means it takes them all.
+
+    A fused arm's gate asks whether the MODEL allows fusion -- that is what the `*_dp_reason`
+    methods above answer. It must ALSO ask whether the OPERATOR accepts the plan it would be
+    handed, and that second question had no owner: the MLP gate was opened for Gemma-4 while
+    `swiglu_mlp_dp` had no `layout` parameter on ANY IRON branch, so every quantized planar build
+    died on a TypeError naming the operator instead of a decline naming the gate. Reading the
+    signature beats listing parameters we believe exist -- it does not drift when an axis lands on
+    one side of the two repos and not the other, and it names EVERY unaccepted kwarg where the
+    TypeError names only the first.
+    """
+    import inspect
+
+    sig = inspect.signature(op_cls.__init__)
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+        return ()
+    return tuple(k for k in kwargs if k not in sig.parameters)
