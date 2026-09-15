@@ -144,7 +144,9 @@ if [ -x "$GEN_MANIFEST" ]; then
     [ -d "$fam" ] || continue
     fam_dirs+=("${fam%/}")
   done
-  if [ "${#fam_dirs[@]}" -gt 0 ] && "$GEN_MANIFEST" "${fam_dirs[@]}"; then
+  # --repo-root makes each manifest record the kernel-source digest it was built from, so a
+  # later verify can see a stale-but-intact artifact instead of reporting it Present.
+  if [ "${#fam_dirs[@]}" -gt 0 ] && "$GEN_MANIFEST" --repo-root "$REPO" "${fam_dirs[@]}"; then
     note "regenerated kernel_manifest.json for ${#fam_dirs[@]} published famil$([ "${#fam_dirs[@]}" -eq 1 ] && echo y || echo ies)"
   else
     note "WARNING: gen_kernel_manifest failed on one or more published families -- resolve_checked will report them unverified"

@@ -23,7 +23,7 @@
 use std::path::PathBuf;
 
 use npu_asr::kernel_registry::{
-    load_declared_kernel_set, verify_declared_kernel_set, DeclaredStatus, PUBLISHED_KERNELS_DIR,
+    load_declared_kernel_set, verify_declared_kernel_set_from, DeclaredStatus, PUBLISHED_KERNELS_DIR,
 };
 
 fn main() {
@@ -42,11 +42,14 @@ fn main() {
         }
     };
 
-    let report = verify_declared_kernel_set(&declared, &kernels_root);
+    // repo_root is known here, so the source-freshness check runs: without it a stale artifact
+    // reports PRESENT, which is what let a two-day-old kernel ship.
+    let report = verify_declared_kernel_set_from(&declared, &kernels_root, Some(&repo_root));
     let total = report.len();
     let mut missing = 0usize;
     let mut unverified = 0usize;
     let mut mismatched = 0usize;
+    let mut stale = 0usize;
     let mut present = 0usize;
 
     for entry in &report {
@@ -63,6 +66,12 @@ fn main() {
                 mismatched += 1;
                 ("MISMATCH", format!(" ({e})"))
             }
+            DeclaredStatus::StaleSource { recorded, current } => {
+                stale += 1;
+                let was = recorded.as_deref().unwrap_or("(none)");
+                ("STALE-SRC", format!(" (built from kernel source {}, tree has {})",
+                                      &was[..was.len().min(12)], &current[..current.len().min(12)]))
+            }
             DeclaredStatus::Missing => {
                 missing += 1;
                 (" MISSING", String::new())
@@ -73,11 +82,13 @@ fn main() {
 
     println!(
         "[verify-declared-kernels] {total} declared: {present} present, {unverified} unverified, \
-         {mismatched} hash-mismatched, {missing} missing  (kernels root: {})",
+         {mismatched} hash-mismatched, {stale} stale-source, {missing} missing  (kernels root: {})",
         kernels_root.display()
     );
 
-    if missing > 0 || mismatched > 0 {
+    // stale-source counts as a failure: the artifact is intact but was built from source the
+    // tree no longer has, which is the case this binary previously reported as PRESENT.
+    if missing > 0 || mismatched > 0 || stale > 0 {
         std::process::exit(1);
     }
 }

@@ -218,6 +218,16 @@ pub struct ManifestEntry {
     pub insts_sha256: Option<String>,
     pub insts_bytes: Option<u64>,
     pub tokens: StemTokens,
+    /// Digest of the KERNEL SOURCE this artifact was published from, per
+    /// [`source_digest`]. `None` on a manifest written before source tracking, and on a family
+    /// that declares no `sources` -- both mean "unknown", never "matches".
+    ///
+    /// The other hashes here answer "are these still the bytes I published"; they cannot answer
+    /// "were these bytes built from the source that is in the tree now". Nothing did, which is
+    /// how a `residual_add.cc` edit shipped an artifact compiled two days earlier: the stem was
+    /// Present, its bytes matched the manifest, and no rebuild was triggered.
+    #[serde(default)]
+    pub source_digest: Option<String>,
 }
 
 /// `dir/kernel_manifest.json` -- one manifest per artifact dir, matching `resolve()`'s
@@ -229,6 +239,65 @@ pub fn manifest_path(dir: &Path) -> PathBuf {
 }
 
 pub type Manifest = BTreeMap<String, ManifestEntry>;
+
+/// File extensions that count as kernel source for [`source_digest`].
+const SOURCE_EXTS: [&str; 4] = ["cc", "cpp", "h", "hpp"];
+
+/// Digest every kernel source under `paths` (each a file or directory, relative to `repo_root`).
+///
+/// `Ok(None)` when `paths` is empty -- a family that declares no sources is not source-gated, so
+/// adding this field cannot change the verdict for a family nobody has migrated yet.
+///
+/// Deliberately COARSE: one digest over a whole declared path, not per stem. A family's recipe
+/// maps a stem to a Makefile and the Makefile finds its `.cc` through a VPATH, so a per-stem
+/// source set is only recoverable by parsing both. The cost is over-rebuilding a family when one
+/// of its kernels changes; the alternative is a hand-maintained per-stem list that drifts, which
+/// is the same silent-staleness bug one layer up.
+pub fn source_digest(repo_root: &Path, paths: &[String]) -> std::io::Result<Option<String>> {
+    if paths.is_empty() {
+        return Ok(None);
+    }
+    let mut files: Vec<PathBuf> = Vec::new();
+    for rel in paths {
+        collect_sources(&repo_root.join(rel), &mut files)?;
+    }
+    // Sort by path so the digest is independent of readdir order, which is not stable across
+    // filesystems and would otherwise make the same tree hash differently on two boxes.
+    files.sort();
+    let mut h = Sha256::new();
+    for f in &files {
+        // The RELATIVE path goes in, so the digest does not change when the repo moves.
+        let rel = f.strip_prefix(repo_root).unwrap_or(f);
+        h.update(rel.to_string_lossy().as_bytes());
+        h.update([0u8]);
+        h.update(std::fs::read(f)?);
+        h.update([0u8]);
+    }
+    let digest = h.finalize();
+    Ok(Some(digest.iter().map(|b| format!("{b:02x}")).collect()))
+}
+
+fn collect_sources(path: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    if path.is_file() {
+        out.push(path.to_path_buf());
+        return Ok(());
+    }
+    if !path.is_dir() {
+        // A declared source path that does not exist is not an error here: verification reports,
+        // it does not fail. It shows up as a digest that omits it, i.e. a change, which is the
+        // conservative direction.
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(path)? {
+        let p = entry?.path();
+        if p.is_dir() {
+            collect_sources(&p, out)?;
+        } else if p.extension().and_then(|e| e.to_str()).is_some_and(|e| SOURCE_EXTS.contains(&e)) {
+            out.push(p);
+        }
+    }
+    Ok(())
+}
 
 fn sha256_hex(path: &Path) -> std::io::Result<(String, u64)> {
     let mut f = std::fs::File::open(path)?;
@@ -245,6 +314,16 @@ fn sha256_hex(path: &Path) -> std::io::Result<(String, u64)> {
 /// hand-maintained list; a manifest that didn't come from reading the actual bytes would just be a
 /// sixth instance of the declared-but-not-connected bug this task exists to close.
 pub fn generate_manifest(dir: &Path) -> std::io::Result<Manifest> {
+    generate_manifest_with_source(dir, None)
+}
+
+/// [`generate_manifest`], stamping each entry with the kernel-source digest the artifacts were
+/// built from. Pass `None` only where the source genuinely is not known -- a wrong digest is worse
+/// than an absent one, because absent reports as unverified and wrong reports as fresh.
+pub fn generate_manifest_with_source(
+    dir: &Path,
+    src_digest: Option<&str>,
+) -> std::io::Result<Manifest> {
     let mut manifest = Manifest::new();
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
@@ -269,6 +348,7 @@ pub fn generate_manifest(dir: &Path) -> std::io::Result<Manifest> {
                 insts_sha256,
                 insts_bytes,
                 tokens: parse_stem_tokens(stem),
+                source_digest: src_digest.map(str::to_string),
             },
         );
     }
@@ -530,6 +610,11 @@ pub struct DeclaredFamily {
     /// `<recipe> build <stem>` produces the artifact `resolve()` expects; `<recipe> list-variants
     /// <range-spec>` optionally prints stems for sweep mode.
     pub recipe: String,
+    /// Kernel-source paths (files or directories, relative to the repo root) this family is built
+    /// from, hashed by [`source_digest`] into the manifest at publish time. Empty = not
+    /// source-gated, which is the pre-existing behaviour.
+    #[serde(default)]
+    pub sources: Vec<String>,
 }
 
 /// Family name -> its declared stems. Keyed the same way `publish_kernels.sh` names a
@@ -563,6 +648,15 @@ pub enum DeclaredStatus {
     PresentUnverified,
     /// The artifact exists but its content hash disagrees with the family manifest.
     HashMismatch(ManifestError),
+    /// The artifact exists and its bytes match, but it was built from DIFFERENT kernel source
+    /// than the tree currently holds. A stale-but-intact artifact, which every other status here
+    /// reports as healthy -- `Present` is exactly what a two-day-old `residual_add.xclbin` looked
+    /// like after its `.cc` changed. Treated as needing a rebuild, like `Missing`.
+    StaleSource {
+        /// What the manifest recorded, or `None` if it predates source tracking.
+        recorded: Option<String>,
+        current: String,
+    },
     /// Declared but not found at `kernels_root/<family>/final_{stem}.xclbin` at all.
     Missing,
 }
@@ -583,15 +677,40 @@ pub fn verify_declared_kernel_set(
     declared: &DeclaredKernelSet,
     kernels_root: &Path,
 ) -> Vec<DeclaredVerifyEntry> {
+    verify_declared_kernel_set_from(declared, kernels_root, None)
+}
+
+/// [`verify_declared_kernel_set`] plus the source-freshness check, which needs `repo_root` to read
+/// the kernel sources a family declares. Pass `None` to skip it and get the presence/bytes-only
+/// verdict; a caller that HAS the repo root should pass it, because without it a stale artifact
+/// reports `Present`.
+pub fn verify_declared_kernel_set_from(
+    declared: &DeclaredKernelSet,
+    kernels_root: &Path,
+    repo_root: Option<&Path>,
+) -> Vec<DeclaredVerifyEntry> {
     let mut out = Vec::new();
     for (family, decl) in declared {
         let dir = kernels_root.join(family);
+        // Once per family, not per stem: the digest covers the whole declared source set.
+        let current = repo_root
+            .and_then(|r| source_digest(r, &decl.sources).ok().flatten());
         for stem in &decl.required {
             let status = if !xclbin_path(&dir, stem).is_file() {
                 DeclaredStatus::Missing
             } else {
                 match resolve_checked(&dir, stem) {
-                    Ok(_) => DeclaredStatus::Present,
+                    Ok(_) => match (&current, recorded_source_digest(&dir, stem)) {
+                        // Only a digest we can compute AND that disagrees is stale. An absent
+                        // record is PresentUnverified territory, not a rebuild trigger, or every
+                        // pre-existing manifest would rebuild on the first run after this lands.
+                        (Some(cur), Some(rec)) if *cur != rec => DeclaredStatus::StaleSource {
+                            recorded: Some(rec),
+                            current: cur.clone(),
+                        },
+                        (Some(_), None) => DeclaredStatus::PresentUnverified,
+                        _ => DeclaredStatus::Present,
+                    },
                     Err(ManifestError::MissingManifest(_) | ManifestError::UnknownStem { .. }) => {
                         DeclaredStatus::PresentUnverified
                     }
@@ -602,6 +721,13 @@ pub fn verify_declared_kernel_set(
         }
     }
     out
+}
+
+/// The `source_digest` a family manifest recorded for one stem, if any.
+fn recorded_source_digest(dir: &Path, stem: &str) -> Option<String> {
+    let bytes = std::fs::read(manifest_path(dir)).ok()?;
+    let manifest: Manifest = serde_json::from_slice(&bytes).ok()?;
+    manifest.get(stem)?.source_digest.clone()
 }
 
 /// What happened when the driver tried to produce one declared-but-missing stem.
@@ -656,11 +782,13 @@ pub fn build_missing_declared_kernels(
     mlir_aie_root: &Path,
 ) -> Vec<BuildResult> {
     debug_assert!(repo_root.is_absolute(), "repo_root must be absolute, got {repo_root:?}");
-    let report = verify_declared_kernel_set(declared, kernels_root);
+    // WITH repo_root: a stale-source stem must reach the rebuild arm below, and it only gets a
+    // StaleSource status when the source digest can be computed.
+    let report = verify_declared_kernel_set_from(declared, kernels_root, Some(repo_root));
     let mut results = Vec::with_capacity(report.len());
     for entry in report {
         let outcome = match entry.status {
-            DeclaredStatus::Missing => {
+            DeclaredStatus::Missing | DeclaredStatus::StaleSource { .. } => {
                 let recipe_rel = &declared[&entry.family].recipe;
                 let recipe_path = repo_root.join(recipe_rel);
                 if !recipe_path.is_file() || !is_executable(&recipe_path) {
@@ -1065,10 +1193,71 @@ mod tests {
                     DeclaredFamily {
                         required: stems.iter().map(|s| s.to_string()).collect(),
                         recipe: format!("scripts/kernel_families/{fam}.sh"),
+                        sources: Vec::new(),
                     },
                 )
             })
             .collect()
+    }
+
+    /// The defect this field exists for: an artifact whose bytes still match its manifest, built
+    /// from kernel source that has since changed. Every other status reports that as healthy --
+    /// `Present` is what a two-day-old resadd xclbin looked like after its .cc was edited, which
+    /// is how install.sh published a stale kernel and reported success.
+    #[test]
+    fn a_source_edit_makes_an_intact_artifact_stale_not_present() {
+        let repo = tempfile::tempdir().unwrap();
+        let kernels = tempfile::tempdir().unwrap();
+        let src_dir = repo.path().join("aie_kernels");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(src_dir.join("k.cc"), b"// v1").unwrap();
+
+        let mut declared = declare(&[("layernorm", &["ctxln_512x1024"])]);
+        declared.get_mut("layernorm").unwrap().sources = vec!["aie_kernels".to_string()];
+
+        let fam = kernels.path().join("layernorm");
+        std::fs::create_dir_all(&fam).unwrap();
+        std::fs::write(xclbin_path(&fam, "ctxln_512x1024"), b"xclbin bytes").unwrap();
+
+        // Publish: stamp the manifest with the digest of the source as it is NOW.
+        let digest = source_digest(repo.path(), &declared["layernorm"].sources).unwrap();
+        assert!(digest.is_some(), "a declared source dir must produce a digest");
+        let manifest = generate_manifest_with_source(&fam, digest.as_deref()).unwrap();
+        write_manifest(&fam, &manifest).unwrap();
+
+        let fresh = verify_declared_kernel_set_from(&declared, kernels.path(), Some(repo.path()));
+        assert!(matches!(fresh[0].status, DeclaredStatus::Present), "unchanged source is Present");
+
+        // Edit the kernel source. The artifact is untouched and still matches its own hash.
+        std::fs::write(src_dir.join("k.cc"), b"// v2").unwrap();
+        let stale = verify_declared_kernel_set_from(&declared, kernels.path(), Some(repo.path()));
+        assert!(
+            matches!(stale[0].status, DeclaredStatus::StaleSource { .. }),
+            "a changed kernel source must not report {:?}",
+            stale[0].status
+        );
+
+        // Without repo_root there is nothing to compare against, so the old verdict stands --
+        // this is what every caller that cannot reach the sources still sees.
+        let blind = verify_declared_kernel_set_from(&declared, kernels.path(), None);
+        assert!(matches!(blind[0].status, DeclaredStatus::Present));
+    }
+
+    /// A family that declares no sources must be unaffected, or adding the field would flip every
+    /// family nobody has migrated.
+    #[test]
+    fn no_declared_sources_means_no_source_gating() {
+        let repo = tempfile::tempdir().unwrap();
+        let kernels = tempfile::tempdir().unwrap();
+        let declared = declare(&[("layernorm", &["ctxln_512x1024"])]);
+        let fam = kernels.path().join("layernorm");
+        std::fs::create_dir_all(&fam).unwrap();
+        std::fs::write(xclbin_path(&fam, "ctxln_512x1024"), b"xclbin bytes").unwrap();
+        write_manifest(&fam, &generate_manifest(&fam).unwrap()).unwrap();
+
+        assert!(source_digest(repo.path(), &declared["layernorm"].sources).unwrap().is_none());
+        let report = verify_declared_kernel_set_from(&declared, kernels.path(), Some(repo.path()));
+        assert!(matches!(report[0].status, DeclaredStatus::Present));
     }
 
     #[test]
@@ -1148,6 +1337,7 @@ mod tests {
             DeclaredFamily {
                 required: vec!["512x768x768_32x32x32_8c".to_string()],
                 recipe: "scripts/kernel_families/whole_array.sh".to_string(),
+                sources: Vec::new(),
             },
         );
         let json = serde_json::to_string_pretty(&declared).unwrap();
@@ -1190,13 +1380,14 @@ mod tests {
         let mut declared = DeclaredKernelSet::new();
         declared.insert(
             "whole_array".to_string(),
-            DeclaredFamily { required: vec!["already_here".to_string()], recipe: "no_such_adapter.sh".to_string() },
+            DeclaredFamily { required: vec!["already_here".to_string()], recipe: "no_such_adapter.sh".to_string(), sources: Vec::new() },
         );
         declared.insert(
             "dwconv1d".to_string(),
             DeclaredFamily {
                 required: vec!["missing_stem".to_string()],
                 recipe: adapter.to_str().unwrap().to_string(),
+                sources: Vec::new(),
             },
         );
 
@@ -1229,6 +1420,7 @@ mod tests {
             DeclaredFamily {
                 required: vec!["ctxln_512x1024".to_string()],
                 recipe: "definitely_does_not_exist.sh".to_string(),
+                sources: Vec::new(),
             },
         );
 
@@ -1259,6 +1451,7 @@ mod tests {
             DeclaredFamily {
                 required: vec!["ctxln_512x1024".to_string()],
                 recipe: recipe.to_str().unwrap().to_string(),
+                sources: Vec::new(),
             },
         );
 
@@ -1280,13 +1473,14 @@ mod tests {
         let mut declared = DeclaredKernelSet::new();
         declared.insert(
             "layernorm".to_string(),
-            DeclaredFamily { required: vec!["will_fail".to_string()], recipe: failing.to_str().unwrap().to_string() },
+            DeclaredFamily { required: vec!["will_fail".to_string()], recipe: failing.to_str().unwrap().to_string(), sources: Vec::new() },
         );
         declared.insert(
             "dwconv1d".to_string(),
             DeclaredFamily {
                 required: vec!["will_succeed".to_string()],
                 recipe: succeeding.to_str().unwrap().to_string(),
+                sources: Vec::new(),
             },
         );
 
