@@ -24,13 +24,18 @@ name = "gemma4-12b"
 # the cost of declining the grid the checkpoint was trained on. g32 is the grid's own block (g64
 # reads 7.19% rel-L2), and g128 does not compile at K=3840 at all.
 #
-# int8 g64, and BOTH halves of that are load-bearing.
-#   int8, not int4: symmetric RTN int4 is 12.3% weight rel-L2 against a gate that wants ~0.3%
-#     logit accuracy, and no group size or calibration closes it.
-#   g64, not g128: at K=3840 the int8 width derivation returns VEC_SIZE=8, and aie::vector<int8,8>
-#     is 64 bits -- below aie_api's minimum vector, so there is no vector_storage specialisation
-#     and the kernel does not compile. g64 derives 16 (128-bit) and is legal, but was PUNISHED to
-#     that width by the header sitting in the row -- see the corrections list below.
+# HISTORICAL -- this paragraph describes the int8 g64 arm this scenario USED to ship. The default
+# has been int4 g32 QAT since 2026-09-15 (see the recipe above and the ladder below); the int8
+# reasoning is kept because one half of it still binds and the other was overturned by measurement.
+#   int8, not int4: OVERTURNED. Symmetric RTN int4 measured 12.3% weight rel-L2 against a ~0.3%
+#     logit-accuracy budget, which is why int8 shipped first -- but that measured the cost of
+#     DECLINING the QAT checkpoint's own 16-level grid, not the cost of four bits. Through the real
+#     wire format at --quant-full-range the same weights read 0.209%.
+#   g64, not g128: STILL TRUE, and it is a kernel constraint rather than a quality one. At K=3840
+#     the int8 width derivation returns VEC_SIZE=8, and aie::vector<int8,8> is 64 bits -- below
+#     aie_api's minimum vector, so there is no vector_storage specialisation and the kernel does not
+#     compile. g64 derives 16 (128-bit) and is legal, but was PUNISHED to that width by the header
+#     sitting in the row -- see the corrections list below.
 #
 # TMV_CTX left UNSET (generator default "1", per-geometry -- gen_llm_decode.py:77). It is NOT a
 # build-wide flag: the global layers (head_dim 512, one kv head, batch_group 16) have no TMatVec
