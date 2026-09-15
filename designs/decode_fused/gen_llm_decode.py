@@ -529,7 +529,8 @@ def load_weight_buffer(buf, arr):
 
 
 
-def sequence_name(sp, NL, S, placer_flags, decode_layer_active=False, T=None, tmv_declined=()):
+def sequence_name(sp, NL, S, placer_flags, decode_layer_active=False, T=None, tmv_declined=(),
+                  tmv_chunked=()):
     """Name the fused sequence after everything that changes its graph, not just the model.
 
     IRON keys the cached artifact by this name. Every knob below produces a DIFFERENT ELF, so
@@ -551,6 +552,10 @@ def sequence_name(sp, NL, S, placer_flags, decode_layer_active=False, T=None, tm
         parts.append("noctx")
     elif tmv_declined:
         parts.append("noctx" + "".join(f"_{h}" for h in sorted(tmv_declined)))
+    # An output-chunked TMatVec is a different graph at the same shape, so it must not share a
+    # cache key with the unchunked one -- same reason as noctx above.
+    if tmv_chunked:
+        parts.append("mc" + "".join(f"_{h}x{m}" for h, m in sorted(tmv_chunked)))
     if not GROUPED_K:
         parts.append("nogk")
     # The KV cache's block size (iron.common.kv_layout). T == S (or None, pre-this-task callers)
@@ -1125,24 +1130,51 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
     # other sites wrote -- the failure the KV_BLOCK_ELIGIBLE comment already warns about.
     tmv_rpc = {}
     if TMV_CTX:
-        from iron.operators.tmatvec.design import check_l1_fits
+        from iron.operators.tmatvec.design import (check_l1_fits,
+                                                   largest_fitting_m_chunk)
         for _hd, _hkv, _ in geoms:
             _gqa, _r = Hq // _hkv, TMV_RPC
             while _r > 1 and (S % _r or check_l1_fits(_hd, S, _gqa, _r) is not None):
                 _r //= 2
-            tmv_rpc[_hd] = None if check_l1_fits(_hd, S, _gqa, _r) is not None else _r
-        for _hd, _r in sorted(tmv_rpc.items()):
-            if _r is None:
+            if check_l1_fits(_hd, S, _gqa, _r) is None:
+                tmv_rpc[_hd] = (_r, None)
+                continue
+            # Unchunked does not fit -- try the OUTPUT axis before declining; see m_chunk's own
+            # comment in tmatvec/design.py for why it is the only knob that moves this floor.
+            # WIDEST chunk that fits, not the first: design.py's headroom constant under-counts
+            # (the data region is per-tiling), so model margin reads optimistic. Measured here,
+            # m_chunk=256 leaves 6656 B of real L1 against m_chunk=128's 1024.
+            _best = None
+            _rr = TMV_RPC
+            while _rr >= 1:
+                if S % _rr == 0:
+                    _mc = largest_fitting_m_chunk(_hd, S, _gqa, _rr)
+                    if _mc and (_best is None or _mc > _best[1]):
+                        _best = (_rr, _mc)
+                _rr //= 2
+            tmv_rpc[_hd] = _best
+        for _hd, _v in sorted(tmv_rpc.items()):
+            if _v is None:
                 print(f"[gen] TMV_CTX declined at head_dim={_hd}: TMatVec does not fit L1 at any "
-                      f"rows_per_chunk; that geometry keeps the transpose+GEMV context path")
+                      f"rows_per_chunk or m_chunk; that geometry keeps the transpose+GEMV path")
+                continue
+            _r, _mc = _v
+            if _mc is not None:
+                print(f"[gen] TMatVec at head_dim={_hd}: m_chunk={_mc} rows_per_chunk={_r} "
+                      f"(output-chunked; unchunked does not fit L1 at any rows_per_chunk)")
             elif _r != TMV_RPC:
                 print(f"[gen] TMatVec rows_per_chunk {TMV_RPC} -> {_r} (L1 fit at head_dim={_hd})")
 
     # The blocked cache stays a BUILD-WIDE decision even though the tmatvec verdict is not: both
     # arms read and write the same buffers, so a geometry on the fallback path would be addressing a
     # layout it cannot express. Blocking therefore needs EVERY geometry on the tmatvec path.
-    _tmv_declined = tuple(sorted(h for h, r in tmv_rpc.items() if r is None))
-    KV_BLOCK_ELIGIBLE = GROUPED_K and TMV_CTX and not _tmv_declined
+    _tmv_declined = tuple(sorted(h for h, v in tmv_rpc.items() if v is None))
+    _tmv_chunked = tuple(sorted((h, v[1]) for h, v in tmv_rpc.items()
+                                if v is not None and v[1] is not None))
+    # ...and no geometry may be OUTPUT-CHUNKED: blocked A and m_chunk both want all four of
+    # TMatVec's access-pattern dims, which the operator asserts against. This gate has to agree, or
+    # enabling the global geometry flips the cache to a layout that cannot be built.
+    KV_BLOCK_ELIGIBLE = GROUPED_K and TMV_CTX and not _tmv_declined and not _tmv_chunked
     _kv_block_env = os.environ.get("KV_BLOCK_T")
     if _kv_block_env is not None:
         T = int(_kv_block_env)
@@ -1665,12 +1697,13 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         # rows_per_chunk=64 puts the L1 A tile at 16 KB double-buffered.
         # The verdict and its rows_per_chunk come from `tmv_rpc`, derived once above -- not
         # recomputed here. A second copy of the L1 model is exactly how the two would drift.
-        rpc = tmv_rpc.get(hd)
-        uses_tmv = rpc is not None
+        _tmv = tmv_rpc.get(hd)
+        uses_tmv = _tmv is not None
         if uses_tmv:
+            rpc, mc = _tmv
             op_ctx = TMatVec(M=hd, K=w, num_aie_columns=hkv, num_batches=Hq, batch_group=gqa,
                                  alloc_K=None if KVA_g == w else KVA_g, block_size=T_g,
-                             rows_per_chunk=rpc, context=ctx)
+                             rows_per_chunk=rpc, m_chunk=mc, context=ctx)
         else:
             op_ctx = gemv(hd, w, ctx, num_batches=Hq)
         g = SimpleNamespace(
@@ -2361,6 +2394,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         if not last:
             seg_bufsz[seg_out] = D * 2
         _sn = sequence_name(sp, NL, S, placer_flags, tmv_declined=_tmv_declined,
+                            tmv_chunked=_tmv_chunked,
                             decode_layer_active=op_decode_layer is not None, T=T)
         name = _sn if len(cuts) == 1 else f"{_sn}_seg{si}of{len(cuts)}"
         # A rung is THIS runlist with the layer design substituted. Only for an unsplit
@@ -2423,7 +2457,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
     if SPLIT_LM_HEAD:
         head_rl = [(op_head, "W_head", "xf", "logits")]
         head = OperatorSequence(
-            f"{sequence_name(sp, NL, S, placer_flags, tmv_declined=_tmv_declined)}_lmhead", head_rl,
+            f"{sequence_name(sp, NL, S, placer_flags, tmv_declined=_tmv_declined, tmv_chunked=_tmv_chunked)}_lmhead", head_rl,
                                 input_args=["xf"], output_args=["logits"],
                                 buffer_sizes={"xf": D * 2, "logits": VOCAB * 2},
                                 context=ctx, extra_flags=placer_flags, share_designs=share)
