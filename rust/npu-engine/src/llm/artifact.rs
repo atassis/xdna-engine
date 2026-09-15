@@ -1158,9 +1158,6 @@ impl LlmArtifact {
     /// wrong token and nothing else.
     pub fn check_prefill_pairing(&self, prefill: &LlmArtifact) -> Result<(), EngineError> {
         let mut checks: Vec<(&str, usize, usize)> = vec![
-            // `S` is the capacity both halves address, so a disagreement puts prefill's KV rows
-            // under decode's head boundaries -- in-arena, past every bounds check.
-            ("dims.S", self.max_seq, prefill.max_seq),
             ("dims.head_dim", self.head_dim, prefill.head_dim),
             ("dims.d_model", self.d_model, prefill.d_model),
             ("dims.layers", self.n_layers, prefill.n_layers),
@@ -1171,6 +1168,25 @@ impl LlmArtifact {
             // nothing between the two halves compared the one number that differed.
             ("dims.kv_block", self.kv_block, prefill.kv_block),
         ];
+        // `dims.S` is deliberately NOT here, and the reason is `kv_off`: it is a function of
+        // (pos, kv_block, head_dim, kv_heads) and `S` appears nowhere in it, so two halves that
+        // agree on the block size compute byte-identical addresses at any window. What used to make
+        // S-equality look load-bearing is the FLAT layout, where `kv_block` defaults to `S` -- and
+        // that case is still caught, by the `kv_block` comparison directly above.
+        //
+        // Requiring equality cost a real configuration: a prefill compiled for a 4096-wide window
+        // cannot pair with the 32768-capacity decode it was built to prime, even though every byte
+        // it writes lands exactly where that decode reads it.
+        //
+        // What DOES have to hold is containment -- prefill must not prime a position past the
+        // window decode addresses.
+        if prefill.max_seq > self.max_seq {
+            return Err(EngineError::Load(format!(
+                "prefill window S={} is wider than decode's S={}: prefill would prime positions \
+                 decode never addresses",
+                prefill.max_seq, self.max_seq
+            )));
+        }
         // 0 means "not declared, and provably never read" -- see the loader. Only compare two
         // artifacts that both state it.
         if self.kv_heads != 0 && prefill.kv_heads != 0 {
@@ -1220,15 +1236,20 @@ impl LlmArtifact {
             )));
         }
         // The final chunk of a prompt is padded to `M`, so a prefill run covers `ceil(n/M)*M`
-        // positions. With `S % M == 0` that can never exceed `S` for any prompt the window already
-        // admits (`n <= S-1` => `ceil(n/M)*M <= S`), which is what lets the chunk loop skip a bound
-        // it could not act on anyway -- declining a long prompt after priming half of it is worse
-        // than refusing the pair at load.
-        if !self.max_seq.is_multiple_of(prefill.batch) {
+        // positions. This is PREFILL's window, not decode's: prefill chunks over its own, and since
+        // the containment check above admits a narrower one, decode's tells us nothing about where
+        // prefill's last chunk lands.
+        //
+        // `NpuPrefill::prime` no longer depends on this -- it floors its stop at the batch-aligned
+        // window and declines the rest, so an indivisible window is safe. It is refused anyway
+        // because it is not CORRECT-but-slow, it is a cliff: the positions past the floor fall back
+        // to one dispatch each, and a build is free to pick a window that divides M.
+        if !prefill.max_seq.is_multiple_of(prefill.batch) {
             return Err(EngineError::Load(format!(
-                "prefill batch M={} does not divide the KV window S={}: the padded final chunk \
-                 would write past the end of the cache for prompts near the window",
-                prefill.batch, self.max_seq
+                "prefill batch M={} does not divide prefill's own window S={}: every position \
+                 past {} would fall back to a per-token dispatch",
+                prefill.batch, prefill.max_seq,
+                (prefill.max_seq / prefill.batch) * prefill.batch
             )));
         }
         Ok(())
@@ -2226,15 +2247,47 @@ mod tests {
     }
 
     #[test]
-    fn a_prefill_built_for_a_different_window_fails_loud() {
-        // S is the head stride of the [Hkv, S, HD] cache, so this is not a capacity difference --
-        // it puts prefill's rows under decode's head boundaries, in-arena and past every check.
+    fn a_flat_prefill_built_for_a_different_window_fails_loud() {
+        // FLAT, so `kv_block` defaults to `S` and IS the head stride: a different window puts
+        // prefill's rows under decode's head boundaries, in-arena and past every bounds check.
+        // The refusal now comes from the block size rather than from `dims.S` directly, because
+        // the block size is the thing addressing actually depends on.
         let (dec, mut pre) = pair_metas(2);
         pre["dims"]["S"] = serde_json::json!(4);
         let (_d, _p, da, pa) = load_pair(&dec, &pre);
         let err = da.check_prefill_pairing(&pa).unwrap_err().to_string();
-        assert!(err.contains("dims.S"), "{err}");
-        assert!(err.contains('8') && err.contains('4'), "must name both windows: {err}");
+        assert!(err.contains("dims.kv_block"), "{err}");
+        assert!(err.contains('8') && err.contains('4'), "must name both: {err}");
+    }
+
+    #[test]
+    fn a_blocked_prefill_may_have_a_narrower_window_than_its_decode() {
+        // The configuration equality used to forbid, and the reason this check was relaxed: `kv_off`
+        // is a function of (pos, kv_block, head_dim, kv_heads), so at a shared block size every byte
+        // a 4-wide prefill writes lands where an 8-wide decode reads it.
+        let (mut dec, mut pre) = pair_metas(2);
+        for m in [&mut dec, &mut pre] {
+            m["dims"]["kv_block"] = serde_json::json!(2);
+            m["dims"]["kv_heads"] = serde_json::json!(1);
+        }
+        pre["dims"]["S"] = serde_json::json!(4);
+        let (_d, _p, da, pa) = load_pair(&dec, &pre);
+        da.check_prefill_pairing(&pa).expect("same block size, narrower window, M divides it");
+    }
+
+    #[test]
+    fn a_prefill_window_wider_than_its_decode_is_refused() {
+        // The direction that is NOT symmetric: prefill would prime positions decode never addresses.
+        let (mut dec, mut pre) = pair_metas(2);
+        for m in [&mut dec, &mut pre] {
+            m["dims"]["kv_block"] = serde_json::json!(2);
+            m["dims"]["kv_heads"] = serde_json::json!(1);
+        }
+        pre["dims"]["S"] = serde_json::json!(16);
+        let (_d, _p, da, pa) = load_pair(&dec, &pre);
+        let err = da.check_prefill_pairing(&pa).unwrap_err().to_string();
+        assert!(err.contains("wider than"), "{err}");
+        assert!(err.contains("16") && err.contains('8'), "must name both windows: {err}");
     }
 
     #[test]
