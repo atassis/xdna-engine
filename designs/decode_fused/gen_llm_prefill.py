@@ -220,11 +220,25 @@ QUANT_TENSOR = {
 
 
 def read_quant_manifest(src_dir):
-    """(dtype, group_size) exactly as `src_dir`'s own quant.json records them -- read, never
-    hardcoded, so a dump that changes its own group_size cannot silently drift from this file."""
+    """(dtype, group_size, scale_dtype) exactly as `src_dir`'s own quant.json records them -- read,
+    never hardcoded, so a dump that changes its own group_size cannot silently drift from this file.
+
+    `layout` and `scale_dtype` are read for the same reason, and `layout` is REFUSED rather than
+    returned: `repack_gemm_weight` parses the row-packed form only (it takes no `layout` argument),
+    so a `row_group_planar` dump -- where the scales sit outside the row -- would be read with
+    payload bytes where the header belongs, silently, at every row. Every Gemma-4-12B quantized dump
+    on this box is planar, which is the case that would hit it.
+    """
     with open(os.path.join(src_dir, "quant.json")) as fh:
         m = json.load(fh)
-    return m["dtype"], int(m["group_size"])
+    layout = m.get("layout", "header_first")
+    if layout != "header_first":
+        raise ValueError(
+            f"{src_dir}/quant.json declares layout={layout!r}, which prefill's GEMM path cannot "
+            f"read: iron.common.quant.repack_gemm_weight permutes the row-packed form and has no "
+            f"{layout!r} parser. Re-dump this checkpoint at layout='header_first', or teach the "
+            f"repack the layout -- do not point this build at it as-is")
+    return m["dtype"], int(m["group_size"]), m.get("scale_dtype", "f32")
 
 
 def build_quant_plan(quant_weights, quant_attn_o_weights):
@@ -238,11 +252,12 @@ def build_quant_plan(quant_weights, quant_attn_o_weights):
     """
     if not quant_weights:
         return {}
-    dtype, group = read_quant_manifest(quant_weights)
+    dtype, group, sdt = read_quant_manifest(quant_weights)
     o_dir = quant_attn_o_weights or quant_weights
-    o_dtype, o_group = (dtype, group) if o_dir == quant_weights else read_quant_manifest(o_dir)
-    return {"qkv": (dtype, group, quant_weights), "mlp": (dtype, group, quant_weights),
-            "o": (o_dtype, o_group, o_dir)}
+    o_dtype, o_group, o_sdt = ((dtype, group, sdt) if o_dir == quant_weights
+                               else read_quant_manifest(o_dir))
+    return {"qkv": (dtype, group, sdt, quant_weights), "mlp": (dtype, group, sdt, quant_weights),
+            "o": (o_dtype, o_group, o_sdt, o_dir)}
 
 
 def quant_source_files(src_dir, prefix, tensor):
@@ -449,7 +464,7 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
         precision plane hands its operators."""
         if site not in quant_plan:
             return {}
-        dtype, group, _ = quant_plan[site]
+        dtype, group, _, _ = quant_plan[site]
         return dict(weight_dtype=dtype, group_size=group)
 
     # Buffers this build packs itself (Task 5), one entry per (layer, chunk): where the packed
@@ -762,7 +777,7 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
         """
         if "qkv" not in quant_plan:
             return qkv_slab(p, role, geom)
-        dtype, group, src_dir = quant_plan["qkv"]
+        dtype, group, scale_dtype, src_dir = quant_plan["qkv"]
         op = {"q": geom.op_gq, "k": geom.op_gkv, "v": geom.op_gkv}[role]
         prefix = f"{sp.weight_prefix}layers.{layer}."
         tensor = QUANT_TENSOR[{"q": "Wq", "k": "Wk", "v": "Wv"}[role]]
@@ -776,7 +791,7 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
         quant_pack.append(dict(buf=name, src_dir=src_dir, src_file=srcs[0],
                                N=op.N, K=op.K, tile_k=op.tile_k, tile_n=op.tile_n,
                                group_size=group, weight_dtype=dtype, cols=op.num_aie_columns,
-                               mmul=op._mmul_rst))
+                               scale_dtype=scale_dtype, mmul=op._mmul_rst))
         return f"{name}[0:{nbytes}]"
 
     def kv_slab(buf, kv, geom):
@@ -837,7 +852,7 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
         """
         plain = p + base_name
         if site in quant_plan:
-            dtype, group, src_dir = quant_plan[site]
+            dtype, group, scale_dtype, src_dir = quant_plan[site]
             prefix = f"{sp.weight_prefix}layers.{layer}."
             tensor = QUANT_TENSOR[base_name]
             srcs = quant_source_files(src_dir, prefix, tensor)
@@ -887,7 +902,7 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
                                        N=Nout, K=chunk_k, tile_k=chunk_op.tile_k,
                                        tile_n=chunk_op.tile_n, group_size=group,
                                        weight_dtype=dtype, cols=chunk_op.num_aie_columns,
-                                       mmul=chunk_op._mmul_rst))
+                                       scale_dtype=scale_dtype, mmul=chunk_op._mmul_rst))
                 return f"{name}[0:{nbytes}]"
         elif not dec_meta_path or plain in dec_sizes:
             return [(plain_op, a_buf, f"{plain}[0:{K * Nout * 2}]", out_buf)]
@@ -1491,7 +1506,7 @@ def main():
             _, mmul_s, mmul_t = e["mmul"]
             packed = repack_gemm_weight(row_packed, e["N"], e["K"], e["tile_k"], e["tile_n"],
                                         e["group_size"], e["weight_dtype"], mmul_s, mmul_t,
-                                        e["cols"])
+                                        e["cols"], scale_dtype=e["scale_dtype"])
             packed.tofile(os.path.join(bdir, f"{e['buf']}.bin"))
         print(f"[gen] packed {len(dims['quant_pack'])} quantized weight buffer(s) into {bdir} "
               f"(sites: {sorted({s for s in quant_plan})})")
