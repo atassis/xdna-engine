@@ -394,6 +394,32 @@ BUCKET_SCRATCH_ORDER = os.environ.get("BUCKET_SCRATCH_ORDER", "0") == "1"
 # Weight tile ROWS for the fused MLP. Trades against WEIGHT_DEPTH at constant L1.
 MLP_TILE_ROWS = int(os.environ.get("MLP_TILE_ROWS", "0"))
 
+# Columns per softmax L1 acquire. 0 keeps the unchunked operator, whose in1/out tiles are the whole
+# attention row -- four `memref<w x bf16>` buffers in one core's L1, which caps the context at
+# w <= 8063 and trips the 16383-word aie.dma_bd length field at w ~ 32768. Set it and the softmax
+# streams each row in `w // SOFTMAX_SEGMENT` pieces instead, so neither limit sees w.
+#
+# MEASURED 2026-09-16 at 1024, 48 layers, instance 8b326264833a: every S from 8192 to 262144
+# builds, scratch 6.69 -> 10.69 GiB. The unchunked op places at none of them.
+SOFTMAX_SEGMENT = int(os.environ.get("SOFTMAX_SEGMENT", "0"))
+
+
+def softmax_segment(w):
+    """The per-acquire tile for a softmax over `w` columns, or None to keep the unchunked op.
+
+    A window the unchunked op already reaches keeps it -- chunking costs two extra streams of the
+    scores and buys nothing there, and it is what leaves the sliding geometry's 1024-wide softmax
+    untouched while the global one is split. Divisibility is raised HERE rather than left to
+    iron/operators/softmax/op.py, so the message names the window a caller actually chose.
+    """
+    if not SOFTMAX_SEGMENT or w <= SOFTMAX_SEGMENT:
+        return None
+    if w % SOFTMAX_SEGMENT:
+        raise ValueError(
+            f"SOFTMAX_SEGMENT={SOFTMAX_SEGMENT} does not divide the attention window {w}"
+        )
+    return SOFTMAX_SEGMENT
+
 # K-SPLIT for reductions that do not fit L1 at ANY tiling. The B vector is double-buffered at
 # 2*K*2 bytes and is independent of every tiling knob, so a large enough K has no legal
 # (tsi, tso) -- Gemma-4-12B's down projection is K=15360 and needs 61440 B of 57344 usable before
@@ -646,6 +672,8 @@ def sequence_name(sp, NL, S, placer_flags, decode_layer_active=False, T=None, tm
         parts.append(f"wd{WEIGHT_DEPTH}")
     if MLP_TILE_ROWS:
         parts.append(f"tr{MLP_TILE_ROWS}")
+    if SOFTMAX_SEGMENT:
+        parts.append(f"smseg{SOFTMAX_SEGMENT}")
     if FUSE_ACT:
         parts.append("fuseact")
     # Flat, not nested under decode_layer_active: _trace.py wires into every design.py this file
@@ -1621,7 +1649,8 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
             mask_slots.append((mask_slot, w))
             win_softmax = Softmax(rows=Hq, cols=w, num_aie_columns=sp.softmax_cols(COLS),
                                   num_channels=1, rtp_vector_size=w,
-                                  vector_size_parameter=mask_slot, context=ctx)
+                                  vector_size_parameter=mask_slot,
+                                  segment=softmax_segment(w), context=ctx)
             win_scale = ElementwiseMul(size=Hq * w, tile_size=w // COLS, num_aie_columns=COLS,
                                        context=ctx)
             _win_cache[w] = (win_softmax, win_scale, mask_slot)
@@ -1842,7 +1871,8 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         # op computes nothing (IRON raises). Gemma-3's 4 heads run at 4 columns.
         op_softmax = Softmax(rows=Hq, cols=S, num_aie_columns=sp.softmax_cols(COLS),
                              num_channels=1, rtp_vector_size=S,
-                             vector_size_parameter="sm_mask", context=ctx)
+                             vector_size_parameter="sm_mask",
+                             segment=softmax_segment(S), context=ctx)
         # num_batches=Hq, not Hq separate invocations. transpose/design.py's L3 tensors already hold
         # "num_batches contiguous (M,N) matrices stacked along the row dimension", which is EXACTLY what
         # vr/vt are; calling it per head issued 448 configure+run pairs per token to do 28 ops' work.
