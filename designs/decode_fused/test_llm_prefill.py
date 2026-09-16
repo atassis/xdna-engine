@@ -13,10 +13,13 @@ Run inside the IRON env:
   PYTHONPATH=designs/decode_fused:$IRON .venv-iron/bin/python -m pytest \
       designs/decode_fused/test_llm_prefill.py -v
 """
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
 iron_gen = pytest.importorskip("gen_llm_prefill")
+BF16 = iron_gen.BF16
 
 
 def _apply(x, cos, sin):
@@ -152,3 +155,37 @@ def test_decode_arena_plan_fills_gaps(tmp_path):
     _, order, sizes, reserved = iron_gen.decode_arena_plan(str(meta))
     assert order == ["a", "__decode_gap0", "b"]
     assert sizes["__decode_gap0"] == 32 and reserved == 56
+
+
+def _scores_entry(n_cols):
+    """One head's scores GEMM over the served Gemma-4 sliding geometry, as the runlist writes it.
+
+    kv head 7's slab is the last of eight in an `L0_kc` decode sized to 8 heads x 1024 positions x
+    head_dim 256 x bf16 = 4194304 B, so it starts at 3670016 and holds 524288. `n_cols` is the B
+    operand's N -- the geometry's own window 1024, or the build-wide S=6912 that reads past it.
+    """
+    op = SimpleNamespace(get_arg_spec=lambda: [
+        SimpleNamespace(shape=(256, 256), dtype=BF16),
+        SimpleNamespace(shape=(n_cols, 256), dtype=BF16),
+        SimpleNamespace(shape=(256, n_cols), dtype=BF16),
+    ])
+    fused = SimpleNamespace(subbuffer_layout={
+        "q": ("scratch", 0, 256 * 4096 * 2),
+        "L0_kc": ("scratch", 0, 4194304),
+        "sc": ("scratch", 0, 16 * 256 * n_cols * 2),
+    })
+    rl = [(op, "q[0:131072]", "L0_kc[3670016:4194304]",
+           f"sc[0:{256 * n_cols * 2}]")]
+    return rl, fused
+
+
+def test_operand_bounds_accepts_the_geometrys_own_window():
+    iron_gen.check_operand_bounds(*_scores_entry(1024))
+
+
+def test_operand_bounds_rejects_an_s_wide_read_of_a_narrowed_kv_slab():
+    """The defect a LAYOUT_ONLY build reported SUCCESS for on 2026-09-16: every shared buffer's
+    own (offset, len) agrees with decode's meta and the descriptor addressing into one does not."""
+    with pytest.raises(ValueError) as e:
+        iron_gen.check_operand_bounds(*_scores_entry(6912))
+    assert "L0_kc" in str(e.value) and "7208960" in str(e.value)

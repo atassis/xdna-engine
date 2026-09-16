@@ -193,14 +193,12 @@ def causal_widths(base, M, S, heads):
     a small number. The clamp at S is reachable -- the last chunk of a full window has
     `base + M - 1 == S - 1`, so its final width is exactly S.
 
-    KNOWN GAP: this is the ONE global-S clamp shared by every layer via `SM_WIDTHS`, not a
-    per-geometry one. A narrowed (sliding) geometry's own softmax now runs at `cols=w` (see
-    `attn_ops`), so once `base + i + 1` exceeds `w` the row's width exceeds `cols` and
-    `mask_bf16`'s loop never fires -- every position in that geometry's window is left unmasked
-    instead of the true sliding width `min(base + i + 1, w)`. Safe (no OOB: a width past `cols` is
-    the already-handled "masks nothing" case above), wrong once a chunk passes position `w`.
-    Closing it needs a second, per-window widths buffer and a host write that knows which window
-    each one clamps to -- out of scope for this generator-only pass.
+    ONE clamp serves every geometry, including a narrowed (sliding) one whose own softmax runs at
+    `cols = w < S`: while `base + M <= w` the width is `base + i + 1` either way, so the global
+    clamp and a per-window `min(base + i + 1, w)` are the same vector. That inequality is not an
+    assumption here -- `npu_prefill.rs::batchable_window` is what holds it, and it holds it because
+    past `w` the valid slots stop being a prefix at all and no width, per-window or not, names
+    them.
     """
     w = np.clip(np.arange(M, dtype=np.int64) + base + 1, 1, S).astype(np.int32)
     return np.tile(w, heads)
@@ -713,7 +711,11 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
             output_sizes=kv_out_sizes, output_strides=kv_out_strides, output_offset=0,
             input_buffer_size=M * hkv * hd, output_buffer_size=kvl_g.total_elems,
             transfer_size=pick_transfer(M * hkv * hd), num_aie_channels=1,
-            output_offset_parameter="kv_off", context=ctx)
+            # THIS geometry's slot, the spelling `geom_slots` puts in the meta -- the two need
+            # different runtime values (different capacity, different head_dim), and a meta naming
+            # a slot the ELF never declared does not load at all. First geometry keeps the bare
+            # `kv_off` for the same reason decode's does: the pre-list host fallback reads it.
+            output_offset_parameter=kv_slot, context=ctx)
         # The head-axis seam, both directions -- only built (and only ever used) when `not seam`.
         # See the module docstring for why these exist and what they cost; pure DMA, 0% compute.
         op_q2h = op_h2t = None
@@ -1248,6 +1250,7 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
                     f"{got[0]} offset {got[1]} len {got[2]}, the decode artifact at "
                     f"scratch offset {want['offset']} len {want['len']} -- the two ELFs cannot "
                     f"share one FusedArena")
+    check_operand_bounds(rl, fused)
 
     # meta.json's tile_n_scores/tile_n_ctx are ONE representative number; a multi-geometry build
     # reports the base (sliding) geometry's and the full per-geometry breakdown is in `tiles`.
@@ -1275,6 +1278,48 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
                 n_designs=len(fused.unique_designs()[0]),
                 n_configures=count_configures(rl, fused))
     return sp, fused, dims
+
+
+def check_operand_bounds(runlist, fused):
+    """Every operand's own declared extent against the bytes its buffer actually holds.
+
+    The `scratch_order` check above compares each shared buffer's (offset, len) with decode's meta
+    and prefill INHERITS both from it, so it passes by construction and cannot see a descriptor
+    that addresses PAST the end of a buffer whose length the two halves agree on. IRON does not
+    own that either: `calculate_buffer_layout` records a slice's (start, end) and never compares
+    it to the parent's length or to the arg spec's own byte count. Two operand failures, both
+    checked here: wider than the slice it was handed, and leaving the buffer from that slice's
+    start.
+
+    What it catches, verified 2026-09-16 against decode_int4g32qat_s6912_l48_rg_mc: a scores/ctx
+    GEMM built at the global S over a sliding geometry declares 3538944 B of B per head against a
+    524288 B slab, and kv head 7 reaches 7208960 B in an `L0_kc` decode sized to 4194304.
+    """
+    worst = {}
+    for op, *bufs in runlist:
+        for spec, nm in zip(op.get_arg_spec(), bufs):
+            base = nm.split("[")[0]
+            buflen = fused.subbuffer_layout[base][2]
+            if "[" in nm:
+                lo, hi = (int(x) for x in nm[nm.index("[") + 1:-1].split(":"))
+            else:
+                lo, hi = 0, buflen
+            need = int(np.prod(spec.shape)) * np.dtype(spec.dtype).itemsize
+            # Ranked so a span that leaves the BUFFER outranks one that merely overruns its slice
+            # into a sibling: same arithmetic, but only the first corrupts the shared arena.
+            rank = (max(lo + need - buflen, 0), max(need - (hi - lo), 0))
+            if not any(rank):
+                continue
+            key = (type(op).__name__, base)
+            if rank > worst.get(key, ((0, 0),))[0]:
+                worst[key] = (rank, nm, need, hi - lo, lo, buflen)
+    if not worst:
+        return
+    lines = [f"  {kind} on {nm}: declares {need} B from offset {lo}, reaching {lo + need} -- "
+             f"slice holds {have} B and buffer {base!r} is {buflen} B"
+             for (kind, base), (_, nm, need, have, lo, buflen) in sorted(worst.items())]
+    raise ValueError(
+        f"{len(worst)} operand(s) address past the buffer they were given:\n" + "\n".join(lines))
 
 
 def count_configures(runlist, fused):
@@ -1646,6 +1691,14 @@ def main():
             if line.strip():
                 n_, idx, ty, kind = line.split()
                 scratchpad_params[n_] = {"byte_offset": int(idx) * 4, "kind": kind, "dtype": ty}
+    # `geom_slots` names the slots the META will advertise; `params.txt` is what the ELF actually
+    # declares. They are produced by different halves of the build and nothing else compares them,
+    # so a geometry whose `output_offset_parameter` was never threaded through ships an artifact
+    # that cannot load -- which is how this one was found, at `LlmArtifact::load_prefill`.
+    undeclared = [n for n, _, _, _ in dims["geom_slots"] if n not in scratchpad_params]
+    if undeclared:
+        raise SystemExit(f"ERROR: geom_slots names scratchpad parameter(s) {undeclared} that the "
+                         f"ELF does not declare (params.txt has {sorted(scratchpad_params)})")
 
     lay_names = [*dims["inputs"], "xout", *dims["shared"], *dims["prefill_local"]]
     lay = {n: fused.get_layout_for_buffer(n) for n in lay_names}
@@ -1758,10 +1811,10 @@ def main():
             "softmax runs); the KV of layers >= 1 is not, because it is computed from a "
             "non-causal layer-0 output. This arm is the A/B control, not a seed for a decode.",
         ]) + ([
-            f"causal width is clamped to the GLOBAL S={S} for every layer (see causal_widths's "
-            "KNOWN GAP): a narrowed geometry's own softmax runs at cols=w < S, so past position w "
-            "a row's width exceeds cols and mask_bf16 masks nothing -- safe, but every position in "
-            "that geometry's window is attended unconditionally past the true sliding boundary.",
+            f"batched prefill covers positions [0, {min(ww for _, _, ww, _ in dims['geom_slots'])}) "
+            f"only, not the full S={S}: past the narrowest geometry's capacity its circular cache "
+            "holds a wrapped interval and mask_bf16's suffix mask cannot express one. The host "
+            "stops there (npu_prefill.rs::batchable_window) and finishes the prompt stepwise.",
         ] if dims["causal"] == "rows" and any(ww < S for _, _, ww, _ in dims["geom_slots"]) else []) + ([
             f"KV cache is blocked (T={dims['kv_block']}): the scores/ctx GEMMs address it in "
             "place, "
