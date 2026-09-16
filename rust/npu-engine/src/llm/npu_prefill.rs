@@ -278,22 +278,24 @@ impl NpuPrefill {
         })?;
 
         let plan = segment_plan(&artifact.segments, &artifact.kernel_name)?;
+        // `open_named` borrows the primary, so every named segment is opened while it is still
+        // owned here. Placing the primary into `segments` at its own position first would end
+        // that borrow and strand whichever segments are declared after it.
+        let mut opened: Vec<Option<_>> = Vec::with_capacity(plan.len());
+        for src in &plan {
+            opened.push(match src {
+                SegmentSource::Primary => None,
+                SegmentSource::Named(label) => Some(primary.open_named(label).map_err(|e| {
+                    EngineError::Load(format!("open prefill segment {label}: {e}"))
+                })?),
+            });
+        }
         let mut primary = Some(primary);
         let mut segments = Vec::with_capacity(plan.len());
-        for src in &plan {
-            let r = match src {
-                SegmentSource::Primary => {
-                    primary.take().expect("segment_plan yields Primary at most once")
-                }
-                SegmentSource::Named(label) => primary
-                    .as_ref()
-                    .ok_or_else(|| {
-                        EngineError::Load(format!(
-                            "prefill segment `{label}` declared before its own primary kernel"
-                        ))
-                    })?
-                    .open_named(label)
-                    .map_err(|e| EngineError::Load(format!("open prefill segment {label}: {e}")))?,
+        for slot in opened {
+            let r = match slot {
+                Some(r) => r,
+                None => primary.take().expect("segment_plan yields Primary at most once"),
             };
             arena.bind_resident(&r).map_err(|e| {
                 EngineError::Load(format!("bind prefill segment {} to the shared arena: {e}", r.kernel_name()))
