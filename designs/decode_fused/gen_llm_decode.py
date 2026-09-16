@@ -109,11 +109,13 @@ from iron.operators.gemv.design import MAX_GROUP_REUSE  # noqa: E402
 # mis-pointed IRON tree, which is the failure scripts/build_llm_decode.sh's gate exists to prevent.
 try:                                                                            # noqa: E402
     from iron.common.quant import (                                            # noqa: E402
-        quantize_weight, row_stride_bytes, derive_row_group, widest_chunk)      # noqa: E402
+        quantize_weight, row_stride_bytes, derive_row_group, widest_chunk,      # noqa: E402
+        dequantize_weight_chunked)                                             # noqa: E402
 except ModuleNotFoundError:                                                     # noqa: E402
     try:                                                                        # noqa: E402
         from iron.operators.gemv.quant import quantize_weight, row_stride_bytes  # noqa: E402
         derive_row_group = widest_chunk = None  # pre-move tree: no row_group_planar  # noqa: E402
+        dequantize_weight_chunked = None  # pre-move tree: no row_parallel_down either  # noqa: E402
     except ModuleNotFoundError as e:                                            # noqa: E402
         raise ModuleNotFoundError(
             "no weight packer in this IRON tree: tried iron.common.quant (post-6a347dc) and "
@@ -393,6 +395,11 @@ SLIDING_KV_CIRCULAR = os.environ.get("SLIDING_KV_CIRCULAR", "0") == "1"
 BUCKET_SCRATCH_ORDER = os.environ.get("BUCKET_SCRATCH_ORDER", "0") == "1"
 # Weight tile ROWS for the fused MLP. Trades against WEIGHT_DEPTH at constant L1.
 MLP_TILE_ROWS = int(os.environ.get("MLP_TILE_ROWS", "0"))
+# Row-parallel down: each core keeps only its own FF slice of `gh` and the partials are
+# summed over the hardware cascade, so the all-gathered FF-wide buffer disappears. Needs
+# post_norm (it reuses that path's gh_scratch round trip to broadcast the result back).
+MLP_ROW_PARALLEL = os.environ.get("MLP_ROW_PARALLEL", "0") == "1"
+MLP_D_CHUNKS = int(os.environ.get("MLP_D_CHUNKS", "8"))
 
 # Columns per softmax L1 acquire. 0 keeps the unchunked operator, whose in1/out tiles are the whole
 # attention row -- four `memref<w x bf16>` buffers in one core's L1, which caps the context at
@@ -689,6 +696,8 @@ def sequence_name(sp, NL, S, placer_flags, decode_layer_active=False, T=None, tm
         parts.append(f"wd{WEIGHT_DEPTH}")
     if MLP_TILE_ROWS:
         parts.append(f"tr{MLP_TILE_ROWS}")
+    if MLP_ROW_PARALLEL:
+        parts.append(f"rp{MLP_D_CHUNKS}")
     if SOFTMAX_SEGMENT:
         parts.append(f"smseg{SOFTMAX_SEGMENT}")
     if ATTN_RUNTIME_EXTENT:
@@ -1988,6 +1997,8 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                                           act=sp.act, post_norm=sp.sandwich_norms,
                                           context=ctx, weight_depth=WEIGHT_DEPTH,
                                           tile_rows_gu=MLP_TILE_ROWS,
+                                          **(dict(row_parallel_down=True, d_chunks=MLP_D_CHUNKS)
+                                             if MLP_ROW_PARALLEL else {}),
                                           **mlp_quant_kw)
     # The whole decoder layer (attention + MLP) as ONE fused device -- see FUSE_DECODE_LAYER above.
     op_decode_layer = None
@@ -2135,6 +2146,28 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         # the layer loop.
         for _hd in sorted({gk[0] for gk in geoms}):
             weights[f"ones_h{_hd}"] = np.ones(_hd, dtype=BF16)
+
+    def _pack_wd_row_parallel(hf, n_chunks):
+        """row_parallel_down's Wd: ONE buffer of `n_chunks` independently-quantized column-shard
+        blocks (design.py's ROW_PARALLEL_DOWN). This dump has no unchunked Wd to slice -- only
+        the unfused path's `down_chunks`-wide kchunks -- so reconstruct the float weight from
+        those and re-chunk at n_chunks. See fused-operators-cannot-read-our-quantized-weight-layout.
+        """
+        chunk_hf = [f"{hf}.kchunk{i}" for i in range(down_chunks)]
+        if not all(n in PACKED for n in chunk_hf):
+            raise SystemExit(f"{hf}: no {down_chunks}-way kchunk dump to rebuild a row-parallel "
+                              f"Wd from (row_parallel_down needs a header_first int4/int8 dump)")
+        if dequantize_weight_chunked is None:
+            raise SystemExit("row_parallel_down needs iron.common.quant.dequantize_weight_chunked "
+                              "(post-6a347dc IRON tree)")
+        packed = np.concatenate([np.asarray(npy_raw(n)) for n in chunk_hf])
+        spec = _spec("mlp")
+        w = dequantize_weight_chunked(packed, D, FF, spec.group_size, spec.dtype,
+                                      n_chunks=down_chunks,
+                                      scale_dtype=_BUILD_STATE["scale_dtype"])
+        return np.concatenate([_pack(np.ascontiguousarray(part), "mlp")
+                               for part in np.split(w, n_chunks, axis=1)])
+
     cur = "x"
     # (runlist index, residual buffer entering this layer) per layer, so the stack can be cut into
     # segments AFTER it is built. Recorded rather than reconstructed: the residual chain is
@@ -2166,13 +2199,22 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
             if key == "Wv" and not g.has_v:
                 continue     # attention_k_eq_v: no v_proj tensor exists for this layer
             hf = f"{sp.weight_prefix}layers.{l}.{tensor}.weight"
-            if {"Wd": down_chunks, "Wo": g.o_chunks}.get(key, 1) > 1:
+            if key == "Wd" and mlp_dp_why is None and MLP_ROW_PARALLEL:
+                # swiglu_mlp_dp's row_parallel_down path owns its own K-split (the hardware
+                # cascade, not down_chunks) and wants ONE buffer of MLP_D_CHUNKS column-shard
+                # blocks -- see _pack_wd_row_parallel.
+                weights[p + key] = _pack_wd_row_parallel(hf, MLP_D_CHUNKS)
+                continue
+            # down_chunks only applies to op_down's unfused GEMV (mlp_dp_why is not None); the
+            # plain fused swiglu_mlp_dp wants Wd as ONE buffer like Wg/Wu, below.
+            _wd_chunks = down_chunks if (key == "Wd" and mlp_dp_why is not None) else 1
+            if {"Wd": _wd_chunks, "Wo": g.o_chunks}.get(key, 1) > 1:
                 # Each chunk is its own contiguous tensor. A pre-chunked dump names them
                 # `<tensor>.kchunkN` and we take those bytes as-is; otherwise the split happens
                 # here, along K, BEFORE quantizing -- so each chunk carries its own per-group
                 # scales, exactly as the kernel reads it. Splitting AFTER packing would cut
                 # through a group.
-                nch = {"Wd": down_chunks, "Wo": g.o_chunks}[key]
+                nch = {"Wd": _wd_chunks, "Wo": g.o_chunks}[key]
                 chunk_hf = [f"{hf}.kchunk{i}" for i in range(nch)]
                 if all(n in PACKED for n in chunk_hf):
                     for i, n in enumerate(chunk_hf):
