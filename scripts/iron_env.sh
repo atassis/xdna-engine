@@ -10,12 +10,6 @@ export PATH="$REPO/.venv-iron/bin:$REPO/.venv-iron/cc-shim:$PATH"   # aiecc + gc
 INST="$("$REPO/scripts/toolchain_up.sh")" || { echo "iron_env: toolchain_up.sh failed" >&2; return 1; }
 [ -n "$INST" ] || { echo "iron_env: empty instance dir from toolchain_up.sh" >&2; return 1; }
 export PYTHONPATH="$INST/python:${PYTHONPATH:-}"   # aie resolves to the fork instance (place-tiles), not the wheel
-aiecc_resolve "$INST" || exit 1
-export MLIR_AIE_INSTANCE="$INST"   # kernel .cc sources resolve here, at the pin -- see design_override.mk
-export PEANO_INSTALL_DIR="$REPO/.venv-iron/lib/python3.14/site-packages/llvm-aie"
-# Arch xrt cmake export is broken (missing static .a); point common.cmake at the shared .so
-export XRT_INC_DIR=/usr/include
-export XRT_LIB_DIR=/usr/lib
 # aiebu-asm assembles the control-code ELF (the `insts.elf` edge of aiecc). It ships with XRT, not
 # with mlir-aie, and a distro XRT package may not install it -- when it is missing, aiecc runs the
 # whole pipeline and only then dies with "tool 'aiebu-asm' not found in search paths or PATH", which
@@ -28,6 +22,12 @@ export XRT_LIB_DIR=/usr/lib
 # enough, and without it the search below sees an empty AIEBU_ASM_DIR and every aiecc run
 # dies on its LAST edge with exactly the message above.
 . "$REPO/scripts/amd_paths.sh"
+aiecc_resolve "$INST" || exit 1
+export MLIR_AIE_INSTANCE="$INST"   # kernel .cc sources resolve here, at the pin -- see design_override.mk
+export PEANO_INSTALL_DIR="$REPO/.venv-iron/lib/python3.14/site-packages/llvm-aie"
+# Arch xrt cmake export is broken (missing static .a); point common.cmake at the shared .so
+export XRT_INC_DIR=/usr/include
+export XRT_LIB_DIR=/usr/lib
 if ! command -v aiebu-asm >/dev/null 2>&1; then
   for _d in "${AIEBU_ASM_DIR:-}" "${XILINX_XRT:-/opt/xilinx/xrt}/bin"; do
     [ -n "$_d" ] && [ -x "$_d/aiebu-asm" ] && { export PATH="$_d:$PATH"; break; }
