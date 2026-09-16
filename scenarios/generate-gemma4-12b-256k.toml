@@ -1,0 +1,56 @@
+[scenario]
+kind = "generate"
+name = "gemma4-12b-256k"
+
+# Gemma-4-12B at a 262144-token context capacity. SAME weights, SAME tokenizer and the same graph
+# as `gemma4-12b`; the only difference is `--max-seq 262144` plus `SOFTMAX_SEGMENT=1024`.
+#
+# THIS IS A SEPARATE MODEL ON PURPOSE. It is not an upgrade of `gemma4-12b` and must not replace
+# it -- see the price below. `gemma4-12b` stays the default at S=6912 and ~355 ms/token.
+#
+#   build  SOFTMAX_SEGMENT=1024 GQA_GROUPED_K=1 GQA_GROUPED_V=1 FUSE_QKV_DP=0 SPLIT_LM_HEAD=0 \
+#            SLIDING_KV_CIRCULAR=1 GEN_EXTRA="--max-seq 262144" \
+#            WEIGHTS=$PWD/artifacts/gemma4-12b/weights_int4g32sbf16_planar_qat_rg \
+#            bash scripts/build_llm_decode.sh gemma4-12b 48 \
+#              $PWD/artifacts/gemma4-12b/decode_int4g32qat_s262144_l48_rg_mc_smseg1024
+#
+# SOFTMAX_SEGMENT=1024 IS LOAD-BEARING. Without it the global geometry's softmax holds in1+out at
+# depth 2, each memref<S x bf16>, and S is capped at 8063; a second, non-decomposable wall (a
+# 16384-word core-tile DMA BD against a 14-bit field) sits behind that at S~32768. Chunking clears
+# both -- L1 goes 9744 B FLAT at every S -- and the output is BIT-IDENTICAL to the unchunked op
+# (225/225 at 0.000e+00), because softmax_simple_bf16 already walked its row three times and
+# chunking only moves the cross-pass state from a register into memory.
+#
+# THE PRICE, AND READ IT BEFORE USING THIS MODEL. Cost tracks the CAPACITY, not the position.
+# `op_scores = gemv(S, HD, ...)` is a build-time shape, so the kernel computes S rows on EVERY
+# token and the mask discards the surplus afterwards. A token at n_past=20 costs the same as one
+# at n_past=200000. Projected from the measured 2048 -> 6912 raise (+58.65 ms/token over 4864
+# positions = ~12.1 us/position across the 8 global layers), that is roughly +3.1 s/token at every
+# position, against `gemma4-12b`'s ~355 ms. The 40 sliding layers are circular at window 1024 and
+# contribute nothing per token at any S; only the 8 global layers scale.
+#
+# So this model exists to make a large context REACHABLE, not fast. The fix that makes it fast is
+# to let the reduction follow n_past instead of S -- the softmax half already takes a runtime width
+# (`sm_mask`, a ScratchpadParameter), the scores GEMV is the half that does not. Once that lands,
+# a token at n_past=1000 should cost ~12 ms more than today rather than ~3.1 s more, and this
+# scenario's price paragraph wants re-measuring rather than re-quoting.
+#
+# ALSO NOT ADDRESSED HERE: there is no batched prefill on this path, so a long PROMPT is still
+# primed one token at a time. Long conversations accumulate fine; pasting 100k tokens does not.
+#
+# TOOLCHAIN: built on MLIR_AIE_FORK_COMMIT ea0dbced832a (the 2026-09-15 repin), which differs from
+# the `gemma4-12b` default's ea0dbced832a-predecessor 6ce38ed5776. Each artifact is a self-contained
+# ELF carrying its own toolchain hash in meta.json, so the two coexist; `npu generate --stats`
+# prints which one ran.
+#
+# NOT DEVICE-GATED. Built, placed and linked; never run on hardware, no 1:1 determinism check
+# against the S=6912 arm, no measured latency. The ms/token figures above are PROJECTIONS from the
+# S=6912 ladder, not measurements of this artifact.
+
+[artifacts]
+decode = "artifacts/gemma4-12b/decode_int4g32qat_s262144_l48_rg_mc_smseg1024"
+weights = "artifacts/gemma4-12b/weights_int4g32sbf16_planar_qat_rg"
+tokenizer_dir = "artifacts/gemma4-12b/tokenizer"
+
+[generation]
+max_tokens = 512
