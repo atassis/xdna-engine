@@ -248,8 +248,47 @@ name = "gemma4-12b"
 # reverted by the next install and leaves no trace in git. That happened: int4 g32 QAT shipped
 # 2026-09-15 by editing the staged file alone, and an install on the same day silently put the
 # engine back on int8 g64. Flip a default HERE, then install.
+# BATCHED PREFILL, SHIPPED 2026-09-17 -- the first one on this model that completes AND is gated.
+#   36.08-36.12 ms/token, flat across P=64/128/256 (2311.87 / 4617.93 / 9237.12 ms at 1/2/4 chunks,
+#   exactly linear in chunks), against 345.2 ms/token priming one token at a time: 9.56x.
+#   A 280-token image goes from ~97 s of ttft to ~10 s.
+#
+# WHAT MADE IT POSSIBLE is PREFILL_SEGMENTS=4, not a faster kernel. One 48-layer dispatch moves
+# 16.00 GB and needs ~2.31 s against the driver's ~2.04 s TDR watchdog -- 13% over, so it was
+# killed every time and had NEVER produced a correct token. Four dispatch variants of 12 layers in
+# ONE ELF over ONE arena (extra_runlists; the residual seam stays in scratch) each fit, and
+# mode-switching inside one hardware context is measured free.
+#   build  PREFILL_SEGMENTS=4 IRON=$WS/wt-iron-integ SPEC=gemma4-12b NO_GOLDEN=1 \
+#            WEIGHTS=/nonexistent QUANT_WEIGHTS=$A/weights_int4g32qat_hf \
+#            DECODE_META=$A/decode_int4g32qat_s6912_l48_rg_mc_repin/meta.json \
+#            bash scripts/build_prefill.sh 48 64 6912 $A/prefill_m64_s6912_l48_seg4
+#
+# GATED, on device, against THIS decode: prefill_token_gate_probe + gate_token_set.py at P=256 gives
+# EXACT token parity 8/8, top-1 8/8; P=64 PASSES on the top-5 rule (top-1 7/8, diverging at step 0
+# as the device's rank-4). P=64 is the weaker row by construction -- the probe batches at every
+# length, so it primes 63 real rows into a 64-wide batch, a padding ratio the shipped policy never
+# reaches.
+#
+# IT WAS BUILT AGAINST `..._mc_repin`, NOT AGAINST THIS DECODE, and that is safe for a checked
+# reason rather than by luck: prefill borrows the decode's arena, and the two decode metas are
+# IDENTICAL buffer-for-buffer -- 832 buffers, zero differences in (offset, len, type), because
+# ATTN_RUNTIME_EXTENT was a pure compute change. meta.json's `decode_artifact.elf_md5` therefore
+# does NOT match; it is written as provenance and never read as a gate. The pairing was then proven
+# on device against this artifact, which is the evidence that matters.
+#
+# LIMITS, read them before assuming this covers a long prompt:
+#   - M=64. The batch is 64 tokens; a prompt is chunked and the tail padded. M=256 is the design
+#     point and is UNBUILT here -- at M=256 the graph is 39.94 GiB and needs its own split sizing.
+#   - Batched prefill covers positions [0, 1024) only, not the full S=6912: past the narrowest
+#     geometry's capacity its circular cache holds a wrapped interval that the suffix mask cannot
+#     express. The host stops there (npu_prefill.rs::batchable_window) and finishes stepwise.
+#   - S=6912. This artifact does NOT serve `gemma4-12b-256k`, whose decode is a different S and a
+#     different arena. A 256k prefill is a separate build that does not exist.
+#   - Rollback: delete the `prefill =` line and reinstall. Decode is untouched either way.
+
 [artifacts]
 decode = "artifacts/gemma4-12b/decode_s6912_l48_are"
+prefill = "artifacts/gemma4-12b/prefill_m64_s6912_l48_seg4"
 weights = "artifacts/gemma4-12b/weights_int4g32sbf16_planar_qat_rg"
 tokenizer_dir = "artifacts/gemma4-12b/tokenizer"
 
