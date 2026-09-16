@@ -88,17 +88,22 @@ name = "gemma4-12b"
 #      (hash 2cebeef9d83c, ABAB 150 tok/rep, n=150 each). **-52.93 ms, -12.96%** against (6)
 #      re-measured in the same session at 408.417 -- A 408.567/408.267 (drift 0.07%),
 #      B 355.419/355.556, both B reps below both A reps with no overlap.
-#      THREE CHANGES, NOT ONE, and the split is UNMEASURED. `m_chunk=256 rows_per_chunk=16` lets
-#      the 8 global layers take TMatVec instead of the gemv_tile_output + Transpose fallback --
-#      but building from main ALSO enabled mlpdp4 and mlpo, because fix/mlp-dp-gate-operator-params
-#      landed after (6) was built. Two isolation arms are built and unmeasured:
-#      decode_int4g32qat_s6912_l48_rg_mcpure (m_chunk alone) and _mconly (m_chunk + mlpo).
+#      ATTRIBUTION CORRECTED 2026-09-16: this arm's change is `m_chunk=256 rows_per_chunk=16`,
+#      letting the 8 global layers take TMatVec instead of the gemv_tile_output + Transpose
+#      fallback. It was recorded as THREE changes -- m_chunk plus mlpdp4 plus mlpo -- and the
+#      MLP-fusion half was never in the graph. `strings` on this artifact's own decode.elf returns
+#      GEMV, RMSNorm, TMatVec, Softmax, RoPE and ZERO swiglu/mlp_dp; a byte-identical L=6
+#      reproduction emits a fused MLIR with no swiglu in it either. The `mlpdp4_mlpo` in the
+#      sequence name is the name over-claiming: it is appended on sp.mlp_dp_reason(), while
+#      construction is gated on mlp_dp_why, which additionally refused swiglu_mlp_dp for having no
+#      layout/scale_dtype parameter. So the isolation arms _mcpure and _mconly split out a term
+#      that does not exist, and -52.93 ms is m_chunk. See the KB note on one predicate per name.
 #      QUALITY IS NOT GATED. Shipped on device-time alone, owner's call, same as (2) was.
 #      The arms produce different text at temperature 0 (divergence at char 155) -- expected for a
 #      bf16 reduction-order change, not a verdict either way, and NOT to be judged by reading
 #      samples: see the two traps below, one of which is exactly this mistake.
-#      The generator predicted -114.91 ms on the byte term alone; measured is -52.93 INCLUDING the
-#      MLP fusion, so do not quote the byte prediction as an expectation.
+#      The generator predicted -114.91 ms on the byte term alone; measured is -52.93, so do not
+#      quote the byte prediction as an expectation.
 #      Rollback: point decode= back at decode_int4g32qat_s6912_l48_rg and restart.
 # (3) beats (2)'s speed while staying on (1)'s quality-gated format -- no quality tradeoff needed.
 # Row_group_planar measures ~3% faster than header_first even at g32, where the width argument
@@ -131,6 +136,26 @@ name = "gemma4-12b"
 #               layers), not bytes -- KV traffic FELL 704 -> 448 MB/token across it.
 #   2026-09-15  int4 g32 QAT: arena 14.2 -> 8.07 GB, weight rel-L2 0.599 -> 0.211%.    410.00 ms/tok
 #               A 35.7% byte cut converted at 2.2% -- shipped for arena, not speed.         -4.60%
+# CONTEXT CAPACITY: the 6912 ceiling is GONE as of 2026-09-16, and S is now a PRICE, not a wall.
+#   SOFTMAX_SEGMENT=<L> (0 = off, the default and what this arm ships) chunks the GLOBAL geometry's
+#   attention softmax. Without it the global op20_Softmax holds in1+out at depth 2, each
+#   memref<S x bf16>, so 4*(S*2)+1032 <= 65536 caps S at 8063; and a second, NON-decomposable wall
+#   sits behind that at S~32768 (a 16384-word core-tile DMA BD against a 14-bit field). Chunking
+#   clears both: L1 goes 9744 B FLAT at every S, and 48-layer builds succeed at
+#   S = 8192 / 16384 / 32768 / 65536 / 131072 / 262144. Output is BIT-IDENTICAL, 225/225 at
+#   0.000e+00 -- softmax_simple_bf16 already walks its row three times, so chunking only moves the
+#   cross-pass state from a register into memory. Arena is linear at 16896 B/position (the 8 global
+#   layers' K and V; the 40 sliding layers are circular at 1024 and cost nothing per token),
+#   10.69 GiB at S=262144. DEVICE-FREE ONLY -- no run on hardware, no 1:1 determinism check.
+#
+#   DO NOT SHIP A BIG S AS THE DEFAULT, and the reason is measured, not caution. Cost tracks the
+#   CAPACITY, not the position: `op_scores = gemv(S, HD, ...)` computes S rows EVERY token whatever
+#   n_past is. That is why the 2048 -> 6912 raise was a +58.65 ms/token REGRESSION -- about
+#   12.1 us per position across the 8 global layers. Extrapolated, S=262144 would add ~3.1 s/token
+#   at every position, including the first token of a 20-token prompt. Raising S is free to BUILD
+#   and expensive to RUN until the reduction follows n_past; the softmax half already takes a
+#   runtime width (sm_mask, a ScratchpadParameter), the scores GEMV is the half that does not.
+#
 # Tried and NOT adopted (kept here so they are not re-tried blind):
 #   int4 (any layout)        12.3% weight rel-L2 against a ~0.3% logit-accuracy budget; no group
 #                             size or calibration closes it -- SUPERSEDED 2026-09-15 by the QAT
