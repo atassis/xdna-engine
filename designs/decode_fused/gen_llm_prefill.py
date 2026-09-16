@@ -1333,6 +1333,30 @@ def count_configures(runlist, fused):
     return 1 + sum(1 for a, b in zip(ids, ids[1:]) if a != b) if ids else 0
 
 
+def gemm_l3_repeats(op):
+    """How many times the GEMM's runtime sequence re-streams each operand FROM DDR: (A, B).
+
+    Neither is a reuse count. `iron/operators/gemm/design.py` fills A with
+    `pattern_repeat=n_c_col_tiles_per_core` and re-issues `B_prods[col].fill()` inside the
+    `tile_row` loop, so each operand is re-READ once per output tile along the axis the OTHER
+    operand is tiled on. The MemTile is a conduit here, not a cache.
+    """
+    cols = op.num_aie_columns
+    return (max(1, op.N // (op.tile_n * cols)),      # n_c_col_tiles_per_core
+            max(1, op.M // (op.tile_m * 4)))         # n_c_row_tiles_per_core; n_aie_rows == 4
+
+
+def gemm_b_bytes(op):
+    """B's size in the unit GEMM declares it -- packed bytes when quantized, bf16 otherwise.
+
+    Same rule as the builder's own `b_bytes`; read off `get_arg_spec` so the two cannot disagree.
+    """
+    n = 1
+    for d in op.get_arg_spec()[1].shape:
+        n *= d
+    return n if op.weight_dtype != "bf16" else n * 2
+
+
 def operand_traffic(op, bufs, resolve):
     """Bytes each of `op`'s operands actually moves, one per name in `bufs`.
 
@@ -1341,11 +1365,22 @@ def operand_traffic(op, bufs, resolve):
     the head holds, and a head-major Wqkv role spans ~2.8x its own rows. StridedCopy is counted off
     its access pattern and GEMM off its shapes; everything else still reads its slice, which for a
     contiguous operand is the same number.
+
+    CORRECTED 2026-09-16. GEMM used to return `[M*K*2, K*N*2, M*N*2]`: bf16 assumed for all three
+    operands, one pass each. Both halves were wrong and they partly cancelled, which is why the
+    total looked plausible. A quantized B read as bf16 is 3.56x its packed size, so `L0_Wg_qp`
+    (35.16 MiB on disk) was counted at 112.50; and ignoring `gemm_l3_repeats` hid a 30x re-read of
+    A at the gate/up/down sites. Corrected, gemma4-12b prefill at M=256/S=6912 reads 38.67 GiB per
+    dispatch against the 35.38 GiB this function used to report, and the composition changes
+    completely: A 16.33 GiB where one pass is 1.73, B 13.73 where one pass is 8.02.
     """
     if isinstance(op, StridedCopy):
         return [int(np.prod(op.input_sizes)) * 2] * len(bufs)
     if isinstance(op, GEMM):
-        return [op.M * op.K * 2, op.K * op.N * 2, op.M * op.N * 2]
+        a_rep, b_rep = gemm_l3_repeats(op)
+        wa = np.dtype(ml_dtypes.bfloat16 if op.dtype_in == "bf16" else op.dtype_in).itemsize
+        wc = np.dtype(ml_dtypes.bfloat16 if op.dtype_out == "bf16" else op.dtype_out).itemsize
+        return [op.M * op.K * wa * a_rep, gemm_b_bytes(op) * b_rep, op.M * op.N * wc]
     out = []
     for name in bufs:
         if "[" in name:
@@ -1382,6 +1417,40 @@ def op_census(runlist, resolve, n_layers):
               f"{100 * b / total:>6.1f}%")
     print(f"[census] {'TOTAL':<22} {len(runlist) // n_layers:>6} "
           f"{total / n_layers / 2**20:>10.2f} {100.0:>6.1f}%")
+    gemm_l3_reread_census(runlist, n_layers, total)
+
+
+def gemm_l3_reread_census(runlist, n_layers, total):
+    """The GEMM operands, split by A/B/C and by how often each is re-read from DDR.
+
+    The line above ranks by OPERATOR, which cannot show this: a site is expensive here because the
+    runtime sequence re-issues its fill, not because the operator is slow. `gemm_l3_repeats` owns
+    the two factors.
+    """
+    sites, a_tot, a_once, b_tot, b_once, c_tot = {}, 0, 0, 0, 0, 0
+    for op, *bufs in runlist:
+        if not isinstance(op, GEMM):
+            continue
+        a_rep, b_rep = gemm_l3_repeats(op)
+        a, b, c = op.M * op.K * 2, gemm_b_bytes(op), op.M * op.N * 2
+        a_tot += a * a_rep; a_once += a
+        b_tot += b * b_rep; b_once += b
+        c_tot += c
+        key = (bufs[1].split("[")[0].split("_", 1)[-1], a_rep, b_rep)
+        sites[key] = sites.get(key, 0) + a * a_rep + b * b_rep + c
+    if not sites:
+        return
+    mb = lambda v: v / n_layers / 2**20
+    print(f"[census] GEMM L3 traffic, per layer -- A x{'N//(tile_n*cols)':>18}, "
+          f"B x{'M//(tile_m*4)':>14}")
+    print(f"[census]   A {mb(a_tot):>8.2f} MB   one pass {mb(a_once):>8.2f}   "
+          f"re-read {a_tot - a_once:>12} B ({100 * (a_tot - a_once) / total:.1f}% of the graph)")
+    print(f"[census]   B {mb(b_tot):>8.2f} MB   one pass {mb(b_once):>8.2f}   "
+          f"re-read {b_tot - b_once:>12} B ({100 * (b_tot - b_once) / total:.1f}% of the graph)")
+    print(f"[census]   C {mb(c_tot):>8.2f} MB")
+    print(f"[census] {'worst re-read sites':<24}{'Arep':>5}{'Brep':>5}{'MB/layer':>10}")
+    for (nm, ar, br), v in sorted(sites.items(), key=lambda kv: -kv[1])[:8]:
+        print(f"[census]   {nm:<22}{ar:>5}{br:>5}{mb(v):>10.2f}")
 
 
 def operand_bytes(runlist, resolve, shared):
@@ -1401,17 +1470,23 @@ def operand_bytes(runlist, resolve, shared):
     """
     out = {"weights": 0, "cache": 0, "scores": 0, "activations": 0}
 
-    def klass(name):
+    def klass(name, is_gemm_b):
         base = name.split("[")[0]
         if base.endswith("_kc") or base.endswith("_vc"):
             return "cache"
         if base == "sc" or base == "sw" or base.startswith(("sc_hd", "sw_hd")):
             return "scores"
-        return "weights" if base in shared else "activations"
+        # A GEMM's B operand IS the weight, whoever owns the buffer. Membership in `shared` used
+        # to stand in for this and answered a different question -- prefill repacks its own
+        # quantized weights (`*_qp`, 6.81 GB of them), so none of them are decode's and all of
+        # them read as activations. That is how `bytes.weights` came to report 0.3% of a stream
+        # that is 61.6% weights.
+        return "weights" if (is_gemm_b or base in shared) else "activations"
 
     for op, *bufs in runlist:
-        for name, moved in zip(bufs, operand_traffic(op, bufs, resolve)):
-            out[klass(name)] += moved
+        gemm = isinstance(op, GEMM)
+        for i, (name, moved) in enumerate(zip(bufs, operand_traffic(op, bufs, resolve))):
+            out[klass(name, gemm and i == 1)] += moved
     return out
 
 
