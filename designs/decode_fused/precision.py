@@ -271,8 +271,13 @@ def plan_from_env(env: Optional[Mapping[str, str]] = None) -> Tuple[Dict[str, Sp
 _LOAD_BYTES = {"int4": 32, "int4a": 32, "int8": 64, "int8a": 64}
 
 
-def wire_row_units(spec: Spec, K: int) -> int:
+def wire_row_units(spec: Spec, K: int, scale_dtype: str = "f32") -> int:
     """Wire units in one weight ROW of width K, refusing an illegal row.
+
+    `scale_dtype` is the dump's, not the Spec's: the per-site plan carries dtype and group_size,
+    while the scale width is one build-wide property of the packed dump (gen_llm_decode's
+    _BUILD_STATE). A caller that reshapes real packed bytes must pass it -- a bf16-scale row is
+    n_groups*2 B shorter than the f32 default, and the reshape is where that disagreement lands.
 
     UNITS, not bytes: bf16 elements for an unquantized weight and packed bytes for a quantized
     one, because those are the units each array is actually indexed in. Returning bytes for both
@@ -294,7 +299,7 @@ def wire_row_units(spec: Spec, K: int) -> int:
         pass
     else:
         try:
-            return row_stride_bytes(K, spec.group_size, spec.dtype)
+            return row_stride_bytes(K, spec.group_size, spec.dtype, scale_dtype)
         except ValueError as exc:
             raise PrecisionRefusal("P007", f"{spec} at K={K}: {exc}") from exc
     if K % spec.group_size:

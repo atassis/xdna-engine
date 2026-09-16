@@ -195,6 +195,19 @@ def _site_of(buffer_name):
                                if buffer_name.startswith("L") else buffer_name)
 
 
+def _stream_pad_rows(wqkv, op):
+    """attn_block_dp strides its L3 Wqkv by the SHARED STREAM TILE, not by the packed row: one
+    acquire is exactly one padded row (design.py's quant_tile_bytes). The fill is never read --
+    mv_quant takes K from -DDIM_K, not from the tile's extent."""
+    if op is None or op.weight_dtype == "bf16":
+        return wqkv
+    from iron.operators.attn_block_dp.design import quant_tile_bytes
+    WB, TB, _ = quant_tile_bytes(op.D, op.HD, op.group_size, op.weight_dtype, op.scale_dtype,
+                                 op.max_seq)
+    assert wqkv.shape[1] == WB, f"packed row {wqkv.shape[1]} B, operator expects {WB} B"
+    return np.pad(wqkv, ((0, 0), (0, TB - WB)))
+
+
 def _pack(w, site):
     """Host-side pack of one weight under its site's spec, into the packer's wire format."""
     spec = _spec(site)
@@ -1449,12 +1462,13 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
     # The qkv arm is decided PER GEOMETRY: its rule is `d_model % head_dim`, so two head_dims can
     # genuinely disagree about it. The mlp arm's rules (sandwich norms, activation) touch no
     # attention geometry, so it stays one verdict for the build.
-    if not FUSE_QKV_DP:
-        qkv_dp_why = {g: "FUSE_QKV_DP=0" for g in geoms}
-    elif not FUSE_QKV_GEMV:
-        qkv_dp_why = {g: "needs FUSE_QKV_GEMV=1 for the concatenated Wqkv" for g in geoms}
-    else:
-        qkv_dp_why = {g: sp.qkv_dp_reason(COLS, head_dim=g[0]) for g in geoms}
+    # Split in two because attn_block_dp REPLACES qkv_head_dp and so shares the SHAPE rules but
+    # not the A/B switch: FUSE_QKV_DP is not one of its preconditions, FUSE_ATTN_BLOCK is.
+    # FUSE_QKV_GEMV is shared -- both arms read one concatenated Wqkv.
+    qkv_shape_why = ({g: "needs FUSE_QKV_GEMV=1 for the concatenated Wqkv" for g in geoms}
+                     if not FUSE_QKV_GEMV else
+                     {g: sp.qkv_dp_reason(COLS, head_dim=g[0]) for g in geoms})
+    qkv_dp_why = {g: "FUSE_QKV_DP=0" for g in geoms} if not FUSE_QKV_DP else qkv_shape_why
     mlp_dp_why = "FUSE_MLP_DP=0" if not FUSE_MLP_DP else sp.mlp_dp_reason()
     if mlp_dp_why is None:
         from iron.operators.swiglu_mlp_dp.op import SwiGLUMLPDataParallel
@@ -1489,7 +1503,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                 )
 
     # Per-GEOMETRY eligibility for attn_block_dp used WITHOUT decode_layer_dp. Same clauses
-    # decode_layer_why checks below for the one geometry it requires, reused via qkv_dp_why/
+    # decode_layer_why checks below for the one geometry it requires, reused via qkv_shape_why/
     # _tmv_declined rather than re-derived, so the two verdicts cannot drift apart -- but with no
     # opinion on the MLP half (no mlp_dp_why, no FUSE_MLP_O) and no single-geometry requirement, so
     # a spec whose layers disagree about attention geometry can fuse some and fall back on others.
@@ -1500,14 +1514,9 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
     def _attn_block_why(g):
         hd, hkv, has_v = g
         return ("FUSE_ATTN_BLOCK=0" if not FUSE_ATTN_BLOCK else
-                qkv_dp_why[g] if qkv_dp_why[g] else
+                qkv_shape_why[g] if qkv_shape_why[g] else
                 f"needs Hkv ({hkv}) == COLS ({COLS})" if hkv != COLS else
                 "attn_block_dp always fuses K and V; this geometry has no v_proj" if not has_v else
-                # Same gap op_qkv_dp already raises on below: attn_block_dp's Wqkv arg is a flat
-                # bf16 buffer (get_arg_spec, design.py's W_L3_ty), no weight_dtype axis either.
-                f"the precision plan sets qkv to {_spec('qkv')} but attn_block_dp has no "
-                "weight_dtype axis (same gap as QKVHeadDataParallel) -- it would consume packed "
-                "bytes as bf16 values" if _spec("qkv").quantized else
                 "needs SCALE_IN_QNORM=1 (attn_block_dp has no separate scale stage)"
                 if not (SCALE_IN_QNORM and sp.qk_norm) else
                 "needs GQA_GROUPED_K=1 and TMV_CTX=1 (attn_block_dp computes exactly that "
@@ -1886,7 +1895,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                 tile_size_input=TSI, context=ctx, weight_depth=WEIGHT_DEPTH,
                 wqkv_head_major=True, kv_offset_parameter=slot, mask_parameter=mask_slot,
                 kv_alloc=None if KVA_g == w else KVA_g, kv_block_size=None if T_g == w else T_g,
-                v_norm=sp.v_norm)
+                v_norm=sp.v_norm, **_quant_kw("qkv"))
         g = SimpleNamespace(
             hd=hd, hkv=hkv, qd=qd, kvd=kvd, gqa=gqa, kv_slot=slot, o_chunks=o_chunks,
             op_qk_norm=op_qk_norm, op_qk_norm_b=op_qk_norm_b, op_qkv=op_qkv, op_q=op_q,
@@ -2144,7 +2153,9 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         # The gainless v-norm's gain, one per head_dim and shared by EVERY layer -- a true constant,
         # unlike the per-layer learned gains beside it, so it is registered once here rather than in
         # the layer loop.
-        for _hd in sorted({gk[0] for gk in geoms}):
+        # Only the geometries the UNFUSED arm carries: attn_block_dp holds the gain as a
+        # compile-time L1 constant, so a fused geometry has no L3 buffer here to look up.
+        for _hd in sorted({gk[0] for gk in geoms if attn_block_why[gk] is not None}):
             weights[f"ones_h{_hd}"] = np.ones(_hd, dtype=BF16)
 
     def _pack_wd_row_parallel(hf, n_chunks):
@@ -2287,14 +2298,16 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                 # blocks per core. Per GEOMETRY -- gqa and the row height are g.hd/g.hkv,
                 # not the spec-wide pair, or the reorder shuffles row fragments.
                 gqa_ = Hq // g.hkv
-                row_w = precision.wire_row_units(_spec("qkv"), D)
+                row_w = precision.wire_row_units(_spec("qkv"), D,
+                                                 _BUILD_STATE["scale_dtype"])
                 wq2, wk2, wv2 = (a.reshape(-1, row_w) for a in qkv_parts)
                 parts = []
                 for c in range(g.hkv):
                     parts += [wq2[(gqa_ * c + gi) * g.hd:(gqa_ * c + gi + 1) * g.hd]
                               for gi in range(gqa_)]
                     parts += [wk2[c * g.hd:(c + 1) * g.hd], wv2[c * g.hd:(c + 1) * g.hd]]
-                weights[p + "Wqkv"] = np.concatenate(parts, axis=0).reshape(-1)
+                weights[p + "Wqkv"] = _stream_pad_rows(
+                    np.concatenate(parts, axis=0), g.op_attn_block).reshape(-1)
             else:
                 weights[p + "Wqkv"] = np.concatenate(qkv_parts)
         # Size is layout-independent (T < S rearranges the same elements), but it is
