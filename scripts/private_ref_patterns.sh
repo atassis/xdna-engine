@@ -56,4 +56,10 @@ private_ref_wikilink_re='\[\[[a-z0-9][a-z0-9-]*\]\]'
 # There is no note named `slug`; it is how the guard's own documentation and commit messages
 # refer to the shape being matched, so describing the rule trips it. Same self-reference as
 # aa87154 ("allowlist [[package]], which blocked the commit that added it").
-private_ref_benign_wikilink_re='\[\[(bin|model|last|nxt|package|slug)\]\]'
+# Sixth, verified 2026-09-16: the C++ standard attributes, which have the wikilink shape --
+# `[[noreturn]]` in scripts/dispatch_arms.cpp blocked a scenario-file edit that contained no
+# wikilink at all. Only the attributes the pattern above CAN match are listed: it allows
+# [a-z0-9-] only, so `maybe_unused`, `no_unique_address` and `carries_dependency` cannot match and
+# are deliberately absent rather than listed for symmetry. Checked against the private KB before
+# allowlisting: none of the seven is an exact slug there.
+private_ref_benign_wikilink_re='\[\[(bin|model|last|nxt|package|slug|noreturn|nodiscard|deprecated|fallthrough|likely|unlikely|assume)\]\]'

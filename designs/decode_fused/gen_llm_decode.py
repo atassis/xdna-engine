@@ -1070,6 +1070,16 @@ def gemv(M, K, ctx, **kw):
                 tile_size_output=tso, context=ctx, **kw)
 
 
+def _swiglu_default_tile_rows_gu():
+    """swiglu_mlp_dp's own default Wg/Wu row batch, read off the design module.
+
+    Hardcoding 6 here would be a second copy of a constant the operator owns, and the two would
+    drift the first time either moved.
+    """
+    from iron.operators.swiglu_mlp_dp import design as _swiglu_design
+    return _swiglu_design.TSI_GU
+
+
 def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_plan=None):
     """Construct the fused decode graph + its weight dict for a spec.
 
@@ -1399,6 +1409,21 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                 f"swiglu_mlp_dp takes no {'/'.join(_unaccepted)} parameter, so it cannot read the "
                 f"{_BUILD_STATE['layout']}/{_BUILD_STATE['scale_dtype']} dump this build packs"
             )
+        # The tiling this build will actually ask for, checked HERE rather than left to fire as an
+        # AssertionError inside design.py. On the unchunked, non-row-parallel path a Wd row batch is
+        # TSI_GU//R, so TSI_GU must be a whole number of R=FF/D; MLP_TILE_ROWS=0 means the
+        # operator's own module default. Gemma-4 (R=4) meets the default TSI_GU=6 here: the gate
+        # stayed shut on the _unaccepted clause above until swiglu_mlp_dp grew layout/scale_dtype,
+        # and the first build after it opened died 250 lines inside the design function.
+        elif os.environ.get("MLP_ROW_PARALLEL", "0") != "1":
+            _tsi_gu = MLP_TILE_ROWS or _swiglu_default_tile_rows_gu()
+            if FF % D == 0 and _tsi_gu % (FF // D) != 0:
+                mlp_dp_why = (
+                    f"MLP_TILE_ROWS={_tsi_gu} is not a multiple of R=FF/D={FF // D}, which "
+                    f"swiglu_mlp_dp's unchunked down projection requires (design.py's TSI_D). "
+                    f"Set MLP_TILE_ROWS to a multiple of {FF // D}, or use MLP_ROW_PARALLEL=1, "
+                    f"whose local matvec has no relationship to R"
+                )
 
     # Per-GEOMETRY eligibility for attn_block_dp used WITHOUT decode_layer_dp. Same clauses
     # decode_layer_why checks below for the one geometry it requires, reused via qkv_dp_why/
@@ -1844,20 +1869,18 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         # transpose has nothing left to do. One kv head per column (n_matrices == cols == Hkv), so each
         # column streams its own head ONCE and applies both query heads' softmax rows out of L1 -- the
         # stride-0 group re-read goes too. rows_per_chunk=64 puts the L1 A tile at 16 KB double-buffered.
-        if TMV_CTX:
-            # TMV_RPC is a CAP, not the value: the largest chunk that fits L1 depends on head_dim, and
-            # 64 is right for Qwen3's HD=128 and too big for Gemma-3's 256. check_l1_fits is the
-            # operator's own arithmetic, so ask it rather than carrying a second copy of the L1 model
-            # here -- or an env constant that was correct for one model and silently wrong for the next.
-            from iron.operators.tmatvec.design import check_l1_fits
-            rpc = TMV_RPC
-            while rpc > 1 and (S % rpc or check_l1_fits(HD, S, sp.gqa_group, rpc) is not None):
-                rpc //= 2
-            if rpc != TMV_RPC:
-                print(f"[gen] TMatVec rows_per_chunk {TMV_RPC} -> {rpc} (L1 fit at head_dim={HD})")
+        _tmv = tmv_rpc.get(HD) if TMV_CTX else None
+        if _tmv is not None:
+            # tmv_rpc is the ONE OWNER of this verdict and it already ran the two-dimensional
+            # (rows_per_chunk, m_chunk) search per geometry. Re-deriving it here with an
+            # rows_per_chunk-only loop is the duplicate that dict's own comment warns about: it
+            # cannot reach m_chunk, so it halved to 1 and constructed anyway, and TMatVec threw
+            # `W (batch_group*K) 131072 B ... shrinking rows_per_chunk cannot help` at S=32768
+            # while BOTH geometries had already fitted above at m_chunk=256.
+            rpc, mc = _tmv
             op_ctx = TMatVec(M=HD, K=S, num_aie_columns=Hkv, num_batches=Hq,
                              batch_group=sp.gqa_group, alloc_K=None if KVA == S else KVA,
-                             rows_per_chunk=rpc, context=ctx, block_size=T)
+                             rows_per_chunk=rpc, m_chunk=mc, context=ctx, block_size=T)
         else:
             op_ctx = gemv(HD, S, ctx, num_batches=Hq)
     # MLP weight-stream dtype axis (Wg/Wu/Wd -- "MLP weights" in the byte breakdown, the largest
@@ -2571,6 +2594,14 @@ def main():
     ap.add_argument("--weights", required=True, help="dir of dumped .npy weights (see dump_llm_weights.py)")
     ap.add_argument("--out", required=True)
     ap.add_argument("--layers", type=int, default=None, help="truncate the stack (bring-up)")
+    # S IS THREE THINGS AND THEY ARE NOT THE SAME NUMBER. It is the KV CAPACITY allocated, the
+    # WINDOW attention reads (sliding layers read sp.sliding_window, not S, under
+    # SLIDING_KV_CIRCULAR), and the REDUCTION LENGTH that sizes L1 tiling. They coincide only on a
+    # non-windowed geometry. `w` at the attn_ops construction site is the window; `KVA`/`alloc_K`
+    # is the capacity; a site that wants either MUST take it rather than reach for S.
+    # Passing S where the window belongs sizes a sliding layer's L1 for positions it can never
+    # reach, which is what held this model's context ceiling at 6912. See
+    # a-name-that-means-three-things-fails-at-the-site-without-the-comment.
     ap.add_argument("--max-seq", type=int, default=2048, help="KV-cache padded capacity S")
     a = ap.parse_args()
     os.makedirs(os.path.join(a.out, "buffers"), exist_ok=True)
