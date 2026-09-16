@@ -1844,20 +1844,18 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         # transpose has nothing left to do. One kv head per column (n_matrices == cols == Hkv), so each
         # column streams its own head ONCE and applies both query heads' softmax rows out of L1 -- the
         # stride-0 group re-read goes too. rows_per_chunk=64 puts the L1 A tile at 16 KB double-buffered.
-        if TMV_CTX:
-            # TMV_RPC is a CAP, not the value: the largest chunk that fits L1 depends on head_dim, and
-            # 64 is right for Qwen3's HD=128 and too big for Gemma-3's 256. check_l1_fits is the
-            # operator's own arithmetic, so ask it rather than carrying a second copy of the L1 model
-            # here -- or an env constant that was correct for one model and silently wrong for the next.
-            from iron.operators.tmatvec.design import check_l1_fits
-            rpc = TMV_RPC
-            while rpc > 1 and (S % rpc or check_l1_fits(HD, S, sp.gqa_group, rpc) is not None):
-                rpc //= 2
-            if rpc != TMV_RPC:
-                print(f"[gen] TMatVec rows_per_chunk {TMV_RPC} -> {rpc} (L1 fit at head_dim={HD})")
+        _tmv = tmv_rpc.get(HD) if TMV_CTX else None
+        if _tmv is not None:
+            # tmv_rpc is the ONE OWNER of this verdict and it already ran the two-dimensional
+            # (rows_per_chunk, m_chunk) search per geometry. Re-deriving it here with an
+            # rows_per_chunk-only loop is the duplicate that dict's own comment warns about: it
+            # cannot reach m_chunk, so it halved to 1 and constructed anyway, and TMatVec threw
+            # `W (batch_group*K) 131072 B ... shrinking rows_per_chunk cannot help` at S=32768
+            # while BOTH geometries had already fitted above at m_chunk=256.
+            rpc, mc = _tmv
             op_ctx = TMatVec(M=HD, K=S, num_aie_columns=Hkv, num_batches=Hq,
                              batch_group=sp.gqa_group, alloc_K=None if KVA == S else KVA,
-                             rows_per_chunk=rpc, context=ctx, block_size=T)
+                             rows_per_chunk=rpc, m_chunk=mc, context=ctx, block_size=T)
         else:
             op_ctx = gemv(HD, S, ctx, num_batches=Hq)
     # MLP weight-stream dtype axis (Wg/Wu/Wd -- "MLP weights" in the byte breakdown, the largest
