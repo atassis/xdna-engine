@@ -2569,6 +2569,14 @@ def main():
     ap.add_argument("--weights", required=True, help="dir of dumped .npy weights (see dump_llm_weights.py)")
     ap.add_argument("--out", required=True)
     ap.add_argument("--layers", type=int, default=None, help="truncate the stack (bring-up)")
+    # S IS THREE THINGS AND THEY ARE NOT THE SAME NUMBER. It is the KV CAPACITY allocated, the
+    # WINDOW attention reads (sliding layers read sp.sliding_window, not S, under
+    # SLIDING_KV_CIRCULAR), and the REDUCTION LENGTH that sizes L1 tiling. They coincide only on a
+    # non-windowed geometry. `w` at the attn_ops construction site is the window; `KVA`/`alloc_K`
+    # is the capacity; a site that wants either MUST take it rather than reach for S.
+    # Passing S where the window belongs sizes a sliding layer's L1 for positions it can never
+    # reach, which is what held this model's context ceiling at 6912. See
+    # a-name-that-means-three-things-fails-at-the-site-without-the-comment.
     ap.add_argument("--max-seq", type=int, default=2048, help="KV-cache padded capacity S")
     a = ap.parse_args()
     os.makedirs(os.path.join(a.out, "buffers"), exist_ok=True)
