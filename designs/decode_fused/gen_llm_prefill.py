@@ -135,6 +135,20 @@ from iron.operators.elementwise_add.op import ElementwiseAdd  # noqa: E402
 from iron.operators.strided_copy.op import StridedCopy  # noqa: E402
 
 BF16 = ml_dtypes.bfloat16
+
+# Cut the layer stack into this many DISPATCH VARIANTS inside ONE ELF. 1 (the default) is the
+# single control code every build had, byte-for-byte. This is the prefill twin of
+# gen_llm_decode.py's DECODE_SEGMENTS and is cheaper than it: decode gives each segment its own
+# OperatorSequence and its own arena, while `extra_runlists` puts every variant in one arena
+# computed over their union (sequence.py::calculate_buffer_layout walks `self.runlists.values()`),
+# so the residual seam stays SCRATCH and needs no arg on either side. `xs` is already one shared
+# buffer across prefill layers, so a cut needs no renaming either.
+#
+# What it buys is the driver's 2 s TDR watchdog (aie2_tdr.c). A 48-layer M=256 dispatch moves
+# 39.94 GiB and cannot finish inside it; four variants of 12 layers move 9.99 GiB each.
+PREFILL_SEGMENTS = int(os.environ.get("PREFILL_SEGMENTS", "1"))
+if PREFILL_SEGMENTS < 1:
+    raise SystemExit(f"PREFILL_SEGMENTS={PREFILL_SEGMENTS} must be >= 1")
 COLS = int(os.environ.get("PREFILL_COLS", "8"))
 # There is no TILE_M/TILE_K/TILE_N constant here any more. It used to be `64` for every GEMM in
 # the model -- q (K=1024,N=2048), o (K=2048,N=1024), gate/up (K=1024,N=3072), down (K=3072,N=1024),
@@ -1071,8 +1085,9 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
     def ang_buf(l):
         return ("rope_global" if sp.is_global(l) else "rope_local") if dual_rope else "rope"
 
-    rl, cache_names = [], []
+    rl, cache_names, layer_starts = [], [], []
     for l in range(NL):
+        layer_starts.append(len(rl))
         p = f"L{l}_"
         src = "x" if l == 0 else "xs"
         dst = "xout" if l == NL - 1 else "xs"
@@ -1227,9 +1242,26 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
     # ops * four numbers does not belong in a filename, and the tiles themselves are in meta.json.
     tile_sig = ";".join(f"{k}:{v['tile']}x{v['cols']}" for k, v in sorted(tiles.items()))
     name += "_t" + hashlib.md5(tile_sig.encode()).hexdigest()[:8]
-    fused = OperatorSequence(name, rl, input_args=inputs, output_args=["xout"],
+    if PREFILL_SEGMENTS > NL:
+        raise SystemExit(f"PREFILL_SEGMENTS={PREFILL_SEGMENTS} exceeds the {NL} layers there are "
+                         f"to split; a segment boundary only exists at a layer boundary")
+    # Contiguous and near-equal, remainder to the earliest segments -- 48 over 4 is 12/12/12/12 and
+    # 48 over 5 is 10/10/10/9/9. Same rule as DECODE_SEGMENTS so the two read alike.
+    _q, _r = divmod(NL, PREFILL_SEGMENTS)
+    cuts, _a = [], 0
+    for _i in range(PREFILL_SEGMENTS):
+        _b = _a + _q + (1 if _i < _r else 0)
+        cuts.append((_a, _b))
+        _a = _b
+    seg_rls = [rl[layer_starts[la]:(layer_starts[lb] if lb < NL else len(rl))] for la, lb in cuts]
+    # A graph knob, so it goes in the NAME for the reason this block already gives: IRON keys the
+    # cached artifact by name and an arm that collides runs the earlier binary.
+    if len(cuts) > 1:
+        name += f"_seg{len(cuts)}"
+    fused = OperatorSequence(name, seg_rls[0], input_args=inputs, output_args=["xout"],
                              buffer_sizes=bufsz, context=ctx, share_designs=True,
-                             scratch_order=(dec_order or None))
+                             scratch_order=(dec_order or None),
+                             extra_runlists={f"seg{i}": seg_rls[i] for i in range(1, len(cuts))})
     if do_compile:
         fused.compile()
     else:
@@ -1269,6 +1301,8 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
                 shared=[n for n in dec_order if not n.startswith("__decode_gap")],
                 reserved=dec_reserved, prefill_local=prefill_local, quant_pack=quant_pack,
                 rl=rl, runlist_len=len(rl), per_layer=len(rl) // NL,
+                segments=cuts, seg_kernels=["sequence"] + [f"seg{i}" for i in
+                                                            range(1, len(cuts))],
                 # TWO different numbers, and conflating them understated the configure count by
                 # 31x. `n_designs` is how many designs get BUILT -- `share_designs` collapses
                 # operators reporting the same design_key onto one. `n_configures` is how many
@@ -1843,6 +1877,13 @@ def main():
                  # flat addresses, which no gate below the token can see. This dict is a hand-
                  # written literal, not `dims` above -- adding a key there does not reach here.
                  "kv_block": dims["kv_block"],
+                 # The dispatch variants, in the order the host must run them. One entry is the
+                 # unsegmented artifact every build produced before; N entries mean N dispatches
+                 # of `main:<kernel>` against ONE hw_context and ONE arena, residual crossing in
+                 # scratch. A host that ignores this runs segment 0 and returns a tenth of a
+                 # forward pass, which looks like a bad answer rather than a missing one.
+                 "segments": [{"layers": [la, lb], "kernel": k}
+                              for (la, lb), k in zip(dims["segments"], dims["seg_kernels"])],
                  "tiles": dims["tiles"],
                  "tile_sources": sorted({v["source"] for v in dims["tiles"].values()}),
                  "tile_n_scores": dims["tn_sc"],
