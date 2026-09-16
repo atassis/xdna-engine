@@ -91,22 +91,28 @@ class TestOneFifoOneDtype:
 
 
 class TestDeclaringOperator:
-    def test_the_fused_attention_half_has_no_axis(self):
+    def test_the_kv_cache_has_no_axis(self):
         exc = refusal("P003", P.check, plan(qkv="int8a", kv="int8a"), FULL)
         assert "attn_block_dp" in str(exc)
 
     def test_qkv_is_reachable_only_on_a_plain_gemv(self):
         P.check(plan(qkv="int8a"), UNFUSED)
 
-    def test_qkv_head_dp_has_no_axis_either(self):
-        """The carrier that is neither the fused layer nor a plain GEMV. Missing it built an
-        artifact whose Wqkv buffer was packed to 4325376 B against a declared 8388608."""
-        exc = refusal("P003", P.check, plan(qkv="int8a"),
-                      replace(UNFUSED, fused_qkv_dp=True))
-        assert "qkv_head_dp" in str(exc)
+    def test_qkv_head_dp_now_has_the_axis(self):
+        """CORRECTED: qkv_head_dp/op.py grew weight_dtype/group_size/scale_dtype/layout fields
+        and gen_llm_decode.py now passes them (_quant_kw("qkv") at the QKVHeadDataParallel call
+        site). Confirmed on-device-free by a real 48-layer aiecc build. This used to be P003;
+        the remaining P003 gap is the KV cache only, see test_the_kv_cache_has_no_axis."""
+        P.check(plan(qkv="int8a"), replace(UNFUSED, fused_qkv_dp=True))
 
-    def test_split_qkv_gemvs_cannot_take_the_axis(self):
-        refusal("P003", P.check, plan(qkv="int8a"), replace(UNFUSED, fused_qkv_gemv=False))
+    def test_split_qkv_gemvs_already_had_the_axis(self):
+        """op_q/op_kv (gemv/op.py) take _quant_kw("qkv") unconditionally, regardless of
+        FUSE_QKV_GEMV -- this case was never actually missing the axis."""
+        P.check(plan(qkv="int8a"), replace(UNFUSED, fused_qkv_gemv=False))
+
+    def test_kv_cache_refuses_on_every_carrier(self):
+        refusal("P003", P.check, plan(kv="int8a"), UNFUSED)
+        refusal("P003", P.check, plan(kv="int8a"), replace(UNFUSED, fused_qkv_dp=True))
 
 
 class TestChannelBudget:

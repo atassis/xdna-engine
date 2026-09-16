@@ -1721,17 +1721,12 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         # QKV projection: one GEMV over the concatenated weight, or the three separate ones. op_kv
         # is built in both arms because share_designs pairs Wk with Wv only in the unfused one.
         #
-        # Both raises below are gated on `attn_block_why[g] is not None` (op_qkv_dp will actually
-        # reach the runlist) as well as `dp_why is None` (it would otherwise be constructed at
-        # all): attn_block_dp replaces op_qkv_dp wholesale for a geometry it covers, so op_qkv_dp
-        # is built but dead there -- same "constructed but never reaches the runlist" shape as
-        # op_rep_k/op_scores/etc. above, and its own capability gaps must not gate a build that
-        # never routes data through it.
-        if _spec("qkv").quantized and dp_why is None and attn_block_why[(hd, hkv, has_v)] is not None:
-            raise NotImplementedError(
-                f"the precision plan sets qkv to {_spec('qkv')} but the fused QKV head is on, and "
-                "QKVHeadDataParallel has no weight_dtype axis -- it would consume packed bytes as "
-                "bf16 values. Set FUSE_QKV_DP=0, or add the axis to the operator.")
+        # The v_norm raise below is gated on `attn_block_why[g] is not None` (op_qkv_dp will
+        # actually reach the runlist) as well as `dp_why is None` (it would otherwise be
+        # constructed at all): attn_block_dp replaces op_qkv_dp wholesale for a geometry it
+        # covers, so op_qkv_dp is built but dead there -- same "constructed but never reaches the
+        # runlist" shape as op_rep_k/op_scores/etc. above, and its own capability gaps must not
+        # gate a build that never routes data through it.
         # attention_k_eq_v: a layer with no v_proj concatenates TWO parts, not three, so both the
         # GEMV shape and the qkv buffer layout are per-geometry. V is then derived from k rather
         # than projected -- see the runlist, where v_norm reads the k slice.
@@ -1749,11 +1744,13 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         op_qkv_dp = None
         if dp_why is None:
             from iron.operators.qkv_head_dp.op import QKVHeadDataParallel
+            # No force_header_first: unlike attn_block_dp, this design reads Wq/Wk/Wv as
+            # contiguous stock rows (no per-head reorder), so it takes the dump's own layout.
             op_qkv_dp = QKVHeadDataParallel(D=D, HD=hd, Hq=Hq, Hkv=hkv, max_seq=KVA,
                                             num_aie_columns=sp.qkv_dp_cols(COLS, n_kv_heads=hkv),
                                             epsilon=sp.eps,
                                             tile_size_input=TSI, context=ctx,
-                                            weight_depth=WEIGHT_DEPTH)
+                                            weight_depth=WEIGHT_DEPTH, **_quant_kw("qkv"))
         # Gemma-4 applies a GAINLESS RMSNorm to the value path of every layer. with_scale=False in
         # the reference removes the learned gain, not the normalisation, so there is no weight
         # tensor anywhere in the checkpoint -- which is why nothing could ever have failed on its
@@ -1768,10 +1765,13 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         # exact multiplicative identity. Costs one 512 B buffer per geometry, shared by every layer.
         op_v_norm = op_qk_norm if sp.v_norm else None
         if sp.v_norm and dp_why is None and attn_block_why[(hd, hkv, has_v)] is not None:
-            # Same dead-vs-live gate as the precision raise above: this fires only when op_qkv_dp
-            # is the arm that actually runs. The fused head drains k and v straight into the
-            # caches, so `v` never exists as a buffer this graph can normalise -- the norm would
-            # be silently skipped rather than rejected, on every layer.
+            # Fires only when op_qkv_dp is the arm that actually runs (attn_block_dp declined
+            # this geometry). The fused head drains k and v straight into the caches, so `v`
+            # never exists as a buffer this graph can normalise -- the norm would be silently
+            # skipped rather than rejected, on every layer. Unlike weight_dtype, this gap is
+            # real: qkv_head_dp has no value-norm stage (attn_block_dp's design.py grew one,
+            # qkv_head_dp/design.py never did) -- confirmed by exercising this raise directly
+            # (FUSE_ATTN_BLOCK=0 FUSE_QKV_DP=1 on gemma4-12b, which sets v_norm=True).
             raise NotImplementedError(
                 "spec sets v_norm but the fused QKV head is on, and QKVHeadDataParallel appends v "
                 "to the cache itself -- the value norm would be silently dropped. Set "
@@ -2328,8 +2328,13 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                                            scale_dtype=_BUILD_STATE["scale_dtype"])
                     # This branch is gated on g.has_v (above), so qkv_parts is always [Wq, Wk, Wv].
                     _sizes = (Hq * g.hd, g.hkv * g.hd, g.hkv * g.hd)
+                    # _planar_to_rows returns np.uint8 (quant.py's own internal byte-view
+                    # convention); every OTHER packer exit point normalizes to np.int8 before
+                    # returning, which is the dtype weight_bytes() tests for "already packed" --
+                    # left as uint8, it fails that test and gets bf16-cast, doubling the size and
+                    # renumbering the bytes as floats. view(), not astype(): same bits, signed label.
                     qkv_parts = [
-                        _planar_to_rows(a, m, D, row_w, _qspec.dtype, _rg).reshape(-1)
+                        _planar_to_rows(a, m, D, row_w, _qspec.dtype, _rg).view(np.int8).reshape(-1)
                         for a, m in zip(qkv_parts, _sizes)
                     ]
                 wq2, wk2, wv2 = (a.reshape(-1, row_w) for a in qkv_parts)

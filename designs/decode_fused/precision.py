@@ -68,9 +68,10 @@ RULES = {r.id: r for r in (
     Rule("P002", "every weight on one ObjectFifo carries one dtype for the fifo's lifetime",
          "iron/operators/attn_block_dp/design.py (STREAM channel), "
          "iron/operators/swiglu_mlp_dp/design.py (shared weight fifo)"),
-    Rule("P003", "the operator that DECLARES a weight buffer must carry a weight_dtype axis",
-         "iron/operators/{gemv,swiglu_mlp_dp}/op.py have one; "
-         "{decode_layer_dp,attn_block_dp,qkv_head_dp} declare buffers without one"),
+    Rule("P003", "the operator that DECLARES the KV cache buffer must carry a dtype axis for it",
+         "iron/operators/{attn_block_dp,qkv_head_dp}/design.py: KV_L3_ty is hardcoded bf16. "
+         "Wqkv itself is NOT this gap -- both operators' weight_dtype/group_size/scale_dtype/"
+         "layout axes size and pack it correctly; see gen_llm_decode.py's _quant_kw call sites"),
     Rule("P004", "giving a byte class its own dtype costs it its own shim channels, and the "
                  "device has 16 per direction",
          "iron/common/utils.py::get_shim_dma_limit, "
@@ -510,23 +511,18 @@ def check(plan: Mapping[str, Spec], ctx: GraphContext) -> None:
                     "per-channel for K, whose outliers are channel-consistent; per-token is "
                     "usually acceptable at 8 bits and is not at 4")
 
-    # P003 -- the operator that DECLARES a buffer must be able to size it in packed bytes.
-    # Named per carrier, because "which operator holds Wqkv" is four different answers depending
-    # on the fused arms and only one of them has the axis.
-    if get("qkv").quantized or get("kv").quantized:
-        carrier = ("attn_block_dp (inside the fused layer)" if ctx.fused_layer else
-                   "qkv_head_dp" if ctx.fused_qkv_dp else
-                   None if ctx.fused_qkv_gemv else
-                   "three separate GEMVs over one concatenated Wqkv blob")
-        if get("kv").quantized and carrier is None:
-            carrier = "whichever operator reads kc/vc"
-        if carrier is not None:
-            raise PrecisionRefusal(
-                "P003", f"qkv={get('qkv')} kv={get('kv')}: {carrier} declares these buffers and "
-                        "has no weight_dtype axis, so they would be sized in bf16 elements "
-                        "against packed bytes -- an artifact that builds clean and fails its "
-                        "own load-time size check. Reach the axis with FUSE_DECODE_LAYER=0 "
-                        "FUSE_QKV_DP=0 FUSE_QKV_GEMV=1, which puts Wqkv on a plain GEMV")
+    # P003 -- the KV cache buffer's dtype. Wqkv is NOT this rule any more: attn_block_dp and
+    # qkv_head_dp both carry weight_dtype/group_size/scale_dtype/layout for it and size it in
+    # packed bytes correctly (op.py fields, exercised by gen_llm_decode.py's _quant_kw call
+    # sites). The KV cache is a separate buffer neither operator gives an axis -- KV_L3_ty is
+    # hardcoded bf16 in both design.py files -- regardless of which arm carries Wqkv.
+    if get("kv").quantized:
+        raise PrecisionRefusal(
+            "P003", f"kv={get('kv')}: attn_block_dp/qkv_head_dp declare the KV cache buffer in "
+                    "bf16 (KV_L3_ty) regardless of weight_dtype, so a quantized kv plan would "
+                    "size in bf16 elements against packed bytes -- an artifact that builds "
+                    "clean and fails its own load-time size check. Give the cache buffer its "
+                    "own dtype axis, or leave kv=bf16")
 
 
 def kv_addr_gran_elems(plan: Mapping[str, Spec]) -> int:
