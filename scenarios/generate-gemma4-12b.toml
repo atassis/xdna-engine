@@ -156,6 +156,22 @@ name = "gemma4-12b"
 #   and expensive to RUN until the reduction follows n_past; the softmax half already takes a
 #   runtime width (sm_mask, a ScratchpadParameter), the scores GEMV is the half that does not.
 #
+# TOOLCHAIN MIGRATION 2026-09-16: default moved to `..._mc_repin`, the SAME GRAPH rebuilt on the
+#   2026-09-15 repin (MLIR_AIE_FORK_COMMIT 6ce38ed5776 -> ea0dbced832). Evidence it is a pure
+#   toolchain move: sequence_name identical, meta.json `layout` identical buffer-for-buffer,
+#   scratch_size identical (7164551680), ELF size identical (29772848 B). Only the toolchain stamp
+#   differs, so the ELF sha does (2cebeef9d83c -> 6111fd909c0c) -- the repin's sixth commit changes
+#   emitted IR and aiecc is not byte-reproducible either way.
+#   WHY IT WAS FORCED RATHER THAN CHOSEN: the artifact loader fails LOUD on a toolchain-stale
+#   stamp, so once toolchain.lock moves, every stamped artifact built on the old pin refuses to
+#   load. `_mc` is stamped; gemma3-270m's and qwen3-0.6b's decode artifacts are UNSTAMPED (built
+#   before the check existed) and only warn. So the repin and this default flip are one atomic act.
+#   ROLLBACK: `git revert` the repin commit, point decode= back at `..._mc`, reinstall.
+#   LATENCY NOT YET GATED ON THE NEW ARTIFACT. Contemporaneous control on `_mc` (2cebeef9d83c) an
+#   hour before the flip: 359.0 ms/token itl_ms.p50, warm, Power Mode Default -- in line with the
+#   410.00/355.5 ladder rows. The repinned arm wants the same measurement; a toolchain change
+#   SHOULD be latency-neutral on an identical graph, and should is not a measurement.
+#
 # Tried and NOT adopted (kept here so they are not re-tried blind):
 #   int4 (any layout)        12.3% weight rel-L2 against a ~0.3% logit-accuracy budget; no group
 #                             size or calibration closes it -- SUPERSEDED 2026-09-15 by the QAT
@@ -209,7 +225,7 @@ name = "gemma4-12b"
 # 2026-09-15 by editing the staged file alone, and an install on the same day silently put the
 # engine back on int8 g64. Flip a default HERE, then install.
 [artifacts]
-decode = "artifacts/gemma4-12b/decode_int4g32qat_s6912_l48_rg_mc"
+decode = "artifacts/gemma4-12b/decode_int4g32qat_s6912_l48_rg_mc_repin"
 weights = "artifacts/gemma4-12b/weights_int4g32sbf16_planar_qat_rg"
 tokenizer_dir = "artifacts/gemma4-12b/tokenizer"
 
