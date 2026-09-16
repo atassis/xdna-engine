@@ -147,6 +147,14 @@ BF16 = ml_dtypes.bfloat16
 # What it buys is the driver's 2 s TDR watchdog (aie2_tdr.c). A 48-layer M=256 dispatch moves
 # 39.94 GiB and cannot finish inside it; four variants of 12 layers move 9.99 GiB each.
 PREFILL_SEGMENTS = int(os.environ.get("PREFILL_SEGMENTS", "1"))
+
+# Hold the GEMM's A operand in L2 across its N loop, instead of re-reading it from DDR
+# `N//(tile_n*cols)` times (iron/operators/gemm/design.py's `pattern_repeat`). Opt-in on both
+# sides: the operator's own `a_resident` defaults off and falls back per site when A+B+C do not
+# co-fit a 512 KiB MemTile. Worth 3.92 GiB of 16.00 at M=64 -- but prefill runs at 13.1% of the
+# read peak, so the BYTE saving is only ~3.5% of the step unless the idle term moves with it.
+# That is the open question this flag exists to measure, not a predicted win.
+A_RESIDENT = os.environ.get("A_RESIDENT", "0") == "1"
 if PREFILL_SEGMENTS < 1:
     raise SystemExit(f"PREFILL_SEGMENTS={PREFILL_SEGMENTS} must be >= 1")
 COLS = int(os.environ.get("PREFILL_COLS", "8"))
@@ -568,7 +576,8 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
             blk["allocation_scheme"] = alloc
         return GEMM(M=M, K=K, N=Nout, b_col_maj=b_col_maj, context=ctx,
                     emulate_bf16_mmul_with_bfp16=emulate, prio_accuracy=prio_acc,
-                    round_conv_even=round_even, **blk, **ch.gemm_kwargs)
+                    round_conv_even=round_even, a_resident=A_RESIDENT,
+                    **blk, **ch.gemm_kwargs)
 
     op_norm = RMSNorm(size=M * D, num_aie_columns=cols, num_channels=1, tile_size=D,
                       weighted=True, epsilon=sp.eps, context=ctx, allocation_scheme=alloc_all)
@@ -1258,6 +1267,8 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
     # cached artifact by name and an arm that collides runs the earlier binary.
     if len(cuts) > 1:
         name += f"_seg{len(cuts)}"
+    if A_RESIDENT:
+        name += "_ares"
     fused = OperatorSequence(name, seg_rls[0], input_args=inputs, output_args=["xout"],
                              buffer_sizes=bufsz, context=ctx, share_designs=True,
                              scratch_order=(dec_order or None),
