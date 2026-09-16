@@ -385,6 +385,20 @@ impl NpuPrefill {
                             chunk.start
                         )));
                     }
+                    // `kv_heads` below is the artifact's one scalar and it reaches the address
+                    // only through `block_stride`, so it is right exactly while this geometry is
+                    // ONE block -- true of every build today, and not of a blocked cache on a
+                    // model whose geometries differ in kv_heads (Gemma-4: 8 sliding, 1 global).
+                    // The per-geometry count is in neither meta, so refuse rather than address
+                    // with the base geometry's.
+                    if self.artifact.kv_windows.len() > 1 && self.artifact.kv_block < capacity {
+                        return Err(EngineError::Unsupported(format!(
+                            "capacity-{capacity} geometry (head_dim={head_dim}) is blocked at \
+                             kv_block={}, so its address needs that geometry's own kv_heads and \
+                             the artifact declares only {}",
+                            self.artifact.kv_block, self.artifact.kv_heads
+                        )));
+                    }
                     let kv = crate::llm::kv_layout::kv_off_circular(
                         chunk.start, capacity, self.artifact.kv_block, head_dim,
                         self.artifact.kv_heads,
