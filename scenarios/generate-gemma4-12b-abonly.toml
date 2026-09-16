@@ -1,0 +1,239 @@
+# DOES NOT SERVE -- kept so the broken fusion is reproducible.
+# FUSE_ATTN_BLOCK=1 FUSE_QKV_DP=0 at 48 layers. Produces GARBAGE on device
+# ('irl ornot4 ...' where the control returns 'Blue'). Root cause is proven and written up in
+# attn-block-quantized-wqkv-assumes-header-first: the quantized Wqkv path is header_first and
+# the dump is row_group_planar, so every scale reads a bf16 zero and q=k=v==0 on all 40
+# sliding layers. Do not register this expecting it to work; register it to reproduce.
+[scenario]
+kind = "generate"
+name = "gemma4-12b-abonly"
+
+# Gemma-4-12B, all 48 layers on the NPU. The first non-uniform model on this rail: its sliding
+# layers are head_dim 256 / 8 kv heads and its global layers 512 / 1, so attention ops are built
+# per GEOMETRY (gen_llm_decode.py's attn_ops factory) rather than once for the stack.
+#
+#   weights  scripts/dump_llm_weights.py --spec gemma4-12b \
+#              --repo google/gemma-4-12B-it-qat-q4_0-unquantized \
+#              --quant int4 --quant-group 32 --quant-layout row_group_planar \
+#              --quant-scale-dtype bf16 --quant-full-range --quant-clip-search \
+#              --quant-leaves gate_proj,up_proj,down_proj,o_proj,q_proj,k_proj,v_proj \
+#              --out artifacts/gemma4-12b/weights_int4g32sbf16_planar_qat_rg
+#   decode   GQA_GROUPED_K=1 GQA_GROUPED_V=1 FUSE_QKV_DP=0 SPLIT_LM_HEAD=0 \
+#              WEIGHTS=$PWD/artifacts/gemma4-12b/weights_int4g32sbf16_planar_qat_rg \
+#              bash scripts/build_llm_decode.sh gemma4-12b 48 \
+#                $PWD/artifacts/gemma4-12b/decode_int4g32qat_s6912_l48_rg
+#
+# EVERY FLAG ABOVE IS LOAD-BEARING and the artifact's own quant.json is the check:
+# {dtype int4, group_size 32, layout row_group_planar, scale_dtype bf16, full_range true,
+#  clip_search true, row_group 2}. --quant-full-range is what reaches the QAT checkpoint's own
+# 16-level [-8,7] grid; without it the packer clips to the symmetric 15-level subset and measures
+# the cost of declining the grid the checkpoint was trained on. g32 is the grid's own block (g64
+# reads 7.19% rel-L2), and g128 does not compile at K=3840 at all.
+#
+# HISTORICAL -- this paragraph describes the int8 g64 arm this scenario USED to ship. The default
+# has been int4 g32 QAT since 2026-09-15 (see the recipe above and the ladder below); the int8
+# reasoning is kept because one half of it still binds and the other was overturned by measurement.
+#   int8, not int4: OVERTURNED. Symmetric RTN int4 measured 12.3% weight rel-L2 against a ~0.3%
+#     logit-accuracy budget, which is why int8 shipped first -- but that measured the cost of
+#     DECLINING the QAT checkpoint's own 16-level grid, not the cost of four bits. Through the real
+#     wire format at --quant-full-range the same weights read 0.209%.
+#   g64, not g128: STILL TRUE, and it is a kernel constraint rather than a quality one. At K=3840
+#     the int8 width derivation returns VEC_SIZE=8, and aie::vector<int8,8> is 64 bits -- below
+#     aie_api's minimum vector, so there is no vector_storage specialisation and the kernel does not
+#     compile. g64 derives 16 (128-bit) and is legal, but was PUNISHED to that width by the header
+#     sitting in the row -- see the corrections list below.
+#
+# TMV_CTX left UNSET (generator default "1", per-geometry -- gen_llm_decode.py:77). It is NOT a
+# build-wide flag: the global layers (head_dim 512, one kv head, batch_group 16) have no TMatVec
+# tiling that fits L1 and decline it automatically (`8ce4727`, 2026-09-11), while the 40 sliding
+# layers take it and drop their zero-compute V-transpose. This was forced to TMV_CTX=0 here from
+# 2026-09-11 to 2026-09-13 -- the per-geometry fix landed the same day as this scenario's first
+# quantized arm but the recipe was never revisited, leaving a real win on the table for two days.
+# SPLIT_LM_HEAD=0 because the host loader carries one elf/kernel name, so a split head would be a
+# second dispatch it cannot express.
+#
+# DEFAULT SINCE 2026-09-15: int4 g32 QAT row_group_planar + TMV_CTX on, S=6912
+# (`decode_int4g32qat_s6912_l48_rg`). ms/token history, this box, same GQA/FUSE_QKV/SPLIT_LM_HEAD
+# config throughout, real service unless noted.
+#
+# EVERY FIGURE BELOW IS `itl_ms.p50` FROM A RUN OF n>=140. Do not quote
+# `predicted_per_token_ms`: it divides a decode span covering n-1 steps by n tokens, so it reads
+# (n-1)/n of the truth -- -14.2% at n=7. Rows 1-3 as originally recorded were short-run figures and
+# are corrected here; the "~316 ms/token TMV build" that appeared in the KB never existed. See
+# the KB note on span-over-count bias, and D030.
+#   1. int8 g64, header_first, TMV_CTX=0 (shipped first)  801.46 ms/token   1.248 tok/s
+#   2. int8 g32, header_first, TMV_CTX=0 (traded quality for speed,
+#      shipped 2026-09-12 over a FAILED perplexity gate -- see below)  528.91 ms/token   1.884 tok/s
+#   3. int8 g64, row_group_planar, TMV_CTX=0, S=2048   416.27 ms/token  (hash b89a907d0b7b, n=140)
+#   4. int8 g64, row_group_planar, TMV_CTX on, S=2048  371.14 ms/token  (hash ebea682c3e91, n=337)
+#      -45.13 ms, -10.84% against (3) -- the real TMV_CTX win. The -13.68% recorded on 2026-09-14
+#      was an ABBA over short runs at unequal n and is superseded. NOT confirmed by a full-depth
+#      perplexity gate -- that
+#      harness was found broken for this model (never received 3 of 4 Gemma-4 fixes that landed on
+#      an unmerged branch, `g4/precision-quality`), partially repaired, still reads
+#      worse-than-uniform NLL on both arms alike as of 2026-09-14 -- DIAGNOSED 2026-09-14: two
+#      separate defects, a missing final_logit_softcapping and, in the re-run that fixed it, a
+#      tokenizer hardcoded to Qwen's for every spec. No run has ever had both right, so the gate
+#      is unblocked but still unvalidated. See the KB note on the two masking defects.
+#      TMV_CTX changes bf16 reduction ORDER only (context step: GEMV-along-a-row -> TMatVec-down-
+#      rows), never a value or a weight byte, and the L=6 exact-oracle gate went 8/8 (the pre-planar
+#      TMV_CTX-alone gate tied/missed at this same step; here it passes clean) -- lower risk class
+#      than (2)'s format narrowing, but the ship call rests on device-time + parity, not perplexity.
+#   5. as (4) but S=6912                               429.79 ms/token  (hash bff9d3434418, n=247)
+#      +58.65 ms against (4), and CONFIRMED 2026-09-15 by an alternated A-B-A-B at matched head
+#      dtype (a37e16f6adfe vs bff9d3434418, 100 tok/rep): 367.82 -> 428.99, +61.17 ms, +16.63%,
+#      both B reps above both A reps. The raise gated on CORRECTNESS only and was never priced;
+#      the overstated -13.68% in (4) is what concealed it. It is not a byte cost -- the same raise
+#      put the sliding layers on a 1024 ring and the global ones at 6912, taking KV traffic from
+#      704 to 448 MB/token while latency ROSE. It is core time in the global geometry's fallback
+#      GEMV, whose K is S on 8 layers. Split-K or a narrower global window is the lever.
+#   6. int4 g32 QAT, S=6912 (THIS DEFAULT)             410.00 ms/token  (hash 7ddc443b8e8d, n=270)
+#      -19.79 ms against (5). Shipped for arena 14.2 -> 8.07 GB and weight rel-L2 0.599 -> 0.211%,
+#      not for speed: a 35.7% byte cut converted at 2.2% (int4-vs-int8 A-B-A, 2026-09-15).
+#   7. + m_chunk on the global geometry, + mlpdp4, + mlpo (THIS DEFAULT)  355.49 ms/token
+#      (hash 2cebeef9d83c, ABAB 150 tok/rep, n=150 each). **-52.93 ms, -12.96%** against (6)
+#      re-measured in the same session at 408.417 -- A 408.567/408.267 (drift 0.07%),
+#      B 355.419/355.556, both B reps below both A reps with no overlap.
+#      ATTRIBUTION CORRECTED 2026-09-16: this arm's change is `m_chunk=256 rows_per_chunk=16`,
+#      letting the 8 global layers take TMatVec instead of the gemv_tile_output + Transpose
+#      fallback. It was recorded as THREE changes -- m_chunk plus mlpdp4 plus mlpo -- and the
+#      MLP-fusion half was never in the graph. `strings` on this artifact's own decode.elf returns
+#      GEMV, RMSNorm, TMatVec, Softmax, RoPE and ZERO swiglu/mlp_dp; a byte-identical L=6
+#      reproduction emits a fused MLIR with no swiglu in it either. The `mlpdp4_mlpo` in the
+#      sequence name is the name over-claiming: it is appended on sp.mlp_dp_reason(), while
+#      construction is gated on mlp_dp_why, which additionally refused swiglu_mlp_dp for having no
+#      layout/scale_dtype parameter. So the isolation arms _mcpure and _mconly split out a term
+#      that does not exist, and -52.93 ms is m_chunk. See the KB note on one predicate per name.
+#      QUALITY IS NOT GATED. Shipped on device-time alone, owner's call, same as (2) was.
+#      The arms produce different text at temperature 0 (divergence at char 155) -- expected for a
+#      bf16 reduction-order change, not a verdict either way, and NOT to be judged by reading
+#      samples: see the two traps below, one of which is exactly this mistake.
+#      The generator predicted -114.91 ms on the byte term alone; measured is -52.93, so do not
+#      quote the byte prediction as an expectation.
+#      Rollback: point decode= back at decode_int4g32qat_s6912_l48_rg and restart.
+# (3) beats (2)'s speed while staying on (1)'s quality-gated format -- no quality tradeoff needed.
+# Row_group_planar measures ~3% faster than header_first even at g32, where the width argument
+# below does not apply (g32's own group size already caps VEC_SIZE, header or no header) -- the
+# residual is attributed to DMA/access-pattern contiguity (payload region is one contiguous run
+# under planar, interleaved with the header every row under header_first), not traced further.
+#
+# WHY row_group_planar IS FASTER: at K=3840 g64, header_first's per-row scale sits between the
+# buffer base and the payload, capping the dequant vector load at VEC_SIZE=16 (128-bit) -- see the
+# note above about g128 not compiling; g64 was legal but similarly punished. row_group_planar moves
+# every block's scales out of the row (`[payload_0..payload_{G-1}][scale_0..scale_{G-1}]`, G=4,
+# derived per K022 -- NOT hand-picked, two prior sessions guessed 8 and it overruns L1 by 9-28 KB at
+# every Gemma-4 quantized GEMV site), which lifts K=3840 to the full 512-bit VEC_SIZE=64. Kernel
+# side: `iron/operators/gemv/op.py` layout/row_group axis (IRON integration-stack commit `b90bde1`).
+#
+# CORRECTIONS APPLIED TO SPEED UP THIS KERNEL, dated, so this list is the answer to "what have we
+# already tried" instead of re-deriving it:
+#   2026-09-12  int8 g64 header_first shipped (from bf16), first quantized arm.        801.46 ms/tok
+#   2026-09-12  int8 g32 header_first shipped as a quality/speed TRADE (perplexity      528.91 ms/tok
+#               gate FAILED, +4.898% NLL vs g64, shipped anyway on owner's call).
+#   2026-09-13  int8 g64 row_group_planar: removes the header-imposed VEC_SIZE cap      416.27 ms/tok
+#               at K=3840 (16->64, 128b->512b) with NO accuracy cost (bytes reordered,
+#               values untouched) -- SUPERSEDES g32, now both faster and quality-safe.
+#   2026-09-14  TMV_CTX on (per-geometry, was force-OFF since 2026-09-11 though the     371.14 ms/tok
+#               generator default flipped to on the same day): deletes the sliding          -10.84%
+#               layers' zero-compute V-transpose (1342.18 MB/token, 7.9% of the byte
+#               census). Reorders a bf16 reduction, changes no value.
+#   2026-09-14  S=6912 long-context raise: +58.65 ms/tok, a REGRESSION, gated on       429.79 ms/tok
+#               correctness only. Core time in the global fallback GEMV (K=S on 8           +15.80%
+#               layers), not bytes -- KV traffic FELL 704 -> 448 MB/token across it.
+#   2026-09-15  int4 g32 QAT: arena 14.2 -> 8.07 GB, weight rel-L2 0.599 -> 0.211%.    410.00 ms/tok
+#               A 35.7% byte cut converted at 2.2% -- shipped for arena, not speed.         -4.60%
+# CONTEXT CAPACITY: the 6912 ceiling is GONE as of 2026-09-16, and S is now a PRICE, not a wall.
+#   SOFTMAX_SEGMENT=<L> (0 = off, the default and what this arm ships) chunks the GLOBAL geometry's
+#   attention softmax. Without it the global op20_Softmax holds in1+out at depth 2, each
+#   memref<S x bf16>, so 4*(S*2)+1032 <= 65536 caps S at 8063; and a second, NON-decomposable wall
+#   sits behind that at S~32768 (a 16384-word core-tile DMA BD against a 14-bit field). Chunking
+#   clears both: L1 goes 9744 B FLAT at every S, and 48-layer builds succeed at
+#   S = 8192 / 16384 / 32768 / 65536 / 131072 / 262144. Output is BIT-IDENTICAL, 225/225 at
+#   0.000e+00 -- softmax_simple_bf16 already walks its row three times, so chunking only moves the
+#   cross-pass state from a register into memory. Arena is linear at 16896 B/position (the 8 global
+#   layers' K and V; the 40 sliding layers are circular at 1024 and cost nothing per token),
+#   10.69 GiB at S=262144. DEVICE-FREE ONLY -- no run on hardware, no 1:1 determinism check.
+#
+#   DO NOT SHIP A BIG S AS THE DEFAULT, and the reason is measured, not caution. Cost tracks the
+#   CAPACITY, not the position: `op_scores = gemv(S, HD, ...)` computes S rows EVERY token whatever
+#   n_past is. That is why the 2048 -> 6912 raise was a +58.65 ms/token REGRESSION -- about
+#   12.1 us per position across the 8 global layers. Extrapolated, S=262144 would add ~3.1 s/token
+#   at every position, including the first token of a 20-token prompt. Raising S is free to BUILD
+#   and expensive to RUN until the reduction follows n_past; the softmax half already takes a
+#   runtime width (sm_mask, a ScratchpadParameter), the scores GEMV is the half that does not.
+#
+# TOOLCHAIN MIGRATION 2026-09-16: default moved to `..._mc_repin`, the SAME GRAPH rebuilt on the
+#   2026-09-15 repin (MLIR_AIE_FORK_COMMIT 6ce38ed5776 -> ea0dbced832). Evidence it is a pure
+#   toolchain move: sequence_name identical, meta.json `layout` identical buffer-for-buffer,
+#   scratch_size identical (7164551680), ELF size identical (29772848 B). Only the toolchain stamp
+#   differs, so the ELF sha does (2cebeef9d83c -> 6111fd909c0c) -- the repin's sixth commit changes
+#   emitted IR and aiecc is not byte-reproducible either way.
+#   WHY IT WAS FORCED RATHER THAN CHOSEN: the artifact loader fails LOUD on a toolchain-stale
+#   stamp, so once toolchain.lock moves, every stamped artifact built on the old pin refuses to
+#   load. `_mc` is stamped; gemma3-270m's and qwen3-0.6b's decode artifacts are UNSTAMPED (built
+#   before the check existed) and only warn. So the repin and this default flip are one atomic act.
+#   ROLLBACK: `git revert` the repin commit, point decode= back at `..._mc`, reinstall.
+#   LATENCY NOT YET GATED ON THE NEW ARTIFACT. Contemporaneous control on `_mc` (2cebeef9d83c) an
+#   hour before the flip: 359.0 ms/token itl_ms.p50, warm, Power Mode Default -- in line with the
+#   410.00/355.5 ladder rows. The repinned arm wants the same measurement; a toolchain change
+#   SHOULD be latency-neutral on an identical graph, and should is not a measurement.
+#
+# Tried and NOT adopted (kept here so they are not re-tried blind):
+#   int4 (any layout)        12.3% weight rel-L2 against a ~0.3% logit-accuracy budget; no group
+#                             size or calibration closes it -- SUPERSEDED 2026-09-15 by the QAT
+#                             checkpoint at full range, which ships (see the recipe above).
+#   int8/int4 KV cache       REFUSED by precision.py, not untried: P003 (the operator declaring
+#                             kc/vc has no weight_dtype axis) blocks any quantized KV, and P006
+#                             additionally blocks sub-8-bit because a kc row is a POSITION, so the
+#                             packer would scale per token where K wants per-channel. Worth 4.0%
+#                             of the token at S=6912 and 18.7% at 131072 -- arena, not latency.
+#   g128                     does not compile at K=3840 (VEC_SIZE derives 8, below aie_api's
+#                             minimum vector width) -- see the "g64, not g128" note above.
+#
+# Two traps from the g32 episode, kept because they generalize to any future quantization change:
+#   - top-1 argmax can be UNCHANGED while perplexity moves broadly (g32 vs g64: 29.05% vs 28.85%
+#     top-1, but g32 worse at 54.2% of positions) -- an argmax-only parity check will not see this
+#     class of regression. Gate on paired perplexity, not just greedy token match.
+#   - per-site weight rel-L2 can disagree with the end-to-end quality result IN SIGN (g32 measured
+#     BETTER at every site, 0.569% vs 0.654% at the head, and was worse end to end). Do not judge a
+#     format change from a weight-space norm alone.
+#
+# DEFAULT SINCE 2026-09-14 (later same day): decode_s6912_headint8_l48. TWO capability changes,
+# not a speed change -- owner-authorized after both were independently device-gated clean:
+#   1. Context ceiling 2048 -> 6912 (3.375x), SLIDING_KV_CIRCULAR=1. The real ceiling was found by
+#      BUILDING, not by the generator's own stated constraint (TMatVec's check_l1_fits on the
+#      sliding geometry never was the binding wall -- the global geometry's fallback GEMV's own L1
+#      limit is: fits through K=6912, fails at 7168). None of 8192/16384/32768 build.
+#   2. lm-head int8 g64 (was bf16): -943.7 MB/token, 5.5% of the token. Blocked for weeks by an
+#      OOM in the packed dump (in-process quantize peaks ~22 GiB on this 262144x3840 tensor);
+#      fixed via row-chunked quantization at dump time, real peak RSS 6.29 GiB. Exposed and fixed a
+#      second bug one level down: GEMV's free tile_size_input search picks an illegal tiling at
+#      this tensor's M=262144 shape under row_group_planar -- verified as a true no-op for every
+#      OTHER site via byte-identical ELF sha256 before/after.
+# GATED, combined, on THIS artifact (not just each piece alone): L=6 oracle parity 7/8 (identical
+# margins to the head-int8-alone gate; the one miss is a classified bf16-ulp tie, gap 0.0 against a
+# 2.0 threshold, not a new divergence). Paired A/B vs the S=2048 int8-head control, same corpus/
+# weights, varying only --max-seq: BIT-EXACT over the full [0:1024) shared range (max|diff| 0.0,
+# 1024/1024 positions exact), new [1024:2560) range sane (no NaN/Inf, mean NLL 6.470 in line with
+# the run). Rust serving path confirmed to honour SLIDING_KV_CIRCULAR (merged same day, kv_off_
+# circular + per-geometry kv_windows, unit-tested) but not yet end-to-end smoke-tested through a
+# live `npu generate` request on this exact artifact -- do that once before trusting it unattended.
+# Also fixed the SAME DAY: eval_llm_perplexity.py's Gemma-4 tokenization, broken since 899354e left
+# it out of scope -- QwenBPE cannot parse Gemma's Split pretokenizer (KeyError: 'pretokenizers').
+# --ids now accepts tokenize_corpus.py's pre-tokenized output; this is what made the paired A/B
+# above possible at all. Prior arm (4)'s "worse-than-uniform NLL on both arms alike" was NOT this
+# tokenization bug alone -- it was the missing softcap, and the tokenizer defect entered with the
+# re-run that fixed the softcap. Both are fixed; neither has yet been confirmed by a run carrying
+# both corrections.
+# THIS FILE IS THE SOURCE OF TRUTH, not the copy under XDNA_ENGINE_ROOT/scenarios.
+# install.sh stages this one over that one, so a default flipped only in the staged copy is
+# reverted by the next install and leaves no trace in git. That happened: int4 g32 QAT shipped
+# 2026-09-15 by editing the staged file alone, and an install on the same day silently put the
+# engine back on int8 g64. Flip a default HERE, then install.
+[artifacts]
+decode = "artifacts/gemma4-12b/decode_s6912_l48_abonly"
+weights = "artifacts/gemma4-12b/weights_int4g32sbf16_planar_qat_rg"
+tokenizer_dir = "artifacts/gemma4-12b/tokenizer"
+
+[generation]
+max_tokens = 512
