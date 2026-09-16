@@ -173,6 +173,29 @@ name = "gemma4-12b"
 #   410.00/355.5 ladder rows. The repinned arm wants the same measurement; a toolchain change
 #   SHOULD be latency-neutral on an identical graph, and should is not a measurement.
 #
+# DEFAULT SINCE 2026-09-16 (later): `decode_s6912_l48_are`, built ATTN_RUNTIME_EXTENT=1 on the
+#   otherwise-identical recipe. -3.98%%, and it is the first arm on this model shipped with BOTH a
+#   latency A/B and a 1:1 parity gate rather than device time alone.
+#     latency   alternated, same prompt, same session, warm, Power Mode Default:
+#               default 359.1 / 359.4 / 357.5 (mean 358.67) against 347.9 / 342.2 / 343.1
+#               (mean 344.40). -14.27 ms, -3.98%%, NO OVERLAP between the two sets.
+#     parity    verify_llm_decode.py L=6 against tests/refs/gemma4-12b/qat_int4g32_oracle_l6.json:
+#               greedy token parity 8/8, margins 17/146/12/2/244/6/5/9 -- PARITY PASS.
+#     arena     7164551680 B, BYTE-IDENTICAL to the previous default. Pure compute change: no new
+#               designs, no extra hardware context, no host or Rust change. ELF 30747584.
+#   WHAT IT DOES: GEMV's M-extent and TMatVec's K-extent follow each geometry's OWN sm_mask
+#   scratchpad parameter, which the Rust path already wrote per geometry per token, clamped to that
+#   geometry's capacity. Nothing outside the generator changed. It is two-geometry-safe by
+#   construction, which is why it works here where the window-rung ladder cannot (rungs carry one
+#   scalar window; sm_mask is per geometry).
+#   WHY IT IS ONLY -3.98%% WHEN THE CAPACITY IS WORTH ~10%%: the global geometry's capacity costs
+#   ~35.5 ms/token at S=6912 (5.13 us/position, re-derived 2026-09-16 -- the older 12.1 us figure
+#   is from the pre-m_chunk arm and must not be quoted). 14.27 of 35.5 is a 40%% conversion, the
+#   ordinary result for a compute cut, not a shortfall.
+#   NOT MEASURED: the delta at large n_past (the ceiling shrinks -- ~8.5%% at 1023, ~4.1%% at 4096),
+#   and the cost of the 4 extra per-dispatch parameter syncs this arm adds.
+#   Rollback: point decode= back at decode_int4g32qat_s6912_l48_rg_mc_repin and restart.
+#
 # Tried and NOT adopted (kept here so they are not re-tried blind):
 #   int4 (any layout)        12.3% weight rel-L2 against a ~0.3% logit-accuracy budget; no group
 #                             size or calibration closes it -- SUPERSEDED 2026-09-15 by the QAT
@@ -226,7 +249,7 @@ name = "gemma4-12b"
 # 2026-09-15 by editing the staged file alone, and an install on the same day silently put the
 # engine back on int8 g64. Flip a default HERE, then install.
 [artifacts]
-decode = "artifacts/gemma4-12b/decode_int4g32qat_s6912_l48_rg_mc_repin"
+decode = "artifacts/gemma4-12b/decode_s6912_l48_are"
 weights = "artifacts/gemma4-12b/weights_int4g32sbf16_planar_qat_rg"
 tokenizer_dir = "artifacts/gemma4-12b/tokenizer"
 
