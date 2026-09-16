@@ -1077,6 +1077,16 @@ def gemv(M, K, ctx, **kw):
                 tile_size_output=tso, context=ctx, **kw)
 
 
+def _swiglu_default_tile_rows_gu():
+    """swiglu_mlp_dp's own default Wg/Wu row batch, read off the design module.
+
+    Hardcoding 6 here would be a second copy of a constant the operator owns, and the two would
+    drift the first time either moved.
+    """
+    from iron.operators.swiglu_mlp_dp import design as _swiglu_design
+    return _swiglu_design.TSI_GU
+
+
 def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_plan=None):
     """Construct the fused decode graph + its weight dict for a spec.
 
@@ -1406,6 +1416,21 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                 f"swiglu_mlp_dp takes no {'/'.join(_unaccepted)} parameter, so it cannot read the "
                 f"{_BUILD_STATE['layout']}/{_BUILD_STATE['scale_dtype']} dump this build packs"
             )
+        # The tiling this build will actually ask for, checked HERE rather than left to fire as an
+        # AssertionError inside design.py. On the unchunked, non-row-parallel path a Wd row batch is
+        # TSI_GU//R, so TSI_GU must be a whole number of R=FF/D; MLP_TILE_ROWS=0 means the
+        # operator's own module default. Gemma-4 (R=4) meets the default TSI_GU=6 here: the gate
+        # stayed shut on the _unaccepted clause above until swiglu_mlp_dp grew layout/scale_dtype,
+        # and the first build after it opened died 250 lines inside the design function.
+        elif os.environ.get("MLP_ROW_PARALLEL", "0") != "1":
+            _tsi_gu = MLP_TILE_ROWS or _swiglu_default_tile_rows_gu()
+            if FF % D == 0 and _tsi_gu % (FF // D) != 0:
+                mlp_dp_why = (
+                    f"MLP_TILE_ROWS={_tsi_gu} is not a multiple of R=FF/D={FF // D}, which "
+                    f"swiglu_mlp_dp's unchunked down projection requires (design.py's TSI_D). "
+                    f"Set MLP_TILE_ROWS to a multiple of {FF // D}, or use MLP_ROW_PARALLEL=1, "
+                    f"whose local matvec has no relationship to R"
+                )
 
     # Per-GEOMETRY eligibility for attn_block_dp used WITHOUT decode_layer_dp. Same clauses
     # decode_layer_why checks below for the one geometry it requires, reused via qkv_dp_why/
