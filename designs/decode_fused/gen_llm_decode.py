@@ -1443,9 +1443,16 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         # operator's own module default. Gemma-4 (R=4) meets the default TSI_GU=6 here: the gate
         # stayed shut on the _unaccepted clause above until swiglu_mlp_dp grew layout/scale_dtype,
         # and the first build after it opened died 250 lines inside the design function.
+        elif FF % D != 0:
+            # design.py asserts this outright ("this design assumes FF is a whole multiple of D").
+            # Gemma-3-270M is D=640 FF=2048, so R would be 3.2 -- the operator has no form for it.
+            mlp_dp_why = (
+                f"swiglu_mlp_dp needs FF ({FF}) to be a whole multiple of D ({D}); this spec's "
+                f"ratio is {FF / D:.4g}"
+            )
         elif os.environ.get("MLP_ROW_PARALLEL", "0") != "1":
             _tsi_gu = MLP_TILE_ROWS or _swiglu_default_tile_rows_gu()
-            if FF % D == 0 and _tsi_gu % (FF // D) != 0:
+            if _tsi_gu % (FF // D) != 0:
                 mlp_dp_why = (
                     f"MLP_TILE_ROWS={_tsi_gu} is not a multiple of R=FF/D={FF // D}, which "
                     f"swiglu_mlp_dp's unchunked down projection requires (design.py's TSI_D). "
