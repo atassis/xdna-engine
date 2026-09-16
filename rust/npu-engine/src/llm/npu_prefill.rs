@@ -129,10 +129,13 @@ pub fn chunk_plan(start: usize, n: usize, batch: usize) -> Vec<PrefillChunk> {
 /// second case (one angle row per position), so a test written against `reference.py` would compute
 /// a wrong expected answer. Each row is `rope_row`'s output verbatim -- the same function the M=1
 /// path calls -- so the two paths cannot drift in the interleaved `[cos, sin, ...]` packing either.
-pub fn rope_block(start: usize, batch: usize, head_dim: usize, theta: f64) -> Vec<u8> {
+pub fn rope_block(
+    start: usize, batch: usize, head_dim: usize, theta: f64, partial: Option<f64>,
+) -> Vec<u8> {
+    let angles = rope_angles(head_dim, partial);
     let mut out = Vec::with_capacity(batch * head_dim * 2);
     for i in 0..batch {
-        out.extend_from_slice(&pack_bf16_bytes(&rope_row(start + i, head_dim, theta, rope_angles(head_dim, None))));
+        out.extend_from_slice(&pack_bf16_bytes(&rope_row(start + i, head_dim, theta, angles)));
     }
     out
 }
@@ -168,6 +171,29 @@ pub fn mask_widths_block(start: usize, batch: usize, heads: usize, max_seq: usiz
 /// width masks nothing.
 pub fn prefill_window(max_seq: usize, batch: usize) -> usize {
     if batch == 0 { 0 } else { (max_seq / batch) * batch }
+}
+
+/// How far batched prefill may run, given each declared geometry's own KV capacity.
+///
+/// A narrowed (circular) geometry holds only its last `capacity` positions and the mask this ELF
+/// can express is a PREFIX -- `mask_bf16` masks `[width, cols)`. While `start + batch <= capacity`
+/// the valid slots ARE a prefix and one width names them. Past it they are a circular interval:
+/// after a chunk at `start >= capacity` the buffer holds `start-capacity+batch .. start+batch-1`,
+/// and row `i` must attend all of them except slots `i+1 ..= batch-1`, a hole in the MIDDLE that
+/// no suffix mask reaches. So batched prefill stops at the narrowest capacity and the caller
+/// finishes stepwise, which is why this returns a position rather than refusing.
+pub fn batchable_window(max_seq: usize, batch: usize, capacities: &[usize]) -> usize {
+    prefill_window(capacities.iter().copied().chain([max_seq]).min().unwrap_or(max_seq), batch)
+}
+
+/// Whether a chunk `[start, start + batch)` crosses a capacity-`capacity` geometry's wrap point.
+/// One `kv_off` write drives one dispatch of `batch` CONSECUTIVE positions; a chunk that straddles
+/// the wrap would need a second, shorter dispatch into the buffer's start, which the compiled ELF
+/// has no way to issue. Gemma-4's shipped shape (capacity=1024, batch=256) never crosses, because
+/// `capacity % batch == 0` puts every chunk boundary on a multiple of the capacity -- this is the
+/// general check for a build where that stops holding.
+fn crosses_wrap_point(start: usize, batch: usize, capacity: usize) -> bool {
+    start % capacity + batch > capacity
 }
 
 /// A resident device backend for one batched-prefill ELF, bound to a `FusedArena` it does not own.
@@ -280,10 +306,11 @@ impl NpuPrefill {
         // And a chunk writes `batch` CONSECUTIVE positions from one `kv_off`, so a chunk crossing
         // `max_seq` cannot be shortened to fit: it runs whole or not at all.
         //
-        // Today `check_prefill_pairing` requires `dims.S` equal across the halves and `S % M == 0`,
-        // which makes this exactly `tokens.len()` and the decline unreachable. It is the
-        // precondition for relaxing either of those, not a live behaviour change.
-        let window = prefill_window(self.artifact.max_seq, self.batch);
+        // The bound is per GEOMETRY, not the build-wide `max_seq` -- see `batchable_window`. On
+        // Gemma-4-12B that is 1024, not S=6912, and the decline it used to describe as unreachable
+        // is now the normal path for a prompt over the sliding window.
+        let caps: Vec<usize> = self.artifact.kv_windows.iter().map(|&(_, _, c, _)| c).collect();
+        let window = batchable_window(self.artifact.max_seq, self.batch, &caps);
         let end = tokens.len().min(window);
         if end <= from {
             return Ok(from);
@@ -307,11 +334,15 @@ impl NpuPrefill {
                 .write_at(x_loc.arena, x_loc.off, &x)
                 .map_err(|e| EngineError::Device(format!("write prefill x: {e}")))?;
 
-            // `hd`, not `w.width`: a prefill angle buffer holds `dims.M` rows, so its layout
-            // length is batch*head_dim*2 and `w.width` is the whole block rather than one row.
+            // `w.width / batch` and `w.partial`, both per TABLE: Gemma-4-12B's global table is
+            // 512 wide and partially rotated against a sliding 256 that is not, so the scalar
+            // `dims.head_dim` short-writes every global row by half and `None` rotates pairs the
+            // model leaves as identity. Same two numbers decode reads off `RopeWrite`.
             for w in &self.rope_writes {
+                let block =
+                    rope_block(chunk.start, self.batch, w.width / self.batch, w.theta, w.partial);
                 arena
-                    .write_at(w.loc.arena, w.loc.off, &rope_block(chunk.start, self.batch, hd, w.theta))
+                    .write_at(w.loc.arena, w.loc.off, &block)
                     .map_err(|e| {
                         EngineError::Device(format!("write prefill rope table @{}: {e}", w.loc.off))
                     })?;
@@ -325,20 +356,58 @@ impl NpuPrefill {
                 })?;
             }
 
-            // `kv_param` is "addr"-kind (element-unit BD offset, no shift); `mask_param` is
-            // "core"-kind and the firmware's UPDATE_REG convention requires the host to pre-shift
-            // by 2 bits. Both values are the decode ones with `M` substituted for 1, so a prefill
-            // ELF built at M=1 would be driven byte-identically to the decode ELF.
-            // The BLOCKED offset, via the same helper decode uses. This was `chunk.start * hd`,
-            // the flat formula: correct while the cache was [Hkv, S, HD] and silently wrong once
-            // decode blocked it, because prefill then primed the right bytes at the wrong
-            // addresses. At kv_block == max_seq the helper returns exactly `pos * head_dim`, so
-            // the flat path is unchanged.
-            let kv = crate::llm::kv_layout::kv_off(
-                chunk.start, self.artifact.kv_block, hd, self.artifact.kv_heads) as u32;
-            self.res
-                .write_scratchpad(self.artifact.kv_off.byte_offset, &kv.to_le_bytes())
-                .map_err(|e| EngineError::Device(format!("write prefill kv_off scratchpad: {e}")))?;
+            // `kv_param` is "addr"-kind (element-unit BD offset, no shift). Both values are the
+            // decode ones with `M` substituted for 1, so a prefill ELF built at M=1 would be
+            // driven byte-identically to the decode ELF.
+            //
+            // ONE write per DISTINCT geometry, to that geometry's OWN slot, via the same
+            // `kv_off_circular` decode drives its per-geometry slots through -- see its module
+            // doc. `kv_windows` is empty only for an artifact built before per-geometry capacity
+            // existed (`check_prefill_pairing` would already have refused a narrowed decode
+            // paired with one), which keeps the flat single-slot write below unchanged for it.
+            if self.artifact.kv_windows.is_empty() {
+                // The BLOCKED offset, via the same helper decode uses. This was `chunk.start *
+                // hd`, the flat formula: correct while the cache was [Hkv, S, HD] and silently
+                // wrong once decode blocked it, because prefill then primed the right bytes at
+                // the wrong addresses. At kv_block == max_seq the helper returns exactly `pos *
+                // head_dim`, so the flat path is unchanged.
+                let kv = crate::llm::kv_layout::kv_off(
+                    chunk.start, self.artifact.kv_block, hd, self.artifact.kv_heads) as u32;
+                self.res
+                    .write_scratchpad(self.artifact.kv_off.byte_offset, &kv.to_le_bytes())
+                    .map_err(|e| EngineError::Device(format!("write prefill kv_off scratchpad: {e}")))?;
+            } else {
+                for &(slot, head_dim, capacity, _) in &self.artifact.kv_windows {
+                    if crosses_wrap_point(chunk.start, self.batch, capacity) {
+                        return Err(EngineError::Unsupported(format!(
+                            "prefill chunk at {} spans the wrap point of a capacity-{capacity} \
+                             geometry (head_dim={head_dim}): one dispatch cannot split across it",
+                            chunk.start
+                        )));
+                    }
+                    // `kv_heads` below is the artifact's one scalar and it reaches the address
+                    // only through `block_stride`, so it is right exactly while this geometry is
+                    // ONE block -- true of every build today, and not of a blocked cache on a
+                    // model whose geometries differ in kv_heads (Gemma-4: 8 sliding, 1 global).
+                    // The per-geometry count is in neither meta, so refuse rather than address
+                    // with the base geometry's.
+                    if self.artifact.kv_windows.len() > 1 && self.artifact.kv_block < capacity {
+                        return Err(EngineError::Unsupported(format!(
+                            "capacity-{capacity} geometry (head_dim={head_dim}) is blocked at \
+                             kv_block={}, so its address needs that geometry's own kv_heads and \
+                             the artifact declares only {}",
+                            self.artifact.kv_block, self.artifact.kv_heads
+                        )));
+                    }
+                    let kv = crate::llm::kv_layout::kv_off_circular(
+                        chunk.start, capacity, self.artifact.kv_block, head_dim,
+                        self.artifact.kv_heads,
+                    ) as u32;
+                    self.res
+                        .write_scratchpad(slot.byte_offset, &kv.to_le_bytes())
+                        .map_err(|e| EngineError::Device(format!("write prefill kv_off scratchpad: {e}")))?;
+                }
+            }
             // A SCALAR width cannot express causality within a chunk (row i must not see row
             // j > i), which is why the causal arm streams the per-row vector above instead and
             // declares no `mask_param`. This branch survives for the degenerate build that has a
@@ -377,6 +446,42 @@ mod tests {
         assert_eq!(prefill_window(2040, 256), 1792);
         // A window shorter than one batch primes nothing: there is no whole chunk to run.
         assert_eq!(prefill_window(200, 256), 0);
+    }
+
+    #[test]
+    fn a_narrowed_geometry_floors_the_batchable_window_below_max_seq() {
+        // The served Gemma-4-12B pair: S=6912, M=256, sliding capacity 1024 against global 6912.
+        // Batched prefill covers the first 1024 positions; the rest is the caller's stepwise loop.
+        assert_eq!(batchable_window(6912, 256, &[1024, 6912]), 1024);
+        // No narrowed geometry, and no declared geometry at all (a pre-kv_windows artifact), are
+        // both the unfloored window.
+        assert_eq!(batchable_window(6912, 256, &[6912, 6912]), 6912);
+        assert_eq!(batchable_window(6912, 256, &[]), 6912);
+        // The floor is batch-aligned like every other window: a 1000-position capacity admits
+        // three whole chunks, not three and a fragment.
+        assert_eq!(batchable_window(6912, 256, &[1000]), 768);
+    }
+
+    #[test]
+    fn gemma4s_shipped_capacity_and_batch_never_cross_the_wrap_point() {
+        // capacity=1024, batch=256: 1024 % 256 == 0, so every chunk boundary is a multiple of the
+        // capacity and no chunk's span reaches past it.
+        for start in [0, 256, 512, 768, 1024, 1280, 6656] {
+            assert!(!crosses_wrap_point(start, 256, 1024), "start={start}");
+        }
+    }
+
+    #[test]
+    fn a_batch_that_does_not_divide_capacity_can_cross() {
+        let capacity = 1024;
+        // [900, 1200) straddles the 1024 boundary.
+        assert!(crosses_wrap_point(900, 300, capacity));
+        // [600, 900) stays inside it.
+        assert!(!crosses_wrap_point(600, 300, capacity));
+        // The chunk landing exactly on the boundary is the edge case: [724, 1024) ends AT
+        // capacity, not past it.
+        assert!(!crosses_wrap_point(724, 300, capacity));
+        assert!(crosses_wrap_point(725, 300, capacity));
     }
 
     #[test]
@@ -454,7 +559,7 @@ mod tests {
     #[test]
     fn a_rope_block_is_the_m1_rows_for_the_chunks_absolute_positions() {
         let (hd, batch, start) = (8usize, 4usize, 12usize);
-        let block = rope_block(start, batch, hd, THETA);
+        let block = rope_block(start, batch, hd, THETA, None);
         assert_eq!(block.len(), batch * hd * 2, "[M, head_dim] bf16, token-major");
         for i in 0..batch {
             let want = pack_bf16_bytes(&rope_row(start + i, hd, THETA, rope_angles(hd, None)));
@@ -465,7 +570,7 @@ mod tests {
     #[test]
     fn the_first_chunks_first_row_is_position_zero() {
         let hd = 128;
-        let block = rope_block(0, 2, hd, THETA);
+        let block = rope_block(0, 2, hd, THETA, None);
         // pos 0 -> every angle is 0 -> cos=1, sin=0, whatever theta and head_dim are.
         let want = pack_bf16_bytes(&rope_row(0, hd, THETA, rope_angles(hd, None)));
         assert_eq!(&block[..hd * 2], &want[..]);
@@ -477,8 +582,8 @@ mod tests {
         // The seam the chunk loop has to get right: the last row of chunk c and the first row of
         // chunk c+1 are consecutive absolute positions, not a restart.
         let (hd, m) = (8usize, 4usize);
-        let c0 = rope_block(0, m, hd, THETA);
-        let c1 = rope_block(m, m, hd, THETA);
+        let c0 = rope_block(0, m, hd, THETA, None);
+        let c1 = rope_block(m, m, hd, THETA, None);
         assert_eq!(&c1[..hd * 2], &pack_bf16_bytes(&rope_row(m, hd, THETA, rope_angles(hd, None)))[..]);
         assert_ne!(&c0[..hd * 2], &c1[..hd * 2]);
     }
@@ -573,7 +678,7 @@ mod tests {
         // prefill graph. If this ever stops holding, the two halves have diverged in the host
         // protocol and the token-identity gate will fail for a reason no device trace will show.
         for pos in [0usize, 1, 7, 2047] {
-            assert_eq!(rope_block(pos, 1, 128, THETA), pack_bf16_bytes(&rope_row(pos, 128, THETA, rope_angles(128, None))));
+            assert_eq!(rope_block(pos, 1, 128, THETA, None), pack_bf16_bytes(&rope_row(pos, 128, THETA, rope_angles(128, None))));
         }
     }
 }

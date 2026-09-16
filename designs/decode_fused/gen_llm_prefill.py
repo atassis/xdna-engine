@@ -192,6 +192,13 @@ def causal_widths(base, M, S, heads):
     `S` masks nothing, and a width of 0 leaves the row all -inf, whose softmax is NaN rather than
     a small number. The clamp at S is reachable -- the last chunk of a full window has
     `base + M - 1 == S - 1`, so its final width is exactly S.
+
+    ONE clamp serves every geometry, including a narrowed (sliding) one whose own softmax runs at
+    `cols = w < S`: while `base + M <= w` the width is `base + i + 1` either way, so the global
+    clamp and a per-window `min(base + i + 1, w)` are the same vector. That inequality is not an
+    assumption here -- `npu_prefill.rs::batchable_window` is what holds it, and it holds it because
+    past `w` the valid slots stop being a prefix at all and no width, per-window or not, names
+    them.
     """
     w = np.clip(np.arange(M, dtype=np.int64) + base + 1, 1, S).astype(np.int32)
     return np.tile(w, heads)
@@ -357,6 +364,13 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
              f"(blocked [S/T,Hkv,T,HD], head_stride={kvl.head_stride}, "
              f"block_stride={kvl.block_stride})"))
 
+    # Per-geometry KV capacity, read off decode's OWN build rather than re-derived: a sliding
+    # geometry (SLIDING_KV_CIRCULAR) is allocated at `sliding_window`, not S, and prefill's
+    # KV-append must target the SAME narrower buffer or it walks past the end of it -- the exact
+    # defect this pairs against (`check_prefill_pairing`'s `kv_windows` check).
+    sliding_kv_circular = bool(dm_early["dims"].get("sliding_kv_circular")) if dm_early else False
+    sliding_window = dm_early["dims"].get("sliding_window") if dm_early else None
+
     # Wqkv's ROW ORDER, likewise taken from the decode artifact rather than assumed.
     # decode_layer_dp's attn column c reads ONE contiguous run of (gqa+2) head blocks -- its gqa
     # query heads, then its own k head, then its own v head -- so decode REORDERS the stock
@@ -424,8 +438,13 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
                                  f"num_aie_columns*tile_size={cols * tile}")
         if (Hq * M) % cols:
             raise ValueError(f"Softmax rows=Hq*M={Hq * M} not divisible by num_aie_columns={cols}")
-    if S % 16:
-        raise ValueError(f"Softmax cols=S={S} must be a multiple of 16")
+        # Softmax cols is THIS geometry's window `w`, not the global S -- same derivation attn_ops
+        # uses below. A narrowed geometry's own window is the shape that reaches the op.
+        is_global_geom = hd == sp.global_head_dim and hkv == sp.global_n_kv_heads
+        w = (S if (is_global_geom or not sliding_kv_circular or sliding_window is None)
+             else sliding_window)
+        if w % 16:
+            raise ValueError(f"Softmax cols=w={w} @hd={hd} must be a multiple of 16")
 
     if os.environ.get("AIE_DEVICE"):
         import aie.utils as _aie_utils
@@ -565,6 +584,37 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
     # gen_llm_decode.py's `attn_ops` (gen_llm_decode.py:1259).
     multi_geom = len(geoms) > 1
     _attn_cache = {}
+    # One (kv_param, head_dim, window, mask_param) entry per DISTINCT geometry, appended as each is
+    # built -- emitted verbatim as `scratchpad.kv_windows`, mirroring gen_llm_decode.py's
+    # `geom_slots`. `mask_param` has no real counterpart here (prefill masks with the per-row
+    # `mask_widths` vector, not a scratchpad scalar); it names this entry's OWN `kv_param` so the
+    # field still resolves to a declared scratchpad parameter, and nothing reads it as a mask --
+    # `check_prefill_pairing` matches `kv_windows` entries on `(head_dim, window)` alone.
+    geom_slots = []
+    # attn_ops (below) builds a per-WINDOW softmax and needs `sm_kw`/`attn_order` to do it -- see
+    # `_win_cache`.
+    sm_kw = dict(vector_size_source="rows") if causal == "rows" else {}
+    # PREFILL_ATTN_ORDER is a CONFIGURE-COST CONTROL, not a feature. Both arms split the softmax
+    # per head -- legal because softmax is per ROW and every head's sc/sw/widths slice is
+    # contiguous -- so the two arms run IDENTICAL ops over IDENTICAL bytes with IDENTICAL designs,
+    # and differ only in runlist ORDER, hence only in how many contiguous same-design blocks the
+    # dispatch configures. `grouped` is 2 blocks for the 32 ops, `interleaved` is 32.
+    #
+    # It exists because D009's 51.0-61.9 us per configure is measured on DECODE and the prefill
+    # regime cell is `p`. If prefill's per-configure cost really is ~55 us, +30 configures/layer
+    # costs ~46 ms; if the per-layer residual is un-overlapped objectFIFO fill/drain at ~350 us a
+    # configure, it costs ~294 ms. The arms separate those by 6x, which no drift can hide.
+    # `off` (the default) is the shipped single whole-buffer softmax, unchanged.
+    attn_order = os.environ.get("PREFILL_ATTN_ORDER", "off")
+    if attn_order not in ("off", "grouped", "interleaved"):
+        raise ValueError(f"PREFILL_ATTN_ORDER={attn_order!r}; want off|grouped|interleaved")
+    n_il = int(os.environ.get("PREFILL_ATTN_HEADS", Hq))
+    # Softmax designs, keyed by WINDOW rather than by full geometry key -- two geometries sharing a
+    # window must share the SAME design object or gain a configure they didn't have before (mirrors
+    # gen_llm_decode.py's `_win_cache`). Every shipped spec has one window (w == S everywhere), so
+    # this produces exactly the one shared design it always did; only SLIDING_KV_CIRCULAR narrowing
+    # one geometry's `w` away from `S` (Gemma-4-12B) makes it produce a second.
+    _win_cache = {}
 
     def attn_ops(hd, hkv, has_v):
         key = (hd, hkv, has_v)
@@ -605,16 +655,39 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
         op_gkv = gemm_for(f"kv{sfx}", D, kvd, blocking=(
             (blocking["k"][0], qkv_rows * D) if hm else None), site="qkv")
         op_o = gemm_for(f"o{sfx}", qd, D, site="o")
-        # scores: B is the kv cache read as [N=S, K=hd] -> b_col_maj. ctx: the SAME bytes read as
-        # [K=S, N=hd] -> plain. `kv_T` is the SAME block size for every geometry -- the only shared
-        # arenas measured so far are flat (kv_T==S) on Gemma-4 and blocked on the uniform-geometry
-        # gemma3-270m, so a per-geometry T has never been exercised; assumed here, not verified.
-        kvl_g = KVLayout(Hkv=hkv, S=KVA, HD=hd, T=kv_T)
+        # This geometry's own KV capacity: S for the global geometry (identified by matching
+        # spec.global_head_dim/global_n_kv_heads, same test gen_llm_decode.py's attn_ops uses), or
+        # decode's `sliding_window` for every other one once SLIDING_KV_CIRCULAR narrowed it.
+        # `kv_T` stays the block size derived from decode's flat `dims.kv_block`; capped to this
+        # geometry's own capacity the same way decode's `T_g = min(T, w)` is.
+        is_global_geom = hd == sp.global_head_dim and hkv == sp.global_n_kv_heads
+        w = (S if (is_global_geom or not sliding_kv_circular or sliding_window is None)
+             else sliding_window)
+        KVA_g = kv_alloc or w
+        T_g = min(kv_T, w)
+        kv_slot = "kv_off" if not geom_slots else f"kv_off{len(geom_slots)}"
+        geom_slots.append((kv_slot, hd, w, kv_slot))
+        # scores: B is the kv cache read as [N=w, K=hd] -> b_col_maj. ctx: the SAME bytes read as
+        # [K=w, N=hd] -> plain. N/K is THIS geometry's own window `w`, matching `kv_slab()`'s own
+        # w-sized span -- an S-wide operand here would read past a narrowed geometry's buffer.
+        kvl_g = KVLayout(Hkv=hkv, S=KVA_g, HD=hd, T=T_g)
         kv_blk = (kvl_g.T, kvl_g.block_stride) if kvl_g.T != kvl_g.S else None
-        op_sc = gemm_for(f"scores{sfx}", hd, S, blocking=kv_blk,
+        op_sc = gemm_for(f"scores{sfx}", hd, w, blocking=kv_blk,
                          extra=dict(a_row_stride=qd) if seam else {})
-        op_cx = gemm_for(f"ctx{sfx}", S, hd, b_col_maj=False, blocking=kv_blk,
+        op_cx = gemm_for(f"ctx{sfx}", w, hd, b_col_maj=False, blocking=kv_blk,
                          extra=dict(c_row_stride=qd) if seam else {})
+        # Softmax, shared across every geometry at this WINDOW (see `_win_cache`'s own comment).
+        # `rows` comes from Hq/M alone, not from hd/hkv, so the shared design is correct even where
+        # two distinct geometries land on the same window.
+        if w not in _win_cache:
+            _win_cache[w] = (
+                Softmax(rows=Hq * M, cols=w, num_aie_columns=cols, num_channels=1,
+                        context=ctx, allocation_scheme=alloc_all, **sm_kw),
+                Softmax(rows=M, cols=w, num_aie_columns=cols, num_channels=1,
+                        context=ctx, allocation_scheme=alloc_all, **sm_kw)
+                if attn_order != "off" else None,
+            )
+        op_sm_w, op_sm_head_w = _win_cache[w]
         # KV append. The cache is [hkv, S, hd] and `kv_off` is an element-unit BD offset, so M
         # consecutive positions are M contiguous rows per head -- the M=1 BD with an extra outer
         # dimension, not a new mechanism. The SOURCE is token-major [M, hkv, hd], so the (M, hkv)
@@ -638,7 +711,11 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
             output_sizes=kv_out_sizes, output_strides=kv_out_strides, output_offset=0,
             input_buffer_size=M * hkv * hd, output_buffer_size=kvl_g.total_elems,
             transfer_size=pick_transfer(M * hkv * hd), num_aie_channels=1,
-            output_offset_parameter="kv_off", context=ctx)
+            # THIS geometry's slot, the spelling `geom_slots` puts in the meta -- the two need
+            # different runtime values (different capacity, different head_dim), and a meta naming
+            # a slot the ELF never declared does not load at all. First geometry keeps the bare
+            # `kv_off` for the same reason decode's does: the pre-list host fallback reads it.
+            output_offset_parameter=kv_slot, context=ctx)
         # The head-axis seam, both directions -- only built (and only ever used) when `not seam`.
         # See the module docstring for why these exist and what they cost; pure DMA, 0% compute.
         op_q2h = op_h2t = None
@@ -653,10 +730,11 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
                 output_sizes=(M, Hq, hd), output_strides=(Hq * hd, hd, 1), output_offset=0,
                 input_buffer_size=M * qd, output_buffer_size=M * qd,
                 transfer_size=pick_transfer(M * qd), num_aie_channels=1, context=ctx)
-        g = SimpleNamespace(hd=hd, hkv=hkv, has_v=has_v, qd=qd, kvd=kvd, grp=g_grp, sfx=sfx,
+        g = SimpleNamespace(hd=hd, hkv=hkv, has_v=has_v, qd=qd, kvd=kvd, grp=g_grp, sfx=sfx, w=w,
                             qkv_rows=qkv_rows, blocking=blocking, kvl=kvl_g,
                             op_qn=op_qn, op_kn=op_kn, op_vn=op_vn, op_rq=op_rq, op_rk=op_rk,
                             op_gq=op_gq, op_gkv=op_gkv, op_o=op_o, op_sc=op_sc, op_cx=op_cx,
+                            op_sm=op_sm_w, op_sm_head=op_sm_head_w,
                             op_kvapp=op_kvapp, op_q2h=op_q2h, op_h2t=op_h2t)
         _attn_cache[key] = g
         return g
@@ -679,33 +757,10 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
     print("[tiles] " + "  ".join(
         f"{k}={v['tile'][0]}x{v['tile'][1]}x{v['tile'][2]}@{v['cols']}c({v['source']})"
         for k, v in sorted(tiles.items())))
-    # ONE softmax over every head's rows at once: its `rows` axis is just "independent rows to
-    # normalise", and every head's [M, S] block is a contiguous slice of the same buffer. That is
-    # also what makes the causal mask a plain vector: row Hq*M is (head, token) flattened, and the
-    # width depends only on the token half.
-    sm_kw = dict(vector_size_source="rows") if causal == "rows" else {}
-    # PREFILL_ATTN_ORDER is a CONFIGURE-COST CONTROL, not a feature. Both arms split the softmax
-    # per head -- legal because softmax is per ROW and every head's sc/sw/widths slice is
-    # contiguous -- so the two arms run IDENTICAL ops over IDENTICAL bytes with IDENTICAL designs,
-    # and differ only in runlist ORDER, hence only in how many contiguous same-design blocks the
-    # dispatch configures. `grouped` is 2 blocks for the 32 ops, `interleaved` is 32.
-    #
-    # It exists because D009's 51.0-61.9 us per configure is measured on DECODE and the prefill
-    # regime cell is `p`. If prefill's per-configure cost really is ~55 us, +30 configures/layer
-    # costs ~46 ms; if the per-layer residual is un-overlapped objectFIFO fill/drain at ~350 us a
-    # configure, it costs ~294 ms. The arms separate those by 6x, which no drift can hide.
-    # `off` (the default) is the shipped single whole-buffer softmax, unchanged.
-    attn_order = os.environ.get("PREFILL_ATTN_ORDER", "off")
-    if attn_order not in ("off", "grouped", "interleaved"):
-        raise ValueError(f"PREFILL_ATTN_ORDER={attn_order!r}; want off|grouped|interleaved")
-    n_il = int(os.environ.get("PREFILL_ATTN_HEADS", Hq))
-    op_sm = Softmax(rows=Hq * M, cols=S, num_aie_columns=cols, num_channels=1,
-                    context=ctx, allocation_scheme=alloc_all, **sm_kw)
-    # One design serves every head: same rows, same cols. Only how many times the runlist SWITCHES
-    # to it changes between the arms.
-    op_sm_head = (Softmax(rows=M, cols=S, num_aie_columns=cols, num_channels=1,
-                          context=ctx, allocation_scheme=alloc_all, **sm_kw)
-                  if attn_order != "off" else None)
+    # ONE softmax per WINDOW over every head's rows at once (see `_win_cache` in attn_ops): its
+    # `rows` axis is just "independent rows to normalise", and every head's [M, w] block is a
+    # contiguous slice of the same buffer. That is also what makes the causal mask a plain vector:
+    # row Hq*M is (head, token) flattened, and the width depends only on the token half.
     if sp.act == "silu":
         op_act = SiLU(size=M * FF, num_aie_columns=cols, tile_size=FF // cols, context=ctx,
                       allocation_scheme=alloc_all)
@@ -724,25 +779,29 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
     # Every prefill intermediate is ONE buffer shared by all layers: the sequence runs layers one
     # at a time, so nothing outlives its layer. Decode declares them per layer; at M=256 that
     # would be 28 * 43 MB of arena for no reason.
-    # q/k/v/cxt are geometry-shaped: IRON's calculate_buffer_layout rejects one buffer NAME
+    # q/k/v/cxt/sc/sw are geometry-shaped: IRON's calculate_buffer_layout rejects one buffer NAME
     # declared at two different operator shapes (a GEMM's own arg spec, not just this file's
     # `bufsz`), so a multi-geometry build needs one buffer per geometry, suffixed exactly like the
-    # tile labels (`sfx` in `attn_ops`) -- `q` unsuffixed when every spec has one geometry, which
-    # keeps the uniform case's buffer set (and arena) byte-identical to before this axis existed.
+    # tile labels (`sfx` in `attn_ops`) -- unsuffixed when every spec has one geometry, which keeps
+    # the uniform case's buffer set (and arena) byte-identical to before this axis existed. sc/sw
+    # are sized off THIS geometry's own window `g.w`, not the global S -- a narrowed geometry's
+    # scores/softmax tile is `[Hq*M, w]`, not `[Hq*M, S]` (see attn_ops).
     bufsz = {
         "h": M * D * 2,
-        "sc": Hq * M * S * 2, "sw": Hq * M * S * 2,
         "a": M * D * 2, "xs": M * D * 2,
         "hf": M * D * 2, "gs": M * FF * 2, "u": M * FF * 2,
         "gh": M * FF * 2, "d": M * D * 2,
     }
     for hd, hkv, has_v in geoms:
-        gsfx = f"_hd{hd}" if multi_geom else ""
+        g = attn_ops(hd, hkv, has_v)
+        gsfx = g.sfx
         qd, kvd = Hq * hd, hkv * hd
         bufsz[f"q{gsfx}"] = M * qd * 2
         bufsz[f"k{gsfx}"] = M * kvd * 2
         bufsz[f"v{gsfx}"] = M * kvd * 2
         bufsz[f"cxt{gsfx}"] = M * qd * 2
+        bufsz[f"sc{gsfx}"] = Hq * M * g.w * 2
+        bufsz[f"sw{gsfx}"] = Hq * M * g.w * 2
         if not seam:
             bufsz[f"qh{gsfx}"] = M * qd * 2
             bufsz[f"cx{gsfx}"] = M * qd * 2
@@ -1051,6 +1110,8 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
         ] + ([] if seam else [(g.op_q2h, qb, qhb)])
         # The widths buffer is an INPUT of the softmax step, not a side channel: op.get_arg_spec()
         # puts it between in and out, so it is the middle name here.
+        scb, swb = f"sc{g.sfx}", f"sw{g.sfx}"
+
         def qslice(h):
             """Head h's queries: a strided slice of token-major `q`, or the head-major copy."""
             if not seam:
@@ -1059,13 +1120,13 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
 
         def score(h):
             return (g.op_sc, qslice(h), kv_slab(p + "kc", h // grp, g),
-                    f"sc[{h * M * S * 2}:{(h + 1) * M * S * 2}]")
+                    f"{scb}[{h * M * g.w * 2}:{(h + 1) * M * g.w * 2}]")
 
         def soft(h):
-            sl = f"sc[{h * M * S * 2}:{(h + 1) * M * S * 2}]"
-            out = f"sw[{h * M * S * 2}:{(h + 1) * M * S * 2}]"
-            w = f"{SM_WIDTHS}[{h * M * 4}:{(h + 1) * M * 4}]"
-            return (op_sm_head, sl, w, out) if causal == "rows" else (op_sm_head, sl, out)
+            sl = f"{scb}[{h * M * g.w * 2}:{(h + 1) * M * g.w * 2}]"
+            out = f"{swb}[{h * M * g.w * 2}:{(h + 1) * M * g.w * 2}]"
+            wid = f"{SM_WIDTHS}[{h * M * 4}:{(h + 1) * M * 4}]"
+            return (g.op_sm_head, sl, wid, out) if causal == "rows" else (g.op_sm_head, sl, out)
 
         if attn_order == "interleaved":
             # Only the first `n_il` heads alternate; the rest stay grouped. The knob exists because
@@ -1080,12 +1141,12 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
             rl += [score(h) for h in range(Hq)] + [soft(h) for h in range(Hq)]
         else:
             rl += [score(h) for h in range(Hq)]
-            rl.append((op_sm, "sc", SM_WIDTHS, "sw") if causal == "rows"
-                      else (op_sm, "sc", "sw"))
+            rl.append((g.op_sm, scb, SM_WIDTHS, swb) if causal == "rows"
+                      else (g.op_sm, scb, swb))
         for h in range(Hq):
             cx_out = (f"{cxtb}[{h * hd * 2}:{(h * hd + g.op_cx.c_elems) * 2}]" if seam
                       else f"{cxb}[{h * M * hd * 2}:{(h + 1) * M * hd * 2}]")
-            rl.append((g.op_cx, f"sw[{h * M * S * 2}:{(h + 1) * M * S * 2}]",
+            rl.append((g.op_cx, f"{swb}[{h * M * g.w * 2}:{(h + 1) * M * g.w * 2}]",
                        kv_slab(p + "vc", h // grp, g), cx_out))
         rl += ([] if seam else [(g.op_h2t, cxb, cxtb)]) + \
             weight_gemm(p, "Wo", g.op_o, g.qd, D, cxtb, "a", f"o_hd{hd}", site="o", layer=l) + \
@@ -1189,6 +1250,7 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
                     f"{got[0]} offset {got[1]} len {got[2]}, the decode artifact at "
                     f"scratch offset {want['offset']} len {want['len']} -- the two ELFs cannot "
                     f"share one FusedArena")
+    check_operand_bounds(rl, fused)
 
     # meta.json's tile_n_scores/tile_n_ctx are ONE representative number; a multi-geometry build
     # reports the base (sliding) geometry's and the full per-geometry breakdown is in `tiles`.
@@ -1202,7 +1264,7 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
     prefill_local = sorted(n for n in bufsz if n not in dec_sizes)
     dims = dict(NL=NL, M=M, S=S, inputs=inputs, cache_names=cache_names,
                 tn_sc=tn_sc, tn_cx=tn_cx, tiles=tiles, cols=cols, causal=causal,
-                kv_block=kvl.T, wqkv_head_major=hm,
+                kv_block=kvl.T, wqkv_head_major=hm, geom_slots=geom_slots,
                 sm_widths=(SM_WIDTHS if causal == "rows" else None), sm_rows=Hq * M,
                 shared=[n for n in dec_order if not n.startswith("__decode_gap")],
                 reserved=dec_reserved, prefill_local=prefill_local, quant_pack=quant_pack,
@@ -1216,6 +1278,48 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
                 n_designs=len(fused.unique_designs()[0]),
                 n_configures=count_configures(rl, fused))
     return sp, fused, dims
+
+
+def check_operand_bounds(runlist, fused):
+    """Every operand's own declared extent against the bytes its buffer actually holds.
+
+    The `scratch_order` check above compares each shared buffer's (offset, len) with decode's meta
+    and prefill INHERITS both from it, so it passes by construction and cannot see a descriptor
+    that addresses PAST the end of a buffer whose length the two halves agree on. IRON does not
+    own that either: `calculate_buffer_layout` records a slice's (start, end) and never compares
+    it to the parent's length or to the arg spec's own byte count. Two operand failures, both
+    checked here: wider than the slice it was handed, and leaving the buffer from that slice's
+    start.
+
+    What it catches, verified 2026-09-16 against decode_int4g32qat_s6912_l48_rg_mc: a scores/ctx
+    GEMM built at the global S over a sliding geometry declares 3538944 B of B per head against a
+    524288 B slab, and kv head 7 reaches 7208960 B in an `L0_kc` decode sized to 4194304.
+    """
+    worst = {}
+    for op, *bufs in runlist:
+        for spec, nm in zip(op.get_arg_spec(), bufs):
+            base = nm.split("[")[0]
+            buflen = fused.subbuffer_layout[base][2]
+            if "[" in nm:
+                lo, hi = (int(x) for x in nm[nm.index("[") + 1:-1].split(":"))
+            else:
+                lo, hi = 0, buflen
+            need = int(np.prod(spec.shape)) * np.dtype(spec.dtype).itemsize
+            # Ranked so a span that leaves the BUFFER outranks one that merely overruns its slice
+            # into a sibling: same arithmetic, but only the first corrupts the shared arena.
+            rank = (max(lo + need - buflen, 0), max(need - (hi - lo), 0))
+            if not any(rank):
+                continue
+            key = (type(op).__name__, base)
+            if rank > worst.get(key, ((0, 0),))[0]:
+                worst[key] = (rank, nm, need, hi - lo, lo, buflen)
+    if not worst:
+        return
+    lines = [f"  {kind} on {nm}: declares {need} B from offset {lo}, reaching {lo + need} -- "
+             f"slice holds {have} B and buffer {base!r} is {buflen} B"
+             for (kind, base), (_, nm, need, have, lo, buflen) in sorted(worst.items())]
+    raise ValueError(
+        f"{len(worst)} operand(s) address past the buffer they were given:\n" + "\n".join(lines))
 
 
 def count_configures(runlist, fused):
@@ -1301,7 +1405,7 @@ def operand_bytes(runlist, resolve, shared):
         base = name.split("[")[0]
         if base.endswith("_kc") or base.endswith("_vc"):
             return "cache"
-        if base in ("sc", "sw"):
+        if base == "sc" or base == "sw" or base.startswith(("sc_hd", "sw_hd")):
             return "scores"
         return "weights" if base in shared else "activations"
 
@@ -1587,6 +1691,14 @@ def main():
             if line.strip():
                 n_, idx, ty, kind = line.split()
                 scratchpad_params[n_] = {"byte_offset": int(idx) * 4, "kind": kind, "dtype": ty}
+    # `geom_slots` names the slots the META will advertise; `params.txt` is what the ELF actually
+    # declares. They are produced by different halves of the build and nothing else compares them,
+    # so a geometry whose `output_offset_parameter` was never threaded through ships an artifact
+    # that cannot load -- which is how this one was found, at `LlmArtifact::load_prefill`.
+    undeclared = [n for n, _, _, _ in dims["geom_slots"] if n not in scratchpad_params]
+    if undeclared:
+        raise SystemExit(f"ERROR: geom_slots names scratchpad parameter(s) {undeclared} that the "
+                         f"ELF does not declare (params.txt has {sorted(scratchpad_params)})")
 
     lay_names = [*dims["inputs"], "xout", *dims["shared"], *dims["prefill_local"]]
     lay = {n: fused.get_layout_for_buffer(n) for n in lay_names}
@@ -1640,6 +1752,11 @@ def main():
             # No scalar causal width in either arm: `rows` streams a per-row vector instead, and
             # `none` masks nothing at all.
             "mask_param": None,
+            "kv_params": [{"param": n, "head_dim": hd} for n, hd, _, _ in dims["geom_slots"]],
+            # Per-geometry KV capacity, the pairing check reads this to catch a decode geometry
+            # narrower than S with no matching prefill capacity -- see `geom_slots`'s own comment.
+            "kv_windows": [{"kv_param": n, "head_dim": hd, "window": ww, "mask_param": mp}
+                           for n, hd, ww, mp in dims["geom_slots"]],
             "head_dim": HD, "kv_heads": Hkv,
         },
         "dims": {"layers": NL, "M": M, "S": S, "d_model": D, "ffn": FF,
@@ -1694,6 +1811,11 @@ def main():
             "softmax runs); the KV of layers >= 1 is not, because it is computed from a "
             "non-causal layer-0 output. This arm is the A/B control, not a seed for a decode.",
         ]) + ([
+            f"batched prefill covers positions [0, {min(ww for _, _, ww, _ in dims['geom_slots'])}) "
+            f"only, not the full S={S}: past the narrowest geometry's capacity its circular cache "
+            "holds a wrapped interval and mask_bf16's suffix mask cannot express one. The host "
+            "stops there (npu_prefill.rs::batchable_window) and finishes the prompt stepwise.",
+        ] if dims["causal"] == "rows" and any(ww < S for _, _, ww, _ in dims["geom_slots"]) else []) + ([
             f"KV cache is blocked (T={dims['kv_block']}): the scores/ctx GEMMs address it in "
             "place, "
             "through a rewritten B descriptor (GEMM's b_block_rows/b_block_stride), so blocking "

@@ -576,10 +576,11 @@ impl LlmArtifact {
                 }
                 out
             }
-            // `sm_mask` is itself optional -- `None` on every prefill artifact (masked instead by
-            // `mask_widths`, a different mechanism entirely). No mask slot means no geometry to
-            // bound here either, so this degrades to empty rather than erroring; nothing in the
-            // prefill dispatch path reads `kv_windows`.
+            // `sm_mask` is itself optional -- `None` on every prefill artifact built before the
+            // generator emitted `kv_windows` (masked instead by `mask_widths`, a different
+            // mechanism entirely). No mask slot means no geometry to bound here either, so this
+            // degrades to empty rather than erroring, and `NpuPrefill::prime` reads an empty list
+            // as "one flat slot, full capacity" exactly as those artifacts were built.
             _ => match sm_mask {
                 Some(sm) => kv_offs.iter().map(|&(p, hd)| (p, hd, max_seq, sm)).collect(),
                 None => Vec::new(),
@@ -767,13 +768,27 @@ impl LlmArtifact {
         // error) or overrun into the next input buffer. Checked for the prefill role only: the
         // decode artifacts already in the field are not re-validated by this change.
         if role == ArtifactRole::Prefill {
-            let rope_names = rope_inputs.iter().map(|(n, _)| (n.as_str(), head_dim, "head_dim"));
-            for (name, unit, what) in std::iter::once(("x", d_model, "d_model")).chain(rope_names) {
-                let Some(loc) = layout.get(name) else { continue };
-                let want = batch * unit * 2;
+            if let Some(loc) = layout.get("x") {
+                let want = batch * d_model * 2;
                 if loc.len != want {
                     return Err(ctx(format!(
-                        "layout[{name}].len = {} but dims.M({batch}) * {what}({unit}) * 2 = {want}",
+                        "layout[x].len = {} but dims.M({batch}) * d_model({d_model}) * 2 = {want}",
+                        loc.len
+                    )));
+                }
+            }
+            // A RoPE table's row is its OWN geometry's head_dim, not `dims.head_dim`: Gemma-4-12B
+            // rotates its global layers over 512 and its sliding ones over 256, so the two tables
+            // are different widths in one artifact. Checked against the geometries `kv_params`
+            // declares rather than against the scalar, which is only the base one.
+            let geoms: Vec<usize> = kv_offs.iter().map(|&(_, hd)| hd).collect();
+            for (name, _) in &rope_inputs {
+                let Some(loc) = layout.get(name.as_str()) else { continue };
+                let row = loc.len / (batch * 2);
+                if loc.len % (batch * 2) != 0 || !geoms.contains(&row) {
+                    return Err(ctx(format!(
+                        "layout[{name}].len = {} is not dims.M({batch}) rows of any geometry \
+                         scratchpad.kv_params declares ({geoms:?}), in bf16",
                         loc.len
                     )));
                 }
