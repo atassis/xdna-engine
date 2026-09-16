@@ -170,6 +170,16 @@ pub fn prefill_window(max_seq: usize, batch: usize) -> usize {
     if batch == 0 { 0 } else { (max_seq / batch) * batch }
 }
 
+/// Whether a chunk `[start, start + batch)` crosses a capacity-`capacity` geometry's wrap point.
+/// One `kv_off` write drives one dispatch of `batch` CONSECUTIVE positions; a chunk that straddles
+/// the wrap would need a second, shorter dispatch into the buffer's start, which the compiled ELF
+/// has no way to issue. Gemma-4's shipped shape (capacity=1024, batch=256) never crosses, because
+/// `capacity % batch == 0` puts every chunk boundary on a multiple of the capacity -- this is the
+/// general check for a build where that stops holding.
+fn crosses_wrap_point(start: usize, batch: usize, capacity: usize) -> bool {
+    start % capacity + batch > capacity
+}
+
 /// A resident device backend for one batched-prefill ELF, bound to a `FusedArena` it does not own.
 ///
 /// Constructed only through [`NpuDecodeStep::with_prefill`](crate::llm::NpuDecodeStep::with_prefill),
@@ -325,20 +335,44 @@ impl NpuPrefill {
                 })?;
             }
 
-            // `kv_param` is "addr"-kind (element-unit BD offset, no shift); `mask_param` is
-            // "core"-kind and the firmware's UPDATE_REG convention requires the host to pre-shift
-            // by 2 bits. Both values are the decode ones with `M` substituted for 1, so a prefill
-            // ELF built at M=1 would be driven byte-identically to the decode ELF.
-            // The BLOCKED offset, via the same helper decode uses. This was `chunk.start * hd`,
-            // the flat formula: correct while the cache was [Hkv, S, HD] and silently wrong once
-            // decode blocked it, because prefill then primed the right bytes at the wrong
-            // addresses. At kv_block == max_seq the helper returns exactly `pos * head_dim`, so
-            // the flat path is unchanged.
-            let kv = crate::llm::kv_layout::kv_off(
-                chunk.start, self.artifact.kv_block, hd, self.artifact.kv_heads) as u32;
-            self.res
-                .write_scratchpad(self.artifact.kv_off.byte_offset, &kv.to_le_bytes())
-                .map_err(|e| EngineError::Device(format!("write prefill kv_off scratchpad: {e}")))?;
+            // `kv_param` is "addr"-kind (element-unit BD offset, no shift). Both values are the
+            // decode ones with `M` substituted for 1, so a prefill ELF built at M=1 would be
+            // driven byte-identically to the decode ELF.
+            //
+            // ONE write per DISTINCT geometry, to that geometry's OWN slot, via the same
+            // `kv_off_circular` decode drives its per-geometry slots through -- see its module
+            // doc. `kv_windows` is empty only for an artifact built before per-geometry capacity
+            // existed (`check_prefill_pairing` would already have refused a narrowed decode
+            // paired with one), which keeps the flat single-slot write below unchanged for it.
+            if self.artifact.kv_windows.is_empty() {
+                // The BLOCKED offset, via the same helper decode uses. This was `chunk.start *
+                // hd`, the flat formula: correct while the cache was [Hkv, S, HD] and silently
+                // wrong once decode blocked it, because prefill then primed the right bytes at
+                // the wrong addresses. At kv_block == max_seq the helper returns exactly `pos *
+                // head_dim`, so the flat path is unchanged.
+                let kv = crate::llm::kv_layout::kv_off(
+                    chunk.start, self.artifact.kv_block, hd, self.artifact.kv_heads) as u32;
+                self.res
+                    .write_scratchpad(self.artifact.kv_off.byte_offset, &kv.to_le_bytes())
+                    .map_err(|e| EngineError::Device(format!("write prefill kv_off scratchpad: {e}")))?;
+            } else {
+                for &(slot, head_dim, capacity, _) in &self.artifact.kv_windows {
+                    if crosses_wrap_point(chunk.start, self.batch, capacity) {
+                        return Err(EngineError::Unsupported(format!(
+                            "prefill chunk at {} spans the wrap point of a capacity-{capacity} \
+                             geometry (head_dim={head_dim}): one dispatch cannot split across it",
+                            chunk.start
+                        )));
+                    }
+                    let kv = crate::llm::kv_layout::kv_off_circular(
+                        chunk.start, capacity, self.artifact.kv_block, head_dim,
+                        self.artifact.kv_heads,
+                    ) as u32;
+                    self.res
+                        .write_scratchpad(slot.byte_offset, &kv.to_le_bytes())
+                        .map_err(|e| EngineError::Device(format!("write prefill kv_off scratchpad: {e}")))?;
+                }
+            }
             // A SCALAR width cannot express causality within a chunk (row i must not see row
             // j > i), which is why the causal arm streams the per-row vector above instead and
             // declares no `mask_param`. This branch survives for the degenerate build that has a
@@ -377,6 +411,28 @@ mod tests {
         assert_eq!(prefill_window(2040, 256), 1792);
         // A window shorter than one batch primes nothing: there is no whole chunk to run.
         assert_eq!(prefill_window(200, 256), 0);
+    }
+
+    #[test]
+    fn gemma4s_shipped_capacity_and_batch_never_cross_the_wrap_point() {
+        // capacity=1024, batch=256: 1024 % 256 == 0, so every chunk boundary is a multiple of the
+        // capacity and no chunk's span reaches past it.
+        for start in [0, 256, 512, 768, 1024, 1280, 6656] {
+            assert!(!crosses_wrap_point(start, 256, 1024), "start={start}");
+        }
+    }
+
+    #[test]
+    fn a_batch_that_does_not_divide_capacity_can_cross() {
+        let capacity = 1024;
+        // [900, 1200) straddles the 1024 boundary.
+        assert!(crosses_wrap_point(900, 300, capacity));
+        // [600, 900) stays inside it.
+        assert!(!crosses_wrap_point(600, 300, capacity));
+        // The chunk landing exactly on the boundary is the edge case: [724, 1024) ends AT
+        // capacity, not past it.
+        assert!(!crosses_wrap_point(724, 300, capacity));
+        assert!(crosses_wrap_point(725, 300, capacity));
     }
 
     #[test]

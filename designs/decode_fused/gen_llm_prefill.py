@@ -357,6 +357,13 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
              f"(blocked [S/T,Hkv,T,HD], head_stride={kvl.head_stride}, "
              f"block_stride={kvl.block_stride})"))
 
+    # Per-geometry KV capacity, read off decode's OWN build rather than re-derived: a sliding
+    # geometry (SLIDING_KV_CIRCULAR) is allocated at `sliding_window`, not S, and prefill's
+    # KV-append must target the SAME narrower buffer or it walks past the end of it -- the exact
+    # defect this pairs against (`check_prefill_pairing`'s `kv_windows` check).
+    sliding_kv_circular = bool(dm_early["dims"].get("sliding_kv_circular")) if dm_early else False
+    sliding_window = dm_early["dims"].get("sliding_window") if dm_early else None
+
     # Wqkv's ROW ORDER, likewise taken from the decode artifact rather than assumed.
     # decode_layer_dp's attn column c reads ONE contiguous run of (gqa+2) head blocks -- its gqa
     # query heads, then its own k head, then its own v head -- so decode REORDERS the stock
@@ -565,6 +572,13 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
     # gen_llm_decode.py's `attn_ops` (gen_llm_decode.py:1259).
     multi_geom = len(geoms) > 1
     _attn_cache = {}
+    # One (kv_param, head_dim, window, mask_param) entry per DISTINCT geometry, appended as each is
+    # built -- emitted verbatim as `scratchpad.kv_windows`, mirroring gen_llm_decode.py's
+    # `geom_slots`. `mask_param` has no real counterpart here (prefill masks with the per-row
+    # `mask_widths` vector, not a scratchpad scalar); it names this entry's OWN `kv_param` so the
+    # field still resolves to a declared scratchpad parameter, and nothing reads it as a mask --
+    # `check_prefill_pairing` matches `kv_windows` entries on `(head_dim, window)` alone.
+    geom_slots = []
 
     def attn_ops(hd, hkv, has_v):
         key = (hd, hkv, has_v)
@@ -605,12 +619,30 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
         op_gkv = gemm_for(f"kv{sfx}", D, kvd, blocking=(
             (blocking["k"][0], qkv_rows * D) if hm else None), site="qkv")
         op_o = gemm_for(f"o{sfx}", qd, D, site="o")
+        # This geometry's own KV capacity: S for the global geometry (identified by matching
+        # spec.global_head_dim/global_n_kv_heads, same test gen_llm_decode.py's attn_ops uses), or
+        # decode's `sliding_window` for every other one once SLIDING_KV_CIRCULAR narrowed it.
+        # `kv_T` stays the block size derived from decode's flat `dims.kv_block`; capped to this
+        # geometry's own capacity the same way decode's `T_g = min(T, w)` is.
+        is_global_geom = hd == sp.global_head_dim and hkv == sp.global_n_kv_heads
+        w = (S if (is_global_geom or not sliding_kv_circular or sliding_window is None)
+             else sliding_window)
+        KVA_g = kv_alloc or w
+        T_g = min(kv_T, w)
+        kv_slot = "kv_off" if not geom_slots else f"kv_off{len(geom_slots)}"
+        geom_slots.append((kv_slot, hd, w, kv_slot))
         # scores: B is the kv cache read as [N=S, K=hd] -> b_col_maj. ctx: the SAME bytes read as
-        # [K=S, N=hd] -> plain. `kv_T` is the SAME block size for every geometry -- the only shared
-        # arenas measured so far are flat (kv_T==S) on Gemma-4 and blocked on the uniform-geometry
-        # gemma3-270m, so a per-geometry T has never been exercised; assumed here, not verified.
-        kvl_g = KVLayout(Hkv=hkv, S=KVA, HD=hd, T=kv_T)
+        # [K=S, N=hd] -> plain.
+        kvl_g = KVLayout(Hkv=hkv, S=KVA_g, HD=hd, T=T_g)
         kv_blk = (kvl_g.T, kvl_g.block_stride) if kvl_g.T != kvl_g.S else None
+        # KNOWN GAP: N/K here is the GLOBAL S, not this geometry's `w`, so a narrowed geometry's
+        # scores/ctx GEMM still declares an S-wide B operand against a `kv_slab()` slice now sized
+        # for capacity `w` (this commit's fix) -- verified empirically (S=6912, w=1024): the scores
+        # GEMM's own arg_spec is (6912, 256) = 3,538,944 B per head against an L0_kc buffer of
+        # 4,194,304 B total, so heads beyond ~5 read past it. Narrowing this needs `sc`/`sw`'s
+        # per-head stride, the softmax op, and the causal width's upper clamp to all become
+        # per-geometry too -- out of scope here; the KV-append (write) path below is what this
+        # commit fixes and is what `check_prefill_pairing` gates.
         op_sc = gemm_for(f"scores{sfx}", hd, S, blocking=kv_blk,
                          extra=dict(a_row_stride=qd) if seam else {})
         op_cx = gemm_for(f"ctx{sfx}", S, hd, b_col_maj=False, blocking=kv_blk,
@@ -1202,7 +1234,7 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
     prefill_local = sorted(n for n in bufsz if n not in dec_sizes)
     dims = dict(NL=NL, M=M, S=S, inputs=inputs, cache_names=cache_names,
                 tn_sc=tn_sc, tn_cx=tn_cx, tiles=tiles, cols=cols, causal=causal,
-                kv_block=kvl.T, wqkv_head_major=hm,
+                kv_block=kvl.T, wqkv_head_major=hm, geom_slots=geom_slots,
                 sm_widths=(SM_WIDTHS if causal == "rows" else None), sm_rows=Hq * M,
                 shared=[n for n in dec_order if not n.startswith("__decode_gap")],
                 reserved=dec_reserved, prefill_local=prefill_local, quant_pack=quant_pack,
@@ -1640,6 +1672,11 @@ def main():
             # No scalar causal width in either arm: `rows` streams a per-row vector instead, and
             # `none` masks nothing at all.
             "mask_param": None,
+            "kv_params": [{"param": n, "head_dim": hd} for n, hd, _, _ in dims["geom_slots"]],
+            # Per-geometry KV capacity, the pairing check reads this to catch a decode geometry
+            # narrower than S with no matching prefill capacity -- see `geom_slots`'s own comment.
+            "kv_windows": [{"kv_param": n, "head_dim": hd, "window": ww, "mask_param": mp}
+                           for n, hd, ww, mp in dims["geom_slots"]],
             "head_dim": HD, "kv_heads": Hkv,
         },
         "dims": {"layers": NL, "M": M, "S": S, "d_model": D, "ffn": FF,
