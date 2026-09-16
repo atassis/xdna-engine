@@ -37,6 +37,7 @@ report_failures() {
 trap report_failures EXIT
 source scripts/iron_env.sh
 source scripts/kernel_sandbox.sh
+source scripts/kernel_build_parallel.sh   # build_family_concurrent (see its header)
 
 # Preflight: the mlir-aie SUBMODULE checkout must actually contain toolchain.lock's pinned
 # commit. The PLAIN matrix_multiplication Makefiles (single_core, whole_array -- not the
@@ -170,33 +171,48 @@ echo "== FUSION xclbins (docs/10): whole_array matmul+epilogue + softmax-400 =="
 WAF=$MMW   # whole_array build dir
 rm -f $MMW/build/mm_*.o $MMW/build/mm_silu_epilogue_*.o
 # linear1 silu(A@B+bias): Kaug=800,N=3072 ; linear2/proj/pw bias: Kaug per K+32
-# NOTE: -C changes dir BEFORE -f is resolved, so the makefile path must be relative to $MMW
-# (i.e. `-C $MMW -f Makefile.silu`, NOT `-f $MMW/Makefile.silu -C $MMW` which doubles the path).
-make -C $MMW -f Makefile.silu NPU2=1 M=512 K=800  N=3072 n_aie_cols=8          build/final_512x800x3072_32x32x32_8c_silu.xclbin
-make -C $MMW -f Makefile.silu NPU2=1 M=512 K=3104 N=768  n_aie_cols=8 no_silu=1 build/final_512x3104x768_32x32x32_8c_bias.xclbin
-make -C $MMW -f Makefile.silu NPU2=1 M=512 K=800  N=1536 n_aie_cols=8 no_silu=1 build/final_512x800x1536_32x32x32_8c_bias.xclbin
-make -C $MMW -f Makefile.silu NPU2=1 M=512 K=800  N=768  n_aie_cols=8 no_silu=1 build/final_512x800x768_32x32x32_8c_bias.xclbin
+# All four share one tile (m=k=n=32, Makefile.silu's default) and so one
+# mm_32x32x32.o/mm_silu_epilogue_32x32x32.o -- build_family_concurrent isolates each
+# design instead of racing N `make`s on that shared object (measured 2026-09-16,
+# task perf/kernel-build-dirs: byte-identical output, 1.3-2.5x depending on box load).
+build_family_concurrent "$MMW" "${KERNEL_BUILD_MAX_JOBS:-4}" \
+  "Makefile.silu|M=512 K=800  N=3072 n_aie_cols=8|build/final_512x800x3072_32x32x32_8c_silu.xclbin" \
+  "Makefile.silu|M=512 K=3104 N=768  n_aie_cols=8 no_silu=1|build/final_512x3104x768_32x32x32_8c_bias.xclbin" \
+  "Makefile.silu|M=512 K=800  N=1536 n_aie_cols=8 no_silu=1|build/final_512x800x1536_32x32x32_8c_bias.xclbin" \
+  "Makefile.silu|M=512 K=800  N=768  n_aie_cols=8 no_silu=1|build/final_512x800x768_32x32x32_8c_bias.xclbin" \
+  || BUILD_FAILURES+=("kernel family: FUSION whole_array Makefile.silu (K=800/3104 quad)")
 # Step-A MODAL on-chip epilogue (NPU_MODAL_EPI=1, native): ONE resident K=800 f32-out xclbin with an
 # RTP-selected epilogue; 6 streams = 3 N x {silu(no_silu=0), identity(no_silu=1)}. The silu/identity
 # xclbins are identical modulo the per-build UUID, so the silu one is the resident; both insts are used.
 # Clean BOTH the epilogue AND the matmul objects: `make` mtime-tracking can reuse a stale mm_*.o across
 # kernel-source changes, producing a silently-wrong xclbin (bit us 2026-06-20).
 rm -f $MMW/build/mm_silu_epilogue_*.o $MMW/build/mm_64x32x96.o $MMW/build/mm_32x32x32.o
-for N in 3072 1536 768; do
-  # FAST (64x32x96 BFP16_IREE) modal -- the shipped default precision
-  WA_C_DEPTH=1 make -C $MMW -f Makefile.modal NPU2=1 M=512 K=800 N=$N m=64 k=32 n=96 n_aie_cols=8 emulate_bfloat16_mmul_with_bfp16=1 bfp16_iree=1           build/final_512x800x${N}_64x32x96_8c_modalsilu.xclbin
-  WA_C_DEPTH=1 make -C $MMW -f Makefile.modal NPU2=1 M=512 K=800 N=$N m=64 k=32 n=96 n_aie_cols=8 emulate_bfloat16_mmul_with_bfp16=1 bfp16_iree=1 no_silu=1 build/final_512x800x${N}_64x32x96_8c_modalid.xclbin
-  # NATIVE (32x32x32) modal -- for NPU_PRECISION=native. The `nat` suffix is Makefile.modal's own
-  # nat_tag: a build without emulate_bfloat16_mmul_with_bfp16=1 is tagged so a fast-flagged build can
-  # never be mistaken for the native kernel. These four target names omitted it and so named targets
-  # that have no rule -- `make` died here, and because the script runs under `set -euo pipefail` that
-  # silently truncated every step after it. ctx2.rs appends the same tag (Precision::nat_tag).
-  make -C $MMW -f Makefile.modal NPU2=1 M=512 K=800 N=$N m=32 k=32 n=32 n_aie_cols=8           build/final_512x800x${N}_32x32x32_8c_modalsilunat.xclbin
-  make -C $MMW -f Makefile.modal NPU2=1 M=512 K=800 N=$N m=32 k=32 n=32 n_aie_cols=8 no_silu=1 build/final_512x800x${N}_32x32x32_8c_modalidnat.xclbin
-done
-# GELU mode (3-branch superset: rtp[0]=2) — only the FFN fc1 width (N=3072). Opt-in via NPU_ENC_GELU_FUSED
-# (folds the Whisper encoder FFN GELU into the fc1 epilogue, ~5-12% encoder / -5% e2e; WER 0.1245 marginal).
-WA_C_DEPTH=1 make -C $MMW -f Makefile.modal NPU2=1 M=512 K=800 N=3072 m=64 k=32 n=96 n_aie_cols=8 emulate_bfloat16_mmul_with_bfp16=1 bfp16_iree=1 gelu=1 build/final_512x800x3072_64x32x96_8c_modalgelu.xclbin
+# FAST (64x32x96 BFP16_IREE) modal -- the shipped default precision. All 3 N's + the GELU
+# line below share mm_64x32x96.o/mm_silu_epilogue_64x32x96.o (gelu=1 only changes a python
+# generator arg, not MM_DEFINES/EPI_DEFINES), so one build_family_concurrent call covers all 7.
+build_family_concurrent "$MMW" "${KERNEL_BUILD_MAX_JOBS:-4}" \
+  "Makefile.modal|WA_C_DEPTH=1 M=512 K=800 N=3072 m=64 k=32 n=96 n_aie_cols=8 emulate_bfloat16_mmul_with_bfp16=1 bfp16_iree=1|build/final_512x800x3072_64x32x96_8c_modalsilu.xclbin" \
+  "Makefile.modal|WA_C_DEPTH=1 M=512 K=800 N=3072 m=64 k=32 n=96 n_aie_cols=8 emulate_bfloat16_mmul_with_bfp16=1 bfp16_iree=1 no_silu=1|build/final_512x800x3072_64x32x96_8c_modalid.xclbin" \
+  "Makefile.modal|WA_C_DEPTH=1 M=512 K=800 N=1536 m=64 k=32 n=96 n_aie_cols=8 emulate_bfloat16_mmul_with_bfp16=1 bfp16_iree=1|build/final_512x800x1536_64x32x96_8c_modalsilu.xclbin" \
+  "Makefile.modal|WA_C_DEPTH=1 M=512 K=800 N=1536 m=64 k=32 n=96 n_aie_cols=8 emulate_bfloat16_mmul_with_bfp16=1 bfp16_iree=1 no_silu=1|build/final_512x800x1536_64x32x96_8c_modalid.xclbin" \
+  "Makefile.modal|WA_C_DEPTH=1 M=512 K=800 N=768  m=64 k=32 n=96 n_aie_cols=8 emulate_bfloat16_mmul_with_bfp16=1 bfp16_iree=1|build/final_512x800x768_64x32x96_8c_modalsilu.xclbin" \
+  "Makefile.modal|WA_C_DEPTH=1 M=512 K=800 N=768  m=64 k=32 n=96 n_aie_cols=8 emulate_bfloat16_mmul_with_bfp16=1 bfp16_iree=1 no_silu=1|build/final_512x800x768_64x32x96_8c_modalid.xclbin" \
+  "Makefile.modal|WA_C_DEPTH=1 M=512 K=800 N=3072 m=64 k=32 n=96 n_aie_cols=8 emulate_bfloat16_mmul_with_bfp16=1 bfp16_iree=1 gelu=1|build/final_512x800x3072_64x32x96_8c_modalgelu.xclbin" \
+  || BUILD_FAILURES+=("kernel family: modal K=800 FAST tile (64x32x96, incl. GELU)")
+# NATIVE (32x32x32) modal -- for NPU_PRECISION=native. The `nat` suffix is Makefile.modal's own
+# nat_tag: a build without emulate_bfloat16_mmul_with_bfp16=1 is tagged so a fast-flagged build can
+# never be mistaken for the native kernel. These four target names omitted it and so named targets
+# that have no rule -- `make` died here, and because the script runs under `set -euo pipefail` that
+# silently truncated every step after it. ctx2.rs appends the same tag (Precision::nat_tag).
+# All 3 N's share mm_32x32x32.o/mm_silu_epilogue_32x32x32.o -- same reasoning as the fast family above.
+build_family_concurrent "$MMW" "${KERNEL_BUILD_MAX_JOBS:-4}" \
+  "Makefile.modal|M=512 K=800 N=3072 m=32 k=32 n=32 n_aie_cols=8|build/final_512x800x3072_32x32x32_8c_modalsilunat.xclbin" \
+  "Makefile.modal|M=512 K=800 N=3072 m=32 k=32 n=32 n_aie_cols=8 no_silu=1|build/final_512x800x3072_32x32x32_8c_modalidnat.xclbin" \
+  "Makefile.modal|M=512 K=800 N=1536 m=32 k=32 n=32 n_aie_cols=8|build/final_512x800x1536_32x32x32_8c_modalsilunat.xclbin" \
+  "Makefile.modal|M=512 K=800 N=1536 m=32 k=32 n=32 n_aie_cols=8 no_silu=1|build/final_512x800x1536_32x32x32_8c_modalidnat.xclbin" \
+  "Makefile.modal|M=512 K=800 N=768  m=32 k=32 n=32 n_aie_cols=8|build/final_512x800x768_32x32x32_8c_modalsilunat.xclbin" \
+  "Makefile.modal|M=512 K=800 N=768  m=32 k=32 n=32 n_aie_cols=8 no_silu=1|build/final_512x800x768_32x32x32_8c_modalidnat.xclbin" \
+  || BUILD_FAILURES+=("kernel family: modal K=800 NATIVE tile (32x32x32)")
 # WHISPER-TURBO (K_aug=1312). The loops above are K_aug=800, i.e. d_model 768 + the 32-row bias
 # augment; turbo is d_model 1280 -> 1312, with N=1280 (proj/out) and N=5120 (FFN fc1). Same
 # Makefiles, same flags, different numbers -- these were NEVER in this script, so ctx2.rs could ask
