@@ -403,6 +403,23 @@ MLP_TILE_ROWS = int(os.environ.get("MLP_TILE_ROWS", "0"))
 # builds, scratch 6.69 -> 10.69 GiB. The unchunked op places at none of them.
 SOFTMAX_SEGMENT = int(os.environ.get("SOFTMAX_SEGMENT", "0"))
 
+# Make attention's reduction follow the POSITION instead of the CAPACITY. Both halves compute the
+# full window every token today -- `op_scores` is gemv(M=w, K=hd) and `op_ctx` is TMatVec(K=w) --
+# so raising max_seq costs core time at every position, which is why the 2048 -> 6912 raise was a
+# regression. Set it and both read the geometry's OWN `sm_mask` (already min(n_past+1, w), already
+# written per dispatch by the Rust path for the softmax) and skip the work above it.
+#
+# EXACT, not approximate: the rows past the mask carry a softmax weight of exactly 0, and the
+# softmax overwrites them with -inf before any exp2, so a dispatch at the full window is
+# bit-identical to the build-constant path.
+#
+# It does NOT move bytes -- a shim BD length is a static field on the binary TXN target, so the
+# fill still streams the whole window and the surplus is drained untouched. What it buys is core
+# time, which is what the S raise actually cost. Two things it does not reach: the softmax and
+# the elementwise scale still walk the full window, and the op_ctx GEMV FALLBACK (no TMV_CTX)
+# reduces along K, an axis GEMV has no runtime knob for.
+ATTN_RUNTIME_EXTENT = os.environ.get("ATTN_RUNTIME_EXTENT", "0") == "1"
+
 
 def softmax_segment(w):
     """The per-acquire tile for a softmax over `w` columns, or None to keep the unchunked op.
@@ -674,6 +691,8 @@ def sequence_name(sp, NL, S, placer_flags, decode_layer_active=False, T=None, tm
         parts.append(f"tr{MLP_TILE_ROWS}")
     if SOFTMAX_SEGMENT:
         parts.append(f"smseg{SOFTMAX_SEGMENT}")
+    if ATTN_RUNTIME_EXTENT:
+        parts.append("rtext")
     if FUSE_ACT:
         parts.append("fuseact")
     # Flat, not nested under decode_layer_active: _trace.py wires into every design.py this file
@@ -1655,6 +1674,9 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                                        context=ctx)
             _win_cache[w] = (win_softmax, win_scale, mask_slot)
         op_softmax, op_scale, mask_slot = _win_cache[w]
+        # Both attention reductions read the SAME per-geometry width the softmax already masks
+        # with, so a geometry cannot disagree with itself about where its positions end.
+        rtp_extent = {"vector_size_parameter": mask_slot} if ATTN_RUNTIME_EXTENT else {}
         dp_why = qkv_dp_why[(hd, hkv, has_v)]
         op_qk_norm = RMSNorm(size=hd, num_aie_columns=1, num_channels=1, tile_size=hd,
                              weighted=True, epsilon=sp.eps, context=ctx) if sp.qk_norm else None
@@ -1778,11 +1800,13 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
             )
             scores_groups = gqa // MAX_GROUP_REUSE
             op_scores = gemv(w, hd, ctx, num_batches=MAX_GROUP_REUSE, batch_group=MAX_GROUP_REUSE,
-                                 block_size=T_g, alloc_M=None if KVA_g == w else KVA_g)
+                                 block_size=T_g, alloc_M=None if KVA_g == w else KVA_g,
+                                 **rtp_extent)
         else:
             scores_groups = 1
             op_scores = gemv(w, hd, ctx, num_batches=Hq, batch_group=gqa if GROUPED_K else 1,
-                                 block_size=T_g, alloc_M=None if KVA_g == w else KVA_g)
+                                 block_size=T_g, alloc_M=None if KVA_g == w else KVA_g,
+                                 **rtp_extent)
         # num_batches=Hq, not Hq separate invocations. transpose/design.py's L3 tensors already hold
         # "num_batches contiguous (M,N) matrices stacked along the row dimension", which is EXACTLY
         # what vr/vt are; calling it per head issued 448 configure+run pairs per token to do 28 ops'
@@ -1819,8 +1843,10 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
             rpc, mc = _tmv
             op_ctx = TMatVec(M=hd, K=w, num_aie_columns=hkv, num_batches=Hq, batch_group=gqa,
                                  alloc_K=None if KVA_g == w else KVA_g, block_size=T_g,
-                             rows_per_chunk=rpc, m_chunk=mc, context=ctx)
+                             rows_per_chunk=rpc, m_chunk=mc, context=ctx, **rtp_extent)
         else:
+            # The fallback reduces along K, and GEMV's runtime extent is its M. Left at the
+            # build-time window: narrowing it needs TMV_CTX, which this geometry declined.
             op_ctx = gemv(hd, w, ctx, num_batches=Hq)
         # attn_block_dp AS A WHOLE, for this geometry alone -- one memoized object per (hd, hkv,
         # has_v), same trap as every other op above: a fresh object per LAYER would defeat
@@ -1860,9 +1886,10 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
     if decode_layer_why is not None:
         op_rep_k = Repeat(rows=Hkv, cols=S * HD, repeat=sp.gqa_group, transfer_size=HD, context=ctx)
         op_rep_v = Repeat(rows=Hkv, cols=S * HD, repeat=sp.gqa_group, transfer_size=HD, context=ctx)
+        _rtp_extent = {"vector_size_parameter": "sm_mask"} if ATTN_RUNTIME_EXTENT else {}
         op_scores = gemv(S, HD, ctx, num_batches=Hq,
                          batch_group=sp.gqa_group if GROUPED_K else 1, block_size=T,
-                         alloc_M=None if KVA == S else KVA)
+                         alloc_M=None if KVA == S else KVA, **_rtp_extent)
         # Folded into n_qn when SCALE_IN_QNORM; built anyway so the A/B arm stays reachable.
         op_scale = (None if scale_in_qnorm else
                     ElementwiseMul(size=Hq * S, tile_size=S // COLS, num_aie_columns=COLS,
@@ -1910,7 +1937,8 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
             rpc, mc = _tmv
             op_ctx = TMatVec(M=HD, K=S, num_aie_columns=Hkv, num_batches=Hq,
                              batch_group=sp.gqa_group, alloc_K=None if KVA == S else KVA,
-                             rows_per_chunk=rpc, m_chunk=mc, context=ctx, block_size=T)
+                             rows_per_chunk=rpc, m_chunk=mc, context=ctx, block_size=T,
+                             **_rtp_extent)
         else:
             op_ctx = gemv(HD, S, ctx, num_batches=Hq)
     # MLP weight-stream dtype axis (Wg/Wu/Wd -- "MLP weights" in the byte breakdown, the largest
