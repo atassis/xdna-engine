@@ -398,6 +398,9 @@ MLP_TILE_ROWS = int(os.environ.get("MLP_TILE_ROWS", "0"))
 # attention row -- four `memref<w x bf16>` buffers in one core's L1, which caps the context at
 # w <= 8063 and trips the 16383-word aie.dma_bd length field at w ~ 32768. Set it and the softmax
 # streams each row in `w // SOFTMAX_SEGMENT` pieces instead, so neither limit sees w.
+#
+# MEASURED 2026-09-16 at 1024, 48 layers, instance 8b326264833a: every S from 8192 to 262144
+# builds, scratch 6.69 -> 10.69 GiB. The unchunked op places at none of them.
 SOFTMAX_SEGMENT = int(os.environ.get("SOFTMAX_SEGMENT", "0"))
 
 
