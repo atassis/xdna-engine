@@ -104,6 +104,17 @@ pub enum RopeBase {
     Local,
 }
 
+/// One dispatch variant of a segmented prefill ELF (`PREFILL_SEGMENTS` in
+/// `designs/decode_fused/gen_llm_prefill.py`): the layer range `[start, end)` its control code
+/// covers, and the code's own label. `kernel` is the FULL `"main:<name>"` form
+/// [`npu_xrt::ElfResident::kernel_name`] reports once opened, not the bare suffix `meta.json`
+/// spells it with -- resolved at parse time so nothing downstream reformats it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrefillSegment {
+    pub layers: (usize, usize),
+    pub kernel: String,
+}
+
 /// A validated, ready-to-drive fused decode ELF: every buffer the artifact declares has a checked
 /// location, and the scratchpad protocol (`kv_off`/`sm_mask`) is resolved to concrete offsets.
 ///
@@ -263,6 +274,14 @@ pub struct LlmArtifact {
     /// artifact (irrelevant there) and on any prefill artifact built before this field existed;
     /// the caller falls back to a hardcoded default in that case.
     pub prefill_break_even_tokens: Option<usize>,
+    /// `meta.json`'s `dims.segments`: the dispatch variants a segmented prefill ELF carries, in
+    /// the order [`crate::llm::npu_prefill::NpuPrefill::prime`] must run them against ONE
+    /// hw_context and ONE arena -- the residual seam between them stays in scratch, so nothing is
+    /// read back between dispatches. Absent (every decode artifact, and every prefill artifact
+    /// built before `PREFILL_SEGMENTS` existed) means one segment covering every layer under this
+    /// artifact's own `kernel_name` -- exactly what an unsegmented ELF's single dispatch already
+    /// is, so a caller that does not know about segments keeps behaving byte-for-byte.
+    pub segments: Vec<PrefillSegment>,
 }
 
 /// Verdict from comparing an artifact's [`LlmArtifact::toolchain_hash`] against the currently
@@ -386,6 +405,65 @@ impl LlmArtifact {
             ArtifactRole::Prefill => dims.get("vocab").and_then(|v| v.as_u64()).map(|v| v as usize),
         };
         let n_layers = dim("layers")?;
+        // `dims.segments`: see `PrefillSegment`'s doc. Read for both roles rather than gated on
+        // Prefill -- a decode `meta.json` simply never has the key, so it takes the same default.
+        let segments = match dims.get("segments") {
+            None | Some(serde_json::Value::Null) => {
+                vec![PrefillSegment { layers: (0, n_layers), kernel: kernel_name.clone() }]
+            }
+            Some(v) => {
+                let arr = v
+                    .as_array()
+                    .filter(|a| !a.is_empty())
+                    .ok_or_else(|| ctx("dims.segments present but not a non-empty array".to_string()))?;
+                let mut out = Vec::with_capacity(arr.len());
+                for (i, e) in arr.iter().enumerate() {
+                    let pair = e
+                        .get("layers")
+                        .and_then(|v| v.as_array())
+                        .filter(|p| p.len() == 2)
+                        .ok_or_else(|| ctx(format!("dims.segments[{i}].layers must be a [start, end] pair")))?;
+                    let la = pair[0]
+                        .as_u64()
+                        .ok_or_else(|| ctx(format!("dims.segments[{i}].layers[0] non-numeric")))? as usize;
+                    let lb = pair[1]
+                        .as_u64()
+                        .ok_or_else(|| ctx(format!("dims.segments[{i}].layers[1] non-numeric")))? as usize;
+                    let kernel = format!(
+                        "main:{}",
+                        e.get("kernel")
+                            .and_then(|v| v.as_str())
+                            .ok_or_else(|| ctx(format!("dims.segments[{i}].kernel missing/non-string")))?
+                    );
+                    out.push(PrefillSegment { layers: (la, lb), kernel });
+                }
+                // Contiguous, ascending, covering exactly [0, n_layers) -- a gap or overlap would
+                // run a layer twice or never, and dispatch order alone cannot catch it: each
+                // segment's runlist is a slice of compiled instructions, not a re-checkable range.
+                let mut at = 0usize;
+                for s in &out {
+                    if s.layers.0 != at || s.layers.1 <= s.layers.0 {
+                        return Err(ctx(format!(
+                            "dims.segments layer ranges are not contiguous from 0 (expected next \
+                             start {at}, got {:?})",
+                            s.layers
+                        )));
+                    }
+                    at = s.layers.1;
+                }
+                if at != n_layers {
+                    return Err(ctx(format!(
+                        "dims.segments cover layers [0, {at}), but dims.layers = {n_layers}"
+                    )));
+                }
+                if !out.iter().any(|s| s.kernel == kernel_name) {
+                    return Err(ctx(format!(
+                        "dims.segments never names this artifact's own primary kernel `{kernel_name}`"
+                    )));
+                }
+                out
+            }
+        };
         let max_seq = dim("S")?;
         // Both absent on any artifact built before blocking landed (including this file's own
         // pre-blocking test fixtures). Default kv_block to max_seq -- one block, the pre-blocking
@@ -923,6 +1001,7 @@ impl LlmArtifact {
             logit_softcap,
             toolchain_hash,
             prefill_break_even_tokens,
+            segments,
         })
     }
 
@@ -2498,5 +2577,87 @@ mod tests {
         write_meta(dir.path(), &meta);
         let art = LlmArtifact::load(dir.path()).expect("an unresolvable pin must be a warning, not fatal");
         assert_eq!(art.toolchain_hash.as_deref(), Some("9da6356ac521"));
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // `dims.segments` (PREFILL_SEGMENTS). Absent must be exactly one segment under the artifact's
+    // own primary kernel -- the unsegmented behaviour every artifact had before this field existed.
+    // ---------------------------------------------------------------------------------------
+
+    #[test]
+    fn missing_dims_segments_defaults_to_one_segment_under_the_primary_kernel() {
+        let pre = generator_shaped_prefill_meta(2, serde_json::Value::Null);
+        assert!(pre["dims"].get("segments").is_none(), "fixture must not already carry the key");
+        let art = load_causal_prefill(&pre).unwrap();
+        assert_eq!(
+            art.segments,
+            vec![PrefillSegment { layers: (0, 1), kernel: "main:sequence".to_string() }]
+        );
+    }
+
+    #[test]
+    fn a_decode_artifact_defaults_the_same_way() {
+        let dir = tempfile::tempdir().unwrap();
+        write_meta(dir.path(), &base_meta(8, 4, serde_json::json!({"rope_global": {"type": "input", "offset": 8, "len": 8}})));
+        let art = LlmArtifact::load(dir.path()).unwrap();
+        assert_eq!(
+            art.segments,
+            vec![PrefillSegment { layers: (0, 1), kernel: "main:sequence".to_string() }]
+        );
+    }
+
+    #[test]
+    fn dims_segments_parses_layer_ranges_and_kernel_labels_in_declared_order() {
+        let mut pre = generator_shaped_prefill_meta(2, serde_json::Value::Null);
+        pre["dims"]["layers"] = serde_json::json!(4);
+        pre["dims"]["segments"] = serde_json::json!([
+            {"layers": [0, 1], "kernel": "sequence"},
+            {"layers": [1, 2], "kernel": "seg1"},
+            {"layers": [2, 3], "kernel": "seg2"},
+            {"layers": [3, 4], "kernel": "seg3"},
+        ]);
+        let art = load_causal_prefill(&pre).unwrap();
+        assert_eq!(
+            art.segments,
+            vec![
+                PrefillSegment { layers: (0, 1), kernel: "main:sequence".to_string() },
+                PrefillSegment { layers: (1, 2), kernel: "main:seg1".to_string() },
+                PrefillSegment { layers: (2, 3), kernel: "main:seg2".to_string() },
+                PrefillSegment { layers: (3, 4), kernel: "main:seg3".to_string() },
+            ],
+            "kernel labels gain the `main:` prefix `ElfResident::kernel_name` reports"
+        );
+    }
+
+    #[test]
+    fn dims_segments_with_a_gap_fails_loud() {
+        let mut pre = generator_shaped_prefill_meta(2, serde_json::Value::Null);
+        pre["dims"]["layers"] = serde_json::json!(4);
+        pre["dims"]["segments"] = serde_json::json!([
+            {"layers": [0, 1], "kernel": "sequence"},
+            {"layers": [2, 4], "kernel": "seg1"},
+        ]);
+        let err = load_causal_prefill(&pre).unwrap_err().to_string();
+        assert!(err.contains("not contiguous from 0"), "{err}");
+    }
+
+    #[test]
+    fn dims_segments_not_covering_every_layer_fails_loud() {
+        let mut pre = generator_shaped_prefill_meta(2, serde_json::Value::Null);
+        pre["dims"]["layers"] = serde_json::json!(4);
+        pre["dims"]["segments"] = serde_json::json!([
+            {"layers": [0, 1], "kernel": "sequence"},
+            {"layers": [1, 3], "kernel": "seg1"},
+        ]);
+        let err = load_causal_prefill(&pre).unwrap_err().to_string();
+        assert!(err.contains("dims.layers = 4"), "{err}");
+    }
+
+    #[test]
+    fn dims_segments_missing_the_primary_kernel_fails_loud() {
+        let mut pre = generator_shaped_prefill_meta(2, serde_json::Value::Null);
+        pre["dims"]["segments"] = serde_json::json!([{"layers": [0, 1], "kernel": "seg1"}]);
+        let err = load_causal_prefill(&pre).unwrap_err().to_string();
+        assert!(err.contains("never names this artifact's own primary kernel"), "{err}");
     }
 }

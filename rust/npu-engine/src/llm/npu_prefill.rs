@@ -31,7 +31,10 @@
 //!      to the window. At M=1 that vector is one value per head, all equal to `pos + 1`, which is
 //!      what the decode ELF writes as its scalar `sm_mask` -- the same mask, one dimension down.
 //!   4. scratchpad `kv_param`   = `start * head_dim`  (element-unit BD offset; `pos * head_dim` at M=1)
-//!   5. one dispatch. Nothing is read back -- prefill's whole product is the KV it left in scratch.
+//!   5. one dispatch per declared segment (`dims.segments`), in order -- one on every artifact
+//!      built before `PREFILL_SEGMENTS` existed. Nothing is read back between them or after: the
+//!      seam is the scratch buffer `xs`, which the shared arena keeps at one offset for every
+//!      segment, and prefill's whole product is the KV it left in scratch.
 //!
 //! Step 5 does no `sync_from_device`, and that is not an omission. The KV writes are device-side and
 //! the arena probe showed them visible to the other context without a host round-trip; what the
@@ -44,7 +47,7 @@ use std::rc::Rc;
 use npu_xrt::{Device, ElfResident, FusedArena};
 
 use crate::api::EngineError;
-use crate::llm::artifact::{BufLoc, LlmArtifact, MaskWidths, RopeWrite};
+use crate::llm::artifact::{BufLoc, LlmArtifact, MaskWidths, PrefillSegment, RopeWrite};
 use crate::llm::npu_decode::{pack_bf16_bytes, rope_angles, rope_row, EmbedTable};
 
 /// `NPU_LLM_PREFILL_BATCHED` -- the one accessor (E003 of the env-flag contract).
@@ -202,7 +205,12 @@ fn crosses_wrap_point(start: usize, batch: usize, capacity: usize) -> bool {
 /// because the arena must be sized and filled for BOTH halves before either resident binds to it.
 pub struct NpuPrefill {
     artifact: LlmArtifact,
-    res: ElfResident,
+    /// One resident per declared dispatch segment (`artifact.segments`), same order: `prime` runs
+    /// every one of them per chunk against the ONE shared arena. Segment 0 is always this
+    /// artifact's own primary control code; every other entry is a second named control code out
+    /// of the SAME ELF ([`ElfResident::open_named`]) -- extra ELF, not a second hw_context. Each
+    /// owns its own ctrl scratchpad, so each got its own `bind_resident` at open.
+    segments: Vec<ElfResident>,
     batch: usize,
     /// Each declared RoPE input buffer with the base its rows are computed from, resolved at load
     /// against the DECODE artifact -- the authority for a model constant, which a prefill artifact
@@ -212,6 +220,43 @@ pub struct NpuPrefill {
     /// the same reason `rope_writes` is. `None` on a non-causal bring-up build, which declares no
     /// widths buffer and masks nothing.
     mask_write: Option<(BufLoc, MaskWidths)>,
+}
+
+/// How one declared segment's resident gets opened: reuse the artifact's own primary (already
+/// opened via `open_elf_resident`), or open a second named control code from it. Pure planning
+/// step, factored out of [`NpuPrefill::open`] so the dispatch order it produces is checkable
+/// without a device -- see the unit tests below.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SegmentSource {
+    Primary,
+    Named(String),
+}
+
+/// The per-segment plan [`NpuPrefill::open`] executes, in `segments`' own declared order:
+/// `Primary` exactly once, at whichever entry names this artifact's own `kernel_name`
+/// (`LlmArtifact::load` already refuses a `dims.segments` that omits it), `Named` for every other
+/// declared control code.
+fn segment_plan(
+    segments: &[PrefillSegment],
+    primary_kernel: &str,
+) -> Result<Vec<SegmentSource>, EngineError> {
+    let mut used_primary = false;
+    segments
+        .iter()
+        .map(|seg| {
+            if seg.kernel == primary_kernel {
+                if used_primary {
+                    return Err(EngineError::Load(format!(
+                        "prefill dims.segments names the primary kernel `{primary_kernel}` more than once"
+                    )));
+                }
+                used_primary = true;
+                Ok(SegmentSource::Primary)
+            } else {
+                Ok(SegmentSource::Named(seg.kernel.clone()))
+            }
+        })
+        .collect()
 }
 
 impl NpuPrefill {
@@ -228,14 +273,36 @@ impl NpuPrefill {
             artifact.mask_widths.clone().map(|mw| (*artifact.loc(&mw.buffer), mw));
         let elf = std::fs::read(artifact.elf_path())
             .map_err(|e| EngineError::Load(format!("read {}: {e}", artifact.elf_path().display())))?;
-        let res = dev.open_elf_resident(&elf, Some(&artifact.kernel_name)).map_err(|e| {
+        let primary = dev.open_elf_resident(&elf, Some(&artifact.kernel_name)).map_err(|e| {
             EngineError::Load(format!("open_elf_resident: prefill ELF lacks a ctrl scratchpad: {e}"))
         })?;
-        arena
-            .bind_resident(&res)
-            .map_err(|e| EngineError::Load(format!("bind prefill resident to the shared arena: {e}")))?;
+
+        let plan = segment_plan(&artifact.segments, &artifact.kernel_name)?;
+        let mut primary = Some(primary);
+        let mut segments = Vec::with_capacity(plan.len());
+        for src in &plan {
+            let r = match src {
+                SegmentSource::Primary => {
+                    primary.take().expect("segment_plan yields Primary at most once")
+                }
+                SegmentSource::Named(label) => primary
+                    .as_ref()
+                    .ok_or_else(|| {
+                        EngineError::Load(format!(
+                            "prefill segment `{label}` declared before its own primary kernel"
+                        ))
+                    })?
+                    .open_named(label)
+                    .map_err(|e| EngineError::Load(format!("open prefill segment {label}: {e}")))?,
+            };
+            arena.bind_resident(&r).map_err(|e| {
+                EngineError::Load(format!("bind prefill segment {} to the shared arena: {e}", r.kernel_name()))
+            })?;
+            segments.push(r);
+        }
+
         let batch = artifact.batch;
-        Ok(NpuPrefill { artifact, res, batch, rope_writes, mask_write })
+        Ok(NpuPrefill { artifact, segments, batch, rope_writes, mask_write })
     }
 
     pub fn batch(&self) -> usize {
@@ -365,6 +432,12 @@ impl NpuPrefill {
             // doc. `kv_windows` is empty only for an artifact built before per-geometry capacity
             // existed (`check_prefill_pairing` would already have refused a narrowed decode
             // paired with one), which keeps the flat single-slot write below unchanged for it.
+            //
+            // Written to EVERY segment resident, not just the primary: each opened via
+            // `open_named` gets its OWN ctrl scratchpad (`ElfResident::open_named`'s doc), so a
+            // value written to one is invisible to the others, and `kv_off`/`sm_mask` are
+            // properties of the WHOLE chunk (the KV position, the causal width), not of which
+            // layer range a segment happens to cover.
             if self.artifact.kv_windows.is_empty() {
                 // The BLOCKED offset, via the same helper decode uses. This was `chunk.start *
                 // hd`, the flat formula: correct while the cache was [Hkv, S, HD] and silently
@@ -373,9 +446,10 @@ impl NpuPrefill {
                 // head_dim`, so the flat path is unchanged.
                 let kv = crate::llm::kv_layout::kv_off(
                     chunk.start, self.artifact.kv_block, hd, self.artifact.kv_heads) as u32;
-                self.res
-                    .write_scratchpad(self.artifact.kv_off.byte_offset, &kv.to_le_bytes())
-                    .map_err(|e| EngineError::Device(format!("write prefill kv_off scratchpad: {e}")))?;
+                for seg in &self.segments {
+                    seg.write_scratchpad(self.artifact.kv_off.byte_offset, &kv.to_le_bytes())
+                        .map_err(|e| EngineError::Device(format!("write prefill kv_off scratchpad: {e}")))?;
+                }
             } else {
                 for &(slot, head_dim, capacity, _) in &self.artifact.kv_windows {
                     if crosses_wrap_point(chunk.start, self.batch, capacity) {
@@ -403,9 +477,10 @@ impl NpuPrefill {
                         chunk.start, capacity, self.artifact.kv_block, head_dim,
                         self.artifact.kv_heads,
                     ) as u32;
-                    self.res
-                        .write_scratchpad(slot.byte_offset, &kv.to_le_bytes())
-                        .map_err(|e| EngineError::Device(format!("write prefill kv_off scratchpad: {e}")))?;
+                    for seg in &self.segments {
+                        seg.write_scratchpad(slot.byte_offset, &kv.to_le_bytes())
+                            .map_err(|e| EngineError::Device(format!("write prefill kv_off scratchpad: {e}")))?;
+                    }
                 }
             }
             // A SCALAR width cannot express causality within a chunk (row i must not see row
@@ -416,13 +491,22 @@ impl NpuPrefill {
             if let Some(mask) = self.artifact.sm_mask {
                 let sm_raw = (chunk.start + self.batch) as u32;
                 let sm = if mask.core { sm_raw << 2 } else { sm_raw };
-                self.res
-                    .write_scratchpad(mask.byte_offset, &sm.to_le_bytes())
-                    .map_err(|e| EngineError::Device(format!("write prefill sm_mask scratchpad: {e}")))?;
+                for seg in &self.segments {
+                    seg.write_scratchpad(mask.byte_offset, &sm.to_le_bytes())
+                        .map_err(|e| EngineError::Device(format!("write prefill sm_mask scratchpad: {e}")))?;
+                }
             }
 
+            // The shared arena's input/output/scratch BOs are bound to every segment resident by
+            // reference (`FusedArena::bind_resident`), so one `sync_input` covers all of them --
+            // and `xs`, the residual seam between segments, never leaves scratch: nothing here
+            // reads it back or re-syncs it between dispatches. Segments run in DECLARED order,
+            // each a full dispatch of its own control code against the SAME arena.
             arena.sync_input().map_err(|e| EngineError::Device(format!("sync prefill input: {e}")))?;
-            self.res.dispatch().map_err(|e| EngineError::Device(format!("prefill dispatch: {e}")))?;
+            for seg in &self.segments {
+                seg.dispatch()
+                    .map_err(|e| EngineError::Device(format!("prefill segment {}: {e}", seg.kernel_name())))?;
+            }
         }
         Ok(end)
     }
@@ -431,6 +515,60 @@ impl NpuPrefill {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---------------------------------------------------------------------------------------
+    // `segment_plan` -- the dispatch-order logic `NpuPrefill::open`/`prime` run, factored out so
+    // it is checkable without a device (opening a real `ElfResident` needs one).
+    // ---------------------------------------------------------------------------------------
+
+    fn seg(la: usize, lb: usize, kernel: &str) -> PrefillSegment {
+        PrefillSegment { layers: (la, lb), kernel: kernel.to_string() }
+    }
+
+    #[test]
+    fn a_single_segment_artifact_plans_only_the_primary() {
+        // The unsegmented case, byte-for-byte: no `open_named` call, exactly what `open` did
+        // before `dims.segments` existed.
+        let segments = vec![seg(0, 1, "main:sequence")];
+        let plan = segment_plan(&segments, "main:sequence").unwrap();
+        assert_eq!(plan, vec![SegmentSource::Primary]);
+    }
+
+    #[test]
+    fn a_multi_segment_artifact_plans_every_kernel_in_declared_order() {
+        let segments = vec![
+            seg(0, 12, "main:sequence"),
+            seg(12, 24, "main:seg1"),
+            seg(24, 36, "main:seg2"),
+            seg(36, 48, "main:seg3"),
+        ];
+        let plan = segment_plan(&segments, "main:sequence").unwrap();
+        assert_eq!(
+            plan,
+            vec![
+                SegmentSource::Primary,
+                SegmentSource::Named("main:seg1".to_string()),
+                SegmentSource::Named("main:seg2".to_string()),
+                SegmentSource::Named("main:seg3".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_primary_may_sit_anywhere_in_declared_order() {
+        // Nothing about the plan assumes index 0 is the primary -- only that its kernel name
+        // matches the artifact's own.
+        let segments = vec![seg(0, 12, "main:seg1"), seg(12, 24, "main:sequence")];
+        let plan = segment_plan(&segments, "main:sequence").unwrap();
+        assert_eq!(plan, vec![SegmentSource::Named("main:seg1".to_string()), SegmentSource::Primary]);
+    }
+
+    #[test]
+    fn a_primary_named_twice_is_refused_rather_than_opened_twice() {
+        let segments = vec![seg(0, 1, "main:sequence"), seg(1, 2, "main:sequence")];
+        let err = segment_plan(&segments, "main:sequence").unwrap_err().to_string();
+        assert!(err.contains("more than once"), "{err}");
+    }
 
     fn plan(n: usize, m: usize) -> Vec<(usize, usize, usize)> {
         chunk_plan(0, n, m).into_iter().map(|c| (c.start, c.real, c.pad(m))).collect()
