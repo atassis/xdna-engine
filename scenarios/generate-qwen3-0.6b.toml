@@ -24,7 +24,7 @@ name = "qwen3-0.6b"
 # Renamed 2026-09-13: rungs4096-rowbatch -> decode, prefill4096 -> prefill. It is the only
 # qwen3-0.6b decode/prefill pair left (dynwindow/buckets/s2048-prefill retired the same day), so
 # the window-count and rowbatch-flag qualifiers in the old names no longer distinguish anything.
-decode = "artifacts/qwen3-0.6b/decode_repin_rungs"
+decode = "artifacts/qwen3-0.6b/decode"
 # Batched prefill, S=4096 to pair with the rung ladder's own window (scripts/build_prefill.sh 28
 # 256 4096; the pair is checked at load, so a mismatch refuses to bind rather than mis-binding).
 # Closes the gap the ladder's own result note named: stepwise priming runs 27.6-28.5 ms/prompt-token
@@ -50,7 +50,7 @@ decode = "artifacts/qwen3-0.6b/decode_repin_rungs"
 # rollback net; deleted 2026-09-13 along with dynwindow4096/fusedbuckets/decode/prefill (S2048),
 # all confirmed superseded and unwired from engine.toml -- see log/2026-09-11-the-rung-ladder-is-
 # the-only-qwen3-model-now.
-prefill = "artifacts/qwen3-0.6b/prefill_repin"
+prefill = "artifacts/qwen3-0.6b/prefill"
 weights = "artifacts/qwen3-0.6b/weights"
 tokenizer_dir = "artifacts/qwen3-0.6b/tokenizer"
 
