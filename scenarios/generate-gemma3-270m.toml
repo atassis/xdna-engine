@@ -9,6 +9,6 @@ name = "gemma3-270m"
 #   weights    scripts/dump_llm_weights.py --spec gemma3-270m --out artifacts/gemma3-270m/weights
 #   tokenizer  the unsloth/gemma-3-270m-it HF snapshot dir
 [artifacts]
-decode = "artifacts/gemma3-270m/decode"
+decode = "artifacts/gemma3-270m/decode_repin"
 weights = "artifacts/gemma3-270m/weights"
 tokenizer_dir = "artifacts/gemma3-270m/tokenizer"
