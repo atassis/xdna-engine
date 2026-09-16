@@ -1203,6 +1203,51 @@ impl LlmArtifact {
                 )));
             }
         }
+        // A geometry decode NARROWS (SLIDING_KV_CIRCULAR, `kv_windows` capacity < S) needs prefill's
+        // KV-append blocked at that SAME capacity, or its write walks past the buffer decode sized
+        // for the narrow window. The `dims.kv_block` equality above cannot see this: prefill's
+        // generator literally COPIES decode's scalar (`gen_llm_prefill.py`'s `kv_T`) and applies it
+        // to every geometry uniformly, so the two are equal by construction regardless of whether
+        // either geometry is actually narrowed. `kv_windows` is where a geometry's real capacity
+        // lives, and prefill's own list is empty on every artifact the generator emits today -- it
+        // masks with `mask_widths`, never a scratchpad `sm_mask`, and an empty `sm_mask` is what
+        // makes `kv_windows` fall back to empty at load (see the loader). So a decode with any
+        // narrowed geometry can never pair with a prefill that has no way to say so.
+        for &(_, head_dim, capacity, _) in &self.kv_windows {
+            if capacity >= self.max_seq {
+                continue;
+            }
+            let matched = prefill
+                .kv_windows
+                .iter()
+                .any(|&(_, hd, cap, _)| hd == head_dim && cap == capacity);
+            if matched {
+                continue;
+            }
+            // Illustrative, not the gate above: kv head 1's own element offset under prefill's flat
+            // block size, in bf16 bytes -- independent of kv_heads, which this struct does not carry
+            // per geometry. Named buffer is best-effort: the one cache buffer whose declared length
+            // is an exact multiple of `capacity` positions but not of the full window `max_seq`,
+            // which is how a narrow geometry's buffer is told apart from a wide one that happens to
+            // also divide evenly.
+            let head1_off = crate::llm::kv_layout::head_base(1, prefill.kv_block, head_dim) * 2;
+            let named = self
+                .cache_buffers
+                .iter()
+                .filter_map(|n| self.layout.get(n).map(|l| (n.as_str(), l.len)))
+                .filter(|&(_, len)| len % capacity == 0 && len % self.max_seq != 0)
+                .min_by_key(|&(_, len)| len)
+                .map(|(name, len)| format!(" -- `{name}` (declared len {len} B) is that buffer"))
+                .unwrap_or_default();
+            return Err(EngineError::Load(format!(
+                "prefill/decode disagree on KV geometry: decode's head_dim={head_dim} geometry is \
+                 circular at capacity={capacity} (dims.S={}), but prefill declares no matching \
+                 kv_windows entry -- it applies its one flat dims.kv_block={} to every geometry, so \
+                 kv head 1 alone lands at byte offset {head1_off}, already past a buffer sized for \
+                 {capacity} positions{named}",
+                self.max_seq, prefill.kv_block
+            )));
+        }
         // The model constants prefill may inherit rather than declare. Where it DOES declare one,
         // it must agree -- a second copy of a number that must match is only useful if it is
         // compared, and a disagreeing RoPE base produces plausible wrong text and nothing else.
@@ -2313,6 +2358,119 @@ mod tests {
         let (_d, _p, da, pa) = load_pair(&dec, &pre);
         let err = da.check_prefill_pairing(&pa).unwrap_err().to_string();
         assert!(err.contains("M=3") && err.contains("S=8"), "must name both numbers: {err}");
+    }
+
+    /// A two-geometry decode shaped like the served `decode_int4g32qat_s6912_l48_rg_mc`: sliding
+    /// (head_dim 256) circular at capacity 1024, global (head_dim 512) at the full window 6912.
+    /// Cache buffer lengths are the artifact's real ones (`L0_kc`/`L5_kc` on disk), so the error
+    /// text this pins is the actual overrun, not a scaled-down stand-in.
+    fn gemma4_shaped_decode_meta() -> serde_json::Value {
+        serde_json::json!({
+            "elf": "decode.elf", "kernel_name": "main:sequence",
+            "input_size": 1552, "output_size": 8, "scratch_size": 22544400,
+            "layout": {
+                "x": {"type": "input", "offset": 0, "len": 16},
+                "rope_global": {"type": "input", "offset": 16, "len": 1024},
+                "rope_local": {"type": "input", "offset": 1040, "len": 512},
+                "logits": {"type": "output", "offset": 0, "len": 8},
+                "W": {"type": "scratch", "offset": 0, "len": 16},
+                "L0_kc": {"type": "scratch", "offset": 16, "len": 4_194_304},
+                "L0_vc": {"type": "scratch", "offset": 4_194_320, "len": 4_194_304},
+                "L5_kc": {"type": "scratch", "offset": 8_388_624, "len": 7_077_888},
+                "L5_vc": {"type": "scratch", "offset": 15_466_512, "len": 7_077_888},
+            },
+            "inputs": ["x", "rope_global", "rope_local"], "output": "logits",
+            "weights": ["W", "L0_kc", "L0_vc", "L5_kc", "L5_vc"],
+            "cache_buffers": ["L0_kc", "L0_vc", "L5_kc", "L5_vc"],
+            "scratchpad": {
+                "params": {"kv_off": {"byte_offset": 0, "kind": "addr"},
+                           "sm_mask": {"byte_offset": 4, "kind": "core"},
+                           "kv_off1": {"byte_offset": 8, "kind": "addr"},
+                           "sm_mask1": {"byte_offset": 12, "kind": "core"}},
+                "kv_param": "kv_off", "mask_param": "sm_mask",
+                "kv_params": [{"param": "kv_off", "head_dim": 256}, {"param": "kv_off1", "head_dim": 512}],
+                "kv_windows": [
+                    {"kv_param": "kv_off", "head_dim": 256, "window": 1024, "mask_param": "sm_mask"},
+                    {"kv_param": "kv_off1", "head_dim": 512, "window": 6912, "mask_param": "sm_mask1"},
+                ],
+            },
+            "dims": {"layers": 1, "d_model": 8, "vocab": 4, "head_dim": 256, "S": 6912, "kv_block": 6912},
+            "host_protocol": {"embed_scale": "none", "rope_theta_global": 1_000_000.0, "rope_theta_local": 10_000.0},
+        })
+    }
+
+    /// A batched prefill built the way `gen_llm_prefill.py` builds one against the meta above:
+    /// `dims.kv_block` copied verbatim from decode (6912) regardless of its own window `s`, one
+    /// flat `kv_off` scratchpad slot, no `kv_windows` (its `mask_param` is `null`, and an absent
+    /// `sm_mask` is what makes the loader default `kv_windows` to empty).
+    fn flat_prefill_meta_for_gemma4(m: usize, s: usize) -> serde_json::Value {
+        serde_json::json!({
+            "elf": "prefill.elf", "kernel_name": "main:sequence",
+            "input_size": m * 8 * 2 + 2 * m * 256 * 2, "output_size": 0, "scratch_size": 0,
+            "layout": {
+                "x": {"type": "input", "offset": 0, "len": m * 8 * 2},
+                "rope_global": {"type": "input", "offset": m * 8 * 2, "len": m * 256 * 2},
+                "rope_local": {"type": "input", "offset": m * 8 * 2 + m * 256 * 2, "len": m * 256 * 2},
+            },
+            "inputs": ["x", "rope_global", "rope_local"],
+            "weights": [],
+            "scratchpad": {
+                "params": {"kv_off": {"byte_offset": 0, "kind": "addr"}},
+                "kv_param": "kv_off", "mask_param": null,
+            },
+            "dims": {"layers": 1, "M": m, "S": s, "d_model": 8, "head_dim": 256,
+                     "kv_block": 6912, "kv_heads": 8},
+            "host_protocol": {},
+        })
+    }
+
+    #[test]
+    fn a_circular_geometry_with_no_matching_prefill_kv_window_fails_loud() {
+        let dec = gemma4_shaped_decode_meta();
+        let pre = flat_prefill_meta_for_gemma4(2, 2);
+        let (_d, _p, da, pa) = load_pair(&dec, &pre);
+        assert!(pa.kv_windows.is_empty(), "the generator's own shape never declares one");
+        let err = da.check_prefill_pairing(&pa).unwrap_err().to_string();
+        assert!(err.contains("head_dim=256") && err.contains("capacity=1024"), "{err}");
+        assert!(err.contains("kv_block=6912"), "{err}");
+        assert!(err.contains("3538944"), "must compute kv head 1's own overrun offset: {err}");
+        assert!(err.contains("L0_kc") && err.contains("4194304"), "must name the real buffer: {err}");
+    }
+
+    #[test]
+    fn a_non_circular_multi_geometry_pair_passes() {
+        // `sliding_kv_circular: false` -- every geometry sized at the full window, exactly
+        // `decode_int4g32qat_l6_rg`'s shape (the known-good `g4_l6_m256_s2048` regression pair).
+        let mut dec = gemma4_shaped_decode_meta();
+        dec["scratchpad"]["kv_windows"] = serde_json::json!([
+            {"kv_param": "kv_off", "head_dim": 256, "window": 6912, "mask_param": "sm_mask"},
+            {"kv_param": "kv_off1", "head_dim": 512, "window": 6912, "mask_param": "sm_mask1"},
+        ]);
+        let pre = flat_prefill_meta_for_gemma4(2, 2);
+        let (_d, _p, da, pa) = load_pair(&dec, &pre);
+        da.check_prefill_pairing(&pa).expect("no narrowed geometry, nothing for prefill to miss");
+    }
+
+    #[test]
+    fn a_prefill_declaring_the_matching_narrow_window_passes() {
+        // The shape a FIXED generator would emit: prefill states its own per-geometry capacity too,
+        // and it agrees with decode's -- proves the check compares capacities, not just presence.
+        let dec = gemma4_shaped_decode_meta();
+        // Both entries must fit the PREFILL artifact's own window too (the loader bounds
+        // `kv_windows` capacity by that artifact's `dims.S`), so this build is compiled at the
+        // full 6912 rather than a narrow chunk -- a real per-chunk build is `check_prefill_pairing`
+        // test 1's shape, which this one deliberately is not.
+        let mut pre = flat_prefill_meta_for_gemma4(2, 6912);
+        pre["scratchpad"]["params"]["sm_mask"] = serde_json::json!({"byte_offset": 4, "kind": "core"});
+        pre["scratchpad"]["params"]["kv_off1"] = serde_json::json!({"byte_offset": 8, "kind": "addr"});
+        pre["scratchpad"]["params"]["sm_mask1"] = serde_json::json!({"byte_offset": 12, "kind": "core"});
+        pre["scratchpad"]["kv_windows"] = serde_json::json!([
+            {"kv_param": "kv_off", "head_dim": 256, "window": 1024, "mask_param": "sm_mask"},
+            {"kv_param": "kv_off1", "head_dim": 512, "window": 6912, "mask_param": "sm_mask1"},
+        ]);
+        let (_d, _p, da, pa) = load_pair(&dec, &pre);
+        assert_eq!(pa.kv_windows.len(), 2);
+        da.check_prefill_pairing(&pa).expect("prefill states the same capacity for the narrow geometry");
     }
 
     #[test]
