@@ -393,6 +393,11 @@ SLIDING_KV_CIRCULAR = os.environ.get("SLIDING_KV_CIRCULAR", "0") == "1"
 BUCKET_SCRATCH_ORDER = os.environ.get("BUCKET_SCRATCH_ORDER", "0") == "1"
 # Weight tile ROWS for the fused MLP. Trades against WEIGHT_DEPTH at constant L1.
 MLP_TILE_ROWS = int(os.environ.get("MLP_TILE_ROWS", "0"))
+# Row-parallel down: each core keeps only its own FF slice of `gh` and the partials are
+# summed over the hardware cascade, so the all-gathered FF-wide buffer disappears. Needs
+# post_norm (it reuses that path's gh_scratch round trip to broadcast the result back).
+MLP_ROW_PARALLEL = os.environ.get("MLP_ROW_PARALLEL", "0") == "1"
+MLP_D_CHUNKS = int(os.environ.get("MLP_D_CHUNKS", "8"))
 
 # K-SPLIT for reductions that do not fit L1 at ANY tiling. The B vector is double-buffered at
 # 2*K*2 bytes and is independent of every tiling knob, so a large enough K has no legal
@@ -646,6 +651,8 @@ def sequence_name(sp, NL, S, placer_flags, decode_layer_active=False, T=None, tm
         parts.append(f"wd{WEIGHT_DEPTH}")
     if MLP_TILE_ROWS:
         parts.append(f"tr{MLP_TILE_ROWS}")
+    if MLP_ROW_PARALLEL:
+        parts.append(f"rp{MLP_D_CHUNKS}")
     if FUSE_ACT:
         parts.append("fuseact")
     # Flat, not nested under decode_layer_active: _trace.py wires into every design.py this file
@@ -1889,6 +1896,8 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                                           act=sp.act, post_norm=sp.sandwich_norms,
                                           context=ctx, weight_depth=WEIGHT_DEPTH,
                                           tile_rows_gu=MLP_TILE_ROWS,
+                                          **(dict(row_parallel_down=True, d_chunks=MLP_D_CHUNKS)
+                                             if MLP_ROW_PARALLEL else {}),
                                           **mlp_quant_kw)
     # The whole decoder layer (attention + MLP) as ONE fused device -- see FUSE_DECODE_LAYER above.
     op_decode_layer = None
