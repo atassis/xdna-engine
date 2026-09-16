@@ -587,7 +587,7 @@ def load_weight_buffer(buf, arr):
 
 
 def sequence_name(sp, NL, S, placer_flags, decode_layer_active=False, T=None, tmv_declined=(),
-                  tmv_chunked=(), attn_block_geoms=()):
+                  tmv_chunked=(), attn_block_geoms=(), decode_layer_geoms=()):
     """Name the fused sequence after everything that changes its graph, not just the model.
 
     IRON keys the cached artifact by this name. Every knob below produces a DIFFERENT ELF, so
@@ -680,6 +680,10 @@ def sequence_name(sp, NL, S, placer_flags, decode_layer_active=False, T=None, tm
     # copy of that logic is exactly the kind of drift this file's other suffixes warn about.
     if decode_layer_active:
         parts.append("declayer")
+    elif decode_layer_geoms:
+        # A spec that fuses SOME of its geometries is a third graph over the same buffers, not the
+        # fused one and not the unfused one -- same collision this function exists to prevent.
+        parts.append("declayer" + "".join(f"_{h}" for h in sorted(decode_layer_geoms)))
     # attn_block_dp used WITHOUT decode_layer_dp, per geometry -- a different graph over the same
     # buffers as the unfused chain, same collision this function's docstring warns about. Passed
     # in rather than re-derived, same reason decode_layer_active is: build_graph already computed
@@ -1449,12 +1453,15 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
     # The qkv arm is decided PER GEOMETRY: its rule is `d_model % head_dim`, so two head_dims can
     # genuinely disagree about it. The mlp arm's rules (sandwich norms, activation) touch no
     # attention geometry, so it stays one verdict for the build.
-    if not FUSE_QKV_DP:
-        qkv_dp_why = {g: "FUSE_QKV_DP=0" for g in geoms}
-    elif not FUSE_QKV_GEMV:
-        qkv_dp_why = {g: "needs FUSE_QKV_GEMV=1 for the concatenated Wqkv" for g in geoms}
-    else:
-        qkv_dp_why = {g: sp.qkv_dp_reason(COLS, head_dim=g[0]) for g in geoms}
+    #
+    # SHAPE and FLAG are separated because three arms share the shape and none shares the flag.
+    # qkv_dp_reason's two rules -- a per-head qk-norm, and `cur`/`n_in` riding the HD-wide misc
+    # channel -- are attn_block_dp's own __post_init__ verbatim, so attn_block_dp and
+    # decode_layer_dp read attn_shape_why. Reading qkv_dp_why instead made FUSE_QKV_DP=0 decline
+    # two arms that never touch QKVHeadDataParallel, which is the shipped Gemma-4 recipe.
+    attn_shape_why = {g: ("needs FUSE_QKV_GEMV=1 for the concatenated Wqkv" if not FUSE_QKV_GEMV
+                          else sp.qkv_dp_reason(COLS, head_dim=g[0])) for g in geoms}
+    qkv_dp_why = {g: ("FUSE_QKV_DP=0" if not FUSE_QKV_DP else attn_shape_why[g]) for g in geoms}
     mlp_dp_why = "FUSE_MLP_DP=0" if not FUSE_MLP_DP else sp.mlp_dp_reason()
     if mlp_dp_why is None:
         from iron.operators.swiglu_mlp_dp.op import SwiGLUMLPDataParallel
@@ -1488,19 +1495,26 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                     f"whose local matvec has no relationship to R"
                 )
 
-    # Per-GEOMETRY eligibility for attn_block_dp used WITHOUT decode_layer_dp. Same clauses
-    # decode_layer_why checks below for the one geometry it requires, reused via qkv_dp_why/
-    # _tmv_declined rather than re-derived, so the two verdicts cannot drift apart -- but with no
-    # opinion on the MLP half (no mlp_dp_why, no FUSE_MLP_O) and no single-geometry requirement, so
-    # a spec whose layers disagree about attention geometry can fuse some and fall back on others.
-    #
-    # v_norm no longer refuses here: attn_block_dp/op.py now takes v_norm (step 5 gets the same
-    # weighted-RMSNorm op as qk-norm), so the only remaining v_norm exposure is op_qkv_dp's own
-    # NotImplementedError below (fused QKV head still has no value-norm stage).
-    def _attn_block_why(g):
+    def _geom_window(hd, hkv):
+        """This geometry's attention window. The GLOBAL geometry (matched on
+        spec.global_head_dim/global_n_kv_heads, the same way attn_ops does) always stays at the
+        build's max_seq; a declared sliding_window narrows every other one under
+        SLIDING_KV_CIRCULAR."""
+        is_global_geom = hd == sp.global_head_dim and hkv == sp.global_n_kv_heads
+        return (S if (is_global_geom or not SLIDING_KV_CIRCULAR or sp.sliding_window is None)
+                else sp.sliding_window)
+
+    # Passed only when on -- see _decode_layer's window_parameter comment for why.
+    _v_norm_kw = {"v_norm": True} if sp.v_norm else {}
+
+    # attn_block_dp's OWN per-geometry rules, in one place: attn_block_why here and
+    # decode_layer_why below both read this, so the two arms cannot drift apart about a geometry.
+    # Reused via qkv_dp_why/_tmv_declined rather than re-derived, same discipline. No opinion on
+    # the MLP half, and no single-geometry requirement, so a spec whose layers disagree about
+    # attention geometry can fuse some and fall back on others.
+    def _attn_dp_why(g):
         hd, hkv, has_v = g
-        return ("FUSE_ATTN_BLOCK=0" if not FUSE_ATTN_BLOCK else
-                qkv_dp_why[g] if qkv_dp_why[g] else
+        return (attn_shape_why[g] if attn_shape_why[g] else
                 f"needs Hkv ({hkv}) == COLS ({COLS})" if hkv != COLS else
                 "attn_block_dp always fuses K and V; this geometry has no v_proj" if not has_v else
                 # Same gap op_qkv_dp already raises on below: attn_block_dp's Wqkv arg is a flat
@@ -1514,7 +1528,33 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                 "variant internally)" if not (GROUPED_K and TMV_CTX and hd not in _tmv_declined)
                 else None)
 
-    attn_block_why = {g: _attn_block_why(g) for g in geoms}
+    def _attn_block_probe(g):
+        """attn_block_dp's own __post_init__ as the verdict -- the L1 budget, the shim channels
+        and the max_seq granule are the operator's arithmetic, not rules to restate here. The
+        object is discarded: attn_ops builds the real one with this geometry's slot names, and
+        only a runlist op becomes a design."""
+        from iron.operators.attn_block_dp.op import AttnBlockDataParallel
+
+        hd, hkv, _ = g
+        if sp.v_norm and operator_rejects(AttnBlockDataParallel, {"v_norm": True}):
+            return ("attn_block_dp takes no v_norm parameter, so this spec's gainless value norm "
+                    "would be dropped rather than refused")
+        w = _geom_window(hd, hkv)
+        kva, blk = KV_ALLOC or w, min(T, w)
+        try:
+            AttnBlockDataParallel(
+                D=D, HD=hd, Hq=Hq, Hkv=hkv, max_seq=w, num_aie_columns=hkv, epsilon=sp.eps,
+                tile_size_input=TSI, context=ctx, weight_depth=WEIGHT_DEPTH,
+                wqkv_head_major=True, **_v_norm_kw,
+                kv_alloc=None if kva == w else kva, kv_block_size=None if blk == w else blk)
+        except ValueError as e:
+            return str(e)
+        return None
+
+    # attn_block_dp used WITHOUT decode_layer_dp -- no opinion on the MLP half, so a spec whose
+    # layers disagree about attention geometry can fuse some and fall back on others.
+    attn_block_why = {g: ("FUSE_ATTN_BLOCK=0" if not FUSE_ATTN_BLOCK else
+                          _attn_dp_why(g) or _attn_block_probe(g)) for g in geoms}
     # head_dims that actually qualify, for sequence_name()'s suffix -- computed once here, same
     # discipline as _tmv_declined/_tmv_chunked above, rather than re-derived at the call site.
     _attn_block_fused = tuple(sorted(g[0] for g in geoms if attn_block_why[g] is None))
@@ -1529,34 +1569,98 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
     # already placed attn_block_dp at the same window.
     #
     # WHICH ARM CARRIES THE LAYER: the precision check below is conditional on it, and every
-    # clause here is a spec/flag question that needs no operator. Eligibility is the union of
-    # qkv_dp_why/mlp_dp_why (the spec-shape rules attn_block_dp and swiglu_mlp_dp already check)
-    # plus what is true only of the MERGED device: attn_block_dp's own Hkv==COLS rule, and no
-    # sandwich norms (the op has no post-attn/post-ffn norm slot).
-    # ONE geometry. decode_layer_dp bakes HD/Hq/Hkv into a single design and the runlist
-    # substitutes ONE op per layer (that is also what a window rung rewrites), so a spec whose
-    # layers disagree about head_dim has no single design to substitute. Refuse by name rather
-    # than build the first geometry's design and run every layer through it.
-    _geom1 = geoms[0] if len(geoms) == 1 else None
-    decode_layer_why = ("FUSE_DECODE_LAYER=0" if not FUSE_DECODE_LAYER else
-                        f"needs ONE attention geometry; {sp.name} has {len(geoms)}: {geoms}"
-                        if _geom1 is None else
-                        qkv_dp_why[_geom1] if qkv_dp_why[_geom1] else
-                        mlp_dp_why if mlp_dp_why else
-                        "needs FUSE_MLP_O=1 (Wo's padding is wired through that flag via "
-                        "op_mlp_dp._wo_rows_padded, and decode_layer_dp always fuses Wo)"
-                        if not FUSE_MLP_O else
-                        f"needs Hkv ({Hkv}) == COLS ({COLS})" if Hkv != COLS else
-                        "needs SCALE_IN_QNORM=1 (attn_block_dp has no separate scale stage)"
-                        if not (SCALE_IN_QNORM and sp.qk_norm) else
-                        "needs GQA_GROUPED_K=1 and TMV_CTX=1 (attn_block_dp computes exactly "
-                        "that variant internally)"
-                        if not (GROUPED_K and TMV_CTX and not _tmv_declined) else
-                        # The weight FORMAT is not a clause here. The MLP half forwards its
-                        # dtype to swiglu_mlp_dp, and a format the attention half cannot carry is
-                        # a REFUSAL (P003), not a reason to quietly drop to the unfused arm --
-                        # which is what silently unfusing a whole decoder layer used to be.
-                        None)
+    # spec/flag clause here needs no operator. Eligibility is the union of qkv_dp_why/mlp_dp_why
+    # (the spec-shape rules attn_block_dp and swiglu_mlp_dp already check) plus what is true only
+    # of the MERGED device -- and that last part is ASKED, not restated: the operator's own
+    # __post_init__ checks both halves' L1, the shim-channel sum and the max_seq granule, so a
+    # construction that raises IS the verdict and cannot go stale as IRON grows.
+    #
+    # PER GEOMETRY, not per build. decode_layer_dp bakes HD/Hq/Hkv into one design and the runlist
+    # substitutes this geometry's op per layer, so a spec whose layers disagree about head_dim
+    # fuses the geometries that qualify and falls back to the unfused chain on the rest.
+    _decode_layer_cache = {}
+
+    def _decode_layer(g, window):
+        """decode_layer_dp for one geometry at one window, MEMOIZED -- unique_designs merges by
+        id(op), so a fresh object per layer would emit one design per layer and defeat the whole
+        configure collapse this arm exists for. Same discipline as _attn_cache below."""
+        if (g, window) not in _decode_layer_cache:
+            from iron.operators.decode_layer_dp.op import DecodeLayerDataParallel
+
+            hd, hkv, _ = g
+            kva, blk = KV_ALLOC or window, min(T, window)
+            _decode_layer_cache[(g, window)] = DecodeLayerDataParallel(
+                D=D, FF=FF, HD=hd, Hq=Hq, Hkv=hkv, max_seq=window, attn_cols=hkv,
+                mlp_cols=MLP_DP_COLS,
+                eps_attn=sp.eps, eps_mlp=sp.eps, tile_size_input=TSI, context=ctx,
+                weight_depth=WEIGHT_DEPTH, wqkv_head_major=True,
+                act=sp.act, post_norm=sp.sandwich_norms, **_v_norm_kw,
+                # max_seq stays the WINDOW the attention math iterates; these two carry the
+                # capacity and the blocked storage, the same split gemv/tmatvec already have. Both
+                # None on the unwidened, unblocked default, which is byte-identical to before they
+                # existed. Compared against THIS op's own window, not against the top one: a rung
+                # is precisely the case where capacity and window differ, and comparing to `S`
+                # would hand a rung `kv_alloc=None` and silently shrink its cache to its window.
+                kv_alloc=None if kva == window else kva,
+                kv_block_size=None if blk == window else blk,
+                # Passed as a kwarg ONLY when the flag is on. Handing it through unconditionally --
+                # even as None -- is a TypeError against any IRON whose decode_layer_dp predates
+                # the field, and the default IRON_DIR (wt-iron-integ) is exactly that. Measured
+                # 2026-09-10: it broke every decode build on the default path, DYNAMIC_WINDOW=0
+                # included, because an unknown kwarg fails at the call and never reaches the flag
+                # test inside.
+                **({"split_gh": SPLIT_GH_DRAIN} if SPLIT_GH_DRAIN != 1 else {}),
+                **({"attn_split": ATTN_SPLIT} if ATTN_SPLIT else {}),
+                **({"window_parameter": "attn_window"} if DYNAMIC_WINDOW else {}),
+                # The MLP half's four weights (Wo, Wg, Wu, Wd) share one fifo and one format,
+                # which P002 has already enforced.
+                **_quant_kw("mlp"))
+        return _decode_layer_cache[(g, window)]
+
+    def _decode_layer_why(g):
+        from iron.operators.decode_layer_dp.op import DecodeLayerDataParallel
+
+        if not FUSE_DECODE_LAYER:
+            return "FUSE_DECODE_LAYER=0"
+        why = _attn_dp_why(g) or mlp_dp_why
+        if why:
+            return why
+        if not FUSE_MLP_O:
+            return ("needs FUSE_MLP_O=1 (Wo's padding is wired through that flag via "
+                    "op_mlp_dp._wo_rows_padded, and decode_layer_dp always fuses Wo)")
+        if sp.v_norm and operator_rejects(DecodeLayerDataParallel, {"v_norm": True}):
+            # attn_block_dp has the stage; decode_layer_dp does not forward it. Refusing here is
+            # what keeps a fused Gemma-4 layer from dropping the value norm silently.
+            return ("decode_layer_dp takes no v_norm parameter, so this spec's gainless value "
+                    "norm would be dropped rather than refused")
+        _unaccepted = operator_rejects(DecodeLayerDataParallel, _quant_kw("mlp"))
+        if _unaccepted:
+            return (f"decode_layer_dp takes no {'/'.join(_unaccepted)} parameter, so it cannot "
+                    f"read the {_BUILD_STATE['layout']}/{_BUILD_STATE['scale_dtype']} dump this "
+                    f"build packs")
+        # Before this file's own gap below, so the log names the harder wall first.
+        try:
+            _decode_layer(g, _geom_window(g[0], g[1]))
+        except ValueError as e:
+            return str(e)
+        if sp.sandwich_norms:
+            # decode_layer_dp itself has the slot (post_norm -> one packed [n_pa | n_pff] 2*D
+            # argument, and Wo padded for the fuse_o overlap window); the runlist below passes
+            # neither. Refuse by name rather than build a device whose argument list the runlist
+            # does not fill.
+            return ("decode_layer_dp wants the post-norm gains as one packed 2*D argument and a "
+                    "TSI_O-padded Wo; this runlist passes neither")
+        # The weight FORMAT is not a clause here. The MLP half forwards its dtype to
+        # swiglu_mlp_dp, and a format the attention half cannot carry is a REFUSAL (P003), not a
+        # reason to quietly drop to the unfused arm -- which is what silently unfusing a whole
+        # decoder layer used to be.
+        return None
+
+    decode_layer_why = {g: _decode_layer_why(g) for g in geoms}
+    # head_dims that fuse, for sequence_name()'s suffix and for the sites that ask "does ANY layer
+    # take this arm" -- computed once, same discipline as _attn_block_fused above.
+    _decode_layer_fused = tuple(sorted(g[0] for g in geoms if decode_layer_why[g] is None))
+    _decode_layer_all = all(decode_layer_why[g] is None for g in geoms)
     # Sandwich norms pass the post-FFN gain as the fused design's own argument, and under fuse_o
     # get_arg_spec wants BOTH post-norm gains packed as one 2*D buffer [n_pa | n_pff] while the
     # generator holds them as two D buffers. Declining fuse_o is not a fallback here, it is the
@@ -1602,7 +1706,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
     # into a named rule.
     _pdtypes, _pkind, _pfull = precision.packer_capability()
     precision_ctx = precision.GraphContext(
-        fused_layer=decode_layer_why is None and FUSE_DECODE_LAYER,
+        fused_layer=bool(_decode_layer_fused),
         fuse_o=fuse_o, fused_qkv_gemv=bool(FUSE_QKV_GEMV),
         fused_qkv_dp=qkv_dp_why is None,
         d_model=D, ffn=FF, q_dim=QD, head_dim=HD, attn_cols=COLS,
@@ -1662,13 +1766,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         if (hd, hkv, has_v) in _attn_cache:
             return _attn_cache[(hd, hkv, has_v)]
         qd, kvd, gqa = Hq * hd, hkv * hd, Hq // hkv
-        # This geometry's own attention capacity. The GLOBAL geometry (identified by matching
-        # spec.global_head_dim/global_n_kv_heads, not by an explicit flag -- attn_ops is keyed
-        # purely on (hd, hkv, has_v)) always stays at the build's max_seq; a declared
-        # sliding_window narrows every OTHER geometry only under SLIDING_KV_CIRCULAR.
-        is_global_geom = hd == sp.global_head_dim and hkv == sp.global_n_kv_heads
-        w = (S if (is_global_geom or not SLIDING_KV_CIRCULAR or sp.sliding_window is None)
-             else sp.sliding_window)
+        w = _geom_window(hd, hkv)
         KVA_g = KV_ALLOC or w
         # T (the KVLayout block size) is derived once, globally, against S -- today always S
         # itself (flat, "one block"). A geometry whose own capacity is w < T needs its OWN flat
@@ -1885,8 +1983,8 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                 D=D, HD=hd, Hq=Hq, Hkv=hkv, max_seq=w, num_aie_columns=hkv, epsilon=sp.eps,
                 tile_size_input=TSI, context=ctx, weight_depth=WEIGHT_DEPTH,
                 wqkv_head_major=True, kv_offset_parameter=slot, mask_parameter=mask_slot,
-                kv_alloc=None if KVA_g == w else KVA_g, kv_block_size=None if T_g == w else T_g,
-                v_norm=sp.v_norm)
+                **_v_norm_kw,
+                kv_alloc=None if KVA_g == w else KVA_g, kv_block_size=None if T_g == w else T_g)
         g = SimpleNamespace(
             hd=hd, hkv=hkv, qd=qd, kvd=kvd, gqa=gqa, kv_slot=slot, o_chunks=o_chunks,
             op_qk_norm=op_qk_norm, op_qk_norm_b=op_qk_norm_b, op_qkv=op_qkv, op_q=op_q,
@@ -1896,7 +1994,9 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
             op_ctx=op_ctx, op_v_norm=op_v_norm, has_v=has_v, kv_parts=kv_parts,
             uses_tmv_ctx=uses_tmv, scores_groups=scores_groups,
             op_softmax=op_softmax, op_scale=op_scale, mask_slot=mask_slot, window=w,
-            op_attn_block=op_attn_block, circular=(w != S))
+            op_attn_block=op_attn_block, circular=(w != S),
+            op_decode_layer=(_decode_layer((hd, hkv, has_v), w)
+                             if decode_layer_why[(hd, hkv, has_v)] is None else None))
         _attn_cache[(hd, hkv, has_v)] = g
         return g
 
@@ -1908,7 +2008,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
     # Folded into n_qn when SCALE_IN_QNORM; built anyway so the A/B arm stays reachable.
     scale_in_qnorm = SCALE_IN_QNORM and sp.qk_norm
     op_rep_k = op_rep_v = op_scores = op_scale = op_softmax = op_trv = op_ctx = None
-    if decode_layer_why is not None:
+    if not _decode_layer_all:
         op_rep_k = Repeat(rows=Hkv, cols=S * HD, repeat=sp.gqa_group, transfer_size=HD, context=ctx)
         op_rep_v = Repeat(rows=Hkv, cols=S * HD, repeat=sp.gqa_group, transfer_size=HD, context=ctx)
         _rtp_extent = {"vector_size_parameter": "sm_mask"} if ATTN_RUNTIME_EXTENT else {}
@@ -2001,42 +2101,21 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                                              if MLP_ROW_PARALLEL else {}),
                                           **mlp_quant_kw)
     # The whole decoder layer (attention + MLP) as ONE fused device -- see FUSE_DECODE_LAYER above.
-    op_decode_layer = None
+    # The per-geometry objects already exist: _decode_layer_why built each eligible one through the
+    # memoizing factory when it probed the operator.
+    op_decode_layer = _decode_layer(geoms[0], _geom_window(*geoms[0][:2])) if _decode_layer_all \
+        else None
     rung_ops = {}
-    if decode_layer_why is None:
-        from iron.operators.decode_layer_dp.op import DecodeLayerDataParallel
-
-        def _decode_layer(window):
-            return DecodeLayerDataParallel(
-                D=D, FF=FF, HD=HD, Hq=Hq, Hkv=Hkv, max_seq=window, attn_cols=Hkv,
-                mlp_cols=MLP_DP_COLS,
-                eps_attn=sp.eps, eps_mlp=sp.eps, tile_size_input=TSI, context=ctx,
-                weight_depth=WEIGHT_DEPTH, wqkv_head_major=True,
-                # max_seq stays the WINDOW the attention math iterates; these two carry the
-                # capacity and the blocked storage, the same split gemv/tmatvec already have. Both
-                # None on the unwidened, unblocked default, which is byte-identical to before they
-                # existed. Compared against THIS op's own window, not against the top one: a rung
-                # is precisely the case where capacity and window differ, and comparing to `S`
-                # would hand a rung `kv_alloc=None` and silently shrink its cache to its window.
-                kv_alloc=None if KVA == window else KVA,
-                kv_block_size=None if T == S else T,
-                # Passed as a kwarg ONLY when the flag is on. Handing it through unconditionally --
-                # even as None -- is a TypeError against any IRON whose decode_layer_dp predates
-                # the field, and the default IRON_DIR (wt-iron-integ) is exactly that. Measured
-                # 2026-09-10: it broke every decode build on the default path, DYNAMIC_WINDOW=0
-                # included, because an unknown kwarg fails at the call and never reaches the flag
-                # test inside.
-                # Conditional for the SAME reason window_parameter is: an unknown kwarg is a
-                # TypeError at the call against any IRON whose decode_layer_dp predates the field,
-                # and it never reaches the flag test inside.
-                **({"split_gh": SPLIT_GH_DRAIN} if SPLIT_GH_DRAIN != 1 else {}),
-                **({"attn_split": ATTN_SPLIT} if ATTN_SPLIT else {}),
-                **({"window_parameter": "attn_window"} if DYNAMIC_WINDOW else {}),
-                # Same discipline again. The MLP half's four weights (Wo, Wg, Wu, Wd) share one
-                # fifo and one format, which P002 has already enforced.
-                **_quant_kw("mlp"))
-
-        op_decode_layer = _decode_layer(S)
+    if WINDOW_RUNGS:
+        if not _decode_layer_all:
+            raise SystemExit(
+                f"WINDOW_RUNGS={','.join(map(str, WINDOW_RUNGS))} rewrites ONE layer design per "
+                f"runlist, so it needs every geometry fused; "
+                + "; ".join(f"head_dim={g[0]}: {w}" for g, w in decode_layer_why.items() if w))
+        if len(geoms) > 1:
+            raise SystemExit(
+                f"WINDOW_RUNGS substitutes one op in one runlist and {sp.name} has {len(geoms)} "
+                f"attention geometries {geoms} -- a rung set would need one design per geometry")
         # A rung is the SAME design at a narrower window over the SAME capacity, so `kv_alloc`
         # doing the capacity/window split is what makes the rungs share one arena byte for byte:
         # `kc`/`vc` are sized from KVA, not from the window. Rejected loudly rather than clamped --
@@ -2047,14 +2126,11 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                 raise SystemExit(f"WINDOW_RUNGS: rung {_w} is not narrower than max_seq {S}")
             if _w in rung_ops:
                 raise SystemExit(f"WINDOW_RUNGS: rung {_w} listed twice")
-            rung_ops[_w] = _decode_layer(_w)
-    elif WINDOW_RUNGS:
-        raise SystemExit(
-            f"WINDOW_RUNGS={','.join(map(str, WINDOW_RUNGS))} needs decode_layer_dp, which is "
-            f"OFF here: {decode_layer_why}"
-        )
-    print(f"[gen] fused arm decode_layer_dp: "
-          f"{'OFF -- ' + decode_layer_why if decode_layer_why else 'on'}")
+            rung_ops[_w] = _decode_layer(geoms[0], _w)
+    for g in geoms:
+        why = decode_layer_why[g]
+        tag = "" if len(geoms) == 1 else f" [head_dim={g[0]}, kv_heads={g[1]}]"
+        print(f"[gen] fused arm decode_layer_dp{tag}: {'OFF -- ' + why if why else 'on'}")
 
     if not fuse_act:
         if sp.act == "silu":
@@ -2280,7 +2356,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
             assert len(qkv_parts) == want, (
                 f"L{l}: expected {want} concat parts ({'Wq, Wk, Wv' if g.has_v else 'Wq, Wk'}); "
                 f"got {len(qkv_parts)}")
-            if ((op_decode_layer is not None and op_decode_layer.wqkv_head_major
+            if ((g.op_decode_layer is not None and g.op_decode_layer.wqkv_head_major
                  or g.op_attn_block is not None and g.op_attn_block.wqkv_head_major)
                     and g.has_v):
                 # attn_block_dp wqkv_head_major: one contiguous run of (gqa+2) hd-row
@@ -2369,7 +2445,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         if not fuse_o:
             bufsz[p + "a"] = D * 2
         nxt = f"x{l+1}"
-        if op_decode_layer is not None:
+        if g.op_decode_layer is not None:
             # The whole layer -- attention AND MLP, including Wo -- is one design. q/k/v/qkv, sc,
             # sw, hn, hf, g, u, d and a are all core-local to attn_block_dp/swiglu_mlp_dp and never
             # become L3 buffers, so none of them gets a bufsz entry here (contrast the unfused arms
@@ -2378,10 +2454,13 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
             # eligibility precondition); `n_pf` stays separate, the MLP half's own argument.
             weights[p + "norms"] = np.concatenate(
                 [weights.pop(p + "n_in"), weights.pop(p + "n_qn"), weights.pop(p + "n_kn")])
-            bufsz[p + "kc"] = kv_layout.total_elems * 2
-            bufsz[p + "vc"] = kv_layout.total_elems * 2
-            bufsz[p + "cx"] = QD * 2
-            rl.append((op_decode_layer, cur, p + "norms", p + "Wqkv", ang, p + "kc", p + "vc",
+            # PER GEOMETRY, at this geometry's own CAPACITY (KV_ALLOC when widened, else its
+            # window) -- the build-wide kv_layout is the sliding geometry's on a mixed spec.
+            _kvl_cap = KVLayout(Hkv=g.hkv, S=KV_ALLOC or g.window, HD=g.hd, T=min(T, g.window))
+            bufsz[p + "kc"] = _kvl_cap.total_elems * 2
+            bufsz[p + "vc"] = _kvl_cap.total_elems * 2
+            bufsz[p + "cx"] = g.qd * 2
+            rl.append((g.op_decode_layer, cur, p + "norms", p + "Wqkv", ang, p + "kc", p + "vc",
                        p + "cx", p + "n_pf", p + "Wo", p + "Wg", p + "Wu", p + "Wd",
                        "mlp_gh", "mlp_a_scratch", nxt))
         else:
@@ -2498,9 +2577,9 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
             rl.append((op_lscale, nxt, p + "ls", nxt))
         cur = nxt
 
-    if op_mlp_dp is not None or op_decode_layer is not None:
+    if op_mlp_dp is not None or _decode_layer_fused:
         bufsz["mlp_gh"] = FF * 2   # one buffer, reused by every layer -- they run one at a time
-        if fuse_o or op_decode_layer is not None:
+        if fuse_o or _decode_layer_fused:
             bufsz["mlp_a_scratch"] = D * 2   # a's own all-gather round-trip buffer, same idiom
 
     weights["n_final"] = load_norm(f"{sp.weight_prefix}norm.weight")
@@ -2562,7 +2641,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
     # single-row spread's measured win is specific to the unfused per-op designs' <=8-worker
     # shape and does not transfer, so this arm's default is the placer's OWN default (no
     # restriction) instead of DECODE_PLACER_FLAGS_DEFAULT -- still overridable via the env var.
-    placer_default = "" if op_decode_layer is not None else DECODE_PLACER_FLAGS_DEFAULT
+    placer_default = "" if _decode_layer_fused else DECODE_PLACER_FLAGS_DEFAULT
     placer_flags = os.environ.get("DECODE_PLACER_FLAGS", placer_default).split()
     # Two designs where one would do: gate/up are the same GEMV shape and adjacent, as are the two
     # KV StridedCopys. Each duplicate pair costs an extra aiex.configure PER LAYER -- 56 per token
@@ -2618,7 +2697,8 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
             seg_bufsz[seg_out] = D * 2
         _sn = sequence_name(sp, NL, S, placer_flags, tmv_declined=_tmv_declined,
                             tmv_chunked=_tmv_chunked, attn_block_geoms=_attn_block_fused,
-                            decode_layer_active=op_decode_layer is not None, T=T)
+                            decode_layer_active=_decode_layer_all,
+                            decode_layer_geoms=_decode_layer_fused, T=T)
         name = _sn if len(cuts) == 1 else f"{_sn}_seg{si}of{len(cuts)}"
         # A rung is THIS runlist with the layer design substituted. Only for an unsplit
         # stack: a rung rewrites one runlist, and a segmented stack has one per segment
@@ -2686,7 +2766,9 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                                 context=ctx, extra_flags=placer_flags, share_designs=share)
         head.compile()
     return sp, fused, weights, dict(NL=NL, S=S, T=T, inputs=inputs, cache_names=cache_names,
-                                        decode_layer_active=op_decode_layer is not None,
+                                        decode_layer_active=_decode_layer_all,
+                                        decode_layer_partial=bool(_decode_layer_fused)
+                                                             and not _decode_layer_all,
                                         # getattr, not attribute access: a spec whose fused
                                         # layer did not build has no such attribute.
                                         # Only when the parameter was actually WIRED. The
@@ -2734,6 +2816,15 @@ def main():
             f"would record only segment 0 ({md['segments'][0]['layers'][1]} of {NL} layers) as the "
             f"whole model. Gate a segmented stack through verify_llm_decode.py, which drives every "
             f"segment, until meta.json carries the per-segment ELF list and seam order.")
+    # `dims.wqkv_head_major` is ONE statement about the whole arena and prefill slices Wqkv by it,
+    # so a stack where only some geometries fuse has no honest value to write: those layers are
+    # head-major and the rest are not. Refuse rather than emit a flag that is right for 40 layers
+    # and silently wrong for 8 -- same disposition as the segmented-stack refusal just above.
+    if md["decode_layer_partial"]:
+        raise SystemExit(
+            "some attention geometries fuse into decode_layer_dp and some do not, so Wqkv's row "
+            "order differs per layer and dims.wqkv_head_major cannot describe this ELF. Give it "
+            "a per-geometry form, or build with FUSE_DECODE_LAYER=0.")
     embed_blob, host_embed = md["embed_blob"], md["host_embed"]
     decode_layer_active = md["decode_layer_active"]
     window_granule = md["window_granule"]
