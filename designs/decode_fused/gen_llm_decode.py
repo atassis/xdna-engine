@@ -110,12 +110,13 @@ from iron.operators.gemv.design import MAX_GROUP_REUSE  # noqa: E402
 try:                                                                            # noqa: E402
     from iron.common.quant import (                                            # noqa: E402
         quantize_weight, row_stride_bytes, derive_row_group, widest_chunk,      # noqa: E402
-        dequantize_weight_chunked)                                             # noqa: E402
+        dequantize_weight_chunked, _planar_to_rows)                            # noqa: E402
 except ModuleNotFoundError:                                                     # noqa: E402
     try:                                                                        # noqa: E402
         from iron.operators.gemv.quant import quantize_weight, row_stride_bytes  # noqa: E402
         derive_row_group = widest_chunk = None  # pre-move tree: no row_group_planar  # noqa: E402
         dequantize_weight_chunked = None  # pre-move tree: no row_parallel_down either  # noqa: E402
+        _planar_to_rows = None  # pre-move tree: no row_group_planar either  # noqa: E402
     except ModuleNotFoundError as e:                                            # noqa: E402
         raise ModuleNotFoundError(
             "no weight packer in this IRON tree: tried iron.common.quant (post-6a347dc) and "
@@ -166,16 +167,25 @@ def _spec(site):
 _BUILD_STATE = {"layout": "header_first", "scale_dtype": "f32"}
 
 
-def _quant_kw(site):
+def _quant_kw(site, force_header_first=False):
     """`weight_dtype`/`group_size`/`layout` kwargs for the operator carrying one site's weight.
     Empty at bf16, so an unquantized call is the shape it would have had with no precision plane.
     row_group is deliberately omitted: GEMV self-derives it (K022), and passing it here would be
-    a second, possibly-disagreeing computation of the same value."""
+    a second, possibly-disagreeing computation of the same value.
+
+    force_header_first: attn_block_dp's Wqkv reorder (wqkv_head_major, below) slices individual
+    output-feature rows out of Wq/Wk/Wv, which needs the fixed per-row stride header_first gives
+    and row_group_planar does not (a row's header sits ROW_GROUP*payload away from its own
+    payload). See attn-block-quantized-wqkv-assumes-header-first: the reorder used to inherit
+    whatever layout the dump declared and silently mis-sliced a planar dump. header_first buys
+    the planar width benefit nothing at the group sizes this model ships (quant.py's
+    max_legal_vec_size docstring), so forcing it here is free at the shipped config.
+    """
     spec = _spec(site)
     if not spec.quantized:
         return {}
     kw = dict(weight_dtype=spec.dtype, group_size=spec.group_size)
-    if _BUILD_STATE["layout"] != "header_first":
+    if _BUILD_STATE["layout"] != "header_first" and not force_header_first:
         kw["layout"] = _BUILD_STATE["layout"]
     if _BUILD_STATE["scale_dtype"] != "f32":
         # Sizes the weight buffer's row and the kernel's header: a build that reads a bf16-scale
@@ -1895,7 +1905,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                 tile_size_input=TSI, context=ctx, weight_depth=WEIGHT_DEPTH,
                 wqkv_head_major=True, kv_offset_parameter=slot, mask_parameter=mask_slot,
                 kv_alloc=None if KVA_g == w else KVA_g, kv_block_size=None if T_g == w else T_g,
-                v_norm=sp.v_norm, **_quant_kw("qkv"))
+                v_norm=sp.v_norm, **_quant_kw("qkv", force_header_first=True))
         g = SimpleNamespace(
             hd=hd, hkv=hkv, qd=qd, kvd=kvd, gqa=gqa, kv_slot=slot, o_chunks=o_chunks,
             op_qk_norm=op_qk_norm, op_qk_norm_b=op_qk_norm_b, op_qkv=op_qkv, op_q=op_q,
@@ -2300,6 +2310,28 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                 gqa_ = Hq // g.hkv
                 row_w = precision.wire_row_units(_spec("qkv"), D,
                                                  _BUILD_STATE["scale_dtype"])
+                # This reorder slices individual output-feature ROWS out of Wq/Wk/Wv at a fixed
+                # row_w stride, which only addresses header_first bytes correctly -- under
+                # row_group_planar a row's header sits ROW_GROUP*payload away from its own payload
+                # (iron/common/quant.py::row_offsets), so the slice below would cut across block
+                # boundaries. Un-planarize first (a pure byte permutation, no requantization) so
+                # every consumer of this reorder gets header_first rows regardless of the dump's
+                # own declared layout -- see attn-block-quantized-wqkv-assumes-header-first.
+                if _BUILD_STATE["layout"] == "row_group_planar":
+                    if _planar_to_rows is None:
+                        raise ModuleNotFoundError(
+                            "dump is row_group_planar but this IRON tree predates "
+                            "_planar_to_rows (pre-6a347dc)")
+                    _qspec = _spec("qkv")
+                    _rg = derive_row_group([D], _qspec.group_size, _qspec.dtype,
+                                           vec_size=widest_chunk(_qspec.group_size, _qspec.dtype),
+                                           scale_dtype=_BUILD_STATE["scale_dtype"])
+                    # This branch is gated on g.has_v (above), so qkv_parts is always [Wq, Wk, Wv].
+                    _sizes = (Hq * g.hd, g.hkv * g.hd, g.hkv * g.hd)
+                    qkv_parts = [
+                        _planar_to_rows(a, m, D, row_w, _qspec.dtype, _rg).reshape(-1)
+                        for a, m in zip(qkv_parts, _sizes)
+                    ]
                 wq2, wk2, wv2 = (a.reshape(-1, row_w) for a in qkv_parts)
                 parts = []
                 for c in range(g.hkv):
