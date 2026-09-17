@@ -149,11 +149,12 @@ BF16 = ml_dtypes.bfloat16
 PREFILL_SEGMENTS = int(os.environ.get("PREFILL_SEGMENTS", "1"))
 
 # Hold the GEMM's A operand in L2 across its N loop, instead of re-reading it from DDR
-# `N//(tile_n*cols)` times (iron/operators/gemm/design.py's `pattern_repeat`). Opt-in on both
-# sides: the operator's own `a_resident` defaults off and falls back per site when A+B+C do not
-# co-fit a 512 KiB MemTile. Worth 3.92 GiB of 16.00 at M=64 -- but prefill runs at 13.1% of the
-# read peak, so the BYTE saving is only ~3.5% of the step unless the idle term moves with it.
-# That is the open question this flag exists to measure, not a predicted win.
+# `N//(tile_n*cols)` times (iron/operators/gemm/design.py's `pattern_repeat`). The operator falls
+# back per site when A+B+C do not co-fit a 512 KiB MemTile, or when there is no N loop to hoist.
+# Opt-in, default OFF: it removes 3.92 GiB of 16.00 at M=64 and costs 0.00% in time, measured over
+# 10 alternated pairs (-0.38%, CI [-0.86, +0.11]). An energy lever, not a latency one -- the DDR
+# fetch it deletes sits upstream of L2, and the L2->L1 stream the cores actually consume is
+# byte-identical either way, so it buys nothing here and stays off until that changes.
 A_RESIDENT = os.environ.get("A_RESIDENT", "0") == "1"
 if PREFILL_SEGMENTS < 1:
     raise SystemExit(f"PREFILL_SEGMENTS={PREFILL_SEGMENTS} must be >= 1")
