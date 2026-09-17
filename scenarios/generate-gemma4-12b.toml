@@ -288,9 +288,28 @@ name = "gemma4-12b"
 #   - S=6912. This artifact does NOT serve `gemma4-12b-256k`, whose decode is a different S and a
 #     different arena. A 256k prefill is a separate build that does not exist.
 #   - Rollback: delete the `prefill =` line and reinstall. Decode is untouched either way.
+#
+# DEFAULT SINCE 2026-09-17 (evening): `decode_s6912_l48_are_wgm_pwm`, the served recipe plus three
+# graph flags that change no arithmetic -- 23 designs -> 17, 970 configures -> 874.
+#   build  GEN_EXTRA='--max-seq 6912' GQA_GROUPED_K=1 GQA_GROUPED_V=1 FUSE_QKV_DP=0 SPLIT_LM_HEAD=0 \
+#            SLIDING_KV_CIRCULAR=1 ATTN_RUNTIME_EXTENT=1 \
+#            MERGE_WEIGHT_GEMVS=1 POINTWISE_MODES=1 COLLAPSE_MERGED_CONFIGURES=1 \
+#            WEIGHTS=$PWD/artifacts/gemma4-12b/weights_int4g32sbf16_planar_qat_rg \
+#            bash scripts/build_llm_decode.sh gemma4-12b 48 $PWD/artifacts/gemma4-12b/decode_s6912_l48_are_wgm_pwm
+#          IRON integration-stack at or after 53b6123 (merge_devices, Pointwise, collapse_configures).
+#   WHAT IT DOES: the five K=3840 int4 weight GEMVs share one device (per-core tile count from an RTP,
+#   tso 32), Add/Mul/GELU become modes of one pointwise device per width, and back-to-back runs on a
+#   shared device share a configure. FF_POINTWISE_CHUNKS is NOT set: it costs +3 ms and buys nothing.
+#     logits    byte-identical to the previous default at L=6 (256 positions) and 48 layers (36).
+#     tokens    through `npu serve`, identical to the previous default: 96 greedy tokens x 8 runs, and a
+#               1216-token prompt + 200 tokens (crossing the 1024 sliding wrap), coherent.
+#     latency   decode step p50 335.7-336.2 ms against 340.9-341.2 (same prompt, alternated, warm,
+#               Power Mode Default); bench floor -4.90 ms at n_past 1 and -4.91 at 512.
+#     arena     7164551680 B, layout byte-identical to the previous default, so the seg4 prefill pairs.
+#   Rollback: point decode= back at decode_s6912_l48_are and reinstall.
 
 [artifacts]
-decode = "artifacts/gemma4-12b/decode_s6912_l48_are"
+decode = "artifacts/gemma4-12b/decode_s6912_l48_are_wgm_pwm"
 prefill = "artifacts/gemma4-12b/prefill_m64_s6912_l48_seg4"
 weights = "artifacts/gemma4-12b/weights_int4g32sbf16_planar_qat_rg"
 tokenizer_dir = "artifacts/gemma4-12b/tokenizer"
