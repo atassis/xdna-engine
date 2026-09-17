@@ -478,6 +478,9 @@ def softmax_segment(w):
 # times instead of once. FORCE_K_SPLIT exists to price exactly that on a shape that does not need
 # the split, by building it both ways.
 FORCE_K_SPLIT = int(os.environ.get("FORCE_K_SPLIT", "0"))
+# Run the FF-wide activation and gate*up multiply as this many equal slices. Elementwise, so the
+# arithmetic is unchanged; at FF/n == d_model the multiply shares the d_model-wide Mul design.
+FF_POINTWISE_CHUNKS = int(os.environ.get("FF_POINTWISE_CHUNKS", "1"))
 # Same axis for the attention output projection. Gemma-4's GLOBAL layers have head_dim 512, so
 # o_proj is K=8192 there and needs 2 chunks while its sliding layers at K=4096 need none -- a
 # PER-LAYER split, which this per-spec version does not yet express (it needs q_dim_for(layer),
@@ -610,7 +613,7 @@ def load_weight_buffer(buf, arr):
 
 
 def sequence_name(sp, NL, S, placer_flags, decode_layer_active=False, T=None, tmv_declined=(),
-                  tmv_chunked=(), attn_block_geoms=()):
+                  tmv_chunked=(), attn_block_geoms=(), ff_chunks=1):
     """Name the fused sequence after everything that changes its graph, not just the model.
 
     IRON keys the cached artifact by this name. Every knob below produces a DIFFERENT ELF, so
@@ -723,6 +726,8 @@ def sequence_name(sp, NL, S, placer_flags, decode_layer_active=False, T=None, tm
         parts.append(f"rp{MLP_D_CHUNKS}")
     if SOFTMAX_SEGMENT:
         parts.append(f"smseg{SOFTMAX_SEGMENT}")
+    if ff_chunks > 1:
+        parts.append(f"ffc{ff_chunks}")
     if ATTN_RUNTIME_EXTENT:
         parts.append("rtext")
     if FUSE_ACT:
@@ -2075,12 +2080,18 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
     print(f"[gen] fused arm decode_layer_dp: "
           f"{'OFF -- ' + decode_layer_why if decode_layer_why else 'on'}")
 
+    # Passed to sequence_name() as computed here, so the suffix and the graph share one predicate.
+    ff_chunks = FF_POINTWISE_CHUNKS if op_mlp_dp is None and op_decode_layer is None else 1
+    if ff_chunks > 1 and (FF % ff_chunks or (FF // ff_chunks) % COLS):
+        raise SystemExit(f"FF_POINTWISE_CHUNKS={ff_chunks}: FF={FF} must split into slices that "
+                         f"are whole multiples of COLS={COLS}")
+    ffw = FF // ff_chunks
     if not fuse_act:
         if sp.act == "silu":
-            op_act = SiLU(size=FF, num_aie_columns=COLS, tile_size=FF // COLS, context=ctx)
+            op_act = SiLU(size=ffw, num_aie_columns=COLS, tile_size=ffw // COLS, context=ctx)
         else:
-            op_act = GELU(size=FF, num_aie_columns=COLS, num_channels=1, tile_size=FF // COLS, context=ctx)
-    op_mul_ffn = ElementwiseMul(size=FF, tile_size=FF // COLS, num_aie_columns=COLS, context=ctx)
+            op_act = GELU(size=ffw, num_aie_columns=COLS, num_channels=1, tile_size=ffw // COLS, context=ctx)
+    op_mul_ffn = ElementwiseMul(size=ffw, tile_size=ffw // COLS, num_aie_columns=COLS, context=ctx)
     # Down projection, split over K when it does not fit L1 (or when FORCE_K_SPLIT prices it).
     # One GEMV per chunk at K=FF/n plus n-1 adds; the chunk GEMVs are the SAME op object, so the
     # split costs one design and n runs, not n designs.
@@ -2094,8 +2105,14 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
     # Gemma-4's trained per-layer scalar, applied to the block output after BOTH residual adds.
     # It cannot fold anywhere: it scales the residual stream itself, so the next layer's norm sees
     # it and every later layer compounds it. One D-wide multiply per layer is the honest form.
-    op_lscale = (ElementwiseMul(size=D, tile_size=D // COLS, num_aie_columns=COLS, context=ctx)
+    op_lscale = ((op_mul_ffn if ff_chunks > 1 and ffw == D else
+                  ElementwiseMul(size=D, tile_size=D // COLS, num_aie_columns=COLS, context=ctx))
                  if sp.layer_scalar else None)
+
+    def ff_slices(buf):
+        if ff_chunks == 1:
+            return [buf]
+        return [f"{buf}[{i * ffw * 2}:{(i + 1) * ffw * 2}]" for i in range(ff_chunks)]
 
     def split_over_k(op, w, xin, out, n, k_elems, tag):
         """A reduction over K as one GEMV, or as `n` partial GEMVs plus a summation tree.
@@ -2524,8 +2541,9 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                     (op_norm, p + "x1", p + "n_pf", p + "hf"),
                     (op_gate, p + "Wg", p + "hf", p + "g"),
                     (op_up, p + "Wu", p + "hf", p + "u"),
-                    *([] if op_act is None else [(op_act, p + "g", p + "g")]),
-                    (op_mul_ffn, p + "g", p + "u", p + "gh"),
+                    *([] if op_act is None else [(op_act, g_, g_) for g_ in ff_slices(p + "g")]),
+                    *[(op_mul_ffn, g_, u_, gh_) for g_, u_, gh_ in
+                      zip(ff_slices(p + "g"), ff_slices(p + "u"), ff_slices(p + "gh"))],
                     *down_runlist(p),
                 ]
             # `d` is the unfused chain's own output buffer and does not exist in the fused arm,
@@ -2668,7 +2686,8 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
             seg_bufsz[seg_out] = D * 2
         _sn = sequence_name(sp, NL, S, placer_flags, tmv_declined=_tmv_declined,
                             tmv_chunked=_tmv_chunked, attn_block_geoms=_attn_block_fused,
-                            decode_layer_active=op_decode_layer is not None, T=T)
+                            decode_layer_active=op_decode_layer is not None, T=T,
+                            ff_chunks=ff_chunks)
         name = _sn if len(cuts) == 1 else f"{_sn}_seg{si}of{len(cuts)}"
         # A rung is THIS runlist with the layer design substituted. Only for an unsplit
         # stack: a rung rewrites one runlist, and a segmented stack has one per segment
