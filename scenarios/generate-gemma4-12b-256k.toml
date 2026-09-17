@@ -27,6 +27,9 @@ name = "gemma4-12b-256k"
 #   decode_int4g32qat_s262144_l48_rg_mc_smseg1024 (no ARE)   1661.5 ms/token   itl p50, n=16
 #   decode_s262144_are_tso        (THIS DEFAULT, ARE on)     1101.0 ms/token   itl p50, n=24
 #   gemma4-12b at S=6912, for scale                           345.2 ms/token   itl p50, n=24
+# A later cold run of THIS artifact over 234 completion tokens (2026-09-17, n_past to 257) read
+# 1203.4 ms/token itl p50, p95 1547.2, device 99.9% -- one run, no alternated control, so an
+# observation and not a delta against the 1101.0 above.
 # -560.5 ms, -33.7%, and OUTPUT-IDENTICAL: all three arms emitted the same 16 greedy token ids
 # on the same prompt ([19765, 25971, 528, 3879, 659, 236787, 108, 236770, 236761, 138, 1018,
 # 23969, 3411, 1018, 107, 236778]). That is what ATTN_RUNTIME_EXTENT promises by construction --
@@ -43,26 +46,39 @@ name = "gemma4-12b-256k"
 # same law holds across a 38x span in S, so it can be used to price any rung: 421.8 ms at 32768,
 # 712.9 at 131072, 1101.0 at 262144.
 #
-# WHERE THE CAPACITY TERM LIVES, from the artifact's own layout. Each global layer's kc and vc are
-# `S x 512 x 2 B` flat blocks (L5_kc len 268435456 = 262144*1024, confirming head_dim 512, 1 kv
-# head), so the 8 global layers hold 16384 B per POSITION and 4.29 GB at S=262144. Dividing the
-# slope by that gives 5.53 GB/s under ARE and 3.21 GB/s without -- a byte rate, an order under this
-# box's 52.7 GB/s read ceiling and in line with the ~6 GB/s that per-command DDR paths measure
-# elsewhere in this tree. So the term is the KV STREAM, and ATTN_RUNTIME_EXTENT cannot remove it by
-# construction: it cuts core work, and its own comment says so -- "a shim BD length is a static
-# field on the binary TXN target, so the fill still streams the whole window and the surplus is
-# drained untouched." The 40 sliding layers are circular at 1024 and contribute nothing at any S.
+# WHERE THE CAPACITY TERM LIVES. CORRECTED 2026-09-17: this paragraph first divided the slope by
+# what the kc/vc buffers HOLD -- 8 global layers x `S x 512 x 2 B`, 16384 B per position -- and read
+# 5.53 GB/s, "an order under the read ceiling". What the graph STREAMS is 141070 B per position,
+# counted off the shim BDs of this arm and the S=6912 one (scripts/ddr_reread_census.py): the
+# global scores GEMV delivers each global layer's K cache 16 TIMES per token, 4 runs (16 query heads
+# split into groups of 4) x 4 deliveries per run (S*512 is past the GEMV coalesce gate's MAX_STRIDE,
+# so group_reuse is off). 92.9% of the S-dependent bytes are those K reads. Divided by the bytes
+# actually streamed, the slope runs at 47.6 GB/s, about 90% of this box's 52.7 GB/s read peak. So
+# the term IS the KV stream, it is transport-bound, and 15 of every 16 K reads carry nothing new.
+# ATTN_RUNTIME_EXTENT cannot remove it by construction: it cuts core work, and its own comment says
+# so -- "a shim BD length is a static field on the binary TXN target, so the fill still streams the
+# whole window and the surplus is drained untouched." The 40 sliding layers are circular at 1024
+# and contribute nothing at any S.
+#
+# The artifact NAME IS WRONG ABOUT THIS: `_tso` was meant to mark the GEMV fix that takes the K
+# read from 16x to 4x (IRON 4511576), and this ELF does not have it. It is md5-identical to a
+# build finished before that commit existed, and both MLIRs on disk still deliver K 16x. Rebuild
+# against an IRON carrying 4511576 before believing the suffix.
 #
 # The softmax and the elementwise scale are the OTHER two ops ARE does not reach (the chunked
 # softmax walks a build-time `segs_per_row = S // segment` = 256 segments per row three times), but
-# they are not where the money is: their intermediates total ~400 MB/token against the KV stream's
-# 4.29 GB. Attribution between them has NOT been separated by measurement; the discriminating
+# they are not where the money is: the global softmax moves 268 MB/token against 36.5 GB of kc/vc
+# reads. Attribution between them has NOT been separated by measurement; the discriminating
 # experiment is one build at SOFTMAX_SEGMENT=4096.
 #
-# So the lever for this model is to make the KV FILL LENGTH follow n_past, not S. `kv_block` is
-# already a generator concept and is set flat (kv_block == S, "one block"); blocking it and
-# dispatching only the blocks below n_past is the shape that removes the term. Until then, cost
-# tracks the CAPACITY and a token at n_past=20 costs exactly what one at n_past=200000 costs.
+# So the FIRST lever for this model is the re-read, and it is already written. PRICED, NOT MEASURED,
+# at 47.6-52.7 GB/s: 16 -> 4 K reads removes 25.8 GB/token, taking the step from 1101 to roughly
+# 560-610 ms; a GEMV that spends its batch group on width the way TMatVec does (4 -> 1) removes a
+# further 6.4 GB, roughly 425-490 ms. Only then does the KV FILL LENGTH following n_past become the
+# lever. `kv_block` is already a generator concept and is set flat (kv_block == S, "one block");
+# blocking it and dispatching only the blocks below n_past is the shape that removes the rest.
+# Until then, cost tracks the CAPACITY and a token at n_past=20 costs exactly what one at
+# n_past=200000 costs.
 #
 # ALSO NOT ADDRESSED HERE: there is no batched prefill on this path, so a long PROMPT is still
 # primed one token at a time -- at 1101 ms each. A 19-token prompt costs 21 s of ttft before the
