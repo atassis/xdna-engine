@@ -484,6 +484,10 @@ FF_POINTWISE_CHUNKS = int(os.environ.get("FF_POINTWISE_CHUNKS", "1"))
 # Quantized weight GEMVs that differ only in M take one tiling per family plus tiles_rtp, and IRON's
 # merge_devices folds each family into one device. Rows are independent, so the arithmetic is unchanged.
 MERGE_WEIGHT_GEMVS = os.environ.get("MERGE_WEIGHT_GEMVS", "0") == "1"
+# Same-width Add, Mul and GELU become modes of IRON's Pointwise, merged onto one device.
+POINTWISE_MODES = os.environ.get("POINTWISE_MODES", "0") == "1"
+# Back-to-back runs on a merged device share one configure (IRON collapse_configures).
+COLLAPSE_MERGED_CONFIGURES = os.environ.get("COLLAPSE_MERGED_CONFIGURES", "0") == "1"
 # Same axis for the attention output projection. Gemma-4's GLOBAL layers have head_dim 512, so
 # o_proj is K=8192 there and needs 2 chunks while its sliding layers at K=4096 need none -- a
 # PER-LAYER split, which this per-spec version does not yet express (it needs q_dim_for(layer),
@@ -616,7 +620,8 @@ def load_weight_buffer(buf, arr):
 
 
 def sequence_name(sp, NL, S, placer_flags, decode_layer_active=False, T=None, tmv_declined=(),
-                  tmv_chunked=(), attn_block_geoms=(), ff_chunks=1, weight_families=0):
+                  tmv_chunked=(), attn_block_geoms=(), ff_chunks=1, weight_families=0,
+                  pointwise_widths=0):
     """Name the fused sequence after everything that changes its graph, not just the model.
 
     IRON keys the cached artifact by this name. Every knob below produces a DIFFERENT ELF, so
@@ -733,6 +738,8 @@ def sequence_name(sp, NL, S, placer_flags, decode_layer_active=False, T=None, tm
         parts.append(f"ffc{ff_chunks}")
     if weight_families:
         parts.append("wgm")
+    if pointwise_widths:
+        parts.append("pwm")
     if ATTN_RUNTIME_EXTENT:
         parts.append("rtext")
     if FUSE_ACT:
@@ -1199,6 +1206,36 @@ def unify_weight_gemvs(rl):
                                               tiles_rtp=True)
         report.append((K, tsi, tso, Ms))
     return [(new.get(id(op), op), *bufs) for op, *bufs in rl], report
+
+
+def pointwise_modes(rl):
+    """Replace Add, Mul and GELU that share (size, tile, columns) with Pointwise modes.
+
+    Only widths carrying at least two of the three ops change, since one mode alone merges with
+    nothing. GELU's (in, out) entries gain the input again as the ignored second operand. Returns
+    the rewritten runlist and (size, tile_size, modes) per rewritten width.
+    """
+    from iron.operators.pointwise.op import Pointwise
+    mode_of = {ElementwiseAdd: "add", ElementwiseMul: "mul", GELU: "gelu"}
+    widths = {}
+    for op in {id(e[0]): e[0] for e in rl}.values():
+        if type(op) in mode_of and getattr(op, "num_channels", 1) == 1:
+            widths.setdefault((op.size, op.tile_size, op.num_aie_columns), []).append(op)
+    new, report = {}, []
+    for (size, tile, cols), ops in widths.items():
+        modes = sorted({mode_of[type(op)] for op in ops})
+        if len(modes) < 2:
+            continue
+        for op in ops:
+            new[id(op)] = Pointwise(size=size, tile_size=tile, mode=mode_of[type(op)],
+                                    num_aie_columns=cols, context=op.context)
+        report.append((size, tile, modes))
+    out = []
+    for op, *bufs in rl:
+        if id(op) in new and isinstance(op, GELU):
+            bufs = [bufs[0], *bufs]
+        out.append((new.get(id(op), op), *bufs))
+    return out, report
 
 
 def _swiglu_default_tile_rows_gu():
@@ -2694,6 +2731,12 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         rl, weight_families = unify_weight_gemvs(rl)
         for K_, tsi_, tso_, Ms_ in weight_families:
             print(f"[gen] weight GEMV family K={K_}: tsi {tsi_} tso {tso_} tiles_rtp over M={Ms_}")
+    pointwise_widths = []
+    if POINTWISE_MODES:
+        rl, pointwise_widths = pointwise_modes(rl)
+        for size_, tile_, modes_ in pointwise_widths:
+            print(f"[gen] pointwise width {size_} (tile {tile_}): modes {modes_}")
+    merge = bool(weight_families or pointwise_widths)
 
     if DECODE_SEGMENTS > NL:
         raise SystemExit(f"DECODE_SEGMENTS={DECODE_SEGMENTS} exceeds the {NL} layers there are to "
@@ -2740,7 +2783,8 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         _sn = sequence_name(sp, NL, S, placer_flags, tmv_declined=_tmv_declined,
                             tmv_chunked=_tmv_chunked, attn_block_geoms=_attn_block_fused,
                             decode_layer_active=op_decode_layer is not None, T=T,
-                            ff_chunks=ff_chunks, weight_families=len(weight_families))
+                            ff_chunks=ff_chunks, weight_families=len(weight_families),
+                            pointwise_widths=len(pointwise_widths))
         name = _sn if len(cuts) == 1 else f"{_sn}_seg{si}of{len(cuts)}"
         # A rung is THIS runlist with the layer design substituted. Only for an unsplit
         # stack: a rung rewrites one runlist, and a segmented stack has one per segment
@@ -2755,7 +2799,9 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                                input_args=seg_inputs, output_args=[seg_out],
                                buffer_sizes=seg_bufsz, context=ctx, extra_flags=placer_flags,
                                share_designs=share,
-                               **({"merge_devices": True} if weight_families else {}),
+                               **({"merge_devices": True} if merge else {}),
+                               **({"collapse_configures": True}
+                                  if merge and COLLAPSE_MERGED_CONFIGURES else {}),
                                **({"extra_runlists": _extra} if _extra else {}),
                                **({"scratch_order": list(weights.keys())}
                                   if BUCKET_SCRATCH_ORDER else {}))
