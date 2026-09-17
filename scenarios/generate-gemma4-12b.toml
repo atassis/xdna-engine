@@ -307,9 +307,29 @@ name = "gemma4-12b"
 #               Power Mode Default); bench floor -4.90 ms at n_past 1 and -4.91 at 512.
 #     arena     7164551680 B, layout byte-identical to the previous default, so the seg4 prefill pairs.
 #   Rollback: point decode= back at decode_s6912_l48_are and reinstall.
+#
+# DEFAULT SINCE 2026-09-17 (night): `decode_s6912_l48_are_wgm_pwm_rr`, one-line fix to the global
+#   scores GEMV's coalesce gate (gemv-tile-output-rereads-the-kv-cache-4x): A_bstride's MAX_STRIDE
+#   check was applied to a dead tap step at hkv=1, silently declining group_reuse and reading the
+#   8 global layers' K cache 16x/token instead of 4x. IRON integration-stack 7753fa6 (re-applies
+#   4511576, reverted at dccf478 for lacking a device gate, onto tiles_rtp + its barrier re-arm).
+#   op19_GEMV 908.79 -> 229.31 MB/dispatch (-679.48 MB); every other op byte-identical per both
+#   decode_ddr_bytes.py and ddr_reread_census.py (their read+write totals agree with each other on
+#   both arms). Priced -12.9 to -14.3 ms/token.
+#     logits    L=6 (256 positions, served flags): fix vs control bit-for-bit IDENTICAL, both 8/8
+#               vs the oracle. 48 layers (36 positions): control run twice IDENTICAL, fix vs control
+#               IDENTICAL, TMV_CTX=0 vs control DIFFERENT from position 9 -- the gate can fail.
+#     latency   bench floor -12.44 ms at n_past 1 (333.82 -> 321.38), -11.30 ms at 512 (335.91 ->
+#               324.61), ABBAAB alternated x3, determinism 2/2 every round both arms. Through
+#               `npu serve`: median step 336.35 -> 323.84 ms, -12.51 ms, n=376 steps/arm.
+#     tokens    identical to the previous default: 96 greedy tokens x 8 runs (chat prompt), and a
+#               1216-token prompt + 200 tokens (crosses the 1024 sliding wrap), coherent, r1==r2.
+#     arena     scratch_size and buffer layout byte-identical to the previous default (prefill pairs).
+#   Residual 4x (scores_group_fix/MAX_GROUP_REUSE=4) is a separate task, needs a brick change.
+#   Rollback: point decode= back at decode_s6912_l48_are_wgm_pwm and reinstall.
 
 [artifacts]
-decode = "artifacts/gemma4-12b/decode_s6912_l48_are_wgm_pwm"
+decode = "artifacts/gemma4-12b/decode_s6912_l48_are_wgm_pwm_rr"
 prefill = "artifacts/gemma4-12b/prefill_m64_s6912_l48_seg4"
 weights = "artifacts/gemma4-12b/weights_int4g32sbf16_planar_qat_rg"
 tokenizer_dir = "artifacts/gemma4-12b/tokenizer"
