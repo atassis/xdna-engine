@@ -57,6 +57,23 @@ pub struct MaskWidths {
     pub rows: usize,
 }
 
+/// The ring mask past a sliding window's wrap (design sec 1.3/2.1): one `(hole_lo, hole_hi,
+/// width)` int32 triple per softmax row, over the concat `[ring capacity | this chunk's own M
+/// rows]`, in the widths fifo's own buffer -- see [`crate::llm::npu_prefill::ring_mask_block`],
+/// which computes it. An ordinary input buffer like [`MaskWidths`], not a scratchpad parameter.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MaskRing {
+    /// The declared input buffer holding the triples.
+    pub buffer: String,
+    /// `dims.q_heads`. The triples repeat once per head (the mask is head-independent).
+    pub heads: usize,
+    /// `heads * M` rows; the buffer is `rows * 3` int32 values, twelve times this in bytes.
+    pub rows: usize,
+    /// `(head_dim, capacity)` per geometry this artifact declares a ring for -- what
+    /// `npu_prefill::batchable_window` may skip flooring at, and only while `capacity % M == 0`.
+    pub geoms: Vec<(usize, usize)>,
+}
+
 /// How the host scales `embed[token]` before writing it to the device -- `host_protocol.embed_scale`
 /// in `meta.json`, a real per-model choice (Whisper embeds unscaled; some LLM families multiply by
 /// `sqrt(d_model)`) and therefore a branch on *what*, not *how*: an unrecognised value fails loud
@@ -197,6 +214,11 @@ pub struct LlmArtifact {
     /// The per-row causal widths, when `meta.json` says `causal: true`. Prefill only -- decode is
     /// M=1, where one scalar width says everything there is to say. See [`MaskWidths`].
     pub mask_widths: Option<MaskWidths>,
+    /// The ring mask (design sec 1.3/2.1), when a sliding (w < S) geometry goes read-first over
+    /// the wrap instead of falling back to stepwise past its window. `None` on every artifact
+    /// built before this existed, or one with no geometry narrow enough to need it. See
+    /// [`MaskRing`].
+    pub mask_ring: Option<MaskRing>,
     /// The declared input buffers holding RoPE angle tables, and which base each wants. Derived
     /// from `inputs` rather than a literal `["rope_global", "rope_local"]`, which is what lets a
     /// single-table prefill artifact name its buffer `rope` without a second code path.
@@ -940,6 +962,69 @@ impl LlmArtifact {
             _ => None,
         };
 
+        // `mask_ring`, like `mask_widths` above: an ordinary input buffer, prefill only, present
+        // only on a build that ran a sliding geometry read-first over the wrap
+        // (PREFILL_SLIDING_RING=1). `None` here is the flag-off/pre-ring default.
+        let mask_ring = match (role, meta.get("mask_ring")) {
+            (ArtifactRole::Prefill, Some(mr)) if !mr.is_null() => {
+                let buffer = mr
+                    .get("buffer")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| ctx("mask_ring.buffer missing/non-string".to_string()))?
+                    .to_string();
+                match mr.get("dtype").and_then(|v| v.as_str()) {
+                    Some("int32") => {}
+                    other => {
+                        return Err(ctx(format!(
+                            "mask_ring.dtype = {other:?}, want \"int32\""
+                        )))
+                    }
+                }
+                let q_heads = dims
+                    .get("q_heads")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize)
+                    .ok_or_else(|| ctx("dims.q_heads missing/non-numeric, and mask_ring is one \
+                                        triple per (head, token) row".to_string()))?;
+                if !inputs.iter().any(|n| n == &buffer) {
+                    return Err(ctx(format!(
+                        "mask_ring.buffer `{buffer}` is not a declared input, so nothing would \
+                         place it in the input arena"
+                    )));
+                }
+                let loc = layout
+                    .get(&buffer)
+                    .ok_or_else(|| ctx(format!("mask_ring.buffer `{buffer}` has no `layout` entry")))?;
+                let want = q_heads * batch * 3 * 4;
+                if loc.len != want {
+                    return Err(ctx(format!(
+                        "layout[{buffer}].len = {} but dims.q_heads({q_heads}) * dims.M({batch}) \
+                         * 3 * 4 = {want}",
+                        loc.len
+                    )));
+                }
+                let geoms_arr = mr.get("geoms").and_then(|v| v.as_array()).ok_or_else(|| {
+                    ctx("mask_ring.geoms missing/non-array".to_string())
+                })?;
+                let mut geoms = Vec::with_capacity(geoms_arr.len());
+                for e in geoms_arr {
+                    let hd = e.get("head_dim").and_then(|v| v.as_u64()).ok_or_else(|| {
+                        ctx("mask_ring.geoms entry missing numeric `head_dim`".to_string())
+                    })? as usize;
+                    let cap = e.get("capacity").and_then(|v| v.as_u64()).ok_or_else(|| {
+                        ctx("mask_ring.geoms entry missing numeric `capacity`".to_string())
+                    })? as usize;
+                    geoms.push((hd, cap));
+                }
+                if geoms.is_empty() {
+                    return Err(ctx("mask_ring declared with an empty `geoms` list -- a ring \
+                                    mask with no geometry to apply it to".to_string()));
+                }
+                Some(MaskRing { buffer, heads: q_heads, rows: q_heads * batch, geoms })
+            }
+            _ => None,
+        };
+
         // Toolchain freshness: fail loud on an ACTIVE mismatch (the pin moved, nobody rebuilt this
         // artifact -- a stale ELF answers with a plausible WRONG token, silently). Anything short of a
         // confirmed mismatch is reported, never fatal -- a shipped consumer must not require
@@ -985,6 +1070,7 @@ impl LlmArtifact {
             window_granule,
             window_rungs,
             mask_widths,
+            mask_ring,
             rope_inputs,
             head_dim,
             d_model,
