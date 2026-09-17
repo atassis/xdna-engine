@@ -181,6 +181,9 @@ name = "gemma4-12b"
 #               (mean 344.40). -14.27 ms, -3.98%%, NO OVERLAP between the two sets.
 #     parity    verify_llm_decode.py L=6 against tests/refs/gemma4-12b/qat_int4g32_oracle_l6.json:
 #               greedy token parity 8/8, margins 17/146/12/2/244/6/5/9 -- PARITY PASS.
+#     logits    2026-09-17, L=6: byte-identical to ATTN_RUNTIME_EXTENT=0 over 12 positions
+#               (verify_llm_decode.py --dump-logits, scripts/compare_logits_dumps.py). The same gate
+#               tells a reduction-order change apart, so this is bit-exactness, not parity.
 #     arena     7164551680 B, BYTE-IDENTICAL to the previous default. Pure compute change: no new
 #               designs, no extra hardware context, no host or Rust change. ELF 30747584.
 #   WHAT IT DOES: GEMV's M-extent and TMatVec's K-extent follow each geometry's OWN sm_mask
