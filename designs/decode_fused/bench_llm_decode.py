@@ -71,7 +71,8 @@ def mean_sd_ci(xs):
     m = statistics.fmean(xs)
     sd = statistics.stdev(xs) if n > 1 else 0.0
     half = 1.96 * sd / (n ** 0.5) if n > 1 else 0.0
-    return {"n": n, "mean": m, "sd": sd, "ci95": [m - half, m + half]}
+    return {"n": n, "mean": m, "sd": sd, "ci95": [m - half, m + half],
+            "median": statistics.median(xs), "min": min(xs), "samples": list(xs)}
 
 
 def linear_fit(xs, ys):
@@ -268,7 +269,8 @@ def main():
         stats_phase = {k: mean_sd_ci([v * 1000 for v in vals]) for k, vals in per_phase.items()}
         sweep[pos] = {"total_ms": stats_total, "phases_ms": stats_phase}
         print(f"[bench] pos={pos:5d}  total {stats_total['mean']:7.3f} ms "
-              f"(sd {stats_total['sd']:.3f}, n={stats_total['n']})  "
+              f"(sd {stats_total['sd']:.3f}, median {stats_total['median']:.3f}, "
+              f"min {stats_total['min']:.3f}, n={stats_total['n']})  "
               f"dispatch_only {stats_phase['dispatch_only']['mean']:7.3f} ms  "
               f"sync_out {stats_phase['sync_out']['mean']:7.3f} ms", flush=True)
 
@@ -339,7 +341,7 @@ def main():
         det_sequences.append(produced)
         print(f"[bench] determinism run {run_idx}: {produced}", flush=True)
 
-    ref_seq = det_sequences[0]
+    ref_seq = det_sequences[0] if det_sequences else []
     match_count = sum(1 for s in det_sequences if s == ref_seq)
     mismatches = []
     for i, seq in enumerate(det_sequences[1:], start=1):
