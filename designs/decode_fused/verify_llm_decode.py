@@ -137,7 +137,9 @@ def main():
     ap.add_argument("--layers", type=int, default=None)
     ap.add_argument("--max-seq", type=int, default=2048)
     ap.add_argument("--steps", type=int, default=None, help="free-running tokens to compare")
-    ap.add_argument("--dump-logits", default=None, help="write step-0 logits to this .npy for offline compare")
+    ap.add_argument("--dump-logits", default=None,
+                    help="write every position's raw logits (before the host softcap) and the token "
+                         "fed there to this .npz; compare two runs with scripts/compare_logits_dumps.py")
     ap.add_argument("--host-lm-head", action="store_true",
                     help="compute the logits on the HOST from the device's own `xf`, instead of "
                          "reading the on-device lm-head output. `xf` is verified correct at every "
@@ -402,6 +404,7 @@ def main():
     # This is what classifies a mismatch. The oracle's stored `margins` describe a DIFFERENT
     # implementation's forward pass; the device's own gap describes this one.
     step_logits = []
+    dumped_lg, dumped_tok = [], []
     tok = fed[0]
     for pos in range(len(fed) + steps - 1):
         with xin.overwrite() as _buf:
@@ -533,11 +536,11 @@ def main():
         # needs it off (its logits are ~1168 against a cap of 30, so 28.9% of the vocab ties at the
         # cap and the argmax is index order); a full-depth one needs it on. Two independent flags
         # would present a disagreement as a token mismatch instead of a configuration error.
+        if a.dump_logits:
+            dumped_lg.append(np.array(lg, np.float32, copy=True))
+            dumped_tok.append(int(tok))
         if sp.logit_softcap is not None and not ref.get("logit_softcap_disabled"):
             lg = np.tanh(lg / sp.logit_softcap) * sp.logit_softcap
-        if a.dump_logits and pos == 0:
-            np.save(a.dump_logits, lg)
-            print(f"[verify] step-0 logits dumped to {a.dump_logits}")
         nxt = int(np.argmax(lg))
         if pos + 1 < len(fed):
             tok = fed[pos + 1]              # teacher-force through the prompt
@@ -558,6 +561,12 @@ def main():
             tok = gen_ids[i] if (a.teacher_force and i < len(gen_ids)) else nxt
         if len(produced) >= steps:
             break
+
+    if a.dump_logits:
+        head = "host" if a.host_lm_head else ("split" if head_c is not None else "graph")
+        np.savez(a.dump_logits, logits=np.stack(dumped_lg), tokens_fed=np.asarray(dumped_tok),
+                 spec=sp.name, layers=NL, max_seq=S, head=head)
+        print(f"[verify] raw logits for {len(dumped_lg)} positions dumped to {a.dump_logits}")
 
     if a.smoke_prompt:
         txt = _tok.decode(produced, skip_special_tokens=False)
