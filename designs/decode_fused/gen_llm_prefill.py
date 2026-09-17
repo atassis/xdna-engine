@@ -128,6 +128,7 @@ from iron.operators.gemm.op import GEMM  # noqa: E402
 from iron.operators.rms_norm.op import RMSNorm  # noqa: E402
 from iron.operators.rope.op import RoPE  # noqa: E402
 from iron.operators.softmax.op import Softmax  # noqa: E402
+from iron.operators.softmax.design import SM_VEC_LEN  # noqa: E402
 from iron.operators.silu.op import SiLU  # noqa: E402
 from iron.operators.gelu.op import GELU  # noqa: E402
 from iron.operators.elementwise_mul.op import ElementwiseMul  # noqa: E402
@@ -176,6 +177,14 @@ COLS = int(os.environ.get("PREFILL_COLS", "8"))
 XFER_ELEMS = int(os.environ.get("PREFILL_XFER_ELEMS", "16384"))
 # The causal mask, as a buffer name. One int32 per softmax row, host-written per chunk.
 SM_WIDTHS = "sm_widths"
+# Batch prefill past a sliding-window's circular KV ring. Default 0: byte-identical MLIR to
+# before this existed. A sliding (w < S) geometry then goes read-first over [ring W | chunk M]
+# instead of append-then-read, which is the only order safe past the wrap for M > 1: today's
+# append-then-read destroys ring data before later rows in the same chunk can read it.
+SLIDING_RING = os.environ.get("PREFILL_SLIDING_RING", "0") == "1"
+# The ring mask, one (hole_lo, hole_hi, width) int32 triple per softmax row -- SM_WIDTHS's sibling
+# for the rows_hole softmax mode.
+SM_RING = "sm_ring"
 
 
 def bf16(a):
@@ -204,6 +213,21 @@ def rope_table(base, rows, head_dim, theta, partial=None):
     t[:, 0::2] = np.cos(ang)
     t[:, 1::2] = np.sin(ang)
     return bf16(t)
+
+
+def ring_mask_rows(base, m, w):
+    """`[m, 3]` int32 (hole_lo, hole_hi, width) triples for a ring chunk at `base`, capacity `w`.
+
+    Row i of a chunk at `base` attends the ring's tail `[hole_lo, hole_hi)` EXCLUDED plus its own
+    batch column `[0, width)`. `b0 = base % w`: `hole_lo = b0`; `hole_hi = w` while `base < w`,
+    else `b0 + i + 1`; `width = w + i + 1`. Independently derived (never copied) against Rust's
+    `ring_mask_block` (`rust/npu-engine/src/llm/npu_prefill.rs`) -- pin the two against each other.
+    """
+    b0 = base % w
+    i = np.arange(m, dtype=np.int64)
+    hole_lo = np.full(m, b0)
+    hole_hi = np.full(m, w) if base < w else b0 + i + 1
+    return np.stack([hole_lo, hole_hi, w + i + 1], 1).astype(np.int32)
 
 
 def causal_widths(base, M, S, heads):
@@ -754,12 +778,63 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
                 output_sizes=(M, Hq, hd), output_strides=(Hq * hd, hd, 1), output_offset=0,
                 input_buffer_size=M * qd, output_buffer_size=M * qd,
                 transfer_size=pick_transfer(M * qd), num_aie_channels=1, context=ctx)
+        # ---- ring variant (sec 2.1): sliding (w < S) geometries only, opt-in, default off. ----
+        # Read-first over the concat [ring w | this chunk's own M rows] instead of append-then-
+        # read: `sc_ring`/`cx_ring` are today's `op_sc`/`op_cx` widened to a row of w+M columns
+        # (c_row_stride/a_row_stride skip the extra M), `sc_batch`/`cx_batch` are the SAME shapes
+        # against the chunk's OWN fresh k/v (b_block_rows=1, b_block_stride=hkv*hd -- the token-
+        # major stride `blocking["k"]` already uses elsewhere in this function), and `op_add_cx`
+        # sums the two context partials. `op_kvapp` is reused unchanged, only moved later in the
+        # runlist (sec 2.1 row 7).
+        ring = SLIDING_RING and w < S
+        op_sc_ring = op_sc_batch = op_sm_ring = op_cx_ring = op_cx_batch = op_add_cx = None
+        if ring:
+            # K007, named at the point w and M are picked: the two divisibility preconditions the
+            # ring algebra and the softmax kernel each need, and the arms the ring runlist is
+            # written for.
+            if not seam or attn_order != "off" or causal != "rows":
+                raise ValueError(
+                    "PREFILL_SLIDING_RING needs PREFILL_HEAD_SEAM=1, PREFILL_ATTN_ORDER=off and "
+                    "--causal rows -- the ring runlist is written for the default arms only")
+            if w % M:
+                raise ValueError(f"PREFILL_SLIDING_RING: window w={w} @hd={hd} is not a multiple "
+                                 f"of M={M} (W % M == 0); a chunk's hole/commit would wrap the "
+                                 f"ring end")
+            row_w = w + M
+            if row_w % SM_VEC_LEN:
+                raise ValueError(f"PREFILL_SLIDING_RING: w+M={row_w} @hd={hd} is not a multiple "
+                                 f"of {SM_VEC_LEN} (softmax SM_VEC_LEN); the kernel would drop a "
+                                 f"tail")
+            # b_block_rows=1: B's physical rows are single hd-wide TOKENS of the fresh (token-
+            # major, [M, hkv*hd]) k/v buffer, block_stride=hkv*hd apart -- not `blocking["k"]`
+            # above, which blocks a head-major WEIGHT's output rows and does not apply here.
+            op_sc_ring = gemm_for(f"sc_ring{sfx}", hd, w, blocking=kv_blk,
+                                  extra=dict(a_row_stride=qd, c_row_stride=row_w))
+            op_sc_batch = gemm_for(f"sc_batch{sfx}", hd, M, blocking=(1, hkv * hd),
+                                   extra=dict(a_row_stride=qd, c_row_stride=row_w))
+            op_cx_ring = gemm_for(f"cx_ring{sfx}", w, hd, b_col_maj=False, blocking=kv_blk,
+                                  extra=dict(a_row_stride=row_w, c_row_stride=qd))
+            op_cx_batch = gemm_for(f"cx_batch{sfx}", M, hd, b_col_maj=False,
+                                   blocking=(1, hkv * hd),
+                                   extra=dict(a_row_stride=row_w, c_row_stride=qd))
+            # One design per geometry, not per window (unlike `_win_cache` above): every shipped
+            # spec has exactly one sliding geometry, so this is the shared-design case already;
+            # a second sliding geometry at the same window would cost an extra configure here,
+            # same tradeoff `_win_cache` exists to avoid -- not built because nothing needs it yet.
+            op_sm_ring = Softmax(rows=Hq * M, cols=row_w, num_aie_columns=cols, num_channels=1,
+                                 context=ctx, allocation_scheme=alloc_all,
+                                 vector_size_source="rows_hole")
+            op_add_cx = ElementwiseAdd(size=M * qd, num_aie_columns=cols, tile_size=qd // cols,
+                                       context=ctx, allocation_scheme=alloc_all)
         g = SimpleNamespace(hd=hd, hkv=hkv, has_v=has_v, qd=qd, kvd=kvd, grp=g_grp, sfx=sfx, w=w,
                             qkv_rows=qkv_rows, blocking=blocking, kvl=kvl_g,
                             op_qn=op_qn, op_kn=op_kn, op_vn=op_vn, op_rq=op_rq, op_rk=op_rk,
                             op_gq=op_gq, op_gkv=op_gkv, op_o=op_o, op_sc=op_sc, op_cx=op_cx,
                             op_sm=op_sm_w, op_sm_head=op_sm_head_w,
-                            op_kvapp=op_kvapp, op_q2h=op_q2h, op_h2t=op_h2t)
+                            op_kvapp=op_kvapp, op_q2h=op_q2h, op_h2t=op_h2t,
+                            ring=ring, op_sc_ring=op_sc_ring, op_sc_batch=op_sc_batch,
+                            op_sm_ring=op_sm_ring, op_cx_ring=op_cx_ring, op_cx_batch=op_cx_batch,
+                            op_add_cx=op_add_cx)
         _attn_cache[key] = g
         return g
 
@@ -824,8 +899,13 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
         bufsz[f"k{gsfx}"] = M * kvd * 2
         bufsz[f"v{gsfx}"] = M * kvd * 2
         bufsz[f"cxt{gsfx}"] = M * qd * 2
-        bufsz[f"sc{gsfx}"] = Hq * M * g.w * 2
-        bufsz[f"sw{gsfx}"] = Hq * M * g.w * 2
+        # A ring geometry's row grows by M (the concat [ring w | this chunk's own M]); sc_batch/
+        # cx_batch write the extra columns in place, so it is one wider buffer, not two.
+        row_w = g.w + M if g.ring else g.w
+        bufsz[f"sc{gsfx}"] = Hq * M * row_w * 2
+        bufsz[f"sw{gsfx}"] = Hq * M * row_w * 2
+        if g.ring:
+            bufsz[f"cxt2{gsfx}"] = M * qd * 2
         if not seam:
             bufsz[f"qh{gsfx}"] = M * qd * 2
             bufsz[f"cx{gsfx}"] = M * qd * 2
@@ -1095,7 +1175,7 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
     def ang_buf(l):
         return ("rope_global" if sp.is_global(l) else "rope_local") if dual_rope else "rope"
 
-    rl, cache_names, layer_starts = [], [], []
+    rl, cache_names, layer_starts, ring_layers = [], [], [], []
     for l in range(NL):
         layer_starts.append(len(rl))
         p = f"L{l}_"
@@ -1128,51 +1208,95 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
             (g.op_kn, kb, w_nkn, kb),
             (g.op_rq, qb, ang_buf(l), qb),
             (g.op_rk, kb, ang_buf(l), kb),
+        ]
+        if not g.ring:
             # K after qk-norm AND after RoPE; V raw, projection only. Different points in the
-            # pipeline, and the M=1 path a decode step resumes from depends on both.
-            (g.op_kvapp, kb, p + "kc"),
-            (g.op_kvapp, vb, p + "vc"),
-        ] + ([] if seam else [(g.op_q2h, qb, qhb)])
+            # pipeline, and the M=1 path a decode step resumes from depends on both. Moved past
+            # the context read on a ring layer -- see the `g.ring` branch below.
+            rl += [(g.op_kvapp, kb, p + "kc"), (g.op_kvapp, vb, p + "vc")]
+        rl += [] if seam else [(g.op_q2h, qb, qhb)]
         # The widths buffer is an INPUT of the softmax step, not a side channel: op.get_arg_spec()
         # puts it between in and out, so it is the middle name here.
         scb, swb = f"sc{g.sfx}", f"sw{g.sfx}"
 
-        def qslice(h):
-            """Head h's queries: a strided slice of token-major `q`, or the head-major copy."""
-            if not seam:
-                return f"{qhb}[{h * M * hd * 2}:{(h + 1) * M * hd * 2}]"
-            return f"{qb}[{h * hd * 2}:{(h * hd + g.op_sc.a_elems) * 2}]"
+        if g.ring:
+            # Read-first ring runlist (sec 2.1): concat [ring g.w | this chunk's own M rows], one
+            # (hole_lo, hole_hi, width) mask per row, commit to the ring AFTER the context is read
+            # (K007 already refused this geometry unless seam=True). Grouped by row type (all Hq
+            # sc_ring, then all Hq sc_batch, ...) so each type is one configure (D009).
+            row_w = g.w + M
 
-        def score(h):
-            return (g.op_sc, qslice(h), kv_slab(p + "kc", h // grp, g),
-                    f"{scb}[{h * M * g.w * 2}:{(h + 1) * M * g.w * 2}]")
+            def qslice_ring(h):
+                return f"{qb}[{h * hd * 2}:{(h * hd + g.op_sc_ring.a_elems) * 2}]"
 
-        def soft(h):
-            sl = f"{scb}[{h * M * g.w * 2}:{(h + 1) * M * g.w * 2}]"
-            out = f"{swb}[{h * M * g.w * 2}:{(h + 1) * M * g.w * 2}]"
-            wid = f"{SM_WIDTHS}[{h * M * 4}:{(h + 1) * M * 4}]"
-            return (g.op_sm_head, sl, wid, out) if causal == "rows" else (g.op_sm_head, sl, out)
-
-        if attn_order == "interleaved":
-            # Only the first `n_il` heads alternate; the rest stay grouped. The knob exists because
-            # a configure costs ~80 KB of instruction stream, so interleaving all 16 heads built a
-            # 157 MB ELF that the driver refuses to allocate a BO for (CREATE_BO EAGAIN,
-            # reproducible). +2 configures per interleaved head per layer.
-            for h in range(n_il):
-                rl += [score(h), soft(h)]
-            rl += [score(h) for h in range(n_il, Hq)]
-            rl += [soft(h) for h in range(n_il, Hq)]
-        elif attn_order == "grouped":
-            rl += [score(h) for h in range(Hq)] + [soft(h) for h in range(Hq)]
+            for h in range(Hq):
+                rl.append((g.op_sc_ring, qslice_ring(h), kv_slab(p + "kc", h // grp, g),
+                           f"{scb}[{h * M * row_w * 2}:"
+                           f"{h * M * row_w * 2 + g.op_sc_ring.c_elems * 2}]"))
+            for h in range(Hq):
+                kg = h // grp
+                rl.append((g.op_sc_batch, qslice_ring(h),
+                           f"{kb}[{kg * hd * 2}:{kg * hd * 2 + g.op_sc_batch.b_elems * 2}]",
+                           f"{scb}[{h * M * row_w * 2 + g.w * 2}:"
+                           f"{h * M * row_w * 2 + g.w * 2 + g.op_sc_batch.c_elems * 2}]"))
+            rl.append((g.op_sm_ring, scb, SM_RING, swb))
+            for h in range(Hq):
+                cx_out = f"{cxtb}[{h * hd * 2}:{(h * hd + g.op_cx_ring.c_elems) * 2}]"
+                rl.append((g.op_cx_ring,
+                           f"{swb}[{h * M * row_w * 2}:"
+                           f"{h * M * row_w * 2 + g.op_cx_ring.a_elems * 2}]",
+                           kv_slab(p + "vc", h // grp, g), cx_out))
+            cxt2b = f"cxt2{g.sfx}"
+            for h in range(Hq):
+                kg = h // grp
+                cx2_out = f"{cxt2b}[{h * hd * 2}:{(h * hd + g.op_cx_batch.c_elems) * 2}]"
+                rl.append((g.op_cx_batch,
+                           f"{swb}[{h * M * row_w * 2 + g.w * 2}:"
+                           f"{h * M * row_w * 2 + g.w * 2 + g.op_cx_batch.a_elems * 2}]",
+                           f"{vb}[{kg * hd * 2}:{kg * hd * 2 + g.op_cx_batch.b_elems * 2}]",
+                           cx2_out))
+            rl.append((g.op_add_cx, cxtb, cxt2b, cxtb))
+            # KV commit LAST: past the wrap, appending before the context read above would
+            # overwrite ring slots this chunk's own later rows still need (sec 1.2/1.4).
+            # `check_kv_append_order` below is the build-time assert that catches this reordered.
+            rl += [(g.op_kvapp, kb, p + "kc"), (g.op_kvapp, vb, p + "vc")]
         else:
-            rl += [score(h) for h in range(Hq)]
-            rl.append((g.op_sm, scb, SM_WIDTHS, swb) if causal == "rows"
-                      else (g.op_sm, scb, swb))
-        for h in range(Hq):
-            cx_out = (f"{cxtb}[{h * hd * 2}:{(h * hd + g.op_cx.c_elems) * 2}]" if seam
-                      else f"{cxb}[{h * M * hd * 2}:{(h + 1) * M * hd * 2}]")
-            rl.append((g.op_cx, f"{swb}[{h * M * g.w * 2}:{(h + 1) * M * g.w * 2}]",
-                       kv_slab(p + "vc", h // grp, g), cx_out))
+            def qslice(h):
+                """Head h's queries: a strided slice of token-major `q`, or the head-major copy."""
+                if not seam:
+                    return f"{qhb}[{h * M * hd * 2}:{(h + 1) * M * hd * 2}]"
+                return f"{qb}[{h * hd * 2}:{(h * hd + g.op_sc.a_elems) * 2}]"
+
+            def score(h):
+                return (g.op_sc, qslice(h), kv_slab(p + "kc", h // grp, g),
+                        f"{scb}[{h * M * g.w * 2}:{(h + 1) * M * g.w * 2}]")
+
+            def soft(h):
+                sl = f"{scb}[{h * M * g.w * 2}:{(h + 1) * M * g.w * 2}]"
+                out = f"{swb}[{h * M * g.w * 2}:{(h + 1) * M * g.w * 2}]"
+                wid = f"{SM_WIDTHS}[{h * M * 4}:{(h + 1) * M * 4}]"
+                return (g.op_sm_head, sl, wid, out) if causal == "rows" else (g.op_sm_head, sl, out)
+
+            if attn_order == "interleaved":
+                # Only the first `n_il` heads alternate; the rest stay grouped. The knob exists
+                # because a configure costs ~80 KB of instruction stream, so interleaving all 16
+                # heads built a 157 MB ELF that the driver refuses to allocate a BO for (CREATE_BO
+                # EAGAIN, reproducible). +2 configures per interleaved head per layer.
+                for h in range(n_il):
+                    rl += [score(h), soft(h)]
+                rl += [score(h) for h in range(n_il, Hq)]
+                rl += [soft(h) for h in range(n_il, Hq)]
+            elif attn_order == "grouped":
+                rl += [score(h) for h in range(Hq)] + [soft(h) for h in range(Hq)]
+            else:
+                rl += [score(h) for h in range(Hq)]
+                rl.append((g.op_sm, scb, SM_WIDTHS, swb) if causal == "rows"
+                          else (g.op_sm, scb, swb))
+            for h in range(Hq):
+                cx_out = (f"{cxtb}[{h * hd * 2}:{(h * hd + g.op_cx.c_elems) * 2}]" if seam
+                          else f"{cxb}[{h * M * hd * 2}:{(h + 1) * M * hd * 2}]")
+                rl.append((g.op_cx, f"{swb}[{h * M * g.w * 2}:{(h + 1) * M * g.w * 2}]",
+                           kv_slab(p + "vc", h // grp, g), cx_out))
         rl += ([] if seam else [(g.op_h2t, cxb, cxtb)]) + \
             weight_gemm(p, "Wo", g.op_o, g.qd, D, cxtb, "a", f"o_hd{hd}", site="o", layer=l) + \
             ([(op_norm, "a", p + "n_pa", "a")] if sp.sandwich_norms else []) + [
@@ -1195,12 +1319,22 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
             rl += [(op_lscale, f"{dst}[{r * D * 2}:{(r + 1) * D * 2}]", p + "ls",
                     f"{dst}[{r * D * 2}:{(r + 1) * D * 2}]") for r in range(M)]
         cache_names += [p + "kc", p + "vc"]
+        ring_layers.append(g.ring)
+
+    uses_ring = any(ring_layers)
+    # (head_dim, capacity) per ring-enabled geometry -- what `check_prefill_pairing` (artifact.rs)
+    # matches a circular decode geometry against before accepting a prefill past its window.
+    ring_geoms = sorted({(attn_ops(hd, hkv, has_v).hd, attn_ops(hd, hkv, has_v).w)
+                         for hd, hkv, has_v in geoms if attn_ops(hd, hkv, has_v).ring})
+    if uses_ring:
+        check_kv_append_order(rl, layer_starts, NL, ring_layers)
+        print(f"[layout] read-before-write assert OK ({sum(ring_layers)}/{NL} ring layer(s))")
 
     # `sm_widths` goes LAST so x and rope keep the input-arena offsets the non-causal arm gives
     # them: add_buffers walks input_args in order, and the host's x/rope writes are the same in
-    # both arms.
+    # both arms. `sm_ring` after it for the same reason.
     inputs = ["x"] + (["rope_local", "rope_global"] if dual_rope else ["rope"]) + \
-        ([SM_WIDTHS] if causal == "rows" else [])
+        ([SM_WIDTHS] if causal == "rows" else []) + ([SM_RING] if uses_ring else [])
 
     # Every buffer this graph READS and never writes has to come from somewhere -- a host input, or
     # the decode arena. One that comes from neither is a prefill-local scratch buffer nothing fills:
@@ -1246,6 +1380,8 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
         name += "_nseam"
     if fuse_silu:
         name += "_fsilu"
+    if uses_ring:
+        name += "_ring"
     # The tiling is now a per-shape lookup, so it is a GRAPH knob like the three above and has to
     # be in the name for the same reason: a re-sweep that moves one GEMM's tile must not link the
     # previous tiling's ELF out of the artifact cache. Hashed rather than spelled out -- seven
@@ -1270,6 +1406,7 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
         name += f"_seg{len(cuts)}"
     if A_RESIDENT:
         name += "_ares"
+    print(f"[layout] name={name}")
     fused = OperatorSequence(name, seg_rls[0], input_args=inputs, output_args=["xout"],
                              buffer_sizes=bufsz, context=ctx, share_designs=True,
                              scratch_order=(dec_order or None),
@@ -1310,6 +1447,7 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
                 tn_sc=tn_sc, tn_cx=tn_cx, tiles=tiles, cols=cols, causal=causal,
                 kv_block=kvl.T, wqkv_head_major=hm, geom_slots=geom_slots,
                 sm_widths=(SM_WIDTHS if causal == "rows" else None), sm_rows=Hq * M,
+                uses_ring=uses_ring, ring_geoms=ring_geoms,
                 shared=[n for n in dec_order if not n.startswith("__decode_gap")],
                 reserved=dec_reserved, prefill_local=prefill_local, quant_pack=quant_pack,
                 rl=rl, runlist_len=len(rl), per_layer=len(rl) // NL,
@@ -1324,6 +1462,43 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
                 n_designs=len(fused.unique_designs()[0]),
                 n_configures=count_configures(rl, fused))
     return sp, fused, dims
+
+
+def check_kv_append_order(rl, layer_starts, NL, ring_layers):
+    """K019-shaped build-time assert: a ring layer's runlist must read `L{l}_kc`/`L{l}_vc` before
+    its own `op_kvapp` write (read-first, sec 1.2/2.1); every other layer must write before it
+    reads (today's append-then-read). Catches the hazard sec 1.2 names by construction: swap
+    `op_kvapp` back above the score GEMMs on a ring layer and this raises, naming the read that now
+    runs after the write which just overwrote it.
+    """
+    for l in range(NL):
+        lo = layer_starts[l]
+        hi = layer_starts[l + 1] if l + 1 < NL else len(rl)
+        for tag in ("kc", "vc"):
+            name = f"L{l}_{tag}"
+            write_idx, read_idx = [], []
+            for i in range(lo, hi):
+                op, *bufs = rl[i]
+                for spec, nm in zip(op.get_arg_spec(), bufs):
+                    if nm.split("[")[0] != name:
+                        continue
+                    (write_idx if spec.direction in ("out", "inout") else read_idx).append(i)
+            if not write_idx:
+                raise ValueError(f"{name}: op_kvapp never writes it in layer {l}'s runlist slice")
+            w0 = write_idx[0]
+            if ring_layers[l]:
+                bad = [i for i in read_idx if i > w0]
+                if bad:
+                    raise ValueError(
+                        f"{name}: ring layer {l} reads it at runlist index {bad[0]}, AFTER its "
+                        f"own op_kvapp write at {w0} -- past the wrap this overwrites positions "
+                        f"the chunk's later rows still need (sec 1.2)")
+            else:
+                bad = [i for i in read_idx if i < w0]
+                if bad:
+                    raise ValueError(
+                        f"{name}: layer {l} reads it at runlist index {bad[0]}, BEFORE its own "
+                        f"op_kvapp write at {w0}")
 
 
 def check_operand_bounds(runlist, fused):
@@ -1754,6 +1929,15 @@ def main():
                              f"layout -- AIERuntimeArgSpec.dtype defaults to bfloat16, so this is "
                              f"what an unset dtype looks like")
         open(os.path.join(bdir, f"{SM_WIDTHS}.bin"), "wb").write(widths.tobytes())
+    if dims["uses_ring"]:
+        # One shared sm_ring, head-major like sm_widths (the triple is head-independent, sec 1.3).
+        # First ring geometry's capacity -- every shipped spec has exactly one.
+        ring_w = dims["ring_geoms"][0][1]
+        rows = np.tile(ring_mask_rows(a.base, M, ring_w), (Hq, 1))
+        want = fused.get_layout_for_buffer(SM_RING)[2]
+        if rows.nbytes != want:
+            raise SystemExit(f"ERROR: {SM_RING} is {rows.nbytes}B here and {want}B in the layout")
+        open(os.path.join(bdir, f"{SM_RING}.bin"), "wb").write(rows.tobytes())
 
     # Quantized weight buffers (Task 5): unlike x/rope/sm_widths above, these are STATIC model
     # weights, packed ONCE, here, at build time -- not per-request. Each is a permutation of the
@@ -1866,6 +2050,23 @@ def main():
             "note": "one width per softmax row; row r attends scores[r, :widths[r]] and "
                     "mask_bf16 writes -inf over the rest. This IS the causal mask -- there is no "
                     "triangle buffer and no scalar width.",
+        },
+        # Present only on a build that ran a sliding (w < S) geometry read-first over the ring
+        # (PREFILL_SLIDING_RING=1). `geoms` names which (head_dim, capacity) it covers --
+        # `check_prefill_pairing` (artifact.rs) accepts a circular decode geometry past its window
+        # only when this names that geometry and `capacity % M == 0`.
+        "mask_ring": None if not dims["uses_ring"] else {
+            "buffer": SM_RING,
+            "dtype": "int32",
+            "rows": dims["sm_rows"],
+            "len": dims["sm_rows"] * 3 * 4,
+            "row_index": "r = h * M + i, h in [0, q_heads), i in [0, M)",
+            "geoms": [{"head_dim": hd, "capacity": ww} for hd, ww in dims["ring_geoms"]],
+            "rule": "hole_lo = base % w; hole_hi = w if base < w else hole_lo + i + 1; "
+                    "width = w + i + 1",
+            "note": "one (hole_lo, hole_hi, width) triple per softmax row over the concat "
+                    "[ring w | this chunk's own M rows]; mask_hole_bf16 writes -inf on "
+                    "[hole_lo, hole_hi) and [width, w+M).",
         },
         "scratchpad": {
             "params": scratchpad_params,
