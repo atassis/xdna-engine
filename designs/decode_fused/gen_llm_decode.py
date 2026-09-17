@@ -481,6 +481,9 @@ FORCE_K_SPLIT = int(os.environ.get("FORCE_K_SPLIT", "0"))
 # Run the FF-wide activation and gate*up multiply as this many equal slices. Elementwise, so the
 # arithmetic is unchanged; at FF/n == d_model the multiply shares the d_model-wide Mul design.
 FF_POINTWISE_CHUNKS = int(os.environ.get("FF_POINTWISE_CHUNKS", "1"))
+# Quantized weight GEMVs that differ only in M take one tiling per family plus tiles_rtp, and IRON's
+# merge_devices folds each family into one device. Rows are independent, so the arithmetic is unchanged.
+MERGE_WEIGHT_GEMVS = os.environ.get("MERGE_WEIGHT_GEMVS", "0") == "1"
 # Same axis for the attention output projection. Gemma-4's GLOBAL layers have head_dim 512, so
 # o_proj is K=8192 there and needs 2 chunks while its sliding layers at K=4096 need none -- a
 # PER-LAYER split, which this per-spec version does not yet express (it needs q_dim_for(layer),
@@ -613,7 +616,7 @@ def load_weight_buffer(buf, arr):
 
 
 def sequence_name(sp, NL, S, placer_flags, decode_layer_active=False, T=None, tmv_declined=(),
-                  tmv_chunked=(), attn_block_geoms=(), ff_chunks=1):
+                  tmv_chunked=(), attn_block_geoms=(), ff_chunks=1, weight_families=0):
     """Name the fused sequence after everything that changes its graph, not just the model.
 
     IRON keys the cached artifact by this name. Every knob below produces a DIFFERENT ELF, so
@@ -728,6 +731,8 @@ def sequence_name(sp, NL, S, placer_flags, decode_layer_active=False, T=None, tm
         parts.append(f"smseg{SOFTMAX_SEGMENT}")
     if ff_chunks > 1:
         parts.append(f"ffc{ff_chunks}")
+    if weight_families:
+        parts.append("wgm")
     if ATTN_RUNTIME_EXTENT:
         parts.append("rtext")
     if FUSE_ACT:
@@ -1114,8 +1119,8 @@ def check_arena_offsets_are_addressable(seq, names):
         f"(+{first[3]:,} bytes) = {(first[2] + first[3]) / 2**30:.3f} GiB. "
         f"Split this graph so each dispatch's arena stays under 4 GiB, or narrow the weights."
     )
-def gemv(M, K, ctx, **kw):
-    """GEMV tiled as large as both the design asserts AND L1 allow."""
+def gemv_tiling(M, K, **kw):
+    """The (tile_size_input, tile_size_output) gemv() builds this shape with."""
     wdt = kw.get("weight_dtype", "bf16")
     # gemv_tile_output's default budget assumes a bf16 A row (K*2 B). A quantized row is narrower
     # -- 1.125*K at int8 g32, K at int8 g64 -- and the bf16 model overstates it by up to 1.78x,
@@ -1140,6 +1145,13 @@ def gemv(M, K, ctx, **kw):
                               scale_dtype=_BUILD_STATE["scale_dtype"])
         if tsi % rg:
             tsi, tso = gemv_tile_output(M, K, a_row_bytes=a_row_bytes, tsi=rg)
+    return tsi, tso
+
+
+def gemv(M, K, ctx, **kw):
+    """GEMV tiled as large as both the design asserts AND L1 allow."""
+    tsi, tso = gemv_tiling(M, K, **kw)
+    wdt = kw.get("weight_dtype", "bf16")
     g = kw.get("group_size", 0)
     if g and g < 64:
         # The width a chunk may span, from the one function that owns it. This used to pin
@@ -1152,6 +1164,41 @@ def gemv(M, K, ctx, **kw):
         kw["kernel_vector_size"] = widest_chunk(g, wdt)
     return GEMV(M=M, K=K, num_aie_columns=COLS, tile_size_input=tsi,
                 tile_size_output=tso, context=ctx, **kw)
+
+
+def unify_weight_gemvs(rl):
+    """Retile every family of quantized weight GEMVs that differ only in M, with tiles_rtp.
+
+    A family is tiled the way gemv() tiles its gcd shape (the gcd of the members' per-core rows),
+    so the one tiling divides every member and fits L1 for all of them. Families with a single M
+    are left alone. Returns the rewritten runlist and (K, tsi, tso, Ms) per retiled family.
+    """
+    import dataclasses
+    from math import gcd
+    fams = {}
+    for op in {id(e[0]): e[0] for e in rl}.values():
+        if not (isinstance(op, GEMV) and op.weight_dtype != "bf16" and op.num_batches == 1
+                and op.alloc_M is None and op.vector_size_parameter is None and not op.tiles_rtp):
+            continue
+        key = op.design_key().split("|")
+        del key[1:6]  # cols, M, K, tsi, tso: keep cols and K, drop M and the tiling
+        fams.setdefault((op.num_aie_columns, op.K, *key), []).append(op)
+    new, report = {}, []
+    for (cols, K, *_), ops in fams.items():
+        Ms = sorted({op.M for op in ops})
+        if len(Ms) < 2:
+            continue
+        rows = 0
+        for M in Ms:
+            rows = gcd(rows, M // cols)
+        o = ops[0]
+        tsi, tso = gemv_tiling(rows * cols, K, weight_dtype=o.weight_dtype,
+                               group_size=o.group_size, layout=o.layout)
+        for op in ops:
+            new[id(op)] = dataclasses.replace(op, tile_size_input=tsi, tile_size_output=tso,
+                                              tiles_rtp=True)
+        report.append((K, tsi, tso, Ms))
+    return [(new.get(id(op), op), *bufs) for op, *bufs in rl], report
 
 
 def _swiglu_default_tile_rows_gu():
@@ -2642,6 +2689,12 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
     # returns zeros at 12 layers while the device plainly computed from it.
     head_name = "logits" if not SPLIT_LM_HEAD else "xf"
 
+    weight_families = []
+    if MERGE_WEIGHT_GEMVS:
+        rl, weight_families = unify_weight_gemvs(rl)
+        for K_, tsi_, tso_, Ms_ in weight_families:
+            print(f"[gen] weight GEMV family K={K_}: tsi {tsi_} tso {tso_} tiles_rtp over M={Ms_}")
+
     if DECODE_SEGMENTS > NL:
         raise SystemExit(f"DECODE_SEGMENTS={DECODE_SEGMENTS} exceeds the {NL} layers there are to "
                          f"split; a segment boundary only exists at a layer boundary")
@@ -2687,7 +2740,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         _sn = sequence_name(sp, NL, S, placer_flags, tmv_declined=_tmv_declined,
                             tmv_chunked=_tmv_chunked, attn_block_geoms=_attn_block_fused,
                             decode_layer_active=op_decode_layer is not None, T=T,
-                            ff_chunks=ff_chunks)
+                            ff_chunks=ff_chunks, weight_families=len(weight_families))
         name = _sn if len(cuts) == 1 else f"{_sn}_seg{si}of{len(cuts)}"
         # A rung is THIS runlist with the layer design substituted. Only for an unsplit
         # stack: a rung rewrites one runlist, and a segmented stack has one per segment
@@ -2702,6 +2755,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                                input_args=seg_inputs, output_args=[seg_out],
                                buffer_sizes=seg_bufsz, context=ctx, extra_flags=placer_flags,
                                share_designs=share,
+                               **({"merge_devices": True} if weight_families else {}),
                                **({"extra_runlists": _extra} if _extra else {}),
                                **({"scratch_order": list(weights.keys())}
                                   if BUCKET_SCRATCH_ORDER else {}))
