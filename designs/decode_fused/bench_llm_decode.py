@@ -164,9 +164,12 @@ def main():
     # One (kv_off, sm_mask) pair per distinct GEOMETRY. The single-slot form below is the
     # fallback for a build that predates geom_slots; see gen_llm_decode.py's geom_slots comment
     # for why kv_slots and mask_slots cannot be zipped positionally.
-    geom_slots = md.get("geom_slots") or [("kv_off", HD, S, "sm_mask")]
-    geoms = [(nm, KVLayout(Hkv=sp.n_kv_heads, S=ww, HD=hd, T=min(T, ww)), ww, mn)
-             for nm, hd, ww, mn in geom_slots]
+    geom_slots = md.get("geom_slots") or [("kv_off", HD, S, "sm_mask", min(T, S), sp.n_kv_heads)]
+    # Every axis comes from the GEOMETRY: its capacity, its block and its own kv-head count.
+    # Deriving any of them here (min(T, ww), sp.n_kv_heads) is wrong the moment two geometries
+    # differ, which gemma4-12b's do -- global is hkv=1/hd=512 against sliding 8/256.
+    geoms = [(nm, KVLayout(Hkv=khv, S=cap, HD=hd, T=blk), cap, mn)
+             for nm, hd, cap, mn, blk, khv in geom_slots]
     out = c.get_buffer("logits")
 
     # ---- instrumentation: wrap THIS instance's methods, no tracked file touched ----
