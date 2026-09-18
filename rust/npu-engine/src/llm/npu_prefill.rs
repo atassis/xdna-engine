@@ -47,7 +47,7 @@ use std::rc::Rc;
 use npu_xrt::{Device, ElfResident, FusedArena};
 
 use crate::api::EngineError;
-use crate::llm::artifact::{BufLoc, LlmArtifact, MaskWidths, PrefillSegment, RopeWrite};
+use crate::llm::artifact::{BufLoc, LlmArtifact, MaskRing, MaskWidths, PrefillSegment, RopeWrite};
 use crate::llm::npu_decode::{pack_bf16_bytes, rope_angles, rope_row, EmbedTable};
 
 /// `NPU_LLM_PREFILL_BATCHED` -- the one accessor (E003 of the env-flag contract).
@@ -166,6 +166,74 @@ pub fn mask_widths_block(start: usize, batch: usize, heads: usize, max_seq: usiz
     out
 }
 
+/// The ring mask for a chunk past a sliding window's wrap (design sec 1.3): `[heads*batch*3]`
+/// little-endian int32 triples `(hole_lo, hole_hi, width)`, row `h*batch + i`, one triple per
+/// (head, token) row -- `mask_hole_bf16`'s three arguments, streamed the way `mask_widths_block`
+/// streams one width. The triple is head-independent (only the token index and the ring's own
+/// wrap state matter), so every head repeats the same `batch` rows, like `mask_widths_block`.
+///
+/// Read-first over the concat `[ring capacity | this chunk's own batch rows]`: row `i` of a chunk
+/// at `start` masks the ring's stale tail `[hole_lo, hole_hi)` (the positions this chunk's own
+/// earlier rows are about to overwrite, or -- below the wrap -- the never-written remainder) and
+/// the batch's own not-yet-valid rows `[width, capacity+batch)`. Closed form, `b0 = start %
+/// capacity`: `hole_lo = b0`; `hole_hi = capacity` while `start < capacity`, else `b0 + i + 1`;
+/// `width = capacity + i + 1`. Pinned against a closed-form table in the tests below, checked
+/// independently against the generator's own `ring_mask_rows`
+/// (`designs/decode_fused/gen_llm_prefill.py`).
+///
+/// Panics (a build-time/host-logic defect, never on data from a request) unless `capacity % batch
+/// == 0` and `start % batch == 0` -- the two preconditions that keep the hole and the commit from
+/// straddling the ring end (`crosses_wrap_point` is the same check on the KV write this mask
+/// pairs with).
+pub fn ring_mask_block(start: usize, batch: usize, heads: usize, capacity: usize) -> Vec<u8> {
+    assert!(batch > 0, "prefill batch must be non-zero");
+    assert!(
+        capacity % batch == 0,
+        "ring capacity {capacity} is not a multiple of batch {batch} (W % M == 0): a chunk's \
+         hole/commit would wrap the ring end"
+    );
+    assert!(
+        start % batch == 0,
+        "ring chunk start {start} is not batch-aligned to {batch}"
+    );
+    let b0 = start % capacity;
+    let mut out = Vec::with_capacity(heads * batch * 3 * 4);
+    for _ in 0..heads {
+        for i in 0..batch {
+            let hole_lo = b0 as u32;
+            let hole_hi = if start < capacity { capacity } else { b0 + i + 1 } as u32;
+            let width = (capacity + i + 1) as u32;
+            out.extend_from_slice(&hole_lo.to_le_bytes());
+            out.extend_from_slice(&hole_hi.to_le_bytes());
+            out.extend_from_slice(&width.to_le_bytes());
+        }
+    }
+    out
+}
+
+/// Stage 1's tail rule (design sec 1.4): the last ring-batched position `prime` may run up to
+/// before a HARMFUL padded chunk -- one whose pad rows would overwrite ring slots the following
+/// decode steps still need to read. Harmful iff the chunk starts past the wrap (`start + batch >
+/// capacity`) and has at least 2 pad rows (one pad overwrites `n-capacity`, which decode at `n`
+/// never reads and rewrites first before it could matter). The caller finishes stepwise from the
+/// returned position, exactly as it already does for `batchable_window`'s floor.
+///
+/// `from` and `n` are absolute positions, `from` batch-aligned; stops on the FIRST harmful chunk
+/// rather than skipping past it, so the caller's stepwise resume never has to reason about a gap.
+pub fn ring_tail_end(from: usize, n: usize, batch: usize, capacity: usize) -> usize {
+    let mut start = from;
+    while start < n {
+        let real = (n - start).min(batch);
+        let pads = batch - real;
+        let harmful = pads >= 2 && start + batch > capacity;
+        if harmful {
+            return start;
+        }
+        start += batch;
+    }
+    n
+}
+
 /// The highest position a prefill ELF of window `max_seq` can prime in batches of `batch`.
 ///
 /// Batch-aligned DOWN, because a chunk writes `batch` consecutive positions from a single `kv_off`
@@ -185,8 +253,23 @@ pub fn prefill_window(max_seq: usize, batch: usize) -> usize {
 /// and row `i` must attend all of them except slots `i+1 ..= batch-1`, a hole in the MIDDLE that
 /// no suffix mask reaches. So batched prefill stops at the narrowest capacity and the caller
 /// finishes stepwise, which is why this returns a position rather than refusing.
-pub fn batchable_window(max_seq: usize, batch: usize, capacities: &[usize]) -> usize {
-    prefill_window(capacities.iter().copied().chain([max_seq]).min().unwrap_or(max_seq), batch)
+///
+/// `ring_capacities` are the geometries the ELF declares a `mask_ring` for (design sec 1.3/2.1):
+/// past those it goes read-first over the concat instead, so they are SKIPPED from the floor --
+/// but only when `capacity % batch == 0` (`W % M == 0`, the one precondition the ring algebra
+/// needs); one that fails it still floors, same as an undeclared capacity. Empty (the default,
+/// flag off) reproduces the pre-ring floor exactly.
+pub fn batchable_window(
+    max_seq: usize, batch: usize, capacities: &[usize], ring_capacities: &[usize],
+) -> usize {
+    let floor = capacities
+        .iter()
+        .copied()
+        .filter(|&c| !(batch != 0 && c % batch == 0 && ring_capacities.contains(&c)))
+        .chain([max_seq])
+        .min()
+        .unwrap_or(max_seq);
+    prefill_window(floor, batch)
 }
 
 /// Whether a chunk `[start, start + batch)` crosses a capacity-`capacity` geometry's wrap point.
@@ -220,6 +303,9 @@ pub struct NpuPrefill {
     /// the same reason `rope_writes` is. `None` on a non-causal bring-up build, which declares no
     /// widths buffer and masks nothing.
     mask_write: Option<(BufLoc, MaskWidths)>,
+    /// Where the ring mask goes, resolved once at open like `mask_write`. `None` unless the
+    /// artifact was built with `PREFILL_SLIDING_RING=1` (design sec 2.2) -- the flag-off default.
+    mask_ring: Option<(BufLoc, MaskRing)>,
 }
 
 /// How one declared segment's resident gets opened: reuse the artifact's own primary (already
@@ -271,6 +357,7 @@ impl NpuPrefill {
         let rope_writes = artifact.rope_writes(decode)?;
         let mask_write =
             artifact.mask_widths.clone().map(|mw| (*artifact.loc(&mw.buffer), mw));
+        let mask_ring = artifact.mask_ring.clone().map(|mr| (*artifact.loc(&mr.buffer), mr));
         let elf = std::fs::read(artifact.elf_path())
             .map_err(|e| EngineError::Load(format!("read {}: {e}", artifact.elf_path().display())))?;
         let primary = dev.open_elf_resident(&elf, Some(&artifact.kernel_name)).map_err(|e| {
@@ -304,7 +391,7 @@ impl NpuPrefill {
         }
 
         let batch = artifact.batch;
-        Ok(NpuPrefill { artifact, segments, batch, rope_writes, mask_write })
+        Ok(NpuPrefill { artifact, segments, batch, rope_writes, mask_write, mask_ring })
     }
 
     pub fn batch(&self) -> usize {
@@ -379,8 +466,18 @@ impl NpuPrefill {
         // Gemma-4-12B that is 1024, not S=6912, and the decline it used to describe as unreachable
         // is now the normal path for a prompt over the sliding window.
         let caps: Vec<usize> = self.artifact.kv_windows.iter().map(|&(_, _, c, _)| c).collect();
-        let window = batchable_window(self.artifact.max_seq, self.batch, &caps);
-        let end = tokens.len().min(window);
+        let ring_caps: Vec<usize> =
+            self.mask_ring.as_ref().map(|(_, mr)| mr.geoms.iter().map(|&(_, c)| c).collect())
+                .unwrap_or_default();
+        let window = batchable_window(self.artifact.max_seq, self.batch, &caps, &ring_caps);
+        let mut end = tokens.len().min(window);
+        // Stage 1 (design sec 1.4): skip a harmful padded last chunk past a ring geometry's wrap
+        // rather than run it -- its pad rows would overwrite ring slots the following decode
+        // steps still need. The caller (below, via `Ok(end)`) already finishes stepwise from
+        // whatever this returns, same as the `window` floor above.
+        for &cap in &ring_caps {
+            end = end.min(ring_tail_end(from, end, self.batch, cap));
+        }
         if end <= from {
             return Ok(from);
         }
@@ -422,6 +519,17 @@ impl NpuPrefill {
                     mask_widths_block(chunk.start, self.batch, mw.heads, self.artifact.max_seq);
                 arena.write_at(loc.arena, loc.off, &widths).map_err(|e| {
                     EngineError::Device(format!("write prefill {}: {e}", mw.buffer))
+                })?;
+            }
+
+            // The ring mask, next to the widths write above. One shared geometry's capacity --
+            // every shipped spec declares exactly one ring geometry; `mask_ring.geoms` is a list
+            // for the same reason `kv_windows` is, but nothing here picks among several yet.
+            if let Some((loc, mr)) = &self.mask_ring {
+                let capacity = mr.geoms[0].1;
+                let rows = ring_mask_block(chunk.start, self.batch, mr.heads, capacity);
+                arena.write_at(loc.arena, loc.off, &rows).map_err(|e| {
+                    EngineError::Device(format!("write prefill {}: {e}", mr.buffer))
                 })?;
             }
 
@@ -592,14 +700,28 @@ mod tests {
     fn a_narrowed_geometry_floors_the_batchable_window_below_max_seq() {
         // The served Gemma-4-12B pair: S=6912, M=256, sliding capacity 1024 against global 6912.
         // Batched prefill covers the first 1024 positions; the rest is the caller's stepwise loop.
-        assert_eq!(batchable_window(6912, 256, &[1024, 6912]), 1024);
+        // No ring capacities (the flag-off default): behavior is unchanged from before ring existed.
+        assert_eq!(batchable_window(6912, 256, &[1024, 6912], &[]), 1024);
         // No narrowed geometry, and no declared geometry at all (a pre-kv_windows artifact), are
         // both the unfloored window.
-        assert_eq!(batchable_window(6912, 256, &[6912, 6912]), 6912);
-        assert_eq!(batchable_window(6912, 256, &[]), 6912);
+        assert_eq!(batchable_window(6912, 256, &[6912, 6912], &[]), 6912);
+        assert_eq!(batchable_window(6912, 256, &[], &[]), 6912);
         // The floor is batch-aligned like every other window: a 1000-position capacity admits
         // three whole chunks, not three and a fragment.
-        assert_eq!(batchable_window(6912, 256, &[1000]), 768);
+        assert_eq!(batchable_window(6912, 256, &[1000], &[]), 768);
+    }
+
+    #[test]
+    fn a_ring_covered_capacity_is_skipped_from_the_floor() {
+        // W % M == 0 (1024 % 64 == 0): the ring covers the sliding geometry, so batched prefill
+        // is bounded only by the global capacity -- the whole point of the design.
+        assert_eq!(batchable_window(6912, 64, &[1024, 6912], &[1024]), 6912);
+        // A SECOND narrowed geometry the ring does NOT cover still floors -- ring is per capacity,
+        // not a blanket "ignore every kv_windows entry" switch.
+        assert_eq!(batchable_window(6912, 64, &[1024, 2048, 6912], &[1024]), 2048);
+        // A capacity that fails W % M == 0 does not skip even if named as a ring capacity --
+        // matches `ring_mask_block`'s own panic on the same precondition.
+        assert_eq!(batchable_window(6912, 64, &[1000], &[1000]), 960);
     }
 
     #[test]
@@ -819,6 +941,85 @@ mod tests {
         // protocol and the token-identity gate will fail for a reason no device trace will show.
         for pos in [0usize, 1, 7, 2047] {
             assert_eq!(rope_block(pos, 1, 128, THETA, None), pack_bf16_bytes(&rope_row(pos, 128, THETA, rope_angles(128, None))));
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // The ring mask past a sliding window's wrap, and the stage-1 tail rule. `ring_mask_block`
+    // is pinned against a closed-form table, cross-checked against the ledger mask and the exact
+    // attended window in `designs/decode_fused/test_prefill_ring.py` -- independent derivations,
+    // never one copied into another as ground truth.
+    // ---------------------------------------------------------------------------------------
+
+    const RING_W: usize = 1024;
+    const RING_M: usize = 64;
+
+    /// Row `i`'s (hole_lo, hole_hi, width) triple, head 0, from a one-head `ring_mask_block`.
+    fn ring_row(start: usize, i: usize) -> (u32, u32, u32) {
+        let block = ring_mask_block(start, RING_M, 1, RING_W);
+        let at = |k: usize| u32::from_le_bytes(block[k * 4..k * 4 + 4].try_into().unwrap());
+        (at(i * 3), at(i * 3 + 1), at(i * 3 + 2))
+    }
+
+    #[test]
+    fn ring_mask_block_matches_the_design_table_sec_1_3() {
+        // (base, row0, row63), exactly the design's own table.
+        let table: &[(usize, (u32, u32, u32), (u32, u32, u32))] = &[
+            (0, (0, 1024, 1025), (0, 1024, 1088)),
+            (960, (960, 1024, 1025), (960, 1024, 1088)),
+            (1024, (0, 1, 1025), (0, 64, 1088)),
+            (1088, (64, 65, 1025), (64, 128, 1088)),
+            (1984, (960, 961, 1025), (960, 1024, 1088)),
+            (2048, (0, 1, 1025), (0, 64, 1088)),
+            (2112, (64, 65, 1025), (64, 128, 1088)),
+        ];
+        for &(base, row0, row63) in table {
+            assert_eq!(ring_row(base, 0), row0, "base={base} row 0");
+            assert_eq!(ring_row(base, RING_M - 1), row63, "base={base} row 63");
+        }
+    }
+
+    #[test]
+    fn ring_mask_block_repeats_the_row_once_per_head() {
+        // The triple is head-independent (design sec 1.3): every head sees the same M rows,
+        // exactly the way `mask_widths_block` repeats its per-token width once per head.
+        let heads = 3;
+        let one = ring_mask_block(1088, RING_M, 1, RING_W);
+        let many = ring_mask_block(1088, RING_M, heads, RING_W);
+        assert_eq!(many.len(), one.len() * heads);
+        for h in 0..heads {
+            assert_eq!(&many[h * one.len()..(h + 1) * one.len()], &one[..], "head {h}");
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "not batch-aligned")]
+    fn ring_mask_block_refuses_a_misaligned_start() {
+        ring_mask_block(1000, RING_M, 1, RING_W);
+    }
+
+    #[test]
+    #[should_panic(expected = "W % M == 0")]
+    fn ring_mask_block_refuses_a_capacity_the_batch_does_not_divide() {
+        ring_mask_block(0, 40, 1, RING_W); // 1024 % 40 != 0 -- the straddling chunk at base=1000
+    }
+
+    #[test]
+    fn ring_tail_end_stage_1_stops_on_the_first_harmful_chunk() {
+        // Design sec 1.4 / task pin: n = P-1 for P = 1025, 1026, 1088, 1100, 2200.
+        assert_eq!(ring_tail_end(0, 1024, RING_M, RING_W), 1024, "exact multiple, no pad at all");
+        assert_eq!(ring_tail_end(0, 1025, RING_M, RING_W), 1024, "63 harmful pads at start=1024");
+        assert_eq!(ring_tail_end(0, 1087, RING_M, RING_W), 1087, "only 1 pad -- not harmful");
+        assert_eq!(ring_tail_end(0, 1099, RING_M, RING_W), 1088, "ragged: harmful chunk at 1088");
+        assert_eq!(ring_tail_end(0, 2199, RING_M, RING_W), 2176, "fully past 2048, ragged again");
+    }
+
+    #[test]
+    fn ring_tail_end_below_the_wrap_never_stops_early() {
+        // `start + batch > capacity` is false everywhere below the wrap, so every chunk runs
+        // whatever its pad count -- matches the existing (pre-ring) padded-last-chunk contract.
+        for n in [0usize, 1, 63, 64, 500, 1023] {
+            assert_eq!(ring_tail_end(0, n, RING_M, RING_W), n);
         }
     }
 }

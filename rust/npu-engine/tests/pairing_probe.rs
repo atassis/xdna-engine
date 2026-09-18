@@ -35,7 +35,11 @@ fn report_pairing() {
         }
     }
     let caps: Vec<usize> = pa.kv_windows.iter().map(|&(_, _, c, _)| c).collect();
+    let ring_caps: Vec<usize> =
+        pa.mask_ring.as_ref().map(|mr| mr.geoms.iter().map(|&(_, c)| c).collect())
+            .unwrap_or_default();
+    eprintln!("mask_ring={:?}", pa.mask_ring.as_ref().map(|mr| &mr.geoms));
     eprintln!("batchable_window = {} of S={}",
-              npu_engine::llm::npu_prefill::batchable_window(pa.max_seq, pa.batch, &caps),
+              npu_engine::llm::npu_prefill::batchable_window(pa.max_seq, pa.batch, &caps, &ring_caps),
               pa.max_seq);
 }

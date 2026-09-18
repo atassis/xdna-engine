@@ -33,7 +33,8 @@ iron_at="$(iron_require_api "gen_llm_prefill.py" \
   "iron/operators/gemm/op.py:b_col_maj" \
   "iron/operators/rope/op.py:angle_rows" \
   "iron/operators/softmax/op.py:vector_size_source" \
-  "iron/operators/strided_copy/op.py:output_offset_parameter")" || exit 1
+  "iron/operators/strided_copy/op.py:output_offset_parameter" \
+  "iron/operators/softmax/op.py:rows_hole")" || exit 1
 echo "[build] IRON on $iron_at (API surface verified)"
 
 ARENA_ARGS=()

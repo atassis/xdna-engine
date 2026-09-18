@@ -2376,6 +2376,25 @@
       "measured": null,
       "candidates_considered": null
     },
+    "m64_k256_n64_bf162bf16_bfp1_acc0": {
+      "M": 64,
+      "K": 256,
+      "N": 64,
+      "dtype": "bf16>bf16",
+      "emulate": true,
+      "prio_accuracy": false,
+      "tile_m": 16,
+      "tile_k": 64,
+      "tile_n": 16,
+      "cols": 4,
+      "b_col_maj": true,
+      "source": "assumed",
+      "labels": [
+        "sc_batch_hd256"
+      ],
+      "measured": null,
+      "candidates_considered": null
+    },
     "m64_k3840_n15360_bf162bf16_bfp1_acc0": {
       "M": 64,
       "K": 3840,
@@ -2544,6 +2563,25 @@
       "source": "assumed",
       "labels": [
         "scores_hd512"
+      ],
+      "measured": null,
+      "candidates_considered": null
+    },
+    "m64_k64_n256_bf162bf16_bfp1_acc0": {
+      "M": 64,
+      "K": 64,
+      "N": 256,
+      "dtype": "bf16>bf16",
+      "emulate": true,
+      "prio_accuracy": false,
+      "tile_m": 16,
+      "tile_k": 64,
+      "tile_n": 32,
+      "cols": 8,
+      "b_col_maj": false,
+      "source": "assumed",
+      "labels": [
+        "cx_batch_hd256"
       ],
       "measured": null,
       "candidates_considered": null
