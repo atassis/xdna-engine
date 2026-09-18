@@ -77,6 +77,11 @@ GROUPED_V = os.environ.get("GQA_GROUPED_V", "0") == "1"
 TMV_CTX = os.environ.get("TMV_CTX", "1") == "1"
 TMV_RPC_DEFAULT = 64
 TMV_RPC = int(os.environ.get("TMV_RPC", str(TMV_RPC_DEFAULT)))
+# Block the SCORES GEMV's K cache, per geometry, where doing so wins a delivery. Default on and
+# byte-identical on every geometry it does not win one for -- see scores_block_size(), which only
+# returns a blocked T when the operator's own group_reuse verdict differs between the two layouts.
+# "0" pins every geometry flat, which is the A/B control arm for the blocked one.
+SCORES_KV_BLOCK = os.environ.get("SCORES_KV_BLOCK", "1") == "1"
 
 import newstack_compat  # noqa: F401,E402 -- MUST precede iron imports (new-mlir-aie port shim)
 # Row-batch the scores GEMV by DEFAULT. SCORES_ROWBATCH is a ROWS COUNT read by IRON's
@@ -101,7 +106,7 @@ from iron.common import AIEContext  # noqa: E402
 from iron.common.kv_layout import KVLayout, derive_block_size  # noqa: E402
 from elf_dispatch_compat import OperatorSequence, load_elf  # noqa: E402
 from iron.operators.gemv.op import GEMV  # noqa: E402
-from iron.operators.gemv.design import MAX_GROUP_REUSE  # noqa: E402
+from iron.operators.gemv.design import MAX_GROUP_REUSE, group_reuse_n_vec  # noqa: E402
 # The packer MOVED in IRON 6a347dc ("the weight packer has two operators now, move it to
 # iron/common"), and the workspace carries trees on both sides of it: integration-stack has only
 # the new path, the vendored designs/iron_operators only the old. Try both and, if neither is
@@ -621,7 +626,7 @@ def load_weight_buffer(buf, arr):
 
 def sequence_name(sp, NL, S, placer_flags, decode_layer_active=False, T=None, tmv_declined=(),
                   tmv_chunked=(), attn_block_geoms=(), ff_chunks=1, weight_families=0,
-                  pointwise_widths=0):
+                  pointwise_widths=0, scores_blocks=()):
     """Name the fused sequence after everything that changes its graph, not just the model.
 
     IRON keys the cached artifact by this name. Every knob below produces a DIFFERENT ELF, so
@@ -654,6 +659,13 @@ def sequence_name(sp, NL, S, placer_flags, decode_layer_active=False, T=None, tm
     # buffers completely differently, so it must not share a name with the flat build.
     if T is not None and T != S:
         parts.append(f"kvt{T}")
+    # The SCORES GEMV's K block, per geometry, where it differs from that geometry's V block.
+    # `kvt` above names the PHYSICAL cache layout; this names an access pattern over the same
+    # bytes, so the two are different suffixes and a build can carry either, both or neither.
+    # Empty on every geometry that stays flat, which is every shipped arm -- see
+    # scores_block_size().
+    if scores_blocks:
+        parts.append("sckt" + "".join(f"_{h}x{t}" for h, t in sorted(scores_blocks)))
     if KV_ALLOC and KV_ALLOC != S:
         parts.append(f"ka{KV_ALLOC}")
     if GROUPED_V:
@@ -1160,6 +1172,61 @@ def check_arena_offsets_are_addressable(seq, names):
         f"(+{first[3]:,} bytes) = {(first[2] + first[3]) / 2**30:.3f} GiB. "
         f"Split this graph so each dispatch's arena stays under 4 GiB, or narrow the weights."
     )
+
+
+# THE SCORES GEMV'S K CACHE IS A SEPARATE DECISION FROM THE CTX TMatVec'S V CACHE, and
+# KV_BLOCK_ELIGIBLE above ANDs them into one build-wide bit. They are different ops on
+# different buffers: gemv/design.py's blocked branch builds its A taps from
+# `M, cols, n_matrices, block_size, a_row_width` alone and never references TMatVec, `m_chunk`
+# or op_ctx. The collision the build-wide bit protects against is entirely inside
+# tmatvec/design.py, whose blocked and m_chunk arms both want all four access-pattern dims --
+# a real constraint on the V side and none at all on the K side.
+#
+# Gemma-4's global geometry is where that coupling costs: its ctx MUST stay output-chunked
+# (at head_dim 512 the W term `batch_group*K*2` is 8 MB against 64 KB of L1, which no
+# rows_per_chunk reaches), so `_tmv_chunked` is non-empty, so the whole build stays flat --
+# and its scores GEMV then re-delivers the K cache 4x per invocation because the flat A run
+# has no wrap-legal split at S=262144.
+def scores_block_size(hd, hkv, w, kva, num_batches, batch_group):
+    """`block_size` for THIS geometry's scores GEMV, or `w` (flat, today's behaviour).
+
+    Blocked ONLY where blocking wins a delivery, which is asked of the operator rather than
+    re-derived here: `group_reuse_n_vec` is gemv/design.py's own coalescing verdict, and the
+    answer differs between the two layouts exactly when the flat A run is too long for the
+    BD wrap field. Every geometry it does not win one for keeps the flat tap byte-for-byte --
+    measured: gemma4-12b at S=6912 and its sliding w=1024 both read 'no change', so the
+    shipped arms' ELFs are untouched by this being on.
+    """
+    if not (GROUPED_K and SCORES_KV_BLOCK):
+        return w
+    Tc = derive_block_size(hd, hkv, S=kva, n_cols=COLS,
+                           addr_gran_elems=precision.kv_addr_gran_elems(PRECISION_PLAN))
+    # Both divisibility rules the blocked GEMV asserts, checked HERE so a geometry that
+    # cannot take the tiling falls back to flat instead of failing the build: `alloc_M % BLK`
+    # (my_matvec) and `(M // cols) % BLK` (the blocked-tap assert).
+    if Tc >= w or w % Tc or kva % Tc or (w // COLS) % Tc:
+        return w
+    alloc = None if kva == w else kva
+    flat = group_reuse_n_vec(w, COLS, num_batches, batch_group, hd, alloc, None)
+    blocked = group_reuse_n_vec(w, COLS, num_batches, batch_group, hd, alloc, Tc)
+    return Tc if blocked > flat else w
+
+
+def append_layouts_coincide(hkv, hd, w, T_k, T_v):
+    """Do the K and V appends put every (head, position) at the SAME element offset?
+
+    They share one `kv_off` scratchpad slot and one host write, so a K/V block split is only
+    expressible today where the two layouts are the same ADDRESSING -- which happens whenever
+    `hkv == 1`, because `block_stride = hkv*T*HD` then equals `T*HD` and the block and
+    within-block terms recombine to exactly `pos*HD` for any T. Checked over the positions
+    that straddle a block boundary rather than asserted from that argument, so this fails on
+    the geometry it is wrong for instead of on the next reader's confidence.
+    """
+    a, b = KVLayout(Hkv=hkv, S=w, HD=hd, T=T_k), KVLayout(Hkv=hkv, S=w, HD=hd, T=T_v)
+    probe = sorted({0, 1, T_k - 1, T_k, T_k + 1, T_v - 1, T_v, T_v + 1, w - 1} & set(range(w)))
+    return all(a.offset(h, q) == b.offset(h, q) for h in range(hkv) for q in probe)
+
+
 def gemv_tiling(M, K, **kw):
     """The (tile_size_input, tile_size_output) gemv() builds this shape with."""
     wdt = kw.get("weight_dtype", "bf16")
@@ -1170,7 +1237,18 @@ def gemv_tiling(M, K, **kw):
     # tile_size_input must be a MULTIPLE of the derived row_group, and the overstated bf16 budget
     # was rejecting exactly the tsi values row_group_planar needs.
     a_row_bytes = row_stride_bytes(K, kw["group_size"], wdt) if wdt != "bf16" else None
-    tsi, tso = gemv_tile_output(M, K, a_row_bytes=a_row_bytes)
+    # n_vec, from the operator's own verdict rather than from `batch_group`: the two differ
+    # exactly when the tap does not coalesce, and the design then runs ungrouped at n_vec=1 with
+    # today's tiling. Asking group_reuse_n_vec keeps the arms that decline reuse -- every shipped
+    # one -- tiled byte-identically, and shrinks the tile only where reuse is really on.
+    #
+    # UNITS: design.py's `a_row_width` is ELEMENTS for bf16 and BYTES for a quantized row, which
+    # is the opposite convention to gemv_tile_output's `a_row_bytes`. Reuse needs batch_group>1,
+    # which the operator asserts is bf16-only, so the quantized branch can only ever return 1.
+    n_vec = group_reuse_n_vec(M, COLS, kw.get("num_batches", 1), kw.get("batch_group", 1),
+                              K if wdt == "bf16" else a_row_bytes,
+                              kw.get("alloc_M"), kw.get("block_size"))
+    tsi, tso = gemv_tile_output(M, K, a_row_bytes=a_row_bytes, n_vec=n_vec)
     if kw.get("layout") == "row_group_planar":
         # The free search picks tsi for the LARGEST legal C tile, which can be SMALLER than the
         # row_group needs -- a planar block cannot be cut, so tsi must be a MULTIPLE of it
@@ -1185,7 +1263,7 @@ def gemv_tiling(M, K, **kw):
                               vec_size=widest_chunk(kw["group_size"], wdt),
                               scale_dtype=_BUILD_STATE["scale_dtype"])
         if tsi % rg:
-            tsi, tso = gemv_tile_output(M, K, a_row_bytes=a_row_bytes, tsi=rg)
+            tsi, tso = gemv_tile_output(M, K, a_row_bytes=a_row_bytes, tsi=rg, n_vec=n_vec)
     return tsi, tso
 
 
@@ -1660,6 +1738,9 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
     # head_dims that actually qualify, for sequence_name()'s suffix -- computed once here, same
     # discipline as _tmv_declined/_tmv_chunked above, rather than re-derived at the call site.
     _attn_block_fused = tuple(sorted(g[0] for g in geoms if attn_block_why[g] is None))
+    # Filled by attn_ops (below) as each geometry is built, then handed to sequence_name -- the
+    # SAME value the op was constructed with, not a re-derivation of the gate.
+    _scores_blocks = []
 
     # HOISTED ABOVE THE UNFUSED ATTENTION OPERATORS, and the move is load-bearing rather than
     # tidy-up. When the fused layer wins, op_rep_k/op_rep_v/op_scores/op_softmax/op_trv/op_ctx are
@@ -1838,6 +1919,61 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         # smaller alloc). Keeping the same "one block" convention this build already uses for S
         # means T_g is simply w, not a blocking scheme of its own.
         T_g = min(T, w)
+        # SCORES BATCHING, derived here because BOTH the block-size gate below and the op itself
+        # must be built from the same pair. The gate asks the operator what n_vec this shape gets,
+        # and n_vec is a function of (num_batches, batch_group) -- computing it from `Hq, gqa`
+        # while the op is built at `MAX_GROUP_REUSE, MAX_GROUP_REUSE` would be a gate answering
+        # about a different graph than the one that ships (see a-name-and-a-graph-need-one-
+        # predicate). GQA's own group_reuse gate (gemv/design.py) DECLINES batch_group >
+        # MAX_GROUP_REUSE (a measured shim-BD ceiling) and falls back to a stride-0 outer BD that
+        # re-reads the whole matrix once per query head -- measured 14.71x on Gemma-4's global
+        # layers (hkv=1, gqa=Hq=16), 270.01 MB/token against 18.35 MB unique. Below the ceiling
+        # (sliding, gqa=2) this is unreachable and op_scores is unchanged.
+        #
+        # The fix stays inside group_reuse instead of raising the ceiling (a known dead end --
+        # batch_group=16 makes aiecc's B_L3L1_0 exceed 16 blocks, see MAX_GROUP_REUSE's own
+        # comment): build op_scores at batch_group=MAX_GROUP_REUSE (n_matrices=1, matching the
+        # ONE real K matrix) and call it scores_groups times over MAX_GROUP_REUSE-head slices --
+        # the same "one configure, N runs over slices" idiom down_runlist/o_runlist already use.
+        scores_group_fix = GROUPED_K and gqa > MAX_GROUP_REUSE
+        if scores_group_fix:
+            assert hkv == 1, (
+                f"scores group-reuse fallback assumes ONE real K matrix per geometry (hkv=1); "
+                f"got hkv={hkv} (hd={hd}) -- the per-slice K addressing is unimplemented for "
+                f"hkv>1"
+            )
+            assert gqa % MAX_GROUP_REUSE == 0, (
+                f"scores group-reuse fallback slices gqa into fixed {MAX_GROUP_REUSE}-head "
+                f"calls; gqa={gqa} (hd={hd}) is not a multiple of it"
+            )
+        scores_groups = gqa // MAX_GROUP_REUSE if scores_group_fix else 1
+        scores_nb = MAX_GROUP_REUSE if scores_group_fix else Hq
+        scores_bg = MAX_GROUP_REUSE if scores_group_fix else (gqa if GROUPED_K else 1)
+        # The K cache's own block size for the SCORES GEMV. `T_g` (the V/physical one) is what
+        # kv_layout, the host's kv_off and the prefill pairing all describe and it is unchanged;
+        # this is a re-TAPING of the same bytes, not a relayout -- append_layouts_coincide below
+        # is what holds that true rather than this comment.
+        T_k = scores_block_size(hd, hkv, w, KVA_g, scores_nb, scores_bg)
+        if T_k != T_g:
+            if not append_layouts_coincide(hkv, hd, w, T_k, T_g):
+                raise NotImplementedError(
+                    f"scores K block T={T_k} and V block T={T_g} at (head_dim={hd}, "
+                    f"n_kv_heads={hkv}) address the SAME (head, position) differently, and both "
+                    f"appends share one `kv_off` slot and one host write. Needs a second kv_off "
+                    f"scratchpad slot (gen_llm_decode's kv_slots, meta.json's kv_windows and "
+                    f"npu_decode.rs's per-geometry write) before a split can be built here -- or "
+                    f"SCORES_KV_BLOCK=0 to keep this geometry flat.")
+            for _op_name, _why in (("op_attn_block", attn_block_why[(hd, hkv, has_v)]),
+                                   ("op_qkv_dp", qkv_dp_why[(hd, hkv, has_v)])):
+                if _why is None:
+                    raise NotImplementedError(
+                        f"scores K block T={T_k} differs from the V block T={T_g}, but {_op_name} "
+                        f"appends BOTH caches itself through one `kv_block_size` and cannot "
+                        f"express two. Set SCORES_KV_BLOCK=0, or give that operator a per-cache "
+                        f"block size.")
+            print(f"[gen] scores K cache BLOCKED at head_dim={hd}: T={T_k} (V cache stays flat "
+                  f"at {T_g}, same bytes) -- A deliveries per invocation {scores_bg} -> 1")
+            _scores_blocks.append((hd, T_k))
         if w not in _win_cache:
             # First geometry at this window keeps the bare name "sm_mask" -- same convention as
             # kv_slots's bare "kv_off", and for the same reason (baked into the design, host's
@@ -1930,10 +2066,17 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         slot = "kv_off" if not kv_slots else f"kv_off{len(kv_slots)}"
         kv_slots.append((slot, hd))
         geom_slots.append((slot, hd, w, mask_slot))
-        sc = dict(input_sizes=(hkv, hd), input_strides=(hd, 1), input_offset=0,
-                  output_sizes=(1, hkv, hd), output_strides=(0, w * hd, 1), output_offset=0,
-                  input_buffer_size=hkv * hd, output_buffer_size=hkv * w * hd, num_aie_channels=1)
-        op_sck = StridedCopy(**sc, output_offset_parameter=slot, context=ctx)
+        # The per-head stride comes from the cache's OWN layout, so K and V each write the one
+        # they are read through. `KVLayout(S=w, T=w).head_stride` is `w*hd`, the literal this
+        # replaces, so every flat geometry is unchanged.
+        def append_op(T_blk):
+            return StridedCopy(
+                input_sizes=(hkv, hd), input_strides=(hd, 1), input_offset=0,
+                output_sizes=(1, hkv, hd), output_offset=0,
+                output_strides=(0, KVLayout(Hkv=hkv, S=w, HD=hd, T=T_blk).head_stride, 1),
+                input_buffer_size=hkv * hd, output_buffer_size=hkv * w * hd, num_aie_channels=1,
+                output_offset_parameter=slot, context=ctx)
+        op_sck = append_op(T_k)
         # V stays [S][hd]. A transposed append would delete op_trv, but a SINGLE-token transposed
         # write is 1024 isolated bf16 elements (h*hd*S + d*S + p) and the shim address generator
         # steps in 4-byte granules: the BD silently halves the innermost dimension (measured on the
@@ -1941,7 +2084,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         # ADJACENT elements). The runtime offset has the same granule floor, so an odd `p` truncates
         # down. The working shape is a PAIR write on an even offset, whose staging cannot itself be
         # a DMA.
-        op_scv = StridedCopy(**sc, output_offset_parameter=slot, context=ctx)
+        op_scv = append_op(T_g)
         # GQA broadcast. Correctness-first; the byte-free form is a batch-stride-0 GEMV read of the
         # kv head (0 ops, 0 bytes) -- at Hq=16 x 28 layers this Repeat plus the V transpose are 41%
         # of the per-token DDR budget, so it is the first optimisation after parity, not an
@@ -1962,37 +2105,10 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         # route that needs none.
         op_rep_k = Repeat(rows=hkv, cols=w * hd, repeat=gqa, transfer_size=hd, context=ctx)
         op_rep_v = Repeat(rows=hkv, cols=w * hd, repeat=gqa, transfer_size=hd, context=ctx)
-        # GQA's own group_reuse gate (gemv/design.py) DECLINES batch_group > MAX_GROUP_REUSE (a
-        # measured shim-BD ceiling) and falls back to a stride-0 outer BD that re-reads the whole
-        # matrix once per query head -- measured 14.71x on Gemma-4's global layers (hkv=1,
-        # gqa=Hq=16), 270.01 MB/token against 18.35 MB unique. Below the ceiling (sliding, gqa=2)
-        # this is unreachable and op_scores is unchanged.
-        #
-        # The fix stays inside group_reuse instead of raising the ceiling (a known dead end --
-        # batch_group=16 makes aiecc's B_L3L1_0 exceed 16 blocks, see MAX_GROUP_REUSE's own
-        # comment): build op_scores at batch_group=MAX_GROUP_REUSE (n_matrices=1, matching the
-        # ONE real K matrix) and call it scores_groups times over MAX_GROUP_REUSE-head slices --
-        # the same "one configure, N runs over slices" idiom down_runlist/o_runlist already use.
-        scores_group_fix = GROUPED_K and gqa > MAX_GROUP_REUSE
-        if scores_group_fix:
-            assert hkv == 1, (
-                f"scores group-reuse fallback assumes ONE real K matrix per geometry (hkv=1); "
-                f"got hkv={hkv} (hd={hd}) -- the per-slice K addressing is unimplemented for "
-                f"hkv>1"
-            )
-            assert gqa % MAX_GROUP_REUSE == 0, (
-                f"scores group-reuse fallback slices gqa into fixed {MAX_GROUP_REUSE}-head "
-                f"calls; gqa={gqa} (hd={hd}) is not a multiple of it"
-            )
-            scores_groups = gqa // MAX_GROUP_REUSE
-            op_scores = gemv(w, hd, ctx, num_batches=MAX_GROUP_REUSE, batch_group=MAX_GROUP_REUSE,
-                                 block_size=T_g, alloc_M=None if KVA_g == w else KVA_g,
-                                 **rtp_extent)
-        else:
-            scores_groups = 1
-            op_scores = gemv(w, hd, ctx, num_batches=Hq, batch_group=gqa if GROUPED_K else 1,
-                                 block_size=T_g, alloc_M=None if KVA_g == w else KVA_g,
-                                 **rtp_extent)
+        # Built from the SAME (scores_nb, scores_bg, T_k) the block-size gate was answered on --
+        # see their derivation above.
+        op_scores = gemv(w, hd, ctx, num_batches=scores_nb, batch_group=scores_bg,
+                         block_size=T_k, alloc_M=None if KVA_g == w else KVA_g, **rtp_extent)
         # num_batches=Hq, not Hq separate invocations. transpose/design.py's L3 tensors already hold
         # "num_batches contiguous (M,N) matrices stacked along the row dimension", which is EXACTLY
         # what vr/vt are; calling it per head issued 448 configure+run pairs per token to do 28 ops'
@@ -2056,7 +2172,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
             op_rope_q=op_rope_q, op_rope_k=op_rope_k, op_sck=op_sck, op_scv=op_scv,
             op_rep_k=op_rep_k, op_rep_v=op_rep_v, op_scores=op_scores, op_trv=op_trv,
             op_ctx=op_ctx, op_v_norm=op_v_norm, has_v=has_v, kv_parts=kv_parts,
-            uses_tmv_ctx=uses_tmv, scores_groups=scores_groups,
+            uses_tmv_ctx=uses_tmv, scores_groups=scores_groups, scores_block=T_k,
             op_softmax=op_softmax, op_scale=op_scale, mask_slot=mask_slot, window=w,
             op_attn_block=op_attn_block, circular=(w != S))
         _attn_cache[(hd, hkv, has_v)] = g
@@ -2305,7 +2421,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         base, n = ref_q.split("[", 1)[0], MAX_GROUP_REUSE
         return [
             (g.op_scores, a, f"{base}[{i*n*g.hd*2}:{(i+1)*n*g.hd*2}]",
-             f"{p}sc[{i*n*S*2}:{(i+1)*n*S*2}]")
+             f"{p}sc[{i*n*g.window*2}:{(i+1)*n*g.window*2}]")
             for i in range(g.scores_groups)
         ]
     # W_head weight-stream dtype axis (see QUANT_HEAD_DTYPE above -- READ THE TIED-EMBEDDING NOTE
@@ -2838,7 +2954,8 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                             tmv_chunked=_tmv_chunked, attn_block_geoms=_attn_block_fused,
                             decode_layer_active=op_decode_layer is not None, T=T,
                             ff_chunks=ff_chunks, weight_families=len(weight_families),
-                            pointwise_widths=len(pointwise_widths))
+                            pointwise_widths=len(pointwise_widths),
+                            scores_blocks=tuple(_scores_blocks))
         name = _sn if len(cuts) == 1 else f"{_sn}_seg{si}of{len(cuts)}"
         # A rung is THIS runlist with the layer design substituted. Only for an unsplit
         # stack: a rung rewrites one runlist, and a segmented stack has one per segment

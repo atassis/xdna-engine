@@ -271,7 +271,7 @@ L1_RESERVE = 8192     # stack + the allocator's own slack; measured headroom, no
 C_TILE_GRANULE = 8    # tile_size_output must be a multiple of this (16 bytes of bf16); see gemv_tile_output
 
 
-def gemv_tile_output(M, K, cols=8, tsi=None, a_row_bytes=None):
+def gemv_tile_output(M, K, cols=8, tsi=None, a_row_bytes=None, n_vec=1):
     """Largest legal `tile_size_output` for a GEMV that also FITS L1.
 
     Two independent constraints, and only the first is checked by the toolchain:
@@ -287,6 +287,12 @@ def gemv_tile_output(M, K, cols=8, tsi=None, a_row_bytes=None):
     Taking m_output = M//cols (the largest the asserts allow) blows constraint 2 on the lm-head:
     vocab 151936 -> 18992 elements -> 37984 B, double-buffered 76 KB against 64 KB of L1. Both the
     retired gen_gemma_decode.py (vocab//8 = 32768, see git history) and a naive port hit this.
+
+    FOURTH constraint: `n_vec`, the group-reuse factor. Every objectFIFO depth follows it (A at
+    2*n_vec, B at n_vec, C at 2*n_vec in design.py), so at 4 the budget below is a quarter of
+    what it is at 1 -- gemma4-12b's blocked global scores GEMV runs at 4, where tso=8192 puts
+    167936 B in a 65536 B L1. It is NOT `batch_group`: the operator declines reuse when the tap
+    does not coalesce, so ask `iron.operators.gemv.design.group_reuse_n_vec` for it.
 
     `a_row_bytes` is one A row's width in BYTES. Default None keeps the bf16 model below
     (`K * 2`), which is what every caller has always got and what every shipped tiling was chosen
@@ -311,10 +317,11 @@ def gemv_tile_output(M, K, cols=8, tsi=None, a_row_bytes=None):
     for cand_tsi in ([tsi] if tsi is not None else (4, 2, 1)):
         if per_col % cand_tsi:
             continue
-        budget = L1_BYTES - L1_RESERVE - 2 * (cand_tsi * a_row_bytes) - 2 * (K * 2)
+        budget = (L1_BYTES - L1_RESERVE - 2 * n_vec * (cand_tsi * a_row_bytes)
+                  - 2 * n_vec * (K * 2))
         if budget <= 0:
             continue
-        cap = budget // 4                  # C is double-buffered, 2 bytes per element
+        cap = budget // (4 * n_vec)        # C is double-buffered, 2 bytes per element
         # THIRD constraint, and nothing in the toolchain checks it: the C tile must be a multiple of
         # C_TILE_GRANULE elements. MEASURED 2026-09-03 with a standalone one-GEMV repro at the
         # lm-head shape -- M=151936 K=1024 with tso=4748 (4748 % 8 == 4) returns a PERMUTATION of the
