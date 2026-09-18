@@ -1,0 +1,45 @@
+{
+  "_generated_by": "designs/codec_block/decoder_chain.py chain_offset(), called directly (not reimplemented) via the toolchain's aie.iron-importable python. Values are pure architecture arithmetic (context/stride from stage_shapes.py's DECODER_RATES plus kernel sizes), not model weight content.",
+  "CTX_HEAD": 6,
+  "CTX_TAIL": 6,
+  "STRIDES": {
+    "1": 8,
+    "2": 8,
+    "3": 4,
+    "4": 2
+  },
+  "RES_CTX_PER_STAGE": 78,
+  "UP_CTX_PER_STAGE": 2,
+  "cases": [
+    {
+      "latent_start": 0,
+      "latent_len": 1760,
+      "audio_start": 10100,
+      "audio_len": 891020
+    },
+    {
+      "latent_start": 0,
+      "latent_len": 3000,
+      "audio_start": 10100,
+      "audio_len": 1525900
+    },
+    {
+      "latent_start": 0,
+      "latent_len": 112640,
+      "audio_start": 10100,
+      "audio_len": 57661580
+    },
+    {
+      "latent_start": 5,
+      "latent_len": 4096,
+      "audio_start": 12660,
+      "audio_len": 2087052
+    },
+    {
+      "latent_start": 100,
+      "latent_len": 8192,
+      "audio_start": 61300,
+      "audio_len": 4184204
+    }
+  ]
+}
