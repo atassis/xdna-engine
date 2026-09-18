@@ -891,6 +891,9 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
     # D-sized (decode's own op, gen_llm_decode.py:1643) and runs once per row below.
     op_lscale = (ElementwiseMul(size=D, tile_size=D // cols, num_aie_columns=cols, context=ctx)
                  if sp.layer_scalar else None)
+    # TIMING PROBE (see commit): PREFILL_NO_LAYER_SCALAR=1 drops the per-row dispatches below to
+    # price their count. Changes numerics -- never for shipping.
+    no_layer_scalar = os.environ.get("PREFILL_NO_LAYER_SCALAR", "0") == "1"
     # ---- buffers ----
     # Every prefill intermediate is ONE buffer shared by all layers: the sequence runs layers one
     # at a time, so nothing outlives its layer. Decode declares them per layer; at M=256 that
@@ -1333,10 +1336,15 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
             (op_add, "xs", "d", dst),
         ]
         if op_lscale is not None:
-            # Last statement of the layer, after both residual adds -- in place on `dst`, against
-            # decode's shared `p+"ls"` (same arena slot, same D-wide value every row).
-            rl += [(op_lscale, f"{dst}[{r * D * 2}:{(r + 1) * D * 2}]", p + "ls",
-                    f"{dst}[{r * D * 2}:{(r + 1) * D * 2}]") for r in range(M)]
+            # `L{l}_ls` is named scratch in decode's own meta.json (a per-layer weight, not a
+            # shared intermediate), so scratch_order needs it declared even when the probe below
+            # is off -- otherwise every later shared buffer shifts off decode's offsets.
+            bufsz[p + "ls"] = D * 2
+            if not no_layer_scalar:
+                # Last statement of the layer, after both residual adds -- in place on `dst`,
+                # against decode's shared `p+"ls"` (same arena slot, same D-wide value every row).
+                rl += [(op_lscale, f"{dst}[{r * D * 2}:{(r + 1) * D * 2}]", p + "ls",
+                        f"{dst}[{r * D * 2}:{(r + 1) * D * 2}]") for r in range(M)]
         cache_names += [p + "kc", p + "vc"]
         ring_layers.append(g.ring)
 
