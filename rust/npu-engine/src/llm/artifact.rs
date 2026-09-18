@@ -183,7 +183,12 @@ pub struct LlmArtifact {
     /// `kv_offs` at `capacity = max_seq` paired with the single `sm_mask` -- every artifact built
     /// before SLIDING_KV_CIRCULAR existed keeps loading, and dispatching through this list is then
     /// byte-identical to today's `kv_offs`/`sm_mask` writes (`pos % max_seq == pos`).
-    pub kv_windows: Vec<(ScratchpadParam, usize, usize, ScratchpadParam)>,
+    /// `(kv_param, head_dim, capacity, mask_param, kv_block, kv_heads)` per geometry. The last
+    /// two used to be taken from the build-wide `dims.kv_block` / `dims.kv_heads`, which is exact
+    /// only while every geometry shares them -- under `KV_ALLOC` a global geometry blocks at its
+    /// own `rows_per_chunk` over a capacity wider than the window, and a circular sliding one does
+    /// not, so one build carries two of each.
+    pub kv_windows: Vec<(ScratchpadParam, usize, usize, ScratchpadParam, usize, usize)>,
     /// The scalar causal-width parameter. Required on a decode artifact. `None` on every prefill
     /// artifact the current generator emits, in BOTH arms and for two different reasons: the
     /// causal one masks with [`Self::mask_widths`] instead, and the non-causal control masks
@@ -666,13 +671,35 @@ impl LlmArtifact {
                     let mask_nm = e.get("mask_param").and_then(|v| v.as_str()).ok_or_else(|| {
                         ctx(format!("scratchpad.kv_windows entry `{kv_nm}` missing string `mask_param`"))
                     })?;
-                    if capacity == 0 || capacity > max_seq {
+                    // A geometry's own block and kv-head count, defaulting to the build-wide
+                    // values so every artifact emitted before they existed reads unchanged.
+                    // Default `min(kv_block, capacity)`, not the bare build-wide block: a
+                    // NARROWED geometry's capacity can be smaller than it, and the generator
+                    // already gives such a geometry its own flat block by the same `min(T, w)`.
+                    // Defaulting to the bare value rejects every pre-existing circular artifact.
+                    let kv_block_g = e.get("kv_block").and_then(|v| v.as_u64())
+                        .map(|v| v as usize).unwrap_or_else(|| kv_block.min(capacity));
+                    let kv_heads_g = e.get("kv_heads").and_then(|v| v.as_u64())
+                        .map(|v| v as usize).unwrap_or(kv_heads);
+                    // NOT bounded by dims.S: `capacity` is the ALLOCATED extent and `dims.S` is
+                    // the window. They coincide on every arm without KV_ALLOC, and the whole point
+                    // of KV_ALLOC is that a geometry's capacity exceeds its window -- so the old
+                    // `capacity > max_seq` rejection refused exactly the artifacts this field was
+                    // added to describe. What must hold is that the block divides the capacity.
+                    if capacity == 0 {
                         return Err(ctx(format!(
                             "scratchpad.kv_windows entry `{kv_nm}` window={capacity} is not a \
-                             capacity inside dims.S = {max_seq}"
+                             positive capacity"
                         )));
                     }
-                    out.push((read_param(kv_nm)?, hd, capacity, read_param(mask_nm)?));
+                    if kv_block_g == 0 || capacity % kv_block_g != 0 {
+                        return Err(ctx(format!(
+                            "scratchpad.kv_windows entry `{kv_nm}`: capacity={capacity} is not a \
+                             whole number of blocks of kv_block={kv_block_g}"
+                        )));
+                    }
+                    out.push((read_param(kv_nm)?, hd, capacity, read_param(mask_nm)?,
+                              kv_block_g, kv_heads_g));
                 }
                 out
             }
@@ -682,7 +709,9 @@ impl LlmArtifact {
             // degrades to empty rather than erroring, and `NpuPrefill::prime` reads an empty list
             // as "one flat slot, full capacity" exactly as those artifacts were built.
             _ => match sm_mask {
-                Some(sm) => kv_offs.iter().map(|&(p, hd)| (p, hd, max_seq, sm)).collect(),
+                Some(sm) => kv_offs.iter()
+                    .map(|&(p, hd)| (p, hd, max_seq, sm, kv_block.min(max_seq), kv_heads))
+                    .collect(),
                 None => Vec::new(),
             },
         };
@@ -1394,14 +1423,14 @@ impl LlmArtifact {
         // masks with `mask_widths`, never a scratchpad `sm_mask`, and an empty `sm_mask` is what
         // makes `kv_windows` fall back to empty at load (see the loader). So a decode with any
         // narrowed geometry can never pair with a prefill that has no way to say so.
-        for &(_, head_dim, capacity, _) in &self.kv_windows {
+        for &(_, head_dim, capacity, _, _, _) in &self.kv_windows {
             if capacity >= self.max_seq {
                 continue;
             }
             let matched = prefill
                 .kv_windows
                 .iter()
-                .any(|&(_, hd, cap, _)| hd == head_dim && cap == capacity);
+                .any(|&(_, hd, cap, _, _, _)| hd == head_dim && cap == capacity);
             if matched {
                 continue;
             }

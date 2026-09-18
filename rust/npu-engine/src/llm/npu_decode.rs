@@ -226,11 +226,11 @@ fn window_len(pos: usize, granule: usize) -> usize {
 /// Split out for the same reason `bucket_index`/`window_len` are: this is the part that can be
 /// checked without a device.
 fn mask_writes(
-    kv_windows: &[(ScratchpadParam, usize, usize, ScratchpadParam)], pos: usize,
+    kv_windows: &[(ScratchpadParam, usize, usize, ScratchpadParam, usize, usize)], pos: usize,
 ) -> Vec<(ScratchpadParam, usize)> {
     let mut seen = Vec::new();
     let mut out = Vec::new();
-    for &(_, _, capacity, mask) in kv_windows {
+    for &(_, _, capacity, mask, _, _) in kv_windows {
         if seen.contains(&mask.byte_offset) {
             continue;
         }
@@ -710,9 +710,14 @@ impl DecodeStep for NpuDecodeStep {
         // SLIDING_KV_CIRCULAR), global 512 (at the full `max_seq`) -- so the same logical
         // position is two different byte offsets, two different masks, and one slot/mask pair
         // cannot carry both.
-        for (slot, head_dim, capacity, _) in &bucket.artifact.kv_windows {
+        for (slot, head_dim, capacity, _, kv_block, kv_heads) in &bucket.artifact.kv_windows {
+            // EVERY axis from the geometry's own entry. The build-wide `artifact.kv_block` and
+            // `artifact.kv_heads` are exact only while all geometries share them; under KV_ALLOC
+            // a global geometry blocks at its own rows_per_chunk over a wider capacity while a
+            // circular sliding one stays flat at its window, so one artifact carries two of each
+            // and reading the build-wide pair addresses the global cache at the wrong stride.
             let kv_val = crate::llm::kv_layout::kv_off_circular(
-                pos, *capacity, bucket.artifact.kv_block, *head_dim, bucket.artifact.kv_heads,
+                pos, *capacity, *kv_block, *head_dim, *kv_heads,
             ) as u32;
             bucket.res
                 .write_scratchpad(slot.byte_offset, &kv_val.to_le_bytes())
@@ -787,8 +792,8 @@ mod tests {
     fn a_mask_slot_shared_by_two_geometries_is_written_once() {
         let shared = param(4);
         let kv_windows = vec![
-            (param(0), 256usize, 2048usize, shared),
-            (param(8), 512usize, 2048usize, shared),
+            (param(0), 256usize, 2048usize, shared, 2048, 8),
+            (param(8), 512usize, 2048usize, shared, 2048, 8),
         ];
         let writes = mask_writes(&kv_windows, 10);
         assert_eq!(writes, vec![(shared, 11)]);
@@ -801,8 +806,8 @@ mod tests {
         let sliding_mask = param(4);
         let global_mask = param(12);
         let kv_windows = vec![
-            (param(0), 256usize, 1024usize, sliding_mask), // narrowed
-            (param(8), 512usize, 2048usize, global_mask),  // full S
+            (param(0), 256usize, 1024usize, sliding_mask, 1024, 8), // narrowed
+            (param(8), 512usize, 2048usize, global_mask, 2048, 8),  // full S
         ];
         assert_eq!(
             mask_writes(&kv_windows, 1023),

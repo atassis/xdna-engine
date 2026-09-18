@@ -2105,7 +2105,11 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         # host's pre-list fallback reads that spelling.
         slot = "kv_off" if not kv_slots else f"kv_off{len(kv_slots)}"
         kv_slots.append((slot, hd))
-        geom_slots.append((slot, hd, w, mask_slot))
+        # CAPACITY, not window -- the host wraps `pos % capacity` and reads the cache at
+        # `kv_block`, and under KV_ALLOC a global geometry's capacity exceeds its window while a
+        # circular sliding one's does not. Both are per geometry; emitting `w` here was the same
+        # confusion the buffer sizing carried, one layer further out (at the host boundary).
+        geom_slots.append((slot, hd, KVA_g, mask_slot, T_g, hkv))
         # The per-head stride comes from the cache's OWN layout, so K and V each write the one
         # they are read through. `KVLayout(S=w, T=w).head_stride` is `w*hd`, the literal this
         # replaces, so every flat geometry is unchanged.
@@ -3085,7 +3089,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         # would silently skip a slot that SHOULD have been there.
         seg_hds = {sp.head_dim_for(l) for l in range(la, lb)}
         seg_kv_slots = [(n, hd) for n, hd in kv_slots if hd in seg_hds]
-        seg_geom_slots = [(n, hd, ww, mn) for n, hd, ww, mn in geom_slots if hd in seg_hds]
+        seg_geom_slots = [t for t in geom_slots if t[1] in seg_hds]
         # Same reasoning as seg_kv_slots, one axis over: a segment whose layers are all one
         # geometry has no reason to declare the OTHER geometry's mask slot.
         seg_ws = {sp.sliding_window if (SLIDING_KV_CIRCULAR and sp.sliding_window is not None
@@ -3254,8 +3258,9 @@ def main():
                        # at its declaration. Not consumed by the Rust host as of 2026-09-14 (see
                        # SLIDING_KV_CIRCULAR's own doc); present so a future consumer has the
                        # pairing without re-deriving it, and so this artifact is self-describing.
-                       "kv_windows": [{"kv_param": n, "head_dim": hd, "window": ww,
-                                      "mask_param": mn} for n, hd, ww, mn in md["geom_slots"]],
+                       "kv_windows": [{"kv_param": n, "head_dim": hd, "window": cap,
+                                       "mask_param": mn, "kv_block": blk, "kv_heads": khv}
+                                      for n, hd, cap, mn, blk, khv in md["geom_slots"]],
                        "head_dim": HD, "kv_heads": Hkv,
                        **({"window_param": "attn_window"} if dynamic_window else {})},
         "dims": {"layers": NL, "d_model": D, "q_heads": Hq, "kv_heads": Hkv, "head_dim": HD,

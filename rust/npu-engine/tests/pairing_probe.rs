@@ -21,7 +21,7 @@ fn report_pairing() {
     let da = LlmArtifact::load(Path::new(&d)).expect("load decode");
     let pa = LlmArtifact::load_prefill(Path::new(&p)).expect("load prefill");
     let wins = |a: &LlmArtifact| {
-        a.kv_windows.iter().map(|&(_, hd, c, _)| (hd, c)).collect::<Vec<_>>()
+        a.kv_windows.iter().map(|&(_, hd, c, _, _, _)| (hd, c)).collect::<Vec<_>>()
     };
     eprintln!("decode  L={} S={} kv_block={} kv_windows={:?}",
               da.n_layers, da.max_seq, da.kv_block, wins(&da));
@@ -34,7 +34,7 @@ fn report_pairing() {
             Err(e) => eprintln!("{what}: FAIL -- {e}"),
         }
     }
-    let caps: Vec<usize> = pa.kv_windows.iter().map(|&(_, _, c, _)| c).collect();
+    let caps: Vec<usize> = pa.kv_windows.iter().map(|&(_, _, c, _, _, _)| c).collect();
     let ring_caps: Vec<usize> =
         pa.mask_ring.as_ref().map(|mr| mr.geoms.iter().map(|&(_, c)| c).collect())
             .unwrap_or_default();

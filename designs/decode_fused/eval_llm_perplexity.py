@@ -147,9 +147,10 @@ def main():
     # geometries sharing one window collapse to its single entry while kv_slots still has two; see
     # gen_llm_decode.py's geom_slots comment). Falls back to the pre-existing single-slot form when
     # the build predates geom_slots (older artifacts, or SLIDING_KV_CIRCULAR-unaware paths).
-    geom_slots = md.get("geom_slots") or [("kv_off", HD, S, "sm_mask")]
-    geoms = [(nm, KVLayout(Hkv=sp.n_kv_heads, S=ww, HD=hd, T=min(md["T"], ww)), ww, mn)
-             for nm, hd, ww, mn in geom_slots]
+    geom_slots = md.get("geom_slots") or [("kv_off", HD, S, "sm_mask", min(md["T"], S), sp.n_kv_heads)]
+    # Per-geometry capacity/block/kv-heads -- see bench_llm_decode.py's note.
+    geoms = [(nm, KVLayout(Hkv=khv, S=cap, HD=hd, T=blk), cap, mn)
+             for nm, hd, cap, mn, blk, khv in geom_slots]
 
     nll, t0, top1_hits, n_sat = [], time.perf_counter(), 0, 0
     for pos in range(n):
