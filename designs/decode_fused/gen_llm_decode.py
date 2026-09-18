@@ -1207,6 +1207,11 @@ def scores_block_size(hd, hkv, w, kva, num_batches, batch_group, flat):
     """
     if not (GROUPED_K and SCORES_KV_BLOCK):
         return flat
+    # K and V share one `kv_off` slot and one host write, so at hkv > 1 they must be the SAME
+    # block -- see append_layouts_coincide. Decline here rather than pick a divergent T and let
+    # construction raise: a chooser that returns an unbuildable answer is not a chooser.
+    if hkv > 1 and flat != w:
+        return flat
     Tc = derive_block_size(hd, hkv, S=kva, n_cols=COLS,
                            addr_gran_elems=precision.kv_addr_gran_elems(PRECISION_PLAN))
     # Both divisibility rules the blocked GEMV asserts, checked HERE so a geometry that
@@ -1926,7 +1931,11 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         # This narrows the sliding window, so it is a QUALITY change and must not be defaulted on.
         if not is_global_geom and os.environ.get("SLIDING_WINDOW_OVERRIDE"):
             w = int(os.environ["SLIDING_WINDOW_OVERRIDE"])
-        KVA_g = KV_ALLOC or w
+        # KV_ALLOC widens the CAPACITY of a geometry whose window can grow; a CIRCULAR sliding
+        # geometry's window never grows -- it wraps at `w` by construction -- so its capacity IS
+        # `w` and widening it would allocate 256x the cache those layers can ever address. `w != S`
+        # is exactly the circular condition (see `w`'s own derivation above).
+        KVA_g = w if w != S else (KV_ALLOC or w)
         # T (the KVLayout block size) is derived once, globally, against S -- today always S
         # itself (flat, "one block"). A geometry whose own capacity is w < T needs its OWN flat
         # block size, or the GEMV/TMatVec block_size%alloc_M==0 check fails (T does not divide a
@@ -1940,6 +1949,13 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         # asks gemv for `split_run` rather than re-deriving the 10-bit field. At KVA_g == w the
         # GEMV is unblocked and none of these bind, so this loop cannot fire on a shipped arm.
         if KVA_g != w:
+            # tmatvec composes m_chunk with block_size only when one block is one K-chunk, so a
+            # CHUNKED ctx over a wider capacity has exactly one legal block size: its own
+            # rows_per_chunk. Anything else re-raises the four-dims refusal from inside the
+            # operator, which is a worse place to learn it.
+            _rpc_mc = tmv_rpc.get(hd)
+            if _rpc_mc is not None and _rpc_mc[1] is not None:
+                T_g = _rpc_mc[0]
             while T_g > 1 and ((w // COLS) % T_g or KVA_g % T_g
                                or gemv_split_run(T_g * hd) is None):
                 T_g //= 2
@@ -2132,8 +2148,15 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         # so "read/write a narrower window of a wider-strided buffer" is new IRON capability, not a
         # generator change. Bucketing S UNIFORMLY (this build already takes it as `max_seq`) is the
         # route that needs none.
-        op_rep_k = Repeat(rows=hkv, cols=w * hd, repeat=gqa, transfer_size=hd, context=ctx)
-        op_rep_v = Repeat(rows=hkv, cols=w * hd, repeat=gqa, transfer_size=hd, context=ctx)
+        # Constructed only when the runlist will use them -- the same predicate its two
+        # `*([] if ... else [...])` sites spell. Under KV_ALLOC these size by the WINDOW while
+        # every live consumer sizes by the CAPACITY, and a constructed-but-dead op still reaches
+        # the arena's argument collection, so it wins the buffer length and the append then
+        # declares 32x what the arena provides.
+        op_rep_k = (Repeat(rows=hkv, cols=w * hd, repeat=gqa, transfer_size=hd, context=ctx)
+                    if not GROUPED_K else None)
+        op_rep_v = (Repeat(rows=hkv, cols=w * hd, repeat=gqa, transfer_size=hd, context=ctx)
+                    if not (GROUPED_V or tmv_rpc.get(hd) is not None) else None)
         # Built from the SAME (scores_nb, scores_bg, T_k) the block-size gate was answered on --
         # see their derivation above.
         op_scores = gemv(w, hd, ctx, num_batches=scores_nb, batch_group=scores_bg,
@@ -2203,6 +2226,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
             op_ctx=op_ctx, op_v_norm=op_v_norm, has_v=has_v, kv_parts=kv_parts,
             uses_tmv_ctx=uses_tmv, scores_groups=scores_groups, scores_block=T_k,
             op_softmax=op_softmax, op_scale=op_scale, mask_slot=mask_slot, window=w,
+            capacity=KVA_g, kv_block=T_g,
             op_attn_block=op_attn_block, circular=(w != S))
         _attn_cache[(hd, hkv, has_v)] = g
         return g
@@ -2677,11 +2701,14 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                     np.concatenate(parts, axis=0), g.op_attn_block).reshape(-1)
             else:
                 weights[p + "Wqkv"] = np.concatenate(qkv_parts)
-        # Size is layout-independent (T < S rearranges the same elements), but it is
-        # PER GEOMETRY: Gemma-4 global layers are hkv=1/hd=512 against sliding 8/256, and under
-        # SLIDING_KV_CIRCULAR the capacity itself (g.window) is per geometry too, not just the
-        # shape -- g.window degrades to S when the flag is off or this geometry is global.
-        _kvl = KVLayout(Hkv=g.hkv, S=g.window, HD=g.hd, T=min(T, g.window))
+        # Size is layout-independent (T < S rearranges the same elements) but PER GEOMETRY, and
+        # the axis is the CAPACITY, not the window: Gemma-4's global layers are hkv=1/hd=512
+        # against sliding 8/256, and under KV_ALLOC a global geometry's capacity exceeds its
+        # window while a CIRCULAR sliding one's does not. Both come from the geometry itself --
+        # `g.capacity`/`g.kv_block` are the values its operators were built with, not a second
+        # derivation of them, which is how this line used to size a global cache at `g.window`
+        # and hand the append a buffer a quarter the size it declares.
+        _kvl = KVLayout(Hkv=g.hkv, S=g.capacity, HD=g.hd, T=g.kv_block)
         weights[p + "kc"] = np.zeros(_kvl.total_elems, BF16)
         weights[p + "vc"] = np.zeros(_kvl.total_elems, BF16)
         cache_names += [p + "kc", p + "vc"]
@@ -2725,7 +2752,12 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         # 28 layers that is 672 MiB of arena that nothing reads -- 33.8% of the 1.99 GiB scratch,
         # and it reconciles exactly: 1.9898 GiB total minus 1.32904 GiB of named buffers = 0.661.
         bufsz.update({
-            p + "kc": g.hkv * g.window * g.hd * 2, p + "vc": g.hkv * g.window * g.hd * 2,
+            # CAPACITY, not window -- the same axis `weights[p+"kc"]` is sized on. These two
+            # disagreed under KV_ALLOC: this said window and every operator said capacity, and
+            # because bufsz is EXPLICIT it wins the arena layout, so the append then declared 32x
+            # what the arena provided. One geometry owns both numbers; read them off it.
+            p + "kc": g.hkv * g.capacity * g.hd * 2,
+            p + "vc": g.hkv * g.capacity * g.hd * 2,
             p + "sc": Hq * g.window * 2, p + "sw": Hq * g.window * 2,
             p + "cx": g.qd * 2,
             p + "g": FF * 2, p + "u": FF * 2, p + "gh": FF * 2, p + "d": D * 2,
