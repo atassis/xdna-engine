@@ -282,9 +282,11 @@ name = "gemma4-12b"
 # LIMITS, read them before assuming this covers a long prompt:
 #   - M=64. The batch is 64 tokens; a prompt is chunked and the tail padded. M=256 is the design
 #     point and is UNBUILT here -- at M=256 the graph is 39.94 GiB and needs its own split sizing.
-#   - Batched prefill covers positions [0, 1024) only, not the full S=6912: past the narrowest
-#     geometry's capacity its circular cache holds a wrapped interval that the suffix mask cannot
-#     express. The host stops there (npu_prefill.rs::batchable_window) and finishes stepwise.
+#   - RETIRED 2026-09-18 by the ring arm below. Batched prefill now spans the prompt past 1024:
+#     mask_hole_bf16 masks the wrapped interval per row instead of by a suffix width. A chunk
+#     needing >= 2 pad rows past a capacity is still skipped and its tail finishes stepwise
+#     (npu_prefill.rs::ring_tail_end), so a prompt that is not a whole number of 64-token chunks
+#     past the wrap still pays a short per-token tail.
 #   - S=6912. This artifact does NOT serve `gemma4-12b-256k`, whose decode is a different S and a
 #     different arena. A 256k prefill is a separate build that does not exist.
 #   - Rollback: delete the `prefill =` line and reinstall. Decode is untouched either way.
@@ -330,7 +332,31 @@ name = "gemma4-12b"
 
 [artifacts]
 decode = "artifacts/gemma4-12b/decode_s6912_l48_are_wgm_pwm_rr"
-prefill = "artifacts/gemma4-12b/prefill_m64_s6912_l48_seg4"
+#
+# DEFAULT SINCE 2026-09-18: `prefill_m64_s6912_l48_seg4_ring`, the same recipe plus
+# PREFILL_SLIDING_RING=1, which batches prefill past the 1024 sliding-window capacity.
+#   build  PREFILL_SLIDING_RING=1 PREFILL_SEGMENTS=4 IRON=$WS/wt-iron-integ SPEC=gemma4-12b \
+#            NO_GOLDEN=1 WEIGHTS=/nonexistent QUANT_WEIGHTS=$A/weights_int4g32qat_hf \
+#            MERGE_WEIGHT_GEMVS=1 POINTWISE_MODES=1 COLLAPSE_MERGED_CONFIGURES=1 \
+#            DECODE_META=$PWD/artifacts/gemma4-12b/decode_s6912_l48_are_wgm_pwm_rr/meta.json \
+#            bash scripts/build_prefill.sh 48 64 6912 $A/prefill_m64_s6912_l48_seg4_ring
+#
+# GATED on device 2026-09-18, seven prompt lengths, both arms:
+#   - priming: every primed_batched equals ring_tail_end(0, P-1, 64, 1024), recomputed independently
+#     -- 1089->1088, 2113->2112 (two wraps past the capacity; the pre-ring path caps at 1024).
+#   - tokens, teacher-forced so every step is independently comparable: top-1 53/56, top-5 56/56.
+#     P=1089/1100/2113 are bit-identical to per-token prefill on every step. P=64 and P=256
+#     reproduce THIS FILE's recorded numbers for the non-ring arm exactly (7/8 diverging at step 0;
+#     8/8), which is the evidence the ring changed nothing where it should not have.
+#   - timing, arms alternated round by round, spread <=0.5%/cell: 8.90x at P=256, 8.26x at P=1100,
+#     8.34x at P=2200. A 2200-token prompt goes ~330 s -> ~87 s.
+#
+# NOT MEASURED: per-segment dispatch against the 2 s TDR watchdog (timeout_in_sec=2, aie2_tdr.c:12).
+# time_prefill.sh reports a dispatch COUNT, not a per-dispatch duration. Zero trips in ~20 device
+# runs is why this ships; it is NOT a margin, so do not size a larger M against it.
+#
+# Rollback: point `prefill =` back at `prefill_m64_s6912_l48_seg4` and reinstall. Decode untouched.
+prefill = "artifacts/gemma4-12b/prefill_m64_s6912_l48_seg4_ring"
 weights = "artifacts/gemma4-12b/weights_int4g32sbf16_planar_qat_rg"
 tokenizer_dir = "artifacts/gemma4-12b/tokenizer"
 
