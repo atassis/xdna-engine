@@ -85,6 +85,54 @@ def _shim_digest(shim):
     return h.hexdigest()[:16]
 
 
+def _install_recompile_guard():
+    """Turn a silent recompile-on-repeat-call into a loud one.
+
+    The failure is not that `use_cache` is False, it is that nothing says so at the call site.
+    A design built with use_cache=False recompiles through aiecc on EVERY call, ~150 ms each,
+    so a `time.perf_counter()` wrapped around that call reports "device time" that is almost
+    entirely the compiler. Each time this has bitten, it was found by a human noticing an
+    implausible number, not by the harness.
+
+    Patching `CallableDesign._compile_and_build_kernel` catches every iron.jit-built design,
+    whether it came through bricklib or a probe's own iron.jit call. `_create_function_cache_key`
+    hashes tensor shape and dtype rather than object identity, so a genuine repeat call -- same
+    design, same shapes, fresh tensors, exactly what a timing loop does -- collapses onto one key.
+    A SECOND compile under one key can only happen with use_cache=False, since a cache hit would
+    have skipped this method entirely; that makes it the only trigger, and it stays quiet for
+    first-time compiles of many distinct shapes and for @iron.jit's CompileTime specialization,
+    where each value is a different and correctly-uncached key.
+
+    Best effort: if the toolchain's internals move, this degrades to a no-op.
+    """
+    try:
+        cls = iron.CallableDesign
+        orig = cls._compile_and_build_kernel
+    except AttributeError:
+        return
+    seen = {}
+
+    def _guarded(self, compilable, cache_key, trace_config):
+        key = (id(self), cache_key)
+        seen[key] = seen.get(key, 0) + 1
+        if seen[key] == 2:
+            import sys
+            name = getattr(compilable, "generator_name", None) or repr(compilable)
+            print(
+                f"[bricklib] WARNING: design {name!r} is recompiling through aiecc on a REPEAT "
+                f"call (use_cache=False on this design) -- ~150 ms of aiecc per call, not device "
+                f"time. Any wall-clock timer around this call site is measuring the compiler. If "
+                f"nothing changes between calls, build with use_cache=True; if the timer is "
+                f"deliberate, isolate CachedXRTRuntime.run instead of wrapping the call.",
+                file=sys.stderr, flush=True)
+        return orig(self, compilable, cache_key, trace_config)
+
+    cls._compile_and_build_kernel = _guarded
+
+
+_install_recompile_guard()
+
+
 def _aie_api_include():
     """Resolve the aie_api include dir and return it as a -I flag, or nothing if the
     active toolchain instance already exposes the headers.
