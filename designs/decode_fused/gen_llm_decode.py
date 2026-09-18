@@ -106,7 +106,8 @@ from iron.common import AIEContext  # noqa: E402
 from iron.common.kv_layout import KVLayout, derive_block_size  # noqa: E402
 from elf_dispatch_compat import OperatorSequence, load_elf  # noqa: E402
 from iron.operators.gemv.op import GEMV  # noqa: E402
-from iron.operators.gemv.design import MAX_GROUP_REUSE, group_reuse_n_vec  # noqa: E402
+from iron.operators.gemv.design import (MAX_GROUP_REUSE, group_reuse_n_vec,  # noqa: E402
+                                        split_run as gemv_split_run)
 # The packer MOVED in IRON 6a347dc ("the weight packer has two operators now, move it to
 # iron/common"), and the workspace carries trees on both sides of it: integration-stack has only
 # the new path, the vendored designs/iron_operators only the old. Try both and, if neither is
@@ -1187,8 +1188,15 @@ def check_arena_offsets_are_addressable(seq, names):
 # rows_per_chunk reaches), so `_tmv_chunked` is non-empty, so the whole build stays flat --
 # and its scores GEMV then re-delivers the K cache 4x per invocation because the flat A run
 # has no wrap-legal split at S=262144.
-def scores_block_size(hd, hkv, w, kva, num_batches, batch_group):
-    """`block_size` for THIS geometry's scores GEMV, or `w` (flat, today's behaviour).
+def scores_block_size(hd, hkv, w, kva, num_batches, batch_group, flat):
+    """`block_size` for THIS geometry's scores GEMV, or `flat` (the V-side block) when blocking
+    buys nothing.
+
+    `flat` is the geometry's SHARED block `T_g`, not the window: the two coincide on every arm
+    that ships (KVA_g == w makes T_g == w), and diverge only under KV_ALLOC, where the V side
+    must shrink to divide the window's per-column share while the K side has no such constraint.
+    Returning `w` there would hand the two appends different layouts for no reason and trip
+    append_layouts_coincide.
 
     Blocked ONLY where blocking wins a delivery, which is asked of the operator rather than
     re-derived here: `group_reuse_n_vec` is gemv/design.py's own coalescing verdict, and the
@@ -1198,18 +1206,18 @@ def scores_block_size(hd, hkv, w, kva, num_batches, batch_group):
     shipped arms' ELFs are untouched by this being on.
     """
     if not (GROUPED_K and SCORES_KV_BLOCK):
-        return w
+        return flat
     Tc = derive_block_size(hd, hkv, S=kva, n_cols=COLS,
                            addr_gran_elems=precision.kv_addr_gran_elems(PRECISION_PLAN))
     # Both divisibility rules the blocked GEMV asserts, checked HERE so a geometry that
     # cannot take the tiling falls back to flat instead of failing the build: `alloc_M % BLK`
     # (my_matvec) and `(M // cols) % BLK` (the blocked-tap assert).
     if Tc >= w or w % Tc or kva % Tc or (w // COLS) % Tc:
-        return w
+        return flat
     alloc = None if kva == w else kva
-    flat = group_reuse_n_vec(w, COLS, num_batches, batch_group, hd, alloc, None)
+    flat_nvec = group_reuse_n_vec(w, COLS, num_batches, batch_group, hd, alloc, None)
     blocked = group_reuse_n_vec(w, COLS, num_batches, batch_group, hd, alloc, Tc)
-    return Tc if blocked > flat else w
+    return Tc if blocked > flat_nvec else flat
 
 
 def append_layouts_coincide(hkv, hd, w, T_k, T_v):
@@ -1919,6 +1927,16 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         # smaller alloc). Keeping the same "one block" convention this build already uses for S
         # means T_g is simply w, not a blocking scheme of its own.
         T_g = min(T, w)
+        # A WINDOWED geometry over a WIDER capacity makes the GEMV genuinely
+        # blocked (alloc_M=KVA_g != block_size), and the blocked tap then also needs the block to
+        # divide each COLUMN'S SHARE OF THE WINDOW -- `(M//cols) % _BLK` in gemv/design.py -- not
+        # just the capacity, AND one block's run must have a wrap-legal split, which is why this
+        # asks gemv for `split_run` rather than re-deriving the 10-bit field. At KVA_g == w the
+        # GEMV is unblocked and none of these bind, so this loop cannot fire on a shipped arm.
+        if KVA_g != w:
+            while T_g > 1 and ((w // COLS) % T_g or KVA_g % T_g
+                               or gemv_split_run(T_g * hd) is None):
+                T_g //= 2
         # SCORES BATCHING, derived here because BOTH the block-size gate below and the op itself
         # must be built from the same pair. The gate asks the operator what n_vec this shape gets,
         # and n_vec is a function of (num_batches, batch_group) -- computing it from `Hq, gqa`
@@ -1953,7 +1971,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         # kv_layout, the host's kv_off and the prefill pairing all describe and it is unchanged;
         # this is a re-TAPING of the same bytes, not a relayout -- append_layouts_coincide below
         # is what holds that true rather than this comment.
-        T_k = scores_block_size(hd, hkv, w, KVA_g, scores_nb, scores_bg)
+        T_k = scores_block_size(hd, hkv, w, KVA_g, scores_nb, scores_bg, T_g)
         if T_k != T_g:
             if not append_layouts_coincide(hkv, hd, w, T_k, T_g):
                 raise NotImplementedError(
@@ -2070,12 +2088,17 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         # they are read through. `KVLayout(S=w, T=w).head_stride` is `w*hd`, the literal this
         # replaces, so every flat geometry is unchanged.
         def append_op(T_blk):
+            # Size and stride from the CAPACITY, not the window. kc/vc are
+            # allocated at KVA_g (bufsz uses kv_layout.total_elems); only this declaration said
+            # `w`, which is why KV_ALLOC>w made one operator declare L0_kc at hkv*w*hd and the
+            # scores GEMV declare it at hkv*KVA*hd. At KVA_g == w both spellings coincide.
+            kvl = KVLayout(Hkv=hkv, S=KVA_g, HD=hd, T=T_blk)
             return StridedCopy(
                 input_sizes=(hkv, hd), input_strides=(hd, 1), input_offset=0,
                 output_sizes=(1, hkv, hd), output_offset=0,
-                output_strides=(0, KVLayout(Hkv=hkv, S=w, HD=hd, T=T_blk).head_stride, 1),
-                input_buffer_size=hkv * hd, output_buffer_size=hkv * w * hd, num_aie_channels=1,
-                output_offset_parameter=slot, context=ctx)
+                output_strides=(0, kvl.head_stride, 1),
+                input_buffer_size=hkv * hd, output_buffer_size=kvl.total_elems,
+                num_aie_channels=1, output_offset_parameter=slot, context=ctx)
         op_sck = append_op(T_k)
         # V stays [S][hd]. A transposed append would delete op_trv, but a SINGLE-token transposed
         # write is 1024 isolated bf16 elements (h*hd*S + d*S + p) and the shim address generator
