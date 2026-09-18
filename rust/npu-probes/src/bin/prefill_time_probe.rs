@@ -52,7 +52,17 @@ fn main() {
     let batched = step.prefill_batch();
     let arm = if batched.is_some() { "batched" } else { "pertok" };
     println!("arm={arm}  prefill_batch={batched:?}  reps={reps}");
-    println!("{:>6} {:>10} {:>12} {:>12} {:>12}", "P", "batched", "ms_median", "ms/token", "dispatches");
+    // `dispatches` used to be `primed.div_ceil(batch) + stepwise` -- a MODEL of the count printed
+    // under a header that reads as an observation, which is what a per-submission time was then
+    // divided out of. npu_xrt::dispatch_log already counts and times every blocking dispatch
+    // together, tagged by kernel (method-time-every-dispatch rule 1), so take both from it.
+    let split = std::env::var("NPU_DISPATCH_LOG").map(|v| v != "0").unwrap_or(false);
+    if !split {
+        eprintln!("[time] NPU_DISPATCH_LOG unset: dispatch count/ms columns will read 0. \
+                   Set NPU_DISPATCH_LOG=1 to measure per-submission time.");
+    }
+    println!("{:>6} {:>10} {:>12} {:>12} {:>10} {:>12} {:>12}",
+             "P", "batched", "ms_median", "ms/token", "disp_n", "disp_ms_tot", "ms/disp_max");
 
     let vocab = 151936u32;
     for &p in &lens {
@@ -64,8 +74,12 @@ fn main() {
 
         let mut ms = Vec::with_capacity(reps);
         let mut primed_n = 0usize;
+        let mut snap: Vec<(String, u32, f64)> = Vec::new();
         for _ in 0..reps {
             step.reset().expect("reset KV between reps");
+            // Zero AFTER reset: reset itself dispatches on some paths, and booking those here
+            // would inflate the prefill's own per-submission time.
+            npu_xrt::dispatch_log::reset();
             let t = Instant::now();
             let primed = step.prefill(&ids, 0).expect("prefill");
             for (i, &tok) in ids[primed..].iter().enumerate() {
@@ -73,12 +87,22 @@ fn main() {
             }
             ms.push(t.elapsed().as_secs_f64() * 1e3);
             primed_n = primed;
+            snap = npu_xrt::dispatch_log::per_kernel_snapshot();
         }
         let m = median(&mut ms);
-        let disp = match batched {
-            Some(b) => primed_n.div_ceil(b) + (p - primed_n),
-            None => p,
-        };
-        println!("{p:>6} {primed_n:>10} {m:>12.2} {:>12.3} {disp:>12}", m / p as f64);
+        let disp_n: u32 = snap.iter().map(|(_, n, _)| *n).sum();
+        let disp_ms: f64 = snap.iter().map(|(_, _, s)| *s).sum::<f64>() * 1e3;
+        // The gate is the SLOWEST submission against the 2 s TDR, not the mean -- a mean hides
+        // exactly the outlier that would trip it. Per-kernel mean is the best bound this log
+        // gives (it sums, it does not keep a max), so report it as a LOWER bound and say so.
+        let per_disp_max = snap.iter()
+            .map(|(_, n, s)| if *n > 0 { s * 1e3 / *n as f64 } else { 0.0 })
+            .fold(0.0f64, f64::max);
+        println!("{p:>6} {primed_n:>10} {m:>12.2} {:>12.3} {disp_n:>10} {disp_ms:>12.1} {per_disp_max:>12.2}",
+                 m / p as f64);
+        for (k, n, s) in &snap {
+            println!("{:>6} {:>10} {:>12} {:>12} {:>10} {:>12.1} {:>12.2}  {k}",
+                     "", "", "", "", n, s * 1e3, if *n > 0 { s * 1e3 / *n as f64 } else { 0.0 });
+        }
     }
 }
