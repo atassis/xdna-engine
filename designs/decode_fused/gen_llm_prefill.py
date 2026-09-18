@@ -711,7 +711,10 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
         is_global_geom = hd == sp.global_head_dim and hkv == sp.global_n_kv_heads
         w = (S if (is_global_geom or not sliding_kv_circular or sliding_window is None)
              else sliding_window)
-        KVA_g = kv_alloc or w
+        # `--kv-alloc` widens the CAPACITY of a geometry whose window can grow. A circular sliding
+        # geometry wraps at `w` by construction, so its capacity IS `w` -- `w != S` is exactly that
+        # condition, see `w`'s own derivation above.
+        KVA_g = (kv_alloc or w) if w == S else w
         T_g = min(kv_T, w)
         kv_slot = "kv_off" if not geom_slots else f"kv_off{len(geom_slots)}"
         geom_slots.append((kv_slot, hd, w, kv_slot))
@@ -719,6 +722,10 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
         # [K=w, N=hd] -> plain. N/K is THIS geometry's own window `w`, matching `kv_slab()`'s own
         # w-sized span -- an S-wide operand here would read past a narrowed geometry's buffer.
         kvl_g = KVLayout(Hkv=hkv, S=KVA_g, HD=hd, T=T_g)
+        # The same layout over the WINDOW. `head_span` is the extent an operand covering the
+        # window may address, so under a wider capacity it has to be asked of the window's layout:
+        # the scores/ctx operands read `w` positions, while the append writes the whole cache.
+        kvl_w = KVLayout(Hkv=hkv, S=w, HD=hd, T=T_g)
         kv_blk = (kvl_g.T, kvl_g.block_stride) if kvl_g.T != kvl_g.S else None
         op_sc = gemm_for(f"scores{sfx}", hd, w, blocking=kv_blk,
                          extra=dict(a_row_stride=qd) if seam else {})
@@ -741,14 +748,18 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
         # dimension, not a new mechanism. The SOURCE is token-major [M, hkv, hd], so the (M, hkv)
         # axes swap in the descriptor: input walks h fastest within a token, output walks m
         # fastest within a head.
-        if kvl_g.T == kvl_g.S:
+        # A batch lands inside ONE block whenever the block is a whole number of batches, and the
+        # descriptor is then the unblocked one at this geometry's own `head_stride`: chunk starts
+        # are M-aligned, so `q0%T + m < T` and the block term is constant across the batch. Only a
+        # batch SPANNING blocks needs the outer block dimension.
+        if kvl_g.T == kvl_g.S or (M <= kvl_g.T and kvl_g.T % M == 0):
             kv_in_sizes, kv_in_strides = (M, hkv, hd), (hkv * hd, hd, 1)
             kv_out_sizes, kv_out_strides = (M, hkv, hd), (hd, kvl_g.head_stride, 1)
         else:
             if M % kvl_g.T:
                 raise ValueError(
-                    f"prefill batch M={M} is not a whole number of KV blocks (T={kvl_g.T}) at "
-                    f"head_dim={hd}; the append would straddle a block boundary mid-descriptor")
+                    f"prefill batch M={M} straddles a KV block boundary (T={kvl_g.T}) at "
+                    f"head_dim={hd}: it neither divides the block nor is a whole number of them")
             nb = M // kvl_g.T
             kv_in_sizes = (nb, hkv, kvl_g.T, hd)
             kv_in_strides = (kvl_g.T * hkv * hd, hd, hkv * hd, 1)
@@ -827,7 +838,7 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
             op_add_cx = ElementwiseAdd(size=M * qd, num_aie_columns=cols, tile_size=qd // cols,
                                        context=ctx, allocation_scheme=alloc_all)
         g = SimpleNamespace(hd=hd, hkv=hkv, has_v=has_v, qd=qd, kvd=kvd, grp=g_grp, sfx=sfx, w=w,
-                            qkv_rows=qkv_rows, blocking=blocking, kvl=kvl_g,
+                            qkv_rows=qkv_rows, blocking=blocking, kvl=kvl_g, kvl_win=kvl_w,
                             op_qn=op_qn, op_kn=op_kn, op_vn=op_vn, op_rq=op_rq, op_rk=op_rk,
                             op_gq=op_gq, op_gkv=op_gkv, op_o=op_o, op_sc=op_sc, op_cx=op_cx,
                             op_sm=op_sm_w, op_sm_head=op_sm_head_w,
@@ -991,9 +1002,11 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
     def kv_slab(buf, kv, geom):
         """A kv head's slab: from its base to the end of its LAST block, not `S*hd` -- across
         blocks the head's positions are `block_stride` apart with the other heads in between.
-        `geom.kvl` owns both numbers, and both reduce to the flat `kv*S*hd` slice at T == S."""
+        The span is the WINDOW's, which is what the scores/ctx operands address; the base is shared
+        (both layouts carry the same `T`, so the same `head_stride`). Both reduce to the flat
+        `kv*S*hd` slice at T == S."""
         base = geom.kvl.head_base(kv)
-        return f"{buf}[{base * 2}:{(base + geom.kvl.head_span) * 2}]"
+        return f"{buf}[{base * 2}:{(base + geom.kvl_win.head_span) * 2}]"
 
     def attn_norms(p, hd):
         """This layer's (input-norm, q-norm, k-norm) operands, as the decode arena actually holds
@@ -1857,7 +1870,10 @@ def main():
         if dkb and dkb != dm["dims"]["S"] and a.batch % dkb:
             raise SystemExit(f"ERROR: decode artifact kv_block={dkb} does not divide --batch "
                              f"{a.batch}; the KV append would straddle a block boundary")
-        for key, ours in (("S", a.seq), ("layers", a.layers), ("d_model", sp.d_model),
+        # `kc`/`vc` are sized by the CAPACITY, so it is the capacity -- `--kv-alloc`, which
+        # defaults to the window -- that has to equal decode's S. A narrower attention window over
+        # a wider shared cache is exactly what the flag exists for.
+        for key, ours in (("S", a.kv_alloc or a.seq), ("layers", a.layers), ("d_model", sp.d_model),
                           ("head_dim", sp.head_dim), ("kv_heads", sp.n_kv_heads)):
             theirs = dm["dims"][key]
             if key == "layers":
@@ -1866,8 +1882,10 @@ def main():
                                      f"{theirs}; the shared arena has no L{theirs}+ buffers")
                 continue
             if theirs != ours:
+                hint = (f"; pass --kv-alloc {theirs} to compute over a {a.seq}-wide window of its "
+                        f"cache" if key == "S" and not a.kv_alloc and a.seq < theirs else "")
                 raise SystemExit(f"ERROR: decode artifact {key}={theirs}, this build {ours} -- "
-                                 f"the shared cache/weight buffers would not match")
+                                 f"the shared cache/weight buffers would not match{hint}")
 
     quant_plan = build_quant_plan(a.quant_weights, a.quant_attn_o_weights)
     sp_, fused, dims = build_graph(a.spec, a.layers, a.batch, a.seq, a.causal,
