@@ -9,7 +9,7 @@ import re
 
 import pytest
 
-from llm_decode_spec import GEMMA3_270M, GEMMA4_12B, QWEN3_0_6B
+from llm_decode_spec import GEMMA3_270M, GEMMA4_12B, QWEN3_0_6B, S2_PRO_SLOW_AR, SPECS
 
 
 class TestCheckPrefillQwen:
@@ -223,3 +223,27 @@ class TestCausalWidth:
         for n_past in (1024, 1536, 2047):
             assert GEMMA4_12B.causal_width(sliding, n_past) != n_past + 1  # today is wrong
         assert GEMMA4_12B.causal_width(0, 5000) == 1024
+
+
+class TestS2ProSlowAr:
+    """S2-Pro (Fish Audio, fish_qwen3_omni) Slow-AR: d_model=2560, q_dim=4096, kv_dim=1024,
+    ffn=9728, head_dim=128 -- dimensionally a scaled-up Qwen3-0.6B in the same LlmSpec shape."""
+
+    def test_is_registered(self):
+        assert SPECS["s2-pro-slow-ar"] is S2_PRO_SLOW_AR
+
+    def test_dims_match_the_checkpoint_config(self):
+        s = S2_PRO_SLOW_AR
+        assert (s.d_model, s.n_layers, s.n_q_heads, s.n_kv_heads, s.head_dim, s.ffn, s.vocab) == \
+            (2560, 36, 32, 8, 128, 9728, 155776)
+        assert s.qk_norm is True
+        assert s.sandwich_norms is False
+        assert s.act == "silu"
+
+    def test_passes_decode_gemv_check(self):
+        S2_PRO_SLOW_AR.check(cols=8, tsi=4)
+
+    def test_passes_prefill_gemm_check(self):
+        # Unlike QWEN3_0_6B/GEMMA3_270M, every op's Nout already divides tile_n(64)*cols(8)=512
+        # cleanly for S2-Pro's dims (o=2560, gate/up=9728, down=2560) -- no override needed.
+        S2_PRO_SLOW_AR.check_prefill(256)

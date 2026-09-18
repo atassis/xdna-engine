@@ -869,7 +869,20 @@ GEMMA4_12B = LlmSpec(
     layer_scalar=True, logit_softcap=30.0, weight_prefix="model.language_model.",
 )
 
-SPECS = {s.name: s for s in (GEMMA3_270M, QWEN3_0_6B, GEMMA4_12B)}
+# S2-Pro (Fish Audio, "fish_qwen3_omni") Slow-AR -- dims verified against the checkpoint's own
+# config, not a vendor copy. Same LlmSpec shape as Qwen3-0.6B (identical head_dim, qk_norm, act,
+# norm_gain, embed_scale, single-theta RoPE), scaled up: d_model 1024->2560, n_layers 28->36,
+# n_q_heads 16->32, ffn 3072->9728, vocab 151936->155776 (tied). No sandwich norms, no dual
+# attention geometry -- unlike Gemma-4, this spec needed nothing new added to LlmSpec itself.
+S2_PRO_SLOW_AR = LlmSpec(
+    name="s2-pro-slow-ar", d_model=2560, n_layers=36, n_q_heads=32, n_kv_heads=8, head_dim=128,
+    ffn=9728, vocab=155776, eps=1e-6, act="silu", norm_gain="w",
+    sandwich_norms=False, qk_norm=True, embed_scale="none",
+    rope_theta_global=1_000_000.0, rope_theta_local=None,
+    sliding_window=None, sw_pattern=None, query_pre_attn_scalar=None,
+)
+
+SPECS = {s.name: s for s in (GEMMA3_270M, QWEN3_0_6B, GEMMA4_12B, S2_PRO_SLOW_AR)}
 
 
 def operator_rejects(op_cls, kwargs):
