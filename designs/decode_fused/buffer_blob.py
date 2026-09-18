@@ -54,12 +54,15 @@ def write_blob(path, data):
 
     A KV cache is registered in a generator's `weights` dict to get a layout entry and a
     `meta.json` name; its VALUE is filler, since the host zeroes the region at load rather
-    than trust the blob. Dense, that filler cost 35 GB over 3792 files (2026-09-11).
+    than trust the blob. Dense, that filler cost 35 GB over 3792 files (2026-09-11) --
+    `gen_llm_decode.py`/`gen_llm_prefill.py` now skip this call for a cache buffer entirely
+    (no blob, not even a sparse one; `meta["weights"]` omits the name and `layout` still
+    carries it) rather than pay even the sparse form.
 
-    Zero-run rather than by-name, because a cache blob is not always zero: `gen_decode.py`
-    seeds a random past segment into `kc`/`vc` when P>0. Sparse rather than absent, because
-    `npu-dev fused-elf` and `npu-dev prefill-golden` each read every
-    `meta["weights"]` blob by name.
+    Zero-run rather than by-name, because a cache blob is not always zero here: `gen_decode.py`
+    seeds a random past segment into `kc`/`vc` when P>0, and still calls this for every name in
+    `meta["weights"]` -- `npu-dev fused-elf` and `npu-dev prefill-golden` read those blobs back
+    by name.
 
     Identical bytes land on ONE inode, shared with whatever sibling arm packed them first
     (see `_pool_root`): an arm's own bytes are its ELF and a few buffers, tens of MB against

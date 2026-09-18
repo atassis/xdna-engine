@@ -464,7 +464,10 @@ impl NpuDecodeStep {
         // A cache buffer's blob is not uploaded: the zeroing pass below overwrites that whole
         // region, so reading it would place bytes nothing goes on to observe. Measured across the
         // 115 cache-bearing artifacts on this box (2026-09-11), that read is 0.22 GB per artifact
-        // at the median and 3.50 GB at the widest (S=32768).
+        // at the median and 3.50 GB at the widest (S=32768). A current generator lists no cache
+        // name in `weights` at all (no blob ships -- see gen_llm_decode.py), so this branch only
+        // still fires for an artifact built before that: `check_blob_len` stats the shipped blob
+        // rather than trust it disappeared.
         for name in &artifact.weights {
             if artifact.cache_buffers.contains(name) {
                 check_blob_len(&artifact, name)?;
@@ -482,12 +485,13 @@ impl NpuDecodeStep {
                 upload_blob(&arena, p, name)?;
             }
         }
-        // Zero every KV-cache buffer EXPLICITLY, rather than relying on its `buffers/<name>.bin`
-        // happening to be an all-zero blob (today all 56 are, but nothing enforces that). This is
-        // what makes cross-request reuse safe: stale entries past `n_past` are masked to -inf and
-        // contribute nothing ONLY while they are finite, and a cache that starts at zero can never
-        // hold anything else -- every value in it afterwards was written by the model. Load-time,
-        // so it costs one memset per load rather than one per request.
+        // Zero every KV-cache buffer EXPLICITLY, never by trusting a shipped blob (a current
+        // artifact ships none at all; an older one's is all-zero, but nothing here reads it to
+        // check). This is what makes cross-request reuse safe: stale entries past `n_past` are
+        // masked to -inf and contribute nothing ONLY while they are finite, and a cache that
+        // starts at zero can never hold anything else -- every value in it afterwards was
+        // written by the model. Load-time, so it costs one memset per load rather than one per
+        // request.
         for name in &artifact.cache_buffers {
             let loc = artifact.loc(name);
             arena
@@ -590,13 +594,14 @@ impl NpuDecodeStep {
     }
 
     /// Re-zero every KV-cache scratch buffer (`meta.json`'s `cache_buffers`) and sync. Call before
-    /// each new generation on a REUSED instance; a freshly-constructed instance is already zero (the
-    /// artifact's own cache-buffer blobs are all-zero) and does not need this.
+    /// each new generation on a REUSED instance; a freshly-constructed instance is already zero
+    /// (`new()` zero-fills every `cache_buffers` name explicitly, by length, once) and does not
+    /// need this.
     pub fn reset(&mut self) -> Result<CacheState, EngineError> {
-        // The cache buffers are ALREADY zero when the model loads: every one of them is listed in
-        // `meta.json`'s `weights` too, and its `buffers/<name>.bin` is an all-zero blob, so
-        // `new()`'s weight loop zeroes them and syncs once. This per-request pass exists only to
-        // stop request N+1 from seeing request N's history.
+        // The cache buffers are ALREADY zero when the model loads: `new()` writes zeros into
+        // every one of them by name+length and syncs once, never by trusting a blob (a current
+        // artifact ships none for them at all; see gen_llm_decode.py). This per-request pass
+        // exists only to stop request N+1 from seeing request N's history.
         //
         // Whether it is NEEDED is a question about the mask, not about the cache: `sm_mask` is
         // written as `n_past + 1` and the attention masks every position at or beyond it to -inf,

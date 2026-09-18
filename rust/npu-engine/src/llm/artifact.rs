@@ -1340,8 +1340,10 @@ impl LlmArtifact {
             )));
         }
 
-        // Protected = everything this artifact needs to survive the other ELF running: its weights
-        // (which include the caches -- the generator lists a cache buffer in both) and its caches.
+        // Protected = everything this artifact needs to survive the other ELF running: its
+        // weights and its caches. Chained rather than assumed disjoint -- an older generator
+        // lists a cache buffer in both, a newer one only in `cache_buffers` -- and `dedup()`
+        // below collapses the overlap either way.
         let mut protected: Vec<(usize, usize, &str)> = self
             .weights
             .iter()
