@@ -489,6 +489,23 @@ class LlmSpec:
             return self.global_n_kv_heads
         return self.n_kv_heads
 
+    def causal_width(self, layer_idx: int, n_past: int) -> int:
+        """The valid attended width THIS layer needs at `n_past`: uncapped on a global layer,
+        capped at `sliding_window` on a sliding one (T3.2 -- today's shipped graph applies
+        n_past+1 to every layer, so a sliding layer runs full causal past n_past>=sliding_window).
+
+        NECESSARY, NOT SUFFICIENT for a build: the shipped Softmax kernel masks a PREFIX
+        (`aie_kernels/aie2p/softmax.cc::mask_bf16` zeroes indices [unmasked_size, total_size),
+        keeping [0, unmasked_size)), and the KV cache write is unconditionally linear
+        (`kv_layout.py`/`kv_layout.rs::kv_off`, no wraparound). Passing this width straight to
+        the existing `sm_mask` would therefore attend to the OLDEST `sliding_window` positions
+        forever once n_past exceeds it, not the most recent ones -- the opposite of a window. A
+        correct build also needs the KV write addressed mod `sliding_window` for a sliding layer
+        (unbuilt), so column 0 of that layer's cache always means "oldest position still live".
+        """
+        w = n_past + 1
+        return w if self.sliding_window is None or self.is_global(layer_idx) else min(w, self.sliding_window)
+
     def q_dim_for(self, layer_idx: int) -> int:
         return self.n_q_heads * self.head_dim_for(layer_idx)
 

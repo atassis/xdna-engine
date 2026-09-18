@@ -192,3 +192,34 @@ class TestCheckPrefillProjections:
         with pytest.raises(ValueError) as exc:
             QWEN3_0_6B.check_prefill_projections(256, (("ctx", 2048, 128),), cols=16)
         assert "num_aie_columns=16" in str(exc.value)
+
+
+class TestCausalWidth:
+    """T3.2: causal_width() is the per-layer mask width a correct build needs -- gen_llm_decode.py
+    does not read it yet (one shared `sm_mask` covers every layer)."""
+
+    def test_uniform_spec_is_always_uncapped(self):
+        for l, n_past in ((0, 0), (0, 2000), (27, 5000)):
+            assert QWEN3_0_6B.causal_width(l, n_past) == n_past + 1
+
+    def test_global_layer_is_never_capped(self):
+        assert GEMMA4_12B.is_global(5)
+        assert GEMMA4_12B.causal_width(5, 5000) == 5001
+
+    def test_sliding_layer_caps_at_the_window(self):
+        assert not GEMMA4_12B.is_global(0)
+        assert GEMMA4_12B.causal_width(0, 100) == 101         # below the window: uncapped
+        assert GEMMA4_12B.causal_width(0, 1023) == 1024        # right at the window
+        assert GEMMA4_12B.causal_width(0, 1024) == 1024        # past it: capped
+
+    def test_diverges_from_the_shipped_scalar_sm_mask_past_the_window(self):
+        """gen_llm_decode.py's ONE `sm_mask` Softmax parameter (see gen_llm_decode.py:1466-1468,
+        used unconditionally at :1942) gives every layer `n_past+1` -- correct for a global
+        layer, wrong for a sliding one once n_past reaches sliding_window. This is the gate a
+        fix must pass: agree with today's shipped width below the window, diverge past it."""
+        sliding = 0
+        for n_past in (0, 500, 1023):
+            assert GEMMA4_12B.causal_width(sliding, n_past) == n_past + 1  # today happens to agree
+        for n_past in (1024, 1536, 2047):
+            assert GEMMA4_12B.causal_width(sliding, n_past) != n_past + 1  # today is wrong
+        assert GEMMA4_12B.causal_width(0, 5000) == 1024
