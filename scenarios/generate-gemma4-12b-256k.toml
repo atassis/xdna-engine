@@ -92,8 +92,32 @@ name = "gemma4-12b-256k"
 #
 # Rollback: point decode= back at decode_int4g32qat_s262144_l48_rg_mc_smseg1024 and restart.
 
+#
+# DEFAULT SINCE 2026-09-18: `decode_s262144_mvq2_wgm`, the same recipe rebuilt against the IRON
+#   whose mv_quant inner loop carries two accumulators (MVQ_UNROLL=2, now the default), plus the
+#   three graph flags the S=6912 arm already ships (MERGE_WEIGHT_GEMVS, POINTWISE_MODES,
+#   COLLAPSE_MERGED_CONFIGURES).
+#     latency   1016.8 ms/token, device 930.5, against 1101.0 on record for the previous default.
+#               -84 ms, which is the SAME base-term win the S=6912 arm measured (-88.19, alternated)
+#               transferring as predicted. NOT alternated here -- one 12-token run against a p50
+#               from another day -- so read it as confirmation of the prediction, not as a measured
+#               delta. Re-run alternated before quoting it as one.
+#     WHY IT IS STILL ~4x THE S=6912 ARM, and it is not the kernel: 776 ms of the 1101 is the
+#               S-dependent term, and unroll-2 attacks the ~325 ms base. A shim BD length is a
+#               static field on the binary TXN target, so `M` stays the ALLOCATED and STREAMED
+#               extent (gemv/design.py:461-472) -- this arm pays for 262144 positions at n_past 19
+#               exactly as it does at n_past 200000. 92.9% of those S-dependent bytes are the 8
+#               global layers' K cache delivered 16x per token.
+#     next      The lever that attacks THAT term is blocking the scores GEMV's K cache: verified
+#               device-free to construct, pass the coalesce gate and cut delivery 16 -> 4,
+#               -25.77 GB/token across the 8 global layers. It works at ANY capacity, unlike the
+#               S=6912 coalesce fix whose ceiling is S<=32704.
+#     NOT FIXED: this model still has no batched prefill, so a long prompt is primed one token at a
+#               time at ~1017 ms each. The rung ladder fixes decode cost, not TTFT.
+#   Rollback: point decode= back at decode_s262144_are_tso and reinstall.
+#
 [artifacts]
-decode = "artifacts/gemma4-12b/decode_s262144_are_tso"
+decode = "artifacts/gemma4-12b/decode_s262144_mvq2_wgm"
 weights = "artifacts/gemma4-12b/weights_int4g32sbf16_planar_qat_rg"
 tokenizer_dir = "artifacts/gemma4-12b/tokenizer"
 
