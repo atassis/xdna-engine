@@ -31,6 +31,21 @@ GATE = 1e-4  # both sides compute in float32 from the SAME bf16-rounded checkpoi
 # term.
 
 
+# The device's arithmetic: bf16 operands, an f32 accumulator, one rounding at each op's OUTPUT.
+# Not "bf16 arithmetic" -- no AIE kernel keeps a bf16 accumulator, and modelling one would report a
+# floor the hardware never pays. `--bf16` turns this on; identity otherwise, so the f32 wiring gate
+# and the precision floor run the same forward.
+_BF16 = False
+
+
+def q(x):
+    if not _BF16:
+        return x
+    u = np.asarray(x, np.float32).view(np.uint32)
+    # round-to-nearest-even on the truncated 16 low bits, which is what mm.cc's conversion does
+    return (((u + 0x7FFF + ((u >> 16) & 1)) & 0xFFFF0000).view(np.float32)).astype(np.float32)
+
+
 def rel_l2(a, b):
     a, b = a.astype(np.float64), b.astype(np.float64)
     return float(np.linalg.norm(a - b) / (np.linalg.norm(b) + 1e-30))
@@ -105,6 +120,15 @@ def patches_merge(patches, positions_xy, length):
     return merged_patches, new_positions
 
 
+def pad_along_first_dim(patches, positions, target_length):
+    """Port of image_processing_gemma4_unified.pad_along_first_dim. Zero patches at position -1."""
+    pad = target_length - patches.shape[0]
+    if pad <= 0:
+        return patches, positions
+    return (np.pad(patches, [(0, pad)] + [(0, 0)] * (patches.ndim - 1)),
+            np.pad(positions, [(0, pad)] + [(0, 0)] * (positions.ndim - 1), constant_values=-1))
+
+
 def extract_waveform_features(waveform, samples_per_token=640):
     """Port of Gemma4UnifiedAudioFeatureExtractor._extract_waveform_features: zero-pad to a
     multiple of samples_per_token, reshape to (num_tokens, samples_per_token). No windowing, no
@@ -119,10 +143,11 @@ def extract_waveform_features(waveform, samples_per_token=640):
 
 
 def load(d, name):
-    return np.load(os.path.join(d, f"{name}.npy"))
+    return q(np.load(os.path.join(d, f"{name}.npy")))
 
 
 def report(host_dir, stage, host_val, oracle_dir, oracle_name):
+    host_val = q(host_val)
     oracle_val = load(oracle_dir, oracle_name)
     np.save(os.path.join(host_dir, f"{stage}.npy"), host_val)
     err = rel_l2(host_val, oracle_val)
@@ -139,7 +164,13 @@ def main():
                      help="the SAME wav gemma4_towers_oracle_gen.py was pointed at, to test the "
                           "waveform-framing numpy port end to end (not just the tower math).")
     ap.add_argument("--out", required=True)
+    ap.add_argument("--bf16", action="store_true",
+                    help="round every operand and every stage output to bf16, keeping the f32 "
+                         "accumulator -- reports the device's numeric floor instead of gating "
+                         "wiring. Stage errors are NOT compared against GATE in this mode.")
     a = ap.parse_args()
+    global _BF16
+    _BF16 = a.bf16
     os.makedirs(a.out, exist_ok=True)
     W, O = a.weights_dir, a.oracle_dir
 
@@ -175,6 +206,13 @@ def main():
     errs["merge"] = report(a.out, "prep_merged_patches", merged_patches, O, "prep_merged_patches")
     errs["merge_pos"] = report(a.out, "prep_merged_positions", merged_positions.astype(np.float32),
                                 O, "prep_merged_positions")
+
+    num_soft_tokens = load(O, "in_pixel_values").shape[1]
+    padded_patches, padded_positions = pad_along_first_dim(merged_patches, merged_positions,
+                                                           num_soft_tokens)
+    errs["pad"] = report(a.out, "prep_padded_patches", padded_patches, O, "prep_padded_patches")
+    errs["pad_pos"] = report(a.out, "prep_padded_positions", padded_positions.astype(np.float32),
+                              O, "prep_padded_positions")
 
     print("== vision tower, staged ==")
     pixel_values = load(O, "in_pixel_values")             # (1,280,6912) -- HF's own preprocessing
@@ -223,9 +261,14 @@ def main():
     a2 = linear(a1, embed_audio_proj)
     errs["a2_projection"] = report(a.out, "aud_s2_projection", a2, O, "aud_s2_projection")
 
+    worst = max(errs.items(), key=lambda kv: kv[1])
+    if _BF16:
+        print("\nbf16 operands + f32 accumulator + bf16 rounding per stage, against the f32 oracle.")
+        print("These are a FLOOR to size a device gate against, not a pass/fail.")
+        print(f"worst stage: {worst[0]} rel-L2={worst[1]:.3e}")
+        return
     print(f"\ngate: rel-L2 <= {GATE:.0e} (float32 both sides, same bf16-rounded weight values --")
     print("no precision gap expected; this gates wiring/op correctness, not a bf16 rounding floor)")
-    worst = max(errs.items(), key=lambda kv: kv[1])
     n_fail = sum(1 for e in errs.values() if e > GATE)
     print(f"worst stage: {worst[0]} rel-L2={worst[1]:.3e}")
     print(f"{len(errs) - n_fail}/{len(errs)} stages PASS" if n_fail == 0 else

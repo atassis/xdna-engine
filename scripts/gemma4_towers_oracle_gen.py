@@ -96,6 +96,10 @@ def main():
     ap.add_argument("--checkpoint-dir", required=True)
     ap.add_argument("--audio-wav", required=True)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--image-size", default="672x960",
+                    help="HxW of the synthetic test image. Must be a fixed point of "
+                         "get_aspect_ratio_preserving_size, which keeps the torchvision resize out "
+                         "of the traced path; sizes under the patch budget exercise the padding.")
     ap.add_argument("--check-from-pretrained-keys", action="store_true")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
@@ -137,15 +141,17 @@ def main():
 
     # ================= VISION =================
     print("== vision preprocessing ==")
-    image = make_test_image()
+    img_h, img_w = (int(v) for v in a.image_size.split("x"))
+    image = make_test_image(img_h, img_w)
     processor = Gemma4UnifiedImageProcessor()
     tensor_img = processor.process_image(image, do_convert_rgb=True)  # uint8 (3,H,W)
-    assert tuple(tensor_img.shape) == (3, 672, 960), tensor_img.shape
+    assert tuple(tensor_img.shape) == (3, img_h, img_w), tensor_img.shape
     max_patches = vc.num_soft_tokens * vc.pooling_kernel_size ** 2
     from transformers.models.gemma4_unified.image_processing_gemma4_unified import (
         get_aspect_ratio_preserving_size)
-    th, tw = get_aspect_ratio_preserving_size(672, 960, vc.patch_size, max_patches, vc.pooling_kernel_size)
-    assert (th, tw) == (672, 960), f"resize would NOT be a no-op: {(th, tw)}"  # confirms the docstring's claim
+    th, tw = get_aspect_ratio_preserving_size(img_h, img_w, vc.patch_size, max_patches,
+                                              vc.pooling_kernel_size)
+    assert (th, tw) == (img_h, img_w), f"resize would NOT be a no-op: {(th, tw)}"  # confirms the docstring's claim
 
     rescaled = processor.rescale_and_normalize(tensor_img, do_rescale=True, rescale_factor=1 / 255,
                                                 do_normalize=False, image_mean=None, image_std=None)
@@ -162,13 +168,20 @@ def main():
     merged_patches, merged_positions = patches_merge(
         teacher_patches.unsqueeze(0), teacher_positions.unsqueeze(0), num_model_patches)
     merged_patches, merged_positions = merged_patches.squeeze(0), merged_positions.squeeze(0)
-    assert merged_patches.shape[0] == vc.num_soft_tokens, \
-        f"expected exactly {vc.num_soft_tokens} soft tokens with no padding, got {merged_patches.shape[0]}"
     save(a.out, "prep_merged_patches", merged_patches)
     save(a.out, "prep_merged_positions", merged_positions.float())
+    # An aspect ratio whose floored resize lands under the budget leaves the tail to be padded --
+    # zero patches at position -1, which is what makes the tower's `valid` mask do anything.
+    n_real = merged_patches.shape[0]
+    merged_patches, merged_positions = pad_along_first_dim(
+        merged_patches, merged_positions, vc.num_soft_tokens)
+    print(f"  soft tokens: {n_real} real + {vc.num_soft_tokens - n_real} padded "
+          f"= {merged_patches.shape[0]}")
+    save(a.out, "prep_padded_patches", merged_patches)
+    save(a.out, "prep_padded_positions", merged_positions.float())
 
-    pixel_values = merged_patches.unsqueeze(0)          # (1, 280, 6912)
-    image_position_ids = merged_positions.unsqueeze(0)  # (1, 280, 2)
+    pixel_values = merged_patches.unsqueeze(0)          # (1, num_soft_tokens, 6912)
+    image_position_ids = merged_positions.unsqueeze(0)  # (1, num_soft_tokens, 2)
 
     # Cross-check against the processor's own black-box preprocess() entry point.
     official = processor.preprocess(images=[image], return_tensors="pt")

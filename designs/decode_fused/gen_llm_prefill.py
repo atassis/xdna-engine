@@ -642,6 +642,10 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
     # attn_ops (below) builds a per-WINDOW softmax and needs `sm_kw`/`attn_order` to do it -- see
     # `_win_cache`.
     sm_kw = dict(vector_size_source="rows") if causal == "rows" else {}
+    # One owner for the chunking policy, decode's: `SOFTMAX_SEGMENT` unset keeps the unchunked op,
+    # which at `cols` over ~7k no longer fits L1 -- in+out objectFIFOs are `cols` wide and double
+    # buffered, so 8192 columns alone ask for the whole 64 KB.
+    from gen_llm_decode import softmax_segment
     # PREFILL_ATTN_ORDER is a CONFIGURE-COST CONTROL, not a feature. Both arms split the softmax
     # per head -- legal because softmax is per ROW and every head's sc/sw/widths slice is
     # contiguous -- so the two arms run IDENTICAL ops over IDENTICAL bytes with IDENTICAL designs,
@@ -737,9 +741,11 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
         if w not in _win_cache:
             _win_cache[w] = (
                 Softmax(rows=Hq * M, cols=w, num_aie_columns=cols, num_channels=1,
-                        context=ctx, allocation_scheme=alloc_all, **sm_kw),
+                        context=ctx, allocation_scheme=alloc_all,
+                        segment=softmax_segment(w), **sm_kw),
                 Softmax(rows=M, cols=w, num_aie_columns=cols, num_channels=1,
-                        context=ctx, allocation_scheme=alloc_all, **sm_kw)
+                        context=ctx, allocation_scheme=alloc_all,
+                        segment=softmax_segment(w), **sm_kw)
                 if attn_order != "off" else None,
             )
         op_sm_w, op_sm_head_w = _win_cache[w]
