@@ -2140,10 +2140,21 @@ def main():
             "softmax runs); the KV of layers >= 1 is not, because it is computed from a "
             "non-causal layer-0 output. This arm is the A/B control, not a seed for a decode.",
         ]) + ([
+            # Which sentence is true here is decided by `uses_ring` -- the SAME value that emits the
+            # `mask_ring` block below, not a re-derivation. A capped-at-the-window limitation
+            # inherited onto a ring artifact reads as a property of the graph while describing the
+            # one it replaced.
             f"batched prefill covers positions [0, {min(ww for _, _, ww, _ in dims['geom_slots'])}) "
             f"only, not the full S={S}: past the narrowest geometry's capacity its circular cache "
             "holds a wrapped interval and mask_bf16's suffix mask cannot express one. The host "
-            "stops there (npu_prefill.rs::batchable_window) and finishes the prompt stepwise.",
+            "stops there (npu_prefill.rs::batchable_window) and finishes the prompt stepwise."
+            if not dims["uses_ring"] else
+            f"batched prefill spans the prompt past the sliding window (ring capacities "
+            f"{sorted({ww for _, ww in dims['ring_geoms']})}), because the wrapped interval is "
+            "masked per row by mask_hole_bf16 rather than by a suffix width. Stage 1: a chunk "
+            "needing >= 2 pad rows past a capacity is skipped and the tail finishes stepwise "
+            "(npu_prefill.rs::ring_tail_end), so a prompt whose length is not a whole number of "
+            "M-chunks still ends per-token.",
         ] if dims["causal"] == "rows" and any(ww < S for _, _, ww, _ in dims["geom_slots"]) else []) + ([
             f"KV cache is blocked (T={dims['kv_block']}): the scores/ctx GEMMs address it in "
             "place, "
