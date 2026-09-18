@@ -876,6 +876,35 @@ def generator_provenance():
     return {"commit": sha.stdout.strip(), "dirty": bool(dirty.stdout.strip())}
 
 
+def iron_provenance():
+    """Best-effort build provenance for meta.json: the git commit of the IRON tree that supplied
+    the OPERATORS AND KERNELS, plus whether aie_kernels/ or iron/ was dirty against it.
+
+    A third axis, and the one that was missing. `toolchain_provenance` answers which toolchain
+    compiled this and `generator_provenance` which generator graph emitted it; neither says
+    anything about IRON, where the kernel SOURCE lives. A kernel edit changes the arithmetic an
+    artifact performs and leaves no trace in its name, its toolchain hash or its generator commit
+    -- `MVQ_UNROLL` (mv_quant.cc's accumulator count) is exactly that: it moved a decode step
+    321.71 -> 233.52 ms and is invisible to all three existing records. Resolved from the `iron`
+    package actually on sys.path, so it describes the tree that was really used rather than a
+    path someone believed was used. Returns {} rather than raising: provenance is a record, not a
+    gate.
+    """
+    try:
+        import iron  # noqa: PLC0415 -- resolved at call time, on purpose
+        tree = os.path.dirname(os.path.dirname(os.path.abspath(iron.__file__)))
+        sha = subprocess.run(["git", "-C", tree, "rev-parse", "HEAD"],
+                             capture_output=True, text=True, timeout=10)
+        dirty = subprocess.run(["git", "-C", tree, "status", "--porcelain", "--",
+                                "iron", "aie_kernels"],
+                               capture_output=True, text=True, timeout=10)
+    except (OSError, ImportError):
+        return {}
+    if sha.returncode != 0 or not sha.stdout.strip():
+        return {}
+    return {"tree": tree, "commit": sha.stdout.strip(), "dirty": bool(dirty.stdout.strip())}
+
+
 def toolchain_provenance():
     """Best-effort build provenance for meta.json: the toolchain.lock semantic hash this ELF was
     just compiled against, plus the instance dir the build used, if resolvable.
@@ -3091,6 +3120,15 @@ def main():
         print("[build] WARNING: could not record toolchain provenance in meta.json "
               "(no toolchain.lock / kernel_sandbox.sh resolvable) -- this artifact will read as "
               "unstamped to any freshness check", file=sys.stderr)
+    iprov = iron_provenance()
+    if iprov:
+        meta["iron"] = iprov
+        if iprov["dirty"]:
+            print(f"[build] WARNING: IRON was DIRTY at {iprov['commit'][:12]} -- meta.json's iron "
+                  "commit will not reproduce this build's kernels", file=sys.stderr)
+    else:
+        print("[build] WARNING: could not record IRON provenance in meta.json -- a kernel change "
+              "in this artifact will be invisible to any later check", file=sys.stderr)
     gprov = generator_provenance()
     if gprov:
         meta["generator"] = gprov
