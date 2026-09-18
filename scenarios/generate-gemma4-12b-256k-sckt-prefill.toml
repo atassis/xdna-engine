@@ -1,0 +1,20 @@
+[scenario]
+kind = "generate"
+name = "gemma4-12b-256k-sckt-prefill"
+
+# The CONTROL for `gemma4-12b-rung8192`: identical graph and flags, window == capacity == 262144.
+# Blocking the scores GEMV's K cache took this arm 1016.0 -> 550.8 ms/token (-45.8%, two alternated
+# ABBA pairs agreeing within 3.5 ms); `gemma4-12b-256k` is the pre-blocking build and is NOT the
+# control for a rung measurement, which would conflate two changes.
+# Batched prefill over a 262144-position cache: window 8192, `--kv-alloc 262144`. The attention
+# extent is the WINDOW, so the host batches a prompt up to 8192 and finishes any tail stepwise
+# (`batchable_window`). 328.04 MB/layer -- the same graph cost as the shipped S=6912 prefill, where
+# a prefill built AT 262144 would be 2064.04.
+[artifacts]
+decode = "artifacts/gemma4-12b/decode_s262144_sckt"
+prefill = "artifacts/gemma4-12b/prefill_m64_w8192_ka262144_l48_seg4_ring"
+weights = "artifacts/gemma4-12b/weights_int4g32sbf16_planar_qat_rg"
+tokenizer_dir = "artifacts/gemma4-12b/tokenizer"
+
+[generation]
+max_tokens = 512
