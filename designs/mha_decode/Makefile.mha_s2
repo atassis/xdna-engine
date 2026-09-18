@@ -1,0 +1,41 @@
+##===- Makefile.mha_s2 -----------------------------------------------------===##
+#
+# mha_decode_s2 -- S2 slow-transformer decode-step MHA xclbin (32 Q heads, 8 KV heads,
+# GQA n_rep=4, HD=128). Same kernel source as Makefile.mha (mha_decode.cc), different
+# compile-time shape (-DMHA_HD=128 -DMHA_TKV=32) and driver (mha_decode_s2_iron.py) --
+# see that file's header for why this is a separate generator, not a Makefile.mha flag.
+# Build (run from the ml/mha_decode sandbox dir, CPU-only):
+#   make -f Makefile.mha_s2 NPU2=1 seq=<S_MAX> build/final_mha_decode_s2_<S_MAX>.xclbin
+# seq HERE IS S_MAX (max decode-step KV-cache length), a PRODUCT decision with no default
+# -- see mha_decode_s2_iron.py's header. No `seq ?=` default on purpose: an unset `seq`
+# must fail loud, not silently build against a guessed length.
+#
+# Distinct object/xclbin names from Makefile.mha's (mha_decode.o / mha_decode_${seq}) so
+# both can be built in the same sandbox dir without collision.
+#
+srcdir := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
+include ${srcdir}/../../makefile-common
+VPATH := ${srcdir}/../../../aie_kernels/aie2p
+
+devicename ?= $(if $(filter 1,$(NPU2)),npu2,npu)
+hd ?= 128
+tkv ?= 32
+tag = mha_decode_s2_${seq}
+
+aie_py_src = mha_decode_s2_iron.py
+
+all: build/final_${tag}.xclbin
+
+build/mha_decode_s2.o: mha_decode.cc
+	mkdir -p ${@D}
+	cd ${@D} && ${PEANO_INSTALL_DIR}/bin/clang++ ${PEANOWRAP2P_FLAGS} -DMHA_HD=${hd} -DMHA_TKV=${tkv} -c $< -o ${@F}
+
+build/aie_${tag}.mlir: ${srcdir}/${aie_py_src}
+	mkdir -p ${@D}
+	python3 $< -d ${devicename} -s ${seq} -t 0 > $@
+
+build/final_${tag}.xclbin: build/aie_${tag}.mlir build/mha_decode_s2.o
+	mkdir -p ${@D}
+	cd ${@D} && aiecc --get-xclbin --get-npu-insts \
+		--peano ${PEANO_INSTALL_DIR} \
+		--xclbin-name=${@F} --npu-insts-name=insts_${tag}.txt aie_${tag}.mlir

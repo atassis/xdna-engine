@@ -8,6 +8,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ffi::{c_void, CStr, CString};
 use std::os::raw::{c_char, c_int, c_uint};
+use std::path::Path;
 use std::rc::Rc;
 use std::sync::OnceLock;
 
@@ -92,16 +93,40 @@ pub mod sim_bf16 {
     }
 }
 
-/// Distinct hw_contexts created so far. The driver's limit is **16** concurrent
-/// (`npu4_family.h` `.hwctx_limit`, divided by the partition count); the 17th `CREATE_HWCTX` fails
-/// with EINVAL. NPU4 is `temporal_only`, so co-resident contexts time-slice and every program
-/// boundary is still a full array reprogram -- co-residency is capacity, never cheapness.
+/// Concurrent hw_contexts the driver allows: `.hwctx_limit` in `npu4_family.h:82`, divided by the
+/// partition count (1 here -- npu4 is `AIE2_TEMPORAL_ONLY`, so contexts time-slice the whole array
+/// rather than partitioning it). npu1 sets 6 (`npu1_regs.c:82`). The (LIMIT+1)-th `CREATE_HWCTX`
+/// fails with EINVAL.
+pub const HWCTX_LIMIT: usize = 16;
+
+/// hw_contexts CREATED over this process's life -- cumulative, never decremented, so it counts
+/// program transitions rather than occupancy. NPU4 is `temporal_only`: co-resident contexts
+/// time-slice and every program boundary is still a full array reprogram -- co-residency is
+/// capacity, never cheapness.
 pub static CONTEXTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// `hw_contexts N/16` -- how much of the driver's budget this configuration has spent.
+/// hw_contexts alive RIGHT NOW -- what the driver's budget is actually spent on. Diverges from
+/// [`CONTEXTS`] only for callers that release contexts ([`Device::load_kernel_owned`]); for the
+/// cached [`Device::load_kernel`] path the two are equal, since that cache never drops an entry.
+///
+/// Incremented at every site that actually creates a context -- kernel loads AND
+/// [`Device::open_elf_resident`] -- and decremented by the matching destructor.
+/// [`ElfResident::open_named`] is deliberately NOT counted: the shim copies the base's refcounted
+/// `xrt::hw_context` rather than registering a second one (`xrt_shim.cpp::
+/// shim_elf_resident_open_named`), which is why `ElfResident` carries `owns_context`.
+pub static CONTEXTS_LIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// `hw_contexts N/16` -- how much of the driver's budget this configuration is spending. Reports
+/// LIVE occupancy, and the cumulative created count alongside it when a caller has been releasing
+/// contexts, since only the first is bounded by [`HWCTX_LIMIT`].
 pub fn context_report() -> String {
-    let n = CONTEXTS.load(std::sync::atomic::Ordering::Relaxed);
-    format!("hw_contexts: {n}/16 used{}", if n >= 16 { "  <- AT THE LIMIT" } else { "" })
+    let live = CONTEXTS_LIVE.load(std::sync::atomic::Ordering::Relaxed);
+    let made = CONTEXTS.load(std::sync::atomic::Ordering::Relaxed);
+    let churn = if made > live { format!(", {made} created") } else { String::new() };
+    format!(
+        "hw_contexts: {live}/{HWCTX_LIMIT} live{churn}{}",
+        if live >= HWCTX_LIMIT { "  <- AT THE LIMIT" } else { "" }
+    )
 }
 
 /// Per-dispatch xclbin-TRANSITION accounting, gated by `NPU_DISPATCH_LOG=1`.
@@ -730,6 +755,11 @@ pub struct ElfKernel2 {
 /// re-registration. Construct via [`Device::open_elf_resident`].
 pub struct ElfResident {
     ptr: *mut CElfResident,
+    /// True only for the resident that REGISTERED the context ([`Device::open_elf_resident`]).
+    /// [`ElfResident::open_named`] variants copy the base's refcounted `xrt::hw_context` instead of
+    /// registering a second (`xrt_shim.cpp::shim_elf_resident_open_named`), so counting them would
+    /// over-report occupancy on open and under-report it on drop.
+    owns_context: bool,
     /// Kernel name, so [`dispatch_log`] can attribute these dispatches. Without it the resident
     /// rail was invisible to `NPU_DISPATCH_LOG=1`: the log covers `Kernel`'s methods, and this
     /// type calls the FFI directly, so an LLM decode reported `dispatches 0` -- a well-formed
@@ -830,6 +860,33 @@ impl Device {
         if let Some(k) = self.kernels.borrow().get(&key) {
             return Ok(k.clone());
         }
+        let k = self.create_kernel_inner(xclbin_path, name, qos, false)?;
+        self.kernels.borrow_mut().insert(key, k.clone());
+        Ok(k)
+    }
+
+    /// Load an xclbin into a hw_context the CALLER owns: not entered in the by-path cache, so
+    /// dropping the last `Rc` runs [`Kernel`]'s destructor and returns the slot to the driver's
+    /// [`HWCTX_LIMIT`] budget. [`load_kernel`](Self::load_kernel) can never do that -- its cache
+    /// holds an `Rc` for the Device's whole life -- which is right for a fixed engine set but wrong
+    /// for a working set larger than the budget: npu-s2's decoder chain has 68 distinct designs
+    /// against 16 slots, and opening them all eagerly died on the 17th `CREATE_HWCTX` with EINVAL.
+    /// A caller using this owns the eviction policy; two calls for one path get two contexts.
+    pub fn load_kernel_owned(&self, xclbin_path: &str, name: Option<&str>) -> Result<Rc<Kernel>> {
+        self.create_kernel_inner(xclbin_path, name, None, true)
+    }
+
+    /// `owned` = the caller manages this context's lifetime and expects one context per use, so the
+    /// duplicate-stem warning is silenced: a repeat is deliberate churn there, not an avoidable
+    /// split. Such a caller gets a directory-qualified label instead, because a design set can name
+    /// every artifact `final.xclbin` (npu-s2's 68 do) and the stem alone identifies none of them.
+    fn create_kernel_inner(
+        &self,
+        xclbin_path: &str,
+        name: Option<&str>,
+        qos: Option<QosPriority>,
+        owned: bool,
+    ) -> Result<Rc<Kernel>> {
         // Each distinct key is one hw_context, and the driver allows only 16 concurrent
         // (npu4_family.h `.hwctx_limit`, divided by partition count). Exceeding it fails
         // CREATE_HWCTX with EINVAL, which is how attention-on-NPU was blocked: the encoder loaded
@@ -850,6 +907,18 @@ impl Device {
             .and_then(|s| s.to_str())
             .unwrap_or(xclbin_path)
             .to_string();
+        if owned {
+            let path = std::path::Path::new(xclbin_path);
+            let label = match (
+                path.parent().and_then(|d| d.file_name()).and_then(|d| d.to_str()),
+                path.file_stem().and_then(|s| s.to_str()),
+            ) {
+                (Some(dir), Some(st)) => format!("{dir}/{st}"),
+                _ => stem,
+            };
+            CONTEXTS_LIVE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Ok(Rc::new(Kernel { ptr, label }));
+        }
         let nth = {
             let mut st = self.stems.borrow_mut();
             let seen = st.entry(stem.clone()).or_default();
@@ -878,9 +947,8 @@ impl Device {
             seen.len()
         };
         let label = if nth == 1 { stem } else { format!("{stem}~ctx{nth}") };
-        let k = Rc::new(Kernel { ptr, label });
-        self.kernels.borrow_mut().insert(key, k.clone());
-        Ok(k)
+        CONTEXTS_LIVE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(Rc::new(Kernel { ptr, label }))
     }
 
     pub fn alloc_bo(&self, kernel: &Kernel, nbytes: usize, flag: i32, group_id: i32) -> Result<Bo> {
@@ -999,7 +1067,12 @@ impl Device {
             // of 16. Counting only there made `context_report()` read 0/16 for a rail that holds
             // one.
             CONTEXTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Ok(ElfResident { ptr, label: name.unwrap_or("main:sequence").to_string() })
+            CONTEXTS_LIVE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(ElfResident {
+                ptr,
+                label: name.unwrap_or("main:sequence").to_string(),
+                owns_context: true,
+            })
         }
     }
 }
@@ -1193,7 +1266,10 @@ impl Kernel {
 
 impl Drop for Kernel {
     fn drop(&mut self) {
+        // `ShimKernel` owns the `xrt::hw_context`, so this is what actually returns the slot to
+        // the driver's `HWCTX_LIMIT` budget.
         unsafe { shim_kernel_close(self.ptr) }
+        CONTEXTS_LIVE.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -1314,7 +1390,7 @@ impl ElfResident {
         if ptr.is_null() {
             Err(format!("resident open_named({kernel_name}): {}", last_error()))
         } else {
-            Ok(ElfResident { ptr, label: kernel_name.to_string() })
+            Ok(ElfResident { ptr, label: kernel_name.to_string(), owns_context: false })
         }
     }
 
@@ -1361,6 +1437,9 @@ impl ElfResident {
 impl Drop for ElfResident {
     fn drop(&mut self) {
         unsafe { shim_elf_resident_close(self.ptr) }
+        if self.owns_context {
+            CONTEXTS_LIVE.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 }
 
@@ -1767,6 +1846,186 @@ impl FusedElfPatcher {
     }
 }
 
+/// Kind of a scratchpad parameter, from `params.txt`'s 4th column -- determines how
+/// [`ScratchpadParams::write`] encodes the value before the raw write. `core`: an AIE-core-visible
+/// `UPDATE_REG` value, left-shifted 2 bits on write (firmware requirement; the core right-shifts by
+/// 2 after reading, `AIEUtils.cpp::emitUpdateBdAddressFromOffsetParameter`'s comment and
+/// `parameter_scratchpad.h::writeBits`). `addr`: a raw DMA BD offset, written unshifted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScratchpadParamKind {
+    Core,
+    Addr,
+}
+
+#[derive(Debug)]
+struct ScratchpadParam {
+    idx: u8,
+    kind: ScratchpadParamKind,
+    width_bytes: usize,
+}
+
+/// A parsed `params.txt` (aiecc `--get-scratchpad-parameters` output), resolving a named
+/// `aiex.scratchpad_parameter` to the byte offset and encoding [`ElfResident::write_scratchpad`]
+/// expects. Device-free -- pure text parsing.
+///
+/// ELF-only, not xclbin: `xrt::run::get_ctrl_scratchpad_bo()` requires a real `xrt::module`, which
+/// only the full-ELF construction path (`xrt::ext::kernel`) attaches -- a plain `xrt::kernel(hwctx,
+/// name)` off a `register_xclbin` context is built with an empty module by design (XRT src,
+/// `xrt_kernel.cpp`: `alloc_kernel_from_ctx` L3813-3820 constructs `kernel_impl` with
+/// `xrt::module{}`; `check_and_get_module(mod, /*is_full_elf_flow=*/false)` L1711-1716 returns that
+/// empty module for the xclbin flow; `get_ctrl_scratchpad_bo()` L2871-2876 throws "No module
+/// associated with run object" when `m_module` is null). Do not re-attempt a `KernelResident`-style
+/// plain-xclbin resident runner -- this is a structural XRT constraint, not a gap in our shim.
+#[derive(Debug)]
+pub struct ScratchpadParams {
+    params: HashMap<String, ScratchpadParam>,
+    /// `num_parameters * 4` -- every parameter occupies one 4-byte state-table slot
+    /// (`parameter_scratchpad.h`'s `scratchpadSizeBytes = numParams * 4`; `boMap` there is a
+    /// `uint32_t*` indexed by `state_table_idx`, never a packed byte layout).
+    size_bytes: usize,
+}
+
+impl ScratchpadParams {
+    /// Parse `path`. Format (`AIEUtils.cpp::emitScratchpadParamsFile`, mirrored by
+    /// `runtime_lib/test_lib/parameter_scratchpad.h::parseParams` in the pinned mlir-aie fork):
+    /// ```text
+    /// <num_parameters>
+    /// <name> <state_table_idx> <mlir_type> <kind>
+    /// ...
+    /// ```
+    /// `kind` is `core` or `addr`. A real line (`aie_kernels/embedding-gather`,
+    /// `aie_kernels/_test/gen/embedding_gather/params.txt`): `row_off 0 i32 addr`.
+    /// Every structural defect (bad count, short file, out-of-range/duplicate index, unrecognized
+    /// kind or type) is a hard `Err` -- never a default-filled or partially-parsed table.
+    pub fn parse(path: &Path) -> Result<ScratchpadParams> {
+        let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let mut lines = text.lines();
+        let n: usize = lines
+            .next()
+            .ok_or_else(|| format!("{}: empty params.txt", path.display()))?
+            .trim()
+            .parse()
+            .map_err(|e| format!("{}: bad parameter count on line 1: {e}", path.display()))?;
+
+        let mut params = HashMap::with_capacity(n);
+        for i in 0..n {
+            let lineno = i + 2;
+            let line = lines.next().ok_or_else(|| {
+                format!("{}: declares {n} parameters but has only {i} more line(s)", path.display())
+            })?;
+            let mut f = line.split_whitespace();
+            let name = f
+                .next()
+                .ok_or_else(|| format!("{}:{lineno}: missing parameter name", path.display()))?;
+            let idx: u32 = f
+                .next()
+                .ok_or_else(|| format!("{}:{lineno}: missing state_table_idx", path.display()))?
+                .parse()
+                .map_err(|e| format!("{}:{lineno}: bad state_table_idx: {e}", path.display()))?;
+            // Matches parameter_scratchpad.h's own bound (idx is stored as uint8_t there) AND
+            // this file's own size_bytes = n*4 layout: every declared parameter's slot must fall
+            // inside the scratchpad this same header describes, not just inside a u8.
+            if idx as usize >= n {
+                return Err(format!(
+                    "{}:{lineno}: state_table_idx {idx} for '{name}' is >= the declared parameter \
+                     count {n} -- its slot would fall outside the {n}*4-byte scratchpad",
+                    path.display()
+                ));
+            }
+            let ty = f
+                .next()
+                .ok_or_else(|| format!("{}:{lineno}: missing type for '{name}'", path.display()))?;
+            let kind = match f.next() {
+                Some("core") => ScratchpadParamKind::Core,
+                Some("addr") => ScratchpadParamKind::Addr,
+                Some(other) => {
+                    return Err(format!(
+                        "{}:{lineno}: invalid kind '{other}' for '{name}' (want core|addr)",
+                        path.display()
+                    ))
+                }
+                None => return Err(format!("{}:{lineno}: missing kind for '{name}'", path.display())),
+            };
+            let width_bytes = mlir_scalar_type_width_bytes(ty).ok_or_else(|| {
+                format!(
+                    "{}:{lineno}: unrecognized or oversized scratchpad parameter type '{ty}' for \
+                     '{name}' -- every scratchpad slot is 4 bytes \
+                     (test_utils::ParameterScratchpad::write<T>'s own `static_assert(sizeof(T) <= 4)`); \
+                     widen mlir_scalar_type_width_bytes if this is a real MLIR scalar type that fits",
+                    path.display()
+                )
+            })?;
+            if params
+                .insert(name.to_string(), ScratchpadParam { idx: idx as u8, kind, width_bytes })
+                .is_some()
+            {
+                return Err(format!("{}:{lineno}: duplicate parameter name '{name}'", path.display()));
+            }
+        }
+        Ok(ScratchpadParams { params, size_bytes: n * 4 })
+    }
+
+    /// Total scratchpad size this `params.txt` implies (bytes).
+    pub fn size_bytes(&self) -> usize {
+        self.size_bytes
+    }
+
+    /// Validated named write: `name` must be declared, and `value_le`'s length must equal that
+    /// parameter's declared type width -- a mismatch (or an unknown name) is a hard `Err`, never a
+    /// truncated or zero-padded write. This tightens
+    /// `test_utils::ParameterScratchpad::writeBytes`'s C++ behavior, which silently truncates to
+    /// `min(len, 4)` instead of checking the declared width. `core`-kind values are left-shifted 2
+    /// bits before the write (see [`ScratchpadParamKind`]); `addr`-kind values are written raw.
+    pub fn write(&self, target: &ElfResident, name: &str, value_le: &[u8]) -> Result<()> {
+        let p = self.params.get(name).ok_or_else(|| {
+            let mut known: Vec<&str> = self.params.keys().map(String::as_str).collect();
+            known.sort_unstable();
+            format!("scratchpad parameter '{name}' not declared in params.txt (known: {known:?})")
+        })?;
+        if value_le.len() != p.width_bytes {
+            return Err(format!(
+                "scratchpad parameter '{name}': value is {} byte(s), declared type is {} byte(s)",
+                value_le.len(),
+                p.width_bytes
+            ));
+        }
+        let mut buf = [0u8; 4];
+        buf[..p.width_bytes].copy_from_slice(value_le);
+        let mut bits = u32::from_le_bytes(buf);
+        if p.kind == ScratchpadParamKind::Core {
+            bits <<= 2;
+        }
+        target.write_scratchpad(p.idx as usize * 4, &bits.to_le_bytes())
+    }
+
+    /// [`write`](Self::write) for an `i32` parameter (`row_off`'s declared type) -- the common case,
+    /// sparing the caller a manual `to_le_bytes()`.
+    pub fn write_i32(&self, target: &ElfResident, name: &str, value: i32) -> Result<()> {
+        self.write(target, name, &value.to_le_bytes())
+    }
+}
+
+/// MLIR scalar type string -> byte width, for the types `--aie-lower-scratchpad-parameters` can
+/// print into `params.txt` (`AIEUtils.cpp::emitScratchpadParamsFile`'s `p.getType().print()`). The
+/// scratchpad slot is 4 bytes, so nothing wider is representable regardless of what MLIR allows;
+/// `None` here is a hard parse error in [`ScratchpadParams::parse`], never a silent default --
+/// widen this table (not the caller) if a real design declares a type not listed here.
+fn mlir_scalar_type_width_bytes(ty: &str) -> Option<usize> {
+    match ty {
+        "bf16" | "f16" => Some(2),
+        "f32" | "tf32" => Some(4),
+        _ => {
+            let digits =
+                ty.strip_prefix('i').or_else(|| ty.strip_prefix("si")).or_else(|| ty.strip_prefix("ui"))?;
+            let bits: u32 = digits.parse().ok()?;
+            if bits == 0 || bits > 32 {
+                return None;
+            }
+            Some(bits.div_ceil(8) as usize)
+        }
+    }
+}
+
 #[cfg(test)]
 mod qos_tests {
     use super::*;
@@ -1908,5 +2167,100 @@ mod bf16_pack_tests {
                 x.to_bits()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod scratchpad_params_tests {
+    use super::*;
+
+    // No tempfile dependency in this crate; a PID+counter-qualified path under the system temp
+    // dir is unique enough for a same-process test suite and is removed at the end of each test.
+    fn write_tmp(contents: &str) -> std::path::PathBuf {
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir()
+            .join(format!("npu_xrt_scratchpad_params_test_{}_{n}.txt", std::process::id()));
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    #[test]
+    fn parses_the_real_embedding_gather_params_txt() {
+        // aie_kernels/_test/gen/embedding_gather/params.txt, verbatim.
+        let path = write_tmp("1\nrow_off 0 i32 addr\n");
+        let params = ScratchpadParams::parse(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(params.size_bytes(), 4);
+        let p = params.params.get("row_off").unwrap();
+        assert_eq!(p.idx, 0);
+        assert_eq!(p.kind, ScratchpadParamKind::Addr);
+        assert_eq!(p.width_bytes, 4);
+    }
+
+    #[test]
+    fn parses_multiple_params_with_a_core_kind() {
+        // Shape of mlir-aie's own scratchpad_params/test.cpp fixture (foo/bar, both core-kind).
+        let path = write_tmp("2\nfoo 0 bf16 core\nbar 1 bf16 core\n");
+        let params = ScratchpadParams::parse(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(params.size_bytes(), 8);
+        assert_eq!(params.params.get("foo").unwrap().kind, ScratchpadParamKind::Core);
+        assert_eq!(params.params.get("foo").unwrap().width_bytes, 2);
+        assert_eq!(params.params.get("bar").unwrap().idx, 1);
+    }
+
+    #[test]
+    fn rejects_duplicate_name() {
+        let path = write_tmp("2\nrow_off 0 i32 addr\nrow_off 1 i32 addr\n");
+        let err = ScratchpadParams::parse(&path).unwrap_err();
+        std::fs::remove_file(&path).ok();
+        assert!(err.contains("duplicate"), "{err}");
+    }
+
+    #[test]
+    fn rejects_unknown_kind() {
+        let path = write_tmp("1\nrow_off 0 i32 sideways\n");
+        let err = ScratchpadParams::parse(&path).unwrap_err();
+        std::fs::remove_file(&path).ok();
+        assert!(err.contains("invalid kind"), "{err}");
+    }
+
+    #[test]
+    fn rejects_index_outside_the_declared_scratchpad() {
+        let path = write_tmp("1\nrow_off 5 i32 addr\n");
+        let err = ScratchpadParams::parse(&path).unwrap_err();
+        std::fs::remove_file(&path).ok();
+        assert!(err.contains(">="), "{err}");
+    }
+
+    #[test]
+    fn rejects_unrecognized_type() {
+        let path = write_tmp("1\nrow_off 0 index addr\n");
+        let err = ScratchpadParams::parse(&path).unwrap_err();
+        std::fs::remove_file(&path).ok();
+        assert!(err.contains("unrecognized or oversized"), "{err}");
+    }
+
+    #[test]
+    fn rejects_truncated_file() {
+        let path = write_tmp("2\nrow_off 0 i32 addr\n");
+        let err = ScratchpadParams::parse(&path).unwrap_err();
+        std::fs::remove_file(&path).ok();
+        assert!(err.contains("more line"), "{err}");
+    }
+
+    #[test]
+    fn type_width_table_matches_the_mlir_types_this_repo_actually_emits() {
+        assert_eq!(mlir_scalar_type_width_bytes("i32"), Some(4));
+        assert_eq!(mlir_scalar_type_width_bytes("i16"), Some(2));
+        assert_eq!(mlir_scalar_type_width_bytes("i8"), Some(1));
+        assert_eq!(mlir_scalar_type_width_bytes("si16"), Some(2));
+        assert_eq!(mlir_scalar_type_width_bytes("ui8"), Some(1));
+        assert_eq!(mlir_scalar_type_width_bytes("bf16"), Some(2));
+        assert_eq!(mlir_scalar_type_width_bytes("f32"), Some(4));
+        assert_eq!(mlir_scalar_type_width_bytes("i64"), None); // wider than the 4-byte slot
+        assert_eq!(mlir_scalar_type_width_bytes("index"), None); // not a fixed-width scalar
+        assert_eq!(mlir_scalar_type_width_bytes(""), None);
     }
 }

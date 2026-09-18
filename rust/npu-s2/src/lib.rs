@@ -13,12 +13,19 @@
 //! [`S2Artifacts`] is the top-level `manifest.json` over every design a codec exports (directory +
 //! role per design, plus the toolchain pin the designs were built against).
 
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 use sha2::{Digest, Sha256};
 
 use npu_xrt::{Bo, Device, Kernel, FLAG_CACHEABLE, FLAG_HOST_ONLY};
+
+pub mod ar;
+pub mod chain;
+pub mod gguf;
+pub mod weights;
+pub mod window;
 
 /// Fixed filenames inside one design's directory (the exporter's convention -- see the task
 /// context this crate was built against: "a directory containing `final.xclbin`, `insts.bin`, and
@@ -103,12 +110,6 @@ fn check_bytes(label: &str, declared: Option<usize>, computed: usize, meta_path:
     }
 }
 
-/// One design's `meta.json`. Required fields are the ones [`S2Design::open`]/[`dispatch`] cannot
-/// operate without; everything else is `Option`/defaulted so a field this schema doesn't (yet)
-/// carry -- or spells differently -- degrades to "not cross-checked", not a parse failure.
-/// Unrecognized fields (`ci_chunk`, `window`, ...) land in `extra` rather than being dropped, since
-/// this crate was written ahead of the exporter and the exact key set is unconfirmed (see the
-/// crate's delivery report for the list of fields guessed here).
 /// `meta.json`'s `dtypes` object. `resident` is null when the design has no resident operand.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct S2Dtypes {
@@ -129,6 +130,54 @@ pub struct S2BufferBytes {
     pub resident: usize,
 }
 
+/// `meta.json`'s `op_params` object -- the exporter's copy of window_driver.py's own `op_meta`
+/// (see `export_codec_artifacts.py`'s `export_one`). This is what lets the driver derive every
+/// windowing parameter (step, context, chunk width) from the artifact itself rather than
+/// replicating `stage_shapes.py`'s chunk-size policy in Rust.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum S2OpParams {
+    Snake {
+        tag: String,
+        #[serde(rename = "C")]
+        c: usize,
+        #[serde(rename = "T")]
+        t: usize,
+    },
+    Conv {
+        tag: String,
+        k: usize,
+        dilation: usize,
+        ctx: usize,
+        c_in: usize,
+        c_in_total: usize,
+        c_out: usize,
+        has_add: bool,
+        #[serde(rename = "T")]
+        t: usize,
+        step: usize,
+        #[serde(default)]
+        #[allow(dead_code)]
+        vector: bool,
+    },
+    ConvTranspose {
+        tag: String,
+        k: usize,
+        stride: usize,
+        ctx: usize,
+        c_in: usize,
+        c_in_total: usize,
+        c_out: usize,
+        t: usize,
+        step: usize,
+    },
+}
+
+/// One design's `meta.json`. Required fields are the ones [`S2Design::open`]/[`dispatch`] cannot
+/// operate without; everything else is `Option`/defaulted so a field this schema doesn't (yet)
+/// carry -- or spells differently -- degrades to "not cross-checked", not a parse failure.
+/// Unrecognized fields (`ci_chunk`, `window`, ...) land in `extra` rather than being dropped, since
+/// this crate was written ahead of the exporter and the exact key set is not pinned.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct S2Meta {
     pub symbol: String,
@@ -167,6 +216,10 @@ pub struct S2Meta {
     pub xclbin_sha256: Option<String>,
     #[serde(default)]
     pub shim_sha256: Option<String>,
+    /// See [`S2OpParams`]. Absent on a hand-written test fixture; every real exported design
+    /// carries it.
+    #[serde(default)]
+    pub op_params: Option<S2OpParams>,
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
@@ -174,13 +227,192 @@ pub struct S2Meta {
 /// One design loaded from an exported artifact directory (`final.xclbin` + `insts.bin` +
 /// `meta.json`). BOs are allocated ONCE in [`open`](Self::open); [`dispatch`](Self::dispatch)
 /// only uploads/runs/downloads -- see `npu-whisper/src/mha_npu.rs`, the template this mirrors.
-pub struct S2Design {
-    kern: Rc<Kernel>,
+/// Cumulative dispatches and a periodic progress line, gated by `NPU_S2_HEARTBEAT=<n>` (dispatches
+/// per line; unset = silent). The chain issues tens of thousands of dispatches over minutes with no
+/// output between op boundaries, which makes "slow" and "hung waiting on a syncobj" look identical
+/// from outside -- a single `/proc/<pid>/wchan` sample cannot tell them apart, since a healthy run
+/// sits in the same DRM wait almost all of its life.
+/// Times a re-read disagreed with the read before it under `NPU_S2_RESYNC` -- i.e. observed
+/// instances of the host-only-BO read race, counted rather than inferred.
+pub static RESYNC_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+static DISPATCHES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn heartbeat(op: &str) {
+    // Count FIRST: the dispatch total is the denominator for the stale-read rate, so it must not
+    // depend on whether the progress log happens to be enabled.
+    let n = DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    note_op(op, false);
+    static EVERY: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let every = *EVERY.get_or_init(|| {
+        std::env::var("NPU_S2_HEARTBEAT").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+    });
+    if every == 0 {
+        return;
+    }
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let start = *START.get_or_init(std::time::Instant::now);
+    if n % every == 0 {
+        let secs = start.elapsed().as_secs_f64();
+        eprintln!("[S2Design] {n} dispatches, {secs:.1}s ({:.1}/s), in {op}", n as f64 / secs);
+    }
+}
+
+/// Observed stale reads: times a re-read under `NPU_S2_RESYNC` disagreed with the read before it.
+/// Measures the host-only-BO coherency race directly -- a host-only BO's mapped pages can serve a
+/// dispatch's output from cache, so the first read after a run can return the previous run's
+/// bytes. Counted per dispatch rather than inferred from a rate.
+pub fn resync_hits() -> usize {
+    RESYNC_HITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+thread_local! {
+    /// Per-op (dispatches, stale reads). The aggregate rate is an average over a heterogeneous mix
+    /// -- designs differ by three orders of magnitude in per-dispatch output bytes -- so only the
+    /// per-op split can say whether the race concentrates where the buffers are small.
+    static PER_OP: std::cell::RefCell<std::collections::BTreeMap<String, (usize, usize)>> =
+        std::cell::RefCell::new(std::collections::BTreeMap::new());
+}
+
+fn note_op(op: &str, stale: bool) {
+    PER_OP.with(|m| {
+        let mut m = m.borrow_mut();
+        let e = m.entry(op.to_string()).or_insert((0, 0));
+        if stale {
+            e.1 += 1;
+        } else {
+            e.0 += 1;
+        }
+    });
+}
+
+/// `(op, dispatches, stale_reads)` sorted by stale count, for a caller that wants to report where
+/// the race actually fires rather than an aggregate.
+pub fn per_op_stats() -> Vec<(String, usize, usize)> {
+    PER_OP.with(|m| {
+        let mut v: Vec<(String, usize, usize)> =
+            m.borrow().iter().map(|(k, (d, s))| (k.clone(), *d, *s)).collect();
+        v.sort_by(|a, b| b.2.cmp(&a.2).then(b.1.cmp(&a.1)));
+        v
+    })
+}
+
+/// Dispatches issued through [`S2Design::dispatch`] so far, for a caller that wants the count
+/// without the log.
+pub fn dispatch_count() -> usize {
+    DISPATCHES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// How many hw_contexts a pooled chain may hold at once. One below the driver's
+/// [`npu_xrt::HWCTX_LIMIT`] so a chain does not consume the whole budget while an unrelated
+/// context (a serving engine, a trace design) is open. Raising it buys nothing: the decoder runs
+/// OP-MAJOR -- each op dispatches all of its chunks before the next op is touched -- so the
+/// instantaneous working set is one design and the LRU never thrashes.
+pub const DEFAULT_POOL_LIMIT: usize = npu_xrt::HWCTX_LIMIT - 1;
+
+/// The device-side half of a design: the hw_context and every BO bound to it. Held behind
+/// [`DesignSlot`] so a [`DesignPool`] can drop it -- and with it the context -- without dropping
+/// the [`S2Design`] handle, which stays usable and reloads on next dispatch.
+struct Loaded {
+    // FIELD ORDER IS LOAD-BEARING. Rust drops fields in declaration order, and every BO here was
+    // allocated against `kern`'s hw_context (`shim_bo_alloc` takes the kernel), so the BOs must go
+    // first -- freeing one after its context is destroyed is a use-after-free in XRT. It never
+    // mattered while designs lived until process exit; eviction is what made drop order reachable.
     instr: Bo,
-    n_instr: usize,
     bo_in: Bo,
     bo_resident: Option<Bo>,
     bo_out: Bo,
+    kern: Rc<Kernel>,
+}
+
+#[derive(Default)]
+struct DesignSlot {
+    loaded: RefCell<Option<Loaded>>,
+}
+
+/// Bounds how many designs hold a hw_context at once, evicting least-recently-used.
+///
+/// Needed because the chain has more designs than the driver has context slots: the S2 codec
+/// decoder is 68 distinct xclbins against `HWCTX_LIMIT` = 16, and opening them eagerly fails the
+/// 17th `CREATE_HWCTX` with EINVAL. Eviction only works on designs opened through
+/// [`S2Design::open_pooled`], which take an uncached context they own outright
+/// ([`Device::load_kernel_owned`]); [`S2Design::open`]'s cached context is never freed.
+pub struct DesignPool {
+    limit: usize,
+    /// Loaded designs, oldest use first. Weak so a released [`S2Design`] leaves no entry behind.
+    lru: RefCell<Vec<Weak<DesignSlot>>>,
+}
+
+impl DesignPool {
+    pub fn new(limit: usize) -> Rc<Self> {
+        Rc::new(DesignPool { limit: limit.max(1), lru: RefCell::new(Vec::new()) })
+    }
+
+    /// [`DEFAULT_POOL_LIMIT`], or `NPU_S2_POOL_LIMIT` when set. The override exists to make eviction
+    /// pressure an independent variable: forcing a low limit at a known-good input separates
+    /// "breaks because the run is longer" from "breaks because more designs were evicted".
+    pub fn with_default_limit() -> Rc<Self> {
+        let limit = std::env::var("NPU_S2_POOL_LIMIT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_POOL_LIMIT);
+        Self::new(limit)
+    }
+
+    /// Designs currently holding a context through this pool.
+    pub fn live(&self) -> usize {
+        self.lru.borrow().iter().filter(|w| w.upgrade().is_some()).count()
+    }
+
+    fn touch(&self, slot: &Rc<DesignSlot>) {
+        let mut lru = self.lru.borrow_mut();
+        lru.retain(|w| w.upgrade().is_some_and(|s| !Rc::ptr_eq(&s, slot)));
+        lru.push(Rc::downgrade(slot));
+    }
+
+    /// Drop loaded designs until one more context fits under [`Self::limit`], never touching
+    /// `keep`. A slot that is already borrowed is in use further up the stack, so it is skipped
+    /// rather than evicted.
+    fn make_room(&self, keep: &Rc<DesignSlot>) {
+        let mut lru = self.lru.borrow_mut();
+        lru.retain(|w| w.upgrade().is_some());
+        let mut i = 0;
+        while lru.len() >= self.limit && i < lru.len() {
+            let Some(s) = lru[i].upgrade() else {
+                lru.remove(i);
+                continue;
+            };
+            if Rc::ptr_eq(&s, keep) {
+                i += 1;
+                continue;
+            }
+            let evicted = match s.loaded.try_borrow_mut() {
+                Ok(mut g) => {
+                    *g = None;
+                    true
+                }
+                Err(_) => false,
+            };
+            if evicted {
+                lru.remove(i);
+            } else {
+                i += 1;
+            }
+        }
+    }
+}
+
+/// One exported design. The handle is device-free -- [`open_pooled`](Self::open_pooled) validates
+/// the artifact and reads its instruction stream, but the hw_context and BOs are built on first
+/// dispatch and may be evicted by the [`DesignPool`] afterwards.
+pub struct S2Design {
+    dev: Rc<Device>,
+    pool: Option<Rc<DesignPool>>,
+    slot: Rc<DesignSlot>,
+    xclbin: String,
+    /// Kept in memory (a few hundred bytes per design) so an evict/reload cycle does not re-read
+    /// and re-validate `insts.bin`.
+    insts: Vec<u8>,
     in_elems: usize,
     out_elems: usize,
     pub meta: S2Meta,
@@ -188,8 +420,25 @@ pub struct S2Design {
 
 impl S2Design {
     /// Load `dir/{final.xclbin,insts.bin,meta.json}` onto an already-open Device (single-tenant;
-    /// reuse the handle) and allocate every BO. No dispatch happens here.
+    /// reuse the handle) and allocate every BO up front, holding the hw_context for this
+    /// `S2Design`'s whole life. Use [`open_pooled`](Self::open_pooled) for a chain whose design
+    /// count exceeds [`npu_xrt::HWCTX_LIMIT`]. No dispatch happens here.
     pub fn open(dev: &Rc<Device>, dir: &Path) -> Result<Self> {
+        let d = Self::prepare(dev, dir, None)?;
+        d.ensure_loaded()?;
+        Ok(d)
+    }
+
+    /// Like [`open`](Self::open) but the context is created on first dispatch and `pool` may evict
+    /// it again, so N designs sharing one pool hold at most `pool`'s limit of the driver's
+    /// budget. Touches no device state.
+    pub fn open_pooled(dev: &Rc<Device>, dir: &Path, pool: &Rc<DesignPool>) -> Result<Self> {
+        Self::prepare(dev, dir, Some(pool.clone()))
+    }
+
+    /// Everything that can be checked without the device: the ABI, the artifact's identity against
+    /// `meta.json`, and every declared byte count.
+    fn prepare(dev: &Rc<Device>, dir: &Path, pool: Option<Rc<DesignPool>>) -> Result<Self> {
         let meta_path = dir.join(META_FILE);
         let meta: S2Meta = read_json(&meta_path)?;
 
@@ -221,29 +470,23 @@ impl S2Design {
                 )));
             }
         }
-        let xclbin_str = xclbin_path
+        let xclbin = xclbin_path
             .to_str()
-            .ok_or_else(|| S2Error::Shape(format!("{} is not valid UTF-8", xclbin_path.display())))?;
-        let kern = dev.load_kernel(xclbin_str, None).map_err(S2Error::Xrt)?;
+            .ok_or_else(|| S2Error::Shape(format!("{} is not valid UTF-8", xclbin_path.display())))?
+            .to_string();
 
         let insts_path = dir.join(INSTS_FILE);
-        let ibytes = std::fs::read(&insts_path).map_err(|e| S2Error::Io(insts_path.clone(), e))?;
-        let n_instr = ibytes.len() / 4;
+        let insts = std::fs::read(&insts_path).map_err(|e| S2Error::Io(insts_path.clone(), e))?;
+        let n_instr = insts.len() / 4;
         if let Some(declared) = meta.insts_words {
             if declared != n_instr {
                 return Err(S2Error::Shape(format!(
                     "{}: n_instr={declared} in meta.json but insts.bin is {n_instr} words \
                      ({} bytes)",
-                    meta_path.display(), ibytes.len()
+                    meta_path.display(), insts.len()
                 )));
             }
         }
-
-        let g = |arg: i32| kern.group_id(arg).map_err(S2Error::Xrt);
-
-        let instr = dev.alloc_bo(&kern, ibytes.len(), FLAG_CACHEABLE, g(1)?).map_err(S2Error::Xrt)?;
-        instr.write_bytes(&ibytes).map_err(S2Error::Xrt)?;
-        instr.sync_to_device().map_err(S2Error::Xrt)?;
 
         let in_elems = meta.n_tiles.checked_mul(meta.in_tile).ok_or_else(|| {
             S2Error::Shape(format!("{}: n_tiles*in_tile overflows usize", meta_path.display()))
@@ -251,88 +494,185 @@ impl S2Design {
         let out_elems = meta.n_tiles.checked_mul(meta.out_numel).ok_or_else(|| {
             S2Error::Shape(format!("{}: n_tiles*out_numel overflows usize", meta_path.display()))
         })?;
-        let in_bytes = in_elems * F32_BYTES;
-        let out_bytes = out_elems * F32_BYTES;
-        check_bytes("in", meta.buffer_bytes.as_ref().map(|b| b.in_), in_bytes, &meta_path)?;
-        check_bytes("out", meta.buffer_bytes.as_ref().map(|b| b.out), out_bytes, &meta_path)?;
+        check_bytes("in", meta.buffer_bytes.as_ref().map(|b| b.in_), in_elems * F32_BYTES, &meta_path)?;
+        check_bytes("out", meta.buffer_bytes.as_ref().map(|b| b.out), out_elems * F32_BYTES, &meta_path)?;
+        if meta.resident_len > 0 {
+            check_bytes(
+                "resident",
+                meta.buffer_bytes.as_ref().map(|b| b.resident),
+                meta.resident_len * F32_BYTES,
+                &meta_path,
+            )?;
+        }
+
+        Ok(S2Design {
+            dev: dev.clone(),
+            pool,
+            slot: Rc::new(DesignSlot::default()),
+            xclbin,
+            insts,
+            in_elems,
+            out_elems,
+            meta,
+        })
+    }
+
+    /// Instruction-stream length in 32-bit words.
+    fn n_instr(&self) -> usize {
+        self.insts.len() / 4
+    }
+
+    /// Build the hw_context and BOs if this design does not currently hold them, evicting other
+    /// pooled designs first if the pool is full. Idempotent; a no-op on the hot path.
+    fn ensure_loaded(&self) -> Result<()> {
+        if self.slot.loaded.borrow().is_some() {
+            if let Some(p) = &self.pool {
+                p.touch(&self.slot);
+            }
+            return Ok(());
+        }
+        if let Some(p) = &self.pool {
+            p.make_room(&self.slot);
+        }
+
+        // A pooled design owns its context so the pool can free it; an unpooled one takes the
+        // Device's shared cached context, which is never released.
+        let kern = match &self.pool {
+            Some(_) => self.dev.load_kernel_owned(&self.xclbin, None).map_err(S2Error::Xrt)?,
+            None => self.dev.load_kernel(&self.xclbin, None).map_err(S2Error::Xrt)?,
+        };
+        let g = |arg: i32| kern.group_id(arg).map_err(S2Error::Xrt);
+
+        let instr = self
+            .dev
+            .alloc_bo(&kern, self.insts.len(), FLAG_CACHEABLE, g(1)?)
+            .map_err(S2Error::Xrt)?;
+        instr.write_bytes(&self.insts).map_err(S2Error::Xrt)?;
+        instr.sync_to_device().map_err(S2Error::Xrt)?;
 
         // Data BOs land at arg indices 3.. in ABI order (in[, resident], out) -- same convention
         // every other design in this codebase uses (`run_mha`'s Q@3 K@4 V@5 O@6, `run_dwconv6`'s
         // X@3 W@4 Y@5); group_id(1)=instr and arg 2 (count) is a scalar with no BO/group_id.
-        let bo_in = dev.alloc_bo(&kern, in_bytes, FLAG_HOST_ONLY, g(3)?).map_err(S2Error::Xrt)?;
-        let (bo_resident, bo_out) = if meta.resident_len > 0 {
-            let resident_bytes = meta.resident_len * F32_BYTES;
-            check_bytes("resident", meta.buffer_bytes.as_ref().map(|b| b.resident), resident_bytes, &meta_path)?;
-            let bo_r =
-                dev.alloc_bo(&kern, resident_bytes, FLAG_HOST_ONLY, g(4)?).map_err(S2Error::Xrt)?;
-            let bo_o = dev.alloc_bo(&kern, out_bytes, FLAG_HOST_ONLY, g(5)?).map_err(S2Error::Xrt)?;
+        let in_bytes = self.in_elems * F32_BYTES;
+        let out_bytes = self.out_elems * F32_BYTES;
+        // A/B handle for the host-only-BO read race: this tree records an unfenced xdna-driver
+        // CLFLUSH race on HOST_ONLY buffers, and the chain's output reads back byte-exactly equal to
+        // the PREVIOUS dispatch's result on some windows. `NPU_S2_OUT_BO_FLAG=0` allocates the
+        // output as a normal device BO instead, so `sync_from_device` is a real transfer rather
+        // than a coherency assumption. Default is unchanged.
+        let out_flag: i32 = std::env::var("NPU_S2_OUT_BO_FLAG")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(FLAG_HOST_ONLY);
+        let bo_in = self.dev.alloc_bo(&kern, in_bytes, FLAG_HOST_ONLY, g(3)?).map_err(S2Error::Xrt)?;
+        let (bo_resident, bo_out) = if self.meta.resident_len > 0 {
+            let bo_r = self
+                .dev
+                .alloc_bo(&kern, self.meta.resident_len * F32_BYTES, FLAG_HOST_ONLY, g(4)?)
+                .map_err(S2Error::Xrt)?;
+            let bo_o = self.dev.alloc_bo(&kern, out_bytes, out_flag, g(5)?).map_err(S2Error::Xrt)?;
             (Some(bo_r), bo_o)
         } else {
-            let bo_o = dev.alloc_bo(&kern, out_bytes, FLAG_HOST_ONLY, g(4)?).map_err(S2Error::Xrt)?;
+            let bo_o = self.dev.alloc_bo(&kern, out_bytes, out_flag, g(4)?).map_err(S2Error::Xrt)?;
             (None, bo_o)
         };
 
         if !npu_xrt::quiet() {
             eprintln!(
                 "[S2Design] loaded {} (role={} symbol={} n_tiles={} in_tile={} out_numel={} \
-                 resident_len={}, {n_instr} instr)",
-                xclbin_path.display(), meta.op, meta.symbol, meta.n_tiles, meta.in_tile,
-                meta.out_numel, meta.resident_len
+                 resident_len={}, {} instr)",
+                self.xclbin, self.meta.op, self.meta.symbol, self.meta.n_tiles, self.meta.in_tile,
+                self.meta.out_numel, self.meta.resident_len, self.n_instr()
             );
         }
 
-        Ok(S2Design { kern, instr, n_instr, bo_in, bo_resident, bo_out, in_elems, out_elems, meta })
+        *self.slot.loaded.borrow_mut() = Some(Loaded { kern, instr, bo_in, bo_resident, bo_out });
+        if let Some(p) = &self.pool {
+            p.touch(&self.slot);
+        }
+        Ok(())
     }
 
     /// `in_tiles`: `n_tiles*in_tile` f32 elements. `resident`: `Some(resident_len elements)` iff
     /// this design has a resident operand, else `None` -- mismatching either way is an `Err`, not
-    /// a silent zero-fill. Returns `n_tiles*out_numel` f32 elements. Upload/run/download only; no
-    /// allocation, no loading (both happened once in [`open`](Self::open)).
+    /// a silent zero-fill. Returns `n_tiles*out_numel` f32 elements. Loads the design first if the
+    /// pool has evicted it since the last call.
     pub fn dispatch(&self, in_tiles: &[f32], resident: Option<&[f32]>) -> Result<Vec<f32>> {
+        heartbeat(&self.meta.op);
         if in_tiles.len() != self.in_elems {
             return Err(S2Error::Shape(format!(
                 "in_tiles: got {} elements, design ({}) wants {}",
                 in_tiles.len(), self.meta.op, self.in_elems
             )));
         }
-        match (resident, &self.bo_resident) {
-            (Some(r), Some(bo)) => {
-                if r.len() != self.meta.resident_len {
+        match (resident, self.meta.resident_len) {
+            (Some(r), n) if n > 0 => {
+                if r.len() != n {
                     return Err(S2Error::Shape(format!(
-                        "resident: got {} elements, design ({}) wants {}",
-                        r.len(), self.meta.op, self.meta.resident_len
+                        "resident: got {} elements, design ({}) wants {n}",
+                        r.len(), self.meta.op
                     )));
                 }
-                bo.write_bytes(f32_bytes(r)).map_err(S2Error::Xrt)?;
-                bo.sync_to_device().map_err(S2Error::Xrt)?;
             }
-            (None, Some(_)) => {
+            (None, n) if n > 0 => {
                 return Err(S2Error::Shape(format!(
-                    "design ({}) requires a resident operand ({} elements), none given",
-                    self.meta.op, self.meta.resident_len
+                    "design ({}) requires a resident operand ({n} elements), none given",
+                    self.meta.op
                 )))
             }
-            (Some(r), None) => {
+            (Some(r), _) => {
                 return Err(S2Error::Shape(format!(
                     "design ({}) has no resident operand, {} elements given",
                     self.meta.op, r.len()
                 )))
             }
-            (None, None) => {}
+            (None, _) => {}
         }
 
-        self.bo_in.write_bytes(f32_bytes(in_tiles)).map_err(S2Error::Xrt)?;
-        self.bo_in.sync_to_device().map_err(S2Error::Xrt)?;
+        self.ensure_loaded()?;
+        let guard = self.slot.loaded.borrow();
+        let l = guard.as_ref().expect("ensure_loaded left the slot filled");
 
-        let data: Vec<&Bo> = match &self.bo_resident {
-            Some(r) => vec![&self.bo_in, r, &self.bo_out],
-            None => vec![&self.bo_in, &self.bo_out],
+        if let (Some(r), Some(bo)) = (resident, &l.bo_resident) {
+            bo.write_bytes(f32_bytes(r)).map_err(S2Error::Xrt)?;
+            bo.sync_to_device().map_err(S2Error::Xrt)?;
+        }
+
+        l.bo_in.write_bytes(f32_bytes(in_tiles)).map_err(S2Error::Xrt)?;
+        l.bo_in.sync_to_device().map_err(S2Error::Xrt)?;
+
+        let data: Vec<&Bo> = match &l.bo_resident {
+            Some(r) => vec![&l.bo_in, r, &l.bo_out],
+            None => vec![&l.bo_in, &l.bo_out],
         };
-        self.kern.run_kernel(OPCODE, &self.instr, self.n_instr, &data).map_err(S2Error::Xrt)?;
+        l.kern.run_kernel(OPCODE, &l.instr, self.n_instr(), &data).map_err(S2Error::Xrt)?;
 
-        self.bo_out.sync_from_device().map_err(S2Error::Xrt)?;
+        l.bo_out.sync_from_device().map_err(S2Error::Xrt)?;
         let mut out = vec![0f32; self.out_elems];
-        self.bo_out.read_bytes(f32_bytes_mut(&mut out)).map_err(S2Error::Xrt)?;
+        l.bo_out.read_bytes(f32_bytes_mut(&mut out)).map_err(S2Error::Xrt)?;
+
+        // `NPU_S2_RESYNC=<n>`: re-sync and re-read until two consecutive reads agree, up to n extra
+        // attempts. Tests the workaround this tree records for the unfenced xdna-driver CLFLUSH
+        // host-only-BO read race -- measured here as a window reading back byte-exactly equal to the
+        // PREVIOUS dispatch's output. Off by default: a retry loop that cannot distinguish "stale"
+        // from "legitimately identical" is a diagnostic, not a fix.
+        let retries: u32 = std::env::var("NPU_S2_RESYNC").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        if retries > 0 {
+            let mut prev = out;
+            for _ in 0..retries {
+                l.bo_out.sync_from_device().map_err(S2Error::Xrt)?;
+                let mut again = vec![0f32; self.out_elems];
+                l.bo_out.read_bytes(f32_bytes_mut(&mut again)).map_err(S2Error::Xrt)?;
+                let same = prev.iter().zip(&again).all(|(a, b)| a.to_bits() == b.to_bits());
+                prev = again;
+                if same {
+                    break;
+                }
+                RESYNC_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                note_op(&self.meta.op, true);
+            }
+            out = prev;
+        }
         Ok(out)
     }
 }
@@ -396,6 +736,15 @@ impl S2Artifacts {
 
     pub fn by_op(&self, role: &str) -> Option<&S2ManifestDesign> {
         self.designs.iter().find(|d| d.op == role)
+    }
+
+    /// Every design with `op == role`. A chunked op that carries a residual add (the 1x1 conv in
+    /// a residual unit, when `c_in_total > c_in`) exports TWO designs under the same `op` -- one
+    /// with the add slot for chunk 0, one without for every later chunk (see `chain::ConvOp`,
+    /// which classifies them by `op_params.has_add` rather than by name suffix). Every other op
+    /// has exactly one.
+    pub fn designs_by_op<'a>(&'a self, role: &str) -> Vec<&'a S2ManifestDesign> {
+        self.designs.iter().filter(|d| d.op == role).collect()
     }
 
     pub fn by_name(&self, name: &str) -> Option<&S2ManifestDesign> {
@@ -574,5 +923,56 @@ mod tests {
         assert_eq!(bb.in_, meta.n_tiles * meta.in_tile * F32_BYTES);
         assert_eq!(bb.out, meta.n_tiles * meta.out_numel * F32_BYTES);
         assert_eq!(bb.resident, meta.resident_len * F32_BYTES);
+    }
+
+    /// Parse `op_params` on EVERY design in a real exported manifest (not one hand-picked
+    /// directory) and cross-check it against that same design's `n_tiles`/`in_tile`/`out_numel`/
+    /// `resident_len` -- i.e. the exact formulas `window::SnakeOp/ConvOp/ConvTransposeOp::new`
+    /// apply when opening a design for real (device-gated, so untestable here directly). This
+    /// catches an `S2OpParams` schema mistake (a wrong field name silently landing in `extra`
+    /// instead of failing to parse, or a formula that disagrees with what the exporter actually
+    /// shipped) BEFORE it would only show up as a device-side dispatch error.
+    #[test]
+    fn op_params_matches_shapes_on_every_real_design() {
+        let Ok(root) = std::env::var("S2_ARTIFACTS_ROOT") else {
+            eprintln!("skip: set S2_ARTIFACTS_ROOT to a directory holding manifest.json + design dirs");
+            return;
+        };
+        let root = Path::new(&root);
+        if !root.join(MANIFEST_FILE).is_file() {
+            eprintln!("skip: no manifest.json at {}", root.display());
+            return;
+        }
+        let art = S2Artifacts::open(root).unwrap();
+        assert!(!art.designs().is_empty(), "manifest at {} lists no designs", root.display());
+        let mut checked = 0;
+        for d in art.designs() {
+            let dir = art.design_dir(d);
+            let meta: S2Meta = read_json(&dir.join(META_FILE)).unwrap();
+            match meta.op_params.as_ref().unwrap_or_else(|| panic!("{}: no op_params", dir.display())) {
+                S2OpParams::Snake { c, t, .. } => {
+                    assert_eq!(meta.n_tiles, *c, "{}: n_tiles", dir.display());
+                    assert_eq!(meta.in_tile, t + 1, "{}: in_tile", dir.display());
+                    assert_eq!(meta.out_numel, *t, "{}: out_numel", dir.display());
+                    assert_eq!(meta.resident_len, 0, "{}: resident_len", dir.display());
+                }
+                S2OpParams::Conv { k, ctx, c_in, c_out, has_add, t, .. } => {
+                    assert_eq!(meta.n_tiles, *c_out, "{}: n_tiles", dir.display());
+                    let want_in = c_in * k + 1 + if *has_add { *t } else { 0 };
+                    assert_eq!(meta.in_tile, want_in, "{}: in_tile", dir.display());
+                    assert_eq!(meta.out_numel, *t, "{}: out_numel", dir.display());
+                    assert_eq!(meta.resident_len, c_in * t, "{}: resident_len", dir.display());
+                    assert!(*ctx > 0 || *k == 1, "{}: ctx=0 but k={k} != 1", dir.display());
+                }
+                S2OpParams::ConvTranspose { k, c_in, c_out, t, stride, .. } => {
+                    assert_eq!(meta.n_tiles, *c_out, "{}: n_tiles", dir.display());
+                    assert_eq!(meta.in_tile, c_in * k + 1, "{}: in_tile", dir.display());
+                    assert_eq!(meta.out_numel, t * stride, "{}: out_numel", dir.display());
+                    assert_eq!(meta.resident_len, c_in * t, "{}: resident_len", dir.display());
+                }
+            }
+            checked += 1;
+        }
+        eprintln!("op_params_matches_shapes_on_every_real_design: checked {checked} designs under {}", root.display());
     }
 }

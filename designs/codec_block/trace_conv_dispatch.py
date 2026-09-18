@@ -73,6 +73,7 @@ needs: instance PYTHONPATH, AIECC_PATH, PEANO_INSTALL_DIR):
 """
 import argparse
 import json
+import os
 import sys
 import time
 from collections import defaultdict

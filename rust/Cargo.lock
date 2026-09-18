@@ -1105,6 +1105,7 @@ dependencies = [
 name = "npu-s2"
 version = "0.1.0"
 dependencies = [
+ "ndarray",
  "npu-xrt",
  "serde",
  "serde_json",
