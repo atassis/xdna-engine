@@ -1762,15 +1762,24 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
     # than build the first geometry's design and run every layer through it.
     _geom1 = geoms[0] if len(geoms) == 1 else None
     decode_layer_why = ("FUSE_DECODE_LAYER=0" if not FUSE_DECODE_LAYER else
+                        # FIRST, ahead of the QD clause below: fuse_o is now a real, checked
+                        # DecodeLayerDataParallel field, and False raises there (no embeddable
+                        # O-projection operator, and the shim/L1 budget forecloses one anyway --
+                        # see decode_layer_dp.op.__post_init__). QD not dividing D only matters
+                        # because fuse_o=True is the only buildable arm; a FUSE_MLP_O=0 caller was
+                        # never reaching it. Falls back to attn_block_dp + a standalone op_o gemv
+                        # + swiglu_mlp_dp(fuse_o=False), same as fused-operators-cannot-read-our-
+                        # quantized-weight-layout's sibling case.
+                        "FUSE_MLP_O=0" if not FUSE_MLP_O else
                         # BEFORE the geometry count, because it does not depend on it.
-                        # decode_layer_dp hardcodes fuse_o=True and swiglu_mlp_dp's fuse_o derives
-                        # R_CX = QD//D, so a model whose QD is not a whole multiple of D is refused
-                        # at ANY geometry count. Checked across EVERY geometry rather than the
-                        # single one, which is None exactly when this used to go unreported: the
-                        # count clause below short-circuited first and the real failure surfaced as
-                        # a raise three frames down in another operator, naming a variable instead
-                        # of a model. A session ordered a day's work behind the count clause
-                        # believing it was the blocker.
+                        # swiglu_mlp_dp's fuse_o derives R_CX = QD//D, so a model whose QD is not
+                        # a whole multiple of D is refused at ANY geometry count. Checked across
+                        # EVERY geometry rather than the single one, which is None exactly when
+                        # this used to go unreported: the count clause below short-circuited
+                        # first and the real failure surfaced as a raise three frames down in
+                        # another operator, naming a variable instead of a model. A session
+                        # ordered a day's work behind the count clause believing it was the
+                        # blocker.
                         "fuse_o needs QD to be a whole multiple of D ({}); {} has {}".format(
                             D, sp.name,
                             ", ".join(f"QD={Hq * _hd} (remainder {(Hq * _hd) % D})"
@@ -1780,9 +1789,6 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                         if _geom1 is None else
                         qkv_dp_why[_geom1] if qkv_dp_why[_geom1] else
                         mlp_dp_why if mlp_dp_why else
-                        "needs FUSE_MLP_O=1 (Wo's padding is wired through that flag via "
-                        "op_mlp_dp._wo_rows_padded, and decode_layer_dp always fuses Wo)"
-                        if not FUSE_MLP_O else
                         f"needs Hkv ({Hkv}) == COLS ({COLS})" if Hkv != COLS else
                         "needs SCALE_IN_QNORM=1 (attn_block_dp has no separate scale stage)"
                         if not (SCALE_IN_QNORM and sp.qk_norm) else
@@ -2439,6 +2445,34 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         for _hd in sorted({gk[0] for gk in geoms if attn_block_why[gk] is not None}):
             weights[f"ones_h{_hd}"] = np.ones(_hd, dtype=BF16)
 
+    def _dequant_wd_from_kchunks(hf):
+        """Wd for the PLAIN fused path (gh_chunks=1, row_parallel_down=False -- swiglu_mlp_dp
+        wants it as ONE buffer, same as Wg/Wu). The dump only ever writes a kchunked Wd
+        (down_chunks-wide, for op_down's unfused GEMV), so reconstruct the flat [D, FF] float
+        matrix the same way _pack_wd_row_parallel does for its own re-chunked shape, but hand it
+        back unchunked for the caller's existing `_pack(w, "mlp")`. See
+        fused-operators-cannot-read-our-quantized-weight-layout."""
+        chunk_hf = [f"{hf}.kchunk{i}" for i in range(down_chunks)]
+        if not all(n in PACKED for n in chunk_hf):
+            raise SystemExit(f"{hf}: {down_chunks}-way kchunk dump is partial (need all of "
+                              f"{chunk_hf})")
+        if dequantize_weight_chunked is None:
+            raise SystemExit("the fused swiglu_mlp_dp path needs "
+                              "iron.common.quant.dequantize_weight_chunked (post-6a347dc IRON "
+                              "tree) to read a kchunked Wd dump")
+        packed = np.concatenate([np.asarray(npy_raw(n)) for n in chunk_hf])
+        spec = _spec("mlp")
+        # layout/row_group default to header_first/ROW_GROUP_DEFAULT inside dequantize_weight,
+        # which silently misreads a row_group_planar dump's [payload][scales] arrangement as
+        # interleaved [header][payload] -- caught by the RuntimeWarnings (invalid value in
+        # divide/multiply/cast) a first version of this function produced against the shipped
+        # int4g32 planar dump before this was added. op_mlp_dp already derived the real values
+        # (its own __post_init__), so ask it rather than re-deriving them here.
+        return dequantize_weight_chunked(packed, D, FF, spec.group_size, spec.dtype,
+                                         n_chunks=down_chunks,
+                                         scale_dtype=_BUILD_STATE["scale_dtype"],
+                                         layout=op_mlp_dp.layout, row_group=op_mlp_dp.row_group)
+
     def _pack_wd_row_parallel(hf, n_chunks):
         """row_parallel_down's Wd: ONE buffer of `n_chunks` independently-quantized column-shard
         blocks (design.py's ROW_PARALLEL_DOWN). This dump has no unchunked Wd to slice -- only
@@ -2540,7 +2574,9 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                         _spec("mlp").group_size, _spec("mlp").dtype)])
                 weights[p + key] = wp
                 continue
-            w = npy(hf)  # [M, K], f32
+            w = (_dequant_wd_from_kchunks(hf)
+                 if key == "Wd" and mlp_dp_why is None and f"{hf}.kchunk0" in PACKED
+                 else npy(hf))  # [M, K], f32
             if key in mlp_keys:
                 weights[p + key] = _pack(w, "mlp")
             elif key == "Wo" and fuse_o:
