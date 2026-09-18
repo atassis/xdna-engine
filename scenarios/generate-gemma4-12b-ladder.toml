@@ -1,0 +1,50 @@
+[scenario]
+kind = "generate"
+name = "gemma4-12b-ladder"
+
+# Gemma-4-12B: fast decode AND a 262144-token context, in ONE model.
+#
+# Resident window BUCKETS over ONE KV allocation. Every bucket is the same graph at a different
+# attention WINDOW over the same 262144-position cache, bound to the one arena `decode` owns, and
+# the engine picks the narrowest bucket whose window covers the current position. A short
+# conversation pays the 8192 price; only a genuinely deep one pays the 262144 price.
+#
+#   MEASURED, alternated, on this box: the 8192 window decodes at 237.38 ms/token against 555.45
+#   for the same graph at window == capacity, and within +0.7% of the shipped S=6912 arm -- so the
+#   capacity is, at short context, free. See the KB's window-rung notes.
+#
+# BUCKET_SCRATCH_ORDER=1 IS LOAD-BEARING and is the whole reason this composes. It pins the
+# persistent buffers (weights + KV cache) to the FRONT of the scratch arena so every bucket presents
+# ONE layout for everything that survives a bucket crossing. Without it the window-sized softmax
+# scratch sits ahead of them and shifts every later offset -- measured here at 735 of 832 buffers
+# disagreeing between two windows, against 0 of 832 with the flag on. The engine checks every
+# bucket's offsets against `decode`'s at load and refuses a disagreement, so a build without the
+# flag fails loudly rather than corrupting a neighbour's weights.
+#
+#   build  (per window W in 8192, 262144)
+#     GEN_EXTRA="--max-seq $W" KV_ALLOC=262144 BUCKET_SCRATCH_ORDER=1 SOFTMAX_SEGMENT=1024 \
+#       ATTN_RUNTIME_EXTENT=1 GQA_GROUPED_K=1 GQA_GROUPED_V=1 FUSE_QKV_DP=0 SPLIT_LM_HEAD=0 \
+#       SLIDING_KV_CIRCULAR=1 MERGE_WEIGHT_GEMVS=1 POINTWISE_MODES=1 COLLAPSE_MERGED_CONFIGURES=1 \
+#       WEIGHTS=$PWD/artifacts/gemma4-12b/weights_int4g32sbf16_planar_qat_rg \
+#       bash scripts/build_llm_decode.sh gemma4-12b 48 $A/decode_bkt_w${W}_ka262144_l48
+#
+# `decode` is the WIDEST bucket on purpose: `max_context()` is the widest bucket's window, so it is
+# what decides which prompts the model accepts at all.
+#
+# COSTS, so they are not a surprise: N buckets are N hardware contexts and N ELFs on disk (~28 MB
+# each), but ONE arena and no extra weight memory. A bucket crossing is a hardware-context
+# transition, which is a per-destination cost rather than a constant.
+#
+# NO BATCHED PREFILL HERE YET. A prefill borrows the decode's arena, so it pairs with ONE bucket's
+# layout; pairing it against the ladder is the open piece. Use gemma4-12b-rung8192-prefill for a
+# batched-prefill arm at the 8192 window.
+[artifacts]
+decode = "artifacts/gemma4-12b/decode_bkt_w262144_ka262144_l48"
+decode_buckets = [
+    "artifacts/gemma4-12b/decode_bkt_w8192_ka262144_l48",
+]
+weights = "artifacts/gemma4-12b/weights_int4g32sbf16_planar_qat_rg"
+tokenizer_dir = "artifacts/gemma4-12b/tokenizer"
+
+[generation]
+max_tokens = 512
