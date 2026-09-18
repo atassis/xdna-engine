@@ -98,10 +98,14 @@ def _aie_api_include():
     """
     import aie
 
-    inst = Path(aie.__file__).resolve().parent.parent  # <instance>/python/aie/__init__.py
-    for cand in (inst / "include", inst / "src" / "third_party" / "aie_api" / "include"):
-        if (cand / "aie_api" / "aie.hpp").exists():
-            return [f"-I{cand}"]
+    # Walk up rather than counting parents: `aie.__file__` has already moved once
+    # (<instance>/python/aie/__init__.py -> <instance>/src/python/__init__.py), and a fixed
+    # parent count does not fail loudly when it moves again -- it resolves to the wrong root,
+    # finds neither candidate, and returns no -I at all.
+    for inst in Path(aie.__file__).resolve().parents:
+        for cand in (inst / "include", inst / "src" / "third_party" / "aie_api" / "include"):
+            if (cand / "aie_api" / "aie.hpp").exists():
+                return [f"-I{cand}"]
     return []
 
 
