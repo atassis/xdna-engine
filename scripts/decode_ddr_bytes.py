@@ -21,20 +21,32 @@ BD = re.compile(r"aie\.dma_bd\(%(\w+)\s*:\s*memref<((?:\d+x)+)(bf16|f32|i8|i32)>
                 r"len\s*=\s*(\d+)\s+sizes\s*=\s*\[([^\]]*)\]\s+strides\s*=\s*\[([^\]]*)\]")
 DEV = re.compile(r"aie\.device\(\w+\)\s*@(\w+)\s*\{")
 CFG = re.compile(r"aiex\.configure\s+@(\w+)\s*\{")
+# MERGE_WEIGHT_GEMVS/POINTWISE_MODES give one device several `aie.runtime_sequence`s (the family's
+# shared tiling, one sequence per M/shape); the callee symbol at the call site -- "sequence" for the
+# sole/default one, else the name after @ -- is what a `tiles_rtp` invocation actually streams, so
+# bytes must be summed PER SEQUENCE, never over the whole device body (that sums every shape in the
+# family into every invocation -- 337 op1_GEMV runs at 645.102 MB/run, ~35x the true ~6228 MB/token
+# for that op, measured 2026-09-18).
+SEQ = re.compile(r"aie\.runtime_sequence(?:\s+@(\w+))?\s*\(")
+RUN = re.compile(r"aiex\.run\s+@(\w+)\s*\(")
 
 src = open(sys.argv[1]).read()
 lines = src.splitlines()
 
-# --- device blocks by name (brace matching from each header) ---
-devs, spans = {}, []
-for m in DEV.finditer(src):
-    name, i, depth = m.group(1), m.end() - 1, 0
-    for j in range(m.end() - 1, len(src)):
-        if src[j] == "{": depth += 1
-        elif src[j] == "}":
+def brace_match(text, open_brace_idx):
+    depth = 0
+    for j in range(open_brace_idx, len(text)):
+        if text[j] == "{": depth += 1
+        elif text[j] == "}":
             depth -= 1
-            if depth == 0: break
-    devs[name] = src[m.end():j]
+            if depth == 0: return j
+    raise ValueError("unbalanced braces")
+
+# --- device blocks by name (brace matching from each header) ---
+devs = {}
+for m in DEV.finditer(src):
+    j = brace_match(src, m.end() - 1)
+    devs[m.group(1)] = src[m.end():j]
 
 def dev_bytes(body):
     """shim DDR bytes for one invocation of this device, per named memref arg."""
@@ -50,27 +62,44 @@ def dev_bytes(body):
         per[arg] += outer * int(ln) * ELEM[ty]
     return per
 
+def dev_seqs(body):
+    """{sequence name: sub-body} for one device -- 1 entry normally, >1 under a merge flag."""
+    out = {}
+    for m in SEQ.finditer(body):
+        j = brace_match(body, body.index("{", m.end()))
+        out[m.group(1) or "sequence"] = body[body.index("{", m.end()):j]
+    return out
+
+devs_seqs = {op: dev_seqs(body) for op, body in devs.items()}
+
 # --- top-level orchestrator = the device with no @name ---
 top = src[src.rindex("aie.device(npu2) {"):]
 # One EXECUTION is one `aiex.run`, not one `aiex.configure`: a configure block may hold many runs
-# (op7_Transpose issues 12 inside a single block), so attribute each run to its enclosing configure.
+# (op7_Transpose issues 12 inside a single block), so attribute each run to its enclosing configure
+# AND to the sequence symbol it names -- that symbol, not the op, picks the BD sizes to charge.
 invocations, cur = [], None
 for line in top.splitlines():
     m = CFG.search(line)
     if m:
         cur = m.group(1)
-    elif "aiex.run" in line and cur:
-        invocations.append(cur)
+    m2 = RUN.search(line)
+    if m2 and cur:
+        invocations.append((cur, m2.group(1)))
 
 print(f"operator invocations per dispatch: {len(invocations)}")
 by_op = collections.Counter(invocations)
 total = 0
 rows = []
-for op, n in by_op.most_common():
-    if op not in devs:
+seq_bytes = {}
+for (op, seq), n in by_op.most_common():
+    if op not in devs_seqs:
         print(f"  MISSING device body for {op}", file=sys.stderr); continue
-    b = sum(dev_bytes(devs[op]).values())
-    rows.append((op, n, b, n * b))
+    seqs = devs_seqs[op]
+    if seq not in seqs:
+        print(f"  MISSING sequence {seq} in device {op}", file=sys.stderr); continue
+    b = seq_bytes.setdefault((op, seq), sum(dev_bytes(seqs[seq]).values()))
+    label = op if seq == "sequence" else f"{op}[{seq}]"
+    rows.append((label, n, b, n * b))
     total += n * b
 
 print(f"\n{'op':28} {'runs':>5} {'MB/run':>9} {'MB/dispatch':>12}")

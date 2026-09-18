@@ -20,6 +20,10 @@ SEQ_ARGS = re.compile(r"(%arg\d+):\s*memref<((?:\d+x)+)(bf16|f32|i8|i32)>")
 TASK = re.compile(r"aiex\.dma_configure_task_for @(\w+)")
 BD = re.compile(r"aie\.dma_bd\((%arg\d+)\s*:\s*memref<[^>]*>\s*offset\s*=\s*(\d+)\s+len\s*=\s*(\d+)"
                 r"\s+sizes\s*=\s*\[([^\]]*)\]\s+strides\s*=\s*\[([^\]]*)\]")
+# Same root cause as decode_ddr_bytes.py's MERGE_WEIGHT_GEMVS/POINTWISE_MODES fix (see its comment):
+# a merged device carries several `aie.runtime_sequence`s, and only the one the `aiex.run @<seq>`
+# call names is live for that invocation -- designs must be keyed (device, sequence), not device alone.
+SEQ = re.compile(r"aie\.runtime_sequence(?:\s+@(\w+))?\s*\(")
 
 
 def body_of(src, start):
@@ -104,7 +108,7 @@ def owner(addr):
     return "-"
 
 
-# Per design: its BDs in textual order as (direction, arg index, [(byte_start, byte_len)]).
+# Per (design, sequence): its BDs in textual order as (direction, arg index, [(byte_start, byte_len)]).
 designs = {}
 for m in DEV.finditer(src):
     body = body_of(src, m.end() - 1)
@@ -113,23 +117,24 @@ for m in DEV.finditer(src):
         prod, cons = f.group(2), f.group(3)
         fifo_dir[f.group(1)] = ("read" if prod.startswith("%logical_shim") else
                                 "write" if "%logical_shim" in cons else "internal")
-    seq = body[body.find("aie.runtime_sequence("):]
-    head = seq.split("\n", 1)[0]
-    esz = {a: ELEM[t] for a, _, t in SEQ_ARGS.findall(head)}
-    bds, task = [], None
-    for line in seq.splitlines():
-        t = TASK.search(line)
-        if t:
-            task = t.group(1)
-            continue
-        b = BD.search(line)
-        if b:
-            arg = b.group(1)
-            sizes = [int(x) for x in b.group(4).split(",")]
-            strides = [int(x) for x in b.group(5).split(",")]
-            bds.append((fifo_dir.get(task, "unknown"), int(arg[4:]),
-                        bd_ranges(int(b.group(2)), int(b.group(3)), sizes, strides, esz[arg])))
-    designs[m.group(1)] = bds
+    for sm in SEQ.finditer(body):
+        seq_body = body_of(body, body.index("{", sm.end()))
+        head = body[sm.start():body.find("\n", sm.end())]
+        esz = {a: ELEM[t] for a, _, t in SEQ_ARGS.findall(head)}
+        bds, task = [], None
+        for line in seq_body.splitlines():
+            t = TASK.search(line)
+            if t:
+                task = t.group(1)
+                continue
+            b = BD.search(line)
+            if b:
+                arg = b.group(1)
+                sizes = [int(x) for x in b.group(4).split(",")]
+                strides = [int(x) for x in b.group(5).split(",")]
+                bds.append((fifo_dir.get(task, "unknown"), int(arg[4:]),
+                            bd_ranges(int(b.group(2)), int(b.group(3)), sizes, strides, esz[arg])))
+        designs[(m.group(1), sm.group(1) or "sequence")] = bds
 
 top = src[src.rindex("aie.device(npu2) {"):]
 spaces = collections.defaultdict(Intervals)
@@ -150,13 +155,17 @@ for line in top.splitlines():
     if v:
         views[v.group(1)] = (v.group(2), consts[v.group(3)])
         continue
-    r = re.match(r"aiex\.run @\w+\(([^)]*)\)", s)
+    r = re.match(r"aiex\.run @(\w+)\(([^)]*)\)", s)
     if r and cur:
-        ops = [views.get(o.strip(), (o.strip(), 0)) for o in r.group(1).split(",")]
+        key = (cur, r.group(1))
+        if key not in designs:
+            print(f"  MISSING sequence {r.group(1)} in device {cur}", file=sys.stderr)
+            continue
+        ops = [views.get(o.strip(), (o.strip(), 0)) for o in r.group(2).split(",")]
         st = stat[cur]
         st[0] += 1
         for want in ("read", "write"):
-            for direction, argi, ranges in designs[cur]:
+            for direction, argi, ranges in designs[key]:
                 if direction != want:
                     continue
                 space, base = ops[argi]
