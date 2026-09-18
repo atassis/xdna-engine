@@ -330,8 +330,43 @@ name = "gemma4-12b"
 #   Residual 4x (scores_group_fix/MAX_GROUP_REUSE=4) is a separate task, needs a brick change.
 #   Rollback: point decode= back at decode_s6912_l48_are_wgm_pwm and reinstall.
 
+#
+# DEFAULT SINCE 2026-09-18: `decode_s6912_l48_are_wgm_pwm_rr_mvq2`, the same recipe built against an
+#   IRON whose mv_quant inner loop carries TWO accumulators instead of one (MVQ_UNROLL=2, default;
+#   odd chunk counts fall back). The int4 dequant loop was recurrence-bound on a single
+#   `::aie::accum` -- chunk c+1's mac could not issue until chunk c's had produced a result -- and
+#   two independent accumulators over the even/odd chunks break that chain. Compile-only:
+#   0.2344 -> 0.1328 bundles/element, -43.3%, and the steady state loses its last idle bundle.
+#   An earlier probe that moved all three pointer walks onto post-increment addressing was 15 -> 15
+#   bundles and freed only NOPs; that refutation is what identified the accumulator as the chain.
+#     latency   decode step p50 321.71 -> 233.52 ms at n_past 1 and 325.08 -> 236.99 at 512,
+#               **-88.19 ms, -27.41%**. ABBA (unroll2/shipped/shipped/unroll2), 30 timed reps and
+#               5 warmup per point, two arms per side reproducing to 0.17 ms, determinism 2/2 on
+#               every arm, medians agreeing with mins. Read on MIN because an interactive tenant
+#               was on the box; the medians say the same thing.
+#     arena     7164551680 B and all 832 layout entries byte-identical to the previous default, so
+#               `prefill_m64_s6912_l48_seg4_ring` pairs with NO prefill rebuild.
+#     logits    NOT byte-identical, by construction -- two accumulators change the summation order.
+#               L=6: 8/8 greedy token parity against qat_int4g32_oracle_l6, same ids as the previous
+#               default. 48 layers teacher-forced on identical context: 95/96 against the previous
+#               default, differing at step 46 only.
+#     THAT MISMATCH WAS ADJUDICATED AGAINST THE OLD KERNEL, which is why this shipped. A float32
+#               host forward (validated first by reproducing all 8 L=6 oracle tokens exactly) puts
+#               this arm's token 12344 at logit 27.39, leading the field by 9.6, and the previous
+#               default's 27736 at 17.13 -- outside the top 5. A 10.25-logit gap, not a near-tie.
+#               The preceding 46 tokens are a 4-token cycle held for 11 repetitions; 12344 continues
+#               it at the expected phase and 27736 is where the OLD kernel breaks it. The shallower
+#               reduction tree is the more accurate one, as the numerics predicted (14% closer to an
+#               f64 reference on the kernel's own shape).
+#     note      This BEAT its own clamped projection of ~79 ms by 9.2 ms, so the "206 ms core term
+#               against a 127 ms weight-stream floor" decomposition is wrong somewhere and wants
+#               re-deriving. Against the full-token transport floor of 140.24 ms this arm sits at
+#               1.67x, where the previous default sat at 2.29x.
+#   Rollback: point decode= back at decode_s6912_l48_are_wgm_pwm_rr and reinstall. The IRON-side
+#   knob is MVQ_UNROLL in aie_kernels/generic/mv_quant.cc; 1 restores the old loop.
+#
 [artifacts]
-decode = "artifacts/gemma4-12b/decode_s6912_l48_are_wgm_pwm_rr"
+decode = "artifacts/gemma4-12b/decode_s6912_l48_are_wgm_pwm_rr_mvq2"
 #
 # DEFAULT SINCE 2026-09-18: `prefill_m64_s6912_l48_seg4_ring`, the same recipe plus
 # PREFILL_SLIDING_RING=1, which batches prefill past the 1024 sliding-window capacity.
