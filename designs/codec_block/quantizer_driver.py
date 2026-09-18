@@ -318,8 +318,15 @@ def _rope_head(x_head, positions, tag):
 # 3. PREFILL_ATTN_CHUNK (flash/chunked attention). `_flash_design` is verify_prefill_attn.py's own
 # `_build_flash_design`, UNCHANGED except for memoization: the compiled program depends only on
 # (t_tokens, n_chunks, hd), never on which head or layer, so this driver builds it ONCE per T and
-# reuses it for all N_HEAD x N_LAYERS calls, rather than rebuilding (use_cache=False, ~150ms each)
-# 128 times over. Packing (`_pack_flash_head`) is golden.pack_head_chunks's own convention, transcribed
+# reuses the same CallableDesign for all N_HEAD x N_LAYERS calls.
+#
+# That object reuse is not on its own enough to skip the rebuild. `use_cache` is read inside
+# `CallableDesign.__call__` (python/utils/callabledesign.py:345, `... if compilable.use_cache else
+# None`), not at construction, so under use_cache=False the kernel cache is bypassed on EVERY call
+# and _compile_and_build_kernel runs each time -- ~150ms x 128 calls. It is True below because
+# nothing edits a kernel between these calls, which is the condition that makes it safe.
+#
+# Packing (`_pack_flash_head`) is golden.pack_head_chunks's own convention, transcribed
 # rather than imported (same reasoning as _rope_cossin above).
 # =====================================================================================================
 
@@ -377,7 +384,7 @@ def _flash_design(t_tokens, n_chunks, hd):
     base = bricklib._design_key(
         "prefill_attn_chunk", compile_flags, bricklib._include_closure_digest(PREFILL_CC, compile_flags))
     design.__name__ = design.__qualname__ = f"{base}_hd{hd}_nchunks{n_chunks}_t{t_tokens}"
-    built = iron.jit(design, use_cache=False)
+    built = iron.jit(design, use_cache=True)
     _flash_design_cache[key] = built
     return built
 
