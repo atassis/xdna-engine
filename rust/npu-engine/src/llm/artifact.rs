@@ -1283,6 +1283,7 @@ impl LlmArtifact {
         std::iter::once("x")
             .chain(self.rope_inputs.iter().map(|(n, _)| n.as_str()))
             .chain(self.mask_widths.iter().map(|m| m.buffer.as_str()))
+            .chain(self.mask_ring.iter().map(|m| m.buffer.as_str()))
             .collect()
     }
 
@@ -2333,6 +2334,41 @@ mod tests {
         // would load fine and then be dispatched as an all-zero mask -- every row all -inf.
         assert_eq!(art.per_dispatch_writes(), vec!["x", "rope", "sm_widths"]);
         art.check_per_token_writes(&art.per_dispatch_writes()).expect("every input is written");
+    }
+
+    /// `PREFILL_SLIDING_RING=1` adds a FOURTH input carrying the per-row (hole_lo, hole_hi, width)
+    /// triples.
+    fn ring_prefill_meta(m: usize) -> serde_json::Value {
+        let mut pre = causal_prefill_meta(m);
+        let q_heads = pre["dims"]["q_heads"].as_u64().unwrap() as usize;
+        let after_widths = pre["input_size"].as_u64().unwrap() as usize;
+        let len = q_heads * m * 3 * 4;
+        pre["layout"]["sm_ring"] =
+            serde_json::json!({"type": "input", "offset": after_widths, "len": len});
+        pre["inputs"] = serde_json::json!(["x", "rope", "sm_widths", "sm_ring"]);
+        pre["input_size"] = serde_json::json!(after_widths + len);
+        pre["mask_ring"] = serde_json::json!({
+            "buffer": "sm_ring", "dtype": "int32", "rows": q_heads * m, "len": len,
+            "geoms": [{"head_dim": HEAD_DIM, "capacity": 1024}],
+        });
+        pre
+    }
+
+    /// The ring buffer must reach `per_dispatch_writes`. It did not: `npu_prefill` wrote it every
+    /// dispatch, but the derived list named only `x`, the rope tables and the widths, so
+    /// `check_per_token_writes` refused every ring artifact at load with "no per-token host write:
+    /// sm_ring" -- a true write reported as missing because the derivation, not the write, was
+    /// short. Pin the failing direction too: the list this returns is the only thing that gates.
+    #[test]
+    fn a_ring_prefill_artifact_puts_its_ring_buffer_on_the_write_list() {
+        let art = load_causal_prefill(&ring_prefill_meta(2)).expect("ring prefill artifact");
+        let mr = art.mask_ring.as_ref().expect("mask_ring must resolve");
+        assert_eq!(mr.buffer, "sm_ring");
+        assert_eq!(mr.geoms, vec![(HEAD_DIM, 1024)]);
+        assert_eq!(art.per_dispatch_writes(), vec!["x", "rope", "sm_widths", "sm_ring"]);
+        art.check_per_token_writes(&art.per_dispatch_writes()).expect("every input is written");
+        assert!(art.check_per_token_writes(&["x", "rope", "sm_widths"]).is_err(),
+            "omitting the ring buffer must still fail -- otherwise this gate proves nothing");
     }
 
     #[test]
