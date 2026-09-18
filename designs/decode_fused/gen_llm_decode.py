@@ -1681,6 +1681,20 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
     # than build the first geometry's design and run every layer through it.
     _geom1 = geoms[0] if len(geoms) == 1 else None
     decode_layer_why = ("FUSE_DECODE_LAYER=0" if not FUSE_DECODE_LAYER else
+                        # BEFORE the geometry count, because it does not depend on it.
+                        # decode_layer_dp hardcodes fuse_o=True and swiglu_mlp_dp's fuse_o derives
+                        # R_CX = QD//D, so a model whose QD is not a whole multiple of D is refused
+                        # at ANY geometry count. Checked across EVERY geometry rather than the
+                        # single one, which is None exactly when this used to go unreported: the
+                        # count clause below short-circuited first and the real failure surfaced as
+                        # a raise three frames down in another operator, naming a variable instead
+                        # of a model. A session ordered a day's work behind the count clause
+                        # believing it was the blocker.
+                        "fuse_o needs QD to be a whole multiple of D ({}); {} has {}".format(
+                            D, sp.name,
+                            ", ".join(f"QD={Hq * _hd} (remainder {(Hq * _hd) % D})"
+                                      for _hd, _, _ in geoms if (Hq * _hd) % D))
+                        if any((Hq * _hd) % D for _hd, _, _ in geoms) else
                         f"needs ONE attention geometry; {sp.name} has {len(geoms)}: {geoms}"
                         if _geom1 is None else
                         qkv_dp_why[_geom1] if qkv_dp_why[_geom1] else
