@@ -227,6 +227,12 @@ PRESETS = {
     # generation also holds.
     "all-int8": ({"mlp": "int8a/g128", "attn_o": "int8a/g128", "head": "int8a/g128",
                   "qkv": "int8a/g128"}, "no-fusion"),
+    # gemma4-12b lm-head (T1.5): symmetric, same reasoning as mlp-int4-sym above -- affine is
+    # better on error (int8a/g32 0.480%) but carries the constant per-call cost. g64 not g128:
+    # at K=3840, g128 derives a sub-128-bit int8 vector, which does not compile
+    # (int8-g128-derives-an-illegal-vector-width-at-k3840). Measured rel-L2 0.654% on the full
+    # 262144x3840 tensor.
+    "head-int8-g64": ({"head": "int8/g64"}, "fused"),
     # The arm the device has run end to end: +7.50% perplexity [+4.05, +11.06] t=4.35 on 2000
     # paired positions.
     "mlp-int4": ({"mlp": "int4a/g128/zero_grid", "attn_o": "int4a/g128/zero_grid"}, "fused"),
