@@ -465,7 +465,7 @@ impl NpuPrefill {
         // The bound is per GEOMETRY, not the build-wide `max_seq` -- see `batchable_window`. On
         // Gemma-4-12B that is 1024, not S=6912, and the decline it used to describe as unreachable
         // is now the normal path for a prompt over the sliding window.
-        let caps: Vec<usize> = self.artifact.kv_windows.iter().map(|&(_, _, c, _)| c).collect();
+        let caps: Vec<usize> = self.artifact.kv_windows.iter().map(|&(_, _, c, _, _, _)| c).collect();
         let ring_caps: Vec<usize> =
             self.mask_ring.as_ref().map(|(_, mr)| mr.geoms.iter().map(|&(_, c)| c).collect())
                 .unwrap_or_default();
@@ -561,7 +561,7 @@ impl NpuPrefill {
                         .map_err(|e| EngineError::Device(format!("write prefill kv_off scratchpad: {e}")))?;
                 }
             } else {
-                for &(slot, head_dim, capacity, _) in &self.artifact.kv_windows {
+                for &(slot, head_dim, capacity, _, _, _) in &self.artifact.kv_windows {
                     if crosses_wrap_point(chunk.start, self.batch, capacity) {
                         return Err(EngineError::Unsupported(format!(
                             "prefill chunk at {} spans the wrap point of a capacity-{capacity} \

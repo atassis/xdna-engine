@@ -438,7 +438,7 @@ def main():
             # the global layers the sliding layers' KV offset.
             # THIS SEGMENT'S slots, not the whole graph's: the names are per geometry, so a
             # segment with no global layer has no `kv_off1` and writing one raises.
-            for slot_name, slot_hd, slot_w, slot_mask in _st["sg"]["geom_slots"]:
+            for slot_name, slot_hd, slot_w, slot_mask, _slot_blk, _slot_hkv in _st["sg"]["geom_slots"]:
                 # `kv_layout.kv_off` owns this formula (main), but it needs kv_heads for the block
                 # stride and `kv_slots` carries only head_dim. At T == S the block term vanishes
                 # (block 0, within == pos) and the two agree exactly, which is every artifact built
