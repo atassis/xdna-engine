@@ -1877,11 +1877,19 @@ def main():
             raise SystemExit(f"ERROR: decode artifact kv_block={dkb} does not divide --batch "
                              f"{a.batch}; the KV append would straddle a block boundary")
         # `kc`/`vc` are sized by the CAPACITY, so it is the capacity -- `--kv-alloc`, which
-        # defaults to the window -- that has to equal decode's S. A narrower attention window over
-        # a wider shared cache is exactly what the flag exists for.
+        # defaults to the window -- that has to be matched. A narrower attention window over a
+        # wider shared cache is exactly what the flag exists for.
+        #
+        # Decode's own capacity is per GEOMETRY and lives in `kv_windows`; `dims.S` is its WINDOW
+        # and equals the capacity only on an artifact built without KV_ALLOC. Take the widest
+        # geometry, which is the one `--kv-alloc` names, and fall back to `dims.S` for every
+        # artifact that predates the field.
+        dec_caps = [e.get("window") for e in (dm.get("scratchpad", {}) or {}).get("kv_windows", [])
+                    if e.get("window")]
+        dec_capacity = max(dec_caps) if dec_caps else dm["dims"]["S"]
         for key, ours in (("S", a.kv_alloc or a.seq), ("layers", a.layers), ("d_model", sp.d_model),
                           ("head_dim", sp.head_dim), ("kv_heads", sp.n_kv_heads)):
-            theirs = dm["dims"][key]
+            theirs = dec_capacity if key == "S" else dm["dims"][key]
             if key == "layers":
                 if a.layers > theirs:
                     raise SystemExit(f"ERROR: --layers {a.layers} exceeds the decode artifact's "
