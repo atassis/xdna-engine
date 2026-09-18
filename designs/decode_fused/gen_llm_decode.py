@@ -720,6 +720,11 @@ def sequence_name(sp, NL, S, placer_flags, decode_layer_active=False, T=None, tm
     # attn_block_why. Empty when no geometry qualifies, so an on-but-inert flag keeps the name.
     if attn_block_geoms:
         parts.append("ab" + "".join(f"_{h}" for h in sorted(attn_block_geoms)))
+    # The window override changes the graph (rpc, the KV ring, every sliding design's max_seq),
+    # so it has to reach the name or two arms share one cached artifact -- this function's own
+    # docstring is about exactly that failure. Experiment knob; absent on every shipped arm.
+    if os.environ.get("SLIDING_WINDOW_OVERRIDE"):
+        parts.append(f"win{os.environ['SLIDING_WINDOW_OVERRIDE']}")
     if SPLIT_GH_DRAIN != 1:
         parts.append(f"sgh{SPLIT_GH_DRAIN}")
     if ATTN_SPLIT:
@@ -1777,6 +1782,12 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
         is_global_geom = hd == sp.global_head_dim and hkv == sp.global_n_kv_heads
         w = (S if (is_global_geom or not SLIDING_KV_CIRCULAR or sp.sliding_window is None)
              else sp.sliding_window)
+        # EXPERIMENT KNOB, 2026-09-18, not a shipped default. attn_block_dp pads each quantized
+        # Wqkv row up to `rpc` cache rows, and `rpc` must both cover the row and DIVIDE the
+        # window -- so 1024 forces rpc=8 (1.90x) where any multiple of 5 reaches rpc=5 (1.19x).
+        # This narrows the sliding window, so it is a QUALITY change and must not be defaulted on.
+        if not is_global_geom and os.environ.get("SLIDING_WINDOW_OVERRIDE"):
+            w = int(os.environ["SLIDING_WINDOW_OVERRIDE"])
         KVA_g = KV_ALLOC or w
         # T (the KVLayout block size) is derived once, globally, against S -- today always S
         # itself (flat, "one block"). A geometry whose own capacity is w < T needs its OWN flat
