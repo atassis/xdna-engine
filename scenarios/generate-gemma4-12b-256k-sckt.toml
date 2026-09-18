@@ -1,0 +1,15 @@
+[scenario]
+kind = "generate"
+name = "gemma4-12b-256k-sckt"
+
+# The CONTROL for `gemma4-12b-rung8192`: identical graph and flags, window == capacity == 262144.
+# Blocking the scores GEMV's K cache took this arm 1016.0 -> 550.8 ms/token (-45.8%, two alternated
+# ABBA pairs agreeing within 3.5 ms); `gemma4-12b-256k` is the pre-blocking build and is NOT the
+# control for a rung measurement, which would conflate two changes.
+[artifacts]
+decode = "artifacts/gemma4-12b/decode_s262144_sckt"
+weights = "artifacts/gemma4-12b/weights_int4g32sbf16_planar_qat_rg"
+tokenizer_dir = "artifacts/gemma4-12b/tokenizer"
+
+[generation]
+max_tokens = 512

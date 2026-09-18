@@ -1,0 +1,35 @@
+[scenario]
+kind = "generate"
+name = "gemma4-12b-rung8192"
+
+# Gemma-4-12B at a 262144-token capacity whose DECODE STEP is priced at an 8192-token window.
+#
+# SAME weights, SAME tokenizer, SAME graph as `gemma4-12b-256k`. The difference is KV_ALLOC: the KV
+# cache is ALLOCATED for 262144 positions while attention computes over `--max-seq 8192`. The 256k
+# arm costs 1016.8 ms/token at n_past 19 exactly as at n_past 200000, because a shim BD length is a
+# static field and `M` stays the streamed extent -- so 776 ms of it is paid for the ALLOCATION.
+# Here the streamed extent is the window, and the cache stays wide enough to hold the context.
+#
+#   build  GEN_EXTRA='--max-seq 8192' KV_ALLOC=262144 SOFTMAX_SEGMENT=1024 ATTN_RUNTIME_EXTENT=1 \
+#            GQA_GROUPED_K=1 GQA_GROUPED_V=1 FUSE_QKV_DP=0 SPLIT_LM_HEAD=0 SLIDING_KV_CIRCULAR=1 \
+#            MERGE_WEIGHT_GEMVS=1 POINTWISE_MODES=1 COLLAPSE_MERGED_CONFIGURES=1 \
+#            WEIGHTS=$PWD/artifacts/gemma4-12b/weights_int4g32sbf16_planar_qat_rg \
+#            bash scripts/build_llm_decode.sh gemma4-12b 48 \
+#              $A/decode_s8192_ka262144_l48
+#
+# CAPACITY AND WINDOW ARE PER GEOMETRY, and meta.json's kv_windows carries both: the 8 global
+# layers hold 262144 positions (kv_block 16, 1 kv head, 268,435,456 B per cache) and the 40
+# circular sliding ones stay at their own 1024 (kv_block 1024, 8 kv heads, 4,194,304 B). 96 caches,
+# 4.31 GB. A rung is a POWER-OF-TWO divisor of the capacity -- `S` must be a whole number of blocks
+# of `T` -- so 2048/4096/8192/16384 are the ladder this one is the first rung of.
+#
+# WHAT IS NOT HERE: attention past position 8192 within one dispatch. The window is the attention
+# EXTENT, so this serves a 262144-position cache one 8192-wide view at a time; the resident ladder
+# that selects a wider rung as `n_past` grows is `window_rungs` and is not built.
+[artifacts]
+decode = "artifacts/gemma4-12b/decode_s8192_ka262144_l48"
+weights = "artifacts/gemma4-12b/weights_int4g32sbf16_planar_qat_rg"
+tokenizer_dir = "artifacts/gemma4-12b/tokenizer"
+
+[generation]
+max_tokens = 512
