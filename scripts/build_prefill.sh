@@ -4,10 +4,8 @@
 #
 #   bash scripts/build_prefill.sh [LAYERS] [BATCH] [SEQ] [OUT_DIR]
 #
-# IRON defaults to wt-iron-causal, NOT amd_paths.sh's wt-iron-integ: this build needs BOTH
-# OperatorSequence(scratch_order=...) for the shared arena and Softmax(vector_size_source="rows")
-# for the causal mask, and branch prefill/causal-softmax is where the two meet.
-# Override with IRON=<dir>; the build fails loud if either parameter is absent.
+# IRON defaults to amd_paths.sh's IRON_DIR and is gated on the API SURFACE below, never on a
+# branch name -- the same idiom build_llm_decode.sh uses. Override with IRON=<dir>.
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WS="$(cd "$REPO/.." && pwd)"
@@ -18,7 +16,7 @@ SPEC="${SPEC:-qwen3-0.6b}"   # override for a non-qwen3 spec (e.g. gemma4-12b)
 VENV_IRON="${VENV_IRON:-$REPO/.venv-iron}"
 [ -x "$VENV_IRON/bin/python" ] || VENV_IRON="$WS/xdna-engine/.venv-iron"
 . "$REPO/scripts/amd_paths.sh"
-IRON="${IRON:-$WS/wt-iron-causal}"
+IRON="${IRON:-$IRON_DIR}"
 # $REPO/artifacts/<spec>, not "$WS/artifacts-<spec>" -- the latter has a hyphen where a path
 # separator belongs and is anchored at the workspace; it resolves to a directory that has
 # never existed, so the build died on a missing weight rather than on a clear message.
@@ -34,7 +32,10 @@ iron_at="$(iron_require_api "gen_llm_prefill.py" \
   "iron/operators/rope/op.py:angle_rows" \
   "iron/operators/softmax/op.py:vector_size_source" \
   "iron/operators/strided_copy/op.py:output_offset_parameter" \
-  "iron/operators/softmax/op.py:rows_hole")" || exit 1
+  "iron/operators/softmax/op.py:rows_hole" \
+  "iron/common/kv_layout.py:def" \
+  "iron/operators/gemv/design.py:MAX_GROUP_REUSE" \
+  "iron/operators/gemv/design.py:group_reuse_n_vec")" || exit 1
 echo "[build] IRON on $iron_at (API surface verified)"
 
 ARENA_ARGS=()
