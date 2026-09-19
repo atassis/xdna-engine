@@ -460,7 +460,7 @@ def run_seed_current(args, registry_path):
                     if shape["N"] % (tn * cols):
                         tn = largest_valid_tile_n(shape["N"], cols, emulate)
                     reg.record(shape["M"], shape["K"], shape["N"], tm, tk, tn, cols,
-                               emulate=emulate, prio_accuracy=prio, source="seed",
+                               emulate=emulate, prio_accuracy=prio, source=args.source,
                                b_col_maj=shape["b_col_maj"],
                                labels=[f"{spec_name}:{lb}" for lb in shape["labels"]])
                     n += 1
@@ -530,7 +530,10 @@ def main():
     ap.add_argument("--tile", default="64,64,64", help="tile_m,tile_k,tile_n for --seed")
     ap.add_argument("--seed-cols", type=int, default=8, help="cols for --seed")
     ap.add_argument("--source", default="assumed", choices=("seed", "assumed"),
-                    help="provenance for --seed; 'sweep' is reserved for --ingest")
+                    help="provenance for --seed and --seed-current. 'seed' claims the entry "
+                         "reproduces what the generator hardcoded before the registry existed, "
+                         "which is only true for a spec that predates it; anything else is "
+                         "'assumed'. 'sweep' is reserved for --ingest")
     ap.add_argument("--seed-current", action="store_true",
                     help="write the pre-registry values for every prefill shape of --seed-specs")
     ap.add_argument("--seed-specs", type=lambda s: s.split(","), default=["qwen3-0.6b"])
