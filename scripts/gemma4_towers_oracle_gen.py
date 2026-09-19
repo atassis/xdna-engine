@@ -146,7 +146,12 @@ def main():
     processor = Gemma4UnifiedImageProcessor()
     tensor_img = processor.process_image(image, do_convert_rgb=True)  # uint8 (3,H,W)
     assert tuple(tensor_img.shape) == (3, img_h, img_w), tensor_img.shape
-    max_patches = vc.num_soft_tokens * vc.pooling_kernel_size ** 2
+    # `vc` (Gemma4UnifiedVisionConfig) carries no soft-token budget -- that is the PROCESSOR's
+    # field (`Gemma4UnifiedImageProcessor.max_soft_tokens`, 280, matching processor_config.json's
+    # `image_processor.max_soft_tokens`), not the model config's. `vc.num_soft_tokens` does not
+    # exist on transformers 5.17.0 as installed (AttributeError) -- fixed here, not re-derived.
+    num_soft_tokens = processor.max_soft_tokens
+    max_patches = num_soft_tokens * vc.pooling_kernel_size ** 2
     from transformers.models.gemma4_unified.image_processing_gemma4_unified import (
         get_aspect_ratio_preserving_size)
     th, tw = get_aspect_ratio_preserving_size(img_h, img_w, vc.patch_size, max_patches,
@@ -174,8 +179,8 @@ def main():
     # zero patches at position -1, which is what makes the tower's `valid` mask do anything.
     n_real = merged_patches.shape[0]
     merged_patches, merged_positions = pad_along_first_dim(
-        merged_patches, merged_positions, vc.num_soft_tokens)
-    print(f"  soft tokens: {n_real} real + {vc.num_soft_tokens - n_real} padded "
+        merged_patches, merged_positions, num_soft_tokens)
+    print(f"  soft tokens: {n_real} real + {num_soft_tokens - n_real} padded "
           f"= {merged_patches.shape[0]}")
     save(a.out, "prep_padded_patches", merged_patches)
     save(a.out, "prep_padded_positions", merged_positions.float())
@@ -249,7 +254,8 @@ def main():
     print(f"  staged-vs-forward() max-abs-diff: {fae:.3e} (expect 0.0)")
 
     with open(os.path.join(a.out, "meta.json"), "w") as f:
-        json.dump({"image_hw": [672, 960], "num_soft_tokens": vc.num_soft_tokens,
+        json.dump({"image_hw": [img_h, img_w], "num_soft_tokens": num_soft_tokens,
+                    "n_real_soft_tokens": n_real,
                     "audio_tokens": int(input_features.shape[1]),
                     "audio_samples": int(raw.shape[0])}, f, indent=2)
     print(f"oracle stage dump written to {a.out}")
