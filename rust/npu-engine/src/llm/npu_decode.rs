@@ -29,6 +29,7 @@ use sha2::{Digest, Sha256};
 use crate::api::EngineError;
 use crate::llm::artifact::{BufLoc, EmbedScale, LlmArtifact, RopeWrite, ScratchpadParam};
 use crate::llm::generator::{CacheState, DecodeStep};
+use crate::llm::multimodal::{self, MediaEmbeds};
 use crate::llm::npu_prefill::NpuPrefill;
 use crate::telemetry::ArmProvenance;
 
@@ -42,7 +43,7 @@ pub(crate) fn pack_bf16_bytes(f: &[f32]) -> Vec<u8> {
     out
 }
 
-fn unpack_bf16_bytes(bytes: &[u8]) -> Vec<f32> {
+pub(crate) fn unpack_bf16_bytes(bytes: &[u8]) -> Vec<f32> {
     let u16s: Vec<u16> = bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
     let mut out = vec![0f32; u16s.len()];
     npu_xrt::unpack_bf16_to_f32(&u16s, &mut out);
@@ -257,6 +258,12 @@ pub struct NpuDecodeStep {
     /// Computed once at load and cloned out per generation -- `artifact_hash` hashes the ELF
     /// (tens of MB), which `provenance()` must not redo on every call. See [`DecodeStep::provenance`].
     provenance: ArmProvenance,
+    /// Per-GENERATION (not per-load) media overrides, set by [`Self::set_media`] before a
+    /// generation starts and consulted by both [`step`](DecodeStep::step) and
+    /// [`prefill`](DecodeStep::prefill) through the one [`multimodal::embed_row`] hook. Empty by
+    /// default, which reproduces this rail's pre-multimodal behaviour exactly (a hash lookup that
+    /// always misses -- see [`MediaEmbeds`]'s doc).
+    media: MediaEmbeds,
 }
 
 /// The host embedding gather, shared verbatim by the per-token and the batched path. Sharing the
@@ -335,6 +342,25 @@ impl EmbedTable {
         }
         let v: Vec<f32> = unpack_bf16_bytes(raw).iter().map(|&e| e * self.scale).collect();
         Ok(Cow::Owned(pack_bf16_bytes(&v)))
+    }
+
+    /// A real (mmapped, not faked) table over `rows`, for tests that need [`EmbedTable::row`]'s
+    /// actual bf16 round-trip without a full [`LlmArtifact`](crate::llm::artifact::LlmArtifact) --
+    /// see `multimodal::tests` for the one that exercises the media-vs-text hook end to end.
+    #[cfg(test)]
+    pub(crate) fn for_test(dir: &std::path::Path, rows: &[Vec<f32>], scale: f32) -> Self {
+        let d_model = rows[0].len();
+        let mut bytes = Vec::with_capacity(rows.len() * d_model * 2);
+        for r in rows {
+            assert_eq!(r.len(), d_model, "for_test rows must share one width");
+            bytes.extend_from_slice(&pack_bf16_bytes(r));
+        }
+        let path = dir.join("embed_table_for_test.bin");
+        std::fs::write(&path, &bytes).expect("write test embed blob");
+        let f = std::fs::File::open(&path).expect("open test embed blob");
+        // SAFETY: same as `open`'s -- a file this test just wrote and owns exclusively.
+        let map = unsafe { memmap2::Mmap::map(&f) }.expect("mmap test embed blob");
+        EmbedTable { map, scale, d_model, vocab: rows.len() }
     }
 }
 
@@ -532,7 +558,10 @@ impl NpuDecodeStep {
 
         
 
-        Ok(NpuDecodeStep { artifact, arena, buckets, embed, rope_writes, prefill, provenance })
+        Ok(NpuDecodeStep {
+            artifact, arena, buckets, embed, rope_writes, prefill, provenance,
+            media: MediaEmbeds::default(),
+        })
     }
 
     /// `(window, kernel name)` for every bucket, ascending by window. The kernel name is what
@@ -645,10 +674,22 @@ impl DecodeStep for NpuDecodeStep {
         self.provenance.clone()
     }
 
-    /// The prefill artifact's `dims.M`, or `None` when this instance has no prefill ELF or the
-    /// batched path is switched off (`NPU_LLM_PREFILL_BATCHED=0`). Returning `None` is what makes
-    /// the A/B a one-variable change: the generator's own fallback is the per-token path.
+    /// Overrides the trait default (a no-op): this backend DOES implement the multimodal join
+    /// (`crate::llm::multimodal`), so a caller reaching it only through `dyn DecodeStep` must still
+    /// land here, not fall through to a default that would silently keep gathering every position
+    /// from the text table.
+    fn set_media(&mut self, media: MediaEmbeds) {
+        self.media = media;
+    }
+
+    /// The prefill artifact's `dims.M`, or `None` when this instance has no prefill ELF, the
+    /// batched path is switched off (`NPU_LLM_PREFILL_BATCHED=0`), or this generation carries media
+    /// (see [`Self::prefill`]'s doc). Returning `None` is what makes the A/B a one-variable change:
+    /// the generator's own fallback is the per-token path.
     fn prefill_batch(&self) -> Option<usize> {
+        if !self.media.is_empty() {
+            return None;
+        }
         self.prefill.as_ref().filter(|p| p.batched_enabled()).map(NpuPrefill::batch)
     }
 
@@ -656,13 +697,26 @@ impl DecodeStep for NpuDecodeStep {
         self.prefill.as_ref().and_then(NpuPrefill::break_even_tokens)
     }
 
+    /// Batched prefill dispatches `M` positions per chunk from one `kv_off`
+    /// (`NpuPrefill::prime`), and a row inside a media block must attend FORWARD to the block's
+    /// end -- a ~280-soft-token image spans 5 chunks at M=64, and chunking it would compute
+    /// silently wrong attention across each boundary (`multimodal`'s module doc). Rather than
+    /// reason per-chunk about which ones a media span actually crosses, this generation's WHOLE
+    /// batched path is declined the moment it carries any media: every prompt token, media and
+    /// text alike, goes through [`step`](DecodeStep::step) instead, which is correct (if slower)
+    /// because it dispatches strictly one position at a time. `set_media` is what a caller uses to
+    /// mark a generation this way; this path is unexercised by the join gate (host-only, no
+    /// device) and remains to be measured against a real batched-media dispatch.
     fn prefill(&mut self, tokens: &[u32], from: usize) -> Result<usize, EngineError> {
+        if !self.media.is_empty() {
+            return Ok(from);
+        }
         let Some(p) = self.prefill.as_ref().filter(|p| p.batched_enabled()) else { return Ok(from) };
-        p.prime(&self.arena, &self.embed, tokens, from)
+        p.prime(&self.arena, &self.embed, &self.media, tokens, from)
     }
 
     fn step(&mut self, token: u32, pos: usize) -> Result<Vec<f32>, EngineError> {
-        let x_bytes = self.embed.row(token)?;
+        let x_bytes = multimodal::embed_row(&self.embed, &self.media, token, pos)?;
         let x_loc = self.artifact.loc("x");
         self.arena
             .write_at(x_loc.arena, x_loc.off, &x_bytes)

@@ -48,6 +48,7 @@ use npu_xrt::{Device, ElfResident, FusedArena};
 
 use crate::api::EngineError;
 use crate::llm::artifact::{BufLoc, LlmArtifact, MaskRing, MaskWidths, PrefillSegment, RopeWrite};
+use crate::llm::multimodal::{self, MediaEmbeds};
 use crate::llm::npu_decode::{pack_bf16_bytes, rope_angles, rope_row, EmbedTable};
 
 /// `NPU_LLM_PREFILL_BATCHED` -- the one accessor (E003 of the env-flag contract).
@@ -422,10 +423,16 @@ impl NpuPrefill {
     /// The caller must NOT include the prompt's last token: prefill produces no logits, so that one
     /// still goes through the decode ELF, which is also what leaves the KV in exactly the state a
     /// `P` sequential-step run would.
+    ///
+    /// `media` goes through the same [`multimodal::embed_row`] hook [`NpuDecodeStep::step`]'s
+    /// per-token gather uses, so this path is CAPABLE of a media chunk -- but
+    /// `NpuDecodeStep::prefill` never calls this with a non-empty one today: see that method's doc
+    /// for why (a media block spanning a chunk boundary attends wrong). Usually `MediaEmbeds::default()`.
     pub(crate) fn prime(
         &self,
         arena: &FusedArena,
         embed: &EmbedTable,
+        media: &MediaEmbeds,
         tokens: &[u32],
         from: usize,
     ) -> Result<usize, EngineError> {
@@ -494,7 +501,11 @@ impl NpuPrefill {
             let last = tokens[chunk.start + chunk.real - 1];
             for i in 0..self.batch {
                 let tok = if i < chunk.real { tokens[chunk.start + i] } else { last };
-                x[i * d * 2..(i + 1) * d * 2].copy_from_slice(&embed.row(tok)?);
+                // A pad row's absolute position is past `tokens.len()` (nothing in `media` was ever
+                // scattered there -- see `scatter_media_rows`), so this always falls through to the
+                // repeated-real-token text gather for it, same as before `media` existed.
+                let row = multimodal::embed_row(embed, media, tok, chunk.start + i)?;
+                x[i * d * 2..(i + 1) * d * 2].copy_from_slice(&row);
             }
             arena
                 .write_at(x_loc.arena, x_loc.off, &x)

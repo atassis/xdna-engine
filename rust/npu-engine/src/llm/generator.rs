@@ -92,6 +92,13 @@ pub trait DecodeStep {
         Ok(from)
     }
 
+    /// Set (or, with `MediaEmbeds::default()`, clear) this generation's multimodal embedding
+    /// overrides -- see `crate::llm::multimodal`. Call before the first [`prefill`](Self::prefill)
+    /// or [`step`](Self::step) of a generation that carries media. The default body does nothing,
+    /// which is correct for every backend with no multimodal join (every host mock here, and a
+    /// text-only request against a device backend that does implement it).
+    fn set_media(&mut self, _media: crate::llm::multimodal::MediaEmbeds) {}
+
     /// Live device BO bytes this backend holds, or 0 for a host backend that holds none.
     ///
     /// Reported so `npu model ls` can weigh the biggest resident thing on the box. An LLM's weights,
