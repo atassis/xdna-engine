@@ -2230,7 +2230,16 @@ def main():
     prov = toolchain_provenance()
     if prov:
         meta["toolchain"] = prov
+    # The artifact's own graph identity, recorded and PRINTED. meta.json already carried the
+    # md5 of the decode it pairs with but never its own, so two arms that collided on one name
+    # linked one binary and every device-free check -- meta's entry counts, the build log, the
+    # layout census -- kept reporting the Python-side runlist they were built from. All three
+    # agreed with each other and none of them described what ran. This is the line that makes a
+    # collision visible in the log of the build that caused it.
+    import hashlib as _hl
+    meta["elf_md5"] = _hl.md5(elf).hexdigest()
     json.dump(meta, open(os.path.join(a.out, "meta.json"), "w"), indent=2)
+    print(f"[ok] elf md5 {meta['elf_md5']} -- compare arms on THIS, never on the name")
     print(f"[ok] {NL}-layer {sp.name} prefill ELF ({len(elf)}B), M={M} S={S} "
           f"causal={dims['causal']}, {dims['runlist_len']} runlist entries "
           f"({dims['per_layer']}/layer), scratch {scr/1e6:.1f} MB "
