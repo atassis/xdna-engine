@@ -48,7 +48,7 @@ name = "g4-lscale-base"
 # decode attends anyway.
 [artifacts]
 decode = "artifacts/gemma4-12b/decode_s8192_ka262144_l48"
-prefill = "artifacts/gemma4-12b/prefill_lscale_arms/baseline_l48"
+prefill = "artifacts/gemma4-12b/prefill_lscale_base_l48"
 weights = "artifacts/gemma4-12b/weights_int4g32sbf16_planar_qat_rg"
 tokenizer_dir = "artifacts/gemma4-12b/tokenizer"
 
