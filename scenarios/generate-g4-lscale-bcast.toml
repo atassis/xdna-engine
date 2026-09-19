@@ -2,7 +2,7 @@
 kind = "generate"
 name = "g4-lscale-bcast"
 
-# BROADCAST: ElementwiseMul(rows=M), 4464 runlist entries (93/layer), -40.38% -- A/B arm for prefill-256k-rung-chunk-stall-attribution. Bytes, designs,
+# BROADCAST: ElementwiseMul(rows=M), 4464 runlist entries (93/layer), -40.38% -- A/B arm for the prefill dispatch-count experiment. Bytes, designs,
 # configures and arena are identical between the two arms; ONLY the dispatch count differs.
 #
 # SAME weights, SAME tokenizer, SAME graph as `gemma4-12b-256k`. The difference is KV_ALLOC: the KV
