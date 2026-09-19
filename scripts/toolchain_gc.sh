@@ -16,7 +16,11 @@ gc_instances() {
   # Comparing unresolved paths would then fail to protect the very directory in use.
   protect_real="$(readlink -f "$protect" 2>/dev/null || echo "$protect")"
   # Any directory that a symlink in this root points at is live under another key -- never GC it.
-  pinned=" $(for l in "$root"/*; do [ -L "$l" ] && readlink -f "$l"; done | tr '\n' ' ') "
+  # `[ -L ] && readlink` as the loop's last command makes the substitution exit 1 whenever the
+  # final entry is a real directory, which set -e then turns into a failed toolchain_up AFTER a
+  # fully successful build -- indistinguishable from a compile error. Use if/fi, which always
+  # exits 0.
+  pinned=" $(for l in "$root"/*; do if [ -L "$l" ]; then readlink -f "$l"; fi; done | tr '\n' ' ') "
   while IFS= read -r d; do
     b="$(basename "$d")"
     [[ "$b" =~ ^[0-9a-f]{12}$ ]] || continue          # only lock-hash dirs are eligible
