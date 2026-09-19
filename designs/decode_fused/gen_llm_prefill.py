@@ -1441,6 +1441,13 @@ def build_graph(spec_name, NL, M, S, causal, dec_meta_path, cols=COLS, do_compil
         name += f"_seg{len(cuts)}"
     if A_RESIDENT:
         name += "_ares"
+    # Both lscale arms change the RUNLIST (156 -> 93 entries/layer at M=64) while leaving every
+    # other name component identical, which is the collision this block's header warns about --
+    # and it bit: an A/B on 2026-09-19 compiled two arms to one md5 and measured nothing.
+    if lscale_bcast:
+        name += "_lsb"
+    if no_layer_scalar:
+        name += "_nols"
     print(f"[layout] name={name}")
     fused = OperatorSequence(name, seg_rls[0], input_args=inputs, output_args=["xout"],
                              buffer_sizes=bufsz, context=ctx, share_designs=True,
