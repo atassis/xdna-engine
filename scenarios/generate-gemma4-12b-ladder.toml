@@ -35,14 +35,25 @@ name = "gemma4-12b-ladder"
 # each), but ONE arena and no extra weight memory. A bucket crossing is a hardware-context
 # transition, which is a per-destination cost rather than a constant.
 #
-# NO BATCHED PREFILL HERE YET. A prefill borrows the decode's arena, so it pairs with ONE bucket's
-# layout; pairing it against the ladder is the open piece. Use gemma4-12b-rung8192-prefill for a
-# batched-prefill arm at the 8192 window.
+# ONE PREFILL SERVES THE WHOLE LADDER, which is the second thing BUCKET_SCRATCH_ORDER buys: a
+# prefill borrows the decode's arena, and because every bucket presents the SAME layout, the one
+# built against the widest pairs with all of them -- checked, 828 shared buffers against each.
+#
+#   build  KV_ALLOC=262144 SOFTMAX_SEGMENT=1024 PREFILL_SLIDING_RING=1 PREFILL_SEGMENTS=4 \
+#            SPEC=gemma4-12b NO_GOLDEN=1 WEIGHTS=/nonexistent \
+#            QUANT_WEIGHTS=$A/weights_int4g32qat_hf MERGE_WEIGHT_GEMVS=1 POINTWISE_MODES=1 \
+#            COLLAPSE_MERGED_CONFIGURES=1 \
+#            DECODE_META=$A/decode_bkt_w262144_ka262144_l48/meta.json \
+#            bash scripts/build_prefill.sh 48 64 8192 $A/prefill_m64_w8192_bkt_ka262144_l48_seg4_ring
+#
+# Its window is 8192, so a prompt past that is declined by `batchable_window` and its tail finishes
+# stepwise -- on the ladder that tail is served by the wider bucket rather than refused.
 [artifacts]
 decode = "artifacts/gemma4-12b/decode_bkt_w262144_ka262144_l48"
 decode_buckets = [
     "artifacts/gemma4-12b/decode_bkt_w8192_ka262144_l48",
 ]
+prefill = "artifacts/gemma4-12b/prefill_m64_w8192_bkt_ka262144_l48_seg4_ring"
 weights = "artifacts/gemma4-12b/weights_int4g32sbf16_planar_qat_rg"
 tokenizer_dir = "artifacts/gemma4-12b/tokenizer"
 
