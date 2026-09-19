@@ -59,7 +59,8 @@ DEFAULT_REGISTRY = Path(__file__).with_name("gemm_tiles.json")
 SCHEMA = 1
 
 #: `source` values, weakest evidence first. Only "sweep" carries device numbers.
-SOURCES = ("seed", "assumed", "sweep")
+#: Weakest to strongest: `record` never lets a weaker claim overwrite a stronger one.
+SOURCES = ("assumed", "seed", "sweep")
 
 
 class UnsweptGemmShape(LookupError):
@@ -228,13 +229,21 @@ class Registry:
         if rej is not None:
             raise IllegalRegistryEntry(f"refusing to record an illegal tiling: {rej.detail}")
         key = key_of(M, K, N, dtype=dtype, emulate=emulate, prio_accuracy=prio_accuracy)
+        prev = self.entries.get(key)
+        merged_labels = sorted(set(labels or []) | set((prev or {}).get("labels") or []))
+        # Models share shapes -- (256,128,2048) is `scores` for qwen3-0.6b and s2-pro-slow-ar
+        # alike -- so seeding a new spec walks over entries an earlier sweep measured. Keep the
+        # stronger claim and take only the label from the weaker one.
+        if prev is not None and SOURCES.index(source) < SOURCES.index(prev["source"]):
+            prev["labels"] = merged_labels
+            return key
         self.entries[key] = {
             "M": M, "K": K, "N": N, "dtype": dtype,
             "emulate": bool(emulate), "prio_accuracy": bool(prio_accuracy),
             "tile_m": tile_m, "tile_k": tile_k, "tile_n": tile_n, "cols": cols,
             "b_col_maj": None if b_col_maj is None else bool(b_col_maj),
             "source": source,
-            "labels": sorted(set(labels or [])),
+            "labels": merged_labels,
             "measured": measured,
             "candidates_considered": candidates,
         }

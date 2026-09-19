@@ -37,6 +37,10 @@ pub struct Request {
 pub enum Body {
     Json(String),
     Wav(Vec<u8>),
+    /// Headerless little-endian i16 mono PCM: OpenAI's `response_format: "pcm"`. No sample rate
+    /// travels with it -- that is the format's own limitation, not something lost here -- so a
+    /// caller that asks for it is presumed to already know the model's rate out of band.
+    Pcm(Vec<u8>),
     /// Server-Sent Events. The generator runs on the actor thread; this is the receiving end of the
     /// channel it feeds, plus what the socket loop needs to render each item into a `data:` frame.
     /// No `Debug`/`PartialEq`: a `Receiver` has neither, and nothing needs to compare a stream body.
@@ -46,12 +50,13 @@ pub enum Body {
 impl Body {
     /// The body as text -- the JSON for a JSON body, empty otherwise. For tests and logging.
     pub fn text(&self) -> &str {
-        match self { Body::Json(s) => s, Body::Wav(_) | Body::Stream(_) => "" }
+        match self { Body::Json(s) => s, Body::Wav(_) | Body::Pcm(_) | Body::Stream(_) => "" }
     }
     pub fn content_type(&self) -> &'static str {
         match self {
             Body::Json(_) => "application/json",
             Body::Wav(_) => "audio/wav",
+            Body::Pcm(_) => "audio/pcm",
             // Ollama's stream is newline-delimited JSON, not SSE -- a client that got
             // `text/event-stream` here would look for `data:` prefixes that are not coming.
             Body::Stream(st) => match st.kind {
@@ -61,7 +66,11 @@ impl Body {
         }
     }
     pub fn bytes(&self) -> &[u8] {
-        match self { Body::Json(s) => s.as_bytes(), Body::Wav(v) => v, Body::Stream(_) => &[] }
+        match self {
+            Body::Json(s) => s.as_bytes(),
+            Body::Wav(v) | Body::Pcm(v) => v,
+            Body::Stream(_) => &[],
+        }
     }
 }
 impl std::fmt::Display for Body {
@@ -69,6 +78,7 @@ impl std::fmt::Display for Body {
         match self {
             Body::Json(s) => f.write_str(s),
             Body::Wav(v) => write!(f, "<{} bytes of audio/wav>", v.len()),
+            Body::Pcm(v) => write!(f, "<{} bytes of audio/pcm>", v.len()),
             Body::Stream(_) => f.write_str("<event-stream>"),
         }
     }
@@ -522,10 +532,17 @@ fn render_buffered(model: String, rx: std::sync::mpsc::Receiver<StreamItem>, kin
 
 /// OpenAI speech synthesis. Serves `Capability::TTS` and returns audio bytes, not JSON.
 ///
-/// `voice` is accepted and currently ignored: no model resolves one yet, and silently accepting a
-/// field that does nothing is better than rejecting requests a real client sends.
+/// `voice`, `speed` and `stream_format` are rejected by name when a caller actually asks for one
+/// (S6: a field that changes the response cannot be a silent no-op -- see
+/// `parse::reject_unsupported_speech_fields`). `response_format` is the same rule but with two
+/// real answers: `"wav"` (the default) and `"pcm"`, the only two shapes this server can produce.
 fn audio_speech(req: &Request, handle: &Handle) -> Response {
     let body = String::from_utf8_lossy(&req.body).to_string();
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+    let format = match parse::reject_unsupported_speech_fields(&v) {
+        Ok(f) => f,
+        Err(e) => return (400, format!("{{\"error\":\"{}\"}}", parse::json_escape(&e)).into()),
+    };
     let model = extract_str_field(&body, "model");
     let input = match parse::parse_inputs(&body) {
         Ok(v) => match v.into_iter().next() {
@@ -539,11 +556,19 @@ fn audio_speech(req: &Request, handle: &Handle) -> Response {
         Err(e) => return engine_err(&e),
     };
     match served.value {
-        EngineResp::Audio { pcm, sample_rate } => (200, Body::Wav(parse::wav_from_i16(&pcm, sample_rate))),
+        EngineResp::Audio { pcm, sample_rate } => match format {
+            SpeechFormat::Wav => (200, Body::Wav(parse::wav_from_i16(&pcm, sample_rate))),
+            SpeechFormat::Pcm => (200, Body::Pcm(parse::pcm_bytes(&pcm))),
+        },
         other => (500, format!("{{\"error\":\"{} returned a {} response\"}}",
             parse::json_escape(&served.model), other.shape()).into()),
     }
 }
+
+/// The two audio shapes this server can actually produce -- the only two values
+/// `reject_unsupported_speech_fields` lets `response_format` resolve to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpeechFormat { Wav, Pcm }
 
 fn embeddings(req: &Request, handle: &Handle) -> Response {
     let body = String::from_utf8_lossy(&req.body).to_string();
@@ -1637,6 +1662,44 @@ pub mod parse {
         Ok(())
     }
 
+    /// `/v1/audio/speech`'s request-shape check, the audio sibling of `reject_unsupported`: a
+    /// field this surface cannot honour must be a 400 naming it, never a silent no-op -- answering
+    /// `response_format: "mp3"` with a 200 and a WAV body would be a 200 that lied. Returns the
+    /// resolved `SpeechFormat` (`Wav` when the field is absent, since that is the one shape every
+    /// existing caller of this route already gets).
+    pub fn reject_unsupported_speech_fields(v: &serde_json::Value) -> Result<super::SpeechFormat, String> {
+        // No supported value exists yet (no model resolves a voice), so ANY explicit choice is a
+        // request this server cannot honour -- unlike `response_format`/`speed`, there is no
+        // default value that would make the field a no-op.
+        if let Some(voice) = v.get("voice").and_then(|x| x.as_str()).filter(|s| !s.is_empty()) {
+            return Err(format!(
+                "\"voice\" {voice:?} is not supported (this server does not offer voice selection)"));
+        }
+        let format = match v.get("response_format").and_then(|x| x.as_str()) {
+            None | Some("wav") => super::SpeechFormat::Wav,
+            Some("pcm") => super::SpeechFormat::Pcm,
+            Some(other) => return Err(format!(
+                "\"response_format\" {other:?} is not supported (supported: [\"wav\", \"pcm\"])")),
+        };
+        if let Some(speed) = v.get("speed").and_then(|x| x.as_f64()) {
+            if speed != 1.0 {
+                return Err(format!(
+                    "\"speed\" {speed} is not supported (no resampling implemented; only 1.0)"));
+            }
+        }
+        if v.get("stream_format").is_some_and(|x| !x.is_null()) {
+            return Err("\"stream_format\" is not supported (this server does not stream audio)".into());
+        }
+        Ok(format)
+    }
+
+    /// Headerless little-endian i16 mono PCM -- `response_format: "pcm"`'s wire shape.
+    pub fn pcm_bytes(pcm: &[i16]) -> Vec<u8> {
+        let mut w = Vec::with_capacity(pcm.len() * 2);
+        for s in pcm { w.extend_from_slice(&s.to_le_bytes()); }
+        w
+    }
+
     /// Wrap mono i16 PCM in a 44-byte canonical WAV header. The rate comes from the model, not a
     /// constant: TTS does not output at the 16 kHz the ASR side works in.
     pub fn wav_from_i16(pcm: &[i16], sample_rate: u32) -> Vec<u8> {
@@ -1839,6 +1902,39 @@ pub mod parse {
         fn json_escape_quotes_and_newlines() { assert_eq!(json_escape("a\"b\nc"), "a\\\"b\\nc"); }
         #[test]
         fn parse_wav_rejects_non_riff() { assert!(parse_wav_i16(b"not a wav").is_none()); }
+
+        #[test]
+        fn pcm_bytes_is_headerless_little_endian_i16() {
+            assert_eq!(pcm_bytes(&[1, -1, 256]), vec![1, 0, 255, 255, 0, 1]);
+            assert_eq!(pcm_bytes(&[]), Vec::<u8>::new());
+        }
+
+        #[test]
+        fn speech_fields_default_to_wav_when_nothing_is_asked_for() {
+            assert_eq!(reject_unsupported_speech_fields(&serde_json::json!({})), Ok(super::super::SpeechFormat::Wav));
+            assert_eq!(reject_unsupported_speech_fields(&serde_json::json!({"response_format":"wav"})),
+                Ok(super::super::SpeechFormat::Wav));
+        }
+
+        #[test]
+        fn speech_fields_accept_pcm() {
+            assert_eq!(reject_unsupported_speech_fields(&serde_json::json!({"response_format":"pcm"})),
+                Ok(super::super::SpeechFormat::Pcm));
+        }
+
+        #[test]
+        fn speech_fields_reject_each_unsupported_field_by_name() {
+            assert!(reject_unsupported_speech_fields(&serde_json::json!({"response_format":"mp3"}))
+                .unwrap_err().contains("response_format"));
+            assert!(reject_unsupported_speech_fields(&serde_json::json!({"voice":"alloy"}))
+                .unwrap_err().contains("voice"));
+            assert!(reject_unsupported_speech_fields(&serde_json::json!({"speed":0.5}))
+                .unwrap_err().contains("speed"));
+            assert!(reject_unsupported_speech_fields(&serde_json::json!({"stream_format":"audio"}))
+                .unwrap_err().contains("stream_format"));
+            // An explicit 1.0 is the implicit default, not a request for something unimplemented.
+            assert!(reject_unsupported_speech_fields(&serde_json::json!({"speed":1.0})).is_ok());
+        }
         #[test]
         fn form_field_reads_model_and_ignores_the_upload() {
             let b = "X";
@@ -1974,6 +2070,89 @@ mod route_tests {
         assert_eq!(u32::from_le_bytes([wav[24], wav[25], wav[26], wav[27]]), 24_000);
         assert_eq!(parse::parse_wav_i16(wav).map(|v| v.len()), None,
             "parse_wav_i16 only accepts the 16 kHz ASR shape, so it must reject 24 kHz speech");
+        h.shutdown(); j.join().unwrap();
+    }
+
+    /// Shared setup for the request-shape tests below: one mock model declaring `Capability::TTS`.
+    fn tts_handle() -> (Handle, std::thread::JoinHandle<()>, tempfile::TempDir, PathBuf) {
+        let mut t = BTreeMap::new();
+        t.insert("tts".to_string(), Ok((Capability::TTS, 1)));
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("engine.toml");
+        let cfg = Config {
+            server: ServerCfg { idle_unload_s: 0, ..Default::default() },
+            models: vec![ModelCfg { name: "tts".into(), scenario: "y".into(), resident: false }],
+            ..Default::default()
+        };
+        cfg.save(&p).unwrap();
+        let (h, j) = start(cfg, Box::new(MockLoader { table: t })).unwrap();
+        (h, j, dir, p)
+    }
+
+    /// `response_format: "pcm"` is the second real shape this server can produce: headerless
+    /// little-endian PCM, not a WAV with its header stripped by the client.
+    #[test]
+    fn speech_response_format_pcm_answers_headerless_pcm() {
+        let (h, j, _d, p) = tts_handle();
+        let (code, body) = route(&post("/v1/audio/speech",
+            r#"{"input":"hello","response_format":"pcm"}"#), &h, &p);
+        assert_eq!(code, 200, "{body}");
+        assert_eq!(body.content_type(), "audio/pcm");
+        // The mock speaks 8 samples (16 bytes); a WAV response would carry a 44-byte header first.
+        assert_eq!(body.bytes().len(), 16, "{:?}", body.bytes());
+        h.shutdown(); j.join().unwrap();
+    }
+
+    /// A `response_format` this server cannot produce (real OpenAI values it does not implement)
+    /// is a 400 naming the field and the two it DOES support -- not a 200 lying about the bytes.
+    #[test]
+    fn speech_rejects_an_unsupported_response_format_by_name() {
+        let (h, j, _d, p) = tts_handle();
+        let (code, body) = route(&post("/v1/audio/speech",
+            r#"{"input":"hello","response_format":"mp3"}"#), &h, &p);
+        assert_eq!(code, 400, "{body}");
+        assert!(body.text().contains("response_format") && body.text().contains("mp3"), "{body}");
+        assert!(body.text().contains("wav") && body.text().contains("pcm"), "{body}");
+        h.shutdown(); j.join().unwrap();
+    }
+
+    /// `speed` has no implementation (no resampling in the AR loop) -- a request for anything but
+    /// the implicit 1.0 must be a 400, never a silently-ignored field.
+    #[test]
+    fn speech_rejects_a_speed_other_than_1() {
+        let (h, j, _d, p) = tts_handle();
+        let (code, body) = route(&post("/v1/audio/speech",
+            r#"{"input":"hello","speed":1.5}"#), &h, &p);
+        assert_eq!(code, 400, "{body}");
+        assert!(body.text().contains("speed"), "{body}");
+        // 1.0 is a request for the implicit default, so it must still serve.
+        let (code, _) = route(&post("/v1/audio/speech", r#"{"input":"hello","speed":1.0}"#), &h, &p);
+        assert_eq!(code, 200);
+        h.shutdown(); j.join().unwrap();
+    }
+
+    /// `voice` has no selectable value at all yet, so any name given must be refused -- omitting
+    /// the field entirely is the only way to get a 200, and that must still work.
+    #[test]
+    fn speech_rejects_any_named_voice() {
+        let (h, j, _d, p) = tts_handle();
+        let (code, body) = route(&post("/v1/audio/speech",
+            r#"{"input":"hello","voice":"nova"}"#), &h, &p);
+        assert_eq!(code, 400, "{body}");
+        assert!(body.text().contains("voice") && body.text().contains("nova"), "{body}");
+        let (code, _) = route(&post("/v1/audio/speech", r#"{"input":"hello"}"#), &h, &p);
+        assert_eq!(code, 200);
+        h.shutdown(); j.join().unwrap();
+    }
+
+    /// `stream_format` asks for a streamed body; this route never streams audio.
+    #[test]
+    fn speech_rejects_stream_format() {
+        let (h, j, _d, p) = tts_handle();
+        let (code, body) = route(&post("/v1/audio/speech",
+            r#"{"input":"hello","stream_format":"sse"}"#), &h, &p);
+        assert_eq!(code, 400, "{body}");
+        assert!(body.text().contains("stream_format"), "{body}");
         h.shutdown(); j.join().unwrap();
     }
 

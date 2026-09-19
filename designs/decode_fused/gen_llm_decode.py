@@ -627,7 +627,7 @@ def load_weight_buffer(buf, arr):
 
 def sequence_name(sp, NL, S, placer_flags, decode_layer_active=False, T=None, tmv_declined=(),
                   tmv_chunked=(), attn_block_geoms=(), ff_chunks=1, weight_families=0,
-                  pointwise_widths=0, scores_blocks=()):
+                  pointwise_widths=0, scores_blocks=(), mlp_dp_active=False, mlp_o_active=False):
     """Name the fused sequence after everything that changes its graph, not just the model.
 
     IRON keys the cached artifact by this name. Every knob below produces a DIFFERENT ELF, so
@@ -707,9 +707,14 @@ def sequence_name(sp, NL, S, placer_flags, decode_layer_active=False, T=None, tm
     # Suffix stays ON the default here, unlike the other switches: the shipped artifact was BUILT
     # and gated under this name, and aiecc is not byte-reproducible, so a rename would mean the
     # next rebuild produces a different ELF under a name nothing was ever gated against.
-    if FUSE_MLP_DP and sp.mlp_dp_reason() is None:
+    # Passed in as the build computed them, never re-derived: `sp.mlp_dp_reason()` returns None
+    # for every spec, while the refusals that decide the graph live in build_graph's `mlp_dp_why`
+    # (operator_rejects, FF % D, MLP_TILE_ROWS) and in `fuse_o` (sandwich norms, QD % D). Reading
+    # the weaker predicate named Gemma-4's shipped arm `mlpdp4_mlpo` over an ELF with zero
+    # `swiglu`, and s2-pro-slow-ar declines both on FF/D = 3.8 and QD/D = 1.6.
+    if mlp_dp_active:
         parts.append(f"mlpdp{MLP_DP_COLS}")
-    if FUSE_MLP_O and sp.mlp_dp_reason() is None:
+    if mlp_o_active:
         parts.append("mlpo")
     # Same convention, its sibling arm: FUSE_QKV_DP defaulted ON 2026-09-07 (27a9411) and was
     # missing here entirely -- not just off-the-default-name, ABSENT, so a build before that
@@ -1572,7 +1577,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
     # _pack_head_chunked), never the bare key -- unlike mlp/attn_o/qkv the base f32 tensor always
     # stays on disk too (the host embedding-gather reads it), so membership has to be checked by
     # this exact name rather than assumed from PACKED being non-empty.
-    _head_key = f"{sp.weight_prefix}embed_tokens.weight"
+    _head_key = sp.head_weight_name()
     _head_packed = f"{_head_key}.headpack" in PACKED
     # Layout is not a per-site plan choice (every quantized site shares one on-wire row shape),
     # so unlike dtype/group_size below there is nothing to conflict-check against -- the dump's
@@ -2921,8 +2926,11 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
             bufsz["mlp_a_scratch"] = D * 2   # a's own all-gather round-trip buffer, same idiom
 
     weights["n_final"] = load_norm(f"{sp.weight_prefix}norm.weight")
-    # tied: also the host's embedding-gather table
-    embed_f32 = npy(f"{sp.weight_prefix}embed_tokens.weight")
+    # The DEVICE's lm-head stream and the HOST's embedding-gather table. One tensor on a tied
+    # spec, two on an untied one (s1-mini ships `output.weight`), which is why the head is asked
+    # for by name rather than assumed to be the table.
+    head_f32 = npy(_head_key)
+    embed_f32 = head_f32 if sp.tied_embeddings else npy(f"{sp.weight_prefix}embed_tokens.weight")
     # Quantizing W_head narrows the DEVICE lm-head stream, but W_head is TIED, so the host also
     # gathers embed[token] out of it. Rather than teach the host to dequantise -- which would
     # quantise the embedding INPUT too, a second quality change for no extra speed -- the exact
@@ -2930,17 +2938,22 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
     # dict on purpose: the device loader takes its buffer set from `weights`/`wnames`, so a side
     # file costs 311 MB of disk and ZERO device arena, and the host only ever faults in the one
     # 2 KB row it gathers.
+    # W_head doubles as the host's table only when the two ARE one tensor and the device's copy is
+    # still readable as bf16. Quantizing it, or an untied head, breaks that for different reasons
+    # and both take the same exit: a host-only blob beside the device buffer.
     embed_blob, host_embed = "W_head", None
+    if not sp.tied_embeddings:
+        embed_blob, host_embed = "W_embed", bf16(embed_f32).reshape(-1)
     if _spec("head").quantized:
         # Pre-packed by the dump when available (_head_packed) -- read the bytes straight off
         # disk rather than re-quantizing here, which is what OOM'd on Gemma-4-12B's 262144x3840
         # table (dump_llm_weights.py's _pack_head_chunked does the same math in row chunks).
         weights["W_head"] = npy_raw(f"{_head_key}.headpack") if _head_packed else \
-            _pack(embed_f32, "head")
+            _pack(head_f32, "head")
         embed_blob = "W_embed"
         host_embed = bf16(embed_f32).reshape(-1)
     else:
-        weights["W_head"] = bf16(embed_f32).reshape(-1)
+        weights["W_head"] = bf16(head_f32).reshape(-1)
     if not scale_in_qnorm:
         weights["attn_scale"] = np.full(Hq * S, sp.attn_scale, BF16)
     rl += [(op_norm, cur, "n_final", "xf")]
@@ -3050,7 +3063,8 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                             decode_layer_active=op_decode_layer is not None, T=T,
                             ff_chunks=ff_chunks, weight_families=len(weight_families),
                             pointwise_widths=len(pointwise_widths),
-                            scores_blocks=tuple(_scores_blocks))
+                            scores_blocks=tuple(_scores_blocks),
+                            mlp_dp_active=op_mlp_dp is not None, mlp_o_active=fuse_o)
         name = _sn if len(cuts) == 1 else f"{_sn}_seg{si}of{len(cuts)}"
         # A rung is THIS runlist with the layer design substituted. Only for an unsplit
         # stack: a rung rewrites one runlist, and a segmented stack has one per segment
@@ -3115,7 +3129,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
     if SPLIT_LM_HEAD:
         head_rl = [(op_head, "W_head", "xf", "logits")]
         head = OperatorSequence(
-            f"{sequence_name(sp, NL, S, placer_flags, tmv_declined=_tmv_declined, tmv_chunked=_tmv_chunked)}_lmhead", head_rl,
+            f"{sequence_name(sp, NL, S, placer_flags, tmv_declined=_tmv_declined, tmv_chunked=_tmv_chunked, mlp_dp_active=op_mlp_dp is not None, mlp_o_active=fuse_o)}_lmhead", head_rl,
                                 input_args=["xf"], output_args=["logits"],
                                 buffer_sizes={"xf": D * 2, "logits": VOCAB * 2},
                                 context=ctx, extra_flags=placer_flags, share_designs=share)

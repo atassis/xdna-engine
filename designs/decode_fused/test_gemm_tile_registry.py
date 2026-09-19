@@ -93,6 +93,32 @@ class TestRegistry:
         with pytest.raises(IllegalRegistryEntry):
             r.record(256, 1024, 2048, 64, 64, 48, 8)
 
+    def test_record_keeps_the_stronger_provenance_and_unions_labels(self):
+        """Two models share a shape: registering the second must not erase the first's timing.
+
+        `scores` is (256,128,2048) for qwen3-0.6b and for s2-pro-slow-ar alike, so seeding a new
+        spec walks over entries an earlier sweep measured.
+        """
+        r = Registry({})
+        r.record(256, 128, 2048, 64, 64, 64, 8, source="sweep",
+                 measured={"ms": 1.5}, labels=["qwen3-0.6b:scores"])
+        r.record(256, 128, 2048, 64, 64, 32, 8, source="assumed",
+                 labels=["s2-pro-slow-ar:scores"])
+        ent = r.entries[key_of(256, 128, 2048)]
+        assert ent["source"] == "sweep"
+        assert ent["tile_n"] == 64
+        assert ent["measured"] == {"ms": 1.5}
+        assert ent["labels"] == ["qwen3-0.6b:scores", "s2-pro-slow-ar:scores"]
+
+    def test_record_upgrades_on_a_real_measurement(self):
+        r = Registry({})
+        r.record(256, 128, 2048, 64, 64, 64, 8, source="assumed", labels=["s2-pro-slow-ar:scores"])
+        r.record(256, 128, 2048, 64, 64, 32, 8, source="sweep",
+                 measured={"ms": 0.9}, labels=["qwen3-0.6b:scores"])
+        ent = r.entries[key_of(256, 128, 2048)]
+        assert (ent["source"], ent["tile_n"], ent["measured"]) == ("sweep", 32, {"ms": 0.9})
+        assert ent["labels"] == ["qwen3-0.6b:scores", "s2-pro-slow-ar:scores"]
+
     def test_override_by_label(self):
         r = Registry.load(DEFAULT_REGISTRY, overrides={"scores": {"tile_n": 32}})
         ch = r.lookup(256, 128, 2048, label="scores")

@@ -33,7 +33,8 @@ int npu_available(void);
 struct NpuModel *npu_model_load(const char *scenario_path);
 
 /**
- * 0 = asr, 1 = embed, 2 = diarize, 3 = generate, -1 = error. Append-only: existing values never move.
+ * 0 = asr, 1 = embed, 2 = diarize, 3 = generate, 4 = tts, -1 = error. Append-only: existing
+ * values never move.
  */
 int npu_model_kind(const struct NpuModel *m);
 

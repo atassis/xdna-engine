@@ -1816,7 +1816,23 @@ def check_shared_weights(dec_meta_path, weights_dir, sp, dims):
     claim(same(raw("Wo")[:D * QD], npy("self_attn.o_proj").reshape(-1)),
           "Wo's first D rows are o_proj (decode pads the tail for fuse_o)")
     for nm, t in (("Wg", "mlp.gate_proj"), ("Wu", "mlp.up_proj"), ("Wd", "mlp.down_proj")):
-        claim(same(raw(nm), npy(t).reshape(-1)), f"{nm} is {t} unreordered")
+        if os.path.exists(os.path.join(bdir, f"L0_{nm}.bin")):
+            claim(same(raw(nm), npy(t).reshape(-1)), f"{nm} is {t} unreordered")
+            continue
+        # decode splits a weight over K into `<nm>k0..k<n-1>`, each a contiguous K-slice of the
+        # (N, K) matrix -- weight_gemm's `wk(i)`/`a_slice(i)` read them that way, and prefill
+        # inherits the split from the arena. Verified against s2-pro-slow-ar's Wdk0/Wdk1.
+        chunks = []
+        while os.path.exists(os.path.join(bdir, f"L0_{nm}k{len(chunks)}.bin")):
+            chunks.append(raw(f"{nm}k{len(chunks)}"))
+        if not chunks:
+            bad.append(f"{nm} is in the arena neither whole nor as k-chunks")
+            continue
+        ref = npy(t)
+        ck = ref.shape[1] // len(chunks)
+        for i, c in enumerate(chunks):
+            claim(same(c, ref[:, i * ck:(i + 1) * ck].reshape(-1)),
+                  f"{nm}k{i} is {t}[:, {i * ck}:{(i + 1) * ck}] unreordered")
 
     if sp.layer_scalar:
         # layer_scalar_name() has no ".weight" suffix, unlike every other leaf `npy()` assumes --

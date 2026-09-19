@@ -102,6 +102,15 @@ pub fn call_json(path: &str, body: &serde_json::Value) -> Result<serde_json::Val
     serde_json::from_slice(&resp).context("control socket: response was not JSON")
 }
 
+/// Like `call_json`, for the one route whose SUCCESS body is not JSON -- `/v1/audio/speech`, which
+/// answers audio bytes. Same error handling; only what a 2xx hands back differs.
+pub fn call_bytes(path: &str, body: &serde_json::Value) -> Result<Vec<u8>> {
+    let bytes = body.to_string();
+    let (code, resp) = call("POST", path, Some("application/json"), bytes.as_bytes())?;
+    if !(200..300).contains(&code) { return Err(response_error(code, &resp)); }
+    Ok(resp)
+}
+
 /// A `multipart/form-data` POST, for the two file-upload endpoints (transcribe, diarize). Mirrors
 /// exactly what `transcriptions()`/`diarizations()` already parse: a `model` field (if present)
 /// then a `file` part -- so a request built here and one built by a real OpenAI client differ only

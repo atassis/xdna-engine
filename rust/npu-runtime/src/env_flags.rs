@@ -493,6 +493,53 @@ pub const FLAGS: &[Flag] = &[
               remaining HTTP-based admin command (load/unload/config's auto-reload, the version- \
               mismatch preflight) connects to it. Also read by npu-cli/src/main.rs's resolve_http_addr." },
 
+    // -- npu-s2 -----------------------------------------------------------------------------------
+    // Five of these seven are one bug's diagnostic kit. This tree records an unfenced xdna-driver
+    // CLFLUSH race on HOST_ONLY buffers, whose signature is a window reading back byte-exactly
+    // equal to the PREVIOUS dispatch's output; RESYNC/OUT_BO_FLAG/DUMP/DUMP2/HEARTBEAT exist to
+    // observe, A/B and count it. None is a tuning knob and none should be treated as one.
+    Flag { name: "NPU_S2_RESYNC", owner: "npu-s2", site: "npu-s2/src/lib.rs",
+        semantics: Value, default: "0",
+        doc: "re-sync and re-read the output BO until two consecutive reads agree, up to this many \
+              extra attempts, counting each disagreement into RESYNC_HITS. A workaround for the \
+              host-only-BO coherency race, deliberately OFF: a retry loop cannot distinguish a \
+              stale read from a legitimately identical one, so it is a diagnostic and not a fix. \
+              Turning it on is a shipped-default change and the owner's call." },
+    Flag { name: "NPU_S2_OUT_BO_FLAG", owner: "npu-s2", site: "npu-s2/src/lib.rs",
+        semantics: Value, default: "2 (FLAG_HOST_ONLY)",
+        doc: "XRT allocation flag for the chain's OUTPUT buffer. The A/B handle for the same race: \
+              =0 allocates a normal device BO, so sync_from_device is a real transfer rather than \
+              a coherency assumption. Pairs with NPU_S2_RESYNC -- one absorbs the symptom, this \
+              one removes the condition it needs." },
+    Flag { name: "NPU_S2_DUMP", owner: "npu-s2", site: "npu-s2/src/bin/s2_chain_probe.rs",
+        semantics: Value, default: "unset (no dump)",
+        doc: "path to write run 1's output to as raw little-endian f32, BEFORE any gate runs, so a \
+              failing part can be aligned against the reference rail's own per-stage tensors \
+              offline instead of being re-run once per hypothesis." },
+    Flag { name: "NPU_S2_DUMP2", owner: "npu-s2", site: "npu-s2/src/bin/s2_chain_probe.rs",
+        semantics: Value, default: "unset (no dump)",
+        doc: "same for run 2 of the run-to-run determinism check, so the two runs can be diffed \
+              outside the harness. Only written when a second run happened." },
+    Flag { name: "NPU_S2_HEARTBEAT", owner: "npu-s2", site: "npu-s2/src/lib.rs",
+        semantics: Value, default: "0 (silent)",
+        doc: "log progress every N dispatches on a chain that otherwise sits in a DRM wait for \
+              almost all of its life. The dispatch counter it prints is also the DENOMINATOR for \
+              the stale-read rate, and is incremented before this flag is consulted -- so the rate \
+              does not depend on whether its own instrument is enabled." },
+    Flag { name: "NPU_S2_POOL_LIMIT", owner: "npu-s2", site: "npu-s2/src/lib.rs",
+        semantics: Value, default: "15 (HWCTX_LIMIT - 1)",
+        doc: "how many designs the LRU DesignPool holds before evicting. Exists to make eviction \
+              pressure an INDEPENDENT VARIABLE: forcing a low limit on a known-good input \
+              separates `breaks because the run is longer` from `breaks because more designs were \
+              evicted`. The 68-design chain needs the pool at all because the driver caps live \
+              hardware contexts at 16." },
+    Flag { name: "NPU_S2_LATENT_FRAMES", owner: "npu-s2", site: "npu-s2/src/bin/s2_chain_probe.rs",
+        semantics: Value, default: "unset (the whole latent)",
+        doc: "truncate the latent to its first N frames, range-checked against the input. Every op \
+              in the chain is a local sliding window, so a prefix reproduces the corresponding \
+              slice of a full-length run bit-identically -- which is what makes a short segment a \
+              real end-to-end gate rather than a different computation." },
+
     // -- npu-weights ------------------------------------------------------------------------------
     Flag { name: "XDNA_CHECKPOINT_DIR", owner: "npu-weights", site: "npu-weights/src/spec.rs",
         semantics: Value, default: "<root>/artifacts/checkpoints",

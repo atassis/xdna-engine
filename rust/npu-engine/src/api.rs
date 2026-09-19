@@ -7,7 +7,7 @@ use crate::pipeline::Scenario;
 
 /// What a loaded model does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ModelKind { Asr, Embed, Diarize, Generate }
+pub enum ModelKind { Asr, Embed, Diarize, Generate, Tts }
 
 impl std::fmt::Display for ModelKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -16,6 +16,7 @@ impl std::fmt::Display for ModelKind {
             ModelKind::Embed => "embed",
             ModelKind::Diarize => "diarize",
             ModelKind::Generate => "generate",
+            ModelKind::Tts => "tts",
         })
     }
 }
@@ -31,6 +32,7 @@ impl ModelKind {
             "embeddings" => Some(ModelKind::Embed),
             "diarize" => Some(ModelKind::Diarize),
             "generate" => Some(ModelKind::Generate),
+            "tts" => Some(ModelKind::Tts),
             _ => None,
         }
     }
@@ -44,6 +46,7 @@ impl ModelKind {
             ModelKind::Embed => crate::capability::Capability::EMBED,
             ModelKind::Diarize => crate::capability::Capability::DIARIZE,
             ModelKind::Generate => crate::capability::Capability::GENERATE,
+            ModelKind::Tts => crate::capability::Capability::TTS,
         }
     }
 }
@@ -127,6 +130,7 @@ impl Model {
             Scenario::Embed(m) => m.bo_bytes(),
             Scenario::Diarize(m) => m.bo_bytes(),
             Scenario::Generate(m) => m.bo_bytes(),
+            Scenario::Tts(m) => m.bo_bytes(),
         }
     }
 
@@ -190,6 +194,21 @@ impl Model {
                 wanted: ModelKind::Diarize.capability(), got: kind_of(other).capability() }),
         }
     }
+
+    /// Speech synthesis: text -> mono PCM at the model's own sample rate.
+    ///
+    /// `&mut self`, matching `generate`: a real synthesis composes the same kind of decoder and
+    /// holds a KV cache and a device context across the call. `cancel` is threaded through rather
+    /// than owned here, the same way `GenerateParams::cancel` is -- the caller (the actor, for a
+    /// device-served model) is what can publish it to something else able to stop the run.
+    pub fn synthesize(&mut self, text: &str, cancel: &crate::cancel::Cancel)
+        -> Result<(Vec<i16>, u32), EngineError> {
+        let got = kind_of(&self.scen).capability();
+        match &mut self.scen {
+            Scenario::Tts(m) => m.synthesize(text, cancel),
+            _ => Err(EngineError::WrongKind { wanted: ModelKind::Tts.capability(), got }),
+        }
+    }
 }
 
 /// The kind of a scenario without needing a `Model`. Keeps every mismatch arm above from having to
@@ -200,6 +219,7 @@ fn kind_of(s: &Scenario) -> ModelKind {
         Scenario::Embed(_) => ModelKind::Embed,
         Scenario::Diarize(_) => ModelKind::Diarize,
         Scenario::Generate(_) => ModelKind::Generate,
+        Scenario::Tts(_) => ModelKind::Tts,
     }
 }
 
@@ -235,5 +255,17 @@ mod tests {
         assert_eq!(ModelKind::from_scenario_kind("asr"), Some(ModelKind::Asr));
         assert_eq!(ModelKind::from_scenario_kind("embeddings"), Some(ModelKind::Embed));
         assert_eq!(ModelKind::from_scenario_kind("nope"), None);
+    }
+
+    #[test]
+    fn tts_is_a_model_kind_that_routes_like_its_three_siblings() {
+        assert_eq!(ModelKind::Tts.to_string(), "tts");
+        assert_eq!(ModelKind::from_scenario_kind("tts"), Some(ModelKind::Tts));
+        assert_eq!(ModelKind::Tts.capability(), crate::capability::Capability::TTS);
+        // The existing four are untouched -- this is the regression that matters.
+        assert_eq!(ModelKind::from_scenario_kind("asr"), Some(ModelKind::Asr));
+        assert_eq!(ModelKind::from_scenario_kind("embeddings"), Some(ModelKind::Embed));
+        assert_eq!(ModelKind::from_scenario_kind("diarize"), Some(ModelKind::Diarize));
+        assert_eq!(ModelKind::from_scenario_kind("generate"), Some(ModelKind::Generate));
     }
 }
