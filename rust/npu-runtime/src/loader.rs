@@ -27,6 +27,15 @@ pub trait StreamServable: Servable {
     ) -> Result<(), EngineError> {
         Err(EngineError::Unsupported(format!("{} cannot stream text generation", self.capabilities())))
     }
+
+    /// `Servable::run`, but interruptible: `cancel` is published for the call's duration the same
+    /// way `GenerateParams::cancel` is for `generate_stream`, so a caller elsewhere can stop it.
+    /// Default forwards to `run` unchanged -- embed/asr/diarize finish inside one dispatch and have
+    /// nothing to interrupt. TTS is the one capability whose `run` is a long AR loop; `EngineModel`
+    /// overrides this for it.
+    fn run_cancellable(&mut self, req: Request, _cancel: npu_engine::Cancel) -> Result<Response, EngineError> {
+        self.run(req)
+    }
 }
 
 pub trait ModelLoader {
@@ -77,7 +86,14 @@ impl Servable for EngineModel {
                     self.model.diarize(&pcm, sample_rate).map(Response::Segments),
                 _ => self.model.transcribe(&pcm, sample_rate).map(Response::Text),
             },
-            Request::Text(text) => self.model.embed(&text).map(Response::Vector),
+            // Text serves two kinds here (Embed and Tts), same reasoning as Audio above. This is
+            // the entry point for a caller that has no `Cancel` to hand in (npu-capi, a direct
+            // `Servable::run`); `run_cancellable` is the one that carries a real one into synthesis.
+            Request::Text(text) => match self.model.kind() {
+                npu_engine::ModelKind::Tts => self.model.synthesize(&text, &npu_engine::Cancel::new())
+                    .map(|(pcm, sample_rate)| Response::Audio { pcm, sample_rate }),
+                _ => self.model.embed(&text).map(Response::Vector),
+            },
             // Neither engine scenario takes an image, so this is a routing bug rather than a user
             // error -- but still a Result, because the actor must not be panicked by one.
             Request::Image { .. } => Err(EngineError::WrongKind {
@@ -92,6 +108,18 @@ impl StreamServable for EngineModel {
     fn generate_stream(&mut self, prompt: &npu_engine::Prompt, params: &npu_engine::GenerateParams,
         sink: &mut dyn FnMut(npu_engine::Chunk<'_>) -> bool) -> Result<(), EngineError> {
         self.model.generate(prompt, params, sink)
+    }
+
+    /// The one capability that needs the actor's published `Cancel`: a synthesis is a long AR loop
+    /// with no sink to poll instead, the same reasoning `generate_stream` above needs none of --
+    /// every other kind's `run` already returns inside one dispatch.
+    fn run_cancellable(&mut self, req: Request, cancel: npu_engine::Cancel) -> Result<Response, EngineError> {
+        match (self.model.kind(), req) {
+            (npu_engine::ModelKind::Tts, Request::Text(text)) =>
+                self.model.synthesize(&text, &cancel)
+                    .map(|(pcm, sample_rate)| Response::Audio { pcm, sample_rate }),
+            (_, req) => self.run(req),
+        }
     }
 }
 
@@ -120,12 +148,28 @@ impl ModelLoader for EngineLoader {
         Capability::from_scenario_kind(&sc.scenario.kind)
     }
 
-    /// Reads the same scenario TOML `declared_capability` does, then stats `artifacts.weights` --
+    /// Reads the same scenario TOML `declared_capability` does, then stats the artifact path(s) --
     /// a file's own size, or the recursive sum of a directory's. Approximate (host bytes, not device
     /// BO bytes -- padding/quantization can disagree with either), but it's the only number that
     /// exists before anything is loaded.
+    ///
+    /// `tts` is not one `artifacts.weights` dir: it is two autoregressive weight sets plus a codec
+    /// (`[tts]`, `config::TtsCfg`), and this is read with the service DOWN to check the pin
+    /// invariant before anything is loaded -- an undercount here corrupts residency accounting for
+    /// every OTHER model, not just this one. Summing a field that is empty by default would silently
+    /// answer `Some(0)`; worse, `self.root.join("")` resolves to `self.root` itself, so it would
+    /// walk and sum the entire root. `dir_or_file_size` is never asked to do either: an empty part
+    /// makes the whole footprint `None`, the same honest-unmeasured answer as a missing directory.
     fn declared_footprint(&self, cfg: &ModelCfg) -> Option<u64> {
         let sc = npu_engine::config::ScenarioConfig::load(&self.scenario_path(cfg)).ok()?;
+        if npu_engine::ModelKind::from_scenario_kind(&sc.scenario.kind) == Some(npu_engine::ModelKind::Tts) {
+            let mut total = 0u64;
+            for part in [&sc.tts.slow_ar, &sc.tts.fast_ar, &sc.tts.codec] {
+                if part.is_empty() { return None; }
+                total += dir_or_file_size(&self.root.join(part))?;
+            }
+            return Some(total);
+        }
         dir_or_file_size(&self.root.join(&sc.artifacts.weights))
     }
 
@@ -293,5 +337,73 @@ mod tests {
         assert_eq!(l.declared_footprint(&cfg()), None, "no scenario.toml at all");
         write_scenario(dir.path(), "nowhere");
         assert_eq!(l.declared_footprint(&cfg()), None, "scenario parses but the weight path is missing");
+    }
+
+    fn write_tts_scenario(root: &std::path::Path, slow_ar: &str, fast_ar: &str, codec: &str) {
+        std::fs::write(root.join("scenario.toml"), format!(
+            "[scenario]\nkind = \"tts\"\nname = \"m\"\n[artifacts]\n\
+             [tts]\nslow_ar = \"{slow_ar}\"\nfast_ar = \"{fast_ar}\"\ncodec = \"{codec}\"\n"
+        )).unwrap();
+    }
+
+    /// A tts model is two weight sets plus a codec, not one `artifacts.weights` dir -- this sums
+    /// all three real directories rather than reading (or, worse, mis-reading) a single field.
+    #[test]
+    fn declared_footprint_sums_all_three_tts_artifact_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, n) in [("slow", 100u8), ("fast", 20), ("codec", 3)] {
+            std::fs::write(dir.path().join(name), vec![0u8; n as usize]).unwrap();
+        }
+        write_tts_scenario(dir.path(), "slow", "fast", "codec");
+        let l = EngineLoader { root: dir.path().to_path_buf() };
+        assert_eq!(l.declared_footprint(&cfg()), Some(123));
+    }
+
+    /// The honesty requirement: an unconfigured tts scenario (every `[tts]` field left at its
+    /// empty default) must answer `None`, never `Some(0)` and never the size of the whole root --
+    /// `self.root.join("")` resolves to `self.root` itself, so summing an empty field the naive
+    /// way would silently walk and total the entire engine root.
+    #[test]
+    fn declared_footprint_is_none_for_an_unconfigured_tts_scenario_not_zero_or_the_whole_root() {
+        let dir = tempfile::tempdir().unwrap();
+        // A file that would be wrongly swept in if an empty artifact path resolved to `root`.
+        std::fs::write(dir.path().join("unrelated"), vec![0u8; 999]).unwrap();
+        write_tts_scenario(dir.path(), "", "", "");
+        let l = EngineLoader { root: dir.path().to_path_buf() };
+        assert_eq!(l.declared_footprint(&cfg()), None);
+    }
+
+    /// Two of three configured is still `None`: a partial footprint would undercount the pin
+    /// invariant, which is worse than refusing to answer.
+    #[test]
+    fn declared_footprint_is_none_when_only_some_tts_artifacts_are_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("slow"), vec![0u8; 100]).unwrap();
+        std::fs::write(dir.path().join("fast"), vec![0u8; 20]).unwrap();
+        write_tts_scenario(dir.path(), "slow", "fast", "");
+        let l = EngineLoader { root: dir.path().to_path_buf() };
+        assert_eq!(l.declared_footprint(&cfg()), None);
+    }
+
+    /// A `tts` scenario loads with no device at all (nothing composes onto one yet), and `run`/
+    /// `run_cancellable` both dispatch `Request::Text` to synthesis rather than falling through to
+    /// `embed` -- the bug this whole route existed to fix would otherwise resurface here as a
+    /// `WrongKind` (embed) error instead of TTS's own honest `Unsupported`.
+    #[test]
+    fn a_tts_scenario_loads_with_no_device_and_dispatches_text_to_synthesis() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("scenario.toml"),
+            "[scenario]\nkind = \"tts\"\nname = \"m\"\n[artifacts]\n").unwrap();
+        let l = EngineLoader { root: dir.path().to_path_buf() };
+        let mut m = l.load(&cfg()).expect("a tts scenario must build with no NPU device present");
+        assert_eq!(m.capabilities(), Capability::TTS);
+        match m.run(Request::Text("hi".into())) {
+            Err(EngineError::Unsupported(_)) => {}
+            other => panic!("expected TTS's own Unsupported, not embed's WrongKind: {other:?}"),
+        }
+        match m.run_cancellable(Request::Text("hi".into()), npu_engine::Cancel::new()) {
+            Err(EngineError::Unsupported(_)) => {}
+            other => panic!("expected TTS's own Unsupported, not embed's WrongKind: {other:?}"),
+        }
     }
 }

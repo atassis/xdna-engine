@@ -16,7 +16,7 @@ mod stats;
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser};
 
-use cli_def::{CheckpointCmd, Cli, Cmd, ConfigCmd, ModelCmd, OutFormat, OutputFormat, SamplingArgs};
+use cli_def::{CheckpointCmd, Cli, Cmd, ConfigCmd, ModelCmd, OutFormat, OutputFormat, SamplingArgs, SpeechFormat};
 use clap_complete::Shell;
 use std::io::IsTerminal;
 use npu_engine::telemetry::wire;
@@ -108,6 +108,8 @@ fn run(cli: &Cli, path: &Path) -> Result<()> {
     match &cli.cmd {
         Cmd::Serve { allow_degraded } => serve(path, *allow_degraded),
         Cmd::Transcribe { input, model } => transcribe(input, model.as_deref(), as_json),
+        Cmd::Speak { text, voice, model, out, play, format } =>
+            speak(text, voice.as_deref(), model.as_deref(), out.as_deref(), *play, *format),
         Cmd::Generate { prompt, model, sampling, no_stream, raw, stats } =>
             generate(prompt, model.as_deref(), sampling, *no_stream, *raw, *stats, as_json),
         Cmd::Chat { prompt, model, sampling, no_stream } =>
@@ -378,6 +380,50 @@ fn transcribe(input: &Path, model: Option<&str>, as_json: bool) -> Result<()> {
     Ok(())
 }
 
+/// One-shot speech synthesis over the control socket, mirroring `transcribe`: the server always
+/// renders WAV (`/v1/audio/speech`'s own default `response_format`), and `--format pcm` is a LOCAL
+/// transform of that response, not a second request shape -- the wire is asked for exactly one
+/// thing regardless of what `--out`/`--play` do with it.
+fn speak(text: &str, voice: Option<&str>, model: Option<&str>, out: Option<&Path>, play: bool,
+          format: SpeechFormat) -> Result<()> {
+    quiet_one_shot();
+    let mut body = serde_json::json!({"input": text});
+    if let Some(m) = model { body["model"] = serde_json::json!(m); }
+    if let Some(v) = voice { body["voice"] = serde_json::json!(v); }
+    let wav = socket_client::call_bytes("/v1/audio/speech", &body)?;
+    if play { play_wav(&wav)?; }
+    let bytes: &[u8] = match format {
+        SpeechFormat::Wav => &wav,
+        // The server's own canonical header (`parse::wav_from_i16`) is always exactly 44 bytes,
+        // so this is an exact strip, not a heuristic.
+        SpeechFormat::Pcm => wav.get(44..).with_context(|| "server WAV shorter than its own header")?,
+    };
+    match out {
+        Some(p) if p.as_os_str() == "-" => std::io::stdout().write_all(bytes)?,
+        Some(p) => { std::fs::write(p, bytes)?; println!("{}", p.display()); }
+        None => {
+            let p = PathBuf::from(format!("speech.{}", format.ext()));
+            std::fs::write(&p, bytes)?;
+            println!("{}", p.display());
+        }
+    }
+    Ok(())
+}
+
+/// `--play`: hand the server's WAV bytes to `ffplay` over stdin, no temp file -- the point of the
+/// canonical 44-byte header is that `ffplay`'s own `wav` demuxer reads it directly, regardless of
+/// what `--format` does with the copy that goes to `--out`.
+fn play_wav(wav: &[u8]) -> Result<()> {
+    let mut child = std::process::Command::new("ffplay")
+        .args(["-autoexit", "-nodisp", "-loglevel", "error", "-f", "wav", "-i", "pipe:0"])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .context("spawn ffplay (needed for --play)")?;
+    child.stdin.take().expect("piped stdin").write_all(wav)?;
+    child.wait().context("ffplay")?;
+    Ok(())
+}
+
 /// `--flag <value>` overrides one `GenerateParams` field; an absent flag keeps the engine default
 /// (`GenerateParams::default()`, OpenAI's own defaults) -- never a CLI-chosen substitute.
 fn build_params(s: &SamplingArgs) -> Result<npu_engine::GenerateParams, String> {
@@ -437,6 +483,7 @@ _npu_models() {
       embed) kind=embed ;;
       diarize) kind=diarize ;;
       generate|chat) kind=generate ;;
+      speak) kind=tts ;;
     esac
   fi
   local -a names
@@ -2125,6 +2172,9 @@ mod tests {
     fn precision_is_absent_when_the_scenario_declares_none() {
         // An LLM scenario has no `[model]` block -- its precision lives in the decode artifact.
         // Defaulting the column to bf16 there would be a guess printed as a fact.
+        // Holds ENV_LOCK because precision_cell READS NPU_PRECISION: a reader that does not take
+        // the lock races every writer that does, and sees an override that is not its own.
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let none = Declared { kind: Some("generate".into()), precision: None, max_seq: None, scenario_max_seq: None };
         assert_eq!(precision_cell(&none), "-");
         let bf16 = Declared { kind: Some("asr".into()), precision: Some("bf16".into()), max_seq: None, scenario_max_seq: None };
@@ -2135,9 +2185,10 @@ mod tests {
     fn a_precision_override_is_noted_in_braces_and_only_when_it_differs() {
         // Serialised against the other env-mutating tests in this binary for the reason
         // npu-asr::tuning learned the hard way: set_var is process-global and cargo runs tests as
-        // threads in one process.
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // threads in one process. It must be the module's ENV_LOCK: a `static` declared inside a
+        // function body is that function's own, so a per-test mutex serialises a test against
+        // itself and nothing else.
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let d = Declared { kind: Some("asr".into()), precision: Some("bf16".into()), max_seq: None, scenario_max_seq: None };
 
         std::env::remove_var("NPU_PRECISION");
@@ -2249,6 +2300,98 @@ mod tests {
         std::env::remove_var("XDG_RUNTIME_DIR");
         handle.shutdown();
         join.join().unwrap();
+    }
+
+    struct MockTts;
+    impl npu_runtime::loader::Servable for MockTts {
+        fn capabilities(&self) -> Capability { Capability::TTS }
+        fn run(&mut self, req: npu_engine::capability::Request)
+            -> Result<npu_engine::capability::Response, npu_engine::EngineError> {
+            match req {
+                npu_engine::capability::Request::Text(_) =>
+                    Ok(npu_engine::capability::Response::Audio { pcm: vec![1, 2, 3, 4], sample_rate: 22_050 }),
+                other => Err(npu_engine::EngineError::Unsupported(other.shape().into())),
+            }
+        }
+    }
+    impl npu_runtime::loader::StreamServable for MockTts {}
+    struct MockTtsLoader;
+    impl ModelLoader for MockTtsLoader {
+        fn load(&self, _cfg: &ModelCfg) -> Result<Box<dyn npu_runtime::loader::StreamServable>, npu_engine::EngineError> {
+            Ok(Box::new(MockTts))
+        }
+        fn declared_capability(&self, _cfg: &ModelCfg) -> Option<Capability> { Some(Capability::TTS) }
+    }
+
+    fn tts_socket_harness(port: u16)
+        -> (npu_runtime::actor::Handle, std::thread::JoinHandle<()>, tempfile::TempDir) {
+        let cfg = Config {
+            server: ServerCfg { port, idle_unload_s: 0, ..Default::default() },
+            defaults: Defaults::from_pairs([(Capability::TTS, "kokoro".to_string())]),
+            models: vec![ModelCfg { name: "kokoro".into(), scenario: "x".into(), resident: false }],
+        };
+        let (handle, join) = start_lazy(cfg, Box::new(MockTtsLoader)).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::remove_var("RUNTIME_DIRECTORY");
+        std::env::set_var("XDG_RUNTIME_DIR", dir.path());
+        let sock_path = npu_runtime::control_socket::socket_path().unwrap();
+        let listener = npu_runtime::control_socket::bind(&sock_path).unwrap();
+        let (h2, live, cfg_path) = (handle.clone(), handle.live_status(), dir.path().join("engine.toml"));
+        std::thread::spawn(move || npu_runtime::control_socket::serve(listener, h2, live, cfg_path));
+        (handle, join, dir)
+    }
+
+    /// `npu speak` is a socket client like every other device command: the server's WAV comes back
+    /// over `control.sock` and lands at `--out` unchanged for `--format wav`.
+    #[test]
+    fn speak_writes_the_servers_wav_bytes_to_the_named_file() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        const PORT: u16 = 19195;
+        let (handle, join, dir) = tts_socket_harness(PORT);
+
+        let out = dir.path().join("out.wav");
+        speak("hello", None, None, Some(&out), false, SpeechFormat::Wav).unwrap();
+        let bytes = std::fs::read(&out).unwrap();
+        assert_eq!(&bytes[..4], b"RIFF");
+        assert_eq!(u32::from_le_bytes([bytes[24], bytes[25], bytes[26], bytes[27]]), 22_050,
+            "the header must carry the model's own rate");
+
+        std::env::remove_var("XDG_RUNTIME_DIR");
+        handle.shutdown(); join.join().unwrap();
+    }
+
+    /// `--format pcm` is a LOCAL transform of the one WAV response, not a second request shape:
+    /// exactly the 44-byte header stripped, samples untouched.
+    #[test]
+    fn speak_format_pcm_strips_exactly_the_wav_header() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        const PORT: u16 = 19196;
+        let (handle, join, dir) = tts_socket_harness(PORT);
+
+        let out = dir.path().join("out.pcm");
+        speak("hello", None, None, Some(&out), false, SpeechFormat::Pcm).unwrap();
+        let bytes = std::fs::read(&out).unwrap();
+        assert_eq!(bytes, vec![1, 0, 2, 0, 3, 0, 4, 0], "i16 samples [1,2,3,4], little-endian, no header");
+
+        std::env::remove_var("XDG_RUNTIME_DIR");
+        handle.shutdown(); join.join().unwrap();
+    }
+
+    /// A field the server cannot honour reaches the caller as an error naming it, the same as any
+    /// other device command's non-2xx -- `--voice` is not silently swallowed by the CLI.
+    #[test]
+    fn speak_surfaces_the_servers_400_for_an_unsupported_voice() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        const PORT: u16 = 19197;
+        let (handle, join, dir) = tts_socket_harness(PORT);
+
+        let out = dir.path().join("out.wav");
+        let err = speak("hello", Some("nova"), None, Some(&out), false, SpeechFormat::Wav).unwrap_err();
+        assert!(err.to_string().contains("voice"), "{err}");
+        assert!(!out.exists(), "a rejected request must not write a file");
+
+        std::env::remove_var("XDG_RUNTIME_DIR");
+        handle.shutdown(); join.join().unwrap();
     }
 
     /// Order step 5 (`2026-09-05-cli-as-client-design.md` §5): a device command with no service

@@ -81,6 +81,11 @@ enum Cmd {
         cap: Capability,
         model: Option<String>,
         req: Request,
+        /// Published to `InFlight` for the call's duration, the same way `Cmd::Generate`'s
+        /// `params.cancel` is -- most capabilities finish inside one dispatch and nothing ever reads
+        /// it, but TTS's synthesis is a long AR loop with no other way to reach `npu cancel`/
+        /// `npu model stop` while the actor thread is blocked inside it.
+        cancel: npu_engine::Cancel,
         reply: Sender<Result<Served<Response>, EngineError>>,
     },
     /// Text generation, split from `Serve` because it does not answer with one `Response`: the
@@ -259,7 +264,7 @@ fn spawn(cfg: Config, loader: Box<dyn ModelLoader + Send>, eager: bool) -> Resul
         live.set(reg.status_at(Instant::now()));
         loop {
             match rx.recv_timeout(next_sweep.saturating_duration_since(Instant::now())) {
-                Ok(Cmd::Serve { cap, model, req, reply }) => {
+                Ok(Cmd::Serve { cap, model, req, cancel, reply }) => {
                     last_request = Instant::now(); released = false;
                     // Two guarded steps rather than one, so the model NAME is known when the second
                     // fails. The shipped failure is a PANIC inside the dispatch (a missing insts
@@ -276,9 +281,15 @@ fn spawn(cfg: Config, loader: Box<dyn ModelLoader + Send>, eager: bool) -> Resul
                             // round until the request finishes, so the end-of-iteration publish can
                             // never observe a model that is serving.
                             live.set_doing(reg.status_serving(Instant::now(), Some(&name)), Some(format!("serving {name}")));
+                            // Published BEFORE the work and cleared after it, panic included -- see
+                            // the identical pattern around `run_generate` below. Harmless for the
+                            // capabilities that finish in one dispatch: nothing ever reads it before
+                            // `clear()` removes it again.
+                            inflight.set(&name, cancel.clone());
                             let t_serve = Instant::now();
-                            let out = guard(|| run_named(&mut reg, &name, req))
+                            let out = guard(|| run_named(&mut reg, &name, req, cancel))
                                 .unwrap_or_else(|msg| Err(EngineError::Device(msg)));
+                            inflight.clear();
                             // Charged whether it succeeded or failed: a request that held the
                             // device and then errored still held it, and occupancy that only
                             // counted successes would understate exactly the runs worth noticing.
@@ -552,9 +563,10 @@ fn serve_ready(cfg: &Config, reg: &mut Registry, loader: &dyn ModelLoader, cap: 
     }
 }
 
-fn run_named(reg: &mut Registry, name: &str, req: Request) -> Result<Response, EngineError> {
+fn run_named(reg: &mut Registry, name: &str, req: Request, cancel: npu_engine::Cancel)
+    -> Result<Response, EngineError> {
     let m = reg.get_loaded_mut(name).ok_or_else(|| EngineError::Load(format!("{name} not loaded")))?;
-    m.run(req)
+    m.run_cancellable(req, cancel)
 }
 
 fn run_generate(reg: &mut Registry, name: &str, prompt: &Prompt, params: &GenerateParams,
@@ -672,7 +684,8 @@ impl Handle {
     pub fn serve(&self, cap: Capability, model: Option<&str>, req: Request)
         -> Result<Served<Response>, EngineError> {
         let (r, rx) = channel();
-        self.tx.send(Cmd::Serve { cap, model: model.map(String::from), req, reply: r })
+        self.tx.send(Cmd::Serve { cap, model: model.map(String::from), req,
+                                  cancel: npu_engine::Cancel::new(), reply: r })
             .map_err(|_| EngineError::Device("actor stopped".into()))?;
         self.await_reply(rx)?
     }

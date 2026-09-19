@@ -155,6 +155,7 @@ const FREE_FORM_ARGS: &[(&str, &str)] = &[
     ("log", "JSONL run-log path to read"),
     ("interval", "refresh seconds -- an arbitrary number"),
     ("diff", "second JSONL run log to compare against"),
+    ("voice", "TTS voice name -- no model resolves one yet, arbitrary string"),
 ];
 
 #[test]

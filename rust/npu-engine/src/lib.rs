@@ -25,4 +25,5 @@ pub use telemetry::{Bound, GenerationReport, PrefillRecord, RunConditions, StepP
 // yet the wired-in replacement for `pipeline::Scenario` / `npu-runtime`'s closed routing.
 #[doc(hidden)] pub mod capability;
 #[doc(hidden)] pub mod llm;
+#[doc(hidden)] pub mod tts;
 #[doc(hidden)] pub mod telemetry;

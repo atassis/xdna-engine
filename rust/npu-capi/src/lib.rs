@@ -41,7 +41,8 @@ pub unsafe extern "C" fn npu_model_load(scenario_path: *const c_char) -> *mut Np
     r.unwrap_or_else(|_| { set_error("panic in npu_model_load"); ptr::null_mut() })
 }
 
-/// 0 = asr, 1 = embed, 2 = diarize, 3 = generate, -1 = error. Append-only: existing values never move.
+/// 0 = asr, 1 = embed, 2 = diarize, 3 = generate, 4 = tts, -1 = error. Append-only: existing
+/// values never move.
 #[no_mangle]
 pub unsafe extern "C" fn npu_model_kind(m: *const NpuModel) -> c_int {
     catch_unwind(AssertUnwindSafe(|| {
@@ -51,6 +52,7 @@ pub unsafe extern "C" fn npu_model_kind(m: *const NpuModel) -> c_int {
             ModelKind::Embed => 1,
             ModelKind::Diarize => 2,
             ModelKind::Generate => 3,
+            ModelKind::Tts => 4,
         }
     })).unwrap_or(-1)
 }

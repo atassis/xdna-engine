@@ -59,12 +59,28 @@ pub trait Diarizer {
     fn bo_bytes(&self) -> u64 { 0 }
 }
 
+/// Speech synthesis: text -> mono PCM at the model's own sample rate. COMPOSES pieces other lanes
+/// own (a prompt template, a Slow AR decoder, a Fast AR decoder, a neural codec) rather than any
+/// of them, so a pipeline with none of those wired in yet still builds -- and answers
+/// `EngineError::Unsupported` naming what is missing, instead of a stub tone.
+pub trait TtsModel {
+    /// A synthesis is an autoregressive loop, the same shape as `TextGenerator::generate` --
+    /// `cancel` is polled the way that loop's sink return is, so a long synthesis can be stopped
+    /// between dispatches instead of running to completion uninterruptibly.
+    fn synthesize(&mut self, text: &str, cancel: &crate::cancel::Cancel)
+        -> Result<(Vec<i16>, u32), EngineError>;
+
+    /// See `AsrModel::bo_bytes`.
+    fn bo_bytes(&self) -> u64 { 0 }
+}
+
 /// One assembled, ready-to-serve pipeline. The registry returns this; `engine_serve` matches on it.
 pub enum Scenario {
     Asr(Box<dyn AsrModel>),
     Embed(Box<dyn Embedder>),
     Diarize(Box<dyn Diarizer>),
     Generate(Box<dyn TextGenerator>),
+    Tts(Box<dyn TtsModel>),
 }
 // ---------------------------------------------------------------------------------------------
 // Text generation (decoder-LLM). Added for `llm-serve-openai-surface`.

@@ -25,6 +25,9 @@ pub struct ScenarioConfig {
     /// see `resolve_decode_backend`.
     #[serde(default)]
     pub decode: DecodeCfg,
+    /// `kind = "tts"` only: the three artifact directories a synthesis pipeline composes.
+    #[serde(default)]
+    pub tts: TtsCfg,
 }
 
 /// Per-model generation defaults. Empty block = the engine's own defaults, which is what every
@@ -75,6 +78,20 @@ impl GenerationCfg {
 pub struct DiarizationCfg {
     #[serde(default)]
     pub manifest: String,
+}
+
+/// Per-kind block for `kind = "tts"`. Three artifact dirs, not one `artifacts.weights`: a
+/// synthesis pipeline composes two autoregressive weight sets (coarse/slow, then fine/fast) plus
+/// a neural codec, and `EngineLoader::declared_footprint` sums exactly these three rather than
+/// guessing at a single legacy path.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+pub struct TtsCfg {
+    #[serde(default)]
+    pub slow_ar: String,
+    #[serde(default)]
+    pub fast_ar: String,
+    #[serde(default)]
+    pub codec: String,
 }
 
 /// Decode-backend tier: how far onto the device the decoder runs, not an implementation name, so

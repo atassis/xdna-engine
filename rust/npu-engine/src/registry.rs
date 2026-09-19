@@ -89,6 +89,9 @@ pub fn try_build(cfg_path: &Path, root: &Path) -> Result<Scenario, EngineError> 
             Scenario::Generate(Box::new(crate::llm::LlmGenerator::new(model_cfg, decode)
                 .with_scenario_defaults(cfg.generation.to_defaults())))
         }
+        // NO open_dev(): nothing here composes onto the device yet (see `tts::TtsPipeline`), so a
+        // `tts` scenario must not take a hardware context away from a model that coexists with it.
+        Some(crate::ModelKind::Tts) => Scenario::Tts(Box::new(crate::tts::TtsPipeline::build(&cfg, root)?)),
         None => return Err(EngineError::Load(format!("unknown scenario kind {:?}", cfg.scenario.kind))),
     };
     Ok(scen)

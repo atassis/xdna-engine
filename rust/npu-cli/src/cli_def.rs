@@ -86,6 +86,25 @@ pub enum Cmd {
         /// Emit the same JSON body the HTTP route returns, instead of readable lines.
         #[arg(long)] json: bool,
     },
+    /// One-shot speech synthesis of a text string, written to a file.
+    ///
+    /// The server always renders WAV; `--format pcm` strips its 44-byte header locally, writing
+    /// raw 16-bit PCM instead. Default output is a FILE (`speech.<format>` unless `--out` names
+    /// one), not stdout -- audio bytes are not something a terminal should receive by accident;
+    /// `--out -` means stdout explicitly.
+    Speak {
+        #[arg(allow_hyphen_values = true)] text: String,
+        /// Voice name. No model resolves one yet, so any value here is a 400 naming that; omit it.
+        #[arg(long)] voice: Option<String>,
+        /// TTS model name; omit to use the configured tts default.
+        #[arg(long)] model: Option<String>,
+        /// Output file, or `-` for stdout. Defaults to `speech.<format>` in the current directory.
+        #[arg(long, short, value_hint = ValueHint::FilePath)] out: Option<PathBuf>,
+        /// Play the audio through `ffplay` after it comes back (in addition to writing `--out`).
+        #[arg(long)] play: bool,
+        /// File format for `--out`: the server's own `wav`, or headerless raw `pcm`.
+        #[arg(long, value_enum, default_value_t = SpeechFormat::Wav)] format: SpeechFormat,
+    },
     /// One-shot embedding of a text string.
     ///
     /// `allow_hyphen_values`: the text to embed is prose, and prose begins with `-` all the time
@@ -280,6 +299,17 @@ impl OutFormat {
     }
     /// File extension for the default output path.
     pub fn ext(self) -> &'static str { self.as_str() }
+}
+
+/// `npu speak --out`'s file shape. The server only ever renders WAV; `Pcm` is that same response
+/// with its 44-byte header stripped locally, not a second thing requested over the wire.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub enum SpeechFormat { Wav, Pcm }
+
+impl SpeechFormat {
+    pub fn ext(self) -> &'static str {
+        match self { SpeechFormat::Wav => "wav", SpeechFormat::Pcm => "pcm" }
+    }
 }
 
 #[derive(Subcommand)]
