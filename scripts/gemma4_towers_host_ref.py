@@ -146,6 +146,58 @@ def load(d, name):
     return q(np.load(os.path.join(d, f"{name}.npy")))
 
 
+# The 11 checkpoint tensor names both towers read, factored out so a caller building `w` (here or
+# in gemma4_multimodal_join_gate.py) names them once.
+VISION_WEIGHT_NAMES = [
+    "model.vision_embedder.patch_ln1.weight", "model.vision_embedder.patch_ln1.bias",
+    "model.vision_embedder.patch_dense.weight", "model.vision_embedder.patch_dense.bias",
+    "model.vision_embedder.patch_ln2.weight", "model.vision_embedder.patch_ln2.bias",
+    "model.vision_embedder.pos_embedding",
+    "model.vision_embedder.pos_norm.weight", "model.vision_embedder.pos_norm.bias",
+    "model.embed_vision.embedding_projection.weight",
+]
+AUDIO_WEIGHT_NAMES = ["model.embed_audio.embedding_projection.weight"]
+
+
+def vision_tower_forward(pixel_values, image_position_ids, w):
+    """`Gemma4UnifiedVisionEmbedder.forward`, ported: patch_ln1 -> patch_dense -> patch_ln2 ->
+    +factorized-position-embedding -> pos_norm -> rms_norm_no_scale -> embedding_projection.
+
+    Runs on every row the caller passes, tower-padding tail (`image_position_ids == (-1, -1)`)
+    included -- HF projects the pad rows too and drops them only afterwards, in
+    `Gemma4UnifiedModel.get_image_features` (a padded row is NOT zero post-projection: LayerNorm
+    bias and RMSNorm turn a zero row nonzero). Dropping is the caller's job.
+
+    `w` is `VISION_WEIGHT_NAMES` -> array, in `load()`'s checkpoint-key naming. Returns every named
+    stage so a caller can either report per-stage parity (as `main` below does) or take `s7` alone
+    (== the checkpoint's `vision_outputs.pooler_output`).
+    """
+    s1 = layer_norm(pixel_values, w["model.vision_embedder.patch_ln1.weight"],
+                     w["model.vision_embedder.patch_ln1.bias"])
+    s2 = linear(s1, w["model.vision_embedder.patch_dense.weight"], w["model.vision_embedder.patch_dense.bias"])
+    s3 = layer_norm(s2, w["model.vision_embedder.patch_ln2.weight"], w["model.vision_embedder.patch_ln2.bias"])
+    pos_embedding = w["model.vision_embedder.pos_embedding"]
+    clamped = np.clip(image_position_ids, 0, None).astype(np.int64)
+    valid = (image_position_ids != -1).astype(pos_embedding.dtype)[..., None]
+    axes = np.arange(2)
+    gathered = pos_embedding[clamped, axes]  # (..., 2, D), numpy advanced indexing == torch's
+    pos_embs = (gathered * valid).sum(axis=-2)
+    s4 = s3 + pos_embs
+    s5 = layer_norm(s4, w["model.vision_embedder.pos_norm.weight"], w["model.vision_embedder.pos_norm.bias"])
+    s6 = rms_norm_no_scale(s5)
+    s7 = linear(s6, w["model.embed_vision.embedding_projection.weight"])  # bias=False
+    return {"s1_patch_ln1": s1, "s2_patch_dense": s2, "s3_patch_ln2": s3, "s4_pos_embs": pos_embs,
+            "s4_hidden_plus_pos": s4, "s5_pos_norm": s5, "s6_rmsnorm": s6, "s7_projection": s7}
+
+
+def audio_tower_forward(input_features, w):
+    """`Gemma4UnifiedMultimodalEmbedder.forward` for audio: rms_norm_no_scale -> embedding_projection.
+    `w` is `AUDIO_WEIGHT_NAMES` -> array."""
+    a1 = rms_norm_no_scale(input_features)
+    a2 = linear(a1, w["model.embed_audio.embedding_projection.weight"])
+    return {"s1_rmsnorm": a1, "s2_projection": a2}
+
+
 def report(host_dir, stage, host_val, oracle_dir, oracle_name):
     host_val = q(host_val)
     oracle_val = load(oracle_dir, oracle_name)
@@ -174,17 +226,8 @@ def main():
     os.makedirs(a.out, exist_ok=True)
     W, O = a.weights_dir, a.oracle_dir
 
-    patch_ln1_w = load(W, "model.vision_embedder.patch_ln1.weight")
-    patch_ln1_b = load(W, "model.vision_embedder.patch_ln1.bias")
-    patch_dense_w = load(W, "model.vision_embedder.patch_dense.weight")
-    patch_dense_b = load(W, "model.vision_embedder.patch_dense.bias")
-    patch_ln2_w = load(W, "model.vision_embedder.patch_ln2.weight")
-    patch_ln2_b = load(W, "model.vision_embedder.patch_ln2.bias")
-    pos_embedding = load(W, "model.vision_embedder.pos_embedding")
-    pos_norm_w = load(W, "model.vision_embedder.pos_norm.weight")
-    pos_norm_b = load(W, "model.vision_embedder.pos_norm.bias")
-    embed_vision_proj = load(W, "model.embed_vision.embedding_projection.weight")
-    embed_audio_proj = load(W, "model.embed_audio.embedding_projection.weight")
+    vision_w = {name: load(W, name) for name in VISION_WEIGHT_NAMES}
+    audio_w = {name: load(W, name) for name in AUDIO_WEIGHT_NAMES}
 
     errs = {}
 
@@ -219,28 +262,9 @@ def main():
     image_position_ids = load(O, "in_image_position_ids")  # output, used as input here so tower
     # parity is isolated from patchify parity (checked separately above).
 
-    s1 = layer_norm(pixel_values, patch_ln1_w, patch_ln1_b)
-    errs["s1_patch_ln1"] = report(a.out, "vis_s1_patch_ln1", s1, O, "vis_s1_patch_ln1")
-    s2 = linear(s1, patch_dense_w, patch_dense_b)
-    errs["s2_patch_dense"] = report(a.out, "vis_s2_patch_dense", s2, O, "vis_s2_patch_dense")
-    s3 = layer_norm(s2, patch_ln2_w, patch_ln2_b)
-    errs["s3_patch_ln2"] = report(a.out, "vis_s3_patch_ln2", s3, O, "vis_s3_patch_ln2")
-
-    clamped = np.clip(image_position_ids, 0, None).astype(np.int64)
-    valid = (image_position_ids != -1).astype(pos_embedding.dtype)[..., None]
-    axes = np.arange(2)
-    gathered = pos_embedding[clamped, axes]  # (1,280,2,3840), numpy advanced indexing == torch's
-    pos_embs = (gathered * valid).sum(axis=-2)
-    errs["s4_pos_embs"] = report(a.out, "vis_s4_pos_embs", pos_embs, O, "vis_s4_pos_embs")
-    s4 = s3 + pos_embs
-    errs["s4_hidden_plus_pos"] = report(a.out, "vis_s4_hidden_plus_pos", s4, O, "vis_s4_hidden_plus_pos")
-    s5 = layer_norm(s4, pos_norm_w, pos_norm_b)
-    errs["s5_pos_norm"] = report(a.out, "vis_s5_pos_norm", s5, O, "vis_s5_pos_norm")
-
-    s6 = rms_norm_no_scale(s5)
-    errs["s6_rmsnorm"] = report(a.out, "vis_s6_rmsnorm", s6, O, "vis_s6_rmsnorm")
-    s7 = linear(s6, embed_vision_proj)  # bias=False
-    errs["s7_projection"] = report(a.out, "vis_s7_projection", s7, O, "vis_s7_projection")
+    vis_stages = vision_tower_forward(pixel_values, image_position_ids, vision_w)
+    for stage, val in vis_stages.items():
+        errs[stage] = report(a.out, f"vis_{stage}", val, O, f"vis_{stage}")
 
     print("== audio preprocessing parity: numpy waveform framing vs the feature extractor's ==")
     with wave.open(a.audio_wav) as wf:
@@ -256,10 +280,9 @@ def main():
 
     print("== audio tower, staged ==")
     input_features = load(O, "in_input_features")  # (1,233,640)
-    a1 = rms_norm_no_scale(input_features)
-    errs["a1_rmsnorm"] = report(a.out, "aud_s1_rmsnorm", a1, O, "aud_s1_rmsnorm")
-    a2 = linear(a1, embed_audio_proj)
-    errs["a2_projection"] = report(a.out, "aud_s2_projection", a2, O, "aud_s2_projection")
+    aud_stages = audio_tower_forward(input_features, audio_w)
+    for stage, val in aud_stages.items():
+        errs[stage] = report(a.out, f"aud_{stage}", val, O, f"aud_{stage}")
 
     worst = max(errs.items(), key=lambda kv: kv[1])
     if _BF16:
