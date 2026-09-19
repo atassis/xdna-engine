@@ -16,8 +16,8 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
 
 from dump_fish_ar_weights import (  # noqa: E402
-    Dims, count_layers, derive_dims, dump, dump_slow_ar_layer, permute_heads,
-    rope_row_permutation, Source,
+    Dims, count_layers, derive_dims, dump, dump_ar_layer, dump_slow_ar_layer, permute_heads,
+    rope_row_permutation, Source, STACKS,
 )
 
 S2_GGUF = os.environ.get("S2_GGUF_PATH", os.path.join(_HERE, "..", "s2.cpp", "models", "s2-pro-q6_k.gguf"))
@@ -136,3 +136,40 @@ class TestS2ProGguf:
         dump(S2_GGUF, str(tmp_path), layers=1)
         assert not (tmp_path / "model.lm_head.weight.npy").exists()
         assert (tmp_path / "model.embed_tokens.weight.npy").exists()
+
+
+@needs_s1
+class TestS1MiniFastStack:
+    """The Fast AR is the same file's OTHER stack: 4 layers at head_dim 64, no per-head norms."""
+
+    def test_head_dim_cannot_be_derived_and_says_so(self):
+        """Two equations, three unknowns. The failure has to name the fix, because the sibling
+        stack's 128 is a plausible-looking wrong answer sitting right there."""
+        with pytest.raises(ValueError, match="fast_head_dim"):
+            derive_dims(Source(S1_PTH), stack="fast")
+
+    def test_dims_with_the_head_dim_supplied(self):
+        d = derive_dims(Source(S1_PTH), stack="fast", head_dim=64)
+        assert d == Dims(d_model=1024, head_dim=64, n_q_heads=16, n_kv_heads=8, ffn=3072,
+                         n_layers=4, vocab=4096, tied_embeddings=False, stack="fast")
+
+    def test_count_layers_does_not_confuse_the_two_stacks(self):
+        src = Source(S1_PTH)
+        assert count_layers(src, "slow") == 28
+        assert count_layers(src, "fast") == 4
+
+    def test_the_fast_layer_emits_no_qk_norm(self):
+        src = Source(S1_PTH)
+        d = derive_dims(src, stack="fast", head_dim=64)
+        out = dump_ar_layer(src, d, 0)
+        assert "model.layers.0.self_attn.q_norm.weight" not in out
+        assert out["model.layers.0.self_attn.q_proj.weight"].shape == (1024, 1024)
+        assert out["model.layers.0.self_attn.k_proj.weight"].shape == (512, 1024)
+
+    def test_dump_reads_head_dim_from_the_checkpoints_config(self, tmp_path):
+        """No --head-dim passed: config.json beside model.pth is the authority."""
+        d = dump(S1_PTH, str(tmp_path), layers=1, stack="fast")
+        assert d.head_dim == 64 and d.stack == "fast"
+        m = json.loads((tmp_path / "dump_manifest.json").read_text())
+        assert m["stack"] == "fast" and m["dims"]["vocab"] == 4096
+        assert (tmp_path / "model.lm_head.weight.npy").exists()

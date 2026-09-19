@@ -9,8 +9,8 @@ import re
 
 import pytest
 
-from llm_decode_spec import (GEMMA3_270M, GEMMA4_12B, QWEN3_0_6B, S1_MINI_SLOW_AR,
-                             S2_PRO_SLOW_AR, SPECS)
+from llm_decode_spec import (GEMMA3_270M, GEMMA4_12B, QWEN3_0_6B, S1_MINI_FAST_AR,
+                             S1_MINI_SLOW_AR, S2_PRO_SLOW_AR, SPECS)
 
 
 class TestCheckPrefillQwen:
@@ -296,3 +296,38 @@ class TestS1MiniSlowAr:
         """Bare, like QWEN3_0_6B's and unlike GEMMA3_270M's -- the same dims pass the same way."""
         S1_MINI_SLOW_AR.check_prefill(256)
         S1_MINI_SLOW_AR.check_prefill_seq(256, 1024, tile_n_overrides={"ctx": 16})
+
+
+class TestS1MiniFastAr:
+    """The residual-codebook stack: 4 layers at head_dim 64, no QK-norm, an untied 4096-wide head,
+    and a context of 11 that runs NINE times per frame."""
+
+    def test_is_registered(self):
+        assert SPECS["s1-mini-fast-ar"] is S1_MINI_FAST_AR
+
+    def test_dims_match_the_checkpoint_config(self):
+        s = S1_MINI_FAST_AR
+        assert (s.d_model, s.n_layers, s.n_q_heads, s.n_kv_heads, s.head_dim, s.ffn, s.vocab) == \
+            (1024, 4, 16, 8, 64, 3072, 4096)
+        assert s.qk_norm is False, "fast_attention_qk_norm is false, unlike the slow half"
+        assert s.tied_embeddings is False
+
+    def test_head_dim_is_the_slow_halfs_half(self):
+        """Not inherited by family resemblance: the slow stack is 128 and this one is 64, so a
+        spec that copied its sibling would be wrong on every attention shape."""
+        assert S1_MINI_FAST_AR.head_dim == 64 and S1_MINI_SLOW_AR.head_dim == 128
+        assert S1_MINI_FAST_AR.q_dim == 1024 and S1_MINI_FAST_AR.kv_dim == 512
+
+    def test_the_fusion_arms_are_open(self):
+        s = S1_MINI_FAST_AR
+        assert s.ffn % s.d_model == 0 and s.q_dim % s.d_model == 0
+
+    def test_passes_decode_checks_at_the_smallest_legal_capacity(self):
+        S1_MINI_FAST_AR.check(cols=8, tsi=4)
+        S1_MINI_FAST_AR.check_seq(256)
+
+    def test_a_context_sized_cache_is_not_legal(self):
+        """11 is the real context; check_seq's Transpose needs a multiple of 256. Recorded so the
+        23x over-allocation reads as a known 2.10 MB cost and not as an oversight."""
+        with pytest.raises(ValueError, match="256"):
+            S1_MINI_FAST_AR.check_seq(16)

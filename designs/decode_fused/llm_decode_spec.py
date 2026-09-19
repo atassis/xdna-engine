@@ -913,7 +913,31 @@ S1_MINI_SLOW_AR = LlmSpec(
     tied_embeddings=False,
 )
 
-SPECS = {s.name: s for s in (GEMMA3_270M, QWEN3_0_6B, GEMMA4_12B, S2_PRO_SLOW_AR, S1_MINI_SLOW_AR)}
+# s1-mini's FAST AR -- the residual-codebook stack, run NINE times per frame against the Slow AR's
+# ONE. Its own hparams from the same config.json (fast_dim 1024, n_fast_layer 4, fast_n_head 16,
+# fast_n_local_heads 8, fast_head_dim 64, fast_intermediate_size 3072, fast_attention_qk_norm
+# false), and its head is `fast_output.weight` over codebook_size 4096, untied.
+#
+# It is expressed as a DECODE spec, not a prefill one, and that is a claim worth stating: the
+# reference recomputes all k rows on call k with no cross-call cache, but attention is causal, so
+# carrying a KV cache across the nine calls of ONE frame is the same function with 9 row-passes
+# instead of 45. The cache must be cleared at each frame boundary -- it is per-frame state, unlike
+# the Slow AR's, which spans the utterance.
+#
+# `max_seq` has to be a multiple of 256 (check_seq's Transpose m=256) against a real context of 11.
+# That over-allocates the cache 23x and costs 2.10 MB, which is why it is a non-issue rather than a
+# reason to change the transpose.
+S1_MINI_FAST_AR = LlmSpec(
+    name="s1-mini-fast-ar", d_model=1024, n_layers=4, n_q_heads=16, n_kv_heads=8, head_dim=64,
+    ffn=3072, vocab=4096, eps=1e-6, act="silu", norm_gain="w",
+    sandwich_norms=False, qk_norm=False, embed_scale="none",
+    rope_theta_global=1_000_000.0, rope_theta_local=None,
+    sliding_window=None, sw_pattern=None, query_pre_attn_scalar=None,
+    tied_embeddings=False,
+)
+
+SPECS = {s.name: s for s in (GEMMA3_270M, QWEN3_0_6B, GEMMA4_12B, S2_PRO_SLOW_AR,
+                             S1_MINI_SLOW_AR, S1_MINI_FAST_AR)}
 
 
 def operator_rejects(op_cls, kwargs):
