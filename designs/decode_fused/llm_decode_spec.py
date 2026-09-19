@@ -448,8 +448,24 @@ class LlmSpec:
     # embedders sit alongside the text stack -- so its text tensors are under
     # `model.language_model.`, not `model.`.
     weight_prefix: str = "model."
+    # Whether the LM head IS the embedding table. True for every spec that predates this field,
+    # which is why it defaults that way -- but it was an unstated assumption, not a fact about
+    # decoder LLMs: s1-mini ships a separate `output.weight`. The distinction is invisible to the
+    # device (it streams one weight buffer either way) and load-bearing for the HOST, which gathers
+    # prompt embeddings from the table -- so an untied head written over the table would give the
+    # device the right logits and the host the wrong embeddings. See head_weight_name().
+    tied_embeddings: bool = True
 
     # ---- derived ----
+    def head_weight_name(self) -> str:
+        """The dump key the LM head's weights come from.
+
+        A tied model has no head tensor of its own, so the head and the host's gather table are one
+        file; an untied one keeps them apart and both are needed.
+        """
+        leaf = "embed_tokens" if self.tied_embeddings else "lm_head"
+        return f"{self.weight_prefix}{leaf}.weight"
+
     @property
     def q_dim(self) -> int:
         return self.n_q_heads * self.head_dim
@@ -882,7 +898,22 @@ S2_PRO_SLOW_AR = LlmSpec(
     sliding_window=None, sw_pattern=None, query_pre_attn_scalar=None,
 )
 
-SPECS = {s.name: s for s in (GEMMA3_270M, QWEN3_0_6B, GEMMA4_12B, S2_PRO_SLOW_AR)}
+# s1-mini (Fish Audio, OpenAudio S1-mini, `dual_ar`) Slow-AR. Every axis below is read from the
+# checkpoint's own config.json and cross-checked against its tensor table -- dim 1024, n_layer 28,
+# n_head 16, n_local_heads 8, head_dim 128, intermediate_size 3072, attention_qk_norm true,
+# norm_eps 1e-6, rope_base 1e6. That is QWEN3_0_6B exactly; only the vocabulary (155776, shared
+# with S2-Pro) and the untied head differ, which is why qwen3's swept GEMM tiles and its fusion
+# verdicts carry over and S2-Pro's do not.
+S1_MINI_SLOW_AR = LlmSpec(
+    name="s1-mini-slow-ar", d_model=1024, n_layers=28, n_q_heads=16, n_kv_heads=8, head_dim=128,
+    ffn=3072, vocab=155776, eps=1e-6, act="silu", norm_gain="w",
+    sandwich_norms=False, qk_norm=True, embed_scale="none",
+    rope_theta_global=1_000_000.0, rope_theta_local=None,
+    sliding_window=None, sw_pattern=None, query_pre_attn_scalar=None,
+    tied_embeddings=False,
+)
+
+SPECS = {s.name: s for s in (GEMMA3_270M, QWEN3_0_6B, GEMMA4_12B, S2_PRO_SLOW_AR, S1_MINI_SLOW_AR)}
 
 
 def operator_rejects(op_cls, kwargs):

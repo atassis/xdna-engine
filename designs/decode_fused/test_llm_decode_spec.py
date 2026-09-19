@@ -9,7 +9,8 @@ import re
 
 import pytest
 
-from llm_decode_spec import GEMMA3_270M, GEMMA4_12B, QWEN3_0_6B, S2_PRO_SLOW_AR, SPECS
+from llm_decode_spec import (GEMMA3_270M, GEMMA4_12B, QWEN3_0_6B, S1_MINI_SLOW_AR,
+                             S2_PRO_SLOW_AR, SPECS)
 
 
 class TestCheckPrefillQwen:
@@ -247,3 +248,51 @@ class TestS2ProSlowAr:
         # Unlike QWEN3_0_6B/GEMMA3_270M, every op's Nout already divides tile_n(64)*cols(8)=512
         # cleanly for S2-Pro's dims (o=2560, gate/up=9728, down=2560) -- no override needed.
         S2_PRO_SLOW_AR.check_prefill(256)
+
+
+class TestS1MiniSlowAr:
+    """s1-mini (Fish Audio, OpenAudio S1-mini, `dual_ar`) Slow-AR.
+
+    Every LlmSpec axis equals QWEN3_0_6B's except the vocabulary and the untied head -- verified
+    against the checkpoint's own config.json, not inferred from the S2-Pro sibling."""
+
+    def test_is_registered(self):
+        assert SPECS["s1-mini-slow-ar"] is S1_MINI_SLOW_AR
+
+    def test_dims_match_the_checkpoint_config(self):
+        s = S1_MINI_SLOW_AR
+        assert (s.d_model, s.n_layers, s.n_q_heads, s.n_kv_heads, s.head_dim, s.ffn, s.vocab) == \
+            (1024, 28, 16, 8, 128, 3072, 155776)
+        assert (s.qk_norm, s.sandwich_norms, s.act, s.eps) == (True, False, "silu", 1e-6)
+        assert s.rope_theta_global == 1_000_000.0 and s.rope_theta_local is None
+
+    def test_differs_from_qwen3_only_in_vocab_and_tying(self):
+        """The reuse claim, asserted rather than described: if a future edit moves any other axis
+        the qwen3 GEMM tiles and fusion verdicts stop transferring, and this is what says so."""
+        import dataclasses
+        a = dataclasses.asdict(QWEN3_0_6B)
+        b = dataclasses.asdict(S1_MINI_SLOW_AR)
+        differ = {k for k in a if a[k] != b[k]}
+        assert differ == {"name", "vocab", "tied_embeddings"}, differ
+
+    def test_the_head_is_untied(self):
+        assert S1_MINI_SLOW_AR.tied_embeddings is False
+        assert QWEN3_0_6B.tied_embeddings is True, "every pre-existing spec stays tied"
+
+    def test_head_weight_name_follows_the_tying(self):
+        assert S1_MINI_SLOW_AR.head_weight_name() == "model.lm_head.weight"
+        assert QWEN3_0_6B.head_weight_name() == "model.embed_tokens.weight"
+
+    def test_the_fusion_arms_qwen3_uses_are_open(self):
+        """FF/D = 3.0 and QD/D = 2.0, where S2-Pro is 3.8 and 1.6 and declines both."""
+        s = S1_MINI_SLOW_AR
+        assert s.ffn % s.d_model == 0, "swiglu_mlp_dp needs FF a whole multiple of D"
+        assert s.q_dim % s.d_model == 0, "fuse_o, and so decode_layer_dp, needs QD likewise"
+
+    def test_passes_decode_gemv_check(self):
+        S1_MINI_SLOW_AR.check(cols=8, tsi=4)
+
+    def test_passes_prefill_gemm_check(self):
+        """Bare, like QWEN3_0_6B's and unlike GEMMA3_270M's -- the same dims pass the same way."""
+        S1_MINI_SLOW_AR.check_prefill(256)
+        S1_MINI_SLOW_AR.check_prefill_seq(256, 1024, tile_n_overrides={"ctx": 16})

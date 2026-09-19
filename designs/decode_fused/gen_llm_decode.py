@@ -1577,7 +1577,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
     # _pack_head_chunked), never the bare key -- unlike mlp/attn_o/qkv the base f32 tensor always
     # stays on disk too (the host embedding-gather reads it), so membership has to be checked by
     # this exact name rather than assumed from PACKED being non-empty.
-    _head_key = f"{sp.weight_prefix}embed_tokens.weight"
+    _head_key = sp.head_weight_name()
     _head_packed = f"{_head_key}.headpack" in PACKED
     # Layout is not a per-site plan choice (every quantized site shares one on-wire row shape),
     # so unlike dtype/group_size below there is nothing to conflict-check against -- the dump's
@@ -2926,8 +2926,11 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
             bufsz["mlp_a_scratch"] = D * 2   # a's own all-gather round-trip buffer, same idiom
 
     weights["n_final"] = load_norm(f"{sp.weight_prefix}norm.weight")
-    # tied: also the host's embedding-gather table
-    embed_f32 = npy(f"{sp.weight_prefix}embed_tokens.weight")
+    # The DEVICE's lm-head stream and the HOST's embedding-gather table. One tensor on a tied
+    # spec, two on an untied one (s1-mini ships `output.weight`), which is why the head is asked
+    # for by name rather than assumed to be the table.
+    head_f32 = npy(_head_key)
+    embed_f32 = head_f32 if sp.tied_embeddings else npy(f"{sp.weight_prefix}embed_tokens.weight")
     # Quantizing W_head narrows the DEVICE lm-head stream, but W_head is TIED, so the host also
     # gathers embed[token] out of it. Rather than teach the host to dequantise -- which would
     # quantise the embedding INPUT too, a second quality change for no extra speed -- the exact
@@ -2935,17 +2938,22 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
     # dict on purpose: the device loader takes its buffer set from `weights`/`wnames`, so a side
     # file costs 311 MB of disk and ZERO device arena, and the host only ever faults in the one
     # 2 KB row it gathers.
+    # W_head doubles as the host's table only when the two ARE one tensor and the device's copy is
+    # still readable as bf16. Quantizing it, or an untied head, breaks that for different reasons
+    # and both take the same exit: a host-only blob beside the device buffer.
     embed_blob, host_embed = "W_head", None
+    if not sp.tied_embeddings:
+        embed_blob, host_embed = "W_embed", bf16(embed_f32).reshape(-1)
     if _spec("head").quantized:
         # Pre-packed by the dump when available (_head_packed) -- read the bytes straight off
         # disk rather than re-quantizing here, which is what OOM'd on Gemma-4-12B's 262144x3840
         # table (dump_llm_weights.py's _pack_head_chunked does the same math in row chunks).
         weights["W_head"] = npy_raw(f"{_head_key}.headpack") if _head_packed else \
-            _pack(embed_f32, "head")
+            _pack(head_f32, "head")
         embed_blob = "W_embed"
         host_embed = bf16(embed_f32).reshape(-1)
     else:
-        weights["W_head"] = bf16(embed_f32).reshape(-1)
+        weights["W_head"] = bf16(head_f32).reshape(-1)
     if not scale_in_qnorm:
         weights["attn_scale"] = np.full(Hq * S, sp.attn_scale, BF16)
     rl += [(op_norm, cur, "n_final", "xf")]
