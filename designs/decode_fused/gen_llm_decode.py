@@ -627,7 +627,7 @@ def load_weight_buffer(buf, arr):
 
 def sequence_name(sp, NL, S, placer_flags, decode_layer_active=False, T=None, tmv_declined=(),
                   tmv_chunked=(), attn_block_geoms=(), ff_chunks=1, weight_families=0,
-                  pointwise_widths=0, scores_blocks=()):
+                  pointwise_widths=0, scores_blocks=(), mlp_dp_active=False, mlp_o_active=False):
     """Name the fused sequence after everything that changes its graph, not just the model.
 
     IRON keys the cached artifact by this name. Every knob below produces a DIFFERENT ELF, so
@@ -707,9 +707,14 @@ def sequence_name(sp, NL, S, placer_flags, decode_layer_active=False, T=None, tm
     # Suffix stays ON the default here, unlike the other switches: the shipped artifact was BUILT
     # and gated under this name, and aiecc is not byte-reproducible, so a rename would mean the
     # next rebuild produces a different ELF under a name nothing was ever gated against.
-    if FUSE_MLP_DP and sp.mlp_dp_reason() is None:
+    # Passed in as the build computed them, never re-derived: `sp.mlp_dp_reason()` returns None
+    # for every spec, while the refusals that decide the graph live in build_graph's `mlp_dp_why`
+    # (operator_rejects, FF % D, MLP_TILE_ROWS) and in `fuse_o` (sandwich norms, QD % D). Reading
+    # the weaker predicate named Gemma-4's shipped arm `mlpdp4_mlpo` over an ELF with zero
+    # `swiglu`, and s2-pro-slow-ar declines both on FF/D = 3.8 and QD/D = 1.6.
+    if mlp_dp_active:
         parts.append(f"mlpdp{MLP_DP_COLS}")
-    if FUSE_MLP_O and sp.mlp_dp_reason() is None:
+    if mlp_o_active:
         parts.append("mlpo")
     # Same convention, its sibling arm: FUSE_QKV_DP defaulted ON 2026-09-07 (27a9411) and was
     # missing here entirely -- not just off-the-default-name, ABSENT, so a build before that
@@ -3050,7 +3055,8 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
                             decode_layer_active=op_decode_layer is not None, T=T,
                             ff_chunks=ff_chunks, weight_families=len(weight_families),
                             pointwise_widths=len(pointwise_widths),
-                            scores_blocks=tuple(_scores_blocks))
+                            scores_blocks=tuple(_scores_blocks),
+                            mlp_dp_active=op_mlp_dp is not None, mlp_o_active=fuse_o)
         name = _sn if len(cuts) == 1 else f"{_sn}_seg{si}of{len(cuts)}"
         # A rung is THIS runlist with the layer design substituted. Only for an unsplit
         # stack: a rung rewrites one runlist, and a segmented stack has one per segment
@@ -3115,7 +3121,7 @@ def build_graph(spec_name, weights_dir, layers=None, max_seq=2048, precision_pla
     if SPLIT_LM_HEAD:
         head_rl = [(op_head, "W_head", "xf", "logits")]
         head = OperatorSequence(
-            f"{sequence_name(sp, NL, S, placer_flags, tmv_declined=_tmv_declined, tmv_chunked=_tmv_chunked)}_lmhead", head_rl,
+            f"{sequence_name(sp, NL, S, placer_flags, tmv_declined=_tmv_declined, tmv_chunked=_tmv_chunked, mlp_dp_active=op_mlp_dp is not None, mlp_o_active=fuse_o)}_lmhead", head_rl,
                                 input_args=["xf"], output_args=["logits"],
                                 buffer_sizes={"xf": D * 2, "logits": VOCAB * 2},
                                 context=ctx, extra_flags=placer_flags, share_designs=share)
