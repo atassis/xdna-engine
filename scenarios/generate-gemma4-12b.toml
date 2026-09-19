@@ -390,8 +390,27 @@ decode = "artifacts/gemma4-12b/decode_s6912_l48_are_wgm_pwm_rr_mvq2"
 # time_prefill.sh reports a dispatch COUNT, not a per-dispatch duration. Zero trips in ~20 device
 # runs is why this ships; it is NOT a margin, so do not size a larger M against it.
 #
-# Rollback: point `prefill =` back at `prefill_m64_s6912_l48_seg4` and reinstall. Decode untouched.
-prefill = "artifacts/gemma4-12b/prefill_m64_s6912_l48_seg4_ring"
+# DEFAULT SINCE 2026-09-19: `prefill_m64_s6912_l48_seg4_ring_lsb`, the same recipe plus
+#   PREFILL_LSCALE_BCAST=1, which serves the per-row layer-scalar multiply as ONE broadcast
+#   dispatch (ElementwiseMul.rows=M) instead of one per token row: 156 -> 93 runlist entries per
+#   layer, -40.38%, and an ELF 10.4 MB smaller (296.6 -> 286.2 MB). Arena unchanged, decode
+#   untouched. Gated 2026-09-19 against this decode: completion parity IDENTICAL to the arm below,
+#   alternated ABBA on a 4024-token prompt.
+#
+#   TIMING IS NOT YET MEASURED ON THIS GEOMETRY. The gate run was contaminated -- the candidate's
+#   own cells spread 6.64 ms (38.82 and 45.46) under a concurrent toolchain build, against 0.26 ms
+#   on the control -- so its 0.94x is noise, not a result. The supporting figure is -1.22% from a
+#   CLEAN alternated A/B of the same flag on the KV_ALLOC arm
+#   arm -- a KV_ALLOC build at window 8192 over capacity 262144, whose cells spread 0.00 and
+#   0.16 ms. That is a different KV layout (blocked, not flat), so re-run here on a quiet box
+#   before quoting any speedup for this arm.
+#
+#   Built with IRON=wt-emul-bcast (the broadcast operator lives only there) rather than the
+#   wt-iron-integ the arm below used; a 6-layer control that day came out byte-identical across
+#   that swap, which is why the arm below stands as the control.
+#
+# Rollback: point `prefill =` back at `prefill_m64_s6912_l48_seg4_ring` and reinstall. Decode untouched.
+prefill = "artifacts/gemma4-12b/prefill_m64_s6912_l48_seg4_ring_lsb"
 weights = "artifacts/gemma4-12b/weights_int4g32sbf16_planar_qat_rg"
 tokenizer_dir = "artifacts/gemma4-12b/tokenizer"
 
