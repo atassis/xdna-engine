@@ -1,0 +1,56 @@
+[scenario]
+kind = "generate"
+name = "g4-lscale-base"
+
+# BASELINE: per-row layer-scalar, 7488 runlist entries (156/layer) -- A/B arm for prefill-256k-rung-chunk-stall-attribution. Bytes, designs,
+# configures and arena are identical between the two arms; ONLY the dispatch count differs.
+#
+# SAME weights, SAME tokenizer, SAME graph as `gemma4-12b-256k`. The difference is KV_ALLOC: the KV
+# cache is ALLOCATED for 262144 positions while attention computes over `--max-seq 8192`. The 256k
+# arm costs 1016.8 ms/token at n_past 19 exactly as at n_past 200000, because a shim BD length is a
+# static field and `M` stays the streamed extent -- so 776 ms of it is paid for the ALLOCATION.
+# Here the streamed extent is the window, and the cache stays wide enough to hold the context.
+#
+#   build  GEN_EXTRA='--max-seq 8192' KV_ALLOC=262144 SOFTMAX_SEGMENT=1024 ATTN_RUNTIME_EXTENT=1 \
+#            GQA_GROUPED_K=1 GQA_GROUPED_V=1 FUSE_QKV_DP=0 SPLIT_LM_HEAD=0 SLIDING_KV_CIRCULAR=1 \
+#            MERGE_WEIGHT_GEMVS=1 POINTWISE_MODES=1 COLLAPSE_MERGED_CONFIGURES=1 \
+#            WEIGHTS=$PWD/artifacts/gemma4-12b/weights_int4g32sbf16_planar_qat_rg \
+#            bash scripts/build_llm_decode.sh gemma4-12b 48 \
+#              $A/decode_s8192_ka262144_l48
+#
+# CAPACITY AND WINDOW ARE PER GEOMETRY, and meta.json's kv_windows carries both: the 8 global
+# layers hold 262144 positions (kv_block 16, 1 kv head, 268,435,456 B per cache) and the 40
+# circular sliding ones stay at their own 1024 (kv_block 1024, 8 kv heads, 4,194,304 B). 96 caches,
+# 4.31 GB. A rung is a POWER-OF-TWO divisor of the capacity -- `S` must be a whole number of blocks
+# of `T` -- so 2048/4096/8192/16384 are the ladder this one is the first rung of.
+#
+# WHAT IS NOT HERE: attention past position 8192 within one dispatch. The window is the attention
+# EXTENT, so this serves a 262144-position cache one 8192-wide view at a time; the resident ladder
+# that selects a wider rung as `n_past` grows is `window_rungs` and is not built.
+
+# THE PAIR. Batched prefill built against THIS decode's arena, same window and same capacity:
+# `--seq 8192 --kv-alloc 262144`, M=64, PREFILL_SEGMENTS=4, PREFILL_SLIDING_RING=1. One decode and
+# one prefill over one 262144-position cache -- speed, batched priming and capacity in one arm.
+#
+#   build  KV_ALLOC=262144 SOFTMAX_SEGMENT=1024 PREFILL_SLIDING_RING=1 PREFILL_SEGMENTS=4 \
+#            SPEC=gemma4-12b NO_GOLDEN=1 WEIGHTS=/nonexistent \
+#            QUANT_WEIGHTS=$A/weights_int4g32qat_hf MERGE_WEIGHT_GEMVS=1 POINTWISE_MODES=1 \
+#            COLLAPSE_MERGED_CONFIGURES=1 DECODE_META=$A/decode_s8192_ka262144_l48/meta.json \
+#            bash scripts/build_prefill.sh 48 64 8192 $A/prefill_m64_w8192_ka262144_l48_seg4_ring_rung
+#
+# A_RESIDENT is ON for the `_ares` arm: it holds each GEMM's A operand in L2 across its N loop and
+# deletes 3.92 GiB of 16.00 at M=64 for 0.00% in time (-0.38%, CI [-0.86, +0.11], 10 alternated
+# pairs). Kept deliberately as an ENERGY lever and as headroom -- the bytes it removes sit upstream
+# of L2, so they convert to time only once something other than the DDR fetch is binding.
+#
+# The prefill's window is the attention EXTENT, so a prompt past it is DECLINED by the host
+# (`batchable_window`) and its tail finishes stepwise -- which for this arm is the same 8192 the
+# decode attends anyway.
+[artifacts]
+decode = "artifacts/gemma4-12b/decode_s8192_ka262144_l48"
+prefill = "artifacts/gemma4-12b/prefill_lscale_arms/baseline_l48"
+weights = "artifacts/gemma4-12b/weights_int4g32sbf16_planar_qat_rg"
+tokenizer_dir = "artifacts/gemma4-12b/tokenizer"
+
+[generation]
+max_tokens = 512
