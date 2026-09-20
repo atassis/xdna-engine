@@ -1870,7 +1870,9 @@ def check_shared_weights(dec_meta_path, weights_dir, sp, dims):
                       f"{tag} is {what} unreordered (packed bytes)")
             else:
                 # Arena narrower than the dump: an unpacked site, bf16 against the f32 dump.
-                claim(same(np.fromfile(part, dtype=BF16), ref.reshape(-1)),
+                # `[:ref.size]` is the element-side twin of the packed path's `[:ref.nbytes]`, and
+                # carries the old `[:D * QD]` slice: decode pads Wo's tail for fuse_o.
+                claim(same(np.fromfile(part, dtype=BF16)[:ref.size], ref.reshape(-1)),
                       f"{tag} is {what} unreordered")
 
     check_weight("Wo", "self_attn.o_proj", "o_proj")
