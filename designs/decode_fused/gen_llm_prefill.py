@@ -1811,28 +1811,71 @@ def check_shared_weights(dec_meta_path, weights_dir, sp, dims):
         claim(same(n[D:D + HD], np.asarray(npy("self_attn.q_norm"), np.float32) * sp.attn_scale),
               "norms[D:D+HD] is the q-norm with attn_scale folded in")
         claim(same(n[D + HD:D + 2 * HD], npy("self_attn.k_norm")), "norms[D+HD:] is the k-norm")
-    claim(same(raw("n_pf"), npy("post_attention_layernorm").reshape(-1)),
-          "n_pf is the post-attention layernorm")
-    claim(same(raw("Wo")[:D * QD], npy("self_attn.o_proj").reshape(-1)),
-          "Wo's first D rows are o_proj (decode pads the tail for fuse_o)")
-    for nm, t in (("Wg", "mlp.gate_proj"), ("Wu", "mlp.up_proj"), ("Wd", "mlp.down_proj")):
-        if os.path.exists(os.path.join(bdir, f"L0_{nm}.bin")):
-            claim(same(raw(nm), npy(t).reshape(-1)), f"{nm} is {t} unreordered")
-            continue
-        # decode splits a weight over K into `<nm>k0..k<n-1>`, each a contiguous K-slice of the
-        # (N, K) matrix -- weight_gemm's `wk(i)`/`a_slice(i)` read them that way, and prefill
-        # inherits the split from the arena. Verified against s2-pro-slow-ar's Wdk0/Wdk1.
-        chunks = []
-        while os.path.exists(os.path.join(bdir, f"L0_{nm}k{len(chunks)}.bin")):
-            chunks.append(raw(f"{nm}k{len(chunks)}"))
-        if not chunks:
+    # WHICH norm `n_pf` holds depends on the spec. With sandwich norms the layer carries three --
+    # `n_pa` post-attention, `n_pf` PRE-feedforward, `n_pff` post-feedforward -- and `n_pf` is the
+    # middle one; without them there is one and it is the post-attention norm. Claiming the
+    # post-attention norm unconditionally reported gemma4-12b's correct arena as wrong.
+    if sp.sandwich_norms:
+        for nm, leaf in (("n_pa", "post_attention_layernorm"),
+                         ("n_pf", "pre_feedforward_layernorm"),
+                         ("n_pff", "post_feedforward_layernorm")):
+            if os.path.exists(os.path.join(bdir, f"L0_{nm}.bin")):
+                claim(same(raw(nm), npy(leaf).reshape(-1)), f"{nm} is the {leaf}")
+    else:
+        claim(same(raw("n_pf"), npy("post_attention_layernorm").reshape(-1)),
+              "n_pf is the post-attention layernorm")
+    # A weight is checked against the SAME dump file decode packed from, and the discriminator is
+    # BYTES, never a dtype label: for a quantized site the arena holds the dump's packed bytes
+    # verbatim (verified byte-for-byte on gemma4-12b -- L0_Wg, L0_Wu and L0_Wdk0 each equal their
+    # own .npy exactly), so the widths agree and a raw compare is exact; for an unpacked one the
+    # arena is bf16 against an f32 dump, the widths differ, and only then is the cast meaningful.
+    # Reading a packed buffer as bf16 -- what this did before -- compares int4 payload against a
+    # bf16 reference and fails every claim on any quantized arena.
+    #
+    # Both sides can split over K, and independently: decode splits into `<nm>k0..`, each a
+    # contiguous K-slice that weight_gemm's `wk(i)` reads, and the DUMP offers `.kchunk0.npy ..`
+    # for the same tensor. They are paired in K order.
+    rawb = lambda p: np.fromfile(p, dtype=np.uint8)
+
+    def arena_parts(nm):
+        whole = os.path.join(bdir, f"L0_{nm}.bin")
+        if os.path.exists(whole):
+            return [whole]
+        parts = []
+        while os.path.exists(os.path.join(bdir, f"L0_{nm}k{len(parts)}.bin")):
+            parts.append(os.path.join(bdir, f"L0_{nm}k{len(parts)}.bin"))
+        return parts
+
+    def check_weight(nm, t, what):
+        parts = arena_parts(nm)
+        if not parts:
             bad.append(f"{nm} is in the arena neither whole nor as k-chunks")
-            continue
-        ref = npy(t)
-        ck = ref.shape[1] // len(chunks)
-        for i, c in enumerate(chunks):
-            claim(same(c, ref[:, i * ck:(i + 1) * ck].reshape(-1)),
-                  f"{nm}k{i} is {t}[:, {i * ck}:{(i + 1) * ck}] unreordered")
+            return
+        files = quant_source_files(weights_dir, f"{sp.weight_prefix}layers.0.", f"{t}.weight")
+        if not files:
+            bad.append(f"{nm}: {t} is in {weights_dir} neither whole nor as kchunks")
+            return
+        if len(parts) != len(files):
+            bad.append(f"{nm} is {len(parts)} arena part(s) against {len(files)} dump file(s)")
+            return
+        for i, (part, fn) in enumerate(zip(parts, files)):
+            ref = np.load(os.path.join(weights_dir, fn))
+            tag = f"{nm}{'' if len(parts) == 1 else f'k{i}'}"
+            a = rawb(part)
+            if a.nbytes >= ref.nbytes:
+                # Widths agree (or the arena is longer): the dump is already in the arena's own
+                # packed representation. `[:ref.nbytes]` generalises the old `[:D * QD]` slice --
+                # decode pads Wo's tail for fuse_o, and the pad sits past the reference's bytes.
+                claim(np.array_equal(a[:ref.nbytes], ref.reshape(-1).view(np.uint8)),
+                      f"{tag} is {what} unreordered (packed bytes)")
+            else:
+                # Arena narrower than the dump: an unpacked site, bf16 against the f32 dump.
+                claim(same(np.fromfile(part, dtype=BF16), ref.reshape(-1)),
+                      f"{tag} is {what} unreordered")
+
+    check_weight("Wo", "self_attn.o_proj", "o_proj")
+    for nm, t in (("Wg", "mlp.gate_proj"), ("Wu", "mlp.up_proj"), ("Wd", "mlp.down_proj")):
+        check_weight(nm, t, t)
 
     if sp.layer_scalar:
         # layer_scalar_name() has no ".weight" suffix, unlike every other leaf `npy()` assumes --
@@ -1841,9 +1884,32 @@ def check_shared_weights(dec_meta_path, weights_dir, sp, dims):
         claim(same(raw("ls"), np.full(D, ls_val, np.float32)),
               "ls is the layer_scalar gain, broadcast D-wide")
 
-    w = raw("Wqkv").reshape(-1, D)
-    q, k, v = (npy(f"self_attn.{r}_proj") for r in ("q", "k", "v"))
-    if dims["wqkv_head_major"]:
+    # Same packed-vs-bf16 split as the weights above. On a packed arena the stock stacking IS a
+    # byte concatenation of the three dumps -- verified byte-for-byte on gemma4-12b -- and the
+    # bf16 read below cannot see it: it reinterprets int4 payload as bf16 and reports a correct
+    # arena as wrong.
+    qkv_files = [quant_source_files(weights_dir, f"{sp.weight_prefix}layers.0.",
+                                    f"self_attn.{r}_proj.weight") for r in ("q", "k", "v")]
+    wqkv_raw = rawb(os.path.join(bdir, "L0_Wqkv.bin"))
+    qkv_packed = all(len(f) == 1 for f in qkv_files) and wqkv_raw.nbytes == sum(
+        np.load(os.path.join(weights_dir, f[0])).nbytes for f in qkv_files)
+    if qkv_packed:
+        if dims["wqkv_head_major"]:
+            # A head's ROWS are not a contiguous byte range once packed: the dump keeps payload
+            # and scales in per-tensor planes. Not expressible from this data -- say so rather
+            # than emit a claim that cannot be true.
+            print("[check] Wqkv head-major over a packed arena is not checkable here "
+                  "(per-head byte offsets are not defined by a planar dump) -- skipped")
+        else:
+            cat = np.concatenate([np.load(os.path.join(weights_dir, f[0])).reshape(-1).view(np.uint8)
+                                  for f in qkv_files])
+            claim(np.array_equal(wqkv_raw, cat),
+                  "Wqkv is the stock [Wq|Wk|Wv] stacking (packed bytes)")
+        q = k = v = w = None
+    else:
+        w = raw("Wqkv").reshape(-1, D)
+        q, k, v = (npy(f"self_attn.{r}_proj") for r in ("q", "k", "v"))
+    if w is not None and dims["wqkv_head_major"]:
         ok = True
         for c in range(sp.n_kv_heads):
             b = c * (grp + 2) * HD
@@ -1852,7 +1918,7 @@ def check_shared_weights(dec_meta_path, weights_dir, sp, dims):
             ok &= same(w[b + grp * HD:b + (grp + 1) * HD], k[c * HD:(c + 1) * HD])
             ok &= same(w[b + (grp + 1) * HD:b + (grp + 2) * HD], v[c * HD:(c + 1) * HD])
         claim(ok, f"Wqkv is head-major ({grp} q + 1 k + 1 v head blocks per kv head)")
-    else:
+    elif w is not None:
         claim(same(w[:QD], q) and same(w[QD:QD + KVD], k) and same(w[QD + KVD:], v),
               "Wqkv is the stock [Wq|Wk|Wv] stacking")
     if bad:
